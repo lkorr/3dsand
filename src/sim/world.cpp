@@ -1837,6 +1837,12 @@ static bool siteFootprintHas(uint32_t sid, int x, int z) {
   if (kind == worldmap::kSiteClearing || kind == worldmap::kSiteSoften || kind == worldmap::kSitePath) return false;
   // A road's carriageway, + 1 for its ragged edge (map v2 R1).
   if (kind == worldmap::kSiteRoad) return routeNear(wmSite(sid), x, z, wmSite(sid).radius + 1);
+  // A river's channel (+ 1) and a lake's shore band (W1; worldgen.wgsl says
+  // why a lake's interior needs no test here).
+  if (kind == worldmap::kSiteRiver)
+    return routeNear(wmSite(sid), x, z, std::max(wmSite(sid).radius, wmSite(sid).hwB) + 1);
+  if (kind == worldmap::kSiteLakeEdge) return routeNear(wmSite(sid), x, z, wmSite(sid).padMargin);
+  if (kind == worldmap::kSiteLakeCell) return false;
   const int dx = x - wmSiteI(sid, WM_S_X);
   const int dz = z - wmSiteI(sid, WM_S_Z);
   if (kind == WM_SITE_WATER) {
@@ -1883,6 +1889,19 @@ static bool sitePadNear(int x, int z, int r) {
     // A road: a FIXED reach past its half-width (worldgen.wgsl says why).
     if ((uint32_t)wmSite(sid).kind == worldmap::kSiteRoad) {
       const int reach = wmSite(sid).radius + (int)worldmap::kSiteRoadShoulderMax + r;
+      const int d2 = routeDist2(wmSite(sid), x, z, reach);
+      if (d2 >= 0 && d2 < reach * reach) return true;
+      continue;
+    }
+    // A river's channel + banks, a lake's shore band (W1).
+    if ((uint32_t)wmSite(sid).kind == worldmap::kSiteRiver) {
+      const int reach = std::max(wmSite(sid).radius, wmSite(sid).hwB) + wmSite(sid).padMargin + r;
+      const int d2 = routeDist2(wmSite(sid), x, z, reach);
+      if (d2 >= 0 && d2 < reach * reach) return true;
+      continue;
+    }
+    if ((uint32_t)wmSite(sid).kind == worldmap::kSiteLakeEdge) {
+      const int reach = wmSite(sid).padMargin + r;
       const int d2 = routeDist2(wmSite(sid), x, z, reach);
       if (d2 >= 0 && d2 < reach * reach) return true;
       continue;
@@ -2756,6 +2775,184 @@ static int sitePadY(uint32_t sid) {
   return wmSiteI(sid, WM_S_PAD_Y);
 }
 
+// ---- RIVERS AND LAKES on the CPU (worldgen.wgsl lakeTest / rivCut /
+// waterApply, docs/PLAN_worldbuilder.md W1) -------------------------------------
+// Outside the mirror on both sides, like roadProj: the mirrored landColumn /
+// TerrainHeight call waterApply by name. Same integers, same order, same
+// first-wins ties as the shader; the `rivers` gate's CPU == GPU pass is the
+// per-voxel proof. The record words are read off the StampSite fields the
+// packer writes them from (worldmap.cpp PackWorldMap).
+struct LakeT {
+  int inside;
+  int d2;
+};
+static LakeT lakeTest(uint32_t cid, int x, int z, int reach) {
+  const worldmap::WorldMapData::StampSite& c = wmSite(cid);
+  const int x0 = c.x, z0 = c.z, side = c.x1 - c.x;
+  int inside = 0;
+  if (!c.bits.empty()) {
+    const uint32_t r = (uint32_t)(z - z0);
+    inside = (int)((c.bits[r >> 5u] >> (r & 31u)) & 1u);
+  } else if ((c.wflags & worldmap::kLakeCellInside) != 0) {
+    inside = 1;
+  }
+  int best = -1;
+  const int px = x - x0;
+  const uint32_t* lst = wmSiteList(x, z);
+  const uint32_t n = wmSiteN(lst);
+  for (uint32_t k = 0u; k < n; k++) {
+    const worldmap::WorldMapData::StampSite& e = wmSite(wmSiteK(lst, k));
+    if ((uint32_t)e.kind != worldmap::kSiteLakeEdge || e.water != c.water) continue;
+    const int ax = e.x, az = e.z, bx = e.x1, bz = e.z1;
+    if ((az > z) != (bz > z)) {
+      int den = bz - az;
+      int num = (ax - x0) * den + (z - az) * (bx - ax);
+      if (den < 0) { den = -den; num = -num; }
+      const int kx = fdiv(num - 1, den);
+      if (px <= kx && kx < side) inside = 1 - inside;
+    }
+    const int d2 = routeDist2(e, x, z, reach);
+    if (d2 >= 0 && (best < 0 || d2 < best)) best = d2;
+  }
+  return LakeT{inside, best};
+}
+static IV2 rivCut(int w) { return iv2((int32_t)((uint32_t)w << 16u) >> 16, w >> 16); }
+struct WaterCol {
+  int h;
+  int water;      // the surface water stands to, -1 = dry
+  uint32_t bed;   // bed / shore material, 0 = none
+  bool wet;
+};
+static WaterCol waterApply(int x, int z, bool roaded, int hRoad, int h0) {
+  using namespace worldmap;
+  WaterCol out{h0, -1, 0u, false};
+  if (sLabWorld) return out;
+  const uint32_t* lst = wmSiteList(x, z);
+  const uint32_t n = wmSiteN(lst);
+  if (n == 0u) return out;
+  bool inCh = false;
+  int wMin = 1048576, sMax = -1048576, floorMin = 1048576, outS = -1048576, lipY = -1048576;
+  bool nearR = false;
+  int nd2 = 0, nS = 0, nHw = 0, nBank = 0;
+  uint32_t nBed = 0u;
+  uint32_t lake = 0u;
+  bool lkIn = false;
+  int lkD2 = -1;
+  for (uint32_t k = 0u; k < n; k++) {
+    const uint32_t sid = wmSiteK(lst, k);
+    const WorldMapData::StampSite& st = wmSite(sid);
+    if ((uint32_t)st.kind == kSiteLakeCell) {
+      const int band = st.padMargin;
+      const LakeT lt = lakeTest(sid, x, z, band);
+      const bool shore = lt.d2 >= 0 && lt.d2 < band * band;
+      if (!lkIn && (lt.inside != 0 || (shore && (lake == 0u || lkD2 < 0 || lt.d2 < lkD2)))) {
+        lake = sid;
+        lkIn = lt.inside != 0;
+        lkD2 = lt.d2;
+      }
+      continue;
+    }
+    if ((uint32_t)st.kind != kSiteRiver) continue;
+    const int hwA = st.radius, hwB = st.hwB, bank = st.padMargin;
+    const int reach = std::max(hwA, hwB) + std::max(bank, (int)kRiverLip);
+    const int ax = st.x, az = st.z, bx = st.x1, bz = st.z1;
+    if (x < std::min(ax, bx) - reach || x > std::max(ax, bx) + reach ||
+        z < std::min(az, bz) - reach || z > std::max(az, bz) + reach) continue;
+    const uint32_t fl = (uint32_t)st.wflags;
+    bool lip = false;
+    if ((fl & kRivFlatA) != 0u) {
+      const IV2 c = rivCut(st.cutA);
+      const int cd = (x - ax) * c.x + (z - az) * c.y;
+      if (cd <= 0) continue;
+      lip = cd <= (int)kRiverLip * 1024;
+    }
+    if ((fl & kRivFlatB) != 0u) {
+      const IV2 c = rivCut(st.cutB);
+      if ((x - bx) * c.x + (z - bz) * c.y > 0) continue;
+    }
+    const int vx = bx - ax, vz = bz - az;
+    const int l2 = std::max(vx * vx + vz * vz, 1);
+    const int t = std::clamp((x - ax) * vx + (z - az) * vz, 0, l2);
+    const int tq = (t * 256) / l2;
+    const int dx = x - (ax + (vx * t) / l2);
+    const int dz = z - (az + (vz * t) / l2);
+    const int d2 = dx * dx + dz * dz;
+    const int hw = std::max(hwA + (((hwB - hwA) * tq) >> 8u), 1);
+    const int o = hw + std::max(bank, (int)kRiverLip);
+    if (d2 >= o * o) continue;
+    const int s = st.surf;
+    if (lip && d2 < (hw + 2 * (int)kRiverLip) * (hw + 2 * (int)kRiverLip)) lipY = std::max(lipY, st.lipY);
+    if (d2 < hw * hw) {
+      inCh = true;
+      wMin = std::min(wMin, s);
+      sMax = std::max(sMax, s);
+      const int dep = st.depthA + (((st.depthB - st.depthA) * tq) >> 8u);
+      int drop = (dep * (hw * hw - d2)) / (hw * hw);
+      if ((fl & kRivProfileV) != 0u) drop = (dep * (hw - isqrtLe(d2, hw))) / hw;
+      floorMin = std::min(floorMin, s - drop);
+    } else if (d2 < (hw + (int)kRiverLip) * (hw + (int)kRiverLip)) {
+      outS = std::max(outS, s);
+    }
+    if (!nearR || d2 < nd2) {
+      nearR = true;
+      nd2 = d2;
+      nS = s;
+      nHw = hw;
+      nBank = std::max(bank, (int)kRiverLip);
+      nBed = st.bed & 0xFFFu;
+    }
+  }
+  if (!nearR && lake == 0u) return out;
+  int h = h0, water = -1;
+  uint32_t bed = 0u;
+  const int sea = seaLevelY();
+  if (inCh) {
+    const int hold = std::max(sMax, std::max(outS, lipY));
+    if (hold > wMin) {
+      h = hold;
+      bed = nBed;
+    } else {
+      h = floorMin;
+      if (roaded) h = std::max(h, std::min(hRoad, wMin - 1));
+      if (h < wMin) { water = wMin; bed = nBed; }
+    }
+  } else if (nearR) {
+    const int tgt = nS + 1;
+    const int inner = nHw + (int)kRiverLip;
+    const int o = nHw + nBank;
+    int w = 256;
+    if (nd2 >= inner * inner) {
+      const int tt = ((o * o - nd2) * 256) / std::max(o * o - inner * inner, 1);
+      w = (tt * tt * (768 - 2 * tt)) >> 16u;
+    }
+    if (nS > sea || h > tgt) h = h + (((tgt - h) * w + 128) >> 8u);
+    const int need = std::max(outS, lipY) + 1;
+    if (need > sea + 1) h = std::max(h, need);
+  }
+  if (lake != 0u) {
+    const WorldMapData::StampSite& lc = wmSite(lake);
+    const int lv = lc.surf, band = lc.padMargin;
+    if (lkIn) {
+      if (water < 0) { h = h0; bed = 0u; }
+      if (h < lv) { water = lv; bed = lc.bed; }
+      else if (lkD2 >= 0 && lkD2 < band * band) bed = lc.shore;
+    } else if (water < 0 && lkD2 >= 0 && lkD2 < band * band) {
+      const int tgt = lv + 1, half = band / 2;
+      int w = 256;
+      if (lkD2 >= half * half) {
+        const int tt = ((band * band - lkD2) * 256) / std::max(band * band - half * half, 1);
+        w = (tt * tt * (768 - 2 * tt)) >> 16u;
+      }
+      if (h < tgt) h = h + (((tgt - h) * w + 128) >> 8u);
+      bed = lc.shore;
+    }
+  }
+  out.h = h;
+  out.water = water;
+  out.bed = bed;
+  out.wet = true;
+  return out;
+}
 
 // MIRROR-BEGIN landheight
 // THE HEIGHT CONTRACT (DESIGN.md; landColumn in worldgen.wgsl):
@@ -2868,13 +3065,30 @@ int World::TerrainHeight(int x, int z, uint32_t seed) {
   // knobs are tuned, or every scene's fixture heights drift.
   if (sLabWorld) return kLabSlabY;
   const int h = landColumnBare(x, z, seed).h;
-  return sitePadAt(x, z, roadPadAt(x, z, h));
+  const int hr = roadPadAt(x, z, h);
+  const int hp = sitePadAt(x, z, hr);
+  return waterApply(x, z, hr != h, hr, hp).h;
 }
 // MIRROR-END landheight
 
 // worldmap.h: LoadWorldMap's site-pad bake, against whatever map is current.
 int worldmap::BareGroundHeight(int x, int z, uint32_t seed) {
   return landColumnBare(x, z, seed).h;
+}
+
+// worldmap.h: the column with its rivers and lakes, as TerrainHeight composes it.
+worldmap::WaterColumn worldmap::WaterColumnAt(int x, int z, uint32_t seed) {
+  WaterColumn c;
+  if (sLabWorld) { c.h = kLabSlabY; return c; }
+  const int h = landColumnBare(x, z, seed).h;
+  const int hr = roadPadAt(x, z, h);
+  const int hp = sitePadAt(x, z, hr);
+  const WaterCol w = waterApply(x, z, hr != h, hr, hp);
+  c.h = w.h;
+  c.water = w.water;
+  c.bed = w.bed;
+  c.wet = w.wet;
+  return c;
 }
 
 // worldmap.h: the mirrored mapHeightAt, for the `worldmap-v2` gate and tools.

@@ -13208,6 +13208,7 @@ const HZ_H_MAT_WATER : u32 = 15u;
 const HZ_H_MIP : u32 = 16u;
 const HZ_H_SKIN : u32 = 32u;
 const HZ_H_TL_PLANE : u32 = 288u;  // horizon.h kHTlPlane (kHSkin + 256)
+const HZ_H_WATER : u32 = 289u;     // horizon.h kHWater: per-sample lake / river coverage (W1)
 // horizon.h kL* (the light map; horizon_light.wgsl writes it).
 const HZ_L_SKY_VALID : u32 = 0u;
 const HZ_L_SUN_VALID : u32 = 1u;
@@ -13469,6 +13470,24 @@ fn hzTreelineAt(p : vec2f) -> f32 {
   return hzBil(h, f);
 }
 
+// THE MAP'S LAKES AND RIVERS at sample-space point p (W1, horizon::Build's
+// water plane): the share of the footprint that is water, bilinear, 0..1.
+// An old header (no plane) has none.
+fn hzWaterAt(p : vec2f) -> f32 {
+  let base = horizon[HZ_H_WATER];
+  if (base == 0u) { return 0.0; }
+  let nn = hzN();
+  let q = clamp(p, vec2f(0.0), vec2f(nn - vec2<i32>(1)));
+  let i = max(min(vec2<i32>(floor(q)), nn - vec2<i32>(2)), vec2<i32>(0));
+  let f = q - vec2f(i);
+  var h : vec4f;
+  for (var k = 0; k < 4; k++) {
+    let c = min(i + vec2<i32>(k & 1, k >> 1), nn - vec2<i32>(1));
+    h[k] = f32(horizon[base + u32(c.y * nn.x + c.x)] & 0xFFu) / 255.0;
+  }
+  return hzBil(h, f);
+}
+
 // ---- THE TERRAIN-SCALE LIGHT (map v2 S1; horizon_light.wgsl) ----------------
 // The map's light map at a world point in fine voxels: bilinear over the four
 // samples round it, each sample's answer computed for THIS point's height.
@@ -13545,11 +13564,14 @@ fn shadeHorizon(hz : HzHit, rd : vec3f) -> vec3f {
   let gz = (hzAvgAt(l, hz.p + vec2f(0.0, e), sea) - hzAvgAt(l, hz.p - vec2f(0.0, e), sea)) /
            (2.0 * e * S);
   let n = normalize(vec3f(-gx, 1.0, -gz));
-  var color : vec3f;
+  var color = vec3f(0.0);
   // Under the sea plane on average: open water, by the far field's own law.
-  if (hzAvgAt(-1, hz.p, -1e9) <= sea) {
-    color = shadeFarWater(hitP, rd, materials[horizon[HZ_H_MAT_WATER]], vec3f(0.0, 1.0, 0.0));
-  } else {
+  // The map's lakes and rivers (W1) are that share of the sample: a lake
+  // reads as one, a river as a line that does not end where the cascades do.
+  // One shadeFarWater call site (its inline is not small).
+  var wc = clamp(hzWaterAt(hz.p) * 1.5, 0.0, 1.0);
+  if (hzAvgAt(-1, hz.p, -1e9) <= sea) { wc = 1.0; }
+  if (wc < 1.0) {
     let albedo = hzAlbedo(hz.p, hitP.y, n);
     let face = n.y * n.y + n.x * n.x * TUNE_FACE_X + n.z * n.z * TUNE_FACE_Z;
     // The terrain's own sky visibility and sun horizon (S1): a gorge sees a
@@ -13565,6 +13587,9 @@ fn shadeHorizon(hz : HzHit, rd : vec3f) -> vec3f {
     color = albedo * face *
             (ambientOpen(ambientAt(n), opennessScale(open), open) + keyLightColor() * lambert);
     if (TUNE_GI_STRENGTH > 0.0) { color += farGiBounce(albedo, n); }
+  }
+  if (wc > 0.0) {
+    color = mix(color, shadeFarWater(hitP, rd, materials[horizon[HZ_H_MAT_WATER]], vec3f(0.0, 1.0, 0.0)), wc);
   }
   return applyAerial(color, rd, hz.t);
 }

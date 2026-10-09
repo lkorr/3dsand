@@ -196,6 +196,10 @@ export const LIVE = {
     'planes.height': R('mapHeightAt: the AUTHORED absolute height, i16 voxels on 2^log2 posts, Catmull-Rom; tiles planes/height/<tx>_<tz>.svt'),
     'planes.biome': R('mapBiomeAt / biomeMixAt: biome cells of 2^log2 voxels; tiles planes/biome/<tx>_<tz>.svt'),
     'ridges[]': N('editor', 'baked into planes.height; the engine reads the plane'),
+    // docs/PLAN_worldbuilder.md W1: rivers and lakes in the engine; ranges /
+    // climate / gen are the editor's own re-bake inputs (2.4).
+    'rivers[]': R('worldbuilder W1 rivers: {id, name?, points [[x, z, w, d] | [x, z]...] source first, smooth?, bed?, joins?, stepVox?, bank?, profile? U|V} -- worldwater.cpp bakes the surface from the bare ground (running min, flat reaches stepping down by stepVox, the mouth at the sea / the lake / the parent it joins) and cuts kSiteRiver pieces; waterApply carves the channel, holds the banks and builds a weir at every step, so the water is born at rest (DESIGN.md, the world map rivers)'),
+    'lakes[]': R('worldbuilder W1 lakes: {id, name?, level, points [[x, z]...], smooth?, bed?, shore?, band?} -- water fills every column inside the polygon whose ground is under the level, and a sill raises the ground to level + 1 across the shore band outside it (kSiteLakeEdge / kSiteLakeCell, waterApply)'),
     'ranges[]': N('editor', 'the Range tool’s splines (docs/PLAN_worldbuilder.md §2.4): baked into planes.height; the engine reads the plane'),
     'climate': N('editor', 'the auto-biome inputs (wind, lapse, sea temperature, latitude; PLAN_worldbuilder §2.4): the editor paints the biome plane from them, the engine reads the plane'),
     'gen': N('editor', 'the Generate panel’s last template run (template, seed, ops, box): re-runnable; the engine reads the planes it wrote')

@@ -37,6 +37,8 @@ const std::vector<Gate>& TreeGates();
 const std::vector<Gate>& BiomeGates();
 const std::vector<Gate>& EnvTruthGates();
 const std::vector<Gate>& MapV2Gates();
+// Rivers and lakes (docs/PLAN_worldbuilder.md W1): a synthetic map in a temp dir.
+const std::vector<Gate>& RiverGates();
 // Locales (docs/PLAN_map_v2.md L1): CPU only, a synthetic map in a temp dir.
 const std::vector<Gate>& LocaleGates();
 const std::vector<Gate>& AltitudeGates();
@@ -1267,6 +1269,11 @@ const char* const kOrder[] = {
     // pinned trace, and before `infect-perf`, whose blood still in flight
     // after its regenerate would land on this gate's carriageways.
     "roads",
+    // Rivers and lakes (docs/PLAN_worldbuilder.md W1): the `roads` seam and
+    // exit exactly (a synthetic map in a TEMP dir, regenerated, TICKED to
+    // rest, the real environment back), so it runs where `roads` runs and for
+    // the same reason -- after every pinned trace.
+    "rivers",
     // What the infection pass COSTS: eight bitten humans ticked four times
     // over (the whole-lattice sweep against the limb's cell list -- identical
     // outcome, a fraction of the time). LATE on purpose: the crowd bleeds over
@@ -1290,7 +1297,7 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &MapV2Gates(), &LocaleGates(), &AltitudeGates(), &GeneratorGates(), &ScaleGates(),
+    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &MapV2Gates(), &RiverGates(), &LocaleGates(), &AltitudeGates(), &GeneratorGates(), &ScaleGates(),
                           &SimGates(), &CaGates(), &GasGates(), &TicketGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),

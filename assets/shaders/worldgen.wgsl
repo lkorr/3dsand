@@ -1538,6 +1538,33 @@ const WM_S_ROAD_Y_B      : u32 = 10u;   // road piece: ... at end B (kS_BoxX1 / 
 const WM_S_ROAD_MAT      : u32 = 11u;   // road piece: the SOLID surface material
 const WM_S_ROAD_DEPTH    : u32 = 12u;   // road piece: surface cells from the ground's top down
 const WM_S_ROAD_FLAGS    : u32 = 15u;   // road piece: 1 = end A OPEN, 2 = end B open (a collinear joint)
+// RIVERS AND LAKES (docs/PLAN_worldbuilder.md W1; worldmap.h kSiteRiver /
+// kSiteLakeEdge / kSiteLakeCell and their kS_Riv* / kS_Lake* words).
+const WM_SITE_RIVER      : u32 = 9u;    // one chord of one REACH of a map.json river
+const WM_SITE_LAKE_EDGE  : u32 = 10u;   // one edge of a map.json lake polygon
+const WM_SITE_LAKE_CELL  : u32 = 11u;   // a lake's per-cell record (row parity bitset)
+const WM_S_RIV_HW_B      : u32 = 5u;    // river piece: half-width at end B (kS_Radius is A's)
+const WM_S_RIV_DEPTH_A   : u32 = 6u;    // river piece: centreline water depth at A
+const WM_S_RIV_DEPTH_B   : u32 = 8u;    // ... at B
+const WM_S_RIV_SURF      : u32 = 9u;    // river piece: the reach's flat water surface Y
+const WM_S_RIV_BED       : u32 = 10u;   // river piece: bed mat | flags << 12 | length << 16
+const WM_S_RIV_LIP_Y     : u32 = 11u;   // river piece at a step start: the upstream surface
+const WM_S_RIV_CUT_A     : u32 = 12u;   // flat end A: the shared cut normal (i16 x | i16 z << 16)
+const WM_S_RIV_CUT_B     : u32 = 15u;   // flat end B: likewise
+const WM_S_LAKE_ID       : u32 = 8u;    // lake edge / cell: 1 + lake index
+const WM_S_LAKE_LEVEL    : u32 = 9u;    // the lake's water surface Y
+const WM_S_LAKE_BED      : u32 = 10u;   // bed material (submerged ground)
+const WM_S_LAKE_SHORE    : u32 = 11u;   // shore material (dry ground within the band)
+const WM_S_LAKE_BITS     : u32 = 12u;   // lake cell: word offset of its row parity bitset, 0 = none
+const WM_S_LAKE_FLAGS    : u32 = 15u;   // lake cell: RIV_LAKE_INSIDE
+// worldmap.h kRiv* / kLakeCellInside / kRiverLip / kWaterBedDepth (no WM_
+// prefix: they are flags and lengths, not record words).
+const RIV_FLAT_A         : u32 = 1u;
+const RIV_FLAT_B         : u32 = 2u;
+const RIV_PROFILE_V      : u32 = 4u;
+const RIV_LAKE_INSIDE    : i32 = 1;
+const RIVER_LIP          : i32 = 4;
+const WATER_BED_DEPTH    : i32 = 2;
 // worldmap.h kSiteRoadShoulderMax: the fixed pond keep-out past a road's
 // half-width (sitePadNear), and kSiteRoadFarTint: how far past it a road
 // still tints a far cell its line crosses (roadTint).
@@ -1901,6 +1928,18 @@ fn siteFootprintHas(sid : u32, x : i32, z : i32) -> bool {
   // tile plant, tarn centre or cactus on the road. Its shoulder is ordinary
   // ground, as a stamp's ramp is.
   if (kind == WM_SITE_ROAD) { return routeNear(sid, x, z, wmSiteI(sid, WM_S_RADIUS) + 1); }
+  // A RIVER's channel (+ 1) and a LAKE's shore band: no cover row, tile
+  // plant, tarn centre or cactus there. A river's banks are ordinary ground
+  // (their height is the column's own, so what grows there stands on it). A
+  // lake's INTERIOR needs no test here: every column of it under the level
+  // is water (pond >= 0 gates the cover, the plants and the cacti cell by
+  // cell), and a thing rooted deeper in than the band has nothing dry to
+  // stand over -- the parity walk stays out of the pond roll's inline sites.
+  if (kind == WM_SITE_RIVER) {
+    return routeNear(sid, x, z, max(wmSiteI(sid, WM_S_RADIUS), wmSiteI(sid, WM_S_RIV_HW_B)) + 1);
+  }
+  if (kind == WM_SITE_LAKE_EDGE) { return routeNear(sid, x, z, wmSiteI(sid, WM_S_PAD_MARGIN)); }
+  if (kind == WM_SITE_LAKE_CELL) { return false; }
   // A stamp: its FLAT core -- the template's rect + the apron. The ramp past
   // it is ordinary ground, so cover grows on it and the lawn has no edge.
   if (kind == WM_SITE_STAMP) { return stampRectDist(sid, x, z) <= wmSiteI(sid, WM_S_APRON); }
@@ -1934,6 +1973,23 @@ fn sitePadNear(x : i32, z : i32, r : i32) -> bool {
       if (d2 >= 0 && d2 < reach * reach) { return true; }
       continue;
     }
+    // A river reshapes its channel and its banks; a lake its polygon and
+    // the shore band round it (W1). Fixed reaches, like a road's.
+    if (wmSiteKind(sid) == WM_SITE_RIVER) {
+      let reach = max(wmSiteI(sid, WM_S_RADIUS), wmSiteI(sid, WM_S_RIV_HW_B)) + wmSiteI(sid, WM_S_PAD_MARGIN) + r;
+      let d2 = routeDist2(sid, x, z, reach);
+      if (d2 >= 0 && d2 < reach * reach) { return true; }
+      continue;
+    }
+    if (wmSiteKind(sid) == WM_SITE_LAKE_EDGE) {
+      let reach = wmSiteI(sid, WM_S_PAD_MARGIN) + r;
+      let d2 = routeDist2(sid, x, z, reach);
+      if (d2 >= 0 && d2 < reach * reach) { return true; }
+      continue;
+    }
+    // (Not the lake's interior: the parity walk would be inlined into every
+    // pond roll of the height mirror. A disc inside a lake sits under its
+    // water; the shore band above is what keeps one off the bank.)
     if (wmSiteKind(sid) != WM_SITE_STAMP) { continue; }
     if (stampRectDist(sid, x, z) < wmSiteI(sid, WM_S_APRON) + wmSiteI(sid, WM_S_PAD_MARGIN) + r) { return true; }
   }
@@ -2107,6 +2163,262 @@ fn roadColAt(x : i32, z : i32, seed : u32) -> RoadCol {
   }
   return r;
 }
+// ---- RIVERS AND LAKES (docs/PLAN_worldbuilder.md W1) -------------------------
+// THE LAKE TEST for lake cell record `cid` (worldmap.h kSiteLakeCell) at a
+// column of its cell: x = 1 inside the polygon (even-odd), y = the squared
+// distance to the nearest of the lake's edges listed here within `reach`, -1
+// when none is. The polygon test is EXACT and needs no ray to infinity: the
+// cell record carries, per row z, the parity of the edges crossing that row
+// strictly right of the cell (its bitset; "whole cell inside" when the cell
+// has no edge), and the edges crossing the row between the column and the
+// cell's right side all pass through this cell, so they are in its list.
+// An edge (a, b) crosses row z when (az > z) != (bz > z), at x = a crossing
+// whose integer floor-below kx = floor((num - 1) / den), num = (ax - x0) den +
+// (z - az)(bx - ax), den = bz - az > 0 (both negated otherwise); the column
+// is left of the crossing iff px <= kx. LoadWorldMap computes the bitset with
+// the same kx in i64 (worldmap.cpp Lake::Inside), so the two cannot differ.
+// Bounds: a listed edge is <= 256 voxels a side and within its reach of the
+// cell, so |ax - x0| < 2048 and every product stays under 2^20.
+fn lakeTest(cid : u32, x : i32, z : i32, reach : i32) -> vec2<i32> {
+  let x0 = wmSiteI(cid, WM_S_X);
+  let z0 = wmSiteI(cid, WM_S_Z);
+  let side = wmSiteI(cid, WM_S_BOX_X1) - x0;
+  let id = wmSiteI(cid, WM_S_LAKE_ID);
+  var inside = 0;
+  let bits = u32(wmSiteI(cid, WM_S_LAKE_BITS));
+  if (bits != 0u) {
+    let r = u32(z - z0);
+    inside = i32((worldMap[bits + (r >> 5u)] >> (r & 31u)) & 1u);
+  } else if ((wmSiteI(cid, WM_S_LAKE_FLAGS) & RIV_LAKE_INSIDE) != 0) {
+    inside = 1;
+  }
+  var best = -1;
+  let px = x - x0;
+  let lst = wmSiteList(x, z);
+  let n = wmSiteN(lst);
+  for (var k = 0u; k < n; k++) {
+    let sid = wmSiteK(lst, k);
+    if (wmSiteKind(sid) != WM_SITE_LAKE_EDGE || wmSiteI(sid, WM_S_LAKE_ID) != id) { continue; }
+    let ax = wmSiteI(sid, WM_S_X);
+    let az = wmSiteI(sid, WM_S_Z);
+    let bx = wmSiteI(sid, WM_S_BOX_X1);
+    let bz = wmSiteI(sid, WM_S_BOX_Z1);
+    if ((az > z) != (bz > z)) {
+      var den = bz - az;
+      var num = (ax - x0) * den + (z - az) * (bx - ax);
+      if (den < 0) { den = -den; num = -num; }
+      let kx = fdiv(num - 1, den);
+      if (px <= kx && kx < side) { inside = 1 - inside; }
+    }
+    let d2 = routeDist2(sid, x, z, reach);
+    if (d2 >= 0 && (best < 0 || d2 < best)) { best = d2; }
+  }
+  return vec2<i32>(inside, best);
+}
+
+// The packed i16 pair of a river piece's cut normal (kS_RivCutA / B).
+fn rivCut(w : i32) -> vec2<i32> {
+  return vec2<i32>((w << 16u) >> 16u, w >> 16u);
+}
+
+// THE WATER at a column: the height mirror's LAST step (landColumn, after the
+// roads and the pads), and the only one that writes standing water above
+// the sea. world.cpp waterApply is the twin; the `rivers` gate holds the two
+// to each other per voxel.
+//
+// RIVERS. Every listed river piece the column is a MEMBER of -- inside its box
+// grown by half-width + bank, and on the right side of a flat (step) end's
+// cut line -- is measured: d2 to its chord, the half-width hw and depth d
+// lerped along it, its reach's flat surface S. Then:
+//   * in some piece's CHANNEL (d2 < hw^2): the floor is S - the cross-section
+//     (U: d (1 - d2 / hw^2), V: d (1 - u / hw)), the lowest of every channel
+//     claiming the column. Water stands to S -- unless the column must HOLD
+//     a higher water: another channel with a higher S claims it, a higher
+//     reach's channel ends within RIVER_LIP of it, or it is in the WEIR STRIP
+//     of a step (the first RIVER_LIP voxels below the step's cut line, which
+//     hold the reach above). Then it is a dry dam at that height. A road deck
+//     that crosses the channel wins up to the water (a ford).
+//   * else in the NEAREST piece's BANK (hw .. hw + bank): the ground blends to
+//     S + 1 -- 256 within RIVER_LIP of the channel, a smoothstep out to the
+//     bank's edge -- cutting where the terrain is higher, building a levee
+//     where it is lower; then it is raised to hold any higher water within
+//     RIVER_LIP (+1). A reach at the sea's level never builds a levee: the
+//     sea is that water already.
+// LAKES. A column inside a lake's polygon whose ground (a river's channel
+// floor, else the ground before any river bank) is under the level holds
+// water to it; outside, within the shore band, the ground is raised toward
+// level + 1 (the SILL: 256 over the inner half of the band, a smoothstep out),
+// so a sloppy polygon never leaks.
+// Every touched column loses its sediment wedge (a powder under water or in
+// a cut bank slides) and its caves (`wet`), and a water column lays the bed
+// material (WATER_BED_DEPTH cells; a powder bed keeps to its step line in
+// `cols`), a dry shore the lake's shore material.
+// Bounds: a piece is <= 256 voxels a side and hw + bank <= 1536, so after
+// routeDist2's box reject every product is < 2^30 (worldmap.h kRiver*).
+fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, LandCol>) {
+  if (T.labMode != 0u) { return; }
+  let lst = wmSiteList(x, z);
+  let n = wmSiteN(lst);
+  if (n == 0u) { return; }
+  let h0 = (*L).h;
+  var inCh = false;
+  var wMin = 1048576;
+  var sMax = -1048576;
+  var floorMin = 1048576;
+  var outS = -1048576;
+  var lipY = -1048576;
+  var near = false;
+  var nd2 = 0;
+  var nS = 0;
+  var nHw = 0;
+  var nBank = 0;
+  var nBed = MAT_AIR;
+  var lake = 0u;
+  var lkIn = false;
+  var lkD2 = -1;
+  for (var k = 0u; k < n; k++) {
+    let sid = wmSiteK(lst, k);
+    let kind = wmSiteKind(sid);
+    if (kind == WM_SITE_LAKE_CELL) {
+      let band = wmSiteI(sid, WM_S_PAD_MARGIN);
+      let lt = lakeTest(sid, x, z, band);
+      let shore = lt.y >= 0 && lt.y < band * band;
+      // The first lake the column is inside wins; else the nearest shore.
+      if (!lkIn && (lt.x != 0 || (shore && (lake == 0u || lkD2 < 0 || lt.y < lkD2)))) {
+        lake = sid;
+        lkIn = lt.x != 0;
+        lkD2 = lt.y;
+      }
+      continue;
+    }
+    if (kind != WM_SITE_RIVER) { continue; }
+    let hwA = wmSiteI(sid, WM_S_RADIUS);
+    let hwB = wmSiteI(sid, WM_S_RIV_HW_B);
+    let bank = wmSiteI(sid, WM_S_PAD_MARGIN);
+    let reach = max(hwA, hwB) + max(bank, RIVER_LIP);
+    let ax = wmSiteI(sid, WM_S_X);
+    let az = wmSiteI(sid, WM_S_Z);
+    let bx = wmSiteI(sid, WM_S_BOX_X1);
+    let bz = wmSiteI(sid, WM_S_BOX_Z1);
+    if (x < min(ax, bx) - reach || x > max(ax, bx) + reach ||
+        z < min(az, bz) - reach || z > max(az, bz) + reach) { continue; }
+    let bw = wmSiteI(sid, WM_S_RIV_BED);
+    let fl = u32(bw >> 12u) & 15u;
+    var lip = false;
+    if ((fl & RIV_FLAT_A) != 0u) {
+      let c = rivCut(wmSiteI(sid, WM_S_RIV_CUT_A));
+      let cd = (x - ax) * c.x + (z - az) * c.y;
+      if (cd <= 0) { continue; }
+      lip = cd <= RIVER_LIP * 1024;
+    }
+    if ((fl & RIV_FLAT_B) != 0u) {
+      let c = rivCut(wmSiteI(sid, WM_S_RIV_CUT_B));
+      if ((x - bx) * c.x + (z - bz) * c.y > 0) { continue; }
+    }
+    let vx = bx - ax;
+    let vz = bz - az;
+    let l2 = max(vx * vx + vz * vz, 1);
+    let t = clamp((x - ax) * vx + (z - az) * vz, 0, l2);
+    let tq = (t * 256) / l2;
+    let dx = x - (ax + (vx * t) / l2);
+    let dz = z - (az + (vz * t) / l2);
+    let d2 = dx * dx + dz * dz;
+    let hw = max(hwA + (((hwB - hwA) * tq) >> 8u), 1);
+    let o = hw + max(bank, RIVER_LIP);
+    if (d2 >= o * o) { continue; }
+    let s = wmSiteI(sid, WM_S_RIV_SURF);
+    // The weir holds the reach above across the channel and the bank next
+    // to it (water above can touch nothing further out).
+    if (lip && d2 < (hw + 2 * RIVER_LIP) * (hw + 2 * RIVER_LIP)) { lipY = max(lipY, wmSiteI(sid, WM_S_RIV_LIP_Y)); }
+    if (d2 < hw * hw) {
+      inCh = true;
+      wMin = min(wMin, s);
+      sMax = max(sMax, s);
+      let da = wmSiteI(sid, WM_S_RIV_DEPTH_A);
+      let dep = da + (((wmSiteI(sid, WM_S_RIV_DEPTH_B) - da) * tq) >> 8u);
+      var drop = (dep * (hw * hw - d2)) / (hw * hw);
+      if ((fl & RIV_PROFILE_V) != 0u) { drop = (dep * (hw - isqrtLe(d2, hw))) / hw; }
+      floorMin = min(floorMin, s - drop);
+    } else if (d2 < (hw + RIVER_LIP) * (hw + RIVER_LIP)) {
+      outS = max(outS, s);
+    }
+    if (!near || d2 < nd2) {
+      near = true;
+      nd2 = d2;
+      nS = s;
+      nHw = hw;
+      nBank = max(bank, RIVER_LIP);
+      nBed = u32(bw) & 0xFFFu;
+    }
+  }
+  if (!near && lake == 0u) { return; }
+  var h = h0;
+  var water = -1;
+  var bed = MAT_AIR;
+  let sea = seaLevelY();
+  if (inCh) {
+    let hold = max(sMax, max(outS, lipY));
+    if (hold > wMin) {
+      // A dry dam (a weir's crest, two channels' seam): the bed's stone,
+      // not the bank's grass, so a step reads as a ledge in the stream.
+      h = hold;
+      bed = nBed;
+    } else {
+      h = floorMin;
+      // A FORD: the road's deck, kept one voxel under the water so the
+      // river runs on over it.
+      if (roaded) { h = max(h, min(hRoad, wMin - 1)); }
+      if (h < wMin) { water = wMin; bed = nBed; }
+    }
+  } else if (near) {
+    let tgt = nS + 1;
+    let inner = nHw + RIVER_LIP;
+    let o = nHw + nBank;
+    var w = 256;
+    if (nd2 >= inner * inner) {
+      let tt = ((o * o - nd2) * 256) / max(o * o - inner * inner, 1);
+      w = (tt * tt * (768 - 2 * tt)) >> 16u;
+    }
+    if (nS > sea || h > tgt) { h = h + (((tgt - h) * w + 128) >> 8u); }
+    let need = max(outS, lipY) + 1;
+    if (need > sea + 1) { h = max(h, need); }
+  }
+  if (lake != 0u) {
+    let lv = wmSiteI(lake, WM_S_LAKE_LEVEL);
+    let band = wmSiteI(lake, WM_S_PAD_MARGIN);
+    if (lkIn) {
+      // Inside: a river's channel keeps its floor; its banks and dams give
+      // way to the lake's own ground.
+      if (water < 0) { h = h0; bed = MAT_AIR; }
+      if (h < lv) { water = lv; bed = u32(wmSiteI(lake, WM_S_LAKE_BED)); }
+      else if (lkD2 >= 0 && lkD2 < band * band) { bed = u32(wmSiteI(lake, WM_S_LAKE_SHORE)); }
+    } else if (water < 0 && lkD2 >= 0 && lkD2 < band * band) {
+      let tgt = lv + 1;
+      let half = band / 2;
+      var w = 256;
+      if (lkD2 >= half * half) {
+        let tt = ((band * band - lkD2) * 256) / max(band * band - half * half, 1);
+        w = (tt * tt * (768 - 2 * tt)) >> 16u;
+      }
+      if (h < tgt) { h = h + (((tgt - h) * w + 128) >> 8u); }
+      bed = u32(wmSiteI(lake, WM_S_LAKE_SHORE));
+    }
+  }
+  (*L).h = h;
+  (*L).sed = 0;
+  (*L).wet = true;
+  (*L).wbed = bed;
+  if (near) { (*L).wtd2 = nd2; (*L).wthw = nHw; }
+  if (water >= 0) {
+    (*L).pond = water;
+    (*L).pw = vec2<i32>(h, water);
+    (*L).fluid = M_WATER;
+    (*L).fluidTop = max((*L).fluidTop, water);
+    (*L).wp = 0u;
+    (*L).bedSolid = false;
+  }
+}
+
 // The keep-out tarns, cacti, tile plants and cover avoid: the pad box and
 // every listed site's footprint.
 fn siteKeepOut(x : i32, z : i32) -> bool {
@@ -2175,6 +2487,17 @@ fn siteBlocksTrunk(wx : i32, wz : i32, reach : i32, seed : u32) -> bool {
       // the half-width + the larger of the two, like a stamp's pad + clear.
       let keep = wmSiteI(sid, WM_S_RADIUS) + max(reach, wmSiteI(sid, WM_S_PAD_MARGIN));
       if (routeNear(sid, wx, wz, keep)) { return true; }
+    } else if (wmSiteKind(sid) == WM_SITE_RIVER) {
+      // A river (W1): no trunk on the channel or the banks (the tree stands
+      // on landAt's ground, which the banks reshape) and no crown over the
+      // water -- the road's rule with the bank for the shoulder.
+      let hw = max(wmSiteI(sid, WM_S_RADIUS), wmSiteI(sid, WM_S_RIV_HW_B));
+      if (routeNear(sid, wx, wz, hw + max(reach, wmSiteI(sid, WM_S_PAD_MARGIN)))) { return true; }
+    } else if (wmSiteKind(sid) == WM_SITE_LAKE_EDGE) {
+      // A lake: no trunk within its shore band (the sill reshapes it) or a
+      // crown's reach of the shoreline. A trunk further in stands in the
+      // water, where every column its crown covers is water too.
+      if (routeNear(sid, wx, wz, wmSiteI(sid, WM_S_PAD_MARGIN) + reach)) { return true; }
     } else if (siteFootprintHas(sid, wx, wz)) { return true; }
   }
   return false;
@@ -3691,6 +4014,11 @@ struct Col {
   // lays on a carriageway, and the nearest piece farSurfaceMat's coverage
   // test tints a coarse far cell with.
   road        : RoadCol,
+  // RIVERS AND LAKES (LandCol's fields of the same names, waterApply).
+  wbed        : u32,
+  wet         : bool,
+  wtd2        : i32,
+  wthw        : i32,
 };
 
 // ---- tile plants: ferns and big toadstools ---------------------------------
@@ -3821,6 +4149,14 @@ struct LandCol {
   wp          : u32,         // the covering pond's preset, else the near shore's; 0 = none
   bedSolid    : bool,        // inside a disc: face steeper than a powder bed can hold
   ponds       : PondSet,     // the column's pond candidates (pondScan), for the scans
+  // RIVERS AND LAKES (waterApply, W1): the bed / shore material this column
+  // lays (MAT_AIR = none), whether a river or lake shaped it (no caves, no
+  // loose cover), and the nearest river piece's squared distance and
+  // half-width for the far field's narrow-water tint (wthw 0 = none).
+  wbed        : u32,
+  wet         : bool,
+  wtd2        : i32,
+  wthw        : i32,
 };
 
 // MIRROR-BEGIN landheight
@@ -3843,6 +4179,10 @@ fn landColumnBare(x : i32, z : i32, seed : u32,
   (*L).wp = 0u;
   (*L).bedSolid = false;
   (*L).ponds = pondSetNone();
+  (*L).wbed = MAT_AIR;
+  (*L).wet = false;
+  (*L).wtd2 = 0;
+  (*L).wthw = 0;
   // The fluid lab's flat slab — the same guard genColumn takes below, taken
   // here as well so World::TerrainHeight sees the slab through the contract
   // rather than through a second copy of the constant.
@@ -4002,7 +4342,9 @@ fn roadPadAt(x : i32, z : i32, h : i32) -> i32 {
 fn landColumn(x : i32, z : i32, seed : u32,
               L : ptr<function, LandCol>) {
   landColumnBare(x, z, seed, L);
-  let hp = sitePadAt(x, z, roadPadAt(x, z, (*L).h));
+  let hr = roadPadAt(x, z, (*L).h);
+  let hp = sitePadAt(x, z, hr);
+  let roaded = hr != (*L).h;
   if (hp != (*L).h) {
     // Cut-and-fill under a building or a road: the loose wedge goes with it,
     // for the reason the pond-bank block gives (powder under a stone floor
@@ -4010,6 +4352,10 @@ fn landColumn(x : i32, z : i32, seed : u32,
     (*L).h = hp;
     (*L).sed = 0;
   }
+  // The rivers and lakes LAST (W1): their water must be contained whatever
+  // the roads and pads did to the ground; a road deck crossing a channel is
+  // a ford (waterApply).
+  waterApply(x, z, roaded, hr, L);
   return;
 }
 // MIRROR-END landheight
@@ -4064,6 +4410,10 @@ fn genColumn(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> Co
     lab.sedTop = LAB_SLAB_Y;
     lab.tl = 1048576;   // never: inRim already keeps the snow and the trees off
     lab.road = roadNone();
+    lab.wbed = MAT_AIR;
+    lab.wet = false;
+    lab.wtd2 = 0;
+    lab.wthw = 0;
     *ponds = pondSetNone();
     return lab;
   }
@@ -4136,6 +4486,10 @@ fn genColumn(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> Co
   col.sedTop = h;
   col.tl = tl;
   col.road = roadColAt(x, z, seed);
+  col.wbed = L.wbed;
+  col.wet = L.wet;
+  col.wtd2 = L.wtd2;
+  col.wthw = L.wthw;
   *ponds = L.ponds;
   return col;
 }
@@ -4212,7 +4566,8 @@ fn looseCoverDepth(col : ptr<function, Col>, depth : i32, mat : u32) -> i32 {
   //   inRim     -- the fluid lab's slab (what the snow cap, the caves and
   //                the sediment wedge also read as "this ground was placed,
   //                not grown").
-  if ((*col).nearWater || (*col).inRim) { return 0; }
+  //   wet       -- a river's channel / bank or a lake's shore (waterApply)
+  if ((*col).nearWater || (*col).inRim || (*col).wet) { return 0; }
   // A CLAMPED taper, not a straight line from slope 0: full authored depth up
   // to terrain.sedSlope (the ground the sediment wedge already calls flat),
   // then tapering to zero at the CA's OWN angle of repose. A ramp ending at
@@ -4467,7 +4822,7 @@ struct ColNeeds { trees : bool, canopy : bool };
 fn colPrologue(col : ptr<function, Col>, x : i32, z : i32, yLo : i32, yHi : i32,
                cave : ptr<function, CaveBands>) -> ColNeeds {
   let h = (*col).h;
-  if (!(*col).inRim && yLo <= h) {
+  if (!(*col).inRim && !(*col).wet && yLo <= h) {
     *cave = caveBands(x, z, h, (*col).biome, T.seed);
   }
   var need : ColNeeds;
@@ -4549,7 +4904,10 @@ fn ccStore(w : u32, col : ptr<function, Col>, cave : ptr<function, CaveBands>,
   // genChunk sees Col.road without another word per column.
   colCache[w + CCW_BIOME] = ((*col).biome & 0xFFu) | (((*col).road.mat & 0xFFFu) << 8u) |
                             (u32((*col).road.depth) << 20u);
-  colCache[w + CCW_WP] = (*col).wp;
+  // The preset index is small; the river / lake bed (12 bits) and the `wet`
+  // flag ride above it (W1).
+  colCache[w + CCW_WP] = ((*col).wp & 0xFFFu) | (((*col).wbed & 0xFFFu) << 12u) |
+                         select(0u, 1u << 24u, (*col).wet);
   colCache[w + CCW_SHORE_WP] = (*col).shore.wp;
   colCache[w + CCW_PACKED] = ((*col).fluid & 0xFFFu) | (((*col).plant.mat & 0xFFFu) << 12u) |
                              (f << 24u);
@@ -4589,7 +4947,11 @@ fn ccLoad(w : u32, col : ptr<function, Col>, cave : ptr<function, CaveBands>) {
   (*col).shore.surf = bitcast<i32>(colCache[w + CCW_SHORE_SURF]);
   (*col).shore.wp = colCache[w + CCW_SHORE_WP];
   (*col).nearWater = (f & CCF_NEAR_WATER) != 0u;
-  (*col).wp = colCache[w + CCW_WP];
+  (*col).wp = colCache[w + CCW_WP] & 0xFFFu;
+  (*col).wbed = (colCache[w + CCW_WP] >> 12u) & 0xFFFu;
+  (*col).wet = (colCache[w + CCW_WP] & (1u << 24u)) != 0u;
+  (*col).wtd2 = 0;
+  (*col).wthw = 0;
   (*col).bedSolid = (f & CCF_BED_SOLID) != 0u;
   (*col).plant.mat = (colCache[w + CCW_PACKED] >> 12u) & 0xFFFu;
   (*col).plant.base = bitcast<i32>(colCache[w + CCW_PLANT_BASE]);
@@ -4770,6 +5132,15 @@ fn genCellIn(col : ptr<function, Col>,
       if (pond < 0 && y > (*col).looseTop) { mat = coverFirmMat(biome); }
     } else if (inPoolFloor) {
       mat = M_STONE;
+    } else if ((*col).wbed != MAT_AIR && y > h - WATER_BED_DEPTH) {
+      // A RIVER OR LAKE BED, or a lake's dry SHORE (waterApply, W1): the
+      // map's material, WATER_BED_DEPTH cells deep. A powder keeps to its
+      // step line (`cols` lowers looseTop for it, as for a flowy pond bed)
+      // and is the biome's firm cover above it, so a bed never slides out
+      // from under the water it holds.
+      var bm = (*col).wbed;
+      if (materials[bm].klass == CLASS_POWDER && y > (*col).looseTop) { bm = coverFirmMat(biome); }
+      mat = bm;
     } else if (submerged && y > h - wmWaterI(wp, WM_W_BED_THICKNESS)) {
       // THE BED: the preset's, by water depth -- bed.shallow (sand)
       // where the water over this column is shallower than bed.shallowDepth,
@@ -4864,7 +5235,7 @@ fn genCellIn(col : ptr<function, Col>,
     // Caves carve the stone body, lava-filled below the magma table. No caves
     // under an authored pool/rim — a cave breaching a rim column drains the
     // pool through the tunnel system and the world never settles.
-    if (mat == M_STONE && !inRim) {
+    if (mat == M_STONE && !inRim && !(*col).wet) {
       // The bands, not just the answer: caveFloraAt needs f1/f2/c2 to ask where
       // the floor and the ceiling of THIS cavern are.
       var cb : CaveBands;
@@ -5335,6 +5706,18 @@ fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
 // piece (Col.road). Untouched ground only -- the callers above apply it where
 // they would return the procgen skin.
 fn roadTint(col : ptr<function, Col>, skin : u32, shift : u32) -> u32 {
+  // A RIVER NARROWER THAN THE CELL (W1): the same coverage rule as a road's,
+  // down to a sixteenth of the cell, painting the cell water -- a river is the
+  // thing on a far hillside the eye looks for, and a 4 m stream must not
+  // vanish at the 25.6 m level. The column's nearest piece is waterApply's.
+  let wv = (*col).wthw;
+  if (wv > 0) {
+    let cell = 1 << shift;
+    if (2 * wv < cell && 16 * wv >= cell) {
+      let reach = wv + min(cell / 2, WM_ROAD_FAR_TINT);
+      if ((*col).wtd2 < reach * reach) { return M_WATER; }
+    }
+  }
   let r = (*col).road;
   if (r.tint == MAT_AIR) { return skin; }
   let cell = 1 << shift;
@@ -6353,6 +6736,15 @@ fn cols(@builtin(workgroup_id) wg : vec3<u32>,
     } else if (coverSplits(col.biome) && yLo <= col.h && yHi + 1 > col.h - coverDepth &&
         looseCoverDepth(&col, coverDepth, looseCoverMat(col.biome)) > 0) {
       lsMat = looseCoverMat(col.biome);
+    } else if (col.wbed != MAT_AIR && materials[col.wbed].klass == CLASS_POWDER &&
+               yLo <= col.h && yHi + 1 > col.h - WATER_BED_DEPTH) {
+      // A RIVER / LAKE BED or a lake's SHORE that is a powder (W1): its own
+      // step line, every slide reach included -- a channel's cross-section
+      // and a weir's drop face are cut, not grown, so no gradient knows them.
+      // Submerged, the sub-voxel rule never fires (looseStep's note); a dry
+      // shore takes the top cell's grains like any loose cover.
+      lsMat = col.wbed;
+      lsFine = col.pond < 0;
     } else if (col.pond >= 0 && !col.bedSolid && !col.inPoolFloor && yLo <= col.h &&
                yHi + 1 > col.h - wmWaterI(col.wp, WM_W_BED_THICKNESS)) {
       // THE SAME LINE FOR A FLOWY POND BED (pondBedMat). Under water a 2:1
@@ -6698,7 +7090,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
       if (yRow > skyCeil) { break; }
       let fine = vec3<i32>(fx, yRow + half, fz);
       var mat = M_STONE;
-      if (fine.y > deepTop || (!col.inRim && caveIn(cave, fine.y) != 0)) {
+      if (fine.y > deepTop || (!col.inRim && !col.wet && caveIn(cave, fine.y) != 0)) {
         mat = genCellIn(&col, &cave, true, &trees, true, &ponds, canopyArg,
                         fine.x, fine.y, fine.z, T.seed) & 0xFFFu;
       }

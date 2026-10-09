@@ -321,9 +321,12 @@ console.log('\n-- live manifest (envlive.js) --');
   const mapRows = {sites: {}, rules: {}, roads: {}, ranges: {}, biomes: null, 'extent.min': null, 'extent.size': null,
                    'planes.height': null, 'planes.biome': null, climate: null, gen: null};
   // P-G: the terrain block is walked leaf by leaf (every number is read).
-  // the editor-only keys of the worldbuilder (PLAN_worldbuilder §2.4): ranges[], climate, gen
-  const mapPaths = leaves(mapJson, '', mapRows).filter(p => !/^(sites|rules|roads|ranges)\[\]\./.test(p))
-      .concat(['sites[]', 'rules[]', 'ridges[]', 'roads[]', 'ranges[]', 'climate', 'gen']);
+  // W1 (docs/PLAN_worldbuilder.md): rivers / lakes are one field each like
+  // roads, and the editor-only ranges / climate / gen keys (2.4) are listed
+  // whether or not the shipped map carries them yet.
+  const mapPaths = leaves(mapJson, '', mapRows)
+      .filter(p => !/^(sites|rules|roads|rivers|lakes|ranges|climate|gen)(\[\]|\.|$)/.test(p))
+      .concat(['sites[]', 'rules[]', 'ridges[]', 'roads[]', 'rivers[]', 'lakes[]', 'ranges[]', 'climate', 'gen']);
   check('map', [...new Set(mapPaths)]);
   // P-D landed: the biome's tile IS read (one lattice, thinned per biome to
   // density × (T/tile)²), and so is every per-row condition on tree and cover

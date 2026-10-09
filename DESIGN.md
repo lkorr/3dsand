@@ -23429,6 +23429,52 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   roads (`default/map.json`, ids `harrowby_*`, kind path) and were erased from
   `default_ground.svedit` by `harrowby_08_paths.sh` (`paint_ground.mjs
   --erase --only <mat>`). Gate `roads`.
+* **LIVE (worldbuilder W1, 2026-10-09): RIVERS, LAKES AND CURVED ROADS.**
+  `docs/PLAN_worldbuilder.md` §2 is the format; `src/sim/worldwater.cpp` the
+  parse and the bake (its header comment is the algorithm E2's JS preview
+  ports, step by step); `worldgen.wgsl waterApply` / `lakeTest` and their
+  `world.cpp` twins the column side. **THE SPLINE** (`worldmap::
+  SplineTessellate`): centripetal Catmull-Rom (alpha 0.5, Barry-Goldman),
+  phantom ends `P[-1] = 2P0 - P1`, each segment densified at clamp(ceil(chord
+  / 2), 8, 4096) parameter steps, resampled at max(1, ceil(arc / 16)) equal
+  arc steps, knots exact; `tests/spline_vectors.json` (written by
+  `scripts/gen_spline_vectors.py`) is the table the C++ (gate `rivers` S) and
+  `assets/editor/spline.js` are both held to. **Roads** `smooth: true` run
+  their points through it (Douglas-Peucker 0.75 voxel so straights stay one
+  piece) before the profile bake; `false` (the default) is the old polyline.
+  **Why a river can sleep:** it is not a current. Its surface is the BARE
+  ground's running minimum source -> mouth, quantized into flat REACHES (a new
+  reach when the ground has fallen `stepVox` below the last reach's start),
+  clamped at the level it drains into (the sea, the lake its mouth is in, or
+  the `joins` parent's surface at the mouth, with the tail forced to it), so
+  every cell of water is born at rest; flow is the renderer's business, never
+  mass transport. Records at the END of the site table: `kSiteRiver` (one
+  chord of one reach: ends, half-width at each end, bank, depth at each end,
+  the reach surface, the bed, the weir's upstream surface and, at a STEP, a
+  shared cut normal so the two pieces partition the plane exactly),
+  `kSiteLakeEdge` (outline edges ≤ 256) and `kSiteLakeCell` (per site cell:
+  the parity of the outline crossings right of the cell, per row, so the
+  shader's inside test is exact with only the cell's own edges). **The
+  column** (`waterApply`, LAST in `landColumn`, after roads and pads): in a
+  channel the floor is the reach surface minus the U (or V) cross-section and
+  water stands to the surface — unless the column must HOLD a higher water
+  (another channel, a higher reach's channel within `kRiverLip`, or the
+  weir strip below a step), when it is a dry dam at that height; a road deck
+  crossing a channel wins up to the water (a ford); on a bank the ground
+  blends to surface + 1 (cut or levee; none at sea level). A lake fills every
+  column inside its polygon under its level; outside, the shore band is
+  raised toward level + 1 (the sill). Touched columns lose the sediment wedge
+  and the caves (`Col.wet`), and lay the bed / shore material (a powder keeps
+  to its step line in `cols`). Keep-outs: no trunk within half-width +
+  max(bank, crown) of a river or band + crown of a shore; no cover, tile
+  plant, tarn or cactus in a channel or a shore band. **Far:** the cascades
+  see the water through genColumn; `roadTint` paints a cell water where a
+  river is narrower than it (down to a sixteenth of the cell); the horizon
+  (`horizon.h kHWater`) carries per-sample lake / river coverage and a lake's
+  level. `--mapcheck` reports each river's reaches, waterfalls (drops >
+  `kRiverWaterfall` 2 m) and baked profile, each lake's outline and cells.
+  Gate `rivers` (sleep ≤ 32 with a waterfall and a lake, contained, CPU ==
+  GPU, far, horizon, the spline table).
 * **LIVE (map v2 E3, 2026-10-08): THE VECTOR LAYERS ARE EDITED ON THE MAP
   PAGE.** `assets/editor/mapvector.js` (pure helpers Node-tested by
   `scripts/test_mapvector.mjs`; the layer is created by `map.js`, which keeps
