@@ -33,9 +33,19 @@
  *   Marker tool: click places a marker with the picked icon; drag one to move
  *     it; shift+click deletes it.
  *
+ * BENDS (docs/PLAN_worldbuilder.md 2.3, E2): a road with `smooth: true` is the
+ * engine's spline through its points (spline.js smoothRoadPoints = the
+ * engine's SmoothRoadPoints: centripetal Catmull-Rom at 16 voxels, rounded,
+ * Douglas-Peucker 0.75); the page draws, hit-tests, snaps onto and profiles
+ * THAT centreline. New roads are smooth; an existing polyline road stays
+ * `smooth: false` until its inspector's "bend" box is ticked. Clicking the
+ * selected road's curve inserts a point there and drags it (drag the curve).
+ *
  * Every edit is one map.json undo step (map.js snapshot / restore). Saving is
  * refused while a road has fewer than two distinct points or a region fewer
  * than three -- the engine would refuse the whole map. */
+
+import * as SPL from './spline.js';
 
 /* ---- pure helpers (Node-testable: scripts/test_mapvector.mjs) ---------------- */
 
@@ -168,6 +178,48 @@ export function pointAtArc(pts, s) {
   }
   return pts[0].slice();
 }
+const clCache = new Map();
+/** A road's CENTRELINE as the engine builds it: `smooth: true` -> the spline
+ *  (spline.smoothRoadPoints, the engine's SmoothRoadPoints), else its points. */
+export function roadCentreline(r) {
+  const P = (r && r.points) || [];
+  if (!r || r.smooth !== true || distinctPoints(P, false) < 2) return P;
+  const key = JSON.stringify(P);
+  let c = clCache.get(key);
+  if (!c) { c = SPL.smoothRoadPoints(P); if (clCache.size > 200) clCache.clear(); clCache.set(key, c); }
+  return c;
+}
+/** Arc length along the road's centreline of each of its own points. */
+export function knotArcs(r) {
+  const C = roadCentreline(r), A = vertexArcs(C);
+  return ((r && r.points) || []).map(p => {
+    let best = Infinity, s = 0;
+    for (let i = 0; i + 1 < C.length; i++) {
+      const q = segDist(C[i], C[i + 1], p[0], p[1]);
+      if (q.d < best) { best = q.d; s = A[i] + (A[i + 1] - A[i]) * q.t; }
+    }
+    return s;
+  });
+}
+/** Where on a road's centreline (x, z) is nearest, as an INSERT position into
+ *  its points: {k (insert after point k), x, z, d, t (0..1 between k and k+1,
+ *  0 or 1 = on a point)}. A polyline road is its segments; a smooth one its curve. */
+export function roadCurveHit(r, x, z) {
+  const P = (r && r.points) || [];
+  if (P.length < 2) return null;
+  if (r.smooth !== true) {
+    let best = null;
+    for (let k = 0; k + 1 < P.length; k++) { const q = segDist(P[k], P[k + 1], x, z); if (!best || q.d < best.d) best = {k, ...q}; }
+    return best;
+  }
+  const t = SPL.tessellate(P.map(p => [p[0], p[1]]), {step: 16, smooth: true});
+  const c = SPL.closest(t, x, z);
+  if (!c) return null;
+  const {map} = SPL.dedupe(P);
+  const k = map[Math.min(c.seg, map.length - 1)];
+  const f = c.t - c.seg;
+  return {k, x: c.x, z: c.z, d: c.dist, t: f};
+}
 /** What is wrong with the three arrays for the engine's loader, or null:
  *  the refusals only (an id missing or twice, too few points, a marker
  *  without `at`). The page refuses to save over one of these. */
@@ -278,6 +330,10 @@ export function createVectorLayer(C) {
   }
   function segmentHit(obj, wx, wz, closed) {
     const pts = obj.points || [];
+    if (!closed && obj.smooth === true) {
+      const h = roadCurveHit(obj, wx, wz);
+      return h && px(h.d) <= segGrab ? h : null;
+    }
     const n = closed ? pts.length : pts.length - 1;
     for (let k = 0; k < n; k++) {
       const s = segDist(pts[k], pts[(k + 1) % pts.length], wx, wz);
@@ -302,6 +358,12 @@ export function createVectorLayer(C) {
     for (const o of J()[layer + 's'] || []) {
       if (o === self) continue;
       const pts = o.points || [], closed = layer === 'region', n = closed ? pts.length : pts.length - 1;
+      if (!closed && o.smooth === true) {
+        const h = roadCurveHit(o, wx, wz);
+        const d = h ? px(h.d) : Infinity;
+        if (h && d <= bd && h.t > 0.02 && h.t < 0.98) { bd = d; best = {x: Math.round(h.x), z: Math.round(h.z), segOf: o, seg: h.k}; }
+        continue;
+      }
       for (let k = 0; k < n; k++) {
         const s = segDist(pts[k], pts[(k + 1) % pts.length], wx, wz);
         const d = px(s.d);
@@ -340,7 +402,7 @@ export function createVectorLayer(C) {
     if (layer === 'road') {
       const d = ROAD_KINDS[st.newRoad.kind] || ROAD_KINDS.path;
       return {id: freshId(J().roads, st.newRoad.kind), kind: st.newRoad.kind, surface: st.newRoad.surface,
-              width: d.width, shoulder: d.shoulder, maxGrade: d.maxGrade, depth: ROAD_DEPTH_DEFAULT, points: [[x, z]]};
+              width: d.width, shoulder: d.shoulder, maxGrade: d.maxGrade, depth: ROAD_DEPTH_DEFAULT, smooth: true, points: [[x, z]]};
     }
     const regs = J().regions || [];
     return {id: freshId(regs, 'region'), name: 'Region ' + (regs.length + 1),
@@ -588,7 +650,7 @@ export function createVectorLayer(C) {
         const sel = st.sel && st.sel.layer === 'road' && st.sel.id === r.id, col = surfaceColour(r.surface);
         const d = ROAD_KINDS[r.kind] || ROAD_KINDS.road, w = r.width == null ? d.width : r.width, sh = r.shoulder == null ? d.shoulder : r.shoulder;
         g.lineCap = 'round'; g.lineJoin = 'round';
-        strokePath(g, pts, false);
+        strokePath(g, roadCentreline(r), false);
         if (pts.length === 1) g.lineTo(C.SX(pts[0][0]) + 0.01, C.SZ(pts[0][1]));
         if (pass === 0) { g.globalAlpha = 0.18; g.strokeStyle = col; g.lineWidth = Math.max(3, px(w + 2 * sh)); g.stroke(); }
         else if (pass === 1) { g.globalAlpha = sel ? 0.95 : 0.8; g.strokeStyle = col; g.lineWidth = Math.max(2, px(w)); g.stroke(); }
@@ -609,7 +671,7 @@ export function createVectorLayer(C) {
             vertexSquare(g, p, sel && st.sel.k === k ? '#ffd866' : jn ? '#ffd866' : '#0e1219', sel ? '#ffffff' : jn ? '#1c1712' : '#c8b48a');
           });
         if (pts.length >= 2 && (sel || C.view.scale >= 0.08)) {
-          const m = pointAtArc(pts, vertexArcs(pts)[pts.length - 1] / 2);
+          const cl = roadCentreline(r), m = pointAtArc(cl, vertexArcs(cl)[cl.length - 1] / 2);
           g.fillStyle = sel ? '#ffffff' : '#e8dcc0';
           g.fillText(r.name || r.id, Math.round(C.SX(m[0])) + 6, Math.round(C.SZ(m[1])) - 6);
         }
@@ -755,7 +817,7 @@ export function createVectorLayer(C) {
       box.replaceChildren(...items.map(o => rowFor(layer, o, text(o))));
       if (!items.length) box.append(el('div', {class: 'mapnote'}, empty));
     };
-    listInto(els.roads, 'road', j.roads || [], r => `${r.name || r.id} · ${fmtM(vertexArcs(r.points || [])[(r.points || []).length - 1] / v || 0)} · ${r.surface || '?'}`,
+    listInto(els.roads, 'road', j.roads || [], r => { const cl = roadCentreline(r); return `${r.name || r.id} · ${fmtM(vertexArcs(cl)[cl.length - 1] / v || 0)} · ${r.surface || '?'}${r.smooth === true ? ' · bends' : ''}`; },
              'no roads — pick the Road tool and click on the map');
     listInto(els.regions, 'region', j.regions || [], r => `${r.name || r.id} · ${(r.points || []).length} pts · ${(Math.abs(polygonArea(r.points || [])) / v / v / 1e6).toFixed(3)} km²`,
              'no regions — pick the Region tool and click out a polygon');
@@ -843,14 +905,18 @@ export function createVectorLayer(C) {
       inp.addEventListener('change', () => edit(() => { o[key] = Math.max(lo, Math.min(hi, Math.round(+inp.value || 0))); }));
       return el('label', {title}, label, ' ', inp, out);
     };
-    const len = vertexArcs(o.points)[o.points.length - 1] || 0;
+    const ocl = roadCentreline(o), len = vertexArcs(ocl)[ocl.length - 1] || 0;
+    const bend = el('input', {type: 'checkbox', title: 'BEND: the road is a smooth spline through its points (the engine tessellates it the same way: map.json smooth: true); off = straight segments between them'});
+    bend.checked = o.smooth === true;
+    bend.addEventListener('change', () => edit(() => { if (bend.checked) o.smooth = true; else o.smooth = false; }));
     box.append(el('b', {}, (o.kind || 'road') + ' “' + (o.name || o.id) + '”'), idField, text('name', 'name', 'a name for the road (optional)'),
       el('label', {}, 'kind ', kind), el('label', {}, 'surface ', surf),
       num('width', 'width', kd.width, w => (w / v).toFixed(1) + ' m', 'carriageway width, voxels (2..256): the surface is laid over this'),
       num('shoulder', 'shoulder', kd.shoulder, s => (s / v).toFixed(1) + ' m', 'the ramp back to the bare ground either side, voxels (0..64); the engine widens it where a cut or fill would step more than a voxel'),
       num('max grade', 'maxGrade', kd.maxGrade, g => '%', 'steepest the baked profile may climb, percent: cuts through bumps, fills dips'),
       num('depth', 'depth', ROAD_DEPTH_DEFAULT, d => 'cells', 'surface cells from the ground’s top down (1..8)'),
-      el('span', {class: 'mapnote'}, `${o.points.length} vertices · ${fmtM(len / v)} long`));
+      el('label', {}, bend, ' bend (smooth)'),
+      el('span', {class: 'mapnote'}, `${o.points.length} vertices · ${fmtM(len / v)} long` + (o.smooth === true ? ` (the curve: ${ocl.length} engine vertices)` : '')));
     const bar = el('div', {class: 'mapbar'});
     const cont = el('button', {title: 'add vertices after the last one (Enter / double-click ends)'}, st.drawing ? 'Finish' : 'Continue from end');
     cont.addEventListener('click', () => { if (st.drawing) finish(); else { st.drawing = true; C.setTool('road'); sync(); } });
@@ -893,7 +959,7 @@ export function createVectorLayer(C) {
     const sj = C.savedJson && C.savedJson();
     return sj ? (sj.roads || []).find(r => r.id === id) || null : null;
   }
-  const roadKey = r => JSON.stringify([r.points, r.kind, r.width, r.shoulder, r.maxGrade, r.surface, r.depth]);
+  const roadKey = r => JSON.stringify([r.points, r.kind, r.width, r.shoulder, r.maxGrade, r.surface, r.depth, r.smooth === true]);
   /** {engine road entry, stale?, why} for the inspector's chart. */
   function bakeOf(o) {
     const ck = C.check && C.check();
@@ -917,8 +983,7 @@ export function createVectorLayer(C) {
       if (!b.e) return;
       const P = profileOf(b.e), r = cv.getBoundingClientRect();
       const s = P.s[P.s.length - 1] * Math.max(0, Math.min(1, (ev.clientX - r.left - 4) / (cv.width - 8)));
-      const pts = b.stale ? (savedRoad(o.id) || o).points : o.points;
-      st.probe = pointAtArc(pts, s);
+      st.probe = pointAtArc(roadCentreline(b.stale ? (savedRoad(o.id) || o) : o), s);
       drawRoadProfile(cv, o, b, note, s);
       C.paint();
     });
@@ -930,14 +995,14 @@ export function createVectorLayer(C) {
   function profileOf(e) {
     if (e.profile && Array.isArray(e.profile.s) && e.profile.s.length >= 2) return {s: e.profile.s, y: e.profile.y, g: e.profile.ground, dense: true};
     const sr = savedRoad(e.id);
-    const arcs = sr ? vertexArcs(sr.points) : (e.vertexY || []).map((_, k) => k);
+    const arcs = sr ? vertexArcs(roadCentreline(sr)) : (e.vertexY || []).map((_, k) => k);
     return {s: arcs, y: e.vertexY || [], g: e.vertexGround || [], dense: false};
   }
   function drawRoadProfile(cv, o, b, note, probeS) {
     const g = cv.getContext('2d'), W = cv.width, Hh = cv.height, v = C.vpm(), sea = C.seaY();
     g.fillStyle = '#0e1219'; g.fillRect(0, 0, W, Hh);
     g.font = '10px monospace';
-    if (!b.e) { g.fillStyle = '#6f7f97'; g.fillText('no bake to show', 6, 14); note.textContent = b.why; return; }
+    if (!b.e) { liveGround(g, o, W, Hh); g.fillStyle = '#6f7f97'; g.fillText('no bake to show: the plane under the current centreline', 6, 14); note.textContent = b.why; return; }
     const P = profileOf(b.e), N = P.s.length, S = Math.max(1, P.s[N - 1]);
     let lo = Infinity, hi = -Infinity;
     for (let i = 0; i < N; i++) { lo = Math.min(lo, P.y[i], P.g[i]); hi = Math.max(hi, P.y[i], P.g[i]); }
@@ -965,7 +1030,7 @@ export function createVectorLayer(C) {
     // vertex ticks along the bottom
     const sr = savedRoad(o.id);
     g.fillStyle = '#c7d2e3';
-    for (const a of sr ? vertexArcs(sr.points) : []) g.fillRect(Math.round(X(a)), Hh - 11, 1, 4);
+    for (const a of sr ? knotArcs(sr) : []) g.fillRect(Math.round(X(a)), Hh - 11, 1, 4);
     g.fillText(fmtM((hi - sea) / v), 3, 10);
     g.fillText(fmtM((lo - sea) / v), 3, Hh - 2);
     g.textAlign = 'right'; g.fillText(fmtM(S / v), W - 3, Hh - 2); g.textAlign = 'left';
@@ -985,6 +1050,26 @@ export function createVectorLayer(C) {
     }
     note.textContent = (b.stale ? 'EDITED since the save — this is the SAVED road’s bake; Save to re-bake. ' : '') + line;
     note.classList.toggle('bad', !!b.stale);
+  }
+
+  /** No engine bake yet: the HEIGHT PLANE under the current centreline (the
+   *  path a save would grade), so the chart still shows the bent route. */
+  function liveGround(g, o, W, Hh) {
+    if (!C.heightAt) return;
+    const cl = roadCentreline(o), A = vertexArcs(cl), L = A[A.length - 1] || 0;
+    if (cl.length < 2 || L <= 0) return;
+    const n = Math.min(300, Math.max(2, Math.ceil(L / 8))), hs = [];
+    for (let i = 0; i <= n; i++) { const p = pointAtArc(cl, L * i / n); hs.push(C.heightAt(p[0], p[1])); }
+    let lo = Math.min(...hs), hi = Math.max(...hs);
+    if (hi - lo < 20) { const m = (hi + lo) / 2; hi = m + 10; lo = m - 10; }
+    g.fillStyle = '#2a362a';
+    for (let i = 0; i < n; i++) {
+      const x0 = Math.round(4 + i / n * (W - 8)), x1 = Math.max(x0 + 1, Math.round(4 + (i + 1) / n * (W - 8)));
+      const y = Math.round(Hh - 14 - (hs[i] - lo) / (hi - lo) * (Hh - 28));
+      g.fillRect(x0, y, x1 - x0, Hh - 12 - y);
+    }
+    g.fillStyle = '#c7d2e3';
+    for (const a of knotArcs(o)) g.fillRect(Math.round(4 + a / L * (W - 8)), Hh - 11, 1, 4);
   }
 
   return {

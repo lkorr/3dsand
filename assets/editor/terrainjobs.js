@@ -23,9 +23,13 @@
  *       stream power on the ground as it is (terraingen.erodeGrid), on a proxy
  *       with the change brought back (hydrology.viaProxy); droplet = the old
  *       particle erosion (erosion.js) on the posts.
+ *   {job: 'rivers', grid, seaY, threshold (cells), minLength}
+ *       the channel network for the River tool's "derive" (hydrology.rivers).
  *   {job: 'flow', grid, seaY}
  *       drainage area (D8 on the epsilon-filled surface) and lake depth
  *       (Priority-Flood fill minus the ground) for the overlays.
+ *   {job: 'rivers', grid, seaY, threshold (cells), minLength}
+ *       the channel network for the River tool's "derive" (hydrology.rivers).
  *
  * Results: {h (Float32Array, same w x hh as the grid unless `coarse`), coarse:
  * {w, hh, x0, z0, cell} when the result is a proxy, ...extras}. */
@@ -111,6 +115,15 @@ export function runJob(J, progress = null) {
       for (let n = 0; n < A.length; n++) { A[n] = F.A[n]; depth[n] = Math.max(0, lakeF[n] - G.h[n]); }
       if (progress) progress(1);
       return {A, depth};
+    }
+    case 'rivers': {
+      // E2 "derive rivers": the D8 channel network on the grid (usually a
+      // proxy), source -> mouth polylines in GRID units with A per point;
+      // riverbake.derivedToRecords turns them into rivers[] records.
+      const F = HY.flow(G.h, G.w, G.hh, G.cell, {seaY: sea});
+      const list = HY.rivers(G.h, G.w, G.hh, G.cell, {flow: F, threshold: Math.max(2, J.threshold | 0), minLength: J.minLength || 4});
+      if (progress) progress(1);
+      return {list: list.map(r => ({id: r.id, joins: r.joins, mouth: r.mouth, A: r.A, line: r.line}))};
     }
     default: throw new Error('unknown job ' + J.job);
   }
