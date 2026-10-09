@@ -1817,7 +1817,8 @@ and its **half-width** (crest to the foot of the mountains, m; `[` `]` scale
 it), and the **profile**. On the map a range is an amber crest line with a
 triangle per knot and dotted lines at its feet; the selected range shows each
 knot's height and a small **diamond** beside each knot. Drag a knot to move it,
-drag its diamond to set that knot's half-width, click the selected crest to
+**Alt+drag** it up or down to set its crest height (5 m a pixel), drag its
+diamond to set that knot's half-width, click the selected crest to
 insert a knot there, shift+click a knot to delete it. The crest is a smooth
 spline through the knots (the same centripetal Catmull-Rom the engine uses for
 smooth roads and rivers, `assets/editor/spline.js`).

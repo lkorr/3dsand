@@ -76,6 +76,20 @@
  * (waynodes), and a 3D WorldView under the map edits the locale's OWN voxel
  * layer. One undo stack still: a refs batch is undone by its inverse commands.
  *
+ * THE WORLDBUILDER (docs/PLAN_worldbuilder.md K1): every tool is one
+ * registerTool({...}) in the registry (maptools.js) -- the built-ins below,
+ * and the layers': RANGE (maprange.js: a mountain range from a spline of crest
+ * height + half-width knots, live preview, bake = terraingen.rangeBake in the
+ * terrain worker, map.json ranges[]), the GENERATE panel (mapgen.js:
+ * Azgaar-style templates over the map or the Area, landforms by the Area),
+ * MEASURE and the overlays (mapoverlay.js: slope bands, flow, lakes, km grid,
+ * minimap). Whole-window work runs as terrainjobs.js jobs in
+ * terrain_worker.js (one main job with the progress bar under the toolbar,
+ * quiet preview jobs beside it); a generator's result waits in the plane as a
+ * PENDING preview (Commit = one undo step, Discard). The Height brush takes a
+ * MASK (land / sea / height band / slope band) and the Erode panel has the
+ * stream-power passes (landscape / incise) beside the droplet one.
+ *
  * Input: left-drag paints / places with the active tool, right- or
  * middle-drag pans, wheel zooms about the cursor, [ ] resize the brush,
  * Alt+click with the height or biome brush picks the value under the cursor,
@@ -109,7 +123,7 @@ let H = null;
 let els = {};
 let map = null;            // {name, json, H: height plane, B: biome plane} (maptiles.js planes)
 let dirty = false;
-let tool = 'height';       // height | biome | pad | spawn | stamp | water | tree | clearing | soften | site | sculpt | road | region | marker | locale | structure | waylink
+let tool = 'height';       // the active tool: a registry key (REG.keys(): site, height, shape, line, range, area, biome, sculpt, road, ...)
 let VL = null;             // the vector layers (mapvector.js): roads, regions, markers
 let LC = null;             // the locales (maplocale.js): markers + bounds, and the locale page
 let RL = null;             // the mountain ranges (maprange.js): ranges[] splines, preview, bake

@@ -91,7 +91,8 @@ export function createRangeLayer(C) {
         }
         if (st.drawing && r === r0 && k === knots(r).length - 1 && k > 0) { finish(); return true; }
         st.sel = r.id;
-        st.drag = {r, k, kind: 'knot', snap: C.snapshot(), moved: false};
+        // Alt+drag: the knot's CREST HEIGHT follows the mouse up / down (5 m a pixel)
+        st.drag = {r, k, kind: ev.altKey ? 'crest' : 'knot', snap: C.snapshot(), moved: false, y0: ev.clientY, c0: p[2]};
         sync(); C.paint();
         return true;
       }
@@ -134,6 +135,7 @@ export function createRangeLayer(C) {
     const p = knots(d.r)[d.k];
     if (!p) return;
     if (d.kind === 'knot') { p[0] = Math.round(fx); p[1] = Math.round(fz); }
+    else if (d.kind === 'crest') p[2] = Math.round(d.c0 + (d.y0 - ev.clientY) * 5 * v());
     else p[3] = Math.max(Math.round(C.map().H.sp * 4), Math.round(Math.hypot(fx - p[0], fz - p[1])));
     d.moved = true;
     if (d.r.baked) d.r.baked = false;
@@ -427,8 +429,14 @@ export function createRangeLayer(C) {
 
   C.registerTool({
     key: 'range', label: 'Range', group: 'height', order: 35,
-    title: 'MOUNTAIN RANGE from a spline: click along the crest (double-click / Enter ends); each knot has a crest height and a half-width (drag its diamond); peaks, spurs, foothills and erosion in the Ranges panel; live preview, then Bake',
+    title: 'MOUNTAIN RANGE from a spline: click along the crest (double-click / Enter ends); each knot has a crest height (Alt+drag it up / down) and a half-width (drag its diamond); peaks, spurs, foothills and erosion in the Ranges panel; live preview, then Bake',
     opts: optsStrip, down, move, up, paint, cursor,
+    statusAt() {
+      const d = st.drag;
+      if (!d || d.kind === 'knot') return null;
+      const p = knots(d.r)[d.k];
+      return p ? `${d.r.id} knot ${d.k}: ` + (d.kind === 'crest' ? `crest ${C.fmtM((p[2] - sea()) / v())} above sea` : `half-width ${C.fmtM(p[3] / v())}`) : null;
+    },
     resize(f) { NEW.widthM = Math.max(100, Math.min(30000, Math.round(NEW.widthM * f / 50) * 50)); },
     onKey(ev) {
       if ((ev.key === 'Enter' || ev.key === 'Escape') && st.drawing) { finish(); return true; }
@@ -437,7 +445,7 @@ export function createRangeLayer(C) {
     dblclick() { if (!st.drawing) return false; finish(); return true; },
     guide: ['Range — a mountain range from a spline',
       'Draws a real mountain range: a crest with peaks and saddles, side ridges (spurs) with valleys between them, foothills fading out, and stream-power erosion that grows branching (dendritic) valleys up to a jagged crest. The heights are the knots’ crest heights; the range only raises the ground.',
-      'Click along the crest to add knots (double-click / Enter ends). Each knot: drag it to move it, drag its diamond to set the half-width (crest to foot), shift+click deletes it; click the selected crest to insert one. The Ranges panel sets each knot’s crest (m above sea) and width, the profile, the seed and the peaks / spurs / foothills / erode / wander sliders. With "live preview" on, every change redraws a coarse version over the map. Bake writes it into the height plane (a worker with a progress bar; one undo step); Rebake replaces this session’s bake, Unbake takes it out.',
+      'Click along the crest to add knots (double-click / Enter ends). Each knot: drag it to move it, Alt+drag it up / down to set its crest height (5 m a pixel), drag its diamond to set the half-width (crest to foot), shift+click deletes it; click the selected crest to insert one. The Ranges panel sets each knot’s crest (m above sea) and width, the profile, the seed and the peaks / spurs / foothills / erode / wander sliders. With "live preview" on, every change redraws a coarse version over the map. Bake writes it into the height plane (a worker with a progress bar; one undo step); Rebake replaces this session’s bake, Unbake takes it out.',
       'Editor-only: map.json ranges[] keeps the spline so you can rebake; the game reads only the baked heights. The preview runs at ~51 m, the bake at 25.6 m brought to the 6.4 m posts with rock detail. A wide range (a 10 km crest, 3 km half-width) bakes in about 5-10 s. Rebake / Unbake reach only a bake made this session.'],
     sync,
   });
