@@ -87,6 +87,11 @@ import * as HS from './heightshapes.js';
 import * as VEC from './mapvector.js';
 import * as LOC from './maplocale.js';
 import {buildLegend, buildToolGuide} from './maplegend.js';
+import {createToolRegistry} from './maptools.js';
+import * as TG from './terraingen.js';
+import {createRangeLayer} from './maprange.js';
+import {createGenLayer} from './mapgen.js';
+import {createOverlayLayer} from './mapoverlay.js';
 
 // Display colours by biome NAME; anything unknown gets a stable hash colour.
 const COLOR = {
@@ -107,8 +112,14 @@ let dirty = false;
 let tool = 'height';       // height | biome | pad | spawn | stamp | water | tree | clearing | soften | site | sculpt | road | region | marker | locale | structure | waylink
 let VL = null;             // the vector layers (mapvector.js): roads, regions, markers
 let LC = null;             // the locales (maplocale.js): markers + bounds, and the locale page
-// The tools of the LOCALE page (a locale open); every other tool is the world's.
-const LOCALE_TOOLS = ['site', 'sculpt', 'clearing', 'soften', 'tree', 'water', 'structure', 'waylink'];
+let RL = null;             // the mountain ranges (maprange.js): ranges[] splines, preview, bake
+let GL = null;             // the generators (mapgen.js): templates + landforms over the map / the Area
+let OL = null;             // the overlays (mapoverlay.js): slope / flow / lakes / grid / minimap + the Measure tool
+// THE TOOL REGISTRY (maptools.js): every tool, built-in or a layer's, is one
+// registerTool({...}) call; `locale: true` puts it on the LOCALE page (a
+// locale open), `world: false` keeps it off the world map.
+const REG = createToolRegistry();
+export const registerTool = t => REG.registerTool(t);
 let savedJson = null;      // map.json as last loaded / saved: the profile chart says when a road differs from its bake
 // P-G: the terrain block map.json carries. Its DEFAULTS (what a map missing a
 // key gets) have one copy, src/sim/worldmap.h TerrainParams, which the tuner
@@ -174,7 +185,10 @@ let waterDrag = null;      // {site, dx, dz}: dragging any site's `at`
 // so a stroke's weight does not depend on mouse speed. Height `strength` is a
 // percent: raise / lower move the centre by strength% of radius/10 per dab (a
 // 1 km brush at 50% = 50 m a dab); set / smooth go strength% of the way.
-let brush = {radiusM: 200, spacing: 25, strength: 30, mode: 'raise', targetM: 0, index: 0};
+let brush = {radiusM: 200, spacing: 25, strength: 30, mode: 'raise', targetM: 0, index: 0,
+             // the MASK every height-brush mode honours (maptiles.maskWeights): lo / hi / soft
+             // are metres above the sea for a height band, degrees for a slope band
+             mask: {kind: 'none', lo: 0, hi: 600, soft: 10}};
 const R_MIN_M = 1, R_MAX_M = 5000;
 // THE DISPLAY: topographic layer on/off, hillshade, contours (interval in
 // metres, 0 = auto by zoom), the biome overlay's opacity (1 when the topo
@@ -216,7 +230,10 @@ let lines = {sel: null, drawing: false, kind: 'ridge', profile: 'round', widthM:
 let bakes = new Map();
 let area = null;           // the Area rectangle, world voxels [x0, z0, x1, z1], or null
 let areaDrag = null;
-let erosion = {iterations: 6, strength: 50, talusDeg: 38, seed: 1, hydraulic: true, thermal: true,
+// method: 'land' = the landscape-evolution stream-power pass (valleys grown into
+// the land, its heights kept), 'incise' = stream power cutting the ground as it
+// is, 'droplet' = particle water + thermal scree (an Area only)
+let erosion = {method: 'land', iterations: 6, strength: 50, talusDeg: 38, seed: 1, hydraulic: true, thermal: true,
                running: null, pending: null, progress: 0};
 let pngIn = null;          // the decoded PNG waiting in the import dialog
 /** The box site (clearing / soften) whose BOX holds world column (wx, wz), the last drawn first. */
@@ -450,6 +467,7 @@ function restore(s) {
   if (!lines.sel) lines.drawing = false;
   syncTerrain(); syncSites(); syncEditSel(); publishTerrain(); syncLines();
   if (VL) VL.afterRestore();
+  if (RL) RL.afterRestore();
   if (LC) LC.afterRestore();
 }
 function pushUndo(e) { undo.push(e); if (undo.length > 60) undo.shift(); redo = []; }
@@ -533,6 +551,10 @@ async function loadMap(name) {
   lines.sel = null; lines.drawing = false; lines.drag = null;
   savedJson = saved;
   if (VL) VL.reset();
+  if (RL) RL.reset();
+  if (GL) GL.reset();
+  if (OL) OL.reset();
+  preview = null;
   if (LC) LC.reset();
   if (els.heightsBtn) els.heightsBtn.classList.remove('on');
   brush.index = Math.min(brush.index, json.biomes.length - 1);
@@ -783,6 +805,8 @@ function stopsLut(stops) {
   return lut;
 }
 const LAND_LUT = stopsLut(LAND_STOPS), SEA_LUT = stopsLut(SEA_STOPS);
+// the slope-band overlay's colours: walkable, steep, cliff (maplegend.js draws the same)
+const SLOPE_COL = [[92, 160, 80], [214, 180, 72], [200, 80, 60]];
 // The ramp's range: the height plane's real min / max (plus the backdrop's,
 // when shown). Recomputed when it is null and no stroke is running, so a
 // stroke that climbs past the max does not rebuild every tile per dab.
@@ -861,14 +885,20 @@ function heightImage(P, tx, tz, L, old, style) {
     }
   const c = tileCanvas(old, n), ctx = c.getContext('2d');
   const im = ctx.createImageData(n, n), d = im.data;
-  const {lo, hi, sea, I, shade, contours} = style;
+  const {lo, hi, sea, I, shade, contours, slope} = style;
   const sp2 = 2 * (P.sp << L), ex = 1.5;
   const col = [0, 0, 0];
   let cpx = 0;
   for (let j = 0; j < vz; j++)
     for (let i = 0; i < vx; i++) {
       const o = (j + 1) * W + i + 1, h = g[o];
-      rampColor(h, lo, hi, sea, col);
+      if (slope && h >= sea) {
+        // THE SLOPE BANDS (mapoverlay.js): walkable / steep / cliff by the game's limits
+        const gx = (g[o + 1] - g[o - 1]) / sp2, gz = (g[o + W] - g[o - W]) / sp2;
+        const deg = Math.atan(Math.sqrt(gx * gx + gz * gz)) * 57.29577951308232;
+        const c = deg >= slope[1] ? SLOPE_COL[2] : deg >= slope[0] ? SLOPE_COL[1] : SLOPE_COL[0];
+        col[0] = c[0]; col[1] = c[1]; col[2] = c[2];
+      } else rampColor(h, lo, hi, sea, col);
       let k2 = 1;
       if (shade) {
         // normal of (x, h, z) with exaggeration ex, lit from the north-west, 45 degrees up
@@ -976,8 +1006,9 @@ function paint() {
   ctx.imageSmoothingEnabled = false;
   const [lo, hi] = rampRange();
   const sea = seaY(), I = contourInterval();
-  const style = {lo, hi, sea, I, shade: disp.shade, contours: disp.contours};
-  const styleKey = [range.ver, lo, hi, sea, I, disp.shade, disp.contours].join(',');
+  const slope = disp.overlay === 'slope' ? (disp.slopeBands || [35, 68]) : null;
+  const style = {lo, hi, sea, I, shade: disp.shade, contours: disp.contours, slope};
+  const styleKey = [range.ver, lo, hi, sea, I, disp.shade, disp.contours, slope ? slope.join('/') : ''].join(',');
   let missing = [];
   if (disp.topo) {
     const P = map.H;
@@ -1005,8 +1036,10 @@ function paint() {
     ctx.globalAlpha = 1;
   }
   paintSculpt(ctx);
+  paintPreview(ctx);
   paintFrame(ctx);
   paintLines(ctx);
+  REG.each('paint', [ctx]);
   if (VL) VL.paint(ctx);
   if (LC) LC.paint(ctx);
   paintArea(ctx);
@@ -1116,29 +1149,19 @@ function paintSites(ctx) {
     ctx.beginPath(); ctx.arc(SX(at[0]), SZ(at[1]), 10, 0, Math.PI * 2); ctx.stroke();
   }
 }
-/** The brush outline of the active plane / sculpt brush, at the cursor. */
-function paintCursor(ctx) {
-  if (!els.hoverW) return;
-  const [wx, wz] = els.hoverW;
-  if (tool === 'shape') { paintShapeCursor(ctx, wx, wz); return; }
-  let r = null, colr = 'rgba(255,255,255,0.8)';
-  if (tool === 'sculpt') {
-    r = sculpt.radius;
-    colr = sculpt.mode === 'lower' ? 'rgba(120,180,255,0.9)' : sculpt.mode === 'raise' ? 'rgba(255,170,90,0.9)' : colr;
-  } else if (tool === 'height') {
-    r = Math.max(brushVox(), map.H.sp);
-    colr = brush.mode === 'lower' ? 'rgba(120,180,255,0.9)' : brush.mode === 'raise' ? 'rgba(255,170,90,0.9)' : colr;
-  } else if (tool === 'biome') r = brushVox();
-  if (r == null) return;
+/** A brush outline at the cursor: the radius circle, and a dashed half-radius
+ *  ring for the falloff brushes. */
+function brushCursor(ctx, wx, wz, r, colr, inner) {
   const sx = SX(wx), sz = SZ(wz), rp = Math.max(2, r * view.scale);
   ctx.strokeStyle = colr; ctx.lineWidth = 1;
   ctx.beginPath(); ctx.arc(sx, sz, rp, 0, Math.PI * 2); ctx.stroke();
-  if (tool !== 'biome') { ctx.setLineDash([2, 3]); ctx.beginPath(); ctx.arc(sx, sz, Math.max(1, rp * 0.5), 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]); }
-  else {
-    // the biome brush paints whole cells: outline the one under the cursor
-    const P = map.B, i = Math.floor((wx - P.min[0]) / P.sp), j = Math.floor((wz - P.min[1]) / P.sp);
-    ctx.strokeRect(SX(P.min[0] + i * P.sp), SZ(P.min[1] + j * P.sp), P.sp * view.scale, P.sp * view.scale);
-  }
+  if (inner) { ctx.setLineDash([2, 3]); ctx.beginPath(); ctx.arc(sx, sz, Math.max(1, rp * 0.5), 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]); }
+}
+/** The active tool's cursor at the hover column (the registry's `cursor`). */
+function paintCursor(ctx) {
+  if (!els.hoverW) return;
+  const [wx, wz] = els.hoverW;
+  REG.call(tool, 'cursor', ctx, wx, wz);
 }
 function fit() {
   if (!map || !els.canvas) return;
@@ -1175,6 +1198,14 @@ function worldAtF(ev) {
 /** The world column under the cursor, whole voxels. */
 function worldColumnAt(ev) { const [x, z] = worldAtF(ev); return [Math.round(x), Math.round(z)]; }
 const brushVox = () => brush.radiusM * vpm();
+/** The brush mask in the plane's units (maptiles.maskWeights): heights in
+ *  absolute voxels, slopes in degrees; null = no mask. */
+function brushMask() {
+  const m = brush.mask, v = vpm();
+  if (!m || m.kind === 'none') return null;
+  if (m.kind === 'slope') return {kind: 'slope', lo: m.lo, hi: m.hi, soft: Math.max(0.5, m.soft)};
+  return {kind: m.kind, seaY: seaY(), lo: seaY() + m.lo * v, hi: seaY() + m.hi * v, soft: Math.max(1, m.soft * v)};
+}
 /** One dab of the active plane brush at world (wx, wz); returns true if it changed anything. */
 function planeDab(wx, wz) {
   let r;
@@ -1184,7 +1215,8 @@ function planeDab(wx, wz) {
                target: brush.mode === 'flatten' ? stroke.flatT : seaY() + brush.targetM * v,
                step: hb.stepM * v, sharp: hb.sharp / 100, datum: seaY(),
                amp: hb.ampM * v, size: hb.sizeM * v, seed: hb.seed, style: hb.style,
-               erosion: {iterations: 2, strength: 0.8, seed: hb.seed, talusDeg: erosion.talusDeg}, stroke: stroke.ctx};
+               erosion: {iterations: 2, strength: 0.8, seed: hb.seed, talusDeg: erosion.talusDeg}, stroke: stroke.ctx,
+               mask: brushMask()};
     if (!stroke.tiles.height) stroke.tiles.height = new Map();
     r = MT.heightDab(map.H, wx, wz, o, stroke.tiles.height);
     if (r.tooBig) status('the erode BRUSH works up to about ' + fmtM(Math.sqrt(MT.ERODE_BRUSH_MAX_POSTS) * map.H.sp / 2 / v) +
@@ -1209,6 +1241,406 @@ function siteCentre(s) {
   if ((s.kind === 'pad' || s.kind === 'clearing' || s.kind === 'soften') && Array.isArray(s.min) && Array.isArray(s.max)) return boxCentre(s);
   return siteXZ(s);
 }
+/* ---- THE TOOLS (maptools.js registry): every tool is declared in ONE place,
+ * registerTool({key, label, group, opts, down, move, up, cursor, key, ...});
+ * the toolbar, the options strip, the pointer / key / double-click routing,
+ * the cursor and the tool guide all come from the registry. A layer
+ * (mapvector, maplocale, maprange, mapgen, mapoverlay) registers its own
+ * through the context it is handed (C.registerTool). */
+/** The plane brushes' drag: dabs every `spacing` % of the radius. */
+function planeMove(fx, fz) {
+  if (!stroke || !stroke.tiles) return;
+  const P = tool === 'height' ? map.H : map.B;
+  const gap = Math.max(P.sp * 0.5, Math.max(brushVox(), tool === 'height' ? P.sp : 0) * brush.spacing / 100);
+  let [lx, lz] = lastDab;
+  let d = Math.hypot(fx - lx, fz - lz);
+  while (d >= gap) {
+    lx += (fx - lx) * gap / d; lz += (fz - lz) * gap / d;
+    if (planeDab(lx, lz)) stroke.changed = true;
+    d = Math.hypot(fx - lx, fz - lz);
+  }
+  lastDab = [lx, lz];
+}
+function planeDown(ev, wx, wz) {
+  if (ev.altKey) {
+    // pick: the height (into the set target) or the biome under the cursor
+    if (tool === 'height') { brush.targetM = Math.round((MT.heightAt(map.H, wx, wz) - seaY()) / vpm() * 10) / 10; brush.mode = 'set'; }
+    else brush.index = MT.biomeAt(map.B, wx, wz);
+    syncControls(); rebuildPalette(); paint();
+    return true;
+  }
+  stroke = {tiles: {}, changed: false, ctx: {}, flatT: MT.heightAt(map.H, wx, wz)};
+  lastDab = [wx, wz];
+  if (planeDab(wx, wz)) stroke.changed = true;
+  paint();
+  return true;
+}
+const sitesOf = () => map.json.sites || (map.json.sites = []);
+function registerBuiltinTools() {
+  const R = REG.registerTool;
+  R({key: 'site', label: 'Select', group: 'select', order: 0, locale: true,
+     title: 'click a site marker of any kind to select it in the Sites panel',
+     down(ev) {
+       const [wx, wz] = worldColumnAt(ev);
+       selected = siteAt(wx, wz);
+       syncSites(); paint();
+       return true;
+     }});
+  R({key: 'height', label: 'Height', group: 'height', order: 10,
+     title: 'paint the AUTHORED HEIGHT plane in metres: raise / lower / smooth / flatten / set / terrace / noise / erode (left-drag; Alt+click picks the height under the cursor into Set); the mask limits it to land, sea, a height band or a slope band',
+     opts: () => els.optHeight,
+     down: planeDown, move: (ev, fx, fz) => planeMove(fx, fz),
+     cursor: (ctx, wx, wz) => brushCursor(ctx, wx, wz, Math.max(brushVox(), map.H.sp),
+       brush.mode === 'lower' ? 'rgba(120,180,255,0.9)' : brush.mode === 'raise' ? 'rgba(255,170,90,0.9)' : 'rgba(255,255,255,0.8)', true),
+     resize: f => { brush.radiusM = Math.max(R_MIN_M, Math.min(R_MAX_M, brush.radiusM * f)); }});
+  R({key: 'shape', label: 'Shape', group: 'height', order: 20,
+     title: 'click: stamp a landform into the height plane -- peak, ridge, basin, plateau, volcano, mesa ([ ] radius, , . rotate)',
+     opts: () => els.optShape,
+     down(ev, wx, wz) { stampShape(wx, wz); paint(); return true; },
+     cursor: paintShapeCursor,
+     resize: f => { shape.radiusM = Math.max(10, Math.min(R_MAX_M, Math.round(shape.radiusM * f))); },
+     onKey(ev) {
+       if (ev.key !== ',' && ev.key !== '.') return false;
+       shape.rot = ((shape.rot + (ev.key === '.' ? 15 : -15)) % 360 + 360) % 360;
+       syncControls(); paint();
+       return true;
+     }});
+  R({key: 'line', label: 'Line', group: 'height', order: 30,
+     title: 'RIDGE / VALLEY lines: click to draw (double-click / Enter ends), drag a vertex, click a segment to insert, shift+click a vertex to delete; Bake in the Height tools panel',
+     opts: () => els.optLine,
+     down(ev) { linePointerDown(ev); paint(); return true; },
+     move(ev) {
+       if (!lines.drag) return;
+       const [wx, wz] = worldColumnAt(ev);
+       const p = lines.drag.line.points[lines.drag.k];
+       p[0] = wx; p[1] = wz;
+       lines.drag.moved = true;
+       lineEdited(lines.drag.line);
+       syncLines();
+     },
+     up() {
+       if (!lines.drag) return;
+       if (lines.drag.moved && lines.drag.snap) pushUndo(lines.drag.snap);
+       if (lines.drag.moved) markDirty(true);
+       lines.drag = null;
+       syncLines();
+     },
+     resize: f => { lines.widthM = Math.max(5, Math.min(R_MAX_M, Math.round(lines.widthM * f))); },
+     onKey(ev) {
+       if ((ev.key !== 'Enter' && ev.key !== 'Escape') || !lines.drawing) return false;
+       lines.drawing = false;
+       syncLines(); paint();
+       return true;
+     },
+     dblclick() {
+       // a double click ends the line being drawn (its second click added a
+       // vertex on top of the first: drop it)
+       if (!lines.drawing || !lines.sel) return false;
+       const pts = lines.sel.points;
+       if (pts.length >= 2) {
+         const a = pts[pts.length - 1], b = pts[pts.length - 2];
+         if (Math.hypot((a[0] - b[0]) * view.scale, (a[1] - b[1]) * view.scale) < 4) pts.pop();
+       }
+       lines.drawing = false;
+       syncLines(); paint();
+       return true;
+     }});
+  R({key: 'area', label: 'Area', group: 'height', order: 40,
+     title: 'drag: the AREA the Height tools / Generate panels erode, generate into and export / import as PNG; shift+click clears it',
+     opts: () => els.optArea,
+     down(ev) {
+       const [wx, wz] = worldColumnAt(ev);
+       if (ev.shiftKey) { area = null; syncHeightTools(); paint(); return true; }
+       areaDrag = {x0: wx, z0: wz};
+       area = [wx, wz, wx, wz];
+       return true;
+     },
+     move(ev) {
+       if (!areaDrag) return;
+       const [wx, wz] = worldColumnAt(ev);
+       area = [Math.min(areaDrag.x0, wx), Math.min(areaDrag.z0, wz), Math.max(areaDrag.x0, wx), Math.max(areaDrag.z0, wz)];
+     },
+     up() {
+       if (!areaDrag) return;
+       areaDrag = null;
+       // a click is not an area
+       if (area && (area[2] - area[0] < map.H.sp || area[3] - area[1] < map.H.sp)) area = null;
+       syncHeightTools();
+     }});
+  R({key: 'biome', label: 'Biome brush', group: 'paint', order: 10,
+     title: 'paint the selected biome (left-drag; Alt+click picks the biome under the cursor)',
+     opts: () => els.optBiome,
+     down: planeDown, move: (ev, fx, fz) => planeMove(fx, fz),
+     cursor(ctx, wx, wz) {
+       brushCursor(ctx, wx, wz, brushVox(), 'rgba(255,255,255,0.8)', false);
+       // the biome brush paints whole cells: outline the one under the cursor
+       const P = map.B, i = Math.floor((wx - P.min[0]) / P.sp), j = Math.floor((wz - P.min[1]) / P.sp);
+       ctx.strokeRect(SX(P.min[0] + i * P.sp), SZ(P.min[1] + j * P.sp), P.sp * view.scale, P.sp * view.scale);
+     },
+     resize: f => { brush.radiusM = Math.max(R_MIN_M, Math.min(R_MAX_M, brush.radiusM * f)); }});
+  R({key: 'sculpt', label: 'Sculpt', group: 'paint', order: 20, locale: true,
+     title: 'SCULPT the fine layer: raise / lower / smooth / flatten / erase the map’s height-offset layer (sculpt.svsculpt, 0.8 m samples), added after everything else',
+     opts: () => els.optSculpt,
+     down(ev, wx, wz) {
+       // THE SCULPT BRUSH (P5): the fine height-offset layer, not the plane.
+       if (sculpt.mode === 'flatten' && groundAt(wx, wz) == null) {
+         toast('Flatten levels to the ground under the cursor, so it needs the engine’s heights here: fetching them for this view — stroke again when they are drawn');
+         fetchHeights().catch(e => toast('heights: ' + e.message, true));
+         return true;
+       }
+       stroke = {sculptBefore: new Map(), changed: false};
+       sculpt.target = sculpt.mode === 'flatten' ? groundAt(wx, wz) : null;
+       sculpt.last = [wx, wz];
+       if (sculptDab(wx, wz, stroke.sculptBefore)) { stroke.changed = true; scheduleSculptPreview(); }
+       paint();
+       return true;
+     },
+     move(ev, fx, fz) {
+       if (!stroke || !stroke.sculptBefore) return;
+       const gap = Math.max(2, sculpt.radius * 0.25);
+       let [lx, lz] = sculpt.last;
+       let d = Math.hypot(fx - lx, fz - lz);
+       while (d >= gap) {
+         lx += (fx - lx) * gap / d; lz += (fz - lz) * gap / d;
+         if (sculptDab(lx, lz, stroke.sculptBefore)) stroke.changed = true;
+         d = Math.hypot(fx - lx, fz - lz);
+       }
+       sculpt.last = [lx, lz];
+       scheduleSculptPreview();
+     },
+     statusAt(fx, fz) {
+       const g = groundAt(fx, fz);
+       return `x ${fmtM(fx / vpm())}  z ${fmtM(fz / vpm())}  sculpt ${scAt(sculpt.tiles, fx, fz) >= 0 ? '+' : ''}${scAt(sculpt.tiles, fx, fz).toFixed(1)} vox` +
+              (g == null ? '  (no heights here: click Real terrain for the engine’s ground)' : `  ground ~y${Math.round(g)}`) +
+              `  layer: ${sculpt.tiles.size} tiles${sculpt.dirty ? ' (unsaved)' : ''}`;
+     },
+     cursor: (ctx, wx, wz) => brushCursor(ctx, wx, wz, sculpt.radius,
+       sculpt.mode === 'lower' ? 'rgba(120,180,255,0.9)' : sculpt.mode === 'raise' ? 'rgba(255,170,90,0.9)' : 'rgba(255,255,255,0.8)', true),
+     resize: f => { sculpt.radius = Math.max(8, Math.min(4096, Math.round(sculpt.radius * f))); }});
+  // the vector layers (mapvector.js) and the locales (maplocale.js) take their
+  // pointer, key and double-click events before the registry; they register
+  // here for the toolbar, the options strip and the guide
+  const vo = VL.toolOpts(), lo = LC.toolOpts();
+  R({key: 'road', label: 'Road', group: 'vector', order: 10, opts: () => vo.road,
+     title: 'ROADS (map.json roads[]: graded ground the engine builds): click to draw (double-click / Enter ends), drag a vertex, click the selected road to insert one, shift+click a vertex to delete; vertices SNAP onto other roads (junctions); Ctrl+click on a road starts a branch there; Alt = no snap'});
+  R({key: 'region', label: 'Region', group: 'vector', order: 20, opts: () => vo.region,
+     title: 'REGIONS (map.json regions[]: named polygons, data only): click out a polygon, click its first vertex to close; drag / insert / shift+click delete vertices like roads'});
+  R({key: 'marker', label: 'Marker', group: 'vector', order: 30, opts: () => vo.marker,
+     title: 'MARKERS (map.json markers[]: annotations with a pixel-art icon): click to place, drag to move, shift+click to delete'});
+  R({key: 'locale', label: 'Locale', group: 'locale', order: 10, opts: () => lo.locale,
+     title: 'LOCALES (map.json locales[]: hand-made places that ride their ground): drag out a new one’s bounds with the icon picked beside it; click one to select it; DOUBLE-CLICK opens it (the locale page)'});
+  R({key: 'structure', label: 'Structure', group: 'locale', order: 20, world: false, locale: true, opts: () => lo.structure,
+     title: 'STRUCTURES of this locale (structure refs, written through the F8 command layer): click places the picked blueprint, drag one to move it, R turns it, shift+click deletes it'});
+  R({key: 'waylink', label: 'Link', group: 'locale', order: 30, world: false, locale: true, opts: () => lo.waylink,
+     title: 'WAYNODE LINKS: click a waynode, then another, to join them (Shift or a second time parts them); click open ground for a new waynode joined to the last'});
+  R({key: 'pad', label: 'Pad box', group: 'site', order: 10, title: 'drag the calm pad box (world voxels)',
+     down(ev) {
+       const [wx, wz] = worldColumnAt(ev);
+       stroke = snapshot();
+       padDrag = {x0: wx, z0: wz};
+       return true;
+     },
+     move(ev) {
+       if (!padDrag) return;
+       const [wx, wz] = worldColumnAt(ev);
+       const s = (map.json.sites || []).find(s => s.kind === 'pad');
+       const box = {min: [Math.min(padDrag.x0, wx), Math.min(padDrag.z0, wz)],
+                    max: [Math.max(padDrag.x0, wx) - 1, Math.max(padDrag.z0, wz) - 1]};
+       if (s) { s.min = box.min; s.max = box.max; }
+       else map.json.sites = [...(map.json.sites || []), {id: 'harness', kind: 'pad', ...box}];
+       stroke.changed = true;
+     },
+     up() { padDrag = null; }});
+  R({key: 'spawn', label: 'Spawn', group: 'site', order: 20,
+     title: 'click: put the spawn site there (where the game starts; the calm home area centres on it). One per map.',
+     down(ev) {
+       // ONE per map (the loader refuses two), so this moves it
+       const [wx, wz] = worldColumnAt(ev);
+       const sites = sitesOf();
+       stroke = snapshot();
+       const s = sites.find(s => s.kind === 'spawn');
+       if (s) s.at = [wx, wz];
+       else sites.push({id: 'spawn', kind: 'spawn', at: [wx, wz]});
+       stroke.changed = true;
+       publishTerrain();
+       paint();
+       return true;
+     }});
+  R({key: 'stamp', label: 'Stamp site', group: 'site', order: 30, opts: () => els.optStamp,
+     title: 'click: place a stamp site (the template picked beside it, from assets/prefabs/); shift+click a marker: delete it',
+     down(ev) {
+       const [wx, wz] = worldColumnAt(ev);
+       const sites = sitesOf();
+       const grab = Math.max(6 / view.scale, 1);
+       const hit = sites.find(s => s.kind === 'stamp' && Math.abs(siteXZ(s)[0] - wx) <= Math.max(s.radius || 16, grab) &&
+                                   Math.abs(siteXZ(s)[1] - wz) <= Math.max(s.radius || 16, grab));
+       stroke = snapshot();
+       if (ev.shiftKey && hit) {
+         sites.splice(sites.indexOf(hit), 1);
+         stroke.changed = true;
+       } else if (!hit) {
+         if (!stamp.template) {
+           toast(stamp.templates.length ? 'pick a stamp template first' : 'no .vox under assets/prefabs/ to stamp', true);
+           stroke = null; return true;
+         }
+         const t = stamp.template, rot = stamp.rot & 3;
+         sites.push({id: t + '_' + sites.length, kind: 'stamp', template: t, at: [wx, wz], rot, padMargin: 8, salt: sites.length});
+         stroke.changed = true;
+       }
+       paint();
+       return true;
+     }});
+  R({key: 'water', label: 'Water', group: 'site', order: 40, locale: true, opts: () => els.optWater,
+     title: 'click: place an AUTHORED LAKE (a water preset at that column, same on every seed); drag a lake to move it; shift+click: delete it',
+     down(ev) {
+       const [wx, wz] = worldColumnAt(ev);
+       const sites = sitesOf();
+       const hit = sites.find(s => {
+         if (s.kind !== 'water' || !Array.isArray(s.at)) return false;
+         const g = water.geom[s.preset] || {radius: 60};
+         if (!LC.circleAllowed(s.at[0], s.at[1], (s.radius || g.radius) + (g.band || 0))) return false;
+         const r = Math.max(s.radius || g.radius, 6 / view.scale);
+         const dx = s.at[0] - wx, dz = s.at[1] - wz;
+         return dx * dx + dz * dz <= r * r;
+       });
+       if (!hit && !ev.shiftKey && LC.clipping()) {
+         const g = water.geom[water.preset] || {radius: 60, band: 24};
+         const rv = water.radiusM > 0 ? Math.round(water.radiusM * 10) : g.radius;
+         if (!LC.circleAllowed(wx, wz, rv + g.band)) { status('the lake and its shore would reach past the locale\'s bounds: place it further in, or make it smaller'); return true; }
+       }
+       stroke = snapshot();
+       if (ev.shiftKey && hit) {
+         sites.splice(sites.indexOf(hit), 1);
+         stroke.changed = true;
+       } else if (hit) {
+         waterDrag = {site: hit, dx: hit.at[0] - wx, dz: hit.at[1] - wz};
+       } else {
+         if (!water.preset) { toast('pick a water preset first', true); stroke = null; return true; }
+         const n = sites.filter(s => s.kind === 'water').length;
+         const s = {id: water.preset + '_' + n, kind: 'water', preset: water.preset, at: [wx, wz]};
+         if (water.radiusM > 0) s.radius = Math.round(water.radiusM * 10);
+         sites.push(s);
+         stroke.changed = true;
+       }
+       paint();
+       return true;
+     },
+     move: siteDragMove, up: () => { waterDrag = null; }});
+  R({key: 'tree', label: 'Tree', group: 'site', order: 50, locale: true, opts: () => els.optTree,
+     title: 'click: place an AUTHORED TREE on the ground at that column; drag a tree to move it; shift+click: delete it',
+     down(ev) {
+       const [wx, wz] = worldColumnAt(ev);
+       const sites = sitesOf();
+       const grab = Math.max(6, 8 / view.scale);   // ~8 px of marker
+       const hit = sites.find(s => s.kind === 'tree' && Array.isArray(s.at) && LC.pointAllowed(s.at[0], s.at[1]) &&
+                                   Math.hypot(s.at[0] - wx, s.at[1] - wz) <= grab);
+       if (!hit && !LC.pointAllowed(wx, wz)) { status('outside the locale: a tree goes inside its bounds'); return true; }
+       stroke = snapshot();
+       if (ev.shiftKey && hit) {
+         sites.splice(sites.indexOf(hit), 1);
+         if (selected === hit) selected = null;
+         stroke.changed = true;
+       } else if (hit) {
+         selected = hit;
+         waterDrag = {site: hit, dx: hit.at[0] - wx, dz: hit.at[1] - wz};
+       } else {
+         if (!trees.species) { toast(trees.list.length ? 'pick a tree species first' : 'no .svtree under assets/trees/', true); stroke = null; return true; }
+         const n = sites.filter(s => s.kind === 'tree').length;
+         const s = {id: trees.species + '_' + n, kind: 'tree', species: trees.species, at: [wx, wz]};
+         if (trees.variant >= 0) s.variant = trees.variant;
+         if (trees.rot >= 0) s.rot = trees.rot;
+         sites.push(s);
+         selected = s;
+         stroke.changed = true;
+       }
+       syncSites();
+       paint();
+       return true;
+     },
+     move: siteDragMove, up: () => { waterDrag = null; }});
+  for (const kind of ['clearing', 'soften']) {
+    R({key: kind, label: kind === 'clearing' ? 'Clearing' : 'Soften', group: 'site', order: kind === 'clearing' ? 60 : 70, locale: true,
+       opts: () => (kind === 'clearing' ? els.optClearing : null),
+       title: kind === 'clearing'
+         ? 'drag: draw a FOREST CLEARING (a box no tree crown reaches over); click one to select it, drag to move it; shift+click inside one: delete it'
+         : 'drag: draw SOFTENED GROUND (a box where the seeded hills, bumps and grain are kept at a percent -- a village’s ground); shift+click inside one: delete it',
+       down(ev) { boxSiteDown(ev, kind); return true; },
+       move: boxSiteMove, up: boxSiteUp});
+  }
+}
+/** Drag of a placed site (a lake, a tree): its `at` follows, clipped to an open locale. */
+function siteDragMove(ev) {
+  if (!waterDrag) return;
+  const [wx, wz] = worldColumnAt(ev);
+  const at = [wx + waterDrag.dx, wz + waterDrag.dz], s = waterDrag.site;
+  const g = water.geom[s.preset] || {radius: 60, band: 24};
+  const ok = s.kind === 'water' ? LC.circleAllowed(at[0], at[1], (s.radius || g.radius) + g.band) : LC.pointAllowed(at[0], at[1]);
+  if (ok) { s.at = at; stroke.changed = true; }
+}
+/** Clearing / Soften: drag on open map draws a new box; click inside one
+ *  selects it and a drag slides it; shift+click inside one deletes it. */
+function boxSiteDown(ev, kind) {
+  const [wx, wz] = worldColumnAt(ev);
+  const sites = sitesOf();
+  // a locale open: only boxes wholly inside it are its to edit
+  let hit = clearingAt(wx, wz, kind);
+  if (hit && !LC.boxEditable(hit)) hit = null;
+  if (!hit && !LC.pointAllowed(wx, wz)) { status('outside the locale: its tools edit inside its bounds only'); return; }
+  stroke = snapshot();
+  if (ev.shiftKey && hit) {
+    sites.splice(sites.indexOf(hit), 1);
+    if (selected === hit) selected = null;
+    stroke.changed = true;
+  } else if (hit) {
+    selected = hit;
+    clearDrag = {mode: 'move', site: hit, dx: hit.min[0] - wx, dz: hit.min[1] - wz,
+                 w: hit.max[0] - hit.min[0], h: hit.max[1] - hit.min[1]};
+  } else {
+    const n = sites.filter(s => s.kind === kind).length;
+    let id = kind + '_' + n;
+    for (let k = n; sites.some(s => s.id === id); k++) id = kind + '_' + (k + 1);
+    const s = kind === 'soften'
+      ? {id, kind, min: [wx, wz], max: [wx, wz], feather: Math.round(soften.feather), hills: soften.hills,
+         bumps: soften.bumps, grain: soften.grain, paths: soften.paths}
+      : {id, kind: 'clearing', min: [wx, wz], max: [wx, wz], feather: Math.round(clearing.feather)};
+    sites.push(s);
+    selected = s;
+    clearDrag = {mode: 'new', site: s, x0: wx, z0: wz};
+  }
+  syncSites();
+  paint();
+}
+function boxSiteMove(ev) {
+  if (!clearDrag) return;
+  const [wx, wz] = worldColumnAt(ev);
+  const s = clearDrag.site;
+  if (clearDrag.mode === 'new') {
+    s.min = [Math.min(clearDrag.x0, wx), Math.min(clearDrag.z0, wz)];
+    s.max = [Math.max(clearDrag.x0, wx), Math.max(clearDrag.z0, wz)];
+  } else {
+    s.min = [wx + clearDrag.dx, wz + clearDrag.dz];
+    s.max = [s.min[0] + clearDrag.w, s.min[1] + clearDrag.h];
+  }
+  // a locale open: the box (and its feather) stays inside the bounds
+  LC.clipBox(s, s.kind === 'soften' ? 96 : 64);
+  stroke.changed = true;
+  syncSites();
+}
+function boxSiteUp() {
+  if (clearDrag && clearDrag.mode === 'new') {
+    // A click without a drag is not a box: take the empty one back.
+    const s = clearDrag.site;
+    if (s.max[0] - s.min[0] < 8 || s.max[1] - s.min[1] < 8) {
+      const sites = map.json.sites || [];
+      if (sites.includes(s)) sites.splice(sites.indexOf(s), 1);
+      if (selected === s) selected = null;
+      if (stroke) stroke.changed = false;
+      toast('drag to draw a ' + (s.kind === 'soften' ? 'softened box' : 'clearing') + ' (at least 8 voxels a side; zoom in for voxel precision)');
+      syncSites();
+    } else if (stroke) stroke.changed = true;
+  }
+  clearDrag = null;
+}
 function wire() {
   const c = els.canvas;
   let panning = null;
@@ -1217,199 +1649,14 @@ function wire() {
     if (!map) return;
     c.setPointerCapture(ev.pointerId);
     if (ev.button === 1 || ev.button === 2) { panning = {x: ev.clientX, y: ev.clientY, cx: view.cx, cz: view.cz}; return; }
-    // an erosion preview is committed by the next edit of any kind
+    // an erosion / generate preview is committed by the next edit of any kind
     if (erosion.pending) commitErosion();
+    // a press any tool yields first (the minimap)
+    if (REG.each('early', [ev], true)) return;
     if (VL.pointerDown(ev)) return;
     if (LC.pointerDown(ev)) return;
-    if (tool === 'shape') {
-      const [wx, wz] = worldAtF(ev);
-      stampShape(wx, wz);
-      paint();
-      return;
-    }
-    if (tool === 'line') { linePointerDown(ev); paint(); return; }
-    if (tool === 'area') {
-      const [wx, wz] = worldColumnAt(ev);
-      if (ev.shiftKey) { area = null; syncHeightTools(); paint(); return; }
-      areaDrag = {x0: wx, z0: wz};
-      area = [wx, wz, wx, wz];
-      return;
-    }
-    if (tool === 'height' || tool === 'biome') {
-      const [wx, wz] = worldAtF(ev);
-      if (ev.altKey) {
-        // pick: the height (into the set target) or the biome under the cursor
-        if (tool === 'height') { brush.targetM = Math.round((MT.heightAt(map.H, wx, wz) - seaY()) / vpm() * 10) / 10; brush.mode = 'set'; }
-        else brush.index = MT.biomeAt(map.B, wx, wz);
-        syncControls(); rebuildPalette(); paint();
-        return;
-      }
-      stroke = {tiles: {}, changed: false, ctx: {}, flatT: MT.heightAt(map.H, wx, wz)};
-      lastDab = [wx, wz];
-      if (planeDab(wx, wz)) stroke.changed = true;
-      paint();
-      return;
-    }
-    if (tool === 'pad') {
-      const [wx, wz] = worldColumnAt(ev);
-      stroke = snapshot();
-      padDrag = {x0: wx, z0: wz};
-      return;
-    }
-    if (tool === 'clearing' || tool === 'soften') {
-      // drag on open map draws a new box; click inside one selects it and a
-      // drag slides it; shift+click inside one deletes it
-      const kind = tool;
-      const [wx, wz] = worldColumnAt(ev);
-      const sites = map.json.sites || (map.json.sites = []);
-      // a locale open: only boxes wholly inside it are its to edit
-      let hit = clearingAt(wx, wz, kind);
-      if (hit && !LC.boxEditable(hit)) hit = null;
-      if (!hit && !LC.pointAllowed(wx, wz)) { status('outside the locale: its tools edit inside its bounds only'); return; }
-      stroke = snapshot();
-      if (ev.shiftKey && hit) {
-        sites.splice(sites.indexOf(hit), 1);
-        if (selected === hit) selected = null;
-        stroke.changed = true;
-      } else if (hit) {
-        selected = hit;
-        clearDrag = {mode: 'move', site: hit, dx: hit.min[0] - wx, dz: hit.min[1] - wz,
-                     w: hit.max[0] - hit.min[0], h: hit.max[1] - hit.min[1]};
-      } else {
-        const n = sites.filter(s => s.kind === kind).length;
-        let id = kind + '_' + n;
-        for (let k = n; sites.some(s => s.id === id); k++) id = kind + '_' + (k + 1);
-        const s = kind === 'soften'
-          ? {id, kind, min: [wx, wz], max: [wx, wz], feather: Math.round(soften.feather), hills: soften.hills,
-             bumps: soften.bumps, grain: soften.grain, paths: soften.paths}
-          : {id, kind: 'clearing', min: [wx, wz], max: [wx, wz], feather: Math.round(clearing.feather)};
-        sites.push(s);
-        selected = s;
-        clearDrag = {mode: 'new', site: s, x0: wx, z0: wz};
-      }
-      syncSites();
-      paint();
-      return;
-    }
-    if (tool === 'spawn') {
-      // ONE per map (the loader refuses two), so this moves it
-      const [wx, wz] = worldColumnAt(ev);
-      const sites = map.json.sites || (map.json.sites = []);
-      stroke = snapshot();
-      const s = sites.find(s => s.kind === 'spawn');
-      if (s) s.at = [wx, wz];
-      else sites.push({id: 'spawn', kind: 'spawn', at: [wx, wz]});
-      stroke.changed = true;
-      publishTerrain();
-      paint();
-      return;
-    }
-    if (tool === 'stamp') {
-      const [wx, wz] = worldColumnAt(ev);
-      const sites = map.json.sites || (map.json.sites = []);
-      const grab = Math.max(6 / view.scale, 1);
-      const hit = sites.find(s => s.kind === 'stamp' && Math.abs(siteXZ(s)[0] - wx) <= Math.max(s.radius || 16, grab) &&
-                                  Math.abs(siteXZ(s)[1] - wz) <= Math.max(s.radius || 16, grab));
-      stroke = snapshot();
-      if (ev.shiftKey && hit) {
-        sites.splice(sites.indexOf(hit), 1);
-        stroke.changed = true;
-      } else if (!hit) {
-        if (!stamp.template) {
-          toast(stamp.templates.length ? 'pick a stamp template first' : 'no .vox under assets/prefabs/ to stamp', true);
-          stroke = null; return;
-        }
-        const t = stamp.template, rot = stamp.rot & 3;
-        sites.push({id: t + '_' + sites.length, kind: 'stamp', template: t, at: [wx, wz], rot, padMargin: 8, salt: sites.length});
-        stroke.changed = true;
-      }
-      paint();
-      return;
-    }
-    if (tool === 'sculpt') {
-      // THE SCULPT BRUSH (P5): the fine height-offset layer, not the plane.
-      const [wx, wz] = worldAtF(ev);
-      if (sculpt.mode === 'flatten' && groundAt(wx, wz) == null) {
-        toast('Flatten levels to the ground under the cursor, so it needs the engine’s heights here: fetching them for this view — stroke again when they are drawn');
-        fetchHeights().catch(e => toast('heights: ' + e.message, true));
-        return;
-      }
-      stroke = {sculptBefore: new Map(), changed: false};
-      sculpt.target = sculpt.mode === 'flatten' ? groundAt(wx, wz) : null;
-      sculpt.last = [wx, wz];
-      if (sculptDab(wx, wz, stroke.sculptBefore)) { stroke.changed = true; scheduleSculptPreview(); }
-      paint();
-      return;
-    }
-    if (tool === 'tree') {
-      const [wx, wz] = worldColumnAt(ev);
-      const sites = map.json.sites || (map.json.sites = []);
-      const grab = Math.max(6, 8 / view.scale);   // ~8 px of marker
-      const hit = sites.find(s => s.kind === 'tree' && Array.isArray(s.at) && LC.pointAllowed(s.at[0], s.at[1]) &&
-                                  Math.hypot(s.at[0] - wx, s.at[1] - wz) <= grab);
-      if (!hit && !LC.pointAllowed(wx, wz)) { status('outside the locale: a tree goes inside its bounds'); return; }
-      stroke = snapshot();
-      if (ev.shiftKey && hit) {
-        sites.splice(sites.indexOf(hit), 1);
-        if (selected === hit) selected = null;
-        stroke.changed = true;
-      } else if (hit) {
-        selected = hit;
-        waterDrag = {site: hit, dx: hit.at[0] - wx, dz: hit.at[1] - wz};
-      } else {
-        if (!trees.species) { toast(trees.list.length ? 'pick a tree species first' : 'no .svtree under assets/trees/', true); stroke = null; return; }
-        const n = sites.filter(s => s.kind === 'tree').length;
-        const s = {id: trees.species + '_' + n, kind: 'tree', species: trees.species, at: [wx, wz]};
-        if (trees.variant >= 0) s.variant = trees.variant;
-        if (trees.rot >= 0) s.rot = trees.rot;
-        sites.push(s);
-        selected = s;
-        stroke.changed = true;
-      }
-      syncSites();
-      paint();
-      return;
-    }
-    if (tool === 'site') {
-      const [wx, wz] = worldColumnAt(ev);
-      selected = siteAt(wx, wz);
-      syncSites();
-      paint();
-      return;
-    }
-    if (tool === 'water') {
-      const [wx, wz] = worldColumnAt(ev);
-      const sites = map.json.sites || (map.json.sites = []);
-      const hit = sites.find(s => {
-        if (s.kind !== 'water' || !Array.isArray(s.at)) return false;
-        const g = water.geom[s.preset] || {radius: 60};
-        if (!LC.circleAllowed(s.at[0], s.at[1], (s.radius || g.radius) + (g.band || 0))) return false;
-        const r = Math.max(s.radius || g.radius, 6 / view.scale);
-        const dx = s.at[0] - wx, dz = s.at[1] - wz;
-        return dx * dx + dz * dz <= r * r;
-      });
-      if (!hit && !ev.shiftKey && LC.clipping()) {
-        const g = water.geom[water.preset] || {radius: 60, band: 24};
-        const rv = water.radiusM > 0 ? Math.round(water.radiusM * 10) : g.radius;
-        if (!LC.circleAllowed(wx, wz, rv + g.band)) { status('the lake and its shore would reach past the locale\'s bounds: place it further in, or make it smaller'); return; }
-      }
-      stroke = snapshot();
-      if (ev.shiftKey && hit) {
-        sites.splice(sites.indexOf(hit), 1);
-        stroke.changed = true;
-      } else if (hit) {
-        waterDrag = {site: hit, dx: hit.at[0] - wx, dz: hit.at[1] - wz};
-      } else {
-        if (!water.preset) { toast('pick a water preset first', true); stroke = null; return; }
-        const n = sites.filter(s => s.kind === 'water').length;
-        const s = {id: water.preset + '_' + n, kind: 'water', preset: water.preset, at: [wx, wz]};
-        if (water.radiusM > 0) s.radius = Math.round(water.radiusM * 10);
-        sites.push(s);
-        stroke.changed = true;
-      }
-      paint();
-      return;
-    }
+    const [wx, wz] = worldAtF(ev);
+    REG.call(tool, 'down', ev, wx, wz);
   });
   c.addEventListener('pointermove', ev => {
     if (!map) return;
@@ -1423,107 +1670,19 @@ function wire() {
       VL.pointerMove(ev);
     } else if (LC.dragging() && ev.buttons & 1) {
       LC.pointerMove(ev);
-    } else if (areaDrag && ev.buttons & 1) {
-      const [wx, wz] = worldColumnAt(ev);
-      area = [Math.min(areaDrag.x0, wx), Math.min(areaDrag.z0, wz), Math.max(areaDrag.x0, wx), Math.max(areaDrag.z0, wz)];
-    } else if (lines.drag && ev.buttons & 1) {
-      const [wx, wz] = worldColumnAt(ev);
-      const p = lines.drag.line.points[lines.drag.k];
-      p[0] = wx; p[1] = wz;
-      lines.drag.moved = true;
-      lineEdited(lines.drag.line);
-      syncLines();
-    } else if (padDrag) {
-      const [wx, wz] = worldColumnAt(ev);
-      const s = (map.json.sites || []).find(s => s.kind === 'pad');
-      const box = {min: [Math.min(padDrag.x0, wx), Math.min(padDrag.z0, wz)],
-                   max: [Math.max(padDrag.x0, wx) - 1, Math.max(padDrag.z0, wz) - 1]};
-      if (s) { s.min = box.min; s.max = box.max; }
-      else map.json.sites = [...(map.json.sites || []), {id: 'harness', kind: 'pad', ...box}];
-      stroke.changed = true;
-    } else if (clearDrag && ev.buttons & 1) {
-      const [wx, wz] = worldColumnAt(ev);
-      const s = clearDrag.site;
-      if (clearDrag.mode === 'new') {
-        s.min = [Math.min(clearDrag.x0, wx), Math.min(clearDrag.z0, wz)];
-        s.max = [Math.max(clearDrag.x0, wx), Math.max(clearDrag.z0, wz)];
-      } else {
-        s.min = [wx + clearDrag.dx, wz + clearDrag.dz];
-        s.max = [s.min[0] + clearDrag.w, s.min[1] + clearDrag.h];
-      }
-      // a locale open: the box (and its feather) stays inside the bounds
-      LC.clipBox(s, s.kind === 'soften' ? 96 : 64);
-      stroke.changed = true;
-      syncSites();
-    } else if (waterDrag && ev.buttons & 1) {
-      const [wx, wz] = worldColumnAt(ev);
-      const at = [wx + waterDrag.dx, wz + waterDrag.dz], s = waterDrag.site;
-      const g = water.geom[s.preset] || {radius: 60, band: 24};
-      const ok = s.kind === 'water' ? LC.circleAllowed(at[0], at[1], (s.radius || g.radius) + g.band) : LC.pointAllowed(at[0], at[1]);
-      if (ok) { s.at = at; stroke.changed = true; }
-    } else if (stroke && stroke.sculptBefore && ev.buttons & 1) {
-      const gap = Math.max(2, sculpt.radius * 0.25);
-      let [lx, lz] = sculpt.last;
-      let d = Math.hypot(fx - lx, fz - lz);
-      while (d >= gap) {
-        lx += (fx - lx) * gap / d; lz += (fz - lz) * gap / d;
-        if (sculptDab(lx, lz, stroke.sculptBefore)) stroke.changed = true;
-        d = Math.hypot(fx - lx, fz - lz);
-      }
-      sculpt.last = [lx, lz];
-      scheduleSculptPreview();
-    } else if (stroke && stroke.tiles && ev.buttons & 1) {
-      // plane brush: dabs every `spacing` % of the radius along the drag
-      const P = tool === 'height' ? map.H : map.B;
-      const gap = Math.max(P.sp * 0.5, Math.max(brushVox(), tool === 'height' ? P.sp : 0) * brush.spacing / 100);
-      let [lx, lz] = lastDab;
-      let d = Math.hypot(fx - lx, fz - lz);
-      while (d >= gap) {
-        lx += (fx - lx) * gap / d; lz += (fz - lz) * gap / d;
-        if (planeDab(lx, lz)) stroke.changed = true;
-        d = Math.hypot(fx - lx, fz - lz);
-      }
-      lastDab = [lx, lz];
-    }
-    if (tool === 'sculpt') {
-      const g = groundAt(fx, fz);
-      status(`x ${fmtM(fx / vpm())}  z ${fmtM(fz / vpm())}  sculpt ${scAt(sculpt.tiles, fx, fz) >= 0 ? '+' : ''}${scAt(sculpt.tiles, fx, fz).toFixed(1)} vox` +
-             (g == null ? '  (no heights here: click Real terrain for the engine’s ground)' : `  ground ~y${Math.round(g)}`) +
-             `  layer: ${sculpt.tiles.size} tiles${sculpt.dirty ? ' (unsaved)' : ''}`);
-    } else status(readout(fx, fz));
+    } else if (ev.buttons & 1) {
+      REG.call(tool, 'move', ev, fx, fz);
+    } else REG.call(tool, 'hover', ev, fx, fz);
+    const st = REG.call(tool, 'statusAt', fx, fz);
+    status(st != null ? st : readout(fx, fz));
     schedulePaint();
   });
   const up = () => {
     panning = null;
     VL.pointerUp();
     LC.pointerUp();
-    padDrag = null;
-    if (areaDrag) {
-      areaDrag = null;
-      // a click is not an area
-      if (area && (area[2] - area[0] < map.H.sp || area[3] - area[1] < map.H.sp)) area = null;
-      syncHeightTools();
-    }
-    if (lines.drag) {
-      if (lines.drag.moved && lines.drag.snap) pushUndo(lines.drag.snap);
-      if (lines.drag.moved) markDirty(true);
-      lines.drag = null;
-      syncLines();
-    }
-    if (clearDrag && clearDrag.mode === 'new') {
-      // A click without a drag is not a box: take the empty one back.
-      const s = clearDrag.site;
-      if (s.max[0] - s.min[0] < 8 || s.max[1] - s.min[1] < 8) {
-        const sites = map.json.sites || [];
-        if (sites.includes(s)) sites.splice(sites.indexOf(s), 1);
-        if (selected === s) selected = null;
-        if (stroke) stroke.changed = false;
-        toast('drag to draw a ' + (s.kind === 'soften' ? 'softened box' : 'clearing') + ' (at least 8 voxels a side; zoom in for voxel precision)');
-        syncSites();
-      } else if (stroke) stroke.changed = true;
-    }
-    clearDrag = null;
-    waterDrag = null;
+    // every tool's release: each ends only the drag it started
+    REG.each('up');
     if (stroke) {
       const st = stroke;
       stroke = null;
@@ -1562,35 +1721,20 @@ function wire() {
     else if ((ev.ctrlKey || ev.metaKey) && ev.key === 'y') { ev.preventDefault(); doRedo(); }
     else if (LC.key(ev)) ev.preventDefault();
     else if ((tool === 'road' || tool === 'region' || tool === 'marker') && VL.key(ev)) ev.preventDefault();
+    else if (REG.call(tool, 'onKey', ev)) ev.preventDefault();
+    else if (REG.each('anyKey', [ev], true)) ev.preventDefault();
     else if (ev.key === '[' || ev.key === ']') {
       const f = ev.key === ']' ? 1.25 : 0.8;
-      if (tool === 'sculpt') sculpt.radius = Math.max(8, Math.min(4096, Math.round(sculpt.radius * f)));
-      else if (tool === 'shape') shape.radiusM = Math.max(10, Math.min(R_MAX_M, Math.round(shape.radiusM * f)));
-      else if (tool === 'line') lines.widthM = Math.max(5, Math.min(R_MAX_M, Math.round(lines.widthM * f)));
+      if (REG.get(tool) && REG.get(tool).resize) REG.call(tool, 'resize', f);
       else brush.radiusM = Math.max(R_MIN_M, Math.min(R_MAX_M, brush.radiusM * f));
       syncControls(); paint();
-    } else if ((ev.key === ',' || ev.key === '.') && tool === 'shape') {
-      shape.rot = ((shape.rot + (ev.key === '.' ? 15 : -15)) % 360 + 360) % 360;
-      syncControls(); paint();
-    } else if ((ev.key === 'Enter' || ev.key === 'Escape') && tool === 'line' && lines.drawing) {
-      lines.drawing = false;
-      syncLines(); paint();
     }
   });
   c.addEventListener('dblclick', ev => {
     if ((tool === 'road' || tool === 'region') && VL.dblclick()) return;
     // a locale's marker (any tool) or its bounds (Locale / Select): open it
     if (LC.dblclick(ev)) return;
-    // a double click ends the line being drawn (its second click added a
-    // vertex on top of the first: drop it)
-    if (tool !== 'line' || !lines.drawing || !lines.sel) return;
-    const pts = lines.sel.points;
-    if (pts.length >= 2) {
-      const a = pts[pts.length - 1], b = pts[pts.length - 2];
-      if (Math.hypot((a[0] - b[0]) * view.scale, (a[1] - b[1]) * view.scale) < 4) pts.pop();
-    }
-    lines.drawing = false;
-    syncLines(); paint();
+    REG.call(tool, 'dblclick', ev);
   });
 }
 // An undo entry is one of: {tiles: {height?, biome?}} (plane tiles before the
@@ -1606,6 +1750,9 @@ function swapEntry(e) {
   const back = {};
   if (e.tiles) Object.assign(back, swapPlanes(e));
   if (e.json) { back.json = snapshot().json; restore(e); }
+  // a layer's own state (a range's bake record, ...): `custom.swap()` puts it
+  // in and returns the entry that puts it back
+  if (e.custom) back.custom = e.custom.swap();
   if (e.bake) {
     back.bake = {id: e.bake.id, rec: bakes.get(e.bake.id) || null};
     if (e.bake.rec) bakes.set(e.bake.id, e.bake.rec); else bakes.delete(e.bake.id);
@@ -2334,55 +2481,168 @@ function paintArea(ctx) {
   const [, , w, h] = areaRect(map.H);
   ctx.fillText(`area ${w}×${h} posts` + (erosion.pending ? ' — erosion PREVIEW (commit / discard in Height tools)' : ''), x0 + 3, z0 - 4);
 }
-/** Run erosion.js on the posts of `rect` in a worker; resolves with the new heights. */
-function erodeInWorker(src, w, h, sp, opts) {
-  let worker = null;
+/* ---- THE TERRAIN JOBS: terrainjobs.js in a worker (terrain_worker.js) ----------------------
+ * One MAIN job at a time (a bake, a generate, an erosion): it owns the job bar
+ * (label, progress, Cancel) under the toolbar. QUIET jobs (live previews) run
+ * beside it in their own worker, superseded by the next of their key and
+ * cancelled when a main job starts. Without module workers the job runs on
+ * this thread (same result, the page waits). */
+let mainJob = null;
+const quietJobs = new Map();
+function runJob(job, opts = {}) {
+  let worker = null, done = false;
+  const quiet = !!opts.quiet, key = opts.key || 'job';
+  if (quiet && quietJobs.has(key)) quietJobs.get(key).cancel();
+  if (!quiet) { if (mainJob) throw new Error('another terrain job is running: ' + mainJob.label); for (const q of quietJobs.values()) q.cancel(); }
   const p = new Promise((resolve, reject) => {
-    try { worker = new Worker(new URL('./erosion_worker.js', import.meta.url), {type: 'module'}); }
+    const finish = () => { done = true; if (worker) worker.terminate(); if (quiet) { if (quietJobs.get(key) === p) quietJobs.delete(key); } else if (mainJob === p) { mainJob = null; syncJobBar(); } };
+    try { worker = new Worker(new URL('./terrain_worker.js', import.meta.url), {type: 'module'}); }
     catch (e) {
-      // no module workers here: the same function on this thread (same result, the page waits)
-      import('./erosion.js').then(m => resolve(m.erode(src, w, h, sp, opts))).catch(reject);
+      import('./terrainjobs.js').then(m => { const r = m.runJob(job); finish(); resolve(r); }).catch(err => { finish(); reject(err); });
       return;
     }
     worker.onmessage = (ev) => {
       const m = ev.data;
-      if (m.progress != null) { erosion.progress = m.progress; syncHeightTools(); return; }
-      worker.terminate();
-      if (m.error) reject(new Error(m.error)); else resolve(m.heights);
+      if (m.progress != null) { p.progress = m.progress; if (opts.onProgress) opts.onProgress(m.progress); if (!quiet) syncJobBar(); return; }
+      finish();
+      if (m.error) reject(new Error(m.error)); else resolve(m.result);
     };
-    worker.onerror = (ev) => { worker.terminate(); reject(new Error(ev.message || 'erosion worker failed')); };
-    worker.postMessage({id: 1, heights: src, w, h, sp, opts}, [src.buffer]);
+    worker.onerror = (ev) => { finish(); reject(new Error(ev.message || 'terrain worker failed')); };
+    const tr = job.grid && job.grid.h && job.grid.h.buffer ? [job.grid.h.buffer] : [];
+    worker.postMessage({id: 1, job}, tr);
   });
-  p.cancel = () => { if (worker) worker.terminate(); };
+  p.label = opts.label || job.job;
+  p.progress = 0;
+  p.cancelled = false;
+  p.cancel = () => {
+    if (done) return;
+    p.cancelled = true; done = true;
+    if (worker) worker.terminate();
+    if (quiet) { if (quietJobs.get(key) === p) quietJobs.delete(key); } else if (mainJob === p) { mainJob = null; syncJobBar(); }
+    if (opts.onCancel) opts.onCancel();
+  };
+  if (quiet) quietJobs.set(key, p); else { mainJob = p; syncJobBar(); }
   return p;
 }
-/** Erode the Area: run, then hold the result as a PREVIEW in the plane until
- *  Commit (one undo step) or Discard (the posts as they were). */
+function buildJobBar() {
+  const el = H.el;
+  els.jobLabel = el('span', {class: 'mapnote'});
+  els.jobProg = el('progress', {max: 100, value: 0, style: 'width:180px;height:10px'});
+  const cancel = el('button', {title: 'stop the job (nothing is written)'}, 'Cancel');
+  cancel.addEventListener('click', () => { if (mainJob) mainJob.cancel(); });
+  const bar = el('div', {class: 'mapbar mapjob'}, el('b', {}, 'working: '), els.jobLabel, els.jobProg, cancel);
+  bar.style.display = 'none';
+  return bar;
+}
+function syncJobBar() {
+  if (!els.jobBar) return;
+  els.jobBar.style.display = mainJob ? '' : 'none';
+  if (!mainJob) return;
+  els.jobLabel.textContent = mainJob.label + ' ';
+  els.jobProg.value = Math.round((mainJob.progress || 0) * 100);
+}
+/** The posts of the plane inside world box [x0, z0, x1, z1] (or all of it)
+ *  as a terrainjobs grid {w, hh, x0, z0, cell, h} + the rect. */
+function postsGrid(box) {
+  const P = map.H, nx = P.posts[0], nz = P.posts[1];
+  let i0 = 0, j0 = 0, i1 = nx - 1, j1 = nz - 1;
+  if (box) {
+    i0 = Math.max(0, Math.floor((box[0] - P.min[0]) / P.sp)); i1 = Math.min(nx - 1, Math.ceil((box[2] - P.min[0]) / P.sp));
+    j0 = Math.max(0, Math.floor((box[1] - P.min[1]) / P.sp)); j1 = Math.min(nz - 1, Math.ceil((box[3] - P.min[1]) / P.sp));
+  }
+  const w = i1 - i0 + 1, hh = j1 - j0 + 1;
+  if (w < 2 || hh < 2) return null;
+  return {rect: [i0, j0, w, hh], grid: {w, hh, x0: P.min[0] + i0 * P.sp, z0: P.min[1] + j0 * P.sp, cell: P.sp, h: null}};
+}
+/** A coarse grid of the posts in world box (box-averaged by f) for a preview job. */
+function coarseGrid(box, f) {
+  const g = postsGrid(box);
+  if (!g) return null;
+  const [i0, j0, w, hh] = g.rect, cw = Math.ceil(w / f), ch = Math.ceil(hh / f), out = new Float32Array(cw * ch);
+  const src = MT.readWindow(map.H, i0, j0, cw * f, ch * f);
+  for (let j = 0; j < ch; j++)
+    for (let i = 0; i < cw; i++) {
+      let sum = 0;
+      for (let b = 0; b < f; b++) for (let a = 0; a < f; a++) sum += src[(j * f + b) * cw * f + i * f + a];
+      out[j * cw + i] = sum / (f * f);
+    }
+  const sp = map.H.sp;
+  return {rect: g.rect, f, grid: {w: cw, hh: ch, x0: g.grid.x0 + (f - 1) / 2 * sp, z0: g.grid.z0 + (f - 1) / 2 * sp, cell: sp * f, h: out}};
+}
+/* ---- THE PREVIEW OVERLAY: a coarse result drawn over its box (a range, a
+ * template, a landform) before anything is written. */
+let preview = null;        // {canvas, box: [x0, z0, x1, z1], label, owner} or null
+/** Show coarse grid result r = {h, base?, coarse: {w, hh, x0, z0, cell}} as the
+ *  preview; only cells that differ from `base` (when given) are drawn. */
+function setPreview(r, label, owner) {
+  if (!r) { preview = null; schedulePaint(); return; }
+  const c = r.coarse, [lo, hi] = rampRange();
+  let mask = null;
+  if (r.base) { mask = new Uint8Array(c.w * c.hh); for (let n = 0; n < mask.length; n++) mask[n] = Math.abs(r.h[n] - r.base[n]) > 0.5 ? 1 : 0; }
+  const rgba = TG.shade(r.h, c.w, c.hh, c.cell, {seaY: seaY(), lo: Math.min(lo, seaY()), hi, tint: 0.75, mask, zf: 1.4});
+  const cv = document.createElement('canvas');
+  cv.width = c.w; cv.height = c.hh;
+  cv.getContext('2d').putImageData(new ImageData(rgba, c.w, c.hh), 0, 0);
+  preview = {canvas: cv, box: [c.x0 - c.cell / 2, c.z0 - c.cell / 2, c.x0 + (c.w - 0.5) * c.cell, c.z0 + (c.hh - 0.5) * c.cell], label, owner};
+  schedulePaint();
+}
+function paintPreview(ctx) {
+  if (!preview) return;
+  const [x0, z0, x1, z1] = preview.box;
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(preview.canvas, SX(x0), SZ(z0), (x1 - x0) * view.scale, (z1 - z0) * view.scale);
+  ctx.imageSmoothingEnabled = false;
+  ctx.strokeStyle = 'rgba(255,216,102,0.7)'; ctx.setLineDash([3, 3]); ctx.lineWidth = 1;
+  ctx.strokeRect(SX(x0) + 0.5, SZ(z0) + 0.5, (x1 - x0) * view.scale, (z1 - z0) * view.scale);
+  ctx.setLineDash([]);
+  ctx.fillStyle = '#ffd866'; ctx.font = '11px monospace';
+  ctx.fillText('PREVIEW: ' + (preview.label || ''), SX(x0) + 4, SZ(z0) + 13);
+}
+/** Write a job's post heights `h` (NaN / `changed` == 0 = leave) into the
+ *  plane's rect as a PENDING result (in the plane, not yet an undo step):
+ *  Commit keeps it (one undo step), Discard puts the posts back, the next
+ *  edit of any kind commits it. `json` = a map.json snapshot to restore
+ *  with it on undo (a generator's `gen` record). */
+function writePending(rect, h, changed, label, json) {
+  if (erosion.pending) commitErosion();
+  const [i0, j0, w, hh] = rect;
+  if (changed) for (let n = 0; n < h.length; n++) if (!changed[n]) h[n] = NaN;
+  const before = new Map();
+  const r = MT.writeValues(map.H, i0, j0, w, hh, h, before);
+  erosion.pending = {before, rect, label, json: json || null};
+  range.vals = null;
+  syncHeightTools(); if (GL) GL.sync(); paint();
+  return r;
+}
+/** Erode the Area (or, for stream power, the whole map): run in the worker,
+ *  then hold the result as a PREVIEW in the plane until Commit (one undo
+ *  step) or Discard (the posts as they were). */
 async function runErosion() {
   if (!map || erosion.running) return null;
-  if (!area) { toast('draw an Area first: the Area tool, drag a rectangle', true); return null; }
+  const droplet = erosion.method === 'droplet';
+  if (!area && droplet) { toast('draw an Area first: the Area tool, drag a rectangle (droplet erosion works on an area)', true); return null; }
   if (erosion.pending) commitErosion();
   const P = map.H, rect = areaRect(P), [i0, j0, w, h] = rect;
   if (w < 8 || h < 8) { toast('the area is under 8 posts a side', true); return null; }
-  if (w * h > 4200000) { toast(`the area is ${w}×${h} posts; erosion takes at most ~2048×2048 (draw a smaller area)`, true); return null; }
+  if (droplet && w * h > 4200000) { toast(`the area is ${w}×${h} posts; droplet erosion takes at most ~2048×2048 (draw a smaller area)`, true); return null; }
   if (rectBlocked(P, rect)) { toast('tiles under the area are still loading; try again in a moment', true); return null; }
-  const opts = {seed: erosion.seed | 0, iterations: erosion.iterations | 0, strength: erosion.strength / 100,
-                talusDeg: erosion.talusDeg, hydraulic: erosion.hydraulic, thermal: erosion.thermal};
-  const run = erodeInWorker(MT.readWindow(P, i0, j0, w, h), w, h, P.sp, opts);
+  const job = {job: 'erode', method: erosion.method, seed: erosion.seed | 0, strength: erosion.strength / 100, iters: droplet ? erosion.iterations | 0 : null,
+               talusDeg: erosion.talusDeg, hydraulic: erosion.hydraulic, thermal: erosion.thermal, seaY: seaY(),
+               grid: {w, hh: h, x0: P.min[0] + i0 * P.sp, z0: P.min[1] + j0 * P.sp, cell: P.sp, h: MT.readWindow(P, i0, j0, w, h)}};
+  let run;
+  try { run = runJob(job, {label: (area ? 'eroding the area' : 'eroding the whole map') + ' (' + erosion.method + ')', onProgress: p => { erosion.progress = p; syncHeightTools(); }}); }
+  catch (e) { toast(e.message, true); return null; }
   erosion.running = run; erosion.progress = 0;
   syncHeightTools();
   const t0 = performance.now();
   try {
-    const out = await run;
-    if (!map || map.H !== P) return null;
-    const before = new Map();
-    const r = MT.writeValues(P, i0, j0, w, h, out, before);
-    erosion.pending = {before, rect};
-    range.vals = null;
-    status(`erosion preview: ${r.changed} posts moved in ${((performance.now() - t0) / 1000).toFixed(1)} s (seed ${opts.seed}) — Commit keeps it, Discard puts the posts back`);
-    return out;
+    const res = await run;
+    if (!map || map.H !== P || run.cancelled) return null;
+    const r = writePending(rect, res.h, null, 'erosion');
+    status(`erosion preview: ${r.changed} posts moved in ${((performance.now() - t0) / 1000).toFixed(1)} s (${erosion.method}, seed ${job.seed}) — Commit keeps it, Discard puts the posts back`);
+    return res.h;
   } catch (e) {
-    toast('erosion: ' + e.message, true);
+    if (!run.cancelled) toast('erosion: ' + e.message, true);
     return null;
   } finally {
     erosion.running = null;
@@ -2393,16 +2653,36 @@ function commitErosion() {
   const p = erosion.pending;
   if (!p) return;
   erosion.pending = null;
-  if (p.before.size) { pushUndo({tiles: {height: p.before}}); markDirty(true); }
+  if (p.before.size) { pushUndo(p.json ? {tiles: {height: p.before}, json: p.json} : {tiles: {height: p.before}}); markDirty(true); }
   syncHeightTools();
+  if (GL) GL.sync();
 }
 function discardErosion() {
   const p = erosion.pending;
   if (!p) return;
   erosion.pending = null;
   MT.swapTiles(map.H, p.before);
+  if (p.json) restore({json: p.json});
   range.vals = null;
-  syncHeightTools(); paint();
+  syncHeightTools(); if (GL) GL.sync(); paint();
+}
+/** The context the K1 layers get (maprange / mapgen / mapoverlay). */
+function layerContext() {
+  return {
+    map: () => map, view, SX, SZ, worldAtF, worldColumnAt, el: H.el,
+    pushUndo, snapshot, restore, markDirty, paint, schedulePaint, status, toast, vpm, seaY, fmtM,
+    tool: () => tool, setTool: t => { tool = t; syncControls(); paint(); },
+    registerTool: REG.registerTool,
+    area: () => area, setArea: a => { area = a; syncHeightTools(); paint(); },
+    areaRect: () => areaRect(map.H), rectBlocked: r => rectBlocked(map.H, r),
+    postsGrid, coarseGrid, readPosts: (i0, j0, w, h) => MT.readWindow(map.H, i0, j0, w, h),
+    runJob, jobBusy: () => !!mainJob, setPreview, preview: () => preview,
+    writePending, pending: () => erosion.pending, commitPending: commitErosion, discardPending: discardErosion,
+    planeChanged: () => { range.vals = null; },
+    heightAt: (x, z) => MT.heightAt(map.H, x, z),
+    rampRange, rampColor, disp, hover: () => els.hoverW || null,
+    syncControls, imgCacheClear: () => imgCache.clear(),
+  };
 }
 function download(name, bytes, type) {
   const a = document.createElement('a');
@@ -2579,18 +2859,26 @@ function buildHeightToolsPanel() {
   det.append(el('div', {class: 'mapsub'}, 'Lines (map.json ridges[]: the plane holds what is BAKED; the engine never reads the lines)'), els.lineList, els.lineInsp);
   // the area + erosion
   els.areaInfo = el('div', {class: 'mapnote'});
+  els.erIn = {};
   const num = (key, min, max, step, title, scale = 1) => {
     const i = el('input', {type: 'number', min, max, step, value: erosion[key], style: 'width:56px', title});
     i.addEventListener('change', () => { erosion[key] = Math.max(min, Math.min(max, +i.value || 0)); i.value = erosion[key]; });
+    els.erIn[key] = i;
     return i;
   };
   const chk = (key, title) => {
     const c = el('input', {type: 'checkbox', title});
     c.checked = erosion[key];
     c.addEventListener('change', () => { erosion[key] = c.checked; });
+    els.erIn[key] = c;
     return c;
   };
-  els.erRun = el('button', {class: 'mapgo', title: 'erode the Area in a worker (deterministic for the seed), then preview it in the plane'}, 'Erode area');
+  els.erMethod = el('select', {title: 'landscape: STREAM POWER as a landscape-evolution run -- the land regrows under an uplift shaped like itself while rivers cut it, then its heights are put back: dendritic valleys reaching every divide (the Range tool\u2019s erosion); incise: stream power cutting the ground as it is (gentler, keeps its shape); droplet: particle water + thermal scree, gullies and fans (an Area only)'},
+    el('option', {value: 'land'}, 'stream power: landscape'), el('option', {value: 'incise'}, 'stream power: incise'), el('option', {value: 'droplet'}, 'droplet + thermal'));
+  els.erMethod.value = erosion.method;
+  els.erMethod.addEventListener('change', () => { erosion.method = els.erMethod.value; syncHeightTools(); });
+  els.erProg = el('progress', {max: 100, value: 0, style: 'width:120px;height:9px'});
+  els.erRun = el('button', {class: 'mapgo', title: 'erode the Area (or, with stream power, the whole map when there is no Area) in a worker, deterministic for the seed, then preview it in the plane'}, 'Erode area');
   els.erRun.addEventListener('click', () => {
     if (erosion.running) { erosion.running.cancel(); erosion.running = null; syncHeightTools(); return; }
     runErosion();
@@ -2600,7 +2888,8 @@ function buildHeightToolsPanel() {
   els.erDiscard = el('button', {title: 'put the posts back as they were'}, 'Discard');
   els.erDiscard.addEventListener('click', discardErosion);
   els.erState = el('span', {class: 'mapnote'});
-  det.append(el('div', {class: 'mapsub'}, 'Area (the Area tool draws it; shift+click clears it)'), els.areaInfo,
+  det.append(el('div', {class: 'mapsub'}, 'Area + erosion (the Area tool draws it; shift+click clears it)'), els.areaInfo,
+    el('div', {class: 'mapbar'}, 'method ', els.erMethod),
     el('div', {class: 'mapgrid2'},
       el('label', {title: 'passes; each pass runs a droplet per four posts and a thermal step'}, 'passes ', num('iterations', 1, 100, 1, 'erosion passes')),
       el('label', {}, 'strength % ', num('strength', 1, 100, 5, 'how much each droplet carries and each slump moves')),
@@ -2608,7 +2897,7 @@ function buildHeightToolsPanel() {
       el('label', {title: 'the same seed on the same posts gives the same result'}, 'seed ', num('seed', 0, 999999, 1, 'seed')),
       el('label', {}, chk('hydraulic', 'droplets: gullies and fans'), ' water'),
       el('label', {}, chk('thermal', 'talus slumping: scree slopes'), ' thermal')),
-    el('div', {class: 'mapbar'}, els.erRun, els.erCommit, els.erDiscard, els.erState));
+    el('div', {class: 'mapbar'}, els.erRun, els.erCommit, els.erDiscard, els.erProg, els.erState));
   // PNG
   const exH = el('button', {title: 'the Area’s (or the whole map’s) HEIGHT as a 16-bit greyscale PNG: exact, 1 unit = 1 voxel, mapping in the file'}, 'Export height PNG');
   exH.addEventListener('click', () => exportHeightPng().catch(e => toast('export: ' + e.message, true)));
@@ -2634,16 +2923,23 @@ function buildHeightToolsPanel() {
   return det;
 }
 function syncHeightTools() {
+  if (GL) GL.sync();
   if (!els.areaInfo || !map) return;
   const el = H.el, v = vpm();
   if (area) {
     const [, , w, h] = areaRect(map.H);
     els.areaInfo.textContent = `${fmtM((area[2] - area[0]) / v)} × ${fmtM((area[3] - area[1]) / v)} — ${w}×${h} height posts`;
-  } else els.areaInfo.textContent = 'no area: erosion needs one; PNG export / import use the whole map';
-  els.erRun.textContent = erosion.running ? 'Cancel' : 'Erode area';
-  els.erRun.disabled = !area && !erosion.running;
+  } else els.areaInfo.textContent = 'no area: stream power erodes the WHOLE map, droplet erosion needs one; PNG export / import use the whole map';
+  const droplet = erosion.method === 'droplet';
+  els.erMethod.value = erosion.method;
+  els.erRun.textContent = erosion.running ? 'Cancel' : area ? 'Erode area' : 'Erode whole map';
+  els.erRun.disabled = !area && droplet && !erosion.running;
   els.erCommit.disabled = els.erDiscard.disabled = !erosion.pending;
-  els.erState.textContent = erosion.running ? ` running ${Math.round(erosion.progress * 100)} %` : erosion.pending ? ' preview in the plane' : '';
+  els.erProg.style.display = erosion.running ? '' : 'none';
+  els.erProg.value = Math.round(erosion.progress * 100);
+  for (const k of ['iterations', 'hydraulic', 'thermal']) if (els.erIn && els.erIn[k]) els.erIn[k].parentNode.style.display = droplet ? '' : 'none';
+  els.erState.textContent = erosion.running ? ` running ${Math.round(erosion.progress * 100)} %` :
+    erosion.pending ? ' ' + (erosion.pending.label || 'erosion') + ' preview in the plane' : '';
   const d = els.pngDlg;
   d.replaceChildren();
   if (!pngIn) return;
@@ -2704,11 +3000,10 @@ function syncControls() {
   // THE LOCALE PAGE (E4) has its own tool set; the world's tools are hidden
   // there (and Structure / Link are the locale's only)
   const inLocale = !!(LC && LC.open());
-  if (inLocale && !LOCALE_TOOLS.includes(tool)) tool = 'sculpt';
-  if (!inLocale && (tool === 'structure' || tool === 'waylink')) tool = 'locale';
-  for (const [k, b] of Object.entries(els.tools))
-    b.style.display = (inLocale ? LOCALE_TOOLS.includes(k) : k !== 'structure' && k !== 'waylink') ? '' : 'none';
-  for (const p of [els.vecPanel, els.htPanel, els.terrainPanel, els.palette]) if (p) p.style.display = inLocale ? 'none' : '';
+  const onPage = k => { const t = REG.get(k); return !!t && (inLocale ? t.locale : t.world); };
+  if (!onPage(tool)) tool = inLocale ? 'sculpt' : REG.has('locale') && (tool === 'structure' || tool === 'waylink') ? 'locale' : 'height';
+  for (const [k, b] of Object.entries(els.tools)) b.style.display = onPage(k) ? '' : 'none';
+  for (const p of [els.vecPanel, els.htPanel, els.terrainPanel, els.palette, ...(els.worldPanels || [])]) if (p) p.style.display = inLocale ? 'none' : '';
   if (els.mapSel) els.mapSel.disabled = inLocale;   // leave the locale to switch maps
   if (els.legend) els.legend.sync(inLocale);
   if (els.guide) els.guide.sync(tool);
@@ -2740,6 +3035,12 @@ function syncControls() {
     els.lnYSea.style.display = lines.yMode === 'sea' ? '' : 'none';
     els.lnYGround.style.display = lines.yMode === 'sea' ? 'none' : '';
   }
+  if (els.mkKind) {
+    els.mkKind.value = brush.mask.kind;
+    els.mkBand.style.display = brush.mask.kind === 'height' || brush.mask.kind === 'slope' ? '' : 'none';
+    els.mkUnit.textContent = brush.mask.kind === 'slope' ? '°' : ' m asl';
+  }
+  for (const t of REG.list()) if (t.sync) t.sync();
 }
 export function attach(hooks) {
   H = hooks;
@@ -2812,6 +3113,9 @@ export function attach(hooks) {
 #env-map .mapcrumb a{color:#7fd4ff}
 #env-map .mapcrumb canvas{image-rendering:pixelated;vertical-align:middle}
 #env-map .maplocale3d{display:flex;flex-direction:column;gap:4px;flex:0 0 300px;min-height:0}
+#env-map .maptoolsep{display:inline-block;width:1px;height:18px;background:#2a3040;margin:0 3px}
+#env-map .mapjob{border:1px solid #6a5a1a;border-radius:4px;padding:2px 6px;background:#1a1608}
+#env-map .mapkind-range{color:#e8a060}
 #env-map .maplocale3d-canvas{flex:1;min-height:200px;width:100%;background:#0e1116;border:1px solid #2a3040;border-radius:6px}
 `;
   document.head.append(style);
@@ -2863,29 +3167,6 @@ export function attach(hooks) {
   els.mapSel = el('select', {});
   els.save = el('button', {disabled: true}, 'Save map');
   els.save.addEventListener('click', saveMap);
-  els.tools = {
-    site: el('button', {title: 'click a site marker of any kind to select it in the Sites panel'}, 'Select'),
-    height: el('button', {title: 'paint the AUTHORED HEIGHT plane in metres: raise / lower / smooth / flatten / set / terrace / noise / erode (left-drag; Alt+click picks the height under the cursor into Set)'}, 'Height'),
-    shape: el('button', {title: 'click: stamp a landform into the height plane -- peak, ridge, basin, plateau, volcano, mesa ([ ] radius, , . rotate)'}, 'Shape'),
-    line: el('button', {title: 'RIDGE / VALLEY lines: click to draw (double-click / Enter ends), drag a vertex, click a segment to insert, shift+click a vertex to delete; Bake in the Height tools panel'}, 'Line'),
-    area: el('button', {title: 'drag: the AREA the Height tools panel erodes and exports / imports as PNG; shift+click clears it'}, 'Area'),
-    biome: el('button', {title: 'paint the selected biome (left-drag; Alt+click picks the biome under the cursor)'}, 'Biome brush'),
-    pad: el('button', {title: 'drag the calm pad box (world voxels)'}, 'Pad box'),
-    spawn: el('button', {title: 'click: put the spawn site there (where the game starts; the calm home area centres on it). One per map.'}, 'Spawn'),
-    stamp: el('button', {title: 'click: place a stamp site (the template picked beside it, from assets/prefabs/); shift+click a marker: delete it'}, 'Stamp site'),
-    water: el('button', {title: 'click: place an AUTHORED LAKE (a water preset at that column, same on every seed); drag a lake to move it; shift+click: delete it'}, 'Water'),
-    tree: el('button', {title: 'click: place an AUTHORED TREE on the ground at that column; drag a tree to move it; shift+click: delete it'}, 'Tree'),
-    clearing: el('button', {title: 'drag: draw a FOREST CLEARING (a box no tree crown reaches over); click one to select it, drag to move it; shift+click inside one: delete it'}, 'Clearing'),
-    soften: el('button', {title: 'drag: draw SOFTENED GROUND (a box where the seeded hills, bumps and grain are kept at a percent -- a village’s ground); shift+click inside one: delete it'}, 'Soften'),
-    road: el('button', {title: 'ROADS (map.json roads[]: graded ground the engine builds): click to draw (double-click / Enter ends), drag a vertex, click the selected road to insert one, shift+click a vertex to delete; vertices SNAP onto other roads (junctions); Ctrl+click on a road starts a branch there; Alt = no snap'}, 'Road'),
-    region: el('button', {title: 'REGIONS (map.json regions[]: named polygons, data only): click out a polygon, click its first vertex to close; drag / insert / shift+click delete vertices like roads'}, 'Region'),
-    marker: el('button', {title: 'MARKERS (map.json markers[]: annotations with a pixel-art icon): click to place, drag to move, shift+click to delete'}, 'Marker'),
-    sculpt: el('button', {title: 'SCULPT the fine layer: raise / lower / smooth / flatten / erase the map’s height-offset layer (sculpt.svsculpt, 0.8 m samples), added after everything else'}, 'Sculpt'),
-    locale: el('button', {title: 'LOCALES (map.json locales[]: hand-made places that ride their ground): drag out a new one’s bounds with the icon picked beside it; click one to select it; DOUBLE-CLICK opens it (the locale page)'}, 'Locale'),
-    structure: el('button', {title: 'STRUCTURES of this locale (structure refs, written through the F8 command layer): click places the picked blueprint, drag one to move it, R turns it, shift+click deletes it'}, 'Structure'),
-    waylink: el('button', {title: 'WAYNODE LINKS: click a waynode, then another, to join them (Shift or a second time parts them); click open ground for a new waynode joined to the last'}, 'Link'),
-  };
-  for (const [k, b] of Object.entries(els.tools)) b.addEventListener('click', () => { tool = k; syncControls(); paint(); });
   // ---- the plane brushes (height + biome): one radius in metres, log slider
   els.brR = el('input', {type: 'range', min: 0, max: 1000, step: 1, style: 'width:130px', title: 'brush radius, 1 m .. 5 km (logarithmic; [ and ])'});
   els.brROut = el('span', {});
@@ -3023,42 +3304,73 @@ export function attach(hooks) {
     el('label', {title: 'biome overlay opacity (full when the topo layer is off)'}, ' biomes ', pct('biomeAlpha', 'biome overlay opacity')),
     els.heightsBtn, pct('realAlpha', 'real-terrain backdrop opacity'),
     el('label', {}, ' ', scShow, 'sculpt'));
-  const toolbar = el('div', {class: 'mapbar'}, els.tools.site, els.tools.height, els.tools.shape, els.tools.line, els.tools.area, els.tools.biome, els.tools.sculpt,
-    els.tools.road, els.tools.region, els.tools.marker, els.tools.locale, els.tools.structure, els.tools.waylink,
-    els.tools.pad, els.tools.spawn, els.tools.stamp, els.tools.water, els.tools.tree, els.tools.clearing, els.tools.soften);
-  els.opts = {
-    'height biome': el('span', {class: 'mapopts'}, 'radius ', els.brR, ' ', els.brROut, el('label', {}, ' spacing ', els.brSpacing, '%')),
-    'height': el('span', {class: 'mapopts'}, 'mode ', els.brMode, ' str ', els.brStr, ' ', els.brStrOut, els.brTargetLbl, ' edge ', els.brFalloff, els.hbTerrace, els.hbNoise),
-    'shape': el('span', {class: 'mapopts'}, 'shape ', els.shKind, ' ', els.shIn.heightM, ' m ', els.shIn.mode, ' r ', els.shIn.radiusM, ' m aspect ', els.shIn.aspect, ' rot ', els.shIn.rot, '°'),
-    'line': el('span', {class: 'mapopts'}, 'new ', els.lnIn.kind, ' ', els.lnIn.profile, ' half-width ', els.lnIn.widthM, ' m · vertex ', els.lnIn.yMode,
-               (els.lnYSea = el('span', {}, ' ', els.lnIn.yM, ' m asl')), (els.lnYGround = el('span', {}, ' ± ', els.lnIn.dyM, ' m'))),
-    'area': el('span', {class: 'mapopts'}, el('span', {class: 'mapnote'}, 'drag a rectangle; erode it or export / import it in the Height tools panel')),
-    'sculpt': el('span', {class: 'mapopts'}, 'sculpt ', els.scMode, ' r ', els.scRadius, ' ', els.scRadiusOut, ' str ', els.scStrength, ' ', els.scStrengthOut),
-    'water': el('span', {class: 'mapopts'}, 'lake ', els.waterPreset, ' r ', els.waterRadius, ' m'),
-    'stamp': el('span', {class: 'mapopts'}, 'stamp ', els.stampTpl, ' ', els.stampRot),
-    'tree': el('span', {class: 'mapopts'}, 'tree ', els.treeSp, ' v ', els.treeVar, ' ', els.treeRot),
-    'clearing': el('span', {class: 'mapopts'}, 'clearing feather ', els.clearFeather, ' vox'),
-    ...VL.toolOpts(),
-    ...LC.toolOpts(),
+  els.dispBar = bar;
+  // ---- the brush MASK (every height brush mode): land only / sea only / a
+  // height band / a slope band, soft-edged
+  els.mkKind = el('select', {title: 'MASK: where the Height brush may act -- everywhere, land only (above the sea), sea only, a height band (m above sea) or a slope band (degrees); soft at the edges'},
+                  ...MT.MASK_KINDS.map(k => el('option', {value: k}, k === 'none' ? 'no mask' : k === 'land' ? 'land only' : k === 'sea' ? 'sea only' : k + ' band')));
+  els.mkKind.addEventListener('change', () => { brush.mask.kind = els.mkKind.value; syncControls(); });
+  const mkNum = (key, title) => {
+    const i = el('input', {type: 'number', step: 5, value: brush.mask[key], style: 'width:56px', title});
+    i.addEventListener('change', () => { brush.mask[key] = +i.value || 0; });
+    els['mk_' + key] = i;
+    return i;
   };
+  els.mkUnit = el('span', {}, ' m asl');
+  els.mkBand = el('span', {}, ' ', mkNum('lo', 'the band\u2019s low end (m above sea, or degrees)'), '..', mkNum('hi', 'the band\u2019s high end (m above sea, or degrees)'), els.mkUnit,
+                  ' soft ', mkNum('soft', 'the soft edge (m, or degrees)'));
+  // ---- every tool's options strip, then THE REGISTRY
+  els.optHeight = el('span', {class: 'mapopts'}, 'mode ', els.brMode, ' str ', els.brStr, ' ', els.brStrOut, els.brTargetLbl, ' edge ', els.brFalloff, els.hbTerrace, els.hbNoise,
+                     ' mask ', els.mkKind, els.mkBand);
+  els.optShape = el('span', {class: 'mapopts'}, 'shape ', els.shKind, ' ', els.shIn.heightM, ' m ', els.shIn.mode, ' r ', els.shIn.radiusM, ' m aspect ', els.shIn.aspect, ' rot ', els.shIn.rot, '°');
+  els.optLine = el('span', {class: 'mapopts'}, 'new ', els.lnIn.kind, ' ', els.lnIn.profile, ' half-width ', els.lnIn.widthM, ' m · vertex ', els.lnIn.yMode,
+                   (els.lnYSea = el('span', {}, ' ', els.lnIn.yM, ' m asl')), (els.lnYGround = el('span', {}, ' ± ', els.lnIn.dyM, ' m')));
+  els.optArea = el('span', {class: 'mapopts'}, el('span', {class: 'mapnote'}, 'drag a rectangle; erode it, generate into it or export / import it (Height tools, Generate panels)'));
+  els.optSculpt = el('span', {class: 'mapopts'}, 'sculpt ', els.scMode, ' r ', els.scRadius, ' ', els.scRadiusOut, ' str ', els.scStrength, ' ', els.scStrengthOut);
+  els.optWater = el('span', {class: 'mapopts'}, 'lake ', els.waterPreset, ' r ', els.waterRadius, ' m');
+  els.optStamp = el('span', {class: 'mapopts'}, 'stamp ', els.stampTpl, ' ', els.stampRot);
+  els.optTree = el('span', {class: 'mapopts'}, 'tree ', els.treeSp, ' v ', els.treeVar, ' ', els.treeRot);
+  els.optClearing = el('span', {class: 'mapopts'}, 'clearing feather ', els.clearFeather, ' vox');
+  registerBuiltinTools();
+  // K1: the range splines, the generators, the overlays + Measure (each registers its tools)
+  const C = layerContext();
+  RL = createRangeLayer(C);
+  GL = createGenLayer(C);
+  OL = createOverlayLayer(C);
+  els.dispBar.append(el('span', {style: 'width:6px'}), ...OL.displayControls());
+  els.tools = {};
+  const toolbar = el('div', {class: 'mapbar'});
+  let lastGroup = null;
+  for (const t of REG.list()) {
+    if (lastGroup && t.group !== lastGroup) toolbar.append(el('span', {class: 'maptoolsep'}));
+    lastGroup = t.group;
+    const b = el('button', {title: t.title || t.label}, t.label);
+    b.addEventListener('click', () => { tool = t.key; syncControls(); paint(); });
+    els.tools[t.key] = b;
+    toolbar.append(b);
+  }
+  els.opts = {'height biome': el('span', {class: 'mapopts'}, 'radius ', els.brR, ' ', els.brROut, el('label', {}, ' spacing ', els.brSpacing, '%'))};
+  for (const t of REG.list()) { const o = t.opts ? t.opts() : null; if (o) els.opts[t.key] = o; }
   toolbar.append(...Object.values(els.opts));
   const note = el('div', {class: 'mapnote'},
     'The HEIGHT plane is the world’s shape, in metres: a post every ' + '6.4 m (map.json planes.height.log2), exact and never scaled by noise; the seeded noise (Terrain) rides on it and the Sculpt layer (0.8 m) on top of that. ' +
     'The BIOME plane says what grows where (planes.biome.log2: 25.6 m cells). Right/middle-drag pans, wheel zooms, [ ] resize the brush, Alt+click picks. ' +
-    'Shape stamps landforms; Line draws ridge / valley lines you Bake into the plane; Area marks a rectangle to erode or to export / import as PNG (Height tools panel). ' +
+    'Range draws a MOUNTAIN RANGE as a spline (crest height + half-width per knot) and bakes it eroded; Shape stamps landforms; Line draws ridge / valley lines you Bake into the plane; Area marks a rectangle to erode, generate into or export / import as PNG (Height tools and Generate panels). Measure reads distance, the elevation profile and the grade. ' +
     'Road draws graded roads the engine builds (vertices snap together into junctions; the Vector layers panel shows the engine’s baked profile once saved); Region outlines named areas; Marker pins pixel-art annotations. ' +
     'Sites: the pad box (calm bare ground; the harness map’s is the selftest’s), the spawn diamond, stamps, authored lakes, authored trees, forest clearings, softened ground; they keep out by their own footprint. The Load check panel says what the engine thinks of the saved map. ' +
     'Saving writes map.json and only the plane tiles you changed (assets/worldmap/<name>/planes/), and moves the world hash; regenerate the world (F7 in the game, or Apply in the sidebar) to see it.');
   els.bar = bar;
-  els.guide = buildToolGuide(el);
+  els.guide = buildToolGuide(el, REG.guides());
   style.textContent += els.guide.css;
-  const main = el('div', {class: 'mapmain'}, LC.buildBreadcrumb(), bar, toolbar, els.guide.panel, els.palette, els.canvas, LC.build3d(), els.status, note);
+  els.jobBar = buildJobBar();
+  const main = el('div', {class: 'mapmain'}, LC.buildBreadcrumb(), bar, toolbar, els.jobBar, els.guide.panel, els.palette, els.canvas, LC.build3d(), els.status, note);
   els.vecPanel = VL.buildPanel();
   els.htPanel = buildHeightToolsPanel();
   els.terrainPanel = buildTerrainSection();
+  els.worldPanels = [RL.buildPanel(), GL.buildPanel()];
   els.legend = buildLegend(el, VEC.iconCanvas, {land: LAND_LUT, sea: SEA_LUT});
   style.textContent += els.legend.css;
-  const side = el('div', {class: 'mapside'}, els.legend.panel, buildCheckPanel(), LC.buildPanel(), els.vecPanel, els.htPanel, els.terrainPanel, buildSitesPanel());
+  const side = el('div', {class: 'mapside'}, els.legend.panel, buildCheckPanel(), LC.buildPanel(), els.worldPanels[0], els.worldPanels[1], els.vecPanel, els.htPanel, els.terrainPanel, buildSitesPanel());
   root.append(el('div', {class: 'mapbody'}, main, side));
   // The PREVIEW pane (P-I): the heightmap and voxel views tuner.html keeps in
   // #wgPreviewHost, adopted under the map as previews.
@@ -3187,7 +3499,7 @@ export function saveFromHost() {
   if (dirty) saveMap();
   if (tuningTouched && H.saveTuning) { H.saveTuning(); tuningTouched = false; }
 }
-export function activate() { if (map) { syncTerrain(); syncSites(); publishTerrain(); syncLines(); syncHeightTools(); VL.sync(); LC.sync(); } }
+export function activate() { if (map) { syncTerrain(); syncSites(); publishTerrain(); syncLines(); syncHeightTools(); VL.sync(); LC.sync(); RL.sync(); GL.sync(); } }
 // test seams
 export function _map() { return map; }
 export function _load(name) { return loadMap(name); }
@@ -3226,6 +3538,13 @@ export function _applyPng() { return applyPngImport(); }
 // E3 test seams (the vector layers)
 export function _vl() { return VL; }
 export function _savedJson() { return savedJson; }
+// K1 test seams (the registry, the ranges, the generators, the overlays, the jobs)
+export function _reg() { return REG; }
+export function _rl() { return RL; }
+export function _gl() { return GL; }
+export function _ol() { return OL; }
+export function _preview() { return preview; }
+export function _job() { return mainJob; }
 // E4 test seams (the locales)
 export function _lc() { return LC; }
 export function _heights() { return heights; }
