@@ -185,13 +185,14 @@ bool SiteCases(Ctx& c, const biomes::BiomeSet& set, std::string& out) {
   }
   // Overflow: kSiteCellMax + 1 sites reaching one cell refuse the load,
   // naming the cell. (Was five against a cap of 4; the world editor's P4
-  // raised the cap to 32 for a village, so the crowd follows the constant.)
+  // raised the cap to 32 for a village, so the crowd follows the constant --
+  // packed 7 voxels apart so even map v2 R1's 129 fit inside one cell.)
   {
     nlohmann::json jo = base;
     const int crowd = static_cast<int>(worldmap::kSiteCellMax) + 1;
     for (int k = 0; k < crowd; k++)
       jo["sites"].push_back({{"id", "p6_crowd_" + std::to_string(k)}, {"kind", "tree"}, {"species", sp->name},
-                             {"at", {14400 + k * 20, 15000}}});
+                             {"at", {14400 + k * 7, 15000}}});
     worldmap::WorldMapData over;
     std::string olog, ot = jo.dump();
     const bool refused = !worldmap::LoadWorldMap(dir, real.name, set, c.mats.size(), kDefaultSeed, over, olog, &ot);

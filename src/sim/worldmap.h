@@ -652,6 +652,8 @@ enum : uint32_t {
   kS_RoadYB = 10,       // road piece: ... at (kS_BoxX1, kS_BoxZ1), Q8 voxels
   kS_RoadMat = 11,      // road piece: the surface material id (a SOLID)
   kS_RoadDepth = 12,    // road piece: surface cells from the ground's top down
+  kS_RoadFlags = 15,    // road piece: 1 = end A open, 2 = end B open (a joint with
+                        // the next piece on the same straight: no round cap)
   kStampHdrWords = 4,
   kStamp_NX = 0, kStamp_NY = 1, kStamp_NZ = 2, kStamp_Columns = 3,
   // columns: nx*nz pairs of (runOff, runCount), absolute word offsets; runs:
@@ -681,10 +683,14 @@ enum : uint32_t {
   // At most this many sites may reach one map cell (the per-cell list); more
   // is a load error. Was 4 ("two neighbouring buildings, a lake and a tree")
   // until the world editor's P4: a village is ~10 structure refs plus its
-  // well, trees and pond in ONE 102 m cell, so 32. The shader's list walks
-  // iterate the list's own n, bounded by this; a cell no site reaches still
-  // costs one read.
-  kSiteCellMax = 32,
+  // well, trees and pond in ONE 102 m cell, so 32. 128 since map v2 R1
+  // (2026-10-08), measured on `default`: Harrowby's cell held 28 (5 houses,
+  // the soften box, 22 waynode routes); its 8 paths as roads made it 42-44,
+  // and a 3-road test network through the village 55..93 depending on how
+  // finely the profiles cut (the `roads` gate's H line reports it). The shader's list walks iterate the list's own n,
+  // bounded by this, and test the kind first, so a long list costs its length
+  // in that cell only; a cell no site reaches still costs one read.
+  kSiteCellMax = 128,
   // The deepest a stamp may sink (kS_Sink): genCell overlays template cells
   // from h - 1 - kStampSinkMax up, so a deeper footing would be cut off.
   kStampSinkMax = 8,
@@ -890,6 +896,7 @@ struct WorldMapData {
     int roadYA = 0, roadYB = 0;
     uint32_t roadMat = 0;
     int roadDepth = 0;
+    int roadFlags = 0;                    // kS_RoadFlags
     int road = -1;
   };
   std::vector<StampSite> sites;           // stamps, water and tree sites, in site-id order

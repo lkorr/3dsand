@@ -33,6 +33,7 @@
 // exit), and the temp directory deleted.
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -782,23 +783,96 @@ Status GateRoads(Ctx& c, std::string& detail) {
       if (!fOk) problems.push_back(Format("F: %d / %d far cells tinted, %d off-road%s", tint, on4, offTint, why.c_str()));
     }
 
-    // ---- G. sleep ----
+    // ---- G. sleep, on THE GATE MAP with roads laid over it ----
+    // The synthetic forest is not a world the suite holds to the sleep budget
+    // (its ponds and its fresh forest settle on their own clock, roads or
+    // none); the gate map is (`sleep`). So the claim is made there: the
+    // loaded map's own map.json + two roads graded at 1 % across the window's
+    // own rolling ground (so they cut and fill), regenerated, ticked to rest.
+    restoreOverride();
     {
-      uint32_t t = 93000;
-      sandvox::support::TickCursor tick{c, t, IVec3{(ox + 256) >> 4, G >> 4, (oz + 200) >> 4}};
-      uint32_t active = kNumSlots;
-      int ticks = 0;
-      for (; ticks < 2000; ticks++) {
-        tick();
-        if (ticks >= 200 && ticks % 100 == 0) {
-          c.ctx.WaitIdle();
-          active = sandvox::ReadActiveChunksSync(c.ctx, c.world, c.sim);
-          if (active <= 32) break;
-        }
+      std::ifstream hf(dir + "/worldmap/" + real.name + "/map.json");
+      nlohmann::json hj;
+      try { hf >> hj; } catch (...) {}
+      const std::vector<RoadCase> gate = {
+          {"g1_road", "road", "cobble", 30, 8, 1, 3, {{ox + 30, oz + 100}, {ox + 250, oz + 150}, {ox + 480, oz + 90}}},
+          {"g2_path", "path", "packed_earth", 12, 4, 1, 2, {{ox + 60, oz + 480}, {ox + 340, oz + 260}}},
+      };
+      nlohmann::json gr = nlohmann::json::array();
+      for (const RoadCase& rc : gate) {
+        nlohmann::json pts = nlohmann::json::array();
+        for (const auto& [x, z] : rc.pts) pts.push_back({x, z});
+        gr.push_back({{"id", rc.id}, {"kind", rc.kind}, {"surface", rc.surface}, {"width", rc.width},
+                      {"shoulder", rc.shoulder}, {"maxGrade", rc.grade}, {"depth", rc.depth}, {"points", pts}});
       }
-      const bool gOk = active <= 32;
-      std::printf("roads: G sleep: %s (%u active chunks after %d ticks)\n", gOk ? "PASS" : "FAIL", active, ticks);
-      if (!gOk) problems.push_back(Format("G: %u chunks still awake after %d ticks", active, ticks));
+      hj["roads"] = gr;
+      const std::string ht = hj.dump();
+      worldmap::WorldMapData hm;
+      std::string hl;
+      std::vector<uint32_t> hw;
+      if (!worldmap::LoadWorldMap(dir, real.name, set, c.mats.size(), kDefaultSeed, hm, hl, &ht) ||
+          !worldmap::PackWorldMap(set, hm, hw, hl)) {
+        problems.push_back("G: the gate map with roads did not load: " + hl.substr(0, 300));
+      } else {
+        worldmap::SetCurrentWorldMap(hm);
+        c.ctx.WaitIdle();
+        c.sim.UploadEnvironment(c.ctx.device, c.ctx.queue, atlas, hw);
+        SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+        c.ctx.WaitIdle();
+        int moved = 0;
+        for (const RoadCase& rc : gate)
+          for (int i = 0; i <= 64; i++) {
+            const double f = i / 64.0;
+            const int x = static_cast<int>(std::lround(rc.pts[0].first + (rc.pts[1].first - rc.pts[0].first) * f));
+            const int z = static_cast<int>(std::lround(rc.pts[0].second + (rc.pts[1].second - rc.pts[0].second) * f));
+            moved = std::max(moved, std::abs(World::TerrainHeight(x, z, kDefaultSeed) -
+                                             worldmap::BareGroundHeight(x, z, kDefaultSeed)));
+          }
+        uint32_t t = 93000;
+        sandvox::support::TickCursor tick{c, t, IVec3{(ox + 256) >> 4, (World::TerrainHeight(ox + 256, oz + 150, kDefaultSeed)) >> 4,
+                                                      (oz + 150) >> 4}};
+        uint32_t active = kNumSlots;
+        int ticks = 0;
+        for (; ticks < 3000; ticks++) {
+          tick();
+          if (ticks >= 200 && ticks % 100 == 0) {
+            c.ctx.WaitIdle();
+            active = sandvox::ReadActiveChunksSync(c.ctx, c.world, c.sim);
+            if (active <= 32) break;
+          }
+        }
+        // WHERE they are awake (CLAUDE.md verification rule 6): over a road's
+        // reshaped ground (the half-width + the widest shoulder + a chunk) or
+        // not, and how far the chunk's centre sits from the ground under it.
+        c.ctx.WaitIdle();
+        std::vector<uint32_t> fl(kNumSlots, 0);
+        rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.DirtyActive(), 0, fl.data(), kNumSlots * 4, "roadsActive");
+        int nearRoad = 0, elsewhere = 0;
+        std::string where;
+        const int m = static_cast<int>(kNChunk) - 1;
+        const int sh = std::countr_zero(kNChunk);
+        for (uint32_t i = 0; i < kNumChunks; i++) {
+          if (fl[i] == 0) continue;
+          const int sx = static_cast<int>(i) & m, sy = (static_cast<int>(i) >> sh) & m, sz = static_cast<int>(i) >> (2 * sh);
+          const IVec3 wc{org.x + ((sx - org.x) & m), org.y + ((sy - org.y) & m), org.z + ((sz - org.z) & m)};
+          const int cxv = wc.x * 16 + 8, czv = wc.z * 16 + 8;
+          bool near = false;
+          for (const RoadCase& rc : gate)
+            if (PolyDist(rc.pts, cxv, czv) <= rc.width / 2 + 64 + 12) near = true;
+          (near ? nearRoad : elsewhere)++;
+          if (where.size() < 400)
+            where += Format(" (%d,%d,%d)%s dy%+d", wc.x, wc.y, wc.z, near ? "R" : "",
+                            wc.y * 16 + 8 - World::TerrainHeight(cxv, czv, kDefaultSeed));
+        }
+        const bool gOk = active <= 32 && moved >= 2;
+        std::printf("roads: G sleep: %s (the gate map + 2 roads graded at 1 %%, moving its ground up to %d voxels: %u active "
+                    "chunks after %d ticks, %d over a road's ground, %d elsewhere)%s%s\n",
+                    gOk ? "PASS" : "FAIL", moved, active, ticks, nearRoad, elsewhere, gOk ? "" : " --",
+                    gOk ? "" : where.c_str());
+        if (!gOk)
+          problems.push_back(Format("G: %u chunks still awake after %d ticks (%d over a road), ground moved %d", active, ticks,
+                                    nearRoad, moved));
+      }
     }
   }
 
@@ -830,9 +904,11 @@ Status GateRoads(Ctx& c, std::string& detail) {
     std::printf("roads: H site index on default: %s (shipped: %zu roads, worst cell %d sites; with a 3-road test network "
                 "through Harrowby (%d pieces in all): worst cell %d; the cap is %d)%s%s\n",
                 hOk ? "PASS" : "FAIL", d0.roads.size(), d0.siteCellWorst, pieces1, d1.siteCellWorst,
-                static_cast<int>(worldmap::kSiteCellMax), ok0 ? "" : (" shipped refused: " + l0).c_str(),
-                ok1 ? "" : (" network refused: " + l1).c_str());
-    if (!hOk) problems.push_back("H: default " + std::string(ok0 ? "" : "REFUSED: " + l0) + (ok1 ? "" : " with the network REFUSED: " + l1));
+                static_cast<int>(worldmap::kSiteCellMax), ok0 ? "" : (" shipped refused: " + l0.substr(0, 200)).c_str(),
+                ok1 ? "" : (" network refused: " + l1.substr(0, 200)).c_str());
+    if (!hOk)
+      problems.push_back("H: default " + std::string(ok0 ? "" : "REFUSED: " + l0.substr(0, 200)) +
+                         (ok1 ? "" : " with the network REFUSED: " + l1.substr(0, 200)));
   }
 
   // ---- the pristine world back ------------------------------------------------------

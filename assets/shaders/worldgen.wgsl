@@ -1501,6 +1501,7 @@ const WM_S_ROAD_Y_A      : u32 = 9u;    // road piece: baked surface Y at end A,
 const WM_S_ROAD_Y_B      : u32 = 10u;   // road piece: ... at end B (kS_BoxX1 / kS_BoxZ1)
 const WM_S_ROAD_MAT      : u32 = 11u;   // road piece: the SOLID surface material
 const WM_S_ROAD_DEPTH    : u32 = 12u;   // road piece: surface cells from the ground's top down
+const WM_S_ROAD_FLAGS    : u32 = 15u;   // road piece: 1 = end A OPEN, 2 = end B open (a collinear joint)
 // worldmap.h kSiteRoadShoulderMax: the fixed pond keep-out past a road's
 // half-width (sitePadNear), and kSiteRoadFarTint: how far past it a road
 // still tints a far cell its line crosses (roadTint).
@@ -1513,7 +1514,7 @@ const WM_STAMP_TREE_CLEAR : i32 = 10;
 // The salt of a clearing's feather-band thinning roll (clearingRefuses): its
 // own hash stream, so it does not correlate with the tile's density roll.
 const CLEARING_THIN_SALT : u32 = 0xC1EA5u;
-const WM_SITE_CELL_MAX   : u32 = 32u;   // sites per cell list (the loader refuses more)
+const WM_SITE_CELL_MAX   : u32 = 128u;   // sites per cell list (the loader refuses more)
 const WM_STAMP_SINK_MAX  : i32 = 8;     // deepest kS_Sink (worldmap.h kStampSinkMax)
 const WM_SITE_TREE_KEEP_OUT : u32 = 6u; // a tree site's trunk keep-out, Chebyshev voxels
 const WM_STAMP_HDR_WORDS : u32 = 4u;
@@ -2005,8 +2006,12 @@ fn routeNear(sid : u32, x : i32, z : i32, keep : i32) -> bool {
 // A ROAD PIECE at a column (worldmap.h kSiteRoad): x = the squared distance
 // to its centreline (routeDist2, -1 outside the box grown by `reach`), y =
 // the baked road surface at the column's projection onto it, Q8 voxels --
-// the two ends' baked Y lerped by the projection parameter. Bounds: the ends
-// are <= kSiteRoadPieceMax (256) apart a side, so l2 <= 131,072 and the
+// the two ends' baked Y lerped by the projection parameter. An OPEN end (a
+// joint with the next piece on the same straight, kS_RoadFlags) has no round
+// cap: a column past it is the next piece's alone -- a cap there would pull
+// that piece's ground toward this end's Y and steepen the grade between.
+// Bounds: the ends are <= kSiteRoadPieceMax (256) apart a side, so l2 <=
+// 131,072, the dot product after routeDist2's box reject is < 2.4e5 and the
 // clamped t * 256 <= 3.4e7; |yb - ya| <= 256 voxels of grade at 100 %, so
 // (yb - ya) * tq <= 65,536 * 256 = 1.7e7. world.cpp roadProj is the twin.
 fn roadProj(sid : u32, x : i32, z : i32, reach : i32) -> vec2<i32> {
@@ -2017,7 +2022,10 @@ fn roadProj(sid : u32, x : i32, z : i32, reach : i32) -> vec2<i32> {
   let vx = wmSiteI(sid, WM_S_BOX_X1) - ax;
   let vz = wmSiteI(sid, WM_S_BOX_Z1) - az;
   let l2 = max(vx * vx + vz * vz, 1);
-  let t = clamp((x - ax) * vx + (z - az) * vz, 0, l2);
+  let dot = (x - ax) * vx + (z - az) * vz;
+  let fl = wmSiteI(sid, WM_S_ROAD_FLAGS);
+  if ((dot < 0 && (fl & 1) != 0) || (dot > l2 && (fl & 2) != 0)) { return vec2<i32>(-1, 0); }
+  let t = clamp(dot, 0, l2);
   let tq = (t * 256) / l2;
   let ya = wmSiteI(sid, WM_S_ROAD_Y_A);
   let yb = wmSiteI(sid, WM_S_ROAD_Y_B);
@@ -4421,7 +4429,11 @@ fn ccStore(w : u32, col : ptr<function, Col>, cave : ptr<function, CaveBands>,
   colCache[w + CCW_SHORE_SURF] = bitcast<u32>((*col).shore.surf);
   colCache[w + CCW_PLANT_BASE] = bitcast<u32>((*col).plant.base);
   colCache[w + CCW_PLANT_TOP] = bitcast<u32>((*col).plant.top);
-  colCache[w + CCW_BIOME] = (*col).biome;
+  // The biome id is a byte (the map's plane); the road surface a carriageway
+  // column lays (12 bits) and its depth (<= 8) ride above it (map v2 R1), so
+  // genChunk sees Col.road without another word per column.
+  colCache[w + CCW_BIOME] = ((*col).biome & 0xFFu) | (((*col).road.mat & 0xFFFu) << 8u) |
+                            (u32((*col).road.depth) << 20u);
   colCache[w + CCW_WP] = (*col).wp;
   colCache[w + CCW_SHORE_WP] = (*col).shore.wp;
   colCache[w + CCW_PACKED] = ((*col).fluid & 0xFFFu) | (((*col).plant.mat & 0xFFFu) << 12u) |
@@ -4445,7 +4457,10 @@ fn ccLoad(w : u32, col : ptr<function, Col>, cave : ptr<function, CaveBands>) {
   (*col).h = bitcast<i32>(colCache[w + CCW_H]);
   (*col).slope = bitcast<i32>(colCache[w + CCW_SLOPE]);
   (*col).sed = bitcast<i32>(colCache[w + CCW_SED]);
-  (*col).biome = colCache[w + CCW_BIOME];
+  (*col).biome = colCache[w + CCW_BIOME] & 0xFFu;
+  (*col).road = roadNone();
+  (*col).road.mat = (colCache[w + CCW_BIOME] >> 8u) & 0xFFFu;
+  (*col).road.depth = i32((colCache[w + CCW_BIOME] >> 20u) & 0xFu);
   (*col).pond = bitcast<i32>(colCache[w + CCW_POND]);
   (*col).pw = vec2<i32>(bitcast<i32>(colCache[w + CCW_PW_X]),
                         bitcast<i32>(colCache[w + CCW_PW_Y]));

@@ -22993,18 +22993,26 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   appended to `materials.json` for this). **The bake** (`LoadWorldMap`, with
   the map installed like the pad bake): the polyline sampled every 4 voxels,
   the BARE ground there (`BareGroundHeight`, no road and no pad in it),
-  low-passed (±4 samples), grade-limited — `lo` = the largest maxGrade-
+  low-passed (±8 samples, 32 voxels), grade-limited — `lo` = the largest maxGrade-
   Lipschitz profile under it, `hi` = the smallest over it (min-plus
   transforms, forward + backward), road = `(lo + hi) / 2`, Q8 voxels — then
   cut into `kSiteRoad` site records (`kind 8`, at the END of the site table):
-  a chord per run of samples while the profile stays within half a voxel of
+  a chord per run of samples while the profile stays within one voxel of
   it and the run is ≤ `kSiteRoadPieceMax` 256 a side (routeDist2's i32
   bound), vertices always ending a piece. Record: ends A/B (`kS_X/Z`,
   `kS_BoxX1/Z1`, a route's layout), `kS_RoadYA/YB` (Q8 surface at the ends),
   `kS_Radius` half-width, `kS_PadMargin` shoulder — WIDENED at load to
   `2·gap + 2` (gap = the road vs the bare ground at the shoulder's outer edge,
   probed every 8 voxels both sides), capped at `kSiteRoadShoulderMax` 64, the
-  stamp ramp's rule — `kS_RoadMat`, `kS_RoadDepth`. The pieces are cut twice
+  stamp ramp's rule, ONE value per polyline segment — `kS_RoadMat`,
+  `kS_RoadDepth`, `kS_RoadFlags` (end A / B OPEN: a joint with the next piece
+  of the same straight has no round cap, or the cap would pull that piece's
+  ground toward the joint's Y and steepen the grade between — measured: 47
+  over-grade 16-voxel spans on a 25 % path before, 0 after; a bend vertex and
+  a road end keep their caps). `kSiteCellMax` went 32 -> 128 with this
+  (Harrowby's cell: 28 sites, 42-44 with its paths as roads, up to 93 with a
+  3-road test network at the first, finer cut; the `roads` gate's H line
+  reports the number). The pieces are cut twice
   (straight first, so the pond keep-out the bare ground reads exists; re-cut
   after the bake along the same lines) and the site index is built twice.
   **Readers:** `roadPadAt` in the `landheight` mirror, applied BEFORE

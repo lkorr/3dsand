@@ -1840,7 +1840,8 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     // ---- THE ROAD PROFILES (map v2 R1, worldmap.h kSiteRoad) ------------------
     // Per road, deterministic integer arithmetic on the BARE ground (no road
     // and no pad in it: landColumnBare), sampled every kRoadStep voxels along
-    // the polyline. Low-passed (a moving mean over +-kRoadSmooth samples),
+    // the polyline. Low-passed (a moving mean over +-kRoadSmooth samples, 32
+    // voxels: a road does not follow the 3 m bumps),
     // then GRADE-LIMITED: `lo` is the largest profile under the smoothed
     // ground whose slope never exceeds maxGrade (a min-plus distance
     // transform, forward then backward), `hi` the smallest one over it, and
@@ -1848,13 +1849,16 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     // profiles, +1 Q8 unit of rounding), cutting every bump and filling every
     // dip by the same amount. Q8 voxels throughout.
     // Then the pieces are RE-CUT along each segment: a chord is kept when the
-    // profile strays at most half a voxel from it and it is <= 256 voxels a
-    // side, else it is split at the sample farthest from it (the middle, when
+    // profile strays at most kRoadChordTolQ8 (one voxel) from it and it is <=
+    // 256 voxels a side -- a chord between two profile points is within
+    // maxGrade by construction, and a half-voxel tolerance cut rolling ground
+    // into ~60-voxel pieces (209 for 12 km of test network), which is what
+    // fills a village's site cell, else it is split at the sample farthest from it (the middle, when
     // only the length is the problem). The re-cut lies on the first cut's
     // lines to within the samples' integer rounding (a voxel), so the bare
     // ground sampled here is the ground under the final pieces too.
     if (!out.roads.empty()) {
-      constexpr int kRoadStep = 4, kRoadSmooth = 4;
+      constexpr int kRoadStep = 4, kRoadSmooth = 8, kRoadChordTolQ8 = 256;
       std::vector<WorldMapData::StampSite> cut;
       for (size_t ri = 0; ri < out.roads.size(); ri++) {
         WorldMapData::Road& rd = out.roads[ri];
@@ -1924,15 +1928,22 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
             }
             const bool tooLong =
                 std::max(std::abs(sx[b] - sx[a]), std::abs(sz[b] - sz[a])) > static_cast<int>(kSiteRoadPieceMax);
-            if (b - a > 1 && (tooLong || dev > 128)) {
-              const int m = (dev <= 128 || farK < 0) ? (a + b) / 2 : farK;
+            if (b - a > 1 && (tooLong || dev > kRoadChordTolQ8)) {
+              const int m = (dev <= kRoadChordTolQ8 || farK < 0) ? (a + b) / 2 : farK;
               stack.push_back({m, b});   // popped second: the pieces come out in order
               stack.push_back({a, m});
               continue;
             }
             done.push_back({a, b});
           }
-          for (const auto& [a, b] : done) {
+          // One SHOULDER per segment (the widest its pieces need) and the
+          // joints between them OPEN: the pieces of one straight are then
+          // one road to the height blend, with no cap and no step in the
+          // shoulder where one piece hands over to the next.
+          int segShoulder = rd.shoulder;
+          const size_t seg0 = cut.size();
+          for (size_t pi = 0; pi < done.size(); pi++) {
+            const auto [a, b] = done[pi];
             WorldMapData::StampSite st;
             st.id = "road " + rd.id + " #" + std::to_string(++q);
             st.kind = kSiteRoad;
@@ -1966,9 +1977,11 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
                 gap = std::max(gap, std::abs(BareGroundHeight(px, pz, seed) - y));
               }
             }
-            st.padMargin = std::max(st.padMargin, std::min(static_cast<int>(kSiteRoadShoulderMax), 2 * gap + 2));
+            segShoulder = std::max(segShoulder, std::min(static_cast<int>(kSiteRoadShoulderMax), 2 * gap + 2));
+            st.roadFlags = (pi > 0 ? 1 : 0) | (pi + 1 < done.size() ? 2 : 0);
             cut.push_back(std::move(st));
           }
+          for (size_t pi = seg0; pi < cut.size(); pi++) cut[pi].padMargin = segShoulder;
         }
         rd.pieces = q;
       }
@@ -2189,6 +2202,7 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
       r[kS_RoadYA] = U(s.roadYA); r[kS_RoadYB] = U(s.roadYB);
       r[kS_RoadMat] = s.roadMat;
       r[kS_RoadDepth] = U(s.roadDepth);
+      r[kS_RoadFlags] = U(s.roadFlags);
     }
     if (s.kind == kSiteStamp) {
       r[kS_BoxX0] = U(s.bx0); r[kS_BoxZ0] = U(s.bz0);
