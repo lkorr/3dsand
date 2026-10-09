@@ -719,6 +719,13 @@ class RunLock:
                     ts = None
                 if ts is not None and ts and time.time() - ts > RUNLOCK_STALE_SEC:
                     shutil.rmtree(RUNLOCK_DIR, ignore_errors=True)
+                # An ORPHAN (no pid, untouched for 30 s) is nobody's: every
+                # acquirer writes its pid within milliseconds of the mkdir.
+                # Twin of the orphan rule in scripts/svlock.sh, which says why.
+                elif (os.path.isdir(RUNLOCK_DIR) and
+                      not os.path.exists(os.path.join(RUNLOCK_DIR, "pid")) and
+                      time.time() - os.path.getmtime(RUNLOCK_DIR) > 30):
+                    shutil.rmtree(RUNLOCK_DIR, ignore_errors=True)
             except OSError:
                 pass
             try:

@@ -896,7 +896,20 @@ function readLit(wv, cv){
         }
         say(!!cell && cell.join() === [-1706, gIn + 3, 1150, mat.id].join(), 'locales/e4test/ground.svedit holds exactly that voxel (resolved back: ' + JSON.stringify(cell) + ')');
         ok = await waitFor(function () { V3.update(); return (V3.cellAtWorld(-1706, gIn + 3, 1150, 0) & 0xFFF) === mat.id && !V3.edit.unsaved.size; }, 120000);
-        say(ok, 'the voxel server applies the saved locale layer: the re-fetched region carries it (map=' + FIX + ', layer @map)');
+        var at3 = V3.cellAtWorld(-1706, gIn + 3, 1150, 0);
+        var r3 = V3.regions.get('0:' + Math.floor(-1706 / 64) + ',' + Math.floor((gIn + 3) / 64) + ',' + Math.floor(1150 / 64));
+        say(ok, 'the voxel server applies the saved locale layer: the re-fetched region carries it (map=' + FIX + ', layer @map)' +
+            (ok ? '' : ' -- cell word ' + at3 + ', its region ' + (r3 ? (r3.empty ? 'EMPTY' : r3.buried ? 'BURIED' : 'resident') : 'absent') +
+             ', unsaved ' + V3.edit.unsaved.size + ', stream: ' + V3.streamStatus() +
+             ', coarser: ' + [1, 2, 3].map(function (L) {
+               var e = 64 << L, k = L + ':' + Math.floor(-1706 / e) + ',' + Math.floor((gIn + 3) / e) + ',' + Math.floor(1150 / e);
+               var q = V3.regions.get(k);
+               var re = 0;
+               if (q && q.cells) for (var zz = 0; zz < 64; zz++) for (var yy = 0; yy < 64; yy++) for (var xx = 0; xx < 64; xx++)
+                 if (q.cells[(zz * 64 + yy) * 64 + xx]) re |= 1 << ((xx >= 32 ? 1 : 0) | (yy >= 32 ? 2 : 0) | (zz >= 32 ? 4 : 0));
+               var li = q && q.cells ? [Math.floor((-1706 - q.origin[0]) / q.lod), Math.floor((gIn + 3 - q.origin[1]) / q.lod), Math.floor((1150 - q.origin[2]) / q.lod)] : null;
+               return k + '=' + (q ? (q.empty ? 'EMPTY' : q.buried ? 'BURIED' : 'oct ' + q.oct + ' (recount ' + re + ') origin ' + q.origin.join(',') + ' lod ' + q.lod + ' dims ' + [q.nx, q.ny, q.nz] + ' local ' + li + ' len ' + q.cells.length + ' word ' + V3._wordAt(-1706, gIn + 3, 1150, L, [])) : 'absent');
+             }).join(' ')));
         V3.edit.clear();
         await LCx.view3d.save();
         rr = await fetch('/api/worldedit?map=' + FIX + '&locale=e4test&seed=1337', {cache: 'no-store'});

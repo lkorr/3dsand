@@ -3148,11 +3148,13 @@ export function attach(hooks) {
 #env-map .mapcrumb{font:12px monospace;color:#cfeeff;padding:2px 4px;border:1px solid #2b4a6f;border-radius:4px;background:#12161f}
 #env-map .mapcrumb a{color:#7fd4ff}
 #env-map .mapcrumb canvas{image-rendering:pixelated;vertical-align:middle}
-#env-map .maplocale3d{display:flex;flex-direction:column;gap:4px;flex:0 0 300px;min-height:0}
+#env-map .maplocale3d{display:flex;flex-direction:column;gap:4px;flex:1.6 1 0;min-height:440px}
+#env-map .maplocale3d-canvas{flex:1;min-height:360px;width:100%;background:#0e1116;border:1px solid #2a3040;border-radius:6px;outline:none;touch-action:none}
+#env-map .maplocale3d.max{position:fixed;inset:0;z-index:1000;background:#0b0e13;padding:8px;min-height:0}
+#env-map .maplocale3d-help{font-size:11px;color:#7d8798}
 #env-map .maptoolsep{display:inline-block;width:1px;height:18px;background:#2a3040;margin:0 3px}
 #env-map .mapjob{border:1px solid #6a5a1a;border-radius:4px;padding:2px 6px;background:#1a1608}
 #env-map .mapkind-range{color:#e8a060}
-#env-map .maplocale3d-canvas{flex:1;min-height:200px;width:100%;background:#0e1116;border:1px solid #2a3040;border-radius:6px}
 `;
   document.head.append(style);
 

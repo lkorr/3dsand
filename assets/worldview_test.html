@@ -50,6 +50,14 @@ function done(){
     wv.cam.pos = [num('x', 32), num('y', 260), num('z', -40)];
     wv.cam.yaw = num('yaw', 0); wv.cam.pitch = num('pitch', -0.5);
     wv.view.levels = num('levels', 2);
+    // orbit=<dist>: the locale editor's camera — orbit (x,y,z) from that far
+    // out. The case the eye-centred shells drew as an empty frame.
+    if (Q.get('orbit')) {
+      wv.cam.mode = 'orbit';
+      wv.cam.target = [num('x', 32), num('y', 200), num('z', -40)];
+      wv.cam.dist = num('orbit', 300);
+      wv.cam.yaw = num('yaw', 0.7); wv.cam.pitch = num('pitch', -0.6);
+    }
     wv.view.showRegions = Q.get('lod') === '1';
 
     // update() only — NOT render(). Under SwiftShader a 1400x900 frame with

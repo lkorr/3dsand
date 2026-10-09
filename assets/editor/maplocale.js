@@ -899,7 +899,16 @@ export function createLocaleLayer(C) {
       ui.undo = el('button', {}, 'Undo'); ui.redo = el('button', {}, 'Redo');
       ui.save = el('button', {class: 'mapgo', title: 'write the locale\'s own voxel layer (stored ground-relative by the engine)'}, 'Save voxels');
       ui.reload = el('button', {title: 'drop the regions and fetch them again'}, 'Reload');
+      ui.frameBtn = el('button', {title: 'orbit the locale anchor again, the whole locale in view'}, 'Frame');
+      ui.max = el('button', {title: 'fill the window with the 3D view (Esc or this button again to restore)'}, 'Maximize');
+      ui.detail = el('select', {title: 'level of detail: how close a region must be before it is drawn at full resolution. Higher is sharper further out and costs more regions'},
+                     ...[['0.6', 'detail low'], ['1', 'detail normal'], ['1.6', 'detail high']].map(([v, t]) => el('option', {value: v}, t)));
+      ui.detail.value = '1';
       ui.status = el('span', {class: 'mapnote'}, '');
+      ui.stream = el('span', {class: 'mapnote'}, '');
+      ui.help = el('div', {class: 'maplocale3d-help'},
+        'Drag: turn · Shift+drag or middle-drag: pan · Wheel: zoom · WASD/QE: move the orbit point · Double-click: orbit what you clicked · ' +
+        'Brush / erase edit full-resolution cells inside the locale bounds (zoom in until the readout says editable).');
       ui.tool.addEventListener('change', () => { if (wv) { wv.tool.name = ui.tool.value; } });
       ui.mat.addEventListener('change', () => { if (wv) wv.tool.material = +ui.mat.value; });
       ui.radius.addEventListener('change', () => { if (wv) wv.tool.radius = Math.max(0, Math.min(12, Math.round(+ui.radius.value || 0))); });
@@ -907,14 +916,47 @@ export function createLocaleLayer(C) {
       ui.redo.addEventListener('click', () => { if (wv) { wv.redo(); status(); } });
       ui.save.addEventListener('click', () => save());
       ui.reload.addEventListener('click', () => { if (wv) { wv.invalidate(); status(); } });
-      ui.root.append(el('div', {class: 'mapbar'}, el('b', {}, '3D (voxels)'), ' tool ', ui.tool, ' ', ui.mat, ' r ', ui.radius, ui.undo, ui.redo, ui.save, ui.reload, ui.status), ui.canvas);
+      ui.frameBtn.addEventListener('click', () => { if (wv && L3) frameLocale(L3); });
+      ui.max.addEventListener('click', () => maximize(!ui.root.classList.contains('max')));
+      ui.detail.addEventListener('change', () => { if (wv) wv.view.detail = +ui.detail.value || 1; });
+      ui.canvas.addEventListener('keydown', ev => { if (ev.key === 'Escape' && ui.root.classList.contains('max')) maximize(false); });
+      ui.root.append(el('div', {class: 'mapbar'}, el('b', {}, '3D (voxels)'), ' tool ', ui.tool, ' ', ui.mat, ' r ', ui.radius, ui.undo, ui.redo, ui.save, ui.reload, ui.frameBtn, ui.detail, ui.max, ui.status),
+                     ui.canvas, el('div', {class: 'mapbar'}, ui.stream), ui.help);
       return ui.root;
+    }
+    function maximize(on) {
+      ui.root.classList.toggle('max', on);
+      ui.max.textContent = on ? 'Restore' : 'Maximize';
+      if (on) ui.canvas.focus();
     }
     function status(t) {
       if (!ui.status) return;
       if (t) { ui.status.textContent = t; return; }
       if (!wv) return;
-      ui.status.textContent = `${wv.edit.count()} voxels in the locale layer${wv.edit.unsaved.size ? ' (' + wv.edit.unsaved.size + ' unsaved)' : ''} · ${wv.regions.size} regions`;
+      ui.status.textContent = `${wv.edit.count()} voxels in the locale layer${wv.edit.unsaved.size ? ' (' + wv.edit.unsaved.size + ' unsaved)' : ''}`;
+    }
+    // The streaming line under the canvas, plus what is under the cursor: an
+    // empty view always says why (still loading, a slow server, an error).
+    function streamLine() {
+      if (!wv) return;
+      const h = wv.hover, b = wv.editBounds;
+      let s = wv.streamStatus();
+      if (h) {
+        const m = wv.pal && wv.pal.materials[h.mat];
+        const inB = !b || (h.vox[0] >= b[0] && h.vox[2] >= b[1] && h.vox[0] <= b[2] && h.vox[2] <= b[3]);
+        s += `  ·  ${m ? m.name : '#' + h.mat} at ${h.vox.join(', ')}` +
+             (h.lod > 1 ? ` (1:${h.lod} preview, zoom in to edit)` : inB ? ' (editable)' : ' (outside the locale bounds)');
+      }
+      if (ui.stream.textContent !== s) ui.stream.textContent = s;
+    }
+    function frameLocale(L) {
+      const e = checkEntry(L.id), gy = e ? e.groundY : L.anchor.y;
+      const b = boundsOf(L);
+      wv.cam.mode = 'orbit';
+      wv.cam.target = [L.anchor.at[0], gy, L.anchor.at[1]];
+      // the whole locale in view: its larger side, from a 35 degree look-down
+      wv.cam.dist = Math.max(60, Math.min(900, 0.9 * Math.max(b[2] - b[0], b[3] - b[1])));
+      wv.cam.yaw = 0.7; wv.cam.pitch = -0.6;
     }
     async function ensure() {
       if (wv) return wv;
@@ -922,10 +964,13 @@ export function createLocaleLayer(C) {
       try {
         wv = new window.WorldView(ui.canvas, {seaY: C.seaY ? C.seaY() : 0});
       } catch (e) { status('3D view unavailable: ' + e.message); wv = null; return null; }
-      wv.view.levels = 2;
       wv.view.showFar = false;
       wv.view.showAxes = false;
-      wv.onError = m => status('region failed: ' + m);
+      wv.view.detail = +ui.detail.value || 1;
+      // the ground under each root column, so the octree sits on the terrain
+      // however far the orbit camera is pulled back
+      wv.groundAt = (x, z) => (C.groundAt ? C.groundAt(x, z) : null);
+      wv.onError = () => streamLine();
       wv.onEdit = () => status();
       return wv;
     }
@@ -961,13 +1006,7 @@ export function createLocaleLayer(C) {
       wv.tool.name = ui.tool.value;
       wv.tool.radius = Math.max(0, Math.round(+ui.radius.value || 2));
       wv.edit.clear(); wv.edit.markSaved();
-      const e = checkEntry(L.id), gy = e ? e.groundY : L.anchor.y;
-      wv.cam.mode = 'orbit';
-      wv.cam.target = [L.anchor.at[0], gy, L.anchor.at[1]];
-      // close enough that the anchor is in the 1:1 level (edits land only there:
-      // a 3 x 3 x 3 shell of 64-voxel regions round the EYE); wheel out to see more
-      wv.cam.dist = 70;
-      wv.cam.yaw = 0.7; wv.cam.pitch = -0.6;
+      frameLocale(L);
       wv.invalidate();
       if (!raf) { last = 0; raf = requestAnimationFrame(frame); }
       try {
@@ -981,6 +1020,7 @@ export function createLocaleLayer(C) {
       if (wv && wv.edit.unsaved.size) C.toast(`left ${wv.edit.unsaved.size} unsaved voxel edit(s) of locale "${L3 && L3.id}" behind (not written)`, true);
       L3 = null;
       if (wv) { wv.edit.clear(); wv.edit.markSaved(); wv.invalidate(); }
+      if (ui.root) maximize(false);
     }
     // Render only when the picture can have changed (the camera, an edit, a
     // region or mesh arriving) -- as tuner.html's wvFrame does. A 3D view
@@ -988,10 +1028,10 @@ export function createLocaleLayer(C) {
     // a still image while the author works on the map beside it.
     let lastSig = '';
     function sig() {
-      const c = wv.cam;
-      let meshed = 0;
-      wv.regions.forEach(r => { meshed += (r.op ? 1 : 0) + (r.fl ? 2 : 0) + (r.dirty ? 4 : 0); });
-      return [c.mode, c.target, c.dist, c.yaw, c.pitch, c.pos, wv.editRev, wv.regions.size, meshed, wv.inflight,
+      const c = wv.cam, v = wv.view;
+      // drawRev covers everything that changes the picture without the camera
+      // moving (a mesh landing, a region arriving or leaving, an edit)
+      return [c.mode, c.target, c.dist, c.yaw, c.pitch, c.pos, wv.drawRev, v.detail,
               wv.tool.name, wv.tool.radius, wv.hover ? wv.hover.vox.join('.') : '-', ui.canvas.clientWidth, ui.canvas.clientHeight].join('|');
     }
     function frame(now) {
@@ -1002,6 +1042,7 @@ export function createLocaleLayer(C) {
       wv.step(dt); wv.update();
       const s = sig();
       if (s !== lastSig) { lastSig = s; wv.render(); }
+      streamLine();
     }
     async function save() {
       if (!wv || !L3) return false;

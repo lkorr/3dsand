@@ -35,20 +35,44 @@
  * looking at cells rather than at terrain.
  *
  * ---------------------------------------------------------------------------
- * LOD. Four levels, each a shell of 64^3-sample regions at lod 1, 2, 4 and 8 —
- * so a level-k region covers (64 << k) voxels per axis and every level costs
- * the same to fetch, mesh and store. A level-k region is skipped when it lies
- * entirely inside level k-1's coverage, which is exact because every extent is
- * a power of two multiple of the last. Past level 3 the heightfield from
- * /api/heightmap draws the horizon, which is the one thing a column map is
- * genuinely better at.
+ * LOD: AN OCTREE, NOT SHELLS. Four levels of 64^3-sample regions at lod 1, 2,
+ * 4 and 8, so a level-k region covers (64 << k) voxels per axis and every
+ * region costs the same to mesh and store. lod 8 is the top because a region
+ * may not span more than the residency window (512 voxels: the server refuses
+ * a lod-16 box), and it is the expensive one — the server generates every
+ * voxel of the box, ~0.4 s cold at lod 8 against ~50 ms at lod 1 — which is
+ * why the root ring is 3 x 3 columns and not wider.
+ * The roots are a ring of lod-8 regions round the camera, sat on the GROUND
+ * (opts.groundAt, else the orbit target / the eye) rather than on the eye; a
+ * node splits into its eight children while it is close to a FOCUS — the eye,
+ * and in orbit mode the target too — relative to its own size. Leaves are what
+ * you look at; internal nodes are fetched as well, for two reasons:
+ *   - FALLBACK. A node whose children are not all meshed yet draws ITSELF, so
+ *     the picture is always the finest complete cover, never a hole.
+ *   - SKY IS FREE. Downsampling is by majority over non-air cells, so a parent
+ *     sample is air only if its whole block is: an octant the parent holds as
+ *     all air is all air at every finer level, exactly. Such children are made
+ *     locally as empty regions and never requested.
+ *
+ * THIS REPLACED a fixed 3x3x3 shell per level centred on the EYE, which drew
+ * nothing in the case the locale editor lives in: an orbit camera zoomed out
+ * puts the eye in the sky, and every shell round it was air. The same version
+ * left a region that fell out of the queue marked pending forever, so a short
+ * zoom out and back deleted terrain until Reload — the queue is rebuilt from
+ * the tree every update now, and pending means "a request is in flight".
+ *
+ * Past the last level the heightfield from /api/heightmap draws the horizon,
+ * which is the one thing a column map is genuinely better at.
  *
  * SEAMS. A mesher that cannot see across a region boundary must guess, and both
  * guesses are wrong: "outside is air" emits a face the neighbour also emits
  * (z-fighting), "outside is solid" leaves a hole. So the mesher is handed the
- * six neighbour FACE SLABS when they exist, and a region is re-meshed when a
- * neighbour arrives. Missing neighbours read as solid, so the transient artifact
- * is a hole that fills itself rather than a flicker that does not.
+ * six neighbour FACE SLABS, sampled from whatever resident region holds each
+ * outside cell — same level first, then coarser, then finer, because in an
+ * octree the neighbour across a face is often another level. A region is
+ * re-meshed when a face neighbour arrives. Cells nothing holds read as solid,
+ * so the transient artifact is a hole that fills itself rather than a flicker
+ * that does not.
  *
  * ---------------------------------------------------------------------------
  * EDITING. Brush strokes and selection operations write into an EDIT LAYER —
@@ -70,7 +94,11 @@
 
   // ---- constants ----------------------------------------------------------
   var REGION_N = 64;          // samples per axis, every level
-  var LEVELS = 4;             // lod 1, 2, 4, 8
+  var LEVELS = 4;             // lod 1, 2, 4, 8: 64 x 8 = 512 = the server's box cap (kWorldN)
+  // The word a slab cell gets when no resident region holds it: any material
+  // id the palette does not define has class 0 (solid), so the mesher reads it
+  // as OPAQUE — the "missing reads as solid" rule, per cell instead of per slab.
+  var UNKNOWN_WORD = 0xFFF;
   var CHUNK = 16;             // engine chunk, in voxels — the grid overlay uses it
   var MAT_MASK = 0xFFF;
 
@@ -149,6 +177,15 @@
     '    o += c;',
     '  }',
     '  h.cells = cells;',
+    // Which octants hold anything: bit (x | y<<1 | z<<2) is set when that half-
+    // box has a non-air sample. The streamer's sky test (see the header): an
+    // octant that is all air here is all air at every finer level.
+    '  var oct = 0, hx = h.nx >> 1, hy = h.ny >> 1, hz = h.nz >> 1, k2 = 0;',
+    '  for (var z = 0; z < h.nz; z++) for (var y = 0; y < h.ny; y++) {',
+    '    var ob = (z >= hz ? 4 : 0) | (y >= hy ? 2 : 0);',
+    '    for (var x = 0; x < h.nx; x++, k2++) if (cells[k2]) oct |= 1 << (ob | (x >= hx ? 1 : 0));',
+    '  }',
+    '  h.oct = oct;',
     '  return h;',
     '}',
     '',
@@ -302,9 +339,9 @@
     '  if (m.cmd === "decode") {',
     '    try {',
     '      var h = decode(m.buf);',
-    '      self.postMessage({cmd: "decoded", key: m.key, head: h, cells: h.cells},',
+    '      self.postMessage({cmd: "decoded", key: m.key, meta: m.meta, head: h, cells: h.cells},',
     '                       [h.cells.buffer]);',
-    '    } catch (err) { self.postMessage({cmd: "error", key: m.key, error: String(err)}); }',
+    '    } catch (err) { self.postMessage({cmd: "error", key: m.key, meta: m.meta, error: String(err)}); }',
     '    return;',
     '  }',
     '  if (m.cmd === "mesh") {',
@@ -315,7 +352,7 @@
     '      self.postMessage({cmd: "meshed", key: m.key, gen: m.gen, rev: m.rev,',
     '                        op: r.op, fl: r.fl},',
     '        [r.op.verts.buffer, r.op.idx.buffer, r.fl.verts.buffer, r.fl.idx.buffer]);',
-    '    } catch (err) { self.postMessage({cmd: "error", key: m.key, error: String(err)}); }',
+    '    } catch (err) { self.postMessage({cmd: "error", key: m.key, mesh: true, error: String(err)}); }',
     '    return;',
     '  }',
     '};'
@@ -503,11 +540,26 @@
     this.canvas = canvas;
     this.opts = opts || {};
     this.gl = null;
-    this.regions = new Map();     // key -> region
-    this.pending = new Map();     // key -> true while fetching
-    this.queue = [];
-    this.inflight = 0;
-    this.maxInflight = 4;
+    this.regions = new Map();     // key -> region (live, cached, or made locally as empty)
+    this.pending = new Map();     // key -> gen, ONLY while a request is in flight
+    this._reqT0 = new Map();
+    this._failAt = new Map();     // key -> when its last request failed (retry after 5 s)      // key@gen -> request start, for "why is it slow"
+    this.queue = [];              // what to fetch next, rebuilt from the tree every update()
+    this.inflight = 0;            // requests not yet decoded, whatever their generation
+    this.maxInflight = 6;
+    this.tree = null;             // the octree of the last update(): {roots, nodes, leaves}
+    this._frame = 0;              // update() counter; region.lastLive is stamped with it
+    // The ground's y at a world column, or null where the host does not know.
+    // Optional; it puts the root ring on the terrain instead of round the eye,
+    // which matters for a camera high above the ground.
+    this.groundAt = this.opts.groundAt || null;
+    // Bumped by anything that changes what a frame would show without moving
+    // the camera — a mesh landing, a region arriving or leaving, an edit, the
+    // palette. Hosts that redraw only on change put it in their signature; a
+    // signature built from the camera and region COUNT missed meshes that
+    // landed after the last fetch, and the view sat on a blank frame until the
+    // mouse moved.
+    this.drawRev = 0;
     this.pal = null;              // parsed /api/voxpalette
     this.palTex = null;
     this.classes = null;
@@ -519,13 +571,19 @@
     // brush stroke.
     this.editRev = 0;
     this.stats = {regions: 0, quads: 0, draws: 0, fetches: 0, bytes: 0, ms: 0,
-                  farD: 0, farNeed: 0};
+                  farD: 0, farNeed: 0, errors: 0, lastError: '',
+                  live: 0, ready: 0, resident: 0, queued: 0, meshing: 0, slowMs: 0};
 
     this.view = {
       mode: 'material',           // material | class | height
       ao: 1.0,
       grid: 1.0,
       levels: LEVELS,
+      // A node splits while its distance to a focus is under detail x its own
+      // extent. 1 puts a lod-k sample at no more than ~15 px on a 1000 px
+      // canvas; 2 halves that and costs roughly 4x the regions.
+      detail: 1.0,
+      reach: 1,                   // root ring radius, in top-level (512-voxel) regions
       showChunks: false,
       showRegions: false,
       showAxes: true,
@@ -629,11 +687,26 @@
     return o;
   }
 
+  // A POOL when streaming: a cold octree is a few hundred regions to decode and
+  // mesh, and one worker made the last of them land seconds after the first.
+  // Replies are self-describing (key, gen, rev), so which worker answers does
+  // not matter.
   WorldView.prototype._initWorker = function () {
     var self = this;
-    var blob = new Blob([WORKER_SRC], {type: 'text/javascript'});
-    this.worker = new Worker(URL.createObjectURL(blob));
-    this.worker.onmessage = function (e) { self._onWorker(e.data); };
+    var url = URL.createObjectURL(new Blob([WORKER_SRC], {type: 'text/javascript'}));
+    var n = this.opts.streaming === false ? 1 :
+      Math.max(1, Math.min(4, ((global.navigator && navigator.hardwareConcurrency) || 4) - 2));
+    this.workers = [];
+    for (var i = 0; i < n; i++) {
+      var w = new Worker(url);
+      w.onmessage = function (e) { self._onWorker(e.data); };
+      this.workers.push(w);
+    }
+    this.worker = this.workers[0];
+    this._wrr = 0;
+  };
+  WorldView.prototype._post = function (msg, xfer) {
+    this.workers[this._wrr++ % this.workers.length].postMessage(msg, xfer || []);
   };
 
   // ---- palette ------------------------------------------------------------
@@ -672,7 +745,9 @@
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8UI, N, 4, 0, gl.RGBA_INTEGER,
                   gl.UNSIGNED_BYTE, data);
-    this.worker.postMessage({cmd: 'classes', classes: classes, passable: passable});
+    for (var w = 0; w < this.workers.length; w++)
+      this.workers[w].postMessage({cmd: 'classes', classes: classes, passable: passable});
+    this.drawRev++;
   };
 
   // ---- region keys and streaming -----------------------------------------
@@ -680,37 +755,133 @@
 
   WorldView.prototype._levelExtent = function (level) { return REGION_N << level; };
 
-  // The set of regions that should be resident, nearest level first.
-  WorldView.prototype._desired = function () {
-    var want = [];
-    var eye = this.camEye();
-    var covered = null;   // world-voxel box already owned by a finer level
-    for (var L = 0; L < this.view.levels; L++) {
-      var ext = this._levelExtent(L);
-      var cx = Math.floor(eye[0] / ext), cy = Math.floor(eye[1] / ext),
-          cz = Math.floor(eye[2] / ext);
-      var rad = 1, radY = 1;
-      var box = [(cx - rad) * ext, (cy - radY) * ext, (cz - rad) * ext,
-                 (cx + rad + 1) * ext, (cy + radY + 1) * ext, (cz + rad + 1) * ext];
-      for (var z = cz - rad; z <= cz + rad; z++)
-        for (var y = cy - radY; y <= cy + radY; y++)
-          for (var x = cx - rad; x <= cx + rad; x++) {
-            // Skip anything a finer level already draws. Exact, not a heuristic:
-            // every level's extent is a power-of-two multiple of the last, so a
-            // coarse region is either wholly inside the fine box or wholly out.
-            if (covered) {
-              var ox = x * ext, oy = y * ext, oz = z * ext;
-              if (ox >= covered[0] && oy >= covered[1] && oz >= covered[2] &&
-                  ox + ext <= covered[3] && oy + ext <= covered[4] && oz + ext <= covered[5])
-                continue;
-            }
-            var d = Math.max(Math.abs(x - cx), Math.abs(y - cy), Math.abs(z - cz));
-            want.push({level: L, rx: x, ry: y, rz: z, pri: L * 10 + d});
-          }
-      covered = box;
+  // Distance from the nearest focus to the cube [x0, x0+e)^3 — zero inside.
+  function boxDist(foci, x0, y0, z0, e) {
+    var best = Infinity;
+    for (var i = 0; i < foci.length; i++) {
+      var f = foci[i];
+      var dx = Math.max(x0 - f[0], 0, f[0] - (x0 + e));
+      var dy = Math.max(y0 - f[1], 0, f[1] - (y0 + e));
+      var dz = Math.max(z0 - f[2], 0, f[2] - (z0 + e));
+      var d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (d < best) best = d;
     }
-    want.sort(function (a, b) { return a.pri - b.pri; });
-    return want;
+    return best;
+  }
+
+  // The octree for this camera (see the header). Pre-order, so a parent is
+  // always in `nodes` before its children — update() relies on that to decide
+  // a child from its parent in the same pass.
+  WorldView.prototype._buildTree = function () {
+    var T = Math.max(0, Math.min(LEVELS, this.view.levels | 0) - 1);
+    var eT = REGION_N << T;
+    var eye = this.camEye();
+    var orbit = this.cam.mode === 'orbit';
+    var foci = orbit ? [eye, this.cam.target.slice()] : [eye];
+    var detail = Math.max(0.25, +this.view.detail || 1);
+    var R = Math.max(0, this.view.reach | 0);
+    var refY = orbit ? this.cam.target[1] : eye[1];
+    var nodes = new Map(), roots = [], leaves = [];
+    function visit(L, rx, ry, rz, parent, octant) {
+      var e = REGION_N << L;
+      var n = {key: regionKey(L, rx, ry, rz), level: L, rx: rx, ry: ry, rz: rz, e: e,
+               d: boxDist(foci, rx * e, ry * e, rz * e, e), parent: parent,
+               octant: octant, kids: null};
+      nodes.set(n.key, n);
+      if (L > 0 && n.d < detail * e) {
+        n.kids = [];
+        for (var k = 0; k < 8; k++)
+          n.kids.push(visit(L - 1, rx * 2 + (k & 1), ry * 2 + ((k >> 1) & 1),
+                            rz * 2 + ((k >> 2) & 1), n, k));
+      } else {
+        leaves.push(n);
+      }
+      return n;
+    }
+    var cx = Math.floor(eye[0] / eT), cz = Math.floor(eye[2] / eT);
+    for (var z = cz - R; z <= cz + R; z++) {
+      for (var x = cx - R; x <= cx + R; x++) {
+        // Each root COLUMN spans the ground under it (half a root either side)
+        // up to the focus height: the terrain is what there is to see, and a
+        // ring of roots round a high eye would be a ring of sky.
+        var g = null;
+        if (this.groundAt) {
+          try { g = this.groundAt((x + 0.5) * eT, (z + 0.5) * eT); } catch (err) { g = null; }
+        }
+        if (g === null || g === undefined || !isFinite(g)) g = refY;
+        var lo = Math.min(g, refY) - eT * 0.5;
+        var hi = Math.min(Math.max(g, refY) + eT * 0.5, lo + eT * 4);
+        for (var y = Math.floor(lo / eT); y <= Math.floor(hi / eT); y++)
+          roots.push(visit(T, x, y, z, null, -1));
+      }
+    }
+    return {roots: roots, nodes: nodes, leaves: leaves, top: T, foci: foci};
+  };
+
+  // Does an UNSAVED stroke sit inside node n? Those exist only on this page, so
+  // a parent the server sent cannot know about them and its sky test must not
+  // be trusted over them.
+  WorldView.prototype._unsavedIn = function (n) {
+    var set = this.edit.unsavedRegions;
+    if (!set || !set.size) return false;
+    var s = n.level, hit = false;
+    set.forEach(function (k) {
+      if (hit) return;
+      var p = k.split(',');
+      if ((+p[0] >> s) === n.rx && (+p[1] >> s) === n.ry && (+p[2] >> s) === n.rz) hit = true;
+    });
+    return hit;
+  };
+
+  // Is node n deep enough under the host's ground that nothing in it can be
+  // seen? Only for levels >= 1: a level-0 region is where edits land, and a
+  // basement dug in the editor must have cells to dig into. The ground is
+  // sampled over the footprint (a column map is smooth between posts, and the
+  // margin of half a region absorbs what the samples miss); any column the
+  // host cannot answer for makes the answer no.
+  WorldView.prototype._buried = function (n) {
+    if (!this.groundAt || n.level < 1) return false;
+    // Memoized per key until invalidate(): a node that is NOT buried is asked
+    // again every update while it waits in the queue.
+    var memo = this._buriedMemo || (this._buriedMemo = new Map());
+    var known = memo.get(n.key);
+    if (known !== undefined) return known;
+    var ans = this._buriedTest(n);
+    if (ans === null) return false;     // ground not known (yet): ask again later
+    memo.set(n.key, ans);
+    if (memo.size > 20000) memo.clear();
+    return ans;
+  };
+  WorldView.prototype._buriedTest = function (n) {
+    var e = n.e, k = e > 128 ? 5 : 3, gmin = Infinity;
+    for (var j = 0; j < k; j++) for (var i = 0; i < k; i++) {
+      var g;
+      try { g = this.groundAt(n.rx * e + (i + 0.5) * e / k, n.rz * e + (j + 0.5) * e / k); }
+      catch (err) { return null; }
+      if (g === null || g === undefined || !isFinite(g)) return null;
+      if (g < gmin) gmin = g;
+    }
+    return (n.ry + 1) * e < gmin - (e / 2 + 16);
+  };
+
+  // A region known without asking: EMPTY (all air — ready at once, draws
+  // nothing, reads as air to the picker and to its neighbours' seams; editing
+  // into one gives it cells, see _poke) or BURIED (under the ground: draws
+  // nothing and reads as unknown, which the mesher treats as solid, so no
+  // neighbour grows a wall against it).
+  WorldView.prototype._synthEmpty = function (n, buried) {
+    var lod = 1 << n.level;
+    var r = {
+      key: n.key, level: n.level, rx: n.rx, ry: n.ry, rz: n.rz,
+      lod: lod, nx: REGION_N, ny: REGION_N, nz: REGION_N,
+      origin: [n.rx * n.e, n.ry * n.e, n.rz * n.e],
+      cells: null, empty: !buried, buried: !!buried, oct: buried ? 0xFF : 0,
+      tex: null, op: null, fl: null,
+      meshing: false, meshed: true, dirty: false, gen: this.gen, rev: 0,
+      lastLive: this._frame, local: true
+    };
+    this.regions.set(n.key, r);
+    return r;
   };
 
   // ---- a LOCAL region, with no server behind it ---------------------------
@@ -753,16 +924,16 @@
         key: 'local' + i, level: 0, rx: 0, ry: 0, rz: 0,
         lod: e.lod || 1, nx: e.nx, ny: e.ny, nz: e.nz,
         origin: [o[0], o[1], o[2]],
-        cells: e.cells, tex: null, op: null, fl: null, meshing: false,
-        dirty: true, gen: this.gen, rev: 0
+        cells: e.cells, empty: false, tex: null, op: null, fl: null, meshing: false,
+        meshed: false, dirty: true, gen: this.gen, rev: 0, local: true
       };
       this.regions.set(r.key, r);
       this._uploadTex(r);
       out.push(r);
     }
-    // _meshPass takes at most two in flight and _onWorker pumps the rest as
-    // each finishes, so two priming calls drain the whole list.
-    this._meshPass();
+    // _meshPass fills every worker slot and _onWorker pumps the rest as each
+    // finishes, so one priming call drains the whole list.
+    this.drawRev++;
     this._meshPass();
     return out;
   };
@@ -777,102 +948,202 @@
     // nothing to evict, and running the streamer would delete the one region
     // the tab is showing on its first frame.
     if (this.opts.streaming === false) return;
-    var want = this._desired();
-    var live = new Set();
-    for (var i = 0; i < want.length; i++) {
-      var w = want[i];
-      var key = regionKey(w.level, w.rx, w.ry, w.rz);
-      live.add(key);
-      if (this.regions.has(key) || this.pending.has(key)) continue;
-      this.pending.set(key, true);
-      this.queue.push(w);
-    }
-    // Evict what fell out of every level's shell. Regions are 512 KB of cells
-    // plus a 3D texture; without this a long flight grows without bound.
+    // Nothing is fetched before the palette: the mesher needs the material
+    // classes to tell water from rock, and a region meshed without them keeps
+    // its liquids as solid walls until something re-meshes it.
+    if (!this.pal) return;
     var self = this;
-    this.regions.forEach(function (r, key) {
-      if (!live.has(key)) { self._freeRegion(r); self.regions.delete(key); }
+    var t = this.tree = this._buildTree();
+    var frame = ++this._frame;
+    var want = [], ready = 0;
+    t.nodes.forEach(function (n) {
+      var r = self.regions.get(n.key);
+      if (!r && n.parent) {
+        var par = self.regions.get(n.parent.key);
+        // Top-down: a child waits for its parent, whose octant mask says
+        // whether there is anything to ask for at all.
+        if (!par) return;
+        if (par.buried) r = self._synthEmpty(n, true);
+        else if ((par.empty || !(par.oct & (1 << n.octant))) && !self._unsavedIn(n))
+          r = self._synthEmpty(n);
+      }
+      if (!r && self._buried(n)) r = self._synthEmpty(n, true);
+      if (r) {
+        r.lastLive = frame;
+        if (r.empty || r.meshed) ready++;
+        return;
+      }
+      if (self.pending.has(n.key)) return;
+      // A failed region is retried, but not every frame: a server answering
+      // 500 for it would otherwise be asked sixty times a second.
+      var failed = self._failAt.get(n.key);
+      if (failed !== undefined && performance.now() - failed < 5000) return;
+      want.push(n);
     });
-    this.queue = this.queue.filter(function (w) {
-      return live.has(regionKey(w.level, w.rx, w.ry, w.rz));
-    });
+    // Nearest-in-screen-size first: d / e is how big the region looks. What the
+    // camera cannot see waits behind everything it can.
+    var mvp = this.mvp;
+    for (var i = 0; i < want.length; i++) {
+      var n = want[i];
+      n.pri = n.d / n.e - n.level * 0.01;
+      if (mvp && !boxVisible(n.rx * n.e, n.ry * n.e, n.rz * n.e, n.e, n.e, n.e, mvp)) n.pri += 4;
+    }
+    want.sort(function (a, b) { return a.pri - b.pri; });
+    this.queue = want;
+    this._failAt.forEach(function (when, key) { if (!t.nodes.has(key)) self._failAt.delete(key); });
+    this.stats.live = t.nodes.size;
+    this.stats.ready = ready;
+    this.stats.queued = want.length;
+    this._evict(frame, t.nodes.size);
     this._pump();
+  };
+
+  // Regions that left the tree stay as a CACHE until the budget is spent, so a
+  // zoom out and back in redraws at once instead of refetching; the oldest go
+  // first.
+  WorldView.prototype._evict = function (frame, live) {
+    var budget = live + (this.view.cacheRegions || 256);
+    if (this.regions.size <= budget) return;
+    var old = [];
+    this.regions.forEach(function (r) { if (r.lastLive !== frame) old.push(r); });
+    old.sort(function (a, b) { return a.lastLive - b.lastLive; });
+    for (var i = 0; i < old.length && this.regions.size > budget; i++) {
+      this._freeRegion(old[i]);
+      this.regions.delete(old[i].key);
+      this.drawRev++;
+    }
+  };
+
+  // One line a host can show so an empty view is never unexplained: how much of
+  // the tree has landed, what is in flight, and why it is slow if it is.
+  WorldView.prototype.streamStatus = function () {
+    var s = this.stats;
+    if (!this.pal) return 'waiting for the material palette';
+    if (!this.tree) return '';
+    var out = s.ready + '/' + s.live + ' regions';
+    if (this.inflight || s.queued) out += ' · loading ' + this.inflight + ' (+' + s.queued + ' queued)';
+    if (s.meshing) out += ' · meshing ' + s.meshing;
+    var oldest = 0, now = performance.now();
+    this._reqT0.forEach(function (t0) { oldest = Math.max(oldest, now - t0); });
+    if (oldest > 2500 || (this.inflight && s.slowMs))
+      out += ' · voxel server slow (' + (Math.max(oldest, s.slowMs) / 1000).toFixed(0) +
+             ' s: it waits for the machine-wide GPU lock while another sandvox run holds it)';
+    // Recent failures only: one that has since been retried successfully is
+    // history, and a stale error beside a full picture is a false alarm.
+    if (s.lastError && this._failAt.size)
+      out += ' · ' + this._failAt.size + ' region(s) failing, retrying: ' + s.lastError;
+    return out;
   };
 
   WorldView.prototype._pump = function () {
     while (this.inflight < this.maxInflight && this.queue.length) {
-      var w = this.queue.shift();
-      this._fetch(w);
+      var n = this.queue.shift();
+      if (this.regions.has(n.key) || this.pending.has(n.key)) continue;
+      this._fetch(n);
     }
   };
 
-  WorldView.prototype._fetch = function (w) {
+  WorldView.prototype._fetch = function (n) {
     var self = this;
-    var key = regionKey(w.level, w.rx, w.ry, w.rz);
-    var lod = 1 << w.level, ext = REGION_N * lod;
-    var q = 'ox=' + (w.rx * ext) + '&oy=' + (w.ry * ext) + '&oz=' + (w.rz * ext) +
+    var key = n.key;
+    var lod = 1 << n.level, ext = n.e;
+    var q = 'ox=' + (n.rx * ext) + '&oy=' + (n.ry * ext) + '&oz=' + (n.rz * ext) +
             '&nx=' + REGION_N + '&ny=' + REGION_N + '&nz=' + REGION_N +
             '&lod=' + lod + '&seed=' + this.seed +
             '&layer=' + encodeURIComponent(this.layerSel || '@map') +
             (this.mapName ? '&map=' + encodeURIComponent(this.mapName) : '');
-    this.inflight++;
     var gen = this.gen;
+    this.inflight++;
+    this.pending.set(key, gen);
     var t0 = performance.now();
+    this._reqT0.set(key + '@' + gen, t0);
     fetch('/api/voxregion?' + q).then(function (r) {
-      if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || ('HTTP ' + r.status)); });
+      if (!r.ok) return r.json().catch(function () { return {}; }).then(function (j) {
+        throw new Error(j.error || ('HTTP ' + r.status));
+      });
       return r.arrayBuffer();
     }).then(function (buf) {
+      var ms = performance.now() - t0;
       self.stats.fetches++;
       self.stats.bytes += buf.byteLength;
-      self.stats.ms = performance.now() - t0;
-      if (gen !== self.gen) { self.pending.delete(key); self.inflight--; self._pump(); return; }
-      self._pendingMeta = self._pendingMeta || new Map();
-      self._pendingMeta.set(key, {level: w.level, rx: w.rx, ry: w.ry, rz: w.rz, gen: gen});
-      self.worker.postMessage({cmd: 'decode', key: key, buf: buf}, [buf]);
+      self.stats.ms = ms;
+      // A slow reply is almost always the voxel server waiting for the
+      // machine-wide GPU lock (another session's run, a link). Recorded so the
+      // host can say so instead of showing an empty view with no reason.
+      self.stats.slowMs = ms > 1500 ? ms : 0;
+      if (gen !== self.gen) { self._settle(key, gen); return; }
+      self._post({cmd: 'decode', key: key, buf: buf,
+                  meta: {level: n.level, rx: n.rx, ry: n.ry, rz: n.rz, gen: gen}}, [buf]);
     }).catch(function (e) {
-      self.pending.delete(key);
-      self.inflight--;
-      self.onError && self.onError(String(e && e.message || e));
-      self._pump();
+      self._failAt.set(key, performance.now());
+      self.stats.errors++;
+      self.stats.lastError = String(e && e.message || e);
+      self._settle(key, gen);
+      if (gen === self.gen && self.onError) self.onError(self.stats.lastError);
     });
   };
 
+  // A request is over (decoded, failed, or answered for a world that has since
+  // been invalidated). `pending` is cleared only if it still names THIS
+  // request: after an invalidate the same key can be in flight twice.
+  WorldView.prototype._settle = function (key, gen) {
+    this.inflight = Math.max(0, this.inflight - 1);
+    this._reqT0.delete(key + '@' + gen);
+    if (this.pending.get(key) === gen) this.pending.delete(key);
+    this._pump();
+  };
+
   WorldView.prototype._onWorker = function (m) {
-    var self = this;
     if (m.cmd === 'error') {
-      this.pending.delete(m.key);
-      this.inflight = Math.max(0, this.inflight - 1);
-      this.onError && this.onError(m.error);
-      this._pump();
+      if (m.mesh) {
+        var bad = this.regions.get(m.key);
+        if (bad) bad.meshing = false;
+        this.stats.errors++;
+        this.stats.lastError = 'mesh: ' + m.error;
+        this.onError && this.onError(this.stats.lastError);
+        this._meshPass();
+        return;
+      }
+      var g = m.meta ? m.meta.gen : this.gen;
+      this._failAt.set(m.key, performance.now());
+      this.stats.errors++;
+      this.stats.lastError = m.error;
+      this._settle(m.key, g);
+      if (g === this.gen && this.onError) this.onError(m.error);
       return;
     }
     if (m.cmd === 'decoded') {
-      var meta = this._pendingMeta && this._pendingMeta.get(m.key);
-      this._pendingMeta && this._pendingMeta.delete(m.key);
-      this.inflight--;
-      this.pending.delete(m.key);
-      if (!meta || meta.gen !== this.gen) { this._pump(); return; }
+      var meta = m.meta;
+      this._settle(m.key, meta.gen);
+      this._failAt.delete(m.key);
+      if (meta.gen !== this.gen || this.regions.has(m.key)) return;
       var r = {
         key: m.key, level: meta.level, rx: meta.rx, ry: meta.ry, rz: meta.rz,
         lod: m.head.lod, nx: m.head.nx, ny: m.head.ny, nz: m.head.nz,
         origin: [m.head.ox, m.head.oy, m.head.oz],
-        cells: m.cells, tex: null, op: null, fl: null, meshing: false,
-        dirty: true, gen: this.gen, rev: 0
+        cells: m.cells, empty: false, oct: m.head.oct, tex: null, op: null, fl: null,
+        meshing: false, meshed: false, dirty: true, gen: this.gen, rev: 0,
+        lastLive: this._frame
       };
       // The SAVED layer is already in the region: the voxel server applies it
       // (P7). What only this page knows is the UNSAVED strokes, so those are
       // composited on arrival — otherwise a fly-away-and-back would lose them.
-      this.edit.applyToRegion(r);
+      var stroked = this.edit.applyToRegion(r);
+      if (!r.oct && !stroked) {
+        // All sky: keep no cells, no texture, no mesh. Most of a tree is this.
+        r.cells = null; r.empty = true; r.meshed = true; r.dirty = false;
+      } else {
+        this._uploadTex(r);
+      }
       this.regions.set(m.key, r);
-      this._uploadTex(r);
+      this.drawRev++;
       this._markNeighborsDirty(r);
-      this._pump();
       this._meshPass();
       return;
     }
     if (m.cmd === 'meshed') {
       var reg = this.regions.get(m.key);
-      if (!reg) return;
+      if (!reg) { this._meshPass(); return; }
       reg.meshing = false;
       // A mesh built from cells that have since been edited describes a world
       // that no longer exists. `rev` is bumped by every poke; if it moved while
@@ -880,21 +1151,37 @@
       if (m.gen !== reg.gen || m.rev !== reg.rev) { reg.dirty = true; this._meshPass(); return; }
       this._uploadMesh(reg, 'op', m.op);
       this._uploadMesh(reg, 'fl', m.fl);
+      reg.meshed = true;
+      this.drawRev++;
       this._meshPass();
       return;
     }
   };
 
+  // Every resident region sharing a FACE with r, at any level: its seam was
+  // meshed against cells r now supplies. Edge and corner contacts change no
+  // face, so they are not counted. Authored (local) regions have no
+  // neighbours by design — two trees side by side must not weld.
   WorldView.prototype._markNeighborsDirty = function (r) {
-    var d = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
-    for (var i = 0; i < 6; i++) {
-      var n = this.regions.get(regionKey(r.level, r.rx + d[i][0], r.ry + d[i][1], r.rz + d[i][2]));
-      if (n) n.dirty = true;
-    }
+    if (this.opts.streaming === false) return;
+    var a0 = r.origin, s = r.nx * r.lod;
+    this.regions.forEach(function (q) {
+      if (q === r || q.empty || !q.cells || q.dirty) return;
+      var b0 = q.origin, t = q.nx * q.lod, touch = 0;
+      for (var i = 0; i < 3; i++) {
+        var a1 = a0[i] + s, b1 = b0[i] + t;
+        if (a1 < b0[i] || b1 < a0[i]) return;
+        if (a1 === b0[i] || b1 === a0[i]) touch++;
+      }
+      if (touch === 1) q.dirty = true;
+    });
   };
 
-  // At most two regions meshed at a time — meshing every dirty region at once
-  // on arrival is what turns a camera move into a stall.
+  // Up to two meshes per worker in flight — meshing every dirty region at once
+  // on arrival is what turns a camera move into a stall. Regions never meshed
+  // go first (they draw nothing yet), then re-meshes; within each, the one
+  // that looks biggest. A region that left the tree is not meshed until it
+  // comes back.
   //
   // THE WORKER GETS A COPY, NOT THE ARRAY. Transferring `cells` is free and was
   // the obvious thing to do, and it is wrong: while the worker holds them the
@@ -905,64 +1192,108 @@
   // itself with no error anywhere. A 512 KB copy per mesh is nothing beside the
   // meshing it feeds.
   WorldView.prototype._meshPass = function () {
+    var cap = 2 * this.workers.length;
     var busy = 0;
     this.regions.forEach(function (r) { if (r.meshing) busy++; });
-    if (busy >= 2) return;
-    var pick = null, bestPri = 1e9;
-    var eye = this.camEye();
+    if (busy >= cap) return;
+    var eye = this.camEye(), frame = this._frame;
+    var streaming = this.opts.streaming !== false;
+    var cand = [];
     this.regions.forEach(function (r) {
-      if (!r.dirty || r.meshing || !r.cells) return;
-      var cx = r.origin[0] + r.nx * r.lod / 2, cy = r.origin[1] + r.ny * r.lod / 2,
-          cz = r.origin[2] + r.nz * r.lod / 2;
-      var pri = r.level * 1e6 + Math.hypot(cx - eye[0], cy - eye[1], cz - eye[2]);
-      if (pri < bestPri) { bestPri = pri; pick = r; }
+      if (!r.dirty || r.meshing || !r.cells || r.empty) return;
+      if (streaming && r.lastLive !== frame) return;
+      var e = r.nx * r.lod;
+      var d = Math.hypot(r.origin[0] + e / 2 - eye[0], r.origin[1] + e / 2 - eye[1],
+                         r.origin[2] + e / 2 - eye[2]);
+      cand.push({r: r, pri: (r.meshed ? 1e6 : 0) + d / e});
     });
-    if (!pick) return;
-    pick.dirty = false;
-    pick.meshing = true;
-    var nbr = this._neighborSlabs(pick);
-    var copy = pick.cells.slice();
-    this.worker.postMessage({
-      cmd: 'mesh', key: pick.key, gen: pick.gen, rev: pick.rev || 0, cells: copy,
-      nx: pick.nx, ny: pick.ny, nz: pick.nz, nbr: nbr
-    }, [copy.buffer]);
+    cand.sort(function (a, b) { return a.pri - b.pri; });
+    for (var i = 0; i < cand.length && busy < cap; i++, busy++) {
+      var pick = cand[i].r;
+      pick.dirty = false;
+      pick.meshing = true;
+      var nbr = this._neighborSlabs(pick);
+      var copy = pick.cells.slice();
+      this._post({
+        cmd: 'mesh', key: pick.key, gen: pick.gen, rev: pick.rev || 0, cells: copy,
+        nx: pick.nx, ny: pick.ny, nz: pick.nz, nbr: nbr
+      }, [copy.buffer]);
+    }
+    this.stats.meshing = busy;
   };
 
-  // The six face slabs of the neighbouring regions, so the mesher can tell a
-  // real surface from a region boundary. A missing neighbour is simply absent,
-  // and the worker reads absent as solid.
+  // The word at world voxel (x,y,z) as resident level `level` holds it: 0 for a
+  // region known empty, -1 when that level has no region there. `cache` is one
+  // slot per level holding the last region box looked up (hit or miss), which
+  // turns a face's 4096 lookups into a handful of Map gets.
+  WorldView.prototype._wordAt = function (x, y, z, level, cache) {
+    var c = cache[level];
+    var e = REGION_N << level;
+    if (!c || x < c.x0 || y < c.y0 || z < c.z0 || x >= c.x0 + e || y >= c.y0 + e || z >= c.z0 + e) {
+      var rx = Math.floor(x / e), ry = Math.floor(y / e), rz = Math.floor(z / e);
+      c = cache[level] = {x0: rx * e, y0: ry * e, z0: rz * e,
+                          r: this.regions.get(regionKey(level, rx, ry, rz)) || null};
+    }
+    var r = c.r;
+    if (!r) return -1;
+    if (r.empty) return 0;
+    if (!r.cells) return -1;
+    var lx = ((x - r.origin[0]) / r.lod) | 0, ly = ((y - r.origin[1]) / r.lod) | 0,
+        lz = ((z - r.origin[2]) / r.lod) | 0;
+    return r.cells[(lz * r.ny + ly) * r.nx + lx];
+  };
+
+  // The six face slabs of what lies just outside r, so the mesher can tell a
+  // real surface from a region boundary. Each outside cell is read from
+  // whichever resident region holds it — r's own level first, then coarser,
+  // then finer — because across a face of an octree leaf the neighbour is
+  // often another level. A cell no region holds is UNKNOWN_WORD (opaque); a
+  // slab with nothing known at all is left absent, which the worker reads the
+  // same way.
   WorldView.prototype._neighborSlabs = function (r) {
     var out = {};
     var nx = r.nx, ny = r.ny, nz = r.nz;
-    var g = this.regions;
-    function slabX(n, xi) {
-      if (!n || !n.cells) return null;
-      var s = new Uint16Array(n.nz * n.ny);
-      for (var z = 0; z < n.nz; z++)
-        for (var y = 0; y < n.ny; y++) s[z * n.ny + y] = n.cells[(z * n.ny + y) * n.nx + xi];
-      return s;
+    if (this.opts.streaming === false) {
+      // Authored regions: no neighbours by design (see setLocalRegions).
+      return out;
     }
-    function slabY(n, yi) {
-      if (!n || !n.cells) return null;
-      var s = new Uint16Array(n.nz * n.nx);
-      for (var z = 0; z < n.nz; z++)
-        for (var x = 0; x < n.nx; x++) s[z * n.nx + x] = n.cells[(z * n.ny + yi) * n.nx + x];
-      return s;
+    var self = this, L = r.level, lod = r.lod, o = r.origin, half = lod >> 1;
+    var order = [L];
+    for (var a = L + 1; a < LEVELS; a++) order.push(a);
+    for (var b = L - 1; b >= 0; b--) order.push(b);
+    var cache = [];
+    function word(x, y, z) {
+      for (var i = 0; i < order.length; i++) {
+        var w = self._wordAt(x, y, z, order[i], cache);
+        if (w >= 0) return w;
+      }
+      return -1;
     }
-    function slabZ(n, zi) {
-      if (!n || !n.cells) return null;
-      var s = new Uint16Array(n.ny * n.nx);
-      for (var y = 0; y < n.ny; y++)
-        for (var x = 0; x < n.nx; x++) s[y * n.nx + x] = n.cells[(zi * n.ny + y) * n.nx + x];
-      return s;
+    // Sample centre of the outside layer on each side of axis `ax`.
+    function outside(ax, hi) {
+      var n = [nx, ny, nz][ax];
+      return hi ? o[ax] + n * lod + half : o[ax] - lod + half;
     }
-    var k = regionKey;
-    out.nx0 = slabX(g.get(k(r.level, r.rx - 1, r.ry, r.rz)), nx - 1);
-    out.px0 = slabX(g.get(k(r.level, r.rx + 1, r.ry, r.rz)), 0);
-    out.ny0 = slabY(g.get(k(r.level, r.rx, r.ry - 1, r.rz)), ny - 1);
-    out.py0 = slabY(g.get(k(r.level, r.rx, r.ry + 1, r.rz)), 0);
-    out.nz0 = slabZ(g.get(k(r.level, r.rx, r.ry, r.rz - 1)), nz - 1);
-    out.pz0 = slabZ(g.get(k(r.level, r.rx, r.ry, r.rz + 1)), 0);
+    function slab(ax, hi) {
+      var u = ax === 0 ? 1 : 0, v = ax === 2 ? 1 : 2;  // x: (y,z)  y: (x,z)  z: (x,y)
+      var nu = [nx, ny, nz][u], nv = [nx, ny, nz][v];
+      var s = new Uint16Array(nu * nv), known = 0, p = [0, 0, 0];
+      p[ax] = outside(ax, hi);
+      for (var j = 0; j < nv; j++) {
+        p[v] = o[v] + j * lod + half;
+        for (var i = 0; i < nu; i++) {
+          p[u] = o[u] + i * lod + half;
+          var w = word(p[0], p[1], p[2]);
+          // Layouts as the worker expects: x-slab [z*ny+y], y-slab [z*nx+x],
+          // z-slab [y*nx+x] — all j*nu+i with (u, v) chosen above.
+          if (w < 0) s[j * nu + i] = UNKNOWN_WORD; else { s[j * nu + i] = w; known++; }
+        }
+      }
+      return known ? s : null;
+    }
+    out.nx0 = slab(0, false); out.px0 = slab(0, true);
+    out.ny0 = slab(1, false); out.py0 = slab(1, true);
+    out.nz0 = slab(2, false); out.pz0 = slab(2, true);
     return out;
   };
 
@@ -1033,10 +1364,19 @@
     var self = this;
     this.regions.forEach(function (r) { self._freeRegion(r); });
     this.regions.clear();
+    // NOT inflight = 0: the old generation's requests are still out, and each
+    // one settles (and is dropped for its gen) when it lands. Zeroing the count
+    // here drove it negative as they came back, and the streamer then ran with
+    // no limit on concurrent requests. `pending` can go, because _settle only
+    // clears an entry that names its own generation.
     this.pending.clear();
     this.queue.length = 0;
-    this.inflight = 0;
-    this._pendingMeta && this._pendingMeta.clear();
+    this._failAt.clear();
+    if (this._buriedMemo) this._buriedMemo.clear();
+    this.stats.errors = 0;
+    this.stats.lastError = '';
+    this.tree = null;
+    this.drawRev++;
   };
 
   // ---- camera -------------------------------------------------------------
@@ -1079,7 +1419,9 @@
     var ext = this._levelExtent(level);
     var r = this.regions.get(regionKey(level,
       Math.floor(x / ext), Math.floor(y / ext), Math.floor(z / ext)));
-    if (!r || !r.cells) return -1;
+    if (!r) return -1;
+    if (r.empty) return 0;
+    if (!r.cells) return -1;
     var lx = Math.floor((x - r.origin[0]) / r.lod);
     var ly = Math.floor((y - r.origin[1]) / r.lod);
     var lz = Math.floor((z - r.origin[2]) / r.lod);
@@ -1097,14 +1439,23 @@
     var tmy = dy !== 0 ? ((dy > 0 ? y + 1 - oy : oy - y) * tdy) : Infinity;
     var tmz = dz !== 0 ? ((dz > 0 ? z + 1 - oz : oz - z) * tdz) : Infinity;
     var face = [0, 0, 0], t = 0;
+    // Level 0 first, so every hit that CAN be edited is the true cell; past the
+    // full-res regions the coarser levels answer, which is what lets the hover
+    // readout and a double-click orbit pick work at any zoom. Such a hit carries
+    // lod > 1 and edits refuse it (apply() reads level 0 only).
+    var streaming = this.opts.streaming !== false, cache = [];
+    var top = Math.min(LEVELS, this.view.levels | 0);
     for (var i = 0; i < maxDist * 3 && t <= maxDist; i++) {
-      var v = this.cellAtWorld(x, y, z, 0);
+      var v = this.cellAtWorld(x, y, z, 0), lod = 1;
+      if (v < 0 && streaming) {
+        for (var L = 1; L < top && v < 0; L++) { v = this._wordAt(x, y, z, L, cache); lod = 1 << L; }
+      }
       if (v > 0) {
         var mat = v & MAT_MASK;
         var cls = this.classes ? this.classes[mat] : 0;
         if (wantFluid || (cls !== CLASS_LIQUID && cls !== CLASS_GAS))
           return {vox: [x, y, z], face: face, word: v, mat: mat,
-                  state: (v >> 12) & 15, t: t};
+                  state: (v >> 12) & 15, t: t, lod: lod};
       }
       if (tmx < tmy && tmx < tmz) { x += sx; t = tmx; tmx += tdx; face = [-sx, 0, 0]; }
       else if (tmy < tmz) { y += sy; t = tmy; tmy += tdy; face = [0, -sy, 0]; }
@@ -1134,8 +1485,8 @@
     // Fluids are transparent to the picker unless you ask otherwise: reaching
     // through a pond to the rock under it is what you want nine times in ten,
     // and "pick water" is a checkbox rather than a surprise.
-    return this.raycast(eye[0], eye[1], eye[2], d[0] / dl, d[1] / dl, d[2] / dl, 400,
-                        !!this.tool.pickFluids);
+    return this.raycast(eye[0], eye[1], eye[2], d[0] / dl, d[1] / dl, d[2] / dl,
+                        this.opts.streaming === false ? 400 : 2000, !!this.tool.pickFluids);
   };
 
   WorldView.prototype.fov = function () { return Math.PI / 3; };
@@ -1152,6 +1503,8 @@
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
     var eye = this.camEye(), fwd = this.camForward();
+    var drawSet = this._drawn = this._drawSet();
+    this.stats.resident = this.regions.size;
     // The far plane follows the coarsest resident level; a fixed one either
     // clips the horizon or wastes the whole depth range on the near field.
     //
@@ -1166,9 +1519,9 @@
     // the farthest corner of everything actually resident. In streaming mode
     // the coarsest shell's corner is ~2.6*ext against a 3*ext floor, so the
     // floor still wins and nothing there changes.
-    var farD = this._levelExtent(this.view.levels - 1) * 3;
+    var farD = this._levelExtent(Math.min(LEVELS, this.view.levels) - 1) * 3;
     var need = 0;
-    this.regions.forEach(function (r) {
+    drawSet.forEach(function (r) {
       var o = r.origin;
       var dx = Math.max(Math.abs(o[0] - eye[0]), Math.abs(o[0] + r.nx * r.lod - eye[0]));
       var dy = Math.max(Math.abs(o[1] - eye[1]), Math.abs(o[1] + r.ny * r.lod - eye[1]));
@@ -1212,7 +1565,7 @@
 
     var list = [];
     var self = this;
-    this.regions.forEach(function (r) {
+    drawSet.forEach(function (r) {
       if (!r.op && !r.fl) return;
       if (!self._visible(r, mvp)) return;
       var cx = r.origin[0] + r.nx * r.lod / 2, cy = r.origin[1] + r.ny * r.lod / 2,
@@ -1246,6 +1599,55 @@
     this._drawOverlays(mvp, eye);
   };
 
+  // What this frame draws. Authored regions: all of them. Streaming: the
+  // finest COMPLETE cover of the octree — a node draws its children only when
+  // every one of them can draw (meshed, or known empty), and otherwise draws
+  // itself if it can. So a region whose children are still on their way stays
+  // on screen until they have all landed, and coarse and fine never overlap.
+  WorldView.prototype._drawSet = function () {
+    var out = [], regions = this.regions;
+    if (this.opts.streaming === false || !this.tree) {
+      regions.forEach(function (r) { if (!r.empty) out.push(r); });
+      return out;
+    }
+    var memo = new Map();
+    function readyR(key) {
+      var r = regions.get(key);
+      return r && (r.empty || r.meshed) ? r : null;
+    }
+    function complete(n) {
+      var c = memo.get(n.key);
+      if (c !== undefined) return c;
+      c = !!readyR(n.key) || (!!n.kids && n.kids.every(complete));
+      memo.set(n.key, c);
+      return c;
+    }
+    function walk(n) {
+      if (n.kids && n.kids.every(complete)) { n.kids.forEach(walk); return; }
+      var r = readyR(n.key);
+      if (r) { if (!r.empty && !r.buried) out.push(r); return; }
+      if (n.kids) n.kids.forEach(walk);
+    }
+    this.tree.roots.forEach(walk);
+    return out;
+  };
+
+  function boxVisible(x0, y0, z0, ex, ey, ez, mvp) {
+    var all = 63;
+    for (var i = 0; i < 8; i++) {
+      var x = x0 + (i & 1 ? ex : 0), y = y0 + (i & 2 ? ey : 0), z = z0 + (i & 4 ? ez : 0);
+      var cx = mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
+      var cy = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
+      var cz = mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14];
+      var cw = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
+      var code = (cx < -cw ? 1 : 0) | (cx > cw ? 2 : 0) | (cy < -cw ? 4 : 0) |
+                 (cy > cw ? 8 : 0) | (cz < -cw ? 16 : 0) | (cz > cw ? 32 : 0);
+      all &= code;
+      if (!all) return true;
+    }
+    return false;
+  }
+
   // Frustum cull on the region's world box. Cheap and it matters: at four
   // levels the resident set is ~80 boxes and a fly camera sees a third of them.
   //
@@ -1259,21 +1661,8 @@
     // agree there, but an AUTHORED one is whatever shape it was handed: a tree
     // is far taller than it is wide, and testing its box as nx^3 culls the
     // crown the moment the camera looks up at it.
-    var ex = r.nx * r.lod, ey = r.ny * r.lod, ez = r.nz * r.lod;
-    var o = r.origin;
-    var all = 63;
-    for (var i = 0; i < 8; i++) {
-      var x = o[0] + (i & 1 ? ex : 0), y = o[1] + (i & 2 ? ey : 0), z = o[2] + (i & 4 ? ez : 0);
-      var cx = mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
-      var cy = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
-      var cz = mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14];
-      var cw = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
-      var code = (cx < -cw ? 1 : 0) | (cx > cw ? 2 : 0) | (cy < -cw ? 4 : 0) |
-                 (cy > cw ? 8 : 0) | (cz < -cw ? 16 : 0) | (cz > cw ? 32 : 0);
-      all &= code;
-      if (!all) return true;
-    }
-    return false;
+    return boxVisible(r.origin[0], r.origin[1], r.origin[2],
+                      r.nx * r.lod, r.ny * r.lod, r.nz * r.lod, mvp);
   };
 
   WorldView.prototype._drawRegion = function (r, slot) {
@@ -1324,9 +1713,9 @@
       pushLine(a, 0,0,0, 0,0,L, [0.4,0.5,1,1]);
     }
     if (v.showRegions) {
-      this.regions.forEach(function (r) {
+      (this._drawn || []).forEach(function (r) {
         var ext = r.nx * r.lod;
-        var t = r.level / 3;
+        var t = r.level / (LEVELS - 1);
         pushBox(a, r.origin[0], r.origin[1], r.origin[2],
                 r.origin[0] + ext, r.origin[1] + ext, r.origin[2] + ext,
                 [0.3 + 0.6 * t, 0.9 - 0.5 * t, 1.0 - 0.4 * t, 0.30]);
@@ -1444,7 +1833,10 @@
     gl.uniformMatrix4fv(this.uFar.uMVP, false, mvp);
     gl.uniform3fv(this.uFar.uLight, light);
     gl.uniform3fv(this.uFar.uEye, eye);
-    gl.uniform1f(this.uFar.uFade, this._levelExtent(this.view.levels - 1) * 0.9);
+    // Fade in where the voxel roots run out: the ring is reach + 1/2 roots
+    // from the eye at its nearest edge.
+    var eT = this._levelExtent(Math.min(LEVELS, this.view.levels) - 1);
+    gl.uniform1f(this.uFar.uFade, (Math.max(0, this.view.reach | 0) + 0.5) * eT * 0.8);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.disable(gl.CULL_FACE);
@@ -1529,7 +1921,15 @@
     var ext = REGION_N;
     var key = regionKey(0, Math.floor(x / ext), Math.floor(y / ext), Math.floor(z / ext));
     var r = this.regions.get(key);
-    if (!r || !r.cells) return;
+    if (!r) return;
+    if (r.empty) {
+      // Painting into open sky: a region known empty has no cells to write.
+      // Give it some — it is a real level-0 region from here on.
+      r.cells = new Uint16Array(r.nx * r.ny * r.nz);
+      r.empty = false; r.meshed = false; r.oct = 0xFF;
+      this._uploadTex(r);
+    }
+    if (!r.cells) return;
     var lx = x - r.origin[0], ly = y - r.origin[1], lz = z - r.origin[2];
     if (lx < 0 || ly < 0 || lz < 0 || lx >= r.nx || ly >= r.ny || lz >= r.nz) return;
     var idx = (lz * r.ny + ly) * r.nx + lx;
@@ -1537,6 +1937,7 @@
     r.cells[idx] = word & 0xFFFF;
     r.rev = (r.rev || 0) + 1;    // invalidates any mesh already in the worker
     this.editRev++;
+    this.drawRev++;
     var gl = this.gl;
     gl.bindTexture(gl.TEXTURE_3D, r.tex);
     gl.texSubImage3D(gl.TEXTURE_3D, 0, lx, ly, lz, 1, 1, 1, gl.RED_INTEGER,
@@ -1609,7 +2010,12 @@
       if (!self.drag) return;
       var dx = e.clientX - self.drag.x, dy = e.clientY - self.drag.y;
       if (Math.abs(dx) + Math.abs(dy) > 2) self.drag.moved = true;
-      if (self.drag.btn === 2) {
+      // LMB turns the camera too when no tool is active: "drag to look" is
+      // the first thing anyone tries, and it used to do nothing at all.
+      var look = self.drag.btn === 2 || (self.drag.btn === 0 && self.tool.name === 'none');
+      if (look && e.shiftKey && self.drag.btn === 0) {
+        self._pan(dx, dy);
+      } else if (look) {
         self.cam.yaw = self.drag.yaw - dx * 0.005;
         self.cam.pitch = Math.max(-1.5, Math.min(1.5, self.drag.pitch - dy * 0.005));
       } else if (self.drag.btn === 1) {
@@ -1622,6 +2028,25 @@
       if (self.drag && self.drag.btn === 0) self._toolUp(e);
       self.drag = null;
       try { cv.releasePointerCapture(e.pointerId); } catch (err) {}
+    });
+    // Double-click (with no tool, or Alt with one): orbit round the cell under
+    // the cursor, at any level. The quickest way to say "that, I want to look
+    // at that".
+    cv.addEventListener('dblclick', function (e) {
+      if (self.tool.name !== 'none' && !e.altKey) return;
+      var rect = cv.getBoundingClientRect();
+      var hit = self.pickAt(e.clientX - rect.left, e.clientY - rect.top);
+      if (!hit) return;
+      var eye = self.camEye();
+      var c = [hit.vox[0] + 0.5, hit.vox[1] + 0.5, hit.vox[2] + 0.5];
+      var d = Math.hypot(c[0] - eye[0], c[1] - eye[1], c[2] - eye[2]);
+      self.cam.target = c;
+      self.cam.dist = Math.max(8, Math.min(d, 400));
+      var f = [c[0] - eye[0], c[1] - eye[1], c[2] - eye[2]];
+      self.cam.yaw = Math.atan2(-f[0], -f[2]);
+      self.cam.pitch = Math.max(-1.5, Math.min(1.5, Math.asin(Math.max(-1, Math.min(1, f[1] / (d || 1))))));
+      self.cam.mode = 'orbit';
+      self.onCamMode && self.onCamMode('orbit');
     });
     cv.addEventListener('wheel', function (e) {
       e.preventDefault();
@@ -1660,10 +2085,7 @@
   };
 
   WorldView.prototype._pan = function (dx, dy) {
-    var f = this.camForward();
-    var right = [f[2], 0, -f[0]];
-    var rl = Math.hypot(right[0], right[2]) || 1;
-    right = [right[0] / rl, 0, right[2] / rl];
+    var right = screenRight(this.camForward());
     var s = (this.cam.mode === 'orbit' ? this.cam.dist : 1) * 0.0025 + 0.05;
     var d = this.drag;
     var mv = [(-dx * right[0]) * s, dy * s, (-dx * right[2]) * s];
@@ -1673,14 +2095,32 @@
       this.cam.pos = [d.pos[0] + mv[0], d.pos[1] + mv[1], d.pos[2] + mv[2]];
   };
 
+  // SCREEN right, flattened: forward x up. The first version used
+  // (f.z, 0, -f.x), which is screen LEFT — D strafed left and a middle-drag
+  // pan dragged the scene against the mouse sideways but with it vertically.
+  function screenRight(f) {
+    var rx = -f[2], rz = f[0], rl = Math.hypot(rx, rz) || 1;
+    return [rx / rl, 0, rz / rl];
+  }
+
   WorldView.prototype.step = function (dt) {
-    if (this.cam.mode !== 'fly') return;
     var k = this.keys, sp = this.cam.speed * dt * (k['shift'] ? 4 : 1) * (k['control'] ? 0.25 : 1);
     if (!(k['w'] || k['a'] || k['s'] || k['d'] || k['q'] || k['e'])) return;
     var f = this.camForward();
-    var right = [f[2], 0, -f[0]];
-    var rl = Math.hypot(right[0], right[2]) || 1;
-    right = [right[0] / rl, 0, right[2] / rl];
+    var right = screenRight(f);
+    if (this.cam.mode === 'orbit') {
+      // Orbit: WASD slides the point you orbit over the ground, QE lifts it,
+      // at a pace that follows the zoom.
+      var t = this.cam.target, fl = Math.hypot(f[0], f[2]) || 1;
+      var fx = f[0] / fl, fz = f[2] / fl, so = sp * Math.max(1, this.cam.dist / 60);
+      if (k['w']) { t[0] += fx * so; t[2] += fz * so; }
+      if (k['s']) { t[0] -= fx * so; t[2] -= fz * so; }
+      if (k['d']) { t[0] += right[0] * so; t[2] += right[2] * so; }
+      if (k['a']) { t[0] -= right[0] * so; t[2] -= right[2] * so; }
+      if (k['e']) t[1] += so;
+      if (k['q']) t[1] -= so;
+      return;
+    }
     var p = this.cam.pos;
     if (k['w']) { p[0] += f[0] * sp; p[1] += f[1] * sp; p[2] += f[2] * sp; }
     if (k['s']) { p[0] -= f[0] * sp; p[1] -= f[1] * sp; p[2] -= f[2] * sp; }
@@ -1900,6 +2340,9 @@
     // server applies the SAVED layer to every region it returns (P7); these
     // are the only cells a freshly arrived region can be missing.
     this.unsaved = new Map();
+    // The level-0 regions ("rx,ry,rz") those cells fall in: the streamer's sky
+    // test must not skip a region an unsaved stroke put something into.
+    this.unsavedRegions = new Set();
     this.undoStack = [];
     this.redoStack = [];
     this.dirty = false;
@@ -1914,11 +2357,13 @@
     var li = ((z & 15) * CHUNK + (y & 15)) * CHUNK + (x & 15);
     m.set(li, word >>> 0);
     this.unsaved.set(x + ',' + y + ',' + z, word >>> 0);
+    this.unsavedRegions.add((x >> 6) + ',' + (y >> 6) + ',' + (z >> 6));
     this.dirty = true;
   };
   // The layer on disk now equals this copy: the server applies it from here on.
   EditLayer.prototype.markSaved = function () {
     this.unsaved.clear();
+    this.unsavedRegions.clear();
     this.dirty = false;
   };
   EditLayer.prototype.get = function (x, y, z) {
@@ -1934,6 +2379,7 @@
   EditLayer.prototype.clear = function () {
     this.chunks.clear(); this.undoStack.length = 0; this.redoStack.length = 0;
     this.unsaved.clear();
+    this.unsavedRegions.clear();
     this.dirty = true;
   };
   EditLayer.prototype.pushUndo = function (cells, label) {
@@ -1950,15 +2396,18 @@
   // so the page draws what the game spawns into. Only level 0 regions map 1:1
   // to world cells; at coarser levels one sample stands for up to 512 voxels
   // and an unsaved stroke has no honest place to land.
+  // Returns whether any stroke landed in it.
   EditLayer.prototype.applyToRegion = function (r) {
-    if (r.lod !== 1 || !this.unsaved.size) return;
-    var ox = r.origin[0], oy = r.origin[1], oz = r.origin[2];
+    if (r.lod !== 1 || !this.unsaved.size) return false;
+    var ox = r.origin[0], oy = r.origin[1], oz = r.origin[2], n = 0;
     this.unsaved.forEach(function (word, k) {
       var p = k.split(',');
       var lx = (+p[0]) - ox, ly = (+p[1]) - oy, lz = (+p[2]) - oz;
       if (lx < 0 || ly < 0 || lz < 0 || lx >= r.nx || ly >= r.ny || lz >= r.nz) return;
       r.cells[((lz * r.ny) + ly) * r.nx + lx] = word & 0xFFFF;
+      n++;
     });
+    return n > 0;
   };
 
   // ---- the .svedit binary, v1 (ABSOLUTE cells). Twin of the v1 branch of
@@ -2020,6 +2469,7 @@
     this.undoStack.length = 0;
     this.redoStack.length = 0;
     this.unsaved.clear();
+    this.unsavedRegions.clear();
     this.dirty = false;
     return {chunks: chunks, seed: d.getUint32(16, true)};
   };

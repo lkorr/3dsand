@@ -41,8 +41,28 @@ SVLOCK_STALE_SEC="${SVLOCK_STALE_SEC:-600}"   # 10 min — kill a stuck lock
 declare -A SVLOCK_HB=()      # dir -> heartbeat pid, for the locks we hold
 SVLOCK_TAG="${SVLOCK_TAG:-$(basename "${BASH_SOURCE[-1]:-$0}")}"
 
+SVLOCK_ORPHAN_SEC="${SVLOCK_ORPHAN_SEC:-30}"   # a lock dir with no pid this old is nobody's
+
 svlock_cleanup_stale() {
   local dir=$1
+  # AN ORPHAN: the directory exists but no holder ever wrote (or no longer
+  # has) a pid in it. Every acquirer — this file and tuner_server.py's RunLock —
+  # writes its pid within milliseconds of mkdir, so a pid-less lock older than
+  # SVLOCK_ORPHAN_SEC belongs to no one. The check below only looked at locks
+  # WITH a pid, so an orphan was never expired: 2026-10-09 a lock holding only
+  # `ts` wedged every run.sh for 17+ minutes and left the tuner's voxel view
+  # answering 503 for every region. (How the orphan is born is a release
+  # racing a heartbeat rewrite of ts; reaping it is the part that matters.)
+  if [ -d "$dir" ] && [ ! -f "$dir/pid" ]; then
+    local born now
+    born=$(stat -c %Y "$dir" 2>/dev/null || date +%s)
+    now=$(date +%s)
+    if [ $(( now - born )) -gt "$SVLOCK_ORPHAN_SEC" ] && [ ! -f "$dir/pid" ]; then
+      echo "$SVLOCK_TAG: removing orphaned $(basename "$dir") (no pid, $(( now - born ))s old)"
+      rm -rf "$dir"
+    fi
+    return
+  fi
   if [ -d "$dir" ] && [ -f "$dir/pid" ]; then
     local ts now age
     # A MISSING OR EMPTY ts IS NOT "AGE 1.7 BILLION SECONDS". It used to be
