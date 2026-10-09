@@ -1879,6 +1879,9 @@ def check_worldmap_layout():
              "kSiteSoften": "WM_SITE_SOFTEN", "kSitePath": "WM_SITE_PATH",
              # map v2 R1: the road piece kind
              "kSiteRoad": "WM_SITE_ROAD",
+             # docs/PLAN_worldbuilder.md W1: river pieces, lake edges, lake cells
+             "kSiteRiver": "WM_SITE_RIVER", "kSiteLakeEdge": "WM_SITE_LAKE_EDGE",
+             "kSiteLakeCell": "WM_SITE_LAKE_CELL",
              "kStampTreeClear": "WM_STAMP_TREE_CLEAR",
              "kRouteSoftInner": "WM_ROUTE_SOFT_INNER", "kRouteSoftOuter": "WM_ROUTE_SOFT_OUTER"}
     for m in re.finditer(r"\b(kBiomeRecWords|kCoverRowWords|kSiteRecWords|kStampHdrWords|kWaterRecWords|kShoreRowWords|kWaterRowWords)\s*=\s*(\d+)", hdr):

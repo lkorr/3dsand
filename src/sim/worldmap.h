@@ -58,6 +58,7 @@
 // docs/PLAN_world_map.md, docs/PLAN_map_overhaul.md.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -708,6 +709,50 @@ enum : uint32_t {
   kSiteSoften = 6,      // softened ground (kind "soften"): the local octaves scaled
   kSitePath = 7,        // a waynode link's trunk keep-out (derived from the refs)
   kSiteRoad = 8,        // one piece of a map.json roads[] entry (map v2 R1)
+  // ---- RIVERS AND LAKES (docs/PLAN_worldbuilder.md W1; worldmap.h "rivers") ----
+  kSiteRiver = 9,       // one piece of a map.json rivers[] entry: a straight
+                        // chord of one REACH (one flat water surface)
+  kSiteLakeEdge = 10,   // one edge of a map.json lakes[] polygon (<= kLakeEdgeMax)
+  kSiteLakeCell = 11,   // a lake's per-site-cell record: the row parity bitset
+  // River piece words (kSiteRiver). kS_X / kS_Z end A (upstream), kS_BoxX1 /
+  // kS_BoxZ1 end B; kS_Radius the channel half-width at A, kS_PadMargin the
+  // bank width (both ends). Word 7 (kS_StampOff) stays 0: wmSiteTopAt reads it
+  // for every kind.
+  kS_RivHwB = 5,        // the channel half-width at end B
+  kS_RivDepthA = 6,     // water depth at the centreline, end A
+  kS_RivDepthB = 8,     // ... end B
+  kS_RivSurf = 9,       // the REACH'S water surface Y (flat over the piece)
+  kS_RivBed = 10,       // bed material (bits 0..11) | kRiv* flags << 12 | length << 16
+  kS_RivLipY = 11,      // a step-start piece: the UPSTREAM reach's surface (the weir it holds)
+  kS_RivCutA = 12,      // a flat end A: the shared cut normal, i16 x | i16 z << 16 (|n| ~ 1024)
+  kS_RivCutB = 15,      // a flat end B: likewise
+  // Lake words (kSiteLakeEdge / kSiteLakeCell). An edge: kS_X / kS_Z and
+  // kS_BoxX1 / kS_BoxZ1 its ends. A cell record: kS_X / kS_Z the site cell's
+  // MIN corner, kS_BoxX1 / kS_BoxZ1 its max (inclusive). kS_PadMargin the
+  // shore band, both kinds.
+  kS_LakeId = 8,        // 1 + index into WorldMapData::lakes
+  kS_LakeLevel = 9,     // the water surface Y
+  kS_LakeBed = 10,      // bed material id (submerged ground)
+  kS_LakeShore = 11,    // shore material id (dry ground within the band)
+  kS_LakeBits = 12,     // a cell record: word offset of its 32-word row bitset, 0 = none
+  kS_LakeFlags = 15,    // a cell record: kLakeCellInside
+  kRivFlatA = 1,        // end A is a STEP START (flat cut on kS_RivCutA, weir strip)
+  kRivFlatB = 2,        // end B is a STEP END (flat cut on kS_RivCutB)
+  kRivProfileV = 4,     // V cross-section (else the parabolic U)
+  kLakeCellInside = 1,  // the cell has no edge of this lake and lies inside it
+  // How far a weir strip reaches downstream of a step (voxels, along the cut
+  // normal), and how far past a channel's edge a different reach's water
+  // still forces a column to hold it (the containment margin).
+  kRiverLip = 4,
+  kRiverPieceMax = 256,      // a piece's longest side (routeDist2's i32 bound)
+  kRiverWidthMin = 8, kRiverWidthMax = 1024,
+  kRiverDepthMin = 2, kRiverDepthMax = 120,
+  kRiverBankMax = 1024,      // the bank never reaches past hw + this
+  kRiverStepDefault = 4, kRiverStepMax = 64,
+  kRiverWaterfall = 20,      // a step that drops more than this (2 m) is a waterfall
+  kLakeEdgeMax = 256,        // a polygon edge's longest side (split at load)
+  kLakeBandDefault = 24, kLakeBandMax = 128,
+  kWaterBedDepth = 2,        // cells of bed / shore material a water column lays
   // A road piece is at most this long (Chebyshev, voxels): routeDist2's
   // projection products stay inside i32 after its box reject.
   kSiteRoadPieceMax = 256,
@@ -1006,6 +1051,15 @@ struct WorldMapData {
     int roadDepth = 0;
     int roadFlags = 0;                    // kS_RoadFlags
     int road = -1;
+    // A RIVER PIECE (kSiteRiver, W1): radius = the half-width at A, padMargin
+    // the bank; these are the kS_Riv* words. A LAKE EDGE / CELL: `surf` the
+    // level, `bed` / `shore` the materials, `bits` a cell's row parity.
+    int hwB = 0, depthA = 0, depthB = 0, surf = 0, lipY = 0, len = 0;
+    int wflags = 0;                       // kRiv* / kLakeCellInside
+    int cutA = 0, cutB = 0;               // packed i16 x | i16 z << 16
+    uint32_t bed = 0, shore = 0;
+    int water = -1;                       // index into rivers / lakes
+    std::vector<uint32_t> bits;           // a lake cell: 32 words, bit z = row parity
   };
   std::vector<StampSite> sites;           // stamps, water and tree sites, in site-id order
   // map.json roads[] (map v2 R1), as authored plus what the load baked: the
@@ -1015,6 +1069,7 @@ struct WorldMapData {
   // END of `sites` (after every other kind), in road order.
   struct Road {
     std::string id, name, kind = "road", surface;
+    bool smooth = false;                       // the points went through THE SPLINE (W1)
     std::vector<std::pair<int, int>> points;   // world voxels
     int width = 30, shoulder = 16, maxGrade = 12, depth = kSiteRoadDepthDefault;
     uint32_t surfaceId = 0;
@@ -1030,6 +1085,48 @@ struct WorldMapData {
     std::vector<int> profS, profY, profG;
   };
   std::vector<Road> roads;
+  // map.json rivers[] (docs/PLAN_worldbuilder.md 2.1, W1), as authored plus
+  // what the load baked. The pieces are kSiteRiver sites at the END of
+  // `sites`, after the roads, in river order. See "RIVERS AND LAKES" above
+  // BakeWater for the bake.
+  struct River {
+    std::string id, name, bedName, joins, profile = "U";
+    // [x, z, w, d] per knot; w / d = -1 where the knot named neither
+    // (interpolated by arc length at load).
+    std::vector<std::array<int, 4>> knots;
+    bool smooth = false;
+    int stepVox = kRiverStepDefault;
+    int bank = -1;                       // -1 = 1.5 x the local width
+    uint32_t bedId = 0;
+    // ---- baked ----
+    int joinIdx = -1;                    // index of the parent in `rivers`
+    int lakeIn = -1, lakeOut = -1;       // the lake its source / mouth lies in
+    int endLevel = 0;                    // the surface it drains to
+    int pieces = 0, reaches = 0;
+    std::vector<std::array<int, 3>> falls;   // waterfalls: x, z, drop (voxels)
+    // The bake along the centreline, decimated to <= kRoadProfileMax samples:
+    // arc length, the water surface, the bare ground (the map page's chart).
+    std::vector<int> profS, profY, profG;
+    // The full-resolution baked centreline (every 4 voxels): x, z, surface,
+    // half-width. Not reported; the horizon and the gate read it.
+    std::vector<std::array<int, 4>> line;
+  };
+  std::vector<River> rivers;
+  // map.json lakes[] (2.2): a polygon filled to `level`. `poly` is the
+  // tessellated outline as the engine reads it (closed, edges <= kLakeEdgeMax).
+  struct Lake {
+    std::string id, name, bedName, shoreName;
+    int level = 0, band = kLakeBandDefault;
+    bool smooth = false;
+    std::vector<std::pair<int, int>> points, poly;
+    uint32_t bedId = 0, shoreId = 0;
+    int x0 = 0, z0 = 0, x1 = 0, z1 = 0;    // poly's bounding box
+    int cells = 0, edges = 0;
+    /** Even-odd inside test at column (x, z) -- the predicate the shader's
+     *  lake cell records reproduce exactly (worldgen.wgsl lakeInside). */
+    bool Inside(int x, int z) const;
+  };
+  std::vector<Lake> lakes;
   // map.json regions[] (map v2 E3): NAMED POLYGONS, data only -- nothing in
   // worldgen reads them; RegionAt answers "which region is this column in"
   // for later systems (quest text, map labels, spawn tables). Points are world
@@ -1234,6 +1331,21 @@ inline constexpr int kRoadProfileMax = 256;
 int BareGroundHeight(int x, int z, uint32_t seed);
 
 /**
+ * The column as World::TerrainHeight composes it, with what its rivers and
+ * lakes did (W1; world.cpp waterApply, the twin of worldgen.wgsl's): the
+ * ground `h`, the surface water stands to over it (-1 = none above the sea
+ * plane's own), the bed / shore material laid on it (0 = none) and whether a
+ * river or lake shaped it. Against CurrentWorldMap().
+ */
+struct WaterColumn {
+  int h = 0;
+  int water = -1;
+  uint32_t bed = 0;
+  bool wet = false;
+};
+WaterColumn WaterColumnAt(int x, int z, uint32_t seed);
+
+/**
  * The AUTHORED height at (x, z) against CurrentWorldMap(): the height plane's
  * Catmull-Rom (world.cpp mapHeightAt, the shader's twin), absolute voxels, no
  * noise, no sculpt; the edge fade outside the extent. `gx` / `gz` (optional)
@@ -1273,5 +1385,26 @@ bool SiteKeepOut(int x, int z);
  */
 std::string ActiveMapName(const std::string& tuned);
 void SetMapOverride(const std::string& name);
+
+// ---- THE SPLINE (docs/PLAN_worldbuilder.md 2.1 / 2.3; assets/editor/spline.js
+// is the JS twin, tests/spline_vectors.json the shared table) -----------------
+// CENTRIPETAL CATMULL-ROM (alpha 0.5, Barry-Goldman) through `pts`, every
+// knot ON the curve. Open: phantom end points P[-1] = 2 P0 - P1 and
+// P[n] = 2 P[n-1] - P[n-2]. Closed: the controls wrap. Each segment Pi ->
+// Pi+1 is evaluated at nd = clamp(ceil(|Pi+1 - Pi| / 2), 8, 4096) uniform
+// steps of its knot parameter into a dense polyline, whose arc length L is
+// then resampled at m = max(1, ceil(L / step)) EQUAL arc steps: outputs
+// Pi exactly, then the m - 1 interior points; the open curve's last point is
+// P[n-1] exactly (a closed one does not repeat P0). Knot distances below
+// 1e-4 count as 1e-4. `seg` / `f` say where each output lies (segment i,
+// arc fraction k / m) so per-knot attributes interpolate linearly along it.
+struct SplinePt {
+  double x = 0, z = 0;
+  int seg = 0;
+  double f = 0;
+};
+std::vector<SplinePt> SplineTessellate(const std::vector<std::array<double, 2>>& pts, bool closed, double step);
+/** The same resampling with straight segments (smooth: false). */
+std::vector<SplinePt> PolylineResample(const std::vector<std::array<double, 2>>& pts, bool closed, double step);
 
 }  // namespace worldmap

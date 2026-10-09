@@ -1396,6 +1396,40 @@ def _map_v2_check(j):
             return 'locale "%s" needs bounds {min: [x, z], max: [x, z]}, min <= max' % o["id"]
         if not (isinstance(a, dict) and xz(a.get("at")) and isinstance(a.get("y"), int) and not isinstance(a.get("y"), bool)):
             return 'locale "%s" needs anchor {at: [x, z], y}' % o["id"]
+    # docs/PLAN_worldbuilder.md 2: rivers[] / lakes[] SHAPE (the engine's
+    # worldwater.cpp refuses the rest by name: joins, widths, materials) and
+    # the roads' optional `smooth`.
+    def num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+    rivers = j.get("rivers", [])
+    if not isinstance(rivers, list):
+        return "rivers[] must be a list"
+    for o in rivers:
+        if not (isinstance(o, dict) and isinstance(o.get("id"), str) and o["id"] and isinstance(o.get("points"), list)
+                and len(o["points"]) >= 2
+                and all(isinstance(p, list) and len(p) in (2, 4) and all(num(x) for x in p) for p in o["points"])):
+            return "rivers[] must be objects with an id and points [[x, z, w, d] | [x, z], ...] (source first, world voxels)"
+        if len(o["points"][0]) != 4 or len(o["points"][-1]) != 4:
+            return 'river "%s": the first and last points must carry [x, z, w, d]' % o["id"]
+        if "joins" in o and not (o["joins"] is None or isinstance(o["joins"], str)):
+            return 'river "%s": joins must be a river id or null' % o["id"]
+        if "smooth" in o and not isinstance(o["smooth"], bool):
+            return 'river "%s": smooth must be true or false' % o["id"]
+    lakes = j.get("lakes", [])
+    if not isinstance(lakes, list) or not all(
+            isinstance(o, dict) and isinstance(o.get("id"), str) and o["id"] and num(o.get("level"))
+            and isinstance(o.get("points"), list) and len(o["points"]) >= 3 and all(xz(p) for p in o["points"])
+            for o in lakes):
+        return "lakes[] must be objects with an id, a level (voxel Y) and points [[x, z], ...] (3+)"
+    for o in j.get("roads", []):
+        if "smooth" in o and not isinstance(o["smooth"], bool):
+            return 'road "%s": smooth must be true or false' % o.get("id")
+    # Editor-only keys (2.4): the engine ignores them; only their container shape.
+    if not isinstance(j.get("ranges", []), list):
+        return "ranges[] must be a list"
+    for k in ("climate", "gen"):
+        if k in j and not isinstance(j[k], (dict, list)):
+            return "%s must be an object or a list" % k
     return None
 
 

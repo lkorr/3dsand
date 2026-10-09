@@ -67,7 +67,13 @@ enum : uint32_t {
   // (worldmap::TreelineAt at the sample, map v2 A1): snow at and above it.
   // 0 = no plane (old header): the shader falls back to kHTreeline.
   kHTlPlane = kHSkin + kSkinSlots,
-  kHeaderWords = kHTlPlane + 1,
+  // word offset: nx * nz per-sample WATER words (W1, docs/PLAN_worldbuilder.md):
+  // coverage u8 (0..255, the share of the sample's footprint under a map
+  // lake or river channel) | the water surface i16 << 16. 0 = no plane. The
+  // horizon paints that share of the sample as water; a lake-covered sample
+  // also lifts its MAX / AVG to the lake's level (a flat lake at distance).
+  kHWater = kHTlPlane + 1,
+  kHeaderWords = kHWater + 1,
   kMaxLevels = 16,
 };
 

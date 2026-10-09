@@ -515,6 +515,7 @@ add_library(sandvox_core OBJECT
   # THE BOLT YOU SEE (docs/PLAN_electricity_wave2.md D): render-only bolt geometry.
   src/sim/boltfx.cpp
   src/sim/worldmap.cpp
+  src/sim/worldwater.cpp
   src/sim/microvox.cpp
   src/sim/microbody.cpp
   src/game/player.cpp
@@ -636,6 +637,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_trees.cpp
   src/test/selftest_biomes.cpp
   src/test/selftest_mapv2.cpp
+  src/test/selftest_rivers.cpp
   src/test/selftest_locale.cpp
   src/test/selftest_altitude.cpp
   src/test/selftest_envtruth.cpp

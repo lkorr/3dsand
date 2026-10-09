@@ -195,7 +195,14 @@ export const LIVE = {
     'roads[]': R('map v2 R1 roads: {id, name?, points [[x, z]...], width, shoulder, surface (a SOLID material), maxGrade %, kind road|track|path, depth?} -- worldmap.cpp bakes a grade-limited profile from the bare ground and cuts it into kSiteRoad pieces; the height mirror levels the ground to it (roadPadAt), genCellIn lays the surface, trees / cover / tarns keep off it, the far field tints the cells it crosses (DESIGN.md, map v2 R1)'),
     'planes.height': R('mapHeightAt: the AUTHORED absolute height, i16 voxels on 2^log2 posts, Catmull-Rom; tiles planes/height/<tx>_<tz>.svt'),
     'planes.biome': R('mapBiomeAt / biomeMixAt: biome cells of 2^log2 voxels; tiles planes/biome/<tx>_<tz>.svt'),
-    'ridges[]': N('editor', 'baked into planes.height; the engine reads the plane')
+    'ridges[]': N('editor', 'baked into planes.height; the engine reads the plane'),
+    // docs/PLAN_worldbuilder.md W1: rivers and lakes in the engine; ranges /
+    // climate / gen are the editor's own re-bake inputs (2.4).
+    'rivers[]': R('worldbuilder W1 rivers: {id, name?, points [[x, z, w, d] | [x, z]...] source first, smooth?, bed?, joins?, stepVox?, bank?, profile? U|V} -- worldwater.cpp bakes the surface from the bare ground (running min, flat reaches stepping down by stepVox, the mouth at the sea / the lake / the parent it joins) and cuts kSiteRiver pieces; waterApply carves the channel, holds the banks and builds a weir at every step, so the water is born at rest (DESIGN.md, the world map rivers)'),
+    'lakes[]': R('worldbuilder W1 lakes: {id, name?, level, points [[x, z]...], smooth?, bed?, shore?, band?} -- water fills every column inside the polygon whose ground is under the level, and a sill raises the ground to level + 1 across the shore band outside it (kSiteLakeEdge / kSiteLakeCell, waterApply)'),
+    'ranges[]': N('editor', 'the range generator’s input, re-bakeable; baked into planes.height'),
+    'climate': N('editor', 'the auto-biome generator’s inputs; its output is the biome plane'),
+    'gen': N('editor', 'the generator op list the base was built with; its output is the height plane')
   }
 };
 

@@ -26,6 +26,7 @@
 #include "sim/tuningstamp.h"   // HashOneFile: the edit layers' fingerprint part (L1)
 #include "sim/voxload.h"
 #include "sim/world.h"
+#include "sim/worldwater.h"   // rivers[] / lakes[] (W1) and the spline
 #include "world/structures.h"   // P4: the map's `structure` refs become stamp sites
 
 using nlohmann::json;
@@ -1754,6 +1755,15 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
         rd.points.push_back(q);
       }
       if (rd.points.size() < 2) { log += who + "needs at least two distinct points\n"; return false; }
+      // smooth: true (docs/PLAN_worldbuilder.md 2.3): the centreline is THE
+      // SPLINE through the points (worldwater.cpp SmoothRoadPoints), and that
+      // polyline is what the profile bake below grades; false (the default)
+      // keeps the authored polyline, so an existing road does not move.
+      if (r.contains("smooth") && r["smooth"].is_boolean() && r["smooth"].get<bool>()) {
+        rd.smooth = true;
+        rd.points = SmoothRoadPoints(rd.points);
+        if (rd.points.size() < 2) { log += who + "its smoothed centreline collapses to one point\n"; return false; }
+      }
       // The numbers, each clamped with a warning (the map page's inspector
       // keeps to these ranges; a hand edit may not). Defaults by kind.
       auto num = [&](const char* key, int def, int lo, int hi) -> int {
@@ -1793,6 +1803,10 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       out.roads.push_back(std::move(rd));
     }
   }
+  // ---- rivers[] and lakes[] (docs/PLAN_worldbuilder.md W1, worldwater.h) --------
+  // Read and validated here; BAKED (surfaces, reaches, pieces, lake cells)
+  // after every other site is in place, at the end of the site-pad block.
+  if (!ParseRiversLakes(j, set, out, at, log, warn)) return false;
   // ---- regions[] and markers[] (map v2 E3): data only ---------------------------
   // Nothing in worldgen reads either (they still move contentHash: they are
   // in map.json). A malformed SHAPE (no id, a duplicate id, a point that is
@@ -1939,7 +1953,9 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   // pond's radius, the 64 a stamp allows too), a trunk's crown, the far tint.
   auto buildIndex = [&]() -> bool {
   for (WorldMapData::StampSite& st : out.sites) {
-    if (st.kind == kSiteRoad)
+    if (st.kind == kSiteRiver || st.kind == kSiteLakeEdge || st.kind == kSiteLakeCell)
+      st.indexReach = WaterIndexReach(st, treeMaxReach);
+    else if (st.kind == kSiteRoad)
       st.indexReach = st.radius + std::max({static_cast<int>(kSiteRoadShoulderMax) + 64, treeMaxReach + 1,
                                             static_cast<int>(kSiteRoadFarTint)}) + 1;
     else if (st.kind == kSiteTree) st.indexReach = st.radius + treeMaxReach;
@@ -1958,7 +1974,8 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       // (a clearing / soften: min .. max; a stamp: its rect; a route: its two
       // ends in either order).
       int lx = st.x, lz = st.z, hx = st.x, hz = st.z;
-      if (st.kind == kSiteClearing || st.kind == kSiteSoften || st.kind == kSitePath || st.kind == kSiteRoad) {
+      if (st.kind == kSiteClearing || st.kind == kSiteSoften || st.kind == kSitePath || st.kind == kSiteRoad ||
+          st.kind == kSiteRiver || st.kind == kSiteLakeEdge || st.kind == kSiteLakeCell) {
         lx = std::min(st.x, st.x1); hx = std::max(st.x, st.x1);
         lz = std::min(st.z, st.z1); hz = std::max(st.z, st.z1);
       } else if (st.kind == kSiteStamp) {
@@ -2074,7 +2091,8 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
           // and authored trees (two clearings overlapping is one bigger one).
           // Nor does softened ground or a route.
           auto claimsNone = [](int k) {
-            return k == kSiteClearing || k == kSiteSoften || k == kSitePath || k == kSiteRoad;
+            return k == kSiteClearing || k == kSiteSoften || k == kSitePath || k == kSiteRoad || k == kSiteRiver ||
+                   k == kSiteLakeEdge || k == kSiteLakeCell;
           };
           if (claimsNone(sa.kind) || claimsNone(sb.kind)) continue;
           if (!clash(sa, sb)) continue;
@@ -2096,7 +2114,9 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
                  "): the player starts in the open, not among trees");
           continue;
         }
-        if (s.kind == kSiteSoften || s.kind == kSitePath || s.kind == kSiteRoad) continue;   // walkable ground, all
+        if (s.kind == kSiteSoften || s.kind == kSitePath || s.kind == kSiteRoad || s.kind == kSiteRiver ||
+            s.kind == kSiteLakeEdge || s.kind == kSiteLakeCell)
+          continue;   // walkable ground or water, said below for water
         const Fp f = fpOf(s, false);
         const Fp sp{false, out.spawnX, out.spawnZ, out.spawnX, out.spawnZ, 0};
         if (meets(f, sp))
@@ -2348,6 +2368,37 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
         warn("site \"" + st.id + "\" (tree) stands on ground y" + std::to_string(st.padY) +
              ", at or above its column's treeline y" + std::to_string(tl) + ": it will not grow");
     }
+    // ---- RIVERS AND LAKES (W1, worldwater.cpp "THE RIVER BAKE") ----------------
+    // Last: they read the BARE ground (no road, pad or water in it), which no
+    // site appended above changes, and their records go at the END of the
+    // table (river pieces, lake edges, lake cells), so no other site's id moves.
+    if (!out.rivers.empty() || !out.lakes.empty()) {
+      if (!out.lakes.empty() && out.siteCellLog2 > 12) {
+        log += at + "lakes need siteCellLog2 <= 12 (a lake cell's row bitset)\n";
+        Slot() = std::move(prev);
+        return false;
+      }
+      if (!readTreeSpecies()) { Slot() = std::move(prev); return false; }
+      std::vector<WorldMapData::StampSite> water;
+      if (!BakeRiversLakes(out, seed, water, log, at, warn)) {
+        Slot() = std::move(prev);
+        return false;
+      }
+      for (WorldMapData::StampSite& st : water) out.sites.push_back(std::move(st));
+      if (!buildIndex()) {
+        Slot() = std::move(prev);
+        return false;
+      }
+      // The spawn in the water is a mistake the page should show.
+      if (out.spawnAuthored) {
+        Slot() = out;
+        const WaterColumn wc = WaterColumnAt(out.spawnX, out.spawnZ, seed);
+        if (wc.water >= 0)
+          warn("the spawn (" + std::to_string(out.spawnX) + "," + std::to_string(out.spawnZ) +
+               ") is in a river or a lake (water to y" + std::to_string(wc.water) + " over ground y" +
+               std::to_string(wc.h) + ")");
+      }
+    }
     Slot() = std::move(prev);
   }
 
@@ -2427,6 +2478,32 @@ std::string MapCheckJson(const std::string& name, bool ok, const WorldMapData& m
     roads.push_back(rj);
   }
   j["roads"] = roads;
+  // W1: each river and lake as the engine baked it -- the map page's preview
+  // draws these numbers (the reach surfaces, the waterfalls), not a re-bake.
+  json rivers = json::array();
+  for (const WorldMapData::River& r : m.rivers) {
+    json rj;
+    rj["id"] = r.id;
+    rj["joins"] = r.joins;
+    rj["bed"] = r.bedName;
+    rj["stepVox"] = r.stepVox;
+    rj["pieces"] = r.pieces;
+    rj["reaches"] = r.reaches;
+    rj["endLevel"] = r.endLevel;
+    rj["lakeIn"] = r.lakeIn >= 0 ? json(m.lakes[static_cast<size_t>(r.lakeIn)].id) : json(nullptr);
+    rj["lakeOut"] = r.lakeOut >= 0 ? json(m.lakes[static_cast<size_t>(r.lakeOut)].id) : json(nullptr);
+    json falls = json::array();
+    for (const auto& f : r.falls) falls.push_back({f[0], f[1], f[2]});
+    rj["waterfalls"] = falls;
+    rj["profile"] = {{"s", r.profS}, {"y", r.profY}, {"ground", r.profG}};
+    rivers.push_back(rj);
+  }
+  j["rivers"] = rivers;
+  json lakes = json::array();
+  for (const WorldMapData::Lake& l : m.lakes)
+    lakes.push_back({{"id", l.id}, {"level", l.level}, {"band", l.band}, {"outline", static_cast<int>(l.poly.size())},
+                     {"cells", l.cells}, {"bbox", {l.x0, l.z0, l.x1, l.z1}}});
+  j["lakes"] = lakes;
   // E3: the regions and markers as the loader accepted them.
   json rs = json::array();
   for (const WorldMapData::Region& r : m.regions)
@@ -2541,6 +2618,38 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
       r[kS_RoadMat] = s.roadMat;
       r[kS_RoadDepth] = U(s.roadDepth);
       r[kS_RoadFlags] = U(s.roadFlags);
+    }
+    if (s.kind == kSiteRiver) {
+      // Every word is the river piece's (worldmap.h kS_Riv*); the generic
+      // words written above are re-written, and word 7 stays 0.
+      r[kS_Radius] = U(s.radius); r[kS_PadMargin] = U(s.padMargin);
+      r[kS_RivHwB] = U(s.hwB);
+      r[kS_RivDepthA] = U(s.depthA); r[kS_StampOff] = 0u; r[kS_RivDepthB] = U(s.depthB);
+      r[kS_RivSurf] = U(s.surf);
+      r[kS_RivBed] = (s.bed & 0xFFFu) | ((static_cast<uint32_t>(s.wflags) & 15u) << 12) |
+                     (static_cast<uint32_t>(std::clamp(s.len, 0, 1023)) << 16);
+      r[kS_RivLipY] = U(s.lipY);
+      r[kS_RivCutA] = static_cast<uint32_t>(s.cutA);
+      r[kS_BoxX1] = U(s.x1); r[kS_BoxZ1] = U(s.z1);
+      r[kS_RivCutB] = static_cast<uint32_t>(s.cutB);
+      continue;
+    }
+    if (s.kind == kSiteLakeEdge || s.kind == kSiteLakeCell) {
+      r[kS_Radius] = 0u; r[kS_PadMargin] = U(s.padMargin);
+      r[kS_Rot] = 0u; r[kS_Salt] = 0u; r[kS_StampOff] = 0u;
+      r[kS_LakeId] = U(s.water + 1);
+      r[kS_LakeLevel] = U(s.surf);
+      r[kS_LakeBed] = s.bed;
+      r[kS_LakeShore] = s.shore;
+      r[kS_BoxX1] = U(s.x1); r[kS_BoxZ1] = U(s.z1);
+      r[kS_LakeFlags] = U(s.wflags);
+      r[kS_LakeBits] = 0u;
+      if (s.kind == kSiteLakeCell && !s.bits.empty()) {
+        const uint32_t base = static_cast<uint32_t>(W.size());
+        W.insert(W.end(), s.bits.begin(), s.bits.end());
+        W.data()[tab0 + i * kSiteRecWords + kS_LakeBits] = base;   // W moved: re-index
+      }
+      continue;
     }
     if (s.kind == kSiteStamp) {
       r[kS_BoxX0] = U(s.bx0); r[kS_BoxZ0] = U(s.bz0);

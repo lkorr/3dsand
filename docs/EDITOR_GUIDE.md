@@ -1853,6 +1853,45 @@ Harrowby's paths are roads (ids `harrowby_*`, kind `path`, `packed_gravel` on
 the green, `packed_earth` lanes); `default/scripts/harrowby_08_paths.sh` now
 only erases the old painted paths from the edit layer.
 
+**Curved roads.** A road with `"smooth": true` bends THROUGH its points (a
+centripetal Catmull-Rom spline, the same curve the river tool draws); without
+it the road is the straight polyline it always was, so old roads do not move.
+
+### 15.2b Rivers and lakes (what the engine does with them)
+
+The drawing tools for these are the River and Lake tools (wave 2); this is
+what the GAME makes of the `rivers[]` / `lakes[]` they write, so you know
+what to expect when you walk there.
+
+**A river is a staircase of still pools, not a current.** Water that flows
+never lets the world rest, so the engine takes your line (source first), finds
+the lowest ground along it, and lays the water in FLAT stretches (reaches)
+that step down every `stepVox` voxels of fall (default 4 = 40 cm). Each step is
+a small weir; a step of more than 2 m is a waterfall (the map page's check
+lists them). The channel is cut `d` voxels deep at its middle (a U, or a V
+with `"profile": "V"`), `w` wide, and the banks blend back into the land over
+`bank` voxels (default 1.5 times the width): where the land is higher the
+banks are cut down, where it is lower a low levee holds the water in. No trees
+grow on a river's banks.
+
+* **Ends.** A river ends at the sea, in a lake (put its last point inside the
+  lake's outline), or in another river (`"joins": "<id>"`, last point on that
+  river's channel): its water meets the other body at that body's level, with
+  a weir or waterfall just before if it arrives from higher up. A river whose
+  first point is inside a lake is that lake's OUTFLOW and starts at its level.
+* **Fords.** A road crossing a river keeps its deck under the water: a ford.
+  Bridges are stamps (later).
+* **Beds.** `bed` (default gravel) lines the channel; a loose bed stays only
+  where it can rest and the rest is rock.
+
+**A lake** is an outline and a `level`: every column inside the outline whose
+ground is below the level is water up to it; columns above it are islands or
+dry shore. Just outside the outline, within the shore `band` (default 24
+voxels), the ground is raised to level + 1, so a sloppy outline never leaks.
+`bed` (default shore_mud) lines the bottom, `shore` (default sand) the dry
+band. The check panel warns when a lake's ground is above its level everywhere
+(it holds no water) or the spawn is in water.
+
 ### 15.3 Regions and markers
 
 **Regions** (`regions[]`: `{id, name, colour, points}`) are named outlines,

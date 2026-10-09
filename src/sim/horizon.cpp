@@ -102,6 +102,59 @@ void Build(const worldmap::WorldMapData& m, const std::vector<uint32_t>& wm, uin
     }
   }
 
+  // ---- THE WATER (W1): map lakes and river channels, per sample ----
+  // A lake: the share of a 4 x 4 subsample grid over the footprint inside its
+  // polygon with the post ground under its level; at least half wet lifts the
+  // sample's MAX and AVG to the level, so the horizon draws the lake flat. A
+  // river: every baked centreline sample (4 voxels of channel, 2 hw wide) adds
+  // its area to the sample under it -- a 4 m stream is a faint line at 20 km,
+  // a 40 m river a solid one; its geometry stays the ground's.
+  std::vector<uint32_t> water;
+  if (!m.lakes.empty() || !m.rivers.empty()) {
+    water.assign(ns, 0u);
+    std::vector<int> cov(ns, 0), lvl(ns, INT32_MIN);
+    auto idxOf = [&](int x, int z, size_t* k) {
+      const int i = (int)std::lround((double)(x - x0) / S), j = (int)std::lround((double)(z - z0) / S);
+      if (i < 0 || j < 0 || i >= nx || j >= nz) return false;
+      *k = (size_t)j * nx + i;
+      return true;
+    };
+    for (const worldmap::WorldMapData::Lake& lk : m.lakes) {
+      const int i0 = std::max(0, (lk.x0 - x0) / S - 1), i1 = std::min(nx - 1, (lk.x1 - x0) / S + 1);
+      const int j0 = std::max(0, (lk.z0 - z0) / S - 1), j1 = std::min(nz - 1, (lk.z1 - z0) / S + 1);
+      for (int j = j0; j <= j1; j++)
+        for (int i = i0; i <= i1; i++) {
+          int wet = 0;
+          for (int b = 0; b < 4; b++)
+            for (int a = 0; a < 4; a++) {
+              const int x = x0 + i * S - S / 2 + S / 8 + a * S / 4, z = z0 + j * S - S / 2 + S / 8 + b * S / 4;
+              // The authored ground (no noise): a lake is a few metres deep
+              // and the posts' floor is coarse, so allow it 16 voxels.
+              if (lk.Inside(x, z) && worldmap::AuthoredHeightAt(x, z) < lk.level + 16) wet++;
+            }
+          if (wet == 0) continue;
+          const size_t k = (size_t)j * nx + i;
+          cov[k] = std::max(cov[k], wet * 255 / 16);
+          lvl[k] = std::max(lvl[k], lk.level);
+          if (wet >= 8) {
+            const int hi = std::max(UnMax(samples[k]), lk.level), avg = std::max(UnAvg(samples[k]), lk.level);
+            samples[k] = Pack(hi, avg);
+            maxY = std::max(maxY, hi);
+          }
+        }
+    }
+    for (const worldmap::WorldMapData::River& rv : m.rivers)
+      for (const auto& p : rv.line) {
+        size_t k;
+        if (!idxOf(p[0], p[1], &k)) continue;
+        cov[k] = std::min(255, cov[k] + (4 * 2 * p[3] * 255 + S * S / 2) / (S * S));
+        lvl[k] = std::max(lvl[k], p[2]);
+      }
+    for (size_t k = 0; k < ns; k++)
+      if (cov[k] > 0)
+        water[k] = (uint32_t)std::min(cov[k], 255) | ((uint32_t)(uint16_t)ClampI16(lvl[k]) << 16);
+  }
+
   // ---- the cell pyramid ----
   // Level 0: (nx-1) x (nz-1) cells between samples. Each level halves (rounding
   // up) until one cell covers everything.
@@ -190,6 +243,10 @@ void Build(const worldmap::WorldMapData& m, const std::vector<uint32_t>& wm, uin
     const size_t at = out.size();
     out.resize(at + tw, 0u);
     std::memcpy(out.data() + at, tline.data(), ns * sizeof(int16_t));
+  }
+  if (!water.empty()) {
+    out[kHWater] = (uint32_t)out.size();
+    out.insert(out.end(), water.begin(), water.end());
   }
 }
 
