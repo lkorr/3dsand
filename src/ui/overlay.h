@@ -1417,6 +1417,16 @@ struct UIState {
     bool discardArmed = false;  // discard asks twice
     std::string text;
     std::vector<Shot> shots;
+    // The ticket these pictures and this text go INTO: an existing
+    // bug_reports/<stamp>/ folder picked from the panel's ticket list, or
+    // empty for a new report. `newText` holds the new report's draft while an
+    // existing ticket is on the panel.
+    std::string target;
+    std::string newText;
+    // Category tags (`tags: lod, graphics` in report.md); `newTags` parks
+    // the new report's while an existing ticket is on the panel.
+    std::vector<std::string> tags;
+    std::vector<std::string> newTags;
     bool wantSubmit = false, wantAddAnother = false, wantDiscard = false;
     int wantRemove = -1;
     std::string toast;          // "saved to ..." after a submit

@@ -12440,7 +12440,7 @@ int main(int argc, char** argv) {
       const bool f12 = eF12.Pressed(key(GLFW_KEY_F12));
       if (f12 && !uiTyping && !ui.bug.open) {
         const bool shift = key(GLFW_KEY_LEFT_SHIFT) || key(GLFW_KEY_RIGHT_SHIFT);
-        if (shift && ui.bug.collecting && !ui.bug.shots.empty()) {
+        if (shift) {  // the panel (and its ticket list) without a picture
           ui.bug.open = true;
           ui.bug.focusText = true;
         } else {
@@ -12460,10 +12460,23 @@ int main(int argc, char** argv) {
         }
         if (f == 130) {
           ui.bug.text = "scripted report: the first picture, then 'add another' and a second.";
+          ui.bug.tags = {"ui"};
           ui.bug.wantAddAnother = true;
         }
         if (f == 175) g_shotJumpPath = "screenshot_bugreport_panel.bmp";
         if (f == 180) ui.bug.wantSubmit = true;
+        // ...then reopen that ticket from the list and add to it: a third
+        // picture, appended as shot_3 with the text extended.
+        if (f == 220) {
+          bugShotPending = true;
+          ui.bug.hideForShot = true;
+        }
+        if (f == 230 && BugReportSelectTicket(ui, 0)) {
+          ui.bug.text += "\n\nscripted addition: a third picture, filed into the same ticket.";
+          ui.bug.tags.push_back("graphics");
+        }
+        if (f == 245) g_shotJumpPath = "screenshot_bugreport_ticket.bmp";
+        if (f == 250) ui.bug.wantSubmit = true;
       }
     }
     // F8: into the editor -- pause, free the cursor, detach the camera.
@@ -12728,6 +12741,10 @@ int main(int argc, char** argv) {
         br.shots.clear();
         br.text.clear();
         br.open = br.collecting = br.discardArmed = false;
+        br.target.clear();
+        br.newText.clear();
+        br.tags.clear();
+        br.newTags.clear();
         bugContext.clear();
       };
       if (br.wantRemove >= 0) {

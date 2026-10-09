@@ -122,6 +122,8 @@ const std::vector<Gate>& EditorGates();
 const std::vector<Gate>& VillageGates();
 const std::vector<Gate>& CellarGates();   // selftest_demon_cellar.cpp (demons D2)
 const std::vector<Gate>& ClearingGates();
+// The F12 ticket files (ui/bugreport.h): report.md parse/append, CPU only.
+const std::vector<Gate>& BugReportGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -179,6 +181,8 @@ const char* const kOrder[] = {
     "grimoire",
     // `spellbook` beside it: the per-user file, CPU-only, a temp dir.
     "spellbook",
+    // `bugreport-md` too: the F12 ticket files, CPU-only, a temp dir.
+    "bugreport-md",
     // And beside it `spell-graph` (PLAN_spell_graph phase 2), for the third
     // time and the same reason: CPU-only over glyphs.json, the generated
     // oracle and its own fixtures, milliseconds, nothing left behind. It
@@ -1311,7 +1315,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(), &ItemStageGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates()})
+                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

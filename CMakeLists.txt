@@ -633,6 +633,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest.cpp
   src/test/selftest_voxregion.cpp
   src/test/selftest_grimoire.cpp
+  src/test/selftest_bugreport.cpp
   src/test/selftest_terrain.cpp
   src/test/selftest_trees.cpp
   src/test/selftest_biomes.cpp
