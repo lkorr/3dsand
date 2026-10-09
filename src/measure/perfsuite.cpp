@@ -3082,12 +3082,15 @@ bool CamSeamVeg(Scene& s, uint32_t& tick, std::string&) {
 // the horizon past it and the height fog in one frame -- the camera the
 // horizon's < 1 ms budget is quoted on. LOADS THE PEAKS MAP and leaves it
 // loaded (the camera after it, if any, stands on peaks): put LAST.
-bool CamSummit(Scene& s, uint32_t& tick, std::string& why) {
+// `peaksea` is the same map from the sea 10 km south (PeaksPoseOf(2)): the
+// massif itself is past the cascades there, so it is the frame where the
+// pyramid walk (not just the analytic sea past the grid) carries the horizon.
+bool CamPeaks(Scene& s, uint32_t& tick, std::string& why, int which) {
   if (worldmap::CurrentWorldMap().name != "peaks" &&
       !SwitchMap(s.ctx, s.sim, s.mats, "peaks", nullptr, why)) {
     return false;
   }
-  const PeaksPose p = PeaksPoseOf(1);
+  const PeaksPose p = PeaksPoseOf(which);
   s.stream.OnRegen();
   CentreWindowOnEye(s.ctx, s.world, s.sim, p.ex, p.ey, p.ez, 120);
   s.eye = {p.ex, p.ey, p.ez};
@@ -3097,6 +3100,8 @@ bool CamSummit(Scene& s, uint32_t& tick, std::string& why) {
   tick = FindNoonTick(CurrentTuning());
   return true;
 }
+bool CamSummit(Scene& s, uint32_t& tick, std::string& why) { return CamPeaks(s, tick, why, 1); }
+bool CamPeakSea(Scene& s, uint32_t& tick, std::string& why) { return CamPeaks(s, tick, why, 2); }
 const char* const kArmsSummit[] = {"baseline", "nohorizon", "nofar", "noshadow", nullptr};
 
 const char* const kArmsSeam[] = {
@@ -3143,6 +3148,9 @@ const BudgetCam kBudgetCams[] = {
     {"summit", "on the peaks map's 1,400 m summit looking out: cascade, "
                "horizon and height fog (loads peaks; last)",
      CamSummit, kArmsSummit},
+    {"peaksea", "3 m over the sea 10 km south of the peaks summit: the massif "
+                "is past the cascades, drawn by the horizon (loads peaks; last)",
+     CamPeakSea, kArmsSummit},
 };
 constexpr int kBudgetCamCount =
     (int)(sizeof(kBudgetCams) / sizeof(kBudgetCams[0]));

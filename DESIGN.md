@@ -16636,7 +16636,12 @@ the sea, the far openness/ambient/bounce and the cloud shadow; the normal is
 the AVG field's gradient at the pyramid level whose cell is about a pixel, so
 30 km of terrain does not alias. NO sun shadows yet (that is S1, which builds
 its horizon map from this pyramid). `render.horizon` (RenderParams flag bit 7,
-a runtime switch, the `nohorizon` budget arm) turns it off.
+a runtime switch, the `nohorizon` budget arm) turns it off. Measured
+2026-10-08, 2560x1440, RTX 3060 Ti, `--render-budget --budget-cams
+summit,peaksea --budget-arms baseline,nohorizon` (fragment time, the `pre`
+compute span excluded): `peaksea` (the massif 10 km off, drawn by the pyramid
+walk) 15.36 vs 15.22 ms, i.e. ~0.14 ms; `summit` within the ±0.3 ms noise.
+The pyramid for the 20 km `default` map is ~832^2 samples, ~4 MiB.
 
 **Peak preservation at levels 6-8.** A cascade cell is solid when its CENTRE
 sample is, so a summit or a knife ridge between two sample columns was shaved
@@ -16651,8 +16656,8 @@ a voxel or two wide.
 
 **The air: height fog.** The fog is now the atmosphere's, not the LOD's:
 extinction `rho(y) = fogSeaDensity * exp(-(y - sea) / fogScaleHeight)`
-(`render.fogSeaDensity` per km at the map's sea plane, 0.12; `render.fogScale
-Height` 1,200 m), integrated exactly along each view ray in closed form
+(`render.fogSeaDensity` per km at the map's sea plane, 0.12;
+`render.fogScaleHeight` 1,200 m), integrated exactly along each view ray in closed form
 (`airFogTauS`): a valley is hazy, a summit is clear, and a ray climbing out of
 the haze sees through it. Both rows are `NO_WGSL` and ride `RenderParams`
 (`hfogDensity / hfogFalloff / hfogBaseY`, spent from the wind-primitive row's
