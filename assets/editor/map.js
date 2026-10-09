@@ -910,10 +910,11 @@ const imgCache = {
 // what it has -- the tile's image in another style, or the same tile at
 // another mip level -- and asks for another frame; the picture converges in a
 // few frames and is then exactly what an unbudgeted paint draws. A paint
-// that is not part of a gesture (an edit, a tool, the tests' _paint) builds
-// everything, as before.
+// that is not part of a gesture, and EVERY direct paint() call (an edit, a tool,
+// a release, the tests' _paint), builds everything, as before: only the
+// frame-scheduled paints (schedulePaint) of a moving view are budgeted.
 const TILE_BUDGET_MS = 4, INTERACT_MS = 250;
-let interactUntil = 0, tileBudget = null;
+let interactUntil = 0, tileBudget = null, framePaint = false;
 // the id of the newest image built for 'h|k|L' (any variant / stamp): what
 // stands in for that tile while its current look waits for the budget
 const tileLatest = new Map();
@@ -1095,7 +1096,7 @@ let paintQueued = false;
 function schedulePaint() {
   if (paintQueued) return;
   paintQueued = true;
-  requestAnimationFrame(() => { paintQueued = false; paint(); });
+  requestAnimationFrame(() => { paintQueued = false; framePaint = true; try { paint(); } finally { framePaint = false; } });
 }
 // PAINT PROFILER (scripts/bench_mappage.sh): when globalThis.__mapProf is set,
 // paint() reports each layer's milliseconds to its rec(name, ms), and the
@@ -1132,7 +1133,7 @@ function paintAll(lap) {
   const styleKey = [range.ver, lo, hi, sea, disp.contours ? I : '-', disp.shade, disp.contours, slope ? slope.join('/') : ''].join(',');
   let missing = [];
   const now = performance.now();
-  tileBudget = now < interactUntil ? {end: now + TILE_BUDGET_MS, built: false, short: false} : null;
+  tileBudget = framePaint && now < interactUntil ? {end: now + TILE_BUDGET_MS, built: false, short: false} : null;
   if (disp.topo) {
     const P = map.H;
     missing = drawPlane(ctx, P, true, (tx, tz, k, L) =>
