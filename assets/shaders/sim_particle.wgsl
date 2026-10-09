@@ -306,6 +306,29 @@ fn canOccupy(w : u32, myDensity : i32, patient : bool) -> bool {
   return patient || myDensity > mm.density;
 }
 
+// ---- A POWDER THAT TOUCHES HARD MATTER UNDER WATER JOINS THE GRID ----------
+// (2026-10-09, owner: poured sodium sat at the bottom of a pond as particles
+// for ~20 s before it rejoined the grid and exploded.) The density test above
+// is right for a plank -- a floater must not "settle" by overwriting the water
+// it rides on -- and wrong for a powder at the bed: anything a hair lighter
+// than the liquid (sodium 970 in water 1000) is neutrally buoyant to this
+// kernel's integer Archimedes, drifts to the bottom, and was then refused every
+// cell there until PART_FLOAT_PATIENCE ran out. A grain has no raft to keep
+// out of: once it is on something hard, the CA owns it, and the CA's own
+// density rules (canDisplace) decide whether it stays, sinks or floats up.
+// So a powder may take a liquid cell when it lands ON hard matter -- a blocked
+// flight (blocksParticle only blocks an inFluid particle on solid/powder), or
+// a berth with solid/powder under it.
+fn isPowderMat(mat : u32) -> bool { return materials[mat].klass == CLASS_POWDER; }
+fn hardBelow(c : vec3<i32>) -> bool {
+  let b = c + vec3<i32>(0, -1, 0);
+  if (!inBounds(b)) { return false; }
+  let bm = voxMat(voxWordAt(b));
+  if (bm == MAT_AIR || matPassable(bm)) { return false; }
+  let k = materials[bm].klass;
+  return k == CLASS_SOLID || k == CLASS_POWDER;
+}
+
 // Is there something under this cell worth coming to rest ON?
 //
 // Solid or powder is ordinary ground. A LIQUID counts only when the particle
@@ -917,7 +940,10 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
       // vertical motion and drifts, and the surface of a pond is very wide.
       // Anything still moving fast is genuinely being thrown at the raft and
       // lands on it, which is what a thrown log does.
-      if (inFluid && slow && !canOccupy(voxWordAt(tgt), myDensity, patient)) {
+      // A powder stopped by hard matter is not a floater looking for a berth:
+      // it lands here, water or not (the HARD-MATTER block above hardBelow).
+      let hardStop = patient || isPowderMat(myMat);
+      if (inFluid && slow && !canOccupy(voxWordAt(tgt), myDensity, hardStop)) {
         p.vy = 0;
         fluidWander(&p, materials[myMat]);
         append(p);
@@ -962,7 +988,13 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
           let cand = tgt + vec3<i32>(k % 3 - 1, 0, k / 3 - 1);
           if (!inBounds(cand)) { continue; }
           let cw = voxWordAt(cand);
-          if (voxMat(cw) == MAT_AIR || matPassable(voxMat(cw))) {
+          // A liquid cell is open to a grain too (it displaces the liquid as a
+          // sinking rock does, canOccupy): under water every candidate is
+          // water, and refusing them all sent the whole stream down the
+          // one-winner-a-tick fallback at the bed.
+          let cm = voxMat(cw);
+          if (cm == MAT_AIR || matPassable(cm) ||
+              (inFluid && materials[cm].klass == CLASS_LIQUID)) {
             landAt = cand;
             nf = 0u;
             // resolve reads the target cell off the particle's position. KEEP
@@ -1018,7 +1050,8 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (inFluid && slow) {
     let here = vec3<i32>(p.px >> 8u, p.py >> 8u, p.pz >> 8u);
     if (inBounds(here)) {
-      if (canOccupy(voxWordAt(here), myDensity, patient) &&
+      let bedded = isPowderMat(myMat) && hardBelow(here);
+      if (canOccupy(voxWordAt(here), myDensity, patient || bedded) &&
           (patient || settleSupported(here, myDensity))) {
         p.flags |= PFLAG_PENDING;
         atomicMax(&claim[claimSlot(claimCellId(here))], particlePriority(p));
@@ -1168,7 +1201,10 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   // that nothing may ever sink.
   let hereWord = voxWordAt(cell);
   let myDensity = materials[p.payload & 0xFFFu].density;
-  let patient = floatTicksOf(p.flags) >= PART_FLOAT_PATIENCE &&
+  // A powder only proposes a liquid cell after touching hard matter (integrate:
+  // hardStop / bedded), so resolve may let any powder have one.
+  let patient = (floatTicksOf(p.flags) >= PART_FLOAT_PATIENCE ||
+                 isPowderMat(p.payload & 0xFFFu)) &&
                 matFluidLift(materials[p.payload & 0xFFFu]) > 0u;
 
   if (won && canOccupy(hereWord, myDensity, patient)) {

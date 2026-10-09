@@ -1227,6 +1227,156 @@ Status GateVesselSand(Ctx& c, std::string& detail) {
   return exact && fast ? Status::Pass : Status::Fail;
 }
 
+// ---- pour-water --------------------------------------------------------------
+//
+// A POUR INTO WATER LANDS TOO (owner, 2026-10-09: "sodium poured into water
+// sinks to the bottom in particle form and sits there, stuck, for like 20
+// seconds before entering the grid and then exploding"). Two arms on the
+// vessel-sand fixture with the tray flooded six cells deep:
+//   * SAND (denser than water): every eighth reaches the grid EXACTLY and the
+//     last grain lands within pourWater.landTicksMax of the pour -- a powder
+//     on the bed rejoins the grid at once, and a grain may scatter into a
+//     water cell (sim_particle.wgsl, the HARD-MATTER block and GRAIN LANDING);
+//   * SODIUM (970, a hair lighter than water, fluid lift 0): it stops on the
+//     water's SURFACE and joins the grid there, so it reacts on contact. Same
+//     landing bound, it never reaches the bed as a cell, and lye/hydrogen
+//     appear (the reaction ran -- the blast effect itself is the session's,
+//     which this hand-rolled step does not run).
+//
+// DIRECT PHASE CALLS ON PURPOSE (W2-O): vessel-sand's hand-rolled step -- a
+// pour and a landing, no bodies.
+Status GatePourWater(Ctx& c, std::string& detail) {
+  uint32_t mSand = 0, mStone = 0, mWater = 0, mSodium = 0, mLye = 0, mH2 = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    const std::string& n = c.mats[i].name;
+    if (n == "sand") mSand = (uint32_t)i;
+    if (n == "stone") mStone = (uint32_t)i;
+    if (n == "water") mWater = (uint32_t)i;
+    if (n == "sodium") mSodium = (uint32_t)i;
+    if (n == "lye") mLye = (uint32_t)i;
+    if (n == "hydrogen") mH2 = (uint32_t)i;
+  }
+  const int pouchI = c.items.Find("pouch");
+  const ItemDef* pouch = c.items.At(pouchI);
+  if (!mSand || !mStone || !mWater || !mSodium || pouch == nullptr) {
+    detail = "no sand/stone/water/sodium/pouch";
+    return Status::Fail;
+  }
+  const int landMax = (int)BaselineNumber("pourWater.landTicksMax", 60);
+  constexpr int kWaterTop = 5;  // water fills dy 0..5 over the stone floor at dy -1
+
+  struct Arm { long got = 0; int landed = -1; int held = 0; int minDy = 99; long lye = 0, h2 = 0; std::string tl; };
+  auto runArm = [&](uint32_t mat, uint32_t armTick) {
+    Arm a;
+    const IVec3 o = c.world.WindowOrigin();
+    const IVec3 base{o.x * (int)kChunk + (int)kWorldN / 2 + 8,
+                     o.y * (int)kChunk + (int)kWorldN - 40,
+                     o.z * (int)kChunk + (int)kWorldN / 2 + 8};
+    const IVec3 chunk{base.x >> 4, base.y >> 4, base.z >> 4};
+    uint32_t tick = armTick;
+    auto step = [&](const std::vector<CellOp>& cells,
+                    const std::vector<ParticleSpawn>& spawns = {}) {
+      std::vector<BrushOp> ops;
+      SubmitTick(c.ctx, c.world, c.sim, tick++, kDefaultSeed, ops, {}, cells, false,
+                 chunk, true, true, spawns, 0, {}, 0);
+      c.ctx.WaitIdle();
+      c.ctx.ProcessEvents();
+    };
+    // Units of `mat` on the grid; also the lowest cell it holds and the lye /
+    // hydrogen cells around (the sodium reaction's products).
+    auto scan = [&](int* minDy, long* lye, long* h2) {
+      long total = 0;
+      std::vector<uint32_t> buf(kChunkVol);
+      for (int cz = -1; cz <= 1; cz++)
+        for (int cy = -1; cy <= 1; cy++)
+          for (int cx = -1; cx <= 1; cx++) {
+            const IVec3 cc{(chunk.x + cx) * (int)kChunk, (chunk.y + cy) * (int)kChunk,
+                           (chunk.z + cz) * (int)kChunk};
+            if (!c.world.CellInWindow(cc)) continue;
+            ReadVoxelsSync(c.ctx, c.world, World::SlotCellIndex(cc) / kChunkVol, 1,
+                           buf.data(), "pour-water");
+            for (uint32_t i = 0; i < kChunkVol; i++) {
+              const uint32_t m = buf[i] & 0xFFFu;
+              if (m == mat) {
+                total += ContainerCellUnits(buf[i], c.mats[mat]);
+                const int y = cc.y + (int)((i / kChunk) % kChunk);
+                if (minDy) *minDy = std::min(*minDy, y - base.y);
+              }
+              if (lye && mLye && m == mLye) ++*lye;
+              if (h2 && mH2 && m == mH2) ++*h2;
+            }
+          }
+      return total;
+    };
+    {  // the vessel-sand tray, walled to dy 8 and flooded to kWaterTop
+      std::vector<CellOp> cells;
+      constexpr int kTray = 12;
+      for (int dz = -kTray; dz <= kTray; dz++)
+        for (int dx = -kTray; dx <= kTray; dx++)
+          for (int dy = -1; dy <= 14; dy++) {
+            const IVec3 p{base.x + dx, base.y + dy, base.z + dz};
+            const int ring = std::max(std::abs(dx), std::abs(dz));
+            const bool tray = dy == -1 || (ring == kTray && dy <= 8);
+            const bool wet = !tray && dy <= kWaterTop;
+            cells.push_back({World::SlotCellIndex(p), tray  ? PackVoxNew(mStone, 0u)
+                                                      : wet ? PackVoxNew(mWater, 7u)
+                                                            : 0u});
+          }
+      step(cells);
+    }
+    for (int i = 0; i < 12; i++) step({});
+    const long s0 = scan(nullptr, nullptr, nullptr);
+
+    ItemStack st = Vs(c.items, pouchI, 1, (uint16_t)mat, 256);  // 32 cells
+    a.held = (int)st.FillTotal();
+    const Vec3 mouth{base.x + 0.5f, base.y + 10.5f, base.z + 0.5f};
+    const Vec3 target{base.x + 0.5f, base.y + 0.5f, base.z + 0.5f};
+    int minDy = 99;
+    for (int pt = 0; pt < 400 && st.Filled(); pt++) {
+      std::vector<ParticleSpawn> spawns;
+      ContainerPour(*pouch, st, mouth, Vec3{0, -1, 0}, &target,
+                    CurrentTuning().sim.partGravity, tick, 0x5A4Du, spawns, nullptr,
+                    0xFFFFFFFFu, &c.mats);
+      step({}, spawns);
+      scan(&minDy, nullptr, nullptr);
+    }
+    for (int i = 1; i <= 1200; i++) {
+      step({});
+      scan(&minDy, &a.lye, &a.h2);
+      if (i == 1 || i == 10 || i == 40 || i == 160 || i == 640)
+        a.tl += Format(" +%d:%u", i, c.world.Snap().particleCount);
+      if (c.world.Snap().valid && c.world.Snap().particleCount == 0) {
+        a.landed = std::max(0, i - (int)World::kSnapshotLatency);
+        break;
+      }
+    }
+    a.got = scan(nullptr, nullptr, nullptr) - s0;
+    a.minDy = minDy;
+    c.mobs.Reset();
+    c.debris.Reset();
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    return a;
+  };
+
+  const Arm sand = runArm(mSand, 74000);
+  const Arm na = runArm(mSodium, 75000);
+  RecordObserved("pourWater.sandLandTicks", (double)sand.landed);
+  RecordObserved("pourWater.sodiumLandTicks", (double)na.landed);
+  const bool sandOk = sand.got == sand.held && sand.landed >= 0 && sand.landed <= landMax;
+  // Never below the surface as a cell: the pour lands on top of the water
+  // (dy kWaterTop + 1); the CA may tuck a grain one cell into the film.
+  const bool naOk = na.landed >= 0 && na.landed <= landMax && na.minDy >= kWaterTop &&
+                    (na.lye > 0 || na.h2 > 0);
+  detail = Format("sand: %ld/%d eighths on grid, last grain %d ticks after the pour "
+                  "(flying%s); sodium: last grain %d ticks after the pour (flying%s), "
+                  "lowest cell dy %d (water top %d), lye seen %ld, hydrogen %ld; max %d",
+                  sand.got, sand.held, sand.landed, sand.tl.c_str(), na.landed,
+                  na.tl.c_str(), na.minDy, kWaterTop, na.lye, na.h2, landMax);
+  std::printf("pour-water: %s (%s)\n", sandOk && naOk ? "PASS" : "FAIL", detail.c_str());
+  return sandOk && naOk ? Status::Pass : Status::Fail;
+}
+
 Status GateVesselMpm(Ctx& c, std::string& detail) {
   return VesselRoundTrip(c, detail, true);
 }
@@ -1542,6 +1692,7 @@ const std::vector<Gate>& VesselGates() {
       // Builds in the sky and regenerates the world after itself.
       {"vessel-grid", "player", {}, false, GateVesselGrid},
       {"vessel-sand", "player", {}, false, GateVesselSand},
+      {"pour-water", "player", {}, false, GatePourWater},
       // The same, the way the game pours water: MPM out, ghost stream in.
       {"vessel-mpm", "player", {}, false, GateVesselMpm},
       // Real Jolt on a stone table; resets debris and regenerates on entry.

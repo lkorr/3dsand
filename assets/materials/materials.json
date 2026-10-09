@@ -3615,8 +3615,9 @@
       ]
     },
     {
-      "//": "Metallic sodium. Soft, silvery and LIGHTER THAN WATER (0.97), so a lump floats on the water it is reacting with -- which is why it skates and bursts rather than sinking. Reacts violently with water (reactions.json: explode effect).",
+      "//": "Metallic sodium. Soft, silvery and LIGHTER THAN WATER (0.97), so a lump floats on the water it is reacting with -- which is why it skates and bursts rather than sinking. Reacts violently with water (reactions.json: explode effect). fluid lift 0: a sodium PARTICLE does not fly into water -- it stops on the surface and rejoins the grid there, so a pour reacts on contact instead of sinking to the bed first (sim_particle.wgsl blocksParticle).",
       "id": "sodium",
+      "fluid": {"lift": 0},
       "electric": {"resist": 2},
       "arcane": 12,
       "class": "powder",
