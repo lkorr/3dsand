@@ -341,9 +341,15 @@ struct DeathBody {
     // (MobSystem::LimbAnchorByBody) every frame.
     Vec3 anchorWorld{};
     bool haveAnchor = false;
-    float rebaseLogged = 0.0f;  // the largest corner drift already reported
+    // THE PHOTOGRAPHED SKIN: a clone of this part's brick taken just after
+    // death (main.cpp, kDeathBrickFreezeSec), drawn by the portrait in place
+    // of the live one; -1 = none (the live brick is drawn). `pinned` = the
+    // corner was fixed from the joint at that moment and never moves again.
+    int frozenModel = -1;
+    bool pinned = false;
   };
   bool have = false;
+  bool bricksFrozen = false;  // the skin has been photographed (frozenModel)
   float yaw = 0.0f;         // the body's facing, so the orbit keeps a front
   std::vector<Limb> limbs;  // the GPU transform override
   LimbBoxes boxes;          // framing, limb focus and the outlines
@@ -373,7 +379,7 @@ struct DeathBody {
         if (h && phys.GetTransform(h, cur)) { found = true; break; }
       }
       if (!found) continue;
-      if (fl.haveLive) {
+      if (fl.haveLive && !fl.pinned) {
         const Quat qOld{fl.lastLive.quat[0], fl.lastLive.quat[1],
                         fl.lastLive.quat[2], fl.lastLive.quat[3]};
         const Quat qFrozen{fl.xf.quat[0], fl.xf.quat[1], fl.xf.quat[2],

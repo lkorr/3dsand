@@ -7233,6 +7233,10 @@ int main(int argc, char** argv) {
   // the outer layers cleared, drawn by the portrait pass in place of the real
   // ones while a death screen asks for a peel. Render-only.
   autopsy::Peeler autopsyPeeler;
+  // The death photograph's own bricks (DeathBody::Limb::frozenModel): clones
+  // of the corpse's skin taken just after death, freed on respawn.
+  std::vector<uint32_t> deathBricks;
+  uint64_t deathBricksEpoch = 0;
   // ---- THE ALCHEMY BENCH'S PICTURE (game/alchemy_bench.h) -----------------
   // Drawn on the CPU by the bench's sim and copied in each frame it is open
   // (rhi CopyBufferToTexture, from a staging buffer the queue writes). RGBA8
@@ -7966,6 +7970,7 @@ int main(int argc, char** argv) {
     ui.autopsy.hideGear = false;
     ui.autopsy.isolate = false;
     deathBody.yaw = avatarHeading;
+    deathBody.bricksFrozen = false;
     // THE BODY AS ONE PIECE (PlayerAvatar::JointConsistentPose). The physics
     // transforms at this instant can be mid-impulse: a blast flings a head
     // that is still on its neck metres away for the tick the solver has not
@@ -15778,6 +15783,36 @@ int main(int argc, char** argv) {
         // Re-key the frozen pose onto any limb a carve rebuilt since the last
         // frame (DeathBody::Follow): the corpse goes on being eaten.
         deathBody.Follow(phys);
+        // THE SKIN IS PHOTOGRAPHED TOO (owner, 2026-10-08: "a last frame of
+        // the body when it died"). A quarter second after death - long enough
+        // for the killing blow's own carve to land, which arrives after Die()
+        // - every frozen part's brick is CLONED, its corner fixed from its
+        // joint once, and from then on the portrait draws the clones: what
+        // burns, dissolves or is eaten off the corpse afterwards never reaches
+        // the picture or the autopsy's numbers. Render-only copies, freed on
+        // respawn.
+        constexpr float kDeathBrickFreezeSec = 0.25f;
+        static const bool kRawSkin = std::getenv("SANDVOX_DEATH_PHOTO_RAW") != nullptr;
+        if (!kRawSkin && !deathBody.bricksFrozen && ui.deathHoldSec >= kDeathBrickFreezeSec) {
+          deathBody.bricksFrozen = true;
+          deathBricksEpoch = mbSet.epoch;
+          for (DeathBody::Limb& fl : deathBody.limbs) {
+            Vec3 aLimb;
+            int model = -1;
+            if (!mobs.LimbAnchorByBody(fl.body, aLimb, &model)) continue;
+            if (fl.haveAnchor) {
+              const Quat q{fl.xf.quat[0], fl.xf.quat[1], fl.xf.quat[2], fl.xf.quat[3]};
+              const Vec3 corner = fl.anchorWorld - QuatRotate(q, aLimb);
+              fl.xf.pos[0] = corner.x; fl.xf.pos[1] = corner.y; fl.xf.pos[2] = corner.z;
+            }
+            fl.pinned = true;
+            if (model < 0) continue;
+            const int c = MicroBodyClone(mbSet, (uint32_t)model);
+            if (c < 0) continue;  // pool refused: the live brick is drawn
+            fl.frozenModel = c;
+            deathBricks.push_back((uint32_t)c);
+          }
+        }
       }
       ui.spellCost = caster.compiled.manaCost;
       ui.spellWord = caster.compiled.wordCost;
@@ -19223,6 +19258,12 @@ int main(int argc, char** argv) {
       if (!deathFrozen &&
           (autopsyPeeler.ClonesLive() > 0 || autopsyPeeler.MaxDepth() >= 0))
         autopsyPeeler.Release(mbSet);
+      if (!deathFrozen && !deathBricks.empty()) {
+        // A reloaded micro set is a different table: forget, never free.
+        if (mbSet.epoch == deathBricksEpoch)
+          for (uint32_t m : deathBricks) MicroBodyFree(mbSet, m);
+        deathBricks.clear();
+      }
       if (ui.inventoryOpen && portraitCam.valid && portraitView) {
         // THE TIER THE PANEL PICKED this frame (UIState::portraitTierTex): the
         // draw list already samples that texture, so this pass must fill it.
@@ -19248,6 +19289,12 @@ int main(int argc, char** argv) {
         // construction. Only the instance lists change. The death pose is the
         // one thing that does re-upload them, and it puts them back below.
         bool posedDead = false;
+        // Which frozen part each micro instance below draws (-1 = not the
+        // corpse), and the slots appended for frozen parts the world no
+        // longer has a body for.
+        std::vector<int> slotLimb;
+        std::vector<std::pair<uint32_t, int>> extraSlots;  // slot, limb index
+        const size_t bodyXfLive = bodyXf.size();
         if (deathFrozen && deathBody.have && !bodyXf.empty()) {
           // EVERY slot, not the debris range: the corpse is a dead Mob in
           // mobs_ now (MobSystem::AdoptDeadAvatar) and draws through mob
@@ -19256,31 +19303,42 @@ int main(int argc, char** argv) {
           bodyReg.BuildHandles(slotHandles);
           const uint32_t nSlots = std::min<uint32_t>(
               (uint32_t)slotHandles.size(), (uint32_t)bodyXf.size());
+          slotLimb.assign(bodyXf.size(), -1);
+          std::vector<uint8_t> matched(deathBody.limbs.size(), 0);
           for (uint32_t s = 0; s < nSlots; s++) {
             const uint64_t h = slotHandles[s];
             if (!h) continue;
-            for (auto& fl : deathBody.limbs) {
+            for (size_t li = 0; li < deathBody.limbs.size(); li++) {
+              DeathBody::Limb& fl = deathBody.limbs[li];
               if (fl.body != h) continue;
-              // Pinned by the joint: the corner follows any rebase since.
+              // Until the bricks are photographed, pinned by the joint: the
+              // corner follows any rebase since death. After, fixed.
               Vec3 aLimb;
               static const bool kRawPin = std::getenv("SANDVOX_DEATH_PHOTO_RAW") != nullptr;
-              if (!kRawPin && fl.haveAnchor && mobs.LimbAnchorByBody(fl.body, aLimb)) {
+              if (!kRawPin && !fl.pinned && fl.haveAnchor &&
+                  mobs.LimbAnchorByBody(fl.body, aLimb)) {
                 const Quat q{fl.xf.quat[0], fl.xf.quat[1], fl.xf.quat[2], fl.xf.quat[3]};
                 const Vec3 corner = fl.anchorWorld - QuatRotate(q, aLimb);
-                const Vec3 dd{corner.x - fl.xf.pos[0], corner.y - fl.xf.pos[1],
-                              corner.z - fl.xf.pos[2]};
-                const float drift = std::sqrt(dd.x * dd.x + dd.y * dd.y + dd.z * dd.z);
-                if (drift > 0.5f && drift > fl.rebaseLogged + 0.5f) {
-                  fl.rebaseLogged = drift;
-                  std::fprintf(stderr, "death photo: a frozen part's brick moved %.1f voxels "
-                               "since death (pinned back by its joint)\n", drift);
-                }
                 fl.xf.pos[0] = corner.x; fl.xf.pos[1] = corner.y; fl.xf.pos[2] = corner.z;
               }
               bodyXf[s] = fl.xf;
+              slotLimb[s] = (int)li;
+              matched[li] = 1;
               posedDead = true;
               break;
             }
+          }
+          // A PHOTOGRAPHED PART THE WORLD HAS LOST (burnt, dissolved or eaten
+          // away since) is still in the photograph: it gets a slot of its own
+          // past the live ones, for this one draw.
+          for (size_t li = 0; li < deathBody.limbs.size(); li++) {
+            const DeathBody::Limb& fl = deathBody.limbs[li];
+            if (matched[li] || fl.frozenModel < 0) continue;
+            if (bodyXf.size() >= (size_t)kMaxBodySlots) break;
+            extraSlots.push_back({(uint32_t)bodyXf.size(), (int)li});
+            bodyXf.push_back(fl.xf);
+            slotLimb.push_back((int)li);
+            posedDead = true;
           }
           if (posedDead)
             ctx.queue.WriteBuffer(world.bodyXforms, 0, bodyXf.data(),
@@ -19288,6 +19346,26 @@ int main(int argc, char** argv) {
         }
         microInsts.clear();
         bodyReg.BuildMicroInsts(microInsts);
+        // The photographed bricks in place of the corpse's live ones, and the
+        // lost parts' instances appended.
+        std::vector<int> instLimb;
+        if (!slotLimb.empty()) {
+          instLimb.assign(microInsts.size(), -1);
+          for (size_t k = 0; k < microInsts.size(); k++) {
+            const uint32_t sl = microInsts[k].slot;
+            if (sl >= slotLimb.size() || slotLimb[sl] < 0) continue;
+            instLimb[k] = slotLimb[sl];
+            const int fm = deathBody.limbs[(size_t)slotLimb[sl]].frozenModel;
+            if (fm >= 0) microInsts[k].model = (uint32_t)fm;
+          }
+          for (const auto& [slot, li] : extraSlots) {
+            MicroBodyInstGpu in{};
+            in.slot = slot;
+            in.model = (uint32_t)deathBody.limbs[(size_t)li].frozenModel;
+            microInsts.push_back(in);
+            instLimb.push_back(li);
+          }
+        }
         // THE AUTOPSY (game/autopsy.h). On a corpse the instance list is
         // rewritten for this one draw: each of the body's parts is matched by
         // its physics handle (the same match the death pose uses), its brick is
@@ -19295,19 +19373,13 @@ int main(int argc, char** argv) {
         // the panel asks. Nothing outside this list changes, so the main view
         // and the corpse itself never see a peel.
         if (deathFrozen && deathBody.have) {
-          std::vector<uint64_t> handles;
-          bodyReg.BuildHandles(handles);
           std::vector<autopsy::Part> parts;
           std::vector<int> instPart(microInsts.size(), -1);
-          for (size_t k = 0; k < microInsts.size(); k++) {
-            const uint32_t sl = microInsts[k].slot;
-            if (sl >= handles.size() || !handles[sl]) continue;
-            for (const auto& fl : deathBody.limbs) {
-              if (fl.body != handles[sl]) continue;
-              instPart[k] = (int)parts.size();
-              parts.push_back({microInsts[k].model, fl.figSlot, fl.isLimb});
-              break;
-            }
+          for (size_t k = 0; k < microInsts.size() && k < instLimb.size(); k++) {
+            if (instLimb[k] < 0) continue;
+            const DeathBody::Limb& fl = deathBody.limbs[(size_t)instLimb[k]];
+            instPart[k] = (int)parts.size();
+            parts.push_back({microInsts[k].model, fl.figSlot, fl.isLimb});
           }
           uint8_t kinds[256];
           AutopsyKinds(burnMats, tissueMats, mats, kinds);
@@ -19394,6 +19466,7 @@ int main(int argc, char** argv) {
         // re-dirties the avatar, so the rebuild below is a genuine requirement
         // rather than a precaution.
         if (posedDead) {
+          bodyXf.resize(bodyXfLive);
           bodyReg.BuildXforms(bodyXf);
           ctx.queue.WriteBuffer(world.bodyXforms, 0, bodyXf.data(),
                                 bodyXf.size() * sizeof(BodyXformGpu));

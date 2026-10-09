@@ -7351,7 +7351,8 @@ class MobSystem {
   // `body`. A carve REBASES a limb (ReskinLimbMicro moves xf.pos and
   // anchorLimb together), so the anchor is the one point of a limb that does
   // not move when its brick does: the death screen pins a frozen limb by it.
-  bool LimbAnchorByBody(uint64_t body, Vec3& anchorLimb) const;
+  // `microModel`, when given, gets the limb's micro brick (-1 = cube path).
+  bool LimbAnchorByBody(uint64_t body, Vec3& anchorLimb, int* microModel = nullptr) const;
   bool IsAlive(uint64_t mobId) const;
   // The live stroke of one creature, for the gates and the dev readout. Null
   // when there is no such mob.
