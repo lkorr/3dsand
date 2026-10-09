@@ -1716,6 +1716,7 @@ Then:
 | `noise` | seeded relief: **amp** (m), **size** (largest feature, m), `ridged` (crests) or `fbm` (rolling), **seed** |
 | `erode` | water + scree erosion under the brush |
 | **edge** | the falloff: `smooth`, `linear`, `flat` (hard core, short soft rim), `sphere` |
+| **mask** | where every mode may act: `no mask`, `land only` (above the sea), `sea only`, `height band` (between two heights in m above sea) or `slope band` (between two slopes in degrees), each soft over **soft** m / degrees. Raise the sea floor without touching the coast, paint rock only on the steep ground, smooth only the valley floors. The mask reads the posts as they were before each dab |
 
 A stroke is one undo step (**Ctrl+Z** / **Ctrl+Y**, or the buttons) and only
 remembers the tiles it touched, so a 5 km stroke undoes as cheaply as a 5 m
@@ -1747,12 +1748,23 @@ bake made in this session. After a reload, Bake bakes on top of the old one;
 Ctrl+Z, or paint it out, if that is not what you want.
 
 **Erosion** (the **Area** tool, then the Height tools panel). Drag a rectangle
-(shift+click clears it). Set **passes**, **strength %**, **talus °** (slopes
-steeper than this slump into scree), **seed**, and tick **water** (droplets:
-gullies and fans) and / or **thermal** (scree). **Erode area** runs in the
-background and shows the result in the plane; **Commit** keeps it (one undo
-step), **Discard** puts the posts back. The same seed on the same posts gives
-the same result.
+(shift+click clears it), pick the **method** and press **Erode area** (with no
+Area the stream-power methods erode the **whole map**):
+
+| method | what it does |
+|---|---|
+| `stream power: landscape` | the land is grown again under an uplift shaped like itself while rivers cut it (the Range tool's erosion), then its heights are put back: branching valleys up to every ridge, the summits where they were. The big one: use it on a template, a painted mountain, a whole map |
+| `stream power: incise` | rivers cut the ground as it is (no regrowth): gentler, keeps the shape you painted, deepens the valleys that are already there |
+| `droplet + thermal` | the old particle erosion: **passes**, **water** (droplets: gullies and fans) and **thermal** (slopes over **talus °** slump into scree). An Area only, at most ~2048 × 2048 posts |
+
+**strength %** and **seed** apply to all three. The stream-power methods run on
+a coarse copy of the plane (25.6 m for an Area, 51.2 m for the whole map) and
+bring the CHANGE back to the 6.4 m posts, so the detail you painted stays; the
+window's edge is feathered into the land around it. It all runs in the
+background (the **working** bar under the toolbar shows the progress and has
+**Cancel**) and shows the result in the plane; **Commit** keeps it (one undo
+step), **Discard** puts the posts back, and the next edit of any kind commits
+it. The same seed on the same posts gives the same result.
 
 **PNG import and export** (Gaea, World Machine, QGIS, …). In the Height tools
 panel, **Export height PNG** writes the Area (or the whole map if there is no
@@ -1789,6 +1801,127 @@ powder, no snow cap, no grass. Sediment fills valleys relative to the authored
 ground, so a high valley gets soil like a low one. Caves stay under the
 column's own ground, and no ground within 20 m of the magma table floods with
 lava.
+
+### 15.1a Mountain ranges: the Range tool
+
+Spamming the raise brush makes blobs. A real range has a crest that rises
+and falls in peaks and cols, side ridges (spurs) running down its flanks with
+valleys between them that branch like trees, foothills fading out into the
+plain, and rock that rivers have cut. The **Range** tool draws all of that
+from a few clicks.
+
+**Drawing.** Pick **Range** and click along the crest you want; each click is a
+**knot** (double-click or Enter ends). The tool bar sets what a NEW knot
+gets: its **crest** height (m above sea; a later knot copies the one before it)
+and its **half-width** (crest to the foot of the mountains, m; `[` `]` scale
+it), and the **profile**. On the map a range is an amber crest line with a
+triangle per knot and dotted lines at its feet; the selected range shows each
+knot's height and a small **diamond** beside each knot. Drag a knot to move it,
+drag its diamond to set that knot's half-width, click the selected crest to
+insert a knot there, shift+click a knot to delete it. The crest is a smooth
+spline through the knots (the same centripetal Catmull-Rom the engine uses for
+smooth roads and rivers, `assets/editor/spline.js`).
+
+**The Ranges panel** (side bar) lists every range; select one for its
+inspector:
+
+| control | means |
+|---|---|
+| `profile` | the cross-section: `alpine` (steep upper walls, concave flanks: the default), `sharp` (a knife edge), `round` (an old, worn range), `massif` (a broad high block with steep edges) |
+| `seed` | the same knots + seed = the same range; another seed = another range on the same line |
+| `peaks` | how much the crest rises and falls along its length: peaks at the knots' heights, cols between (0 = an even crest) |
+| `spurs` | the side ridges and the valleys between them |
+| `foothills` | how far rough hills reach out past the foot, and how high |
+| `erode` | the stream-power erosion: the branching valleys cut into the range and the jagged crest of peaks and cols (0 = the designed shape alone) |
+| `wander` | how far the crest line and the spurs bend away from the drawn spline |
+| the knot table | each knot's crest (m above sea) and half-width (m); **all crests to** / **all widths to** set every knot |
+
+With **live preview** on (tool bar), every change runs a coarse version
+(~51 m cells) in the background and draws it over the map inside a dashed
+yellow box marked PREVIEW: nothing is written yet. **Bake** (panel or tool
+bar) writes the range into the height plane: the full erosion at 25.6 m,
+brought to the 6.4 m posts with rock detail, in the background with a
+progress bar; one undo step. A range only ever RAISES the ground, so baking
+one over a higher hill leaves the hill. **Rebake** (this session) takes the
+last bake out (strokes painted since stay, as offsets) and bakes the range as
+it is now; **Unbake** takes it out. Like the Line tool's, they only reach a
+bake made in this session; after a reload Bake bakes on top.
+
+The range lives in map.json `ranges[]` (`{id, name, points: [[x, z, crestY,
+halfWidth], ...], profile, seed, peaks, spurs, foothills, erode, wander,
+baked}`, voxels). It is EDITOR-ONLY: the game reads only the posts a bake
+wrote.
+
+How it is made (`assets/editor/terraingen.js`, `rangeField`): the knots give
+an envelope (the profile across, ridged noise along the crest for peaks and
+cols, ridged noise in the range's own along / across frame for spurs, warped
+ridged hills for the foothills); that envelope is an UPLIFT field, and a
+landscape-evolution run (implicit stream power after Braun & Willett, with
+hardness bands and talus slumping) grows the range from low ground under it,
+so the drainage net forms while the land is low and branches, captures and
+reaches the crest, as a real range's does. The relief's local maxima are then
+put back on the envelope, so the crest stays at the knots' heights. Size and
+time: a 10 km crest with a 3 km half-width (a 17 × 12 km window) bakes in
+about 7-10 s. `node scripts/render_terrain_preview.mjs` renders what it makes
+as hillshaded PNGs (`build/terrain_preview/`).
+
+### 15.1b The Generate panel: continents and landforms
+
+**Templates** make the land of a whole map (no Area) or of the Area, the way
+Azgaar's generator does: an op list run with a seed. `continent`, `island`,
+`archipelago`, `peninsula` (the mainland off the north edge) and `highlands`
+ship. Each is a list of ops you can see and edit in the panel (JSON):
+`fill` (everything to a height), `hill` / `pit` (organic blobs), `range` /
+`trough` (a random-walk crest made into a real range spline / a U valley),
+`strait` (a channel across), `mask` (drown the edges: an island; `open` keeps
+one side as mainland), `noise` (ridged or rolling relief), `smooth`, `add`,
+`multiply`, `erode` (the landscape stream-power pass) and every landform
+below. Coordinates are fractions of the target (0..1), heights metres above
+the sea, sizes fractions of its larger side. **Preview** draws a coarse run
+over the map; **Generate** runs it in full (51.2 m, brought to the posts with
+detail) and holds it in the plane: **Commit** keeps it (one undo step,
+recorded in map.json `gen`, editor-only: `{template, seed, ops, box}`),
+**Discard** puts the land back. Into the Area, the result blends into the land
+round it over its outer edge.
+
+**Landforms** are placed by the Area (draw one first): `crater` (a bowl,
+raised rim and ejecta, slump terraces and a central peak when big; at the
+Area's centre), `volcano` (a gullied cone with a summit crater), `canyon` (a
+meandering terraced gorge with side canyons, along the Area's long side),
+`glacial valley` (a U trough), `fjord` (a U trough dug below the sea, so the
+sea floods it), `mesa field` (flat-topped mesas and buttes with terraced
+cliffs and talus aprons over the Area) and `dunes` (asymmetric dunes, gentle
+upwind, steep slip faces downwind, crests that fork; **wind toward** is the
+direction the wind blows to, 0° = east, 90° = south). Their numbers are in
+metres. Preview / Apply / Commit / Discard as for templates.
+
+### 15.1c Reading the map: overlays, grid, minimap, Measure
+
+The display bar's overlay picker:
+
+| overlay | shows |
+|---|---|
+| `slope bands` | the land coloured by the game's slope bands instead of height: GREEN walkable (under 35°, where soil and scree hold), YELLOW steep (still climbable: the player steps 0.58 m per 0.1 m voxel, so stairs up to ~80°), RED cliff (at or past the map's `terrain.rockSlope`, 2.5:1 = 68° shipped: bare rock, no soil, snow or plants). Measured post to post on the 6.4 m plane; the engine's noise adds steepness on top |
+| `flow` | where rivers would run: drainage area over a ~51 m copy of the whole plane, water routed downhill across filled hollows (Priority-Flood); brighter = more water. Recomputed a moment after an edit |
+| `lakes` | where water would stand: every closed hollow filled to its spill point, deeper = darker. A hint for lakes; the game puts no water there by itself |
+
+**km grid** draws a kilometre grid (1 / 2 / 5 / 10 km by zoom), labelled.
+**minimap** (when the canvas is big enough) puts the whole map in the corner
+with the view's box; click it to jump there.
+
+**Measure** (tool): click points along a route; drag a point to move it;
+shift+click, Esc or **clear** start over. Under the tool bar: the horizontal
+and 3D length, the climb and descent, the steepest and the mean grade (%),
+and the elevation profile coloured by the slope bands (hover it to find the
+spot). It reads the authored plane and writes nothing.
+
+**Adding a tool to this page** (for whoever builds the next one): one
+`registerTool({key, label, group, title, opts, down, move, up, cursor, paint,
+onKey, dblclick, resize, sync, guide})` call, from map.js or from a layer
+module handed the page's context (`C.registerTool`, as `maprange.js`,
+`mapgen.js` and `mapoverlay.js` do); the tool bar, the options strip, the
+pointer / key routing, the cursor and this guide's box all come from it.
+`assets/editor/maptools.js` documents every hook.
 
 ### 15.2 Roads
 
@@ -2012,4 +2145,13 @@ deck. All render-only: `tuning.json`, live on F5.
 - **Placing a structure is refused on the locale page**: save the map first;
   the engine needs the locale as shown.
 - **Rebake does nothing useful after a reload**: rebake only reaches this
-  session's bake (§15.1). Ctrl+Z, paint it out, or bake again on top.
+  session's bake (§15.1, §15.1a). Ctrl+Z, paint it out, or bake again on top.
+- **"another terrain job is running"**: one bake / generate / erosion at a
+  time; wait for the **working** bar to finish, or press its **Cancel**
+  (nothing is written by a cancelled job).
+- **A bake, a template or an erosion says "tiles are still loading"**: the
+  page loads the plane's tiles in the background after opening a map; wait a
+  moment (the status line stops saying "(loading)") and try again.
+- **A range came out lower than its knots**: the `peaks` slider puts cols
+  between peaks, so a knot can sit in a col; the highest point near it is the
+  knot's height. Lower `peaks` for an even crest.
