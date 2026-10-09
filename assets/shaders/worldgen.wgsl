@@ -5555,9 +5555,10 @@ fn farPeakTop(h : i32, ccx : i32, ccz : i32, shift : u32) -> i32 {
   }
   return top;
 }
-// The paint of a cell the peak raised: the column's skin, snow over the line.
-fn farPeakMat(biome : u32, peak : i32) -> u32 {
-  return select(wmBiome(biome, WM_B_SKIN), M_SNOW, peak >= treeline());
+// The paint of a cell the peak raised: the column's skin, snow over the
+// column's own treeline (`tl` = Col.tl, map v2 A1 -- there is no map-wide one).
+fn farPeakMat(biome : u32, peak : i32, tl : i32) -> u32 {
+  return select(wmBiome(biome, WM_B_SKIN), M_SNOW, peak >= tl);
 }
 
 var<workgroup> wgCount : atomic<u32>;
@@ -6583,7 +6584,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
                             byteV);
       } else if (fine.y > col.h && fine.y <= peak) {
         // A summit between the sample columns (farPeakTop).
-        byteV = farCellByte(matFarPal(&materials, farPeakMat(col.biome, peak)), byteV);
+        byteV = farCellByte(matFarPal(&materials, farPeakMat(col.biome, peak, col.tl)), byteV);
       }
       // farOcc counts NON-EMPTY cells, which now includes blocker-only ones —
       // it gates empty-space skipping for every far reader, and a reader that
@@ -7268,7 +7269,7 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
                                                                   shift, T.seed, ground)),
                               byteV);
         } else if (fine.y > pcol.h && fine.y <= peak) {
-          byteV = farCellByte(matFarPal(&materials, farPeakMat(pcol.biome, peak)), byteV);
+          byteV = farCellByte(matFarPal(&materials, farPeakMat(pcol.biome, peak, pcol.tl)), byteV);
         }
         let bi = farVoxByteIndex(level, cc);
         let bsh = (bi & 3u) * 8u;

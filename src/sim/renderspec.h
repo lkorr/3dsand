@@ -83,6 +83,13 @@ struct CloudFrame {
   unsigned lowW = 1, lowH = 1;
 };
 const CloudFrame& LastCloudFrame();
+
+// ---- the key light's direction (map v2 S1, the terrain light map) ---------
+// RenderParams.keyDir as the last MAIN-view WriteRenderParams wrote it (an aux
+// view's portrait light never lands here). Simulation::EncodeShadowResolve
+// rebuilds the sun's horizon map when its azimuth has turned; the kernel reads
+// the uniform itself, so this only decides WHEN, never what is built.
+const float* LastKeyLightDir();
 // The recorder calls this when it has recorded this frame's cloud rows. If the
 // uniform asked for a weather-map regen (kClfWeather), the map those rows
 // write becomes the one later frames reuse; if the rows were never recorded,

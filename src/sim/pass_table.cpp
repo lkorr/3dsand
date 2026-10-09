@@ -106,6 +106,8 @@ namespace {
 #define PIPE_RAY_START_MIN   Pipe::RayStartMin
 #define PIPE_RAIN_MAP_PREP   Pipe::RainMapPrep
 #define PIPE_RAIN_MAP_BUILD  Pipe::RainMapBuild
+#define PIPE_HZ_SKY          Pipe::HzSky
+#define PIPE_HZ_SUN          Pipe::HzSun
 #define PIPE_GODRAY_VIS      Pipe::GodrayVis
 #define PIPE_GAS_MASK        Pipe::GasMask
 #define PIPE_GI_PREPARE      Pipe::GiPrepare
@@ -243,6 +245,8 @@ namespace {
 #define C_SHADOWON  Cond::ShadowCacheOn
 #define C_RAYSTART  Cond::RayStart
 #define C_RAINMAP   Cond::RainMap
+#define C_HZSKY     Cond::HzSky
+#define C_HZSUN     Cond::HzSun
 #define C_RAINEXPO  Cond::RainExpo
 #define C_STREAKS   Cond::WindStreaks
 #define C_DRAFTALL   Cond::DraftAll
@@ -292,6 +296,7 @@ namespace {
 #define D_RSGX            (uint32_t)DispatchSel::RayStartGx
 #define D_RSGY            (uint32_t)DispatchSel::RayStartGy
 #define D_STREAKGX        (uint32_t)DispatchSel::StreakGx
+#define D_HZGX            (uint32_t)DispatchSel::HzGx
 #define IND_SOLARGS       (uint32_t)DispatchSel::IndSolArgs
 #define IND_DRAFTARGS     (uint32_t)DispatchSel::IndDraftArgs
 #define IND_HEATARGS      (uint32_t)DispatchSel::IndHeatArgs

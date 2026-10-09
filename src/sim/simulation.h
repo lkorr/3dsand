@@ -1066,6 +1066,8 @@ class Simulation {
   rhi::ComputePipeline rayStartTrace_, rayStartMin_;
   // The rain shadow map (rain_map.wgsl rainMapPrep / rainMapBuild).
   rhi::ComputePipeline rainMapPrep_, rainMapBuild_;
+  // The terrain-scale light map (horizon_light.wgsl hzSky / hzSun, map v2 S1).
+  rhi::ComputePipeline hzSky_, hzSun_;
   // The gust streaks' update (wind_streak.wgsl `update`, per-frame table).
   rhi::ComputePipeline windStreak_;
   // The god-ray sun visibility volume (godray_vis.wgsl `godrayVis`).
@@ -1244,6 +1246,20 @@ class Simulation {
   // uploads the horizon before it builds them).
   rhi::Buffer horizonBuf_;
   size_t horizonWords_ = 0;
+  // THE TERRAIN-SCALE LIGHT MAP (horizon.h kL*; horizon_light.wgsl): the
+  // sun's horizon and the sky visibility per pyramid sample, GPU-written by
+  // the hz_sky / hz_sun rows. 33 in shadowBGL_ (compute, read-write), 46 in
+  // renderBGL_ (fragment, read). Grow-only like the pyramid. hzSamples_ is
+  // the pyramid's sample count (0 = none: no row records). hzSkyDue_ is set
+  // by every pyramid upload (the sky visibility is a function of the map
+  // alone); hzSunAz_ is the key light azimuth the sun rows last ran for
+  // (unit xz; hzSunBuilt_ false = never / since the last upload).
+  rhi::Buffer hzLightBuf_;
+  uint64_t hzLightWords_ = 0;
+  uint32_t hzSamples_ = 0;
+  bool hzSkyDue_ = false;
+  bool hzSunBuilt_ = false;
+  float hzSunAz_[2] = {0.0f, 0.0f};
   bool renderBGBuilt_ = false;
   // The GI gather request list (gi_gather.wgsl; pass_table.h kGiReq*): fixed
   // size, zeroed at Init (the dedup bitmap must start empty). 28 in

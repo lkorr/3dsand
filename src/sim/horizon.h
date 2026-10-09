@@ -53,7 +53,7 @@ enum : uint32_t {
   kHLevels = 6,      // levels of the cell pyramid (level 0 = cells between samples)
   kHSeaY = 7,        // i32: the sea plane, world voxel y
   kHOuterY = 8,      // i32: the surface past the grid: max(height default, sea)
-  kHTreeline = 9,    // i32: snow at and above this ground y (map terrain.treeline)
+  kHTreeline = 9,    // i32: the map's terrain.treeline (the fallback; kHTlPlane is per sample)
   kHMaxY = 10,       // i32: the highest effective surface anywhere
   kHSamples = 11,    // word offset: nx * nz words, z-major (MAX | AVG << 16)
   kHBiome = 12,      // word offset: nx * nz biome ids, four per word, little-endian
@@ -63,9 +63,44 @@ enum : uint32_t {
   kHMip = 16,        // kMaxLevels words: word offset of level l's cells (MAX | AVG << 16)
   kHSkin = 32,       // kSkinSlots words: the skin material of biome id b
   kSkinSlots = 256,
-  kHeaderWords = kHSkin + kSkinSlots,
+  // word offset: nx * nz i16 per-sample TREELINES, two per word, little-endian
+  // (worldmap::TreelineAt at the sample, map v2 A1): snow at and above it.
+  // 0 = no plane (old header): the shader falls back to kHTreeline.
+  kHTlPlane = kHSkin + kSkinSlots,
+  kHeaderWords = kHTlPlane + 1,
   kMaxLevels = 16,
 };
+
+// ---- THE TERRAIN-SCALE LIGHT MAP (map v2 S1; horizon_light.wgsl) -----------
+// A second, GPU-WRITTEN buffer beside the pyramid (Simulation::hzLightBuf_,
+// shadow group 33 read-write, renderBGL 46 read-only), on the pyramid's own
+// sample lattice. Per sample, two words:
+//   w0  the SUN'S HORIZON in the key light's azimuth: the blocker that makes
+//       the largest elevation angle seen from the sample's ground -- its top
+//       Y (i16, voxels, absolute) | its distance (u16, units of kLightDistUnit
+//       voxels) << 16. 0xFFFF distance = nothing blocks. A receiver at height
+//       y is lit while tan(sun elevation) > (top - y) / distance, so the one
+//       word serves a valley floor and the ridge crest above it.
+//   w1  SKY VISIBILITY, f32 0..1: the cosine-weighted share of the upper
+//       hemisphere the sample's ground sees past the terrain, from horizon
+//       angles in kSkyDirs azimuths (mean of cos^2 of each horizon angle).
+// Both march the pyramid from kLightMinDistSamples samples out: the near
+// field's own shadow cache and openness grid own the first ~50 m.
+// Header (kLightHeaderWords): words written by the KERNELS, never the CPU
+// (a CPU write lands at the head of the NEXT command buffer):
+enum : uint32_t {
+  kLSkyValid = 0,    // 1 = w1 holds this map's sky visibility
+  kLSunValid = 1,    // 1 = w0 holds a sun horizon
+  kLSunDirX = 2,     // f32: the key light azimuth (unit xz) w0 was built for
+  kLSunDirZ = 3,
+  kLightHeaderWords = 8,
+  kLightDistUnit = 8,        // voxels per w0 distance unit (65534 x 8 = 52 km)
+  kLightMinDistSamples = 2,  // the first sample out the march looks at
+  kSkyDirs = 8,
+};
+// Words the light buffer needs for a packed pyramid `words` (header + 2 per
+// sample; the header alone when there is no pyramid).
+uint64_t LightWords(const std::vector<uint32_t>& words);
 
 // 2^8 = 256 voxels = 25.6 m: the biome plane's own cell, and the level-8
 // cascade cell, so the horizon starts at the resolution the cascade ends at.
@@ -74,10 +109,12 @@ inline constexpr int kSampleLog2 = 8;
 /**
  * The packed buffer for `map`. `worldMapWords` is PackWorldMap's output for the
  * same map (the biome records' skin words are read from it, so the horizon
- * paints exactly the materials worldgen lays). A map with no height plane
- * packs a header with kHValid = 0. Pure.
+ * paints exactly the materials worldgen lays). `seed` is the world seed the
+ * per-sample treeline's jitter is read at (worldmap::TreelineAt, which reads
+ * the INSTALLED map: `map` must be CurrentWorldMap()). A map with no height
+ * plane packs a header with kHValid = 0.
  */
 void Build(const worldmap::WorldMapData& map, const std::vector<uint32_t>& worldMapWords,
-           std::vector<uint32_t>& out);
+           uint32_t seed, std::vector<uint32_t>& out);
 
 }  // namespace horizon

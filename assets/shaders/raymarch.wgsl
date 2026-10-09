@@ -414,6 +414,10 @@ fn pixelAngle() -> f32 { return 2.0 * R.tanHalfFov / max(R.viewPx, 1.0); }
 // The map's height plane as a 2D max pyramid, written at load / environment
 // reload only. Header word 0 = 0: no pyramid, every horizon ray misses.
 @group(0) @binding(45) var<storage, read> horizon : array<u32>;
+// ---- THE TERRAIN-SCALE LIGHT MAP (map v2 S1; horizon.h kL*, HZ_L_* below) ---
+// Per pyramid sample: the sun's horizon (blocker top | distance) and the sky
+// visibility, written by horizon_light.wgsl on the frames that rebuild it.
+@group(0) @binding(46) var<storage, read> hzLight : array<u32>;
 const BOLT_ROW_GROUPS : u32 = 1u;
 const BOLT_ROW_LIGHTS : u32 = 129u;
 const BOLT_ROW_SEGS : u32 = 145u;
@@ -7121,11 +7125,17 @@ fn rainColumns(camM : vec3f, rd : vec3f, dq : vec2f, wind : vec2f, fallV : f32,
 // where the openness grid says its cell cannot see the sky.
 fn rainOverlay(colorIn : vec3f, rd : vec3f, tDepthVox : f32) -> vec3f {
   let here = bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 2u]);
-  let amount = clamp(here * 1.4, 0.0, 1.0) * TUNE_CLOUD_RAIN_STREAKS;
+  let camM = R.camPos * VOXEL_METERS;
+  // PRECIPITATION FALLS FROM THE BASE (map v2 S1): an eye on a summit above
+  // the deck is over the weather, not in its rain. Faded over the base's own
+  // jitter band so a walk up through it does not switch the streaks off.
+  let deckLo = CL.baseM - cloudBaseJitterM(CL.thicknessM);
+  let under = 1.0 - smoothstep(deckLo, CL.baseM + cloudBaseJitterM(CL.thicknessM), camM.y);
+  let amount = clamp(here * 1.4, 0.0, 1.0) * TUNE_CLOUD_RAIN_STREAKS * under;
   if (amount <= 0.002) { return colorIn; }
   let sceneM = select(1e9, tDepthVox * VOXEL_METERS, tDepthVox >= 0.0);
-  let snow = clamp(CL.precipType, 0.0, 1.0);
-  let camM = R.camPos * VOXEL_METERS;
+  // Snow above the freezing level over the eye (common.wgsl precipSnowAt).
+  let snow = precipSnowAt(CL.precipType, CL.spare.w, camM.y);
   let lit = ambientAt(vec3f(0.0, 1.0, 0.0)) * 1.1 + keyLightColor() * 0.12;
   // One pixel's angular size: every drop is drawn no thinner than ~0.7 px and
   // dimmed by how much it had to be widened, so a far streak thins out
@@ -13172,9 +13182,9 @@ fn traceTickets(ro : vec3f, rdIn : vec3f, tMin : f32, tMax : f32) -> FarHit {
 //
 // SHADED as a cascade cell is: the biome's skin (the material worldgen lays,
 // via the packed records), bare stone on slopes past ~45 deg, snow over the
-// map's treeline, the far water law under the sea; the far field's ambient,
-// sun and bounce; the cloud shadow; then the air (applyAerial). No sun
-// shadows (package S1). The normal is the AVG field's gradient at the level
+// column's treeline (hzTreelineAt), the far water law under the sea; the far field's ambient,
+// sun and bounce; the cloud shadow; the terrain-scale sun horizon and sky
+// visibility (S1, hzSunVis / hzSkyVis); then the air (applyAerial). The normal is the AVG field's gradient at the level
 // whose cell matches the pixel footprint, so a 25 m sample 30 km off does not
 // alias into speckle.
 //
@@ -13197,6 +13207,16 @@ const HZ_H_MAT_SNOW : u32 = 14u;
 const HZ_H_MAT_WATER : u32 = 15u;
 const HZ_H_MIP : u32 = 16u;
 const HZ_H_SKIN : u32 = 32u;
+const HZ_H_TL_PLANE : u32 = 288u;  // horizon.h kHTlPlane (kHSkin + 256)
+// horizon.h kL* (the light map; horizon_light.wgsl writes it).
+const HZ_L_SKY_VALID : u32 = 0u;
+const HZ_L_SUN_VALID : u32 = 1u;
+const HZ_L_HDR : u32 = 8u;
+const HZ_L_DIST_UNIT : f32 = 8.0;
+// The sun's penumbra across a ridge line, in tangent: the disc's own ~0.5 deg
+// plus the 25.6 m sample's blur at a few km. Wide enough that a sample-to-
+// sample change in the stored horizon reads as a soft edge, not a stair.
+const HZ_SUN_PEN : f32 = 0.012;
 // RenderParams flag bit 7: render.horizon (WriteRenderParams).
 const RFLAG_HORIZON : u32 = 128u;
 // The walk's budget, in cell visits. A grazing ray over open sea descends
@@ -13422,10 +13442,90 @@ fn hzAlbedo(p : vec2f, y : f32, n : vec3f) -> vec3f {
   var alb = paletteMean(materials[horizon[HZ_H_SKIN + b]]);
   let tanS = sqrt(max(1.0 - n.y * n.y, 0.0)) / max(n.y, 0.05);
   alb = mix(alb, paletteMean(materials[horizon[HZ_H_MAT_STONE]]), smoothstep(0.9, 1.5, tanS));
-  let tl = f32(hzI(HZ_H_TREELINE));
+  let tl = hzTreelineAt(p);
   alb = mix(alb, paletteMean(materials[horizon[HZ_H_MAT_SNOW]]),
             smoothstep(tl - 8.0, tl + 8.0, y));
   return alb;
+}
+
+// THE COLUMN'S TREELINE at sample-space point p (map v2 A1's treelineAt,
+// baked per sample by horizon::Build; bilinear): worldgen caps a column with
+// snow when its ground reaches it, so the horizon's snow line is the same
+// per-biome, jittered line the cascades draw -- not the map's one Y, which
+// painted all of `peaks` white. An old header (no plane) keeps the map's Y.
+fn hzTreelineAt(p : vec2f) -> f32 {
+  let base = horizon[HZ_H_TL_PLANE];
+  if (base == 0u) { return f32(hzI(HZ_H_TREELINE)); }
+  let nn = hzN();
+  let q = clamp(p, vec2f(0.0), vec2f(nn - vec2<i32>(1)));
+  let i = max(min(vec2<i32>(floor(q)), nn - vec2<i32>(2)), vec2<i32>(0));
+  let f = q - vec2f(i);
+  var h : vec4f;
+  for (var k = 0; k < 4; k++) {
+    let c = min(i + vec2<i32>(k & 1, k >> 1), nn - vec2<i32>(1));
+    let idx = u32(c.y * nn.x + c.x);
+    h[k] = f32(bitcast<i32>((horizon[base + (idx >> 1u)] >> ((idx & 1u) * 16u)) << 16u) >> 16u);
+  }
+  return hzBil(h, f);
+}
+
+// ---- THE TERRAIN-SCALE LIGHT (map v2 S1; horizon_light.wgsl) ----------------
+// The map's light map at a world point in fine voxels: bilinear over the four
+// samples round it, each sample's answer computed for THIS point's height.
+// Outside the grid, with no pyramid, with render.horizon off or before the
+// first build: 1 (no opinion), the look before S1.
+fn hzLightOn() -> bool {
+  return (R.flags & RFLAG_HORIZON) != 0u && horizon[HZ_H_VALID] != 0u;
+}
+// The sun's visibility past the terrain, 0..1: the sample's stored blocker
+// (top Y, distance) makes tan = (top - y) / distance at height y, and the key
+// light's own elevation tangent clears it or not (soft over HZ_SUN_PEN).
+fn hzSunVis(pv : vec3f) -> f32 {
+  if (!hzLightOn() || hzLight[HZ_L_SUN_VALID] == 0u) { return 1.0; }
+  let L = keyLightDir();
+  let tanSun = L.y / max(length(L.xz), 1e-4);
+  let nn = hzN();
+  let q = (pv.xz - hzOrigin()) / hzS();
+  if (any(q < vec2f(0.0)) || any(q > vec2f(nn - vec2<i32>(1)))) { return 1.0; }
+  let i = max(min(vec2<i32>(floor(q)), nn - vec2<i32>(2)), vec2<i32>(0));
+  let f = q - vec2f(i);
+  var v : vec4f;
+  for (var k = 0; k < 4; k++) {
+    let c = i + vec2<i32>(k & 1, k >> 1);
+    let w = hzLight[HZ_L_HDR + 2u * u32(c.y * nn.x + c.x)];
+    let du = f32(w >> 16u);
+    if (du >= 65535.0) {
+      v[k] = 1.0;
+    } else {
+      let top = f32(bitcast<i32>(w << 16u) >> 16u);
+      v[k] = smoothstep(-HZ_SUN_PEN, HZ_SUN_PEN,
+                        tanSun - (top - pv.y) / (du * HZ_L_DIST_UNIT));
+    }
+  }
+  return hzBil(v, f);
+}
+// The terrain-scale sun term on the near field's softening law: a ridge
+// kilometres off is a DISTANT blocker, which shadowFromOpaqueHit lifts to
+// TUNE_SHADOW_LIFT -- so a valley in a mountain's shadow and the same valley
+// in the shadow the cascade march finds sit at one depth across every seam.
+fn hzSunShade(pv : vec3f) -> f32 {
+  return mix(TUNE_SHADOW_LIFT, 1.0, hzSunVis(pv));
+}
+// The share of the sky the terrain leaves open, 0..1 (cosine-weighted over the
+// upper hemisphere, horizons past ~50 m only: nearer is the openness grid's).
+fn hzSkyVis(pv : vec3f) -> f32 {
+  if (!hzLightOn() || hzLight[HZ_L_SKY_VALID] == 0u) { return 1.0; }
+  let nn = hzN();
+  let q = (pv.xz - hzOrigin()) / hzS();
+  if (any(q < vec2f(0.0)) || any(q > vec2f(nn - vec2<i32>(1)))) { return 1.0; }
+  let i = max(min(vec2<i32>(floor(q)), nn - vec2<i32>(2)), vec2<i32>(0));
+  let f = q - vec2f(i);
+  var v : vec4f;
+  for (var k = 0; k < 4; k++) {
+    let c = i + vec2<i32>(k & 1, k >> 1);
+    v[k] = bitcast<f32>(hzLight[HZ_L_HDR + 2u * u32(c.y * nn.x + c.x) + 1u]);
+  }
+  return clamp(hzBil(v, f), 0.0, 1.0);
 }
 
 // A horizon hit, lit and fogged. The far field's lighting law (ambient on the
@@ -13452,11 +13552,16 @@ fn shadeHorizon(hz : HzHit, rd : vec3f) -> vec3f {
   } else {
     let albedo = hzAlbedo(hz.p, hitP.y, n);
     let face = n.y * n.y + n.x * n.x * TUNE_FACE_X + n.z * n.z * TUNE_FACE_Z;
+    // The terrain's own sky visibility and sun horizon (S1): a gorge sees a
+    // slot of sky, a valley lies in its ridge's shadow.
+    let open = farOpenness(n) * hzSkyVis(hitP);
     var lambert = wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP);
+    if (lambert > 0.0 && (R.flags & 1u) != 0u) {
+      lambert *= shadowLiftCap(hzSunShade(hitP), open);
+    }
     if (lambert > 0.0 && (R.weatherFlags & RWF_CLOUDS) != 0u) {
       lambert *= cloudSunAt(hitP, keyLightDir(), &CL, &cloudMaps);
     }
-    let open = farOpenness(n);
     color = albedo * face *
             (ambientOpen(ambientAt(n), opennessScale(open), open) + keyLightColor() * lambert);
     if (TUNE_GI_STRENGTH > 0.0) { color += farGiBounce(albedo, n); }
@@ -13876,6 +13981,9 @@ fn fs(in : VSOut) -> FSOut {
         let oN = opennessAt(fineV, hitP, n, &openness, &opennessGen);
         if (oN >= 0.0) { openF = mix(openF, oN, bandW); }
       }
+      // The terrain past ~50 m that hides the sky (S1, hzSkyVis): a cascade
+      // cell on a gorge floor is not under an open sky.
+      openF *= hzSkyVis(hitP);
       // Same wrapped diffuse as the near field — a different falloff here is a
       // visible brightness step at the window seam.
       var lambert = select(wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP),
@@ -13942,6 +14050,12 @@ fn fs(in : VSOut) -> FSOut {
           // Shading LOD (see lodShadeFade): the staircase's contact shadow
           // is an artefact of the sampling at this projected size.
           sh = mix(sh, max(sh, LOD_SHADE_SHADOW_LIFT), lodShadeFade(far.t));
+        }
+        // THE TERRAIN-SCALE SUN (S1, hzSunShade): a ridge farther than the
+        // march reaches. After the LOD lift, which is for contact shadows:
+        // a mountain's is a cast shadow at the near law's depth.
+        sh = min(sh, hzSunShade(hitP));
+        if (sh < 1.0) {
           // The near field's cap (shadowLiftCap): the lift cannot reach a
           // face that sees little sky. The near shade applies it to every
           // shadowed face, on the openness the far arm now carries too, so a
@@ -14197,7 +14311,11 @@ fn fs(in : VSOut) -> FSOut {
       openCell = h.cell - vec3<i32>(0, 1, 0);
       openN = vec3f(0.0, 1.0, 0.0);
     }
-    let openRaw = opennessAt(openCell, hp, openN, &openness, &opennessGen);
+    // THE TERRAIN'S SKY (S1, hzSkyVis): the grid's probes stop at the window
+    // top, so a gorge floor read the whole sky; the map's horizon angles past
+    // ~50 m scale what the grid measured. No measurement stays no measurement.
+    var openRaw = opennessAt(openCell, hp, openN, &openness, &opennessGen);
+    if (openRaw >= 0.0) { openRaw *= hzSkyVis(hp); }
     var lambert = wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP);
     if (lambert > 0.0 && (R.flags & 1u) != 0u) {
       // h.t is the receiver's distance from the camera in fine voxels, which
@@ -14254,6 +14372,10 @@ fn fs(in : VSOut) -> FSOut {
       // Shading LOD: contact shadows lift with projected size (see
       // lodShadeFade); a real cast shadow is already above the lift.
       sh = mix(sh, max(sh, LOD_SHADE_SHADOW_LIFT), lodShadeFade(h.t));
+      // A ridge past every march's reach (S1, hzSunShade): the same cast-
+      // shadow depth as the far field's, so a mountain's shadow crosses the
+      // window seam as one shadow.
+      sh = min(sh, hzSunShade(hitP));
       // The distance-softened LIFT cannot reach a face that cannot see the
       // sky (shadowLiftCap, common.wgsl): a cave floor under a 10 m roof got
       // 45% sun through the rock before this. `openRaw` is read above, once,
@@ -14833,17 +14955,23 @@ fn fs(in : VSOut) -> FSOut {
   // of pools rather than with screen area.
 
 
-  // ---- THE DECK BETWEEN A HIGH CAMERA AND THE GROUND ----------------------
+  // ---- THE DECK BETWEEN THE CAMERA AND THE GROUND -------------------------
   // From above (or inside) the deck the clouds stand in FRONT of the terrain,
   // not behind it, and the march already stopped each downward ray at the
-  // ground — so the same low-res image composites over hit pixels too. Only
-  // when the eye is at or above the deck's lowest base: below it the terrain
-  // is always nearer than any cloud and this is skipped (the common case, and
-  // the one that must not pay a fetch per terrain pixel).
-  if ((R.weatherFlags & RWF_CLOUDS) != 0u && tDepth >= 0.0 &&
-      CL.camM.y > CL.baseM - cloudBaseJitterM(CL.thicknessM)) {
-    let cs = cloudScreenAt(in.pos.xy);
-    color = color * cs.t + cs.c;
+  // ground — so the same low-res image composites over hit pixels too. And
+  // from BELOW (map v2 S1): a hit whose point is at or above the deck's lowest
+  // base is a summit standing in the cloud, which the march now stops at too
+  // (cloud.wgsl deckSpan reads the far horizon's pyramid), so the cloud in
+  // front of it is in that same image. A hit under the base with the eye under
+  // it is nearer than any cloud (a straight segment between two points below
+  // a plane stays below it): skipped, the common case, no fetch.
+  if ((R.weatherFlags & RWF_CLOUDS) != 0u && tDepth >= 0.0) {
+    let deckLo = CL.baseM - cloudBaseJitterM(CL.thicknessM);
+    let hitYM = (R.camPos.y + rd.y * tDepth) * VOXEL_METERS;
+    if (CL.camM.y > deckLo || hitYM > deckLo) {
+      let cs = cloudScreenAt(in.pos.xy);
+      color = color * cs.t + cs.c;
+    }
   }
 
   // ---- RAIN / SNOW near the camera (weather.h; plan §2.5 tier 1) ----------

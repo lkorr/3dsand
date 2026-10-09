@@ -412,6 +412,8 @@ bool gWeatherRegenAsked = false;
 }  // namespace
 
 const CloudFrame& LastCloudFrame() { return gCloudFrame; }
+float gKeyLightDir[3] = {0.0f, 1.0f, 0.0f};
+const float* LastKeyLightDir() { return gKeyLightDir; }
 unsigned LastVeilPitch() { return gVeilPitch; }
 CloudHistoryProbe MainCloudHistory() {
   CloudHistoryProbe p;
@@ -540,6 +542,17 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
   cp.camM[0] = eye.x * kVoxelMeters;
   cp.camM[1] = eye.y * kVoxelMeters;
   cp.camM[2] = eye.z * kVoxelMeters;
+  // THE FREEZING LEVEL over the eye's column (map v2 S1; spare.w, metres):
+  // where precipitation turns to snow (common.wgsl precipSnowAt). The heat
+  // layer's own law (HeatFreezingLevelY: the column's snowline, or where the
+  // lapse rate takes the biome climate below freezing). Render only -- the
+  // sim's rain word is untouched. No map: far above any deck.
+  cp.spare[3] = 1.0e6f;
+  if (worldmap::CurrentWorldMap().Loaded()) {
+    const uint32_t seed = world.WorldSeed() != 0u ? world.WorldSeed() : kDefaultSeed;
+    cp.spare[3] = (float)HeatFreezingLevelY((int)std::floor(eye.x), (int)std::floor(eye.z), seed) *
+                  kVoxelMeters;
+  }
 
   // ---- the drift: every unbounded quantity folded here, in double ----
   double dx = 0.0, dz = 0.0;
@@ -1100,6 +1113,8 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   gVeilPitch = (unsigned)std::max(1.0f, std::round(rp.viewPx * rp.aspect));
   // After the clouds: the ambient's overcast and lightning come from there.
   ResolveFrameLight(rp, tun.render);
+  if (!auxView)
+    for (int k = 0; k < 3; k++) gKeyLightDir[k] = rp.keyDir[k];
   queue.WriteBuffer(world.renderUBO, 0, &rp, sizeof(rp));
 }
 

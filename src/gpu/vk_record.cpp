@@ -168,6 +168,8 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::ShadowCacheOn: return (cx.cloudFlags & 4u) != 0u;
     case pass::Cond::RayStart:      return cx.rayStartGx > 0 && cx.rayStartGy > 0;
     case pass::Cond::RainMap:       return (cx.cloudFlags & 8u) != 0u;
+    case pass::Cond::HzSky:         return cx.hzGx > 0 && (cx.cloudFlags & 16u) != 0u;
+    case pass::Cond::HzSun:         return cx.hzGx > 0 && (cx.cloudFlags & 32u) != 0u;
     // ...and only when the CA runs: its rainExposed is the one reader.
     case pass::Cond::RainExpo:      return cx.rainExpoGroups > 0 && cx.caActive;
     case pass::Cond::WindStreaks:   return cx.streakGx > 0;
@@ -235,6 +237,7 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
     case pass::DispatchSel::RainFallSel: return cx.rainFallGroups;
     case pass::DispatchSel::RainExpoSel: return cx.rainExpoGroups;
     case pass::DispatchSel::StreakGx: return cx.streakGx;
+    case pass::DispatchSel::HzGx: return cx.hzGx;
     case pass::DispatchSel::ElecQuerySel: return cx.elecQueries;
     default:                          return v;
   }
