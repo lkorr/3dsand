@@ -11780,11 +11780,34 @@ int main(int argc, char** argv) {
         player.fly = true;
         ui.visible = false;
       }
-      player.pos = Vec3{g_atEye[0], g_atEye[1], g_atEye[2]} - Vec3{0, player.EyeOffsetNow(), 0};
+      // SANDVOX_AT_FLY=vx,vy,vz (m/s): the held camera moves instead, a fixed
+      // 1/60 s per frame, so a report taken IN FLIGHT (the far cascade
+      // refilling behind a moving box) is reproduced with the motion that
+      // made it. SANDVOX_AT_SHOT_EVERY=N also writes screenshot_at_<frame>.bmp
+      // every N frames, so a transient one frame shows is not missed.
+      static float atFly[3] = {0, 0, 0};
+      static int atShotEvery = 0;
+      static int atFlyAfter = 0;   // SANDVOX_AT_FLY_AFTER=N: hold still N frames first
+      if (frameCounter == 1) {
+        if (const char* fa = std::getenv("SANDVOX_AT_FLY_AFTER")) atFlyAfter = std::atoi(fa);
+        if (const char* fv = std::getenv("SANDVOX_AT_FLY"))
+          std::sscanf(fv, "%f,%f,%f", &atFly[0], &atFly[1], &atFly[2]);
+        if (const char* se = std::getenv("SANDVOX_AT_SHOT_EVERY")) atShotEvery = std::atoi(se);
+      }
+      const float flyVox = (float)std::max<int64_t>((int64_t)frameCounter - atFlyAfter, 0) *
+                           (1.0f / 60.0f) / kVoxelMeters;
+      player.pos = Vec3{g_atEye[0] + atFly[0] * flyVox, g_atEye[1] + atFly[1] * flyVox,
+                        g_atEye[2] + atFly[2] * flyVox} -
+                   Vec3{0, player.EyeOffsetNow(), 0};
       player.vel = Vec3{0, 0, 0};
       cam.yaw = g_atYawDeg * 0.0174532925f;
       cam.pitch = g_atPitchDeg * 0.0174532925f;
+      static std::string atShotName;
       if (frameCounter == g_harnessFrames - 8) g_shotJumpPath = "screenshot_at.bmp";
+      else if (atShotEvery > 0 && frameCounter % (uint64_t)atShotEvery == 0) {
+        atShotName = "screenshot_at_" + std::to_string(frameCounter) + ".bmp";
+        g_shotJumpPath = atShotName.c_str();
+      }
       // SANDVOX_AT_FARPROBE=x,y,z[,level]: the cascade cells the picture drew
       // around one fine voxel -- a 5x5 slab in XZ at the voxel's level cell
       // row, as the GPU holds them (byte = far slot | blocker bit) beside the

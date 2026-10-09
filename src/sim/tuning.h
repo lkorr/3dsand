@@ -4731,7 +4731,20 @@ struct Tuning {
     // at all — 437k entries (3.8 minutes of drain) after 22 s of flight, deep
     // enough that the valid-box face counts overflowed and the renderer fell
     // through to house-sized cells at 40 m. 256 is ~4.8 ms/tick of sieve,
-    // still under what 64 was sized to spend. Hot-reloads on F5.
+    // still under what 64 was sized to spend.
+    //
+    // 1024 SINCE 2026-10-08. 256 was sized for a WALKING sprint (~130
+    // entries/tick); fly sprint (player.flySprint 32.5 m/s) queues ~700 on one
+    // axis, ~1,000 diagonally. Owner report: flying toward a mountain, "the
+    // mountain chunks all turn into discrete blocks" and the view saw
+    // underground at boundaries. Measured with the --at flight harness
+    // (SANDVOX_AT_FLY=32.5,0,0 SANDVOX_AT_FLY_AFTER=600, 15 s of flight):
+    //   256:  3 coalesced resets, 75,264 entries still queued at exit, the
+    //         near ground and the mountain drawn in level-3+ cells
+    //   1024: 0 coalesced resets, 0 queued, fine cells throughout
+    //   farField GPU mean 3.98 -> 4.03 ms, p99 31.4 -> 29.0, present p50
+    //   15.8 -> 15.6 — the same work either way; the cap only decided whether
+    //   it landed before the level had to be thrown away. Hot-reloads on F5.
     int farPlaneFillRate = TPD(render, farPlaneFillRate);
 
     // budgets

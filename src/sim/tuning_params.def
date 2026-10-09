@@ -2504,8 +2504,9 @@ TP_F(render, fogLerpPerFrame, NO_WGSL, 0.08f, 0.005f, 1.0f)
 // the top is the whole farList buffer, which is the dispatch's own limit.
 TP_I(render, farRefillRate, NO_WGSL, 1024, 1, kFarListCap)
 // Same two bounds, same reasons: 0 would freeze the horizon wherever the
-// player left it, and farList is the dispatch's own ceiling.
-TP_I(render, farPlaneFillRate, NO_WGSL, 256, 1, kFarListCap)
+// player left it, and farList is the dispatch's own ceiling. 1024 since
+// 2026-10-08 (tuning.h has the measurement).
+TP_I(render, farPlaneFillRate, NO_WGSL, 1024, 1, kFarListCap)
 // A scale above 1 would be supersampling the most expensive shader in the
 // engine; below a quarter the frame is 400x225 and the UI text on top is
 // larger than the terrain. Present mode is an enum; fpsCap 0 = off.

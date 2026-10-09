@@ -46,6 +46,10 @@ Brush edits, spells, explosions, worldgen — everything CPU→GPU via `sim_muta
 - snapshot restores (worldgen, `LoadWorld`) — they replace the grid wholesale, not a cell at a time;
 - the dev panel's "clear fluid" button (`main.cpp:6392`), which zeroes the GPU-owned MLS-MPM live count (`world.fluidArgsStage[7]`) directly. It is a debug control with no gameplay path to it, it writes no voxel, and the count it clears is GPU-owned so there is no op that could express it. If the fluid clear ever becomes a gameplay action it needs a `TickParams` flag the fluid kernel honours, not a buffer write.
 
+## Bug reports (the owner's F12 tickets)
+
+`bug_reports/<stamp>/` (gitignored, main checkout only) = OPEN tickets: `report.md` + shots, with an `--at` line that reproduces the camera. `bug_reports/fixed/` = CLOSED. **When you fix a ticket — or close it as not reproducible / by design — move its folder into `fixed/` with a `FIXED.md` naming the commit and the cause.** Never delete one. Full procedure and the in-flight repro env vars (`SANDVOX_AT_FLY`, `_AFTER`, `_SHOT_EVERY`): `bug_reports/README.md`.
+
 ## Build and verify
 
 ```bash

@@ -65,17 +65,14 @@ fn streakU01(a : u32, b : u32) -> f32 {
 
 fn streakAlive(h0 : vec4f, h1 : vec4f) -> bool { return h1.x > 0.0 && h0.w < h1.x; }
 
-// How far into "flying" the camera is: 0 within one radius of the ground,
-// 1 from two radii up. Drives the spawn band's blend from the surface layer to
-// a box round the eye.
-fn streakFly(ground : f32, radius : f32) -> f32 {
-  return clamp((R.camPos.y - ground) / max(radius, 1.0) - 1.0, 0.0, 1.0);
-}
-// The vertical half-reach of the band at this flying fraction: the surface
-// layer's 6.2 m on the ground, the radius high up (whichever is larger).
-fn streakVertReach(ground : f32, radius : f32) -> f32 {
-  let fly = streakFly(ground, radius);
-  return max(mix(R.camPos.y - ground + 62.0, radius, fly), 62.0);
+// The vertical half-reach of the band: from the eye down to the surface
+// layer's 6.2 m top. The band never follows the camera up (owner report
+// 2026-10-08: flying at 365 m at night, a box of white wisps round the eye
+// filled the whole view -- "straight line wispy visuals that shouldn't be
+// here"). Streaks are air seen against the ground; high up they stay down
+// there and the draw's vertical fade hides them.
+fn streakVertReach(ground : f32) -> f32 {
+  return max(R.camPos.y - ground + 62.0, 62.0);
 }
 
 @compute @workgroup_size(64)
@@ -98,17 +95,14 @@ fn update(@builtin(global_invocation_id) gid : vec3<u32>) {
     var p = vec3f(R.camPos.x + cos(ang) * rr, 0.0, R.camPos.z + sin(ang) * rr);
     let tr = windTerrF(p, &R);
     let ground = select(R.camPos.y - 17.0, tr.h, tr.edge > 0.0);
-    // HEIGHT. Near the ground the band is the surface layer, 0.2 .. 6.2 m up
-    // and most of them low, because that is where the gusts are seen against
-    // the grass. Climb and it follows the camera: past one radius above the
-    // ground it blends into a box +-radius round the eye, fully by two, so a
-    // flier high up still sees streaks around them instead of a carpet of
-    // them far below.
+    // HEIGHT. The surface layer, 0.2 .. 6.2 m up and most of them low,
+    // because that is where the gusts are seen against the grass. Wherever
+    // the camera is (streakVertReach says why it does not follow a flier).
+    // A camera far above the band spawns nothing: the draw would fade every
+    // one of them out anyway.
+    if (R.camPos.y - ground > 2.0 * radius + 62.0) { return; }
     let hq = streakU01(4u, i);
-    let fly = streakFly(ground, radius);
-    let lo = mix(ground + 2.0, max(ground + 2.0, R.camPos.y - radius), fly);
-    let hi = mix(ground + 62.0, max(ground + 62.0, R.camPos.y + radius), fly);
-    p.y = lo + mix(hq * hq, hq, fly) * (hi - lo);
+    p.y = ground + 2.0 + hq * hq * 60.0;
     let s = windSampleAt(p, R.time, 0.0, &R);
     let bands = windBandWS(s, s.b1) * WIND_BAND_W1 + windBandWS(s, s.b2) * WIND_BAND_W2;
     let m = windMeanWS(s);
@@ -164,7 +158,7 @@ fn update(@builtin(global_invocation_id) gid : vec3<u32>) {
   // ...or out of it vertically: the band's own reach (streakVertReach).
   let tr = windTerrF(p, &R);
   let groundHere = select(R.camPos.y - 17.0, tr.h, tr.edge > 0.0);
-  if (abs(p.y - R.camPos.y) > streakVertReach(groundHere, radius) * 1.3) { dead = true; }
+  if (abs(p.y - R.camPos.y) > streakVertReach(groundHere) * 1.3) { dead = true; }
   if (tr.edge > 0.0 && p.y < tr.h) { dead = true; }
   if (dead) { h0.w = h1.x; }
   streaks[base] = h0;
