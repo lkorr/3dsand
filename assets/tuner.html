@@ -5208,10 +5208,30 @@ function wvSig(){
 function wvFrame(now){
   wvRaf = requestAnimationFrame(wvFrame);
   if(!wvOn || !wv) return;
+  // A PICTURE NOBODY CAN SEE COSTS NOTHING EITHER. The view sits under the
+  // World map page's map, usually scrolled below it, and keeps its loop while
+  // another tab is up: off screen (or the tab / window hidden) it neither
+  // streams nor renders, so the map above it has the main thread to itself.
+  // Coming back draws at once (the signature is cleared).
+  if(!wvFrame.io && window.IntersectionObserver){
+    wvFrame.inView = true;
+    wvFrame.io = new IntersectionObserver(function(es){ wvFrame.inView = es[es.length-1].isIntersecting; });
+    wvFrame.io.observe($('#wvCanvas'));
+  }
+  if(document.hidden || wvFrame.inView === false){ wvLast = now; wvFrame.sig = ''; return; }
   var dt = Math.min(0.1, (now - wvLast) / 1000 || 0);
   wvLast = now;
   wv.step(dt);
-  wv.update();
+  // The streamer's update rebuilds the whole LOD octree: run it when the
+  // camera or the picture moved, while anything is in flight or queued, and
+  // once a second otherwise (a failed region's retry); a still, fully
+  // streamed view skips it.
+  var sigU = wvSig();
+  if(sigU !== wvFrame.sigU || wv.inflight || (wv.queue && wv.queue.length) || (wv.stats && wv.stats.meshing) ||
+     now - (wvFrame.tU || 0) > 1000){
+    wv.update();
+    wvFrame.sigU = sigU; wvFrame.tU = now;
+  }
   var sig = wvSig();
   if(sig !== wvFrame.sig){
     wvFrame.sig = sig;
@@ -8767,8 +8787,8 @@ const ARCH_NODES={
     rule:2,
     wip:'Flow is only LOOKED (no CA mass transport, by design). Weirs and fords read as grey patches; no foam on waterfalls yet.'},
   worldBuilder:{label:'Worldbuilder tools (World map page)',tag:'cpu',
-    desc:'The World map page as a worldbuilding suite (2026-10-09, docs/PLAN_worldbuilder.md): a tool registry (maptools.js registerTool); the RANGE tool (spline crest &rarr; uplift field &rarr; implicit stream-power landscape evolution &rarr; dendritic ranges); the Generate panel (continent / island / archipelago / peninsula / highlands op lists + crater, volcano, canyon, glacial valley, fjord, mesa field, dunes); stream-power + droplet + thermal erosion; brush masks; Measure; slope / flow / lake overlays; RIVER (draw, derive from D8 flow, meander, a live JS port of the engine bake, riverbake.js) and LAKE (Priority-Flood spill level) tools; roads that bend; CLIMATE (lapse, wind-march rain shadow, wetness &rarr; auto-biomes with hand-painted locks) and COAST (wobble / beach / cliff / smooth). The default map Tirnhallow is built by scripts/design_world.mjs from the same modules (docs/WORLD_tirnhallow.md).',
-    files:['assets/editor/maptools.js','assets/editor/spline.js','assets/editor/hydrology.js','assets/editor/terraingen.js','assets/editor/terrainjobs.js','assets/editor/maprange.js','assets/editor/mapwater.js','assets/editor/riverbake.js','assets/editor/climate.js','assets/editor/mapclimate.js','assets/editor/mapcoast.js','scripts/design_world.mjs','scripts/check_worldbuilder.sh'],
+    desc:'The World map page as a worldbuilding suite (2026-10-09, docs/PLAN_worldbuilder.md): a tool registry (maptools.js registerTool); the RANGE tool (spline crest &rarr; uplift field &rarr; implicit stream-power landscape evolution &rarr; dendritic ranges); the Generate panel (continent / island / archipelago / peninsula / highlands op lists + crater, volcano, canyon, glacial valley, fjord, mesa field, dunes); stream-power + droplet + thermal erosion; brush masks; Measure; slope / flow / lake overlays; RIVER (draw, derive from D8 flow, meander, a live JS port of the engine bake, riverbake.js) and LAKE (Priority-Flood spill level) tools; roads that bend; CLIMATE (lapse, wind-march rain shadow, wetness &rarr; auto-biomes with hand-painted locks) and COAST (wobble / beach / cliff / smooth). The default map Tirnhallow is built by scripts/design_world.mjs from the same modules (docs/WORLD_tirnhallow.md). PERFORMANCE: scripts/bench_mappage.sh (assets/mappage_bench.html, the real tuner in headless Chrome) times every paint per layer and every frame over scripted wheel zooms and pans; paint() reports layers to globalThis.__mapProf. Layers cull to the view, tile images build within a 4 ms budget while the view moves, the river bake throttles while the plane is busy.',
+    files:['assets/editor/maptools.js','assets/editor/spline.js','assets/editor/hydrology.js','assets/editor/terraingen.js','assets/editor/terrainjobs.js','assets/editor/maprange.js','assets/editor/mapwater.js','assets/editor/riverbake.js','assets/editor/climate.js','assets/editor/mapclimate.js','assets/editor/mapcoast.js','scripts/design_world.mjs','scripts/check_worldbuilder.sh','scripts/bench_mappage.sh','assets/mappage_bench.html'],
     sym:['registerTool','rangeBake','streamPower','priorityFlood','bakeRivers','climateJob'],
     tst:[],
     doc:['docs/PLAN_worldbuilder.md','docs/WORLD_brief.md','docs/WORLD_tirnhallow.md','docs/EDITOR_GUIDE.md'],
@@ -11205,6 +11225,7 @@ function renderEngine(){
   const recentSec=el('div',{class:'status-section'});
   recentSec.appendChild(el('h4',{},'Recently Landed'));
   const recentItems=[
+    {label:'The World map page pans and zooms at 60 fps on the 20 km default map',desc:'2026-10-09, from the owner&rsquo;s report (zoom / pan at a few frames a second on the 2.5&times; taller map). Measured first with the new <code>scripts/bench_mappage.sh</code> (the real tuner in headless Chrome, scripted wheel zooms and pans, per-layer paint timing): paint was 65 ms at the fit view and 750&ndash;970 ms three zooms in, an edit 1.1&ndash;1.5 s. Causes: SX / SZ read the canvas&rsquo;s clientWidth for every vertex; the river fords tested every road segment against every 4-voxel river segment on every re-bake; every river, lake, road and region was drawn in full at every zoom; a zoom across a mip level or the auto contour interval rebuilt every tile in one frame. Now: paint 2&ndash;5 ms p50, &le; 12 ms p95 at every zoom, frames 16.7 ms p95; an edit about 100 ms (the river re-bake, throttled during strokes). The voxel preview under the map pauses while scrolled off screen or the tab is hidden, and skips its octree update when nothing moved.'},
     {label:'Flying keeps the fine LOD; gust streaks stay on the ground',desc:'2026-10-08, from F12 reports 2026-10-08_22-52-00 / 22-54-32. FLIGHT LOD: fly sprint (32.5 m/s) queues ~700 cascade plane entries a tick against a travel cap of 256, so levels coalesced into resets and the mountain and near ground drew in 3.2 m+ cells; <code>render.farPlaneFillRate</code> 256 -&gt; 1024 (same GPU work, measured: 0 resets, 0 backlog). STREAKS: the gust streaks no longer follow a flier up into a box round the eye (at 365 m at night they filled the view); they stay in the surface layer. Harness: <code>--at</code> + <code>SANDVOX_AT_FLY=vx,vy,vz</code> / <code>SANDVOX_AT_FLY_AFTER</code> / <code>SANDVOX_AT_SHOT_EVERY</code> replays a report in flight.'},
     {label:'World map v2: the format',desc:'2026-10-08, map-v2 F1 (d908d7f). World map v2 format: tiled i16 height plane (6.4 m posts, Catmull-Rom, authored height exact) + u8 biome plane (25.6 m), site index 102.4 m; converter (scripts/convert_map_v2.py); peaks fixture (scripts/gen_map_peaks.py); gate <code>worldmap-v2</code>.'},
     {label:'World map v2: the page',desc:'2026-10-08, map-v2 E1 (a76b898). World map page (v2): tiled planes (maptiles.js), topographic display (hillshade, contours, hypsometric ramp), metre brushes, dirty-tile save via /api/worldmap/tile.'},
