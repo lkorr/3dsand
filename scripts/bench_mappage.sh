@@ -7,7 +7,7 @@
 # paint() (total + per layer, map.js's __mapProf hook) and every frame.
 #
 #   bash scripts/bench_mappage.sh [--port N] [--map NAME] [--voxels 0|1|both]
-#                                 [--gpu] [--passes N] [--json out.json]
+#                                 [--gpu] [--flush] [--window W,H] [--passes N] [--json out.json]
 #
 # --voxels both (the default) runs the bench twice: with the voxel preview
 # streaming under the map and without it.
@@ -31,6 +31,7 @@ MAP=default
 VOX=both
 GPU=0
 PASSES=2
+WIN=1920,1080
 JSON=""
 EXTRA=""
 while [ $# -gt 0 ]; do
@@ -40,6 +41,7 @@ while [ $# -gt 0 ]; do
     --voxels) VOX="$2"; shift 2;;
     --gpu) GPU=1; shift;;
     --flush) EXTRA="$EXTRA&flush=1"; shift;;
+    --window) WIN="$2"; shift 2;;
     --passes) PASSES="$2"; shift 2;;
     --json) JSON="$2"; shift 2;;
     *) echo "bench_mappage: unknown arg $1" >&2; exit 2;;
@@ -78,7 +80,7 @@ fi
 run_one() {   # $1 = voxels 0|1
   PROF="$(mktemp -d)"
   local DPORT=$((PORT + 1000))
-  local FLAGS=(--headless=new "--user-data-dir=$PROF" --no-first-run --window-size=1920,1080
+  local FLAGS=(--headless=new "--user-data-dir=$PROF" --no-first-run "--window-size=$WIN"
                "--remote-debugging-port=$DPORT" --disable-background-timer-throttling
                --disable-renderer-backgrounding --disable-backgrounding-occluded-windows)
   if [ "$GPU" = 1 ]; then FLAGS+=(--enable-gpu --ignore-gpu-blocklist --use-angle=d3d11)

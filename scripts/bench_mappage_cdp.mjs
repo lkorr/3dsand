@@ -44,12 +44,35 @@ await send('Page.enable');
 // the page, the tuner iframe included), the top self-time functions printed.
 const PROFILE = process.env.BENCH_PROFILE || '';
 if (PROFILE) { await send('Profiler.enable'); await send('Profiler.setSamplingInterval', {interval: 250}); await send('Profiler.start'); }
+// BENCH_TRACE=<file>: a Chrome trace of the TIMED PHASES (the page sets
+// window.benchTracing while it times), summarised per thread by event name.
+const TRACE = process.env.BENCH_TRACE || '';
+const traceEvents = [];
+let traceDone = null;
+if (TRACE) {
+  ws.addEventListener('message', m => {
+    const d = JSON.parse(m.data);
+    if (d.method === 'Tracing.dataCollected') traceEvents.push(...d.params.value);
+    if (d.method === 'Tracing.tracingComplete' && traceDone) traceDone();
+  });
+}
 await send('Page.navigate', {url});
 const t0 = Date.now();
 let title = '';
+let tracing = false;
 while (Date.now() - t0 < timeoutMs) {
-  await sleep(1000);
+  await sleep(TRACE ? 100 : 1000);
   title = await evalJs('document.title');
+  if (TRACE && !tracing && await evalJs('!!window.benchTiming')) {
+    tracing = true;
+    await send('Tracing.start', {categories: 'devtools.timeline,disabled-by-default-devtools.timeline,toplevel,blink,cc,gpu,viz,v8', transferMode: 'ReportEvents'});
+  }
+  if (TRACE && tracing && await evalJs('!window.benchTiming')) {
+    tracing = false;
+    const done = new Promise(r => { traceDone = r; });
+    await send('Tracing.end');
+    await done;
+  }
   if (title === 'BENCH DONE' || title === 'BENCH FAIL') break;
 }
 const res = await evalJs('JSON.stringify(window.benchResult || null)');
@@ -69,6 +92,21 @@ if (PROFILE) {
   }
   console.log('\nCPU profile, top self time (of ' + (tot / 1e6).toFixed(1) + ' s):');
   for (const [k, us] of Object.entries(dt).sort((a, b) => b[1] - a[1]).slice(0, 40)) console.log('  ' + (us / 1000).toFixed(0).padStart(7) + ' ms  ' + k);
+}
+if (TRACE && traceEvents.length) {
+  writeFileSync(TRACE, JSON.stringify({traceEvents}));
+  const tn = {};
+  for (const e of traceEvents) if (e.ph === 'M' && e.name === 'thread_name') tn[e.pid + ':' + e.tid] = e.args.name;
+  const agg = {};
+  for (const e of traceEvents) {
+    if (e.ph !== 'X' || !e.dur) continue;
+    const k = (tn[e.pid + ':' + e.tid] || '?') + ' | ' + e.name;
+    const a = agg[k] || (agg[k] = {n: 0, us: 0});
+    a.n++; a.us += e.dur;
+  }
+  console.log('\nTrace (timed phases), top complete events by total time:');
+  for (const [k, a] of Object.entries(agg).sort((x, y) => y[1].us - x[1].us).slice(0, 45))
+    console.log('  ' + (a.us / 1000).toFixed(0).padStart(7) + ' ms ' + String(a.n).padStart(6) + 'x  ' + k);
 }
 if (outFile) writeFileSync(outFile, JSON.stringify(r, null, 1));
 await Promise.race([send("Browser.close"), sleep(2000)]);

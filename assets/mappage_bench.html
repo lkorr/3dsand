@@ -138,6 +138,8 @@ html,body{margin:0;background:#111;color:#ddd;font:12px monospace}
       }
     }
     async function idle(frames) { for (let i = 0; i < frames; i++) await nextFrame(); }
+    window.benchTiming = true;    // (bench_mappage_cdp.mjs traces while this is set)
+    await sleep(400);
     const V = M._view();
     const levels = [];
     for (let pass = 1; pass <= PASSES; pass++) {
@@ -155,6 +157,8 @@ html,body{margin:0;background:#111;color:#ddd;font:12px monospace}
     }
     phase = null;
     W.__mapProf = null;
+    window.benchTiming = false;
+    await sleep(400);
     // THE EDIT PATH: what one height-plane edit (a brush dab bumps the plane's
     // gen) costs the next paint -- the rivers re-bake on the new ground
     const editMs = [];
@@ -169,7 +173,8 @@ html,body{margin:0;background:#111;color:#ddd;font:12px monospace}
     const f1 = x => (isNaN(x) ? '   -  ' : x.toFixed(1).padStart(6));
     const sum = a => a.reduce((s, x) => s + x, 0);
     const lines = [];
-    lines.push(`map ${MAP} · voxels ${VOX ? 'ON' : 'off'} · grid ${GRID ? 'on' : 'off'}${FLUSH ? ' · FLUSH (per-layer raster attribution; frame times inflated)' : ''} · canvas ${canvas.width}x${canvas.height} · dpr ${W.devicePixelRatio} · zoom scales ${levels.map(s => s.toFixed(4)).join(' / ')}`);
+    const wvc = W.document.getElementById('wvCanvas'), wr = wvc && wvc.getBoundingClientRect();
+    lines.push(`map ${MAP} · voxels ${VOX ? 'ON' : 'off'}${VOX ? ' (3D canvas at y ' + (wr ? Math.round(wr.top) + '..' + Math.round(wr.bottom) : '?') + ' of a ' + W.innerHeight + ' px window, ' + (W.wvFrame && W.wvFrame.inView === false ? 'OFF screen: paused' : 'in view') + ')' : ''} · grid ${GRID ? 'on' : 'off'}${FLUSH ? ' · FLUSH (per-layer raster attribution; frame times inflated)' : ''} · canvas ${canvas.width}x${canvas.height} · dpr ${W.devicePixelRatio} · zoom scales ${levels.map(s => s.toFixed(4)).join(' / ')}`);
     lines.push('paint after a height-plane edit (gen bump: the river re-bake), 5 runs: ' + editMs.map(x => x.toFixed(1)).join(' / ') + ' ms');
     lines.push('');
     lines.push('phase                 frames  f.p50  f.p95  f.max  >20ms  paints p.p50  p.p95  p.max');
