@@ -8039,6 +8039,7 @@ int main(int argc, char** argv) {
       fl.haveLive = phys.GetTransform(fl.body, fl.lastLive);
       fl.isLimb = avatar.Def() && i < (int)avatar.Def()->limbs.size();
       fl.figSlot = fl.isLimb ? BodySlotFor(avatar.PartName(i), avatar.PartTag(i)) : -1;
+      std::snprintf(fl.name, sizeof fl.name, "%s", avatar.PartName(i));
       deathBody.limbs.push_back(fl);
     }
     deathBody.have = !deathBody.boxes.Empty() && !deathBody.limbs.empty();
@@ -12101,6 +12102,15 @@ int main(int argc, char** argv) {
       if (frameCounter == kShotInvDeathTurnAt) {
         ui.portraitYaw = 1.4f;
         ui.autopsy.peel = 2;
+        // ...from nearly straight above (the pitch reaches the poles now).
+        ui.portraitPitch = -1.45f;
+      }
+      // The probe held on the chest for both death pictures, so the
+      // UNDER CURSOR readout is in them.
+      if (frameCounter == kShotInvDeathFrame + 4) {
+        ui.autopsy.probeForce = true;
+        ui.autopsy.probeAt[0] = 0.5f;
+        ui.autopsy.probeAt[1] = 0.42f;
       }
     }
     glfwPollEvents();
@@ -19389,6 +19399,8 @@ int main(int argc, char** argv) {
           const bool peeling = ui.autopsy.peel > 0;
           const int iso = ui.autopsy.isolate ? ui.inspectSelected : -1;
           size_t keep = 0;
+          std::vector<int> keptPart;  // parts[] index of each kept instance, -1 = not the corpse
+          keptPart.reserve(microInsts.size());
           for (size_t k = 0; k < microInsts.size(); k++) {
             MicroBodyInstGpu in = microInsts[k];
             if (instPart[k] >= 0) {
@@ -19404,8 +19416,118 @@ int main(int argc, char** argv) {
               }
             }
             microInsts[keep++] = in;
+            keptPart.push_back(instPart[k]);
           }
           microInsts.resize(keep);
+          // THE PROBE (UIState::AutopsyUI::probe): the cursor's ray through the
+          // instances just kept - the photograph exactly as it is about to be
+          // drawn, peel and all - nearest occupied cell wins, read back in full.
+          ui.autopsy.probe.valid = false;
+          if (ui.autopsy.probeWant && portraitCam.valid) {
+            const PortraitCam& pc = portraitCam;
+            const float ndcX = ui.autopsy.probeAt[0] * 2.0f - 1.0f;
+            const float ndcY = 1.0f - ui.autopsy.probeAt[1] * 2.0f;
+            const Vec3 rd = (pc.cam.Forward() +
+                             pc.cam.Right() * (ndcX * pc.tanHalf * pc.aspect) +
+                             pc.cam.Up() * (ndcY * pc.tanHalf))
+                                .normalized();
+            float bestT = 1e30f;
+            int bestK = -1, bestCell[3] = {0, 0, 0};
+            for (size_t k = 0; k < microInsts.size(); k++) {
+              if (keptPart[k] < 0) continue;
+              const MicroBodyInstGpu& in = microInsts[k];
+              if (in.slot >= bodyXf.size() || in.model >= mbSet.models.size()) continue;
+              const BodyXformGpu& x = bodyXf[in.slot];
+              const Quat q{x.quat[0], x.quat[1], x.quat[2], x.quat[3]};
+              const float sc = (float)std::max(1u, mbSet.models[in.model].scale);
+              const Vec3 o = QuatRotateInv(q, pc.eye - Vec3{x.pos[0], x.pos[1], x.pos[2]}) * sc;
+              const Vec3 d = QuatRotateInv(q, rd) * sc;
+              const float ro3[3] = {o.x, o.y, o.z}, rd3[3] = {d.x, d.y, d.z};
+              float t;
+              int cell[3];
+              if (autopsy::PickBrick(mbSet, in.model, ro3, rd3, t, cell) && t < bestT) {
+                bestT = t;
+                bestK = (int)k;
+                bestCell[0] = cell[0]; bestCell[1] = cell[1]; bestCell[2] = cell[2];
+              }
+            }
+            if (bestK >= 0) {
+              UIState::AutopsyUI::Probe& pr = ui.autopsy.probe;
+              pr = {};
+              const MicroBodyInstGpu& in = microInsts[(size_t)bestK];
+              const autopsy::Part& pp = parts[(size_t)keptPart[(size_t)bestK]];
+              const size_t pre = (size_t)std::distance(
+                  instPart.begin(), std::find(instPart.begin(), instPart.end(),
+                                              keptPart[(size_t)bestK]));
+              const int li = pre < instLimb.size() ? instLimb[pre] : -1;
+              const char* pname = li >= 0 ? deathBody.limbs[(size_t)li].name : "";
+              const int fig = pp.figSlot;
+              if (fig >= 0 && fig < UIState::kSlotCount) {
+                std::snprintf(pr.part, sizeof pr.part, "%s", ui.body[fig].label);
+              } else {
+                // A worn piece's part name is "worn:<item>:<over>": say it
+                // as "<item> - <over>".
+                std::string nm = pname[0] ? pname : "worn";
+                if (nm.rfind("worn:", 0) == 0) nm = nm.substr(5);
+                for (size_t c = nm.find(':'); c != std::string::npos; c = nm.find(':'))
+                  nm.replace(c, 1, " - ");
+                for (char& c : nm)
+                  if (c == '_') c = ' ';
+                std::snprintf(pr.part, sizeof pr.part, "%s", nm.c_str());
+              }
+              const uint16_t v = MicroBodyCell(mbSet, in.model, bestCell[0], bestCell[1], bestCell[2]);
+              const uint32_t m = v & 0xFFu;
+              auto nameOf = [&](uint32_t id, char* out, size_t n) {
+                std::string nm = id < mats.size() ? (!mats[id].infectLabel.empty() ? mats[id].infectLabel
+                                                                                   : mats[id].name)
+                                                  : std::string("material ") + std::to_string(id);
+                for (char& c : nm)
+                  if (c == '_') c = ' ';
+                std::snprintf(out, n, "%s", nm.c_str());
+              };
+              nameOf(m, pr.mat, sizeof pr.mat);
+              pr.matColor = m < mats.size() ? (0xFF000000u | (mats[m].gpu.color0 & 0x00FFFFFFu))
+                                            : 0xFF808080u;
+              pr.kind = kinds[m];
+              pr.painted = (v >> 8) != 0;
+              pr.cell[0] = bestCell[0]; pr.cell[1] = bestCell[1]; pr.cell[2] = bestCell[2];
+              // The layer, measured on the UNPEELED brick (the peel clone keeps
+              // its dims, so the cell is the same cell): depth from the skin.
+              static autopsy::DepthField probeDepth;
+              static uint32_t probeDepthModel = 0xFFFFFFFFu, probeDepthGen = 0;
+              const uint32_t src = pp.model;
+              if (src != probeDepthModel || MicroBodyEditGen(mbSet, src) != probeDepthGen) {
+                autopsy::MeasureDepth(mbSet, src, probeDepth);
+                probeDepthModel = src;
+                probeDepthGen = MicroBodyEditGen(mbSet, src);
+              }
+              if (bestCell[0] < probeDepth.dx && bestCell[1] < probeDepth.dy &&
+                  bestCell[2] < probeDepth.dz) {
+                const uint8_t dep = probeDepth.At(bestCell[0], bestCell[1], bestCell[2]);
+                pr.layer = dep == autopsy::kEmpty ? -1 : dep;
+              }
+              const uint32_t st = autopsy::CellStain(mbSet, in.model, bestCell[0], bestCell[1], bestCell[2]);
+              const uint16_t coat = (uint16_t)(st & 0xFFFFu), bruise = (uint16_t)(st >> 16);
+              pr.bruise = (int)BodyStainAmt(bruise);
+              if (BodyStainAmt(coat) > 0) {
+                const uint32_t cm = BodyStainMat(coat);
+                nameOf(cm, pr.coat, sizeof pr.coat);
+                pr.coatAmt = (int)BodyStainAmt(coat);
+                pr.coatColor = cm < mats.size()
+                                   ? (0xFF000000u | (mats[cm].gpu.stainColor & 0x00FFFFFFu))
+                                   : 0xFF808080u;
+                if ((pr.coatColor & 0x00FFFFFFu) == 0 && cm < mats.size())
+                  pr.coatColor = 0xFF000000u | (mats[cm].gpu.color0 & 0x00FFFFFFu);
+              }
+              const Vec3 hitW = pc.eye + rd * bestT;
+              float uv[2];
+              if (ProjectToPortrait(pc, hitW, uv)) {
+                pr.uv[0] = uv[0];
+                pr.uv[1] = uv[1];
+              }
+              pr.valid = true;
+            }
+          }
           // The clones' bricks, before the encoder below exists (queued
           // writes drain at the head of the NEXT command buffer).
           if (mbSet.dirty) sim.UploadMicroBodies(ctx.queue, mbSet);

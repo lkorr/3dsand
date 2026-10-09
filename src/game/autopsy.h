@@ -162,6 +162,16 @@ class Peeler {
   DepthField scratch_;
 };
 
+// THE PROBE. The nearest occupied cell of brick `model` along a ray already
+// in the brick's MICRO frame (origin and direction scaled by the brick's
+// scale, so `t` is in the caller's units when the world direction was unit).
+// The same box the shader marches: [0, dims) in micro voxels.
+bool PickBrick(const MicroBodySet& set, uint32_t model, const float ro[3],
+               const float rd[3], float& tHit, int cell[3]);
+// A cell's stain word: low 16 bits the coat, high 16 the bruise (both
+// voxload.h PackBodyStain words). 0 when the brick carries no lattice.
+uint32_t CellStain(const MicroBodySet& set, uint32_t model, int x, int y, int z);
+
 // Mirror `p`'s strata into the death screen's readout (UIState::autopsy):
 // the legend, the per-layer composition of the body and of every part, and the
 // findings. `kinds` is the 256-entry Kind table. Skips the copy when the

@@ -1,6 +1,7 @@
 #include "game/autopsy.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -87,6 +88,67 @@ void MeasureDepth(const MicroBodySet& set, uint32_t model, DepthField& out) {
   // is as deep as it gets.
   for (uint8_t& v : out.depth)
     if (v == kUnseen) v = (uint8_t)std::max(0, out.maxDepth);
+}
+
+bool PickBrick(const MicroBodySet& set, uint32_t model, const float ro[3],
+               const float rd[3], float& tHit, int cell[3]) {
+  const IVec3 d = MicroBodyDims(set, model);
+  const int dim[3] = {d.x, d.y, d.z};
+  if (d.x <= 0 || d.y <= 0 || d.z <= 0) return false;
+  // Slab test against the brick box.
+  float t0 = 0.0f, t1 = 1e30f;
+  for (int a = 0; a < 3; a++) {
+    if (std::fabs(rd[a]) < 1e-12f) {
+      if (ro[a] < 0.0f || ro[a] > (float)dim[a]) return false;
+      continue;
+    }
+    float ta = (0.0f - ro[a]) / rd[a], tb = ((float)dim[a] - ro[a]) / rd[a];
+    if (ta > tb) std::swap(ta, tb);
+    t0 = std::max(t0, ta);
+    t1 = std::min(t1, tb);
+  }
+  if (t1 < t0) return false;
+  // DDA (Amanatides-Woo) from just inside the entry.
+  float t = t0 + 1e-4f;
+  int c[3], step[3];
+  float tMax[3], tDelta[3];
+  for (int a = 0; a < 3; a++) {
+    const float p = ro[a] + rd[a] * t;
+    c[a] = std::clamp((int)std::floor(p), 0, dim[a] - 1);
+    step[a] = rd[a] > 0 ? 1 : -1;
+    if (std::fabs(rd[a]) < 1e-12f) {
+      tMax[a] = tDelta[a] = 1e30f;
+    } else {
+      const float edge = (float)(c[a] + (rd[a] > 0 ? 1 : 0));
+      tMax[a] = (edge - ro[a]) / rd[a];
+      tDelta[a] = std::fabs(1.0f / rd[a]);
+    }
+  }
+  for (int guard = 0; guard < 4096; guard++) {
+    if (MicroBodyCell(set, model, c[0], c[1], c[2]) & 0xFFu) {
+      tHit = t;
+      cell[0] = c[0]; cell[1] = c[1]; cell[2] = c[2];
+      return true;
+    }
+    int a = tMax[0] < tMax[1] ? (tMax[0] < tMax[2] ? 0 : 2) : (tMax[1] < tMax[2] ? 1 : 2);
+    t = tMax[a];
+    c[a] += step[a];
+    if (c[a] < 0 || c[a] >= dim[a] || t > t1) return false;
+    tMax[a] += tDelta[a];
+  }
+  return false;
+}
+
+uint32_t CellStain(const MicroBodySet& set, uint32_t model, int x, int y, int z) {
+  if (model >= set.models.size()) return 0;
+  const MicroBodyModelGpu& m = set.models[model];
+  if ((m.dims & kMicroBodyDimsStainBit) == 0) return 0;
+  const IVec3 d = MicroBodyDims(set, model);
+  if (x < 0 || y < 0 || z < 0 || x >= d.x || y >= d.y || z >= d.z) return 0;
+  const size_t cells = (size_t)d.x * d.y * d.z;
+  const size_t idx = ((size_t)z * d.y + y) * d.x + x;
+  const size_t w = m.base + (cells + 1) / 2 + idx;
+  return w < set.pool.size() ? set.pool[w] : 0u;
 }
 
 uint32_t Peeler::DrawModel(uint32_t src) const {

@@ -331,6 +331,7 @@ struct DeathBody {
     // never cuts and "hide gear" takes away).
     int figSlot = -1;
     bool isLimb = false;
+    char name[32] = {};  // the part's authored name, for the probe readout
     // WHERE ITS JOINT WAS, world voxels, at the instant of death (after the
     // joint-consistency snap). The frozen pose is pinned by THIS rather than
     // by the lattice corner in `xf.pos`: a carve after death (the blast's

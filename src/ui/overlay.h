@@ -961,6 +961,29 @@ struct UIState {
     };
     Finding findings[kFindings];
     int findingCount = 0;
+    // THE PROBE: the voxel under the cursor on the portrait. The panel asks
+    // (`probeWant` + `probeAt`, portrait-normalized) and main.cpp casts the
+    // ray through the instances the portrait DREW - the photograph, peeled
+    // and filtered exactly as on screen - and answers here, one frame later.
+    bool probeWant = false;
+    bool probeForce = false;  // a harness holds the probe at probeAt (--shot-inventory)
+    float probeAt[2] = {0, 0};
+    struct Probe {
+      bool valid = false;
+      float uv[2] = {0, 0};   // where the hit projects, for the marker
+      char part[32] = {};     // "Head", "robe"
+      char mat[24] = {};      // what the voxel IS
+      uint32_t matColor = 0;  // ImU32, opaque
+      uint8_t kind = 0;       // as Legend::kind
+      int layer = -1;         // depth from the surface (0 = skin), -1 unknown
+      int cell[3] = {0, 0, 0};
+      bool painted = false;   // carries an art colour over its material's
+      int bruise = 0;         // 0 none, 1..14 contusion, 15 split open
+      char coat[24] = {};     // what is ON it ("" = clean)
+      uint32_t coatColor = 0;
+      int coatAmt = 0;        // 0..15
+    };
+    Probe probe;
   };
   AutopsyUI autopsy;
 

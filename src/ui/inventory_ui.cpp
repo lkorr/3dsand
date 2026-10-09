@@ -594,7 +594,9 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
   if (orbit) {
     const ImVec2 d = ImGui::GetIO().MouseDelta;
     s.portraitYaw -= d.x * 0.012f;
-    s.portraitPitch = std::clamp(s.portraitPitch - d.y * 0.008f, -0.9f, 0.9f);
+    // Straight down to straight up (owner, 2026-10-08): a hair short of the
+    // poles, where the camera's right axis (forward x world up) degenerates.
+    s.portraitPitch = std::clamp(s.portraitPitch - d.y * 0.008f, -1.55f, 1.55f);
   }
   // PAN (right or middle drag; middle only while pouring): instant — writes
   // both current and target.
@@ -642,6 +644,15 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
   // click-to-frame through without also selecting.
   // A readied spell makes the click a cast with the health column shut too.
   const bool castReady = !s.spellText.empty() && !pourMode;
+  // THE PROBE (UIState::AutopsyUI::probe): on a corpse, the voxel under a
+  // still cursor is read back by main.cpp and named under MADE OF.
+  s.autopsy.probeWant = (dead && hovered && !dragL && !dragR && !dragM) ||
+                        (dead && s.autopsy.probeForce);
+  if (s.autopsy.probeWant && !s.autopsy.probeForce) {
+    const ImVec2 m = ImGui::GetMousePos();
+    s.autopsy.probeAt[0] = (m.x - at.x) / size.x;
+    s.autopsy.probeAt[1] = (m.y - at.y) / size.y;
+  }
   if ((s.inspectMode || castReady) && s.bodyValid &&
       ImGui::IsItemDeactivated() &&
       ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
@@ -4087,6 +4098,16 @@ void PostMortemScreen(UIState& s) {
     Portrait(s, pAt, pSize);
     InspectOverlay(s, pAt, pSize);
 
+    // The probe's voxel, marked where the ray met it: a pixel crosshair.
+    if (a.probe.valid && s.autopsy.probeWant) {
+      const float mx = std::floor(pAt.x + a.probe.uv[0] * pw);
+      const float my = std::floor(pAt.y + a.probe.uv[1] * ph);
+      const ImU32 c = ui::ColGoldHi();
+      dl->AddRectFilled(ImVec2(mx - 7, my - 1), ImVec2(mx - 2, my + 1), c);
+      dl->AddRectFilled(ImVec2(mx + 2, my - 1), ImVec2(mx + 7, my + 1), c);
+      dl->AddRectFilled(ImVec2(mx - 1, my - 7), ImVec2(mx + 1, my - 2), c);
+      dl->AddRectFilled(ImVec2(mx - 1, my + 2), ImVec2(mx + 1, my + 7), c);
+    }
     // Specimen brackets at the four corners, in bone.
     {
       const ImU32 bone = IM_COL32(222, 214, 196, 200);
@@ -4292,7 +4313,9 @@ void PostMortemScreen(UIState& s) {
           ImGui::PushFont(ui::FontSmall());
           uint32_t all = 0;
           for (int k = 0; k < a.legendCount; k++) all += a.legend[k].count;
-          for (int k = 0; k < a.legendCount && cy + lh <= pAt.y + ph; k++) {
+          // Rows stop short of the probe's block below.
+          const float kProbeH = 10.0f * lh + 40.0f;
+          for (int k = 0; k < a.legendCount && cy + lh <= pAt.y + ph - kProbeH; k++) {
             const UIState::AutopsyUI::Legend& g = a.legend[k];
             dl->AddRectFilled(ImVec2(sx, cy + 3), ImVec2(sx + 8, cy + 11), g.color);
             const ImU32 tc = g.kind == 3   ? IM_COL32(120, 176, 92, 255)
@@ -4311,6 +4334,58 @@ void PostMortemScreen(UIState& s) {
             cy += lh + 1;
           }
           cy += 6;
+        }
+        // ---- UNDER THE CURSOR: the one voxel the mouse is on --------------
+        ImGui::PopFont();
+        cy = ui::Subheading(dl, ImVec2(sx, cy), sw, "UNDER CURSOR") + 2;
+        ImGui::PushFont(ui::FontSmall());
+        const UIState::AutopsyUI::Probe& pr = a.probe;
+        if (!pr.valid) {
+          dl->AddText(nullptr, 0.0f, ImVec2(sx, cy), Fade(ui::ColParchDim(), 0.75f),
+                      "Hold the mouse still over the body to read the voxel under it.",
+                      nullptr, sw);
+        } else {
+          auto row = [&](const char* k, ImU32 col, const char* v, uint32_t swatch) {
+            ui::ShadowText(dl, ImVec2(sx, cy), Fade(ui::ColParchDim(), 0.85f), k);
+            float vx = sx + 64;
+            if (swatch) {
+              dl->AddRectFilled(ImVec2(vx, cy + 3), ImVec2(vx + 8, cy + 11), swatch);
+              dl->AddRect(ImVec2(vx, cy + 3), ImVec2(vx + 8, cy + 11), Fade(ui::ColInk(), 0.8f));
+              vx += 12;
+            }
+            dl->AddText(nullptr, 0.0f, ImVec2(vx, cy), col, v, nullptr, sx + sw - vx);
+            cy += ImGui::CalcTextSize(v, nullptr, false, sx + sw - vx).y + 2;
+          };
+          char buf[64];
+          row("part", ui::ColParch(), pr.part, 0);
+          const ImU32 kc = pr.kind == 3   ? IM_COL32(120, 176, 92, 255)
+                           : pr.kind == 2 ? ui::ColEmber()
+                                          : ui::ColGoldPale();
+          std::snprintf(buf, sizeof buf, "%s%s%s", pr.mat,
+                        pr.kind == 3 ? "  (infection)" : pr.kind == 2 ? "  (burnt)" : "",
+                        pr.painted ? "  - painted" : "");
+          row("voxel", kc, buf, pr.matColor);
+          if (pr.layer >= 0) {
+            std::snprintf(buf, sizeof buf, "%d%s", pr.layer,
+                          pr.layer == 0 ? "  - the surface" : "  below the surface");
+            row("layer", ui::ColParch(), buf, 0);
+          }
+          if (pr.bruise >= 15)
+            row("tissue", ui::ColBloodHi(), "split open", 0);
+          else if (pr.bruise > 0) {
+            std::snprintf(buf, sizeof buf, "bruised  %d / 14", pr.bruise);
+            row("tissue", ui::Mix(ui::ColBlood(), ui::ColParch(), 0.4f), buf, 0);
+          } else {
+            row("tissue", Fade(ui::ColParchDim(), 0.8f), "unbruised", 0);
+          }
+          if (pr.coatAmt > 0) {
+            std::snprintf(buf, sizeof buf, "%s  %d / 15", pr.coat, pr.coatAmt);
+            row("stained", ui::Mix(pr.coatColor, IM_COL32_WHITE, 0.35f), buf, pr.coatColor);
+          } else {
+            row("stained", Fade(ui::ColParchDim(), 0.8f), "clean", 0);
+          }
+          std::snprintf(buf, sizeof buf, "%d, %d, %d", pr.cell[0], pr.cell[1], pr.cell[2]);
+          row("cell", Fade(ui::ColParchDim(), 0.7f), buf, 0);
         }
       }
       if (a.refusals > 0) {
