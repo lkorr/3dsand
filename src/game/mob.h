@@ -4213,6 +4213,9 @@ class Mob {
   // The ledge climb (pose.cpp): the drive and torso lean BEFORE the flatten,
   // the legs AFTER the leg IK. The arms are ApplyHangArms, kept on the lip.
   void UpdateClimbDrive(const PoseInputs& in, float dt);
+  // The ledge shimmy: hand-over-hand grips and the body's lurch (pose.cpp).
+  void UpdateShimmy(const PoseInputs& in, float dt);
+  void ApplyShimmyBody(const AnimSkeleton& sk, AnimState& st);
   void ApplyClimbLean(const AnimSkeleton& sk, AnimState& st);
   void ApplyClimbLegs(const AnimSkeleton& sk, AnimState& st);
   // The LIVE half of AddBodyVelocity / BodyVelocity: whichever integrator the

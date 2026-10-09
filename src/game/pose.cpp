@@ -473,6 +473,68 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
     locoKneel_ = 0.0f;   // the state that owned the kneel is gone
   }
 
+  // ---- the stride clips: `walk` and `run` (2026-10-08) ----------------------
+  // Resolved once per clip table, not per tick (FindClip is a string scan and
+  // the avatar runs this up to four times a frame).
+  if (pose_.gaitClipsKey != (const void*)sk.clips.data() ||
+      pose_.gaitClipsCount != sk.clips.size()) {
+    pose_.gaitClipsKey = sk.clips.data();
+    pose_.gaitClipsCount = sk.clips.size();
+    pose_.walkClip = sk.FindClip("walk");
+    pose_.runClip = sk.FindClip("run");
+  }
+  const int walkClip = pose_.walkClip, runClip = pose_.runClip;
+  // THE NPC'S PICK (PoseInputs::gaitClips). The avatar's thresholds, for the
+  // avatar's reason: `def.speed` is the top (sprint/chase) speed, so a wander
+  // at 0.6 of it walks and a chase at 1.0 runs, and the hysteresis keeps a
+  // speed near the split from flickering between two 180 ms blend-ins that
+  // never finish. A clip-owned state (crawl, stumps) and the air own the arms
+  // themselves, so both retire the pair.
+  if (in.gaitClips && walkClip >= 0) {
+    const float top = std::max(def.speed, 0.01f);
+    pose_.gaitRunning = pose_.gaitRunning ? speedNow_ > top * 0.70f
+                                          : speedNow_ > top * 0.80f;
+    const bool moving = in.grounded && !clipOwnsPose &&
+                        speedNow_ > std::max(0.4f, top * 0.08f);
+    const int want =
+        !moving ? -1 : (pose_.gaitRunning && runClip >= 0 ? runClip : walkClip);
+    for (ClipInstance& inst : st.clips) {
+      if (inst.clip != walkClip && inst.clip != runClip) continue;
+      if (inst.clip == want) inst.stopping = false;   // revive, see chase pose
+      else inst.stopping = true;
+    }
+    if (want >= 0) PlayClipIndex(want);   // no-op once it is running
+    // The chase pose (a zombie's arms out) owns the arms while it is up: a
+    // runner's bent-elbow pump added on top of a reach is neither.
+    for (ClipInstance& inst : st.clips)
+      if (inst.clip == walkClip || inst.clip == runClip)
+        inst.weight = 1.0f - std::clamp(chasePose_, 0.0f, 1.0f);
+  }
+  // STRIDE-LOCKED, FOR EVERY CREATURE. The rate makes one authored cycle span
+  // one stride (the avatar sets it too, after this, from the same clock), and
+  // the PHASE is pulled onto the feet's: clip t=0 is the left arm back, which
+  // is gaitPhase 0, the left foot's touchdown (SyncStrideClock's leg ordinal 0
+  // is legU.L on every generated rig). A partial pull rather than a set, so
+  // the first touchdown's phase snap eases into the arms instead of jerking
+  // them. Without it the arms ran at the right RATE at an arbitrary phase —
+  // as often as not the left arm swung forward with the left leg.
+  if (pose_.strideRate > 1e-4f && (walkClip >= 0 || runClip >= 0)) {
+    for (ClipInstance& inst : st.clips) {
+      if (inst.stopping || (inst.clip != walkClip && inst.clip != runClip))
+        continue;
+      const float dur = (float)sk.clips[inst.clip].durationMs;
+      if (dur <= 1.0f) continue;
+      inst.rate = std::clamp(pose_.strideRate * dur * 0.001f, 0.25f, 3.0f);
+      // AnimSampleAndBlend advances the playhead before it samples, so the
+      // target is the phase one tick back.
+      float want = st.gaitPhase * dur - dt * 1000.0f * inst.rate;
+      float err = want - inst.timeMs;
+      err -= dur * std::floor(err / dur + 0.5f);
+      inst.timeMs += err * 0.25f;
+      inst.timeMs -= dur * std::floor(inst.timeMs / dur);
+    }
+  }
+
   // ---- the chase pose: arms out while the dead come for you ----------------
   // `MobDef::chaseClip` (zombie.json names `reach`). Held while the driver
   // says the creature is engaged (PoseInputs::chaseWant — the NPC brain's
@@ -673,6 +735,10 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   // palms kept on the lip.
   UpdateClimbDrive(in, dt);
   ApplyClimbLean(sk, st);
+  // The shimmy's grips and the body's lurch onto the holding arm, in the same
+  // pre-flatten layer; the palms themselves are ApplyHangArms'.
+  UpdateShimmy(in, dt);
+  ApplyShimmyBody(sk, st);
 
   // ---- stage 3.7: the body answers a blow (mob.h Mob::HitReact) ----
   // After the aim and the twist, so a creature mid-bite that gets hit rocks
@@ -864,6 +930,17 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   // like the legs, faded by `weaponWeight_`. The notes about the mirrored-
   // authoring x flip, the pole, and why nothing may rotate the held part after
   // the flatten live in Mob::ApplyWeaponArm.
+  // A GUARD CARRIED AT A RUN PUMPS WITH THE STRIDE (PoseInputs::guardPump).
+  // The guard is an IK hold on one point in front of the shoulder, and held
+  // rigidly through a sprint it read as a mannequin carrying a prop. Faded in
+  // with the speed; dropped outright the tick the guard ends, so nothing of it
+  // rides into a stroke's windup (which takes the arm from WeaponArmPose).
+  if (in.guardPump && in.grounded && !clipOwnsPose) {
+    const float want = std::clamp(speedFactor, 0.0f, 1.0f);
+    pose_.guardPumpW += (want - pose_.guardPumpW) * HalfLifeK(dt, 0.12f);
+  } else {
+    pose_.guardPumpW = 0.0f;
+  }
   PoseAxisOverride weaponHinge;
   ApplyWeaponArm(sk, st, weaponHinge);
   // ...and the style's per-joint brakes on what it solved (melee.h ArmSmooth).
@@ -1908,17 +1985,35 @@ void Mob::ApplyHangArms(const PoseInputs& in, float dt, const AnimSkeleton& sk,
   const float ahead = std::clamp(aheadRaw - MetresToCells(0.055f),
                                  Player::kHalfXZ * 0.6f,
                                  Player::kHalfXZ + MetresToCells(0.12f));
+  const float bodyS = cx * leftW.x + cz * leftW.z;
+  int armOrdinal = -1;
   for (size_t c = 0; c < sk.chains.size(); c++) {
     const IkChain& ch = sk.chains[c];
     if (ch.tag != "arm" || ch.parts.empty() || ch.effector < 0) continue;
+    armOrdinal++;   // counted BEFORE the weight test: UpdateShimmy's order
     const float weight = ch.weight * pose_.hangIkWeight;
     if (weight <= 0) continue;
     const Vec3 shoulder = sk.parts[ch.parts[0]].anchorLocal;
-    const float latM = shoulder.x - pivot.x;  // this arm's own spread
+    float latM = shoulder.x - pivot.x;  // this arm's own spread
+    // THE SHIMMY'S GRIP (UpdateShimmy): where this hand holds the lip, fixed
+    // in the world, or where it is in flight to -- lifted off the lip and
+    // drawn back from its edge on the way.
+    float lift = 0.0f, drawBack = 0.0f;
+    if (pose_.shimmyInit && armOrdinal < pose_.shimmyArms) {
+      float s = pose_.gripS[armOrdinal];
+      if (armOrdinal == pose_.shimmyHand) {
+        const float t = std::clamp(pose_.shimmyT, 0.0f, 1.0f);
+        s = pose_.shimmyFrom + (pose_.shimmyTo - pose_.shimmyFrom) * Smooth01(t);
+        const float arc = std::sin(3.14159265f * t);
+        lift = MetresToCells(0.06f) * arc;   // the hand lifts off the lip
+        drawBack = MetresToCells(0.035f) * arc;
+      }
+      latM = s - bodyS;
+    }
     // Palm rest point on the lip: fingers just over the top surface.
-    const Vec3 palmW{cx + leftW.x * latM + dir.x * ahead,
-                     lipTopY + MetresToCells(0.02f),
-                     cz + leftW.z * latM + dir.z * ahead};
+    const Vec3 palmW{cx + leftW.x * latM + dir.x * (ahead - drawBack),
+                     lipTopY + MetresToCells(0.02f) + lift,
+                     cz + leftW.z * latM + dir.z * (ahead - drawBack)};
     const Vec3 rel = palmW - bodyOrigin - pivot;
     const Vec3 palmPrefab = RotateInv(yaw, rel) + pivot;
     // The solver places the EFFECTOR's joint (the wrist). The grip point is the
@@ -2024,6 +2119,205 @@ void Mob::UpdateClimbDrive(const PoseInputs& in, float dt) {
                   HalfLifeK(dt, CurrentTuning().avatar.ikBlendHalflife);
   if (pose_.climbW < 1e-3f) pose_.climbW = 0.0f;
   if (pose_.climbW > 0.999f) pose_.climbW = 1.0f;
+}
+
+// ---- the ledge shimmy: hand over hand, and the body hangs off it -----------
+//
+// The shimmy used to be the body sliding sideways at a flat rate with both
+// palms pinned to fixed spots either side of its centre, so the hands slid
+// along the lip with it like they were on rails. Now each hand GRIPS: a point
+// along the wall fixed in the world (PoseDrive::gripS), and the body slides
+// under the grips until a hand is a half step behind its shoulder, when it lets
+// go, arcs up off the lip and re-grips a half step AHEAD of its shoulder.
+//
+// KEYED ON DISTANCE, NOT ON A CLOCK, like the stride: a hand moves each time
+// the body crosses a half-step boundary along the wall, alternating hands by
+// the boundary's parity, so stopping freezes the cycle, a slow shimmy steps
+// slowly, and a network ghost (which has only its position) steps the same
+// hands at the same places. Only the flight itself is timed, and it is cut to
+// fit inside the half step at any speed.
+//
+// THE BODY ANSWERS EACH REACH (ApplyShimmyBody): while one hand is off the lip
+// the weight is on the other, so the pelvis swings under the holding hand and
+// drops a little, the torso rolls toward it, and the legs swing after on a
+// spring -- the pendulum a real one-armed hang is.
+namespace {
+constexpr float kShimmyStepM = 0.30f;     // one hand's travel per move, metres
+constexpr float kShimmySwingS = 0.20f;    // a hand's flight, seconds (max)
+constexpr float kShimmyRollDeg = 7.0f;    // torso roll onto the holding arm
+constexpr float kShimmySwayM = 0.04f;     // pelvis swing under the holding hand
+constexpr float kShimmyDipM = 0.03f;      // the drop onto one arm
+}  // namespace
+
+void Mob::UpdateShimmy(const PoseInputs& in, float dt) {
+  PoseDrive& p = pose_;
+  const AnimSkeleton& sk = skel_;
+  const bool hang = in.hangActive && !in.climbActive && def_ != nullptr &&
+                    alive_ && !Ragdolled();
+  // The lurch eases out whatever ends the shimmy; the grips are kept through
+  // a ledge climb (its palms stay where the hands were) and dropped after.
+  if (!hang) {
+    const float k = HalfLifeK(dt, 0.10f);
+    p.shimmyRoll -= p.shimmyRoll * k;
+    p.shimmyBodyOff = p.shimmyBodyOff - p.shimmyBodyOff * k;
+    p.shimmyLegRoll -= p.shimmyLegRoll * k;
+    p.shimmyLegVel = 0.0f;
+    p.shimmyHand = -1;
+    if (!in.climbActive) p.shimmyInit = false;
+    return;
+  }
+  const Vec3 pivot{def_->worldSize.x * 0.5f, 0, def_->worldSize.z * 0.5f};
+  const Vec3 dir = in.hangDir;
+  const Vec3 leftW{dir.z, 0.0f, -dir.x};  // model +X is the rig's left
+  const float bodyS =
+      (origin_.x + pivot.x) * leftW.x + (origin_.z + pivot.z) * leftW.z;
+  if (!p.shimmyInit || std::fabs(p.shimmyDir.x - dir.x) +
+                               std::fabs(p.shimmyDir.z - dir.z) > 1e-3f) {
+    // A new hang (or a new wall): every hand on the lip above its shoulder.
+    // The arm ORDER is ApplyHangArms' (arm chains with parts and an effector).
+    p.shimmyArms = 0;
+    for (const IkChain& ch : sk.chains) {
+      if (ch.tag != "arm" || ch.parts.empty() || ch.effector < 0) continue;
+      if (p.shimmyArms >= PoseDrive::kShimmyArms) break;
+      const float lat = sk.parts[ch.parts[0]].anchorLocal.x - pivot.x;
+      p.gripLat[p.shimmyArms] = lat;
+      p.gripS[p.shimmyArms] = bodyS + lat;
+      p.shimmyArms++;
+    }
+    p.shimmyInit = true;
+    p.shimmyDir = dir;
+    p.shimmyS = bodyS;
+    p.shimmyVel = 0.0f;
+    p.shimmyHand = -1;
+  }
+  if (p.shimmyArms <= 0) return;
+
+  const float step = MetresToCells(kShimmyStepM);
+  const float half = step * 0.5f;
+  const float prevS = p.shimmyS;
+  p.shimmyS = bodyS;
+  const float vNow = dt > 1e-5f ? (bodyS - prevS) / dt : 0.0f;
+  p.shimmyVel += (vNow - p.shimmyVel) * HalfLifeK(dt, 0.08f);
+  const float vOn = MetresToCells(0.12f);
+  const float m = p.shimmyVel > vOn ? 1.0f : (p.shimmyVel < -vOn ? -1.0f : 0.0f);
+  // Fits inside one half step at the current speed, so a hand is always
+  // down before the next boundary asks the other one to go.
+  const float flightS = std::max(
+      0.08f, std::min(kShimmySwingS,
+                      0.85f * half / std::max(std::fabs(p.shimmyVel), 1e-3f)));
+
+  auto land = [&] {
+    if (p.shimmyHand >= 0) p.gripS[p.shimmyHand] = p.shimmyTo;
+    p.shimmyHand = -1;
+    p.shimmyT = 0.0f;
+  };
+  auto launch = [&](int h, float sign) {
+    p.shimmyHand = h;
+    p.shimmyFrom = p.gripS[h];
+    p.shimmySign = sign;
+    p.shimmyT = 0.0f;
+    p.shimmyTo = bodyS + p.gripLat[h] + sign * half;
+  };
+  // A boundary crossed: the hand of that boundary's parity goes, toward the
+  // travel. Crossing two at once (a teleport, a huge frame) re-grips both.
+  const int jPrev = (int)std::floor(prevS / half);
+  const int jNow = (int)std::floor(bodyS / half);
+  if (jNow != jPrev && m != 0.0f) {
+    if (std::abs(jNow - jPrev) > 1) {
+      for (int k = 0; k < p.shimmyArms; k++) p.gripS[k] = bodyS + p.gripLat[k];
+      p.shimmyHand = -1;
+    } else {
+      const int j = std::max(jNow, jPrev);
+      const int h = ((j % p.shimmyArms) + p.shimmyArms) % p.shimmyArms;
+      land();   // a hand still in the air lands where it was going
+      launch(h, m);
+    }
+  }
+  // Stopped with a hand stretched well off its shoulder: bring it home.
+  if (p.shimmyHand < 0 && m == 0.0f) {
+    int best = -1;
+    float bestE = 0.75f * step;
+    for (int k = 0; k < p.shimmyArms; k++) {
+      const float e = std::fabs(bodyS + p.gripLat[k] - p.gripS[k]);
+      if (e > bestE) { best = k; bestE = e; }
+    }
+    if (best >= 0) launch(best, 0.0f);
+  }
+  if (p.shimmyHand >= 0) {
+    // The aim tracks the body: the hand re-grips a half step ahead of where
+    // its shoulder IS, not where it was when the hand let go.
+    p.shimmyTo = bodyS + p.gripLat[p.shimmyHand] + p.shimmySign * half;
+    p.shimmyT += dt / flightS;
+    if (p.shimmyT >= 1.0f) land();
+  }
+
+  // ---- the body's answer ----
+  float roll = 0.0f;
+  Vec3 off{};
+  if (p.shimmyHand >= 0) {
+    const float w = std::sin(3.14159265f * std::clamp(p.shimmyT, 0.0f, 1.0f));
+    // +1 = the reaching hand is on the rig's LEFT (+X). The weight goes onto
+    // the other arm: the pelvis swings under it (toward -side) and the
+    // reaching side drops -- a positive roll about +Z lifts the LEFT, so the
+    // roll is -side.
+    const float side = p.gripLat[p.shimmyHand] >= 0.0f ? 1.0f : -1.0f;
+    roll = -side * kShimmyRollDeg * (3.14159265f / 180.0f) * w;
+    off = Vec3{-side * MetresToCells(kShimmySwayM) * w,
+               -MetresToCells(kShimmyDipM) * w, 0.0f};
+  }
+  const float k = HalfLifeK(dt, 0.05f);
+  p.shimmyRoll += (roll - p.shimmyRoll) * k;
+  p.shimmyBodyOff = p.shimmyBodyOff + (off - p.shimmyBodyOff) * k;
+  // The legs hang: relative to the rolling pelvis they swing back past
+  // vertical and overshoot, on a lightly damped spring (~1.4 Hz).
+  {
+    const float kSpring = 78.0f, kDamp = 4.5f;
+    const float target = -1.3f * p.shimmyRoll;
+    const float acc =
+        kSpring * (target - p.shimmyLegRoll) - kDamp * p.shimmyLegVel;
+    p.shimmyLegVel += acc * dt;
+    p.shimmyLegRoll += p.shimmyLegVel * dt;
+    p.shimmyLegRoll = std::clamp(p.shimmyLegRoll, -0.5f, 0.5f);
+  }
+}
+
+void Mob::ApplyShimmyBody(const AnimSkeleton& sk, AnimState& st) {
+  const PoseDrive& p = pose_;
+  if (def_ == nullptr) return;
+  if (std::fabs(p.shimmyRoll) < 1e-4f && p.shimmyBodyOff.len() < 1e-4f &&
+      std::fabs(p.shimmyLegRoll) < 1e-4f)
+    return;
+  auto alive = [&](size_t i) {
+    return i >= st.partAlive.size() || st.partAlive[i] != 0;
+  };
+  const int root = def_->rootLimb;
+  if (root >= 0 && root < (int)sk.parts.size() && alive((size_t)root)) {
+    st.local[root].pos += p.shimmyBodyOff;
+    st.local[root].rot = QuatNormalize(
+        Mul(st.local[root].rot, AxisAngle({0, 0, 1}, p.shimmyRoll)));
+  }
+  // The chest gives back a little of the pelvis' roll, so the shoulders stay
+  // nearer level under the lip than the hips do.
+  int nSpine = 0;
+  for (size_t i = 0; i < sk.parts.size(); i++)
+    if (sk.parts[i].tag == "spine" && (int)i != root) nSpine++;
+  if (nSpine > 0) {
+    const Quat per = AxisAngle({0, 0, 1}, -0.4f * p.shimmyRoll / nSpine);
+    for (size_t i = 0; i < sk.parts.size(); i++) {
+      if (sk.parts[i].tag != "spine" || (int)i == root || !alive(i)) continue;
+      st.local[i].rot = QuatNormalize(Mul(st.local[i].rot, per));
+    }
+  }
+  if (std::fabs(p.shimmyLegRoll) > 1e-4f) {
+    const Quat legQ = AxisAngle({0, 0, 1}, p.shimmyLegRoll);
+    for (size_t c = 0; c < sk.chains.size(); c++) {
+      if (!IsLegChain(sk, c) || sk.chains[c].parts.empty()) continue;
+      const int hip = sk.chains[c].parts[0];
+      if (hip < 0 || hip >= (int)st.local.size() || !alive((size_t)hip))
+        continue;
+      st.local[hip].rot = QuatNormalize(Mul(st.local[hip].rot, legQ));
+    }
+  }
 }
 
 namespace {

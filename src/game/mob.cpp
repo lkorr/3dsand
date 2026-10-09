@@ -8562,6 +8562,11 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
                   (mob.ai_.hasTarget && mob.ai_.intent != ai::Intent::Idle &&
                    (def.chaseRange <= 0.0f ||
                     mob.ai_.targetDist <= def.chaseRange)));
+  // The arms swing with the stride (walk / run), and a held guard pumps with
+  // it rather than riding rigid (pose.h PoseInputs::gaitClips / guardPump).
+  in.gaitClips = true;
+  in.guardPump = mob.stroke_.Active() &&
+                 mob.stroke_.phase == NpcStroke::Phase::Guard;
   mob.PosePipeline(in, dt, world, tick);
 }
 
@@ -32915,7 +32920,18 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
   // off the arc.
   const int i0 = chain->parts[0], i1 = chain->parts[1];
   const Vec3 shoulder = st.model[i0].pos;
-  const Vec3 targetLocal = shoulder + toRig(weapon_.hand);
+  Vec3 targetLocal = shoulder + toRig(weapon_.hand);
+  // THE GUARD'S STRIDE PUMP (PosePipeline sets the weight; 0 off a guard).
+  // The arm opposes its own leg: at gaitPhase 0 the left foot is down and in
+  // front, so the RIGHT hand is forward. Model +X is the character's left.
+  // The hand rises as it comes forward, the way a carried blade does.
+  if (pose_.guardPumpW > 1e-3f && def_ != nullptr) {
+    const float side =
+        sk.parts[i0].anchorLocal.x >= def_->worldSize.x * 0.5f ? 1.0f : -1.0f;
+    const float fwd = -side * std::cos(6.2831853f * st.gaitPhase);
+    const float amp = MetresToCells(0.09f) * pose_.guardPumpW;
+    targetLocal = targetLocal + Vec3{0.0f, 0.45f * amp * fwd, amp * fwd};
+  }
 
   IkChain steer = *chain;
   if ((weapon_.steerBlade || weapon_.usePole) && weapon_.bendPole.len() > 1e-4f) {
