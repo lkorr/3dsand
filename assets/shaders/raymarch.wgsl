@@ -971,6 +971,10 @@ var<private> gRs : array<u32, RENDER_STATS_SLOTS>;
 // Whether THIS pixel is on the sample. Set once at the top of fs(); every
 // rsAdd is predicated on it so the 15-in-16 unsampled pixels do no counting.
 var<private> gRsOn : bool = false;
+// This fragment's pixel, for the one term that needs the screen-space cloud
+// image from inside applyAerial (skyBackdrop, short-range mode). Set first
+// thing in fs(); nothing outside fs() calls applyAerial.
+var<private> gFragXY : vec2f = vec2f(0.0);
 // trace()'s own step count. A call site zeroes it, calls, and bills the delta
 // to its slot — cheaper than a parameter through a function that is inlined
 // into six places and whose signature is load-bearing for register pressure.
@@ -7206,12 +7210,46 @@ fn rainOverlay(colorIn : vec3f, rd : vec3f, tDepthVox : f32) -> vec3f {
   return mix(colorIn, lit * mix(1.0, 1.6, snow), 1.0 - trans);
 }
 
+// What the sky branch of fs() paints at pixel `xy` looking along `rd`, split
+// like skyColorParts: `full` is the pixel (clouds over the sky, the point
+// sources through the DIRECT transmittance), `glow` the same without the point
+// sources. ONE function because short-range fog (applyAerial) has to converge
+// to exactly what the sky branch draws next to it.
+fn skyBackdrop(rd : vec3f, xy : vec2f) -> SkyParts {
+  let sp = skyColorParts(rd);
+  if ((R.weatherFlags & RWF_CLOUDS) == 0u) { return sp; }
+  let cs = cloudScreenAt(xy);
+  let glow = sp.glow * cs.t + cs.c;
+  return SkyParts(glow + (sp.full - sp.glow) * cs.td, glow);
+}
+
 // Aerial perspective: distance fog that converges EXACTLY to the sky color in
 // that ray's direction. The old `skyColor * 0.9` target left every distant
 // surface hanging slightly darker than the sky it should dissolve into, which
 // read as a gray veil over the whole horizon instead of atmosphere.
 fn applyAerial(color : vec3f, rd : vec3f, tFine : f32) -> vec3f {
   let f = aerialFrac(tFine, rd.y);
+  // ---- SHORT-RANGE MODE: DISSOLVE INTO THE PIXEL'S OWN BACKDROP ----------
+  // Owner ticket 2026-10-09_11-01-50: "with fog on at 100 m I see clear walls
+  // in the distance at what are probably LOD boundaries". The walls were
+  // cascade cells whose hit sits ON the ceiling (a level-7/8 cell the ray is
+  // inside when tCeil stops it), fogged to exactly 1 -- i.e. painted
+  // cloudySkyAirglow(rd), the env-map overcast, while the sky pixel beside
+  // them is skyBackdrop's screen-resolution cloud image. Two different greys,
+  // so every coarse cell standing at the ceiling drew its 32 m face, and every
+  // hill crossing 65-100 m drew its silhouette against the sky.
+  //
+  // In this mode everything past the ceiling IS that backdrop (the march stops
+  // there and the pixel goes to the sky branch), so the ramp has to converge
+  // to it, per pixel, or the ramp's renormalisation to exactly 1 at the
+  // ceiling buys nothing. The point sources (stars, moons, sun disc) join only
+  // over the last tenth of the ramp: still exactly the backdrop at the
+  // ceiling, but no starfield on a hill that is merely hazy
+  // (gotcha-sky-tiers-fog-target).
+  if (SPEC_SHORT_RANGE && (R.flags & 4u) != 0u) {
+    let bg = skyBackdrop(rd, gFragXY);
+    return mix(color, bg.glow, f) + (bg.full - bg.glow) * smoothstep(0.9, 1.0, f);
+  }
   // Star-free sky. Aerial perspective is AIR between the eye and a SOLID
   // surface, so it must converge to the airglow in that direction and nothing
   // else. Using the full skyColor() here mixes the starfield, moon and
@@ -7265,6 +7303,37 @@ fn lodShadeFade(tVox : f32) -> f32 {
   let fpx = R.viewPx * 0.5 / R.tanHalfFov;
   let voxPx = fpx / max(tVox, 1.0);
   return 1.0 - smoothstep(LOD_SHADE_PX_FULL, LOD_SHADE_PX_START, voxPx);
+}
+
+// ---- THE LIFT IS FOR CONTACT SHADOWS, NOT CAST ONES (2026-10-09) ----------
+// Owner ticket 2026-10-09_10-48-59: "a ring around the observer where shadows
+// are correct and then they drop off entirely". That ring was the lift above
+// applied to EVERY shadow: a canopy's shadow on the grass sits at
+// shadowFromOpaqueHit's 0.1-0.3, and once lodShadeFade(t) reached 1 (~20 m at
+// 900 px tall, ~36 m at 1620) max(sh, 0.7) raised it to 0.7 -- the forest
+// floor went from shaded to nearly lit over a few metres, in the near cache
+// and the cascade alike. The note above assumed a cast shadow "already sits at
+// TUNE_SHADOW_LIFT"; that is 0.45, under the 0.7 lift, so the max() never
+// left one alone.
+//
+// What makes a shadow sub-pixel noise is the size of the SHADOW, not of the
+// voxel it falls on, and a shadow's size on the ground scales with its
+// blocker's distance: a riser one voxel up casts a one-voxel sliver, a crown
+// four metres up casts a four-metre pool. So the fade is lodShadeFade's law on
+// the blocker distance's projected size instead of one voxel's. The value is
+// all the shadow cache (near or far) hands back, so the distance is read off
+// it through the softening law it was made by (shadowFromOpaqueHit: 0 for a
+// blocker under shadowSoftNear, rising to TUNE_SHADOW_LIFT at shadowSoftFar):
+// squared, so a contact shadow's partly-filled patch (a few % from the
+// 16-sample penumbra window) still reads as a contact one and lifts exactly as
+// before, while a canopy's 0.1-0.45 keeps its pool to hundreds of metres. A
+// value of 0 gives a one-voxel feature, i.e. lodShadeFade(t) exactly -- the old
+// behaviour for the artefact it was written for.
+fn lodShadowLift(sh : f32, tVox : f32) -> f32 {
+  if (sh >= LOD_SHADE_SHADOW_LIFT) { return sh; }
+  let x = clamp(sh / max(TUNE_SHADOW_LIFT, 1e-3), 0.0, 1.0);
+  let featVox = max(1.0, x * x * TUNE_SHADOW_SOFT_FAR / VOXEL_METERS);
+  return mix(sh, LOD_SHADE_SHADOW_LIFT, lodShadeFade(tVox / featVox));
 }
 
 // ---- FAR EMBER PLASMA: the breath on a fire the window has left behind -----
@@ -8173,7 +8242,8 @@ fn shadowAppendRequest(key : u32, slot : u32, packedCell : u32, packedSub : u32)
 // A MISS RETURNS 1.0 (lit), which is the cache's documented one-frame cost: a
 // patch nobody has requested yet renders unshadowed until the resolve pass
 // fills it in next frame, and a one-frame bright edge on a newly visible
-// surface is invisible in motion outdoors.
+// surface is invisible in motion outdoors. It was NOT invisible where patches
+// are sub-pixel — see SUB-PIXEL PATCHES ARE POOLED below.
 //
 // INDOORS IT WAS NOT INVISIBLE, and the fix is NOT here. `shadowLiftCap` used
 // to pass v = 1 through untouched, so a miss inside a sealed cave shaded with
@@ -8198,6 +8268,9 @@ fn shadowAppendRequest(key : u32, slot : u32, packedCell : u32, packedSub : u32)
 // Close up, where a patch is wider than SHADOW_NEAREST_PX, the blend stays:
 // there a patch-square staircase along a shadow edge is plainly visible.
 const SHADOW_NEAREST_PX : f32 = 4.0;
+// Below this patch width the nearest read pools patches (SUB-PIXEL PATCHES ARE
+// POOLED, in the function). 1.5 so a pooled patch lands at 1.5-3 px.
+const SHADOW_POOL_PX : f32 = 1.5;
 fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
                 camDistFine : f32) -> f32 {
   rsAdd(RS_SC_TAPS, 1u);
@@ -8234,6 +8307,38 @@ fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
     // and the loop below skips them.
     u = min(floor(fu * m), m - 1.0);
     v = min(floor(fv * m), m - 1.0);
+    // ---- SUB-PIXEL PATCHES ARE POOLED (owner report 2026-10-08) ----
+    // Where a patch is narrower than SHADOW_POOL_PX, adjacent pixels land on
+    // DIFFERENT patches and most of a face's patches are sampled by nobody in
+    // any given frame. Standing still that settles; moving, every frame puts
+    // a scattering of pixels on a patch no pixel touched last frame, each one
+    // a cache MISS, and a miss shades as full sun — so mid-distance shadows
+    // SPARKLED while the camera moved (bug_reports/2026-10-08_19-45-11).
+    // So the patch grid is coarsened in powers of two until a patch is about
+    // a pixel wide, and every pixel of the coarse block reads ONE fine patch
+    // inside it (index `step * k + step / 2`, a real sub-patch, so the key,
+    // the request and the resolve are unchanged). A newly sampled patch is
+    // then as rare as a newly visible pixel-sized piece of surface. What it
+    // costs: a shadow edge here is quantised to 1.5-3 px instead of < 1 px,
+    // and it REMOVES requests rather than adding any. A few ALU ops on
+    // purpose: an 8-neighbour slot-peek on a miss was tried first and the
+    // next run sat in this file's driver compile for 40+ minutes.
+    //
+    // PER AXIS AND FORESHORTENED, which is the opposite of `patchPx`'s
+    // "face-on is conservative": for pooling it is the anti-conservative
+    // side. The reported speckle was ground ~12 m off at a grazing angle,
+    // where a patch is ~2 px wide face-on but ~0.3 px tall on screen. A
+    // tangent axis projects in proportion to its component across the view
+    // ray, so each axis pools by its own projected width.
+    let vd = normalize(hp - R.camPos);
+    let du = dot(vec3f(ta), vd);
+    let dv = dot(vec3f(tb), vd);
+    let pxU = patchPx * sqrt(max(1.0 - du * du, 0.0));
+    let pxV = patchPx * sqrt(max(1.0 - dv * dv, 0.0));
+    let stepU = min(exp2(ceil(log2(max(SHADOW_POOL_PX / max(pxU, 1e-6), 1.0)))), m);
+    let stepV = min(exp2(ceil(log2(max(SHADOW_POOL_PX / max(pxV, 1e-6), 1.0)))), m);
+    u = min(floor(u / stepU) * stepU + floor(stepU * 0.5), m - 1.0);
+    v = min(floor(v / stepV) * stepV + floor(stepV * 0.5), m - 1.0);
   }
   let i0 = i32(floor(u));
   let j0 = i32(floor(v));
@@ -13617,6 +13722,7 @@ fn fs(in : VSOut) -> FSOut {
     let spx = vec2<u32>(in.pos.xy);
     gRsOn = (spx.x & 3u) == 0u && (spx.y & 3u) == 0u;
   }
+  gFragXY = in.pos.xy;
   let ndc = in.uv;
   let rd = normalize(R.camFwd
                    + R.camRight * (ndc.x * R.tanHalfFov * R.aspect)
@@ -14074,7 +14180,7 @@ fn fs(in : VSOut) -> FSOut {
         if (sh < 1.0) {
           // Shading LOD (see lodShadeFade): the staircase's contact shadow
           // is an artefact of the sampling at this projected size.
-          sh = mix(sh, max(sh, LOD_SHADE_SHADOW_LIFT), lodShadeFade(far.t));
+          sh = lodShadowLift(sh, far.t);
         }
         // THE TERRAIN-SCALE SUN (S1, hzSunShade): a ridge farther than the
         // march reaches. After the LOD lift, which is for contact shadows:
@@ -14189,9 +14295,7 @@ fn fs(in : VSOut) -> FSOut {
       // haze in front of a cloud is airlight, which may pale the cloud toward
       // the sky but must not let the sun disc through it.
       if ((R.weatherFlags & RWF_CLOUDS) != 0u) {
-        let sp = skyColorParts(rd);
-        let cs = cloudScreenAt(in.pos.xy);
-        color = sp.glow * cs.t + (sp.full - sp.glow) * cs.td + cs.c;
+        color = skyBackdrop(rd, in.pos.xy).full;
       } else {
         color = skyColor(rd);
       }
@@ -14394,9 +14498,9 @@ fn fs(in : VSOut) -> FSOut {
           sh = sunShadowAt(hitP, n, in.pos.xy, h.t, true);
         }
       }
-      // Shading LOD: contact shadows lift with projected size (see
-      // lodShadeFade); a real cast shadow is already above the lift.
-      sh = mix(sh, max(sh, LOD_SHADE_SHADOW_LIFT), lodShadeFade(h.t));
+      // Shading LOD: contact shadows lift with projected size; a cast
+      // shadow keeps its depth while its pool is pixels wide (lodShadowLift).
+      sh = lodShadowLift(sh, h.t);
       // A ridge past every march's reach (S1, hzSunShade): the same cast-
       // shadow depth as the far field's, so a mountain's shadow crosses the
       // window seam as one shadow.

@@ -753,7 +753,18 @@ fn deckSpan(rd : vec3f, groundT : ptr<function, f32>) -> vec2f {
   // that first (terrainHitM). Looked for only as far as the deck could matter.
   let g = shellHits(hc, rd.y, min(0.0, hc - 1.0));
   *groundT = select(1e9, g.x, g.x <= g.y && rd.y < 0.0 && g.x > 0.0);
-  *groundT = min(*groundT, terrainHitM(rd, min(*groundT, TUNE_CLOUD_MAX_DIST_M + RAIN_MAX_M)));
+  //
+  // SHORT-RANGE MODE (raymarch.wgsl shortRangeCeilM, restated as ray_start.wgsl
+  // does): the frame draws no terrain past the ceiling, so the deck must not be
+  // cut by terrain past it either. Cutting it there left the hidden hills'
+  // silhouettes in the cloud image as bands of thinner haze -- the backdrop
+  // short-range fog dissolves into (ticket 2026-10-09_11-01-50).
+  var groundLook = min(*groundT, TUNE_CLOUD_MAX_DIST_M + RAIN_MAX_M);
+  if ((R.flags & 4u) != 0u) {
+    groundLook = min(groundLook, select(TUNE_SHORT_RANGE_DIST, TUNE_SHORT_RANGE_NEAR_DIST,
+                                        (R.flags & 16u) != 0u));
+  }
+  *groundT = min(*groundT, terrainHitM(rd, groundLook));
   var t0 = 0.0;
   var t1 = 0.0;
   let sLo = shellHits(hc, rd.y, lo);
