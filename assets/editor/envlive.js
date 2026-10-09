@@ -48,13 +48,19 @@ const P = (why) => ({preview: true, why});
 // table (TA_H_COND_TABLE, TA_C_*) and compared in treeInfoAt after the species
 // pick, on top of the SPECIES FILE's own band/slope. Water and cave rows: not
 // packed at all.
-const ALL_CONDS = ['minY', 'maxY', 'maxSlope', 'nearWaterMax', 'nearWaterMin', 'patchThreshold', 'canopyMin', 'canopyMax'];
+const ALL_CONDS = ['minY', 'maxY', 'maxSlope', 'nearWaterMax', 'nearWaterMin', 'patchThreshold', 'canopyMin', 'canopyMax', 'treeline'];
+// Map v2 A1: the treeline condition is the cover rows' (WM_C_TREELINE against
+// the column's treelineAt); a tree has the treeline built in and a pond is a
+// pond above it.
+const TREE_ROW_CONDS = ALL_CONDS.filter(k => k !== 'treeline');
 const COND_CANOPY = 'the canopy band is a COVER-ROW condition (P-G: WM_C_CANOPY_MIN / MAX against undergrowthSite); a tree, a water body or a cave has no canopy to read';
 function conditions(base, readSet, pkg, why) {
   const out = {};
   for (const k of ALL_CONDS)
     out[base + '.conditions.' + k] = readSet.includes(k) ? R()
-        : (k === 'canopyMin' || k === 'canopyMax') ? N('later', COND_CANOPY) : N(pkg, why);
+        : (k === 'canopyMin' || k === 'canopyMax') ? N('later', COND_CANOPY)
+        : k === 'treeline' ? N('A1', 'the treeline condition is a COVER-ROW condition (WM_C_TREELINE); trees stop at the column\u2019s treeline by construction')
+        : N(pkg, why);
   return out;
 }
 
@@ -80,6 +86,7 @@ export const LIVE = {
     'terrain.hill': R('P-G: WM_B_HILL_MUL — Q8 multiplier on the map\u2019s hill octave (256 = the map\u2019s amplitude)'),
     'terrain.detail': R('P-G: WM_B_DETAIL_MUL — Q8 multiplier on the map\u2019s detail octave'),
     'terrain.grain': R('P-G: WM_B_GRAIN_MUL — Q8 multiplier on the map\u2019s grain octave'),
+    'terrain.treelineScale': R('map v2 A1: WM_B_TREELINE_Q8 — this biome\u2019s treeline as a fraction of the map\u2019s height above the sea, blended over the four biome cells (biomeTreelineAt)'),
 
     'cover.skin': R('WM_B_SKIN'),
     'cover.skinDepth': R('WM_B_SKIN_DEPTH'),
@@ -117,7 +124,7 @@ export const LIVE = {
     'swatch.sizeM': P('the swatch side; not a world value')
   },
   conditions('cover.plants[]', ALL_CONDS, 'P-D', COND_COVER),
-  conditions('trees.species[]', ALL_CONDS, 'P-D', COND_TREE),
+  conditions('trees.species[]', TREE_ROW_CONDS, 'P-D', COND_TREE),
   conditions('water.features[]', ['minY', 'maxY', 'maxSlope'], 'later', COND_WATER),
   conditions('caves.features[]', [], 'later', COND_CAVE)),
 
@@ -139,29 +146,32 @@ export const LIVE = {
     'ground.reliefFreq': P('preview relief; not part of what the engine will read')
   },
 
-  // ---- assets/worldmap/<name>/map.json + the three planes ---------------------
+  // ---- assets/worldmap/<name>/map.json (v2) + the plane tiles ----------------
   map: {
+    'version': R('worldmap.cpp LoadWorldMap: 2 (a v1 map is refused, naming scripts/convert_map_v2.py)'),
     'name': R('identity'),
     'about': R('free text'),
-    'cellLog2': R('WM_H_CELL_LOG2'),
-    'size': R('WM_H_WIDTH / HEIGHT'),
-    'originCell': R('WM_H_ORIGIN_X / Z'),
+    'extent.min': R('WM_H_EXTENT_X0 / Z0: the authored extent\u2019s min corner, world voxels'),
+    'extent.size': R('WM_H_EXTENT_W / H: the authored extent, a multiple of the site cell'),
+    'siteCellLog2': R('WM_H_SITE_CELL_LOG2: the site index lattice (102.4 m at 10)'),
     'seaLevelY': R('WM_H_SEA_LEVEL_Y'),
-    'oceanFadeCells': R('WM_H_OCEAN_FADE'),
-    'warpAmpVox': R('the biome-edge warp'),
+    'edgeFadeVox': R('WM_H_EDGE_FADE: how far past the extent the authored height eases to planes.height.default'),
+    'warpAmpVox': R('the biome-edge warp (at most a biome cell / 4)'),
     'biomes': R('the palette: plane byte -> biome file'),
     // map-overhaul P7 (b5359be) moved the edit layer from tuning.json world.editLayer
     // to the map; 5e62edf first shipped a map that names one.
     'editLayer': R('worldmap.cpp LoadWorldMap: the assets/worldedits/<name>.svedit layer applied over this map’s worldgen as an op-stream patch (DESIGN.md §9c.4)'),
-    'sites[]': R('the site table: the pad box, the spawn site (where the game starts; the calm home area centres on it), stamps, kind "water" AUTHORED LAKES (P-F: a preset at a fixed centre, same on every seed), kind "landform" DECLARED MOUNTAINS (P-G: peak / ridge / basin / plateau overlaid onto the landform plane at load, same on every seed), and kind "tree" AUTHORED TREES (P6: a species at a column, near and far), kind "clearing" FOREST CLEARINGS (a box no crown reaches over) and kind "soften" SOFTENED GROUND (a box whose hills / bumps / grain are scaled, the village routes flatter still). Each is listed in the map cells its reach touches (at most four a cell) and keeps out by its own footprint'),
+    // map v2 L1: a locale's ref group rides the ground at its anchor; its own
+    // edit layer applies after the map's.
+    'locales[]': R('worldmap.cpp LoadWorldMap (worldmap.h LocaleDef): a hand-made place -- bounds, an anchor whose ground lifts every ref of refs/<id>.json (stored relative to anchor.y), and locales/<id>/ground.svedit merged after the map layer (DESIGN.md §9g)'),
+    'sites[]': R('the site table: the pad box, the spawn site (where the game starts; the calm home area centres on it), stamps, kind "water" AUTHORED LAKES (P-F: a preset at a fixed centre, same on every seed), and kind "tree" AUTHORED TREES (P6: a species at a column, near and far), kind "clearing" FOREST CLEARINGS (a box no crown reaches over) and kind "soften" SOFTENED GROUND (a box whose hills / bumps / grain are scaled, the village routes flatter still). Each is listed in the map cells its reach touches (at most four a cell) and keeps out by its own footprint'),
     // P-G: the terrain, per map (worldmap.h kHTerrain*), read by the height
     // mirror on both sides through the worldMap header. Every number that
     // used to be a worldgen.* knob.
     'terrain.about': R('free text'),
     'terrain.refVoxelsPerMetre': R('WM_H_TERRAIN_REF_VPM / the prelude\u2019s REF_VOXELS_PER_METRE: the scale the lengths below are authored at; LoadWorldMap rescales them to the live voxel size'),
-    'terrain.baseHeight': R('WM_H_TERRAIN_BASE_HEIGHT: the world datum, the mean ground height'),
-    'terrain.landformRangeVox': R('WM_H_TERRAIN_LANDFORM_RANGE: what a painted landform 0..255 spans, centred on 128 (was worldgen.contAmplitude)'),
-    'terrain.rangeAmplitude': R('WM_H_TERRAIN_RANGE_AMPLITUDE: the seeded range octave under the plane'),
+    'terrain.baseHeight': R('WM_H_TERRAIN_BASE_HEIGHT: the authored height when no plane is loaded (map v2: the height plane is the ground)'),
+    'terrain.rangeAmplitude': R('WM_H_TERRAIN_RANGE_AMPLITUDE: the seeded range octave on the authored height (the rung the biome curve shapes)'),
     'terrain.rangeLog2': R('WM_H_TERRAIN_RANGE_LOG2'),
     'terrain.hillAmplitude': R('WM_H_TERRAIN_HILL_AMPLITUDE (each biome scales it by its terrain.hill)'),
     'terrain.hillLog2': R('WM_H_TERRAIN_HILL_LOG2'),
@@ -170,10 +180,11 @@ export const LIVE = {
     'terrain.grainAmplitude': R('WM_H_TERRAIN_GRAIN_AMPLITUDE (scaled per biome by terrain.grain)'),
     'terrain.grainLog2': R('WM_H_TERRAIN_GRAIN_LOG2'),
     'terrain.fbmAtten': R('WM_H_TERRAIN_FBM_ATTEN: iq\u2019s derivative attenuation, Q8; the rule-2 mechanism that keeps the ladder under the angle of repose'),
-    'terrain.homeArea.y': R('WM_H_TERRAIN_HOME_Y: the calm home area\u2019s ground height around the spawn site (was spawnPlainY)'),
     'terrain.homeArea.radius': R('WM_H_TERRAIN_HOME_R: Chebyshev radius held calm (was spawnPlainR)'),
-    'terrain.homeArea.fade': R('WM_H_TERRAIN_HOME_FADE: how far past it the coarse relief ramps back (was spawnPlainFade; the terrain gate\u2019s A4 measures the slope it builds)'),
-    'terrain.sedCeil': R('WM_H_TERRAIN_SED_CEIL: the sediment wedge (was sedCeil)'),
+    'terrain.homeArea.fade': R('WM_H_TERRAIN_HOME_FADE: how far past it the range rung ramps back (was spawnPlainFade; the terrain gate\u2019s A4 measures the slope it builds)'),
+    'terrain.sedAbove': R('WM_H_TERRAIN_SED_ABOVE: the sediment wedge, relative to the authored ground (was the absolute sedCeil)'),
+    'terrain.treelineJitter': R('WM_H_TERRAIN_TREELINE_JITTER: +- wobble of every column\u2019s treeline'),
+    'terrain.rockSlope': R('WM_H_TERRAIN_ROCK_SLOPE: steep columns skin as rock (colSteep)'),
     'terrain.sedFraction': R('WM_H_TERRAIN_SED_FRACTION'),
     'terrain.sedStrip': R('WM_H_TERRAIN_SED_STRIP'),
     'terrain.sedSlope': R('WM_H_TERRAIN_SED_SLOPE: the wedge\u2019s slope gate, a rule-2 knob (0 = off)'),
@@ -181,9 +192,10 @@ export const LIVE = {
     'terrain.sedTopsoil': R('WM_H_TERRAIN_SED_TOPSOIL'),
     'terrain.treeline': R('WM_H_TERRAIN_TREELINE: snow and no trees at or above this ground Y'),
     'rules[]': R('seeded per-biome stamp placement'),
-    'planes.biome': R('mapBiomeAt'),
-    'planes.landform': R('mapLandformQ8: owns the continental rung of the height'),
-    'planes.moisture': N('later', 'packed (WM_H_MOISTURE_PLANE) and read by nothing; no package claims it yet')
+    'roads[]': R('map v2 R1 roads: {id, name?, points [[x, z]...], width, shoulder, surface (a SOLID material), maxGrade %, kind road|track|path, depth?} -- worldmap.cpp bakes a grade-limited profile from the bare ground and cuts it into kSiteRoad pieces; the height mirror levels the ground to it (roadPadAt), genCellIn lays the surface, trees / cover / tarns keep off it, the far field tints the cells it crosses (DESIGN.md, map v2 R1)'),
+    'planes.height': R('mapHeightAt: the AUTHORED absolute height, i16 voxels on 2^log2 posts, Catmull-Rom; tiles planes/height/<tx>_<tz>.svt'),
+    'planes.biome': R('mapBiomeAt / biomeMixAt: biome cells of 2^log2 voxels; tiles planes/biome/<tx>_<tz>.svt'),
+    'ridges[]': N('editor', 'baked into planes.height; the engine reads the plane')
   }
 };
 

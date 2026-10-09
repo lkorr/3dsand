@@ -1860,7 +1860,6 @@ def check_worldmap_layout():
              "kCoverRowWords": "WM_C_WORDS", "kC_HeightVox": "WM_C_HEIGHT",
              "kC_PatchThreshold": "WM_C_PATCH_THRESH", "kHBiomeRecords": "WM_H_BIOME_RECORDS",
              "kHMaxCoverH": "WM_H_MAX_COVER_H", "kB_MaxCoverH": "WM_B_MAX_COVER_H",
-             "kHLandformPlane": "WM_H_LANDFORM_PLANE", "kHMoisturePlane": "WM_H_MOISTURE_PLANE",
              "kSiteRecWords": "WM_S_WORDS", "kStampHdrWords": "WM_STAMP_HDR_WORDS",
              "kS_PadMargin": "WM_S_PAD_MARGIN", "kS_StampOff": "WM_S_STAMP_OFF",
              "kStamp_NX": "WM_STAMP_NX", "kStamp_NY": "WM_STAMP_NY", "kStamp_NZ": "WM_STAMP_NZ",
@@ -1878,6 +1877,8 @@ def check_worldmap_layout():
              "kSiteClearing": "WM_SITE_CLEARING",
              # softened ground, the waynode routes, the per-tree building rule
              "kSiteSoften": "WM_SITE_SOFTEN", "kSitePath": "WM_SITE_PATH",
+             # map v2 R1: the road piece kind
+             "kSiteRoad": "WM_SITE_ROAD",
              "kStampTreeClear": "WM_STAMP_TREE_CLEAR",
              "kRouteSoftInner": "WM_ROUTE_SOFT_INNER", "kRouteSoftOuter": "WM_ROUTE_SOFT_OUTER"}
     for m in re.finditer(r"\b(kBiomeRecWords|kCoverRowWords|kSiteRecWords|kStampHdrWords|kWaterRecWords|kShoreRowWords|kWaterRowWords)\s*=\s*(\d+)", hdr):
@@ -3234,7 +3235,7 @@ _HEAT_CONSTS = {
     "HF_EMIT": "kHfEmit", "HF_SRC": "kHfSrc", "HF_RECOMP": "kHfRecomp",
     "HF_RELAX": "kHfRelax", "HF_NEW": "kHfNew", "HS_SOURCE": "kHsSource",
     "HS_NONZERO": "kHsNonzero", "HP_MODE": "kHpMode", "HP_RADIUS": "kHpRadius",
-    "HP_SNOWLINE_Y": "kHpSnowlineY", "HP_SNOW_BASE": "kHpSnowBase",
+    "HP_LAPSE": "kHpLapse", "HP_SEA_Y": "kHpSeaY", "HP_SNOW_BASE": "kHpSnowBase",
     "HP_SNOW_SWING": "kHpSnowSwing", "HP_PROBE": "kHpProbe", "HP_PROBE_ON": "kHpProbeOn",
     "HP_GAIN": "kHpGain", "HP_UP_GAIN": "kHpUpGain", "HP_SIDE_GAIN": "kHpSideGain",
     "HP_DOWN_GAIN": "kHpDownGain", "HEAT_GAIN_ONE": "kHeatGainOne", "HP_BIOME": "kHpBiome", "HP_MAT": "kHpMat",

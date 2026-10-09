@@ -328,6 +328,8 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
 
   std::vector<BiomeStat> stats;
   std::vector<int16_t> hcol(static_cast<size_t>(N) * N);
+  // Each column's own treeline (map v2 A1: worldmap::TreelineAt), beside its height.
+  std::vector<int16_t> tlcol(static_cast<size_t>(N) * N);
   std::vector<uint8_t> elig(static_cast<size_t>(N) * N);
   bool gpuState = false;   // an environment other than the real one is uploaded
 
@@ -347,8 +349,10 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
     // ---- B. the synthetic one-biome map --------------------------------------
     worldmap::WorldMapData syn = real;
     std::fill(syn.biome.begin(), syn.biome.end(), static_cast<uint8_t>(b.index));
-    std::fill(syn.landform.begin(), syn.landform.end(), static_cast<uint8_t>(128));   // mapLandformQ8's "flat"
-    std::fill(syn.moisture.begin(), syn.moisture.end(), static_cast<uint8_t>(128));
+    // Flat authored ground at the terrain's datum (map v2's height plane; v1
+    // filled the landform plane with 128, the same datum): only the seeded
+    // noise shapes it.
+    std::fill(syn.height.begin(), syn.height.end(), static_cast<int16_t>(syn.terrain.baseHeight));
     syn.sites.clear();
     syn.siteIndex.assign(syn.siteIndex.size(), 0);
     // No pad box (crownMeetsPad and padOutside both read x1 < x0 as "none").
@@ -391,7 +395,7 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
     const uint32_t nRows = R[worldmap::kB_CoverCount];
     const uint32_t* rows = words.data() + R[worldmap::kB_CoverOff];
     const double chanceQ16 = R[worldmap::kB_TreeChanceQ16] / 65536.0;
-    struct Row { uint32_t mat, head, chance; int minY, maxY, nwMax, nwMin, patch, canopyMin, canopyMax; double pf; };
+    struct Row { uint32_t mat, head, chance; int minY, maxY, nwMax, nwMin, patch, canopyMin, canopyMax, tl; double pf; };
     std::vector<Row> rowv;
     for (uint32_t i = 0; i < nRows; i++) {
       const uint32_t* r = rows + static_cast<size_t>(i) * worldmap::kCoverRowWords;
@@ -400,6 +404,7 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
       row.minY = static_cast<int32_t>(r[worldmap::kC_MinY]); row.maxY = static_cast<int32_t>(r[worldmap::kC_MaxY]);
       row.nwMax = static_cast<int32_t>(r[worldmap::kC_NearWaterMax]); row.nwMin = static_cast<int32_t>(r[worldmap::kC_NearWaterMin]);
       row.canopyMin = static_cast<int>(r[worldmap::kC_CanopyMin]); row.canopyMax = static_cast<int>(r[worldmap::kC_CanopyMax]);
+      row.tl = static_cast<int>(r[worldmap::kC_Treeline]);
       row.patch = std::max(bThresh, static_cast<int>(r[worldmap::kC_PatchThreshold]));
       row.pf = PatchPassFraction(row.patch, pLog2);
       rowv.push_back(row);
@@ -428,7 +433,9 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
         const size_t idx = static_cast<size_t>(z) * N + x;
         const int h = World::TerrainHeight(wx, wz, kDefaultSeed);
         hcol[idx] = static_cast<int16_t>(h);
-        bool ok = h < treeline && h - skinDepth >= y0 && h + 1 < y0 + N;
+        const int tl = worldmap::TreelineAt(wx, wz, kDefaultSeed);
+        tlcol[idx] = static_cast<int16_t>(std::clamp(tl, -32000, 32000));
+        bool ok = h < tl && h - skinDepth >= y0 && h + 1 < y0 + N;
         if (ok) {
           const World::PondQuery pq = World::PondNearColumn(wx, wz, kDefaultSeed);
           ok = !pq.inDisc && !pq.near;
@@ -450,6 +457,9 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
           double p = 1.0 / r.chance;
           if (r.minY >= 0 && h < r.minY) p = 0;
           if (r.maxY >= 0 && h > r.maxY) p = 0;
+          // The treeline condition (kC_Treeline): an eligible column is below
+          // its treeline, so a "below" row passes and an "above" row never does.
+          if (r.tl == 2) p = 0;
           p *= r.pf;
           // A nearWater or a canopy condition has no CPU twin: hi only.
           const bool bounded = r.nwMax >= 0 || r.nwMin > 0 || r.canopyMin > 0 || r.canopyMax < 255;
@@ -486,7 +496,7 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
           const int wz = tz * T + inset + static_cast<int>((hsh >> 9u) % span);
           if (wx < x0 || wx >= x0 + N || wz < z0 || wz >= z0 + N) continue;
           const int h = hcol[static_cast<size_t>(wz - z0) * N + (wx - x0)];
-          if (h >= treeline || h + 1 < y0 || h + 1 >= y0 + N) continue;
+          if (h >= tlcol[static_cast<size_t>(wz - z0) * N + (wx - x0)] || h + 1 < y0 || h + 1 >= y0 + N) continue;
           if (World::PondNearColumn(wx, wz, kDefaultSeed).inDisc) continue;
           st.sites++;
           {   // the readback band must reach the site's trunk cell too
@@ -553,7 +563,7 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
           for (int x = 0; x < N; x++) {
             const size_t idx = static_cast<size_t>(z) * N + x;
             const int h = hcol[idx];
-            if (siteMark[idx] && h + 1 >= y0 && h + 1 + trunkMaxLy < y0 + N && h < treeline) {
+            if (siteMark[idx] && h + 1 >= y0 && h + 1 + trunkMaxLy < y0 + N && h < tlcol[idx]) {
               for (const auto& tb : trunkBase)
                 if (wordAt(x, h + 1 + tb.first, z) == tb.second) { st.treesMeasured++; break; }
             }

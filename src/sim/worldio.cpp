@@ -494,19 +494,23 @@ WorldgenFingerprint ComputeWorldgenFingerprint(const std::string& assetDir,
     fp.parts[0] = Fnv32(norm.data(), norm.size());
   }
   // [1..3] the authored environment, with the stamp the tuner already mirrors.
-  // The map part covers map.json, map.svmap and the sculpt layer (P5).
+  // The map part covers map.json, the plane tiles (map v2) and the sculpt layer
+  // (biomes::HashMapFiles).
   const std::string mapName = worldmap::ActiveMapName(CurrentTuning().world.mapLayer);
   const biomes::EnvironmentStamp env = biomes::StampEnvironment(assetDir, mapName);
   fp.parts[1] = env.map;
   fp.parts[2] = env.biomes;
   fp.parts[3] = env.trees;
   // [4] the edit layer genChunk's output is always patched with (worldedit.h):
-  // the one the loaded map names (map.json `editLayer`, P7). Chunks the layer
-  // alone touched are not stored, so they regenerate from this on load.
-  const std::string& edit = worldmap::CurrentWorldMap().editLayer;
-  if (!edit.empty())
-    fp.parts[4] = sandvox::HashOneFile(assetDir + "/worldedits/" + edit + ".svedit",
-                                       edit + ".svedit");
+  // the one the loaded map names (map.json `editLayer`, P7), then each of its
+  // locales' (L1). Chunks the layer alone touched are not stored, so they
+  // regenerate from this on load. Exactly HashOneFile of the map's layer when
+  // the map has no locale layers.
+  {
+    const worldmap::WorldMapData& cm = worldmap::CurrentWorldMap();
+    fp.parts[4] = worldmap::HashEditLayerFiles(
+        worldmap::MapEditLayerFiles(assetDir, cm.name, cm.editLayer, cm.locales));
+  }
   // [5] the material NAME table, in id order, NUL-separated.
   {
     uint32_t h = 2166136261u;

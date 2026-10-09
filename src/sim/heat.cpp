@@ -32,14 +32,35 @@ HeatClimate HeatSnowlineClimate() {
   return c;
 }
 
-// The snow caps start at treeline - 1 (worldgen.wgsl: snow at y > h - 2 for
-// h >= treeline), so that is where the frozen climate begins.
-int32_t HeatSnowlineY() { return worldmap::CurrentTerrain().treeline - 1; }
+// The snow caps start at the column's treeline - 1 (worldgen.wgsl: snow at
+// y > h - 2 for h >= Col.tl), so that is where the frozen climate begins.
+int32_t HeatSnowlineYAt(int x, int z, uint32_t seed) { return worldmap::TreelineAt(x, z, seed) - 1; }
+
+int32_t HeatLapseAt(int y) {
+  const int lapse = std::clamp(CurrentTuning().sim.heatLapsePerKm, 0, 64);
+  return (std::max(y - worldmap::CurrentWorldMap().seaLevelY, 0) * lapse) / (1000 * kVoxelsPerMetre);
+}
+
+int32_t HeatFreezingLevelY(int x, int z, uint32_t seed) {
+  const int32_t snow = HeatSnowlineYAt(x, z, seed);
+  const int32_t sea = worldmap::CurrentWorldMap().seaLevelY;
+  const int32_t base = HeatBiomeClimate(World::MapBiomeAt(x, z, seed)).base;
+  if (base <= 0) return std::min(snow, sea);
+  const int lapse = std::clamp(CurrentTuning().sim.heatLapsePerKm, 0, 64);
+  if (lapse <= 0) return snow;
+  // HeatLapseAt's inverse: (y - sea) * lapse / (1000 * vpm) reaches `base`.
+  // base <= 63 and 1000 * vpm = 10^4: the product is far inside i32.
+  const int32_t y = sea + (base * 1000 * kVoxelsPerMetre + lapse - 1) / lapse;
+  return std::min(snow, y);
+}
 
 int32_t HeatAmbientCpu(int x, int y, int z, uint32_t seed, bool day) {
-  const HeatClimate c = y >= HeatSnowlineY()
-                            ? HeatSnowlineClimate()
-                            : HeatBiomeClimate(World::MapBiomeAt(x, z, seed));
+  if (y >= HeatSnowlineYAt(x, z, seed)) {
+    const HeatClimate c = HeatSnowlineClimate();
+    return day ? c.Day() : c.Night();
+  }
+  HeatClimate c = HeatBiomeClimate(World::MapBiomeAt(x, z, seed));
+  c.base -= HeatLapseAt(y);
   return day ? c.Day() : c.Night();
 }
 

@@ -36,9 +36,10 @@ def terrain_defaults(root):
     """The map terrain block's DEFAULTS, in map.json's shape, read from
     src/sim/worldmap.h `struct TerrainParams` -- the values the engine uses for
     any key a map.json `terrain` block omits. The ONE copy: the tuner server
-    serves it to the World map page (/api/worldmap/terrain-defaults) and
-    scripts/seed_worldmap.py writes it into a new map; neither keeps its own.
-    homeY / homeR / homeFade are map.json's homeArea.{y, radius, fade}."""
+    serves it to the World map page (/api/worldmap/terrain-defaults); it keeps
+    no copy of its own.
+    homeR / homeFade are map.json's homeArea.{radius, fade} (map v2 A1
+    retired homeArea.y: the authored height plane is the home ground)."""
     import re
     with open(os.path.join(root, "src", "sim", "worldmap.h"), encoding="utf-8") as f:
         src = f.read()
@@ -46,7 +47,7 @@ def terrain_defaults(root):
     if not m:
         raise RuntimeError("worldmap.h: struct TerrainParams not found")
     body = re.sub(r"//[^\n]*", "", m.group(1))
-    home_keys = {"homeY": "y", "homeR": "radius", "homeFade": "fade"}
+    home_keys = {"homeR": "radius", "homeFade": "fade"}
     out = {}
     for k, v in re.findall(r"(\w+)\s*=\s*(-?\d+)", body):
         if k in home_keys:
@@ -54,7 +55,7 @@ def terrain_defaults(root):
         else:
             out[k] = int(v)
     if set(out.get("homeArea", {})) != set(home_keys.values()):
-        raise RuntimeError("worldmap.h: TerrainParams lost homeY/homeR/homeFade")
+        raise RuntimeError("worldmap.h: TerrainParams lost homeR/homeFade")
     return out
 
 

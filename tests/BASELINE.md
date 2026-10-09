@@ -1304,3 +1304,32 @@ debris, gas crosses the op wire.
   save-entities, save-items, save-avatar-body, mob-save-delta, mob-handoff,
   blast-players, ops-exchange, determinism, ops-replay: all PASS, 0 page
   faults.
+
+## 2026-10-08 — map v2 A1 (altitude correctness): `determinismHash` 39b3de48 -> 66d04733, `heat-ambient` recorded fail
+
+Intentional moves, every one of them in worldgen or the heat ambient: the
+per-column jittered treeline (biome `treelineScale`; snow cap, trees, cacti,
+shore fringe, ice, cover rows' new `treeline` condition), the sediment wedge
+relative to the authored ground (`sedAbove`), band-2 caves 24..31 m under the
+column's ground, the lava clearance, steep rock (`rockSlope` 640), the lapse
+rate (`sim.heatLapsePerKm` 6) and the per-column snowline in the heat column
+table (now one word per column, tiled by chunk column). On the HARNESS map most
+of these are the identity (its treeline jitter is 0, its ground is ~y 200 where
+the relative wedge equals the absolute one and band 2 lands where it was), but
+the treeline scales (tundra 0.85, alpine 0.9, pine 1.05) and steep rock move
+it. Recorded with `--verify ... --rebaseline`.
+
+- New gate `altitude` (pass): on the `peaks` map, the spawn window, the
+  per-biome jittered treeline, the lapse rate, lava clearance under the gorge,
+  a uniform +200 raise translating the bare ground exactly (8 columns,
+  home area included), CPU + GPU sediment on the 900 m valley floor, rock and
+  <= 32 active chunks on the cliff band.
+- `heat-ambient` recorded `fail`, part D only: one tundra snow grain slides
+  into a forest column on the default map and melts (see
+  `_heatAmbientKnown_about` in baseline.json for the voxels and the owner
+  options). Attributed to the relative sediment wedge moving that lowland's
+  ground; not compensated.
+- The same rebaseline refreshed `terrain.*Observed` / `reliefVox` /
+  `surfaceMinY` and the `envTruthTreesPerHa_*` observations, last written by
+  the P-G rebaseline (0b63a10) -- they are observations, not thresholds, and
+  were stale from before map v2.

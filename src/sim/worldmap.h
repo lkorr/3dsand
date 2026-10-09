@@ -2,11 +2,16 @@
 // worldgen samples instead of deriving biome and landform from noise.
 //
 // WHAT THIS IS. `assets/worldmap/<name>/` is one map: `map.json` (the
-// diffable half -- cell size, extent, the biome roster that DEFINES the id
-// space, hand-placed sites, seeded placement rules) beside `map.svmap` (the
-// painted half -- three u8 planes: biome, landform, moisture). It is authored
-// on the tuner's Environment -> World map page and named by `world.mapLayer`
-// in tuning.json (the map in turn names its `.svedit` edit layer, P7).
+// diffable half -- version 2: the extent, the plane lattices, the biome
+// roster that DEFINES the id space, hand-placed sites, seeded placement
+// rules) beside `planes/<plane>/<tx>_<tz>.svt` (the painted half, TILED: an
+// absolute HEIGHT plane in i16 voxels at 6.4 m posts and a u8 BIOME plane at
+// 25.6 m, 256 x 256 samples a tile, an absent tile = the plane's default).
+// It is authored on the tuner's Environment -> World map page and named by
+// `world.mapLayer` in tuning.json (the map in turn names its `.svedit` edit
+// layer, P7). docs/PLAN_map_v2.md "The v2 map format" is the contract; a v1
+// map (map.svmap) is refused with the converter's name,
+// scripts/convert_map_v2.py.
 //
 // WHY A MAP AND NOT MORE NOISE. docs/RESEARCH_worldgen.md §8 asked the
 // question and answered it: a falling-sand sandbox's replay value is in the
@@ -16,7 +21,7 @@
 // because random terrain kept eating the test fixtures. §8.3 asked that the
 // swap be "one function so that replacing analytic climate noise with a
 // bilinear lookup into a coarse map buffer is a one-function change". This
-// header is that buffer; `mapBiomeAt`/`mapLandformQ8` in worldgen.wgsl are
+// header is that buffer; `mapBiomeAt`/`mapHeightAt` in worldgen.wgsl are
 // that function.
 //
 // THE THREE TIERS (RESEARCH_worldgen §8.2), because the seed discipline is
@@ -33,9 +38,10 @@
 //
 // FINITE MAP, INFINITE ENGINE. Nothing here bounds the world: i32 world
 // coordinates, the toroidal residency window and `Stream::ShiftAxis` are all
-// untouched and must stay that way. Outside the painted extent the landform
-// plane fades to zero over `oceanFadeCells` and the biome is `ocean`, so the
-// world keeps going as open water rather than ending at a wall.
+// untouched and must stay that way. Outside the painted extent the authored
+// height eases to the height plane's default over `edgeFadeVox` and the biome
+// is the biome plane's default (ocean), so the world keeps going as open
+// water rather than ending at a wall.
 //
 // DETERMINISM (rule 1). The map is a new INPUT beside the seed, not a source
 // of runtime state: every read is a pure function of (world coords, map
@@ -53,7 +59,9 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 #include "sim/heat.h"
 
@@ -71,27 +79,32 @@ namespace worldmap {
 enum : uint32_t {
   kHMagic = 0,        // 'SVMP'
   kHVersion = 1,
-  kHCellLog2 = 2,     // log2 of the map cell in voxels (10 = 1024 vox = 102.4 m)
-  kHWidth = 3,        // plane width in cells
-  kHHeight = 4,       // plane height in cells
-  kHOriginX = 5,      // i32: world voxel X of plane cell (0,0)
-  kHOriginZ = 6,      // i32: world voxel Z of plane cell (0,0)
+  // THE SITE INDEX LATTICE (map.json `siteCellLog2`): the per-cell site lists
+  // (kHSiteIndex) and nothing else. Since map v2 the height and biome planes
+  // have their own lattices (kHHeight* / kHBiome* below); this one stays
+  // coarse because a site list is per cell, not per sample.
+  kHSiteCellLog2 = 2, // log2 of the site cell in voxels (10 = 1024 vox = 102.4 m)
+  kHSiteW = 3,        // site index plane width in site cells
+  kHSiteH = 4,        // site index plane height in site cells
+  kHSiteOriginX = 5,  // i32: the site-plane CELL INDEX of the cell whose low
+  kHSiteOriginZ = 6,  //   corner is world voxel (0, 0), i.e. -(extent.min >> log2)
   kHSeaLevelY = 7,    // world voxel Y of the sea plane
-  kHOceanFade = 8,    // cells over which landform fades to 0 outside the plane
+  kHEdgeFade = 8,     // voxels over which the authored height eases to the
+                      // height plane's default outside the extent (map.json edgeFadeVox)
   kHWarpAmp = 9,      // biome-boundary warp amplitude, in voxels
   kHBiomeCount = 10,
   kHBiomeRecords = 11,  // word offset: per-biome record table
-  kHBiomePlane = 12,    // word offset: biome plane, 4 cells per word
-  kHLandformPlane = 13, // word offset: landform plane, 4 cells per word
-  kHMoisturePlane = 14, // word offset: moisture plane, 4 cells per word
-  kHSiteIndex = 15,     // word offset: per-cell site index
+  kHBiomePlane = 12,    // word offset: biome plane, 4 posts per word, 0 = no planes
+  kHHeightPlane = 13,   // word offset: height plane, 2 i16 posts per word, 0 = no planes
+  kHHeightDefault = 14, // i32: planes.height.default, the height an absent tile and the far ocean hold
+  kHSiteIndex = 15,     // word offset: per-site-cell site index
   kHSiteTable = 16,     // word offset: site records
   kHSiteCount = 17,
   kHStampRuns = 18,     // word offset: stamp template run-lists
-  kHContentHash = 19,   // FNV-1a of both files; reported at boot
+  kHContentHash = 19,   // FNV-1a of the map's files; reported at boot
   kHMaxCoverH = 20,     // max over every biome of kB_MaxCoverH: the far
                         // cascade's blocker band has no biome in hand
-  kHOceanBiome = 21,    // biome id returned outside the painted planes
+  kHBiomeDefault = 21,  // biome id returned outside the extent (planes.biome.default)
   // The harness site (map.json sites[], kind "pad"): a world-voxel box that
   // keeps the selftest fixtures' ground clear of trees, tarns and cover. It
   // replaced the spawn clearing / fixture pads / pond keep-out literals in
@@ -130,8 +143,12 @@ enum : uint32_t {
   // identical inside the mirror). Lengths are VOXELS at the live voxel size
   // (LoadWorldMap rescaled them from the map's refVoxelsPerMetre); log2 cells
   // are shifts; fbmAtten / sedFraction / sedSlope are dimensionless.
-  kHTerrainBaseHeight = 32,      // the world datum: mean ground height
-  kHTerrainLandformRange = 33,   // what a painted landform 0..255 spans, voxels (was contAmplitude)
+  kHTerrainBaseHeight = 32,      // the authored height when NO plane is loaded (tools, P0/P1)
+  // Map v2 A1 (docs/PLAN_map_v2.md): word 33 was kHTerrainLandformRange (the
+  // v1 u8 landform plane's span). The treeline's seeded wobble: treelineAt
+  // adds +-this many voxels of 25.6 m value noise so the treeline is not a
+  // ruled contour. 0 = a ruled line (the harness map).
+  kHTerrainTreelineJitter = 33,
   kHTerrainRangeAmplitude = 34,  // the seeded octave ladder under the plane
   kHTerrainRangeLog2 = 35,
   kHTerrainHillAmplitude = 36,
@@ -141,16 +158,31 @@ enum : uint32_t {
   kHTerrainGrainAmplitude = 40,
   kHTerrainGrainLog2 = 41,
   kHTerrainFbmAtten = 42,        // Q8 derivative attenuation, 0..256
-  kHTerrainHomeY = 43,           // the calm home area (was spawnPlainY/R/Fade)
-  kHTerrainHomeR = 44,
+  // Map v2 A1: word 43 was kHTerrainHomeY, the height the calm home area
+  // faded the coarse relief toward. The authored plane is the author's now and
+  // the calm fade flattens only the range rung's NOISE, so no word reads a Y.
+  // STEEP ROCK: a column whose landform slope (Land.slope, Q8) is at or above
+  // this skins as the biome's rock (coverFirmMat) and wears no snow cap and no
+  // cover row -- powder on a cliff never sleeps (rule 2), and grass on one
+  // does not read as a cliff. 0 = off.
+  kHTerrainRockSlope = 43,
+  kHTerrainHomeR = 44,        // the calm home area (was spawnPlainR/Fade)
   kHTerrainHomeFade = 45,
-  kHTerrainSedCeil = 46,         // the sediment wedge (was sed*)
+  // The sediment wedge (was sed*). SED_ABOVE is RELATIVE (map v2 A1): the
+  // wedge fills where the noise sits below the AUTHORED ground (plane + sculpt)
+  // + this many voxels, so a high valley carries sediment like a low one. It
+  // was the absolute kHTerrainSedCeil (y 264), which put every column above
+  // 26 m dry.
+  kHTerrainSedAbove = 46,
   kHTerrainSedFraction = 47,
   kHTerrainSedStrip = 48,
   kHTerrainSedSlope = 49,
   kHTerrainSedMax = 50,
   kHTerrainSedTopsoil = 51,
-  kHTerrainTreeline = 52,        // snow and no trees at or above this ground Y
+  // THE MAP'S TREELINE, absolute ground Y. A column's own (treelineAt) is
+  // sea + (this - sea) * the biome's treelineScale, blended like the relief,
+  // + the jitter: snow and no trees at or above it.
+  kHTerrainTreeline = 52,
   kHTerrainRefVpm = 53,          // the voxels-per-metre the map's terrain was authored at
   // THE SCULPT LAYER (P5 of docs/PLAN_map_overhaul.md): word offset of the
   // packed sculpt block (kSculpt* / kSc_* below), 0 = the map has none. 0 is
@@ -158,7 +190,31 @@ enum : uint32_t {
   // zero offset for it, which is the whole "empty layer = byte-identical
   // world" argument.
   kHSculpt = 54,
-  kHeaderWords = 64,    // padded, like treeatlas::kFileHeaderWords
+  // ---- MAP V2: the extent and the two fine planes (docs/PLAN_map_v2.md) ------
+  // The authored extent, world voxels: [X0, X0 + W] x [Z0, Z0 + H]. A plane of
+  // log2 L has (W >> L) + 1 x (H >> L) + 1 POSTS, post (i, k) at world
+  // (X0 + i << L, Z0 + k << L): the last post sits ON the max edge. Packed
+  // dense, z-major (index = k * postsX + i): the height plane two i16 per
+  // word (low half first), the biome plane four u8 per word (little-endian).
+  // The height plane is interpolated (Catmull-Rom over the 4 x 4 posts,
+  // worldgen.wgsl mapHeightAt); a biome post is the CELL centred half a cell
+  // past it (biomeCellAt), and biomeMixAt blends cell centres bilinearly.
+  kHExtentX0 = 55,      // i32
+  kHExtentZ0 = 56,      // i32
+  kHExtentW = 57,
+  kHExtentH = 58,
+  kHHeightLog2 = 59,    // 3..6 (the Catmull-Rom's i32 bounds are argued for f < 64)
+  kHHeightPostsX = 60,
+  kHHeightPostsZ = 61,
+  kHBiomeLog2 = 62,
+  kHBiomePostsX = 63,
+  kHBiomePostsZ = 64,
+  // Map v2 A1: the highest any column's treeline can be (PackWorldMap, over
+  // every biome's treelineScale and the jitter) -- the world-wide bound
+  // treeMaxTop gives the sky early-outs (cacti: per column, worldgen.wgsl
+  // cactusColTop). Read by the GPU only.
+  kHTreelineMax = 65,
+  kHeaderWords = 72,    // padded, like treeatlas::kFileHeaderWords
 };
 
 // ---- the sculpt layer (P5) ---------------------------------------------------
@@ -168,7 +224,7 @@ enum : uint32_t {
 // adds it to the ground in landAt (both sides) after the octave ladder and the
 // calm-area fade and BEFORE the sediment wedge, the ponds, the sea test and the
 // site pads, so everything downstream reacts to the sculpted ground. It is the
-// tier between the 102 m landform cell and the single voxel (.svedit).
+// tier between the 6.4 m height post and the single voxel (.svedit).
 //
 // GEOMETRY. One sample every 2^kSculptSpacingLog2 = 8 voxels (0.8 m), bilinear
 // between samples; a TILE is 32 x 32 samples = 256 voxels (25.6 m) square; a
@@ -218,14 +274,38 @@ inline constexpr int kSculptTileSamples = 1 << kSculptTileLog2;   // 32
  *  set whose bounding box needs more is refused, not silently allocated. The
  *  whole shipped 196 x 196-cell map is 38,416. */
 inline constexpr int64_t kSculptMaxRegions = int64_t(1) << 22;
-// Planes are packed FOUR CELLS PER WORD, little-endian: cell i of a plane at
-// word (off + (i >> 2)), byte (i & 3); i = cz * width + cx. The biome plane's
-// bytes are biome IDS (map.json's palette resolved by name at load), never
-// palette indices, so the shader does one lookup.
+// The biome plane's bytes in the BUFFER are biome IDS (map.json's palette
+// resolved by name at load), never palette indices, so the shader does one
+// lookup. Its tiles on disk hold palette indices.
 
-// The magic in both the file and the buffer header: 'SVMP', little-endian.
+// The magic of the buffer header: 'SVMP', little-endian. Version 2 = map v2.
 inline constexpr uint32_t kMagic = 0x504D5653u;
-inline constexpr uint32_t kVersion = 1u;
+inline constexpr uint32_t kVersion = 2u;
+
+// ---- the plane tiles on disk (map v2) -----------------------------------------
+// assets/worldmap/<name>/planes/<plane>/<tx>_<tz>.svt, one per 256 x 256 posts
+// (tile index = post index >> 8). Little-endian: u32 kTileMagic, u32 plane kind
+// (kPlaneHeight | kPlaneBiome), i32 tx, i32 tz, u32 w, u32 h (both kTileSide,
+// edge tiles too: samples past the plane are ignored), u32 sample bytes
+// (2 | 1), u32 reserved 0; then w*h samples, z-major. Absent tile = every
+// sample is the plane's `default`.
+inline constexpr uint32_t kTileMagic = 0x31545653u;   // 'SVT1'
+inline constexpr uint32_t kPlaneHeight = 1u;
+inline constexpr uint32_t kPlaneBiome = 2u;
+inline constexpr int kTileSide = 256;
+inline constexpr int kTileHeaderBytes = 32;
+// The authored height's bound, voxels (+-3.2 km): every encoding downstream
+// (farMap u16 biased, wind i16, sculpt i16, chunk keys) holds it, and the
+// Catmull-Rom's i32 products are argued for it (worldgen.wgsl crStep).
+inline constexpr int kHeightLimit = 32000;
+// A terrain noise amplitude's ceiling, voxels (map.json terrain.*Amplitude):
+// with a biome multiplier of at most 16x (kB_*Mul <= 4096 Q8) the octave's
+// n.dx * amp product stays under 2^31 (24575 * 65536 = 1.6e9; worldgen.wgsl
+// octave()).
+inline constexpr int kNoiseAmpMax = 4096;
+// The treeline jitter's ceiling, voxels (map.json terrain.treelineJitter):
+// treelineAt's ((n - 8192) * jitter) >> 13 stays under 2^26.
+inline constexpr int kTreelineJitterMax = 4096;
 
 // ---- the biome record table (P1) -------------------------------------------
 // One fixed-stride record per biome id, at `kHBiomeRecords`, followed by the
@@ -283,9 +363,9 @@ enum : uint32_t {
   // Nine Q14 relief-curve knots (i32 in u32; the identity is -16384 + i*4096)
   // and three Q8 multipliers on the map's hill / detail / grain amplitudes
   // (256 = the map's own). The height mirror reads them through biomeCurve /
-  // biomeReliefAt, BILINEARLY over the four map cells around the column (the
-  // landform plane's own lattice), so two biomes' curves crossfade over a
-  // whole 102 m cell and never meet on a cliff. Packed by PackBiomeTerrain,
+  // biomeReliefAt, BILINEARLY over the four biome cells around the column (the
+  // biome plane's own lattice, map v2), so two biomes' curves crossfade over a
+  // whole 25.6 m cell and never meet on a cliff. Packed by PackBiomeTerrain,
   // the one conversion both the packer and the CPU twin use.
   kB_CurveKnot0 = 22,         // ..30: knots 0..8
   kB_HillMul = 31,
@@ -300,8 +380,15 @@ enum : uint32_t {
   // skin (desert / ocean author `sand`); a solid skin is untouched.
   // 0 = unset: the biome's subsoil if that is solid, else stone.
   kB_FirmCover = 34,
-  // 35..47 reserved
-  kCoverRowWords = 12,
+  // Map v2 A1: the biome's TREELINE SCALE, Q8 (256 = the map's treeline; a
+  // biome file's terrain.treelineScale). A column's treeline is
+  // sea + (map treeline - sea) * scale, the scale blended over the four biome
+  // cells like the relief (worldgen.wgsl biomeTreelineAt): tundra 0.85 puts
+  // its trees out 15% lower on a 1,000 m mountain and 1.7 m lower on the
+  // harness's 11.6 m one -- a fraction, so one biome file serves both maps.
+  kB_TreelineQ8 = 35,
+  // 36..47 reserved
+  kCoverRowWords = 13,
   kC_Mat = 0,
   kC_Head = 1,
   kC_Chance = 2,          // 1 in N surface columns; 0 = row is off
@@ -319,6 +406,11 @@ enum : uint32_t {
   // carries kBF_CanopyRows so the stack pays the 25-tile scan only there.
   kC_CanopyMin = 10,
   kC_CanopyMax = 11,
+  // Map v2 A1: the TREELINE condition (conditions.treeline): 0 = any ground,
+  // 1 = only below the column's treeline, 2 = only at or above it. What the
+  // shipped rows' absolute maxY 227 / minY 228 meant on a map whose treeline
+  // was y 228; relative, it holds on any map at any altitude.
+  kC_Treeline = 12,
   // ---- the biome's water rows (P-F) ----
   // Rolled in authored order per pond tile, first hit wins (the cover stack's
   // rule): a row's chance is `(T / tile)^2 / rarity` in Q16 on the shared
@@ -523,6 +615,30 @@ enum : uint32_t {
 // kS_BoxZ1 the other, kS_PadMargin the half-width (kPathTrunkKeepOut). A
 // trunk whose column is within that distance of the segment is refused
 // (siteBlocksTrunk); nothing else reads it.
+// kSiteRoad (map v2 R1, 2026-10-08): ONE PIECE OF AN AUTHORED ROAD -- not a
+// sites[] kind: map.json `roads[]` (`{id, name?, points: [[x, z], ...],
+// width, shoulder, surface, maxGrade, kind?: road|track|path, depth?}`) is
+// read, its profile BAKED at load (densified, the bare ground sampled, low-
+// passed, grade-limited to maxGrade: the midpoint of the largest
+// grade-Lipschitz profile under the ground and the smallest over it, so bumps
+// are cut and dips filled by the same amount), and split into pieces of at
+// most kSiteRoadPieceMax voxels (routeDist2's i32 bound) wherever a chord
+// strays more than half a voxel from the baked profile. kS_X / kS_Z one end,
+// kS_BoxX1 / kS_BoxZ1 the other (a route's layout, so routeDist2 reads it);
+// kS_RoadYA / kS_RoadYB the baked road surface at the two ends, Q8 voxels;
+// kS_Radius the half-width, kS_PadMargin the shoulder (widened at load so a
+// cut or a fill never steps more than a voxel a column, like a stamp's ramp,
+// up to kSiteRoadShoulderMax); kS_RoadMat the SOLID surface material,
+// kS_RoadDepth its cells. Readers: roadPadAt (the height mirror: the road Y
+// lerped along the piece, weight 256 over the half-width, a smoothstep to the
+// bare ground across the shoulder), roadColAt (genColumn: the surface, with
+// a ragged edge), siteFootprintHas (no cover / tile plant / tarn / cactus
+// on the carriageway), siteBlocksTrunk (no trunk within half-width + the
+// larger of the crown's reach and the shoulder), sitePadNear (no rolled pond
+// within half-width + kSiteRoadShoulderMax of the line -- a FIXED distance,
+// so the bare ground the profile is baked from cannot depend on the baked
+// shoulder), and farSurfaceMat (a road narrower than a far cell still tints
+// the cell its line crosses).
 // STAMPS carry their FOOTPRINT RECT (2026-09-29): kS_BoxX0 / kS_BoxZ0 ..
 // kS_BoxX1 / kS_BoxZ1 the template's own rotated nx x nz box (inclusive,
 // what wmStampCell draws into), kS_Apron the flat ring round it. The pad is
@@ -572,6 +688,12 @@ enum : uint32_t {
   kS_SoftBump = 10,     // soften site: Q8 scale of the detail octave
   kS_SoftGrain = 11,    // soften site: Q8 scale of the grain octave
   kS_SoftPath = 12,     // soften site: Q8 scale of the hill octave ON the routes
+  kS_RoadYA = 9,        // road piece: the baked surface Y at (kS_X, kS_Z), Q8 voxels
+  kS_RoadYB = 10,       // road piece: ... at (kS_BoxX1, kS_BoxZ1), Q8 voxels
+  kS_RoadMat = 11,      // road piece: the surface material id (a SOLID)
+  kS_RoadDepth = 12,    // road piece: surface cells from the ground's top down
+  kS_RoadFlags = 15,    // road piece: 1 = end A open, 2 = end B open (a joint with
+                        // the next piece on the same straight: no round cap)
   kStampHdrWords = 4,
   kStamp_NX = 0, kStamp_NY = 1, kStamp_NZ = 2, kStamp_Columns = 3,
   // columns: nx*nz pairs of (runOff, runCount), absolute word offsets; runs:
@@ -585,13 +707,30 @@ enum : uint32_t {
                         // its box, trunks thinned across its feather band
   kSiteSoften = 6,      // softened ground (kind "soften"): the local octaves scaled
   kSitePath = 7,        // a waynode link's trunk keep-out (derived from the refs)
+  kSiteRoad = 8,        // one piece of a map.json roads[] entry (map v2 R1)
+  // A road piece is at most this long (Chebyshev, voxels): routeDist2's
+  // projection products stay inside i32 after its box reject.
+  kSiteRoadPieceMax = 256,
+  // The widest a road's shoulder may be (authored or widened), voxels; also
+  // the FIXED distance past the half-width that keeps rolled ponds off a road.
+  kSiteRoadShoulderMax = 64,
+  // How far past the half-width a road tints a far cascade cell its line
+  // crosses (farSurfaceMat), voxels: the road's index reach covers it.
+  kSiteRoadFarTint = 32,
+  // Surface cells a road lays when it names no depth, and the most it may.
+  kSiteRoadDepthDefault = 3,
+  kSiteRoadDepthMax = 8,
   // At most this many sites may reach one map cell (the per-cell list); more
   // is a load error. Was 4 ("two neighbouring buildings, a lake and a tree")
   // until the world editor's P4: a village is ~10 structure refs plus its
-  // well, trees and pond in ONE 102 m cell, so 32. The shader's list walks
-  // iterate the list's own n, bounded by this; a cell no site reaches still
-  // costs one read.
-  kSiteCellMax = 32,
+  // well, trees and pond in ONE 102 m cell, so 32. 128 since map v2 R1
+  // (2026-10-08), measured on `default`: Harrowby's cell held 28 (5 houses,
+  // the soften box, 22 waynode routes); its 8 paths as roads made it 42-44,
+  // and a 3-road test network through the village 55..93 depending on how
+  // finely the profiles cut (the `roads` gate's H line reports it). The shader's list walks iterate the list's own n,
+  // bounded by this, and test the kind first, so a long list costs its length
+  // in that cell only; a cell no site reaches still costs one read.
+  kSiteCellMax = 128,
   // The deepest a stamp may sink (kS_Sink): genCell overlays template cells
   // from h - 1 - kStampSinkMax up, so a deeper footing would be cut off.
   kStampSinkMax = 8,
@@ -636,41 +775,38 @@ namespace worldmap {
 struct TerrainParams {
   int refVoxelsPerMetre = 10;     // the scale the map's lengths are authored at
   int baseHeight = 200;
-  int landformRangeVox = 1024;    // a painted 0..255 spans this many voxels, centred on 128
   int rangeAmplitude = 256, rangeLog2 = 9;
   int hillAmplitude = 64, hillLog2 = 7;
   int detailAmplitude = 16, detailLog2 = 5;
   int grainAmplitude = 4, grainLog2 = 3;
   int fbmAtten = 256;
-  int homeY = 200, homeR = 320, homeFade = 2048;
-  int sedCeil = 264, sedFraction = 64, sedStrip = 6, sedSlope = 96, sedMax = 32, sedTopsoil = 4;
+  int treelineJitter = 0;
+  int rockSlope = 640;
+  int homeR = 320, homeFade = 2048;
+  int sedAbove = 64, sedFraction = 64, sedStrip = 6, sedSlope = 96, sedMax = 32, sedTopsoil = 4;
   int treeline = 228;
 };
 inline constexpr uint32_t kTerrainWords = kHTerrainRefVpm + 1 - kHTerrainBaseHeight;
 /** The terrain as header words kHTerrainBaseHeight..kHTerrainRefVpm. */
 void TerrainWords(const TerrainParams& t, uint32_t out[kTerrainWords]);
-/** The world's treeline, home height and reference scale, for the CPU code
- *  that used to read worldgen.treeline / spawnPlainY / refVoxelsPerMetre.
- *  The loaded map's, or the defaults above when no map is loaded. */
+/** The map's terrain numbers (its treeline, home area, reference scale), for
+ *  the CPU code that used to read worldgen.treeline / refVoxelsPerMetre.
+ *  The loaded map's, or the defaults above when no map is loaded. A COLUMN's
+ *  treeline is TreelineAt, not `treeline`. */
 const TerrainParams& CurrentTerrain();
+/** A biome's treeline scale in Q8 (terrain.treelineScale, 1.0 = 256),
+ *  clamped 0..1024. The packer and the loader both call it. */
+int BiomeTreelineQ8(const biomes::BiomeDef& b);
+/** The window's chunk Y for a view centred on ground at `groundY` (map v2 A1):
+ *  quantised to half a window (256 voxels) so that ground in [72, 328) -- the
+ *  harness map's ~y 200 -- is window 0 exactly as every scene had it, and a
+ *  valley at y 9,000 gets a window that holds it with >= 72 voxels below and
+ *  >= 184 above. Every boot / scripted-scene / perfsuite origin uses it. */
+int WindowChunkYForGround(int groundY);
 
 // ---- a biome's terrain record (P-G): the kB_CurveKnot0..kB_GrainMul words ----
 inline constexpr uint32_t kBiomeTerrainWords = kB_GrainMul + 1 - kB_CurveKnot0;
 struct BiomeTerrainPacked { uint32_t w[kBiomeTerrainWords] = {}; };
-
-// ---- an authored LANDFORM site (P-G, Tier A): a declared mountain ----------
-// `{kind: "landform", shape: peak | ridge | basin | plateau, at: [x, z],
-// radius, heightVox, rotation?}` in map.json sites[]. Overlaid onto the
-// packed landform PLANE at load (OverlayLandformSites), so the shader reads
-// the plane exactly as before and nothing new enters the height mirror. Not
-// in the site table: a landform keeps nothing out, it only shapes the ground.
-struct LandformSite {
-  std::string id, shape;
-  int x = 0, z = 0;               // world voxels
-  int radius = 1024;              // voxels: a peak's footprint, a ridge's half-length
-  int heightVox = 0;              // signed: how far the plane is lifted (or, for a basin, sunk)
-  int rotation = 0;               // degrees, ridges only
-};
 
 // ---- the geometry half of a water preset, as the engine holds it (P-F) ----
 // ONE conversion from assets/water/<name>.json to voxel integers + the sampled
@@ -710,14 +846,6 @@ uint32_t WaterPresetIndex(const biomes::BiomeSet& set, const std::string& name);
 /** A biome's terrain record (curve knots clamped to +-16384, Q8 multipliers
  *  clamped to 0..4096). Pure; the packer and the loader both call it. */
 BiomeTerrainPacked PackBiomeTerrain(const biomes::BiomeDef& b);
-/** Overlay `sites` onto a landform plane of `width` x `height` cells whose
- *  cell (cx, cz) is centred on world column ((cx - ox) << log2) + half.
- *  Cone / elliptical ridge / plateau / inverted cone in landform units,
- *  heightVox * 256 / landformRangeVox per voxel; clamped 0..255. */
-void OverlayLandformSites(const std::vector<LandformSite>& sites, int landformRangeVox,
-                          int cellLog2, int width, int height, int originCellX, int originCellZ,
-                          std::vector<uint8_t>& landform);
-
 /**
  * An .svsculpt file's bytes -> the packed sculpt block (layout above). An
  * empty input, a file with no tiles, or tiles that are all zero give an EMPTY
@@ -740,6 +868,59 @@ bool PackSculpt(const uint8_t* data, size_t n, std::vector<uint32_t>& block,
 bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& words,
                     std::string& log);
 
+// ---- locales (docs/PLAN_map_v2.md L1) ----------------------------------------
+// A LOCALE is a hand-made place on the map (a village, a witch's hut):
+// map.json `locales[]`, {id, name, icon, bounds: {min: [x, z], max: [x, z]},
+// anchor: {at: [x, z], y}, editLayer?}. Two things belong to it:
+//
+//   * its REF GROUP, refs/<id>.json (group name == locale id). Those refs are
+//     STORED with pos.y relative to anchor.y. At load the locale's delta is
+//     BareGroundHeight(anchor.at, seed) - anchor.y, and every ref of the group
+//     lands at file y + anchor.y + delta == file y + groundY: structures (their
+//     stamp padY), waynodes, NPCs, markers. Reshaping the world under a locale
+//     moves the whole locale RIGIDLY with the ground at its anchor.
+//   * its EDIT LAYER, locales/<id>/<editLayer or "ground">.svedit (SVED v2,
+//     ground-relative per column like the map's own; absent = none), applied
+//     after the map's layer in table order (sim/worldedit.h).
+//
+// The sculpt layer is an offset and edit-layer cells are per-column relative,
+// so neither needs the delta.
+struct LocaleDef {
+  std::string id, name, icon;
+  int x0 = 0, z0 = 0, x1 = 0, z1 = 0;   // bounds, world voxels, inclusive
+  int ax = 0, az = 0;                   // anchor.at
+  int ay = 0;                           // anchor.y: the ground there when it was authored
+  std::string editLayer;                // file stem under locales/<id>/ ("ground" when unnamed)
+  // RESOLVED by LoadWorldMap for its seed: the bare ground at the anchor.
+  int groundY = 0;
+  bool resolved = false;
+  int Delta() const { return resolved ? groundY - ay : 0; }
+  // What a ref of this locale's group adds to its FILE y.
+  int RefYOffset() const { return ay + Delta(); }
+};
+// map.json's `locales` of <assetDir>/worldmap/<map> (unresolved), table order.
+// False + `err` on a malformed entry; a missing file or key is zero locales.
+bool ReadLocales(const std::string& assetDir, const std::string& mapName,
+                 std::vector<LocaleDef>& out, std::string& err);
+// group -> the y offset its refs' FILE y take (LocaleDef::RefYOffset), for
+// every locale of the map. Resolved from CurrentWorldMap() when it is that
+// map; otherwise anchor.y (delta 0) and a line in `warn` saying the locale
+// sits at its authored height because the world map is not loaded.
+std::map<std::string, int> LocaleRefYOffsets(const std::string& assetDir, const std::string& mapName,
+                                             std::vector<std::string>* warn = nullptr);
+// Every edit-layer FILE a map applies, in application order: the map's own
+// (assets/worldedits/<editLayer>.svedit) when named, then each locale's that
+// exists on disk. (path, name) -- `name` is what the save fingerprint and the
+// environment stamp hash the bytes under ("<layer>.svedit",
+// "<locale>/<stem>.svedit").
+std::vector<std::pair<std::string, std::string>> MapEditLayerFiles(const std::string& assetDir,
+                                                                   const std::string& mapName,
+                                                                   const std::string& editLayer,
+                                                                   const std::vector<LocaleDef>& locales);
+// sandvox::HashOneFile over those files, folded in order (h * FNV prime ^ next):
+// exactly HashOneFile of the map layer when the map has no locale layers.
+uint32_t HashEditLayerFiles(const std::vector<std::pair<std::string, std::string>>& files);
+
 // ---- the loaded map (P2) ---------------------------------------------------
 /** assets/worldmap/<name>/{map.json,map.svmap}, parsed and resolved. */
 struct WorldMapData {
@@ -748,13 +929,24 @@ struct WorldMapData {
   // heightmap route), and a zero homeFade there is a division by zero.
   WorldMapData() { TerrainWords(terrain, terrainWords); }
   std::string name;
-  int cellLog2 = 10;
-  int width = 0, height = 0;
-  int originCellX = 0, originCellZ = 0;   // plane cell whose low corner is world (0,0)
+  // ---- map v2: the extent and the planes (worldmap.h kHExtent* / kHHeight* /
+  // kHBiome*). Posts (i, k) of a plane of log2 L sit at world
+  // (extentX0 + (i << L), extentZ0 + (k << L)), i = 0 .. extentW >> L inclusive.
+  int extentX0 = 0, extentZ0 = 0, extentW = 0, extentH = 0;
+  int heightLog2 = 6, heightPostsX = 0, heightPostsZ = 0;
+  int heightDefault = 0;                  // planes.height.default, voxels
+  std::vector<int16_t> height;            // heightPostsX * heightPostsZ, z-major, absolute voxels
+  int biomeLog2 = 8, biomePostsX = 0, biomePostsZ = 0;
+  std::vector<uint8_t> biome;             // biomePostsX * biomePostsZ, RESOLVED to biome ids
+  int biomeDefault = 0;                   // id of planes.biome.default (outside the extent too)
+  int edgeFadeVox = 0;
+  int heightTiles = 0, biomeTiles = 0;    // authored (present) tile files
+  // ---- the site index lattice (map.json siteCellLog2) ----
+  int siteCellLog2 = 10;
+  int siteW = 0, siteH = 0;               // the extent in site cells
+  int siteOriginX = 0, siteOriginZ = 0;   // site cell index of the cell whose low corner is world (0,0)
   int seaLevelY = 0;
-  int oceanFadeCells = 0;
   int warpAmpVox = 0;
-  int oceanBiome = 0;                     // id of "ocean" in the set, or 0
   // The calm pad box, world voxels, inclusive (worldgen.wgsl inPadBox). From
   // map.json sites[] kind "pad"; a map without one gets an empty box (x1 < x0).
   int padX0 = 0, padZ0 = 0, padX1 = -1, padZ1 = -1;
@@ -802,8 +994,64 @@ struct WorldMapData {
     std::string base;
     int refX = 0, refY = 0, refZ = 0, refYaw = 0;
     int refPadMargin = -1, refPadApron = -1;   // the ref's props as written (-1 = default)
+    // L1: index into `locales` when the structure ref is in a locale's group
+    // (its refY / padY then carry the locale's offset), else -1.
+    int locale = -1;
+    // A ROAD PIECE (kSiteRoad): (x, z) .. (x1, z1) its two ends, radius the
+    // half-width, padMargin the shoulder; the baked surface Y at the ends in
+    // Q8 voxels, the surface material and its depth in cells. `road` is the
+    // index into WorldMapData::roads it was cut from.
+    int roadYA = 0, roadYB = 0;
+    uint32_t roadMat = 0;
+    int roadDepth = 0;
+    int roadFlags = 0;                    // kS_RoadFlags
+    int road = -1;
   };
   std::vector<StampSite> sites;           // stamps, water and tree sites, in site-id order
+  // map.json roads[] (map v2 R1), as authored plus what the load baked: the
+  // profile at every polyline VERTEX (the surface Y, voxels, and the bare
+  // ground there) -- what the map page's profile preview shows, the engine's
+  // bake being the truth. The pieces themselves are kSiteRoad sites, at the
+  // END of `sites` (after every other kind), in road order.
+  struct Road {
+    std::string id, name, kind = "road", surface;
+    std::vector<std::pair<int, int>> points;   // world voxels
+    int width = 30, shoulder = 16, maxGrade = 12, depth = kSiteRoadDepthDefault;
+    uint32_t surfaceId = 0;
+    std::vector<int> vertexY;                  // baked surface Y at each point
+    std::vector<int> vertexGround;             // bare ground at each point
+    int pieces = 0;
+    int worstGradeQ8 = 0;                      // steepest baked step, percent * 256
+    // The baked profile along the whole polyline, decimated to at most
+    // kRoadProfileMax samples (the bake's own every-4-voxel samples, every
+    // k-th one, the last always kept): arc length from the first point,
+    // the road surface Y and the bare ground there, voxels. --mapcheck hands
+    // it to the map page's profile chart.
+    std::vector<int> profS, profY, profG;
+  };
+  std::vector<Road> roads;
+  // map.json regions[] (map v2 E3): NAMED POLYGONS, data only -- nothing in
+  // worldgen reads them; RegionAt answers "which region is this column in"
+  // for later systems (quest text, map labels, spawn tables). Points are world
+  // voxels, the polygon closes itself, colour is the map page's "#rrggbb".
+  struct Region {
+    std::string id, name, colour;
+    std::vector<std::pair<int, int>> points;
+    int x0 = 0, z0 = 0, x1 = 0, z1 = 0;        // bounding box, inclusive
+  };
+  std::vector<Region> regions;
+  // map.json markers[] (map v2 E3): map ANNOTATIONS, `{id, name, icon, at}`;
+  // nothing in the engine reads them. `icon` is one of kMarkerIcons (an
+  // unknown one is a warning; the page draws a plain pin).
+  struct Marker {
+    std::string id, name, icon;
+    int x = 0, z = 0;
+  };
+  std::vector<Marker> markers;
+  /** The region holding world column (x, z) -- the LAST in table order whose
+   *  polygon contains it (the map page draws later regions on top), even-odd
+   *  rule, integer arithmetic; nullptr when none does. */
+  const Region* RegionAt(int x, int z) const;
   // LOAD WARNINGS (P6): everything the loader skipped or thinks is a mistake
   // but will not refuse a boot over -- an unknown site kind, a stamp .vox or
   // tree species that is not there, two footprints that overlap, a tree at
@@ -819,17 +1067,18 @@ struct WorldMapData {
   std::vector<std::vector<WaterRowPacked>> biomeWater;
   int pondTile = 0, pondBand = 0;
   // P-G: the map's terrain (map.json `terrain`), rescaled to the live voxel
-  // size, and the same as header words; each biome's terrain record by id;
-  // the authored landform sites (already overlaid onto `landform`).
+  // size, and the same as header words; each biome's terrain record by id.
   TerrainParams terrain;
   uint32_t terrainWords[kTerrainWords] = {};
   std::vector<BiomeTerrainPacked> biomeTerrain;
+  // Each biome's treeline scale by id (BiomeTreelineQ8; kB_TreelineQ8), for
+  // the CPU twin of worldgen.wgsl biomeTreelineAt.
+  std::vector<int> biomeTreelineQ8;
   // Each biome's climate by id (biomes::BiomeDef::ambient), for heat.cpp, and
   // its name by id (the F1 temperature readout: `palette` is indexed by the
   // map's plane byte, not by biome id).
   std::vector<HeatClimate> biomeClimate;
   std::vector<std::string> biomeName;
-  std::vector<LandformSite> landformSites;
   // P5: the sculpt layer as the PACKED BLOCK both sides read (PackSculpt;
   // offsets relative to its first word). Empty = the map has no layer, and
   // PackWorldMap then leaves kHSculpt at 0. The CPU twin (world.cpp
@@ -841,43 +1090,65 @@ struct WorldMapData {
   // [n, id_1 .. id_n] (id = 1 + index into `sites`). siteLists[0] is a pad
   // word so 0 can mean "none". PackWorldMap rebases the offsets onto the
   // buffer; the CPU twins read these directly.
-  std::vector<uint32_t> siteIndex;        // width*height
+  std::vector<uint32_t> siteIndex;        // siteW * siteH
+  int siteCellWorst = 0;                  // the longest cell list (<= kSiteCellMax), for --mapcheck
   std::vector<uint32_t> siteLists;
   /** The list of cell (cx, cz): nullptr = no site, else [n, ids...]. */
   const uint32_t* SiteList(int cx, int cz) const {
     if (siteIndex.empty()) return nullptr;
-    const uint32_t off = siteIndex[static_cast<size_t>(cz) * width + cx];
+    const uint32_t off = siteIndex[static_cast<size_t>(cz) * siteW + cx];
     return off == 0u ? nullptr : siteLists.data() + off;
   }
-  std::vector<uint8_t> biome;             // RESOLVED to biome ids, width*height
-  std::vector<uint8_t> landform;
-  std::vector<uint8_t> moisture;
-  uint32_t contentHash = 0;               // FNV-1a over both files
+  uint32_t contentHash = 0;               // FNV-1a over map.json, every tile, the sculpt layer, the refs
   // P4: the structure refs' placements + their assets' bytes (0 = none, and
   // then contentHash is exactly what it was before structures existed).
   uint32_t structureHash = 0;
   // map.json `editLayer` (P7): assets/worldedits/<name>.svedit, applied over
   // this map's worldgen (sim/worldedit.h). "" = none. A bare name, never a path.
   std::string editLayer;
-  bool Loaded() const { return width > 0 && height > 0; }
-  /** Cell coordinates of a world voxel column (arithmetic shift: floors). */
+  // map.json `locales[]` (L1), table order, RESOLVED for the load seed.
+  std::vector<LocaleDef> locales;
+  bool Loaded() const { return extentW > 0 && extentH > 0; }
+  /** SITE cell coordinates of a world voxel column (arithmetic shift: floors). */
   void CellOf(int x, int z, int* cx, int* cz) const {
-    *cx = (x >> cellLog2) + originCellX;
-    *cz = (z >> cellLog2) + originCellZ;
+    *cx = (x >> siteCellLog2) + siteOriginX;
+    *cz = (z >> siteCellLog2) + siteOriginZ;
   }
   bool Inside(int cx, int cz) const {
-    return cx >= 0 && cz >= 0 && cx < width && cz < height;
+    return cx >= 0 && cz >= 0 && cx < siteW && cz < siteH;
   }
-  uint8_t BiomeCell(int cx, int cz) const {
-    return biome[static_cast<size_t>(cz) * width + cx];
+  /** Is world column (x, z) inside the authored extent (max edge exclusive)? */
+  bool InExtent(int x, int z) const {
+    return x >= extentX0 && z >= extentZ0 && x < extentX0 + extentW && z < extentZ0 + extentH;
+  }
+  /** The biome id of biome post (i, k), clamped to the plane. */
+  uint8_t BiomePost(int i, int k) const {
+    i = i < 0 ? 0 : (i >= biomePostsX ? biomePostsX - 1 : i);
+    k = k < 0 ? 0 : (k >= biomePostsZ ? biomePostsZ - 1 : k);
+    return biome[static_cast<size_t>(k) * biomePostsX + i];
+  }
+  /** The biome CELL holding world column (x, z), no warp: the post whose cell
+   *  [X0 + i << L, X0 + (i + 1) << L) holds it; outside the extent, the default.
+   *  worldgen.wgsl biomeCellAt's arithmetic. */
+  uint8_t BiomeCellAt(int x, int z) const {
+    if (!Loaded() || biome.empty()) return 0;
+    if (!InExtent(x, z)) return static_cast<uint8_t>(biomeDefault);
+    return BiomePost((x - extentX0) >> biomeLog2, (z - extentZ0) >> biomeLog2);
+  }
+  /** The authored height post (i, k), clamped to the plane. */
+  int HeightPost(int i, int k) const {
+    i = i < 0 ? 0 : (i >= heightPostsX ? heightPostsX - 1 : i);
+    k = k < 0 ? 0 : (k >= heightPostsZ ? heightPostsZ - 1 : k);
+    return height[static_cast<size_t>(k) * heightPostsX + i];
   }
 };
 
 /**
  * Load assets/worldmap/<name>/ and resolve its palette against the biome
- * set. False, with `log`, on a missing directory, a malformed file, a
- * palette name no biome file has, or planes whose size disagrees with
- * map.json, or a cell more than kSiteCellMax sites reach -- the caller ABORTS
+ * set. False, with `log`, on a missing directory, a malformed file, a v1 map
+ * (map.svmap / no "version": 2 -- the message names scripts/convert_map_v2.py),
+ * a palette name no biome file has, a tile whose header disagrees with its
+ * plane, or a cell more than kSiteCellMax sites reach -- the caller ABORTS
  * on false (a world with no map is not a world, see the header comment).
  * What it skips or doubts without refusing is in `out.warnings` (and stderr).
  *
@@ -896,6 +1167,7 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
 // warning when missing / mis-yawed) by the loader.
 struct StructurePlacement {
   std::string id, base, file;   // file: "refs/<group>.json", for warnings
+  std::string group;            // the group file's stem (== a locale id when it is one)
   int x = 0, y = 0, z = 0;      // the ref's pos: the asset's origin lands here
   int yaw = 0;
   int padMargin = -1;           // props.padMargin, -1 = the default
@@ -925,8 +1197,10 @@ std::string MapCheckJson(const std::string& name, bool ok, const WorldMapData& m
 
 /**
  * The whole `worldMap` buffer: PackBiomeTable's words plus the map header
- * fields and the three planes. `map` may be unloaded (P0/P1 tools), in which
- * case the plane offsets stay 0 and the samplers return biome 0.
+ * fields, the dense height and biome planes, the site index and table and the
+ * sculpt block. `map` may be unloaded (P0/P1 tools), in which case the plane
+ * offsets stay 0, the samplers return biome 0 and the authored height is the
+ * terrain's baseHeight.
  */
 bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
                   std::vector<uint32_t>& words, std::string& log);
@@ -940,6 +1214,17 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
 const WorldMapData& CurrentWorldMap();
 void SetCurrentWorldMap(WorldMapData map);
 
+/** The NAME of the region of CurrentWorldMap() holding world column (x, z)
+ *  (WorldMapData::RegionAt; its id when it has no name), "" when none does. */
+std::string RegionAt(int x, int z);
+
+// The marker icons the map page draws (pixel art, assets/editor/mapvector.js
+// ICONS): a marker naming another one loads with a warning.
+inline constexpr const char* kMarkerIcons[] = {"hut",    "village", "castle", "tower", "cave",
+                                               "ruin",   "shrine",  "camp",   "mine",  "port"};
+// The most samples a road's reported profile carries (WorldMapData::Road::profS).
+inline constexpr int kRoadProfileMax = 256;
+
 /**
  * The CPU height mirror's BARE ground (landColumnBare's h, no site pad) at
  * (x, z) against CurrentWorldMap(). Defined in world.cpp beside the mirror;
@@ -947,6 +1232,27 @@ void SetCurrentWorldMap(WorldMapData map);
  * (StampSite::padY), which runs it with the map being loaded installed.
  */
 int BareGroundHeight(int x, int z, uint32_t seed);
+
+/**
+ * The AUTHORED height at (x, z) against CurrentWorldMap(): the height plane's
+ * Catmull-Rom (world.cpp mapHeightAt, the shader's twin), absolute voxels, no
+ * noise, no sculpt; the edge fade outside the extent. `gx` / `gz` (optional)
+ * get its gradient in the octave ladder's Q8 per voxel.
+ */
+int AuthoredHeightAt(int x, int z, int* gx = nullptr, int* gz = nullptr);
+
+/**
+ * THE COLUMN'S TREELINE (map v2 A1) against CurrentWorldMap(): the ground Y at
+ * and above which the column wears the snow cap and grows no tree, and at and
+ * above whose `- 1` the heat layer gives it the snowline climate. The map's
+ * terrain.treeline, scaled above the sea by the biome's treelineScale (blended
+ * over the four biome cells) plus the seeded +-treelineJitter. The CPU twin of
+ * worldgen.wgsl treelineAt (the height mirror); defined in world.cpp.
+ */
+int TreelineAt(int x, int z, uint32_t seed);
+
+/** The highest ground Y any column's treeline can reach on `map` (kHTreelineMax). */
+int TreelineMaxOf(const WorldMapData& map);
 
 /**
  * The keep-out every generated feature avoids (worldgen.wgsl siteKeepOut),

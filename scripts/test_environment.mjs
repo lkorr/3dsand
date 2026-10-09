@@ -179,23 +179,50 @@ console.log('\n-- swatch (nominal rarity) --');
 // covers the fixture columns and its fixture lake, and the shipped map carries
 // no pad at all. src/sim/worldmap.h is the authority for the format.
 console.log('\n-- world map --');
-for (const mapName of ['default', 'harness']) {
+for (const mapName of ['default', 'harness', 'peaks']) {
   const MAP = join(ROOT, 'assets', 'worldmap', mapName);
-  ok(existsSync(join(MAP, 'map.json')) && existsSync(join(MAP, 'map.svmap')), `assets/worldmap/${mapName} has map.json + map.svmap`);
-  if (existsSync(join(MAP, 'map.json')) && existsSync(join(MAP, 'map.svmap'))) {
+  ok(existsSync(join(MAP, 'map.json')) && !existsSync(join(MAP, 'map.svmap')), `assets/worldmap/${mapName} has map.json and no v1 map.svmap`);
+  if (existsSync(join(MAP, 'map.json'))) {
     const j = readJson(join(MAP, 'map.json'));
-    const raw = readFileSync(join(MAP, 'map.svmap'));
-    const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
-    const [w, h] = j.size;
-    ok(dv.getUint32(0, true) === 0x504D5653 && dv.getUint32(4, true) === 1, 'map.svmap magic SVMP v1');
-    ok(dv.getUint32(8, true) === w && dv.getUint32(12, true) === h, `map.svmap is ${w}x${h} like map.json`);
-    ok(raw.length === 16 + w * h * 3, `map.svmap holds three ${w}x${h} planes`);
+    // MAP V2 (docs/PLAN_map_v2.md): the extent, the lattices and the tiles.
+    ok(j.version === 2, `${mapName}: map.json is version 2`);
+    const site = 1 << j.siteCellLog2;
+    const [ex, ez] = j.extent.min, [ew, eh] = j.extent.size;
+    ok([ex, ez, ew, eh].every(v => Number.isInteger(v) && v % site === 0) && ew > 0 && eh > 0,
+       `${mapName}: extent min/size are multiples of the ${site}-voxel site cell`);
     const biomeFiles = new Set(readdirSync(join(ROOT, 'assets', 'biomes')).filter(f => f.endsWith('.json') && f[0] !== '_').map(f => f.slice(0, -5)));
     ok(j.biomes.every(n => biomeFiles.has(n)), 'every palette name has a biome file: ' + j.biomes.join(','));
-    let maxIdx = 0;
-    for (let i = 16; i < 16 + w * h; i++) maxIdx = Math.max(maxIdx, raw[i]);
-    ok(maxIdx < j.biomes.length, `biome plane indices < palette size (${maxIdx} < ${j.biomes.length})`);
-    ok(j.warpAmpVox >= 0 && j.warpAmpVox <= (1 << j.cellLog2) / 4, `warpAmpVox ${j.warpAmpVox} <= cell/4`);
+    ok(j.biomes.includes(j.planes.biome.default), `planes.biome.default "${j.planes.biome.default}" is in the palette`);
+    ok(j.planes.height.log2 >= 3 && j.planes.height.log2 <= 6 && Math.abs(j.planes.height.default) <= 32000,
+       `planes.height: log2 ${j.planes.height.log2} in 3..6, default ${j.planes.height.default} within +-32000`);
+    // Every tile: the SVT1 header agrees with its name and plane, the size is
+    // exact, it lies on the plane, and its samples are in range.
+    for (const [plane, kind, bytes] of [['height', 1, 2], ['biome', 2, 1]]) {
+      const pd = join(MAP, 'planes', plane);
+      const files = existsSync(pd) ? readdirSync(pd).filter(f => f.endsWith('.svt')) : [];
+      const posts = [(ew >> j.planes[plane].log2) + 1, (eh >> j.planes[plane].log2) + 1];
+      let bad = [], maxIdx = 0, hMin = Infinity, hMax = -Infinity;
+      for (const f of files) {
+        const m = /^(-?\d+)_(-?\d+)\.svt$/.exec(f);
+        const raw = readFileSync(join(pd, f));
+        const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+        const tx = m ? +m[1] : NaN, tz = m ? +m[2] : NaN;
+        if (!m || raw.length !== 32 + 256 * 256 * bytes || dv.getUint32(0, true) !== 0x31545653 || dv.getUint32(4, true) !== kind ||
+            dv.getInt32(8, true) !== tx || dv.getInt32(12, true) !== tz || dv.getUint32(16, true) !== 256 ||
+            dv.getUint32(20, true) !== 256 || dv.getUint32(24, true) !== bytes || tx * 256 >= posts[0] || tz * 256 >= posts[1]) {
+          bad.push(f);
+          continue;
+        }
+        for (let i = 0; i < 256 * 256; i++) {
+          if (bytes === 2) { const v = dv.getInt16(32 + 2 * i, true); hMin = Math.min(hMin, v); hMax = Math.max(hMax, v); }
+          else maxIdx = Math.max(maxIdx, raw[32 + i]);
+        }
+      }
+      ok(bad.length === 0, `${mapName}: ${files.length} ${plane} tile(s) carry a valid SVT1 header on the plane` + (bad.length ? ' — BAD: ' + bad.join(', ') : ''));
+      if (bytes === 2 && files.length) ok(hMin >= -32000 && hMax <= 32000, `${mapName}: height samples y${hMin}..y${hMax} within +-32000`);
+      if (bytes === 1) ok(maxIdx < j.biomes.length, `${mapName}: biome tile indices < palette size (${maxIdx} < ${j.biomes.length})`);
+    }
+    ok(j.warpAmpVox >= 0 && j.warpAmpVox <= (1 << j.planes.biome.log2) / 4, `warpAmpVox ${j.warpAmpVox} <= biome cell/4`);
     const pad = (j.sites || []).find(s => s.kind === 'pad');
     if (mapName === 'harness') {
       ok(!!pad && pad.min[0] <= pad.max[0] && pad.min[1] <= pad.max[1], 'harness: a pad box exists and is a box');
@@ -206,6 +233,7 @@ for (const mapName of ['default', 'harness']) {
     } else {
       ok(!pad, `${mapName}: no pad box (the harness pad lives on the harness map)`);
     }
+    ok(!(j.sites || []).some(s => s.kind === 'landform'), `${mapName}: no v1 landform sites (v2 bakes them into the height plane)`);
     // stamp sites and rules (P5): every template named must exist as a .vox
     // (the engine skips one that does not, with a warning -- a shipped map
     // should not carry one). A stamp spells its column at[2] since P6; the
@@ -217,7 +245,7 @@ for (const mapName of ['default', 'harness']) {
     ok(stamps.every(s => prefabs.has(s.template)), 'every stamp site names an existing assets/prefabs/<template>.vox');
     // P6: every site kind is one the loader knows (an unknown one is a load
     // warning and ignored), and every tree site names a baked species.
-    const kinds = new Set(['spawn', 'pad', 'stamp', 'water', 'landform', 'tree', 'clearing', 'soften']);
+    const kinds = new Set(['spawn', 'pad', 'stamp', 'water', 'tree', 'clearing', 'soften']);
     ok((j.sites || []).every(s => kinds.has(s.kind)), 'every site kind is known to the loader');
     // A forest clearing is a box (min <= max on both axes, the loader refuses
     // otherwise) with a feather 0..512.
@@ -287,10 +315,12 @@ console.log('\n-- live manifest (envlive.js) --');
   const wp = WG.defaultParams();
   check('water', leaves(wp, '', {'shore.plants': wp.shore.plants[0], 'bathymetry.profile': null}));
   const mapJson = readJson(join(ROOT, 'assets', 'worldmap', 'default', 'map.json'));
-  const mapRows = {sites: {}, rules: {}, biomes: null, size: null, originCell: null};
+  // Map v2: the extent's pairs and each plane's declaration are one field each.
+  const mapRows = {sites: {}, rules: {}, roads: {}, biomes: null, 'extent.min': null, 'extent.size': null,
+                   'planes.height': null, 'planes.biome': null};
   // P-G: the terrain block is walked leaf by leaf (every number is read).
-  const mapPaths = leaves(mapJson, '', mapRows).filter(p => !/^(sites|rules)\[\]\./.test(p))
-      .concat(['sites[]', 'rules[]', 'planes.biome', 'planes.landform', 'planes.moisture']);
+  const mapPaths = leaves(mapJson, '', mapRows).filter(p => !/^(sites|rules|roads)\[\]\./.test(p))
+      .concat(['sites[]', 'rules[]', 'ridges[]', 'roads[]']);
   check('map', [...new Set(mapPaths)]);
   // P-D landed: the biome's tile IS read (one lattice, thinned per biome to
   // density × (T/tile)²), and so is every per-row condition on tree and cover

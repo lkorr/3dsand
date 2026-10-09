@@ -1888,6 +1888,7 @@ void Overlay::DrawDevWorld(UIState& s) {
       hs.heatDownGain = d.sim.heatDownGain;
       hs.heatSnowlineBase = d.sim.heatSnowlineBase;
       hs.heatSnowlineSwing = d.sim.heatSnowlineSwing;
+      hs.heatLapsePerKm = d.sim.heatLapsePerKm;
       changed = true;
     }
     ImGui::SetItemTooltip("Every heat knob back to its shipped value.");
@@ -1912,6 +1913,9 @@ void Overlay::DrawDevWorld(UIState& s) {
                           "day (base + swing < 0) so the peaks keep their snow.");
     changed |= EditableSliderInt("snowline swing##heat", &hs.heatSnowlineSwing, 0, 63);
     ImGui::SetItemTooltip("Day / night swing of the snowline climate (day = base + swing).");
+    changed |= EditableSliderInt("lapse rate##heat", &hs.heatLapsePerKm, 0, 64);
+    ImGui::SetItemTooltip("Heat units colder per km above the sea, below the snowline\n"
+                          "(map v2): a high valley's ponds skin over on cold nights.");
 
     // ---- heat-driven wind (wind phase 5; common.wgsl HEAT UPDRAFTS) ----
     // Def-row ranges. Live: they ride TickParams, and a change re-solves the

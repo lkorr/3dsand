@@ -1,5 +1,15 @@
 # HARROWBY 05 -- the green and its well: a structure built from nothing.
 #
+# HISTORY, NOT A RECIPE (2026-10-08, docs/PLAN_map_v2.md L1). The positions
+# below are WORLD voxels on the PRE-v2 ground, where Harrowby's floors were
+# y 201. Map v2 (F1) moved the ground under the village +5, and Harrowby is
+# now a LOCALE (harrowby_09_locale.py): refs/harrowby.json stores y RELATIVE
+# to the locale's anchor (map.json locales[harrowby].anchor.y 201), and each
+# ref's world y is file y + the ground at the anchor, so the village rides
+# its ground. The ref commands still take WORLD y -- re-read it in game (the
+# References page, or F8) before copying a line from here; as written they
+# would land 5 voxels below today's floors (y 206).
+#
 # struct.new starts an empty asset; its house frame is wherever we say the
 # ground is: y = 0 is the grass you stand on, (0, 0) the middle of the green.
 # y = -1 cells REPLACE the ground (the well's flagstone apron).

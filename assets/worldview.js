@@ -554,6 +554,13 @@
     // (map-overhaul P7): '@map' = the one the map names (what the game spawns
     // into), '-' = bare worldgen, or a layer name (the one being edited).
     this.layerSel = '@map';
+    // Which MAP the server generates (map v2 E4): '' = tuning's world.mapLayer
+    // (what the game loads); a name = that map (the locale editor's view).
+    this.mapName = '';
+    // Where an edit may land: null = anywhere at level 0, or [x0, z0, x1, z1]
+    // world voxels INCLUSIVE (a locale's bounds: its own layer holds nothing
+    // outside them). A cell outside is skipped like a cell outside level 0.
+    this.editBounds = null;
     this.tool = {
       name: 'none',               // none | brush | erase | box | picker | measure
       material: 1,
@@ -806,7 +813,8 @@
     var q = 'ox=' + (w.rx * ext) + '&oy=' + (w.ry * ext) + '&oz=' + (w.rz * ext) +
             '&nx=' + REGION_N + '&ny=' + REGION_N + '&nz=' + REGION_N +
             '&lod=' + lod + '&seed=' + this.seed +
-            '&layer=' + encodeURIComponent(this.layerSel || '@map');
+            '&layer=' + encodeURIComponent(this.layerSel || '@map') +
+            (this.mapName ? '&map=' + encodeURIComponent(this.mapName) : '');
     this.inflight++;
     var gen = this.gen;
     var t0 = performance.now();
@@ -1473,6 +1481,7 @@
     var undo = [];
     for (var i = 0; i < cells.length; i++) {
       var c = cells[i];
+      if (!this.editableAt(c[0], c[2])) continue;
       var prev = this.cellAtWorld(c[0], c[1], c[2], 0);
       if (prev < 0) continue;                 // outside level 0: refuse, see header
       var word = c[3];
@@ -1485,6 +1494,12 @@
     this.edit.pushUndo(undo, label || 'edit');
     this._flushPokes();
     return undo.length;
+  };
+
+  // Inside editBounds (or no bounds): the one test apply() and the brush make.
+  WorldView.prototype.editableAt = function (x, z) {
+    var b = this.editBounds;
+    return !b || (x >= b[0] && z >= b[1] && x <= b[2] && z <= b[3]);
   };
 
   WorldView.prototype.undo = function () { return this._replay(this.edit.popUndo(), true); };
@@ -1737,6 +1752,7 @@
     var n = 0;
     for (var i = 0; i < cells.length; i++) {
       var c = cells[i];
+      if (!this.editableAt(c[0], c[2])) continue;
       var word = mat ? this.wordFor(mat, c[0], c[1], c[2]) : 0;
       var prev = this.cellAtWorld(c[0], c[1], c[2], 0);
       if (prev < 0) continue;

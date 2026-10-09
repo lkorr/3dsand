@@ -260,6 +260,18 @@ enum class Buf : uint8_t {
   // the same command buffer. Render-private like GodVis: never hashed, never
   // saved, never bound by a sim kernel.
   GasMask,
+  // THE FAR HORIZON's pyramid (src/sim/horizon.h): CPU-written at load and
+  // environment reload only, read by raymarch.wgsl (renderBGL 45) and, map v2
+  // S1, by the cloud march (cloud.wgsl, shadow group 32) and the light map's
+  // two rows. On the table for the reads: a compute row that read a buffer the
+  // table does not know about is the hazard this file exists to rule out.
+  Horizon,
+  // THE TERRAIN-SCALE LIGHT MAP (horizon.h kL*, horizon_light.wgsl): the sun's
+  // horizon and the sky visibility per pyramid sample. WRITTEN by the hz_sky /
+  // hz_sun rows on the ShadowCache table (only on the frames that rebuild it),
+  // READ by raymarch.wgsl's fragment stage (renderBGL 46) -- BeginRendering's
+  // flush, as for RayStart. Render-private: never hashed, never saved.
+  HzLight,
   // The GI gather request list (assets/shaders/gi_gather.wgsl): block-faces
   // whose one-bounce gather cache is due, appended by raymarch.wgsl's fragment
   // stage (with a dedup bitmap) and consumed by the next frame's gi_prepare /
@@ -534,6 +546,9 @@ enum class Pipe : uint8_t {
   // The rain shadow map (rain_map.wgsl), per-FRAME rows on the ShadowCache
   // table, after the clouds (the prep reads the env pass's wind probe).
   RainMapPrep, RainMapBuild,
+  // The terrain-scale light map (horizon_light.wgsl, map v2 S1), per-FRAME
+  // rows on the ShadowCache table that record only on a rebuild frame.
+  HzSky, HzSun,
   WindStreak,
   // The god-ray sun visibility volume (godray_vis.wgsl), one per-FRAME row on
   // the ShadowCache table. Before ShadowResolve for the copy loop's bound.
@@ -724,6 +739,12 @@ enum class Cond : uint8_t {
   // harness switched it off). Off = no row, and the readers' stamp check sees
   // a stale header and take the openness path.
   RainMap,
+  // HzSky / HzSun: the terrain light map's rows (RecordCtx::hzGx > 0 and
+  // cloudFlags bit 16 / 32). The sky visibility is rebuilt once per pyramid
+  // upload; the sun's horizon when the key light's azimuth has moved past a
+  // threshold since the last build. Off = no row: the map is static data.
+  HzSky,
+  HzSun,
   // RainExpo: the rain exposure map's row (RecordCtx::rainExpoGroups > 0:
   // rain or wetness in the tick's rain word, i.e. exactly the ticks on which
   // the CA's rainExposed can be asked).
@@ -855,6 +876,7 @@ enum class DispatchSel : uint32_t {
   RainExpoSel,
   // ---- the gust streaks: one 64-thread workgroup per 64 live slots ----
   StreakGx,
+  HzGx,
   // ---- the body query (package E4): one workgroup per box this tick ----
   ElecQuerySel,
   IndSolArgs,        // indirect: world.solArgs @ 0 (one group per want-list entry)
@@ -1031,6 +1053,9 @@ struct RecordCtx {
   uint32_t rainFallGroups = 64, rainExpoGroups = 0;
   // Workgroups over the live streak pool; 0 = streaks off (Cond::WindStreaks).
   uint32_t streakGx = 0;
+  // Workgroups (64 threads, 1D) over the horizon light map's samples; 0 = no
+  // pyramid (neither hz row records).
+  uint32_t hzGx = 0;
   // Wind drafts (Simulation::SetDraft): the gate, and "re-mask the whole box
   // this tick" (it moved, the gate or the materials changed, or it is new).
   bool draftOn = false;

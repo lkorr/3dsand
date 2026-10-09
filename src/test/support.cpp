@@ -412,6 +412,8 @@ bool gWeatherRegenAsked = false;
 }  // namespace
 
 const CloudFrame& LastCloudFrame() { return gCloudFrame; }
+float gKeyLightDir[3] = {0.0f, 1.0f, 0.0f};
+const float* LastKeyLightDir() { return gKeyLightDir; }
 unsigned LastVeilPitch() { return gVeilPitch; }
 CloudHistoryProbe MainCloudHistory() {
   CloudHistoryProbe p;
@@ -540,6 +542,17 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
   cp.camM[0] = eye.x * kVoxelMeters;
   cp.camM[1] = eye.y * kVoxelMeters;
   cp.camM[2] = eye.z * kVoxelMeters;
+  // THE FREEZING LEVEL over the eye's column (map v2 S1; spare.w, metres):
+  // where precipitation turns to snow (common.wgsl precipSnowAt). The heat
+  // layer's own law (HeatFreezingLevelY: the column's snowline, or where the
+  // lapse rate takes the biome climate below freezing). Render only -- the
+  // sim's rain word is untouched. No map: far above any deck.
+  cp.spare[3] = 1.0e6f;
+  if (worldmap::CurrentWorldMap().Loaded()) {
+    const uint32_t seed = world.WorldSeed() != 0u ? world.WorldSeed() : kDefaultSeed;
+    cp.spare[3] = (float)HeatFreezingLevelY((int)std::floor(eye.x), (int)std::floor(eye.z), seed) *
+                  kVoxelMeters;
+  }
 
   // ---- the drift: every unbounded quantity folded here, in double ----
   double dx = 0.0, dz = 0.0;
@@ -705,10 +718,13 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
   // A near strike lights the field whether or not the sky drew a deck (a
   // forced strike under a clear sky, the lightning glyph): the bolt is there.
   if (st.enabled && !auxView) rp.lightning = std::max(rp.lightning, st.strikeFlash);
-  // Mist: rain and fog thicken the air. A multiplier on the far-field fog
-  // density the caller computed, so the horizon still dissolves where the
-  // cascades end — mist only brings it closer.
-  if (on) rp.fogDensity *= 1.0f + w.mist;
+  // Mist: rain and fog thicken the air. A multiplier on the height fog (the
+  // air itself, H1) and on the loading fog the caller computed, so a misty
+  // day brings the whole horizon closer at every altitude.
+  if (on) {
+    rp.fogDensity *= 1.0f + w.mist;
+    rp.hfogDensity *= 1.0f + w.mist;
+  }
 
   // An aux view records no cloud passes of its own (and composites none, see
   // above), and the main view writing its params next frame must find the
@@ -823,9 +839,13 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   // Bit 4 is deliberately NOT reflected into RenderSpec: it picks a distance
   // inside a branch bit 2 already guards, so it changes no shader's shape and
   // must not double the pipeline variants.
+  // Bit 7 = the far horizon march (render.horizon; raymarch.wgsl
+  // RFLAG_HORIZON, sim/horizon.h): a runtime switch, not a variant, so the
+  // `nohorizon` budget arm prices the march without a recompile.
   rp.flags = (shadows ? 1u : 0u) | extraFlags | (ShortRangeMode() ? 4u : 0u) |
              (GasRenderActive() ? 8u : 0u) | (ShortRangeNear() ? 16u : 0u) |
-             (GasFarRenderActive() ? 32u : 0u);
+             (GasFarRenderActive() ? 32u : 0u) |
+             (CurrentTuning().render.horizon ? 128u : 0u);
   // Publish the SPEC_* predicates for this frame (support.h RenderSpec). Read
   // off `rp` rather than off the arguments, so the record is the WORD THAT WAS
   // UPLOADED and not a second derivation of it.
@@ -902,7 +922,15 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
     rp.fluidLo[0] = flo.x; rp.fluidLo[1] = flo.y; rp.fluidLo[2] = flo.z;
     rp.fluidHi[0] = fhi.x; rp.fluidHi[1] = fhi.y; rp.fluidHi[2] = fhi.z;
   }
-  rp.fogDensity = fogDensity;  // horizon fades at the trusted far-field extent
+  // The LOADING fog: hides cascade bands still unfilled (0 = all filled).
+  rp.fogDensity = fogDensity;
+  // THE AIR (H1): the height fog, from the map's sea plane up. Per metre at
+  // the base; the falloff per metre of climb. An aux view (the portrait) is a
+  // character a few metres off: no air, as it had no fog before.
+  rp.hfogDensity = auxView ? 0.0f : tun.render.fogSeaDensity * 0.001f;
+  rp.hfogFalloff = 1.0f / std::max(tun.render.fogScaleHeight, 1.0f);
+  rp.hfogBaseY = (float)worldmap::CurrentWorldMap().seaLevelY;
+  rp.fogHaze = tun.render.fogHaze;
   rp.viewPx = viewPx;          // water ripple LOD footprint (see world.h)
   // Micro-detail animation clock + per-cell variation key (see world.h). Both
   // are render-only inputs; the tick is passed rather than `time` so a flipbook
@@ -1085,6 +1113,8 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   gVeilPitch = (unsigned)std::max(1.0f, std::round(rp.viewPx * rp.aspect));
   // After the clouds: the ambient's overcast and lightning come from there.
   ResolveFrameLight(rp, tun.render);
+  if (!auxView)
+    for (int k = 0; k < 3; k++) gKeyLightDir[k] = rp.keyDir[k];
   queue.WriteBuffer(world.renderUBO, 0, &rp, sizeof(rp));
 }
 

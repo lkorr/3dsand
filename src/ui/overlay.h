@@ -924,6 +924,7 @@ struct UIState {
     int maxDepth = -1;       // deepest layer in the body, -1 = not measured
     uint32_t gen = 0;        // bumped when the strata below were re-measured
     int clonesLive = 0;      // peeled bricks currently drawn
+    bool hasGear = false;    // worn or held pieces on the body: the first peel takes them
     uint32_t refusals = 0;   // bricks the micro pool refused to clone
     // What a material reads as. Mirrors autopsy::Kind (this header includes
     // no game header): 0 other, 1 tissue, 2 burn, 3 infection.
@@ -963,8 +964,10 @@ struct UIState {
     int findingCount = 0;
     // THE PROBE: the voxel under the cursor on the portrait. The panel asks
     // (`probeWant` + `probeAt`, portrait-normalized) and main.cpp casts the
-    // ray through the instances the portrait DREW - the photograph, peeled
-    // and filtered exactly as on screen - and answers here, one frame later.
+    // ray through the instances the portrait DREW - on a corpse the
+    // photograph, peeled and filtered exactly as on screen - and answers
+    // here, one frame later. The LIVING sheet asks too (owner, 2026-10-08):
+    // the same readout, as a tip beside the cursor.
     bool probeWant = false;
     bool probeForce = false;  // a harness holds the probe at probeAt (--shot-inventory)
     float probeAt[2] = {0, 0};
@@ -977,7 +980,6 @@ struct UIState {
       uint8_t kind = 0;       // as Legend::kind
       int layer = -1;         // depth from the surface (0 = skin), -1 unknown
       int cell[3] = {0, 0, 0};
-      bool painted = false;   // carries an art colour over its material's
       int bruise = 0;         // 0 none, 1..14 contusion, 15 split open
       char coat[24] = {};     // what is ON it ("" = clean)
       uint32_t coatColor = 0;

@@ -36,6 +36,10 @@ const std::vector<Gate>& TerrainGates();
 const std::vector<Gate>& TreeGates();
 const std::vector<Gate>& BiomeGates();
 const std::vector<Gate>& EnvTruthGates();
+const std::vector<Gate>& MapV2Gates();
+// Locales (docs/PLAN_map_v2.md L1): CPU only, a synthetic map in a temp dir.
+const std::vector<Gate>& LocaleGates();
+const std::vector<Gate>& AltitudeGates();
 // The Node generator data gates (test_mobgen / test_anatomy / test_environment.mjs),
 // shelled out to through scripts/generator_parity.mjs. No World, no GPU.
 const std::vector<Gate>& GeneratorGates();
@@ -267,6 +271,23 @@ const char* const kOrder[] = {
     // Right after terrain, on the same pristine world: the painted map's
     // biome reaches the kernel (CPU twin at cell centres, GPU skin in-window).
     "worldmap",
+    // With it, map v2's authored height plane (docs/PLAN_map_v2.md): a
+    // synthetic map in a TEMP asset dir -- tile format, post exactness, CPU ==
+    // GPU per voxel across post edges and a steep ramp, C1 continuity, the
+    // edge fade. The `sculpt` gate's seam and exit (reload, regenerate, far
+    // refill), so `waterbody` still sees what `terrain` left.
+    "worldmap-v2",
+    // With it, locales (docs/PLAN_map_v2.md L1): a synthetic map in a TEMP
+    // asset dir whose height plane is raised under a locale -- the locale's
+    // house, pad, refs and edit layer move by exactly the anchor's change, an
+    // ordinary group does not, overlapping layers resolve map-then-locale.
+    // CPU only; the loaded map is put back as it was.
+    "locale",
+    // Map v2 A1: nothing absolute-Y that should be relative, on the `peaks`
+    // fixture (window, per-biome treeline, lapse rate, lava clearance, valley
+    // sediment, cliff rock + settle). The `clearing` exit: reload, put the
+    // window back, regenerate, far refill.
+    "altitude",
     // With it: the map's spawn site is where a player can actually start --
     // outside the harness box, on land, not in a tarn, where trees may grow.
     // CPU only (the height mirror and the map), nothing left behind.
@@ -1236,6 +1257,16 @@ const char* const kOrder[] = {
     // a fly-mode camera that walks a few voxels in the control arm; it writes
     // no voxel.
     "dialogue-graph",
+    // Map v2 roads (docs/PLAN_map_v2.md R1). The `sculpt` seam (a synthetic
+    // map in a TEMP asset dir, uploaded, regenerated, read back) and its exit
+    // (the real environment reloaded, the world regenerated, the far cascades
+    // refilled) -- but it TICKS (400+ ticks of the gate map with roads, the
+    // sleep claim), and engine state outlives the gates' resets: run anywhere
+    // before `determinism` it moved that gate's pinned hash (39b3de48 ->
+    // 8616b32e in `--verify roads,determinism`), so it runs LATE, after every
+    // pinned trace, and before `infect-perf`, whose blood still in flight
+    // after its regenerate would land on this gate's carriageways.
+    "roads",
     // What the infection pass COSTS: eight bitten humans ticked four times
     // over (the whole-lattice sweep against the limb's cell list -- identical
     // outcome, a fraction of the time). LATE on purpose: the crowd bleeds over
@@ -1259,7 +1290,7 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &GeneratorGates(), &ScaleGates(),
+    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &MapV2Gates(), &LocaleGates(), &AltitudeGates(), &GeneratorGates(), &ScaleGates(),
                           &SimGates(), &CaGates(), &GasGates(), &TicketGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),

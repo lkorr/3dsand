@@ -18,9 +18,11 @@
      checks the tuner's wiring by regex against GET / — the same arrangement
      as trees_test.html, for the same reasons.
 
-     NEEDS NO BUILT EXE: the one engine call (the map page's Load check,
-     `sandvox --mapcheck`) is asserted only when the exe answers; without one
-     the panel says so and the line says "engine unavailable". -->
+     The map page section (?only=map) NEEDS NO BUILT EXE: the one engine call
+     (the Load check, `sandvox --mapcheck`) is asserted only when the exe
+     answers, and is a SKIP when the exe predates v2 maps. It writes a
+     synthetic v2 map to assets/worldmap/_e1test/ through the tuner's own
+     routes; check_environment.sh deletes that folder. -->
 <meta charset="utf-8">
 <title>environment harness</title>
 <body style="background:#111;color:#ddd;font:12px monospace">
@@ -31,7 +33,12 @@
 var log = [], fail = 0;
 // Progress lands in #out as it happens, so a run that exhausts the virtual
 // time budget still says how far it got (the last line is where it stalled).
-function say(ok, msg){ log.push((ok?'PASS  ':'FAIL  ') + msg); if(!ok) fail++; document.getElementById('out').textContent = 'running' + String.fromCharCode(10) + log.join(String.fromCharCode(10)); }
+// ...and on the console, so a run that HANGS (a dump-dom never comes) can be
+// read live with Chrome's --enable-logging=stderr.
+function say(ok, msg){ log.push((ok?'PASS  ':'FAIL  ') + msg); if(!ok) fail++; console.log('ENVTEST ' + log[log.length - 1]); document.getElementById('out').textContent = 'running' + String.fromCharCode(10) + log.join(String.fromCharCode(10)); }
+// A line this harness cannot decide on this machine (an engine that predates
+// the format under test): printed, never counted as a pass or a failure.
+function skip(msg){ log.push('SKIP  ' + msg); }
 function done(){
   document.getElementById('out').textContent =
     log.join('\n') + '\n\nRESULT ' + (fail ? ('FAIL(' + fail + ')') : 'OK');
@@ -127,7 +134,7 @@ function readLit(wv, cv){
     say(nav.querySelectorAll('button[data-page]').length >= 6, 'and the map + two component pages');
 
     // ?only=map runs the mount and the World map page alone (sections 1, 2,
-    // 6, 6b): the page's tools can be iterated on without the swatch bakes.
+    // 6..6d): the page's tools can be iterated on without the swatch bakes.
     var ONLY_MAP = /[?&]only=map(&|$)/.test(location.search);
     if (!ONLY_MAP) {
     // ---- 3. the biome page --------------------------------------------------------------------------
@@ -288,101 +295,671 @@ function readLit(wv, cv){
     say(ok, 'deep link opened samples/smithy on the Structures page (' + ST._slots().length + ' slots)');
 
     }   // !ONLY_MAP
-    // ---- 6. the World map page: the front door (P-I) ----------------------------------------------------------
+    // ---- 6. the World map page on the v2 format (docs/PLAN_map_v2.md, E1) ------------------------------------
+    // The page first opens the map tuning names. Everything below runs on a
+    // SYNTHETIC v2 map written through the tuner's own routes into
+    // assets/worldmap/_e1test/ (check_environment.sh deletes the folder; this
+    // section deletes its tiles): 16384 vox a side, a 600 m cone hill on one
+    // height tile, alpine / meadow / ocean rings on one biome tile.
     E._open('map');
     var M = E._modules.WorldMap;
-    ok = await waitFor(function(){ return !!M._map(); }, 30000);
-    say(ok && pages.map.classList.contains('active'), 'map page loaded ' + (M._map() && M._map().name));
+    var MT = await import('./editor/maptiles.js');
+    var FIX = '_e1test';
+    var fixJson = {
+      version: 2, name: FIX, extent: {min: [-8192, -8192], size: [16384, 16384]}, siteCellLog2: 10,
+      planes: {height: {log2: 6, tile: 256, default: -600}, biome: {log2: 8, tile: 256, default: 'ocean'}},
+      seaLevelY: 112, edgeFadeVox: 2048, warpAmpVox: 48, biomes: ['ocean', 'meadow', 'alpine', 'pine'],
+      terrain: {refVoxelsPerMetre: 10},
+      sites: [{id: 'spawn', kind: 'spawn', at: [0, 0]}, {id: 'harness', kind: 'pad', min: [-512, -512], max: [-256, -256]},
+              {id: 'tarn_0', kind: 'water', preset: 'tarn', at: [2000, 2000]},
+              {id: 'clearing_0', kind: 'clearing', min: [1000, -2000], max: [1500, -1500], feather: 64}]
+    };
+    var api = function (path, body) { return fetch(path, body === undefined ? {cache: 'no-store'} : {method: 'POST', body: body}).then(function (r) { return r.json(); }); };
+    var tileUrl = function (plane, tx, tz) { return '/api/worldmap/tile?name=' + FIX + '&plane=' + plane + '&tx=' + tx + '&tz=' + tz; };
+    var v1try = await api('/api/worldmap?name=' + FIX, JSON.stringify({version: 1, cellLog2: 10, size: [4, 4], biomes: ['ocean']}));
+    say(v1try.ok === false && /version must be 2/.test(v1try.error), 'POST /api/worldmap refuses a v1 map.json: ' + v1try.error);
+    var wj = await api('/api/worldmap?name=' + FIX, JSON.stringify(fixJson, null, 2));
+    say(!!wj.ok, 'POST /api/worldmap accepts the v2 fixture map.json' + (wj.ok ? '' : ': ' + wj.error));
+    var FH = MT.makePlane('height', fixJson), FB = MT.makePlane('biome', fixJson);
+    var ht = MT.newTile(FH), bt = MT.newTile(FB);
+    for (var j = 0; j < 256; j++) for (var i = 0; i < 256; i++) {
+      var d = Math.hypot(i - 128, j - 128);   // post (128,128) is world (0,0)
+      ht[j * 256 + i] = Math.round(-600 + Math.max(0, 1 - d / 120) * 6712);   // peak y 6112 = 600 m above sea
+      var c = Math.hypot((i + 0.5) * 256 - 8192, (j + 0.5) * 256 - 8192);
+      bt[j * 256 + i] = c < 1500 ? 2 : c < 6000 ? 1 : 0;
+    }
+    var hb = MT.encodeTile(FH, 0, 0, ht), bb = MT.encodeTile(FB, 0, 0, bt);
+    var bad = await api(tileUrl('height', 1, 0), hb);
+    say(bad.ok === false && /header says \(0,0\)/.test(bad.error), 'a tile POSTed at the wrong tx/tz is refused: ' + bad.error);
+    bad = await api(tileUrl('biome', 0, 0), hb);
+    say(bad.ok === false && /planeKind/.test(bad.error), 'a height tile POSTed as a biome tile is refused: ' + bad.error);
+    say(!!(await api(tileUrl('height', 0, 0), hb)).ok && !!(await api(tileUrl('biome', 0, 0), bb)).ok, 'the fixture tiles are written');
+    var lst = await api('/api/worldmap/tiles?name=' + FIX + '&plane=height');
+    say(lst.ok && lst.tiles.length === 1 && lst.tiles[0].tx === 0 && lst.tiles[0].size === 131104, 'GET tiles lists the one height tile: ' + JSON.stringify(lst.tiles));
+    var r404 = await fetch(tileUrl('height', 1, 1), {cache: 'no-store'});
+    say(r404.status === 404, 'an absent tile is a 404 (the default)');
+    say((await fetch('/api/worldmap/planes?name=default', {cache: 'no-store'})).status === 404, 'the v1 /api/worldmap/planes route is gone');
+
+    await M._load(FIX);
+    ok = await waitFor(function(){ return !!M._map() && M._map().name === FIX && M._loadsIdle() && M._map().H.tiles.size === 1 && M._map().B.tiles.size === 1; }, 30000);
+    var mp = M._map();
+    say(ok && pages.map.classList.contains('active'), 'map page loaded the v2 fixture: ' + (mp && (mp.H.posts[0] + '² height posts, ' + mp.B.posts[0] + '² biome cells, tiles loaded ' + mp.H.tiles.size + '+' + mp.B.tiles.size)));
     say(!!pages.map.querySelector('.mapterrain') && pages.map.querySelectorAll('.mapterrain-grid input').length >= 20,
         'Terrain section built with ' + pages.map.querySelectorAll('.mapterrain-grid input').length + ' inputs');
     var siteRows = pages.map.querySelectorAll('.mapsite');
     say(siteRows.length >= 4, 'Sites panel lists ' + siteRows.length + ' sites');
-    var lf = [].slice.call(siteRows).filter(function (r) { return /landform/.test(r.querySelector('.mapkind').textContent); });
-    say(lf.length >= 1, 'a landform site is listed (' + lf.length + ')');
-    if (lf.length) {
-      lf[0].querySelector('button').click();
-      say(M._selected() && M._selected().kind === 'landform' && !!pages.map.querySelector('.mapsites-panel select'),
-          'selecting it opens the shape / radius / height panel');
-    }
-    // ---- 6b. the map page's TOOLS, driven with pointer events (P5 sculpt, P6 tree / load check) ----------------
-    // Nothing is saved: every change is undone, so no file moves.
-    var btns = [].slice.call(pages.map.querySelectorAll('.mapbar button')).map(function (b) { return b.textContent; });
-    say(btns.indexOf('Landform brush') >= 0 && btns.indexOf('Landform site') >= 0 && btns.indexOf('Tree') >= 0 && btns.indexOf('Sculpt') >= 0,
-        'the toolbar carries Landform brush AND Landform site, Tree and Sculpt (' + btns.length + ' buttons)');
+    var wrow = [].slice.call(siteRows).filter(function (r) { return /water/.test(r.querySelector('.mapkind').textContent); });
+    if (wrow.length) wrow[0].querySelector('button').click();
+    say(M._selected() && M._selected().kind === 'water' && /tarn/.test(pages.map.querySelector('.mapsites-panel').textContent),
+        'selecting the lake opens its panel');
+
+    // ---- 6b. the topographic display ----------------------------------------------------------------------
     var cv = pages.map.querySelector('canvas.mapcanvas');
     cv.setPointerCapture = function () {};   // a synthetic pointer has no capture to take
+    say(cv.clientWidth > 100 && cv.clientHeight > 100, 'map canvas laid out ' + cv.clientWidth + 'x' + cv.clientHeight);
+    M._view().cx = 0; M._view().cz = 0;
+    function frac(wx, wz) { var v = M._view(); return [0.5 + (wx - v.cx) * v.scale / cv.clientWidth, 0.5 + (wz - v.cz) * v.scale / cv.clientHeight]; }
     function ptr(type, fx, fy, extra) {
       var r = cv.getBoundingClientRect();
-      var o = {clientX: r.left + r.width * fx, clientY: r.top + r.height * fy, button: 0, buttons: type === 'pointerup' ? 0 : 1, pointerId: 7, bubbles: true};
+      // fractions of the CONTENT box (what the page's view maps), not the border box
+      var o = {clientX: r.left + cv.clientLeft + cv.clientWidth * fx, clientY: r.top + cv.clientTop + cv.clientHeight * fy,
+               button: 0, buttons: type === 'pointerup' ? 0 : 1, pointerId: 7, bubbles: true};
       for (var k in (extra || {})) o[k] = extra[k];
       cv.dispatchEvent(new PointerEvent(type, o));
     }
-    say(cv.clientWidth > 100 && cv.clientHeight > 100, 'map canvas laid out ' + cv.clientWidth + 'x' + cv.clientHeight);
-    // SCULPT: a raise stroke writes the layer, one undo step, Undo takes it back.
-    var S = M._sculpt(), u0 = M._undoDepth(), tiles0 = S.tiles.size;
-    // The map may carry a sculpt layer of its own (the default map's
-    // Harrowby flatten): Undo must give back exactly what was there.
-    var left0 = 0;
-    S.tiles.forEach(function (t) { for (var i = 0; i < t.length; i++) left0 = Math.max(left0, Math.abs(t[i])); });
+    function at(type, wx, wz, extra) { var f = frac(wx, wz); ptr(type, f[0], f[1], extra); }
+    M._paint();
+    say(M._stats().tileImages > 0 && M._stats().contourPx > 0, 'the topographic render built ' + M._stats().tileImages + ' tile images, ' + M._stats().contourPx + ' contour pixels since load');
+    var g2 = cv.getContext('2d'), f0 = frac(400, 300), f1 = frac(-7000, -7000);
+    var px = function (f) { return g2.getImageData(Math.floor(cv.width * f[0]), Math.floor(cv.height * f[1]), 1, 1).data; };
+    var peakPx = px(f0), seaPx = px(f1);
+    say(peakPx[0] + peakPx[1] + peakPx[2] > seaPx[0] + seaPx[1] + seaPx[2] && seaPx[2] > seaPx[0],
+        'hypsometric ramp: the summit slopes (' + [].slice.call(peakPx, 0, 3) + ') is lighter than the deep sea (' + [].slice.call(seaPx, 0, 3) + '), which is blue');
+    M._disp().interval = 100; M._paint();
+    var c100 = M._stats().contourPx; M._disp().interval = 10; M._paint();
+    say(M._stats().contourPx - c100 > 0, 'a 10 m contour interval redraws the tiles (' + (M._stats().contourPx - c100) + ' contour px)');
+    M._disp().interval = 0;
+    var sc0 = M._view().scale; M._view().scale = 1;   // one pixel = one voxel for the readout
+    at('pointermove', 0, 0, {buttons: 0});
+    var ro = M._status();
+    M._view().scale = sc0;
+    say(/height 611 m \(y 61[01]\d,/.test(ro) && /\+600 m above sea/.test(ro) && /biome alpine/.test(ro) && /x 0\.\d m/.test(ro),
+        'hover readout at the summit: ' + ro.slice(0, 140));
+
+    // ---- 6c. height + biome strokes, undo / redo, the dirty-tile save --------------------------------------------
+    var btns = [].slice.call(pages.map.querySelectorAll('.mapbar button')).map(function (b) { return b.textContent; });
+    say(btns.indexOf('Height') >= 0 && btns.indexOf('Biome brush') >= 0 && btns.indexOf('Tree') >= 0 && btns.indexOf('Sculpt') >= 0 && btns.indexOf('Landform brush') < 0,
+        'the toolbar carries Height, Biome brush, Tree and Sculpt and no v1 landform tools (' + btns.length + ' buttons)');
+    var undoBtn = [].slice.call(pages.map.querySelectorAll('.mapbar button')).filter(function (b) { return b.textContent === 'Undo'; })[0];
+    var redoBtn = [].slice.call(pages.map.querySelectorAll('.mapbar button')).filter(function (b) { return b.textContent === 'Redo'; })[0];
+    var probe = function () { return MT.heightAt(mp.H, 8192, 0); };
+    var h0 = probe(), hIn0 = MT.heightAt(mp.H, 7500, 0), u0 = M._undoDepth();
+    M._tool('height');
+    var Br = M._brush(); Br.mode = 'raise'; Br.radiusM = 30; Br.strength = 60; Br.spacing = 25;
+    at('pointerdown', 7500, 0); at('pointermove', 7800, 0); at('pointermove', 8150, 0); at('pointerup', 8150, 0);
+    var pay = M._payload();
+    say(M._undoDepth() === u0 + 1 && probe() > h0 + 1, 'a height stroke raised the edge post ' + h0 + ' -> ' + probe().toFixed(1) + ' vox in one undo step');
+    say(pay.height.length === 2 && pay.biome.length === 0 && pay.height.every(function (e) { return e.bytes && e.bytes.length === 131104 && e.tz === 0; }),
+        'dirty-tile payload = only the touched tiles: height ' + pay.height.map(function (e) { return '(' + e.tx + ',' + e.tz + ')'; }).join(' ') + ', biome none');
+    var hAfter = probe();
+    undoBtn.click();
+    say(probe() === h0 && MT.heightAt(mp.H, 7500, 0) === hIn0 && !mp.H.tiles.has(MT.tileKey(1, 0)), 'Undo restores the posts exactly (the fresh tile is gone again)');
+    redoBtn.click();
+    say(probe() === hAfter, 'Redo brings the stroke back');
+    M._tool('biome'); Br.index = 3; Br.radiusM = 50;
+    var b0 = MT.biomeAt(mp.B, -6000, -6000);
+    at('pointerdown', -6000, -6000); at('pointerup', -6000, -6000);
+    say(b0 === 0 && MT.biomeAt(mp.B, -6000, -6000) === 3 && M._payload().biome.length === 1, 'a biome dab painted pine where the ocean was (1 biome tile dirty)');
+    Br.index = 0; at('pointerdown', 0, 0, {altKey: true}); at('pointerup', 0, 0);
+    say(Br.index === 2, 'Alt+click with the biome brush picks alpine at the summit');
+    pay = M._payload();
+    var saved = await M._save();
+    lst = await api('/api/worldmap/tiles?name=' + FIX + '&plane=height');
+    var disk = await (await fetch(tileUrl('height', 1, 0), {cache: 'no-store'})).arrayBuffer();
+    var want = pay.height.filter(function (e) { return e.tx === 1; })[0].bytes, same = disk.byteLength === want.length;
+    new Uint8Array(disk).forEach(function (b, i) { if (b !== want[i]) same = false; });
+    say(saved && lst.tiles.length === 2 && same && M._payload().height.length === 0,
+        'Save wrote only the dirty tiles: ' + lst.tiles.length + ' height tiles on disk, tile (1,0) byte-identical to the payload, nothing dirty after');
+
+    // ---- 6d. the site tools and the sculpt layer still work on v2 (P5 sculpt, P6 tree / clearing) -----------------
+    var S = M._sculpt(), u1 = M._undoDepth(), tiles0 = S.tiles.size;
     M._tool('sculpt');
     S.mode = 'raise'; S.radius = 2048; S.strength = 50;
     ptr('pointerdown', 0.5, 0.5); ptr('pointermove', 0.55, 0.5); ptr('pointermove', 0.6, 0.52); ptr('pointerup', 0.6, 0.52);
     var peak = 0;
     S.tiles.forEach(function (t) { for (var i = 0; i < t.length; i++) peak = Math.max(peak, t[i]); });
-    say(S.tiles.size > tiles0 && peak > 1 && S.dirty && M._undoDepth() === u0 + 1,
-        'a sculpt raise stroke wrote ' + (S.tiles.size - tiles0) + ' tiles, peak +' + peak.toFixed(1) + ' vox, ' + (M._undoDepth() - u0) + ' undo step');
+    say(S.tiles.size > tiles0 && peak > 1 && S.dirty && M._undoDepth() === u1 + 1,
+        'a sculpt raise stroke wrote ' + (S.tiles.size - tiles0) + ' tiles, peak +' + peak.toFixed(1) + ' vox, ' + (M._undoDepth() - u1) + ' undo step');
     var bytes = M.serializeSculpt(S.tiles), back2 = bytes ? M.parseSculpt(bytes.buffer) : new Map();
-    var same = bytes && back2.size <= S.tiles.size && back2.size > 0;
-    back2.forEach(function (t, k) { var a = S.tiles.get(k); if (!a) { same = false; return; } for (var i = 0; i < t.length; i++) if (t[i] !== Math.round(a[i])) same = false; });
-    say(!!same, 'the stroke serialises and parses back to the rounded layer (' + (bytes ? bytes.length : 0) + ' bytes, ' + back2.size + ' tiles)');
-    [].slice.call(pages.map.querySelectorAll('.mapbar button')).filter(function (b) { return b.textContent === 'Undo'; })[0].click();
+    var same2 = bytes && back2.size <= S.tiles.size && back2.size > 0;
+    back2.forEach(function (t, k) { var a = S.tiles.get(k); if (!a) { same2 = false; return; } for (var i = 0; i < t.length; i++) if (t[i] !== Math.round(a[i])) same2 = false; });
+    say(!!same2, 'the stroke serialises and parses back to the rounded layer (' + (bytes ? bytes.length : 0) + ' bytes, ' + back2.size + ' tiles)');
+    undoBtn.click();
     var left = 0;
     S.tiles.forEach(function (t) { for (var i = 0; i < t.length; i++) left = Math.max(left, Math.abs(t[i])); });
-    say(S.tiles.size === tiles0 && left === left0 && M._undoDepth() === u0, 'Undo takes the stroke back (' + S.tiles.size + ' tiles, max |offset| ' + left + ', was ' + left0 + ')');
-    // TREE: a click plants the picked species at the column, the Sites panel edits it; Undo removes it.
+    say(S.tiles.size === tiles0 && left === 0 && M._undoDepth() === u1, 'Undo takes the sculpt stroke back (' + S.tiles.size + ' tiles)');
     ok = await waitFor(function(){ return M._trees().list.length > 0; }, 10000);
     say(ok, 'tree species listed from assets/trees/*.svtree: ' + M._trees().list.join(', '));
-    var nSites = M._map().json.sites.length;
+    var nSites = mp.json.sites.length;
     M._tool('tree');
     ptr('pointerdown', 0.3, 0.4); ptr('pointerup', 0.3, 0.4);
     var ts = M._map().json.sites[M._map().json.sites.length - 1];
     say(M._map().json.sites.length === nSites + 1 && ts.kind === 'tree' && ts.species === M._trees().species &&
         Array.isArray(ts.at) && ts.variant === undefined && ts.rot === undefined,
         'the Tree tool planted ' + JSON.stringify(ts));
-    say(M._selected() === ts && !!pages.map.querySelector('.mapsites-panel select') &&
-        [].slice.call(pages.map.querySelectorAll('.mapsite .mapkind')).some(function (k) { return k.textContent === 'tree'; }),
-        'the new tree is selected, listed, and its panel has the species select');
-    [].slice.call(pages.map.querySelectorAll('.mapbar button')).filter(function (b) { return b.textContent === 'Undo'; })[0].click();
+    say(M._selected() === ts && !!pages.map.querySelector('.mapsites-panel select'), 'the new tree is selected and its panel has the species select');
+    undoBtn.click();
     say(M._map().json.sites.length === nSites, 'Undo removes it (' + M._map().json.sites.length + ' sites)');
-    // CLEARING: a drag draws a forest clearing box, selected with its corner
-    // and feather fields; a drag inside moves it; shift+click deletes it; Undo
-    // brings it back and Undo again takes the drawing back.
     M._tool('clearing');
-    ptr('pointerdown', 0.40, 0.40); ptr('pointermove', 0.44, 0.45); ptr('pointerup', 0.44, 0.45);
+    var nc = M._map().json.sites.length;
+    at('pointerdown', -4000, 3000); at('pointermove', -3000, 4000); at('pointerup', -3000, 4000);
     var cs = M._map().json.sites[M._map().json.sites.length - 1];
-    say(M._map().json.sites.length === nSites + 1 && cs.kind === 'clearing' && cs.min[0] < cs.max[0] && cs.min[1] < cs.max[1] &&
+    say(M._map().json.sites.length === nc + 1 && cs.kind === 'clearing' && cs.min[0] < cs.max[0] && cs.min[1] < cs.max[1] &&
         cs.feather === 64 && M._selected() === cs && pages.map.querySelectorAll('.mapsites-panel input[type=number]').length >= 5,
         'the Clearing tool drew ' + JSON.stringify(cs) + ', selected, with corner + feather fields');
     var w0 = cs.max[0] - cs.min[0], x0 = cs.min[0];
-    ptr('pointerdown', 0.42, 0.42); ptr('pointermove', 0.43, 0.42); ptr('pointerup', 0.43, 0.42);
-    say(cs.min[0] > x0 && cs.max[0] - cs.min[0] === w0, 'a drag inside it moves it, same size (x ' + x0 + ' -> ' + cs.min[0] + ')');
-    ptr('pointerdown', 0.43, 0.43, {shiftKey: true}); ptr('pointerup', 0.43, 0.43, {shiftKey: true});
-    say(M._map().json.sites.length === nSites, 'shift+click inside it deletes it');
-    var undoBtn = [].slice.call(pages.map.querySelectorAll('.mapbar button')).filter(function (b) { return b.textContent === 'Undo'; })[0];
+    at('pointerdown', -3500, 3500); at('pointermove', -3300, 3500); at('pointerup', -3300, 3500);
+    cs = M._selected();
+    say(!!cs && cs.min[0] > x0 && cs.max[0] - cs.min[0] === w0, 'a drag inside it moves it, same size (x ' + x0 + ' -> ' + (cs && cs.min[0]) + ')');
+    at('pointerdown', cs.min[0] + 50, cs.min[1] + 50, {shiftKey: true}); at('pointerup', cs.min[0] + 50, cs.min[1] + 50, {shiftKey: true});
+    say(M._map().json.sites.length === nc, 'shift+click inside it deletes it');
     undoBtn.click(); undoBtn.click(); undoBtn.click();
-    say(M._map().json.sites.length === nSites && !M._map().json.sites.some(function (s) { return s.kind === 'clearing' && s.id === cs.id; }),
-        'three Undos take back the delete, the move and the drawing (' + M._map().json.sites.length + ' sites)');
+    say(M._map().json.sites.length === nc, 'three Undos take back the delete, the move and the drawing (' + M._map().json.sites.length + ' sites)');
+    // ---- 6e. the HEIGHT TOOLS (docs/PLAN_map_v2.md E2) ---------------------------------------------------------
+    // Every check compares ENCODED TILES (what a save would write) across all
+    // four fixture tiles, so "changed only the expected tiles" and "undo is
+    // byte-exact" are about bytes on disk, not floats.
+    var HP = mp.H, ALLK = [MT.tileKey(0, 0), MT.tileKey(1, 0), MT.tileKey(0, 1), MT.tileKey(1, 1)];
+    var tileBytes = function (P) { return ALLK.map(function (k) { var t = P.tiles.get(k), xz = MT.tileXZ(k); return t && !MT.isDefaultTile(P, t) ? MT.encodeTile(P, xz[0], xz[1], t) : null; }); };
+    var sameT = function (a, b) { return a === null || b === null ? a === b : a.length === b.length && a.every(function (v, i) { return v === b[i]; }); };
+    var diffTiles = function (A, B) { var out = []; for (var q = 0; q < A.length; q++) if (!sameT(A[q], B[q])) out.push(MT.tileXZ(ALLK[q]).join(',')); return out.join(' '); };
+    var Hb = M._hb();
+    // A worker's answer is not network: under --virtual-time-budget an idle
+    // await on it lets virtual time run out. Poll with waitFor (a fetch) instead.
+    async function settle(p) { var d = false, v; p.then(function (x) { v = x; d = true; }, function () { d = true; }); await waitFor(function () { return d; }, 120000); return v; }
+    say(MT.HEIGHT_MODES.join() === 'raise,lower,smooth,flatten,set,terrace,noise,erode', 'the height brush has eight modes: ' + MT.HEIGHT_MODES.join(', '));
+    M._tool('height');
+    Br.radiusM = 40; Br.strength = 80; Br.spacing = 25; Br.targetM = 50;
+    Hb.stepM = 20; Hb.sharp = 80; Hb.ampM = 40; Hb.sizeM = 200; Hb.seed = 3;
+    MT.HEIGHT_MODES.forEach(function (m) {
+      Br.mode = m;
+      var pre = tileBytes(HP), d0 = M._undoDepth();
+      at('pointerdown', -4000, -4000); at('pointermove', -3900, -3950); at('pointermove', -3800, -3900); at('pointerup', -3800, -3900);
+      var post = tileBytes(HP), moved = diffTiles(pre, post);
+      undoBtn.click();
+      var back = diffTiles(pre, tileBytes(HP));
+      say(moved === '0,0' && M._undoDepth() === d0 && back === '', m + ': the stroke changed only tile 0,0 (' + (moved || 'none') + '), one undo step, and Undo is byte-exact' + (back ? ' (DIFFERS: ' + back + ')' : ''));
+    });
+    Br.mode = 'raise';
+    // shape stamp: one click, one undo step
+    M._tool('shape');
+    var Sh = M._shape(); Sh.kind = 'peak'; Sh.heightM = 200; Sh.mode = 'rise'; Sh.radiusM = 150; Sh.aspect = 1; Sh.rot = 0;
+    var preS = tileBytes(HP), hS0 = MT.heightAt(HP, -4032, 4032);
+    var vw = M._view(), vs0 = [vw.cx, vw.cz, vw.scale];
+    vw.cx = -4032; vw.cz = 4032; vw.scale = 1;   // a pixel per voxel: the click lands on the post
+    at('pointerdown', -4032, 4032); at('pointerup', -4032, 4032);
+    vw.cx = vs0[0]; vw.cz = vs0[1]; vw.scale = vs0[2];
+    var hS1 = MT.heightAt(HP, -4032, 4032), movedS = diffTiles(preS, tileBytes(HP));
+    undoBtn.click();
+    say(Math.abs(hS1 - hS0 - 2000) < 8 && movedS === '0,0' && diffTiles(preS, tileBytes(HP)) === '',
+        'Shape: a +200 m peak raised its centre ' + (hS1 - hS0).toFixed(1) + ' vox in tile ' + movedS + ' only; Undo byte-exact');
+    Sh.kind = 'mesa'; Sh.mode = 'summit'; Sh.heightM = 100;
+    at('pointerdown', -4000, 4000); at('pointerup', -4000, 4000);
+    say(Math.abs(MT.heightAt(HP, -4000, 4000) - (112 + 1000)) < 1, 'Shape: a mesa with its top at 100 m above sea sits at y ' + MT.heightAt(HP, -4000, 4000).toFixed(1));
+    undoBtn.click();
+    // ridge line: draw, bake, undo / redo byte-exact, rebake after an edit
+    M._tool('line');
+    var preL = tileBytes(HP), nr = (mp.json.ridges || []).length;
+    at('pointerdown', -6000, -2000); at('pointerup', -6000, -2000);
+    at('pointerdown', -2000, -2000); at('pointerup', -2000, -2000);
+    cv.dispatchEvent(new MouseEvent('dblclick', {bubbles: true}));
+    var LN = M._map().json.ridges[nr];
+    say(!!LN && LN.points.length === 2 && LN.kind === 'ridge' && !M._lines().drawing && M._lines().sel === LN && !LN.baked,
+        'Line: two clicks and a double-click drew ' + JSON.stringify(LN && {id: LN.id, kind: LN.kind, profile: LN.profile, width: LN.width, n: LN.points.length}));
+    // put the vertices ON posts (a pointer lands within a voxel; the crest check wants exact posts)
+    LN.points[0][0] = -6016; LN.points[1][0] = -1984;
+    LN.points.forEach(function (p) { p[1] = -2048; p[2] = 112 + 9000; }); LN.width = 600; LN.profile = 'sharp';
+    var d1 = M._undoDepth();
+    M._bake(LN);
+    var crest = MT.heightAt(HP, -4032, -2048), bakedB = tileBytes(HP);
+    say(Math.abs(crest - 9112) < 2 && LN.baked && diffTiles(preL, bakedB) === '0,0' && M._undoDepth() === d1 + 1 &&
+        !!pages.map.querySelector('.mapprofile'),
+        'Bake: the crest is at y ' + crest.toFixed(1) + ' (900 m asl), tile ' + diffTiles(preL, bakedB) + ' only, one undo step, profile chart drawn');
+    undoBtn.click();
+    var LN2 = M._map().json.ridges[nr];   // a json undo replaces the objects: re-read
+    say(diffTiles(preL, tileBytes(HP)) === '' && !LN2.baked && !M._bakes().has(LN2.id), 'Undo of the bake is byte-exact, the line is unbaked again and the bake record is gone');
+    redoBtn.click();
+    LN2 = M._map().json.ridges[nr];
+    say(diffTiles(bakedB, tileBytes(HP)) === '' && LN2.baked && M._bakes().has(LN2.id), 'Redo of the bake is byte-exact and brings the record back');
+    // a stroke after the bake survives a rebake as its offset
+    M._tool('height'); Br.mode = 'raise'; Br.radiusM = 20; Br.strength = 50;
+    at('pointerdown', -3000, -4500); at('pointerup', -3000, -4500);
+    var hBump = MT.heightAt(HP, -3000, -4500);
+    LN2 = M._map().json.ridges[nr];
+    LN2.points[1][2] = 112 + 4000;
+    var preRe = tileBytes(HP);
+    M._bake(LN2);
+    var endH = MT.heightAt(HP, -1984, -2048);
+    say(Math.abs(endH - 4112) < 2 && Math.abs(MT.heightAt(HP, -3000, -4500) - hBump) < 1e-3 && M._lines().sel && M._lines().sel.baked,
+        'Rebake after lowering the east vertex: its crest is now y ' + endH.toFixed(1) + ', and a stroke painted after the first bake is kept (' + hBump.toFixed(1) + ')');
+    undoBtn.click();
+    say(diffTiles(preRe, tileBytes(HP)) === '', 'Undo of the rebake is byte-exact');
+    undoBtn.click(); undoBtn.click();   // the stroke and the bake
+    say(diffTiles(preL, tileBytes(HP)) === '', 'two more Undos take the plane back to before the line, byte-exact');
+    // ---- erosion of an Area, in the worker
+    M._tool('area');
+    at('pointerdown', -7000, -7000); at('pointermove', -4000, -4000); at('pointermove', -1000, -1000); at('pointerup', -1000, -1000);
+    var AR = M._area();
+    say(!!AR && Math.abs(AR[0] + 7000) < 80 && Math.abs(AR[3] + 1000) < 80, 'Area tool drew ' + JSON.stringify(AR));
+    var Er = M._erosion(); Er.seed = 7; Er.iterations = 3; Er.strength = 60;
+    var preE = tileBytes(HP), dE = M._undoDepth();
+    await settle(M._runErosion());
+    var e1 = tileBytes(HP), movedE = diffTiles(preE, e1);
+    say(!!Er.pending && movedE === '0,0', 'Erode area (worker): a preview in the plane, tiles ' + (movedE || 'none'));
+    M._discardErosion();
+    say(diffTiles(preE, tileBytes(HP)) === '' && !Er.pending, 'Discard puts the posts back byte-exact');
+    await settle(M._runErosion());
+    say(diffTiles(e1, tileBytes(HP)) === '', 'erosion is DETERMINISTIC: the same seed on the same posts gives byte-identical tiles');
+    M._discardErosion();
+    Er.seed = 8;
+    await settle(M._runErosion());
+    say(diffTiles(e1, tileBytes(HP)) !== '', 'a different seed erodes differently');
+    M._commitErosion();
+    say(M._undoDepth() === dE + 1, 'Commit is one undo step');
+    undoBtn.click();
+    say(diffTiles(preE, tileBytes(HP)) === '', 'and Undo of it is byte-exact');
+    // ---- PNG export -> import round trip (through scripts/map_png.py)
+    var prePng = tileBytes(HP);
+    var png = await M._exportPng('height');
+    var sig = png && String.fromCharCode(png[1], png[2], png[3]);
+    say(sig === 'PNG' && png.length > 100, 'Export height PNG over the area: ' + (png ? png.length : 0) + ' bytes');
+    M._tool('height'); Br.mode = 'raise'; Br.radiusM = 80; Br.strength = 100;
+    at('pointerdown', -4000, -4000); at('pointerup', -4000, -4000);
+    say(diffTiles(prePng, tileBytes(HP)) === '0,0', 'a raise stroke inside the area changed the plane');
+    await M._importPng(png, 'height', 'rt.png');
+    var PI = M._pngIn();
+    say(!!PI && PI.target === 'note' && Math.abs(PI.mpu - 0.1) < 1e-12,
+        'the import dialog read the PNG’s own note: ' + (PI && JSON.stringify({target: PI.target, mpu: PI.mpu, offsetM: PI.offsetM, w: PI.img.w, h: PI.img.h})));
+    M._applyPng();
+    say(diffTiles(prePng, tileBytes(HP)) === '', 'PNG export -> import round-trips the height EXACTLY (the stroke is gone, every tile byte-identical)');
+    var BP = mp.B, preB = [MT.tileKey(0, 0)].map(function (k) { return MT.encodeTile(BP, 0, 0, BP.tiles.get(k) || MT.newTile(BP)); });
+    var bpng = await M._exportPng('biome');
+    M._tool('biome'); Br.index = 3; Br.radiusM = 200;
+    at('pointerdown', -4000, -4000); at('pointerup', -4000, -4000);
+    await M._importPng(bpng, 'biome', 'b.png');
+    var unm = M._pngIn() && M._pngIn().map.unmapped.length;
+    M._applyPng();
+    var postB = MT.encodeTile(BP, 0, 0, BP.tiles.get(MT.tileKey(0, 0)));
+    say(unm === 0 && sameT(preB[0], postB), 'biome PNG export -> import round-trips exactly (' + unm + ' unmapped colours)');
+    M._area(null);
+
+    // ---- 6f. the VECTOR LAYERS (docs/PLAN_map_v2.md E3): roads, regions, markers ---------------------------
+    // Drawn with synthetic pointers at one pixel per two voxels, so every
+    // click lands on a whole voxel and the snap reach is 16 voxels.
+    var VL = M._vl(), VS = VL.st, VEC = await import('./editor/mapvector.js');
+    btns = [].slice.call(pages.map.querySelectorAll('.mapbar button')).map(function (b) { return b.textContent; });
+    say(['Road', 'Region', 'Marker'].every(function (n) { return btns.indexOf(n) >= 0; }) && !!pages.map.querySelector('details.mapvector'),
+        'the toolbar carries Road, Region and Marker; the Vector layers panel is built');
+    var vw2 = M._view(); vw2.cx = 0; vw2.cz = 5000; vw2.scale = 0.5;
+    var JS = function () { return M._map().json; };
+    var dbl = function () { cv.dispatchEvent(new MouseEvent('dblclick', {bubbles: true})); };
+    var click = function (x, z, extra) { at('pointerdown', x, z, extra); at('pointerup', x, z, extra); };
+    var nRoads = (JS().roads || []).length, dV = M._undoDepth();
+    M._tool('road');
+    VS.newRoad.kind = 'path'; VS.newRoad.surface = 'packed_gravel';
+    click(-500, 5000); click(0, 5000); click(400, 5100); dbl();
+    var R1 = JS().roads[nRoads];
+    say(!!R1 && R1.points.length === 3 && R1.kind === 'path' && R1.width === 12 && R1.shoulder === 6 && R1.maxGrade === 25 &&
+        R1.surface === 'packed_gravel' && !VS.drawing && M._undoDepth() === dV + 3,
+        'Road: three clicks and a double-click drew ' + JSON.stringify(R1 && {id: R1.id, pts: R1.points, kind: R1.kind, width: R1.width}) + ' in ' + (M._undoDepth() - dV) + ' undo steps');
+    var d0 = M._undoDepth();
+    at('pointerdown', 0, 5000); at('pointermove', 0, 5040); at('pointermove', 0, 5080); at('pointerup', 0, 5080);
+    R1 = JS().roads[nRoads];
+    say(R1.points[1][0] === 0 && R1.points[1][1] === 5080 && M._undoDepth() === d0 + 1, 'dragging a vertex moved it to (' + R1.points[1] + ') in one undo step');
+    click(-250, 5040);
+    R1 = JS().roads[nRoads];
+    say(R1.points.length === 4 && R1.points[1][0] === -250 && R1.points[1][1] === 5040, 'a click on the selected road inserted a vertex at (' + R1.points[1] + ')');
+    click(-250, 5040, {shiftKey: true});
+    R1 = JS().roads[nRoads];
+    say(R1.points.length === 3, 'shift+click on it deleted it again (' + R1.points.length + ' vertices)');
+    // JUNCTIONS: a branch off vertex 1 (Ctrl+click snaps onto it), its end dropped on R1's other segment (T junction)
+    click(4, 5083, {ctrlKey: true}); click(200, 4800); click(201, 5093); dbl();
+    R1 = JS().roads[nRoads];
+    var R2 = JS().roads[nRoads + 1];
+    say(!!R2 && R2.points.length === 3 && R2.points[0].join() === '0,5080' && R2.points[2].join() === '201,5090' &&
+        R1.points.length === 4 && R1.points[2].join() === '201,5090',
+        'junction snapping: the branch starts ON vertex (' + (R2 && R2.points[0]) + ') and ends ON the segment it was dropped on, which gained the vertex (' + R1.points[2] + ')');
+    d0 = M._undoDepth();
+    at('pointerdown', 0, 5080); at('pointermove', 10, 5070); at('pointermove', 20, 5060); at('pointerup', 20, 5060);
+    R1 = JS().roads[nRoads]; R2 = JS().roads[nRoads + 1];
+    say(R1.points[1].join() === '20,5060' && R2.points[0].join() === '20,5060' && M._undoDepth() === d0 + 1, 'dragging the junction moves both roads\' vertices (' + R1.points[1] + ' / ' + R2.points[0] + ')');
+    undoBtn.click();
+    R1 = JS().roads[nRoads]; R2 = JS().roads[nRoads + 1];
+    say(R1.points[1].join() === '0,5080' && R2.points[0].join() === '0,5080', 'Undo puts the junction back');
+    at('pointerdown', 0, 5080, {altKey: true}); at('pointermove', 30, 5000, {altKey: true}); at('pointerup', 30, 5000, {altKey: true});
+    R1 = JS().roads[nRoads]; R2 = JS().roads[nRoads + 1];
+    var detached = R1.points[1].join() !== R2.points[0].join();
+    undoBtn.click();
+    R1 = JS().roads[nRoads]; R2 = JS().roads[nRoads + 1];
+    say(detached && R1.points[1].join() === R2.points[0].join(), 'Alt+drag pulls one road\'s vertex out of the junction (undone)');
+    // the inspector (select from the list centres the road; the view goes back after)
+    VL.selectById('road', R1.id, true);
+    say(Math.abs(vw2.cx - (-50)) < 1 && Math.abs(vw2.cz - 5050) < 1, 'selecting a road from the list centres the view on it (' + vw2.cx + ', ' + vw2.cz + ')');
+    vw2.cx = 0; vw2.cz = 5000; vw2.scale = 0.5;
+    var insp = pages.map.querySelector('details.mapvector .maptools-panel');
+    var nIn = insp.querySelectorAll('input[type=number]');
+    nIn[0].value = 30; nIn[0].dispatchEvent(new Event('change'));
+    R1 = JS().roads[nRoads];
+    insp = pages.map.querySelector('details.mapvector .maptools-panel');
+    var kSel = insp.querySelector('select');
+    kSel.value = 'road'; kSel.dispatchEvent(new Event('change'));
+    R1 = JS().roads[nRoads];
+    say(R1.width === 30 && R1.kind === 'road' && R1.shoulder === 16 && R1.maxGrade === 10,
+        'inspector: width 30 typed, kind -> road took the road defaults for the fields left at the path\'s (' + JSON.stringify({w: R1.width, sh: R1.shoulder, g: R1.maxGrade}) + ')');
+    var prof = pages.map.querySelector('canvas.mapprofile-road');
+    say(!!prof && /not saved yet/.test(prof.parentNode.textContent), 'the profile chart is there and says an unsaved road has no bake yet');
+    // a region: three clicks and a click on the first vertex close it
+    M._tool('region');
+    var nReg = (JS().regions || []).length;
+    click(-500, 4850); click(-200, 4850); click(-200, 4950); click(-500, 4850);
+    var RG = JS().regions[nReg];
+    say(!!RG && RG.points.length === 3 && !VS.drawing && /^#[0-9a-f]{6}$/i.test(RG.colour) && VEC.regionAt(JS().regions, -300, 4870) === RG &&
+        VEC.regionAt(JS().regions, -450, 4940) === null,
+        'Region: closed a triangle ' + JSON.stringify(RG && {id: RG.id, name: RG.name, colour: RG.colour, n: RG.points.length}) + '; regionAt inside / outside it agree');
+    click(-350, 4850);
+    RG = JS().regions[nReg];
+    say(RG.points.length === 4 && RG.points[1].join() === '-350,4850', 'a click on its edge inserted a vertex');
+    // a marker
+    M._tool('marker'); VS.newIcon = 'castle';
+    var nMk = (JS().markers || []).length;
+    click(300, 4900);
+    var MK = JS().markers[nMk];
+    say(!!MK && MK.icon === 'castle' && MK.at.join() === '300,4900', 'Marker: placed ' + JSON.stringify(MK));
+    at('pointerdown', 300, 4880); at('pointermove', 330, 4880); at('pointermove', 360, 4880); at('pointerup', 360, 4880);
+    MK = JS().markers[nMk];
+    say(MK.at.join() === '360,4900', 'dragging its badge moved it to (' + MK.at + ')');
+    M._paint();
+    var fm = frac(360, 4900), bx = Math.round(cv.width * fm[0]) - 14, bz = Math.round(cv.height * fm[1]) - 30;
+    var bp = g2.getImageData(bx, bz, 1, 1).data;
+    say(bp[0] === 255 && bp[1] === 216 && bp[2] === 102, 'the selected marker\'s pixel-art badge is drawn (corner ' + [].slice.call(bp, 0, 3) + ')');
+    click(360, 4890, {shiftKey: true});
+    var gone = JS().markers.length === nMk;
+    undoBtn.click();
+    say(gone && JS().markers.length === nMk + 1, 'shift+click deletes the marker; Undo brings it back');
+    // save: refused over a road the engine would refuse; then the round trip
+    JS().roads.push({id: 'e3_bad', points: [[0, 0]]});
+    var refused = await M._save();
+    var tIdx = toasts.findIndex(function (t) { return /not saved/.test(t); });
+    say(refused === false && tIdx >= 0, 'Save is refused over a one-point road: ' + (tIdx >= 0 ? toasts[tIdx].slice(0, 120) : '(no toast)'));
+    if (tIdx >= 0) toasts.splice(tIdx, 1);
+    JS().roads.pop();
+    var oldCk = M._check();
+    var okS = await M._save();
+    var disk2 = await api('/api/worldmap?name=' + FIX);
+    say(okS && JSON.stringify(disk2.roads) === JSON.stringify(JS().roads) && JSON.stringify(disk2.regions) === JSON.stringify(JS().regions) &&
+        JSON.stringify(disk2.markers) === JSON.stringify(JS().markers),
+        'Save round-trips ' + JS().roads.length + ' roads, ' + JS().regions.length + ' region(s), ' + JS().markers.length + ' marker(s) through map.json');
+    ok = await waitFor(function () { return !!M._check() && M._check() !== oldCk; }, 90000);
+    var ck2 = M._check();
+    if (!ck2 || ck2.unavailable) skip('the engine bake of the drawn roads: ' + (ck2 ? String(ck2.error).slice(0, 80) : 'no answer'));
+    else if (!ck2.ok && /svmap|version|v1/i.test(String(ck2.error))) skip('the engine bake of the drawn roads: this sandvox.exe predates v2 maps');
+    else if (!Array.isArray(ck2.regions)) skip('--mapcheck regions / markers / dense profile: this sandvox.exe predates E3');
+    else {
+      var er = (ck2.roads || []).filter(function (r) { return r.id === R1.id; })[0];
+      say(ck2.ok && ck2.regions.length === JS().regions.length && ck2.markers.length === JS().markers.length && !!er && !!er.profile && er.profile.s.length >= 2,
+          '--mapcheck accepts the saved vector layers: ' + (ck2.ok ? (ck2.roads || []).length + ' roads baked, ' + ck2.regions.length + ' region(s), ' + ck2.markers.length + ' marker(s)' +
+          (er && er.profile ? ', ' + er.profile.s.length + ' profile samples, worst grade ' + er.worstGrade + ' %' : '') : 'REFUSED: ' + String(ck2.error).slice(0, 160)));
+      VL.selectById('road', R1.id);
+      prof = pages.map.querySelector('canvas.mapprofile-road');
+      var pn = prof ? prof.parentNode.textContent : '';
+      say(/engine: \d+ pieces/.test(pn) && !/EDITED/.test(pn), 'the profile chart shows the engine\'s bake: ' + pn.replace(/^Profile[^)]*\)/, '').slice(0, 140));
+      JS().roads[nRoads].points[0][1] += 40;
+      VL.sync();
+      pn = pages.map.querySelector('canvas.mapprofile-road').parentNode.textContent;
+      say(/EDITED since the save/.test(pn), 'an edit after the save marks the chart as the SAVED road\'s bake');
+      JS().roads[nRoads].points[0][1] -= 40;
+    }
+    M._tool('height');
+
+    // ---- 6g. LOCALES (docs/PLAN_map_v2.md E4): the locale editor --------------------------------------------
+    // A SYNTHETIC locale on the fixture map -- never Harrowby's files: drawn with
+    // the Locale tool, saved, opened by a double-click on its badge. A sculpt
+    // stroke dragged ACROSS its edge moves no sample whose reach leaves the
+    // bounds (and, with an engine, no column of the engine's own heights
+    // outside them); a clearing dragged out of it is clamped; a tree outside is
+    // refused. With an engine (L1): a structure placed / turned / moved /
+    // deleted and two waynodes joined, all through the F8 command layer, each
+    // undone; the refs file stores y RELATIVE to the anchor; a voxel edit
+    // inside the bounds (and not the one outside) saved to the LOCALE's own
+    // layer and served back by the voxel server. Engine lines SKIP on an exe
+    // that predates L1.
+    var LCx = M._lc(), LS = LCx.st, LOCm = await import('./editor/maplocale.js');
+    btns = [].slice.call(pages.map.querySelectorAll('.mapbar button')).map(function (b) { return b.textContent; });
+    say(btns.indexOf('Locale') >= 0 && btns.indexOf('Structure') >= 0 && btns.indexOf('Link') >= 0 && !!pages.map.querySelector('details.maplocale'),
+        'the toolbar carries Locale (+ the locale page\'s Structure and Link); the Locales panel is built');
+    var LB = [-2000, 1000, -1701, 1299];   // the synthetic locale's bounds (inclusive), on the cone's west flank
+    vw2.cx = -1850; vw2.cz = 1150; vw2.scale = 0.5;
+    M._tool('locale'); LS.newIcon = 'shrine';
+    var nLoc = (JS().locales || []).length, dL = M._undoDepth();
+    at('pointerdown', LB[0], LB[1]); at('pointermove', -1900, 1100); at('pointermove', LB[2], LB[3]); at('pointerup', LB[2], LB[3]);
+    var LZ = (JS().locales || [])[nLoc];
+    say(!!LZ && LZ.icon === 'shrine' && JSON.stringify(LZ.bounds) === JSON.stringify({min: [LB[0], LB[1]], max: [LB[2], LB[3]]}) &&
+        LOCm.inBounds(LZ, LZ.anchor.at[0], LZ.anchor.at[1]) && Number.isInteger(LZ.anchor.y) && M._undoDepth() === dL + 1,
+        'Locale tool: a drag drew ' + JSON.stringify(LZ) + ' in one undo step');
+    at('pointerdown', -1990, 1010); at('pointerup', -1990, 1010);
+    say(JS().locales.length === nLoc + 1 && LS.sel === LZ.id, 'a click inside it selects it, draws no second one');
+    var lin = pages.map.querySelectorAll('details.maplocale .maptools-panel input.mapid');
+    lin[0].value = 'e4test'; lin[0].dispatchEvent(new Event('change'));
+    lin = pages.map.querySelectorAll('details.maplocale .maptools-panel input.mapid');
+    lin[1].value = 'E4 Test'; lin[1].dispatchEvent(new Event('change'));
+    LZ = JS().locales[nLoc];
+    say(LZ.id === 'e4test' && LZ.name === 'E4 Test' && LS.sel === 'e4test', 'the inspector renames it: ' + LZ.id + ' / ' + LZ.name);
+    M._paint();
+    var la = LZ.anchor.at, fa = frac(la[0], la[1]);
+    var lp = g2.getImageData(Math.round(cv.width * fa[0]) - 14, Math.round(cv.height * fa[1]) - 30, 1, 1).data;
+    say(lp[0] === 255 && lp[1] === 216 && lp[2] === 102, 'the selected locale\'s pixel-art badge is drawn at its anchor (corner ' + [].slice.call(lp, 0, 3) + ')');
+    var oldCkL = M._check();
+    say(await M._save(), 'Save writes the locale into map.json');
+    var diskL = await api('/api/worldmap?name=' + FIX);
+    say((diskL.locales || []).some(function (l) { return l.id === 'e4test' && l.icon === 'shrine'; }), 'map.json on disk carries locales[] e4test');
+    await waitFor(function () { return !!M._check() && M._check() !== oldCkL; }, 90000);
+    var ckL = M._check(), ENGINE = !!(ckL && ckL.ok && Array.isArray(ckL.locales));
+    var ckE = ENGINE ? ckL.locales.filter(function (e) { return e.id === 'e4test'; })[0] : null;
+    if (!ENGINE) skip('the engine side of the locale (anchor, refs, voxels): ' + (ckL ? (ckL.unavailable ? 'engine unavailable' : (ckL.ok ? 'this sandvox.exe predates L1' : 'REFUSED: ' + String(ckL.error).slice(0, 100))) : 'no answer'));
+    else say(!!ckE && Number.isInteger(ckE.groundY) && ckE.anchorY === LZ.anchor.y, '--mapcheck measures its anchor: ' + JSON.stringify(ckE));
+    // the engine's heights of the box BEFORE the sculpt (the saved files: no sculpt here yet)
+    var HSPAN = 428, HCX = -1850, HCZ = 1150;
+    var hmUrl = '/api/heightmap?cx=' + HCX + '&cz=' + HCZ + '&span=' + HSPAN + '&res=' + HSPAN + '&seed=1337&map=' + FIX;
+    var readH = async function () {
+      var r = await fetch(hmUrl, {cache: 'no-store'});
+      if (!r.ok) return null;
+      var d = new DataView(await r.arrayBuffer());
+      var res = d.getUint32(8, true), h = new Int32Array(res * res);
+      for (var i = 0; i < res * res; i++) h[i] = d.getInt32(48 + i * 8, true);
+      return {res: res, x0: d.getInt32(16, true) - Math.trunc(d.getUint32(12, true) / 2), z0: d.getInt32(20, true) - Math.trunc(d.getUint32(12, true) / 2), h: h};
+    };
+    var H0 = ENGINE ? await readH() : null;
+    // OPEN it: a double-click on its badge
+    var cr = cv.getBoundingClientRect();
+    cv.dispatchEvent(new MouseEvent('dblclick', {bubbles: true, clientX: cr.left + cv.clientLeft + cv.clientWidth * fa[0], clientY: cr.top + cv.clientTop + cv.clientHeight * fa[1] - 15}));
+    var crumb = pages.map.querySelector('.mapcrumb');
+    var vis = function (label) { var b = [].slice.call(pages.map.querySelectorAll('.mapbar button')).filter(function (x) { return x.textContent === label; })[0]; return !!b && b.style.display !== 'none'; };
+    say(!!LCx.open() && LCx.open().id === 'e4test' && crumb.style.display !== 'none' && /World map/.test(crumb.textContent) && /E4 Test/.test(crumb.textContent),
+        'a double-click on the badge OPENS the locale page; breadcrumb: ' + crumb.textContent.trim().slice(0, 80));
+    say(vis('Sculpt') && vis('Structure') && vis('Link') && vis('Clearing') && !vis('Height') && !vis('Road') && !vis('Locale') && M._tool() === 'sculpt',
+        'the locale page\'s tools: Sculpt, Clearing, Structure, Link (no Height, Road, Locale); Sculpt in hand');
+    var vL = M._view();
+    say(Math.abs(vL.cx - (LB[0] + LB[2] + 1) / 2) < 1 && Math.abs(vL.cz - (LB[1] + LB[3] + 1) / 2) < 1 && vL.scale * (LB[2] - LB[0]) > 0.5 * Math.min(cv.clientWidth, cv.clientHeight),
+        'the view frames the bounds (centre ' + vL.cx + ', ' + vL.cz + ', ' + (vL.scale * (LB[2] - LB[0] + 1)).toFixed(0) + ' px wide)');
+    // SCULPT ACROSS THE EDGE: raise, a stroke from inside to well past the east edge
+    var SC = M._sculpt(), scBefore = new Map();
+    SC.tiles.forEach(function (t, k) { scBefore.set(k, new Float32Array(t)); });
+    var ring = [];
+    for (var zz = LB[1] - 24; zz <= LB[3] + 24; zz += 3) for (var xx = LB[2] - 30; xx <= LB[2] + 60; xx += 1) if (!LOCm.inBounds(LZ, xx, zz)) ring.push([xx, zz, M._scAt(xx, zz)]);
+    SC.mode = 'raise'; SC.radius = 64; SC.strength = 100;
+    var dS = M._undoDepth();
+    at('pointerdown', -1760, 1150); at('pointermove', -1720, 1150); at('pointermove', -1680, 1150); at('pointermove', -1640, 1150); at('pointerup', -1640, 1150);
+    var changed = 0, badS = 0;
+    SC.tiles.forEach(function (t, k) {
+      var b0 = scBefore.get(k), tx = Math.floor(k / 65536) - 32768, tz = (k % 65536) - 32768;
+      for (var i = 0; i < 1024; i++) {
+        if ((b0 ? b0[i] : 0) === t[i]) continue;
+        changed++;
+        if (!LOCm.sculptSampleInside(LZ, tx * 32 + (i & 31), tz * 32 + (i >> 5))) badS++;
+      }
+    });
+    var ringBad = ring.filter(function (p) { return M._scAt(p[0], p[1]) !== p[2]; }).length;
+    say(changed > 0 && badS === 0 && ringBad === 0 && M._undoDepth() === dS + 1,
+        'sculpt across the east edge: ' + changed + ' samples raised, ' + badS + ' of them reach outside; ' + ringBad + ' of ' + ring.length + ' outside columns moved (one undo step)');
+    // a clearing dragged out of it is clamped (feather too); a tree outside is refused
+    M._tool('clearing');
+    var nSi = JS().sites.length;
+    at('pointerdown', -1780, 1060); at('pointermove', -1700, 1150); at('pointermove', -1600, 1250); at('pointerup', -1600, 1250);
+    var CL = JS().sites[JS().sites.length - 1];
+    say(JS().sites.length === nSi + 1 && CL.kind === 'clearing' && CL.max[0] === LB[2] && CL.min[0] === -1780 && CL.feather === 0,
+        'a clearing dragged past the edge is clamped to it (feather 64 -> ' + CL.feather + '): ' + JSON.stringify({min: CL.min, max: CL.max}));
+    M._tool('tree');
+    at('pointerdown', -1600, 1150); at('pointerup', -1600, 1150);
+    var treeOut = JS().sites.length === nSi + 1;
+    at('pointerdown', -1850, 1250); at('pointerup', -1850, 1250);
+    say(treeOut && JS().sites.length === nSi + 2 && JS().sites[nSi + 1].kind === 'tree', 'a tree outside the bounds is refused, one inside is planted');
+    undoBtn.click(); undoBtn.click();
+    say(JS().sites.length === nSi, 'Undo takes the tree and the clearing back');
+    M._tool('sculpt');
+    say(await M._save(), 'Save writes the clipped sculpt layer');
+    if (ENGINE && H0) {
+      var H1 = await readH();
+      var outDiff = 0, inDiff = 0, outN = 0;
+      for (var j = 0; j < H1.res; j++) for (var i = 0; i < H1.res; i++) {
+        var x = H1.x0 + i, z = H1.z0 + j, d = H1.h[j * H1.res + i] !== H0.h[j * H0.res + i];
+        if (LOCm.inBounds(LZ, x, z)) { if (d) inDiff++; } else { outN++; if (d) outDiff++; }
+      }
+      say(inDiff > 0 && outDiff === 0, 'the ENGINE\'s heights (--heightmap of the saved files): ' + inDiff + ' columns inside the bounds moved, ' + outDiff + ' of ' + outN + ' outside');
+      // ---- structures + waynodes through the F8 command layer (/api/refs/commands)
+      ok = await waitFor(function () { return LS.library.length > 0 && !!M._heights() && /^locale:/.test(M._heights().key); }, 60000);
+      say(ok && LS.library.indexOf('samples/smithy') >= 0, 'the Structures library is listed (' + LS.library.length + ') and the locale\'s heights are the backdrop');
+      M._tool('structure');
+      LS.place.base = 'samples/smithy'; LS.place.yaw = 0; LS.place.name = 'forge';
+      var floorY = Math.round(M._groundAt(-1850, 1150)) + 1;
+      await LCx.placeStructure(-1850, 1150);
+      var SR = LS.refs.filter(function (r) { return r.kind === 'structure'; });
+      say(SR.length === 1 && SR[0].id === 'e4test/forge' && SR[0].base === 'samples/smithy' && SR[0].pos[0] === -1850 && SR[0].pos[2] === 1150,
+          'Structure: placed ' + JSON.stringify(SR[0] || LS.lastResult));
+      var gr = await api('/api/refs?name=' + FIX);
+      var fileRef = gr.groups && gr.groups.e4test && gr.groups.e4test.refs.filter(function (r) { return r.id === 'e4test/forge'; })[0];
+      say(!!fileRef && !!ckE && fileRef.pos[1] === floorY - ckE.groundY,
+          'refs/e4test.json stores y RELATIVE to the anchor: world floor y' + floorY + ' - ground y' + (ckE && ckE.groundY) + ' = ' + (fileRef && fileRef.pos[1]));
+      var waitRefs = function () { return waitFor(function () { return !LS.busy; }, 60000); };
+      LCx.turnStructure(SR[0], 90); await waitRefs();
+      var yawT = (LS.refs.filter(function (r) { return r.id === 'e4test/forge'; })[0] || {}).yaw;
+      LCx.moveStructure(LS.refs.filter(function (r) { return r.id === 'e4test/forge'; })[0], 20, -10); await waitRefs();
+      var mv = LS.refs.filter(function (r) { return r.id === 'e4test/forge'; })[0] || {pos: []};
+      say(yawT === 90 && mv.pos[0] === -1830 && mv.pos[2] === 1140, 'turned to ' + yawT + '°, moved to (' + mv.pos[0] + ', ' + mv.pos[2] + ')');
+      undoBtn.click(); await waitRefs();
+      undoBtn.click(); await waitRefs();
+      var back0 = LS.refs.filter(function (r) { return r.id === 'e4test/forge'; })[0] || {pos: []};
+      say(back0.pos[0] === -1850 && back0.pos[2] === 1150 && (back0.yaw || 0) === 0 && !M.isDirty(), 'two Undos run the inverse commands: back at (' + back0.pos[0] + ', ' + back0.pos[2] + ') ' + (back0.yaw || 0) + '° (the map is not dirtied by refs)');
+      LCx.deleteRef(back0); await waitRefs();
+      var gone = !LS.refs.some(function (r) { return r.id === 'e4test/forge'; });
+      undoBtn.click(); await waitRefs();
+      var again = LS.refs.filter(function (r) { return r.id === 'e4test/forge'; })[0];
+      say(gone && !!again && again.pos[0] === -1850 && JSON.stringify(again.pos) === JSON.stringify(back0.pos), 'delete, then Undo places it back exactly (' + JSON.stringify(again && again.pos) + ')');
+      M._tool('waylink'); LS.linkFrom = null;
+      await LCx.newWaynode(-1950, 1270);
+      var w1 = LS.linkFrom;
+      await LCx.newWaynode(-1900, 1270);
+      var w2 = LS.linkFrom, W1 = LS.refs.filter(function (r) { return r.id === w1; })[0];
+      say(!!W1 && w2 !== w1 && ((W1.props || {}).links || []).map(function (l) { return LOCm.linkTarget('e4test', l); }).indexOf(w2) >= 0 && LCx.waynodes().length >= 2,
+          'Link: two new waynodes, joined (' + w1 + ' -> ' + JSON.stringify((W1 || {}).props) + ')');
+      undoBtn.click(); await waitRefs();
+      W1 = LS.refs.filter(function (r) { return r.id === w1; })[0];
+      say(!LS.refs.some(function (r) { return r.id === w2; }) && !!W1 && !((W1.props || {}).links || []).length, 'Undo parts them and takes the second waynode away');
+      // ---- the 3D view: a voxel edit inside the bounds saved to the LOCALE's layer
+      var V3 = LCx.view3d.view();
+      if (!V3) skip('the 3D view: ' + LCx.view3d.ui.status.textContent);
+      else {
+        var gIn = Math.round(M._groundAt(-1706, 1150)), gOut = Math.round(M._groundAt(-1696, 1150));
+        V3.cam.target = [-1701, gIn, 1150]; V3.cam.dist = 30;
+        // the view streams from rAF, which this fetch-polling wait starves under virtual
+        // time: pump its streamer from the predicate (as worldview_test.html does)
+        ok = await waitFor(function () { V3.update(); return V3.cellAtWorld(-1706, gIn + 3, 1150, 0) >= 0 && V3.cellAtWorld(-1696, gOut + 3, 1150, 0) >= 0 && V3.pal; }, 120000);
+        var mat = ok ? V3.pal.materials.filter(function (m) { return m.name === 'cobble'; })[0] : null;
+        var nA = ok && mat ? V3.apply([[-1706, gIn + 3, 1150, mat.id], [-1696, gOut + 3, 1150, mat.id]], 'test') : -1;
+        say(ok && nA === 1 && V3.edit.count() === 1, '3D view: of two voxels painted, the one inside the bounds is taken, the one 5 voxels past the edge is not (' + nA + ')');
+        say(await LCx.view3d.save(), 'Save voxels writes the locale\'s layer: ' + JSON.stringify(LS.saved));
+        var rr = await fetch('/api/worldedit?map=' + FIX + '&locale=e4test&seed=' + V3.seed, {cache: 'no-store'});
+        var lay = rr.ok ? new DataView(await rr.arrayBuffer()) : null;
+        var cell = null;
+        if (lay && lay.getUint32(12, true) === 1) {
+          var ccx = lay.getInt32(32, true), ccy = lay.getInt32(36, true), ccz = lay.getInt32(40, true), li = lay.getUint32(48, true), wd = lay.getUint32(52, true);
+          cell = [ccx * 16 + (li & 15), ccy * 16 + ((li >> 4) & 15), ccz * 16 + (li >> 8), wd & 0xFFF];
+        }
+        say(!!cell && cell.join() === [-1706, gIn + 3, 1150, mat.id].join(), 'locales/e4test/ground.svedit holds exactly that voxel (resolved back: ' + JSON.stringify(cell) + ')');
+        ok = await waitFor(function () { V3.update(); return (V3.cellAtWorld(-1706, gIn + 3, 1150, 0) & 0xFFF) === mat.id && !V3.edit.unsaved.size; }, 120000);
+        say(ok, 'the voxel server applies the saved locale layer: the re-fetched region carries it (map=' + FIX + ', layer @map)');
+        V3.edit.clear();
+        await LCx.view3d.save();
+        rr = await fetch('/api/worldedit?map=' + FIX + '&locale=e4test&seed=1337', {cache: 'no-store'});
+        say(rr.status === 404 && LS.saved && LS.saved.deleted, 'an empty locale layer is no file (saved empty -> 404)');
+      }
+    }
+    // a locale-layer route for a locale that is not in map.json is refused
+    var bogus = await fetch('/api/worldedit?map=' + FIX + '&locale=nope&seed=1337', {method: 'POST', body: new Uint8Array(32)});
+    var bj = await bogus.json().catch(function () { return {}; });
+    say(bogus.status === 400 && /not in worldmap/.test(bj.error || ''), 'POST /api/worldedit for a locale map.json does not list is refused: ' + bj.error);
+    LCx.leave();
+    say(!LCx.open() && crumb.style.display === 'none' && vis('Height') && !vis('Structure'), 'the breadcrumb leads back: world tools again, no breadcrumb');
+    // the default map's shipped locale: Harrowby opens with its houses (nothing is saved)
+    M._tool('height');
+
     // LOAD CHECK: the panel asked the engine (or says why it could not).
     ok = await waitFor(function(){ return !!M._check(); }, 60000);
     var ck = M._check();
     say(ok && !!pages.map.querySelector('.mapcheck'), 'Load check panel: ' + (ck ? (ck.unavailable ? 'engine unavailable (' + String(ck.error).slice(0, 60) + ')' :
-        (ck.ok ? (ck.warnings || []).length + ' warnings' : 'REFUSED: ' + ck.error)) : 'no answer'));
-    say(!ck || ck.unavailable || ck.ok, 'the engine loads the ' + M._map().name + ' map');
-    M._tool('biome');
+        (ck.ok ? (ck.warnings || []).length + ' warnings' : 'REFUSED: ' + String(ck.error).slice(0, 100))) : 'no answer'));
+    if (ck && !ck.unavailable && !ck.ok && /svmap|version|v1/i.test(String(ck.error)))
+      skip('the engine loads the v2 fixture: this sandvox.exe predates v2 maps (' + String(ck.error).slice(0, 80) + ')');
+    else say(!ck || ck.unavailable || ck.ok, 'the engine loads the ' + FIX + ' map');
+    M._tool('height');
+    // the fixture's tiles go; check_environment.sh removes the folder
+    for (var pl of ['height', 'biome']) {
+      var ls = await api('/api/worldmap/tiles?name=' + FIX + '&plane=' + pl);
+      for (var tt of ls.tiles) await api(tileUrl(pl, tt.tx, tt.tz), new Uint8Array(0));
+    }
+    lst = await api('/api/worldmap/tiles?name=' + FIX + '&plane=height');
+    say(lst.tiles.length === 0, 'an EMPTY tile POST deletes the tile (fixture tiles removed)');
+
+    // E3: the SHIPPED map's roads (Harrowby's paths, R1) load into the vector layers.
+    await M._load('default');
+    ok = await waitFor(function(){ return !!M._map() && M._map().name === 'default'; }, 30000);
+    var hr = ok ? (M._map().json.roads || []).filter(function (r) { return /^harrowby_/.test(r.id); }) : [];
+    var rows = pages.map.querySelectorAll('details.mapvector .mapkind-road').length;
+    M._vl().selectById('road', hr.length ? hr[0].id : '', true);
+    say(hr.length === 8 && rows >= 8 && !!pages.map.querySelector('canvas.mapprofile-road'),
+        'the default map\'s ' + hr.length + ' Harrowby roads are listed (' + rows + ' rows) and open in the inspector');
+
+    // E4: Harrowby, the shipped locale, opens on the locale page with its houses -- nothing is saved
+    var LCh = M._lc();
+    say((M._map().json.locales || []).some(function (l) { return l.id === 'harrowby' && l.icon === 'village'; }) &&
+        !!pages.map.querySelector('details.maplocale .mapkind-locale'), 'the default map lists its locale Harrowby (icon village) in the Locales panel');
+    LCh.enter('harrowby', {view3d: false});   // no second voxel server boot for a look
+    ok = await waitFor(function () {
+      var s = LCh.st;
+      return s.refsFor === 'default/harrowby' && s.refs.filter(function (r) { return r.kind === 'structure'; }).every(function (r) { var sj = s.structs.get(r.base); return sj && sj !== 'loading'; });
+    }, 30000);
+    var hs = LCh.st.refs.filter(function (r) { return r.kind === 'structure'; });
+    say(ok && hs.length === 5 && ['harrowby/longhouse', 'harrowby/smithy', 'harrowby/alehouse', 'harrowby/green', 'harrowby/field'].every(function (id) { return hs.some(function (r) { return r.id === id; }); }) &&
+        LCh.waynodes().length > 10,
+        'Harrowby opens: ' + hs.length + ' houses (' + hs.map(function (r) { return r.id.split('/')[1]; }).join(', ') + '), ' + LCh.waynodes().length + ' waynodes (its own + the houses\' slots)');
+    var hit = LCh.structureAt(700, 3460);
+    M._paint();
+    say(!!hit && hit.id === 'harrowby/smithy' && pages.map.querySelectorAll('details.maplocale .mapkind-stamp').length === 5,
+        'the smithy\'s turned footprint is hit at its anchor and every house is listed in the Locale panel');
+    LCh.leave();
+    say(!M.isDirty() && !LCh.open(), 'leaving Harrowby leaves the map clean (nothing was written)');
 
     // The preview host lives in tuner.html; this harness drives the module
-    // alone, so only the wiring is checked here: tuner.html carries the host
-    // and the map page's adoption code.
+    // alone, so only the wiring is checked here.
     say(/id="wgPreviewHost"/.test(page) && /wgPreviewShow/.test(page), 'tuner.html carries the preview host the map page adopts');
 
     if (ONLY_MAP) { done(); return; }

@@ -1891,8 +1891,11 @@ biome has a climate with a day/night swing. All of it is DATA: materials.json
 **The temperature of a cell** is `T = A + X`, heat units, 0 = water freezes.
 `A` is the AMBIENT: the climate of the cell's column (the biome the seeded map
 puts there, read through a CPU-built 512 x 512 window column table in
-`heatParams`, refilled only for the strip a window shift brings in) or, at and
-above the snowline (map treeline - 1), the snowline climate (`sim.heatSnowline*`),
+`heatParams`, one word per column -- biome | snowline Y << 8 -- tiled by chunk
+column and refilled only for the tiles a window shift brings in) cooled by the
+LAPSE RATE (`sim.heatLapsePerKm` heat units per km above the map's sea level;
+map v2 A1) or, at and above the COLUMN's snowline (its treeline - 1,
+`worldmap::TreelineAt`), the snowline climate (`sim.heatSnowline*`),
 `base + swing` by day and `base - swing` by night. It is evaluated, never
 stored per cell and never diffused, and it is TWO-LEVEL on purpose: it changes
 only on the tick daylight switches, which is the tick `SubmitTick` already
@@ -5627,8 +5630,11 @@ anywhere else.
 **The sediment wedge** is what makes the relief mean something to the sim rather
 than only to the eye: low flat ground carries metres of loose dirt over gravel,
 ridges carry bare rock. Thickness is
-`(sedCeil − ground)·sedFraction/256 − sedStrip`, slope-gated and clamped to
-`sedMax`, which stays under `caveBands`' 40-voxel shell so a cavern cannot
+`(sedAbove − noise)·sedFraction/256 − sedStrip`, where `noise` is the ground
+less the AUTHORED ground (height plane + sculpt) -- relative since map v2 A1,
+so a hollow on a 900 m valley floor fills like one at the sea; it was the
+absolute `(sedCeil − ground)` with `sedCeil` y 264 -- slope-gated and clamped
+to `sedMax`, which stays under `caveBands`' 40-voxel shell so a cavern cannot
 undercut it.
 
 Dirt and gravel are **powders**, so the gate is the safety property. Two things
@@ -5709,6 +5715,12 @@ is written and works, but it moves the harness pool's bed enough to need the
 
 ##### Per-biome height curves (2026-09-01, Lin 13.3.3)
 
+> **Map v2 (2026-10-08):** the curve now reshapes the RANGE RUNG only (its
+> domain is ±rangeAmplitude/2) and the AUTHORED height plane is never scaled
+> by it; it blends on the 25.6 m biome cells. The rest of this section (the
+> nine knots, the bit-exact identity, Fritsch–Carlson) still holds. See the
+> map v2 bullet in the world-map list (§ "THE AUTHORED HEIGHT PLANE").
+
 "This biome is flat plains, that one is jagged mountains", authored as nine
 numbers per biome instead of a hand-tuned noise ladder. `biomeCurve` reshapes
 **the coarse sum only** — `o0.dev + o1.dev`, the continental and range rungs
@@ -5778,6 +5790,11 @@ default moving under `armor-react`.
 
 ##### The terrain is the map's (environment truth P-G, 2026-09-07)
 
+> **Map v2 (2026-10-08):** the landform plane, `landformRangeVox` and the
+> declared landform sites below are GONE — the ground is the authored height
+> plane (absolute voxels) and the terrain block's octaves are noise on it.
+> See "THE AUTHORED HEIGHT PLANE" in the world-map list.
+
 Every number that shaped the ground used to be a `worldgen.*` row in
 `tuning.json`. It is **`map.json terrain`** now, per map, packed into the
 worldMap buffer header (`worldmap.h kHTerrain*`, words 32..53) and read by
@@ -5786,8 +5803,9 @@ token-identical in `worldgen.wgsl` and `world.cpp`): the datum, what a
 painted landform 0..255 spans (`landformRangeVox`, the old `contAmplitude`
 — a painted ridge can be a 150 m mountain by raising it), the four seeded
 octaves (range / hill / detail / grain, amplitude + log2 cell), `fbmAtten`,
-the calm home area (`homeArea.y/radius/fade`), the sediment wedge, the
-treeline and the reference scale. `TerrainWords` is the one packing; the
+the calm home area (`homeArea.radius/fade`; `homeArea.y` retired by map v2
+A1), the sediment wedge (`sedAbove`, relative), the treeline (+
+`treelineJitter`), `rockSlope` and the reference scale. `TerrainWords` is the one packing; the
 loader keeps the same words on `WorldMapData` for the CPU twin, and the
 `terrain` gate's C1 is the per-voxel proof. Lengths are rescaled from
 `refVoxelsPerMetre` at load exactly as `LoadTuning` used to rescale the rows.
@@ -5837,8 +5855,10 @@ sky .. 255 deep shade, `worldmap.h kC_CanopyMin/Max`) and a `minY` at the
 treeline for the cushion. `undergrowthSite`'s 25-tile scan runs once per
 column, only for a biome whose rows bound the canopy (`kBF_CanopyRows`),
 handed into `genCellIn` as the memo the flower stalk used to be. The cover
-stack has no treeline gate any more: a row's `maxY` is its own snowline (the
-seeded rows stop at 227). The `env-truth` gate therefore asserts every
+stack has no hard treeline gate: a row carries a `treeline` CONDITION
+(`below` / `above` the column's treeline, `kC_Treeline`; map v2 A1 -- the
+seeded rows say `below`, the cushion `above`; they were absolute `maxY` 227 /
+`minY` 228, which meant nothing on a map whose treeline is not y 228). The `env-truth` gate therefore asserts every
 biome's rows; the tile plants (`plantColumnAt`'s ferns and big toadstools)
 and the proc cactus are the two second sources left, reported not asserted,
 and a canopy-conditioned row is an interval (hi only) like a nearWater row.
@@ -8789,7 +8809,14 @@ sear it; its block targets `tag:soft_tissue` — `flesh`, `muscle`, `brain`,
 tissue whose wound leaks venom through `bleedFluid`). All three are appended
 (ids 204-206), so `venom_gland` (>127) cannot be painted into a `.vox`
 directly: a snake paints a stand-in and rewrites it at load, as `garmentsBecome`
-does.
+does. The third such rewrite is `anatomy.paintBecomes` (human.json, 2026-10-08):
+a voxel of one material painted one of a list of the file's own art slots
+becomes another — every skin cell the generator paints in its hair slots (251,
+252: scalp hair, brows, beard) is `hair` (id 222), which catches from one hot
+face at 90 per-mille (skin only sears, at 63), burns out through `hair_burning`,
+and has `woundHp` 0, so losing it is not a wound. Found before the art-palette
+merge renumbers `color`, applied after `anatomy::Resolve` so the parity gate
+still compares recipe against bake.
 
 **The arithmetic: a branching process.** Each infectious cell lives until it
 is eaten (rate `μ = eat · s`) and spawns at rate `λ = spread · s` while it
@@ -14280,7 +14307,19 @@ still burning re-peels at most every 0.25 s). A materials reload replaces the
 micro set wholesale, so the peeler keys on `MicroBodySet::epoch` and forgets —
 never frees — indices from a set that no longer exists. Any peel also drops the
 worn and held parts from the picture (a robe over a peeled chest hides what the
-peel is for); "isolate" draws the selected part alone.
+peel is for); "isolate" draws the selected part alone. **The first peel
+undresses** (owner, 2026-10-08): on a body that died with anything worn or held
+(`AutopsyUI::hasGear`), the first step down (PageDown, "peel >") only hides the
+gear, and the next one starts on the skin; restoring walks the same ladder back,
+the clothes last. "skin" is the bare, undressed surface.
+
+**The probe** (`AutopsyUI::probe`) casts the cursor's ray through the instances
+the portrait drew and reads the nearest cell back: part, material, depth layer,
+bruise, coat. On a corpse it is the UNDER CURSOR block of the post-mortem; on
+the living character sheet it is a tip beside the cursor (`VoxelProbeTip`), the
+parts matched to the avatar by physics handle. It names the voxel's MATERIAL —
+whether the cell carries an art colour is not reported, since nearly every
+surface cell of a generated body does.
 
 The same depth fields are the readout: per layer, per figure slot, what the body
 is made of there (`autopsy::Strata`, mirrored by `autopsy::FillUI`). Materials
@@ -15498,6 +15537,22 @@ where you hear from either (§12b, "The ears are on the character").
   column and 4x4-super-column height bounds over the cascade half (a ray above
   a whole column skipped it in one probe) cost +0.1 ms of `pre` — the extra
   probe on every chunk outweighed the skips.
+  **Sky tiles (map v2 P1, 2026-10-08).** The sky bound is one ceiling per
+  level, and on the `peaks` map that ceiling is the summit for every ray in
+  the box. `sky_top.wgsl` now also reduces it per TILE of 4 x 4 chunk
+  columns (8 x 8 tiles a level, keyed by slot column, after the 16 level
+  words in farOcc's tail; `world.cpp` sizes it), and `rayStartFar` walks the
+  tiles from its level entry to the first one whose ceiling the ray is under
+  (`rsSkyTileClip`), skipping the level when there is none. ENTRY ONLY, on
+  purpose: clipping the exit as well needs the walk to run to the box face
+  for every ray, and measured that way the summit camera's
+  `ray_start_trace` went 1.09 -> 3.63 ms. Entry-only, 2560x1440, one run per
+  tree: `peaksea` (3 m over the sea) `ray_start_trace` 2.14 -> 1.64 ms, frame
+  18.41 -> 17.99; `summit` 0.95 -> 0.93, frame 5.73 -> 5.76 (noise). NOT in
+  `raymarch.wgsl`'s `traceFar`: the fragment march takes 2.5-4.5 far steps a
+  pixel on both cameras after the ray-start map, so there is little left to
+  cut there, and fs has no register headroom (and was another package's file
+  that day).
   Measured in ONE process (`norstart` arm -> `baseline`, 1080p, RTX
   3060 Ti): noon 9.27 -> 7.75 ms, cascade 6.38 -> 4.93, meadow 7.47 -> 6.64,
   canopy 7.01 -> 5.31, seam 6.47 -> 5.44, seamveg 9.28 -> 7.89, fire 14.07 ->
@@ -15572,6 +15627,51 @@ where you hear from either (§12b, "The ears are on the character").
   superseded ones (`PruneLevel`), drains on the bulk cap and leaves the level
   CORRECT rather than partly stale. Per-level backlog is then bounded by one
   level, and "the horizon is minutes behind" becomes the state a load leaves.
+  **Tall terrain (map v2 P1, 2026-10-08).** Two exact shortcuts in the sweep:
+  a cactus-biome column's ceiling is its own `cactusColTop` (the 3x3 tiles
+  that can reach it), no longer `treelineMax + 5.4 m` for every desert column
+  in the world; and a row sample at or under `colDeepStoneTop` (the column's
+  `h` less the deepest of genCellIn's surface layers -- road, snow, bed,
+  steep rock, sand cap, skin, sediment, stamp sink) that the cave bands leave
+  solid is `M_STONE` without the call -- genCellIn's own answer there, by
+  enumeration of its `y <= h` chain (a new branch there must add its depth to
+  `colDeepStoneTop`; `far-downsample` compares the sieve with the grid
+  genChunk filled). Both are byte-identical, and the second is SMALL: the
+  sieve's per-entry cost is its four `genColumn`s, not its rows. Measured on
+  `--perf --scenario peaks-route` (sprint flight summit -> gorge -> high
+  valley on `peaks` with the far field driven, one run per tree, the climb
+  at sprint speed): `farField` GPU p50 8.73 -> 8.58 ms, p95 29.85 -> 29.59;
+  frame p50 19.45 -> 19.42; world hash aa4dcda6 both. **What that flight
+  shows, unfixed:** the far list is at its plane cap on every one of the
+  2,724 ticks (2.5 M entries, peak queue 250,592, 103,424 still queued at the
+  end, 14 coalesced level resets) -- demand is ~2x the cap once the eye moves
+  on three axes, and the lever is the per-entry cost: an X/Z plane is 32
+  entries stacked on each level-chunk column, every one recomputing the same
+  256 `genColumn`s (a far column cache, as `cols` is for genChunk, would cut
+  that up to 32x; `far`'s compile cliff is why it is its own package). And
+  the page pool peaks at 88.5% (32,616 of 36,864): 29,438 FULL chunks hold a
+  page, 25,510 of them not cpuDirty. `SANDVOX_PT_DEBUG=1` attributes it
+  (Stream::ApplyGenVerdict / HarvestDemotes): of 2.73 M generated slots,
+  1.16 M demoted as sky and 975 k full by verdict; 368 k full ones went to
+  the word copy because Materialize had reached them (201 k) or the mirror
+  held them dirty (168 k), and of those the harvest demoted 60 k, skipped
+  298 k as cpuDirty AT HARVEST (never retried) and classified 0 as mixed --
+  so the leak is clean buried bulk that the copy path refuses once and never
+  revisits, held until the window scrolls past it. **And the open sea**
+  (`altitude` gate pass H, the `peaksea` window 3 m over the ocean): worldgen
+  wakes every chunk holding a liquid cell (genChunk's birth wake is
+  `matCanAct`, and a liquid always can), 16,384 chunks; ALL of them are
+  asleep after tick 1 (0 active at every check from tick 1 to 512), but tick
+  1 costs 199.7 ms submit-to-idle against 3.2 ms for tick 2. And the 16,384
+  water chunks hold a PAGE each for as long as they are resident (256 MiB):
+  a liquid word carries fullness 7 in its state nibble and `SynthWord` has
+  state 0, so no sentinel can represent a full-water chunk at all. The two
+  fixes, neither in P1: a sentinel form with state 7 (a PT entry bit, mirrored
+  in `synthWord`, the verdict and Classify -- page-table format, hash-neutral)
+  and, on top of it, not waking a uniform full-liquid chunk whose 26
+  neighbours are the same liquid (every CA path for such a cell needs a
+  non-matching neighbour: flow, PAIR, inverted-count DECAY, heat, stain;
+  checkable per material from the reaction table).
   **A wholesale refill is FINEST level first and is BUDGETED (2026-09-10).**
   A `FullRefill` — startup, `LoadWorld`, regen, a teleport past a level's
   window — is `kFarLevels × kFarNumChunks` = 262,144 sieve entries. Drained at
@@ -16274,7 +16374,10 @@ where you hear from either (§12b, "The ears are on the character").
   out the bands still in the queue instead of showing sky through them,
   clamped between the full-horizon pin (`kFarFogDensity`) and a ceiling at
   level 2's half-extent (`kFarFogDensityMax`, so the residency window is never
-  fogged away) and eased over a few frames. *Farthest complete*, not "the one
+  fogged away) and eased over a few frames. **Since H1 (2026-10-08) that pin
+  is 0 and this fog is only the LOADING fog:** with every level filled it
+  lifts entirely, because the far horizon draws the map past the cascade edge
+  and the air is the height fog ("The far horizon and the air", below). *Farthest complete*, not "the one
   below the innermost incomplete", which is what it read until 2026-09-10: the
   levels are nested boxes all centred on the player and `traceFar` tests each
   independently, so a level `farBox` has collapsed is skipped and the next one
@@ -16707,6 +16810,142 @@ where you hear from either (§12b, "The ears are on the character").
   second key light — `keyLightColor()`/`keyLightDir()` route sun-vs-moon
   through one place, so shadows, water glints and caustics all follow whichever
   body is actually up.
+
+### The far horizon and the air (2026-10-08; map v2 H1, docs/PLAN_map_v2.md; `src/sim/horizon.*`, raymarch.wgsl `traceHorizon` / `shadeHorizon` / `aerialFrac`, common.wgsl `airFogTauS`)
+
+**The horizon past the cascades.** The far field ends at the outermost level's
+box, 6.55 km from the eye; until H1 a ray that found nothing there was sky,
+so a 1,400 m massif 10 km off did not exist and the fog was pinned to reach
+~99% exactly at the box edge to hide the square. The world map's AUTHORED
+HEIGHT PLANE is on the CPU (`WorldMapData`), so `horizon::Build` turns it into
+a render-only 2D pyramid at load and at every environment reload
+(`Simulation::UploadHorizon`, from `Init` / `UploadEnvironment`; renderBGL 45):
+one SAMPLE every 256 voxels (25.6 m, the level-8 cell) over the extent widened
+by `edgeFadeVox`, each holding the MAX effective surface (`max(ground, sea)`)
+over its footprint's posts — the silhouette, so a ridge between two samples
+survives — and the AVG ground over the same posts; then a cell MAX pyramid
+(level 0 = max of a cell's four corner samples, an exact bound of their
+bilinear; each level the max of 2x2) that also carries the cell's average.
+`traceHorizon` starts where the ray leaves the level-8 box in XZ and walks the
+pyramid top-down: a cell whose MAX is under the ray across it is skipped
+whole, and a level-0 cell intersects the bilinear surface (four sub-steps and
+a bisection). Most sky pixels leave on the first compare (ascending and
+already above the map's highest point). Past the grid the surface is flat —
+the sea, or the plane's default if higher — and is hit analytically, so the
+ocean runs to the horizon. The surface eases from the AVG ground at the
+cascade edge to the MAX over the first 1.5 km (`HZ_BLEND_M`), so it meets the
+cascade's centre-sampled cells without a lip; level-8 cascade hits within
+900 m of the box face take the horizon's paint (`hzSeamWeight`) so the two
+meet in one colour. Shading is the far field's: the biome's skin material
+(from the packed biome records, so the horizon paints what worldgen lays),
+stone past ~45 degrees, snow over the COLUMN's treeline (A1's `treelineAt`,
+baked per sample into the pyramid by `horizon::Build` -- `kHTlPlane`, i16 --
+so the horizon's snow line is the per-biome, jittered one the cascades draw;
+until S1 it was the map's one Y and painted all of `peaks` white), the far
+water law under the sea, the far openness/ambient/bounce and the cloud shadow,
+and since S1 the terrain-scale sun and sky below; the normal is
+the AVG field's gradient at the pyramid level whose cell is about a pixel, so
+30 km of terrain does not alias. `render.horizon` (RenderParams flag bit 7,
+a runtime switch, the `nohorizon` budget arm) turns it off -- and with it
+everything S1 below reads from the pyramid. Measured
+2026-10-08, 2560x1440, RTX 3060 Ti, `--render-budget --budget-cams
+summit,peaksea --budget-arms baseline,nohorizon` (fragment time, the `pre`
+compute span excluded): `peaksea` (the massif 10 km off, drawn by the pyramid
+walk) 15.36 vs 15.22 ms, i.e. ~0.14 ms; `summit` within the ±0.3 ms noise.
+The pyramid for the 20 km `default` map is ~832^2 samples, ~4 MiB.
+
+**Peak preservation at levels 6-8.** A cascade cell is solid when its CENTRE
+sample is, so a summit or a knife ridge between two sample columns was shaved
+by up to a whole cell (25.6 m at level 8). `far` and `fardown` now raise a
+column's top to the highest authored height post inside the cell footprint
+(`farPeakTop`, at most 4 x 4 posts) from `FAR_PEAK_MIN_SHIFT` (6) up, and an
+air-sampled cell in `(h, peak]` takes the column's skin (snow over the
+treeline). Both producers call it on genColumn's own column, so the
+`far-downsample` agreement holds. The surface map (`farmap`) is NOT where
+this lives: it is only read at the refine levels (1-2), whose sub-columns are
+a voxel or two wide.
+
+**The air: height fog.** The fog is now the atmosphere's, not the LOD's:
+extinction `rho(y) = fogSeaDensity * exp(-(y - sea) / fogScaleHeight)`
+(`render.fogSeaDensity` per km at the map's sea plane, 0.12;
+`render.fogScaleHeight` 1,200 m), integrated exactly along each view ray in closed form
+(`airFogTauS`): a valley is hazy, a summit is clear, and a ray climbing out of
+the haze sees through it. Both rows are `NO_WGSL` and ride `RenderParams`
+(`hfogDensity / hfogFalloff / hfogBaseY`, spent from the wind-primitive row's
+pads) so the sliders are live without a recompile; the weather's mist scales
+`hfogDensity` with the loading fog. `RenderParams.fogDensity` is now ONLY the
+loading fog (`kFarFogDensity` = 0 when every level is filled; main.cpp's
+adaptive term otherwise). The raster bodies and the gust streaks use the same
+law (common.wgsl `airFogFrac`). `applyAerial` adds the DISTANCE BLUE
+(`render.fogHaze`, 0.6): a part-fogged surface takes some of the airglow ~17
+degrees above its own direction, weighted `1 - f^2` so full fog still
+converges to exactly the sky in `rd` (the rule above) while a 1 km peak at
+15 km reads as a blue silhouette rather than a grey one.
+
+**The light at terrain scale (map v2 S1; `assets/shaders/horizon_light.wgsl`,
+horizon.h `kL*`).** Every sun shadow in the renderer is a RAY (the shadow
+cache, the cascade's patch march), bounded by `render.farShadowReach` because
+a ray per receiver cannot afford kilometres; the openness grid's sky probes
+stop at the window top. So a 1 km ridge never shaded its valley, a 600 m gorge
+floor was lit by the whole sky, and the horizon had no sun shadow at all.
+Terrain at that scale is a heightfield, and a heightfield has the classical
+answer: the HORIZON ANGLE. A second, GPU-written buffer on the pyramid's own
+sample lattice (`Simulation::hzLightBuf_`, shadow group 33 / renderBGL 46)
+holds per sample: (w0) the SUN'S HORIZON in the key light's azimuth -- the
+blocker that makes the steepest elevation seen from the sample's ground,
+stored as its top Y (i16) and distance (u16, 8-voxel units), so a receiver at
+ANY height y is lit while tan(sun elevation) > (top - y) / distance, a valley
+floor and the crest above it from one word; and (w1) the SKY VISIBILITY, the
+cosine-weighted visible share of the upper hemisphere over eight azimuths
+(mean of cos^2 of each horizon angle). Both march the pyramid from two samples
+(~51 m) out -- nearer is the shadow cache's and the openness grid's -- with
+geometric steps (6% of the distance) reading the level whose cell matches the
+step: a cell MAX is an upper bound, so a knife ridge between two steps blurs
+by a cell of azimuth but is never lost; each march stops once nothing the map
+holds (`kHMaxY`) can beat the best angle. Reach: 30 km for the sun, 12 km for
+the sky. **When it runs (rule 2):** two rows on the per-frame table, `hz_sky`
+once per pyramid upload (a function of the map alone) and `hz_sun` when the
+key light's AZIMUTH has turned more than 0.0044 rad (~0.25 deg: a ridge's
+edge 5 km off moves under one sample) since the last build -- the sun RISING
+needs no rebuild, the per-pixel compare takes the elevation from the uniform.
+A frame that rebuilds nothing records neither row. **Readers** (raymarch.wgsl
+`hzSunVis` / `hzSunShade` / `hzSkyVis`, bilinear over four samples, each
+evaluated for the receiver's own height; 1 = no opinion outside the grid,
+before the first build or with `render.horizon` off): the horizon hit (its
+first sun shadow and a gorge-aware ambient), the cascade hit (the sun term
+`min`'d into the march's shadow AFTER the LOD contact-shadow lift, the sky
+term multiplied into `openF`), and the near field (`min` into the shadow cache
+answer; the openness byte scaled by the sky visibility -- the "floor" in the
+plan read as a multiplicative term, which is what the grid's probes cannot
+see past the window top). The sun term rides the near field's softening law:
+a mountain is a DISTANT blocker, `mix(TUNE_SHADOW_LIFT, 1, vis)`, so a
+valley in a ridge's shadow sits at one depth whichever path found the ridge.
+Raster bodies (debris / microbody) do not read it yet: a mob in a mountain's
+shadow is lit (follow-up).
+
+**Clouds against mountains (S1).** The cloud march's ground was the
+sea-level sphere ("the land is metres, the deck kilometres") -- false for a
+1,400 m massif under a 700 m storm base. `cloud.wgsl` now binds the pyramid
+(shadow group 32) and `deckSpan` stops each ray at the first crossing of its
+AVG ground (`terrainHitM`: 40 geometric steps from 20 m, then a bisection;
+AVG, not the MAX silhouette, which stopped rays grazing a ridge short of the
+deck and drew a sliver of clear sky between ridge and cloud), so the deck and
+the rain curtains are marched only in front of the land. The raymarch
+composites the cloud image over a HIT pixel when the eye is at or above the
+deck's lowest base (as before) OR the hit point is (a summit standing in the
+cloud seen from the valley); a hit under the base with the eye under it is
+nearer than any cloud and pays no fetch. `cloudSunAtM` is now altitude-aware:
+1 above the deck top, and inside the deck the map's transmittance raised to
+the share of the deck still overhead. **Precipitation by altitude:** the
+streaks are faded out over the base's jitter band as the eye climbs through
+it (a summit is over the weather); and `precipSnowAt` (common.wgsl) turns
+rain to snow above the FREEZING LEVEL over the eye's column -- CPU
+`HeatFreezingLevelY` (heat.h: the lower of the column's snowline and the
+height where `sim.heatLapsePerKm` takes its biome's mean climate below 0),
+uploaded in `CloudParams.spare.w` (metres) -- over a 200 m melt band: the
+overlay, its lean, the rain shadow map built along that lean, and the curtains
+per sample (a curtain that is rain at sea is snow on the massif behind it).
+Render only: the sim's rain word is untouched.
 
 ### Static micro-detail (2026-08-20; docs/PLAN_voxel_editor.md §A)
 
@@ -20537,7 +20776,9 @@ Brush strokes and selection operations write a sparse patch of world cell →
 voxel word, saved to `assets/worldedits/<name>.svedit` and named by the MAP:
 `map.json editLayer` (the map page's edits selector; it was tuning.json
 `world.editLayer` until map-overhaul P7 — a layer is authored against one
-map's ground, so the map owns the name).
+map's ground, so the map owns the name). Since map v2 L1 a map's layer is
+SEVERAL files merged in order — its own, then each locale's
+`locales/<id>/ground.svedit` (§9g); later wins where two name one cell.
 
 It is deliberately none of the three things it could have been:
 
@@ -22865,7 +23106,8 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   Eight biomes ship: forest, meadow, pine, desert, tundra, swamp, alpine,
   ocean. `worldgen.wgsl` still names the first four by id (`B_*`) as the
   (identity, folded-out) height curve's input until P4.
-* **LIVE (world map P2a, 2026-09-04): THE BIOME COMES FROM THE PAINTED MAP.**
+* **LIVE, format superseded by map v2 (below) (world map P2a, 2026-09-04): THE
+  BIOME COMES FROM THE PAINTED MAP.**
   `assets/worldmap/<world.mapLayer>/` — `map.json` (cell size, extent,
   origin cell, sea level, ocean fade, warp amplitude, the palette of biome
   NAMES, sites, rules) beside `map.svmap` (three u8 planes: biome, landform,
@@ -22933,6 +23175,35 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   rename). The page shows the planes as painted; its preview pane (the old
   Worldgen tab's heightmap/voxel views, P-I) shows what worldgen makes of
   them. Every save moves the world hash.
+  **Superseded by map v2 E1 (2026-10-08, `docs/PLAN_map_v2.md`):** the page
+  edits only v2 maps (a v1 map is refused with the converter's name). The
+  height and biome planes are 256²-sample tiles (`assets/editor/maptiles.js`
+  is the in-memory model: lazy per-tile load, dirty tiles, per-stroke tile
+  undo); a save POSTs map.json + only the dirty tiles through
+  `/api/worldmap/tile` (SVT1 header checked, write-then-rename, empty body =
+  delete = back to the default; `/api/worldmap/tiles` lists them) and
+  `/api/worldmap/planes` is gone. The canvas is a topographic map of the
+  authored height (real min..max hypsometric ramp, hillshade, contours, biome
+  overlay) with brushes in metres; the landform brush and landform sites are
+  gone with the landform plane.
+  **Map v2 E2 (2026-10-08): the height authoring tools.** The Height brush
+  gained flatten, terrace / cliff, seeded noise (stroke-stable: a post moves
+  by amp × its largest falloff weight in the stroke, so dab overlap does not
+  stack) and erode modes, plus a falloff (smooth / linear / flat / sphere).
+  The Shape tool stamps the v1 landform kinds (peak, ridge, basin, plateau,
+  volcano, mesa) into the plane. The Line tool draws RIDGE / VALLEY lines
+  stored in map.json `ridges[]` (`{id, kind, profile V|U|round|sharp, width
+  (half, vox), points [[x, z, y]]}`, `baked`): the ENGINE NEVER READS THEM --
+  the bake writes the plane (a ridge only raises, a valley only lowers, toward
+  the line height by the profile weight). A rebake takes the session's last
+  bake out (`maptiles.unbake`: pre-bake posts + whatever was painted since,
+  as offsets) and bakes again; across sessions there is no snapshot, so Bake
+  bakes on top. The Area tool's rectangle is eroded (`erosion.js`: droplet
+  hydraulic + Jacobi thermal, seeded, in a worker, preview then commit) and
+  exported / imported as a 16-bit grey (height, 1 unit = 1 voxel by default,
+  exact) or RGB (biome, palette colours) PNG through `scripts/map_png.py`
+  (`/api/mappng/encode|decode`; stdlib zlib, no Pillow). All of it is
+  editor-side: it writes plane tiles like a brush stroke.
 * **LIVE (environment truth P-A, 2026-09-04): THE ENVIRONMENT HOT-RELOADS,
   and the game says what it was generated from.** `ReloadEnvironment`
   (`test/support.cpp`) re-reads the biome files, the map named by
@@ -22975,8 +23246,8 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   click. Gate: `spawn-site` (authored, outside the box and every site cell,
   above the sea, not under a tarn, not ocean). `spawnPlain*` stays in
   `tuning.json` until P-G moves it to `map.json terrain.homeArea`.
-* **LIVE (world map P4, 2026-09-04): THE LANDFORM PLANE OWNS THE CONTINENTAL
-  RUNG, and the sea is a plane.** `landAt`'s `o0` is `landformOctave(x, z)`
+* **SUPERSEDED by map v2 (below) except the sea: (world map P4, 2026-09-04)
+  THE LANDFORM PLANE OWNS THE CONTINENTAL RUNG, and the sea is a plane.** `landAt`'s `o0` is `landformOctave(x, z)`
   on both mirrors: `dev = ((mapLandformQ8 - 32768) * contAmplitude) >> 16`,
   so `worldgen.contAmplitude` still says how tall the world is (one landform
   unit = amplitude/256 voxels, 4 at the default) and the map says WHERE;
@@ -22996,6 +23267,204 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   map page's landform brush is where that is authored. `LAVA_LID` is not
   needed yet: no biome record carves caves under the sea (ocean's cave
   thresholds are 255) and lava only pools in caves.
+* **LIVE (map v2 F1, 2026-10-08, `docs/PLAN_map_v2.md`): THE AUTHORED HEIGHT
+  PLANE. The ground is the author's; the noise is texture on it.** A map is
+  `map.json` **version 2** (`extent {min, size}` in world voxels, a multiple
+  of the site cell; `siteCellLog2`; `planes.height {log2, tile, default}` and
+  `planes.biome {log2, tile, default}`; `edgeFadeVox`; the palette, terrain,
+  sites and rules as before) beside TILES, `planes/<plane>/<tx>_<tz>.svt`:
+  `'SVT1'`, plane kind (1 height / 2 biome), tx, tz, 256, 256, sample bytes,
+  0, then 256x256 samples z-major; tile = post index >> 8; an ABSENT tile is
+  every sample at the plane's default (ocean tiles are simply not there). A
+  plane of log2 L has `(size >> L) + 1` posts a side, post i at
+  `min + (i << L)` (the last ON the max edge). **Height:** i16 ABSOLUTE
+  voxels at 6.4 m posts (log2 6, +-32000 by the loader), **biome:** u8
+  palette index per 25.6 m cell (log2 8; sample i is the cell
+  `[min + i·256, + 256)`). The site index stays on the 102.4 m `siteCellLog2`
+  lattice (`kHSiteCellLog2/W/H/OriginX/Z`, `wmCellOf`, `CellOf`); rules roll
+  per SITE cell. `LoadWorldMap` validates every tile (header against name and
+  plane, size, on the plane, samples in range), refuses a v1 map naming
+  `scripts/convert_map_v2.py`, clamps every terrain amplitude to
+  `kNoiseAmpMax` (4096: the octave's `n.dx·amp` i32 bound with a 16x biome
+  multiplier), and refuses planes past 64 MiB dense / 4097 posts a side.
+  `PackWorldMap` packs both planes DENSE (height two i16 a word, biome four
+  ids a word) behind the extended header (`kHExtent*`, `kHHeight*`,
+  `kHBiome*`, `kHeaderWords` 72): `default` is 20.2 MiB (3137² posts), `peaks`
+  3.3 MiB. The content hash folds map.json, every tile in (plane, tz, tx)
+  order, the sculpt layer and the refs; `biomes::HashMapFiles` (the
+  environment stamp, the save fingerprint) and `tuner_server.py _map_hash`
+  hash the same files.
+  **`landAt` (both mirrors):** `bed = authored + curve(range rung)·calm +
+  hill/detail/grain (biome multipliers, soften) + sculpt`. `mapHeightAt` is
+  a Catmull-Rom over the 4x4 posts, rows in x then the column in z, integer
+  Horner in the post fraction (`crStep`: exact at a post because f == 0
+  multiplies every term away; every i32 product bounded in the comment over
+  it), returning the height and its ANALYTIC gradient (the x slopes blended
+  in z by the same spline), so the gradient fed to the octave attenuation and
+  the sediment gate is CONTINUOUS across post edges — the v1 piecewise-
+  constant landform gradient turned a gradient jump into a height step
+  through the attenuation. The authored height is never scaled by a curve, a
+  fade or the attenuation; the biome curve's domain is the range rung only
+  (±rangeAmplitude/2); the calm home/pad fade applies to the range rung's
+  DEVIATION only (its gradient still feeds the fine rungs' attenuation
+  unfaded, as v1's coarse rungs did, so the harness pad's ground is v1's to
+  ±2 voxels; `homeArea.y` no longer reaches the ground — A1 replaces it);
+  `octave` clamps |g| to 32767. Outside the extent the authored height eases from the
+  edge value to `planes.height.default` over `edgeFadeVox` (smoothstep in the
+  Chebyshev distance; continuous, C1 everywhere but on the extent's edge).
+  Biomes blend (`biomeMixAt`) on the 25.6 m biome cells. `landformOctave`,
+  `mapLandformQ8/Gx/Gz`, the moisture plane, `landformRangeVox` and the
+  landform SITES are gone (a `kind: landform` site is a load warning; the
+  converter bakes them, the map page stamps them into the plane).
+  **Converter:** `scripts/convert_map_v2.py <name>` (v1 bilinear landform +
+  sites unclamped + the v1 calm fade baked toward `homeArea.y`, biome =
+  nearest v1 cell); `default` and `harness` are converted, Harrowby's refs
+  kept on their ground by `assets/worldmap/default/scripts/harrowby_v2_shift.py`.
+  **Test map `peaks`** (`scripts/gen_map_peaks.py`, 8 km): a 1,400 m massif
+  with a knife ridge, a 300 m cliff band, a 600 m gorge, a ~900 m high valley
+  with a tarn and the spawn, foothills, a coast. Gate: `worldmap-v2` (tile
+  format and absent = default, v1 refused, post exactness with zero noise,
+  CPU == GPU per voxel over post edges and a 2 vox/vox ramp, gradient and
+  ground continuity at post edges, the edge fade).
+* **LIVE (map v2 A1, 2026-10-08): ALTITUDE IS RELATIVE.** Every rule that
+  held one absolute Y for a 20 m-tall world now reads the column.
+  **Window:** `worldmap::WindowChunkYForGround(h)` = `((h - 72) >> 8)` half
+  windows -- ground in [72, 328) is window 0 (the harness map, so no scene
+  moved), a 900 m valley gets a window holding it with >= 72 voxels below and
+  >= 184 above; `SpawnWindowOrigin`, the `--shot` scenes that place a window
+  on a column and perfsuite's spawn / village scenarios use it.
+  **Treeline:** `treelineAt` (height mirror, CPU `worldmap::TreelineAt`) =
+  `sea + (terrain.treeline − sea)·biomeTreelineAt >> 8 ± treelineJitter`
+  (25.6 m value noise): the biome's `terrain.treelineScale` (Q8 in
+  `kB_TreelineQ8`, blended over the four biome cells like the relief) is a
+  FRACTION of the map's height above the sea, so one biome file serves the
+  harness's 11.6 m treeline and peaks' 1,000 m one (shipped: tundra 0.85,
+  alpine 0.9, pine 1.05). `genColumn` caches it as `Col.tl` (column cache
+  word `CCW_TREELINE`, `CC_WORDS` 26); the snow cap, `colGrowsTrees`, the
+  shore fringe, cacti, tile plants, the trunk column of a lattice / site tree,
+  ice born on water and the cover rows' `treeline` condition all read it.
+  `kHTreelineMax` (the highest any column's can be) bounds `treeMaxTop`;
+  the cactus sky term is per column since P1 (`cactusColTop`: the max
+  `cactusVTop` of the 3x3 tiles that can reach the column, pond gate
+  dropped), not `treelineMax + 5.4 m` -- a world-wide bound that, on a map
+  with a 1,000 m treeline, held every desert column's sky open to 1 km.
+  **Heat:** the column table carries each column's snowline;
+  `sim.heatLapsePerKm` (6) cools the biome climate per km above the sea
+  (`heatLapse`, `kHpLapse` / `kHpSeaY`; word 2 was the one snowline Y).
+  **Sediment:** relative (`sedAbove`, above). **Caves:** band 2 sits
+  24..31 m under the COLUMN's ground (`h - vlen(240) - noise`; it was
+  y -4..-11 m absolute, which is where it still lands under ground at y 200).
+  The magma table stays ONE flat plane (`LAVA_LEVEL`, the flat-liquid
+  invariant above it is load-bearing) but no column whose ground is within
+  `LAVA_CLEAR` (20 m) of it floods: its carve below the table stays stone, so
+  containment holds and no valley floor meets lava within 20 m. **Steep
+  rock:** a column whose landform slope reaches `terrain.rockSlope` (Q8,
+  640 = 2.5:1; 0 = off) skins four cells of `coverFirmMat` and wears no snow
+  cap and no cover row (`colSteep`): powder on a cliff never sleeps, grass on
+  one does not read as a cliff. `homeArea.y` is retired (a warning if
+  present). Gate `altitude` (on `peaks`): the window, the per-biome jittered
+  treeline, the lapse rate, the lava clearance under the gorge, CPU + GPU
+  sediment on the valley floor, rock + <= 32 active chunks on the cliff band.
+* **LIVE (map v2 R1, 2026-10-08, `docs/PLAN_map_v2.md` R1): ROADS ARE
+  GRADED GROUND, NOT PAINT.** `map.json roads[]`:
+  `{id, name?, points: [[x, z], ...] (world voxels), width (vox), shoulder
+  (vox), surface (a material name), maxGrade (%), kind?: road|track|path,
+  depth?}` — `depth` (surface cells, default 3, 1..8) is the one key past the
+  plan's schema (a superset; E3 may ignore it). Defaults by kind (road / track
+  / path): width 40 / 24 / 12, shoulder 16 / 12 / 6, maxGrade 10 / 15 / 25;
+  clamps (width 2..256, shoulder 0..64, grade 1..100) are warnings; a missing
+  id, a duplicate id, an unknown kind, fewer than two distinct points, an
+  unknown material or a **non-SOLID surface** are refusals naming the road (a
+  graded road is a slope; gravel and dirt are powders at repose 40 and would
+  never sleep — `packed_gravel` / `packed_earth` are the solid look-alikes,
+  appended to `materials.json` for this). **The bake** (`LoadWorldMap`, with
+  the map installed like the pad bake): the polyline sampled every 4 voxels,
+  the BARE ground there (`BareGroundHeight`, no road and no pad in it),
+  low-passed (±8 samples, 32 voxels), grade-limited — `lo` = the largest maxGrade-
+  Lipschitz profile under it, `hi` = the smallest over it (min-plus
+  transforms, forward + backward), road = `(lo + hi) / 2`, Q8 voxels — then
+  cut into `kSiteRoad` site records (`kind 8`, at the END of the site table):
+  a chord per run of samples while the profile stays within one voxel of
+  it and the run is ≤ `kSiteRoadPieceMax` 256 a side (routeDist2's i32
+  bound), vertices always ending a piece. Record: ends A/B (`kS_X/Z`,
+  `kS_BoxX1/Z1`, a route's layout), `kS_RoadYA/YB` (Q8 surface at the ends),
+  `kS_Radius` half-width, `kS_PadMargin` shoulder — WIDENED at load to
+  `2·gap + 2` (gap = the road vs the bare ground at the shoulder's outer edge,
+  probed every 8 voxels both sides), capped at `kSiteRoadShoulderMax` 64, the
+  stamp ramp's rule, ONE value per polyline segment — `kS_RoadMat`,
+  `kS_RoadDepth`, `kS_RoadFlags` (end A / B OPEN: a joint with the next piece
+  of the same straight has no round cap, or the cap would pull that piece's
+  ground toward the joint's Y and steepen the grade between — measured: 47
+  over-grade 16-voxel spans on a 25 % path before, 0 after; a bend vertex and
+  a road end keep their caps). `kSiteCellMax` went 32 -> 128 with this
+  (Harrowby's cell: 28 sites, 42-44 with its paths as roads, up to 93 with a
+  3-road test network at the first, finer cut; the `roads` gate's H line
+  reports the number). The pieces are cut twice
+  (straight first, so the pond keep-out the bare ground reads exists; re-cut
+  after the bake along the same lines) and the site index is built twice.
+  **Readers:** `roadPadAt` in the `landheight` mirror, applied BEFORE
+  `sitePadAt` (a house levels its floor over the road to its door): weight 256
+  within the half-width, a smoothstep in the squared distance across the
+  shoulder, the road Y lerped by the projection (`roadProj`), pieces blended
+  in table order; the sediment wedge is zeroed wherever it moved `h`.
+  `genCellIn` lays the surface over the top `depth` cells (first in the
+  ladder: above the snow line too; never under a pond) where `roadColAt`
+  (once per column in `genColumn`, `Col.road`) says the column is on a
+  carriageway — the half-width ±1 by a counter hash of the 2x2 block, a
+  ragged edge. Keep-outs: `siteFootprintHas` = half-width + 1 (no cover, tile
+  plant, tarn centre, cactus); `siteBlocksTrunk` = half-width + max(crown
+  reach, shoulder); `sitePadNear` (rolled ponds, cacti) = half-width +
+  `kSiteRoadShoulderMax` + r, a FIXED reach so the bare ground the bake samples
+  cannot depend on the shoulder it then widens. **Far field:** `roadTint` in
+  `farSurfaceMat` (no new site walk: `Col.road` carries the nearest piece):
+  where the cell is wider than the road but the road is at least a quarter of
+  it (`2·hw < cell ≤ 8·hw`), a cell whose centre column is within half a cell
+  (≤ `kSiteRoadFarTint` 32) of the road's edge takes its surface, untouched
+  ground only. Index reach: half-width + max(64 + 64, widest crown + 1, 32)
+  + 1. **Not done:** junctions are not profile-matched (two roads meeting at
+  a vertex blend in table order; snap their Y in the editor or keep the later
+  one's end on level ground); `--mapcheck` reports each road's per-vertex
+  baked Y and bare ground (`roads[]`) and the longest cell list
+  (`siteCellWorst`) for the map page. Harrowby's eight painted paths are
+  roads (`default/map.json`, ids `harrowby_*`, kind path) and were erased from
+  `default_ground.svedit` by `harrowby_08_paths.sh` (`paint_ground.mjs
+  --erase --only <mat>`). Gate `roads`.
+* **LIVE (map v2 E3, 2026-10-08): THE VECTOR LAYERS ARE EDITED ON THE MAP
+  PAGE.** `assets/editor/mapvector.js` (pure helpers Node-tested by
+  `scripts/test_mapvector.mjs`; the layer is created by `map.js`, which keeps
+  the canvas, undo and save) edits three map.json arrays. **Roads** (the R1
+  schema above, `depth` included; a new road is written with its kind's
+  defaults spelled out): draw (click, double-click / Enter ends), vertex
+  drag / insert (click the selected road) / delete (shift+click, Delete),
+  JUNCTIONS — a vertex dropped within 8 px of another road's vertex lands ON
+  it, dropped on another road's segment it lands on the segment and that road
+  gains a vertex there (a T); dragging a shared vertex moves every road on it
+  (Alt detaches, Alt on release does not snap); Ctrl+click starts a branch on
+  top of an existing road. Sharing a vertex is all a junction is: the R1 bake
+  does not profile-match junctions, so two roads meet at whatever Y each
+  bakes there. The inspector edits every field (kind change moves only the
+  fields left at the old kind's defaults; surface offers the SOLID mineral
+  materials) and draws the **profile as the ENGINE baked it**: `--mapcheck`'s
+  `roads[].profile` = the bake's own 4-voxel samples decimated to
+  `kRoadProfileMax` 256 (`s` arc length, `y` surface, `ground` bare ground),
+  cut / fill tinted, vertices ticked, hover shows the spot on the map. The
+  check is of the SAVED files, so a road edited since its save is labelled
+  as the saved road's bake. The page refuses to save a road with < 2
+  distinct points, a region with < 3, or a duplicate id (the loader would
+  refuse the whole map). **Regions** `{id, name, colour "#rrggbb", points}`
+  — named polygons, data only: `LoadWorldMap` refuses a missing / duplicate
+  id or < 3 distinct points, warns on a bad colour or a vertex outside the
+  extent; `WorldMapData::RegionAt(x, z)` (and the free `worldmap::RegionAt`,
+  by name, against `CurrentWorldMap()`) = the LAST region in table order
+  whose polygon holds the column centre (even-odd, integer, the page's
+  `regionAt` is the same arithmetic). Nothing reads it yet. **Markers**
+  `{id, name, icon, at}` — annotations; icons are 12x12 pixel art in
+  `mapvector.js ICONS` and must equal `worldmap.h kMarkerIcons` (hut,
+  village, castle, tower, cave, ruin, shrine, camp, mine, port; another is
+  a load warning). Locale markers are E4's (`locales[]`), not these. All
+  three are in map.json, so they move `contentHash` like any map edit.
+  `worldmap` gate part F: RegionAt over a square, a concave ell and a later
+  region on top; the warnings; the three refusals.
 * **LIVE (world map P5, 2026-09-04): THE SITE TABLE.** `map.json sites[]`
   of kind `stamp` (a `.vox` from `assets/prefabs/`, a world column, a
   rotation, a pad margin) and `rules[]` (`{kind: stamp, template, biome,
@@ -23553,6 +24022,118 @@ the next load. Solutes kept for a regenerated chunk are not cleared. The op
 record carries the regenerated gen list but not the environment reload, so
 `ops-replay` of a session with a live structure edit diverges (as with F7).
 "open in editor" is P5's.
+
+## 9g. Locales: a hand-made place rides its ground (added 2026-10-08)
+
+`docs/PLAN_map_v2.md` L1. Code: `worldmap.h` `LocaleDef` / `ReadLocales` /
+`LocaleRefYOffsets` / `MapEditLayerFiles`, `worldmap.cpp` (parse + the anchor
+bake), `world/refs.cpp` (relative group files), `world/structures.cpp`
+(`ReadPlacements`), `sim/worldedit.cpp` (several files, one layer). Gate:
+`locale`.
+
+```jsonc
+// map.json
+"locales": [ { "id": "harrowby", "name": "Harrowby", "icon": "village",
+               "bounds": { "min": [330, 3090], "max": [790, 3650] },
+               "anchor": { "at": [555, 3467], "y": 201 },
+               "editLayer": "ground" } ]          // optional; locales/<id>/<editLayer>.svedit
+```
+
+**The problem.** The world map v2 makes the ground an authored height plane
+that the author keeps reshaping, but a village's refs carry absolute `pos.y`:
+raise the hill under Harrowby and the houses stay in the air (F1 had to shift
+the refs by a script to survive its own conversion). A LOCALE is the unit that
+moves with the ground.
+
+**Rigid, by one number.** A locale's ref group (`refs/<id>.json`, the group
+name IS the locale id) is stored with y relative to `anchor.y`. At load
+`LoadWorldMap` measures the bare ground at `anchor.at` for the seed
+(`BareGroundHeight`, at the site-pad bake, where the planes, the sculpt layer,
+the soften boxes and the waynode routes are all in place) — `groundY`; the
+locale's delta is `groundY - anchor.y`, and every ref of the group lands at
+`file y + groundY`. Structure refs become stamp sites with `padY` / `refY`
+lifted by that offset (`StampSite::locale` names the locale; two houses of one
+locale share a floor exactly as before); the `RefStore` adds it on read and
+takes it off on every group-file write, so the store, the kinds, the editor
+commands and the References page all see WORLD positions and only the file is
+relative (`RefStore::yOff_`). One delta for the whole locale, not per house:
+the houses, the routes and the people between them were authored against each
+other, and a per-house shift would tilt the village apart. When the loaded map
+re-resolves a locale to another offset (F7 after the ground under it was
+reshaped), `RefStore::Update` moves the group by the difference and
+re-applies it (`FollowLocales`). A store whose map is not the loaded one (a
+tool, `--edit-script` on a map that failed to load) uses `anchor.y` — delta 0
+— and says so in its warnings. `--edit-script` loads the map CPU-only when it
+has locales, so a script's world positions convert through the real anchor at
+the default seed. `--mapcheck` reports each locale's `groundY`, `anchorY` and
+`delta`.
+
+**Its own edit layer.** `locales/<id>/ground.svedit` (or `editLayer`), SVED v2
+ground-relative like the map's (§9c.4) — the cells are per-column relative
+already, so they need no delta. `MapEditLayerFiles` lists the map's layer
+then each locale's that exists, in table order, and `WorldEdits::LoadFiles`
+merges them into the one process layer column by column: where two files name
+the same cell the LATER one wins (map first, then locales in order); a file
+that fails to parse is left out whole. Every consumer (the stream drain, the
+far base, `--voxserve`) sees the merged layer unchanged. The environment stamp,
+the save fingerprint's edit part and `tuner_server.py`'s `editsHash` fold the
+files in the same order (`HashEditLayerFiles`; exactly the old single-file hash
+for a map without locale layers), and the voxel region cache digests every
+file of `@map`.
+
+**Harrowby is the first** (`assets/worldmap/default/scripts/harrowby_09_locale.py`,
+re-runnable): anchor at the green with `anchor.y` = the loader's ground there
+(201, so its delta was 0 the day it moved and the village did not move); refs
+converted to relative y; the cellar's 5,184 columns moved out of
+`default_ground.svedit` into `locales/harrowby/ground.svedit`; the gravel and
+dirt path columns stay in the map layer (they become `roads[]`, R1). The
+earlier `harrowby_0x.jsonl` edit scripts are a RECORD in world voxels at the
+pre-v2 ground (y 201 floors), not something to re-run.
+
+**Known gaps.** A ref's save delta lives in the region bucket of its position;
+a delta big enough to carry a ref across a region boundary in y orphans the
+delta (warned and dropped on load, like a deleted ref). The overlap warning
+between a locale house and a house outside every locale judges their floors as
+different (it runs before the anchors resolve). The noise is not translation-
+invariant in y (a +200 plane moved the bare ground +183 with the default
+terrain noise), so a locale follows its anchor's ground, not the plane.
+
+**The locale editor (E4, 2026-10-08).** `assets/editor/maplocale.js`, a
+layer of the World map page like `mapvector.js`. World mode: every locale's
+bounds at low opacity and its 12x12 pixel-art badge (the E3 marker icons =
+`kMarkerIcons`) at `anchor.at`; the Locale tool drags out a new one (anchor
+at the centre, `anchor.y` from the heights backdrop or the plane; the panel
+offers "anchor.y := engine ground" from `--mapcheck`'s `locales[]`); a
+double-click opens it. THE LOCALE PAGE is a mode of the same page, not a
+second editor (one undo stack, one save, the same sculpt layer and site
+code): a breadcrumb back, the view framed on the bounds over the engine's
+`--heightmap` of the box at one sample a voxel, and only Sculpt / Clearing /
+Soften / Tree / Water / Structure / Link. **Clipping is exact for sculpt**:
+`sculptOctave` reads samples `x >> 3` and `+1` for a column's offset AND its
+gradient, so sample `s` reaches columns `8s-8 .. 8s+7`; `sculptDab` skips any
+sample whose reach leaves the bounds, so no column outside reads a changed
+sample (`scripts/test_maplocale.mjs` brute-forces it; the browser harness
+checks the engine's heights outside are unchanged after a stroke dragged
+across the edge). Box sites are clamped with their feather; a lake (with its
+shore band) or a tree outside is refused. **Refs are never written by the
+page**: Structure / Link build F8 commands (`ref.place / move / delete / link
+/ unlink`, world y = the backdrop's ground + 1) for `/api/refs/commands`
+(`--edit-script`), refused until the locale is in the SAVED map.json exactly
+as shown (the engine converts y through the saved anchor); each batch is one
+page undo step holding its inverse commands (a delete's inverse re-places the
+ref at file y + the locale's `groundY`). **The 3D view** is a streaming
+`WorldView` with `mapName` = the page's map and `layerSel @map` (the map's
+layer + every locale's, merged as the game merges them), `editBounds` = the
+locale's bounds (`apply` and the brush skip cells outside), and saves its
+`EditLayer` (loaded from the locale's file, resolved at the view's seed) to
+`/api/worldedit?locale=&map=` -> `locales/<id>/<stem>.svedit`, ground-relative
+through that map's voxel server; an empty layer deletes the file. The tuner
+server spawns `--voxserve` PER MAP (`SANDVOX_MAP`, one process alive,
+restarted on a map switch; PALETTE / voxreload take whatever is live) and
+`/api/heightmap` takes `map=`, so the map page's engine previews are of the
+map it edits, not tuning's `world.mapLayer`. `/api/voxregion?layer=@map` now
+sends `LAYER @map` (it sent the map layer's NAME, which loaded that one file
+and left every locale's layer out of the 3D preview).
 
 ## 10. Networking — the model of record (decided 2026-09-10)
 
@@ -25352,8 +25933,9 @@ id: schedules, dialogue speakers, save deltas.
 
 **The file is the truth** — `assets/worldmap/<map>/refs/<group>.json`, one ref
 per line, key order `id, kind, base, pos, yaw, props`, then any field this build
-does not know, in file order. `pos` is integer world voxels, `yaw` whole degrees
-(heading 0 = +Z, 90 = +X). Unknown props, unknown fields and unknown kinds are
+does not know, in file order. `pos` is integer world voxels — except `pos.y` in
+a LOCALE's group, which the file stores relative to the locale's anchor (§9g;
+the store holds world y) — `yaw` whole degrees (heading 0 = +Z, 90 = +X). Unknown props, unknown fields and unknown kinds are
 KEPT and written back verbatim; `WriteGroup(ParseGroup(x)) == x` for anything the
 writer produced (`refs-roundtrip`). Every load problem is a warning naming file,
 id and field, listed on the References page. The harness map's

@@ -869,6 +869,47 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
   if (j.contains("palette"))
     ApplyPaletteRecolour(j["palette"], def.prefab.artColors, jp, log);
 
+  // ---- PAINT THAT IS A SUBSTANCE (anatomy.paintBecomes), part 1 -----------
+  // `[{"material": "skin", "art": [251, 252], "becomes": "hair"}]`: every
+  // voxel of `material` painted one of these art slots is `becomes` (human.json:
+  // the scalp hair, brows and beard the generator paints over the skin). The
+  // slots are THIS FILE's palette indices (the generator's ART table), so the
+  // cells are found here, before the merge below renumbers `color`, and
+  // rewritten in part 2, after anatomy::Resolve — for garmentsBecome's reason:
+  // the anatomy-parity gate compares the recipe against the bake, and the bake
+  // says skin. A .vox paints ids 0..127 only, which is why this is not baked.
+  struct PaintBecomes {
+    int toId = -1;
+    std::vector<std::pair<uint32_t, uint32_t>> at;  // (model, voxel) indices
+  };
+  std::vector<PaintBecomes> paintBecomes;
+  if (j.contains("anatomy") && j["anatomy"].is_object() &&
+      j["anatomy"].contains("paintBecomes") && j["anatomy"]["paintBecomes"].is_array()) {
+    for (const json& r : j["anatomy"]["paintBecomes"]) {
+      if (!r.is_object()) continue;
+      const int fromId = FindMaterialId(mats, r.value("material", std::string()));
+      const int toId = FindMaterialId(mats, r.value("becomes", std::string()));
+      if (fromId <= 0 || toId <= 0 || !r.contains("art") || !r["art"].is_array()) {
+        log += jp + ": anatomy.paintBecomes " + r.dump() +
+               " needs a known `material`, a known `becomes` and an `art` list; skipped\n";
+        continue;
+      }
+      bool slot[256] = {};
+      for (const json& a : r["art"])
+        if (a.is_number_integer() && a.get<int>() > 0 && a.get<int>() < 256)
+          slot[a.get<int>()] = true;
+      PaintBecomes pb;
+      pb.toId = toId;
+      for (uint32_t mi = 0; mi < def.prefab.models.size(); mi++) {
+        const std::vector<PrefabVoxel>& vs = def.prefab.models[mi].voxels;
+        for (uint32_t vi = 0; vi < vs.size(); vi++)
+          if ((int)vs[vi].material == fromId && vs[vi].color && slot[vs[vi].color])
+            pb.at.push_back({mi, vi});
+      }
+      paintBecomes.push_back(std::move(pb));
+    }
+  }
+
   // Fold this file's art colours into the one palette every def resolves
   // against, and rewrite its voxels' slots to the merged numbering NOW —
   // before anything copies them into a limb, a flipbook frame or a micro
@@ -1320,6 +1361,17 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
           if ((int)v.material == fromId) v.material = (uint16_t)toId;
     }
   }
+  // ---- PAINT THAT IS A SUBSTANCE, part 2 ----------------------------------
+  // The cells part 1 found, still painted (Resolve clears the art of every
+  // voxel it rewrites, and a rewritten one is no longer that paint's).
+  // Resolve rewrites in place, so the indices still name the same voxels.
+  for (const PaintBecomes& pb : paintBecomes)
+    for (const auto& [mi, vi] : pb.at) {
+      if (mi >= def.prefab.models.size() || vi >= def.prefab.models[mi].voxels.size())
+        continue;
+      PrefabVoxel& v = def.prefab.models[mi].voxels[vi];
+      if (v.color) v.material = (uint16_t)pb.toId;
+    }
 
   if (def.artUpsample > 1) {
     UpsamplePrefab(def.prefab, def.artUpsample);
@@ -8510,6 +8562,11 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
                   (mob.ai_.hasTarget && mob.ai_.intent != ai::Intent::Idle &&
                    (def.chaseRange <= 0.0f ||
                     mob.ai_.targetDist <= def.chaseRange)));
+  // The arms swing with the stride (walk / run), and a held guard pumps with
+  // it rather than riding rigid (pose.h PoseInputs::gaitClips / guardPump).
+  in.gaitClips = true;
+  in.guardPump = mob.stroke_.Active() &&
+                 mob.stroke_.phase == NpcStroke::Phase::Guard;
   mob.PosePipeline(in, dt, world, tick);
 }
 
@@ -32863,7 +32920,18 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
   // off the arc.
   const int i0 = chain->parts[0], i1 = chain->parts[1];
   const Vec3 shoulder = st.model[i0].pos;
-  const Vec3 targetLocal = shoulder + toRig(weapon_.hand);
+  Vec3 targetLocal = shoulder + toRig(weapon_.hand);
+  // THE GUARD'S STRIDE PUMP (PosePipeline sets the weight; 0 off a guard).
+  // The arm opposes its own leg: at gaitPhase 0 the left foot is down and in
+  // front, so the RIGHT hand is forward. Model +X is the character's left.
+  // The hand rises as it comes forward, the way a carried blade does.
+  if (pose_.guardPumpW > 1e-3f && def_ != nullptr) {
+    const float side =
+        sk.parts[i0].anchorLocal.x >= def_->worldSize.x * 0.5f ? 1.0f : -1.0f;
+    const float fwd = -side * std::cos(6.2831853f * st.gaitPhase);
+    const float amp = MetresToCells(0.09f) * pose_.guardPumpW;
+    targetLocal = targetLocal + Vec3{0.0f, 0.45f * amp * fwd, amp * fwd};
+  }
 
   IkChain steer = *chain;
   if ((weapon_.steerBlade || weapon_.usePole) && weapon_.bendPole.len() > 1e-4f) {

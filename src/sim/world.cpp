@@ -449,8 +449,12 @@ void World::Init(const rhi::Device& device) {
                         U::Storage | U::CopySrc, "farVox");
   // shadow_resolve.wgsl SKY_TOP_BASE indexes past the counts; FAR_LEVELS (8)
   // of these words are used, the rest are headroom.
-  constexpr uint32_t kFarSkyTopWords = 16;
-  static_assert(kFarLevels <= kFarSkyTopWords, "sky-bound tail too small");
+  // + the SKY TILES after those 16 (map v2 P1, sky_top.wgsl SKY_TILE_*): one
+  // word per 4 x 4 chunk-column tile, 8 x 8 tiles a level.
+  constexpr uint32_t kFarSkyTileN = kFarNChunk / 4;
+  static_assert(kFarNChunk % 4 == 0, "sky tiles are 4 chunk columns wide");
+  constexpr uint32_t kFarSkyTopWords = 16 + kFarLevels * kFarSkyTileN * kFarSkyTileN;
+  static_assert(kFarLevels <= 16, "sky-bound tail too small");
   // + kFarSkyTopWords: the per-level SKY BOUND tail (shadow_resolve.wgsl
   // skyTopReduce, read by raymarch.wgsl traceFar/farShadowDist). Zero = "this
   // level holds nothing", which is also what an unfilled level is.
@@ -1729,10 +1733,7 @@ uint32_t World::MapBiomeAt(int x, int z, uint32_t seed) {
   const int amp = m.warpAmpVox;
   const int wx = x + (((vnoise2d(x, z, 9u, seed ^ 0x3A9Fu).n - 8192) * amp) >> 14);
   const int wz = z + (((vnoise2d(x, z, 9u, seed ^ 0x3AA0u).n - 8192) * amp) >> 14);
-  int cx, cz;
-  m.CellOf(wx, wz, &cx, &cz);
-  if (!m.Inside(cx, cz)) return static_cast<uint32_t>(m.oceanBiome);
-  return m.BiomeCell(cx, cz);
+  return m.BiomeCellAt(wx, wz);
 }
 
 // The map's calm pad box (worldgen.wgsl inPadBox; map.json kind "pad", which
@@ -1812,6 +1813,12 @@ static int sitePadWeight(uint32_t sid, int x, int z) {
 }
 // worldgen.wgsl sitePadNear: is any stamp's whole pad within r?
 static bool sitePadNear(int x, int z, int r);
+// worldgen.wgsl routeDist2 / routeNear: a route's or a road piece's segment.
+static int routeDist2(const worldmap::WorldMapData::StampSite& st, int x, int z, int reach);
+static bool routeNear(const worldmap::WorldMapData::StampSite& st, int x, int z, int keep) {
+  const int d2 = routeDist2(st, x, z, keep);
+  return d2 >= 0 && d2 <= keep * keep;
+}
 // worldgen.wgsl softenAt: the Q8 scales of the three local octaves.
 struct Soften {
   int hill;
@@ -1828,6 +1835,8 @@ static bool siteFootprintHas(uint32_t sid, int x, int z) {
   // A clearing keeps crowns off and nothing else: no footprint. Nor does
   // softened ground or a route.
   if (kind == worldmap::kSiteClearing || kind == worldmap::kSiteSoften || kind == worldmap::kSitePath) return false;
+  // A road's carriageway, + 1 for its ragged edge (map v2 R1).
+  if (kind == worldmap::kSiteRoad) return routeNear(wmSite(sid), x, z, wmSite(sid).radius + 1);
   const int dx = x - wmSiteI(sid, WM_S_X);
   const int dz = z - wmSiteI(sid, WM_S_Z);
   if (kind == WM_SITE_WATER) {
@@ -1871,6 +1880,13 @@ static bool sitePadNear(int x, int z, int r) {
   const uint32_t n = wmSiteN(lst);
   for (uint32_t k = 0u; k < n; k++) {
     const uint32_t sid = wmSiteK(lst, k);
+    // A road: a FIXED reach past its half-width (worldgen.wgsl says why).
+    if ((uint32_t)wmSite(sid).kind == worldmap::kSiteRoad) {
+      const int reach = wmSite(sid).radius + (int)worldmap::kSiteRoadShoulderMax + r;
+      const int d2 = routeDist2(wmSite(sid), x, z, reach);
+      if (d2 >= 0 && d2 < reach * reach) return true;
+      continue;
+    }
     if ((uint32_t)wmSite(sid).kind != WM_SITE_STAMP) continue;
     if (stampRectDist(sid, x, z) < wmSite(sid).apron + wmSite(sid).padMargin + r) return true;
   }
@@ -1890,6 +1906,25 @@ static int routeDist2(const worldmap::WorldMapData::StampSite& st, int x, int z,
   else if (l2 > 0 && t > 0) { cx = ax + (vx * t) / l2; cz = az + (vz * t) / l2; }
   const int dx = x - cx, dz = z - cz;
   return dx * dx + dz * dz;
+}
+// worldgen.wgsl roadProj: x = squared distance to a road piece's line (-1
+// outside its box grown by `reach`), y = the baked surface at the column's
+// projection, Q8 voxels. Same bounds as the shader's comment.
+struct RoadP {
+  int d2;
+  int y;
+};
+static RoadP roadProj(uint32_t sid, int x, int z, int reach) {
+  const worldmap::WorldMapData::StampSite& st = wmSite(sid);
+  const int d2 = routeDist2(st, x, z, reach);
+  if (d2 < 0) return RoadP{-1, 0};
+  const int vx = st.x1 - st.x, vz = st.z1 - st.z;
+  const int l2 = std::max(vx * vx + vz * vz, 1);
+  const int dot = (x - st.x) * vx + (z - st.z) * vz;
+  if ((dot < 0 && (st.roadFlags & 1) != 0) || (dot > l2 && (st.roadFlags & 2) != 0)) return RoadP{-1, 0};
+  const int t = std::clamp(dot, 0, l2);
+  const int tq = (t * 256) / l2;
+  return RoadP{d2, st.roadYA + (((st.roadYB - st.roadYA) * tq) >> 8u)};
 }
 static Soften softenAt(int x, int z) {
   Soften s{256, 256, 256};
@@ -1935,12 +1970,7 @@ static Soften softenAt(int x, int z) {
 // The painted cell's biome, no warp and no seed (worldgen.wgsl biomeCellAt):
 // whose water rows roll at a pond tile.
 static uint32_t biomeCellAt(int x, int z) {
-  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
-  if (!m.Loaded()) return 0u;
-  int cx, cz;
-  m.CellOf(x, z, &cx, &cz);
-  if (!m.Inside(cx, cz)) return static_cast<uint32_t>(m.oceanBiome);
-  return m.BiomeCell(cx, cz);
+  return worldmap::CurrentWorldMap().BiomeCellAt(x, z);
 }
 
 // ---- the water table, on the CPU (worldgen.wgsl wmWater / wmWaterRow /
@@ -2044,7 +2074,6 @@ static int padOutside(int x, int z) {
 // TerrainWords() the packer wrote into the buffer; an unloaded map carries the
 // defaults (WorldMapData's constructor), never zeros.
 static constexpr uint32_t WM_H_TERRAIN_BASE_HEIGHT = worldmap::kHTerrainBaseHeight;
-static constexpr uint32_t WM_H_TERRAIN_LANDFORM_RANGE = worldmap::kHTerrainLandformRange;
 static constexpr uint32_t WM_H_TERRAIN_RANGE_AMPLITUDE = worldmap::kHTerrainRangeAmplitude;
 static constexpr uint32_t WM_H_TERRAIN_RANGE_LOG2 = worldmap::kHTerrainRangeLog2;
 static constexpr uint32_t WM_H_TERRAIN_HILL_AMPLITUDE = worldmap::kHTerrainHillAmplitude;
@@ -2054,10 +2083,11 @@ static constexpr uint32_t WM_H_TERRAIN_DETAIL_LOG2 = worldmap::kHTerrainDetailLo
 static constexpr uint32_t WM_H_TERRAIN_GRAIN_AMPLITUDE = worldmap::kHTerrainGrainAmplitude;
 static constexpr uint32_t WM_H_TERRAIN_GRAIN_LOG2 = worldmap::kHTerrainGrainLog2;
 static constexpr uint32_t WM_H_TERRAIN_FBM_ATTEN = worldmap::kHTerrainFbmAtten;
-static constexpr uint32_t WM_H_TERRAIN_HOME_Y = worldmap::kHTerrainHomeY;
+static constexpr uint32_t WM_H_TERRAIN_TREELINE = worldmap::kHTerrainTreeline;
+static constexpr uint32_t WM_H_TERRAIN_TREELINE_JITTER = worldmap::kHTerrainTreelineJitter;
 static constexpr uint32_t WM_H_TERRAIN_HOME_R = worldmap::kHTerrainHomeR;
 static constexpr uint32_t WM_H_TERRAIN_HOME_FADE = worldmap::kHTerrainHomeFade;
-static constexpr uint32_t WM_H_TERRAIN_SED_CEIL = worldmap::kHTerrainSedCeil;
+static constexpr uint32_t WM_H_TERRAIN_SED_ABOVE = worldmap::kHTerrainSedAbove;
 static constexpr uint32_t WM_H_TERRAIN_SED_FRACTION = worldmap::kHTerrainSedFraction;
 static constexpr uint32_t WM_H_TERRAIN_SED_STRIP = worldmap::kHTerrainSedStrip;
 static constexpr uint32_t WM_H_TERRAIN_SED_SLOPE = worldmap::kHTerrainSedSlope;
@@ -2077,8 +2107,8 @@ static uint32_t wmTerrainU(uint32_t w) {
 // biomeMixAt / biomeCurve / biomeReliefAt by name, and the `terrain` gate's
 // pass C1 compares the two implementations per voxel over 9,409 columns,
 // which is the proof this block is right. Spelled as the shader spells it
-// anyway -- same cell lattice as mapLandformQ8, same bilinear shifts, same
-// Hermite -- over the same integers (WorldMapData::biomeTerrain, the same
+// anyway -- same biome-cell lattice, same bilinear shifts, same Hermite --
+// over the same integers (WorldMapData::biomeTerrain, the same
 // PackBiomeTerrain the packer wrote into the records).
 //
 // See the long note over the same functions in worldgen.wgsl for why there are
@@ -2096,29 +2126,24 @@ struct BiomeMix {
   int fx, fz;
   uint32_t l;
 };
-static uint32_t wmBiomeCellId(int cx, int cz) {
-  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
-  const int x = std::clamp(cx, 0, m.width - 1), z = std::clamp(cz, 0, m.height - 1);
-  return m.biome[(size_t)z * m.width + x];
-}
 static BiomeMix biomeMixAt(int x, int z) {
   BiomeMix m{};
   const worldmap::WorldMapData& d = worldmap::CurrentWorldMap();
   if (!d.Loaded()) { m.l = 1u; return m; }
-  const uint32_t l = (uint32_t)d.cellLog2;
+  const uint32_t l = (uint32_t)d.biomeLog2;
   const int half = 1 << (l - 1u);
-  const int mx = x - half + (d.originCellX << l);
-  const int mz = z - half + (d.originCellZ << l);
+  const int mx = x - half - d.extentX0;
+  const int mz = z - half - d.extentZ0;
   const int cx = mx >> l;
   const int cz = mz >> l;
   const int mask = (1 << l) - 1;
   m.fx = mx & mask;
   m.fz = mz & mask;
   m.l = l;
-  m.b00 = wmBiomeCellId(cx, cz);
-  m.b10 = wmBiomeCellId(cx + 1, cz);
-  m.b01 = wmBiomeCellId(cx, cz + 1);
-  m.b11 = wmBiomeCellId(cx + 1, cz + 1);
+  m.b00 = d.BiomePost(cx, cz);
+  m.b10 = d.BiomePost(cx + 1, cz);
+  m.b01 = d.BiomePost(cx, cz + 1);
+  m.b11 = d.BiomePost(cx + 1, cz + 1);
   return m;
 }
 static int mixI(BiomeMix m, int v00, int v10, int v01, int v11) {
@@ -2138,7 +2163,7 @@ static int curveKnotAt(BiomeMix m, int i) {
   return mixI(m, wmBiomeI(m.b00, w), wmBiomeI(m.b10, w), wmBiomeI(m.b01, w), wmBiomeI(m.b11, w));
 }
 static int curveHi() {
-  return std::max((wmTerrain(WM_H_TERRAIN_LANDFORM_RANGE) + wmTerrain(WM_H_TERRAIN_RANGE_AMPLITUDE)) / 2, 1);
+  return std::max(wmTerrain(WM_H_TERRAIN_RANGE_AMPLITUDE) / 2, 1);
 }
 static int curveTangent(int dPrev, int dNext) {
   if (dPrev * dNext <= 0) return 0;
@@ -2180,6 +2205,14 @@ struct BiomeRelief {
   int detail;
   int grain;
 };
+// The biome's treeline scale, blended like the relief (worldgen.wgsl
+// biomeTreelineAt; map v2 A1). 256 = the map's treeline.
+static int biomeTreelineAt(BiomeMix m) {
+  const worldmap::WorldMapData& d = worldmap::CurrentWorldMap();
+  if (!d.Loaded()) return 256;
+  auto q = [&](uint32_t b) { return b < d.biomeTreelineQ8.size() ? d.biomeTreelineQ8[b] : 256; };
+  return mixI(m, q(m.b00), q(m.b10), q(m.b01), q(m.b11));
+}
 static BiomeRelief biomeReliefAt(BiomeMix m) {
   BiomeRelief r;
   r.hill = 256;
@@ -2195,61 +2228,29 @@ static BiomeRelief biomeReliefAt(BiomeMix m) {
   return r;
 }
 
-// ---- the landform plane and the sea level, on the CPU (P4) ----------------
-// The twins of worldgen.wgsl's seaLevelY / mapLandformQ8 / mapLandformGx,Gz:
-// same arithmetic over the same bytes (worldmap::CurrentWorldMap()). Outside
-// the height mirror on both sides; the mirrored landAt calls them by name and
-// the `terrain` gate's C1 pass is the per-voxel proof they agree.
+// ---- the authored height plane and the sea level, on the CPU (map v2) ------
+// The twins of worldgen.wgsl's seaLevelY / wmHasHeight / wmHeightLog2 /
+// wmExtentLo / wmExtentSize / wmHeightDefault / wmEdgeFade / wmHeightPost:
+// the same numbers over WorldMapData (the same posts PackWorldMap packed).
+// Outside the height mirror on both sides; the mirrored mapHeightAt calls them
+// by name and the `terrain` gate's C1 pass is the per-voxel proof they agree.
 static int seaLevelY() { return worldmap::CurrentWorldMap().seaLevelY; }
-static int wmLandformCellQ8(int cx, int cz) {
+static bool wmHasHeight() {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
-  const int x = std::clamp(cx, 0, m.width - 1), z = std::clamp(cz, 0, m.height - 1);
-  return (int)m.landform[(size_t)z * m.width + x] << 8;
+  return m.Loaded() && !m.height.empty();
 }
-static int mapLandformQ8(int x, int z) {
+static uint32_t wmHeightLog2() { return (uint32_t)worldmap::CurrentWorldMap().heightLog2; }
+static IV2 wmExtentLo() {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
-  if (!m.Loaded()) return 32768;
-  const uint32_t l = (uint32_t)m.cellLog2;
-  const int half = 1 << (l - 1u);
-  const int mx = x - half + (m.originCellX << l);
-  const int mz = z - half + (m.originCellZ << l);
-  const int cx = mx >> l;
-  const int cz = mz >> l;
-  const int mask = (1 << l) - 1;
-  const int fx = mx & mask;
-  const int fz = mz & mask;
-  const int c00 = wmLandformCellQ8(cx, cz);
-  const int c10 = wmLandformCellQ8(cx + 1, cz);
-  const int c01 = wmLandformCellQ8(cx, cz + 1);
-  const int c11 = wmLandformCellQ8(cx + 1, cz + 1);
-  const int a = c00 + (((c10 - c00) * fx) >> l);
-  const int b = c01 + (((c11 - c01) * fx) >> l);
-  const int v = a + (((b - a) * fz) >> l);
-  const int dOut = std::max(std::max(-cx, cx + 1 - m.width), std::max(-cz, cz + 1 - m.height));
-  const int fade = std::max(m.oceanFadeCells, 1);
-  if (dOut <= 0) return v;
-  return (v * std::max(fade - dOut, 0)) / fade;
+  return iv2(m.extentX0, m.extentZ0);
 }
-static int mapLandformGx(int x, int z) {
+static IV2 wmExtentSize() {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
-  if (!m.Loaded()) return 0;
-  const uint32_t l = (uint32_t)m.cellLog2;
-  const int half = 1 << (l - 1u);
-  const int cx = (x - half + (m.originCellX << l)) >> l;
-  const int cz = (z - half + (m.originCellZ << l)) >> l;
-  const int d = wmLandformCellQ8(cx + 1, cz) - wmLandformCellQ8(cx, cz);
-  return (d * wmTerrain(WM_H_TERRAIN_LANDFORM_RANGE)) >> (8u + l);
+  return iv2(m.extentW, m.extentH);
 }
-static int mapLandformGz(int x, int z) {
-  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
-  if (!m.Loaded()) return 0;
-  const uint32_t l = (uint32_t)m.cellLog2;
-  const int half = 1 << (l - 1u);
-  const int cx = (x - half + (m.originCellX << l)) >> l;
-  const int cz = (z - half + (m.originCellZ << l)) >> l;
-  const int d = wmLandformCellQ8(cx, cz + 1) - wmLandformCellQ8(cx, cz);
-  return (d * wmTerrain(WM_H_TERRAIN_LANDFORM_RANGE)) >> (8u + l);
-}
+static int wmHeightDefault() { return worldmap::CurrentWorldMap().heightDefault; }
+static int wmEdgeFade() { return std::max(worldmap::CurrentWorldMap().edgeFadeVox, 1); }
+static int wmHeightPost(int i, int k) { return worldmap::CurrentWorldMap().HeightPost(i, k); }
 
 // ---- the sculpt layer, on the CPU (worldgen.wgsl sculptSample / sculptOctave; P5) ----
 // Outside the height mirror on both sides, like the plane readers: the
@@ -2281,7 +2282,7 @@ struct Oct {
 static Oct octave(int x, int z, uint32_t csl, int amp,
                   int gx, int gz, uint32_t seed) {
   N2 n = vnoise2d(x, z, csl, seed);
-  int g = std::abs(gx) + std::abs(gz);
+  int g = std::min(std::abs(gx) + std::abs(gz), 32767);
   int att = 65536 / (256 + ((wmTerrain(WM_H_TERRAIN_FBM_ATTEN) * ((g * g) >> 8)) >> 8));
   Oct o;
   o.dev = ((((n.n - 8192) * amp) >> 14) * att) >> 8;
@@ -2290,36 +2291,90 @@ static Oct octave(int x, int z, uint32_t csl, int amp,
   return o;
 }
 
-static Oct landformOctave(int x, int z) {
+// The authored height: worldgen.wgsl's crStep / crRow / crGrad /
+// heightPlaneAt / mapHeightAt, token for token. Read that file's block for the
+// Catmull-Rom, its exactness at posts and every i32 bound.
+static IV2 crStep(int p0, int p1, int p2, int p3, int f, uint32_t l) {
+  const int a1 = p2 - p0;
+  const int a2 = 2 * p0 - 5 * p1 + 4 * p2 - p3;
+  const int a3 = 3 * (p1 - p2) + p3 - p0;
+  int c = a2 + ((a3 * f) >> l);
+  c = a1 + ((c * f) >> l);
+  int d = 2 * a2 + ((3 * a3 * f) >> l);
+  d = a1 + ((d * f) >> l);
+  return iv2(2 * p1 + ((c * f) >> l), d);
+}
+static IV2 crRow(int i, int k, int f, uint32_t l) {
+  return crStep(wmHeightPost(i - 1, k) * 4, wmHeightPost(i, k) * 4, wmHeightPost(i + 1, k) * 4,
+                wmHeightPost(i + 2, k) * 4, f, l);
+}
+static int crGrad(int g, uint32_t l) {
+  return std::clamp((g * 32) >> l, -1048576, 1048576);
+}
+static Oct heightPlaneAt(int x, int z) {
+  const uint32_t l = wmHeightLog2();
+  const IV2 lo = wmExtentLo();
+  const int mask = (1 << l) - 1;
+  const int i = (x - lo.x) >> l;
+  const int k = (z - lo.y) >> l;
+  const int fx = (x - lo.x) & mask;
+  const int fz = (z - lo.y) & mask;
+  const IV2 r0 = crRow(i, k - 1, fx, l);
+  const IV2 r1 = crRow(i, k, fx, l);
+  const IV2 r2 = crRow(i, k + 1, fx, l);
+  const IV2 r3 = crRow(i, k + 2, fx, l);
+  const IV2 v = crStep(r0.x, r1.x, r2.x, r3.x, fz, l);
+  const IV2 gx = crStep(crGrad(r0.y, l), crGrad(r1.y, l), crGrad(r2.y, l), crGrad(r3.y, l), fz, l);
   Oct o;
-  o.dev = ((mapLandformQ8(x, z) - 32768) * wmTerrain(WM_H_TERRAIN_LANDFORM_RANGE)) >> 16;
-  o.gx = mapLandformGx(x, z);
-  o.gz = mapLandformGz(x, z);
+  o.dev = v.x >> 4u;
+  o.gx = std::clamp(gx.x >> 1u, -1048576, 1048576);
+  o.gz = std::clamp((v.y * 16) >> l, -1048576, 1048576);
   return o;
 }
+static Oct mapHeightAt(int x, int z) {
+  Oct o;
+  if (!wmHasHeight()) {
+    o.dev = wmTerrain(WM_H_TERRAIN_BASE_HEIGHT);
+    o.gx = 0;
+    o.gz = 0;
+    return o;
+  }
+  const IV2 lo = wmExtentLo();
+  const IV2 sz = wmExtentSize();
+  const int cx = std::clamp(x, lo.x, lo.x + sz.x);
+  const int cz = std::clamp(z, lo.y, lo.y + sz.y);
+  const Oct e = heightPlaneAt(cx, cz);
+  const int ox = std::abs(x - cx);
+  const int oz = std::abs(z - cz);
+  const int d = std::max(ox, oz);
+  if (d == 0) { return e; }
+  const int fade = wmEdgeFade();
+  o.dev = wmHeightDefault();
+  o.gx = 0;
+  o.gz = 0;
+  if (d >= fade) { return o; }
+  const int t = (d * 32768) / fade;
+  const int s = vsmooth(t);
+  const int dh = wmHeightDefault() - e.dev;
+  const int ds = (dh * (vsmoothd(t) >> 4)) / (8 * fade);
+  const int keep = (32768 - s) >> 5;
+  o.dev = e.dev + ((dh * (s >> 1)) >> 14);
+  o.gx = ((select(e.gx, 0, ox > 0) * keep) >> 10) + select(0, select(-ds, ds, x > cx), ox >= oz);
+  o.gz = ((select(e.gz, 0, oz > 0) * keep) >> 10) + select(0, select(-ds, ds, z > cz), oz > ox);
+  return o;
+}
+
 static Land landAt(int x, int z, uint32_t seed) {
   BiomeMix bm = biomeMixAt(x, z);
   BiomeRelief rl = biomeReliefAt(bm);
-  Oct o0 = landformOctave(x, z);
+  Oct au = mapHeightAt(x, z);
   Oct o1 = octave(x, z, wmTerrainU(WM_H_TERRAIN_RANGE_LOG2), wmTerrain(WM_H_TERRAIN_RANGE_AMPLITUDE),
-                  o0.gx, o0.gz, seed ^ 2u);
-  // The per-biome height curve, on the two COARSE rungs only. cv.y is the
-  // curve's own slope in Q8 and it scales the accumulated gradient rather than
-  // the deviation, so iq's attenuation of hill/detail/grain keeps describing
-  // the ground it is actually attenuating against. See worldgen.wgsl.
-  const IV2 cv = biomeCurve(bm, o0.dev + o1.dev);
-  int g1x = ((o0.gx + o1.gx) * cv.y) >> 8;
-  int g1z = ((o0.gz + o1.gz) * cv.y) >> 8;
-  Oct o2 = octave(x, z, wmTerrainU(WM_H_TERRAIN_HILL_LOG2), (wmTerrain(WM_H_TERRAIN_HILL_AMPLITUDE) * rl.hill) >> 8,
-                  g1x, g1z, seed ^ 3u);
-  int g2x = g1x + o2.gx;
-  int g2z = g1z + o2.gz;
-  Oct o3 = octave(x, z, wmTerrainU(WM_H_TERRAIN_DETAIL_LOG2), (wmTerrain(WM_H_TERRAIN_DETAIL_AMPLITUDE) * rl.detail) >> 8,
-                  g2x, g2z, seed ^ 4u);
-  int g3x = g2x + o3.gx;
-  int g3z = g2z + o3.gz;
-  Oct o4 = octave(x, z, wmTerrainU(WM_H_TERRAIN_GRAIN_LOG2), (wmTerrain(WM_H_TERRAIN_GRAIN_AMPLITUDE) * rl.grain) >> 8,
-                  g3x, g3z, seed ^ 5u);
+                  au.gx, au.gz, seed ^ 2u);
+  // The per-biome height curve, on the RANGE RUNG only (map v2). cv.y is the
+  // curve's own slope in Q8 and it scales the rung's gradient rather than the
+  // deviation, so iq's attenuation of hill/detail/grain keeps describing the
+  // ground it is actually attenuating against. See worldgen.wgsl.
+  const IV2 cv = biomeCurve(bm, o1.dev);
 
   IV2 sc = spawnCentre();
   int fade = wmTerrain(WM_H_TERRAIN_HOME_FADE);
@@ -2334,15 +2389,25 @@ static Land landAt(int x, int z, uint32_t seed) {
     wh = (dh * 16384) / fade;
   }
   int ws = vsmooth(std::min(w, wh) << 1) >> 1;
-  int homeY = wmTerrain(WM_H_TERRAIN_HOME_Y);
-  int coarse = wmTerrain(WM_H_TERRAIN_BASE_HEIGHT) + cv.x - homeY;
+  int g1x = au.gx + std::clamp((o1.gx * cv.y) >> 8, -65536, 65536);
+  int g1z = au.gz + std::clamp((o1.gz * cv.y) >> 8, -65536, 65536);
+  Oct o2 = octave(x, z, wmTerrainU(WM_H_TERRAIN_HILL_LOG2), (wmTerrain(WM_H_TERRAIN_HILL_AMPLITUDE) * rl.hill) >> 8,
+                  g1x, g1z, seed ^ 3u);
+  int g2x = g1x + o2.gx;
+  int g2z = g1z + o2.gz;
+  Oct o3 = octave(x, z, wmTerrainU(WM_H_TERRAIN_DETAIL_LOG2), (wmTerrain(WM_H_TERRAIN_DETAIL_AMPLITUDE) * rl.detail) >> 8,
+                  g2x, g2z, seed ^ 4u);
+  int g3x = g2x + o3.gx;
+  int g3z = g2z + o3.gz;
+  Oct o4 = octave(x, z, wmTerrainU(WM_H_TERRAIN_GRAIN_LOG2), (wmTerrain(WM_H_TERRAIN_GRAIN_AMPLITUDE) * rl.grain) >> 8,
+                  g3x, g3z, seed ^ 5u);
   Oct sp = sculptOctave(x, z);
   Soften sf = softenAt(x, z);
-  int bed = homeY + ((o2.dev * sf.hill) >> 8) + ((o3.dev * sf.bump) >> 8) + ((o4.dev * sf.grain) >> 8)
-          + ((coarse * ws) >> 14) + sp.dev;
+  int bed = au.dev + ((cv.x * ws) >> 14) + ((o2.dev * sf.hill) >> 8) + ((o3.dev * sf.bump) >> 8)
+          + ((o4.dev * sf.grain) >> 8) + sp.dev;
 
   int slope = std::abs(g1x + ((o2.gx * sf.hill) >> 8) + sp.gx) + std::abs(g1z + ((o2.gz * sf.hill) >> 8) + sp.gz);
-  int room = std::max(0, wmTerrain(WM_H_TERRAIN_SED_CEIL) - bed);
+  int room = std::max(0, wmTerrain(WM_H_TERRAIN_SED_ABOVE) - (bed - au.dev - sp.dev));
   int sed = ((room * wmTerrain(WM_H_TERRAIN_SED_FRACTION)) >> 8) - wmTerrain(WM_H_TERRAIN_SED_STRIP);
   int sedSlope = wmTerrain(WM_H_TERRAIN_SED_SLOPE);
   sed = (std::max(sed, 0) * std::max(sedSlope - slope, 0)) /
@@ -2358,6 +2423,13 @@ static Land landAt(int x, int z, uint32_t seed) {
 }
 static int baseHeight(int x, int z, uint32_t seed) {
   return landAt(x, z, seed).h;
+}
+static int treelineAt(int x, int z, uint32_t seed) {
+  const int sea = seaLevelY();
+  const int s = biomeTreelineAt(biomeMixAt(x, z));
+  const N2 n = vnoise2d(x, z, 8u, seed ^ 0x7E11u);
+  return sea + (((wmTerrain(WM_H_TERRAIN_TREELINE) - sea) * s) >> 8)
+       + (((n.n - 8192) * wmTerrain(WM_H_TERRAIN_TREELINE_JITTER)) >> 13);
 }
 struct Pond {
   bool present;
@@ -2755,6 +2827,28 @@ static BareCol landColumnBare(int x, int z, uint32_t seed) {
   return b;
 }
 
+static int roadPadAt(int x, int z, int h) {
+  const uint32_t* lst = wmSiteList(x, z);
+  const uint32_t n = wmSiteN(lst);
+  int hh = h;
+  for (uint32_t k = 0u; k < n; k++) {
+    const uint32_t sid = wmSiteK(lst, k);
+    if ((uint32_t)wmSite(sid).kind != worldmap::kSiteRoad) { continue; }
+    const int hw = wmSite(sid).radius;
+    const int o = hw + wmSite(sid).padMargin;
+    const RoadP p = roadProj(sid, x, z, o);
+    if (p.d2 < 0 || p.d2 > o * o) { continue; }
+    int w = 256;
+    if (p.d2 > hw * hw) {
+      const int t = ((o * o - p.d2) * 256) / (o * o - hw * hw);
+      w = (t * t * (768 - 2 * t)) >> 16u;
+    }
+    const int y = (p.y + 128) >> 8u;
+    hh = hh + (((y - hh) * w + 128) >> 8u);
+  }
+  return hh;
+}
+
 static int sitePadAt(int x, int z, int h) {
   const uint32_t* lst = wmSiteList(x, z);
   const uint32_t n = wmSiteN(lst);
@@ -2774,7 +2868,7 @@ int World::TerrainHeight(int x, int z, uint32_t seed) {
   // knobs are tuned, or every scene's fixture heights drift.
   if (sLabWorld) return kLabSlabY;
   const int h = landColumnBare(x, z, seed).h;
-  return sitePadAt(x, z, h);
+  return sitePadAt(x, z, roadPadAt(x, z, h));
 }
 // MIRROR-END landheight
 
@@ -2782,6 +2876,17 @@ int World::TerrainHeight(int x, int z, uint32_t seed) {
 int worldmap::BareGroundHeight(int x, int z, uint32_t seed) {
   return landColumnBare(x, z, seed).h;
 }
+
+// worldmap.h: the mirrored mapHeightAt, for the `worldmap-v2` gate and tools.
+int worldmap::AuthoredHeightAt(int x, int z, int* gx, int* gz) {
+  const Oct o = mapHeightAt(x, z);
+  if (gx) *gx = o.gx;
+  if (gz) *gz = o.gz;
+  return o.dev;
+}
+// worldmap.h: the mirrored treelineAt (map v2 A1), for the heat layer's
+// column table, the loader's tree-site warning and the gates.
+int worldmap::TreelineAt(int x, int z, uint32_t seed) { return treelineAt(x, z, seed); }
 
 
 // The map probe (world.h Column). Composed from the SAME functions the height

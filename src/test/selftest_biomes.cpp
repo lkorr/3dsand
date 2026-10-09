@@ -115,7 +115,6 @@ bool SiteCases(Ctx& c, const biomes::BiomeSet& set, std::string& out) {
 
   // The tree's column: in the window, below the treeline, dry (the C sweep).
   const IVec3 org = c.world.WindowOrigin();
-  const int treeline = worldmap::CurrentTerrain().treeline;
   int tx = 0, tz = 0, th = 0;
   bool found = false;
   for (int i = 0; i < 12 && !found; i++) {
@@ -123,7 +122,7 @@ bool SiteCases(Ctx& c, const biomes::BiomeSet& set, std::string& out) {
     const int z = org.z * (int)kChunk + 300 + i * 11;
     const int h = World::TerrainHeight(x, z, kDefaultSeed);
     const World::PondQuery pq = World::PondNearColumn(x, z, kDefaultSeed);
-    if (h >= treeline - 1 || pq.inDisc || pq.near) continue;
+    if (h >= worldmap::TreelineAt(x, z, kDefaultSeed) - 1 || pq.inDisc || pq.near) continue;
     if (!c.world.ChunkInWindow(IVec3{x >> 4, (h + 1) >> 4, z >> 4})) continue;
     tx = x; tz = z; th = h; found = true;
   }
@@ -185,18 +184,86 @@ bool SiteCases(Ctx& c, const biomes::BiomeSet& set, std::string& out) {
   }
   // Overflow: kSiteCellMax + 1 sites reaching one cell refuse the load,
   // naming the cell. (Was five against a cap of 4; the world editor's P4
-  // raised the cap to 32 for a village, so the crowd follows the constant.)
+  // raised the cap to 32 for a village, so the crowd follows the constant --
+  // packed 7 voxels apart so even map v2 R1's 129 fit inside one cell.)
   {
     nlohmann::json jo = base;
     const int crowd = static_cast<int>(worldmap::kSiteCellMax) + 1;
     for (int k = 0; k < crowd; k++)
       jo["sites"].push_back({{"id", "p6_crowd_" + std::to_string(k)}, {"kind", "tree"}, {"species", sp->name},
-                             {"at", {14400 + k * 20, 15000}}});
+                             {"at", {14400 + k * 7, 15000}}});
     worldmap::WorldMapData over;
     std::string olog, ot = jo.dump();
     const bool refused = !worldmap::LoadWorldMap(dir, real.name, set, c.mats.size(), kDefaultSeed, over, olog, &ot);
     say(refused && olog.find("at most") != std::string::npos,
         "D: " + std::to_string(crowd) + " sites in one cell did not refuse the load (" + olog + ")");
+  }
+  // F. REGIONS AND MARKERS (map v2 E3), CPU, through the same in-memory door:
+  // a square, an L-shaped (concave) region and a small one drawn later INSIDE
+  // the square load; RegionAt answers inside / outside / the notch of the L /
+  // the later region on top; a bad colour and an unknown icon are warnings;
+  // a duplicate id, a two-point polygon and a marker without `at` refuse.
+  int regionHits = 0;
+  {
+    nlohmann::json jr = base;
+    jr["regions"] = nlohmann::json::array({
+        {{"id", "e3_square"}, {"name", "The Square"}, {"colour", "#336699"},
+         {"points", {{30000, 30000}, {31000, 30000}, {31000, 31000}, {30000, 31000}}}},
+        {{"id", "e3_ell"}, {"name", "The Ell"}, {"colour", "nope"},
+         {"points", {{32000, 30000}, {33000, 30000}, {33000, 30400}, {32400, 30400}, {32400, 31000}, {32000, 31000}}}},
+        {{"id", "e3_inner"}, {"colour", "#aabbcc"},
+         {"points", {{30400, 30400}, {30600, 30400}, {30600, 30600}, {30400, 30600}}}}});
+    jr["markers"] = nlohmann::json::array({{{"id", "e3_hut"}, {"name", "Hut"}, {"icon", "hut"}, {"at", {30500, 30100}}},
+                                            {{"id", "e3_odd"}, {"icon", "teapot"}, {"at", {30500, 30200}}}});
+    worldmap::WorldMapData rm;
+    std::string rlog, rt = jr.dump();
+    const bool rok = worldmap::LoadWorldMap(dir, real.name, set, c.mats.size(), kDefaultSeed, rm, rlog, &rt);
+    say(rok, "F: the regions / markers map was REFUSED: " + rlog);
+    if (rok) {
+      auto name = [&](int x, int z) {
+        const worldmap::WorldMapData::Region* r = rm.RegionAt(x, z);
+        return r ? r->id : std::string("-");
+      };
+      const std::pair<std::pair<int, int>, const char*> probes[] = {
+          {{30100, 30100}, "e3_square"}, {{30999, 30999}, "e3_square"}, {{31000, 30500}, "-"},
+          {{30500, 30500}, "e3_inner"},  {{32200, 30800}, "e3_ell"},   {{32800, 30200}, "e3_ell"},
+          {{32800, 30800}, "-"},         {{29999, 30500}, "-"}};
+      std::string miss;
+      for (const auto& [p, want] : probes) {
+        if (name(p.first, p.second) == want) regionHits++;
+        else miss += " (" + std::to_string(p.first) + "," + std::to_string(p.second) + ")=" + name(p.first, p.second) + " want " + want;
+      }
+      say(regionHits == 8, "F: RegionAt wrong at" + miss);
+      say(rm.regions.size() == 3 && rm.markers.size() == 2 && rm.markers[0].x == 30500 && rm.markers[0].icon == "hut",
+          "F: regions / markers not read back (" + std::to_string(rm.regions.size()) + " / " + std::to_string(rm.markers.size()) + ")");
+      auto rwarned = [&](const std::string& a, const std::string& b) {
+        for (const std::string& w : rm.warnings)
+          if (w.find(a) != std::string::npos && w.find(b) != std::string::npos) return true;
+        return false;
+      };
+      say(rwarned("e3_ell", "#rrggbb") && rwarned("e3_odd", "teapot") && !rwarned("e3_square", "colour"),
+          "F: missing the bad-colour / unknown-icon warnings");
+      // RegionAt by NAME against CurrentWorldMap(), the free function.
+      worldmap::SetCurrentWorldMap(rm);
+      const std::string n1 = worldmap::RegionAt(30100, 30100), n2 = worldmap::RegionAt(30500, 30500);
+      worldmap::SetCurrentWorldMap(real);
+      say(n1 == "The Square" && n2 == "e3_inner", "F: RegionAt by name gave \"" + n1 + "\" / \"" + n2 + "\"");
+    }
+    auto refuses = [&](nlohmann::json bad, const std::string& needle, const std::string& what) {
+      worldmap::WorldMapData bm;
+      std::string blog, bt = bad.dump();
+      const bool no = !worldmap::LoadWorldMap(dir, real.name, set, c.mats.size(), kDefaultSeed, bm, blog, &bt);
+      say(no && blog.find(needle) != std::string::npos, "F: " + what + " did not refuse (" + blog + ")");
+    };
+    nlohmann::json d1 = jr;
+    d1["regions"].push_back(jr["regions"][0]);
+    refuses(d1, "second region", "a duplicate region id");
+    nlohmann::json d2 = jr;
+    d2["regions"][1]["points"] = {{1, 1}, {5, 5}, {5, 5}};
+    refuses(d2, "three distinct", "a two-point region");
+    nlohmann::json d3 = jr;
+    d3["markers"][0].erase("at");
+    refuses(d3, "needs at", "a marker without at");
   }
 
   // E. The tree on the GPU.
@@ -244,13 +311,14 @@ bool SiteCases(Ctx& c, const biomes::BiomeSet& set, std::string& out) {
       DrainFullRefill(c.ctx, c.world, c.sim, IVec3{108 >> 4, 122 >> 4, 108 >> 4});
     }
   }
-  char buf[400];
+  char buf[520];
   std::snprintf(buf, sizeof buf,
                 "sites: synthetic load %s with %zu warnings, %s tree at (%d,%d) h %d listed %d, keep-out trunk %s / "
-                "past %s, GPU trunk cell %s (atlas %s)",
+                "past %s, GPU trunk cell %s (atlas %s); regions: RegionAt %d/8",
                 loaded ? "ok" : "REFUSED", syn.warnings.size(), sp->name.c_str(), tx, tz, th, listed,
                 keepIn ? "yes" : "NO", keepOut ? "YES" : "no",
-                got < c.mats.size() ? c.mats[got].name.c_str() : "?", want < c.mats.size() ? c.mats[want].name.c_str() : "?");
+                got < c.mats.size() ? c.mats[got].name.c_str() : "?", want < c.mats.size() ? c.mats[want].name.c_str() : "?",
+                regionHits);
   out = buf;
   for (const std::string& b : bad) out += "; " + b;
   return bad.empty();
@@ -273,16 +341,18 @@ Status GateWorldMap(Ctx& c, std::string& detail) {
     return Status::Fail;
   }
 
-  // B: sixteen cell centres spread over the plane.
+  // B: sixteen biome-cell centres spread over the plane (the warp is at most
+  // a quarter cell, so a centre never leaves its cell).
   int centreOk = 0, centreN = 0;
-  const int half = 1 << (m.cellLog2 - 1);
+  const int half = 1 << (m.biomeLog2 - 1);
+  const int cellsX = m.extentW >> m.biomeLog2, cellsZ = m.extentH >> m.biomeLog2;
   for (int k = 0; k < 16; k++) {
-    const int cx = (m.width * (k % 4) + m.width / 8) / 4;
-    const int cz = (m.height * (k / 4) + m.height / 8) / 4;
-    const int x = ((cx - m.originCellX) << m.cellLog2) + half;
-    const int z = ((cz - m.originCellZ) << m.cellLog2) + half;
+    const int cx = (cellsX * (k % 4) + cellsX / 8) / 4;
+    const int cz = (cellsZ * (k / 4) + cellsZ / 8) / 4;
+    const int x = m.extentX0 + (cx << m.biomeLog2) + half;
+    const int z = m.extentZ0 + (cz << m.biomeLog2) + half;
     centreN++;
-    if (World::MapBiomeAt(x, z, kDefaultSeed) == m.BiomeCell(cx, cz)) centreOk++;
+    if (World::MapBiomeAt(x, z, kDefaultSeed) == m.BiomePost(cx, cz)) centreOk++;
   }
 
   // C: the skin at ground level, at columns inside the window, off the
@@ -290,12 +360,11 @@ Status GateWorldMap(Ctx& c, std::string& detail) {
   const IVec3 org = c.world.WindowOrigin();
   int skinOk = 0, skinN = 0, skipped = 0, skinFirm = 0;
   std::string first;
-  const int treeline = worldmap::CurrentTerrain().treeline;
   for (int i = 0; i < 6; i++) {
     const int x = org.x * (int)kChunk + 40 + i * 52;
     const int z = org.z * (int)kChunk + 400 + i * 13;
     const int h = World::TerrainHeight(x, z, kDefaultSeed);
-    if (h >= treeline) { skipped++; continue; }   // snow cap, not the skin
+    if (h >= worldmap::TreelineAt(x, z, kDefaultSeed)) { skipped++; continue; }   // snow cap, not the skin
     const IVec3 cc{x >> 4, h >> 4, z >> 4};
     if (!c.world.ChunkInWindow(cc)) { skipped++; continue; }
     std::vector<uint32_t> chunk(kChunkVol, 0);
@@ -327,9 +396,9 @@ Status GateWorldMap(Ctx& c, std::string& detail) {
   const bool ok = centreOk == centreN && skinN >= 3 && skinOk == skinN && p6ok;
   char buf[320];
   std::snprintf(buf, sizeof buf,
-                "map '%s' %dx%d @%d vox, %zu palette, content %08x; twin at cell centres %d/%d; "
+                "map '%s' %dx%d biome cells @%d vox, %zu palette, content %08x; twin at cell centres %d/%d; "
                 "GPU skin == twin's biome skin %d/%d (%d as its firmSkin, %d skipped)%s",
-                mapName.c_str(), m.width, m.height, 1 << m.cellLog2, m.palette.size(),
+                mapName.c_str(), m.extentW >> m.biomeLog2, m.extentH >> m.biomeLog2, 1 << m.biomeLog2, m.palette.size(),
                 m.contentHash, centreOk, centreN, skinOk, skinN, skinFirm, skipped, first.c_str());
   detail = std::string(buf) + "; " + p6;
   std::printf("worldmap: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
@@ -406,13 +475,13 @@ Status GateSpawnSite(Ctx& c, std::string& detail) {
   }
   if (h <= m.seaLevelY) why += "; ground y" + std::to_string(h) + " is under seaLevelY " + std::to_string(m.seaLevelY);
   if (pq.inDisc) why += "; under a tarn (surface y" + std::to_string(pq.surf) + ")";
-  if ((int)b == m.oceanBiome) why += "; biome is the ocean";
+  if ((int)b == m.biomeDefault) why += "; biome is the plane default (ocean)";
   const bool ok = why.empty();
   char buf[320];
   std::snprintf(buf, sizeof buf,
-                "map '%s': spawn (%d,%d) on %s: ground y%d (sea y%d, home y%d), %d vox past the pad box, "
+                "map '%s': spawn (%d,%d) on %s: ground y%d (sea y%d, treeline y%d), %d vox past the pad box, "
                 "%d site%s in its cell, keep-out %s, tarn %s%s",
-                m.name.c_str(), sx, sz, bname.c_str(), h, m.seaLevelY, worldmap::CurrentTerrain().homeY,
+                m.name.c_str(), sx, sz, bname.c_str(), h, m.seaLevelY, worldmap::TreelineAt(sx, sz, kDefaultSeed),
                 boxDist, siteCount, siteCount == 1 ? "" : "s", keepOut ? "YES" : "no",
                 pq.inDisc ? "YES" : (pq.near ? "near" : "no"), why.c_str());
   detail = buf;
@@ -454,7 +523,6 @@ Status GateEnvReload(Ctx& c, std::string& detail) {
   // The column: in-window, below the treeline, whose twin biome has a skin
   // that is not what we will swap it to. Same sweep the worldmap gate uses.
   const IVec3 org = c.world.WindowOrigin();
-  const int treeline = worldmap::CurrentTerrain().treeline;
   int cx = 0, cz = 0, ch = 0;
   biomes::BiomeDef* target = nullptr;
   // THE HARNESS WINDOW IS DESERT (the harness map is a copy of `default`,
@@ -482,7 +550,7 @@ Status GateEnvReload(Ctx& c, std::string& detail) {
     const int x = org.x * (int)kChunk + 40 + (i % 9) * 52;
     const int z = org.z * (int)kChunk + 40 + (i / 9) * 52;
     const int h = World::TerrainHeight(x, z, kDefaultSeed);
-    if (h >= treeline) continue;
+    if (h >= worldmap::TreelineAt(x, z, kDefaultSeed)) continue;
     if (!c.world.ChunkInWindow(IVec3{x >> 4, h >> 4, z >> 4})) continue;
     const int b = (int)World::MapBiomeAt(x, z, kDefaultSeed);
     for (biomes::BiomeDef& d : set.biomes) {

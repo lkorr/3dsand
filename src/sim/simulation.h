@@ -70,6 +70,11 @@ class Simulation {
   // worldgen reads the new tables the same way the first one read the old.
   void UploadEnvironment(const rhi::Device& device, const rhi::Queue& queue,
                          const TreeAtlas& trees, const std::vector<uint32_t>& worldMapWords);
+  // The far horizon's pyramid (sim/horizon.h) from worldmap::CurrentWorldMap()
+  // and the packed map words: built and uploaded (grow-only). Init and
+  // UploadEnvironment call it; render-only, so nothing the sim reads moves.
+  void UploadHorizon(const rhi::Device& device, const rhi::Queue& queue,
+                     const std::vector<uint32_t>& worldMapWords);
 
   // A dense (denseGen = true) worldgen reads the column cache like `list`
   // does, so the caller runs WriteGenList over every slot first
@@ -920,8 +925,8 @@ class Simulation {
   uint32_t elecTagMask_ = 0;
   uint32_t elecCrackleLoMat_ = 0, elecCrackleLoSrc_ = 0;
   uint32_t elecCrackleHiMat_ = 0, elecCrackleHiSrc_ = 0;
-  std::vector<uint8_t> heatCol_;
-  std::vector<int> heatColX_, heatColZ_;
+  std::vector<uint32_t> heatCol_;          // heat.h kHpCol: biome | snowline << 8, chunk-column tiles
+  std::vector<int> heatColX_, heatColZ_;   // the world chunk column each tile row / column holds
   bool heatColValid_ = false;
   uint32_t heatColSeed_ = 0;
   uint64_t heatColKey_ = 0;
@@ -1061,6 +1066,8 @@ class Simulation {
   rhi::ComputePipeline rayStartTrace_, rayStartMin_;
   // The rain shadow map (rain_map.wgsl rainMapPrep / rainMapBuild).
   rhi::ComputePipeline rainMapPrep_, rainMapBuild_;
+  // The terrain-scale light map (horizon_light.wgsl hzSky / hzSun, map v2 S1).
+  rhi::ComputePipeline hzSky_, hzSun_;
   // The gust streaks' update (wind_streak.wgsl `update`, per-frame table).
   rhi::ComputePipeline windStreak_;
   // The god-ray sun visibility volume (godray_vis.wgsl `godrayVis`).
@@ -1233,6 +1240,27 @@ class Simulation {
   // points. 44 in renderBGL_ (fragment, read); CPU-written per frame by
   // boltfx::Upload while a bolt burns.
   rhi::Buffer boltBuf_;
+  // The far horizon's height pyramid (sim/horizon.h): 45 in renderBGL_
+  // (fragment, read). Built from the map at Init and every UploadEnvironment;
+  // grow-only. renderBGBuilt_ says the render bind groups exist yet (Init
+  // uploads the horizon before it builds them).
+  rhi::Buffer horizonBuf_;
+  size_t horizonWords_ = 0;
+  // THE TERRAIN-SCALE LIGHT MAP (horizon.h kL*; horizon_light.wgsl): the
+  // sun's horizon and the sky visibility per pyramid sample, GPU-written by
+  // the hz_sky / hz_sun rows. 33 in shadowBGL_ (compute, read-write), 46 in
+  // renderBGL_ (fragment, read). Grow-only like the pyramid. hzSamples_ is
+  // the pyramid's sample count (0 = none: no row records). hzSkyDue_ is set
+  // by every pyramid upload (the sky visibility is a function of the map
+  // alone); hzSunAz_ is the key light azimuth the sun rows last ran for
+  // (unit xz; hzSunBuilt_ false = never / since the last upload).
+  rhi::Buffer hzLightBuf_;
+  uint64_t hzLightWords_ = 0;
+  uint32_t hzSamples_ = 0;
+  bool hzSkyDue_ = false;
+  bool hzSunBuilt_ = false;
+  float hzSunAz_[2] = {0.0f, 0.0f};
+  bool renderBGBuilt_ = false;
   // The GI gather request list (gi_gather.wgsl; pass_table.h kGiReq*): fixed
   // size, zeroed at Init (the dedup bitmap must start empty). 28 in
   // shadowBGL_ (compute), 39 in renderBGL_ (fragment, appends). giArgsBuf_ is

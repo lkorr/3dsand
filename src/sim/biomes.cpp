@@ -63,6 +63,8 @@ Conditions ReadCond(const json& j) {
   c.patchThreshold = Get<int>(s, "patchThreshold", c.patchThreshold);
   c.canopyMin = std::clamp(Get<int>(s, "canopyMin", c.canopyMin), 0, 255);
   c.canopyMax = std::clamp(Get<int>(s, "canopyMax", c.canopyMax), 0, 255);
+  const std::string tl = GetS(s, "treeline");
+  c.treeline = tl == "below" ? 1 : tl == "above" ? 2 : 0;
   return c;
 }
 
@@ -105,6 +107,10 @@ bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& m
   out = BiomeSet{};
   std::unordered_map<std::string, uint32_t> byName;
   for (size_t i = 0; i < mats.size(); i++) byName[mats[i].name] = static_cast<uint32_t>(i);
+  for (const MaterialDef& m : mats) {
+    out.matNames.push_back(m.name);
+    out.matClass.push_back(m.gpu.klass);
+  }
   auto matId = [&](const std::string& n) -> uint32_t {
     if (n.empty() || n == "none") return 0;
     auto it = byName.find(n);
@@ -206,6 +212,7 @@ bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& m
       b.terrain.hill = std::clamp(Get<int>(te, "hill", 256), 0, 4096);
       b.terrain.detail = std::clamp(Get<int>(te, "detail", 256), 0, 4096);
       b.terrain.grain = std::clamp(Get<int>(te, "grain", 256), 0, 4096);
+      b.terrain.treelineScale = std::clamp(Get<double>(te, "treelineScale", 1.0), 0.0, 4.0);
     }
     out.biomes.push_back(std::move(b));
   }
@@ -474,17 +481,33 @@ uint32_t HashFileSet(const std::string& dir, const std::vector<std::string>& ext
   return h;
 }
 
+uint32_t HashMapFiles(const std::string& mapDir) {
+  // Map v2: map.json (+ the sculpt layer) beside, then each plane's tiles.
+  // Folded with one FNV multiply between the sets so a tile moving from one
+  // plane to the other is a change; scripts/tuner_server.py _map_hash mirrors
+  // this exactly (the tuner's badge compares the two).
+  uint32_t h = HashFileSet(mapDir, {".json", ".svsculpt"});
+  h = (h * 16777619u) ^ HashFileSet(mapDir + "/planes/biome", {".svt"});
+  h = (h * 16777619u) ^ HashFileSet(mapDir + "/planes/height", {".svt"});
+  return h;
+}
+
 EnvironmentStamp StampEnvironment(const std::string& assetDir, const std::string& mapName,
                                   const std::string& editLayer) {
   EnvironmentStamp s;
   s.mapName = mapName;
   s.editLayer = editLayer;
-  if (!editLayer.empty())
-    s.edits = sandvox::HashOneFile(assetDir + "/worldedits/" + editLayer + ".svedit",
-                                   editLayer + ".svedit");
+  // The map's layer, then each locale's (L1), read from map.json on disk like
+  // the rest of the stamp.
+  {
+    std::vector<worldmap::LocaleDef> locales;
+    std::string lerr;
+    worldmap::ReadLocales(assetDir, mapName, locales, lerr);   // malformed = none: the loader refuses it anyway
+    s.edits = worldmap::HashEditLayerFiles(worldmap::MapEditLayerFiles(assetDir, mapName, editLayer, locales));
+  }
   // .svsculpt (P5): the sculpt layer is part of the map. A map without one
   // hashes exactly as it did before the layer existed.
-  s.map = HashFileSet(assetDir + "/worldmap/" + mapName, {".json", ".svmap", ".svsculpt"});
+  s.map = HashMapFiles(assetDir + "/worldmap/" + mapName);
   // The water presets are a worldgen input since P-E (their flora rows are
   // packed into the same buffer as the biome records), so they are part of
   // the `biomes` stamp: an edited preset must light the apply button too.

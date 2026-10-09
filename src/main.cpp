@@ -1756,6 +1756,12 @@ void ProjectBodyUI(const LimbBoxes& lb, const PortraitCam& pc, UIState& ui) {
 // that column BEFORE the boot worldgen, so the first frame is generated
 // around the player rather than streamed to them one chunk-plane at a time
 // (Stream::Update shifts one chunk per axis per frame).
+// THE WINDOW'S Y over a column (map v2 A1): worldmap::WindowChunkYForGround of
+// the ground there. 0 on the harness map (its ground is ~y 200), so every
+// scripted scene below keeps the window it was written against.
+static int GroundWindowY(int x, int z) {
+  return worldmap::WindowChunkYForGround(World::TerrainHeight(x, z, kDefaultSeed));
+}
 IVec3 SpawnWindowOrigin() {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
   const int half = (int)kNChunk / 2;
@@ -1766,7 +1772,10 @@ IVec3 SpawnWindowOrigin() {
   // over before the cut, but it owned the whole-run stream and worldgen rows.
   if (g_fellSiteSet) { sx = g_fellSiteX - 48; sz = g_fellSiteZ; }
   if (g_atSet) { sx = (int)std::floor(g_atEye[0]); sz = (int)std::floor(g_atEye[2]); }
-  return IVec3{(sx >> 4) - half, 0, (sz >> 4) - half};
+  // Map v2 A1: the window's Y follows the ground under the spawn (it was
+  // pinned at 0, so a spawn on a 900 m valley booted into a window of sky
+  // 8 km below it and streamed up one chunk-plane a frame).
+  return IVec3{(sx >> 4) - half, GroundWindowY(sx, sz), (sz >> 4) - half};
 }
 Vec3 SpawnPos() {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
@@ -2178,7 +2187,7 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim,
   // the far-field cascade as flat colour with no submerged path at all. Shot
   // from the origin window this frame is a grey slab of far-field stone.
   {
-    world.SetWindowOrigin({260 / (int)kChunk - 8, 0, 300 / (int)kChunk - 8});
+    world.SetWindowOrigin({260 / (int)kChunk - 8, GroundWindowY(260, 300), 300 / (int)kChunk - 8});
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     for (uint32_t t = 1; t <= 40; t++)
@@ -2228,7 +2237,7 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim,
   // jitter either read or don't. Both are stills; judging the SWAY needs the
   // live app, but a frame mid-gust still shows the sheared blades leaning.
   {
-    world.SetWindowOrigin({336 / (int)kChunk - 8, 0, 96 / (int)kChunk - 8});
+    world.SetWindowOrigin({336 / (int)kChunk - 8, GroundWindowY(336, 96), 96 / (int)kChunk - 8});
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     for (uint32_t t = 1; t <= 40; t++)
@@ -2311,7 +2320,7 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim,
     const int kLx = 420, kLz = 420;
     const World::Column lakeCol = World::TerrainColumn(kLx, kLz, kDefaultSeed);
     const int kSurf = lakeCol.water != INT32_MIN ? lakeCol.water : lakeCol.h;
-    world.SetWindowOrigin({kLx / (int)kChunk - 8, 0, kLz / (int)kChunk - 8});
+    world.SetWindowOrigin({kLx / (int)kChunk - 8, GroundWindowY(kLx, kLz), kLz / (int)kChunk - 8});
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     std::vector<CellOp> slick;
@@ -2808,7 +2817,7 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim,
     // shot (the near half is what these frames are about) but it is why the
     // camera sits close to the middle rather than back on the bank.
     const int kPx = 258, kPz = -235;
-    world.SetWindowOrigin({kPx / (int)kChunk - 8, 0, kPz / (int)kChunk - 8});
+    world.SetWindowOrigin({kPx / (int)kChunk - 8, GroundWindowY(kPx, kPz), kPz / (int)kChunk - 8});
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     for (uint32_t t = 1; t <= 60; t++)
@@ -2880,7 +2889,7 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim,
     const uint32_t copper = matId("copper_bar"), mLight = matId("lightning"),
                    mSpark = matId("spark"), mArc = matId("arc");
     const int gx = 120, gz = 140;
-    world.SetWindowOrigin({gx / (int)kChunk - 8, 0, gz / (int)kChunk - 8});
+    world.SetWindowOrigin({gx / (int)kChunk - 8, GroundWindowY(gx, gz), gz / (int)kChunk - 8});
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     const int x0 = gx - 30, x1 = gx + 30, z0 = gz - 16, z1 = gz + 16;
@@ -3093,6 +3102,77 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim,
                   veg.x, veg.z, veg.ground, veg.ey, veg.what);
       sandvox::CentreWindowOnEye(ctx, world, sim, veg.ex, veg.ey, veg.ez, 120);
       render({veg.ex, veg.ey, veg.ez}, 0.0f, 0.0f, "screenshot_seam_veg.bmp");
+    }
+  }
+  // ---- THE PEAKS VIEWS (map v2 H1: the far horizon + the height fog) -------
+  //   _valley  the high valley floor by the spawn, facing the massif
+  //   _summit  on the 1,400 m summit, facing SW over the range to the coast
+  //   _sea10k  3 m over the sea 10 km south of the summit, facing the massif:
+  //            the massif itself is PAST the cascades here (horizon only)
+  // Map v2 S1 (terrain-scale light + clouds against mountains):
+  //   _dusk     the _valley view under a low evening sun (0.78 of the day,
+  //             ~6 deg up in the WSW): the valley floor in the western
+  //             ridges' shadow, the massif's face lit above a shadow line
+  //             (the terrain light map, horizon_light.wgsl)
+  //   _storm    the _sea10k view under the `storm` preset (base 700 m): the
+  //             massif's upper half in the deck, rain at sea, snow above the
+  //             freezing level
+  //   _cloudcap the _valley view under `towering` (base 1,100 m): summits
+  //             wrapped in cloud seen from below the deck
+  // On the `peaks` test map, loaded here and the harness map restored after,
+  // with the cameras placed explicitly (sandvox::PeaksPoseOf), not at the
+  // spawn. LAST and skipped whole unless one is wanted: a map reload and a
+  // worldgen + full far refill per view.
+  if (ShotWanted("screenshot_peaks_valley") || ShotWanted("screenshot_peaks_summit") ||
+      ShotWanted("screenshot_peaks_sea10k") || ShotWanted("screenshot_peaks_dusk") ||
+      ShotWanted("screenshot_peaks_storm") || ShotWanted("screenshot_peaks_cloudcap")) {
+    std::string prevMap, why;
+    if (!sandvox::SwitchMap(ctx, sim, mats, "peaks", &prevMap, why)) {
+      std::fprintf(stderr, "--shot: peaks views skipped: %s\n", why.c_str());
+    } else {
+      const char* names[3] = {"screenshot_peaks_valley.bmp", "screenshot_peaks_summit.bmp",
+                              "screenshot_peaks_sea10k.bmp"};
+      for (int v = 0; v < 3; v++) {
+        if (!ShotWanted(names[v])) continue;
+        const sandvox::PeaksPose p = sandvox::PeaksPoseOf(v);
+        std::printf("peaks view %d: eye (%.0f, %.0f, %.0f) yaw %.3f pitch %.3f -- %s\n", v,
+                    p.ex, p.ey, p.ez, p.yaw, p.pitch, p.what);
+        sandvox::CentreWindowOnEye(ctx, world, sim, p.ex, p.ey, p.ez, 120);
+        render({p.ex, p.ey, p.ez}, p.yaw, p.pitch, names[v]);
+      }
+      // ---- S1: the same cameras in other light and weather ----
+      if (ShotWanted("screenshot_peaks_dusk")) {
+        // 0.78 of the day: the sun ~6 degrees up in the WSW, behind the
+        // valley's western ridges -- whose shadows, kilometres long, are
+        // past every shadow ray's reach and only the terrain light map sees.
+        const sandvox::PeaksPose p = sandvox::PeaksPoseOf(0);
+        const uint32_t tick = (uint32_t)(0.78 * (double)shotTicksPerDay) % shotTicksPerDay;
+        const SkyState ss = SkyForTick(shotTun, tick);
+        std::printf("peaks dusk: sun dir (%.3f, %.3f, %.3f)\n", ss.sunDir[0], ss.sunDir[1],
+                    ss.sunDir[2]);
+        sandvox::CentreWindowOnEye(ctx, world, sim, p.ex, p.ey, p.ez, 120);
+        renderAt({p.ex, p.ey, p.ez}, p.yaw, p.pitch, "screenshot_peaks_dusk.bmp", (int64_t)tick);
+      }
+      struct WxShot { const char* name; const char* preset; int pose; };
+      const WxShot wx[] = {{"screenshot_peaks_storm.bmp", "storm", 2},
+                           {"screenshot_peaks_cloudcap.bmp", "towering", 0}};
+      const std::string savedPin = weather::Override();
+      for (const WxShot& x : wx) {
+        if (!ShotWanted(x.name)) continue;
+        const sandvox::PeaksPose p = sandvox::PeaksPoseOf(x.pose);
+        weather::SetOverride(x.preset);
+        weather::Snap();
+        std::printf("peaks %s: preset %s, eye (%.0f, %.0f, %.0f)\n", x.name, x.preset, p.ex,
+                    p.ey, p.ez);
+        sandvox::CentreWindowOnEye(ctx, world, sim, p.ex, p.ey, p.ez, 120);
+        render({p.ex, p.ey, p.ez}, p.yaw, p.pitch, x.name);
+      }
+      weather::SetOverride(savedPin);
+      weather::Snap();
+      std::string back;
+      if (!sandvox::SwitchMap(ctx, sim, mats, prevMap, nullptr, back))
+        std::fprintf(stderr, "--shot: could not restore map '%s': %s\n", prevMap.c_str(),
+                     back.c_str());
     }
   }
   // A hazard report with no message pop is a hazard report that goes nowhere:
@@ -3403,7 +3483,7 @@ int RunDebrisPondShot(GpuContext& ctx, World& world, Simulation& sim,
   // chunk that holds it is -15.
   const IVec3 here{(int)std::floor(kPx / (float)kChunk), 3,
                    (int)std::floor(kPz / (float)kChunk)};
-  world.SetWindowOrigin({here.x - 8, 0, here.z - 8});
+  world.SetWindowOrigin({here.x - 8, GroundWindowY(kPx, kPz), here.z - 8});
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
   FarField far;
@@ -3609,7 +3689,7 @@ int RunFluidShot(GpuContext& ctx, World& world, Simulation& sim,
     // clips nothing — which would hide the exact defect this scene exists to
     // photograph. Drain it so the shot sees the box the game sees.
     SetHarnessSnapshotDrain(true);
-    world.SetWindowOrigin({kPx / (int)kChunk - 8, 0, kPz / (int)kChunk - 8});
+    world.SetWindowOrigin({kPx / (int)kChunk - 8, GroundWindowY(kPx, kPz), kPz / (int)kChunk - 8});
   }
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
@@ -5053,7 +5133,7 @@ struct KeyEdge {
 //   4  u32  version (1)                 20  i32 cz
 //   8  u32  res                         24  u32 seed
 //   12 u32  span (voxels)               28  i32 voxelsPerMetre
-//   32 i32  hMin   36 i32 hMax          40 i32 seaHint (the map's terrain.homeArea.y)
+//   32 i32  hMin   36 i32 hMax          40 i32 seaLevelY (the map's sea plane)
 //   44 u32  reserved
 //   48 .. res*res * 8 bytes: i32 h, i16 water (h - water, clamped, or -32768
 //          for dry), u8 sed, u8 slope (Q8 clamped to 255)
@@ -5124,7 +5204,8 @@ int WriteHeightmap(const std::string& spec, const std::string& outPath) {
   put32(28, (uint32_t)kVoxelsPerMetre);
   put32(32, (uint32_t)hMin);
   put32(36, (uint32_t)hMax);
-  put32(40, (uint32_t)worldmap::CurrentTerrain().homeY);
+  // The SEA: map.js reads this word as `sea` (it used to carry homeArea.y).
+  put32(40, (uint32_t)worldmap::CurrentWorldMap().seaLevelY);
   put32(44, 0);
 
   std::error_code ec;
@@ -5533,7 +5614,7 @@ int main(int argc, char** argv) {
           "  --perf-out <path>     Where --perf writes its JSON\n"
           "  --perf-w/--perf-h <n> Offscreen render size for --perf/--render-budget\n"
           "  --render-budget       Where INSIDE the raymarch the GPU frame went\n"
-          "  --budget-cams <list>  --render-budget cameras (noon,dusk,cascade,submerged,meadow,canopy,fire,storm,village,seam,seamveg; default all)\n"
+          "  --budget-cams <list>  --render-budget cameras (noon,dusk,cascade,submerged,meadow,canopy,fire,storm,village,seam,seamveg,summit,peaksea; default all)\n"
           "  --shader-stats        Per-shader registers/spills from the driver\n"
           "                        -> build/shader_stats.json (headless)\n\n"
           "Residency:\n"
@@ -6196,6 +6277,29 @@ int main(int argc, char** argv) {
     refs::RegisterAllKinds();
     refs::RefStore store;
     const std::string mapName = worldmap::ActiveMapName(CurrentTuning().world.mapLayer);
+    // The world map too, CPU-only (--mapcheck's load), when the map has
+    // LOCALES (L1): a locale's refs are stored relative to its anchor, and the
+    // store converts world <-> file y through the anchor's ground for the
+    // default seed, which only a loaded map can say. A map without locales
+    // never pays the load.
+    {
+      std::vector<worldmap::LocaleDef> locales;
+      std::string lerr;
+      if (worldmap::ReadLocales(ad, mapName, locales, lerr) && !locales.empty()) {
+        std::vector<MaterialDef> m;
+        std::vector<ReactionGpu> rx;
+        std::string errs, blog;
+        biomes::BiomeSet set;
+        worldmap::WorldMapData map;
+        if (LoadAssets(ad + "/materials/materials.json", ad + "/materials/reactions.json", m, rx, errs) &&
+            biomes::LoadBiomeSet(ad, m, set, blog) &&
+            worldmap::LoadWorldMap(ad, mapName, set, m.size(), kDefaultSeed, map, blog))
+          worldmap::SetCurrentWorldMap(std::move(map));
+        else
+          std::fprintf(stderr, "--edit-script: map '%s' did not load (%s%s); its locales' refs are written "
+                               "against their authored anchor heights\n", mapName.c_str(), errs.c_str(), blog.c_str());
+      }
+    }
     store.LoadMap(ad, mapName);
     editor::Session es;
     es.ctx.refs = &store;
@@ -15442,9 +15546,12 @@ int main(int argc, char** argv) {
       // filled, so a backlogged refill (spawn, load, teleport, sprinting past
       // a level's hysteresis) fogs out the pending bands instead of showing
       // sky holes through them. Clamped to [kFarFogDensity, kFarFogDensityMax]
-      // — never thinner than the full-horizon pin, never so thick that the
-      // residency window itself disappears — then eased so the horizon opens
-      // smoothly rather than stepping with each landed plane.
+      // — never so thick that the residency window itself disappears — then
+      // eased so the horizon opens smoothly rather than stepping with each
+      // landed plane. With NOTHING pending the target is kFarFogDensity (0
+      // since H1): the far horizon (sim/horizon.h) draws past the cascade
+      // edge, so the edge needs no fog, and the air is the height fog
+      // (RenderParams hfog*), which WriteRenderParams sets on its own.
       //
       // The budget and the ease are render.fogOpticalDepths /
       // render.fogLerpPerFrame (read here since 2026-09-24; they loaded into
@@ -15456,9 +15563,12 @@ int main(int argc, char** argv) {
                     "tuning_params.def fog defaults must match world.h's pins");
       const Tuning::Render& fogTun = CurrentTuning().render;
       const float fogScale = fogTun.fogOpticalDepths / kFogOpticalDepths;
-      float fogTarget = std::clamp(
-          fogTun.fogOpticalDepths / far.SafeRadiusMeters(),
-          kFarFogDensity * fogScale, kFarFogDensityMax * fogScale);
+      const float safeR = far.SafeRadiusMeters();
+      float fogTarget =
+          safeR >= kFarHalfExtentMeters(kFarLevels) * 0.999f
+              ? kFarFogDensity * fogScale
+              : std::clamp(fogTun.fogOpticalDepths / safeR, kFarFogDensity * fogScale,
+                           kFarFogDensityMax * fogScale);
       fogSmooth += (fogTarget - fogSmooth) * fogTun.fogLerpPerFrame;
       // ---- short range: the panel checkbox is the live authority ----------
       // Pushed into support.cpp rather than OR'd into extraFlags below so that
@@ -16198,9 +16308,10 @@ int main(int argc, char** argv) {
           const bool day = DaylightStrengthCpu(DayPhaseNow(tick)) > 0;
           hr.valid = true;
           hr.day = day;
-          hr.snowline = hy >= HeatSnowlineY();
+          hr.snowline = hy >= HeatSnowlineYAt(hx, hz, world.WorldSeed());
           const uint32_t bi = World::MapBiomeAt(hx, hz, world.WorldSeed());
-          const HeatClimate cl = hr.snowline ? HeatSnowlineClimate() : HeatBiomeClimate(bi);
+          HeatClimate cl = hr.snowline ? HeatSnowlineClimate() : HeatBiomeClimate(bi);
+          if (!hr.snowline) cl.base -= HeatLapseAt(hy);   // the lapse rate (map v2 A1)
           // By biome ID (MapBiomeAt's answer), not by the map's palette slot.
           const std::vector<std::string>& names = worldmap::CurrentWorldMap().biomeName;
           hr.biome = hr.snowline ? std::string("snowline")
@@ -19382,6 +19493,19 @@ int main(int argc, char** argv) {
         // swapped for a peeled clone, and gear / unselected parts drop out when
         // the panel asks. Nothing outside this list changes, so the main view
         // and the corpse itself never see a peel.
+        //
+        // THE PROBE'S TARGETS (UIState::AutopsyUI::probe), filled by whichever
+        // body the portrait is of: per instance of the FINAL list, the index
+        // of the part it draws in probeTargets, or -1 (another creature, the
+        // world). The corpse fills it below; the living body after it.
+        struct ProbeTarget {
+          int fig;         // UIState body slot, -1 = worn / held
+          uint32_t src;    // the unpeeled brick, for the depth measure
+          const char* name;
+        };
+        std::vector<ProbeTarget> probeTargets;
+        std::vector<int> probeOf;
+        uint8_t probeKinds[256] = {};
         if (deathFrozen && deathBody.have) {
           std::vector<autopsy::Part> parts;
           std::vector<int> instPart(microInsts.size(), -1);
@@ -19398,9 +19522,11 @@ int main(int argc, char** argv) {
           autopsy::FillUI(autopsyPeeler, kinds, mats, ui);
           const bool peeling = ui.autopsy.peel > 0;
           const int iso = ui.autopsy.isolate ? ui.inspectSelected : -1;
+          std::memcpy(probeKinds, kinds, sizeof kinds);
+          // Anything worn or held makes the panel's first peel an undressing.
+          ui.autopsy.hasGear = std::any_of(parts.begin(), parts.end(),
+                                           [](const autopsy::Part& p) { return !p.isLimb; });
           size_t keep = 0;
-          std::vector<int> keptPart;  // parts[] index of each kept instance, -1 = not the corpse
-          keptPart.reserve(microInsts.size());
           for (size_t k = 0; k < microInsts.size(); k++) {
             MicroBodyInstGpu in = microInsts[k];
             if (instPart[k] >= 0) {
@@ -19415,15 +19541,53 @@ int main(int argc, char** argv) {
                 in.model = dm;
               }
             }
-            microInsts[keep++] = in;
-            keptPart.push_back(instPart[k]);
+            microInsts[keep] = in;
+            // The probe reads the photograph exactly as it is about to be
+            // drawn, peel and all.
+            if (instPart[k] >= 0) {
+              const autopsy::Part& pp = parts[(size_t)instPart[k]];
+              const int li = k < instLimb.size() ? instLimb[k] : -1;
+              probeOf.resize(keep + 1, -1);
+              probeOf[keep] = (int)probeTargets.size();
+              probeTargets.push_back(
+                  {pp.figSlot, pp.model, li >= 0 ? deathBody.limbs[(size_t)li].name : ""});
+            }
+            keep++;
           }
           microInsts.resize(keep);
+          // The clones' bricks, before the encoder below exists (queued
+          // writes drain at the head of the NEXT command buffer).
+          if (mbSet.dirty) sim.UploadMicroBodies(ctx.queue, mbSet);
+        } else if (ui.autopsy.probeWant && avatar.Spawned()) {
+          // THE LIVING BODY: its parts are matched by physics handle, the same
+          // match the death pose makes, and probed as they stand.
+          std::vector<uint64_t> slotHandles;
+          bodyReg.BuildHandles(slotHandles);
+          std::unordered_map<uint64_t, int> partOfBody;
+          for (int i = 0; i < avatar.PartCount(); i++)
+            if (const uint64_t h = avatar.PartBody(i)) partOfBody[h] = i;
+          const int limbCount = avatar.Def() ? (int)avatar.Def()->limbs.size() : 0;
+          for (size_t k = 0; k < microInsts.size(); k++) {
+            const uint32_t sl = microInsts[k].slot;
+            if (sl >= slotHandles.size() || !slotHandles[sl]) continue;
+            const auto it = partOfBody.find(slotHandles[sl]);
+            if (it == partOfBody.end()) continue;
+            const int i = it->second;
+            probeOf.resize(k + 1, -1);
+            probeOf[k] = (int)probeTargets.size();
+            probeTargets.push_back(
+                {i < limbCount ? BodySlotFor(avatar.PartName(i), avatar.PartTag(i)) : -1,
+                 microInsts[k].model, avatar.PartName(i)});
+          }
+          AutopsyKinds(burnMats, tissueMats, mats, probeKinds);
+        }
+        probeOf.resize(microInsts.size(), -1);
+        {
           // THE PROBE (UIState::AutopsyUI::probe): the cursor's ray through the
-          // instances just kept - the photograph exactly as it is about to be
-          // drawn, peel and all - nearest occupied cell wins, read back in full.
+          // instances of the inspected body - nearest occupied cell wins, read
+          // back in full.
           ui.autopsy.probe.valid = false;
-          if (ui.autopsy.probeWant && portraitCam.valid) {
+          if (ui.autopsy.probeWant && portraitCam.valid && !probeTargets.empty()) {
             const PortraitCam& pc = portraitCam;
             const float ndcX = ui.autopsy.probeAt[0] * 2.0f - 1.0f;
             const float ndcY = 1.0f - ui.autopsy.probeAt[1] * 2.0f;
@@ -19434,7 +19598,7 @@ int main(int argc, char** argv) {
             float bestT = 1e30f;
             int bestK = -1, bestCell[3] = {0, 0, 0};
             for (size_t k = 0; k < microInsts.size(); k++) {
-              if (keptPart[k] < 0) continue;
+              if (probeOf[k] < 0) continue;
               const MicroBodyInstGpu& in = microInsts[k];
               if (in.slot >= bodyXf.size() || in.model >= mbSet.models.size()) continue;
               const BodyXformGpu& x = bodyXf[in.slot];
@@ -19455,13 +19619,9 @@ int main(int argc, char** argv) {
               UIState::AutopsyUI::Probe& pr = ui.autopsy.probe;
               pr = {};
               const MicroBodyInstGpu& in = microInsts[(size_t)bestK];
-              const autopsy::Part& pp = parts[(size_t)keptPart[(size_t)bestK]];
-              const size_t pre = (size_t)std::distance(
-                  instPart.begin(), std::find(instPart.begin(), instPart.end(),
-                                              keptPart[(size_t)bestK]));
-              const int li = pre < instLimb.size() ? instLimb[pre] : -1;
-              const char* pname = li >= 0 ? deathBody.limbs[(size_t)li].name : "";
-              const int fig = pp.figSlot;
+              const ProbeTarget& pt = probeTargets[(size_t)probeOf[(size_t)bestK]];
+              const char* pname = pt.name ? pt.name : "";
+              const int fig = pt.fig;
               if (fig >= 0 && fig < UIState::kSlotCount) {
                 std::snprintf(pr.part, sizeof pr.part, "%s", ui.body[fig].label);
               } else {
@@ -19488,14 +19648,13 @@ int main(int argc, char** argv) {
               nameOf(m, pr.mat, sizeof pr.mat);
               pr.matColor = m < mats.size() ? (0xFF000000u | (mats[m].gpu.color0 & 0x00FFFFFFu))
                                             : 0xFF808080u;
-              pr.kind = kinds[m];
-              pr.painted = (v >> 8) != 0;
+              pr.kind = probeKinds[m];
               pr.cell[0] = bestCell[0]; pr.cell[1] = bestCell[1]; pr.cell[2] = bestCell[2];
               // The layer, measured on the UNPEELED brick (the peel clone keeps
               // its dims, so the cell is the same cell): depth from the skin.
               static autopsy::DepthField probeDepth;
               static uint32_t probeDepthModel = 0xFFFFFFFFu, probeDepthGen = 0;
-              const uint32_t src = pp.model;
+              const uint32_t src = pt.src;
               if (src != probeDepthModel || MicroBodyEditGen(mbSet, src) != probeDepthGen) {
                 autopsy::MeasureDepth(mbSet, src, probeDepth);
                 probeDepthModel = src;
@@ -19528,9 +19687,6 @@ int main(int argc, char** argv) {
               pr.valid = true;
             }
           }
-          // The clones' bricks, before the encoder below exists (queued
-          // writes drain at the head of the NEXT command buffer).
-          if (mbSet.dirty) sim.UploadMicroBodies(ctx.queue, mbSet);
         }
         const uint32_t pMicro = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
         // bodyXf carries the death pose here when there is one, so the cull

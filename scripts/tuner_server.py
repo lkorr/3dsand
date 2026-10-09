@@ -41,6 +41,22 @@ happens in this process rather than in the page:
   GET  /api/worldmap/terrain-defaults   map.json terrain defaults (worldmap.h)
   GET  /api/worldmap/check?name=    the SAVED map's load warnings / refusal
                               (`sandvox --mapcheck`, GPU-free): {ok, warnings[], error}
+  GET  /api/worldmap?name=          the map's map.json
+  POST /api/worldmap?name=          write it; must be a v2 map.json (version,
+                              extent, planes: docs/PLAN_map_v2.md)
+  GET  /api/worldmap/tiles?name=&plane=   the plane's tile files:
+                              {tiles: [{tx, tz, size, mtime}]} (plane =
+                              height | biome; an absent tile = the default)
+  GET  /api/worldmap/tile?name=&plane=&tx=&tz=   one 'SVT1' tile (404 = absent)
+  POST /api/worldmap/tile?name=&plane=&tx=&tz=   write it (header checked
+                              against plane and tx/tz; write-then-rename); an
+                              EMPTY body deletes it (back to the default)
+  POST /api/mappng/encode?w=&h=&format=grey16|rgb8[&note=]   body = raw
+                              samples (grey16: u16 LE; rgb8: 3 bytes a pixel) ->
+                              a PNG (scripts/map_png.py; the map page's export)
+  POST /api/mappng/decode     body = a PNG -> 'SVPN' blob: u32 w, h, format
+                              (1 grey, 2 rgb), max, noteLen, note JSON, samples
+                              (the map page's height / biome import)
   GET  /api/worldmap/sculpt?name=   the map's sculpt layer (binary 'SVSC'; 404 = none)
   POST /api/worldmap/sculpt?name=   write it (write-then-rename); an EMPTY body
                               deletes the file (no layer = the pre-P5 world)
@@ -50,12 +66,30 @@ happens in this process rather than in the page:
   POST /api/worldedit?name=[&seed=]  write one edit layer; with seed, the v1
                               body is stored GROUND-RELATIVE (v2) against that
                               seed's ground through --voxserve (P7)
+       /api/worldedit?locale=&map=[&seed=]  the same for a LOCALE's own layer
+                              (worldmap/<map>/locales/<id>/<editLayer|ground>
+                              .svedit), against THAT map's ground; the locale
+                              must be in the map.json on disk; a POST with no
+                              voxels deletes the file (map v2 E4)
+  GET  /api/heightmap and /api/voxregion take `map=` (E4): that map, not
+                              tuning's world.mapLayer (--voxserve is spawned
+                              per map with SANDVOX_MAP)
   POST /api/worldedit/export  {save, name, seed}: a save's edits vs the
                               generator -> assets/worldedits/<name>.svedit (P7)
   POST /api/biomeswatch?name=&seed=&size=  body = the biome JSON (unsaved
                               copy): the biome as the ENGINE makes it, an 'SVSW'
                               bundle of SVVX regions from --voxserve SWATCH (P7)
   POST /api/worldedit/delete  delete one edit layer
+  GET  /api/refs?name=        the map's refs group files (as stored: a LOCALE's
+                              group has y relative to its anchor) + map.json
+                              locales[] (L1, docs/PLAN_map_v2.md)
+  GET  /api/refs/commands     `sandvox --edit-commands`: every editor command
+  POST /api/refs/commands?name=   {commands: [{cmd, args}, ...]} or {script:
+                              "<jsonl>"}: run them through the CANONICAL F8
+                              command layer (`sandvox --edit-script`, GPU-free,
+                              all or nothing) on that map -- ref.place / move /
+                              delete / set_prop / link ..., in WORLD voxels;
+                              the engine writes the files (L1)
   GET  /api/status            build state + whether the exe is running
 
 Usage:
@@ -100,6 +134,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -576,6 +611,8 @@ _build = {"running": False, "ok": None, "log": "", "returncode": None}
 # Serialises /api/heightmap: a slider drag queues a dozen requests and there is
 # no point running a dozen copies of the exporter.
 _hm_lock = threading.Lock()
+# /api/refs/commands: one --edit-script at a time (each rewrites group files).
+_refs_lock = threading.Lock()
 _play_procs = []
 
 
@@ -635,8 +672,9 @@ WORLDEDIT_DIR = os.path.join(ASSETS, "worldedits")
 WORLDEDIT_EXT = ".svedit"
 # The P5 sculpt layer's file, beside map.json / map.svmap (worldmap.h).
 SCULPT_FILE = "sculpt.svsculpt"
-# The authored world map (src/sim/worldmap.h): assets/worldmap/<name>/ holds
-# map.json (the diffable half) beside map.svmap (the three u8 planes). The
+# The authored world map (src/sim/worldmap.h, docs/PLAN_map_v2.md):
+# assets/worldmap/<name>/ holds map.json (the diffable half) beside
+# planes/<plane>/<tx>_<tz>.svt (the height and biome plane tiles). The
 # Environment tab's World map page reads and writes both through the
 # /api/worldmap routes below; the engine reads them at boot.
 WORLDMAP_DIR = os.path.join(ASSETS, "worldmap")
@@ -725,18 +763,26 @@ class VoxServe:
         # so the server can never answer from tables older than the disk --
         # whichever page saved, and whether or not it said so.
         self.sig = None
+        # THE MAP the live process generates (map v2 E4). Spawned with
+        # SANDVOX_MAP=<map> (worldmap::ActiveMapName), so a page editing a map
+        # that is not tuning's world.mapLayer -- the locale editor on any map,
+        # its harness on a synthetic one -- gets THAT map's voxels and ground.
+        # A request for another map restarts the process (one alive at a time:
+        # each holds a Vulkan device and a page pool).
+        self.map = None
 
-    def _spawn(self):
+    def _spawn(self, map_name):
         if not os.path.isfile(EXE):
             raise RuntimeError("build/Release/sandvox.exe not built yet — press Build")
         os.makedirs(VOXTMP, exist_ok=True)
         # Taken BEFORE the boot reads the files: a save during the boot then
         # shows as a mismatch and the next request reloads.
-        sig = _world_signature()
+        sig = _world_signature(map_name)
+        env = dict(os.environ, SANDVOX_MAP=map_name)
         # The boot is the expensive, GPU-heavy part, so it holds the run mutex.
         with RunLock("voxserve-boot"):
             p = subprocess.Popen(
-                [EXE, "--voxserve"], cwd=ROOT,
+                [EXE, "--voxserve"], cwd=ROOT, env=env,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, bufsize=1,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -750,28 +796,35 @@ class VoxServe:
                     break
         self.proc = p
         self.sig = sig
+        self.map = map_name
 
-    def _ensure(self):
+    def _ensure(self, map_name):
         if self.proc is not None and self.proc.poll() is None:
-            return
+            # "*": any map will do (PALETTE -- the material table is no map's;
+            # RELOAD from /api/voxreload).
+            if self.map == map_name or map_name == "*":
+                return
+            self._stop_locked()     # another map: this process cannot answer for it
         self.proc = None
-        self._spawn()
+        self._spawn(_tuning_map() if map_name == "*" else map_name)
 
-    def command(self, line, hold_lock=True):
+    def command(self, line, hold_lock=True, map_name=None):
         """Send one command, return (ok, payload_bytes_or_message).
 
         `hold_lock=False` is for commands that touch no GPU (PING), so a
-        liveness check does not queue behind somebody's build.
+        liveness check does not queue behind somebody's build. `map_name`
+        None = tuning's world.mapLayer (what the game loads).
         """
-        return self.commands([line], hold_lock)
+        return self.commands([line], hold_lock, map_name)
 
-    def commands(self, lines, hold_lock=True):
+    def commands(self, lines, hold_lock=True, map_name=None):
         """Send several commands as ONE uninterrupted sequence and return the
         last one's (ok, message); the first failure stops the sequence. For
         state a later command depends on (LAYER before REGION, P7): another
         request thread must not get in between."""
+        want = map_name or _tuning_map()
         with self.lock:
-            self._ensure()
+            self._ensure(want)
             def _round_trip(line):
                 self.proc.stdin.write(line + "\n")
                 self.proc.stdin.flush()
@@ -811,19 +864,24 @@ class VoxServe:
                 return False, ack[4:]
             return True, ack[3:]
 
-    def sync(self, sig):
-        """RELOAD a live server whose files are not `sig`. A dead one needs
-        nothing: the next command respawns it on the current files."""
-        if self.proc is None or self.proc.poll() is not None or self.sig == sig:
+    def sync(self, sig, map_name=None):
+        """RELOAD a live server whose files are not `sig`. A dead one -- or one
+        generating another map -- needs nothing: the next command respawns it
+        on the current files of the map it asks for."""
+        want = map_name or _tuning_map()
+        if self.proc is None or self.proc.poll() is not None or self.map != want or self.sig == sig:
             return True, ""
-        ok, msg = self.command("RELOAD")
+        ok, msg = self.command("RELOAD", map_name=want)
         if ok:
             self.sig = sig
         return ok, msg
 
     def stop(self):
         with self.lock:
-            p, self.proc = self.proc, None
+            self._stop_locked()
+
+    def _stop_locked(self):
+        p, self.proc = self.proc, None
         if p and p.poll() is None:
             try:
                 p.stdin.write("QUIT\n")
@@ -861,14 +919,15 @@ def _file_digest(path):
     return hit
 
 
-def _world_signature():
+def _world_signature(name=None):
     """What the generated world depends on, as a short hex string.
 
     The cache key has to move when the world does, and the voxel server's
     worldgen is a function of: tuning.json (world.mapLayer names the map, and
     the prelude consts), materials.json (the ids the words carry), the named
-    map (map.json + map.svmap: the terrain block, sites, planes; + the P5
-    sculpt layer when the map has one), the biome and
+    map (map.json + the plane tiles planes/<plane>/*.svt: the terrain block,
+    sites, height and biome planes; + the P5 sculpt layer when the map has
+    one), the biome and
     water files, and the tree atlases (.svtree; the species .json are only the
     bake's input). Hashed by CONTENT, not mtime: a tuner restart should not
     throw away a cache, and an edit that reverts a file should hit the entries
@@ -882,14 +941,18 @@ def _world_signature():
     """
     h = hashlib.sha1()
     paths = [WRITABLE["tuning"], WRITABLE["materials"]]
-    try:
-        with open(WRITABLE["tuning"], "r", encoding="utf-8") as f:
-            name = (json.load(f).get("world") or {}).get("mapLayer") or "default"
-    except (OSError, ValueError):
-        name = "default"
+    name = name or _tuning_map()
+    h.update(name.encode("utf-8") + b"\0")
     d = _worldmap_dir(name)
     if d:
-        paths += [os.path.join(d, "map.json"), os.path.join(d, "map.svmap")]
+        paths.append(os.path.join(d, "map.json"))
+        # Map v2: every tile of both planes, in sorted name order.
+        for plane in ("biome", "height"):
+            pd = os.path.join(d, "planes", plane)
+            try:
+                paths += [os.path.join(pd, n) for n in sorted(os.listdir(pd)) if n.endswith(".svt")]
+            except OSError:
+                pass
         # Only when present, so a map without a layer keeps the signature (and
         # the region cache) it had before the layer existed.
         sp = os.path.join(d, SCULPT_FILE)
@@ -906,6 +969,15 @@ def _world_signature():
         h.update(os.path.basename(path).encode("utf-8") + b"\0")
         h.update(_file_digest(path))
     return h.hexdigest()[:16]
+
+
+def _tuning_map():
+    """tuning.json world.mapLayer: the map the GAME loads ("default" when unset)."""
+    try:
+        with open(WRITABLE["tuning"], "r", encoding="utf-8") as f:
+            return (json.load(f).get("world") or {}).get("mapLayer") or "default"
+    except (OSError, ValueError):
+        return "default"
 
 
 def _map_edit_layer(name=None):
@@ -927,6 +999,85 @@ def _map_edit_layer(name=None):
     except (OSError, ValueError):
         return ""
     return v if isinstance(v, str) and _worldedit_path(v) else ""
+
+
+def _map_locales(name):
+    """map.json `locales` of the named map ([] when none or unreadable)."""
+    d = _worldmap_dir(name) if name else None
+    if not d:
+        return []
+    try:
+        with open(os.path.join(d, "map.json"), "r", encoding="utf-8") as f:
+            v = json.load(f).get("locales") or []
+    except (OSError, ValueError):
+        return []
+    return [l for l in v if isinstance(l, dict) and isinstance(l.get("id"), str)]
+
+
+def _map_edit_layer_files(name=None):
+    """MIRRORS worldmap::MapEditLayerFiles (src/sim/worldmap.cpp): every edit
+    layer the map applies, in order, as (path, hash name) -- its own
+    (assets/worldedits/<editLayer>.svedit) when named, then each LOCALE's
+    locales/<id>/<editLayer or "ground">.svedit that exists (L1)."""
+    if not name:
+        try:
+            with open(WRITABLE["tuning"], "r", encoding="utf-8") as f:
+                name = (json.load(f).get("world") or {}).get("mapLayer") or "default"
+        except (OSError, ValueError):
+            name = "default"
+    out = []
+    edit = _map_edit_layer(name)
+    if edit:
+        out.append((_worldedit_path(edit), edit + ".svedit"))
+    d = _worldmap_dir(name)
+    for l in _map_locales(name):
+        stem = l.get("editLayer") or "ground"
+        if stem.endswith(".svedit"):
+            stem = stem[:-len(".svedit")]
+        if not d or any(c in stem for c in "/\\:.") or any(c in l["id"] for c in "/\\:."):
+            continue
+        path = os.path.join(d, "locales", l["id"], stem + ".svedit")
+        if os.path.isfile(path):
+            out.append((path, l["id"] + "/" + stem + ".svedit"))
+    return out
+
+
+_LOCALE_ID_OK = set("abcdefghijklmnopqrstuvwxyz0123456789_-")
+
+
+def _locale_edit_path(map_name, lid):
+    """(path, None) or (None, error): the edit layer FILE of locale `lid` of
+    map `map_name` -- locales/<id>/<editLayer or "ground">.svedit, the stem
+    rule of worldmap::MapEditLayerFiles. Only a locale the map.json ON DISK
+    lists: the engine applies no other, so a layer for an unsaved locale is
+    refused rather than written where nothing reads it (map v2 E4)."""
+    d = _worldmap_dir(map_name)
+    if not d:
+        return None, "bad map name"
+    if not lid or len(lid) > 64 or any(c not in _LOCALE_ID_OK for c in lid):
+        return None, "bad locale id (it is a folder and a ref group: [a-z0-9_-]+)"
+    for l in _map_locales(map_name):
+        if l["id"] != lid:
+            continue
+        stem = l.get("editLayer") or "ground"
+        if not isinstance(stem, str):
+            return None, 'locale "%s": editLayer must be a file name' % lid
+        if stem.endswith(".svedit"):
+            stem = stem[:-len(".svedit")]
+        if not stem or any(c in stem for c in "/\\:."):
+            return None, 'locale "%s": editLayer is a file name under locales/%s/, not a path' % (lid, lid)
+        return os.path.join(d, "locales", lid, stem + ".svedit"), None
+    return None, 'locale "%s" is not in worldmap/%s/map.json on disk -- save the map first' % (lid, map_name)
+
+
+def _edit_layers_hash(files):
+    """MIRRORS worldmap::HashEditLayerFiles: HashOneFile of each, folded
+    h * FNV prime ^ next (exactly the map layer's hash when there is one file)."""
+    h = 0
+    for i, (path, nm) in enumerate(files):
+        x = _fnv_one_file(path, nm)
+        h = x if i == 0 else (((h * 0x01000193) & 0xFFFFFFFF) ^ x)
+    return h
 
 
 _LAYER_INDEX = {}
@@ -965,7 +1116,9 @@ def _layer_index(path):
                 p = end
     except (OSError, struct.error):
         out = []
-    _LAYER_INDEX.clear()          # one layer is live at a time; keep it small
+    # A few layers are live at once (L1: the map's + each locale's); keep it small.
+    if len(_LAYER_INDEX) >= 16:
+        _LAYER_INDEX.clear()
     _LAYER_INDEX[key] = out
     return out
 
@@ -975,6 +1128,18 @@ def _layer_region_digest(layer, ox, oy, oz, ext_x, ext_y, ext_z):
     Only the records whose footprint meets the box, so saving an edit on one
     hill does not invalidate the cached regions of every other."""
     path = _worldedit_path(layer) if layer else None
+    return _layer_path_region_digest(path, ox, oy, oz, ext_x, ext_y, ext_z)
+
+
+def _map_layers_region_digest(name, ox, oy, oz, ext_x, ext_y, ext_z):
+    """_layer_region_digest over EVERY file the map applies (L1): its own layer,
+    then each locale's, in order -- what `layer=@map` makes --voxserve apply."""
+    parts = [_layer_path_region_digest(path, ox, oy, oz, ext_x, ext_y, ext_z)
+             for path, _ in _map_edit_layer_files(name)]
+    return "+".join(parts) if any(parts) else ""
+
+
+def _layer_path_region_digest(path, ox, oy, oz, ext_x, ext_y, ext_z):
     if not path or not os.path.isfile(path):
         return ""
     h = hashlib.sha1()
@@ -1027,6 +1192,16 @@ def _worldedit_path(name):
 
 
 _FNV_CACHE = {}
+
+
+def _map_hash(d):
+    """MIRRORS biomes::HashMapFiles (src/sim/biomes.cpp): map.json + the
+    sculpt layer, then the biome plane's tiles, then the height plane's, each
+    set folded in with one FNV multiply (map v2)."""
+    h = _fnv_file_set(d or "", (".json", ".svsculpt"))
+    for plane in ("biome", "height"):
+        h = ((h * 0x01000193) & 0xFFFFFFFF) ^ _fnv_file_set(os.path.join(d, "planes", plane) if d else "", (".svt",))
+    return h
 
 
 def _fnv_file_set(d, exts):
@@ -1082,6 +1257,146 @@ def _worldmap_dir(name):
     if any(c not in ok for c in name):
         return None
     return os.path.join(WORLDMAP_DIR, name)
+
+
+# ---- map v2 plane tiles (docs/PLAN_map_v2.md, "Plane tiles") ----------------
+# assets/worldmap/<name>/planes/<plane>/<tx>_<tz>.svt: one 256x256-sample tile,
+# 32-byte header (magic 'SVT1', planeKind, tx, tz, w, h, sampleBytes, 0) then
+# the samples z-major little-endian. An absent tile is the plane's default.
+TILE_MAGIC = b"SVT1"
+TILE_N = 256
+# plane name -> (planeKind, sampleBytes)
+TILE_PLANES = {"height": (1, 2), "biome": (2, 1)}
+# Tile indices are post index >> 8 and posts start at 0; 4097 posts a side is
+# the plan's ceiling, so 17 tiles would do -- 4096 only refuses garbage.
+TILE_MAX_INDEX = 4096
+
+
+def _tile_args(q):
+    """(plane, tx, tz) from a query, or an error string."""
+    plane = (q.get("plane") or [""])[0]
+    if plane not in TILE_PLANES:
+        return "plane must be one of " + ", ".join(sorted(TILE_PLANES))
+    try:
+        tx = int((q.get("tx") or [""])[0])
+        tz = int((q.get("tz") or [""])[0])
+    except ValueError:
+        return "tx and tz must be integers"
+    if not (0 <= tx < TILE_MAX_INDEX and 0 <= tz < TILE_MAX_INDEX):
+        return "tx/tz out of range"
+    return plane, tx, tz
+
+
+def _tile_check(blob, plane, tx, tz):
+    """None if `blob` is a well-formed tile of `plane` at (tx, tz), else why not."""
+    kind, sb = TILE_PLANES[plane]
+    if len(blob) < 32 or blob[:4] != TILE_MAGIC:
+        return "not an SVT1 tile"
+    w = [int.from_bytes(blob[i:i + 4], "little", signed=True) for i in range(4, 32, 4)]
+    if w[0] != kind:
+        return "tile planeKind %d is not %s (%d)" % (w[0], plane, kind)
+    if w[1] != tx or w[2] != tz:
+        return "tile header says (%d,%d), the request (%d,%d)" % (w[1], w[2], tx, tz)
+    if w[3] != TILE_N or w[4] != TILE_N:
+        return "tile is %dx%d, must be %dx%d" % (w[3], w[4], TILE_N, TILE_N)
+    if w[5] != sb:
+        return "tile sampleBytes %d, %s needs %d" % (w[5], plane, sb)
+    if w[6] != 0:
+        return "tile reserved word is not 0"
+    if len(blob) != 32 + TILE_N * TILE_N * sb:
+        return "tile is %d bytes, must be %d" % (len(blob), 32 + TILE_N * TILE_N * sb)
+    return None
+
+
+def _map_v2_check(j):
+    """None if `j` is a v2 map.json the page may write, else why not. The
+    engine's loader is the full validator (--mapcheck); this refuses only what
+    would make the map unloadable in shape."""
+    if not isinstance(j, dict):
+        return "map.json is not an object"
+    if j.get("version") != 2:
+        return "map.json version must be 2 (a v1 map converts with scripts/convert_map_v2.py)"
+    for k in ("cellLog2", "size", "originCell", "oceanFadeCells"):
+        if k in j:
+            return "map.json v2 has no `%s` (a v1 key)" % k
+
+    def ints(v, n):
+        return isinstance(v, list) and len(v) == n and all(isinstance(x, int) and not isinstance(x, bool) for x in v)
+    ext = j.get("extent")
+    if not isinstance(ext, dict) or not ints(ext.get("min"), 2) or not ints(ext.get("size"), 2):
+        return "map.json needs extent {min: [x, z], size: [w, h]} in voxels"
+    scl = j.get("siteCellLog2")
+    if not isinstance(scl, int) or not (4 <= scl <= 16):
+        return "map.json needs siteCellLog2 (4..16)"
+    if any(s <= 0 or s % (1 << scl) for s in ext["size"]) or any(m % (1 << scl) for m in ext["min"]):
+        return "extent min and size must be multiples of the site cell (1 << siteCellLog2)"
+    biomes = j.get("biomes")
+    if not isinstance(biomes, list) or not biomes or not all(isinstance(b, str) for b in biomes):
+        return "map.json needs biomes[] (the palette, by name)"
+    planes = j.get("planes")
+    if not isinstance(planes, dict):
+        return "map.json needs planes {height, biome}"
+    for name in ("height", "biome"):
+        p = planes.get(name)
+        if not isinstance(p, dict):
+            return "planes.%s missing" % name
+        lg = p.get("log2")
+        if not isinstance(lg, int) or not (0 <= lg <= 12):
+            return "planes.%s.log2 must be 0..12" % name
+        if any(s % (1 << lg) for s in ext["size"]) or any(m % (1 << lg) for m in ext["min"]):
+            return "extent is not a whole number of planes.%s posts" % name
+        if p.get("tile") != TILE_N:
+            return "planes.%s.tile must be %d" % (name, TILE_N)
+        posts = max(ext["size"]) // (1 << lg) + 1
+        # the plan's ceiling: 4096 post SPANS a side (docs/PLAN_map_v2.md, out of scope)
+        if posts > 4097:
+            return "planes.%s has %d posts a side (over 4097)" % (name, posts)
+    hd = planes["height"].get("default")
+    if not isinstance(hd, int) or not (-32000 <= hd <= 32000):
+        return "planes.height.default must be an integer in -32000..32000 (voxels)"
+    if planes["biome"].get("default") not in biomes:
+        return "planes.biome.default must name a biome in biomes[]"
+    # E2: ridge / valley LINES -- the editor's re-bake source. The engine
+    # reads the baked height plane, never these; only their shape is checked.
+    ridges = j.get("ridges", [])
+    if not isinstance(ridges, list) or not all(
+            isinstance(r, dict) and isinstance(r.get("points"), list)
+            and all(isinstance(p, list) and len(p) == 3 and all(isinstance(x, (int, float)) for x in p) for p in r["points"])
+            for r in ridges):
+        return "ridges[] must be objects whose points are [x, z, y] triples (world voxels)"
+    # E3: the vector layers' SHAPE (the loader refuses the rest by name).
+    def xz(p):
+        return isinstance(p, list) and len(p) == 2 and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in p)
+    for key in ("roads", "regions"):
+        arr = j.get(key, [])
+        if not isinstance(arr, list) or not all(
+                isinstance(o, dict) and isinstance(o.get("id"), str) and o["id"]
+                and isinstance(o.get("points"), list) and all(xz(p) for p in o["points"]) for o in arr):
+            return "%s[] must be objects with an id and points [[x, z], ...] (world voxels)" % key
+    markers = j.get("markers", [])
+    if not isinstance(markers, list) or not all(
+            isinstance(o, dict) and isinstance(o.get("id"), str) and o["id"] and xz(o.get("at")) for o in markers):
+        return "markers[] must be objects with an id and at: [x, z] (world voxels)"
+    # E4: locales[] SHAPE (L1's loader refuses the rest by name): an id that
+    # is a folder and a ref group, bounds, an anchor.
+    locales = j.get("locales", [])
+    if not isinstance(locales, list):
+        return "locales[] must be a list"
+    seen = set()
+    for o in locales:
+        if not (isinstance(o, dict) and isinstance(o.get("id"), str) and o["id"]
+                and all(c in _LOCALE_ID_OK for c in o["id"])):
+            return "a locale needs an id of [a-z0-9_-]+ (its folder and its ref group)"
+        if o["id"] in seen:
+            return 'two locales are called "%s"' % o["id"]
+        seen.add(o["id"])
+        b, a = o.get("bounds"), o.get("anchor")
+        if not (isinstance(b, dict) and xz(b.get("min")) and xz(b.get("max"))
+                and b["min"][0] <= b["max"][0] and b["min"][1] <= b["max"][1]):
+            return 'locale "%s" needs bounds {min: [x, z], max: [x, z]}, min <= max' % o["id"]
+        if not (isinstance(a, dict) and xz(a.get("at")) and isinstance(a.get("y"), int) and not isinstance(a.get("y"), bool)):
+            return 'locale "%s" needs anchor {at: [x, z], y}' % o["id"]
+    return None
 
 
 def run_build():
@@ -1216,6 +1531,15 @@ class Handler(BaseHTTPRequestHandler):
         out = os.path.join(ROOT, "build", "tuner_heightmap.bin")
         cmd = [EXE, "--heightmap", "%d,%d,%d,%d,%d" % (cx, cz, span, res, seed),
                "--heightmap-out", out]
+        # `map=` (map v2 E4): the heights of THAT map (SANDVOX_MAP, which
+        # worldmap::ActiveMapName honours) -- the page's map, not necessarily
+        # tuning's world.mapLayer. Absent = tuning's, as before.
+        env = dict(os.environ)
+        mname = (q.get("map") or [""])[0]
+        if mname:
+            if not _worldmap_dir(mname):
+                return self._json(400, {"ok": False, "error": "bad map name"})
+            env["SANDVOX_MAP"] = mname
         if not os.path.isfile(EXE):
             return self._json(503, {"ok": False,
                                     "error": "build/Release/sandvox.exe not built yet "
@@ -1231,7 +1555,7 @@ class Handler(BaseHTTPRequestHandler):
         with _hm_lock:
             try:
                 r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
-                                   timeout=120,
+                                   timeout=120, env=env,
                                    creationflags=getattr(subprocess,
                                                          "CREATE_NO_WINDOW", 0))
             except Exception as e:
@@ -1287,6 +1611,88 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(500, {"ok": False, "error": "this sandvox.exe predates --mapcheck (rebuild): " +
                                 ((r.stderr or r.stdout or "")[-600:])})
 
+    # ---- references (L1): the F8 command layer, headless --------------------
+    #
+    # The page and the scripts share ONE authoring surface: the tuner never
+    # writes a refs group file itself. A change is a list of editor commands
+    # (src/editor/commands.h: ref.place / ref.move / ref.delete / ref.set_prop
+    # / ref.link ...) handed to `sandvox --edit-script`, which applies them
+    # through the same handlers F8 uses, all or nothing, and writes the files.
+    # Positions are WORLD voxels; a LOCALE's group is converted to
+    # anchor-relative y by the engine (world/refs.h), so the page never does
+    # that arithmetic. GPU-free (like --mapcheck), so no run.sh.
+    def _refs_get(self):
+        name = (self._query().get("name") or [""])[0]
+        d = _worldmap_dir(name)
+        if not d:
+            return self._json(400, {"ok": False, "error": "bad map name"})
+        groups = {}
+        rd = os.path.join(d, "refs")
+        try:
+            names = sorted(n for n in os.listdir(rd) if n.endswith(".json"))
+        except OSError:
+            names = []
+        for n in names:
+            try:
+                with open(os.path.join(rd, n), "r", encoding="utf-8") as f:
+                    groups[n[:-5]] = json.load(f)
+            except (OSError, ValueError) as e:
+                groups[n[:-5]] = {"error": str(e)}
+        return self._json(200, {"ok": True, "map": name, "locales": _map_locales(name),
+                                "groups": groups,
+                                "note": "a locale's group (group name == locale id) stores pos.y "
+                                        "relative to its anchor.y; commands take WORLD y"})
+
+    def _edit_commands_list(self):
+        if not os.path.isfile(EXE):
+            return self._json(503, {"ok": False, "error": "build/Release/sandvox.exe not built yet"})
+        try:
+            r = subprocess.run([EXE, "--edit-commands"], cwd=ROOT, capture_output=True, text=True,
+                               timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception as e:  # noqa: BLE001
+            return self._json(500, {"ok": False, "error": str(e)})
+        return self._json(200, {"ok": r.returncode == 0, "text": r.stdout})
+
+    def _refs_commands(self):
+        name = (self._query().get("name") or [""])[0]
+        if not _worldmap_dir(name):
+            return self._json(400, {"ok": False, "error": "bad map name"})
+        body = self._body()
+        lines = []
+        if isinstance(body.get("script"), str):
+            lines = body["script"].splitlines()
+        elif isinstance(body.get("commands"), list):
+            for c in body["commands"]:
+                if not isinstance(c, dict) or not isinstance(c.get("cmd"), str):
+                    return self._json(400, {"ok": False, "error": "each command is {cmd, args}"})
+                lines.append(json.dumps({"cmd": c["cmd"], "args": c.get("args") or {}}))
+        else:
+            return self._json(400, {"ok": False, "error": "body is {commands: [...]} or {script: \"...\"}"})
+        if not os.path.isfile(EXE):
+            return self._json(503, {"ok": False, "error": "build/Release/sandvox.exe not built yet"})
+        who = _wait_for_link(45.0)
+        if who is not None:
+            return self._json(503, {"ok": False, "error": "sandvox.exe is being linked (%s)" % who})
+        os.makedirs(os.path.join(ROOT, "build", "editor"), exist_ok=True)
+        script = os.path.join(ROOT, "build", "editor", "tuner_refs_%d.jsonl" % threading.get_ident())
+        with open(script, "w", encoding="utf-8", newline="\n") as f:
+            f.write("# written by tuner_server.py /api/refs/commands\n" + "\n".join(lines) + "\n")
+        env = dict(os.environ, SANDVOX_MAP=name, SANDVOX_NO_CRASH_DIALOG="1")
+        with _refs_lock:
+            try:
+                r = subprocess.run([EXE, "--edit-script", script], cwd=ROOT, capture_output=True, text=True,
+                                   timeout=120, env=env,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except Exception as e:  # noqa: BLE001
+                return self._json(500, {"ok": False, "error": str(e)})
+        out = (r.stdout or "") + (r.stderr or "")
+        okl = [l for l in out.splitlines() if l.startswith("EDIT-SCRIPT OK")]
+        bad = [l for l in out.splitlines() if l.startswith("EDIT-SCRIPT FAILED")]
+        warns = [l.strip()[len("refs warning: "):] for l in out.splitlines() if l.strip().startswith("refs warning: ")]
+        if r.returncode == 0 and okl:
+            return self._json(200, {"ok": True, "result": okl[-1], "warnings": warns})
+        return self._json(200, {"ok": False, "error": bad[-1] if bad else out[-800:], "warnings": warns})
+
     # ---- the voxel view ----------------------------------------------------
     def _send_blob(self, blob, gz=False):
         self.send_response(200)
@@ -1324,7 +1730,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"ok": False,
                                         "error": "box origin must be a multiple of 16"})
 
-        sig = _world_signature()
+        # WHICH MAP (map v2 E4): `map=` names one (the locale editor's 3D view
+        # asks for the map it edits); absent = tuning's world.mapLayer, what the
+        # game loads. The voxel server is spawned per map (VoxServe.map).
+        mname = (q.get("map") or [""])[0] or _tuning_map()
+        if not _worldmap_dir(mname):
+            return self._json(400, {"ok": False, "error": "bad map name"})
+        sig = _world_signature(mname)
         # WHICH EDIT LAYER the region carries (P7: --voxserve applies it).
         # `layer=@map` (the default) is the one map.json names -- what the game
         # spawns into; `-` is bare worldgen; a name is the layer the viewer is
@@ -1333,8 +1745,11 @@ class Handler(BaseHTTPRequestHandler):
         sel = (q.get("layer") or ["@map"])[0] or "@map"
         if sel not in ("@map", "-") and not _worldedit_path(sel):
             return self._json(400, {"ok": False, "error": "bad layer name"})
-        layer = _map_edit_layer() if sel == "@map" else ("" if sel == "-" else sel)
-        ldig = _layer_region_digest(layer, ox, oy, oz, nx * lod, ny * lod, nz * lod)
+        layer = _map_edit_layer(mname) if sel == "@map" else ("" if sel == "-" else sel)
+        if sel == "@map":
+            ldig = _map_layers_region_digest(mname, ox, oy, oz, nx * lod, ny * lod, nz * lod)
+        else:
+            ldig = _layer_region_digest(layer, ox, oy, oz, nx * lod, ny * lod, nz * lod)
         key = hashlib.sha1(("%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%s" % (
             ox, oy, oz, nx, ny, nz, lod, seed, sig, layer, ldig)
         ).encode()).hexdigest()
@@ -1357,10 +1772,13 @@ class Handler(BaseHTTPRequestHandler):
         cmd = "REGION %d %d %d %d %d %d %d %d %s" % (
             ox, oy, oz, nx, ny, nz, lod, seed, raw.replace("\\", "/"))
         try:
-            ok, msg = _voxserve.sync(sig)
+            ok, msg = _voxserve.sync(sig, mname)
             if not ok:
                 return self._json(503, {"ok": False, "error": "reload: " + msg})
-            ok, msg = _voxserve.commands(["LAYER " + (layer or "-"), cmd])
+            # LAYER @map, not the layer's name: the map's own layer AND every
+            # locale's (L1), merged as the game merges them.
+            ok, msg = _voxserve.commands(["LAYER " + ("@map" if sel == "@map" else (layer or "-")), cmd],
+                                         map_name=mname)
         except Exception as e:
             return self._json(503, {"ok": False, "error": str(e)})
         if not ok:
@@ -1391,8 +1809,14 @@ class Handler(BaseHTTPRequestHandler):
         out = os.path.join(VOXTMP, "palette.json")
         os.makedirs(VOXTMP, exist_ok=True)
         # PALETTE touches no GPU, so it does not queue behind a build.
+        # Any live map will do; `map=` (E4) names the one the caller is about
+        # to ask regions of, so a cold server boots on it once, not twice.
+        mname = (self._query().get("map") or [""])[0]
+        if mname and not _worldmap_dir(mname):
+            return self._json(400, {"ok": False, "error": "bad map name"})
+        live = _voxserve.proc is not None and _voxserve.proc.poll() is None
         ok, msg = _voxserve.command("PALETTE " + out.replace("\\", "/"),
-                                    hold_lock=False)
+                                    hold_lock=False, map_name=mname if (mname and not live) else "*")
         if not ok:
             return self._json(503, {"ok": False, "error": msg})
         try:
@@ -1620,13 +2044,23 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             return self._json(200, {"ok": True, "layers": names})
         if p == "/api/worldedit":
-            name = (self._query().get("name") or [""])[0]
-            path = _worldedit_path(name)
-            if not path:
-                return self._json(400, {"ok": False, "error": "bad layer name"})
+            q = self._query()
+            # `locale=<id>&map=<name>` (map v2 E4): a LOCALE's own layer,
+            # assets/worldmap/<map>/locales/<id>/<stem>.svedit, resolved
+            # against THAT map's ground; else `name=` under assets/worldedits/.
+            lmap = None
+            if (q.get("locale") or [""])[0]:
+                lmap = (q.get("map") or [""])[0] or _tuning_map()
+                path, err = _locale_edit_path(lmap, q["locale"][0])
+                if not path:
+                    return self._json(400, {"ok": False, "error": err})
+            else:
+                path = _worldedit_path((q.get("name") or [""])[0])
+                if not path:
+                    return self._json(400, {"ok": False, "error": "bad layer name"})
             if not os.path.isfile(path):
                 return self._json(404, {"ok": False, "error": "no such layer"})
-            seed = (self._query().get("seed") or [""])[0]
+            seed = (q.get("seed") or [""])[0]
             if not seed:
                 with open(path, "rb") as f:
                     return self._send(200, f.read(), "application/octet-stream")
@@ -1639,8 +2073,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"ok": False, "error": "bad seed"})
             os.makedirs(VOXTMP, exist_ok=True)
             out = os.path.join(VOXTMP, "resolved_%d.svedit" % threading.get_ident())
-            ok, msg = _voxserve.command("EDITS RESOLVE %d %s|%s" % (
-                seed, path.replace("\\", "/"), out.replace("\\", "/")), hold_lock=False)
+            ok, msg = _voxserve.sync(_world_signature(lmap), lmap) if lmap else (True, "")
+            if ok:
+                ok, msg = _voxserve.command("EDITS RESOLVE %d %s|%s" % (
+                    seed, path.replace("\\", "/"), out.replace("\\", "/")), hold_lock=False, map_name=lmap)
             if not ok:
                 return self._json(503, {"ok": False, "error": msg})
             try:
@@ -1674,16 +2110,18 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "map": name,
                 # + .svsculpt (P5), mirroring StampEnvironment's map set
-                "mapHash": "%08x" % _fnv_file_set(d or "", (".json", ".svmap", ".svsculpt")),
+                "mapHash": "%08x" % _map_hash(d),
                 # biomes ^ water: the presets' flora rows are packed with the
                 # biome records since P-E (mirrors StampEnvironment)
                 "biomesHash": "%08x" % (_fnv_file_set(os.path.join(ASSETS, "biomes"), (".json",)) ^
                                         _fnv_file_set(os.path.join(ASSETS, "water"), (".json",))),
                 "treesHash": "%08x" % _fnv_file_set(os.path.join(ASSETS, "trees"), (".json", ".svtree")),
-                # the edit layer the map names (mirrors StampEnvironment's
-                # `edits`: HashOneFile over the one .svedit, 0 if none/missing)
+                # the edit layer the map names, then its locales' (mirrors
+                # StampEnvironment's `edits`: worldmap::HashEditLayerFiles,
+                # HashOneFile of the one .svedit when there are no locale
+                # layers, 0 if none/missing)
                 "editLayer": edit,
-                "editsHash": "%08x" % (_fnv_one_file(ep, edit + ".svedit") if ep else 0),
+                "editsHash": "%08x" % _edit_layers_hash(_map_edit_layer_files(name)),
             })
         if p == "/api/worldmap/terrain-defaults":
             # The map terrain block's defaults, from the ONE copy
@@ -1734,6 +2172,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "name": name, "uses": uses})
         if p == "/api/worldmap/check":
             return self._mapcheck()
+        if p == "/api/refs":
+            return self._refs_get()
+        if p == "/api/refs/commands":
+            return self._edit_commands_list()
         if p == "/api/worldmap/sculpt":
             # The P5 sculpt layer. 404 is the normal answer for a map nobody
             # has sculpted: the page starts from an empty layer.
@@ -1746,18 +2188,55 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(404, {"ok": False, "error": "no sculpt layer"})
             with open(path, "rb") as f:
                 return self._send(200, f.read(), "application/octet-stream")
-        if p == "/api/worldmap" or p == "/api/worldmap/planes":
+        if p == "/api/worldmap":
             name = (self._query().get("name") or [""])[0]
             d = _worldmap_dir(name)
             if not d:
                 return self._json(400, {"ok": False, "error": "bad map name"})
-            fn = "map.json" if p == "/api/worldmap" else "map.svmap"
-            path = os.path.join(d, fn)
+            path = os.path.join(d, "map.json")
             if not os.path.isfile(path):
                 return self._json(404, {"ok": False, "error": "no such map"})
             with open(path, "rb") as f:
-                return self._send(200, f.read(),
-                                  "application/json" if fn == "map.json" else "application/octet-stream")
+                return self._send(200, f.read(), "application/json")
+        if p == "/api/worldmap/tiles":
+            # The v2 plane's tile LISTING: which tiles exist (every other one
+            # is the plane's default). The page loads only what it shows.
+            q = self._query()
+            name = (q.get("name") or [""])[0]
+            plane = (q.get("plane") or [""])[0]
+            d = _worldmap_dir(name)
+            if not d:
+                return self._json(400, {"ok": False, "error": "bad map name"})
+            if plane not in TILE_PLANES:
+                return self._json(400, {"ok": False, "error": "plane must be one of " + ", ".join(sorted(TILE_PLANES))})
+            pd = os.path.join(d, "planes", plane)
+            tiles = []
+            try:
+                names = sorted(os.listdir(pd))
+            except OSError:
+                names = []
+            for fn in names:
+                m = re.match(r"^(\d+)_(\d+)\.svt$", fn)
+                if not m:
+                    continue
+                st = os.stat(os.path.join(pd, fn))
+                tiles.append({"tx": int(m.group(1)), "tz": int(m.group(2)),
+                              "size": st.st_size, "mtime": int(st.st_mtime)})
+            return self._json(200, {"ok": True, "plane": plane, "tiles": tiles})
+        if p == "/api/worldmap/tile":
+            q = self._query()
+            d = _worldmap_dir((q.get("name") or [""])[0])
+            if not d:
+                return self._json(400, {"ok": False, "error": "bad map name"})
+            a = _tile_args(q)
+            if isinstance(a, str):
+                return self._json(400, {"ok": False, "error": a})
+            plane, tx, tz = a
+            path = os.path.join(d, "planes", plane, "%d_%d.svt" % (tx, tz))
+            if not os.path.isfile(path):
+                return self._json(404, {"ok": False, "error": "no such tile (the plane's default)"})
+            with open(path, "rb") as f:
+                return self._send(200, f.read(), "application/octet-stream")
 
         if p == "/perf.json":
             # The Performance tab reads build/perf.json, which lives OUTSIDE
@@ -2092,24 +2571,48 @@ class Handler(BaseHTTPRequestHandler):
             # until this runs. The tab sends it after every save — the same
             # save-then-render order the 2D map has always used, for the same
             # reason.
-            sig = _world_signature()
-            ok, msg = _voxserve.command("RELOAD")
+            # Whatever map the live server generates ("*"): a reload is not a
+            # reason to switch it back to tuning's.
+            sig = _world_signature(_voxserve.map)
+            ok, msg = _voxserve.command("RELOAD", map_name="*")
             if not ok:
                 return self._json(503, {"ok": False, "error": msg})
             _voxserve.sig = sig
             return self._json(200, {"ok": True, "signature": sig})
 
         if p == "/api/worldedit":
-            name = (self._query().get("name") or [""])[0]
-            path = _worldedit_path(name)
-            if not path:
-                return self._json(400, {"ok": False, "error": "bad layer name"})
+            q = self._query()
+            # `locale=<id>&map=<name>` (map v2 E4): write a LOCALE's own layer
+            # (see the GET); relativised against THAT map's ground.
+            lmap = None
+            if (q.get("locale") or [""])[0]:
+                lmap = (q.get("map") or [""])[0] or _tuning_map()
+                path, err = _locale_edit_path(lmap, q["locale"][0])
+                if not path:
+                    return self._json(400, {"ok": False, "error": err})
+            else:
+                path = _worldedit_path((q.get("name") or [""])[0])
+                if not path:
+                    return self._json(400, {"ok": False, "error": "bad layer name"})
             blob = self._raw()
             if len(blob) < 32 or blob[:4] != b"SVED":
                 return self._json(400, {"ok": False, "error": "not an SVED layer"})
-            seed = (self._query().get("seed") or [""])[0]
+            seed = (q.get("seed") or [""])[0]
+            if lmap and struct.unpack_from("<I", blob, 12)[0] == 0:
+                # A locale layer with no voxels is NO file (the loader then
+                # lists nothing for it), not an empty one.
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except OSError as e:
+                    return self._json(500, {"ok": False, "error": str(e)})
+                return self._json(200, {"ok": True, "bytes": 0, "deleted": True})
+            if lmap:
+                ok, msg = _voxserve.sync(_world_signature(lmap), lmap)
+                if not ok:
+                    return self._json(503, {"ok": False, "error": "reload: " + msg})
             try:
-                os.makedirs(WORLDEDIT_DIR, exist_ok=True)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
                 # Write-then-rename: a half-written edit layer is a world the
                 # engine will refuse to load, and the tuner autosaves.
                 tmp = path + ".tmp"
@@ -2123,7 +2626,7 @@ class Handler(BaseHTTPRequestHandler):
                     rel = path + ".rel.tmp"
                     ok, msg = _voxserve.command("EDITS RELATIVE %d %s|%s" % (
                         int(seed), tmp.replace("\\", "/"), rel.replace("\\", "/")),
-                        hold_lock=False)
+                        hold_lock=False, map_name=lmap)
                     os.remove(tmp)
                     if not ok:
                         return self._json(503, {"ok": False, "error": "relativize: " + msg})
@@ -2247,24 +2750,92 @@ class Handler(BaseHTTPRequestHandler):
             except OSError as e:
                 return self._json(500, {"ok": False, "error": str(e)})
             return self._json(200, {"ok": True, "bytes": len(blob), "tiles": count})
-        if p == "/api/worldmap" or p == "/api/worldmap/planes":
+        if p in ("/api/mappng/encode", "/api/mappng/decode"):
+            # The World map page's PNG import / export (PLAN_map_v2 E2): the
+            # page owns the planes and the mapping (metres per unit, offset,
+            # which posts); this is only the codec, so an import lands in the
+            # page's undo like any stroke and an export carries unsaved edits.
+            try:
+                here = os.path.dirname(os.path.abspath(__file__))
+                if here not in sys.path:
+                    sys.path.insert(0, here)
+                import map_png
+            except Exception as e:  # noqa: BLE001
+                return self._json(500, {"ok": False, "error": "map_png: %s" % e})
+            blob = self._raw()
+            try:
+                if p == "/api/mappng/decode":
+                    return self._send(200, map_png.decoded_blob(map_png.decode(blob)), "application/octet-stream")
+                q = self._query()
+                w = int((q.get("w") or ["0"])[0])
+                h = int((q.get("h") or ["0"])[0])
+                fmt = (q.get("format") or [""])[0]
+                note = (q.get("note") or [None])[0]
+                if not (0 < w <= 16384 and 0 < h <= 16384):
+                    return self._json(400, {"ok": False, "error": "w and h must be 1..16384"})
+                if fmt == "grey16":
+                    if len(blob) != w * h * 2:
+                        return self._json(400, {"ok": False, "error": "grey16 needs %d bytes, got %d" % (w * h * 2, len(blob))})
+                    png = map_png.encode_grey16(w, h, struct.unpack("<%dH" % (w * h), blob), note)
+                elif fmt == "rgb8":
+                    if len(blob) != w * h * 3:
+                        return self._json(400, {"ok": False, "error": "rgb8 needs %d bytes, got %d" % (w * h * 3, len(blob))})
+                    png = map_png.encode_rgb8(w, h, blob, note)
+                else:
+                    return self._json(400, {"ok": False, "error": "format must be grey16 or rgb8"})
+                return self._send(200, png, "image/png")
+            except Exception as e:  # noqa: BLE001 -- a malformed PNG / zlib stream is the client's error
+
+                return self._json(400, {"ok": False, "error": str(e)})
+        if p == "/api/worldmap/tile":
+            # One v2 plane tile. An EMPTY body deletes it: the tile is back
+            # to the plane's default, which is what an absent tile means.
+            q = self._query()
+            d = _worldmap_dir((q.get("name") or [""])[0])
+            if not d:
+                return self._json(400, {"ok": False, "error": "bad map name"})
+            if not os.path.isfile(os.path.join(d, "map.json")):
+                return self._json(404, {"ok": False, "error": "no such map (save map.json first)"})
+            a = _tile_args(q)
+            if isinstance(a, str):
+                return self._json(400, {"ok": False, "error": a})
+            plane, tx, tz = a
+            blob = self._raw()
+            path = os.path.join(d, "planes", plane, "%d_%d.svt" % (tx, tz))
+            if not blob:
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except OSError as e:
+                    return self._json(500, {"ok": False, "error": str(e)})
+                return self._json(200, {"ok": True, "bytes": 0, "deleted": True})
+            why = _tile_check(blob, plane, tx, tz)
+            if why:
+                return self._json(400, {"ok": False, "error": why})
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                # Write-then-rename: a torn tile is a map the engine refuses.
+                tmp = path + ".tmp"
+                with open(tmp, "wb") as f:
+                    f.write(blob)
+                os.replace(tmp, path)
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": str(e)})
+            return self._json(200, {"ok": True, "bytes": len(blob)})
+        if p == "/api/worldmap":
             name = (self._query().get("name") or [""])[0]
             d = _worldmap_dir(name)
             if not d:
                 return self._json(400, {"ok": False, "error": "bad map name"})
             blob = self._raw()
-            if p == "/api/worldmap":
-                try:
-                    j = json.loads(blob.decode("utf-8"))
-                except Exception as e:  # noqa: BLE001
-                    return self._json(400, {"ok": False, "error": "map.json does not parse: %s" % e})
-                if not isinstance(j.get("biomes"), list) or not isinstance(j.get("size"), list):
-                    return self._json(400, {"ok": False, "error": "map.json needs biomes[] and size[]"})
-                fn = "map.json"
-            else:
-                if len(blob) < 16 or blob[:4] != b"SVMP":
-                    return self._json(400, {"ok": False, "error": "not an SVMP plane file"})
-                fn = "map.svmap"
+            try:
+                j = json.loads(blob.decode("utf-8"))
+            except Exception as e:  # noqa: BLE001
+                return self._json(400, {"ok": False, "error": "map.json does not parse: %s" % e})
+            why = _map_v2_check(j)
+            if why:
+                return self._json(400, {"ok": False, "error": why})
+            fn = "map.json"
             path = os.path.join(d, fn)
             try:
                 os.makedirs(d, exist_ok=True)
@@ -2276,6 +2847,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(500, {"ok": False, "error": str(e)})
             return self._json(200, {"ok": True, "bytes": len(blob)})
 
+        if p == "/api/refs/commands":
+            return self._refs_commands()
         if p == "/api/worldedit/delete":
             name = (self._body().get("name") or "")
             path = _worldedit_path(name)

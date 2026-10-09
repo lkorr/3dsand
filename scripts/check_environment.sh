@@ -19,20 +19,26 @@
 # lines and this reads the verdict out of the dumped DOM.
 #
 #   bash scripts/check_environment.sh              # verdict only
+#   bash scripts/check_environment.sh --only map   # the mount + the World map page alone
 #   bash scripts/check_environment.sh --shot out.png
 #
 # NEEDS THE BUILT EXE since map-overhaul P7: the biome swatch is rendered by
 # the engine (--voxserve SWATCH), which the tuner server spawns on demand.
+# `--only map` does not: the map page runs on a synthetic v2 map the harness
+# writes to assets/worldmap/_e1test/ (removed on exit), and its one engine
+# call (--mapcheck) is a SKIP line on an exe that predates v2 maps.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PORT="${ENV_PORT:-8799}"
 SHOT=""
+ONLY=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --shot) SHOT="$2"; shift 2;;
     --port) PORT="$2"; shift 2;;
+    --only) ONLY="$2"; shift 2;;
     *) shift;;
   esac
 done
@@ -53,6 +59,7 @@ cleanup() {
   rm -rf "$PROF"
   # The harness writes scratch files; do not leave them in the tree.
   rm -f "$ROOT/assets/biomes/_harness.json" "$ROOT/assets/water/_harness.json"
+  rm -rf "$ROOT/assets/worldmap/_e1test"
 }
 trap cleanup EXIT
 
@@ -70,7 +77,7 @@ if ! curl -sf -o /dev/null "http://127.0.0.1:$PORT/environment_test.html"; then
   exit 2
 fi
 
-URL="http://127.0.0.1:$PORT/environment_test.html"
+URL="http://127.0.0.1:$PORT/environment_test.html${ONLY:+?only=$ONLY}"
 
 # The biome swatch bakes a great oak on first composition (~4 s of real CPU
 # under SwiftShader-less headless), so the budget is generous.

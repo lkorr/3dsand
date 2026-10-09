@@ -26,6 +26,8 @@
 #include "sim/heat.h"        // the temperature layer's layout (heatParams, PackHeatMaterial)
 #include "sim/elec.h"        // the charge field's layout (elecParams, PackElecMaterial)
 #include "sim/boltfx.h"      // the bolt table at renderBGL 44 (render-only)
+#include "sim/worlddefaults.h"  // kDefaultSeed: the horizon treeline before streaming sets the seed
+#include "sim/horizon.h"     // the far horizon's pyramid at renderBGL 45 (render-only)
 #include "test/support.h"    // AssetDir(): the one asset-path chokepoint (solutes.json)
 
 // The pond lattice the live shaders were compiled with (POND_TILE), so an
@@ -46,7 +48,7 @@ using pass::kPassStride;
 // outside the window). genCols holds the per-POSITION map ([0, kNumSlots),
 // worldgen.wgsl GC_REC_BASE) and then kGenColRecWords words per chunk-column.
 namespace {
-constexpr uint32_t kColCacheWords = 25;
+constexpr uint32_t kColCacheWords = 26;
 constexpr uint32_t kColCacheHdr = 16;
 constexpr uint32_t kColCacheBlock = kColCacheHdr + kChunk * kChunk * kColCacheWords;
 constexpr uint32_t kGenColMax = kNChunk * kNChunk + kTicketMax * kTicketBoxN * kTicketBoxN;
@@ -110,6 +112,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     pad.resize(worldMapWords_, 0u);
     queue.WriteBuffer(worldMapBuf_, 0, pad.data(), pad.size() * 4);
   }
+  // The far horizon (sim/horizon.h): the same map's height plane as the
+  // pyramid the raymarch draws past the cascades. Render-only derived data,
+  // rebuilt with the map in UploadEnvironment; created here because it is a
+  // render bind-group entry (renderBGL 45).
+  UploadHorizon(device, queue, worldMapWords);
 
   // The worldgen column cache (worldgen.wgsl's block; WriteGenList). Sized for
   // the widest list: kGenColMax chunk-columns of 256 cached columns each —
@@ -784,6 +791,13 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // boltLightAt): a strike's render-only segments and light points,
         // CPU-written per frame while a bolt burns. Empty = one load a pixel.
         entry(44, T::ReadOnlyStorage, S::Fragment),               // boltBuf
+        // THE FAR HORIZON (sim/horizon.h; raymarch.wgsl traceHorizon): the
+        // map's height pyramid, written at load / environment reload only.
+        entry(45, T::ReadOnlyStorage, S::Fragment),               // horizon
+        // THE TERRAIN-SCALE LIGHT MAP (horizon.h kL*; horizon_light.wgsl):
+        // the sun's horizon + sky visibility per pyramid sample, written by
+        // the hz rows on the per-frame table (BeginRendering's flush).
+        entry(46, T::ReadOnlyStorage, S::Fragment),               // hzLight
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1081,6 +1095,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     veilPixels_ = 0;
     BuildRenderBindGroup(renderBG_, veilBuf_);
     BuildRenderBindGroup(renderBGNoVeil_, veilNone_);
+    renderBGBuilt_ = true;
   }
   // ---- the shadow-cache resolve pass (shadow_resolve.wgsl) ----
   // Its OWN layout rather than a reuse of renderBGL_ with widened visibility:
@@ -1161,6 +1176,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // dedup bits released) by gi_prepare / gi_gather; appended by the
         // raymarch at renderBGL_ 39.
         entry(28, T::Storage),         // giReq
+        // THE FAR HORIZON's pyramid (horizon.h), read by the cloud march
+        // (terrain against the deck, map v2 S1) and by the light map's rows,
+        // which write 33 (horizon.h kL*; the raymarch reads it at 46).
+        entry(32, T::ReadOnlyStorage), // horizon
+        entry(33, T::Storage),         // hzLight
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1432,6 +1452,56 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
   }
 }
 
+void Simulation::UploadHorizon(const rhi::Device& device, const rhi::Queue& queue,
+                               const std::vector<uint32_t>& worldMapWords) {
+  std::vector<uint32_t> words;
+  // The seed the per-sample treeline's jitter is read at: the world's, once
+  // streaming has set it (the default world's before, at Init -- the jitter
+  // is +-30 m of paint 7 km off, and every environment reload re-bakes).
+  const uint32_t seed = (world_ && world_->WorldSeed() != 0u) ? world_->WorldSeed() : sandvox::kDefaultSeed;
+  horizon::Build(worldmap::CurrentWorldMap(), worldMapWords, seed, words);
+  // THE LIGHT MAP rides the pyramid (horizon.h kL*): sized on its samples,
+  // header zeroed (the kernels set the valid words), the sky visibility due
+  // again and the sun's horizon stale. A buffer that had to grow rebinds both
+  // groups that name it.
+  const uint64_t lightWords = horizon::LightWords(words);
+  hzSamples_ = words[horizon::kHValid] != 0u ? words[horizon::kHNX] * words[horizon::kHNZ] : 0u;
+  hzSkyDue_ = hzSamples_ > 0;
+  hzSunBuilt_ = false;
+  bool rebind = false;
+  if (lightWords > hzLightWords_) {
+    hzLightWords_ = lightWords;
+    hzLightBuf_ = CreateBuffer(device, hzLightWords_ * 4,
+                               rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                               "hzLight");
+    rebind = true;
+  }
+  {
+    const uint32_t zero[horizon::kLightHeaderWords] = {};
+    queue.WriteBuffer(hzLightBuf_, 0, zero, sizeof zero);
+  }
+  // Grow-only, like the worldMap buffer: a smaller map keeps the buffer and
+  // the shader reads only what the header names. A buffer that had to grow is
+  // a new handle, so the two render bind groups that name it are rebuilt --
+  // once they exist (Init uploads before it builds them).
+  if (words.size() > horizonWords_) {
+    horizonWords_ = words.size();
+    horizonBuf_ = CreateBuffer(device, (uint64_t)horizonWords_ * 4,
+                               rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                               "horizon");
+    rebind = true;
+  }
+  if (rebind) {
+    if (renderBGBuilt_) {
+      BuildRenderBindGroup(renderBG_, veilBuf_);
+      BuildRenderBindGroup(renderBGNoVeil_, veilNone_);
+    }
+    BuildShadowBindGroup();
+  }
+  words.resize(horizonWords_, 0u);
+  queue.WriteBuffer(horizonBuf_, 0, words.data(), words.size() * 4);
+}
+
 void Simulation::UploadEnvironment(const rhi::Device& device, const rhi::Queue& queue,
                                    const TreeAtlas& trees,
                                    const std::vector<uint32_t>& worldMapWords) {
@@ -1465,6 +1535,9 @@ void Simulation::UploadEnvironment(const rhi::Device& device, const rhi::Queue& 
     queue.WriteBuffer(worldMapBuf_, 0, pad.data(), pad.size() * 4);
   }
   if (rebind) BuildSimBindGroups(device);
+  // The horizon is the map's too: rebuilt from the map the caller has just
+  // installed as CurrentWorldMap (ReloadEnvironment sets it before this).
+  UploadHorizon(device, queue, worldMapWords);
   // The tree lattice is a PRELUDE CONSTANT (TREE_TILE / TREE_SCAN /
   // TREE_CAND_MAX size worldgen's candidate array), so a reload that changed
   // the finest biome tile or the widest species has to recompile the shaders
@@ -2124,6 +2197,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mRayStart;
   // The rain shadow map (rain_map.wgsl): two per-frame entries on shadowPL_.
   rhi::ShaderModule mRainMap;
+  // The terrain-scale light map (horizon_light.wgsl, map v2 S1): two
+  // per-frame entries on shadowPL_.
+  rhi::ShaderModule mHzLight;
   // The god-ray sun visibility volume (godray_vis.wgsl): one per-frame entry
   // on shadowPL_.
   rhi::ShaderModule mGodVis;
@@ -2164,6 +2240,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mSkyTop, "sky_top.wgsl");
     mod(&mRayStart, "ray_start.wgsl");
     mod(&mRainMap, "rain_map.wgsl");
+    mod(&mHzLight, "horizon_light.wgsl");
     mod(&mGodVis, "godray_vis.wgsl");
     mod(&mGasMask, "gas_mask.wgsl");
     mod(&mGiGather, "gi_gather.wgsl");
@@ -2190,7 +2267,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !mExplode || !mParticle || !mGas || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
       !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur || !mSkyTop ||
-      !mRayStart || !mRainMap || !mWindStreak || !mGodVis || !mGiGather ||
+      !mRayStart || !mRainMap || !mHzLight || !mWindStreak || !mGodVis || !mGiGather ||
       !mGasMask) {
     if (err) *err = "shader file read failure";
     return false;
@@ -2253,6 +2330,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { rayStartMin_ = MakeComputePipeline(device, shadowPL_, mRayStart, "rayStartMin", "rayStartMin"); });
   pool.Add([&] { rainMapPrep_ = MakeComputePipeline(device, shadowPL_, mRainMap, "rainMapPrep", "rainMapPrep"); });
   pool.Add([&] { rainMapBuild_ = MakeComputePipeline(device, shadowPL_, mRainMap, "rainMapBuild", "rainMapBuild"); });
+  pool.Add([&] { hzSky_ = MakeComputePipeline(device, shadowPL_, mHzLight, "hzSky", "hzSky"); });
+  pool.Add([&] { hzSun_ = MakeComputePipeline(device, shadowPL_, mHzLight, "hzSun", "hzSun"); });
   pool.Add([&] { godrayVis_ = MakeComputePipeline(device, shadowPL_, mGodVis, "godrayVis", "godrayVis"); });
   pool.Add([&] { gasMask_ = MakeComputePipeline(device, shadowPL_, mGasMask, "gasMaskBuild", "gasMask"); });
   pool.Add([&] { giPrepare_ = MakeComputePipeline(device, shadowPL_, mGiGather, "giPrepare", "giPrepare"); });
@@ -2756,6 +2835,8 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::ShadowHist:          return world_->shadowHist;
     case B::RayStart:            return rayStartBuf_;
     case B::RainMap:             return rainMapBuf_;
+    case B::Horizon:             return horizonBuf_;
+    case B::HzLight:             return hzLightBuf_;
     case B::GodVis:              return godVisBuf_;
     case B::GasMask:             return gasMaskBuf_;
     case B::GiReq:               return giReqBuf_;
@@ -2892,6 +2973,8 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::RayStartMin:    return rayStartMin_;
     case P::RainMapPrep:    return rainMapPrep_;
     case P::RainMapBuild:   return rainMapBuild_;
+    case P::HzSky:          return hzSky_;
+    case P::HzSun:          return hzSun_;
     case P::WindStreak:     return windStreak_;
     case P::GodrayVis:      return godrayVis_;
     case P::GasMask:        return gasMask_;
@@ -3248,6 +3331,36 @@ void Simulation::EncodeShadowResolve(const rhi::CommandEncoder& enc) {
     if (cf.rainMap && !rainMapOff_ && rainMapPrep_ && rainMapBuild_)
       cx.cloudFlags |= 8u;
   }
+  // THE TERRAIN-SCALE LIGHT MAP (horizon_light.wgsl, map v2 S1). Static data
+  // between rebuilds, so a frame records a row only when it is due: the sky
+  // visibility once per pyramid upload (a function of the map alone), the
+  // sun's horizon when the key light's AZIMUTH has turned more than
+  // kHzSunTurnRad since the last build (its elevation is compared per pixel,
+  // so a rising sun needs no rebuild). Off with render.horizon, like the
+  // pyramid it reads; nothing at all on a map with no height plane.
+  if (hzSamples_ > 0 && hzSky_ && hzSun_ && hzLightBuf_ && CurrentTuning().render.horizon) {
+    // ~0.25 deg: a ridge's shadow edge 5 km off moves ~22 m (under one
+    // 25.6 m sample) between builds.
+    constexpr float kHzSunTurnRad = 0.0044f;
+    cx.hzGx = std::min<uint32_t>((hzSamples_ + 63) / 64, 65535u);
+    if (hzSkyDue_) {
+      cx.cloudFlags |= 16u;
+      hzSkyDue_ = false;
+    }
+    const float* L = sandvox::LastKeyLightDir();
+    const float lh = std::sqrt(L[0] * L[0] + L[2] * L[2]);
+    if (lh > 1e-4f) {
+      const float ax = L[0] / lh, az = L[2] / lh;
+      const float turn = std::fabs(std::atan2(ax * hzSunAz_[1] - az * hzSunAz_[0],
+                                              ax * hzSunAz_[0] + az * hzSunAz_[1]));
+      if (!hzSunBuilt_ || turn > kHzSunTurnRad) {
+        cx.cloudFlags |= 32u;
+        hzSunBuilt_ = true;
+        hzSunAz_[0] = ax;
+        hzSunAz_[1] = az;
+      }
+    }
+  }
   RecordTable(enc, pass::Table::ShadowCache, &cx);
   // The weather row just recorded: if the uniform asked it to rebuild the map
   // (kClfWeather), that map is now the one later frames reuse.
@@ -3393,7 +3506,7 @@ bool Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], u
   hdr[kHpMode] = tn.sim.heatMode != 0 ? 1u : 0u;
   hdr[kHpRadius] = (uint32_t)std::clamp(tn.sim.heatRadius, 1, (int)kHeatRadiusMax);
   const HeatClimate snow = HeatSnowlineClimate();
-  hdr[kHpSnowlineY] = (uint32_t)HeatSnowlineY();
+  hdr[kHpLapse] = (uint32_t)std::clamp(tn.sim.heatLapsePerKm, 0, 64);
   hdr[kHpSnowBase] = (uint32_t)snow.base;
   hdr[kHpSnowSwing] = (uint32_t)snow.swing;
   hdr[kHpProbe + 0] = (uint32_t)heatProbe_[0];
@@ -3435,6 +3548,7 @@ bool Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], u
   // The tent cadence (heat.h kHmDue): outside the knob words above on purpose,
   // since changing it moves no target and so needs no re-target and no wake.
   hdr[kHpTentEvery] = (uint32_t)std::clamp(tn.sim.heatTentEvery, 1, (int)kHeatTentEveryMax);
+  hdr[kHpSeaY] = (uint32_t)worldmap::CurrentWorldMap().seaLevelY;
   queue.WriteBuffer(heatParamsBuf_, 0, hdr, sizeof(hdr));
   uint32_t bio[2 * kHeatBiomesMax];
   uint64_t key = 1469598103934665603ull ^ seed;
@@ -3453,15 +3567,31 @@ bool Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], u
   for (const HeatColumnPin& p : heatPins_) {
     mix((uint32_t)p.x0); mix((uint32_t)p.z0); mix((uint32_t)p.x1); mix((uint32_t)p.z1);
   }
+  // The treeline inputs the column table's snowline reads (map v2 A1): the
+  // map's treeline / jitter words and every biome's scale. A biome file's
+  // treelineScale edit reloads the environment without touching the map's
+  // own files, so the content hash alone would not see it.
+  {
+    const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+    mix((uint32_t)m.terrain.treeline);
+    mix((uint32_t)m.terrain.treelineJitter);
+    mix((uint32_t)m.seaLevelY);
+    for (int q : m.biomeTreelineQ8) mix((uint32_t)q);
+  }
+  // THE WINDOW COLUMN TABLE (heat.h kHpCol): biome | snowline << 8 per
+  // column, in 16 x 16 chunk-column tiles. A tile is rebuilt when the world
+  // chunk column it holds changes (the window moved past it) and uploaded as
+  // part of a run of consecutive rebuilt tiles: a one-chunk window shift is
+  // 32 tiles (32 KB), not the table (1 MB).
   const uint32_t n = kWorldN;
+  const uint32_t tpa = n / kChunk;                // tiles per axis
   if (!heatColValid_ || key != heatColKey_ || heatCol_.size() != (size_t)n * n) {
-    heatCol_.assign((size_t)n * n, 0);
-    heatColX_.assign(n, -0x7FFFFFFF);
-    heatColZ_.assign(n, -0x7FFFFFFF);
+    heatCol_.assign((size_t)n * n, 0u);
+    heatColX_.assign(tpa, -0x7FFFFFFF);
+    heatColZ_.assign(tpa, -0x7FFFFFFF);
     heatColKey_ = key;
     heatColValid_ = true;
   }
-  const int x0 = origin[0] * (int)kChunk, z0 = origin[2] * (int)kChunk;
   auto pinned = [&](int x, int z, uint32_t& b) {
     for (size_t k = 0; k < heatPins_.size(); k++) {
       const HeatColumnPin& p = heatPins_[k];
@@ -3472,29 +3602,39 @@ bool Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], u
     }
     return false;
   };
-  auto biomeAt = [&](int x, int z) -> uint8_t {
+  auto colWord = [&](int x, int z) -> uint32_t {
     uint32_t b = 0;
     if (!pinned(x, z, b)) b = World::MapBiomeAt(x, z, seed);
-    return (uint8_t)std::min<uint32_t>(b, kHeatBiomesMax - 1);
+    b = std::min<uint32_t>(b, kHeatBiomesMax - 1);
+    const int32_t snowY = HeatSnowlineYAt(x, z, seed);
+    return b | ((uint32_t)snowY << 8);
   };
-  bool changed = false;
-  std::vector<int> wantX(n), wantZ(n);
-  for (uint32_t k = 0; k < n; k++) {
-    // The world column window index k holds: x in [x0, x0 + n) with x & (n-1) == k.
-    wantX[k] = x0 + (int)((k - (uint32_t)x0) & (n - 1));
-    wantZ[k] = z0 + (int)((k - (uint32_t)z0) & (n - 1));
+  // The world chunk column window tile k holds on each axis: chunk c in
+  // [origin, origin + tpa) with c & (tpa - 1) == k.
+  std::vector<int> wantX(tpa), wantZ(tpa);
+  for (uint32_t k = 0; k < tpa; k++) {
+    wantX[k] = origin[0] + (int)((k - (uint32_t)origin[0]) & (tpa - 1));
+    wantZ[k] = origin[2] + (int)((k - (uint32_t)origin[2]) & (tpa - 1));
   }
-  for (uint32_t i = 0; i < n; i++) {
-    const bool colX = heatColX_[i] != wantX[i];
-    for (uint32_t j = 0; j < n; j++) {
-      if (!colX && heatColZ_[j] == wantZ[j]) continue;
-      heatCol_[(size_t)j * n + i] = biomeAt(wantX[i], wantZ[j]);
-      changed = true;
+  std::vector<uint8_t> dirty((size_t)tpa * tpa, 0);
+  for (uint32_t tj = 0; tj < tpa; tj++)
+    for (uint32_t ti = 0; ti < tpa; ti++) {
+      if (heatColX_[ti] == wantX[ti] && heatColZ_[tj] == wantZ[tj]) continue;
+      dirty[(size_t)tj * tpa + ti] = 1;
+      uint32_t* t = heatCol_.data() + ((size_t)tj * tpa + ti) * kHeatColTile;
+      const int x0 = wantX[ti] * (int)kChunk, z0 = wantZ[tj] * (int)kChunk;
+      for (uint32_t lz = 0; lz < kChunk; lz++)
+        for (uint32_t lx = 0; lx < kChunk; lx++) t[lz * kChunk + lx] = colWord(x0 + (int)lx, z0 + (int)lz);
     }
+  for (uint32_t k = 0; k < tpa; k++) { heatColX_[k] = wantX[k]; heatColZ_[k] = wantZ[k]; }
+  for (size_t i = 0; i < dirty.size();) {
+    if (!dirty[i]) { i++; continue; }
+    size_t j = i;
+    while (j < dirty.size() && dirty[j]) j++;
+    queue.WriteBuffer(heatParamsBuf_, ((uint64_t)kHpCol + (uint64_t)i * kHeatColTile) * 4,
+                      heatCol_.data() + i * kHeatColTile, (j - i) * kHeatColTile * sizeof(uint32_t));
+    i = j;
   }
-  for (uint32_t k = 0; k < n; k++) { heatColX_[k] = wantX[k]; heatColZ_[k] = wantZ[k]; }
-  if (changed)
-    queue.WriteBuffer(heatParamsBuf_, (uint64_t)kHpCol * 4, heatCol_.data(), heatCol_.size());
   return knobsMoved;
 }
 
@@ -4083,6 +4223,8 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(42, world_->elecPool),      // the charge field (raymarch elecPAt)
         b(43, world_->elecMeta),
         b(44, boltBuf_),              // the bolt table (boltfx.h)
+        b(45, horizonBuf_),           // the far horizon (horizon.h)
+        b(46, hzLightBuf_),           // the terrain light map (horizon.h kL*)
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");
@@ -4148,7 +4290,7 @@ void Simulation::BuildShadowBindGroup() {
     e.size = 0;
     return e;
   };
-  if (!shadowBGL_ || !cloudRawBuf_) return;
+  if (!shadowBGL_ || !cloudRawBuf_ || !horizonBuf_ || !hzLightBuf_) return;
   rhi::BindGroupEntry bges[] = {
       b(0, world_->voxels),
       b(1, world_->occupancy),
@@ -4181,6 +4323,8 @@ void Simulation::BuildShadowBindGroup() {
       b(30, world_->gasOuter),
       b(31, gasMaskBuf_),
       b(28, giReqBuf_),
+      b(32, horizonBuf_),
+      b(33, hzLightBuf_),
   };
   shadowBG_ = device_.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
 }

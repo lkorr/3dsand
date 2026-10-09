@@ -88,6 +88,48 @@ bool WorldEdits::Load(const std::string& path, std::string& err) {
 bool WorldEdits::LoadBytes(const std::vector<uint8_t>& b, const std::string& path,
                            std::string& err) {
   Clear();
+  if (!ParseInto(b, path, err)) {
+    Clear();
+    return false;
+  }
+  name_ = path;
+  return true;
+}
+
+bool WorldEdits::LoadFiles(const std::vector<std::string>& paths, std::string& err) {
+  Clear();
+  bool all = true;
+  std::string names;
+  for (const std::string& path : paths) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+      err += (err.empty() ? "" : "; ") + ("cannot open " + path);
+      all = false;
+      continue;
+    }
+    std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    // Parse into a scratch copy first, so a malformed file leaves nothing of
+    // itself behind: whole files or none.
+    const auto before = cols_;
+    const size_t vc = voxelCount_;
+    const bool rel = relative_;
+    std::string e;
+    if (!ParseInto(b, path, e)) {
+      cols_ = before;
+      voxelCount_ = vc;
+      relative_ = rel;
+      err += (err.empty() ? "" : "; ") + e;
+      all = false;
+      continue;
+    }
+    names += (names.empty() ? "" : " + ") + path;
+  }
+  name_ = names;
+  return all;
+}
+
+bool WorldEdits::ParseInto(const std::vector<uint8_t>& b, const std::string& path,
+                           std::string& err) {
   if (b.size() < 32 || Rd32(b.data()) != kMagic) {
     err = path + ": not an SVED edit layer";
     return false;
@@ -100,11 +142,11 @@ bool WorldEdits::LoadBytes(const std::vector<uint8_t>& b, const std::string& pat
   const uint32_t count = Rd32(b.data() + 8);
   fileSeed_ = Rd32(b.data() + 16);
   const uint32_t flags = Rd32(b.data() + 20);
-  relative_ = ver == 2 && (flags & kFlagRelative) != 0;
+  const bool rel = ver == 2 && (flags & kFlagRelative) != 0;
+  relative_ = relative_ || rel;
   size_t p = 32;
   auto fail = [&](const std::string& why) {
     err = path + ": " + why;
-    Clear();
     return false;
   };
   for (uint32_t i = 0; i < count; i++) {
@@ -126,7 +168,7 @@ bool WorldEdits::LoadBytes(const std::vector<uint8_t>& b, const std::string& pat
         const int x = wc.x * (int)kChunk + (int)(li % kChunk);
         const int y = wc.y * (int)kChunk + (int)((li / kChunk) % kChunk);
         const int z = wc.z * (int)kChunk + (int)(li / (kChunk * kChunk));
-        cols_[{x, z}].push_back({y, CleanWord(w)});
+        cols_[{x, z}].push_back({y, CleanWord(w), false});
         voxelCount_++;
       }
     } else {
@@ -145,12 +187,11 @@ bool WorldEdits::LoadBytes(const std::vector<uint8_t>& b, const std::string& pat
         // tunnel kilometres under a mountain (measured: -4146), but not a
         // cell a million voxels from the ground — that is a corrupt offset.
         if (dy < -(1 << 20) || dy > (1 << 20)) return fail("column offset out of range");
-        col.push_back({dy, CleanWord(w)});
+        col.push_back({dy, CleanWord(w), rel});
         voxelCount_++;
       }
     }
   }
-  name_ = path;
   return true;
 }
 
@@ -183,9 +224,11 @@ void WorldEdits::Resolve(uint32_t seed) {
     // TerrainHeight is the ground CONTRACT (== genColumn(x, z, seed).h, and
     // since P5 it includes the sculpt layer), so an offset means "this many
     // cells above the ground the world was generated with" on both sides.
-    const int base = relative_ ? World::TerrainHeight(x, z, seed) : 0;
+    bool anyRel = false;
+    for (const ColCell& c : kv.second) anyRel = anyRel || c.rel;
+    const int ground = anyRel ? World::TerrainHeight(x, z, seed) : 0;
     for (const ColCell& c : kv.second) {
-      const int y = base + c.y;
+      const int y = (c.rel ? ground : 0) + c.y;
       const IVec3 wc{x >> 4, y >> 4, z >> 4};
       const uint32_t li = (uint32_t)(x & 15) + (uint32_t)(y & 15) * kChunk +
                           (uint32_t)(z & 15) * kChunk * kChunk;
@@ -407,49 +450,79 @@ WorldEdits& WorldEditLayer() {
   return g;
 }
 
-void LoadWorldEditLayerNamed(const std::string& assetDir, const std::string& name) {
-  // What was last loaded, so a caller that asks per request (the voxel
-  // server) pays a stat, not a parse.
-  static std::string lastPath;
-  static std::filesystem::file_time_type lastTime{};
-  static uintmax_t lastSize = 0;
+namespace {
+// Load `paths` (in order) into the process layer, unless they are exactly the
+// files last loaded with the same mtimes and sizes: a caller that asks per
+// request (the voxel server) pays a stat per file, not a parse. `label` names
+// the set in the log line.
+void LoadLayerFiles(const std::vector<std::string>& paths, const std::string& label) {
+  struct Seen {
+    std::string path;
+    std::filesystem::file_time_type t{};
+    uintmax_t size = 0;
+    bool operator==(const Seen& o) const { return path == o.path && t == o.t && size == o.size; }
+  };
+  static std::vector<Seen> last;
+  static bool lastOk = false;
 
-  if (name.empty()) {
+  if (paths.empty()) {
     if (!WorldEditLayer().Empty()) {
       std::printf("world edits: layer cleared\n");
       WorldEditLayer().Clear();
     }
-    lastPath.clear();
+    last.clear();
+    lastOk = false;
+    return;
+  }
+  std::vector<Seen> now;
+  bool statOk = true;
+  for (const std::string& p : paths) {
+    std::error_code ec;
+    Seen s;
+    s.path = p;
+    s.t = std::filesystem::last_write_time(p, ec);
+    if (!ec) s.size = std::filesystem::file_size(p, ec);
+    statOk = statOk && !ec;
+    now.push_back(s);
+  }
+  if (statOk && lastOk && now == last) return;
+  std::string err;
+  const bool ok = WorldEditLayer().LoadFiles(paths, err);
+  if (!ok) std::fprintf(stderr, "world edits: %s\n", err.c_str());
+  last = now;
+  lastOk = ok && statOk;
+  std::printf("world edits: layer %s (%zu file%s, SVED %s) - %zu voxels in %zu columns\n", label.c_str(),
+              paths.size(), paths.size() == 1 ? "" : "s",
+              WorldEditLayer().Relative() ? "v2 ground-relative" : "v1 absolute",
+              WorldEditLayer().VoxelCount(), WorldEditLayer().ColumnCount());
+}
+}  // namespace
+
+void LoadWorldEditLayerNamed(const std::string& assetDir, const std::string& name) {
+  if (name.empty()) {
+    LoadLayerFiles({}, "");
     return;
   }
   // A NAME, never a path: anything with a separator is refused.
   if (name.find_first_of("/\\:.") != std::string::npos) {
     std::fprintf(stderr, "world edits: '%s' is not a bare layer name\n", name.c_str());
-    WorldEditLayer().Clear();
-    lastPath.clear();
+    LoadLayerFiles({}, "");
     return;
   }
-  const std::string path = assetDir + "/worldedits/" + name + ".svedit";
-  std::error_code ec;
-  const auto t = std::filesystem::last_write_time(path, ec);
-  const uintmax_t sz = ec ? 0 : std::filesystem::file_size(path, ec);
-  if (!ec && path == lastPath && t == lastTime && sz == lastSize) return;
-  std::string err;
-  if (!WorldEditLayer().Load(path, err)) {
-    std::fprintf(stderr, "world edits: %s\n", err.c_str());
-    lastPath.clear();
-    return;
-  }
-  lastPath = path;
-  lastTime = t;
-  lastSize = sz;
-  std::printf("world edits: layer '%s' (SVED %s) - %zu voxels in %zu columns\n",
-              name.c_str(), WorldEditLayer().Relative() ? "v2 ground-relative" : "v1 absolute",
-              WorldEditLayer().VoxelCount(), WorldEditLayer().ColumnCount());
+  LoadLayerFiles({assetDir + "/worldedits/" + name + ".svedit"}, "'" + name + "'");
 }
 
 void LoadWorldEditLayerForMap(const std::string& assetDir) {
-  LoadWorldEditLayerNamed(assetDir, worldmap::CurrentWorldMap().editLayer);
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  std::vector<std::string> paths;
+  std::string label;
+  for (const auto& [path, nm] : worldmap::MapEditLayerFiles(assetDir, m.name, m.editLayer, m.locales)) {
+    paths.push_back(path);
+    label += (label.empty() ? "'" : " + '") + nm + "'";
+  }
+  // A map layer that is NAMED but missing is still asked for, so the loader
+  // says so (MapEditLayerFiles lists it whether or not it exists).
+  LoadLayerFiles(paths, label.empty() ? std::string("(none)") : "of map '" + m.name + "': " + label);
 }
 
 }  // namespace sandvox

@@ -5257,6 +5257,81 @@
         "#ffe6a8"
       ],
       "tags": []
+    },
+    {
+      "//": "HAIR ON THE SCALP (owner, 2026-10-08): the head's painted hair, brows and beard -- the surface cells the generator paints in the hair colour -- were skin wearing a hair colour, so they seared like skin and the probe read them as skin. The .vox still bakes them as `skin` (a .vox paints ids 0..127 and this is past that), and human.json's anatomy.paintBecomes rewrites every skin cell painted a hair slot to this at load, the way garmentsBecome turns the shorts to flesh. SLIGHTLY MORE FLAMMABLE THAN SKIN and gone faster: it catches from ONE hot face (skin only sears at one, and needs a three-face front to actually ignite), at 90 against skin's sear of 63, into hair_burning, which is ash in about four ticks -- a lit scalp flashes off and leaves the skin under it to the ordinary flesh chain. Not the hanging hair mass (hair_white), which catches almost on contact. woundHp 0: a voxel of hair is not a wound, so a scalp burnt bare or a lock cut off costs the head nothing. `rubble: ash` keeps it out of MobDef::tissue (no bleed, no rot). Appended at the END: an id is the index.",
+      "id": "hair",
+      "class": "solid",
+      "density": 300,
+      "hardness": 3,
+      "rubble": "ash",
+      "woundHp": 0,
+      "colors": [
+        "#4a3728",
+        "#33251a",
+        "#6b4a2e"
+      ],
+      "//tints": "GRID colours (sim/materials.h kMatFlagTinted): the generator's hair colours (mobgen.js HAIR_COLORS), so a scalp that lands in the world keeps its family. Entry 0 is hair's own dark brown.",
+      "tints": [
+        "#4a3728",
+        "#1e1a17",
+        "#6b4a2e",
+        "#7a3a22",
+        "#a8823f",
+        "#cfa85e",
+        "#8e8a83",
+        "#d8d3cb"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "MAP V2 R1. PACKED EARTH: a road's or a lane's beaten surface -- dirt trodden and rolled until it holds its shape. A SOLID on purpose: a road is graded, and a graded road is a slope, so a powder surface (dirt, gravel: repose 40) would slide off the first cut it is laid on and the chunk would never sleep (CLAUDE.md rule 2). Dirt's colours, a shade darker and flatter. Laid by worldgen only, from map.json roads[] (worldgen.wgsl roadColAt); a dug or blasted cell crumbles back to dirt.",
+      "id": "packed_earth",
+      "arcane": 1,
+      "footstep": "path",
+      "class": "solid",
+      "density": 1700,
+      "hardness": 30,
+      "rubble": "dirt",
+      "absorb": {
+        "capacity": 6
+      },
+      "colors": [
+        "#5f4730",
+        "#553f2a",
+        "#6a5036"
+      ],
+      "tags": [
+        "mineral",
+        "dissolvable",
+        "soil"
+      ],
+      "molten": "lava"
+    },
+    {
+      "//": "MAP V2 R1. PACKED GRAVEL: a metalled track -- gravel rolled into the ground until it is one crust. Solid for the reason packed_earth is (a graded road is a slope; loose gravel slides off it). Gravel's colours, a shade darker. Laid by worldgen only, from map.json roads[]; broken up it is gravel again.",
+      "id": "packed_gravel",
+      "arcane": 1,
+      "footstep": "path",
+      "class": "solid",
+      "density": 2000,
+      "hardness": 35,
+      "rubble": "gravel",
+      "colors": [
+        "#8f8880",
+        "#827b74",
+        "#9b948b"
+      ],
+      "tags": [
+        "mineral",
+        "dissolvable"
+      ],
+      "molten": "lava"
     }
   ]
 }

@@ -3648,7 +3648,9 @@ struct RenderParams {
   float camFwd[3];
   uint32_t flags;
   float sunDir[3];
-  float fogDensity = 0.0128f;  // per-meter; pinned to the far-field extent
+  // Per metre: the LOADING fog that hides an unfilled cascade (kFarFogDensity
+  // when complete, i.e. 0 since H1). The air itself is hfog* below.
+  float fogDensity = 0.0f;
   int32_t origin[3] = {0, 0, 0};  // residency window origin, chunk units
   // Render target HEIGHT in pixels. The water shader damps its ripple bands
   // against the angular size of one pixel (tanHalfFov*2/viewPx), so this has
@@ -3788,7 +3790,9 @@ struct RenderParams {
   // switch the march off. Before the first snapshot arrives the box is the
   // whole residency window (conservative — never clip real water).
   int32_t fluidLo[3] = {0, 0, 0};
-  int32_t pad_fb0 = 0;
+  // Spent from pad_fb0 (H1): render.fogHaze, the blue share of a part-fogged
+  // surface's airlight (raymarch.wgsl applyAerial). Fills the row fluidLo opens.
+  float fogHaze = 0.0f;
   int32_t fluidHi[3] = {-1, -1, -1};
   int32_t pad_fb1 = 0;
 
@@ -3827,7 +3831,18 @@ struct RenderParams {
   // No fluidLo-style pad games needed: windGust ends a whole row, and the
   // array's own 16-byte stride starts the next one.
   uint32_t windPrimCount = 0;
-  uint32_t pad_wpr0 = 0, pad_wpr1 = 0, pad_wpr2 = 0;
+  // ---- THE HEIGHT FOG (H1; spent from pad_wpr0..2, completing windPrimCount's
+  // row). The air's extinction: hfogDensity per METRE at y = hfogBaseY (fine
+  // voxels; the map's sea plane), falling as exp(-(y - hfogBaseY) * VOXEL_METERS
+  // * hfogFalloff) -- hfogFalloff is 1 / render.fogScaleHeight in metres.
+  // Written by WriteRenderParams from render.fogSeaDensity / fogScaleHeight
+  // and scaled by the weather's mist with fogDensity. raymarch.wgsl
+  // aerialFrac integrates it along the ray; common.wgsl airFogFrac is the same
+  // law for the raster passes. fogDensity above is now ONLY the loading fog
+  // that hides an unfilled cascade (0 once every level is filled).
+  float hfogDensity = 0.0f;
+  float hfogFalloff = 0.0f;
+  float hfogBaseY = 0.0f;
   int32_t windPrimLo[3] = {1, 1, 1};
   int32_t pad_wpr3 = 0;
   int32_t windPrimHi[3] = {0, 0, 0};
@@ -4333,12 +4348,18 @@ constexpr uint32_t kFarFaceAllPending = 1u << kFarFaceFlagBit;
 // to; kFogOpticalDepths is that budget, shared by the static pin below and by
 // the adaptive term in WriteRenderParams.
 constexpr float kFogOpticalDepths = 4.5f;
-// Fog density such that opacity ~= 1 at the outermost level's half-extent from
-// the centered player. This is the FLOOR of the adaptive density (phase 3B):
-// the fully-filled cascade is the farthest anything is ever visible, so fog is
-// never thinner than this.
-constexpr float kFarFogDensity =
-    kFogOpticalDepths / kFarHalfExtentMeters(kFarLevels);
+// The LOADING fog's density when every cascade level is filled: ZERO. Until
+// H1 (docs/PLAN_map_v2.md) this was kFogOpticalDepths / kFarHalfExtentMeters(
+// kFarLevels) -- the fog was PINNED to the cascade edge, because the filled
+// cascade was the farthest anything was ever visible and the box had to
+// dissolve before its square edge did. The far horizon (sim/horizon.h) now
+// draws the map past that edge, so nothing needs hiding there, and the air is
+// the height fog (RenderParams hfog*: render.fogSeaDensity / fogScaleHeight),
+// which knows nothing about the cascades. What remains of this term is its
+// job of hiding an UNFILLED cascade: main.cpp's adaptive target is
+// kFogOpticalDepths / SafeRadius while a level is pending and this floor once
+// none is. The --shot / gate harnesses pass it as "the cascade is complete".
+constexpr float kFarFogDensity = 0.0f;
 // Ceiling of the adaptive density (phase 3B). While a cold start / teleport
 // has cascade fills outstanding, fog closes in to hide the unfilled bands —
 // but never nearer than 4x the residency window's own half-extent. That keeps

@@ -4,6 +4,7 @@
 #include "sim/worldmap.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -13,15 +14,16 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <tuple>
 #include <unordered_map>
 
 #include <nlohmann/json.hpp>
 
 #include "sim/biomes.h"
-#include "sim/intmath.h"   // the landform bake's integer sine/sqrt (no libm)
 #include "sim/rng.h"
 #include "sim/treeatlas.h"   // ReadTreeSpeciesHeaders: a tree site's species index + reach
 #include "sim/tuning.h"
+#include "sim/tuningstamp.h"   // HashOneFile: the edit layers' fingerprint part (L1)
 #include "sim/voxload.h"
 #include "sim/world.h"
 #include "world/structures.h"   // P4: the map's `structure` refs become stamp sites
@@ -157,20 +159,22 @@ uint32_t WaterPresetIndex(const biomes::BiomeSet& set, const std::string& name) 
 void TerrainWords(const TerrainParams& t, uint32_t out[kTerrainWords]) {
   const auto at = [&](uint32_t word) -> uint32_t& { return out[word - kHTerrainBaseHeight]; };
   at(kHTerrainBaseHeight) = U(t.baseHeight);
-  at(kHTerrainLandformRange) = U(std::max(0, t.landformRangeVox));
-  at(kHTerrainRangeAmplitude) = U(std::max(0, t.rangeAmplitude));
+  // Every amplitude is clamped to kNoiseAmpMax (worldmap.h: the octave's
+  // n.dx * amp * biome multiplier bound); LoadWorldMap says so when it bites.
+  at(kHTerrainRangeAmplitude) = U(std::clamp(t.rangeAmplitude, 0, kNoiseAmpMax));
   at(kHTerrainRangeLog2) = U(std::clamp(t.rangeLog2, 3, 15));
-  at(kHTerrainHillAmplitude) = U(std::max(0, t.hillAmplitude));
+  at(kHTerrainHillAmplitude) = U(std::clamp(t.hillAmplitude, 0, kNoiseAmpMax));
   at(kHTerrainHillLog2) = U(std::clamp(t.hillLog2, 3, 15));
-  at(kHTerrainDetailAmplitude) = U(std::max(0, t.detailAmplitude));
+  at(kHTerrainDetailAmplitude) = U(std::clamp(t.detailAmplitude, 0, kNoiseAmpMax));
   at(kHTerrainDetailLog2) = U(std::clamp(t.detailLog2, 3, 15));
-  at(kHTerrainGrainAmplitude) = U(std::max(0, t.grainAmplitude));
+  at(kHTerrainGrainAmplitude) = U(std::clamp(t.grainAmplitude, 0, kNoiseAmpMax));
   at(kHTerrainGrainLog2) = U(std::clamp(t.grainLog2, 3, 15));
   at(kHTerrainFbmAtten) = U(std::clamp(t.fbmAtten, 0, 256));
-  at(kHTerrainHomeY) = U(t.homeY);
+  at(kHTerrainTreelineJitter) = U(std::clamp(t.treelineJitter, 0, kTreelineJitterMax));
+  at(kHTerrainRockSlope) = U(std::max(0, t.rockSlope));
   at(kHTerrainHomeR) = U(std::max(0, t.homeR));
   at(kHTerrainHomeFade) = U(std::max(1, t.homeFade));
-  at(kHTerrainSedCeil) = U(t.sedCeil);
+  at(kHTerrainSedAbove) = U(std::clamp(t.sedAbove, -4096, 4096));
   at(kHTerrainSedFraction) = U(std::max(0, t.sedFraction));
   at(kHTerrainSedStrip) = U(std::max(0, t.sedStrip));
   at(kHTerrainSedSlope) = U(std::max(0, t.sedSlope));
@@ -178,6 +182,27 @@ void TerrainWords(const TerrainParams& t, uint32_t out[kTerrainWords]) {
   at(kHTerrainSedTopsoil) = U(std::clamp(t.sedTopsoil, 0, std::max(0, t.sedMax)));
   at(kHTerrainTreeline) = U(t.treeline);
   at(kHTerrainRefVpm) = U(std::max(1, t.refVoxelsPerMetre));
+}
+
+int BiomeTreelineQ8(const biomes::BiomeDef& b) {
+  return std::clamp(static_cast<int>(std::lround(b.terrain.treelineScale * 256.0)), 0, 1024);
+}
+
+int TreelineMaxOf(const WorldMapData& map) {
+  // treelineAt = sea + (((treeline - sea) * scale) >> 8) + jitter, scale over
+  // every biome the map can show (the default 256 too: no planes = identity),
+  // jitter +-treelineJitter. Monotone in the scale, so its two ends bound it.
+  const int sea = map.seaLevelY, d = map.terrain.treeline - sea;
+  int lo = 256, hi = 256;
+  for (int q : map.biomeTreelineQ8) { lo = std::min(lo, q); hi = std::max(hi, q); }
+  const int top = sea + std::max((d * lo) >> 8, (d * hi) >> 8);
+  return top + std::clamp(map.terrain.treelineJitter, 0, kTreelineJitterMax) + 1;
+}
+
+int WindowChunkYForGround(int groundY) {
+  // floor((groundY - 72) / 256) half-windows, as chunks. Arithmetic shift
+  // floors on the negative side too.
+  return ((groundY - 72) >> 8) * static_cast<int>(kNChunk / 2);
 }
 
 BiomeTerrainPacked PackBiomeTerrain(const biomes::BiomeDef& b) {
@@ -188,122 +213,6 @@ BiomeTerrainPacked PackBiomeTerrain(const biomes::BiomeDef& b) {
   p.w[kB_DetailMul - kB_CurveKnot0] = U(std::clamp(b.terrain.detail, 0, 4096));
   p.w[kB_GrainMul - kB_CurveKnot0] = U(std::clamp(b.terrain.grain, 0, 4096));
   return p;
-}
-
-// A declared landform, onto the plane. Tier A: no seed anywhere in here. The
-// plane's unit is landformRangeVox / 256 voxels (the shader's
-// ((L << 8) - 32768) * range >> 16), so a site's heightVox becomes
-// heightVox * 256 / range units at its centre. Shapes are profiles of the
-// normalised distance t in 0..1 from the centre:
-//   peak     1 - t                      (a cone)
-//   basin    -(1 - t)                   (the cone, sunk; heightVox's sign is
-//                                        taken as a magnitude either way)
-//   plateau  1 inside 0.6, then 1 - (t - 0.6) / 0.4   (a flat top, ramped out)
-//   ridge    the cone over an ellipse of semi-axes (radius, radius / 3)
-//            turned `rotation` degrees, so it reads as a range with a crest
-// The value is accumulated in whole units and clamped to the byte at the end,
-// so a peak painted over a basin sums rather than replaces.
-//
-// INTEGER, AND WHY. This bake used to run in doubles with libm cos and sin on
-// the ridge rotation. The plane it writes is read by worldgen — by the shader
-// AND by the CPU height twin — so one byte that differs between two machines
-// is a terrain that differs between two machines, which is a desync no gate on
-// one box can see. libm is not specified to be correctly rounded and is not
-// bit-identical across platforms or compiler versions, so the bake is now
-// integer end to end: imath::BamFromDegreesI turns whole degrees into an exact
-// BAM (90 degrees really is a quarter turn), imath's Q30 sine replaces libm's,
-// distances come out of an exact integer sqrt, and the accumulator is Q16.16
-// landform units rounded half-up at the end. See docs/PLAN_multiplayer_now.md
-// L6. `+ - * / sqrt` on floats WOULD have been safe (IEEE specifies them
-// exactly, which is why ProfileAt above still uses std::sqrt); cos and sin are
-// the two that are not.
-void OverlayLandformSites(const std::vector<LandformSite>& sites, int landformRangeVox,
-                          int cellLog2, int width, int height, int originCellX, int originCellZ,
-                          std::vector<uint8_t>& landform) {
-  if (sites.empty() || landform.size() != static_cast<size_t>(width) * height) return;
-  const int64_t range = std::max(1, landformRangeVox);
-  const int64_t half = 1 << (cellLog2 - 1);
-  // Q16.16 landform units. The plane's own bytes seed it, so a site adds to
-  // what the author painted rather than replacing it.
-  std::vector<int64_t> acc(landform.size());
-  for (size_t i = 0; i < landform.size(); i++) acc[i] = static_cast<int64_t>(landform[i]) << 16;
-  for (const LandformSite& st : sites) {
-    const int64_t r = std::max(1, st.radius);
-    const int64_t hv = st.heightVox < 0 ? -static_cast<int64_t>(st.heightVox)
-                                        : static_cast<int64_t>(st.heightVox);
-    // heightVox * 256 / range landform units, Q16.16; a basin sinks the plane.
-    int64_t ampQ = imath::DivRound(hv * 256 * 65536, range);
-    if (st.shape == "basin") ampQ = -ampQ;
-    if (ampQ == 0) continue;
-    const uint32_t rotBam = imath::BamFromDegreesI(st.rotation);
-    const int64_t ca = imath::CosQ30(rotBam), sa = imath::SinQ30(rotBam);
-    // The ridge's cross-crest semi-axis, radius / 3, kept as Q16.16 so the
-    // thirds are not thrown away on a small footprint.
-    const int64_t bQ = std::max<int64_t>(65536, (r * 65536) / 3);
-    // cells the footprint can reach, +1 for the ridge's rotated corners
-    int c0x, c0z, c1x, c1z;
-    const auto cellOf = [&](int x, int z, int* cx, int* cz) {
-      *cx = (x >> cellLog2) + originCellX;
-      *cz = (z >> cellLog2) + originCellZ;
-    };
-    cellOf(st.x - st.radius - 1, st.z - st.radius - 1, &c0x, &c0z);
-    cellOf(st.x + st.radius + 1, st.z + st.radius + 1, &c1x, &c1z);
-    c0x = std::max(c0x - 1, 0); c0z = std::max(c0z - 1, 0);
-    c1x = std::min(c1x + 1, width - 1); c1z = std::min(c1z + 1, height - 1);
-    for (int cz = c0z; cz <= c1z; cz++)
-      for (int cx = c0x; cx <= c1x; cx++) {
-        const int64_t wx = (static_cast<int64_t>(cx - originCellX) << cellLog2) + half;
-        const int64_t wz = (static_cast<int64_t>(cz - originCellZ) << cellLog2) + half;
-        const int64_t dx = wx - st.x, dz = wz - st.z;
-        int64_t tQ;  // normalised distance from the centre, Q16.16
-        if (st.shape == "ridge") {
-          // into the ridge's frame: `u` along the crest, `v` across it. The
-          // Q30 sine times a whole-voxel offset is a Q30 length; >>14 (rounded,
-          // never a bare arithmetic shift, which would floor both signs the
-          // same way and drag the crest one way) lands it in Q16.16.
-          const int64_t uQ = imath::DivRound(dx * ca + dz * sa, 1 << 14);
-          const int64_t vQ = imath::DivRound(-dx * sa + dz * ca, 1 << 14);
-          const int64_t ru = imath::DivRound(uQ, r);         // u / a, Q16.16
-          const int64_t rv = imath::DivRound(vQ << 16, bQ);  // v / b, Q16.16
-          // Two Q16.16s squared make a Q32.32; its exact integer sqrt is a
-          // Q16.16 again, with no intermediate rounding to argue about.
-          tQ = static_cast<int64_t>(imath::Sqrt64(static_cast<uint64_t>(ru * ru + rv * rv)));
-        } else {
-          const uint64_t d2 = static_cast<uint64_t>(dx * dx + dz * dz);
-          // `d2 << 32` is exact only while d2 < 2^32, i.e. while the distance
-          // is under 65,536 voxels; past that it wraps the u64 and bakes
-          // garbage. That is REACHABLE, because the loader clamps radius to
-          // 1 << 20 (a 105 km site), so take the root first and shift after
-          // for the far branch: the fraction it drops is under one voxel out
-          // of a distance already past 65,536, hence under 1/65,536 of t --
-          // below the Q16.16 LSB, let alone the byte the plane stores.
-          // The ridge branch needs no such guard: dx * ca peaks at
-          // 2^20 * 2^30 = 2^50, vQ << 16 at 2^52, and ru / rv are bounded by
-          // ~2^18 each, so its ru*ru + rv*rv sits around 2^36.
-          tQ = d2 < (1ull << 32)
-                   ? imath::DivRound(static_cast<int64_t>(imath::Sqrt64(d2 << 32)), r)
-                   : imath::DivRound(static_cast<int64_t>(imath::Sqrt64(d2) << 16), r);
-        }
-        if (tQ >= 65536) continue;
-        int64_t fQ;
-        if (st.shape == "plateau") {
-          // 1 inside 0.6, then 1 - (t - 0.6) / 0.4 == (5 - 5t) / 2. Written as
-          // exact fifths rather than as 0.6/0.4 rounded into Q16.16, so the
-          // flat top ends exactly where the comment above says it does.
-          fQ = (5 * tQ <= 3 * 65536) ? 65536 : imath::DivRound(5 * (65536 - tQ), 2);
-        } else {
-          fQ = 65536 - tQ;
-        }
-        acc[static_cast<size_t>(cz) * width + cx] += imath::MulShiftRound(ampQ, fQ, 16);
-      }
-  }
-  for (size_t i = 0; i < landform.size(); i++) {
-    // Explicit integer half-up: +0.5 then floor, the floor being the
-    // arithmetic shift. Written out rather than left to std::lround because
-    // the rounding MODE is part of the byte the whole world reads.
-    const int64_t v = (acc[i] + 32768) >> 16;
-    landform[i] = static_cast<uint8_t>(std::clamp<int64_t>(v, 0, 255));
-  }
 }
 
 namespace {
@@ -451,6 +360,7 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
       const BiomeTerrainPacked bt = PackBiomeTerrain(b);
       for (uint32_t k = 0; k < kBiomeTerrainWords; k++) r[kB_CurveKnot0 + k] = bt.w[k];
     }
+    r[kB_TreelineQ8] = U(BiomeTreelineQ8(b));
     // P-E: cave flora from the band rows (mushrooms on the near band's floor,
     // crystal on the deep band's floor and ceiling), the cactus density, and
     // the water preset the biome's ponds and shores wear (see WaterPresetOf).
@@ -492,6 +402,7 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
       row[kC_NearWaterMin] = U(std::max(0, static_cast<int>(std::lround(c.cond.nearWaterMinM * kVoxelsPerMetre))));
       row[kC_CanopyMin] = U(std::clamp(c.cond.canopyMin, 0, 255));
       row[kC_CanopyMax] = U(std::clamp(c.cond.canopyMax, 0, 255));
+      row[kC_Treeline] = U(std::clamp(c.cond.treeline, 0, 2));
       count++;
     }
     // The biome's ceiling includes EVERY preset its water rows can roll (and,
@@ -771,6 +682,138 @@ bool PackSculpt(const uint8_t* data, size_t n, std::vector<uint32_t>& block,
   return true;
 }
 
+// ---- locales (L1, worldmap.h LocaleDef) ----------------------------------------
+namespace {
+// A locale id names its ref group and its folder: the ref id alphabet.
+bool LocaleIdOk(const std::string& s) {
+  if (s.empty() || s.size() > 64) return false;
+  for (char c : s)
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
+  return true;
+}
+// map.json `locales` -> `out`, table order. False + `err` on a malformed entry
+// (a missing id / bounds / anchor, corners the wrong way round, a duplicate
+// id, a layer name that is a path): a half-read locale would put its refs at
+// a height nobody authored. Softer doubts go to `warn`.
+bool ParseLocales(const json& j, std::vector<LocaleDef>& out, std::string& err,
+                  std::vector<std::string>* warn) {
+  out.clear();
+  if (!j.contains("locales")) return true;
+  if (!j["locales"].is_array()) { err = "locales must be an array"; return false; }
+  auto pair = [](const json& o, const char* k, int& a, int& b) {
+    if (!o.contains(k) || !o[k].is_array() || o[k].size() != 2 || !o[k][0].is_number() || !o[k][1].is_number())
+      return false;
+    a = o[k][0].get<int>();
+    b = o[k][1].get<int>();
+    return true;
+  };
+  for (const json& l : j["locales"]) {
+    LocaleDef d;
+    if (!l.is_object() || !l.contains("id") || !l["id"].is_string()) { err = "a locale needs an \"id\""; return false; }
+    d.id = l["id"].get<std::string>();
+    const std::string who = "locale \"" + d.id + "\": ";
+    if (!LocaleIdOk(d.id)) { err = who + "the id is its ref group and folder name: [a-z0-9_-]+"; return false; }
+    for (const LocaleDef& o : out)
+      if (o.id == d.id) { err = who + "two locales with this id"; return false; }
+    d.name = l.value("name", d.id);
+    d.icon = l.value("icon", std::string());
+    const json b = l.contains("bounds") && l["bounds"].is_object() ? l["bounds"] : json::object();
+    if (!pair(b, "min", d.x0, d.z0) || !pair(b, "max", d.x1, d.z1)) {
+      err = who + "needs bounds {min: [x, z], max: [x, z]} in world voxels";
+      return false;
+    }
+    if (d.x1 < d.x0 || d.z1 < d.z0) { err = who + "bounds min is not below max on both axes"; return false; }
+    const json an = l.contains("anchor") && l["anchor"].is_object() ? l["anchor"] : json::object();
+    if (!pair(an, "at", d.ax, d.az) || !an.contains("y") || !an["y"].is_number()) {
+      err = who + "needs anchor {at: [x, z], y} (y = the authored ground at `at`)";
+      return false;
+    }
+    d.ay = an["y"].get<int>();
+    if (l.contains("editLayer")) {
+      if (!l["editLayer"].is_string()) { err = who + "editLayer must be a file name"; return false; }
+      d.editLayer = l["editLayer"].get<std::string>();
+      if (d.editLayer.size() > 7 && d.editLayer.compare(d.editLayer.size() - 7, 7, ".svedit") == 0)
+        d.editLayer.resize(d.editLayer.size() - 7);
+      if (d.editLayer.empty() || d.editLayer.find_first_of("/\\:.") != std::string::npos) {
+        err = who + "editLayer is a file name under locales/" + d.id + "/ (\"ground\"), not a path";
+        return false;
+      }
+    }
+    if (warn && (d.ax < d.x0 || d.ax > d.x1 || d.az < d.z0 || d.az > d.z1))
+      warn->push_back(who + "anchor (" + std::to_string(d.ax) + "," + std::to_string(d.az) +
+                      ") is outside its bounds; the locale rides the ground THERE");
+    out.push_back(std::move(d));
+  }
+  return true;
+}
+std::string LocaleLayerStem(const LocaleDef& l) { return l.editLayer.empty() ? std::string("ground") : l.editLayer; }
+}  // namespace
+
+bool ReadLocales(const std::string& assetDir, const std::string& mapName, std::vector<LocaleDef>& out,
+                 std::string& err) {
+  out.clear();
+  std::ifstream f(assetDir + "/worldmap/" + mapName + "/map.json");
+  if (!f) return true;
+  json j;
+  try { f >> j; } catch (const std::exception& e) {
+    err = "map.json does not parse: " + std::string(e.what());
+    return false;
+  }
+  return ParseLocales(j, out, err, nullptr);
+}
+
+std::map<std::string, int> LocaleRefYOffsets(const std::string& assetDir, const std::string& mapName,
+                                             std::vector<std::string>* warn) {
+  std::map<std::string, int> off;
+  std::vector<LocaleDef> ls;
+  std::string err;
+  if (!ReadLocales(assetDir, mapName, ls, err)) {
+    if (warn) warn->push_back("worldmap/" + mapName + "/map.json: " + err + " -- no locale offsets applied");
+    return off;
+  }
+  const WorldMapData& cur = CurrentWorldMap();
+  for (const LocaleDef& l : ls) {
+    const LocaleDef* live = nullptr;
+    if (cur.name == mapName)
+      for (const LocaleDef& c : cur.locales)
+        if (c.id == l.id && c.ay == l.ay && c.ax == l.ax && c.az == l.az && c.resolved) live = &c;
+    if (live) {
+      off[l.id] = live->RefYOffset();
+    } else {
+      off[l.id] = l.ay;
+      if (warn)
+        warn->push_back("locale \"" + l.id + "\": the world map '" + mapName +
+                        "' is not the loaded one, so its refs sit at their AUTHORED height (anchor y " +
+                        std::to_string(l.ay) + ", delta 0)");
+    }
+  }
+  return off;
+}
+
+std::vector<std::pair<std::string, std::string>> MapEditLayerFiles(const std::string& assetDir,
+                                                                   const std::string& mapName,
+                                                                   const std::string& editLayer,
+                                                                   const std::vector<LocaleDef>& locales) {
+  std::vector<std::pair<std::string, std::string>> out;
+  if (!editLayer.empty()) out.push_back({assetDir + "/worldedits/" + editLayer + ".svedit", editLayer + ".svedit"});
+  for (const LocaleDef& l : locales) {
+    const std::string stem = LocaleLayerStem(l);
+    const std::string p = assetDir + "/worldmap/" + mapName + "/locales/" + l.id + "/" + stem + ".svedit";
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(p, ec)) out.push_back({p, l.id + "/" + stem + ".svedit"});
+  }
+  return out;
+}
+
+uint32_t HashEditLayerFiles(const std::vector<std::pair<std::string, std::string>>& files) {
+  uint32_t h = 0;
+  for (size_t i = 0; i < files.size(); i++) {
+    const uint32_t x = sandvox::HashOneFile(files[i].first, files[i].second);
+    h = i == 0 ? x : (h * 16777619u) ^ x;
+  }
+  return h;
+}
+
 bool LoadWorldMap(const std::string& assetDir, const std::string& name,
                   const biomes::BiomeSet& set, size_t materialCount, uint32_t seed,
                   WorldMapData& out, std::string& log, const std::string* mapJson) {
@@ -798,6 +841,14 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     }
   }
   auto geti = [&](const char* k, int d) { return j.contains(k) && j[k].is_number() ? j[k].get<int>() : d; };
+  // MAP V2 ONLY (docs/PLAN_map_v2.md). A v1 map -- map.svmap's u8 landform
+  // plane, `cellLog2` / `size` / `originCell` -- is refused, naming the one
+  // tool that turns it into a v2 map, rather than half-read.
+  if (geti("version", 1) != 2) {
+    log += at + "map.json is a v1 map (no \"version\": 2); convert it with "
+                "`python scripts/convert_map_v2.py " + name + "` (docs/PLAN_map_v2.md)\n";
+    return false;
+  }
   out.name = name;
   // P7: the edit layer is the map's (was tuning.json world.editLayer). A bare
   // name: worldedit.cpp joins it under assets/worldedits/.
@@ -807,6 +858,25 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       log += at + "editLayer must be a bare layer name; ignored\n";
       out.editLayer.clear();
     }
+  }
+  // L1: the locales. Resolved (each anchor's bare ground for `seed`) at the
+  // site-pad bake below, once the planes, the sculpt layer and every site the
+  // bare ground reads are in place.
+  {
+    std::string lerr;
+    std::vector<std::string> lwarn;
+    if (!ParseLocales(j, out.locales, lerr, &lwarn)) {
+      log += at + lerr + "\n";
+      return false;
+    }
+    for (const std::string& w : lwarn) warn(w);
+    for (const LocaleDef& l : out.locales)
+      if (!l.editLayer.empty()) {
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(dir + "/locales/" + l.id + "/" + l.editLayer + ".svedit", ec))
+          warn("locale \"" + l.id + "\": editLayer locales/" + l.id + "/" + l.editLayer +
+               ".svedit does not exist; the locale has no edit layer");
+      }
   }
   // ---- terrain (P-G): the numbers that used to be worldgen.* --------------------
   // Every length is authored at `refVoxelsPerMetre` voxels to the metre and
@@ -825,7 +895,6 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     for (int r = ref; r > kVoxelsPerMetre; r /= 2) cellShift--;
     auto log2c = [&](const char* k, int d) { return std::clamp(num(k, d) + cellShift, 3, 15); };
     t.baseHeight = len("baseHeight", t.baseHeight);
-    t.landformRangeVox = len("landformRangeVox", t.landformRangeVox);
     t.rangeAmplitude = len("rangeAmplitude", t.rangeAmplitude);
     t.rangeLog2 = log2c("rangeLog2", t.rangeLog2);
     t.hillAmplitude = len("hillAmplitude", t.hillAmplitude);
@@ -837,12 +906,26 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     t.fbmAtten = std::clamp(num("fbmAtten", t.fbmAtten), 0, 256);
     const json ha = te.contains("homeArea") && te["homeArea"].is_object() ? te["homeArea"] : json::object();
     auto hnum = [&](const char* k, int d) { return ha.contains(k) && ha[k].is_number() ? ha[k].get<int>() : d; };
-    t.homeY = (hnum("y", t.homeY) * kVoxelsPerMetre) / ref;
+    // homeArea.y is not read (map v2 A1): the authored plane is the ground's
+    // height and the calm fade flattens only the noise. A map that still
+    // carries it gets a warning, not a refusal.
+    if (ha.contains("y")) warn("terrain.homeArea.y is ignored since map v2 (the height plane is the home ground)");
     t.homeR = std::max(0, (hnum("radius", t.homeR) * kVoxelsPerMetre) / ref);
     // A fade of 0 would divide by zero in landAt and make the home area's
     // boundary a STEP of the whole coarse relief (the terrain gate's A4).
     t.homeFade = std::max(1, (hnum("fade", t.homeFade) * kVoxelsPerMetre) / ref);
-    t.sedCeil = len("sedCeil", t.sedCeil);
+    // The wedge's ceiling is RELATIVE to the authored ground (map v2 A1):
+    // `sedAbove`. A map still written with the absolute v1 `sedCeil` is read
+    // as sedCeil - baseHeight -- v1's baseHeight was the mean ground the
+    // ceiling was tuned against (264 - 200 = 64, the shipped value) -- and
+    // warned about.
+    if (te.contains("sedAbove") && te["sedAbove"].is_number()) {
+      t.sedAbove = len("sedAbove", t.sedAbove);
+    } else if (te.contains("sedCeil") && te["sedCeil"].is_number()) {
+      t.sedAbove = len("sedCeil", 0) - t.baseHeight;
+      warn("terrain.sedCeil (absolute) read as sedAbove " + std::to_string(t.sedAbove) +
+           " (sedCeil - baseHeight); write sedAbove");
+    }
     t.sedFraction = std::max(0, num("sedFraction", t.sedFraction));
     t.sedStrip = std::max(0, len("sedStrip", t.sedStrip));
     t.sedSlope = std::max(0, num("sedSlope", t.sedSlope));
@@ -860,28 +943,117 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     }
     t.sedTopsoil = std::clamp(len("sedTopsoil", t.sedTopsoil), 0, t.sedMax);
     t.treeline = len("treeline", t.treeline);
+    t.treelineJitter = std::clamp(len("treelineJitter", t.treelineJitter), 0, kTreelineJitterMax);
+    t.rockSlope = std::max(0, num("rockSlope", t.rockSlope));
     TerrainWords(t, out.terrainWords);
   }
-  out.cellLog2 = geti("cellLog2", 10);
+  // Amplitudes past kNoiseAmpMax are clamped by TerrainWords (the octave's
+  // i32 bound); said here, where the map that asked for it is named.
+  for (const auto& [key, v] : {std::pair<const char*, int>{"rangeAmplitude", out.terrain.rangeAmplitude},
+                               {"hillAmplitude", out.terrain.hillAmplitude},
+                               {"detailAmplitude", out.terrain.detailAmplitude},
+                               {"grainAmplitude", out.terrain.grainAmplitude}})
+    if (v > kNoiseAmpMax)
+      warn(std::string("terrain.") + key + " " + std::to_string(v) + " clamped to " + std::to_string(kNoiseAmpMax) +
+           " voxels (the octave's overflow bound)");
+
+  // ---- the extent and the lattices (map v2) -----------------------------------
   out.seaLevelY = geti("seaLevelY", 0);
-  out.oceanFadeCells = geti("oceanFadeCells", 0);
   out.warpAmpVox = geti("warpAmpVox", 0);
-  if (j.contains("size") && j["size"].is_array() && j["size"].size() == 2) {
-    out.width = j["size"][0].get<int>(); out.height = j["size"][1].get<int>();
+  out.edgeFadeVox = geti("edgeFadeVox", 6144);
+  out.siteCellLog2 = geti("siteCellLog2", 10);
+  {
+    const json ex = j.contains("extent") && j["extent"].is_object() ? j["extent"] : json::object();
+    auto pair = [&](const char* k, int* a, int* b) -> bool {
+      if (!(ex.contains(k) && ex[k].is_array() && ex[k].size() == 2 && ex[k][0].is_number_integer() &&
+            ex[k][1].is_number_integer())) return false;
+      *a = ex[k][0].get<int>(); *b = ex[k][1].get<int>();
+      return true;
+    };
+    if (!pair("min", &out.extentX0, &out.extentZ0) || !pair("size", &out.extentW, &out.extentH)) {
+      log += at + "map.json needs extent.min[2] and extent.size[2] in world voxels\n"; return false;
+    }
   }
-  if (j.contains("originCell") && j["originCell"].is_array() && j["originCell"].size() == 2) {
-    out.originCellX = j["originCell"][0].get<int>(); out.originCellZ = j["originCell"][1].get<int>();
+  if (out.siteCellLog2 < 6 || out.siteCellLog2 > 14) {
+    log += at + "siteCellLog2 " + std::to_string(out.siteCellLog2) + " is outside 6..14\n"; return false;
   }
-  if (out.cellLog2 < 4 || out.cellLog2 > 14 || out.width <= 0 || out.height <= 0 ||
-      out.width > 4096 || out.height > 4096) {
-    log += at + "bad cellLog2/size\n"; return false;
+  const int siteVox = 1 << out.siteCellLog2;
+  // The extent's corners are site-cell corners, so the site plane, every
+  // finer plane and the extent tile each other exactly (floor division by a
+  // power of two is then a shift on both sides of the mirror).
+  if (out.extentW <= 0 || out.extentH <= 0 || out.extentW % siteVox || out.extentH % siteVox ||
+      out.extentX0 % siteVox || out.extentZ0 % siteVox) {
+    log += at + "extent min (" + std::to_string(out.extentX0) + "," + std::to_string(out.extentZ0) + ") size (" +
+           std::to_string(out.extentW) + "," + std::to_string(out.extentH) + ") must be positive multiples of the " +
+           std::to_string(siteVox) + "-voxel site cell (siteCellLog2)\n";
+    return false;
   }
-  // The warp must stay well inside a cell or a one-cell region pinches below
-  // the tree-tile width the shader's comments require (plan: <= cell/6).
-  const int cellVox = 1 << out.cellLog2;
-  if (out.warpAmpVox < 0 || out.warpAmpVox > cellVox / 4) {
-    log += at + "warpAmpVox " + std::to_string(out.warpAmpVox) + " exceeds cell/4 (" +
-           std::to_string(cellVox / 4) + ")\n";
+  if (static_cast<int64_t>(out.extentX0) + out.extentW > (int64_t(1) << 30) || out.extentX0 < -(1 << 30) ||
+      static_cast<int64_t>(out.extentZ0) + out.extentH > (int64_t(1) << 30) || out.extentZ0 < -(1 << 30)) {
+    log += at + "extent reaches past +-2^30 voxels\n"; return false;
+  }
+  out.siteW = out.extentW >> out.siteCellLog2;
+  out.siteH = out.extentH >> out.siteCellLog2;
+  out.siteOriginX = -(out.extentX0 >> out.siteCellLog2);
+  out.siteOriginZ = -(out.extentZ0 >> out.siteCellLog2);
+  if (out.siteW > 4096 || out.siteH > 4096) {
+    log += at + "the extent is " + std::to_string(out.siteW) + "x" + std::to_string(out.siteH) +
+           " site cells; at most 4096 a side\n";
+    return false;
+  }
+  if (out.edgeFadeVox < 64 || out.edgeFadeVox > 65536) {
+    // 65536: mapHeightAt's d * 32768 stays inside i32 for d < fade.
+    log += at + "edgeFadeVox " + std::to_string(out.edgeFadeVox) + " is outside 64..65536\n"; return false;
+  }
+  // The two planes' declarations. Their DATA is read after the palette.
+  const json pl = j.contains("planes") && j["planes"].is_object() ? j["planes"] : json::object();
+  const json ph = pl.contains("height") && pl["height"].is_object() ? pl["height"] : json::object();
+  const json pb = pl.contains("biome") && pl["biome"].is_object() ? pl["biome"] : json::object();
+  if (ph.empty() || pb.empty()) {
+    log += at + "map.json needs planes.height and planes.biome\n"; return false;
+  }
+  out.heightLog2 = ph.value("log2", 6);
+  out.biomeLog2 = pb.value("log2", 8);
+  out.heightDefault = ph.value("default", 0);
+  if (ph.value("tile", kTileSide) != kTileSide || pb.value("tile", kTileSide) != kTileSide) {
+    log += at + "planes.*.tile must be " + std::to_string(kTileSide) + "\n"; return false;
+  }
+  // 3..6: the Catmull-Rom's i32 bounds (worldgen.wgsl crStep) are argued for a
+  // post fraction under 64; and a post may not be coarser than a site cell.
+  if (out.heightLog2 < 3 || out.heightLog2 > 6 || out.heightLog2 > out.siteCellLog2) {
+    log += at + "planes.height.log2 " + std::to_string(out.heightLog2) + " is outside 3..6 (and <= siteCellLog2)\n";
+    return false;
+  }
+  if (out.biomeLog2 < 4 || out.biomeLog2 > out.siteCellLog2) {
+    log += at + "planes.biome.log2 " + std::to_string(out.biomeLog2) + " is outside 4..siteCellLog2\n"; return false;
+  }
+  if (std::abs(out.heightDefault) > kHeightLimit) {
+    log += at + "planes.height.default " + std::to_string(out.heightDefault) + " is outside +-" +
+           std::to_string(kHeightLimit) + "\n";
+    return false;
+  }
+  out.heightPostsX = (out.extentW >> out.heightLog2) + 1;
+  out.heightPostsZ = (out.extentH >> out.heightLog2) + 1;
+  out.biomePostsX = (out.extentW >> out.biomeLog2) + 1;
+  out.biomePostsZ = (out.extentH >> out.biomeLog2) + 1;
+  // THE 64 MiB CEILING (docs/PLAN_map_v2.md "GPU packing"): the planes are
+  // packed DENSE; a map past this needs a sparse GPU directory, which this
+  // loader does not have, so it says so instead of allocating.
+  {
+    const int64_t words = (int64_t(out.heightPostsX) * out.heightPostsZ + 1) / 2 +
+                          (int64_t(out.biomePostsX) * out.biomePostsZ + 3) / 4 + int64_t(out.siteW) * out.siteH;
+    if (out.heightPostsX > 4097 || out.heightPostsZ > 4097 || words * 4 > (int64_t(64) << 20)) {
+      log += at + "the planes need " + std::to_string(words * 4 / (1 << 20)) + " MiB dense (" +
+             std::to_string(out.heightPostsX) + "x" + std::to_string(out.heightPostsZ) +
+             " height posts); the ceiling is 64 MiB and 4097 posts a side without a sparse directory\n";
+      return false;
+    }
+  }
+  // The warp must stay well inside a biome cell or a one-cell region pinches
+  // below the tree-tile width the shader's comments require.
+  if (out.warpAmpVox < 0 || out.warpAmpVox > (1 << out.biomeLog2) / 4) {
+    log += at + "warpAmpVox " + std::to_string(out.warpAmpVox) + " exceeds the biome cell / 4 (" +
+           std::to_string((1 << out.biomeLog2) / 4) + ")\n";
     return false;
   }
 
@@ -902,8 +1074,16 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     out.palette.push_back(n);
     paletteId.push_back(static_cast<uint8_t>(it->second));
   }
-  auto oc = idOf.find("ocean");
-  out.oceanBiome = oc == idOf.end() ? 0 : oc->second;
+  int biomeDefaultIdx = -1;   // planes.biome.default as a palette index
+  {
+    const std::string bd = pb.value("default", std::string("ocean"));
+    for (size_t i = 0; i < out.palette.size(); i++)
+      if (out.palette[i] == bd) biomeDefaultIdx = static_cast<int>(i);
+    if (biomeDefaultIdx < 0) {
+      log += at + "planes.biome.default \"" + bd + "\" is not in the biomes[] palette\n"; return false;
+    }
+    out.biomeDefault = paletteId[static_cast<size_t>(biomeDefaultIdx)];
+  }
 
   // ---- stamp templates: one .vox load + pack per (template, rotation) --------
   // A missing template is a broken AUTHORED reference; refuse, the way a
@@ -954,7 +1134,7 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     return true;
   };
 
-  // ---- sites: the pad box, the spawn, stamps, lakes, landforms, trees ---------
+  // ---- sites: the pad box, the spawn, stamps, lakes, trees ---------------------
   bool havePad = false;
   if (j.contains("sites") && j["sites"].is_array()) {
     for (const json& s : j["sites"]) {
@@ -1025,25 +1205,11 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
         if (s.contains("radius") && s["radius"].is_number()) st.radius = std::max(st.radius, s["radius"].get<int>());
         out.sites.push_back(std::move(st));
       } else if (kind == "landform") {
-        // P-G: a DECLARED landform, Tier A. Overlaid onto the plane once the
-        // planes are read (below); never in the site table.
-        LandformSite ls;
-        ls.id = id;
-        ls.shape = s.value("shape", "peak");
-        if (ls.shape != "peak" && ls.shape != "ridge" && ls.shape != "basin" && ls.shape != "plateau") {
-          log += at + "site \"" + id + "\" kind landform: shape must be peak | ridge | basin | plateau, not \"" + ls.shape + "\"\n";
-          return false;
-        }
-        if (!(s.contains("at") && s["at"].is_array() && s["at"].size() == 2 &&
-              s["at"][0].is_number() && s["at"][1].is_number())) {
-          log += at + "site \"" + id + "\" kind landform needs at[2] in world voxels\n";
-          return false;
-        }
-        ls.x = s["at"][0].get<int>(); ls.z = s["at"][1].get<int>();
-        ls.radius = std::clamp(s.value("radius", 1024), 1, 1 << 20);
-        ls.heightVox = std::clamp(s.value("heightVox", 0), -100000, 100000);
-        ls.rotation = s.value("rotation", 0);
-        out.landformSites.push_back(std::move(ls));
+        // Map v1's declared landforms are gone (docs/PLAN_map_v2.md): the
+        // converter baked them into the height plane, and the World map page
+        // offers the shapes as stamps that WRITE the plane. Said, not refused.
+        warn("site \"" + id + "\": kind landform is a map v1 site; v2 bakes landforms into the height "
+             "plane (scripts/convert_map_v2.py, the map page's shape stamps) -- ignored");
       } else if (kind == "water") {
         // P-F: an AUTHORED LAKE. Tier A -- its centre is the map's, its
         // geometry the preset's (radius overridable, in world voxels), and it
@@ -1187,7 +1353,7 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
         out.sites.push_back(std::move(st));
       } else {
         warn("site \"" + id + "\": unknown kind \"" + kind +
-             "\" -- ignored (the loader knows spawn, pad, stamp, water, landform, tree, clearing, soften)");
+             "\" -- ignored (the loader knows spawn, pad, stamp, water, tree, clearing, soften)");
       }
     }
   }
@@ -1209,7 +1375,9 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     if (StructureOverrideActive()) {
       placements = *StructureOverrideSlot();
     } else {
-      structures::ReadPlacements(assetDir, name, placements, swarn);
+      // FILE y: a locale group's offset is not known until the planes are
+      // read (the pad bake below adds it).
+      structures::ReadPlacements(assetDir, name, placements, swarn, /*resolveLocales=*/false);
     }
     for (const std::string& w : swarn) warn(w);
     std::map<std::string, structures::Asset> assets;   // one load per base
@@ -1258,6 +1426,10 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       st.refPadApron = sp.padApron;
       st.salt = 0;
       st.padY = sp.y - 1;   // the AUTHORED floor: ground top is one below GRADE
+      // A locale's house: refY / padY are relative to its anchor until the
+      // pad bake adds the locale's offset.
+      for (size_t li = 0; li < out.locales.size(); li++)
+        if (out.locales[li].id == sp.group) st.locale = static_cast<int>(li);
       st.sink = f.sink;
       if (st.sink > static_cast<int>(kStampSinkMax)) {
         warn(who + "base: \"" + sp.base + "\" has " + std::to_string(st.sink) +
@@ -1349,48 +1521,98 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   // Rules are resolved after the planes are read (they need the biome plane);
   // see below.
 
-  // ---- map.svmap --------------------------------------------------------------
-  std::vector<uint8_t> raw;
+  // ---- the plane tiles (map v2): planes/<plane>/<tx>_<tz>.svt ------------------
+  // A v1 map.svmap still on disk is a half-converted map: refuse it rather than
+  // boot on planes nobody reads.
   {
-    std::ifstream f(dir + "/map.svmap", std::ios::binary);
-    if (!f) { log += at + "map.svmap not found\n"; return false; }
-    std::ostringstream ss; ss << f.rdbuf();
-    const std::string s = ss.str();
-    raw.assign(s.begin(), s.end());
-  }
-  const size_t cells = static_cast<size_t>(out.width) * out.height;
-  if (raw.size() < 16 + cells * 3) {
-    log += at + "map.svmap is " + std::to_string(raw.size()) + " bytes; expected " +
-           std::to_string(16 + cells * 3) + " for " + std::to_string(out.width) + "x" +
-           std::to_string(out.height) + "\n";
-    return false;
-  }
-  uint32_t magic, ver, w, h;
-  std::memcpy(&magic, raw.data(), 4); std::memcpy(&ver, raw.data() + 4, 4);
-  std::memcpy(&w, raw.data() + 8, 4); std::memcpy(&h, raw.data() + 12, 4);
-  if (magic != kMagic || ver != kVersion) { log += at + "map.svmap: bad magic/version\n"; return false; }
-  if (w != U(out.width) || h != U(out.height)) {
-    log += at + "map.svmap is " + std::to_string(w) + "x" + std::to_string(h) +
-           " but map.json says " + std::to_string(out.width) + "x" + std::to_string(out.height) + "\n";
-    return false;
-  }
-  out.biome.resize(cells); out.landform.resize(cells); out.moisture.resize(cells);
-  for (size_t i = 0; i < cells; i++) {
-    const uint8_t p = raw[16 + i];
-    if (p >= paletteId.size()) {
-      log += at + "biome plane byte " + std::to_string(p) + " at cell " + std::to_string(i) +
-             " is outside the palette (" + std::to_string(paletteId.size()) + " entries)\n";
+    std::error_code ec;
+    if (std::filesystem::exists(dir + "/map.svmap", ec)) {
+      log += at + "map.svmap is a map v1 plane file; a v2 map keeps its planes as tiles -- re-run "
+                  "`python scripts/convert_map_v2.py " + name + "` or delete the stale file\n";
       return false;
     }
-    out.biome[i] = paletteId[p];
   }
-  std::memcpy(out.landform.data(), raw.data() + 16 + cells, cells);
-  std::memcpy(out.moisture.data(), raw.data() + 16 + cells * 2, cells);
+  out.height.assign(static_cast<size_t>(out.heightPostsX) * out.heightPostsZ, static_cast<int16_t>(out.heightDefault));
+  out.biome.assign(static_cast<size_t>(out.biomePostsX) * out.biomePostsZ, static_cast<uint8_t>(out.biomeDefault));
+  // Every tile file read, in (plane, tz, tx) order: the content hash folds them
+  // in this order, so it is a pure function of the files whatever order the
+  // directory lists them in.
+  std::map<std::tuple<uint32_t, int, int>, std::vector<uint8_t>> tileBytes;
+  auto readPlane = [&](const char* plane, uint32_t kind, int postsX, int postsZ) -> bool {
+    const std::string pd = dir + "/planes/" + plane;
+    std::error_code ec;
+    if (!std::filesystem::is_directory(pd, ec)) return true;   // no tiles: every post is the default
+    for (const auto& de : std::filesystem::directory_iterator(pd, ec)) {
+      const std::string fn = de.path().filename().string();
+      if (de.path().extension() != ".svt") continue;
+      int tx = 0, tz = 0;
+      char tail = 0;
+      if (std::sscanf(fn.c_str(), "%d_%d.sv%c", &tx, &tz, &tail) != 3 || tail != 't') {
+        log += at + "planes/" + plane + "/" + fn + ": a tile is named <tx>_<tz>.svt\n";
+        return false;
+      }
+      std::ifstream f(de.path(), std::ios::binary);
+      std::ostringstream ss; ss << f.rdbuf();
+      const std::string raw = ss.str();
+      const uint32_t sb = kind == kPlaneHeight ? 2u : 1u;
+      const size_t need = kTileHeaderBytes + size_t(kTileSide) * kTileSide * sb;
+      auto rd = [&](size_t o) { uint32_t v; std::memcpy(&v, raw.data() + o, 4); return v; };
+      const std::string who = at + "planes/" + plane + "/" + fn + ": ";
+      if (raw.size() != need) {
+        log += who + std::to_string(raw.size()) + " bytes, a tile is " + std::to_string(need) + "\n"; return false;
+      }
+      if (rd(0) != kTileMagic || rd(4) != kind || static_cast<int>(rd(8)) != tx || static_cast<int>(rd(12)) != tz ||
+          rd(16) != U(kTileSide) || rd(20) != U(kTileSide) || rd(24) != sb) {
+        log += who + "header disagrees with its plane / name (magic 'SVT1', kind " + std::to_string(kind) +
+               ", tx " + std::to_string(tx) + ", tz " + std::to_string(tz) + ", " + std::to_string(kTileSide) +
+               "x" + std::to_string(kTileSide) + ", " + std::to_string(sb) + "-byte samples)\n";
+        return false;
+      }
+      if (tx < 0 || tz < 0 || tx * kTileSide >= postsX || tz * kTileSide >= postsZ) {
+        log += who + "lies outside the " + std::to_string(postsX) + "x" + std::to_string(postsZ) + "-post plane\n";
+        return false;
+      }
+      for (int k = 0; k < kTileSide; k++) {
+        const int pk = tz * kTileSide + k;
+        if (pk >= postsZ) break;
+        for (int i = 0; i < kTileSide; i++) {
+          const int pi = tx * kTileSide + i;
+          if (pi >= postsX) break;
+          const size_t so = kTileHeaderBytes + (size_t(k) * kTileSide + i) * sb;
+          const size_t di = size_t(pk) * postsX + pi;
+          if (kind == kPlaneHeight) {
+            int16_t v;
+            std::memcpy(&v, raw.data() + so, 2);
+            if (std::abs(static_cast<int>(v)) > kHeightLimit) {
+              log += who + "post (" + std::to_string(pi) + "," + std::to_string(pk) + ") height " + std::to_string(v) +
+                     " is outside +-" + std::to_string(kHeightLimit) + "\n";
+              return false;
+            }
+            out.height[di] = v;
+          } else {
+            const uint8_t p = static_cast<uint8_t>(raw[so]);
+            if (p >= paletteId.size()) {
+              log += who + "biome index " + std::to_string(p) + " at post (" + std::to_string(pi) + "," +
+                     std::to_string(pk) + ") is outside the palette (" + std::to_string(paletteId.size()) + " entries)\n";
+              return false;
+            }
+            out.biome[di] = paletteId[p];
+          }
+        }
+      }
+      (kind == kPlaneHeight ? out.heightTiles : out.biomeTiles)++;
+      tileBytes[{kind, tz, tx}] = std::vector<uint8_t>(raw.begin(), raw.end());
+    }
+    return true;
+  };
+  if (!readPlane("height", kPlaneHeight, out.heightPostsX, out.heightPostsZ) ||
+      !readPlane("biome", kPlaneBiome, out.biomePostsX, out.biomePostsZ))
+    return false;
   // ---- sculpt.svsculpt (P5): the sparse height-offset layer, optional --------
   // Read BEFORE the site-pad bake below: a pad's height is the sculpted ground
   // (BareGroundHeight runs the mirror, which reads out.sculpt). Absent = no
   // layer, and nothing downstream sees a difference; malformed = refuse, like
-  // a bad map.svmap -- a half-read layer would be a different world.
+  // a bad tile -- a half-read layer would be a different world.
   std::vector<uint8_t> sculptRaw;
   {
     std::ifstream f(dir + "/sculpt.svsculpt", std::ios::binary);
@@ -1407,17 +1629,15 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
                   out.sculpt.size());
     }
   }
-  // ---- the declared landforms, onto the painted plane (P-G) --------------------
-  // After the plane is read, before anything samples it. The shader and the
-  // CPU twin both read the OVERLAID plane and nothing else: a landform site
-  // exists at load and nowhere in the height mirror.
-  OverlayLandformSites(out.landformSites, out.terrain.landformRangeVox, out.cellLog2,
-                       out.width, out.height, out.originCellX, out.originCellZ, out.landform);
   // ---- each biome's terrain record for the CPU twin (worldmap.h kB_Curve*) ----
   out.biomeTerrain.assign(set.biomes.size(), {});
   for (const biomes::BiomeDef& b : set.biomes)
     if (b.index >= 0 && b.index < static_cast<int>(set.biomes.size()))
       out.biomeTerrain[static_cast<size_t>(b.index)] = PackBiomeTerrain(b);
+  out.biomeTreelineQ8.assign(set.biomes.size(), 256);
+  for (const biomes::BiomeDef& b : set.biomes)
+    if (b.index >= 0 && b.index < static_cast<int>(set.biomes.size()))
+      out.biomeTreelineQ8[static_cast<size_t>(b.index)] = BiomeTreelineQ8(b);
   out.biomeClimate.assign(set.biomes.size(), {});
   out.biomeName.assign(set.biomes.size(), std::string());
   for (const biomes::BiomeDef& b : set.biomes)
@@ -1431,11 +1651,15 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   // row. Tier B: takes the world seed (and the rule's salt), so every seed
   // puts them somewhere else, but the SAME seed puts them in the same
   // places on every machine -- integer arithmetic throughout, row-major
-  // cell order, greedy spacing against sites already placed (hand-placed
-  // sites first). Expected sites per cell = perKm2 * cellVox^2 / 1e8 (a km is
-  // 10,000 voxels at 0.1 m); the roll is `hash % 1e6 < that * 1e6`.
+  // SITE-cell order, greedy spacing against sites already placed (hand-placed
+  // sites first). Rolled once per SITE cell (siteCellLog2; map v2 -- the biome
+  // plane is finer, and a roll per biome cell would multiply every density by
+  // 16): expected sites per cell = perKm2 * cellVox^2 / 1e8 (a km is 10,000
+  // voxels at 0.1 m); the roll is `hash % 1e6 < that * 1e6`. The cell counts
+  // as the rule's biome when the biome CELL under its centre is (no warp).
+  // minSpacing is voxels and defaults to one site cell.
   if (j.contains("rules") && j["rules"].is_array()) {
-    const int cellVox = 1 << out.cellLog2;
+    const int cellVox = siteVox;
     for (const json& ru : j["rules"]) {
       if (!ru.is_object() || ru.value("kind", "") != "stamp") continue;
       const std::string tpl = ru.value("template", "");
@@ -1455,18 +1679,19 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       const uint32_t salt = static_cast<uint32_t>(ru.value("salt", 0));
       const std::string rid = ru.value("id", tpl);
       int placed = 0;
-      for (int cz = 0; cz < out.height; cz++)
-        for (int cx = 0; cx < out.width; cx++) {
-          const size_t i = static_cast<size_t>(cz) * out.width + cx;
-          if (out.biome[i] != static_cast<uint8_t>(bi->second)) continue;
+      for (int cz = 0; cz < out.siteH; cz++)
+        for (int cx = 0; cx < out.siteW; cx++) {
+          const int ccx = ((cx - out.siteOriginX) << out.siteCellLog2) + cellVox / 2;
+          const int ccz = ((cz - out.siteOriginZ) << out.siteCellLog2) + cellVox / 2;
+          if (out.BiomeCellAt(ccx, ccz) != static_cast<uint8_t>(bi->second)) continue;
           const uint32_t h = rng::Hash3(seed ^ salt ^ 0x51735u, static_cast<uint32_t>(cx),
                                         static_cast<uint32_t>(cz));
           if (h % 1000000u >= thr) continue;
           // the site: cell centre, jittered by up to a quarter cell
           const int jx = static_cast<int>((h >> 20) % static_cast<uint32_t>(cellVox / 2)) - cellVox / 4;
           const int jz = static_cast<int>((h >> 10) % static_cast<uint32_t>(cellVox / 2)) - cellVox / 4;
-          const int wx = ((cx - out.originCellX) << out.cellLog2) + cellVox / 2 + jx;
-          const int wz = ((cz - out.originCellZ) << out.cellLog2) + cellVox / 2 + jz;
+          const int wx = ccx + jx;
+          const int wz = ccz + jz;
           bool tooClose = false;
           for (const WorldMapData::StampSite& o : out.sites)
             if (o.kind != kSiteClearing &&   // a clearing's (x, z) is a corner, and it keeps nothing out
@@ -1486,6 +1711,200 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       std::printf("world map: rule '%s' placed %d x %s in %s\n", rid.c_str(), placed, tpl.c_str(), bname.c_str());
     }
   }
+
+  // ---- roads[] (map v2 R1, worldmap.h kSiteRoad) -------------------------------
+  // Read and validated here; the PIECES are cut twice: once now, a straight
+  // split of every polyline segment into <= kSiteRoadPieceMax runs (the
+  // geometry the bare ground's pond keep-out reads -- see sitePadNear), and
+  // again after the profile bake below, along the same lines, wherever a
+  // chord leaves the baked profile. Both cuts cover the same polylines, so the
+  // bare ground the bake samples is the same under either.
+  if (j.contains("roads")) {
+    if (!j["roads"].is_array()) { log += at + "roads must be an array\n"; return false; }
+    std::set<std::string> roadIds;
+    for (const json& r : j["roads"]) {
+      if (!r.is_object()) { log += at + "a roads[] entry that is not an object\n"; return false; }
+      WorldMapData::Road rd;
+      rd.id = r.value("id", std::string());
+      const std::string who = at + "road \"" + rd.id + "\": ";
+      if (rd.id.empty()) { log += at + "a roads[] entry needs an id\n"; return false; }
+      if (!roadIds.insert(rd.id).second) { log += who + "a second road with this id\n"; return false; }
+      rd.name = r.value("name", std::string());
+      rd.kind = r.value("kind", std::string("road"));
+      if (rd.kind != "road" && rd.kind != "track" && rd.kind != "path") {
+        log += who + "kind \"" + rd.kind + "\" is not road, track or path\n";
+        return false;
+      }
+      if (!r.contains("points") || !r["points"].is_array()) {
+        log += who + "needs points: [[x, z], ...] in world voxels\n";
+        return false;
+      }
+      for (const json& pt : r["points"]) {
+        if (!pt.is_array() || pt.size() != 2 || !pt[0].is_number() || !pt[1].is_number()) {
+          log += who + "a point that is not [x, z]\n";
+          return false;
+        }
+        const std::pair<int, int> q{static_cast<int>(std::lround(pt[0].get<double>())),
+                                    static_cast<int>(std::lround(pt[1].get<double>()))};
+        if (std::abs(q.first) > (1 << 24) || std::abs(q.second) > (1 << 24)) {
+          log += who + "a point past +-16M voxels\n";
+          return false;
+        }
+        if (!rd.points.empty() && rd.points.back() == q) continue;   // a repeated vertex is no segment
+        rd.points.push_back(q);
+      }
+      if (rd.points.size() < 2) { log += who + "needs at least two distinct points\n"; return false; }
+      // The numbers, each clamped with a warning (the map page's inspector
+      // keeps to these ranges; a hand edit may not). Defaults by kind.
+      auto num = [&](const char* key, int def, int lo, int hi) -> int {
+        int v = def;
+        if (r.contains(key) && r[key].is_number()) v = static_cast<int>(std::lround(r[key].get<double>()));
+        const int c = std::clamp(v, lo, hi);
+        if (c != v)
+          warn("road \"" + rd.id + "\": " + key + " " + std::to_string(v) + " clamped to " + std::to_string(c) +
+               " (" + std::to_string(lo) + ".." + std::to_string(hi) + ")");
+        return c;
+      };
+      const bool path = rd.kind == "path", track = rd.kind == "track";
+      rd.width = num("width", path ? 12 : track ? 24 : 40, 2, 256);
+      rd.shoulder = num("shoulder", path ? 6 : track ? 12 : 16, 0, static_cast<int>(kSiteRoadShoulderMax));
+      rd.maxGrade = num("maxGrade", path ? 25 : track ? 15 : 10, 1, 100);
+      rd.depth = num("depth", static_cast<int>(kSiteRoadDepthDefault), 1, static_cast<int>(kSiteRoadDepthMax));
+      rd.surface = r.value("surface", std::string("packed_earth"));
+      for (size_t i = 1; i < set.matNames.size(); i++)
+        if (set.matNames[i] == rd.surface) rd.surfaceId = static_cast<uint32_t>(i);
+      if (rd.surfaceId == 0) {
+        log += who + "surface \"" + rd.surface + "\" is not a material in materials.json\n";
+        return false;
+      }
+      // A SOLID, always: a graded road is a slope, and a powder on a slope
+      // avalanches out from under itself and never sleeps (CLAUDE.md rule 2).
+      if (set.matClass[rd.surfaceId] != CLASS_SOLID) {
+        log += who + "surface \"" + rd.surface + "\" is not a solid; a road on a grade needs one "
+               "(packed_gravel, packed_earth, cobble, flagstone, ...)\n";
+        return false;
+      }
+      for (const auto& [x, z] : rd.points)
+        if (!out.InExtent(x, z)) {
+          warn("road \"" + rd.id + "\": point (" + std::to_string(x) + "," + std::to_string(z) +
+               ") is outside the map's extent");
+          break;
+        }
+      out.roads.push_back(std::move(rd));
+    }
+  }
+  // ---- regions[] and markers[] (map v2 E3): data only ---------------------------
+  // Nothing in worldgen reads either (they still move contentHash: they are
+  // in map.json). A malformed SHAPE (no id, a duplicate id, a point that is
+  // not [x, z], a polygon of fewer than three distinct points, a marker
+  // without `at`) is a refusal naming the entry, like a road's -- a half-read
+  // region would answer RegionAt wrongly forever. A colour that is not
+  // "#rrggbb", an icon the page has no art for, a vertex outside the extent
+  // are warnings.
+  auto xzPair = [](const json& p, std::pair<int, int>& q) {
+    if (!p.is_array() || p.size() != 2 || !p[0].is_number() || !p[1].is_number()) return false;
+    const double a = p[0].get<double>(), b = p[1].get<double>();
+    if (std::abs(a) > (1 << 24) || std::abs(b) > (1 << 24)) return false;
+    q = {static_cast<int>(std::lround(a)), static_cast<int>(std::lround(b))};
+    return true;
+  };
+  if (j.contains("regions")) {
+    if (!j["regions"].is_array()) { log += at + "regions must be an array\n"; return false; }
+    std::set<std::string> ids;
+    for (const json& r : j["regions"]) {
+      if (!r.is_object() || !r.contains("id") || !r["id"].is_string() || r["id"].get<std::string>().empty()) {
+        log += at + "a regions[] entry needs an id\n";
+        return false;
+      }
+      WorldMapData::Region rg;
+      rg.id = r["id"].get<std::string>();
+      const std::string who = at + "region \"" + rg.id + "\": ";
+      if (!ids.insert(rg.id).second) { log += who + "a second region with this id\n"; return false; }
+      rg.name = r.contains("name") && r["name"].is_string() ? r["name"].get<std::string>() : std::string();
+      rg.colour = r.contains("colour") && r["colour"].is_string() ? r["colour"].get<std::string>() : std::string();
+      bool hex = rg.colour.size() == 7 && rg.colour[0] == '#';
+      for (size_t k = 1; hex && k < 7; k++) hex = std::isxdigit(static_cast<unsigned char>(rg.colour[k])) != 0;
+      if (!hex) warn("region \"" + rg.id + "\": colour \"" + rg.colour + "\" is not #rrggbb (the map page draws it grey)");
+      if (!r.contains("points") || !r["points"].is_array()) {
+        log += who + "needs points: [[x, z], ...] in world voxels\n";
+        return false;
+      }
+      for (const json& p : r["points"]) {
+        std::pair<int, int> q;
+        if (!xzPair(p, q)) { log += who + "a point that is not [x, z] within +-16M voxels\n"; return false; }
+        if (!rg.points.empty() && rg.points.back() == q) continue;
+        rg.points.push_back(q);
+      }
+      if (rg.points.size() > 1 && rg.points.front() == rg.points.back()) rg.points.pop_back();   // closed by hand
+      if (rg.points.size() < 3) { log += who + "a polygon needs at least three distinct points\n"; return false; }
+      rg.x0 = rg.x1 = rg.points[0].first;
+      rg.z0 = rg.z1 = rg.points[0].second;
+      bool outside = false;
+      for (const auto& [x, z] : rg.points) {
+        rg.x0 = std::min(rg.x0, x); rg.x1 = std::max(rg.x1, x);
+        rg.z0 = std::min(rg.z0, z); rg.z1 = std::max(rg.z1, z);
+        outside = outside || !out.InExtent(x, z);
+      }
+      if (outside) warn("region \"" + rg.id + "\": a vertex is outside the map's extent");
+      out.regions.push_back(std::move(rg));
+    }
+  }
+  if (j.contains("markers")) {
+    if (!j["markers"].is_array()) { log += at + "markers must be an array\n"; return false; }
+    std::set<std::string> ids;
+    for (const json& r : j["markers"]) {
+      if (!r.is_object() || !r.contains("id") || !r["id"].is_string() || r["id"].get<std::string>().empty()) {
+        log += at + "a markers[] entry needs an id\n";
+        return false;
+      }
+      WorldMapData::Marker mk;
+      mk.id = r["id"].get<std::string>();
+      const std::string who = at + "marker \"" + mk.id + "\": ";
+      if (!ids.insert(mk.id).second) { log += who + "a second marker with this id\n"; return false; }
+      std::pair<int, int> q;
+      if (!r.contains("at") || !xzPair(r["at"], q)) { log += who + "needs at: [x, z] in world voxels\n"; return false; }
+      mk.x = q.first;
+      mk.z = q.second;
+      mk.name = r.contains("name") && r["name"].is_string() ? r["name"].get<std::string>() : std::string();
+      mk.icon = r.contains("icon") && r["icon"].is_string() ? r["icon"].get<std::string>() : std::string();
+      bool known = false;
+      for (const char* ic : kMarkerIcons) known = known || mk.icon == ic;
+      if (!known) warn("marker \"" + mk.id + "\": icon \"" + mk.icon + "\" is not one the map page draws");
+      if (!out.InExtent(mk.x, mk.z)) warn("marker \"" + mk.id + "\": outside the map's extent");
+      out.markers.push_back(std::move(mk));
+    }
+  }
+  // The first cut: every segment in <= kSiteRoadPieceMax straight runs,
+  // appended at the END of `sites` (every road after every other kind, so a
+  // road's pieces never shift another site's id). Ends only; the bake below
+  // fills in the surface and replaces them.
+  const size_t roadSite0 = out.sites.size();
+  for (size_t ri = 0; ri < out.roads.size(); ri++) {
+    const WorldMapData::Road& rd = out.roads[ri];
+    for (size_t i = 0; i + 1 < rd.points.size(); i++) {
+      const auto [ax, az] = rd.points[i];
+      const auto [bx, bz] = rd.points[i + 1];
+      const int len = std::max(std::abs(bx - ax), std::abs(bz - az));
+      const int n = std::max(1, (len + static_cast<int>(kSiteRoadPieceMax) - 1) / static_cast<int>(kSiteRoadPieceMax));
+      for (int k = 0; k < n; k++) {
+        WorldMapData::StampSite st;
+        st.id = "road " + rd.id + " (uncut)";
+        st.kind = kSiteRoad;
+        st.road = static_cast<int>(ri);
+        st.x = ax + (bx - ax) * k / n;
+        st.z = az + (bz - az) * k / n;
+        st.x1 = ax + (bx - ax) * (k + 1) / n;
+        st.z1 = az + (bz - az) * (k + 1) / n;
+        st.radius = std::max(1, rd.width / 2);
+        st.padMargin = rd.shoulder;
+        st.roadMat = rd.surfaceId;
+        st.roadDepth = rd.depth;
+        st.salt = 0;
+        out.sites.push_back(std::move(st));
+      }
+    }
+  }
+  if (!out.roads.empty() && !readTreeSpecies()) return false;   // a road keeps crowns off: the widest one
 
   // ---- the site index: every cell a site's REACH touches lists the site ------
   // The reach is the widest thing any reader tests against the site (worldmap.h
@@ -1513,8 +1932,17 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     st.z1 = st.bz0 + std::max(st.nz, 1) - 1;
   }
   if (anyStamp && !readTreeSpecies()) return false;
+  // Built twice when the map has roads (once here, once after the profile
+  // bake re-cuts their pieces), so a lambda.
+  // A ROAD piece's reach: the half-width + the widest thing a reader asks
+  // from past it -- a rolled pond's centre (the fixed shoulder keep-out + a
+  // pond's radius, the 64 a stamp allows too), a trunk's crown, the far tint.
+  auto buildIndex = [&]() -> bool {
   for (WorldMapData::StampSite& st : out.sites) {
-    if (st.kind == kSiteTree) st.indexReach = st.radius + treeMaxReach;
+    if (st.kind == kSiteRoad)
+      st.indexReach = st.radius + std::max({static_cast<int>(kSiteRoadShoulderMax) + 64, treeMaxReach + 1,
+                                            static_cast<int>(kSiteRoadFarTint)}) + 1;
+    else if (st.kind == kSiteTree) st.indexReach = st.radius + treeMaxReach;
     else if (st.kind == kSiteClearing) st.indexReach = st.padMargin + treeMaxReach + 1;
     else if (st.kind == kSiteSoften) st.indexReach = st.padMargin + 1;
     else if (st.kind == kSitePath) st.indexReach = std::max(st.padMargin, static_cast<int>(kRouteSoftOuter)) + 1;
@@ -1530,7 +1958,7 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       // (a clearing / soften: min .. max; a stamp: its rect; a route: its two
       // ends in either order).
       int lx = st.x, lz = st.z, hx = st.x, hz = st.z;
-      if (st.kind == kSiteClearing || st.kind == kSiteSoften || st.kind == kSitePath) {
+      if (st.kind == kSiteClearing || st.kind == kSiteSoften || st.kind == kSitePath || st.kind == kSiteRoad) {
         lx = std::min(st.x, st.x1); hx = std::max(st.x, st.x1);
         lz = std::min(st.z, st.z1); hz = std::max(st.z, st.z1);
       } else if (st.kind == kSiteStamp) {
@@ -1539,23 +1967,25 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       int c0x, c0z, c1x, c1z;
       out.CellOf(lx - st.indexReach, lz - st.indexReach, &c0x, &c0z);
       out.CellOf(hx + st.indexReach, hz + st.indexReach, &c1x, &c1z);
-      for (int cz = std::max(c0z, 0); cz <= std::min(c1z, out.height - 1); cz++)
-        for (int cx = std::max(c0x, 0); cx <= std::min(c1x, out.width - 1); cx++)
-          byCell[static_cast<size_t>(cz) * out.width + cx].push_back(static_cast<uint32_t>(si + 1));
+      for (int cz = std::max(c0z, 0); cz <= std::min(c1z, out.siteH - 1); cz++)
+        for (int cx = std::max(c0x, 0); cx <= std::min(c1x, out.siteW - 1); cx++)
+          byCell[static_cast<size_t>(cz) * out.siteW + cx].push_back(static_cast<uint32_t>(si + 1));
     }
-    out.siteIndex.assign(cells, 0u);
+    out.siteIndex.assign(static_cast<size_t>(out.siteW) * out.siteH, 0u);
     out.siteLists.assign(1, 0u);   // offset 0 = "no site"
     std::map<std::vector<uint32_t>, uint32_t> shared;
+    out.siteCellWorst = 0;
     for (const auto& kv : byCell) {
       const std::vector<uint32_t>& ids = kv.second;
+      out.siteCellWorst = std::max(out.siteCellWorst, static_cast<int>(ids.size()));
       if (ids.size() > kSiteCellMax) {
-        const int cx = static_cast<int>(kv.first % static_cast<size_t>(out.width));
-        const int cz = static_cast<int>(kv.first / static_cast<size_t>(out.width));
+        const int cx = static_cast<int>(kv.first % static_cast<size_t>(out.siteW));
+        const int cz = static_cast<int>(kv.first / static_cast<size_t>(out.siteW));
         std::string names;
         for (uint32_t id : ids) names += (names.empty() ? "\"" : ", \"") + out.sites[id - 1].id + "\"";
         log += at + std::to_string(ids.size()) + " sites reach map cell (" + std::to_string(cx) + "," +
-               std::to_string(cz) + ") (world x " + std::to_string((cx - out.originCellX) << out.cellLog2) +
-               ", z " + std::to_string((cz - out.originCellZ) << out.cellLog2) + ", " + std::to_string(cellVox) +
+               std::to_string(cz) + ") (world x " + std::to_string((cx - out.siteOriginX) << out.siteCellLog2) +
+               ", z " + std::to_string((cz - out.siteOriginZ) << out.siteCellLog2) + ", " + std::to_string(siteVox) +
                " vox square): " + names + "; a cell holds at most " + std::to_string(kSiteCellMax) +
                " -- move one of them\n";
         return false;
@@ -1570,6 +2000,9 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       out.siteIndex[kv.first] = it->second;
     }
   }
+  return true;
+  };
+  if (!buildIndex()) return false;
 
   // ---- overlap warnings: two sites that claim the same ground ----------------
   // Each kind's FOOTPRINT as its readers test it (a stamp's pad square, a
@@ -1619,7 +2052,10 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       if (a.kind == kSiteStamp && b.kind == kSiteStamp) {
         const int64_t g = rectGap(a, b);
         if (g <= a.apron || g <= b.apron) return true;   // the flat cores themselves meet
-        if (a.structure && b.structure && a.padY == b.padY) return false;   // map stamps bake padY below
+        // (map stamps bake padY below; a locale's houses carry the locale's
+        // offset there too, so only two of ONE locale -- or of none -- are
+        // known to share a floor yet)
+        if (a.structure && b.structure && a.locale == b.locale && a.padY == b.padY) return false;
         return g - b.apron < a.apron + a.padMargin || g - a.apron < b.apron + b.padMargin;
       }
       return meets(fpOf(a, false), fpOf(b, false));
@@ -1637,7 +2073,9 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
           // A clearing claims no ground: it is MEANT to hold houses, lakes
           // and authored trees (two clearings overlapping is one bigger one).
           // Nor does softened ground or a route.
-          auto claimsNone = [](int k) { return k == kSiteClearing || k == kSiteSoften || k == kSitePath; };
+          auto claimsNone = [](int k) {
+            return k == kSiteClearing || k == kSiteSoften || k == kSitePath || k == kSiteRoad;
+          };
           if (claimsNone(sa.kind) || claimsNone(sb.kind)) continue;
           if (!clash(sa, sb)) continue;
           warn("site \"" + sa.id + "\" (" + kindName(sa.kind) + " at " + std::to_string(sa.x) + "," +
@@ -1658,7 +2096,7 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
                  "): the player starts in the open, not among trees");
           continue;
         }
-        if (s.kind == kSiteSoften || s.kind == kSitePath) continue;   // walkable ground, both
+        if (s.kind == kSiteSoften || s.kind == kSitePath || s.kind == kSiteRoad) continue;   // walkable ground, all
         const Fp f = fpOf(s, false);
         const Fp sp{false, out.spawnX, out.spawnZ, out.spawnX, out.spawnZ, 0};
         if (meets(f, sp))
@@ -1682,9 +2120,194 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     Slot() = out;
     for (WorldMapData::StampSite& st : out.sites) {
       if (st.structure) continue;   // the AUTHORED floor, set above (P4)
-      st.padY = st.kind == kSiteWater || st.kind == kSiteClearing || st.kind == kSiteSoften || st.kind == kSitePath
+      st.padY = st.kind == kSiteWater || st.kind == kSiteClearing || st.kind == kSiteSoften || st.kind == kSitePath ||
+                        st.kind == kSiteRoad
                     ? 0 : BareGroundHeight(st.x, st.z, seed);
     }
+    // THE LOCALES' ANCHORS (L1, worldmap.h LocaleDef): the bare ground at each
+    // anchor for this seed, and every house of the locale's ref group lifted
+    // by the locale's offset (anchor.y + delta) from its anchor-relative file
+    // y. Bare ground reads no pad, so the houses being in the table still at
+    // their relative floors does not matter; it does read the soften boxes
+    // and the routes, which are all in place.
+    for (LocaleDef& l : out.locales) {
+      l.groundY = BareGroundHeight(l.ax, l.az, seed);
+      l.resolved = true;
+      std::printf("world map: '%s' locale '%s' anchor (%d,%d): ground y%d, authored y%d, delta %+d\n",
+                  name.c_str(), l.id.c_str(), l.ax, l.az, l.groundY, l.ay, l.Delta());
+    }
+    for (WorldMapData::StampSite& st : out.sites) {
+      if (!st.structure || st.locale < 0) continue;
+      const int off = out.locales[static_cast<size_t>(st.locale)].RefYOffset();
+      st.padY += off;
+      st.refY += off;
+    }
+    // ---- THE ROAD PROFILES (map v2 R1, worldmap.h kSiteRoad) ------------------
+    // Per road, deterministic integer arithmetic on the BARE ground (no road
+    // and no pad in it: landColumnBare), sampled every kRoadStep voxels along
+    // the polyline. Low-passed (a moving mean over +-kRoadSmooth samples, 32
+    // voxels: a road does not follow the 3 m bumps),
+    // then GRADE-LIMITED: `lo` is the largest profile under the smoothed
+    // ground whose slope never exceeds maxGrade (a min-plus distance
+    // transform, forward then backward), `hi` the smallest one over it, and
+    // the road is (lo + hi) / 2 -- itself within maxGrade (the mean of two such
+    // profiles, +1 Q8 unit of rounding), cutting every bump and filling every
+    // dip by the same amount. Q8 voxels throughout.
+    // Then the pieces are RE-CUT along each segment: a chord is kept when the
+    // profile strays at most kRoadChordTolQ8 (one voxel) from it and it is <=
+    // 256 voxels a side -- a chord between two profile points is within
+    // maxGrade by construction, and a half-voxel tolerance cut rolling ground
+    // into ~60-voxel pieces (209 for 12 km of test network), which is what
+    // fills a village's site cell, else it is split at the sample farthest from it (the middle, when
+    // only the length is the problem). The re-cut lies on the first cut's
+    // lines to within the samples' integer rounding (a voxel), so the bare
+    // ground sampled here is the ground under the final pieces too.
+    if (!out.roads.empty()) {
+      constexpr int kRoadStep = 4, kRoadSmooth = 8, kRoadChordTolQ8 = 256;
+      std::vector<WorldMapData::StampSite> cut;
+      for (size_t ri = 0; ri < out.roads.size(); ri++) {
+        WorldMapData::Road& rd = out.roads[ri];
+        std::vector<int> sx, sz, ss, vtx;   // sample x, z, arc length (voxels); each vertex's sample
+        int arc = 0;
+        for (size_t i = 0; i + 1 < rd.points.size(); i++) {
+          const auto [ax, az] = rd.points[i];
+          const auto [bx, bz] = rd.points[i + 1];
+          const int64_t dx = bx - ax, dz = bz - az;
+          const int len = std::max(1, static_cast<int>(std::llround(std::sqrt(static_cast<double>(dx * dx + dz * dz)))));
+          const int n = std::max(1, (len + kRoadStep - 1) / kRoadStep);
+          vtx.push_back(static_cast<int>(sx.size()));
+          for (int k = 0; k < n; k++) {
+            sx.push_back(ax + static_cast<int>(dx * k / n));
+            sz.push_back(az + static_cast<int>(dz * k / n));
+            ss.push_back(arc + len * k / n);
+          }
+          arc += len;
+        }
+        vtx.push_back(static_cast<int>(sx.size()));
+        sx.push_back(rd.points.back().first);
+        sz.push_back(rd.points.back().second);
+        ss.push_back(arc);
+        const int N = static_cast<int>(sx.size());
+        std::vector<int> g(N), sm(N), pr(N);
+        for (int i = 0; i < N; i++) g[i] = BareGroundHeight(sx[i], sz[i], seed) * 256;
+        for (int i = 0; i < N; i++) {
+          int64_t sum = 0;
+          int cnt = 0;
+          for (int k = std::max(0, i - kRoadSmooth); k <= std::min(N - 1, i + kRoadSmooth); k++) { sum += g[k]; cnt++; }
+          sm[i] = static_cast<int>(sum / cnt);
+        }
+        // The grade allowance between samples i - 1 and i, Q8 voxels:
+        // maxGrade percent of the arc between them (i64: <= 100 * 256 * arc).
+        auto allow = [&](int i) {
+          return static_cast<int>(static_cast<int64_t>(ss[i] - ss[i - 1]) * rd.maxGrade * 256 / 100);
+        };
+        std::vector<int> lo = sm, hi = sm;
+        for (int i = 1; i < N; i++) {
+          lo[i] = std::min(lo[i], lo[i - 1] + allow(i));
+          hi[i] = std::max(hi[i], hi[i - 1] - allow(i));
+        }
+        for (int i = N - 2; i >= 0; i--) {
+          lo[i] = std::min(lo[i], lo[i + 1] + allow(i + 1));
+          hi[i] = std::max(hi[i], hi[i + 1] - allow(i + 1));
+        }
+        for (int i = 0; i < N; i++) pr[i] = static_cast<int>((static_cast<int64_t>(lo[i]) + hi[i]) >> 1);
+        rd.vertexY.clear();
+        rd.vertexGround.clear();
+        for (int vi : vtx) {
+          rd.vertexY.push_back((pr[vi] + 128) >> 8);
+          rd.vertexGround.push_back(g[vi] >> 8);
+        }
+        // The reported profile: every k-th sample, the last always (map page).
+        rd.profS.clear(); rd.profY.clear(); rd.profG.clear();
+        const int pk = std::max(1, (N + kRoadProfileMax - 2) / (kRoadProfileMax - 1));
+        for (int i = 0; i < N; i += pk) {
+          rd.profS.push_back(ss[i]); rd.profY.push_back((pr[i] + 128) >> 8); rd.profG.push_back(g[i] >> 8);
+        }
+        if ((N - 1) % pk != 0) {
+          rd.profS.push_back(ss[N - 1]); rd.profY.push_back((pr[N - 1] + 128) >> 8); rd.profG.push_back(g[N - 1] >> 8);
+        }
+        // The pieces, segment by segment (a vertex always ends a piece).
+        int q = 0;
+        rd.worstGradeQ8 = 0;
+        for (size_t v = 0; v + 1 < vtx.size(); v++) {
+          std::vector<std::pair<int, int>> stack{{vtx[v], vtx[v + 1]}}, done;
+          while (!stack.empty()) {
+            const auto [a, b] = stack.back();
+            stack.pop_back();
+            int farK = -1, dev = 0;
+            for (int k = a + 1; k < b; k++) {
+              const int64_t lin = pr[a] + static_cast<int64_t>(pr[b] - pr[a]) * (ss[k] - ss[a]) / std::max(ss[b] - ss[a], 1);
+              const int d = static_cast<int>(std::llabs(pr[k] - lin));
+              if (d > dev) { dev = d; farK = k; }
+            }
+            const bool tooLong =
+                std::max(std::abs(sx[b] - sx[a]), std::abs(sz[b] - sz[a])) > static_cast<int>(kSiteRoadPieceMax);
+            if (b - a > 1 && (tooLong || dev > kRoadChordTolQ8)) {
+              const int m = (dev <= kRoadChordTolQ8 || farK < 0) ? (a + b) / 2 : farK;
+              stack.push_back({m, b});   // popped second: the pieces come out in order
+              stack.push_back({a, m});
+              continue;
+            }
+            done.push_back({a, b});
+          }
+          // One SHOULDER per segment (the widest its pieces need) and the
+          // joints between them OPEN: the pieces of one straight are then
+          // one road to the height blend, with no cap and no step in the
+          // shoulder where one piece hands over to the next.
+          int segShoulder = rd.shoulder;
+          const size_t seg0 = cut.size();
+          for (size_t pi = 0; pi < done.size(); pi++) {
+            const auto [a, b] = done[pi];
+            WorldMapData::StampSite st;
+            st.id = "road " + rd.id + " #" + std::to_string(++q);
+            st.kind = kSiteRoad;
+            st.road = static_cast<int>(ri);
+            st.x = sx[a]; st.z = sz[a]; st.x1 = sx[b]; st.z1 = sz[b];
+            st.radius = std::max(1, rd.width / 2);
+            st.padMargin = rd.shoulder;
+            st.roadYA = pr[a]; st.roadYB = pr[b];
+            st.roadMat = rd.surfaceId;
+            st.roadDepth = rd.depth;
+            st.salt = 0;
+            const int arcAB = std::max(ss[b] - ss[a], 1);
+            rd.worstGradeQ8 = std::max(
+                rd.worstGradeQ8, static_cast<int>(std::llabs(static_cast<int64_t>(pr[b] - pr[a])) * 100 / arcAB));
+            // A CUT OR A FILL NEVER STEPS MORE THAN A VOXEL A COLUMN: the
+            // shoulder widens to twice the largest gap between the road and
+            // the bare ground at its outer edge (+2), up to
+            // kSiteRoadShoulderMax -- a stamp's ramp rule. Probed every 8
+            // voxels along the piece, both sides, at the authored edge.
+            const double vx = st.x1 - st.x, vz = st.z1 - st.z;
+            const double vl = std::max(std::sqrt(vx * vx + vz * vz), 1.0);
+            const double off = st.radius + std::max(st.padMargin, 1);
+            int gap = 0;
+            const int steps = std::max(1, static_cast<int>(vl) / 8);
+            for (int k = 0; k <= steps; k++) {
+              const double f = static_cast<double>(k) / steps;
+              const int y = (st.roadYA + static_cast<int>(static_cast<int64_t>(st.roadYB - st.roadYA) * k / steps) + 128) >> 8;
+              for (int side = -1; side <= 1; side += 2) {
+                const int px = static_cast<int>(std::lround(st.x + vx * f - side * vz / vl * off));
+                const int pz = static_cast<int>(std::lround(st.z + vz * f + side * vx / vl * off));
+                gap = std::max(gap, std::abs(BareGroundHeight(px, pz, seed) - y));
+              }
+            }
+            segShoulder = std::max(segShoulder, std::min(static_cast<int>(kSiteRoadShoulderMax), 2 * gap + 2));
+            st.roadFlags = (pi > 0 ? 1 : 0) | (pi + 1 < done.size() ? 2 : 0);
+            cut.push_back(std::move(st));
+          }
+          for (size_t pi = seg0; pi < cut.size(); pi++) cut[pi].padMargin = segShoulder;
+        }
+        rd.pieces = q;
+      }
+      out.sites.resize(roadSite0);
+      for (WorldMapData::StampSite& st : cut) out.sites.push_back(std::move(st));
+      if (!buildIndex()) {
+        Slot() = std::move(prev);
+        return false;
+      }
+      Slot() = out;   // the stamp ramps below read the re-cut map (the same bare ground)
+    }
+
     // A RAMP NEVER STEPS MORE THAN A VOXEL (2026-09-29). The smoothstep's
     // steepest point is 1.5 x the height it makes up over the margin, so a
     // pad cut into a hillside, or raised off a hollow, by more than the
@@ -1714,21 +2337,34 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       }
       if (need > st.padMargin) st.padMargin = need;
     }
+    // A tree at or above ITS COLUMN'S treeline does not grow (worldgen.wgsl
+    // siteTree). Said, not refused: the author may be about to lower the
+    // ground under it. TreelineAt reads the current map, so it is asked here,
+    // with the map being loaded installed.
+    for (const WorldMapData::StampSite& st : out.sites) {
+      if (st.kind != kSiteTree) continue;
+      const int tl = TreelineAt(st.x, st.z, seed);
+      if (st.padY >= tl)
+        warn("site \"" + st.id + "\" (tree) stands on ground y" + std::to_string(st.padY) +
+             ", at or above its column's treeline y" + std::to_string(tl) + ": it will not grow");
+    }
     Slot() = std::move(prev);
   }
-  // A tree at or above the treeline does not grow (worldgen.wgsl siteTree:
-  // treeMaxTop() is the world-wide bound the sky skips rely on). Said, not
-  // refused: the author may be about to lower the ground under it.
-  for (const WorldMapData::StampSite& st : out.sites)
-    if (st.kind == kSiteTree && st.padY >= out.terrain.treeline)
-      warn("site \"" + st.id + "\" (tree) stands on ground y" + std::to_string(st.padY) +
-           ", at or above the treeline y" + std::to_string(out.terrain.treeline) + ": it will not grow");
 
+  // THE CONTENT HASH: map.json, then every tile file in (plane, tz, tx) order
+  // (name + bytes, so moving a tile is a change), then the sculpt layer and
+  // the structure refs. biomes.cpp's environment stamp and the save
+  // fingerprint hash the same files from disk.
   uint32_t hsh = 2166136261u;
-  hsh = FnvBytes(hsh, raw.data(), raw.size());
   {
     const std::string js = j.dump();
     hsh = FnvBytes(hsh, reinterpret_cast<const uint8_t*>(js.data()), js.size());
+  }
+  for (const auto& [key, bytes] : tileBytes) {
+    const std::string tn = std::to_string(std::get<0>(key)) + ":" + std::to_string(std::get<2>(key)) + "_" +
+                           std::to_string(std::get<1>(key));
+    hsh = FnvBytes(hsh, reinterpret_cast<const uint8_t*>(tn.data()), tn.size());
+    hsh = FnvBytes(hsh, bytes.data(), bytes.size());
   }
   // Only when the file exists, so a map without one reports what it did.
   if (!sculptRaw.empty()) hsh = FnvBytes(hsh, sculptRaw.data(), sculptRaw.size());
@@ -1760,7 +2396,53 @@ std::string MapCheckJson(const std::string& name, bool ok, const WorldMapData& m
   }
   j["softens"] = nSoft;
   j["routes"] = nRoute;
+  // L1: each locale as resolved for the check's seed -- how far the ground at
+  // its anchor has moved since it was authored (the locale page shows it).
+  json ls = json::array();
+  for (const LocaleDef& l : m.locales)
+    ls.push_back({{"id", l.id}, {"groundY", l.groundY}, {"anchorY", l.ay}, {"delta", l.Delta()}});
+  j["locales"] = ls;
   j["siteCellMax"] = static_cast<int>(kSiteCellMax);
+  j["siteCellWorst"] = m.siteCellWorst;
+  // Map v2 R1: each road as the engine baked it -- the map page's profile
+  // preview draws vertexY (the surface) against vertexGround (the bare
+  // ground) at each polyline vertex, the engine's numbers, not a JS re-bake.
+  json roads = json::array();
+  for (const WorldMapData::Road& r : m.roads) {
+    json rj;
+    rj["id"] = r.id;
+    rj["kind"] = r.kind;
+    rj["surface"] = r.surface;
+    rj["width"] = r.width;
+    rj["shoulder"] = r.shoulder;
+    rj["maxGrade"] = r.maxGrade;
+    rj["depth"] = r.depth;
+    rj["pieces"] = r.pieces;
+    rj["worstGrade"] = r.worstGradeQ8 / 256.0;
+    rj["vertexY"] = r.vertexY;
+    rj["vertexGround"] = r.vertexGround;
+    // E3: the whole baked profile (decimated), so the chart is the bake's
+    // own curve between the vertices, not a JS guess at it.
+    rj["profile"] = {{"s", r.profS}, {"y", r.profY}, {"ground", r.profG}};
+    roads.push_back(rj);
+  }
+  j["roads"] = roads;
+  // E3: the regions and markers as the loader accepted them.
+  json rs = json::array();
+  for (const WorldMapData::Region& r : m.regions)
+    rs.push_back({{"id", r.id}, {"name", r.name}, {"points", static_cast<int>(r.points.size())},
+                  {"bbox", {r.x0, r.z0, r.x1, r.z1}}});
+  j["regions"] = rs;
+  json ms = json::array();
+  for (const WorldMapData::Marker& k : m.markers)
+    ms.push_back({{"id", k.id}, {"icon", k.icon}, {"at", {k.x, k.z}}});
+  j["markers"] = ms;
+  // Map v2: the extent and what the planes hold (authored tiles; the rest
+  // are the planes' defaults).
+  j["extent"] = {m.extentX0, m.extentZ0, m.extentW, m.extentH};
+  j["heightPosts"] = {m.heightPostsX, m.heightPostsZ};
+  j["heightTiles"] = m.heightTiles;
+  j["biomeTiles"] = m.biomeTiles;
   j["warnings"] = m.warnings;
   j["error"] = error;
   return j.dump();
@@ -1777,31 +2459,50 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
   // The terrain words likewise (P-G): an unloaded map carries the defaults,
   // and the twin reads WorldMapData's copy of the same words either way.
   for (uint32_t k = 0; k < kTerrainWords; k++) W[kHTerrainBaseHeight + k] = map.terrainWords[k];
+  W[kHTreelineMax] = U(TreelineMaxOf(map));
   if (!map.Loaded()) return true;   // P0/P1 tools: records only, planes absent
-  W[kHCellLog2] = U(map.cellLog2);
-  W[kHWidth] = U(map.width);
-  W[kHHeight] = U(map.height);
-  W[kHOriginX] = U(map.originCellX);
-  W[kHOriginZ] = U(map.originCellZ);
+  W[kHSiteCellLog2] = U(map.siteCellLog2);
+  W[kHSiteW] = U(map.siteW);
+  W[kHSiteH] = U(map.siteH);
+  W[kHSiteOriginX] = U(map.siteOriginX);
+  W[kHSiteOriginZ] = U(map.siteOriginZ);
   W[kHSeaLevelY] = U(map.seaLevelY);
-  W[kHOceanFade] = U(map.oceanFadeCells);
+  W[kHEdgeFade] = U(map.edgeFadeVox);
   W[kHWarpAmp] = U(map.warpAmpVox);
-  W[kHOceanBiome] = U(map.oceanBiome);
+  W[kHBiomeDefault] = U(map.biomeDefault);
   W[kHPadX0] = U(map.padX0);
   W[kHPadZ0] = U(map.padZ0);
   W[kHPadX1] = U(map.padX1);
   W[kHPadZ1] = U(map.padZ1);
+  W[kHExtentX0] = U(map.extentX0);
+  W[kHExtentZ0] = U(map.extentZ0);
+  W[kHExtentW] = U(map.extentW);
+  W[kHExtentH] = U(map.extentH);
+  W[kHHeightLog2] = U(map.heightLog2);
+  W[kHHeightPostsX] = U(map.heightPostsX);
+  W[kHHeightPostsZ] = U(map.heightPostsZ);
+  W[kHHeightDefault] = U(map.heightDefault);
+  W[kHBiomeLog2] = U(map.biomeLog2);
+  W[kHBiomePostsX] = U(map.biomePostsX);
+  W[kHBiomePostsZ] = U(map.biomePostsZ);
+  // The planes, DENSE (docs/PLAN_map_v2.md "GPU packing"; the loader refused
+  // anything past 64 MiB): biome ids four per word, height posts two i16 per
+  // word, low half first -- the sculpt block's packing, read by the same
+  // sign-extending shift (worldgen.wgsl wmHeightPost).
   W[kHBiomePlane] = U(static_cast<int>(W.size()));
   AppendPlane(W, map.biome);
-  W[kHLandformPlane] = U(static_cast<int>(W.size()));
-  AppendPlane(W, map.landform);
-  W[kHMoisturePlane] = U(static_cast<int>(W.size()));
-  AppendPlane(W, map.moisture);
+  W[kHHeightPlane] = U(static_cast<int>(W.size()));
+  {
+    const size_t at = W.size();
+    W.resize(at + (map.height.size() + 1) / 2, 0u);
+    for (size_t i = 0; i < map.height.size(); i++)
+      W[at + (i >> 1)] |= (static_cast<uint32_t>(static_cast<uint16_t>(map.height[i]))) << ((i & 1) * 16);
+  }
   // ---- sites: the index plane + lists, the records, then each stamp block ----
   // One word per cell (the list's buffer offset, 0 = none), then the shared
   // lists. No sites at all packs no plane: kHSiteIndex stays 0 and every
   // reader's list walk ends at its first read.
-  if (!map.sites.empty() && map.siteIndex.size() == static_cast<size_t>(map.width) * map.height) {
+  if (!map.sites.empty() && map.siteIndex.size() == static_cast<size_t>(map.siteW) * map.siteH) {
     const size_t plane0 = W.size();
     W[kHSiteIndex] = U(static_cast<int>(plane0));
     W.resize(plane0 + map.siteIndex.size(), 0u);
@@ -1834,6 +2535,13 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
       r[kS_SoftHill] = U(s.softHill); r[kS_SoftBump] = U(s.softBump); r[kS_SoftGrain] = U(s.softGrain);
       r[kS_SoftPath] = U(s.softPath);
     }
+    if (s.kind == kSiteRoad) {
+      r[kS_BoxX1] = U(s.x1); r[kS_BoxZ1] = U(s.z1);
+      r[kS_RoadYA] = U(s.roadYA); r[kS_RoadYB] = U(s.roadYB);
+      r[kS_RoadMat] = s.roadMat;
+      r[kS_RoadDepth] = U(s.roadDepth);
+      r[kS_RoadFlags] = U(s.roadFlags);
+    }
     if (s.kind == kSiteStamp) {
       r[kS_BoxX0] = U(s.bx0); r[kS_BoxZ0] = U(s.bz0);
       r[kS_BoxX1] = U(s.x1); r[kS_BoxZ1] = U(s.z1);
@@ -1859,10 +2567,12 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
   }
   W[kHContentHash] = 0u;
   W[kHContentHash] = FnvWords(W) ^ map.contentHash;
-  std::printf("world map: '%s' %dx%d cells of %d vox, origin cell (%d,%d), %zu palette, "
-              "content %08x\n",
-              map.name.c_str(), map.width, map.height, 1 << map.cellLog2,
-              map.originCellX, map.originCellZ, map.palette.size(), W[kHContentHash]);
+  std::printf("world map: '%s' extent (%d,%d)+(%d,%d), height %dx%d posts @%d vox (%d tiles), "
+              "biome %dx%d @%d vox (%d tiles), %zu palette, buffer %.1f MiB, content %08x\n",
+              map.name.c_str(), map.extentX0, map.extentZ0, map.extentW, map.extentH, map.heightPostsX,
+              map.heightPostsZ, 1 << map.heightLog2, map.heightTiles, map.biomePostsX, map.biomePostsZ,
+              1 << map.biomeLog2, map.biomeTiles, map.palette.size(), W.size() * 4.0 / (1 << 20),
+              W[kHContentHash]);
   return true;
 }
 
@@ -1887,6 +2597,36 @@ const std::vector<StructurePlacement>* StructureOverrideSlot() {
 
 const WorldMapData& CurrentWorldMap() { return Slot(); }
 void SetCurrentWorldMap(WorldMapData map) { Slot() = std::move(map); }
+
+const WorldMapData::Region* WorldMapData::RegionAt(int x, int z) const {
+  // Even-odd crossing test at the column CENTRE (x + 1/2, z + 1/2), in
+  // doubled coordinates so it stays integer: a ray toward +x crosses edge
+  // (a, b) when the edge straddles the centre's z (half-open, so a vertex is
+  // counted once) and the crossing lies right of the centre. i64: every
+  // coordinate is within +-2^25 doubled, products within 2^52.
+  const int64_t px = 2 * static_cast<int64_t>(x) + 1, pz = 2 * static_cast<int64_t>(z) + 1;
+  for (size_t ri = regions.size(); ri-- > 0;) {
+    const Region& r = regions[ri];
+    if (x < r.x0 || x > r.x1 || z < r.z0 || z > r.z1) continue;
+    bool in = false;
+    const size_t n = r.points.size();
+    for (size_t i = 0, k = n - 1; i < n; k = i++) {
+      const int64_t ax = 2 * static_cast<int64_t>(r.points[k].first), az = 2 * static_cast<int64_t>(r.points[k].second);
+      const int64_t bx = 2 * static_cast<int64_t>(r.points[i].first), bz = 2 * static_cast<int64_t>(r.points[i].second);
+      if ((az > pz) == (bz > pz)) continue;
+      // crossing x = ax + (pz - az) * (bx - ax) / (bz - az) > px, without the division
+      const int64_t lhs = (pz - az) * (bx - ax), rhs = (px - ax) * (bz - az);
+      if (bz > az ? lhs > rhs : lhs < rhs) in = !in;
+    }
+    if (in) return &r;
+  }
+  return nullptr;
+}
+
+std::string RegionAt(int x, int z) {
+  const WorldMapData::Region* r = CurrentWorldMap().RegionAt(x, z);
+  return r ? (r->name.empty() ? r->id : r->name) : std::string();
+}
 
 namespace {
 std::string& MapOverrideSlot() {

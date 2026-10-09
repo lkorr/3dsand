@@ -228,10 +228,11 @@ uint64_t TerrKey(const Tuning& t, uint32_t seed) {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
   f.Bytes(m.name.data(), m.name.size());
   f.I(m.seaLevelY);
-  f.I(m.width);
-  f.I(m.height);
-  f.I(m.originCellX);
-  f.I(m.originCellZ);
+  f.I(m.extentX0);
+  f.I(m.extentZ0);
+  f.I(m.extentW);
+  f.I(m.extentH);
+  f.I(static_cast<int>(m.contentHash));
   f.F(t.wind.tpiRadius);
   f.F(t.wind.tpiScale);
   f.F(t.wind.seaRadius);

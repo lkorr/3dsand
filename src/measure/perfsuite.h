@@ -169,4 +169,26 @@ void RefillFarAround(GpuContext& ctx, World& world, Simulation& sim,
 // The fine chunk at the residency window's centre (origin + kNChunk/2).
 IVec3 WindowCentreChunk(const World& world);
 
+// ---- THE PEAKS VIEWS (map v2 H1: the far horizon + the height fog) ----------
+// The three cameras on the `peaks` test map (assets/worldmap/peaks/,
+// scripts/gen_map_peaks.py) that --shot's screenshot_peaks_* frames and the
+// --render-budget `summit` camera share: placed EXPLICITLY (ground asked of
+// World::TerrainHeight on the loaded map, eye 1.7 m over it or over the sea),
+// never at the spawn, so they do not depend on the boot window's Y.
+//   0 valley  the high valley floor by the spawn, looking ENE at the massif
+//   1 summit  on the 1,400 m summit, looking SW over the range to the coast
+//   2 sea10k  3 m over the sea 10 km south of the summit (past the map's own
+//             coast: the map is 8 km across), looking north at the massif --
+//             the only one where the massif itself is past the cascades
+struct PeaksPose {
+  float ex = 0, ey = 0, ez = 0, yaw = 0, pitch = 0;
+  const char* what = "";
+};
+PeaksPose PeaksPoseOf(int which);
+// Replace the loaded environment with map `name` (worldmap::SetMapOverride +
+// ReloadEnvironment) and report the map it replaced in `prev`. false + `why`
+// when it did not load (nothing is replaced then).
+bool SwitchMap(GpuContext& ctx, Simulation& sim, const std::vector<MaterialDef>& mats,
+               const std::string& name, std::string* prev, std::string& why);
+
 }  // namespace sandvox

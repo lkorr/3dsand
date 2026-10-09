@@ -61,6 +61,10 @@ struct Conditions {
   // flower chain became.
   int canopyMin = 0;
   int canopyMax = 255;
+  // Map v2 A1: relative to the COLUMN's treeline (conditions.treeline:
+  // "below" / "above"; absent or "" = any). Only cover rows read it (the
+  // tree rows have the treeline built in, and a pond is a pond above it).
+  int treeline = 0;   // 0 any, 1 below, 2 at or above (worldmap.h kC_Treeline)
 };
 
 struct CoverRow {
@@ -145,6 +149,11 @@ struct BiomeDef {
   struct Terrain {
     int curve[9] = {-16384, -12288, -8192, -4096, 0, 4096, 8192, 12288, 16384};
     int hill = 256, detail = 256, grain = 256;
+    // Map v2 A1: this biome's treeline as a FRACTION of the map's height
+    // above the sea (terrain.treelineScale; 1 = the map's treeline). A
+    // fraction rather than metres so one file serves a 1,400 m mountain map
+    // and the harness's 11.6 m one. Packed Q8 (worldmap.h kB_TreelineQ8).
+    double treelineScale = 1.0;
   } terrain;
   std::string file;
 };
@@ -210,6 +219,11 @@ struct BiomeSet {
   std::vector<WaterPresetDef> water;
   std::vector<SpeciesMirror> species;
   int problems = 0;                      // counted by ValidateBiomeSet
+  // The material table the set was resolved against, by engine id (air at
+  // 0): its names and classes, for a reader that names a material the biome
+  // files do not -- the world map's roads[] surface (map v2 R1).
+  std::vector<std::string> matNames;
+  std::vector<uint32_t> matClass;
 };
 
 /**
@@ -269,7 +283,7 @@ uint32_t TreeChanceQ16(const BiomeDef& b, int latticeVox);
 /**
  * THE ENVIRONMENT STAMP (docs/PLAN_environment_truth.md P-A): one
  * change-detector per authored input worldgen takes from disk -- the world
- * map (map.json + map.svmap + sculpt.svsculpt when present), the biome
+ * map (map.json + its plane tiles + sculpt.svsculpt when present), the biome
  * files, and the tree species + baked
  * atlases. Each is FNV-1a over every file's NAME, a zero byte, and its BYTES,
  * files in sorted-name order. Deliberately that simple, because the tuner
@@ -283,7 +297,9 @@ uint32_t TreeChanceQ16(const BiomeDef& b, int latticeVox);
  * The EDIT LAYER (map.json `editLayer` since P7, assets/worldedits/<name>.svedit)
  * is the fourth input: `edits` is sandvox::HashOneFile over that one file (0
  * when no layer is named or the file is missing), so saving an edit layer
- * marks a running game stale like any other environment save.
+ * marks a running game stale like any other environment save. Since L1 the
+ * map's LOCALES' layers (locales/<id>/ground.svedit) are folded in after it
+ * (worldmap::HashEditLayerFiles); a map with none hashes as before.
  */
 struct EnvironmentStamp {
   std::string mapName;
@@ -293,6 +309,10 @@ struct EnvironmentStamp {
   std::string Json() const;   // {"map":"<name>","mapHash":"..","biomesHash":"..","treesHash":"..","editLayer":"<name>","editsHash":".."}
 };
 uint32_t HashFileSet(const std::string& dir, const std::vector<std::string>& exts);
+/** A map directory's content hash (map v2): map.json and sculpt.svsculpt, then
+ *  planes/biome/*.svt, then planes/height/*.svt, each set by HashFileSet. The
+ *  environment stamp's `map` and so the save fingerprint's map part. */
+uint32_t HashMapFiles(const std::string& mapDir);
 EnvironmentStamp StampEnvironment(const std::string& assetDir, const std::string& mapName,
                                   const std::string& editLayer = {});
 

@@ -1622,7 +1622,9 @@ struct RenderParams {
   //               TUNE_SHORT_RANGE_NEAR_DIST (raymarch.wgsl shortRangeCeilM).
   // Written in ONE place: WriteRenderParams (src/test/support.cpp).
   camFwd     : vec3f,  flags      : u32,
-  sunDir     : vec3f,  fogDensity : f32,   // per meter (pinned to far extent)
+  // fogDensity: per metre, the LOADING fog that hides unfilled cascade bands
+  // (0 once every level is filled, H1). The air is hfog* below.
+  sunDir     : vec3f,  fogDensity : f32,
   origin     : vec3<i32>,                  // residency window origin, CHUNK units
   viewPx     : f32,    // render target HEIGHT in pixels — pixel angular size
                        // (tanHalfFov*2/viewPx) is the LOD footprint the water
@@ -1685,7 +1687,7 @@ struct RenderParams {
   // is the post-settle idle state (see the RenderParams block in world.h — the
   // CPU-side fluidCount is monotone, so this box is what actually sleeps).
   fluidLo    : vec3<i32>,
-  _pfb0      : i32,
+  fogHaze    : f32,    // render.fogHaze (H1): the blue share of part-fogged airlight
   fluidHi    : vec3<i32>,
   _pfb1      : i32,
   // ---- wind (docs/RESEARCH_wind.md §4.2 — must match RenderParams in
@@ -1706,9 +1708,12 @@ struct RenderParams {
   // fan's blast with nothing wiring grass to fans, and why the debug arrows
   // are evidence rather than decoration (invariant 2: ONE field function).
   windPrimCount : u32,
-  _pwpr0 : u32,
-  _pwpr1 : u32,
-  _pwpr2 : u32,
+  // ---- THE HEIGHT FOG (H1; world.h says more): extinction per METRE at
+  // y = hfogBaseY (fine voxels, the sea plane), falling as
+  // exp(-(y - hfogBaseY) * VOXEL_METERS * hfogFalloff). airFogFrac below.
+  hfogDensity : f32,
+  hfogFalloff : f32,
+  hfogBaseY   : f32,
   windPrimLo : vec3<i32>,
   _pwpr3 : i32,
   windPrimHi : vec3<i32>,
@@ -1937,9 +1942,23 @@ fn cloudOctDecode(uv : vec2f) -> vec3f {
 // Outside the map (a receiver kilometres away, or a light ray too grazing to
 // reach the deck inside it) the answer is the deck's MEAN transmittance, which
 // is what a shadow that far away averages to on screen anyway.
+//
+// BY ALTITUDE (map v2 S1): the map integrates the whole deck from its base
+// plane up, which is right for a receiver under the deck and wrong for a
+// summit standing in it or above it. Above the deck's top nothing is between
+// the receiver and the light; inside, only the part of the deck above it is,
+// so the transmittance is raised to the share of the deck still overhead
+// (the optical depth scales with it).
 fn cloudSunAtM(pM : vec3f, lightDir : vec3f, C : ptr<uniform, CloudParams>,
                maps : ptr<storage, array<u32>, read>) -> f32 {
   if (((*C).flags & CLF_ON) == 0u) { return 1.0; }
+  let top = (*C).baseM + (*C).thicknessM;
+  if (pM.y >= top) { return 1.0; }
+  let over = 1.0 - clamp((pM.y - (*C).shadowPlaneM) / max(top - (*C).shadowPlaneM, 1.0), 0.0, 1.0);
+  return pow(max(cloudSunMapM(pM, lightDir, C, maps), 1e-4), over);
+}
+fn cloudSunMapM(pM : vec3f, lightDir : vec3f, C : ptr<uniform, CloudParams>,
+                maps : ptr<storage, array<u32>, read>) -> f32 {
   let mean = 1.0 - clamp((*C).overcast, 0.0, 1.0) * 0.85;
   if (lightDir.y < 0.03) { return mean; }
   let t = ((*C).shadowPlaneM - pM.y) / lightDir.y;
@@ -1959,6 +1978,16 @@ fn cloudSunAtM(pM : vec3f, lightDir : vec3f, C : ptr<uniform, CloudParams>,
   let edge = min(min(f.x, f.y), min(n - 1.0 - f.x, n - 1.0 - f.y)) / (n * 0.125);
   let v = mix(mix(s00, s10, fr.x), mix(s01, s11, fr.x), fr.y);
   return mix(mean, v, clamp(edge, 0.0, 1.0));
+}
+
+// HOW MUCH OF THE PRECIPITATION IS SNOW at altitude `altM` (metres): the
+// preset's own precipType, raised to snow above the freezing level over the
+// eye's column (`freezeM`, CloudParams.spare.w: src/sim/heat.h
+// HeatFreezingLevelY, the lapse rate's and the snowline's) over a 200 m melt
+// band (map v2 S1). One function, because the streaks, their lean and the
+// rain shadow map built along it, and the curtains must agree.
+fn precipSnowAt(precipType : f32, freezeM : f32, altM : f32) -> f32 {
+  return max(clamp(precipType, 0.0, 1.0), smoothstep(freezeM - 100.0, freezeM + 100.0, altM));
 }
 
 // The same, for a point in fine-voxel world coordinates (what every shading
@@ -2410,13 +2439,46 @@ fn litColorSNoFog(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
   return c;
 }
 
+// ---- THE AIR: OPTICAL DEPTH ALONG A STRAIGHT RAY (H1, docs/PLAN_map_v2.md) --
+// The atmosphere is a HEIGHT-EXPONENTIAL fog: extinction rho(y) = dens *
+// exp(-(y - baseY) * VOXEL_METERS * falloff) per metre, `baseY` the map's sea
+// plane in fine voxels and `falloff` 1 / scale height in metres. Along a ray
+// leaving the eye at eyeY with unit direction y-component dirY, the depth over
+// distM metres is exact in closed form:
+//   tau = rho(eyeY) * distM * (1 - exp(-x)) / x,   x = dirY * distM * falloff
+// (x -> 0 is the horizontal ray, tau = rho * distM). A valley is hazy, a
+// summit clear, and a ray climbing out of the haze sees through it -- which a
+// single density pinned to the cascade edge (the fog before H1) could not.
+// `hide` is the LOADING fog (RenderParams.fogDensity), per metre, homogeneous:
+// it only ever hides cascade bands still unfilled, and is 0 when none is.
+// Shared by the raymarcher (aerialFrac) and the raster passes (bodyAirFog,
+// the gust streaks) so a body and the ground behind it fog by one law.
+fn airFogTauS(eyeY : f32, dens : f32, falloff : f32, baseY : f32, hide : f32,
+              distM : f32, dirY : f32) -> f32 {
+  let up = (eyeY - baseY) * VOXEL_METERS;
+  // Clamped exponents: deep under the base (a cave under the sea plane) the
+  // density saturates instead of overflowing, and tau is clamped by the caller's
+  // exp(-tau) anyway.
+  let rho = dens * exp(clamp(-up * falloff, -60.0, 8.0));
+  let x = dirY * distM * falloff;
+  var g = 1.0 - 0.5 * x;
+  if (abs(x) > 1e-3) { g = (1.0 - exp(-clamp(x, -30.0, 60.0))) / x; }
+  return min(rho * distM * g + hide * distM, 60.0);
+}
+// The fraction of a surface `distM` metres along unit direction `dir` from the
+// eye that the air has replaced: 0 = shown as shaded, 1 = dissolved.
+fn airFogFrac(R : RenderParams, distM : f32, dirY : f32) -> f32 {
+  return 1.0 - exp(-airFogTauS(R.camPos.y, R.hfogDensity, R.hfogFalloff, R.hfogBaseY,
+                               R.fogDensity, distM, dirY));
+}
+
 // The raster bodies' air fog, the tail litColorS always had.
 fn bodyAirFog(c : vec3f, worldPos : vec3f, R : RenderParams) -> vec3f {
-  let dist = length(worldPos - R.camPos);
-  // R.fogDensity, not a hardcoded 0.0128. They agreed at the shipped default
-  // and diverged everywhere else — main.cpp passes 0.0 for portrait renders,
-  // and the hardcode fogged every portrait the frame behind it did not.
-  let fog = 1.0 - exp(-dist * VOXEL_METERS * R.fogDensity);
+  let dv = worldPos - R.camPos;
+  let dist = length(dv);
+  // The one air law (airFogFrac). A portrait (an aux view) uploads no air and
+  // no loading fog, so it stays unfogged as it always was.
+  let fog = airFogFrac(R, dist * VOXEL_METERS, dv.y / max(dist, 1e-3));
   // cheap sky tint for fog, dimmed through the night like the real sky (a
   // fixed day-blue tint here was a second source of midnight glow). Both moons
   // count, and an eclipse dims it with everything else.

@@ -13,6 +13,7 @@
 #include "sim/bytestream.h"
 #include "sim/chunkstore.h"
 #include "sim/world.h"
+#include "sim/worldmap.h"   // L1: a locale group's anchor offset
 
 namespace refs {
 
@@ -337,9 +338,12 @@ void RefStore::Index() {
 
 namespace {
 // Read one refs dir into groups (file-name order). Shared by LoadMap/Reload.
+// A LOCALE's group (yOff names it, worldmap.h LocaleDef) is stored with y
+// relative to its anchor: its refs are read in WORLD y (file y + offset), and
+// WriteGroupFile takes the offset back off.
 void ReadDir(const std::string& dir, std::map<std::string, RefGroupFile>& groups,
              std::vector<std::string>& order, std::map<std::string, Ref>& refs,
-             std::vector<std::string>& warn) {
+             std::vector<std::string>& warn, const std::map<std::string, int>& yOff) {
   std::error_code ec;
   if (!fs::is_directory(dir, ec)) return;
   std::vector<fs::path> files;
@@ -364,8 +368,10 @@ void ReadDir(const std::string& dir, std::map<std::string, RefGroupFile>& groups
       continue;
     }
     std::vector<Ref> kept;
+    const auto off = yOff.find(g.group);
     for (Ref& r : g.refs) {
       r.group = g.group;
+      if (off != yOff.end()) r.pos.y += off->second;
       if (refs.count(r.id)) {
         warn.push_back(label + ": " + r.id + ": id: already used by refs/" +
                        refs[r.id].group + ".json; this one is skipped (ids are map-wide)");
@@ -497,7 +503,8 @@ void RefStore::LoadMap(const std::string& assetDir, const std::string& mapName) 
   log_.clear();
   haveOrigin_ = false;
   std::vector<std::string> warn;
-  ReadDir(dir_, groups_, groupOrder_, refs_, warn);
+  yOff_ = worldmap::LocaleRefYOffsets(assetDir_, map_, &warn);
+  ReadDir(dir_, groups_, groupOrder_, refs_, warn, yOff_);
   DeriveInto(refs_, &warn);
   for (const std::string& w : warn) Warn(w);
   for (const auto& [id, r] : refs_) ValidateRef(r, "refs/" + r.group + ".json");
@@ -512,7 +519,8 @@ void RefStore::Reload(RefCtx& ctx) {
   std::vector<std::string> order;
   std::map<std::string, Ref> refs;
   std::vector<std::string> warn;
-  ReadDir(dir_, groups, order, refs, warn);
+  yOff_ = worldmap::LocaleRefYOffsets(assetDir_, map_, &warn);
+  ReadDir(dir_, groups, order, refs, warn, yOff_);
   DeriveInto(refs, &warn);
   // What changed in the AUTHORED lines, for the kinds that care whether or
   // not the ref is active (RefKind::onEdit; a structure is worldgen input).
@@ -640,8 +648,42 @@ void RefStore::DeactivateAll(RefCtx& ctx, RefEvent why) {
   retry_.clear();
 }
 
+void RefStore::FollowLocales() {
+  if (yOff_.empty()) return;
+  const worldmap::WorldMapData& cur = worldmap::CurrentWorldMap();
+  if (cur.name != map_) return;
+  std::map<std::string, int> shift;
+  for (const worldmap::LocaleDef& l : cur.locales) {
+    auto it = yOff_.find(l.id);
+    if (it == yOff_.end() || !l.resolved || l.RefYOffset() == it->second) continue;
+    shift[l.id] = l.RefYOffset() - it->second;
+    it->second = l.RefYOffset();
+  }
+  if (shift.empty()) return;
+  for (auto& [id, r] : refs_) {
+    if (!r.derivedFrom.empty()) continue;   // re-derived from the moved parents below
+    auto s = shift.find(r.group);
+    if (s == shift.end()) continue;
+    if (active_.count(id) && !prev_.count(id)) prev_[id] = r;
+    r.pos.y += s->second;
+    reapply_.insert(id);
+  }
+  for (auto& [g, file] : groups_) {
+    auto s = shift.find(g);
+    if (s == shift.end()) continue;
+    for (Ref& r : file.refs) r.pos.y += s->second;
+  }
+  SyncDerived(false);
+  Index();
+  haveOrigin_ = false;
+  revision_++;
+  for (const auto& [g, d] : shift)
+    std::printf("refs: locale '%s' follows its ground: %+d voxels\n", g.c_str(), d);
+}
+
 void RefStore::Update(RefCtx& ctx, IVec3 wo) {
   lastTick_ = ctx.tick;
+  FollowLocales();
   const bool moved = !haveOrigin_ || wo.x != lastOrigin_.x || wo.y != lastOrigin_.y ||
                      wo.z != lastOrigin_.z;
   if (!moved && retry_.empty() && reapply_.empty() && graveyard_.empty()) return;
@@ -822,7 +864,15 @@ bool RefStore::WriteGroupFile(const std::string& group, std::string* err) {
       if (err) *err = "could not write " + path;
       return false;
     }
-    f << WriteGroup(it->second);
+    // A locale's group goes back to anchor-relative y (ReadDir added it).
+    const auto off = yOff_.find(group);
+    if (off == yOff_.end()) {
+      f << WriteGroup(it->second);
+    } else {
+      RefGroupFile g = it->second;
+      for (Ref& r : g.refs) r.pos.y -= off->second;
+      f << WriteGroup(g);
+    }
   }
   fs::rename(tmp, path, ec);
   if (ec) {

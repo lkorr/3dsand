@@ -293,6 +293,15 @@ class RefStore {
   // new world). Missing dir = zero refs, no warning. Always succeeds; every
   // problem is a warning (Warnings()).
   void LoadMap(const std::string& assetDir, const std::string& mapName);
+  // A LOCALE's group (worldmap.h LocaleDef; group name == locale id) is
+  // stored with y relative to the locale's anchor. The store holds WORLD y
+  // throughout -- Find, All, Group, the kinds and the authoring actions all
+  // see world positions -- and only the file is relative: LoadMap / Reload
+  // add the locale's offset (worldmap::LocaleRefYOffsets), every group-file
+  // write takes it off. When the loaded world map re-resolves a locale to a
+  // new offset (F7 after the ground under it was reshaped), the next Update
+  // moves the whole group by the difference and re-applies it.
+  //
   // Re-read the same directory (R in game). Refs whose line changed are
   // re-applied (Edited), vanished ones Deleted, new ones activate on the next
   // Update. `ctx` reaches the hooks.
@@ -389,6 +398,8 @@ class RefStore {
 
  private:
   bool WriteGroupFile(const std::string& group, std::string* err);
+  // L1: follow CurrentWorldMap()'s resolved locale offsets (see LoadMap).
+  void FollowLocales();
   void Index();
   void EnsurePulled(const Ref& r);
   void Activate(RefCtx& ctx, const Ref& r);
@@ -401,6 +412,8 @@ class RefStore {
   void NoteEdit(const Ref* before, const Ref* after);
 
   std::string assetDir_, map_, dir_;
+  // L1: group -> the y its refs' file y take (a locale group); see LoadMap.
+  std::map<std::string, int> yOff_;
   std::map<std::string, RefGroupFile> groups_;
   std::vector<std::string> groupOrder_;
   std::map<std::string, Ref> refs_;
