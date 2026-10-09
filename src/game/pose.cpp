@@ -647,12 +647,22 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   // The goal is driven by velocity NORMALIZED against the def's own top speed,
   // so `gain` means "radians of lag at full speed" for every def regardless of
   // how fast that def moves (kSpringVelScale, anim.h).
+  //
+  // IN THE BODY'S FRAME. `st.velocity` is WORLD-space and the jiggle composes
+  // onto a part-local rotation, so feeding it straight in made the lag depend
+  // on which way the world was facing: the authored pitch-back at heading 0
+  // became a sideways ROLL walking along X — a head held tilted to one side
+  // for the whole walk. Rotated by -heading first: +Z is forward, +X the
+  // character's left, the frame the rig's locals are in.
   const float speedRef = std::max(def.speed, 0.01f);
+  const float hc = std::cos(heading_), hs = std::sin(heading_);
+  const float velFwd = st.velocity.x * hs + st.velocity.z * hc;
+  const float velLeft = st.velocity.x * hc - st.velocity.z * hs;
   for (size_t i = 0; i < sk.parts.size(); i++) {
     const AnimPart& p = sk.parts[i];
     if (!p.hasSpring) continue;
-    Vec3 goal{-st.velocity.z / speedRef * p.spring.gain * kSpringVelScale, 0,
-              st.velocity.x / speedRef * p.spring.gain * kSpringVelScale};
+    Vec3 goal{-velFwd / speedRef * p.spring.gain * kSpringVelScale, 0,
+              velLeft / speedRef * p.spring.gain * kSpringVelScale};
     goal.x = std::clamp(goal.x, -p.spring.maxAngle, p.spring.maxAngle);
     goal.z = std::clamp(goal.z, -p.spring.maxAngle, p.spring.maxAngle);
     AnimSpringStep(p.spring, st.springs[i], goal, dt);
