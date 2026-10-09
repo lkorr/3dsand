@@ -129,7 +129,9 @@ fn rainLeanWindHere(fallV : f32) -> vec2f {
 // ---- prep: one thread decides this frame's slope, generation and centre ----
 @compute @workgroup_size(1)
 fn rainMapPrep() {
-  let snow = clamp(C.precipType, 0.0, 1.0);
+  // The overlay's snow (raymarch.wgsl rainOverlay): the eye's altitude
+  // against the freezing level (common.wgsl precipSnowAt), map v2 S1.
+  let snow = precipSnowAt(C.precipType, C.spare.w, R.camPos.y * VOXEL_METERS);
   let fallV = mix(8.5, 1.1, snow);
   let sNew = rainLeanWindHere(fallV) / fallV;
   var s = vec2f(bitcast<f32>(rainMap[2]), bitcast<f32>(rainMap[3]));

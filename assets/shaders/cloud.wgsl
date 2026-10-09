@@ -43,6 +43,9 @@
 @group(0) @binding(15) var<storage, read_write> cloudMaps : array<u32>;
 @group(0) @binding(16) var<storage, read_write> cloudRaw : array<u32>;
 @group(0) @binding(17) var<storage, read_write> cloudHist : array<u32>;
+// THE FAR HORIZON's pyramid (src/sim/horizon.h; map v2 S1): the ground the
+// march stops at, so a summit inside the deck is not marched through.
+@group(0) @binding(32) var<storage, read> horizon : array<u32>;
 
 // ---- sizes: MUST MATCH world.h kCloud* (check_invariants.py pairs) --------
 const CLOUD_SHAPE_N   : u32 = 128u;
@@ -628,8 +631,8 @@ fn rainLayer(rd : vec3f, Lt : CloudLight, mu : f32, tMax : f32, jit : f32) -> Ma
                         vec3f(0.016, 0.016, 0.017)) * 0.35;
   // A real bow is faint against the curtain it stands in: ~a third of the
   // curtain's own brightness at its peak, less toward the sides.
-  let bow = (bowP + bowS) * 0.15 * TUNE_CLOUD_RAINBOW * smoothstep(0.0, 0.06, R.sunDir.y) *
-            (1.0 - C.precipType);
+  // Rain-only bow: snow (by altitude, precipSnowAt) bends no light into one.
+  let bow = (bowP + bowS) * 0.15 * TUNE_CLOUD_RAINBOW * smoothstep(0.0, 0.06, R.sunDir.y);
   for (var i = 0u; i < RAIN_STEPS; i++) {
     let t = (f32(i) + jit) * ds;
     let p = C.camM + rd * t;
@@ -648,8 +651,11 @@ fn rainLayer(rd : vec3f, Lt : CloudLight, mu : f32, tMax : f32, jit : f32) -> Ma
     let tr = exp(-dens * ds);
     // Snow is brighter and whiter than rain; rain is mostly the grey of the
     // cloud it falls from.
-    let lit = Lt.ambTop * mix(0.75, 1.35, C.precipType) +
-              Lt.col * (0.10 + 0.35 * hg(mu, 0.5) * 0.1) + Lt.col * bow * 2.5;
+    // Snow above the freezing level (map v2 S1): a curtain that is rain in
+    // the valley is snow on the mountain behind it.
+    let snowS = precipSnowAt(C.precipType, C.spare.w, p.y);
+    let lit = Lt.ambTop * mix(0.75, 1.35, snowS) +
+              Lt.col * (0.10 + 0.35 * hg(mu, 0.5) * 0.1) + Lt.col * bow * (2.5 * (1.0 - snowS));
     acc += T * lit * (1.0 - tr);
     dAcc += t * T * (1.0 - tr);
     T *= tr;
@@ -661,16 +667,93 @@ fn rainLayer(rd : vec3f, Lt : CloudLight, mu : f32, tMax : f32, jit : f32) -> Ma
   return o;
 }
 
+// ---- THE GROUND (map v2 S1) ---------------------------------------------------
+// Until map v2 the land was metres and the deck kilometres, so the sea-level
+// sphere stood in for "the ray went into the ground". A 1,400 m massif under a
+// 700 m storm base is not metres: its flanks are IN the deck. So the ground is
+// the far horizon's pyramid (horizon.h; raymarch.wgsl traceHorizon reads the
+// same words): its AVG ground (never under the sea), bilinear, flat-world
+// like the terrain the raymarch draws. AVG and not the MAX silhouette: a ray
+// that grazes a ridge the MAX overstates would stop short of the deck and
+// draw a sliver of clear sky between the real ridge and the cloud (seen on
+// screenshot_peaks_cloudcap); a ray that sinks a few metres into the real
+// ground under the AVG only marches a little cloud behind the surface. HZ_* mirror horizon.h's header (raymarch.wgsl and
+// horizon_light.wgsl carry the same list).
+const HZ_H_VALID : u32 = 0u;
+const HZ_H_X0 : u32 = 1u;
+const HZ_H_Z0 : u32 = 2u;
+const HZ_H_NX : u32 = 3u;
+const HZ_H_NZ : u32 = 4u;
+const HZ_H_LOG2 : u32 = 5u;
+const HZ_H_SEA_Y : u32 = 7u;
+const HZ_H_MAX_Y : u32 = 10u;
+const HZ_H_SAMPLES : u32 = 11u;
+// The ground search: geometric steps from 20 m out to the deck's reach, then a
+// bisection of the crossing. A ridge narrower than a step at that distance
+// can be stepped over -- it is a few low-res cloud pixels wide there.
+const GROUND_STEPS : i32 = 40;
+const GROUND_FIRST_M : f32 = 20.0;
+const GROUND_GROW : f32 = 1.12;
+
+fn hzGroundM(xzM : vec2f) -> f32 {
+  let s = f32(1u << horizon[HZ_H_LOG2]);
+  let n = vec2<i32>(bitcast<i32>(horizon[HZ_H_NX]), bitcast<i32>(horizon[HZ_H_NZ]));
+  let o = vec2f(f32(bitcast<i32>(horizon[HZ_H_X0])), f32(bitcast<i32>(horizon[HZ_H_Z0])));
+  let q = clamp((xzM / VOXEL_METERS - o) / s, vec2f(0.0), vec2f(n - vec2<i32>(1)));
+  let i = max(min(vec2<i32>(floor(q)), n - vec2<i32>(2)), vec2<i32>(0));
+  let f = q - vec2f(i);
+  var h : vec4f;
+  for (var k = 0; k < 4; k++) {
+    let c = min(i + vec2<i32>(k & 1, k >> 1), n - vec2<i32>(1));
+    let w = horizon[horizon[HZ_H_SAMPLES] + u32(c.y * n.x + c.x)];
+    h[k] = f32(bitcast<i32>(w) >> 16u);
+  }
+  let sea = f32(bitcast<i32>(horizon[HZ_H_SEA_Y]));
+  return max(mix(mix(h.x, h.y, f.x), mix(h.z, h.w, f.x), f.y), sea) * VOXEL_METERS;
+}
+
+// The distance along `rd` (metres from the eye) to the pyramid's ground, 1e9
+// for none within `tMax`. Rays that start over the map's highest point and
+// climb never look.
+fn terrainHitM(rd : vec3f, tMax : f32) -> f32 {
+  if (horizon[HZ_H_VALID] == 0u) { return 1e9; }
+  let topM = f32(bitcast<i32>(horizon[HZ_H_MAX_Y])) * VOXEL_METERS;
+  if (rd.y >= 0.0 && C.camM.y >= topM) { return 1e9; }
+  var tPrev = 0.0;
+  var t = GROUND_FIRST_M;
+  for (var k = 0; k < GROUND_STEPS; k++) {
+    if (tPrev >= tMax) { break; }
+    let tk = min(t, tMax);
+    let p = C.camM + rd * tk;
+    if (p.y <= hzGroundM(p.xz)) {
+      var a = tPrev;
+      var b = tk;
+      for (var it = 0; it < 6; it++) {
+        let m = 0.5 * (a + b);
+        let pm = C.camM + rd * m;
+        if (pm.y <= hzGroundM(pm.xz)) { b = m; } else { a = m; }
+      }
+      return b;
+    }
+    // Climbing past everything the map holds: nothing further can be ground.
+    if (rd.y > 0.0 && p.y > topM) { break; }
+    tPrev = tk;
+    t *= GROUND_GROW;
+  }
+  return 1e9;
+}
+
 // Where along `rd` the deck is: [t0, t1] in metres, empty if t0 >= t1. Also
 // reports the distance to the ground, so the rain march stops there.
 fn deckSpan(rd : vec3f, groundT : ptr<function, f32>) -> vec2f {
   let hc = C.camM.y;
   let lo = C.baseM - cloudBaseJitterM(C.thicknessM);
   let hi = C.baseM + 1.1 * C.thicknessM;
-  // The ground sphere: sea level. Terrain here is metres, the deck kilometres,
-  // so sea level is a faithful stand-in for "the ray went into the land".
+  // The ground: the sea-level sphere, or the map's terrain where the ray meets
+  // that first (terrainHitM). Looked for only as far as the deck could matter.
   let g = shellHits(hc, rd.y, min(0.0, hc - 1.0));
   *groundT = select(1e9, g.x, g.x <= g.y && rd.y < 0.0 && g.x > 0.0);
+  *groundT = min(*groundT, terrainHitM(rd, min(*groundT, TUNE_CLOUD_MAX_DIST_M + RAIN_MAX_M)));
   var t0 = 0.0;
   var t1 = 0.0;
   let sLo = shellHits(hc, rd.y, lo);
@@ -1030,7 +1113,7 @@ fn writeRainWindProbe() {
     let prev = vec3f(bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 4u]),
                      bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 5u]),
                      bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 6u]));
-    let tau = mix(1.5, 4.0, clamp(C.precipType, 0.0, 1.0));
+    let tau = mix(1.5, 4.0, precipSnowAt(C.precipType, C.spare.w, C.camM.y));
     let blend = 1.0 - exp(-dt / tau);
     if (all(prev == prev)) { w = mix(prev, w, blend); }   // NaN guard
   }

@@ -148,6 +148,8 @@ PIPE_TO_MEMBER = {
     "PIPE_RAY_START_MIN": "rayStartMin_",
     "PIPE_RAIN_MAP_PREP": "rainMapPrep_",
     "PIPE_RAIN_MAP_BUILD": "rainMapBuild_",
+    "PIPE_HZ_SKY": "hzSky_",
+    "PIPE_HZ_SUN": "hzSun_",
     "PIPE_GODRAY_VIS": "godrayVis_",
     "PIPE_GAS_MASK": "gasMask_",
     "PIPE_GI_PREPARE": "giPrepare_",
@@ -262,6 +264,10 @@ BUF_TO_WGSL = {
     "ShadowHist": {"shadowHist"},
     "RayStart": {"rayStart"},
     "RainMap": {"rainMap"},
+    # The far horizon's pyramid and the terrain light map (map v2 S1). The
+    # raymarch DRAW's views (renderBGL 45 / 46) are not rows.
+    "Horizon": {"horizon"},
+    "HzLight": {"hzLight"},
     "GodVis": {"godVis"},
     "GasMask": {"gasMask"},
     # The GI gather request list; GiArgs is indirect-only and never bound.

@@ -44,7 +44,12 @@ int UnAvg(uint32_t w) { return (int)(int16_t)(w >> 16); }
 
 }  // namespace
 
-void Build(const worldmap::WorldMapData& m, const std::vector<uint32_t>& wm,
+uint64_t LightWords(const std::vector<uint32_t>& w) {
+  if (w.size() <= kHNZ || w[kHValid] == 0u) return kLightHeaderWords;
+  return kLightHeaderWords + 2ull * (uint64_t)w[kHNX] * (uint64_t)w[kHNZ];
+}
+
+void Build(const worldmap::WorldMapData& m, const std::vector<uint32_t>& wm, uint32_t seed,
            std::vector<uint32_t>& out) {
   out.assign(kHeaderWords, 0u);
   if (!m.Loaded() || m.height.empty()) return;   // kHValid stays 0
@@ -70,6 +75,10 @@ void Build(const worldmap::WorldMapData& m, const std::vector<uint32_t>& wm,
   const size_t ns = (size_t)nx * nz;
   std::vector<uint32_t> samples(ns);
   std::vector<uint8_t> biome(ns);
+  // The column's own treeline (map v2 A1): worldgen caps a column with snow
+  // when its ground reaches TreelineAt, which varies by biome and carries a
+  // seeded jitter -- one map-wide Y painted all of `peaks` white.
+  std::vector<int16_t> tline(ns);
   int maxY = outer;
   for (int j = 0; j < nz; j++) {
     for (int i = 0; i < nx; i++) {
@@ -88,6 +97,7 @@ void Build(const worldmap::WorldMapData& m, const std::vector<uint32_t>& wm,
       const int avg = (int)(sum / std::max(n, 1));
       samples[(size_t)j * nx + i] = Pack(hi, avg);
       biome[(size_t)j * nx + i] = m.BiomeCellAt(x, z);
+      tline[(size_t)j * nx + i] = ClampI16(worldmap::TreelineAt(x, z, seed));
       maxY = std::max(maxY, hi);
     }
   }
@@ -173,6 +183,13 @@ void Build(const worldmap::WorldMapData& m, const std::vector<uint32_t>& wm,
   for (size_t l = 0; l < mips.size(); l++) {
     out[kHMip + l] = (uint32_t)out.size();
     out.insert(out.end(), mips[l].begin(), mips[l].end());
+  }
+  out[kHTlPlane] = (uint32_t)out.size();
+  {
+    const size_t tw = (ns + 1) / 2;
+    const size_t at = out.size();
+    out.resize(at + tw, 0u);
+    std::memcpy(out.data() + at, tline.data(), ns * sizeof(int16_t));
   }
 }
 
