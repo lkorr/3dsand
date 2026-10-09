@@ -1891,8 +1891,11 @@ biome has a climate with a day/night swing. All of it is DATA: materials.json
 **The temperature of a cell** is `T = A + X`, heat units, 0 = water freezes.
 `A` is the AMBIENT: the climate of the cell's column (the biome the seeded map
 puts there, read through a CPU-built 512 x 512 window column table in
-`heatParams`, refilled only for the strip a window shift brings in) or, at and
-above the snowline (map treeline - 1), the snowline climate (`sim.heatSnowline*`),
+`heatParams`, one word per column -- biome | snowline Y << 8 -- tiled by chunk
+column and refilled only for the tiles a window shift brings in) cooled by the
+LAPSE RATE (`sim.heatLapsePerKm` heat units per km above the map's sea level;
+map v2 A1) or, at and above the COLUMN's snowline (its treeline - 1,
+`worldmap::TreelineAt`), the snowline climate (`sim.heatSnowline*`),
 `base + swing` by day and `base - swing` by night. It is evaluated, never
 stored per cell and never diffused, and it is TWO-LEVEL on purpose: it changes
 only on the tick daylight switches, which is the tick `SubmitTick` already
@@ -5627,8 +5630,11 @@ anywhere else.
 **The sediment wedge** is what makes the relief mean something to the sim rather
 than only to the eye: low flat ground carries metres of loose dirt over gravel,
 ridges carry bare rock. Thickness is
-`(sedCeil − ground)·sedFraction/256 − sedStrip`, slope-gated and clamped to
-`sedMax`, which stays under `caveBands`' 40-voxel shell so a cavern cannot
+`(sedAbove − noise)·sedFraction/256 − sedStrip`, where `noise` is the ground
+less the AUTHORED ground (height plane + sculpt) -- relative since map v2 A1,
+so a hollow on a 900 m valley floor fills like one at the sea; it was the
+absolute `(sedCeil − ground)` with `sedCeil` y 264 -- slope-gated and clamped
+to `sedMax`, which stays under `caveBands`' 40-voxel shell so a cavern cannot
 undercut it.
 
 Dirt and gravel are **powders**, so the gate is the safety property. Two things
@@ -5797,8 +5803,9 @@ token-identical in `worldgen.wgsl` and `world.cpp`): the datum, what a
 painted landform 0..255 spans (`landformRangeVox`, the old `contAmplitude`
 — a painted ridge can be a 150 m mountain by raising it), the four seeded
 octaves (range / hill / detail / grain, amplitude + log2 cell), `fbmAtten`,
-the calm home area (`homeArea.y/radius/fade`), the sediment wedge, the
-treeline and the reference scale. `TerrainWords` is the one packing; the
+the calm home area (`homeArea.radius/fade`; `homeArea.y` retired by map v2
+A1), the sediment wedge (`sedAbove`, relative), the treeline (+
+`treelineJitter`), `rockSlope` and the reference scale. `TerrainWords` is the one packing; the
 loader keeps the same words on `WorldMapData` for the CPU twin, and the
 `terrain` gate's C1 is the per-voxel proof. Lengths are rescaled from
 `refVoxelsPerMetre` at load exactly as `LoadTuning` used to rescale the rows.
@@ -5848,8 +5855,10 @@ sky .. 255 deep shade, `worldmap.h kC_CanopyMin/Max`) and a `minY` at the
 treeline for the cushion. `undergrowthSite`'s 25-tile scan runs once per
 column, only for a biome whose rows bound the canopy (`kBF_CanopyRows`),
 handed into `genCellIn` as the memo the flower stalk used to be. The cover
-stack has no treeline gate any more: a row's `maxY` is its own snowline (the
-seeded rows stop at 227). The `env-truth` gate therefore asserts every
+stack has no hard treeline gate: a row carries a `treeline` CONDITION
+(`below` / `above` the column's treeline, `kC_Treeline`; map v2 A1 -- the
+seeded rows say `below`, the cushion `above`; they were absolute `maxY` 227 /
+`minY` 228, which meant nothing on a map whose treeline is not y 228). The `env-truth` gate therefore asserts every
 biome's rows; the tile plants (`plantColumnAt`'s ferns and big toadstools)
 and the proc cactus are the two second sources left, reported not asserted,
 and a canopy-conditioned row is an interval (hi only) like a nearWater row.
@@ -22980,6 +22989,41 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   format and absent = default, v1 refused, post exactness with zero noise,
   CPU == GPU per voxel over post edges and a 2 vox/vox ramp, gradient and
   ground continuity at post edges, the edge fade).
+* **LIVE (map v2 A1, 2026-10-08): ALTITUDE IS RELATIVE.** Every rule that
+  held one absolute Y for a 20 m-tall world now reads the column.
+  **Window:** `worldmap::WindowChunkYForGround(h)` = `((h - 72) >> 8)` half
+  windows -- ground in [72, 328) is window 0 (the harness map, so no scene
+  moved), a 900 m valley gets a window holding it with >= 72 voxels below and
+  >= 184 above; `SpawnWindowOrigin`, the `--shot` scenes that place a window
+  on a column and perfsuite's spawn / village scenarios use it.
+  **Treeline:** `treelineAt` (height mirror, CPU `worldmap::TreelineAt`) =
+  `sea + (terrain.treeline − sea)·biomeTreelineAt >> 8 ± treelineJitter`
+  (25.6 m value noise): the biome's `terrain.treelineScale` (Q8 in
+  `kB_TreelineQ8`, blended over the four biome cells like the relief) is a
+  FRACTION of the map's height above the sea, so one biome file serves the
+  harness's 11.6 m treeline and peaks' 1,000 m one (shipped: tundra 0.85,
+  alpine 0.9, pine 1.05). `genColumn` caches it as `Col.tl` (column cache
+  word `CCW_TREELINE`, `CC_WORDS` 26); the snow cap, `colGrowsTrees`, the
+  shore fringe, cacti, tile plants, the trunk column of a lattice / site tree,
+  ice born on water and the cover rows' `treeline` condition all read it.
+  `kHTreelineMax` (the highest any column's can be) bounds `treeMaxTop` /
+  `cactusMaxTop`. **Heat:** the column table carries each column's snowline;
+  `sim.heatLapsePerKm` (6) cools the biome climate per km above the sea
+  (`heatLapse`, `kHpLapse` / `kHpSeaY`; word 2 was the one snowline Y).
+  **Sediment:** relative (`sedAbove`, above). **Caves:** band 2 sits
+  24..31 m under the COLUMN's ground (`h - vlen(240) - noise`; it was
+  y -4..-11 m absolute, which is where it still lands under ground at y 200).
+  The magma table stays ONE flat plane (`LAVA_LEVEL`, the flat-liquid
+  invariant above it is load-bearing) but no column whose ground is within
+  `LAVA_CLEAR` (20 m) of it floods: its carve below the table stays stone, so
+  containment holds and no valley floor meets lava within 20 m. **Steep
+  rock:** a column whose landform slope reaches `terrain.rockSlope` (Q8,
+  640 = 2.5:1; 0 = off) skins four cells of `coverFirmMat` and wears no snow
+  cap and no cover row (`colSteep`): powder on a cliff never sleeps, grass on
+  one does not read as a cliff. `homeArea.y` is retired (a warning if
+  present). Gate `altitude` (on `peaks`): the window, the per-biome jittered
+  treeline, the lapse rate, the lava clearance under the gorge, CPU + GPU
+  sediment on the valley floor, rock + <= 32 active chunks on the cliff band.
 * **LIVE (world map P5, 2026-09-04): THE SITE TABLE.** `map.json sites[]`
   of kind `stamp` (a `.vox` from `assets/prefabs/`, a world column, a
   rotation, a pad margin) and `rules[]` (`{kind: stamp, template, biome,

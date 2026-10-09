@@ -48,13 +48,19 @@ const P = (why) => ({preview: true, why});
 // table (TA_H_COND_TABLE, TA_C_*) and compared in treeInfoAt after the species
 // pick, on top of the SPECIES FILE's own band/slope. Water and cave rows: not
 // packed at all.
-const ALL_CONDS = ['minY', 'maxY', 'maxSlope', 'nearWaterMax', 'nearWaterMin', 'patchThreshold', 'canopyMin', 'canopyMax'];
+const ALL_CONDS = ['minY', 'maxY', 'maxSlope', 'nearWaterMax', 'nearWaterMin', 'patchThreshold', 'canopyMin', 'canopyMax', 'treeline'];
+// Map v2 A1: the treeline condition is the cover rows' (WM_C_TREELINE against
+// the column's treelineAt); a tree has the treeline built in and a pond is a
+// pond above it.
+const TREE_ROW_CONDS = ALL_CONDS.filter(k => k !== 'treeline');
 const COND_CANOPY = 'the canopy band is a COVER-ROW condition (P-G: WM_C_CANOPY_MIN / MAX against undergrowthSite); a tree, a water body or a cave has no canopy to read';
 function conditions(base, readSet, pkg, why) {
   const out = {};
   for (const k of ALL_CONDS)
     out[base + '.conditions.' + k] = readSet.includes(k) ? R()
-        : (k === 'canopyMin' || k === 'canopyMax') ? N('later', COND_CANOPY) : N(pkg, why);
+        : (k === 'canopyMin' || k === 'canopyMax') ? N('later', COND_CANOPY)
+        : k === 'treeline' ? N('A1', 'the treeline condition is a COVER-ROW condition (WM_C_TREELINE); trees stop at the column\u2019s treeline by construction')
+        : N(pkg, why);
   return out;
 }
 
@@ -80,6 +86,7 @@ export const LIVE = {
     'terrain.hill': R('P-G: WM_B_HILL_MUL — Q8 multiplier on the map\u2019s hill octave (256 = the map\u2019s amplitude)'),
     'terrain.detail': R('P-G: WM_B_DETAIL_MUL — Q8 multiplier on the map\u2019s detail octave'),
     'terrain.grain': R('P-G: WM_B_GRAIN_MUL — Q8 multiplier on the map\u2019s grain octave'),
+    'terrain.treelineScale': R('map v2 A1: WM_B_TREELINE_Q8 — this biome\u2019s treeline as a fraction of the map\u2019s height above the sea, blended over the four biome cells (biomeTreelineAt)'),
 
     'cover.skin': R('WM_B_SKIN'),
     'cover.skinDepth': R('WM_B_SKIN_DEPTH'),
@@ -117,7 +124,7 @@ export const LIVE = {
     'swatch.sizeM': P('the swatch side; not a world value')
   },
   conditions('cover.plants[]', ALL_CONDS, 'P-D', COND_COVER),
-  conditions('trees.species[]', ALL_CONDS, 'P-D', COND_TREE),
+  conditions('trees.species[]', TREE_ROW_CONDS, 'P-D', COND_TREE),
   conditions('water.features[]', ['minY', 'maxY', 'maxSlope'], 'later', COND_WATER),
   conditions('caves.features[]', [], 'later', COND_CAVE)),
 
@@ -173,10 +180,11 @@ export const LIVE = {
     'terrain.grainAmplitude': R('WM_H_TERRAIN_GRAIN_AMPLITUDE (scaled per biome by terrain.grain)'),
     'terrain.grainLog2': R('WM_H_TERRAIN_GRAIN_LOG2'),
     'terrain.fbmAtten': R('WM_H_TERRAIN_FBM_ATTEN: iq\u2019s derivative attenuation, Q8; the rule-2 mechanism that keeps the ladder under the angle of repose'),
-    'terrain.homeArea.y': N('A1', 'map v2: the calm area fades the NOISE toward the authored height; homeArea.y no longer reaches the ground (A1 replaces it)'),
     'terrain.homeArea.radius': R('WM_H_TERRAIN_HOME_R: Chebyshev radius held calm (was spawnPlainR)'),
     'terrain.homeArea.fade': R('WM_H_TERRAIN_HOME_FADE: how far past it the range rung ramps back (was spawnPlainFade; the terrain gate\u2019s A4 measures the slope it builds)'),
-    'terrain.sedCeil': R('WM_H_TERRAIN_SED_CEIL: the sediment wedge (was sedCeil)'),
+    'terrain.sedAbove': R('WM_H_TERRAIN_SED_ABOVE: the sediment wedge, relative to the authored ground (was the absolute sedCeil)'),
+    'terrain.treelineJitter': R('WM_H_TERRAIN_TREELINE_JITTER: +- wobble of every column\u2019s treeline'),
+    'terrain.rockSlope': R('WM_H_TERRAIN_ROCK_SLOPE: steep columns skin as rock (colSteep)'),
     'terrain.sedFraction': R('WM_H_TERRAIN_SED_FRACTION'),
     'terrain.sedStrip': R('WM_H_TERRAIN_SED_STRIP'),
     'terrain.sedSlope': R('WM_H_TERRAIN_SED_SLOPE: the wedge\u2019s slope gate, a rule-2 knob (0 = off)'),

@@ -150,6 +150,12 @@ def main():
     nb = write_plane(os.path.join(d, 'planes', 'biome'), PLANE_BIOME, biome, OCEAN, 1)
     with open(os.path.join(a.assets, 'worldmap', 'default', 'map.json'), encoding='utf-8') as f:
         terrain = json.load(f)['terrain']
+    # The altitude a 1,400 m map lives at (map v2 A1): the treeline 1,000 m
+    # above the sea (each biome scales it -- tundra 0.85, alpine 0.9, pine
+    # 1.05 -- so the high valley at ~900 m grows trees and the tundra rim at
+    # ~1,080 m does not), wobbling +-30 m so it is not a ruled contour.
+    terrain['treeline'] = int(SEA + m(1000))
+    terrain['treelineJitter'] = int(m(30))
     mj = {
         'version': 2,
         'name': 'peaks',

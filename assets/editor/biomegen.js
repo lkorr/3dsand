@@ -70,7 +70,11 @@ export function defaultConditions() {
     // became: the shade plants author canopyMin 96, the gap flowers
     // canopyMax 95, the woodland-margin rose 40..95.
     canopyMin: 0,
-    canopyMax: 255
+    canopyMax: 255,
+    // Map v2 A1: relative to the column's treeline -- 'below', 'above', or ''
+    // (any). Cover rows only. What the shipped rows' maxY 227 / minY 228
+    // meant on a map whose treeline was y 228.
+    treeline: ''
   };
 }
 
@@ -101,7 +105,8 @@ export function defaultBiome() {
       curve: CURVE_IDENTITY.slice(),   // 9 Q14 knots over the coarse relief's swing; below the diagonal = flatter
       hill: 256,                       // Q8 multipliers on the map's hill / detail / grain octaves (256 = the map's)
       detail: 256,
-      grain: 256
+      grain: 256,
+      treelineScale: 1                 // map v2 A1: the treeline as a fraction of the map's height above the sea
     },
     cover: {
       skin: 'grass',                 // the topmost ground cell
@@ -159,6 +164,7 @@ export function normalizeConditions(c) {
   const out = merge(defaultConditions(), c || {});
   out.canopyMin = Math.min(255, Math.max(0, out.canopyMin | 0));
   out.canopyMax = Math.min(255, Math.max(0, out.canopyMax | 0));
+  if (out.treeline !== 'below' && out.treeline !== 'above') out.treeline = '';
   return out;
 }
 
@@ -170,7 +176,11 @@ export function normalizeTerrain(t) {
       ? src.curve.map(k => Math.min(16384, Math.max(-16384, Math.round(+k || 0))))
       : CURVE_IDENTITY.slice();
   const q8 = (v) => Math.min(4096, Math.max(0, Math.round(v === undefined ? 256 : +v || 0)));
-  return {curve, hill: q8(src.hill), detail: q8(src.detail), grain: q8(src.grain)};
+  const out = {curve, hill: q8(src.hill), detail: q8(src.detail), grain: q8(src.grain)};
+  // Map v2 A1: the biome's treeline as a fraction of the map's (0..4, the
+  // loader's clamp; 1 = the map's treeline).
+  out.treelineScale = src.treelineScale === undefined ? 1 : Math.min(4, Math.max(0, +src.treelineScale || 0));
+  return out;
 }
 export function terrainIsIdentity(t) {
   const n = normalizeTerrain(t);

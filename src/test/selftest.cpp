@@ -39,6 +39,7 @@ const std::vector<Gate>& EnvTruthGates();
 const std::vector<Gate>& MapV2Gates();
 // Locales (docs/PLAN_map_v2.md L1): CPU only, a synthetic map in a temp dir.
 const std::vector<Gate>& LocaleGates();
+const std::vector<Gate>& AltitudeGates();
 // The Node generator data gates (test_mobgen / test_anatomy / test_environment.mjs),
 // shelled out to through scripts/generator_parity.mjs. No World, no GPU.
 const std::vector<Gate>& GeneratorGates();
@@ -282,6 +283,11 @@ const char* const kOrder[] = {
     // ordinary group does not, overlapping layers resolve map-then-locale.
     // CPU only; the loaded map is put back as it was.
     "locale",
+    // Map v2 A1: nothing absolute-Y that should be relative, on the `peaks`
+    // fixture (window, per-biome treeline, lapse rate, lava clearance, valley
+    // sediment, cliff rock + settle). The `clearing` exit: reload, put the
+    // window back, regenerate, far refill.
+    "altitude",
     // With it: the map's spawn site is where a player can actually start --
     // outside the harness box, on land, not in a tarn, where trees may grow.
     // CPU only (the height mirror and the map), nothing left behind.
@@ -1268,7 +1274,7 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &MapV2Gates(), &LocaleGates(), &GeneratorGates(), &ScaleGates(),
+    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &MapV2Gates(), &LocaleGates(), &AltitudeGates(), &GeneratorGates(), &ScaleGates(),
                           &SimGates(), &CaGates(), &GasGates(), &TicketGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),

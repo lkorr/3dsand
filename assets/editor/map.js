@@ -112,16 +112,17 @@ const TERRAIN_ROWS = [
   ['grainAmplitude', 'grain height', 0, 32, 1, 'vox', 'Full swing of the finest octave (scaled per biome by terrain.grain).'],
   ['grainLog2', 'grain size (log2)', 3, 15, 1, 'log2', 'Grain noise cell: 3 = 8 voxels = 0.8 m.'],
   ['fbmAtten', 'slope attenuation (Q8)', 0, 256, 8, 'Q8', 'iq’s derivative attenuation: each octave is divided by 1 + atten·|slope|², the slope including the authored height’s. 0 is plain fBm; 256 is the textbook form. A rule-2 mechanism, not a look knob.'],
-  ['homeArea.y', 'home area height', 0, 1024, 4, 'vox', 'The ground height the calm area around the spawn site sits at.'],
   ['homeArea.radius', 'home area radius', 0, 4096, 16, 'vox', 'Chebyshev radius around the spawn site held calm.'],
   ['homeArea.fade', 'home area fade', 1, 8192, 64, 'vox', 'How far past the radius the noise ramps back to full. LOAD-BEARING: a short fade builds a cliff at exactly the boundary.'],
-  ['sedCeil', 'sediment ceiling', 0, 1024, 4, 'vox', 'The sediment wedge: ground below this carries loose dirt over gravel, thickness (ceiling - ground) × fraction/256 - strip, slope-gated, clamped to max.'],
+  ['sedAbove', 'sediment ceiling (relative)', -1024, 1024, 4, 'vox', 'The sediment wedge: where the noise sits below the AUTHORED ground (height plane + sculpt) + this, the ground carries loose dirt over gravel, thickness (this - noise) × fraction/256 - strip, slope-gated, clamped to max. Relative, so a high valley fills like a low one.'],
   ['sedFraction', 'sediment fraction (Q8)', 0, 256, 4, 'Q8', ''],
   ['sedStrip', 'sediment strip', 0, 64, 1, 'vox', ''],
   ['sedSlope', 'sediment slope gate (Q8)', 0, 512, 8, 'Q8', 'Dirt and gravel are POWDERS: the wedge thins to nothing as the slope approaches this, or the CA never sleeps. 0 = no wedge.'],
   ['sedMax', 'sediment max', 0, 40, 1, 'vox', 'Clamped under the cave shell (36 vox) at load.'],
   ['sedTopsoil', 'topsoil depth', 0, 40, 1, 'vox', 'The top of the wedge that wears the biome’s subsoil material.'],
-  ['treeline', 'treeline', 0, 32000, 4, 'y vox', 'Snow and no trees at or above this ground Y.'],
+  ['treeline', 'treeline', -32000, 32000, 4, 'y vox', 'The map’s treeline (absolute ground Y): snow and no trees at or above it. A column’s own is sea + (this − sea) × its biome’s treelineScale, ± the jitter.'],
+  ['treelineJitter', 'treeline jitter', 0, 4096, 4, 'vox', 'The treeline wobbles ± this much (25.6 m noise) so it is not a ruled contour.'],
+  ['rockSlope', 'steep rock slope (Q8)', 0, 4096, 16, 'Q8', 'A column at least this steep (landform slope; 256 = 1:1) skins as its biome’s rock with no snow and no plants: powder on a cliff never sleeps. 0 = off.'],
 ];
 let selected = null;       // the site the sites panel has selected (any kind)
 let heights = null;        // the decoded --heightmap backdrop, or null
@@ -454,7 +455,9 @@ function publishTerrain() {
   const t = terrainOf();
   const sp = (map.json.sites || []).find(s => s.kind === 'spawn');
   const at = sp && Array.isArray(sp.at) ? sp.at : SPAWN_DEFAULT;
-  window.wgTerrain = {treeline: t.treeline, homeY: t.homeArea.y, homeR: t.homeArea.radius, homeFade: t.homeArea.fade,
+  // homeY: the AUTHORED ground at the spawn (map v2 A1 retired homeArea.y).
+  const homeY = map.H ? Math.round(MT.heightAt(map.H, at[0], at[1])) : t.baseHeight;
+  window.wgTerrain = {treeline: t.treeline, homeY, homeR: t.homeArea.radius, homeFade: t.homeArea.fade,
                       seaLevelY: seaY(), spawnX: at[0], spawnZ: at[1]};
 }
 

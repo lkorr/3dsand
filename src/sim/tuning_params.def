@@ -801,6 +801,10 @@ TP_F(sim, heatDownGain, NO_WGSL, 0.25f, 0.0f, 4.0f)
 // + a hand-written rule in LoadTuning
 TP_I(sim, heatSnowlineBase, NO_WGSL, -20, -64, 63)
 TP_I(sim, heatSnowlineSwing, NO_WGSL, 8, 0, 63)
+// THE LAPSE RATE (map v2 A1): heat units the climate cools per km above the
+// map's sea level (heatParams kHpLapse; sim_heat.wgsl heatLapse). Integer,
+// converted nowhere: the kernel divides by 1000 m in voxels.
+TP_I(sim, heatLapsePerKm, NO_WGSL, 6, 0, 64)
 // THE TENT CADENCE (2026-10-06): a chunk's heat target is recomputed at most
 // every Nth tick, on its phase (world chunk x mod N; heat.h kHmDue). The
 // relaxation toward the target (8+ ticks) hides the lag; sources, triggers

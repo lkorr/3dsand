@@ -1729,6 +1729,12 @@ void ProjectBodyUI(const LimbBoxes& lb, const PortraitCam& pc, UIState& ui) {
 // that column BEFORE the boot worldgen, so the first frame is generated
 // around the player rather than streamed to them one chunk-plane at a time
 // (Stream::Update shifts one chunk per axis per frame).
+// THE WINDOW'S Y over a column (map v2 A1): worldmap::WindowChunkYForGround of
+// the ground there. 0 on the harness map (its ground is ~y 200), so every
+// scripted scene below keeps the window it was written against.
+static int GroundWindowY(int x, int z) {
+  return worldmap::WindowChunkYForGround(World::TerrainHeight(x, z, kDefaultSeed));
+}
 IVec3 SpawnWindowOrigin() {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
   const int half = (int)kNChunk / 2;
@@ -1739,7 +1745,10 @@ IVec3 SpawnWindowOrigin() {
   // over before the cut, but it owned the whole-run stream and worldgen rows.
   if (g_fellSiteSet) { sx = g_fellSiteX - 48; sz = g_fellSiteZ; }
   if (g_atSet) { sx = (int)std::floor(g_atEye[0]); sz = (int)std::floor(g_atEye[2]); }
-  return IVec3{(sx >> 4) - half, 0, (sz >> 4) - half};
+  // Map v2 A1: the window's Y follows the ground under the spawn (it was
+  // pinned at 0, so a spawn on a 900 m valley booted into a window of sky
+  // 8 km below it and streamed up one chunk-plane a frame).
+  return IVec3{(sx >> 4) - half, GroundWindowY(sx, sz), (sz >> 4) - half};
 }
 Vec3 SpawnPos() {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
@@ -2151,7 +2160,7 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim,
   // the far-field cascade as flat colour with no submerged path at all. Shot
   // from the origin window this frame is a grey slab of far-field stone.
   {
-    world.SetWindowOrigin({260 / (int)kChunk - 8, 0, 300 / (int)kChunk - 8});
+    world.SetWindowOrigin({260 / (int)kChunk - 8, GroundWindowY(260, 300), 300 / (int)kChunk - 8});
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     for (uint32_t t = 1; t <= 40; t++)
@@ -2201,7 +2210,7 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim,
   // jitter either read or don't. Both are stills; judging the SWAY needs the
   // live app, but a frame mid-gust still shows the sheared blades leaning.
   {
-    world.SetWindowOrigin({336 / (int)kChunk - 8, 0, 96 / (int)kChunk - 8});
+    world.SetWindowOrigin({336 / (int)kChunk - 8, GroundWindowY(336, 96), 96 / (int)kChunk - 8});
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     for (uint32_t t = 1; t <= 40; t++)
@@ -2284,7 +2293,7 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim,
     const int kLx = 420, kLz = 420;
     const World::Column lakeCol = World::TerrainColumn(kLx, kLz, kDefaultSeed);
     const int kSurf = lakeCol.water != INT32_MIN ? lakeCol.water : lakeCol.h;
-    world.SetWindowOrigin({kLx / (int)kChunk - 8, 0, kLz / (int)kChunk - 8});
+    world.SetWindowOrigin({kLx / (int)kChunk - 8, GroundWindowY(kLx, kLz), kLz / (int)kChunk - 8});
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     std::vector<CellOp> slick;
@@ -2781,7 +2790,7 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim,
     // shot (the near half is what these frames are about) but it is why the
     // camera sits close to the middle rather than back on the bank.
     const int kPx = 258, kPz = -235;
-    world.SetWindowOrigin({kPx / (int)kChunk - 8, 0, kPz / (int)kChunk - 8});
+    world.SetWindowOrigin({kPx / (int)kChunk - 8, GroundWindowY(kPx, kPz), kPz / (int)kChunk - 8});
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     for (uint32_t t = 1; t <= 60; t++)
@@ -2853,7 +2862,7 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim,
     const uint32_t copper = matId("copper_bar"), mLight = matId("lightning"),
                    mSpark = matId("spark"), mArc = matId("arc");
     const int gx = 120, gz = 140;
-    world.SetWindowOrigin({gx / (int)kChunk - 8, 0, gz / (int)kChunk - 8});
+    world.SetWindowOrigin({gx / (int)kChunk - 8, GroundWindowY(gx, gz), gz / (int)kChunk - 8});
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     const int x0 = gx - 30, x1 = gx + 30, z0 = gz - 16, z1 = gz + 16;
@@ -3376,7 +3385,7 @@ int RunDebrisPondShot(GpuContext& ctx, World& world, Simulation& sim,
   // chunk that holds it is -15.
   const IVec3 here{(int)std::floor(kPx / (float)kChunk), 3,
                    (int)std::floor(kPz / (float)kChunk)};
-  world.SetWindowOrigin({here.x - 8, 0, here.z - 8});
+  world.SetWindowOrigin({here.x - 8, GroundWindowY(kPx, kPz), here.z - 8});
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
   FarField far;
@@ -3582,7 +3591,7 @@ int RunFluidShot(GpuContext& ctx, World& world, Simulation& sim,
     // clips nothing — which would hide the exact defect this scene exists to
     // photograph. Drain it so the shot sees the box the game sees.
     SetHarnessSnapshotDrain(true);
-    world.SetWindowOrigin({kPx / (int)kChunk - 8, 0, kPz / (int)kChunk - 8});
+    world.SetWindowOrigin({kPx / (int)kChunk - 8, GroundWindowY(kPx, kPz), kPz / (int)kChunk - 8});
   }
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
@@ -16047,9 +16056,10 @@ int main(int argc, char** argv) {
           const bool day = DaylightStrengthCpu(DayPhaseNow(tick)) > 0;
           hr.valid = true;
           hr.day = day;
-          hr.snowline = hy >= HeatSnowlineY();
+          hr.snowline = hy >= HeatSnowlineYAt(hx, hz, world.WorldSeed());
           const uint32_t bi = World::MapBiomeAt(hx, hz, world.WorldSeed());
-          const HeatClimate cl = hr.snowline ? HeatSnowlineClimate() : HeatBiomeClimate(bi);
+          HeatClimate cl = hr.snowline ? HeatSnowlineClimate() : HeatBiomeClimate(bi);
+          if (!hr.snowline) cl.base -= HeatLapseAt(hy);   // the lapse rate (map v2 A1)
           // By biome ID (MapBiomeAt's answer), not by the map's palette slot.
           const std::vector<std::string>& names = worldmap::CurrentWorldMap().biomeName;
           hr.biome = hr.snowline ? std::string("snowline")

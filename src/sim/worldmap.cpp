@@ -169,10 +169,11 @@ void TerrainWords(const TerrainParams& t, uint32_t out[kTerrainWords]) {
   at(kHTerrainGrainAmplitude) = U(std::clamp(t.grainAmplitude, 0, kNoiseAmpMax));
   at(kHTerrainGrainLog2) = U(std::clamp(t.grainLog2, 3, 15));
   at(kHTerrainFbmAtten) = U(std::clamp(t.fbmAtten, 0, 256));
-  at(kHTerrainHomeY) = U(t.homeY);
+  at(kHTerrainTreelineJitter) = U(std::clamp(t.treelineJitter, 0, kTreelineJitterMax));
+  at(kHTerrainRockSlope) = U(std::max(0, t.rockSlope));
   at(kHTerrainHomeR) = U(std::max(0, t.homeR));
   at(kHTerrainHomeFade) = U(std::max(1, t.homeFade));
-  at(kHTerrainSedCeil) = U(t.sedCeil);
+  at(kHTerrainSedAbove) = U(std::clamp(t.sedAbove, -4096, 4096));
   at(kHTerrainSedFraction) = U(std::max(0, t.sedFraction));
   at(kHTerrainSedStrip) = U(std::max(0, t.sedStrip));
   at(kHTerrainSedSlope) = U(std::max(0, t.sedSlope));
@@ -180,6 +181,27 @@ void TerrainWords(const TerrainParams& t, uint32_t out[kTerrainWords]) {
   at(kHTerrainSedTopsoil) = U(std::clamp(t.sedTopsoil, 0, std::max(0, t.sedMax)));
   at(kHTerrainTreeline) = U(t.treeline);
   at(kHTerrainRefVpm) = U(std::max(1, t.refVoxelsPerMetre));
+}
+
+int BiomeTreelineQ8(const biomes::BiomeDef& b) {
+  return std::clamp(static_cast<int>(std::lround(b.terrain.treelineScale * 256.0)), 0, 1024);
+}
+
+int TreelineMaxOf(const WorldMapData& map) {
+  // treelineAt = sea + (((treeline - sea) * scale) >> 8) + jitter, scale over
+  // every biome the map can show (the default 256 too: no planes = identity),
+  // jitter +-treelineJitter. Monotone in the scale, so its two ends bound it.
+  const int sea = map.seaLevelY, d = map.terrain.treeline - sea;
+  int lo = 256, hi = 256;
+  for (int q : map.biomeTreelineQ8) { lo = std::min(lo, q); hi = std::max(hi, q); }
+  const int top = sea + std::max((d * lo) >> 8, (d * hi) >> 8);
+  return top + std::clamp(map.terrain.treelineJitter, 0, kTreelineJitterMax) + 1;
+}
+
+int WindowChunkYForGround(int groundY) {
+  // floor((groundY - 72) / 256) half-windows, as chunks. Arithmetic shift
+  // floors on the negative side too.
+  return ((groundY - 72) >> 8) * static_cast<int>(kNChunk / 2);
 }
 
 BiomeTerrainPacked PackBiomeTerrain(const biomes::BiomeDef& b) {
@@ -337,6 +359,7 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
       const BiomeTerrainPacked bt = PackBiomeTerrain(b);
       for (uint32_t k = 0; k < kBiomeTerrainWords; k++) r[kB_CurveKnot0 + k] = bt.w[k];
     }
+    r[kB_TreelineQ8] = U(BiomeTreelineQ8(b));
     // P-E: cave flora from the band rows (mushrooms on the near band's floor,
     // crystal on the deep band's floor and ceiling), the cactus density, and
     // the water preset the biome's ponds and shores wear (see WaterPresetOf).
@@ -378,6 +401,7 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
       row[kC_NearWaterMin] = U(std::max(0, static_cast<int>(std::lround(c.cond.nearWaterMinM * kVoxelsPerMetre))));
       row[kC_CanopyMin] = U(std::clamp(c.cond.canopyMin, 0, 255));
       row[kC_CanopyMax] = U(std::clamp(c.cond.canopyMax, 0, 255));
+      row[kC_Treeline] = U(std::clamp(c.cond.treeline, 0, 2));
       count++;
     }
     // The biome's ceiling includes EVERY preset its water rows can roll (and,
@@ -881,12 +905,26 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     t.fbmAtten = std::clamp(num("fbmAtten", t.fbmAtten), 0, 256);
     const json ha = te.contains("homeArea") && te["homeArea"].is_object() ? te["homeArea"] : json::object();
     auto hnum = [&](const char* k, int d) { return ha.contains(k) && ha[k].is_number() ? ha[k].get<int>() : d; };
-    t.homeY = (hnum("y", t.homeY) * kVoxelsPerMetre) / ref;
+    // homeArea.y is not read (map v2 A1): the authored plane is the ground's
+    // height and the calm fade flattens only the noise. A map that still
+    // carries it gets a warning, not a refusal.
+    if (ha.contains("y")) warn("terrain.homeArea.y is ignored since map v2 (the height plane is the home ground)");
     t.homeR = std::max(0, (hnum("radius", t.homeR) * kVoxelsPerMetre) / ref);
     // A fade of 0 would divide by zero in landAt and make the home area's
     // boundary a STEP of the whole coarse relief (the terrain gate's A4).
     t.homeFade = std::max(1, (hnum("fade", t.homeFade) * kVoxelsPerMetre) / ref);
-    t.sedCeil = len("sedCeil", t.sedCeil);
+    // The wedge's ceiling is RELATIVE to the authored ground (map v2 A1):
+    // `sedAbove`. A map still written with the absolute v1 `sedCeil` is read
+    // as sedCeil - baseHeight -- v1's baseHeight was the mean ground the
+    // ceiling was tuned against (264 - 200 = 64, the shipped value) -- and
+    // warned about.
+    if (te.contains("sedAbove") && te["sedAbove"].is_number()) {
+      t.sedAbove = len("sedAbove", t.sedAbove);
+    } else if (te.contains("sedCeil") && te["sedCeil"].is_number()) {
+      t.sedAbove = len("sedCeil", 0) - t.baseHeight;
+      warn("terrain.sedCeil (absolute) read as sedAbove " + std::to_string(t.sedAbove) +
+           " (sedCeil - baseHeight); write sedAbove");
+    }
     t.sedFraction = std::max(0, num("sedFraction", t.sedFraction));
     t.sedStrip = std::max(0, len("sedStrip", t.sedStrip));
     t.sedSlope = std::max(0, num("sedSlope", t.sedSlope));
@@ -904,6 +942,8 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     }
     t.sedTopsoil = std::clamp(len("sedTopsoil", t.sedTopsoil), 0, t.sedMax);
     t.treeline = len("treeline", t.treeline);
+    t.treelineJitter = std::clamp(len("treelineJitter", t.treelineJitter), 0, kTreelineJitterMax);
+    t.rockSlope = std::max(0, num("rockSlope", t.rockSlope));
     TerrainWords(t, out.terrainWords);
   }
   // Amplitudes past kNoiseAmpMax are clamped by TerrainWords (the octave's
@@ -1593,6 +1633,10 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   for (const biomes::BiomeDef& b : set.biomes)
     if (b.index >= 0 && b.index < static_cast<int>(set.biomes.size()))
       out.biomeTerrain[static_cast<size_t>(b.index)] = PackBiomeTerrain(b);
+  out.biomeTreelineQ8.assign(set.biomes.size(), 256);
+  for (const biomes::BiomeDef& b : set.biomes)
+    if (b.index >= 0 && b.index < static_cast<int>(set.biomes.size()))
+      out.biomeTreelineQ8[static_cast<size_t>(b.index)] = BiomeTreelineQ8(b);
   out.biomeClimate.assign(set.biomes.size(), {});
   out.biomeName.assign(set.biomes.size(), std::string());
   for (const biomes::BiomeDef& b : set.biomes)
@@ -1915,15 +1959,19 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       }
       if (need > st.padMargin) st.padMargin = need;
     }
+    // A tree at or above ITS COLUMN'S treeline does not grow (worldgen.wgsl
+    // siteTree). Said, not refused: the author may be about to lower the
+    // ground under it. TreelineAt reads the current map, so it is asked here,
+    // with the map being loaded installed.
+    for (const WorldMapData::StampSite& st : out.sites) {
+      if (st.kind != kSiteTree) continue;
+      const int tl = TreelineAt(st.x, st.z, seed);
+      if (st.padY >= tl)
+        warn("site \"" + st.id + "\" (tree) stands on ground y" + std::to_string(st.padY) +
+             ", at or above its column's treeline y" + std::to_string(tl) + ": it will not grow");
+    }
     Slot() = std::move(prev);
   }
-  // A tree at or above the treeline does not grow (worldgen.wgsl siteTree:
-  // treeMaxTop() is the world-wide bound the sky skips rely on). Said, not
-  // refused: the author may be about to lower the ground under it.
-  for (const WorldMapData::StampSite& st : out.sites)
-    if (st.kind == kSiteTree && st.padY >= out.terrain.treeline)
-      warn("site \"" + st.id + "\" (tree) stands on ground y" + std::to_string(st.padY) +
-           ", at or above the treeline y" + std::to_string(out.terrain.treeline) + ": it will not grow");
 
   // THE CONTENT HASH: map.json, then every tile file in (plane, tz, tx) order
   // (name + bytes, so moving a tile is a change), then the sculpt layer and
@@ -1999,6 +2047,7 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
   // The terrain words likewise (P-G): an unloaded map carries the defaults,
   // and the twin reads WorldMapData's copy of the same words either way.
   for (uint32_t k = 0; k < kTerrainWords; k++) W[kHTerrainBaseHeight + k] = map.terrainWords[k];
+  W[kHTreelineMax] = U(TreelineMaxOf(map));
   if (!map.Loaded()) return true;   // P0/P1 tools: records only, planes absent
   W[kHSiteCellLog2] = U(map.siteCellLog2);
   W[kHSiteW] = U(map.siteW);

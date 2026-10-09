@@ -61,6 +61,10 @@ struct Conditions {
   // flower chain became.
   int canopyMin = 0;
   int canopyMax = 255;
+  // Map v2 A1: relative to the COLUMN's treeline (conditions.treeline:
+  // "below" / "above"; absent or "" = any). Only cover rows read it (the
+  // tree rows have the treeline built in, and a pond is a pond above it).
+  int treeline = 0;   // 0 any, 1 below, 2 at or above (worldmap.h kC_Treeline)
 };
 
 struct CoverRow {
@@ -145,6 +149,11 @@ struct BiomeDef {
   struct Terrain {
     int curve[9] = {-16384, -12288, -8192, -4096, 0, 4096, 8192, 12288, 16384};
     int hill = 256, detail = 256, grain = 256;
+    // Map v2 A1: this biome's treeline as a FRACTION of the map's height
+    // above the sea (terrain.treelineScale; 1 = the map's treeline). A
+    // fraction rather than metres so one file serves a 1,400 m mountain map
+    // and the harness's 11.6 m one. Packed Q8 (worldmap.h kB_TreelineQ8).
+    double treelineScale = 1.0;
   } terrain;
   std::string file;
 };

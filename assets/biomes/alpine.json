@@ -25,7 +25,8 @@
     ],
     "hill": 256,
     "detail": 256,
-    "grain": 256
+    "grain": 256,
+    "treelineScale": 0.9
   },
   "cover": {
     "skin": "stone",
@@ -43,7 +44,8 @@
         "height": 0.1,
         "conditions": {
           "minY": -1,
-          "maxY": 227,
+          "maxY": -1,
+          "treeline": "below",
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
@@ -59,7 +61,8 @@
         "height": 0.1,
         "conditions": {
           "minY": -1,
-          "maxY": 227,
+          "maxY": -1,
+          "treeline": "below",
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
@@ -75,7 +78,8 @@
         "height": 0.3,
         "conditions": {
           "minY": -1,
-          "maxY": 227,
+          "maxY": -1,
+          "treeline": "below",
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
@@ -90,8 +94,9 @@
         "chance": 80,
         "height": 0.1,
         "conditions": {
-          "minY": 228,
+          "minY": -1,
           "maxY": -1,
+          "treeline": "above",
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
