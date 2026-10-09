@@ -137,6 +137,7 @@ let OL = null;             // the overlays (mapoverlay.js): slope / flow / lakes
 let CLM = null;            // the climate panel (mapclimate.js): climate inputs, overlays, Generate biomes, the Lock tool
 let CST = null;            // the coast tools (mapcoast.js): wobble / beach / cliff / smooth
 let WL = null;             // the rivers + lakes (mapwater.js): rivers[] / lakes[], the River + Lake tools, the live bake
+let previewPending = false; // the preview pane opens in its voxel view on the page's first activate()
 // THE TOOL REGISTRY (maptools.js): every tool, built-in or a layer's, is one
 // registerTool({...}) call; `locale: true` puts it on the LOCALE page (a
 // locale open), `world: false` keeps it off the world map.
@@ -3422,7 +3423,7 @@ export function attach(hooks) {
       el('b', {}, 'Preview'),
       el('span', {class: 'mapnote'}, ' the engine’s heights (--heightmap) or its real voxels (--voxserve) for the SAVED files: previews, not authoring. ' +
          'Regen note: the game re-reads the map, the biomes and the trees on F7 / Apply; the Plants button cycles the two dev A/B switches (tuning.json debug.groundCover, debug.vegetation) through ALL / no ground cover / none.'));
-    const pvToggle = el('button', {}, 'Show preview');
+    const pvToggle = el('button', {}, 'Hide preview');
     pvToggle.addEventListener('click', () => {
       const on = pv.style.display === 'none';
       pv.style.display = on ? '' : 'none';
@@ -3431,7 +3432,12 @@ export function attach(hooks) {
     });
     head.prepend(pvToggle);
     main.append(head, pv);
-    pv.style.display = 'none';
+    // Owner, 2026-10-09: the preview is OPEN by default and in its VOXEL view.
+    // The voxel view is switched on the first time the page is shown
+    // (activate), not here: attach runs at tuner load, and the voxel view
+    // starts a --voxserve process the other tabs have no use for.
+    pv.style.display = '';
+    previewPending = true;
   }
   wire();
   new ResizeObserver(() => paint()).observe(els.canvas);
@@ -3541,7 +3547,16 @@ export function saveFromHost() {
   if (dirty) saveMap();
   if (tuningTouched && H.saveTuning) { H.saveTuning(); tuningTouched = false; }
 }
-export function activate() { if (map) { syncTerrain(); syncSites(); publishTerrain(); syncLines(); syncHeightTools(); VL.sync(); LC.sync(); RL.sync(); GL.sync(); CLM.sync(); WL.sync(); } }
+export function activate() {
+  if (map) { syncTerrain(); syncSites(); publishTerrain(); syncLines(); syncHeightTools(); VL.sync(); LC.sync(); RL.sync(); GL.sync(); CLM.sync(); WL.sync(); }
+  // First showing: open the preview in its voxel view (the deep link's recipe,
+  // tuner.html tunerDeepLink). wvToggle / wvOn are tuner.html globals.
+  if (previewPending) {
+    previewPending = false;
+    if (window.wgPreviewShow) window.wgPreviewShow();
+    if (typeof window.wvToggle === 'function' && !window.wvOn) window.wvToggle();
+  }
+}
 // test seams
 export function _map() { return map; }
 export function _load(name) { return loadMap(name); }
