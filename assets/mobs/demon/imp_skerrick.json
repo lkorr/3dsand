@@ -22,7 +22,7 @@
           }
         ]
       },
-      "bough": {
+      "tail": {
         "layers": [
           {
             "material": "hair_white",
@@ -199,9 +199,9 @@
       ]
     },
     {
-      "name": "bough",
+      "name": "tail",
       "parent": "torso",
-      "joint": "fixed",
+      "joint": "ball",
       "hp": 4,
       "severable": true,
       "vital": false,
@@ -209,9 +209,17 @@
       "tag": "hair",
       "anchor": [
         14.5,
-        31,
-        5.5
-      ]
+        28,
+        3.5
+      ],
+      "cone": 0.6,
+      "coneSide": 0.9,
+      "twist": 0.2,
+      "spring": {
+        "halflife": 0.37,
+        "gain": 0.6,
+        "maxAngle": 0.55
+      }
     }
   ],
   "sockets": [
@@ -291,6 +299,11 @@
     {
       "name": "crawl.shins",
       "bodyYOffset": null
+    },
+    {
+      "name": "tailsway",
+      "overlay": true,
+      "clip": "tailsway"
     },
     {
       "name": "hunch",
@@ -478,6 +491,51 @@
     },
     "run": {
       "durationMs": 257
+    },
+    "tailsway": {
+      "durationMs": 1720,
+      "loop": true,
+      "mode": "additive",
+      "blendInMs": 300,
+      "blendOutMs": 300,
+      "mask": [
+        "tail"
+      ],
+      "tracks": {
+        "tail": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                0,
+                0.1736,
+                0,
+                0.9848
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 860,
+              "q": [
+                0,
+                -0.1736,
+                0,
+                0.9848
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 1720,
+              "q": [
+                0,
+                0.1736,
+                0,
+                0.9848
+              ]
+            }
+          ]
+        }
+      }
     }
   },
   "genome": {
@@ -488,6 +546,32 @@
       "race": "demon",
       "sex": "male",
       "bust": 0,
+      "bra": {
+        "style": "classic",
+        "cover": 1,
+        "cupSize": 1,
+        "cupLift": 0,
+        "bridge": 0,
+        "bridgePos": 0.5,
+        "taper": 0,
+        "plunge": 0,
+        "bandPos": 0,
+        "band": 1,
+        "wrap": 0,
+        "straps": "classic",
+        "strapWidth": 0.75,
+        "strapSet": 0.45,
+        "tone": "cloth"
+      },
+      "briefs": {
+        "style": "shorts",
+        "rise": 0,
+        "band": 1,
+        "leg": 0,
+        "cut": 0,
+        "back": "full",
+        "tone": "cloth"
+      },
       "heightM": 0.85,
       "hipWidth": 8,
       "shoulderWidth": 8,
@@ -554,6 +638,8 @@
       "mouthOpen": 0,
       "mouthTone": "shade",
       "lips": 0,
+      "lipTone": "lit",
+      "lipLine": false,
       "nose": 0,
       "noseWidth": 1,
       "earSize": 1,
@@ -619,6 +705,7 @@
       "cloth": "#3a2a20",
       "clothShade": "#261a12",
       "nail": "#5a1410",
+      "lip": "#811919",
       "root": "#4a3a2b",
       "moss": "#7f9a3e",
       "branch": "#6b5540",
@@ -741,6 +828,13 @@
       "hornCurl": 0.1,
       "hornSpread": 0.35,
       "tail": 0.7,
+      "tailThick": 0.5,
+      "tailCurl": 0.5,
+      "tailTrail": 0.3,
+      "tailTip": "point",
+      "tailSway": 0.5,
+      "tailSpeed": 0.4,
+      "tailLag": 0.5,
       "claws": 0.8,
       "mottle": 0.4,
       "glow": true,

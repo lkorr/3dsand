@@ -164,7 +164,8 @@ export const ANATOMY_NOTES = {
  *  caller's default (bark). */
 export function slotMaterialNames(g, ART) {
   const m = {};
-  for (const s of [ART.SKIN_BASE, ART.SKIN_SHADE, ART.SKIN_LIGHT, ART.NAIL])
+  for (const s of [ART.SKIN_BASE, ART.SKIN_SHADE, ART.SKIN_LIGHT, ART.NAIL,
+                   ART.LIP])
     m[s] = MATS.bark;
   m[SLOTS.ROOT] = MATS.root;
   for (const s of [ART.HAIR, ART.HAIR_SHADE, ART.HAIR_WISP1, ART.HAIR_WISP2,

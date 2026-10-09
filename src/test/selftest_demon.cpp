@@ -551,6 +551,91 @@ Status GateDemonCircle(Ctx& c, std::string& detail) {
   return fails.empty() ? Status::Pass : Status::Fail;
 }
 
+// ---- THE TAIL SWAYS (AnimStateRule::overlay) --------------------------------
+// A demon's tail is a jointed `tail` limb with an additive `tailsway` clip kept
+// playing by an OVERLAY state: never selected, played on top of whichever
+// state won. The claim is that it really moves -- standing still on a pad, on
+// an upright demon (no state at all) AND on a hunched one (its `always` hunch
+// state wins the selection, and the sway must play anyway). Measured as the
+// tail's yaw in the torso's frame (Mob::LimbJointGap's relQuat), min to max
+// over a few sway periods. Threshold: tests/baseline.json demonTail.minSwayDeg.
+struct SwayOut {
+  bool def = false, limb = false, overlay = false, spawned = false;
+  float lo = 1e9f, hi = -1e9f;
+};
+
+SwayOut RunSway(Ctx& c, const std::string& mobName, uint32_t t0, uint64_t idBase) {
+  SwayOut out;
+  Regenerate(c);
+  c.mobs.SetNextIdCounter(idBase);
+  Fix f = Build(c, 8, false, false);
+  support::TickRig rig(c, t0, f.chunk);
+  for (size_t i = 0; i < f.pad.size(); i += kMaxCellOpsPerTick / 2)
+    Tick(rig, std::vector<CellOp>(f.pad.begin() + (ptrdiff_t)i,
+                                  f.pad.begin() + (ptrdiff_t)std::min(
+                                      f.pad.size(), i + kMaxCellOpsPerTick / 2)));
+  for (int i = 0; i < 8; i++) Tick(rig);
+  const int def = c.mobs.FindDef(mobName);
+  out.def = def >= 0;
+  if (def < 0) return out;
+  const MobDef& d = c.mobs.Defs()[(size_t)def];
+  int tail = -1;
+  for (size_t i = 0; i < d.limbs.size(); i++)
+    if (d.limbs[i].name == "tail") tail = (int)i;
+  out.limb = tail >= 0;
+  for (const AnimStateRule& r : d.skel.states)
+    out.overlay |= r.overlay && r.clip == "tailsway" && d.skel.FindClip(r.clip) >= 0;
+  if (tail < 0) return out;
+  const Vec3 ws = d.worldSize;
+  const uint64_t id =
+      c.mobs.Spawn(def, {f.x - (int)(ws.x * 0.5f), f.y, f.z - (int)(ws.z * 0.5f)});
+  out.spawned = id != 0;
+  if (!id) return out;
+  for (int i = 0; i < 10; i++) Tick(rig);
+  const int ticks = (int)BaselineNumber("demonTail.ticks", 150);
+  for (int i = 0; i < ticks; i++) {
+    Tick(rig);
+    float q[4] = {0, 0, 0, 1};
+    if (c.mobs.LimbJointGap(id, tail, false, q) < 0) continue;
+    const float yaw = 2.0f * std::atan2(q[1], q[3]) * 57.2957795f;
+    out.lo = std::min(out.lo, yaw);
+    out.hi = std::max(out.hi, yaw);
+  }
+  c.mobs.Reset();               // leave no demon behind for the next gate
+  return out;
+}
+
+Status GateDemonTail(Ctx& c, std::string& detail) {
+  IdCounterScope ids(c.mobs);
+  std::string fails;
+  auto check = [&](bool ok, const std::string& what) {
+    if (!ok) {
+      fails += (fails.empty() ? "" : "; ") + what;
+      std::printf("demon-tail: FAILED %s\n", what.c_str());
+    }
+  };
+  const float minDeg = (float)BaselineNumber("demonTail.minSwayDeg", 10);
+  const char* who[] = {"fiend", "imp_skerrick"};   // upright, hunched
+  uint64_t idBase = 0x7a11'0000ull;
+  for (const char* m : who) {
+    const SwayOut s = RunSway(c, m, 95000u, idBase);
+    idBase += 0x1000;
+    check(s.def, std::string(m) + " def loads");
+    check(s.limb, std::string(m) + " has a `tail` limb");
+    check(s.overlay, std::string(m) + " has the `tailsway` overlay state and clip");
+    check(s.spawned, std::string(m) + " spawns");
+    const float range = s.hi - s.lo;
+    check(range >= minDeg, Format("%s's tail swings %.1f deg (want >= %.1f)", m,
+                                  range > 0 ? range : 0.0f, minDeg));
+    detail += Format("%s%s: tail yaw %.1f..%.1f deg (%.1f)", detail.empty() ? "" : ", ",
+                     m, s.lo < 1e8f ? s.lo : 0.0f, s.hi > -1e8f ? s.hi : 0.0f,
+                     range > 0 ? range : 0.0f);
+  }
+  if (!fails.empty()) detail += "; FAILED: " + fails;
+  std::printf("demon-tail: %s (%s)\n", fails.empty() ? "PASS" : "FAIL", detail.c_str());
+  return fails.empty() ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 Status GateDemonSeals(Ctx& c, std::string& detail);   // selftest_demon_seals.cpp
@@ -573,6 +658,8 @@ const std::vector<Gate>& DemonGates() {
       // Creatures cast from a HAND (spell in, weapon put away and drawn back, the
       // gesture, the release from the fist): selftest_demon_cast.cpp.
       {"npc-hand-cast", "mob", {}, false, GateNpcHandCast},
+      // The demon's tail sways under every state (AnimStateRule::overlay).
+      {"demon-tail", "mob", {}, false, GateDemonTail},
   };
   return g;
 }

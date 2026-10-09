@@ -14487,6 +14487,19 @@ and `ConformProneSegments` bends each segment onto its own stretch of that
 ground. The snake has no IK chains, so the gait, the stride clock and the leg
 IK never run.
 
+**Motion that belongs to a PART, not a state: `states[].overlay`**
+(`AnimStateRule::overlay`, 2026-10-08, the demon's tail). States are
+first-match-wins, so a looping motion authored as a state would fight the
+body's real one (a hunched demon's `always` hunch) and stop whenever a damage
+state won. An overlay rule is never SELECTED (`AnimSelectState` skips it);
+`pose.cpp` keeps its clip playing every tick, on top of whatever state did
+win, restarting it only if the instance is missing. Its clip should be
+additive and masked to the parts it moves. The demon's tail is a jointed,
+sprung `tail` limb (mobgen `HAIR_PARTS.tail`, anchored at its root, spring
+from `demon.tailLag`) with a generated `tailsway` clip (a yaw of
++-(5 + 30 x tailSway) degrees at the root); gate `demon-tail` measures the
+swing on an upright and a hunched demon.
+
 **Lateral undulation: a wave fixed in the WORLD** (`Mob::ApplySlither`,
 `game/pose.cpp`, sidecar `slither`). A pose stage straight after the clip
 blend, data-gated on `MobDef::slither`. The chain (`parts`, head first) is

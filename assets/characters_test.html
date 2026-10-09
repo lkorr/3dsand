@@ -374,6 +374,27 @@ var toasts = [], dirt = [];
         'editing marks the page dirty and saving clears it',
         dirt.join(','));
 
+    // The gene rows are TABBED (one group on screen at a time), so "is this
+    // row offered" walks every tab and puts the first one back.
+    function allRowLabels() {
+      var out = [];
+      var tabs = [...host.querySelectorAll('.gtab')].map(function(b){
+        return b.textContent; });
+      var was = host.querySelector('.gtab.on');
+      was = was ? was.textContent : null;
+      tabs.forEach(function(t){
+        var b = [...host.querySelectorAll('.gtab')].find(function(x){
+          return x.textContent === t; });
+        if (b) b.click();
+        host.querySelectorAll('.grow .gl').forEach(function(e){
+          out.push(e.textContent); });
+      });
+      var back = [...host.querySelectorAll('.gtab')].find(function(x){
+        return x.textContent === was; });
+      if (back) back.click();
+      return out;
+    }
+
     mark('10. the race toggle: human <-> sylvan');
     // ---- 10. the race toggle ------------------------------------------------
     // The sylvan (editor/sylvan.js) is a second surface on the same rig. What
@@ -393,14 +414,14 @@ var toasts = [], dirt = [];
         'the preview repaints as a sylvan');
     say(!!host.querySelector('.sf-sel') && !!host.querySelector('.sc-sel'),
         'the sylvan face and crown pickers appear');
-    var labels = [...host.querySelectorAll('.grow .gl')].map(function(e){
-      return e.textContent; });
+    var labels = allRowLabels();
     say(labels.some(function(t){ return t.indexOf('eye depth') === 0; }) &&
         labels.some(function(t){ return t.indexOf('bark') === 0; }),
         'the sylvan rows (eye depth, bark...) are offered');
     var before10 = host.querySelector('.prev canvas').toDataURL();
     var sc = host.querySelector('.sc-sel');
     sc.value = 'blossom'; sc.dispatchEvent(new Event('change'));
+    breed.__test.flush();
     say(st.genome.sylvan.crown === 'blossom' &&
         host.querySelector('.prev canvas').toDataURL() !== before10,
         'picking a crown reaches the preview');
@@ -409,6 +430,7 @@ var toasts = [], dirt = [];
     var sb = host.querySelector('.sb-sel');
     say(!!sb, 'the branch picker is offered');
     if (sb) { sb.value = 'shoulders'; sb.dispatchEvent(new Event('change')); }
+    breed.__test.flush();
     say(st.genome.sylvan.branchStyle === 'shoulders' &&
         st.genome.sylvan.crown === 'blossom' &&
         host.querySelector('.prev canvas').toDataURL() !== before10b,
@@ -419,8 +441,8 @@ var toasts = [], dirt = [];
     if (violet) violet.click();
     say(st.genome.colors.eye === mg.SYLVAN_GLOWS.violet,
         'clicking a glow swatch sets the eye colour');
-    say([...host.querySelectorAll('.grow .gl')].some(function(e){
-          return e.textContent.indexOf('leaf mix') === 0; }),
+    say(allRowLabels().some(function(t){
+          return t.indexOf('leaf mix') === 0; }),
         'the leaf mix row is offered');
     st.source = 'random';
     breed.__test.rollLitter();
@@ -476,18 +498,19 @@ var toasts = [], dirt = [];
       var pickSel = host.querySelector('.rp-' + M.picker + '-sel');
       say(!!faceSel && !!pickSel, 'the ' + M.race + ' face and ' + M.picker +
           ' pickers appear');
-      var mLabels = [...host.querySelectorAll('.grow .gl')].map(function(e){
-        return e.textContent; });
+      var mLabels = allRowLabels();
       say(mLabels.some(function(t){ return t.indexOf(M.row) === 0; }),
           'the ' + M.race + ' rows (' + M.row + '...) are offered');
       var mBefore = host.querySelector('.prev canvas').toDataURL();
       if (pickSel) { pickSel.value = M.style; pickSel.dispatchEvent(new Event('change')); }
+      breed.__test.flush();
       say(st.genome[M.race][M.picker] === M.style &&
           host.querySelector('.prev canvas').toDataURL() !== mBefore,
           'picking ' + M.picker + ' ' + M.style + ' reaches the preview');
       var mBefore2 = host.querySelector('.prev canvas').toDataURL();
       var faces = mg.RACE_MODS[M.race].FACE_ORDER;
       if (faceSel) { faceSel.value = faces[2]; faceSel.dispatchEvent(new Event('change')); }
+      breed.__test.flush();
       say(st.genome[M.race].face === faces[2] &&
           host.querySelector('.prev canvas').toDataURL() !== mBefore2,
           'picking the ' + faces[2] + ' face reaches the preview');
@@ -520,6 +543,34 @@ var toasts = [], dirt = [];
     if (humBtn2) humBtn2.click();
     say(st.genome.body.race === 'human' && !host.querySelector('.rp-face-sel'),
         'clicking human switches back and hides the machine rows');
+
+    mark('12. a tab randomizes only its own group, and undo puts it back');
+    // ---- 12. per-tab randomize + undo ----------------------------------------
+    breed.__test.preset('human');
+    var hairTab = [...host.querySelectorAll('.gtab')].find(function(b){
+      return b.textContent === 'hair'; });
+    say(!!hairTab, 'a hair tab is offered');
+    if (hairTab) hairTab.click();
+    var gBefore = JSON.stringify(st.genome);
+    var nonHair = function(g){
+      var c = JSON.parse(JSON.stringify(g)); delete c.hair; return JSON.stringify(c); };
+    var rnd = [...host.querySelectorAll('.bhead button')].find(function(b){
+      return b.textContent === 'randomize hair'; });
+    say(!!rnd, 'the hair tab has a randomize button');
+    // Ten tries: one roll can land on the same style by chance.
+    for (var ri = 0; ri < 10 && JSON.stringify(st.genome) === gBefore; ri++)
+      if (rnd) [...host.querySelectorAll('.bhead button')].find(function(b){
+        return b.textContent === 'randomize hair'; }).click();
+    say(JSON.stringify(st.genome.hair) !==
+          JSON.stringify(JSON.parse(gBefore).hair) &&
+        JSON.stringify(st.genome) !== gBefore,
+        'randomize hair changes the hair');
+    say(nonHair(st.genome) === nonHair(JSON.parse(gBefore)),
+        'randomize hair leaves every other group alone');
+    for (var ui = 0; ui < ri; ui++) breed.undoFromHost();
+    say(JSON.stringify(st.genome) === gBefore, 'undo puts the hair back');
+    breed.redoFromHost();
+    say(JSON.stringify(st.genome) !== gBefore, 'redo re-applies it');
   } catch (e) {
     say(false, 'harness threw: ' + (e && e.message || e),
         e && e.stack ? String(e.stack).split('\n')[1] : '');

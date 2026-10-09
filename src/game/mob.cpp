@@ -2045,6 +2045,7 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
       rule.minChainsLost = s.value("minChainsLost", 0);
       rule.activity = s.value("activity", "");
       rule.always = s.value("always", false);
+      rule.overlay = s.value("overlay", false);   // AnimStateRule::overlay
       rule.clip = s.value("clip", "");
       rule.speedScale = s.value("speedScale", 1.0f);
       // Read AFTER speedScale so its default can BE speedScale (anim.h).
@@ -2072,7 +2073,8 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
                "\" sets groundAlign without disableGait; the gait's foot "
                "plane will fight the ground fit\n";
       if (rule.missingAll.empty() && rule.missingAnyOf.empty() &&
-          rule.minChainsLost <= 0 && rule.activity.empty() && !rule.always)
+          rule.minChainsLost <= 0 && rule.activity.empty() && !rule.always &&
+          !rule.overlay)
         log += jp + ": state \"" + rule.name +
                "\" has an empty predicate and will never match\n";
       sk.states.push_back(std::move(rule));

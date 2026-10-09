@@ -364,6 +364,18 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
       }
     }
   }
+  // ---- OVERLAYS (AnimStateRule::overlay): kept playing whatever won above.
+  // A handful of compares a tick; PlayClip only when the instance is missing
+  // (first tick, or a def reload emptied the list).
+  for (const AnimStateRule& rule : sk.states) {
+    if (!rule.overlay || rule.clip.empty()) continue;
+    const int ci = sk.FindClip(rule.clip);
+    if (ci < 0) continue;
+    bool on = false;
+    for (const ClipInstance& inst : st.clips)
+      on |= inst.clip == ci && !inst.stopping;
+    if (!on) PlayClip(rule.clip);
+  }
   const AnimStateRule* loco =
       st.locoState >= 0 ? &sk.states[st.locoState] : nullptr;
   const bool clipOwnsPose = loco && loco->disableGait;
