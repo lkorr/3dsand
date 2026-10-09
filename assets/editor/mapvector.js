@@ -68,14 +68,14 @@ export const ICONS = {
     '............', 'k.k......k.k', 'kgk......kgk', 'kgk......kgk', 'kgkk.kk.kkgk', 'kgkkkkkkkkgk',
     'kggggggggggk', 'kgdggggggdgk', 'kggggkkggggk', 'kgggkbbkgggk', 'kgggkbbkgggk', 'kkkkkkkkkkkk'],
   tower: [
-    '...k.kk.k...', '...kggggk...', '....kggk....', '....kdgk....', '....kggk....', '....kggk....',
-    '....kgdk....', '....kggk....', '...kggggk...', '...kgbbgk...', '...kgbbgk...', '..kkkkkkkk..'],
+    '..kk.kk.kk..', '..kggggggk..', '..kkkkkkkk..', '...kggggk...', '...kgddgk...', '...kgddgk...',
+    '...kggggk...', '...kggggk...', '...kggggk...', '...kgbbgk...', '...kgbbgk...', '..kkkkkkkk..'],
   cave: [
     '............', '............', '....kkkk....', '...kggggk...', '..kggggggk..', '.kgggkkgggk.',
     '.kggkddkggk.', 'kgggkddkgggk', 'kggkddddkggk', 'kggkddddkggk', 'kggkddddkggk', 'kkkkkkkkkkkk'],
   ruin: [
-    '............', '.kk.........', '.kgk........', '.kgk....kk..', '.kgk....kgk.', '.kgk....kgk.',
-    '.kgk.kk.kgk.', '.kgk.kgkkgk.', '.kgk.kgkkgk.', '.kgk.kgkkgk.', 'kggggggggggk', 'kkkkkkkkkkkk'],
+    '............', 'kkkkkkk.....', '.kgggk......', '.kgggk......', '.kgggk.k..k.', '.kgggk.kgkgk',
+    '.kgggk.kgggk', '.kgggk.kgggk', '.kgggk.kgggk', 'kkkkkkkkkkkk', 'kggk.kgggggk', 'kkkk.kkkkkkk'],
   shrine: [
     '............', '.....kk.....', '....kyyk....', '...kkkkkk...', '..kllllllk..', '.kkkkkkkkkk.',
     '..klk..klk..', '..klkyyklk..', '..klk..klk..', '..klk..klk..', '.kkkkkkkkkk.', 'kllllllllllk'],
@@ -216,7 +216,8 @@ export function iconCanvas(name) {
 /**
  * The vector layer of one map page. `C` is the page:
  *   map()            the loaded {json, ...} or null
- *   view, SX(x), SZ(z), worldAtF(ev)
+ *   view, SX(x), SZ(z), worldAtF(ev), fitBox(x0, z0, x1, z1) (centre on a box,
+ *                    zooming only when it would be tiny or not fit)
  *   pushUndo(e), snapshot(), markDirty(), paint(), status(t), toast(t, bad), el(...)
  *   vpm(), seaY(), check(), savedJson() (the map.json as last loaded / saved)
  *   tool(), setTool(t), hover() ([wx, wz] under the cursor or null), materials()
@@ -736,11 +737,11 @@ export function createVectorLayer(C) {
     st.drawing = false;
     st.sel = {layer, id, k: -1};
     if (centre) {
-      if (layer === 'marker') { C.view.cx = o.at[0]; C.view.cz = o.at[1]; }
+      if (layer === 'marker') C.fitBox(o.at[0] - 200, o.at[1] - 200, o.at[0] + 200, o.at[1] + 200);
       else if ((o.points || []).length) {
         let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
         for (const p of o.points) { x0 = Math.min(x0, p[0]); x1 = Math.max(x1, p[0]); z0 = Math.min(z0, p[1]); z1 = Math.max(z1, p[1]); }
-        C.view.cx = (x0 + x1) / 2; C.view.cz = (z0 + z1) / 2;
+        C.fitBox(x0, z0, x1, z1);
       }
     }
     sync(); C.paint();

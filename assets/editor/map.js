@@ -1139,9 +1139,10 @@ function readout(wx, wz) {
 /* ---- input --------------------------------------------------------------------- */
 /** The world column under the cursor, fractional. */
 function worldAtF(ev) {
-  const r = els.canvas.getBoundingClientRect();
-  return [(ev.clientX - r.left - els.canvas.clientWidth / 2) / view.scale + view.cx,
-          (ev.clientY - r.top - els.canvas.clientHeight / 2) / view.scale + view.cz];
+  // the CONTENT box: the bounding rect includes the canvas's CSS border
+  const c = els.canvas, r = c.getBoundingClientRect();
+  return [(ev.clientX - r.left - c.clientLeft - c.clientWidth / 2) / view.scale + view.cx,
+          (ev.clientY - r.top - c.clientTop - c.clientHeight / 2) / view.scale + view.cz];
 }
 /** The world column under the cursor, whole voxels. */
 function worldColumnAt(ev) { const [x, z] = worldAtF(ev); return [Math.round(x), Math.round(z)]; }
@@ -2736,6 +2737,13 @@ export function attach(hooks) {
   // E3: the vector layers, handed the page (mapvector.js createVectorLayer)
   VL = VEC.createVectorLayer({
     map: () => map, view, SX, SZ, worldAtF,
+    fitBox: (x0, z0, x1, z1) => {
+      const c = els.canvas, vmin = Math.min(c.clientWidth || 600, c.clientHeight || 400);
+      const span = Math.max(x1 - x0, z1 - z0, 64), onScreen = span * view.scale;
+      if (onScreen < 40 || onScreen > 0.9 * vmin) view.scale = Math.min(4, 0.5 * vmin / span);
+      view.cx = (x0 + x1) / 2; view.cz = (z0 + z1) / 2;
+      scheduleRealRefresh();
+    },
     pushUndo, snapshot, markDirty, paint, status, toast, el,
     vpm, seaY, check: () => check, savedJson: () => savedJson,
     tool: () => tool, setTool: t => { tool = t; syncControls(); paint(); },

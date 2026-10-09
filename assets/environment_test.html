@@ -359,7 +359,9 @@ function readLit(wv, cv){
     function frac(wx, wz) { var v = M._view(); return [0.5 + (wx - v.cx) * v.scale / cv.clientWidth, 0.5 + (wz - v.cz) * v.scale / cv.clientHeight]; }
     function ptr(type, fx, fy, extra) {
       var r = cv.getBoundingClientRect();
-      var o = {clientX: r.left + r.width * fx, clientY: r.top + r.height * fy, button: 0, buttons: type === 'pointerup' ? 0 : 1, pointerId: 7, bubbles: true};
+      // fractions of the CONTENT box (what the page's view maps), not the border box
+      var o = {clientX: r.left + cv.clientLeft + cv.clientWidth * fx, clientY: r.top + cv.clientTop + cv.clientHeight * fy,
+               button: 0, buttons: type === 'pointerup' ? 0 : 1, pointerId: 7, bubbles: true};
       for (var k in (extra || {})) o[k] = extra[k];
       cv.dispatchEvent(new PointerEvent(type, o));
     }
@@ -638,8 +640,10 @@ function readLit(wv, cv){
     undoBtn.click();
     R1 = JS().roads[nRoads]; R2 = JS().roads[nRoads + 1];
     say(detached && R1.points[1].join() === R2.points[0].join(), 'Alt+drag pulls one road\'s vertex out of the junction (undone)');
-    // the inspector
+    // the inspector (select from the list centres the road; the view goes back after)
     VL.selectById('road', R1.id, true);
+    say(Math.abs(vw2.cx - (-50)) < 1 && Math.abs(vw2.cz - 5050) < 1, 'selecting a road from the list centres the view on it (' + vw2.cx + ', ' + vw2.cz + ')');
+    vw2.cx = 0; vw2.cz = 5000; vw2.scale = 0.5;
     var insp = pages.map.querySelector('details.mapvector .maptools-panel');
     var nIn = insp.querySelectorAll('input[type=number]');
     nIn[0].value = 30; nIn[0].dispatchEvent(new Event('change'));

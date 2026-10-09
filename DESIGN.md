@@ -23088,6 +23088,42 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   roads (`default/map.json`, ids `harrowby_*`, kind path) and were erased from
   `default_ground.svedit` by `harrowby_08_paths.sh` (`paint_ground.mjs
   --erase --only <mat>`). Gate `roads`.
+* **LIVE (map v2 E3, 2026-10-08): THE VECTOR LAYERS ARE EDITED ON THE MAP
+  PAGE.** `assets/editor/mapvector.js` (pure helpers Node-tested by
+  `scripts/test_mapvector.mjs`; the layer is created by `map.js`, which keeps
+  the canvas, undo and save) edits three map.json arrays. **Roads** (the R1
+  schema above, `depth` included; a new road is written with its kind's
+  defaults spelled out): draw (click, double-click / Enter ends), vertex
+  drag / insert (click the selected road) / delete (shift+click, Delete),
+  JUNCTIONS — a vertex dropped within 8 px of another road's vertex lands ON
+  it, dropped on another road's segment it lands on the segment and that road
+  gains a vertex there (a T); dragging a shared vertex moves every road on it
+  (Alt detaches, Alt on release does not snap); Ctrl+click starts a branch on
+  top of an existing road. Sharing a vertex is all a junction is: the R1 bake
+  does not profile-match junctions, so two roads meet at whatever Y each
+  bakes there. The inspector edits every field (kind change moves only the
+  fields left at the old kind's defaults; surface offers the SOLID mineral
+  materials) and draws the **profile as the ENGINE baked it**: `--mapcheck`'s
+  `roads[].profile` = the bake's own 4-voxel samples decimated to
+  `kRoadProfileMax` 256 (`s` arc length, `y` surface, `ground` bare ground),
+  cut / fill tinted, vertices ticked, hover shows the spot on the map. The
+  check is of the SAVED files, so a road edited since its save is labelled
+  as the saved road's bake. The page refuses to save a road with < 2
+  distinct points, a region with < 3, or a duplicate id (the loader would
+  refuse the whole map). **Regions** `{id, name, colour "#rrggbb", points}`
+  — named polygons, data only: `LoadWorldMap` refuses a missing / duplicate
+  id or < 3 distinct points, warns on a bad colour or a vertex outside the
+  extent; `WorldMapData::RegionAt(x, z)` (and the free `worldmap::RegionAt`,
+  by name, against `CurrentWorldMap()`) = the LAST region in table order
+  whose polygon holds the column centre (even-odd, integer, the page's
+  `regionAt` is the same arithmetic). Nothing reads it yet. **Markers**
+  `{id, name, icon, at}` — annotations; icons are 12x12 pixel art in
+  `mapvector.js ICONS` and must equal `worldmap.h kMarkerIcons` (hut,
+  village, castle, tower, cave, ruin, shrine, camp, mine, port; another is
+  a load warning). Locale markers are E4's (`locales[]`), not these. All
+  three are in map.json, so they move `contentHash` like any map edit.
+  `worldmap` gate part F: RegionAt over a square, a concave ell and a later
+  region on top; the warnings; the three refusals.
 * **LIVE (world map P5, 2026-09-04): THE SITE TABLE.** `map.json sites[]`
   of kind `stamp` (a `.vox` from `assets/prefabs/`, a world column, a
   rotation, a pad margin) and `rules[]` (`{kind: stamp, template, biome,
