@@ -982,12 +982,26 @@ export function createLocaleLayer(C) {
       L3 = null;
       if (wv) { wv.edit.clear(); wv.edit.markSaved(); wv.invalidate(); }
     }
+    // Render only when the picture can have changed (the camera, an edit, a
+    // region or mesh arriving) -- as tuner.html's wvFrame does. A 3D view
+    // redrawn every frame is a GPU (or, headless, a SwiftShader core) spent on
+    // a still image while the author works on the map beside it.
+    let lastSig = '';
+    function sig() {
+      const c = wv.cam;
+      let meshed = 0;
+      wv.regions.forEach(r => { meshed += (r.op ? 1 : 0) + (r.fl ? 2 : 0) + (r.dirty ? 4 : 0); });
+      return [c.mode, c.target, c.dist, c.yaw, c.pitch, c.pos, wv.editRev, wv.regions.size, meshed, wv.inflight,
+              wv.tool.name, wv.tool.radius, wv.hover ? wv.hover.vox.join('.') : '-', ui.canvas.clientWidth, ui.canvas.clientHeight].join('|');
+    }
     function frame(now) {
       raf = requestAnimationFrame(frame);
       if (!wv || !L3 || !C.isVisible() || ui.root.offsetParent === null) return;
       const dt = Math.min(0.1, (now - last) / 1000 || 0);
       last = now;
-      wv.step(dt); wv.update(); wv.render();
+      wv.step(dt); wv.update();
+      const s = sig();
+      if (s !== lastSig) { lastSig = s; wv.render(); }
     }
     async function save() {
       if (!wv || !L3) return false;

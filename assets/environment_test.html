@@ -33,7 +33,9 @@
 var log = [], fail = 0;
 // Progress lands in #out as it happens, so a run that exhausts the virtual
 // time budget still says how far it got (the last line is where it stalled).
-function say(ok, msg){ log.push((ok?'PASS  ':'FAIL  ') + msg); if(!ok) fail++; document.getElementById('out').textContent = 'running' + String.fromCharCode(10) + log.join(String.fromCharCode(10)); }
+// ...and on the console, so a run that HANGS (a dump-dom never comes) can be
+// read live with Chrome's --enable-logging=stderr.
+function say(ok, msg){ log.push((ok?'PASS  ':'FAIL  ') + msg); if(!ok) fail++; console.log('ENVTEST ' + log[log.length - 1]); document.getElementById('out').textContent = 'running' + String.fromCharCode(10) + log.join(String.fromCharCode(10)); }
 // A line this harness cannot decide on this machine (an engine that predates
 // the format under test): printed, never counted as a pass or a failure.
 function skip(msg){ log.push('SKIP  ' + msg); }
@@ -878,7 +880,9 @@ function readLit(wv, cv){
       else {
         var gIn = Math.round(M._groundAt(-1706, 1150)), gOut = Math.round(M._groundAt(-1696, 1150));
         V3.cam.target = [-1701, gIn, 1150]; V3.cam.dist = 30;
-        ok = await waitFor(function () { return V3.cellAtWorld(-1706, gIn + 3, 1150, 0) >= 0 && V3.cellAtWorld(-1696, gOut + 3, 1150, 0) >= 0 && V3.pal; }, 120000);
+        // the view streams from rAF, which this fetch-polling wait starves under virtual
+        // time: pump its streamer from the predicate (as worldview_test.html does)
+        ok = await waitFor(function () { V3.update(); return V3.cellAtWorld(-1706, gIn + 3, 1150, 0) >= 0 && V3.cellAtWorld(-1696, gOut + 3, 1150, 0) >= 0 && V3.pal; }, 120000);
         var mat = ok ? V3.pal.materials.filter(function (m) { return m.name === 'cobble'; })[0] : null;
         var nA = ok && mat ? V3.apply([[-1706, gIn + 3, 1150, mat.id], [-1696, gOut + 3, 1150, mat.id]], 'test') : -1;
         say(ok && nA === 1 && V3.edit.count() === 1, '3D view: of two voxels painted, the one inside the bounds is taken, the one 5 voxels past the edge is not (' + nA + ')');
@@ -891,7 +895,7 @@ function readLit(wv, cv){
           cell = [ccx * 16 + (li & 15), ccy * 16 + ((li >> 4) & 15), ccz * 16 + (li >> 8), wd & 0xFFF];
         }
         say(!!cell && cell.join() === [-1706, gIn + 3, 1150, mat.id].join(), 'locales/e4test/ground.svedit holds exactly that voxel (resolved back: ' + JSON.stringify(cell) + ')');
-        ok = await waitFor(function () { return (V3.cellAtWorld(-1706, gIn + 3, 1150, 0) & 0xFFF) === mat.id && !V3.edit.unsaved.size; }, 120000);
+        ok = await waitFor(function () { V3.update(); return (V3.cellAtWorld(-1706, gIn + 3, 1150, 0) & 0xFFF) === mat.id && !V3.edit.unsaved.size; }, 120000);
         say(ok, 'the voxel server applies the saved locale layer: the re-fetched region carries it (map=' + FIX + ', layer @map)');
         V3.edit.clear();
         await LCx.view3d.save();
