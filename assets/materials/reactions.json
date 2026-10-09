@@ -2909,6 +2909,141 @@
       "neighbor": "tag:extinguisher",
       "chance": 250,
       "selfBecomes": "smoke"
+    },
+    {
+      "note": "WORLDBUILDER B1 (2026-10-09): the new biome skins and tree ramps (materials.json, ids 225..265). Each is a copy of the rule its model already has -- grass's for the turfs, the autumn leaves' for the maple/beech ramps, ice's for the glacier -- because a solid with a thermal transition needs a rule of its own to be looked at by the CA at all. Contact only (neighbor tag:hot): nothing here runs at rest. Appended: re-rolls no earlier rule."
+    },
+    {
+      "self": "moor_turf",
+      "neighbor": "tag:hot",
+      "chance": 220,
+      "rainDamped": true,
+      "selfBecomes": "fire",
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "self": "savanna_grass",
+      "neighbor": "tag:hot",
+      "chance": 220,
+      "rainDamped": true,
+      "selfBecomes": "fire",
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "self": "amber_turf",
+      "neighbor": "tag:hot",
+      "chance": 220,
+      "rainDamped": true,
+      "selfBecomes": "fire",
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "self": "steppe_grass",
+      "neighbor": "tag:hot",
+      "chance": 220,
+      "rainDamped": true,
+      "selfBecomes": "fire",
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "self": "jungle_humus",
+      "neighbor": "tag:hot",
+      "chance": 220,
+      "rainDamped": true,
+      "selfBecomes": "fire",
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "self": "old_moss",
+      "neighbor": "tag:hot",
+      "chance": 220,
+      "rainDamped": true,
+      "selfBecomes": "fire",
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "self": "maple_dark",
+      "neighbor": "tag:hot",
+      "chance": 133,
+      "rainDamped": true,
+      "selfBecomes": "autumn_burning",
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "self": "maple_leaves",
+      "neighbor": "tag:hot",
+      "chance": 133,
+      "rainDamped": true,
+      "selfBecomes": "autumn_burning",
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "self": "maple_lit",
+      "neighbor": "tag:hot",
+      "chance": 133,
+      "rainDamped": true,
+      "selfBecomes": "autumn_burning",
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "self": "gold_dark",
+      "neighbor": "tag:hot",
+      "chance": 133,
+      "rainDamped": true,
+      "selfBecomes": "autumn_burning",
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "self": "gold_leaves",
+      "neighbor": "tag:hot",
+      "chance": 133,
+      "rainDamped": true,
+      "selfBecomes": "autumn_burning",
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "self": "gold_lit",
+      "neighbor": "tag:hot",
+      "chance": 133,
+      "rainDamped": true,
+      "selfBecomes": "autumn_burning",
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "self": "glacier_ice",
+      "neighbor": "tag:hot",
+      "chance": 400,
+      "selfBecomes": "water"
+    },
+    {
+      "self": "rime_crystal",
+      "neighbor": "tag:hot",
+      "chance": 400,
+      "selfBecomes": "water"
     }
   ]
 }

@@ -49,7 +49,11 @@ export const DEFAULT_VOX_PER_M = 10;
 // missing from this list would be saved as -1 and the engine would refuse to
 // start (ids must be contiguous). Add a biome HERE and as a file together.
 export const ENGINE_BIOMES = ['forest', 'meadow', 'pine', 'desert',
-                              'tundra', 'swamp', 'alpine', 'ocean'];
+                              'tundra', 'swamp', 'alpine', 'ocean',
+                              // worldbuilder B1 (2026-10-09)
+                              'ashlands', 'mesa', 'moor', 'glowfen', 'glacier',
+                              'savanna', 'dunes', 'amberwood', 'eldwood',
+                              'crystal_barrens', 'steppe', 'jungle', 'downs', 'karst'];
 
 // =============================================================================
 // the data model
@@ -89,8 +93,19 @@ export function defaultBiome() {
     displayName: 'Biome',
     index: -1,                       // worldgen B_* id; -1 = not an engine biome yet
     climate: {
-      temperature: 0.5,              // 0 cold .. 1 hot   (future climate grid)
-      moisture: 0.5,                 // 0 arid .. 1 wet
+      // THE WHITTAKER COORDINATES (worldbuilder B1, 2026-10-09). Read by the
+      // World map page's auto-biome generator (a column's climate is looked
+      // up against every biome's pair), never by the sim:
+      //   temperature: MEAN ANNUAL air temperature, degrees C
+      //                (tundra -10, forest 10, desert 24, jungle 26);
+      //   moisture:    EFFECTIVE annual moisture, 0..1 = annual
+      //                precipitation / 3000 mm (desert 0.04 = 120 mm,
+      //                forest 0.33 = 1000 mm, jungle 0.9 = 2700 mm); a
+      //                waterlogged biome counts its standing water (swamp
+      //                0.6), open water is 1.
+      // Until 2026-10-09 these were unread 0..1 placeholders.
+      temperature: 10,
+      moisture: 0.33,
       // THE CLIMATE THE SIM READS (docs/PLAN_temperature.md §5): heat units,
       // 0 = water freezes; day = base + swing, night = base - swing. The
       // loader refuses a range that straddles 0, a day that reaches any
@@ -295,7 +310,7 @@ export function validateBiome(biome, libs) {
 export const BIOME_PRESETS = {
   forest: {
     name: 'forest', displayName: 'Forest', index: 0,
-    climate: {temperature: 0.55, moisture: 0.65,
+    climate: {temperature: 10, moisture: 0.33,
               notes: 'The default band of the biome noise: between meadowThreshold and pineThreshold.'},
     cover: {
       skin: 'grass', skinDepth: 1, subsoil: 'dirt', patch: {threshold: 0, cellLog2: 5},
@@ -321,7 +336,7 @@ export const BIOME_PRESETS = {
   },
   meadow: {
     name: 'meadow', displayName: 'Meadow', index: 1,
-    climate: {temperature: 0.6, moisture: 0.5, notes: 'Biome noise below meadowThreshold.'},
+    climate: {temperature: 12, moisture: 0.22, notes: 'Biome noise below meadowThreshold.'},
     cover: {
       skin: 'grass', skinDepth: 1, subsoil: 'dirt', patch: {threshold: 0, cellLog2: 5},
       plants: [
@@ -348,7 +363,7 @@ export const BIOME_PRESETS = {
   },
   pine: {
     name: 'pine', displayName: 'Pine highland', index: 2,
-    climate: {temperature: 0.3, moisture: 0.55, notes: 'Biome noise between pineThreshold and desertThreshold.'},
+    climate: {temperature: 4, moisture: 0.28, notes: 'Biome noise between pineThreshold and desertThreshold.'},
     cover: {
       skin: 'grass', skinDepth: 1, subsoil: 'dirt', patch: {threshold: 120, cellLog2: 5},
       plants: [
@@ -372,7 +387,7 @@ export const BIOME_PRESETS = {
   },
   desert: {
     name: 'desert', displayName: 'Desert', index: 3,
-    climate: {temperature: 0.9, moisture: 0.1, notes: 'Biome noise above desertThreshold.'},
+    climate: {temperature: 24, moisture: 0.04, notes: 'Biome noise above desertThreshold.'},
     cover: {
       skin: 'sand', skinDepth: 4, subsoil: 'sand', patch: {threshold: 128, cellLog2: 5},
       plants: [

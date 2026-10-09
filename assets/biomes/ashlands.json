@@ -1,0 +1,169 @@
+{
+  "name": "ashlands",
+  "displayName": "Ashlands",
+  "index": 8,
+  "climate": {
+    "ambient": {
+      "base": 32,
+      "swing": 10
+    },
+    "temperature": 24.0,
+    "moisture": 0.08,
+    "notes": "Volcanic badlands: grey ash dunes over black basalt, charred snags, yellow brimstone crusts and the magenta of fireweed, the first plant back on any burn. Geothermally warm (day 42, night 22) and dry. The ash is a POWDER skin, so basalt is its firm skin: every slope past the ash's repose and every cut face is black rock. Caves are lava tubes (more of them, no mushrooms). Treeline 1.8x the map's so the cones stay bare ash, not snow."
+  },
+  "terrain": {
+    "curve": [
+      -16384,
+      -13312,
+      -9216,
+      -4608,
+      0,
+      5120,
+      10240,
+      13824,
+      16384
+    ],
+    "hill": 320,
+    "detail": 420,
+    "grain": 420,
+    "treelineScale": 1.8
+  },
+  "cover": {
+    "skin": "tephra",
+    "skinDepth": 2,
+    "subsoil": "cinder",
+    "firmSkin": "basalt",
+    "patch": {
+      "threshold": 0,
+      "cellLog2": 5
+    },
+    "plants": [
+      {
+        "material": "brimstone",
+        "head": "",
+        "chance": 90,
+        "height": 0.1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 170,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "fireweed",
+        "head": "",
+        "chance": 30,
+        "height": 0.8,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 120,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "dry_tussock",
+        "head": "",
+        "chance": 50,
+        "height": 0.3,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      }
+    ],
+    "groundFlora": false,
+    "cacti": false,
+    "sandCap": false,
+    "cactusChance": 26,
+    "saguaroFraction": 22
+  },
+  "trees": {
+    "tile": 14.4,
+    "density": 20,
+    "species": [
+      {
+        "species": "charred",
+        "weight": 30,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "dead",
+        "weight": 8,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      }
+    ]
+  },
+  "water": {
+    "features": []
+  },
+  "caves": {
+    "features": [
+      {
+        "preset": "near_surface",
+        "threshold": 140,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        },
+        "mushroomChance": 0
+      },
+      {
+        "preset": "deep",
+        "threshold": 135,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        },
+        "crystalChance": 6
+      }
+    ]
+  },
+  "swatch": {
+    "sizeM": 24,
+    "reliefM": 1.6,
+    "reliefFreq": 1
+  }
+}

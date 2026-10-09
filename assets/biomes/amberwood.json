@@ -1,0 +1,330 @@
+{
+  "name": "amberwood",
+  "displayName": "Amberwood",
+  "index": 15,
+  "climate": {
+    "ambient": {
+      "base": 10,
+      "swing": 6
+    },
+    "temperature": 7.0,
+    "moisture": 0.38,
+    "notes": "The autumn wood: a closed canopy of crimson maples and golden beeches over a floor of gold-gone turf, toadstools and ferns in the shade, golden grass in the gaps. A cool, continental broadleaf forest caught in its season."
+  },
+  "terrain": {
+    "curve": [
+      -16384,
+      -12288,
+      -8192,
+      -4096,
+      0,
+      4096,
+      8192,
+      12288,
+      16384
+    ],
+    "hill": 280,
+    "detail": 260,
+    "grain": 256,
+    "treelineScale": 1.05
+  },
+  "cover": {
+    "skin": "amber_turf",
+    "skinDepth": 1,
+    "subsoil": "dirt",
+    "patch": {
+      "threshold": 0,
+      "cellLog2": 5
+    },
+    "plants": [
+      {
+        "material": "mushroom_cluster",
+        "head": "",
+        "chance": 24,
+        "height": 0.2,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 96,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "toadstool_pale",
+        "head": "",
+        "chance": 40,
+        "height": 0.2,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 96,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "fern",
+        "head": "",
+        "chance": 18,
+        "height": 0.4,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 96,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "bramble",
+        "head": "",
+        "chance": 46,
+        "height": 0.3,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 96,
+          "canopyMax": 189
+        }
+      },
+      {
+        "material": "savanna_tallgrass",
+        "head": "savanna_tallgrass_head",
+        "chance": 10,
+        "height": 0.5,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 95
+        }
+      },
+      {
+        "material": "flower_foxglove",
+        "head": "",
+        "chance": 400,
+        "height": 0.5,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 95
+        }
+      },
+      {
+        "material": "toadstool_pale",
+        "head": "",
+        "chance": 120,
+        "height": 0.2,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "bramble",
+        "head": "",
+        "chance": 60,
+        "height": 0.4,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "fern",
+        "head": "",
+        "chance": 40,
+        "height": 0.4,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      }
+    ],
+    "groundFlora": true,
+    "cacti": false,
+    "sandCap": false,
+    "cactusChance": 26,
+    "saguaroFraction": 22
+  },
+  "trees": {
+    "tile": 6.4,
+    "density": 45,
+    "species": [
+      {
+        "species": "maple",
+        "weight": 40,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "goldbeech",
+        "weight": 30,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "oak",
+        "weight": 5,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "birch",
+        "weight": 6,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "bush",
+        "weight": 6,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "great_oak",
+        "weight": 4,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "dead",
+        "weight": 2,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      }
+    ]
+  },
+  "water": {
+    "features": []
+  },
+  "caves": {
+    "features": [
+      {
+        "preset": "near_surface",
+        "threshold": 150,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        },
+        "mushroomChance": 26
+      },
+      {
+        "preset": "deep",
+        "threshold": 140,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        },
+        "crystalChance": 9
+      }
+    ]
+  },
+  "swatch": {
+    "sizeM": 24,
+    "reliefM": 1.6,
+    "reliefFreq": 1
+  }
+}

@@ -1,0 +1,296 @@
+{
+  "name": "jungle",
+  "displayName": "Jungle",
+  "index": 19,
+  "climate": {
+    "ambient": {
+      "base": 27,
+      "swing": 4
+    },
+    "temperature": 26.0,
+    "moisture": 0.9,
+    "notes": "Lush tropical valley: a dense multi-storey forest -- kapok emergents over palms and broadleaves over a shrub layer -- on dark humus and red earth, ferns everywhere, tall grass in the gaps. Hot and wet all year. Hilly."
+  },
+  "terrain": {
+    "curve": [
+      -16384,
+      -13312,
+      -9728,
+      -5120,
+      0,
+      5120,
+      9728,
+      13312,
+      16384
+    ],
+    "hill": 360,
+    "detail": 300,
+    "grain": 256,
+    "treelineScale": 1.8
+  },
+  "cover": {
+    "skin": "jungle_humus",
+    "skinDepth": 1,
+    "subsoil": "red_earth",
+    "patch": {
+      "threshold": 0,
+      "cellLog2": 5
+    },
+    "plants": [
+      {
+        "material": "fern",
+        "head": "",
+        "chance": 5,
+        "height": 0.4,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 96,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "moss_patch",
+        "head": "",
+        "chance": 10,
+        "height": 0.1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 96,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "mushroom_cluster",
+        "head": "",
+        "chance": 80,
+        "height": 0.2,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 96,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "tall_grass",
+        "head": "tall_grass_head",
+        "chance": 6,
+        "height": 0.7,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "fern",
+        "head": "",
+        "chance": 10,
+        "height": 0.4,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "flower_foxglove",
+        "head": "",
+        "chance": 150,
+        "height": 0.5,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "bramble",
+        "head": "",
+        "chance": 40,
+        "height": 0.4,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      }
+    ],
+    "groundFlora": true,
+    "cacti": false,
+    "sandCap": false,
+    "cactusChance": 26,
+    "saguaroFraction": 22
+  },
+  "trees": {
+    "tile": 5.6,
+    "density": 70,
+    "species": [
+      {
+        "species": "kapok",
+        "weight": 10,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "palm",
+        "weight": 18,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "eucalyptus",
+        "weight": 10,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "great_oak",
+        "weight": 6,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "oak",
+        "weight": 6,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "bush",
+        "weight": 30,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "willow",
+        "weight": 8,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": 6,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      }
+    ]
+  },
+  "water": {
+    "features": []
+  },
+  "caves": {
+    "features": [
+      {
+        "preset": "near_surface",
+        "threshold": 150,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        },
+        "mushroomChance": 12
+      },
+      {
+        "preset": "deep",
+        "threshold": 140,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        },
+        "crystalChance": 9
+      }
+    ]
+  },
+  "swatch": {
+    "sizeM": 24,
+    "reliefM": 1.6,
+    "reliefFreq": 1
+  }
+}

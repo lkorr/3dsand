@@ -1,0 +1,290 @@
+{
+  "name": "downs",
+  "displayName": "Chalk downs",
+  "index": 20,
+  "climate": {
+    "ambient": {
+      "base": 11,
+      "swing": 6
+    },
+    "temperature": 10.0,
+    "moisture": 0.3,
+    "notes": "Rolling chalk downland: smooth, rounded, close-cropped turf (almost no detail or grain) with a SCARP in its relief curve (knots 3-4), white chalk under the turf and white chalk rock as the firm skin, so every steep face is a white cliff, and bare white chalk scars break the turf in patches (a one-cell chalk_rock cover row on the flatter ground). Wildflowers, hawthorn bushes, the odd oak. Mild."
+  },
+  "terrain": {
+    "curve": [
+      -16384,
+      -13824,
+      -11264,
+      -8704,
+      -2048,
+      4608,
+      7168,
+      9216,
+      11264
+    ],
+    "hill": 230,
+    "detail": 64,
+    "grain": 48,
+    "treelineScale": 1.2
+  },
+  "cover": {
+    "skin": "grass",
+    "skinDepth": 1,
+    "subsoil": "chalk",
+    "firmSkin": "chalk_rock",
+    "patch": {
+      "threshold": 0,
+      "cellLog2": 5
+    },
+    "plants": [
+      {
+        "material": "chalk_rock",
+        "head": "",
+        "chance": 3,
+        "height": 0.1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 300,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 205,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "grass_tuft",
+        "head": "",
+        "chance": 10,
+        "height": 0.2,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "flower_clover",
+        "head": "",
+        "chance": 30,
+        "height": 0.1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "flower_daisy",
+        "head": "",
+        "chance": 60,
+        "height": 0.25,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "flower_buttercup",
+        "head": "",
+        "chance": 70,
+        "height": 0.3,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "flower_bluebell",
+        "head": "",
+        "chance": 120,
+        "height": 0.2,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "flower_poppy",
+        "head": "",
+        "chance": 200,
+        "height": 0.3,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "bramble",
+        "head": "",
+        "chance": 200,
+        "height": 0.4,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      }
+    ],
+    "groundFlora": false,
+    "cacti": false,
+    "sandCap": false,
+    "cactusChance": 26,
+    "saguaroFraction": 22
+  },
+  "trees": {
+    "tile": 16.0,
+    "density": 6,
+    "species": [
+      {
+        "species": "bush",
+        "weight": 40,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "oak",
+        "weight": 12,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "juniper",
+        "weight": 10,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "birch",
+        "weight": 6,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "great_oak",
+        "weight": 2,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      }
+    ]
+  },
+  "water": {
+    "features": []
+  },
+  "caves": {
+    "features": [
+      {
+        "preset": "near_surface",
+        "threshold": 155,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        },
+        "mushroomChance": 26
+      },
+      {
+        "preset": "deep",
+        "threshold": 140,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        },
+        "crystalChance": 9
+      }
+    ]
+  },
+  "swatch": {
+    "sizeM": 24,
+    "reliefM": 1.6,
+    "reliefFreq": 1
+  }
+}

@@ -1,0 +1,164 @@
+{
+  "name": "mesa",
+  "displayName": "Red-rock mesa",
+  "index": 9,
+  "climate": {
+    "ambient": {
+      "base": 22,
+      "swing": 16
+    },
+    "temperature": 16.0,
+    "moisture": 0.09,
+    "notes": "Canyonlands: rust-red sand over red sandstone, cut into TERRACES -- the relief curve holds two plateaus (knots 2-5 and 6-7) with steep steps between them, so every map hill becomes a stepped butte and every step face is banded red rock (red_sandstone is the firm skin). Juniper, scrub and a few cacti. Hot days, cool nights."
+  },
+  "terrain": {
+    "curve": [
+      -16384,
+      -15360,
+      -14336,
+      -3072,
+      -2560,
+      -2048,
+      8704,
+      9216,
+      16384
+    ],
+    "hill": 200,
+    "detail": 300,
+    "grain": 300,
+    "treelineScale": 1.8
+  },
+  "cover": {
+    "skin": "red_sand",
+    "skinDepth": 2,
+    "subsoil": "red_sandstone",
+    "firmSkin": "red_sandstone",
+    "patch": {
+      "threshold": 0,
+      "cellLog2": 5
+    },
+    "plants": [
+      {
+        "material": "desert_scrub",
+        "head": "",
+        "chance": 60,
+        "height": 0.5,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "dry_tussock",
+        "head": "",
+        "chance": 30,
+        "height": 0.3,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      }
+    ],
+    "groundFlora": false,
+    "cacti": true,
+    "sandCap": false,
+    "cactusChance": 8,
+    "saguaroFraction": 30
+  },
+  "trees": {
+    "tile": 14.4,
+    "density": 6,
+    "species": [
+      {
+        "species": "juniper",
+        "weight": 30,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "bush",
+        "weight": 15,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "dead",
+        "weight": 8,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      }
+    ]
+  },
+  "water": {
+    "features": []
+  },
+  "caves": {
+    "features": [
+      {
+        "preset": "near_surface",
+        "threshold": 145,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        },
+        "mushroomChance": 60
+      },
+      {
+        "preset": "deep",
+        "threshold": 140,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        },
+        "crystalChance": 9
+      }
+    ]
+  },
+  "swatch": {
+    "sizeM": 24,
+    "reliefM": 1.6,
+    "reliefFreq": 1
+  }
+}

@@ -1,0 +1,330 @@
+{
+  "name": "eldwood",
+  "displayName": "Eldwood",
+  "index": 16,
+  "climate": {
+    "ambient": {
+      "base": 9,
+      "swing": 3
+    },
+    "temperature": 9.0,
+    "moisture": 0.65,
+    "notes": "Dark old-growth: a dense stand of great oaks and redwoods (with the rare glowcap) over a deep carpet of old moss and ferns, almost no sky. A cool temperate rainforest; the floor is shade plants everywhere and fern banks under the canopy."
+  },
+  "terrain": {
+    "curve": [
+      -16384,
+      -12800,
+      -8960,
+      -4352,
+      0,
+      4608,
+      9216,
+      13312,
+      16384
+    ],
+    "hill": 320,
+    "detail": 320,
+    "grain": 280,
+    "treelineScale": 1.1
+  },
+  "cover": {
+    "skin": "old_moss",
+    "skinDepth": 1,
+    "subsoil": "dirt",
+    "patch": {
+      "threshold": 0,
+      "cellLog2": 5
+    },
+    "plants": [
+      {
+        "material": "fern",
+        "head": "",
+        "chance": 6,
+        "height": 0.4,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 96,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "moss_patch",
+        "head": "",
+        "chance": 5,
+        "height": 0.1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 96,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "toadstool_pale",
+        "head": "",
+        "chance": 30,
+        "height": 0.2,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 96,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "mushroom_cluster",
+        "head": "",
+        "chance": 50,
+        "height": 0.2,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 96,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "glowcap_cluster",
+        "head": "",
+        "chance": 200,
+        "height": 0.2,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 160,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "bramble",
+        "head": "",
+        "chance": 40,
+        "height": 0.3,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 40,
+          "canopyMax": 189
+        }
+      },
+      {
+        "material": "fern",
+        "head": "",
+        "chance": 12,
+        "height": 0.4,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "flower_foxglove",
+        "head": "",
+        "chance": 200,
+        "height": 0.5,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "grass_tuft",
+        "head": "",
+        "chance": 30,
+        "height": 0.2,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      }
+    ],
+    "groundFlora": true,
+    "cacti": false,
+    "sandCap": false,
+    "cactusChance": 26,
+    "saguaroFraction": 22
+  },
+  "trees": {
+    "tile": 6.4,
+    "density": 60,
+    "species": [
+      {
+        "species": "great_oak",
+        "weight": 34,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "redwood",
+        "weight": 30,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "spruce",
+        "weight": 10,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "oak",
+        "weight": 8,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "dead",
+        "weight": 6,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "bush",
+        "weight": 6,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "glowcap_tree",
+        "weight": 2,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      }
+    ]
+  },
+  "water": {
+    "features": []
+  },
+  "caves": {
+    "features": [
+      {
+        "preset": "near_surface",
+        "threshold": 150,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        },
+        "mushroomChance": 10
+      },
+      {
+        "preset": "deep",
+        "threshold": 140,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        },
+        "crystalChance": 9
+      }
+    ]
+  },
+  "swatch": {
+    "sizeM": 24,
+    "reliefM": 1.6,
+    "reliefFreq": 1
+  }
+}

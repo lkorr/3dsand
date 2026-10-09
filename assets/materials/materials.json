@@ -5332,6 +5332,1214 @@
         "dissolvable"
       ],
       "molten": "lava"
+    },
+    {
+      "//": "WORLDBUILDER B1 (2026-10-09): the HIGHLAND MOOR set begins here. Heather (ling): the moor's signature dwarf shrub, a knee-high carpet of stiff wiry stems tipped with mauve bloom. An ANALYTIC grass-kind plant (tracePlant), its blades short, thick and upright so a stand reads as a springy mat rather than as grass; the tips paint with heather_bloom. INERT like every worldgen plant (CLAUDE.md rule 2): no reaction uses it as `self`.",
+      "id": "heather",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 230,
+      "hardness": 3,
+      "rubble": "dust",
+      "//colors": "MODEL AVERAGE: brown-green wiry stems under a mauve top, so a dusky purple-brown -- what a heather moor actually is from a distance, never the saturated violet a single bloom is.",
+      "colors": [
+        "#5e4a4e",
+        "#4f3e42",
+        "#6e5660"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "plant": {
+          "kind": "grass",
+          "tip": "heather_bloom",
+          "count": 9,
+          "params": {
+            "halfWidth": 0.06,
+            "thickness": 0.04,
+            "taper": 0.45,
+            "tipFrac": 0.3,
+            "heightVary": 0.45,
+            "swayScale": 0.35,
+            "headChance": 0.0,
+            "rootSpread": 0.34,
+            "lean": 0.12,
+            "headLen": 0.0
+          }
+        }
+      }
+    },
+    {
+      "//": "Heather bloom: the mauve palette heather's blade tips paint with. Also a plain inert solid, like the petal colours.",
+      "id": "heather_bloom",
+      "class": "solid",
+      "density": 280,
+      "hardness": 2,
+      "rubble": "dust",
+      "colors": [
+        "#7c4678",
+        "#6a3a66",
+        "#8e5488"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire",
+      "far": "heather"
+    },
+    {
+      "//": "Cotton grass (bog cotton): the white-tufted sedge of wet moorland hollows -- a grass-kind plant whose seed heads are white tufts (petal_white). Placed only near water on the moor.",
+      "id": "cotton_grass",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 200,
+      "hardness": 2,
+      "rubble": "dust",
+      "colors": [
+        "#8f9c6c",
+        "#7e8b5e",
+        "#c8ccb4"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "far": "marsh_grass",
+      "micro": {
+        "plant": {
+          "kind": "grass",
+          "tip": "petal_white",
+          "accent": "petal_white",
+          "count": 6,
+          "params": {
+            "halfWidth": 0.035,
+            "thickness": 0.018,
+            "taper": 0.7,
+            "tipFrac": 0.1,
+            "heightVary": 0.4,
+            "swayScale": 1.1,
+            "headChance": 0.7,
+            "rootSpread": 0.3,
+            "lean": 0.18,
+            "headLen": 0.5
+          }
+        }
+      }
+    },
+    {
+      "//": "Fireweed (rosebay willowherb): the first plant back on burnt ground, a tall spire of magenta flowers. The ASHLANDS' one splash of colour, and a true story -- fireweed is what colonises every burn. Flower-kind spire (style 2, like the foxglove).",
+      "id": "fireweed",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 215,
+      "hardness": 2,
+      "rubble": "dust",
+      "colors": [
+        "#8e5a7e",
+        "#7a4c6c",
+        "#a46a92"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "far": "heather",
+      "micro": {
+        "plant": {
+          "kind": "flower",
+          "style": 2,
+          "body": "leaf_green",
+          "stem": "stem_green",
+          "tip": "petal_pink",
+          "accent": "leaf_green",
+          "params": {
+            "stemHalfW": 0.024,
+            "headR": 0.07,
+            "headH": 0.06,
+            "leafCount": 4,
+            "leafLen": 0.3,
+            "leafW": 0.06,
+            "swayScale": 0.9,
+            "heightVary": 0.35,
+            "headDrop": 0.0,
+            "headCount": 13,
+            "centreR": 0.0,
+            "petalGap": 0.0,
+            "petalCount": 1
+          }
+        }
+      }
+    },
+    {
+      "//": "Glowcap cluster: a knot of small teal-glowing mushrooms, the GLOWFEN's floor light. Mushroom-kind analytic plant painted with glowcap (the alchemy mushroom, emission 150); this cell itself glows far softer (45) so a carpet of them lights the mist without flooding it. INERT: unlike luminous_spores it grows nothing.",
+      "id": "glowcap_cluster",
+      "passable": true,
+      "class": "solid",
+      "density": 380,
+      "hardness": 2,
+      "rubble": "dust",
+      "emission": 45,
+      "colors": [
+        "#5ed8b4",
+        "#46c09c",
+        "#7cf0cc"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire",
+      "far": "glowcap",
+      "micro": {
+        "plant": {
+          "kind": "mushroom",
+          "style": 0,
+          "count": 4,
+          "body": "glowcap",
+          "accent": "glowcap",
+          "accent2": "mushroom_gill",
+          "stem": "mushroom_stem",
+          "params": {
+            "capRMin": 0.08,
+            "capRMax": 0.22,
+            "capH": 0.5,
+            "stemR": 0.26,
+            "stemH": 2.0,
+            "spotChance": 0.0,
+            "swayScale": 1.0,
+            "gillDepth": 0.3,
+            "heightVary": 0.45,
+            "capFlat": 0.0
+          }
+        }
+      }
+    },
+    {
+      "//": "Savanna grass SEGMENT: the tall golden grass of the savanna, stacked 5-9 cells by worldgen and capped by savanna_tallgrass_head, exactly like tall_grass (whose note explains the stacking). Its plant block must stay IDENTICAL to the head's apart from body/tip.",
+      "id": "savanna_tallgrass",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 210,
+      "hardness": 2,
+      "rubble": "dust",
+      "colors": [
+        "#b49c4c",
+        "#a28a42",
+        "#c6ae5c"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "plant": {
+          "kind": "grass",
+          "body": "savanna_tallgrass",
+          "tip": "savanna_tallgrass_head",
+          "accent": "savanna_tallgrass_head",
+          "count": 8,
+          "params": {
+            "halfWidth": 0.06,
+            "thickness": 0.025,
+            "taper": 0.65,
+            "tipFrac": 0.16,
+            "heightVary": 0.5,
+            "swayScale": 1.0,
+            "headChance": 0.25,
+            "rootSpread": 0.36,
+            "lean": 0.4,
+            "headLen": 0.6
+          }
+        }
+      }
+    },
+    {
+      "//": "Savanna grass HEAD: the terminal cell of a savanna_tallgrass stack and the straw palette its tips and seed heads paint with. Plant block identical to the segment's apart from body/tip.",
+      "id": "savanna_tallgrass_head",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 200,
+      "hardness": 2,
+      "rubble": "dust",
+      "colors": [
+        "#d2ba74",
+        "#c0a662",
+        "#e2cc88"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "far": "savanna_tallgrass",
+      "micro": {
+        "plant": {
+          "kind": "grass",
+          "body": "savanna_tallgrass",
+          "tip": "savanna_tallgrass_head",
+          "accent": "savanna_tallgrass_head",
+          "count": 8,
+          "params": {
+            "halfWidth": 0.06,
+            "thickness": 0.025,
+            "taper": 0.65,
+            "tipFrac": 0.16,
+            "heightVary": 0.5,
+            "swayScale": 1.0,
+            "headChance": 0.25,
+            "rootSpread": 0.36,
+            "lean": 0.4,
+            "headLen": 0.6
+          }
+        }
+      }
+    },
+    {
+      "//": "Marram grass: the dune builder -- tough, grey-green, rolled blades in loose clumps on coastal sand. Grass-kind, longer and thinner than a tuft and leaning with the sea wind.",
+      "id": "marram_grass",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 200,
+      "hardness": 2,
+      "rubble": "dust",
+      "colors": [
+        "#76895c",
+        "#66784f",
+        "#889a6c"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "micro": {
+        "plant": {
+          "kind": "grass",
+          "count": 7,
+          "params": {
+            "halfWidth": 0.035,
+            "thickness": 0.02,
+            "taper": 0.8,
+            "tipFrac": 0.2,
+            "heightVary": 0.45,
+            "swayScale": 1.2,
+            "headChance": 0.0,
+            "rootSpread": 0.3,
+            "lean": 0.45,
+            "headLen": 0.0
+          }
+        }
+      }
+    },
+    {
+      "//": "Sea thrift: the pink cushion flower of cliff-tops and dunes. Flower-kind cup (style 3) in petal_pink, short.",
+      "id": "sea_thrift",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 210,
+      "hardness": 2,
+      "rubble": "dust",
+      "colors": [
+        "#8c7a6c",
+        "#78685c",
+        "#c9849c"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "far": "marram_grass",
+      "micro": {
+        "plant": {
+          "kind": "flower",
+          "style": 3,
+          "body": "leaf_green",
+          "stem": "stem_green",
+          "tip": "petal_pink",
+          "accent": "petal_pink",
+          "params": {
+            "stemHalfW": 0.018,
+            "headR": 0.1,
+            "headH": 0.08,
+            "leafCount": 3,
+            "leafLen": 0.2,
+            "leafW": 0.04,
+            "swayScale": 1.2,
+            "heightVary": 0.3,
+            "headDrop": 0.0,
+            "headCount": 1,
+            "centreR": 0.03,
+            "petalGap": 0.0,
+            "petalCount": 5
+          }
+        }
+      }
+    },
+    {
+      "//": "Feather grass (stipa): the steppe's silver sea -- fine blades with long silky awns that catch the light and ripple in the wind. Grass-kind; the awns are its own pale palette (tip = itself).",
+      "id": "feather_grass",
+      "passable": true,
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 190,
+      "hardness": 2,
+      "rubble": "dust",
+      "colors": [
+        "#b8b894",
+        "#a6a684",
+        "#cfcfb0"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "far": "steppe_grass",
+      "micro": {
+        "plant": {
+          "kind": "grass",
+          "count": 8,
+          "params": {
+            "halfWidth": 0.03,
+            "thickness": 0.015,
+            "taper": 0.85,
+            "tipFrac": 0.5,
+            "heightVary": 0.5,
+            "swayScale": 1.4,
+            "headChance": 0.0,
+            "rootSpread": 0.34,
+            "lean": 0.5,
+            "headLen": 0.0
+          }
+        }
+      }
+    },
+    {
+      "//": "Brimstone crust: the yellow sulphur bloom around the ASHLANDS' fumaroles. A thin INERT mineral crust, one cell, laid as a cover row; not the alchemy `sulfur` powder (which burns) on purpose -- worldgen paints this by the thousand and a flammable crust would be a fire waiting for the first spark of every visitor.",
+      "id": "brimstone",
+      "passable": true,
+      "footstep": "path",
+      "class": "solid",
+      "density": 1900,
+      "hardness": 8,
+      "rubble": "sulfur",
+      "colors": [
+        "#d8c040",
+        "#c4ac30",
+        "#e8d458"
+      ],
+      "tags": [
+        "mineral"
+      ]
+    },
+    {
+      "//": "Rime crystal (frost-glass): the GLACIER's signature -- clear blades of hoarfrost ice standing up off the ice sheet, faintly lit from within. Melts like ice above 4 (the glacier's day is far below that: the loader's climate check proves it).",
+      "id": "rime_crystal",
+      "footstep": "path",
+      "class": "solid",
+      "density": 900,
+      "hardness": 10,
+      "rubble": "snow",
+      "emission": 30,
+      "opacity": 90,
+      "thermal": {
+        "melt": {
+          "above": 4,
+          "full": 64,
+          "chance": 25,
+          "into": "water"
+        }
+      },
+      "colors": [
+        "#d6f2fb",
+        "#bfe8f7",
+        "#ecfbff"
+      ],
+      "tags": [
+        "dissolvable"
+      ],
+      "molten": "water",
+      "far": "glacier_ice"
+    },
+    {
+      "//": "Crystal spire: violet quartz needles growing out of the CRYSTAL BARRENS' rock -- a surface cousin of the cave `crystal`, dimmer (70) so a field of them reads as glitter, not as a lamp. INERT mineral (rule 2), not flammable, does not melt.",
+      "id": "crystal_spire",
+      "footstep": "path",
+      "class": "solid",
+      "density": 2600,
+      "hardness": 70,
+      "emission": 70,
+      "colors": [
+        "#b48af0",
+        "#9a6edc",
+        "#d0b0ff"
+      ],
+      "tags": [
+        "mineral"
+      ]
+    },
+    {
+      "//": "Basalt: the ASHLANDS' rock -- black lava stone, the firm skin wherever ash cannot lie and the rock every cut face shows. Plain inert mineral like stone; melts back to lava.",
+      "id": "basalt",
+      "arcane": 2,
+      "footstep": "path",
+      "class": "solid",
+      "density": 2900,
+      "hardness": 95,
+      "rubble": "cinder",
+      "colors": [
+        "#3a3a3e",
+        "#323236",
+        "#46464b"
+      ],
+      "tags": [
+        "mineral",
+        "dissolvable"
+      ],
+      "molten": "lava"
+    },
+    {
+      "//": "Cinder: loose black-red scoria, the ashlands' subsoil. A powder (repose 38).",
+      "id": "cinder",
+      "footstep": "path",
+      "class": "powder",
+      "repose": 38,
+      "density": 1100,
+      "hardness": 14,
+      "colors": [
+        "#4a302a",
+        "#3c2622",
+        "#5a3a32"
+      ],
+      "tags": [
+        "mineral",
+        "dissolvable"
+      ],
+      "molten": "lava",
+      "far": "basalt"
+    },
+    {
+      "//": "Red sand: the MESA's rust-red desert sand (iron-stained). A powder like sand, and like sand it gets a firm skin (red_sandstone) wherever the ground is past its repose. NOT tagged `soil`: grass spreads into `soil` under sky (reactions.json), and a new SKIN carrying the tag would let a neighbouring grass biome creep across this one forever (rule 2).",
+      "id": "red_sand",
+      "arcane": 1,
+      "footstep": "path",
+      "class": "powder",
+      "repose": 34,
+      "density": 1600,
+      "hardness": 12,
+      "absorb": {
+        "capacity": 6
+      },
+      "colors": [
+        "#c8673a",
+        "#b85a30",
+        "#d67a4a"
+      ],
+      "tags": [
+        "mineral",
+        "meltable",
+        "dissolvable"
+      ],
+      "molten": "molten_glass"
+    },
+    {
+      "//": "Red sandstone: the mesa's banded cliff rock -- the firm half of a red-sand cover and the subsoil under it, so every cliff, butte and cut bank in the canyonlands is red.",
+      "id": "red_sandstone",
+      "arcane": 1,
+      "footstep": "path",
+      "class": "solid",
+      "density": 2300,
+      "hardness": 22,
+      "rubble": "red_sand",
+      "colors": [
+        "#a8502e",
+        "#984628",
+        "#b8623a"
+      ],
+      "tags": [
+        "mineral",
+        "meltable",
+        "dissolvable"
+      ],
+      "molten": "molten_glass"
+    },
+    {
+      "//": "Moor turf: the rough, tussocky ground of the HIGHLAND MOOR -- olive-brown grass and dead bracken over peat. The moor's skin. Burns like grass. NOT tagged `soil` (see red_sand: a skin must not be grass's to colonise).",
+      "id": "moor_turf",
+      "thermal": {
+        "ignite": {
+          "above": 135,
+          "full": 220,
+          "chance": 40,
+          "into": "fire"
+        }
+      },
+      "footstep": "path",
+      "class": "solid",
+      "density": 420,
+      "hardness": 8,
+      "absorb": {
+        "capacity": 14
+      },
+      "rubble": "peat",
+      "colors": [
+        "#57532e",
+        "#4a4727",
+        "#646036"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Peat: the moor's dark, waterlogged soil, under the turf. A powder (topsoil of the sediment wedge), tagged soil like dirt, and flammable -- peat smoulders, and a fire that gets into it is a real moorland hazard.",
+      "id": "peat",
+      "thermal": {
+        "ignite": {
+          "above": 150,
+          "full": 230,
+          "chance": 20,
+          "into": "ember"
+        }
+      },
+      "footstep": "path",
+      "class": "powder",
+      "repose": 40,
+      "density": 900,
+      "hardness": 10,
+      "absorb": {
+        "capacity": 15
+      },
+      "colors": [
+        "#3b2a1e",
+        "#312218",
+        "#473326"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "soil"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Fen moss: the GLOWFEN's spongy, blue-green sphagnum carpet -- the skin of the whole biome. Wet, soft, solid underfoot (a powder skin would never sleep on a slope). NOT tagged soil.",
+      "id": "fen_moss",
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 400,
+      "hardness": 5,
+      "absorb": {
+        "capacity": 15
+      },
+      "rubble": "peat",
+      "colors": [
+        "#3f7a62",
+        "#356a54",
+        "#4b8c70"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Glacier ice: the GLACIER's skin, subsoil and seracs -- old compacted ice, blue-white and OPAQUE (unlike pond `ice`, which is clear: a translucent ice sheet a kilometre wide would make the renderer march through it). Melts like ice above 4; the glacier's climate never reaches that.",
+      "id": "glacier_ice",
+      "thermal": {
+        "melt": {
+          "above": 4,
+          "full": 64,
+          "chance": 25,
+          "into": "water"
+        }
+      },
+      "footstep": "path",
+      "class": "solid",
+      "density": 917,
+      "hardness": 40,
+      "rubble": "snow",
+      "colors": [
+        "#a6d2ea",
+        "#92c4e2",
+        "#bcdff0"
+      ],
+      "tags": [
+        "dissolvable"
+      ],
+      "molten": "water"
+    },
+    {
+      "//": "Savanna grass: the SAVANNA's dry, golden ground layer (the short sward between the tall stands). Burns like grass. NOT tagged soil.",
+      "id": "savanna_grass",
+      "thermal": {
+        "ignite": {
+          "above": 135,
+          "full": 220,
+          "chance": 40,
+          "into": "fire"
+        }
+      },
+      "footstep": "path",
+      "class": "solid",
+      "density": 400,
+      "hardness": 8,
+      "absorb": {
+        "capacity": 10
+      },
+      "rubble": "red_earth",
+      "colors": [
+        "#b8a253",
+        "#a8924a",
+        "#c8b466"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Red earth (laterite): the iron-red tropical soil under the savanna and the jungle. A powder, tagged soil like dirt.",
+      "id": "red_earth",
+      "arcane": 1,
+      "footstep": "path",
+      "class": "powder",
+      "repose": 40,
+      "density": 1600,
+      "hardness": 14,
+      "absorb": {
+        "capacity": 10
+      },
+      "colors": [
+        "#9a4a2c",
+        "#8a4026",
+        "#aa5636"
+      ],
+      "tags": [
+        "mineral",
+        "dissolvable",
+        "soil"
+      ],
+      "molten": "lava",
+      "far": "red_sand"
+    },
+    {
+      "//": "Amber turf: the AMBERWOOD's floor -- grass gone gold under a canopy of falling leaves. Burns like grass. NOT tagged soil.",
+      "id": "amber_turf",
+      "thermal": {
+        "ignite": {
+          "above": 135,
+          "full": 220,
+          "chance": 40,
+          "into": "fire"
+        }
+      },
+      "footstep": "path",
+      "class": "solid",
+      "density": 420,
+      "hardness": 8,
+      "absorb": {
+        "capacity": 12
+      },
+      "rubble": "dirt",
+      "colors": [
+        "#9a7d38",
+        "#896e30",
+        "#ad8f44"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Quartzite: the CRYSTAL BARRENS' pale, lilac-grey rock pavement, skin and firm rock both. Inert mineral, harder than stone.",
+      "id": "quartzite",
+      "arcane": 4,
+      "footstep": "path",
+      "class": "solid",
+      "density": 2650,
+      "hardness": 100,
+      "rubble": "gravel",
+      "colors": [
+        "#c6bed2",
+        "#b6adc3",
+        "#d6cfe0"
+      ],
+      "tags": [
+        "mineral"
+      ],
+      "molten": "molten_glass"
+    },
+    {
+      "//": "Steppe grass: the STEPPE's short, dusty sage-green sward. Burns like grass. NOT tagged soil.",
+      "id": "steppe_grass",
+      "thermal": {
+        "ignite": {
+          "above": 135,
+          "full": 220,
+          "chance": 40,
+          "into": "fire"
+        }
+      },
+      "footstep": "path",
+      "class": "solid",
+      "density": 400,
+      "hardness": 8,
+      "absorb": {
+        "capacity": 10
+      },
+      "rubble": "black_earth",
+      "colors": [
+        "#7f9150",
+        "#718246",
+        "#8ea05c"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Black earth (chernozem): the steppe's deep, dark, fertile soil. A powder, tagged soil like dirt.",
+      "id": "black_earth",
+      "footstep": "path",
+      "class": "powder",
+      "repose": 40,
+      "density": 1300,
+      "hardness": 12,
+      "absorb": {
+        "capacity": 14
+      },
+      "colors": [
+        "#2c2622",
+        "#241f1b",
+        "#36302a"
+      ],
+      "tags": [
+        "mineral",
+        "dissolvable",
+        "soil"
+      ],
+      "molten": "lava",
+      "far": "peat"
+    },
+    {
+      "//": "Jungle humus: the JUNGLE's dark floor of leaf mould and roots. Burns reluctantly (it is wet). NOT tagged soil.",
+      "id": "jungle_humus",
+      "thermal": {
+        "ignite": {
+          "above": 160,
+          "full": 235,
+          "chance": 20,
+          "into": "fire"
+        }
+      },
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 450,
+      "hardness": 7,
+      "absorb": {
+        "capacity": 15
+      },
+      "rubble": "dirt",
+      "colors": [
+        "#3c3a1e",
+        "#323018",
+        "#484626"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Chalk rock: the CHALK DOWNS' white bedrock -- the solid form of `chalk` and the downs' firm skin, so every scarp and cut face is a white cliff. Its rubble is chalk powder, so the whole lime cycle (acid fizz, the kiln) still works on it once broken.",
+      "id": "chalk_rock",
+      "arcane": 2,
+      "footstep": "path",
+      "class": "solid",
+      "density": 2000,
+      "hardness": 30,
+      "rubble": "chalk",
+      "colors": [
+        "#ecebe2",
+        "#dddcd0",
+        "#f6f5ee"
+      ],
+      "tags": [
+        "mineral"
+      ]
+    },
+    {
+      "//": "Limestone: the KARST's grey pavement rock -- clints and grikes, the skin of the biome. Inert mineral; its rubble is gravel.",
+      "id": "limestone",
+      "arcane": 2,
+      "footstep": "path",
+      "class": "solid",
+      "density": 2500,
+      "hardness": 70,
+      "rubble": "gravel",
+      "colors": [
+        "#b2b2a6",
+        "#a3a398",
+        "#c0c0b4"
+      ],
+      "tags": [
+        "mineral",
+        "dissolvable"
+      ],
+      "molten": "lava"
+    },
+    {
+      "//": "Crimson MAPLE leaf ramp (dark / mid / lit), the amberwood's canopy (assets/trees/maple.json). Like every foliage ramp: inert, carries the leaf tag row, ignites like the autumn leaves.",
+      "id": "maple_dark",
+      "thermal": {
+        "ignite": {
+          "above": 135,
+          "full": 220,
+          "chance": 40,
+          "into": "autumn_burning"
+        }
+      },
+      "bleed": 0.2,
+      "bleedFluid": "syrup",
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 320,
+      "hardness": 6,
+      "rubble": "ash",
+      "colors": [
+        "#741c18",
+        "#651714",
+        "#842420"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "far": "maple_leaves"
+    },
+    {
+      "id": "maple_leaves",
+      "thermal": {
+        "ignite": {
+          "above": 135,
+          "full": 220,
+          "chance": 40,
+          "into": "autumn_burning"
+        }
+      },
+      "bleed": 0.2,
+      "bleedFluid": "syrup",
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 320,
+      "hardness": 6,
+      "rubble": "ash",
+      "colors": [
+        "#b4302a",
+        "#a22822",
+        "#c63e34"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "maple_lit",
+      "thermal": {
+        "ignite": {
+          "above": 135,
+          "full": 220,
+          "chance": 40,
+          "into": "autumn_burning"
+        }
+      },
+      "bleed": 0.2,
+      "bleedFluid": "syrup",
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 320,
+      "hardness": 6,
+      "rubble": "ash",
+      "colors": [
+        "#dc4c38",
+        "#cc4030",
+        "#ec6248"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "far": "maple_leaves"
+    },
+    {
+      "//": "Golden BEECH leaf ramp (dark / mid / lit), the amberwood's second canopy (assets/trees/goldbeech.json).",
+      "id": "gold_dark",
+      "thermal": {
+        "ignite": {
+          "above": 135,
+          "full": 220,
+          "chance": 40,
+          "into": "autumn_burning"
+        }
+      },
+      "bleed": 0.2,
+      "bleedFluid": "syrup",
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 320,
+      "hardness": 6,
+      "rubble": "ash",
+      "colors": [
+        "#866416",
+        "#765812",
+        "#94721c"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "far": "gold_leaves"
+    },
+    {
+      "id": "gold_leaves",
+      "thermal": {
+        "ignite": {
+          "above": 135,
+          "full": 220,
+          "chance": 40,
+          "into": "autumn_burning"
+        }
+      },
+      "bleed": 0.2,
+      "bleedFluid": "syrup",
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 320,
+      "hardness": 6,
+      "rubble": "ash",
+      "colors": [
+        "#cc9c2e",
+        "#bc8c26",
+        "#dcae3e"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "gold_lit",
+      "thermal": {
+        "ignite": {
+          "above": 135,
+          "full": 220,
+          "chance": 40,
+          "into": "autumn_burning"
+        }
+      },
+      "bleed": 0.2,
+      "bleedFluid": "syrup",
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 320,
+      "hardness": 6,
+      "rubble": "ash",
+      "colors": [
+        "#eec44e",
+        "#e2b842",
+        "#fcd664"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire",
+      "far": "gold_leaves"
+    },
+    {
+      "//": "Charred wood: the ASHLANDS' burnt snags (assets/trees/charred.json). Already burnt: NOT flammable (it would only ever burn again), soft (a charred limb snaps), crumbles to charcoal.",
+      "id": "charred_wood",
+      "sounds": {
+        "break": "branch"
+      },
+      "footstep": "branch",
+      "class": "solid",
+      "density": 450,
+      "hardness": 20,
+      "rubble": "charcoal",
+      "colors": [
+        "#221e1c",
+        "#1a1716",
+        "#2e2925"
+      ],
+      "tags": [
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Giant glowcap CAP (assets/trees/glowcap_tree.json): the glowfen's tree-sized mushroom, teal and softly luminous (35 -- a stand of them lights the fen at night without turning it into a lamp). glowcap_gill is the shaded underside the tree bake puts beneath it. INERT (rule 2).",
+      "id": "glowcap_giant",
+      "class": "solid",
+      "density": 300,
+      "hardness": 4,
+      "rubble": "dust",
+      "emission": 35,
+      "colors": [
+        "#4ec8a4",
+        "#3cb090",
+        "#6ae0bc"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "glowcap_gill",
+      "class": "solid",
+      "density": 300,
+      "hardness": 3,
+      "rubble": "dust",
+      "emission": 18,
+      "colors": [
+        "#2a7a6a",
+        "#226a5c",
+        "#348a78"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire",
+      "far": "glowcap_giant"
+    },
+    {
+      "//": "Old moss: the ELDWOOD's floor -- a deep, dark-green carpet of feather moss over centuries of fallen wood. The skin of the old-growth forest. Solid, burns like grass. NOT tagged soil (unlike wet_moss, which is a waterline skin swap): a grass biome next door must not be able to creep across it. `far` borrows wet_moss's slot: at cascade distance a moss floor is a moss floor.",
+      "id": "old_moss",
+      "thermal": {
+        "ignite": {
+          "above": 135,
+          "full": 220,
+          "chance": 40,
+          "into": "fire"
+        }
+      },
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 420,
+      "hardness": 6,
+      "absorb": {
+        "capacity": 14
+      },
+      "rubble": "dirt",
+      "colors": [
+        "#36602a",
+        "#2d5223",
+        "#416f33"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire",
+      "far": "wet_moss"
+    },
+    {
+      "//": "Tephra: the ASHLANDS' skin -- dark grey volcanic ash and lapilli, the fallout of an eruption, NOT the pale wood `ash` a fire leaves (which reads as snow across a whole biome). A powder (repose 38) whose firm skin is basalt. `far` shares basalt's slot: at cascade distance the two are one dark ground.",
+      "id": "tephra",
+      "footstep": "path",
+      "class": "powder",
+      "repose": 38,
+      "density": 1000,
+      "hardness": 10,
+      "absorb": {
+        "capacity": 8
+      },
+      "colors": [
+        "#55524e",
+        "#4a4744",
+        "#615d58"
+      ],
+      "tags": [
+        "mineral",
+        "dissolvable"
+      ],
+      "molten": "lava",
+      "far": "basalt"
     }
   ]
 }

@@ -7,8 +7,8 @@
       "base": 10,
       "swing": 6
     },
-    "temperature": 0.55,
-    "moisture": 0.65,
+    "temperature": 10.0,
+    "moisture": 0.33,
     "notes": "The default band of the biome noise: between meadowThreshold and pineThreshold."
   },
   "terrain": {

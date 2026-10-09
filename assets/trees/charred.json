@@ -1,0 +1,111 @@
+{
+  "name": "charred",
+  "displayName": "Charred snag",
+  "variants": 3,
+  "shape": 2,
+  "baseSize": 0.4,
+  "scale": 6.0,
+  "scaleV": 2.0,
+  "levels": 3,
+  "ratio": 0.034,
+  "ratioPower": 1.4,
+  "flare": 0.7,
+  "attractionUp": 0.6,
+  "whorlCount": 0,
+  "lobes": 4,
+  "lobeDepth": 0.14,
+  "barkNoise": 0.14,
+  "levelsData": [
+    {
+      "length": 1.0,
+      "lengthV": 0.1,
+      "taper": 0.85,
+      "branches": 0,
+      "downAngle": 60,
+      "downAngleV": 0,
+      "rotate": 137.5,
+      "rotateV": 12,
+      "curve": 8,
+      "curveBack": 0,
+      "curveV": 60,
+      "curveRes": 7,
+      "segSplits": 0.2,
+      "splitAngle": 24,
+      "splitAngleV": 8
+    },
+    {
+      "length": 0.36,
+      "lengthV": 0.3,
+      "taper": 1.0,
+      "branches": 6,
+      "downAngle": 50,
+      "downAngleV": -30,
+      "rotate": 137.5,
+      "rotateV": 50,
+      "curve": -10,
+      "curveBack": 0,
+      "curveV": 90,
+      "curveRes": 4,
+      "segSplits": 0,
+      "splitAngle": 20,
+      "splitAngleV": 8
+    },
+    {
+      "length": 0.35,
+      "lengthV": 0.4,
+      "taper": 1.0,
+      "branches": 3,
+      "downAngle": 40,
+      "downAngleV": 30,
+      "rotate": 137.5,
+      "rotateV": 50,
+      "curve": 0,
+      "curveBack": 0,
+      "curveV": 100,
+      "curveRes": 2,
+      "segSplits": 0,
+      "splitAngle": 20,
+      "splitAngleV": 8
+    },
+    {
+      "length": 0.4,
+      "lengthV": 0.1,
+      "taper": 1.0,
+      "branches": 2,
+      "downAngle": 45,
+      "downAngleV": 0,
+      "rotate": 137.5,
+      "rotateV": 12,
+      "curve": 0,
+      "curveBack": 0,
+      "curveV": 40,
+      "curveRes": 2,
+      "segSplits": 0,
+      "splitAngle": 20,
+      "splitAngleV": 8
+    }
+  ],
+  "foliage": {
+    "startLevel": 9,
+    "clumpsPerStem": 0,
+    "radius": 0.1
+  },
+  "bark": [
+    "charred_wood",
+    "charred_wood",
+    "charred_wood"
+  ],
+  "leaf": [
+    "leaves_dark",
+    "leaves",
+    "leaves_lit"
+  ],
+  "autumnChance": 0,
+  "placement": {
+    "minY": -1,
+    "maxY": -1,
+    "maxSlope": 700,
+    "sparsity": 1,
+    "shade": 0
+  }
+}

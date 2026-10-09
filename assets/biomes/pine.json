@@ -7,8 +7,8 @@
       "base": 8,
       "swing": 6
     },
-    "temperature": 0.3,
-    "moisture": 0.55,
+    "temperature": 4.0,
+    "moisture": 0.28,
     "notes": "Biome noise between pineThreshold and desertThreshold."
   },
   "terrain": {

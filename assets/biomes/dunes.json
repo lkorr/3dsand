@@ -1,0 +1,193 @@
+{
+  "name": "dunes",
+  "displayName": "Coastal dunes",
+  "index": 14,
+  "climate": {
+    "ambient": {
+      "base": 14,
+      "swing": 6
+    },
+    "temperature": 13.0,
+    "moisture": 0.25,
+    "notes": "Coastal dune belt: pale rolling sand ridges (strong hill/detail, almost no grain) bound by clumps of grey-green marram grass, pink sea thrift, scattered wind-shaped pines and junipers. The sand cap gets sandstone where it steepens. Temperate and breezy."
+  },
+  "terrain": {
+    "curve": [
+      -10240,
+      -7680,
+      -5120,
+      -2560,
+      0,
+      2560,
+      5120,
+      7680,
+      10240
+    ],
+    "hill": 360,
+    "detail": 340,
+    "grain": 96,
+    "treelineScale": 1.0
+  },
+  "cover": {
+    "skin": "sand",
+    "skinDepth": 4,
+    "subsoil": "sand",
+    "firmSkin": "sandstone",
+    "patch": {
+      "threshold": 0,
+      "cellLog2": 5
+    },
+    "plants": [
+      {
+        "material": "marram_grass",
+        "head": "",
+        "chance": 4,
+        "height": 0.6,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 130,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "sea_thrift",
+        "head": "",
+        "chance": 90,
+        "height": 0.15,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "dry_tussock",
+        "head": "",
+        "chance": 40,
+        "height": 0.3,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      }
+    ],
+    "groundFlora": false,
+    "cacti": false,
+    "sandCap": true,
+    "cactusChance": 26,
+    "saguaroFraction": 22
+  },
+  "trees": {
+    "tile": 14.4,
+    "density": 4,
+    "species": [
+      {
+        "species": "pine",
+        "weight": 20,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "bush",
+        "weight": 30,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "juniper",
+        "weight": 8,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "dead",
+        "weight": 4,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      }
+    ]
+  },
+  "water": {
+    "features": []
+  },
+  "caves": {
+    "features": [
+      {
+        "preset": "near_surface",
+        "threshold": 200,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        },
+        "mushroomChance": 60
+      },
+      {
+        "preset": "deep",
+        "threshold": 150,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        },
+        "crystalChance": 9
+      }
+    ]
+  },
+  "swatch": {
+    "sizeM": 24,
+    "reliefM": 1.6,
+    "reliefFreq": 1
+  }
+}

@@ -1,0 +1,110 @@
+{
+  "name": "glacier",
+  "displayName": "Frost-glass glacier",
+  "index": 12,
+  "climate": {
+    "ambient": {
+      "base": -26,
+      "swing": 6
+    },
+    "temperature": -18.0,
+    "moisture": 0.12,
+    "notes": "Ice sheet: smooth blue-white glacier ice (opaque, skin and subsoil both, and the firm face of every serac), studded with standing blades of frost-glass rime that glow faintly. Nothing grows. Frozen day and night (day -20), so every water surface is ice and nothing it generates can melt."
+  },
+  "terrain": {
+    "curve": [
+      -16384,
+      -12288,
+      -8192,
+      -4096,
+      0,
+      4096,
+      8192,
+      12288,
+      16384
+    ],
+    "hill": 220,
+    "detail": 96,
+    "grain": 48,
+    "treelineScale": 0.9
+  },
+  "cover": {
+    "skin": "glacier_ice",
+    "skinDepth": 3,
+    "subsoil": "glacier_ice",
+    "firmSkin": "glacier_ice",
+    "patch": {
+      "threshold": 0,
+      "cellLog2": 5
+    },
+    "plants": [
+      {
+        "material": "rime_crystal",
+        "head": "",
+        "chance": 30,
+        "height": 0.6,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "treeline": "below",
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 120,
+          "canopyMin": 0,
+          "canopyMax": 255
+        }
+      }
+    ],
+    "groundFlora": false,
+    "cacti": false,
+    "sandCap": false,
+    "cactusChance": 26,
+    "saguaroFraction": 22
+  },
+  "trees": {
+    "tile": 14.4,
+    "density": 0,
+    "species": []
+  },
+  "water": {
+    "features": []
+  },
+  "caves": {
+    "features": [
+      {
+        "preset": "near_surface",
+        "threshold": 190,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        },
+        "mushroomChance": 0
+      },
+      {
+        "preset": "deep",
+        "threshold": 150,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        },
+        "crystalChance": 4
+      }
+    ]
+  },
+  "swatch": {
+    "sizeM": 24,
+    "reliefM": 1.6,
+    "reliefFreq": 1
+  }
+}

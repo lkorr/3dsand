@@ -7,8 +7,8 @@
       "base": 12,
       "swing": 8
     },
-    "temperature": 0.6,
-    "moisture": 0.5,
+    "temperature": 12.0,
+    "moisture": 0.22,
     "notes": "Biome noise below meadowThreshold."
   },
   "terrain": {

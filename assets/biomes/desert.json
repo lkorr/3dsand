@@ -7,8 +7,8 @@
       "base": 24,
       "swing": 20
     },
-    "temperature": 0.9,
-    "moisture": 0.1,
+    "temperature": 24.0,
+    "moisture": 0.04,
     "notes": "Biome noise above desertThreshold."
   },
   "terrain": {

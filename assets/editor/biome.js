@@ -478,10 +478,10 @@ function buildPanel() {
   const dispRow = el('div', {class: CLS + 'row'}, el('label', {}, 'display name'), disp);
   s.body.append(dispRow);
   UI.liveMark(C, dispRow, 'displayName');
-  UI.row(C, s.body, {k: 'temperature', n: 'temperature', min: 0, max: 1, step: 0.01,
-                     d: '0 cold .. 1 hot. The planned climate field is seed-independent with a fixed compass: colder toward +Z.'}, 'climate');
+  UI.row(C, s.body, {k: 'temperature', n: 'temperature °C', min: -40, max: 40, step: 0.5,
+                     d: 'WHITTAKER COORDINATE 1: the MEAN ANNUAL air temperature of the place this biome is, in degrees C (tundra -10, forest 10, desert 24, jungle 26). Not read by the sim (that is the ambient row below); read by the World map page’s auto-biome generator, which looks each column’s climate up against every biome’s (temperature, moisture).'}, 'climate');
   UI.row(C, s.body, {k: 'moisture', n: 'moisture', min: 0, max: 1, step: 0.01,
-                     d: '0 arid .. 1 wet. Drier toward +X in the planned field. Also the natural knob for how FULL this biome’s basins are.'}, 'climate');
+                     d: 'WHITTAKER COORDINATE 2: EFFECTIVE annual moisture, 0..1 = annual precipitation / 3000 mm (desert 0.04 = 120 mm, forest 0.33 = 1000 mm, jungle 0.9 = 2700 mm); a waterlogged biome counts its standing water (swamp 0.6, glowfen 0.7), open water is 1. Read by the auto-biome generator with temperature.'}, 'climate');
   UI.row(C, s.body, {k: 'base', n: 'ambient', min: -64, max: 63, step: 1,
                      d: 'The temperature the simulation uses here, in heat units where 0 is the freezing point of water. Day is this plus the swing, night this minus it. Snow and ice melt above 0; nothing a climate can reach ignites. The loader REFUSES a biome whose night is below 0 while its day is not (water would freeze at every dusk and thaw at every dawn) and one whose day melts something it generates.'}, 'climate.ambient');
   UI.row(C, s.body, {k: 'swing', n: 'day/night swing', min: 0, max: 63, step: 1,
