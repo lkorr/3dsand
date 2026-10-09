@@ -250,6 +250,64 @@ fn farSkyCeil(level : u32) -> f32 {
   let w = farOcc[SKY_TOP_BASE + level - 1u];
   return select(f32(i32(w) - SKY_TOP_BIAS), -1e30, w == 0u);
 }
+// ---- THE SKY TILES (map v2 P1; sky_top.wgsl writes them, SKY_TILE_* agree) --
+// The level word above is ONE ceiling for the whole 512-cell box: on the peaks
+// map that is the summit, so a ray over the foothills or the sea walked every
+// chunk of every level under a ceiling it never meets. The tiles hold the same
+// bound per 4 x 4 chunk columns (64 x 64 level cells), keyed by slot column.
+// rsSkyTileClip walks the tiles the ray's XZ path crosses from tEnter and
+// moves tEnter to the first t at which the ray is under the ceiling of the tile
+// it is in (or past tExit: the level is skipped), stopping THERE -- one word a
+// tile, at most 2 * SKY_TILE_N + 2 of them, and usually one: a ray near
+// terrain is under its first tile's ceiling. Entry only, on purpose: clipping
+// tExit to the LAST tile under a ceiling needs the walk to run to the box
+// face for every ray, and measured that way (summit camera, 2560x1440) the
+// walk cost ray_start_trace 1.09 -> 3.63 ms, more than the chunk probes it cut.
+// CONSERVATIVE in the direction this pass needs: what it skips are cells over
+// their tile's highest occupied cell, so no candidate is skipped.
+const SKY_TILE_BASE : u32 = SKY_TOP_BASE + 16u;
+const SKY_TILE_CHUNKS : i32 = 4;
+const SKY_TILE_N : u32 = FAR_NCHUNK / 4u;
+fn rsSkyTileCeil(level : u32, tx : i32, tz : i32) -> f32 {
+  let n = i32(SKY_TILE_N);
+  let w = farOcc[SKY_TILE_BASE + ((level - 1u) * SKY_TILE_N + u32(tz & (n - 1))) * SKY_TILE_N +
+                 u32(tx & (n - 1))];
+  return select(f32(i32(w) - SKY_TOP_BIAS), -1e30, w == 0u);
+}
+fn rsSkyTileClip(level : u32, roL : vec3f, rd : vec3f, inv : vec3f, tIn : f32, tOut : f32,
+                 levelCeil : f32) -> vec2f {
+  let ts = f32(SKY_TILE_CHUNKS * i32(CHUNK));   // level cells per tile
+  var t = tIn;
+  let p = roL + rd * (tIn + 1e-4);
+  var tx = i32(floor(p.x / ts));
+  var tz = i32(floor(p.z / ts));
+  let sx = select(-1, 1, rd.x > 0.0);
+  let sz = select(-1, 1, rd.z > 0.0);
+  var nx = select(1e30, (f32(tx + select(0, 1, rd.x > 0.0)) * ts - roL.x) * inv.x, rd.x != 0.0);
+  var nz = select(1e30, (f32(tz + select(0, 1, rd.z > 0.0)) * ts - roL.z) * inv.z, rd.z != 0.0);
+  let dx = select(1e30, ts * abs(inv.x), rd.x != 0.0);
+  let dz = select(1e30, ts * abs(inv.z), rd.z != 0.0);
+  var first = tOut + 1.0;   // the earliest t under the ceiling of its tile
+  for (var i = 0u; i < 2u * SKY_TILE_N + 2u; i++) {
+    let tb = min(min(nx, nz), tOut);
+    let ceil = rsSkyTileCeil(level, tx, tz);
+    let ya = roL.y + rd.y * t;
+    // Rising and over the level's own ceiling: so is every later tile.
+    if (rd.y > 0.0 && ya >= levelCeil) { break; }
+    // The ray's lowest point in this tile: its entry when rising, its exit
+    // otherwise.
+    let yLow = select(roL.y + rd.y * tb, ya, rd.y > 0.0);
+    if (yLow < ceil) {
+      first = select(max(t, (ceil - roL.y) * inv.y), t, ya < ceil);
+      break;
+    }
+    if (tb >= tOut) { break; }
+    t = tb;
+    if (nx < nz) { tx += sx; nx += dx; } else { tz += sz; nz += dz; }
+  }
+  return vec2f(max(tIn, first - 1e-3), tOut);
+}
+
 const FAR_SPHERE_MARGIN_CHUNKS : i32 = 2;   // raymarch.wgsl, same name
 const FAR_DITHER_MAX : f32 = 0.5;           // raymarch.wgsl farDither's ceiling
 
@@ -299,6 +357,11 @@ fn rayStartFar(ro : vec3f, rd : vec3f, inv : vec3f, tStart : f32) -> f32 {
     let tPlane = (ceil - roL.y) * inv.y;
     if (rd.y > 0.0) { tExit = min(tExit, tPlane + 1e-3); }
     else if (roL.y >= ceil) { tEnter = max(tEnter, tPlane - 1e-3); }
+    if (tExit <= tEnter) { continue; }
+    // ...then per sky tile (rsSkyTileClip above).
+    let tc = rsSkyTileClip(level, roL, rd, inv, tEnter, tExit, ceil);
+    tEnter = tc.x;
+    tExit = tc.y;
     if (tExit <= tEnter) { continue; }
 
     var tCur = tEnter + 1e-4;

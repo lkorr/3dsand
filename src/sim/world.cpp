@@ -449,8 +449,12 @@ void World::Init(const rhi::Device& device) {
                         U::Storage | U::CopySrc, "farVox");
   // shadow_resolve.wgsl SKY_TOP_BASE indexes past the counts; FAR_LEVELS (8)
   // of these words are used, the rest are headroom.
-  constexpr uint32_t kFarSkyTopWords = 16;
-  static_assert(kFarLevels <= kFarSkyTopWords, "sky-bound tail too small");
+  // + the SKY TILES after those 16 (map v2 P1, sky_top.wgsl SKY_TILE_*): one
+  // word per 4 x 4 chunk-column tile, 8 x 8 tiles a level.
+  constexpr uint32_t kFarSkyTileN = kFarNChunk / 4;
+  static_assert(kFarNChunk % 4 == 0, "sky tiles are 4 chunk columns wide");
+  constexpr uint32_t kFarSkyTopWords = 16 + kFarLevels * kFarSkyTileN * kFarSkyTileN;
+  static_assert(kFarLevels <= 16, "sky-bound tail too small");
   // + kFarSkyTopWords: the per-level SKY BOUND tail (shadow_resolve.wgsl
   // skyTopReduce, read by raymarch.wgsl traceFar/farShadowDist). Zero = "this
   // level holds nothing", which is also what an unfilled level is.

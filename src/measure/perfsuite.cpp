@@ -246,6 +246,20 @@ struct Scene {
 
   // Notes the setup wants on the page ("great oak, 187 voxels of trunk").
   std::string note;
+
+  // THE FAR FIELD, for a scenario that wants it driven (peaks-route). Every
+  // other scenario leaves it null and SubmitTick's farCount at 0 -- which is
+  // why no scenario before this one ever showed a `farField` GPU row
+  // (gotcha: the far plane fill is the walking GPU spike). When set, Record()
+  // runs the game's own sequence after Stream::Update: caps from tuning,
+  // Update(eye chunk), PrepareTick, and the count into SubmitTick.
+  FarField* far = nullptr;
+  uint64_t farEntries = 0, farTicks = 0, farBiggest = 0, farCapped = 0;
+  size_t farPendingMax = 0;
+  uint32_t pagesPeak = 0;
+  std::string pagesPeakWhy;   // what the pages were at the peak (rule 6)
+  int eyeYMin = INT_MAX, eyeYMax = INT_MIN;
+  std::string prevMap;   // the map a map-switching setup restores in verify
 };
 
 // What a scenario asks the engine to do on one tick.
@@ -1243,6 +1257,164 @@ void VerifySurfaceSprint(Scene& s) {
   s.note += extra;
 }
 
+// ---------------------------------------------------------------------------
+// SCENARIO: peaks-route  (map v2 P1: tall-terrain streaming)
+//
+// Every other streaming scenario flies over terrain a few tens of metres tall,
+// so the residency window only ever shifts SIDEWAYS. On the `peaks` map
+// (scripts/gen_map_peaks.py) the ground spans 1,400 m, and a player who walks
+// off the summit drives the window DOWN through solid rock: the vertical
+// shift, the page pool filling with buried bulk, worldgen chunks that are all
+// stone, and far planes on every level at once. The route is sprint flight
+// (player.flySprint, per tick from the tick counter as surface-sprint does)
+// at a pinned 3.5 m over max(ground, sea), the height itself moving at most
+// the sprint speed a tick (DrivePeaksRoute):
+//   summit (9000, 16000) ~1,400 m
+//   -> the gorge floor due east (12533, 16000), 600 m down in ~350 m
+//   -> the high valley (-13000, 14000) ~900 m, back over the massif.
+// THE FAR FIELD IS DRIVEN (Scene::far), the game's own per-tick sequence, so
+// the farField and worldgen GPU rows are real. One tick per frame: the GPU
+// rows of two builds compare directly. Loads `peaks` and puts the previous
+// map back in verify.
+namespace {
+FarField g_peaksFar;
+constexpr int kPeaksRoute[][2] = {{9000, 16000}, {12533, 16000}, {-13000, 14000}};
+constexpr float kPeaksRouteClearVox = 35.0f;
+
+float PeaksRouteLen() {
+  float len = 0;
+  for (int i = 1; i < 3; i++)
+    len += std::hypot((float)(kPeaksRoute[i][0] - kPeaksRoute[i - 1][0]),
+                      (float)(kPeaksRoute[i][1] - kPeaksRoute[i - 1][1]));
+  return len;
+}
+
+// The eye at arc length `d` along the route, pinned over the ground.
+Vec3 PeaksRouteAt(float d) {
+  for (int i = 1; i < 3; i++) {
+    const float ax = (float)kPeaksRoute[i - 1][0], az = (float)kPeaksRoute[i - 1][1];
+    const float bx = (float)kPeaksRoute[i][0], bz = (float)kPeaksRoute[i][1];
+    const float L = std::hypot(bx - ax, bz - az);
+    if (d <= L || i == 2) {
+      const float u = std::min(d / L, 1.0f);
+      const float x = ax + (bx - ax) * u, z = az + (bz - az) * u;
+      const int gx = (int)std::floor(x), gz = (int)std::floor(z);
+      const int g = std::max(World::TerrainHeight(gx, gz, kDefaultSeed),
+                             worldmap::CurrentWorldMap().seaLevelY);
+      return {x, (float)g + kPeaksRouteClearVox, z};
+    }
+    d -= L;
+  }
+  return {};
+}
+}  // namespace
+
+bool SetupPeaksRoute(Scene& s, std::string& why) {
+  std::string prev;
+  if (!SwitchMap(s.ctx, s.sim, s.mats, "peaks", &prev, why)) return false;
+  s.prevMap = prev;
+  s.flightTick = 0;
+  s.eye = PeaksRouteAt(0.0f);
+  s.cam.yaw = std::atan2((float)(kPeaksRoute[1][1] - kPeaksRoute[0][1]),
+                         (float)(kPeaksRoute[1][0] - kPeaksRoute[0][0]));
+  s.cam.pitch = -0.2f;
+  // The window on the eye, as play holds it (CentreWindowOnEye's origin), and
+  // THIS scenario's FarField refilled around it and drained, so the driven
+  // far field starts from the same complete cascade a player standing there
+  // would have.
+  const int half = (int)kNChunk / 2;
+  const IVec3 pc{(int)std::floor(s.eye.x) >> 4, (int)std::floor(s.eye.y) >> 4,
+                 (int)std::floor(s.eye.z) >> 4};
+  s.stream.OnRegen();
+  s.world.SetWindowOrigin({pc.x - half, pc.y - half, pc.z - half});
+  SubmitWorldgen(s.ctx, s.world, s.sim, kDefaultSeed);
+  s.ctx.WaitIdle();
+  g_peaksFar = FarField{};
+  g_peaksFar.Init(&s.world);
+  g_peaksFar.FullRefill(pc);
+  uint32_t n;
+  while ((n = g_peaksFar.PrepareTick(s.ctx.queue)) > 0) {
+    TickParams tp{0, kDefaultSeed, 0, 0};
+    tp.farCount = n;
+    s.ctx.queue.WriteBuffer(s.world.tickUBO, 0, &tp, sizeof(tp));
+    rhi::CommandEncoder enc = s.ctx.device.CreateCommandEncoder();
+    s.sim.EncodeFarFill(enc, n);
+    s.ctx.queue.Submit(enc.Finish());
+  }
+  s.ctx.WaitIdle();
+  s.far = &g_peaksFar;
+  char note[256];
+  std::snprintf(note, sizeof note,
+                "peaks map: summit -> gorge -> high valley, %.0f voxels at %.1f "
+                "vox/tick, %.0f voxels over max(ground, sea); far field DRIVEN",
+                PeaksRouteLen(), CurrentTuning().player.flySprint / kVoxelMeters * kTickDt,
+                kPeaksRouteClearVox);
+  s.note = note;
+  return true;
+}
+
+void DrivePeaksRoute(Scene& s, uint32_t, TickOps&) {
+  const uint32_t t = s.flightTick++;
+  const float speed = CurrentTuning().player.flySprint / kVoxelMeters * kTickDt;
+  const float d = std::min((float)t * speed, PeaksRouteLen());
+  Vec3 e = PeaksRouteAt(d);
+  // THE CLIMB IS FLOWN, NOT TELEPORTED: the eye's height moves at most the
+  // sprint speed a tick toward the pinned height. Unclamped, the pin went up
+  // the gorge wall (a 600 m face) in a handful of ticks -- a 1,000-voxel jump
+  // in one tick reset whole far levels as a teleport would (measured: 7 gap
+  // resets, worst gap 33 level-1 chunks), which no player can do. Clamped, a
+  // steep climb runs inside the rock face for a while; the window and the
+  // cascades still only ever move at the speed a player can.
+  if (t > 0) e.y = std::clamp(e.y, s.eye.y - speed, s.eye.y + speed);
+  // Look along the leg being flown, a little down.
+  const Vec3 ahead = PeaksRouteAt(std::min(d + 200.0f, PeaksRouteLen()));
+  if (std::fabs(ahead.x - e.x) + std::fabs(ahead.z - e.z) > 1.0f)
+    s.cam.yaw = std::atan2(ahead.z - e.z, ahead.x - e.x);
+  s.eye = e;
+  s.eyeYMin = std::min(s.eyeYMin, (int)e.y);
+  s.eyeYMax = std::max(s.eyeYMax, (int)e.y);
+}
+
+void VerifyPeaksRoute(Scene& s) {
+  const Stream::Timing& t = s.stream.Timings();
+  char extra[512];
+  std::snprintf(extra, sizeof extra,
+                "  |  flew %u ticks (eye y%d..y%d), %u window shifts, page pool "
+                "peak %u of %u (%.1f%%); far sieve %llu entries over %llu ticks, "
+                "biggest tick %llu, %llu ticks at the cap, peak queue %zu, %zu "
+                "still queued",
+                s.flightTick, s.eyeYMin, s.eyeYMax, t.shifts, s.pagesPeak, kPoolPages,
+                100.0 * (double)s.pagesPeak / (double)kPoolPages,
+                (unsigned long long)s.farEntries, (unsigned long long)s.farTicks,
+                (unsigned long long)s.farBiggest, (unsigned long long)s.farCapped,
+                s.farPendingMax, s.far ? s.far->PendingFills() : (size_t)0);
+  s.note += extra;
+  std::printf("  peaks-route %s\n", extra + 5);
+  // Why the far queue is what it is: planes queued by recentring, levels
+  // reset whole because a face fell a box behind (coalesced) or the gap
+  // passed a box (teleport-like), and the worst recentre gap seen.
+  if (s.far) {
+    std::printf("  peaks-route far field: %llu planes, %llu resets (%llu coalesced, %llu gap), "
+                "worst gap %u level-chunks at level %u\n",
+                (unsigned long long)s.far->PlanesIssued(),
+                (unsigned long long)s.far->ResetsIssued(),
+                (unsigned long long)s.far->CoalescedResets(),
+                (unsigned long long)s.far->GapResetsIssued(), s.far->WorstGap(),
+                s.far->WorstGapLevel());
+  }
+  if (!s.pagesPeakWhy.empty()) {
+    std::printf("  peaks-route page pool %s\n", s.pagesPeakWhy.c_str());
+    s.note += "  |  page pool " + s.pagesPeakWhy;
+  }
+  s.far = nullptr;
+  if (!s.prevMap.empty()) {
+    std::string why;
+    if (!SwitchMap(s.ctx, s.sim, s.mats, s.prevMap, nullptr, why))
+      std::fprintf(stderr, "peaks-route: could not restore map '%s': %s\n",
+                   s.prevMap.c_str(), why.c_str());
+  }
+}
+
 const Scenario kScenarios[] = {
     {"idle", "Idle (settled)",
      "A settled world with no input. Rule 2's floor: every other scenario's "
@@ -1311,6 +1483,17 @@ const Scenario kScenarios[] = {
      "worldStorage;worldgen;pageTable;farField;caLoop;renderPass", 60, 600,
      SetupSurfaceSprint, DriveSurfaceSprint, VerifySurfaceSprint,
      /*paced=*/true},
+
+    // LAST: it loads the peaks map (and puts the old one back in verify).
+    {"peaks-route", "Peaks route (vertical streaming)",
+     "Sprint flight on the peaks map from the 1,400 m summit down into the "
+     "600 m gorge and across the massif to the high valley, 3.5 m over the "
+     "ground, with the FAR FIELD DRIVEN as play drives it. The only scenario "
+     "whose window shifts vertically through solid rock and whose farField "
+     "and worldgen GPU rows include incoming cascade planes. One tick per "
+     "frame.",
+     "worldStorage;worldgen;pageTable;farField;caLoop;renderPass", 30, 2700,
+     SetupPeaksRoute, DrivePeaksRoute, VerifyPeaksRoute},
 };
 constexpr int kScenarioCount = (int)(sizeof(kScenarios) / sizeof(kScenarios[0]));
 
@@ -1693,6 +1876,51 @@ Run PerfRunner::Record(const Scenario& scIn) {
           stream_.MarkModifiedBox({e.x - e.radius, e.y - e.radius, e.z - e.radius},
                                   {e.x + e.radius, e.y + e.radius, e.z + e.radius});
       }
+      // The far field, for a scenario that drives it (Scene::far): the
+      // game's own order and caps (session.cpp's stream phase).
+      uint32_t farCount = 0;
+      if (s.far) {
+        ScopeTimer sc3(fc, PerfScope::Stream);
+        s.far->SetBulkCap((uint32_t)CurrentTuning().render.farRefillRate);
+        s.far->SetPlaneCap((uint32_t)CurrentTuning().render.farPlaneFillRate);
+        s.far->Update(playerChunk);
+        s.farPendingMax = std::max(s.farPendingMax, s.far->PendingFills());
+        farCount = s.far->PrepareTick(ctx_.queue);
+        if (farCount) {
+          s.farEntries += farCount;
+          s.farTicks++;
+          s.farBiggest = std::max<uint64_t>(s.farBiggest, farCount);
+          if (farCount >= (uint32_t)CurrentTuning().render.farPlaneFillRate) s.farCapped++;
+        }
+        // THE PEAK, ATTRIBUTED: a page count alone is a bare count. At each
+        // new high, every slot holding a page is split by the published
+        // snapshot's occupancy (empty / partial / full) and by whether the
+        // mirror holds it dirty, plus the retire queue -- "full and clean" is
+        // the share a sentinel could have held (buried bulk a wake or a ring
+        // paged in), "partial" the surface band, which genuinely needs one.
+        if (world_.pages && world_.pages->PagesInUse() > s.pagesPeak) {
+          s.pagesPeak = world_.pages->PagesInUse();
+          const WorldSnapshot& sn = world_.Snap();
+          uint32_t em = 0, pa = 0, fu = 0, fuClean = 0, unk = 0, dirty = 0;
+          for (uint32_t slot = 0; slot < kNumSlots; slot++) {
+            if (world_.PageOffsetOfSlot(slot) == World::kNoPage) continue;
+            const bool d = world_.pages->CpuDirty().Has(slot);
+            if (d) dirty++;
+            if (!sn.valid || slot >= sn.occupancy.size()) { unk++; continue; }
+            const uint32_t n = sn.occupancy[slot] & 0xFFFFu;
+            if (n == 0) em++;
+            else if (n == kChunkVol) { fu++; if (!d) fuClean++; }
+            else pa++;
+          }
+          char why[320];
+          std::snprintf(why, sizeof why,
+                        "peak %u pages at eye y%d: %u empty, %u partial, %u full "
+                        "(%u not cpuDirty), %u unknown; cpuDirty %u; retire queue %u",
+                        s.pagesPeak, (int)s.eye.y, em, pa, fu, fuClean, unk, dirty,
+                        world_.pages->RetireQueueDepth());
+          s.pagesPeakWhy = why;
+        }
+      }
 
       // SubmitTick BILLS ITSELF now (measure/perfscope.h), in five spans —
       // upload / waterBody / pageTableCpu / encode / submit — which land in the
@@ -1707,7 +1935,7 @@ Run PerfRunner::Record(const Scenario& scIn) {
       SubmitTick(ctx_, world_, sim_, tick, kDefaultSeed, ops.ops, ops.exps,
                  ops.cells, /*hashEnable=*/tick % 15 == 0, playerChunk,
                  /*wantReadback=*/true, ops.particlesActive, ops.spawns,
-                 /*farCount=*/0, ops.fluidSpawns, s.fluidLive);
+                 farCount, ops.fluidSpawns, s.fluidLive);
       // ONE KickDeferred PER TIMED COMMAND BUFFER, all tagged with the FRAME.
       // Each SubmitTick resolves its own buffer into its own ring slot, so a
       // 4-tick frame arms four of them; PassTimer::kRing is sized for that.
@@ -1910,6 +2138,25 @@ Run PerfRunner::Record(const Scenario& scIn) {
               sc.id, r.samples.size(), p50, p95, p99,
               p50 > 0 ? 1000.0 / p50 : 0.0, gpuValid, r.samples.size(),
               r.worldHash);
+  // The streaming GPU rows on the terminal for a scenario that is about
+  // streaming: p50 / p95 / max per frame, so a worldgen or far-fill spike has
+  // a number without opening the page.
+  if (std::strstr(sc.stresses, "farField")) {
+    std::printf("  %-12s gpu:", "");
+    for (const char* key : {"worldgen", "farField", "pageTable", "caLoop"}) {
+      int n = -1;
+      for (int k = 0; k < kPerfNodeCount; k++)
+        if (std::strcmp(kPerfNodes[k].node, key) == 0) n = k;
+      if (n < 0) continue;
+      std::vector<double> v;
+      for (const PerfSample& smp : r.samples)
+        if (smp.gpuValid) v.push_back(smp.gpuMs[n]);
+      if (v.empty()) continue;
+      std::printf("  %s %.2f/%.2f/%.2f", key, Percentile(v, 0.50), Percentile(v, 0.95),
+                  *std::max_element(v.begin(), v.end()));
+    }
+    std::printf("  (ms p50/p95/max)\n");
+  }
   if (sc.paced) {
     // A paced run's tick count is machine-dependent (that is the whole point),
     // so it is REPORTED rather than assumed. Quoting a frame percentile without
@@ -3168,6 +3415,12 @@ struct ArmResult {
   // own span so a lever that moves work between the fragment shader and that
   // table shows up as a move and not as a saving. gpuP50 stays the SUM.
   double preP50 = 0;
+  // ...and what is INSIDE that span, per pass_table row, p50 each: "pre 70
+  // ms" is a bare count (rule 6). The sim records the table with the arm's
+  // own PassTimer for that one EncodeShadowResolve call, so the row pairs
+  // land inside the `pre` pair of the same command buffer; they are NOT
+  // added into gpuP50 (the span already holds them).
+  std::vector<std::pair<std::string, double>> preRows;
   int frames = 0;
   bool ok = false;
   std::string why;
@@ -3180,7 +3433,9 @@ class RenderBudgetRunner {
       : ctx_(ctx), world_(world), sim_(sim), stream_(stream), opt_(opt) {}
 
   bool Init() {
-    haveTimer_ = timer_.Init(ctx_, 2);
+    // `pre` + `render` + the per-frame table's rows (preRows), a pair each.
+    haveTimer_ = timer_.Init(ctx_, 48);
+    timer_.SetRowGranularity(true);
     if (!pacer_.Init(ctx_)) return false;
     for (int i = 0; i < 2; i++) {
       const uint32_t d = i == 0 ? 1u : 2u;
@@ -3261,18 +3516,32 @@ class RenderBudgetRunner {
     const rhi::TextureView& view = view_[d == 1 ? 0 : 1];
 
     std::vector<double> ms, pre;
+    // The per-frame table's rows, nested INSIDE "pre" (ArmResult::preRows).
+    std::vector<std::pair<std::string, std::vector<double>>> rows;
     // One frame's two spans arrive together in LastFrame(): the per-frame
     // table ("pre") and the world pass ("render"). `ms` keeps their sum so the
-    // headline number means what it always meant.
+    // headline number means what it always meant; the table's own rows sit
+    // inside "pre" and are kept apart.
     auto take = [&](const std::vector<PassSample>& fr) {
       double sum = 0, p = 0;
       for (const PassSample& ps : fr) {
-        sum += (double)ps.ns / 1e6;
-        if (ps.name && std::strcmp(ps.name, "pre") == 0) p += (double)ps.ns / 1e6;
+        const double v = (double)ps.ns / 1e6;
+        const bool isPre = ps.name && std::strcmp(ps.name, "pre") == 0;
+        const bool isRender = ps.name && std::strcmp(ps.name, "render") == 0;
+        if (isPre || isRender) sum += v;
+        if (isPre) p += v;
       }
       if (!fr.empty()) {
         ms.push_back(sum);
         pre.push_back(p);
+        for (const PassSample& ps : fr) {
+          if (!ps.name || !std::strcmp(ps.name, "pre") || !std::strcmp(ps.name, "render"))
+            continue;
+          size_t k = 0;
+          while (k < rows.size() && rows[k].first != ps.name) k++;
+          if (k == rows.size()) rows.push_back({ps.name, {}});
+          rows[k].second.push_back((double)ps.ns / 1e6);
+        }
       }
     };
     timer_.ResetStats();
@@ -3294,7 +3563,12 @@ class RenderBudgetRunner {
       uint32_t pb = 0, pe = 0, rb = 0, re = 0;
       const bool timedPre = timer_.AllocPassPair("pre", pb, pe);
       if (timedPre) enc.WriteTimestamp(timer_.NativeQuerySet(), pb, false);
+      // The table's rows into the same query set for THIS call only: every
+      // other recording in this runner (worldgen, settle ticks, far refills)
+      // stays untimed, so nothing allocates pairs a buffer never resolves.
+      if (timedPre) sim_.SetPassTimer(&timer_);
       sim_.EncodeShadowResolve(enc);
+      sim_.SetPassTimer(nullptr);
       if (timedPre) enc.WriteTimestamp(timer_.NativeQuerySet(), pe, true);
       const bool timed = timer_.AllocPassPair("render", rb, re);
       if (timed) enc.WriteTimestamp(timer_.NativeQuerySet(), rb, false);
@@ -3331,6 +3605,7 @@ class RenderBudgetRunner {
     res.gpuP50 = Percentile(ms, 0.50);
     res.gpuP95 = Percentile(ms, 0.95);
     res.preP50 = Percentile(pre, 0.50);
+    for (auto& r : rows) res.preRows.push_back({r.first, Percentile(r.second, 0.50)});
     res.frames = (int)ms.size();
     res.ok = true;
     return res;
@@ -3860,6 +4135,14 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
       std::printf("  %-11s %-42s ", arm->id, arm->label);
       if (!r.ok) std::printf("SKIPPED — %s\n", r.why.c_str());
       else std::printf("%7.2f ms  (pre %.2f)\n", r.gpuP50, r.preP50);
+      // What `pre` is made of (rows >= 0.05 ms), baseline arm only: one line
+      // per camera on the terminal, every arm's in the JSON.
+      if (r.ok && std::strcmp(arm->id, "baseline") == 0 && !r.preRows.empty()) {
+        std::printf("  %-11s pre rows:", "");
+        for (const auto& pr : r.preRows)
+          if (pr.second >= 0.05) std::printf(" %s %.2f", pr.first.c_str(), pr.second);
+        std::printf("\n");
+      }
       std::fflush(stdout);
       if (rows) {
         RenderBudgetRow row;
@@ -4005,6 +4288,13 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
                              .c_str());
           else
             std::fprintf(f, ",\"why\":%s", JStr(r.why).c_str());
+          if (r.ok) {
+            std::fprintf(f, ",\"preRows\":{");
+            for (size_t k = 0; k < r.preRows.size(); k++)
+              std::fprintf(f, "%s%s:%s", k ? "," : "", JStr(r.preRows[k].first).c_str(),
+                           JNum(r.preRows[k].second).c_str());
+            std::fprintf(f, "}");
+          }
           std::fprintf(f, "}");
         }
         std::fprintf(f, "],\n \"stats\":");
