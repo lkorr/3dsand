@@ -2276,6 +2276,26 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
           // shoulder where one piece hands over to the next.
           int segShoulder = rd.shoulder;
           const size_t seg0 = cut.size();
+          // THE JOINT CUT (kS_RoadCut): the AUTHORED straight's direction,
+          // ~1024 long, one value for every piece of it. A piece's own ends
+          // are integer samples, so two pieces of one straight point a hair
+          // apart; had each judged "past my open end" by its own direction,
+          // a wedge of columns beside the joint would belong to neither (the
+          // bare ground standing up as a 1-voxel wall across the shoulder)
+          // and its mirror on the other side to both (blended twice: a
+          // ridge). One normal and a strict / non-strict split partition the
+          // plane exactly (roadProj, bug 2026-10-08_23-42-45).
+          int segCut = 1024;
+          {
+            const double tx = rd.points[v + 1].first - rd.points[v].first;
+            const double tz = rd.points[v + 1].second - rd.points[v].second;
+            const double tl = std::sqrt(tx * tx + tz * tz);
+            if (tl > 0) {
+              const int cx = static_cast<int>(std::lround(tx / tl * 1024.0));
+              const int cz = static_cast<int>(std::lround(tz / tl * 1024.0));
+              segCut = static_cast<int>((static_cast<uint32_t>(cx) & 0xFFFFu) | ((static_cast<uint32_t>(cz) & 0xFFFFu) << 16));
+            }
+          }
           for (size_t pi = 0; pi < done.size(); pi++) {
             const auto [a, b] = done[pi];
             WorldMapData::StampSite st;
@@ -2313,6 +2333,7 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
             }
             segShoulder = std::max(segShoulder, std::min(static_cast<int>(kSiteRoadShoulderMax), 2 * gap + 2));
             st.roadFlags = (pi > 0 ? 1 : 0) | (pi + 1 < done.size() ? 2 : 0);
+            st.roadCut = segCut;
             cut.push_back(std::move(st));
           }
           for (size_t pi = seg0; pi < cut.size(); pi++) cut[pi].padMargin = segShoulder;
@@ -2618,6 +2639,7 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
       r[kS_RoadMat] = s.roadMat;
       r[kS_RoadDepth] = U(s.roadDepth);
       r[kS_RoadFlags] = U(s.roadFlags);
+      r[kS_RoadCut] = static_cast<uint32_t>(s.roadCut);
     }
     if (s.kind == kSiteRiver) {
       // Every word is the river piece's (worldmap.h kS_Riv*); the generic

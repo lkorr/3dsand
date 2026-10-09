@@ -23396,7 +23396,15 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   of the same straight has no round cap, or the cap would pull that piece's
   ground toward the joint's Y and steepen the grade between — measured: 47
   over-grade 16-voxel spans on a 25 % path before, 0 after; a bend vertex and
-  a road end keep their caps). `kSiteCellMax` went 32 -> 128 with this
+  a road end keep their caps), and `kS_RoadCut` (word 8: the AUTHORED
+  straight's direction, i16 x | i16 z, |n| ~ 1024, one value per straight) is
+  where an open end hands over — the earlier piece keeps `(c - joint)·n <= 0`,
+  the later `> 0`. Judging "past my end" by each piece's OWN direction left,
+  at every joint of a diagonal straight, a wedge of columns no piece claimed
+  (the bare ground standing as a 1-voxel wall across the shoulder) and its
+  mirror claimed by both (blended twice: a ridge) — 2,999 one-column spikes
+  at 205 sampled joints on Tirnhallow (bug 2026-10-08_23-42-45); the `roads`
+  gate's B2 / I lines check the joints. `kSiteCellMax` went 32 -> 128 with this
   (Harrowby's cell: 28 sites, 42-44 with its paths as roads, up to 93 with a
   3-road test network at the first, finer cut; the `roads` gate's H line
   reports the number). The pieces are cut twice

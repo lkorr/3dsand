@@ -1538,6 +1538,7 @@ const WM_S_ROAD_Y_B      : u32 = 10u;   // road piece: ... at end B (kS_BoxX1 / 
 const WM_S_ROAD_MAT      : u32 = 11u;   // road piece: the SOLID surface material
 const WM_S_ROAD_DEPTH    : u32 = 12u;   // road piece: surface cells from the ground's top down
 const WM_S_ROAD_FLAGS    : u32 = 15u;   // road piece: 1 = end A OPEN, 2 = end B open (a collinear joint)
+const WM_S_ROAD_CUT      : u32 = 8u;    // road piece: its straight's shared joint cut normal (i16 x | i16 z << 16)
 // RIVERS AND LAKES (docs/PLAN_worldbuilder.md W1; worldmap.h kSiteRiver /
 // kSiteLakeEdge / kSiteLakeCell and their kS_Riv* / kS_Lake* words).
 const WM_SITE_RIVER      : u32 = 9u;    // one chord of one REACH of a map.json river
@@ -2102,8 +2103,9 @@ fn routeNear(sid : u32, x : i32, z : i32, keep : i32) -> bool {
 // the baked road surface at the column's projection onto it, Q8 voxels --
 // the two ends' baked Y lerped by the projection parameter. An OPEN end (a
 // joint with the next piece on the same straight, kS_RoadFlags) has no round
-// cap: a column past it is the next piece's alone -- a cap there would pull
-// that piece's ground toward this end's Y and steepen the grade between.
+// cap: a column past it -- past the straight's shared cut through the joint,
+// kS_RoadCut -- is the next piece's alone; a cap there would pull that
+// piece's ground toward this end's Y and steepen the grade between.
 // Bounds: the ends are <= kSiteRoadPieceMax (256) apart a side, so l2 <=
 // 131,072, the dot product after routeDist2's box reject is < 2.4e5 and the
 // clamped t * 256 <= 3.4e7; |yb - ya| <= 256 voxels of grade at 100 %, so
@@ -2118,7 +2120,18 @@ fn roadProj(sid : u32, x : i32, z : i32, reach : i32) -> vec2<i32> {
   let l2 = max(vx * vx + vz * vz, 1);
   let dot = (x - ax) * vx + (z - az) * vz;
   let fl = wmSiteI(sid, WM_S_ROAD_FLAGS);
-  if ((dot < 0 && (fl & 1) != 0) || (dot > l2 && (fl & 2) != 0)) { return vec2<i32>(-1, 0); }
+  if (fl != 0) {
+    // An open end hands over on the STRAIGHT's shared cut normal (kS_RoadCut),
+    // not on this piece's own direction: the earlier piece keeps (c - joint)
+    // . n <= 0, the later one > 0, so the two partition the plane exactly. Own
+    // directions differ by the ends' integer rounding and left a sliver no
+    // piece claimed -- a 1-voxel wall of bare ground across the shoulder --
+    // and one both did (bug 2026-10-08_23-42-45). |c - end| < 2^10 here and
+    // |n| ~ 1024, so the products stay under 2^21.
+    let c = rivCut(wmSiteI(sid, WM_S_ROAD_CUT));
+    if ((fl & 1) != 0 && (x - ax) * c.x + (z - az) * c.y <= 0) { return vec2<i32>(-1, 0); }
+    if ((fl & 2) != 0 && (x - ax - vx) * c.x + (z - az - vz) * c.y > 0) { return vec2<i32>(-1, 0); }
+  }
   let t = clamp(dot, 0, l2);
   let tq = (t * 256) / l2;
   let ya = wmSiteI(sid, WM_S_ROAD_Y_A);

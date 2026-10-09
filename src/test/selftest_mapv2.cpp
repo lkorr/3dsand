@@ -41,6 +41,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -421,6 +422,8 @@ Status GateWorldMapV2(Ctx& c, std::string& detail) {
 //   B. GRADE ON THE GROUND (CPU): along every centreline the ground climbs no
 //      faster than maxGrade (over 16 voxels, + the rounding), and the ridge is
 //      CUT and the dip FILLED (so A and B are not vacuous).
+//   B2. JOINT SEAMS (CPU): the open joints of the synthetic roads carry no
+//      more one-column spikes / pits than the pieces' middles (RoadSeamsOk).
 //   C. SURFACE (GPU): the top `depth` cells on every centreline column are the
 //      road's material.
 //   D. KEEP-OUTS (GPU): nothing -- no trunk, crown, cover row or tile plant --
@@ -433,6 +436,7 @@ Status GateWorldMapV2(Ctx& c, std::string& detail) {
 //   H. THE SITE INDEX on `default`: the worst per-cell site list with the
 //      shipped roads (Harrowby's paths) and with a test network through the
 //      village, against kSiteCellMax -- a number, reported.
+//   I. JOINT SEAMS on `default`: B2 over ~200 of the shipped roads' joints.
 // Leaves the pristine world behind (the worldmap-v2 exit).
 
 // The distance from a column to a polyline, voxels (a test measure only).
@@ -448,6 +452,77 @@ double PolyDist(const std::vector<std::pair<int, int>>& pts, double x, double z)
   }
   return best;
 }
+
+// THE JOINT SEAMS of the CURRENT map's roads (bug 2026-10-08_23-42-45): at
+// every OPEN joint (two pieces of one straight, kS_RoadFlags), a band of
+// columns +-4 voxels along the road either side of the joint, out across the
+// carriageway and both shoulders, is checked for a one-column SPIKE or PIT --
+// a column 2+ voxels above (below) both its x neighbours or both its z
+// neighbours -- that the bare ground does not have there (a natural knob is
+// not the road's). The pieces' integer ends make two pieces of one straight
+// point a hair apart, so a per-piece "past my open end" test left a sliver
+// of columns no piece claimed: the bare ground stood there as a 1-voxel wall
+// across the shoulder. `every` samples every n-th joint (the shipped map has
+// thousands); `control` scans the pieces' middles instead (RoadSeamsOk).
+// Returns the bad columns; `why` / `worst` name the largest.
+int RoadJointSeams(const worldmap::WorldMapData& m, int every, int& joints, std::string& why, int& worst,
+                   bool control = false) {
+  int bad = 0;
+  worst = 0;
+  joints = 0;
+  int seen = 0;
+  for (size_t i = 0; i + 1 < m.sites.size(); i++) {
+    const worldmap::WorldMapData::StampSite& a = m.sites[i];
+    if (a.kind != worldmap::kSiteRoad || (a.roadFlags & 2) == 0) continue;
+    if (seen++ % every != 0) continue;
+    joints++;
+    const double vx = a.x1 - a.x, vz = a.z1 - a.z, vl = std::max(std::hypot(vx, vz), 1.0);
+    const double ux = vx / vl, uz = vz / vl;
+    const int reach = a.radius + a.padMargin + 1;
+    // The CONTROL arm: the same band across the piece's MIDDLE, where no
+    // joint is -- what the blend's rounding over natural bumps does alone.
+    const double jx = control ? (a.x + a.x1) * 0.5 : a.x1, jz = control ? (a.z + a.z1) * 0.5 : a.z1;
+    std::set<std::pair<int, int>> cols;
+    for (int s = -4; s <= 4; s++)
+      for (int n = -reach; n <= reach; n++)
+        cols.insert({static_cast<int>(std::lround(jx + ux * s - uz * n)), static_cast<int>(std::lround(jz + uz * s + ux * n))});
+    std::map<std::pair<int, int>, std::pair<int, int>> hc;   // (h, bare)
+    auto H = [&](int x, int z) {
+      auto it = hc.find({x, z});
+      if (it != hc.end()) return it->second;
+      const std::pair<int, int> v{World::TerrainHeight(x, z, kDefaultSeed), worldmap::BareGroundHeight(x, z, kDefaultSeed)};
+      hc[{x, z}] = v;
+      return v;
+    };
+    for (const auto& [x, z] : cols) {
+      const auto c0 = H(x, z), xl = H(x - 1, z), xr = H(x + 1, z), zl = H(x, z - 1), zr = H(x, z + 1);
+      auto spike = [](int h, int p, int q) { return std::max(h - std::max(p, q), std::min(p, q) - h); };
+      const int sx = spike(c0.first, xl.first, xr.first), sz = spike(c0.first, zl.first, zr.first);
+      const int bx = spike(c0.second, xl.second, xr.second), bz = spike(c0.second, zl.second, zr.second);
+      if ((sx >= 2 && sx > bx) || (sz >= 2 && sz > bz)) {
+        bad++;
+        if (std::max(sx, sz) > worst) {
+          worst = std::max(sx, sz);
+          why = Format(" worst: (%d,%d) h%d, x neighbours %d / %d, z neighbours %d / %d (bare %d: %d / %d, %d / %d), %.0f "
+                       "voxels from %s's line (half-width %d, shoulder %d)",
+                       x, z, c0.first, xl.first, xr.first, zl.first, zr.first, c0.second, xl.second, xr.second, zl.second,
+                       zr.second, std::abs((x - jx) * -uz + (z - jz) * ux), a.id.c_str(), a.radius, a.padMargin);
+        }
+      }
+    }
+  }
+  return bad;
+}
+
+// The verdict is a DIFFERENTIAL: the joint bands may carry no more one-column
+// spikes than the same bands across the pieces' middles (+ half, + 8). The
+// blend's rounding over natural 1-voxel knobs, and a shoulder capped at
+// kSiteRoadShoulderMax on a 300-voxel mountain fill, make spikes anywhere a
+// road reshapes the ground; only the EXCESS at the joints is a seam.
+// Measured on Tirnhallow, 205 joints: 2,999 at the joints before the shared
+// cut (kS_RoadCut), 132 after against 171 mid-piece; the synthetic map's 12
+// joints: 393 before, 2 after against 1.
+bool RoadSeamsOk(int seams, int control) { return seams <= control + control / 2 + 8; }
 
 Status GateRoads(Ctx& c, std::string& detail) {
   using sandvox::ReadVoxelsSync;
@@ -624,6 +699,18 @@ Status GateRoads(Ctx& c, std::string& detail) {
               "fills the dip %d)%s\n",
               bOk ? "PASS" : "FAIL", steep, cut, fill, steepWhy.c_str());
   if (!bOk) problems.push_back(Format("B: %d over-steep spans, cut %d, fill %d%s", steep, cut, fill, steepWhy.c_str()));
+  {
+    int joints = 0, worst = 0, cj = 0, cworst = 0;
+    std::string why, cwhy;
+    const int seams = RoadJointSeams(on, 1, joints, why, worst);
+    const int ctrl = RoadJointSeams(on, 1, cj, cwhy, cworst, true);
+    std::printf("roads: B2 joint seams: %s (%d open joints, %d one-column spikes / pits the bare ground lacks, worst %d; "
+                "control mid-piece %d, worst %d)%s |%s\n",
+                RoadSeamsOk(seams, ctrl) && joints > 0 ? "PASS" : "FAIL", joints, seams, worst, ctrl, cworst, why.c_str(),
+                cwhy.c_str());
+    if (!RoadSeamsOk(seams, ctrl) || joints == 0)
+      problems.push_back(Format("B2: %d seam columns at %d joints (control %d)%s", seams, joints, ctrl, why.c_str()));
+  }
 
   // ---- the world on the GPU ------------------------------------------------------------------
   std::vector<uint32_t> words;
@@ -909,6 +996,26 @@ Status GateRoads(Ctx& c, std::string& detail) {
     if (!hOk)
       problems.push_back("H: default " + std::string(ok0 ? "" : "REFUSED: " + l0.substr(0, 200)) +
                          (ok1 ? "" : " with the network REFUSED: " + l1.substr(0, 200)));
+    // ---- I. the joint seams of the SHIPPED roads (CPU; the GPU is the twin, E) ----
+    if (ok0) {
+      int total = 0;
+      for (const auto& s : d0.sites) total += (s.kind == worldmap::kSiteRoad && (s.roadFlags & 2) != 0) ? 1 : 0;
+      const int every = std::max(1, total / 200);
+      worldmap::SetCurrentWorldMap(d0);
+      int joints = 0, worst = 0, cj = 0, cworst = 0;
+      std::string why, cwhy;
+      const auto t0c = std::chrono::steady_clock::now();
+      const int seams = RoadJointSeams(d0, every, joints, why, worst);
+      const int ctrl = RoadJointSeams(d0, every, cj, cwhy, cworst, true);
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0c).count();
+      worldmap::SetCurrentWorldMap(real);
+      std::printf("roads: I joint seams on default: %s (%d of %d open joints, %d one-column spikes / pits, worst %d; control "
+                  "mid-piece %d, worst %d; %.0f ms)%s |%s\n",
+                  RoadSeamsOk(seams, ctrl) ? "PASS" : "FAIL", joints, total, seams, worst, ctrl, cworst, ms, why.c_str(),
+                  cwhy.c_str());
+      if (!RoadSeamsOk(seams, ctrl))
+        problems.push_back(Format("I: %d seam columns at %d shipped joints (control %d)%s", seams, joints, ctrl, why.c_str()));
+    }
   }
 
   // ---- the pristine world back ------------------------------------------------------
