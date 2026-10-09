@@ -695,6 +695,12 @@ enum : uint32_t {
   kS_RoadDepth = 12,    // road piece: surface cells from the ground's top down
   kS_RoadFlags = 15,    // road piece: 1 = end A open, 2 = end B open (a joint with
                         // the next piece on the same straight: no round cap)
+  kS_RoadCut = 8,       // road piece: the JOINT CUT normal of its straight, i16 x |
+                        // i16 z << 16 (|n| ~ 1024), shared by every piece of it:
+                        // an open end hands over on (c - joint) . n, so two pieces
+                        // whose integer ends point a hair apart still split the
+                        // plane exactly (bug 2026-10-08_23-42-45: their own
+                        // directions left 1-voxel walls of bare ground)
   kStampHdrWords = 4,
   kStamp_NX = 0, kStamp_NY = 1, kStamp_NZ = 2, kStamp_Columns = 3,
   // columns: nx*nz pairs of (runOff, runCount), absolute word offsets; runs:
@@ -1050,6 +1056,7 @@ struct WorldMapData {
     uint32_t roadMat = 0;
     int roadDepth = 0;
     int roadFlags = 0;                    // kS_RoadFlags
+    int roadCut = 0;                      // kS_RoadCut (packed like cutA)
     int road = -1;
     // A RIVER PIECE (kSiteRiver, W1): radius = the half-width at A, padMargin
     // the bank; these are the kS_Riv* words. A LAKE EDGE / CELL: `surf` the

@@ -1940,7 +1940,13 @@ static RoadP roadProj(uint32_t sid, int x, int z, int reach) {
   const int vx = st.x1 - st.x, vz = st.z1 - st.z;
   const int l2 = std::max(vx * vx + vz * vz, 1);
   const int dot = (x - st.x) * vx + (z - st.z) * vz;
-  if ((dot < 0 && (st.roadFlags & 1) != 0) || (dot > l2 && (st.roadFlags & 2) != 0)) return RoadP{-1, 0};
+  if (st.roadFlags != 0) {
+    // The open ends hand over on the straight's shared cut (kS_RoadCut), the
+    // shader's split exactly (bug 2026-10-08_23-42-45).
+    const int cx = (int32_t)((uint32_t)st.roadCut << 16u) >> 16, cz = st.roadCut >> 16;
+    if ((st.roadFlags & 1) != 0 && (x - st.x) * cx + (z - st.z) * cz <= 0) return RoadP{-1, 0};
+    if ((st.roadFlags & 2) != 0 && (x - st.x - vx) * cx + (z - st.z - vz) * cz > 0) return RoadP{-1, 0};
+  }
   const int t = std::clamp(dot, 0, l2);
   const int tq = (t * 256) / l2;
   return RoadP{d2, st.roadYA + (((st.roadYB - st.roadYA) * tq) >> 8u)};
