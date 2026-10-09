@@ -1877,6 +1877,8 @@ def check_worldmap_layout():
              "kSiteClearing": "WM_SITE_CLEARING",
              # softened ground, the waynode routes, the per-tree building rule
              "kSiteSoften": "WM_SITE_SOFTEN", "kSitePath": "WM_SITE_PATH",
+             # map v2 R1: the road piece kind
+             "kSiteRoad": "WM_SITE_ROAD",
              "kStampTreeClear": "WM_STAMP_TREE_CLEAR",
              "kRouteSoftInner": "WM_ROUTE_SOFT_INNER", "kRouteSoftOuter": "WM_ROUTE_SOFT_OUTER"}
     for m in re.finditer(r"\b(kBiomeRecWords|kCoverRowWords|kSiteRecWords|kStampHdrWords|kWaterRecWords|kShoreRowWords|kWaterRowWords)\s*=\s*(\d+)", hdr):

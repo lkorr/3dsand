@@ -5257,6 +5257,50 @@
         "#ffe6a8"
       ],
       "tags": []
+    },
+    {
+      "//": "MAP V2 R1. PACKED EARTH: a road's or a lane's beaten surface -- dirt trodden and rolled until it holds its shape. A SOLID on purpose: a road is graded, and a graded road is a slope, so a powder surface (dirt, gravel: repose 40) would slide off the first cut it is laid on and the chunk would never sleep (CLAUDE.md rule 2). Dirt's colours, a shade darker and flatter. Laid by worldgen only, from map.json roads[] (worldgen.wgsl roadColAt); a dug or blasted cell crumbles back to dirt.",
+      "id": "packed_earth",
+      "arcane": 1,
+      "footstep": "path",
+      "class": "solid",
+      "density": 1700,
+      "hardness": 30,
+      "rubble": "dirt",
+      "absorb": {
+        "capacity": 6
+      },
+      "colors": [
+        "#5f4730",
+        "#553f2a",
+        "#6a5036"
+      ],
+      "tags": [
+        "mineral",
+        "dissolvable",
+        "soil"
+      ],
+      "molten": "lava"
+    },
+    {
+      "//": "MAP V2 R1. PACKED GRAVEL: a metalled track -- gravel rolled into the ground until it is one crust. Solid for the reason packed_earth is (a graded road is a slope; loose gravel slides off it). Gravel's colours, a shade darker. Laid by worldgen only, from map.json roads[]; broken up it is gravel again.",
+      "id": "packed_gravel",
+      "arcane": 1,
+      "footstep": "path",
+      "class": "solid",
+      "density": 2000,
+      "hardness": 35,
+      "rubble": "gravel",
+      "colors": [
+        "#8f8880",
+        "#827b74",
+        "#9b948b"
+      ],
+      "tags": [
+        "mineral",
+        "dissolvable"
+      ],
+      "molten": "lava"
     }
   ]
 }

@@ -614,6 +614,30 @@ enum : uint32_t {
 // kS_BoxZ1 the other, kS_PadMargin the half-width (kPathTrunkKeepOut). A
 // trunk whose column is within that distance of the segment is refused
 // (siteBlocksTrunk); nothing else reads it.
+// kSiteRoad (map v2 R1, 2026-10-08): ONE PIECE OF AN AUTHORED ROAD -- not a
+// sites[] kind: map.json `roads[]` (`{id, name?, points: [[x, z], ...],
+// width, shoulder, surface, maxGrade, kind?: road|track|path, depth?}`) is
+// read, its profile BAKED at load (densified, the bare ground sampled, low-
+// passed, grade-limited to maxGrade: the midpoint of the largest
+// grade-Lipschitz profile under the ground and the smallest over it, so bumps
+// are cut and dips filled by the same amount), and split into pieces of at
+// most kSiteRoadPieceMax voxels (routeDist2's i32 bound) wherever a chord
+// strays more than half a voxel from the baked profile. kS_X / kS_Z one end,
+// kS_BoxX1 / kS_BoxZ1 the other (a route's layout, so routeDist2 reads it);
+// kS_RoadYA / kS_RoadYB the baked road surface at the two ends, Q8 voxels;
+// kS_Radius the half-width, kS_PadMargin the shoulder (widened at load so a
+// cut or a fill never steps more than a voxel a column, like a stamp's ramp,
+// up to kSiteRoadShoulderMax); kS_RoadMat the SOLID surface material,
+// kS_RoadDepth its cells. Readers: roadPadAt (the height mirror: the road Y
+// lerped along the piece, weight 256 over the half-width, a smoothstep to the
+// bare ground across the shoulder), roadColAt (genColumn: the surface, with
+// a ragged edge), siteFootprintHas (no cover / tile plant / tarn / cactus
+// on the carriageway), siteBlocksTrunk (no trunk within half-width + the
+// larger of the crown's reach and the shoulder), sitePadNear (no rolled pond
+// within half-width + kSiteRoadShoulderMax of the line -- a FIXED distance,
+// so the bare ground the profile is baked from cannot depend on the baked
+// shoulder), and farSurfaceMat (a road narrower than a far cell still tints
+// the cell its line crosses).
 // STAMPS carry their FOOTPRINT RECT (2026-09-29): kS_BoxX0 / kS_BoxZ0 ..
 // kS_BoxX1 / kS_BoxZ1 the template's own rotated nx x nz box (inclusive,
 // what wmStampCell draws into), kS_Apron the flat ring round it. The pad is
@@ -663,6 +687,12 @@ enum : uint32_t {
   kS_SoftBump = 10,     // soften site: Q8 scale of the detail octave
   kS_SoftGrain = 11,    // soften site: Q8 scale of the grain octave
   kS_SoftPath = 12,     // soften site: Q8 scale of the hill octave ON the routes
+  kS_RoadYA = 9,        // road piece: the baked surface Y at (kS_X, kS_Z), Q8 voxels
+  kS_RoadYB = 10,       // road piece: ... at (kS_BoxX1, kS_BoxZ1), Q8 voxels
+  kS_RoadMat = 11,      // road piece: the surface material id (a SOLID)
+  kS_RoadDepth = 12,    // road piece: surface cells from the ground's top down
+  kS_RoadFlags = 15,    // road piece: 1 = end A open, 2 = end B open (a joint with
+                        // the next piece on the same straight: no round cap)
   kStampHdrWords = 4,
   kStamp_NX = 0, kStamp_NY = 1, kStamp_NZ = 2, kStamp_Columns = 3,
   // columns: nx*nz pairs of (runOff, runCount), absolute word offsets; runs:
@@ -676,13 +706,30 @@ enum : uint32_t {
                         // its box, trunks thinned across its feather band
   kSiteSoften = 6,      // softened ground (kind "soften"): the local octaves scaled
   kSitePath = 7,        // a waynode link's trunk keep-out (derived from the refs)
+  kSiteRoad = 8,        // one piece of a map.json roads[] entry (map v2 R1)
+  // A road piece is at most this long (Chebyshev, voxels): routeDist2's
+  // projection products stay inside i32 after its box reject.
+  kSiteRoadPieceMax = 256,
+  // The widest a road's shoulder may be (authored or widened), voxels; also
+  // the FIXED distance past the half-width that keeps rolled ponds off a road.
+  kSiteRoadShoulderMax = 64,
+  // How far past the half-width a road tints a far cascade cell its line
+  // crosses (farSurfaceMat), voxels: the road's index reach covers it.
+  kSiteRoadFarTint = 32,
+  // Surface cells a road lays when it names no depth, and the most it may.
+  kSiteRoadDepthDefault = 3,
+  kSiteRoadDepthMax = 8,
   // At most this many sites may reach one map cell (the per-cell list); more
   // is a load error. Was 4 ("two neighbouring buildings, a lake and a tree")
   // until the world editor's P4: a village is ~10 structure refs plus its
-  // well, trees and pond in ONE 102 m cell, so 32. The shader's list walks
-  // iterate the list's own n, bounded by this; a cell no site reaches still
-  // costs one read.
-  kSiteCellMax = 32,
+  // well, trees and pond in ONE 102 m cell, so 32. 128 since map v2 R1
+  // (2026-10-08), measured on `default`: Harrowby's cell held 28 (5 houses,
+  // the soften box, 22 waynode routes); its 8 paths as roads made it 42-44,
+  // and a 3-road test network through the village 55..93 depending on how
+  // finely the profiles cut (the `roads` gate's H line reports it). The shader's list walks iterate the list's own n,
+  // bounded by this, and test the kind first, so a long list costs its length
+  // in that cell only; a cell no site reaches still costs one read.
+  kSiteCellMax = 128,
   // The deepest a stamp may sink (kS_Sink): genCell overlays template cells
   // from h - 1 - kStampSinkMax up, so a deeper footing would be cut off.
   kStampSinkMax = 8,
@@ -949,8 +996,33 @@ struct WorldMapData {
     // L1: index into `locales` when the structure ref is in a locale's group
     // (its refY / padY then carry the locale's offset), else -1.
     int locale = -1;
+    // A ROAD PIECE (kSiteRoad): (x, z) .. (x1, z1) its two ends, radius the
+    // half-width, padMargin the shoulder; the baked surface Y at the ends in
+    // Q8 voxels, the surface material and its depth in cells. `road` is the
+    // index into WorldMapData::roads it was cut from.
+    int roadYA = 0, roadYB = 0;
+    uint32_t roadMat = 0;
+    int roadDepth = 0;
+    int roadFlags = 0;                    // kS_RoadFlags
+    int road = -1;
   };
   std::vector<StampSite> sites;           // stamps, water and tree sites, in site-id order
+  // map.json roads[] (map v2 R1), as authored plus what the load baked: the
+  // profile at every polyline VERTEX (the surface Y, voxels, and the bare
+  // ground there) -- what the map page's profile preview shows, the engine's
+  // bake being the truth. The pieces themselves are kSiteRoad sites, at the
+  // END of `sites` (after every other kind), in road order.
+  struct Road {
+    std::string id, name, kind = "road", surface;
+    std::vector<std::pair<int, int>> points;   // world voxels
+    int width = 30, shoulder = 16, maxGrade = 12, depth = kSiteRoadDepthDefault;
+    uint32_t surfaceId = 0;
+    std::vector<int> vertexY;                  // baked surface Y at each point
+    std::vector<int> vertexGround;             // bare ground at each point
+    int pieces = 0;
+    int worstGradeQ8 = 0;                      // steepest baked step, percent * 256
+  };
+  std::vector<Road> roads;
   // LOAD WARNINGS (P6): everything the loader skipped or thinks is a mistake
   // but will not refuse a boot over -- an unknown site kind, a stamp .vox or
   // tree species that is not there, two footprints that overlap, a tree at
@@ -990,6 +1062,7 @@ struct WorldMapData {
   // word so 0 can mean "none". PackWorldMap rebases the offsets onto the
   // buffer; the CPU twins read these directly.
   std::vector<uint32_t> siteIndex;        // siteW * siteH
+  int siteCellWorst = 0;                  // the longest cell list (<= kSiteCellMax), for --mapcheck
   std::vector<uint32_t> siteLists;
   /** The list of cell (cx, cz): nullptr = no site, else [n, ids...]. */
   const uint32_t* SiteList(int cx, int cz) const {

@@ -1711,6 +1711,119 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     }
   }
 
+  // ---- roads[] (map v2 R1, worldmap.h kSiteRoad) -------------------------------
+  // Read and validated here; the PIECES are cut twice: once now, a straight
+  // split of every polyline segment into <= kSiteRoadPieceMax runs (the
+  // geometry the bare ground's pond keep-out reads -- see sitePadNear), and
+  // again after the profile bake below, along the same lines, wherever a
+  // chord leaves the baked profile. Both cuts cover the same polylines, so the
+  // bare ground the bake samples is the same under either.
+  if (j.contains("roads")) {
+    if (!j["roads"].is_array()) { log += at + "roads must be an array\n"; return false; }
+    std::set<std::string> roadIds;
+    for (const json& r : j["roads"]) {
+      if (!r.is_object()) { log += at + "a roads[] entry that is not an object\n"; return false; }
+      WorldMapData::Road rd;
+      rd.id = r.value("id", std::string());
+      const std::string who = at + "road \"" + rd.id + "\": ";
+      if (rd.id.empty()) { log += at + "a roads[] entry needs an id\n"; return false; }
+      if (!roadIds.insert(rd.id).second) { log += who + "a second road with this id\n"; return false; }
+      rd.name = r.value("name", std::string());
+      rd.kind = r.value("kind", std::string("road"));
+      if (rd.kind != "road" && rd.kind != "track" && rd.kind != "path") {
+        log += who + "kind \"" + rd.kind + "\" is not road, track or path\n";
+        return false;
+      }
+      if (!r.contains("points") || !r["points"].is_array()) {
+        log += who + "needs points: [[x, z], ...] in world voxels\n";
+        return false;
+      }
+      for (const json& pt : r["points"]) {
+        if (!pt.is_array() || pt.size() != 2 || !pt[0].is_number() || !pt[1].is_number()) {
+          log += who + "a point that is not [x, z]\n";
+          return false;
+        }
+        const std::pair<int, int> q{static_cast<int>(std::lround(pt[0].get<double>())),
+                                    static_cast<int>(std::lround(pt[1].get<double>()))};
+        if (std::abs(q.first) > (1 << 24) || std::abs(q.second) > (1 << 24)) {
+          log += who + "a point past +-16M voxels\n";
+          return false;
+        }
+        if (!rd.points.empty() && rd.points.back() == q) continue;   // a repeated vertex is no segment
+        rd.points.push_back(q);
+      }
+      if (rd.points.size() < 2) { log += who + "needs at least two distinct points\n"; return false; }
+      // The numbers, each clamped with a warning (the map page's inspector
+      // keeps to these ranges; a hand edit may not). Defaults by kind.
+      auto num = [&](const char* key, int def, int lo, int hi) -> int {
+        int v = def;
+        if (r.contains(key) && r[key].is_number()) v = static_cast<int>(std::lround(r[key].get<double>()));
+        const int c = std::clamp(v, lo, hi);
+        if (c != v)
+          warn("road \"" + rd.id + "\": " + key + " " + std::to_string(v) + " clamped to " + std::to_string(c) +
+               " (" + std::to_string(lo) + ".." + std::to_string(hi) + ")");
+        return c;
+      };
+      const bool path = rd.kind == "path", track = rd.kind == "track";
+      rd.width = num("width", path ? 12 : track ? 24 : 40, 2, 256);
+      rd.shoulder = num("shoulder", path ? 6 : track ? 12 : 16, 0, static_cast<int>(kSiteRoadShoulderMax));
+      rd.maxGrade = num("maxGrade", path ? 25 : track ? 15 : 10, 1, 100);
+      rd.depth = num("depth", static_cast<int>(kSiteRoadDepthDefault), 1, static_cast<int>(kSiteRoadDepthMax));
+      rd.surface = r.value("surface", std::string("packed_earth"));
+      for (size_t i = 1; i < set.matNames.size(); i++)
+        if (set.matNames[i] == rd.surface) rd.surfaceId = static_cast<uint32_t>(i);
+      if (rd.surfaceId == 0) {
+        log += who + "surface \"" + rd.surface + "\" is not a material in materials.json\n";
+        return false;
+      }
+      // A SOLID, always: a graded road is a slope, and a powder on a slope
+      // avalanches out from under itself and never sleeps (CLAUDE.md rule 2).
+      if (set.matClass[rd.surfaceId] != CLASS_SOLID) {
+        log += who + "surface \"" + rd.surface + "\" is not a solid; a road on a grade needs one "
+               "(packed_gravel, packed_earth, cobble, flagstone, ...)\n";
+        return false;
+      }
+      for (const auto& [x, z] : rd.points)
+        if (!out.InExtent(x, z)) {
+          warn("road \"" + rd.id + "\": point (" + std::to_string(x) + "," + std::to_string(z) +
+               ") is outside the map's extent");
+          break;
+        }
+      out.roads.push_back(std::move(rd));
+    }
+  }
+  // The first cut: every segment in <= kSiteRoadPieceMax straight runs,
+  // appended at the END of `sites` (every road after every other kind, so a
+  // road's pieces never shift another site's id). Ends only; the bake below
+  // fills in the surface and replaces them.
+  const size_t roadSite0 = out.sites.size();
+  for (size_t ri = 0; ri < out.roads.size(); ri++) {
+    const WorldMapData::Road& rd = out.roads[ri];
+    for (size_t i = 0; i + 1 < rd.points.size(); i++) {
+      const auto [ax, az] = rd.points[i];
+      const auto [bx, bz] = rd.points[i + 1];
+      const int len = std::max(std::abs(bx - ax), std::abs(bz - az));
+      const int n = std::max(1, (len + static_cast<int>(kSiteRoadPieceMax) - 1) / static_cast<int>(kSiteRoadPieceMax));
+      for (int k = 0; k < n; k++) {
+        WorldMapData::StampSite st;
+        st.id = "road " + rd.id + " (uncut)";
+        st.kind = kSiteRoad;
+        st.road = static_cast<int>(ri);
+        st.x = ax + (bx - ax) * k / n;
+        st.z = az + (bz - az) * k / n;
+        st.x1 = ax + (bx - ax) * (k + 1) / n;
+        st.z1 = az + (bz - az) * (k + 1) / n;
+        st.radius = std::max(1, rd.width / 2);
+        st.padMargin = rd.shoulder;
+        st.roadMat = rd.surfaceId;
+        st.roadDepth = rd.depth;
+        st.salt = 0;
+        out.sites.push_back(std::move(st));
+      }
+    }
+  }
+  if (!out.roads.empty() && !readTreeSpecies()) return false;   // a road keeps crowns off: the widest one
+
   // ---- the site index: every cell a site's REACH touches lists the site ------
   // The reach is the widest thing any reader tests against the site (worldmap.h
   // "the site table"): a stamp's footprint + pad margin; a lake's disc + its
@@ -1737,8 +1850,17 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     st.z1 = st.bz0 + std::max(st.nz, 1) - 1;
   }
   if (anyStamp && !readTreeSpecies()) return false;
+  // Built twice when the map has roads (once here, once after the profile
+  // bake re-cuts their pieces), so a lambda.
+  // A ROAD piece's reach: the half-width + the widest thing a reader asks
+  // from past it -- a rolled pond's centre (the fixed shoulder keep-out + a
+  // pond's radius, the 64 a stamp allows too), a trunk's crown, the far tint.
+  auto buildIndex = [&]() -> bool {
   for (WorldMapData::StampSite& st : out.sites) {
-    if (st.kind == kSiteTree) st.indexReach = st.radius + treeMaxReach;
+    if (st.kind == kSiteRoad)
+      st.indexReach = st.radius + std::max({static_cast<int>(kSiteRoadShoulderMax) + 64, treeMaxReach + 1,
+                                            static_cast<int>(kSiteRoadFarTint)}) + 1;
+    else if (st.kind == kSiteTree) st.indexReach = st.radius + treeMaxReach;
     else if (st.kind == kSiteClearing) st.indexReach = st.padMargin + treeMaxReach + 1;
     else if (st.kind == kSiteSoften) st.indexReach = st.padMargin + 1;
     else if (st.kind == kSitePath) st.indexReach = std::max(st.padMargin, static_cast<int>(kRouteSoftOuter)) + 1;
@@ -1754,7 +1876,7 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       // (a clearing / soften: min .. max; a stamp: its rect; a route: its two
       // ends in either order).
       int lx = st.x, lz = st.z, hx = st.x, hz = st.z;
-      if (st.kind == kSiteClearing || st.kind == kSiteSoften || st.kind == kSitePath) {
+      if (st.kind == kSiteClearing || st.kind == kSiteSoften || st.kind == kSitePath || st.kind == kSiteRoad) {
         lx = std::min(st.x, st.x1); hx = std::max(st.x, st.x1);
         lz = std::min(st.z, st.z1); hz = std::max(st.z, st.z1);
       } else if (st.kind == kSiteStamp) {
@@ -1770,8 +1892,10 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     out.siteIndex.assign(static_cast<size_t>(out.siteW) * out.siteH, 0u);
     out.siteLists.assign(1, 0u);   // offset 0 = "no site"
     std::map<std::vector<uint32_t>, uint32_t> shared;
+    out.siteCellWorst = 0;
     for (const auto& kv : byCell) {
       const std::vector<uint32_t>& ids = kv.second;
+      out.siteCellWorst = std::max(out.siteCellWorst, static_cast<int>(ids.size()));
       if (ids.size() > kSiteCellMax) {
         const int cx = static_cast<int>(kv.first % static_cast<size_t>(out.siteW));
         const int cz = static_cast<int>(kv.first / static_cast<size_t>(out.siteW));
@@ -1794,6 +1918,9 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       out.siteIndex[kv.first] = it->second;
     }
   }
+  return true;
+  };
+  if (!buildIndex()) return false;
 
   // ---- overlap warnings: two sites that claim the same ground ----------------
   // Each kind's FOOTPRINT as its readers test it (a stamp's pad square, a
@@ -1864,7 +1991,9 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
           // A clearing claims no ground: it is MEANT to hold houses, lakes
           // and authored trees (two clearings overlapping is one bigger one).
           // Nor does softened ground or a route.
-          auto claimsNone = [](int k) { return k == kSiteClearing || k == kSiteSoften || k == kSitePath; };
+          auto claimsNone = [](int k) {
+            return k == kSiteClearing || k == kSiteSoften || k == kSitePath || k == kSiteRoad;
+          };
           if (claimsNone(sa.kind) || claimsNone(sb.kind)) continue;
           if (!clash(sa, sb)) continue;
           warn("site \"" + sa.id + "\" (" + kindName(sa.kind) + " at " + std::to_string(sa.x) + "," +
@@ -1885,7 +2014,7 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
                  "): the player starts in the open, not among trees");
           continue;
         }
-        if (s.kind == kSiteSoften || s.kind == kSitePath) continue;   // walkable ground, both
+        if (s.kind == kSiteSoften || s.kind == kSitePath || s.kind == kSiteRoad) continue;   // walkable ground, all
         const Fp f = fpOf(s, false);
         const Fp sp{false, out.spawnX, out.spawnZ, out.spawnX, out.spawnZ, 0};
         if (meets(f, sp))
@@ -1909,7 +2038,8 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     Slot() = out;
     for (WorldMapData::StampSite& st : out.sites) {
       if (st.structure) continue;   // the AUTHORED floor, set above (P4)
-      st.padY = st.kind == kSiteWater || st.kind == kSiteClearing || st.kind == kSiteSoften || st.kind == kSitePath
+      st.padY = st.kind == kSiteWater || st.kind == kSiteClearing || st.kind == kSiteSoften || st.kind == kSitePath ||
+                        st.kind == kSiteRoad
                     ? 0 : BareGroundHeight(st.x, st.z, seed);
     }
     // THE LOCALES' ANCHORS (L1, worldmap.h LocaleDef): the bare ground at each
@@ -1930,6 +2060,163 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       st.padY += off;
       st.refY += off;
     }
+    // ---- THE ROAD PROFILES (map v2 R1, worldmap.h kSiteRoad) ------------------
+    // Per road, deterministic integer arithmetic on the BARE ground (no road
+    // and no pad in it: landColumnBare), sampled every kRoadStep voxels along
+    // the polyline. Low-passed (a moving mean over +-kRoadSmooth samples, 32
+    // voxels: a road does not follow the 3 m bumps),
+    // then GRADE-LIMITED: `lo` is the largest profile under the smoothed
+    // ground whose slope never exceeds maxGrade (a min-plus distance
+    // transform, forward then backward), `hi` the smallest one over it, and
+    // the road is (lo + hi) / 2 -- itself within maxGrade (the mean of two such
+    // profiles, +1 Q8 unit of rounding), cutting every bump and filling every
+    // dip by the same amount. Q8 voxels throughout.
+    // Then the pieces are RE-CUT along each segment: a chord is kept when the
+    // profile strays at most kRoadChordTolQ8 (one voxel) from it and it is <=
+    // 256 voxels a side -- a chord between two profile points is within
+    // maxGrade by construction, and a half-voxel tolerance cut rolling ground
+    // into ~60-voxel pieces (209 for 12 km of test network), which is what
+    // fills a village's site cell, else it is split at the sample farthest from it (the middle, when
+    // only the length is the problem). The re-cut lies on the first cut's
+    // lines to within the samples' integer rounding (a voxel), so the bare
+    // ground sampled here is the ground under the final pieces too.
+    if (!out.roads.empty()) {
+      constexpr int kRoadStep = 4, kRoadSmooth = 8, kRoadChordTolQ8 = 256;
+      std::vector<WorldMapData::StampSite> cut;
+      for (size_t ri = 0; ri < out.roads.size(); ri++) {
+        WorldMapData::Road& rd = out.roads[ri];
+        std::vector<int> sx, sz, ss, vtx;   // sample x, z, arc length (voxels); each vertex's sample
+        int arc = 0;
+        for (size_t i = 0; i + 1 < rd.points.size(); i++) {
+          const auto [ax, az] = rd.points[i];
+          const auto [bx, bz] = rd.points[i + 1];
+          const int64_t dx = bx - ax, dz = bz - az;
+          const int len = std::max(1, static_cast<int>(std::llround(std::sqrt(static_cast<double>(dx * dx + dz * dz)))));
+          const int n = std::max(1, (len + kRoadStep - 1) / kRoadStep);
+          vtx.push_back(static_cast<int>(sx.size()));
+          for (int k = 0; k < n; k++) {
+            sx.push_back(ax + static_cast<int>(dx * k / n));
+            sz.push_back(az + static_cast<int>(dz * k / n));
+            ss.push_back(arc + len * k / n);
+          }
+          arc += len;
+        }
+        vtx.push_back(static_cast<int>(sx.size()));
+        sx.push_back(rd.points.back().first);
+        sz.push_back(rd.points.back().second);
+        ss.push_back(arc);
+        const int N = static_cast<int>(sx.size());
+        std::vector<int> g(N), sm(N), pr(N);
+        for (int i = 0; i < N; i++) g[i] = BareGroundHeight(sx[i], sz[i], seed) * 256;
+        for (int i = 0; i < N; i++) {
+          int64_t sum = 0;
+          int cnt = 0;
+          for (int k = std::max(0, i - kRoadSmooth); k <= std::min(N - 1, i + kRoadSmooth); k++) { sum += g[k]; cnt++; }
+          sm[i] = static_cast<int>(sum / cnt);
+        }
+        // The grade allowance between samples i - 1 and i, Q8 voxels:
+        // maxGrade percent of the arc between them (i64: <= 100 * 256 * arc).
+        auto allow = [&](int i) {
+          return static_cast<int>(static_cast<int64_t>(ss[i] - ss[i - 1]) * rd.maxGrade * 256 / 100);
+        };
+        std::vector<int> lo = sm, hi = sm;
+        for (int i = 1; i < N; i++) {
+          lo[i] = std::min(lo[i], lo[i - 1] + allow(i));
+          hi[i] = std::max(hi[i], hi[i - 1] - allow(i));
+        }
+        for (int i = N - 2; i >= 0; i--) {
+          lo[i] = std::min(lo[i], lo[i + 1] + allow(i + 1));
+          hi[i] = std::max(hi[i], hi[i + 1] - allow(i + 1));
+        }
+        for (int i = 0; i < N; i++) pr[i] = static_cast<int>((static_cast<int64_t>(lo[i]) + hi[i]) >> 1);
+        rd.vertexY.clear();
+        rd.vertexGround.clear();
+        for (int vi : vtx) {
+          rd.vertexY.push_back((pr[vi] + 128) >> 8);
+          rd.vertexGround.push_back(g[vi] >> 8);
+        }
+        // The pieces, segment by segment (a vertex always ends a piece).
+        int q = 0;
+        rd.worstGradeQ8 = 0;
+        for (size_t v = 0; v + 1 < vtx.size(); v++) {
+          std::vector<std::pair<int, int>> stack{{vtx[v], vtx[v + 1]}}, done;
+          while (!stack.empty()) {
+            const auto [a, b] = stack.back();
+            stack.pop_back();
+            int farK = -1, dev = 0;
+            for (int k = a + 1; k < b; k++) {
+              const int64_t lin = pr[a] + static_cast<int64_t>(pr[b] - pr[a]) * (ss[k] - ss[a]) / std::max(ss[b] - ss[a], 1);
+              const int d = static_cast<int>(std::llabs(pr[k] - lin));
+              if (d > dev) { dev = d; farK = k; }
+            }
+            const bool tooLong =
+                std::max(std::abs(sx[b] - sx[a]), std::abs(sz[b] - sz[a])) > static_cast<int>(kSiteRoadPieceMax);
+            if (b - a > 1 && (tooLong || dev > kRoadChordTolQ8)) {
+              const int m = (dev <= kRoadChordTolQ8 || farK < 0) ? (a + b) / 2 : farK;
+              stack.push_back({m, b});   // popped second: the pieces come out in order
+              stack.push_back({a, m});
+              continue;
+            }
+            done.push_back({a, b});
+          }
+          // One SHOULDER per segment (the widest its pieces need) and the
+          // joints between them OPEN: the pieces of one straight are then
+          // one road to the height blend, with no cap and no step in the
+          // shoulder where one piece hands over to the next.
+          int segShoulder = rd.shoulder;
+          const size_t seg0 = cut.size();
+          for (size_t pi = 0; pi < done.size(); pi++) {
+            const auto [a, b] = done[pi];
+            WorldMapData::StampSite st;
+            st.id = "road " + rd.id + " #" + std::to_string(++q);
+            st.kind = kSiteRoad;
+            st.road = static_cast<int>(ri);
+            st.x = sx[a]; st.z = sz[a]; st.x1 = sx[b]; st.z1 = sz[b];
+            st.radius = std::max(1, rd.width / 2);
+            st.padMargin = rd.shoulder;
+            st.roadYA = pr[a]; st.roadYB = pr[b];
+            st.roadMat = rd.surfaceId;
+            st.roadDepth = rd.depth;
+            st.salt = 0;
+            const int arcAB = std::max(ss[b] - ss[a], 1);
+            rd.worstGradeQ8 = std::max(
+                rd.worstGradeQ8, static_cast<int>(std::llabs(static_cast<int64_t>(pr[b] - pr[a])) * 100 / arcAB));
+            // A CUT OR A FILL NEVER STEPS MORE THAN A VOXEL A COLUMN: the
+            // shoulder widens to twice the largest gap between the road and
+            // the bare ground at its outer edge (+2), up to
+            // kSiteRoadShoulderMax -- a stamp's ramp rule. Probed every 8
+            // voxels along the piece, both sides, at the authored edge.
+            const double vx = st.x1 - st.x, vz = st.z1 - st.z;
+            const double vl = std::max(std::sqrt(vx * vx + vz * vz), 1.0);
+            const double off = st.radius + std::max(st.padMargin, 1);
+            int gap = 0;
+            const int steps = std::max(1, static_cast<int>(vl) / 8);
+            for (int k = 0; k <= steps; k++) {
+              const double f = static_cast<double>(k) / steps;
+              const int y = (st.roadYA + static_cast<int>(static_cast<int64_t>(st.roadYB - st.roadYA) * k / steps) + 128) >> 8;
+              for (int side = -1; side <= 1; side += 2) {
+                const int px = static_cast<int>(std::lround(st.x + vx * f - side * vz / vl * off));
+                const int pz = static_cast<int>(std::lround(st.z + vz * f + side * vx / vl * off));
+                gap = std::max(gap, std::abs(BareGroundHeight(px, pz, seed) - y));
+              }
+            }
+            segShoulder = std::max(segShoulder, std::min(static_cast<int>(kSiteRoadShoulderMax), 2 * gap + 2));
+            st.roadFlags = (pi > 0 ? 1 : 0) | (pi + 1 < done.size() ? 2 : 0);
+            cut.push_back(std::move(st));
+          }
+          for (size_t pi = seg0; pi < cut.size(); pi++) cut[pi].padMargin = segShoulder;
+        }
+        rd.pieces = q;
+      }
+      out.sites.resize(roadSite0);
+      for (WorldMapData::StampSite& st : cut) out.sites.push_back(std::move(st));
+      if (!buildIndex()) {
+        Slot() = std::move(prev);
+        return false;
+      }
+      Slot() = out;   // the stamp ramps below read the re-cut map (the same bare ground)
+    }
+
     // A RAMP NEVER STEPS MORE THAN A VOXEL (2026-09-29). The smoothstep's
     // steepest point is 1.5 x the height it makes up over the margin, so a
     // pad cut into a hillside, or raised off a hollow, by more than the
@@ -2025,6 +2312,27 @@ std::string MapCheckJson(const std::string& name, bool ok, const WorldMapData& m
     ls.push_back({{"id", l.id}, {"groundY", l.groundY}, {"anchorY", l.ay}, {"delta", l.Delta()}});
   j["locales"] = ls;
   j["siteCellMax"] = static_cast<int>(kSiteCellMax);
+  j["siteCellWorst"] = m.siteCellWorst;
+  // Map v2 R1: each road as the engine baked it -- the map page's profile
+  // preview draws vertexY (the surface) against vertexGround (the bare
+  // ground) at each polyline vertex, the engine's numbers, not a JS re-bake.
+  json roads = json::array();
+  for (const WorldMapData::Road& r : m.roads) {
+    json rj;
+    rj["id"] = r.id;
+    rj["kind"] = r.kind;
+    rj["surface"] = r.surface;
+    rj["width"] = r.width;
+    rj["shoulder"] = r.shoulder;
+    rj["maxGrade"] = r.maxGrade;
+    rj["depth"] = r.depth;
+    rj["pieces"] = r.pieces;
+    rj["worstGrade"] = r.worstGradeQ8 / 256.0;
+    rj["vertexY"] = r.vertexY;
+    rj["vertexGround"] = r.vertexGround;
+    roads.push_back(rj);
+  }
+  j["roads"] = roads;
   // Map v2: the extent and what the planes hold (authored tiles; the rest
   // are the planes' defaults).
   j["extent"] = {m.extentX0, m.extentZ0, m.extentW, m.extentH};
@@ -2122,6 +2430,13 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
       r[kS_BoxX1] = U(s.x1); r[kS_BoxZ1] = U(s.z1);
       r[kS_SoftHill] = U(s.softHill); r[kS_SoftBump] = U(s.softBump); r[kS_SoftGrain] = U(s.softGrain);
       r[kS_SoftPath] = U(s.softPath);
+    }
+    if (s.kind == kSiteRoad) {
+      r[kS_BoxX1] = U(s.x1); r[kS_BoxZ1] = U(s.z1);
+      r[kS_RoadYA] = U(s.roadYA); r[kS_RoadYB] = U(s.roadYB);
+      r[kS_RoadMat] = s.roadMat;
+      r[kS_RoadDepth] = U(s.roadDepth);
+      r[kS_RoadFlags] = U(s.roadFlags);
     }
     if (s.kind == kSiteStamp) {
       r[kS_BoxX0] = U(s.bx0); r[kS_BoxZ0] = U(s.bz0);

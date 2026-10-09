@@ -107,6 +107,10 @@ bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& m
   out = BiomeSet{};
   std::unordered_map<std::string, uint32_t> byName;
   for (size_t i = 0; i < mats.size(); i++) byName[mats[i].name] = static_cast<uint32_t>(i);
+  for (const MaterialDef& m : mats) {
+    out.matNames.push_back(m.name);
+    out.matClass.push_back(m.gpu.klass);
+  }
   auto matId = [&](const std::string& n) -> uint32_t {
     if (n.empty() || n == "none") return 0;
     auto it = byName.find(n);

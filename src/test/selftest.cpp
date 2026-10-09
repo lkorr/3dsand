@@ -1251,6 +1251,16 @@ const char* const kOrder[] = {
     // a fly-mode camera that walks a few voxels in the control arm; it writes
     // no voxel.
     "dialogue-graph",
+    // Map v2 roads (docs/PLAN_map_v2.md R1). The `sculpt` seam (a synthetic
+    // map in a TEMP asset dir, uploaded, regenerated, read back) and its exit
+    // (the real environment reloaded, the world regenerated, the far cascades
+    // refilled) -- but it TICKS (400+ ticks of the gate map with roads, the
+    // sleep claim), and engine state outlives the gates' resets: run anywhere
+    // before `determinism` it moved that gate's pinned hash (39b3de48 ->
+    // 8616b32e in `--verify roads,determinism`), so it runs LATE, after every
+    // pinned trace, and before `infect-perf`, whose blood still in flight
+    // after its regenerate would land on this gate's carriageways.
+    "roads",
     // What the infection pass COSTS: eight bitten humans ticked four times
     // over (the whole-lattice sweep against the limb's cell list -- identical
     // outcome, a fraction of the time). LATE on purpose: the crowd bleeds over

@@ -23024,6 +23024,70 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   present). Gate `altitude` (on `peaks`): the window, the per-biome jittered
   treeline, the lapse rate, the lava clearance under the gorge, CPU + GPU
   sediment on the valley floor, rock + <= 32 active chunks on the cliff band.
+* **LIVE (map v2 R1, 2026-10-08, `docs/PLAN_map_v2.md` R1): ROADS ARE
+  GRADED GROUND, NOT PAINT.** `map.json roads[]`:
+  `{id, name?, points: [[x, z], ...] (world voxels), width (vox), shoulder
+  (vox), surface (a material name), maxGrade (%), kind?: road|track|path,
+  depth?}` — `depth` (surface cells, default 3, 1..8) is the one key past the
+  plan's schema (a superset; E3 may ignore it). Defaults by kind (road / track
+  / path): width 40 / 24 / 12, shoulder 16 / 12 / 6, maxGrade 10 / 15 / 25;
+  clamps (width 2..256, shoulder 0..64, grade 1..100) are warnings; a missing
+  id, a duplicate id, an unknown kind, fewer than two distinct points, an
+  unknown material or a **non-SOLID surface** are refusals naming the road (a
+  graded road is a slope; gravel and dirt are powders at repose 40 and would
+  never sleep — `packed_gravel` / `packed_earth` are the solid look-alikes,
+  appended to `materials.json` for this). **The bake** (`LoadWorldMap`, with
+  the map installed like the pad bake): the polyline sampled every 4 voxels,
+  the BARE ground there (`BareGroundHeight`, no road and no pad in it),
+  low-passed (±8 samples, 32 voxels), grade-limited — `lo` = the largest maxGrade-
+  Lipschitz profile under it, `hi` = the smallest over it (min-plus
+  transforms, forward + backward), road = `(lo + hi) / 2`, Q8 voxels — then
+  cut into `kSiteRoad` site records (`kind 8`, at the END of the site table):
+  a chord per run of samples while the profile stays within one voxel of
+  it and the run is ≤ `kSiteRoadPieceMax` 256 a side (routeDist2's i32
+  bound), vertices always ending a piece. Record: ends A/B (`kS_X/Z`,
+  `kS_BoxX1/Z1`, a route's layout), `kS_RoadYA/YB` (Q8 surface at the ends),
+  `kS_Radius` half-width, `kS_PadMargin` shoulder — WIDENED at load to
+  `2·gap + 2` (gap = the road vs the bare ground at the shoulder's outer edge,
+  probed every 8 voxels both sides), capped at `kSiteRoadShoulderMax` 64, the
+  stamp ramp's rule, ONE value per polyline segment — `kS_RoadMat`,
+  `kS_RoadDepth`, `kS_RoadFlags` (end A / B OPEN: a joint with the next piece
+  of the same straight has no round cap, or the cap would pull that piece's
+  ground toward the joint's Y and steepen the grade between — measured: 47
+  over-grade 16-voxel spans on a 25 % path before, 0 after; a bend vertex and
+  a road end keep their caps). `kSiteCellMax` went 32 -> 128 with this
+  (Harrowby's cell: 28 sites, 42-44 with its paths as roads, up to 93 with a
+  3-road test network at the first, finer cut; the `roads` gate's H line
+  reports the number). The pieces are cut twice
+  (straight first, so the pond keep-out the bare ground reads exists; re-cut
+  after the bake along the same lines) and the site index is built twice.
+  **Readers:** `roadPadAt` in the `landheight` mirror, applied BEFORE
+  `sitePadAt` (a house levels its floor over the road to its door): weight 256
+  within the half-width, a smoothstep in the squared distance across the
+  shoulder, the road Y lerped by the projection (`roadProj`), pieces blended
+  in table order; the sediment wedge is zeroed wherever it moved `h`.
+  `genCellIn` lays the surface over the top `depth` cells (first in the
+  ladder: above the snow line too; never under a pond) where `roadColAt`
+  (once per column in `genColumn`, `Col.road`) says the column is on a
+  carriageway — the half-width ±1 by a counter hash of the 2x2 block, a
+  ragged edge. Keep-outs: `siteFootprintHas` = half-width + 1 (no cover, tile
+  plant, tarn centre, cactus); `siteBlocksTrunk` = half-width + max(crown
+  reach, shoulder); `sitePadNear` (rolled ponds, cacti) = half-width +
+  `kSiteRoadShoulderMax` + r, a FIXED reach so the bare ground the bake samples
+  cannot depend on the shoulder it then widens. **Far field:** `roadTint` in
+  `farSurfaceMat` (no new site walk: `Col.road` carries the nearest piece):
+  where the cell is wider than the road but the road is at least a quarter of
+  it (`2·hw < cell ≤ 8·hw`), a cell whose centre column is within half a cell
+  (≤ `kSiteRoadFarTint` 32) of the road's edge takes its surface, untouched
+  ground only. Index reach: half-width + max(64 + 64, widest crown + 1, 32)
+  + 1. **Not done:** junctions are not profile-matched (two roads meeting at
+  a vertex blend in table order; snap their Y in the editor or keep the later
+  one's end on level ground); `--mapcheck` reports each road's per-vertex
+  baked Y and bare ground (`roads[]`) and the longest cell list
+  (`siteCellWorst`) for the map page. Harrowby's eight painted paths are
+  roads (`default/map.json`, ids `harrowby_*`, kind path) and were erased from
+  `default_ground.svedit` by `harrowby_08_paths.sh` (`paint_ground.mjs
+  --erase --only <mat>`). Gate `roads`.
 * **LIVE (world map P5, 2026-09-04): THE SITE TABLE.** `map.json sites[]`
   of kind `stamp` (a `.vox` from `assets/prefabs/`, a world column, a
   rotation, a pad margin) and `rules[]` (`{kind: stamp, template, biome,

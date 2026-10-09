@@ -219,6 +219,11 @@ struct BiomeSet {
   std::vector<WaterPresetDef> water;
   std::vector<SpeciesMirror> species;
   int problems = 0;                      // counted by ValidateBiomeSet
+  // The material table the set was resolved against, by engine id (air at
+  // 0): its names and classes, for a reader that names a material the biome
+  // files do not -- the world map's roads[] surface (map v2 R1).
+  std::vector<std::string> matNames;
+  std::vector<uint32_t> matClass;
 };
 
 /**

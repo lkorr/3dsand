@@ -21,6 +21,9 @@
  *   --layer    the edit layer; default: the one map.json names, else
  *              "<map>_ground", which is then written into map.json
  *   --erase    take those columns OUT of the layer instead
+ *   --only     with --erase: only a column whose every cell is this material
+ *              (a materials.json id), so a path is taken out without the
+ *              apron, cellar or yard it ran over
  *
  * GROUND-RELATIVE (SVED v2): each cell is stored as an offset from the
  * ground at its column (dy 0 = the top ground cell, -1 the one under it), so
@@ -53,6 +56,7 @@ for (let i = pathAt + 1; i < args.length && !args[i].startsWith('--'); i++) {
 }
 if (pts.length < 1) { console.error('--path needs at least one x,z'); process.exit(2); }
 const erase = args.includes('--erase');
+const onlyName = opt('--only', '');
 const dry = args.includes('--dry');
 const width = Math.max(1, Number(opt('--width', 10)));
 const depth = Math.max(1, Number(opt('--depth', 1)) | 0);
@@ -72,6 +76,12 @@ const mats = JSON.parse(readFileSync(join(ROOT, 'assets/materials/materials.json
 const mi = mats.findIndex(m => m.id === matName);
 if (!erase && mi < 0) { console.error('no material "' + matName + '" in materials.json'); process.exit(2); }
 const matId = mi + 1;
+let onlyId = 0;
+if (onlyName) {
+  const oi = mats.findIndex(m => m.id === onlyName);
+  if (oi < 0) { console.error('no material "' + onlyName + '" in materials.json'); process.exit(2); }
+  onlyId = oi + 1;
+}
 
 // The counter hash (housegen.js's): stable per column, no Math.random.
 function mix32(x) {
@@ -129,7 +139,14 @@ for (let z = Math.floor(z0 - reach); z <= Math.ceil(z1 + reach); z++) {
     const edge = half + (ragged ? ((hash(x >> 2, z >> 2, 0x9a7) % 1000) / 1000 - 0.5) * 2 * ragged : 0);
     if (d > edge) continue;
     const key = x + ',' + z;
-    if (erase) { if (cols.delete(key)) painted++; continue; }
+    if (erase) {
+      const had = cols.get(key);
+      if (!had) continue;
+      if (onlyId && !had.every(c => (c.word & 0xFFF) === onlyId)) continue;
+      cols.delete(key);
+      painted++;
+      continue;
+    }
     const col = [];
     for (let k = 0; k < depth; k++) {
       // State nibble = the palette variant (0..2), as worldgen jitters a solid.
