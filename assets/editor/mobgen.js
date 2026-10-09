@@ -320,7 +320,7 @@ export function wispColors(colors) {
 
 /** What hair is made of once it leaves the scalp. The painted cap on the
  *  skull stays FLESH -- it is the scalp. The MASS (volume, crests, buns,
- *  anything that hangs) is `hair_white`, which catches fast, burns out to ash
+ *  anything that hangs) is `hair_white`, which catches as scalp hair does, burns out to ash
  *  and does not bleed. Its own white is never seen while the art layer holds:
  *  the name is the material's, not the character's. By NAME, for FLESH_ID's
  *  reason. */

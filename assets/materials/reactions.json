@@ -1073,17 +1073,14 @@
       }
     },
     {
-      "note": "HAIR: catches almost on contact and is gone in about 4 ticks. One material and three rules, and it is the clearest single read that a character is on fire."
+      "note": "HAIR MASS (hair_white, the long hanging hair): catches EXACTLY as scalp hair does below -- 90 per-mille from any hot face, fire gas included -- then burns through hair_burning to air in a few ticks. It caught at 600 (fire gas at 1/16 of that) until 2026-10-08, when the owner asked that long hair be no easier to light than the hair on the scalp."
     },
     {
       "self": "hair_white",
       "neighbor": "tag:hot",
-      "chance": 600,
+      "chance": 90,
       "rainDamped": true,
-      "selfBecomes": "hair_burning",
-      "neighborChance": {
-        "fire": 0.0625
-      }
+      "selfBecomes": "hair_burning"
     },
     {
       "note": "SCALP HAIR (materials.json `hair`): the painted hair on a head. Catches from a single hot face like the hanging mass, but at 90 per-mille rather than 600 -- a little readier than skin's sear (63), far short of the mass's flash -- and then burns as the mass does, through hair_burning to air in a few ticks. Bounded by the scalp it sits on: nothing else is made of it."
