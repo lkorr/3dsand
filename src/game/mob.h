@@ -7346,6 +7346,12 @@ class MobSystem {
   uint64_t NextIdCounter() const { return nextId_; }
   void SetNextIdCounter(uint64_t n) { nextId_ = n ? n : 1; }
   uint64_t LimbBody(uint64_t mobId, int limbIndex) const;
+  // The joint anchor (limb-local, MobLimb::anchorLimb) of whichever limb of
+  // whichever creature - a corpse included - currently owns physics body
+  // `body`. A carve REBASES a limb (ReskinLimbMicro moves xf.pos and
+  // anchorLimb together), so the anchor is the one point of a limb that does
+  // not move when its brick does: the death screen pins a frozen limb by it.
+  bool LimbAnchorByBody(uint64_t body, Vec3& anchorLimb) const;
   bool IsAlive(uint64_t mobId) const;
   // The live stroke of one creature, for the gates and the dev readout. Null
   // when there is no such mob.

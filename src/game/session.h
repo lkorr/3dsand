@@ -331,6 +331,17 @@ struct DeathBody {
     // never cuts and "hide gear" takes away).
     int figSlot = -1;
     bool isLimb = false;
+    // WHERE ITS JOINT WAS, world voxels, at the instant of death (after the
+    // joint-consistency snap). The frozen pose is pinned by THIS rather than
+    // by the lattice corner in `xf.pos`: a carve after death (the blast's
+    // own carve landing after Die(), a corpse still crumbling) rebases the
+    // limb's brick and moves its corner and its anchor together, so the
+    // corner drifts off the body while the anchor stays put. The portrait
+    // pass rebuilds `xf.pos` from this and the limb's CURRENT anchorLimb
+    // (MobSystem::LimbAnchorByBody) every frame.
+    Vec3 anchorWorld{};
+    bool haveAnchor = false;
+    float rebaseLogged = 0.0f;  // the largest corner drift already reported
   };
   bool have = false;
   float yaw = 0.0f;         // the body's facing, so the orbit keeps a front

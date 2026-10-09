@@ -7975,7 +7975,10 @@ int main(int argc, char** argv) {
     std::vector<Vec3> jPos;
     std::vector<Quat> jRot;
     std::vector<uint8_t> jHave;
-    avatar.JointConsistentPose(jPos, jRot, jHave);
+    // SANDVOX_DEATH_PHOTO_RAW=1: the old photograph (no snap, no pin), the
+    // control arm when a death still looks wrong.
+    static const bool kRawPhoto = std::getenv("SANDVOX_DEATH_PHOTO_RAW") != nullptr;
+    avatar.JointConsistentPose(jPos, jRot, jHave, kRawPhoto ? 1e9f : 1.0f);
     // The boxes ride the same correction, so framing, limb focus and the
     // outlines agree with the picture.
     deathBody.boxes.boxes.clear();
@@ -8007,6 +8010,24 @@ int main(int argc, char** argv) {
       if (i >= (int)jHave.size() || !jHave[(size_t)i]) continue;
       const Vec3 pos = jPos[(size_t)i];
       const Quat rot = jRot[(size_t)i];
+      // The joint, from the live corner and anchor (PartAnchorWorld), carried
+      // onto the snapped pose: anchorLimb = R^-1 (anchorWorld - corner).
+      {
+        Vec3 aLive, livePos;
+        Quat liveRot;
+        if (avatar.PartAnchorWorld(i, aLive) &&
+            avatar.PartWorldTransform(i, livePos, liveRot)) {
+          const Vec3 local = QuatRotateInv(liveRot, aLive - livePos);
+          fl.anchorWorld = pos + QuatRotate(rot, local);
+          fl.haveAnchor = true;
+        }
+        const Vec3 moved = pos - livePos;
+        const float d2 = moved.x * moved.x + moved.y * moved.y + moved.z * moved.z;
+        // One line per part the snap moved: a still that was wrong says why.
+        if (d2 > 0.25f)
+          std::fprintf(stderr, "death photo: %s put back on its joint (%.1f voxels)\n",
+                       avatar.PartName(i), std::sqrt(d2));
+      }
       fl.xf.pos[0] = pos.x; fl.xf.pos[1] = pos.y; fl.xf.pos[2] = pos.z;
       fl.xf.quat[0] = rot.x; fl.xf.quat[1] = rot.y;
       fl.xf.quat[2] = rot.z; fl.xf.quat[3] = rot.w;
@@ -12033,7 +12054,27 @@ int main(int argc, char** argv) {
           const uint64_t mid = mobs.MobIdAt(i);
           if (mid && !mobs.IsAlive(mid)) mobs.RemoveMob(mid);
         }
-        avatar.SeverByName("head");
+        // SANDVOX_SHOT_DEATH_BLAST=1: die to a BLAST beside the head instead
+        // (bug report 2026-10-08 17:10: a blast flung a still-attached head
+        // off the neck for the tick the photograph was taken on).
+        const int headPart = avatar.PartIndex("head");
+        Vec3 headAt;
+        if (std::getenv("SANDVOX_SHOT_DEATH_BLAST") && headPart >= 0 &&
+            avatar.PartCentreWorld(headPart, headAt)) {
+          for (int k = 0; k < 1; k++) {
+            ExplosionOp e{};
+            const int off = std::getenv("SANDVOX_SHOT_BLAST_OFF") ? std::atoi(std::getenv("SANDVOX_SHOT_BLAST_OFF")) : 3;
+            e.x = (int32_t)std::floor(headAt.x) + off - k;
+            e.y = (int32_t)std::floor(headAt.y) + 1;
+            e.z = (int32_t)std::floor(headAt.z) + k;
+            e.radius = std::getenv("SANDVOX_SHOT_BLAST_R") ? std::atoi(std::getenv("SANDVOX_SHOT_BLAST_R")) : 3;
+            e.power = std::getenv("SANDVOX_SHOT_BLAST_P") ? std::atoi(std::getenv("SANDVOX_SHOT_BLAST_P")) : 120;
+            session.pendingBlasts.push_back(e);
+          }
+          std::printf("--shot-inventory: blasting beside the player's head\n");
+        } else {
+          avatar.SeverByName("head");
+        }
         std::printf("--shot-inventory: took the player's head off "
                     "(health %d/%d, alive=%d)\n",
                     avatar.TotalHealth(), avatar.HealthMax(),
@@ -19218,8 +19259,24 @@ int main(int argc, char** argv) {
           for (uint32_t s = 0; s < nSlots; s++) {
             const uint64_t h = slotHandles[s];
             if (!h) continue;
-            for (const auto& fl : deathBody.limbs) {
+            for (auto& fl : deathBody.limbs) {
               if (fl.body != h) continue;
+              // Pinned by the joint: the corner follows any rebase since.
+              Vec3 aLimb;
+              static const bool kRawPin = std::getenv("SANDVOX_DEATH_PHOTO_RAW") != nullptr;
+              if (!kRawPin && fl.haveAnchor && mobs.LimbAnchorByBody(fl.body, aLimb)) {
+                const Quat q{fl.xf.quat[0], fl.xf.quat[1], fl.xf.quat[2], fl.xf.quat[3]};
+                const Vec3 corner = fl.anchorWorld - QuatRotate(q, aLimb);
+                const Vec3 dd{corner.x - fl.xf.pos[0], corner.y - fl.xf.pos[1],
+                              corner.z - fl.xf.pos[2]};
+                const float drift = std::sqrt(dd.x * dd.x + dd.y * dd.y + dd.z * dd.z);
+                if (drift > 0.5f && drift > fl.rebaseLogged + 0.5f) {
+                  fl.rebaseLogged = drift;
+                  std::fprintf(stderr, "death photo: a frozen part's brick moved %.1f voxels "
+                               "since death (pinned back by its joint)\n", drift);
+                }
+                fl.xf.pos[0] = corner.x; fl.xf.pos[1] = corner.y; fl.xf.pos[2] = corner.z;
+              }
               bodyXf[s] = fl.xf;
               posedDead = true;
               break;

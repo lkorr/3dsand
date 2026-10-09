@@ -27207,6 +27207,17 @@ uint64_t MobSystem::LimbBody(uint64_t mobId, int limbIndex) const {
   return 0;
 }
 
+bool MobSystem::LimbAnchorByBody(uint64_t body, Vec3& anchorLimb) const {
+  if (!body) return false;
+  for (const Mob& mob : mobs_)
+    for (const MobLimb& l : mob.limbs_)
+      if (l.body == body) {
+        anchorLimb = l.anchorLimb;
+        return true;
+      }
+  return false;
+}
+
 bool MobSystem::IsAlive(uint64_t mobId) const {
   for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId) return mob.alive_;
