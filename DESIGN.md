@@ -23896,6 +23896,43 @@ different (it runs before the anchors resolve). The noise is not translation-
 invariant in y (a +200 plane moved the bare ground +183 with the default
 terrain noise), so a locale follows its anchor's ground, not the plane.
 
+**The locale editor (E4, 2026-10-08).** `assets/editor/maplocale.js`, a
+layer of the World map page like `mapvector.js`. World mode: every locale's
+bounds at low opacity and its 12x12 pixel-art badge (the E3 marker icons =
+`kMarkerIcons`) at `anchor.at`; the Locale tool drags out a new one (anchor
+at the centre, `anchor.y` from the heights backdrop or the plane; the panel
+offers "anchor.y := engine ground" from `--mapcheck`'s `locales[]`); a
+double-click opens it. THE LOCALE PAGE is a mode of the same page, not a
+second editor (one undo stack, one save, the same sculpt layer and site
+code): a breadcrumb back, the view framed on the bounds over the engine's
+`--heightmap` of the box at one sample a voxel, and only Sculpt / Clearing /
+Soften / Tree / Water / Structure / Link. **Clipping is exact for sculpt**:
+`sculptOctave` reads samples `x >> 3` and `+1` for a column's offset AND its
+gradient, so sample `s` reaches columns `8s-8 .. 8s+7`; `sculptDab` skips any
+sample whose reach leaves the bounds, so no column outside reads a changed
+sample (`scripts/test_maplocale.mjs` brute-forces it; the browser harness
+checks the engine's heights outside are unchanged after a stroke dragged
+across the edge). Box sites are clamped with their feather; a lake (with its
+shore band) or a tree outside is refused. **Refs are never written by the
+page**: Structure / Link build F8 commands (`ref.place / move / delete / link
+/ unlink`, world y = the backdrop's ground + 1) for `/api/refs/commands`
+(`--edit-script`), refused until the locale is in the SAVED map.json exactly
+as shown (the engine converts y through the saved anchor); each batch is one
+page undo step holding its inverse commands (a delete's inverse re-places the
+ref at file y + the locale's `groundY`). **The 3D view** is a streaming
+`WorldView` with `mapName` = the page's map and `layerSel @map` (the map's
+layer + every locale's, merged as the game merges them), `editBounds` = the
+locale's bounds (`apply` and the brush skip cells outside), and saves its
+`EditLayer` (loaded from the locale's file, resolved at the view's seed) to
+`/api/worldedit?locale=&map=` -> `locales/<id>/<stem>.svedit`, ground-relative
+through that map's voxel server; an empty layer deletes the file. The tuner
+server spawns `--voxserve` PER MAP (`SANDVOX_MAP`, one process alive,
+restarted on a map switch; PALETTE / voxreload take whatever is live) and
+`/api/heightmap` takes `map=`, so the map page's engine previews are of the
+map it edits, not tuning's `world.mapLayer`. `/api/voxregion?layer=@map` now
+sends `LAYER @map` (it sent the map layer's NAME, which loaded that one file
+and left every locale's layer out of the 3D preview).
+
 ## 10. Networking — the model of record (decided 2026-09-10)
 
 Until 2026-09-10 this section said "both classic models are viable, decide at

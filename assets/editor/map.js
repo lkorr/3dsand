@@ -65,6 +65,17 @@
  * engine's RegionAt) and MARKERS (`markers[]`, pixel-art map annotations).
  * Locale markers are the locale editor's (E4), not these.
  *
+ * LOCALES (E4, maplocale.js): every map.json `locales[]` entry drawn as its
+ * bounds (low opacity) and a pixel-art marker; the Locale tool drags out a
+ * new one; a double-click OPENS it -- the page becomes the LOCALE PAGE (a
+ * breadcrumb back to the world): the view frames the bounds over the engine's
+ * own heights of the box, the tools are cut to Sculpt / Clearing / Soften /
+ * Tree / Water (all CLIPPED to the bounds: sculptDab skips a sample whose
+ * bilinear reach leaves them, a box is clamped, a lake or tree outside is
+ * refused) plus Structure (refs through the F8 command layer) and Link
+ * (waynodes), and a 3D WorldView under the map edits the locale's OWN voxel
+ * layer. One undo stack still: a refs batch is undone by its inverse commands.
+ *
  * Input: left-drag paints / places with the active tool, right- or
  * middle-drag pans, wheel zooms about the cursor, [ ] resize the brush,
  * Alt+click with the height or biome brush picks the value under the cursor,
@@ -74,6 +85,7 @@
 import * as MT from './maptiles.js';
 import * as HS from './heightshapes.js';
 import * as VEC from './mapvector.js';
+import * as LOC from './maplocale.js';
 
 // Display colours by biome NAME; anything unknown gets a stable hash colour.
 const COLOR = {
@@ -91,8 +103,11 @@ let H = null;
 let els = {};
 let map = null;            // {name, json, H: height plane, B: biome plane} (maptiles.js planes)
 let dirty = false;
-let tool = 'height';       // height | biome | pad | spawn | stamp | water | tree | clearing | soften | site | sculpt | road | region | marker
+let tool = 'height';       // height | biome | pad | spawn | stamp | water | tree | clearing | soften | site | sculpt | road | region | marker | locale | structure | waylink
 let VL = null;             // the vector layers (mapvector.js): roads, regions, markers
+let LC = null;             // the locales (maplocale.js): markers + bounds, and the locale page
+// The tools of the LOCALE page (a locale open); every other tool is the world's.
+const LOCALE_TOOLS = ['site', 'sculpt', 'clearing', 'soften', 'tree', 'water', 'structure', 'waylink'];
 let savedJson = null;      // map.json as last loaded / saved: the profile chart says when a road differs from its bake
 // P-G: the terrain block map.json carries. Its DEFAULTS (what a map missing a
 // key gets) have one copy, src/sim/worldmap.h TerrainParams, which the tuner
@@ -348,6 +363,8 @@ function sculptDab(wx, wz, before) {
     for (let sx = sx0; sx <= sx1; sx++) {
       const d = Math.hypot(sx * SC_SP - wx, sz * SC_SP - wz);
       if (d >= r) continue;
+      // a locale open: only samples whose bilinear reach stays inside its bounds
+      if (LC && !LC.sampleAllowed(sx, sz)) continue;
       const w = 0.5 * (1 + Math.cos(Math.PI * d / r));
       const key = scKey(sx >> 5, sz >> 5);
       const cur = scSample(sculpt.tiles, sx, sz);
@@ -432,6 +449,7 @@ function restore(s) {
   if (!lines.sel) lines.drawing = false;
   syncTerrain(); syncSites(); syncEditSel(); publishTerrain(); syncLines();
   if (VL) VL.afterRestore();
+  if (LC) LC.afterRestore();
 }
 function pushUndo(e) { undo.push(e); if (undo.length > 60) undo.shift(); redo = []; }
 /** The map's terrain block, created from the defaults if the file has none. */
@@ -514,6 +532,7 @@ async function loadMap(name) {
   lines.sel = null; lines.drawing = false; lines.drag = null;
   savedJson = saved;
   if (VL) VL.reset();
+  if (LC) LC.reset();
   if (els.heightsBtn) els.heightsBtn.classList.remove('on');
   brush.index = Math.min(brush.index, json.biomes.length - 1);
   range.vals = null;
@@ -673,9 +692,16 @@ function syncCheck() {
       row.title = 'select ' + vm[1] + ' ' + vm[2];
       row.addEventListener('click', () => { tool = vm[1]; syncControls(); VL.selectById(vm[1], vm[2], true); });
     }
+    const lm = !hit && !vm && map && String(w).match(/\blocale "([^"]+)"/);
+    if (lm && (map.json.locales || []).some(l => l.id === lm[1])) {
+      row.classList.add('link');
+      row.title = 'select locale ' + lm[1];
+      row.addEventListener('click', () => { if (!LC.open()) { LC.st.sel = lm[1]; tool = 'locale'; syncControls(); LC.sync(); paint(); } });
+    }
     els.checkList.append(row);
   }
   if (VL) VL.sync();
+  if (LC) LC.sync();
 }
 function buildCheckPanel() {
   const el = H.el;
@@ -695,8 +721,8 @@ async function saveMap() {
   const name = map.name;
   // The engine REFUSES the whole map over a road with one point, a region
   // with two, an id twice: never write one.
-  const vp = VL && VL.problems();
-  if (vp) { toast('not saved: ' + vp.join('; ') + ' (the engine would refuse the whole map)', true); return false; }
+  const vp = [...((VL && VL.problems()) || []), ...((LC && LC.problems()) || [])];
+  if (vp.length) { toast('not saved: ' + vp.join('; ') + ' (the engine would refuse the whole map)', true); return false; }
   const body = JSON.stringify(map.json, null, 2) + '\n';
   let r = await fetch('/api/worldmap?name=' + encodeURIComponent(name), {method: 'POST', body});
   let j = await r.json();
@@ -981,6 +1007,7 @@ function paint() {
   paintFrame(ctx);
   paintLines(ctx);
   if (VL) VL.paint(ctx);
+  if (LC) LC.paint(ctx);
   paintArea(ctx);
   paintSites(ctx);
   paintCursor(ctx);
@@ -1192,6 +1219,7 @@ function wire() {
     // an erosion preview is committed by the next edit of any kind
     if (erosion.pending) commitErosion();
     if (VL.pointerDown(ev)) return;
+    if (LC.pointerDown(ev)) return;
     if (tool === 'shape') {
       const [wx, wz] = worldAtF(ev);
       stampShape(wx, wz);
@@ -1233,7 +1261,10 @@ function wire() {
       const kind = tool;
       const [wx, wz] = worldColumnAt(ev);
       const sites = map.json.sites || (map.json.sites = []);
-      const hit = clearingAt(wx, wz, kind);
+      // a locale open: only boxes wholly inside it are its to edit
+      let hit = clearingAt(wx, wz, kind);
+      if (hit && !LC.boxEditable(hit)) hit = null;
+      if (!hit && !LC.pointAllowed(wx, wz)) { status('outside the locale: its tools edit inside its bounds only'); return; }
       stroke = snapshot();
       if (ev.shiftKey && hit) {
         sites.splice(sites.indexOf(hit), 1);
@@ -1313,8 +1344,9 @@ function wire() {
       const [wx, wz] = worldColumnAt(ev);
       const sites = map.json.sites || (map.json.sites = []);
       const grab = Math.max(6, 8 / view.scale);   // ~8 px of marker
-      const hit = sites.find(s => s.kind === 'tree' && Array.isArray(s.at) &&
+      const hit = sites.find(s => s.kind === 'tree' && Array.isArray(s.at) && LC.pointAllowed(s.at[0], s.at[1]) &&
                                   Math.hypot(s.at[0] - wx, s.at[1] - wz) <= grab);
+      if (!hit && !LC.pointAllowed(wx, wz)) { status('outside the locale: a tree goes inside its bounds'); return; }
       stroke = snapshot();
       if (ev.shiftKey && hit) {
         sites.splice(sites.indexOf(hit), 1);
@@ -1350,10 +1382,16 @@ function wire() {
       const hit = sites.find(s => {
         if (s.kind !== 'water' || !Array.isArray(s.at)) return false;
         const g = water.geom[s.preset] || {radius: 60};
+        if (!LC.circleAllowed(s.at[0], s.at[1], (s.radius || g.radius) + (g.band || 0))) return false;
         const r = Math.max(s.radius || g.radius, 6 / view.scale);
         const dx = s.at[0] - wx, dz = s.at[1] - wz;
         return dx * dx + dz * dz <= r * r;
       });
+      if (!hit && !ev.shiftKey && LC.clipping()) {
+        const g = water.geom[water.preset] || {radius: 60, band: 24};
+        const rv = water.radiusM > 0 ? Math.round(water.radiusM * 10) : g.radius;
+        if (!LC.circleAllowed(wx, wz, rv + g.band)) { status('the lake and its shore would reach past the locale\'s bounds: place it further in, or make it smaller'); return; }
+      }
       stroke = snapshot();
       if (ev.shiftKey && hit) {
         sites.splice(sites.indexOf(hit), 1);
@@ -1382,6 +1420,8 @@ function wire() {
       scheduleRealRefresh();
     } else if (VL.dragging() && ev.buttons & 1) {
       VL.pointerMove(ev);
+    } else if (LC.dragging() && ev.buttons & 1) {
+      LC.pointerMove(ev);
     } else if (areaDrag && ev.buttons & 1) {
       const [wx, wz] = worldColumnAt(ev);
       area = [Math.min(areaDrag.x0, wx), Math.min(areaDrag.z0, wz), Math.max(areaDrag.x0, wx), Math.max(areaDrag.z0, wz)];
@@ -1410,12 +1450,16 @@ function wire() {
         s.min = [wx + clearDrag.dx, wz + clearDrag.dz];
         s.max = [s.min[0] + clearDrag.w, s.min[1] + clearDrag.h];
       }
+      // a locale open: the box (and its feather) stays inside the bounds
+      LC.clipBox(s, s.kind === 'soften' ? 96 : 64);
       stroke.changed = true;
       syncSites();
     } else if (waterDrag && ev.buttons & 1) {
       const [wx, wz] = worldColumnAt(ev);
-      waterDrag.site.at = [wx + waterDrag.dx, wz + waterDrag.dz];
-      stroke.changed = true;
+      const at = [wx + waterDrag.dx, wz + waterDrag.dz], s = waterDrag.site;
+      const g = water.geom[s.preset] || {radius: 60, band: 24};
+      const ok = s.kind === 'water' ? LC.circleAllowed(at[0], at[1], (s.radius || g.radius) + g.band) : LC.pointAllowed(at[0], at[1]);
+      if (ok) { s.at = at; stroke.changed = true; }
     } else if (stroke && stroke.sculptBefore && ev.buttons & 1) {
       const gap = Math.max(2, sculpt.radius * 0.25);
       let [lx, lz] = sculpt.last;
@@ -1451,6 +1495,7 @@ function wire() {
   const up = () => {
     panning = null;
     VL.pointerUp();
+    LC.pointerUp();
     padDrag = null;
     if (areaDrag) {
       areaDrag = null;
@@ -1514,6 +1559,7 @@ function wire() {
     if (inField) return;
     if ((ev.ctrlKey || ev.metaKey) && ev.key === 'z') { ev.preventDefault(); doUndo(); }
     else if ((ev.ctrlKey || ev.metaKey) && ev.key === 'y') { ev.preventDefault(); doRedo(); }
+    else if (LC.key(ev)) ev.preventDefault();
     else if ((tool === 'road' || tool === 'region' || tool === 'marker') && VL.key(ev)) ev.preventDefault();
     else if (ev.key === '[' || ev.key === ']') {
       const f = ev.key === ']' ? 1.25 : 0.8;
@@ -1530,8 +1576,10 @@ function wire() {
       syncLines(); paint();
     }
   });
-  c.addEventListener('dblclick', () => {
+  c.addEventListener('dblclick', ev => {
     if ((tool === 'road' || tool === 'region') && VL.dblclick()) return;
+    // a locale's marker (any tool) or its bounds (Locale / Select): open it
+    if (LC.dblclick(ev)) return;
     // a double click ends the line being drawn (its second click added a
     // vertex on top of the first: drop it)
     if (tool !== 'line' || !lines.drawing || !lines.sel) return;
@@ -1551,6 +1599,9 @@ function wire() {
 // (the plane, the line's `baked` flag, and the session's bake record).
 function swapEntry(e) {
   if (e.sculptBefore) return {sculptBefore: sculptSwap(e.sculptBefore)};
+  // E4: a refs batch (written by the engine at once): run its inverse
+  // commands; the opposite stack gets the forward ones
+  if (e.refs) { LC.replay(e.refs.undo, e.refs.label); return {refs: {undo: e.refs.redo, redo: e.refs.undo, label: e.refs.label}}; }
   const back = {};
   if (e.tiles) Object.assign(back, swapPlanes(e));
   if (e.json) { back.json = snapshot().json; restore(e); }
@@ -1563,13 +1614,17 @@ function swapEntry(e) {
 }
 function doUndo() {
   if (!undo.length) return;
-  redo.push(swapEntry(undo.pop()));
-  markDirty(true); paint();
+  const e = undo.pop();
+  redo.push(swapEntry(e));
+  if (!e.refs) markDirty(true);   // refs are on disk already: the map is no dirtier
+  paint();
 }
 function doRedo() {
   if (!redo.length) return;
-  undo.push(swapEntry(redo.pop()));
-  markDirty(true); paint();
+  const e = redo.pop();
+  undo.push(swapEntry(e));
+  if (!e.refs) markDirty(true);
+  paint();
 }
 /** The nearest site marker of any kind within a generous radius, or null. */
 function siteAt(wx, wz) {
@@ -1773,6 +1828,15 @@ function decodeHeightmap(buf) {
  *  whole extent otherwise. `key` says whether the backdrop on screen answers it. */
 function heightsRequest() {
   const e = map.json.extent, whole = Math.max(e.size[0], e.size[1]);
+  const L = LC && LC.open(), lb = L && LOC.boundsOf(L);
+  if (lb) {
+    // THE LOCALE PAGE: the bounds (plus a margin), one sample a voxel up to
+    // 1024 a side -- finer than the sculpt layer's 0.8 m, so a stroke's
+    // preview and Flatten read the ground the brush is actually on.
+    const span = Math.max(lb[2] - lb[0], lb[3] - lb[1]) + 1 + 64;
+    const cx = Math.round((lb[0] + lb[2] + 1) / 2), cz = Math.round((lb[1] + lb[3] + 1) / 2);
+    return {cx, cz, span, res: Math.min(1024, span), whole, key: 'locale:' + cx + ',' + cz + ',' + span};
+  }
   const c = els.canvas;
   const vis = Math.max(c.clientWidth || 1, c.clientHeight || 1) / view.scale;
   const span = Math.min(whole, Math.max(256, Math.round(vis)));
@@ -1791,7 +1855,9 @@ async function fetchHeights() {
   const gen = savedGen;
   const base = scClone(sculpt.saved);
   const seed = H.previewSeed ? H.previewSeed() : 1337;
-  const r = await fetch('/api/heightmap?cx=' + cx + '&cz=' + cz + '&span=' + span + '&res=' + res + '&seed=' + seed, {cache: 'no-store'});
+  // &map=: THIS page's map (E4), not necessarily the one tuning names
+  const r = await fetch('/api/heightmap?cx=' + cx + '&cz=' + cz + '&span=' + span + '&res=' + res + '&seed=' + seed +
+                        '&map=' + encodeURIComponent(map.name), {cache: 'no-store'});
   if (!r.ok) { let m = 'HTTP ' + r.status; try { m = (await r.json()).error || m; } catch (e) {} throw new Error(m); }
   const D = decodeHeightmap(await r.arrayBuffer());
   heights = {res: D.res, img: new ImageData(D.res, D.res), D, base, hc: null, key, gen, seed, ver: 0, drawn: -1};
@@ -2634,6 +2700,15 @@ const rToSlider = m => Math.round(1000 * Math.log(m / R_MIN_M) / Math.log(R_MAX_
 const sliderToR = v => R_MIN_M * Math.pow(R_MAX_M / R_MIN_M, v / 1000);
 function syncControls() {
   if (!els.tools) return;
+  // THE LOCALE PAGE (E4) has its own tool set; the world's tools are hidden
+  // there (and Structure / Link are the locale's only)
+  const inLocale = !!(LC && LC.open());
+  if (inLocale && !LOCALE_TOOLS.includes(tool)) tool = 'sculpt';
+  if (!inLocale && (tool === 'structure' || tool === 'waylink')) tool = 'locale';
+  for (const [k, b] of Object.entries(els.tools))
+    b.style.display = (inLocale ? LOCALE_TOOLS.includes(k) : k !== 'structure' && k !== 'waylink') ? '' : 'none';
+  for (const p of [els.vecPanel, els.htPanel, els.terrainPanel, els.palette]) if (p) p.style.display = inLocale ? 'none' : '';
+  if (els.mapSel) els.mapSel.disabled = inLocale;   // leave the locale to switch maps
   for (const [k, b] of Object.entries(els.tools)) b.classList.toggle('on', k === tool);
   // per-tool option groups: only the active tool's
   for (const [k, g] of Object.entries(els.opts || {})) g.style.display = k.split(' ').includes(tool) ? '' : 'none';
@@ -2729,6 +2804,12 @@ export function attach(hooks) {
 #env-map .mapnote.bad{color:#ffcf8a}
 #env-map button.mapgo{background:#2a2410;border-color:#6a5a1a;color:#ffd866}
 #env-map button.mapgo:disabled,#env-map .maptools button:disabled{opacity:.45}
+#env-map .mapkind-locale{color:#7fd4ff;display:inline-flex;align-items:center;gap:3px}
+#env-map .mapcrumb{font:12px monospace;color:#cfeeff;padding:2px 4px;border:1px solid #2b4a6f;border-radius:4px;background:#12161f}
+#env-map .mapcrumb a{color:#7fd4ff}
+#env-map .mapcrumb canvas{image-rendering:pixelated;vertical-align:middle}
+#env-map .maplocale3d{display:flex;flex-direction:column;gap:4px;flex:0 0 300px;min-height:0}
+#env-map .maplocale3d-canvas{flex:1;min-height:200px;width:100%;background:#0e1116;border:1px solid #2a3040;border-radius:6px}
 `;
   document.head.append(style);
 
@@ -2749,6 +2830,31 @@ export function attach(hooks) {
     tool: () => tool, setTool: t => { tool = t; syncControls(); paint(); },
     hover: () => els.hoverW || null,
     materials: () => (H.materials ? H.materials() : null),
+  });
+  // E4: the locales, handed the page (maplocale.js createLocaleLayer)
+  LC = LOC.createLocaleLayer({
+    map: () => map, view, SX, SZ, worldAtF,
+    // centre on a box; `soft` zooms only when it would be tiny or not fit
+    // (a list click), else it fills ~90 % of the canvas (opening a locale)
+    fitBounds: (x0, z0, x1, z1, soft) => {
+      const c = els.canvas, W = c.clientWidth || 600, Hh = c.clientHeight || 400;
+      const span = Math.max(x1 - x0, z1 - z0, 32), onScreen = span * view.scale;
+      if (!soft || onScreen < 40 || onScreen > 0.9 * Math.min(W, Hh))
+        view.scale = Math.max(1e-4, Math.min(16, 0.9 * Math.min(W / Math.max(1, x1 - x0), Hh / Math.max(1, z1 - z0))));
+      view.cx = (x0 + x1) / 2; view.cz = (z0 + z1) / 2;
+      scheduleRealRefresh();
+    },
+    pushUndo, snapshot, markDirty, paint, status, toast, el,
+    vpm, seaY, check: () => check, savedJson: () => savedJson,
+    tool: () => tool, setTool: t => { tool = t; syncControls(); paint(); },
+    hover: () => els.hoverW || null,
+    groundAt: (x, z) => groundAt(x, z),
+    planeAt: (x, z) => MT.heightAt(map.H, x, z),
+    refreshHeights: () => fetchHeights().catch(e => status('locale heights failed: ' + e.message)),
+    previewSeed: () => (H.previewSeed ? H.previewSeed() : 1337),
+    modeChanged: () => { syncControls(); syncSites(); paint(); },
+    isVisible: () => (H.isVisible ? H.isVisible() : true),
+    saved: () => { if (H.saved) H.saved(); },
   });
   els.palette = el('div', {class: 'mapbar'});
   els.mapSel = el('select', {});
@@ -2772,6 +2878,9 @@ export function attach(hooks) {
     region: el('button', {title: 'REGIONS (map.json regions[]: named polygons, data only): click out a polygon, click its first vertex to close; drag / insert / shift+click delete vertices like roads'}, 'Region'),
     marker: el('button', {title: 'MARKERS (map.json markers[]: annotations with a pixel-art icon): click to place, drag to move, shift+click to delete'}, 'Marker'),
     sculpt: el('button', {title: 'SCULPT the fine layer: raise / lower / smooth / flatten / erase the map’s height-offset layer (sculpt.svsculpt, 0.8 m samples), added after everything else'}, 'Sculpt'),
+    locale: el('button', {title: 'LOCALES (map.json locales[]: hand-made places that ride their ground): drag out a new one’s bounds with the icon picked beside it; click one to select it; DOUBLE-CLICK opens it (the locale page)'}, 'Locale'),
+    structure: el('button', {title: 'STRUCTURES of this locale (structure refs, written through the F8 command layer): click places the picked blueprint, drag one to move it, R turns it, shift+click deletes it'}, 'Structure'),
+    waylink: el('button', {title: 'WAYNODE LINKS: click a waynode, then another, to join them (Shift or a second time parts them); click open ground for a new waynode joined to the last'}, 'Link'),
   };
   for (const [k, b] of Object.entries(els.tools)) b.addEventListener('click', () => { tool = k; syncControls(); paint(); });
   // ---- the plane brushes (height + biome): one radius in metres, log slider
@@ -2912,7 +3021,7 @@ export function attach(hooks) {
     els.heightsBtn, pct('realAlpha', 'real-terrain backdrop opacity'),
     el('label', {}, ' ', scShow, 'sculpt'));
   const toolbar = el('div', {class: 'mapbar'}, els.tools.site, els.tools.height, els.tools.shape, els.tools.line, els.tools.area, els.tools.biome, els.tools.sculpt,
-    els.tools.road, els.tools.region, els.tools.marker,
+    els.tools.road, els.tools.region, els.tools.marker, els.tools.locale, els.tools.structure, els.tools.waylink,
     els.tools.pad, els.tools.spawn, els.tools.stamp, els.tools.water, els.tools.tree, els.tools.clearing, els.tools.soften);
   els.opts = {
     'height biome': el('span', {class: 'mapopts'}, 'radius ', els.brR, ' ', els.brROut, el('label', {}, ' spacing ', els.brSpacing, '%')),
@@ -2927,6 +3036,7 @@ export function attach(hooks) {
     'tree': el('span', {class: 'mapopts'}, 'tree ', els.treeSp, ' v ', els.treeVar, ' ', els.treeRot),
     'clearing': el('span', {class: 'mapopts'}, 'clearing feather ', els.clearFeather, ' vox'),
     ...VL.toolOpts(),
+    ...LC.toolOpts(),
   };
   toolbar.append(...Object.values(els.opts));
   const note = el('div', {class: 'mapnote'},
@@ -2936,8 +3046,12 @@ export function attach(hooks) {
     'Road draws graded roads the engine builds (vertices snap together into junctions; the Vector layers panel shows the engine’s baked profile once saved); Region outlines named areas; Marker pins pixel-art annotations. ' +
     'Sites: the pad box (calm bare ground; the harness map’s is the selftest’s), the spawn diamond, stamps, authored lakes, authored trees, forest clearings, softened ground; they keep out by their own footprint. The Load check panel says what the engine thinks of the saved map. ' +
     'Saving writes map.json and only the plane tiles you changed (assets/worldmap/<name>/planes/), and moves the world hash; regenerate the world (F7 in the game, or Apply in the sidebar) to see it.');
-  const main = el('div', {class: 'mapmain'}, bar, toolbar, els.palette, els.canvas, els.status, note);
-  const side = el('div', {class: 'mapside'}, buildCheckPanel(), VL.buildPanel(), buildHeightToolsPanel(), buildTerrainSection(), buildSitesPanel());
+  els.bar = bar;
+  const main = el('div', {class: 'mapmain'}, LC.buildBreadcrumb(), bar, toolbar, els.palette, els.canvas, LC.build3d(), els.status, note);
+  els.vecPanel = VL.buildPanel();
+  els.htPanel = buildHeightToolsPanel();
+  els.terrainPanel = buildTerrainSection();
+  const side = el('div', {class: 'mapside'}, buildCheckPanel(), LC.buildPanel(), els.vecPanel, els.htPanel, els.terrainPanel, buildSitesPanel());
   root.append(el('div', {class: 'mapbody'}, main, side));
   // The PREVIEW pane (P-I): the heightmap and voxel views tuner.html keeps in
   // #wgPreviewHost, adopted under the map as previews.
@@ -3066,7 +3180,7 @@ export function saveFromHost() {
   if (dirty) saveMap();
   if (tuningTouched && H.saveTuning) { H.saveTuning(); tuningTouched = false; }
 }
-export function activate() { if (map) { syncTerrain(); syncSites(); publishTerrain(); syncLines(); syncHeightTools(); VL.sync(); } }
+export function activate() { if (map) { syncTerrain(); syncSites(); publishTerrain(); syncLines(); syncHeightTools(); VL.sync(); LC.sync(); } }
 // test seams
 export function _map() { return map; }
 export function _load(name) { return loadMap(name); }
@@ -3105,3 +3219,9 @@ export function _applyPng() { return applyPngImport(); }
 // E3 test seams (the vector layers)
 export function _vl() { return VL; }
 export function _savedJson() { return savedJson; }
+// E4 test seams (the locales)
+export function _lc() { return LC; }
+export function _heights() { return heights; }
+export function _fetchHeights() { return fetchHeights(); }
+export function _groundAt(x, z) { return groundAt(x, z); }
+export function _scAt(x, z) { return scAt(sculpt.tiles, x, z); }
