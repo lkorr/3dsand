@@ -25,6 +25,7 @@
 #include "sim/windfield.h" // the wind & weather section: regimes + readout
 #include "ui/contract_ui.h"
 #include "ui/dialogue_ui.h"
+#include "ui/map_ui.h"
 #include "ui/inventory_ui.h"
 #include "ui/refs_ui.h"
 #include "ui/theme.h"
@@ -2468,7 +2469,7 @@ void Overlay::DrawDevDebug(UIState& s) {
         {"[ ]", "brush radius"},     {"Esc", "free cursor"},
         {"P / N", "pause / step"},   {"V", "fly"},
         {"G", "grenade"},            {"X", "detonate at crosshair"},
-        {"F", "laser"},              {"M", "spawn mob"},
+        {"F", "laser"},              {"M", "world map (Shift+M: spawn mob)"},
         {"K", "rolling sphere"},     {"B", "place"},
         {"Z", "magic mode"},         {"F3", "collision boxes"},
         {"F4", "vector field"},      {"F5", "reload shaders + tuning"},
@@ -2497,6 +2498,11 @@ void Overlay::Draw(UIState& s) {
     DrawInventoryScreen(s);
     // demons D5: the contract editor, opened from the spellbook's header.
     DrawContractEditor(s);
+    ImGui::PopFont();
+  } else if (s.worldMap.open) {
+    // THE WORLD MAP (M; ui/map_ui.h) owns the frame the same way.
+    ImGui::PushFont(ui::FontLarge());
+    DrawWorldMapScreen(s);
     ImGui::PopFont();
   } else if (s.talk.open) {
     // A CONVERSATION owns the frame the same way: the cursor is free for the

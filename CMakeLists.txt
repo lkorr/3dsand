@@ -736,6 +736,8 @@ add_library(sandvox_core OBJECT
   src/ui/inventory_ui.cpp
   # The item stage's picture: a CPU DDA over one item's lattice (ui/item_stage.h).
   src/ui/item_stage.cpp
+  # The world map screen (M): the picture from the map planes + the panel (ui/map_ui.h).
+  src/ui/map_ui.cpp
   # The conversation panel (pixel art, ui/dialogue_ui.h).
   src/ui/dialogue_ui.cpp
   # F12: screenshot(s) + text into bug_reports/<stamp>/ (ui/bugreport.h).

@@ -1655,6 +1655,43 @@ struct UIState {
     float imgScale = 1;          // screen pixels per stage pixel
     float areaW = 0, areaH = 0;  // the room the panel has for it, screen pixels
   } itemStage;
+  // ---- THE WORLD MAP SCREEN (M; ui/map_ui.h) ---------------------------------
+  // The active map's picture (biome colour, hillshade, sea, lakes, rivers,
+  // roads; drawn on the CPU by BuildWorldMapImage from the map's planes, not
+  // from voxels) with the player, the spawn and the map's named places over
+  // it. Pan with a drag, zoom with the wheel. The DEV TELEPORT button arms a
+  // click: the click's world (x, z) goes out as `wantTeleport` and main.cpp
+  // re-seats the residency window there (Stream::ReloadWindow, the load path).
+  struct WorldMapUI {
+    // ---- mirror ----
+    bool open = false;
+    uint64_t tex = 0;            // ImTextureID of the picture, 0 = not built yet
+    int texW = 0, texH = 0;      // the texture's full size
+    int imgW = 0, imgH = 0;      // the drawn picture (top-left of tex), pixels
+    bool texReady = false;
+    std::string mapName;
+    int x0 = 0, z0 = 0, w = 0, h = 0;   // world voxels the picture covers
+    float playerX = 0, playerZ = 0;     // world voxels
+    float fwdX = 1, fwdZ = 0;           // the camera's flat forward
+    int spawnX = 0, spawnZ = 0;
+    struct Label {
+      std::string name;
+      int x = 0, z = 0;
+      int kind = 0;              // 0 locale, 1 marker, 2 region
+    };
+    std::vector<Label> labels;
+    bool canTeleport = true;     // false in a networked session
+    std::string status;          // one line under the map ("teleported to ...")
+    // ---- panel-owned view ----
+    bool viewSet = false;        // false = fit the whole map on the next draw
+    float cx = 0, cz = 0;        // view centre, world voxels
+    float voxPerPx = 1;          // zoom: world voxels per screen pixel
+    bool teleportArmed = false;
+    // ---- latches, consumed by main.cpp ----
+    bool wantClose = false;
+    bool wantTeleport = false;
+    int tpX = 0, tpZ = 0;
+  } worldMap;
   // ---- WHERE THINGS ARE DRAWN, for a look-iteration harness's mouse --------
   // Off in the game. When `recordRects` is set (--shot-stage), every item slot
   // and the stage's buttons record their screen rectangle here by widget id

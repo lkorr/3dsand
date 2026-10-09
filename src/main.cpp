@@ -124,6 +124,7 @@
 #include "test/treefixture.h"
 #include "ui/bugreport.h"
 #include "ui/item_stage.h"
+#include "ui/map_ui.h"
 #include "ui/overlay.h"
 #include "world/refs.h"
 #include "world/refs_game.h"
@@ -7396,6 +7397,24 @@ int main(int argc, char** argv) {
   std::vector<uint8_t> stagePixels;
   uint64_t stageKey = 0;
   bool stageFresh = false;
+  // ---- THE WORLD MAP SCREEN'S PICTURE (M, ui/map_ui.h) ----------------------
+  // Drawn on the CPU from the active map's planes the first time the screen
+  // opens (and again after an F7, which may have switched or edited the map),
+  // copied in once through a staging buffer, then only sampled. Made on first
+  // use, never re-made: re-registering would free a descriptor set an
+  // in-flight frame may still sample. The picture packs at the top-left.
+  constexpr uint32_t kMapTexSide = 2048;
+  rhi::Texture mapTexture;
+  rhi::Buffer mapStaging;
+  rhi::TextureView mapView;
+  bool mapImageStale = true;
+  // Biome plane byte -> biome name (the plane holds BiomeSet indices).
+  std::vector<std::string> mapBiomeNames;
+  for (const biomes::BiomeDef& b : biomeSet.biomes) {
+    if (b.index < 0) continue;
+    if ((size_t)b.index >= mapBiomeNames.size()) mapBiomeNames.resize((size_t)b.index + 1);
+    mapBiomeNames[(size_t)b.index] = b.name;
+  }
   // ---- internal render scale (render.renderScale) --------------------------
   // The world's offscreen colour target when the scale is below 1, cached on
   // its size like the depth targets; the blit up to the swapchain and the
@@ -7781,6 +7800,10 @@ int main(int argc, char** argv) {
 
   KeyEdge eP, eN, eV, eF1, eF2, eF3, eF4, eF5, eF6, eF7, eF8, eF9, eF10, eF11, eF12, eR, eEsc, eLBracket, eRBracket, eJump,
       eJ, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eU, eL, eI;
+  // M opens the world map (ui/map_ui.h); its own edge, because the dev
+  // panel's spawn-a-mob moved to Shift+M and reads eM only while captured.
+  KeyEdge eMap;
+  bool captureBeforeMap = true;
   // THE HANDS (dual wielding, 2026-09-27): Q puts the selected hotbar stack
   // in the LEFT hand, E in the RIGHT (a swap: what was held goes back into
   // that hotbar slot; an empty selected slot takes the hand's item back).
@@ -11785,6 +11808,27 @@ int main(int argc, char** argv) {
     // camera is held where --at put it (flying, still, no HUD) and the frame
     // is written to screenshot_at.bmp eight frames before the run ends, so a
     // fix to what the report shows is judged from the report's own camera.
+    // SANDVOX_MAP_SCRIPT=x,z under --frames N (N >= 200): the world map
+    // screen without hands -- opened at frame 60, photographed at 100
+    // (screenshot_map.bmp), the dev teleport to (x, z) at 110, and the
+    // arrival photographed eight frames before the run ends
+    // (screenshot_map_arrival.bmp).
+    {
+      static const char* mapScript = std::getenv("SANDVOX_MAP_SCRIPT");
+      if (mapScript && g_harnessFrames >= 200) {
+        int sx = 0, sz = 0;
+        if (std::sscanf(mapScript, "%d,%d", &sx, &sz) == 2) {
+          if (frameCounter == 60) { ui.visible = false; ui.worldMap.open = true; ui.worldMap.teleportArmed = true; }
+          if (frameCounter == 100) g_shotJumpPath = "screenshot_map.bmp";
+          if (frameCounter == 110) {
+            ui.worldMap.wantTeleport = true;
+            ui.worldMap.tpX = sx;
+            ui.worldMap.tpZ = sz;
+          }
+          if (frameCounter == g_harnessFrames - 8) g_shotJumpPath = "screenshot_map_arrival.bmp";
+        }
+      }
+    }
     if (g_atSet && g_harnessFrames > 16) {
       if (frameCounter == 1) {
         ui.fly = true;
@@ -12387,8 +12431,8 @@ int main(int argc, char** argv) {
     // The editor (F8) owns the keyboard and the mouse while it is on: no game
     // binding may fire under it (its own keys are read through ImGui).
     const bool edActive = editorMode.Active();
-    const bool gameKeys =
-        !ui.inventoryOpen && !ui.talk.open && !uiTyping && !edActive && !ui.bug.open;
+    const bool gameKeys = !ui.inventoryOpen && !ui.talk.open && !uiTyping && !edActive &&
+                          !ui.bug.open && !ui.worldMap.open;
     // F12: photograph this frame for a bug report (the panel opens once the
     // picture is in). Shift+F12 while collecting goes back to the panel
     // without a new picture. Read every frame so the edge stays honest.
@@ -12556,9 +12600,34 @@ int main(int argc, char** argv) {
       glfwGetCursorPos(window, &mx0, &my0);
     }
 
+    // M opens and closes the WORLD MAP (ui/map_ui.h) -- the captureBeforeUi
+    // rule again: opening frees the cursor, closing hands back what it was.
+    // Not over the character screen, a conversation or the editor; Shift+M
+    // is the dev panel's spawn-a-mob.
+    {
+      const bool shiftM = key(GLFW_KEY_LEFT_SHIFT) || key(GLFW_KEY_RIGHT_SHIFT);
+      const bool mEdge = eMap.Pressed(key(GLFW_KEY_M)) && !shiftM;
+      bool toggle = false;
+      if (devKeys && mEdge && !edActive && !ui.inventoryOpen && !ui.talk.open) toggle = true;
+      if (ui.worldMap.open && ui.worldMap.wantClose) toggle = true;
+      ui.worldMap.wantClose = false;
+      if (toggle) {
+        ui.worldMap.open = !ui.worldMap.open;
+        ui.worldMap.teleportArmed = false;
+        if (ui.worldMap.open) {
+          captureBeforeMap = captured;
+          captured = false;
+        } else {
+          captured = captureBeforeMap;
+        }
+        glfwSetInputMode(window, GLFW_CURSOR,
+                         captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+        glfwGetCursorPos(window, &mx0, &my0);
+      }
+    }
     // I opens and closes the character screen. Opening frees the cursor and
     // remembers what capture WAS, so closing restores it rather than assuming.
-    if (devKeys && eI.Pressed(key(GLFW_KEY_I))) {
+    if (devKeys && eI.Pressed(key(GLFW_KEY_I)) && !ui.worldMap.open) {
       ui.inventoryOpen = !ui.inventoryOpen;
       if (ui.inventoryOpen) {
         captureBeforeUi = captured;
@@ -12587,6 +12656,12 @@ int main(int argc, char** argv) {
     if (devKeys && !edActive && eEsc.Pressed(key(GLFW_KEY_ESCAPE))) {
       // A conversation first: Esc is "leave", when the node allows it (a
       // command for the tick, like every other answer).
+      if (ui.worldMap.open) {
+        // The map: Esc is "close it" (the captureBeforeMap rule restores).
+        ui.worldMap.open = false;
+        ui.worldMap.teleportArmed = false;
+        captured = captureBeforeMap;
+      } else
       if (ui.talk.open) {
         if (ui.talk.canLeave) feeder.Talk(kTalkLeave);
       } else
@@ -13274,7 +13349,9 @@ int main(int argc, char** argv) {
       if (ui.tool == UIState::kToolFluid && fluidCueMat != 0)
         ui.brushMaterial = (int)fluidCueMat;
     }
-    if (captured && ui.devControls && eM.Pressed(key(GLFW_KEY_M))) feeder.Press(TB_SPAWN);
+    if (captured && ui.devControls &&
+        eM.Pressed(key(GLFW_KEY_M) && (key(GLFW_KEY_LEFT_SHIFT) || key(GLFW_KEY_RIGHT_SHIFT))))
+      feeder.Press(TB_SPAWN);
     if (captured && ui.devControls && eB.Pressed(key(GLFW_KEY_B))) feeder.Press(TB_PLACE);
     if (captured && ui.devControls && eK.Pressed(key(GLFW_KEY_K))) ui.spawnSphere = true;
     // Y lets your contained demon out of its circle (game/demon_seals.h): the
@@ -13952,6 +14029,82 @@ int main(int argc, char** argv) {
       // per-tick block respawns it on the next tick.
       avatar.Despawn();
       tpRig.Snap();
+      mapImageStale = true;   // F7 may have switched or edited the map
+    }
+    // ---- THE WORLD MAP'S MIRROR + THE DEV TELEPORT (ui/map_ui.h) -----------
+    if (ui.worldMap.open) {
+      ui.worldMap.playerX = player.pos.x;
+      ui.worldMap.playerZ = player.pos.z;
+      const Vec3 ff = cam.FlatForward();
+      ui.worldMap.fwdX = ff.x;
+      ui.worldMap.fwdZ = ff.z;
+      ui.worldMap.canTeleport = netRoleBoot == NetRole::None && labScene < 0;
+    }
+    // A click on the armed map. BETWEEN ticks, the way F7 and a load are: the
+    // residency window is RE-SEATED at the target rather than walked there
+    // one chunk plane a frame (a 10 km walk is thousands of shifts). This is
+    // LoadWorld's own sequence -- flush the resident chunks into the store so
+    // nothing played here is lost (the store is the world: walking back
+    // finds it), then refill the whole window from the store / procgen at
+    // the new origin (Stream::ReloadWindow, the sanctioned snapshot-restore
+    // path, not a gameplay mutation), reset the sim's transient state and
+    // refill the far field. Creatures and loose items left behind are parked
+    // by the tick's own out-of-window passes (mobs.PreTick, debris cull).
+    // A DEV control: not recorded in the op log, so an ops-replay recording
+    // that spans one does not replay. Single player only (a peer's window
+    // cannot be re-seated under it).
+    if (ui.worldMap.wantTeleport) {
+      ui.worldMap.wantTeleport = false;
+      if (netRoleBoot != NetRole::None || labScene >= 0) {
+        ui.worldMap.status = "teleport refused: single player only";
+      } else {
+        const int tx = ui.worldMap.tpX, tz = ui.worldMap.tpZ;
+        const double t0 = NowSeconds();
+        ctx.WaitIdle();
+        if (grab.Active()) grab.Release(phys);
+        // The body's wounds ride along: record them, despawn the rig at the
+        // old spot, and the next tick's Spawn re-applies them at the new one
+        // (the save path's AVTR round trip, in memory).
+        std::vector<uint8_t> avState;
+        const bool avHad = avatar.Spawned() && avatar.Alive();
+        if (avHad) avatar.SaveState(avState);
+        avatar.Despawn();
+        if (avHad && !avState.empty())
+          avatar.LoadState(avState.data(), avState.size(), PlayerAvatar::kSaveVersion);
+        stream.FlushResident();
+        const int half = (int)kNChunk / 2;
+        const IVec3 origin{(tx >> 4) - half, GroundWindowY(tx, tz), (tz >> 4) - half};
+        world.InvalidateSnapshot();
+        stream.ReloadWindow(origin);
+        {
+          rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+          sim.EncodeLoadReset(enc);
+          rhi::CommandBuffer cmd = enc.Finish();
+          ctx.queue.Submit(1, &cmd);
+        }
+        grenades.clear();
+        fluidCount = 0;               // loadReset zeroes the GPU MPM count
+        fluidPendingSpawns.clear();
+        const int gy = World::TerrainHeight(tx, tz, kDefaultSeed);
+        player.pos = Vec3{(float)tx + 0.5f, (float)(gy + 10), (float)tz + 0.5f};
+        player.vel = Vec3{0, 0, 0};
+        player.ResetViewSmooth();
+        player.SnapRender();
+        tpRig.Snap();
+        far.FullRefill(IVec3{tx >> 4, gy >> 4, tz >> 4});
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "teleported to x %d z %d (ground y %d) in %.0f ms", tx,
+                      tz, gy, (NowSeconds() - t0) * 1000.0);
+        ui.worldMap.status = msg;
+        std::printf("map: %s\n", msg);
+        // Close the map so the arrival is what you see.
+        ui.worldMap.open = false;
+        ui.worldMap.teleportArmed = false;
+        captured = captureBeforeMap;
+        glfwSetInputMode(window, GLFW_CURSOR,
+                         captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+        glfwGetCursorPos(window, &mx0, &my0);
+      }
     }
     // ---- PLACED STRUCTURES: an edit reaches worldgen (PLAN_world_editor P4) --
     // A structure ref was placed / moved / turned / deleted (References page,
@@ -18408,7 +18561,7 @@ int main(int argc, char** argv) {
       // numbers spelled out, so drawing the corner chrome underneath it is two
       // readouts of the same thing fighting for the same corner.
       // ...and while talking: the conversation panel sits where the hotbar is.
-      if (!ui.inventoryOpen && !ui.talk.open && !editorMode.Active()) overlay.DrawHUD(ui);
+      if (!ui.inventoryOpen && !ui.talk.open && !ui.worldMap.open && !editorMode.Active()) overlay.DrawHUD(ui);
       overlay.Draw(ui);
       DrawBugReport(ui);  // F12 (ui/bugreport.h): over everything, or nothing in the shot frame
       // ---- THE EDITOR (F8): its panels, overlays and input, then its world
@@ -19419,6 +19572,47 @@ int main(int argc, char** argv) {
         sEnc.CopyBufferToTexture(src, dst, {siW, siH, 1});
         ctx.queue.Submit(sEnc.Finish());
         ui.itemStage.texReady = true;
+      }
+      // THE WORLD MAP'S PICTURE (ui/map_ui.h): built and copied when the
+      // screen is open and the picture is stale (first open, after F7).
+      if (ui.worldMap.open && mapImageStale) {
+        mapImageStale = false;
+        const worldmap::WorldMapData& wm = worldmap::CurrentWorldMap();
+        FillWorldMapMirror(wm, ui.worldMap);
+        ui.worldMap.viewSet = false;
+        std::vector<uint8_t> px;
+        int iw = 0, ih = 0;
+        const double t0 = NowSeconds();
+        if (BuildWorldMapImage(wm, mapBiomeNames, (int)kMapTexSide, px, iw, ih)) {
+          if (!ui.worldMap.tex) {
+            mapTexture = ctx.device.CreateTexture(
+                {kMapTexSide, kMapTexSide, 1}, rhi::TextureFormat::RGBA8Unorm,
+                rhi::TextureUsage::CopyDst | rhi::TextureUsage::TextureBinding, "worldMap");
+            mapView = mapTexture.CreateView();
+            mapStaging = ctx.device.CreateBuffer(
+                (uint64_t)kMapTexSide * kMapTexSide * 4,
+                rhi::BufferUsage::CopySrc | rhi::BufferUsage::CopyDst, "worldMapStaging");
+            ui.worldMap.tex = overlay.RegisterTexture(mapView);
+            ui.worldMap.texW = ui.worldMap.texH = (int)kMapTexSide;
+          }
+          if (ui.worldMap.tex) {
+            ctx.queue.WriteBuffer(mapStaging, 0, px.data(), px.size());
+            rhi::CommandEncoder mEnc = ctx.device.CreateCommandEncoder();
+            rhi::TexelCopyBuffer src;
+            src.buffer = mapStaging;
+            src.bytesPerRow = (uint32_t)iw * 4;
+            src.rowsPerImage = (uint32_t)ih;
+            rhi::TexelCopyTexture dst;
+            dst.texture = mapTexture;
+            mEnc.CopyBufferToTexture(src, dst, {(uint32_t)iw, (uint32_t)ih, 1});
+            ctx.queue.Submit(mEnc.Finish());
+            ui.worldMap.imgW = iw;
+            ui.worldMap.imgH = ih;
+            ui.worldMap.texReady = true;
+          }
+          std::printf("world map picture: %dx%d of '%s' in %.0f ms\n", iw, ih, wm.name.c_str(),
+                      (NowSeconds() - t0) * 1000.0);
+        }
       }
       // The autopsy's clones live only as long as the death screen that asked
       // for them: the moment the body is rebuilt they are freed.
