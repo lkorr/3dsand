@@ -135,26 +135,63 @@ export function priorityFlood(h, w, hh, opts = {}) {
   return z;
 }
 
+/** A seeded hash of (cell, k) to [0, 1). */
+export function hashU(n, k, seed) {
+  let h = Math.imul(n | 0, 0x27d4eb2d) ^ Math.imul((k + 1) | 0, 0x165667b1) ^ Math.imul(seed | 0, 0x9e3779b1);
+  h ^= h >>> 15; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
 /** D8 steepest-descent receivers on `z`. Returns {rcv: Int32Array (self = a
  *  pit or outlet), dist: Float32Array (voxels to the receiver)}. Outlets
  *  (opts.mask) are always their own receivers. */
-export function d8(z, w, hh, dx, mask = null) {
-  const N = w * hh, rcv = new Int32Array(N), dist = new Float32Array(N);
-  for (let j = 0; j < hh; j++)
+export function d8(z, w, hh, dx, mask = null, jitter = 0, seed = 0, out = null) {
+  const N = w * hh;
+  const rcv = out && out.rcv && out.rcv.length === N ? out.rcv : new Int32Array(N);
+  const dist = out && out.dist && out.dist.length === N ? out.dist : new Float32Array(N);
+  // STOCHASTIC routing (jitter > 0): a fixed, seeded per-(cell, direction)
+  // factor on each downhill slope, so a planar flank does not drain in
+  // straight grid-aligned lines and flow paths converge. Cached per call site
+  // through out.jf (N * 8 factors), it is the same every step of a run.
+  let jf = null;
+  if (jitter > 0) {
+    jf = out && out.jf && out.jf.length === N * 8 && out.jfKey === jitter + ':' + seed ? out.jf : jitterFactors(N, jitter, seed);
+    if (out) { out.jf = jf; out.jfKey = jitter + ':' + seed; }
+  }
+  const OFF = [1, -1, w, -w, w + 1, w - 1, -w + 1, -w - 1];
+  for (let j = 0; j < hh; j++) {
+    const edgeRow = j === 0 || j === hh - 1;
     for (let i = 0; i < w; i++) {
       const n = j * w + i;
       rcv[n] = n; dist[n] = dx;
       if (mask && mask[n]) continue;
+      const zn = z[n];
       let best = 0, bk = -1;
-      for (let k = 0; k < 8; k++) {
-        const ii = i + NX[k], jj = j + NZ[k];
-        if (ii < 0 || jj < 0 || ii >= w || jj >= hh) continue;
-        const s = (z[n] - z[jj * w + ii]) / ND[k];
-        if (s > best) { best = s; bk = k; }
+      if (!edgeRow && i > 0 && i < w - 1) {
+        // interior: no bounds checks
+        for (let k = 0; k < 8; k++) {
+          let s = (zn - z[n + OFF[k]]) * (k < 4 ? 1 : 0.7071067811865476);
+          if (s > 0 && jf) s *= jf[n * 8 + k];
+          if (s > best) { best = s; bk = k; }
+        }
+      } else {
+        for (let k = 0; k < 8; k++) {
+          const ii = i + NX[k], jj = j + NZ[k];
+          if (ii < 0 || jj < 0 || ii >= w || jj >= hh) continue;
+          let s = (zn - z[jj * w + ii]) / ND[k];
+          if (s > 0 && jf) s *= jf[n * 8 + k];
+          if (s > best) { best = s; bk = k; }
+        }
       }
-      if (bk >= 0) { rcv[n] = (j + NZ[bk]) * w + i + NX[bk]; dist[n] = dx * ND[bk]; }
+      if (bk >= 0) { rcv[n] = n + OFF[bk]; dist[n] = dx * ND[bk]; }
     }
+  }
   return {rcv, dist};
+}
+/** The jitter multipliers of d8: 1 + jitter * (u * 2 - 1), u = hashU(n, k, seed). */
+export function jitterFactors(N, jitter, seed) {
+  const jf = new Float32Array(N * 8);
+  for (let n = 0; n < N; n++) for (let k = 0; k < 8; k++) jf[n * 8 + k] = 1 + jitter * (hashU(n, k, seed) * 2 - 1);
+  return jf;
 }
 
 /** Braun & Willett 2013 stack: every receiver before its donors. O(n). */
@@ -446,28 +483,31 @@ export function rivers(h, w, hh, dx, opts = {}) {
  *  pass). `fixed` cells neither give nor take. Mass-conserving. */
 export function thermal(h, w, hh, dx, talusDeg, passes = 1, opts = {}) {
   const T = Math.tan(Math.max(1, Math.min(89, talusDeg)) * Math.PI / 180) * dx;
-  const k = opts.rate == null ? 0.5 : opts.rate, fixed = opts.fixed || null;
-  const N = w * hh, d = new Float64Array(N);
+  const k = opts.rate == null ? 0.5 : opts.rate, fixed = opts.fixed || null, sink = opts.fixedSink === true;
+  const N = w * hh, d = opts.scratch && opts.scratch.length === N ? opts.scratch : new Float64Array(N);
+  const ex = new Float64Array(8), TD = ND.map(v => v * T);
   for (let p = 0; p < passes; p++) {
     d.fill(0);
     for (let j = 0; j < hh; j++)
       for (let i = 0; i < w; i++) {
         const n = j * w + i;
         if (fixed && fixed[n]) continue;
+        const hn = h[n];
         let sum = 0, mx = 0;
-        const ex = [0, 0, 0, 0, 0, 0, 0, 0];
         for (let q = 0; q < 8; q++) {
+          ex[q] = 0;
           const ii = i + NX[q], jj = j + NZ[q];
           if (ii < 0 || jj < 0 || ii >= w || jj >= hh) continue;
           const nb = jj * w + ii;
-          if (fixed && fixed[nb] && opts.fixedSink !== true) continue;
-          const e = h[n] - h[nb] - T * ND[q];
+          if (fixed && fixed[nb] && !sink) continue;
+          const e = hn - h[nb] - TD[q];
           if (e > 0) { ex[q] = e; sum += e; if (e > mx) mx = e; }
         }
         if (sum <= 0) continue;
         const move = k * mx * 0.5;
         d[n] -= move;
-        for (let q = 0; q < 8; q++) if (ex[q] > 0) d[(j + NZ[q]) * w + i + NX[q]] += move * ex[q] / sum;
+        const f = move / sum;
+        for (let q = 0; q < 8; q++) if (ex[q] > 0) d[(j + NZ[q]) * w + i + NX[q]] += ex[q] * f;
       }
     for (let n = 0; n < N; n++) h[n] += d[n];
   }
@@ -493,18 +533,22 @@ export function streamPower(h, w, hh, dx, opts = {}) {
   const Uc = typeof opts.U === 'number' || opts.U == null ? (opts.U || 0) : null;
   const fixed = opts.fixed || null;
   const mask = outletMask(h, w, hh, {seaY: opts.seaY, outlets: fixed, edges: opts.edges});
-  const fillEvery = Math.max(1, opts.fillEvery || 6);
+  const fillEvery = Math.max(1, opts.fillEvery || 8), thermalEvery = Math.max(1, opts.thermalEvery || 3);
+  const scratch = {}, tscr = new Float64Array(N);
   const talus = opts.talusDeg || 0, tp = opts.thermalPasses == null ? 2 : opts.thermalPasses;
   const z = h;
   let rcv = null, dist = null, stack = null, A = null;
   const pow = m === 0.5 ? Math.sqrt : (a => Math.pow(a, m));
   for (let it = 0; it < iters; it++) {
     if (Uc !== 0) for (let n = 0; n < N; n++) if (!mask[n]) z[n] += (Uc != null ? Uc : opts.U[n]) * dt;
+    // a CEILING (the designed envelope of a range): the land rises into it and
+    // no further, so the crest heights are the design and erosion only cuts down
+    if (opts.ceiling) for (let n = 0; n < N; n++) if (z[n] > opts.ceiling[n]) z[n] = opts.ceiling[n];
     if (it % fillEvery === 0) {
       const f = priorityFlood(z, w, hh, {mask, epsilon: 1e-3});
       for (let n = 0; n < N; n++) if (f[n] > z[n]) z[n] = f[n];
     }
-    ({rcv, dist} = d8(z, w, hh, 1, mask));
+    ({rcv, dist} = d8(z, w, hh, 1, mask, opts.jitter || 0, opts.seed || 0, scratch));
     stack = stackOrder(rcv);
     A = accumulate(rcv, stack, opts.weight || null);
     for (let k = 0; k < N; k++) {
@@ -515,8 +559,90 @@ export function streamPower(h, w, hh, dx, opts = {}) {
       const hn = (z[n] + f * z[r]) / (1 + f);
       if (hn < z[n]) z[n] = hn;
     }
-    if (talus > 0 && tp > 0) thermal(z, w, hh, dx, talus, tp, {fixed: mask, rate: 0.5});
+    // hillslope diffusion (opts.diffuse, fading to 0 by opts.diffuseUntil of the run)
+    if (opts.diffuse > 0) {
+      const fr = it / iters, until = opts.diffuseUntil == null ? 1 : opts.diffuseUntil;
+      if (fr < until) diffuse(z, w, hh, mask, opts.diffuse * (1 - fr / until), opts.diffusePasses || 1);
+    }
+    if (talus > 0 && tp > 0 && (it % thermalEvery === thermalEvery - 1 || it === iters - 1)) thermal(z, w, hh, dx, talus, tp, {fixed: mask, rate: 0.5, scratch: tscr});
     if (opts.progress && (it % 4 === 3 || it === iters - 1)) opts.progress((it + 1) / iters);
+  }
+  return {h: z, A, rcv, stack};
+}
+
+/** Laplacian smoothing (Jacobi, 4 neighbours) of the free cells, `passes` times. */
+export function diffuse(z, w, hh, mask, k, passes = 1) {
+  const N = w * hh, t = new Float64Array(N);
+  for (let p = 0; p < passes; p++) {
+    for (let j = 0; j < hh; j++)
+      for (let i = 0; i < w; i++) {
+        const n = j * w + i;
+        if (mask[n] || i === 0 || j === 0 || i === w - 1 || j === hh - 1) { t[n] = z[n]; continue; }
+        t[n] = z[n] + k * 0.25 * (z[n - 1] + z[n + 1] + z[n - w] + z[n + w] - 4 * z[n]);
+      }
+    for (let n = 0; n < N; n++) z[n] = t[n];
+  }
+  return z;
+}
+/** The STEADY STATE of uplift vs stream power (Cordonnier et al. 2016's
+ *  fixed point): with dh/dt = U - K A^m S = 0 every cell sits exactly
+ *  U dist / (K A^m) above its receiver, so given a drainage network the whole
+ *  surface follows in one pass up the stack. The network depends on the
+ *  surface, so iterate: route D8 on the (epsilon-filled) surface, rebuild,
+ *  relax toward it; a few tens of rounds and the divides settle into a
+ *  dendritic net whose valleys reach the crest. Base-level cells (`fixed`,
+ *  the grid edge, cells below seaY) keep their height.
+ *  h is modified IN PLACE. opts = {U (array), K (number | array), m, fixed,
+ *  seaY, iters, relax (0..1, the step toward the new surface), talusDeg (cap
+ *  the slope to a receiver at this angle; 0 = none), progress}. */
+export function steadyState(h, w, hh, dx, opts = {}) {
+  const N = w * hh, m = opts.m == null ? 0.5 : +opts.m;
+  const iters = Math.max(1, opts.iters | 0 || 20), relax = opts.relax == null ? 0.5 : +opts.relax;
+  const fixed = opts.fixed || null;
+  const mask = outletMask(h, w, hh, {seaY: opts.seaY, outlets: fixed, edges: opts.edges});
+  const Kc = typeof opts.K === 'number' || opts.K == null ? (opts.K == null ? 1 : opts.K) : null;
+  const cap = opts.talusDeg ? Math.tan(opts.talusDeg * Math.PI / 180) : Infinity;
+  const pow = m === 0.5 ? Math.sqrt : (a => Math.pow(a, m));
+  const hillA = opts.hillA || 0, hillS = Math.tan((opts.hillDeg || 33) * Math.PI / 180), hillU = opts.hillU || 1e9;
+  const z = h, base = Float64Array.from(h), nz = new Float64Array(N);
+  let A = null, rcv = null, stack = null, U = Float64Array.from(opts.U);
+  for (let it = 0; it < iters; it++) {
+    const f = priorityFlood(z, w, hh, {mask, epsilon: 1e-3});
+    let r;
+    ({rcv, dist: r} = d8(f, w, hh, dx, mask, opts.jitter || 0, opts.seed || 0));
+    stack = stackOrder(rcv);
+    A = accumulate(rcv, stack, opts.weight || null);
+    for (let k = 0; k < N; k++) {
+      const n = stack[k], q = rcv[n];
+      if (q === n || mask[n]) { nz[n] = base[n]; continue; }
+      const K = Kc != null ? Kc : opts.K[n];
+      let rise = U[n] * r[n] / (K * pow(A[n]));
+      // THRESHOLD HILLSLOPES: above the channel heads (A < hillA) the ground is
+      // a planar slope at hillSlope (times the local uplift share), not a channel
+      if (hillA > 0 && A[n] < hillA) rise = Math.min(rise, hillS * r[n] * Math.min(1, U[n] * hillU));
+      if (rise > cap * r[n]) rise = cap * r[n];
+      nz[n] = nz[q] + rise;
+    }
+    // CALIBRATION (opts.targetMax): rescale the uplift so the highest relief
+    // is the target -- the solution is linear in U while no slope rule binds,
+    // so the hillslope / talus angles below are real angles, not arbitrary units
+    if (opts.targetMax > 0) {
+      let mx = 0;
+      for (let n = 0; n < N; n++) if (!mask[n] && nz[n] - base[n] > mx) mx = nz[n] - base[n];
+      if (mx > 1e-6) {
+        const sc = opts.targetMax / mx;
+        for (let n = 0; n < N; n++) if (!mask[n]) nz[n] = base[n] + (nz[n] - base[n]) * sc;
+        U = U.map ? U.map(v => v * sc) : U;
+      }
+    }
+    // hillslope DIFFUSION (fading out over the run): it smooths away the
+    // smallest valleys, which sets the drainage spacing and makes the flow
+    // gather into fewer, bigger, branching valleys
+    const kd = (opts.diffuse || 0) * (1 - it / iters);
+    if (kd > 0) diffuse(nz, w, hh, mask, kd, opts.diffusePasses || 2);
+    const a = it === iters - 1 ? 1 : relax;
+    for (let n = 0; n < N; n++) z[n] = z[n] + (nz[n] - z[n]) * a;
+    if (opts.progress) opts.progress((it + 1) / iters);
   }
   return {h: z, A, rcv, stack};
 }
