@@ -201,6 +201,42 @@ Status GateAltitude(Ctx& c, std::string& detail) {
     if (!dOk) problems.push_back("D: lava within the bound under the gorge");
   }
 
+  // ---- G. a uniform raise translates the ground exactly --------------------------------
+  // Every rule the bare ground (BareGroundHeight: what a locale's anchor delta
+  // and a site pad are computed from) reads is relative to the authored
+  // height or a gradient, and a uniform raise moves no gradient -- so +200 on
+  // every post must move the bare ground by exactly +200, in the calm home
+  // area as anywhere. Before A1 the absolute sedCeil took a quarter of the
+  // raise back out of the wedge (L1 measured +183 for +200). The one absolute
+  // the ground still has is the sea (no wedge on ground below it), so the
+  // columns stand well above it.
+  {
+    constexpr int kRaise = 200;
+    struct P { int x, z; const char* what; };
+    const P pts[] = {{sx, sz, "spawn"}, {sx + 150, sz - 90, "home area"}, {sx - 280, sz + 200, "home edge"},
+                     {sx + 900, sz + 1700, "valley"}, {0, -20000, "foothills"}, {0, -7790, "cliff band"},
+                     {9000, 10000, "massif flank"}, {-2000, 16000, "knife ridge"}};
+    int before[8];
+    for (int i = 0; i < 8; i++) before[i] = worldmap::BareGroundHeight(pts[i].x, pts[i].z, kDefaultSeed);
+    worldmap::WorldMapData up = pk;
+    for (int16_t& h : up.height) h = static_cast<int16_t>(h + kRaise);
+    up.heightDefault += kRaise;
+    worldmap::SetCurrentWorldMap(up);
+    int exact = 0;
+    std::string why;
+    for (int i = 0; i < 8; i++) {
+      const int after = worldmap::BareGroundHeight(pts[i].x, pts[i].z, kDefaultSeed);
+      if (after - before[i] == kRaise) exact++;
+      else why += Format(" %s (%d,%d) y%d -> y%d (%+d);", pts[i].what, pts[i].x, pts[i].z, before[i], after, after - before[i]);
+    }
+    worldmap::SetCurrentWorldMap(pk);
+    const bool gOk = exact == 8;
+    std::printf("altitude: G uniform raise: %s (+%d on every post: %d / 8 columns' bare ground moved by exactly +%d, "
+                "spawn y%d, home area y%d)%s\n",
+                gOk ? "PASS" : "FAIL", kRaise, exact, kRaise, before[0], before[1], why.c_str());
+    if (!gOk) problems.push_back("G: a uniform raise did not translate the bare ground:" + why);
+  }
+
   // ---- E. sediment on the high valley (CPU twin, then the generated world) --------------
   {
     c.stream.OnRegen();
