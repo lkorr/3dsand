@@ -1029,7 +1029,24 @@ function schedulePaint() {
   paintQueued = true;
   requestAnimationFrame(() => { paintQueued = false; paint(); });
 }
+// PAINT PROFILER (scripts/bench_mappage.sh): when globalThis.__mapProf is set,
+// paint() reports each layer's milliseconds to its rec(name, ms), and the
+// total as 'paint'. Off (the default) it costs one property read per paint.
+// With pf.flush each lap first reads one pixel back, which makes the canvas
+// RASTERIZE what was drawn so far: the layer's number is then its JavaScript
+// and its pixels (a 2D canvas otherwise records the calls and rasterizes them
+// at the end of the frame, where no lap can see which layer they came from).
+// Software canvas only: on a GPU canvas the readback is a pipeline stall.
 function paint() {
+  const pf = globalThis.__mapProf;
+  if (!pf) return paintAll(null);
+  const t0 = performance.now();
+  let t = t0;
+  const ctx = els.canvas && els.canvas.getContext('2d');
+  paintAll(name => { if (pf.flush && ctx) ctx.getImageData(0, 0, 1, 1); const n = performance.now(); pf.rec(name, n - t); t = n; });
+  pf.rec('paint', performance.now() - t0);
+}
+function paintAll(lap) {
   if (!els.canvas) return;
   const c = els.canvas, ctx = c.getContext('2d');
   const W = c.clientWidth, Hh = c.clientHeight;
@@ -1050,6 +1067,7 @@ function paint() {
       cacheGet('h|' + k + '|' + L, (P.ver.get(k) || 0) + '|' + styleKey, old => heightImage(P, tx, tz, L, old, style)));
     if (missing.length) wantTiles(P, missing);
   }
+  if (lap) lap('height');
   if (disp.biomeAlpha > 0 || !disp.topo) {
     const P = map.B, pk = palCache.key;
     ctx.globalAlpha = disp.topo ? disp.biomeAlpha : 1;
@@ -1058,6 +1076,7 @@ function paint() {
     ctx.globalAlpha = 1;
     if (mb.length) wantTiles(P, mb);
   }
+  if (lap) lap('biome');
   if (showHeights && heights && heights.img && disp.realAlpha > 0) {
     // The engine's own heights (World::TerrainColumn over the SAVED files:
     // authored + noise + sculpt + sites), on the same ramp, over the plane.
@@ -1069,16 +1088,22 @@ function paint() {
     ctx.drawImage(hi2, SX(x0), SZ(z0), D.span * view.scale, D.span * view.scale);
     ctx.globalAlpha = 1;
   }
+  if (lap) lap('realHeights');
   paintSculpt(ctx);
   paintPreview(ctx);
   paintFrame(ctx);
   paintLines(ctx);
-  REG.each('paint', [ctx]);
+  if (lap) lap('sculpt+preview+frame+lines');
+  if (lap) { for (const t of REG.list()) if (typeof t.paint === 'function') { t.paint(ctx); lap('tool:' + t.key); } }
+  else REG.each('paint', [ctx]);
   if (VL) VL.paint(ctx);
+  if (lap) lap('vector');
   if (LC) LC.paint(ctx);
+  if (lap) lap('locale');
   paintArea(ctx);
   paintSites(ctx);
   paintCursor(ctx);
+  if (lap) lap('sites+cursor');
 }
 /** The extent (solid) and the edge fade (dashed), the origin crosshair. */
 function paintFrame(ctx) {

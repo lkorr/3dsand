@@ -1,0 +1,210 @@
+<!doctype html>
+<!-- THE WORLD MAP PAGE BENCHMARK. Loads the REAL tuner (tuner.html, in an
+     iframe the size of this window) on Environment -> World map, the map
+     named by ?map= (default `default`), with the voxel preview on (?voxels=1,
+     the page's own default) or off (?voxels=0), and scripts the interaction
+     the owner does: wheel zoom in and out across levels about the cursor and
+     right-drag pans, one input step per animation frame.
+
+     It times every paint() of the map (map.js's globalThis.__mapProf hook:
+     the total and each layer: height / biome tiles, the tools' paint hooks,
+     the vector, locale and site layers) and every FRAME (the
+     requestAnimationFrame delta in the tuner's window), per phase, and
+     prints p50 / p95 / max tables into #out. window.benchResult holds the
+     raw numbers; document.title becomes 'BENCH DONE' (or 'BENCH FAIL').
+
+     Run headless by scripts/bench_mappage.sh (Chrome over CDP, real time --
+     NOT --virtual-time-budget, which would make every timing fiction).
+     Or open http://127.0.0.1:<port>/mappage_bench.html in a desktop Chrome
+     on a real GPU and read the table: that is the owner's machine's number.
+
+     Query: map=<name>  voxels=0|1  passes=N (default 2: a cold cache pass and
+     a warm one)  grid=0|1 (default 1: the km grid on top of the defaults)
+     settle=ms (wait for the voxel view to stream before timing, default 8000). -->
+<meta charset="utf-8">
+<title>mappage bench</title>
+<style>
+html,body{margin:0;background:#111;color:#ddd;font:12px monospace}
+#f{position:fixed;left:0;top:0;width:100vw;height:100vh;border:0}
+#out{position:fixed;right:0;bottom:0;max-height:60vh;overflow:auto;margin:0;padding:6px;background:rgba(0,0,0,0.85);z-index:9;white-space:pre}
+</style>
+<iframe id="f"></iframe>
+<pre id="out">loading the tuner…</pre>
+<script>
+(async function () {
+  const Q = new URLSearchParams(location.search);
+  const MAP = Q.get('map') || 'default';
+  const VOX = Q.get('voxels') !== '0';
+  const PASSES = +(Q.get('passes') || 2);
+  const GRID = Q.get('grid') !== '0';
+  const SETTLE = +(Q.get('settle') || 8000);
+  const FLUSH = Q.get('flush') === '1';
+  const out = document.getElementById('out');
+  const say = t => { out.textContent = t; console.log('BENCH ' + t.split('\n')[0]); };
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  try {
+    const f = document.getElementById('f');
+    f.src = '/tuner.html?tab=environment';
+    await new Promise(r => f.addEventListener('load', r, {once: true}));
+    const W = f.contentWindow;
+    const waitFor = async (pred, ms, what) => {
+      const t0 = performance.now();
+      while (performance.now() - t0 < ms) { try { if (pred()) return true; } catch (e) {} await sleep(50); }
+      throw new Error('timed out waiting for ' + what);
+    };
+    // The tuner imports environment.js as a module; a dynamic import from its
+    // own realm returns that same instance (one URL, one module map).
+    const E = await W.eval("import('./editor/environment.js')");
+    await waitFor(() => W.document.querySelector('#view-environment.active') && E._current() === 'map', 30000, 'the Environment tab to attach');
+    await E._open('map');
+    const M = E._modules.WorldMap;
+    await waitFor(() => M._map(), 30000, 'a map');
+    if (M._map().name !== MAP && (M._map().json || {}).name !== MAP) await M._load(MAP);
+    await waitFor(() => M._loadsIdle(), 240000, 'the plane tiles');
+    // the voxel preview: on by default (the page's first showing turns it on)
+    if (!VOX && W.wvOn && W.wvToggle) await W.wvToggle();
+    if (VOX && !W.wvOn && W.wvToggle) await W.wvToggle();
+    if (GRID) { M._disp().grid = true; }
+    const canvas = W.document.querySelector('#env-map .mapcanvas');
+    if (!canvas) throw new Error('no map canvas');
+    canvas.setPointerCapture = function () {};
+    canvas.releasePointerCapture = function () {};
+    canvas.scrollIntoView({block: 'start'});
+    say('settling (' + (VOX ? 'voxel view streaming' : 'no voxel view') + ')…');
+    await sleep(VOX ? SETTLE : 500);
+    M._paint();
+
+    // ---- recorders ----
+    let phase = null;
+    const rec = {};       // phase -> {frames: [], paints: [], layers: {name: []}}
+    const bucket = () => rec[phase] || (rec[phase] = {frames: [], paints: [], layers: {}});
+    W.__mapProf = {flush: FLUSH, rec(name, ms) {
+      if (!phase) return;
+      const b = bucket();
+      if (name === 'paint') b.paints.push(ms);
+      else (b.layers[name] || (b.layers[name] = [])).push(ms);
+    }};
+    let lastT = 0, frameCb = null;
+    const raf = t => {
+      if (phase && lastT) bucket().frames.push(t - lastT);
+      lastT = t;
+      if (frameCb) frameCb(t);
+      W.requestAnimationFrame(raf);
+    };
+    W.requestAnimationFrame(raf);
+    // Resolve one TASK after the frame, not inside its rAF callbacks: a real
+    // mouse event is a task that runs between frames, so a paint it schedules
+    // through requestAnimationFrame lands in the very next frame. Input sent
+    // from inside a rAF callback would race the page's own rAF and make every
+    // other frame look like it was skipped.
+    const mc = new W.MessageChannel();
+    let mcWake = null;
+    mc.port1.onmessage = () => { const f = mcWake; mcWake = null; if (f) f(); };
+    const nextFrame = () => new Promise(r => { frameCb = () => { frameCb = null; mcWake = r; mc.port2.postMessage(0); }; });
+
+    // ---- input, in the tuner's window coordinates ----
+    const rect = () => canvas.getBoundingClientRect();
+    const at = (fx, fy) => { const r = rect(); return [r.left + r.width * fx, r.top + r.height * fy]; };
+    const ptr = (type, x, y, buttons, button) => canvas.dispatchEvent(new W.PointerEvent(type,
+      {bubbles: true, cancelable: true, clientX: x, clientY: y, buttons, button, pointerId: 1, pointerType: 'mouse', isPrimary: true}));
+    const wheel = (x, y, dy) => canvas.dispatchEvent(new W.WheelEvent('wheel', {bubbles: true, cancelable: true, clientX: x, clientY: y, deltaY: dy, deltaMode: 0}));
+    async function zoom(notches, dir, fx = 0.55, fy = 0.5) {
+      const [x, y] = at(fx, fy);
+      for (let i = 0; i < notches; i++) {
+        ptr('pointermove', x, y, 0, -1);
+        wheel(x, y, dir * 100);
+        await nextFrame();
+        await nextFrame();
+      }
+    }
+    async function pan(frames) {
+      // a right-drag in a slow loop: out and back so the view ends where it began
+      const [x0, y0] = at(0.5, 0.5);
+      ptr('pointerdown', x0, y0, 2, 2);
+      for (let i = 1; i <= frames; i++) {
+        const a = i / frames * Math.PI * 2, R = Math.min(rect().width, rect().height) * 0.3;
+        ptr('pointermove', x0 + Math.sin(a) * R, y0 + (1 - Math.cos(a)) * R * 0.5, 2, -1);
+        await nextFrame();
+      }
+      ptr('pointerup', x0, y0, 0, 2);
+      await nextFrame();
+    }
+    async function hover(frames) {
+      // the plain mouse over the map: the readout + the cursor (no button)
+      for (let i = 0; i < frames; i++) {
+        const [x, y] = at(0.3 + 0.4 * i / frames, 0.4 + 0.2 * Math.sin(i / 7));
+        ptr('pointermove', x, y, 0, -1);
+        await nextFrame();
+      }
+    }
+    async function idle(frames) { for (let i = 0; i < frames; i++) await nextFrame(); }
+    const V = M._view();
+    const levels = [];
+    for (let pass = 1; pass <= PASSES; pass++) {
+      // from the fit view: pan, then 3 zoom steps of 7 notches (x4.8 each) with a pan at each, then all the way out
+      phase = `p${pass} idle`; await idle(60);
+      phase = `p${pass} hover@fit`; await hover(60);
+      phase = `p${pass} pan@fit`; await pan(90);
+      for (let z = 1; z <= 3; z++) {
+        phase = `p${pass} zoomIn->${z}`; await zoom(7, -1);
+        phase = `p${pass} pan@zoom${z}`; await pan(90);
+        if (pass === 1) levels.push(V.scale);
+      }
+      phase = `p${pass} zoomOut`; await zoom(21, 1);
+      phase = null; await idle(10);
+    }
+    phase = null;
+    W.__mapProf = null;
+    // THE EDIT PATH: what one height-plane edit (a brush dab bumps the plane's
+    // gen) costs the next paint -- the rivers re-bake on the new ground
+    const editMs = [];
+    for (let i = 0; i < 5; i++) {
+      M._map().H.gen++;
+      const t0 = performance.now(); M._paint(); editMs.push(performance.now() - t0);
+      await nextFrame();
+    }
+
+    // ---- report ----
+    const pct = (a, p) => { if (!a.length) return NaN; const s = [...a].sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
+    const f1 = x => (isNaN(x) ? '   -  ' : x.toFixed(1).padStart(6));
+    const sum = a => a.reduce((s, x) => s + x, 0);
+    const lines = [];
+    lines.push(`map ${MAP} · voxels ${VOX ? 'ON' : 'off'} · grid ${GRID ? 'on' : 'off'}${FLUSH ? ' · FLUSH (per-layer raster attribution; frame times inflated)' : ''} · canvas ${canvas.width}x${canvas.height} · dpr ${W.devicePixelRatio} · zoom scales ${levels.map(s => s.toFixed(4)).join(' / ')}`);
+    lines.push('paint after a height-plane edit (gen bump: the river re-bake), 5 runs: ' + editMs.map(x => x.toFixed(1)).join(' / ') + ' ms');
+    lines.push('');
+    lines.push('phase                 frames  f.p50  f.p95  f.max  >20ms  paints p.p50  p.p95  p.max');
+    for (const [k, b] of Object.entries(rec)) {
+      const slow = b.frames.filter(x => x > 20).length;
+      lines.push(`${k.padEnd(21)} ${String(b.frames.length).padStart(6)} ${f1(pct(b.frames, 0.5))} ${f1(pct(b.frames, 0.95))} ${f1(Math.max(...b.frames))} ${String(slow).padStart(6)} ${String(b.paints.length).padStart(6)} ${f1(pct(b.paints, 0.5))} ${f1(pct(b.paints, 0.95))} ${f1(b.paints.length ? Math.max(...b.paints) : NaN)}`);
+    }
+    // per-layer, over every phase of the last pass (warm) and the first (cold)
+    for (const pass of [...new Set([1, PASSES])]) {
+      const L = {};
+      for (const [k, b] of Object.entries(rec)) if (k.startsWith('p' + pass + ' ')) for (const [n, a] of Object.entries(b.layers)) (L[n] || (L[n] = [])).push(...a);
+      lines.push('');
+      lines.push(`layers, pass ${pass}${pass === 1 ? ' (cold caches)' : ' (warm)'}     n   p50    p95    max   total`);
+      for (const [n, a] of Object.entries(L).sort((x, y) => sum(y[1]) - sum(x[1])))
+        lines.push(`  ${n.padEnd(26)} ${String(a.length).padStart(5)} ${f1(pct(a, 0.5))} ${f1(pct(a, 0.95))} ${f1(Math.max(...a))} ${f1(sum(a))}`);
+    }
+    // per layer x phase (the last pass): p95 ms, the layers that matter
+    {
+      const ph = Object.keys(rec).filter(k => k.startsWith('p' + PASSES + ' ') && !k.endsWith('idle'));
+      const names = new Set();
+      for (const k of ph) for (const [n, a] of Object.entries(rec[k].layers)) if (pct(a, 0.95) >= 0.5) names.add(n);
+      lines.push('');
+      lines.push(`layer p95 by phase, pass ${PASSES}`.padEnd(28) + ph.map(k => k.slice(3).slice(0, 10).padStart(11)).join(''));
+      for (const n of names) lines.push('  ' + n.padEnd(26) + ph.map(k => f1(pct(rec[k].layers[n] || [], 0.95)).padStart(11)).join(''));
+    }
+    const summary = {};
+    for (const [k, b] of Object.entries(rec)) summary[k] = {frames: b.frames.length, fp50: pct(b.frames, 0.5), fp95: pct(b.frames, 0.95), fmax: Math.max(...b.frames),
+      paints: b.paints.length, pp50: pct(b.paints, 0.5), pp95: pct(b.paints, 0.95), pmax: b.paints.length ? Math.max(...b.paints) : null};
+    window.benchResult = {map: MAP, voxels: VOX, grid: GRID, canvas: [canvas.width, canvas.height], summary, editMs, raw: rec, text: lines.join('\n')};
+    say(lines.join('\n'));
+    document.title = 'BENCH DONE';
+  } catch (e) {
+    say('BENCH FAIL ' + (e && e.stack || e));
+    window.benchResult = {error: String(e && e.stack || e)};
+    document.title = 'BENCH FAIL';
+  }
+})();
+</script>
