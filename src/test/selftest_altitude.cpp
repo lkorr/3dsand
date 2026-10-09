@@ -29,12 +29,17 @@
 //   F. THE CLIFF BAND: a window on the 300 m escarpment (~7 voxels a column)
 //      skins its steep columns as rock (no grass, no snow, no powder) and
 //      settles to <= 32 active chunks (rule 2).
+//   H. THE SEA WINDOW (map v2 P1): the `peaksea` camera's window, whose lower
+//      half is open ocean down to the bed, comes to rest too -- with the
+//      decay curve printed and, if it does not, which chunk layers stay
+//      awake and which word field moves in them.
 //
 // Leaves the pristine world behind: the real environment reloaded from disk,
 // the window put back, the world regenerated and the far cascades refilled
 // (the `clearing` gate's exit).
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -42,8 +47,10 @@
 #include <string>
 #include <vector>
 
+#include "measure/perfsuite.h"
 #include "sim/biomes.h"
 #include "sim/heat.h"
+#include "sim/pagetable.h"
 #include "sim/stream.h"
 #include "sim/treeatlas.h"
 #include "sim/tuning.h"
@@ -320,6 +327,129 @@ Status GateAltitude(Ctx& c, std::string& detail) {
                 fOk ? "PASS" : "FAIL", fx, fz, org.y * static_cast<int>(kChunk), steepest / 256.0, steep, rock / 256.0,
                 rocky, active, settled, maxActive, why.c_str());
     if (!fOk) problems.push_back(Format("F: %d of %d steep columns rock, %u active chunks at rest%s", rocky, steep, active, why.c_str()));
+  }
+
+  // ---- H. the sea window sleeps (map v2 P1) ----------------------------------------------
+  // The `peaksea` budget camera's window: 3 m over the open sea 10 km south of
+  // the summit, so the lower half of the window is ocean down to the bed. H1
+  // saw "the sea-level window wakes 16,384 water chunks"; this measures the
+  // DECAY (active chunks at ticks 1, 2, 4 .. 512) and, if it does not reach
+  // rest, says WHERE (chunk layers relative to the sea) and WHAT moves (the
+  // word field, material, over 8 ticks in up to four awake chunks) instead of
+  // a bare count (CLAUDE.md rule 6).
+  {
+    const PeaksPose p = PeaksPoseOf(2);
+    const IVec3 ec{static_cast<int>(std::floor(p.ex)) >> 4, static_cast<int>(std::floor(p.ey)) >> 4,
+                   static_cast<int>(std::floor(p.ez)) >> 4};
+    const int half = static_cast<int>(kNChunk) / 2;
+    const IVec3 org{ec.x - half, ec.y - half, ec.z - half};
+    c.stream.OnRegen();
+    c.world.SetWindowOrigin(org);
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    // DIRECT PHASE CALLS ON PURPOSE (W2-O): worldgen + the CA coming to rest,
+    // as F above -- no body, no op.
+    uint32_t t = 100000;
+    std::string curve;
+    uint32_t active = kNumSlots;
+    const uint32_t checkAt[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512};
+    uint32_t done = 0;
+    // The birth wake's price: ticks 1 and 2 timed submit-to-idle, one at a
+    // time (worldgen's wake is spent on tick 1; tick 2 is the settled cost).
+    double tickMs[2] = {0, 0};
+    for (uint32_t at : checkAt) {
+      while (done < at) {
+        c.stream.TicketTick(t + 1);
+        const auto t0 = std::chrono::steady_clock::now();
+        SubmitTick(c.ctx, c.world, c.sim, ++t, kDefaultSeed, {}, {}, {}, false, ec, false, false);
+        if (done < 2) {
+          c.ctx.WaitIdle();
+          tickMs[done] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        }
+        done++;
+      }
+      c.ctx.WaitIdle();
+      active = ReadActiveChunksSync(c.ctx, c.world, c.sim);
+      curve += Format(" %u@%u", active, at);
+    }
+    curve += Format("; tick 1 %.1f ms, tick 2 %.1f ms submit-to-idle; %u pages resident",
+                    tickMs[0], tickMs[1], c.world.pages ? c.world.pages->PagesInUse() : 0u);
+    const uint32_t maxActive = static_cast<uint32_t>(BaselineNumber("altitude.seaMaxActive", 32));
+    const bool hOk = active <= maxActive;
+    std::string where;
+    if (!hOk) {
+      std::vector<uint32_t> flags(kNumSlots, 0);
+      rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.DirtyActive(), 0, flags.data(),
+                            kNumSlots * 4, "altitudeSea");
+      const int seaCy = sea >> 4;
+      std::map<int, int> byLayer;   // chunk y - sea chunk y -> awake chunks
+      std::vector<uint32_t> picks;
+      for (uint32_t i = 0; i < kNumSlots; i++) {
+        if (!flags[i]) continue;
+        const IVec3 wc = c.world.SlotToWorldChunk(i);
+        byLayer[wc.y - seaCy]++;
+      }
+      // One awake chunk from each of up to four distinct layers: the
+      // shallowest, the deepest and two between.
+      std::vector<int> layers;
+      for (auto& kv : byLayer) layers.push_back(kv.first);
+      std::vector<int> want;
+      if (!layers.empty()) {
+        want.push_back(layers.back());
+        want.push_back(layers.front());
+        if (layers.size() > 2) want.push_back(layers[layers.size() / 2]);
+        if (layers.size() > 3) want.push_back(layers[layers.size() - 2]);
+      }
+      for (int L : want)
+        for (uint32_t i = 0; i < kNumSlots; i++)
+          if (flags[i] && c.world.SlotToWorldChunk(i).y - seaCy == L) { picks.push_back(i); break; }
+      where += " | awake by chunk layer (0 = the sea's):";
+      for (auto& kv : byLayer) where += Format(" %+d:%d", kv.first, kv.second);
+      std::vector<std::vector<uint32_t>> before(picks.size(), std::vector<uint32_t>(kChunkVol, 0));
+      for (size_t k = 0; k < picks.size(); k++)
+        ReadVoxelsSync(c.ctx, c.world, picks[k], 1, before[k].data(), "altitudeSeaA");
+      for (int i = 0; i < 8; i++) {
+        c.stream.TicketTick(t + 1);
+        SubmitTick(c.ctx, c.world, c.sim, ++t, kDefaultSeed, {}, {}, {}, false, ec, false, false);
+      }
+      c.ctx.WaitIdle();
+      for (size_t k = 0; k < picks.size(); k++) {
+        std::vector<uint32_t> after(kChunkVol, 0);
+        ReadVoxelsSync(c.ctx, c.world, picks[k], 1, after.data(), "altitudeSeaB");
+        int mat = 0, state = 0, stain = 0, stampOnly = 0;
+        std::map<uint32_t, int> hist, movedMat;
+        for (uint32_t v = 0; v < kChunkVol; v++) {
+          const uint32_t a = before[k][v], b = after[v];
+          hist[b & 0xFFFu]++;
+          if (a == b) continue;
+          if ((a & 0xFFFu) != (b & 0xFFFu)) mat++;
+          else if (((a >> 12) & 0xFu) != ((b >> 12) & 0xFu)) state++;
+          else if ((a & 0x7F000000u) != (b & 0x7F000000u)) stain++;
+          else stampOnly++;
+          if (a != b) movedMat[b & 0xFFFu]++;
+        }
+        const IVec3 wc = c.world.SlotToWorldChunk(picks[k]);
+        where += Format(" | chunk (%d,%d,%d) layer %+d over 8 ticks: %d material, %d state, %d stain, %d "
+                        "stamp/scratch-only;", wc.x, wc.y, wc.z, wc.y - seaCy, mat, state, stain, stampOnly);
+        for (auto& kv : hist)
+          where += Format(" %s x%d", kv.first == 0 ? "air"
+                                     : kv.first < c.mats.size() ? c.mats[kv.first].name.c_str() : "?",
+                          kv.second);
+        if (!movedMat.empty()) {
+          where += " (moved:";
+          for (auto& kv : movedMat)
+            where += Format(" %s x%d", kv.first == 0 ? "air"
+                                       : kv.first < c.mats.size() ? c.mats[kv.first].name.c_str() : "?",
+                            kv.second);
+          where += ")";
+        }
+      }
+    }
+    std::printf("altitude: H sea window: %s (window at chunk (%d,%d,%d), sea y%d; active chunks by tick:%s; max "
+                "%u)%s\n",
+                hOk ? "PASS" : "FAIL", org.x, org.y, org.z, sea, curve.c_str(), maxActive, where.c_str());
+    if (!hOk) problems.push_back(Format("H: %u active chunks in the sea window after 512 ticks%s", active,
+                                        where.c_str()));
   }
 
   // ---- the pristine world back --------------------------------------------------------------
