@@ -8050,6 +8050,9 @@ class MobSystem {
     uint64_t coatMatched = 0, coatFired = 0, coatCovered = 0, coatPartner = 0;
     // Clause 2c: coat firings that made a flame ON a voxel that then caught.
     uint64_t coatCaught = 0;
+    // Clause 2d: coat firings whose GRID partner then boiled (its own rule
+    // against the coat made a gas: water beside a lava coat -> steam).
+    uint64_t coatBoiled = 0;
     // THE BUDGETS RAN OUT: candidates left unevaluated because the front
     // budget (the caller's share of it) was spent, and grid writes an emit or
     // a leaving voxel wanted that the ops budget refused. Non-zero on any

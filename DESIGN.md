@@ -4984,6 +4984,26 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
        as is its own combustion, bounded by the fire chain. It applies to the
        coat's OWN rules only; a flame released through rule 4 was V's own
        rule firing, which is V's one rule already.
+     - *2d. A grid partner answers with its own rule (2026-10-09, owner
+       ticket 2026-10-08_23-13-24: a lava-dipped severed head in a basin
+       cooled without a wisp of steam).* On the grid a lava cell beside water
+       is two reactants -- `lava + water -> stone` crusts the lava and the
+       water's own `water + tag:hot -> steam` boils the water -- and under 2a
+       a body only ever ran the first. Now, when a coat rule FIRES against a
+       face partner that is a real GRID cell (not a sibling or a worn shell
+       standing in for it), the partner's first pair rule that the COAT
+       material arms and whose `selfBecomes` is a GAS is rolled ONCE per world
+       cell per tick (keyed on the cell, so a face of 64 skin voxels boils its
+       water at the rule's own per-tick chance, as one grid cell of lava
+       would). On a hit the partner LEAVES as that gas: the gas is released
+       fill-if-air at the first air cell straight up the column through liquid
+       and gas (at most 16 cells; deeper, or under a lid, the bubble condenses
+       and nothing happens), and the partner cell is cleared only if it still
+       holds its material (`CellOpClearIfMat`). A cell of water becomes a cell
+       of steam; nothing is named. Bounded by the coat: it needs a firing,
+       which spends a level. `MobSystem::BurnOneLimb` `boilPartner`,
+       `BurnStats::coatBoiled`; gate `lava-quench`. The grid needs no twin:
+       it already runs the partner's own rule.
   3. *A quenching coat covers the cell.* If a coat rule MATCHED this tick
      (partner found, rolled or not) and its coat-side product is not a flame,
      the cell is COVERED for this tick: V's own rules see its coat and nothing
@@ -9697,6 +9717,15 @@ bag freezes a coat because nothing touches a stored item; on the ground the
 world does. Picking it up (local `E`, a remote grant) and saving it (ITMS)
 first bring the instance up to date from the body (`SyncGroundCoat` ->
 `CaptureGroundCoat`), so what you pick up is what was lying there.
+
+**Every piece that came off a creature wears its coat the same way
+(2026-10-09).** `ForEachCoatBody` admits severed flesh, dropped items AND every
+other `dead`, non-follower piece -- the BLOODLESS limbs (`MobLimbDef::bloodless`:
+hair, a mane), which have no `bleedMat` and so are not `IsFlesh`. Before, a
+severed head's hair kept whatever it wore forever: never rinsed, dried or
+rained off (owner ticket 2026-10-08_23-13-24, a lava-dipped head that stayed
+orange at the bottom of a basin of water; gate `lava-quench`). A strapped
+garment (a follower) stays out: the piece it is worn on owns the contact.
 
 ### A coat that heals (2026-09-27, alchemy package D; `Mob::HealTick` / `HealLimbStep`, `MaterialDef::coatRestore`, gates `heal-restore` + `heal-wound`)
 

@@ -1138,6 +1138,9 @@ const char* const kOrder[] = {
     // ...and a HOT coat (lava) sets the limb alight and eats it, a FUEL coat
     // (oil) is inert until heat reaches it and then flashes. Pose ticks only.
     "lava-oil-coat",
+    // ...and a lava-coated SEVERED HEAD in water is quenched (the coat goes)
+    // and steams. Ticks the world; regenerated on the way out.
+    "lava-quench",
     // ...and EVERY liquid coats a body, syrup by hand and walked through
     // (DefaultLiquidStain). Ticks the world; regenerated on the way out.
     "liquid-coats",

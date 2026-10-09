@@ -71,6 +71,7 @@
 #include "gpu/resources.h"  // CreateBuffer, ditto
 #include "sim/microbody.h"
 #include "phys/bodystain.h"   // bruise-is-skin: SoakBruise and the coat rules
+#include "phys/coatcontact.h"  // lava-quench: BuildLatticeOcc (which voxels are surface)
 #include "sim/tuning.h"
 #include "sim/weather.h"  // corpse-sleep: the rain word, for attribution
 #include "test/selftest.h"
@@ -5019,6 +5020,260 @@ Status GateCorpseAcid(Ctx& c, std::string& detail) {
                   coatPeak, n0, n90, at90, left, trace.c_str(), livePeak, liveN0,
                   liveN90);
   return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// lava-quench: a lava-coated SEVERED HEAD dropped in water is quenched
+// ---------------------------------------------------------------------------
+// Owner ticket 2026-10-08_23-13-24: "put a disembodied head, covered in lava
+// into water. the water should stain and clean off the lava immediately, and
+// probably produce smoke as it does so". The head is severed flesh -- a
+// DebrisSystem body whose coat runs through MobSystem's passes
+// (StainDeadFlesh, the burn pass) -- so this cuts a real one off a corpse,
+// coats it in lava, and bathes it.
+//
+// Two arms on the same fixture, kTicks each: WET (water written round the
+// head every tick, fill-if-air so the steam it makes is not painted over) and
+// DRY (nothing). The claims:
+//   A. the fixture took the coat (lava on the head before the bath);
+//   B. in water the lava is GONE: at most lavaQuenchMaxFrac of it is left
+//      after lavaQuenchTicks ticks;
+//   C. ...and it was the WATER: the dry arm still wears at least
+//      lavaQuenchDryMinFrac of its coat at the same tick (lava cools on its
+//      own in seconds, coat.decay, so "gone eventually" proves nothing);
+//   D. the quench STEAMS: steam cells round the head in the wet arm (summed
+//      over the ticks), and none in the dry arm.
+// Thresholds in tests/baseline.json.
+Status GateLavaQuench(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  const uint32_t mLava = MatIdOf(c, "lava"), mWater = MatIdOf(c, "water"),
+                 mSteam = MatIdOf(c, "steam");
+  if (!mLava || !mWater || !mSteam) {
+    detail = "lava, water or steam missing from materials.json";
+    return Status::Fail;
+  }
+  const int kTicks = (int)BaselineNumber("lavaQuenchTicks", 45);
+  struct Arm {
+    uint32_t coat0 = 0, coatEnd = 0, steamTicks = 0, steamPeak = 0;
+    uint32_t pieces = 0, bare0 = 0, bareEnd = 0;
+    uint64_t coatFired = 0, boiled = 0;
+    std::string trace, why;
+  };
+  // EVERY loose body that came off `corpse`, flesh or not: a severed head
+  // takes its BLOODLESS hair limb with it (MobLimbDef::bloodless), and that
+  // piece is not DebrisSystem::IsFlesh (no bleedMat), so ForEachCoatBody used
+  // not to see it at all.
+  auto forPieces = [&](uint64_t corpse,
+                       const std::function<void(DebrisSystem::FleshLattice&, bool)>& fn) {
+    for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++) {
+      const uint64_t h = c.debris.BodyHandle(bi);
+      DebrisSystem::FleshLattice f;
+      if (!c.debris.CoatLatticeOf(h, f) || f.creature != corpse) continue;
+      fn(f, c.debris.BodyIsDeadFlesh(h));
+    }
+  };
+  // Lava-coated voxels (any amount) over every severed piece of `corpse`;
+  // `onBare` gets the share on pieces that are not flesh (the hair); `centre`
+  // the biggest piece's box centre.
+  auto census = [&](uint64_t corpse, Vec3* centre, uint32_t* pieces,
+                    uint32_t* onBare = nullptr) {
+    uint32_t n = 0, best = 0;
+    if (pieces) *pieces = 0;
+    if (onBare) *onBare = 0;
+    forPieces(corpse, [&](DebrisSystem::FleshLattice& f, bool flesh) {
+      if (pieces) (*pieces)++;
+      const size_t sz = f.skin ? f.skin->size() : (f.coll ? f.coll->size() : 0);
+      for (size_t i = 0; i < sz; i++) {
+        const uint16_t s = f.skin ? (*f.skin)[i].stain : (*f.coll)[i].stain;
+        if (BodyStainAmt(s) != 0 && BodyStainMat(s) == mLava) {
+          n++;
+          if (!flesh && onBare) (*onBare)++;
+        }
+      }
+      if (centre && f.xf && sz > best) {
+        best = (uint32_t)sz;
+        const float ps = 1.0f / (float)std::max(1u, f.physScale);
+        const Vec3 mid{(float)(f.lo.x + f.hi.x) * 0.5f * ps,
+                       (float)(f.lo.y + f.hi.y) * 0.5f * ps,
+                       (float)(f.lo.z + f.hi.z) * 0.5f * ps};
+        const Quat q{f.xf->quat[0], f.xf->quat[1], f.xf->quat[2], f.xf->quat[3]};
+        *centre = f.xf->pos + QuatRotate(q, mid);
+      }
+    });
+    return n;
+  };
+  // What the head IS, beside what it wears: voxels left, and how many of them
+  // are a HOT material (tag "hot": flesh_burning, hair_burning, ...) -- the
+  // other thing that reads as "still covered in lava" on screen.
+  std::vector<uint8_t> isHot(c.mats.size(), 0);
+  for (size_t m = 0; m < c.mats.size(); m++)
+    for (const std::string& tg : c.mats[m].tags)
+      if (tg == "hot") isHot[m] = 1;
+  auto bodyCensus = [&](uint64_t corpse, uint32_t& vox, uint32_t& hot) {
+    vox = hot = 0;
+    forPieces(corpse, [&](DebrisSystem::FleshLattice& f, bool) {
+      const size_t sz = f.skin ? f.skin->size() : (f.coll ? f.coll->size() : 0);
+      for (size_t i = 0; i < sz; i++) {
+        const uint32_t m = f.skin ? ((*f.skin)[i].material & 0xFFFu)
+                                  : ((*f.coll)[i].payload & 0xFFFu);
+        if (m == 0) continue;
+        vox++;
+        if (m < isHot.size() && isHot[m]) hot++;
+      }
+    });
+  };
+  auto matNear = [&](const Vec3& at, uint32_t mat, int r) -> uint32_t {
+    const IVec3 b{ifloor(at.x), ifloor(at.y), ifloor(at.z)};
+    uint32_t n = 0;
+    for (int dy = -r; dy <= r; dy++)
+      for (int dz = -r; dz <= r; dz++)
+        for (int dx = -r; dx <= r; dx++) {
+          const IVec3 cc{b.x + dx, b.y + dy, b.z + dz};
+          if (!c.world.CellInWindow(cc)) continue;
+          const CachedChunk* k = c.world.Cached(IVec3{cc.x >> 4, cc.y >> 4, cc.z >> 4});
+          if (!k || k->voxels.size() != kChunkVol) continue;
+          const uint32_t w = k->voxels[((uint32_t)(cc.z & 15) * kChunk +
+                                        (uint32_t)(cc.y & 15)) * kChunk +
+                                       (uint32_t)(cc.x & 15)];
+          if ((w & 0xFFFu) == mat) n++;
+        }
+    return n;
+  };
+  auto steamNear = [&](const Vec3& at) -> uint32_t {
+    const IVec3 b{ifloor(at.x), ifloor(at.y), ifloor(at.z)};
+    uint32_t n = 0;
+    for (int dy = -3; dy <= 10; dy++)
+      for (int dz = -5; dz <= 5; dz++)
+        for (int dx = -5; dx <= 5; dx++) {
+          const IVec3 cc{b.x + dx, b.y + dy, b.z + dz};
+          if (!c.world.CellInWindow(cc)) continue;
+          const CachedChunk* cc16 = c.world.Cached(IVec3{cc.x >> 4, cc.y >> 4, cc.z >> 4});
+          if (!cc16 || cc16->voxels.size() != kChunkVol) continue;
+          const uint32_t w = cc16->voxels[((uint32_t)(cc.z & 15) * kChunk +
+                                           (uint32_t)(cc.y & 15)) * kChunk +
+                                          (uint32_t)(cc.x & 15)];
+          if ((w & 0xFFFu) == mSteam) n++;
+        }
+    return n;
+  };
+  auto runArm = [&](bool wet) -> Arm {
+    Arm a;
+    PrepareWorld(c);
+    DeadFixture f(c);
+    if (!f.Make(300, 63000)) {
+      a.why = f.why;
+      return a;
+    }
+    const Mob* mob = c.mobs.FindMobById(f.id);
+    const MobDef* def = mob ? mob->Def() : nullptr;
+    int head = -1;
+    if (def)
+      for (size_t li = 0; li < def->limbs.size(); li++)
+        if (def->limbs[li].vital && def->limbs[li].severable &&
+            (int)li != def->rootLimb && c.mobs.LimbBody(f.id, (int)li)) {
+          head = (int)li;
+          break;
+        }
+    if (head < 0) {
+      a.why = "the corpse has no severable head";
+      return a;
+    }
+    // THE BATH FIRST: water round the head while it is still on the corpse,
+    // so the claim is about the quench and not about how long the fill takes
+    // to arrive. Fill-if-air every tick (the steam the quench makes is not
+    // painted over, and what flows away is topped up).
+    Vec3 at{};
+    if (!mob->LimbCentreWorld(head, at)) at = c.mobs.LimbVoxelPos(f.id, head, 0);
+    auto bath = [&](std::vector<CellOp>& cellOps) {
+      if (!wet) return;
+      const IVec3 b{ifloor(at.x), ifloor(at.y), ifloor(at.z)};
+      for (int dy = -3; dy <= 3; dy++)
+        for (int dz = -4; dz <= 4; dz++)
+          for (int dx = -4; dx <= 4; dx++) {
+            const IVec3 cc{b.x + dx, b.y + dy, b.z + dz};
+            if (!c.world.CellInWindow(cc)) continue;
+            if (cellOps.size() >= kMaxCellOpsPerTick) return;
+            if (cc.y <= World::TerrainHeight(cc.x, cc.z, kDefaultSeed)) continue;
+            cellOps.push_back({World::SlotCellIndex(cc),
+                               PackVoxNew(mWater, 8u) | kCellOpIfAir});
+          }
+    };
+    {
+      const IVec3 b{ifloor(at.x), ifloor(at.y), ifloor(at.z)};
+      f.pchunk = IVec3{b.x >> 4, b.y >> 4, b.z >> 4};
+    }
+    for (int i = 0; i < 8; i++) f.Step(bath);
+    c.mobs.Sever(f.id, head);
+    // ...THEN THE LAVA, on the SURFACE of the head and of everything that
+    // came off with it (the hair limb, bloodless): what a dunk in a lava pool
+    // leaves -- the contact pass coats exposed voxels only, so a coat on the
+    // inside of a lattice is nothing the game can make and nothing water
+    // could reach.
+    forPieces(f.id, [&](DebrisSystem::FleshLattice& p, bool) {
+      const StainLattice L{p.skin, p.coll};
+      if (!L.skin && !L.coll) return;
+      const LatticeOcc occ = BuildLatticeOcc(L);
+      for (size_t i = 0; i < L.Size(); i++)
+        if (L.Mat(i) != 0 && occ.Exposed(L.At(i)))
+          L.SetStain(i, PackBodyStain(mLava, 10));
+    });
+    a.coat0 = census(f.id, &at, &a.pieces, &a.bare0);
+    if (a.pieces == 0) {
+      a.why = "the severed head is not a loose body";
+      return a;
+    }
+    c.mobs.ResetBurnStats();
+    for (int i = 0; i < kTicks; i++) {
+      census(f.id, &at, nullptr);
+      const IVec3 b{ifloor(at.x), ifloor(at.y), ifloor(at.z)};
+      f.pchunk = IVec3{b.x >> 4, b.y >> 4, b.z >> 4};
+      f.Step(bath);
+      const uint32_t s = steamNear(at);
+      a.steamTicks += s;
+      a.steamPeak = std::max(a.steamPeak, s);
+      if (i % 5 == 0 || i + 1 == kTicks) {
+        uint32_t vox = 0, hot = 0;
+        bodyCensus(f.id, vox, hot);
+        a.trace += Format(" t+%d %u/%u/%u/%u/%u", i, census(f.id, nullptr, nullptr), s,
+                          vox, hot, matNear(at, mWater, 3));
+      }
+    }
+    a.coatEnd = census(f.id, nullptr, nullptr, &a.bareEnd);
+    a.coatFired = c.mobs.Burn().coatFired;
+    a.boiled = c.mobs.Burn().coatBoiled;
+    c.mobs.Reset();
+    c.debris.Reset();
+    return a;
+  };
+  const Arm w = runArm(true);
+  const Arm d = w.why.empty() ? runArm(false) : Arm{};
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  if (!w.why.empty() || !d.why.empty()) {
+    detail = !w.why.empty() ? w.why : d.why;
+    return Status::Fail;
+  }
+  RecordObserved("lavaQuenchWetLeft", w.coat0 ? (double)w.coatEnd / w.coat0 : 0.0);
+  RecordObserved("lavaQuenchDryLeft", d.coat0 ? (double)d.coatEnd / d.coat0 : 0.0);
+  RecordObserved("lavaQuenchSteam", (double)w.steamTicks);
+  const double maxWet = BaselineNumber("lavaQuenchMaxFrac", 0.1);
+  const double minDry = BaselineNumber("lavaQuenchDryMinFrac", 0.3);
+  const bool a = w.coat0 > 0 && d.coat0 > 0;
+  const bool b = a && (double)w.coatEnd <= maxWet * (double)w.coat0;
+  const bool cc = a && (double)d.coatEnd >= minDry * (double)d.coat0;
+  const bool dd = w.steamTicks > 0 && w.boiled > 0 && d.steamTicks == 0;
+  detail = Format(
+      "severed head (%u pieces), lava coat, %d ticks: A coated %u (wet, %u on bloodless pieces) / %u (dry) %s | B in "
+      "water %u -> %u (%u on bloodless pieces; max %.0f%%) %s | C dry %u -> %u (min %.0f%%) %s | D steam "
+      "cell-ticks wet %u (peak %u, %llu boils) dry %u %s | coat rules fired wet %llu dry %llu "
+      "| wet trace (lava/steam/voxels/hot/water r3):%s | dry trace:%s",
+      w.pieces, kTicks, w.coat0, w.bare0, d.coat0, a ? "ok" : "FAIL", w.coat0, w.coatEnd,
+      w.bareEnd, maxWet * 100.0,
+      b ? "ok" : "FAIL", d.coat0, d.coatEnd, minDry * 100.0, cc ? "ok" : "FAIL",
+      w.steamTicks, w.steamPeak, (unsigned long long)w.boiled, d.steamTicks, dd ? "ok" : "FAIL",
+      (unsigned long long)w.coatFired, (unsigned long long)d.coatFired, w.trace.c_str(),
+      d.trace.c_str());
+  return a && b && cc && dd ? Status::Pass : Status::Fail;
 }
 
 // ---------------------------------------------------------------------------
@@ -10017,6 +10272,8 @@ const std::vector<Gate>& WoundGates() {
       {"acid-coat", "mob", {}, false, GateAcidCoat, false},
       {"corpse-acid", "mob", {}, false, GateCorpseAcid, false},
       {"lava-oil-coat", "mob", {}, false, GateLavaOilCoat, false},
+      // A lava-coated severed head in water is quenched and steams.
+      {"lava-quench", "mob", {}, false, GateLavaQuench, false},
       // Every liquid coats a body; syrup by hand and by walking through it.
       {"liquid-coats", "mob", {}, false, GateLiquidCoats, false},
       // A HEALING coat (alchemy package D): enchanted blood / water rebuild
