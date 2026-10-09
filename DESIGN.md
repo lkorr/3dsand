@@ -23076,8 +23076,12 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   word `CCW_TREELINE`, `CC_WORDS` 26); the snow cap, `colGrowsTrees`, the
   shore fringe, cacti, tile plants, the trunk column of a lattice / site tree,
   ice born on water and the cover rows' `treeline` condition all read it.
-  `kHTreelineMax` (the highest any column's can be) bounds `treeMaxTop` /
-  `cactusMaxTop`. **Heat:** the column table carries each column's snowline;
+  `kHTreelineMax` (the highest any column's can be) bounds `treeMaxTop`;
+  the cactus sky term is per column since P1 (`cactusColTop`: the max
+  `cactusVTop` of the 3x3 tiles that can reach the column, pond gate
+  dropped), not `treelineMax + 5.4 m` -- a world-wide bound that, on a map
+  with a 1,000 m treeline, held every desert column's sky open to 1 km.
+  **Heat:** the column table carries each column's snowline;
   `sim.heatLapsePerKm` (6) cools the biome climate per km above the sea
   (`heatLapse`, `kHpLapse` / `kHpSeaY`; word 2 was the one snowline Y).
   **Sediment:** relative (`sedAbove`, above). **Caves:** band 2 sits

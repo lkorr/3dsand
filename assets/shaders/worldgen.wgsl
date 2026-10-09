@@ -324,7 +324,7 @@ fn vnoise2d(x : i32, z : i32, csl : u32, seed : u32) -> N2 {
 // Snow/treeline: the ground Y at and above which the skin is snow and no tree
 // stands is PER COLUMN since map v2 A1 -- treelineAt (the height mirror) and
 // Col.tl. treelineMax() is the world-wide ceiling of every column's, for the
-// sky early-outs' bounds (treeMaxTop, cactusMaxTop).
+// sky early-outs' tree bound (treeMaxTop; cacti are per column, cactusColTop).
 fn treelineMax() -> i32 { return wmTerrain(WM_H_TREELINE_MAX); }
 // debug.vegetation: the kill-switch for every plant this file places,
 // TREES AND CACTI INCLUDED. Gated at the SOURCE of each feature (the *Info /
@@ -1486,7 +1486,7 @@ const WM_H_BIOME_LOG2               : u32 = 62u;
 const WM_H_BIOME_POSTS_X            : u32 = 63u;
 const WM_H_BIOME_POSTS_Z            : u32 = 64u;
 // map v2 A1: the highest any column's treeline reaches (PackWorldMap) -- the
-// world-wide bound under treeMaxTop / cactusMaxTop.
+// world-wide bound under treeMaxTop.
 const WM_H_TREELINE_MAX             : u32 = 65u;
 const WM_SCULPT_SPACING_LOG2        : u32 = 3u;    // 8 voxels between samples
 const WM_SCULPT_TILE_LOG2           : u32 = 5u;    // 32 samples per tile side
@@ -3086,18 +3086,11 @@ const CACTUS_TILE : i32 = (40 * VLEN_NUM) / VLEN_DEN;   // 2.5 m between sites
 // a 25-tile one for a shape that cannot reach that far.
 const CACTUS_SCAN : i32 = 1;
 const CACTUS_ARMS : i32 = 2;     // hard cap; bounds the per-cell loop
-// The tallest bole cactusInfo builds, in decimetres: a saguaro at j == 4
-// (32 + 4 * 5). Barrels top out at 9.
-const CACTUS_MAX_DM : i32 = 52;
 
-// The highest y ANY cactus can occupy, world-wide -- the cactus analogue of
-// treeMaxTop(), for the sky early-outs. A cactus roots only on ground below
-// its column's treeline (cactusInfo), so below treelineMax(), is at most
-// CACTUS_MAX_DM tall, and cactusAt clips every cell to base + height + 2 (the
-// crown bloom sits one above the tip).
-fn cactusMaxTop() -> i32 {
-  return treelineMax() - 1 + CACTUS_MAX_DM * VOX_PER_M / 10 + 2;
-}
+// (cactusMaxTop -- the world-wide bound treelineMax() - 1 + the tallest
+// cactus -- was the sky early-outs' cactus term until map v2 P1. On a map
+// whose treeline is 1,000 m it held every desert column's sky open to 1 km;
+// the per-column bound is cactusColTop below.)
 
 struct Cactus {
   present : bool,
@@ -3111,7 +3104,12 @@ struct Cactus {
   rnd     : u32,
 };
 
-fn cactusInfo(tx : i32, tz : i32, seed : u32, ponds : ptr<function, PondSet>) -> Cactus {
+// The tile's cactus with every gate but the ASKING column's pond set
+// (cactusInfo below adds it): a function of the TILE alone, so a column's sky
+// bound (cactusColTop) and the `cols` tile cache can evaluate it without a
+// column. Dropping the pond gate only ever ADDS a cactus, so a bound over these
+// is an upper bound over cactusInfo's.
+fn cactusInfoBare(tx : i32, tz : i32, seed : u32) -> Cactus {
   var c : Cactus;
   c.present = false;
   c.species = 0u; c.wx = 0; c.wz = 0; c.base = 0;
@@ -3142,7 +3140,6 @@ fn cactusInfo(tx : i32, tz : i32, seed : u32, ponds : ptr<function, PondSet>) ->
   c.base = h;
   if (h >= treelineAt(c.wx, c.wz, seed)) { return c; }
   if (siteKeepOut(c.wx, c.wz) || sitePadNear(c.wx, c.wz, 0)) { return c; }
-  if (pondCoversP(ponds,c.wx, c.wz)) { return c; }
 
   // Density and mix are the biome's (cover.cactusChance / saguaroFraction,
   // both percents, packed by worldmap.cpp): the flag says whether, the
@@ -3156,8 +3153,8 @@ fn cactusInfo(tx : i32, tz : i32, seed : u32, ponds : ptr<function, PondSet>) ->
   let sroll = (hsh >> 24u) % 100u;
   c.species = select(1u, 0u, sroll < wmBiome(cb, WM_B_SAGUARO_FRACTION));
 
-  // Dimensions in TENTHS OF A METRE, converted below. CACTUS_MAX_DM (and with
-  // it cactusMaxTop, the sky early-outs' bound) is the top of this table.
+  // Dimensions in TENTHS OF A METRE, converted below (a saguaro tops out at
+  // 5.2 m, a barrel at 0.9; the sky bound reads the built cactus, cactusVTop).
   let j = i32((hsh >> 12u) % 5u);
   var hDm = 0;
   var rDm = 0;
@@ -3176,6 +3173,51 @@ fn cactusInfo(tx : i32, tz : i32, seed : u32, ponds : ptr<function, PondSet>) ->
   c.radius = max(rDm * VOX_PER_M / 10, 2);
   c.present = true;
   return c;
+}
+
+// The tile's cactus as column (x, z)'s cactusAt sees it: cactusInfoBare plus
+// the asking column's pond gate.
+fn cactusInfo(tx : i32, tz : i32, seed : u32, ponds : ptr<function, PondSet>) -> Cactus {
+  var c = cactusInfoBare(tx, tz, seed);
+  if (c.present && pondCoversP(ponds, c.wx, c.wz)) { c.present = false; }
+  return c;
+}
+
+// HORIZONTAL reach of a cactus from its axis. Must cover the widest thing the
+// species can produce or the outer arm gets sliced off at an invisible
+// cylinder: a saguaro arm reaches radius*3 + jitter from the axis, plus its own
+// thickness. One function for cactusAt's reject and the sky bound, so the two
+// cannot disagree about which columns a cactus can touch.
+fn cactusReach(c : Cactus) -> i32 {
+  return select(c.radius + 2, c.radius * 6 + 4, c.species == 0u);
+}
+// VERTICAL extent: the highest y the cactus can put a cell at (cactusAt's
+// clip; + 2 covers the bloom sitting one voxel above the tip).
+fn cactusVTop(c : Cactus) -> i32 { return c.base + c.height + 2; }
+
+// THE CACTUS SKY BOUND OF ONE COLUMN (map v2 P1). The highest y any cactus can
+// put a cell at in column (x, z): the max of cactusVTop over the 3x3 tiles
+// cactusAt scans, for the bare cactus of each tile (no pond gate: only ever
+// more cacti, so only ever a higher bound) within cactusReach of the column --
+// exactly cactusAt's AABB reject. -1048576 where none can reach. This is what
+// the sky early-outs add for a cactus-biome column; it replaced the world-wide
+// cactusMaxTop, which a 1,000 m treeline turned into "the desert's sky is
+// solid to 1 km". A cactus stands on its OWN tile's ground (cactusInfoBare's
+// base), which can be a higher neighbour column's -- why this is a scan and
+// not the column's `h` plus the tallest cactus.
+fn cactusColTop(x : i32, z : i32, seed : u32) -> i32 {
+  var top = -1048576;
+  let tx = fdiv(x, CACTUS_TILE);
+  let tz = fdiv(z, CACTUS_TILE);
+  // One rolled loop, one call site: every call is an inlined landColumn in
+  // `far` (the compile-cliff note at unrollFence).
+  for (var i = unrollFence(); i < (2 * CACTUS_SCAN + 1) * (2 * CACTUS_SCAN + 1); i++) {
+    let c = cactusInfoBare(tx + i % (2 * CACTUS_SCAN + 1) - CACTUS_SCAN,
+                           tz + i / (2 * CACTUS_SCAN + 1) - CACTUS_SCAN, seed);
+    let r = cactusReach(c);
+    if (c.present && abs(x - c.wx) <= r && abs(z - c.wz) <= r) { top = max(top, cactusVTop(c)); }
+  }
+  return top;
 }
 
 // Where arm `i` leaves the bole, and how far it reaches. Returns
@@ -3295,17 +3337,13 @@ fn cactusAt(x : i32, y : i32, z : i32, seed : u32, ponds : ptr<function, PondSet
     for (var ox = -CACTUS_SCAN + unrollFence(); ox <= CACTUS_SCAN; ox++) {
       let c = cactusInfo(tx + ox, tz + oz, seed, ponds);
       if (!c.present) { continue; }
-      // HORIZONTAL reject. Must cover the widest thing the species can produce
-      // or the outer arm gets sliced off at an invisible cylinder. A saguaro
-      // arm reaches radius*3 + jitter from the axis, plus its own thickness.
-      var reach = c.radius + 2;
-      if (c.species == 0u) { reach = c.radius * 6 + 4; }
+      // HORIZONTAL reject (cactusReach, shared with the sky bound).
+      let reach = cactusReach(c);
       if (abs(x - c.wx) > reach || abs(z - c.wz) > reach) { continue; }
       // VERTICAL extent must cover the tallest thing the species can put above
       // its base. Clipping this is how canopies get flat tops (treeAt's vtop
       // comment); here it would behead the saguaro and its crown of flowers.
-      // + 2 covers the bloom sitting one voxel above the tip.
-      let vtop = c.base + c.height + 2;
+      let vtop = cactusVTop(c);
       if (y < c.base || y > vtop) { continue; }
       let m = cactusCell(c, x, y, z, seed);
       if (m != MAT_AIR) { return m; }
@@ -4709,6 +4747,9 @@ fn genCellIn(col : ptr<function, Col>,
   var mat = MAT_AIR;
 
   if (y <= h) {
+    // EVERY BRANCH OF THIS CHAIN AHEAD OF `mat = M_STONE` IS GATED BY A DEPTH
+    // UNDER h, and colDeepStoneTop (after this function) is the max of them:
+    // a new branch adds its depth there too.
     let submerged = pond >= 0;
     // SNOW IS A POWDER, which is why the rim keep-out is `!inRim` and not
     // merely `!inPoolFloor`: snow on a rim ring slides down its inner face
@@ -5087,6 +5128,37 @@ fn genCellIn(col : ptr<function, Col>,
   // STAMP_NEVER, not a live code: a generated voxel has not acted, so it must
   // be free to move on the first tick it is simulated.
   return packVox(mat, state, STAMP_NEVER);
+}
+
+// ---- THE DEEP STONE OF A COLUMN (map v2 P1) ---------------------------------
+// The highest y at and below which genCellIn's MATERIAL is M_STONE for every
+// cell the cave bands leave solid -- the bulk of a mountain. `far`'s sweep
+// uses it to answer a buried row sample without the call (a 1,400 m massif
+// is mostly such rows at every level). EXACT, not an estimate, and it is
+// exact because it is genCellIn's own `y <= h` chain read backwards: every
+// branch ahead of the final `mat = M_STONE` is gated `y > h - d` for a depth
+// d this max covers --
+//   road           (*col).road.depth (only where the column has a road)
+//   snow cap, mud  2
+//   bed            the preset's bed thickness (only under a pond)
+//   steep rock, sand cap   4
+//   skin           the biome's skinDepth
+//   sediment       (*col).sed
+// -- and every later block that can REPLACE a material is gated `y > h`,
+// `y == h` (moss), `mat == M_WATER` (pond life), `mat == MAT_AIR`, or
+// `y > h - 2 - WM_STAMP_SINK_MAX` (stamps), so it is covered by the 10.
+// inPoolFloor is M_STONE at every depth already. What is NOT covered here is
+// the carve, so the caller still asks caveIn (the bands it already holds).
+// ADD A BRANCH TO genCellIn's `y <= h` CHAIN, ADD ITS DEPTH HERE: the
+// `far-downsample` gate compares the sieve against the live grid genChunk
+// filled through genCellIn, so a missed depth shows up there.
+fn colDeepStoneTop(col : ptr<function, Col>) -> i32 {
+  var d = 2 + WM_STAMP_SINK_MAX;
+  d = max(d, select(0, (*col).road.depth, (*col).road.mat != MAT_AIR));
+  d = max(d, select(0, wmWaterI((*col).wp, WM_W_BED_THICKNESS), (*col).pond >= 0));
+  d = max(d, max(4, i32(wmBiome((*col).biome, WM_B_SKIN_DEPTH))));
+  d = max(d, (*col).sed);
+  return (*col).h - d;
 }
 
 // One cell of a column the caller already holds, with nothing hoisted: the
@@ -5555,7 +5627,9 @@ fn farPeakTop(h : i32, ccx : i32, ccz : i32, shift : u32) -> i32 {
   }
   return top;
 }
-// The paint of a cell the peak raised: the column's skin, snow over the line.
+// The paint of a cell the peak raised: the column's skin, snow at or over the
+// COLUMN's treeline (Col.tl, map v2 A1; H1 was written against the one
+// world-wide treeline() A1 removed, and the merged shader did not compile).
 fn farPeakMat(biome : u32, peak : i32, tl : i32) -> u32 {
   return select(wmBiome(biome, WM_B_SKIN), M_SNOW, peak >= tl);
 }
@@ -6148,7 +6222,7 @@ fn wetbanksAll(@builtin(workgroup_id) wg : vec3<u32>,
 //     plant.top). Adding it here only declines skips, but would move the
 //     hash if that gap is ever hit, so it waits for a hash-moving package.
 //   an authored site's stamp              wmSiteTopAt
-//   cacti                                 cactusMaxTop(), cactus biomes only
+//   cacti                                 cactusColTop, cactus biomes only
 //
 // All the h-relative plant reaches collapse into one margin, which is
 // strictly conservative: over-estimating the ceiling only declines a skip.
@@ -6161,15 +6235,60 @@ fn wetbanksAll(@builtin(workgroup_id) wg : vec3<u32>,
 // skip either way) or above treeMaxTop() (and every candidate's top is below
 // that, so the term cannot decide the compare).
 //
-// CACTI HAVE NO COLUMN-LOCAL BOUND: a saguaro stands at a NEIGHBOURING tile's
-// ground height and cactusAt clips it against that site's own `base`, not
-// against this column's `h`. The bound is the world-wide one (cactusMaxTop:
-// a cactus roots only below the treeline), which still lets a cactus column's
-// sky skip.
+// CACTI: a saguaro stands at a NEIGHBOURING tile's ground height and cactusAt
+// clips it against that site's own `base`, not against this column's `h`, so
+// the column's bound is a scan of the tiles it can be reached from
+// (cactusColTop). Until map v2 P1 it was the world-wide cactusMaxTop
+// (treelineMax + the tallest cactus), which on a map with a 1,000 m treeline
+// held every desert column's sky open to 1 km. The scan reads the block's
+// cactus tiles from workgroup memory (wgCactTilesFill below): the same tiles,
+// the same reject, the same max as cactusColTop, evaluated once per block.
+//
+// HASH-NEUTRAL BY CONSTRUCTION: colTop only decides where genChunk stops
+// asking genCellIn and writes air, and the new bound is still >= every cactus
+// cell's y (cactusAt places a cell only inside a present tile's reach and
+// below its cactusVTop; the bound drops only the pond gate, which can only
+// remove a cactus). Lower ceiling, same cells.
 var<workgroup> wgColTop : atomic<i32>;
 var<workgroup> wgColTreeTop : atomic<i32>;
 var<workgroup> wgColMinH : atomic<i32>;
 var<workgroup> wgColMinGrainH : atomic<i32>;
+
+// The block's cactus tiles (the tree tile cache's shape): for the columns
+// [bx, bx + CHUNK) the tile fdiv(x, CACTUS_TILE) spans at most
+// (CHUNK - 1) / CACTUS_TILE + 1 tiles, and cactusColTop's scan adds
+// CACTUS_SCAN on each side. Per tile: the bare cactus's (wx, wz, reach,
+// vtop), vtop -1048576 when there is none.
+const WG_CACT_AXIS : i32 = (i32(CHUNK) - 1) / CACTUS_TILE + 2 + 2 * CACTUS_SCAN;
+const WG_CACT_TILES : i32 = WG_CACT_AXIS * WG_CACT_AXIS;
+const_assert WG_CACT_TILES <= 64;
+var<workgroup> wgCact : array<vec4<i32>, WG_CACT_TILES>;
+
+fn wgCactOrigin(b : i32) -> i32 { return fdiv(b, CACTUS_TILE) - CACTUS_SCAN; }
+
+// Called by the whole workgroup in uniform control flow; the caller barriers.
+fn wgCactTilesFill(li : u32, bx : i32, bz : i32, seed : u32) {
+  let tx0 = wgCactOrigin(bx);
+  let tz0 = wgCactOrigin(bz);
+  for (var i = i32(li); i < WG_CACT_TILES; i += 64) {
+    let c = cactusInfoBare(tx0 + i % WG_CACT_AXIS, tz0 + i / WG_CACT_AXIS, seed);
+    wgCact[i] = vec4<i32>(c.wx, c.wz, cactusReach(c), select(-1048576, cactusVTop(c), c.present));
+  }
+}
+
+// cactusColTop, reading the block's cache: same 3x3 tiles, same reject.
+fn wgCactColTop(x : i32, z : i32, bx : i32, bz : i32) -> i32 {
+  var top = -1048576;
+  let tx = fdiv(x, CACTUS_TILE) - wgCactOrigin(bx);
+  let tz = fdiv(z, CACTUS_TILE) - wgCactOrigin(bz);
+  for (var oz = -CACTUS_SCAN + unrollFence(); oz <= CACTUS_SCAN; oz++) {
+    for (var ox = -CACTUS_SCAN; ox <= CACTUS_SCAN; ox++) {
+      let t = wgCact[(tz + oz) * WG_CACT_AXIS + tx + ox];
+      if (abs(x - t.x) <= t.z && abs(z - t.y) <= t.z) { top = max(top, t.w); }
+    }
+  }
+  return top;
+}
 
 @compute @workgroup_size(64)
 fn cols(@builtin(workgroup_id) wg : vec3<u32>,
@@ -6191,6 +6310,7 @@ fn cols(@builtin(workgroup_id) wg : vec3<u32>,
     atomicStore(&wgColMinGrainH, 1048576);
   }
   treeTilesFill(li, bx, bz, T.seed);
+  wgCactTilesFill(li, bx, bz, T.seed);
   workgroupBarrier();
   let blk = wg.x * CC_BLOCK;
   var top = -1048576;
@@ -6290,7 +6410,7 @@ fn cols(@builtin(workgroup_id) wg : vec3<u32>,
     colTop = max(colTop, col.pond + 1);
     colTop = max(colTop, wmSiteTopAt(x, z));
     colTop = max(colTop, trees.top);
-    if (wmFlag(col.biome, WM_BF_CACTI)) { colTop = max(colTop, cactusMaxTop()); }
+    if (wmFlag(col.biome, WM_BF_CACTI)) { colTop = max(colTop, wgCactColTop(x, z, bx, bz)); }
     ccStore(blk + CC_HDR + ci * CC_WORDS, &col, &cave, ponds.n, canopy, colTop, trees.top);
     // Low byte the top cell's grains, next byte h - sedTop (clamped: 255 is
     // deeper than any wedge, i.e. the whole wedge is firm).
@@ -6546,9 +6666,11 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
     //                 to cover by being taller than anything: the h-relative
     //                 plant reach (skyMargin), the pond life (pond + 1) and the
     //                 tile plant standing on this column (cells end at
-    //                 plant.top). CACTI have no column-local bound, so a
-    //                 cactus-biome column adds the world-wide cactusMaxTop(),
-    //                 as genChunk does.
+    //                 plant.top). CACTI: a cactus-biome column adds its own
+    //                 cactus bound (cactusColTop, map v2 P1), as genChunk does;
+    //                 until then it was the world-wide cactusMaxTop, 1 km of
+    //                 open sky over every desert column of a map whose
+    //                 treeline is 1,000 m.
     // Everything else genCellIn can put above ground is a gas, and
     // farCellIsSolid drops those already. Rows ascend, so the first row past
     // the ceiling ends the column: its bytes and every later row's stay 0.
@@ -6557,18 +6679,30 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
     // for byte (the `far-downsample` gate).
     var skyCeil = max(max(topC + step, btop), trees.top);
     skyCeil = max(skyCeil, max(col.h + skyMargin, max(col.pond + 1, col.plant.top)));
-    if (wmFlag(col.biome, WM_BF_CACTI)) { skyCeil = max(skyCeil, cactusMaxTop()); }
+    if (wmFlag(col.biome, WM_BF_CACTI)) { skyCeil = max(skyCeil, cactusColTop(fx, fz, T.seed)); }
     // The peak the cell footprint's authored posts reach (farPeakTop): rows
     // up to it are not sky either.
     let peak = farPeakTop(col.h, cc0.x, cc0.z, shift);
     skyCeil = max(skyCeil, peak);
+    // THE BURIED ROWS (map v2 P1): a sample at or under colDeepStoneTop that
+    // the cave bands leave solid is M_STONE -- genCellIn's own answer there,
+    // by colDeepStoneTop's enumeration of its chain -- so it is answered
+    // without the call. The bands are genCellIn's `caveValid` ones: every such
+    // sample is <= h, so colPrologue computed them unless the column is a rim,
+    // where genCellIn carves nothing either. Everything after the material
+    // (the blocker band, farSurfaceMat, the palette) is unchanged, so the
+    // byte is the one the call would have produced.
+    let deepTop = colDeepStoneTop(&col);
     for (var yi = unrollFenceU(); yi < CHUNK; yi++) {
       // The row's floor.
       let yRow = (base.y + i32(yi)) << shift;
       if (yRow > skyCeil) { break; }
       let fine = vec3<i32>(fx, yRow + half, fz);
-      let mat = genCellIn(&col, &cave, true, &trees, true, &ponds, canopyArg,
-                          fine.x, fine.y, fine.z, T.seed) & 0xFFFu;
+      var mat = M_STONE;
+      if (fine.y > deepTop || (!col.inRim && caveIn(cave, fine.y) != 0)) {
+        mat = genCellIn(&col, &cave, true, &trees, true, &ponds, canopyArg,
+                        fine.x, fine.y, fine.z, T.seed) & 0xFFFu;
+      }
       // The conservative flag first: it is what a cell keeps when the centre
       // sample found nothing (common.wgsl FAR_PAL_BLOCKER), on the hoisted
       // topC/btop.

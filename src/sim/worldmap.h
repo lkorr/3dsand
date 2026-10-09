@@ -211,7 +211,8 @@ enum : uint32_t {
   kHBiomePostsZ = 64,
   // Map v2 A1: the highest any column's treeline can be (PackWorldMap, over
   // every biome's treelineScale and the jitter) -- the world-wide bound
-  // treeMaxTop / cactusMaxTop give the sky early-outs. Read by the GPU only.
+  // treeMaxTop gives the sky early-outs (cacti: per column, worldgen.wgsl
+  // cactusColTop). Read by the GPU only.
   kHTreelineMax = 65,
   kHeaderWords = 72,    // padded, like treeatlas::kFileHeaderWords
 };

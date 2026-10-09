@@ -257,6 +257,7 @@ struct Scene {
   uint64_t farEntries = 0, farTicks = 0, farBiggest = 0, farCapped = 0;
   size_t farPendingMax = 0;
   uint32_t pagesPeak = 0;
+  std::string pagesPeakWhy;   // what the pages were at the peak (rule 6)
   int eyeYMin = INT_MAX, eyeYMax = INT_MIN;
   std::string prevMap;   // the map a map-switching setup restores in verify
 };
@@ -1266,7 +1267,8 @@ void VerifySurfaceSprint(Scene& s) {
 // shift, the page pool filling with buried bulk, worldgen chunks that are all
 // stone, and far planes on every level at once. The route is sprint flight
 // (player.flySprint, per tick from the tick counter as surface-sprint does)
-// at a pinned 3.5 m over max(ground, sea):
+// at a pinned 3.5 m over max(ground, sea), the height itself moving at most
+// the sprint speed a tick (DrivePeaksRoute):
 //   summit (9000, 16000) ~1,400 m
 //   -> the gorge floor due east (12533, 16000), 600 m down in ~350 m
 //   -> the high valley (-13000, 14000) ~900 m, back over the massif.
@@ -1355,7 +1357,15 @@ void DrivePeaksRoute(Scene& s, uint32_t, TickOps&) {
   const uint32_t t = s.flightTick++;
   const float speed = CurrentTuning().player.flySprint / kVoxelMeters * kTickDt;
   const float d = std::min((float)t * speed, PeaksRouteLen());
-  const Vec3 e = PeaksRouteAt(d);
+  Vec3 e = PeaksRouteAt(d);
+  // THE CLIMB IS FLOWN, NOT TELEPORTED: the eye's height moves at most the
+  // sprint speed a tick toward the pinned height. Unclamped, the pin went up
+  // the gorge wall (a 600 m face) in a handful of ticks -- a 1,000-voxel jump
+  // in one tick reset whole far levels as a teleport would (measured: 7 gap
+  // resets, worst gap 33 level-1 chunks), which no player can do. Clamped, a
+  // steep climb runs inside the rock face for a while; the window and the
+  // cascades still only ever move at the speed a player can.
+  if (t > 0) e.y = std::clamp(e.y, s.eye.y - speed, s.eye.y + speed);
   // Look along the leg being flown, a little down.
   const Vec3 ahead = PeaksRouteAt(std::min(d + 200.0f, PeaksRouteLen()));
   if (std::fabs(ahead.x - e.x) + std::fabs(ahead.z - e.z) > 1.0f)
@@ -1380,6 +1390,22 @@ void VerifyPeaksRoute(Scene& s) {
                 s.farPendingMax, s.far ? s.far->PendingFills() : (size_t)0);
   s.note += extra;
   std::printf("  peaks-route %s\n", extra + 5);
+  // Why the far queue is what it is: planes queued by recentring, levels
+  // reset whole because a face fell a box behind (coalesced) or the gap
+  // passed a box (teleport-like), and the worst recentre gap seen.
+  if (s.far) {
+    std::printf("  peaks-route far field: %llu planes, %llu resets (%llu coalesced, %llu gap), "
+                "worst gap %u level-chunks at level %u\n",
+                (unsigned long long)s.far->PlanesIssued(),
+                (unsigned long long)s.far->ResetsIssued(),
+                (unsigned long long)s.far->CoalescedResets(),
+                (unsigned long long)s.far->GapResetsIssued(), s.far->WorstGap(),
+                s.far->WorstGapLevel());
+  }
+  if (!s.pagesPeakWhy.empty()) {
+    std::printf("  peaks-route page pool %s\n", s.pagesPeakWhy.c_str());
+    s.note += "  |  page pool " + s.pagesPeakWhy;
+  }
   s.far = nullptr;
   if (!s.prevMap.empty()) {
     std::string why;
@@ -1866,8 +1892,34 @@ Run PerfRunner::Record(const Scenario& scIn) {
           s.farBiggest = std::max<uint64_t>(s.farBiggest, farCount);
           if (farCount >= (uint32_t)CurrentTuning().render.farPlaneFillRate) s.farCapped++;
         }
-        if (world_.pages)
-          s.pagesPeak = std::max(s.pagesPeak, (uint32_t)world_.pages->PagesInUse());
+        // THE PEAK, ATTRIBUTED: a page count alone is a bare count. At each
+        // new high, every slot holding a page is split by the published
+        // snapshot's occupancy (empty / partial / full) and by whether the
+        // mirror holds it dirty, plus the retire queue -- "full and clean" is
+        // the share a sentinel could have held (buried bulk a wake or a ring
+        // paged in), "partial" the surface band, which genuinely needs one.
+        if (world_.pages && world_.pages->PagesInUse() > s.pagesPeak) {
+          s.pagesPeak = world_.pages->PagesInUse();
+          const WorldSnapshot& sn = world_.Snap();
+          uint32_t em = 0, pa = 0, fu = 0, fuClean = 0, unk = 0, dirty = 0;
+          for (uint32_t slot = 0; slot < kNumSlots; slot++) {
+            if (world_.PageOffsetOfSlot(slot) == World::kNoPage) continue;
+            const bool d = world_.pages->CpuDirty().Has(slot);
+            if (d) dirty++;
+            if (!sn.valid || slot >= sn.occupancy.size()) { unk++; continue; }
+            const uint32_t n = sn.occupancy[slot] & 0xFFFFu;
+            if (n == 0) em++;
+            else if (n == kChunkVol) { fu++; if (!d) fuClean++; }
+            else pa++;
+          }
+          char why[320];
+          std::snprintf(why, sizeof why,
+                        "peak %u pages at eye y%d: %u empty, %u partial, %u full "
+                        "(%u not cpuDirty), %u unknown; cpuDirty %u; retire queue %u",
+                        s.pagesPeak, (int)s.eye.y, em, pa, fu, fuClean, unk, dirty,
+                        world_.pages->RetireQueueDepth());
+          s.pagesPeakWhy = why;
+        }
       }
 
       // SubmitTick BILLS ITSELF now (measure/perfscope.h), in five spans —

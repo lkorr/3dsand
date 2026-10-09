@@ -1475,6 +1475,8 @@ void Stream::ApplyGenVerdict(const std::vector<uint32_t>& genSlots,
     std::vector<uint32_t> cands;
     cands.reserve(genSlots.size());
     uint32_t skyDemoted = 0, skyHeld = 0, fullDemoted = 0;
+    uint32_t fullNoVerdict = 0, fullCpuDirty = 0, fullSnapDirty = 0, fullReached = 0,
+             fullMixed = 0;
     for (size_t i = 0; i < genSlots.size(); i++) {
       if (isStale(i)) continue;
       const uint32_t gs = genSlots[i];
@@ -1524,6 +1526,12 @@ void Stream::ApplyGenVerdict(const std::vector<uint32_t>& genSlots,
       // any of them takes the word copy exactly as before; so does one whose
       // verdict was not published (a failed map fills act with 1s).
       const uint32_t v = i < act.size() ? act[i] : 0u;
+      // WHY a full chunk went to the word copy instead (PtDbg attribution,
+      // map v2 P1): the first condition that refused it.
+      if ((v & kGenVerdictValid) == 0u) fullNoVerdict++;
+      else if (world_->pages->CpuDirty().Has(gs)) fullCpuDirty++;
+      else if (snap.valid && snap.dirtyFlags[gs]) fullSnapDirty++;
+      else if (world_->pages->ReachTick(gs) >= genTick) fullReached++;
       if ((v & kGenVerdictValid) != 0u &&
           !world_->pages->CpuDirty().Has(gs) &&
           !(snap.valid && snap.dirtyFlags[gs]) &&
@@ -1532,6 +1540,8 @@ void Stream::ApplyGenVerdict(const std::vector<uint32_t>& genSlots,
         if (e != PageTable::kNeedsPage) {
           world_->pages->SetSentinel(gs, e);
           fullDemoted++;
+        } else {
+          fullMixed++;
         }
         continue;
       }
@@ -1551,9 +1561,11 @@ void Stream::ApplyGenVerdict(const std::vector<uint32_t>& genSlots,
     IssueDemoteCopies(cands, keys, tick);
     if (PtDbg())
       std::printf("[pt-time] shift demote: gen=%zu cands=%zu sky=%u held=%u "
-                  "full-by-verdict=%u\n",
+                  "full-by-verdict=%u full-kept=%u | cands because noverdict=%u "
+                  "cpudirty=%u snapdirty=%u reached=%u\n",
                   genSlots.size(), cands.size(), skyDemoted, skyHeld,
-                  fullDemoted);
+                  fullDemoted, fullMixed, fullNoVerdict, fullCpuDirty, fullSnapDirty,
+                  fullReached);
   }
 
   // ---- and only now, THE WAKE ------------------------------------------
@@ -1698,6 +1710,8 @@ void Stream::HarvestDemotes(uint32_t tick) {
   constexpr uint32_t kDemoteMaxRetries = 4;
   const bool dbg = PtDbg();
   uint32_t demoted = 0, retried = 0, harvested = 0, dropped = 0;
+  // PtDbg attribution (map v2 P1): why a copied chunk was NOT demoted.
+  uint32_t hMoved = 0, hDirty = 0, hKept = 0;
   double cpyMs = 0.0, clsMs = 0.0;
   while (!demotes_.empty() && demotes_.front().map.Ready()) {
     PendingDemote d = std::move(demotes_.front());
@@ -1726,7 +1740,7 @@ void Stream::HarvestDemotes(uint32_t tick) {
         // classifying chunk A's bytes into chunk B's table row is silent
         // corruption of the worst kind.
         if (World::PackChunkKey(world_->SlotToWorldChunk(s)) != d.keys[i])
-          continue;
+          { hMoved++; continue; }
         if (world_->PageOffsetOfSlot(s) == World::kNoPage) continue;  // demoted already
         const bool untouched = world_->pages->ReachTick(s) < d.copyTick;
         if (!fresh && !untouched) {
@@ -1738,12 +1752,12 @@ void Stream::HarvestDemotes(uint32_t tick) {
           }
           continue;
         }
-        if (world_->pages->CpuDirty().Has(s)) continue;  // written since the copy
+        if (world_->pages->CpuDirty().Has(s)) { hDirty++; continue; }  // written since the copy
         const double k0 = dbg ? PtNowMs() : 0.0;
         const uint32_t e =
             world_->pages->Classify(s, demoteScratch_.data() + i * kChunkVol);
         if (dbg) clsMs += PtNowMs() - k0;
-        if (e == PageTable::kNeedsPage) continue;
+        if (e == PageTable::kNeedsPage) { hKept++; continue; }
         world_->pages->SetSentinel(s, e);
         demoted++;
       }
@@ -1759,9 +1773,10 @@ void Stream::HarvestDemotes(uint32_t tick) {
   if (demoted) world_->pages->FlushTableWrites(ctx_->queue);
   if (dbg && (harvested || retried || dropped))
     std::printf("[pt-time] demote harvest: batches=%u demoted=%u retried=%u "
-                "dropped=%u queued=%zu (memcpy %.2f ms, classify %.2f ms)\n",
-                harvested, demoted, retried, dropped, demotes_.size(), cpyMs,
-                clsMs);
+                "dropped=%u queued=%zu not: moved=%u dirty=%u kept=%u "
+                "(memcpy %.2f ms, classify %.2f ms)\n",
+                harvested, demoted, retried, dropped, demotes_.size(), hMoved, hDirty,
+                hKept, cpyMs, clsMs);
 }
 
 void Stream::FoldSnapshot() {
