@@ -1,6 +1,7 @@
 #include "game/anatomy_resolve.h"
 
 #include <algorithm>
+#include <cmath>
 #include <unordered_set>
 
 namespace anatomy {
@@ -54,19 +55,36 @@ struct Carve {
   double box[3][2] = {{0, 0}, {0, 0}, {0, 0}};
   int depthMin = 0, depthMax = 254;
   int stripeAxis = -1, stripePeriod = 0, stripeWidth = 0;
+  int core = -1;           // -1 = no `core` test
 };
 
 std::vector<Carve> CarveFor(const nlohmann::json& recipe,
                             const std::string& limb) {
   std::vector<Carve> out;
-  if (!recipe.contains("limbs") || !recipe["limbs"].is_object() ||
-      limb.empty() || !recipe["limbs"].contains(limb))
-    return out;
-  const nlohmann::json& L = recipe["limbs"][limb];
-  if (!L.is_object() || !L.contains("carve") || !L["carve"].is_array())
-    return out;
+  // A limb's own `carve`, else the recipe's DEFAULT `carve` (the long bones)
+  // -- only for a limb on the default `layers` (anatomy.js carveFor says why);
+  // an explicit `"carve": []` is a limb opting out of the default.
+  const nlohmann::json* src = nullptr;
+  bool ownLayers = false;
+  if (recipe.contains("limbs") && recipe["limbs"].is_object() &&
+      !limb.empty() && recipe["limbs"].contains(limb)) {
+    const nlohmann::json& L = recipe["limbs"][limb];
+    if (L.is_object() && L.contains("carve") && L["carve"].is_array())
+      src = &L["carve"];
+    // JS truthiness of `L.layers`: present and not null/false/0/"".
+    if (L.is_object() && L.contains("layers")) {
+      const nlohmann::json& ly = L["layers"];
+      ownLayers = !(ly.is_null() || (ly.is_boolean() && !ly.get<bool>()) ||
+                    (ly.is_number() && ly.get<double>() == 0) ||
+                    (ly.is_string() && ly.get<std::string>().empty()));
+    }
+  }
+  if (!src && !ownLayers && recipe.contains("carve") &&
+      recipe["carve"].is_array())
+    src = &recipe["carve"];
+  if (!src) return out;
   static const char* kAxes[3] = {"x", "y", "z"};
-  for (const nlohmann::json& c : L["carve"]) {
+  for (const nlohmann::json& c : *src) {
     if (!c.is_object()) continue;
     Carve e;
     e.material = c.value("material", std::string());
@@ -94,6 +112,11 @@ std::vector<Carve> CarveFor(const nlohmann::json& recipe,
       e.stripeWidth = s.value("width", 0);
       if (e.stripePeriod <= 0) e.stripeAxis = -1;
     }
+    // JS: Number.isInteger(c.core) && c.core >= 0.
+    if (c.contains("core") && c["core"].is_number()) {
+      const double v = c["core"].get<double>();
+      if (v >= 0 && v == std::floor(v)) e.core = (int)v;
+    }
     out.push_back(std::move(e));
   }
   return out;
@@ -102,9 +125,11 @@ std::vector<Carve> CarveFor(const nlohmann::json& recipe,
 // anatomy.js `carveMatches`. The box test is (l + 0.5) / n in [lo, hi), the
 // same double arithmetic JS does, so both sides pick the same cells.
 bool CarveMatches(const Carve& c, int whereId, int layerId, const int l[3],
-                  const IVec3& size, int depth) {
+                  const IVec3& size, int depth, int coreDepth, int coreMax) {
   if (!c.where.empty() && whereId != layerId) return false;
   if (depth < c.depthMin || depth > c.depthMax) return false;
+  if (c.core >= 0 && (coreDepth < 0 || coreDepth < coreMax - c.core))
+    return false;
   const int n[3] = {size.x, size.y, size.z};
   for (int a = 0; a < 3; a++) {
     if (!c.hasBox[a]) continue;
@@ -114,6 +139,83 @@ bool CarveMatches(const Carve& c, int whereId, int layerId, const int l[3],
   if (c.stripeAxis >= 0 && l[c.stripeAxis] % c.stripePeriod >= c.stripeWidth)
     return false;
   return true;
+}
+
+// anatomy.js `coreAxis`: the limb's LONGEST box axis, ties to y, then x.
+int CoreAxis(const IVec3& d) {
+  if (d.y >= d.x && d.y >= d.z) return 1;
+  return d.x >= d.z ? 0 : 2;
+}
+
+// anatomy.js `coreField`: each voxel's IN-SLICE depth (4-connected steps to
+// the outline of its cross-section across CoreAxis) and each slice's deepest.
+// BFS distances are order-independent, so this matches the JS exactly.
+struct CoreField {
+  int axis = 1;
+  std::vector<int> depth;  // dense model-local index, -1 = empty
+  std::vector<int> max;    // per slice index along `axis`
+};
+
+CoreField MakeCoreField(const PrefabModel& m, const std::vector<uint8_t>& union_,
+                        const IVec3& pdim) {
+  CoreField cf;
+  const IVec3 d = m.size;
+  cf.axis = CoreAxis(d);
+  const int dimA[3] = {d.x, d.y, d.z};
+  const size_t n = (size_t)std::max(d.x, 0) * std::max(d.y, 0) * std::max(d.z, 0);
+  const size_t strA[3] = {1, (size_t)d.x, (size_t)d.x * d.y};
+  std::vector<uint8_t> solid(n, 0);
+  for (const PrefabVoxel& v : m.voxels)
+    if (v.x >= 0 && v.y >= 0 && v.z >= 0 && v.x < d.x && v.y < d.y && v.z < d.z)
+      solid[(size_t)v.x + v.y * strA[1] + v.z * strA[2]] = 1;
+  const int plane[3][2] = {{1, 2}, {0, 2}, {0, 1}};
+  const int ua = plane[cf.axis][0], va = plane[cf.axis][1];
+  std::vector<int> flat(n, -1);
+  std::vector<size_t> queue;
+  queue.reserve(n);
+  const auto coord = [&](size_t i, int c[3]) {
+    c[0] = (int)(i % (size_t)d.x);
+    c[1] = (int)((i / (size_t)d.x) % (size_t)d.y);
+    c[2] = (int)(i / strA[2]);
+  };
+  for (size_t i = 0; i < n; i++) {
+    if (!solid[i]) continue;
+    int c[3];
+    coord(i, c);
+    bool edge = false;
+    for (int a : {ua, va}) {
+      if (c[a] == 0 || !solid[i - strA[a]]) edge = true;
+      if (c[a] == dimA[a] - 1 || !solid[i + strA[a]]) edge = true;
+    }
+    if (edge) { flat[i] = 0; queue.push_back(i); }
+  }
+  for (size_t h = 0; h < queue.size(); h++) {
+    const size_t i = queue[h];
+    int c[3];
+    coord(i, c);
+    for (int a : {ua, va})
+      for (int s : {-1, 1}) {
+        const int k = c[a] + s;
+        if (k < 0 || k >= dimA[a]) continue;
+        const size_t j = s < 0 ? i - strA[a] : i + strA[a];
+        if (solid[j] && flat[j] < 0) { flat[j] = flat[i] + 1; queue.push_back(j); }
+      }
+  }
+  cf.depth.assign(n, -1);
+  cf.max.assign((size_t)std::max(dimA[cf.axis], 0), 0);
+  const size_t psy = (size_t)pdim.x, psz = (size_t)pdim.x * pdim.y;
+  for (size_t i = 0; i < n; i++) {
+    if (!solid[i]) continue;
+    int c[3];
+    coord(i, c);
+    const int px = c[0] + m.offset.x, py = c[1] + m.offset.y, pz = c[2] + m.offset.z;
+    if (px < 0 || py < 0 || pz < 0 || px >= pdim.x || py >= pdim.y || pz >= pdim.z)
+      continue;
+    if (union_[(size_t)px + py * psy + pz * psz] == kDepthEmpty) continue;
+    cf.depth[i] = flat[i];
+    if (flat[i] > cf.max[(size_t)c[cf.axis]]) cf.max[(size_t)c[cf.axis]] = flat[i];
+  }
+  return cf;
 }
 
 // anatomy.js `layerIndexAt`: layers are consumed outermost first, each `depth`
@@ -369,6 +471,10 @@ Report Resolve(Prefab& prefab, const nlohmann::json& recipe,
     }
     for (int id : carveId)
       if (id) interior.insert(id);
+    bool anyCore = false;
+    for (const Carve& c : carve) anyCore |= c.core >= 0;
+    CoreField cf;
+    if (anyCore) cf = MakeCoreField(m, depth, dim);
     for (PrefabVoxel& v : m.voxels) {
       const int px = v.x + m.offset.x, py = v.y + m.offset.y,
                 pz = v.z + m.offset.z;
@@ -392,9 +498,16 @@ Report Resolve(Prefab& prefab, const nlohmann::json& recipe,
       }
       if (!L.keep) {
         const int l[3] = {v.x, v.y, v.z};
+        int coreDepth = -1, coreMax = 0;
+        if (anyCore) {
+          coreDepth = cf.depth[(size_t)v.x + (size_t)v.y * m.size.x +
+                               (size_t)v.z * m.size.x * m.size.y];
+          coreMax = cf.max[(size_t)l[cf.axis]];
+        }
         for (size_t k = 0; k < carve.size(); k++)
           if (carveId[k] && CarveMatches(carve[k], carveWhere[k],
-                                         ids[(size_t)li], l, m.size, (int)d))
+                                         ids[(size_t)li], l, m.size, (int)d,
+                                         coreDepth, coreMax))
             mat = carveId[k];
       }
       if (!mat) continue;                                 // unresolved: leave
