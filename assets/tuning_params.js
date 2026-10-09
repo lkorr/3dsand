@@ -1050,7 +1050,7 @@ const TUNING_PARAMS = {
   'render.asyncCompute':{t:'b',def:false},
   'render.sunDir':{t:'v3',def:[0.5,0.55,0.38]},
   'render.fogOpticalDepths':{t:'f',def:4.5,min:0.5,max:20},
-  'render.fogSeaDensity':{t:'f',def:0.2,min:0,max:20},
+  'render.fogSeaDensity':{t:'f',def:0.12,min:0,max:20},
   'render.fogScaleHeight':{t:'f',def:1200,min:50,max:20000},
   'render.fogHaze':{t:'f',def:0.6,min:0,max:1},
   'render.horizon':{t:'b',def:true},

@@ -16651,7 +16651,7 @@ a voxel or two wide.
 
 **The air: height fog.** The fog is now the atmosphere's, not the LOD's:
 extinction `rho(y) = fogSeaDensity * exp(-(y - sea) / fogScaleHeight)`
-(`render.fogSeaDensity` per km at the map's sea plane, 0.2; `render.fogScale
+(`render.fogSeaDensity` per km at the map's sea plane, 0.12; `render.fogScale
 Height` 1,200 m), integrated exactly along each view ray in closed form
 (`airFogTauS`): a valley is hazy, a summit is clear, and a ray climbing out of
 the haze sees through it. Both rows are `NO_WGSL` and ride `RenderParams`

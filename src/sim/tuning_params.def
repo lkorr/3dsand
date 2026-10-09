@@ -2490,7 +2490,7 @@ TP_F(render, fogOpticalDepths, NO_WGSL, 4.5f, 0.5f, 20.0f)
 // The height fog (H1): per-frame RenderParams fields, so NO_WGSL -- a slider
 // move is live and recompiles nothing. Density per km at the sea plane, the
 // e-folding height in metres, and the blue share of a part-fogged surface.
-TP_F(render, fogSeaDensity, NO_WGSL, 0.2f, 0.0f, 20.0f)
+TP_F(render, fogSeaDensity, NO_WGSL, 0.12f, 0.0f, 20.0f)
 TP_F(render, fogScaleHeight, NO_WGSL, 1200.0f, 50.0f, 20000.0f)
 TP_F(render, fogHaze, NO_WGSL, 0.6f, 0.0f, 1.0f)
 // The far horizon's march (sim/horizon.h): RenderParams flag bit 7.

@@ -13329,7 +13329,8 @@ fn traceHorizon(ro : vec3f, rd : vec3f, tStart : f32) -> HzHit {
       let w10 = hzSampleW(c + vec2<i32>(1, 0));
       let w01 = hzSampleW(c + vec2<i32>(0, 1));
       let w11 = hzSampleW(c + vec2<i32>(1, 1));
-      let hc = mix(max(vec4f(hzHi(w00), hzHi(w10), hzHi(w01), hzHi(w11)), vec4f(sea)),
+      let hc = mix(max(vec4f(hzHi(w00), hzHi(w10), hzHi(w01), hzHi(w11)),
+                       vec4f(hzSeaAt(sea, wB))),
                    vec4f(hzLo(w00), hzLo(w10), hzLo(w01), hzLo(w11)), wB);
       let cf = vec2f(c);
       // y - surface along the segment: the first sign change, found on four
@@ -13366,9 +13367,24 @@ fn traceHorizon(ro : vec3f, rd : vec3f, tStart : f32) -> HzHit {
     }
   }
   // Past the grid: the flat outer surface (the sea, or the plane's default
-  // where that is higher), analytically.
+  // where that is higher), analytically -- eased up from the cascade's own
+  // sea like the grid's (hzSeaAt), by one fixed-point step on the blend.
+  let outer = f32(hzI(HZ_H_OUTER_Y));
+  let def = select(outer, -1e9, outer <= sea);   // the default floor, if it is land
+  let P0 = o + d * T0;
+  let outside0 = any(P0 < vec2f(0.0)) || any(P0 > nMax);
+  if (outside0 && ro.y + ySc * T0 <= max(def, hzSeaAt(sea, 0.0))) {
+    // The ray leaves the cascade already under the outer surface (it passed
+    // over the cascade's lower sea): the surface is where it left.
+    out.hit = true;
+    out.t = T0 * S;
+    out.p = P0;
+    return out;
+  }
   if (rd.y < 0.0) {
-    let Tp = (f32(hzI(HZ_H_OUTER_Y)) - ro.y) / ySc;
+    var Tp = (outer - ro.y) / ySc;
+    let wP = clamp((Tp - T0) * S * VOXEL_METERS / HZ_BLEND_M, 0.0, 1.0);
+    if (wP < 1.0) { Tp = (max(def, hzSeaAt(sea, wP)) - ro.y) / ySc; }
     if (Tp >= T0 && Tp * S * VOXEL_METERS <= HZ_FAR_M) {
       let P = o + d * Tp;
       if (any(P < vec2f(0.0)) || any(P > nMax)) {
@@ -13379,6 +13395,19 @@ fn traceHorizon(ro : vec3f, rd : vec3f, tStart : f32) -> HzHit {
     }
   }
   return out;
+}
+
+// THE SEA AT THE SEAM. The level-8 cascade's sea is its cells' top, not the
+// sea plane: a cell is water when its CENTRE is, so the drawn surface is the
+// cell boundary above the last centre at or under the sea (y = 0 for a sea at
+// 112 and 25.6 m cells: 11 m low). A horizon sea at the true plane would stand
+// that much above it at the box face, and a ray grazing the cascade's sea
+// would see the step. So the horizon's sea starts at the cascade's and eases
+// to the plane over HZ_BLEND_M, the same blend `wB` the ground takes.
+fn hzSeaAt(sea : f32, wB : f32) -> f32 {
+  let st = f32(1u << farCellShift(FAR_LEVELS));
+  let seaQ = (floor((sea - 0.5 * st) / st) + 1.0) * st;
+  return mix(seaQ, sea, wB);
 }
 
 // The horizon's paint at sample-space point p, ground height y (fine voxels),
