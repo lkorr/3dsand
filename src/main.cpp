@@ -21,6 +21,7 @@
 #include <GLFW/glfw3.h>
 
 #include "audio/cues.h"
+#include "game/autopsy.h"
 #include "game/avatar.h"
 #include "sim/trample.h"
 #include "sim/plants.h"
@@ -1364,6 +1365,32 @@ struct SlotCoat {
     return best;
   }
 };
+
+// HOW EACH MATERIAL READS IN AN AUTOPSY (game/autopsy.h Kind), from the same
+// tables the health column's tissue counts use, so the post-mortem and the
+// triage cannot disagree about what is rot and what is char. A micro voxel's
+// material is 8 bits, hence 256.
+void AutopsyKinds(const BurnMats& burnMats, const TissueMats& tissueMats,
+                  const std::vector<MaterialDef>& mats, uint8_t out[256]) {
+  for (int m = 0; m < 256; m++) {
+    out[m] = autopsy::kOther;
+    if ((size_t)m >= mats.size()) continue;
+    for (const std::string& t : mats[(size_t)m].tags)
+      if (t == "organic" || t == "soft_tissue") out[m] = autopsy::kTissue;
+  }
+  for (uint32_t m : {tissueMats.skin, tissueMats.flesh, tissueMats.muscle,
+                     tissueMats.bone, tissueMats.brain})
+    if (m && m < 256) out[m] = autopsy::kTissue;
+  for (int m = 0; m < 256 && (size_t)m < mats.size(); m++)
+    for (const std::string& t : mats[(size_t)m].tags)
+      if (t == "hot") out[m] = autopsy::kBurn;
+  for (uint32_t m : burnMats.cooked)
+    if (m < 256) out[m] = autopsy::kBurn;
+  for (uint32_t m : burnMats.charred)
+    if (m < 256) out[m] = autopsy::kBurn;
+  for (uint32_t m : tissueMats.rot)
+    if (m < 256) out[m] = autopsy::kInfection;
+}
 
 void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
                 const TissueMats& tissueMats,
@@ -7280,13 +7307,40 @@ int main(int argc, char** argv) {
   // EVERY render pipeline when it changes. A portrait in RGBA8 beside a
   // BGRA8 swapchain would therefore rebuild the whole render pipeline set
   // TWICE PER FRAME for as long as the screen was open.
+  //
+  // EIGHT SIZES, ALL 5:7 (2026-10-08; UIState::portraitTierTex). The panel picks
+  // the largest that fits the screen each frame, and the death screen's
+  // post-mortem takes the biggest it can. Made and registered ONCE: a target
+  // re-made on a resize would free a descriptor set an in-flight frame may
+  // still sample. The aspect is the same at every tier, so the camera below
+  // (kPortraitW / kPortraitH) frames them all identically; only the pixel
+  // count changes. ~13 MiB for the set at BGRA8.
   constexpr uint32_t kPortraitW = 320, kPortraitH = 448;
-  rhi::Texture portraitTexture = ctx.device.CreateTexture(
-      {kPortraitW, kPortraitH, 1}, ctx.surfaceFormat,
-      rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::TextureBinding,
-      "avatarPortrait");
-  rhi::TextureView portraitView = portraitTexture.CreateView();
-  ui.portraitTex = overlay.RegisterTexture(portraitView);
+  constexpr uint32_t kPortraitTierW[UIState::kPortraitTiers] = {320, 360, 400, 440,
+                                                                 480, 560, 640, 720};
+  rhi::Texture portraitTierTexture[UIState::kPortraitTiers];
+  rhi::TextureView portraitTierView[UIState::kPortraitTiers];
+  for (int t = 0; t < UIState::kPortraitTiers; t++) {
+    const uint32_t tw = kPortraitTierW[t], th = tw * 7 / 5;
+    portraitTierTexture[t] = ctx.device.CreateTexture(
+        {tw, th, 1}, ctx.surfaceFormat,
+        rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::TextureBinding,
+        "avatarPortrait");
+    portraitTierView[t] = portraitTierTexture[t].CreateView();
+    ui.portraitTierTex[t].tex = overlay.RegisterTexture(portraitTierView[t]);
+    ui.portraitTierTex[t].w = (int)tw;
+    ui.portraitTierTex[t].h = (int)th;
+  }
+  rhi::TextureView portraitView = portraitTierView[0];
+  ui.portraitTex = ui.portraitTierTex[0].tex;
+  // THE AUTOPSY'S PEEL (game/autopsy.h): clones of the corpse's bricks with
+  // the outer layers cleared, drawn by the portrait pass in place of the real
+  // ones while a death screen asks for a peel. Render-only.
+  autopsy::Peeler autopsyPeeler;
+  // The death photograph's own bricks (DeathBody::Limb::frozenModel): clones
+  // of the corpse's skin taken just after death, freed on respawn.
+  std::vector<uint32_t> deathBricks;
+  uint64_t deathBricksEpoch = 0;
   // ---- THE ALCHEMY BENCH'S PICTURE (game/alchemy_bench.h) -----------------
   // Drawn on the CPU by the bench's sim and copied in each frame it is open
   // (rhi CopyBufferToTexture, from a staging buffer the queue writes). RGBA8
@@ -8014,8 +8068,43 @@ int main(int argc, char** argv) {
     ui.portraitPivotSlot = -1;
     ui.portraitReset = false;
     ui.portraitFocusSlot = -1;
+    // A new death opens on the post-mortem, at the skin, everything shown.
+    ui.autopsy.open = true;
+    ui.autopsy.peel = 0;
+    ui.autopsy.hideGear = false;
+    ui.autopsy.isolate = false;
     deathBody.yaw = avatarHeading;
-    CollectLimbBoxes(avatar, phys, deathBody.boxes);
+    deathBody.bricksFrozen = false;
+    // THE BODY AS ONE PIECE (PlayerAvatar::JointConsistentPose). The physics
+    // transforms at this instant can be mid-impulse: a blast flings a head
+    // that is still on its neck metres away for the tick the solver has not
+    // pulled it back yet, and a photograph of that tick shows a decapitation
+    // that never happened. Every part still jointed is put back on its joint
+    // (rotation kept); a part that is really gone has no body and is not here.
+    std::vector<Vec3> jPos;
+    std::vector<Quat> jRot;
+    std::vector<uint8_t> jHave;
+    // SANDVOX_DEATH_PHOTO_RAW=1: the old photograph (no snap, no pin), the
+    // control arm when a death still looks wrong.
+    static const bool kRawPhoto = std::getenv("SANDVOX_DEATH_PHOTO_RAW") != nullptr;
+    avatar.JointConsistentPose(jPos, jRot, jHave, kRawPhoto ? 1e9f : 1.0f);
+    // The boxes ride the same correction, so framing, limb focus and the
+    // outlines agree with the picture.
+    deathBody.boxes.boxes.clear();
+    if (avatar.Spawned() && avatar.Def()) {
+      const int limbCount = (int)avatar.Def()->limbs.size();
+      for (int i = 0; i < limbCount && i < (int)jHave.size(); i++) {
+        LimbBoxes::Box b;
+        if (!jHave[(size_t)i] || !LimbBoxCorners(avatar, phys, i, b.c)) continue;
+        Vec3 livePos; Quat liveRot;
+        if (avatar.PartWorldTransform(i, livePos, liveRot)) {
+          const Vec3 d = jPos[(size_t)i] - livePos;
+          for (Vec3& c : b.c) c = c + d;
+        }
+        b.slot = BodySlotFor(avatar.PartName(i), avatar.PartTag(i));
+        deathBody.boxes.boxes.push_back(b);
+      }
+    }
     // EVERY PART, not just the def's limbs: the box list above is deliberately
     // limbs-only so the framing is not thrown off by a held sword, but the
     // transform override has the opposite requirement — a garment shell or a
@@ -8027,12 +8116,34 @@ int main(int argc, char** argv) {
       DeathBody::Limb fl;
       fl.body = avatar.PartBody(i);
       if (!fl.body) continue;
-      Vec3 pos; Quat rot;
-      if (!avatar.PartWorldTransform(i, pos, rot)) continue;
+      if (i >= (int)jHave.size() || !jHave[(size_t)i]) continue;
+      const Vec3 pos = jPos[(size_t)i];
+      const Quat rot = jRot[(size_t)i];
+      // The joint, from the live corner and anchor (PartAnchorWorld), carried
+      // onto the snapped pose: anchorLimb = R^-1 (anchorWorld - corner).
+      {
+        Vec3 aLive, livePos;
+        Quat liveRot;
+        if (avatar.PartAnchorWorld(i, aLive) &&
+            avatar.PartWorldTransform(i, livePos, liveRot)) {
+          const Vec3 local = QuatRotateInv(liveRot, aLive - livePos);
+          fl.anchorWorld = pos + QuatRotate(rot, local);
+          fl.haveAnchor = true;
+        }
+        const Vec3 moved = pos - livePos;
+        const float d2 = moved.x * moved.x + moved.y * moved.y + moved.z * moved.z;
+        // One line per part the snap moved: a still that was wrong says why.
+        if (d2 > 0.25f)
+          std::fprintf(stderr, "death photo: %s put back on its joint (%.1f voxels)\n",
+                       avatar.PartName(i), std::sqrt(d2));
+      }
       fl.xf.pos[0] = pos.x; fl.xf.pos[1] = pos.y; fl.xf.pos[2] = pos.z;
       fl.xf.quat[0] = rot.x; fl.xf.quat[1] = rot.y;
       fl.xf.quat[2] = rot.z; fl.xf.quat[3] = rot.w;
       fl.haveLive = phys.GetTransform(fl.body, fl.lastLive);
+      fl.isLimb = avatar.Def() && i < (int)avatar.Def()->limbs.size();
+      fl.figSlot = fl.isLimb ? BodySlotFor(avatar.PartName(i), avatar.PartTag(i)) : -1;
+      std::snprintf(fl.name, sizeof fl.name, "%s", avatar.PartName(i));
       deathBody.limbs.push_back(fl);
     }
     deathBody.have = !deathBody.boxes.Empty() && !deathBody.limbs.empty();
@@ -12053,7 +12164,27 @@ int main(int argc, char** argv) {
           const uint64_t mid = mobs.MobIdAt(i);
           if (mid && !mobs.IsAlive(mid)) mobs.RemoveMob(mid);
         }
-        avatar.SeverByName("head");
+        // SANDVOX_SHOT_DEATH_BLAST=1: die to a BLAST beside the head instead
+        // (bug report 2026-10-08 17:10: a blast flung a still-attached head
+        // off the neck for the tick the photograph was taken on).
+        const int headPart = avatar.PartIndex("head");
+        Vec3 headAt;
+        if (std::getenv("SANDVOX_SHOT_DEATH_BLAST") && headPart >= 0 &&
+            avatar.PartCentreWorld(headPart, headAt)) {
+          for (int k = 0; k < 1; k++) {
+            ExplosionOp e{};
+            const int off = std::getenv("SANDVOX_SHOT_BLAST_OFF") ? std::atoi(std::getenv("SANDVOX_SHOT_BLAST_OFF")) : 3;
+            e.x = (int32_t)std::floor(headAt.x) + off - k;
+            e.y = (int32_t)std::floor(headAt.y) + 1;
+            e.z = (int32_t)std::floor(headAt.z) + k;
+            e.radius = std::getenv("SANDVOX_SHOT_BLAST_R") ? std::atoi(std::getenv("SANDVOX_SHOT_BLAST_R")) : 3;
+            e.power = std::getenv("SANDVOX_SHOT_BLAST_P") ? std::atoi(std::getenv("SANDVOX_SHOT_BLAST_P")) : 120;
+            session.pendingBlasts.push_back(e);
+          }
+          std::printf("--shot-inventory: blasting beside the player's head\n");
+        } else {
+          avatar.SeverByName("head");
+        }
         std::printf("--shot-inventory: took the player's head off "
                     "(health %d/%d, alive=%d)\n",
                     avatar.TotalHealth(), avatar.HealthMax(),
@@ -12070,7 +12201,21 @@ int main(int argc, char** argv) {
       // Sixth: the same corpse, turned. If the pose override ever stops
       // working this picture is the one that says so — by then the real
       // corpse has been ragdolling for a second and is nowhere near this.
-      if (frameCounter == kShotInvDeathTurnAt) ui.portraitYaw = 1.4f;
+      // ...and PEELED two layers (the autopsy, game/autopsy.h): the picture
+      // shows the flesh and muscle under the skin, the gear gone.
+      if (frameCounter == kShotInvDeathTurnAt) {
+        ui.portraitYaw = 1.4f;
+        ui.autopsy.peel = 2;
+        // ...from nearly straight above (the pitch reaches the poles now).
+        ui.portraitPitch = -1.45f;
+      }
+      // The probe held on the chest for both death pictures, so the
+      // UNDER CURSOR readout is in them.
+      if (frameCounter == kShotInvDeathFrame + 4) {
+        ui.autopsy.probeForce = true;
+        ui.autopsy.probeAt[0] = 0.5f;
+        ui.autopsy.probeAt[1] = 0.42f;
+      }
     }
     glfwPollEvents();
     double now = NowSeconds();
@@ -15758,6 +15903,36 @@ int main(int argc, char** argv) {
         // Re-key the frozen pose onto any limb a carve rebuilt since the last
         // frame (DeathBody::Follow): the corpse goes on being eaten.
         deathBody.Follow(phys);
+        // THE SKIN IS PHOTOGRAPHED TOO (owner, 2026-10-08: "a last frame of
+        // the body when it died"). A quarter second after death - long enough
+        // for the killing blow's own carve to land, which arrives after Die()
+        // - every frozen part's brick is CLONED, its corner fixed from its
+        // joint once, and from then on the portrait draws the clones: what
+        // burns, dissolves or is eaten off the corpse afterwards never reaches
+        // the picture or the autopsy's numbers. Render-only copies, freed on
+        // respawn.
+        constexpr float kDeathBrickFreezeSec = 0.25f;
+        static const bool kRawSkin = std::getenv("SANDVOX_DEATH_PHOTO_RAW") != nullptr;
+        if (!kRawSkin && !deathBody.bricksFrozen && ui.deathHoldSec >= kDeathBrickFreezeSec) {
+          deathBody.bricksFrozen = true;
+          deathBricksEpoch = mbSet.epoch;
+          for (DeathBody::Limb& fl : deathBody.limbs) {
+            Vec3 aLimb;
+            int model = -1;
+            if (!mobs.LimbAnchorByBody(fl.body, aLimb, &model)) continue;
+            if (fl.haveAnchor) {
+              const Quat q{fl.xf.quat[0], fl.xf.quat[1], fl.xf.quat[2], fl.xf.quat[3]};
+              const Vec3 corner = fl.anchorWorld - QuatRotate(q, aLimb);
+              fl.xf.pos[0] = corner.x; fl.xf.pos[1] = corner.y; fl.xf.pos[2] = corner.z;
+            }
+            fl.pinned = true;
+            if (model < 0) continue;
+            const int c = MicroBodyClone(mbSet, (uint32_t)model);
+            if (c < 0) continue;  // pool refused: the live brick is drawn
+            fl.frozenModel = c;
+            deathBricks.push_back((uint32_t)c);
+          }
+        }
       }
       ui.spellCost = caster.compiled.manaCost;
       ui.spellWord = caster.compiled.wordCost;
@@ -19199,7 +19374,23 @@ int main(int argc, char** argv) {
         ctx.queue.Submit(sEnc.Finish());
         ui.itemStage.texReady = true;
       }
+      // The autopsy's clones live only as long as the death screen that asked
+      // for them: the moment the body is rebuilt they are freed.
+      if (!deathFrozen &&
+          (autopsyPeeler.ClonesLive() > 0 || autopsyPeeler.MaxDepth() >= 0))
+        autopsyPeeler.Release(mbSet);
+      if (!deathFrozen && !deathBricks.empty()) {
+        // A reloaded micro set is a different table: forget, never free.
+        if (mbSet.epoch == deathBricksEpoch)
+          for (uint32_t m : deathBricks) MicroBodyFree(mbSet, m);
+        deathBricks.clear();
+      }
       if (ui.inventoryOpen && portraitCam.valid && portraitView) {
+        // THE TIER THE PANEL PICKED this frame (UIState::portraitTierTex): the
+        // draw list already samples that texture, so this pass must fill it.
+        const int pTier = std::clamp(ui.portraitTier, 0, UIState::kPortraitTiers - 1);
+        const uint32_t pW = (uint32_t)ui.portraitTierTex[pTier].w;
+        const uint32_t pH = (uint32_t)ui.portraitTierTex[pTier].h;
         // THE WHOLE BODY, ALWAYS — but only a mask that actually hides
         // something needs swapping (third person hides nothing). The arena
         // keeps a hidden part's span alive between toggles (kKeepCommits), so
@@ -19219,6 +19410,12 @@ int main(int argc, char** argv) {
         // construction. Only the instance lists change. The death pose is the
         // one thing that does re-upload them, and it puts them back below.
         bool posedDead = false;
+        // Which frozen part each micro instance below draws (-1 = not the
+        // corpse), and the slots appended for frozen parts the world no
+        // longer has a body for.
+        std::vector<int> slotLimb;
+        std::vector<std::pair<uint32_t, int>> extraSlots;  // slot, limb index
+        const size_t bodyXfLive = bodyXf.size();
         if (deathFrozen && deathBody.have && !bodyXf.empty()) {
           // EVERY slot, not the debris range: the corpse is a dead Mob in
           // mobs_ now (MobSystem::AdoptDeadAvatar) and draws through mob
@@ -19227,15 +19424,42 @@ int main(int argc, char** argv) {
           bodyReg.BuildHandles(slotHandles);
           const uint32_t nSlots = std::min<uint32_t>(
               (uint32_t)slotHandles.size(), (uint32_t)bodyXf.size());
+          slotLimb.assign(bodyXf.size(), -1);
+          std::vector<uint8_t> matched(deathBody.limbs.size(), 0);
           for (uint32_t s = 0; s < nSlots; s++) {
             const uint64_t h = slotHandles[s];
             if (!h) continue;
-            for (const auto& fl : deathBody.limbs) {
+            for (size_t li = 0; li < deathBody.limbs.size(); li++) {
+              DeathBody::Limb& fl = deathBody.limbs[li];
               if (fl.body != h) continue;
+              // Until the bricks are photographed, pinned by the joint: the
+              // corner follows any rebase since death. After, fixed.
+              Vec3 aLimb;
+              static const bool kRawPin = std::getenv("SANDVOX_DEATH_PHOTO_RAW") != nullptr;
+              if (!kRawPin && !fl.pinned && fl.haveAnchor &&
+                  mobs.LimbAnchorByBody(fl.body, aLimb)) {
+                const Quat q{fl.xf.quat[0], fl.xf.quat[1], fl.xf.quat[2], fl.xf.quat[3]};
+                const Vec3 corner = fl.anchorWorld - QuatRotate(q, aLimb);
+                fl.xf.pos[0] = corner.x; fl.xf.pos[1] = corner.y; fl.xf.pos[2] = corner.z;
+              }
               bodyXf[s] = fl.xf;
+              slotLimb[s] = (int)li;
+              matched[li] = 1;
               posedDead = true;
               break;
             }
+          }
+          // A PHOTOGRAPHED PART THE WORLD HAS LOST (burnt, dissolved or eaten
+          // away since) is still in the photograph: it gets a slot of its own
+          // past the live ones, for this one draw.
+          for (size_t li = 0; li < deathBody.limbs.size(); li++) {
+            const DeathBody::Limb& fl = deathBody.limbs[li];
+            if (matched[li] || fl.frozenModel < 0) continue;
+            if (bodyXf.size() >= (size_t)kMaxBodySlots) break;
+            extraSlots.push_back({(uint32_t)bodyXf.size(), (int)li});
+            bodyXf.push_back(fl.xf);
+            slotLimb.push_back((int)li);
+            posedDead = true;
           }
           if (posedDead)
             ctx.queue.WriteBuffer(world.bodyXforms, 0, bodyXf.data(),
@@ -19243,6 +19467,227 @@ int main(int argc, char** argv) {
         }
         microInsts.clear();
         bodyReg.BuildMicroInsts(microInsts);
+        // The photographed bricks in place of the corpse's live ones, and the
+        // lost parts' instances appended.
+        std::vector<int> instLimb;
+        if (!slotLimb.empty()) {
+          instLimb.assign(microInsts.size(), -1);
+          for (size_t k = 0; k < microInsts.size(); k++) {
+            const uint32_t sl = microInsts[k].slot;
+            if (sl >= slotLimb.size() || slotLimb[sl] < 0) continue;
+            instLimb[k] = slotLimb[sl];
+            const int fm = deathBody.limbs[(size_t)slotLimb[sl]].frozenModel;
+            if (fm >= 0) microInsts[k].model = (uint32_t)fm;
+          }
+          for (const auto& [slot, li] : extraSlots) {
+            MicroBodyInstGpu in{};
+            in.slot = slot;
+            in.model = (uint32_t)deathBody.limbs[(size_t)li].frozenModel;
+            microInsts.push_back(in);
+            instLimb.push_back(li);
+          }
+        }
+        // THE AUTOPSY (game/autopsy.h). On a corpse the instance list is
+        // rewritten for this one draw: each of the body's parts is matched by
+        // its physics handle (the same match the death pose uses), its brick is
+        // swapped for a peeled clone, and gear / unselected parts drop out when
+        // the panel asks. Nothing outside this list changes, so the main view
+        // and the corpse itself never see a peel.
+        //
+        // THE PROBE'S TARGETS (UIState::AutopsyUI::probe), filled by whichever
+        // body the portrait is of: per instance of the FINAL list, the index
+        // of the part it draws in probeTargets, or -1 (another creature, the
+        // world). The corpse fills it below; the living body after it.
+        struct ProbeTarget {
+          int fig;         // UIState body slot, -1 = worn / held
+          uint32_t src;    // the unpeeled brick, for the depth measure
+          const char* name;
+        };
+        std::vector<ProbeTarget> probeTargets;
+        std::vector<int> probeOf;
+        uint8_t probeKinds[256] = {};
+        if (deathFrozen && deathBody.have) {
+          std::vector<autopsy::Part> parts;
+          std::vector<int> instPart(microInsts.size(), -1);
+          for (size_t k = 0; k < microInsts.size() && k < instLimb.size(); k++) {
+            if (instLimb[k] < 0) continue;
+            const DeathBody::Limb& fl = deathBody.limbs[(size_t)instLimb[k]];
+            instPart[k] = (int)parts.size();
+            parts.push_back({microInsts[k].model, fl.figSlot, fl.isLimb});
+          }
+          uint8_t kinds[256];
+          AutopsyKinds(burnMats, tissueMats, mats, kinds);
+          autopsyPeeler.Update(mbSet, parts, std::max(0, ui.autopsy.peel), now,
+                               UIState::kSlotCount);
+          autopsy::FillUI(autopsyPeeler, kinds, mats, ui);
+          const bool peeling = ui.autopsy.peel > 0;
+          const int iso = ui.autopsy.isolate ? ui.inspectSelected : -1;
+          std::memcpy(probeKinds, kinds, sizeof kinds);
+          // Anything worn or held makes the panel's first peel an undressing.
+          ui.autopsy.hasGear = std::any_of(parts.begin(), parts.end(),
+                                           [](const autopsy::Part& p) { return !p.isLimb; });
+          size_t keep = 0;
+          for (size_t k = 0; k < microInsts.size(); k++) {
+            MicroBodyInstGpu in = microInsts[k];
+            if (instPart[k] >= 0) {
+              const autopsy::Part& pp = parts[(size_t)instPart[k]];
+              // Gear goes with any peel: a robe over a peeled torso would hide
+              // exactly what the peel was for.
+              if (!pp.isLimb && (ui.autopsy.hideGear || peeling || iso >= 0)) continue;
+              if (iso >= 0 && pp.figSlot != iso) continue;
+              if (pp.isLimb) {
+                const uint32_t dm = autopsyPeeler.DrawModel(in.model);
+                if (dm == autopsy::Peeler::kHidden) continue;
+                in.model = dm;
+              }
+            }
+            microInsts[keep] = in;
+            // The probe reads the photograph exactly as it is about to be
+            // drawn, peel and all.
+            if (instPart[k] >= 0) {
+              const autopsy::Part& pp = parts[(size_t)instPart[k]];
+              const int li = k < instLimb.size() ? instLimb[k] : -1;
+              probeOf.resize(keep + 1, -1);
+              probeOf[keep] = (int)probeTargets.size();
+              probeTargets.push_back(
+                  {pp.figSlot, pp.model, li >= 0 ? deathBody.limbs[(size_t)li].name : ""});
+            }
+            keep++;
+          }
+          microInsts.resize(keep);
+          // The clones' bricks, before the encoder below exists (queued
+          // writes drain at the head of the NEXT command buffer).
+          if (mbSet.dirty) sim.UploadMicroBodies(ctx.queue, mbSet);
+        } else if (ui.autopsy.probeWant && avatar.Spawned()) {
+          // THE LIVING BODY: its parts are matched by physics handle, the same
+          // match the death pose makes, and probed as they stand.
+          std::vector<uint64_t> slotHandles;
+          bodyReg.BuildHandles(slotHandles);
+          std::unordered_map<uint64_t, int> partOfBody;
+          for (int i = 0; i < avatar.PartCount(); i++)
+            if (const uint64_t h = avatar.PartBody(i)) partOfBody[h] = i;
+          const int limbCount = avatar.Def() ? (int)avatar.Def()->limbs.size() : 0;
+          for (size_t k = 0; k < microInsts.size(); k++) {
+            const uint32_t sl = microInsts[k].slot;
+            if (sl >= slotHandles.size() || !slotHandles[sl]) continue;
+            const auto it = partOfBody.find(slotHandles[sl]);
+            if (it == partOfBody.end()) continue;
+            const int i = it->second;
+            probeOf.resize(k + 1, -1);
+            probeOf[k] = (int)probeTargets.size();
+            probeTargets.push_back(
+                {i < limbCount ? BodySlotFor(avatar.PartName(i), avatar.PartTag(i)) : -1,
+                 microInsts[k].model, avatar.PartName(i)});
+          }
+          AutopsyKinds(burnMats, tissueMats, mats, probeKinds);
+        }
+        probeOf.resize(microInsts.size(), -1);
+        {
+          // THE PROBE (UIState::AutopsyUI::probe): the cursor's ray through the
+          // instances of the inspected body - nearest occupied cell wins, read
+          // back in full.
+          ui.autopsy.probe.valid = false;
+          if (ui.autopsy.probeWant && portraitCam.valid && !probeTargets.empty()) {
+            const PortraitCam& pc = portraitCam;
+            const float ndcX = ui.autopsy.probeAt[0] * 2.0f - 1.0f;
+            const float ndcY = 1.0f - ui.autopsy.probeAt[1] * 2.0f;
+            const Vec3 rd = (pc.cam.Forward() +
+                             pc.cam.Right() * (ndcX * pc.tanHalf * pc.aspect) +
+                             pc.cam.Up() * (ndcY * pc.tanHalf))
+                                .normalized();
+            float bestT = 1e30f;
+            int bestK = -1, bestCell[3] = {0, 0, 0};
+            for (size_t k = 0; k < microInsts.size(); k++) {
+              if (probeOf[k] < 0) continue;
+              const MicroBodyInstGpu& in = microInsts[k];
+              if (in.slot >= bodyXf.size() || in.model >= mbSet.models.size()) continue;
+              const BodyXformGpu& x = bodyXf[in.slot];
+              const Quat q{x.quat[0], x.quat[1], x.quat[2], x.quat[3]};
+              const float sc = (float)std::max(1u, mbSet.models[in.model].scale);
+              const Vec3 o = QuatRotateInv(q, pc.eye - Vec3{x.pos[0], x.pos[1], x.pos[2]}) * sc;
+              const Vec3 d = QuatRotateInv(q, rd) * sc;
+              const float ro3[3] = {o.x, o.y, o.z}, rd3[3] = {d.x, d.y, d.z};
+              float t;
+              int cell[3];
+              if (autopsy::PickBrick(mbSet, in.model, ro3, rd3, t, cell) && t < bestT) {
+                bestT = t;
+                bestK = (int)k;
+                bestCell[0] = cell[0]; bestCell[1] = cell[1]; bestCell[2] = cell[2];
+              }
+            }
+            if (bestK >= 0) {
+              UIState::AutopsyUI::Probe& pr = ui.autopsy.probe;
+              pr = {};
+              const MicroBodyInstGpu& in = microInsts[(size_t)bestK];
+              const ProbeTarget& pt = probeTargets[(size_t)probeOf[(size_t)bestK]];
+              const char* pname = pt.name ? pt.name : "";
+              const int fig = pt.fig;
+              if (fig >= 0 && fig < UIState::kSlotCount) {
+                std::snprintf(pr.part, sizeof pr.part, "%s", ui.body[fig].label);
+              } else {
+                // A worn piece's part name is "worn:<item>:<over>": say it
+                // as "<item> - <over>".
+                std::string nm = pname[0] ? pname : "worn";
+                if (nm.rfind("worn:", 0) == 0) nm = nm.substr(5);
+                for (size_t c = nm.find(':'); c != std::string::npos; c = nm.find(':'))
+                  nm.replace(c, 1, " - ");
+                for (char& c : nm)
+                  if (c == '_') c = ' ';
+                std::snprintf(pr.part, sizeof pr.part, "%s", nm.c_str());
+              }
+              const uint16_t v = MicroBodyCell(mbSet, in.model, bestCell[0], bestCell[1], bestCell[2]);
+              const uint32_t m = v & 0xFFu;
+              auto nameOf = [&](uint32_t id, char* out, size_t n) {
+                std::string nm = id < mats.size() ? (!mats[id].infectLabel.empty() ? mats[id].infectLabel
+                                                                                   : mats[id].name)
+                                                  : std::string("material ") + std::to_string(id);
+                for (char& c : nm)
+                  if (c == '_') c = ' ';
+                std::snprintf(out, n, "%s", nm.c_str());
+              };
+              nameOf(m, pr.mat, sizeof pr.mat);
+              pr.matColor = m < mats.size() ? (0xFF000000u | (mats[m].gpu.color0 & 0x00FFFFFFu))
+                                            : 0xFF808080u;
+              pr.kind = probeKinds[m];
+              pr.cell[0] = bestCell[0]; pr.cell[1] = bestCell[1]; pr.cell[2] = bestCell[2];
+              // The layer, measured on the UNPEELED brick (the peel clone keeps
+              // its dims, so the cell is the same cell): depth from the skin.
+              static autopsy::DepthField probeDepth;
+              static uint32_t probeDepthModel = 0xFFFFFFFFu, probeDepthGen = 0;
+              const uint32_t src = pt.src;
+              if (src != probeDepthModel || MicroBodyEditGen(mbSet, src) != probeDepthGen) {
+                autopsy::MeasureDepth(mbSet, src, probeDepth);
+                probeDepthModel = src;
+                probeDepthGen = MicroBodyEditGen(mbSet, src);
+              }
+              if (bestCell[0] < probeDepth.dx && bestCell[1] < probeDepth.dy &&
+                  bestCell[2] < probeDepth.dz) {
+                const uint8_t dep = probeDepth.At(bestCell[0], bestCell[1], bestCell[2]);
+                pr.layer = dep == autopsy::kEmpty ? -1 : dep;
+              }
+              const uint32_t st = autopsy::CellStain(mbSet, in.model, bestCell[0], bestCell[1], bestCell[2]);
+              const uint16_t coat = (uint16_t)(st & 0xFFFFu), bruise = (uint16_t)(st >> 16);
+              pr.bruise = (int)BodyStainAmt(bruise);
+              if (BodyStainAmt(coat) > 0) {
+                const uint32_t cm = BodyStainMat(coat);
+                nameOf(cm, pr.coat, sizeof pr.coat);
+                pr.coatAmt = (int)BodyStainAmt(coat);
+                pr.coatColor = cm < mats.size()
+                                   ? (0xFF000000u | (mats[cm].gpu.stainColor & 0x00FFFFFFu))
+                                   : 0xFF808080u;
+                if ((pr.coatColor & 0x00FFFFFFu) == 0 && cm < mats.size())
+                  pr.coatColor = 0xFF000000u | (mats[cm].gpu.color0 & 0x00FFFFFFu);
+              }
+              const Vec3 hitW = pc.eye + rd * bestT;
+              float uv[2];
+              if (ProjectToPortrait(pc, hitW, uv)) {
+                pr.uv[0] = uv[0];
+                pr.uv[1] = uv[1];
+              }
+              pr.valid = true;
+            }
+          }
+        }
         const uint32_t pMicro = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
         // bodyXf carries the death pose here when there is one, so the cull
         // tests the pose the portrait draws.
@@ -19255,17 +19700,17 @@ int main(int argc, char** argv) {
         // WriteRenderParams in test/support.h).
         WriteRenderParams(ctx.queue, world, portraitCam.eye, portraitCam.cam,
                           portraitCam.aspect, /*shadows=*/true, (float)now,
-                          /*fogDensity=*/0.0f, (float)kPortraitH,
+                          /*fogDensity=*/0.0f, (float)pH,
                           kPortraitLightTick, fluidCount,
-                          /*frameFrac=*/0.0f, /*extraFlags=*/0u, kPortraitW,
-                          kPortraitH, /*auxView=*/true);
+                          /*frameFrac=*/0.0f, /*extraFlags=*/0u, pW,
+                          pH, /*auxView=*/true);
         rhi::CommandEncoder pEnc = ctx.device.CreateCommandEncoder();
         // Near-black indigo, the panel's own deepest tone, so the portrait
         // reads as an inset rather than as a hole punched in the sheet.
         const float kPortraitClear[4] = {0.055f, 0.048f, 0.086f, 1.0f};
         rhi::RenderPass pRp =
-            sim.BeginAuxRenderPass(pEnc, portraitView, ctx.surfaceFormat,
-                                   kPortraitW, kPortraitH, kPortraitClear);
+            sim.BeginAuxRenderPass(pEnc, portraitTierView[pTier], ctx.surfaceFormat,
+                                   pW, pH, kPortraitClear);
         sim.DrawWorld(pRp);
         sim.DrawParticles(pRp);
         if (CurrentTuning().render.fluidSurface < 0.5f) sim.DrawFluid(pRp, fluidCount);
@@ -19299,6 +19744,7 @@ int main(int argc, char** argv) {
         // re-dirties the avatar, so the rebuild below is a genuine requirement
         // rather than a precaution.
         if (posedDead) {
+          bodyXf.resize(bodyXfLive);
           bodyReg.BuildXforms(bodyXf);
           ctx.queue.WriteBuffer(world.bodyXforms, 0, bodyXf.data(),
                                 bodyXf.size() * sizeof(BodyXformGpu));

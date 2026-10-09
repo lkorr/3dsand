@@ -3704,6 +3704,9 @@ class Mob {
   // thigh — a place its jaws are nowhere near. The centre of the limb's own
   // collider box is the part as a target rather than as a pivot.
   bool LimbCentreWorld(int part, Vec3& out) const;
+  // The limb's lattice +Z as it is drawn, in the world (unit). The `snake`
+  // gate reads a segment's pitch off it.
+  bool LimbAxisWorld(int part, Vec3& out) const;
   // THE STROKE DRIVER'S COMMAND TO THE RIG (game/melee.h). Presentation only;
   // consumed by the driver's own animation pass through ApplyWeaponArm.
   void SetWeaponPose(const WeaponPose& pose);
@@ -5316,6 +5319,13 @@ class Mob {
   // Per part, the eased pitch (radians, + = far end up) ConformProneSegments
   // is holding that segment at relative to the body plane.
   std::vector<float> proneConform_;
+  // A SLITHER BODY'S LYING CLEARANCE (ConformProneSegments' drape): how high
+  // the root's middle is drawn over its support, LEARNED while the root lies
+  // on level ground and held everywhere else -- on a staircase the one fitted
+  // plane holds the body proud of the treads, and draping from that height
+  // floated every segment by it.
+  float drapeClr_ = 0;
+  bool drapeClrSet_ = false;
   // ---- THE ONE-FOOTED DRAG (anim.h AnimApplyStumpDrag) --------------------
   //
   // `dragW_` is the eased commitment to the drag, 0 at a standstill and 1 at
@@ -7336,6 +7346,13 @@ class MobSystem {
   uint64_t NextIdCounter() const { return nextId_; }
   void SetNextIdCounter(uint64_t n) { nextId_ = n ? n : 1; }
   uint64_t LimbBody(uint64_t mobId, int limbIndex) const;
+  // The joint anchor (limb-local, MobLimb::anchorLimb) of whichever limb of
+  // whichever creature - a corpse included - currently owns physics body
+  // `body`. A carve REBASES a limb (ReskinLimbMicro moves xf.pos and
+  // anchorLimb together), so the anchor is the one point of a limb that does
+  // not move when its brick does: the death screen pins a frozen limb by it.
+  // `microModel`, when given, gets the limb's micro brick (-1 = cube path).
+  bool LimbAnchorByBody(uint64_t body, Vec3& anchorLimb, int* microModel = nullptr) const;
   bool IsAlive(uint64_t mobId) const;
   // The live stroke of one creature, for the gates and the dev readout. Null
   // when there is no such mob.

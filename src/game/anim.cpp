@@ -272,9 +272,11 @@ int AnimSelectState(const AnimSkeleton& sk, const AnimState& st) {
   // outranks how it is damaged.
   if (!st.activity.empty())
     for (size_t r = 0; r < sk.states.size(); r++)
-      if (sk.states[r].activity == st.activity) return (int)r;
+      if (!sk.states[r].overlay && sk.states[r].activity == st.activity)
+        return (int)r;
   for (size_t r = 0; r < sk.states.size(); r++) {
     const AnimStateRule& rule = sk.states[r];
+    if (rule.overlay) continue;             // played on top, never selected
     if (!rule.activity.empty()) continue;   // matched above or not at all
     if (rule.always) return (int)r;         // the body's own base posture
     // an empty predicate would shadow every rule after it — never match it

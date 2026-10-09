@@ -15,7 +15,7 @@
  * Only MATERIALS change. The script asserts the tight rebase is a no-op, so
  * the sidecar's anchors stay valid and nothing here can move a limb.
  */
-import { readFileSync, writeFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { dirname, join } from 'path';
 import { mobFile } from './mobfiles.mjs';
@@ -24,6 +24,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const load = rel => import(pathToFileURL(join(ROOT, rel)).href);
 const VOX = await load('assets/editor/vox.js');
 const ANA = await load('assets/editor/anatomy.js');
+const SC = await load('assets/editor/sidecar.js');
 
 const args = process.argv.slice(2);
 const flags = new Set(args.filter(a => a.startsWith('--')));
@@ -35,7 +36,18 @@ if (!name) {
 
 const voxPath = mobFile(name, '.vox');
 const jsonPath = mobFile(name, '.json');
-const side = JSON.parse(readFileSync(jsonPath, 'utf8'));
+// THE RESOLVED SIDECAR, as the engine and test_anatomy.mjs read it: a
+// character's recipe arrives through `extends` (and effects may override it),
+// so the raw file of a variant has no `layers` and baking it was a silent
+// no-op that left its interior one human-recipe edit behind.
+const readStem = stem => JSON.parse(readFileSync(mobFile(stem, '.json'), 'utf8'));
+const readEffect = fx => {
+  const p = join(ROOT, 'assets/mobs/effects', fx + '.json');
+  return existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : null;
+};
+const side = SC.resolveSidecar(
+  stem => stem === name ? JSON.parse(readFileSync(jsonPath, 'utf8')) : readStem(stem),
+  name, readEffect);
 if (!side.anatomy) {
   console.error(`${name}.json has no "anatomy" block — nothing to bake. ` +
     'Author one (assets/editor/anatomy.js documents the format) or use the ' +

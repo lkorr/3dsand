@@ -318,6 +318,19 @@ class PlayerAvatar : public Mob {
   // World position of a part's joint anchor — where the camera boom pivots and
   // where a first-person eye sits.
   bool PartAnchorWorld(int part, Vec3& out) const;
+  // THE BODY AS ONE PIECE, for a photograph (the death screen's frozen pose).
+  // Every part with a body, at its physics transform - EXCEPT that a part still
+  // jointed to its parent is moved (rotation kept) so its joint anchor sits on
+  // the parent where the rig says it does. A blast can fling an attached head
+  // metres from the neck for the one tick the solver has not yet pulled it
+  // back, and a still taken on that tick shows a decapitation that never
+  // happened. Parents are corrected before children, so a whole chain follows.
+  // `slack` (world voxels) is how far a joint may already be off before it is
+  // snapped: ordinary solver give is left alone. Non-limb parts (garments,
+  // held items) ride their parent's correction rigidly. `have[i]` = part i has
+  // a body and an entry.
+  void JointConsistentPose(std::vector<Vec3>& pos, std::vector<Quat>& rot,
+                           std::vector<uint8_t>& have, float slack = 1.0f) const;
   // Eye height from the creature's bottom in world voxels, derived from the
   // sidecar's eyeLocal + the head's rest-pose anchor. 0 when no eyeLocal was
   // authored (caller falls back to a constant).

@@ -254,6 +254,12 @@ struct AnimStateRule {
   // Every other rule's predicate is about what is missing; a snake is missing
   // nothing and still never stands up.
   bool always = false;
+  // AN OVERLAY (2026-10-08, the demon's tail sway): never SELECTED -- it is
+  // not a posture -- but its clip is kept playing on top of whichever state
+  // did win, from the first tick to the last. For motion that belongs to a
+  // part rather than to a state (a tail swaying under a walk, a hunch, a
+  // limp). Its clip should be additive and masked to the parts it moves.
+  bool overlay = false;
   std::string clip;               // looping loco clip, crossfaded on entry
   float speedScale = 1.0f;        // walk-drive speed multiplier
   // ...and the same multiplier for a BALLISTIC opening (strokes.h StyleLunge).

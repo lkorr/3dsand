@@ -95,7 +95,51 @@ const S = {
   // Which side columns are folded to a strip. Kept across reloads: someone who
   // folds the litter away to work the sliders wants it folded next time too.
   collapsed: loadCollapsed(),
+  // Which gene group the tabbed slider column shows. Kept across reloads like
+  // the folds; a tab another race does not have falls back to the first.
+  geneTab: (() => { try { return localStorage.getItem('breed.geneTab') || 'body'; }
+                    catch { return 'body'; } })(),
+  // Genome snapshots for undo / redo (JSON strings, so equality is a compare).
+  undo: [],
+  redo: [],
+  // Play the body's idle motion (the tail sway) in the preview.
+  animate: true,
+  // Which race the saved-characters column lists ('all' for every one).
+  // Kept across reloads; empty until first shown, then the edited race.
+  poolRace: (() => { try { return localStorage.getItem('breed.poolRace') || ''; }
+                     catch { return ''; } })(),
 };
+
+// ---- undo -------------------------------------------------------------------
+//
+// SNAPSHOT ON THE WAY IN. A pointerdown or keydown anywhere on the page records
+// the genome as it stands, and a snapshot equal to the one on top of the stack
+// is dropped -- so every control (slider drag, swatch, style pick, randomize,
+// preset, litter "tweak") is one undo step without each needing to remember
+// to push, and a click that changed nothing leaves nothing behind.
+const UNDO_CAP = 200;
+const snap = () => JSON.stringify(S.genome);
+
+function pushUndo() {
+  const cur = snap();
+  if (S.undo[S.undo.length - 1] === cur) return;
+  S.undo.push(cur);
+  if (S.undo.length > UNDO_CAP) S.undo.shift();
+  S.redo = [];
+}
+
+function stepHistory(from, to, what) {
+  const cur = snap();
+  // A snapshot taken by a click that changed nothing is the state we are in.
+  while (from.length && from[from.length - 1] === cur) from.pop();
+  if (!from.length) { toast('nothing to ' + what); return; }
+  to.push(cur);
+  S.genome = mg.normalizeGenome(JSON.parse(from.pop()));
+  setDirty(true);
+  render();
+}
+const undo = () => stepHistory(S.undo, S.redo, 'undo');
+const redo = () => stepHistory(S.redo, S.undo, 'redo');
 
 function loadCollapsed() {
   try {
@@ -117,7 +161,7 @@ function collapsedCol(which, title) {
   return el('div', { class: 'bcol collapsed',
                      title: 'show ' + title,
                      onclick: () => setCollapsed(which, false) },
-    el('button', { title: 'show ' + title }, which === 'pool' ? '»' : '«'),
+    el('button', { title: 'show ' + title }, which === 'pool' ? '»' : '▸'),
     el('div', { class: 'vlab' }, title));
 }
 
@@ -128,7 +172,7 @@ function colHead(which, title, tip, ...extra) {
     which ? el('button', { title: 'fold this column away to give the sliders ' +
                                    'the room',
                            onclick: () => setCollapsed(which, true) },
-               which === 'pool' ? '«' : '»') : null);
+               which === 'pool' ? '«' : '▾') : null);
 }
 
 const el = (...a) => H.el(...a);
@@ -216,9 +260,12 @@ function slotRGB(genome) {
     const n = parseInt((genome.colors[k] || '#ff00ff').slice(1), 16);
     out[slot - 127] = [(n >> 16) & 255, (n >> 8) & 255, n & 255];
   }
+  // ...except the LIPS: a skin tone for the carry, but a colour of their own
+  // on the face (a red is not a shading cue).
   for (const [base, deps] of Object.entries(mg.COLOR_FAMILIES))
     for (const d of deps)
-      out[mg.COLOR_SLOTS[d] - 127] = out[mg.COLOR_SLOTS[base] - 127];
+      if (d !== 'lip')
+        out[mg.COLOR_SLOTS[d] - 127] = out[mg.COLOR_SLOTS[base] - 127];
   // THE WISPS carry a fourth entry, their coverage 0..255 (mobgen.js
   // wispColors). Both painters draw them see-through, as the game does.
   for (const [slot, hex] of Object.entries(mg.wispColors(genome.colors))) {
@@ -553,12 +600,31 @@ export function drawBody(canvas, b, opts = {}) {
 // =============================================================================
 
 const buildCache = new Map();
+// THE SAME BODY IN ANOTHER COLOUR. Colour never reaches the geometry -- the
+// cells carry art SLOTS and both painters read the RGB off `b.genome` at draw
+// time -- so a colour drag needs no generateMob (25 ms a human, 60 a demon,
+// 175 a sylvan, per input event). Keyed on the genome minus its colours.
+const shapeCache = new Map();
+const shapeKey = g => JSON.stringify({ ...g, colors: null });
 
-function buildOf(genome, name) {
+/** The body for `genome`. `exact` is for SAVING: the written .vox palette and
+ *  the sidecar carry the colours, so a save always generates for real; every
+ *  other caller only paints, and a recolour of a cached shape is a view of it
+ *  (prototype-linked, so the shape's grid and face caches are shared). */
+function buildOf(genome, name, exact = false) {
   const g = mg.normalizeGenome(genome);
   const k = JSON.stringify(g);
   const hit = buildCache.get(k);
-  if (hit) return hit;
+  if (hit && (!exact || !hit.recolour)) return hit;
+  const sk = shapeKey(g);
+  const shape = !exact && shapeCache.get(sk);
+  if (shape) {
+    const v = Object.create(shape);
+    v.genome = g; v.key = k; v.recolour = true;
+    if (buildCache.size > 240) buildCache.clear();
+    buildCache.set(k, v);
+    return v;
+  }
   let out;
   try {
     out = mg.generateMob(g, 0, {
@@ -573,6 +639,8 @@ function buildOf(genome, name) {
   out.key = k;                       // what thumbFor caches the PIXELS against
   if (buildCache.size > 240) buildCache.clear();        // bounded, like everything
   buildCache.set(k, out);
+  if (shapeCache.size > 120) shapeCache.clear();
+  if (!out.error) shapeCache.set(sk, out);
   return out;
 }
 
@@ -641,9 +709,16 @@ async function loadPool() {
     } catch { continue; }
     // behaviors.json and attack_styles.json live here too and are not mobs.
     if (!j || (!j.limbs && !j.extends)) continue;
+    const genome = j.genome ? mg.normalizeGenome(j.genome) : null;
     S.pool.push({
       name: stem,
-      genome: j.genome ? mg.normalizeGenome(j.genome) : null,
+      genome,
+      // WHAT RACE IT IS, for the column's race tabs: the genome says, else
+      // the sidecar's own `race`, else the folder it is filed in
+      // (assets/mobs/demon/); a hand-made creature with none is 'other'.
+      race: (genome && genome.body.race) ||
+            (mg.RACES.includes(j.race) ? j.race : '') ||
+            (mg.RACES.includes(f.variantOf) ? f.variantOf : '') || 'other',
       extendsName: j.extends || '',
       hasPalette: !!j.palette,
       bytes: f.size,
@@ -722,7 +797,7 @@ async function saveCharacter() {
   const name = S.name.trim().toLowerCase();
   if (!NAME_OK.test(name))
     return toast('a mob name is lowercase letters, digits and underscores', true);
-  const b = buildOf(S.genome, name);
+  const b = buildOf(S.genome, name, true);
   if (b.error) return toast('cannot build: ' + b.error, true);
   if (b.complaints.length)
     return toast('refused: ' + b.complaints[0], true);
@@ -898,7 +973,23 @@ function css() {
 #view-characters .prow .pk{font-size:9px;opacity:.55}
 #view-characters .litter{display:grid;
   grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:6px;
-  max-height:62vh;overflow:auto}
+  max-height:52vh;overflow:auto}
+/* THE LITTER lives under the preview in the middle column; folded, it is one
+   bar you click to get it back. */
+#view-characters .lsec{margin-top:12px;border-top:1px solid #2a2a2a;
+  padding-top:8px}
+#view-characters .lsec.collapsed{display:flex;align-items:center;gap:8px;
+  cursor:pointer;opacity:.75}
+#view-characters .lsec.collapsed:hover{opacity:1}
+#view-characters .lsec.collapsed .vlab{font-size:11px;letter-spacing:.1em;
+  text-transform:uppercase}
+/* THE GENE TABS: one per group, so hair is one click away instead of a
+   scroll past the face. */
+#view-characters .gtabs{display:flex;flex-wrap:wrap;gap:3px;margin:0 0 6px}
+#view-characters .gtab{font-size:10px;padding:2px 7px;opacity:.6}
+#view-characters .gtab:hover{opacity:.9}
+#view-characters .gtab.on{opacity:1;border-color:#c9b46a;color:#fff3c8;
+  background:#2a2618}
 #view-characters .lcell{border:1px solid #2a2a2a;background:#141414;
   cursor:pointer;position:relative}
 #view-characters .lcell:hover{border-color:#5a5a4a}
@@ -907,7 +998,8 @@ function css() {
   image-rendering:pixelated}
 #view-characters .lbtns{display:flex;gap:2px;padding:2px}
 #view-characters .lbtns button{flex:1;font-size:9px;padding:1px 0}
-#view-characters .genes{max-height:56vh;overflow:auto;padding-right:4px}
+#view-characters .genes{max-height:calc(100vh - 230px);overflow:auto;
+  padding-right:4px}
 #view-characters .ggroup{margin:0 0 8px}
 #view-characters .genes .gh{font-size:10px;opacity:.75;color:#cbbf95;
   text-transform:uppercase;letter-spacing:.08em;margin:12px 0 2px;
@@ -943,7 +1035,8 @@ function css() {
 /* A tone row is indented under the base it follows, so the five colours read
    as five and not as nine. */
 #view-characters .grow.tone .gl{padding-left:9px;opacity:.85}
-#view-characters .prev{display:flex;gap:8px;align-items:flex-start}
+#view-characters .prev{display:flex;flex-wrap:wrap;gap:8px;
+  align-items:flex-start}
 #view-characters .prev canvas{background:#0d0d0f;image-rendering:pixelated;
   border:1px solid #2a2a2a}
 #view-characters .bad{color:#e08080}
@@ -959,13 +1052,6 @@ function css() {
 #view-characters .bcol.collapsed .vlab{writing-mode:vertical-rl;
   font-size:11px;letter-spacing:.1em;text-transform:uppercase;opacity:.7}
 #view-characters .pcanv{display:flex;gap:8px;align-items:flex-start}
-/* WIDE: the litter is collapsed, so the tweak pane has the page. The preview
-   and its buttons stack on the left and the sliders run the full height on
-   the right, instead of a thin list under a picture. */
-#view-characters .tbody.wide{display:grid;
-  grid-template-columns:auto minmax(0,1fr);gap:14px;align-items:start}
-#view-characters .tbody.wide .prev{flex-direction:column;max-width:440px}
-#view-characters .tbody.wide .genes{max-height:calc(100vh - 150px)}
 #view-characters .hsctl,#view-characters .hcctl{display:inline-flex;gap:6px;
   align-items:center;min-width:0}
 #view-characters .hsctl input[type=range]{width:110px}
@@ -1050,17 +1136,18 @@ function renderPage() {
   // left to infer it from a pane called "Litter".
   root.append(el('div', { class: 'bintro' },
     el('b', {}, 'Make a person by picking one.'), ' ',
-    'Roll a litter on the right, keep whichever child looks like somebody, ',
-    'make it a parent and roll again. Use the middle column when you want to ',
-    'move one thing by hand. Saving writes a finished character into ',
+    'Roll a litter under the preview, keep whichever child looks like ',
+    'somebody, make it a parent and roll again. Use the sliders on the right ',
+    'when you want to move one thing by hand. Saving writes a finished ',
+    'character into ',
     el('code', {}, 'assets/mobs/'), ' that the game will spawn as it is.'));
   const c = S.collapsed;
   root.append(el('div', { class: 'bwrap', style: 'grid-template-columns:' +
-                            (c.pool ? '26px' : '210px') + ' ' +
-                            (c.litter ? '1fr 26px' : '1fr 1fr') },
+                            (c.pool ? '26px' : '210px') +
+                            ' minmax(0,1fr) minmax(0,1fr)' },
     c.pool ? collapsedCol('pool', 'saved characters') : poolPane(),
     tweakPane(),
-    c.litter ? collapsedCol('litter', 'litter') : litterPane()));
+    genesPane()));
   if (S.status)
     root.append(el('div', { class: 'note' }, S.status));
 }
@@ -1107,9 +1194,35 @@ function poolPane() {
              el('div', { class: 'pk' }, kind)));
     rows.push(row);
   }
+  // RACE TABS: every race with a saved character, each with its count, and
+  // 'all'. The list below shows the picked one.
+  const counts = new Map();
+  for (const p of S.pool) counts.set(p.race, (counts.get(p.race) || 0) + 1);
+  const races = [...mg.RACES, 'other'].filter(r => counts.has(r));
+  if (!S.poolRace) S.poolRace = counts.has(S.genome.body.race)
+    ? S.genome.body.race : 'all';
+  const cur = S.poolRace === 'all' || counts.has(S.poolRace) ? S.poolRace : 'all';
+  const pick = r => {
+    S.poolRace = r;
+    try { localStorage.setItem('breed.poolRace', r); } catch { /* ok */ }
+    render();
+    const box = root.querySelector('.pool');
+    if (box) box.scrollTop = 0;
+  };
+  const raceTabs = el('div', { class: 'gtabs pooltabs' },
+    [...races, 'all'].map(r => el('button', {
+      class: 'gtab' + (r === cur ? ' on' : ''),
+      title: r === 'all' ? 'every saved character'
+           : r === 'other' ? 'creatures with no race: hand-made bodies'
+           : 'the saved ' + r + ' characters',
+      onclick: () => pick(r),
+    }, r + ' ' + (r === 'all' ? S.pool.length : counts.get(r)))));
+  const shown = cur === 'all' ? rows
+    : rows.filter((_, i) => S.pool[i].race === cur);
   return el('div', { class: 'bcol' },
     colHead('pool', 'saved characters',
-            'every character already saved in assets/mobs'),
+            'every character already saved in assets/mobs, by race'),
+    raceTabs,
     el('div', { class: 'brow' },
       el('button', { onclick: async () => { await loadPool(); render(); } },
          'refresh'),
@@ -1128,8 +1241,193 @@ function poolPane() {
       'The ones marked hand-authored were drawn in the model editor before ',
       'this page existed, so there are no settings to load — pick one of ',
       'those as the thing a recolour points at instead.'),
-    el('div', { class: 'pool' }, rows.length ? rows
-      : el('div', { class: 'note' }, 'nothing loaded')));
+    el('div', { class: 'pool' }, shown.length ? shown
+      : el('div', { class: 'note' }, rows.length ? 'none of this race yet'
+                                                 : 'nothing loaded')));
+}
+
+
+// =============================================================================
+// THE PREVIEW PLAYS THE BODY'S OWN IDLE MOTION
+//
+// What the engine keeps playing whatever the body is doing -- the sidecar's
+// OVERLAY states (AnimStateRule::overlay; today the demon's `tailsway`) -- is
+// played here too, from the SAME clip the save writes: its duration, its keys,
+// its ease. Generic over parts and quaternions, so a future overlay on another
+// part plays with no code here.
+//
+// Each animated part is rotated about its JOINT: the mean of its cells that
+// touch its parent part (a tail's root against the small of the back). Cells
+// are forward-mapped at 2x2x2 sub-samples so a rotated tube has no holes.
+// Frames are cached per shape per whole degree, so after one cycle a frame
+// costs only the paint.
+// =============================================================================
+
+/** quat (x, y, z, w) in ENGINE axes (Y up) -> the same rotation in SCENE axes
+ *  (Z up): engine = (sx, sz, -sy) is a proper rotation, so the axis maps and
+ *  the angle stays. */
+const sceneQuat = q => [q[0], -q[2], q[1], q[3]];
+
+function qRotate(q, v) {
+  const [x, y, z, w] = q;
+  const ix = w * v[0] + y * v[2] - z * v[1];
+  const iy = w * v[1] + z * v[0] - x * v[2];
+  const iz = w * v[2] + x * v[1] - y * v[0];
+  const iw = -x * v[0] - y * v[1] - z * v[2];
+  return [ix * w + iw * -x + iy * -z - iz * -y,
+          iy * w + iw * -y + iz * -x - ix * -z,
+          iz * w + iw * -z + ix * -y - iy * -x];
+}
+
+function qSlerp(a, b, t) {
+  let d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+  const s = d < 0 ? -1 : 1;
+  d *= s;
+  if (d > 0.9995) {
+    const r = a.map((v, i) => v + (s * b[i] - v) * t);
+    const n = Math.hypot(...r);
+    return r.map(v => v / n);
+  }
+  const th = Math.acos(d), sn = Math.sin(th);
+  const ka = Math.sin((1 - t) * th) / sn, kb = s * Math.sin(t * th) / sn;
+  return a.map((v, i) => v * ka + b[i] * kb);
+}
+
+const EASE = {
+  quadInOut: u => (u < 0.5 ? 2 * u * u : 1 - (-2 * u + 2) ** 2 / 2),
+  linear: u => u,
+};
+
+/** The clip's rotation of one track at time `tMs` (looped). */
+function trackAt(keys, tMs, dur) {
+  const t = dur > 0 ? ((tMs % dur) + dur) % dur : 0;
+  for (let i = 0; i + 1 < keys.length; i++) {
+    const k0 = keys[i], k1 = keys[i + 1];
+    if (t < k0.t || t > k1.t) continue;
+    const u = k1.t > k0.t ? (t - k0.t) / (k1.t - k0.t) : 0;
+    return qSlerp(k0.q, k1.q, (EASE[k0.ease] || EASE.linear)(u));
+  }
+  return keys.length ? keys[keys.length - 1].q : [0, 0, 0, 1];
+}
+
+/** shape (its parts array) -> { tracks, frames } or null: what moves. */
+const animOfShape = new WeakMap();
+
+function animOf(b) {
+  if (!b || !b.parts || !b.sidecar) return null;
+  if (animOfShape.has(b.parts)) return animOfShape.get(b.parts);
+  const sc = b.sidecar;
+  const byName = new Map(b.parts.map(p => [p.name, p]));
+  const tracks = [];
+  for (const st of sc.states || []) {
+    if (!st.overlay || !st.clip || !sc.clips || !sc.clips[st.clip]) continue;
+    const clip = sc.clips[st.clip];
+    for (const [part, tr] of Object.entries(clip.tracks || {})) {
+      const p = byName.get(part);
+      if (!p || !tr.rot || tr.rot.length < 2) continue;
+      const limb = (sc.limbs || []).find(l => l.name === part);
+      const parent = limb && byName.get(limb.parent);
+      tracks.push({ part, keys: tr.rot, dur: clip.durationMs,
+                    pivot: jointPivot(p, parent) });
+    }
+  }
+  const out = tracks.length ? { tracks, frames: new Map() } : null;
+  animOfShape.set(b.parts, out);
+  return out;
+}
+
+/** Scene point a part turns about: its cells face-touching its parent. */
+function jointPivot(p, parent) {
+  const abs = c => [p.mn[0] + c[0], p.mn[1] + c[1], p.mn[2] + c[2]];
+  let pts = [];
+  if (parent) {
+    const has = new Set(parent.cells.map(c =>
+      (parent.mn[0] + c[0]) + ',' + (parent.mn[1] + c[1]) + ',' +
+      (parent.mn[2] + c[2])));
+    for (const c of p.cells) {
+      const [x, y, z] = abs(c);
+      if ([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]
+            .some(([dx, dy, dz]) => has.has((x + dx) + ',' + (y + dy) + ',' + (z + dz))))
+        pts.push([x, y, z]);
+    }
+  }
+  if (!pts.length) pts = p.cells.map(abs);
+  const n = pts.length;
+  return [0, 1, 2].map(i => pts.reduce((s, v) => s + v[i] + 0.5, 0) / n);
+}
+
+/** One part turned by `q` (scene axes) about `pivot`: a fresh part with its
+ *  own box, since a turned tail leaves the box it was cut for. */
+function turnedPart(p, q, pivot) {
+  const seen = new Map();
+  for (const [x, y, z, c] of p.cells)
+    for (const sx of [0.25, 0.75]) for (const sy of [0.25, 0.75])
+      for (const sz of [0.25, 0.75]) {
+        const v = [p.mn[0] + x + sx - pivot[0], p.mn[1] + y + sy - pivot[1],
+                   p.mn[2] + z + sz - pivot[2]];
+        const r = qRotate(q, v);
+        const X = Math.floor(r[0] + pivot[0]), Y = Math.floor(r[1] + pivot[1]),
+              Z = Math.floor(r[2] + pivot[2]);
+        const k = X + ',' + Y + ',' + Z;
+        if (!seen.has(k)) seen.set(k, [X, Y, Z, c]);
+      }
+  const cells = [...seen.values()];
+  const mn = [0, 1, 2].map(i => Math.min(...cells.map(c => c[i])));
+  const mx = [0, 1, 2].map(i => Math.max(...cells.map(c => c[i])));
+  return { name: p.name, mn, size: mx.map((v, i) => v - mn[i] + 1),
+           cells: cells.map(c => [c[0] - mn[0], c[1] - mn[1], c[2] - mn[2], c[3]]) };
+}
+
+/** `b` as it stands at `tMs` into its idle motion, or `b` itself. Shares the
+ *  shape's frame cache across recolours: the colours come from `b.genome`. */
+function posedBody(b, tMs) {
+  const A = S.animate === false ? null : animOf(b);
+  if (!A) return b;
+  const qs = A.tracks.map(tr => sceneQuat(trackAt(tr.keys, tMs, tr.dur)));
+  // Key by whole degrees of each track's angle (and its axis sign).
+  const key = qs.map(q => Math.round(2 * Math.acos(Math.min(1, Math.abs(q[3]))) *
+                                     57.29578) * Math.sign(q[0] + q[1] + q[2] || 1))
+                .join('|');
+  let frame = A.frames.get(key);
+  if (!frame) {
+    const turned = new Map(A.tracks.map((tr, i) => {
+      const p = b.parts.find(pp => pp.name === tr.part);
+      return [tr.part, turnedPart(p, qs[i], tr.pivot)];
+    }));
+    frame = { genome: b.genome, sidecar: b.sidecar, stats: b.stats,
+              complaints: b.complaints,
+              parts: b.parts.map(p => turned.get(p.name) || p) };
+    gridOf(frame); exposedFaces(frame);           // cache ON the frame
+    if (A.frames.size > 120) A.frames.clear();
+    A.frames.set(key, frame);
+  }
+  const v = Object.create(frame);
+  v.genome = b.genome;
+  return v;
+}
+
+/** The preview's clock: repaint the orbit canvas while the body has an idle
+ *  motion, the page is showing and animation is on. ~30 fps; stops itself
+ *  when there is nothing to play and is restarted by the next paint. */
+let animRunning = false, animLast = 0;
+function ensureAnimLoop() {
+  if (animRunning) return;
+  animRunning = true;
+  const step = now => {
+    const cv = root && root.querySelector('.prev canvas');
+    const b = cv && buildOf(S.genome, S.name);
+    if (!cv || !cv.isConnected || cv.offsetParent === null ||
+        S.animate === false || !animOf(b)) {
+      animRunning = false;
+      return;
+    }
+    if (now - animLast >= 33) {
+      animLast = now;
+      drawOrbit(cv, posedBody(b, now), S.view || ORBIT_HOME);
+    }
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
 }
 
 // ---- tweak ------------------------------------------------------------------
@@ -1143,7 +1441,8 @@ function orbitControls(canvas) {
     queued = true;
     requestAnimationFrame(() => {
       queued = false;
-      drawOrbit(canvas, buildOf(S.genome, S.name), S.view);
+      drawOrbit(canvas, posedBody(buildOf(S.genome, S.name), performance.now()),
+                S.view);
     });
   };
   // Pointer deltas arrive in CSS pixels; pan is in backing-store pixels.
@@ -1205,30 +1504,14 @@ function tweakPane() {
   big.style.touchAction = 'none';
   if (!S.view) S.view = { ...ORBIT_HOME };
   const b = buildOf(S.genome, S.name);
-  drawOrbit(big, b, S.view);
+  drawOrbit(big, posedBody(b, performance.now()), S.view);
   orbitControls(big);
+  // After this render puts the canvas in the page.
+  requestAnimationFrame(ensureAnimLoop);
   const side = wide ? canvasFor(150, 400, 2) : canvasFor(90, 230, 2);
   side.title = 'side view — depth, the jaw, the skull set-back and the hair ' +
                'sweep, none of which read from the front at this resolution';
   thumbFor(side, S.genome, S.name, 'side');
-
-  rowSync.clear();
-  const geneRows = [];
-  let group = null;
-  for (const spec of mg.GENE_SPECS) {
-    // A row another race has (the sylvan's face, bark and crown) is hidden.
-    if (!mg.specApplies(spec, S.genome)) continue;
-    if (spec.group !== group) {
-      group = spec.group;
-      const g = mg.GENE_GROUPS.find(x => x.key === group);
-      geneRows.push(el('div', { class: 'gh' }, (g && g.title) || group));
-      if (g) geneRows.push(el('div', { class: 'gnote' }, g.note));
-    }
-    // The stock-colour stepper sits directly above the swatch it drives (the
-    // hair, or on a machine its plating / shell: stockKind).
-    if (spec.path === 'colors.' + stockKind().base) geneRows.push(hairStockRow());
-    geneRows.push(geneRow(spec));
-  }
 
   const sylvan = S.genome.body.race === 'sylvan';
   // A MACHINE RACE (automaton.js / android.js): its named pickers, its lamp
@@ -1269,10 +1552,19 @@ function tweakPane() {
                 setCollapsed('litter', !both);
               },
             }, both ? 'unfocus' : 'focus')),
-    el('div', { class: 'tbody' + (wide ? ' wide' : '') },
+    el('div', { class: 'tbody' },
       el('div', { class: 'prev' },
         el('div', { class: 'pcanv' }, big, side),
         el('div', {},
+          animOf(b) ? el('div', { class: 'brow' },
+            el('label', { style: 'font-size:10px',
+                          title: 'play what the body does on its own in the ' +
+                                 'game (the tail sway), at its real speed. ' +
+                                 'Tail lag only shows when a body moves.' },
+              el('input', { type: 'checkbox', checked: S.animate !== false,
+                            onchange: e => { S.animate = e.target.checked;
+                                             render(); } }),
+              ' animate (tail sway)')) : null,
           el('div', { class: 'brow racerow' },
             el('span', { title: 'the kind of person: human, sylvan (a wood ' +
                                 'spirit), automaton (clockwork) or android ' +
@@ -1373,8 +1665,120 @@ function tweakPane() {
                                   'whole character',
                            onclick: () => { S.locks = new Set(); render(); } },
                'un-pin all')),
-          variantRow())),
-      el('div', { class: 'genes' }, geneRows)));
+          variantRow()))),
+    S.collapsed.litter ? collapsedLitter() : litterPane());
+}
+
+/** The litter folded: one bar under the preview that brings it back. */
+function collapsedLitter() {
+  return el('div', { class: 'lsec collapsed', title: 'show the litter',
+                     onclick: () => setCollapsed('litter', false) },
+    el('button', {}, '▸'), el('span', { class: 'vlab' }, 'litter'));
+}
+
+// ---- genes: one tab per group ------------------------------------------------
+
+const groupOf = k => mg.GENE_GROUPS.find(x => x.key === k) || null;
+
+/** The rows a group shows on this character, in GENE_SPECS order. A row
+ *  another race has (the sylvan's face, bark and crown) is not one of them. */
+function groupSpecs() {
+  const groups = new Map();
+  for (const spec of mg.GENE_SPECS) {
+    if (!mg.specApplies(spec, S.genome)) continue;
+    if (!groups.has(spec.group)) groups.set(spec.group, []);
+    groups.get(spec.group).push(spec);
+  }
+  return groups;
+}
+
+/** RANDOMIZE ONE TAB: a whole random character of this race (randomGenome,
+ *  colours rolled as a set), moved onto this character's sex, and only this
+ *  group's unpinned genes copied across. Copying the group whole is what keeps
+ *  a style pick and the numbers it set agreeing -- a random hairstyle arrives
+ *  with its own lengths, not with the old ones. The sex and race buttons stay
+ *  put: they move the whole body, which is not "this tab". */
+function randomizeGroup(key) {
+  const specs = groupSpecs().get(key) || [];
+  const rng = mg.makeRng((Math.random() * 1e9) | 0);
+  const g = mg.rollColors(mg.randomGenome(rng, S.locks,
+                                          { race: S.genome.body.race }), rng);
+  const sex = S.genome.body.sex === 'female' ? 'female' : 'male';
+  if (g.body.sex !== sex) mg.applySex(g, sex, S.locks);
+  pushUndo();
+  let n = 0;
+  for (const spec of specs) {
+    if (spec.fixed || S.locks.has(spec.path)) continue;
+    if (spec.path === 'body.sex' || spec.path === 'body.race') continue;
+    mg.setPath(S.genome, spec.path, mg.getPath(g, spec.path));
+    n++;
+  }
+  S.genome = mg.normalizeGenome(S.genome);
+  setDirty(true);
+  const t = (groupOf(key) || {}).title || key;
+  S.status = n ? `randomized ${t} (${n} settings; pinned ones held) -- ` +
+                 'Ctrl+Z undoes it'
+               : `nothing to randomize in ${t}: every setting there is pinned`;
+  render();
+}
+
+function genesPane() {
+  rowSync.clear();
+  const groups = groupSpecs();
+  const keys = [...groups.keys()];
+  const cur = groups.has(S.geneTab) ? S.geneTab : keys[0];
+  const title = k => (groupOf(k) && groupOf(k).title) || k;
+  const tabs = el('div', { class: 'gtabs' }, keys.map(k => el('button', {
+    class: 'gtab' + (k === cur ? ' on' : ''),
+    title: (groupOf(k) || {}).note || '',
+    onclick: () => {
+      if (k === cur) return;
+      S.geneTab = k;
+      try { localStorage.setItem('breed.geneTab', k); } catch { /* ok */ }
+      render();
+      const box = root.querySelector('.genes');
+      if (box) box.scrollTop = 0;
+    },
+  }, title(k))));
+
+  const rows = [];
+  const g = groupOf(cur);
+  if (g) rows.push(el('div', { class: 'gnote' }, g.note));
+  const push = spec => {
+    // The stock-colour stepper sits directly above the swatch it drives (the
+    // hair, or on a machine its plating / shell: stockKind).
+    if (spec.path === 'colors.' + stockKind().base) rows.push(hairStockRow());
+    // ...and the lip swatches above the lip colour row.
+    if (spec.path === 'face.lipTone') rows.push(lipStockRow());
+    rows.push(geneRow(spec));
+  };
+  for (const spec of groups.get(cur) || []) push(spec);
+  // THIS TAB'S COLOURS, the same rows the colours tab has (mg.COLOR_HOME):
+  // the eye colour on the face tab, the lips on the mouth tab.
+  if (cur !== 'colour') {
+    const mine = (groups.get('colour') || []).filter(sp =>
+      (mg.COLOR_HOME[sp.path.slice(7)] || []).includes(cur));
+    if (mine.length) {
+      rows.push(el('div', { class: 'gh' }, 'colours'));
+      mine.forEach(push);
+    }
+  }
+  return el('div', { class: 'bcol' },
+    colHead(null, 'sliders',
+            'every setting of this character, a group per tab. The box at ' +
+            'the left of a row pins it against a litter roll and a randomize.',
+            el('button', { title: 'undo the last change to this character ' +
+                                  '(Ctrl+Z)',
+                           'data-nohist': true, onclick: undo }, 'undo'),
+            el('button', { title: 'redo (Ctrl+Y or Ctrl+Shift+Z)',
+                           'data-nohist': true, onclick: redo }, 'redo'),
+            el('button', { title: 'roll every unpinned setting on this tab ' +
+                                  '(' + title(cur) + ') and nothing else. ' +
+                                  'Ctrl+Z undoes it.',
+                           onclick: () => randomizeGroup(cur) },
+               'randomize ' + title(cur))),
+    tabs,
+    el('div', { class: 'genes' }, rows));
 }
 
 // ---- race: two buttons, one lit ------------------------------------------------
@@ -1592,6 +1996,23 @@ function beardStyleControl() {
     el('span', { class: 'bs-name gv' }, (i + 1) + '/' + order.length));
 }
 
+// The bra's twin of the beard pickers: a style is a preset of every bra gene.
+function pickBra(style) {
+  mg.applyBraStyle(S.genome, style);
+  setDirty(true);
+  syncListControl('bra', mg.BRA_STYLE_ORDER, style);
+  syncRows(p => p.startsWith('body.bra.'));
+  renderPreviewOnly();
+}
+
+function pickBriefs(style) {
+  mg.applyBriefsStyle(S.genome, style);
+  setDirty(true);
+  syncListControl('brf', mg.BRIEFS_STYLE_ORDER, style);
+  syncRows(p => p.startsWith('body.briefs.'));
+  renderPreviewOnly();
+}
+
 /** A machine race's named picker that owns `path`, or null. */
 function machinePicker(path) {
   const M = mg.raceMod(S.genome);
@@ -1670,6 +2091,29 @@ function hairColorControl() {
     el('span', { class: 'hcsw', style: 'background:' + S.genome.colors[k.base] }),
     el('span', { class: 'hc-name gv', style: 'text-align:left' },
        i >= 0 ? list[i][0] : 'custom'));
+}
+
+/** LIP SWATCHES: the character's own deeper skin first, then the stock reds,
+ *  plums and darks. A pick sets `colors.lip`, switches the lips to it and
+ *  turns them on if they were off -- one click to see a colour on the face. */
+function lipStockRow() {
+  const swatches = [['deeper skin', mg.deepLip(S.genome.colors)],
+                    ...Object.entries(mg.LIP_STOCK)];
+  const cur = String(S.genome.colors.lip).toLowerCase();
+  const hint = 'One click puts that colour on the lips (and turns them on). ' +
+               'The first is a deeper version of this character\'s own skin.';
+  return el('div', { class: 'grow', title: hint },
+    el('span'), el('span', { class: 'gl' }, 'lip swatches'),
+    el('span', { class: 'glowctl' }, swatches.map(([k, hex]) => el('button', {
+      class: 'glowsw' + (hex === cur ? ' on' : ''), title: k,
+      style: 'background:' + hex,
+      onclick: () => {
+        gset('colors.lip', hex);
+        if (S.genome.face.lipTone !== 'colour') gset('face.lipTone', 'colour');
+        if (!(S.genome.face.lips >= 1)) gset('face.lips', 2);
+        render();
+      },
+    }))), el('span'), el('div', { class: 'ghint' }, hint));
 }
 
 /** The stock-colour stepper as a gene-list row, above the hair swatch. Not a
@@ -1777,6 +2221,10 @@ function geneRow(spec) {
     input = hairStyleControl();
   } else if (spec.path === 'face.beardStyle') {
     input = beardStyleControl();
+  } else if (spec.path === 'body.bra.style') {
+    input = listStyleControl('bra', mg.BRA_STYLE_ORDER, v, pickBra);
+  } else if (spec.path === 'body.briefs.style') {
+    input = listStyleControl('brf', mg.BRIEFS_STYLE_ORDER, v, pickBriefs);
   } else if (spec.kind === 'enum') {
     input = el('select', {
       onchange: e => { gset(spec.path, e.target.value);
@@ -1851,11 +2299,28 @@ const fmt = (v, spec) => {
 /** Redraw only the tweak pane's two canvases and the three lines under them.
  *  Called on every slider frame, so it must not touch the pool or the litter:
  *  a full render() is thirty bodies, and this is one. */
+let previewQueued = false;
 function renderPreviewOnly() {
+  // ONE REPAINT A FRAME. A colour picker or a slider fires input events far
+  // faster than the screen refreshes; every one used to rebuild and repaint.
+  if (previewQueued) return;
+  previewQueued = true;
+  requestAnimationFrame(() => {
+    if (!previewQueued) return;          // flushed already (__test.flush)
+    previewQueued = false;
+    paintPreview();
+  });
+}
+
+function paintPreview() {
   if (!root) return;
   const cs = root.querySelectorAll('.prev canvas');
   let b = null;
-  if (cs[0]) drawOrbit(cs[0], b = buildOf(S.genome, S.name), S.view || ORBIT_HOME);
+  if (cs[0]) {
+    b = buildOf(S.genome, S.name);
+    drawOrbit(cs[0], posedBody(b, performance.now()), S.view || ORBIT_HOME);
+    ensureAnimLoop();
+  }
   if (cs[1]) b = thumbFor(cs[1], S.genome, S.name, 'side');
   const box = root.querySelector('.bstats');
   if (box && b) { box.textContent = ''; box.append(...statLines(b)); }
@@ -1948,7 +2413,7 @@ function litterPane() {
   // and it was the first thing anyone hit.
   const reroll = () => { rollLitter(); render(); };
 
-  return el('div', { class: 'bcol' },
+  return el('div', { class: 'lsec' },
     colHead('litter', 'litter',
             'a fresh batch of candidates, drawn from the parents'),
     el('div', { class: 'brow' }, srcSel,
@@ -1996,8 +2461,8 @@ function litterPane() {
               'character in the Tweak pane instead.')),
     el('div', { class: 'note' },
       'Keep what looks like a person and breed from it — there is no score ',
-      'here, you are the judge. A PINNED setting (the boxes in the Tweak ',
-      'pane) does not move, which is what lets a litter vary hair and face ',
+      'here, you are the judge. A PINNED setting (the boxes beside the ',
+      'sliders) does not move, which is what lets a litter vary hair and face ',
       'while holding the body still. A red border is a child that failed its ',
       'own structural checks — hover it to read why.'),
     el('div', { class: 'litter' },
@@ -2050,7 +2515,20 @@ export function attach(hooks) {
   H = hooks;
   root = hooks.section;
   css();
+  // See "undo" above: the snapshot is taken BEFORE the control acts. Capture
+  // phase, so it runs ahead of every onclick/oninput on the page.
+  // The undo and redo buttons themselves are not edits: a snapshot there
+  // would clear the redo stack under the very click that wants it.
+  const hist = e => !(e.target.closest && e.target.closest('[data-nohist]'));
+  root.addEventListener('pointerdown', e => { if (hist(e)) pushUndo(); }, true);
+  root.addEventListener('keydown', e => {
+    if (!e.ctrlKey && !e.metaKey && hist(e)) pushUndo();
+  }, true);
 }
+
+/** Ctrl+Z / Ctrl+Y from the host. */
+export function undoFromHost() { undo(); }
+export function redoFromHost() { redo(); }
 
 export async function activate() {
   if (!built) {
@@ -2072,5 +2550,10 @@ export const __test = {
   state: S,
   buildOf, drawBody, rollLitter, render, loadPool,
   set(path, v) { gset(path, v); render(); },
+  /** Paint a repaint queued for the next frame NOW, so a check can read the
+   *  canvas straight after a pick (renderPreviewOnly is one-per-frame). */
+  flush() { if (previewQueued) { previewQueued = false; paintPreview(); } },
+  /** The preview's posed body at `tMs` into its idle motion (posedBody). */
+  posed(tMs) { return posedBody(buildOf(S.genome, S.name), tMs); },
   preset(k) { S.genome = mg.presetGenome(k); render(); },
 };

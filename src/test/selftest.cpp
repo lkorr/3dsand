@@ -955,6 +955,8 @@ const char* const kOrder[] = {
     // (DESIGN.md §8b "The item stage"). Regenerates the ground like
     // coat-transfer, poses one creature with direct phase calls, never ticks.
     "item-stage",
+    // The death screen's peel on a packed cube: CPU only (game/autopsy.h).
+    "autopsy-peel",
     "wound-rebleed",
     // ...and a mace MARKS a corpse and leaves it crumbling, instead of boring
     // an instant sphere out of it: the same three-rung ladder the living
@@ -1054,6 +1056,9 @@ const char* const kOrder[] = {
     // Creatures cast from a hand: a weapon put away for the spell and drawn
     // back, the gesture, the release from the fist. Own pad, regenerated.
     "npc-hand-cast",
+    // The demon's tail: a swaying jointed limb on an upright and a hunched
+    // demon (AnimStateRule::overlay). Own pad, regenerated.
+    "demon-tail",
     // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
     // ledger names the material, it dries at that material's own authored rate
     // (and does not at the default one), and a coat can be tracked back onto

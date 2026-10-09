@@ -292,6 +292,10 @@ export const ART = {
   ...AN.SLOTS,
   // THE DEMON's (demon.js), likewise.
   ...DM.SLOTS,
+  // THE LIPS (2026-10-08): below the demon's. Written into a palette only
+  // when a face paints it (lipUsed), so a body without coloured lips spends
+  // no slot of the engine's shared art palette on it.
+  LIP: 217,
 };
 
 /** Coverage of each wisp tier, 0..255. The steps are even in how THIN they
@@ -328,7 +332,7 @@ export const HAIR_MAT_ID = 'hair_white';
  *  hair through the shoulders. Neither exists on a body whose style has no
  *  mass, so every pre-existing character builds exactly as it did. */
 export const HAIR_PARTS = { hair: 'head', mane: 'torso', snout: 'head',
-                            bough: 'torso' };
+                            bough: 'torso', tail: 'torso' };
 
 /** genome.colors key -> art slot. The genome names a colour by what it IS,
  *  the slot is where it lands; the UI pickers walk this map. */
@@ -346,6 +350,9 @@ export const COLOR_SLOTS = {
   ...AU.COLOR_SLOTS,
   ...AN.COLOR_SLOTS,
   ...DM.COLOR_SLOTS,
+  // LAST, so the jitter loop in rollColors draws for it after every slot it
+  // drew for before it existed (it is a skin tone, so it takes no draw anyway).
+  lip: ART.LIP,
 };
 
 /**
@@ -373,7 +380,10 @@ export const COLOR_SLOTS = {
  * roll simply carries the relationship you left it at.
  */
 export const COLOR_FAMILIES = {
-  skin:  ['skinShade', 'skinLight', 'nail'],
+  // The lips are a TONE of the skin: a deeper, redder version of it, carried
+  // with it -- so a random character's lips are its own complexion's, and a
+  // red picked by hand keeps its relationship when the skin moves.
+  skin:  ['skinShade', 'skinLight', 'nail', 'lip'],
   hair:  ['hairShade'],
   cloth: ['clothShade'],
 };
@@ -484,6 +494,37 @@ export function defaultGenome() {
       sex: 'male',
       /** Chest forward of the torso, 0..1. Female only. */
       bust: 0,
+      /** THE BRA, female only (torsoVox). Paint, like the shorts. Every
+       *  default is the bra as drawn before these genes existed, so no saved
+       *  character moved. `style` is a preset of the rest (BRA_STYLES). */
+      bra: {
+        style: 'classic',
+        cover: 1,         // how high the cups reach: 1 the whole bust, 0.5 to the peak
+        cupSize: 1,       // the painted cups, bigger or smaller than the bust
+        cupLift: 0,       // the painted cups up (+) or down (-) on the bust
+        bridge: 0,        // rows of centre bridge (gore) between the cups
+        bridgePos: 0.5,   // where it sits: 0 on the band, 1 at the cups' top
+        taper: 0,         // cups narrow toward the top (a triangle)
+        plunge: 0,        // a V cut down between the cups
+        bandPos: 0,       // the under-band up (+) or down (-)
+        band: 1,          // the under-band's width; 0 is no band
+        wrap: 0,          // cloth right round the chest from the band up
+        straps: 'classic',
+        strapWidth: 0.75, // half-width of a strap, in cells
+        strapSet: 0.45,   // how far out the straps sit, of the chest's half-width
+        tone: 'cloth',
+      },
+      /** THE LOWER GARMENT, either sex (hipsVox, thighVox). Paint, like the
+       *  bra; every default is the shorts as drawn before these genes. */
+      briefs: {
+        style: 'shorts',
+        rise: 0,          // the waistband up (+) or down (-), ~4 rows a step
+        band: 1,          // waistband rows, in the shaded cloth
+        leg: 0,           // down the thigh: -1 none (briefs), 0 the shorts, 4 near the knee
+        cut: 0,           // the leg opening rises at the hips (a high cut)
+        back: 'full',     // 'full' | 'cheeky' | 'thong'
+        tone: 'cloth',
+      },
       heightM: DEFAULT_HEIGHT_M,
       /** Box widths in AUTHORED micro. Forced EVEN by normalizeGenome: a box
        *  is centred at mn.x = -sx/2 and an odd width puts the ellipse centre
@@ -573,6 +614,8 @@ export function defaultGenome() {
       mouthOpen: 0,     // rows of open mouth under the line
       mouthTone: 'shade',
       lips: 0,          // 0 none, 1 a lit lower lip, 2 both lips
+      lipTone: 'lit',   // 'lit' | 'shade' | 'colour' (colors.lip)
+      lipLine: false,   // the mouth line in colors.lip
       // Other features.
       nose: 0,          // rows of nose standing one cell proud, below the eyes
       noseWidth: 1,     // half-width: 1 is two cells, 2 is four
@@ -662,6 +705,7 @@ export function defaultGenome() {
       cloth: '#7a6a4e',
       clothShade: '#5c4f39',
       nail: '#d9ae90',
+      lip: '#a8564a',
       // Sylvan-only colours (sylvan.js). Carried by every genome so a race
       // switch has somewhere to put them; a human never paints them.
       root: SY.DEFAULT_COLORS.root,
@@ -825,6 +869,77 @@ const BEARD_ROLL = { clean: 10, shadow: 3, stubble: 4, moustache: 2,
                      forked: 0.4, wizard: 0.3, pencil: 0.5 };
 
 /**
+ * BRA STYLES: a preset of every bra gene, the way BEARD_STYLES are of the
+ * beard's. Pick one, then drag. `classic` is the bra as first drawn.
+ */
+const BRA_NONE = { cover: 1, cupSize: 1, cupLift: 0, bridge: 0, bridgePos: 0.5,
+                   taper: 0, plunge: 0, bandPos: 0, band: 1, wrap: 0,
+                   straps: 'classic', strapWidth: 0.75, strapSet: 0.45,
+                   tone: 'cloth' };
+const brs = o => ({ ...BRA_NONE, ...o });
+export const BRA_STYLES = {
+  classic:     brs({}),
+  balconette:  brs({ cover: 0.55, strapSet: 0.56 }),
+  plunge:      brs({ cover: 0.85, plunge: 0.9, strapSet: 0.4 }),
+  triangle:    brs({ cover: 0.95, taper: 0.85, band: 0.6, strapWidth: 0.5,
+                     straps: 'halter' }),
+  halter:      brs({ cover: 0.9, straps: 'halter', strapWidth: 0.9 }),
+  strapless:   brs({ cover: 0.8, straps: 'none', band: 1.3 }),
+  bandeau:     brs({ wrap: 1, straps: 'none' }),
+  sports:      brs({ wrap: 0.7, band: 2, straps: 'racer', strapWidth: 1.5,
+                     strapSet: 0.38, tone: 'shade' }),
+  crossback:   brs({ straps: 'cross', strapWidth: 0.9 }),
+  longline:    brs({ band: 3, bandPos: -1 }),
+  crop:        brs({ wrap: 1.5, strapWidth: 1.8, strapSet: 0.42 }),
+  oneshoulder: brs({ cover: 0.9, straps: 'single', strapWidth: 1.2 }),
+};
+export const BRA_STYLE_ORDER = Object.keys(BRA_STYLES);
+export const BRA_STRAPS = ['classic', 'none', 'halter', 'cross', 'racer',
+                           'single'];
+const BRA_KEYS = Object.keys(BRA_NONE);
+
+/** Snap the bra genes to a named style (see applyBeardStyle). */
+export function applyBraStyle(genome, style) {
+  const s = BRA_STYLES[style];
+  if (!s) return genome;
+  genome.body.bra = { ...genome.body.bra, ...s, style };
+  return genome;
+}
+
+/** LOWER GARMENT STYLES, a preset of every briefs gene (see BRA_STYLES). */
+const BRIEFS_NONE = { rise: 0, band: 1, leg: 0, cut: 0, back: 'full',
+                      tone: 'cloth' };
+const bfs = o => ({ ...BRIEFS_NONE, ...o });
+export const BRIEFS_STYLES = {
+  shorts:     bfs({}),
+  boxers:     bfs({ leg: 1.6, band: 2 }),
+  boyshorts:  bfs({ leg: 0.6, rise: -0.3 }),
+  longshorts: bfs({ leg: 3.5, band: 2 }),
+  briefs:     bfs({ leg: -1, cut: 0.3, band: 2 }),
+  bikini:     bfs({ leg: -1, cut: 0.6, rise: -0.7 }),
+  highcut:    bfs({ leg: -1, cut: 1, rise: 0.4 }),
+  cheeky:     bfs({ leg: -1, cut: 0.5, back: 'cheeky', rise: -0.4 }),
+  thong:      bfs({ leg: -1, cut: 0.9, back: 'thong', rise: -0.3 }),
+};
+export const BRIEFS_STYLE_ORDER = Object.keys(BRIEFS_STYLES);
+export const BRIEFS_BACKS = ['full', 'cheeky', 'thong'];
+
+/** Snap the lower-garment genes to a named style. */
+export function applyBriefsStyle(genome, style) {
+  const s = BRIEFS_STYLES[style];
+  if (!s) return genome;
+  genome.body.briefs = { ...genome.body.briefs, ...s, style };
+  return genome;
+}
+const BRIEFS_ROLL = { shorts: 5, boxers: 2, boyshorts: 2, longshorts: 1,
+                      briefs: 3, bikini: 2, highcut: 1, cheeky: 1, thong: 1 };
+
+/** How often a random roll picks each bra style. */
+const BRA_ROLL = { classic: 6, balconette: 3, plunge: 2, triangle: 2,
+                   halter: 1.5, strapless: 1.5, bandeau: 1.5, sports: 2,
+                   crossback: 1, longline: 1, crop: 1.5, oneshoulder: 0.7 };
+
+/**
  * THE GENE GROUPS, in the order the Characters page stacks them. `note` is the
  * one line under the heading that says what the whole group does — the thing
  * you need BEFORE any individual slider makes sense, and the only place the
@@ -875,6 +990,12 @@ export const GENE_GROUPS = [
           'skin included -- a fade on shaved sides, a buzz on a bald head, ' +
           'stubble growing back. Separate from the style above: picking a ' +
           'style keeps it. Lengths are in voxels.' },
+  { key: 'underwear', title: 'underwear',
+    note: 'Paint on the skin, never geometry, so armour still fits. The bra ' +
+          '(female bodies): cups over the bust, a band round the ribs, straps ' +
+          'over the shoulders. Then the lower garment, on everyone. Pick a ' +
+          'style to set its rows, then drag. The colour is the clothing ' +
+          'colour.' },
   // The sylvan's groups (sylvan.js). `race` hides them on a human's page.
   ...SY.GENE_GROUPS,
   ...AU.GENE_GROUPS,
@@ -906,6 +1027,9 @@ const COLOR_LABELS = {
                'from the light.'],
   nail:       ['nails', 'Fingertips and toenails. Barely visible; it stops ' +
                'the hands reading as mittens.'],
+  lip:        ['lips', 'The lip colour, painted when the mouth tab\'s lip ' +
+               'colour is "colour" (or the line is). A tone of the skin: it ' +
+               'moves with it unless you pin it.'],
 };
 
 /**
@@ -1173,12 +1297,24 @@ export const GENE_SPECS = [
   { path: 'face.mouthTone', label: 'line colour', group: 'mouth',
     kind: 'enum',
     hint: 'The mouth line in the skin shade (soft) or the eye colour (a ' +
-          'hard dark line).',
+          'hard dark line). "line in lip colour" below overrides both.',
     choices: ['shade', 'dark'], sigma: 0.1 },
   { path: 'face.lips', label: 'lips', group: 'mouth',
-    hint: 'A lit row under the mouth for the lower lip; 2 lights the upper ' +
-          'lip too. Hidden under a moustache.',
+    hint: 'A row under the mouth for the lower lip; 2 paints the upper lip ' +
+          'too. Hidden under a moustache.',
     min: 0, max: 2, step: 1, int: true, sigma: 0.3 },
+  { path: 'face.lipTone', label: 'lip colour', group: 'mouth', kind: 'enum',
+    hint: 'lit: the skin\'s lit tone (the old lips). shade: the skin\'s shade, ' +
+          'a deeper version of it. colour: the lip swatch -- a deeper skin ' +
+          'by default, or any red, plum or black you pick.',
+    choices: ['lit', 'shade', 'colour'], sigma: 0.1,
+    // `styled`: no draw in the roll / mutate / cross loops (adding the row
+    // moved no existing roll); randomGenome picks it at the very end.
+    styled: true },
+  { path: 'face.lipLine', label: 'line in lip colour', group: 'mouth',
+    kind: 'bool', styled: true,
+    hint: 'Paint the mouth line itself in the lip colour, for a lipstick ' +
+          'mouth even with no lip rows.' },
 
   // ---- other features ----
   { path: 'face.nose', label: 'nose length', group: 'details',
@@ -1387,7 +1523,7 @@ export const GENE_SPECS = [
   // BASE FIRST, THEN ITS TONES. COLOR_SLOTS is keyed for the palette writer
   // and puts `nail` last; on screen it belongs under the skin it follows, or
   // the indent says "a tone of the thing above" while pointing at the cloth.
-  ...['skin', 'skinShade', 'skinLight', 'nail',
+  ...['skin', 'skinShade', 'skinLight', 'nail', 'lip',
       'hair', 'hairShade', 'eye',
       'cloth', 'clothShade'].map(k => ({
     path: 'colors.' + k, label: (COLOR_LABELS[k] || [k, ''])[0],
@@ -1414,13 +1550,95 @@ export const GENE_SPECS = [
 // The sylvan's face / bark / crown rows go in BEFORE the colours, so the page
 // stacks them under their own headings. Their place in the list moves no
 // human draw: a race-gated row is skipped without one (see `race` above).
+const BRA = (key, label, hint, extra) => ({
+  path: 'body.bra.' + key, label, group: 'underwear', sex: 'female', hint,
+  ...extra });
+const BRA_SPECS = [
+  BRA('style', 'style', 'A starting bra: classic, balconette (low cups, wide ' +
+      'straps), plunge, triangle, halter, strapless, bandeau, sports, ' +
+      'cross-back, longline, crop top, one-shoulder.',
+      { kind: 'enum', choices: BRA_STYLE_ORDER, sigma: 0.1 }),
+  BRA('cover', 'cup height', 'How high the cups reach: 1 covers the whole ' +
+      'bust, 0.5 stops at its fullest point (a demi or balconette cup).',
+      { min: 0.3, max: 1, step: 0.05, sigma: 0.1 }),
+  BRA('cupSize', 'cup size', 'The painted cups bigger or smaller than the ' +
+      'bust under them: below 1 a scrap of fabric, above 1 full coverage.',
+      { min: 0.4, max: 1.8, step: 0.05, sigma: 0.1 }),
+  BRA('cupLift', 'cup height', 'Moves the cups up or down on the bust.',
+      { min: -1, max: 1, step: 0.05, sigma: 0.1 }),
+  BRA('bridge', 'centre bridge', 'Rows of the strap across the middle ' +
+      'between the cups (the gore). 0 is none.',
+      { min: 0, max: 4, step: 1, int: true, sigma: 0.3 }),
+  BRA('bridgePos', 'bridge height', 'Where the centre bridge sits: 0 on the ' +
+      'band, 1 level with the top of the cups.',
+      { min: 0, max: 1, step: 0.05, sigma: 0.1 }),
+  BRA('taper', 'cup taper', 'The cups narrow toward the top. High values ' +
+      'make triangles.', { min: 0, max: 1, step: 0.05, sigma: 0.1 }),
+  BRA('plunge', 'plunge', 'A V cut down between the cups, deeper toward the ' +
+      'top.', { min: 0, max: 1.5, step: 0.05, sigma: 0.15 }),
+  BRA('bandPos', 'band position', 'Moves the under-band -- the lowest strap ' +
+      'round the ribs -- up or down. Each step of 1 is about four rows.',
+      { min: -1.5, max: 1, step: 0.05, sigma: 0.15 }),
+  BRA('band', 'band width', 'How deep the under-band is: 1 is about three ' +
+      'rows, 3 a longline. 0 leaves no band at all.',
+      { min: 0, max: 4, step: 0.1, sigma: 0.2 }),
+  BRA('wrap', 'wrap', 'Cloth right round the chest, front and back, from the ' +
+      'band up: 1 reaches the top of the bust (a bandeau), past 1 a crop top.',
+      { min: 0, max: 2, step: 0.05, sigma: 0.15 }),
+  BRA('straps', 'straps', 'classic: over each shoulder. none: strapless. ' +
+      'halter: up to the neck in front, nothing down the back. cross: ' +
+      'crossed over the back. racer: meeting in the middle of the back. ' +
+      'single: one shoulder only.',
+      { kind: 'enum', choices: BRA_STRAPS, sigma: 0.1 }),
+  BRA('strapWidth', 'strap width', 'Half-width of a strap in cells: 0.5 is ' +
+      'one cell, 2 is a wide band.', { min: 0.5, max: 2.5, step: 0.05,
+                                       sigma: 0.15 }),
+  BRA('strapSet', 'strap spacing', 'How far out on the shoulders the straps ' +
+      'sit: narrow near the neck, wide off the shoulder.',
+      { min: 0.2, max: 0.75, step: 0.01, sigma: 0.05 }),
+  BRA('tone', 'tone', 'cloth: the clothing colour, shaded at the back. ' +
+      'shade: the darker clothing tone all over.',
+      { kind: 'enum', choices: ['cloth', 'shade'], sigma: 0.05 }),
+];
+// THE LOWER GARMENT, on either sex. `styled`: rolled as a STYLE at the end of
+// randomGenome and left alone by mutate / cross, so adding these rows moved
+// no existing roll (both are pinned by test_mobgen on fixed seeds).
+const BRF = (key, label, hint, extra) => ({
+  path: 'body.briefs.' + key, label, group: 'underwear', styled: true, hint,
+  ...extra });
+const BRIEFS_SPECS = [
+  BRF('style', 'bottoms', 'A starting lower garment: shorts, boxers, boy ' +
+      'shorts, long shorts, briefs, bikini, high-cut, cheeky, thong.',
+      { kind: 'enum', choices: BRIEFS_STYLE_ORDER, sigma: 0.1 }),
+  BRF('rise', 'rise', 'Where the waistband sits: up toward the navel or ' +
+      'down on the hips. Each step of 1 is about four rows.',
+      { min: -1.5, max: 1, step: 0.05, sigma: 0.15 }),
+  BRF('band', 'waistband', 'Rows of waistband, in the shaded cloth. 0 is ' +
+      'none.', { min: 0, max: 4, step: 1, int: true, sigma: 0.3 }),
+  BRF('leg', 'leg length', 'How far down the thigh the legs come: -1 none ' +
+      '(briefs), 0 the stock shorts, 4 most of the way to the knee.',
+      { min: -1, max: 4, step: 0.1, sigma: 0.3 }),
+  BRF('cut', 'leg cut', 'How high the leg opening rises over the hips. 0 ' +
+      'is straight across, 1 a high-cut swimsuit line.',
+      { min: 0, max: 1, step: 0.05, sigma: 0.1 }),
+  BRF('back', 'back', 'full: covered behind. cheeky: cut up over the seat. ' +
+      'thong: a strip down the middle.',
+      { kind: 'enum', choices: BRIEFS_BACKS, sigma: 0.1 }),
+  BRF('tone', 'bottoms tone', 'cloth: the clothing colour, shaded at the ' +
+      'back. shade: the darker clothing tone all over.',
+      { kind: 'enum', choices: ['cloth', 'shade'], sigma: 0.05 }),
+];
 GENE_SPECS.splice(GENE_SPECS.findIndex(sp => sp.group === 'colour'), 0,
-                  ...SY.GENE_SPECS, ...AU.GENE_SPECS, ...AN.GENE_SPECS,
+                  ...BRA_SPECS, ...BRIEFS_SPECS, ...SY.GENE_SPECS, ...AU.GENE_SPECS, ...AN.GENE_SPECS,
                   ...DM.GENE_SPECS);
 
-/** Does this row apply to this genome? (race-gated rows, see GENE_SPECS) */
+/** Does this row apply to this genome? (race-gated rows, see GENE_SPECS;
+ *  `sex`-gated rows, the bra, show on that sex only) */
 export const specApplies = (spec, genome) =>
-  !spec.race || spec.race === ((genome && genome.body && genome.body.race) || 'human');
+  (!spec.race ||
+   spec.race === ((genome && genome.body && genome.body.race) || 'human')) &&
+  (!spec.sex ||
+   spec.sex === ((genome && genome.body && genome.body.sex) || 'male'));
 
 /** The label and hint a row shows for this genome: a sylvan's skin is bark. */
 export function specText(spec, genome) {
@@ -1508,12 +1726,63 @@ export function normalizeGenome(src) {
           a[k] = a[k] * ARM_STOCK_SUM / sum;
     }
   }
+  // A GENOME FROM BEFORE THE LIP SLOT gets lips that are a tone of ITS skin
+  // (the default's relationship carried onto it), not the default's colour.
+  if (src && typeof src === 'object' &&
+      !(src.colors && typeof src.colors === 'object' && 'lip' in src.colors))
+    g.colors.lip = deepLip(g.colors);
   const def = defaultGenome();
   for (const spec of GENE_SPECS)
     setPath(g, spec.path, coerceGene(spec, getPath(g, spec.path),
                                      getPath(def, spec.path), g));
   return g;
 }
+
+/** Lips that are a deeper, redder version of `colors.skin`: the default
+ *  genome's lip-to-skin relationship carried onto this skin. */
+export function deepLip(colors) {
+  const def = defaultGenome().colors;
+  const tmp = { colors: { ...colors } };
+  reshadeOne(tmp, 'skin', def, null, d => d === 'lip');
+  return tmp.colors.lip;
+}
+
+/** Does this face paint the lip slot? (paletteBytes writes it only then.) */
+export function lipUsed(g) {
+  const f = g.face || {};
+  return (f.lips >= 1 && f.lipTone === 'colour') || !!f.lipLine;
+}
+
+/** Stock lip colours for the Characters page's swatches. `skin` is computed
+ *  per character (deepLip), the rest are fixed. */
+export const LIP_STOCK = {
+  rose: '#b5605e', coral: '#d0705a', nude: '#b07a66', red: '#a8222a',
+  crimson: '#7a1018', berry: '#7a2c3e', plum: '#5a2a40', brown: '#6a3a2e',
+  black: '#1a1214',
+};
+
+/** WHERE A COLOUR ALSO LIVES: the tabs that show a colour row besides the
+ *  colours tab, so the eye colour is on the face tab and the lips on the
+ *  mouth tab. A tab the race does not have simply never shows. */
+export const COLOR_HOME = {
+  skin: ['body', 'sylbark', 'autobody', 'andbody', 'dmbody'],
+  skinShade: ['body', 'sylbark', 'autobody', 'andbody', 'dmbody'],
+  skinLight: ['body', 'sylbark', 'autobody', 'andbody', 'dmbody'],
+  nail: ['arms', 'dmbody'],
+  lip: ['mouth'],
+  hair: ['hair', 'sylcrown'], hairShade: ['hair', 'sylcrown'],
+  eye: ['face', 'sylface', 'autoface', 'andface', 'dmhead'],
+  cloth: ['underwear'], clothShade: ['underwear'],
+  root: ['sylbark'], moss: ['sylbark'], branch: ['sylbranch'],
+  flower: ['sylcrown'], flowerEye: ['sylcrown'], leaf2: ['sylcrown'],
+  leaf3: ['sylcrown'], leaf4: ['sylcrown'],
+  rivet: ['autobody'], pipe: ['autobody'], gear: ['autobody'],
+  gearDark: ['autobody'], patina: ['autobody'], fire: ['autobody'],
+  joint: ['autobody'], glass: ['autoface'],
+  light: ['andbody'], seam: ['andbody'], frame: ['andbody'], core: ['andbody'],
+  trace: ['andbody'], visor: ['andface'],
+  horn: ['dmhead'], hornTip: ['dmhead'], claw: ['dmbody'], mark: ['dmbody'],
+};
 
 /**
  * THE SEXES, as offsets female-minus-male over the build genes. A toggle
@@ -1791,6 +2060,7 @@ export function mutate(genome, sigma, rng, locks) {
   for (const spec of GENE_SPECS) {
     if (isLocked(locks, spec.path)) continue;
     if (spec.fixed || !specApplies(spec, g)) continue;   // no draw: see `race`
+    if (spec.styled) continue;          // a style row: kept, see BRIEFS_SPECS
     const cur = getPath(g, spec.path);
     const s = (spec.sigma ?? 0.1) * sigma;
     if (spec.kind === 'color') {
@@ -1814,6 +2084,9 @@ export function mutate(genome, sigma, rng, locks) {
   if (!isLocked(locks, 'face.beardStyle') &&
       g.face.beardStyle !== (genome?.face?.beardStyle ?? 'clean'))
     applyBeardStyle(g, g.face.beardStyle);
+  if (!isLocked(locks, 'body.bra.style') &&
+      g.body.bra.style !== (genome?.body?.bra?.style ?? 'classic'))
+    applyBraStyle(g, g.body.bra.style);
   // ...and a sylvan face or crown pick, likewise.
   if (g.body.race === 'sylvan') {
     if (!isLocked(locks, 'sylvan.face') &&
@@ -1869,6 +2142,7 @@ export function cross(parents, rng, opts = {}) {
   for (const spec of GENE_SPECS) {
     if (isLocked(opts.locks, spec.path)) continue;
     if (spec.fixed || !specApplies(spec, g)) continue;   // no draw: see `race`
+    if (spec.styled) continue;          // a style row: kept, see BRIEFS_SPECS
     if (spec.kind === 'enum' || spec.kind === 'bool') {
       setPath(g, spec.path, getPath(r.pick(ps), spec.path));
     } else if (spec.kind === 'color') {
@@ -1925,6 +2199,12 @@ export function cross(parents, rng, opts = {}) {
   if (!isLocked(opts.locks, 'face.beardStyle'))
     for (const k of BEARD_KEYS)
       if (!isLocked(opts.locks, 'face.' + k)) g.face[k] = bdonor.face[k];
+  // ...and the bra genes from whichever parent supplied the bra style.
+  const brdonor = ps.find(p => p.body.bra.style === g.body.bra.style) || ps[0];
+  if (!isLocked(opts.locks, 'body.bra.style'))
+    for (const k of BRA_KEYS)
+      if (!isLocked(opts.locks, 'body.bra.' + k))
+        g.body.bra[k] = brdonor.body.bra[k];
   // Each family's tones come from the parent its BASE came mostly from, so the
   // child gets one person's relationship between a skin and its shade rather
   // than an average of two.
@@ -1947,6 +2227,10 @@ export function randomGenome(rng, locks, opts = {}) {
   for (const spec of GENE_SPECS) {
     if (isLocked(locks, spec.path)) continue;
     if (spec.fixed || !specApplies(spec, g)) continue;   // no draw: see `race`
+    // A SEX-GATED ROW (the bra) is rolled as a style at the end, not here:
+    // `body.sex` is drawn earlier in this very loop, so a draw gated on it
+    // would shift every draw after it whenever the sex came up female.
+    if (spec.sex || spec.styled) continue;
     // A RARE FEATURE stays at its default unless its own draw comes up: a
     // scar, freckles or pointed ears on every other roll is not variety.
     if (spec.roll !== undefined && r() >= spec.roll) continue;
@@ -2003,6 +2287,19 @@ export function randomGenome(rng, locks, opts = {}) {
     applyRace(g, opts.race, locks);
     RACE_MODS[opts.race].randomize(g, r, path => isLocked(locks, path));
     rollColors(g, r);
+  }
+  // A BRA IS A STYLE, then a nudge of its band -- as the beard is. Drawn on
+  // either sex (a man never draws it) so the Characters page's per-tab
+  // randomize has a bra to copy whichever sex the roll came out.
+  if (!isLocked(locks, 'body.briefs.style'))
+    applyBriefsStyle(g, weightedPick(BRIEFS_ROLL, r));
+  if (!isLocked(locks, 'face.lipTone'))
+    g.face.lipTone = weightedPick({ lit: 3, shade: 2, colour: 3 }, r);
+  if (!isLocked(locks, 'body.bra.style')) {
+    applyBraStyle(g, weightedPick(BRA_ROLL, r));
+    if (!isLocked(locks, 'body.bra.bandPos'))
+      g.body.bra.bandPos = clamp(g.body.bra.bandPos + (r() - 0.5) * 0.6,
+                                 -1.5, 1);
   }
   return normalizeGenome(g);
 }
@@ -2487,6 +2784,11 @@ function torsoProfiles(g, size) {
  * body that is skin all the way through. Cups over the bust, a band right
  * round the ribs under it, and a strap up each side of the chest to the top
  * of the shoulder, front and back. Pre-flip, high y is the FRONT.
+ *
+ * Its shape is `body.bra` (BRA_STYLES): cup height, taper and plunge carve
+ * the cups; the band moves and widens; `wrap` paints a tube from the band up;
+ * the straps take one of BRA_STRAPS' routes. At the defaults every test
+ * below reduces to the original three (cup / band / strap), cell for cell.
  */
 function torsoVox(g, size) {
   const [sx, sy, sz] = size;
@@ -2509,11 +2811,46 @@ function torsoVox(g, size) {
     if (bx <= 0) return 0;
     return bust * 2.2 * Math.sqrt(bx) * Math.sqrt(bu);
   };
+  const bra = g.body.bra;
+  // THE PAINTED CUPS are the bust's lobes, moved by cupLift and scaled by
+  // cupSize -- the same bump test on a lobe of their own, so at 0 / 1 they are
+  // exactly the bust (and so exactly the bra as first drawn).
+  const pPeak = uPeak + bra.cupLift * 0.08, pHalf = uHalf * bra.cupSize;
+  const cupAt = (x, u, rx) => {
+    if (bust <= 0) return 0;
+    const bu = 1 - Math.abs(u - pPeak) / pHalf;
+    if (bu <= 0) return 0;
+    const off = rx * 0.45, w = Math.max(rx * 0.32, 1.1) * bra.cupSize;
+    const dx = Math.min(Math.abs(x + 0.5 - (cx - off)),
+                        Math.abs(x + 0.5 - (cx + off)));
+    const bx = 1 - (dx / w) * (dx / w);
+    if (bx <= 0) return 0;
+    return bust * 2.2 * Math.sqrt(bx) * Math.sqrt(bu);
+  };
+  // The cups' top: the whole lobe at cover 1, its peak at 0.5.
+  const cupTop = pPeak + pHalf * (2 * bra.cover - 1);
+  const cupLo = pPeak - pHalf;
+  const bandBot = bandLo + bra.bandPos * 0.12;
+  const bandTop = bandBot + 0.09 * bra.band;
+  const wrapTop = bandBot + bra.wrap * (bandHi - bandBot + 0.04);
+  // Straps leave from wherever the cups stop.
+  const strapLo = Math.min(bandHi, cupTop) - 0.02;
+  const sw = bra.strapWidth;
+  const row = 1 / Math.max(sz - 1, 1);
+  const bridgeLo = bandTop + (cupTop - bandTop) * bra.bridgePos -
+                   row * bra.bridge * 0.5;
+  // The plunge's V opens from one row above the band's foot, so even a deep
+  // plunge through a wide band leaves the band joined at the bottom.
+  const vBase = bandBot + row * 1.2;
   const out = [];
   for (let z = 0; z < sz; z++) {
     const u = z / Math.max(sz - 1, 1);
     const rx = profile(u, prx), ry = profile(u, pry);
-    const strapX = rx * 0.45;
+    const strapX = rx * bra.strapSet;
+    const lobeOff = rx * 0.45, lobeW = Math.max(rx * 0.32, 1.1);
+    // Where the back straps run at this height, as a distance off the spine
+    // (classic: straight up; cross: an X; racer: in to the spine, then down).
+    const backT = clamp((u - bandTop) / Math.max(1 - bandTop, 1e-6), 0, 1);
     for (let y = 0; y < sy; y++)
       for (let x = 0; x < sx; x++) {
         const front = y + 0.5 > cy;
@@ -2523,14 +2860,67 @@ function torsoVox(g, size) {
         if (!ellipseMask(x, y, cx, cy, rx, front ? ryHere : ry)) continue;
         let col = shadeBack(y, cy, ART.SKIN_BASE, ART.SKIN_SHADE);
         if (female) {
-          const cup = bump > 0.25;
-          const band = u >= bandLo && u < bandLo + 0.09;
-          // Straps: one column pair each side, from the cups to the top.
-          const strap = u > bandHi - 0.02 &&
-            Math.abs(Math.abs(x + 0.5 - cx) - strapX) < 0.75;
-          if (cup || band || strap)
-            col = front || !cup ? shadeBack(y, cy, ART.CLOTH, ART.CLOTH_SHADE)
-                                : col;
+          // THE ORDER IS THE GARMENT: (1) the cups, cut to height and shape;
+          // (2) the band, the wrap and the centre bridge; (3) the PLUNGE,
+          // which cuts its V out of ALL of those -- it used to cut the cups
+          // only, and a wide band painted straight back over it; (4) the
+          // straps, on top of everything.
+          const dxc = x + 0.5 - cx, ax = Math.abs(dxc);
+          let cup = front && cupAt(x, u, rx) > 0.25 && u <= cupTop + 1e-9;
+          if (cup && bra.taper > 0) {
+            const t = clamp((u - cupLo) / Math.max(cupTop - cupLo, 1e-6), 0, 1);
+            const dl = Math.min(Math.abs(ax - lobeOff), lobeW * bra.cupSize);
+            if (dl > lobeW * bra.cupSize * (1 - bra.taper * t)) cup = false;
+          }
+          let band = bra.band > 0 && u >= bandBot && u < bandTop;
+          let wrap = bra.wrap > 0 && u >= bandBot && u < wrapTop;
+          let bridge = bra.bridge > 0 && front && ax < lobeOff &&
+                       u >= bridgeLo && u < bridgeLo + row * bra.bridge;
+          if (front && bra.plunge > 0) {
+            const t = clamp((u - vBase) / Math.max(cupTop - vBase, 1e-6), 0, 1);
+            // Never a point: the V is already open at its foot, and opens
+            // fast, so a deep plunge visibly parts a wide band too.
+            if (u >= vBase &&
+                ax < bra.plunge * lobeOff * (0.3 + 0.7 * Math.sqrt(t)))
+              cup = band = wrap = bridge = false;
+          }
+          band = band || bridge;
+          let strap = false;
+          const near = xl => Math.abs(ax - xl) < sw;
+          if (u > strapLo) {
+            switch (bra.straps) {
+              case 'classic': strap = near(strapX); break;
+              case 'single': strap = dxc < 0 && near(strapX); break;
+              case 'halter': {
+                // Front: in from the cups to the neck. Back: a tie at the nape.
+                const t = clamp((u - strapLo) / Math.max(1 - strapLo, 1e-6),
+                                0, 1);
+                strap = front ? near(strapX + (rx * 0.16 - strapX) * t)
+                              : u > 0.94 && ax < rx * 0.16 + sw;
+                break;
+              }
+              case 'cross':
+                strap = front ? near(strapX)
+                              : u > bandTop - 0.02 &&
+                                near(strapX * Math.abs(2 * backT - 1));
+                break;
+              case 'racer': {
+                const mid = 0.45;
+                strap = front ? near(strapX)
+                              : u > bandTop - 0.02 &&
+                                near(strapX * clamp((backT - mid) / (1 - mid),
+                                                    0, 1));
+                break;
+              }
+              default: break;           // 'none'
+            }
+          }
+          if (cup || band || wrap || strap)
+            col = front || !cup || wrap
+              ? (bra.tone === 'shade' ? ART.CLOTH_SHADE
+                                      : shadeBack(y, cy, ART.CLOTH,
+                                                  ART.CLOTH_SHADE))
+              : col;
         }
         out.push([x, y, z, col]);
       }
@@ -2552,7 +2942,12 @@ function hipsVox(g, size) {
   const prx = scaleKnots([[0.00, 4.4], [0.40, 4.9], [1.00, 4.6]], rxr,
                          () => g.shape.seat);
   const pry = scaleKnots([[0.00, 2.8], [0.50, 3.3], [1.00, 3.0]], ryr);
-  const waist = sz - 3;      // the waistband row; everything above it is bare
+  // THE LOWER GARMENT (body.briefs). At the defaults: the waistband row at
+  // sz-3, cloth everything below it -- the shorts as first drawn.
+  const br = g.body.briefs;
+  const waist = clamp(sz - 3 + Math.round(br.rise * 4), 1, sz - 1);
+  const cloth = y => br.tone === 'shade' ? ART.CLOTH_SHADE
+                                         : shadeBack(y, cy, ART.CLOTH, ART.CLOTH_SHADE);
   const out = [];
   for (let z = 0; z < sz; z++) {
     const u = z / Math.max(sz - 1, 1);
@@ -2560,10 +2955,24 @@ function hipsVox(g, size) {
     for (let y = 0; y < sy; y++)
       for (let x = 0; x < sx; x++) {
         if (!ellipseMask(x, y, cx, cy, rx, ry)) continue;
+        const skin = shadeBack(y, cy, ART.SKIN_BASE, ART.SKIN_SHADE);
         let col;
-        if (z > waist) col = shadeBack(y, cy, ART.SKIN_BASE, ART.SKIN_SHADE);
-        else if (z === waist) col = ART.CLOTH_SHADE;
-        else col = shadeBack(y, cy, ART.CLOTH, ART.CLOTH_SHADE);
+        if (z > waist) col = skin;
+        else if (z > waist - br.band) col = ART.CLOTH_SHADE;
+        else {
+          col = cloth(y);
+          // THE LEG OPENING rises toward the sides of the hips; behind, a
+          // cheeky cut rises further and a thong leaves one strip.
+          const back = y + 0.5 < cy;               // pre-flip: low y is BACK
+          const ax = Math.abs(x + 0.5 - cx) / Math.max(rx, 1);
+          const cut = back && br.back === 'cheeky' ? Math.min(1, br.cut + 0.5)
+                                                   : br.cut;
+          const side = clamp((ax - (back && br.back === 'cheeky' ? 0.15 : 0.35)) /
+                             0.65, 0, 1);
+          if (cut > 0 && z < cut * (waist - 1) * side * side) col = skin;
+          if (back && br.back === 'thong' && Math.abs(x + 0.5 - cx) > 1.1)
+            col = skin;
+        }
         out.push([x, y, z, col]);
       }
   }
@@ -3020,7 +3429,11 @@ function headVox(g, size, ctx) {
   const mcols = [];
   for (let k = 0; k < mw; k++)
     mcols.push(Math.trunc(cx) - 1 + k - ((mw - 2) >> 1) + f.mouthShift);
-  const mtone = f.mouthTone === 'dark' ? ART.EYE : ART.SKIN_SHADE;
+  const mtone = f.lipLine ? ART.LIP
+              : f.mouthTone === 'dark' ? ART.EYE : ART.SKIN_SHADE;
+  const lipCol = f.lipTone === 'colour' ? ART.LIP
+               : f.lipTone === 'shade' ? ART.SKIN_SHADE : null;
+  const lip = (x, z) => lipCol ? paintAt(x, z, lipCol, true) : light(x, z);
   const mz = mouthZ;
   const curveUp = Math.sign(f.mouthCurve);
   const moff = mcols.map((_, n) => {
@@ -3039,9 +3452,9 @@ function headVox(g, size, ctx) {
   for (let r = 1; r <= f.mouthOpen; r++)
     mcols.forEach((x, n) => paintAt(x, mz + moff[n] - r, ART.EYE));
   if (f.lips >= 1)
-    for (const x of mcols) light(x, mz + Math.min(...moff) - f.mouthOpen - 1);
+    for (const x of mcols) lip(x, mz + Math.min(...moff) - f.mouthOpen - 1);
   if (f.lips >= 2)
-    for (const x of mcols) light(x, mz + Math.max(...moff) + 1);
+    for (const x of mcols) lip(x, mz + Math.max(...moff) + 1);
   if (f.wrinkles >= 0.7) {                    // nose-to-mouth lines
     shade(mcols[0] - 1, mz + moff[0] + 1);
     shade(mcols[mw - 1] + 1, mz + moff[mw - 1] + 1);
@@ -3104,11 +3517,16 @@ function handVox(g, size) {
  *  the leg swings. */
 function thighVox(g, size) {
   const sz = size[2];
-  const hem = sz - 4;
+  // body.briefs.leg: 3 cloth rows over a hem at 0 (the stock shorts), none
+  // at -1 (briefs: no hem either), most of the thigh at 4.
+  const br = g.body.briefs;
+  const rows = clamp(Math.round(3 + br.leg * 3), 0, sz - 2);
+  const hem = rows > 0 ? sz - 1 - rows : sz;
   const r = g.shape.legGirth * (size[0] / DEF['legU.L'].size[0]);
   const col = (x, y, z, sx, sy) => {
     if (z === hem) return ART.CLOTH_SHADE;
-    if (z > hem) return shadeBack(y, sy * 0.5, ART.CLOTH, ART.CLOTH_SHADE);
+    if (z > hem) return br.tone === 'shade'
+      ? ART.CLOTH_SHADE : shadeBack(y, sy * 0.5, ART.CLOTH, ART.CLOTH_SHADE);
     return shadeBack(y, sy * 0.5, ART.SKIN_BASE, ART.SKIN_SHADE);
   };
   return flipY(size, limbTube(size, 1.9 * r, 2.1 * r, col));
@@ -3871,7 +4289,9 @@ function hairMass(g, parts, extra = {}) {
   // After the mass is built AND thinned (the thinning only touches hair slots,
   // but it also deletes cells in front of the eyes, which the veil must see
   // gone), before the split. Leaves use the hair slots, so they are leaves.
-  let snoutCells = [], boughCells = [];
+  // A TAIL (demon.js) is its own group: one jointed limb off the small of the
+  // back that sways and lags (sidecar `tail` limb), not a fixed bough.
+  let snoutCells = [], boughCells = [], limbTail = [];
   if (crownOn) {
     const got = SY.crownExtras(g, { ART, K, add, C, halfW, halfD, skullH,
                                     head, mass, body, face: extra.face,
@@ -3888,10 +4308,12 @@ function hairMass(g, parts, extra = {}) {
                                splitZ });
     snoutCells = snoutCells.concat(got.head);
     boughCells = boughCells.concat(got.torso);
+    limbTail = limbTail.concat(got.tail || []);
   }
 
   // ---- split by what it rides, then into connected pieces -------------------
-  const groups = { hair: [], mane: [], snout: snoutCells, bough: boughCells };
+  const groups = { hair: [], mane: [], snout: snoutCells, bough: boughCells,
+                   tail: limbTail };
   // A TAIL RIDES THE HEAD all the way down: it is tied to the head, and a
   // ponytail swinging when the head turns is what one does.
   for (const [k, v] of mass)
@@ -3938,6 +4360,7 @@ function hairMass(g, parts, extra = {}) {
   const taken = new Set([...mass.keys()]);
   for (const c of groups.snout || []) taken.add(K(c[0], c[1], c[2]));
   for (const c of groups.bough || []) taken.add(K(c[0], c[1], c[2]));
+  for (const c of groups.tail || []) taken.add(K(c[0], c[1], c[2]));
   // THE BLOCKS ARE THE ENGINE'S: the loader maps scene (x, y, z) to engine
   // (x, z, -y) and rebases to the min corner, so a block runs up from the min
   // corner in x and z but DOWN from the max corner in scene y.
@@ -4035,11 +4458,14 @@ function hairMass(g, parts, extra = {}) {
     // Specks too small to be a limb (a crest ray that clipped a corner) are
     // dropped; everything else is a limb.
     // (The snout is small and deliberate: it keeps anything past a speck.)
-    pieces.filter(p => p.length >= (base === 'snout' || base === 'bough' ? 8
+    pieces.filter(p => p.length >= (base === 'snout' || base === 'bough' ||
+                                    base === 'tail' ? 8
                                                      : Math.max(32, total * 0.02)))
       .sort((a, b) => b.length - a.length)
       .map(p => p.map(i => cells[i]))
-      .filter(pc => base !== 'bough' || rooted(pc))
+      .filter(pc => (base !== 'bough' && base !== 'tail') || rooted(pc))
+      // ONE tail: a scrap the body cut off it is not a second tail.
+      .filter((pc, n) => base !== 'tail' || n === 0)
       .map(pc => giveCollider(pc))
       .filter(Boolean)
       .forEach((pc, n) => out.push({
@@ -4772,7 +5198,10 @@ export function generateMob(genome, seed = 0, opts = {}) {
       models.push({ name: p.name + '.col', size, t,
                     voxels: p.cells.map(([x, y, z, c]) => ({ x, y, z, c })) });
     }
-    vox = writeVox(models, paletteBytes(opts.materials, g.colors, g.body.race),
+    vox = writeVox(models, paletteBytes(opts.materials,
+                                        lipUsed(g) ? g.colors
+                                                   : { ...g.colors, lip: null },
+                                        g.body.race),
                    { scene: true });
   }
 
@@ -5162,12 +5591,16 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
   const hairLimbs = [], hairAnatomy = {};
   for (const p of hairParts) {
     let best = null, bestD = Infinity;
+    const isTail = p.name === 'tail';
     for (const [x, y, z] of p.cells) {
       const X = (p.mn[0] + x) / U, Y = (p.mn[1] + y) / U, Z = (p.mn[2] + z) / U;
       const par = L[p.parent];
-      const px = par.mn[0] + par.size[0] / 2, py = par.mn[1] + par.size[1] / 2;
+      // A TAIL pivots at its ROOT: the back of the torso at its foot (scene
+      // +y is BACK), not the top of the torso a mane hangs from.
+      const px = par.mn[0] + par.size[0] / 2;
+      const py = isTail ? par.mn[1] + par.size[1] : par.mn[1] + par.size[1] / 2;
       const pz = p.parent === 'head' ? par.mn[2] + par.size[2] * 0.5
-                                     : par.mn[2] + par.size[2];
+               : isTail ? par.mn[2] : par.mn[2] + par.size[2];
       const d = (X - px) ** 2 + (Y - py) ** 2 + (Z - pz) ** 2;
       if (d < bestD) { bestD = d; best = [p.mn[0] + x, p.mn[1] + y, p.mn[2] + z]; }
     }
@@ -5180,7 +5613,14 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
       hp, severable: true, vital: false, bloodless: true, tag: 'hair',
       anchor: anchor([best[0] + 0.5, best[1] + 0.5, best[2] + 1]),
     };
-    if (p.parent !== 'head' && !p.name.startsWith('bough')) {
+    if (isTail) {
+      // Swings wide side to side (the sway clip) and lags the body on a
+      // spring -- the race says how much (demon.js tailLimb).
+      const Mt = raceMod(g);
+      Object.assign(limb, { cone: 0.6, coneSide: 0.9, twist: 0.2,
+                            spring: { halflife: 0.35, gain: 0.6, maxAngle: 0.6 },
+                            ...((Mt && Mt.tailLimb) ? Mt.tailLimb(g) : {}) });
+    } else if (p.parent !== 'head' && !p.name.startsWith('bough')) {
       Object.assign(limb, { cone: 0.3, coneSide: 0.2, twist: 0.15,
                             spring: { halflife: 0.3, gain: 0.3, maxAngle: 0.25 } });
     }
@@ -5199,6 +5639,11 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
 
   const gait = gaitNumbers(table, opts, g.body.heightM);
   const clips = scaleClipPositions(buildClips(gait), SKIN_UPSCALE);
+  // A race's own clips (demon.js extraClips: the tail sway), rotation-only,
+  // only for parts this body actually grew.
+  const Mc = raceMod(g);
+  if (Mc && Mc.extraClips)
+    Object.assign(clips, Mc.extraClips(g, new Set(hairParts.map(p => p.name))));
 
   return {
     root: ARCHETYPE.root,
@@ -5245,7 +5690,9 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
     // ...plus a race's base posture (demon.js extraStates: the hunch),
     // appended AFTER every damage state so a crawl or a limp still wins.
     states: [...buildStates(),
-             ...((raceMod(g) && raceMod(g).extraStates) ? raceMod(g).extraStates(g) : [])],
+             ...((raceMod(g) && raceMod(g).extraStates)
+                   ? raceMod(g).extraStates(g)
+                       .filter(st => !st.overlay || clips[st.clip]) : [])],
     clips,
     flipbooks: {},
     // What rolled this body. Not read by the engine; it is what lets the

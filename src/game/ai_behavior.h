@@ -374,6 +374,20 @@ struct AttackTuning {
   // Facing error (radians) the mob will accept before committing. A swing at a
   // target 90 degrees off the nose is a whiff nobody asked for.
   float aimTolerance = 0.45f;
+  // ---- A BLOW THAT LEAVES FROM THE HEAD, NOT THE CENTRE (snake, 2026-10-08) --
+  //
+  // Radians; 0 = off, which is every creature whose blow leaves from about its
+  // own centre (a shoulder is a hand's width from it). A snake's fangs are
+  // NINE voxels ahead of its centre, so `reach` and `aimTolerance` measured
+  // from the centre licensed strikes at a man standing beside its neck or 40
+  // degrees off its nose -- both behind or beside the head -- and the lunge,
+  // aimed from the centre too, carried the jaws straight past him, every
+  // cadence, for as long as he stood there. With a cone set, the commit also
+  // requires the target to be AHEAD of the head (SelfView::muzzleFwd) and
+  // within this half-angle of the nose as seen FROM the head, the band floor
+  // never lets the target inside the body's own length, and the lunge is
+  // aimed from the head (MobSystem::StepStroke).
+  float muzzleCone = 0.0f;
   // Ticks between attacks, plus a per-attack hash-RNG jitter in [0, jitter).
   // The jitter is not garnish: a metronome is the single most robot-like thing
   // a melee NPC can do, and it makes two of them perfectly synchronised.
@@ -796,6 +810,12 @@ struct SelfView {
   // (which reads as "no opinion — keep the authored band"). `Think` pulls the
   // band in onto it, and only ever INWARD; see the band-geometry note there.
   float strikeReach = 0.0f;
+  // ---- WHERE THE BLOW LEAVES FROM, ahead of the centre (AttackTuning::
+  // muzzleCone) -------------------------------------------------------------
+  // World voxels along the heading from Centre() to the striking part's joint
+  // (Mob::StrokePivotWorld): a snake's neck. 0 = the centre, which is what
+  // every caller that does not fill it means.
+  float muzzleFwd = 0.0f;
   // ---- THE BODY'S CONDITION, for the rule facts (Fact::Hp and friends) -----
   // Filled by MobSystem::DecideIntent from the rig (Mob::BodyFacts). The
   // defaults are an unhurt creature, so a caller that knows nothing about a

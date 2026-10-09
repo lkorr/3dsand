@@ -10427,6 +10427,259 @@ Status GateSnake(Ctx& c, std::string& detail) {
     c.mobs.OnMaterialsReloaded(c.mats, c.reactions);
   }
 
+  // ---- PASS C2: THE AWKWARD PLACEMENTS, AND A STAIRCASE (2026-10-08) -------
+  //
+  // Owner: "sometimes their bites will just miss indefinitely depending on how
+  // the player is positioned". A snake's fangs are nine voxels ahead of its
+  // centre, and the commit gate and the lunge both measured from the centre,
+  // so a man standing beside its neck, or 40 degrees off its nose at striking
+  // distance, was struck at -- and missed -- every cadence. Each placement
+  // below is a still man and a snake facing +Z on its own profile; it must
+  // land its bite (the infect material in him) inside `snake.placeTicks`.
+  // `strikes` before the bite is the number of whiffs (rule 6: the per-strike
+  // line prints where each went).
+  if (humanDef >= 0 && sd.bite.infectMat != 0) {
+    const MobDef& hd = c.mobs.Defs()[humanDef];
+    const float sx = (float)spot.x + 0.5f, sz = (float)spot.z + 4.0f;
+    struct Place { const char* name; float dx, dz; };
+    const Place places[] = {
+        {"beside the neck", 4.0f, 6.0f},
+        {"40 deg off the nose", 6.4f, 7.7f},
+        {"dead ahead", 0.0f, 11.0f},
+    };
+    const int maxTicks = (int)BaselineNumber("snake.placeTicks", 300.0);
+    for (const Place& pl : places) {
+      const uint64_t prey = c.mobs.Spawn(
+          humanDef,
+          {(int)std::lround(sx + pl.dx - hd.worldSize.x * 0.5f), h0 + 1,
+           (int)std::lround(sz + pl.dz - hd.worldSize.z * 0.5f)});
+      const uint64_t biter = c.mobs.Spawn(
+          snakeDef, {(int)std::lround(sx - sd.worldSize.x * 0.5f), h0 + 1,
+                     (int)std::lround(sz - sd.worldSize.z * 0.5f)});
+      if (prey == 0 || biter == 0 ||
+          !c.mobs.SetMobBehavior(prey, "training_dummy")) {
+        check(false, Format("the placement fixture spawned (%s)", pl.name));
+        cleanup();
+        continue;
+      }
+      c.mobs.SetHeading(biter, 0.0f);
+      int took = -1, strikes = 0;
+      bool wasCutting = false;
+      NpcStroke lastCut;
+      std::string trail;
+      for (int t = 0; t < maxTicks && took < 0; t++) {
+        tick();
+        const NpcStroke* st = c.mobs.MobStroke(biter);
+        const bool cutting = st != nullptr && st->Cutting();
+        if (cutting && !wasCutting) strikes++;
+        if (cutting) lastCut = *st;
+        if (!cutting && wasCutting) {
+          Vec3 head{};
+          const Mob* hm = c.mobs.FindMobById(biter);
+          const bool haveHead = hm != nullptr && !chain.empty() &&
+                                hm->LimbCentreWorld(chain.front(), head);
+          trail += Format(" [t%d head %.1f from aim, body %d]", t,
+                          haveHead ? (head - lastCut.targetPoint).len() : -1.0f,
+                          lastCut.probesBody);
+        }
+        wasCutting = cutting;
+        uint32_t env = 0;
+        for (size_t li = 0; li < hd.limbs.size(); li++)
+          env += c.mobs.LimbMaterialCount(prey, (int)li, sd.bite.infectMat);
+        if (env > 0) took = t;
+      }
+      check(took >= 0, Format("placed %s, it bites within %d ticks (%d "
+                              "strike(s):%s)",
+                              pl.name, maxTicks, strikes, trail.c_str()));
+      std::printf("snake placement %-20s: bite at tick %d after %d strike(s)%s\n",
+                  pl.name, took, strikes, trail.c_str());
+      cleanup();
+    }
+  }
+
+  // ---- ...AND A SNAKE CUT BEHIND ITS HEAD IS DEAD ---------------------------
+  // Owner: "if a snake's head gets chopped off its body seems to still live".
+  // The blade went through `body1`, the segment the head hangs from; it came
+  // off WITH the head, and since `body1` is not itself vital the rest went on
+  // slithering. Mob::Sever now dies of any cut that carries a vital limb away.
+  {
+    int neck = -1;
+    for (size_t i = 0; i < sd.limbs.size(); i++)
+      if (sd.limbs[i].name == "body1") neck = (int)i;
+    const uint64_t sid = c.mobs.Spawn(
+        snakeDef, {spot.x - (int)std::lround(sd.worldSize.x * 0.5f), h0 + 1,
+                   (int)std::lround((float)spot.z - sd.worldSize.z * 0.5f)});
+    Mob* sm = sid != 0 ? c.mobs.FindMobById(sid) : nullptr;
+    if (neck < 0 || sm == nullptr) {
+      check(false, "the decapitation fixture (a snake with a `body1`)");
+    } else {
+      for (int i = 0; i < 5; i++) tick();
+      sm = c.mobs.FindMobById(sid);
+      if (sm != nullptr) sm->Sever(neck);
+      for (int i = 0; i < 3; i++) tick();
+      check(!c.mobs.IsAlive(sid),
+            "cut through `body1` (the head goes with it), the snake is dead");
+    }
+    cleanup();
+  }
+
+  // ---- ...AND UP A STAIRCASE, SEGMENT BY SEGMENT ----------------------------
+  // Owner: "when going up ramps they just move at an incline ... at each
+  // voxel incline the body should flatten a bit in different segments". Six
+  // one-voxel steps, each two voxels deep, across the pad; the snake slithers
+  // up them at a target above the top. Every tick with at least five segments
+  // over the stairs, the CLEARANCE of each segment's centre over the tread
+  // under it is taken, and the spread (max - min) across those segments is
+  // averaged: one plank on the fitted plane floats over the low half of every
+  // step and sinks into the high half, a draped body holds each segment at
+  // the same height over its own tread. SANDVOX_PRONE_RIGID=1 is the plank.
+  {
+    const int stairZ0 = spot.z, kSteps = 6, kTread = 2;
+    const uint32_t stone = [&] {
+      for (size_t i = 0; i < c.mats.size(); i++)
+        if (c.mats[i].name == "stone") return (uint32_t)i;
+      return 1u;
+    }();
+    auto stairTop = [&](float z) {   // the surface (first air) at z
+      const int wz = ifloor(z);
+      if (wz < stairZ0) return (float)(h0 + 1);
+      return (float)(h0 + 1 + std::min(kSteps, (wz - stairZ0) / kTread + 1));
+    };
+    std::vector<CellOp> ops;
+    // WIDER THAN THE PAD, and solid from the terrain up: in its stance the
+    // snake curls across the steps, and the first version (stairs on the
+    // 21-voxel pad only) had its rear hanging off the pad's edge onto lower
+    // ground the clearance below did not know about. Pass D re-levels all of
+    // this for the wander.
+    const int sx0 = spot.x - 24, sx1 = spot.x + 24;
+    const int sz0 = stairZ0 - 24, sz1 = stairZ0 + kSteps * kTread + 16;
+    for (int wz = sz0; wz <= sz1; wz++)
+      for (int wx = sx0; wx <= sx1; wx++) {
+        const int top = (int)stairTop((float)wz);
+        const int base =
+            std::min(h0, World::TerrainHeight(wx, wz, kDefaultSeed) - 2);
+        for (int y = base; y <= h0 + kSteps + 12; y++) {
+          const IVec3 cell{wx, y, wz};
+          if (!c.world.CellInWindow(cell)) continue;
+          ops.push_back(
+              CellOp{World::SlotCellIndex(cell), y < top ? stone : 0u});
+        }
+      }
+    for (size_t i = 0; i < ops.size(); i += 4000) {
+      std::vector<CellOp> slice(
+          ops.begin() + (ptrdiff_t)i,
+          ops.begin() + (ptrdiff_t)std::min(i + 4000, ops.size()));
+      tick({}, slice);
+    }
+    for (int i = 0; i < 120; i++) {
+      bool all = true;
+      for (int wz = sz0; wz <= sz1; wz += 4)
+        for (int wx = sx0; wx <= sx1; wx += 6) {
+          const IVec3 cell{wx, (int)stairTop((float)wz) - 1, wz};
+          if (cachedSolid(cell)) continue;
+          all = false;
+          c.world.RequestChunkFetch({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+        }
+      if (all) break;
+      tick();
+    }
+    const float scz = (float)stairZ0 - 12.0f;
+    const Vec3 goal{(float)spot.x + 0.5f, (float)(h0 + 1 + kSteps) + 8.0f,
+                    (float)(stairZ0 + kSteps * kTread) + 4.0f};
+    c.mobs.SetPlayerActor(goal, 3.0f, 17.0f, true);
+    const uint64_t sid = c.mobs.Spawn(
+        snakeDef, {spot.x - (int)std::lround(sd.worldSize.x * 0.5f), h0 + 1,
+                   (int)std::lround(scz - sd.worldSize.z * 0.5f)});
+    if (sid == 0) {
+      check(false, "the staircase snake spawned");
+    } else {
+      c.mobs.SetHeading(sid, 0.0f);
+      const int ticks = (int)BaselineNumber("snake.stairTicks", 240.0);
+      double spreadSum = 0.0, flatSum = 0.0, steepSum = 0.0;
+      float spreadMax = 0.0f, topZ = -1e9f;
+      int samples = 0;
+      std::vector<int> intents((size_t)ai::Intent::Count, 0);
+      for (int t = 0; t < ticks; t++) {
+        tick();
+        if (const ai::Brain* br = c.mobs.MobBrain(sid))
+          intents[std::min((size_t)br->intent, intents.size() - 1)]++;
+        const Mob* sm = c.mobs.FindMobById(sid);
+        if (sm == nullptr) break;
+        float lo = 1e9f, hi = -1e9f;
+        int over = 0, flat = 0, steep = 0;
+        for (int p : chain) {
+          if (reared(sm, p)) continue;
+          Vec3 pc{};
+          if (!sm->LimbCentreWorld(p, pc)) continue;
+          topZ = std::max(topZ, pc.z);
+          if (ifloor(pc.z) < stairZ0 || ifloor(pc.z) >= stairZ0 + kSteps * kTread)
+            continue;
+          const float clear = pc.y - stairTop(pc.z);
+          lo = std::min(lo, clear);
+          hi = std::max(hi, clear);
+          over++;
+          // The segment's own pitch: its long axis (+Z in the lattice).
+          Vec3 ax{};
+          if (sm->LimbAxisWorld(p, ax)) {
+            const float pitch =
+                std::asin(std::clamp(ax.y, -1.0f, 1.0f)) * 57.29578f;
+            if (std::fabs(pitch) < 9.0f) flat++;
+            if (std::fabs(pitch) > 18.0f) steep++;
+          }
+        }
+        if (over >= 5 && (samples == 40 || kSnakeTrace)) {
+          // ONE TICK, EVERY SEGMENT (rule 6): where the spread comes from.
+          std::string row;
+          for (int p : chain) {
+            Vec3 pc{};
+            if (!sm->LimbCentreWorld(p, pc)) continue;
+            row += Format(" %s z%+.1f c%+.2f%s", sd.limbs[(size_t)p].name.c_str(),
+                          pc.z - (float)stairZ0, pc.y - stairTop(pc.z),
+                          reared(sm, p) ? "R" : "");
+          }
+          std::printf("  stairs t%d:%s\n", t, row.c_str());
+        }
+        if (over >= 5) {
+          spreadSum += (double)(hi - lo);
+          spreadMax = std::max(spreadMax, hi - lo);
+          flatSum += (double)flat / (double)over;
+          steepSum += (double)steep / (double)over;
+          samples++;
+        }
+      }
+      const float mean = samples > 0 ? (float)(spreadSum / samples) : -1.0f;
+      const float flatFrac = samples > 0 ? (float)(flatSum / samples) : 0.0f;
+      const float steepFrac = samples > 0 ? (float)(steepSum / samples) : 0.0f;
+      RecordObserved("snake.stairFlatObserved", (double)flatFrac);
+      std::string hist;
+      for (size_t k = 0; k < intents.size(); k++)
+        if (intents[k] > 0)
+          hist += Format(" %s %d", ai::IntentName((ai::Intent)k), intents[k]);
+      const Vec3 endC = AiMobCentre(c.mobs, sid, sd);
+      std::printf("snake stairs: %d ticks with >=5 segments on the steps | "
+                  "segments flat (<9 deg) %.0f%%, steep (>18 deg) %.0f%% | "
+                  "segment clearance spread mean %.2f max %.2f vox | head "
+                  "reached z %+.1f of the first step | centre ends z %+.1f y "
+                  "%.1f (pad %d), goal %.1f away | intents:%s%s\n",
+                  samples, flatFrac * 100.0f, steepFrac * 100.0f, mean,
+                  spreadMax, topZ - (float)stairZ0, endC.z - (float)stairZ0, endC.y, h0, AiPlanar(endC, goal),
+                  hist.c_str(),
+                  std::getenv("SANDVOX_PRONE_RIGID") ? " (SANDVOX_PRONE_RIGID)" : "");
+      check(samples >= 10,
+            Format("it climbs onto the stairs (%d ticks with >=5 segments on "
+                   "them)", samples));
+      // A plank on a one-in-two grade has every segment at ~26 degrees and
+      // none flat; a draped body lies flat on the treads and tips up over the
+      // risers -- both kinds, every tick.
+      check(samples < 10 ||
+                flatFrac >= (float)BaselineNumber("snake.stairFlatMin", 0.25),
+            Format("each segment lies on its own tread: %.0f%% of the segments "
+                   "on the steps lie flat (plank: SANDVOX_PRONE_RIGID=1)",
+                   flatFrac * 100.0f));
+    }
+    cleanup();
+  }
+
   // ---- PASS D: NOTHING TO HUNT, SO IT WANDERS -------------------------------
   //
   // Alone on the pad (no player actor, no prey), on its own profile: the

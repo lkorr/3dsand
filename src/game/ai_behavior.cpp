@@ -470,6 +470,7 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
         pr.attack.styles.push_back(q.value("style", std::string("slash")));
       pr.attack.reach = q.value("reach", 8.0f);
       pr.attack.aimTolerance = q.value("aimTolerance", 0.45f);
+      pr.attack.muzzleCone = std::clamp(q.value("muzzleCone", 0.0f), 0.0f, 3.1f);
       pr.attack.cadenceTicks = q.value("cadenceTicks", 40u);
       pr.attack.jitterTicks = q.value("jitterTicks", 18u);
       pr.attack.commitTicks = q.value("commitTicks", 10u);
@@ -662,8 +663,10 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
     o << (i ? ", " : "") << "\"" << p.attack.styles[i] << "\"";
   o << "]"
       << ", \"reach\": " << num(p.attack.reach)
-      << ", \"aimTolerance\": " << num(p.attack.aimTolerance)
-      << ", \"cadenceTicks\": " << p.attack.cadenceTicks
+      << ", \"aimTolerance\": " << num(p.attack.aimTolerance);
+  if (p.attack.muzzleCone > 0.0f)
+    o << ", \"muzzleCone\": " << num(p.attack.muzzleCone);
+  o << ", \"cadenceTicks\": " << p.attack.cadenceTicks
       << ", \"jitterTicks\": " << p.attack.jitterTicks
       << ", \"commitTicks\": " << p.attack.commitTicks
       << ", \"disengageTicks\": " << p.attack.disengageTicks
@@ -1463,6 +1466,19 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
     if (floor < hi - 0.5f) lo = std::max(lo, floor);
   }
 
+  // ---- ...AND NEVER INSIDE ITS OWN LENGTH (AttackTuning::muzzleCone) -------
+  // A blow that leaves from the head cannot land on anything nearer the
+  // centre than the head is: a man beside a snake's neck is out of reach
+  // however close he stands. The weapon slide above may pull the floor in
+  // below that, so the floor is put back a voxel past the head, and the
+  // HoldRange retreat does the rest. Last, after every rule: no rule can ask
+  // a creature to strike from behind its own teeth.
+  const bool fromHead = pr.attack.muzzleCone > 0.0f && self.muzzleFwd > 0.0f;
+  if (fromHead && hi > 0.0f) {
+    lo = std::max(lo, self.muzzleFwd + 1.0f);
+    hi = std::max(hi, lo + 0.5f);
+  }
+
   // ---- ...AND THE STEP-OFF IS SUSPENDED AGAINST A TARGET THAT IS LEAVING ---
   //
   // `disengageTicks` is "hit and step off", and it is exactly right against
@@ -1646,11 +1662,27 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
                                     std::max(0.0f, tn[(int)Tune::Cadence]));
   // A booked riposte / feint follow-up overrides the cadence either way.
   const bool riposteNow = brain.riposteArmed && tick >= brain.riposteAt;
+  // THE HEAD MUST SEE IT (AttackTuning::muzzleCone): the target ahead of the
+  // striking joint and inside the cone about the nose as seen from there.
+  // `aimErr` is the bearing from the CENTRE, and on a body this long the two
+  // disagree by the whole neck: 40 degrees off at 10 voxels from a snake's
+  // centre is a voxel BEHIND its head and six to the side.
+  bool muzzleSees = true;
+  if (fromHead && brain.hasTarget) {
+    const Vec3 fw{std::sin(self.heading), 0.0f, std::cos(self.heading)};
+    const float tx = brain.targetPos.x - (centre.x + fw.x * self.muzzleFwd);
+    const float tz = brain.targetPos.z - (centre.z + fw.z * self.muzzleFwd);
+    const float ahead = tx * fw.x + tz * fw.z;
+    const float side = std::fabs(tx * fw.z - tz * fw.x);
+    muzzleSees = ahead > 0.0f &&
+                 std::atan2(side, ahead) <=
+                     pr.attack.muzzleCone * tn[(int)Tune::Aim];
+  }
   const bool attackReady =
       brain.hasTarget && brain.visible &&
       (tick >= readyAt || riposteNow) &&
       !disengaging && brain.leadDist <= reach &&
-      aimErr <= pr.attack.aimTolerance * tn[(int)Tune::Aim];
+      aimErr <= pr.attack.aimTolerance * tn[(int)Tune::Aim] && muzzleSees;
 
   // ---- IS A BLOW COMING AT ME, AND HAVE I READ IT? ------------------------
   // "In range of it" is its reach (or a generous guess when unknown) plus

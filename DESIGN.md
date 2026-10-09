@@ -8809,7 +8809,14 @@ sear it; its block targets `tag:soft_tissue` — `flesh`, `muscle`, `brain`,
 tissue whose wound leaks venom through `bleedFluid`). All three are appended
 (ids 204-206), so `venom_gland` (>127) cannot be painted into a `.vox`
 directly: a snake paints a stand-in and rewrites it at load, as `garmentsBecome`
-does.
+does. The third such rewrite is `anatomy.paintBecomes` (human.json, 2026-10-08):
+a voxel of one material painted one of a list of the file's own art slots
+becomes another — every skin cell the generator paints in its hair slots (251,
+252: scalp hair, brows, beard) is `hair` (id 222), which catches from one hot
+face at 90 per-mille (skin only sears, at 63), burns out through `hair_burning`,
+and has `woundHp` 0, so losing it is not a wound. Found before the art-palette
+merge renumbers `color`, applied after `anatomy::Resolve` so the parity gate
+still compares recipe against bake.
 
 **The arithmetic: a branching process.** Each infectious cell lives until it
 is eaten (rate `μ = eat · s`) and spawns at rate `λ = spread · s` while it
@@ -14235,6 +14242,13 @@ already does one array over. Matched by *physics handle*, because `AdoptBody`
 carries a limb's handle into `DebrisSystem` unchanged while a slot index does
 not survive the next cull. What you orbit is the body as it fell, however long
 it has since been burning, sinking or rolling downhill.
+The photograph is taken JOINT-CONSISTENT (`PlayerAvatar::JointConsistentPose`,
+2026-10-08): the physics transforms on the tick of death can be mid-impulse - a
+blast flings a head still on its neck metres away for the tick the solver has
+not yet pulled it back - so every part that still has a joint is moved (rotation
+kept) until its anchor sits on its parent where the posed skeleton puts it,
+parents first, if it is more than a voxel off. A part that really came off has
+no body and is not in the photograph at all; gear rides its parent's correction.
 
 The live rig and the death snapshot reach the camera through **one type**
 (`LimbBoxes`: one oriented box per limb, tagged with its figure slot), so
@@ -14257,6 +14271,66 @@ takes the view away at the one moment you want to look — and it lands on the
 health column with the worst limb selected whenever `deathScreen` is set
 (`deathScreenOpened`). The HUD carries the only thing that has to be said
 immediately: `DEAD - I to respawn`.
+
+**The post-mortem and the autopsy (2026-10-08).** A death no longer lands on the
+character sheet: it lands on its own screen (`PostMortemScreen` in
+`ui/inventory_ui.cpp`, chosen by `UIState::autopsy.open`; "character sheet" on its
+band goes back to the old layout, whose death banner has an "autopsy" button to
+return). Three panels under a blood-red band: AUTOPSY (cause glyph and verdict,
+the toll, the findings, a core sample), THE BODY (the portrait at the biggest size
+the screen allows, a depth gauge beside it, the peel controls and what the
+exposed layer is made of in a strip beside that), and THE PARTS (the ordinary
+`VitalsColumn` without its banner).
+
+The portrait now comes in **eight sizes, all 5:7** (`UIState::portraitTierTex`,
+320x448 up to 720x1008), made and registered once at startup — re-making a target
+on a resize would free a descriptor set an in-flight frame still samples
+(`UnregisterTexture` is immediate), and the ImGui descriptor pool is a fixed budget
+(raised from the minimum 8 to 32 for them). Both layouts pick the largest tier
+that fits each frame (`portraitTier`), and main.cpp renders the portrait pass
+into that tier *after* the UI is built, so the texture the draw list samples is
+the one rendered that frame. The camera's aspect is the same at every tier.
+
+**The peel is the tuner's Models-tab peel on the corpse** (`game/autopsy.h`).
+Depth from the surface is a multi-source 6-connected BFS per limb brick, depth 0
+= a cell with an exposed face (anatomy.js's convention); a brick face that is a
+JOINT (`MicroBodyModelGpu::cutFaces`) counts as interior, which is what the
+tuner's union-of-limbs measurement would have said, so a peeled forearm does not
+open a ring at the elbow. Peel N clones each of the corpse's limb bricks
+(`MicroBodyClone`), clears every cell shallower than N in the clone, and the
+portrait pass swaps the clone's model index into its own instance list for that
+one draw (the parts are matched by physics handle, as the death pose is). **It
+is render-only end to end**: the corpse's bricks, its debris voxels and the
+hashed grid never see a peel, the main view never draws a clone, and the clones
+are freed at peel 0, on respawn, and when the brick they copy changes (a corpse
+still burning re-peels at most every 0.25 s). A materials reload replaces the
+micro set wholesale, so the peeler keys on `MicroBodySet::epoch` and forgets —
+never frees — indices from a set that no longer exists. Any peel also drops the
+worn and held parts from the picture (a robe over a peeled chest hides what the
+peel is for); "isolate" draws the selected part alone. **The first peel
+undresses** (owner, 2026-10-08): on a body that died with anything worn or held
+(`AutopsyUI::hasGear`), the first step down (PageDown, "peel >") only hides the
+gear, and the next one starts on the skin; restoring walks the same ladder back,
+the clothes last. "skin" is the bare, undressed surface.
+
+**The probe** (`AutopsyUI::probe`) casts the cursor's ray through the instances
+the portrait drew and reads the nearest cell back: part, material, depth layer,
+bruise, coat. On a corpse it is the UNDER CURSOR block of the post-mortem; on
+the living character sheet it is a tip beside the cursor (`VoxelProbeTip`), the
+parts matched to the avatar by physics handle. It names the voxel's MATERIAL —
+whether the cell carries an art colour is not reported, since nearly every
+surface cell of a generated body does.
+
+The same depth fields are the readout: per layer, per figure slot, what the body
+is made of there (`autopsy::Strata`, mirrored by `autopsy::FillUI`). Materials
+are classed by the tables the health column already uses (`AutopsyKinds` in
+main.cpp: tissue / burn / infection), and every burn or infection material in a
+part is a FINDING with the shallowest and deepest layer it reached — "venom in
+the left forearm, layers 1-4 of 6" — clicking which selects the part, frames it
+and peels to that depth. Gate `autopsy-peel` (CPU only) pins the depth field, the
+joint rule, the clone, the source left untouched, the strata, the findings and
+the epoch rule on a packed cube; `--shot-inventory`'s turned death picture is
+peeled two layers.
 
 Four gates (`selftest_combat.cpp`, at the end of the mob group):
 `npc-strike` (the AI's own request becomes a windup, a cut and lost voxels; then
@@ -14451,6 +14525,19 @@ the two stages the legless zombie's crawl already had, unchanged:
 and `ConformProneSegments` bends each segment onto its own stretch of that
 ground. The snake has no IK chains, so the gait, the stride clock and the leg
 IK never run.
+
+**Motion that belongs to a PART, not a state: `states[].overlay`**
+(`AnimStateRule::overlay`, 2026-10-08, the demon's tail). States are
+first-match-wins, so a looping motion authored as a state would fight the
+body's real one (a hunched demon's `always` hunch) and stop whenever a damage
+state won. An overlay rule is never SELECTED (`AnimSelectState` skips it);
+`pose.cpp` keeps its clip playing every tick, on top of whatever state did
+win, restarting it only if the instance is missing. Its clip should be
+additive and masked to the parts it moves. The demon's tail is a jointed,
+sprung `tail` limb (mobgen `HAIR_PARTS.tail`, anchored at its root, spring
+from `demon.tailLag`) with a generated `tailsway` clip (a yaw of
++-(5 + 30 x tailSway) degrees at the root); gate `demon-tail` measures the
+swing on an upright and a hunched demon.
 
 **Lateral undulation: a wave fixed in the WORLD** (`Mob::ApplySlither`,
 `game/pose.cpp`, sidecar `slither`). A pose stage straight after the clip
@@ -14665,6 +14752,56 @@ general mechanism the sidecar or the style opts into:
   and the ticks of a strike, a leap and the six after one: the claims there
   are about the body travelling. `SANDVOX_SNAKE_TRACE=1` prints the hunt, the
   slither clearance and each rear strike tick by tick.
+
+**Decapitation, aim from the head, and a body that drapes (2026-10-08, owner
+report: "a snake whose head is chopped off lives; its bites miss forever
+depending on where I stand; it goes up a ramp as one inclined plank").**
+- **A cut that carries a vital limb away is fatal** (`Mob::Sever`). The head
+  hangs from `body1`; a blade through `body1` took the head with it as a child
+  (DetachLimb takes the subtree), and since `body1` is not itself vital the
+  snake lived. Now any still-attached vital limb below the cut kills. Only the
+  neck trim (`TrimNeckForSever`) stays keyed on the cut limb being the vital
+  one. In shipped content only the snake has a vital limb under a severable
+  non-vital one.
+- **The bite is aimed from the head** (`AttackTuning::muzzleCone`,
+  `SelfView::muzzleFwd`; behaviors.json snake 0.5). Range and aim were taken
+  from the CENTRE, nine voxels behind the fangs, so a man beside the neck or
+  40 degrees off the nose was committed at and whiffed. With a cone set the
+  commit also needs the target ahead of the striking joint
+  (`Mob::StrokePivotWorld`, projected on the heading) and inside the cone as
+  seen from there; the band floor never lets the target inside the body's own
+  length (it backs off, `retreatSpeed` 0.7); and the lunge is sized and aimed
+  from the neck, not the centre (and not at all at a target behind it).
+- **The fangs close on what they meet** (`AttackStyle::biteAnywhere`, both
+  snake styles). The stroke's one bite was held for the drawn limb until the
+  last cut tick (`EdgeSweep::biteHoldout`); a ground strike drew a foot, met
+  the shin, and had recoiled by the last tick -- three strikes in a row
+  touched the man and none bit. Gate pass C2: beside the neck and off the
+  nose each bitten on the FIRST strike (before: 3 and 2..4 strikes, most of
+  them touching nothing).
+- **A legless body drapes** (`Mob::ConformProneSegments`, its
+  `def.slither` branch). The general conform reads a 5-voxel least-squares
+  grade, bends a segment by run/5 of it and refuses any segment under 1.5
+  voxels -- every 1.4-voxel snake segment, so the whole body was the one plank
+  on the fitted plane. Now the root takes the grade between the supports under
+  its two ends, and from it outward each segment's far end is put on the
+  higher of the supports under its far half plus the lying clearance (learned
+  while the root lies level, `drapeClr_`; the body is moved onto it, except
+  more than a voxel off the ground, i.e. a leap); bends are capped at 55
+  degrees and 38 from the parent, eased with a 0.07 s half-life, and yielded
+  to an override clip by its weight as the slither yields. Flat on a tread,
+  tipped over a riser, level for one segment past a drop edge.
+- **...and lies along the grade it climbs** (`kLieGrade` 0.65, about 33
+  degrees). `FootprintFooting` treated every column more than a step above the
+  middle as a wall and the steering fan (`SenseGround`) every probe more than
+  a step up as blocked; on a snake both reach nine voxels ahead, so it lay at
+  the foot of a one-in-two staircase forever. For a slither body a column or
+  probe `v` along it may stand `kLieGrade * |v|` higher, its height is taken
+  over its middle third, and headroom over each column's own ground.
+- **Gate pass C2's staircase**: six 1-voxel steps 2 deep; it climbs onto them
+  and 22% of the segments on the steps lie flat (< 9 degrees), 53% steep;
+  the plank (`SANDVOX_PRONE_RIGID=1`) is 0% and 95%. `SANDVOX_DRAPE_DEBUG=1`
+  prints each segment's joint, supports, wanted and achieved slope per tick.
 
 ### Combat feel: hit-stop, hit flash, and the three melee cues (2026-08-31; `sim/tuning.h` `Tuning::CombatFx`, `audio/cues.*`, `assets/shaders/microbody.wgsl`)
 

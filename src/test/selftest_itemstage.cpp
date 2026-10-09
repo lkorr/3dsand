@@ -32,6 +32,7 @@
 #include <tuple>
 #include <vector>
 
+#include "game/autopsy.h"
 #include "game/equipment.h"
 #include "game/item.h"
 #include "game/itemcoat.h"
@@ -41,6 +42,7 @@
 #include "test/selftest.h"
 #include "test/support.h"
 #include "ui/item_stage.h"
+#include "ui/overlay.h"
 
 using namespace sandvox;
 
@@ -401,11 +403,126 @@ Status GateItemStage(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- autopsy-peel (game/autopsy.h; the death screen's post-mortem) ----------
+//
+// CPU only: no world, no GPU. A 9-cube brick of material 5 around a 3-cube
+// core of material 7, packed into a fresh MicroBodySet, peeled the way the
+// portrait pass peels a corpse:
+//   A  depth    corner 0, centre 4, maxDepth 4 (anatomy.js's convention: 0 =
+//               a cell with an exposed face).
+//   B  joint    the same brick with its +x face a JOINT: a cell on that face
+//               is interior (depth 4), not surface.
+//   C  peel 2   the clone holds exactly the 5-cube left, and the SOURCE brick
+//               is untouched (729 cells).
+//   D  strata   layer 0 is the 386-cell shell; the core material sits at
+//               layers 3..4 (26 + 1 cells).
+//   E  too deep peel 5 draws nothing (kHidden) and makes no clone.
+//   F  release  every clone freed back to the set.
+//   G  findings the core marked as an infection is one finding, layers 3-4.
+//   H  epoch    a replaced set is forgotten, never freed into.
+Status GateAutopsyPeel(Ctx&, std::string& detail) {
+  std::string why;
+  auto fail = [&](const std::string& w) { if (why.empty()) why = w; };
+  constexpr int N = 9;
+  std::vector<PrefabVoxel> vox;
+  for (int z = 0; z < N; z++)
+    for (int y = 0; y < N; y++)
+      for (int x = 0; x < N; x++) {
+        PrefabVoxel v{};
+        v.x = (int16_t)x; v.y = (int16_t)y; v.z = (int16_t)z;
+        const bool core = x >= 3 && x <= 5 && y >= 3 && y <= 5 && z >= 3 && z <= 5;
+        v.material = core ? 7 : 5;
+        vox.push_back(v);
+      }
+  MicroBodySet set;
+  std::string log;
+  const int m = MicroBodyPack(set, vox, IVec3{N, N, N}, 2, "cube", log, 0u);
+  const int mj = MicroBodyPack(set, vox, IVec3{N, N, N}, 2, "cubeJoint", log, 1u << 1);
+  if (m < 0 || mj < 0) {
+    detail = "pack refused: " + log;
+    std::printf("autopsy-peel: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  // A
+  autopsy::DepthField f;
+  autopsy::MeasureDepth(set, (uint32_t)m, f);
+  const int dCorner = f.At(0, 0, 0), dCentre = f.At(4, 4, 4);
+  if (dCorner != 0 || dCentre != 4 || f.maxDepth != 4) fail("A depth");
+  // B
+  autopsy::MeasureDepth(set, (uint32_t)mj, f);
+  const int dJoint = f.At(8, 4, 4), dFree = f.At(0, 4, 4);
+  if (dJoint != 4 || dFree != 0) fail("B joint");
+  // C
+  auto solid = [&](uint32_t model) {
+    const IVec3 d = MicroBodyDims(set, model);
+    int n = 0;
+    for (int z = 0; z < d.z; z++)
+      for (int y = 0; y < d.y; y++)
+        for (int x = 0; x < d.x; x++)
+          if (MicroBodyCell(set, model, x, y, z) & 0xFFu) n++;
+    return n;
+  };
+  autopsy::Peeler peeler;
+  std::vector<autopsy::Part> parts = {{(uint32_t)m, 1, true}};
+  peeler.Update(set, parts, 2, 0.0, UIState::kSlotCount);
+  const uint32_t clone = peeler.DrawModel((uint32_t)m);
+  const int kept = clone != autopsy::Peeler::kHidden && clone != (uint32_t)m ? solid(clone) : -1;
+  const int src = solid((uint32_t)m);
+  if (kept != 125 || src != N * N * N) fail("C peel");
+  // D
+  const autopsy::Strata& st = peeler.Slot(1);
+  const uint32_t l0 = st.layers[0].total, core3 = st.layers[3].byMat[7],
+                 core4 = st.layers[4].byMat[7];
+  if (l0 != 386 || core3 != 26 || core4 != 1 || peeler.Body().maxDepth != 4) fail("D strata");
+  // E
+  peeler.Update(set, parts, 5, 1.0, UIState::kSlotCount);
+  const bool hidden = peeler.DrawModel((uint32_t)m) == autopsy::Peeler::kHidden;
+  if (!hidden || peeler.ClonesLive() != 1) fail("E too deep");
+  // F (peel 0 frees, then a fresh peel and an explicit Release)
+  peeler.Update(set, parts, 0, 2.0, UIState::kSlotCount);
+  const int liveAt0 = peeler.ClonesLive();
+  peeler.Update(set, parts, 1, 3.0, UIState::kSlotCount);
+  const uint32_t c1 = peeler.DrawModel((uint32_t)m);
+  peeler.Release(set);
+  const bool freed = c1 < set.owned.size() && !set.owned[c1];
+  if (liveAt0 != 0 || !freed || peeler.ClonesLive() != 0) fail("F release");
+  // G
+  uint8_t kinds[256] = {};
+  kinds[5] = autopsy::kTissue;
+  kinds[7] = autopsy::kInfection;
+  peeler.Update(set, parts, 0, 4.0, UIState::kSlotCount);
+  static UIState ui;  // static: UIState is large
+  ui = UIState{};
+  autopsy::FillUI(peeler, kinds, {}, ui);
+  const auto& fi = ui.autopsy.findings[0];
+  if (ui.autopsy.findingCount != 1 || fi.slot != 1 || fi.shallowest != 3 || fi.deepest != 4 ||
+      fi.count != 27)
+    fail("G findings");
+  // H
+  peeler.Update(set, parts, 2, 5.0, UIState::kSlotCount);
+  const uint32_t heldClone = peeler.DrawModel((uint32_t)m);
+  set = MicroBodySet{};
+  peeler.Release(set);  // must not touch the new set
+  const bool untouched = set.models.empty() && set.freeModels.empty();
+  if (!untouched || heldClone == (uint32_t)m) fail("H epoch");
+
+  const bool ok = why.empty();
+  detail = Format("A corner %d centre %d | B joint %d free %d | C kept %d src %d | D l0 %u "
+                  "core %u+%u | E hidden %d | F live@0 %d freed %d | G findings %d (%d-%d, %u) "
+                  "| H %d%s%s",
+                  dCorner, dCentre, dJoint, dFree, kept, src, l0, core3, core4, (int)hidden,
+                  liveAt0, (int)freed, ui.autopsy.findingCount, fi.shallowest, fi.deepest,
+                  fi.count, (int)untouched, why.empty() ? "" : " | FAILED ", why.c_str());
+  std::printf("autopsy-peel: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& ItemStageGates() {
   static const std::vector<Gate> g = {
       {"item-stage", "mob", {}, false, GateItemStage, false},
+      {"autopsy-peel", "mob", {}, false, GateAutopsyPeel, false},
   };
   return g;
 }

@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -179,7 +180,19 @@ constexpr size_t kWardrobeArtReserve = 40;
 // three levels a channel, below what 8-bit art can show (MicroBodyMergeArt).
 constexpr int64_t kArtMergeNear = 27;
 
+// A fresh number per constructed MicroBodySet. See MicroBodySet::epoch.
+inline uint64_t NextMicroBodySetEpoch() {
+  static std::atomic<uint64_t> n{0};
+  return ++n;
+}
+
 struct MicroBodySet {
+  // WHICH SET THIS IS. A materials reload replaces the set wholesale
+  // (`mbSet = MicroBodySet{}`), after which a model index held from before is
+  // a position in a different table — freeing it would free somebody else's
+  // brick. A holder that outlives a reload without being told about it (the
+  // death screen's peel clones, game/autopsy.h) compares this instead.
+  uint64_t epoch = NextMicroBodySetEpoch();
   std::vector<MicroBodyModelGpu> models;
   std::vector<uint32_t> pool;
   // model index -> true when this record is an owned COW clone (freeable).

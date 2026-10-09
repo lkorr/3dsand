@@ -1852,13 +1852,15 @@ section('Q. the demon race: flesh on the SAME rig, its own height band');
     const b = mg.generateMob(g, 0, opts);
     ok(!mg.validateMob(b).length, `demon horns ${st}: sound`, mg.validateMob(b).join('; '));
   }
-  // 7. EVERY NUMERIC GENE REACHES THE BODY.
+  // 7. EVERY NUMERIC GENE REACHES THE BODY -- or its MOTION: the tail's
+  // sway, speed and lag move only the sidecar (the sway clip, the spring).
   {
     const base = mg.applyRace(mg.defaultGenome(), 'demon');
     DM.applyHorns(base, 'goat');
     const key = g => {
       const b = mg.generateMob(g, 0, opts);
-      return b.parts.map(p => p.name + ':' + p.cells.map(c => c.join(',')).join(';')).join('|');
+      return b.parts.map(p => p.name + ':' + p.cells.map(c => c.join(',')).join(';')).join('|') +
+             JSON.stringify(b.sidecar.clips) + JSON.stringify(b.sidecar.limbs);
     };
     const k0 = key(base);
     for (const spec of mg.GENE_SPECS.filter(sp => sp.race === 'demon' && !sp.kind)) {

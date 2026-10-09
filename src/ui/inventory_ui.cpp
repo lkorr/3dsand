@@ -594,7 +594,9 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
   if (orbit) {
     const ImVec2 d = ImGui::GetIO().MouseDelta;
     s.portraitYaw -= d.x * 0.012f;
-    s.portraitPitch = std::clamp(s.portraitPitch - d.y * 0.008f, -0.9f, 0.9f);
+    // Straight down to straight up (owner, 2026-10-08): a hair short of the
+    // poles, where the camera's right axis (forward x world up) degenerates.
+    s.portraitPitch = std::clamp(s.portraitPitch - d.y * 0.008f, -1.55f, 1.55f);
   }
   // PAN (right or middle drag; middle only while pouring): instant — writes
   // both current and target.
@@ -642,6 +644,18 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
   // click-to-frame through without also selecting.
   // A readied spell makes the click a cast with the health column shut too.
   const bool castReady = !s.spellText.empty() && !pourMode;
+  // THE PROBE (UIState::AutopsyUI::probe): the voxel under a still cursor is
+  // read back by main.cpp - on a corpse named under MADE OF, on the living
+  // body in a tip beside the cursor (VoxelProbeTip). Not while pouring: the
+  // brush owns the cursor then.
+  s.autopsy.probeWant =
+      (hovered && !dragL && !dragR && !dragM && (dead || (s.bodyValid && !pourMode))) ||
+      (dead && s.autopsy.probeForce);
+  if (s.autopsy.probeWant && !s.autopsy.probeForce) {
+    const ImVec2 m = ImGui::GetMousePos();
+    s.autopsy.probeAt[0] = (m.x - at.x) / size.x;
+    s.autopsy.probeAt[1] = (m.y - at.y) / size.y;
+  }
   if ((s.inspectMode || castReady) && s.bodyValid &&
       ImGui::IsItemDeactivated() &&
       ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
@@ -835,6 +849,60 @@ void InspectOverlay(const UIState& s, ImVec2 at, ImVec2 size) {
                         ImVec2(cs[k].x + (sx[k] > 0 ? 2 : 0), y1), col);
     }
   }
+}
+
+// THE PROBE ON THE LIVING BODY: the post-mortem's UNDER CURSOR readout as a
+// tip beside the cursor, with the same gold crosshair on the voxel. DRAW ONLY;
+// Portrait asks for the probe and main.cpp answers a frame later. Quiet while
+// a spell is readied: the cast pick's tip owns the cursor then.
+void VoxelProbeTip(const UIState& s, ImVec2 at, ImVec2 size) {
+  const UIState::AutopsyUI::Probe& pr = s.autopsy.probe;
+  if (!s.autopsy.probeWant || !pr.valid || !s.spellText.empty()) return;
+  if (!ImGui::IsMouseHoveringRect(at, ImVec2(at.x + size.x, at.y + size.y))) return;
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const float mx = std::floor(at.x + pr.uv[0] * size.x);
+  const float my = std::floor(at.y + pr.uv[1] * size.y);
+  const ImU32 c = ui::ColGoldHi();
+  dl->AddRectFilled(ImVec2(mx - 7, my - 1), ImVec2(mx - 2, my + 1), c);
+  dl->AddRectFilled(ImVec2(mx + 2, my - 1), ImVec2(mx + 7, my + 1), c);
+  dl->AddRectFilled(ImVec2(mx - 1, my - 7), ImVec2(mx + 1, my - 2), c);
+  dl->AddRectFilled(ImVec2(mx - 1, my + 2), ImVec2(mx + 1, my + 7), c);
+
+  BeginTip();
+  auto col = [](ImU32 u) { return ImGui::ColorConvertU32ToFloat4(u); };
+  ImGui::TextColored(col(ui::ColParch()), "%s", pr.part);
+  // The material, after a swatch of its own colour.
+  {
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float h = ImGui::GetTextLineHeight();
+    ImDrawList* tl = ImGui::GetWindowDrawList();
+    tl->AddRectFilled(ImVec2(p.x, p.y + h * 0.5f - 4), ImVec2(p.x + 8, p.y + h * 0.5f + 4),
+                      pr.matColor);
+    tl->AddRect(ImVec2(p.x, p.y + h * 0.5f - 4), ImVec2(p.x + 8, p.y + h * 0.5f + 4),
+                Fade(ui::ColInk(), 0.8f));
+    ImGui::Dummy(ImVec2(12, h));
+    ImGui::SameLine(0, 0);
+    const ImU32 kc = pr.kind == 3   ? IM_COL32(120, 176, 92, 255)
+                     : pr.kind == 2 ? ui::ColEmber()
+                                    : ui::ColGoldPale();
+    ImGui::TextColored(col(kc), "%s%s", pr.mat,
+                       pr.kind == 3 ? "  (infection)" : pr.kind == 2 ? "  (burnt)" : "");
+  }
+  if (pr.layer >= 0) {
+    if (pr.layer == 0)
+      ImGui::TextColored(col(ui::ColParchDim()), "the surface");
+    else
+      ImGui::TextColored(col(ui::ColParchDim()), "%d below the surface", pr.layer);
+  }
+  if (pr.bruise >= 15)
+    ImGui::TextColored(col(ui::ColBloodHi()), "split open");
+  else if (pr.bruise > 0)
+    ImGui::TextColored(col(ui::Mix(ui::ColBlood(), ui::ColParch(), 0.4f)), "bruised  %d / 14",
+                       pr.bruise);
+  if (pr.coatAmt > 0)
+    ImGui::TextColored(col(ui::Mix(pr.coatColor, IM_COL32_WHITE, 0.35f)), "%s  %d / 15",
+                       pr.coat, pr.coatAmt);
+  EndTip();
 }
 
 // The hover frame both pick layers draw: the limb under the cursor, clamped to
@@ -2730,7 +2798,7 @@ void LootPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
 // what TRIAGE and THE LIMB now say between them: every limb listed whether or
 // not anything was wrong, two bars each, and the detail column repeating all
 // of it the moment you clicked one.
-void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size) {
+void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size, bool deathBanner = true) {
   ImGui::SetCursorScreenPos(at);
   ImGui::BeginChild("##vitals", size, ImGuiChildFlags_None,
                     ImGuiWindowFlags_NoBackground);
@@ -2757,7 +2825,7 @@ void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size) {
   // the body at the instant it died (UIState::deathScreen). The button is the
   // ONLY way back — there is no respawn timer running behind this panel — so
   // it is drawn full width and cannot be mistaken for a chip.
-  if (s.deathScreen) {
+  if (s.deathScreen && deathBanner) {
     const float bannerH = 42.0f;
     dl->AddRectFilled(ImVec2(base.x, y), ImVec2(base.x + w, y + bannerH),
                       Fade(ui::ColBloodHi(), 0.18f));
@@ -2818,6 +2886,13 @@ void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size) {
           "Nothing is on a timer: close this screen and look the body over\n"
           "first if you want. The readout is frozen and will still be here.");
     }
+    // The way back to the post-mortem (PostMortemScreen), under it.
+    if (ui::Button("##postmortem", ImVec2(base.x, ImGui::GetItemRectMax().y + 6),
+                   "autopsy", true, w))
+      s.autopsy.open = true;
+    if (ImGui::IsItemHovered())
+      Tip("Back to the post-mortem: the body as big as the screen allows,\n"
+          "peeled a layer at a time, with what was found inside it.");
     y = ImGui::GetItemRectMax().y + 10;
   }
 
@@ -3487,6 +3562,954 @@ void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size) {
   ImGui::EndChild();
 }
 
+// ======================= THE POST-MORTEM ======================================
+//
+// A death used to open the ordinary character sheet with a red banner on its
+// health column: the body you are meant to read wounds off drawn at 320x448,
+// beside a pack and a spellbook nobody wants at that moment. A death now gets
+// its own screen (UIState::autopsy.open; "character sheet" goes back to the
+// old one, and its banner has a "post-mortem" button to come back):
+//
+//   +- YOU DIED - the cause, in the engine's words - how long - [respawn] -+
+//   | AUTOPSY          |   THE BODY, as big as the screen    | THE PARTS   |
+//   |  cause / toll    |   allows, with the depth gauge      |  triage     |
+//   |  findings        |   beside it and the peel controls   |  the limb   |
+//   |  core sample     |   under it                          |             |
+//   +------------------+-------------------------------------+-------------+
+//
+// THE PEEL is the tuner's Models-tab peel on the corpse (game/autopsy.h): a
+// layer is a depth from the surface, peel N hides every voxel shallower than
+// N, and what the portrait shows is the body N layers in. The CORE SAMPLE is
+// the same depth fields read as numbers - every layer of the selected part (or
+// the whole body), what it is made of there - so rot two layers under intact
+// skin is a coloured band in a column of flesh and muscle, not a guess.
+
+// A pixel glyph: each '#' in `rows` is one `px` square. Pixel art at any
+// scale, with nothing but rectangles.
+void PixelGlyph(ImDrawList* dl, ImVec2 at, float px, const char* const* rows,
+                int n, ImU32 col) {
+  for (int r = 0; r < n; r++)
+    for (int c = 0; rows[r][c]; c++)
+      if (rows[r][c] == '#')
+        dl->AddRectFilled(ImVec2(at.x + c * px, at.y + r * px),
+                          ImVec2(at.x + (c + 1) * px, at.y + (r + 1) * px), col);
+}
+
+constexpr int kGlyphRows = 11;
+const char* const kGlyphSkull[kGlyphRows] = {
+    "...#####...", ".#########.", "###########", "##...#...##",
+    "##...#...##", "###########", ".####.####.", "..#######..",
+    "..#.#.#.#..", "..#######..", "...........",
+};
+const char* const kGlyphDrop[kGlyphRows] = {
+    ".....#.....", ".....#.....", "....###....", "....###....",
+    "...#####...", "..#######..", ".#########.", ".#########.",
+    ".#########.", "..#######..", "...#####...",
+};
+const char* const kGlyphFlame[kGlyphRows] = {
+    ".....#.....", "....##.....", "....###....", "...####.#..",
+    "..#####.##.", "..########.", ".##########", ".####.#####",
+    ".###...####", "..##...###.", "...#####...",
+};
+const char* const kGlyphFall[kGlyphRows] = {
+    "....###....", "....###....", "....###....", "....###....",
+    ".#########.", "..#######..", "...#####...", "....###....",
+    ".....#.....", "...........", "###########",
+};
+
+// What the cause string reads as on this screen. Matched on the words
+// Mob::Die's callers write (mob.cpp deathCause_), loosely, so a new phrasing
+// falls through to the skull rather than to nothing.
+struct CauseLook {
+  const char* const* glyph;
+  ImU32 col;
+  const char* title;
+  const char* gloss;
+};
+CauseLook LookOfCause(const std::string& c) {
+  auto has = [&](const char* w) { return c.find(w) != std::string::npos; };
+  if (has("blood"))
+    return {kGlyphDrop, ui::ColBloodHi(), "EXSANGUINATED",
+            "The body ran out of blood before it ran out of anything else."};
+  if (has("infect") || has("poison") || has("rot") || has("venom"))
+    return {kGlyphSkull, IM_COL32(120, 176, 92, 255), "POISONED",
+            "Something living in the tissue reached a part the body could not lose."};
+  if (has("burn") || has("knot") || has("fire"))
+    return {kGlyphFlame, ui::ColEmber(), "BURNED",
+            "Fire took more of the body than the body could spare."};
+  if (has("fall"))
+    return {kGlyphFall, ui::ColSteel(), "FELL",
+            "The ground arrived faster than the legs could take it."};
+  return {kGlyphSkull, IM_COL32(222, 214, 196, 255), "SLAIN",
+          "A part the body cannot live without was destroyed."};
+}
+
+// The dominant material of an autopsy layer, as a legend index (-1 = empty).
+int LayerLead(const UIState::AutopsyUI::Layer& L) { return L.n > 0 ? L.leg[0] : -1; }
+
+// The strata the readout talks about: the selected part's when one is picked
+// and measured, else the whole body's.
+const UIState::AutopsyUI::Layer* StrataOf(const UIState& s, int& depthOut,
+                                         const char*& whoOut) {
+  const UIState::AutopsyUI& a = s.autopsy;
+  const int sel = s.inspectSelected;
+  if (sel >= 0 && sel < UIState::kSlotCount && a.partDepth[sel] >= 0) {
+    depthOut = a.partDepth[sel];
+    whoOut = s.body[sel].label;
+    return a.part[sel];
+  }
+  depthOut = a.bodyDepth;
+  whoOut = "whole body";
+  return a.body;
+}
+
+// A stacked bar of one layer's composition, segment widths by share.
+void CompositionBar(ImDrawList* dl, const UIState::AutopsyUI& a,
+                    const UIState::AutopsyUI::Layer& L, ImVec2 p0, ImVec2 p1) {
+  dl->AddRectFilled(p0, p1, Fade(ui::ColInk(), 0.85f));
+  if (L.total == 0) return;
+  float x = p0.x;
+  const float w = p1.x - p0.x;
+  uint32_t shown = 0;
+  for (int k = 0; k < L.n; k++) {
+    const float x1 = std::floor(x + w * (float)L.count[k] / (float)L.total);
+    if (x1 > x) {
+      dl->AddRectFilled(ImVec2(x, p0.y), ImVec2(x1, p1.y), a.legend[L.leg[k]].color);
+      // A one-pixel ink seam between bands keeps two similar tissues apart.
+      if (k > 0) dl->AddRectFilled(ImVec2(x, p0.y), ImVec2(x + 1, p1.y), Fade(ui::ColInk(), 0.7f));
+    }
+    x = x1;
+    shown += L.count[k];
+  }
+  // What did not make the top five: hatched.
+  if (shown < L.total && x < p1.x)
+    for (float hx = x; hx < p1.x; hx += 4)
+      dl->AddRectFilled(ImVec2(hx, p0.y), ImVec2(std::min(hx + 2, p1.x), p1.y),
+                        Fade(ui::ColParchDim(), 0.35f));
+  // Damage in the layer: a pulsing rule over the bar in its colour.
+  for (int k = 0; k < L.n; k++)
+    if (a.legend[L.leg[k]].kind >= 2) {
+      dl->AddRectFilled(ImVec2(p0.x, p0.y - 3), ImVec2(p1.x, p0.y - 1),
+                        Fade(a.legend[L.leg[k]].color, 0.5f + 0.5f * AlarmPulse()));
+      break;
+    }
+}
+
+// THE CORE SAMPLE: one row per depth layer, skin at the top, the core at the
+// bottom, each a composition bar. Clicking a row peels to it. Returns the
+// height used.
+float CoreSample(UIState& s, ImDrawList* dl, ImVec2 at, float w, float maxH) {
+  UIState::AutopsyUI& a = s.autopsy;
+  int depth = -1;
+  const char* who = "";
+  const UIState::AutopsyUI::Layer* L = StrataOf(s, depth, who);
+  ImGui::PushFont(ui::FontSmall());
+  const float lh = ImGui::GetTextLineHeight();
+  float y = at.y;
+  char buf[96];
+  std::snprintf(buf, sizeof buf, "%s  -  %d layers", who, depth + 1);
+  ui::ShadowText(dl, ImVec2(at.x, y), ui::ColParch(), buf);
+  y += lh + 4;
+  if (depth < 0) {
+    ui::ShadowText(dl, ImVec2(at.x, y), Fade(ui::ColParchDim(), 0.8f),
+                   a.maxDepth < 0 ? "measuring..." : "nothing left to sample");
+    ImGui::PopFont();
+    return y + lh - at.y;
+  }
+  const float labelW = 22.0f;
+  const float rowH =
+      std::clamp(std::floor((maxH - (y - at.y)) / (float)(depth + 1)), 6.0f, 16.0f);
+  for (int d = 0; d <= depth; d++) {
+    const ImVec2 r0(at.x + labelW, y + 1), r1(at.x + w - 2, y + rowH - 1);
+    CompositionBar(dl, a, L[d], r0, r1);
+    const bool cur = d == a.peel;
+    const bool hidden = d < a.peel;
+    if (hidden) dl->AddRectFilled(r0, r1, Fade(ui::ColInk(), 0.55f));
+    if (cur)
+      dl->AddRect(ImVec2(r0.x - 2, r0.y - 2), ImVec2(r1.x + 2, r1.y + 2), ui::ColGoldHi(),
+                  0.0f, 0, 2.0f);
+    if (rowH >= lh - 2 || d % 2 == 0) {
+      std::snprintf(buf, sizeof buf, "%d", d);
+      ui::ShadowText(dl, ImVec2(at.x + 2, std::floor(y + (rowH - lh) * 0.5f)),
+                     cur ? ui::ColGoldHi() : Fade(ui::ColParchDim(), hidden ? 0.5f : 0.9f),
+                     buf);
+    }
+    ImGui::SetCursorScreenPos(ImVec2(at.x, y));
+    char id[24];
+    std::snprintf(id, sizeof id, "##core%d", d);
+    if (ImGui::InvisibleButton(id, ImVec2(w, rowH))) a.peel = d;
+    if (ImGui::IsItemHovered()) {
+      dl->AddRect(ImVec2(r0.x - 1, r0.y - 1), ImVec2(r1.x + 1, r1.y + 1),
+                  Fade(ui::ColGold(), 0.8f));
+      BeginTip();
+      ImGui::Text("Layer %d  (%u cells)%s", d, L[d].total, d == 0 ? "  -  the surface" : "");
+      for (int k = 0; k < L[d].n; k++) {
+        const UIState::AutopsyUI::Legend& g = a.legend[L[d].leg[k]];
+        ImGui::TextColored(
+            ImGui::ColorConvertU32ToFloat4(ui::Mix(g.color, IM_COL32_WHITE, 0.3f)),
+            "  %-16s %5.1f%%", g.label,
+            100.0f * (float)L[d].count[k] / (float)std::max(1u, L[d].total));
+      }
+      ImGui::TextDisabled("click to peel down to this layer");
+      EndTip();
+    }
+    y += rowH;
+  }
+  ImGui::PopFont();
+  return y - at.y;
+}
+
+// The left column: what killed you, what it cost, what the knife found.
+void PostMortemLeft(UIState& s, ImVec2 at, ImVec2 size) {
+  ImGui::SetCursorScreenPos(at);
+  ImGui::BeginChild("##pm_left", size, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const ImVec2 base = ImGui::GetCursorScreenPos();
+  const float w = std::max(140.0f, ImGui::GetContentRegionAvail().x);
+  float y = base.y;
+  const UIState::AutopsyUI& a = s.autopsy;
+
+  // ---- CAUSE: the glyph, the verdict, and the engine's own words ----------
+  {
+    const CauseLook look = LookOfCause(s.deathCause);
+    y = ui::Subheading(dl, ImVec2(base.x, y), w, "CAUSE") + 4;
+    const float px = 5.0f, gw = 11 * px, gh = kGlyphRows * px;
+    const ImVec2 g0(base.x + 4, y + 4);
+    dl->AddRectFilled(ImVec2(g0.x - 4, g0.y - 4), ImVec2(g0.x + gw + 4, g0.y + gh + 4),
+                      Fade(ui::ColInk(), 0.8f));
+    dl->AddRect(ImVec2(g0.x - 4, g0.y - 4), ImVec2(g0.x + gw + 4, g0.y + gh + 4),
+                Fade(look.col, 0.6f), 0.0f, 0, 2.0f);
+    PixelGlyph(dl, ImVec2(g0.x + px * 0.5f, g0.y + px * 0.5f), px, look.glyph, kGlyphRows,
+               Fade(ui::ColInk(), 0.9f));
+    PixelGlyph(dl, g0, px, look.glyph, kGlyphRows,
+               Fade(look.col, 0.75f + 0.25f * AlarmPulse()));
+    const float tx = g0.x + gw + 14;
+    // The verdict in the small face, tracked: "EXSANGUINATED" is 13 letters
+    // and the column beside the glyph is ~170 px.
+    ImGui::PushFont(ui::FontSmall());
+    const float lh = ImGui::GetTextLineHeight();
+    ui::TrackedText(dl, ImVec2(tx, y + 6), look.col, look.title, 2.0f);
+    const char* words = s.deathCause.empty() ? "cause unrecorded" : s.deathCause.c_str();
+    dl->AddText(nullptr, 0.0f, ImVec2(tx, y + 10 + lh), ui::ColParch(), words, nullptr,
+                base.x + w - tx);
+    y += gh + 16;
+    dl->AddText(nullptr, 0.0f, ImVec2(base.x, y), Fade(ui::ColParchDim(), 0.9f), look.gloss,
+                nullptr, w);
+    y += ImGui::CalcTextSize(look.gloss, nullptr, false, w).y + 10;
+    ImGui::PopFont();
+  }
+
+  // ---- THE TOLL: the numbers, one line each ----------------------------------
+  {
+    y = ui::Subheading(dl, ImVec2(base.x, y), w, "THE TOLL") + 2;
+    float live = 0, born = 0;
+    int lost = 0, bleeding = 0;
+    uint32_t burning = 0, rot = 0;
+    int worst = -1;
+    float worstScore = 2.0f;
+    for (int i = 0; i < UIState::kSlotCount; i++) {
+      const UIState::BodyPartUI& b = s.body[i];
+      if (!b.present) continue;
+      if (b.severed) { lost++; continue; }
+      if (b.bleeding) bleeding++;
+      burning += b.burningVoxels;
+      rot += b.voxelRot;
+      if (b.voxelTotal > 0 && b.voxelFrac > 0.01f) {
+        live += (float)b.voxelTotal;
+        born += (float)b.voxelTotal / b.voxelFrac;
+      }
+      const float sc = std::min(b.hpFrac, b.voxelFrac);
+      if (sc < worstScore) { worstScore = sc; worst = i; }
+    }
+    ImGui::PushFont(ui::FontSmall());
+    const float lh = ImGui::GetTextLineHeight();
+    auto row = [&](ImU32 col, const char* k, const char* v) {
+      ui::ShadowText(dl, ImVec2(base.x + 4, y), Fade(ui::ColParchDim(), 0.9f), k);
+      const ImVec2 ts = ImGui::CalcTextSize(v);
+      ui::ShadowText(dl, ImVec2(base.x + w - ts.x - 2, y), col, v);
+      const float d0 = base.x + 10 + ImGui::CalcTextSize(k).x;
+      const float d1 = base.x + w - ts.x - 8;
+      for (float dx = d0; dx < d1; dx += 4)
+        dl->AddRectFilled(ImVec2(dx, y + lh - 3), ImVec2(dx + 1, y + lh - 2),
+                          Fade(ui::ColBronze(), 0.7f));
+      y += lh + 3;
+    };
+    char v[48];
+    std::snprintf(v, sizeof v, "%.0f%%", born > 0 ? 100.0f * live / born : 100.0f);
+    row(ui::ColGoldPale(), "body left", v);
+    std::snprintf(v, sizeof v, "%d", lost);
+    row(lost ? ui::ColBloodHi() : ui::ColParch(), "parts lost", v);
+    std::snprintf(v, sizeof v, "%d", bleeding);
+    row(bleeding ? ui::ColBloodHi() : ui::ColParch(), "still bleeding", v);
+    std::snprintf(v, sizeof v, "%u", burning);
+    row(burning ? ui::ColEmber() : ui::ColParch(), "cells burning", v);
+    std::snprintf(v, sizeof v, "%u", rot);
+    row(rot ? IM_COL32(120, 176, 92, 255) : ui::ColParch(), "cells infected", v);
+    if (worst >= 0) row(ui::ColBloodHi(), "worst part", s.body[worst].label);
+    std::snprintf(v, sizeof v, "%.0f s", s.deathHoldSec);
+    row(ui::ColParch(), "lain there", v);
+    ImGui::PopFont();
+    y += 6;
+  }
+
+  // ---- FINDINGS: damage that is not only on the surface ---------------------
+  {
+    y = ui::Subheading(dl, ImVec2(base.x, y), w, "FINDINGS") + 2;
+    ImGui::PushFont(ui::FontSmall());
+    const float lh = ImGui::GetTextLineHeight();
+    if (a.findingCount == 0) {
+      ui::ShadowText(dl, ImVec2(base.x + 4, y), Fade(ui::ColParchDim(), 0.8f),
+                     a.maxDepth < 0 ? "measuring..." : "no burn or infection in the tissue");
+      y += lh + 4;
+    }
+    for (int i = 0; i < a.findingCount; i++) {
+      const UIState::AutopsyUI::Finding& f = a.findings[i];
+      const UIState::AutopsyUI::Legend& g = a.legend[f.leg];
+      const int depth = f.slot >= 0 ? a.partDepth[f.slot] : a.bodyDepth;
+      const bool deep = f.deepest > 0;
+      const float y0 = y;
+      dl->AddRectFilled(ImVec2(base.x + 4, y + 3), ImVec2(base.x + 12, y + 11), g.color);
+      dl->AddRect(ImVec2(base.x + 4, y + 3), ImVec2(base.x + 12, y + 11),
+                  Fade(ui::ColInk(), 0.8f));
+      char line[96];
+      std::snprintf(line, sizeof line, "%s in the %s", g.label,
+                    f.slot >= 0 ? s.body[f.slot].label : "body");
+      ui::ShadowText(dl, ImVec2(base.x + 18, y), ui::Mix(g.color, IM_COL32_WHITE, 0.35f), line);
+      y += lh;
+      if (f.shallowest == f.deepest)
+        std::snprintf(line, sizeof line, "%u cells, layer %d of %d", f.count, f.deepest, depth);
+      else
+        std::snprintf(line, sizeof line, "%u cells, layers %d-%d of %d", f.count, f.shallowest,
+                      f.deepest, depth);
+      ui::ShadowText(dl, ImVec2(base.x + 18, y),
+                     deep ? Fade(ui::ColBloodHi(), 0.7f + 0.3f * AlarmPulse())
+                          : Fade(ui::ColParchDim(), 0.85f),
+                     line);
+      y += lh;
+      // Click a finding: select its part, frame it, and peel to the deepest
+      // layer it reached, so the portrait shows the worst of it.
+      ImGui::SetCursorScreenPos(ImVec2(base.x, y0));
+      char id[24];
+      std::snprintf(id, sizeof id, "##find%d", i);
+      if (ImGui::InvisibleButton(id, ImVec2(w, y - y0))) {
+        if (f.slot >= 0) {
+          s.inspectSelected = f.slot;
+          s.portraitFocusSlot = f.slot;
+          s.portraitPivotSlot = f.slot;
+        }
+        s.autopsy.peel = f.deepest;
+      }
+      if (ImGui::IsItemHovered()) {
+        dl->AddRect(ImVec2(base.x, y0 - 1), ImVec2(base.x + w, y + 1), Fade(ui::ColGold(), 0.6f));
+        Tip("Show me: select this part, frame it, and peel down to the\n"
+            "deepest layer this was found at.");
+      }
+      y += 5;
+    }
+    ImGui::PopFont();
+    y += 4;
+  }
+
+  // ---- THE CORE SAMPLE -------------------------------------------------------
+  {
+    y = ui::Subheading(dl, ImVec2(base.x, y), w, "CORE SAMPLE") + 2;
+    const float room = std::max(140.0f, base.y + size.y - y - 8);
+    y += CoreSample(s, dl, ImVec2(base.x, y), w, room) + 6;
+  }
+  ImGui::SetCursorScreenPos(base);
+  ImGui::Dummy(ImVec2(w, y - base.y));
+  ImGui::EndChild();
+}
+
+// Blood that runs off the bottom of the band and lengthens for the first few
+// seconds the body lies there. Deterministic per column (a hash of x, no RNG
+// state), every length a whole number of 2 px pixels.
+void BloodDrips(ImDrawList* dl, float x0, float x1, float y, float since) {
+  const float grow = std::clamp(since / 6.0f, 0.0f, 1.0f);
+  for (float x = x0 + 6; x < x1 - 6; x += 6) {
+    uint32_t h = (uint32_t)(int)x * 2654435761u;
+    h ^= h >> 13;
+    h *= 0x5bd1e995u;
+    h ^= h >> 15;
+    if ((h & 7u) > 2u) continue;
+    const float len = std::floor((4.0f + (float)((h >> 8) & 31u)) * grow / 2.0f) * 2.0f;
+    if (len < 2) continue;
+    const float wpx = ((h >> 16) & 1u) ? 4.0f : 2.0f;
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + wpx, y + len), ui::ColBlood());
+    dl->AddRectFilled(ImVec2(x - 1, y + len - 2), ImVec2(x + wpx + 1, y + len + 2),
+                      ui::ColBlood());
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + 1, y + len), Fade(ui::ColBloodHi(), 0.6f));
+  }
+}
+
+// THE WHOLE SCREEN. Called instead of the character sheet's layout while the
+// death screen holds and the post-mortem is chosen.
+void PostMortemScreen(UIState& s) {
+  ImGuiIO& io = ImGui::GetIO();
+  const ImVec2 disp = io.DisplaySize;
+  ImDrawList* bg = ImGui::GetBackgroundDrawList();
+  UIState::AutopsyUI& a = s.autopsy;
+
+  // A heavier dim than the sheet's, and a red rim banded toward the edges in
+  // 4 px steps so the vignette stays pixel art.
+  ui::ScreenDim(bg, disp, 0.62f, 0.7f);
+  for (int k = 0; k < 6; k++) {
+    const float e = 4.0f * (float)k;
+    const ImU32 c = Fade(ui::ColBlood(), 0.20f - 0.03f * (float)k);
+    bg->AddRectFilled(ImVec2(e, e), ImVec2(disp.x - e, e + 4), c);
+    bg->AddRectFilled(ImVec2(e, disp.y - e - 4), ImVec2(disp.x - e, disp.y - e), c);
+    bg->AddRectFilled(ImVec2(e, e + 4), ImVec2(e + 4, disp.y - e - 4), c);
+    bg->AddRectFilled(ImVec2(disp.x - e - 4, e + 4), ImVec2(disp.x - e, disp.y - e - 4), c);
+  }
+
+  if (a.maxDepth >= 0) a.peel = std::clamp(a.peel, 0, a.maxDepth);
+  // THE FIRST PEEL UNDRESSES (owner, 2026-10-08). On a body that died in
+  // gear, the first step down takes off everything worn and held - one step
+  // for the whole outfit - and only the next starts on the skin. Restoring
+  // walks the same ladder back up: the skin returns before the clothes do.
+  // A peel past the skin keeps the gear off (main.cpp drops it from any peel
+  // anyway), so the ladder never has a rung with the robe over a flayed chest.
+  if (a.peel > 0 && a.hasGear) a.hideGear = true;
+  auto peelDown = [&a] {
+    if (a.peel == 0 && a.hasGear && !a.hideGear)
+      a.hideGear = true;
+    else if (a.maxDepth < 0 || a.peel < a.maxDepth)
+      a.peel++;
+  };
+  auto peelUp = [&a] {
+    if (a.peel > 0)
+      a.peel--;
+    else if (a.hideGear)
+      a.hideGear = false;
+  };
+  // PageDown peels, PageUp puts a layer back: the tuner's keys.
+  if (!io.WantTextInput) {
+    if (ImGui::IsKeyPressed(ImGuiKey_PageDown)) peelDown();
+    if (ImGui::IsKeyPressed(ImGuiKey_PageUp)) peelUp();
+  }
+
+  const ImGuiWindowFlags kFlags =
+      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
+      ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground |
+      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus;
+  const float edge = disp.x >= 1400 ? 24.0f : 12.0f;
+  const float top = 16.0f;
+  const float bottom = disp.y - 36.0f;
+
+  // ======================= THE BAND ==========================================
+  const float bandH = 84.0f;
+  {
+    ImGui::SetNextWindowPos(ImVec2(edge, top));
+    ImGui::SetNextWindowSize(ImVec2(disp.x - edge * 2, bandH + 28));
+    ImGui::Begin("##pm_band", nullptr, kFlags);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p0(edge, top), p1(disp.x - edge, top + bandH);
+    ui::DropShadow(dl, p0, p1, 14.0f, 0.6f);
+    // Blood, posterised: 4 px bands in eight steps, darkening downward.
+    for (float yy = p0.y; yy < p1.y; yy += 4) {
+      const float t = (yy - p0.y) / bandH;
+      const ImU32 c = ui::Mix(IM_COL32(74, 18, 22, 245), IM_COL32(22, 6, 10, 250),
+                              std::floor(t * 8.0f) / 8.0f);
+      dl->AddRectFilled(ImVec2(p0.x, yy), ImVec2(p1.x, std::min(p1.y, yy + 4)), c);
+    }
+    ui::Grain(dl, p0, p1, 0.08f);
+    dl->AddRectFilled(p0, ImVec2(p1.x, p0.y + 2), Fade(ui::ColBloodHi(), 0.9f));
+    dl->AddRectFilled(ImVec2(p0.x, p1.y - 2), p1, Fade(ui::ColBloodHi(), 0.9f));
+    BloodDrips(dl, p0.x, p1.x, p1.y, s.deathHoldSec);
+
+    // YOU DIED, tracked wide, with a slow pulse of light behind it.
+    const char* title = "YOU  DIED";
+    const float trk = 6.0f;
+    const float tw = ui::TrackedTextWidth(title, trk);
+    const float th = ImGui::GetTextLineHeight();
+    const ImVec2 tp(std::floor(p0.x + 28), std::floor(p0.y + 14));
+    const float pulse = 0.5f + 0.5f * (float)std::sin(ImGui::GetTime() * 1.6);
+    ui::Glow(dl, ImVec2(tp.x - 8, tp.y - 4), ImVec2(tp.x + tw + 8, tp.y + th + 4),
+             ui::ColBloodHi(), 10.0f, 0.18f + 0.18f * pulse);
+    ui::TrackedText(dl, ImVec2(tp.x + 2, tp.y + 2), Fade(ui::ColInk(), 0.9f), title, trk);
+    ui::TrackedText(dl, tp, ui::Mix(ui::ColBloodHi(), ui::ColGoldPale(), 0.2f * pulse), title,
+                    trk);
+    ImGui::PushFont(ui::FontSmall());
+    {
+      char line[192];
+      const std::string cause =
+          s.deathCause.empty() ? std::string("cause unrecorded") : s.deathCause;
+      std::snprintf(line, sizeof line,
+                    "%s   -   %.0f s ago   -   every readout here is the body at the instant it died",
+                    cause.c_str(), s.deathHoldSec);
+      ui::ShadowText(dl, ImVec2(tp.x, tp.y + th + 10), Fade(ui::ColParch(), 0.9f), line);
+    }
+    ImGui::PopFont();
+
+    // Respawn, and the way back to the ordinary sheet, at the right end.
+    const float wait = s.deathRespawnAfter - s.deathHoldSec;
+    const bool ready = wait <= 0.0f;
+    char blabel[32];
+    if (ready) std::snprintf(blabel, sizeof blabel, "respawn");
+    else std::snprintf(blabel, sizeof blabel, "respawn  %.0f", std::ceil(wait));
+    const float bw = 180.0f;
+    const float by = std::floor(p0.y + (bandH - 34.0f) * 0.5f);
+    if (!ready) ImGui::BeginDisabled();
+    if (ui::Button("##pm_respawn", ImVec2(p1.x - bw - 20, by), blabel, ready, bw) && ready)
+      s.respawnRequest = true;
+    if (!ready) {
+      ImGui::EndDisabled();
+      dl->AddRectFilled(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                        Fade(ui::ColInk(), 0.45f));
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      Tip("Build a new body and put it back in the world. Nothing here is kept,\n"
+          "and nothing is on a timer: look the body over first if you want.");
+    ImGui::PushFont(ui::FontSmall());
+    if (ui::Button("##pm_sheet", ImVec2(p1.x - bw - 20 - 150, by + 6), "character sheet",
+                   false, 136))
+      a.open = false;
+    if (ImGui::IsItemHovered())
+      Tip("The ordinary character screen: your gear, your pack, the health\n"
+          "column. The post-mortem button on its banner brings this back.");
+    ImGui::PopFont();
+    ImGui::End();
+  }
+
+  // ======================= THE COLUMNS =======================================
+  const float bodyTop = top + bandH + 28.0f;
+  const float bodyH = bottom - bodyTop;
+  const float sideW = 300.0f;
+  const float gap = 16.0f;
+  // Narrow screens give up the left column first: the body is the point.
+  const bool leftShown = disp.x - edge * 2 >= sideW * 2 + gap * 2 + 420.0f;
+  const float centerX = edge + (leftShown ? sideW + gap : 0.0f);
+  const float rightX = disp.x - edge - sideW;
+  const float centerW = rightX - gap - centerX;
+
+  // THE PORTRAIT TIER: the biggest that fits the centre panel with the gauge
+  // beside it and the controls in a strip beside that - or, on a centre too
+  // narrow for the strip, under the picture.
+  const float gaugeW = 22.0f;
+  const float stripW = 230.0f;
+  const float controlsH = 150.0f;
+  const float chromeH = kFrame * 2 + ui::kHeaderH + 14 + kPad;
+  int tier = 0;
+  bool stripBeside = false;
+  for (int pass = 0; pass < 2 && !stripBeside; pass++) {
+    const bool beside = pass == 0;
+    for (int t = UIState::kPortraitTiers - 1; t >= 0; t--) {
+      const UIState::PortraitTierTex& T = s.portraitTierTex[t];
+      if (!T.tex) continue;
+      const float needW = (float)T.w + gaugeW + 10 + (beside ? 18 + stripW : 0.0f) +
+                          (kFrame + kPad) * 2;
+      const float needH = (float)T.h + (beside ? 0.0f : controlsH) + chromeH;
+      if (needW <= centerW && needH <= bodyH) {
+        tier = t;
+        stripBeside = beside;
+        break;
+      }
+    }
+    if (beside && !stripBeside) continue;  // nothing fits beside: try under
+    break;
+  }
+  s.portraitTier = tier;
+  if (s.portraitTierTex[tier].tex) {
+    s.portraitTex = s.portraitTierTex[tier].tex;
+    s.portraitW = s.portraitTierTex[tier].w;
+    s.portraitH = s.portraitTierTex[tier].h;
+  }
+  const float pw = s.portraitW > 0 ? (float)s.portraitW : kPortraitWFallback;
+  const float ph = s.portraitH > 0 ? (float)s.portraitH : kPortraitHFallback;
+
+  // THE THREE PANELS STAND TOGETHER (owner, 2026-10-08): the side panels hug
+  // the body panel and the group is centred, rather than the sides pinned to
+  // the screen edges with empty desk between. Room the body does not use goes
+  // to the side panels first (up to kSideMax), then to the margins.
+  const float panelW = std::min(
+      centerW, pw + gaugeW + 10 + (stripBeside ? 18 + stripW : 0.0f) + (kFrame + kPad) * 2);
+  const float hug = 4.0f;
+  const float kSideMax = 380.0f;
+  const int sides = leftShown ? 2 : 1;
+  const float sideRoom = (disp.x - edge * 2 - panelW - hug * (float)sides) / (float)sides;
+  const float sideWide = std::floor(std::clamp(sideRoom, sideW, kSideMax));
+  const float groupW = panelW + (sideWide + hug) * (float)sides;
+  const float groupX = std::max(edge, std::floor((disp.x - groupW) * 0.5f));
+  const float leftPanelX = groupX;
+  const float panelX = groupX + (leftShown ? sideWide + hug : 0.0f);
+  const float rightPanelX = panelX + panelW + hug;
+
+  ui::PanelStyle stSide;
+  stSide.darkMix = 0.22f;
+  stSide.sheenPeak = 0.40f;
+  stSide.bronzeAlpha = 0.07f;
+
+  if (leftShown) {
+    ImGui::SetNextWindowPos(ImVec2(leftPanelX, bodyTop));
+    ImGui::SetNextWindowSize(ImVec2(sideWide, bodyH));
+    ImGui::Begin("##pm_left_panel", nullptr, kFlags);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+    const float y = PanelChrome(dl, wp, ws, "AUTOPSY", nullptr, stSide);
+    PostMortemLeft(s, ImVec2(wp.x + kFrame + kPad - 4, y),
+                   ImVec2(ws.x - 2 * (kFrame + kPad) + 8, wp.y + ws.y - kFrame - kPad - y));
+    ImGui::End();
+  }
+
+  // ---- the centre: the body ----------------------------------------------------
+  {
+    ImGui::SetNextWindowPos(ImVec2(panelX, bodyTop));
+    ImGui::SetNextWindowSize(ImVec2(panelW, bodyH));
+    ImGui::Begin("##pm_body", nullptr, kFlags);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+    ui::PanelStyle st;
+    st.darkMix = 0.16f;
+    st.sheenPeak = 0.5f;
+    st.bronzeAlpha = 0.05f;
+    const float y = PanelChrome(dl, wp, ws, "THE BODY",
+                                a.peel > 0                ? "dissected"
+                                : a.hasGear && a.hideGear ? "undressed"
+                                                          : "as it fell",
+                                st);
+    const float gx = wp.x + kFrame + kPad;
+    const float px0 = gx + gaugeW + 10;
+    const ImVec2 pAt(px0, y);
+    const ImVec2 pSize(pw, ph);
+    // The click on a part selects it, as the health column does.
+    s.inspectMode = true;
+    Portrait(s, pAt, pSize);
+    InspectOverlay(s, pAt, pSize);
+
+    // The probe's voxel, marked where the ray met it: a pixel crosshair.
+    if (a.probe.valid && s.autopsy.probeWant) {
+      const float mx = std::floor(pAt.x + a.probe.uv[0] * pw);
+      const float my = std::floor(pAt.y + a.probe.uv[1] * ph);
+      const ImU32 c = ui::ColGoldHi();
+      dl->AddRectFilled(ImVec2(mx - 7, my - 1), ImVec2(mx - 2, my + 1), c);
+      dl->AddRectFilled(ImVec2(mx + 2, my - 1), ImVec2(mx + 7, my + 1), c);
+      dl->AddRectFilled(ImVec2(mx - 1, my - 7), ImVec2(mx + 1, my - 2), c);
+      dl->AddRectFilled(ImVec2(mx - 1, my + 2), ImVec2(mx + 1, my + 7), c);
+    }
+    // Specimen brackets at the four corners, in bone.
+    {
+      const ImU32 bone = IM_COL32(222, 214, 196, 200);
+      const float L = 18.0f, t = 3.0f;
+      const ImVec2 q0(pAt.x - 6, pAt.y - 6), q1(pAt.x + pw + 6, pAt.y + ph + 6);
+      dl->AddRectFilled(q0, ImVec2(q0.x + L, q0.y + t), bone);
+      dl->AddRectFilled(q0, ImVec2(q0.x + t, q0.y + L), bone);
+      dl->AddRectFilled(ImVec2(q1.x - L, q0.y), ImVec2(q1.x, q0.y + t), bone);
+      dl->AddRectFilled(ImVec2(q1.x - t, q0.y), ImVec2(q1.x, q0.y + L), bone);
+      dl->AddRectFilled(ImVec2(q0.x, q1.y - t), ImVec2(q0.x + L, q1.y), bone);
+      dl->AddRectFilled(ImVec2(q0.x, q1.y - L), ImVec2(q0.x + t, q1.y), bone);
+      dl->AddRectFilled(ImVec2(q1.x - L, q1.y - t), q1, bone);
+      dl->AddRectFilled(ImVec2(q1.x - t, q1.y - L), q1, bone);
+    }
+    // While peeled, a scan line sweeps the picture: a dissection under the
+    // lamp rather than a frozen photograph. Quantised to 2 px rows.
+    if (a.peel > 0) {
+      const float period = 3.2f;
+      const float t = (float)std::fmod(ImGui::GetTime(), (double)period) / period;
+      const float sy = std::floor((pAt.y + t * ph) / 2.0f) * 2.0f;
+      dl->PushClipRect(pAt, ImVec2(pAt.x + pw, pAt.y + ph), true);
+      dl->AddRectFilled(ImVec2(pAt.x, sy), ImVec2(pAt.x + pw, sy + 2), IM_COL32(140, 230, 200, 70));
+      dl->AddRectFilled(ImVec2(pAt.x, sy - 8), ImVec2(pAt.x + pw, sy), IM_COL32(140, 230, 200, 18));
+      dl->PopClipRect();
+    }
+    // The toe tag, pinned to the top-left of the picture: which layer this is.
+    {
+      ImGui::PushFont(ui::FontSmall());
+      char tag[48];
+      int depth = -1;
+      const char* who = "";
+      const UIState::AutopsyUI::Layer* L = StrataOf(s, depth, who);
+      const int lead = depth >= 0 && a.peel <= depth ? LayerLead(L[a.peel]) : -1;
+      if (lead >= 0)
+        std::snprintf(tag, sizeof tag, "LAYER %d  %s", a.peel, a.legend[lead].label);
+      else
+        std::snprintf(tag, sizeof tag, "LAYER %d", a.peel);
+      const ImVec2 ts = ImGui::CalcTextSize(tag);
+      const ImVec2 t0(pAt.x + 10, pAt.y + 10), t1(t0.x + ts.x + 24, t0.y + ts.y + 8);
+      dl->AddRectFilled(ImVec2(t0.x + 2, t0.y + 2), ImVec2(t1.x + 2, t1.y + 2),
+                        Fade(ui::ColInk(), 0.6f));
+      dl->AddRectFilled(t0, t1, ui::ColVellum());
+      dl->AddRectFilled(ImVec2(t0.x, t1.y - 2), t1, ui::ColVellumLo());
+      const float mid = std::floor((t0.y + t1.y) * 0.5f);
+      dl->AddRectFilled(ImVec2(t0.x + 5, mid - 2), ImVec2(t0.x + 9, mid + 2),
+                        Fade(ui::ColInk(), 0.8f));
+      // The string it hangs from.
+      dl->AddRectFilled(ImVec2(t0.x + 6, t0.y - 8), ImVec2(t0.x + 8, mid - 2),
+                        Fade(ui::ColVellumLo(), 0.9f));
+      dl->AddText(ImVec2(t0.x + 16, t0.y + 4), ui::ColIronGall(), tag);
+      ImGui::PopFont();
+    }
+
+    // THE DEPTH GAUGE, left of the picture: one segment per layer of the
+    // whole body, coloured by what dominates it, the peel marked in gold.
+    {
+      const ImVec2 g0(gx, pAt.y), g1(gx + gaugeW, pAt.y + ph);
+      dl->AddRectFilled(ImVec2(g0.x - 2, g0.y - 2), ImVec2(g1.x + 2, g1.y + 2),
+                        Fade(ui::ColInk(), 0.9f));
+      const int n = a.bodyDepth + 1;
+      if (n > 0) {
+        const float segH = std::max(2.0f, std::floor(ph / (float)n));
+        for (int d = 0; d < n; d++) {
+          const float y0 = g0.y + d * segH;
+          const float y1 = d == n - 1 ? g1.y : y0 + segH - 1;
+          const int lead = LayerLead(a.body[d]);
+          ImU32 c = lead >= 0 ? a.legend[lead].color : ui::ColChar();
+          if (d < a.peel) c = ui::Mix(c, ui::ColInk(), 0.7f);
+          dl->AddRectFilled(ImVec2(g0.x, y0), ImVec2(g1.x, y1), c);
+          ImGui::SetCursorScreenPos(ImVec2(g0.x, y0));
+          char id[24];
+          std::snprintf(id, sizeof id, "##gauge%d", d);
+          if (ImGui::InvisibleButton(id, ImVec2(gaugeW, std::max(1.0f, y1 - y0 + 1)))) a.peel = d;
+          if (ImGui::IsItemHovered()) {
+            dl->AddRect(ImVec2(g0.x - 1, y0 - 1), ImVec2(g1.x + 1, y1 + 1), ui::ColGold());
+            char tip[64];
+            std::snprintf(tip, sizeof tip, "layer %d - mostly %s", d,
+                          lead >= 0 ? a.legend[lead].label : "nothing");
+            Tip(tip);
+          }
+          if (d == a.peel) {
+            dl->AddRect(ImVec2(g0.x - 3, y0 - 2), ImVec2(g1.x + 3, y1 + 2), ui::ColGoldHi(), 0.0f,
+                        0, 2.0f);
+            // A stepped pointer into the picture.
+            const float my = std::floor((y0 + y1) * 0.5f);
+            for (int k = 0; k < 4; k++)
+              dl->AddRectFilled(ImVec2(g1.x + 3 + k * 2, my - (float)(3 - k)),
+                                ImVec2(g1.x + 5 + k * 2, my + (float)(3 - k) + 1),
+                                ui::ColGoldHi());
+          }
+        }
+      }
+    }
+
+    // ---- THE CONTROLS ----------------------------------------------------------
+    // In a strip BESIDE the picture when the centre is wide enough (every
+    // pixel of height then goes to the body), under it otherwise.
+    const float sx = stripBeside ? pAt.x + pw + 18 : px0;
+    const float sw = stripBeside ? stripW : pw;
+    float cy = stripBeside ? pAt.y : pAt.y + ph + 14;
+    {
+      int depth = -1;
+      const char* who = "";
+      const UIState::AutopsyUI::Layer* L = StrataOf(s, depth, who);
+      // The layer, in the display face: the one number this panel is about.
+      char big[32];
+      std::snprintf(big, sizeof big, "LAYER %d", a.peel);
+      ui::TrackedText(dl, ImVec2(sx, cy), ui::ColGoldPale(), big, 2.0f);
+      ImGui::PushFont(ui::FontSmall());
+      const float lh = ImGui::GetTextLineHeight();
+      if (depth >= 0) {
+        char of[32];
+        std::snprintf(of, sizeof of, "of %d", depth);
+        const ImVec2 ts = ImGui::CalcTextSize(of);
+        ui::ShadowText(dl, ImVec2(sx + sw - ts.x, cy + 8), ui::ColParchDim(), of);
+      }
+      cy += 30;
+      char line[96];
+      if (depth >= 0 && a.peel <= depth)
+        std::snprintf(line, sizeof line, "%s  -  %u cells", who, L[a.peel].total);
+      else if (depth >= 0)
+        std::snprintf(line, sizeof line, "%s  -  nothing this deep", who);
+      else
+        std::snprintf(line, sizeof line, "measuring...");
+      ui::ShadowText(dl, ImVec2(sx, cy), Fade(ui::ColParch(), 0.9f), line);
+      cy += lh + 6;
+      if (depth >= 0 && a.peel <= depth) {
+        const UIState::AutopsyUI::Layer& cur = L[a.peel];
+        CompositionBar(dl, a, cur, ImVec2(sx, cy), ImVec2(sx + sw, cy + 12));
+        cy += 18;
+        float lx = sx;
+        for (int k = 0; k < cur.n; k++) {
+          const UIState::AutopsyUI::Legend& g = a.legend[cur.leg[k]];
+          char item[48];
+          std::snprintf(item, sizeof item, "%s %.0f%%", g.label,
+                        100.0f * (float)cur.count[k] / (float)std::max(1u, cur.total));
+          const float iw = ImGui::CalcTextSize(item).x + 12;
+          if (lx > sx && lx + iw > sx + sw) {
+            lx = sx;
+            cy += lh + 2;
+          }
+          dl->AddRectFilled(ImVec2(lx, cy + 3), ImVec2(lx + 8, cy + 11), g.color);
+          ui::ShadowText(dl, ImVec2(lx + 11, cy),
+                         g.kind >= 2 ? ui::Mix(g.color, IM_COL32_WHITE, 0.35f) : ui::ColParch(),
+                         item);
+          lx += iw + 8;
+        }
+        cy += lh + 10;
+      }
+
+      // The buttons, wrapped to the strip.
+      float cx = sx;
+      auto btn = [&](const char* id, const char* label, bool on) {
+        const float bwid = ImGui::CalcTextSize(label).x + 24;
+        if (cx > sx && cx + bwid > sx + sw) {
+          cx = sx;
+          cy += lh + 14;
+        }
+        const bool hit = ui::Button(id, ImVec2(cx, cy), label, on, 0.0f);
+        cx = ImGui::GetItemRectMax().x + 6;
+        return hit;
+      };
+      if (btn("##pm_up", "< restore", false)) peelUp();
+      if (ImGui::IsItemHovered()) Tip("Put one layer back - the clothes last.  [PageUp]");
+      if (btn("##pm_dn", "peel >", a.peel > 0 || (a.hasGear && a.hideGear))) peelDown();
+      if (ImGui::IsItemHovered())
+        Tip("Take the outermost layer off the whole body - the clothes and\n"
+            "armour first, then the skin, then what is under it, down to the\n"
+            "bone. The same peel as the tuner's Models tab. It draws a copy:\n"
+            "the body itself is untouched.  [PageDown]");
+      if (btn("##pm_skin", "skin", a.peel == 0 && (!a.hasGear || a.hideGear))) {
+        a.peel = 0;
+        a.hideGear = a.hasGear;
+      }
+      if (ImGui::IsItemHovered()) Tip("Back to the bare skin: undressed, nothing peeled.");
+      cx = sw >= 300 ? cx + 8 : sx + sw;  // a new row for the view toggles
+      if (btn("##pm_gear", "gear", !a.hideGear && a.peel == 0 && !a.isolate))
+        a.hideGear = !a.hideGear;
+      if (ImGui::IsItemHovered())
+        Tip("Show or hide what was worn and held. A peel takes the gear off\n"
+            "anyway: a robe over a peeled chest hides what the peel is for.");
+      if (btn("##pm_iso", "isolate", a.isolate)) a.isolate = !a.isolate;
+      if (ImGui::IsItemHovered())
+        Tip("Draw only the selected part (click one on the body, or a finding).");
+      cy = ImGui::GetItemRectMax().y + 12;
+
+      // What is selected, and how to change it.
+      if (stripBeside) {
+        const int sel = s.inspectSelected;
+        const char* name = sel >= 0 && sel < UIState::kSlotCount ? s.body[sel].label : nullptr;
+        std::snprintf(line, sizeof line, "selected: %s", name ? name : "nothing");
+        ui::ShadowText(dl, ImVec2(sx, cy), name ? ui::ColParch() : Fade(ui::ColParchDim(), 0.8f),
+                       line);
+        cy += lh + 2;
+        const char* help =
+            "Click a part to read it on the right and sample it on the left; "
+            "double-click to frame it. Drag to turn, scroll to zoom.";
+        dl->AddText(nullptr, 0.0f, ImVec2(sx, cy), Fade(ui::ColParchDim(), 0.75f), help,
+                    nullptr, sw);
+        cy += ImGui::CalcTextSize(help, nullptr, false, sw).y + 10;
+        // EVERYTHING THE BODY IS MADE OF, damage first (the legend's order),
+        // as many rows as the picture's height leaves room for.
+        if (a.legendCount > 0) {
+          ImGui::PopFont();
+          cy = ui::Subheading(dl, ImVec2(sx, cy), sw, "MADE OF") + 2;
+          ImGui::PushFont(ui::FontSmall());
+          uint32_t all = 0;
+          for (int k = 0; k < a.legendCount; k++) all += a.legend[k].count;
+          // Rows stop short of the probe's block below.
+          const float kProbeH = 10.0f * lh + 40.0f;
+          for (int k = 0; k < a.legendCount && cy + lh <= pAt.y + ph - kProbeH; k++) {
+            const UIState::AutopsyUI::Legend& g = a.legend[k];
+            dl->AddRectFilled(ImVec2(sx, cy + 3), ImVec2(sx + 8, cy + 11), g.color);
+            const ImU32 tc = g.kind == 3   ? IM_COL32(120, 176, 92, 255)
+                             : g.kind == 2 ? ui::ColEmber()
+                                           : ui::ColParch();
+            ui::ShadowText(dl, ImVec2(sx + 12, cy), tc, g.label);
+            char pct[24];
+            std::snprintf(pct, sizeof pct, "%.1f%%", 100.0f * (float)g.count / (float)std::max(1u, all));
+            const ImVec2 ts = ImGui::CalcTextSize(pct);
+            ui::ShadowText(dl, ImVec2(sx + sw - ts.x, cy), Fade(ui::ColParchDim(), 0.9f), pct);
+            if (g.kind >= 2) {
+              const char* tag = g.kind == 3 ? "infection" : "burn";
+              const ImVec2 tt = ImGui::CalcTextSize(tag);
+              ui::ShadowText(dl, ImVec2(sx + sw - ts.x - tt.x - 10, cy), Fade(tc, 0.7f), tag);
+            }
+            cy += lh + 1;
+          }
+          cy += 6;
+        }
+        // ---- UNDER THE CURSOR: the one voxel the mouse is on --------------
+        ImGui::PopFont();
+        cy = ui::Subheading(dl, ImVec2(sx, cy), sw, "UNDER CURSOR") + 2;
+        ImGui::PushFont(ui::FontSmall());
+        const UIState::AutopsyUI::Probe& pr = a.probe;
+        if (!pr.valid) {
+          dl->AddText(nullptr, 0.0f, ImVec2(sx, cy), Fade(ui::ColParchDim(), 0.75f),
+                      "Hold the mouse still over the body to read the voxel under it.",
+                      nullptr, sw);
+        } else {
+          auto row = [&](const char* k, ImU32 col, const char* v, uint32_t swatch) {
+            ui::ShadowText(dl, ImVec2(sx, cy), Fade(ui::ColParchDim(), 0.85f), k);
+            float vx = sx + 64;
+            if (swatch) {
+              dl->AddRectFilled(ImVec2(vx, cy + 3), ImVec2(vx + 8, cy + 11), swatch);
+              dl->AddRect(ImVec2(vx, cy + 3), ImVec2(vx + 8, cy + 11), Fade(ui::ColInk(), 0.8f));
+              vx += 12;
+            }
+            dl->AddText(nullptr, 0.0f, ImVec2(vx, cy), col, v, nullptr, sx + sw - vx);
+            cy += ImGui::CalcTextSize(v, nullptr, false, sx + sw - vx).y + 2;
+          };
+          char buf[64];
+          row("part", ui::ColParch(), pr.part, 0);
+          const ImU32 kc = pr.kind == 3   ? IM_COL32(120, 176, 92, 255)
+                           : pr.kind == 2 ? ui::ColEmber()
+                                          : ui::ColGoldPale();
+          std::snprintf(buf, sizeof buf, "%s%s", pr.mat,
+                        pr.kind == 3 ? "  (infection)" : pr.kind == 2 ? "  (burnt)" : "");
+          row("voxel", kc, buf, pr.matColor);
+          if (pr.layer >= 0) {
+            std::snprintf(buf, sizeof buf, "%d%s", pr.layer,
+                          pr.layer == 0 ? "  - the surface" : "  below the surface");
+            row("layer", ui::ColParch(), buf, 0);
+          }
+          if (pr.bruise >= 15)
+            row("tissue", ui::ColBloodHi(), "split open", 0);
+          else if (pr.bruise > 0) {
+            std::snprintf(buf, sizeof buf, "bruised  %d / 14", pr.bruise);
+            row("tissue", ui::Mix(ui::ColBlood(), ui::ColParch(), 0.4f), buf, 0);
+          } else {
+            row("tissue", Fade(ui::ColParchDim(), 0.8f), "unbruised", 0);
+          }
+          if (pr.coatAmt > 0) {
+            std::snprintf(buf, sizeof buf, "%s  %d / 15", pr.coat, pr.coatAmt);
+            row("stained", ui::Mix(pr.coatColor, IM_COL32_WHITE, 0.35f), buf, pr.coatColor);
+          } else {
+            row("stained", Fade(ui::ColParchDim(), 0.8f), "clean", 0);
+          }
+          std::snprintf(buf, sizeof buf, "%d, %d, %d", pr.cell[0], pr.cell[1], pr.cell[2]);
+          row("cell", Fade(ui::ColParchDim(), 0.7f), buf, 0);
+        }
+      }
+      if (a.refusals > 0) {
+        char r[80];
+        std::snprintf(r, sizeof r, "%u bricks could not be copied: drawn unpeeled", a.refusals);
+        dl->AddText(nullptr, 0.0f, ImVec2(sx, cy), Fade(ui::ColEmber(), 0.8f), r, nullptr, sw);
+      }
+      ImGui::PopFont();
+    }
+    ImGui::End();
+  }
+
+  // ---- the right: triage and the selected part --------------------------------
+  {
+    ImGui::SetNextWindowPos(ImVec2(rightPanelX, bodyTop));
+    ImGui::SetNextWindowSize(ImVec2(sideWide, bodyH));
+    ImGui::Begin("##pm_right_panel", nullptr, kFlags);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+    const float y = PanelChrome(dl, wp, ws, "THE PARTS", nullptr, stSide);
+    VitalsColumn(s, ImVec2(wp.x + kFrame + kPad - 4, y),
+                 ImVec2(ws.x - 2 * (kFrame + kPad) + 8, wp.y + ws.y - kFrame - kPad - y),
+                 /*deathBanner=*/false);
+    ImGui::End();
+  }
+
+  // The footer line, in the sheet's own vocabulary.
+  {
+    const char* text =
+        "PageDown peel   |   PageUp restore   |   click a part to read it   |   "
+        "double-click to frame it   |   I to close";
+    ImGui::PushFont(ui::FontSmall());
+    const ImVec2 ts = ImGui::CalcTextSize(text);
+    const ImVec2 tp(std::floor((disp.x - ts.x) * 0.5f), disp.y - ts.y - 10);
+    bg->AddRectFilled(ImVec2(tp.x - 12, tp.y - 3), ImVec2(tp.x + ts.x + 12, disp.y),
+                      Fade(ui::ColInk(), 0.7f));
+    bg->AddRectFilled(ImVec2(tp.x - 12, tp.y - 3), ImVec2(tp.x + ts.x + 12, tp.y - 1),
+                      Fade(ui::ColBlood(), 0.7f));
+    ui::ShadowText(bg, tp, Fade(ui::ColParchDim(), 0.9f), text);
+    ImGui::PopFont();
+  }
+}
+
 }  // namespace
 
 void DrawInventoryScreen(UIState& s) {
@@ -3498,7 +4521,9 @@ void DrawInventoryScreen(UIState& s) {
   // fire you set spread while you rummage. Dimmed only enough that the panels
   // are the thing being read, and vignetted so the eye is pulled in off the
   // edges of the screen onto them.
-  ui::ScreenDim(bg, disp, 0.5f, 0.55f);
+  // (The post-mortem draws its own, heavier one.)
+  const bool postMortem = s.deathScreen && s.autopsy.open;
+  if (!postMortem) ui::ScreenDim(bg, disp, 0.5f, 0.55f);
 
   // A DEATH OPENS THE HEALTH COLUMN, on the limb in the most trouble. main.cpp
   // opens the screen; which page of it you land on is this file's business,
@@ -3516,6 +4541,12 @@ void DrawInventoryScreen(UIState& s) {
     s.triageOpen = 0xFFFFFFFFu;
   }
 
+  // THE POST-MORTEM (above): a death gets its own screen, not the sheet.
+  if (postMortem) {
+    PostMortemScreen(s);
+    return;
+  }
+
   // THE BENCH KEEPS ITS ROOM: the health column stays shut while a vessel is
   // on the alchemy bench (owner, 2026-09-27: opening it shrank the bench).
   // Shut here, its toggle hidden below, and opened again when the bench is
@@ -3529,6 +4560,43 @@ void DrawInventoryScreen(UIState& s) {
   }
 
   // ---- layout ---------------------------------------------------------------
+  // THE PORTRAIT'S SIZE (UIState::portraitTierTex, 2026-10-08): the biggest
+  // tier that still fits. Vertically, the portrait and everything the
+  // character panel stacks under it (flasks, the two pools, the locomotion
+  // line, PROTECTION: ~320 px, measured off the drawing below) inside the
+  // panel; horizontally, the character panel - with the health column when
+  // it is open - beside the narrowest the right-hand column may be for what
+  // it is showing (the same three minimums the reflow below uses). A screen
+  // that fits none gets the smallest, and the reflow handles it as before.
+  {
+    const float rightNeed =
+        (s.alchemy.open || s.itemStage.open)
+            ? 1024.0f
+            : s.spellbookOpen
+                  ? kPad * 2 + ((kKeyCols - 1) * kCell + kSlot) + 20.0f +
+                        (kGutter + 4.0f * kCell - (kCell - kSlot))
+                  : kPad * 2 + (kKeyCols - 1) * kCell + kSlot;
+    const float kBelowPortrait = 320.0f;
+    const float roomH = (disp.y - 46.0f) - 28.0f - (kFrame + ui::kHeaderH + 14) - kBelowPortrait;
+    int tier = 0;
+    for (int t = UIState::kPortraitTiers - 1; t > 0; t--) {
+      const UIState::PortraitTierTex& T = s.portraitTierTex[t];
+      if (!T.tex) continue;
+      const float base = kPad * 2 + kSlot * 2 + kSlotGap * 2 + (float)T.w + 8;
+      const float wide = 12.0f + base + (s.inspectMode ? 272.0f + kColGap : 0.0f) +
+                         kColGap + rightNeed + 12.0f;
+      if ((float)T.h <= roomH && wide <= disp.x) {
+        tier = t;
+        break;
+      }
+    }
+    s.portraitTier = tier;
+    if (s.portraitTierTex[tier].tex) {
+      s.portraitTex = s.portraitTierTex[tier].tex;
+      s.portraitW = s.portraitTierTex[tier].w;
+      s.portraitH = s.portraitTierTex[tier].h;
+    }
+  }
   const float kPortraitW =
       s.portraitW > 0 ? (float)s.portraitW : kPortraitWFallback;
   const float kPortraitH =
@@ -3825,6 +4893,7 @@ void DrawInventoryScreen(UIState& s) {
     // click), health column open or not: the click casts either way.
     if (s.applyText.empty())
       InspectCastPicks(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
+    VoxelProbeTip(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
     // A hovered armour slot shades the limbs it is standing in front of. This
     // is the other half of the COVER section in the health column and the same
     // fact from the other end: "what does this piece protect" answered by

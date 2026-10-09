@@ -325,8 +325,32 @@ struct DeathBody {
     BodyXformGpu xf{};
     BodyTransform lastLive{};  // where `body` was the last frame it was alive
     bool haveLive = false;
+    // What this part IS, for the death screen's autopsy (game/autopsy.h):
+    // its figure slot (BodySlotFor, -1 = none) and whether it is one of the
+    // def's limbs (false = a garment shell or a held item, which the peel
+    // never cuts and "hide gear" takes away).
+    int figSlot = -1;
+    bool isLimb = false;
+    char name[32] = {};  // the part's authored name, for the probe readout
+    // WHERE ITS JOINT WAS, world voxels, at the instant of death (after the
+    // joint-consistency snap). The frozen pose is pinned by THIS rather than
+    // by the lattice corner in `xf.pos`: a carve after death (the blast's
+    // own carve landing after Die(), a corpse still crumbling) rebases the
+    // limb's brick and moves its corner and its anchor together, so the
+    // corner drifts off the body while the anchor stays put. The portrait
+    // pass rebuilds `xf.pos` from this and the limb's CURRENT anchorLimb
+    // (MobSystem::LimbAnchorByBody) every frame.
+    Vec3 anchorWorld{};
+    bool haveAnchor = false;
+    // THE PHOTOGRAPHED SKIN: a clone of this part's brick taken just after
+    // death (main.cpp, kDeathBrickFreezeSec), drawn by the portrait in place
+    // of the live one; -1 = none (the live brick is drawn). `pinned` = the
+    // corner was fixed from the joint at that moment and never moves again.
+    int frozenModel = -1;
+    bool pinned = false;
   };
   bool have = false;
+  bool bricksFrozen = false;  // the skin has been photographed (frozenModel)
   float yaw = 0.0f;         // the body's facing, so the orbit keeps a front
   std::vector<Limb> limbs;  // the GPU transform override
   LimbBoxes boxes;          // framing, limb focus and the outlines
@@ -356,7 +380,7 @@ struct DeathBody {
         if (h && phys.GetTransform(h, cur)) { found = true; break; }
       }
       if (!found) continue;
-      if (fl.haveLive) {
+      if (fl.haveLive && !fl.pinned) {
         const Quat qOld{fl.lastLive.quat[0], fl.lastLive.quat[1],
                         fl.lastLive.quat[2], fl.lastLive.quat[3]};
         const Quat qFrozen{fl.xf.quat[0], fl.xf.quat[1], fl.xf.quat[2],

@@ -70,6 +70,14 @@
  *    (limb-local index along `axis`) % period < width. Rules run in order and
  *    the LAST match wins, so a rule list reads as "hollow it, then put the
  *    ribs back". Kept layers are never carved: the surface is the character.
+ *  - `"core": k` also requires the cell to lie within k of the DEEPEST cell of
+ *    its own cross-section, slicing across the limb's longest box axis
+ *    (`coreAxis`). It is what makes a long bone a SHAFT: "everything deeper
+ *    than the muscle layer" grows with the limb, so a muscular arm was a bone
+ *    log with a skin on it, while the deepest cells of each slice are a thin
+ *    rod however thick the meat around it is.
+ *  - A recipe-level `carve` is the DEFAULT for every limb with neither a
+ *    `carve` nor `layers` of its own (`"carve": []` opts a limb out).
  */
 
 export const ANATOMY_VERSION = 1;
@@ -98,6 +106,18 @@ export const DEFAULT_ANATOMY = {
   // flesh where the human has skin. A real asymmetry, in the ART and not in
   // this recipe.)
   garments: ['linen'],
+  // LONG BONES ARE SHAFTS. The default carve for every limb without its own
+  // (arms, legs, hands, feet, tails): bone where the schedule put it ONLY in
+  // the deepest cells of each cross-section (`core`, anatomy.js header); the
+  // rest of the core is muscle. Bone thickness follows the limb's LENGTH, not
+  // its bulk -- a femur is ~6% of its length across, two voxels on every body
+  // here -- and "everything deeper than the muscle" made a muscular upper arm
+  // 1,800 cells of bone against the stock human's 78. A stock limb is
+  // unchanged: its 2x2 core already IS the deepest cells.
+  carve: [
+    { material: 'muscle', where: 'bone' },
+    { material: 'bone', where: 'bone', core: 0 },
+  ],
   limbs: {
     // THE SKULL IS A SHELL AND WHAT IT PROTECTS IS NOT BONE. The flesh ring
     // over it is the SCALP and is not decoration: without it bone sits one
@@ -155,6 +175,35 @@ export const DEFAULT_ANATOMY = {
           box: { x: [0.45, 0.55], y: [0.42, 0.94], z: [0.5, 1] } },
         { material: 'bone', where: 'bone',
           box: { x: [0.4, 0.6], z: [0, 0.5] } },
+      ],
+    },
+    // A PELVIS, NOT A BONE BRICK. The hips are the widest limb, so depth alone
+    // made them a solid 14x6 bone block -- ~1,050 cells against a femur's ~100,
+    // where a real pelvis is a RING of plates about 1.5 femurs by mass. Same
+    // move as the chest: the pelvic organs (flesh) inside, a muscle wall at
+    // depth 3, then bone put back where a pelvis has it. Bands are measured up
+    // from the femoral heads (hips y ~0.1): acetabula solid over them; the
+    // brim a full ring just above; the iliac wings a plate round the sides and
+    // back, OPEN at the front (the belly), to the crest ~10 cm above the hip
+    // joint (y 0.65) -- everything higher is waist, lumbar spine only; a pubic
+    // symphysis at the front between the sockets; and the sacrum carrying the
+    // torso's spine column down into the ring. ~390 cells, ~85 of them spine.
+    hips: {
+      carve: [
+        { material: 'flesh', where: 'bone' },
+        { material: 'muscle', where: 'bone', depth: [3, 3] },
+        { material: 'bone', where: 'bone', depth: [3, 3],
+          box: { y: [0.35, 0.65], z: [0, 0.7] } },
+        { material: 'bone', where: 'bone', depth: [3, 3],
+          box: { y: [0.25, 0.35] } },
+        { material: 'bone', where: 'bone',
+          box: { x: [0, 0.35], y: [0, 0.25] } },
+        { material: 'bone', where: 'bone',
+          box: { x: [0.65, 1], y: [0, 0.25] } },
+        { material: 'bone', where: 'bone', depth: [3, 3],
+          box: { x: [0.4, 0.6], y: [0, 0.25], z: [0.5, 1] } },
+        { material: 'bone', where: 'bone',
+          box: { x: [0.4, 0.6], y: [0.15, 1], z: [0, 0.5] } },
       ],
     },
   },
@@ -300,8 +349,16 @@ export function keepOnly(layers) {
  * stripe: {axis:0|1|2, period, width}|null}. Empty when the limb has none.
  */
 export function carveFor(recipe, limbName) {
-  const src = (recipe.limbs && limbName && recipe.limbs[limbName] &&
-               recipe.limbs[limbName].carve) || [];
+  // A limb's own `carve`, else the recipe's DEFAULT `carve` (the long bones)
+  // -- but only for a limb on the DEFAULT `layers`: the default carve is
+  // written against that schedule, and a limb with layers of its own (a skull,
+  // a snout, a tail) is a different structure. An explicit `"carve": []` is a
+  // limb opting out.
+  const L = recipe.limbs && limbName && recipe.limbs[limbName];
+  const own = L && L.carve;
+  const src = Array.isArray(own) ? own
+            : (L && L.layers) ? []
+            : Array.isArray(recipe.carve) ? recipe.carve : [];
   const range = r => Array.isArray(r) && r.length === 2 ? [+r[0], +r[1]] : null;
   const out = [];
   for (const c of src) {
@@ -317,16 +374,85 @@ export function carveFor(recipe, limbName) {
       depth: [dep[0] == null ? 0 : dep[0] | 0, dep[1] == null ? 254 : dep[1] | 0],
       stripe: axis >= 0 && (s.period | 0) > 0
         ? { axis, period: s.period | 0, width: s.width | 0 } : null,
+      core: Number.isInteger(c.core) && c.core >= 0 ? c.core : null,
     });
   }
   return out;
 }
 
+/** The axis a limb's `core` slices across: its LONGEST box dimension (an arm
+ *  or leg stands along y, a foot lies along z), ties going to y, then x. */
+export function coreAxis(dim) {
+  if (dim.y >= dim.x && dim.y >= dim.z) return 1;
+  return dim.x >= dim.z ? 0 : 2;
+}
+
+/** The `core` test's field for one model: every voxel's CORE DEPTH and each
+ *  slice's deepest one, slicing across `coreAxis`.
+ *
+ *  Core depth is IN-SLICE depth: 4-connected steps to the slice's own outline
+ *  (the model's cells in that plane), not the union depth. Union depth has a
+ *  flat top wherever the limb's END is the nearest surface -- under a shoulder
+ *  every cell of the slice is four from the top face, so "the deepest cells"
+ *  were the whole slice and the humerus grew an 88-cell head. The cross-section
+ *  always has a centre. (The rule's `where: "bone"` still gates on the union
+ *  schedule, so this never puts bone nearer a surface than the layers allow.)
+ *
+ *  Returns { axis, depth: Int32Array (model-local index, -1 for empty), max:
+ *  Int32Array per slice index }. */
+export function coreField(field, model) {
+  const d = model.dim, data = model.grid.data, axis = coreAxis(d);
+  const sx = 1, sy = d.x, sz = d.x * d.y;
+  const n = d.x * d.y * d.z;
+  // The two in-plane axes and their strides.
+  const [ua, va] = [[1, 2], [0, 2], [0, 1]][axis];
+  const dimA = [d.x, d.y, d.z], strA = [sx, sy, sz];
+  const flat = new Int32Array(n).fill(-1);
+  const queue = new Int32Array(n);
+  let head = 0, tail = 0;
+  const coord = i => [i % d.x, ((i / d.x) | 0) % d.y, (i / sz) | 0];
+  for (let i = 0; i < n; i++) {
+    if (!data[i]) continue;
+    const c = coord(i);
+    let edge = false;
+    for (const a of [ua, va]) {
+      if (c[a] === 0 || !data[i - strA[a]]) edge = true;
+      if (c[a] === dimA[a] - 1 || !data[i + strA[a]]) edge = true;
+    }
+    if (edge) { flat[i] = 0; queue[tail++] = i; }
+  }
+  while (head < tail) {
+    const i = queue[head++];
+    const c = coord(i);
+    for (const a of [ua, va])
+      for (const s of [-1, 1]) {
+        const k = c[a] + s;
+        if (k < 0 || k >= dimA[a]) continue;
+        const j = i + s * strA[a];
+        if (data[j] && flat[j] < 0) { flat[j] = flat[i] + 1; queue[tail++] = j; }
+      }
+  }
+  const depth = new Int32Array(n).fill(-1);
+  const max = new Int32Array(dimA[axis]);
+  for (let i = 0; i < n; i++) {
+    if (!data[i]) continue;
+    const c = coord(i);
+    if (depthAt(field, model, c[0], c[1], c[2]) === DEPTH_EMPTY) continue;
+    const e = flat[i];
+    depth[i] = e;
+    if (e > max[c[axis]]) max[c[axis]] = e;
+  }
+  return { axis, depth, max };
+}
+
 /** Does carve rule `c` take this model-local cell? `layerId` is the material
  *  the depth schedule put there, `whereId` the rule's resolved `where`. */
-export function carveMatches(c, whereId, layerId, lx, ly, lz, dim, depth) {
+export function carveMatches(c, whereId, layerId, lx, ly, lz, dim, depth,
+                             core = null) {
   if (c.where && whereId !== layerId) return false;
   if (depth < c.depth[0] || depth > c.depth[1]) return false;
+  // `core`: { depth, max } of this cell from `coreField`.
+  if (c.core != null && (!core || core.depth < core.max - c.core)) return false;
   const l = [lx, ly, lz], n = [dim.x, dim.y, dim.z];
   for (let a = 0; a < 3; a++) {
     const r = c.box[['x', 'y', 'z'][a]];
@@ -439,6 +565,7 @@ export function planAnatomy(prefab, recipe, matId) {
     const carve = carveFor(recipe, m.name);
     const carveId = carve.map(c => resolve(c.material));
     const carveWhere = carve.map(c => c.where ? resolve(c.where) : 0);
+    const cf = carve.some(c => c.core != null) ? coreField(field, m) : null;
     // What this recipe puts under the surface. A `keep` voxel made of one of
     // these is a face that was once baked as interior, not the painted
     // character, and it gets the kept layer's material back (see the module
@@ -478,7 +605,9 @@ export function planAnatomy(prefab, recipe, matId) {
           if (!L.keep)
             for (let k = 0; k < carve.length; k++)
               if (carveId[k] && carveMatches(carve[k], carveWhere[k], ids[li],
-                                             x, y, z, d, depth)) {
+                                             x, y, z, d, depth,
+                                             cf && { depth: cf.depth[i],
+                                                     max: cf.max[[x, y, z][cf.axis]] })) {
                 mat = carveId[k]; label = carve[k].material;
               }
           if (!mat) continue;                      // unresolved name: leave it
