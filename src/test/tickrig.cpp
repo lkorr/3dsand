@@ -77,6 +77,7 @@ TickRig::TickRig(const TickEngine& c, uint32_t lastTick, IVec3 fixtureChunk)
       .farBiggest = farBiggest_,
   });
   w_->harness.pinWindow = true;
+  w_->harness.farInert = true;
   w_->harness.ownsActors = true;
   SetFixtureChunk(fixtureChunk);
   // The gate's own ops for the tick about to run, handed over at its top.

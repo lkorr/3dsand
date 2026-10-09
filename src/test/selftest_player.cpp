@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -26,6 +27,7 @@
 #include "sim/tuning.h"
 #include "test/selftest.h"
 #include "test/support.h"
+#include "test/tickrig.h"
 
 using namespace sandvox;
 
@@ -2446,6 +2448,345 @@ Status GateLayerRoles(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- freefall --------------------------------------------------------------
+//
+// A 150 M FALL IS ONE CONTINUOUS MOTION, ON THE REAL TICK.
+//
+// Reported 2026-10-08: a body in freefall stutters -- it glides, jerks back,
+// glides -- and the game lags while it falls. `player-fastfall` cannot see it:
+// it runs Player::Update against a synthetic KindFn, so it has no snapshot
+// latency the tick did not script, no streaming, no avatar and no pose. This
+// gate drops the REAL player -- non-fly, avatar spawned, CPU mirror centred on
+// the body the way the game does it, residency window FOLLOWING the body
+// (TickAuthorityCtx::Harness::pinWindow off) -- from 150 m above the harness
+// map's ground, through TickAuthority, and watches every tick of it.
+//
+// WHAT "CLEAN" MEANS, each its own claim and each attributed to the tick and
+// the state it failed in (CLAUDE.md rule 6):
+//   (A) THE BODY'S FALL IS GRAVITY. The per-tick drop grows by g*dt^2 a tick
+//       until maxFall clamps it, then stays put. A tick whose drop differs
+//       from that by more than `freefall.maxDropJerkVox` is a stutter.
+//       `Player::blindFall` (a descent held by a mirror the body outran,
+//       KnownDrop) is counted separately and must be ZERO: it is the named
+//       cause, so it is reported by name.
+//   (B) THE DRAWN BODY NEVER GOES BACK UP. Sampled per FRAME (four a tick,
+//       the alpha sweep the frame loop does), the rendered eye and body must
+//       descend monotonically while airborne.
+//   (C) THE AVATAR RIDES THE BODY. The hips' physics transform relative to
+//       the player position must not jump tick to tick by more than
+//       `freefall.maxRigSlipVox`, and must never move UP mid-fall -- a rig
+//       left behind by its driver and snapped back is the "glitching back" a
+//       camera sees.
+//   (D) THE ANIMATION IS ONE FALL. The air pose weight, once in, stays in
+//       until touchdown (no flicker out and back), and the loco state does not
+//       churn mid-air.
+//   (E) IT LANDS. Grounded, on the surface, inside the tick budget.
+// It also REPORTS the tick wall time (max / p50) and the window shifts -- the
+// "lag" half of the report; the bound is `freefall.maxTickMs`.
+// SANDVOX_FREEFALL_DUMP=1 prints every tick's row.
+constexpr int kFreefallDropVox = 1500;     // 150 m at kVoxelMeters 0.10
+constexpr int kFreefallMaxTicks = 900;     // 30 s; the fall takes ~6
+constexpr int kFreefallFrames = 4;         // frames per tick for (B)
+
+Status GateFreefall(Ctx& c, std::string& detail) {
+  const IVec3 savedOrigin = c.world.WindowOrigin();
+  const float terminal = CurrentTuning().player.maxFall / kVoxelMeters;
+  const float g = CurrentTuning().player.gravity / kVoxelMeters;
+
+  // The site: the flattest patch near the window centre, so the landing claim
+  // is about the fall and not about an overhang TerrainHeight cannot see.
+  const int cx = (savedOrigin.x + (int)kNChunk / 2) * (int)kChunk;
+  const int cz = (savedOrigin.z + (int)kNChunk / 2) * (int)kChunk;
+  int relief = 0;
+  const IVec3 site = TwoPlayerFlatSpot(cx, cz, 48, kDefaultSeed, relief);
+  const float startY = (float)(site.y + kFreefallDropVox) + Player::kHalfY;
+  const IVec3 startChunk{site.x >> 4, ifloor(startY) >> 4, site.z >> 4};
+
+  c.debris.Reset();
+  c.debris.ResetUntunnelProbe();
+  c.mobs.Reset(true);
+  c.mobs.ClearRisings();
+  // The window starts CENTRED on the body, 150 m up, the way it is after a
+  // player has flown there: what follows is the streaming a real fall drives.
+  c.world.SetWindowOrigin({startChunk.x - (int)kNChunk / 2,
+                           startChunk.y - (int)kNChunk / 2,
+                           startChunk.z - (int)kNChunk / 2});
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  struct TickRow {
+    float y, vy, drop, hipsRel, hipsDy, air, ms;
+    int blind, grounded, loco, winY, mirY, limp;
+    // Chunks between the body and the nearest window face on Y: the window
+    // the sim, the colliders and the mirror all live in.
+    int winMargin;
+    // The chunk one below the body's: what the ragdoll's anti-tunnel clamp
+    // waits on (DebrisSystem::ColliderVouched). held = rig-steps clamped this
+    // tick; built = its patch's mirror version (0 = never polygonized).
+    int held, belowCached, belowSky;
+    uint32_t belowBuilt;
+    // The body's lowest point above the site's ground, in voxels: the sole
+    // while live, the pelvis less a margin while limp (the capsule follows the
+    // pelvis then, RagdollFollow).
+    float gap;
+  };
+  std::vector<TickRow> rows;
+  std::vector<float> frameEye, frameBody;   // per frame, airborne only
+  bool spawned = false;
+  int landTick = -1;
+  float landFeet = 0.0f;
+  // THE CROSSING (CLAUDE.md rule 6): the first tick the body is below the
+  // ground it should have landed on, and what every collision source said
+  // about that ground at that moment.
+  std::string crossing;
+  {
+    support::TickRig rig(c, 91000u, startChunk);
+    // THE GAME'S ARRANGEMENT, not the harness's: the window follows the body
+    // and the mirror is centred on it (session.cpp phase L's `pc`). The far
+    // field stays inert (Harness::farInert): a rig never Init's one.
+    rig.Authority().harness.pinWindow = false;
+    rig.Authority().harness.haveSubmitChunk = false;
+    PlayerSession& s = rig.Session();
+    s.avatar.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+    s.avatar.SetDefs(&c.mobs.Defs(), kAvatarDefName);
+    c.mobs.SetAvatar(&s.avatar);
+    s.player.fly = false;
+    s.player.grounded = false;
+    s.player.vel = Vec3{0, 0, 0};
+    s.player.pos = Vec3{(float)site.x + 0.5f, startY, (float)site.z + 0.5f};
+    s.player.SnapRender();
+    const int hips = s.avatar.PartIndex("hips");
+
+    float prevY = s.player.pos.y, prevHipsY = 0.0f;
+    uint32_t prevRigHolds = c.debris.Untunnel().rigHolds;
+    bool haveHips = false;
+    for (int i = 0; i < kFreefallMaxTicks; i++) {
+      const double t0 = NowSeconds();
+      support::RunTicks(rig, 1);
+      const double ms = (NowSeconds() - t0) * 1000.0;
+      const Player& p = s.player;
+      spawned = spawned || s.avatar.Spawned();
+      TickRow r{};
+      r.y = p.pos.y;
+      r.vy = p.vel.y;
+      r.drop = prevY - p.pos.y;
+      r.blind = p.blindFall ? 1 : 0;
+      r.grounded = p.grounded ? 1 : 0;
+      r.ms = (float)ms;
+      r.winY = c.world.WindowOrigin().y;
+      r.mirY = c.world.Snap().valid ? c.world.Snap().mirrorBase.y : -99999;
+      r.limp = s.avatar.Spawned() && s.avatar.Ragdolled() ? 1 : 0;
+      r.gap = (r.limp ? p.pos.y - 4.0f : p.pos.y + p.CurrentBox().yLo) - (float)site.y;
+      {
+        const uint32_t h = c.debris.Untunnel().rigHolds;
+        r.held = (int)(h - prevRigHolds);
+        prevRigHolds = h;
+        const IVec3 bw{ifloor(p.pos.x) >> 4, (ifloor(p.pos.y) >> 4) - 1, ifloor(p.pos.z) >> 4};
+        r.belowBuilt = c.debris.TerrainBuiltVersion(bw);
+        r.belowCached = c.world.Cached(bw) != nullptr ? 1 : 0;
+        r.belowSky = c.debris.SkyKnown(bw) ? 1 : 0;
+      }
+      {
+        const int bc = ifloor(p.pos.y) >> 4;
+        r.winMargin = std::min(bc - r.winY, r.winY + (int)kNChunk - 1 - bc);
+      }
+      r.loco = s.avatar.Spawned() ? s.avatar.LocoState() : -1;
+      r.air = s.avatar.Spawned() ? s.avatar.AirPoseWeight() : 0.0f;
+      Vec3 hp{};
+      Quat hq{};
+      if (hips >= 0 && s.avatar.Spawned() &&
+          s.avatar.PartWorldTransform(hips, hp, hq)) {
+        r.hipsRel = hp.y - p.pos.y;
+        r.hipsDy = haveHips ? hp.y - prevHipsY : 0.0f;
+        prevHipsY = hp.y;
+        haveHips = true;
+      }
+      rows.push_back(r);
+      if (crossing.empty() && p.pos.y + p.CurrentBox().yLo < (float)site.y - 2.0f) {
+        const IVec3 gc{site.x >> 4, site.y >> 4, site.z >> 4};
+        const uint64_t hb = hips >= 0 && s.avatar.Spawned() ? s.avatar.PartBody(hips) : 0;
+        int solidCol = 0, unknownCol = 0;
+        for (int y = site.y - 4; y <= site.y + 4; y++) {
+          const CellKind k = s.kindAt({site.x, y, site.z});
+          solidCol += k == CellKind::Solid ? 1 : 0;
+          unknownCol += k == CellKind::Unknown ? 1 : 0;
+        }
+        crossing = Format(
+            "crossed ground at tick %d: limp %d, ground chunk (%d,%d,%d) patch version %u "
+            "vouched %d (chunk below: %u), mirror column y%d..%d: %d solid %d unknown, "
+            "hips body %llu linearCast %d",
+            i, r.limp, gc.x, gc.y, gc.z, c.debris.TerrainBuiltVersion(gc),
+            c.debris.ColliderVouched(gc) ? 1 : 0,
+            c.debris.TerrainBuiltVersion({gc.x, gc.y - 1, gc.z}), site.y - 4, site.y + 4,
+            solidCol, unknownCol, (unsigned long long)hb,
+            hb != 0 && c.phys.UsesLinearCast(hb) ? 1 : 0);
+      }
+      prevY = p.pos.y;
+      if (!p.grounded)
+        for (int f = 0; f < kFreefallFrames; f++) {
+          const float a = (float)f / (float)kFreefallFrames;
+          frameEye.push_back(p.RenderEyePos(a).y);
+          frameBody.push_back(p.pos.y + p.RenderBodyOffset(a).y);
+        }
+      if (p.grounded && landTick < 0) {
+        landTick = i;
+        landFeet = p.pos.y + p.CurrentBox().yLo;
+      }
+      if (landTick >= 0 && i - landTick >= 15) break;
+    }
+    c.mobs.SetAvatar(nullptr);
+    if (s.avatar.Spawned()) s.avatar.Despawn();
+  }
+  const bool landed = landTick >= 0;
+  // Put the window back and regenerate: every gate after this in kOrder
+  // assumes worldgen it did not move (selftest.h's ordering note).
+  c.world.SetWindowOrigin(savedOrigin);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  // ---- the analysis --------------------------------------------------------
+  // The fall proper: from the first tick that moved to the tick before the
+  // landing. Ticks before that are the body waiting for a first snapshot.
+  int first = -1;
+  for (size_t i = 0; i < rows.size(); i++)
+    if (rows[i].drop > 1e-3f) { first = (int)i; break; }
+  // ...to the tick before IMPACT: the first tick the body could not fall its
+  // full step because the ground was in the way. What follows -- the limp
+  // body's bounce, the get-up, the landing settle -- is a collision, not a
+  // fall, and the claims below are about the fall.
+  int impact = -1;
+  if (first >= 0)
+    for (int i = first + 1; i < (int)rows.size(); i++)
+      if (rows[i].gap < rows[i - 1].drop + 1.0f) { impact = i; break; }
+  const int last = impact >= 0 ? impact - 1 : landed ? landTick - 1 : (int)rows.size() - 1;
+  // The drawn frames are sampled only while airborne and in tick order; cut
+  // them at the same tick.
+  {
+    size_t keep = 0;
+    for (int i = 0; i <= last && i < (int)rows.size(); i++)
+      if (!rows[i].grounded) keep += kFreefallFrames;
+    if (keep < frameEye.size()) { frameEye.resize(keep); frameBody.resize(keep); }
+  }
+  const float gStep = g * kTickDt * kTickDt;
+  float worstJerk = 0.0f, peakDrop = 0.0f, worstSlip = 0.0f, worstHipsUp = 0.0f;
+  int jerkAt = -1, slipAt = -1, hipsUpAt = -1, blindTicks = 0, firstBlind = -1;
+  int airDrops = 0, locoChanges = 0, limpAt = -1, minMargin = 1 << 20, marginAt = -1;
+  float airPeak = 0.0f;
+  if (first >= 0)
+    for (int i = first + 1; i <= last; i++) {
+      const TickRow& r = rows[i];
+      const TickRow& q = rows[i - 1];
+      peakDrop = std::max(peakDrop, r.drop);
+      // Expected: d_t = d_{t-1} + g dt^2, capped at terminal * dt while the
+      // controller owns the body. A LIMP body (ragdoll.fallSeconds into the
+      // fall the avatar goes limp and the capsule follows the pelvis) is
+      // Jolt's, with no maxFall: only the gravity step is expected of it. The
+      // tick it goes limp is a hand-over and is measured like any other.
+      const float want = r.limp ? q.drop + gStep
+                                : std::min(q.drop + gStep, terminal * kTickDt);
+      const float jerk = std::abs(r.drop - want);
+      if (jerk > worstJerk) { worstJerk = jerk; jerkAt = i; }
+      if (r.blind) { blindTicks++; if (firstBlind < 0) firstBlind = i; }
+      const float slip = std::abs(r.hipsRel - q.hipsRel);
+      if (i > first + 1 && slip > worstSlip) { worstSlip = slip; slipAt = i; }
+      if (r.hipsDy > worstHipsUp) { worstHipsUp = r.hipsDy; hipsUpAt = i; }
+      // The air pose is the LIVE body's; a limp one is the ragdoll's.
+      if (!r.limp && r.air < airPeak - 0.05f && airPeak > 0.9f) airDrops++;
+      if (r.limp && limpAt < 0) limpAt = i;
+      if (r.winMargin < minMargin) { minMargin = r.winMargin; marginAt = i; }
+      airPeak = std::max(airPeak, r.air);
+      if (r.loco != q.loco && i > first + 5 && !r.limp) locoChanges++;
+    }
+  float worstFrameUpEye = 0.0f, worstFrameUpBody = 0.0f;
+  for (size_t i = 1; i < frameEye.size(); i++) {
+    worstFrameUpEye = std::max(worstFrameUpEye, frameEye[i] - frameEye[i - 1]);
+    worstFrameUpBody = std::max(worstFrameUpBody, frameBody[i] - frameBody[i - 1]);
+  }
+  std::vector<float> ms;
+  for (const TickRow& r : rows) ms.push_back(r.ms);
+  std::sort(ms.begin(), ms.end());
+  const float msMax = ms.empty() ? 0.0f : ms.back();
+  const float msP50 = ms.empty() ? 0.0f : ms[ms.size() / 2];
+  const int winShift = rows.empty() ? 0 : rows.front().winY - rows.back().winY;
+
+  const double jerkAllow = BaselineNumber("freefall.maxDropJerkVox", 0.25);
+  const double slipAllow = BaselineNumber("freefall.maxRigSlipVox", 1.0);
+  const double upAllow = BaselineNumber("freefall.maxFrameRiseVox", 0.01);
+  const double msAllow = BaselineNumber("freefall.maxTickMs", 1.0e9);
+  RecordObserved("freefall.maxDropJerkVox", (double)worstJerk);
+  RecordObserved("freefall.blindTicks", (double)blindTicks);
+  RecordObserved("freefall.maxRigSlipVox", (double)worstSlip);
+  RecordObserved("freefall.maxFrameRiseVox",
+                 (double)std::max(worstFrameUpEye, worstFrameUpBody));
+  RecordObserved("freefall.maxTickMs", (double)msMax);
+  RecordObserved("freefall.p50TickMs", (double)msP50);
+
+  std::string fails;
+  auto check = [&](bool ok, const std::string& what) {
+    if (!ok) fails += (fails.empty() ? "" : "; ") + what;
+  };
+  auto rowAt = [&](int i) -> std::string {
+    if (i < 0 || i >= (int)rows.size()) return "-";
+    const TickRow& r = rows[i];
+    return Format("tick %d: y %.1f vy %.1f drop %.2f blind %d gnd %d limp %d held %d "
+                  "[below: built %u cached %d sky %d] win.y %d mirror.y %d (body chunk %d) "
+                  "hipsRel %.2f hipsDy %.2f air %.2f loco %d %.1f ms",
+                  i, r.y, r.vy, r.drop, r.blind, r.grounded, r.limp, r.held, r.belowBuilt,
+                  r.belowCached, r.belowSky, r.winY, r.mirY, ifloor(r.y) >> 4, r.hipsRel,
+                  r.hipsDy, r.air, r.loco, r.ms);
+  };
+  check(spawned, "the avatar never spawned");
+  check(first >= 0, "the body never moved");
+  check(peakDrop > 0.95f * terminal * kTickDt,
+        Format("peak drop %.2f vox/tick never reached terminal %.2f: not a long fall",
+               peakDrop, terminal * kTickDt));
+  check(landed, Format("never landed in %d ticks (%s)", (int)rows.size(),
+                       rowAt((int)rows.size() - 1).c_str()));
+  check(!landed || std::abs(landFeet - (float)site.y) < 6.0f,
+        Format("landed with feet at %.2f, ground %d (relief %d)", landFeet, site.y, relief));
+  check(blindTicks == 0, Format("%d ticks held by a starved mirror (Player::blindFall), "
+                                "first [%s]", blindTicks, rowAt(firstBlind).c_str()));
+  check(worstJerk <= (float)jerkAllow,
+        Format("drop jerk %.2f vox (allow %.2f) at [%s] after [%s]", worstJerk, jerkAllow,
+               rowAt(jerkAt).c_str(), rowAt(jerkAt - 1).c_str()));
+  check(worstFrameUpEye <= (float)upAllow && worstFrameUpBody <= (float)upAllow,
+        Format("a drawn frame went UP while airborne: eye %.3f body %.3f vox (allow %.3f)",
+               worstFrameUpEye, worstFrameUpBody, upAllow));
+  check(worstSlip <= (float)slipAllow,
+        Format("hips slipped %.2f vox against the body in one tick (allow %.2f) at [%s]",
+               worstSlip, slipAllow, rowAt(slipAt).c_str()));
+  check(worstHipsUp <= 0.5f, Format("hips moved UP %.2f vox in a tick mid-fall at [%s]",
+                                    worstHipsUp, rowAt(hipsUpAt).c_str()));
+  check(airDrops == 0, Format("air pose flickered out %d times mid-fall", airDrops));
+  check(locoChanges <= 1, Format("loco state changed %d times mid-fall", locoChanges));
+  check(msMax <= (float)msAllow, Format("tick took %.1f ms (allow %.1f)", msMax, msAllow));
+  // THE BODY STAYS IN THE WINDOW. Past its faces nothing is simulated, the
+  // mirror cannot be centred and every collider vouches: a body that leaves
+  // it falls through the world (Stream kCatchUpLag).
+  check(minMargin >= 2, Format("body came within %d chunks of the window face at [%s]",
+                               minMargin, rowAt(marginAt).c_str()));
+  const auto& ut = c.debris.Untunnel();
+  RecordObserved("freefall.rigHolds", (double)ut.rigHolds);
+  check(ut.released == 0, Format("%u bodies released into unvouched space", ut.released));
+
+  detail = Format("%d vox drop over %d ticks (landed tick %d, feet %.1f / ground %d), "
+                  "peak %.2f vox/tick of %.2f, jerk %.3f, blind %d, frame rise %.3f, "
+                  "rig slip %.2f, air peak %.2f, window shifted %d chunks, "
+                  "tick %.1f ms p50 / %.1f max, limp at tick %d, impact tick %d, min window margin %d, "
+                  "untunnel holds %u rig %u released %u",
+                  kFreefallDropVox, (int)rows.size(), landTick, landFeet, site.y, peakDrop,
+                  terminal * kTickDt, worstJerk, blindTicks,
+                  std::max(worstFrameUpEye, worstFrameUpBody), worstSlip, airPeak, winShift,
+                  msP50, msMax, limpAt, impact, minMargin, ut.holds, ut.rigHolds, ut.released);
+  if (!crossing.empty()) detail += " | " + crossing;
+  if (!fails.empty()) detail += " | " + fails;
+  const bool ok = fails.empty();
+  std::printf("freefall: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  if (std::getenv("SANDVOX_FREEFALL_DUMP"))
+    for (size_t i = 0; i < rows.size(); i++) std::printf("  ff %s\n", rowAt((int)i).c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& PlayerGates() {
@@ -2456,6 +2797,7 @@ const std::vector<Gate>& PlayerGates() {
       {"player-crouch", "player", {}, false, GatePlayerCrouch},
       {"player-plants", "player", {}, false, GatePlayerPlants},
       {"player-fastfall", "player", {}, false, GatePlayerFastFall},
+      {"freefall", "player", {}, false, GateFreefall},
       {"tick-input", "player", {}, false, GateTickInput},
       {"view-smooth", "player", {}, false, GateViewSmooth},
       {"two-players", "player", {}, false, GateTwoPlayers},

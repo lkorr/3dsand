@@ -1106,12 +1106,19 @@ uint32_t PlayerAvatar::IgnitePart(int partIndex, uint32_t count,
 void PlayerAvatar::BurnParts(uint32_t tick, World& world,
                              std::vector<CellOp>& cellOps,
                              std::vector<ParticleSpawn>& spawns) {
-  if (!sys_ || !spawned_ || !alive_ || !sys_->BurnTablesReady()) return;
+  if (!spawned_) return;
   // A terrain anchor around the body keeps the chunks under it FETCHED AND
   // REFRESHED in the CPU mirror; the burn pass reads that mirror to find out
   // whether it is standing in a fire. Without it the player did not burn
   // while mobs did (see Mob::RegisterTerrainAnchor).
+  //
+  // ABOVE the burn pass's own guard, not under it: the anchor is also what
+  // asks for the ground a LIMP body is falling onto (its velocity lookahead),
+  // and that cannot depend on whether the burn tables are loaded. Under the
+  // guard a harness without them got no lookahead, and the ragdoll was held a
+  // chunk at a time down the last metres of a fall (`freefall` gate).
   RegisterTerrainAnchor();
+  if (!sys_ || !alive_ || !sys_->BurnTablesReady()) return;
   // A separate budget from the mob pass's, and deliberately: the player is
   // one creature out of up to kMaxMobs (64), and sharing one pool would let a crowd
   // of burning NPCs starve the fire on the character the camera is pointed

@@ -230,6 +230,7 @@ struct WorldScratch {
   uint32_t farCount = 0;        // phase B -> phase N (SubmitTick)
   bool particlesActive = false; // phase L -> phase N
   IVec3 pc{};                   // phase L -> phase N: the submit's centre chunk
+  IVec3 mirrorChunk{};          // phase L -> phase N: the CPU mirror's (MirrorLeadChunk)
   double t0 = 0;                // phase L -> phase P
   double tSubmit0 = 0;          // phase N -> phase P
   double tSubmit1 = 0;
@@ -1087,7 +1088,8 @@ static void PhaseB(TickAuthorityCtx& w, WorldScratch& ws,
         // which a shader edit can move by more than 2x without a rebuild.
         far.SetPlaneCap((uint32_t)CurrentTuning().render.farPlaneFillRate);
         // far-field cascades track the same interest set (render-only)
-        if (!farBlind && !w.harness.pinWindow) far.Update(interest);
+        if (!farBlind && !w.harness.pinWindow && !w.harness.farInert)
+          far.Update(interest);
         farCount = far.PrepareTick(ctx.queue, !farBlind);
         if (farCount) {
           g_farEntries += farCount;
@@ -5241,6 +5243,78 @@ uint32_t RemoteExplosionsHitOwnBodies(std::span<const ExplosionOp> exps,
 
 // ---- PHASE L (WORLD) - dirty marks, the celestial clock and the edit layer
 // Verbatim from the single-body TickAuthority, lines 2335-2384 at 54fe241.
+// ---- THE MIRROR LEADS A FAST BODY ------------------------------------------
+//
+// The CPU mirror is a 3x3x3 chunk cube copied out of a snapshot that is read
+// exactly World::kSnapshotLatency ticks after it was encoded. Centred on the
+// body's chunk AT ENCODE, it is centred on where the body WAS by the time
+// anything collides against it. Standing or walking that costs nothing; in a
+// fall it is everything. At maxFall (17.8 voxels a tick) the body is ~71
+// voxels below the cube's centre when the cube arrives, and the cube only
+// holds 16-32 voxels under it -- so every tick of a long fall was held by
+// KnownDrop at the cube's lower face, and that face moves in 16-voxel chunk
+// steps: the per-tick drop came out 0, 35, 2, 30, ... A fall that stuttered
+// and dragged, measured by the `freefall` gate (2026-10-08).
+//
+// So the cube is centred where the body WILL BE: its position plus
+// kSnapshotLatency ticks of its own velocity, and one more tick down while
+// falling (the drop scan reaches a whole step below the sole). At rest the
+// lead is zero and the cube is exactly the old one.
+//
+// NEVER LEAD THROUGH A FLOOR. A lead past the ground the body is about to land
+// on would deliver, for the ticks after touchdown, cubes centred underground
+// with Unknown under the feet -- the body would hover and read ungrounded.
+// The predicted body therefore stops on the first floor that is known: the
+// first Solid/Liquid cell the CURRENT mirror shows under the body's centre
+// column, and worldgen's own height contract (World::TerrainHeight) when the
+// body is above that analytic ground. Both only CHOOSE WHICH CUBE IS COPIED;
+// neither is collision. A wrong guess costs coverage for a few ticks, which is
+// what every tick of a fall cost before.
+//
+// `vel` is the BODY's velocity, which is not always `p.vel`: a limp avatar
+// is Jolt's and the capsule only follows its pelvis (RagdollFollow), so
+// `p.vel` reads zero for the whole limp part of a fall while the rig drops at
+// up to 80 m/s.
+//
+// Deterministic: the body's state, the snapshot (fixed-latency) and a pure
+// height function. SANDVOX_NO_MIRROR_LEAD=1 restores the old centre (an A/B
+// switch for the gate, not a setting).
+static IVec3 MirrorLeadChunk(const Player& p, Vec3 vel,
+                             const Player::KindFn& kindAt, const World& world,
+                             IVec3 here) {
+  static const bool kOff = [] {
+    const char* e = std::getenv("SANDVOX_NO_MIRROR_LEAD");
+    return e != nullptr && e[0] != '0';
+  }();
+  if (kOff || p.fly) return here;
+  const float ahead = (float)World::kSnapshotLatency * kTickDt;
+  Vec3 at = p.pos + vel * ahead;
+  if (vel.y < 0.0f) {
+    at.y += vel.y * kTickDt;
+    const float yLo = p.CurrentBox().yLo;   // sole relative to pos (< 0)
+    const int x = ifloor(p.pos.x), z = ifloor(p.pos.z);
+    const int top = ifloor(p.pos.y + yLo) - 1;
+    const int bot = ifloor(at.y + yLo);
+    float floorTop = -1e30f;
+    for (int y = top; y >= bot; y--) {
+      const CellKind k = kindAt({x, y, z});
+      if (k == CellKind::Unknown) break;   // past the cube: no answer
+      if (k == CellKind::Solid || k == CellKind::Liquid) {
+        floorTop = (float)(y + 1);
+        break;
+      }
+    }
+    // The analytic ground, only for a body above it (a body already under
+    // the surface -- a cave, a shaft -- has left what the column describes).
+    const float ground =
+        (float)(World::TerrainHeight(x, z, world.WorldSeed()) + 1);
+    if (p.pos.y + yLo >= ground) floorTop = std::max(floorTop, ground);
+    at.y = std::max(at.y, floorTop - yLo);
+  }
+  return IVec3{ifloor(at.x) / (int)kChunk, ifloor(at.y) / (int)kChunk,
+               ifloor(at.z) / (int)kChunk};
+}
+
 static void PhaseL(TickAuthorityCtx& w, WorldScratch& ws,
                     std::span<SessionTick> players,
                     std::span<PlayerScratch> scratch, uint32_t tick,
@@ -5306,6 +5380,16 @@ static void PhaseL(TickAuthorityCtx& w, WorldScratch& ws,
                  ifloor(player.pos.z) / (int)kChunk};
       // A harness centres the mirror on its FIXTURE (session.h section J).
       if (w.harness.haveSubmitChunk) pc = w.harness.submitChunk;
+      // The mirror LEADS the body (MirrorLeadChunk); a harness fixture's
+      // mirror stays on its fixture.
+      ws.mirrorChunk =
+          w.harness.haveSubmitChunk
+              ? pc
+              : MirrorLeadChunk(player,
+                                avatar.Spawned() && avatar.Ragdolled()
+                                    ? avatar.BodyVelocity()
+                                    : player.vel,
+                                kindAt, world, pc);
       t0 = NowSeconds();
       spanGame.Close();
       // ---- the celestial clock (sim/world.h) -----------------------------
@@ -5567,7 +5651,7 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,
                  spawns, farCount, fluidSpawns, fluidCount,
-                 ui.showDirtyVoxels);
+                 ui.showDirtyVoxels, &ws.mirrorChunk);
       // Conservative estimate refresh: the newest snapshot's GPU-owned count
       // plus every spawn batch it has not seen yet. Settles decay it (the
       // snapshot count shrinks); excites grow it one snapshot late, which the

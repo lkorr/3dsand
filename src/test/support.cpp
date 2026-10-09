@@ -1101,7 +1101,15 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 uint32_t farCount,
                 const std::vector<FluidSpawnOp>& fluidSpawns,
                 uint32_t fluidLive,
-                bool vizActive) {
+                bool vizActive,
+                const IVec3* mirrorChunk) {
+  // THE CPU MIRROR'S CENTRE, which is the player's chunk unless the caller
+  // LEADS it (session.cpp MirrorLeadChunk: a fast body is mirrored where it
+  // will be when this tick's snapshot is read, kSnapshotLatency ticks on).
+  // Only the two mirror consumers below read it -- the voxel mirror copy and
+  // the seam's fluid fold, which must describe one cube. The draft box and
+  // the op record keep the body's own chunk.
+  const IVec3 mc = mirrorChunk != nullptr ? *mirrorChunk : playerChunk;
   // ---- ASYNC COMPUTE: the switch (docs/PLAN_async_compute.md) -------------
   // render.asyncCompute, or SANDVOX_ASYNC_COMPUTE=0/1 over it (the A/B arm).
   // Applied per tick so an F5 reload or a --perf arm flips it between ticks;
@@ -1806,8 +1814,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // The mirror corner for the seam's fluid-occupancy fold: the SAME clamp
   // EncodeReadbacks applies to the same input below, so the fold and the
   // voxel mirror describe one cube.
-  IVec3 mb = world.MirrorBaseFor(
-      {playerChunk.x - 1, playerChunk.y - 1, playerChunk.z - 1});
+  IVec3 mb = world.MirrorBaseFor({mc.x - 1, mc.y - 1, mc.z - 1});
   tp.mirrorBase[0] = mb.x; tp.mirrorBase[1] = mb.y; tp.mirrorBase[2] = mb.z;
   // ---- WIND DRAFTS: the shelter volume's box (world.h kDraft*) ----------
   // A pure function of the player's chunk, snapped to EVEN chunks so the box
@@ -2505,7 +2512,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // have changed on (World::EncodeReadbacks). 236 KiB of the ~1 MiB a
     // resting tick used to copy out.
     doCopy = world.EncodeReadbacks(ctx.device, enc,
-                                   {playerChunk.x - 1, playerChunk.y - 1, playerChunk.z - 1},
+                                   {mc.x - 1, mc.y - 1, mc.z - 1},
                                    1 - sim.Page(), tick, hashEnable,
                                    sim.FluidSeamRecorded());
     if (doCopy) {

@@ -17,6 +17,19 @@
 namespace {
 constexpr uint64_t kChunkBytes = kChunkVol * 4;
 constexpr int kHysteresis = 2;        // chunks past center before a shift
+// THE WINDOW MUST KEEP UP WITH A FALL. One shift per Update moves the window
+// at most a chunk a tick, 16 voxels = 48 m/s at kVoxelMeters 0.10 and 30 Hz,
+// and a falling body is faster than that: the player's maxFall is 53.5 m/s
+// and a limp ragdoll has only Jolt's 80 m/s ceiling. The lag grows every tick
+// of the fall until the body leaves the bottom of the window, where nothing
+// is simulated and every collider "vouches" (DebrisSystem::ColliderVouched) —
+// measured by the `freefall` gate (2026-10-08): a 150 m drop ended 2,300
+// voxels under the ground. So once the primary is this many chunks past the
+// centre on its worst axis, the window takes a SECOND shift on that axis in
+// the same Update, frame gate or not (the R4 argument is "the player is 13+
+// chunks from the edge", which is exactly what has stopped being true). Two
+// chunks a tick is 96 m/s, above every speed a body here can reach.
+constexpr int kCatchUpLag = 4;
 constexpr size_t kEvictBatch = 256;   // staging bound: 4 MB per readback batch
 // THE RING MUST BE DEEPER THAN ONE SHIFT, or every shift blocks.
 //
@@ -353,19 +366,25 @@ void Stream::Update(const InterestSet& interest, uint32_t tick) {
 
   // R4: at most one shift per FRAME (see BeginFrame in stream.h). Ungated for
   // callers with no frame loop, where one Update is one tick anyway.
-  if (best >= 0 && !(frameGated_ && shiftedThisFrame_)) {
-    // THE WINDOW-OVERLAP RULE (docs/PLAN_chunk_tickets.md §2.4). A ticket box
-    // the shifted window would cover is RELEASED first: its chunks go to the
-    // store (the batch is forced by the plane fill's drain, keep-all), so the
-    // plane decodes the ticket's state instead of regenerating over it, and
-    // no chunk is ever resident twice.
-    IVec3 no = o;
+  // A body outrunning the window overrides the frame gate (kCatchUpLag).
+  const bool catchUp = best >= 0 && bestMag >= kCatchUpLag;
+  if (best >= 0 && (!(frameGated_ && shiftedThisFrame_) || catchUp)) {
     const int dir = d[best] > 0 ? 1 : -1;
-    if (best == 0) no.x += dir;
-    else if (best == 1) no.y += dir;
-    else no.z += dir;
-    tickets_.ReleaseOverlapping(no, tick);
-    ShiftAxis(best, dir);
+    // ...and takes a second plane this call while it is still that far out.
+    const int shifts = catchUp && bestMag - 1 >= kCatchUpLag ? 2 : 1;
+    for (int k = 0; k < shifts; k++) {
+      // THE WINDOW-OVERLAP RULE (docs/PLAN_chunk_tickets.md §2.4). A ticket
+      // box the shifted window would cover is RELEASED first: its chunks go
+      // to the store (the batch is forced by the plane fill's drain,
+      // keep-all), so the plane decodes the ticket's state instead of
+      // regenerating over it, and no chunk is ever resident twice.
+      IVec3 no = world_->WindowOrigin();
+      if (best == 0) no.x += dir;
+      else if (best == 1) no.y += dir;
+      else no.z += dir;
+      tickets_.ReleaseOverlapping(no, tick);
+      ShiftAxis(best, dir);
+    }
     shiftedThisFrame_ = true;
   }
   timing_.totalMs += PtNowMs() - uT0;

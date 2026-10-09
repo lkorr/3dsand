@@ -167,14 +167,21 @@ static uint32_t TerrainBuildsPerTick() {
 // ---- ANTI-TUNNELLING (DebrisSystem::UntunnelBody) ---------------------------
 // How far ahead along its own velocity a body asks for collision patches, and
 // the ceiling on that. 0.35 s is 21 ticks at 60 Hz, which comfortably covers a
-// chunk fetch plus a slot in kTerrainBuildsPerTick; the 64-voxel cap (four
-// chunks) is what keeps a body at Jolt's 500 m/s from asking for a corridor
-// across the whole window. The samples are the chunks the swept segment passes
-// through and nothing else -- a box around each would multiply the fetch
-// budget by the lookahead, and the ground a falling body needs is directly
-// under it.
+// chunk fetch plus a slot in kTerrainBuildsPerTick; the cap is what keeps a
+// body at the velocity ceiling from asking for a corridor across the whole
+// window. The samples are the chunks the swept segment passes through and
+// nothing else -- a box around each would multiply the fetch budget by the
+// lookahead, and the ground a falling body needs is directly under it.
+//
+// The cap was 64 voxels (four chunks) while Jolt's ceiling was 500 m/s. It is
+// 80 m/s now (physics.cpp kBodyMaxSpeedMS), and 64 voxels is under four ticks
+// of a limp body at terminal -- less than a fetch's own latency, so the ground
+// patch was asked for after the body needed it (`freefall` gate). 192 voxels
+// is the 0.35 s horizon up to ~55 m/s, and known-empty sky in the corridor
+// costs no fetch (SkyKnown), so the longer reach spends the budget only on
+// chunks with matter in them.
 constexpr float kTerrainLookaheadSeconds = 0.35f;
-constexpr float kTerrainLookaheadVox = 64.0f;
+constexpr float kTerrainLookaheadVox = 192.0f;
 // Consecutive steps a body may be held at a collider boundary before it is let
 // through anyway. Half a second at 60 Hz: long enough that the patch normally
 // lands first, short enough that a starved readback reads as a stutter rather
@@ -6447,6 +6454,9 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     t.wc = wc;
     t.lastNeeded = tick;
     const CachedChunk* cc = world.Cached(wc);
+    // Known-empty sky needs no patch, so it costs no fetch: the budget below
+    // goes to the ground a falling body is about to reach (SkyKnown).
+    if (!cc && SkyKnown(wc)) continue;
     if (!cc) {
       // THE FETCH BUDGET. World::kFetchPerTick is 64 for the whole engine and
       // a felled tree used to ask for 454 in one tick; everything else that
@@ -6774,7 +6784,42 @@ bool DebrisSystem::ColliderVouched(IVec3 wc) const {
   // builtVersion != 0 is "polygonized at least once from real voxels", which
   // is the same three-way split TerrainCensus reports: a patch with triangles
   // and a patch that came out EMPTY both vouch, an unfetched one does not.
-  return it != terrain_.end() && it->second.builtVersion != 0;
+  if (it != terrain_.end() && it->second.builtVersion != 0) return true;
+  // ...and so does sky the snapshot already counts as empty. Without this a
+  // body falling through open air was in unvouched space the whole way down
+  // -- the patches are fetched and polygonized a few chunks a tick, and a
+  // limp body at 50 m/s outruns that -- and UntunnelRig deliberately lets go
+  // of a rig that STARTED its step unvouched (the deadlock rule), so the clamp
+  // was disarmed by the time the rig met the ground and it fell through it
+  // (`freefall` gate, 2026-10-08). Sky that vouches keeps the rig in vouched
+  // space until the first chunk with matter in it, which is the boundary the
+  // clamp exists for.
+  return SkyKnown(wc);
+}
+
+bool DebrisSystem::SkyKnown(IVec3 wc) const {
+  static const bool kOff = [] {
+    const char* e = std::getenv("SANDVOX_NO_SKY_VOUCH");
+    return e != nullptr && e[0] != '0';
+  }();
+  if (kOff || world_ == nullptr) return false;
+  const WorldSnapshot& snap = world_->Snap();
+  if (!snap.valid || snap.occupancy.size() < kNumChunks) return false;
+  // The count describes the chunk the slot held AT CAPTURE, so every chunk
+  // asked about must have been inside the snapshot's window and still be
+  // inside the current one (a shift since then refilled the slot).
+  const IVec3 so = snap.windowOrigin;
+  const int n = (int)kNChunk;
+  for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+      for (int dx = -1; dx <= 1; dx++) {
+        const IVec3 c{wc.x + dx, wc.y + dy, wc.z + dz};
+        if (c.x < so.x || c.y < so.y || c.z < so.z || c.x >= so.x + n ||
+            c.y >= so.y + n || c.z >= so.z + n || !world_->ChunkInWindow(c))
+          return false;
+        if (snap.occupancy[World::SlotChunkIndex(c)] != 0) return false;
+      }
+  return true;
 }
 
 bool DebrisSystem::UntunnelBody(uint64_t handle, const Vec3& prevPosVoxel) {

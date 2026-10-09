@@ -1152,6 +1152,11 @@ class DebrisSystem {
   // complete answer). So does being outside the residency window: there is no
   // sim and no body out there, and a body that reaches it despawns.
   bool ColliderVouched(IVec3 worldChunk) const;
+  // KNOWN EMPTY SKY: the published snapshot counts no matter in this chunk
+  // NOR in any of its 26 neighbours (every cell a patch's 18^3 gather would
+  // read), so its patch would polygonize EMPTY and needs no fetch to say so.
+  // Answers for the chunk as of the snapshot, the same age the mirror is.
+  bool SkyKnown(IVec3 worldChunk) const;
 
   // ---- why a body stopped in mid-air, or did not (CLAUDE.md rule 6) -------
   // A clamp that fires is not a bug and a clamp that releases IS one, so the

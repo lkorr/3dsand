@@ -429,6 +429,7 @@ const char* const kOrder[] = {
     "underwater-body",
     "player-walk", "player-waterjump", "player-ledgegrab", "player-crouch",
     "player-fastfall",
+    "freefall",
     "player-plants",
     // TWO PLAYERS IN ONE WORLD (M9.1 P3). Here, with the other player gates,
     // and NOT beside `tick-input` at the front of the list even though they are

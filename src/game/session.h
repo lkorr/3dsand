@@ -1250,6 +1250,12 @@ struct TickAuthorityCtx {
     // (the harvests and deferred wakes it owes are ticks, not motion) with an
     // empty interest set, which is its own "no shift" answer.
     bool pinWindow = false;
+    // THE FAR FIELD IS NOT RUN. A rig's FarField is never Init'ed (it is
+    // render-only and a gate draws nothing), so a harness that UNPINS the
+    // window to let the residency follow its body (the `freefall` gate) must
+    // still keep the cascades from recentring onto buffers that do not exist.
+    // Implied by pinWindow; only meaningful without it.
+    bool farInert = false;
     // The chunk the submit centres the CPU mirror on (SubmitTick's
     // playerChunk), when it is not the player's: the gate's FIXTURE chunk,
     // which is what every hand-rolled ticker passed.

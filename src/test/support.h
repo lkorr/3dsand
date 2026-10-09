@@ -172,7 +172,8 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 uint32_t farCount = 0,
                 const std::vector<FluidSpawnOp>& fluidSpawns = {},
                 uint32_t fluidLive = 0,
-                bool vizActive = false);
+                bool vizActive = false,
+                const IVec3* mirrorChunk = nullptr);
 
 // Re-read the AUTHORED ENVIRONMENT from disk -- assets/biomes/*.json, the
 // world map named by world.mapLayer, assets/trees/* -- validate it the way
