@@ -1818,6 +1818,25 @@ struct Tuning {
     // voxel is untouched. Only a blast that states a power reads it (an
     // explosion does; a fall's splat is radius-only).
     float blastPowerRef = TPD(gore, blastPowerRef);
+    // ---- THE SPRAY (Mob::ShedSpray, bug report 2026-10-09 14:26) ---------
+    // Matter a blast or a lethal landing carves off a body leaves as ballistic
+    // particles AWAY from the blast centre (from under the body, for a
+    // landing) instead of the 3 vox/s drip a blade's gobbet falls with, which
+    // stacked a blown-apart torso into a column where it stood.
+    // blastShedSpeed: vox/s at gore.blastPowerRef (x sqrt(power/ref), clamped
+    // 0.5..2), halving toward the crater's edge. fallShedPerMs: vox/s per m/s
+    // of landing speed. shedSpread: random direction jitter, 0 = straight out.
+    float blastShedSpeed = TPD(gore, blastShedSpeed);
+    float fallShedPerMs = TPD(gore, fallShedPerMs);
+    float shedSpread = TPD(gore, shedSpread);
+    // ---- THE SHRED (Mob::CarveRadialAll) ----------------------------------
+    // A blast's crater is all-or-nothing per limb, so a chest-height blast
+    // took the torso and left the legs untouched. Every limb whose near side
+    // is within blastShredReach crater radii is gouged on the face toward the
+    // blast: a bite of blastShredGouge x the crater radius at its edge,
+    // shrinking to nothing at the reach. 1 / 0 = off.
+    float blastShredReach = TPD(gore, blastShredReach);
+    float blastShredGouge = TPD(gore, blastShredGouge);
     // ---- A THROWN ROCK IS A BLOW (W2-H phase 2, MobSystem::ApplyContactDamage)
     //
     // A loose body (debris, a log, a flung limb) that strikes a living

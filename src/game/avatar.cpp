@@ -1351,6 +1351,24 @@ void PlayerAvatar::JointConsistentPose(std::vector<Vec3>& pos, std::vector<Quat>
     pos[(size_t)i] = pos[(size_t)i] + d;
     moved[(size_t)i] = d;
   }
+  // WORN SHELLS SIT ON THEIR HOST, NOT WHERE THEIR OWN BODY WAS (bug report
+  // 2026-10-09 14:30: armour standing off the limbs in the death photograph).
+  // At the instant of death a shell's physics transform can be a step behind
+  // its host — the rig has just gone limp and DriveWornShells has not run
+  // since — and carrying only the parent's translation above kept the shell's
+  // own stale rotation. Placed by the same rigid offset DriveWornShells uses:
+  // the host's anchor through the host's (corrected) rotation, backed off to
+  // the shell's corner.
+  for (int i = 0; i < n; i++) {
+    const int h = limbs_[(size_t)i].wornHost;
+    if (h < 0 || h >= n || limbs_[(size_t)i].holdSeconds > 0 ||
+        !have[(size_t)i] || !have[(size_t)h])
+      continue;
+    const Quat q = rot[(size_t)h];
+    rot[(size_t)i] = q;
+    pos[(size_t)i] = pos[(size_t)h] + Rotate(q, limbs_[(size_t)h].anchorLimb) -
+                     Rotate(q, limbs_[(size_t)i].anchorLimb);
+  }
 }
 
 int PlayerAvatar::LivePartCount() const {

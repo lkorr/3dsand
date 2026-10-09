@@ -12265,7 +12265,10 @@ int main(int argc, char** argv) {
             ExplosionOp e{};
             const int off = std::getenv("SANDVOX_SHOT_BLAST_OFF") ? std::atoi(std::getenv("SANDVOX_SHOT_BLAST_OFF")) : 3;
             e.x = (int32_t)std::floor(headAt.x) + off - k;
-            e.y = (int32_t)std::floor(headAt.y) + 1;
+            // SANDVOX_SHOT_BLAST_DY: height off the head (-4 = the chest, the
+            // fiend's hellfire of bug report 2026-10-09 14:26).
+            e.y = (int32_t)std::floor(headAt.y) +
+                  (std::getenv("SANDVOX_SHOT_BLAST_DY") ? std::atoi(std::getenv("SANDVOX_SHOT_BLAST_DY")) : 1);
             e.z = (int32_t)std::floor(headAt.z) + k;
             e.radius = std::getenv("SANDVOX_SHOT_BLAST_R") ? std::atoi(std::getenv("SANDVOX_SHOT_BLAST_R")) : 3;
             e.power = std::getenv("SANDVOX_SHOT_BLAST_P") ? std::atoi(std::getenv("SANDVOX_SHOT_BLAST_P")) : 120;

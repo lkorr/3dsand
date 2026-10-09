@@ -2713,10 +2713,12 @@ class Mob {
                        const DamageCtx& ctx = {}, float blastPower = 0.0f);
   // Every live limb of THIS creature within the blast — the explosion path
   // (DamageCause::Blast by default; a splat or an overcast states its own).
-  // `power` as CarveLimbRadial's `blastPower`.
+  // `power` as CarveLimbRadial's `blastPower`. `splatMs`: a Fall's landing
+  // speed (m/s), which sets how hard the shed matter sprays (ShedSpray).
   void CarveRadialAll(Vec3 centerWorldVoxel, float radiusVoxels, World& world,
                       std::vector<ParticleSpawn>& spawns, float power = 0.0f,
-                      const DamageCtx& ctx = DamageCtx(DamageCause::Blast));
+                      const DamageCtx& ctx = DamageCtx(DamageCause::Blast),
+                      float splatMs = 0.0f);
   // ---- ONE DAMAGE EVENT, ONE SHELL RESPONSE (W2-H, game/shellresponse.h) --
   //
   // The material of the voxel of slot `limbIndex` a blow STRUCK: the live
@@ -4710,6 +4712,21 @@ class Mob {
   void LimbVoxelsToParticles(const MobLimb& limb, uint32_t physScale,
                              const std::vector<DebrisVoxel>& voxels, World& world,
                              std::vector<ParticleSpawn>& spawns) const;
+  // THE SPRAY A VIOLENT CARVE THROWS (bug report 2026-10-09 14:26). Set by
+  // CarveRadialAll for the length of one blast or splat, read by
+  // LimbVoxelsToParticles: matter shed while it is on leaves AWAY FROM
+  // `origin` at `speed` voxels/s (falling off to half at `radius`), with a
+  // per-voxel jitter, instead of the 3 vox/s drip a blade's gobbets get. Off,
+  // every carve keeps the drip. A struct on the Mob rather than a parameter
+  // because the shed is reached through CarveLimb's split and fragment paths,
+  // which have no blast in their signatures and should not grow one.
+  struct ShedSpray {
+    bool on = false;
+    Vec3 origin{};
+    float speed = 0.0f;
+    float radius = 1.0f;
+  };
+  ShedSpray shedSpray_;
   void ReleaseLimbMicro(MobLimb& limb);
   // `keepJoint`: the limb leaves WITH its parent (DetachLimb's own child
   // recursion), so the joint between them is handed to the debris pair rather

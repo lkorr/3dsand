@@ -1922,6 +1922,13 @@ TP_F(gore, brainHpPerVoxel, NO_WGSL, 10.0f, 0.0f, 200.0f)
 TP_F(gore, carveHpPerVolume, NO_WGSL, 1.5f, 0.0f, 20.0f)
 // Blast power for a full-radius body crater. Floor 1: it is a divisor.
 TP_F(gore, blastPowerRef, NO_WGSL, 200.0f, 1.0f, 2000.0f)
+// The spray a blast or a lethal landing throws the shed matter in (Mob::ShedSpray).
+TP_F(gore, blastShedSpeed, NO_WGSL, 45.0f, 0.0f, 300.0f)
+TP_F(gore, fallShedPerMs, NO_WGSL, 1.5f, 0.0f, 20.0f)
+TP_F(gore, shedSpread, NO_WGSL, 0.6f, 0.0f, 3.0f)
+// The shred: a blast gouges limbs past its crater (Mob::CarveRadialAll).
+TP_F(gore, blastShredReach, NO_WGSL, 1.8f, 1.0f, 6.0f)
+TP_F(gore, blastShredGouge, NO_WGSL, 0.35f, 0.0f, 2.0f)
 // A thrown rock is a blow (MobSystem::ApplyContactDamage, W2-H phase 2).
 // contactMaxPerTick is the rule-2 bound on contacts billed per tick.
 TP_F(gore, contactImpulseMin, NO_WGSL, 40.0f, 0.0f, 2000.0f)
