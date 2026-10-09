@@ -58,6 +58,13 @@
  * tested by scripts/test_heighttools.mjs); every tool writes through
  * maptiles.js, so each dirties only its tiles and is one undo step.
  *
+ * THE VECTOR LAYERS (E3, mapvector.js): ROADS (map.json `roads[]`, graded
+ * ground the engine builds: polyline draw / vertex drag / insert / delete,
+ * junction snapping, the inspector, and the ENGINE's baked profile from
+ * --mapcheck), REGIONS (`regions[]`, named polygons, data only -- the
+ * engine's RegionAt) and MARKERS (`markers[]`, pixel-art map annotations).
+ * Locale markers are the locale editor's (E4), not these.
+ *
  * Input: left-drag paints / places with the active tool, right- or
  * middle-drag pans, wheel zooms about the cursor, [ ] resize the brush,
  * Alt+click with the height or biome brush picks the value under the cursor,
@@ -66,6 +73,7 @@
  */
 import * as MT from './maptiles.js';
 import * as HS from './heightshapes.js';
+import * as VEC from './mapvector.js';
 
 // Display colours by biome NAME; anything unknown gets a stable hash colour.
 const COLOR = {
@@ -83,7 +91,9 @@ let H = null;
 let els = {};
 let map = null;            // {name, json, H: height plane, B: biome plane} (maptiles.js planes)
 let dirty = false;
-let tool = 'height';       // height | biome | pad | spawn | stamp | water | tree | clearing | soften | site | sculpt
+let tool = 'height';       // height | biome | pad | spawn | stamp | water | tree | clearing | soften | site | sculpt | road | region | marker
+let VL = null;             // the vector layers (mapvector.js): roads, regions, markers
+let savedJson = null;      // map.json as last loaded / saved: the profile chart says when a road differs from its bake
 // P-G: the terrain block map.json carries. Its DEFAULTS (what a map missing a
 // key gets) have one copy, src/sim/worldmap.h TerrainParams, which the tuner
 // server reads and serves (/api/worldmap/terrain-defaults, via
@@ -421,6 +431,7 @@ function restore(s) {
   lines.sel = lid ? (map.json.ridges || []).find(x => x.id === lid) || null : null;
   if (!lines.sel) lines.drawing = false;
   syncTerrain(); syncSites(); syncEditSel(); publishTerrain(); syncLines();
+  if (VL) VL.afterRestore();
 }
 function pushUndo(e) { undo.push(e); if (undo.length > 60) undo.shift(); redo = []; }
 /** The map's terrain block, created from the defaults if the file has none. */
@@ -486,6 +497,7 @@ async function loadMap(name) {
   if (!json.extent || !Array.isArray(json.extent.min) || !Array.isArray(json.extent.size) || !json.planes)
     throw new Error(`worldmap/${name}: map.json v2 needs extent and planes`);
   const m = {name, json, H: MT.makePlane('height', json), B: MT.makePlane('biome', json)};
+  const saved = JSON.parse(JSON.stringify(json));
   const [lh, lb] = await Promise.all([listTiles(name, 'height'), listTiles(name, 'biome')]);
   for (const t of lh) m.H.onDisk.add(MT.tileKey(t.tx, t.tz));
   for (const t of lb) m.B.onDisk.add(MT.tileKey(t.tx, t.tz));
@@ -500,6 +512,8 @@ async function loadMap(name) {
   if (erosion.running) erosion.running.cancel();
   bakes = new Map(); area = null; erosion.pending = null; pngIn = null;
   lines.sel = null; lines.drawing = false; lines.drag = null;
+  savedJson = saved;
+  if (VL) VL.reset();
   if (els.heightsBtn) els.heightsBtn.classList.remove('on');
   brush.index = Math.min(brush.index, json.biomes.length - 1);
   range.vals = null;
@@ -653,8 +667,15 @@ function syncCheck() {
         syncSites(); paint();
       });
     }
+    const vm = !hit && map && String(w).match(/\b(road|region|marker) "([^"]+)"/);
+    if (vm && VL && (map.json[vm[1] + 's'] || []).some(o => o.id === vm[2])) {
+      row.classList.add('link');
+      row.title = 'select ' + vm[1] + ' ' + vm[2];
+      row.addEventListener('click', () => { tool = vm[1]; syncControls(); VL.selectById(vm[1], vm[2], true); });
+    }
     els.checkList.append(row);
   }
+  if (VL) VL.sync();
 }
 function buildCheckPanel() {
   const el = H.el;
@@ -672,6 +693,10 @@ function planePayload() { return {height: MT.dirtyPayload(map.H), biome: MT.dirt
 async function saveMap() {
   if (!map) return;
   const name = map.name;
+  // The engine REFUSES the whole map over a road with one point, a region
+  // with two, an id twice: never write one.
+  const vp = VL && VL.problems();
+  if (vp) { toast('not saved: ' + vp.join('; ') + ' (the engine would refuse the whole map)', true); return false; }
   const body = JSON.stringify(map.json, null, 2) + '\n';
   let r = await fetch('/api/worldmap?name=' + encodeURIComponent(name), {method: 'POST', body});
   let j = await r.json();
@@ -701,6 +726,7 @@ async function saveMap() {
     sculpt.dirty = false;
   }
   markDirty(false);
+  savedJson = JSON.parse(body);
   savedGen++;
   range.vals = null;
   fetchCheck();
@@ -954,6 +980,7 @@ function paint() {
   paintSculpt(ctx);
   paintFrame(ctx);
   paintLines(ctx);
+  if (VL) VL.paint(ctx);
   paintArea(ctx);
   paintSites(ctx);
   paintCursor(ctx);
@@ -1112,9 +1139,10 @@ function readout(wx, wz) {
 /* ---- input --------------------------------------------------------------------- */
 /** The world column under the cursor, fractional. */
 function worldAtF(ev) {
-  const r = els.canvas.getBoundingClientRect();
-  return [(ev.clientX - r.left - els.canvas.clientWidth / 2) / view.scale + view.cx,
-          (ev.clientY - r.top - els.canvas.clientHeight / 2) / view.scale + view.cz];
+  // the CONTENT box: the bounding rect includes the canvas's CSS border
+  const c = els.canvas, r = c.getBoundingClientRect();
+  return [(ev.clientX - r.left - c.clientLeft - c.clientWidth / 2) / view.scale + view.cx,
+          (ev.clientY - r.top - c.clientTop - c.clientHeight / 2) / view.scale + view.cz];
 }
 /** The world column under the cursor, whole voxels. */
 function worldColumnAt(ev) { const [x, z] = worldAtF(ev); return [Math.round(x), Math.round(z)]; }
@@ -1163,6 +1191,7 @@ function wire() {
     if (ev.button === 1 || ev.button === 2) { panning = {x: ev.clientX, y: ev.clientY, cx: view.cx, cz: view.cz}; return; }
     // an erosion preview is committed by the next edit of any kind
     if (erosion.pending) commitErosion();
+    if (VL.pointerDown(ev)) return;
     if (tool === 'shape') {
       const [wx, wz] = worldAtF(ev);
       stampShape(wx, wz);
@@ -1351,6 +1380,8 @@ function wire() {
       view.cx = panning.cx - (ev.clientX - panning.x) / view.scale;
       view.cz = panning.cz - (ev.clientY - panning.y) / view.scale;
       scheduleRealRefresh();
+    } else if (VL.dragging() && ev.buttons & 1) {
+      VL.pointerMove(ev);
     } else if (areaDrag && ev.buttons & 1) {
       const [wx, wz] = worldColumnAt(ev);
       area = [Math.min(areaDrag.x0, wx), Math.min(areaDrag.z0, wz), Math.max(areaDrag.x0, wx), Math.max(areaDrag.z0, wz)];
@@ -1419,6 +1450,7 @@ function wire() {
   });
   const up = () => {
     panning = null;
+    VL.pointerUp();
     padDrag = null;
     if (areaDrag) {
       areaDrag = null;
@@ -1482,6 +1514,7 @@ function wire() {
     if (inField) return;
     if ((ev.ctrlKey || ev.metaKey) && ev.key === 'z') { ev.preventDefault(); doUndo(); }
     else if ((ev.ctrlKey || ev.metaKey) && ev.key === 'y') { ev.preventDefault(); doRedo(); }
+    else if ((tool === 'road' || tool === 'region' || tool === 'marker') && VL.key(ev)) ev.preventDefault();
     else if (ev.key === '[' || ev.key === ']') {
       const f = ev.key === ']' ? 1.25 : 0.8;
       if (tool === 'sculpt') sculpt.radius = Math.max(8, Math.min(4096, Math.round(sculpt.radius * f)));
@@ -1498,6 +1531,7 @@ function wire() {
     }
   });
   c.addEventListener('dblclick', () => {
+    if ((tool === 'road' || tool === 'region') && VL.dblclick()) return;
     // a double click ends the line being drawn (its second click added a
     // vertex on top of the first: drop it)
     if (tool !== 'line' || !lines.drawing || !lines.sel) return;
@@ -2684,6 +2718,15 @@ export function attach(hooks) {
 #env-map .mapgrid2 label{display:flex;justify-content:space-between;align-items:center;gap:4px}
 #env-map .maplinepts{display:flex;flex-direction:column;gap:1px;max-height:160px;overflow-y:auto}
 #env-map .mapprofile{width:300px;height:84px;image-rendering:pixelated;border:1px solid #2a3040;border-radius:3px}
+#env-map .mapkind-road{color:#c8b48a}
+#env-map .mapkind-region{color:#c9a227}
+#env-map .mapkind-marker{color:#e8dcc0;display:inline-flex;align-items:center;gap:3px}
+#env-map .mapicons{display:inline-flex;flex-wrap:wrap;gap:2px}
+#env-map button.mapicon{padding:1px;line-height:0;background:#0e1219;border:1px solid #2a3040;border-radius:2px}
+#env-map button.mapicon.on{border-color:#ffd866}
+#env-map .mapicon canvas,#env-map canvas.mapiconsm{image-rendering:pixelated}
+#env-map .mapprofile-road{width:320px;height:120px}
+#env-map .mapnote.bad{color:#ffcf8a}
 #env-map button.mapgo{background:#2a2410;border-color:#6a5a1a;color:#ffd866}
 #env-map button.mapgo:disabled,#env-map .maptools button:disabled{opacity:.45}
 `;
@@ -2691,6 +2734,22 @@ export function attach(hooks) {
 
   els.canvas = el('canvas', {class: 'mapcanvas'});
   els.status = el('div', {class: 'mapstatus'}, 'no map loaded');
+  // E3: the vector layers, handed the page (mapvector.js createVectorLayer)
+  VL = VEC.createVectorLayer({
+    map: () => map, view, SX, SZ, worldAtF,
+    fitBox: (x0, z0, x1, z1) => {
+      const c = els.canvas, vmin = Math.min(c.clientWidth || 600, c.clientHeight || 400);
+      const span = Math.max(x1 - x0, z1 - z0, 64), onScreen = span * view.scale;
+      if (onScreen < 40 || onScreen > 0.9 * vmin) view.scale = Math.min(4, 0.5 * vmin / span);
+      view.cx = (x0 + x1) / 2; view.cz = (z0 + z1) / 2;
+      scheduleRealRefresh();
+    },
+    pushUndo, snapshot, markDirty, paint, status, toast, el,
+    vpm, seaY, check: () => check, savedJson: () => savedJson,
+    tool: () => tool, setTool: t => { tool = t; syncControls(); paint(); },
+    hover: () => els.hoverW || null,
+    materials: () => (H.materials ? H.materials() : null),
+  });
   els.palette = el('div', {class: 'mapbar'});
   els.mapSel = el('select', {});
   els.save = el('button', {disabled: true}, 'Save map');
@@ -2709,6 +2768,9 @@ export function attach(hooks) {
     tree: el('button', {title: 'click: place an AUTHORED TREE on the ground at that column; drag a tree to move it; shift+click: delete it'}, 'Tree'),
     clearing: el('button', {title: 'drag: draw a FOREST CLEARING (a box no tree crown reaches over); click one to select it, drag to move it; shift+click inside one: delete it'}, 'Clearing'),
     soften: el('button', {title: 'drag: draw SOFTENED GROUND (a box where the seeded hills, bumps and grain are kept at a percent -- a village’s ground); shift+click inside one: delete it'}, 'Soften'),
+    road: el('button', {title: 'ROADS (map.json roads[]: graded ground the engine builds): click to draw (double-click / Enter ends), drag a vertex, click the selected road to insert one, shift+click a vertex to delete; vertices SNAP onto other roads (junctions); Ctrl+click on a road starts a branch there; Alt = no snap'}, 'Road'),
+    region: el('button', {title: 'REGIONS (map.json regions[]: named polygons, data only): click out a polygon, click its first vertex to close; drag / insert / shift+click delete vertices like roads'}, 'Region'),
+    marker: el('button', {title: 'MARKERS (map.json markers[]: annotations with a pixel-art icon): click to place, drag to move, shift+click to delete'}, 'Marker'),
     sculpt: el('button', {title: 'SCULPT the fine layer: raise / lower / smooth / flatten / erase the map’s height-offset layer (sculpt.svsculpt, 0.8 m samples), added after everything else'}, 'Sculpt'),
   };
   for (const [k, b] of Object.entries(els.tools)) b.addEventListener('click', () => { tool = k; syncControls(); paint(); });
@@ -2850,6 +2912,7 @@ export function attach(hooks) {
     els.heightsBtn, pct('realAlpha', 'real-terrain backdrop opacity'),
     el('label', {}, ' ', scShow, 'sculpt'));
   const toolbar = el('div', {class: 'mapbar'}, els.tools.site, els.tools.height, els.tools.shape, els.tools.line, els.tools.area, els.tools.biome, els.tools.sculpt,
+    els.tools.road, els.tools.region, els.tools.marker,
     els.tools.pad, els.tools.spawn, els.tools.stamp, els.tools.water, els.tools.tree, els.tools.clearing, els.tools.soften);
   els.opts = {
     'height biome': el('span', {class: 'mapopts'}, 'radius ', els.brR, ' ', els.brROut, el('label', {}, ' spacing ', els.brSpacing, '%')),
@@ -2863,16 +2926,18 @@ export function attach(hooks) {
     'stamp': el('span', {class: 'mapopts'}, 'stamp ', els.stampTpl, ' ', els.stampRot),
     'tree': el('span', {class: 'mapopts'}, 'tree ', els.treeSp, ' v ', els.treeVar, ' ', els.treeRot),
     'clearing': el('span', {class: 'mapopts'}, 'clearing feather ', els.clearFeather, ' vox'),
+    ...VL.toolOpts(),
   };
   toolbar.append(...Object.values(els.opts));
   const note = el('div', {class: 'mapnote'},
     'The HEIGHT plane is the world’s shape, in metres: a post every ' + '6.4 m (map.json planes.height.log2), exact and never scaled by noise; the seeded noise (Terrain) rides on it and the Sculpt layer (0.8 m) on top of that. ' +
     'The BIOME plane says what grows where (planes.biome.log2: 25.6 m cells). Right/middle-drag pans, wheel zooms, [ ] resize the brush, Alt+click picks. ' +
     'Shape stamps landforms; Line draws ridge / valley lines you Bake into the plane; Area marks a rectangle to erode or to export / import as PNG (Height tools panel). ' +
+    'Road draws graded roads the engine builds (vertices snap together into junctions; the Vector layers panel shows the engine’s baked profile once saved); Region outlines named areas; Marker pins pixel-art annotations. ' +
     'Sites: the pad box (calm bare ground; the harness map’s is the selftest’s), the spawn diamond, stamps, authored lakes, authored trees, forest clearings, softened ground; they keep out by their own footprint. The Load check panel says what the engine thinks of the saved map. ' +
     'Saving writes map.json and only the plane tiles you changed (assets/worldmap/<name>/planes/), and moves the world hash; regenerate the world (F7 in the game, or Apply in the sidebar) to see it.');
   const main = el('div', {class: 'mapmain'}, bar, toolbar, els.palette, els.canvas, els.status, note);
-  const side = el('div', {class: 'mapside'}, buildCheckPanel(), buildHeightToolsPanel(), buildTerrainSection(), buildSitesPanel());
+  const side = el('div', {class: 'mapside'}, buildCheckPanel(), VL.buildPanel(), buildHeightToolsPanel(), buildTerrainSection(), buildSitesPanel());
   root.append(el('div', {class: 'mapbody'}, main, side));
   // The PREVIEW pane (P-I): the heightmap and voxel views tuner.html keeps in
   // #wgPreviewHost, adopted under the map as previews.
@@ -3001,7 +3066,7 @@ export function saveFromHost() {
   if (dirty) saveMap();
   if (tuningTouched && H.saveTuning) { H.saveTuning(); tuningTouched = false; }
 }
-export function activate() { if (map) { syncTerrain(); syncSites(); publishTerrain(); syncLines(); syncHeightTools(); } }
+export function activate() { if (map) { syncTerrain(); syncSites(); publishTerrain(); syncLines(); syncHeightTools(); VL.sync(); } }
 // test seams
 export function _map() { return map; }
 export function _load(name) { return loadMap(name); }
@@ -3037,3 +3102,6 @@ export function _exportPng(plane) { return plane === 'biome' ? exportBiomePng(fa
 export function _importPng(bytes, plane, name) { return openPngImport(bytes, plane, name); }
 export function _pngIn() { return pngIn; }
 export function _applyPng() { return applyPngImport(); }
+// E3 test seams (the vector layers)
+export function _vl() { return VL; }
+export function _savedJson() { return savedJson; }

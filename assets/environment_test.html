@@ -359,7 +359,9 @@ function readLit(wv, cv){
     function frac(wx, wz) { var v = M._view(); return [0.5 + (wx - v.cx) * v.scale / cv.clientWidth, 0.5 + (wz - v.cz) * v.scale / cv.clientHeight]; }
     function ptr(type, fx, fy, extra) {
       var r = cv.getBoundingClientRect();
-      var o = {clientX: r.left + r.width * fx, clientY: r.top + r.height * fy, button: 0, buttons: type === 'pointerup' ? 0 : 1, pointerId: 7, bubbles: true};
+      // fractions of the CONTENT box (what the page's view maps), not the border box
+      var o = {clientX: r.left + cv.clientLeft + cv.clientWidth * fx, clientY: r.top + cv.clientTop + cv.clientHeight * fy,
+               button: 0, buttons: type === 'pointerup' ? 0 : 1, pointerId: 7, bubbles: true};
       for (var k in (extra || {})) o[k] = extra[k];
       cv.dispatchEvent(new PointerEvent(type, o));
     }
@@ -589,6 +591,134 @@ function readLit(wv, cv){
     say(unm === 0 && sameT(preB[0], postB), 'biome PNG export -> import round-trips exactly (' + unm + ' unmapped colours)');
     M._area(null);
 
+    // ---- 6f. the VECTOR LAYERS (docs/PLAN_map_v2.md E3): roads, regions, markers ---------------------------
+    // Drawn with synthetic pointers at one pixel per two voxels, so every
+    // click lands on a whole voxel and the snap reach is 16 voxels.
+    var VL = M._vl(), VS = VL.st, VEC = await import('./editor/mapvector.js');
+    btns = [].slice.call(pages.map.querySelectorAll('.mapbar button')).map(function (b) { return b.textContent; });
+    say(['Road', 'Region', 'Marker'].every(function (n) { return btns.indexOf(n) >= 0; }) && !!pages.map.querySelector('details.mapvector'),
+        'the toolbar carries Road, Region and Marker; the Vector layers panel is built');
+    var vw2 = M._view(); vw2.cx = 0; vw2.cz = 5000; vw2.scale = 0.5;
+    var JS = function () { return M._map().json; };
+    var dbl = function () { cv.dispatchEvent(new MouseEvent('dblclick', {bubbles: true})); };
+    var click = function (x, z, extra) { at('pointerdown', x, z, extra); at('pointerup', x, z, extra); };
+    var nRoads = (JS().roads || []).length, dV = M._undoDepth();
+    M._tool('road');
+    VS.newRoad.kind = 'path'; VS.newRoad.surface = 'packed_gravel';
+    click(-500, 5000); click(0, 5000); click(400, 5100); dbl();
+    var R1 = JS().roads[nRoads];
+    say(!!R1 && R1.points.length === 3 && R1.kind === 'path' && R1.width === 12 && R1.shoulder === 6 && R1.maxGrade === 25 &&
+        R1.surface === 'packed_gravel' && !VS.drawing && M._undoDepth() === dV + 3,
+        'Road: three clicks and a double-click drew ' + JSON.stringify(R1 && {id: R1.id, pts: R1.points, kind: R1.kind, width: R1.width}) + ' in ' + (M._undoDepth() - dV) + ' undo steps');
+    var d0 = M._undoDepth();
+    at('pointerdown', 0, 5000); at('pointermove', 0, 5040); at('pointermove', 0, 5080); at('pointerup', 0, 5080);
+    R1 = JS().roads[nRoads];
+    say(R1.points[1][0] === 0 && R1.points[1][1] === 5080 && M._undoDepth() === d0 + 1, 'dragging a vertex moved it to (' + R1.points[1] + ') in one undo step');
+    click(-250, 5040);
+    R1 = JS().roads[nRoads];
+    say(R1.points.length === 4 && R1.points[1][0] === -250 && R1.points[1][1] === 5040, 'a click on the selected road inserted a vertex at (' + R1.points[1] + ')');
+    click(-250, 5040, {shiftKey: true});
+    R1 = JS().roads[nRoads];
+    say(R1.points.length === 3, 'shift+click on it deleted it again (' + R1.points.length + ' vertices)');
+    // JUNCTIONS: a branch off vertex 1 (Ctrl+click snaps onto it), its end dropped on R1's other segment (T junction)
+    click(4, 5083, {ctrlKey: true}); click(200, 4800); click(201, 5093); dbl();
+    R1 = JS().roads[nRoads];
+    var R2 = JS().roads[nRoads + 1];
+    say(!!R2 && R2.points.length === 3 && R2.points[0].join() === '0,5080' && R2.points[2].join() === '201,5090' &&
+        R1.points.length === 4 && R1.points[2].join() === '201,5090',
+        'junction snapping: the branch starts ON vertex (' + (R2 && R2.points[0]) + ') and ends ON the segment it was dropped on, which gained the vertex (' + R1.points[2] + ')');
+    d0 = M._undoDepth();
+    at('pointerdown', 0, 5080); at('pointermove', 10, 5070); at('pointermove', 20, 5060); at('pointerup', 20, 5060);
+    R1 = JS().roads[nRoads]; R2 = JS().roads[nRoads + 1];
+    say(R1.points[1].join() === '20,5060' && R2.points[0].join() === '20,5060' && M._undoDepth() === d0 + 1, 'dragging the junction moves both roads\' vertices (' + R1.points[1] + ' / ' + R2.points[0] + ')');
+    undoBtn.click();
+    R1 = JS().roads[nRoads]; R2 = JS().roads[nRoads + 1];
+    say(R1.points[1].join() === '0,5080' && R2.points[0].join() === '0,5080', 'Undo puts the junction back');
+    at('pointerdown', 0, 5080, {altKey: true}); at('pointermove', 30, 5000, {altKey: true}); at('pointerup', 30, 5000, {altKey: true});
+    R1 = JS().roads[nRoads]; R2 = JS().roads[nRoads + 1];
+    var detached = R1.points[1].join() !== R2.points[0].join();
+    undoBtn.click();
+    R1 = JS().roads[nRoads]; R2 = JS().roads[nRoads + 1];
+    say(detached && R1.points[1].join() === R2.points[0].join(), 'Alt+drag pulls one road\'s vertex out of the junction (undone)');
+    // the inspector (select from the list centres the road; the view goes back after)
+    VL.selectById('road', R1.id, true);
+    say(Math.abs(vw2.cx - (-50)) < 1 && Math.abs(vw2.cz - 5050) < 1, 'selecting a road from the list centres the view on it (' + vw2.cx + ', ' + vw2.cz + ')');
+    vw2.cx = 0; vw2.cz = 5000; vw2.scale = 0.5;
+    var insp = pages.map.querySelector('details.mapvector .maptools-panel');
+    var nIn = insp.querySelectorAll('input[type=number]');
+    nIn[0].value = 30; nIn[0].dispatchEvent(new Event('change'));
+    R1 = JS().roads[nRoads];
+    insp = pages.map.querySelector('details.mapvector .maptools-panel');
+    var kSel = insp.querySelector('select');
+    kSel.value = 'road'; kSel.dispatchEvent(new Event('change'));
+    R1 = JS().roads[nRoads];
+    say(R1.width === 30 && R1.kind === 'road' && R1.shoulder === 16 && R1.maxGrade === 10,
+        'inspector: width 30 typed, kind -> road took the road defaults for the fields left at the path\'s (' + JSON.stringify({w: R1.width, sh: R1.shoulder, g: R1.maxGrade}) + ')');
+    var prof = pages.map.querySelector('canvas.mapprofile-road');
+    say(!!prof && /not saved yet/.test(prof.parentNode.textContent), 'the profile chart is there and says an unsaved road has no bake yet');
+    // a region: three clicks and a click on the first vertex close it
+    M._tool('region');
+    var nReg = (JS().regions || []).length;
+    click(-500, 4850); click(-200, 4850); click(-200, 4950); click(-500, 4850);
+    var RG = JS().regions[nReg];
+    say(!!RG && RG.points.length === 3 && !VS.drawing && /^#[0-9a-f]{6}$/i.test(RG.colour) && VEC.regionAt(JS().regions, -300, 4870) === RG &&
+        VEC.regionAt(JS().regions, -450, 4940) === null,
+        'Region: closed a triangle ' + JSON.stringify(RG && {id: RG.id, name: RG.name, colour: RG.colour, n: RG.points.length}) + '; regionAt inside / outside it agree');
+    click(-350, 4850);
+    RG = JS().regions[nReg];
+    say(RG.points.length === 4 && RG.points[1].join() === '-350,4850', 'a click on its edge inserted a vertex');
+    // a marker
+    M._tool('marker'); VS.newIcon = 'castle';
+    var nMk = (JS().markers || []).length;
+    click(300, 4900);
+    var MK = JS().markers[nMk];
+    say(!!MK && MK.icon === 'castle' && MK.at.join() === '300,4900', 'Marker: placed ' + JSON.stringify(MK));
+    at('pointerdown', 300, 4880); at('pointermove', 330, 4880); at('pointermove', 360, 4880); at('pointerup', 360, 4880);
+    MK = JS().markers[nMk];
+    say(MK.at.join() === '360,4900', 'dragging its badge moved it to (' + MK.at + ')');
+    M._paint();
+    var fm = frac(360, 4900), bx = Math.round(cv.width * fm[0]) - 14, bz = Math.round(cv.height * fm[1]) - 30;
+    var bp = g2.getImageData(bx, bz, 1, 1).data;
+    say(bp[0] === 255 && bp[1] === 216 && bp[2] === 102, 'the selected marker\'s pixel-art badge is drawn (corner ' + [].slice.call(bp, 0, 3) + ')');
+    click(360, 4890, {shiftKey: true});
+    var gone = JS().markers.length === nMk;
+    undoBtn.click();
+    say(gone && JS().markers.length === nMk + 1, 'shift+click deletes the marker; Undo brings it back');
+    // save: refused over a road the engine would refuse; then the round trip
+    JS().roads.push({id: 'e3_bad', points: [[0, 0]]});
+    var refused = await M._save();
+    var tIdx = toasts.findIndex(function (t) { return /not saved/.test(t); });
+    say(refused === false && tIdx >= 0, 'Save is refused over a one-point road: ' + (tIdx >= 0 ? toasts[tIdx].slice(0, 120) : '(no toast)'));
+    if (tIdx >= 0) toasts.splice(tIdx, 1);
+    JS().roads.pop();
+    var oldCk = M._check();
+    var okS = await M._save();
+    var disk2 = await api('/api/worldmap?name=' + FIX);
+    say(okS && JSON.stringify(disk2.roads) === JSON.stringify(JS().roads) && JSON.stringify(disk2.regions) === JSON.stringify(JS().regions) &&
+        JSON.stringify(disk2.markers) === JSON.stringify(JS().markers),
+        'Save round-trips ' + JS().roads.length + ' roads, ' + JS().regions.length + ' region(s), ' + JS().markers.length + ' marker(s) through map.json');
+    ok = await waitFor(function () { return !!M._check() && M._check() !== oldCk; }, 90000);
+    var ck2 = M._check();
+    if (!ck2 || ck2.unavailable) skip('the engine bake of the drawn roads: ' + (ck2 ? String(ck2.error).slice(0, 80) : 'no answer'));
+    else if (!ck2.ok && /svmap|version|v1/i.test(String(ck2.error))) skip('the engine bake of the drawn roads: this sandvox.exe predates v2 maps');
+    else if (!Array.isArray(ck2.regions)) skip('--mapcheck regions / markers / dense profile: this sandvox.exe predates E3');
+    else {
+      var er = (ck2.roads || []).filter(function (r) { return r.id === R1.id; })[0];
+      say(ck2.ok && ck2.regions.length === JS().regions.length && ck2.markers.length === JS().markers.length && !!er && !!er.profile && er.profile.s.length >= 2,
+          '--mapcheck accepts the saved vector layers: ' + (ck2.ok ? (ck2.roads || []).length + ' roads baked, ' + ck2.regions.length + ' region(s), ' + ck2.markers.length + ' marker(s)' +
+          (er && er.profile ? ', ' + er.profile.s.length + ' profile samples, worst grade ' + er.worstGrade + ' %' : '') : 'REFUSED: ' + String(ck2.error).slice(0, 160)));
+      VL.selectById('road', R1.id);
+      prof = pages.map.querySelector('canvas.mapprofile-road');
+      var pn = prof ? prof.parentNode.textContent : '';
+      say(/engine: \d+ pieces/.test(pn) && !/EDITED/.test(pn), 'the profile chart shows the engine\'s bake: ' + pn.replace(/^Profile[^)]*\)/, '').slice(0, 140));
+      JS().roads[nRoads].points[0][1] += 40;
+      VL.sync();
+      pn = pages.map.querySelector('canvas.mapprofile-road').parentNode.textContent;
+      say(/EDITED since the save/.test(pn), 'an edit after the save marks the chart as the SAVED road\'s bake');
+      JS().roads[nRoads].points[0][1] -= 40;
+    }
+    M._tool('height');
+
     // LOAD CHECK: the panel asked the engine (or says why it could not).
     ok = await waitFor(function(){ return !!M._check(); }, 60000);
     var ck = M._check();
@@ -605,6 +735,15 @@ function readLit(wv, cv){
     }
     lst = await api('/api/worldmap/tiles?name=' + FIX + '&plane=height');
     say(lst.tiles.length === 0, 'an EMPTY tile POST deletes the tile (fixture tiles removed)');
+
+    // E3: the SHIPPED map's roads (Harrowby's paths, R1) load into the vector layers.
+    await M._load('default');
+    ok = await waitFor(function(){ return !!M._map() && M._map().name === 'default'; }, 30000);
+    var hr = ok ? (M._map().json.roads || []).filter(function (r) { return /^harrowby_/.test(r.id); }) : [];
+    var rows = pages.map.querySelectorAll('details.mapvector .mapkind-road').length;
+    M._vl().selectById('road', hr.length ? hr[0].id : '', true);
+    say(hr.length === 8 && rows >= 8 && !!pages.map.querySelector('canvas.mapprofile-road'),
+        'the default map\'s ' + hr.length + ' Harrowby roads are listed (' + rows + ' rows) and open in the inspector');
 
     // The preview host lives in tuner.html; this harness drives the module
     // alone, so only the wiring is checked here.

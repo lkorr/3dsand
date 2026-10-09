@@ -1021,8 +1021,36 @@ struct WorldMapData {
     std::vector<int> vertexGround;             // bare ground at each point
     int pieces = 0;
     int worstGradeQ8 = 0;                      // steepest baked step, percent * 256
+    // The baked profile along the whole polyline, decimated to at most
+    // kRoadProfileMax samples (the bake's own every-4-voxel samples, every
+    // k-th one, the last always kept): arc length from the first point,
+    // the road surface Y and the bare ground there, voxels. --mapcheck hands
+    // it to the map page's profile chart.
+    std::vector<int> profS, profY, profG;
   };
   std::vector<Road> roads;
+  // map.json regions[] (map v2 E3): NAMED POLYGONS, data only -- nothing in
+  // worldgen reads them; RegionAt answers "which region is this column in"
+  // for later systems (quest text, map labels, spawn tables). Points are world
+  // voxels, the polygon closes itself, colour is the map page's "#rrggbb".
+  struct Region {
+    std::string id, name, colour;
+    std::vector<std::pair<int, int>> points;
+    int x0 = 0, z0 = 0, x1 = 0, z1 = 0;        // bounding box, inclusive
+  };
+  std::vector<Region> regions;
+  // map.json markers[] (map v2 E3): map ANNOTATIONS, `{id, name, icon, at}`;
+  // nothing in the engine reads them. `icon` is one of kMarkerIcons (an
+  // unknown one is a warning; the page draws a plain pin).
+  struct Marker {
+    std::string id, name, icon;
+    int x = 0, z = 0;
+  };
+  std::vector<Marker> markers;
+  /** The region holding world column (x, z) -- the LAST in table order whose
+   *  polygon contains it (the map page draws later regions on top), even-odd
+   *  rule, integer arithmetic; nullptr when none does. */
+  const Region* RegionAt(int x, int z) const;
   // LOAD WARNINGS (P6): everything the loader skipped or thinks is a mistake
   // but will not refuse a boot over -- an unknown site kind, a stamp .vox or
   // tree species that is not there, two footprints that overlap, a tree at
@@ -1184,6 +1212,17 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
  */
 const WorldMapData& CurrentWorldMap();
 void SetCurrentWorldMap(WorldMapData map);
+
+/** The NAME of the region of CurrentWorldMap() holding world column (x, z)
+ *  (WorldMapData::RegionAt; its id when it has no name), "" when none does. */
+std::string RegionAt(int x, int z);
+
+// The marker icons the map page draws (pixel art, assets/editor/mapvector.js
+// ICONS): a marker naming another one loads with a warning.
+inline constexpr const char* kMarkerIcons[] = {"hut",    "village", "castle", "tower", "cave",
+                                               "ruin",   "shrine",  "camp",   "mine",  "port"};
+// The most samples a road's reported profile carries (WorldMapData::Road::profS).
+inline constexpr int kRoadProfileMax = 256;
 
 /**
  * The CPU height mirror's BARE ground (landColumnBare's h, no site pad) at
