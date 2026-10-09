@@ -198,6 +198,73 @@ bool SiteCases(Ctx& c, const biomes::BiomeSet& set, std::string& out) {
     say(refused && olog.find("at most") != std::string::npos,
         "D: " + std::to_string(crowd) + " sites in one cell did not refuse the load (" + olog + ")");
   }
+  // F. REGIONS AND MARKERS (map v2 E3), CPU, through the same in-memory door:
+  // a square, an L-shaped (concave) region and a small one drawn later INSIDE
+  // the square load; RegionAt answers inside / outside / the notch of the L /
+  // the later region on top; a bad colour and an unknown icon are warnings;
+  // a duplicate id, a two-point polygon and a marker without `at` refuse.
+  int regionHits = 0;
+  {
+    nlohmann::json jr = base;
+    jr["regions"] = nlohmann::json::array({
+        {{"id", "e3_square"}, {"name", "The Square"}, {"colour", "#336699"},
+         {"points", {{30000, 30000}, {31000, 30000}, {31000, 31000}, {30000, 31000}}}},
+        {{"id", "e3_ell"}, {"name", "The Ell"}, {"colour", "nope"},
+         {"points", {{32000, 30000}, {33000, 30000}, {33000, 30400}, {32400, 30400}, {32400, 31000}, {32000, 31000}}}},
+        {{"id", "e3_inner"}, {"colour", "#aabbcc"},
+         {"points", {{30400, 30400}, {30600, 30400}, {30600, 30600}, {30400, 30600}}}}});
+    jr["markers"] = nlohmann::json::array({{{"id", "e3_hut"}, {"name", "Hut"}, {"icon", "hut"}, {"at", {30500, 30100}}},
+                                            {{"id", "e3_odd"}, {"icon", "teapot"}, {"at", {30500, 30200}}}});
+    worldmap::WorldMapData rm;
+    std::string rlog, rt = jr.dump();
+    const bool rok = worldmap::LoadWorldMap(dir, real.name, set, c.mats.size(), kDefaultSeed, rm, rlog, &rt);
+    say(rok, "F: the regions / markers map was REFUSED: " + rlog);
+    if (rok) {
+      auto name = [&](int x, int z) {
+        const worldmap::WorldMapData::Region* r = rm.RegionAt(x, z);
+        return r ? r->id : std::string("-");
+      };
+      const std::pair<std::pair<int, int>, const char*> probes[] = {
+          {{30100, 30100}, "e3_square"}, {{30999, 30999}, "e3_square"}, {{31000, 30500}, "-"},
+          {{30500, 30500}, "e3_inner"},  {{32200, 30800}, "e3_ell"},   {{32800, 30200}, "e3_ell"},
+          {{32800, 30800}, "-"},         {{29999, 30500}, "-"}};
+      std::string miss;
+      for (const auto& [p, want] : probes) {
+        if (name(p.first, p.second) == want) regionHits++;
+        else miss += " (" + std::to_string(p.first) + "," + std::to_string(p.second) + ")=" + name(p.first, p.second) + " want " + want;
+      }
+      say(regionHits == 8, "F: RegionAt wrong at" + miss);
+      say(rm.regions.size() == 3 && rm.markers.size() == 2 && rm.markers[0].x == 30500 && rm.markers[0].icon == "hut",
+          "F: regions / markers not read back (" + std::to_string(rm.regions.size()) + " / " + std::to_string(rm.markers.size()) + ")");
+      auto rwarned = [&](const std::string& a, const std::string& b) {
+        for (const std::string& w : rm.warnings)
+          if (w.find(a) != std::string::npos && w.find(b) != std::string::npos) return true;
+        return false;
+      };
+      say(rwarned("e3_ell", "#rrggbb") && rwarned("e3_odd", "teapot") && !rwarned("e3_square", "colour"),
+          "F: missing the bad-colour / unknown-icon warnings");
+      // RegionAt by NAME against CurrentWorldMap(), the free function.
+      worldmap::SetCurrentWorldMap(rm);
+      const std::string n1 = worldmap::RegionAt(30100, 30100), n2 = worldmap::RegionAt(30500, 30500);
+      worldmap::SetCurrentWorldMap(real);
+      say(n1 == "The Square" && n2 == "e3_inner", "F: RegionAt by name gave \"" + n1 + "\" / \"" + n2 + "\"");
+    }
+    auto refuses = [&](nlohmann::json bad, const std::string& needle, const std::string& what) {
+      worldmap::WorldMapData bm;
+      std::string blog, bt = bad.dump();
+      const bool no = !worldmap::LoadWorldMap(dir, real.name, set, c.mats.size(), kDefaultSeed, bm, blog, &bt);
+      say(no && blog.find(needle) != std::string::npos, "F: " + what + " did not refuse (" + blog + ")");
+    };
+    nlohmann::json d1 = jr;
+    d1["regions"].push_back(jr["regions"][0]);
+    refuses(d1, "second region", "a duplicate region id");
+    nlohmann::json d2 = jr;
+    d2["regions"][1]["points"] = {{1, 1}, {5, 5}, {5, 5}};
+    refuses(d2, "three distinct", "a two-point region");
+    nlohmann::json d3 = jr;
+    d3["markers"][0].erase("at");
+    refuses(d3, "needs at", "a marker without at");
+  }
 
   // E. The tree on the GPU.
   uint32_t want = 0, got = 0;
@@ -244,13 +311,14 @@ bool SiteCases(Ctx& c, const biomes::BiomeSet& set, std::string& out) {
       DrainFullRefill(c.ctx, c.world, c.sim, IVec3{108 >> 4, 122 >> 4, 108 >> 4});
     }
   }
-  char buf[400];
+  char buf[520];
   std::snprintf(buf, sizeof buf,
                 "sites: synthetic load %s with %zu warnings, %s tree at (%d,%d) h %d listed %d, keep-out trunk %s / "
-                "past %s, GPU trunk cell %s (atlas %s)",
+                "past %s, GPU trunk cell %s (atlas %s); regions: RegionAt %d/8",
                 loaded ? "ok" : "REFUSED", syn.warnings.size(), sp->name.c_str(), tx, tz, th, listed,
                 keepIn ? "yes" : "NO", keepOut ? "YES" : "no",
-                got < c.mats.size() ? c.mats[got].name.c_str() : "?", want < c.mats.size() ? c.mats[want].name.c_str() : "?");
+                got < c.mats.size() ? c.mats[got].name.c_str() : "?", want < c.mats.size() ? c.mats[want].name.c_str() : "?",
+                regionHits);
   out = buf;
   for (const std::string& b : bad) out += "; " + b;
   return bad.empty();

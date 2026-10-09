@@ -1302,6 +1302,19 @@ def _map_v2_check(j):
             and all(isinstance(p, list) and len(p) == 3 and all(isinstance(x, (int, float)) for x in p) for p in r["points"])
             for r in ridges):
         return "ridges[] must be objects whose points are [x, z, y] triples (world voxels)"
+    # E3: the vector layers' SHAPE (the loader refuses the rest by name).
+    def xz(p):
+        return isinstance(p, list) and len(p) == 2 and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in p)
+    for key in ("roads", "regions"):
+        arr = j.get(key, [])
+        if not isinstance(arr, list) or not all(
+                isinstance(o, dict) and isinstance(o.get("id"), str) and o["id"]
+                and isinstance(o.get("points"), list) and all(xz(p) for p in o["points"]) for o in arr):
+            return "%s[] must be objects with an id and points [[x, z], ...] (world voxels)" % key
+    markers = j.get("markers", [])
+    if not isinstance(markers, list) or not all(
+            isinstance(o, dict) and isinstance(o.get("id"), str) and o["id"] and xz(o.get("at")) for o in markers):
+        return "markers[] must be objects with an id and at: [x, z] (world voxels)"
     return None
 
 

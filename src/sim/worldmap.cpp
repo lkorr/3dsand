@@ -4,6 +4,7 @@
 #include "sim/worldmap.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1792,6 +1793,87 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       out.roads.push_back(std::move(rd));
     }
   }
+  // ---- regions[] and markers[] (map v2 E3): data only ---------------------------
+  // Nothing in worldgen reads either (they still move contentHash: they are
+  // in map.json). A malformed SHAPE (no id, a duplicate id, a point that is
+  // not [x, z], a polygon of fewer than three distinct points, a marker
+  // without `at`) is a refusal naming the entry, like a road's -- a half-read
+  // region would answer RegionAt wrongly forever. A colour that is not
+  // "#rrggbb", an icon the page has no art for, a vertex outside the extent
+  // are warnings.
+  auto xzPair = [](const json& p, std::pair<int, int>& q) {
+    if (!p.is_array() || p.size() != 2 || !p[0].is_number() || !p[1].is_number()) return false;
+    const double a = p[0].get<double>(), b = p[1].get<double>();
+    if (std::abs(a) > (1 << 24) || std::abs(b) > (1 << 24)) return false;
+    q = {static_cast<int>(std::lround(a)), static_cast<int>(std::lround(b))};
+    return true;
+  };
+  if (j.contains("regions")) {
+    if (!j["regions"].is_array()) { log += at + "regions must be an array\n"; return false; }
+    std::set<std::string> ids;
+    for (const json& r : j["regions"]) {
+      if (!r.is_object() || !r.contains("id") || !r["id"].is_string() || r["id"].get<std::string>().empty()) {
+        log += at + "a regions[] entry needs an id\n";
+        return false;
+      }
+      WorldMapData::Region rg;
+      rg.id = r["id"].get<std::string>();
+      const std::string who = at + "region \"" + rg.id + "\": ";
+      if (!ids.insert(rg.id).second) { log += who + "a second region with this id\n"; return false; }
+      rg.name = r.contains("name") && r["name"].is_string() ? r["name"].get<std::string>() : std::string();
+      rg.colour = r.contains("colour") && r["colour"].is_string() ? r["colour"].get<std::string>() : std::string();
+      bool hex = rg.colour.size() == 7 && rg.colour[0] == '#';
+      for (size_t k = 1; hex && k < 7; k++) hex = std::isxdigit(static_cast<unsigned char>(rg.colour[k])) != 0;
+      if (!hex) warn("region \"" + rg.id + "\": colour \"" + rg.colour + "\" is not #rrggbb (the map page draws it grey)");
+      if (!r.contains("points") || !r["points"].is_array()) {
+        log += who + "needs points: [[x, z], ...] in world voxels\n";
+        return false;
+      }
+      for (const json& p : r["points"]) {
+        std::pair<int, int> q;
+        if (!xzPair(p, q)) { log += who + "a point that is not [x, z] within +-16M voxels\n"; return false; }
+        if (!rg.points.empty() && rg.points.back() == q) continue;
+        rg.points.push_back(q);
+      }
+      if (rg.points.size() > 1 && rg.points.front() == rg.points.back()) rg.points.pop_back();   // closed by hand
+      if (rg.points.size() < 3) { log += who + "a polygon needs at least three distinct points\n"; return false; }
+      rg.x0 = rg.x1 = rg.points[0].first;
+      rg.z0 = rg.z1 = rg.points[0].second;
+      bool outside = false;
+      for (const auto& [x, z] : rg.points) {
+        rg.x0 = std::min(rg.x0, x); rg.x1 = std::max(rg.x1, x);
+        rg.z0 = std::min(rg.z0, z); rg.z1 = std::max(rg.z1, z);
+        outside = outside || !out.InExtent(x, z);
+      }
+      if (outside) warn("region \"" + rg.id + "\": a vertex is outside the map's extent");
+      out.regions.push_back(std::move(rg));
+    }
+  }
+  if (j.contains("markers")) {
+    if (!j["markers"].is_array()) { log += at + "markers must be an array\n"; return false; }
+    std::set<std::string> ids;
+    for (const json& r : j["markers"]) {
+      if (!r.is_object() || !r.contains("id") || !r["id"].is_string() || r["id"].get<std::string>().empty()) {
+        log += at + "a markers[] entry needs an id\n";
+        return false;
+      }
+      WorldMapData::Marker mk;
+      mk.id = r["id"].get<std::string>();
+      const std::string who = at + "marker \"" + mk.id + "\": ";
+      if (!ids.insert(mk.id).second) { log += who + "a second marker with this id\n"; return false; }
+      std::pair<int, int> q;
+      if (!r.contains("at") || !xzPair(r["at"], q)) { log += who + "needs at: [x, z] in world voxels\n"; return false; }
+      mk.x = q.first;
+      mk.z = q.second;
+      mk.name = r.contains("name") && r["name"].is_string() ? r["name"].get<std::string>() : std::string();
+      mk.icon = r.contains("icon") && r["icon"].is_string() ? r["icon"].get<std::string>() : std::string();
+      bool known = false;
+      for (const char* ic : kMarkerIcons) known = known || mk.icon == ic;
+      if (!known) warn("marker \"" + mk.id + "\": icon \"" + mk.icon + "\" is not one the map page draws");
+      if (!out.InExtent(mk.x, mk.z)) warn("marker \"" + mk.id + "\": outside the map's extent");
+      out.markers.push_back(std::move(mk));
+    }
+  }
   // The first cut: every segment in <= kSiteRoadPieceMax straight runs,
   // appended at the END of `sites` (every road after every other kind, so a
   // road's pieces never shift another site's id). Ends only; the bake below
@@ -2135,6 +2217,15 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
           rd.vertexY.push_back((pr[vi] + 128) >> 8);
           rd.vertexGround.push_back(g[vi] >> 8);
         }
+        // The reported profile: every k-th sample, the last always (map page).
+        rd.profS.clear(); rd.profY.clear(); rd.profG.clear();
+        const int pk = std::max(1, (N + kRoadProfileMax - 2) / (kRoadProfileMax - 1));
+        for (int i = 0; i < N; i += pk) {
+          rd.profS.push_back(ss[i]); rd.profY.push_back((pr[i] + 128) >> 8); rd.profG.push_back(g[i] >> 8);
+        }
+        if ((N - 1) % pk != 0) {
+          rd.profS.push_back(ss[N - 1]); rd.profY.push_back((pr[N - 1] + 128) >> 8); rd.profG.push_back(g[N - 1] >> 8);
+        }
         // The pieces, segment by segment (a vertex always ends a piece).
         int q = 0;
         rd.worstGradeQ8 = 0;
@@ -2330,9 +2421,22 @@ std::string MapCheckJson(const std::string& name, bool ok, const WorldMapData& m
     rj["worstGrade"] = r.worstGradeQ8 / 256.0;
     rj["vertexY"] = r.vertexY;
     rj["vertexGround"] = r.vertexGround;
+    // E3: the whole baked profile (decimated), so the chart is the bake's
+    // own curve between the vertices, not a JS guess at it.
+    rj["profile"] = {{"s", r.profS}, {"y", r.profY}, {"ground", r.profG}};
     roads.push_back(rj);
   }
   j["roads"] = roads;
+  // E3: the regions and markers as the loader accepted them.
+  json rs = json::array();
+  for (const WorldMapData::Region& r : m.regions)
+    rs.push_back({{"id", r.id}, {"name", r.name}, {"points", static_cast<int>(r.points.size())},
+                  {"bbox", {r.x0, r.z0, r.x1, r.z1}}});
+  j["regions"] = rs;
+  json ms = json::array();
+  for (const WorldMapData::Marker& k : m.markers)
+    ms.push_back({{"id", k.id}, {"icon", k.icon}, {"at", {k.x, k.z}}});
+  j["markers"] = ms;
   // Map v2: the extent and what the planes hold (authored tiles; the rest
   // are the planes' defaults).
   j["extent"] = {m.extentX0, m.extentZ0, m.extentW, m.extentH};
@@ -2493,6 +2597,36 @@ const std::vector<StructurePlacement>* StructureOverrideSlot() {
 
 const WorldMapData& CurrentWorldMap() { return Slot(); }
 void SetCurrentWorldMap(WorldMapData map) { Slot() = std::move(map); }
+
+const WorldMapData::Region* WorldMapData::RegionAt(int x, int z) const {
+  // Even-odd crossing test at the column CENTRE (x + 1/2, z + 1/2), in
+  // doubled coordinates so it stays integer: a ray toward +x crosses edge
+  // (a, b) when the edge straddles the centre's z (half-open, so a vertex is
+  // counted once) and the crossing lies right of the centre. i64: every
+  // coordinate is within +-2^25 doubled, products within 2^52.
+  const int64_t px = 2 * static_cast<int64_t>(x) + 1, pz = 2 * static_cast<int64_t>(z) + 1;
+  for (size_t ri = regions.size(); ri-- > 0;) {
+    const Region& r = regions[ri];
+    if (x < r.x0 || x > r.x1 || z < r.z0 || z > r.z1) continue;
+    bool in = false;
+    const size_t n = r.points.size();
+    for (size_t i = 0, k = n - 1; i < n; k = i++) {
+      const int64_t ax = 2 * static_cast<int64_t>(r.points[k].first), az = 2 * static_cast<int64_t>(r.points[k].second);
+      const int64_t bx = 2 * static_cast<int64_t>(r.points[i].first), bz = 2 * static_cast<int64_t>(r.points[i].second);
+      if ((az > pz) == (bz > pz)) continue;
+      // crossing x = ax + (pz - az) * (bx - ax) / (bz - az) > px, without the division
+      const int64_t lhs = (pz - az) * (bx - ax), rhs = (px - ax) * (bz - az);
+      if (bz > az ? lhs > rhs : lhs < rhs) in = !in;
+    }
+    if (in) return &r;
+  }
+  return nullptr;
+}
+
+std::string RegionAt(int x, int z) {
+  const WorldMapData::Region* r = CurrentWorldMap().RegionAt(x, z);
+  return r ? (r->name.empty() ? r->id : r->name) : std::string();
+}
 
 namespace {
 std::string& MapOverrideSlot() {
