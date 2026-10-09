@@ -480,6 +480,8 @@ const FLATS = [
   {id: 'saltmarsh', poly: [[-9.2, -2.8], [-8.6, -2.8], [-8.6, 0.4], [-9.2, 0.4]], to: 3.5, keep: 0.2, r: 6},
   {id: 'teethsound', poly: [[-5.0, 5.9], [-4.0, 5.9], [-4.0, 6.8], [-5.0, 6.8]], to: 3, keep: 0.2, r: 6},
   {id: 'hearthfloor', poly: [[-0.4, -0.3], [1.9, -0.3], [2.3, 5.2], [0.2, 5.0], [-0.9, 2.2]], to: 12.5, keep: 0.5, r: 16, both: true},
+  // Harrowby's own plain: the vale eased down to the village's 8.8 m, so it sits on the land, not in a bowl
+  {id: 'harrowbyplain', poly: [[-0.9, -0.3], [1.0, -0.4], [1.4, 0.6], [1.0, 1.3], [-0.4, 1.4], [-1.1, 0.6]], to: 9.6, keep: 0.4, r: 14, both: true},
 ];
 function flattenLowlands(G) {
   for (const F of FLATS) {
@@ -1914,6 +1916,7 @@ buildRivers();
 makeConfluence();
 settleWater();
 channelRivers();
+harrowbyGround();   // last: nothing after the posts stage (hollow fill, channels) may move the village's ground
 checkRivers();
 log('9 biomes');
 buildBiomes();

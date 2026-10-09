@@ -1452,8 +1452,23 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
   }
 }
 
+namespace {
+// SUBMIT WHAT IS QUEUED. The environment's tables are the biggest writes the
+// engine makes (the shipped map's packed planes are 22 MiB, its horizon 11
+// MiB, the tree atlas 14 MiB), and a reload that swaps maps queues two sets of
+// them with no frame between (the village gate's harness -> default -> back;
+// the game's F7): one unsubmitted batch that outgrew the 64 MiB staging ring
+// and aborted (2026-10-09, when Tirnhallow made `default` that big). An empty
+// submit hands the batch to the GPU so the ring can reclaim it.
+void FlushQueuedUploads(const rhi::Device& device, const rhi::Queue& queue) {
+  rhi::CommandEncoder enc = device.CreateCommandEncoder("flushUploads");
+  queue.Submit(enc.Finish());
+}
+}  // namespace
+
 void Simulation::UploadHorizon(const rhi::Device& device, const rhi::Queue& queue,
                                const std::vector<uint32_t>& worldMapWords) {
+  FlushQueuedUploads(device, queue);
   std::vector<uint32_t> words;
   // The seed the per-sample treeline's jitter is read at: the world's, once
   // streaming has set it (the default world's before, at Init -- the jitter
@@ -1505,6 +1520,7 @@ void Simulation::UploadHorizon(const rhi::Device& device, const rhi::Queue& queu
 void Simulation::UploadEnvironment(const rhi::Device& device, const rhi::Queue& queue,
                                    const TreeAtlas& trees,
                                    const std::vector<uint32_t>& worldMapWords) {
+  FlushQueuedUploads(device, queue);
   // Grow-only: a table that shrank keeps its buffer and is zero-padded, the
   // same way Init pads to the header floor. Only a table that no longer fits
   // costs a new buffer -- and with it the two bind groups, because a bind

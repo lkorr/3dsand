@@ -11790,6 +11790,18 @@ int main(int argc, char** argv) {
         ui.fly = true;
         player.fly = true;
         ui.visible = false;
+        // SANDVOX_AT_MINUTE=m: hold the sky at that minute of the day (as
+        // --shot-spawn's SANDVOX_SHOT_SPAWN_AT does), so an aerial view of the
+        // map is taken in daylight rather than at whatever hour the run boots.
+        if (const char* am = std::getenv("SANDVOX_AT_MINUTE")) {
+          const int minute = std::atoi(am);
+          CelestialClock& cc = Celestial();
+          cc.engaged = true;
+          cc.scaleNum = cc.scaleDen = 1;
+          cc.ticks = (int64_t)((double)(((minute % 1440) + 1440) % 1440) / 1440.0 * (double)TicksPerDay(CurrentTuning()));
+          cc.prevTicks = cc.ticks;
+          cc.rem = 0;
+        }
       }
       // SANDVOX_AT_FLY=vx,vy,vz (m/s): the held camera moves instead, a fixed
       // 1/60 s per frame, so a report taken IN FLIGHT (the far cascade

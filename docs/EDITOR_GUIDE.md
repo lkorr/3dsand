@@ -2380,3 +2380,39 @@ deck. All render-only: `tuning.json`, live on F5.
 - **A range came out lower than its knots**: the `peaks` slider puts cols
   between peaks, so a knot can sit in a col; the highest point near it is the
   knot's height. Lower `peaks` for an even crest.
+
+### 15.8 The `default` map is generated: `scripts/design_world.mjs`
+
+The `default` map — the continent of Tirnhallow, gazetteer in
+`docs/WORLD_tirnhallow.md` — was built by a script, not by hand on this page:
+
+```bash
+node scripts/design_world.mjs                 # rebuild assets/worldmap/default/
+node scripts/design_world.mjs --dry           # build + render overviews, write nothing into assets/
+node scripts/design_world.mjs --png DIR       # where the overview PNGs go (default build/world)
+node scripts/design_world.mjs --stage terrain # stop after the height plane
+```
+
+**Re-running it OVERWRITES** the height and biome tiles (stale tiles are
+deleted) and every vector layer it owns in `map.json`: rivers, lakes, roads
+(except the eight `harrowby_*` lanes), regions, markers, ranges, climate,
+`gen`, and the water and lava sites. It keeps `version`, extent, planes, sea
+level, the Harrowby locale, its refs and edit layers, and the spawn; the plane
+under Harrowby is restored from `scripts/design_world_harrowby.json`.
+
+So the rule is: **once you have hand-edited the map on this page, the map is
+yours** — do not re-run the script, or your edits are gone. Change the world
+at the source (the zone, river, road and place tables in the script) only
+while it is still script-owned. After any re-run, load the map here (or run
+`sandvox.exe --mapcheck default`) and check: zero warnings, and the worst site
+cell well under 128 (the script prints its own estimate).
+
+Design aids, all printing to the console (km coordinates):
+
+- `DW_DUMP="x0,z0,x1,z1,step"` — a table of ground heights in metres.
+- `DW_TRACE="x,z;x,z"` — where water from each point flows.
+- `DW_RIVER=<id>` — that river's bake profile.
+
+For daylight aerial engine shots of a place, `--at` with
+`SANDVOX_AT_MINUTE=<minute of day>` (e.g. 720) holds the sky at that hour, and
+`SANDVOX_WEATHER=clear` clears it.
