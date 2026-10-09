@@ -26,6 +26,7 @@
 #include "sim/heat.h"        // the temperature layer's layout (heatParams, PackHeatMaterial)
 #include "sim/elec.h"        // the charge field's layout (elecParams, PackElecMaterial)
 #include "sim/boltfx.h"      // the bolt table at renderBGL 44 (render-only)
+#include "sim/horizon.h"     // the far horizon's pyramid at renderBGL 45 (render-only)
 #include "test/support.h"    // AssetDir(): the one asset-path chokepoint (solutes.json)
 
 // The pond lattice the live shaders were compiled with (POND_TILE), so an
@@ -110,6 +111,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     pad.resize(worldMapWords_, 0u);
     queue.WriteBuffer(worldMapBuf_, 0, pad.data(), pad.size() * 4);
   }
+  // The far horizon (sim/horizon.h): the same map's height plane as the
+  // pyramid the raymarch draws past the cascades. Render-only derived data,
+  // rebuilt with the map in UploadEnvironment; created here because it is a
+  // render bind-group entry (renderBGL 45).
+  UploadHorizon(device, queue, worldMapWords);
 
   // The worldgen column cache (worldgen.wgsl's block; WriteGenList). Sized for
   // the widest list: kGenColMax chunk-columns of 256 cached columns each —
@@ -784,6 +790,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // boltLightAt): a strike's render-only segments and light points,
         // CPU-written per frame while a bolt burns. Empty = one load a pixel.
         entry(44, T::ReadOnlyStorage, S::Fragment),               // boltBuf
+        // THE FAR HORIZON (sim/horizon.h; raymarch.wgsl traceHorizon): the
+        // map's height pyramid, written at load / environment reload only.
+        entry(45, T::ReadOnlyStorage, S::Fragment),               // horizon
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1081,6 +1090,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     veilPixels_ = 0;
     BuildRenderBindGroup(renderBG_, veilBuf_);
     BuildRenderBindGroup(renderBGNoVeil_, veilNone_);
+    renderBGBuilt_ = true;
   }
   // ---- the shadow-cache resolve pass (shadow_resolve.wgsl) ----
   // Its OWN layout rather than a reuse of renderBGL_ with widened visibility:
@@ -1432,6 +1442,28 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
   }
 }
 
+void Simulation::UploadHorizon(const rhi::Device& device, const rhi::Queue& queue,
+                               const std::vector<uint32_t>& worldMapWords) {
+  std::vector<uint32_t> words;
+  horizon::Build(worldmap::CurrentWorldMap(), worldMapWords, words);
+  // Grow-only, like the worldMap buffer: a smaller map keeps the buffer and
+  // the shader reads only what the header names. A buffer that had to grow is
+  // a new handle, so the two render bind groups that name it are rebuilt --
+  // once they exist (Init uploads before it builds them).
+  if (words.size() > horizonWords_) {
+    horizonWords_ = words.size();
+    horizonBuf_ = CreateBuffer(device, (uint64_t)horizonWords_ * 4,
+                               rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                               "horizon");
+    if (renderBGBuilt_) {
+      BuildRenderBindGroup(renderBG_, veilBuf_);
+      BuildRenderBindGroup(renderBGNoVeil_, veilNone_);
+    }
+  }
+  words.resize(horizonWords_, 0u);
+  queue.WriteBuffer(horizonBuf_, 0, words.data(), words.size() * 4);
+}
+
 void Simulation::UploadEnvironment(const rhi::Device& device, const rhi::Queue& queue,
                                    const TreeAtlas& trees,
                                    const std::vector<uint32_t>& worldMapWords) {
@@ -1465,6 +1497,9 @@ void Simulation::UploadEnvironment(const rhi::Device& device, const rhi::Queue& 
     queue.WriteBuffer(worldMapBuf_, 0, pad.data(), pad.size() * 4);
   }
   if (rebind) BuildSimBindGroups(device);
+  // The horizon is the map's too: rebuilt from the map the caller has just
+  // installed as CurrentWorldMap (ReloadEnvironment sets it before this).
+  UploadHorizon(device, queue, worldMapWords);
   // The tree lattice is a PRELUDE CONSTANT (TREE_TILE / TREE_SCAN /
   // TREE_CAND_MAX size worldgen's candidate array), so a reload that changed
   // the finest biome tile or the widest species has to recompile the shaders
@@ -4083,6 +4118,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(42, world_->elecPool),      // the charge field (raymarch elecPAt)
         b(43, world_->elecMeta),
         b(44, boltBuf_),              // the bolt table (boltfx.h)
+        b(45, horizonBuf_),           // the far horizon (horizon.h)
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");

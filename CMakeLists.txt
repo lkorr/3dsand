@@ -476,6 +476,9 @@ add_library(sandvox_core OBJECT
   src/sim/farfield.cpp
   src/sim/faredits.cpp
   src/sim/farplumes.cpp
+  # The far horizon: the map's height plane as a pyramid the raymarch draws
+  # past the cascades (render-only; docs/PLAN_map_v2.md H1).
+  src/sim/horizon.cpp
   src/sim/chunkstore.cpp
   # Material name tables in saves (rule-unification W1-D).
   src/sim/mattable.cpp

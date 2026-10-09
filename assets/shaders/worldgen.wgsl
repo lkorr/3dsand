@@ -5248,6 +5248,53 @@ fn farBlockerBitAt(topC : i32, cc : vec3<i32>, shift : u32, seed : u32) -> u32 {
   return farBlockerBand(y0, topC, btop, step);
 }
 
+// ---- PEAK PRESERVATION (map v2 H1, docs/PLAN_map_v2.md) ---------------------
+// A coarse cell is solid when its CENTRE sample is, so at levels 6-8 (6.4 to
+// 25.6 m cells) a summit or a knife ridge that passes between two sample
+// columns is shaved off the far field -- by up to a whole cell, which on a
+// 1,400 m massif seen from the valley is the difference between a peak and a
+// rounded hill. The blocker band above does not save it: blocker-only cells
+// are not drawn as primary hits (render.farBlockerHitLevel 0).
+//
+// So from FAR_PEAK_MIN_SHIFT up, the column's top is raised to the highest
+// AUTHORED HEIGHT POST inside the cell's footprint (at most 4 x 4 posts,
+// strided), and a cell whose centre sample is air but lies in (h, peak] takes
+// the column's ground paint: the biome's skin, or snow over the treeline.
+// Posts are the author's numbers (the summit IS a post on `peaks`), and a
+// pure function of the cell, so `far` and `fardown` -- both call this with
+// genColumn's own column -- write the same byte (the `far-downsample` gate).
+// The noise on top of the plane is not maximised (it is +-25 m against a
+// 25.6 m cell, and the centre sample keeps it). Outside the extent, or below
+// the minimum shift, the top is the column's own: nothing changes.
+const FAR_PEAK_MIN_SHIFT : u32 = 6u;
+fn farPeakTop(h : i32, ccx : i32, ccz : i32, shift : u32) -> i32 {
+  if (shift < FAR_PEAK_MIN_SHIFT || !wmHasHeight()) { return h; }
+  let l = wmHeightLog2();
+  let lo = wmExtentLo();
+  let sz = wmExtentSize();
+  let step = 1 << shift;
+  let x0 = ccx << shift;
+  let z0 = ccz << shift;
+  if (x0 < lo.x || z0 < lo.y || x0 + step > lo.x + sz.x || z0 + step > lo.y + sz.y) { return h; }
+  // The posts inside [x0, x0 + step) per axis (x0 - lo.x >= 0, so the shifts
+  // floor and the +mask rounds up).
+  let pm = (1 << l) - 1;
+  let i0 = (x0 - lo.x + pm) >> l;
+  let k0 = (z0 - lo.y + pm) >> l;
+  let i1 = (x0 + step - 1 - lo.x) >> l;
+  let k1 = (z0 + step - 1 - lo.y) >> l;
+  let st = max(1, (max(i1 - i0, k1 - k0) + 4) / 4);
+  var top = h;
+  for (var k = k0 + unrollFence(); k <= k1; k += st) {
+    for (var i = i0; i <= i1; i += st) { top = max(top, wmHeightPost(i, k)); }
+  }
+  return top;
+}
+// The paint of a cell the peak raised: the column's skin, snow over the line.
+fn farPeakMat(biome : u32, peak : i32) -> u32 {
+  return select(wmBiome(biome, WM_B_SKIN), M_SNOW, peak >= treeline());
+}
+
 var<workgroup> wgCount : atomic<u32>;
 var<workgroup> wgBlock : atomic<u32>;
 // Cells in this chunk that can ACT (matCanAct, common.wgsl). Third counter
@@ -6246,6 +6293,10 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
     var skyCeil = max(max(topC + step, btop), trees.top);
     skyCeil = max(skyCeil, max(col.h + skyMargin, max(col.pond + 1, col.plant.top)));
     if (wmFlag(col.biome, WM_BF_CACTI)) { skyCeil = max(skyCeil, cactusMaxTop()); }
+    // The peak the cell footprint's authored posts reach (farPeakTop): rows
+    // up to it are not sky either.
+    let peak = farPeakTop(col.h, cc0.x, cc0.z, shift);
+    skyCeil = max(skyCeil, peak);
     for (var yi = unrollFenceU(); yi < CHUNK; yi++) {
       // The row's floor.
       let yRow = (base.y + i32(yi)) << shift;
@@ -6265,6 +6316,9 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
         byteV = farCellByte(matFarPal(&materials, farSurfaceMat(&col, &ponds, mat, fine, shift,
                                                                 T.seed, FAR_GROUND_PROCGEN)),
                             byteV);
+      } else if (fine.y > col.h && fine.y <= peak) {
+        // A summit between the sample columns (farPeakTop).
+        byteV = farCellByte(matFarPal(&materials, farPeakMat(col.biome, peak)), byteV);
       }
       // farOcc counts NON-EMPTY cells, which now includes blocker-only ones —
       // it gates empty-space skipping for every far reader, and a reader that
@@ -6911,6 +6965,8 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
       var pponds : PondSet;
       var pcol = genColumn(fx, fz, T.seed, &pponds);
       let topC = farColTopFrom(pcol.h, pcol.fluidTop, fx, fz);
+      // The sieve's peak rule, on the same column (farPeakTop): same bytes.
+      let peak = farPeakTop(pcol.h, ccx, ccz, shift);
       for (var iy = 0; iy < n.y; iy++) {
         // fine-voxel sample point, and the level cell it belongs to
         let fine = vec3<i32>(fx, first.y + iy * step, fz);
@@ -6946,6 +7002,8 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
           byteV = farCellByte(matFarPal(&materials, farSurfaceMat(&pcol, &pponds, mat, fine,
                                                                   shift, T.seed, ground)),
                               byteV);
+        } else if (fine.y > pcol.h && fine.y <= peak) {
+          byteV = farCellByte(matFarPal(&materials, farPeakMat(pcol.biome, peak)), byteV);
         }
         let bi = farVoxByteIndex(level, cc);
         let bsh = (bi & 3u) * 8u;

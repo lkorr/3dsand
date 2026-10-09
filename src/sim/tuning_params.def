@@ -2487,6 +2487,14 @@ TP_B(render, dbgCurrentField, NO_WGSL, false)
 TP_B(render, asyncCompute, NO_WGSL, false)
 TP_V3(render, sunDir, NO_WGSL, 0.50f, 0.55f, 0.38f)
 TP_F(render, fogOpticalDepths, NO_WGSL, 4.5f, 0.5f, 20.0f)
+// The height fog (H1): per-frame RenderParams fields, so NO_WGSL -- a slider
+// move is live and recompiles nothing. Density per km at the sea plane, the
+// e-folding height in metres, and the blue share of a part-fogged surface.
+TP_F(render, fogSeaDensity, NO_WGSL, 0.2f, 0.0f, 20.0f)
+TP_F(render, fogScaleHeight, NO_WGSL, 1200.0f, 50.0f, 20000.0f)
+TP_F(render, fogHaze, NO_WGSL, 0.6f, 0.0f, 1.0f)
+// The far horizon's march (sim/horizon.h): RenderParams flag bit 7.
+TP_B(render, horizon, NO_WGSL, true)
 TP_F(render, fogLerpPerFrame, NO_WGSL, 0.08f, 0.005f, 1.0f)
 // 0 would stall a refill forever (the horizon would never come back) and
 // the top is the whole farList buffer, which is the dispatch's own limit.

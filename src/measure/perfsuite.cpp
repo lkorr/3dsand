@@ -2099,6 +2099,12 @@ const RenderArm kRenderArms[] = {
     {"nofar", "farSteps 384 -> 0",
      [](Tuning& t) { t.render.farSteps = 0; }, true, 1,
      "the far-field cascade march for rays that leave the fine window"},
+    // The far horizon (map v2 H1, sim/horizon.h): RenderParams bit 7, a
+    // runtime switch (the reload is a SPIR-V cache hit). baseline - nohorizon
+    // is the pyramid march + its shading for rays that leave the cascades.
+    {"nohorizon", "horizon on -> off",
+     [](Tuning& t) { t.render.horizon = false; }, true, 1,
+     "the far horizon march past the cascades (traceHorizon + shadeHorizon)"},
     // The far SURFACE MAP refine (LOD-seam package A). Off = every surface
     // cell is the plain centre-sampled cube again; baseline - norefine is what
     // the refine costs (map loads + the 2x2 sub-column test) on this camera.
@@ -3071,6 +3077,28 @@ bool CamSeam(Scene& s, uint32_t& tick, std::string&) {
 bool CamSeamVeg(Scene& s, uint32_t& tick, std::string&) {
   return CamSeamAt(s, tick, SeamVegPose());
 }
+// THE PEAKS SUMMIT (map v2 H1). On the `peaks` test map's 1,400 m summit
+// looking out over the range: the far cascade, the cascade-to-horizon seam,
+// the horizon past it and the height fog in one frame -- the camera the
+// horizon's < 1 ms budget is quoted on. LOADS THE PEAKS MAP and leaves it
+// loaded (the camera after it, if any, stands on peaks): put LAST.
+bool CamSummit(Scene& s, uint32_t& tick, std::string& why) {
+  if (worldmap::CurrentWorldMap().name != "peaks" &&
+      !SwitchMap(s.ctx, s.sim, s.mats, "peaks", nullptr, why)) {
+    return false;
+  }
+  const PeaksPose p = PeaksPoseOf(1);
+  s.stream.OnRegen();
+  CentreWindowOnEye(s.ctx, s.world, s.sim, p.ex, p.ey, p.ez, 120);
+  s.eye = {p.ex, p.ey, p.ez};
+  s.cam.yaw = p.yaw;
+  s.cam.pitch = p.pitch;
+  s.note = p.what;
+  tick = FindNoonTick(CurrentTuning());
+  return true;
+}
+const char* const kArmsSummit[] = {"baseline", "nohorizon", "nofar", "noshadow", nullptr};
+
 const char* const kArmsSeam[] = {
     "baseline", "noshadow", "nofar", "nogi", "nomicro", "halfres",
     // LOD-seam package A: the surface-map refine's cost, and the 20 m handoff
@@ -3112,6 +3140,9 @@ const BudgetCam kBudgetCams[] = {
     {"seamveg", "the same at the nearest meadow to the spawn: plants across "
                 "the seam",
      CamSeamVeg, kArmsSeam},
+    {"summit", "on the peaks map's 1,400 m summit looking out: cascade, "
+               "horizon and height fog (loads peaks; last)",
+     CamSummit, kArmsSummit},
 };
 constexpr int kBudgetCamCount =
     (int)(sizeof(kBudgetCams) / sizeof(kBudgetCams[0]));
@@ -4473,6 +4504,57 @@ IVec3 WindowCentreChunk(const World& world) {
   const IVec3 o = world.WindowOrigin();
   const int half = (int)kNChunk / 2;
   return {o.x + half, o.y + half, o.z + half};
+}
+
+PeaksPose PeaksPoseOf(int which) {
+  // scripts/gen_map_peaks.py's feature sites, world voxels.
+  constexpr int kSummitX = 9000, kSummitZ = 16000;
+  constexpr int kSpawnX = -12400, kSpawnZ = 13400;
+  const int sea = worldmap::CurrentWorldMap().seaLevelY;
+  auto ground = [&](int x, int z) {
+    return std::max(World::TerrainHeight(x, z, kDefaultSeed), sea);
+  };
+  PeaksPose p;
+  if (which == 0) {
+    p.ex = (float)kSpawnX;
+    p.ez = (float)kSpawnZ;
+    p.ey = (float)(ground(kSpawnX, kSpawnZ) + 17);
+    p.yaw = std::atan2((float)(kSummitZ - kSpawnZ), (float)(kSummitX - kSpawnX));
+    p.pitch = 0.10f;
+    p.what = "peaks: the high valley by the spawn, facing the massif 2.2 km ENE";
+  } else if (which == 1) {
+    // A few voxels off the very top, so the eye stands on the cone.
+    p.ex = (float)(kSummitX - 40);
+    p.ez = (float)(kSummitZ - 40);
+    p.ey = (float)(ground(kSummitX - 40, kSummitZ - 40) + 17);
+    p.yaw = -2.356f;   // SW: (-x, -z)
+    p.pitch = -0.10f;
+    p.what = "peaks: on the 1,400 m summit, facing SW over the range to the coast";
+  } else {
+    const int x = kSummitX, z = kSummitZ - 100000;   // 10 km south, offshore
+    p.ex = (float)x;
+    p.ez = (float)z;
+    p.ey = (float)(ground(x, z) + 30);
+    p.yaw = 1.5708f;   // +z: north
+    p.pitch = 0.06f;
+    p.what = "peaks: 3 m over the sea 10 km south of the summit, facing the massif";
+  }
+  return p;
+}
+
+bool SwitchMap(GpuContext& ctx, Simulation& sim, const std::vector<MaterialDef>& mats,
+               const std::string& name, std::string* prev, std::string& why) {
+  const std::string was = worldmap::ActiveMapName(CurrentTuning().world.mapLayer);
+  if (prev) *prev = was;
+  worldmap::SetMapOverride(name);
+  biomes::EnvironmentStamp stamp;
+  std::string log;
+  if (!ReloadEnvironment(ctx, sim, mats, stamp, log)) {
+    worldmap::SetMapOverride(was);
+    why = "map '" + name + "' did not load: " + log;
+    return false;
+  }
+  return true;
 }
 
 void CentreWindowOnEye(GpuContext& ctx, World& world, Simulation& sim,

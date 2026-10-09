@@ -4110,9 +4110,31 @@ struct Tuning {
     // depth budget spent across the filled cascade radius, and the per-frame
     // ease toward it. world.h kFogOpticalDepths/kFogLerpPerFrame are the same
     // numbers for the constexpr static pin the --shot harnesses use;
-    // main.cpp static_asserts the defaults agree.
+    // main.cpp static_asserts the defaults agree. Since H1 this term only
+    // HIDES an unfilled cascade (it is 0 once every level is filled); the air
+    // itself is the height fog below.
     float fogOpticalDepths = TPD(render, fogOpticalDepths);
     float fogLerpPerFrame = TPD(render, fogLerpPerFrame);
+    // ---- THE AIR: height-exponential fog (docs/PLAN_map_v2.md H1) ----
+    // Extinction per KILOMETRE at the sea plane; it falls off with altitude as
+    // exp(-(y - sea) / fogScaleHeight). Written into RenderParams per frame
+    // (WriteRenderParams, mist-scaled by the weather), so the sliders are
+    // live without a shader recompile. raymarch.wgsl aerialFrac integrates
+    // it exactly along each view ray; common.wgsl airFogFrac is the same law
+    // for the raster bodies and the gust streaks.
+    float fogSeaDensity = TPD(render, fogSeaDensity);
+    // Metres over which the density falls by e. ~1.2 km is the aerosol scale
+    // height of real air: a valley is hazy, a summit is clear.
+    float fogScaleHeight = TPD(render, fogScaleHeight);
+    // 0..1: how much of a partly-fogged surface's airlight is the deeper
+    // blue of the sky ABOVE its direction instead of the pale horizon band,
+    // which is what makes a peak 15 km off a blue silhouette rather than a
+    // grey one. Full fog still converges to exactly the sky in that direction.
+    float fogHaze = TPD(render, fogHaze);
+    // The far horizon (sim/horizon.h): the map's height pyramid marched past
+    // the cascades. false = rays that leave the cascades see sky, as before H1
+    // (the --render-budget `nohorizon` arm).
+    bool horizon = TPD(render, horizon);
 
     // ambient / diffuse
     float ambSky[3] = TPD_V3(render, ambSky);

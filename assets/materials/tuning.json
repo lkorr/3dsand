@@ -716,6 +716,10 @@
     "sunIntensity": 1.35,
     "fogOpticalDepths": 4.5,
     "fogLerpPerFrame": 0.08,
+    "fogSeaDensity": 0.2,
+    "fogScaleHeight": 1200,
+    "fogHaze": 0.6,
+    "horizon": true,
     "ambSky": [
       0.4,
       0.48,

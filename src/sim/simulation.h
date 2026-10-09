@@ -70,6 +70,11 @@ class Simulation {
   // worldgen reads the new tables the same way the first one read the old.
   void UploadEnvironment(const rhi::Device& device, const rhi::Queue& queue,
                          const TreeAtlas& trees, const std::vector<uint32_t>& worldMapWords);
+  // The far horizon's pyramid (sim/horizon.h) from worldmap::CurrentWorldMap()
+  // and the packed map words: built and uploaded (grow-only). Init and
+  // UploadEnvironment call it; render-only, so nothing the sim reads moves.
+  void UploadHorizon(const rhi::Device& device, const rhi::Queue& queue,
+                     const std::vector<uint32_t>& worldMapWords);
 
   // A dense (denseGen = true) worldgen reads the column cache like `list`
   // does, so the caller runs WriteGenList over every slot first
@@ -1233,6 +1238,13 @@ class Simulation {
   // points. 44 in renderBGL_ (fragment, read); CPU-written per frame by
   // boltfx::Upload while a bolt burns.
   rhi::Buffer boltBuf_;
+  // The far horizon's height pyramid (sim/horizon.h): 45 in renderBGL_
+  // (fragment, read). Built from the map at Init and every UploadEnvironment;
+  // grow-only. renderBGBuilt_ says the render bind groups exist yet (Init
+  // uploads the horizon before it builds them).
+  rhi::Buffer horizonBuf_;
+  size_t horizonWords_ = 0;
+  bool renderBGBuilt_ = false;
   // The GI gather request list (gi_gather.wgsl; pass_table.h kGiReq*): fixed
   // size, zeroed at Init (the dedup bitmap must start empty). 28 in
   // shadowBGL_ (compute), 39 in renderBGL_ (fragment, appends). giArgsBuf_ is

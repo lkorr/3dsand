@@ -410,6 +410,10 @@ fn pixelAngle() -> f32 { return 2.0 * R.tanHalfFov / max(R.viewPx, 1.0); }
 // zero: ONE dynamically uniform load a pixel, the whole cost of a frame with
 // no bolt (rule 2 for the render path).
 @group(0) @binding(44) var<storage, read> boltBuf : array<vec4f>;
+// ---- THE FAR HORIZON (H1; src/sim/horizon.h owns the layout, HZ_* below) ----
+// The map's height plane as a 2D max pyramid, written at load / environment
+// reload only. Header word 0 = 0: no pyramid, every horizon ray misses.
+@group(0) @binding(45) var<storage, read> horizon : array<u32>;
 const BOLT_ROW_GROUPS : u32 = 1u;
 const BOLT_ROW_LIGHTS : u32 = 129u;
 const BOLT_ROW_SEGS : u32 = 145u;
@@ -6794,13 +6798,14 @@ fn farVoxelAO(level : u32, cell : vec3<i32>, n : vec3<i32>, a1 : i32, a2 : i32,
 // ---- the fog fraction, split out so short-range mode can replace the ramp --
 // 0 = the surface is shown as shaded, 1 = it has dissolved entirely into the
 // sky in that direction. Every fogged path goes through here, so the two ramps
-// cannot disagree about what "fully fogged" means.
-fn aerialFrac(tFine : f32) -> f32 {
+// cannot disagree about what "fully fogged" means. `dirY` is the ray
+// direction's y (the height fog's integral needs the climb along the ray).
+fn aerialFrac(tFine : f32, dirY : f32) -> f32 {
   let dM = tFine * VOXEL_METERS;
   // ---- SHORT-RANGE MODE (RenderParams flag bit 2, arm in bit 4) ----
-  // The ordinary ramp is a global exponential pinned to the cascade radius: it
-  // starts thinning the image at the camera, which is right for kilometres of
-  // atmosphere and wrong for a 100 m wall. The dense-100 m engines this mode
+  // The ordinary ramp is the air (common.wgsl airFogTauS): it starts thinning
+  // the image at the camera, which is right for kilometres of atmosphere and
+  // wrong for a 100 m wall. The dense-100 m engines this mode
   // exists to compare against read as CLEAR up close and then close in over
   // the last third, so that is the curve here: nothing before the start
   // fraction, then 1 - exp(-k x^2) over the remainder.
@@ -6823,7 +6828,12 @@ fn aerialFrac(tFine : f32) -> f32 {
     return clamp((1.0 - exp(-TUNE_SHORT_RANGE_FOG_DENSITY * x * x)) / full,
                  0.0, 1.0);
   }
-  return 1.0 - exp(-dM * R.fogDensity);
+  // THE AIR (H1): the height fog integrated along this ray, plus the loading
+  // fog. Was 1 - exp(-dM * R.fogDensity) with the density pinned so the fog
+  // was ~99% at the cascade edge; the far horizon now draws past that edge
+  // and the fog is the atmosphere's, not the LOD's.
+  return 1.0 - exp(-airFogTauS(R.camPos.y, R.hfogDensity, R.hfogFalloff, R.hfogBaseY,
+                               R.fogDensity, dM, dirY));
 }
 
 // ---- THE CLOUDS, as the renderer sees them -----------------------------------
@@ -7191,14 +7201,27 @@ fn rainOverlay(colorIn : vec3f, rd : vec3f, tDepthVox : f32) -> vec3f {
 // surface hanging slightly darker than the sky it should dissolve into, which
 // read as a gray veil over the whole horizon instead of atmosphere.
 fn applyAerial(color : vec3f, rd : vec3f, tFine : f32) -> vec3f {
-  let f = aerialFrac(tFine);
+  let f = aerialFrac(tFine, rd.y);
   // Star-free sky. Aerial perspective is AIR between the eye and a SOLID
   // surface, so it must converge to the airglow in that direction and nothing
   // else. Using the full skyColor() here mixes the starfield, moon and
   // nebulae into distant terrain — which renders stars *through* hillsides,
   // trees and the ground near the horizon, because those surfaces are exactly
   // the ones carrying the most fog.
-  return mix(color, cloudySkyAirglow(rd), f);
+  var airlight = cloudySkyAirglow(rd);
+  // THE DISTANCE BLUE (H1, render.fogHaze). The horizon band of the sky is
+  // pale because it is the airlight of an INFINITE path; the airlight of a
+  // finite one -- a ridge 15 km off, part dissolved -- is the deeper blue of
+  // the sky higher up. So a part-fogged surface takes the airglow ~17 deg
+  // above its own direction, by a weight that is 0 at full fog: the far end
+  // still converges to exactly the sky in `rd` (the rule above), and the
+  // middle distance reads as a blue silhouette instead of a grey one. Skipped
+  // where the air has barely started (the near field, most of the screen).
+  if (R.fogHaze > 0.0 && f > 0.03) {
+    let up = normalize(vec3f(rd.x, max(rd.y, 0.0) + 0.3, rd.z));
+    airlight = mix(airlight, skyAirglow(up), R.fogHaze * (1.0 - f * f));
+  }
+  return mix(color, airlight, f);
 }
 
 // ============================================================================
@@ -13126,6 +13149,305 @@ fn traceTickets(ro : vec3f, rdIn : vec3f, tMin : f32, tMax : f32) -> FarHit {
   return out;
 }
 
+// ============================================================================
+// THE FAR HORIZON (H1, docs/PLAN_map_v2.md; DESIGN.md §9 "The far horizon")
+// ============================================================================
+// The cascades end at the outermost level's box, 6.55 km from the eye. Past
+// it, a ray that found nothing used to be sky -- so a 1,400 m massif 10 km off
+// did not exist. The world map's height plane does, on the CPU, and
+// src/sim/horizon.cpp turns it into a 2D pyramid at load: SAMPLES every 25.6 m
+// over the map extent and its edge fade (MAX effective surface in the low i16
+// -- the silhouette, sea included -- and AVG ground in the high i16), and a
+// CELL MAX pyramid over them. traceHorizon walks that pyramid from where the
+// ray leaves the level-8 box: a coarse cell the ray passes above is skipped
+// whole, so an ascending sky ray costs a compare or two and a grazing one a
+// few dozen cells. Past the grid the surface is flat (the sea, or the plane's
+// default if that is higher) and a ray hits it analytically.
+//
+// THE SURFACE: bilinear over the four samples of a level-0 cell, eased from
+// the AVG ground (sea-clamped) at the cascade edge to the MAX over the first
+// HZ_BLEND_M: the cascade's centre-sampled cells sit near the average, so the
+// horizon meets them without a lip and then keeps the ridges sharp (the MAX
+// pyramid bounds every blend, so the skip test stays exact).
+//
+// SHADED as a cascade cell is: the biome's skin (the material worldgen lays,
+// via the packed records), bare stone on slopes past ~45 deg, snow over the
+// map's treeline, the far water law under the sea; the far field's ambient,
+// sun and bounce; the cloud shadow; then the air (applyAerial). No sun
+// shadows (package S1). The normal is the AVG field's gradient at the level
+// whose cell matches the pixel footprint, so a 25 m sample 30 km off does not
+// alias into speckle.
+//
+// RENDER-ONLY: the pyramid is derived from the map and read by nothing else.
+const HZ_H_VALID : u32 = 0u;       // horizon.h kHValid ... (keep in step)
+const HZ_H_X0 : u32 = 1u;
+const HZ_H_Z0 : u32 = 2u;
+const HZ_H_NX : u32 = 3u;
+const HZ_H_NZ : u32 = 4u;
+const HZ_H_LOG2 : u32 = 5u;
+const HZ_H_LEVELS : u32 = 6u;
+const HZ_H_SEA_Y : u32 = 7u;
+const HZ_H_OUTER_Y : u32 = 8u;
+const HZ_H_TREELINE : u32 = 9u;
+const HZ_H_MAX_Y : u32 = 10u;
+const HZ_H_SAMPLES : u32 = 11u;
+const HZ_H_BIOME : u32 = 12u;
+const HZ_H_MAT_STONE : u32 = 13u;
+const HZ_H_MAT_SNOW : u32 = 14u;
+const HZ_H_MAT_WATER : u32 = 15u;
+const HZ_H_MIP : u32 = 16u;
+const HZ_H_SKIN : u32 = 32u;
+// RenderParams flag bit 7: render.horizon (WriteRenderParams).
+const RFLAG_HORIZON : u32 = 128u;
+// The walk's budget, in cell visits. A grazing ray over open sea descends
+// only near where it lands; a ray that runs out is sky, which is what it was
+// before the horizon existed.
+const HZ_MAX_STEPS : i32 = 192;
+// The farthest anything is drawn: the air is ~opaque well before this.
+const HZ_FAR_M : f32 = 120000.0;
+// The AVG -> MAX ease past the cascade edge, metres.
+const HZ_BLEND_M : f32 = 1500.0;
+// The level-8 cells within this many metres of the box face take the
+// horizon's paint, so the two representations meet in colour (hzSeamWeight).
+const HZ_SEAM_M : f32 = 900.0;
+
+fn hzI(w : u32) -> i32 { return bitcast<i32>(horizon[w]); }
+fn hzLo(w : u32) -> f32 { return f32(bitcast<i32>(w << 16u) >> 16u); }   // MAX
+fn hzHi(w : u32) -> f32 { return f32(bitcast<i32>(w) >> 16u); }          // AVG
+fn hzN() -> vec2<i32> { return vec2<i32>(hzI(HZ_H_NX), hzI(HZ_H_NZ)); }
+fn hzS() -> f32 { return f32(1u << horizon[HZ_H_LOG2]); }
+fn hzSea() -> f32 { return f32(hzI(HZ_H_SEA_Y)); }
+fn hzOrigin() -> vec2f { return vec2f(f32(hzI(HZ_H_X0)), f32(hzI(HZ_H_Z0))); }
+fn hzSampleW(c : vec2<i32>) -> u32 {
+  let n = hzN();
+  let q = clamp(c, vec2<i32>(0), n - vec2<i32>(1));
+  return horizon[horizon[HZ_H_SAMPLES] + u32(q.y * n.x + q.x)];
+}
+fn hzCellDims(l : u32) -> vec2<i32> {
+  let n = max(hzN() - vec2<i32>(1), vec2<i32>(1));
+  return (n + vec2<i32>((1 << l) - 1)) >> vec2<u32>(l);
+}
+fn hzCellW(l : u32, c : vec2<i32>) -> u32 {
+  let d = hzCellDims(l);
+  let q = clamp(c, vec2<i32>(0), d - vec2<i32>(1));
+  return horizon[horizon[HZ_H_MIP + l] + u32(q.y * d.x + q.x)];
+}
+// Bilinear over (h00, h10, h01, h11) at fraction f.
+fn hzBil(h : vec4f, f : vec2f) -> f32 {
+  return mix(mix(h.x, h.y, f.x), mix(h.z, h.w, f.x), f.y);
+}
+// The AVG ground (clamped up to `floorY`) at sample-space point p, bilinear on
+// level l's lattice: l < 0 the samples (lattice at integer p), l >= 0 the
+// level-l cells, whose centres sit at (i + 0.5) * 2^l.
+fn hzAvgAt(l : i32, p : vec2f, floorY : f32) -> f32 {
+  var q = p;
+  if (l >= 0) { q = p / f32(1 << u32(l)) - vec2f(0.5); }
+  let i = vec2<i32>(floor(q));
+  let f = q - floor(q);
+  var h : vec4f;
+  for (var k = 0; k < 4; k++) {
+    let c = i + vec2<i32>(k & 1, k >> 1);
+    var w : u32;
+    if (l < 0) { w = hzSampleW(c); } else { w = hzCellW(u32(l), c); }
+    h[k] = max(hzHi(w), floorY);
+  }
+  return hzBil(h, f);
+}
+
+struct HzHit { hit : bool, t : f32, p : vec2f };   // t fine voxels, p sample space
+
+// Where a ray leaves the level-8 box in XZ (fine voxels from the eye): the
+// horizon takes over there. The full box, not farBox's valid box -- a pending
+// face is the loading fog's to hide.
+fn hzStartT(ro : vec3f, rd : vec3f) -> f32 {
+  let s = f32(1u << farCellShift(FAR_LEVELS));
+  let lo = vec2f(F.origins[FAR_LEVELS - 1u].xz * i32(CHUNK)) * s;
+  let hi = lo + vec2f(f32(FAR_N) * s);
+  var tx = 1e30;
+  var tz = 1e30;
+  if (abs(rd.x) > 1e-7) { tx = (select(lo.x, hi.x, rd.x > 0.0) - ro.x) / rd.x; }
+  if (abs(rd.z) > 1e-7) { tz = (select(lo.y, hi.y, rd.z > 0.0) - ro.z) / rd.z; }
+  return max(min(tx, tz), 0.0);
+}
+
+fn traceHorizon(ro : vec3f, rd : vec3f, tStart : f32) -> HzHit {
+  var out : HzHit;
+  out.hit = false;
+  out.t = 0.0;
+  out.p = vec2f(0.0);
+  if (horizon[HZ_H_VALID] == 0u) { return out; }
+  let S = hzS();
+  let sea = hzSea();
+  let maxY = f32(hzI(HZ_H_MAX_Y));
+  // An ascending ray already over everything the map holds: sky. Most of the
+  // screen's sky pixels leave here.
+  if (rd.y >= 0.0 && ro.y + rd.y * tStart > maxY) { return out; }
+  // Everything below in SAMPLE units: T = t / S, positions (xz - origin) / S.
+  let T0 = tStart / S;
+  var T1 = HZ_FAR_M / (VOXEL_METERS * S);
+  if (rd.y > 1e-6) { T1 = min(T1, (maxY - ro.y) / (rd.y * S)); }
+  if (T1 <= T0) { return out; }
+  let o = (ro.xz - hzOrigin()) / S;
+  var d = rd.xz;
+  if (abs(d.x) < 1e-7) { d.x = select(-1e-7, 1e-7, d.x >= 0.0); }
+  if (abs(d.y) < 1e-7) { d.y = select(-1e-7, 1e-7, d.y >= 0.0); }
+  let inv = 1.0 / d;
+  let ySc = rd.y * S;   // fine y per unit T
+  let nMax = vec2f(hzN() - vec2<i32>(1));
+  let ta = -o * inv;
+  let tb = (nMax - o) * inv;
+  let tEn = max(max(min(ta.x, tb.x), min(ta.y, tb.y)), T0);
+  let tEx = min(min(max(ta.x, tb.x), max(ta.y, tb.y)), T1);
+  if (tEn < tEx) {
+    let L = i32(horizon[HZ_H_LEVELS]);
+    var lvl = L - 1;
+    var T = tEn;
+    for (var s = 0; s < HZ_MAX_STEPS; s++) {
+      if (T >= tEx) { break; }
+      let P = o + d * T;
+      let cs = f32(1 << u32(lvl));
+      let c = clamp(vec2<i32>(floor(P / cs)), vec2<i32>(0),
+                    hzCellDims(u32(lvl)) - vec2<i32>(1));
+      let lo = vec2f(c) * cs;
+      let tx = (select(lo.x, lo.x + cs, d.x > 0.0) - o.x) * inv.x;
+      let tz = (select(lo.y, lo.y + cs, d.y > 0.0) - o.y) * inv.y;
+      let Te = min(min(tx, tz), tEx);
+      let yA = ro.y + ySc * T;
+      let yB = ro.y + ySc * Te;
+      let eps = 1e-3 + T * 2e-6;
+      // The whole cell's surface is under the ray across it: skip it, and try
+      // the coarser level next (the cheap way back up the pyramid).
+      if (min(yA, yB) > hzLo(hzCellW(u32(lvl), c))) {
+        T = max(Te, T) + eps;
+        lvl = min(lvl + 1, L - 1);
+        continue;
+      }
+      if (lvl > 0) { lvl -= 1; continue; }
+      // ---- a level-0 cell: the bilinear surface between samples c .. c + 1 ----
+      let wB = clamp((T - T0) * S * VOXEL_METERS / HZ_BLEND_M, 0.0, 1.0);
+      let w00 = hzSampleW(c);
+      let w10 = hzSampleW(c + vec2<i32>(1, 0));
+      let w01 = hzSampleW(c + vec2<i32>(0, 1));
+      let w11 = hzSampleW(c + vec2<i32>(1, 1));
+      let hc = mix(max(vec4f(hzHi(w00), hzHi(w10), hzHi(w01), hzHi(w11)), vec4f(sea)),
+                   vec4f(hzLo(w00), hzLo(w10), hzLo(w01), hzLo(w11)), wB);
+      let cf = vec2f(c);
+      // y - surface along the segment: the first sign change, found on four
+      // sub-steps and refined by bisection (the bilinear is a quadratic in T;
+      // a dip shallower than a quarter cell is below what this distance shows).
+      var hitT = -1.0;
+      if (yA - hzBil(hc, P - cf) <= 0.0) {
+        hitT = T;   // the ray leaves the cascade already under the horizon
+      } else {
+        var tPrev = T;
+        for (var q = 1; q <= 4; q++) {
+          let tq = mix(T, Te, f32(q) * 0.25);
+          if ((ro.y + ySc * tq) - hzBil(hc, o + d * tq - cf) <= 0.0) {
+            var a = tPrev;
+            var b = tq;
+            for (var it = 0; it < 6; it++) {
+              let m = 0.5 * (a + b);
+              if ((ro.y + ySc * m) - hzBil(hc, o + d * m - cf) <= 0.0) { b = m; } else { a = m; }
+            }
+            hitT = b;
+            break;
+          }
+          tPrev = tq;
+        }
+      }
+      if (hitT >= 0.0) {
+        out.hit = true;
+        out.t = hitT * S;
+        out.p = o + d * hitT;
+        return out;
+      }
+      T = Te + eps;
+      lvl = min(lvl + 1, L - 1);
+    }
+  }
+  // Past the grid: the flat outer surface (the sea, or the plane's default
+  // where that is higher), analytically.
+  if (rd.y < 0.0) {
+    let Tp = (f32(hzI(HZ_H_OUTER_Y)) - ro.y) / ySc;
+    if (Tp >= T0 && Tp * S * VOXEL_METERS <= HZ_FAR_M) {
+      let P = o + d * Tp;
+      if (any(P < vec2f(0.0)) || any(P > nMax)) {
+        out.hit = true;
+        out.t = Tp * S;
+        out.p = P;
+      }
+    }
+  }
+  return out;
+}
+
+// The horizon's paint at sample-space point p, ground height y (fine voxels),
+// shading normal n: the biome's skin under the nearest sample, stone on steep
+// ground, snow over the treeline. Shared by the horizon hit and the level-8
+// seam blend, so the two meet in one colour.
+fn hzAlbedo(p : vec2f, y : f32, n : vec3f) -> vec3f {
+  let nn = hzN();
+  let c = clamp(vec2<i32>(round(p)), vec2<i32>(0), nn - vec2<i32>(1));
+  let idx = u32(c.y * nn.x + c.x);
+  let b = (horizon[horizon[HZ_H_BIOME] + (idx >> 2u)] >> ((idx & 3u) * 8u)) & 0xFFu;
+  var alb = paletteMean(materials[horizon[HZ_H_SKIN + b]]);
+  let tanS = sqrt(max(1.0 - n.y * n.y, 0.0)) / max(n.y, 0.05);
+  alb = mix(alb, paletteMean(materials[horizon[HZ_H_MAT_STONE]]), smoothstep(0.9, 1.5, tanS));
+  let tl = f32(hzI(HZ_H_TREELINE));
+  alb = mix(alb, paletteMean(materials[horizon[HZ_H_MAT_SNOW]]),
+            smoothstep(tl - 8.0, tl + 8.0, y));
+  return alb;
+}
+
+// A horizon hit, lit and fogged. The far field's lighting law (ambient on the
+// far openness, wrapped Lambert, the one-bounce closed form, the cloud
+// shadow) so a mountain past the cascade and one inside it are the same
+// mountain.
+fn shadeHorizon(hz : HzHit, rd : vec3f) -> vec3f {
+  let S = hzS();
+  let sea = hzSea();
+  let hitP = R.camPos + rd * hz.t;
+  // The normal's lattice: the pyramid level whose cell is about one pixel.
+  let fpS = hz.t * 2.0 * R.tanHalfFov / max(R.viewPx, 1.0) / S;
+  let l = clamp(i32(floor(log2(max(fpS, 1e-4)))), -1, i32(horizon[HZ_H_LEVELS]) - 1);
+  let e = 0.5 * select(f32(1 << u32(max(l, 0))), 1.0, l < 0);
+  let gx = (hzAvgAt(l, hz.p + vec2f(e, 0.0), sea) - hzAvgAt(l, hz.p - vec2f(e, 0.0), sea)) /
+           (2.0 * e * S);
+  let gz = (hzAvgAt(l, hz.p + vec2f(0.0, e), sea) - hzAvgAt(l, hz.p - vec2f(0.0, e), sea)) /
+           (2.0 * e * S);
+  let n = normalize(vec3f(-gx, 1.0, -gz));
+  var color : vec3f;
+  // Under the sea plane on average: open water, by the far field's own law.
+  if (hzAvgAt(-1, hz.p, -1e9) <= sea) {
+    color = shadeFarWater(hitP, rd, materials[horizon[HZ_H_MAT_WATER]], vec3f(0.0, 1.0, 0.0));
+  } else {
+    let albedo = hzAlbedo(hz.p, hitP.y, n);
+    let face = n.y * n.y + n.x * n.x * TUNE_FACE_X + n.z * n.z * TUNE_FACE_Z;
+    var lambert = wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP);
+    if (lambert > 0.0 && (R.weatherFlags & RWF_CLOUDS) != 0u) {
+      lambert *= cloudSunAt(hitP, keyLightDir(), &CL, &cloudMaps);
+    }
+    let open = farOpenness(n);
+    color = albedo * face *
+            (ambientOpen(ambientAt(n), opennessScale(open), open) + keyLightColor() * lambert);
+    if (TUNE_GI_STRENGTH > 0.0) { color += farGiBounce(albedo, n); }
+  }
+  return applyAerial(color, rd, hz.t);
+}
+
+// How much of a LEVEL-8 cascade hit takes the horizon's paint: 1 on the box
+// face, 0 from HZ_SEAM_M inside it. The cascade paints canopy, cover and the
+// noise's own skin variety that the horizon's one-biome-per-sample cannot, so
+// without this the colour would step where the two meet.
+fn hzSeamWeight(hitP : vec3f) -> f32 {
+  if ((R.flags & RFLAG_HORIZON) == 0u || horizon[HZ_H_VALID] == 0u) { return 0.0; }
+  let s = f32(1u << farCellShift(FAR_LEVELS));
+  let lo = vec2f(F.origins[FAR_LEVELS - 1u].xz * i32(CHUNK)) * s;
+  let hi = lo + vec2f(f32(FAR_N) * s);
+  let dEdge = min(min(hitP.x - lo.x, hi.x - hitP.x), min(hitP.z - lo.y, hi.y - hitP.z));
+  return 1.0 - smoothstep(0.0, HZ_SEAM_M / VOXEL_METERS, dEdge);
+}
+
 @fragment
 fn fs(in : VSOut) -> FSOut {
   // No per-pixel "dry" clear: a veil record is live only when its w6 names
@@ -13185,6 +13507,15 @@ fn fs(in : VSOut) -> FSOut {
       if (tk.hit) { far = tk; }
     }
   }
+  // THE FAR HORIZON (traceHorizon, above): what the cascades did not find, from
+  // where the ray leaves the level-8 box. Not in short-range mode (its ceiling
+  // is the point of the mode), and not when render.horizon is off.
+  var hz : HzHit;
+  hz.hit = false;
+  if (!h.hit && !h.saturated && !far.hit && (R.flags & RFLAG_HORIZON) != 0u &&
+      !(SPEC_SHORT_RANGE && (R.flags & 4u) != 0u)) {
+    hz = traceHorizon(R.camPos, rd, hzStartT(R.camPos, rd));
+  }
 
   // ---- coarse gas (docs/PLAN_gas_particles.md §2.5 + stage 1b) ------------
   // Stage 1 ran this only for rays that reached the outside, on the argument
@@ -13212,6 +13543,7 @@ fn fs(in : VSOut) -> FSOut {
     var tStop = 1e30;
     if (h.hit || h.saturated) { tStop = h.t; }
     else if (far.hit) { tStop = far.t; }
+    else if (hz.hit) { tStop = hz.t; }
     gasFarFill = gasOuterFill(R.camPos, rd, tStop, in.pos.xy);
   }
 
@@ -13310,6 +13642,8 @@ fn fs(in : VSOut) -> FSOut {
     tDepth = h.t;
   } else if (far.hit) {
     tDepth = far.t;
+  } else if (hz.hit) {
+    tDepth = hz.t;
   }
   // Liquid interface: nearest wins. `> 0.0` skips the underwater case (liqT
   // ~0 means the camera is already submerged, so there is no interface in
@@ -13489,6 +13823,15 @@ fn fs(in : VSOut) -> FSOut {
       // calmed independently if a coarser cascade ever needs it.
       if (smoothAlb.x >= 0.0) { albedo = mix(albedo, smoothAlb, wN); }
       albedo *= surfaceGrainFp(fineV, TUNE_GRAIN_AMP_FAR, voxPx);
+      // THE HORIZON SEAM (H1): the outermost level's cells near its box face
+      // ease into the far horizon's paint (hzAlbedo), so the cascade and the
+      // horizon past it meet in one colour rather than on a line.
+      if (flv == FAR_LEVELS && m.klass != CLASS_LIQUID) {
+        let wS = hzSeamWeight(hitP);
+        if (wS > 0.0) {
+          albedo = mix(albedo, hzAlbedo((hitP.xz - hzOrigin()) / hzS(), hitP.y, nSh), wS);
+        }
+      }
       // Burning foliage breathes toward the flame colour out here too, keyed
       // on the FINE cell so a leaf keeps its phase across the cascade seam.
       let bt = burnTint(m, albedo, f32(m.emission) / 255.0,
@@ -13666,6 +14009,9 @@ fn fs(in : VSOut) -> FSOut {
       }
       if (h.liqT <= 0.0) { color = applyAerial(color, rd, far.t); }
       else { color = applyAerial(color, rd, far.t - h.liqT); }
+    } else if (hz.hit) {
+      // The map past the cascades (shadeHorizon: lit and fogged there).
+      color = shadeHorizon(hz, rd);
     } else {
       // THE CLOUDS, over the sky they stand in front of, with the stars, the
       // moons and the sun disc all behind them — the z-order the SkyLayer
@@ -14291,7 +14637,7 @@ fn fs(in : VSOut) -> FSOut {
       // (-1 = none): 0 for a submerged eye, the interface otherwise.
       var veilT = -1.0;
       if (underwater && !mpmOwned) {
-        let sawSky = !h.hit && !h.saturated && !far.hit;
+        let sawSky = !h.hit && !h.saturated && !far.hit && !hz.hit;
         rsAdd(RS_PX_SUB, 1u);
         color = shadeSubmerged(R.camPos, rd, lm, h.liqPath, color, in.pos.xy,
                                sawSky);
@@ -14345,7 +14691,7 @@ fn fs(in : VSOut) -> FSOut {
       if (!underwater && caShadedLiquid && elecAnyCharge()) {
         let lp = elecPAt(liqCell);
         if (lp != 0u) {
-          color += elecGlow(liqCell, lp, hitP) * (1.0 - aerialFrac(h.liqT));
+          color += elecGlow(liqCell, lp, hitP) * (1.0 - aerialFrac(h.liqT, rd.y));
         }
       }
       if (SPEC_DEBUG_VIZ && (R.flags & RFLAG_ELECVIEW) != 0u && !underwater &&
@@ -14356,7 +14702,7 @@ fn fs(in : VSOut) -> FSOut {
       // covers a body under it exactly as it covers the bed.
       if (WATER_VEIL && veilT >= 0.0) {
         writeWaterVeil(in.pos.xy, veilT, h.liqPath, color,
-                       select(0.0, aerialFrac(veilT), veilT > 0.0));
+                       select(0.0, aerialFrac(veilT, rd.y), veilT > 0.0));
       }
     }
   }
@@ -14443,7 +14789,7 @@ fn fs(in : VSOut) -> FSOut {
       if (WATER_VEIL) {
         writeWaterVeil(in.pos.xy, select(mf.t, 0.0, mf.inside),
                        max(mf.thick, caPath), color,
-                       select(aerialFrac(mf.t), 0.0, mf.inside));
+                       select(aerialFrac(mf.t, rd.y), 0.0, mf.inside));
       }
     }
   }

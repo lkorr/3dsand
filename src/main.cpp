@@ -3068,6 +3068,37 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim,
       render({veg.ex, veg.ey, veg.ez}, 0.0f, 0.0f, "screenshot_seam_veg.bmp");
     }
   }
+  // ---- THE PEAKS VIEWS (map v2 H1: the far horizon + the height fog) -------
+  //   _valley  the high valley floor by the spawn, facing the massif
+  //   _summit  on the 1,400 m summit, facing SW over the range to the coast
+  //   _sea10k  3 m over the sea 10 km south of the summit, facing the massif:
+  //            the massif itself is PAST the cascades here (horizon only)
+  // On the `peaks` test map, loaded here and the harness map restored after,
+  // with the cameras placed explicitly (sandvox::PeaksPoseOf), not at the
+  // spawn. LAST and skipped whole unless one is wanted: a map reload and a
+  // worldgen + full far refill per view.
+  if (ShotWanted("screenshot_peaks_valley") || ShotWanted("screenshot_peaks_summit") ||
+      ShotWanted("screenshot_peaks_sea10k")) {
+    std::string prevMap, why;
+    if (!sandvox::SwitchMap(ctx, sim, mats, "peaks", &prevMap, why)) {
+      std::fprintf(stderr, "--shot: peaks views skipped: %s\n", why.c_str());
+    } else {
+      const char* names[3] = {"screenshot_peaks_valley.bmp", "screenshot_peaks_summit.bmp",
+                              "screenshot_peaks_sea10k.bmp"};
+      for (int v = 0; v < 3; v++) {
+        if (!ShotWanted(names[v])) continue;
+        const sandvox::PeaksPose p = sandvox::PeaksPoseOf(v);
+        std::printf("peaks view %d: eye (%.0f, %.0f, %.0f) yaw %.3f pitch %.3f -- %s\n", v,
+                    p.ex, p.ey, p.ez, p.yaw, p.pitch, p.what);
+        sandvox::CentreWindowOnEye(ctx, world, sim, p.ex, p.ey, p.ez, 120);
+        render({p.ex, p.ey, p.ez}, p.yaw, p.pitch, names[v]);
+      }
+      std::string back;
+      if (!sandvox::SwitchMap(ctx, sim, mats, prevMap, nullptr, back))
+        std::fprintf(stderr, "--shot: could not restore map '%s': %s\n", prevMap.c_str(),
+                     back.c_str());
+    }
+  }
   // A hazard report with no message pop is a hazard report that goes nowhere:
   // the debug messenger collects continuously, but only the F5-reload scope
   // pops. Print (and count) whatever this run gathered.
@@ -5507,7 +5538,7 @@ int main(int argc, char** argv) {
           "  --perf-out <path>     Where --perf writes its JSON\n"
           "  --perf-w/--perf-h <n> Offscreen render size for --perf/--render-budget\n"
           "  --render-budget       Where INSIDE the raymarch the GPU frame went\n"
-          "  --budget-cams <list>  --render-budget cameras (noon,dusk,cascade,submerged,meadow,canopy,fire,storm,village,seam,seamveg; default all)\n"
+          "  --budget-cams <list>  --render-budget cameras (noon,dusk,cascade,submerged,meadow,canopy,fire,storm,village,seam,seamveg,summit; default all)\n"
           "  --shader-stats        Per-shader registers/spills from the driver\n"
           "                        -> build/shader_stats.json (headless)\n\n"
           "Residency:\n"
@@ -15298,9 +15329,12 @@ int main(int argc, char** argv) {
       // filled, so a backlogged refill (spawn, load, teleport, sprinting past
       // a level's hysteresis) fogs out the pending bands instead of showing
       // sky holes through them. Clamped to [kFarFogDensity, kFarFogDensityMax]
-      // — never thinner than the full-horizon pin, never so thick that the
-      // residency window itself disappears — then eased so the horizon opens
-      // smoothly rather than stepping with each landed plane.
+      // — never so thick that the residency window itself disappears — then
+      // eased so the horizon opens smoothly rather than stepping with each
+      // landed plane. With NOTHING pending the target is kFarFogDensity (0
+      // since H1): the far horizon (sim/horizon.h) draws past the cascade
+      // edge, so the edge needs no fog, and the air is the height fog
+      // (RenderParams hfog*), which WriteRenderParams sets on its own.
       //
       // The budget and the ease are render.fogOpticalDepths /
       // render.fogLerpPerFrame (read here since 2026-09-24; they loaded into
@@ -15312,9 +15346,12 @@ int main(int argc, char** argv) {
                     "tuning_params.def fog defaults must match world.h's pins");
       const Tuning::Render& fogTun = CurrentTuning().render;
       const float fogScale = fogTun.fogOpticalDepths / kFogOpticalDepths;
-      float fogTarget = std::clamp(
-          fogTun.fogOpticalDepths / far.SafeRadiusMeters(),
-          kFarFogDensity * fogScale, kFarFogDensityMax * fogScale);
+      const float safeR = far.SafeRadiusMeters();
+      float fogTarget =
+          safeR >= kFarHalfExtentMeters(kFarLevels) * 0.999f
+              ? kFarFogDensity * fogScale
+              : std::clamp(fogTun.fogOpticalDepths / safeR, kFarFogDensity * fogScale,
+                           kFarFogDensityMax * fogScale);
       fogSmooth += (fogTarget - fogSmooth) * fogTun.fogLerpPerFrame;
       // ---- short range: the panel checkbox is the live authority ----------
       // Pushed into support.cpp rather than OR'd into extraFlags below so that
