@@ -987,8 +987,25 @@ var<private> gFragXY : vec2f = vec2f(0.0);
 // paths (dbgRec): 1 = side (0.5 near / 1 far), material id & 255 (GPU id =
 // materials.json index + 1), distance / 50 m; 2 = albedo luma, shadow, AO;
 // 3 = openness, lit lambert, raw lambert; 4 = pre-aerial colour luma / 2,
-// bounce luma x 4, face weight. 0 = off and const-folded away.
+// bounce luma x 4, face weight. WATER (2026-10-10, the sea's seam; the
+// water surface pixels of both paths, shadeWater / shadeFarWater): 5 = side
+// (0.5 near / 1 far), surface distance / 50 m, Fresnel; 6 = refracted luma,
+// reflection luma / 2, bed lit luma / 2; 7 = foam, pre-aerial colour luma / 2,
+// path to the bed / 30 m. 8 = a far hit's level / 8, liquid, refined (0.5 a
+// feature) -- which representation drew a distant pixel. 0 = off and
+// const-folded away.
 const SEAM_DBG : u32 = 0u;
+// The water frames' terms (SEAM_DBG 5-7), set by both water shades.
+var<private> gDbgW0 : vec4f = vec4f(0.0);   // side, distance (vox), fresnel, foam
+var<private> gDbgW1 : vec4f = vec4f(0.0);   // refracted, reflection, lit, pre-aerial (luma)
+var<private> gDbgWPath : f32 = 0.0;          // metres of water to the bed
+fn dbgWater(fres : f32, refr : vec3f, refl : vec3f, lit : vec3f, pathM : f32) {
+  if (SEAM_DBG >= 5u && SEAM_DBG <= 7u) {
+    gDbgW0.z = fres;
+    gDbgW1 = vec4f(dbgLum(refr), dbgLum(refl), dbgLum(lit), gDbgW1.w);
+    gDbgWPath = pathM;
+  }
+}
 const SEAM_HANDOFF : f32 = TUNE_LOD_HANDOFF_DIST;
 var<private> gDbg : vec4f = vec4f(0.0);
 fn dbgLum(c : vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
@@ -9016,15 +9033,13 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
   let hx1 = liquidColumn(cell + vec3<i32>( 1, 0, 0), mat);
   let hz0 = liquidColumn(cell + vec3<i32>(0, 0, -1), mat);
   let hz1 = liquidColumn(cell + vec3<i32>(0, 0,  1), mat);
-  var slope = vec2f((hx0 - hx1) * 0.5, (hz0 - hz1) * 0.5);
+  let slope = vec2f((hx0 - hx1) * 0.5, (hz0 - hz1) * 0.5);
 
-  // Ripples on top of the macro slope, in world metres.
-  let pm = vec2f(hitP.x, hitP.z) * VOXEL_METERS;
+  // Ripples on top of the macro slope, in world metres (waterWaveNormal).
   // Damping is applied PER WAVE against its own wavelength inside
   // rippleSlope() — a 2.6 m swell stays visible long after 0.4 m chop has
-  // averaged out, which is what gives distance a sense of scale. `gain` here
-  // is just the footprint handed down (see waterRippleFootprint).
-  let gain = waterRippleFootprint(hitP);
+  // averaged out, which is what gives distance a sense of scale; the
+  // footprint handed down is waterRippleFootprint's.
   // Ripple slope is metres-of-height per metre — same units as `slope` above
   // (voxels per voxel), so they add directly.
   //
@@ -9037,11 +9052,7 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
   // field: depth sets each octave's speed and its shoaling, and the current
   // advects the phase so a drifting surface reads as drifting. Both are
   // measured HERE, at the surface hit, and nowhere else in the march.
-  let depthM = waterDepthM(cell, mat);
-  let flowMS = currentAt(hitP, &R).xz * VOXEL_METERS;
-  slope += waveSlope(pm, R.time, gain, depthM, flowMS) *
-           waterOpenness(cell, mat);
-
+  //
   // W3 (PLAN_water_relevel.md §5). The SIM's own surface momentum, tilting the
   // normal DOWN-FLOW: a column whose pipes are running toward +x has water
   // piling away from us that way, so the surface leans with it. This is the
@@ -9049,10 +9060,67 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
   // eighths and cannot express a tilt smaller than one, which is exactly the
   // range a ring spends most of its life in. Additive and small: the Gerstner
   // field stays the texture, this is the body underneath it.
-  slope += waveFluxAt(cell) * TUNE_WAVE_SIM_SLOPE;
+  return waterWaveNormal(hitP, slope, waterDepthM(cell, mat), waterOpenness(cell, mat),
+                         waveFluxAt(cell));
+}
 
+// ---- THE WATER SURFACE LAW, SHARED BY THE NEAR AND THE FAR FIELD ----------
+// (2026-10-10, the sea's LOD seam.) shadeWater (a window hit) and
+// shadeFarWater (a cascade hit) are ONE surface seen through two sets of
+// data, and every term below is called by both, so the only thing that may
+// differ across the 20.5 m handoff is an INPUT: the window measures the
+// macro slope, the fetch and the sim's flux from voxels; the cascade has
+// none of those (0, open, 0) and takes its depth and path from farWaterBed.
+// A term added to one side and not the other is the seam coming back.
+//
+// The wave normal: the macro slope plus the Gerstner field (depth -> speed
+// and shoaling, the analytic current -> drift, scaled by fetch) plus the
+// sim's flux. `depthM` is the VERTICAL water depth under the hit, metres.
+fn waterWaveNormal(hitP : vec3f, macroSlope : vec2f, depthM : f32, openness : f32,
+                   flux : vec2f) -> vec3f {
+  let pm = vec2f(hitP.x, hitP.z) * VOXEL_METERS;
+  let flowMS = currentAt(hitP, &R).xz * VOXEL_METERS;
+  var slope = macroSlope +
+              waveSlope(pm, R.time, waterRippleFootprint(hitP), depthM, flowMS) * openness;
+  slope += flux * TUNE_WAVE_SIM_SLOPE;
   return normalize(vec3f(-slope.x, 1.0, -slope.y));
 }
+// Schlick on WATER_F0, scaled by the liquid's optics, faded on a partial
+// surface cell and halved on a side wall.
+fn waterFresnel(n : vec3f, v : vec3f, opticsFresnel : f32, surfFull : f32,
+                upFacing : bool) -> f32 {
+  let cosI = clamp(dot(n, v), 0.0, 1.0);
+  var fres = WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - cosI, TUNE_WATER_FRESNEL_POWER);
+  fres *= opticsFresnel;
+  fres *= mix(0.35, 1.0, surfFull);
+  if (!upFacing) { fres *= 0.5; }
+  return fres;
+}
+// The sun / moon glint on the rippled normal (shadeWater's note says why the
+// lobe stays tight with distance).
+fn waterGlint(n : vec3f, v : vec3f, hitP : vec3f, fres : f32) -> vec3f {
+  let hv = normalize(keyLightDir() + v);
+  let distM = length(hitP - R.camPos) * VOXEL_METERS;
+  let power = mix(TUNE_GLINT_POWER_NEAR, TUNE_GLINT_POWER_FAR, clamp(distM / 40.0, 0.0, 1.0));
+  let spec = pow(max(dot(n, hv), 0.0), power);
+  let glintTint = normalize(keyLightColor() + vec3f(1e-4)) * 1.732;
+  return glintTint * min(spec, 1.0) * TUNE_GLINT_INTENSITY * (0.25 + fres);
+}
+// The foam weight: shallow PATH (`pathM`, the ray's metres of water to the
+// bed), the analytic current's convergence and the sim's flux (`simFoam`,
+// 0 where there is no record), masked by the ripple field.
+fn waterFoam(hitP : vec3f, pathM : f32, simFoam : f32) -> f32 {
+  let shallow = 1.0 - smoothstep(0.0, TUNE_FOAM_DEPTH, pathM);
+  let conv = currentConvergeAt(hitP, &R) * VOXEL_METERS;   // per second
+  let flowFoam = clamp((conv - TUNE_WAVE_FOAM_THRESHOLD) * TUNE_WAVE_FOAM_GAIN, 0.0, 1.0);
+  let amount = max(max(shallow, flowFoam), simFoam);
+  if (amount <= 0.0) { return 0.0; }
+  let pm = vec2f(hitP.x, hitP.z) * VOXEL_METERS;
+  let rs = rippleSlope(pm, R.time, 0.0);
+  let mask = smoothstep(0.010, 0.055, length(rs));
+  return amount * mask * TUNE_FOAM_STRENGTH;
+}
+const WATER_FOAM_COLOR : vec3f = vec3f(0.92, 0.95, 0.97);
 
 // Sky-only reflection fallback plus a horizon-grounded haze, used when a
 // reflected ray finds nothing. A raw skyColor() lookup below the horizon
@@ -10269,24 +10337,20 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   if (underwater) { n = -n; }   // seen from below, the interface faces down
 
   let v = -rd;                                  // toward the eye
-  let cosI = clamp(dot(n, v), 0.0, 1.0);
 
-  // ---- Fresnel (Schlick) ----
+  // ---- Fresnel (Schlick, waterFresnel) ----
   // The single most important term. At 2% head-on and ~100% at grazing, this
   // is what makes water look wet: you see THROUGH it at your feet and see the
   // SKY in it at the far shore, across one continuous surface.
-  var fres = WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - cosI, TUNE_WATER_FRESNEL_POWER);
   // Murky liquids (oil, acid, blood) are dielectrics too but far more
   // absorbing; they get the same interface with a muted reflection so they
   // read as their own substance rather than all becoming "water". The one
   // liquid optics model decides how much (liquidOptics: fresnel, clear).
-  let optics = liquidClearBlend(liquidOptics(m), WATER_ABSORB, WATER_SCATTER);
-  fres *= optics.fresnel;
   // A partially-filled surface cell is a thin film / spray, not a mirror:
-  // fade the specular interface out with fullness so a 1/8 puddle skin doesn't
-  // reflect the sky as hard as a lake does.
-  fres *= mix(0.35, 1.0, surfFull);
-  if (!upFacing) { fres *= 0.5; }   // side walls: glancing, but not mirrors
+  // the interface fades with fullness so a 1/8 puddle skin doesn't reflect
+  // the sky as hard as a lake does; side walls: glancing, but not mirrors.
+  let optics = liquidClearBlend(liquidOptics(m), WATER_ABSORB, WATER_SCATTER);
+  let fres = waterFresnel(n, v, optics.fresnel, surfFull, upFacing);
 
   // ---- transmitted light: per-channel Beer-Lambert ----
   // Depth in METRES, so the look is independent of voxel size. Absorption is
@@ -10379,6 +10443,7 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
 
   var color = mix(refracted, reflection, fres);
   gVK = vec3f(1.0 - fres);
+  dbgWater(fres, refracted, reflection, lit, depthM);
 
   // ---- sun glint ----
   // Sharp Blinn-Phong lobe on the RIPPLED normal. This is what turns a
@@ -10388,22 +10453,12 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   if (upFacing && !underwater) {
     // Key light, so a moonlit lake gets a moon track instead of staying flat
     // black at night — a still lake under a full moon is one of the strongest
-    // night-lighting cues there is.
-    let kd = keyLightDir();
-    let hv = normalize(kd + v);
-    // Roughen the lobe with distance to match the ripple damping in
-    // waterNormal(): those flattened far normals would otherwise all agree and
-    // collapse the sparkle into one hard mirror disc. Widening the lobe as the
-    // ripples fade spreads that energy back out into a glitter path, which is
-    // what a real sun track on water looks like.
-    let distM = length(hitP - R.camPos) * VOXEL_METERS;
+    // night-lighting cues there is (waterGlint).
     // Keep the lobe TIGHT with distance rather than widening it. Widening it
     // was wrong: as the ripple damping flattens the far normals they all agree,
     // and a broad lobe over agreeing normals integrates into one blown-out
     // white slab across the sun track instead of a glitter path. A narrow lobe
     // on flat water gives a small bright highlight, which is correct.
-    let power = mix(TUNE_GLINT_POWER_NEAR, TUNE_GLINT_POWER_FAR, clamp(distM / 40.0, 0.0, 1.0));
-    let spec = pow(max(dot(n, hv), 0.0), power);
     // Modulated by Fresnel so the glint follows the same angular law as the
     // reflection instead of floating on top of it. Capped: the highlight is a
     // bloom cue, not a light source, and letting it run to 2.6x saturates a
@@ -10411,8 +10466,8 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // underneath it.
     // Tinted by the key light so the track is amber at sunset and cold blue
     // under the moon, matching whatever is actually casting it.
-    let glintTint = normalize(keyLightColor() + vec3f(1e-4)) * 1.732;
-    color += glintTint * min(spec, 1.0) * TUNE_GLINT_INTENSITY * (0.25 + fres);
+    let gl = waterGlint(n, v, hitP, fres);
+    color += gl;
   }
 
   // ---- shoreline foam ----
@@ -10422,7 +10477,6 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // ring, sells the boundary between water and land far better than the hard
   // color step it replaces.
   if (upFacing && !underwater) {
-    let shallow = 1.0 - smoothstep(0.0, TUNE_FOAM_DEPTH, depthM);
     // FOAM ON CONVERGENCE LINES (plan component 9). Surface water piles up
     // where the flow converges — the inflow line of a drain, the seam where a
     // jet's outward spread meets the bank — and that is where the froth
@@ -10430,30 +10484,26 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // without storing anything: currentConvergeAt is four evaluations of a
     // function that early-outs to one compare where there is no current, so a
     // still lake pays nothing for this.
-    let conv = currentConvergeAt(hitP, &R) * VOXEL_METERS;   // per second
-    let flowFoam = clamp((conv - TUNE_WAVE_FOAM_THRESHOLD) * TUNE_WAVE_FOAM_GAIN,
-                         0.0, 1.0);
     // W3 (PLAN_water_relevel.md §5): FOAM WHERE |q| IS HIGH. The shoreline term
     // above is about DEPTH and the convergence term about the analytic current;
     // this one is about the sim's own pipes, so a ring travelling across deep
     // still water — which neither of the other two can see — carries froth on
     // its front. max() rather than a sum, like the two already here: three
     // reasons to foam are not three times the foam.
+    // The shallow-path term, the current's convergence and this flux, max()'d
+    // in waterFoam; the ripple field (undamped: foam is a shoreline feature
+    // and damping it would dissolve the far shore's foam line) is the mask so
+    // the foam moves with the waves.
     let simFoam = clamp(length(waveFluxAt(cell)) * TUNE_WAVE_SIM_FOAM, 0.0, 1.0);
-    let amount = max(max(shallow, flowFoam), simFoam);
-    if (amount > 0.0) {
-      let pm = vec2f(hitP.x, hitP.z) * VOXEL_METERS;
-      // reuse the ripple field as the foam mask so foam moves with the waves
-      // (undamped: foam is a shoreline feature, always near the camera, and
-      // damping it would dissolve the far shore's foam line)
-      let s = rippleSlope(pm, R.time, 0.0);
-      let mask = smoothstep(0.010, 0.055, length(s));
-      let foamA = amount * mask * TUNE_FOAM_STRENGTH;
-      color = mix(color, vec3f(0.92, 0.95, 0.97), foamA);
+    let foamA = waterFoam(hitP, depthM, simFoam);
+    if (foamA > 0.0) {
+      color = mix(color, WATER_FOAM_COLOR, foamA);
       gVK *= 1.0 - foamA;
+      if (SEAM_DBG >= 5u) { gDbgW0.w = foamA; }
     }
   }
 
+  if (SEAM_DBG >= 5u) { gDbgW1.w = dbgLum(color); }
   return color;
 }
 
@@ -12943,103 +12993,178 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
 // and no new data. All three run only on far hits, after traceFar has
 // returned, so nothing here is live across a march loop.
 
-// ---- far WATER: shadeWater's surface, without the bed ----
-// The cascade used to paint a lake flat colour0 + 35% airglow, lit like rock.
-// Near water at the seam is almost none of that: seen from eye height 25 m out
-// the view is ~4 degrees off grazing, where Schlick puts the reflection at
-// ~70% of the pixel, and the refracted remainder is a column so long (the ray
-// runs ~15x the depth before it meets the bed) that Beer-Lambert has taken the
-// bed away and left the body's in-scatter. So the far arm is exactly
-// shadeWater's up-facing, bed-less limit:
-//   * the SAME normal law — waveSlope's deep-water field with the SAME
-//     screen-footprint damping (waterRippleFootprint), so at the seam both
-//     sides carry the same surviving swell bands (the 2.6/1.7 m ones; chop
-//     is already averaged out there by the per-band Nyquist fade);
-//   * the SAME Fresnel (Schlick on WATER_F0 = 0.0204, render.waterFresnelPower,
-//     scaled by the liquid's optics.fresnel), against reflectionSky — the
-//     near field's fallback when its reflected ray finds nothing, which over an
-//     open lake is what it finds;
-//   * refracted = the body's in-scatter (trans -> 0 over the long column),
-//     through liquidClearBlend so a murky liquid keeps its own colour;
-//   * the sun glint with the near field's far lobe power.
-// (Seen from ABOVE the bed would matter; a probe for it was tried and removed —
-// see DESIGN.md §9, far water.)
-// What it does NOT reproduce: shoreline foam, the traced reflection of the
-// far shore, caustics. All three are near-shore, near-camera features; none
-// survives 25 m of grazing view as more than a few pixels.
+// ---- far WATER: shadeWater's surface law on the cascade's data ----
+// The cascade used to paint a lake flat colour0 + 35% airglow, lit like rock;
+// then (LOD-seam package D) shadeWater's bed-less limit; then (ticket
+// 2026-10-09_14-57-40) that limit over a bed found by a column walk. Since
+// 2026-10-10 it is shadeWater ITSELF, term for term: the normal, the
+// Fresnel, the glint and the foam are the shared functions beside
+// waterWaveNormal, and the body is the same Beer-Lambert column over the bed
+// with the same caustic on it. What the cascade cannot measure is passed as
+// the input the near field would have measured on open water: no macro
+// slope, full fetch, no sim flux, a full surface cell, reflectionSky for the
+// traced reflection (an open lake's reflected ray finds nothing to hit).
+//
+// THE SEAM IT CLOSED (measured, same pixels shaded both ways, SEAM_HANDOFF
+// at 8 m, a shallow shelf at noon): far water +7.6/255 luma over near. The
+// normal and Fresnel already agreed; the refracted term was 1.8x the near
+// one because the column walk measured the water STRAIGHT DOWN from the hit
+// and divided by the ray's slope, a flat-bed estimate, where the near ray
+// meets the bed it actually reaches -- on a shelf that deepens away from the
+// eye, 2.6x further along (4.6 m of path against 12.2 m). farWaterBed now
+// follows the ray, as trace() does, and the bed is lit through the caustic
+// web the near bed wears (veilCaustic only ever brightens, so a bed without
+// it reads darker than the near one).
+//
 // A far water top face is a CASCADE CELL TOP (20 cm at level 1), not the
 // fullness plane, so the waterline can sit up to one fine voxel off the near
 // field's across the seam — a geometry matter, package A's surface map.
 // Returned UNFOGGED: the caller applies applyAerial like every far hit.
-// ---- THE BED UNDER FAR WATER (ticket 2026-10-09_14-57-40) ----
-// The near field sees a lake bed through shadeWater's Beer-Lambert column;
-// the far field used to paint every water cell as the bottomless in-scatter
-// colour. So at every handoff a shallow shore went from see-through to opaque
-// on a circle, and a near ray whose bed lay PAST the fine march's end was
-// worse: its column stopped at the sphere, so it read ~no water, saw the far
-// water cell's paint as its "bed" and the shallow-foam rule drew a white rim
-// along the arc. ONE depth model now serves both sides: from a point in or on
-// far water, walk the level's column down to the first non-liquid cell and
-// return the bed's lit colour (rgb) and the ray's path to it (w, fine voxels).
-// The column walk stops at the depth that cannot matter any more — trace()'s
-// own 24 m-of-path cap, projected onto this ray — and reports that cap as the
-// path, which is "deep" to every caller (trans ~ 0).
+//
+// ---- THE BED UNDER FAR WATER ----
+// From a point on (or in) far water: `path` = the ray's fine voxels of water
+// to the first non-liquid cell ALONG THE RAY in this level, `lit` = that
+// bed's lit colour, `depth` = the vertical water depth under the point (fine
+// voxels) for the wave law's shoaling and shore fade, as waterDepthM gives
+// the near normal. The ray march steps one cell, then grows by a quarter of
+// the distance walked (the bed's distance matters to Beer-Lambert to ~10%,
+// not to the voxel), and bisects the last step three times. It stops at
+// FAR_WATER_PATH_MAX_M -- trace()'s own cap -- and reports that as the path,
+// which every caller reads as deep (trans ~ 0, lit unused).
 const FAR_WATER_PATH_MAX_M : f32 = 24.0;
-fn farWaterBed(level : u32, p : vec3f, rd : vec3f) -> vec4f {
+// The vertical probe's reach (metres): the shore fade ends at
+// render.waveShoreDepth (0.45 m) and tanh(k h) has saturated for every band
+// past ~1.5 m, so 2 m is "deep" to the wave law.
+const FAR_WATER_DEPTH_PROBE_M : f32 = 2.0;
+struct FarBed {
+  lit   : vec3f,
+  path  : f32,
+  depth : f32,
+}
+fn farBedDeep() -> FarBed {
+  var r : FarBed;
+  r.lit = vec3f(0.0);
+  r.path = FAR_WATER_PATH_MAX_M / VOXEL_METERS;
+  r.depth = FAR_WATER_DEPTH_PROBE_M / VOXEL_METERS;
+  return r;
+}
+fn farWaterLiquidAt(level : u32, box : FarBox, p : vec3f, s : f32) -> u32 {
+  // 0 = air / outside (no bed this way), 1 = liquid, 2 = a bed (its mat in
+  // the high bits).
+  let c = vec3<i32>(floor(p / s));
+  if (!farInValid(c, box)) { return 0u; }
+  let mat = farMatAt(level, c);
+  if (mat == 0u) { return 0u; }
+  if (materials[mat].klass == CLASS_LIQUID) { return 1u; }
+  return 2u | (mat << 2u);
+}
+fn farWaterBed(level : u32, p : vec3f, rd : vec3f) -> FarBed {
+  var r = farBedDeep();
   let s = f32(1u << farCellShift(level));
   let box = farBox(level);
-  let ry = max(-rd.y, 0.05);
-  let maxV = FAR_WATER_PATH_MAX_M / VOXEL_METERS;
-  let nMax = min(i32(ceil(maxV * ry / s)) + 1, 64);
-  var c = vec3<i32>(floor(p / s));
-  for (var i = 0; i < nMax; i++) {
-    c.y -= 1;
+  // Vertical depth (the wave law's input).
+  let nV = min(i32(ceil(r.depth / s)), 16);
+  let c0 = vec3<i32>(floor(p / s));
+  for (var i = 1; i <= nV; i++) {
+    let c = c0 - vec3<i32>(0, i, 0);
     if (!farInValid(c, box)) { break; }
     let mat = farMatAt(level, c);
-    if (mat == 0u) { break; }   // air under water: no bed to show
-    let bm = materials[mat];
-    if (bm.klass != CLASS_LIQUID) {
-      let depthV = max(p.y - f32(c.y + 1) * s, 0.0);
-      let up = vec3f(0.0, 1.0, 0.0);
-      let lit = paletteMean(bm) *
-                (ambientOpen(ambientAt(up), opennessScale(1.0), 1.0) +
-                 keyLightColor() * wrapDiffuse(dot(up, keyLightDir()), TUNE_DIFFUSE_WRAP));
-      return vec4f(lit, min(depthV / ry, maxV));
+    if (mat == 0u || materials[mat].klass != CLASS_LIQUID) {
+      r.depth = clamp(p.y - f32(c.y + 1) * s, 0.0, r.depth);
+      break;
     }
   }
-  return vec4f(0.0, 0.0, 0.0, maxV);
+  // The path along the ray.
+  let maxV = r.path;
+  var t0 = 0.0;
+  var t = 0.5 * s;
+  var hitK = 0u;
+  var inWater = false;
+  for (var k = 0; k < 40; k++) {
+    if (t >= maxV) { break; }
+    let q = farWaterLiquidAt(level, box, p + rd * t, s);
+    // AIR BEFORE THE FIRST LIQUID SAMPLE is the cell the hit is IN, not a
+    // hole under the water: a refined hit (the surface map draws the water
+    // top at the column's exact height) lies inside the AIR cell over the
+    // cascade's water, and the march walks out of it first. Air after the
+    // water, or leaving the level: no bed shows this way.
+    if (q == 0u) {
+      if (inWater || (p.y - (p + rd * t).y) > s) { return r; }
+    } else if (q != 1u) {
+      hitK = q;
+      break;
+    } else {
+      inWater = true;
+    }
+    t0 = t;
+    t += max(s, t * 0.25);
+  }
+  if (hitK == 0u) { return r; }
+  for (var b = 0; b < 3; b++) {
+    let tm = 0.5 * (t0 + t);
+    let q = farWaterLiquidAt(level, box, p + rd * tm, s);
+    // Air inside the bracket can only be the hit's own air cell (above).
+    if (q <= 1u) { t0 = tm; } else { t = tm; hitK = q; }
+  }
+  // THE BED IS LIT BY THE FAR TERRAIN'S LAW on the face the ray entered
+  // (the last water cell to the bed cell): its face weight, farOpenness and
+  // farGiBounce, as a cascade hit on dry ground of that orientation is. A
+  // grazing ray through shallow water sees mostly the RISERS of the bed's
+  // staircase (measured at the shelf camera: median raw Lambert 0.23, a side
+  // face at noon), and an up-facing sunlit closed form drew them 4x brighter
+  // than the near bed. Not reproduced: the bed's cast and contact shadows
+  // (the near bed's median shadow there was 0.36) and its AO.
+  let bm = materials[hitK >> 2u];
+  let d = vec3<i32>(floor((p + rd * t) / s)) - vec3<i32>(floor((p + rd * t0) / s));
+  var axis = 2;
+  if (d.y != 0) { axis = 1; } else if (d.x != 0) { axis = 0; }
+  let nb = axisVec(axis, -sign(axisPick(rd, axis)));
+  var face = 1.0;
+  if (axis == 0) { face = TUNE_FACE_X; } else if (axis == 2) { face = TUNE_FACE_Z; }
+  let ob = farOpenness(nb);
+  let albedo = paletteMean(bm);
+  r.lit = albedo * face *
+          (ambientOpen(ambientAt(nb), opennessScale(ob), ob) +
+           keyLightColor() * wrapDiffuse(dot(nb, keyLightDir()), TUNE_DIFFUSE_WRAP));
+  if (TUNE_GI_STRENGTH > 0.0) { r.lit += farGiBounce(albedo, nb); }
+  r.path = min(0.5 * (t0 + t), maxV);
+  return r;
 }
 
-// `bed` = farWaterBed's answer (rgb lit bed, w = path in fine voxels).
+// `bed` = farWaterBed's answer.
 fn shadeFarWater(hitP : vec3f, rd : vec3f, m : Material, nFace : vec3f,
-                 bed : vec4f) -> vec3f {
+                 bed : FarBed) -> vec3f {
   let up = nFace.y > 0.5;
   var n = nFace;
   if (up) {
-    let s = waveSlope(vec2f(hitP.x, hitP.z) * VOXEL_METERS, R.time,
-                      waterRippleFootprint(hitP), WAVE_DEEP_H, vec2f(0.0));
-    n = normalize(vec3f(-s.x, 1.0, -s.y));
+    // The near field's waterNormal on open water: no macro slope, full fetch,
+    // no sim flux; the depth is the bed's.
+    n = waterWaveNormal(hitP, vec2f(0.0), bed.depth * VOXEL_METERS, 1.0, vec2f(0.0));
   }
   let v = -rd;
-  let cosI = clamp(dot(n, v), 0.0, 1.0);
   let optics = liquidClearBlend(liquidOptics(m), WATER_ABSORB, WATER_SCATTER);
-  var fres = (WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - cosI, TUNE_WATER_FRESNEL_POWER)) *
-             optics.fresnel;
-  if (!up) { fres *= 0.5; }   // shadeWater's side-wall rule
-  // shadeWater's column law on the bed under it (farWaterBed).
-  let trans = exp(-optics.absorbK * (bed.w * VOXEL_METERS));
-  let refracted = bed.rgb * trans + optics.scatter * (vec3f(1.0) - trans);
-  var color = mix(refracted, reflectionSky(reflect(rd, n)), fres);
-  if (up) {
-    // shadeWater's glint at its far lobe (distM >= 40 m is past the seam's
-    // 25 m, but the mix is one clamp: keep the law, not a constant).
-    let distM = length(hitP - R.camPos) * VOXEL_METERS;
-    let power = mix(TUNE_GLINT_POWER_NEAR, TUNE_GLINT_POWER_FAR,
-                    clamp(distM / 40.0, 0.0, 1.0));
-    let spec = pow(max(dot(n, normalize(keyLightDir() + v)), 0.0), power);
-    let glintTint = normalize(keyLightColor() + vec3f(1e-4)) * 1.732;
-    color += glintTint * min(spec, 1.0) * TUNE_GLINT_INTENSITY * (0.25 + fres);
+  let fres = waterFresnel(n, v, optics.fresnel, 1.0, up);
+  // shadeWater's body: the bed through the caustic web, then the column.
+  let depthM = bed.path * VOXEL_METERS;
+  var lit = bed.lit;
+  if (depthM > 0.02 && bed.path < FAR_WATER_PATH_MAX_M / VOXEL_METERS) {
+    lit *= veilCaustic(waterCausticCurv(hitP, rd, bed.path, depthM), depthM);
   }
+  let trans = exp(-optics.absorbK * depthM);
+  let refracted = lit * trans + optics.scatter * (vec3f(1.0) - trans);
+  let reflection = reflectionSky(reflect(rd, n));
+  var color = mix(refracted, reflection, fres);
+  dbgWater(fres, refracted, reflection, lit, depthM);
+  if (up) {
+    let gl = waterGlint(n, v, hitP, fres);
+    color += gl;
+    let foamA = waterFoam(hitP, depthM, 0.0);
+    if (foamA > 0.0) {
+      color = mix(color, WATER_FOAM_COLOR, foamA);
+      if (SEAM_DBG >= 5u) { gDbgW0.w = foamA; }
+    }
+  }
+  if (SEAM_DBG >= 5u) { gDbgW1.w = dbgLum(color); }
   return color;
 }
 
@@ -13948,7 +14073,7 @@ fn shadeHorizon(hz : HzHit, rd : vec3f) -> vec3f {
   }
   if (wc > 0.0) {
     color = mix(color, shadeFarWater(hitP, rd, materials[horizon[HZ_H_MAT_WATER]], vec3f(0.0, 1.0, 0.0),
-                                         vec4f(0.0, 0.0, 0.0, FAR_WATER_PATH_MAX_M / VOXEL_METERS)), wc);
+                                         farBedDeep()), wc);
   }
   return applyAerial(color, rd, hz.t);
 }
@@ -14589,6 +14714,11 @@ fn fs(in : VSOut) -> FSOut {
           }
         }
         color = shadeFarWater(hitP, rd, m, nW, farWaterBed(flv, hitP + rd * 0.01, rd));
+        if (SEAM_DBG >= 5u) { gDbgW0.x = 1.0; gDbgW0.y = far.t; }
+      }
+      if (SEAM_DBG == 8u) {
+        gDbg = vec4f(f32(flv) / 8.0, select(0.0, 1.0, m.klass == CLASS_LIQUID),
+                     select(select(0.0, 0.5, fFeat), 1.0, fRefined), 1.0);
       }
       // ---- the frozen fire's breath (farEmberPlasma) ----
       // A cascade ember is a fire the window left behind: nothing about it
@@ -14613,8 +14743,8 @@ fn fs(in : VSOut) -> FSOut {
       if (nearCut && m.klass == CLASS_LIQUID && !isViscousLiquid(m) &&
           (m.flags & MATF_OPAQUE) == 0u) {
         let bed = farWaterBed(flv, hitP + rd * 0.01, rd);
-        color = bed.rgb;
-        liqExtra += bed.w;
+        color = bed.lit;
+        liqExtra += bed.path;
       }
       if (h.liqT <= 0.0) { color = applyAerial(color, rd, far.t); }
       else { color = applyAerial(color, rd, far.t - h.liqT); }
@@ -15311,6 +15441,7 @@ fn fs(in : VSOut) -> FSOut {
         color = shadeWater(hitP, rd, lm, liqCell, faceAxis(h.liqFace), faceSgn(h.liqFace),
                            h.liqPath + liqExtra, max(h.mediaSurf, 0.125), color,
                            h.liqT, underwater);
+        if (SEAM_DBG >= 5u) { gDbgW0.x = 0.5; gDbgW0.y = h.liqT; }
         color = applyAerial(color, rd, h.liqT);
         caShadedLiquid = true;
         veilT = h.liqT;
@@ -15556,6 +15687,9 @@ fn fs(in : VSOut) -> FSOut {
   }
   var out : FSOut;
   out.color = vec4f(color, 1.0);
+  if (SEAM_DBG == 5u) { gDbg = vec4f(gDbgW0.x, gDbgW0.y * VOXEL_METERS / 50.0, gDbgW0.z, 1.0); }
+  else if (SEAM_DBG == 6u) { gDbg = vec4f(gDbgW1.x, gDbgW1.y * 0.5, gDbgW1.z * 0.5, 1.0); }
+  else if (SEAM_DBG == 7u) { gDbg = vec4f(gDbgW0.w, gDbgW1.w * 0.5, min(gDbgWPath / 30.0, 1.0), 1.0); }
   if (SEAM_DBG != 0u) { out.color = vec4f(gDbg.xyz, 1.0); }
   out.depth = depth;
   return out;
