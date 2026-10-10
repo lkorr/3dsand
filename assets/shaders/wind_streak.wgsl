@@ -58,6 +58,15 @@ const STREAK_SALT : u32 = 0x57EAu;
 // Respawn attempts per second per dead slot. The spawn PROBABILITY is the gust
 // gate below; this only sets how quickly a gust fills with streaks.
 const STREAK_SPAWN_RATE : f32 = 5.0;
+// The ground as the flow's boundary (the advection step's note): the depth
+// over which a streak's vertical speed follows the terrain table's slope,
+// fading linearly to none (voxels: 40 m, so the whole 0.2-6.2 m spawn band
+// follows at >= 85%); the steepest slope it follows (a 56-degree face; a cliff
+// cell's gradient is clamped to this); and the clearance a step that ends
+// under the table's ground is put back to (the spawn band's own floor).
+const STREAK_FOLLOW_DEPTH : f32 = 400.0;
+const STREAK_FOLLOW_MAX_SLOPE : f32 = 1.5;
+const STREAK_FLOOR : f32 = 2.0;
 
 fn streakU01(a : u32, b : u32) -> f32 {
   return f32(hash3(STREAK_SALT ^ a, R.streakN.z, b) & 0xFFFFFFu) * (1.0 / 16777216.0);
@@ -128,10 +137,48 @@ fn update(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
 
   // ---- advect by THE field ----
-  let w = windAt(h0.xyz, R.time, &R);
+  var w = windAt(h0.xyz, R.time, &R);
   let p0 = h0.xyz;
   let a0 = h0.w;
-  let p = p0 + w * dt;
+  // ---- ...WITH THE GROUND AS A BOUNDARY (ticket 2026-10-09_15-09-01) ----
+  // The field's mean is HORIZONTAL: nothing in windAt turns it up a slope.
+  // The CA never notices -- a voxel blocks whatever pushes into it -- but a
+  // tracer does: a streak born 0.2-6 m over a WINDWARD slope ran straight
+  // into the coarse ground within metres and died, mostly while still fading
+  // in, so a hill's windward face showed no streaks at all and its lee (where
+  // the ground falls away from the same horizontal motion) showed them
+  // running full length. Owner: "on one side of the hill there's no wind
+  // trail, on the other it goes on way longer".
+  //
+  // Real air in the surface layer cannot pass through the ground, so it
+  // follows it: the vertical speed AT the surface is U . grad(h) (the
+  // no-penetration condition), fading with height on the scale of the hill.
+  // That is applied here, to the tracer, from the same terrain table the
+  // field's ramp reads -- up a windward face, down a lee one, the same law
+  // both ways. The slope is clamped (a cliff cell would otherwise fling a
+  // streak straight up), and a step that still ends under the table's ground
+  // (its bilinear facets, a clamped slope) slides along it instead of
+  // killing the streak -- but only by about one step's own rise: a step that
+  // ends DEEP under the ground hit a wall (a cliff, a ridge the table steps
+  // up onto between cells) and dies there as before, or the slide would
+  // teleport it up the face and draw a 40 m ribbon in one frame.
+  let trA = windTerrF(p0, &R);
+  if (trA.edge > 0.0) {
+    var g = vec2f(trA.gx, trA.gz);
+    let gl = length(g);
+    if (gl > STREAK_FOLLOW_MAX_SLOPE) { g *= STREAK_FOLLOW_MAX_SLOPE / gl; }
+    let hagl = max(p0.y - trA.h, 0.0);
+    let follow = trA.edge * (1.0 - min(hagl / STREAK_FOLLOW_DEPTH, 1.0));
+    w.y += dot(w.xz, g) * follow;
+  }
+  var p = p0 + w * dt;
+  let trB = windTerrF(p, &R);
+  var hitWall = false;
+  if (trB.edge > 0.0) {
+    let under = trB.h + STREAK_FLOOR - p.y;
+    if (under > STREAK_FLOOR + STREAK_FOLLOW_MAX_SLOPE * length(w.xz) * dt) { hitWall = true; }
+    else if (under > 0.0) { p.y += under; }
+  }
   h0 = vec4f(p, a0 + dt);
   var head = u32(h1.z) % trail;
   // Push a trail point every `spacing` seconds — AS MANY as fell inside this
@@ -154,12 +201,11 @@ fn update(@builtin(global_invocation_id) gid : vec3<u32>) {
   let timer = min(total - spacing * f32(cnt), spacing);
   // Out of the pool's reach, or into the ground: done (age = life).
   let d = p.xz - R.camPos.xz;
-  var dead = dot(d, d) > radius * radius * 1.69;
+  var dead = hitWall || dot(d, d) > radius * radius * 1.69;
   // ...or out of it vertically: the band's own reach (streakVertReach).
   let tr = windTerrF(p, &R);
   let groundHere = select(R.camPos.y - 17.0, tr.h, tr.edge > 0.0);
   if (abs(p.y - R.camPos.y) > streakVertReach(groundHere) * 1.3) { dead = true; }
-  if (tr.edge > 0.0 && p.y < tr.h) { dead = true; }
   if (dead) { h0.w = h1.x; }
   streaks[base] = h0;
   streaks[base + 1u] = vec4f(h1.x, h1.y, f32(head), timer);

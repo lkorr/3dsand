@@ -16957,7 +16957,12 @@ law (common.wgsl `airFogFrac`). `applyAerial` adds the DISTANCE BLUE
 (`render.fogHaze`, 0.6): a part-fogged surface takes some of the airglow ~17
 degrees above its own direction, weighted `1 - f^2` so full fog still
 converges to exactly the sky in `rd` (the rule above) while a 1 km peak at
-15 km reads as a blue silhouette rather than a grey one.
+15 km reads as a blue silhouette rather than a grey one. That sample is
+`skyAirlightSmooth` (day scattering + the night gradient) under the cloud-env
+cover, NOT `skyAirglow`: the latter carries the aurora, galactic band and
+nebulae, and sampled at a clamped elevation it varies with azimuth alone --
+the aurora drew as vertical "smoke" wisps over every fogged hillside at night,
+even under a storm deck (ticket 2026-10-09_15-06-49).
 
 **The light at terrain scale (map v2 S1; `assets/shaders/horizon_light.wgsl`,
 horizon.h `kL*`).** Every sun shadow in the renderer is a RAY (the shadow
@@ -19031,7 +19036,17 @@ a flat `wf*` block on BOTH TickParams and RenderParams (`world.h`
 kWindTerrN's note), filled by `windfield::FillWindField` alone. Knobs: F1 →
 World → Wind & weather, all live except `gustWavelength`/`gustSpeed` (F5).
 Visuals: the gust streaks (`wind_streak.wgsl`, render-only; §9b is the field,
-the streaks only draw it).
+the streaks only draw it). **One thing the tracer adds to the field: the
+ground as a boundary (2026-10-09, ticket 15-09-01).** The field's mean is
+horizontal, which the CA never notices (a voxel blocks what pushes into it)
+but a tracer does: streaks born over a windward slope ran into the terrain
+table within metres and died while still fading in, so a hill's windward face
+showed none and its lee showed them full length. The streak step now takes the
+no-penetration vertical `U . grad(h)` off the same table (slope clamped to
+1.5, fading over 40 m of height), slides along the ground if a step still ends
+just under it, and dies only on a step that ends DEEP under it (a wall). Not
+added to `windAt` itself: that would have to be mirrored into `windAtQ` and
+would move the sim.
 
 `windSampleAt` / `windAt` live in **`assets/shaders/common.wgsl`**, which is
 prepended to every shader, so the field is in scope everywhere without being

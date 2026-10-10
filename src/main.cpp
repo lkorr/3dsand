@@ -20476,6 +20476,12 @@ int main(int argc, char** argv) {
         sim.DrawBodyRanges(srp, bodyDraws);
         sim.DrawMicroBodies(srp, microCount);
         sim.DrawPourMarker(srp, pourMarkerAt);
+        // The gust streaks, as the frame draws them: without this a --at
+        // repro of a wind-streak ticket showed none at all (ticket
+        // 2026-10-09_15-09-01). The pool was already advanced this frame;
+        // the EncodeShadowResolve above steps it once more by the same dt.
+        sim.DrawWindStreaks(srp, WindStreakDrawCount(CurrentTuning()),
+                            (uint32_t)CurrentTuning().wind.streakTrail);
         overlay.RenderRecorded(srp);
         srp.End();
         ctx.queue.Submit(senc.Finish());
