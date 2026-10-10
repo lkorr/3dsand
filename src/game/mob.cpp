@@ -9416,14 +9416,22 @@ void Mob::RegisterTerrainAnchor() {
   // creature is driven kinematically at a few voxels a second and the plain
   // anchor has always covered it.
   Vec3 vel{};
+  Vec3 at = origin_ + Vec3{ws.x * 0.5f, ws.y * 0.5f, ws.z * 0.5f};
   const int rl = def_->rootLimb;
   if (ragdoll_ == RagdollPhase::Limp && phys_ != nullptr && rl >= 0 &&
       rl < (int)limbs_.size() && limbs_[rl].body) {
     Vec3 ang{};
     phys_->GetBodyVelocities(limbs_[rl].body, vel, ang);
+    // ...FROM WHERE THE PELVIS IS NOW. origin_ is re-derived from the root
+    // limb's cached transform in TickRagdollLimp, which runs after this and
+    // reads a transform PostStep copied a tick earlier: at 50 m/s the anchor
+    // stood two ticks (~30 voxels, two chunks) above the body it asks for
+    // (the `freefall` gate's dump, 2026-10-09). The pelvis is the rig's
+    // middle to within a limb, which the anchor's radius already covers.
+    BodyTransform xf{};
+    if (phys_->GetTransform(limbs_[rl].body, xf)) at = xf.pos;
   }
-  debris_->AddTerrainAnchor(
-      origin_ + Vec3{ws.x * 0.5f, ws.y * 0.5f, ws.z * 0.5f}, r, vel, horizon);
+  debris_->AddTerrainAnchor(at, r, vel, horizon);
 }
 
 void Mob::SubmitPose(float dt, bool writeXf) {
@@ -10725,6 +10733,18 @@ bool Mob::SpendHp(float amount, const DamageCtx& ctx) {
     Damage(s.body, s.hp, s.at, /*impactSpeed=*/0.0f, ctx);
   }
   return alive_;
+}
+
+bool Mob::ArrestIsLethal(Vec3 impactDeltaV) const {
+  // ApplyFallDamage's verdict without its side effects: the same thresholds,
+  // the same hp bar.
+  if (!alive_ || !def_ || limbs_.empty()) return false;
+  const auto& pt = CurrentTuning().player;
+  const float impactMs = impactDeltaV.len() * kVoxelMeters;
+  if (impactMs < pt.fallDamageSpeed) return false;
+  const float excess = impactMs - pt.fallDamageSpeed;
+  const float damage = excess * excess * pt.fallDamageScale;
+  return impactMs >= pt.fallSplatSpeed || damage >= std::floor(SpendableHp());
 }
 
 bool Mob::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,

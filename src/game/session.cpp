@@ -5750,7 +5750,7 @@ static void PhaseO(TickAuthorityCtx& w, WorldScratch& ws,
       // tick after the get-up does not snap the rig round to the camera.
       bool avatarRagdolled = false;
       {
-        Vec3 follow;
+        Vec3 follow = player.pos;
         if (avatar.RagdollFollow(follow)) {
           player.pos = follow;
           player.vel = {};

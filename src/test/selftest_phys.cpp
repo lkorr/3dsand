@@ -578,6 +578,18 @@ auto note = [&failed](bool ok, const char* name) {
   uint32_t spawnsSeen = 0;
   t = 10000;
   for (int i = 0; i < 400 && debris.BodyCount() > 0 && spawnsSeen < 3; i++) {
+    // KEEP IT SPINNING. One spin at spawn died out on the ground by tick ~60,
+    // and from then on the subtest was a race between the ember burning the
+    // bridge through (~170 ticks) and the settle converting the resting body
+    // back into grid -- which a change that only made the ground's patches
+    // complete sooner (2026-10-09, the mirror seeding the fetch cache) lost.
+    // The subtest is about the shatter, so the body is kept awake the way its
+    // comment always said it was.
+    if (i % 15 == 0) {
+      Vec3 lin{}, ang{};
+      phys.GetBodyVelocities(db, lin, ang);
+      phys.SetBodyVelocities(db, lin, Vec3{0.4f, 1.2f, 0.3f});
+    }
     std::vector<CellOp> cellOps;
     std::vector<ParticleSpawn> spawns;
     debris.PreTick(t + 1, world, cellOps, spawns);

@@ -11428,7 +11428,7 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
       const float len = push.len();
       const float kMaxPush = 2.0f * Player::kHalfXZ;
       if (len > kMaxPush) push = push * (kMaxPush / len);
-      Vec3 follow;
+      Vec3 follow = pl.pos;
       if (avatar.RagdollFollow(follow)) pl.pos = follow;
       else pl.pos += push;
       gobbets = std::max(gobbets, debris.BodyCount());
@@ -12057,7 +12057,7 @@ Status GateRagdollFallDamage(Ctx& c, std::string& detail) {
       phys.Step(kTickDt);
       debris.PostStep();
       avatar.PostStep();
-      Vec3 follow;
+      Vec3 follow = pl.pos;
       if (avatar.RagdollFollow(follow)) pl.pos = follow;
     };
     // Standing still long enough for the feet to plant and, at lift > 0, for

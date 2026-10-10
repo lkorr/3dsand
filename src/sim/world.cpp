@@ -1387,6 +1387,44 @@ void World::LandFetches(WorldSnapshot& s) {
   }
 }
 
+void World::SeedCacheFromMirror(const WorldSnapshot& s) {
+  // THE MIRROR IS A FETCH NOBODY HAD TO ASK FOR. Every snapshot carries the
+  // 27 chunks round the player's mirror centre -- the same post-tick words a
+  // fetch of them would have returned, at the same tick, sentinels already
+  // synthesized -- and the centre LEADS a moving body (session.cpp
+  // MirrorLeadChunk). A chunk the cache has never held gets that copy now,
+  // instead of waiting a fetch round trip (kSnapshotLatency) for a request
+  // somebody makes only once they need it. Measured on `freefall-slope`
+  // (2026-10-09): a limp rig skipping down a cliff and spraying its own blood
+  // into the sky around it entered a fresh chunk every few ticks, each one
+  // matter-bearing (so not SkyKnown) and each held by UntunnelRig for the
+  // fetch's ~5 ticks -- the body froze in mid-air beside the face.
+  //
+  // ABSENT ENTRIES ONLY. A chunk already cached keeps the version its
+  // consumers asked for and are tracking (ManageTerrain rebuilds on a version
+  // change; refreshing all 27 every tick would re-gather 27 patches a tick for
+  // nothing). The cost is 27 lookups per publish and a 16 KiB copy per chunk
+  // the mirror newly covers.
+  if (!s.valid || s.mirror.size() < (size_t)27 * kChunkVol) return;
+  static const bool kOff = [] {
+    const char* e = std::getenv("SANDVOX_NO_MIRROR_SEED");
+    return e != nullptr && e[0] != '0';
+  }();
+  if (kOff) return;
+  for (int dz = 0; dz < 3; dz++)
+    for (int dy = 0; dy < 3; dy++)
+      for (int dx = 0; dx < 3; dx++) {
+        const IVec3 wc{s.mirrorBase.x + dx, s.mirrorBase.y + dy, s.mirrorBase.z + dz};
+        const uint64_t key = PackChunkKey(wc);
+        auto it = cache_.find(key);
+        if (it != cache_.end() && it->second.voxels.size() == kChunkVol) continue;
+        CachedChunk& cc = cache_[key];
+        cc.version = s.tick;
+        const uint32_t* src = s.mirror.data() + (size_t)((dz * 3 + dy) * 3 + dx) * kChunkVol;
+        cc.voxels.assign(src, src + kChunkVol);
+      }
+}
+
 // ---- THE SOLUTE LAYER'S RESET (world.h kSol* block) ------------------------
 // Every slot SOL_EMPTY, every page on the free stack (stack[i] = i, depth =
 // kSolutePoolPages), every flag, stall counter, aggregate and ledger counter 0.
@@ -1484,6 +1522,7 @@ bool World::PublishSnapshotsUpTo(uint32_t target) {
     // The chunk fetches this snapshot carried join the cache NOW, one
     // snapshot at a time in tick order (see the callback, det-cpu).
     LandFetches(snap_);
+    SeedCacheFromMirror(snap_);
     // Reaction effects ride the publish, one snapshot at a time, so a publish
     // that walks two snapshots delivers both ticks' firings (World::TakeReactFx).
     if (snap_.valid && !snap_.reactFx.empty()) {

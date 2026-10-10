@@ -694,12 +694,14 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
       if (std::fabs(pose_.swimLift) < 1e-3f) pose_.swimLift = 0.0f;
     }
     if (swimNow) {
-      if (!pose_.swimOn) {
-        // Entering the water starts from treading, whatever was left from
-        // the last swim, and from the velocity as it is now.
-        for (int k = 0; k < PoseDrive::kSwimClips; k++) pose_.swimW[k] = k == 0;
-        pose_.swimVel = in.velocity;
-      }
+      // A stroke still fading out (a lapse shorter than its blendOut) is the
+      // same swim resumed: keep its weights and velocity, or the body snaps
+      // to the upright tread for a frame and has to blend back.
+      bool resumed = false;
+      for (const ClipInstance& inst : st.clips)
+        resumed |= isSwimClip(inst.clip);
+      const bool fresh = !pose_.swimOn && !resumed;
+      if (fresh) pose_.swimVel = in.velocity;
       pose_.swimVel = pose_.swimVel + (in.velocity - pose_.swimVel) *
                                           HalfLifeK(dt, kSwimVelHalflife);
       // The body's frame, as the springs read it: +fwd along the heading,
@@ -711,7 +713,14 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
       const float left = (v.x * shc - v.z * shs) / ref;
       // At the surface an upward push only holds the head out: treading.
       // Sinking from the surface is still a dive.
-      const float up = (surfaced ? std::min(v.y, 0.0f) : v.y) / ref;
+      float up = (surfaced ? std::min(v.y, 0.0f) : v.y) / ref;
+      // SINKING IS NOT DIVING. swim_down is a head-first dive, a stroke that
+      // goes somewhere; straight down with no travel (Ctrl alone, or just not
+      // holding Space) is the tread with the water closing over it. So the
+      // descent only counts toward the dive as far as there is horizontal
+      // travel to dive along: at most an even split with it, and nothing
+      // when there is none.
+      if (up < 0.0f) up = std::max(up, -std::sqrt(fwd * fwd + left * left));
       const float mag2 = fwd * fwd + left * left + up * up;
       const float mag = std::sqrt(mag2);
       // How much of the pose is a stroke rather than the tread: a dead zone
@@ -726,7 +735,11 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
                                std::max(up, 0.0f),   std::max(-up, 0.0f)};
         for (int k = 0; k < 6; k++) want[k + 1] = go * comp[k] * comp[k] / mag2;
       }
-      const float wk = HalfLifeK(dt, kSwimBlendHalflife);
+      // Entering the water starts on the mix the velocity asks for, not on
+      // the tread: wading in at a walk goes straight into the crawl (the
+      // clips' own blendIn fades the whole family over the walk), instead of
+      // standing up into a tread and then tipping forward.
+      const float wk = fresh ? 1.0f : HalfLifeK(dt, kSwimBlendHalflife);
       for (int k = 0; k < PoseDrive::kSwimClips; k++)
         pose_.swimW[k] += (want[k] - pose_.swimW[k]) * wk;
       // The stroke rate follows the effort: a drift strokes slowly, a full

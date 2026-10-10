@@ -6332,26 +6332,64 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
   // A ragdoll three seconds into a fall covers that whole margin in three
   // ticks and was arriving in chunks with no collision mesh in them at all.
   // So ALSO ask for the chunks the body's own velocity says it is entering,
-  // sampled along the swept segment (just those chunks -- a box around each
-  // would multiply the fetch budget by the lookahead). They carry the distance
-  // from the SAMPLE, not from the body, so the build order below puts the
-  // ground a body is falling onto ahead of the ground it has already left.
+  // sampled along the swept segment. They carry the distance from the SAMPLE,
+  // not from the body, so the build order below puts the ground a body is
+  // falling onto ahead of the ground it has already left.
+  //
+  // WHAT IS SWEPT IS THE BODY'S EXTENT, NOT ITS CENTRE LINE (`halfExtent`).
+  // A debris body's lattice is listed by needBody and its sweep stays the
+  // one-chunk-per-sample line it always was (halfExtent 0). A creature anchor
+  // is a RIG: fifteen limbs spread a body length round the pelvis, and
+  // UntunnelRig holds the whole rig the moment ANY limb's step ends in an
+  // unvouched chunk. A centre-line sweep listed one chunk column; a body
+  // falling on a chunk-column corner (the `freefall` gate's site is exactly
+  // one: x 224, z 272) put its limbs in the three columns beside it, which
+  // nothing listed until needAround reached them a chunk away -- and the rig
+  // was then held ~5 ticks per chunk over the last chunks of matter above the
+  // ground (2026-10-09, attributed by DebrisSystem::NeedProbe: the chunk below
+  // the body was "never listed" until it was one chunk off). So an anchor
+  // sweeps the box of its radius: each sample lists every chunk that box
+  // overlaps. Known sky in it costs no fetch (SkyKnown), so the wider corridor
+  // spends the budget only where there is matter.
   const bool lookahead = !AntiTunnelOff(AntiTunnel::Lookahead);
-  auto sweepAhead = [&](Vec3 pos, Vec3 vel) {
+  auto sweepAhead = [&](Vec3 pos, Vec3 vel, float halfExtent) {
     const float speed = vel.len();
     if (!lookahead || speed < 1e-3f) return;
     const float reach =
         std::min(speed * kTerrainLookaheadSeconds, kTerrainLookaheadVox);
     if (reach < (float)kChunk * 0.5f) return;
     const Vec3 dir = vel * (1.0f / speed);
+    const float h = std::max(halfExtent, 0.0f);
     for (float t = (float)kChunk * 0.5f; t <= reach; t += (float)kChunk * 0.5f) {
       const Vec3 p = pos + dir * t;
-      const IVec3 wc{ifloor(p.x) >> 4, ifloor(p.y) >> 4, ifloor(p.z) >> 4};
-      if (!world.ChunkInWindow(wc)) continue;
-      const float dx = (float)(wc.x * (int)kChunk + (int)kChunk / 2) - p.x;
-      const float dy = (float)(wc.y * (int)kChunk + (int)kChunk / 2) - p.y;
-      const float dz = (float)(wc.z * (int)kChunk + (int)kChunk / 2) - p.z;
-      needed.push_back({wc, dx * dx + dy * dy + dz * dz});
+      const int lo[3] = {ifloor(p.x - h) >> 4, ifloor(p.y - h) >> 4, ifloor(p.z - h) >> 4};
+      const int hi[3] = {ifloor(p.x + h) >> 4, ifloor(p.y + h) >> 4, ifloor(p.z + h) >> 4};
+      const float bl[3] = {p.x - h, p.y - h, p.z - h}, bh[3] = {p.x + h, p.y + h, p.z + h};
+      for (int cz = lo[2]; cz <= hi[2]; cz++)
+        for (int cy = lo[1]; cy <= hi[1]; cy++)
+          for (int cx = lo[0]; cx <= hi[0]; cx++) {
+            const IVec3 wc{cx, cy, cz};
+            if (!world.ChunkInWindow(wc)) continue;
+            // Chunk centre to the sample's box (to the sample itself when
+            // h is 0, which is the metric this sweep has always used).
+            const float cc[3] = {(float)(cx * (int)kChunk + (int)kChunk / 2),
+                                 (float)(cy * (int)kChunk + (int)kChunk / 2),
+                                 (float)(cz * (int)kChunk + (int)kChunk / 2)};
+            float d2 = 0.0f;
+            for (int a = 0; a < 3; a++) {
+              const float e = cc[a] < bl[a] ? bl[a] - cc[a]
+                              : (cc[a] > bh[a] ? cc[a] - bh[a] : 0.0f);
+              d2 += e * e;
+            }
+            // A box sweep orders by ARRIVAL: every chunk the box overlaps is
+            // at distance 0 from its sample, so without the path term the
+            // whole corridor tied and the fetch budget served it in KEY order
+            // -- the chunk the rig entered next waited five ticks behind
+            // chunks it would reach a third of a second later
+            // (`freefall-slope`, 2026-10-09: "budget 5" on the held chunk).
+            if (h > 0.0f) d2 += t * t;
+            needed.push_back({wc, d2});
+          }
     }
   };
   for (Body& b : bodies_) {
@@ -6360,14 +6398,16 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     Vec3 lin{}, ang{};
     if (phys_->IsActive(b.handle)) phys_->GetBodyVelocities(b.handle, lin, ang);
     needBody(b);
-    sweepAhead(b.xf.pos, lin);
+    sweepAhead(b.xf.pos, lin, 0.0f);
   }
+  if (needProbeOn_) probeAnchors_.clear();
   for (const Anchor& a : extraAnchors_) {
+    if (needProbeOn_) probeAnchors_.push_back({a.pos, a.vel});
     const size_t before = needed.size();
     needAround(a.pos, a.radius);
     if (prof_.on) prof_.anchorChunks += needed.size() - before;
     needHorizon(a.pos, a.radius, a.horizon);
-    sweepAhead(a.pos, a.vel);
+    sweepAhead(a.pos, a.vel, a.radius);
   }
   extraAnchors_.clear();
   // Dedupe by chunk, keeping the NEAREST distance any anchor gave it, then
@@ -6431,6 +6471,12 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
   // scan below at O(kTerrainNeedCeiling) whatever the scene holds, and costs
   // only latency: nothing is forgotten, because a chunk still needed next tick
   // is listed again and its patch (if it has one) survives kTerrainEvictTicks.
+  if (needProbeOn_)
+    for (size_t i = 0; i < needed.size(); i++) {
+      NeedRec& r = needProbe_[World::PackChunkKey(needed[i].first)];
+      if (r.firstNeeded == 0) { r.firstNeeded = tick; r.firstRank = (uint32_t)i; }
+      if (i >= kTerrainNeedCeiling) r.ceilingCut++;
+    }
   if (needed.size() > kTerrainNeedCeiling) needed.resize(kTerrainNeedCeiling);
   }  // end Phase::TerrainNeed
 
@@ -6454,9 +6500,15 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     t.wc = wc;
     t.lastNeeded = tick;
     const CachedChunk* cc = world.Cached(wc);
+    NeedRec* probe = needProbeOn_ ? &needProbe_[World::PackChunkKey(wc)] : nullptr;
+    if (probe && cc && probe->firstCached == 0) probe->firstCached = tick;
     // Known-empty sky needs no patch, so it costs no fetch: the budget below
     // goes to the ground a falling body is about to reach (SkyKnown).
-    if (!cc && SkyKnown(wc)) continue;
+    if (!cc && SkyKnown(wc)) {
+      if (probe) probe->skyskipped++;
+      t.skyTick = tick;
+      continue;
+    }
     if (!cc) {
       // THE FETCH BUDGET. World::kFetchPerTick is 64 for the whole engine and
       // a felled tree used to ask for 454 in one tick; everything else that
@@ -6467,6 +6519,9 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
       if (fetchesThisTick < kTerrainFetchPerTick) {
         world.RequestChunkFetch(wc, World::FetchSource::Terrain);
         fetchesThisTick++;
+        if (probe && probe->firstRequested == 0) probe->firstRequested = tick;
+      } else if (probe) {
+        probe->budgetDenied++;
       }
       continue;
     }
@@ -6517,6 +6572,31 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
                        ((uint64_t)pv->second.stamp * 0xC2B2AE3D27D4EB4Full);
         }
     const bool vacateChanged = vacateKey != t.vacateKey;
+    // A guess the patch was built on has stopped holding (TerrainEntry
+    // outMask / missMask): a neighbour that was outside the window is inside
+    // it now, or one that was not cached has landed. Only the set bits are
+    // looked at, and a patch built with every neighbour present has none.
+    // SANDVOX_NO_TERRAIN_BORDER=1: the pre-2026-10-09 behaviour (a patch
+    // keeps its guesses until its own chunk changes), the A/B arm in one
+    // binary.
+    static const bool borderOff = [] {
+      const char* e = std::getenv("SANDVOX_NO_TERRAIN_BORDER");
+      return e != nullptr && e[0] != '0';
+    }();
+    bool borderStale = false;
+    if (!borderOff && t.builtVersion != 0 && (t.outMask | t.missMask) != 0u) {
+      for (int b = 0; b < 27 && !borderStale; b++) {
+        const uint32_t bit = 1u << b;
+        if (((t.outMask | t.missMask) & bit) == 0u) continue;
+        const IVec3 nwc{wc.x + b % 3 - 1, wc.y + (b / 3) % 3 - 1, wc.z + b / 9 - 1};
+        if ((t.outMask & bit) && world.ChunkInWindow(nwc)) borderStale = true;
+        if ((t.missMask & bit) && world.ChunkInWindow(nwc)) {
+          const CachedChunk* n = world.Cached(nwc);
+          if (n && n->voxels.size() == kChunkVol) borderStale = true;
+        }
+      }
+      if (borderStale) settle_.terrainBorderStale++;
+    }
     // refresh when the sim says the chunk changed (rate-limited). dirtyFlags
     // are slot-indexed under the CURRENT window origin.
     uint32_t slot = World::SlotChunkIndex(wc);
@@ -6528,8 +6608,9 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
         fetchesThisTick++;
       }
     }
-    if (!vacateChanged && t.builtVersion >= cc->version && t.handle != 0) continue;
-    if (!vacateChanged && t.builtVersion >= cc->version && t.handle == 0 &&
+    if (!vacateChanged && !borderStale && t.builtVersion >= cc->version && t.handle != 0)
+      continue;
+    if (!vacateChanged && !borderStale && t.builtVersion >= cc->version && t.handle == 0 &&
         t.builtVersion != 0)
       continue;  // built empty at this version
 
@@ -6563,6 +6644,7 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     // "identical surface" or "sky" never reaches that one.
     if (gathers >= kTerrainGatherPerTick) {
       settle_.terrainGatherDeferred++;
+      if (probe) probe->gatherDeferred++;
       continue;
     }
     gathers++;
@@ -6575,6 +6657,7 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     // occ is exactly dens >= 4, so the binary and weighted views agree.
     uint8_t dens[kMcOccCells] = {};
     bool anyPartial = false;
+    uint32_t outMask = 0, missMask = 0;
     auto put = [&](int x, int y, int z, uint32_t d) {
       dens[McOccIndex(x, y, z)] = (uint8_t)d;
       if (d >= 4u) McOccSet(occ, x, y, z);
@@ -6605,6 +6688,21 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
           bool haveVox = n && n->voxels.size() == kChunkVol;
           // Outside the residency window is solid and inert (matches the sim
           // rule); in-window but not yet fetched reads as empty until it lands.
+          // Both are recorded (TerrainEntry::outMask / missMask) so the patch
+          // is re-gathered when the guess stops holding -- except a missing
+          // neighbour the snapshot counts EMPTY, which air is the right answer
+          // for (the SkyKnown argument, one chunk wide).
+          const uint32_t nbit = 1u << ((ncz + 1) * 9 + (ncy + 1) * 3 + (ncx + 1));
+          if (!inWin) outMask |= nbit;
+          else if (!haveVox && (ncx | ncy | ncz) != 0) {
+            const IVec3 so = snap.windowOrigin;
+            const int nn = (int)kNChunk;
+            const bool snapEmpty =
+                snap.valid && snap.occupancy.size() >= kNumChunks && nwc.x >= so.x &&
+                nwc.y >= so.y && nwc.z >= so.z && nwc.x < so.x + nn && nwc.y < so.y + nn &&
+                nwc.z < so.z + nn && snap.occupancy[World::SlotChunkIndex(nwc)] == 0;
+            if (!snapEmpty) missMask |= nbit;
+          }
           if (!inWin) {
             for (int z = blo[2]; z <= bhi[2]; z++)
               for (int y = blo[1]; y <= bhi[1]; y++)
@@ -6660,9 +6758,12 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
       for (int i = 0; i < kMcOccCells; i++)
         if (dens[i] != 0u && dens[i] != kPowderFull)
           h = (h ^ ((uint64_t)i << 8 | dens[i])) * 1099511628211ull;
+    if (probe && probe->firstBuilt == 0) probe->firstBuilt = tick;
     if (t.builtVersion != 0 && h == t.occHash) {
       t.builtVersion = cc->version;
       t.vacateKey = vacateKey;
+      t.outMask = outMask;
+      t.missMask = missMask;
       settle_.terrainSame++;
       continue;
     }
@@ -6680,10 +6781,13 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
       t.builtVersion = cc->version;
       t.occHash = h;
       t.vacateKey = vacateKey;
+      t.outMask = outMask;
+      t.missMask = missMask;
       continue;
     }
     if (builds >= TerrainBuildsPerTick()) {
       settle_.terrainDeferred++;
+      if (probe) { probe->buildDeferred++; if (probe->firstBuilt == tick) probe->firstBuilt = 0; }
       continue;
     }
     builds++;
@@ -6701,6 +6805,8 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     tb.version = cc->version;
     tb.occHash = h;
     tb.vacateKey = vacateKey;
+    tb.outMask = outMask;
+    tb.missMask = missMask;
     if (prof_.on && t.builtVersion == 0) prof_.freshPolys++;
     if (prof_.on && vacateChanged) prof_.vacatePolys++;
   }
@@ -6741,6 +6847,8 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
       t.builtVersion = tb.version;
       t.occHash = tb.occHash;
       t.vacateKey = tb.vacateKey;
+      t.outMask = tb.outMask;
+      t.missMask = tb.missMask;
       // ground under sleeping debris may have moved: let them re-settle. The
       // bodies whose broad-phase box touches THIS patch (plus contact slop),
       // not every centre of mass within 24 voxels of its middle: that woke
@@ -6785,6 +6893,17 @@ bool DebrisSystem::ColliderVouched(IVec3 wc) const {
   // is the same three-way split TerrainCensus reports: a patch with triangles
   // and a patch that came out EMPTY both vouch, an unfetched one does not.
   if (it != terrain_.end() && it->second.builtVersion != 0) return true;
+  // ONE VERDICT PER TICK. The sweep skipped this chunk as known sky (no fetch,
+  // no patch) THIS tick, and that is the verdict the step after it is clamped
+  // against -- not a fresh SkyKnown, which reads whatever snapshot the tick
+  // has published SINCE the sweep. Blood a limp rig sprayed ahead of itself
+  // landed in such a chunk between the two, the sweep had asked for nothing
+  // and the clamp held the rig a tick for a patch nobody was building
+  // (`freefall-slope`, 2026-10-09). Next tick's sweep sees the matter and
+  // fetches it like any other chunk.
+  if (it != terrain_.end() && it->second.skyTick == lastTerrainTick_ &&
+      lastTerrainTick_ != 0)
+    return true;
   // ...and so does sky the snapshot already counts as empty. Without this a
   // body falling through open air was in unvouched space the whole way down
   // -- the patches are fetched and polygonized a few chunks a tick, and a

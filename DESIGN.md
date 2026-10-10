@@ -7836,6 +7836,44 @@ neighbors, so this needs an explicit connectivity pass:
      exactly as it was, still rigid and still at speed. Both escape hatches keep
      their meaning at rig scope (any member that STARTED outside lets the whole
      rig through; the hold counter is keyed on the rig's first live body).
+  5. **Freefall and cliff grazing (2026-10-09, gates `freefall` and
+     `freefall-slope`; ticket 2026-10-09_15-16-57).** Attributed with
+     `DebrisSystem::NeedProbe` (per chunk: when listed, at what rank, when
+     requested, when cached and built, and how often it was passed over by
+     the ceiling, the fetch budget, known sky, the gather and build budgets):
+     - A creature anchor's lookahead sweeps the **box of its radius**, not its
+       centre line, and orders the corridor by **arrival** (distance along the
+       path added to the box distance), so the fetch budget serves the chunk
+       the rig enters next first. A centre-line sweep listed one chunk column
+       while a rig's limbs spread into the columns beside it. Debris bodies
+       keep the one-chunk line (their lattice is listed by `needBody`).
+     - A limp anchor is the **live pelvis** (`Mob::RegisterTerrainAnchor`),
+       not `origin_`, which was two ticks stale.
+     - **The mirror seeds the fetch cache** (`World::SeedCacheFromMirror`):
+       every published snapshot's 27 mirror chunks go into the cache where it
+       holds no copy yet. The mirror leads a moving body (`MirrorLeadChunk`),
+       so the chunks a falling rig enters arrive with no fetch round trip.
+       Absent entries only, so no consumer sees a version churn.
+       `SANDVOX_NO_MIRROR_SEED=1` is the A/B arm.
+     - **One known-sky verdict per tick**: a chunk the sweep skipped as
+       `SkyKnown` stays vouched for the step it clamps, even if the snapshot
+       published in between shows matter there (a rig's own blood spray).
+     - **A patch is re-gathered when a guess it was built on stops holding**
+       (`TerrainEntry::outMask`/`missMask`): a neighbour that was OUTSIDE the
+       window reads as solid, and one in-window but uncached (and not
+       counted empty by the snapshot) reads as air. Before, a patch was only
+       rebuilt when its own chunk changed, so a window face polygonized as a
+       wall stayed a wall in open sky once the window had followed the body
+       past it. `SANDVOX_NO_TERRAIN_BORDER=1` is the A/B arm.
+     - **A lethal arrest is billed the tick it becomes lethal**
+       (`Mob::TakeRagdollImpact` / `ArrestIsLethal`). The hold-until-quiet rule
+       exists so a fold cannot bill twice, and a splat cannot bill twice
+       anyway. Holding it put the splat in the wrong place: the rig bounced off
+       a cliff face and burst in open air three ticks later, or lay still at
+       the foot of a fall for six ticks and then burst.
+     - **The limp hand-over is seated**: `PlayerAvatar::RagdollFollow` keeps
+       the capsule's offset from the pelvis on the first limp tick and eases
+       it to the 0.2 m lift, rather than popping half a voxel up.
 
 ### A corpse in armour is not allowed to be a motor (2026-09-13; `Physics::SweepRunawayRigs`, gate `corpse-armor`)
 
@@ -15113,7 +15151,12 @@ whole mixer: still is `tread`; a stroke takes over between 0.15 and 0.55 of
 the reference swim speed (0.28 of the def's top speed: the player's full swim);
 past that each direction gets its squared share of the body-frame velocity, so
 forward-and-down is part crawl and part dive and the body pitches part way. At
-the surface an upward push is treading, not swimming up. The pipeline finds the
+the surface an upward push is treading, not swimming up, and a descent counts
+toward the dive only up to the horizontal travel (sinking straight down is the
+tread going under). Entering starts on the mix the velocity asks for, and a
+stroke still fading out is resumed, never reset. The avatar's gate is HELD
+0.35 s past its condition while wet (`kSwimExitGrace`): the surface bob and a
+wader's toe-taps flicker it. The pipeline finds the
 waterline itself (`World::KindAt` up the body's own column) and, while the top
 of the body is out, settles the DRAWN body so the water crosses it where the
 blended clips want it (pose.cpp `kSwimWaterShare`: 0.76 of the standing height
@@ -18799,7 +18842,32 @@ each, never a march):
   weighted by `render.cloudFogMix`;
 - the shared hemisphere ambient (`ambientAtP`): greys and flattens by
   `RenderParams.overcast`, and takes a cold flash from `RenderParams.lightning`;
-- a camera at or above the deck base: the same image composited OVER hit pixels.
+- a camera at or above the deck base, or a hit above it: the same image
+  composited OVER hit pixels, TRUNCATED AT THE HIT (`cloudScreenAtHit`, below).
+
+**A hit pixel takes only the cloud in front of it** (2026-10-09, tickets
+`15-11-18` and `15-14-31`). Each screen-march texel records WHERE along its ray
+the extinction happened — the first and last deck sample that held cloud,
+widened by the rain, horizon fill and cirrus it added (`gExtSpan`) — as two
+11-bit log2 distances packed beside a 10-bit Td in history word 2 (no new
+words; `packTdSpan`). The composite over a hit at distance t scales each
+texel's optical depth by the share of that span in front of t (T^f, the
+in-scatter by the same opacity ratio) BEFORE the bilinear blend. So a slope
+climbing into the deck takes a sliver of cloud at the base and grades into it
+higher up; the deck seen from above stays off a cliff standing in front of it;
+and the upsample is depth-aware for free (a sky texel's far span does not bleed
+onto a near silhouette). It was the WHOLE column on every hit above the base: a
+hard line where the hit crossed `deckLo`, and from above the deck a false ledge
+of cloud painted across the face of the mountain the camera stood on. The second
+half of the cause: `terrainHitM`'s geometric ground search grew by a fixed 1.12
+over 40 steps, i.e. reached only 1.9 km, so no summit further off ever stopped
+the march. The growth is now fitted to the search distance (56 steps for the
+screen, 28 for the env map), and the search runs only as far as the deck's far
+side or the rain's reach. A screen ray that stops at the ground also drops the
+horizon fill and the cirrus (both behind it); the env map keeps them, as the fog
+target the fogged ground must meet. Cost: within noise of before (cloud pass
+1.3-1.8 ms mean in the two ticket views at 1600x900 under overcast, `--frames`
+pass attribution, before and after alike).
 
 **Precipitation, tier 1 only.** Rain curtains hang under raining cells in the
 march (with the primary and secondary RAINBOW at 42°/51° from the anti-solar
