@@ -1259,6 +1259,7 @@
     "streakLife": 1.6,
     "streakRadius": 20,
     "streakWidth": 0.015,
+    "streakGround": true,
     "dbgWindField": false,
     "dbgWindSpacing": 8,
     "dbgWindRadius": 48

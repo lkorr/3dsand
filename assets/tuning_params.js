@@ -1052,6 +1052,7 @@ const TUNING_PARAMS = {
   'wind.streakLife':{t:'f',def:1.6,min:0.2,max:6},
   'wind.streakRadius':{t:'f',def:20,min:2,max:60},
   'wind.streakWidth':{t:'f',def:0.015,min:0.005,max:0.2},
+  'wind.streakGround':{t:'b',def:true},
   'wind.dbgWindField':{t:'b',def:false},
   'render.dbgCurrentField':{t:'b',def:false},
   'render.asyncCompute':{t:'b',def:false},

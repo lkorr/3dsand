@@ -72,6 +72,11 @@ constexpr float kGaitCoyoteLegLengths = 0.5f;
 // of its five samples wet (see the note where swimming_ is set). Space held
 // while moving at the surface lifts the body to 0.2 (measured, --shot-swim).
 constexpr float kSwimPoseSubmersion = 0.19f;
+// How long the swim pose outlives its condition while the body is still wet
+// (see where swimming_ is set): longer than a surface bob's dip below the
+// line or a wader's toe-tap on the bottom, short enough that standing up in
+// the shallows hands back to the walk within a step.
+constexpr float kSwimExitGrace = 0.35f;
 
 ParticleSpawn MakeDroplet(Vec3 posVoxel, Vec3 vel, uint32_t material,
                           bool micro, int lifeTicks, int microScale) {
@@ -536,6 +541,7 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // get-up at a tuck.
     airPoseEligible_ = false;
     swimming_ = false;
+    swimHold_ = 0.0f;
     pose_.airFrac = 0.0f;
     pose_.airLandW = 0.0f;
     pose_.airLeanPitch = pose_.airLeanRoll = 0.0f;
@@ -551,6 +557,7 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     crouchWant_ = false;
     airPoseEligible_ = false;
     swimming_ = false;
+    swimHold_ = 0.0f;
     playerVel_ = Vec3{};
     PosePipeline(AvatarPoseInputs(/*grounded=*/true, Vec3{}), dt, world, tick);
     SubmitPose(dt, /*writeXf=*/true);
@@ -580,10 +587,25 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // the bottom and below kSwimSubmersion, and that is exactly the tread. So
     // a body the water holds up -- wet at all and with no floor -- swims too.
     // (Where the surface is, the pipeline finds for itself.)
-    swimming_ = (player.swimming ||
-                 (player.inLiquid && !player.grounded &&
-                  player.submersion >= kSwimPoseSubmersion)) &&
-                !player.fly && !player.hanging && player.mantleTimer <= 0.0f;
+    //
+    // HELD, NOT SAMPLED: every input here flickers. A surface swimmer's
+    // submersion rides the 0.75 line, and a body at chest depth taps the
+    // bottom (grounded for a tick) between bobs. Each lapse used to drop the
+    // stroke for a tick and restart it from the tread -- the one-frame
+    // stutter in a straight swim, and the stammer wading out of the shallows.
+    // So the pose lets go only after the condition has been false for
+    // kSwimExitGrace while the body is still wet; leaving the water, flying,
+    // grabbing a ledge or climbing out ends it at once.
+    const bool swimHard =
+        player.inLiquid && !player.fly && !player.hanging && player.mantleTimer <= 0.0f;
+    const bool swimCond =
+        swimHard && (player.swimming ||
+                     (!player.grounded && player.submersion >= kSwimPoseSubmersion));
+    if (swimCond)
+      swimHold_ = kSwimExitGrace;
+    else
+      swimHold_ = swimHard ? std::max(0.0f, swimHold_ - dt) : 0.0f;
+    swimming_ = swimCond || swimHold_ > 0.0f;
     // A ledge climb is the hang's continuation: same lip, same wall.
     climbActive_ = player.mantleFromHang && player.mantleTimer > 0.0f;
     climbRise_ = climbActive_ ? player.LedgeClimbRise() : 0.0f;
@@ -970,13 +992,37 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
 }
 
 bool PlayerAvatar::RagdollFollow(Vec3& outPlayerPos) const {
-  if (!spawned_ || !alive_ || !def_ || !Ragdolled()) return false;
+  if (!spawned_ || !alive_ || !def_ || !Ragdolled()) {
+    limpFollowing_ = false;
+    return false;
+  }
   const MobDef& def = *def_;
   if (ragdoll_ == RagdollPhase::Limp) {
     // The pelvis body's origin is its lattice corner; lift a little so the
     // camera boom pivots inside the body rather than at its underside.
-    outPlayerPos = RootWorldPos() + Vec3{0.0f, MetresToCells(0.2f), 0.0f};
+    //
+    // THE HAND-OVER IS SEATED, NOT SNAPPED. The live capsule stood 1.5 voxels
+    // over the pelvis and this lift is 2, so the tick a fall went limp the
+    // capsule (and the camera on it) popped half a voxel UP against the fall
+    // and the next tick fell 1.5x its step to make up for it -- the
+    // `freefall` gate's one remaining jerk (2026-10-09). The first limp tick
+    // keeps whatever offset the capsule had from the pelvis (`outPlayerPos`
+    // comes in holding the capsule's position), and it eases to the lift
+    // over the next ~half second, a few hundredths of a voxel a tick.
+    const Vec3 root = RootWorldPos();
+    const Vec3 lift{0.0f, MetresToCells(0.2f), 0.0f};
+    if (!limpFollowing_) {
+      limpFollowing_ = true;
+      limpOffset_ = outPlayerPos - root;
+      // A capsule nowhere near the body (a caller with nothing to seat, a
+      // teleport) starts at the lift.
+      if (!(limpOffset_.len() < 8.0f)) limpOffset_ = lift;
+    } else {
+      limpOffset_ = limpOffset_ + (lift - limpOffset_) * 0.12f;
+    }
+    outPlayerPos = root + limpOffset_;
   } else {
+    limpFollowing_ = false;
     // The standing spot: the inverse of the origin_ line in PreTick.
     outPlayerPos = Vec3{origin_.x + def.worldSize.x * 0.5f,
                         origin_.y + Player::kHalfY,
@@ -1310,7 +1356,15 @@ bool PlayerAvatar::HeadEyeWorld(Vec3& out) const {
   if (head < 0 || head >= (int)limbs_.size()) return false;
   Vec3 corner;
   Quat q;
-  if (!PartPosedWorld(head, corner, q)) return false;
+  // RAGDOLLED, THE HEAD IS WHERE THE BODY IS, not where the animation would
+  // put it: limp, Jolt owns the limb and the pose target sits wherever the
+  // controller last stood; getting up, SubmitPose writes the blended lying ->
+  // standing transform into xf. Either way xf is the head that is DRAWN, so
+  // the eye goes with it (same corner+rotation form as PartPosedWorld). A
+  // severed head has no body here and falls through to the pose.
+  if (!(Ragdolled() && PartWorldTransform(head, corner, q)) &&
+      !PartPosedWorld(head, corner, q))
+    return false;
   // eyeLocal is an offset from the head's ANCHOR (the neck joint) in art
   // voxels, rest frame (MobDef::eyeLocal); the posed rotation carries both.
   out = corner + Rotate(q, limbs_[(size_t)head].anchorLimb +

@@ -7532,6 +7532,9 @@ int main(int argc, char** argv) {
   // posed head's eyes (PlayerAvatar::HeadEyeWorld). Render-only.
   Vec3 fpHeadDelta{};
   bool fpHeadValid = false;
+  // Weight (0..1) of the avatar.firstPersonForward push: eased out while the
+  // body is ragdolled, so the eye stays inside the tumbling head.
+  float fpFwdW = 1.0f;
   float& respawnTimer = session.respawnTimer;
   // Night-ambience rarity roll. Deliberately a plain PRNG and NOT the sim's
   // counter-based hash: this decides whether a mood bed plays, never anything
@@ -7778,8 +7781,14 @@ int main(int argc, char** argv) {
     if (lake.present && lake.surf >= 0) {
       player.pos = Vec3{(float)lake.cx + 0.5f, (float)lake.surf + Player::kHalfY + 2.0f,
                         (float)lake.cz + 0.5f};
-      std::printf("--shot-swim: into the harness lake at (%d, %d), waterline y%d\n",
-                  lake.cx, lake.cz, lake.surf);
+      // SANDVOX_SHOT_SWIM_WADE: start on the shore instead and walk in (the
+      // first phase window holds W toward the centre), so the wade -> swim
+      // hand-over is in the run.
+      if (std::getenv("SANDVOX_SHOT_SWIM_WADE"))
+        player.pos = Vec3{(float)(lake.cx - lake.r - 8) + 0.5f,
+                          (float)lake.surf + Player::kHalfY + 24.0f, (float)lake.cz + 0.5f};
+      std::printf("--shot-swim: into the harness lake at (%d, %d), waterline y%d, r %d\n",
+                  lake.cx, lake.cz, lake.surf, lake.r);
     } else {
       std::fprintf(stderr, "--shot-swim: no harness lake on this map -- nothing to swim in\n");
     }
@@ -13602,15 +13611,17 @@ int main(int argc, char** argv) {
       // A body with no planar travel holds its facing (thirdperson.h), so a
       // still phase is shot square to its SIDE, the profile a stroke reads
       // from: camera heading (= pi/2 - yaw) a right angle off the body's.
+      static const bool wade = std::getenv("SANDVOX_SHOT_SWIM_WADE") != nullptr;
       cam.yaw = (crawl || dive) ? 0.6f
-                                : 1.5707963f - (avatarHeading + 1.5707963f);
+                : (wade && tread) ? 0.0f
+                                  : 1.5707963f - (avatarHeading + 1.5707963f);
       cam.pitch = -0.22f;
-      pin.forward = (crawl || dive) ? 0.4f : 0.0f;
+      pin.forward = (crawl || dive) ? 0.4f : (wade && tread) ? 1.0f : 0.0f;
       pin.strafe = (crawl || dive) ? 1.0f : 0.0f;
       pin.SetHeld(TB_SPRINT, false);
       // The crawl is W alone: Space held while moving lifts the body half out
       // of the water (submersion 0.2..0.4), which is not how anyone swims.
-      pin.SetHeld(TB_JUMP, tread || up);
+      pin.SetHeld(TB_JUMP, (tread && !wade) || up);
       pin.SetHeld(TB_CROUCH, dive || down);
       pin.SetPressed(TB_JUMP, false);
     }
@@ -15369,9 +15380,19 @@ int main(int argc, char** argv) {
         } else {
           fpHeadValid = false;
         }
+        // The forward push is along the LOOK direction, which says nothing
+        // about which way a limp head faces: ragdolled, it would put the eye
+        // a quarter metre outside the skull (often in the ground). Eased, so
+        // going limp and finishing the get-up do not jump the view.
+        {
+          const float hl =
+              std::max(0.1f, CurrentTuning().avatar.firstPersonHeadHalflife);
+          const float want = avatar.Spawned() && avatar.Ragdolled() ? 0.0f : 1.0f;
+          fpFwdW += (want - fpFwdW) * (1.0f - std::exp2(-dt / hl));
+        }
         const float fpFwd =
             CurrentTuning().avatar.firstPersonForward / kVoxelMeters;
-        eye = eye + cam.FlatForward() * fpFwd;
+        eye = eye + cam.FlatForward() * (fpFwd * fpFwdW);
       } else {
         fpHeadValid = false;
       }
@@ -20476,6 +20497,12 @@ int main(int argc, char** argv) {
         sim.DrawBodyRanges(srp, bodyDraws);
         sim.DrawMicroBodies(srp, microCount);
         sim.DrawPourMarker(srp, pourMarkerAt);
+        // The gust streaks, as the frame draws them: without this a --at
+        // repro of a wind-streak ticket showed none at all (ticket
+        // 2026-10-09_15-09-01). The pool was already advanced this frame;
+        // the EncodeShadowResolve above steps it once more by the same dt.
+        sim.DrawWindStreaks(srp, WindStreakDrawCount(CurrentTuning()),
+                            (uint32_t)CurrentTuning().wind.streakTrail);
         overlay.RenderRecorded(srp);
         srp.End();
         ctx.queue.Submit(senc.Finish());

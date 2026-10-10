@@ -2445,9 +2445,20 @@ class Mob {
   // nothing. 0.1 s of latency on a fall-damage number nobody can see arrive.
   //
   // VOXELS per second, the same units ApplyFallDamage wants.
+  //
+  // ...EXCEPT A LETHAL ONE, which is billed the tick it becomes lethal. The
+  // hold exists so a fold cannot bill twice; a splat cannot be billed twice
+  // anyway (the body is dead after it), and holding it cost the splat its
+  // place: the rig hit the face of a cliff at 40 m/s, BOUNCED off it, and
+  // three quiet ticks later burst in open air with nothing near it, or lay
+  // still at the foot of a fall for six ticks and then burst (bug report
+  // 2026-10-09_15-16-57; `freefall-slope` measured the bill 6-7 ticks after
+  // the arrest that earned it). ArrestIsLethal is ApplyFallDamage's own test.
   static constexpr uint8_t kArrestSettleTicks = 3;
+  bool ArrestIsLethal(Vec3 impactDeltaV) const;
   Vec3 TakeRagdollImpact() {
-    if (ragdollArrestQuiet_ < kArrestSettleTicks) return Vec3{};
+    if (ragdollArrestQuiet_ < kArrestSettleTicks && !ArrestIsLethal(ragdollImpact_))
+      return Vec3{};
     const Vec3 v = ragdollImpact_;
     ragdollImpact_ = Vec3{};
     return v;
