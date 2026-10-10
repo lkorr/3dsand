@@ -3939,6 +3939,12 @@ struct Tuning {
     float streakLife = TPD(wind, streakLife);
     float streakRadius = TPD(wind, streakRadius);
     float streakWidth = TPD(wind, streakWidth);
+    // The ground as the streaks' BOUNDARY (ticket 2026-10-09_15-09-01): the
+    // tracer adds the no-penetration vertical U . grad(h) off the terrain table
+    // and slides along it, so a windward slope keeps its streaks. Off = the
+    // bare field, which is what the heat-updraft gate's probe reads (it uses
+    // one streak step as a readback of windAt).
+    bool streakGround = TPD(wind, streakGround);
 
     // ---- debug slope-field overlay (research doc §4.8) ----
     // Initial state of the arrow overlay; F4 toggles it in-game. It is a

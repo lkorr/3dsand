@@ -162,8 +162,9 @@ fn update(@builtin(global_invocation_id) gid : vec3<u32>) {
   // ends DEEP under the ground hit a wall (a cliff, a ridge the table steps
   // up onto between cells) and dies there as before, or the slide would
   // teleport it up the face and draw a 40 m ribbon in one frame.
+  let ground = (R.streakN.w & 1u) != 0u;   // wind.streakGround
   let trA = windTerrF(p0, &R);
-  if (trA.edge > 0.0) {
+  if (ground && trA.edge > 0.0) {
     var g = vec2f(trA.gx, trA.gz);
     let gl = length(g);
     if (gl > STREAK_FOLLOW_MAX_SLOPE) { g *= STREAK_FOLLOW_MAX_SLOPE / gl; }
@@ -174,7 +175,9 @@ fn update(@builtin(global_invocation_id) gid : vec3<u32>) {
   var p = p0 + w * dt;
   let trB = windTerrF(p, &R);
   var hitWall = false;
-  if (trB.edge > 0.0) {
+  // Off: the bare field's old rule, into the table's ground = dead.
+  if (!ground && trB.edge > 0.0 && p.y < trB.h) { hitWall = true; }
+  if (ground && trB.edge > 0.0) {
     let under = trB.h + STREAK_FLOOR - p.y;
     if (under > STREAK_FLOOR + STREAK_FOLLOW_MAX_SLOPE * length(w.xz) * dt) { hitWall = true; }
     else if (under > 0.0) { p.y += under; }

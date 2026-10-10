@@ -19114,7 +19114,9 @@ no-penetration vertical `U . grad(h)` off the same table (slope clamped to
 1.5, fading over 40 m of height), slides along the ground if a step still ends
 just under it, and dies only on a step that ends DEEP under it (a wall). Not
 added to `windAt` itself: that would have to be mirrored into `windAtQ` and
-would move the sim.
+would move the sim. `wind.streakGround` (default on, `RenderParams.streakN[3]`
+bit 0) switches it; the `heat-updraft` gate's probe turns it off, because it
+reads one streak step back as `windAt`.
 
 `windSampleAt` / `windAt` live in **`assets/shaders/common.wgsl`**, which is
 prepended to every shader, so the field is in scope everywhere without being

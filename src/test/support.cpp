@@ -991,7 +991,7 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
       rp.streakN[0] = (uint32_t)std::clamp(tw.streakCount, 0, (int)kWindStreakCap);
       rp.streakN[1] = (uint32_t)std::clamp(tw.streakTrail, 2, (int)kWindStreakTrail);
       rp.streakN[2] = frame;
-      rp.streakN[3] = 0;
+      rp.streakN[3] = tw.streakGround ? 1u : 0u;
     }
     // The field block, from the same resolution the sim's copy comes from
     // (SubmitTick), with the three clocks at the frame's sub-tick instant so

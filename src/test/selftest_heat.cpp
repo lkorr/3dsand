@@ -1868,6 +1868,8 @@ bool ProbeRenderWind(Ctx& c, const std::vector<Vec3>& pts, const Vec3& eye, uint
     t.wind.streakCount = (int)pts.size();
     t.wind.streakTrail = 2;
     t.wind.streakRadius = std::max(t.wind.streakRadius, 40.0f);
+    // The bare field: the streaks' ground boundary would add U . grad(h).
+    t.wind.streakGround = false;
     SetCurrentTuning(t);
   }
   const uint32_t stride = kWindStreakStride;
