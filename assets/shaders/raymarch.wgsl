@@ -13142,10 +13142,6 @@ fn farBandNearWeight(tFine : f32) -> f32 {
 // level 5), so the term eases out with distance, never on a level boundary.
 const FAR_SKY_FADE_START_M : f32 = 60.0;
 const FAR_SKY_FADE_END_M : f32 = 110.0;
-// A heightfield tread with something over it: its one ray is closed, and it
-// keeps this much of its sky (the near grid under the ticket's crowns: grass
-// openness ~0.3-0.5 against open meadow's 1).
-const FAR_SKY_TREAD_COVERED : f32 = 0.45;
 // A sample is solid when its level chunk holds anything at or above its row
 // (farOcc's count and top row: an open-sky sample above the ground costs the
 // chunk's word, which every neighbouring sample shares) and its byte is a
@@ -13158,11 +13154,7 @@ fn farSkySolid(level : u32, c : vec3<i32>, b : FarBox) -> bool {
   if (top != 0u && (c.y & (i32(CHUNK) - 1)) >= i32(top)) { return false; }
   return farPalAt(level, c) != 0u;
 }
-// `rays` = 5 for a feature's face; 1 (the normal alone) for a heightfield
-// TREAD, whose only sky-hider is something standing over it -- a canopy, an
-// overhang -- since the heightfield is single-valued over its own column.
-fn farFeatureSky(level : u32, cell : vec3<i32>, ni : vec3<i32>, tFine : f32,
-                 rays : i32) -> f32 {
+fn farFeatureSky(level : u32, cell : vec3<i32>, ni : vec3<i32>, tFine : f32) -> f32 {
   let fade = 1.0 - smoothstep(FAR_SKY_FADE_START_M, FAR_SKY_FADE_END_M, tFine * VOXEL_METERS);
   if (fade <= 0.0) { return 1.0; }
   let b = farBox(level);
@@ -13172,15 +13164,13 @@ fn farFeatureSky(level : u32, cell : vec3<i32>, ni : vec3<i32>, tFine : f32,
   let t2 = vec3<i32>(ni.y * t1.z - ni.z * t1.y, ni.z * t1.x - ni.x * t1.z,
                      ni.x * t1.y - ni.y * t1.x);
   var vis = 0.0;
-  for (var r = 0; r < rays; r++) {
+  for (var r = 0; r < 5; r++) {
     var d = ni;
     if (r == 1) { d = ni + t1; } else if (r == 2) { d = ni - t1; }
     else if (r == 3) { d = ni + t2; } else if (r == 4) { d = ni - t2; }
     var open = 1.0;
     var kPrev = 0;
-    // A tread's ray starts 6 fine voxels up: the cells just over a refined
-    // hit's level cell can hold the next sub-column of its own slope.
-    for (var j = select(1, 3, rays == 1); j <= 12; j++) {
+    for (var j = 1; j <= 12; j++) {
       // 2, 4, .. 16 fine voxels densely (a crown lobe's shell is a cell or
       // two thick: a doubling stride stepped over it), then every 12 to 64.
       let k = max(1, select(2 * j, 16 + 12 * (j - 8), j > 8) >> shift);
@@ -13192,9 +13182,8 @@ fn farFeatureSky(level : u32, cell : vec3<i32>, ni : vec3<i32>, tFine : f32,
       let c = cell + d * k;
       if (farSkySolid(level, c, b)) { open = 0.0; break; }
     }
-    vis += select(0.16, select(0.36, 1.0, rays == 1), r == 0) * open;
+    vis += select(0.16, 0.36, r == 0) * open;
   }
-  if (rays == 1) { vis = mix(FAR_SKY_TREAD_COVERED, 1.0, vis); }
   return mix(1.0, vis, fade);
 }
 // THE BOUNCE A FEATURE'S FACE GETS FROM THE GROUND falls off with its height
@@ -14370,11 +14359,8 @@ fn fs(in : VSOut) -> FSOut {
       // one voxel inside the handoff.
       var featSky = 1.0;
       var featBounce = 1.0;
-      if (fSurf && n.y > 0.5) {
-        // A tread: only a canopy or an overhang hides its sky (one ray).
-        openF *= farFeatureSky(flv, far.cell, vec3<i32>(0, 1, 0), far.t, 1);
-      } else if (!fSurf && !fFeat && m.klass != CLASS_LIQUID) {
-        featSky = farFeatureSky(flv, far.cell, vec3<i32>(round(n)), far.t, 5);
+      if (!fSurf && !fFeat && m.klass != CLASS_LIQUID) {
+        featSky = farFeatureSky(flv, far.cell, vec3<i32>(round(n)), far.t);
         openF *= featSky;
         featBounce = featSky * farFeatureBounce(select(hitP.y - groundY, 0.0, groundY < -1e8),
                                                 far.t);
@@ -14531,13 +14517,6 @@ fn fs(in : VSOut) -> FSOut {
       var dbgGiF = vec3f(0.0);
       if (TUNE_GI_STRENGTH > 0.0) {
         dbgGiF = ao * featBounce * farGiBounce(albedo, select(nSh, vec3f(0.0, 1.0, 0.0), fCard));
-        // THE HANDOFF BAND reads the near gather too, as it reads the near
-        // openness above: a far hit inside the window shades with the bounce
-        // the near field measured there, eased to the far estimate by bandW.
-        if (bandW > 0.0 && inBounds(fineV)) {
-          dbgGiF = mix(dbgGiF, albedo * ao * giBounceAt(hitP, n, fineV, albedo) * TUNE_GI_STRENGTH,
-                       bandW);
-        }
         color += dbgGiF;
       }
       if (SEAM_DBG != 0u) {

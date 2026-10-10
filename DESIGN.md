@@ -16363,24 +16363,39 @@ where you hear from either (§12b, "The ears are on the character").
     MATERIAL cell; samples above their level chunk's top row (farOcc) cost no
     byte read. It scales the openness and, with `farFeatureBounce` (1 within
     0.6 m of the column's heightfield top, 0.35 from 2 m up: the ground a crown
-    sees is ground it shades), the bounce. A heightfield TREAD takes one ray
-    (the normal, from 6 fine voxels up so a refined slope's next sub-column is
-    not mistaken for a roof) and keeps 0.45 of its sky under a canopy. Risers
-    and everything else on the heightfield are unchanged. Both terms ease out
-    over 60-110 m (never on a level boundary).
-  - **The band reads the near gather too.** A far hit between the sphere and
-    22.3 m already blended its openness from the near grid (package E); it now
-    blends `giBounceAt` the same way, so inside the band the bounce is the
-    measured one.
+    sees is ground it shades), the bounce. The heightfield itself is
+    unchanged. Both terms ease out over 60-110 m (never on a level boundary).
+    Tried and taken out for cost: one up ray on every heightfield tread (for
+    ground under a canopy; +0.2 ms on the overlook for no measured seam), and
+    blending the near gather (`giBounceAt`) across the 20.5-22.3 m band as
+    the openness is (its gather requests for far-only faces cost the dusk
+    camera's prepass +0.5 ms).
   - **The far bounce's light law is the deposits' law.** The tread radiance
     in `farGiBounce` / `farGiIrradiance` is `irrSample` (hard Lambert), which
     is what the near grid's resolve-pass deposits use. It was the shade's
     WRAPPED Lambert, which at a horizon sun (and under the moon) still lit the
     far ground at half strength: at minute 1020 the meadow was +11/255 across
     the handoff, all of it this term.
-  - **Measured**, same-pixel medians far - near (/255 luma), before -> after:
-    see the package report for the full table; noon leaves +16.5 -> +0.8, bark
-    +16.7 -> -1.5, grass +0.3 -> +0.1.
+  - **Measured**, same-pixel medians far - near (/255 luma, final image, 9-20 m,
+    the ticket's camera, 1600x900), before -> after (the shipped code). Noon:
+    all tree leaves +16.5 -> +2.7 (autumn_dark +16.6 -> +1.2, gold_dark
+    +14.3 -> +0.9, gold_leaves, the crown's outer mid tier, +17.7 -> +7.3),
+    bark_light +16.7 -> +0.3, bark_dark +10.1 -> +1.8, grass +0.3 -> +0.5.
+    Minute 1020 (dusk; sun under the horizon, moonlit): leaves -> +6, bark
+    +4..6, grass +12.6 -- but the sky and the near ground themselves drifted
+    +1.7 / +1.3 between the two boots of that pair, and with the tread ray
+    (above) the same pair read leaves 0.0, grass +7.8, so read dusk as "within
+    a few luma, grass under canopy still brighter far". 16:00: leaves -1.8,
+    grass +6.4 (with the tread ray). Overcast runs agree within the run-to-run
+    drift of the sky (the weather is not pinned frame-exact between boots, and
+    the aerial fog takes the sky's colour, which moves distant pixels by
+    several luma between two
+    otherwise identical runs: compare pre-aerial terms, SEAM_DBG 4, there).
+    `--render-budget` baseline (1080p, exclusive lock, main's exe, c278b75's
+    shaders vs these, back to back): noon 4.85 -> 5.04 ms, dusk 7.33 -> 7.50,
+    cascade 4.64 -> 4.77, seam 5.82 -> 6.07, seamveg 10.47 -> 10.62, fire
+    12.84 -> 13.06, canopy 5.88 -> 5.97, peaksea 12.44 -> 12.42 (single
+    samples; ~0.1 ms is the run-to-run spread).
   - **Still not matched**: the far crown is a centre-sampled shell, so it is
     porous to the SUN (outer leaves: far shadow ~1 where the near shell gives
     0.44-0.57) and to view rays (a far crown shows sky through it); the far
