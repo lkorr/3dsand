@@ -24008,7 +24008,11 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   raised toward level + 1 (the sill). Touched columns lose the sediment wedge
   and the caves (`Col.wet`), and lay the bed / shore material (a powder keeps
   to its step line in `cols`). Keep-outs: no trunk within half-width +
-  max(bank, crown) of a river or band + crown of a shore; no cover, tile
+  max(bank, crown) of a river or band + crown of a shore, nor inside a
+  lake's polygon where its ground is under the level (`siteBlocksTrunk`
+  asks `lakeTest` at the trunk, so the far cascades' crowns -- which read
+  only `treeInfoBare` -- agree with the near field, which drops tree cells
+  over water; an island keeps its trees); no cover, tile
   plant, tarn or cactus in a channel or a shore band. **Far:** the cascades
   see the water through genColumn; `roadTint` paints a cell water where a
   river is narrower than it (down to a sixteenth of the cell); the horizon
