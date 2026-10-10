@@ -1334,7 +1334,15 @@ bool PlayerAvatar::HeadEyeWorld(Vec3& out) const {
   if (head < 0 || head >= (int)limbs_.size()) return false;
   Vec3 corner;
   Quat q;
-  if (!PartPosedWorld(head, corner, q)) return false;
+  // RAGDOLLED, THE HEAD IS WHERE THE BODY IS, not where the animation would
+  // put it: limp, Jolt owns the limb and the pose target sits wherever the
+  // controller last stood; getting up, SubmitPose writes the blended lying ->
+  // standing transform into xf. Either way xf is the head that is DRAWN, so
+  // the eye goes with it (same corner+rotation form as PartPosedWorld). A
+  // severed head has no body here and falls through to the pose.
+  if (!(Ragdolled() && PartWorldTransform(head, corner, q)) &&
+      !PartPosedWorld(head, corner, q))
+    return false;
   // eyeLocal is an offset from the head's ANCHOR (the neck joint) in art
   // voxels, rest frame (MobDef::eyeLocal); the posed rotation carries both.
   out = corner + Rotate(q, limbs_[(size_t)head].anchorLimb +

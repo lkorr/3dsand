@@ -7532,6 +7532,9 @@ int main(int argc, char** argv) {
   // posed head's eyes (PlayerAvatar::HeadEyeWorld). Render-only.
   Vec3 fpHeadDelta{};
   bool fpHeadValid = false;
+  // Weight (0..1) of the avatar.firstPersonForward push: eased out while the
+  // body is ragdolled, so the eye stays inside the tumbling head.
+  float fpFwdW = 1.0f;
   float& respawnTimer = session.respawnTimer;
   // Night-ambience rarity roll. Deliberately a plain PRNG and NOT the sim's
   // counter-based hash: this decides whether a mood bed plays, never anything
@@ -15369,9 +15372,19 @@ int main(int argc, char** argv) {
         } else {
           fpHeadValid = false;
         }
+        // The forward push is along the LOOK direction, which says nothing
+        // about which way a limp head faces: ragdolled, it would put the eye
+        // a quarter metre outside the skull (often in the ground). Eased, so
+        // going limp and finishing the get-up do not jump the view.
+        {
+          const float hl =
+              std::max(0.1f, CurrentTuning().avatar.firstPersonHeadHalflife);
+          const float want = avatar.Spawned() && avatar.Ragdolled() ? 0.0f : 1.0f;
+          fpFwdW += (want - fpFwdW) * (1.0f - std::exp2(-dt / hl));
+        }
         const float fpFwd =
             CurrentTuning().avatar.firstPersonForward / kVoxelMeters;
-        eye = eye + cam.FlatForward() * fpFwd;
+        eye = eye + cam.FlatForward() * (fpFwd * fpFwdW);
       } else {
         fpHeadValid = false;
       }
