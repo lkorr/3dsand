@@ -711,6 +711,49 @@ struct UIState {
     kSlotLegUR, kSlotLegLR, kSlotFootR,
     kSlotCount
   };
+  // ---- THE PAPER DOLL'S LAYOUT (overlay.cpp DrawBodyFigure) ---------------
+  // The HUD figure is a pixel grid, kDollW x kDollH cells, the body seen from
+  // BEHIND (so the player's left arm is on the screen's left, as it is in
+  // their own view). Each slot owns one rectangle of it, and main.cpp fills
+  // that rectangle from the limb's REAL voxels projected front-on, so a hole
+  // bored through a forearm is a hole in the forearm's cells. Shared here
+  // because both sides need it: main.cpp bins voxels into a slot's w x h, the
+  // overlay places those cells at x, y. Rest-pose rigs hang their arms, which
+  // is why every slot is a vertical rectangle.
+  static constexpr int kDollW = 36, kDollH = 76;
+  struct DollRect { int x, y, w, h; };
+  static constexpr DollRect kDollRect[kSlotCount] = {
+      {12, 0, 12, 14},   // head
+      {10, 15, 16, 20},  // torso
+      {10, 36, 16, 6},   // hips
+      {3, 15, 6, 15},    // upper arm L
+      {3, 31, 6, 14},    // forearm L
+      {3, 46, 6, 6},     // hand L
+      {27, 15, 6, 15},   // upper arm R
+      {27, 31, 6, 14},   // forearm R
+      {27, 46, 6, 6},    // hand R
+      {10, 43, 7, 14},   // thigh L
+      {10, 58, 7, 13},   // shin L
+      {9, 72, 8, 4},     // foot L
+      {19, 43, 7, 14},   // thigh R
+      {19, 58, 7, 13},   // shin R
+      {19, 72, 8, 4},    // foot R
+  };
+  static constexpr int kDollCellsMax = 16 * 20;  // the torso, the largest rect
+  // One cell of a slot's rectangle: what the voxel COLUMN behind it is doing.
+  // Everything but `had` is a 0..255 share, so the overlay mixes colours from
+  // it directly. `intact` is of the matter the column held at spawn; the rest
+  // are of what it holds NOW.
+  struct DollCell {
+    uint8_t had = 0;      // 1 = the limb had matter here at spawn
+    uint8_t intact = 0;   // live voxels / voxels at spawn
+    uint8_t hot = 0;      // on fire (material tagged `hot`)
+    uint8_t charred = 0;  // cooked counts half, charred whole
+    uint8_t rot = 0;      // infection tissue
+    uint8_t bruise = 0;   // mean contusion, 255 = split skin everywhere
+    uint8_t stain = 0;    // amount-weighted coat
+    uint8_t pad = 0;
+  };
   struct BodyPartUI {
     bool present = false;   // rig HAS this part (false = never draw it)
     bool severed = false;   // lost — drawn as a stump, not as a damaged limb
@@ -803,6 +846,10 @@ struct UIState {
     float projMin[2] = {0, 0}, projMax[2] = {0, 0};
     bool projValid = false;
     const char* label = "";  // "Left forearm" etc, for the damage list
+    // The doll's cells for this slot, row-major in kDollRect[slot].w x h.
+    // dollValid false = no profile yet (draws as a plain filled rectangle).
+    bool dollValid = false;
+    DollCell doll[kDollCellsMax];
   };
   BodyPartUI body[kSlotCount];
   bool bodyValid = false;   // false until the avatar has spawned
@@ -1939,7 +1986,20 @@ class Overlay {
   // The per-limb body readout that sits above the hp bar. Draws upward from
   // `yBottom` and returns the height it reserved, so DrawHUD stacks the "DEAD"
   // banner above it without duplicating the figure's proportions.
-  float DrawBodyFigure(const UIState& s, float x, float yBottom);
+  float DrawBodyFigure(const UIState& s, float x, float yBottom, float width);
+  // The figure's PRESENTATION memory — never game state, only what the HUD
+  // needs to animate: each slot's hp last frame (a drop flashes the limb
+  // white), the flash's remaining seconds, and the heart trace's scrolling
+  // history and phase. Wall-clock, frame-rate independent, and reset when the
+  // body stops being valid.
+  float dollPrevHp_[UIState::kSlotCount] = {};
+  float dollFlash_[UIState::kSlotCount] = {};
+  bool dollPrevSevered_[UIState::kSlotCount] = {};
+  bool dollPrevValid_ = false;
+  static constexpr int kEcgCols = 64;
+  float ecg_[kEcgCols] = {};
+  int ecgHead_ = 0;
+  float ecgPhase_ = 0.0f, ecgAcc_ = 0.0f;
   // The F1 sidebar's pages (Draw() owns the frame, header and page strip).
   void DrawDevPaint(UIState& s);
   void DrawDevSpawn(UIState& s);

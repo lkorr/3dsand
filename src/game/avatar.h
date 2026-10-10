@@ -177,6 +177,24 @@ class PlayerAvatar : public Mob {
   // cost this exists to remove (docs/PLAN_perf_audit_2026-09-23.md P6.1).
   void PartMaterialTally(int part, const uint16_t* binMask,
                          uint32_t* bins) const;
+  // Every voxel of `part` on the lattice PartVoxelCount counts, in the limb's
+  // own rest frame: fn(x, y, z, material, stainWord, bruise). The HUD paper
+  // doll walks this once per limb per frame to draw WHERE a limb is hollowed,
+  // charred or burning, and folds its material tally into the same walk. The
+  // coarse lattice carries no bruise, so it reports 0 there.
+  template <class F>
+  void ForEachPartVoxel(int part, F&& fn) const {
+    if (part < 0 || part >= (int)limbs_.size()) return;
+    const MobLimb& l = limbs_[part];
+    if (l.HasFineSkin()) {
+      for (const PrefabVoxel& v : l.skinVoxels)
+        fn((int)v.x, (int)v.y, (int)v.z, (uint32_t)v.material, (uint32_t)v.stain,
+           (uint32_t)v.bruise);
+    } else {
+      for (const DebrisVoxel& v : l.voxels)
+        fn((int)v.x, (int)v.y, (int)v.z, (uint32_t)v.payload, (uint32_t)v.stain, 0u);
+    }
+  }
   // Cells in a part's dense burn index; 0 = the index does not exist, i.e.
   // nothing reactive has come near it. Diagnostic.
   uint32_t PartBurnIndexCells(int part) const {

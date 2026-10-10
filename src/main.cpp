@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <thread>
 #include <cstdio>
@@ -1436,7 +1438,7 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
   // One bin PER INFECTION MATERIAL from kBinRot up (the mask is 16 bits: nine
   // infections each get their own; any past that share the last bin).
   enum : int { kBinCooked, kBinCharred, kBinSkin, kBinFlesh, kBinMuscle,
-               kBinBone, kBinBrain, kBinRot, kBinCount = 16 };
+               kBinBone, kBinBrain, kBinHot, kBinRot, kBinCount = 16 };
   std::array<uint16_t, 4096> binMask{};
   auto mark = [&](uint32_t m, int bin) { binMask[m & 0xFFFu] |= (uint16_t)(1u << bin); };
   const int nInfect = std::min((int)tissueMats.rot.size(), kBinCount - kBinRot);
@@ -1449,20 +1451,65 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
   if (tissueMats.brain)  mark(tissueMats.brain, kBinBrain);
   for (size_t k = 0; k < tissueMats.rot.size(); k++)
     mark(tissueMats.rot[k], kBinRot + std::min((int)k, kBinCount - kBinRot - 1));
+  // `hot` by TAG, the same test BodyBurnState::hotVox counts, so the doll's
+  // burning cells and the inspector's "N burning" are one definition.
+  for (size_t m = 0; m < mats.size() && m < 4096; m++)
+    for (const std::string& t : mats[m].tags)
+      if (t == "hot") { mark((uint32_t)m, kBinHot); break; }
+
+  // ---- THE PAPER DOLL (UIState::kDollRect) --------------------------------
+  // Each limb's voxels, binned front-on into its slot's rectangle. The FRAME
+  // a limb is binned in (its x/y extent) and the per-cell count it had are
+  // taken the first time the limb is seen and then only ever raised: matter
+  // is lost, never grown, so the high-water mark IS the spawn silhouette, and
+  // freezing the extent is what keeps a hole a hole rather than letting the
+  // shrunken limb re-stretch to fill its rectangle. Presentation memory only,
+  // never hashed, never saved, reset when the body (id or def) changes.
+  struct DollFrame {
+    bool valid = false;
+    int x0 = 0, x1 = 0, y0 = 0, y1 = 0;
+    uint16_t spawn[UIState::kDollCellsMax] = {};
+  };
+  struct DollAcc {
+    uint32_t spawn[UIState::kDollCellsMax], now[UIState::kDollCellsMax],
+        hot[UIState::kDollCellsMax], charred2[UIState::kDollCellsMax],
+        rot[UIState::kDollCellsMax], bruise[UIState::kDollCellsMax],
+        stain[UIState::kDollCellsMax];
+    bool used;
+  };
+  static uint64_t dollMob = 0;
+  static const MobDef* dollDef = nullptr;
+  static std::vector<DollFrame> dollFrames;
+  static std::vector<DollAcc> dollAcc(UIState::kSlotCount);
+  for (DollAcc& a : dollAcc) std::memset(&a, 0, sizeof a);
   // Walk the DEF's limbs, not PartCount() — the latter includes the borrowed
   // held-item slot, which is not part of the body.
   const int limbCount = (int)def->limbs.size();
+  if (dollMob != mobId || dollDef != def || (int)dollFrames.size() != limbCount) {
+    dollMob = mobId;
+    dollDef = def;
+    dollFrames.assign((size_t)limbCount, DollFrame{});
+  }
   for (int i = 0; i < limbCount; i++) {
     const int slot = BodySlotFor(avatar.PartName(i), avatar.PartTag(i));
     if (slot < 0) continue;
     UIState::BodyPartUI& b = ui.body[slot];
     b.present = true;
     b.hpMax = avatar.PartHpMax(i);
+    const UIState::DollRect& R = UIState::kDollRect[slot];
+    const int nCells = R.w * R.h;
+    DollFrame& df = dollFrames[(size_t)i];
+    DollAcc& da = dollAcc[(size_t)slot];
     if (!avatar.PartAlive(i)) {
       b.severed = true;
       b.hpFrac = 0.0f;
       b.hp = 0.0f;
       b.voxelFrac = 0.0f;
+      // The silhouette it HAD, so the doll can draw the ghost of the limb.
+      if (df.valid) {
+        da.used = true;
+        for (int c = 0; c < nCells; c++) da.spawn[c] += df.spawn[c];
+      }
       continue;  // a lost limb neither bleeds nor reports damage
     }
     const float max = avatar.PartHpMax(i);
@@ -1479,7 +1526,52 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
     b.voxelFrac = spawn > 0 ? std::clamp((float)now / (float)spawn, 0.0f, 1.0f)
                             : 1.0f;
     uint32_t bins[kBinCount] = {};
-    if (now > 0) avatar.PartMaterialTally(i, binMask.data(), bins);
+    if (now > 0 && !df.valid) {
+      df.x0 = df.y0 = INT_MAX;
+      df.x1 = df.y1 = INT_MIN;
+      avatar.ForEachPartVoxel(i, [&](int x, int y, int, uint32_t, uint32_t, uint32_t) {
+        df.x0 = std::min(df.x0, x); df.x1 = std::max(df.x1, x);
+        df.y0 = std::min(df.y0, y); df.y1 = std::max(df.y1, y);
+      });
+      df.valid = true;
+    }
+    if (now > 0) {
+      // ONE walk: the tally the inspector reads and the doll's cells. Column
+      // 0 is the limb's +x side, the body's left, which the doll draws on the
+      // screen's left (it is the body seen from behind); row 0 is the top.
+      const int spanX = df.x1 - df.x0 + 1, spanY = df.y1 - df.y0 + 1;
+      uint16_t cellNow[UIState::kDollCellsMax] = {};
+      da.used = true;
+      avatar.ForEachPartVoxel(i, [&](int x, int y, int, uint32_t mat, uint32_t stain,
+                                     uint32_t bruise) {
+        uint16_t m = binMask[mat & 0xFFFu];
+        const uint32_t mm = m;
+        while (m) {
+          bins[std::countr_zero((unsigned)m)]++;
+          m &= (uint16_t)(m - 1);
+        }
+        const int cx = std::clamp((df.x1 - x) * R.w / spanX, 0, R.w - 1);
+        const int cy = std::clamp((df.y1 - y) * R.h / spanY, 0, R.h - 1);
+        const int c = cy * R.w + cx;
+        cellNow[c]++;
+        da.now[c]++;
+        if (mm & (1u << kBinHot)) da.hot[c]++;
+        if (mm & (1u << kBinCooked)) da.charred2[c] += 1;
+        if (mm & (1u << kBinCharred)) da.charred2[c] += 2;
+        if (mm >> kBinRot) da.rot[c]++;
+        // A split cell counts past the deepest bruise, so torn skin reads
+        // as the worst contusion the figure can show.
+        da.bruise[c] += bruise >= kBruiseBroken ? 28u : bruise;
+        da.stain[c] += BodyStainAmt((uint16_t)stain);
+      });
+      for (int c = 0; c < nCells; c++) {
+        df.spawn[c] = std::max(df.spawn[c], cellNow[c]);
+        da.spawn[c] += df.spawn[c];
+      }
+    } else if (df.valid) {
+      da.used = true;
+      for (int c = 0; c < nCells; c++) da.spawn[c] += df.spawn[c];
+    }
     if (now > 0) {
       const uint32_t cooked = bins[kBinCooked], charred = bins[kBinCharred];
       // Charred counts double against "intact-looking": cooked flesh is still
@@ -1538,6 +1630,30 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
       sc.voxels += lc->voxels;
       sc.sumAmt += lc->sumAmt;
       for (const CoatEntry& e : lc->top) sc.Add(e.mat, e.sumAmt);
+    }
+  }
+
+  // Fold each slot's accumulated columns into the 0..255 shares the overlay
+  // mixes colours from.
+  for (int i = 0; i < UIState::kSlotCount; i++) {
+    const DollAcc& da = dollAcc[(size_t)i];
+    UIState::BodyPartUI& b = ui.body[i];
+    if (!da.used || !b.present) continue;
+    b.dollValid = true;
+    const UIState::DollRect& R = UIState::kDollRect[i];
+    auto share = [](uint32_t n, uint32_t d) {
+      return (uint8_t)(d ? std::min<uint32_t>(255u, n * 255u / d) : 0u);
+    };
+    for (int c = 0; c < R.w * R.h; c++) {
+      UIState::DollCell& dc = b.doll[c];
+      const uint32_t n = da.now[c];
+      dc.had = da.spawn[c] > 0 ? 1 : 0;
+      dc.intact = share(n, da.spawn[c]);
+      dc.hot = share(da.hot[c], n);
+      dc.charred = share(da.charred2[c], n * 2);
+      dc.rot = share(da.rot[c], n);
+      dc.bruise = share(da.bruise[c], n * 28);
+      dc.stain = share(da.stain[c], n * kBodyStainAmtMax);
     }
   }
 
@@ -12115,6 +12231,31 @@ int main(int argc, char** argv) {
             break;
           }
         }
+      }
+      // SANDVOX_SHOT_HUD_HURT=1: hurt the body BEFORE screenshot_hud.bmp, so
+      // the HUD's paper doll is photographed with something to say — a hand
+      // off, a forearm bored through, a shin on fire and a cut thigh. Off by
+      // default so the ordinary HUD picture stays the unhurt one.
+      if (frameCounter == kShotInvHudSetup + 4 && avatar.Spawned() &&
+          std::getenv("SANDVOX_SHOT_HUD_HURT")) {
+        std::vector<ParticleSpawn> shotSpawns;
+        for (int i = 0; avatar.Def() && i < (int)avatar.Def()->limbs.size(); i++) {
+          const std::string n = avatar.PartName(i);
+          Vec3 at;
+          if (n == "armL.L" && avatar.PartAnchorWorld(i, at)) {
+            at.y -= 2.5f;
+            avatar.CarveRadial(at, 1.3f, world, shotSpawns);
+          } else if (n == "legL.R") {
+            avatar.IgnitePart(i, 60);
+          } else if (n == "legU.L" && avatar.PartAnchorWorld(i, at)) {
+            at.y -= 3.0f;
+            at.x += 1.0f;
+            avatar.CarveRadial(at, 1.0f, world, shotSpawns);
+          }
+        }
+        avatar.SeverByName("hand.R");
+        std::printf("--shot-inventory: SANDVOX_SHOT_HUD_HURT (health %d/%d)\n",
+                    avatar.TotalHealth(), avatar.HealthMax());
       }
       if (frameCounter == kShotInvOpenFrame) {
         // DRESS THE FIGURE BEFORE PHOTOGRAPHING IT. The portrait is the only

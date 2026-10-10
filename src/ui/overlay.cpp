@@ -437,50 +437,14 @@ void Overlay::DrawHUD(const UIState& s) {
       ui::ShadowText(d, ImVec2(tx, ty), ui::ColGoldHi(), s.strikeNowText.c_str());
   }
 
-  // ---- what is ON you, one line, only when there is enough of it -----------
-  //
-  // The bars say how you ARE; the figure's tint says which parts are coated;
-  // this NAMES the substance, which a colour cannot. Below s.stainHudMin
-  // (tune.coat.hudMinFrac, mirrored into UIState so this file needs no sim
-  // header) the line is not drawn AT ALL — no reserved gap, no faded caption
-  // — so a clean player's HUD is exactly the HUD that was here before.
-  float yStack = yHealth - gap;
-  if (s.bodyValid && s.stainFrac >= s.stainHudMin && s.stainColor != 0) {
-    // EVERY substance, each in its own colour with its own share: "stained
-    // 40% · oil 22% · water 18%". Naming only the heaviest is how an
-    // oiled player in the rain read as "water" and nothing else (2026-09-23).
-    // A substance too thin to round to 1% is not worth a word.
-    char buf[80];
-    snprintf(buf, sizeof buf, "stained %.0f%%", s.stainFrac * 100.0f);
-    const ImVec2 ts = ImGui::CalcTextSize(buf);
-    const ImVec2 tp(x, std::floor(yStack - ts.y - 2.0f));
-    // Lightened toward white: an authored stain colour is picked to read as
-    // DRIED matter on a lit surface, and the same value set as 13 px of text
-    // over the figure's dark scrim is barely a shape.
-    ui::ShadowText(d, tp, ui::Mix(s.stainColor, IM_COL32_WHITE, 0.45f), buf);
-    float cx = tp.x + ts.x;
-    int named = 0;
-    for (int k = 0; k < s.coatCount; k++) {
-      const UIState::CoatName& c = s.coats[k];
-      if (c.color == 0 || c.frac < 0.005f) continue;
-      snprintf(buf, sizeof buf, " \xc2\xb7 %s %.0f%%",
-               c.label[0] ? c.label : "something", c.frac * 100.0f);
-      ui::ShadowText(d, ImVec2(cx, tp.y),
-                     ui::Mix(c.color, IM_COL32_WHITE, 0.45f), buf);
-      cx += ImGui::CalcTextSize(buf).x;
-      named++;
-    }
-    if (named == 0) {
-      snprintf(buf, sizeof buf, " \xc2\xb7 %s",
-               s.stainLabel[0] ? s.stainLabel : "something");
-      ui::ShadowText(d, ImVec2(cx, tp.y),
-                     ui::Mix(s.stainColor, IM_COL32_WHITE, 0.45f), buf);
-    }
-    yStack = tp.y - 2.0f;
-  }
+  // What is ON you used to be a text line here ("stained 40% . oil 22%");
+  // it is the coat chip in the paper doll's right column now, still silent
+  // below s.stainHudMin, with the per-substance breakdown on the character
+  // screen where there is room to read it.
+  const float yStack = yHealth - gap - 2.0f;
 
-  // ---- body condition, sitting directly above the hp bar -------------------
-  const float figureH = DrawBodyFigure(s, x, yStack);
+  // ---- body condition: the paper doll, directly above the hp bar -----------
+  const float figureH = DrawBodyFigure(s, x, yStack, w);
   const float yTop = yStack - figureH;
   sHudTop = yTop - (s.playerAlive ? 8.0f : 30.0f);
 
@@ -753,148 +717,520 @@ void Overlay::DrawHUD(const UIState& s) {
   DrawHudHotbar(s, d);
 }
 
-// ---- the body-condition stick figure ----------------------------------------
+// ---- the body-condition PAPER DOLL ------------------------------------------
 //
-// A limb is one thick line segment. Three states, in priority order, because
-// they are not independent — a severed limb cannot bleed and its damage is no
-// longer news:
+// A panel as wide as the health bar it sits on. Left: the body as a pixel
+// grid (UIState::kDollRect), every limb filled from its OWN voxels, so the
+// figure is not a diagram of the body but a small picture of it — a forearm
+// bored through has a hole where the bolt went, a charred thigh is black where
+// it is charred, a burning hand is on fire. Right: only what is urgent, and
+// only while it is. One word for the worst thing happening, a pixel icon per
+// condition with a pip per limb it is happening to, the coat as a strip of
+// its colours, and a heart trace whose rate and colour follow the hp pool.
+// Numbers live in the character screen's health view; this is the glance.
 //
-//   severed   -> the segment is NOT drawn at all; a dim stump tick is left at
-//                the joint so the gap reads as "lost" rather than "the HUD
-//                forgot to draw an arm"
-//   bleeding  -> flashes between its damage colour and hot red, on a wall-clock
-//                sine (ImGui::GetTime) so the pulse is frame-rate independent
-//   damaged   -> lerp from bone-white at full hp to deep red at zero
+// Per cell, in the order they paint (later layers win, because they are
+// later in the story of the limb and the louder alarm):
+//   base     hp tint of the slot (parchment -> ochre -> cinnabar), shaded as
+//            if lit from the upper left, darkened as the column hollows out
+//   char     toward soot, by how cooked/charred the column is
+//   rot      toward the infection's own colour
+//   bruise   toward a contusion purple; split skin toward blood
+//   coat     toward the substance on it, per cell, so a spray reads as a spray
+//   fire     a stepped flicker of flame colours, plus rising embers
+//   flash    white for a moment when the slot just lost hp
+// A column with less than ~15% of its matter left is a HOLE and draws as a
+// dim checker of what was there; a severed limb draws its whole silhouette
+// that way in dried blood, so a lost arm is visibly an absence and not an
+// arm the HUD forgot. Bleeding limbs get a pulsing red rim and falling drops;
+// burning limbs a flickering ember rim with a glow ring outside it.
 //
-// Drawn bottom-up from `yBottom` and returns its own height so the caller can
-// stack whatever comes next without restating the layout.
-float Overlay::DrawBodyFigure(const UIState& s, float x, float yBottom) {
-  // Proportions in figure-local units, then scaled. Origin is the pelvis.
-  const float unit = 5.0f;                 // px per figure unit
-  const float legLen = 3.0f, armLen = 2.6f, spineLen = 3.2f;
-  const float shoulder = 2.2f, hipW = 1.3f, headR = 1.5f * unit;
-  const float thick = 3.2f;
-  const float height = (spineLen + legLen * 2 + 3.4f) * unit;
-  if (!s.bodyValid) return height;
+// Everything that moves runs on the wall clock (ImGui::GetTime) and is
+// stepped at a sprite-like rate, never smooth, so it stays pixel art.
+namespace {
+
+uint32_t DollHash(uint32_t a, uint32_t b = 0, uint32_t c = 0) {
+  uint32_t h = a * 0x9E3779B1u ^ (b + 0x7F4A7C15u) * 0x85EBCA77u ^ (c + 0x165667B1u) * 0xC2B2AE3Du;
+  h ^= h >> 15;
+  h *= 0x2C1B3C6Du;
+  h ^= h >> 12;
+  h *= 0x297A2D39u;
+  h ^= h >> 15;
+  return h;
+}
+float DollRand(uint32_t a, uint32_t b = 0, uint32_t c = 0) {
+  return (float)(DollHash(a, b, c) & 0xFFFFu) / 65535.0f;
+}
+
+// A 2x pixel icon from a little bitmap: '.' clear, anything else looked up
+// in `pal` by character. Drawn at `px` screen pixels per art pixel.
+struct IconInk { char ch; ImU32 col; };
+void DollIcon(ImDrawList* d, ImVec2 at, const char* const* rows, int nRows,
+              const IconInk* pal, int nPal, float px) {
+  for (int y = 0; y < nRows; y++)
+    for (int x = 0; rows[y][x]; x++) {
+      const char ch = rows[y][x];
+      if (ch == '.') continue;
+      for (int k = 0; k < nPal; k++)
+        if (pal[k].ch == ch) {
+          const ImVec2 a(at.x + x * px, at.y + y * px);
+          d->AddRectFilled(a, ImVec2(a.x + px, a.y + px), pal[k].col);
+          break;
+        }
+    }
+}
+
+const char* const kIconFlameA[8] = {"...#...", "..##...", "..###..", ".##o##.",
+                                    ".#ooo#.", "##oYo##", "#ooYYo#", ".#ooo#."};
+const char* const kIconFlameB[8] = {"....#..", "...##..", "..###..", ".##o##.",
+                                    ".#oo##.", "##oYo##", "#oYYoo#", ".#ooo#."};
+const char* const kIconDrop[8] = {"...#...", "...#...", "..###..", ".##o##.",
+                                  "##oo###", "##o####", ".#####.", "..###.."};
+const char* const kIconSkull[8] = {".#####.", "#######", "#kk#kk#", "#kk#kk#",
+                                   "###k###", ".#####.", ".#k#k#.", "......."};
+const char* const kIconSplat[8] = {"#..#...", "...#..#", ".####..", "######.",
+                                   ".#####.", "..###.#", ".#..#..", "#......"};
+
+}  // namespace
+
+float Overlay::DrawBodyFigure(const UIState& s, float x, float yBottom, float width) {
+  using DC = UIState::DollCell;
+  constexpr int W = UIState::kDollW, H = UIState::kDollH;
+  const float C = 2.0f;                       // screen px per doll cell
+  const float pad = 6.0f;
+  const float height = H * C + pad * 2.0f;
+  const float dt = std::clamp(ImGui::GetIO().DeltaTime, 0.0f, 0.1f);
+  const double now = ImGui::GetTime();
+  // No body (fly mode despawns the rig): no panel, and no empty gap either.
+  if (!s.bodyValid) {
+    dollPrevValid_ = false;
+    return 0.0f;
+  }
 
   ImDrawList* d = ImGui::GetForegroundDrawList();
+  const float top = std::floor(yBottom - height);
+  x = std::floor(x);
 
-  // Pelvis sits one leg-span up from the bottom edge; the head crown lands at
-  // the top of the reserved height.
-  const float px = x + 3.0f * unit;   // a little inset so arms have room
-  const float py = yBottom - legLen * 2.0f * unit - 2.0f;
-  auto P = [&](float fx, float fy) {  // figure units -> screen, +fy is UP
-    return ImVec2(px + fx * unit, py - fy * unit);
+  // ---- presentation memory: which slot just got hurt ----------------------
+  for (int i = 0; i < UIState::kSlotCount; i++) {
+    const UIState::BodyPartUI& b = s.body[i];
+    dollFlash_[i] = std::max(0.0f, dollFlash_[i] - dt);
+    if (dollPrevValid_ && b.present) {
+      if (b.severed && !dollPrevSevered_[i]) dollFlash_[i] = 0.6f;
+      else if (!b.severed && b.hp < dollPrevHp_[i] - 0.5f) dollFlash_[i] = 0.3f;
+    }
+    dollPrevHp_[i] = b.hp;
+    dollPrevSevered_[i] = b.severed;
+  }
+  dollPrevValid_ = true;
+
+  // ---- the panel ------------------------------------------------------------
+  // Flat obsidian with a bronze rim and a 2 px ridge: the HUD bars' language,
+  // zero rounding.
+  d->AddRectFilled(ImVec2(x - 2, top - 2), ImVec2(x + width + 2, yBottom + 2),
+                   IM_COL32(0, 0, 0, 110));
+  d->AddRectFilled(ImVec2(x, top), ImVec2(x + width, yBottom), IM_COL32(18, 20, 28, 200));
+  d->AddRectFilled(ImVec2(x, top), ImVec2(x + width, top + 2), ui::Fade(ui::ColHi(), 0.8f));
+  d->AddRect(ImVec2(x, top), ImVec2(x + width, yBottom), ui::Fade(ui::ColBronze(), 0.9f),
+             0.0f, 0, 2.0f);
+
+  const float ox = x + 8.0f, oy = top + pad;   // doll origin
+  // A faint floor line under the feet, so the figure stands on something.
+  d->AddRectFilled(ImVec2(ox + 4, oy + H * C), ImVec2(ox + W * C - 4, oy + H * C + 2),
+                   ui::Fade(ui::ColBronze(), 0.5f));
+
+  // ---- composite the doll into a cell buffer --------------------------------
+  // col = 0 means empty. ghost marks a hole/severed cell (drawn as a checker
+  // and NOT counted as filled by the rim pass). owner = which slot painted it.
+  ImU32 col[W * H] = {};
+  ImU32 ghost[W * H] = {};
+  int8_t owner[W * H];
+  std::memset(owner, -1, sizeof owner);
+  const float pulse = 0.5f + 0.5f * (float)std::sin(now * 7.0);
+  const uint32_t flick = (uint32_t)(now * 12.0);   // sprite-rate flame step
+
+  auto hpTint = [](float f) {
+    f = std::clamp(f, 0.0f, 1.0f);
+    const ImU32 hi = IM_COL32(214, 200, 160, 255);   // parchment, well
+    const ImU32 mid = IM_COL32(206, 138, 70, 255);   // ochre, hurt
+    const ImU32 lo = IM_COL32(150, 38, 36, 255);     // cinnabar, failing
+    return f > 0.5f ? ui::Mix(mid, hi, (f - 0.5f) * 2.0f) : ui::Mix(lo, mid, f * 2.0f);
   };
+  auto scale = [](ImU32 c, float k) {
+    const int r = std::min(255, (int)(((c >> IM_COL32_R_SHIFT) & 0xFF) * k));
+    const int g = std::min(255, (int)(((c >> IM_COL32_G_SHIFT) & 0xFF) * k));
+    const int b = std::min(255, (int)(((c >> IM_COL32_B_SHIFT) & 0xFF) * k));
+    return IM_COL32(r, g, b, 255);
+  };
+  const ImU32 kFlame[4] = {IM_COL32(255, 226, 110, 255), IM_COL32(250, 160, 50, 255),
+                           IM_COL32(226, 90, 34, 255), IM_COL32(255, 196, 70, 255)};
 
-  // Wall-clock flash for bleeding parts. One phase for the whole body so the
-  // wounds pulse together and read as one alarm rather than as noise.
-  const float flash =
-      0.5f + 0.5f * (float)sin(ImGui::GetTime() * 7.0f);
+  bool slotBurning[UIState::kSlotCount] = {};
+  int nBurning = 0, nBleeding = 0, nSevered = 0;
+  uint32_t rotVox = 0, bodyVox = 0, rotBest = 0;
+  ImU32 rotCol = IM_COL32(90, 160, 110, 255);
+  const char* rotLabel = "infected";
 
-  // Damage tint: bone -> deep red as hp drops. Bleeding parts blend toward a
-  // hot red on the flash phase.
-  auto tint = [&](const UIState::BodyPartUI& b) {
-    float f = b.hpFrac < 0 ? 0.0f : (b.hpFrac > 1 ? 1.0f : b.hpFrac);
-    int r = (int)(215 + (200 - 215) * (1.0f - f));
-    int g = (int)(220 * f * f + 30 * f);
-    int bl = (int)(225 * f * f + 30 * f);
-    // WHAT IS ON THE LIMB, over what has happened TO it — mixed in AFTER the
-    // damage lerp and BEFORE the bleeding flash, and the order is the whole
-    // point: a coat is a layer on the outside, so it sits over the damage
-    // colour; an active haemorrhage is an ALARM and has to stay the loudest
-    // thing on the figure even on a limb already drenched in something.
-    //
-    // 1.5x with a 0.85 ceiling: a light splash is visible without repainting
-    // the limb, a soaked one reads as the substance, and the ceiling keeps a
-    // sliver of the damage tint so a drenched limb that is ALSO half dead is
-    // still distinguishable from a drenched healthy one.
-    if (b.stainFrac > 0.0f && b.stainColor != 0) {
-      const float k = std::min(0.85f, b.stainFrac * 1.5f);
-      const int sr = (int)((b.stainColor >> IM_COL32_R_SHIFT) & 0xFFu);
-      const int sg = (int)((b.stainColor >> IM_COL32_G_SHIFT) & 0xFFu);
-      const int sb = (int)((b.stainColor >> IM_COL32_B_SHIFT) & 0xFFu);
-      r = (int)(r + (sr - r) * k);
-      g = (int)(g + (sg - g) * k);
-      bl = (int)(bl + (sb - bl) * k);
+  for (int i = 0; i < UIState::kSlotCount; i++) {
+    const UIState::BodyPartUI& b = s.body[i];
+    if (!b.present) continue;
+    const UIState::DollRect& R = UIState::kDollRect[i];
+    slotBurning[i] = !b.severed && b.burningVoxels > 0;
+    nBurning += slotBurning[i];
+    nBleeding += (!b.severed && b.bleeding);
+    nSevered += b.severed;
+    bodyVox += b.voxelTotal;
+    rotVox += b.voxelRot;
+    if (b.infectCount > 0 && b.infect[0].count > rotBest) {
+      rotBest = b.infect[0].count;
+      rotCol = b.infect[0].color | 0xFF000000u;
+      if (b.infect[0].label[0]) rotLabel = b.infect[0].label;
+    }
+    const ImU32 infectCol = b.infectCount > 0 ? (b.infect[0].color | 0xFF000000u) : rotCol;
+    const ImU32 base = hpTint(b.hpFrac);
+    const float flash = std::min(1.0f, dollFlash_[i] / 0.3f);
+    for (int cy = 0; cy < R.h; cy++)
+      for (int cx = 0; cx < R.w; cx++) {
+        DC c;
+        if (b.dollValid) {
+          c = b.doll[cy * R.w + cx];
+        } else {
+          c.had = 1;
+          c.intact = b.severed ? 0 : 255;
+        }
+        if (!c.had) continue;
+        const int gx = R.x + cx, gy = R.y + cy;
+        const int gi = gy * W + gx;
+        if (b.severed || c.intact < 40) {
+          // An absence: the severed limb's outline in dried blood, a hole in
+          // a living limb as a dimmer ghost of the flesh it was.
+          if (((gx + gy) & 1) == 0)
+            ghost[gi] = b.severed ? ui::Mix(ui::Fade(ui::ColBlood(), 0.55f),
+                                            ui::Fade(IM_COL32_WHITE, 0.7f), flash * 0.6f)
+                                  : ui::Fade(ui::ColHi(), 0.55f);
+          continue;
+        }
+        // Lit from the upper left, darker as the column hollows.
+        const float t = R.w > 1 ? (float)cx / (float)(R.w - 1) : 0.5f;
+        float k = 1.08f - 0.24f * t - (cy == 0 ? -0.06f : 0.0f);
+        k *= 0.55f + 0.45f * (c.intact / 255.0f);
+        ImU32 p = scale(base, k);
+        if (c.charred) p = ui::Mix(p, IM_COL32(40, 33, 32, 255), std::min(1.0f, c.charred / 255.0f * 1.15f));
+        if (c.rot) p = ui::Mix(p, infectCol, std::min(0.9f, c.rot / 255.0f * 1.2f));
+        if (c.bruise) {
+          const float bz = c.bruise / 255.0f;
+          p = ui::Mix(p, bz > 0.75f ? ui::ColBlood() : IM_COL32(104, 54, 120, 255),
+                      std::min(0.75f, bz * 1.1f));
+        }
+        if (c.stain && b.stainColor != 0)
+          p = ui::Mix(p, b.stainColor | 0xFF000000u, std::min(0.85f, c.stain / 255.0f * 1.3f));
+        if (c.hot) {
+          const ImU32 fl = kFlame[DollHash((uint32_t)gi, flick) & 3u];
+          p = ui::Mix(p, fl, std::min(1.0f, c.hot / 255.0f * 3.0f));
+        }
+        if (b.bleeding && !b.severed && c.bruise > 190)
+          p = ui::Mix(p, ui::ColBloodHi(), pulse * 0.6f);
+        if (flash > 0.0f) p = ui::Mix(p, IM_COL32(255, 250, 240, 255), flash * 0.85f);
+        col[gi] = p;
+        owner[gi] = (int8_t)i;
+      }
+  }
+
+  // ---- the rim: an outline cell around every filled cell ---------------------
+  // Ink by default; ember (flickering) for a burning limb, pulsing blood for a
+  // bleeding one. A burning limb also gets a faint glow ring one cell further.
+  ImU32 rim[W * H] = {};
+  auto filled = [&](int gx, int gy) {
+    return gx >= 0 && gy >= 0 && gx < W && gy < H && col[gy * W + gx] != 0;
+  };
+  for (int gy = 0; gy < H; gy++)
+    for (int gx = 0; gx < W; gx++) {
+      const int gi = gy * W + gx;
+      if (col[gi]) continue;
+      int nb = -1;
+      const int dx[4] = {1, -1, 0, 0}, dy[4] = {0, 0, 1, -1};
+      for (int k = 0; k < 4 && nb < 0; k++)
+        if (filled(gx + dx[k], gy + dy[k])) nb = owner[(gy + dy[k]) * W + gx + dx[k]];
+      if (nb < 0) continue;
+      const UIState::BodyPartUI& b = s.body[nb];
+      if (slotBurning[nb])
+        rim[gi] = ui::Mix(ui::ColEmber(), IM_COL32(255, 210, 90, 255),
+                          (DollHash((uint32_t)gi, flick) & 1u) ? 0.6f : 0.0f);
+      else if (b.bleeding)
+        rim[gi] = ui::Mix(ui::ColBlood(), IM_COL32(255, 70, 60, 255), pulse);
+      else
+        rim[gi] = ui::ColInk();
+    }
+  for (int gy = 0; gy < H; gy++)
+    for (int gx = 0; gx < W; gx++) {
+      const int gi = gy * W + gx;
+      if (col[gi] || rim[gi]) continue;
+      for (int ddy = -2; ddy <= 2 && !rim[gi]; ddy++)
+        for (int ddx = -2; ddx <= 2; ddx++) {
+          if (!filled(gx + ddx, gy + ddy)) continue;
+          const int nb = owner[(gy + ddy) * W + gx + ddx];
+          if (nb >= 0 && slotBurning[nb] && ((gx + gy + (int)flick) % 3) != 0) {
+            rim[gi] = ui::Fade(ui::ColEmber(), 0.35f);
+            break;
+          }
+        }
+    }
+
+  // ---- draw, merging runs of one colour per row -----------------------------
+  auto drawRow = [&](const ImU32* buf, int gy) {
+    for (int gx = 0; gx < W;) {
+      const ImU32 c = buf[gy * W + gx];
+      int e = gx + 1;
+      while (e < W && buf[gy * W + e] == c) e++;
+      if (c)
+        d->AddRectFilled(ImVec2(ox + gx * C, oy + gy * C), ImVec2(ox + e * C, oy + (gy + 1) * C), c);
+      gx = e;
+    }
+  };
+  for (int gy = 0; gy < H; gy++) {
+    drawRow(ghost, gy);
+    drawRow(rim, gy);
+    drawRow(col, gy);
+  }
+
+  // ---- embers rising off burning cells, drops falling off bleeding limbs ----
+  for (int i = 0; i < UIState::kSlotCount; i++) {
+    const UIState::BodyPartUI& b = s.body[i];
+    if (!b.present || b.severed) continue;
+    const UIState::DollRect& R = UIState::kDollRect[i];
+    if (slotBurning[i]) {
+      // The cells actually burning, so the embers leave from the fire.
+      int hotCells[UIState::kDollCellsMax];
+      int nHot = 0;
+      for (int c = 0; c < R.w * R.h; c++)
+        if (b.dollValid ? b.doll[c].hot > 30 : c < R.w) hotCells[nHot++] = c;
+      if (nHot == 0)
+        for (int c = 0; c < R.w; c++) hotCells[nHot++] = c;
+      const int n = std::min(7, 2 + nHot / 5);
+      for (int j = 0; j < n; j++) {
+        const float period = 0.55f + 0.45f * DollRand((uint32_t)i, (uint32_t)j, 1);
+        const double u = now / period + DollRand((uint32_t)i, (uint32_t)j, 2);
+        const uint32_t cycle = (uint32_t)u;
+        const float ph = (float)(u - (double)cycle);
+        const int cell = hotCells[DollHash((uint32_t)i, (uint32_t)j, cycle) % (uint32_t)nHot];
+        const float sx = ox + (R.x + cell % R.w) * C;
+        const float sy = oy + (R.y + cell / R.w) * C;
+        const float wob = std::floor(std::sin((float)u * 9.0f + j) * 1.5f) * C;
+        const float px = std::floor(sx + wob);
+        const float pyq = std::floor((sy - ph * 26.0f) / C) * C;
+        ImU32 ec = ph < 0.25f ? kFlame[0] : ph < 0.55f ? kFlame[1] : ph < 0.8f ? kFlame[2]
+                                                                                : IM_COL32(110, 104, 100, 255);
+        ec = ui::Fade(ec, ph < 0.8f ? 1.0f : (1.0f - ph) * 4.0f);
+        const float sz = ph < 0.3f ? C * 2.0f : C;
+        d->AddRectFilled(ImVec2(px, pyq), ImVec2(px + sz, pyq + sz), ec);
+      }
     }
     if (b.bleeding) {
-      r = (int)(r + (255 - r) * flash);
-      g = (int)(g * (1.0f - 0.85f * flash));
-      bl = (int)(bl * (1.0f - 0.85f * flash));
-    }
-    return IM_COL32(r, g, bl, 245);
-  };
-
-  // One limb segment. Severed parts leave a stump tick at `a` instead.
-  auto seg = [&](int slot, ImVec2 a, ImVec2 b) {
-    const UIState::BodyPartUI& p = s.body[slot];
-    if (!p.present) return;
-    if (p.severed) {
-      // A short perpendicular tick at the joint: the wound, not the limb.
-      const float dx = b.x - a.x, dy = b.y - a.y;
-      const float len = sqrtf(dx * dx + dy * dy);
-      if (len > 0.001f) {
-        const float nx = -dy / len * 2.5f, ny = dx / len * 2.5f;
-        d->AddLine(ImVec2(a.x - nx, a.y - ny), ImVec2(a.x + nx, a.y + ny),
-                   IM_COL32(120, 40, 40, 200), 2.0f);
+      // Drops leave the lowest row the limb still has matter in.
+      int lowRow = R.h - 1;
+      if (b.dollValid)
+        for (; lowRow > 0; lowRow--) {
+          bool any = false;
+          for (int cx = 0; cx < R.w; cx++) {
+            const DC& c = b.doll[lowRow * R.w + cx];
+            any |= c.had && c.intact >= 40;
+          }
+          if (any) break;
+        }
+      for (int j = 0; j < 2; j++) {
+        const float period = 0.8f + 0.3f * DollRand((uint32_t)i, (uint32_t)j, 7);
+        const double u = now / period + 0.5 * j;
+        const uint32_t cycle = (uint32_t)u;
+        const float ph = (float)(u - (double)cycle);
+        const int cx = (int)(DollHash((uint32_t)i, (uint32_t)j, cycle) % (uint32_t)R.w);
+        const float px = ox + (R.x + cx) * C;
+        const float py = std::floor((oy + (R.y + lowRow + 1) * C + ph * ph * 30.0f) / C) * C;
+        if (py > oy + H * C) continue;
+        const ImU32 bc = ui::Fade(IM_COL32(200, 40, 36, 255), ph < 0.7f ? 1.0f : (1.0f - ph) / 0.3f);
+        d->AddRectFilled(ImVec2(px, py), ImVec2(px + C, py + C * (ph < 0.5f ? 2.0f : 1.0f)), bc);
       }
-      return;
     }
-    d->AddLine(a, b, tint(p), thick);
+  }
+
+  // ---- the right column: only what is urgent --------------------------------
+  const float sx = ox + W * C + 12.0f;
+  const float sw = x + width - 8.0f - sx;
+  float sy = oy;
+  const float hpF = s.healthMax > 0 ? std::clamp((float)s.health / (float)s.healthMax, 0.0f, 1.0f)
+                                    : 1.0f;
+
+  // The worst thing happening, as one word. Priority is "what kills you
+  // fastest and can you do something about it": fire, then blood, then the
+  // infection, then a lost limb, then simply being low.
+  {
+    char word[24] = "";
+    ImU32 wc = ui::ColGoldPale();
+    bool throb = false;
+    if (!s.playerAlive) {
+      // The DEAD banner above the panel says it; the trace flatlines.
+    } else if (nBurning > 0) {
+      std::snprintf(word, sizeof word, "ON FIRE");
+      wc = (flick & 1u) ? IM_COL32(255, 200, 80, 255) : ui::ColEmber();
+    } else if (nBleeding > 0) {
+      std::snprintf(word, sizeof word, "BLEEDING");
+      wc = ui::Mix(ui::ColBlood(), IM_COL32(255, 80, 70, 255), pulse);
+      throb = true;
+    } else if (rotVox > 0) {
+      int k = 0;
+      for (const char* c = rotLabel; *c && k < (int)sizeof word - 1; c++)
+        word[k++] = (char)std::toupper((unsigned char)*c);
+      word[k] = 0;
+      wc = ui::Mix(rotCol, IM_COL32_WHITE, 0.35f);
+    } else if (nSevered > 0) {
+      std::snprintf(word, sizeof word, "MAIMED");
+      wc = ui::ColBloodHi();
+    } else if (hpF < 0.3f) {
+      std::snprintf(word, sizeof word, "CRITICAL");
+      wc = ui::Mix(ui::ColBloodHi(), IM_COL32(255, 120, 100, 255), pulse);
+      throb = true;
+    }
+    if (word[0]) {
+      // The 26 px chrome font, with a whole-pixel 2 px shadow to match it.
+      ImGui::PushFont(ui::FontLarge());
+      const float jx = throb && pulse > 0.85f ? 2.0f : 0.0f;
+      const ImVec2 at(std::floor(sx + jx), std::floor(sy - 4.0f));
+      d->AddText(ImVec2(at.x + 2, at.y + 2), ui::Fade(ui::ColInk(), 0.9f), word);
+      d->AddText(at, wc, word);
+      ImGui::PopFont();
+    }
+    sy += 30.0f;
+  }
+
+  // Condition chips: an icon, then a pip per limb it is happening to.
+  const float ipx = 2.0f;   // icon art pixel
+  auto pips = [&](float px, float py, int n, ImU32 c) {
+    for (int k = 0; k < std::min(n, 8); k++) {
+      const float a = px + k * 7.0f;
+      d->AddRectFilled(ImVec2(a, py + 3), ImVec2(a + 5, py + 13), ui::ColInk());
+      d->AddRectFilled(ImVec2(a + 1, py + 4), ImVec2(a + 4, py + 12), c);
+      d->AddRectFilled(ImVec2(a + 1, py + 4), ImVec2(a + 4, py + 6), ui::Mix(c, IM_COL32_WHITE, 0.4f));
+    }
   };
+  if (nBurning > 0) {
+    const IconInk pal[3] = {{'#', IM_COL32(214, 64, 30, 255)}, {'o', ui::ColEmber()},
+                            {'Y', IM_COL32(255, 228, 120, 255)}};
+    DollIcon(d, ImVec2(sx, sy), (flick & 2u) ? kIconFlameB : kIconFlameA, 8, pal, 3, ipx);
+    pips(sx + 20.0f, sy, nBurning, (flick & 1u) ? IM_COL32(255, 200, 80, 255) : ui::ColEmber());
+    sy += 20.0f;
+  }
+  if (nBleeding > 0) {
+    const IconInk pal[2] = {{'#', IM_COL32(176, 30, 30, 255)}, {'o', IM_COL32(240, 120, 110, 255)}};
+    const float drip = pulse > 0.5f ? ipx : 0.0f;
+    DollIcon(d, ImVec2(sx, sy + drip), kIconDrop, 8, pal, 2, ipx);
+    pips(sx + 20.0f, sy, nBleeding, ui::Mix(ui::ColBlood(), IM_COL32(255, 80, 70, 255), pulse));
+    sy += 20.0f;
+  }
+  if (rotVox > 0 && bodyVox > 0) {
+    const IconInk pal[2] = {{'#', ui::Mix(rotCol, IM_COL32_WHITE, 0.2f)}, {'k', ui::ColInk()}};
+    DollIcon(d, ImVec2(sx, sy), kIconSkull, 8, pal, 2, ipx);
+    // How much of the body it has turned, on a short gauge.
+    const float gw = std::min(84.0f, sw - 22.0f);
+    const float f = std::clamp((float)rotVox / (float)bodyVox * 2.0f, 0.04f, 1.0f);
+    d->AddRectFilled(ImVec2(sx + 20, sy + 4), ImVec2(sx + 20 + gw, sy + 12), ui::ColInk());
+    d->AddRectFilled(ImVec2(sx + 21, sy + 5), ImVec2(sx + 21 + std::floor((gw - 2) * f / 2) * 2, sy + 11),
+                     rotCol);
+    sy += 20.0f;
+  }
+  // The coat: what is ON you, as a strip of its colours sized by share, and
+  // the heaviest one named. Silent below tune.coat.hudMinFrac, so a clean
+  // player's panel says nothing about it at all.
+  if (s.stainFrac >= s.stainHudMin && s.stainColor != 0) {
+    const ImU32 top = s.stainColor | 0xFF000000u;
+    const IconInk pal[1] = {{'#', ui::Mix(top, IM_COL32_WHITE, 0.2f)}};
+    DollIcon(d, ImVec2(sx, sy), kIconSplat, 8, pal, 1, ipx);
+    const float gw = 48.0f;
+    d->AddRectFilled(ImVec2(sx + 20, sy + 4), ImVec2(sx + 20 + gw, sy + 12), ui::ColInk());
+    // Length is HOW MUCH (square-rooted, so a light splash is still a visible
+    // bar rather than two pixels), split by WHAT in proportion.
+    const float inner = gw - 2.0f;
+    const float len = std::max(6.0f, std::floor(inner * std::sqrt(std::min(1.0f, s.stainFrac)) / 2) * 2);
+    float cx = sx + 21;
+    const float end = cx + len;
+    float sum = 0.0f;
+    for (int k = 0; k < s.coatCount; k++)
+      if (s.coats[k].color != 0) sum += s.coats[k].frac;
+    for (int k = 0; k < s.coatCount && sum > 0.0f; k++) {
+      const UIState::CoatName& c = s.coats[k];
+      if (c.color == 0 || c.frac < 0.005f) continue;
+      const float e = std::min(end, cx + std::max(2.0f, std::round(len * c.frac / sum / 2) * 2));
+      if (e > cx) d->AddRectFilled(ImVec2(cx, sy + 5), ImVec2(e, sy + 11), c.color | 0xFF000000u);
+      cx = e;
+    }
+    if (cx < end) d->AddRectFilled(ImVec2(cx, sy + 5), ImVec2(end, sy + 11), top);
+    const char* lbl = s.stainLabel[0] ? s.stainLabel : "";
+    if (lbl[0] && sx + 20 + gw + 6 < x + width - 8)
+      ui::ShadowText(d, ImVec2(sx + 20 + gw + 6, sy + 1), ui::Mix(top, IM_COL32_WHITE, 0.45f), lbl);
+    sy += 20.0f;
+  }
 
-  // scrim, so the figure stays readable over a bright world
-  d->AddRectFilled(ImVec2(x - 4, yBottom - height), ImVec2(x + 13.5f * unit,
-                   yBottom + 2), IM_COL32(0, 0, 0, 70), 4.0f);
-
-  // ---- skeleton points (figure units, pelvis at origin) ----
-  const ImVec2 pelvis = P(0, 0);
-  const ImVec2 neck = P(0, spineLen);
-  const ImVec2 shL = P(-shoulder, spineLen * 0.92f);
-  const ImVec2 shR = P(shoulder, spineLen * 0.92f);
-  const ImVec2 elbL = P(-shoulder - armLen * 0.35f, spineLen * 0.92f - armLen);
-  const ImVec2 elbR = P(shoulder + armLen * 0.35f, spineLen * 0.92f - armLen);
-  const ImVec2 hndL = P(-shoulder - armLen * 0.6f,
-                        spineLen * 0.92f - armLen * 2.0f);
-  const ImVec2 hndR = P(shoulder + armLen * 0.6f,
-                        spineLen * 0.92f - armLen * 2.0f);
-  const ImVec2 hipL = P(-hipW, 0), hipR = P(hipW, 0);
-  const ImVec2 kneeL = P(-hipW * 1.1f, -legLen), kneeR = P(hipW * 1.1f, -legLen);
-  const ImVec2 ankL = P(-hipW * 1.2f, -legLen * 2.0f);
-  const ImVec2 ankR = P(hipW * 1.2f, -legLen * 2.0f);
-
-  // torso + hips are the spine; drawn first so limbs overlap them at the joints
-  seg(UIState::kSlotHips, pelvis, P(0, spineLen * 0.4f));
-  seg(UIState::kSlotTorso, P(0, spineLen * 0.4f), neck);
-  seg(UIState::kSlotArmUL, shL, elbL);
-  seg(UIState::kSlotArmLL, elbL, hndL);
-  seg(UIState::kSlotArmUR, shR, elbR);
-  seg(UIState::kSlotArmLR, elbR, hndR);
-  seg(UIState::kSlotLegUL, hipL, kneeL);
-  seg(UIState::kSlotLegLL, kneeL, ankL);
-  seg(UIState::kSlotLegUR, hipR, kneeR);
-  seg(UIState::kSlotLegLR, kneeR, ankR);
-
-  // hands and feet are dots rather than segments — too short to read as lines
-  auto dot = [&](int slot, ImVec2 at, float r) {
-    const UIState::BodyPartUI& p = s.body[slot];
-    if (!p.present || p.severed) return;
-    d->AddCircleFilled(at, r, tint(p), 8);
-  };
-  dot(UIState::kSlotHandL, hndL, 2.4f);
-  dot(UIState::kSlotHandR, hndR, 2.4f);
-  dot(UIState::kSlotFootL, ankL, 2.4f);
-  dot(UIState::kSlotFootR, ankR, 2.4f);
-
-  // head: a circle on the neck, or an empty socket outline when decapitated
-  const UIState::BodyPartUI& head = s.body[UIState::kSlotHead];
-  if (head.present) {
-    const ImVec2 hc(neck.x, neck.y - headR - 1.0f);
-    if (head.severed) {
-      d->AddCircle(hc, headR * 0.5f, IM_COL32(120, 40, 40, 170), 10, 1.5f);
-    } else {
-      d->AddCircleFilled(hc, headR, tint(head), 14);
+  // ---- the heart trace ------------------------------------------------------
+  // A monitor sweep, not a scroll: a write head crosses the strip leaving the
+  // trace behind it, older columns dimmer, a blank gap ahead of the head. The
+  // rate climbs as the hp pool empties and with bleeding or fire, the colour
+  // walks green -> amber -> red, and a dead body flatlines.
+  {
+    const float bpm = !s.playerAlive ? 0.0f
+                      : std::min(180.0f, 62.0f + (1.0f - hpF) * 84.0f + (nBleeding ? 22.0f : 0.0f) +
+                                             (nBurning ? 18.0f : 0.0f));
+    auto wave = [](float p) {
+      auto g = [](float p, float c, float w, float a) {
+        const float z = (p - c) / w;
+        return a * std::exp(-z * z);
+      };
+      return g(p, 0.10f, 0.025f, 0.12f) + g(p, 0.185f, 0.008f, -0.18f) + g(p, 0.21f, 0.010f, 1.0f) +
+             g(p, 0.235f, 0.009f, -0.32f) + g(p, 0.42f, 0.040f, 0.24f);
+    };
+    const float eh = 30.0f;
+    const float ey = oy + H * C - eh;
+    const float ew = std::clamp(std::floor(sw / 2) * 2, 16.0f, (float)kEcgCols * 2.0f);
+    const int cols = (int)(ew / 2.0f);   // the ring is this long; <= kEcgCols
+    ecgHead_ %= cols;
+    const float period = 1.0f / 40.0f;
+    ecgAcc_ += dt;
+    while (ecgAcc_ >= period) {
+      ecgAcc_ -= period;
+      float v = 0.0f;
+      for (int k = 0; k < 6; k++) {
+        const float w = wave(ecgPhase_ + bpm / 60.0f * period * (k / 6.0f));
+        if (std::fabs(w) > std::fabs(v)) v = w;
+      }
+      ecgPhase_ += bpm / 60.0f * period;
+      ecgPhase_ -= std::floor(ecgPhase_);
+      ecg_[ecgHead_] = v;
+      ecgHead_ = (ecgHead_ + 1) % cols;
+    }
+    d->AddRectFilled(ImVec2(sx - 2, ey - 2), ImVec2(sx + ew + 2, ey + eh + 2), ui::ColInk());
+    d->AddRectFilled(ImVec2(sx, ey), ImVec2(sx + ew, ey + eh), IM_COL32(12, 22, 18, 230));
+    for (float gx = sx + 8; gx < sx + ew; gx += 16)   // the graticule, dotted
+      for (float gy = ey + 4; gy < ey + eh; gy += 8)
+        d->AddRectFilled(ImVec2(gx, gy), ImVec2(gx + 2, gy + 2), IM_COL32(40, 70, 52, 160));
+    const ImU32 hiC = IM_COL32(110, 226, 140, 255), midC = IM_COL32(232, 180, 64, 255),
+                loC = IM_COL32(236, 66, 56, 255);
+    const ImU32 trace = !s.playerAlive ? IM_COL32(120, 120, 120, 255)
+                        : hpF > 0.5f   ? ui::Mix(midC, hiC, (hpF - 0.5f) * 2.0f)
+                                       : ui::Mix(loC, midC, hpF * 2.0f);
+    const float mid = ey + std::floor(eh * 0.62f / 2) * 2;
+    auto yAt = [&](float v) { return std::floor((mid - v * (eh * 0.55f)) / 2) * 2; };
+    // A sweep: screen column k IS ring slot k, and its age is how far behind
+    // the write head it sits.
+    for (int k = 0; k < cols; k++) {
+      const int idx = k;
+      const int age = ((ecgHead_ - 1 - idx) % cols + cols) % cols;
+      if (age >= cols - 3) continue;   // the blank gap ahead of the head
+      const int prev = (idx + cols - 1) % cols;
+      float y0 = yAt(ecg_[idx]);
+      float y1 = k > 0 && age + 1 < cols - 3 ? yAt(ecg_[prev]) : y0;
+      if (y1 < y0) std::swap(y0, y1);
+      const float a = std::clamp(1.0f - (float)age / (float)cols, 0.2f, 1.0f);
+      const float px = sx + k * 2.0f;
+      d->AddRectFilled(ImVec2(px, y0), ImVec2(px + 2, y1 + 2), ui::Fade(trace, a));
+      if (age == 0)
+        d->AddRectFilled(ImVec2(px - 1, y0 - 1), ImVec2(px + 3, y1 + 3), ui::Fade(IM_COL32_WHITE, 0.8f));
     }
   }
   return height;
