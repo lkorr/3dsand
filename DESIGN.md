@@ -16439,14 +16439,13 @@ where you hear from either (§12b, "The ears are on the character").
     cascade 4.64 -> 4.77, seam 5.82 -> 6.07, seamveg 10.47 -> 10.62, fire
     12.84 -> 13.06, canopy 5.88 -> 5.97, peaksea 12.44 -> 12.42 (single
     samples; ~0.1 ms is the run-to-run spread).
-  - **Still not matched**: the far crown is a centre-sampled shell, so it is
-    porous to the SUN (outer leaves: far shadow ~1 where the near shell gives
-    0.44-0.57) and to view rays (a far crown shows sky through it); the far
-    contact shadow of a crown's inner leaves is a hard 0 that `lodShadowLift`
-    raises to ~0.33, which happens to match. Both are geometry, not shading:
-    the cure is an occupancy rule for features in the cascade (any-of-eight at
-    level 1), a worldgen change with its own gate. The sea's shadeWater /
-    shadeFarWater seam is untouched by this.
+  - **Still not matched** (then): the far crown was a centre-sampled shell,
+    porous to the SUN and to view rays. Closed by THE COVER RULE (below, "Far
+    crowns keep their coverage", 2026-10-10), together with the far palette
+    aliases that painted two leaf ramps' dark and lit steps in their mid step.
+    The far contact shadow of a crown's inner leaves is a hard 0 that
+    `lodShadowLift` raises to ~0.33, which happens to match. The sea's
+    shadeWater / shadeFarWater seam is untouched by this.
   **Those seven bits are a PALETTE SLOT, not a material id (2026-09-09):**
   a far cell byte names one of 128 entries in the FAR PALETTE — the fourth
   reserved run of the GPU material table (`kFarPaletteBaseGpu`, world.h,
@@ -16646,6 +16645,98 @@ where you hear from either (§12b, "The ears are on the character").
   `--at x,y,z,yaw,pitch --frames N` reproduces a report's camera into
   `screenshot_at.bmp`; `SANDVOX_AT_FARPROBE=x,y,z[,level]` prints the cascade
   bytes and patch words around a voxel on that frame.
+  **FAR CROWNS KEEP THEIR COVERAGE: THE COVER RULE (2026-10-10; worldgen.wgsl
+  `farCoverPick` / `farcover`, faredits.h `CoverPick`; gate `far-cover`;
+  ticket 2026-10-09_14-23-01).** The second exception to "a cell is its
+  centre sample". A leaf crown is 30-60 % leaf in clumps, and one voxel per
+  2^k block makes it a sparse porous lattice: past the 20.5 m handoff sun and
+  view rays went through it, and the far crown read flatter and brighter than
+  the near one (measured below). At the levels whose cells lie inside one
+  fine chunk (shift <= 4, levels 1-4, 0.2-1.6 m cells, out to ~410 m) a cell
+  whose centre found NO matter (byte air or blocker-only) takes the dominant
+  COVER material of its EIGHT SUB-SAMPLES when at least the level's minimum
+  of them are cover. The sub-samples are c0 + o*half + half/2 per axis, o in
+  {0,1}^3 -- at level 1 exactly the block's eight voxels, coarser the
+  octants' centres -- scanned x fastest; ties go to the first in that order.
+  The rule only ever ADDS leaf to an EMPTY cell: terrain, trunks, walls and
+  water are byte-identical to the centre rule.
+  - **Cover is data, per far slot.** `farCover` on a material (materials.h
+    MaterialDef; default = far-solid AND tagged `foliage`, i.e. every leaf
+    ramp; grass and flowers are MICRO and never far-solid; `"farCover":
+    true|false` overrides). The slot's OWNER decides; its minimums ride the
+    far palette entry's `tagMask` (Simulation::UploadTables) as four bits per
+    level, `kFarCoverMinDefault` = 3,3,3,3 (`SANDVOX_FAR_COVER_MIN=a,b,c,d`
+    overrides it for look-tuning without a rebuild; 0 at a level = off, and
+    0,0,0,0 is the control arm every measurement below was taken against).
+    Why 3 of 8: for independent leaves at fill p a two-voxel-thick cell stops
+    a ray with probability 1-(1-p)^2 (0.70 at p = 0.45); P(>= 3 of 8) is 0.78,
+    P(>= 4) 0.52, P(>= 2) 0.94. Measured at noon (old palette), every step
+    down closes the gap further -- all leaves +6.8 / +6.2 / +5.3 / +4.8 at
+    4 / 3 / 2 / 1 -- and with the palette fixed 2 gives +0.1 against 3's
+    +1.3; 3 stays because at 16:00 and overcast 3 already lands at -0.4 and
+    a denser rule only darkens a far crown further (2 and 1 were not
+    measured there). The crowns at 50 m / 200 m / 1 km were not blobby at
+    any of 1-3 (any-of-eight fills the most ground gaps between distant
+    crowns), so the threshold is a measured balance, not a guard against an
+    artefact.
+  - **Three producers, one rule** (the far-downsample agreement): `farcover`
+    over PROCGEN trees -- its own entry after the sweep (pass_table.def
+    `farCoverFill`), with no genColumn: the sweep's bytes say which cells are
+    empty, a per-workgroup cache of the tiles whose tree can reach the level
+    chunk (`treeInfoBare` + the trunk's pond gate, then the footprint's
+    authored site trees, in treeCandsInto's offer order) says what the tree
+    atlas puts at a sub-sample; the tail of `fardownFeat` over the LIVE grid
+    (before the container pass, which may overwrite a cell with a container
+    wall; exact prefilter: no cover voxel in the chunk, no pass); and
+    `FarEdits::CoverPick` over an evicted chunk's voxels for its patch. The
+    procgen producer reads the atlas, not genCellIn: it does not see a stamp,
+    a pond column or ground taking a crown voxel first, and it gates a tree's
+    ponds at its TRUNK where genCellIn gates them per asking column. Both are
+    a leaf more or less at a crown's edge. The `far-cover` gate grows a real
+    crown (env-truth's synthetic all-forest map at the origin), and holds the
+    downsample and the CPU patch to the voxel oracle exactly (0 / 372 cells
+    off) and the sieve to it within `farCover.sieveAgreeMin` (1.000 of 90
+    leaf cells measured); level-1 coverage of the crown's cells goes from 0.57
+    (centre rule) to 0.82.
+  - **The leaf ramps' far palette.** maple_{dark,lit} and gold_{dark,lit}
+    carried `"far": "<mid step>"` from the day they were added (the palette
+    had 8 slots to spare), so past the handoff a goldbeech or maple crown was
+    painted in its mid step only and lost the lit-top / dark-underside bake
+    the near field shows: near gold_dark pixels were +18.5 luma far over near
+    (the largest single term at the ticket camera, and invisible to a
+    same-material metric because the far side reported gold_leaves). Every
+    ramp now owns its three slots (250 of 254 used; 4 to spare).
+  - **Measured** (same-pixel method above, ticket camera, 1600x900, 9-20 m,
+    median far - near luma over pixels grouped by the NEAR material whatever
+    the far ray hit -- a far ray that goes through a porous crown is part of
+    the seam). All leaves, control (rule off, old palette) -> rule -> rule +
+    palette: noon +8.0 -> +6.2 -> +1.3; 16:00 +4.6 -> +4.1 -> -0.4; overcast
+    +5.9 -> +5.3 -> -0.4. gold_dark +18.5 -> +16.9 -> +2.1 (noon), gold_leaves
+    +5.9 -> +3.8 -> +1.3, autumn_dark +2.3 -> +1.2 -> +1.3. The palette
+    alone (rule off) gives all leaves +2.4 at noon, so of the 8.0 the palette
+    is ~5.6 and the rule ~1.1-1.8; the rule is the whole of it on the ramps
+    that never had an alias (autumn_dark +2.1 -> +1.3, and the see-through:
+    the far side now hits leaf where it hit ground or sky). Same-material
+    medians (the earlier paragraph's metric) at noon: leaves +1.3 -> +0.6,
+    gold_leaves +5.9 -> +3.8. Minimums 2,2,2,2 at noon: all leaves +0.1
+    (+1.3 at 3). Bark and grass do not move. **Still open:**
+    grass UNDER a canopy reads +16 luma far at 16:00 and +12 overcast (not
+    the crown's geometry -- the control and the rule agree to 0.5), and an
+    outer leaf's far shadow is still mostly 1 where the near shell averages
+    0.6 (the near view ray stops on a voxel inside a porous lobe that the
+    sun half sees; the far one on the lobe's sunlit face).
+  - **Cost.** The refill at the ticket camera (one boot, the --frames GPU pass
+    table, mean over 635 frames): `farFill` 12.8 + `farMapFill` 13.5 ms/frame
+    against `farCoverFill` 1.5 (p99 8.2, max 10.9 ms in one frame): +5.7 % of
+    the far-plane fill, in the frames that refill, and the same at every
+    minimum (it is the per-workgroup tree scan, not the cells: a level chunk
+    above every tree or filled solid by the sweep returns before it). The
+    live pass stays under the pass table's 0.05 ms/frame floor on
+    `--forest-fire` (600 frames, rule off vs on: `farDown` 1.17 / 1.16). The
+    render does not move: `--render-budget` baseline, 1080p, exclusive lock,
+    rule off vs on in one binary, every camera within +-0.1 ms (noon 5.83 /
+    5.77, seam 5.92 / 5.89, seamveg 9.56 / 9.54, cascade 4.89 / 4.80).
+    Render-only; the world hash is unchanged (ef7d9a06).
   **The far SURFACE MAP (LOD-seam package A, 2026-09-28).** Centre sampling
   is the cascade's resolution limit and the window edge is where it shows: a
   level-1 cell is a 20 cm cube standing where the near field draws four 10 cm

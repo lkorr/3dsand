@@ -24,6 +24,10 @@
 //                     smithy's 1-voxel quench trough must read as stone, not
 //                     water, at cascade levels 1-2 from all three producers
 //                     (sieve, downsample, CPU patch), which agree byte for byte.
+//   far-cover         The far field's COVER RULE on a real procgen crown: an
+//                     empty-centre cell whose sub-samples are mostly leaf
+//                     reads leaf at levels 1-4; downsample and CPU patch match
+//                     the oracle exactly, the sieve (tree atlas) nearly.
 //
 // All run on the HARNESS map through worldmap::SetStructureOverride (the
 // harness refs dir is the refs gates' fixture), both restore the environment
@@ -42,10 +46,12 @@
 #include <unordered_map>
 #include <vector>
 
+#include "gpu/resources.h"
 #include "measure/perfsuite.h"
 #include "sim/biomes.h"
 #include "sim/materials.h"
 #include "sim/stream.h"
+#include "sim/treeatlas.h"
 #include "sim/worldgen_run.h"
 #include "sim/worldmap.h"
 #include "test/selftest.h"
@@ -1083,6 +1089,307 @@ Status GateFarContain(Ctx& c, std::string& detail) {
   return why.empty() ? Status::Pass : Status::Fail;
 }
 
+// ---- far-cover -------------------------------------------------------------
+// THE COVER RULE (worldgen.wgsl farCoverPick / `farcover`, faredits.h
+// CoverPick; DESIGN.md "Far crowns keep their coverage"; ticket
+// 2026-10-09_14-23-01): past the LOD handoff a leaf crown must keep its
+// density, not become the porous lattice one centre sample per block makes
+// of it. The fixture is a REAL procgen crown: the window at the origin of
+// env-truth's synthetic all-FOREST map, searched for the fine chunk where the rule fires most at
+// level 1. Three producers, the far-contain arrangement:
+//
+//   S  the SIEVE (`far` + `farcover`, a full refill: pristine procgen, the
+//      rule evaluated from the tree atlas);
+//   D  the DOWNSAMPLE (one leaf voxel at a level-1 cell centre turned to
+//      glass -- the proof the chunk went through `fardown` -- so fardownFeat
+//      re-applies the rule from the live grid);
+//   P  the CPU PATCH (the chunk noted into FarEdits, then a refill).
+//
+// Over every level-1..4 cell inside the chunk whose centre is not far-solid
+// (the only cells the rule may touch), against an oracle evaluated from the
+// voxels read back (FarEdits::CoverPick on them):
+//   (a) the rule fired (an empty-centre cell took leaf) at level 1 at least
+//       farCover.firedL1Min times, and at level 2 at least once;
+//   (b) D and P equal the oracle on every such cell (both read the live grid);
+//   (c) S agrees with the oracle on at least farCover.sieveAgreeMin of the
+//       cells either calls leaf: procgen asks the tree atlas, the live grid
+//       holds what genCellIn put there (DESIGN.md names the differences).
+// It also prints the level-1 coverage of the crown's cells -- centre rule,
+// cover rule, sieve -- which is the number the ticket is about.
+Status GateFarCover(Ctx& c, std::string& detail) {
+  std::vector<std::string> why;
+  auto check = [&](bool ok, const std::string& what) {
+    if (!ok && why.size() < 8) why.push_back(what);
+    return ok;
+  };
+  const IVec3 savedOrigin = c.world.WindowOrigin();
+  // THE GROUND: env-truth's synthetic one-biome map, FOREST everywhere (flat
+  // authored ground, no sites, no pad), so the window is sure to hold crowns
+  // whatever the harness map paints at its origin.
+  const std::string dir = AssetDir();
+  biomes::BiomeSet set;
+  TreeAtlas atlas;
+  std::string log;
+  const worldmap::WorldMapData real = worldmap::CurrentWorldMap();
+  int forest = -1;
+  if (biomes::LoadBiomeSet(dir, c.mats, set, log) &&
+      LoadTreeAtlas(dir + "/trees", c.mats, set, atlas, log))
+    for (const biomes::BiomeDef& b : set.biomes)
+      if (b.name == "forest") forest = b.index;
+  if (forest < 0 || !real.Loaded()) {
+    detail = "no forest biome / tree atlas / world map to grow the fixture on: " + log;
+    return Status::Fail;
+  }
+  {
+    worldmap::WorldMapData syn = real;
+    std::fill(syn.biome.begin(), syn.biome.end(), static_cast<uint8_t>(forest));
+    std::fill(syn.height.begin(), syn.height.end(), static_cast<int16_t>(syn.terrain.baseHeight));
+    syn.sites.clear();
+    syn.siteIndex.assign(syn.siteIndex.size(), 0);
+    syn.padX0 = syn.padZ0 = 0;
+    syn.padX1 = syn.padZ1 = -1;
+    syn.spawnX = syn.spawnZ = (int)kWorldN / 2;
+    syn.spawnAuthored = true;
+    syn.name = "far-cover:forest";
+    syn.contentHash = 0xC0FE7u;
+    std::vector<uint32_t> words;
+    if (!worldmap::PackWorldMap(set, syn, words, log)) {
+      detail = "the forest map did not pack: " + log;
+      return Status::Fail;
+    }
+    worldmap::SetCurrentWorldMap(syn);
+    c.ctx.WaitIdle();
+    c.sim.UploadEnvironment(c.ctx.device, c.ctx.queue, atlas, words);
+  }
+  c.stream.OnRegen();
+  c.world.SetWindowOrigin({0, 0, 0});
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  FarEdits& edits = c.stream.Edits();
+  edits.Clear();
+  auto restore = [&]() {
+    edits.Clear();
+    biomes::EnvironmentStamp stamp;
+    std::string rlog;
+    if (!ReloadEnvironment(c.ctx, c.sim, c.mats, stamp, rlog)) worldmap::SetCurrentWorldMap(real);
+    c.stream.OnRegen();
+    c.world.SetWindowOrigin(savedOrigin);
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+  };
+  auto farSolid = [&](uint32_t m) {
+    if (m == kMatAir || m >= c.mats.size()) return false;
+    const MaterialDef& d = c.mats[m];
+    return d.gpu.klass != CLASS_GAS && (d.gpu.flags & kMatFlagMicro) == 0;
+  };
+  auto slotOf = [&](uint32_t m) { return m < c.mats.size() ? c.mats[m].farPalSlot : 0u; };
+  auto local = [](int x, int y, int z) {
+    return ((uint32_t)z * kChunk + (uint32_t)y) * kChunk + (uint32_t)x;
+  };
+  // The rule's answer for the level-`level` cell at chunk-local index lc of a
+  // chunk's words: -1 when the centre is far-solid (the rule may not touch
+  // it), else the slot it fills (0 = stays empty).
+  auto oracle = [&](const uint32_t* w, uint32_t level, IVec3 lc) -> int {
+    const int shift = (int)(level + kFarShiftBase), step = 1 << shift, half = step >> 1;
+    const int c0[3] = {lc.x * step, lc.y * step, lc.z * step};
+    const uint32_t centre = w[local(c0[0] + half, c0[1] + half, c0[2] + half)] & 0xFFFu;
+    if (farSolid(centre)) return -1;
+    const uint32_t pick = edits.CoverPick(centre, level, half, c0, [&](int x, int y, int z) {
+      return w[local(x, y, z)] & 0xFFFu;
+    });
+    return pick == centre ? 0 : (int)slotOf(pick);
+  };
+  auto firedL1 = [&](const uint32_t* w) {
+    int n = 0;
+    for (int z = 0; z < 8; z++)
+      for (int y = 0; y < 8; y++)
+        for (int x = 0; x < 8; x++) n += oracle(w, 1, {x, y, z}) > 0 ? 1 : 0;
+    return n;
+  };
+
+  // ---- A. the crown: the fine chunk where the rule fires most at level 1 ----
+  IVec3 wc{0, 0, 0};
+  int bestFired = 0;
+  std::vector<uint32_t> before(kChunkVol);
+  const int rows[] = {16, 8, 24, 4, 28, 12, 20};
+  int scanned = 0;
+  for (int cz : rows) {
+    int hmin = INT32_MAX, hmax = INT32_MIN;
+    for (int cx = 0; cx < (int)kNChunk; cx++) {
+      const int h = World::TerrainHeight(cx * 16 + 8, cz * 16 + 8, kDefaultSeed);
+      hmin = std::min(hmin, h);
+      hmax = std::max(hmax, h);
+    }
+    const int cyLo = std::max(0, hmin >> 4);
+    const int cyHi = std::min((int)kNChunk - 1, (hmax + 260) >> 4);
+    std::vector<uint32_t> row((size_t)kNChunk * kChunkVol);
+    for (int cy = cyLo; cy <= cyHi; cy++) {
+      ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex({0, cy, cz}), kNChunk, row.data(),
+                     "far-cover");
+      for (int cx = 0; cx < (int)kNChunk; cx++) {
+        const uint32_t* w = row.data() + (size_t)cx * kChunkVol;
+        int cover = 0;
+        for (uint32_t i = 0; i < kChunkVol; i++) cover += edits.CoverOf(w[i] & 0xFFFu) != 0 ? 1 : 0;
+        scanned++;
+        if (cover < 64) continue;
+        const int f = firedL1(w);
+        if (f > bestFired) {
+          bestFired = f;
+          wc = {cx, cy, cz};
+          std::copy(w, w + kChunkVol, before.begin());
+        }
+      }
+    }
+    if (bestFired >= 96) break;
+  }
+  if (bestFired == 0) {
+    restore();
+    detail = Format("no crown: %d chunks scanned, none where the cover rule fires (no trees in "
+                    "the harness window, or no material is farCover)", scanned);
+    return Status::Fail;
+  }
+
+  // ---- the arms: every cell byte of the chunk, levels 1..4 -------------------
+  const uint32_t kLevels = (uint32_t)std::max(0, FarEdits::kCoverMaxShift - (int)kFarShiftBase);
+  auto readArm = [&]() {
+    std::vector<std::vector<uint8_t>> lv(kLevels + 1);
+    for (uint32_t level = 1; level <= kLevels; level++) {
+      const int shift = (int)(level + kFarShiftBase);
+      const IVec3 cc0{(wc.x * 16) >> shift, (wc.y * 16) >> shift, (wc.z * 16) >> shift};
+      auto wrapv = [](int v) { return (uint32_t)(v & (int)(kFarN - 1)); };
+      const uint32_t ch = ((wrapv(cc0.z) >> 4) * kFarNChunk + (wrapv(cc0.y) >> 4)) * kFarNChunk +
+                          (wrapv(cc0.x) >> 4);
+      const uint64_t off = (uint64_t)(level - 1) * kFarVox + (uint64_t)ch * kChunkVol;
+      rhi::Buffer staging = CreateBuffer(c.ctx.device, kChunkVol,
+                                         rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                                         "farCoverRead");
+      rhi::CommandEncoder enc = c.ctx.device.CreateCommandEncoder();
+      enc.CopyBufferToBuffer(c.world.farVox, off, staging, 0, kChunkVol);
+      c.ctx.queue.Submit(enc.Finish());
+      lv[level].resize(kChunkVol);
+      rhi::ReadBufferBlocking(c.ctx.device, staging, 0, lv[level].data(), kChunkVol);
+    }
+    return lv;
+  };
+  // The slot an arm holds at the level cell lc (chunk-local cell index).
+  auto armSlot = [&](const std::vector<std::vector<uint8_t>>& lv, uint32_t level, IVec3 lc) {
+    const int shift = (int)(level + kFarShiftBase);
+    const IVec3 cc{((wc.x * 16) >> shift) + lc.x, ((wc.y * 16) >> shift) + lc.y,
+                   ((wc.z * 16) >> shift) + lc.z};
+    auto wrapv = [](int v) { return (uint32_t)(v & (int)(kFarN - 1)); };
+    const uint8_t b = lv[level][((wrapv(cc.z) & 15) * kChunk + (wrapv(cc.y) & 15)) * kChunk +
+                                (wrapv(cc.x) & 15)];
+    return b == kFarPalBlocker ? 0u : (uint32_t)b;
+  };
+
+  // S: the sieve.
+  DrainFullRefill(c.ctx, c.world, c.sim, wc);
+  const auto S = readArm();
+  // D: the downsample. DIRECT PHASE CALLS ON PURPOSE (W2-O): as far-contain,
+  // this gate tests the far producers, not the tick; one cell op through a
+  // bare SubmitTick is what puts the chunk through `fardown`. The op is the
+  // proof it ran: a leaf at a level-1 cell centre becomes glass (solid for
+  // solid, so no island breaks off), and that cell must then read glass.
+  IVec3 probe{-1, -1, -1};
+  for (int z = 0; z < 8 && probe.x < 0; z++)
+    for (int y = 0; y < 8 && probe.x < 0; y++)
+      for (int x = 0; x < 8 && probe.x < 0; x++)
+        if (edits.CoverOf(before[local(2 * x + 1, 2 * y + 1, 2 * z + 1)] & 0xFFFu) != 0)
+          probe = {x, y, z};
+  const bool haveProbe = probe.x >= 0;
+  const IVec3 probeVox{wc.x * 16 + 2 * probe.x + 1, wc.y * 16 + 2 * probe.y + 1,
+                       wc.z * 16 + 2 * probe.z + 1};
+  for (uint32_t t = 1; t <= 3; t++) {
+    std::vector<CellOp> ops;
+    if (t == 1 && haveProbe) ops.push_back(CellOp{World::SlotCellIndex(probeVox), kMatGlass});
+    SubmitTick(c.ctx, c.world, c.sim, t, kDefaultSeed, {}, {}, ops, false, wc, false, false);
+  }
+  c.ctx.WaitIdle();
+  const auto D = readArm();
+  std::vector<uint32_t> after(kChunkVol);
+  ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex(wc), 1, after.data(), "far-cover");
+  // P: the CPU patch.
+  edits.Clear();
+  edits.NoteChunk(wc, after.data());
+  DrainFullRefill(c.ctx, c.world, c.sim, wc);
+  const auto P = readArm();
+  edits.Clear();
+
+  // ---- verdict ---------------------------------------------------------------
+  int fired[5] = {0, 0, 0, 0, 0}, sBoth = 0, sAgree = 0, liveBad = 0, liveCells = 0;
+  std::string firstLive, firstS;
+  for (uint32_t level = 1; level <= kLevels; level++) {
+    const int n = 16 >> (int)(level + kFarShiftBase);
+    for (int z = 0; z < n; z++)
+      for (int y = 0; y < n; y++)
+        for (int x = 0; x < n; x++) {
+          const IVec3 lc{x, y, z};
+          const int ob = oracle(before.data(), level, lc);
+          if (ob > 0) fired[level]++;
+          if (ob >= 0) {
+            const int s = (int)armSlot(S, level, lc);
+            if (ob > 0 || s > 0) {
+              sBoth++;
+              if (s == ob) sAgree++;
+              else if (firstS.empty())
+                firstS = Format("L%u cell (%d,%d,%d): oracle %d sieve %d", level, x, y, z, ob, s);
+            }
+          }
+          const int oa = oracle(after.data(), level, lc);
+          if (oa < 0) continue;
+          liveCells++;
+          const int d = (int)armSlot(D, level, lc), p = (int)armSlot(P, level, lc);
+          if (d != oa || p != oa) {
+            if (liveBad++ == 0)
+              firstLive = Format("L%u cell (%d,%d,%d): oracle %d downsample %d patch %d", level, x,
+                                 y, z, oa, d, p);
+          }
+        }
+  }
+  // Level-1 coverage of the crown's cells (cells holding any leaf voxel).
+  int crown = 0, centreOcc = 0, ruleOcc = 0, sieveOcc = 0;
+  for (int z = 0; z < 8; z++)
+    for (int y = 0; y < 8; y++)
+      for (int x = 0; x < 8; x++) {
+        bool any = false;
+        for (int o = 0; o < 8; o++)
+          any = any || edits.CoverOf(before[local(2 * x + (o & 1), 2 * y + ((o >> 1) & 1),
+                                                  2 * z + ((o >> 2) & 1))] & 0xFFFu) != 0;
+        if (!any) continue;
+        crown++;
+        const uint32_t centre = before[local(2 * x + 1, 2 * y + 1, 2 * z + 1)] & 0xFFFu;
+        const bool cOcc = farSolid(centre);
+        centreOcc += cOcc ? 1 : 0;
+        ruleOcc += (cOcc || oracle(before.data(), 1, {x, y, z}) > 0) ? 1 : 0;
+        sieveOcc += armSlot(S, 1, {x, y, z}) != 0 ? 1 : 0;
+      }
+  const uint32_t glassSlot = slotOf(kMatGlass);
+  const uint32_t probeD = haveProbe ? armSlot(D, 1, probe) : 0;
+  const uint32_t probeP = haveProbe ? armSlot(P, 1, probe) : 0;
+  const double agree = sBoth > 0 ? (double)sAgree / sBoth : 0.0;
+  const double agreeMin = BaselineNumber("farCover.sieveAgreeMin", 0.9);
+  check(haveProbe && probeD == glassSlot && probeP == glassSlot,
+        Format("the arms did not run: probe L1 cell (%d,%d,%d) downsample %u patch %u, glass is %u",
+               probe.x, probe.y, probe.z, probeD, probeP, glassSlot));
+  check(fired[1] >= (int)BaselineNumber("farCover.firedL1Min", 32) && fired[2] > 0,
+        Format("vacuous: the rule fired at L1 %d, L2 %d times", fired[1], fired[2]));
+  check(liveBad == 0, Format("%d of %d live cells disagree with the oracle; first %s", liveBad,
+                             liveCells, firstLive.c_str()));
+  check(agree >= agreeMin, Format("sieve agrees with the oracle on %.3f of %d leaf cells (< %.3f); "
+                                  "first %s", agree, sBoth, agreeMin, firstS.c_str()));
+  restore();
+  detail = Format("crown chunk (%d,%d,%d): fired L1 %d L2 %d L3 %d L4 %d | live D/P vs oracle %d/%d "
+                  "bad | sieve agrees %.3f of %d | L1 crown cells %d: occupied centre %.2f, rule "
+                  "%.2f, sieve %.2f | probe glass %u/%u",
+                  wc.x, wc.y, wc.z, fired[1], fired[2], fired[3], fired[4], liveBad, liveCells, agree,
+                  sBoth, crown, crown ? (double)centreOcc / crown : 0.0,
+                  crown ? (double)ruleOcc / crown : 0.0, crown ? (double)sieveOcc / crown : 0.0,
+                  probeD, probeP);
+  for (const std::string& w : why) detail += " | FAIL: " + w;
+  std::printf("far-cover: %s (%s)\n", why.empty() ? "PASS" : "FAIL", detail.c_str());
+  return why.empty() ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& StructureGates() {
@@ -1091,6 +1398,7 @@ const std::vector<Gate>& StructureGates() {
       {"structure-reload", "world", {}, false, GateStructureReload, /*needsRender=*/false},
       {"structure-door", "world", {}, false, GateStructureDoor, /*needsRender=*/false},
       {"far-contain", "render", {}, false, GateFarContain, /*needsRender=*/false},
+      {"far-cover", "render", {}, false, GateFarCover, /*needsRender=*/false},
   };
   return g;
 }

@@ -1650,6 +1650,17 @@ PASS(farFill, "farFill", PT_FARFILL, PIPE_FAR_FILL, K_COMPUTE, D_FARCOUNT,1,1,
      GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
      USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO)
           A(FarVox) A(FarOcc) R(TreeAtlas) R(WorldMap)))
+// THE COVER RULE OVER PROCGEN TREES (worldgen.wgsl `farcover`, DESIGN.md "Far
+// crowns keep their coverage"). Same dispatch extent; reads the bytes the
+// sweep just wrote (a cell whose centre sample found matter keeps it) and
+// fills an empty cell with leaf when enough of its eight sub-samples are
+// leaf. AFTER the sweep (A(FarVox) A(FarOcc) RAW) and BEFORE the patch, so an
+// edited chunk's patch words -- whose CPU twin applies the same rule from the
+// voxels that were really there -- still have the last word.
+PASS(farCoverFill, "farCoverFill", PT_FARFILL, PIPE_FAR_COVER_FILL, K_COMPUTE, D_FARCOUNT,1,1,
+     GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
+     USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO)
+          A(FarVox) A(FarOcc) R(TreeAtlas) R(WorldMap)))
 // THE SURFACE MAP FILL (worldgen.wgsl `farmap`, LOD-seam package A). Same
 // dispatch extent; only an entry carrying kFarListMapBit does any work — one
 // per level-chunk COLUMN of an X/Z plane or reset, which rewrites the 2D map

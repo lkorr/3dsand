@@ -166,6 +166,18 @@ constexpr uint32_t kMatFarPalShift = 24, kMatFarPalMask = 0xFF;
 // Slots 0..254: kFarPalBlocker (255) is the blocker-only cell value.
 constexpr uint32_t kMatFarPalSlots = 255;   // == world.h kFarPalBlocker
 
+// ---- THE FAR COVER RULE's minimums (worldgen.wgsl farCoverPick) -------------
+// How many of a cascade cell's eight sub-samples must be cover matter
+// (MaterialDef::farCover) before an otherwise empty cell takes the dominant
+// one: four bits per far level, level 1 in bits 0..3 up to level 4 in 12..15,
+// 0 = the rule is off at that level. One word for every cover slot today; it
+// rides per slot (the far palette entry's `tagMask`, and FarEdits'
+// coverOf_) so a material could carry its own. SANDVOX_FAR_COVER_MIN="a,b,c,d"
+// overrides it for look-tuning without a rebuild. See DESIGN.md "Far crowns
+// keep their coverage" for why these numbers.
+constexpr uint32_t kFarCoverMinDefault = 3u | (3u << 4) | (3u << 8) | (3u << 12);
+uint32_t FarCoverMinWord();
+
 // The default when a material authors no "wind" block, so that adding wind did
 // not mean editing 96 materials — and so that a NEW material is windy on the
 // day it is added rather than inert until someone remembers.
@@ -947,6 +959,17 @@ struct MaterialDef {
   // and it is what UploadTables walks: an alias must not overwrite the entry
   // for the slot it borrowed.
   bool farPalOwner = false;
+  // THE FAR COVER RULE (worldgen.wgsl farCoverRule, DESIGN.md "Far crowns
+  // keep their coverage"): a cascade cell whose centre sample is empty takes
+  // this material when enough of its eight sub-samples are cover matter, so a
+  // leaf crown keeps its density past the LOD handoff instead of becoming the
+  // porous lattice one centre sample per block makes of it. Default: a
+  // far-solid material tagged "foliage" (every leaf; grass and flowers are
+  // MICRO, never far-solid). materials.json `"farCover": true|false`
+  // overrides. Keyed on the GPU by FAR SLOT -- the slot's OWNER decides, so a
+  // leaf ramp aliased onto its mid step (`"far"`) follows that material -- in
+  // the far palette entry's `tagMask` (Simulation::UploadTables).
+  bool farCover = false;
   // The AUTHORED angle of repose in degrees, mirrored unpacked for the tuner
   // and the wiki exactly as absorbCapacity and the wind nibbles are. Always
   // populated: a powder that authors nothing reads 45, and a non-powder reads

@@ -1,6 +1,7 @@
 #include "sim/materials.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <fstream>
 #include <map>
@@ -58,6 +59,26 @@ std::vector<uint8_t> SmokeSourceTable(const std::vector<MaterialDef>& mats,
     }
   }
   return out;
+}
+
+uint32_t FarCoverMinWord() {
+  // Read once: the GPU table and FarEdits' CPU copy must hold the same word.
+  static const uint32_t word = [] {
+    const char* e = std::getenv("SANDVOX_FAR_COVER_MIN");
+    if (!e || !*e) return kFarCoverMinDefault;
+    uint32_t w = 0;
+    int level = 0;
+    for (const char* p = e; *p && level < 4; level++) {
+      const long v = std::strtol(p, const_cast<char**>(&p), 10);
+      w |= (uint32_t)std::clamp(v, 0L, 8L) << (level * 4);
+      if (*p == ',') p++;
+      else break;
+    }
+    std::printf("far cover minimums: %u,%u,%u,%u (SANDVOX_FAR_COVER_MIN)\n", w & 15u,
+                (w >> 4) & 15u, (w >> 8) & 15u, (w >> 12) & 15u);
+    return w;
+  }();
+  return word;
 }
 
 static bool ParseColor(const std::string& hex, uint32_t& out) {
@@ -1084,6 +1105,21 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
       // A gas_heavy GAS sinks and creeps instead of rising (kMatFlagHeavyGas,
       // sim_step.wgsl stepGas). The tag on a non-gas means nothing.
       if (t == "gas_heavy" && d.gpu.klass == CLASS_GAS) d.gpu.flags |= kMatFlagHeavyGas;
+    }
+    // The far cover rule (materials.h MaterialDef::farCover): a far-solid
+    // (worldgen farCellIsSolid: not a gas, not MICRO) foliage material by
+    // default, the authored `farCover` otherwise.
+    {
+      const bool farSolid = d.gpu.klass != CLASS_GAS && (d.gpu.flags & kMatFlagMicro) == 0;
+      const bool foliage =
+          std::find(d.tags.begin(), d.tags.end(), std::string("foliage")) != d.tags.end();
+      d.farCover = foliage && farSolid;
+      if (m.contains("farCover")) {
+        if (!m["farCover"].is_boolean())
+          errors += path + ": material \"" + d.name + "\": farCover must be true or false\n";
+        else
+          d.farCover = m["farCover"].get<bool>() && farSolid;
+      }
     }
     mats.push_back(d);
   }

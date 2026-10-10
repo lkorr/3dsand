@@ -6957,6 +6957,9 @@ var<workgroup> wgFarTop : atomic<u32>;
 // `fardownFeat`'s container pass: 1 when the chunk, or a voxel just across one
 // of its faces, is LIQUID (farContainedBy's prefilter).
 var<workgroup> wgFarLiq : atomic<u32>;
+// `fardownFeat`'s cover pass: 1 when the chunk holds a cover voxel
+// (farCoverSlotOf, the cover rule's prefilter).
+var<workgroup> wgFarCov : atomic<u32>;
 
 @compute @workgroup_size(64)
 fn far(@builtin(workgroup_id) wg : vec3<u32>,
@@ -7158,6 +7161,385 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
     atomicStore(&farOcc[(level - 1u) * FAR_NUM_CHUNKS + slot],
                 farOccPack(min(atomicLoad(&wgFarCount), CHUNK_VOL),
                            atomicLoad(&wgFarTop)));
+  }
+}
+
+// ---- THE COVER RULE: far crowns keep their coverage (2026-10-10) ------------
+// (ticket 2026-10-09_14-23-01; DESIGN.md "Far crowns keep their coverage")
+//
+// A cell is its CENTRE sample (the sweep above; fardown from the live grid),
+// which is exact for terrain and wrong for a leaf crown: a crown is 30-60 %
+// leaf in clumps, and one voxel per 2^k block turns it into a sparse porous
+// lattice. Sun and view rays went through it, so past the 20.5 m handoff the
+// outer leaves lost the self-shadow the near field gives them (far ~1, near
+// 0.44-0.57: +7 luma on gold_leaves after the indirect-light fix) and a far
+// crown showed sky through it.
+//
+// THE RULE, for the levels whose cells lie inside one fine chunk (shift <=
+// FAR_COVER_MAX_SHIFT): a cell whose centre found NO matter (byte air or
+// blocker-only) takes the dominant COVER material of its EIGHT SUB-SAMPLES
+// -- the voxels at c0 + o*half + half/2 per axis, o in {0,1}^3, x fastest (at
+// level 1 exactly the block's eight voxels, coarser the octants' centres) --
+// when at least the dominant's minimum for the level are cover. COVER is
+// per far slot (farCoverWord): the slot's owner material's `farCover`
+// (materials.h; default = a far-solid foliage material, i.e. leaves), and the
+// word is the per-level minimums (FarCoverMinWord). Ties go to the sub-sample
+// first in scan order. A cell with matter at its centre keeps it -- the rule
+// only ever ADDS leaf to an empty cell, so terrain, trunks, walls and water
+// are byte-identical to the centre rule.
+//
+// THREE PRODUCERS, ONE RULE (the far-downsample agreement): `farcover` below
+// over procgen trees, fardownFeat over the live grid, and FarEdits::CoverPick
+// (faredits.h) over an evicted chunk's voxels for its patch. The procgen one
+// asks the tree atlas directly, which is genCellIn's answer above the ground
+// except where genCellIn puts something else first (a stamp, a pond column,
+// ground under a crown that reaches a slope); and it gates a tree's ponds at
+// its TRUNK where genCellIn gates them per asking column. Both differences
+// are a leaf more or less at a crown's edge, never terrain.
+const FAR_COVER_MAX_SHIFT : u32 = 4u;   // faredits.h kCoverMaxShift (== CHUNK_SHIFT)
+
+// The slot's cover word: per-level minimums, 4 bits each from level 1, 0 =
+// not cover (Simulation::UploadTables writes it into the far palette entry's
+// `tagMask`; a palette entry is never a voxel's material).
+fn farCoverWord(slot : u32) -> u32 {
+  if (slot == 0u || slot >= FAR_PAL_BLOCKER) { return 0u; }
+  return materials[FAR_PALETTE_BASE + slot].tagMask;
+}
+// What sub-sample material `m` contributes: its far slot when that slot
+// covers, else 0.
+fn farCoverSlotOf(m : u32) -> u32 {
+  if (m == MAT_AIR) { return 0u; }
+  let s = matFarPal(&materials, m);
+  return select(0u, s, farCoverWord(s) != 0u);
+}
+// The eight sub-sample slots, 8 bits each (o 0..3 in lo, 4..7 in hi): two
+// registers, not a function-local array a dynamic index would put in scratch.
+struct FarCoverAcc { lo : u32, hi : u32 };
+fn farCoverPut(a : ptr<function, FarCoverAcc>, o : u32, slot : u32) {
+  if (o < 4u) { (*a).lo |= slot << (o * 8u); } else { (*a).hi |= slot << ((o - 4u) * 8u); }
+}
+fn farCoverAt(a : FarCoverAcc, o : u32) -> u32 {
+  return (select(a.lo, a.hi, o >= 4u) >> ((o & 3u) * 8u)) & 0xFFu;
+}
+// Sub-sample o of the cell whose min corner is c0 (fine voxels).
+fn farCoverSub(c0 : vec3<i32>, half : i32, o : u32) -> vec3<i32> {
+  return c0 + vec3<i32>(i32(o & 1u), i32((o >> 1u) & 1u), i32((o >> 2u) & 1u)) * half +
+         vec3<i32>(half >> 1u);
+}
+// The rule's answer: the dominant cover slot, or 0 when the cell keeps what
+// its centre gave it. FarEdits::CoverPick is the CPU twin, line for line.
+fn farCoverPick(a : FarCoverAcc, level : u32) -> u32 {
+  var n = 0u;
+  var best = 0u;
+  var bestS = 0u;
+  for (var i = 0u; i < 8u; i++) {
+    let si = farCoverAt(a, i);
+    if (si == 0u) { continue; }
+    n += 1u;
+    var c = 0u;
+    for (var j = 0u; j < 8u; j++) { c += select(0u, 1u, farCoverAt(a, j) == si); }
+    if (c > best) { best = c; bestS = si; }
+  }
+  if (bestS == 0u) { return 0u; }
+  let minN = (farCoverWord(bestS) >> ((level - 1u) * 4u)) & 15u;
+  return select(0u, bestS, minN != 0u && n >= minN);
+}
+
+// ---- `farcover`: the rule over PROCGEN trees -------------------------------
+// Its own entry over the sweep's dispatch extent, recorded right after it
+// (pass_table.def farCoverFill), for the compile reason `farpatch` and
+// `farmap` are: inside `far` it would be one more thing for the driver's
+// superlinear compile of that entry. It needs no genColumn: the sweep's
+// bytes say which cells are empty, and the tree atlas says what the trees
+// put at a sub-sample.
+//
+// The trees: every lattice tile whose tree can reach the level chunk's XZ
+// footprint (+- TREE_SCAN tiles, the scan treeCandsInto does per column),
+// evaluated ONCE per workgroup into wgCover (treeInfoBare + the trunk's pond
+// gate), then the authored site trees of the footprint's site cells, in that
+// order -- the order treeCandsInto offers them in, so where two trees claim a
+// voxel the same one wins. A compact list of the present ones (at most
+// FAR_COVER_TREES) is what the threads walk.
+struct CoverTree {
+  wx     : i32,
+  wz     : i32,
+  base   : i32,
+  vtop   : i32,   // highest y the tree can occupy; FAR_COVER_NONE = absent
+  varOff : u32,
+  rm     : u32,   // rot | mir << 2
+  reach  : i32,
+  leafSw : u32,   // treeCandAdd's autumn word
+};
+const FAR_COVER_NONE : i32 = -1048576;
+const FAR_COVER_TREES : u32 = 64u;   // two 32-bit masks per column
+const FAR_COVER_SITES : i32 = 8;
+// Tiles across the widest footprint the rule runs at (level FAR_COVER_MAX_SHIFT):
+// 7 on a 14.4 m lattice, 10 on the finest authored one (5.6 m; TreeLatticeFor
+// caps TREE_SCAN at 2). CLAMPED rather than asserted: a failed const_assert
+// would take the whole worldgen module down with it, genChunk included, and
+// a lattice past the clamp only loses trees at a level chunk's far edge.
+const WG_COVER_AXIS : i32 = min((i32(CHUNK << FAR_COVER_MAX_SHIFT) - 1) / TREE_TILE + 2 + 2 * TREE_SCAN, 16);
+const WG_COVER_SLOTS : i32 = WG_COVER_AXIS * WG_COVER_AXIS + FAR_COVER_SITES;
+var<workgroup> wgCover : array<CoverTree, WG_COVER_SLOTS>;
+var<workgroup> wgCoverIdx : array<u32, FAR_COVER_TREES>;
+var<workgroup> wgCoverN : atomic<u32>;
+var<workgroup> wgCoverAdd : atomic<u32>;
+var<workgroup> wgCoverTop : atomic<u32>;
+
+fn coverTreeOf(t : ptr<function, Tree>) -> CoverTree {
+  var e : CoverTree;
+  e.wx = (*t).wx;
+  e.wz = (*t).wz;
+  e.base = (*t).base;
+  e.vtop = (*t).base + 1 + i32(treeAtlas[(*t).varOff + TA_V_NY]);
+  e.varOff = (*t).varOff;
+  e.rm = (*t).rot | select(0u, 4u, (*t).mir);
+  e.reach = (*t).reach;
+  e.leafSw = select(0u, treeAtlas[TA_H_SPECIES_DIR] + u32((*t).sp) * TA_SPECIES_WORDS,
+                    (*t).autumn);
+  return e;
+}
+fn coverTreeNone() -> CoverTree {
+  var e : CoverTree;
+  e.wx = 0; e.wz = 0; e.base = 0; e.vtop = FAR_COVER_NONE;
+  e.varOff = 0u; e.rm = 0u; e.reach = 0; e.leafSw = 0u;
+  return e;
+}
+// Does the tree reach the box [lo, hi] (fine x/z, inclusive) and the rows [ylo, yhi]?
+fn coverTreeMeets(e : CoverTree, lo : vec2<i32>, hi : vec2<i32>, ylo : i32, yhi : i32) -> bool {
+  return e.vtop != FAR_COVER_NONE &&
+         e.wx + e.reach >= lo.x && e.wx - e.reach <= hi.x &&
+         e.wz + e.reach >= lo.y && e.wz - e.reach <= hi.y &&
+         e.base + 1 <= yhi && e.vtop >= ylo;
+}
+// What tree `e` puts at fine voxel p (MAT_AIR when nothing): treeCandAdd's
+// column lookup and treeCellFrom's run scan.
+fn coverTreeCell(e : CoverTree, p : vec3<i32>) -> u32 {
+  if (p.y <= e.base || p.y > e.vtop) { return MAT_AIR; }
+  let dx = p.x - e.wx;
+  let dz = p.z - e.wz;
+  if (abs(dx) > e.reach || abs(dz) > e.reach) { return MAT_AIR; }
+  var rx = dx;
+  var rz = dz;
+  switch (e.rm & 3u) {
+    case 1u: { rx = -dz; rz = dx; }
+    case 2u: { rx = -dx; rz = -dz; }
+    case 3u: { rx = dz;  rz = -dx; }
+    default: {}
+  }
+  if ((e.rm & 4u) != 0u) { rx = -rx; }
+  let vo = e.varOff;
+  let lx = i32(treeAtlas[vo + TA_V_ANCHORX]) + rx;
+  let lz = i32(treeAtlas[vo + TA_V_ANCHORZ]) + rz;
+  let nx = i32(treeAtlas[vo + TA_V_NX]);
+  let nz = i32(treeAtlas[vo + TA_V_NZ]);
+  if (lx < 0 || lz < 0 || lx >= nx || lz >= nz) { return MAT_AIR; }
+  let ci = treeAtlas[vo + TA_V_COLUMNS] + u32(lz * nx + lx) * 2u;
+  let cnt = treeAtlas[ci + 1u];
+  if (cnt == 0u) { return MAT_AIR; }
+  var c : TreeCand;
+  c.wx = e.wx; c.wz = e.wz; c.base = e.base;
+  c.ny = e.vtop - e.base - 1;
+  c.vtop = e.vtop;
+  c.colOff = treeAtlas[ci];
+  c.colCnt = cnt;
+  c.leafSw = e.leafSw;
+  return treeCellFrom(c, p.y);
+}
+// The first tree of the column's mask (compact-list order) with matter at p.
+fn coverTreesAt(m0 : u32, m1 : u32, p : vec3<i32>) -> u32 {
+  var lo = m0;
+  while (lo != 0u) {
+    let b = countTrailingZeros(lo);
+    lo &= lo - 1u;
+    let m = coverTreeCell(wgCover[wgCoverIdx[b]], p);
+    if (m != MAT_AIR) { return m; }
+  }
+  var hi = m1;
+  while (hi != 0u) {
+    let b = countTrailingZeros(hi);
+    hi &= hi - 1u;
+    let m = coverTreeCell(wgCover[wgCoverIdx[32u + b]], p);
+    if (m != MAT_AIR) { return m; }
+  }
+  return MAT_AIR;
+}
+
+@compute @workgroup_size(64)
+fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
+            @builtin(local_invocation_index) li : u32) {
+  if (wg.x >= T.farCount) { return; }
+  let packed = farList[wg.x];
+  let level = ((packed & ~FAR_LIST_MAP_BIT) >> FAR_SLOT_SHIFT) + 1u;   // 1-based
+  let slot = packed & FAR_SLOT_MASK;
+  let shift = farCellShift(level);
+  if (shift > FAR_COVER_MAX_SHIFT || !VEGETATION || taSpeciesCount() <= 0) { return; }
+  let sc = vec3<i32>(vec3<u32>(slot % FAR_NCHUNK, (slot / FAR_NCHUNK) % FAR_NCHUNK,
+                               slot / (FAR_NCHUNK * FAR_NCHUNK)));
+  let base = farSlotToChunk(sc, F.origins[level - 1u].xyz) * i32(CHUNK);
+  let half = 1 << (shift - 1u);
+  let span = i32(CHUNK) << shift;            // the level chunk, in fine voxels
+  let f0 = base << vec3<u32>(shift);         // its min corner, fine
+  // Above every tree in the world: nothing to add (most of a level's sky).
+  if (f0.y > treeMaxTop()) { return; }
+  let oi = (level - 1u) * FAR_NUM_CHUNKS + slot;
+  // A level chunk the sweep filled solid has no empty cell to fill.
+  if (li == 0u) {
+    atomicStore(&wgCoverN, select(0u, 1u, (atomicLoad(&farOcc[oi]) & 0xFFFFu) < CHUNK_VOL));
+    atomicStore(&wgCoverAdd, 0u);
+    atomicStore(&wgCoverTop, 0u);
+  }
+  if (workgroupUniformLoad(&wgCoverN) == 0u) { return; }
+
+  // ---- the trees that can reach this level chunk, one tile per thread ----
+  let lo = f0.xz;
+  let hi = f0.xz + vec2<i32>(span - 1);
+  let ylo = f0.y;
+  let yhi = f0.y + span - 1;
+  let tx0 = fdiv(lo.x, TREE_TILE) - TREE_SCAN;
+  let tz0 = fdiv(lo.y, TREE_TILE) - TREE_SCAN;
+  let nAx = min(fdiv(hi.x, TREE_TILE) + TREE_SCAN - tx0 + 1, WG_COVER_AXIS);
+  let nAz = min(fdiv(hi.y, TREE_TILE) + TREE_SCAN - tz0 + 1, WG_COVER_AXIS);
+  let maxReach = treeMaxReach();
+  for (var i = i32(li); i < nAx * nAz; i += 64) {
+    var e = coverTreeNone();
+    let s = treeSite(tx0 + i % nAx, tz0 + i / nAx, T.seed);
+    if (s.wx + maxReach >= lo.x && s.wx - maxReach <= hi.x &&
+        s.wz + maxReach >= lo.y && s.wz - maxReach <= hi.y) {
+      var t = treeInfoBare(s, landAt(s.wx, s.wz, T.seed), T.seed);
+      if (t.present) {
+        // The pond gate at the TRUNK (see the rule's note above).
+        var ps = pondScan(s.wx, s.wz, T.seed);
+        if (treePondOk(&t, &ps)) {
+          let c = coverTreeOf(&t);
+          if (coverTreeMeets(c, lo, hi, ylo, yhi)) { e = c; }
+        }
+      }
+    }
+    wgCover[i] = e;
+  }
+  // The authored trees of the footprint's site cells (at most four: a level
+  // chunk here is <= 25.6 m, a site cell 102.4 m), after the lattice's.
+  if (li == 0u) {
+    var k = 0;
+    for (var q = 0u; q < 4u; q++) {
+      let cx = select(lo.x, hi.x, (q & 1u) != 0u);
+      let cz = select(lo.y, hi.y, (q & 2u) != 0u);
+      let lst = wmSiteList(cx, cz);
+      // A cell already walked (the corners share cells unless they straddle).
+      var seen = false;
+      for (var r = 0u; r < q; r++) {
+        let rx = select(lo.x, hi.x, (r & 1u) != 0u);
+        let rz = select(lo.y, hi.y, (r & 2u) != 0u);
+        if (wmSiteList(rx, rz) == lst) { seen = true; }
+      }
+      if (seen) { continue; }
+      let n = wmSiteN(lst);
+      for (var j = 0u; j < n && k < FAR_COVER_SITES; j++) {
+        let sid = wmSiteK(lst, j);
+        if (wmSiteKind(sid) != WM_SITE_TREE) { continue; }
+        var t = siteTree(sid, T.seed);
+        if (!t.present) { continue; }
+        let c = coverTreeOf(&t);
+        if (!coverTreeMeets(c, lo, hi, ylo, yhi)) { continue; }
+        // A site listed in two of the cells is one tree.
+        var dup = false;
+        for (var d = 0; d < k; d++) {
+          let o = wgCover[WG_COVER_AXIS * WG_COVER_AXIS + d];
+          if (o.wx == c.wx && o.wz == c.wz) { dup = true; }
+        }
+        if (dup) { continue; }
+        wgCover[WG_COVER_AXIS * WG_COVER_AXIS + k] = c;
+        k += 1;
+      }
+    }
+    for (var d = k; d < FAR_COVER_SITES; d++) {
+      wgCover[WG_COVER_AXIS * WG_COVER_AXIS + d] = coverTreeNone();
+    }
+  }
+  workgroupBarrier();
+  // The compact list, in offer order, by one thread (<= ~110 entries).
+  if (li == 0u) {
+    var n = 0u;
+    for (var i = 0; i < nAx * nAz && n < FAR_COVER_TREES; i++) {
+      if (wgCover[i].vtop != FAR_COVER_NONE) { wgCoverIdx[n] = u32(i); n += 1u; }
+    }
+    for (var d = 0; d < FAR_COVER_SITES && n < FAR_COVER_TREES; d++) {
+      let i = WG_COVER_AXIS * WG_COVER_AXIS + d;
+      if (wgCover[i].vtop != FAR_COVER_NONE) { wgCoverIdx[n] = u32(i); n += 1u; }
+    }
+    atomicStore(&wgCoverN, n);
+  }
+  let nTrees = workgroupUniformLoad(&wgCoverN);
+  if (nTrees == 0u) { return; }
+
+  // ---- the cells: the sweep's own ownership (one z row, four x per thread,
+  // the sixteen words those four columns pack into), so the stores need no
+  // byte read-modify-write and no other thread touches the words.
+  let zi = li / 4u;
+  let x0 = (li % 4u) * 4u;
+  let planeBase = ((level - 1u) * FAR_VOX + slot * CHUNK_VOL) / 4u;
+  var words : array<u32, CHUNK>;
+  for (var yi = 0u; yi < CHUNK; yi++) {
+    words[yi] = atomicLoad(&farVox[planeBase + zi * (CHUNK * CHUNK / 4u) + yi * (CHUNK / 4u) + li % 4u]);
+  }
+  var changed = 0u;   // bit yi: row yi's word was rewritten
+  var added = 0u;
+  var top = 0u;
+  let step = 1 << shift;
+  for (var b = 0u; b < 4u; b++) {
+    let cx0 = f0.x + i32(x0 + b) * step;
+    let cz0 = f0.z + i32(zi) * step;
+    // The trees that reach this cell column, as a mask over the compact list,
+    // and their vertical extent.
+    var m0 = 0u;
+    var m1 = 0u;
+    var yb = 2147483647;
+    var yt = FAR_COVER_NONE;
+    let clo = vec2<i32>(cx0, cz0);
+    let chi = clo + vec2<i32>(step - 1);
+    for (var i = 0u; i < nTrees; i++) {
+      let e = wgCover[wgCoverIdx[i]];
+      if (!coverTreeMeets(e, clo, chi, ylo, yhi)) { continue; }
+      if (i < 32u) { m0 |= 1u << i; } else { m1 |= 1u << (i - 32u); }
+      yb = min(yb, e.base + 1);
+      yt = max(yt, e.vtop);
+    }
+    if ((m0 | m1) == 0u) { continue; }
+    for (var yi = 0u; yi < CHUNK; yi++) {
+      let byteV = (words[yi] >> (b * 8u)) & 0xFFu;
+      if (farCellSlot(byteV) != 0u) { continue; }       // the centre found matter
+      let c0 = vec3<i32>(cx0, f0.y + i32(yi) * step, cz0);
+      if (c0.y + step - 1 < yb || c0.y > yt) { continue; }
+      var acc : FarCoverAcc;
+      acc.lo = 0u;
+      acc.hi = 0u;
+      for (var o = 0u; o < 8u; o++) {
+        farCoverPut(&acc, o, farCoverSlotOf(coverTreesAt(m0, m1, farCoverSub(c0, half, o))));
+      }
+      let pick = farCoverPick(acc, level);
+      if (pick == 0u) { continue; }
+      words[yi] = (words[yi] & ~(0xFFu << (b * 8u))) | (pick << (b * 8u));
+      changed |= 1u << yi;
+      if (byteV == 0u) { added += 1u; }   // a blocker cell was already counted
+      top = max(top, yi + 1u);
+    }
+  }
+  for (var yi = 0u; yi < CHUNK; yi++) {
+    if ((changed & (1u << yi)) == 0u) { continue; }
+    atomicStore(&farVox[planeBase + zi * (CHUNK * CHUNK / 4u) + yi * (CHUNK / 4u) + li % 4u],
+                words[yi]);
+  }
+  atomicAdd(&wgCoverAdd, added);
+  atomicMax(&wgCoverTop, top);
+  workgroupBarrier();
+  if (li == 0u) {
+    // The sweep's publication, raised by what this pass added (only this
+    // workgroup touches this slot's word in this dispatch).
+    let cur = atomicLoad(&farOcc[oi]);
+    atomicStore(&farOcc[oi],
+                farOccPack(min((cur & 0xFFFFu) + atomicLoad(&wgCoverAdd), CHUNK_VOL),
+                           max(farOccTop(cur), atomicLoad(&wgCoverTop))));
   }
 }
 
@@ -8123,6 +8505,69 @@ fn fardownFeat(@builtin(workgroup_id) wg : vec3<u32>,
     }
   }
 
+  // ---- THE COVER RULE, LIVE (farCoverPick; DESIGN.md "Far crowns keep their
+  // coverage") ----------------------------------------------------------------
+  // `fardown` wrote every cell of this chunk from its centre sample; at the
+  // levels whose cells lie inside one chunk this fills, from the live voxels,
+  // each cell whose centre found no matter but whose eight sub-samples are
+  // mostly leaf -- the rule `farcover` applies to procgen trees, so a crown
+  // the player walked away from downsamples as dense as the sieve fills it.
+  // HERE and not in `fardown` for the container rule's reason (below): no
+  // procgen, and that entry's compile is the cliff. Before the container pass,
+  // which may overwrite a cell this one filled (a wall between liquid and
+  // open space is the stronger claim) and which returns early on a dry chunk.
+  //
+  // PREFILTER (exact): a chunk with no cover voxel has nothing to add. A
+  // sentinel chunk is one material: every centre is it, so no cell is empty
+  // AND covered.
+  let pe = pageTable[slot];
+  let pageBase = pe * CHUNK_VOL;
+  var cov = select(0u, 2u, (pe & PT_SENTINEL_BIT) != 0u);
+  if (li == 0u) { atomicStore(&wgFarCov, 0u); }
+  workgroupBarrier();
+  for (var i = li; i < CHUNK_VOL && cov == 0u; i += 64u) {
+    cov |= select(0u, 1u, farCoverSlotOf(voxels[pageBase + i] & 0xFFFu) != 0u);
+  }
+  if (cov == 1u) { atomicOr(&wgFarCov, 1u); }
+  if (workgroupUniformLoad(&wgFarCov) != 0u) {
+    for (var level = 1u; level <= FAR_LEVELS; level++) {
+      let shift = farCellShift(level);
+      if (shift > FAR_COVER_MAX_SHIFT) { break; }
+      let step = 1 << shift;
+      let half = 1 << (shift - 1u);
+      let first = vec3<i32>(farFirstCenter(base.x, step, half), farFirstCenter(base.y, step, half),
+                            farFirstCenter(base.z, step, half));
+      let n = vec3<i32>(farCenterCount(base.x, first.x, step), farCenterCount(base.y, first.y, step),
+                        farCenterCount(base.z, first.z, step));
+      let origin = F.origins[level - 1u].xyz;
+      let cells = u32(n.x * n.y * n.z);
+      for (var ci = li; ci < cells; ci += 64u) {
+        let fine = first + vec3<i32>(i32(ci) % n.x, (i32(ci) / n.x) % n.y, i32(ci) / (n.x * n.y)) * step;
+        let cc = fine >> vec3<u32>(shift);
+        if (!farInBox(cc, origin)) { continue; }
+        let bi = farVoxByteIndex(level, cc);
+        let bsh = (bi & 3u) * 8u;
+        if (farCellSlot((atomicLoad(&farVox[bi >> 2u]) >> bsh) & 0xFFu) != 0u) { continue; }
+        // The cell's min corner, chunk-local: the whole cell is in this page.
+        let c0 = fine - vec3<i32>(half) - base;
+        var acc : FarCoverAcc;
+        acc.lo = 0u;
+        acc.hi = 0u;
+        for (var o = 0u; o < 8u; o++) {
+          let lf = vec3<u32>(farCoverSub(c0, half, o));
+          farCoverPut(&acc, o,
+                      farCoverSlotOf(voxels[pageBase + (lf.z * CHUNK + lf.y) * CHUNK + lf.x] & 0xFFFu));
+        }
+        let pick = farCoverPick(acc, level);
+        if (pick == 0u) { continue; }
+        atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
+        atomicOr(&farVox[bi >> 2u], pick << bsh);
+        atomicMax(&farOcc[farOccIndex(level, cc)],
+                  farOccPack(1u, u32(cc.y & (i32(CHUNK) - 1)) + 1u));
+      }
+    }
+  }
+
   // ---- THE CONTAINER RULE, LIVE (farContainedBy) ----------------------------
   // `fardown` wrote every cell of this chunk from its centre sample; this
   // overwrites, at levels 1-2, the cells where a container wall beats that
@@ -8145,8 +8590,7 @@ fn fardownFeat(@builtin(workgroup_id) wg : vec3<u32>,
   // PREFILTER (exact): a container wall touches liquid inside the chunk or
   // directly across one of its six faces; a dry chunk with dry faces -- most
   // of a burning forest -- reads its voxels once and stops.
-  let pe = pageTable[slot];
-  let pageBase = pe * CHUNK_VOL;
+  // (`pe` / `pageBase`: the cover pass above looked them up.)
   // A sentinel chunk is one material: no container. It skips the scan by
   // starting with its answer instead of returning (the barriers below).
   var liq = select(0u, 2u, (pe & PT_SENTINEL_BIT) != 0u);

@@ -724,6 +724,9 @@ const char* const kOrder[] = {
     // structure-stamp and keeps its exit contract (override cleared, window
     // regenerated at the origin it found).
     "far-contain",
+    // The far cover rule on a procgen crown at the harness origin: regenerates
+    // the window there and restores the origin it found, like far-contain.
+    "far-cover",
     // P5 editor: editor-commands is CPU-only (scratch refs + a _gate asset);
     // editor-struct-edit installs a turned house like structure-reload and
     // keeps its exit contract (override cleared, window regenerated).

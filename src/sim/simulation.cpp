@@ -1770,9 +1770,15 @@ void Simulation::UploadTables(const rhi::Queue& queue,
   // -- the far field wants its palette jitter, its opacity and its class, not
   // just an RGB. Only the owner writes: an alias shares the slot precisely so
   // that the byte resolves to the material it named.
+  // `tagMask` of the entry is the slot's COVER word (materials.h
+  // MaterialDef::farCover / FarCoverMinWord; worldgen.wgsl farCoverWord): the
+  // per-level minimums, 0 = not cover. A palette entry is never a voxel's
+  // material, so no reaction's tag test can reach it. The owner decides,
+  // like the id.
   for (size_t i = 0; i < mats.size() && i < 4096; i++) {
     if (!mats[i].farPalOwner) continue;
     table[kFarPaletteBaseGpu + mats[i].farPalSlot].flags = (uint32_t)i;
+    table[kFarPaletteBaseGpu + mats[i].farPalSlot].tagMask = mats[i].farCover ? FarCoverMinWord() : 0u;
   }
 
   // Art palette, same trick one range lower (world.h). Re-applied here because
@@ -2525,6 +2531,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // WaitForFarPipelines at the top of this function joined its thread, so
   // nothing is compiling from the module these handles came from.
   farFill_ = {};
+  farCoverFill_ = {};
   farMapFill_ = {};
   farPatchFill_ = {};
   farDown_ = {};
@@ -2634,6 +2641,9 @@ void Simulation::StartFarBuild(unsigned threads) {
       r.map = MakeComputePipeline(dev, layout, module, "farmap", "farMapFill");
     });
     r.fill = MakeComputePipeline(dev, layout, module, "far", "farFill");
+    // The cover rule (`farcover`): a tree scan and no genColumn, so it
+    // compiles in a fraction of the sweep's time and shares its thread.
+    r.cover = MakeComputePipeline(dev, layout, module, "farcover", "farCoverFill");
     // fardown's follow-up phases: no procgen in them, so they compile in a
     // fraction of fardown's time and share the fill's thread.
     r.downClaim = MakeComputePipeline(dev, layout, module, "fardownClaim", "farDownClaim");
@@ -2678,6 +2688,7 @@ void Simulation::StartFarBuild(unsigned threads) {
   if (threads <= 1) {
     FarPipelines r = build();
     farFill_ = std::move(r.fill);
+    farCoverFill_ = std::move(r.cover);
     farMapFill_ = std::move(r.map);
     farPatchFill_ = std::move(r.patch);
     farDown_ = std::move(r.down);
@@ -2694,6 +2705,7 @@ void Simulation::StartFarBuild(unsigned threads) {
 void Simulation::PublishFarPipelines() {
   FarPipelines r = farFuture_.get();  // blocks if the thread is still running
   farFill_ = std::move(r.fill);
+  farCoverFill_ = std::move(r.cover);
   farMapFill_ = std::move(r.map);
   farPatchFill_ = std::move(r.patch);
   farDown_ = std::move(r.down);
@@ -2704,7 +2716,7 @@ void Simulation::PublishFarPipelines() {
   farReady_.store(true, std::memory_order_release);
   // Not fatal: a failed far compile costs the horizon, not the sim. Say so
   // once — silence here would read as "the cascades are just empty".
-  if (!farFill_ || !farMapFill_ || !farPatchFill_ || !farDown_ ||
+  if (!farFill_ || !farCoverFill_ || !farMapFill_ || !farPatchFill_ || !farDown_ ||
       !farDownClaim_ || !farDownStalk_ || !farDownFeat_)
     std::fprintf(stderr,
                  "far-cascade pipelines failed to compile; the horizon will "
@@ -2968,6 +2980,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::FarFill:        return farFill_;
     case P::FarPatchFill:   return farPatchFill_;
     case P::FarMapFill:     return farMapFill_;
+    case P::FarCoverFill:   return farCoverFill_;
     case P::FarDown:        return farDown_;
     case P::FarDownClaim:   return farDownClaim_;
     case P::FarDownStalk:   return farDownStalk_;
@@ -3237,7 +3250,9 @@ void Simulation::EncodeFarFill(const rhi::CommandEncoder& enc, uint32_t count) {
   // missing one (the patch entry is what puts the edits back).
   // The map fill joins them: without it an X/Z plane would leave the surface
   // map holding the OUTGOING face's columns under the incoming one's cells.
-  if (!farFill_ || !farMapFill_ || !farPatchFill_) return;
+  // The cover rule joins them: without it a refilled plane's crowns are
+  // the porous centre-sample lattice beside dense downsampled ones.
+  if (!farFill_ || !farCoverFill_ || !farMapFill_ || !farPatchFill_) return;
   RecordCtx cx{};
   cx.farCount = count;
   RecordTable(enc, pass::Table::FarFill, &cx);

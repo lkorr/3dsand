@@ -495,7 +495,9 @@ enum class Pipe : uint8_t {
   // sit inside the merged entry.
   // FarMapFill is the far SURFACE MAP's fill (worldgen.wgsl `farmap`), a third
   // row between the two: after the sweep, before the patch that invalidates it.
-  FarFill, FarMapFill, FarPatchFill, FarDown,
+  // FarCoverFill is the far COVER RULE over procgen trees (worldgen.wgsl
+  // `farcover`): after the sweep whose empty cells it fills, before the patch.
+  FarFill, FarCoverFill, FarMapFill, FarPatchFill, FarDown,
   // fardown's three follow-up dispatches (cross-vendor audit #9): the claim
   // check, the cut-stalk clear and the feature check, each its own entry so
   // no phase reads what another phase of the same dispatch is writing.

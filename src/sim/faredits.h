@@ -123,6 +123,49 @@ class FarEdits {
   static constexpr int kMatAtGround = -2;   // a WALL of unknown material, never a candidate
   void SetContainSource(std::vector<uint8_t> kindOf) { containKind_ = std::move(kindOf); }
 
+  // ---- THE COVER RULE (2026-10-10; worldgen.wgsl farCoverPick) -------------
+  // At the levels whose cells lie inside one fine chunk (shift <=
+  // kCoverMaxShift), a cell whose centre is not far-solid (air, a gas, a MICRO
+  // plant: ContainKindOf == kContainNone) takes the dominant COVER material
+  // (materials.h MaterialDef::farCover: leaves) of its eight sub-samples --
+  // the voxels at c0 + o*half + half/2 per axis, o in {0,1}^3, x fastest --
+  // when at least the dominant's per-level minimum of them are cover. Ties go
+  // to the sub-sample first in that order. The GPU applies the same rule in
+  // two places (the sieve's `farcover` from procgen trees, fardownFeat from
+  // the live grid); this is the patch's half, for an evicted edited chunk.
+  // Per material id: 0 = not cover, else farCoverWord's (slot | minimums << 8)
+  // of the material's slot OWNER. Until it is set, no cover.
+  static constexpr int kCoverMaxShift = 4;   // == FAR_COVER_MAX_SHIFT (== CHUNK_SHIFT)
+  void SetCoverSource(std::vector<uint32_t> coverOf) { coverOf_ = std::move(coverOf); }
+  uint32_t CoverOf(uint32_t mat) const { return mat < coverOf_.size() ? coverOf_[mat] : 0u; }
+  // The cover rule for one cell (see SetCoverSource): `centre` its centre
+  // material (already known not far-solid), `half` its half-width, `c0` its
+  // min corner in whatever coordinates `matAt` takes. Returns the cell's
+  // material. Public for the far-cover gate's oracle.
+  template <class F>
+  uint32_t CoverPick(uint32_t centre, uint32_t level, int half, const int c0[3], F&& matAt) const {
+    uint32_t slot[8], mat[8];
+    uint32_t n = 0;
+    const int q = half >> 1;
+    for (int o = 0; o < 8; o++) {
+      mat[o] = matAt(c0[0] + (o & 1) * half + q, c0[1] + ((o >> 1) & 1) * half + q,
+                     c0[2] + ((o >> 2) & 1) * half + q);
+      const uint32_t cw = CoverOf(mat[o]);
+      slot[o] = cw & 0xFFu;
+      if (cw != 0) n++;
+    }
+    int best = 0, bestO = -1;
+    for (int i = 0; i < 8; i++) {
+      if (slot[i] == 0) continue;
+      int c = 0;
+      for (int j = 0; j < 8; j++) c += slot[j] == slot[i] ? 1 : 0;
+      if (c > best) { best = c; bestO = i; }
+    }
+    if (bestO < 0) return centre;
+    const uint32_t minN = (CoverOf(mat[bestO]) >> (8 + (level - 1) * 4)) & 15u;
+    return (minN != 0 && n >= minN) ? mat[bestO] : centre;
+  }
+
   // Forgets every NOTED edit. The BASE (SetBase) survives: it is the authored
   // edit layer, which belongs to the map, not to the store being replaced.
   void Clear() {
@@ -290,6 +333,7 @@ class FarEdits {
   // kMatAtUnseen or kMatAtGround. Returns the cell's material.
   uint32_t ContainedBy(uint32_t centre, int step, const int c0[3],
                        const std::function<int(int, int, int)>& matAt) const;
+  std::vector<uint32_t> coverOf_;   // SetCoverSource
   // THE CONTAINER RULE FOR STAMPS (SetBase's first contribution): the cells
   // of every map stamp holding liquid where the rule changes the centre
   // sample, filed into `out` as patch words. See SetBase.
