@@ -849,6 +849,18 @@ struct BodyBurnState {
   // about the COAT, not an index into the lattice, so it survives
   // DropBurnIndex.
   uint8_t rainSated = 0;
+  // IMMERSED: tick + 1 of the last contact walk (MobSystem::StainOneLimb) that
+  // found a WASHER liquid (water) against this limb; 0 = never. While it is
+  // this tick, the limb's water coat neither dries nor wicks and drips
+  // (Mob::StainTick): a body lying in water stays wet, so once its surface is
+  // soaked the contact pass has nothing left to write and a corpse in a pond
+  // can sleep instead of being dried and re-wetted every tick forever.
+  uint32_t washTouch = 0;
+  bool InWasher(uint32_t tick) const { return washTouch == tick + 1u; }
+  // InWasher as of the last Mob::StainTick visit, for the corpse sleep test
+  // (Mob::DeadAwakeCriterion), which has no tick: a washer coat on a limb
+  // lying in water is not changing, so it does not hold the corpse awake.
+  bool soaking = false;
   bool Burning() const { return !front.empty() || alight; }
   // ON FIRE, which is NARROWER than `front`. The front is every voxel whose
   // material carries a self decay/emit rule, and fire is only one of the things
@@ -1413,6 +1425,7 @@ struct StainEvt {
 struct StainPre {
   bool valid = false;   // the walk below is this tick's
   bool any = false;     // the walk found something against the limb
+  bool anyWash = false; // ...and some of it was a washer liquid (water)
   bool swept = false;   // `evts` holds the first `kPlanned` samples
   uint32_t ns = 0;      // surface size (0 = none / refused)
   uint32_t kPlanned = 0;
@@ -1640,6 +1653,13 @@ struct MobLimb {
   // voxel word (there are no spare bits), it is not saved, and it is not
   // hashed.
   float hitFlash = 0;
+  // Mob::LimbFloatDensity's cache: the mean density of this limb's matter plus
+  // its worn shells, and the voxel total it was taken at. A carve or a shell
+  // lost changes the total and re-takes it; a burn that only swaps a material
+  // keeps the old figure (flesh to char is a few percent of buoyancy). Derived,
+  // never saved.
+  float floatRho = 0;
+  uint32_t floatRhoKey = 0;
   // THE DYE this shell was worn in (game/dye.h). 0 on every body limb and on
   // every undyed piece, which is what the GPU's default word already means, so
   // nothing that does not wear a dyed garment changes at all.
@@ -2667,6 +2687,14 @@ class Mob {
   // (PreTick), 2 the chunks round it changed, 3 Jolt active after the step
   // (PostStep), 4 a drying visit wrote something else; 0 = never.
   uint8_t DeadWokeHow() const { return deadWokeHow_; }
+  // Limb-ticks FloatDeadLimbs has pushed up, ever (diagnostic, for gates).
+  uint32_t FloatedLimbs() const { return floatedLimbs_; }
+  // The waterline FloatDeadLimbs last pushed against (-1 = never).
+  float FloatSurfaceY() const { return floatSurfaceY_; }
+  // FloatDeadLimbs' rhoLimb before the air fraction: the mean density (kg/m^3)
+  // of limb `limbIndex`'s matter plus its worn shells, cached on the limb by
+  // its voxel count.
+  float LimbFloatDensity(int limbIndex);
   // Wake a sleeping corpse. Cheap and idempotent; every entry point that can
   // change a dead body calls it.
   void WakeDead() {
@@ -4281,6 +4309,15 @@ class Mob {
   // nothing else — no settle test, no get-up (a body with no pelvis left does
   // not stand up either), no arrest and therefore no fall damage.
   void TickDeadLimp(float dt);
+  // ARCHIMEDES FOR A CORPSE (DebrisSystem::FloatBodies' rule, per limb): every
+  // dynamic limb touching liquid gets Jolt's buoyancy impulse with the ratio
+  // rhoLiquid / rhoLimb, where rhoLimb is the mean density of what the limb
+  // (and anything worn on it) is MADE of, less ragdoll.corpseAirFraction for
+  // the gas a body holds. Flesh floats low, a brass automaton sinks, a sylvan
+  // rides high. `rouse` (the corpse was just woken by the world changing
+  // round it) activates a sleeping wet limb once, so water arriving over a
+  // corpse at rest lifts it; otherwise a sleeping limb is left asleep.
+  void FloatDeadLimbs(World& world, float dt, bool rouse);
   // Every sleep criterion (MobSystem's note on kDeadSleepTicks) as of now.
   // The criteria themselves, asleep or not (DeadAwakeReason adds the asleep
   // report on top).
@@ -5073,6 +5110,8 @@ class Mob {
   float dryScale_ = 0.0f;
   uint8_t dryWokeBy_ = 0;      // see DeadDryWokeBy()
   uint8_t deadWokeHow_ = 0;    // see DeadWokeHow()
+  uint32_t floatedLimbs_ = 0;  // see FloatedLimbs()
+  float floatSurfaceY_ = -1;   // see FloatSurfaceY()
   int16_t dryWokeLimb_ = -1;
   // Which of StainTick's passes wrote on its last run, and on which limb
   // (bits: 1 contact, 2 rain, 4 dry, 8 wet). Attribution for DeadAwakeReason.
@@ -7764,8 +7803,11 @@ class MobSystem {
   // period. Shared by the living and the dead (StainDeadFlesh). In the SUN
   // (daylight, and nothing but air/gas over the limb, InSunlight) the period
   // is divided by coat.sunDryScale; `world` null skips the probe (shade).
+  // `keepWashers`: the limb is lying in water this tick (BodyBurnState::
+  // washTouch), so a washer coat (water) is skipped -- it does not dry.
   bool DryOneLimb(BurnLimbView& v, const LimbCoat& led, uint32_t tick,
-                  uint32_t key, uint32_t& budget, World* world);
+                  uint32_t key, uint32_t& budget, World* world,
+                  bool keepWashers = false);
   // Is this world point in sunshine: daylight up (dayPhase_) and a clear
   // column to kSunProbeCells above it in the CPU mirror. A column not yet
   // mirrored reads as OPEN and is requested -- most of the world is outdoors,

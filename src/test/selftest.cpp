@@ -1162,6 +1162,10 @@ const char* const kOrder[] = {
     // debris (docs/PLAN_corpse_is_a_mob.md). The first ticks the world and
     // regenerates it on the way out; the second is one PreTick, CPU only.
     "corpse-sleep", "corpse-cap",
+    // A corpse dropped into a stamped basin floats (flesh) or sinks (brass,
+    // synth shell) by what it is made of. Ticks the world and regenerates it
+    // on the way out.
+    "corpse-float",
     // The player's corpse is a dead Mob too (P2b): moved into mobs_ at the
     // PreTick after the death, whole respawn, sleeps, a cut reaches it. Ticks
     // the world and regenerates it on the way out, as corpse-sleep does.

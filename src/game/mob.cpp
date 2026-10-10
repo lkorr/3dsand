@@ -8845,10 +8845,15 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
           continue;
         }
       }
+      // Woken by the world changing round it (not by its own rig moving):
+      // water may have arrived, and a corpse asleep on a flooded bank must be
+      // lifted (FloatDeadLimbs' `rouse`).
+      bool roused = false;
       if (mob.deadAsleep_) {
         if (mob.RigActive() || mob.DeadWakeKey(world) != mob.deadWakeKey_) {
           mob.WakeDead();
           mob.deadWokeHow_ = mob.RigActive() ? 1 : 2;
+          roused = mob.deadWokeHow_ == 2;
         } else {
           if ((tick + (uint32_t)mob.id_) % kDeadAnchorStride == 0) {
             mob.RegisterTerrainAnchor();
@@ -8861,6 +8866,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       mob.RegisterTerrainAnchor();
       deadAnchors_++;
       mob.TickDeadLimp(dt);
+      mob.FloatDeadLimbs(world, dt, roused);
       // Wounds pay out and close; nothing refills them (the open stump's pump
       // is `alive_`-gated in BleedTick), and DrainBlood cannot kill twice.
       mob.BleedTick(tick, world, ops, spawns, bleedOps);
@@ -22537,11 +22543,15 @@ void MobSystem::StainDeadFlesh(uint32_t tick, World& world, uint32_t& budget,
       cc.dirty = false;
     }
     if (RainOneLimb(v, tick, key, rainBudget, &world)) changed = true;
-    if (budget && DryOneLimb(v, cc.led, tick, key, budget, &world)) changed = true;
+    // In water, its water coat stays, as a limb's does (Mob::StainTick).
+    const bool immersed = v.burn && v.burn->InWasher(tick);
+    if (budget && DryOneLimb(v, cc.led, tick, key, budget, &world, immersed))
+      changed = true;
     // ...and while it is still wet it wicks and drips, as a limb does
     // (Mob::StainTick). The drips queue on the system and go out at the top of
     // the next PreTick, one tick latent like a creature's.
-    if (budget && WetOneLimb(v, cc.led, tick, key, budget, &pendingSpawns_))
+    if (budget && !immersed &&
+        WetOneLimb(v, cc.led, tick, key, budget, &pendingSpawns_))
       changed = true;
     if (changed) cc.dirty = true;
     if (model >= 0) *f.microModel = (uint32_t)model;
@@ -22625,6 +22635,10 @@ void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget,
                         ? &stainPre_[li]
                         : nullptr;
     if (sys_->StainOneLimb(v, tick, key, world, budget, pre)) wrote(1, li);
+    // IN WATER (the walk just above saw it), the water on it stays: no drying
+    // of a washer coat and no wicking or dripping. Other coats dry on.
+    const bool immersed = v.burn && v.burn->InWasher(tick);
+    if (v.burn) v.burn->soaking = immersed;
 
     // ---- AND WHAT IS ALREADY ON IT DRIES ------------------------------------
     // AFTER the contact pass and NOT gated on it: StainOneLimb returns early
@@ -22643,10 +22657,11 @@ void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget,
     // around it.)
     if (sys_->RainOneLimb(v, tick, key, rainBudget, &world)) wrote(2, li);
     if (budget == 0) continue;
-    if (sys_->DryOneLimb(v, limbs_[li].coat, tick, key, budget, &world))
+    if (sys_->DryOneLimb(v, limbs_[li].coat, tick, key, budget, &world,
+                         immersed))
       wrote(4, li);
     // ...and while it is still wet it wicks and drips (WetOneLimb).
-    if (budget == 0) continue;
+    if (budget == 0 || immersed) continue;
     if (sys_->WetOneLimb(v, limbs_[li].coat, tick, key, budget, &pendingSpawns_))
       wrote(8, li);
   }
@@ -22749,7 +22764,7 @@ bool MobSystem::CoatDriesAsleep(uint32_t mat) const {
 
 bool MobSystem::DryOneLimb(BurnLimbView& v, const LimbCoat& led,
                            uint32_t tick, uint32_t key, uint32_t& budget,
-                           World* world) {
+                           World* world, bool keepWashers) {
   burnprof::Scope bpScope(burnprof::kStainDry);
   // Asked at most once per call, and only on a tick some substance's period
   // could fire on -- a wet creature pays one column walk a period, not a tick.
@@ -22789,6 +22804,7 @@ bool MobSystem::DryOneLimb(BurnLimbView& v, const LimbCoat& led,
     // same terms. Two periods, and the probe only on a tick one lands on.
     const bool washer = en.mat < matGpu_.size() &&
                         (matGpu_[en.mat].stainPack & kStainPackWashesBit);
+    if (washer && keepWashers) continue;  // lying in it: it does not dry
     const long tkSun =
         washer ? std::lround((double)secs * 30.0 /
                              ((double)ct.decayScale * (double)ct.sunDryScale))
@@ -23502,6 +23518,7 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   if (planWalk && pre != nullptr) {
     pre->valid = false;
     pre->any = false;
+    pre->anyWash = false;
     pre->swept = false;
     pre->ns = 0;
     pre->kPlanned = 0;
@@ -23647,6 +23664,7 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   } else if (usePlan) {
     // The plan's walk: its fetches asked now, in its order, and its answer.
     for (const IVec3& wc : pre->walkFetches) world.RequestChunkFetch(wc);
+    if (pre->anyWash && v.burn) v.burn->washTouch = tick + 1u;
     if (!pre->any) return false;
   } else {
     const float sinv = 1.0f / (float)std::max(1u, v.physScale);
@@ -23663,6 +23681,10 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     const IVec3 hi{ifloor(mx.x) + 1, ifloor(mx.y) + 1, ifloor(mx.z) + 1};
     burnprof::Scope bpWalk(burnprof::kStainWalk);
     bool any = false;
+    // Found water against it. The walk does not stop at the first contact
+    // until it has looked for this too: a sunk corpse's first contact is the
+    // bloodied bed under it, and it is still lying in water (washTouch).
+    bool anyWash = false;
     uint32_t seen = 0;
     Contact probe;
     // ONE CHUNK'S RUN OF A ROW AT A TIME (PLAN_fight64_perf M; BurnOneLimb's
@@ -23672,9 +23694,9 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // in the same y/z/x order, against the same cap, stopping on the same
     // cell as worldWordAt one by one. Air (word 0) is the common case and
     // classify refuses it on its first test, so it is skipped inline.
-    for (int y = lo.y; y <= hi.y && !any && seen < kStainScanCells; y++)
-      for (int z = lo.z; z <= hi.z && !any && seen < kStainScanCells; z++)
-        for (int x = lo.x; x <= hi.x && !any && seen < kStainScanCells;) {
+    for (int y = lo.y; y <= hi.y && !anyWash && seen < kStainScanCells; y++)
+      for (int z = lo.z; z <= hi.z && !anyWash && seen < kStainScanCells; z++)
+        for (int x = lo.x; x <= hi.x && !anyWash && seen < kStainScanCells;) {
           const int nRun = std::min<int>(std::min(hi.x, x | 15) - x + 1,
                                          (int)(kStainScanCells - seen));
           seen += (uint32_t)nRun;
@@ -23697,11 +23719,18 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             if ((w & 0xFFFu) == 0u) continue;
             if (classify(w, probe)) {
               any = true;
-              break;
+              if (probe.wash) {
+                anyWash = true;
+                break;
+              }
             }
           }
         }
-    if (planWalk && pre) pre->any = any;
+    if (planWalk && pre) {
+      pre->any = any;
+      pre->anyWash = anyWash;
+    }
+    if (!planOnly && anyWash && v.burn) v.burn->washTouch = tick + 1u;
     if (!any) {
       if (planWalk && pre) pre->valid = true;
       return false;  // the walk was the whole cost
@@ -26829,6 +26858,110 @@ void Mob::TickDeadLimp(float dt) {
     origin_ = limbs_[rl].xf.pos - limbs_[rl].restOffset;
 }
 
+// The mean density of limb `li`'s matter, weighted by cell VOLUME so a worn
+// shell on another lattice (a scale-4 breastplate on a scale-8 torso) counts
+// for the space it fills. Worn shells are folded into their host because they
+// are kinematic followers with no buoyancy of their own: an iron-plated chest
+// should sink the man wearing it, and a cloth shirt should not.
+float Mob::LimbFloatDensity(int li) {
+  MobLimb& host = limbs_[li];
+  uint32_t key = 0;
+  for (size_t j = 0; j < limbs_.size(); j++) {
+    const MobLimb& l = limbs_[j];
+    if ((int)j != li && l.wornHost != li) continue;
+    key += (uint32_t)(l.HasFineSkin() ? l.skinVoxels.size() : l.voxels.size());
+  }
+  if (key == host.floatRhoKey && host.floatRho > 0) return host.floatRho;
+  const std::vector<float>& rhoOf = sys_->densityOf_;
+  double mass = 0, vol = 0;
+  for (size_t j = 0; j < limbs_.size(); j++) {
+    const MobLimb& l = limbs_[j];
+    if ((int)j != li && l.wornHost != li) continue;
+    const bool fine = l.HasFineSkin();
+    const double s = (double)std::max(1u, fine ? SkinScaleOf(l) : PhysScaleOf(l));
+    const double cell = 1.0 / (s * s * s);
+    auto add = [&](uint32_t mat) {
+      if (mat == 0 || mat >= rhoOf.size()) return;
+      mass += rhoOf[mat] * cell;
+      vol += cell;
+    };
+    if (fine)
+      for (const PrefabVoxel& v : l.skinVoxels) add(v.material & 0xFFFu);
+    else
+      for (const DebrisVoxel& v : l.voxels) add(v.payload & 0xFFFu);
+  }
+  host.floatRhoKey = key;
+  host.floatRho = vol > 0 ? (float)(mass / vol) : 1000.0f;
+  return host.floatRho;
+}
+
+// DebrisSystem::FloatBodies, for a corpse. Liquids are not in the collider, so
+// without this a body fell through a lake as though it were air and lay on the
+// bed. Per LIMB rather than per body: Jolt finds each limb's submerged volume
+// from its own collider and the joints do the rest, so a floating corpse lies
+// with its chest up and its arms hanging below it, and a severed-headed one
+// floats as what is left of it.
+//
+// Cost: an asleep limb is skipped before any read (a corpse at rest on the bed
+// or on the surface stays asleep, rule 2); an awake dry limb is two mirror
+// reads. The surface walk is capped like FloatBodies'.
+void Mob::FloatDeadLimbs(World& world, float dt, bool rouse) {
+  if (!phys_ || !sys_) return;
+  const float air = CurrentTuning().ragdoll.corpseAirFraction;
+  const float linDrag = CurrentTuning().physics.waterLinearDrag;
+  const float angDrag = CurrentTuning().physics.waterAngularDrag;
+  const std::vector<MaterialGpu>& mg = sys_->matGpu_;
+  IVec3 memoWc{INT32_MIN, INT32_MIN, INT32_MIN};
+  const CachedChunk* memoCc = nullptr;
+  auto matAt = [&](int x, int y, int z) -> uint32_t {
+    if (!world.CellInWindow({x, y, z})) return 0u;
+    const IVec3 wc{x >> 4, y >> 4, z >> 4};
+    if (wc.x != memoWc.x || wc.y != memoWc.y || wc.z != memoWc.z) {
+      memoWc = wc;
+      memoCc = world.Cached(wc);
+    }
+    if (!memoCc || memoCc->voxels.size() != kChunkVol) return 0u;
+    return memoCc->voxels[((uint32_t)(z & 15) * kChunk + (uint32_t)(y & 15)) *
+                              kChunk + (uint32_t)(x & 15)] & 0xFFFu;
+  };
+  auto isLiquid = [&](uint32_t m) {
+    return m != 0 && m < mg.size() && mg[m].klass == CLASS_LIQUID;
+  };
+  for (size_t i = 0; i < limbs_.size(); i++) {
+    const MobLimb& l = limbs_[i];
+    // Followers and held pieces are kinematic; ApplyBuoyancy would refuse
+    // them anyway, and a shell's matter is already in its host's density.
+    if (!l.body || l.wornHost >= 0 || l.holdSeconds > 0) continue;
+    const bool active = phys_->IsActive(l.body);
+    if (!active && !rouse) continue;
+    Vec3 com;
+    if (!phys_->BodyCenterOfMass(l.body, com)) continue;
+    float bmin[3], bmax[3];
+    if (!phys_->BodyWorldBoundsM(l.body, bmin, bmax)) continue;
+    const int cx = (int)std::floor(com.x), cz = (int)std::floor(com.z);
+    const int keelY = (int)std::floor(MetresToCells(bmin[1]));
+    const int comY = (int)std::floor(com.y);
+    uint32_t mat = matAt(cx, keelY, cz);
+    int seedY = keelY;
+    if (!isLiquid(mat)) {
+      mat = matAt(cx, comY, cz);
+      seedY = comY;
+      if (!isLiquid(mat)) continue;  // dry
+    }
+    constexpr int kMaxColumnWalk = 96;
+    int surfY = seedY + 1;
+    for (int k = 0; k < kMaxColumnWalk && isLiquid(matAt(cx, surfY, cz)); k++)
+      surfY++;
+    if (!active) phys_->ActivateBody(l.body);  // rouse: the water came to it
+    const float rhoB = std::max(1.0f, LimbFloatDensity((int)i) * (1.0f - air));
+    const float buoy = (float)mg[mat].density / rhoB;
+    if (phys_->ApplyBuoyancy(l.body, (float)surfY, buoy, linDrag, angDrag, dt)) {
+      floatedLimbs_++;
+      floatSurfaceY_ = (float)surfY;
+    }
+  }
+}
+
 bool Mob::RigActive() const {
   if (!phys_) return false;
   const int rl = def_ ? def_->rootLimb : -1;
@@ -26986,7 +27119,9 @@ const char* Mob::DeadAwakeCriterion(bool passiveDrySleeps) const {
       // A PASSIVE coat (blood, ichor, oil) only dries, and dries asleep on
       // its own cadence (MobSystem::CoatDriesAsleep, Mob::DeadDryVisit).
       if (passiveDrySleeps && sys_->CoatDriesAsleep(m)) continue;
-      // A WASHER (water) wicks and drips while it is on a body.
+      // A WASHER (water) wicks and drips while it is on a body -- unless the
+      // limb is lying in it, where it does neither (Mob::StainTick).
+      if (l.burn.soaking) continue;
       if (m < sys_->matGpu_.size() &&
           (sys_->matGpu_[m].stainPack & kStainPackWashesBit))
         return "washer coat";

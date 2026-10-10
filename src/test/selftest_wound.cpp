@@ -8387,6 +8387,229 @@ Status GatePlayerCorpse(Ctx& c, std::string& detail) {
 //      loose dead flesh in DebrisSystem now, and the newest is still a corpse;
 //   C. the living cap is untouched by the dead: kMaxMobs creatures still
 //      spawn beside the corpses, and the next one is refused.
+// ---------------------------------------------------------------------------
+// corpse-float: a dead body in water floats or sinks by what it is made of
+// ---------------------------------------------------------------------------
+// Owner, 2026-10-09: "corpses should slightly float in water with a bit of
+// buoyancy, depending on the material the corpse is made out of. So robots
+// obviously wouldn't float." Before Mob::FloatDeadLimbs a corpse fell through a
+// lake as if it were air (liquids are not in the collider) and lay on the bed.
+//
+// One stamped basin (stone bed and walls, 14 layers of water, air above),
+// four corpses dropped into it one at a time from just above the surface:
+//   * HUMAN must FLOAT LOW: its pelvis never gets near the bed, ends within a
+//     few voxels of the waterline, and the rig comes to rest there in Jolt
+//     (rule 2: buoyancy is not what keeps it moving);
+//   * and A CORPSE LYING IN WATER SLEEPS, floating (human) or sunk
+//     (automaton). Before 2026-10-09 the water coat dried and the contact pass
+//     re-wetted it every tick, so a corpse in a pond was awake forever; now a
+//     limb in water keeps its water coat (BodyBurnState::washTouch).
+//   * AUTOMATON (tinker, brass) must SINK to the bed;
+//   * ANDROID (courier, synth shell) must SINK too;
+//   * SYLVAN (deku, wood) must ride at least as high as the human.
+// Each arm reports its mean limb density, so a failure says whether the matter
+// or the push is wrong. Thresholds in tests/baseline.json (corpseFloat*).
+Status GateCorpseFloat(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  MobSystem& mobs = c.mobs;
+  const uint32_t mStone = MatIdOf(c, "stone"), mWater = MatIdOf(c, "water");
+  if (!mStone || !mWater) {
+    detail = "stone / water missing from materials.json";
+    return Status::Fail;
+  }
+  PrepareWorld(c);
+  mobs.Reset();
+  c.debris.Reset();
+  // THE SITE: DRY AND LOW, chosen off the GPU's own voxels. Two ways a
+  // basin went wrong here, both measured:
+  //   * inset 445 is inside the harness map's fixture lake, and there a
+  //     sealed basin with intact walls was topped up from y197 to the lake's
+  //     own y206 mid-gate (the water body releveling it as part of the lake);
+  //   * inset 350 is high ground (y228) where the surface froze to ice and
+  //     snow settled on it, so the corpses floated under a lid.
+  // So: the first candidate with no liquid near it and ground no higher than
+  // corpseFloatMaxGround. Every rejection is in the detail.
+  constexpr int R = 17, kDepth = 14;
+  const int maxGround = (int)BaselineNumber("corpseFloatMaxGround", 205);
+  IVec3 site{};
+  int hMax = 0;
+  std::string siteWhy;
+  bool sited = false;
+  {
+    std::vector<uint32_t> ch(kChunkVol, 0);
+    for (int inset : {480, 400, 380, 300, 250, 200, 150, 100}) {
+      const IVec3 s = FixtureSite(c.world, inset);
+      int h = 0, hLo = 1 << 30;
+      for (int x = s.x - R; x <= s.x + R; x++)
+        for (int z = s.z - R; z <= s.z + R; z++) {
+          const int th = World::TerrainHeight(x, z, kDefaultSeed);
+          h = std::max(h, th);
+          hLo = std::min(hLo, th);
+        }
+      if (h > maxGround) {
+        siteWhy += Format("%d: ground y%d; ", inset, h);
+        continue;
+      }
+      uint32_t wet = 0;
+      constexpr int kMargin = 8;
+      for (int cy = (hLo - 4) >> 4; cy <= (h + 32) >> 4; cy++)
+        for (int cz = (s.z - R - kMargin) >> 4; cz <= (s.z + R + kMargin) >> 4; cz++)
+          for (int cx = (s.x - R - kMargin) >> 4; cx <= (s.x + R + kMargin) >> 4; cx++) {
+            if (!c.world.ChunkInWindow({cx, cy, cz})) continue;
+            ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex({cx, cy, cz}), 1,
+                           ch.data(), "corpseFloatSite");
+            for (uint32_t w : ch) {
+              const uint32_t mm = w & 0xFFFu;
+              if (mm && mm < c.mats.size() && c.mats[mm].gpu.klass == CLASS_LIQUID)
+                wet++;
+            }
+          }
+      if (wet > 0) {
+        siteWhy += Format("%d: %u liquid cells near; ", inset, wet);
+        continue;
+      }
+      site = s;
+      hMax = h;
+      siteWhy += Format("%d: chosen", inset);
+      sited = true;
+      break;
+    }
+  }
+  if (!sited) {
+    detail = "no dry, low site: " + siteWhy;
+    return Status::Fail;
+  }
+  const int bedY = hMax + 1;              // top stone layer of the floor
+  const int waterTop = bedY + kDepth;     // topmost water layer
+  std::vector<CellOp> basin;
+  for (int x = site.x - R; x <= site.x + R; x++)
+    for (int z = site.z - R; z <= site.z + R; z++)
+      for (int y = bedY - 1; y <= waterTop + 22; y++) {
+        const IVec3 cc{x, y, z};
+        if (!c.world.CellInWindow(cc)) continue;
+        const bool wall = std::abs(x - site.x) >= R - 1 ||
+                          std::abs(z - site.z) >= R - 1;
+        uint32_t w = PackVoxNew(0u, 0u);
+        // Walls the FULL height: inset 445 is in the harness map's fixture
+        // lake, whose surface (y~204 measured) poured over a 2-high rim and
+        // set this basin's waterline instead of the stamp.
+        if (y <= bedY || wall) w = PackVoxNew(mStone, 0u);
+        else if (y <= waterTop) w = (mWater & 0xFFFu) | (7u << 12);
+        basin.push_back({World::SlotCellIndex(cc), w});
+      }
+  const IVec3 pchunk{site.x >> 4, waterTop >> 4, site.z >> 4};
+  support::TickRig rig(c, 71000u, pchunk);
+
+  const int kTicks = (int)BaselineNumber("corpseFloatTicks", 600);
+  struct Arm {
+    const char* label;
+    const char* def;
+    bool ran = false;
+    float rho = 0;          // volume-weighted mean over the dynamic limbs
+    float lowest = 1e9f;    // the pelvis's lowest centre of mass
+    float final = -1;       // ...and where it ended
+    int asleepAt = -1;      // first tick seen asleep after it went in
+    uint32_t pushes = 0;    // FloatDeadLimbs limb-impulses
+    bool rigActive = true;  // Jolt still moving it at the end
+    const char* why = "";   // DeadAwakeReason at the end
+    std::string trace;      // pelvis y every 60 ticks (rule 6)
+    std::string limbs;      // each limb's final y / density
+    float surf = -1;        // the waterline it was last pushed against
+  };
+  Arm arms[] = {{"human", "human"},
+                {"automaton", "tinker"},
+                {"android", "courier"},
+                {"sylvan", "deku"}};
+  for (Arm& a : arms) {
+    const int d = mobs.FindDef(a.def);
+    if (d < 0) continue;
+    mobs.Reset();
+    c.debris.Reset();
+    // A FRESH BASIN PER ARM: each arm is measured against the stamp, not
+    // against whatever the arm before it left in the water.
+    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) { o.cells = basin; });
+    support::RunTicks(rig, 20);  // the water settles; the mirror fetches it
+    const uint64_t id = mobs.Spawn(d, {site.x, waterTop + 3, site.z});
+    Mob* m = id ? mobs.FindMobById(id) : nullptr;
+    if (!m || !m->Def() || m->Def()->rootLimb < 0) continue;
+    mobs.SetMobBehavior(id, "dummy");
+    const int root = m->Def()->rootLimb;
+    m->Die();
+    a.ran = true;
+    for (int i = 0; i < kTicks; i++) {
+      support::RunTicks(rig, 1);
+      m = mobs.FindMobById(id);
+      if (!m) break;
+      Vec3 com{};
+      const uint64_t h = mobs.LimbBody(id, root);
+      if (h && c.phys.BodyCenterOfMass(h, com)) {
+        a.lowest = std::min(a.lowest, com.y);
+        a.final = com.y;
+        if (i % 60 == 0) {
+          const char* r = m->DeadAwakeReason();
+          a.trace += Format(" %.1f", com.y);
+          if (r != nullptr && a.label[0] == 'h') a.trace += Format("'%.40s'", r);
+        }
+      }
+      if (m->DeadAsleep() && a.asleepAt < 0) a.asleepAt = i;
+      if (!m->DeadAsleep()) a.asleepAt = -1;
+    }
+    if (m) {
+      double rv = 0, n = 0;
+      for (int li = 0; li < m->LimbCount(); li++) {
+        if (!mobs.LimbBody(id, li)) continue;
+        rv += m->LimbFloatDensity(li);
+        n += 1;
+      }
+      a.rho = n > 0 ? (float)(rv / n) : 0.0f;
+      // Where every limb ended (rule 6): name, centre-of-mass y, density.
+      for (int li = 0; li < m->LimbCount(); li++) {
+        const uint64_t hl = mobs.LimbBody(id, li);
+        Vec3 lc{};
+        if (!hl || !c.phys.BodyCenterOfMass(hl, lc)) continue;
+        a.limbs += Format(" %d:%.1f/%.0f", li, lc.y, m->LimbFloatDensity(li));
+      }
+      a.pushes = m->FloatedLimbs();
+      a.surf = m->FloatSurfaceY();
+      const uint64_t hr = mobs.LimbBody(id, root);
+      a.rigActive = hr != 0 && c.phys.IsActive(hr);
+      const char* w = m->DeadAwakeReason();
+      a.why = w ? w : "";
+    }
+  }
+  mobs.Reset();
+  c.debris.Reset();
+  PrepareWorld(c);
+
+  const Arm &hu = arms[0], &au = arms[1], &an = arms[2], &sy = arms[3];
+  const float band = (float)BaselineNumber("corpseFloatBand", 4.0);
+  const bool humanOk = hu.ran && hu.pushes > 0 &&
+                       hu.lowest >= (float)(bedY + 4) &&
+                       std::fabs(hu.final - (float)(waterTop + 1)) <= band &&
+                       !hu.rigActive && hu.asleepAt >= 0;
+  auto sank = [&](const Arm& a) {
+    return !a.ran || a.lowest <= (float)(bedY + 5);
+  };
+  // Riding higher = less of it under the surface it was pushed against.
+  const bool sylvanOk =
+      !sy.ran || (sy.final - sy.surf) >= (hu.final - hu.surf) - 0.5f;
+  const bool ok = humanOk && sank(au) && (!au.ran || au.asleepAt >= 0) &&
+                  sank(an) && sylvanOk;
+  auto line = [&](const Arm& a) {
+    if (!a.ran) return Format("%s: (no def %s); ", a.label, a.def);
+    return Format("%s: surface y%.0f, ", a.label, a.surf) + Format("rho %.0f, pelvis lowest y%.1f final y%.1f, %u pushes, "
+                  "rig %s, corpse %s (%s), y every 60:%s; ", a.rho,
+                  a.lowest, a.final, a.pushes, a.rigActive ? "MOVING" : "still",
+                  a.asleepAt >= 0 ? "asleep" : "awake", a.why, a.trace.c_str())
+           + " | limbs" + a.limbs + "; ";
+  };
+  detail = Format("site [%s] bed y%d waterline y%d | ", siteWhy.c_str(), bedY,
+                  waterTop) + line(hu) +
+           line(au) + line(an) + line(sy);
+  std::printf("corpse-float: %s %s\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 Status GateCorpseCap(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
   IdCounterScope idScope(mobs);
@@ -10285,6 +10508,8 @@ const std::vector<Gate>& WoundGates() {
       {"severed-hand", "mob", {}, false, GateSeveredHand, false},
       {"corpse-sleep", "mob", {}, false, GateCorpseSleep, false},
       {"corpse-cap", "mob", {}, false, GateCorpseCap, false},
+      // A corpse in water floats or sinks by its matter (Mob::FloatDeadLimbs).
+      {"corpse-float", "mob", {}, false, GateCorpseFloat, false},
       {"player-corpse", "mob", {}, false, GatePlayerCorpse, false},
   };
   return g;

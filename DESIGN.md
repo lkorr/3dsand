@@ -12591,6 +12591,31 @@ debris for the network). All of that is gone.
   Their passes are MobSystem's `BurnDeadFlesh` / `StainDeadFlesh` /
   `SplatterDeadFlesh` over `ForEachDeadFlesh`, the living limb passes through
   `FleshView`.
+- **A corpse in water floats or sinks by its matter (2026-10-09;
+  `Mob::FloatDeadLimbs`, gate `corpse-float`).** Liquids are not in the
+  collider, so before this a corpse fell through a lake and lay on the bed.
+  Now `DebrisSystem::FloatBodies`' rule runs per LIMB of a dead rig: Jolt's
+  buoyancy impulse at the waterline the CPU mirror shows, with the ratio
+  rhoLiquid / rhoLimb. rhoLimb is the volume-weighted mean `density` of what
+  the limb is made of PLUS its worn shells (kinematic followers with no
+  buoyancy of their own -- an iron breastplate sinks its wearer), cached on
+  the limb by voxel count (`Mob::LimbFloatDensity`), less
+  `ragdoll.corpseAirFraction` (0.07: lungs and gut). Human tissue averages
+  ~1,010, so a human corpse floats awash at the surface with its legs hanging;
+  a brass automaton (~7,800) and a synth-shell android (~2,800) sink; a
+  wooden sylvan (~610) rides high. Asleep limbs are skipped (a corpse at rest
+  costs nothing); a corpse woken by the chunks round it changing activates
+  its wet limbs once, so water arriving over a corpse lifts it.
+- **A body lying in water stays wet, so a wet corpse can sleep (2026-10-09;
+  `BodyBurnState::washTouch` / `soaking`).** The contact walk in
+  `StainOneLimb` records when a WASHER liquid (water) is against a limb (it
+  keeps walking past a first non-water contact to look for one). That tick
+  the limb's washer coat does not dry (`DryOneLimb`'s `keepWashers`) and does
+  not wick or drip (`WetOneLimb` is skipped), and a washer coat on a soaking
+  limb no longer holds a corpse awake (`DeadAwakeCriterion`). Before this the
+  coat dried and the contact pass re-wetted it every tick, so a corpse in a
+  pond was awake forever. Applies to severed flesh and to the living too (a
+  wader's legs stay wet while they are in the water); other coats dry on.
 
 ### One creature list (2026-09-24, rule-unification W2-K; `MobSystem::ForEachCreature` / `FindCreature`, `Mob::Controller`, gate `creature-reach`)
 

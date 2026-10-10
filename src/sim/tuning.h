@@ -983,6 +983,13 @@ struct Tuning {
     float getUpDropFrac = TPD(ragdoll, getUpDropFrac);
     // How long the dev panel's "ragdoll me" keeps the player down.
     float devSeconds = TPD(ragdoll, devSeconds);
+    // A CORPSE IN WATER (Mob::FloatDeadLimbs): the fraction of a dead body's
+    // volume that is gas (lungs, gut), taken off the mean density of the
+    // matter each limb is made of. Human tissue averages a little over water
+    // (skin 1010, muscle 1060, bone 1200 against flesh 950), so 0 sinks a
+    // corpse slowly; 0.07 floats it low in the water. Matter still decides: a
+    // brass or iron body sinks whatever this is, a wooden one floats high.
+    float corpseAirFraction = TPD(ragdoll, corpseAirFraction);
   } ragdoll;
 
   // ---- debris / island -> rigidbody conversion ----
