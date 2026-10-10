@@ -16113,7 +16113,7 @@ where you hear from either (§12b, "The ears are on the character").
   `farGiBounce` is the irradiance gather's closed form on open terrain:
   0 on a tread (every ray sees sky), one ring ray's weight (0.09375) on a
   riser, 0.33 on an underside, of the ground's direct radiance
-  (albedo × key light × the wrapped Lambert of an up face), × `giStrength`,
+  (albedo × key light × the hard Lambert of an up face, `irrSample`; the wrapped one until 2026-10-09, see "Features take their indirect light" below), × `giStrength`,
   × the far AO. CALIBRATED, not derived: measured near, a riser's bounce is
   0.11-0.13 of the adjacent tread's radiance (screenshot_ground, giStrength
   2 vs 0, tonemap inverted), a third of what the ideal three-ray weight
@@ -16332,6 +16332,63 @@ where you hear from either (§12b, "The ears are on the character").
     cards are not tested for rays whose far hit is at level 3+; sparse micro
     plants (tussocks) show only close in front of their ground; a shore reed
     over the sample column is recorded one voxel tall.
+  **Features take their indirect light from the cascade, not from the
+  terrain's closed forms (2026-10-09, ticket 2026-10-09_14-23-01).** The
+  ticket: walking toward a grove, a sphere 20.5 m around you inside which
+  trees "render more realistically", and the owner's note that the seam keeps
+  coming back for new materials, biomes and lighting. Packages A-F matched the
+  two sides ON THE HEIGHTFIELD; everything standing on it (crowns, trunks,
+  walls, boulders) still took the far field's open-terrain closed forms.
+  - **How it was measured: the same pixels, shaded near and far.**
+    `SEAM_HANDOFF` (a const alias of `render.lodHandoffDist` in raymarch.wgsl
+    AND ray_start.wgsl, which must agree) moved to 8 m makes every pixel at
+    9-20 m a far hit while the 20.5 m frame shades it near; the geometry is the
+    same voxels, so the per-pixel difference IS the seam, per material, with no
+    "different trees on each side" confound. `SEAM_DBG` (raymarch.wgsl, 0 = off,
+    const-folded) writes per-term frames for both paths (1: side / material /
+    distance, 2: albedo / shadow / AO, 3: openness / lit lambert / raw lambert,
+    4: colour / bounce / face). Noon at the ticket's camera: leaves +16.5/255
+    luma far over near, bark +17, grass +0.3. Terms: far bounce 4.5x the near
+    gather on leaves, openness 0.59 vs 0.18. Substituting the near grid's
+    openness alone: +14.8; openness AND bounce: +0.3. **The bounce was the
+    seam.** `farGiBounce` is a lit tread one cell in front of the face, which
+    is true on the heightfield and false in a crown, where the near gather's
+    fan lands on the undersides of other lobes.
+  - **`farFeatureSky`**: for a hit that is not its sub-column's skin / sub-skin
+    (`fSurf`), the fan sim_openness measures with (normal + four 45-degree
+    diagonals of the face's hemisphere, weights 0.36 / 0.16) is point-sampled in
+    the hit's own level every 2 fine voxels to 16, then every 12 to 64 (one
+    6.4 m reach at every level; a doubling stride stepped straight over a
+    lobe's one-cell shell and closed only half the gap), closed by the first
+    MATERIAL cell; samples above their level chunk's top row (farOcc) cost no
+    byte read. It scales the openness and, with `farFeatureBounce` (1 within
+    0.6 m of the column's heightfield top, 0.35 from 2 m up: the ground a crown
+    sees is ground it shades), the bounce. A heightfield TREAD takes one ray
+    (the normal, from 6 fine voxels up so a refined slope's next sub-column is
+    not mistaken for a roof) and keeps 0.45 of its sky under a canopy. Risers
+    and everything else on the heightfield are unchanged. Both terms ease out
+    over 60-110 m (never on a level boundary).
+  - **The band reads the near gather too.** A far hit between the sphere and
+    22.3 m already blended its openness from the near grid (package E); it now
+    blends `giBounceAt` the same way, so inside the band the bounce is the
+    measured one.
+  - **The far bounce's light law is the deposits' law.** The tread radiance
+    in `farGiBounce` / `farGiIrradiance` is `irrSample` (hard Lambert), which
+    is what the near grid's resolve-pass deposits use. It was the shade's
+    WRAPPED Lambert, which at a horizon sun (and under the moon) still lit the
+    far ground at half strength: at minute 1020 the meadow was +11/255 across
+    the handoff, all of it this term.
+  - **Measured**, same-pixel medians far - near (/255 luma), before -> after:
+    see the package report for the full table; noon leaves +16.5 -> +0.8, bark
+    +16.7 -> -1.5, grass +0.3 -> +0.1.
+  - **Still not matched**: the far crown is a centre-sampled shell, so it is
+    porous to the SUN (outer leaves: far shadow ~1 where the near shell gives
+    0.44-0.57) and to view rays (a far crown shows sky through it); the far
+    contact shadow of a crown's inner leaves is a hard 0 that `lodShadowLift`
+    raises to ~0.33, which happens to match. Both are geometry, not shading:
+    the cure is an occupancy rule for features in the cascade (any-of-eight at
+    level 1), a worldgen change with its own gate. The sea's shadeWater /
+    shadeFarWater seam is untouched by this.
   **Those seven bits are a PALETTE SLOT, not a material id (2026-09-09):**
   a far cell byte names one of 128 entries in the FAR PALETTE — the fourth
   reserved run of the GPU material table (`kFarPaletteBaseGpu`, world.h,

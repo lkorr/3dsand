@@ -1,4 +1,6 @@
 // ray_start.wgsl — THE RAY-START MAP (2026-09-28, raymarch perf round 2).
+// render.lodHandoffDist as raymarch.wgsl's SEAM_HANDOFF (its note): the two MUST agree.
+const SEAM_HANDOFF : f32 = TUNE_LOD_HANDOFF_DIST;
 // Two per-frame compute entries on the shadow layout (pass_table.def
 // ray_start_trace / ray_start_min, the ShadowCache table), read by
 // raymarch.wgsl's fs() through rayStartAt().
@@ -117,8 +119,8 @@ fn rayStartSpan(ro : vec3f, inv : vec3f) -> RsSpan {
   var s : RsSpan;
   s.tEnter = max(max(tmin.x, tmin.y), max(tmin.z, 0.0));
   s.tExit = min(tmax.x, min(tmax.y, tmax.z));
-  if (TUNE_LOD_HANDOFF_DIST < WINDOW_HALF_EXTENT_METERS) {
-    s.tExit = min(s.tExit, max(s.tEnter, TUNE_LOD_HANDOFF_DIST / VOXEL_METERS));
+  if (SEAM_HANDOFF < WINDOW_HALF_EXTENT_METERS) {
+    s.tExit = min(s.tExit, max(s.tEnter, SEAM_HANDOFF / VOXEL_METERS));
   }
   if ((R.flags & 4u) != 0u) {
     // shortRangeCeilM() (raymarch.wgsl), restated: bit 4 picks the near arm.
@@ -490,8 +492,8 @@ const RS_LAW_PX : f32 = 3.0;                // raymarch.wgsl agrees
 const RS_LAW_WIDE_PX : f32 = 2.5;           // raymarch.wgsl agrees
 const RS_NEAR_MIN_VOX : f32 = 32.0;         // raymarch.wgsl agrees
 const RS_NEAR_MAX_VOX : f32 = select(f32(WORLD_N) * 0.8661,
-                                     TUNE_LOD_HANDOFF_DIST / VOXEL_METERS,
-                                     TUNE_LOD_HANDOFF_DIST < WINDOW_HALF_EXTENT_METERS);
+                                     SEAM_HANDOFF / VOXEL_METERS,
+                                     SEAM_HANDOFF < WINDOW_HALF_EXTENT_METERS);
 const RS_FAR_MAX_CELLS : f32 =
     f32((i32(FAR_NCHUNK) / 2 - FAR_SPHERE_MARGIN_CHUNKS) * i32(CHUNK));
 fn rayStartK() -> f32 { return R.viewPx * 0.5 / R.tanHalfFov; }

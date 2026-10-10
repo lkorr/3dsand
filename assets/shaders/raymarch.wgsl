@@ -935,8 +935,8 @@ fn gasBlendW(p : vec3f) -> f32 {
 // complement, and the coarse box carries all of the gas.
 fn gasCoarseW(p : vec3f, t : f32) -> f32 {
   var w = gasBlendW(p);
-  if (TUNE_LOD_HANDOFF_DIST < WINDOW_HALF_EXTENT_METERS) {
-    let h = TUNE_LOD_HANDOFF_DIST / VOXEL_METERS;
+  if (SEAM_HANDOFF < WINDOW_HALF_EXTENT_METERS) {
+    let h = SEAM_HANDOFF / VOXEL_METERS;
     w = max(w, smoothstep(min(TUNE_GAS_BLEND_START, 0.99) * h, h, t));
   }
   return w;
@@ -975,6 +975,30 @@ var<private> gRsOn : bool = false;
 // image from inside applyAerial (skyBackdrop, short-range mode). Set first
 // thing in fs(); nothing outside fs() calls applyAerial.
 var<private> gFragXY : vec2f = vec2f(0.0);
+// ---- THE SEAM INSTRUMENTS (2026-10-09; DESIGN.md "Features take their
+// indirect light from the cascade") ----
+// SEAM_HANDOFF is render.lodHandoffDist as every reader in this shader and in
+// ray_start.wgsl sees it; ray_start.wgsl declares the same alias and the two
+// MUST agree. Set BOTH to a number (8.0) and every pixel between it and
+// 20.5 m is a far hit that the shipped handoff shades near: the same voxels
+// shaded both ways, so a per-pixel diff of the two frames is the seam, per
+// material, with no "different trees on each side" confound.
+// SEAM_DBG replaces the output with one frame of shading terms for BOTH
+// paths (dbgRec): 1 = side (0.5 near / 1 far), material id & 255 (GPU id =
+// materials.json index + 1), distance / 50 m; 2 = albedo luma, shadow, AO;
+// 3 = openness, lit lambert, raw lambert; 4 = pre-aerial colour luma / 2,
+// bounce luma x 4, face weight. 0 = off and const-folded away.
+const SEAM_DBG : u32 = 0u;
+const SEAM_HANDOFF : f32 = TUNE_LOD_HANDOFF_DIST;
+var<private> gDbg : vec4f = vec4f(0.0);
+fn dbgLum(c : vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
+fn dbgRec(isFar : bool, mat : u32, t : f32, alb : vec3f, sh : f32, ao : f32, open : f32,
+          lamPre : f32, lam : f32, col : vec3f, gi : vec3f, face : f32) {
+  if (SEAM_DBG == 1u) { gDbg = vec4f(select(0.5, 1.0, isFar), f32(mat & 255u) / 255.0, t * VOXEL_METERS / 50.0, 1.0); }
+  else if (SEAM_DBG == 2u) { gDbg = vec4f(dbgLum(alb), sh, ao, 1.0); }
+  else if (SEAM_DBG == 3u) { gDbg = vec4f(open, lam, lamPre, 1.0); }
+  else if (SEAM_DBG == 4u) { gDbg = vec4f(dbgLum(col) * 0.5, dbgLum(gi) * 4.0, face, 1.0); }
+}
 // trace()'s own step count. A call site zeroes it, calls, and bills the delta
 // to its slot — cheaper than a parameter through a function that is inlined
 // into six places and whose signature is load-bearing for register pressure.
@@ -2439,7 +2463,7 @@ const DETAIL_SLOTS : i32 = 4;
 // (16 m), clamped to at least 1 m short of END. Moving the handoff moves END;
 // nothing else needs retuning.
 const DETAIL_FADE_END_M : f32 =
-    min(TUNE_LOD_HANDOFF_DIST,
+    min(SEAM_HANDOFF,
         WINDOW_HALF_EXTENT_METERS - 2.0 * f32(CHUNK) * VOXEL_METERS) - 0.5;
 const DETAIL_FADE_START_M : f32 = min(TUNE_PLANT_LOD_DIST, DETAIL_FADE_END_M - 1.0);
 const DETAIL_SHRINK_M : f32 = 1.5;
@@ -3628,8 +3652,8 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
   // ahead, hysteresis 2), in Y too. 20.5 m is inside the nearest the face can
   // be (22.4 m) with room for the far arm's handoff band (farBandNearWeight),
   // which reads the window's own openness out to 22.3 m.
-  if (wantMedia && TUNE_LOD_HANDOFF_DIST < WINDOW_HALF_EXTENT_METERS) {
-    tExit = min(tExit, max(tEnter0, TUNE_LOD_HANDOFF_DIST / VOXEL_METERS));
+  if (wantMedia && SEAM_HANDOFF < WINDOW_HALF_EXTENT_METERS) {
+    tExit = min(tExit, max(tEnter0, SEAM_HANDOFF / VOXEL_METERS));
   }
 
   // ---- SHORT-RANGE MODE (RenderParams flag bit 2, arm in bit 4) ----
@@ -4423,9 +4447,9 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
         let ex = max(e0, e1);
         tFree = min(ex.x, min(ex.y, ex.z)) - 0.5;
         if (any(abs(ro - ctr) > vec3f(ib - 1.0))) { tFree = -1.0; }
-        if (TUNE_LOD_HANDOFF_DIST < WINDOW_HALF_EXTENT_METERS) {
+        if (SEAM_HANDOFF < WINDOW_HALF_EXTENT_METERS) {
           tFree = min(tFree, min(TUNE_GAS_BLEND_START, 0.99) *
-                             TUNE_LOD_HANDOFF_DIST / VOXEL_METERS);
+                             SEAM_HANDOFF / VOXEL_METERS);
         }
       }
       var sat = false;
@@ -5334,9 +5358,9 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
   // ...or where gasCoarseW's handoff ramp starts, if that is nearer: on a
   // diagonal the ray is still inside the inner box well past the handoff.
   var innerA = select(0.0, tExitI, insideInner);
-  if (TUNE_LOD_HANDOFF_DIST < WINDOW_HALF_EXTENT_METERS) {
+  if (SEAM_HANDOFF < WINDOW_HALF_EXTENT_METERS) {
     innerA = min(innerA, min(TUNE_GAS_BLEND_START, 0.99) *
-                         TUNE_LOD_HANDOFF_DIST / VOXEL_METERS);
+                         SEAM_HANDOFF / VOXEL_METERS);
   }
   let bandA = max(max(max(tminW.x, tminW.y), max(tminW.z, 0.0)), innerA);
   let bandB = min(tExitW, tEnd);
@@ -5925,8 +5949,8 @@ const RS_LAW_PX : f32 = 3.0;
 const RS_LAW_WIDE_PX : f32 = 2.5;
 const RS_NEAR_MIN_VOX : f32 = 32.0;
 const RS_NEAR_MAX_VOX : f32 = select(f32(WORLD_N) * 0.8661,
-                                     TUNE_LOD_HANDOFF_DIST / VOXEL_METERS,
-                                     TUNE_LOD_HANDOFF_DIST < WINDOW_HALF_EXTENT_METERS);
+                                     SEAM_HANDOFF / VOXEL_METERS,
+                                     SEAM_HANDOFF < WINDOW_HALF_EXTENT_METERS);
 const RS_FAR_MAX_CELLS : f32 =
     f32((i32(FAR_NCHUNK) / 2 - FAR_SPHERE_MARGIN_CHUNKS) * i32(CHUNK));
 fn rayStartDims() -> vec2<u32> {
@@ -12965,8 +12989,14 @@ fn farGiBounce(albedo : vec3f, n : vec3f) -> vec3f {
   // Continuous in n.y (see farOpenness); the same three values on axis normals.
   let frac = select(FAR_GI_SIDE_FRAC * (1.0 - clamp(n.y, 0.0, 1.0)), FAR_GI_UNDER_FRAC,
                     n.y < -0.5);
-  let ground = albedo * keyLightColor() *
-               wrapDiffuse(keyLightDir().y, TUNE_DIFFUSE_WRAP);
+  // The tread's radiance by irrSample's law (common.wgsl), the one the near
+  // grid's deposits use: HARD Lambert, not the shade's wrapped one. With the
+  // wrap a sun at the horizon still lit the far ground at half strength (and
+  // the moon at night lit it like a noon sun dimmed), so at dusk the far
+  // terrain's bounce was 5x the near gather's (ticket 2026-10-09_14-23-01,
+  // minute 1020: meadow +11/255 across the handoff, all of it this term).
+  let ground = irrSample(albedo, vec3f(0.0, 1.0, 0.0), keyLightDir(), keyLightColor(),
+                         1.0, 0.0);
   return albedo * ground * (frac * TUNE_GI_STRENGTH);
 }
 // The same closed form as IRRADIANCE (what farGiBounce multiplies by albedo x
@@ -12977,8 +13007,8 @@ fn farGiBounce(albedo : vec3f, n : vec3f) -> vec3f {
 fn farGiIrradiance(albedo : vec3f, n : vec3f) -> vec3f {
   let frac = select(FAR_GI_SIDE_FRAC * (1.0 - clamp(n.y, 0.0, 1.0)), FAR_GI_UNDER_FRAC,
                     n.y < -0.5);
-  let ground = albedo * keyLightColor() *
-               wrapDiffuse(keyLightDir().y, TUNE_DIFFUSE_WRAP);
+  let ground = irrSample(albedo, vec3f(0.0, 1.0, 0.0), keyLightDir(), keyLightColor(),
+                         1.0, 0.0);
   return ground * frac;
 }
 
@@ -13025,11 +13055,114 @@ const FAR_OPEN_RISER : f32 = 0.6;
 // 1 at the handoff, 0 from FAR_BAND_END_M on; 0 everywhere with the handoff
 // disabled (>= the half extent).
 const FAR_BAND_END_M : f32 =
-    min(TUNE_LOD_HANDOFF_DIST + 1.8,
+    min(SEAM_HANDOFF + 1.8,
         WINDOW_HALF_EXTENT_METERS - 2.0 * f32(CHUNK) * VOXEL_METERS - 0.1);
 fn farBandNearWeight(tFine : f32) -> f32 {
-  if (TUNE_LOD_HANDOFF_DIST >= FAR_BAND_END_M) { return 0.0; }
-  return 1.0 - smoothstep(TUNE_LOD_HANDOFF_DIST, FAR_BAND_END_M, tFine * VOXEL_METERS);
+  if (SEAM_HANDOFF >= FAR_BAND_END_M) { return 0.0; }
+  return 1.0 - smoothstep(SEAM_HANDOFF, FAR_BAND_END_M, tFine * VOXEL_METERS);
+}
+
+// ---- THE SKY OVER A FAR FEATURE (LOD seam, 2026-10-09) ----
+// The far field's indirect terms are CLOSED FORMS for open terrain: an up face
+// sees the whole sky (farOpenness 1), a riser 0.6 of it, and the bounce is a
+// lit tread in front of the face (farGiBounce). On the heightfield that is
+// what the near grid measures, and the seam there is invisible. On anything
+// STANDING on the heightfield it is wrong by a factor of four: a face inside a
+// tree crown sees other leaves, not sky and sunlit ground. Measured at the
+// owner's ticket (2026-10-09_14-23-01, a golden-beech grove at noon), same
+// pixels shaded near and far: leaves' far bounce 4.5x the near gather's,
+// openness 0.59 vs 0.18, the whole crown +17/255 luma -- the "sphere inside
+// which trees render realistically". Substituting the near grid's openness
+// AND bounce for the far ones closed it to +0.3; openness alone to +15, so
+// the bounce is the term.
+//
+// So a feature's face takes its sky from the cascade: the fan sim_openness
+// measures with (the normal and four 45-degree diagonals of the face's own
+// hemisphere), point-sampled in the hit's own level every 2 fine voxels to
+// 16, then every 12 to 64 (the same 6.4 m at every level: a level's cell
+// count halves as its cells double, and repeats are skipped; the near walk
+// reaches render.opennessReach, 12 m), a ray closed by the first
+// MATERIAL cell (never the blocker flag, as for AO and shadows). Weights are
+// the near quadrature's: the normal's cone 0.36, each diagonal 0.16. The
+// result scales the openness and the bounce together, the two indirect terms
+// the near grid carries. The heightfield never takes it (fSurf): its look is
+// the calibrated closed form, bit-identical. Past FAR_SKY_FADE_END_M the
+// cascade's trees are cells wider than a lobe (and flattened into the skin at
+// level 5), so the term eases out with distance, never on a level boundary.
+const FAR_SKY_FADE_START_M : f32 = 60.0;
+const FAR_SKY_FADE_END_M : f32 = 110.0;
+// A heightfield tread with something over it: its one ray is closed, and it
+// keeps this much of its sky (the near grid under the ticket's crowns: grass
+// openness ~0.3-0.5 against open meadow's 1).
+const FAR_SKY_TREAD_COVERED : f32 = 0.45;
+// A sample is solid when its level chunk holds anything at or above its row
+// (farOcc's count and top row: an open-sky sample above the ground costs the
+// chunk's word, which every neighbouring sample shares) and its byte is a
+// material.
+fn farSkySolid(level : u32, c : vec3<i32>, b : FarBox) -> bool {
+  if (!farInValid(c, b)) { return false; }
+  let occ = farOcc[farOccIndex(level, c)];
+  if (occ == 0u) { return false; }
+  let top = farOccTop(occ);
+  if (top != 0u && (c.y & (i32(CHUNK) - 1)) >= i32(top)) { return false; }
+  return farPalAt(level, c) != 0u;
+}
+// `rays` = 5 for a feature's face; 1 (the normal alone) for a heightfield
+// TREAD, whose only sky-hider is something standing over it -- a canopy, an
+// overhang -- since the heightfield is single-valued over its own column.
+fn farFeatureSky(level : u32, cell : vec3<i32>, ni : vec3<i32>, tFine : f32,
+                 rays : i32) -> f32 {
+  let fade = 1.0 - smoothstep(FAR_SKY_FADE_START_M, FAR_SKY_FADE_END_M, tFine * VOXEL_METERS);
+  if (fade <= 0.0) { return 1.0; }
+  let b = farBox(level);
+  let shift = farCellShift(level);
+  // Two tangents of the face, integer: t1 is x unless the normal is x.
+  let t1 = select(vec3<i32>(1, 0, 0), vec3<i32>(0, 0, 1), ni.x != 0);
+  let t2 = vec3<i32>(ni.y * t1.z - ni.z * t1.y, ni.z * t1.x - ni.x * t1.z,
+                     ni.x * t1.y - ni.y * t1.x);
+  var vis = 0.0;
+  for (var r = 0; r < rays; r++) {
+    var d = ni;
+    if (r == 1) { d = ni + t1; } else if (r == 2) { d = ni - t1; }
+    else if (r == 3) { d = ni + t2; } else if (r == 4) { d = ni - t2; }
+    var open = 1.0;
+    var kPrev = 0;
+    // A tread's ray starts 6 fine voxels up: the cells just over a refined
+    // hit's level cell can hold the next sub-column of its own slope.
+    for (var j = select(1, 3, rays == 1); j <= 12; j++) {
+      // 2, 4, .. 16 fine voxels densely (a crown lobe's shell is a cell or
+      // two thick: a doubling stride stepped over it), then every 12 to 64.
+      let k = max(1, select(2 * j, 16 + 12 * (j - 8), j > 8) >> shift);
+      if (k == kPrev) { continue; }
+      kPrev = k;
+      // From the hit cell's centre: k cells along the normal and k along the
+      // tangent (the 45-degree ray from the face centre lands in that cell).
+      // The normal's first sample is the front cell, empty by construction.
+      let c = cell + d * k;
+      if (farSkySolid(level, c, b)) { open = 0.0; break; }
+    }
+    vis += select(0.16, select(0.36, 1.0, rays == 1), r == 0) * open;
+  }
+  if (rays == 1) { vis = mix(FAR_SKY_TREAD_COVERED, 1.0, vis); }
+  return mix(1.0, vis, fade);
+}
+// THE BOUNCE A FEATURE'S FACE GETS FROM THE GROUND falls off with its height
+// over it. farGiBounce is a lit tread one cell in front of the face; the near
+// gather (giBounceAt) reads what its fan actually lands on, and from a crown
+// that is the undersides of other lobes and, metres down, ground the crown
+// itself shades. Measured on the ticket's grove after farFeatureSky (near
+// gather / far closed form, same pixels): crown leaves 0.26-0.5, bark under a
+// crown 0.35. A face within FAR_BOUNCE_NEAR_V of the ground (a boulder's side,
+// a wall's foot) keeps the closed form whole, which is what the near gather
+// gives it; from FAR_BOUNCE_HIGH_V up it keeps FAR_BOUNCE_HIGH. `hAbove` is
+// in fine voxels over the column's heightfield top (-1e9 = unmapped: whole).
+const FAR_BOUNCE_NEAR_V : f32 = 6.0;
+const FAR_BOUNCE_HIGH_V : f32 = 20.0;
+const FAR_BOUNCE_HIGH : f32 = 0.35;
+fn farFeatureBounce(hAbove : f32, tFine : f32) -> f32 {
+  let fade = 1.0 - smoothstep(FAR_SKY_FADE_START_M, FAR_SKY_FADE_END_M, tFine * VOXEL_METERS);
+  let k = mix(1.0, FAR_BOUNCE_HIGH, smoothstep(FAR_BOUNCE_NEAR_V, FAR_BOUNCE_HIGH_V, hAbove));
+  return mix(1.0, k, fade);
 }
 
 // ---- THE FOOTPRINT FADE: detail below a pixel (package E) ----
@@ -13063,7 +13196,7 @@ fn farVoxPx(tFine : f32) -> f32 {
   return (R.viewPx * 0.5 / R.tanHalfFov) / max(tFine, 1.0);
 }
 fn farFootprintFade(voxPx : f32, full : f32, start : f32) -> f32 {
-  let hand = farVoxPx(min(TUNE_LOD_HANDOFF_DIST, WINDOW_HALF_EXTENT_METERS) / VOXEL_METERS);
+  let hand = farVoxPx(min(SEAM_HANDOFF, WINDOW_HALF_EXTENT_METERS) / VOXEL_METERS);
   let s = min(start, hand);
   return 1.0 - smoothstep(s * (full / start), s, voxPx);
 }
@@ -14085,12 +14218,20 @@ fn fs(in : VSOut) -> FSOut {
       var lamSm = -1.0;
       var faceSm = 1.0;
       var smoothAlb = vec3f(-1.0);
+      // Is this hit the HEIGHTFIELD (its sub-column's skin / sub-skin), or
+      // something standing on it (a crown, a trunk, a wall, a boulder)? The
+      // far field's closed-form indirect terms are calibrated for the first;
+      // the second takes its sky from the cascade (farFeatureSky, below).
+      var fSurf = false;
+      var groundY = -1e9;   // the column's heightfield top (fine voxels), if mapped
       if (m.klass != CLASS_LIQUID && !fFeat) {
         let fs2 = farSurfAt(flv, hitP, wN > 0.0);
         if (fs2.ok) {
+          groundY = f32(farMapTop(fs2.e) + 1);
           let skinM = farPalMat(&materials, (fs2.e >> 16u) & 0x7Fu);
           let subM = farPalMat(&materials, fs2.sub);
           if (far.mat == skinM || far.mat == subM) {
+            fSurf = true;
             // The cover: this sub-column's bit, or the cell's fraction once a
             // sub-column is under ~2 px; the plant is this sub-column's, or
             // the first covered sibling's.
@@ -14171,6 +14312,22 @@ fn fs(in : VSOut) -> FSOut {
       // Read before the sun: the shadow's lift cap wants it, as the near's does.
       // A card reads the GROUND's openness, as a near micro hit does.
       var openF = select(farOpenness(nSh), 1.0, fCard);
+      // A FEATURE's sky (farFeatureSky): the fraction of its face's
+      // hemisphere the cascade's own cells leave open. Scales the far
+      // openness here and the far bounce below (`featSky`), so a face inside a
+      // crown is lit like one: the near field's measured grid says the same
+      // one voxel inside the handoff.
+      var featSky = 1.0;
+      var featBounce = 1.0;
+      if (fSurf && n.y > 0.5) {
+        // A tread: only a canopy or an overhang hides its sky (one ray).
+        openF *= farFeatureSky(flv, far.cell, vec3<i32>(0, 1, 0), far.t, 1);
+      } else if (!fSurf && !fFeat && m.klass != CLASS_LIQUID) {
+        featSky = farFeatureSky(flv, far.cell, vec3<i32>(round(n)), far.t, 5);
+        openF *= featSky;
+        featBounce = featSky * farFeatureBounce(select(hitP.y - groundY, 0.0, groundY < -1e8),
+                                                far.t);
+      }
       let bandW = select(farBandNearWeight(far.t), 0.0, fCard);
       if (bandW > 0.0 && inBounds(fineV)) {
         let oN = opennessAt(fineV, hitP, n, &openness, &opennessGen);
@@ -14184,6 +14341,8 @@ fn fs(in : VSOut) -> FSOut {
       var lambert = select(wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP),
                            0.0, farWater);
       if (lamSm >= 0.0 && !farWater) { lambert = mix(lambert, lamSm, wN); }
+      let dbgLamPreF = lambert;
+      var dbgShF = 1.0;
       if (lambert > 0.0 && (R.flags & 1u) != 0u) {
         // start the shadow march just off the hit face, in fine-voxel coords
         var hp = R.camPos + rd * (far.t - 1e-3) + n * (0.55 * sL);
@@ -14234,8 +14393,8 @@ fn fs(in : VSOut) -> FSOut {
         // FAR_HF_SHADOW_FADE_M past the handoff (the treads beyond get the
         // cell march's shadow alone, as they always did), which also keeps
         // its cost to the band the seam is in.
-        let hfW = 1.0 - smoothstep(TUNE_LOD_HANDOFF_DIST + FAR_HF_SHADOW_FADE_M * 0.5,
-                                   TUNE_LOD_HANDOFF_DIST + FAR_HF_SHADOW_FADE_M,
+        let hfW = 1.0 - smoothstep(SEAM_HANDOFF + FAR_HF_SHADOW_FADE_M * 0.5,
+                                   SEAM_HANDOFF + FAR_HF_SHADOW_FADE_M,
                                    far.t * VOXEL_METERS);
         if (fRefined && flv <= 2u && hfW > 0.0) {
           let tb = farHfShadow(flv, hitP + n * 0.02, keyLightDir());
@@ -14258,6 +14417,7 @@ fn fs(in : VSOut) -> FSOut {
           sh = shadowLiftCap(sh, openF);
           lambert *= sh;
         }
+        dbgShF = sh;
       }
       // Cloud shadow (common.wgsl cloudSunAt): the deck's shadow crossing the
       // distant hills, from the same map the near field reads — so a cloud
@@ -14317,8 +14477,20 @@ fn fs(in : VSOut) -> FSOut {
       // The near field's one-bounce GI, in its open-terrain closed form
       // (farGiBounce). Occluded by the same ao, as the near term is.
       // TUNE_GI_STRENGTH = 0 folds it away with the near gather (`nogi`).
+      var dbgGiF = vec3f(0.0);
       if (TUNE_GI_STRENGTH > 0.0) {
-        color += ao * farGiBounce(albedo, select(nSh, vec3f(0.0, 1.0, 0.0), fCard));
+        dbgGiF = ao * featBounce * farGiBounce(albedo, select(nSh, vec3f(0.0, 1.0, 0.0), fCard));
+        // THE HANDOFF BAND reads the near gather too, as it reads the near
+        // openness above: a far hit inside the window shades with the bounce
+        // the near field measured there, eased to the far estimate by bandW.
+        if (bandW > 0.0 && inBounds(fineV)) {
+          dbgGiF = mix(dbgGiF, albedo * ao * giBounceAt(hitP, n, fineV, albedo) * TUNE_GI_STRENGTH,
+                       bandW);
+        }
+        color += dbgGiF;
+      }
+      if (SEAM_DBG != 0u) {
+        dbgRec(true, far.mat, far.t, albedo, dbgShF, ao, openF, dbgLamPreF, lambert, color, dbgGiF, face);
       }
       // The near field's wet sheen (its `wet > 0` block), same lobe.
       if (wet > 0.0) {
@@ -14542,6 +14714,8 @@ fn fs(in : VSOut) -> FSOut {
     var openRaw = opennessAt(openCell, hp, openN, &openness, &opennessGen);
     if (openRaw >= 0.0) { openRaw *= hzSkyVis(hp); }
     var lambert = wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP);
+    let dbgLamPreN = lambert;
+    var dbgShN = 1.0;
     if (lambert > 0.0 && (R.flags & 1u) != 0u) {
       // h.t is the receiver's distance from the camera in fine voxels, which
       // is what picks the near (per-voxel) or cascade shadow — see sunShadowAt.
@@ -14606,6 +14780,7 @@ fn fs(in : VSOut) -> FSOut {
       // 45% sun through the rock before this. `openRaw` is read above, once,
       // for the ambient term below.
       lambert *= shadowLiftCap(sh, openRaw);
+      dbgShN = shadowLiftCap(sh, openRaw);
     }
     // THE CLOUDS' SHADOW: one bilinear lookup in the per-frame cloud shadow
     // map (cloud.wgsl `shadow`). Applied to the direct term only, like every
@@ -14700,9 +14875,11 @@ fn fs(in : VSOut) -> FSOut {
     // either) and never by the openness scale, which measures SKY. The micro
     // case gathers from the ground the tuft grows in, like the openness read.
     // TUNE_GI_STRENGTH = 0 folds the whole call away (the `nogi` arm).
+    var dbgGiN = vec3f(0.0);
     if (TUNE_GI_STRENGTH > 0.0) {
       let bounce = albedo * ao * giBounceAt(hp, openN, openCell, albedo) * TUNE_GI_STRENGTH;
       color += bounce;
+      dbgGiN = bounce;
       // ---- P2 write-back (docs/PLAN_gi.md §4) ----
       // This pixel's OUTGOING radiance — the direct term it just computed plus
       // the bounce it just gathered — blended into its own block-face at
@@ -14732,6 +14909,9 @@ fn fs(in : VSOut) -> FSOut {
       }
     }
 
+    if (SEAM_DBG != 0u) {
+      dbgRec(false, mat, h.t, albedo, dbgShN, ao, openRaw, dbgLamPreN, lambert, color, dbgGiN, face);
+    }
     // ---- caustics on a submerged surface ----
     // The rippling web of focused sunlight on anything under water. This is
     // the term that makes a pond bed read as being underwater rather than as
@@ -15289,6 +15469,7 @@ fn fs(in : VSOut) -> FSOut {
   }
   var out : FSOut;
   out.color = vec4f(color, 1.0);
+  if (SEAM_DBG != 0u) { out.color = vec4f(gDbg.xyz, 1.0); }
   out.depth = depth;
   return out;
 }
