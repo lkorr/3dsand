@@ -16881,6 +16881,69 @@ where you hear from either (§12b, "The ears are on the character").
     rule off vs on in one binary, every camera within +-0.1 ms (noon 5.83 /
     5.77, seam 5.92 / 5.89, seamveg 9.56 / 9.54, cascade 4.89 / 4.80).
     Render-only; the world hash is unchanged (ef7d9a06).
+  **A THIN LAYER KEEPS ITS FOOTPRINT: THE LOOSE TOP (2026-10-10; worldgen.wgsl
+  `farRunTop` + the pass in `fardownFeat`, faredits.h `SetLooseSource`; gate
+  `far-layer`; ticket 2026-10-10_11-01-58).** The third exception to "a cell
+  is its centre sample", and the general one. A layer thinner than a cell --
+  oil on a lake, snow, ash or spilled sand on the ground, a puddle on a floor
+  -- reached a level only where one of that level's centre ROWS landed in it:
+  a 1-voxel slick at row y showed at exactly the one level whose centres sit
+  at y (y = 570 at the ticket's lake: level 2 only), and every other level
+  drew the water under it, so the slick appeared, vanished and reappeared as
+  the camera backed away. THE RULE: a cell whose centre voxel is far-solid
+  takes the material of T, the top voxel of the far-solid run that starts at
+  its centre, when the run ends inside the cell's reach (T in [c, c+step-1],
+  the voxel over T not far-solid), T is LOOSE (a far-solid liquid or powder)
+  and T lies above the ground contract h; and a cell whose centre is above h
+  and whose run does not end in a loose T is its centre's own material (what
+  `fardown` writes there anyway -- this is how a layer comes OFF again). So
+  every level's surface cell over a column wears what the near field shows
+  on top of it, the footprint at level k is the layer sampled at level k's
+  centre COLUMNS (the same disc to within one cell at every level), and no
+  cell changes SHAPE -- only its colour follows the column's top. What it
+  leaves alone, by construction: a run ending at the ground (T <= h: a sand
+  skin, a road or river tint, a flattened canopy -- procgen's business), a
+  standing fluid's top (the sieve's `wetTop` already paints it), and SOLID
+  tops (a tree, a stalk, a roof, ice: centre-sampled, as before). At levels
+  1-2 a cell the container rule claims is left to it. Producers: the live
+  pass in `fardownFeat` (procgen-free but for one `landColumn` per cell whose
+  byte would change; exact prefilter: no loose voxel in the chunk or on the
+  bottom row of the chunk above, no pass) -- EVERY dirty chunk whose rows
+  meet a cell's reach evaluates it and writes the same byte, because `fardown`
+  will not rerun for the centre's chunk when only the layer above it moved
+  (its signature covers its own voxels; the first cut left a spreading
+  slick's old cells oiled); and the CPU twin in `FarEdits::Sweep`, which
+  substitutes the top's material into the centre word (and its slot into the
+  ground field, so `farpatch`'s skin rule paints the layer), seeing the noted
+  chunk plus the chunk ABOVE when the eviction batch holds it (a window shift
+  across x or z evicts whole columns; a load's rebuild has none), and files
+  no ground word for a column whose ground has a loose layer on it. The
+  sieve is unchanged: pristine procgen has no loose matter above h but its
+  fluids, which it already paints. **Measured** (`far-layer`: a 128 x 128
+  glass tub in the sky, 15 voxels of water, a one-voxel oil disc on a
+  64-multiple row): oil cells drawn / oiled sample columns, levels 1-5,
+  before 0/1191, 0/295, 0/70, 0/20, 0/4; after 1191/1191, 294/295 (the one
+  is a container cell: the rim froze against the glass), 70/70, 20/20, 4/4,
+  footprint area 0.87-1.08x the fine slick, and the same after a patched
+  refill. At the ticket's lake, backing away at 20 m/s from 12 m: before, the
+  slick is gone at 32 m (level 1), a disc at 52-72 m (level 2), a sliver at
+  92 m and gone past it; after, one disc at every distance whose apparent
+  width x distance stays within 4 %. Cost: the follow-up's farDown rows stay
+  under the pass table's 0.05 ms/frame floor in both arms at the ticket's
+  lake; render untouched; render-only, world hash unchanged (ef7d9a06).
+  **Left open:** (a) a centre at or under h whose layer goes away while the
+  layer's chunk is the only one that changed keeps the layer's colour until
+  the centre's chunk next downsamples (putting a skin back needs procgen);
+  (b) a REFILL of a level (startup, load, teleport, F5) that lands over a
+  resident chunk which is asleep erases that chunk's downsample of ANY edit
+  until it is dirty again -- `sigClear_` only helps dirty chunks, and the
+  index only holds evicted ones (seen as the slick vanishing past level 2
+  when it was poured before the startup refill drained; not this rule's, and
+  not fixed here); (c) the far oil reads pale grey-lilac where the near field
+  shows brown iridescence (far liquid shading, a colour seam, not footprint).
+  `SANDVOX_AT_SLICK=x,y,z,r[,material]` (+ `SANDVOX_AT_SLICK_AFTER=<ticks>`)
+  lays a one-voxel liquid disc in an `--at` run; with `SANDVOX_AT_FLY` it
+  reproduces the ticket's walk-away.
   **The far SURFACE MAP (LOD-seam package A, 2026-09-28).** Centre sampling
   is the cascade's resolution limit and the window edge is where it shows: a
   level-1 cell is a 20 cm cube standing where the near field draws four 10 cm
