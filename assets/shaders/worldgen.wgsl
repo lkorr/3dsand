@@ -5709,18 +5709,42 @@ fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
   // than a cascade cell contributes nothing to the far field (farCellIsSolid
   // drops the plant cell itself); the skin is what the far field paints.
   //
-  // ONE genCellCol body, two answers: the skin at h, and (FAR_GROUND_SAMPLE
-  // only) procgen's material at the sample. A second call site would inline a
+  // ONE genCellCol body, up to three answers: the skin at h, (FAR_GROUND_SAMPLE
+  // only) procgen's material at the sample, and (wetTop only, below) the voxel
+  // at the fluid's surface. A second call site would inline a
   // second copy into `far`/`farpatch`/`fardown`, whose compile time is the
   // engine's worst (unrollFence).
+  //
+  // THE FLUID OVER A BED THINNER THAN THE CELL (ticket 2026-10-09_22-16-05).
+  // A submerged column (fluidTop > h) whose NEXT cell up centre-samples above
+  // the fluid's surface has no fluid cell at all at this level: the fluid's
+  // surface and its bed round to the same cell boundary, and the bed cell
+  // won. On the default map's coast (sea 112) every level-8 row [0, 256)
+  // centre-samples air, so the whole shelf up to 24 m deep was drawn as DRY
+  // SAND at y = 0 with the deeper columns' water speckled through it, and the
+  // far shoreline sat at the -128 depth contour instead of the coast. From
+  // above, a submerged column's top is its fluid, so this cell -- the column's
+  // topmost non-air cell -- wears the voxel at the fluid's surface (`top`,
+  // q == 2: water, or a frozen lake's ice), exactly as a dry column's wears
+  // the voxel at h. The cell's shape is unchanged; only its colour, and with
+  // it the renderer's water path, follows the column's top. The skin at h is
+  // still read first: the live-ground and sample modes below compare against
+  // it to tell an edited bed from an untouched one.
+  let ft = (*col).fluidTop;
+  let wetTop = ft >= 0 && ft > h && fine.y + (1 << shift) > ft &&
+               farCellIsSolid((*col).fluid);
   var skin = MAT_AIR;
   var pristine = mat;
-  let nq = select(1u, 2u, ground == FAR_GROUND_SAMPLE);
-  for (var q = unrollFenceU(); q < nq; q++) {
-    let y = select(h, fine.y, q == 1u);
+  var top = MAT_AIR;
+  for (var q = unrollFenceU(); q < 3u; q++) {
+    if (q == 1u && ground != FAR_GROUND_SAMPLE) { continue; }
+    if (q == 2u && !wetTop) { continue; }
+    let y = select(select(h, fine.y, q == 1u), ft, q == 2u);
     let g = genCellCol(col, ponds, vec3<i32>(fine.x, y, fine.z), seed) & 0xFFFu;
-    if (q == 0u) { skin = g; } else { pristine = g; }
+    if (q == 0u) { skin = g; } else if (q == 1u) { pristine = g; } else { top = g; }
   }
+  // A plant floating on the surface (a lily pad) is not far-solid: the fluid.
+  if (wetTop && !farCellIsSolid(top)) { top = (*col).fluid; }
   // a stamp's hollow interior can be air at y == h; keep the body mat then
   let skinOk = skin != MAT_AIR && materials[skin].klass != CLASS_GAS;
   if (ground < FAR_GROUND_SAMPLE) {
@@ -5731,12 +5755,14 @@ fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
     if (!skinOk || matFarPal(&materials, ground) != matFarPal(&materials, skin)) {
       return ground;
     }
+    if (wetTop) { return top; }
     return roadTint(col, skin, shift);
   }
   if (ground == FAR_GROUND_SAMPLE &&
       matFarPal(&materials, mat) != matFarPal(&materials, pristine)) {
     return mat;
   }
+  if (wetTop) { return top; }
   if (!skinOk) { return mat; }
   return roadTint(col, skin, shift);
 }

@@ -16038,7 +16038,32 @@ where you hear from either (§12b, "The ears are on the character").
   than a tree) surface cells under a crown's XZ footprint take the leaf
   material instead (`treeCanopyAt`) — trees too thin to survive center
   sampling are flattened into the terrain, so the far forest keeps its canopy
-  color. Far hits shade with the same palette/face/ambient constants as the
+  color. **A submerged column's surface cell wears its FLUID (2026-10-10,
+  ticket 2026-10-09_22-16-05).** The skin rule had one hole: a column whose
+  fluid surface and bed round to the same cell boundary has no fluid cell at
+  all at that level (the cell over the bed centre-samples above the
+  surface), so the bed cell won and painted its skin. On the default map's
+  coast (sea 112) every level-8 row [0, 256) samples air, so the whole shelf
+  to 24 m deep was drawn as DRY SAND at y = 0 with the deeper columns' water
+  speckled through it: the far shoreline sat at the -128 depth contour, a
+  25.6 m-cell band of beach that is not there (seen from 2 km up over the
+  north coast; the CPU heightmap puts 9-22 m of water under it). Now the
+  topmost bed cell of a submerged column whose next cell up samples above
+  the surface takes the voxel at the surface (`farSurfaceMat`'s third
+  genCellCol answer, `wetTop`: water, a frozen lake's ice, the fluid under
+  a lily pad). Shape is unchanged; colour and the renderer's water path
+  follow the column's top, as a dry column's follow `h`. The live-ground and
+  sample modes still compare against the bed skin to tell an edited bed from
+  an untouched one, so `fardown` and the sieve keep their byte agreement.
+  Measured at the ticket's camera at noon, sand-coloured samples in the
+  frame: 31,828 before, 3,090 after (the rest is real beach). Ponds, W1
+  lakes, W1 rivers and lava pools shallower than half a cell gain the same
+  fix: from 600 m up, the Twinmere (2.5 m deep) was a brown mud bed with
+  water speckles and its rivers grey dry channels; both now read as water.
+  Raymarch GPU p50 over 2,400 frames, main vs this: the ticket camera 3.67
+  -> 3.65 ms, the Twinmere aerial 1.61 -> 1.74 (mean 2.04 -> 2.07; more of
+  the frame is now water). Far
+  hits shade with the same palette/face/ambient constants as the
   near field (far water: `shadeFarWater`, below); the texture, AO
   and shadow terms are the near field's own since the seam pass below (phase 4
   had a 0.5 m palette hash, a one-sample AO and a flat ×0.3 shadow lift). Fog
@@ -16146,7 +16171,8 @@ where you hear from either (§12b, "The ears are on the character").
   Three terms the near shade had and the cascade lacked, each reduced to what
   the near field SHOWS at the seam (20-26 m, eye height) and reproduced with
   ALU only, in helpers beside `fs` (`raymarch.wgsl`):
-  (a) **water** — `shadeFarWater` is `shadeWater`'s up-facing, bed-less limit:
+  (a) **water** — SUPERSEDED 2026-10-10 by "The far water IS shadeWater"
+  below; kept for the history. `shadeFarWater` is `shadeWater`'s up-facing, bed-less limit:
   the same deep-water `waveSlope` normal with the same screen-footprint
   damping (so both sides carry the same surviving swell bands), the same
   Schlick Fresnel (F0 0.0204, `waterFresnelPower`, × `liquidOptics.fresnel`)
@@ -16458,7 +16484,61 @@ where you hear from either (§12b, "The ears are on the character").
     aliases that painted two leaf ramps' dark and lit steps in their mid step.
     The far contact shadow of a crown's inner leaves is a hard 0 that
     `lodShadowLift` raises to ~0.33, which happens to match. The sea's
-    shadeWater / shadeFarWater seam is untouched by this.
+    shadeWater / shadeFarWater seam is untouched by this (closed separately,
+    next).
+  **The far water IS shadeWater (2026-10-10).** The near and far water
+  shades had been written twice and agreed by calibration. They now share
+  the surface law term for term: `waterWaveNormal` (macro slope + Gerstner
+  field with depth, current and fetch + the sim's flux), `waterFresnel`,
+  `waterGlint`, `waterFoam` (raymarch.wgsl, beside `waterNormal`) are called
+  by both, and `shadeFarWater` takes the body exactly as `shadeWater` does:
+  the bed through `veilCaustic`, then the per-channel Beer-Lambert column,
+  then Fresnel against the reflection. What the cascade cannot measure is
+  passed as the open-water input the near field would have measured: no
+  macro slope, full fetch, no flux, a full surface cell, `reflectionSky` for
+  the traced reflection. A term added to one side and not the other is the
+  seam coming back.
+  - **Attributed with the tree seam's instruments**: `SEAM_HANDOFF` at 8 m
+    (the same water pixels at 9-20 m shaded far) and new `SEAM_DBG` frames
+    5-7 (side / distance / Fresnel; refracted / reflection / bed lit; foam /
+    pre-aerial / path to the bed) plus 8 (a far hit's level / liquid /
+    refined: which representation drew a pixel, the instrument of the
+    shoreline ticket). On deep open sea the two sides were already equal
+    (same-pixel median 0/255 at noon: normal, Fresnel, reflection, glint all
+    identical; the path is past the cap on both). On a shallow shelf the far
+    side was +7.6/255 brighter, all of it the REFRACTED term (1.8x): the
+    far bed was found by a column walk STRAIGHT DOWN from the hit and its
+    path taken as depth / slope, a flat-bed estimate, where the near ray
+    meets the bed it actually reaches -- on a shelf deepening away from the
+    eye 2.6x further along (median 4.6 m of path vs 12.2 m). `farWaterBed`
+    now marches the RAY through the hit's level (one cell, then steps
+    growing by a quarter of the distance walked, three bisections; a refined
+    hit starts in the AIR cell over the cascade's water and walks out of it
+    first), returns the vertical depth for the wave law as `waterDepthM`
+    does near, and lights the bed by the far terrain's law on the face the
+    ray entered (face weight, `farOpenness`, `farGiBounce`).
+  - **Measured**, same-pixel median far - near (/255 luma, 9-20 m, 1600x900),
+    before -> after: shelf (the default map's north coast, eye 3 m, (2016,
+    142, -84950) yaw -90 pitch -14) noon +7.6 -> +2.1, minute 960 (low sun)
+    +8.4 -> +3.1, overcast +9.3 -> +1.9; the Twinmere lake ((12000, 213,
+    24500) yaw 0, 2.5 m deep) noon -1.8 -> -0.2; deep open sea ((4000, 172,
+    -105000)) 0.0 -> 0.0. Across-the-boundary step in the shipped frames (trend-fit
+    either side of 20.5 m): within +-0.4 on every camera before and after --
+    the visible seam on these cameras was the shallow band's colour, not a
+    line at the sphere.
+  - **Cost**: `--render-budget` baseline (1080p, exclusive lock, main's exe,
+    main's shaders vs these, back to back): cascade 4.78 -> 4.76 ms, peaksea
+    (the sea from 3 m) 10.62 -> 10.61, noon 11.10 -> 9.91 (no water in that
+    frame: run-to-run spread). The far bed march replaces a column walk of
+    up to 64 fetches with at most ~25 + 3; the caustic runs only where a bed
+    was found.
+  - **Still not matched**: the far bed has no cast or contact shadow and no
+    AO (a grazing ray through shallow water sees mostly the risers of the bed
+    staircase; the near bed's median shadow there is 0.36), so beds under
+    less than ~4 m of path stay brighter far (+2..+7/255 in those pixels);
+    the far bed is the level's centre-sampled staircase, not the near
+    voxels; no traced reflection of the far shore; the waterline is a cell
+    top (or the refine's exact column top at levels 1-2).
   **Those seven bits are a PALETTE SLOT, not a material id (2026-09-09):**
   a far cell byte names one of 128 entries in the FAR PALETTE — the fourth
   reserved run of the GPU material table (`kFarPaletteBaseGpu`, world.h,
