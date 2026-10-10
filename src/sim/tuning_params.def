@@ -2497,6 +2497,9 @@ TP_F(wind, streakRadius, NO_WGSL, 20.0f, 2.0f, 60.0f)
 TP_F(wind, streakWidth, NO_WGSL, 0.015f, 0.005f, 0.2f)
 // the ground as the streaks' boundary (wind_streak.wgsl, RenderParams.streakN[3] bit 0)
 TP_B(wind, streakGround, NO_WGSL, true)
+// ---- water-current tracers (wind_streak.wgsl's pool, the slots after streakCount; render-only) ----
+TP_F(wind, currentStreakAlpha, NO_WGSL, 0.35f, 0.0f, 1.0f)
+TP_I(wind, currentStreakCount, NO_WGSL, 256, 0, kWindStreakCap)
 TP_B(wind, dbgWindField, NO_WGSL, false)
 
 

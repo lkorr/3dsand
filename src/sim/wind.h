@@ -270,12 +270,24 @@ inline uint32_t WindDebugArrowCount(const Tuning& t) {
   return n * n * n;
 }
 
-// ---- gust streaks (wind_streak.wgsl) -----------------------------------------
-// Instances for the streak draw: the live pool, or 0 when the master alpha is
-// off — the SAME test Simulation::EncodeShadowResolve uses to record the
-// update row, so the draw never reads a pool nobody advanced.
-inline uint32_t WindStreakDrawCount(const Tuning& t) {
+// ---- gust streaks + water-current tracers (wind_streak.wgsl) ---------------
+// The pool is split by slot index: [0, wind) are gust streaks, [wind, wind +
+// current) are current tracers. A kind whose alpha is 0 owns no slots, so the
+// other kind starts at slot 0 rather than leaving dead slots dispatched.
+inline uint32_t WindStreakSlots(const Tuning& t) {
   if (t.wind.streakAlpha <= 0.0f) return 0u;
   const int n = t.wind.streakCount < 0 ? 0 : t.wind.streakCount;
   return (uint32_t)(n > (int)kWindStreakCap ? (int)kWindStreakCap : n);
+}
+inline uint32_t CurrentStreakSlots(const Tuning& t) {
+  if (t.wind.currentStreakAlpha <= 0.0f) return 0u;
+  const int n = t.wind.currentStreakCount < 0 ? 0 : t.wind.currentStreakCount;
+  const int room = (int)kWindStreakCap - (int)WindStreakSlots(t);
+  return (uint32_t)(n > room ? room : n);
+}
+// Instances for the streak draw: both kinds' slots, or 0 when both alphas are
+// off — the SAME count Simulation::EncodeShadowResolve dispatches the update
+// over, so the draw never reads a pool nobody advanced.
+inline uint32_t WindStreakDrawCount(const Tuning& t) {
+  return WindStreakSlots(t) + CurrentStreakSlots(t);
 }

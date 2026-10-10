@@ -19397,6 +19397,27 @@ would move the sim. `wind.streakGround` (default on, `RenderParams.streakN[3]`
 bit 0) switches it; the `heat-updraft` gate's probe turns it off, because it
 reads one streak step back as `windAt`.
 
+**Streaks are air; the pool also draws the CURRENT (2026-10-10).** The update
+reads the cell under each streak (`voxWordAt`; the row declares
+`R(Voxels) R(Materials) R(PageTable)`): a gust streak is never born in liquid
+and dies the step it enters one. The terrain table counts a lake as ground, but
+not a pond under its bilinear facets, a river or a player-filled basin, and
+under the water veil the surface writes no depth, so streaks were drawn under
+water. Thread 0 writes "eye cell is liquid" to the pool's row 0 and the draw
+hides the gust streaks while it is set. The slots after `wind.streakCount` are
+**current tracers**: `wind.currentStreakCount` slots, born 0.15-1.15 m under
+a water surface (found by a column scan) where `currentAt` runs over
+~0.05 m/s, carried by its horizontal part, dead out of liquid; a cooler white,
+1.6x wider, trail spacing x4. `currentAt` is zero without current primitives,
+so still water shows none. Their count and alpha ride `streakN[3]` bits 8..19
+and 24..31 (RenderParams has no spare field, and a new one is a `common.wgsl`
+edit); spawn speeds and lifetime are consts in `wind_streak.wgsl`.
+**Rain on water** is shading, not particles: `raymarch.wgsl` `rainRipples`
+adds expanding rings (three incommensurate drop grids, one cell each) to
+`waterNormal`'s slope and a short splash speck in `shadeWater`, gated by the
+eye probe's rain rate, the deck, snow at the surface's height and the rain
+shadow map, and faded by pixel footprint.
+
 `windSampleAt` / `windAt` live in **`assets/shaders/common.wgsl`**, which is
 prepended to every shader, so the field is in scope everywhere without being
 copied anywhere. The evolving weather comes from **`WindWeatherQ`

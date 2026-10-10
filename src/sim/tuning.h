@@ -3957,6 +3957,16 @@ struct Tuning {
     // bare field, which is what the heat-updraft gate's probe reads (it uses
     // one streak step as a readback of windAt).
     bool streakGround = TPD(wind, streakGround);
+    // WATER-CURRENT TRACERS (wind_streak.wgsl, the same pool: the
+    // currentStreakCount slots after the streakCount wind ones). The current
+    // field drawn: faint ribbons just under a water surface, advected by
+    // currentAt() along the surface, born only where the current runs (the
+    // spawn speeds and lifetime are consts in the shader: RenderParams has no
+    // room left, and both knobs here ride RenderParams.streakN[3]'s spare
+    // bits) and dying when they leave the liquid. Still water and a world with
+    // no current primitives show none. currentStreakAlpha 0 = off.
+    float currentStreakAlpha = TPD(wind, currentStreakAlpha);
+    int currentStreakCount = TPD(wind, currentStreakCount);
 
     // ---- debug slope-field overlay (research doc §4.8) ----
     // Initial state of the arrow overlay; F4 toggles it in-game. It is a

@@ -26,7 +26,24 @@
 // tapering and fading from head to tail, fading in and out over the particle's
 // life, near the camera, at the pool's radius and into the fog.
 //
-// LAYOUT, array<vec4f>: word 0 unused, then per slot STREAK_STRIDE rows —
+// WATER. A gust streak is AIR: it is never born in a liquid cell and dies the
+// step it enters one. The coarse terrain table counts a lake's surface as
+// ground, but not a pond under its bilinear facets, a river, or a basin the
+// player filled -- and under the water veil the surface writes no depth, so a
+// streak under it drew straight through. While the camera's own cell is
+// liquid the gust streaks are not drawn at all: from below, the air is seen
+// through a moving interface, not as crisp wisps.
+//
+// CURRENT TRACERS (2026-10-10). The slots after the gust streaks are the
+// CURRENT field drawn the same way: born a hand's depth under a water surface
+// where currentAt() runs faster than CUR_SPAWN_LO, carried along the surface
+// by its horizontal part, dead when they leave the liquid. currentAt is the
+// function the surface waves advect with and the current arrows sample
+// (debug_current.wgsl), so these ARE that field. Still water, and a world with
+// no current primitives (currentRenderOn 0), spawns none.
+//
+// LAYOUT, array<vec4f>: row 0 = (camera cell is liquid ? 1 : 0, 0, 0, 0),
+// written by the update's thread 0 for the draw; then per slot STREAK_STRIDE rows —
 //   [0] position (world voxels), age (s)
 //   [1] lifetime (s, 0 = never spawned), strength (0..1), ring head, push timer
 //   [2 .. 2 + STREAK_TRAIL_MAX) the trail ring: position, age at push
@@ -34,6 +51,13 @@
 // kWindStreakStride in src/sim/world.h (check_invariants `windstreak`).
 
 @group(0) @binding(3) var<uniform> R : RenderParams;
+// The cell under a particle (the update's layout, shadowBGL_ 0/2/4): a gust
+// streak dies in liquid and a current tracer lives only in it. The draw never
+// reads them. `> voxels` with EXACTLY ONE SPACE: resources.cpp keys the
+// page-table block on it.
+@group(0) @binding(0) var<storage, read> voxels : array<u32>;
+@group(0) @binding(2) var<storage, read> materials : array<Material>;
+@group(0) @binding(4) var<storage, read> pageTable : array<u32>;
 // The wind-draft shelter volume (shadowBGL_ 24, the UPDATE's layout): a streak
 // advected by windAt stops at a wall and threads through a doorway. The draw
 // never reads it, so it is not in renderBGL_'s view of this module.
@@ -68,6 +92,42 @@ const STREAK_FOLLOW_DEPTH : f32 = 400.0;
 const STREAK_FOLLOW_MAX_SLOPE : f32 = 1.5;
 const STREAK_FLOOR : f32 = 2.0;
 
+// ---- current tracers. RenderParams has no room for more knobs: alpha and
+// slot count ride streakN.w (support.cpp packs it), the rest is here ----
+// Respawn attempts per second per dead slot.
+const CUR_SPAWN_RATE : f32 = 3.0;
+// Surface speed (world cells/s) below which nothing is born, and the span over
+// which a spawn becomes certain: 0.05 m/s and +0.5 m/s. A river reach runs
+// ~0.5-1.5 m/s; a pond with no primitive is exactly 0.
+const CUR_SPAWN_LO : f32 = 0.5;
+const CUR_SPAWN_SPAN : f32 = 5.0;
+// Lifetime (s, +-30%); trail spacing as a multiple of the gust streaks' (water
+// is ~10x slower than air: the same spacing would be a 2 cm smear); ribbon
+// width as a multiple of theirs.
+const CUR_LIFE : f32 = 4.0;
+const CUR_SPACING_MUL : f32 = 4.0;
+const CUR_WIDTH_MUL : f32 = 1.6;
+// Depth under the surface a tracer rides at, voxels: 0.15 .. 1.15 m, most of
+// them shallow, so from the bank they read as on the water.
+const CUR_DEPTH_MIN : f32 = 1.5;
+const CUR_DEPTH_SPAN : f32 = 10.0;
+// The surface search: from this far over the terrain table's ground (which
+// counts standing water) down at most this many cells.
+const CUR_SCAN_ABOVE : i32 = 24;
+const CUR_SCAN_CELLS : i32 = 72;
+
+fn curSlots() -> u32 { return (R.streakN.w >> 8u) & 0xFFFu; }
+fn curAlpha() -> f32 { return f32(R.streakN.w >> 24u) * (1.0 / 255.0); }
+fn streakSlots() -> u32 { return R.streakN.x + curSlots(); }
+
+// Is the cell at p a liquid? Outside the residency window = no (the masked
+// read would alias another chunk).
+fn streakCellLiquid(p : vec3f) -> bool {
+  let c = vec3<i32>(floor(p));
+  if (!chunkInWindow(worldChunkOf(c), ptOrigin())) { return false; }
+  return materials[voxMat(voxWordAt(c))].klass == CLASS_LIQUID;
+}
+
 fn streakU01(a : u32, b : u32) -> f32 {
   return f32(hash3(STREAK_SALT ^ a, R.streakN.z, b) & 0xFFFFFFu) * (1.0 / 16777216.0);
 }
@@ -87,14 +147,22 @@ fn streakVertReach(ground : f32) -> f32 {
 @compute @workgroup_size(64)
 fn update(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
-  if (i >= R.streakN.x) { return; }
+  if (i >= streakSlots()) { return; }
   let base = 1u + i * STREAK_STRIDE;
   var h0 = streaks[base];
   var h1 = streaks[base + 1u];
   let dt = R.streakB.w;
   if (dt <= 0.0) { return; }                  // paused, or an aux view's frame
+  // Row 0: is the eye under a liquid? The draw hides the gust streaks then.
+  if (i == 0u) {
+    streaks[0] = vec4f(select(0.0, 1.0, streakCellLiquid(R.camPos)), 0.0, 0.0, 0.0);
+  }
   let trail = clamp(R.streakN.y, 2u, STREAK_TRAIL_MAX);
   let radius = R.streakA.w;
+  if (i >= R.streakN.x) {
+    currentUpdate(i, base, h0, h1, dt, trail, radius);
+    return;
+  }
 
   if (!streakAlive(h0, h1)) {
     // ---- respawn attempt ----
@@ -112,6 +180,7 @@ fn update(@builtin(global_invocation_id) gid : vec3<u32>) {
     if (R.camPos.y - ground > 2.0 * radius + 62.0) { return; }
     let hq = streakU01(4u, i);
     p.y = ground + 2.0 + hq * hq * 60.0;
+    if (streakCellLiquid(p)) { return; }        // air, not water (header)
     let s = windSampleAt(p, R.time, 0.0, &R);
     let bands = windBandWS(s, s.b1) * WIND_BAND_W1 + windBandWS(s, s.b2) * WIND_BAND_W2;
     let m = windMeanWS(s);
@@ -182,6 +251,8 @@ fn update(@builtin(global_invocation_id) gid : vec3<u32>) {
     if (under > STREAK_FLOOR + STREAK_FOLLOW_MAX_SLOPE * length(w.xz) * dt) { hitWall = true; }
     else if (under > 0.0) { p.y += under; }
   }
+  // Into a liquid: done, as into the ground (header, WATER).
+  if (streakCellLiquid(p)) { hitWall = true; }
   h0 = vec4f(p, a0 + dt);
   var head = u32(h1.z) % trail;
   // Push a trail point every `spacing` seconds — AS MANY as fell inside this
@@ -214,6 +285,89 @@ fn update(@builtin(global_invocation_id) gid : vec3<u32>) {
   streaks[base + 1u] = vec4f(h1.x, h1.y, f32(head), timer);
 }
 
+// ---- one CURRENT TRACER slot (header, CURRENT TRACERS) ----
+// The gust streak's update, re-cut for water: spawn under a surface instead of
+// over the ground, advect by currentAt's horizontal part, die out of liquid.
+// The trail push is the gust streak's loop, at CUR_SPACING_MUL its spacing.
+fn currentUpdate(i : u32, base : u32, h0In : vec4f, h1In : vec4f, dt : f32,
+                 trail : u32, radius : f32) {
+  var h0 = h0In;
+  var h1 = h1In;
+  if (!streakAlive(h0, h1)) {
+    // ---- respawn attempt ----
+    if (R.currentRenderOn == 0u || R.currentPrimCount == 0u) { return; }
+    if (streakU01(11u, i) >= min(dt * CUR_SPAWN_RATE, 1.0)) { return; }
+    let ang = streakU01(12u, i) * 6.28318531;
+    let rr = sqrt(streakU01(13u, i)) * radius;
+    var p = vec3f(R.camPos.x + cos(ang) * rr, 0.0, R.camPos.z + sin(ang) * rr);
+    let tr = windTerrF(p, &R);
+    let ground = select(R.camPos.y, tr.h, tr.edge > 0.0);
+    // A camera far above the water spawns nothing: the draw's vertical fade
+    // would hide every tracer anyway.
+    if (R.camPos.y - ground > 2.0 * radius + 62.0) { return; }
+    // The water's surface in this column: down from over the table's ground
+    // (or from just over a submerged eye) to the first cell that is neither
+    // air nor gas. Liquid = found; anything else = dry here.
+    let top = i32(floor(max(ground, min(R.camPos.y, ground + 62.0)))) + CUR_SCAN_ABOVE;
+    var c = vec3<i32>(i32(floor(p.x)), top, i32(floor(p.z)));
+    if (!chunkInWindow(worldChunkOf(c), ptOrigin()) ||
+        !chunkInWindow(worldChunkOf(c - vec3<i32>(0, CUR_SCAN_CELLS, 0)), ptOrigin())) {
+      return;
+    }
+    var surf = -1e9;
+    for (var k = 0; k < CUR_SCAN_CELLS; k++) {
+      let mat = voxMat(voxWordAt(c));
+      if (mat != MAT_AIR) {
+        let kl = materials[mat].klass;
+        if (kl == CLASS_LIQUID) { surf = f32(c.y) + 1.0; break; }
+        if (kl != CLASS_GAS) { break; }
+      }
+      c.y -= 1;
+    }
+    if (surf < -1e8) { return; }
+    let dq = streakU01(14u, i);
+    p.y = surf - CUR_DEPTH_MIN - dq * dq * CUR_DEPTH_SPAN;
+    if (!streakCellLiquid(p)) { return; }       // shallower than that: skip
+    let v = currentAt(p, &R);
+    let pr = smoothstep(CUR_SPAWN_LO, CUR_SPAWN_LO + CUR_SPAWN_SPAN, length(v.xz));
+    if (streakU01(15u, i) >= pr) { return; }
+    h0 = vec4f(p, 0.0);
+    h1 = vec4f(CUR_LIFE * (0.7 + 0.6 * streakU01(16u, i)), pr, 0.0, 0.0);
+    for (var k = 0u; k < STREAK_TRAIL_MAX; k++) {
+      streaks[base + 2u + k] = vec4f(p, 0.0);
+    }
+    streaks[base] = h0;
+    streaks[base + 1u] = h1;
+    return;
+  }
+
+  // ---- carried along the surface by THE field's horizontal part ----
+  // The depth is held: the vertical term is a vortex's rise, which would sink
+  // or surface a tracer that is drawing the SURFACE flow.
+  let w = currentAt(h0.xyz, &R);
+  let p0 = h0.xyz;
+  let a0 = h0.w;
+  let p = p0 + vec3f(w.x, 0.0, w.z) * dt;
+  var head = u32(h1.z) % trail;
+  let spacing = max(R.streakB.y * CUR_SPACING_MUL, 1e-3);
+  let total = h1.w + dt;
+  let cnt = u32(floor(total / spacing));
+  for (var k = select(0u, cnt - trail, cnt > trail); k < cnt; k++) {
+    let ago = total - spacing * f32(k + 1u);
+    let f = clamp(1.0 - ago / dt, 0.0, 1.0);
+    head = (head + 1u) % trail;
+    streaks[base + 2u + head] = vec4f(mix(p0, p, f), a0 + dt * f);
+  }
+  let timer = min(total - spacing * f32(cnt), spacing);
+  h0 = vec4f(p, a0 + dt);
+  // Out of the water (a bank, the surface dropping under it) or out of the
+  // pool's reach: done.
+  let d = p.xz - R.camPos.xz;
+  if (!streakCellLiquid(p) || dot(d, d) > radius * radius * 1.69) { h0.w = h1.x; }
+  streaks[base] = h0;
+  streaks[base + 1u] = vec4f(h1.x, h1.y, f32(head), timer);
+}
+
 struct StreakOut {
   @builtin(position) pos : vec4f,
   @location(0) color : vec3f,
@@ -234,7 +388,10 @@ fn vsStreak(@builtin(vertex_index) vi : u32,
   out.color = vec3f(0.0);
   out.alpha = 0.0;
   let trail = clamp(R.streakN.y, 2u, STREAK_TRAIL_MAX);
-  if (ii >= R.streakN.x) { return out; }
+  if (ii >= streakSlots()) { return out; }
+  let isCur = ii >= R.streakN.x;
+  // A submerged eye sees no gust streaks (header, WATER).
+  if (!isCur && streaksR[0].x > 0.5) { return out; }
   let base = 1u + ii * STREAK_STRIDE;
   let h0 = streaksR[base];
   let h1 = streaksR[base + 1u];
@@ -273,7 +430,7 @@ fn vsStreak(@builtin(vertex_index) vi : u32,
   // raster as it moves) — but a ribbon WIDENED to that floor is dimmed by the
   // same factor, so a distant wisp keeps the brightness its real width earns
   // instead of reading as a bold line.
-  let want = R.streakB.z * (1.0 - 0.7 * kf);
+  let want = R.streakB.z * select(1.0, CUR_WIDTH_MUL, isCur) * (1.0 - 0.7 * kf);
   let width = max(want, pxWorld * 0.6);
   let cover = want / width;
   out.pos = projectView(rel + perp * (side * width), R);
@@ -297,12 +454,16 @@ fn vsStreak(@builtin(vertex_index) vi : u32,
   // and out toward the tail. A full-alpha head was a blunt cap, which reads
   // as a comet (a thing) rather than a wisp (moving air).
   let shape = min(kf * f32(trail - 1u), 1.0) * (1.0 - kf);
-  out.alpha = clamp(R.streakA.x * h1.y * shape * cover * life * near * far * fog, 0.0, 1.0);
+  let master = select(R.streakA.x, curAlpha(), isCur);
+  out.alpha = clamp(master * h1.y * shape * cover * life * near * far * fog, 0.0, 1.0);
   // The same translucent white day and night (owner call, 2026-09-30). It was
   // dimmed with the light (down to 0.08 at night), and a dark colour blended
   // at the streak's alpha reads as a BLACK line over a moonlit scene, not as
   // faint air. Visibility is the alpha's job; the colour stays constant.
   out.color = vec3f(0.92, 0.95, 1.0);
+  // A current tracer is light on water: a cooler white, so where a river
+  // runs under the wind the two fields read as two things.
+  if (isCur) { out.color = vec3f(0.80, 0.94, 1.0); }
   return out;
 }
 

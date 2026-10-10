@@ -988,10 +988,17 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
       rp.streakB[1] = tw.streakSpacing;
       rp.streakB[2] = tw.streakWidth * cells;
       rp.streakB[3] = dt;
-      rp.streakN[0] = (uint32_t)std::clamp(tw.streakCount, 0, (int)kWindStreakCap);
+      // [0] = the gust streaks' slots; the current tracers' follow them.
+      // [3]: bit 0 ground boundary | bits 8..19 current tracer slots |
+      // bits 24..31 their alpha x 255 (RenderParams has no spare field, and
+      // a new one is a common.wgsl edit = every shader's cache).
+      const uint32_t curN = CurrentStreakSlots(tun);
+      const uint32_t curA =
+          (uint32_t)std::lround(std::clamp(tw.currentStreakAlpha, 0.0f, 1.0f) * 255.0f);
+      rp.streakN[0] = WindStreakSlots(tun);
       rp.streakN[1] = (uint32_t)std::clamp(tw.streakTrail, 2, (int)kWindStreakTrail);
       rp.streakN[2] = frame;
-      rp.streakN[3] = tw.streakGround ? 1u : 0u;
+      rp.streakN[3] = (tw.streakGround ? 1u : 0u) | ((curN & 0xFFFu) << 8) | (curA << 24);
     }
     // The field block, from the same resolution the sim's copy comes from
     // (SubmitTick), with the three clocks at the frame's sub-tick instant so

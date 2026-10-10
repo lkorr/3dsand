@@ -19,6 +19,7 @@
 #include "sim/rainexpo.h"  // the rain lattice (rainFall / rainExpo extents)
 #include "sim/renderspec.h"  // LastRenderSpec(): which raymarch variant this frame takes
 #include "sim/tuning.h"      // fluidExciteMode gates the seam recording
+#include "sim/wind.h"        // WindStreakDrawCount: the streak pool's live slots
 #include "gpu/rhi_record.h"  // the Vulkan table-recording bridge (phase 4a)
 #include "gpu/rhi_vk.h"      // rhi::vkr::SavePipelineCache (EnsureRenderPipelines)
 #include "sim/worldmap.h"    // CurrentWorldMap().pondTile: the POND_TILE prelude const (P-F)
@@ -3356,11 +3357,11 @@ void Simulation::EncodeShadowResolve(const rhi::CommandEncoder& enc) {
   // every frame the far cascade is drawn, cache or clouds or neither.
   RecordCtx cx{};
   cx.cloudFlags = (shadowCacheOn_ ? 4u : 0u);
-  // The gust streaks: one thread per live slot, nothing at all at alpha 0.
+  // The gust streaks + current tracers: one thread per live slot, nothing at
+  // all with both alphas at 0.
   {
-    const Tuning::Wind& tw = CurrentTuning().wind;
-    const uint32_t n = (uint32_t)std::clamp(tw.streakCount, 0, (int)kWindStreakCap);
-    if (tw.streakAlpha > 0.0f && n > 0 && windStreak_) cx.streakGx = (n + 63) / 64;
+    const uint32_t n = WindStreakDrawCount(CurrentTuning());
+    if (n > 0 && windStreak_) cx.streakGx = (n + 63) / 64;
   }
   // The ray-start map covers the largest target sized so far; each thread
   // bounds itself against THIS frame's size (ray_start.wgsl).

@@ -1261,6 +1261,8 @@
     "streakRadius": 20,
     "streakWidth": 0.015,
     "streakGround": true,
+    "currentStreakAlpha": 0.35,
+    "currentStreakCount": 256,
     "dbgWindField": false,
     "dbgWindSpacing": 8,
     "dbgWindRadius": 48

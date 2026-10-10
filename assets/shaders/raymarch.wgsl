@@ -9063,8 +9063,98 @@ fn waveFluxAt(c : vec3<i32>) -> vec2f {
   return vec2f(qx, qz) * (1.0 / 256.0);
 }
 
+// ---- RAIN ON WATER (2026-10-10) ----------------------------------------------
+// Where rain lands on an open liquid surface, each drop starts a small ring
+// that runs outward and fades, with a short bright speck at the impact. Pure
+// shading: a slope added to waterNormal's and a splash term shadeWater lays
+// over the surface. Nothing stored, nothing hashed, zero cost when dry.
+//
+// THE DROPS. Three grids of drop cells with incommensurate sizes and offsets
+// (one grid's lattice would read as a lattice). Each cell runs a cycle of
+// RAIN_RIP_LIFE seconds at its own phase; every cycle it rolls whether a drop
+// lands (probability = the rain amount) and where. The drop centre keeps a
+// margin of the ring's full radius from the cell's walls, so a ring never
+// crosses into a neighbour and one cell per grid is the whole evaluation.
+//
+// WHERE IT RAINS is the rain overlay's question, asked at the surface: the
+// camera probe's rain rate (cloud.wgsl), under the deck, not snow at this
+// height, and exposed to the fall per the rain shadow map (a pond under a
+// roof stays still). The probe is the EYE's rain, like the streak overlay's.
+const RAIN_RIP_LIFE : f32 = 0.9;     // s from impact to a faded ring
+const RAIN_RIP_RMAX : f32 = 0.36;    // ring's final radius, in cells
+const RAIN_RIP_SLOPE : f32 = 0.20;   // peak ring slope at impact, m/m
+const RAIN_RIP_K : f32 = 150.0;      // ring wavenumber, rad/m (~4 cm crest spacing)
+const RAIN_RIP_W : f32 = 0.035;      // ring envelope width, m
+const RAIN_SPLASH_S : f32 = 0.09;    // s a splash speck lasts
+const RAIN_SPLASH_R : f32 = 0.02;    // speck radius, m
+// The splash of the last waterNormal call, for shadeWater (0 = none).
+var<private> gRainSplash : f32;
+
+fn rainOnWaterAmount(hitP : vec3f) -> f32 {
+  if ((R.weatherFlags & (RWF_RAIN | RWF_CLOUDS)) != (RWF_RAIN | RWF_CLOUDS)) { return 0.0; }
+  let here = bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 2u]);
+  let yM = hitP.y * VOXEL_METERS;
+  let jit = cloudBaseJitterM(CL.thicknessM);
+  let under = 1.0 - smoothstep(CL.baseM - jit, CL.baseM + jit, yM);
+  let snow = precipSnowAt(CL.precipType, CL.spare.w, yM);
+  var a = clamp(here * 1.4, 0.0, 1.0) * under * (1.0 - snow);
+  if (a <= 0.002) { return 0.0; }
+  let rm = rainMapHeader();
+  if (rm.live) {
+    let e = rainMapExposure(rm, hitP + vec3f(0.0, 0.05, 0.0));
+    if (e >= 0.0) { a *= e; }
+  }
+  return a;
+}
+
+// One grid's ring at pm (world metres): adds its slope, maxes its splash.
+fn rainRippleCell(pm : vec2f, t : f32, cellM : f32, salt : u32, density : f32,
+                  slope : ptr<function, vec2f>, splash : ptr<function, f32>) {
+  let g = pm / cellM;
+  let ci = floor(g);
+  let cu = vec2<u32>(bitcast<u32>(i32(ci.x)), bitcast<u32>(i32(ci.y)));
+  let h0 = hash3(salt, cu.x, cu.y);
+  let tt = t / RAIN_RIP_LIFE + f32(h0 & 0xFFFFu) * (1.0 / 65536.0);
+  let cyc = floor(tt);
+  let fr = tt - cyc;
+  let h1 = hash3(h0, bitcast<u32>(i32(cyc)), salt ^ 0x9E37u);
+  if (f32(h1 & 0xFFFu) * (1.0 / 4096.0) >= density) { return; }
+  let ctr = vec2f(f32((h1 >> 12u) & 0xFFu), f32((h1 >> 20u) & 0xFFu)) * (1.0 / 255.0) *
+            (1.0 - 2.0 * RAIN_RIP_RMAX) + vec2f(RAIN_RIP_RMAX);
+  let dv = (g - ci - ctr) * cellM;
+  let d = length(dv);
+  // The ring: crests behind a front running out to RAIN_RIP_RMAX cells,
+  // shrinking as it spreads. Slope is radial.
+  let x = d - fr * RAIN_RIP_RMAX * cellM;
+  let env = exp(-(x * x) / (RAIN_RIP_W * RAIN_RIP_W));
+  let amp = RAIN_RIP_SLOPE * (1.0 - fr) * (1.0 - fr);
+  if (d > 1e-4) { *slope += (dv / d) * (amp * cos(x * RAIN_RIP_K) * env); }
+  let ts = fr * RAIN_RIP_LIFE;
+  if (ts < RAIN_SPLASH_S) {
+    let sp = (1.0 - ts / RAIN_SPLASH_S) * (1.0 - smoothstep(RAIN_SPLASH_R * 0.3, RAIN_SPLASH_R, d));
+    *splash = max(*splash, sp);
+  }
+}
+
+// The rings' slope at pm (metres/metre, waterNormal's units); sets gRainSplash.
+// `footM` is the pixel's footprint (waterRippleFootprint): a ring finer than a
+// pixel is noise, so both fade out between ~1.2 and ~4 cm a pixel.
+fn rainRipples(pm : vec2f, t : f32, amount : f32, footM : f32) -> vec2f {
+  let fade = 1.0 - smoothstep(0.012, 0.04, footM);
+  if (fade <= 0.0) { return vec2f(0.0); }
+  let dens = clamp(amount, 0.0, 1.0) * 0.8;
+  var s = vec2f(0.0);
+  var sp = 0.0;
+  rainRippleCell(pm, t, 0.50, 0x52A1u, dens, &s, &sp);
+  rainRippleCell(pm + vec2f(0.23, 0.11), t, 0.41, 0x52A2u, dens, &s, &sp);
+  rainRippleCell(pm + vec2f(0.07, 0.31), t, 0.33, 0x52A3u, dens, &s, &sp);
+  gRainSplash = sp * fade;
+  return s * fade;
+}
+
 fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
                hitP : vec3f, upFacing : bool) -> vec3f {
+  gRainSplash = 0.0;
   // Side/bottom faces of a liquid volume keep their flat voxel normal: the
   // fullness gradient describes the TOP surface, and applying it to a wall
   // would tilt it into the terrain.
@@ -9105,7 +9195,15 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
   // eighths and cannot express a tilt smaller than one, which is exactly the
   // range a ring spends most of its life in. Additive and small: the Gerstner
   // field stays the texture, this is the body underneath it.
-  return waterWaveNormal(hitP, slope, waterDepthM(cell, mat), waterOpenness(cell, mat),
+  // Rain landing on it (RAIN ON WATER above): rings + the splash shadeWater
+  // adds. Near-field only: the cascade's water has no rain term.
+  var waveBase = slope;
+  let rainA = rainOnWaterAmount(hitP);
+  if (rainA > 0.0) {
+    waveBase += rainRipples(vec2f(hitP.x, hitP.z) * VOXEL_METERS, R.time, rainA,
+                         waterRippleFootprint(hitP));
+  }
+  return waterWaveNormal(hitP, waveBase, waterDepthM(cell, mat), waterOpenness(cell, mat),
                          waveFluxAt(cell));
 }
 
@@ -10546,6 +10644,17 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
       gVK *= 1.0 - foamA;
       if (SEAM_DBG >= 5u) { gDbgW0.w = foamA; }
     }
+  }
+
+  // ---- rain splashes (RAIN ON WATER; waterNormal set gRainSplash) ----
+  // The speck of a drop's impact: thrown-up water lit like the rain streaks
+  // (sky + a little key light), so it is a glint at noon and a dim fleck at
+  // night rather than a white dot.
+  if (upFacing && !underwater && gRainSplash > 0.0) {
+    let sa = min(gRainSplash, 1.0) * 0.6;
+    let splashLit = ambientAt(vec3f(0.0, 1.0, 0.0)) * 1.1 + keyLightColor() * 0.25;
+    color = mix(color, splashLit, sa);
+    gVK *= 1.0 - sa;
   }
 
   if (SEAM_DBG >= 5u) { gDbgW1.w = dbgLum(color); }

@@ -1748,9 +1748,14 @@ PASS(ray_start_trace, "rayStart", PT_SHADOWCACHE, PIPE_RAY_START_TRACE, K_COMPUT
 // and friends, A(HeatMeta) RW(HeatPool)); nothing on the async queue touches
 // either buffer (the PT_DERIVED rows are openness and glow), so the read
 // never splits a command buffer for a join it does not need.
+// R(Voxels) R(Materials) R(PageTable) (2026-10-10): the update reads the cell
+// under each particle -- a gust streak dies in liquid, a current tracer lives
+// only in it -- through voxWordAt. Written on the tick command buffer, covered
+// by the global barrier every command buffer opens with, like the draft.
 PASS(wind_streak, "windStreaks", PT_SHADOWCACHE, PIPE_WIND_STREAK, K_COMPUTE, D_STREAKGX,1,1,
      GRP_SHADOW, DYN_NONE, C_STREAKS, 1,
-     USES(U(RenderUBO) RW(WindStreaks) R(Draft) R(HeatPool) R(HeatMeta)))
+     USES(R(Voxels) R(Materials) U(RenderUBO) R(PageTable) RW(WindStreaks) R(Draft)
+          R(HeatPool) R(HeatMeta)))
 PASS(ray_start_min, "rayStart", PT_SHADOWCACHE, PIPE_RAY_START_MIN, K_COMPUTE, D_RSGX,D_RSGY,1,
      GRP_SHADOW, DYN_NONE, C_RAYSTART, 1,
      USES(U(RenderUBO) RW(RayStart)))
