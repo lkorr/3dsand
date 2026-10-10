@@ -454,7 +454,8 @@ const char* const kOrder[] = {
     // leaves a filled basin 45 cells from body-shade's site, clear of that
     // gate's roof; nothing after it reads that region before regenerating.
     "underwater-body",
-    "player-walk", "player-waterjump", "player-ledgegrab", "player-crouch",
+    "player-walk", "player-waterjump", "player-ledgegrab", "player-climb-fuzz",
+    "player-crouch",
     "player-fastfall",
     "freefall",
     "player-plants",

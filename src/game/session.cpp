@@ -5323,8 +5323,14 @@ static IVec3 MirrorLeadChunk(const Player& p, Vec3 vel,
     if (p.pos.y + yLo >= ground) floorTop = std::max(floorTop, ground);
     at.y = std::max(at.y, floorTop - yLo);
   }
-  return IVec3{ifloor(at.x) / (int)kChunk, ifloor(at.y) / (int)kChunk,
-               ifloor(at.z) / (int)kChunk};
+  // FLOOR division (>> 4, as World::KindAt and playerChunkNow use), never `/`:
+  // `/` truncates toward zero, so at a negative coordinate the cube came out
+  // one chunk toward the origin and the body sat on its edge with 0..15 cells
+  // of mirror on the negative side instead of 16..31. Past that edge KindAt
+  // answers Unknown, collision reads Unknown as air, and a ledge climb's
+  // step onto the lip swept straight into rock the mirror had not delivered
+  // -- stuck in the wall once it arrived (2026-10-09).
+  return IVec3{ifloor(at.x) >> 4, ifloor(at.y) >> 4, ifloor(at.z) >> 4};
 }
 
 static void PhaseL(TickAuthorityCtx& w, WorldScratch& ws,
@@ -5387,9 +5393,9 @@ static void PhaseL(TickAuthorityCtx& w, WorldScratch& ws,
       particlesActive = particlesActive ||
           (lastFluidTick != 0 && tick - lastFluidTick < 300);
 
-      pc = IVec3{ifloor(player.pos.x) / (int)kChunk,
-                 ifloor(player.pos.y) / (int)kChunk,
-                 ifloor(player.pos.z) / (int)kChunk};
+      // Floor division, for the reason MirrorLeadChunk gives.
+      pc = IVec3{ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
+                 ifloor(player.pos.z) >> 4};
       // A harness centres the mirror on its FIXTURE (session.h section J).
       if (w.harness.haveSubmitChunk) pc = w.harness.submitChunk;
       // The mirror LEADS the body (MirrorLeadChunk); a harness fixture's

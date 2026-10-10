@@ -75,6 +75,24 @@ bool Collides(const Vec3& p, const Player::Box& b,
   return false;
 }
 
+// Can the mirror answer for every cell the box at p covers? Collides() reads
+// Unknown as air -- an unfetched cell must not become an invisible wall -- so
+// a move that ends somewhere the mirror cannot see has not been validated at
+// all. The scripted mantle drive asks this of every step it takes: it carries
+// the body several voxels past where it stood, and a climb onto rock the
+// mirror had not delivered is the body inside a wall a few ticks later.
+bool BoxKnown(const Vec3& p, const Player::Box& b, const Player::KindFn& kindAt) {
+  const float hx = b.hx - kSkin;
+  const int x0 = ifloor(p.x - hx), x1 = ifloor(p.x + hx);
+  const int y0 = ifloor(p.y + b.yLo + kSkin), y1 = ifloor(p.y + b.yHi - kSkin);
+  const int z0 = ifloor(p.z - hx), z1 = ifloor(p.z + hx);
+  for (int y = y0; y <= y1; y++)
+    for (int z = z0; z <= z1; z++)
+      for (int x = x0; x <= x1; x++)
+        if (kindAt({x, y, z}) == CellKind::Unknown) return false;
+  return true;
+}
+
 // The highest cell top under the box's footprint between two sole heights --
 // where a downward sweep lands when the floor is a partial powder cell rather
 // than a whole one. -1e30 if nothing Solid is there.
@@ -469,7 +487,15 @@ bool LedgeGrabAhead(const Vec3& pos, const Vec3& dir, const Player::Box& b,
       const float az = pos.z + dir.z * ahead + perp.z * lat;
       const int cx = ifloor(ax), cz = ifloor(az);
       for (int y = yHi; y >= yLo; y--) {
-        if (kindAt({cx, y, cz}) != CellKind::Solid) continue;
+        // A column the mirror cannot see is no answer, not open sky: read
+        // as air, an unfetched wall top let the scan fall through to a
+        // "lip" partway up a sheer face.
+        const CellKind k = kindAt({cx, y, cz});
+        if (k == CellKind::Unknown) break;
+        if (k != CellKind::Solid) continue;
+        if (kindAt({cx, y + 1, cz}) == CellKind::Unknown ||
+            kindAt({cx, y + 2, cz}) == CellKind::Unknown)
+          break;
         // First solid from the top. A lip only if the hands have room on it.
         if (kindAt({cx, y + 1, cz}) != CellKind::Solid &&
             kindAt({cx, y + 2, cz}) != CellKind::Solid &&
@@ -869,6 +895,7 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
       Vec3 d = mantleTarget - pos;
       const float rise = (mantleSpeed / kVoxelMeters) * dt;
       float yBefore = pos.y;
+      const Vec3 held = pos;
       if (d.y > 1e-3f && mantleFromHang) {
         // The ledge climb rises on its authored profile (player.h
         // ledgeclimb), so the pauses the pose plays are pauses of the BODY.
@@ -896,6 +923,19 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
           SweepAxis(pos, d.z * s, 2, b, kindAt);
         }
       }
+      // NEVER INTO CELLS THE MIRROR CANNOT SEE. The sweeps read Unknown as
+      // air, and this drive is the one move that carries the body several
+      // voxels past where it stood at a fixed rate: onto a lip whose top
+      // the readback has not delivered, it walked into the rock and was
+      // inside it when the snapshot landed. Hold instead -- the mirror is a
+      // few ticks behind, the timeout still bounds the wait, and the ledge
+      // profile resumes from where the body is (its clock follows pos).
+      // The PATH is what is checked, not the stand spot at the pull-up: that
+      // box's top is ~25 cells over the hanging body and the mirror only
+      // promises 16, so it is routinely partly unseen at the start of a
+      // perfectly good climb -- and the rise brings the mirror up with it
+      // long before the box gets there.
+      if (!BoxKnown(pos, b, kindAt)) pos = held;
       // Bank the climb into the view offset like a step-up, so the camera glides
       // out of the water instead of snapping up it.
       BankVerticalSnap(pos.y - yBefore);

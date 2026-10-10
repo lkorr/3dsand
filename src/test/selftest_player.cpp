@@ -663,6 +663,201 @@ Status GatePlayerLedgeGrab(Ctx&, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- player-climb-fuzz ---------------------------------------------------
+//
+// THE CLIMB MUST NEVER END A TICK INSIDE THE WORLD (2026-10-09, owner report:
+// "the climbing up animation can inject the player inside voxels and get them
+// stuck inside a wall"). player-ledgegrab proves the climb WORKS on three clean
+// walls; this proves it is SAFE on hundreds of rough ones. Every fixture is a
+// static kindAt, so the world never moves into the body: any tick that ends
+// with the live box overlapping a solid cell when the tick before did not is
+// the controller putting it there, and the report names the state it was in.
+//
+// Fixtures (seeded, deterministic): the player-ledgegrab launch pad and pit,
+// then a rough wall from x=150 -- a lip at a random height, per-column noise
+// on the top, terraces stepping back, knobs on the face, sometimes a roof slab
+// over the lip. Inputs: sprint, jump, then space held with W held, W pulsed
+// (the cancel-and-resume path) or W plus a strafe (the shimmy) -- at the real
+// 30 Hz tick.
+//
+// The controller sees the world through a model of the CPU mirror (a lagged
+// 3x3x3 chunk cube, Unknown outside), because that is where the reported bug
+// lived: the mirror's centre used a truncating divide, so at negative
+// coordinates the cube sat a chunk off and the climb's step onto the lip
+// crossed cells the mirror had not delivered -- read as air, solid a few
+// ticks later. Half the seeds reproduce that off-by-one cube on purpose; the
+// controller must hold rather than CLIMB into what it cannot see. Plain
+// walking and jumping are not defended against a mis-centred mirror -- the
+// centring is what defends them -- so on shifted seeds only an entry made
+// while hanging or mantling counts; on centred seeds every entry does.
+Status GatePlayerClimbFuzz(Ctx&, std::string& detail) {
+  struct Rng {
+    uint32_t s;
+    uint32_t Next() {
+      s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+      return s;
+    }
+    int Range(int lo, int hi) { return lo + (int)(Next() % (uint32_t)(hi - lo + 1)); }
+  };
+  auto cellHash = [](uint32_t seed, int x, int y, int z) {
+    uint32_t h = seed * 0x9E3779B1u ^ (uint32_t)x * 0x85EBCA77u ^
+                 (uint32_t)y * 0xC2B2AE3Du ^ (uint32_t)z * 0x27D4EB2Fu;
+    h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12;
+    return h;
+  };
+  const int kSeeds = 400;
+  const int kTicks = 240;
+  const float dt = kTickDt;
+  int climbs = 0, entered = 0, endedInside = 0, unseen[2] = {0, 0};
+  int walkEntriesShifted = 0;  // reported, not asserted (see the header)
+  std::string first;
+  for (int seed = 1; seed <= kSeeds; seed++) {
+    Rng r{(uint32_t)seed * 2654435761u | 1u};
+    const int lipTop = r.Range(110, 118);
+    const int noiseP = r.Range(0, 3);          // in 8ths: per-column top noise
+    const int terraceAt = r.Range(1, 6);       // columns back to the next tier
+    const int terraceUp = r.Range(0, 3) == 0 ? 0 : r.Range(1, 12);
+    const bool roof = r.Range(0, 2) == 0;
+    const int roofLo = lipTop + r.Range(4, 20);
+    const int roofOver = r.Range(-2, 4);       // roof's front edge, from x=150
+    const int knobP = r.Range(0, 2);           // in 8ths: knobs on the face
+    const uint32_t hs = (uint32_t)seed;
+    // Where the wall falls against the 16-cell chunk grid, so the mirror cube
+    // below meets it at every alignment.
+    const int ox = r.Range(0, 15);
+    auto top = [=](int x, int z) {             // exclusive top of column x>=150
+      int t = lipTop + (x >= 150 + terraceAt ? terraceUp : 0);
+      if ((int)(cellHash(hs, x, 0, z) & 7u) < noiseP)
+        t += (int)(cellHash(hs, x, 1, z) % 3u) - 1;
+      return t;
+    };
+    Player::KindFn kf = [=](IVec3 c) {
+      c.x -= ox;
+      if (c.y < 60) return CellKind::Solid;
+      if (c.x < 140) return c.y < 100 ? CellKind::Solid : CellKind::Air;
+      if (roof && c.x >= 150 + roofOver && c.y >= roofLo && c.y < roofLo + 3)
+        return CellKind::Solid;
+      if (c.x >= 150) return c.y < top(c.x, c.z) ? CellKind::Solid : CellKind::Air;
+      if (c.x == 149 && c.y > 100 && c.y < lipTop &&
+          (int)(cellHash(hs, c.x, c.y, c.z) & 7u) < knobP)
+        return CellKind::Solid;
+      return CellKind::Air;
+    };
+    // THE CPU MIRROR, as the game has it: KindAt answers only inside a 3x3x3
+    // chunk cube centred on where the body was World::kSnapshotLatency ticks
+    // ago, Unknown past it. Odd seeds shift the cube one chunk back along x,
+    // the geometry the truncating chunk divide in session.cpp produced at
+    // negative coordinates: the body on the cube's +x edge, the wall it faces
+    // a few cells past it. `truth` stays the oracle for "inside".
+    const bool shifted = (seed & 1) != 0;
+    std::vector<IVec3> chunkHist;
+    IVec3 cubeLo{};
+    Player::KindFn truth = kf;
+    Player::KindFn mirror = [&cubeLo, truth](IVec3 c) {
+      const IVec3 ch{c.x >> 4, c.y >> 4, c.z >> 4};
+      if (ch.x < cubeLo.x || ch.y < cubeLo.y || ch.z < cubeLo.z ||
+          ch.x > cubeLo.x + 2 || ch.y > cubeLo.y + 2 || ch.z > cubeLo.z + 2)
+        return CellKind::Unknown;
+      return truth(c);
+    };
+    auto inside = [&](const Player& p) {
+      const Player::Box b = p.CurrentBox();
+      const float hx = b.hx - 0.01f;
+      for (int y = ifloor(p.pos.y + b.yLo + 0.01f); y <= ifloor(p.pos.y + b.yHi - 0.01f); y++)
+        for (int z = ifloor(p.pos.z - hx); z <= ifloor(p.pos.z + hx); z++)
+          for (int x = ifloor(p.pos.x - hx); x <= ifloor(p.pos.x + hx); x++)
+            if (kf({x, y, z}) == CellKind::Solid) return true;
+      return false;
+    };
+
+    const int mode = r.Range(0, 2);  // 0 hold W, 1 pulse W, 2 W + strafe
+    const float strafe = r.Range(0, 1) ? 1.0f : -1.0f;
+    const float zStart = 200.0f + (float)r.Range(0, 9) * 0.1f;
+    Player p;
+    p.fly = false;
+    p.pos = Vec3{132.0f + (float)ox, 100.0f + Player::kHalfY, zStart};
+    const Vec3 fwd{1, 0, 0}, right{0, 0, 1};
+    bool jumped = false, climbed = false, wasInside = false, unseenThisSeed = false;
+    for (int t = 0; t < kTicks; t++) {
+      TickInput in;
+      in.SetHeld(TB_SPRINT, !jumped);
+      in.forward = 1.0f;
+      if (!jumped) {
+        if (p.grounded && p.pos.x > 135.0f + (float)ox) {
+          in.SetPressed(TB_JUMP, true);
+          in.SetHeld(TB_JUMP, true);
+          jumped = true;
+        }
+      } else {
+        in.SetHeld(TB_JUMP, true);
+        if (mode == 1) in.forward = ((t / r.Range(3, 9)) & 1) ? 1.0f : 0.0f;
+        if (mode == 2) in.strafe = strafe;
+      }
+      const bool hangB = p.hanging, mantleB = p.mantleTimer > 0.0f;
+      const Vec3 before = p.pos;
+      chunkHist.push_back({ifloor(p.pos.x) >> 4, ifloor(p.pos.y) >> 4, ifloor(p.pos.z) >> 4});
+      const IVec3 seen = chunkHist[chunkHist.size() > World::kSnapshotLatency
+                                       ? chunkHist.size() - 1 - World::kSnapshotLatency
+                                       : 0];
+      cubeLo = IVec3{seen.x - 1 - (shifted ? 1 : 0), seen.y - 1, seen.z - 1};
+      // Did the mirror hide part of the spot a pull-up would stand on? That
+      // is the situation the climb used to walk into rock from.
+      if (p.hanging && !unseenThisSeed) {
+        const Player::Box sb = p.CurrentBox();
+        const Vec3 s = p.hangStand;
+        for (int y = ifloor(s.y + sb.yLo + 0.01f); y <= ifloor(s.y + sb.yHi - 0.01f) && !unseenThisSeed; y++)
+          for (int z = ifloor(s.z - sb.hx); z <= ifloor(s.z + sb.hx) && !unseenThisSeed; z++)
+            for (int x = ifloor(s.x - sb.hx); x <= ifloor(s.x + sb.hx); x++)
+              if (mirror({x, y, z}) == CellKind::Unknown) {
+                unseenThisSeed = true;
+                break;
+              }
+      }
+      p.Update(dt, in, fwd, right, fwd, mirror);
+      if (p.mantleFromHang && p.mantleTimer > 0.0f) climbed = true;
+      const bool now = inside(p);
+      const bool climbState = hangB || mantleB || p.hanging || p.mantleTimer > 0.0f;
+      if (now && !wasInside && shifted && !climbState) walkEntriesShifted++;
+      if (now && !wasInside && (!shifted || climbState)) {
+        entered++;
+        if (first.empty()) {
+          char b[400];
+          std::snprintf(b, sizeof(b),
+                        "seed %d mode %d tick %d: (%.2f,%.2f,%.2f)->(%.2f,%.2f,%.2f) "
+                        "hang %d->%d mantle %d->%d fromHang %d clock %.2f lip (%d,%d,%d) "
+                        "stand (%.2f,%.2f,%.2f) | lipTop %d terrace +%d@%d roof %d@%d over %d "
+                        "noise %d knob %d",
+                        seed, mode, t, before.x, before.y, before.z, p.pos.x, p.pos.y,
+                        p.pos.z, hangB, p.hanging, mantleB, p.mantleTimer > 0.0f,
+                        p.mantleFromHang, p.climbClock, p.hangLip.x, p.hangLip.y,
+                        p.hangLip.z, p.hangStand.x, p.hangStand.y, p.hangStand.z, lipTop,
+                        terraceUp, terraceAt, roof, roofLo, roofOver, noiseP, knobP);
+          first = b;
+        }
+      }
+      wasInside = now;
+    }
+    if (climbed) climbs++;
+    if (wasInside && !shifted) endedInside++;
+    if (unseenThisSeed) unseen[shifted ? 1 : 0]++;
+  }
+  char buf[700];
+  std::snprintf(buf, sizeof(buf),
+                "%d fixtures, %d climbed; %d entries into solid, %d ended inside; "
+                "stand spot partly unseen by the mirror in %d centred / %d shifted; "
+                "%d walk entries on shifted seeds (not asserted)%s%s",
+                kSeeds, climbs, entered, endedInside, unseen[0], unseen[1],
+                walkEntriesShifted,
+                first.empty() ? "" : " | first: ", first.c_str());
+  detail = buf;
+  // A fuzz that never climbs proves nothing: most fixtures must reach the climb.
+  // And the shifted cube must actually hide stand spots, or the mirror half
+  // of this gate is not exercising the case it exists for.
+  const bool ok = entered == 0 && climbs >= kSeeds / 4 && unseen[1] > 0;
+  std::printf("player climb-fuzz: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- player-plants -----------------------------------------------------
 //
 // Soft vegetation must not stop a moving body. Pond weed, reeds and kelp are
@@ -2852,6 +3047,7 @@ const std::vector<Gate>& PlayerGates() {
       {"player-walk", "player", {}, false, GatePlayerWalk},
       {"player-waterjump", "player", {}, false, GatePlayerWaterJump},
       {"player-ledgegrab", "player", {}, false, GatePlayerLedgeGrab},
+      {"player-climb-fuzz", "player", {}, false, GatePlayerClimbFuzz},
       {"player-crouch", "player", {}, false, GatePlayerCrouch},
       {"player-plants", "player", {}, false, GatePlayerPlants},
       {"player-fastfall", "player", {}, false, GatePlayerFastFall},
