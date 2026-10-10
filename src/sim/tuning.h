@@ -4425,7 +4425,8 @@ struct Tuning {
     float subScatterGain = TPD(render, subScatterGain);
     // Metres at which the view has fully faded to the scatter colour. The
     // underwater analogue of fog distance: this is the "murky pond" vs "clear
-    // tropical water" knob.
+    // tropical water" knob. Exact: transmission reaches 0 at this distance and
+    // the raymarch's liquid paths stop there (the deep-lake perf bound).
     float subVisibility = TPD(render, subVisibility);
     // screen-edge darkening while submerged
     float subVignette = TPD(render, subVignette);

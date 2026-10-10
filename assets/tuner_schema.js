@@ -584,7 +584,7 @@ const TUNING_SCHEMA = [
       {k:'subAbsorb', n:'absorption', d:'Per-channel absorption per metre while submerged. Much weaker than the Water tab’s so you can actually see across a pond. Raise red for murk.', type:'vec3', min:0, max:4, step:0.005},
       {k:'subScatter', n:'water colour', d:'The colour the volume tends toward with distance — what a far-off wall fades into rather than going black.', type:'color'},
       {k:'subScatterGain', n:'scatter strength', d:'How strongly the volume adds its own colour. 0 gives clear glass water with no body to it.', step:0.02},
-      {k:'subVisibility', n:'visibility', d:'Metres at which the view has fully faded into the water colour. THE murky-pond vs clear-tropical knob.', step:0.5, u:'m'},
+      {k:'subVisibility', n:'visibility', d:'Metres at which the view has fully faded into the water colour (exactly: nothing past it shows, and the raymarch stops liquid paths there, so it is also the deep-water perf bound). THE murky-pond vs clear-tropical knob.', step:0.5, u:'m'},
       {k:'subVignette', n:'edge darkening', d:'Screen-edge darkening while submerged. A cheap, strong "you are in a medium" cue.', step:0.01},
       {k:'subSnellGain', n:'snell window', d:'Brightness of the compressed disc of sky you see looking straight up from below. Outside that ~97° cone the surface mirrors the murk instead.', step:0.02},
       {k:'subSurfaceRipple', n:'surface distortion', d:'How much the underside of the surface ripples your view of the sky through it.', step:0.05},

@@ -162,7 +162,7 @@ const TUNING_PARAMS = {
   'render.subAbsorb':{t:'v3',def:[0.42,0.11,0.075],wgsl:'TUNE_SUB_ABSORB'},
   'render.subScatter':{t:'v3',def:[0.055,0.19,0.24],wgsl:'TUNE_SUB_SCATTER'},
   'render.subScatterGain':{t:'f',def:1,min:0,max:4,wgsl:'TUNE_SUB_SCATTER_GAIN'},
-  'render.subVisibility':{t:'f',def:11,min:0.5,max:60,wgsl:'TUNE_SUB_VISIBILITY'},
+  'render.subVisibility':{t:'f',def:10,min:0.5,max:60,wgsl:'TUNE_SUB_VISIBILITY'},
   'render.subVignette':{t:'f',def:0.34,min:0,max:1,wgsl:'TUNE_SUB_VIGNETTE'},
   'render.subSnellGain':{t:'f',def:1.25,min:0,max:4,wgsl:'TUNE_SUB_SNELL_GAIN'},
   'render.bedCausticGain':{t:'f',def:2.4,min:0,max:10,wgsl:'TUNE_BED_CAUSTIC_GAIN'},

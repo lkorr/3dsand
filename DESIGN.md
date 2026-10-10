@@ -4298,6 +4298,34 @@ that path draws. `subClearHigh` moved 0.82 -> 0.78 so that water (clarity
 0.787) is fully clear on every path; at 0.82 it was 93% clear, which the
 submerged comment had always claimed was 100%.
 
+THE VISIBILITY DISTANCE IS HARD (2026-10-10, F12 ticket 2026-10-10_11-00-47:
+~30 fps under a lake at night, ~40 on its surface). `render.subVisibility`
+(owner decision: 10 m) is now what its tuner text always said — the distance
+past which nothing shows — not a 1/e length. `liqVisFade` (raymarch.wgsl)
+multiplies the transmission of BOTH liquid shades (`shadeSubmerged`,
+`shadeWater`) by 1 out to 40% of it and 0 at it, and `trace()` stops every
+liquid path there (`LIQ_VIS_M`, was a fixed 24 m). The fade is what makes the
+stop invisible: the pixel is already the medium's in-scatter colour where the
+march ends. God rays inherit the shorter path (they march `min(path, 14 m)`);
+silt motes keep their old 24 m slab spread on a capped ray
+(`SILT_OPEN_SPAN_M`), since four slabs at fractions of 10 m read as blobs.
+Far water (`FAR_WATER_PATH_MAX_M`) and the MPM refraction trace are untouched.
+Attribution, `--render-budget --budget-cams at` (`SANDVOX_BUDGET_AT=<the
+ticket's --at>`, `SANDVOX_BUDGET_SUN_DEG=-25`, 1920x1080, same exe):
+
+| camera | before | after | primary steps/px | what the rest is |
+|---|---|---|---|---|
+| submerged (shot 1) | 24.08 ms | 14.25 ms | 268 -> 148 | god rays 2.9 ms (moonlit: the key light is the moon at night, so `kd.y < 0.08` never skips them), clouds 1.6 |
+| surface (shot 2) | 19.55 ms | 16.00 ms | 116 -> 74 | pre 4.0 (ray_start 1.6, clouds 2.3), reflection 0.9 |
+
+In play (`--frames 900 --at`, 1600x900 = the ticket's 0.57 x 2880x1623
+pixel count, `rm_world` p50): submerged 14.48 -> 8.61 ms, surface 12.23 ->
+9.38 ms; both cameras now sit on the 60 Hz vsync floor (whole-frame p50 16.8 /
+17.0 ms). Active chunks p50/p95 0/0 at both cameras: the lake reservoir stage
+does not keep an idle lake awake (its miss path marks only a cell
+`stillWant` says can still change). Next lever if water is ever hot again: a
+UNIFORM-water chunk crossed analytically instead of ~16 run-loop steps.
+
 THE RENDER SEAM: ONE LAKE, TWO REPRESENTATIONS (2026-08-25). The virtual-mass
 blend above lets the isosurface reach over SETTLED voxel water, which closes the
 geometric gap — and hands this shade a body of water the CA owns, described by

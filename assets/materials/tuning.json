@@ -887,7 +887,7 @@
       0.24
     ],
     "subScatterGain": 1,
-    "subVisibility": 11,
+    "subVisibility": 10,
     "subVignette": 0.34,
     "subSnellGain": 1.25,
     "bedCausticGain": 5.5,
