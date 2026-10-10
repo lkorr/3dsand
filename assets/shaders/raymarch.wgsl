@@ -7631,6 +7631,13 @@ fn giRequest(blockMin : vec3<i32>, face : u32, pidx : u32) {
   }
 }
 
+// The most one bounce may CARRY back into the grid, per channel: the P2
+// write-back's loop gain is min(albedo x giStrength, this) x the gather, and
+// the gather is a normalised mean (<= 1), so this < 1 is what makes the
+// multi-bounce iteration converge for every geometry and material. See the
+// write-back below for the ticket that measured it.
+const GI_TRANSPORT_GAIN_MAX : f32 = 0.8;
+
 fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>, albedo : vec3f) -> vec3f {
   let slot = chunkIndexW(cell);
   if (opennessGen[slot] != opennessStamp(worldChunkOf(cell))) { return farGiIrradiance(albedo, n); }
@@ -14701,16 +14708,16 @@ fn fs(in : VSOut) -> FSOut {
     // case gathers from the ground the tuft grows in, like the openness read.
     // TUNE_GI_STRENGTH = 0 folds the whole call away (the `nogi` arm).
     if (TUNE_GI_STRENGTH > 0.0) {
-      let bounce = albedo * ao * giBounceAt(hp, openN, openCell, albedo) * TUNE_GI_STRENGTH;
+      let gathered = giBounceAt(hp, openN, openCell, albedo);
+      let bounce = albedo * ao * gathered * TUNE_GI_STRENGTH;
       color += bounce;
       // ---- P2 write-back (docs/PLAN_gi.md §4) ----
       // This pixel's OUTGOING radiance — the direct term it just computed plus
       // the bounce it just gathered — blended into its own block-face at
       // TUNE_GI_FEEDBACK, so the next frame's gather at a neighbour sees light
       // that has already bounced once: Lin's "unlimited bounces" as a
-      // fixed-point iteration over frames. Bounded: each bounce is albedo ×
-      // the gather's 0.28 × giStrength of the last, and LoadTuning keeps that
-      // below 1. Racy against the resolve pass's deposits by design (same
+      // fixed-point iteration over frames. Bounded by GI_TRANSPORT_GAIN_MAX
+      // below, NOT by LoadTuning's giStrength <= 3 clamp (see `carried`). Racy against the resolve pass's deposits by design (same
       // word, same blend); a slot whose stamp does not match is left to the
       // walk. Micro hits skip it — their cell is the ground below, and a tuft
       // is not that surface.
@@ -14726,7 +14733,27 @@ fn fs(in : VSOut) -> FSOut {
       if (TUNE_GI_FEEDBACK > 0.0 && !isMicro &&
           opennessGen[chunkIndexW(h.cell)] == opennessStamp(worldChunkOf(h.cell))) {
         let wi = irrIndexOfCell(h.cell, openFaceOfNormal(n));
-        let outgoing = albedo * sun + bounce;
+        // THE LOOP GAIN IS CAPPED PER CHANNEL, NOT ASSUMED (owner ticket
+        // 2026-10-09 "snow is glowing"). The bound above leaned on the
+        // gather's 0.28 wall-beside-a-floor form factor, but the gather is a
+        // NORMALISED mean radiance (gi_gather.wgsl: weights sum to 1), so a
+        // face in a nook -- a terrace riser, a gap between ice columns, where
+        // most of the nine rays land on more of the same -- sees up to 1, and
+        // the per-bounce gain is albedo x giStrength itself. Snow (#fbfdff,
+        // x1.065 grain) at the shipped giStrength 2 is ~2.1: the fixed point
+        // does not exist and the word climbs to rgb9e5's ceiling over a
+        // session. Ice (#bfe4f5) runs away in green and blue while red still
+        // converges, which is why it glowed CYAN; blood-stained cells did not
+        // glow only because the stain darkens their albedo below the edge.
+        // At giStrength 3 the whole harness overlook whites out in ~1,500
+        // frames. Capping what each bounce CARRIES at GI_TRANSPORT_GAIN_MAX
+        // keeps the gain below 1 for any geometry and any material, and
+        // leaves every surface whose albedo x giStrength is already below the
+        // cap (grass, rock, dirt, wood -- nearly everything) exactly as it
+        // was. The displayed `bounce` keeps the full artistic giStrength.
+        let carried = min(albedo * TUNE_GI_STRENGTH, vec3f(GI_TRANSPORT_GAIN_MAX)) *
+                      (ao * gathered);
+        let outgoing = albedo * sun + carried;
         irradiance[wi] =
             packRgb9e5(mix(unpackRgb9e5(irradiance[wi]), outgoing, TUNE_GI_FEEDBACK));
       }
