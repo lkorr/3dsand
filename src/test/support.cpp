@@ -1468,6 +1468,10 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // tuning snapshot windMode comes from, so the value the kernel branches on
     // and the value Simulation gates Cond::Gas on are one read.
     tp.gasMode = (uint32_t)wtun.sim.gasMode;
+    // The lake reservoir's rate (sim_step.wgsl stage 5), from the same
+    // snapshot, per tick, so a gate's SetCurrentTuning reaches it without a
+    // pipeline rebuild.
+    tp.stillWaterRelax = (uint32_t)std::clamp(wtun.sim.stillWaterRelax, 0, 1024);
     // The two dev force multipliers, Q8. Rounded half-away-from-zero by hand
     // for the WindQuantize reason — the rounding mode is part of what the sim
     // sees, so it is written here rather than left to a compiler flag. At the

@@ -1141,6 +1141,14 @@ TP_I(sim, waterRelevelGain, TUNE_WATER_RELEVEL_GAIN, 8, 1, 256)
 // not an approximation, it is another body's block.
 TP_I(sim, waterRelevelDepth, TUNE_WATER_RELEVEL_DEPTH, 32, 0, kWaterRelevelDepthMax)
 
+// ---- THE RESERVOIR (sim_step.wgsl stage 5, bug 2026-10-10_03-17-54) ----
+// A map lake / river reach / sea surface cell the CA has finished with, off
+// its authored level, moves one eighth toward it with this chance per 1024
+// per CA visit (two visits a tick). 0 is the off switch and an exact
+// identity: stillWant returns before its first read. NO_WGSL: it reaches the
+// kernel as TickParams::stillWaterRelax (SubmitTick), so it is live.
+TP_I(sim, stillWaterRelax, NO_WGSL, 32, 0, 1024)
+
 // ---- SURFACE MOMENTUM (docs/PLAN_water_relevel.md W2) ----
 // The relevel relaxes and never overshoots. This is the overshoot: four
 // non-negative outflow pipes per column (Mei/O'Brien), so the columns beside a

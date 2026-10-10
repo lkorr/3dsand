@@ -3098,6 +3098,18 @@ struct Tuning {
     // bucket and is treated as deep.
     int waterRelevelDepth = TPD(sim, waterRelevelDepth);
 
+    // ---- the reservoir (sim_step.wgsl stage 5) ----
+    //
+    // A map lake, a river reach and the sea are bigger than the residency
+    // window, so a mound a blast leaves on one is nothing once spread over the
+    // whole of it, and a dent is refilled from it. The reach-1 CA provably
+    // cannot do either (it leaves a ramp of one eighth per two cells and a
+    // frozen one-eighth rim), so once the CA has nothing left to do for a
+    // free-surface cell of such water, the cell moves one eighth toward the
+    // authored level with this chance per 1024 per CA visit (two a tick).
+    // 32 drains a full eighth-stack cell in ~4 s; 0 turns the stage off.
+    int stillWaterRelax = TPD(sim, stillWaterRelax);
+
     // ---- W2: surface momentum (docs/PLAN_water_relevel.md §4) ----
     //
     // The relevel RELAXES: every column moves toward the body's mean and stops.

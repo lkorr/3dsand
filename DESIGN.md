@@ -20621,6 +20621,74 @@ a 256-eighth slack with nothing else changed). That is the same discipline
 passes R, N and S already state in their own words; the wave's own conservation
 is asserted exactly, on its own fixture, by S and T.
 
+### 5b.12 The reservoir — map lakes, rivers and the sea hold their level (added 2026-10-10)
+
+Bug report 2026-10-10_03-17-54: a blast on the bed of Mirrormere (a `map.json
+lakes[]` polygon) left a terraced MOUND standing on the surface, and dents
+beside it, for good. Two separate defects, both fixed:
+
+**1. Map lakes, river reaches and the sea were never bodies.** §5b's machinery
+only knows disc `water` sites, tarns and discovered pools — finite things inside
+the window. A map lake is kilometres across, so nothing but the reach-1 CA ever
+levelled it, and §5b.8 proves where the CA stops: a ramp of one eighth per two
+cells, plus a one-eighth film rim that cannot split and so never moves. That is
+exactly the terraced dome in the report.
+
+The fix is the model a real lake has: the residency window holds a few dozen
+metres of a body far larger than it, so a mound's worth of water spread over the
+whole of it is nothing, and a dent is refilled from it. **The far field is a
+reservoir held at the authored level.** `sim_step.wgsl` gains a stage 5 (THE
+RESERVOIR), run only when stages 1–4 found nothing for a cell to do, so the CA
+spreads the water first and the reservoir takes the residue the CA provably
+cannot:
+
+* EXCESS — a free-surface cell (air directly above) up to 8 voxels ABOVE the
+  level, standing on this same water, gives one eighth back;
+* DEFICIT — a free-surface cell AT the level that is not full, or a full one up
+  to 2 voxels below it, standing on anything, takes one eighth (into itself, or
+  as a fresh one-eighth cell in the air above).
+
+Each with chance `sim.stillWaterRelax`/1024 per CA visit (two a tick; 32 ships:
+a full cell of excess sinks in ~4 s). The level comes from worldgen: `cols`
+writes a per-WINDOW-column STILL-WATER TABLE (binding 58, `stillWater`, two
+words per column: a world-column tag and `level | mat << 20`) for every column
+`waterApply` shaped into a lake or river reach, and every column under the sea.
+Disc ponds are deliberately absent — they are bodies, and a reservoir under one
+would refill a pond its drain is emptying. The table is derived data (a pure
+function of seed, map and column; not hashed, not saved), and the tag makes a
+record from another world column read as "none", never as its level.
+
+Properties: the write is the acting cell's own (or the air cell above it),
+inside the colour lattice's reach; the roll is `hash3(seed, tick, substep, world
+cell)`; every write moves the surface one eighth TOWARD the level and never past
+it, so it terminates, and the generated lake (every column full to the level,
+air above) is already its fixed point — an untouched lake never enters the
+stage. A cell whose roll fails keeps only its own chunk awake (`DIRTY_R_REACT`),
+and only while it is off level. It is a SOURCE and a SINK, deliberately, in the
+class evaporation and rain already are; it is not on the conservation ledgers
+because it is not in a body. Known consequences: a channel cut out of a map lake
+runs for as long as it is open (a big lake is a spring), and a water container
+standing IN a lake within 8 voxels of its surface drains to the lake's level.
+`sim.stillWaterRelax` rides `TickParams::stillWaterRelax` (it was `padWi0`), so
+the F1 slider and a gate's control arm move it without a pipeline rebuild.
+
+**2. The body relevel could not see a mound.** `wbColumnSurface` started its
+walk at `level + 1` and gave up the moment the cell above was more water, so
+every column standing two or more voxels over a body's level reported nothing —
+the excess never reached the histogram and the mean never moved. It now climbs
+to the top of its own water first (at most `WB_RV_CLIMB` = 16 cells; taller is
+something standing in the lake, and stays unmeasured). A flat lake pays the same
+one read it did. Gives from a mound column write the top cell, which holds water
+with air above and so is a real page; takes stay clamped to `level + 1`.
+
+**Gate `lake-settle`** (`selftest_lakesettle.cpp`, the `rivers` seam): one
+synthetic map lake. A rest; B a lake-bed blast with the stage OFF (must stay off
+level, or the fixture proves nothing); C the same blast with it on (flat and
+asleep inside `lakeSettle.ticks`); D a 12x12x3 mound dropped on the surface; E
+two layers dug out of it; F a twice-run of a one-layer mound + dent at the same
+tick numbers, hashed. Every arm prints its off-level curve (columns off, eighths
+off, highest, lowest, awake), so a failure says which half did not finish.
+
 ## 9d. The current field, and surface waves (added 2026-08-29)
 
 `docs/PLAN_water_master.md` components 8 and 9 (milestone M4, "it looks alive").

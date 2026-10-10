@@ -4115,7 +4115,151 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
   }
   // 4) last resort: level two of the neighbours THROUGH this cell. Same scan and
   //    same predicate as the moving path — one function, so they cannot drift.
-  return !submerged && bridgeLevel(c, mat, false);
+  if (!submerged && bridgeLevel(c, mat, false)) { return true; }
+  // 5) the reservoir: same predicate as stepLiquid's stage 5.
+  return stillWant(c, mat, f) != STILL_NONE;
+}
+
+// ============================ 5) THE RESERVOIR ==============================
+// Bug report 2026-10-10_03-17-54: a blast at the bottom of a map lake leaves a
+// terraced MOUND of water standing on the surface (and dents beside it) that
+// never goes away. Nothing above can remove it, and that is proven rather than
+// tuned (memory note gotcha-ca-liquid-levelling-limit): the equalize branch
+// needs a 2-eighth step and bridgeLevel a 2-eighth step two cells apart, so a
+// ramp of one eighth per two cells is a FIXED POINT of every reach-1 rule, and
+// a film of one eighth cannot split at all, so the rim of the mound is frozen
+// where it stopped. The water-body ledger (sim_waterbody.wgsl) is the global
+// operation that flattens a FINITE pond; a map lake, a river reach and the sea
+// are not bodies -- they are bigger than the window -- and nothing levelled
+// them at all.
+//
+// For those, the honest model is the one a real lake has: the residency window
+// is a few dozen metres of a body kilometres across, so a mound's worth of
+// water spread over the whole of it is NOTHING, and a dent is refilled from it.
+// The far field is a reservoir held at its authored level. So:
+//
+//   * EXCESS: a free-surface cell ABOVE the authored level, standing on this
+//     same water (it is part of the lake, not a bucket on a pier), gives one
+//     eighth back to the reservoir;
+//   * DEFICIT: a free-surface cell AT the level that is not full, or BELOW it
+//     by at most STILL_BAND_DOWN that is full, standing on anything, takes one
+//     eighth from it -- into itself, or as a fresh one-eighth cell above it.
+//
+// The authored level is worldgen's (worldgen.wgsl's still-water table, binding
+// 58): a map lake's `level`, a river reach's flat surface, the sea. Disc ponds
+// are not in it -- they are bodies, and their ledger already levels them to
+// their own mean.
+//
+// WHY IT IS STAGE 5 AND NOT A PASS. It runs only when stages 1-4 found nothing
+// for this cell to do, so the CA spreads the water first, as water spreads, and
+// the reservoir takes the residue the CA PROVABLY cannot -- a lake does not
+// visibly suck a splash in, it lets it run out and then it is gone. And it
+// writes only its own cell (or the air cell directly above it), inside the
+// colour lattice's reach-1 guarantee, so it needs no mark/apply.
+//
+// TERMINATION (rule 2), and it is a strict one: every write moves the cell's
+// surface one eighth TOWARD the authored level and never past it, so
+// SUM |8 y + f - 8 level - 8| over the lake's surface strictly decreases, and a
+// surface at the level -- every column full to `level`, air above -- has no
+// cell in either branch. That is also exactly what worldgen generates, so an
+// untouched lake never enters this stage and costs one table read per surface
+// cell the CA visits for some other reason. A cell whose roll fails keeps only
+// its OWN chunk awake (DIRTY_R_REACT: "matched, did not fire"), and only while
+// it is off-level.
+//
+// MASS. This is a source and a sink, deliberately -- the reservoir is the
+// world past the window, which the voxel grid does not hold. It is the same
+// class of term evaporation and rain already are, and like them it is bounded
+// per cell and per tick by the roll.
+//
+// RULE 1. The roll is hash3 of (seed, tick, substep, world cell): stateless,
+// order-free, and the write is the acting cell's own.
+@group(0) @binding(58) var<storage, read> stillWater : array<u32>;
+// STILL_WORDS / stillIndex / stillTag: worldgen.wgsl's, written out again
+// (the WRITER is `cols`). Must agree; `--gate lake-settle` fails if not.
+const STILL_WORDS : u32 = 2u;
+fn stillIndex(x : i32, z : i32) -> u32 {
+  return (bitcast<u32>(z & WORLD_MASK) * WORLD_N + bitcast<u32>(x & WORLD_MASK)) * STILL_WORDS;
+}
+fn stillTag(x : i32, z : i32) -> u32 {
+  let tx = bitcast<u32>(x >> firstTrailingBit(WORLD_N)) & 0x7FFFu;
+  let tz = bitcast<u32>(z >> firstTrailingBit(WORLD_N)) & 0x7FFFu;
+  return 1u | (tx << 1u) | (tz << 16u);
+}
+// How far above the level the EXCESS branch reaches, in voxels: a mound is a
+// few voxels tall, and a cap keeps a column of water stacked in something
+// standing in the lake (a flooded tower) out of it.
+const STILL_BAND_UP : i32 = 8;
+// How far below the level a FULL cell grows upward. Small on purpose: a
+// deeper dip is the CA's (a lateral split off the level row fills it fast),
+// and a cell well under the level with air over it is a pocket under the bed,
+// which the lake has no business filling.
+const STILL_BAND_DOWN : i32 = 2;
+const STILL_SALT : u32 = 0x5711A7E5u;
+const STILL_NONE : u32 = 0u;
+const STILL_GIVE : u32 = 1u;     // one eighth off this cell
+const STILL_TAKE : u32 = 2u;     // one eighth into this cell
+const STILL_GROW : u32 = 3u;     // a one-eighth cell into the air above
+
+// Which branch, if any, cell c (liquid `mat`, fullness f) is in. PURE READ:
+// canFlowAnywhere asks it too, and the two must agree.
+fn stillWant(c : vec3<i32>, mat : u32, f : u32) -> u32 {
+  if (T.stillWaterRelax == 0u) { return STILL_NONE; }
+  let si = stillIndex(c.x, c.z);
+  if (stillWater[si] != stillTag(c.x, c.z)) { return STILL_NONE; }
+  let v = stillWater[si + 1u];
+  if (v == 0u || (v >> 20u) != mat) { return STILL_NONE; }
+  let level = bitcast<i32>(v << 12u) >> 12u;
+  let dy = c.y - level;
+  if (dy > STILL_BAND_UP || dy < -STILL_BAND_DOWN) { return STILL_NONE; }
+  // A FREE SURFACE: air directly above. Ice, a raft, a roof or more water
+  // over it and this is not the surface the level is about.
+  let a = c + vec3<i32>(0, 1, 0);
+  let b = c - vec3<i32>(0, 1, 0);
+  if (!inBounds(a) || !inBounds(b)) { return STILL_NONE; }
+  if (voxMat(voxWordAt(a)) != MAT_AIR) { return STILL_NONE; }
+  // Dissolved mass would need a home when its solvent shrinks; a lake's own
+  // water carries none, and a brine slick is left to the CA.
+  if (solValueAt(c) != 0u) { return STILL_NONE; }
+  // A sentinel chunk has no word to write (a whole-water chunk whose top row
+  // is this cell): leave it, rather than fault the store.
+  if (voxWordIndex(c) == PT_NO_WORD) { return STILL_NONE; }
+  let bm = voxMat(voxWordAt(b));
+  if (dy > 0) {
+    // Standing on the lake itself, not on a pier, a raft or a bank.
+    return select(STILL_NONE, STILL_GIVE, bm == mat);
+  }
+  // At or under the level, resting on something (the lake or its bed).
+  if (bm == MAT_AIR) { return STILL_NONE; }
+  if (f < 8u) { return STILL_TAKE; }
+  if (dy < 0 && voxWordIndex(a) != PT_NO_WORD) { return STILL_GROW; }
+  return STILL_NONE;
+}
+
+// Stage 5 proper: roll, and on a hit move one eighth. Returns whether it wrote.
+fn stillReservoir(c : vec3<i32>, mat : u32, f : u32) -> bool {
+  let want = stillWant(c, mat, f);
+  if (want == STILL_NONE) { return false; }
+  let roll = hash3(T.seed ^ STILL_SALT, T.tick * 4u + P.substep, cellIndexW(c)) & 1023u;
+  if (roll >= T.stillWaterRelax) {
+    markDirtyR(c, DIRTY_R_REACT);   // matched, did not fire: own chunk only
+    return false;
+  }
+  let stamp = stampFor(T.tick, P.substep);
+  let iw = voxIndexAndWord(c);
+  if (want == STILL_GIVE) {
+    if (f <= 1u) { voxStore(iw.x, 0u); }
+    else { voxStore(iw.x, packVoxKeepStain(mat, f - 2u, stamp, iw.y)); }
+  } else if (want == STILL_TAKE) {
+    voxStore(iw.x, packVoxKeepStain(mat, f, stamp, iw.y));
+  } else {
+    let ai = voxWordIndex(c + vec3<i32>(0, 1, 0));
+    voxStore(ai, packVoxKeepStain(mat, 0u, stamp, 0u));
+    markVoxActive(ai);
+  }
+  markVoxActive(iw.x);
+  markDirtyR(c, DIRTY_R_MOVE | DIRTY_R_WATERBODY);
+  return true;
 }
 
 // Mass-conserving liquid flow (fullness in eighths, DESIGN.md §4).
@@ -4347,6 +4491,10 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
     markDirtyR(c, DIRTY_M_BRIDGE | sub);
     return true;
   }
+  // 5) nothing the CA can do -- but if this is a map lake / river / sea
+  //    surface off its authored level, the reservoir can. See THE RESERVOIR.
+  //    `submerged` cells never qualify (it needs air above).
+  if (!submerged && stillReservoir(c, mat, f)) { return true; }
   return false;  // settled — the caller decides whether to stay awake
 }
 
