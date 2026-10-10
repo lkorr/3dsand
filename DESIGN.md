@@ -7836,6 +7836,44 @@ neighbors, so this needs an explicit connectivity pass:
      exactly as it was, still rigid and still at speed. Both escape hatches keep
      their meaning at rig scope (any member that STARTED outside lets the whole
      rig through; the hold counter is keyed on the rig's first live body).
+  5. **Freefall and cliff grazing (2026-10-09, gates `freefall` and
+     `freefall-slope`; ticket 2026-10-09_15-16-57).** Attributed with
+     `DebrisSystem::NeedProbe` (per chunk: when listed, at what rank, when
+     requested, when cached and built, and how often it was passed over by
+     the ceiling, the fetch budget, known sky, the gather and build budgets):
+     - A creature anchor's lookahead sweeps the **box of its radius**, not its
+       centre line, and orders the corridor by **arrival** (distance along the
+       path added to the box distance), so the fetch budget serves the chunk
+       the rig enters next first. A centre-line sweep listed one chunk column
+       while a rig's limbs spread into the columns beside it. Debris bodies
+       keep the one-chunk line (their lattice is listed by `needBody`).
+     - A limp anchor is the **live pelvis** (`Mob::RegisterTerrainAnchor`),
+       not `origin_`, which was two ticks stale.
+     - **The mirror seeds the fetch cache** (`World::SeedCacheFromMirror`):
+       every published snapshot's 27 mirror chunks go into the cache where it
+       holds no copy yet. The mirror leads a moving body (`MirrorLeadChunk`),
+       so the chunks a falling rig enters arrive with no fetch round trip.
+       Absent entries only, so no consumer sees a version churn.
+       `SANDVOX_NO_MIRROR_SEED=1` is the A/B arm.
+     - **One known-sky verdict per tick**: a chunk the sweep skipped as
+       `SkyKnown` stays vouched for the step it clamps, even if the snapshot
+       published in between shows matter there (a rig's own blood spray).
+     - **A patch is re-gathered when a guess it was built on stops holding**
+       (`TerrainEntry::outMask`/`missMask`): a neighbour that was OUTSIDE the
+       window reads as solid, and one in-window but uncached (and not
+       counted empty by the snapshot) reads as air. Before, a patch was only
+       rebuilt when its own chunk changed, so a window face polygonized as a
+       wall stayed a wall in open sky once the window had followed the body
+       past it. `SANDVOX_NO_TERRAIN_BORDER=1` is the A/B arm.
+     - **A lethal arrest is billed the tick it becomes lethal**
+       (`Mob::TakeRagdollImpact` / `ArrestIsLethal`). The hold-until-quiet rule
+       exists so a fold cannot bill twice, and a splat cannot bill twice
+       anyway. Holding it put the splat in the wrong place: the rig bounced off
+       a cliff face and burst in open air three ticks later, or lay still at
+       the foot of a fall for six ticks and then burst.
+     - **The limp hand-over is seated**: `PlayerAvatar::RagdollFollow` keeps
+       the capsule's offset from the pelvis on the first limp tick and eases
+       it to the 0.2 m lift, rather than popping half a voxel up.
 
 ### A corpse in armour is not allowed to be a motor (2026-09-13; `Physics::SweepRunawayRigs`, gate `corpse-armor`)
 

@@ -970,13 +970,37 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
 }
 
 bool PlayerAvatar::RagdollFollow(Vec3& outPlayerPos) const {
-  if (!spawned_ || !alive_ || !def_ || !Ragdolled()) return false;
+  if (!spawned_ || !alive_ || !def_ || !Ragdolled()) {
+    limpFollowing_ = false;
+    return false;
+  }
   const MobDef& def = *def_;
   if (ragdoll_ == RagdollPhase::Limp) {
     // The pelvis body's origin is its lattice corner; lift a little so the
     // camera boom pivots inside the body rather than at its underside.
-    outPlayerPos = RootWorldPos() + Vec3{0.0f, MetresToCells(0.2f), 0.0f};
+    //
+    // THE HAND-OVER IS SEATED, NOT SNAPPED. The live capsule stood 1.5 voxels
+    // over the pelvis and this lift is 2, so the tick a fall went limp the
+    // capsule (and the camera on it) popped half a voxel UP against the fall
+    // and the next tick fell 1.5x its step to make up for it -- the
+    // `freefall` gate's one remaining jerk (2026-10-09). The first limp tick
+    // keeps whatever offset the capsule had from the pelvis (`outPlayerPos`
+    // comes in holding the capsule's position), and it eases to the lift
+    // over the next ~half second, a few hundredths of a voxel a tick.
+    const Vec3 root = RootWorldPos();
+    const Vec3 lift{0.0f, MetresToCells(0.2f), 0.0f};
+    if (!limpFollowing_) {
+      limpFollowing_ = true;
+      limpOffset_ = outPlayerPos - root;
+      // A capsule nowhere near the body (a caller with nothing to seat, a
+      // teleport) starts at the lift.
+      if (!(limpOffset_.len() < 8.0f)) limpOffset_ = lift;
+    } else {
+      limpOffset_ = limpOffset_ + (lift - limpOffset_) * 0.12f;
+    }
+    outPlayerPos = root + limpOffset_;
   } else {
+    limpFollowing_ = false;
     // The standing spot: the inverse of the origin_ line in PreTick.
     outPlayerPos = Vec3{origin_.x + def.worldSize.x * 0.5f,
                         origin_.y + Player::kHalfY,

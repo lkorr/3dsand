@@ -458,6 +458,9 @@ const char* const kOrder[] = {
     "player-crouch",
     "player-fastfall",
     "freefall",
+    // After freefall, and like `altitude` it loads `peaks` and puts the
+    // harness map and window back (worldgen regenerated) before it returns.
+    "freefall-slope",
     "player-plants",
     // TWO PLAYERS IN ONE WORLD (M9.1 P3). Here, with the other player gates,
     // and NOT beside `tick-input` at the front of the list even though they are

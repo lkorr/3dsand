@@ -272,7 +272,11 @@ class PlayerAvatar : public Mob {
   // The capsule itself is inert meanwhile — no gravity, no sweeps, no
   // impact latch — which is also why a body knocked flying by a blast does
   // not take fall damage on landing: the controller never saw the fall.
+  // `outPlayerPos` comes IN holding the capsule's current position: the first
+  // limp tick seats the follow offset from it (no pop at the hand-over).
   bool RagdollFollow(Vec3& outPlayerPos) const;
+  mutable bool limpFollowing_ = false;
+  mutable Vec3 limpOffset_{};
 
   // Impact damage is Mob::ApplyFallDamage (W2-H), driven for the player by
   // Player::impactDeltaV — the velocity a collision sweep refused, so falls
