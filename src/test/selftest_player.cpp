@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -23,8 +24,13 @@
                                // SAME free functions session.cpp's phases do
 #include "game/session.h"   // PrefetchChunksAround -- the gate and the real
                             // tick must call ONE definition of it
+#include "sim/biomes.h"
 #include "sim/materials.h"
+#include "sim/stream.h"
+#include "sim/treeatlas.h"
 #include "sim/tuning.h"
+#include "sim/worldgen_run.h"
+#include "sim/worldmap.h"
 #include "test/selftest.h"
 #include "test/support.h"
 #include "test/tickrig.h"
@@ -2779,8 +2785,13 @@ Status GateFreefall(Ctx& c, std::string& detail) {
     // while live, the pelvis less a margin while limp (the capsule follows the
     // pelvis then, RagdollFollow).
     float gap;
+    // The below chunk's NeedRec (DebrisSystem::NeedProbe), as ticks RELATIVE
+    // to this one (-1 = never): listed, requested, cached, built; and the
+    // pass-over counts.
+    std::string need;
   };
   std::vector<TickRow> rows;
+  c.debris.EnableNeedProbe(true);
   std::vector<float> frameEye, frameBody;   // per frame, airborne only
   bool spawned = false;
   int landTick = -1;
@@ -2835,6 +2846,22 @@ Status GateFreefall(Ctx& c, std::string& detail) {
         r.belowBuilt = c.debris.TerrainBuiltVersion(bw);
         r.belowCached = c.world.Cached(bw) != nullptr ? 1 : 0;
         r.belowSky = c.debris.SkyKnown(bw) ? 1 : 0;
+        if (const DebrisSystem::NeedRec* nr = c.debris.NeedProbe(bw)) {
+          const uint32_t now = rig.tick;
+          auto ago = [&](uint32_t t) { return t == 0 ? -1 : (int)(now - t); };
+          r.need = Format("need -%d rank %u req -%d cached -%d built -%d | ceil %u budget %u "
+                          "sky %u gather %u build %u",
+                          ago(nr->firstNeeded), nr->firstRank, ago(nr->firstRequested),
+                          ago(nr->firstCached), ago(nr->firstBuilt), nr->ceilingCut,
+                          nr->budgetDenied, nr->skyskipped, nr->gatherDeferred,
+                          nr->buildDeferred);
+        } else {
+          r.need = Format("never listed (%d,%d,%d) pos (%.1f,%.1f,%.1f) map %zu", bw.x, bw.y,
+                          bw.z, p.pos.x, p.pos.y, p.pos.z, c.debris.NeedProbeSize());
+        }
+        for (const auto& an : c.debris.ProbeAnchors())
+          r.need += Format(" | anchor (%.0f,%.0f,%.0f) v (%.0f,%.0f,%.0f)", an.first.x,
+                           an.first.y, an.first.z, an.second.x, an.second.y, an.second.z);
       }
       {
         const int bc = ifloor(p.pos.y) >> 4;
@@ -2887,6 +2914,7 @@ Status GateFreefall(Ctx& c, std::string& detail) {
     c.mobs.SetAvatar(nullptr);
     if (s.avatar.Spawned()) s.avatar.Despawn();
   }
+  c.debris.EnableNeedProbe(false);
   const bool landed = landTick >= 0;
   // Put the window back and regenerate: every gate after this in kOrder
   // assumes worldgen it did not move (selftest.h's ordering note).
@@ -2980,10 +3008,10 @@ Status GateFreefall(Ctx& c, std::string& detail) {
     const TickRow& r = rows[i];
     return Format("tick %d: y %.1f vy %.1f drop %.2f blind %d gnd %d limp %d held %d "
                   "[below: built %u cached %d sky %d] win.y %d mirror.y %d (body chunk %d) "
-                  "hipsRel %.2f hipsDy %.2f air %.2f loco %d %.1f ms",
+                  "hipsRel %.2f hipsDy %.2f air %.2f loco %d %.1f ms {%s}",
                   i, r.y, r.vy, r.drop, r.blind, r.grounded, r.limp, r.held, r.belowBuilt,
                   r.belowCached, r.belowSky, r.winY, r.mirY, ifloor(r.y) >> 4, r.hipsRel,
-                  r.hipsDy, r.air, r.loco, r.ms);
+                  r.hipsDy, r.air, r.loco, r.ms, r.need.c_str());
   };
   check(spawned, "the avatar never spawned");
   check(first >= 0, "the body never moved");
@@ -3035,8 +3063,365 @@ Status GateFreefall(Ctx& c, std::string& detail) {
   if (!fails.empty()) detail += " | " + fails;
   const bool ok = fails.empty();
   std::printf("freefall: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
-  if (std::getenv("SANDVOX_FREEFALL_DUMP"))
+  if (std::getenv("SANDVOX_FREEFALL_DUMP")) {
     for (size_t i = 0; i < rows.size(); i++) std::printf("  ff %s\n", rowAt((int)i).c_str());
+    std::printf("  ff %s\n", c.world.FetchReport().c_str());
+  }
+  return ok ? Status::Pass : Status::Fail;
+}
+
+
+// ---- freefall-slope ----------------------------------------------------------
+//
+// A LIMP BODY SKIPPING DOWN A MOUNTAINSIDE (bug report 2026-10-09_15-16-57).
+//
+// The owner jumped off a ~2 km mountain on the default map: the fall was
+// smooth while it touched nothing, glitchy while the body grazed and skipped
+// down the face, and SOMETIMES THE BODY HIT NOTHING IN THE AIR AND BURST.
+// `freefall` drops onto flat ground through open sky; this drops the real
+// player (non-fly, avatar spawned, window and mirror following the body, the
+// same arrangement) beside the `peaks` map's 300 m cliff band
+// (scripts/gen_map_peaks.py: a smoothstep over 420 voxels, ~10 voxels of rise
+// per voxel at its steepest) with a little speed INTO the face, so the limp rig
+// meets the face partway down and slides and tumbles the rest of it -- the
+// window shifting on two axes the whole way, which is what puts patches at its
+// faces.
+//
+// Claims, each attributed to the tick it failed on (CLAUDE.md rule 6):
+//   (A) NO RIG HOLDS. UntunnelRig holds a rig whose step ends in a chunk with
+//       no collider yet; a held rig hangs in the air for a tick. With the
+//       lookahead serving the body's whole extent there should be none.
+//   (B) NOTHING RELEASED into unvouched space.
+//   (C) NO ARREST IN OPEN AIR. A tick in which the pelvis lost more than
+//       `freefallSlope.airArrestMs` m/s (beyond gravity) while the nearest
+//       landform cell (World::TerrainHeight over a grid round it) is more than
+//       `freefallSlope.airClearVox` voxels away is a collision with nothing.
+//       Each is reported with what the colliders round the pelvis were built
+//       on (TerrainEntry outMask = a neighbour that was outside the window).
+//   (D) IT GETS DOWN: the body descends at least half the face.
+// SANDVOX_FREEFALL_DUMP=1 prints every tick's row.
+constexpr int kSlopeMaxTicks = 900;  // 30 s at 30 Hz
+
+Status GateFreefallSlope(Ctx& c, std::string& detail) {
+  const std::string dir = AssetDir();
+  auto fail = [&](const std::string& why) {
+    detail = why;
+    std::printf("freefall-slope: FAIL (%s)\n", why.c_str());
+    return Status::Fail;
+  };
+  biomes::BiomeSet set;
+  std::string log;
+  if (!biomes::LoadBiomeSet(dir, c.mats, set, log)) return fail("biome files did not load: " + log);
+  TreeAtlas atlas;
+  if (!LoadTreeAtlas(dir + "/trees", c.mats, set, atlas, log))
+    return fail("tree atlas did not load: " + log);
+  const worldmap::WorldMapData real = worldmap::CurrentWorldMap();  // a COPY
+  if (!real.Loaded()) return fail("no world map loaded");
+  worldmap::WorldMapData pk;
+  std::vector<uint32_t> words;
+  if (!worldmap::LoadWorldMap(dir, "peaks", set, c.mats.size(), kDefaultSeed, pk, log) ||
+      !worldmap::PackWorldMap(set, pk, words, log))
+    return fail("the peaks map did not load: " + log);
+  const IVec3 savedOrigin = c.world.WindowOrigin();
+  c.ctx.WaitIdle();
+  worldmap::SetCurrentWorldMap(pk);
+  c.sim.UploadEnvironment(c.ctx.device, c.ctx.queue, atlas, words);
+
+  // The face at x = 0: the band's centreline is z = -8000 there and the land
+  // to +z stands 300 m higher. Find the steepest column pair, then start the
+  // body off the low side of it, 60 m above the face's middle.
+  const int fx = 0;
+  int zMid = -7790, steepest = 0;
+  for (int z = -8100; z <= -7500; z += 4) {
+    const int d = World::TerrainHeight(fx, z + 4, kDefaultSeed) -
+                  World::TerrainHeight(fx, z, kDefaultSeed);
+    if (d > steepest) { steepest = d; zMid = z; }
+  }
+  const int hMid = World::TerrainHeight(fx, zMid, kDefaultSeed);
+  const int hTop = World::TerrainHeight(fx, zMid + 400, kDefaultSeed);
+  const int hFoot = World::TerrainHeight(fx, zMid - 400, kDefaultSeed);
+  const float startX = (float)fx + 0.5f;
+  const float startZ = (float)(zMid - 40) + 0.5f;
+  const float startY = (float)(hMid + 600) + Player::kHalfY;
+  const IVec3 startChunk{ifloor(startX) >> 4, ifloor(startY) >> 4, ifloor(startZ) >> 4};
+  const float g = CurrentTuning().player.gravity / kVoxelMeters;
+  const double airArrestMs = BaselineNumber("freefallSlope.airArrestMs", 6.0);
+  const double airClearVox = BaselineNumber("freefallSlope.airClearVox", 24.0);
+
+  // The nearest landform cell to p, from the CPU height function over a grid
+  // round it (cells inside the ground count 0). The landform is what
+  // TerrainHeight answers; the band is bare rock, so it is the face itself.
+  auto clearance = [&](Vec3 p) {
+    float best = 1e9f;
+    for (int dz = -40; dz <= 40; dz += 4)
+      for (int dx = -40; dx <= 40; dx += 4) {
+        const int x = ifloor(p.x) + dx, z = ifloor(p.z) + dz;
+        const float h = (float)World::TerrainHeight(x, z, kDefaultSeed);
+        const float up = std::max(0.0f, p.y - h);
+        best = std::min(best, std::sqrt((float)(dx * dx + dz * dz) + up * up));
+      }
+    return best;
+  };
+
+  c.debris.Reset();
+  c.debris.ResetUntunnelProbe();
+  c.mobs.Reset(true);
+  c.mobs.ClearRisings();
+  c.stream.OnRegen();
+  c.world.SetWindowOrigin({startChunk.x - (int)kNChunk / 2, startChunk.y - (int)kNChunk / 2,
+                           startChunk.z - (int)kNChunk / 2});
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  struct Row {
+    Vec3 hips, hv;
+    int limp = 0, held = 0, alive = 1, bills = 0;
+    float clear = 0.0f, lost = 0.0f;
+    int outPatches = 0;  // patches round the pelvis built against an out-of-window neighbour
+    float ms = 0.0f;
+    std::string why;     // a held tick: the unvouched chunk and its NeedProbe
+  };
+  std::vector<Row> rows;
+  std::string crossing;
+  uint32_t bordersBefore = c.debris.Settle().terrainBorderStale;
+  c.debris.EnableNeedProbe(true);
+  {
+    support::TickRig rig(c, 92000u, startChunk);
+    rig.Authority().harness.pinWindow = false;
+    rig.Authority().harness.haveSubmitChunk = false;
+    PlayerSession& s = rig.Session();
+    s.avatar.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+    s.avatar.SetDefs(&c.mobs.Defs(), kAvatarDefName);
+    c.mobs.SetAvatar(&s.avatar);
+    s.player.fly = false;
+    s.player.grounded = false;
+    // A step toward the face (+z), the way a jump off a ledge carries one.
+    s.player.vel = Vec3{0.0f, 0.0f, 30.0f};
+    s.player.pos = Vec3{startX, startY, startZ};
+    s.player.SnapRender();
+    const int hips = s.avatar.PartIndex("hips");
+    uint32_t prevHolds = c.debris.Untunnel().rigHolds;
+    uint32_t prevBills = 0;
+    Vec3 prevHv{};
+    bool havePrev = false;
+    int stillTicks = 0;
+    for (int i = 0; i < kSlopeMaxTicks; i++) {
+      const double t0 = NowSeconds();
+      support::RunTicks(rig, 1);
+      Row r;
+      r.ms = (float)((NowSeconds() - t0) * 1000.0);
+      const uint32_t h = c.debris.Untunnel().rigHolds;
+      r.held = (int)(h - prevHolds);
+      prevHolds = h;
+      if (r.held) {
+        const IVec3 uc = c.debris.Untunnel().lastChunk;
+        const uint32_t now = rig.tick;
+        auto ago = [&](uint32_t t) { return t == 0 ? -1 : (int)(now - t); };
+        if (const DebrisSystem::NeedRec* nr = c.debris.NeedProbe(uc))
+          r.why = Format("unvouched (%d,%d,%d): need -%d rank %u req -%d cached -%d built -%d "
+                         "| ceil %u budget %u sky %u gather %u build %u",
+                         uc.x, uc.y, uc.z, ago(nr->firstNeeded), nr->firstRank,
+                         ago(nr->firstRequested), ago(nr->firstCached), ago(nr->firstBuilt),
+                         nr->ceilingCut, nr->budgetDenied, nr->skyskipped, nr->gatherDeferred,
+                         nr->buildDeferred);
+        else
+          r.why = Format("unvouched (%d,%d,%d): never listed", uc.x, uc.y, uc.z);
+      }
+      r.limp = s.avatar.Spawned() && s.avatar.Ragdolled() ? 1 : 0;
+      r.alive = s.avatar.Spawned() && s.avatar.Alive() ? 1 : 0;
+      const uint32_t bills = s.avatar.Spawned() ? s.avatar.FallsBilled() : prevBills;
+      r.bills = (int)(bills - prevBills);
+      prevBills = bills;
+      Vec3 hp = s.player.pos;
+      Quat hq{};
+      if (hips >= 0 && s.avatar.Spawned()) s.avatar.PartWorldTransform(hips, hp, hq);
+      r.hips = hp;
+      Vec3 lin{}, ang{};
+      const uint64_t hb = hips >= 0 && s.avatar.Spawned() ? s.avatar.PartBody(hips) : 0;
+      if (hb != 0 && c.phys.GetBodyVelocities(hb, lin, ang)) r.hv = lin;
+      else r.hv = s.player.vel;
+      r.clear = clearance(hp);
+      if (havePrev) {
+        const Vec3 expect = prevHv + Vec3{0.0f, -g * kTickDt, 0.0f};
+        r.lost = (expect - r.hv).len() * kVoxelMeters;  // m/s
+      }
+      {
+        const IVec3 pc{ifloor(hp.x) >> 4, ifloor(hp.y) >> 4, ifloor(hp.z) >> 4};
+        for (int dz = -1; dz <= 1; dz++)
+          for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++) {
+              uint32_t om = 0, mm = 0;
+              if (c.debris.TerrainBorder({pc.x + dx, pc.y + dy, pc.z + dz}, om, mm) && om != 0)
+                r.outPatches++;
+            }
+      }
+      // THE CROSSING (as `freefall` reports it): the first tick the pelvis is
+      // inside the landform, and what every collision source said about the
+      // chunks round it at that moment.
+      if (crossing.empty() && hp.y < (float)World::TerrainHeight(ifloor(hp.x), ifloor(hp.z),
+                                                                 kDefaultSeed) - 8.0f) {
+        const IVec3 pc{ifloor(hp.x) >> 4, ifloor(hp.y) >> 4, ifloor(hp.z) >> 4};
+        crossing = Format("crossed the ground at tick %d (pelvis chunk (%d,%d,%d), linearCast %d):",
+                          i, pc.x, pc.y, pc.z, hb != 0 && c.phys.UsesLinearCast(hb) ? 1 : 0);
+        const WorldSnapshot& sn = c.world.Snap();
+        for (int dy = 1; dy >= -1; dy--) {
+          const IVec3 q{pc.x, pc.y + dy, pc.z};
+          uint32_t om = 0, mm = 0;
+          const bool body = c.debris.TerrainBorder(q, om, mm);
+          const uint32_t occ = sn.valid && sn.occupancy.size() >= kNumChunks
+                                   ? sn.occupancy[World::SlotChunkIndex(q)] : 0xFFFFFFFFu;
+          crossing += Format(" [y%+d built %u body %d out %x miss %x vouched %d cached %d sky %d occ %u]",
+                             dy, c.debris.TerrainBuiltVersion(q), body ? 1 : 0, om, mm,
+                             c.debris.ColliderVouched(q) ? 1 : 0, c.world.Cached(q) ? 1 : 0,
+                             c.debris.SkyKnown(q) ? 1 : 0, occ);
+        }
+      }
+      prevHv = r.hv;
+      havePrev = true;
+      rows.push_back(r);
+      // Settled: a limp (or dead) body that has stopped for two seconds.
+      if (r.limp && r.hv.len() * kVoxelMeters < 0.5f) stillTicks++;
+      else stillTicks = 0;
+      if (stillTicks >= 60) break;
+    }
+    c.mobs.SetAvatar(nullptr);
+    if (s.avatar.Spawned()) s.avatar.Despawn();
+  }
+  c.debris.EnableNeedProbe(false);
+  const uint32_t borders = c.debris.Settle().terrainBorderStale - bordersBefore;
+  // WHAT THE HELD-FOR CHUNKS HELD, read from the mirror cache now that they
+  // have landed: the material in each, by count (attribution for (A)).
+  std::string heldWhat;
+  {
+    std::vector<IVec3> seen;
+    for (const Row& r : rows) {
+      if (!r.held) continue;
+      int ux, uy, uz;
+      if (std::sscanf(r.why.c_str(), "unvouched (%d,%d,%d)", &ux, &uy, &uz) != 3) continue;
+      const IVec3 uc{ux, uy, uz};
+      bool dup = false;
+      for (const IVec3& q : seen) dup = dup || (q.x == uc.x && q.y == uc.y && q.z == uc.z);
+      if (dup || seen.size() >= 6) continue;
+      seen.push_back(uc);
+      const CachedChunk* cc = c.world.Cached(uc);
+      if (!cc || cc->voxels.size() != kChunkVol) {
+        heldWhat += Format(" (%d,%d,%d): not cached;", uc.x, uc.y, uc.z);
+        continue;
+      }
+      std::map<uint32_t, int> n;
+      for (uint32_t w : cc->voxels)
+        if ((w & 0xFFFu) != 0u) n[w & 0xFFFu]++;
+      heldWhat += Format(" (%d,%d,%d):", uc.x, uc.y, uc.z);
+      if (n.empty()) heldWhat += " empty";
+      for (const auto& [m, k] : n)
+        heldWhat += Format(" %s(class %u) x%d", m < c.mats.size() ? c.mats[m].name.c_str() : "?",
+                           m < c.mats.size() ? c.mats[m].gpu.klass : 99u, k);
+      heldWhat += ";";
+    }
+  }
+  const auto ut = c.debris.Untunnel();
+
+  // ---- the pristine world back (as `altitude` does) --------------------------
+  std::string restoreWhy;
+  {
+    biomes::EnvironmentStamp stamp;
+    std::string l;
+    if (!ReloadEnvironment(c.ctx, c.sim, c.mats, stamp, l)) {
+      worldmap::SetCurrentWorldMap(real);
+      restoreWhy = "ReloadEnvironment REFUSED afterwards: " + l;
+    }
+    c.stream.OnRegen();
+    c.world.SetWindowOrigin(savedOrigin);
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    DrainFullRefill(c.ctx, c.world, c.sim, IVec3{108 >> 4, 122 >> 4, 108 >> 4});
+  }
+
+  // ---- the analysis -----------------------------------------------------------
+  int holds = 0, firstHold = -1, airArrests = 0, firstAir = -1, contacts = 0, firstContact = -1;
+  int airBills = 0, outAtAir = 0, splatAway = 0, splatAwayAt = -1;
+  float worstAir = 0.0f;
+  int worstAirAt = -1;
+  std::string billList;
+  for (int i = 0; i < (int)rows.size(); i++) {
+    const Row& r = rows[i];
+    if (r.held) { holds++; if (firstHold < 0) firstHold = i; }
+    if (r.clear < 6.0f && firstContact < 0) firstContact = i;
+    if (r.clear < 6.0f) contacts++;
+    // A bill is made in the tick's PreTick, from the arrest the PREVIOUS
+    // step produced, at the pelvis as that step left it: the previous row's.
+    const float billClear = i > 0 ? rows[i - 1].clear : r.clear;
+    if (r.bills)
+      billList += Format(" t%d(clear %.0f%s)", i, billClear, r.alive ? "" : " dead");
+    // THE SPLAT IS WHERE THE BODY HIT. A lethal bill (the tick the body dies
+    // of a fall) with the pelvis clear of every landform cell is a body that
+    // burst away from what killed it -- after bouncing off it, or lying still
+    // beside it (Mob::TakeRagdollImpact's lethal exception).
+    if (r.bills && !r.alive && i > 0 && rows[i - 1].alive && billClear > 8.0f) {
+      splatAway++;
+      if (splatAwayAt < 0) splatAwayAt = i;
+    }
+    // Skip the tick the avatar goes limp (a hand-over from the controller's
+    // velocity to the solver's) and the death tick (a splat reseeds the rig).
+    const bool handover = i > 0 && (rows[i - 1].limp != r.limp || rows[i - 1].alive != r.alive);
+    if (i == 0 || handover) continue;
+    if (billClear > (float)airClearVox && r.bills) airBills++;
+    if (r.lost > (float)airArrestMs && r.clear > (float)airClearVox) {
+      airArrests++;
+      if (firstAir < 0) firstAir = i;
+      outAtAir += r.outPatches;
+      if (r.lost > worstAir) { worstAir = r.lost; worstAirAt = i; }
+    }
+  }
+  const float startHipsY = rows.empty() ? 0.0f : rows.front().hips.y;
+  float lowest = startHipsY;
+  for (const Row& r : rows) lowest = std::min(lowest, r.hips.y);
+  const float descended = startHipsY - lowest;
+  auto rowAt = [&](int i) -> std::string {
+    if (i < 0 || i >= (int)rows.size()) return "-";
+    const Row& r = rows[i];
+    return Format("tick %d: hips (%.1f,%.1f,%.1f) v (%.1f,%.1f,%.1f) m/s lost %.1f m/s clear %.1f "
+                  "limp %d alive %d held %d bills %d outPatches %d %.1f ms %s",
+                  i, r.hips.x, r.hips.y, r.hips.z, r.hv.x * kVoxelMeters, r.hv.y * kVoxelMeters,
+                  r.hv.z * kVoxelMeters, r.lost, r.clear, r.limp, r.alive, r.held, r.bills,
+                  r.outPatches, r.ms, r.why.c_str());
+  };
+  RecordObserved("freefallSlope.rigHolds", (double)holds);
+  RecordObserved("freefallSlope.airArrests", (double)airArrests);
+  RecordObserved("freefallSlope.descendedVox", (double)descended);
+
+  std::string fails;
+  auto check = [&](bool ok, const std::string& what) {
+    if (!ok) fails += (fails.empty() ? "" : "; ") + what;
+  };
+  check(restoreWhy.empty(), restoreWhy);
+  check(steepest >= 16, Format("the face is not steep at x %d (steepest %d over 4 voxels)", fx, steepest));
+  check(firstContact >= 0, "the body never came within 6 voxels of the face");
+  check(holds == 0, Format("%d rig-held ticks (UntunnelRig), first [%s]", holds, rowAt(firstHold).c_str()));
+  check(ut.released == 0, Format("%u bodies released into unvouched space", ut.released));
+  check(airArrests == 0 && airBills == 0,
+        Format("%d arrests and %d billed impacts in open air (worst %.1f m/s at [%s]; %d patches "
+               "round the pelvis built against an out-of-window neighbour at those ticks)",
+               airArrests, airBills, worstAir, rowAt(worstAirAt).c_str(), outAtAir));
+  check(splatAway == 0, Format("the lethal splat went off %d time(s) clear of the ground, first [%s]",
+                               splatAway, rowAt(splatAwayAt).c_str()));
+  check(descended >= 0.5f * (float)(hMid - hFoot),
+        Format("descended only %.0f voxels of a face %d tall (last [%s])", descended, hTop - hFoot,
+               rowAt((int)rows.size() - 1).c_str()));
+  detail = Format("face x %d z %d (mid y%d, foot y%d, top y%d, steepest %d/4 vox), %d ticks, "
+                  "first contact tick %d, %d ticks within 6 vox of the face, descended %.0f vox, "
+                  "rig holds %d (released %u), open-air arrests %d, border re-gathers %u, "
+                  "fall bills:%s | held-for chunks:%s",
+                  fx, zMid, hMid, hFoot, hTop, steepest, (int)rows.size(), firstContact, contacts,
+                  descended, holds, ut.released, airArrests, borders,
+                  billList.empty() ? " none" : billList.c_str(),
+                  heldWhat.empty() ? " none" : heldWhat.c_str());
+  check(crossing.empty(), crossing);
+  if (!fails.empty()) detail += " | " + fails;
+  const bool ok = fails.empty();
+  std::printf("freefall-slope: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  if (std::getenv("SANDVOX_FREEFALL_DUMP"))
+    for (size_t i = 0; i < rows.size(); i++) std::printf("  fs %s\n", rowAt((int)i).c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -3052,6 +3437,7 @@ const std::vector<Gate>& PlayerGates() {
       {"player-plants", "player", {}, false, GatePlayerPlants},
       {"player-fastfall", "player", {}, false, GatePlayerFastFall},
       {"freefall", "player", {}, false, GateFreefall},
+      {"freefall-slope", "player", {}, false, GateFreefallSlope},
       {"tick-input", "player", {}, false, GateTickInput},
       {"view-smooth", "player", {}, false, GateViewSmooth},
       {"two-players", "player", {}, false, GateTwoPlayers},

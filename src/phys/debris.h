@@ -1221,6 +1221,10 @@ class DebrisSystem {
     // two mean different things: a build deferral is a mesh that is late, a
     // gather deferral is a chunk whose surface has not been LOOKED at yet.
     uint32_t terrainGatherDeferred = 0;
+    // Patches re-gathered because a neighbour they were built without (out
+    // of the window, or not yet cached) became readable (TerrainEntry
+    // outMask / missMask).
+    uint32_t terrainBorderStale = 0;
   };
   const SettleProbe& Settle() const { return settle_; }
   // Diagnostic: the mirror version the terrain collider for `wc` was last
@@ -1231,6 +1235,38 @@ class DebrisSystem {
     return it == terrain_.end() ? 0u : it->second.builtVersion;
   }
   void ResetSettleProbe() { settle_ = SettleProbe{}; }
+  // Diagnostic: the TerrainEntry::outMask / missMask of `wc`'s patch, and
+  // whether it holds a Jolt body (0 / false when there is no entry).
+  bool TerrainBorder(IVec3 wc, uint32_t& outMask, uint32_t& missMask) const {
+    auto it = terrain_.find(World::PackChunkKey(wc));
+    if (it == terrain_.end()) { outMask = missMask = 0; return false; }
+    outMask = it->second.outMask;
+    missMask = it->second.missMask;
+    return it->second.handle != 0;
+  }
+
+  // ---- WHY A CHUNK'S PATCH WAS LATE (CLAUDE.md rule 6) --------------------
+  // Off unless a gate turns it on (EnableNeedProbe). Per world chunk: the
+  // first tick ManageTerrain listed it, the rank it had in the sorted list
+  // that tick, the first tick a fetch was REQUESTED for it, and how often it
+  // was passed over for each of the three reasons the sweep can pass a chunk
+  // over (cut by the list ceiling, declined by the fetch budget, skipped as
+  // known sky). "The chunk below was not cached" is a bare fact; these name
+  // which door it was waiting behind.
+  struct NeedRec {
+    uint32_t firstNeeded = 0, firstRank = 0, firstRequested = 0;
+    uint32_t firstCached = 0, firstBuilt = 0;
+    uint32_t ceilingCut = 0, budgetDenied = 0, skyskipped = 0, gatherDeferred = 0,
+             buildDeferred = 0;
+  };
+  void EnableNeedProbe(bool on) { needProbeOn_ = on; needProbe_.clear(); }
+  // The anchors the last ManageTerrain swept (probe on only): pos, vel.
+  const std::vector<std::pair<Vec3, Vec3>>& ProbeAnchors() const { return probeAnchors_; }
+  size_t NeedProbeSize() const { return needProbe_.size(); }
+  const NeedRec* NeedProbe(IVec3 wc) const {
+    auto it = needProbe_.find(World::PackChunkKey(wc));
+    return it == needProbe_.end() ? nullptr : &it->second;
+  }
 
   // ---- WHERE THE TICK WENT (CLAUDE.md rule 6, applied to TIME) ------------
   //
@@ -1845,6 +1881,20 @@ class DebrisSystem {
                             // occupancy box the mesh is a pure function of, so
                             // liquids flowing through a chunk neither rebuild
                             // nor wake, and the compare runs BEFORE the mesh
+    // THE NEIGHBOURS THIS PATCH WAS BUILT WITHOUT (bit (dz+1)*9+(dy+1)*3+(dx+1)).
+    // The 18^3 gather reads a neighbour OUTSIDE the residency window as solid
+    // and an in-window one that is not cached (and not counted empty by the
+    // snapshot) as air; both are guesses about a chunk that has no data yet,
+    // and the patch is a function of them. A patch is otherwise rebuilt only
+    // when ITS OWN chunk's version moves, so a window face polygonized as a
+    // wall stayed a wall in open sky after the window followed the body down
+    // past it -- a collider made of nothing (bug report 2026-10-09_15-16-57).
+    // ManageTerrain re-gathers the patch the tick either guess stops holding.
+    uint32_t outMask = 0, missMask = 0;
+    // The sweep (lastTerrainTick_) that last skipped this chunk as known sky.
+    // ColliderVouched honours that verdict for the rest of the tick
+    // (debris.cpp, "ONE VERDICT PER TICK").
+    uint32_t skyTick = 0;
   };
   // One patch this tick's terrain sweep decided to rebuild, captured by value
   // so the polygonize + Jolt shape build can run on worker threads after the
@@ -1857,6 +1907,7 @@ class DebrisSystem {
     bool partial = false;
     uint32_t version = 0;
     uint64_t occHash = 0, vacateKey = 0;
+    uint32_t outMask = 0, missMask = 0;
     Physics::TerrainShapeJob job;
   };
 
@@ -2370,6 +2421,9 @@ class DebrisSystem {
   SettleProbe settle_{};
   FloaterProbe floaters_{};
   UntunnelProbe untunnel_{};
+  bool needProbeOn_ = false;
+  std::vector<std::pair<Vec3, Vec3>> probeAnchors_;
+  std::unordered_map<uint64_t, NeedRec> needProbe_;
   // Consecutive steps each body has been held at a collider boundary. Only
   // bodies actually being held have an entry (erased the step they stop being
   // held), so this is empty in every ordinary frame.

@@ -272,7 +272,11 @@ class PlayerAvatar : public Mob {
   // The capsule itself is inert meanwhile — no gravity, no sweeps, no
   // impact latch — which is also why a body knocked flying by a blast does
   // not take fall damage on landing: the controller never saw the fall.
+  // `outPlayerPos` comes IN holding the capsule's current position: the first
+  // limp tick seats the follow offset from it (no pop at the hand-over).
   bool RagdollFollow(Vec3& outPlayerPos) const;
+  mutable bool limpFollowing_ = false;
+  mutable Vec3 limpOffset_{};
 
   // Impact damage is Mob::ApplyFallDamage (W2-H), driven for the player by
   // Player::impactDeltaV — the velocity a collision sweep refused, so falls
@@ -340,7 +344,9 @@ class PlayerAvatar : public Mob {
   // (PartPosedWorld -- the animation's answer, not Jolt's one-tick-latent
   // readback) carried out to the sidecar's eyeLocal. The first-person
   // camera rides this, so a crawl puts the eye near the floor where the head
-  // is. False with no head, no eyeLocal, or a dead body.
+  // is. While RAGDOLLED (limp or getting up) it is the head's actual
+  // transform instead -- the body is not where the animation says. False with
+  // no head, no eyeLocal, or a dead body.
   bool HeadEyeWorld(Vec3& out) const;
 
   // ---- render plumbing ----

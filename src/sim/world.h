@@ -5259,6 +5259,10 @@ class World {
   // the publish for every snapshot it walks, so Cached() at tick T holds
   // exactly the fetches of ticks <= T - kSnapshotLatency.
   void LandFetches(WorldSnapshot& s);
+  // Copies the snapshot's 27 mirror chunks into the fetch cache where the
+  // cache holds no copy of them yet (world.cpp says why). Called by the
+  // publish beside LandFetches. SANDVOX_NO_MIRROR_SEED=1 is the A/B arm.
+  void SeedCacheFromMirror(const WorldSnapshot& s);
 
   // ---- THE FRESHEST DELIVERED SNAPSHOT: DERIVED DATA ONLY ----------------
   //
