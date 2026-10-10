@@ -397,6 +397,20 @@ constexpr uint64_t kShotJumpLastFrame = 420;
 enum class JumpShot { Rise, Apex, Fall, Land, Done };
 JumpShot g_shotJumpWant = JumpShot::Rise;
 const char* g_shotJumpPath = nullptr;  // set for exactly one frame, then taken
+// `--shot-swim`: the SWIM POSE's look-iteration harness (pose.cpp, "the swim
+// family"). The player is dropped into the harness map's fixture lake in third
+// person and scripted through tread -> crawl -> down -> dive -> up, one BMP per
+// phase through g_shotJumpPath. Each phase is a frame window; the picture is
+// taken at a fixed frame near its end (tread, crawl, dive) or on the first
+// frame the controller says the state is real (down: fully under and sinking;
+// up: fully under and rising -- "swimming up" at the surface is, by design,
+// treading). The still phases are shot square to the body's side.
+bool g_shotSwim = false;
+constexpr uint64_t kShotSwimTreadEnd = 280;   // Space held at the surface
+constexpr uint64_t kShotSwimCrawlEnd = 420;   // forward at the surface
+constexpr uint64_t kShotSwimDownEnd = 500;    // Ctrl alone
+constexpr uint64_t kShotSwimDiveEnd = 600;    // forward + Ctrl
+constexpr uint64_t kShotSwimLast = 760;       // Space under water, then stop
 // `--shot-bench`: the alchemy bench's look-iteration harness. Fills a flask
 // (SANDVOX_BENCH_A, a ContainerParseFillSpec, default water+oil+sand) and a
 // second one (SANDVOX_BENCH_B, default lava+sand), opens the first on the
@@ -5768,6 +5782,12 @@ int main(int argc, char** argv) {
       g_shotJump = true;
       g_harnessFrames = kShotJumpLastFrame;
     }
+    // `--shot-swim`: the swim pose, phase by phase, in the harness lake. See
+    // the note at g_shotSwim.
+    else if (a == "--shot-swim") {
+      g_shotSwim = true;
+      g_harnessFrames = kShotSwimLast;
+    }
     // `--duel-dummy` is the melee FEEL harness: a sword-armed human standing
     // three metres in front of the spawn, with nothing driving it. Mobs have no
     // AI yet, so "stands still" is simply the default and this flag is only a
@@ -6184,7 +6204,7 @@ int main(int argc, char** argv) {
   // and the tuner's tools keep world.mapLayer. SANDVOX_MAP still wins.
   if (selftest || verify || suiteAcceptance || vkSmoke || vkSmokeLoud ||
       fluidBench || labFlag || shot || shotFrames || shotFluid ||
-      shotWaterfall || shotDebrisPond || shotFluidPond)
+      shotWaterfall || shotDebrisPond || shotFluidPond || g_shotSwim)
     worldmap::SetMapOverride(kHarnessMapName);
 
   // --list is pure metadata: answering it before any device or asset init
@@ -6469,10 +6489,13 @@ int main(int argc, char** argv) {
     // body. Forced here rather than in tuning.json because it feeds the shader
     // constant prelude and therefore worldgen — it has to be true before the
     // first chunk is generated, not toggled later.
-    if (g_shotJump) {
+    if (g_shotJump || g_shotSwim) {
       tune.debug.vegetation = 0;
       tune.debug.groundCover = 0;
     }
+    // ...and a swimmer is mostly under the surface: a closer boom so a limb
+    // is more than a few pixels of murk.
+    if (g_shotSwim) tune.thirdPerson.distance = 2.2f;
     SetCurrentTuning(tune);
   }
   std::vector<MaterialDef> mats;
@@ -7746,6 +7769,21 @@ int main(int argc, char** argv) {
     std::printf("--at: eye (%.2f, %.2f, %.2f) yaw %.1f pitch %.1f\n", g_atEye[0], g_atEye[1],
                 g_atEye[2], g_atYawDeg, g_atPitchDeg);
   }
+  // --shot-swim: into the harness lake, a little above its waterline, so the
+  // first thing the body does is splash in and float.
+  if (g_shotSwim) {
+    const int li = World::WaterSiteIndex(kHarnessLakeSite);
+    const World::PondDisc lake =
+        li >= 0 ? World::WaterSiteDisc(li, kDefaultSeed) : World::PondDisc{};
+    if (lake.present && lake.surf >= 0) {
+      player.pos = Vec3{(float)lake.cx + 0.5f, (float)lake.surf + Player::kHalfY + 2.0f,
+                        (float)lake.cz + 0.5f};
+      std::printf("--shot-swim: into the harness lake at (%d, %d), waterline y%d\n",
+                  lake.cx, lake.cz, lake.surf);
+    } else {
+      std::fprintf(stderr, "--shot-swim: no harness lake on this map -- nothing to swim in\n");
+    }
+  }
   // Lab: fixed per-scene pose, flying, aimed at the scene — the same pose the
   // bench renders from, so what is judged live and what is measured headless
   // are the same framing.
@@ -8017,6 +8055,15 @@ int main(int argc, char** argv) {
         kit.bag.Add(StackOf(items, i));        // armour, into the pack
       else
         hotbar.Add(StackOf(items, i));
+    }
+    // --shot-swim photographs the STROKE: a sword in the fist puts that arm
+    // in its guard and hides half of it, so the harness swims empty-handed.
+    if (g_shotSwim) {
+      ItemStack& rh = kit.equip.slots[EquipSlotOfHand(Hand::Right)];
+      if (!rh.Empty()) {
+        hotbar.Add(rh);
+        rh = ItemStack{};
+      }
     }
   }
   // The equipment slot table, mirrored into the UI once. It is authored data
@@ -11101,6 +11148,33 @@ int main(int argc, char** argv) {
     // four are compared with, and it costs one frame.
     if (g_shotJump && frameCounter == kShotJumpAtFrame - 20)
       g_shotJumpPath = "screenshot_jump_walk.bmp";
+    // --shot-swim: one picture per phase (see g_shotSwim). The fixed frames
+    // sit near each window's end, so the blend into that phase has finished.
+    if (g_shotSwim && avatar.Spawned()) {
+      static bool upTaken = false, downTaken = false;
+      const bool under = player.submersion > 0.999f;
+      const float vyM = player.vel.y * kVoxelMeters;
+      if (frameCounter == kShotSwimTreadEnd - 10)
+        g_shotJumpPath = "screenshot_swim_tread.bmp";
+      else if (frameCounter == kShotSwimCrawlEnd - 10)
+        g_shotJumpPath = "screenshot_swim_crawl.bmp";
+      else if (!downTaken && frameCounter > kShotSwimCrawlEnd + 15 &&
+               frameCounter < kShotSwimDownEnd && under && vyM < -0.3f) {
+        g_shotJumpPath = "screenshot_swim_down.bmp";
+        downTaken = true;
+      } else if (frameCounter == kShotSwimDiveEnd - 10)
+        g_shotJumpPath = "screenshot_swim_dive.bmp";
+      else if (!upTaken && frameCounter > kShotSwimDiveEnd + 15 && under &&
+               vyM > 0.3f) {
+        g_shotJumpPath = "screenshot_swim_up.bmp";
+        upTaken = true;
+      }
+      if (g_shotJumpPath)
+        std::printf("--shot-swim: %s  frame %llu  swimming=%d submersion=%.2f vel=(%.1f %.1f %.1f) m/s\n",
+                    g_shotJumpPath, (unsigned long long)frameCounter, (int)player.swimming,
+                    player.submersion, player.vel.x * kVoxelMeters,
+                    player.vel.y * kVoxelMeters, player.vel.z * kVoxelMeters);
+    }
     if (g_shotJump && frameCounter > kShotJumpAtFrame &&
         g_shotJumpWant != JumpShot::Done && avatar.Spawned()) {
       const auto& av = CurrentTuning().avatar;
@@ -13501,6 +13575,44 @@ int main(int argc, char** argv) {
       cam.yaw = 0.6f;
       cam.pitch = -0.12f;
       pin.SetPressed(TB_JUMP, frameCounter == kShotJumpAtFrame);
+    }
+    // --shot-swim: the phase script (g_shotSwim). The same three-quarter view
+    // as --shot-jump: the body faces its travel in third person, and a stroke
+    // reads from its profile. Morning sun, no dev panel.
+    if (g_shotSwim) {
+      if (frameCounter == 1) {
+        ui.visible = false;
+        CelestialClock& sky = Celestial();
+        sky.SetScale(2.0f, tick);
+        sky.SetScale(1.0f, tick);
+        const int64_t tpd = (int64_t)TicksPerDay(CurrentTuning());
+        sky.ticks = tpd * 42 / 100;
+        sky.prevTicks = sky.ticks;
+        sky.rem = 0;
+      }
+      player.fly = false;
+      ui.fly = false;
+      camMode = CameraMode::Third;
+      const uint64_t f = frameCounter;
+      const bool tread = f < kShotSwimTreadEnd;
+      const bool crawl = f >= kShotSwimTreadEnd && f < kShotSwimCrawlEnd;
+      const bool down = f >= kShotSwimCrawlEnd && f < kShotSwimDownEnd;
+      const bool dive = f >= kShotSwimDownEnd && f < kShotSwimDiveEnd;
+      const bool up = f >= kShotSwimDiveEnd;
+      // A body with no planar travel holds its facing (thirdperson.h), so a
+      // still phase is shot square to its SIDE, the profile a stroke reads
+      // from: camera heading (= pi/2 - yaw) a right angle off the body's.
+      cam.yaw = (crawl || dive) ? 0.6f
+                                : 1.5707963f - (avatarHeading + 1.5707963f);
+      cam.pitch = -0.22f;
+      pin.forward = (crawl || dive) ? 0.4f : 0.0f;
+      pin.strafe = (crawl || dive) ? 1.0f : 0.0f;
+      pin.SetHeld(TB_SPRINT, false);
+      // The crawl is W alone: Space held while moving lifts the body half out
+      // of the water (submersion 0.2..0.4), which is not how anyone swims.
+      pin.SetHeld(TB_JUMP, tread || up);
+      pin.SetHeld(TB_CROUCH, dive || down);
+      pin.SetPressed(TB_JUMP, false);
     }
     // --autofly: hold W+sprint in fly mode, no human at the keyboard. Exists to
     // reproduce the streaming-shift stutter, which only appears when the window

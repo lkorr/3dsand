@@ -137,6 +137,13 @@ struct PoseInputs {
   // LedgeClimbRise) — against the same hangLip / hangDir as the hang.
   bool climbActive = false;
   float climbRise = 0.0f;
+  // ---- THE WATER CARRIES THE BODY (pose.cpp, "the swim family") ----------
+  // `swim`: the water is carrying the body -- swimming or treading, not
+  // wading. The library's swim clips then own the whole body, blended by
+  // which way `velocity` points in the body's frame; legs and arms are both
+  // clip-driven (a swimmer is not grounded, so the leg IK has faded out).
+  // The pipeline finds the waterline itself, over the body's own column.
+  bool swim = false;
   // Anything else a driver needs to solve, AFTER the leg IK, the weapon arm
   // and the hang palms and BEFORE the anatomical clamp (so it is clamped like
   // everything else). Empty on both current drivers.
@@ -204,6 +211,23 @@ struct PoseDrive {
   int walkClip = -1, runClip = -1;
   const void* gaitClipsKey = nullptr;
   size_t gaitClipsCount = 0;
+  // ---- the swim family (PoseInputs::swim) ---------------------------------
+  // tread, swim (forward), swim_back, swim_side (right), swim_side.mirror
+  // (left), swim_up, swim_down: indices resolved per clip table like the
+  // stride pair, the eased blend weight of each, and the 3D velocity the
+  // weights are read from (eased: the vertical bobs at the surface).
+  static constexpr int kSwimClips = 7;
+  int swimClip[kSwimClips] = {-1, -1, -1, -1, -1, -1, -1};
+  const void* swimClipsKey = nullptr;
+  size_t swimClipsCount = 0;
+  float swimW[kSwimClips] = {1, 0, 0, 0, 0, 0, 0};
+  Vec3 swimVel{};
+  bool swimOn = false;
+  // The drawn body's offset from the driver's height while surfaced (world
+  // voxels, eased): the controller's box floats wherever buoyancy and the
+  // swim thrust put it, and the pose settles the body against the WATERLINE
+  // instead, so a treading head is out and a crawling back is awash.
+  float swimLift = 0.0f;
   // ---- the guard arm's stride pump (PoseInputs::guardPump) ---------------
   // 0..1 eased weight, and the rig-frame hand offset ApplyWeaponArm adds to
   // the guard's IK target this tick.

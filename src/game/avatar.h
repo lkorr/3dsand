@@ -548,6 +548,9 @@ class PlayerAvatar : public Mob {
   // all. The pipeline reads PoseInputs, not Player, so this comes across
   // the same way hangActive_ does.
   bool airPoseEligible_ = false;
+  // Mirrored out of Player the same way, for PoseInputs::swim: the water is
+  // carrying the body (not wading, not flying, not climbing out).
+  bool swimming_ = false;
   // Was the support a LEDGE HANG last tick? Losing that support must not fire
   // the "jump" clip — the arms are already up in the hang pose.
   bool wasHanging_ = false;

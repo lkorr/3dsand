@@ -68,6 +68,10 @@ constexpr float kDragSpeedPenalty = 1.0f / 3.0f;
 // footing to keep.
 constexpr float kGaitCoyoteSeconds = 0.30f;
 constexpr float kGaitCoyoteLegLengths = 0.5f;
+// The swim pose's floor on Player::submersion for a body with no footing: one
+// of its five samples wet (see the note where swimming_ is set). Space held
+// while moving at the surface lifts the body to 0.2 (measured, --shot-swim).
+constexpr float kSwimPoseSubmersion = 0.19f;
 
 ParticleSpawn MakeDroplet(Vec3 posVoxel, Vec3 vel, uint32_t material,
                           bool micro, int lifeTicks, int microScale) {
@@ -451,6 +455,7 @@ PoseInputs PlayerAvatar::AvatarPoseInputs(bool grounded,
   in.hangDir = hangDirW_;
   in.climbActive = climbActive_;
   in.climbRise = climbRise_;
+  in.swim = swimming_;
   return in;
 }
 
@@ -530,6 +535,7 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // ragdoll left, and a stale air weight would aim the first solve of the
     // get-up at a tuck.
     airPoseEligible_ = false;
+    swimming_ = false;
     pose_.airFrac = 0.0f;
     pose_.airLandW = 0.0f;
     pose_.airLeanPitch = pose_.airLeanRoll = 0.0f;
@@ -544,6 +550,7 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     climbActive_ = false;
     crouchWant_ = false;
     airPoseEligible_ = false;
+    swimming_ = false;
     playerVel_ = Vec3{};
     PosePipeline(AvatarPoseInputs(/*grounded=*/true, Vec3{}), dt, world, tick);
     SubmitPose(dt, /*writeXf=*/true);
@@ -567,6 +574,16 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // hold the fall clip open for the whole flight.
     airPoseEligible_ = !player.hanging && player.mantleTimer <= 0.0f &&
                        !player.inLiquid && !player.fly;
+    // SWIMMING, NOT WET: a wader is standing and walks. Player::swimming (the
+    // three-quarters-under state) is not enough on its own: Space held at the
+    // surface lifts the body to 0.2..0.4 under (measured, --shot-swim), off
+    // the bottom and below kSwimSubmersion, and that is exactly the tread. So
+    // a body the water holds up -- wet at all and with no floor -- swims too.
+    // (Where the surface is, the pipeline finds for itself.)
+    swimming_ = (player.swimming ||
+                 (player.inLiquid && !player.grounded &&
+                  player.submersion >= kSwimPoseSubmersion)) &&
+                !player.fly && !player.hanging && player.mantleTimer <= 0.0f;
     // A ledge climb is the hang's continuation: same lip, same wall.
     climbActive_ = player.mantleFromHang && player.mantleTimer > 0.0f;
     climbRise_ = climbActive_ ? player.LedgeClimbRise() : 0.0f;
@@ -882,8 +899,14 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
       // skips an instance already marked `stopping`, so each tick APPENDS a new
       // one. Naming idle keeps the arms' base pose alive under the air IK, which
       // is what the note below says the airborne case wants anyway.
+      // SWIMMING RETIRES THE WHOLE FAMILY: the swim clips own every part
+      // (pose.cpp, "the swim family" — it set pose_.swimOn this tick), and
+      // idle is ADDITIVE, so leaving it running would sway the arms on top
+      // of the stroke. A rig with no swim clips keeps its idle arms.
       const int want =
-          hangingNow && hc >= 0
+          pose_.swimOn
+              ? -1
+          : hangingNow && hc >= 0
               ? hc
               : airborneNow ? (CurrentTuning().avatar.airPose ? ic : fc)
                             : (!moving ? ic : (running ? rc : wc));
@@ -903,10 +926,11 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // Hanging is the exception: the hang pose is started HERE (there is no
     // edge-driven owner for it the way jump/fall have one), and it must be,
     // or the retire block above would empty the family and leave rest arms.
-    PlayClipIndex(hangingNow && locoClips_.hang >= 0
-                      ? locoClips_.hang
-                      : moving ? (running ? locoClips_.run : locoClips_.walk)
-                               : locoClips_.idle);
+    if (!pose_.swimOn)
+      PlayClipIndex(hangingNow && locoClips_.hang >= 0
+                        ? locoClips_.hang
+                        : moving ? (running ? locoClips_.run : locoClips_.walk)
+                                 : locoClips_.idle);
 
     // ---- lock the arm swing to the feet --------------------------------
     // The walk and run clips are authored at ONE speed each (the arm cycle is

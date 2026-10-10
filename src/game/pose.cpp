@@ -136,6 +136,33 @@ constexpr float kStepPeriodHalflife = 0.25f;
 // A step slower than this is not a gait — the clock parks rather than crawling.
 constexpr float kMaxStepPeriod = 1.2f;
 
+// The swim family's mixer (PosePipeline, "the swim family"). Speeds are
+// SHARES of the def's top speed so one table drives any rig: the player's
+// full swim (walkSpeed x liquidSpeedScale, ~8.8 vox/s) is 0.28 of the human's
+// 31.5. Below `kSwimStillShare` of that the body treads -- the surface bob
+// and a drift must not stroke -- and by `kSwimFullShare` the stroke owns
+// the pose. The velocity is eased before it is read because the vertical
+// bobs every tick at the surface; the weights are eased so a change of
+// direction turns the stroke over rather than cutting it.
+constexpr float kSwimRefSpeedShare = 0.28f;
+constexpr float kSwimStillShare = 0.15f;
+constexpr float kSwimFullShare = 0.55f;
+constexpr float kSwimVelHalflife = 0.12f;
+constexpr float kSwimBlendHalflife = 0.15f;
+// Where a surfaced swimmer's drawn body meets the water, as a share of its
+// standing height above the drawn soles, per swim clip in PoseDrive::swimClip
+// order (tread, swim, back, side, side.mirror, up, down), and how far the pose
+// may move it off the controller's box to get there (shares of height; the
+// box rides HIGH at the surface with Space held, 0.2..0.4 under). The human's
+// shoulders are at 0.78: a treading head is out to the collarbone; the crawl
+// (hips lifted 0.3 m, pitched 70 degrees) rides with its back awash.
+constexpr float kSwimWaterShare[PoseDrive::kSwimClips] = {0.76f, 0.66f, 0.72f,
+                                                          0.72f, 0.72f, 0.76f,
+                                                          0.60f};
+constexpr float kSwimMaxDrop = 0.6f;
+constexpr float kSwimMaxRise = 0.3f;
+constexpr float kSwimLiftHalflife = 0.15f;
+
 // ---- THE AIRBORNE POSE, IN LEG LENGTHS AND ARM REACHES ---------------------
 //
 // Four shapes, blended by one number. `avatar.airPose` in tuning.h says why the
@@ -580,6 +607,163 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
           if (inst.clip == ci) inst.stopping = true;
       }
     }
+  }
+
+  // ---- the swim family (PoseInputs::swim, 2026-10-09) ----------------------
+  // Seven library clips (assets/anims: tread, swim, swim_back, swim_side and
+  // its derived .mirror, swim_up, swim_down), all full-body OVERRIDES on one
+  // 1200 ms period, played together while the body swims and blended by
+  // WEIGHT on which way it is going in its own frame. The override blend is a
+  // weighted mean, so the weights are the whole mixer: still is `tread`, a
+  // forward-and-down travel is part `swim` and part `swim_down` (the body
+  // pitches part way between the two), and nothing has a threshold to pop at.
+  //
+  // ONE PLAYHEAD: every instance is held at the first one's time and rate,
+  // so two directions in a blend stroke in step instead of averaging two
+  // arms at different points of their cycle into a limp one.
+  //
+  // A rig missing some of the clips swims with the ones it has (an absent
+  // index is skipped, and the weighted mean renormalises over the rest); a
+  // rig with none never notices. Nothing here is the PLAYER's: the avatar
+  // sets `swim` from its controller, and an NPC driver that grows swimming
+  // sets the same field.
+  {
+    static const char* const kSwimNames[PoseDrive::kSwimClips] = {
+        "tread", "swim", "swim_back", "swim_side", "swim_side.mirror",
+        "swim_up", "swim_down"};
+    if (pose_.swimClipsKey != (const void*)sk.clips.data() ||
+        pose_.swimClipsCount != sk.clips.size()) {
+      pose_.swimClipsKey = sk.clips.data();
+      pose_.swimClipsCount = sk.clips.size();
+      for (int k = 0; k < PoseDrive::kSwimClips; k++)
+        pose_.swimClip[k] = sk.FindClip(kSwimNames[k]);
+    }
+    auto isSwimClip = [&](int ci) {
+      if (ci < 0) return false;
+      for (int k = 0; k < PoseDrive::kSwimClips; k++)
+        if (pose_.swimClip[k] == ci) return true;
+      return false;
+    };
+    // A clip-owned state (crawl, stumps, sleep) keeps the body: a legless
+    // swimmer is a later question, and blending a crawl with a crawl stroke
+    // is neither.
+    const bool swimNow = in.swim && !clipOwnsPose && pose_.swimClip[0] >= 0;
+    // THE WATERLINE, over the body's own column: the first non-liquid cell
+    // above liquid, scanned up from the soles to twice the body's height. Not
+    // found (the column is liquid to the top of the scan, or the mirror cannot
+    // see it) = under water. Surfaced = the top of the body is out, which is
+    // where an upward push only holds the head up: treading.
+    const float standH = std::max(def.worldSize.y, 1.0f);
+    bool surfaced = false;
+    float waterline = 0.0f;
+    if (swimNow) {
+      const int cx = ifloor(origin_.x + def.worldSize.x * 0.5f);
+      const int cz = ifloor(origin_.z + def.worldSize.z * 0.5f);
+      const int y0 = ifloor(origin_.y);
+      const int y1 = y0 + (int)std::ceil(2.0f * standH);
+      bool wet = false;
+      for (int y = y0; y <= y1; y++) {
+        const CellKind k = world.KindAt({cx, y, cz}, ClassOf());
+        if (k == CellKind::Unknown) break;
+        if (k == CellKind::Liquid) {
+          wet = true;
+        } else if (wet) {
+          waterline = (float)y;
+          surfaced = waterline <= origin_.y + standH;
+          break;
+        }
+      }
+    }
+    // Settle the drawn body so the waterline crosses it where each clip wants
+    // it (kSwimWaterShare, blended by the clips' own weights: a treading body
+    // has its shoulders there, the crawl's pitched torso its back). Bounded,
+    // eased, and nothing under water or out of it.
+    {
+      float share = 0.0f, wsum = 0.0f;
+      for (int k = 0; k < PoseDrive::kSwimClips; k++) {
+        share += kSwimWaterShare[k] * pose_.swimW[k];
+        wsum += pose_.swimW[k];
+      }
+      share = wsum > 1e-4f ? share / wsum : kSwimWaterShare[0];
+      const float want =
+          surfaced ? std::clamp(waterline - share * standH - origin_.y,
+                                -kSwimMaxDrop * standH, kSwimMaxRise * standH)
+                   : 0.0f;
+      pose_.swimLift +=
+          (want - pose_.swimLift) * HalfLifeK(dt, kSwimLiftHalflife);
+      if (std::fabs(pose_.swimLift) < 1e-3f) pose_.swimLift = 0.0f;
+    }
+    if (swimNow) {
+      if (!pose_.swimOn) {
+        // Entering the water starts from treading, whatever was left from
+        // the last swim, and from the velocity as it is now.
+        for (int k = 0; k < PoseDrive::kSwimClips; k++) pose_.swimW[k] = k == 0;
+        pose_.swimVel = in.velocity;
+      }
+      pose_.swimVel = pose_.swimVel + (in.velocity - pose_.swimVel) *
+                                          HalfLifeK(dt, kSwimVelHalflife);
+      // The body's frame, as the springs read it: +fwd along the heading,
+      // +left to the body's left.
+      const float shc = std::cos(heading_), shs = std::sin(heading_);
+      const Vec3& v = pose_.swimVel;
+      const float ref = std::max(def.speed * kSwimRefSpeedShare, 0.5f);
+      const float fwd = (v.x * shs + v.z * shc) / ref;
+      const float left = (v.x * shc - v.z * shs) / ref;
+      // At the surface an upward push only holds the head out: treading.
+      // Sinking from the surface is still a dive.
+      const float up = (surfaced ? std::min(v.y, 0.0f) : v.y) / ref;
+      const float mag2 = fwd * fwd + left * left + up * up;
+      const float mag = std::sqrt(mag2);
+      // How much of the pose is a stroke rather than the tread: a dead zone
+      // for the surface bob and the drift, then a smooth ramp to full.
+      const float go = SmoothSpan(kSwimStillShare, kSwimFullShare, mag);
+      float want[PoseDrive::kSwimClips] = {1.0f - go, 0, 0, 0, 0, 0, 0};
+      if (mag2 > 1e-6f) {
+        // Squared components over the squared length sum to 1, so a
+        // diagonal is an even split and an axis is all one clip.
+        const float comp[6] = {std::max(fwd, 0.0f),  std::max(-fwd, 0.0f),
+                               std::max(-left, 0.0f), std::max(left, 0.0f),
+                               std::max(up, 0.0f),   std::max(-up, 0.0f)};
+        for (int k = 0; k < 6; k++) want[k + 1] = go * comp[k] * comp[k] / mag2;
+      }
+      const float wk = HalfLifeK(dt, kSwimBlendHalflife);
+      for (int k = 0; k < PoseDrive::kSwimClips; k++)
+        pose_.swimW[k] += (want[k] - pose_.swimW[k]) * wk;
+      // The stroke rate follows the effort: a drift strokes slowly, a full
+      // swim at the authored rate, a sprint a little faster. The tread keeps
+      // its own rate when there is no stroke at all.
+      const float rate = 1.0f + go * (std::clamp(mag, 0.6f, 1.4f) - 1.0f);
+      // Revive-before-request (the chase pose's note), then the playhead.
+      for (ClipInstance& inst : st.clips)
+        if (isSwimClip(inst.clip)) inst.stopping = false;
+      const ClipInstance* lead = nullptr;
+      for (int k = 0; k < PoseDrive::kSwimClips; k++) {
+        const int ci = pose_.swimClip[k];
+        if (ci < 0) continue;
+        PlayClipIndex(ci);  // no-op once it is running
+      }
+      for (const ClipInstance& inst : st.clips)
+        if (isSwimClip(inst.clip)) {
+          lead = &inst;
+          break;
+        }
+      const float leadTime = lead != nullptr ? lead->timeMs : 0.0f;
+      for (ClipInstance& inst : st.clips) {
+        if (!isSwimClip(inst.clip)) continue;
+        for (int k = 0; k < PoseDrive::kSwimClips; k++)
+          if (pose_.swimClip[k] == inst.clip) inst.weight = pose_.swimW[k];
+        inst.rate = rate;
+        if (sk.clips[inst.clip].durationMs ==
+            sk.clips[pose_.swimClip[0]].durationMs)
+          inst.timeMs = leadTime;
+      }
+    } else if (pose_.swimOn) {
+      // Out of the water (or a state took the body): every stroke blends out
+      // on its own blendOutMs, under whatever the driver starts in its place.
+      for (ClipInstance& inst : st.clips)
+        if (isSwimClip(inst.clip)) inst.stopping = true;
+    }
+    pose_.swimOn = swimNow;
   }
 
   // ---- stages 1-3: sample active clips, blend, apply additives ----
@@ -1765,10 +1949,12 @@ void Mob::ParkGaitForAir(const PoseInputs& in, float dt) {
   // is not a step period.
   pose_.lastFootDown = -1;
   pose_.sinceTouchdown = 0.0f;
+  // `swimLift`: a surfaced swimmer is drawn against the waterline (the swim
+  // family in PosePipeline), zero for every other body.
   if (in.height == PoseInputs::Height::FromDriver)
-    bodyY_ = origin_.y - pose_.stanceCrouch - pose_.crouchHold;
+    bodyY_ = origin_.y + pose_.swimLift - pose_.stanceCrouch - pose_.crouchHold;
   else
-    MobSystem::EaseBodyY(*this, origin_.y, dt);
+    MobSystem::EaseBodyY(*this, origin_.y + pose_.swimLift, dt);
   bodyUp_ = (bodyUp_ * 0.85f + Vec3{0, 1, 0} * 0.15f).normalized();
   if (bodyUp_.len() < 0.5f) bodyUp_ = {0, 1, 0};
 }

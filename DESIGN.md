@@ -15078,6 +15078,29 @@ The inputs are the facts only a driver has:
 | look target | the camera's head-look goal (`SetLook`) | none (`ApplyStrikeAim` looks at `aimLook_`) |
 | aim target | `strikeAim` on (a no-op without an Aim effector) | `strikeAim` on |
 | extras | held crouch, ledge-hang lip | `chaseWant` |
+| `swim` | the water carries the body: `Player::swimming`, or wet with no footing (Space at the surface floats the box only 0.2..0.4 under); not fly / hanging / mantling | false: NPCs have no submersion or swim locomotion yet |
+
+**The swim family (2026-10-09).** While `swim` is set the pipeline plays seven
+library clips at once (`assets/anims`: `tread`, `swim`, `swim_back`,
+`swim_side` and its derived `.mirror`, `swim_up`, `swim_down`), all full-body
+overrides on one 1200 ms period held on ONE playhead, and the weights are the
+whole mixer: still is `tread`; a stroke takes over between 0.15 and 0.55 of
+the reference swim speed (0.28 of the def's top speed: the player's full swim);
+past that each direction gets its squared share of the body-frame velocity, so
+forward-and-down is part crawl and part dive and the body pitches part way. At
+the surface an upward push is treading, not swimming up. The pipeline finds the
+waterline itself (`World::KindAt` up the body's own column) and, while the top
+of the body is out, settles the DRAWN body so the water crosses it where the
+blended clips want it (pose.cpp `kSwimWaterShare`: 0.76 of the standing height
+for the tread, the shoulders out; 0.66 for the crawl, the back awash;
+`PoseDrive::swimLift`, bounded and eased): the controller's
+box rides wherever buoyancy and the thrust put it, which with Space held is
+waist-out. The
+avatar retires its idle/walk/run/fall/hang family under it (idle is additive
+and would sway the stroke). A rig missing some of the clips swims with the
+rest; a clip-owned state (crawl, stumps) keeps the body. In third person the
+body faces its travel, so the back/side clips show in first person and through
+a turn. Look-iteration: `--shot-swim` (harness lake, one BMP per phase).
 
 What stays per driver is the part that is genuinely per driver: the player's
 clip family (idle/walk/run/jump/land/fall/hang, the stride-locked clip rate,
