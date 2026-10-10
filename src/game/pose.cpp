@@ -806,6 +806,20 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
       for (ClipInstance& inst : st.clips)
         if (isSwimClip(inst.clip)) inst.stopping = true;
     }
+    // SANDVOX_SWIM_TRACE=1: one line per posed tick of a swimming body, the
+    // inputs the stroke mixer reads. Presentation only.
+    static const bool swimTrace = std::getenv("SANDVOX_SWIM_TRACE") != nullptr;
+    if (swimTrace && swimNow)
+      std::printf("swimtrace t%llu o(%.2f %.2f %.2f) col(%d %d) surf %d wl %.0f "
+                  "aim(%.2f %.2f %.2f) v(%.2f %.2f %.2f) hd %.3f pitch %.3f lift %.3f "
+                  "w %.2f %.2f %.2f %.2f %.2f %.2f %.2f\n",
+                  (unsigned long long)tick, origin_.x, origin_.y, origin_.z,
+                  ifloor(origin_.x + def.worldSize.x * 0.5f),
+                  ifloor(origin_.z + def.worldSize.z * 0.5f), (int)surfaced, waterline,
+                  in.swimAim.x, in.swimAim.y, in.swimAim.z, in.velocity.x,
+                  in.velocity.y, in.velocity.z, heading_, pose_.swimPitch,
+                  pose_.swimLift, pose_.swimW[0], pose_.swimW[1], pose_.swimW[2],
+                  pose_.swimW[3], pose_.swimW[4], pose_.swimW[5], pose_.swimW[6]);
     pose_.swimOn = swimNow;
     if (!swimNow) {
       pose_.swimPitch -= pose_.swimPitch * HalfLifeK(dt, kSwimPitchHalflife);
