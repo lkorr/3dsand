@@ -101,6 +101,39 @@ const GEN_V_MAT_SHIFT : u32 = 4u;
 // Bindings 38/39 exist ONLY in simBGL_, like genAct.
 @group(0) @binding(38) var<storage, read> genCols : array<u32>;
 @group(0) @binding(39) var<storage, read_write> colCache : array<u32>;
+// ---- THE STILL-WATER TABLE (sim_step.wgsl's RESERVOIR stage reads it) ------
+// One record per WINDOW column, (x & WORLD_MASK, z & WORLD_MASK), stride
+// STILL_WORDS: [0] the world column's tag (stillTag), [1] the authored
+// standing-water surface of a map LAKE, a RIVER reach or the SEA at that
+// column -- (level & 0xFFFFF) | mat << 20, or 0 for "none". Disc ponds
+// (water sites, tarns) are deliberately NOT here: they are finite bodies the
+// water-body ledger owns, and a reservoir under one would refill a pond its
+// drain is emptying.
+//
+// Written by `cols` and nothing else, so it is a pure function of (seed, map,
+// x, z), like everything `cols` computes: every chunk-column a gen list names
+// rewrites its 256 records with the same answer, and a window shift that
+// hands a slot to a new world column rewrites it before any chunk of that
+// column is resident. The tag is the belt to that brace -- a slot whose
+// record names another world column (a snapshot restore that bypassed the
+// list) reads as "no still water", never as somebody else's level.
+// Derived data: not hashed, not saved. Binding 58 in simBGL_ only.
+@group(0) @binding(58) var<storage, read_write> stillWater : array<u32>;
+// STILL_WORDS, stillIndex and stillTag are written out again in sim_step.wgsl
+// (the reader); `--gate lake-settle` fails if the two ever disagree, because
+// a reader that never matches a tag never levels anything.
+const STILL_WORDS : u32 = 2u;
+fn stillIndex(x : i32, z : i32) -> u32 {
+  return (bitcast<u32>(z & WORLD_MASK) * WORLD_N + bitcast<u32>(x & WORLD_MASK)) * STILL_WORDS;
+}
+// Which world column a window slot holds: the window-sized tile it is in, per
+// axis, 15 bits each, plus a set low bit so a never-written record (0) never
+// matches. The map extent is +-100 k voxels = +-196 tiles of 512.
+fn stillTag(x : i32, z : i32) -> u32 {
+  let tx = bitcast<u32>(x >> firstTrailingBit(WORLD_N)) & 0x7FFFu;
+  let tz = bitcast<u32>(z >> firstTrailingBit(WORLD_N)) & 0x7FFFu;
+  return 1u | (tx << 1u) | (tz << 16u);
+}
 const GC_REC_BASE : u32 = NUM_SLOTS;
 const GC_REC_WORDS : u32 = 4u;
 const CC_WORDS : u32 = 26u;
@@ -6816,6 +6849,21 @@ fn cols(@builtin(workgroup_id) wg : vec3<u32>,
     colTop = max(colTop, trees.top);
     if (wmFlag(col.biome, WM_BF_CACTI)) { colTop = max(colTop, wgCactColTop(x, z, bx, bz)); }
     ccStore(blk + CC_HDR + ci * CC_WORDS, &col, &cave, ponds.n, canopy, colTop, trees.top);
+    // THE STILL-WATER RECORD (binding 58's block above). A map lake or a river
+    // reach is waterApply's water -- the column it shaped (`wet`) standing to
+    // its own surface (`pond == fluidTop`); the sea is the one global plane
+    // with no pond at all. Anything else, a disc pond included, records 0.
+    {
+      var sv = 0u;
+      if (col.fluidTop >= 0 && col.fluid == M_WATER &&
+          ((col.wet && col.pond == col.fluidTop) ||
+           (col.pond < 0 && col.fluidTop == seaLevelY()))) {
+        sv = (bitcast<u32>(col.fluidTop) & 0xFFFFFu) | (col.fluid << 20u);
+      }
+      let si = stillIndex(x, z);
+      stillWater[si] = stillTag(x, z);
+      stillWater[si + 1u] = sv;
+    }
     // Low byte the top cell's grains, next byte h - sedTop (clamped: 255 is
     // deeper than any wedge, i.e. the whole wedge is firm).
     colCache[blk + CC_HDR + ci * CC_WORDS + CCW_TOP_MASS] =

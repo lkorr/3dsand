@@ -360,6 +360,7 @@ BUF_TO_WGSL = {
     "CaMask": {"caMask"},
     "CaWind": {"caWind"},
     "CaArgs": {"caArgs"},
+    "StillWater": {"stillWater"},
     # The temperature layer, bindings 50..52 of simBGL_ (src/sim/heat.h).
     # HeatArgs is indirect-only and never bound, like SolArgs.
     "HeatPool": {"heatPool"},
@@ -460,6 +461,9 @@ _SIM_GROUP0 = {
     # The worldgen column cache, bindings 38/39 (worldgen.wgsl, Simulation::
     # WriteGenList). simBGL_ only: `cols`, `main` and `list` run on it.
     "genCols", "colCache",
+    # The still-water table, binding 58 (worldgen.wgsl `cols` writes it, the
+    # CA's reservoir stage reads it). simBGL_ only.
+    "stillWater",
     # The baked tree atlas, binding 26.
     "treeAtlas",
     # The discharge's emission seam, binding 25 (M3).

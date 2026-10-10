@@ -631,6 +631,7 @@
     "waterRelevelMax": 4,
     "waterRelevelGain": 8,
     "waterRelevelDepth": 32,
+    "stillWaterRelax": 32,
     "waveMode": 1,
     "waveGravity": 98,
     "waveDepthCap": 10,

@@ -995,6 +995,9 @@ class Simulation {
   rhi::Buffer caMaskBuf_, caWindBuf_;
   // The colour rows' indirect args (sim_step.wgsl calist / caArgs, binding 54).
   rhi::Buffer caArgsBuf_;
+  // pass::Buf::StillWater (worldgen.wgsl's still-water table, binding 58):
+  // per window column, the authored surface of a map lake / river / the sea.
+  rhi::Buffer stillWaterBuf_;
   // pass::Buf::RenderUBOTick (docs/PLAN_async_compute.md).
   rhi::Buffer renderUBOTickBuf_;
   bool draftOn_ = false, draftRebuild_ = false, draftForce_ = true, draftValid_ = false;

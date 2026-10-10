@@ -1521,10 +1521,38 @@ fn wbBandFloor(level : i32, floorY : i32) -> i32 {
 // the body's FREE SURFACE at all, and a roofed pocket — water under a ledge,
 // water in a flooded tunnel below the bank — is not a free surface. Requiring
 // air is what keeps this rule out of the caves that open under a bank.
+//
+// THE MOUND CLIMB (2026-10-10, bug report 2026-10-10_03-17-54). The walk used
+// to START at `yTop` (level + 1) and give up the moment the cell above its
+// first water was more water. So a column whose water stood TWO or more voxels
+// over the level -- every column of the mound a lake-bottom blast leaves when
+// the MPM settles its particles back on top of the surface -- reported
+// nothing, the histogram never saw the excess, the mean never moved, and the
+// relevel (whose whole job is to flatten that mound) sat still beside it while
+// the reach-1 CA spread it into a permanent terraced dome. Now a column whose
+// `yTop` cell is ours climbs to the top of its own water first, at most
+// WB_RV_CLIMB cells: a pillar taller than that is not a mound on a lake, it is
+// something standing in it, and it stays unmeasured as before. A flat lake
+// pays one extra read (yTop is air), exactly what it paid.
+//
+// Writes stay legal: a give takes eighths off the TOP cell, which is water
+// with air above it, so its chunk holds both and is a real page. A take is
+// still clamped to `level + 1` (wbRelevel), so a mound column only ever gives.
+const WB_RV_CLIMB : i32 = 16;
 fn wbColumnSurface(x : i32, z : i32, mat : i32, yTop : i32, yBot : i32,
                    outY : ptr<function, i32>, outFull : ptr<function, i32>,
                    outWord : ptr<function, u32>) -> i32 {
-  for (var y = yTop; y >= yBot; y--) {
+  var top = yTop;
+  if (i32(voxMat(voxWordAt(vec3<i32>(x, yTop, z)))) == mat) {
+    var k = 0;
+    loop {
+      if (i32(voxMat(voxWordAt(vec3<i32>(x, top + 1, z)))) != mat) { break; }
+      if (k >= WB_RV_CLIMB) { return WB_RV_NOTAKE; }
+      top = top + 1;
+      k = k + 1;
+    }
+  }
+  for (var y = top; y >= yBot; y--) {
     let c = vec3<i32>(x, y, z);
     let w = voxWordAt(c);
     if (i32(voxMat(w)) != mat) { continue; }

@@ -425,6 +425,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(55, T::Storage),         // elecPool (u16 P per cell, two halves)
         entry(56, T::Storage),         // elecMeta (table, owners, wants, lists, stack)
         entry(57, T::ReadOnlyStorage), // elecParams (knobs, wet table, per material)
+        // The still-water table (worldgen.wgsl's block of that name): `cols`
+        // writes it, the CA's reservoir stage (sim_step.wgsl THE RESERVOIR)
+        // reads it. simBGL_ only. 58 is the first free slot of this dense
+        // 0..57 layout.
+        entry(58, T::Storage),         // stillWater (per window column)
     };
     simBGL_ =device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -922,6 +927,19 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   {
     const uint32_t zero[192] = {};
     device.GetQueue().WriteBuffer(caArgsBuf_, 0, zero, sizeof zero);
+  }
+  // The still-water table (worldgen.wgsl, binding 58): two words per WINDOW
+  // column (tag, level | mat << 20), written by every `cols` dispatch. ZEROED
+  // so a record no list has written yet carries tag 0, which no column's tag
+  // equals (stillTag sets bit 0): it reads as "no still water", never as a
+  // level some uninitialised memory happened to spell. 2 MiB.
+  {
+    constexpr uint64_t kStillWaterWords = (uint64_t)kWorldN * kWorldN * 2u;
+    stillWaterBuf_ = CreateBuffer(device, kStillWaterWords * 4u,
+                                  rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                                  "stillWater");
+    const std::vector<uint32_t> zero(kStillWaterWords, 0u);
+    device.GetQueue().WriteBuffer(stillWaterBuf_, 0, zero.data(), zero.size() * 4u);
   }
   // ...and its ambient wind cache (sim_step.wgsl caWind): 64 blocks x 3 words.
   caWindBuf_ = CreateBuffer(device, (uint64_t)kNumSlots * 64u * 3u * 4u,
@@ -1427,6 +1445,7 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(55, world_->elecPool),
         b(56, world_->elecMeta),
         b(57, elecParamsBuf_),
+        b(58, stillWaterBuf_),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -2876,6 +2895,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::CaMask:              return caMaskBuf_;
     case B::CaWind:              return caWindBuf_;
     case B::CaArgs:              return caArgsBuf_;
+    case B::StillWater:          return stillWaterBuf_;
     case B::RenderUBOTick:       return renderUBOTickBuf_;
     case B::WindStreaks:         return windStreakBuf_;
     case B::ShadowArgsStage:     return world_->shadowArgsStage;
