@@ -6109,7 +6109,17 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
                           vec2f(tEnter0, tLvlOut));
     let tEnter = clip.x;
     let tExit = clip.y;
-    if (tExit <= tEnter) { continue; }   // box missed (or fully behind tPrev)
+    // A level the sky bound empties still COVERS its range: the ray is above
+    // every cell it holds out to tLvlOut, so the next level starts there, as
+    // it would behind a level marched to the end. Handing on the CLIPPED stop
+    // (or, on this skip, nothing at all) let a coarser level march the finer
+    // one's range from near the eye, where its taller quantised cells -- a
+    // level-8 summit cell stands up to a cell above the summit -- drew a
+    // floating dithered band over a mountain top (ticket 2026-10-09_22-05-04).
+    if (tExit <= tEnter) {   // box missed, fully behind tPrev, or all sky
+      tPrev = max(tPrev, tLvlOut * s - dith * 2.0 * s);
+      continue;
+    }
 
     // ---- NESTED TRAVERSAL: a CHUNK cursor over a CELL cursor ---------------
     // (2026-09-07.) This was ONE flat cell DDA with a re-seed hack: every time
@@ -6185,7 +6195,9 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     // CHUNK cursor's, i.e. the entry face of the chunk the budget died in —
     // conservative by up to one chunk, which makes the next level re-cover a
     // little instead of leaving a hole.
-    var tStop = tExit;
+    // tLvlOut, not tExit: past the sky bound's plane this level is all air,
+    // so its coverage still runs to tLvlOut (see the skip above).
+    var tStop = tLvlOut;
     var budget = TUNE_FAR_STEPS;
     // Where the budget died INSIDE a chunk's cell walk (the entry t of the
     // last cell it tested), or -1. See "THE BUDGET DIED MID-CHUNK" below.
@@ -6912,29 +6924,52 @@ fn cloudySkyAirglow(rd : vec3f) -> vec3f {
 // A target whose size is not the one CloudParams was written for (a stale
 // uniform) reads as clear sky rather than as someone else's clouds.
 struct CloudPx { c : vec3f, t : f32, td : f32 };
-fn cloudScreenAt(fragXY : vec2f) -> CloudPx {
+// For a SKY pixel along `rd`. A texel whose march stopped at the far
+// horizon's ground (the CUT bit, cloud.wgsl gCut) holds only the cloud in
+// front of a mountain the pyramid says is there; this pixel is sky, so the
+// frame drew no such ground (the pyramid's 25.6 m posts bridge a notch, or the
+// cascade is still refilling). Taking it painted a mountain-shaped HOLE in the
+// clouds, which jittered with the march's sub-pixel offset (ticket
+// 2026-10-09_22-19-35). A cut texel's bilinear weight goes to the env map
+// instead (the uncut column, cloud.wgsl env): weighted, not switched, so the
+// hand-over is as smooth as the bilinear itself. The env map has no detail
+// erosion, so a large region the frame draws no ground under (a cascade
+// refilling) reads softer, never as a hole.
+fn cloudScreenAt(fragXY : vec2f, rd : vec3f) -> CloudPx {
   let div = f32(max(CL.resDiv, 1u));
   let f = clamp(fragXY / div - 0.5, vec2f(0.0),
                 vec2f(f32(CL.lowW) - 1.001, f32(CL.lowH) - 1.001));
   let i0 = vec2<u32>(floor(f));
   let fr = f - floor(f);
   let i1 = min(i0 + vec2<u32>(1u), vec2<u32>(CL.lowW - 1u, CL.lowH - 1u));
-  let a = cloudHistTexel(vec2<u32>(i0.x, i0.y));
-  let b = cloudHistTexel(vec2<u32>(i1.x, i0.y));
-  let c = cloudHistTexel(vec2<u32>(i0.x, i1.y));
-  let d = cloudHistTexel(vec2<u32>(i1.x, i1.y));
-  let v = mix(mix(a.c, b.c, fr.x), mix(c.c, d.c, fr.x), fr.y);
-  let t = mix(mix(a.t, b.t, fr.x), mix(c.t, d.t, fr.x), fr.y);
-  let td = mix(mix(a.td, b.td, fr.x), mix(c.td, d.td, fr.x), fr.y);
-  return CloudPx(max(v, vec3f(0.0)), clamp(t, 0.0, 1.0), clamp(td, 0.0, 1.0));
+  var acc = CloudPx(vec3f(0.0), 0.0, 0.0);
+  var wCut = 0.0;
+  for (var k = 0u; k < 4u; k++) {
+    let p = vec2<u32>(select(i0.x, i1.x, (k & 1u) != 0u), select(i0.y, i1.y, k >= 2u));
+    let w = select(1.0 - fr.x, fr.x, (k & 1u) != 0u) * select(1.0 - fr.y, fr.y, k >= 2u);
+    let idx = CL.histCur + (p.y * CL.lowW + p.x) * 3u;
+    if (idx + 2u >= arrayLength(&cloudHist)) { return CloudPx(vec3f(0.0), 1.0, 1.0); }
+    if ((cloudHist[idx + 2u] & 512u) != 0u) { wCut += w; continue; }
+    let e = cloudHistTexel(p);
+    acc.c += e.c * w;
+    acc.t += e.t * w;
+    acc.td += e.td * w;
+  }
+  if (wCut > 0.0) {
+    let e = cloudEnvAt(normalize(rd), &CL, &cloudMaps);
+    acc.c += max(e.rgb, vec3f(0.0)) * wCut;
+    acc.t += e.a * wCut;
+    acc.td += e.a * wCut;
+  }
+  return CloudPx(max(acc.c, vec3f(0.0)), clamp(acc.t, 0.0, 1.0), clamp(acc.td, 0.0, 1.0));
 }
 fn cloudHistTexel(p : vec2<u32>) -> CloudPx {
   let i = CL.histCur + (p.y * CL.lowW + p.x) * 3u;
   if (i + 2u >= arrayLength(&cloudHist)) { return CloudPx(vec3f(0.0), 1.0, 1.0); }
   let rg = unpack2x16float(cloudHist[i]);
   let bt = unpack2x16float(cloudHist[i + 1u]);
-  // Word 2 = Td (10 bits) | extinction span (2 x 11 bits): cloud.wgsl packTdSpan.
-  return CloudPx(vec3f(rg.x, rg.y, bt.x), bt.y, f32(cloudHist[i + 2u] & 1023u) / 1023.0);
+  // Word 2 = Td (9 bits) | cut (bit 9) | span (2 x 11 bits): cloud.wgsl packTdSpan.
+  return CloudPx(vec3f(rg.x, rg.y, bt.x), bt.y, f32(cloudHist[i + 2u] & 511u) / 511.0);
 }
 // The cloud image IN FRONT OF a surface `tHitM` metres along the ray, for the
 // deck composite over hit pixels. Each texel's march recorded where along its
@@ -6954,13 +6989,20 @@ fn cloudScreenAtHit(fragXY : vec2f, tHitM : f32) -> CloudPx {
   let fr = f - floor(f);
   let i1 = min(i0 + vec2<u32>(1u), vec2<u32>(CL.lowW - 1u, CL.lowH - 1u));
   var o = CloudPx(vec3f(0.0), 0.0, 0.0);
+  var wSum = 0.0;
   for (var k = 0u; k < 4u; k++) {
     let p = vec2<u32>(select(i0.x, i1.x, (k & 1u) != 0u), select(i0.y, i1.y, k >= 2u));
-    let w = select(1.0 - fr.x, fr.x, (k & 1u) != 0u) * select(1.0 - fr.y, fr.y, k >= 2u);
+    var w = select(1.0 - fr.x, fr.x, (k & 1u) != 0u) * select(1.0 - fr.y, fr.y, k >= 2u);
     let idx = CL.histCur + (p.y * CL.lowW + p.x) * 3u;
     var c = vec3f(0.0);
     var t = 1.0;
     if (idx + 2u < arrayLength(&cloudHist)) {
+      // A CUT texel's ray stopped on the ground, in steps fitted to that
+      // short segment: the best proxy a hit pixel has. An uncut texel is a
+      // sky ray whose span runs kilometres past this surface in steps of
+      // hundreds of metres, so its share for a near hit is a guess; next to a
+      // cut texel it all but gives way (ticket 2026-10-09_22-19-35).
+      w *= select(0.08, 1.0, (cloudHist[idx + 2u] & 512u) != 0u);
       let rg = unpack2x16float(cloudHist[idx]);
       let bt = unpack2x16float(cloudHist[idx + 1u]);
       let sw = cloudHist[idx + 2u];
@@ -6976,7 +7018,10 @@ fn cloudScreenAtHit(fragXY : vec2f, tHitM : f32) -> CloudPx {
     }
     o.c += c * w;
     o.t += t * w;
+    wSum += w;
   }
+  o.c /= max(wSum, 1e-6);
+  o.t = select(1.0, o.t / wSum, wSum > 1e-6);
   o.td = o.t;
   return o;
 }
@@ -7312,7 +7357,7 @@ fn rainOverlay(colorIn : vec3f, rd : vec3f, tDepthVox : f32) -> vec3f {
 fn skyBackdrop(rd : vec3f, xy : vec2f) -> SkyParts {
   let sp = skyColorParts(rd);
   if ((R.weatherFlags & RWF_CLOUDS) == 0u) { return sp; }
-  let cs = cloudScreenAt(xy);
+  let cs = cloudScreenAt(xy, rd);
   let glow = sp.glow * cs.t + cs.c;
   return SkyParts(glow + (sp.full - sp.glow) * cs.td, glow);
 }

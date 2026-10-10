@@ -672,13 +672,18 @@ fn rainLayer(rd : vec3f, Lt : CloudLight, mu : f32, tMax : f32, jit : f32) -> Ma
 // sphere stood in for "the ray went into the ground". A 1,400 m massif under a
 // 700 m storm base is not metres: its flanks are IN the deck. So the ground is
 // the far horizon's pyramid (horizon.h; raymarch.wgsl traceHorizon reads the
-// same words): its AVG ground (never under the sea), bilinear, flat-world
-// like the terrain the raymarch draws. AVG and not the MAX silhouette: a ray
-// that grazes a ridge the MAX overstates would stop short of the deck and
-// draw a sliver of clear sky between the real ridge and the cloud (seen on
-// screenshot_peaks_cloudcap); a ray that sinks a few metres into the real
-// ground under the AVG only marches a little cloud behind the surface. HZ_* mirror horizon.h's header (raymarch.wgsl and
-// horizon_light.wgsl carry the same list).
+// same words): its MAX silhouette past a few hundred metres, its AVG ground
+// nearer (hzGroundM; bilinear, flat-world like the terrain the raymarch
+// draws). It was the AVG ground everywhere until 2026-10-10, because a ray that
+// grazes a ridge the MAX overstates stopped short of the deck and drew a
+// sliver of clear SKY between the real ridge and the cloud. Sky pixels no
+// longer take a cut texel (the CUT bit, raymarch.wgsl cloudScreenAt), so that
+// cost is gone, and the AVG's own cost was the larger one: a hit pixel on a
+// crest the AVG shaves borrowed an UNCUT texel whose extinction lies kilometres
+// past the crest, so ridge tops inside the deck drew clear while the face
+// under them drew clouded (ticket 2026-10-09_22-19-35, "glitched out bits of
+// the mountain poking through"). HZ_* mirror horizon.h's header (raymarch.wgsl
+// and horizon_light.wgsl carry the same list).
 const HZ_H_VALID : u32 = 0u;
 const HZ_H_X0 : u32 = 1u;
 const HZ_H_Z0 : u32 = 2u;
@@ -698,24 +703,36 @@ const HZ_H_SAMPLES : u32 = 11u;
 // can still be stepped over; the composite's span rescale (raymarch.wgsl
 // cloudScreenAtHit) then trims what was marched behind the real surface.
 const GROUND_STEPS : i32 = 56;
-// The env map (64^2, a fog target read through a bilinear of a coarse
-// octahedron) does not need the screen's ridge resolution.
-const GROUND_STEPS_ENV : i32 = 28;
+// Only the SCREEN march looks for the ground (deckSpan). The env map is the
+// fog target and the sky fallback for a texel the ground cut (raymarch.wgsl
+// cloudScreenAt), and in both roles it must be the column as if no mountain
+// stood in it: a fogged slope converges to it, and a sky pixel only reaches
+// it where the frame drew no ground.
 const GROUND_FIRST_M : f32 = 20.0;
 const GROUND_GROW_MIN : f32 = 1.06;
 
-fn hzGroundM(xzM : vec2f) -> f32 {
+// The ground at (x, z) for a ray point `t` metres out: the AVG ground near the
+// eye, eased to the MAX silhouette by HZ_MAX_FAR_M. Near, MAX overstates a
+// slope by up to a whole 25.6 m sample sideways -- a big angle at 50 m, and
+// every sky pixel in it took the env stand-in (a lighter wedge beside a cliff
+// seen from inside a storm deck) -- while the cloud in front of near ground is
+// thin either way. Far, the AVG shaved crests into clear slivers (above).
+const HZ_MAX_NEAR_M : f32 = 60.0;
+const HZ_MAX_FAR_M : f32 = 500.0;
+fn hzGroundM(xzM : vec2f, t : f32) -> f32 {
   let s = f32(1u << horizon[HZ_H_LOG2]);
   let n = vec2<i32>(bitcast<i32>(horizon[HZ_H_NX]), bitcast<i32>(horizon[HZ_H_NZ]));
   let o = vec2f(f32(bitcast<i32>(horizon[HZ_H_X0])), f32(bitcast<i32>(horizon[HZ_H_Z0])));
   let q = clamp((xzM / VOXEL_METERS - o) / s, vec2f(0.0), vec2f(n - vec2<i32>(1)));
   let i = max(min(vec2<i32>(floor(q)), n - vec2<i32>(2)), vec2<i32>(0));
   let f = q - vec2f(i);
+  let u = smoothstep(HZ_MAX_NEAR_M, HZ_MAX_FAR_M, t);
   var h : vec4f;
   for (var k = 0; k < 4; k++) {
     let c = min(i + vec2<i32>(k & 1, k >> 1), n - vec2<i32>(1));
     let w = horizon[horizon[HZ_H_SAMPLES] + u32(c.y * n.x + c.x)];
-    h[k] = f32(bitcast<i32>(w) >> 16u);
+    // lo i16 = MAX, hi i16 = AVG (horizon.h)
+    h[k] = mix(f32(bitcast<i32>(w) >> 16u), f32((bitcast<i32>(w) << 16u) >> 16u), u);
   }
   let sea = f32(bitcast<i32>(horizon[HZ_H_SEA_Y]));
   return max(mix(mix(h.x, h.y, f.x), mix(h.z, h.w, f.x), f.y), sea) * VOXEL_METERS;
@@ -736,13 +753,13 @@ fn terrainHitM(rd : vec3f, tMax : f32, steps : i32) -> f32 {
     if (tPrev >= tMax) { break; }
     let tk = min(t, tMax);
     let p = C.camM + rd * tk;
-    if (p.y <= hzGroundM(p.xz)) {
+    if (p.y <= hzGroundM(p.xz, tk)) {
       var a = tPrev;
       var b = tk;
       for (var it = 0; it < 6; it++) {
         let m = 0.5 * (a + b);
         let pm = C.camM + rd * m;
-        if (pm.y <= hzGroundM(pm.xz)) { b = m; } else { a = m; }
+        if (pm.y <= hzGroundM(pm.xz, m)) { b = m; } else { a = m; }
       }
       return b;
     }
@@ -800,8 +817,8 @@ fn deckSpan(rd : vec3f, groundT : ptr<function, f32>, quality : u32) -> vec2f {
     groundLook = min(groundLook, select(TUNE_SHORT_RANGE_DIST, TUNE_SHORT_RANGE_NEAR_DIST,
                                         (R.flags & 16u) != 0u));
   }
-  if (groundLook > 0.0) {
-    let steps = select(GROUND_STEPS_ENV, GROUND_STEPS, quality == 1u);
+  if (groundLook > 0.0 && quality == 1u) {
+    let steps = GROUND_STEPS;
     *groundT = min(*groundT, terrainHitM(rd, groundLook, steps));
   }
   if (t0 >= t1 || t0 >= *groundT) { return vec2f(0.0, -1.0); }
@@ -818,12 +835,19 @@ fn deckSpan(rd : vec3f, groundT : ptr<function, f32>, quality : u32) -> vec2f {
 // the deck behind a slope painted over it, the deck below a cliff painted
 // over the cliff.
 var<private> gExtSpan : vec2f;
+// 1 when this screen ray stopped at the pyramid's ground (bit 9 of word 2).
+var<private> gCut : u32;
 fn extendSpan(a : f32, b : f32) {
   gExtSpan = vec2f(min(gExtSpan.x, a), max(gExtSpan.y, b));
 }
 
 // The whole column along `rd`: rain in front, then the deck, then the cirrus
-// behind it. `quality` 0 = the env map (few steps, no detail), 1 = the screen.
+// behind it. `quality` 0 = the env map, 1 = the screen. Both march at full
+// quality since 2026-10-10: the env map is now also the stand-in for a sky
+// pixel whose screen texels the ground cut (raymarch.wgsl cloudScreenAt), and
+// at a third of the steps without the detail erosion it drew a visibly lighter,
+// flatter band beside every such silhouette. 64^2 rays, so the cost is small.
+// Only the screen march looks for the ground (deckSpan) and sets the CUT bit.
 fn marchSky(rd : vec3f, jit : f32, quality : u32) -> March {
   let Lt = cloudLight();
   let mu = dot(rd, Lt.dir);
@@ -832,12 +856,19 @@ fn marchSky(rd : vec3f, jit : f32, quality : u32) -> March {
   gExtSpan = vec2f(1e7, 0.0);
   var tFirst = 1e7;
   var tLast = 0.0;
+  // The last sample the march KNOWS was empty (the span start until one is
+  // taken). The span's near end is that point, not the first cloudy sample
+  // less half a step: the steps run to hundreds of metres on a long ray and
+  // their start is jittered per frame, so "first cloudy sample" jumped by a
+  // step frame to frame and a slope inside the deck flickered between clear
+  // and clouded (ticket 2026-10-09_22-19-35). From the last empty sample the
+  // near end only moves where the march saw real empty air in front.
+  var tEmpty = span.x;
 
   // ---- the deck ----
   var deck = March(vec3f(0.0), 1.0, 1e7, 1.0);
   if (span.x < span.y && C.coverage > 0.001) {
-    let full = quality == 1u;
-    let nSteps = select(max(TUNE_CLOUD_STEPS / 3u, 12u), TUNE_CLOUD_STEPS, full);
+    let nSteps = TUNE_CLOUD_STEPS;
     let seg = span.y - span.x;
     // Steps no finer than 25 m (a vertical ray through a thin sheet would
     // otherwise spend its whole budget on 5 m steps) and no coarser than the
@@ -847,7 +878,7 @@ fn marchSky(rd : vec3f, jit : f32, quality : u32) -> March {
     var T = 1.0;
     var acc = vec3f(0.0);
     var dAcc = 0.0;
-    let lightN = select(3u, TUNE_CLOUD_LIGHT_STEPS, full);
+    let lightN = TUNE_CLOUD_LIGHT_STEPS;
     let pw = TUNE_CLOUD_POWDER * (0.5 - 0.5 * mu);
     // Lightning: where the stroke is, and how bright.
     let flashCol = vec3f(0.75, 0.82, 1.0) * C.flashAmp * 60.0;
@@ -858,8 +889,9 @@ fn marchSky(rd : vec3f, jit : f32, quality : u32) -> March {
       let p = C.camM + rd * t;
       let wm = weatherAt(p.xz);
       // Empty-space stride: no coverage here means no cloud for a while.
-      if (wm.x < 0.01) { t += ds0 * 2.0; continue; }
-      let d = cloudDensity(p, wm, !full);
+      if (wm.x < 0.01) { tEmpty = t; t += ds0 * 2.0; continue; }
+      let d = cloudDensity(p, wm, false);
+      if (d <= 0.0 && tLast == 0.0) { tEmpty = t; }
       if (d > 0.0) {
         let h = clamp((altOf(p) - deckBase(wm)) / C.thicknessM, 0.0, 1.0);
         let od = lightOD(p, Lt.dir, lightN, fract(jit * 7.31 + f32(it) * 0.618));
@@ -890,8 +922,8 @@ fn marchSky(rd : vec3f, jit : f32, quality : u32) -> March {
           S += sigS * flashCol * exp(-fd / 900.0);
         }
         let tr = exp(-sigT * ds0);
-        tFirst = min(tFirst, t - 0.5 * ds0);
-        tLast = t + 0.5 * ds0;
+        tFirst = min(tFirst, tEmpty);
+        tLast = t + ds0;
         let Sint = (S - S * tr) / max(sigT, 1e-7);
         acc += T * Sint;
         dAcc += t * T * (1.0 - tr);
@@ -911,6 +943,7 @@ fn marchSky(rd : vec3f, jit : f32, quality : u32) -> March {
   // The env map keeps them -- it is the fog target, and the fogged ground has
   // to meet the fill without a seam.
   let blocked = quality == 1u && groundT < 1e9;
+  gCut = select(0u, 1u, blocked);
 
   // ---- THE DECK PAST THE MARCH: the horizon ----
   // Under a deck at 1 km the base meets the horizon ~110 km out — past the
@@ -988,22 +1021,23 @@ fn march(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = (gid.y * C.lowW + gid.x) * RAW_WORDS;
   cloudRaw[i] = pack2x16float(m.c.xy);
   cloudRaw[i + 1u] = pack2x16float(vec2f(m.c.z, m.t));
-  cloudRaw[i + 2u] = packTdSpan(m.td, gExtSpan);
+  cloudRaw[i + 2u] = packTdSpan(m.td, gExtSpan) | (gCut << 9u);
   cloudRaw[i + 3u] = bitcast<u32>(m.depth);
 }
 
-// Word 2 of a raw/history texel: Td in 10 bits, then the extinction span
-// (gExtSpan) as two 11-bit log2 distances, 1 m .. 2^17 m in 0.6% steps.
-// raymarch.wgsl cloudHistTexel decodes it; the two must agree.
+// Word 2 of a raw/history texel: Td in 9 bits, the CUT flag (bit 9: the ray
+// stopped at the pyramid's ground, gCut), then the extinction span (gExtSpan)
+// as two 11-bit log2 distances, 1 m .. 2^17 m in 0.6% steps. raymarch.wgsl
+// cloudHistTexel / cloudScreenAt / cloudScreenAtHit decode it; they must agree.
 const SPAN_LOG2_MAX : f32 = 17.0;
 fn encSpanM(d : f32) -> u32 {
   return u32(round(clamp(log2(max(d, 1.0)) / SPAN_LOG2_MAX, 0.0, 1.0) * 2047.0));
 }
 fn packTdSpan(td : f32, span : vec2f) -> u32 {
-  return u32(round(clamp(td, 0.0, 1.0) * 1023.0)) | (encSpanM(span.x) << 10u) |
+  return u32(round(clamp(td, 0.0, 1.0) * 511.0)) | (encSpanM(span.x) << 10u) |
          (encSpanM(span.y) << 21u);
 }
-fn unpackTd(w : u32) -> f32 { return f32(w & 1023u) / 1023.0; }
+fn unpackTd(w : u32) -> f32 { return f32(w & 511u) / 511.0; }
 
 // A texel as (r, g, b, T) plus Td, the direct transmittance, in `td`.
 struct Tex5 { v : vec4f, td : f32 };
@@ -1050,6 +1084,7 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
   var outv = cur.v;
   var outd = cur.td;
+  var spanW = cloudRaw[(gid.y * C.lowW + gid.x) * RAW_WORDS + 2u];
   if ((C.flags & CLF_HIST_VALID) != 0u) {
     let ri = (gid.y * C.lowW + gid.x) * RAW_WORDS;
     let depth = min(bitcast<f32>(cloudRaw[ri + 3u]), 2e5);
@@ -1081,16 +1116,27 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
         let alpha = max(TUNE_CLOUD_TEMPORAL, 1.0 / (C.spare.x + 1.0));
         outv = mix(hist, cur.v, alpha);
         outd = mix(histD, cur.td, alpha);
+        // THE SPAN IS ACCUMULATED TOO, in its log2 code. It was this frame's
+        // alone while (c, T) were the running mean of many: the jittered
+        // march moved the span's ends by up to a step every frame against a
+        // steady opacity, and the composite over a slope inside the deck
+        // twitched with it (ticket 2026-10-09_22-19-35). Nearest history
+        // texel (a log distance does not bilinear across a silhouette), and
+        // only when both carry cloud: an empty span is not a distance.
+        let hs = cloudHist[C.histPrev + (u32(round(q.y)) * C.lowW + u32(round(q.x))) * HIST_WORDS + 2u];
+        let ha = vec2f(f32((hs >> 10u) & 2047u), f32(hs >> 21u));
+        let ca = vec2f(f32((spanW >> 10u) & 2047u), f32(spanW >> 21u));
+        if (ha.x <= ha.y && ca.x <= ca.y) {
+          let m = vec2<u32>(round(mix(ha, ca, alpha)));
+          spanW = (spanW & 1023u) | (m.x << 10u) | (m.y << 21u);
+        }
       }
     }
   }
   let o = C.histCur + (gid.y * C.lowW + gid.x) * HIST_WORDS;
   cloudHist[o] = pack2x16float(outv.xy);
   cloudHist[o + 1u] = pack2x16float(vec2f(outv.z, clamp(outv.w, 0.0, 1.0)));
-  // The span is THIS frame's, not reprojected: it is a property of the ray
-  // through this texel, and the blend above only smooths the dithered light.
-  let spanBits = cloudRaw[(gid.y * C.lowW + gid.x) * RAW_WORDS + 2u] & ~1023u;
-  cloudHist[o + 2u] = (packTdSpan(outd, vec2f(1.0)) & 1023u) | spanBits;
+  cloudHist[o + 2u] = (packTdSpan(outd, vec2f(1.0)) & 511u) | (spanW & ~511u);
 }
 
 // ============================================================================

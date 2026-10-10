@@ -15673,6 +15673,19 @@ where you hear from either (§12b, "The ears are on the character").
   pixel on both cameras after the ray-start map, so there is little left to
   cut there, and fs has no register headroom (and was another package's file
   that day).
+  **A level the sky bound empties still hands on its whole range**
+  (2026-10-10, ticket `2026-10-09_22-05-04`). `traceFar` clips each level to
+  the slab under its ceiling, and a level so clipped to nothing took
+  `continue` without moving `tPrev` — and a level clipped short handed on the
+  CLIPPED stop. Either way the next, coarser level marched the finer one's
+  range from near the eye, where its quantised cells stand taller than the
+  terrain the finer level just proved absent (a coarse summit cell reaches up
+  to a cell over the summit): from a peak, a floating dithered band of
+  level-8 cells ~100 m away hung across the sky at every yaw. Above a level's
+  ceiling the level is air, so its coverage runs to its sphere `tLvlOut`
+  regardless, and that is what the next level now starts from (the seam's
+  dither offset kept). The ray-start map is unaffected: it remains a lower
+  bound, of a hit that can now only be later.
   Measured in ONE process (`norstart` arm -> `baseline`, 1080p, RTX
   3060 Ti): noon 9.27 -> 7.75 ms, cascade 6.38 -> 4.93, meadow 7.47 -> 6.64,
   canopy 7.01 -> 5.31, seam 6.47 -> 5.44, seamveg 9.28 -> 7.89, fire 14.07 ->
@@ -18921,8 +18934,11 @@ each, never a march):
 `15-11-18` and `15-14-31`). Each screen-march texel records WHERE along its ray
 the extinction happened — the first and last deck sample that held cloud,
 widened by the rain, horizon fill and cirrus it added (`gExtSpan`) — as two
-11-bit log2 distances packed beside a 10-bit Td in history word 2 (no new
-words; `packTdSpan`). The composite over a hit at distance t scales each
+11-bit log2 distances packed beside a 9-bit Td and a CUT bit in history word 2
+(no new words; `packTdSpan`). The span's near end is the last sample the march
+saw EMPTY (not the first cloudy one less half a step: steps run to hundreds of
+metres and their start is jittered per frame), and the resolve accumulates the
+span like the light, in its log2 code. The composite over a hit at distance t scales each
 texel's optical depth by the share of that span in front of t (T^f, the
 in-scatter by the same opacity ratio) BEFORE the bilinear blend. So a slope
 climbing into the deck takes a sliver of cloud at the base and grades into it
@@ -18933,13 +18949,33 @@ hard line where the hit crossed `deckLo`, and from above the deck a false ledge
 of cloud painted across the face of the mountain the camera stood on. The second
 half of the cause: `terrainHitM`'s geometric ground search grew by a fixed 1.12
 over 40 steps, i.e. reached only 1.9 km, so no summit further off ever stopped
-the march. The growth is now fitted to the search distance (56 steps for the
-screen, 28 for the env map), and the search runs only as far as the deck's far
-side or the rain's reach. A screen ray that stops at the ground also drops the
-horizon fill and the cirrus (both behind it); the env map keeps them, as the fog
-target the fogged ground must meet. Cost: within noise of before (cloud pass
-1.3-1.8 ms mean in the two ticket views at 1600x900 under overcast, `--frames`
-pass attribution, before and after alike).
+the march. The growth is now fitted to the search distance (56 steps), and the
+search runs only as far as the deck's far side or the rain's reach. A screen ray
+that stops at the ground also drops the horizon fill and the cirrus (both behind
+it).
+
+**The ground cut is for hit pixels; sky pixels refuse it** (2026-10-10, ticket
+`22-19-35`). The pyramid is not the terrain the frame draws — 25.6 m posts that
+bridge notches and stand over or shave real crests, and nothing at all where a
+cascade is still refilling — and once the search reached past 1.9 km every sky
+ray that met it lost the deck behind: mountain-shaped holes in the clouds,
+twitching with the march's sub-pixel offset. So a texel whose march stopped at
+the ground carries the CUT bit, and `cloudScreenAt` (the sky composite) gives
+its bilinear weight to the env map instead, weighted rather than switched. The
+env map therefore marches the UNCUT column (no ground search) and, since it is
+now shown on screen, at full quality (the env pass went ~0.09 -> ~0.2-0.35 ms at
+1600x900). `cloudScreenAtHit` goes the other way: a cut texel is the best proxy
+a hit pixel has (fine steps fitted to a short segment), an uncut one a guess
+from a kilometres-long coarse span, so next to a cut texel the uncut ones carry
+8% weight. The surface searched is the pyramid's MAX silhouette past ~2.5 km,
+eased from the AVG ground inside ~300 m: the AVG shaved distant crests, so ridge
+tops inside the deck borrowed uncut texels and drew CLEAR over a clouded face
+("bits of the mountain poking through"); near the eye the MAX overstates a slope
+by a whole sample sideways, a wide angle of sky pixels sent to the env map,
+while the cloud in front of near ground is thin either way.
+
+Cost of the march itself: within noise of before (cloud pass 1.3-1.8 ms mean in
+the 10-09 ticket views at 1600x900 under overcast, `--frames` pass attribution).
 
 **Precipitation, tier 1 only.** Rain curtains hang under raining cells in the
 march (with the primary and secondary RAINBOW at 42°/51° from the anti-solar
