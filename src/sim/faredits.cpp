@@ -66,6 +66,17 @@ void FarEdits::Sweep(IVec3 wc,
               return (int)(sample(x, y, z) & 0xFFFu);
             });
           }
+          // THE COVER RULE (SetCoverSource): the cell lies inside this chunk
+          // at these shifts, and so do its eight sub-samples. After the
+          // container rule: a wall it found is far-solid and keeps the cell.
+          if (shift <= kCoverMaxShift && !coverOf_.empty() && !containKind_.empty() &&
+              ContainKindOf(mat & 0xFFFu) == kContainNone) {
+            const int c0[3] = {fine[0] - half - base[0], fine[1] - half - base[1],
+                               fine[2] - half - base[2]};
+            mat = CoverPick(mat & 0xFFFu, level, half, c0, [&](int x, int y, int z) {
+              return sample(x, y, z) & 0xFFFu;
+            });
+          }
           // level-cell coord -> its index inside the owning level chunk
           const uint32_t cx = (uint32_t)((fine[0] >> shift) & 15);
           const uint32_t cy = (uint32_t)((fine[1] >> shift) & 15);

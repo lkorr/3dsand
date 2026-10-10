@@ -389,6 +389,11 @@ enum class Buf : uint8_t {
   // upload, which lands while those rows may still be running on the async
   // queue, writes a different buffer.
   RenderUBOTick,
+  // The still-water table (worldgen.wgsl `cols` writes it, the CA's reservoir
+  // stage reads it; simBGL_ binding 58): per window column, the authored
+  // surface of a map lake / river reach / the sea, or none. Derived from the
+  // map like colCache, but persistent across gen lists.
+  StillWater,
   kCount,
 };
 
@@ -495,7 +500,9 @@ enum class Pipe : uint8_t {
   // sit inside the merged entry.
   // FarMapFill is the far SURFACE MAP's fill (worldgen.wgsl `farmap`), a third
   // row between the two: after the sweep, before the patch that invalidates it.
-  FarFill, FarMapFill, FarPatchFill, FarDown,
+  // FarCoverFill is the far COVER RULE over procgen trees (worldgen.wgsl
+  // `farcover`): after the sweep whose empty cells it fills, before the patch.
+  FarFill, FarCoverFill, FarMapFill, FarPatchFill, FarDown,
   // fardown's three follow-up dispatches (cross-vendor audit #9): the claim
   // check, the cut-stalk clear and the feature check, each its own entry so
   // no phase reads what another phase of the same dispatch is writing.
@@ -905,7 +912,8 @@ enum class DispatchSel : uint32_t {
 // `ca` gains R(CaMask) -> 26 uses (2026-10-01).
 // Raised 28 -> 32 by the temperature layer: `ca` gains R(HeatPool)
 // A(HeatMeta) R(HeatParams) -> 29 uses.
-inline constexpr int kMaxUses = 32;
+// Raised 32 -> 36 by the lake reservoir: `ca` gains R(StillWater) -> 33 uses.
+inline constexpr int kMaxUses = 36;
 
 struct Row {
   const char* name;

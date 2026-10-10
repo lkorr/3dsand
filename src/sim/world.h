@@ -3500,7 +3500,13 @@ struct TickParams {
   // Zero is the shipping state of every tick nobody blew anything up on, and
   // zero is an exact identity: `wbFlux`'s impulse loop does not execute.
   uint32_t waterImpulseCount = 0;
-  uint32_t padWi0 = 0, padWi1 = 0, padWi2 = 0;
+  // THE RESERVOIR'S RATE (sim_step.wgsl stage 5, sim.stillWaterRelax): the
+  // chance per 1024 per CA visit that a map lake / river / sea surface cell
+  // off its authored level moves one eighth toward it. On the tick stream
+  // rather than a WGSL const so a gate's control arm (and the F1 slider) moves
+  // it without a pipeline rebuild. Was padWi0; 0 = off, an exact identity.
+  uint32_t stillWaterRelax = 0;
+  uint32_t padWi1 = 0, padWi2 = 0;
   int32_t waterImpulses[kWaterImpulseScalars] = {};
 
   // ---- THE WIND FIELD BLOCK, the SIM's copy (kWindTerrN's note above;

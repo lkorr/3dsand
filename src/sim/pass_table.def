@@ -569,7 +569,7 @@ PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_CAARGS,0,
           A(GasSpawn) A(GasOuter) R(ReposeSnap)
           R(SolTable) A(SolPool) A(SolMeta) R(SolSpec) R(RainExpo) R(Draft) R(CaMask)
           R(CaWind) R(HeatPool) A(HeatMeta) R(HeatParams) R(ElecPool) A(ElecMeta)
-          R(ElecParams)))
+          R(ElecParams) R(StillWater)))
 // read-only in practice: `voxels`, as for caMask above.
 PASS(caMask1, "ca(54 color x substep)", PT_TICK, PIPE_CA_MASK, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA1, C_CAACTIVE, 1,
      USES(R(Voxels) R(PageTable) R(DirtyList) I(DispatchArgs) W(CaMask)
@@ -589,7 +589,7 @@ PASS(ca1, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_CAARGS,0
           A(GasSpawn) A(GasOuter) R(ReposeSnap)
           R(SolTable) A(SolPool) A(SolMeta) R(SolSpec) R(RainExpo) R(Draft) R(CaMask)
           R(CaWind) R(HeatPool) A(HeatMeta) R(HeatParams) R(ElecPool) A(ElecMeta)
-          R(ElecParams)))
+          R(ElecParams) R(StillWater)))
 
 // ---- phase 3a: THE SOLUTE LAYER AFTER THE CA (docs/PLAN_solutes.md §3.3) ---
 //
@@ -1464,7 +1464,8 @@ PASS(wg_fill_fluidBlockMap, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_
 // below is an in-pass barrier.
 PASS(worldgenColsDense, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN_COLS, K_COMPUTE, D_GENCOLS,1,1,
      GRP_SIM, DYN_ZERO, C_DENSEWG, 1,
-     USES(R(GenCols) R(Materials) U(TickUBO) W(ColCache) R(TreeAtlas) R(WorldMap)))
+     USES(R(GenCols) R(Materials) U(TickUBO) W(ColCache) R(TreeAtlas) R(WorldMap)
+          W(StillWater)))
 // read-only in practice: `colCache` is read_write for the module because
 // `cols` writes it; genChunk only reads the column records.
 PASS(worldgen, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_DENSEWG, 1,
@@ -1494,7 +1495,8 @@ PASS(worldgenWetAll, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN_WET_ALL, K_COMPUTE, 
 // `worldgenList` span is the whole streamed-gen cost, pre-pass included.
 PASS(worldgenCols, "worldgenList", PT_GENLIST, PIPE_WORLDGEN_COLS, K_COMPUTE, D_GENCOLS,1,1,
      GRP_SIM, DYN_ZERO, C_GENCOUNT, 1,
-     USES(R(GenCols) R(Materials) U(TickUBO) W(ColCache) R(TreeAtlas) R(WorldMap)))
+     USES(R(GenCols) R(Materials) U(TickUBO) W(ColCache) R(TreeAtlas) R(WorldMap)
+          W(StillWater)))
 // read-only in practice: `colCache` is read_write for the module because
 // `cols` writes it; genChunk only reads the column records.
 PASS(worldgenList,"worldgenList", PT_GENLIST, PIPE_WORLDGEN_LIST, K_COMPUTE, D_GENCOUNT,1,1,
@@ -1647,6 +1649,17 @@ PASS(ho_solHash, "occupancyFull(hashOnly)", PT_HASHONLY, PIPE_SOL_HASH, K_COMPUT
 // that was a hand-written storageBarrier; here both rows declare A(FarVox)
 // A(FarOcc) and the recorder generates it (barrier_graph §3.8).
 PASS(farFill, "farFill", PT_FARFILL, PIPE_FAR_FILL, K_COMPUTE, D_FARCOUNT,1,1,
+     GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
+     USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO)
+          A(FarVox) A(FarOcc) R(TreeAtlas) R(WorldMap)))
+// THE COVER RULE OVER PROCGEN TREES (worldgen.wgsl `farcover`, DESIGN.md "Far
+// crowns keep their coverage"). Same dispatch extent; reads the bytes the
+// sweep just wrote (a cell whose centre sample found matter keeps it) and
+// fills an empty cell with leaf when enough of its eight sub-samples are
+// leaf. AFTER the sweep (A(FarVox) A(FarOcc) RAW) and BEFORE the patch, so an
+// edited chunk's patch words -- whose CPU twin applies the same rule from the
+// voxels that were really there -- still have the last word.
+PASS(farCoverFill, "farCoverFill", PT_FARFILL, PIPE_FAR_COVER_FILL, K_COMPUTE, D_FARCOUNT,1,1,
      GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
      USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO)
           A(FarVox) A(FarOcc) R(TreeAtlas) R(WorldMap)))

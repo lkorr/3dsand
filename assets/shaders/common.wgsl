@@ -1014,7 +1014,8 @@ struct TickParams {
   // every pipe word (§4.1) — an impulse is another term in the head it already
   // integrates, not a second writer.
   waterImpulseCount : u32,
-  padWi0 : u32,
+  // sim.stillWaterRelax (world.h's note): sim_step.wgsl's reservoir stage.
+  stillWaterRelax : u32,
   padWi1 : u32,
   padWi2 : u32,
   waterImpulses : array<vec4<i32>, 16>,

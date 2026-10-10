@@ -124,6 +124,8 @@ PIPE_TO_MEMBER = {
     "PIPE_FAR_PATCH_FILL": "farPatchFill_",
     # The far SURFACE MAP fill (LOD-seam package A): worldgen.wgsl `farmap`.
     "PIPE_FAR_MAP_FILL": "farMapFill_",
+    # The cover rule over procgen trees: worldgen.wgsl `farcover`.
+    "PIPE_FAR_COVER_FILL": "farCoverFill_",
     "PIPE_FAR_DOWN": "farDown_",
     # fardown's follow-up phases (cross-vendor audit #9).
     "PIPE_FAR_DOWN_CLAIM": "farDownClaim_",
@@ -358,6 +360,7 @@ BUF_TO_WGSL = {
     "CaMask": {"caMask"},
     "CaWind": {"caWind"},
     "CaArgs": {"caArgs"},
+    "StillWater": {"stillWater"},
     # The temperature layer, bindings 50..52 of simBGL_ (src/sim/heat.h).
     # HeatArgs is indirect-only and never bound, like SolArgs.
     "HeatPool": {"heatPool"},
@@ -458,6 +461,9 @@ _SIM_GROUP0 = {
     # The worldgen column cache, bindings 38/39 (worldgen.wgsl, Simulation::
     # WriteGenList). simBGL_ only: `cols`, `main` and `list` run on it.
     "genCols", "colCache",
+    # The still-water table, binding 58 (worldgen.wgsl `cols` writes it, the
+    # CA's reservoir stage reads it). simBGL_ only.
+    "stillWater",
     # The baked tree atlas, binding 26.
     "treeAtlas",
     # The discharge's emission seam, binding 25 (M3).

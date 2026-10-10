@@ -254,6 +254,20 @@ void Stream::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
                                                       : FarEdits::kContainNone);
   }
   farEdits_.SetContainSource(std::move(containKind));
+  // The far index's COVER RULE source (faredits.h SetCoverSource): per
+  // material, its slot and the minimums word when its slot's OWNER is cover
+  // -- the GPU keys the rule on the far palette entry, which the owner writes
+  // (Simulation::UploadTables).
+  std::vector<uint8_t> ownerCovers(256, 0);
+  for (const auto& m : mats)
+    if (m.farPalOwner && m.farPalSlot < 256) ownerCovers[m.farPalSlot] = m.farCover ? 1 : 0;
+  std::vector<uint32_t> coverOf;
+  coverOf.reserve(mats.size());
+  for (const auto& m : mats) {
+    const bool cover = m.farPalSlot != 0 && m.farPalSlot < 256 && ownerCovers[m.farPalSlot] != 0;
+    coverOf.push_back(cover ? (m.farPalSlot | (FarCoverMinWord() << 8)) : 0u);
+  }
+  farEdits_.SetCoverSource(std::move(coverOf));
 }
 
 void Stream::Update(const InterestSet& interest, uint32_t tick) {

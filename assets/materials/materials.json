@@ -6268,8 +6268,7 @@
         "dissolvable",
         "foliage"
       ],
-      "molten": "fire",
-      "far": "maple_leaves"
+      "molten": "fire"
     },
     {
       "id": "maple_leaves",
@@ -6329,8 +6328,7 @@
         "dissolvable",
         "foliage"
       ],
-      "molten": "fire",
-      "far": "maple_leaves"
+      "molten": "fire"
     },
     {
       "//": "Golden BEECH leaf ramp (dark / mid / lit), the amberwood's second canopy (assets/trees/goldbeech.json).",
@@ -6361,8 +6359,7 @@
         "dissolvable",
         "foliage"
       ],
-      "molten": "fire",
-      "far": "gold_leaves"
+      "molten": "fire"
     },
     {
       "id": "gold_leaves",
@@ -6422,8 +6419,7 @@
         "dissolvable",
         "foliage"
       ],
-      "molten": "fire",
-      "far": "gold_leaves"
+      "molten": "fire"
     },
     {
       "//": "Charred wood: the ASHLANDS' burnt snags (assets/trees/charred.json). Already burnt: NOT flammable (it would only ever burn again), soft (a charred limb snaps), crumbles to charcoal.",
