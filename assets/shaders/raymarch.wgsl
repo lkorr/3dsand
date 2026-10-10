@@ -1349,11 +1349,15 @@ const NEBULA_EXTINCT : f32 = 1.2;
 // skyColorNoBodies(), so that fog and reflection lookups can take this and get
 // the right colour without point sources bleeding into solid geometry. The
 // `veil` it returns is how much of the starfield this glow stands in front of.
-fn nightGlow(rd : vec3f) -> SkyLayer {
-  // Base gradient: deep indigo overhead easing to a warmer, lighter horizon
-  // (airglow plus whatever light pollution the world implies).
+// The night dome's GRADIENT alone: deep indigo overhead easing to a warmer,
+// lighter horizon (airglow plus whatever light pollution the world implies).
+// nightGlow starts from it; skyAirlightSmooth takes nothing else.
+fn nightBase(rd : vec3f) -> vec3f {
   let up = clamp(rd.y, 0.0, 1.0);
-  var c = mix(TUNE_NIGHT_HORIZON, TUNE_NIGHT_ZENITH, pow(up, 0.65));
+  return mix(TUNE_NIGHT_HORIZON, TUNE_NIGHT_ZENITH, pow(up, 0.65));
+}
+fn nightGlow(rd : vec3f) -> SkyLayer {
+  var c = nightBase(rd);
 
   // Galactic band: a great circle tilted off the horizon, thickened with fbm
   // so its edges are ragged rather than a clean stripe.
@@ -1753,6 +1757,28 @@ fn skyColorNoBodiesU(rd : vec3f, dayW : f32) -> vec3f {
 
 fn skyAirglow(rdIn : vec3f) -> vec3f {
   return skyAirglowU(normalize(rdIn), dayWeight());
+}
+
+// THE AIR'S OWN LIGHT, with no emission layer in it: the day sky's scattering
+// plus the night dome's gradient (nightBase), and NOT the galactic band, the
+// nebulae or the aurora. Those are sources at infinity seen THROUGH the air;
+// a stretch of air between the eye and a hillside scatters the dome's light,
+// it does not paint a picture of one direction of the sky onto the hill.
+// Read where a direction OTHER than the pixel's own is sampled for airlight
+// (applyAerial's distance blue): there the structure of that other direction
+// lands on terrain that has nothing to do with it. Owner ticket
+// 2026-10-09_15-06-49 ("wispy stacks of smoke everywhere, below the height of
+// the character") was exactly that -- the aurora's curtains, sampled 17 deg
+// above each terrain pixel, where every below-horizon ray clamps to the SAME
+// elevation, so the curtain pattern varied with azimuth alone and drew as
+// vertical streaks over every fogged hillside, under a storm deck that hid
+// the aurora itself.
+fn skyAirlightSmooth(rdIn : vec3f) -> vec3f {
+  let rd = normalize(rdIn);
+  let dayW = dayWeight();
+  var c = daySky(rd) * dayW;
+  if (dayW < 0.999) { c += nightBase(rd) * (1.0 - dayW); }
+  return max(c, vec3f(0.0));
 }
 
 fn skyColorNoBodies(rdIn : vec3f) -> vec3f {
@@ -7265,9 +7291,20 @@ fn applyAerial(color : vec3f, rd : vec3f, tFine : f32) -> vec3f {
   // still converges to exactly the sky in `rd` (the rule above), and the
   // middle distance reads as a blue silhouette instead of a grey one. Skipped
   // where the air has barely started (the near field, most of the screen).
+  //
+  // The sample 17 deg up is the dome's SMOOTH airlight (skyAirlightSmooth: no
+  // galaxy, nebulae or aurora -- ticket 2026-10-09_15-06-49, see there) under
+  // the same cloud cover the base airlight takes (cloudySkyAirglow's env-map
+  // composite), so an overcast's distance haze is the grey of the deck it
+  // stands under rather than a clear sky's blue.
   if (R.fogHaze > 0.0 && f > 0.03) {
     let up = normalize(vec3f(rd.x, max(rd.y, 0.0) + 0.3, rd.z));
-    airlight = mix(airlight, skyAirglow(up), R.fogHaze * (1.0 - f * f));
+    var hz = skyAirlightSmooth(up);
+    if ((R.weatherFlags & RWF_CLOUDS) != 0u && TUNE_CLOUD_FOG_MIX > 0.0) {
+      let e = cloudEnvAt(up, &CL, &cloudMaps);
+      hz = mix(hz, hz * e.a + e.rgb, TUNE_CLOUD_FOG_MIX);
+    }
+    airlight = mix(airlight, hz, R.fogHaze * (1.0 - f * f));
   }
   return mix(color, airlight, f);
 }
