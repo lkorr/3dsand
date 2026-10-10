@@ -666,8 +666,13 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
         f.swingTo = f.swingTo + d;
       }
     }
-    PosePipeline(AvatarPoseInputs(gaitGrounded, player.vel - player.slideVel),
-                 dt, world, tick);
+    {
+      PoseInputs pin = AvatarPoseInputs(gaitGrounded, player.vel - player.slideVel);
+      // The stroke's direction (Player::swimAim): what the body lies along
+      // under water. Zero whenever the controller is not swimming.
+      pin.swimAim = swimming_ ? player.swimAim : Vec3{};
+      PosePipeline(pin, dt, world, tick);
+    }
 
     // ---- air state clips ----
     // Grounded transitions drive jump/land; sustained air drives fall. Kept

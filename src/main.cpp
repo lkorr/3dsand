@@ -11171,7 +11171,10 @@ int main(int argc, char** argv) {
                frameCounter < kShotSwimDownEnd && under && vyM < -0.3f) {
         g_shotJumpPath = "screenshot_swim_down.bmp";
         downTaken = true;
-      } else if (frameCounter == kShotSwimDiveEnd - 10)
+      } else if (frameCounter == kShotSwimDownEnd + 20 &&
+                 std::getenv("SANDVOX_SHOT_SWIM_STEER"))
+        g_shotJumpPath = "screenshot_swim_steer.bmp";  // mid-dive, off the floor
+      else if (frameCounter == kShotSwimDiveEnd - 10)
         g_shotJumpPath = "screenshot_swim_dive.bmp";
       else if (!upTaken && frameCounter > kShotSwimDiveEnd + 15 && under &&
                vyM > 0.3f) {
@@ -13624,6 +13627,18 @@ int main(int argc, char** argv) {
       pin.SetHeld(TB_JUMP, (tread && !wade) || up);
       pin.SetHeld(TB_CROUCH, dive || down);
       pin.SetPressed(TB_JUMP, false);
+      // SANDVOX_SHOT_SWIM_STEER=<camera pitch, rad>: the dive phase is W alone
+      // with the camera at that pitch instead -- the look-steered stroke
+      // (Player::swimAim), body pointed along it. Seen from behind it.
+      static const char* steerEnv = std::getenv("SANDVOX_SHOT_SWIM_STEER");
+      // The Ctrl sink before it is skipped, or the dive starts on the floor.
+      if (steerEnv && down) pin.SetHeld(TB_CROUCH, false);
+      if (steerEnv && dive) {
+        cam.pitch = (float)std::atof(steerEnv);
+        pin.forward = 1.0f;
+        pin.strafe = 0.0f;
+        pin.SetHeld(TB_CROUCH, false);
+      }
     }
     // --autofly: hold W+sprint in fly mode, no human at the keyboard. Exists to
     // reproduce the streaming-shift stutter, which only appears when the window

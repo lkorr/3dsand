@@ -304,6 +304,11 @@ class Player {
   // their jump, their step-up and their ground snap for one voxel of puddle.
   // Never true in fly or during a scripted climb.
   bool swimming = false;
+  // While `swimming`, the direction the stroke is pushing: the LOOK direction
+  // (pitch included) under the movement keys, unit length; zero with no
+  // movement input or when not swimming. Under water the body travels along
+  // it and the avatar's pose points the body along it (PoseInputs::swimAim).
+  Vec3 swimAim{};
   // THE DROP IS RATE-LIMITED BY THE MIRROR: the body is descending faster than
   // the CPU mirror can answer for the cells beneath it, so this frame's fall is
   // clamped to the distance the mirror does vouch for and gravity is not added

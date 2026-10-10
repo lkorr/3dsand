@@ -694,6 +694,7 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
   swimming = false;   // decided in the walk path; fly and the scripted climbs
                       // are never swimming, and a stale true would take the
                       // jump away after stepping out of a pool in fly mode
+  swimAim = Vec3{};
   ledgeGrabbed = false;  // one-frame flag; set again below if a grab latches
   ledgeInReach = false;  // recomputed below (hang block or the walk probe)
 
@@ -1182,6 +1183,20 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
                   (crouching ? T().crouchSpeedScale : 1.0f);
     Vec3 wish = flatFwd * in.forward + right * in.strafe;
     wish.y = 0;
+    // UNDER WATER THE STROKE GOES WHERE YOU LOOK (2026-10-10). A swimmer
+    // (three-quarters under, see `swimming`) steers in 3D: W while looking
+    // down dives, looking up climbs, looking level holds depth. Only while
+    // `swimming`, so the surface stays a surface: a treading or crawling body
+    // at the waterline is below kSwimSubmersion and keeps the flat wish and
+    // the Space/Ctrl thrust, and a climb toward the light hands back to it as
+    // the head breaks the surface.
+    if (swimming) {
+      const Vec3 w3 = lookFwd * in.forward + right * in.strafe;
+      if (w3.len() > 1e-3f) {
+        swimAim = w3.normalized();
+        wish = swimAim;
+      }
+    }
     if (wish.len() > 1e-3f) wish = wish.normalized() * speed;
     // Snappy ground control, floatier air control. Expressed as a per-SECOND
     // rate and converted with 1-exp(-rate*dt): lerping by a bare constant every
@@ -1192,6 +1207,11 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     float blend = 1.0f - std::exp(-rate * dt);
     vel.x += (wish.x - vel.x) * blend;
     vel.z += (wish.z - vel.z) * blend;
+    // The steered swimmer's vertical is driven like its horizontal. Gravity
+    // (already scaled by buoyancy above) still pulls on it, so letting go of
+    // the keys returns the body to its float or its sink.
+    if (swimAim.x != 0.0f || swimAim.y != 0.0f || swimAim.z != 0.0f)
+      vel.y += (wish.y - vel.y) * blend;
     // THE SLIDE (see slideVel in player.h): on slippery footing, the part of
     // the horizontal velocity the legs are not driving. What the input asks
     // for is walked -- velocity along the wish direction, up to the wish speed

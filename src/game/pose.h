@@ -144,6 +144,12 @@ struct PoseInputs {
   // clip-driven (a swimmer is not grounded, so the leg IK has faded out).
   // The pipeline finds the waterline itself, over the body's own column.
   bool swim = false;
+  // Which way the swimmer is STROKING (world, unit; zero = no stroke asked
+  // for): the driver's intent, not its velocity, because a body sinking with
+  // no input and one diving head-first can have the same velocity. Under
+  // water the pipeline points the body along it (PoseDrive::swimPitch); at
+  // the surface, and with it zero, the velocity mix alone poses the swim.
+  Vec3 swimAim{};
   // Anything else a driver needs to solve, AFTER the leg IK, the weapon arm
   // and the hang palms and BEFORE the anatomical clamp (so it is clamped like
   // everything else). Empty on both current drivers.
@@ -228,6 +234,12 @@ struct PoseDrive {
   // swim thrust put it, and the pose settles the body against the WATERLINE
   // instead, so a treading head is out and a crawling back is awash.
   float swimLift = 0.0f;
+  // Extra pitch (radians, + = forward, about the body's left-right axis) put
+  // on the whole body over the crawl clip's own, eased, so an underwater
+  // stroke's body lies along PoseInputs::swimAim; and the share of it the
+  // root actually took this tick (the head look hands that much back).
+  float swimPitch = 0.0f;
+  float swimPitchApplied = 0.0f;
   // ---- the guard arm's stride pump (PoseInputs::guardPump) ---------------
   // 0..1 eased weight, and the rig-frame hand offset ApplyWeaponArm adds to
   // the guard's IK target this tick.

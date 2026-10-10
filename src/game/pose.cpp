@@ -162,6 +162,17 @@ constexpr float kSwimWaterShare[PoseDrive::kSwimClips] = {0.76f, 0.66f, 0.72f,
 constexpr float kSwimMaxDrop = 0.6f;
 constexpr float kSwimMaxRise = 0.3f;
 constexpr float kSwimLiftHalflife = 0.15f;
+// THE BODY LIES ALONG AN UNDERWATER STROKE (PoseInputs::swimAim). The crawl
+// clip pitches the hips 70.9 degrees forward (assets/anims/swim.json: the
+// back rides the surface, head up); under water the pipeline adds whatever
+// takes the body from there to the stroke's own angle from vertical -- 90 for
+// level, 180 for straight down, near 0 for straight up. A stroke with less
+// forward share than `kSwimAimFwdMin` (pure strafe, backstroke, Space alone)
+// keeps the velocity mix and its own clips. Eased, because the look swings
+// faster than a body turns over in water.
+constexpr float kSwimCrawlPitch = 70.9f * 3.14159265f / 180.0f;
+constexpr float kSwimAimFwdMin = 0.01f;
+constexpr float kSwimPitchHalflife = 0.2f;
 
 // ---- THE AIRBORNE POSE, IN LEG LENGTHS AND ARM REACHES ---------------------
 //
@@ -709,11 +720,29 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
       const float shc = std::cos(heading_), shs = std::sin(heading_);
       const Vec3& v = pose_.swimVel;
       const float ref = std::max(def.speed * kSwimRefSpeedShare, 0.5f);
-      const float fwd = (v.x * shs + v.z * shc) / ref;
+      float fwd = (v.x * shs + v.z * shc) / ref;
       const float left = (v.x * shc - v.z * shs) / ref;
       // At the surface an upward push only holds the head out: treading.
       // Sinking from the surface is still a dive.
       float up = (surfaced ? std::min(v.y, 0.0f) : v.y) / ref;
+      // UNDER WATER, A FORWARD STROKE IS THE CRAWL, POINTED (kSwimCrawlPitch).
+      // All the travel in the body's forward-vertical plane strokes as `swim`,
+      // and the body is turned to lie along the aim instead of being a blend
+      // of swim/swim_up/swim_down -- a weighted mean of a 71 and a 115 degree
+      // hip is 93 degrees for a 45 degree dive, nowhere near the 135 it is.
+      // The aim, not the velocity, says which way: sinking and diving can
+      // have the same velocity (the cap below), and only one of them is a dive.
+      float pitchWant = 0.0f;
+      const Vec3& aim = in.swimAim;
+      const float aimF = aim.x * shs + aim.z * shc;
+      if (!surfaced && aimF > kSwimAimFwdMin) {
+        pitchWant = std::atan2(aimF, aim.y) - kSwimCrawlPitch;
+        const float f = std::max(fwd, 0.0f);
+        fwd = std::sqrt(f * f + up * up);
+        up = 0.0f;
+      }
+      pose_.swimPitch +=
+          (pitchWant - pose_.swimPitch) * HalfLifeK(dt, kSwimPitchHalflife);
       // SINKING IS NOT DIVING. swim_down is a head-first dive, a stroke that
       // goes somewhere; straight down with no travel (Ctrl alone, or just not
       // holding Space) is the tread with the water closing over it. So the
@@ -777,10 +806,29 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
         if (isSwimClip(inst.clip)) inst.stopping = true;
     }
     pose_.swimOn = swimNow;
+    if (!swimNow) {
+      pose_.swimPitch -= pose_.swimPitch * HalfLifeK(dt, kSwimPitchHalflife);
+      if (std::fabs(pose_.swimPitch) < 1e-3f) pose_.swimPitch = 0.0f;
+    }
   }
 
   // ---- stages 1-3: sample active clips, blend, apply additives ----
   AnimSampleAndBlend(sk, st, dt);
+
+  // ---- the underwater stroke's body pitch (PoseDrive::swimPitch) ----------
+  // Composed in the RIG frame, in front of the blended root rotation, so the
+  // whole body turns about the hips' lateral axis and the crawl's own roll
+  // stays a roll about the body's long axis. Scaled by the crawl's weight:
+  // the pitch is the crawl's, and a body still mostly treading stays upright.
+  pose_.swimPitchApplied = 0.0f;
+  if (std::fabs(pose_.swimPitch) > 1e-4f && pose_.swimClip[1] >= 0 &&
+      def.rootLimb >= 0 && def.rootLimb < (int)sk.parts.size() &&
+      (def.rootLimb >= (int)st.partAlive.size() || st.partAlive[def.rootLimb])) {
+    const float a = pose_.swimPitch * std::clamp(pose_.swimW[1], 0.0f, 1.0f);
+    Transform& root = st.local[def.rootLimb];
+    root.rot = QuatNormalize(Mul(AxisAngle({1, 0, 0}, a), root.rot));
+    pose_.swimPitchApplied = a;
+  }
 
   // ---- the legless body's locomotion: lateral undulation -------------------
   // Straight after the clips, so a clip that OWNS a segment (the strike's
@@ -885,7 +933,11 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
     const auto& av = CurrentTuning().avatar;
     const float k = HalfLifeK(dt, av.headLookHalflife);
     const float goalYaw = in.haveLook ? in.lookYaw : 0.0f;
-    const float goalPitch = in.haveLook ? in.lookPitch : 0.0f;
+    // A swimmer's body already pitched along the stroke (swimPitchApplied,
+    // + = forward) carries the head down with it; the look hands that back,
+    // so the gaze still goes where the driver says rather than twice as far.
+    const float goalPitch =
+        (in.haveLook ? in.lookPitch : 0.0f) + pose_.swimPitchApplied;
     pose_.lookYaw += (goalYaw - pose_.lookYaw) * k;
     pose_.lookPitch += (goalPitch - pose_.lookPitch) * k;
     int head = -1;
