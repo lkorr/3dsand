@@ -2477,7 +2477,8 @@ fn siteKeepOut(x : i32, z : i32) -> bool {
   return false;
 }
 // May the LATTICE put a trunk at (wx, wz), whose species reaches `reach`? Not
-// on a stamp's pad (a building's floor), not in a lake's disc + band, and not
+// on a stamp's pad (a building's floor), not in a lake's shore band nor
+// where its polygon holds water over the trunk's ground, and not
 // within an authored tree's crown width of it (site reach + this reach,
 // Chebyshev: the two crowns never share a column, so the site tree is never
 // a second candidate the cap has to hold). A crown reaching over a pad or a
@@ -2502,7 +2503,7 @@ fn clearingRefuses(sid : u32, wx : i32, wz : i32, reach : i32, seed : u32) -> bo
   let roll = hash3(seed ^ CLEARING_THIN_SALT, bitcast<u32>(wx), bitcast<u32>(wz)) % u32(feather);
   return i32(roll) >= gap;
 }
-fn siteBlocksTrunk(wx : i32, wz : i32, reach : i32, seed : u32) -> bool {
+fn siteBlocksTrunk(wx : i32, wz : i32, h : i32, reach : i32, seed : u32) -> bool {
   let lst = wmSiteList(wx, wz);
   let n = wmSiteN(lst);
   for (var k = 0u; k < n; k++) {
@@ -2541,9 +2542,19 @@ fn siteBlocksTrunk(wx : i32, wz : i32, reach : i32, seed : u32) -> bool {
       if (routeNear(sid, wx, wz, hw + max(reach, wmSiteI(sid, WM_S_PAD_MARGIN)))) { return true; }
     } else if (wmSiteKind(sid) == WM_SITE_LAKE_EDGE) {
       // A lake: no trunk within its shore band (the sill reshapes it) or a
-      // crown's reach of the shoreline. A trunk further in stands in the
-      // water, where every column its crown covers is water too.
+      // crown's reach of the shoreline.
       if (routeNear(sid, wx, wz, wmSiteI(sid, WM_S_PAD_MARGIN) + reach)) { return true; }
+    } else if (wmSiteKind(sid) == WM_SITE_LAKE_CELL) {
+      // ...and none further in, where waterApply fills the column: inside the
+      // polygon with the ground under the level. genCellIn would drop every
+      // cell of such a tree (each column it covers is water, pond >= 0), but
+      // the far producers -- farcover's crowns, treeCanopyAt's proxy -- only
+      // ask treeInfoBare, so the tree stood in the lake at range and vanished
+      // on approach (ticket 2026-10-10_10-47-49). Refused HERE, the one tile
+      // gate every producer reads, they agree by construction. `h` is the
+      // trunk's landAt ground, the lake's own ground before any river bank.
+      // A dry island (ground at or over the level) keeps its trees.
+      if (h < wmSiteI(sid, WM_S_LAKE_LEVEL) && lakeTest(sid, wx, wz, 0).x != 0) { return true; }
     } else if (siteFootprintHas(sid, wx, wz)) { return true; }
   }
   return false;
@@ -3018,14 +3029,14 @@ fn treeInfoBare(s : TreeSite, land : Land, seed : u32) -> Tree {
   // every corner check while covering the whole thing.
   if (crownMeetsPad(t.wx, t.wz, t.reach)) { return t; }
   // No trunk on an authored site's FOOTPRINT (siteBlocksTrunk): a stamp's pad
-  // is a floor, a lake's disc + band is water and shore, and an authored
+  // is a floor, a lake's water and shore band are no ground, and an authored
   // tree keeps the lattice a crown's width away. A crown reaching in from
   // outside a pad or a shore is allowed and wanted. (Until P6 this refused
   // every trunk in the site's 102 m CELLS, so an authored lake balded a
   // hectare of forest around itself.)
   // A clearing's box keeps crowns off too, and its feather band thins the
   // edge (clearingRefuses, same call).
-  if (siteBlocksTrunk(t.wx, t.wz, t.reach, seed)) { return t; }
+  if (siteBlocksTrunk(t.wx, t.wz, h, t.reach, seed)) { return t; }
 
   t.sp = sp;
   t.above = i32(taSpecies(sp, TA_S_ABOVE));
@@ -7269,7 +7280,9 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
 // except where genCellIn puts something else first (a stamp, a pond column,
 // ground under a crown that reaches a slope); and it gates a tree's ponds at
 // its TRUNK where genCellIn gates them per asking column. Both differences
-// are a leaf more or less at a crown's edge, never terrain.
+// are a leaf more or less at a crown's edge, never terrain. A MAP lake is
+// not a pond disc: its trunks are refused in treeInfoBare itself
+// (siteBlocksTrunk), so no whole crown here stands in one.
 const FAR_COVER_MAX_SHIFT : u32 = 4u;   // faredits.h kCoverMaxShift (== CHUNK_SHIFT)
 
 // The slot's cover word: per-level minimums, 4 bits each from level 1, 0 =
