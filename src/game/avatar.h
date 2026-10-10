@@ -340,7 +340,9 @@ class PlayerAvatar : public Mob {
   // (PartPosedWorld -- the animation's answer, not Jolt's one-tick-latent
   // readback) carried out to the sidecar's eyeLocal. The first-person
   // camera rides this, so a crawl puts the eye near the floor where the head
-  // is. False with no head, no eyeLocal, or a dead body.
+  // is. While RAGDOLLED (limp or getting up) it is the head's actual
+  // transform instead -- the body is not where the animation says. False with
+  // no head, no eyeLocal, or a dead body.
   bool HeadEyeWorld(Vec3& out) const;
 
   // ---- render plumbing ----
