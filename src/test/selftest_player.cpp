@@ -384,6 +384,87 @@ Status GatePlayerWaterJump(Ctx&, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- player-swim-floor -------------------------------------------------
+//
+// A swimmer pressed into the lake bed keeps going and keeps its heading
+// (player.cpp SwimSlide, 2026-10-10). Before it, an afloat body took the
+// airborne slide: the box's SOLE caught each voxel step of the floor, that
+// axis lost its velocity for a tick, travel snapped onto the other axis and
+// the third-person body (which faces its travel) twitched toward it -- at a
+// rate set by the swim angle to the grid -- and a rising bed stopped it dead.
+//
+// Fixture: water to y=160 over a bed that rises one voxel per six in x with a
+// one-voxel checker of bumps on top. The stroke runs 15 degrees off +x (so it
+// crosses both grid families) with the look pitched 0.4 rad down into the
+// bed. The control is the same stroke in the same water with no bed in reach.
+// Asserted: progress >= 60% of the control's, the per-tick travel direction
+// never more than 20 degrees off the stroke, and the body ended up riding
+// the bed rather than inside it.
+Status GatePlayerSwimFloor(Ctx&, std::string& detail) {
+  auto bedTop = [](int x, int z) {
+    return 100 + std::max(0, x - 100) / 6 + (((x >> 1) + (z >> 1)) & 1);
+  };
+  auto bedKind = [&](IVec3 c) {
+    if (c.y < bedTop(c.x, c.z)) return CellKind::Solid;
+    return c.y < 160 ? CellKind::Liquid : CellKind::Air;
+  };
+  auto openKind = [](IVec3 c) {
+    if (c.y < 0) return CellKind::Solid;
+    return c.y < 160 ? CellKind::Liquid : CellKind::Air;
+  };
+  const float dt = 1.0f / 30.0f;
+  const float yaw = 0.2618f, pitch = 0.4f;
+  const Vec3 fwd{std::cos(yaw), 0, std::sin(yaw)};
+  const Vec3 right{-fwd.z, 0, fwd.x};
+  const Vec3 look{fwd.x * std::cos(pitch), -std::sin(pitch), fwd.z * std::cos(pitch)};
+
+  struct Run {
+    float dist = 0, worstDeg = 0, endSole = 0, endBed = 0;
+    bool swam = true;
+  };
+  auto run = [&](const Player::KindFn& kindAt, const Vec3& lookFwd, float startY) {
+    Player p;
+    p.fly = false;
+    p.pos = Vec3{100.5f, startY, 100.5f};
+    TickInput in;
+    in.forward = 1.0f;
+    Run r;
+    const Vec3 start = p.pos;
+    for (int i = 0; i < 120; i++) {
+      const Vec3 before = p.pos;
+      p.Update(dt, in, fwd, right, lookFwd, kindAt);
+      r.swam &= p.inLiquid;
+      const float dx = p.pos.x - before.x, dz = p.pos.z - before.z;
+      const float l = std::sqrt(dx * dx + dz * dz);
+      if (i >= 10 && l > 0.02f) {
+        const float c = std::clamp((dx * fwd.x + dz * fwd.z) / l, -1.0f, 1.0f);
+        r.worstDeg = std::max(r.worstDeg, std::acos(c) * 57.2958f);
+      }
+    }
+    r.dist = std::sqrt((p.pos.x - start.x) * (p.pos.x - start.x) +
+                       (p.pos.z - start.z) * (p.pos.z - start.z));
+    r.endSole = p.pos.y - Player::kHalfY;
+    r.endBed = (float)bedTop((int)std::floor(p.pos.x), (int)std::floor(p.pos.z));
+    return r;
+  };
+  // Start with the sole two voxels over the bed, so the stroke meets it at once.
+  const Run bed = run(bedKind, look, 103.0f + Player::kHalfY);
+  const Run open = run(openKind, fwd, 130.0f);
+  const bool progress = open.dist > 1.0f && bed.dist >= 0.6f * open.dist;
+  const bool steady = bed.worstDeg <= 20.0f;
+  const bool riding = bed.endSole >= bed.endBed - 0.01f;
+  const bool ok = progress && steady && riding && bed.swam;
+  char buf[256];
+  std::snprintf(buf, sizeof(buf),
+                "bed %.1f vox vs open %.1f (%.0f%%), worst heading %.1f deg, "
+                "end sole %.2f over bed %.0f, wet %d",
+                bed.dist, open.dist, open.dist > 0 ? 100.0f * bed.dist / open.dist : 0.0f,
+                bed.worstDeg, bed.endSole, bed.endBed, bed.swam ? 1 : 0);
+  detail = buf;
+  std::printf("player swim-floor: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- player-ledgegrab --------------------------------------------------
 //
 // Ledge grabbing: airborne with space held, arms facing a voxel lip within
@@ -3431,6 +3512,7 @@ const std::vector<Gate>& PlayerGates() {
   static const std::vector<Gate> g = {
       {"player-walk", "player", {}, false, GatePlayerWalk},
       {"player-waterjump", "player", {}, false, GatePlayerWaterJump},
+      {"player-swim-floor", "player", {}, false, GatePlayerSwimFloor},
       {"player-ledgegrab", "player", {}, false, GatePlayerLedgeGrab},
       {"player-climb-fuzz", "player", {}, false, GatePlayerClimbFuzz},
       {"player-crouch", "player", {}, false, GatePlayerCrouch},

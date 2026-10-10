@@ -182,7 +182,10 @@ PASS(fill_gasFarOuter, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN
 // buffer, so it orders against nothing.
 PASS(mutate, "prep(mutate+explode+compact)", PT_TICK, PIPE_MUTATE,      K_COMPUTE, D_OPS,4,4,   GRP_SIM,       DYN_ZERO, C_OPS, 1,
      USES(R(Materials) U(TickUBO) R(OpsBuf) RW(Voxels) A(DirtyIn) A(DirtyOut)
-          A(Support) R(PageTable) A(PageFaults)))
+          A(Support) R(PageTable) A(PageFaults) R(SolSpec)))
+// R(SolSpec): paint fills a liquid the painted liquid MIXES into (blood into
+// water: a wound bleeding under water), which is a species-table question
+// (sim_mutate.wgsl paintTakes).
 // R(Materials) is NEW here and the comment it replaces said the opposite: this
 // row genuinely did not consult the material table, because `cells` wrote the
 // authored word straight into the grid. It now reads the OUTGOING occupant's
@@ -603,8 +606,10 @@ PASS(ca1, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_CAARGS,0
 //             written this tick): clear mass stranded on a cell that is no
 //             longer a solvent, apply the DILUTION FLOOR to a stalled chunk
 //             (§3.3.1 -- mass below the floor is discarded, which is what lets a
-//             plume in a lake be GONE), republish the chunk's aggregate, and
-//             hand the page back if the chunk turned uniform or empty.
+//             plume in a lake be GONE), FADE a species with a halfLife (blood;
+//             a chunk still holding fading mass marks itself DIRTY_R_SOLUTE,
+//             the one DirtyOut write here), republish the chunk's aggregate,
+//             and hand the page back if the chunk turned uniform or empty.
 //
 // Right after the CA and before every post-CA voxel writer (water bodies,
 // particles, the MPM seam), so a cell those writers turn into liquid never
@@ -623,7 +628,7 @@ PASS(solDiffuse, "solute(diffuse+compact)", PT_TICK, PIPE_SOL_DIFFUSE, K_INDIREC
 PASS(solCompact, "solute(diffuse+compact)", PT_TICK, PIPE_SOL_COMPACT, K_INDIRECT, IND_SOLARGS,0,0,
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(U(TickUBO) R(Materials) I(SolArgs) R(Voxels) R(PageTable)
-          RW(SolTable) A(SolPool) A(SolMeta) R(SolSpec)))
+          RW(SolTable) A(SolPool) A(SolMeta) R(SolSpec) A(DirtyOut)))
 
 // ---- phase 3a2: THE TEMPERATURE LAYER AFTER THE CA (src/sim/heat.h) ---------
 // docs/PLAN_temperature.md. Over the CA's own dirty list:

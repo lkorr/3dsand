@@ -120,6 +120,21 @@
       "glow": 30,
       "precipitatesTo": "gold_dust",
       "solvents": ["aqua_regia"]
+    },
+    {
+      "//": "BLOOD IN WATER (2026-10-10). The one LIQUID source: a blood cell touching water MIXES (sim_step.wgsl solTryMix) -- it becomes a water cell of its own fullness carrying its blood as mass, so the volume stays and the cloud starts where the blood was. yieldPerVoxel 248 because a full cell holds 255 at most (31 a fullness eighth fits exactly). dissolveChance 250: blood meeting water clouds within a few ticks, before it can sink to the bed or dry. diffusivity 40 billows it a body-length in a few seconds; halfLife 10 s FADES it wherever it is (spread or not), and the floor takes the faint tail once the chunk stalls, so a fight in a lake leaves it clear again within a minute. densityPerUnit 12: bloody water is a little heavier, so a thick cloud sags. Tint is blood's own palette red; tintStrength 230 so a fresh cloud is near-opaque and a thin one a pink haze. No precipitatesTo: bloody water that dries leaves nothing, like blood itself.",
+      "name": "blood",
+      "from": "blood",
+      "yieldPerVoxel": 248,
+      "saturation": 255,
+      "dissolveChance": 250,
+      "diffusivity": 40,
+      "floor": 4,
+      "halfLife": 10,
+      "densityPerUnit": 12,
+      "tint": "#5a0606",
+      "tintStrength": 230,
+      "solvents": ["water"]
     }
   ]
 }

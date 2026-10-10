@@ -1714,6 +1714,29 @@ water of its own kind (`solTrySink`, `densityPerUnit`), and a solvent past a
 `converts` row's `cMin` becomes `into` (`solTryConvert`: fairy dust in water is
 enchanted water -- this replaced package A's placeholder pair rule).
 
+**A LIQUID source MIXES** (2026-10-10, gate `solute-blood`): a `from` may be a
+liquid (blood, the only one). A blood cell touching one of its `solvents`
+(water) BECOMES that solvent at its own fullness and carries
+`fullness x yield/8` (capped at saturation) as mass (`solTryMix`) -- volume
+kept, no bubble, the cloud starts where the blood stood; a source already
+carrying another species is refused. Two feeds make it reach the water: a
+whole-voxel LIQUID particle buried in a liquid it is denser than rejoins the
+grid in that cell instead of being shoved up a cell a tick
+(`sim_particle.wgsl`, the burial block -- what made exploded blood climb to
+the surface and dry there), and a paint-mode brush op fills a liquid the
+painted liquid mixes into as well as air (`sim_mutate.wgsl paintTakes`), which
+is how a wound's drip bleeds under water. Micro spray in water is still
+spent with no deposit (an effect, not matter).
+
+**Fade** (`halfLife`, seconds; 0 = conserved): `solCompact` takes
+`mass x decayQ / 65536` off every cell of a fading species each tick
+(stochastic rounding off the slot-cell hash; decayQ is derived on the CPU and
+rides the high half of the floor word, `UploadSolutes`), counted as
+discarded, and a chunk still holding fading mass marks itself
+`DIRTY_R_SOLUTE` so the fade runs to the end -- bounded, since mass only goes
+down and the floor takes the tail. That is what makes a blood cloud thin out
+and be gone in tens of seconds rather than only spread.
+
 **Diffusion** (`solDiffuse`) is pair exchange: three axis dispatches a tick,
 pairs at stride 1/2/4/8 (cycled by tick), parity alternating, the equalising
 amount rounded half-down and the rate (`diffusivity` / 256 x `sim.soluteDiffusion`

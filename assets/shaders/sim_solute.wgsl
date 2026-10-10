@@ -154,7 +154,7 @@ fn solYield8(s : u32) -> u32 { return max(solSpec[SOLS_BASE + s * SOLS_STRIDE], 
 fn solSaturation(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 1u]; }
 fn solDissolveChance(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 2u]; }
 fn solDiffusivity(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 3u]; }
-fn solFloor(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 4u]; }
+fn solFloor(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 4u] & 0xFFFFu; }
 fn solDensityPerUnit(s : u32) -> i32 { return bitcast<i32>(solSpec[SOLS_BASE + s * SOLS_STRIDE + 5u]); }
 fn solPrecipitate(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 9u]; }
 fn solConvertCount(s : u32) -> u32 { return min(solSpec[SOLS_BASE + s * SOLS_STRIDE + 10u], 4u); }
@@ -530,8 +530,14 @@ fn solDiffuse(@builtin(workgroup_id) wg : vec3<u32>,
 //      without this a creature's worth of blood in a lake would freeze in
 //      blotches forever. Only STALLED chunks, so a plume still spreading loses
 //      nothing and a body held above the floor conserves exactly;
-//   3. the chunk's aggregate (species, total mass) is republished;
-//   4. a chunk whose 4096 values are all equal becomes SOL_UNIFORM (or
+//   3. a species with a halfLife (solutes.json; blood) FADES: each cell loses
+//      mass * decayQ / 65536 a tick, stochastically rounded, wherever it is --
+//      spread or not, stalled or not. Also discarded and counted. A chunk
+//      still holding fading mass keeps itself awake (DIRTY_R_SOLUTE) so the
+//      fade runs to the end: bounded, since the mass only goes down and the
+//      dilution floor takes the tail once the chunk stalls (rule 2);
+//   4. the chunk's aggregate (species, total mass) is republished;
+//   5. a chunk whose 4096 values are all equal becomes SOL_UNIFORM (or
 //      SOL_EMPTY when the value is 0) and its page goes back on the stack.
 // Every discarded unit is counted (SOLM_DISCARDED), so the gates balance the
 // ledger rather than trusting it.
@@ -541,6 +547,12 @@ var<workgroup> cmpEntry : u32;
 var<workgroup> cmpMixed : atomic<u32>;
 var<workgroup> cmpMass : atomic<u32>;
 var<workgroup> cmpSpecies : atomic<u32>;
+var<workgroup> cmpFading : atomic<u32>;
+
+// The species' FADE: per-tick loss fraction x 65536, the high half of the
+// floor word (Simulation::UploadSolutes; solutes.h decayQ). 0 = conserved.
+// Declared here, beside its only reader, not in the mirrored block.
+fn solDecayQ(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 4u] >> 16u; }
 
 fn solCellOfLocal(base : vec3<i32>, local : u32) -> vec3<i32> {
   return base + vec3<i32>(i32(local & 15u), i32((local >> 4u) & 15u), i32(local >> 8u));
@@ -556,6 +568,7 @@ fn solCompact(@builtin(workgroup_id) wg : vec3<u32>,
     atomicStore(&cmpMixed, 0u);
     atomicStore(&cmpMass, 0u);
     atomicStore(&cmpSpecies, 0u);
+    atomicStore(&cmpFading, 0u);
   }
   workgroupBarrier();
   let slot = workgroupUniformLoad(&cmpSlot);
@@ -578,6 +591,7 @@ fn solCompact(@builtin(workgroup_id) wg : vec3<u32>,
   var mass = 0u;
   var species = 0u;
   var discarded = 0u;
+  var fading = false;
   for (var j = 0u; j < 8u; j = j + 1u) {
     let wi = li + j * 256u;
     let w = atomicLoad(&solPool[pbase + wi]);
@@ -596,6 +610,17 @@ fn solCompact(@builtin(workgroup_id) wg : vec3<u32>,
           discarded += solMassOf(v);
           v = 0u;
         }
+        // 3. the fade. Keyed by the SLOT cell index (an identity, never the
+        // page), so it is as deterministic as the diffusion's rounding.
+        let dq = solDecayQ(s);
+        if (v != 0u && dq != 0u) {
+          let mm = solMassOf(v);
+          let rnd = hash3(T.seed ^ 0xFADEB10Du, T.tick, slot * CHUNK_VOL + wi * 2u + h) & 0xFFFFu;
+          let loss = min((mm * dq + rnd) >> 16u, mm);
+          discarded += loss;
+          v = solPack(s, mm - loss);
+          if (v != 0u) { fading = true; }
+        }
       }
       mass += solMassOf(v);
       species = max(species, solSpeciesOf(v));
@@ -606,6 +631,7 @@ fn solCompact(@builtin(workgroup_id) wg : vec3<u32>,
   if (discarded != 0u) { atomicAdd(&solMeta[SOLM_DISCARDED], discarded); }
   if (mass != 0u) { atomicAdd(&cmpMass, mass); }
   if (species != 0u) { atomicMax(&cmpSpecies, species); }
+  if (fading) { atomicOr(&cmpFading, 1u); }
   storageBarrier();
   workgroupBarrier();
   // Uniform iff every word equals word 0 and word 0's halves agree.
@@ -620,6 +646,8 @@ fn solCompact(@builtin(workgroup_id) wg : vec3<u32>,
   let total = atomicLoad(&cmpMass);
   atomicStore(&solMeta[SOLM_AGG + slot],
               (atomicLoad(&cmpSpecies) << 24u) | min(total, 0xFFFFFFu));
+  // Fading mass left: awake next tick, so this pass runs on it again.
+  if (atomicLoad(&cmpFading) != 0u) { atomicOr(&dirtyOut[slot], DIRTY_R_SOLUTE); }
   if (atomicLoad(&cmpMixed) != 0u) { return; }
   let v0 = w0 & 0xFFFFu;
   var ne = 0u;

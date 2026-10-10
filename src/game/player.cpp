@@ -608,6 +608,45 @@ float StepSlide(Vec3& pos, float dx, float dz, const Player::Box& b,
   return 0.0f;
 }
 
+// THE SWIMMER'S LEGS RIDE OVER WHAT THEY HIT (2026-10-10). A body afloat is
+// never `onGround`, so StepSlide (which must land on floor) is not for it,
+// and the plain airborne slide let a lake-floor bump or a rising shore catch
+// the box's SOLE and stop the swimmer dead -- while the drawn body lies flat
+// well above it. Here a blocked flat slide retries from the smallest lift
+// that puts the sole on the next whole voxel up, then the next, through the
+// lower half of the box (the legs). No press back down: the water holds the
+// body, and buoyancy and the tread settle it from there. Whatever still
+// blocks with the legs lifted clear is a wall at the torso, and stops it.
+// Returns the height lifted in voxels (0 if the flat slide won).
+float SwimSlide(Vec3& pos, float dx, float dz, const Player::Box& b,
+                const Player::KindFn& kindAt) {
+  const Vec3 start = pos;
+  Vec3 flat = start;
+  const bool blockedX = SweepAxis(flat, dx, 0, b, kindAt);
+  const bool blockedZ = SweepAxis(flat, dz, 2, b, kindAt);
+  if (!blockedX && !blockedZ) {
+    pos = flat;
+    return 0.0f;
+  }
+  const float sole = start.y + b.yLo;
+  const float reach = 0.5f * (b.yHi - b.yLo);
+  for (int k = 1;; k++) {
+    const float lift = (std::floor(sole) + (float)k) - sole;
+    if (lift > reach) break;
+    Vec3 up = start;
+    if (SweepAxis(up, lift, 1, b, kindAt)) break;  // ceiling: no higher try
+    SweepAxis(up, dx, 0, b, kindAt);
+    SweepAxis(up, dz, 2, b, kindAt);
+    // StepSlide's rule: a lift is only worth taking if it got farther.
+    if (FlatDist2(start, up) > FlatDist2(start, flat) + 1e-6f) {
+      pos = up;
+      return lift;
+    }
+  }
+  pos = flat;
+  return 0.0f;
+}
+
 // Feet-below-lip distance of the dead hang, voxels: the whole rise of a ledge
 // climb. The hang anchor puts the HEAD ledgeHangDrop below the lip top.
 float LedgeClimbDepth() {
@@ -1202,11 +1241,22 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     // at the waterline is below kSwimSubmersion and keeps the flat wish and
     // the Space/Ctrl thrust, and a climb toward the light hands back to it as
     // the head breaks the surface.
-    if (swimming) {
+    //
+    // FROM THE SURFACE, LOOKING DOWN DIVES. Since swim stamina the surface
+    // float holds a body well under kSwimSubmersion, so the steered stroke
+    // above would never engage from it and W while looking at the lake bed
+    // just crawled along the top. An afloat body whose stroke points clearly
+    // down (kSurfaceDiveY) strokes along it; anything flatter stays the flat
+    // surface crawl, so a level look does not slowly sink the crawl.
+    constexpr float kSurfaceDiveY = -0.35f;  // ~20 degrees below level
+    {
       const Vec3 w3 = lookFwd * in.forward + right * in.strafe;
       if (w3.len() > 1e-3f) {
-        swimAim = w3.normalized();
-        wish = swimAim;
+        const Vec3 a = w3.normalized();
+        if (swimming || (inLiquid && !onGround && a.y < kSurfaceDiveY)) {
+          swimAim = a;
+          wish = swimAim;
+        }
       }
     }
     if (wish.len() > 1e-3f) wish = wish.normalized() * speed;
@@ -1326,8 +1376,9 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
         // hovering with only its feet wet. Scaled, thrust and buoyancy fall off
         // together and the body settles AT the waterline, which is what
         // floating is.
-        // `buoyed && !swimming` is the implied tread (swim stamina, above).
-        if (in.Held(TB_JUMP) || (buoyed && !swimming))
+        // `buoyed && !swimming` is the implied tread (swim stamina, above);
+        // a surface dive (swimAim pointing down) is not held up by it.
+        if (in.Held(TB_JUMP) || (buoyed && !swimming && swimAim.y >= 0.0f))
           vel.y += (T().swimUp / kVoxelMeters) * submersion * dt;
         if (in.Held(TB_CROUCH)) vel.y -= (T().swimDown / kVoxelMeters) * submersion * dt;
       }
@@ -1375,7 +1426,23 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     // site that made walking up a hill judder). Horizontal motion is untouched
     // — it IS travel along the segment, and stays 1:1.
     BankVerticalSnap(climbed);
-    if (!onGround) {
+    // SANDVOX_SWIM_TRACE=1: the wet body's move inputs, one line per tick
+    // (pose.cpp prints the stroke mixer's side under the same switch).
+    static const bool swimTrace = std::getenv("SANDVOX_SWIM_TRACE") != nullptr;
+    if (swimTrace && inLiquid)
+      std::printf("playertrace pos(%.2f %.2f %.2f) sole %.2f sub %.2f swim %d onGround %d "
+                  "climbed %.2f want(%.3f %.3f)\n",
+                  pos.x, pos.y, pos.z, pos.y + b.yLo, submersion, (int)swimming,
+                  (int)onGround, climbed, vel.x * dt, vel.z * dt);
+    if (!onGround && inLiquid && mantleTimer <= 0.0f) {
+      // Afloat: the legs ride over the floor (SwimSlide). The axis it still
+      // could not make loses its velocity, as the airborne slide's does.
+      const Vec3 before = pos;
+      const float wantX = vel.x * dt, wantZ = vel.z * dt;
+      BankVerticalSnap(SwimSlide(pos, wantX, wantZ, b, kindAt));
+      if (std::abs(pos.x - before.x) < std::abs(wantX) - 1e-4f) vel.x = 0;
+      if (std::abs(pos.z - before.z) < std::abs(wantZ) - 1e-4f) vel.z = 0;
+    } else if (!onGround) {
       // Airborne: plain slide, no stepping (both Quake and Source refuse to
       // step while off the ground).
       //

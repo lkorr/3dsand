@@ -305,7 +305,7 @@ fn solYield8(s : u32) -> u32 { return max(solSpec[SOLS_BASE + s * SOLS_STRIDE], 
 fn solSaturation(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 1u]; }
 fn solDissolveChance(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 2u]; }
 fn solDiffusivity(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 3u]; }
-fn solFloor(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 4u]; }
+fn solFloor(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 4u] & 0xFFFFu; }
 fn solDensityPerUnit(s : u32) -> i32 { return bitcast<i32>(solSpec[SOLS_BASE + s * SOLS_STRIDE + 5u]); }
 fn solPrecipitate(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 9u]; }
 fn solConvertCount(s : u32) -> u32 { return min(solSpec[SOLS_BASE + s * SOLS_STRIDE + 10u], 4u); }
@@ -1233,6 +1233,57 @@ fn solOnReplace(c : vec3<i32>, v : u32, prod : u32, push : bool, rot : u32) -> v
   return out;
 }
 
+// ---- MIXING: a LIQUID named as a solute's `from` meets a solvent -----------
+// Blood in water. The acting cell is the source liquid (blood); when one of its
+// faces is a solvent of its species, the cell BECOMES that solvent at its own
+// fullness and carries its own volume as dissolved mass (fullness x yield8,
+// capped at the species' saturation for that fullness -- the excess was never
+// mass and is not counted). So volume is conserved, no bubble is born where
+// the blood was, and the cloud starts exactly where the blood stood; the
+// diffusion (sim_solute.wgsl) spreads it and the species' halfLife fades it.
+//
+// A source already carrying a solute (salt in blood) is refused: its value is
+// the cell's one slot, and overwriting it would lose that mass. The solvent
+// neighbour's own species does not matter -- this writes only the acting cell,
+// which the colour lattice gives this thread alone.
+//
+// Same page and probe discipline as solTryDissolve, but the page asked for is
+// the ACTING cell's: that is where the mass lands.
+fn solTryMix(c : vec3<i32>, idx : u32, w : u32, s : u32, slotIdx : u32,
+             probe : bool) -> bool {
+  if (solValueAt(c) != 0u) { return false; }
+  let rr = hash3(T.seed ^ 0x3C1D8B0Du, T.tick, slotIdx);
+  let rot = (rr >> 12u) % 6u;
+  for (var i = 0u; i < 6u; i = i + 1u) {
+    let n = c + faceDir((i + rot) % 6u);
+    if (!inBounds(n)) { continue; }
+    let nmat = voxMat(voxWordAt(n));
+    if (!solIsLiquidMat(nmat) || !solIsSolvent(nmat, s)) { continue; }
+    if (probe) {
+      markDirtyR(c, DIRTY_R_REACT);
+      return false;
+    }
+    if (!solWritable(c)) {
+      atomicStore(&solMeta[SOLM_REQ_FLAG + voxSlotOfCell(c)], 1u);
+      markDirtyR(c, DIRTY_R_SOLUTE);
+      return false;
+    }
+    if ((rr % REACT_CHANCE_DEN) >= solDissolveChance(s)) {
+      markDirtyR(c, DIRTY_R_REACT);
+      return false;
+    }
+    let f = voxState(w) + 1u;
+    let units = min(f * solYield8(s), solCap(s, f));
+    voxStore(idx, packVoxKeepStain(nmat, voxState(w), stampFor(T.tick, P.substep), w));
+    _ = solStoreAt(c, solPack(s, units));
+    atomicAdd(&solMeta[SOLM_DISSOLVED], units);
+    markVoxActive(idx);
+    markDirty(c);
+    return true;
+  }
+  return false;
+}
+
 // The state nibble for a precipitate of `e` eighths at cell c.
 fn solPrecipState(p : u32, e : u32, c : vec3<i32>) -> u32 {
   if (matHasPowderMass(materials[p])) { return powderStateFor(e, c, ptSeed()); }
@@ -1255,6 +1306,7 @@ fn solPrecipState(p : u32, e : u32, c : vec3<i32>) -> u32 {
 // Returns true when the cell dissolved (fully or in part): it has acted.
 fn solTryDissolve(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material,
                   s : u32, slotIdx : u32, probe : bool) -> bool {
+  if (m.klass == CLASS_LIQUID) { return solTryMix(c, idx, w, s, slotIdx, probe); }
   let rr = hash3(T.seed ^ 0x501D155Du, T.tick, slotIdx);
   let rot = (rr >> 12u) % 6u;
   let pm = select(POWDER_FULL, powderMass(w), matHasPowderMass(m));
@@ -5943,8 +5995,9 @@ fn caCell(ci : u32, local : vec3<i32>) {
   // the chunk marks dirty is a tick the CPU can prove the world settled and
   // stop running the CA -- measured, a grain on a pond floor went to sleep
   // after 22 ticks and never dissolved. doReactions probes for the same reason.
-  // Only a POWDER dissolves (solutes.cpp refuses any other `from`) and only a
-  // LIQUID converts: gases and solids -- most of a burning forest's awake
+  // Only a POWDER dissolves or a LIQUID mixes (blood into water, solTryMix;
+  // solutes.cpp refuses any other `from`) and only a LIQUID converts: gases
+  // and solids -- most of a burning forest's awake
   // cells -- skip the species-table read entirely (measured: +9% CA in the
   // --perf forestfire scene before this gate).
   if (P.substep == 0u && (m.klass == CLASS_POWDER || m.klass == CLASS_LIQUID)) {

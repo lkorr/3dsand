@@ -211,7 +211,7 @@ fn solYield8(s : u32) -> u32 { return max(solSpec[SOLS_BASE + s * SOLS_STRIDE], 
 fn solSaturation(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 1u]; }
 fn solDissolveChance(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 2u]; }
 fn solDiffusivity(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 3u]; }
-fn solFloor(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 4u]; }
+fn solFloor(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 4u] & 0xFFFFu; }
 fn solDensityPerUnit(s : u32) -> i32 { return bitcast<i32>(solSpec[SOLS_BASE + s * SOLS_STRIDE + 5u]); }
 fn solPrecipitate(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 9u]; }
 fn solConvertCount(s : u32) -> u32 { return min(solSpec[SOLS_BASE + s * SOLS_STRIDE + 10u], 4u); }
@@ -275,9 +275,24 @@ fn opCovers(o : BrushOp, c : vec3<i32>) -> bool {
 }
 const MUT_NO_OP : u32 = 0xFFFFFFFFu;  // "no op writes this cell"
 
+// PAINT (mode 0) fills AIR -- and a liquid the painted liquid MIXES into
+// (solutes.json: a species whose `from` is the painted material lists the
+// occupant as a solvent). That is how a wound bleeds under water: the drip
+// paints blood over the water cell, and the CA's solTryMix (sim_step.wgsl)
+// turns the cell straight back into water carrying the blood as mass, so the
+// water is not lost and the blood becomes a cloud where the wound is. Without
+// it a drip under water painted nothing and the blood it charged vanished.
+fn paintTakes(o : BrushOp, prevMat : u32) -> bool {
+  if (prevMat == MAT_AIR) { return true; }
+  if (TUNE_SOLUTE_MODE == 0u || !solIsLiquidMat(prevMat) || !solIsLiquidMat(o.material)) {
+    return false;
+  }
+  return solIsSolvent(prevMat, solFromSpecies(o.material));
+}
+
 fn opWouldWrite(o : BrushOp, c : vec3<i32>, prevMat : u32) -> bool {
   if (!opCovers(o, c)) { return false; }
-  if (o.mode == 0u) { return prevMat == MAT_AIR; }  // paint fills air only
+  if (o.mode == 0u) { return paintTakes(o, prevMat); }  // paint fills air (+ see paintTakes)
   // the spell transmute's from-filter (see the note in main)
   if (o._p0 != 0u && prevMat != o._p0) { return false; }
   if ((o._p1 & 1u) != 0u && prevMat == MAT_AIR) { return false; }
@@ -369,7 +384,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   }
   if (winner == MUT_NO_OP) { return; }
   let op = ops[winner];
-  if (op.mode == 0u && prevMat != MAT_AIR) { return; }  // paint fills air only
+  if (op.mode == 0u && !paintTakes(op, prevMat)) { return; }  // paint fills air (+ paintTakes)
   // A spell's transmute (game/spell.cpp Convert) is an overwrite with a FROM
   // filter: _p0 names the only material it may replace (0 = any), and bit 0 of
   // _p1 says the wildcard matches matter, not the void. Both are zero for every

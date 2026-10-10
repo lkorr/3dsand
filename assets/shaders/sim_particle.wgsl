@@ -708,6 +708,24 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
       append(p);
       return;
     }
+    // A LIQUID buried in a liquid it is denser than (blood flung into a pond)
+    // is not trapped: it is where it would sink to anyway. It rejoins the grid
+    // in this very cell -- canOccupy already lets it, exactly as a rock at the
+    // bed takes a water cell -- and the CA takes it from there: canDisplace
+    // sinks it, and a species that mixes (solutes.json blood) becomes a cloud
+    // in the water. Without this, liquids have no fluid lift, so this block
+    // shoved blood up one cell a tick to the surface, where it landed ON the
+    // water and dried away. A LIGHTER liquid (oil) still rises: that one is
+    // right.
+    if (materials[myMat].klass == CLASS_LIQUID && startKlass == CLASS_LIQUID &&
+        canOccupy(startWord, myDensity, false)) {
+      p.flags |= PFLAG_PENDING;
+      let ss = claimSlot(claimCellId(startCell));
+      atomicMax(&claim[ss], particlePriority(p));
+      publishForeign(ss);
+      append(p);
+      return;
+    }
     p.py += PART_ONE;
     p.vx = 0; p.vy = 0; p.vz = 0;
     append(p);

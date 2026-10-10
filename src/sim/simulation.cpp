@@ -1859,7 +1859,10 @@ void Simulation::UploadSolutes(const rhi::Queue& queue, const std::vector<Solute
     // rolls it against the same counter-hash the reaction rules do.
     r[2] = std::min<uint32_t>(1000u, d.dissolveChance) * kReactChanceScale;
     r[3] = std::min<uint32_t>(256u, d.diffusivity);
-    r[4] = d.floor;
+    // The dilution floor in the low half, the FADE (decayQ, per-tick loss x
+    // 65536, solutes.h) in the high half: the 16-word row is full, and a floor
+    // past 255 means nothing to a 0..255 concentration anyway.
+    r[4] = std::min<uint32_t>(d.floor, 0xFFFFu) | (std::min<uint32_t>(d.decayQ, 0xFFFFu) << 16);
     r[5] = (uint32_t)d.densityPerUnit;
     r[6] = d.tint;
     r[7] = d.tintStrength;

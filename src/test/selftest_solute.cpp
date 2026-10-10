@@ -1379,6 +1379,137 @@ Status GateSolutePayout(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- solute-blood -----------------------------------------------------------
+// BLOOD IN WATER: the one LIQUID source species (solutes.json `blood`). A
+// sealed 20 x 20 pond six deep; on tick 12 a radius-2 blood sphere is PAINTED
+// under the surface (a BrushOp in paint mode -- exactly what a wound's drip is,
+// so this is the underwater-wound path, sim_mutate.wgsl paintTakes) and nine
+// blood cells are dropped on the surface (what a flung voxel lands as).
+// Asserted, each failing differently:
+//   mixed  no blood VOXEL left in the box by tick `mixBy` -- every one became
+//          water carrying its blood (sim_step.wgsl solTryMix);
+//   cloud  the mass spread to more cells than the blood occupied;
+//   water  the pond lost no water: the painted sphere replaced water cells and
+//          mixing turned them back, the surface cells added their own volume
+//          (a cell that dried before it mixed adds nothing, hence a range);
+//   gone   by the end the mass is GONE (halfLife + the floor), no page or
+//          sentinel left, the ledger balanced, the box asleep.
+uint64_t LiquidEighths(Ctx& c, const Box& box, uint32_t mat, uint32_t* cells = nullptr) {
+  uint64_t e = 0;
+  uint32_t n = 0;
+  std::vector<uint32_t> cbuf((size_t)kChunkVol);
+  for (uint32_t slot : box.Chunks()) {
+    ReadVoxelsSync(c.ctx, c.world, slot, 1, cbuf.data(), "bloodVox");
+    const IVec3 wc = c.world.SlotToWorldChunk(slot);
+    for (uint32_t k = 0; k < kChunkVol; k++) {
+      const int x = wc.x * 16 + (int)(k % 16), y = wc.y * 16 + (int)((k / 16) % 16),
+                z = wc.z * 16 + (int)(k / 256);
+      if (!box.Inside(x, y, z) || (cbuf[k] & 0xFFFu) != mat) continue;
+      e += ((cbuf[k] >> 12) & 0x7u) + 1u;
+      n++;
+    }
+  }
+  if (cells) *cells = n;
+  return e;
+}
+
+Status GateSoluteBlood(Ctx& c, std::string& detail) {
+  const uint32_t water = MatNamed(c, "water"), blood = MatNamed(c, "blood");
+  const SoluteDef* sd = CurrentSoluteNamed("blood");
+  if (!water || !blood || !sd) {
+    detail = "needs materials water + blood and a `blood` species in solutes.json";
+    return Status::Fail;
+  }
+  FixtureTuning tune;
+  const int px = 96, py = 120, pz = 96;
+  const Box box{px - 10, px + 9, pz - 10, pz + 9, py, py + 10, true};
+  const int layers = 6;
+  const int kTicks = (int)BaselineNumber("solute-blood.ticks", 2100);
+  const int mixBy = (int)BaselineNumber("solute-blood.mixBy", 90);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  const std::vector<CellOp> build = box.Build((uint32_t)kMatStone);
+  const std::vector<CellOp> pond = box.Layers(water, py + 1, layers, 7u);
+  const std::vector<BrushOp> wound = {{px, py + 3, pz, 2, blood, 0u, 0u, 0u}};
+  std::vector<CellOp> drops;
+  for (int z = pz + 4; z < pz + 7; z++)
+    for (int x = px + 4; x < px + 7; x++)
+      drops.push_back({World::SlotCellIndex({x, py + 1 + layers, z}), (blood & 0xFFFu) | (7u << 12)});
+
+  uint32_t t = 54000;
+  support::TickCursor ticker{c, t, {px >> 4, py >> 4, pz >> 4}};
+  const int kInject = 12;
+  uint64_t water0 = 0, bloodIn = 0;
+  uint32_t bloodLeft = 0xFFFFFFFFu, peakCells = 0, peakMass = 0;
+  int mixedAt = -1, goneAt = -1;
+  for (int i = 0; i < kTicks; i++) {
+    if (i == kInject) {
+      water0 = LiquidEighths(c, box, water);
+      ticker(wound, drops);
+      bloodIn = LiquidEighths(c, box, blood);
+      continue;
+    }
+    ticker({}, i == 0 ? build : i == 2 ? pond : std::vector<CellOp>{});
+    const bool sample = i > kInject && (i <= 150 ? i % 10 == 0 : i % 60 == 0);
+    if (!sample) continue;
+    if (mixedAt < 0) {
+      LiquidEighths(c, box, blood, &bloodLeft);
+      if (bloodLeft == 0) mixedAt = i;
+    }
+    SoluteLayer L;
+    ReadSoluteLayer(c, L);
+    uint32_t cells = 0, mass = 0;
+    for (uint32_t slot : box.Chunks())
+      for (uint32_t k = 0; k < kChunkVol; k++) {
+        const uint32_t v = L.Value(slot, k);
+        if (v == 0) continue;
+        cells++;
+        mass += v & 0xFFu;
+      }
+    peakCells = std::max(peakCells, cells);
+    peakMass = std::max(peakMass, mass);
+    if (mass == 0 && L.hdr[kSolMDissolved] != 0 && goneAt < 0) goneAt = i;
+    if (mass != 0) goneAt = -1;
+  }
+  const uint64_t water1 = LiquidEighths(c, box, water);
+  const uint32_t awake = AwakeIn(c, box);
+  SoluteLayer L;
+  ReadSoluteLayer(c, L);
+  const BoxCensus k = Census(c, box, L, 0);
+  std::string latch;
+  const bool latchOk = LatchesClean(L, latch);
+  // The sphere under water replaced water with blood (no net volume), so of
+  // what was painted only the nine surface cells are NEW liquid.
+  const uint64_t added = (uint64_t)drops.size() * 8u;
+  const bool mixedOk = mixedAt >= 0 && mixedAt <= mixBy && bloodIn > added;
+  const bool waterOk = water1 >= water0 && water1 <= water0 + added;
+  const bool cloudOk = peakCells > bloodIn / 8u;
+  const bool goneOk = k.mass == 0 && k.pageSlots == 0 && k.uniformSlots == 0;
+  const bool ledgerOk = L.hdr[kSolMDissolved] != 0 &&
+                        L.hdr[kSolMDissolved] == L.hdr[kSolMDiscarded];
+  const bool idleOk = awake == 0;
+  RecordObserved("solute-blood.mixedAt", (double)mixedAt);
+  RecordObserved("solute-blood.goneAt", (double)goneAt);
+  RecordObserved("solute-blood.peakCells", (double)peakCells);
+  detail = Format(
+      "blood painted under %d layers of %d x %d water + %zu cells on top: %llu blood "
+      "eighths in, every blood voxel mixed by tick %d (allow %d)%s; cloud peaked at %u "
+      "cells / %u units; water eighths %llu -> %llu (allow +0..+%llu) %s; mass gone "
+      "from tick %d (%s, %u page / %u uniform slots); ledger dissolved %u discarded "
+      "%u (%s); %u of %zu chunks awake%s%s",
+      layers, box.x1 - box.x0 + 1, box.z1 - box.z0 + 1, drops.size(),
+      (unsigned long long)bloodIn, mixedAt, mixBy,
+      mixedAt < 0 ? Format(" -- %u blood cells left", bloodLeft).c_str() : "", peakCells,
+      peakMass, (unsigned long long)water0, (unsigned long long)water1,
+      (unsigned long long)added, waterOk ? "kept" : "LOST/MINTED", goneAt,
+      goneOk ? "GONE" : "RESIDUE", k.pageSlots, k.uniformSlots, L.hdr[kSolMDissolved],
+      L.hdr[kSolMDiscarded], ledgerOk ? "balanced" : "UNBALANCED", awake,
+      box.Chunks().size(), latchOk ? "" : ", ", latch.c_str());
+  const bool ok = mixedOk && waterOk && cloudOk && goneOk && ledgerOk && idleOk && latchOk;
+  std::printf("solute-blood: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SoluteGates() {
@@ -1392,6 +1523,7 @@ const std::vector<Gate>& SoluteGates() {
       {"solute-look", "render", {}, false, GateSoluteLook, true},
       {"solute-pour", "sim", {}, false, GateSolutePour, false},
       {"solute-payout", "sim", {}, false, GateSolutePayout, false},
+      {"solute-blood", "sim", {}, false, GateSoluteBlood, false},
   };
   return g;
 }

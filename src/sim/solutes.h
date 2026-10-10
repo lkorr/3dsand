@@ -2,7 +2,10 @@
 // DISSOLVED SUBSTANCES: the species table (assets/materials/solutes.json).
 //
 // A solute is not a material. A powder that dissolves (salt, fairy dust)
-// stops being cells and becomes MASS carried by the liquid it dissolved in;
+// stops being cells and becomes MASS carried by the liquid it dissolved in --
+// and so does a LIQUID that mixes into another (blood into water: the blood
+// cell becomes a water cell carrying the blood as mass, sim_step.wgsl
+// solTryMix);
 // concentration = mass / fullness is derived, never stored
 // (docs/PLAN_solutes.md section 1). This file is only the DATA: which powder
 // dissolves into which liquids, how much of it a cell can hold, how fast it
@@ -34,12 +37,18 @@ struct SoluteConvert {
 struct SoluteDef {
   std::string name;              // species name ("salt", "fairy")
   uint16_t species = 0;          // 1-based index; 0 = none (the aux layer's "no species")
-  uint16_t from = 0;             // material id of the powder that dissolves
+  uint16_t from = 0;             // material id of the powder (or liquid) that dissolves
   uint32_t yieldPerVoxel = 256;  // units one voxel of `from` becomes
   uint32_t saturation = 255;     // max concentration a solvent holds; the rest stays powder
   uint32_t dissolveChance = 60;  // per-mille per tick a grain touching a solvent dissolves (world + bench)
   uint32_t diffusivity = 12;     // pair-exchange rate, /256 (PLAN_solutes 3.3)
   uint32_t floor = 1;            // dilution floor: below this concentration mass is discarded (3.3.1)
+  // FADING: the mass halves every `halfLife` seconds wherever it is, spread
+  // or not (0 = never: salt is conserved). What makes a blood cloud thin out
+  // and be gone rather than only spread. decayQ is the per-tick loss fraction
+  // x 65536 the GPU applies (solCompact), derived from halfLife at load.
+  float halfLife = 0.0f;
+  uint32_t decayQ = 0;
   int32_t densityPerUnit = 0;    // density modifier: density += (densityPerUnit * c) >> 8  (4.2)
   uint32_t tint = 0;             // 0x00RRGGBB, linear palette colour the solvent shifts toward
   uint32_t tintStrength = 0;     // 0..255 at saturation
