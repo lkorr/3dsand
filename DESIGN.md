@@ -16044,7 +16044,12 @@ where you hear from either (§12b, "The ears are on the character").
   an untouched one, so `fardown` and the sieve keep their byte agreement.
   Measured at the ticket's camera at noon, sand-coloured samples in the
   frame: 31,828 before, 3,090 after (the rest is real beach). Ponds, W1
-  lakes and lava pools shallower than half a cell gain the same fix. Far
+  lakes, W1 rivers and lava pools shallower than half a cell gain the same
+  fix: from 600 m up, the Twinmere (2.5 m deep) was a brown mud bed with
+  water speckles and its rivers grey dry channels; both now read as water.
+  Raymarch GPU p50 over 2,400 frames, main vs this: the ticket camera 3.67
+  -> 3.65 ms, the Twinmere aerial 1.61 -> 1.74 (mean 2.04 -> 2.07; more of
+  the frame is now water). Far
   hits shade with the same palette/face/ambient constants as the
   near field (far water: `shadeFarWater`, below); the texture, AO
   and shadow terms are the near field's own since the seam pass below (phase 4
@@ -16503,11 +16508,17 @@ where you hear from either (§12b, "The ears are on the character").
     before -> after: shelf (the default map's north coast, eye 3 m, (2016,
     142, -84950) yaw -90 pitch -14) noon +7.6 -> +2.1, minute 960 (low sun)
     +8.4 -> +3.1, overcast +9.3 -> +1.9; the Twinmere lake ((12000, 213,
-    24500) yaw 0) noon +20.9 -> -0.1; deep open sea ((4000, 172, -105000))
-    0.0 -> 0.0. Across-the-boundary step in the shipped frames (trend-fit
+    24500) yaw 0, 2.5 m deep) noon -1.8 -> -0.2; deep open sea ((4000, 172,
+    -105000)) 0.0 -> 0.0. Across-the-boundary step in the shipped frames (trend-fit
     either side of 20.5 m): within +-0.4 on every camera before and after --
     the visible seam on these cameras was the shallow band's colour, not a
     line at the sphere.
+  - **Cost**: `--render-budget` baseline (1080p, exclusive lock, main's exe,
+    main's shaders vs these, back to back): cascade 4.78 -> 4.76 ms, peaksea
+    (the sea from 3 m) 10.62 -> 10.61, noon 11.10 -> 9.91 (no water in that
+    frame: run-to-run spread). The far bed march replaces a column walk of
+    up to 64 fetches with at most ~25 + 3; the caustic runs only where a bed
+    was found.
   - **Still not matched**: the far bed has no cast or contact shadow and no
     AO (a grazing ray through shallow water sees mostly the risers of the bed
     staircase; the near bed's median shadow there is 0.36), so beds under
