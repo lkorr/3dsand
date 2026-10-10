@@ -1,6 +1,7 @@
 #include "sim/solutes.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -59,9 +60,11 @@ bool LoadSolutes(const std::string& path, const std::vector<MaterialDef>& mats,
       return (uint16_t)(id > 0 ? id : 0);
     };
     d.from = mat("from", true);
-    // Only a powder dissolves: sim_step gates the dissolve read on the class.
-    if (d.from && mats[d.from].gpu.klass != CLASS_POWDER)
-      errors += where + "\"from\" must be a powder\n";
+    // A powder DISSOLVES (salt into water) and a liquid MIXES (blood into
+    // water: sim_step.wgsl solTryMix); nothing else reaches the dissolve read.
+    if (d.from && mats[d.from].gpu.klass != CLASS_POWDER &&
+        mats[d.from].gpu.klass != CLASS_LIQUID)
+      errors += where + "\"from\" must be a powder or a liquid\n";
     d.precipitatesTo = mat("precipitatesTo", false);
     d.yieldPerVoxel = r.value("yieldPerVoxel", 256u);
     // THE UNIT BRIDGE (contract 2.4): one dissolved eighth in a vessel is
@@ -76,6 +79,16 @@ bool LoadSolutes(const std::string& path, const std::vector<MaterialDef>& mats,
     d.diffusivity = std::min(256u, r.value("diffusivity", 12u));
     d.floor = r.value("floor", 1u);
     d.densityPerUnit = r.value("densityPerUnit", 0);
+    d.halfLife = r.value("halfLife", 0.0f);
+    if (d.halfLife < 0.0f) errors += where + "halfLife must be >= 0\n";
+    if (d.halfLife > 0.0f) {
+      // Per 30 Hz tick the fraction lost is 1 - 2^(-1/(30 h)). Converted ONCE
+      // here to an integer the kernel applies with stochastic rounding (rule
+      // 1: no float reaches the sim). >= 1 so a very long half-life still
+      // fades, < 65536 so a cell never loses everything in one tick.
+      const double f = 1.0 - std::pow(2.0, -1.0 / (30.0 * (double)d.halfLife));
+      d.decayQ = (uint32_t)std::clamp<double>(std::round(f * 65536.0), 1.0, 65535.0);
+    }
     d.tintStrength = std::min(255u, r.value("tintStrength", 0u));
     d.glow = std::min(255u, r.value("glow", 0u));
     if (r.contains("tint")) {
@@ -97,6 +110,8 @@ bool LoadSolutes(const std::string& path, const std::vector<MaterialDef>& mats,
       }
     }
     if (d.solvents.empty()) errors += where + "no solvents\n";
+    if (d.from && d.DissolvesIn(d.from))
+      errors += where + "a liquid cannot be a solvent of itself\n";
     if (r.contains("converts") && r["converts"].is_array()) {
       for (const json& c : r["converts"]) {
         SoluteConvert cv;
