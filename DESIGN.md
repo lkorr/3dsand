@@ -18316,7 +18316,11 @@ D: the emitter is replaced with stone and both go back to exactly zero.
 ### 9.t TAA and temporal upscale (added 2026-09-07; `assets/shaders/taa.wgsl`)
 
 `render.renderScale` renders the world at a fraction of the window and blits it
-up with NEAREST. That is the biggest single lever in the renderer — the
+up (bilinear by default since 2026-10-09, `render.upscaleLinear`; NEAREST was
+uneven at non-integer ratios). `render.maxRenderMPix` (1.5 MP, added
+2026-10-09) caps the PIXEL COUNT on top of that fraction, so the frame's cost
+stops tracking the window size: the 1600x900 window renders native and a
+2560x1440 fullscreen renders at ~0.64. That is the biggest single lever in the renderer — the
 `halfres` budget arm saves ~70% of the raymarch — but what it produces is a
 SMALLER PICTURE, not a cheaper one: at 0.7 you are looking at 0.7-resolution
 edges and nothing ever fills them back in. `render.taa` replaces that blit with

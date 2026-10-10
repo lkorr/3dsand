@@ -2518,6 +2518,10 @@ TP_I(render, farPlaneFillRate, NO_WGSL, 1024, 1, kFarListCap)
 // engine; below a quarter the frame is 400x225 and the UI text on top is
 // larger than the terrain. Present mode is an enum; fpsCap 0 = off.
 TP_F(render, renderScale, NO_WGSL, 1.0f, 0.25f, 1.0f)
+// The pixel budget the world may render at, in MEGAPIXELS; 0 = no cap. The
+// top is 4K x 2 -- above that the cap can never bind on any real display.
+TP_F(render, maxRenderMPix, NO_WGSL, 1.5f, 0.0f, 16.0f)
+TP_I(render, upscaleLinear, NO_WGSL, 1, 0, 1)
 TP_I(render, taa, NO_WGSL, 0, 0, 1)
 // TAA: a history shorter than 1 sample is not a history, and one longer
 // than the f16 the shader stores it in cannot be counted. The clamp width

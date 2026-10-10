@@ -1064,6 +1064,8 @@ const TUNING_PARAMS = {
   'render.farRefillRate':{t:'i',def:1024,min:1,max:4096},
   'render.farPlaneFillRate':{t:'i',def:1024,min:1,max:4096},
   'render.renderScale':{t:'f',def:1,min:0.25,max:1},
+  'render.maxRenderMPix':{t:'f',def:1.5,min:0,max:16},
+  'render.upscaleLinear':{t:'i',def:1,min:0,max:1},
   'render.taa':{t:'i',def:0,min:0,max:1},
   'render.taaMaxHist':{t:'f',def:24,min:1,max:512},
   'render.taaClamp':{t:'f',def:0.25,min:0,max:4},

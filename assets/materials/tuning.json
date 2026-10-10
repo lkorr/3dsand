@@ -968,6 +968,8 @@
     "cloudFogMix": 1.0,
     "lodHandoffDist": 20.5,
     "renderScale": 1,
+    "maxRenderMPix": 1.5,
+    "upscaleLinear": 1,
     "taa": 0,
     "taaMaxHist": 8,
     "taaClamp": 0.25,

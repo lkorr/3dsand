@@ -15927,7 +15927,19 @@ int main(int argc, char** argv) {
       // The world's render size this frame. `scaled` is the whole switch: at
       // 1.0 (or on a surface that cannot be blitted into) the frame renders
       // straight into the swapchain and nothing below changes.
-      const float renderScale = CurrentTuning().render.renderScale;
+      //
+      // render.maxRenderMPix caps the PIXEL COUNT on top of the fraction: the
+      // raymarch is pixel-linear, so a fraction alone leaves fullscreen
+      // 2560x1440 costing 2.56x the 1600x900 window at any setting. The cap
+      // leaves a window under the budget at native size and holds a bigger
+      // one to the budget's pixel count. Floored at the row's own 0.25.
+      float renderScale = CurrentTuning().render.renderScale;
+      if (const float mpix = CurrentTuning().render.maxRenderMPix;
+          mpix > 0.0f && ctx.width > 0 && ctx.height > 0) {
+        const float fit = std::sqrt(mpix * 1.0e6f /
+                                    ((float)ctx.width * (float)ctx.height));
+        renderScale = std::max(0.25f, std::min(renderScale, fit));
+      }
       const bool scaled = renderScale < 0.999f && ctx.SwapchainBlittable();
       const uint32_t renderW =
           scaled ? std::max(1u, (uint32_t)std::lround(ctx.width * renderScale))
@@ -20301,7 +20313,8 @@ int main(int argc, char** argv) {
           taaFrameNo++;
           sim.FlipTaaPage();
         } else {
-          enc.BlitTexture(scaledView, target);
+          enc.BlitTexture(scaledView, target,
+                          CurrentTuning().render.upscaleLinear != 0);
         }
         rp = sim.BeginOverlayRenderPass(enc, target, ctx.surfaceFormat, ctx.width,
                                         ctx.height);
@@ -20362,7 +20375,7 @@ int main(int argc, char** argv) {
                 std::remainder(cam.yaw * 57.2957795f, 360.0f), cam.pitch * 57.2957795f, tick, ui.paused ? " (paused)" : "", ui.fps,
                 ui.frameMs, W, H,
                 hm > 0 && hm < (int)ui.materialNames.size() ? ui.materialNames[hm].c_str() : "-",
-                CurrentTuning().render.renderScale);
+                renderScale);
             bugContext = c;
           }
           // THIS picture's camera: where it stood, where it looked, what the

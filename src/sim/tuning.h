@@ -4958,6 +4958,22 @@ struct Tuning {
     // never had. 1.0 renders straight into the swapchain as before — the
     // offscreen target and the blit exist only below 1. Clamped to [0.25, 1].
     float renderScale = TPD(render, renderScale);
+    // maxRenderMPix: a CAP on the world's render size in megapixels, applied
+    // on top of renderScale: the effective scale is
+    // min(renderScale, sqrt(maxRenderMPix * 1e6 / (width * height))). This is
+    // the knob that makes the frame cost independent of the WINDOW size.
+    // renderScale is a fraction, so it shrinks a small window as much as a
+    // fullscreen one and the 2.5x gap between 1600x900 and 2560x1440 stays;
+    // a pixel budget leaves the small window at native resolution and holds
+    // fullscreen to the same pixel count. 1.5 = the 1600x900 default window
+    // is untouched, 1080p renders at 0.85, 1440p at 0.64. 0 = no cap.
+    float maxRenderMPix = TPD(render, maxRenderMPix);
+    // upscaleLinear: 1 blits a scaled frame up with BILINEAR filtering, 0 with
+    // NEAREST. Nearest is only clean at integer ratios; at the 0.64 a pixel
+    // budget gives fullscreen 1440p it doubles some rows and columns and not
+    // others, which reads as shimmering stair-steps in motion. Ignored with
+    // render.taa on (the resolve does its own reconstruction).
+    int upscaleLinear = TPD(render, upscaleLinear);
     // ---- TAA + temporal upscale (assets/shaders/taa.wgsl) ----------------
     //
     // taa: 1 replaces the NEAREST blit at the end of a scaled frame with a
