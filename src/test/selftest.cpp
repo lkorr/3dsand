@@ -428,7 +428,7 @@ const char* const kOrder[] = {
     "drafts",
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-identity", "fluid-settle",
     "fluid-excite", "fluid-onwater", "debris-float", "fluid-stain", "fluid-react", "fluid-self-react", "far-fog",  "far-downsample",
-    "far-persist", "far-surface",
+    "far-persist", "far-surface", "far-layer",
     // `shadow-cache` recompiles raymarch.wgsl three times (its three arms are
     // const-folded, so they do not exist without a reload) and restores the
     // baseline tuning before returning. It leaves no world state behind, so

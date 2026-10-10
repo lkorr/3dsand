@@ -5814,6 +5814,33 @@ fn farCellIsSolid(mat : u32) -> bool {
   return m.klass != CLASS_GAS && (m.flags & MATF_MICRO) == 0u;
 }
 
+// ---- THE LOOSE TOP's two questions (the rule: fardownFeat; CPU twin
+// faredits.cpp FarEdits::LooseTop) ------------------------------------------
+// LOOSE matter is what lies ON a surface rather than being it: a far-solid
+// liquid or powder (oil, water, blood, snow, ash, sand). faredits.h
+// SetLooseSource is the same predicate, per material id.
+fn farIsLoose(m : u32) -> bool {
+  if (!farCellIsSolid(m)) { return false; }
+  let k = materials[m].klass;
+  return k == CLASS_LIQUID || k == CLASS_POWDER;
+}
+// T, the top of the far-solid run that starts at a cell's centre `fine`, when
+// the run ends inside the cell's reach: T in [c, c + step - 1], the voxel over
+// T not far-solid. FAR_RUN_ON when the run reaches the next centre (the cell
+// above holds the surface); FAR_NO_TOP when the centre is not far-solid or the
+// run leaves the window before ending (unknown, so no claim).
+const FAR_NO_TOP : i32 = -2147483647;
+const FAR_RUN_ON : i32 = 2147483647;
+fn farRunTop(fine : vec3<i32>, step : i32) -> i32 {
+  if (!inWindow(fine, T.origin) || !farCellIsSolid(voxWordAt(fine) & 0xFFFu)) { return FAR_NO_TOP; }
+  for (var d = 1; d <= step; d++) {
+    let q = fine + vec3<i32>(0, d, 0);
+    if (!inWindow(q, T.origin)) { return FAR_NO_TOP; }
+    if (!farCellIsSolid(voxWordAt(q) & 0xFFFu)) { return q.y - 1; }
+  }
+  return FAR_RUN_ON;
+}
+
 // ---- THE CONTAINER RULE: a wall between liquid and open space is kept -------
 // (2026-10-07, bug report 2026-10-07_20-46-57). A centre sample sees ONE voxel
 // of the cell's 2^(3*shift), so a basin with 1-voxel walls -- Harrowby's
@@ -7034,6 +7061,9 @@ var<workgroup> wgFarLiq : atomic<u32>;
 // `fardownFeat`'s cover pass: 1 when the chunk holds a cover voxel
 // (farCoverSlotOf, the cover rule's prefilter).
 var<workgroup> wgFarCov : atomic<u32>;
+// `fardownFeat`'s loose-top pass: 1 when the chunk, or the bottom row of the
+// chunk above it, holds LOOSE matter (farIsLoose, the rule's prefilter).
+var<workgroup> wgFarLay : atomic<u32>;
 
 @compute @workgroup_size(64)
 fn far(@builtin(workgroup_id) wg : vec3<u32>,
@@ -8636,6 +8666,140 @@ fn fardownFeat(@builtin(workgroup_id) wg : vec3<u32>,
         if (pick == 0u) { continue; }
         atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
         atomicOr(&farVox[bi >> 2u], pick << bsh);
+        atomicMax(&farOcc[farOccIndex(level, cc)],
+                  farOccPack(1u, u32(cc.y & (i32(CHUNK) - 1)) + 1u));
+      }
+    }
+  }
+
+  // ---- THE LOOSE TOP, LIVE (farRunTop; DESIGN.md "A thin layer keeps its
+  // footprint") --------------------------------------------------------------
+  // `fardown` wrote every cell from its centre sample, so a layer thinner than
+  // a cell -- oil on a lake, snow or ash on the ground, spilled sand, a puddle
+  // on a floor -- reached a level only where one of that level's centre ROWS
+  // happened to land in it: a 1-voxel slick at y showed at exactly the one
+  // level whose centres sit at y (ticket 2026-10-10_11-01-58), and every other
+  // level drew the water under it. THE RULE, one law for every producer:
+  //
+  //   a cell whose centre voxel is far-solid takes the material of T, the top
+  //   voxel of the far-solid run that starts at its centre, when the run ends
+  //   inside the cell's reach (T in [c, c + step - 1], the voxel over T not
+  //   far-solid), T is LOOSE matter (a liquid or a powder: farIsLoose), and T
+  //   lies above the ground contract h. At the container rule's levels a cell
+  //   that rule claims is left to it.
+  //
+  // And the same pass puts a cell BACK: a cell whose centre is above h and
+  // whose run does not end in a loose T is its centre's own material -- which
+  // is exactly what `fardown` writes there (farSurfaceMat leaves a centre above
+  // the ground alone), so this is no second rule, only the first one's
+  // complement, written by whoever sees the column change.
+  //
+  // So every level's surface cell over a column wears what the near field shows
+  // on top of it, the footprint is the same centre-column sample at every level
+  // (to within one cell of that level), and the cell's SHAPE is untouched --
+  // only its colour follows the column's top. Each condition is what keeps
+  // pristine terrain on the sieve's bytes: a run ending at the ground (T <= h:
+  // a sand skin, a road's tint, a flattened canopy) is the sieve's business;
+  // a standing fluid's top is the sieve's `wetTop` water already; a tree, a
+  // stalk, a roof or ice is solid and keeps its centre.
+  //
+  // OWNERSHIP ACROSS CHUNKS. T can be up to a cell above the centre, so the
+  // centre and its top need not share a chunk. EVERY dirty chunk whose rows
+  // meet a cell's reach [c, c + step) evaluates the cell, from the live grid
+  // through voxWordAt (the window is resident), and they write the same byte
+  // -- a pure function of the grid, h and the cell, so two writers in one
+  // dispatch end on it whatever the interleaving. The chunk holding the centre
+  // must, because `fardown` just rewrote the cell from the centre; any chunk
+  // the run passes through must, because it may be the one that changed --
+  // and `fardown` itself will NOT rerun for the centre's chunk when only the
+  // layer above it moved (its signature covers its own voxels; measured: a
+  // slick that spread left its old cells oiled until this pass took them back).
+  // What no chunk can do without procgen is put a skin or a tint back when a
+  // layer goes from a centre at or under h: removing the whole layer writes
+  // the voxel over h, which lies in the centre's chunk or on a face of it, so
+  // the centre's own downsample does that (fan-out, sim_step.wgsl markDirtyR;
+  // its signature moves only if that chunk's own voxels did).
+  //
+  // HERE, procgen-free but for one landColumn per cell that would change,
+  // for the cover and container rules' reason (`fardown`'s compile cliff).
+  // After the cover pass (it fills only cells whose centre found nothing; this
+  // touches only cells whose centre is far-solid) and before the container
+  // pass, which claims its cells itself (the check below keeps the two
+  // disjoint, so neither order nor a chunk that did not run can matter).
+  //
+  // PREFILTER (exact for the cells this chunk owns): no loose voxel in the
+  // chunk and none on the bottom row of the chunk above -> no T here, and a
+  // run starting in here can only reach loose matter through that row.
+  // (Exact up to a run that climbs a solid voxel of the chunk above first, a
+  // layer on a ledge one voxel up a chunk face: that cell is the top chunk's
+  // to fix when it changes.)
+  let isSent = (pe & PT_SENTINEL_BIT) != 0u;
+  var lay = select(0u, select(0u, 1u, farIsLoose(pe & PT_MAT_MASK)), isSent);
+  if (li == 0u) { atomicStore(&wgFarLay, 0u); }
+  workgroupBarrier();
+  if (!isSent) {
+    for (var i = li; i < CHUNK_VOL && lay == 0u; i += 64u) {
+      lay |= select(0u, 1u, farIsLoose(voxels[pageBase + i] & 0xFFFu));
+    }
+  }
+  for (var i = li; i < CHUNK * CHUNK && lay == 0u; i += 64u) {
+    let q = base + vec3<i32>(i32(i % CHUNK), i32(CHUNK), i32(i / CHUNK));
+    if (inWindow(q, T.origin)) { lay |= select(0u, 1u, farIsLoose(voxWordAt(q) & 0xFFFu)); }
+  }
+  if (lay == 1u) { atomicOr(&wgFarLay, 1u); }
+  if (workgroupUniformLoad(&wgFarLay) != 0u) {
+    for (var level = 1u; level <= FAR_LEVELS; level++) {
+      let shift = farCellShift(level);
+      let step = 1 << shift;
+      let half = 1 << (shift - 1u);
+      let fx0 = farFirstCenter(base.x, step, half);
+      let fz0 = farFirstCenter(base.z, step, half);
+      let nx = farCenterCount(base.x, fx0, step);
+      let nz = farCenterCount(base.z, fz0, step);
+      // The candidate centres: every one whose reach [c, c + step) meets this
+      // chunk's rows. The first one is at or under base.y, so ny >= 1.
+      let cy0 = farFirstCenter(base.y - step + 1, step, half);
+      let ny = (base.y + i32(CHUNK) - 1 - cy0) / step + 1;
+      let origin = F.origins[level - 1u].xyz;
+      let cells = u32(max(nx * nz, 0) * ny);
+      for (var ci = li; ci < cells; ci += 64u) {
+        let fine = vec3<i32>(fx0 + (i32(ci) % nx) * step,
+                             cy0 + (i32(ci) / (nx * nz)) * step,
+                             fz0 + ((i32(ci) / nx) % nz) * step);
+        let cc = fine >> vec3<u32>(shift);
+        if (!farInBox(cc, origin)) { continue; }
+        let t = farRunTop(fine, step);
+        if (t == FAR_NO_TOP) { continue; }
+        // The answer, before h is known: a loose T's material, else the
+        // centre's own (what `fardown` writes for a centre above the ground).
+        var m = voxWordAt(fine) & 0xFFFu;
+        var loose = false;
+        if (t != FAR_RUN_ON) {
+          let tm = voxWordAt(vec3<i32>(fine.x, t, fine.z)) & 0xFFFu;
+          if (farIsLoose(tm)) { m = tm; loose = true; }
+        }
+        let slotT = matFarPal(&materials, m);
+        if (slotT == 0u) { continue; }
+        let bi = farVoxByteIndex(level, cc);
+        let bsh = (bi & 3u) * 8u;
+        // Already wearing it: nothing to write (the steady state everywhere --
+        // a lake surface's T is the water the cell already holds).
+        if (farCellSlot((atomicLoad(&farVox[bi >> 2u]) >> bsh) & 0xFFu) == slotT) { continue; }
+        var L : LandCol;
+        landColumn(fine.x, fine.z, T.seed, &L);
+        // A loose T over the ground, or -- the way a layer comes OFF again --
+        // a centre above the ground, whose byte is its own material whatever
+        // `fardown` last wrote (farSurfaceMat returns it unchanged there). A
+        // centre at or under h is procgen's skin business: silent.
+        if (!((loose && t > L.h) || fine.y > L.h)) { continue; }
+        if (shift <= FAR_CONTAIN_MAX_SHIFT) {
+          let centre = voxWordAt(fine) & 0xFFFu;
+          let cpe = pageTable[voxSlotOfCell(fine)];
+          let cbase = (fine >> vec3<u32>(CHUNK_SHIFT)) * i32(CHUNK);
+          if (farContainedBy(centre, fine, shift, cbase, cpe) != centre) { continue; }
+        }
+        atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
+        atomicOr(&farVox[bi >> 2u], slotT << bsh);
         atomicMax(&farOcc[farOccIndex(level, cc)],
                   farOccPack(1u, u32(cc.y & (i32(CHUNK) - 1)) + 1u));
       }

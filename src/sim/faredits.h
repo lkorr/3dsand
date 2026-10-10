@@ -137,6 +137,27 @@ class FarEdits {
   // of the material's slot OWNER. Until it is set, no cover.
   static constexpr int kCoverMaxShift = 4;   // == FAR_COVER_MAX_SHIFT (== CHUNK_SHIFT)
   void SetCoverSource(std::vector<uint32_t> coverOf) { coverOf_ = std::move(coverOf); }
+
+  // ---- THE LOOSE TOP (2026-10-10; worldgen.wgsl farRunTop, the pass in
+  // fardownFeat; DESIGN.md "A thin layer keeps its footprint") ------------
+  // A cell whose centre is far-solid takes the material of T, the top voxel of
+  // the far-solid run starting at its centre, when that run ends inside the
+  // cell's reach (T in [c + 1, c + step - 1], the voxel over T not far-solid),
+  // T is LOOSE (a far-solid liquid or powder) and T is above the ground
+  // contract h (World::TerrainHeight). A cell the container rule claimed is
+  // left to it. The GPU sees the whole window; this side sees the noted chunk
+  // and, when the caller has it, the chunk ABOVE (NoteChunk's `above`: the
+  // same eviction batch; a load's rebuild has none) -- a run that leaves both
+  // is a downsample-only answer, like a container wall whose liquid is across
+  // a chunk face. The substituted word also carries the top's slot in its
+  // ground field, so `farpatch`'s farSurfaceMat paints the layer and not the
+  // skin over a cell that straddles h; and a column whose ground has a loose
+  // layer on it files no ground word (the layer, not the ground, is its top).
+  // Per material id: 1 when loose. Until it is set, no substitution.
+  void SetLooseSource(std::vector<uint8_t> looseOf) { looseOf_ = std::move(looseOf); }
+  // Material of the chunk directly above a noted chunk at chunk-local
+  // (x, y, z), or -1 when the caller cannot see it.
+  using AboveFn = std::function<int(int, int, int)>;
   uint32_t CoverOf(uint32_t mat) const { return mat < coverOf_.size() ? coverOf_[mat] : 0u; }
   // The cover rule for one cell (see SetCoverSource): `centre` its centre
   // material (already known not far-solid), `half` its half-width, `c0` its
@@ -227,11 +248,11 @@ class FarEdits {
   // a cell wins at compaction, and a level chunk whose appended runs outgrow
   // twice its cell count is compacted on the spot (Append), so storage stays
   // bounded however often a chunk is re-noted.
-  void NoteChunk(IVec3 wc, const uint32_t* words);
+  void NoteChunk(IVec3 wc, const uint32_t* words, const AboveFn& above = {});
   // Same, for a page-table sentinel slot whose whole content is one material
   // (EMPTY / UNIFORM / JITTER — JITTER varies only the palette nibble, which
   // the far field does not store).
-  void NoteUniformChunk(IVec3 wc, uint32_t mat);
+  void NoteUniformChunk(IVec3 wc, uint32_t mat, const AboveFn& above = {});
 
   // Patch words for one level chunk (1-based level, coord in level-CHUNK
   // units), or nullptr when that chunk holds no edits. One word per cell,
@@ -308,7 +329,10 @@ class FarEdits {
   // The per-level sample sweep shared by NoteChunk / NoteUniformChunk: calls
   // `sample(fineOffsetInChunk)` for every cascade cell center that lands in
   // this chunk and returns the raw material for it.
-  void Sweep(IVec3 wc, const std::function<uint32_t(int, int, int)>& sample);
+  void Sweep(IVec3 wc, const std::function<uint32_t(int, int, int)>& sample,
+             const AboveFn& above);
+  std::vector<uint8_t> looseOf_;   // SetLooseSource
+  bool LooseOf(uint32_t mat) const { return mat < looseOf_.size() && looseOf_[mat] != 0; }
 
   std::unordered_map<LKey, Chunk, LKeyHash> byChunk_;
   // The base (compacted, ColumnKey order) and, per level chunk that has BOTH a

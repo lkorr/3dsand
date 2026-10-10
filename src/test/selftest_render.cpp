@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "game/brush.h"
@@ -911,6 +912,292 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
   // Leave the cascades as the next gate expects to find them: pristine + the
   // index the harness had (none), not our two edits' patches.
   edits.Clear();
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- far-layer ---------------------------------------------------------
+// THE LOOSE TOP (worldgen.wgsl farRunTop + the pass in fardownFeat, the CPU
+// twin in faredits.cpp Sweep; DESIGN.md "A thin layer keeps its footprint").
+// Ticket 2026-10-10_11-01-58: a patch of oil on a lake drew a different size
+// and shape at every distance. A cascade cell was the material of its CENTRE
+// voxel, so a 1-voxel slick at row y reached a level only where that level's
+// centre rows hit y -- exactly one level for a slick on a 64-multiple -- and
+// every other level drew the water under it.
+//
+// The fixture is that case in the sky, where nothing else is: a glass tub
+// 128 x 128, 15 voxels of settled water, and a disc of oil one voxel thick on
+// it, the oil row ON a multiple of 64 so that no level 1-6 centre row lands
+// in it (the worst parity; before the rule every level drew water there).
+//
+// For every level-k cell whose footprint lies inside the tub, the far column's
+// SURFACE cell (its topmost material cell) must wear the far slot of what the
+// live grid has on top of that cell's sample column -- oil where the column
+// is oiled, water where it is not. That is the near field's answer, so the
+// footprint at level k is the slick sampled at level k's centre columns: the
+// same disc to within one cell at every level, which is what the owner asked
+// for. A level whose cells are thicker than the whole tub can have no surface
+// cell at all (a shape question, not this rule's): counted, never failed.
+//
+// TWO ARMS, the far-persist shape: LIVE (fardown + the loose-top pass), then
+// the tub's chunks noted into the edit index -- each with the chunk above it,
+// as an eviction batch hands it -- and the cascades refilled from the sieve +
+// `farpatch`, which must give the same answer.
+Status GateFarLayer(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const uint32_t seed = kDefaultSeed;
+  auto matId = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t water = matId("water"), oil = matId("oil");
+  if (water == 0 || oil == 0) {
+    detail = "no water/oil material";
+    std::printf("far layer: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  auto farSolid = [&](uint32_t m) {
+    return m != kMatAir && m < c.mats.size() && c.mats[m].gpu.klass != CLASS_GAS &&
+           (c.mats[m].gpu.flags & kMatFlagMicro) == 0;
+  };
+  const uint32_t oilSlot = c.mats[oil].farPalSlot;
+
+  // The tub: interior [x0, x0 + W)^2, clear of far-persist's sky paint (300)
+  // and far-surface's ground sites. 320 is a multiple of 64, so levels 1-6
+  // have whole cells inside it.
+  const int x0 = 320, z0 = 320, W = 128;
+  int yo = FixtureYOver(x0 - 1, z0 - 1, x0 + W, z0 + W, seed, 120, 40);
+  yo = (yo + 63) & ~63;            // the oil row
+  const int y0 = yo - 16;          // the glass floor; water y0 + 1 .. yo - 1
+  if (yo + 8 >= (int)kWorldN) {
+    detail = Format("oil row %d leaves no window above it", yo);
+    std::printf("far layer: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  const IVec3 playerChunk{(x0 + W / 2) >> 4, yo >> 4, (z0 + W / 2) >> 4};
+  const int ocx = x0 + 61, ocz = z0 + 67, orad = 37;   // the slick, off-grid
+
+  FarEdits& edits = c.stream.Edits();
+  edits.Clear();
+  SubmitWorldgen(ctx, world, sim, seed);
+  ctx.WaitIdle();
+  DrainFullRefill(ctx, world, sim, playerChunk);
+
+  // ---- build: floor + walls, water in three-layer slabs (the cell-op cap),
+  // the oil, then settle ticks for the downsample --------------------------
+  auto put = [](std::vector<CellOp>& v, int x, int y, int z, uint32_t m, uint32_t st) {
+    v.push_back({World::SlotCellIndex({x, y, z}), (m & 0xFFFu) | (st << 12)});
+  };
+  uint32_t t = 0;
+  auto tick = [&](const std::vector<CellOp>& cells) {
+    // DIRECT PHASE CALLS ON PURPOSE (W2-O): the phase under test is the
+    // sim tick's far downsample, which SubmitTick records; far-downsample,
+    // far-persist and far-surface tick the same way.
+    SubmitTick(ctx, world, sim, ++t, seed, {}, {}, cells, false, playerChunk, false, false);
+  };
+  {
+    std::vector<CellOp> v;
+    for (int z = z0 - 1; z <= z0 + W; z++)
+      for (int x = x0 - 1; x <= x0 + W; x++) {
+        put(v, x, y0, z, kMatGlass, 0);
+        if (x == x0 - 1 || x == x0 + W || z == z0 - 1 || z == z0 + W)
+          for (int y = y0 + 1; y <= yo + 2; y++) put(v, x, y, z, kMatGlass, 0);
+      }
+    tick(v);
+  }
+  for (int y = y0 + 1; y < yo; y += 3) {
+    std::vector<CellOp> v;
+    for (int yy = y; yy < std::min(y + 3, yo); yy++)
+      for (int z = z0; z < z0 + W; z++)
+        for (int x = x0; x < x0 + W; x++) put(v, x, yy, z, water, 7u);
+    tick(v);
+  }
+  {
+    std::vector<CellOp> v;
+    for (int z = ocz - orad; z <= ocz + orad; z++)
+      for (int x = ocx - orad; x <= ocx + orad; x++)
+        if ((x - ocx) * (x - ocx) + (z - ocz) * (z - ocz) <= orad * orad)
+          put(v, x, yo, z, oil, 7u);
+    tick(v);
+  }
+  for (int i = 0; i < 3; i++) tick({});
+  ctx.WaitIdle();
+
+  // ---- the live grid over the tub, one chunk at a time ---------------------
+  std::unordered_map<uint64_t, std::vector<uint32_t>> live;
+  auto chunkWords = [&](IVec3 wc) -> const std::vector<uint32_t>& {
+    const uint64_t k = World::PackChunkKey(wc);
+    auto it = live.find(k);
+    if (it != live.end()) return it->second;
+    std::vector<uint32_t> w(kChunkVol, 0);
+    if (world.ChunkInWindow(wc))
+      ReadVoxelsSync(ctx, world, World::SlotChunkIndex(wc), 1, w.data(), "farLayer");
+    return live.emplace(k, std::move(w)).first->second;
+  };
+  auto liveMat = [&](int x, int y, int z) -> uint32_t {
+    const auto& w = chunkWords({x >> 4, y >> 4, z >> 4});
+    return w[(((z & 15) * kChunk + (y & 15)) * kChunk) + (x & 15)] & 0xFFFu;
+  };
+  // One level chunk of the far field, 4,096 bytes, cached per arm.
+  std::unordered_map<uint64_t, std::vector<uint8_t>> farCache;
+  auto farByte = [&](uint32_t level, IVec3 cc) -> uint32_t {
+    auto wrapv = [](int v) { return (uint32_t)(v & (int)(kFarN - 1)); };
+    const uint32_t x = wrapv(cc.x), y = wrapv(cc.y), z = wrapv(cc.z);
+    const uint32_t ch = ((z >> 4) * kFarNChunk + (y >> 4)) * kFarNChunk + (x >> 4);
+    const uint64_t key = ((uint64_t)level << 40) | ch;
+    auto it = farCache.find(key);
+    if (it == farCache.end()) {
+      std::vector<uint8_t> b(kChunkVol, 0);
+      rhi::Buffer staging = CreateBuffer(
+          ctx.device, kChunkVol, rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+          "farLayerRead");
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      enc.CopyBufferToBuffer(world.farVox,
+                             (uint64_t)(level - 1) * kFarVox + (uint64_t)ch * kChunkVol,
+                             staging, 0, kChunkVol);
+      ctx.queue.Submit(enc.Finish());
+      rhi::ReadBufferBlocking(ctx.device, staging, 0, b.data(), kChunkVol);
+      it = farCache.emplace(key, std::move(b)).first;
+    }
+    return it->second[((z & 15) * kChunk + (y & 15)) * kChunk + (x & 15)];
+  };
+
+  // ---- the measurement: per level, the surface cell vs the live top ------
+  constexpr int kLevels = 6;
+  struct Arm {
+    int cells[kLevels + 1] = {}, liveOil[kLevels + 1] = {}, farOil[kLevels + 1] = {};
+    int wrong[kLevels + 1] = {}, noCell[kLevels + 1] = {}, contained[kLevels + 1] = {},
+        solidTop[kLevels + 1] = {};
+    std::string why;
+    int bad = 0;
+  };
+  int fineOil = 0;
+  for (int z = z0; z < z0 + W; z++)
+    for (int x = x0; x < x0 + W; x++)
+      for (int y = yo + 3; y >= y0; y--) {
+        const uint32_t m = liveMat(x, y, z);
+        if (!farSolid(m)) continue;
+        fineOil += m == oil;
+        break;
+      }
+  auto measure = [&](Arm& a, const char* name) {
+    farCache.clear();
+    for (int level = 1; level <= kLevels; level++) {
+      const int shift = level + (int)kFarShiftBase;
+      const int step = 1 << shift, half = step >> 1;
+      for (int cz = (z0 + step - 1) >> shift; ((cz + 1) << shift) <= z0 + W; cz++)
+        for (int cx = (x0 + step - 1) >> shift; ((cx + 1) << shift) <= x0 + W; cx++) {
+          const int fx = (cx << shift) + half, fz = (cz << shift) + half;
+          int ty = INT32_MIN;
+          uint32_t tm = kMatAir;
+          for (int y = yo + 3; y >= y0; y--) {
+            const uint32_t m = liveMat(fx, y, fz);
+            if (farSolid(m)) { ty = y; tm = m; break; }
+          }
+          const uint32_t want = c.mats[tm].farPalSlot;
+          int row = INT32_MIN;
+          uint32_t got = 0;
+          for (int cy = (yo + 8) >> shift; cy >= (y0 - 1) >> shift; cy--) {
+            const uint32_t s = FarCellSlot(farByte((uint32_t)level, {cx, cy, cz}));
+            if (s != 0) { row = cy; got = s; break; }
+          }
+          a.cells[level]++;
+          a.liveOil[level] += tm == oil;
+          a.farOil[level] += got == oilSlot && got != 0;
+          if (row == INT32_MIN) { a.noCell[level]++; continue; }
+          // THE CONTAINER RULE's cells are its own (worldgen farContainedBy,
+          // levels 1-2): the tub's rim water freezes against the glass in the
+          // cold sky, and a cell holding an ice voxel between the water and
+          // the air wears the ice. A cell whose byte is a far-solid NON-liquid
+          // voxel inside the cell itself is that rule's, not this one's.
+          bool contained = false;
+          if (got != want && shift <= 2) {
+            for (int dz = 0; dz < step && !contained; dz++)
+              for (int dy = 0; dy < step && !contained; dy++)
+                for (int dx = 0; dx < step && !contained; dx++) {
+                  const uint32_t m = liveMat((cx << shift) + dx, (row << shift) + dy,
+                                             (cz << shift) + dz);
+                  contained = farSolid(m) && c.mats[m].gpu.klass != CLASS_LIQUID &&
+                              c.mats[m].farPalSlot == got;
+                }
+          }
+          if (contained) { a.contained[level]++; continue; }
+          // A SOLID top (the rim water froze to ice) is not a layer: the rule
+          // leaves such a cell its centre sample, like a tree or a roof.
+          if (got != want && c.mats[tm].gpu.klass != CLASS_LIQUID &&
+              c.mats[tm].gpu.klass != CLASS_POWDER) {
+            a.solidTop[level]++;
+            continue;
+          }
+          if (got != want) {
+            a.wrong[level]++;
+            if (a.bad++ < 4) {
+              const int cyc = (row << shift) + half;   // that cell's centre row
+              auto slotName = [&](uint32_t sl) -> std::string {
+                for (const auto& m : c.mats)
+                  if (m.farPalSlot == sl && m.farPalOwner) return m.name;
+                return Format("slot%u", sl);
+              };
+              std::string col;
+              for (int y = ty + 1; y >= ty - 2; y--)
+                col += Format(" %s", c.mats[liveMat(fx, y, fz)].name.c_str());
+              a.why += Format(" [%s L%d (%d,%d): live top y%d %s, far row y%d..%d holds %s "
+                              "(centre %s, want %s); column y%d down:%s]",
+                              name, level, fx, fz, ty, c.mats[tm].name.c_str(), row << shift,
+                              (row << shift) + step - 1, slotName(got).c_str(),
+                              c.mats[liveMat(fx, cyc, fz)].name.c_str(), slotName(want).c_str(),
+                              ty + 1, col.c_str());
+            }
+          }
+        }
+    }
+  };
+  Arm liveArm, patchArm;
+  measure(liveArm, "live");
+
+  // ---- the patch arm: index the tub's chunks (each with the one above, the
+  // eviction batch's view), refill from the sieve + farpatch ---------------
+  edits.Clear();
+  uint32_t noted = 0;
+  for (int wz = (z0 - 1) >> 4; wz <= (z0 + W) >> 4; wz++)
+    for (int wx = (x0 - 1) >> 4; wx <= (x0 + W) >> 4; wx++)
+      for (int wy = y0 >> 4; wy <= (yo + 3) >> 4; wy++) {
+        const IVec3 wc{wx, wy, wz};
+        if (!world.ChunkInWindow(wc)) continue;
+        const std::vector<uint32_t> words = chunkWords(wc);
+        const std::vector<uint32_t> up = chunkWords({wx, wy + 1, wz});
+        edits.NoteChunk(wc, words.data(), [&up](int lx, int ly, int lz) {
+          return (int)(up[((uint32_t)lz * kChunk + (uint32_t)ly) * kChunk + (uint32_t)lx] &
+                       0xFFFu);
+        });
+        noted++;
+      }
+  DrainFullRefill(ctx, world, sim, playerChunk);
+  measure(patchArm, "patch");
+  edits.Clear();
+
+  bool ok = true;
+  std::string per;
+  for (int level = 1; level <= kLevels; level++) {
+    const bool lvOk = liveArm.wrong[level] == 0 && patchArm.wrong[level] == 0 &&
+                      (level > 5 || liveArm.liveOil[level] > 0);
+    ok = ok && lvOk;
+    const int step = 1 << (level + (int)kFarShiftBase);
+    per += Format("%sL%d oil %d/%d live %d patch (%d cells, area %.2fx, %d wrong / %d "
+                  "patch wrong, %d no cell, %d container, %d solid top)",
+                  level > 1 ? "; " : "", level, liveArm.farOil[level], liveArm.liveOil[level],
+                  patchArm.farOil[level], liveArm.cells[level],
+                  fineOil > 0 ? (double)liveArm.farOil[level] * step * step / fineOil : 0.0,
+                  liveArm.wrong[level], patchArm.wrong[level], liveArm.noCell[level],
+                  liveArm.contained[level], liveArm.solidTop[level]);
+  }
+  ok = ok && fineOil > 0;
+  detail = Format("oil row y%d, %d fine columns oiled; %s; %u chunks indexed", yo, fineOil,
+                  per.c_str(), noted);
+  std::printf("far layer: %s (%s%s%s)\n", ok ? "PASS" : "FAIL", detail.c_str(),
+              liveArm.why.c_str(), patchArm.why.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -5201,6 +5488,9 @@ const std::vector<Gate>& RenderGates() {
       // The far SURFACE MAP (LOD-seam package A): pristine agreement, live
       // edits invalidate, a refill does not resurrect. Compute + readback only.
       {"far-surface", "render", {}, false, GateFarSurface},
+      // The LOOSE TOP (ticket 2026-10-10_11-01-58): a slick on a lake keeps
+      // its footprint at every level, live and after a patched refill.
+      {"far-layer", "render", {}, false, GateFarLayer},
       // The only gate in this file that actually DRAWS: far-fog and
       // far-downsample exercise the far-field cascades through compute and a
       // one-word readback, and never touch the offscreen target.

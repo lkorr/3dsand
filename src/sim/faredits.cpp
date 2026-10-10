@@ -27,9 +27,18 @@ inline int FirstCenter(int b, int step, int half) {
 }  // namespace
 
 void FarEdits::Sweep(IVec3 wc,
-                     const std::function<uint32_t(int, int, int)>& sample) {
+                     const std::function<uint32_t(int, int, int)>& sample,
+                     const AboveFn& above) {
   const int base[3] = {wc.x * (int)kChunk, wc.y * (int)kChunk,
                        wc.z * (int)kChunk};
+  const int k16 = (int)kChunk;
+  // A chunk-local column read that may run into the chunk above: -1 = unseen.
+  auto colAt = [&](int lx, int ly, int lz) -> int {
+    if (ly < k16) return (int)(sample(lx, ly, lz) & 0xFFFu);
+    if (ly < 2 * k16 && above) return above(lx, ly - k16, lz);
+    return -1;
+  };
+  auto farSolid = [&](int m) { return m > 0 && ContainKindOf((uint32_t)m) != kContainNone; };
   for (uint32_t level = 1; level <= kFarLevels; level++) {
     const int shift = (int)(level + kFarShiftBase);
     const int step = 1 << shift;
@@ -77,12 +86,38 @@ void FarEdits::Sweep(IVec3 wc,
               return sample(x, y, z) & 0xFFFu;
             });
           }
+          // THE LOOSE TOP (SetLooseSource): worldgen.wgsl farRunTop, over what
+          // this side can see. Not a cell the container rule claimed (`mat`
+          // still the raw centre); the cover rule only fills non-solid ones.
+          uint32_t gsTop = kGroundUnknown;
+          if (!looseOf_.empty() && groundWorld_ && !containKind_.empty()) {
+            const int lx = fine[0] - base[0], ly = fine[1] - base[1], lz = fine[2] - base[2];
+            const int raw = (int)(sample(lx, ly, lz) & 0xFFFu);
+            if ((int)(mat & 0xFFFu) == raw && farSolid(raw)) {
+              int t = -1;
+              for (int d = 1; d <= step; d++) {
+                const int m = colAt(lx, ly + d, lz);
+                if (m < 0) break;   // unseen: no claim
+                if (!farSolid(m)) {
+                  if (d > 1) t = ly + d - 1;
+                  break;
+                }
+              }
+              if (t >= 0) {
+                const int tm = colAt(lx, t, lz);
+                if (tm > 0 && LooseOf((uint32_t)tm) && base[1] + t > GroundHeight(fine[0], fine[2])) {
+                  mat = (uint32_t)tm;
+                  gsTop = GroundSlotOf((uint32_t)tm);
+                }
+              }
+            }
+          }
           // level-cell coord -> its index inside the owning level chunk
           const uint32_t cx = (uint32_t)((fine[0] >> shift) & 15);
           const uint32_t cy = (uint32_t)((fine[1] >> shift) & 15);
           const uint32_t cz = (uint32_t)((fine[2] >> shift) & 15);
           const uint32_t ci = (cz * kChunk + cy) * kChunk + cx;
-          scratch_.push_back(((mat & 0xFFFu) << kCellBits) | ci);
+          scratch_.push_back((gsTop << kGroundShift) | ((mat & 0xFFFu) << kCellBits) | ci);
         }
     const IVec3 lc = LevelChunkOf(wc, level);
     Append({lc.x, lc.y, lc.z, level}, scratch_);
@@ -105,6 +140,12 @@ void FarEdits::Sweep(IVec3 wc,
       for (int x = fx; x < base[0] + (int)kChunk; x += step) {
         const int h = GroundHeight(x, z);
         if (h < base[1] || h >= base[1] + (int)kChunk) continue;
+        // A loose layer ON the ground (the loose top above): the layer is the
+        // column's top, so the ground has nothing to say about its cell.
+        if (!looseOf_.empty()) {
+          const int up = colAt(x - base[0], h + 1 - base[1], z - base[2]);
+          if (up > 0 && LooseOf((uint32_t)up)) continue;
+        }
         GroundWord((uint32_t)level, x, h, z,
                    sample(x - base[0], h - base[1], z - base[2]), ground);
       }
@@ -186,16 +227,16 @@ uint32_t FarEdits::ContainedBy(uint32_t centre, int step, const int c0[3],
   return centre;
 }
 
-void FarEdits::NoteChunk(IVec3 wc, const uint32_t* words) {
+void FarEdits::NoteChunk(IVec3 wc, const uint32_t* words, const AboveFn& above) {
   Sweep(wc, [words](int lx, int ly, int lz) {
     return words[(uint32_t)lx + (uint32_t)ly * kChunk +
                  (uint32_t)lz * kChunk * kChunk] &
            0xFFFu;
-  });
+  }, above);
 }
 
-void FarEdits::NoteUniformChunk(IVec3 wc, uint32_t mat) {
-  Sweep(wc, [mat](int, int, int) { return mat & 0xFFFu; });
+void FarEdits::NoteUniformChunk(IVec3 wc, uint32_t mat, const AboveFn& above) {
+  Sweep(wc, [mat](int, int, int) { return mat & 0xFFFu; }, above);
 }
 
 void FarEdits::Append(const LKey& key, const std::vector<uint32_t>& add) {
@@ -473,6 +514,9 @@ size_t FarEdits::RebuildFromStore(ChunkStore& store) {
   Clear();
   std::vector<uint32_t> words(kChunkVol);
   size_t n = 0;
+  // No `above` (SetLooseSource) here: ChunkStore::Get inside ForEachStored
+  // may load or spill a region under the iteration. A run that crosses into
+  // the chunk above is a downsample-only answer after a load.
   store.ForEachStored([&](IVec3 wc, const uint32_t* rle, size_t pairs) {
     if (!RleDecodeChunk(rle, pairs, words.data())) return;
     NoteChunk(wc, words.data());

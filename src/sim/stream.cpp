@@ -254,6 +254,17 @@ void Stream::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
                                                       : FarEdits::kContainNone);
   }
   farEdits_.SetContainSource(std::move(containKind));
+  // The far index's LOOSE TOP source (faredits.h SetLooseSource): far-solid
+  // liquids and powders -- worldgen.wgsl farIsLoose.
+  std::vector<uint8_t> looseOf;
+  looseOf.reserve(mats.size());
+  for (const auto& m : mats) {
+    const bool farSolid = looseOf.size() != kMatAir && m.gpu.klass != CLASS_GAS &&
+                          (m.gpu.flags & kMatFlagMicro) == 0;
+    looseOf.push_back(
+        farSolid && (m.gpu.klass == CLASS_LIQUID || m.gpu.klass == CLASS_POWDER) ? 1 : 0);
+  }
+  farEdits_.SetLooseSource(std::move(looseOf));
   // The far index's COVER RULE source (faredits.h SetCoverSource): per
   // material, its slot and the minimums word when its slot's OWNER is cover
   // -- the GPU keys the rule on the far palette entry, which the owner writes
@@ -754,12 +765,34 @@ void Stream::CompleteOldest(bool discard) {
           // chunk's content, and it is what lets a sieve refill put the
           // player's crater back after the chunk has left the window.
           if (p.items[i].edited) {
+            // The chunk ABOVE, when it left in the same batch (a window shift
+            // across x or z evicts whole columns): the loose top's run may end
+            // in it (faredits.h SetLooseSource). Unseen otherwise.
+            FarEdits::AboveFn above;
+            for (size_t j = 0; j < p.items.size(); j++) {
+              const IVec3 wj = p.items[j].wc;
+              if (wj.x != p.items[i].wc.x || wj.y != p.items[i].wc.y + 1 ||
+                  wj.z != p.items[i].wc.z)
+                continue;
+              const uint32_t ej = j < p.sentinel.size() ? p.sentinel[j] : 0u;
+              if (ej != 0u) {
+                above = [ej](int, int, int) { return (int)(ej & kPtMatMask & 0xFFFu); };
+              } else {
+                const uint32_t* uwords = (const uint32_t*)(ptr + j * kChunkBytes);
+                above = [uwords](int lx, int ly, int lz) {
+                  return (int)(uwords[(uint32_t)lx + (uint32_t)ly * kChunk +
+                                      (uint32_t)lz * kChunk * kChunk] &
+                               0xFFFu);
+                };
+              }
+              break;
+            }
             if (e != 0u) {
-              farEdits_.NoteUniformChunk(p.items[i].wc, e & kPtMatMask);
+              farEdits_.NoteUniformChunk(p.items[i].wc, e & kPtMatMask, above);
               farPlumes_.NoteUniformChunk(p.items[i].wc, e & kPtMatMask);
             } else {
               farEdits_.NoteChunk(p.items[i].wc,
-                                  (const uint32_t*)(ptr + i * kChunkBytes));
+                                  (const uint32_t*)(ptr + i * kChunkBytes), above);
               // The SAME words, at the same instant: this is where a chunk
               // that was on fire when the window left it becomes a plume the
               // renderer can still see (src/sim/farplumes.h).

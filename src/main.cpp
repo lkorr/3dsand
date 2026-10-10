@@ -9084,6 +9084,51 @@ int main(int argc, char** argv) {
       }
     };
   }
+  if (g_atSet && !g_fellTree && !g_forestFire && std::getenv("SANDVOX_AT_SLICK")) {
+    // ---- SANDVOX_AT_SLICK=x,y,z,r[,material]: a disc of LIQUID one voxel
+    // thick laid at row y (into air only), once the far pipelines are up --
+    // the oil-on-a-lake case of ticket 2026-10-10_11-01-58, reproducible
+    // with --at + SANDVOX_AT_FLY so the camera can pour it near and then
+    // back away through the cascade levels. Harness only; the frame layer's
+    // one cell-op hook (the fell-tree slot), like --forest-fire.
+    tickCtx.fellTree = [&world, &mats, &sim](uint32_t tick, std::vector<CellOp>& cellOps) {
+      static bool done = false;
+      static uint32_t at = 0;
+      if (done) return;
+      if (!sim.FarPipelinesReady()) return;
+      // SANDVOX_AT_SLICK_AFTER=<ticks> (default 30) after the far pipelines
+      // are up: late enough that the startup refill has drained, or the
+      // refill's sieve lands over the slick's downsample.
+      if (at == 0) {
+        const char* sa = std::getenv("SANDVOX_AT_SLICK_AFTER");
+        at = tick + (uint32_t)std::max(1, sa ? std::atoi(sa) : 30);
+        return;
+      }
+      if (tick < at) return;
+      done = true;
+      int x = 0, y = 0, z = 0, r = 0;
+      char name[64] = "oil";
+      if (std::sscanf(std::getenv("SANDVOX_AT_SLICK"), "%d,%d,%d,%d,%63s", &x, &y, &z, &r,
+                      name) < 4)
+        return;
+      uint32_t m = 0;
+      for (size_t i = 0; i < mats.size(); i++)
+        if (mats[i].name == name) m = (uint32_t)i;
+      if (m == 0) return;
+      size_t n = 0;
+      for (int dz = -r; dz <= r; dz++)
+        for (int dx = -r; dx <= r; dx++) {
+          if (dx * dx + dz * dz > r * r) continue;
+          const IVec3 cc{x + dx, y, z + dz};
+          if (!world.CellInWindow(cc) || cellOps.size() >= kMaxCellOpsPerTick) continue;
+          cellOps.push_back({World::SlotCellIndex(cc), (m & 0xFFFu) | (7u << 12) | kCellOpIfAir});
+          n++;
+        }
+      std::printf("SANDVOX_AT_SLICK: %zu cells of %s at y %d around (%d,%d), tick %u\n", n,
+                  name, y, x, z, tick);
+      std::fflush(stdout);
+    };
+  }
   if (g_forestFire && !g_fellTree) {
     // ---- --forest-fire (see g_forestFire). Borrows the fell-tree slot: it is
     // the frame layer's one cell-op hook, and the two harnesses are exclusive.
