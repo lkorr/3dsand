@@ -680,7 +680,7 @@
     "fluidStretch": 0.4,
     "fluidDensityShade": 0.45,
     "fluidFoam": 0.55,
-    "fluidSurface": 2,
+    "fluidSurface": 1,
     "fluidIso": 0.3,
     "fluidSmooth": 1.3,
     "fluidLevel": 1,

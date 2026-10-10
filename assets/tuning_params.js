@@ -28,7 +28,7 @@ const TUNING_PARAMS = {
   'render.fluidStretch':{t:'f',def:0.4,min:0,max:1.5,wgsl:'TUNE_FLUID_STRETCH'},
   'render.fluidDensityShade':{t:'f',def:0.45,min:0,max:1,wgsl:'TUNE_FLUID_DENSITY_SHADE'},
   'render.fluidFoam':{t:'f',def:0.55,min:0,max:2,wgsl:'TUNE_FLUID_FOAM'},
-  'render.fluidSurface':{t:'f',def:2,min:0,max:3,wgsl:'TUNE_FLUID_SURFACE'},
+  'render.fluidSurface':{t:'f',def:1,min:0,max:3,wgsl:'TUNE_FLUID_SURFACE'},
   'render.fluidIso':{t:'f',def:0.3,min:0.08,max:1,wgsl:'TUNE_FLUID_ISO'},
   'render.fluidSmooth':{t:'f',def:1.3,min:0.4,max:3,wgsl:'TUNE_FLUID_SMOOTH'},
   'render.fluidLevel':{t:'f',def:1,min:0,max:1,wgsl:'TUNE_FLUID_LEVEL'},

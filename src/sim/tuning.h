@@ -4038,11 +4038,10 @@ struct Tuning {
     // what they always did, so tuning.json needs no migration:
     //   0 = one raster cube per particle (solver debug; DrawFluid, not the
     //       raymarcher — this is the only mode that draws on the CPU side)
-    //   1 = smooth isosurface, the Splash look
+    //   1 = smooth isosurface, the Splash look. DEFAULT (owner, 2026-10-10:
+    //       the voxelized mode was the shipped look until then)
     //   2 = voxelized at half a cell (2x2x2 sub-voxels per sim cell, which is
-    //       one sub-voxel per particle at rest density). DEFAULT — the engine
-    //       is a voxel engine, so MPM water reads as voxels by default and the
-    //       smooth surface is the opt-in look
+    //       one sub-voxel per particle at rest density)
     //   3 = voxelized on the sim lattice, one cube per world cell — MPM water
     //       that reads as ordinary voxel water
     // Modes 2 and 3 are RENDER-ONLY quantization of the same density field the

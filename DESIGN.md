@@ -4358,6 +4358,29 @@ enforces it. It replaced two independent tests that had to agree and did not:
   surface first cannot meet another interface behind it, which `caShadedLiquid`
   already records.
 
+WHO SHADES A LAKE'S SURFACE (2026-10-10, ticket 10-50-10: "blow up the bed
+under a lake and whole chunks of it go blocky"). Everything above made
+`shadeMpmFluid` IMITATE `shadeWater` over settled water, one measured term at a
+time, and it never converged: the march draws its isosurface over the settled
+lake in every block-map chunk plus the seam ring, so after a disturbance whole
+chunks of calm lake were repainted by a second water model — the pond's
+decaying foam FIELD (~0.3 across the marked chunks, measured with `SEAM_DBG 9`),
+the MPM Fresnel and reflection, ripples without the swell, and wherever the
+near trace had not measured the column (past the 20.5 m handoff, or a cut-off
+`liqPath`) `caFrac` collapsed to the authored bright blue. The rule now is
+OWNERSHIP, not imitation: a fluid hit whose sampled density is at least
+`MPM_LAKE_SETTLED` (half) settled voxel water is the LAKE'S surface, and the
+lake's shade draws it (`mfLake` in `fs`: no MPM shade, no MPM interface for
+the CA ownership test, the rain stop or the depth write). `shadeMpmFluid` keeps
+the surfaces its particles make — the pour, the splash, a raft standing proud
+of the lake — and for those the CA column now includes `liqExtra` (the far
+bed past the handoff) and, when the near trace crossed no liquid at all, the
+cascade's own water under them, so a raft past 20 m blends to the lake instead
+of the authored blue. Instruments: `SEAM_DBG 9` (owner per water pixel, caFrac,
+foam) and `10` (settled share, churn, column). Repro without a C++ hook:
+`--shot-fluid-pond` on a map with an authored lake at the pond site
+(`SANDVOX_MAP`), since the harness map has no pond there.
+
 Two smaller repairs in the same pass: `fluidSampleAt` gained the virtual-mass
 term (settled liquid accumulates in its own material's colour), without which
 a node carrying only settled mass divided by the colour floor and shaded BLACK — the dark rim
@@ -4369,19 +4392,19 @@ made a pour into a lake absorb like a puddle.
 DRAW MODES — `render.fluidSurface` is a MODE, not a boolean, and it kept its
 name because 0 and 1 still mean what they always did (no `tuning.json`
 migration). `0` = one raster cube per particle, the solver-debug view and the
-only mode drawn CPU-side; `1` = the smooth isosurface above; **`2` = VOXELIZED
-at half a cell — the field quantized to a 2x2x2 sub-voxel lattice, which is one
-sub-voxel per particle at rest density, and THE DEFAULT**; `3` = VOXELIZED on
+only mode drawn CPU-side; **`1` = the smooth isosurface above, THE DEFAULT**;
+`2` = VOXELIZED at half a cell — the field quantized to a 2x2x2 sub-voxel
+lattice, which is one sub-voxel per particle at rest density; `3` = VOXELIZED on
 the sim lattice, one cube per world cell. The voxelized modes exist to answer a
 look question the isosurface cannot — *what does MPM water look like if it
 still reads as VOXELS?* — and mode 3 in particular makes a pour
 indistinguishable from CA water at a glance while the motion underneath is
 still the full MPM solve.
 
-Mode 2 is the default because this is a voxel engine: water that reads as
-voxels is the house style, and the smooth Splash surface — which is the more
-expensive march *and* the one that visually disagrees with every other surface
-in the world — is the opt-in look rather than the assumed one. Half a cell, not
+Mode 2 was the default until 2026-10-10, on the argument that this is a voxel
+engine and water that reads as voxels is the house style; the owner switched
+the shipped look to the smooth isosurface (mode 1) with the lake-slab ticket
+(below, "who shades a lake's surface"). Half a cell, not
 a whole one, because it is the resolution the solver already works at (8
 particles per cell on a 2x2x2 lattice), so it is the finest quantization that
 carries real information rather than interpolation.
