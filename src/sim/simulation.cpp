@@ -117,7 +117,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   // pyramid the raymarch draws past the cascades. Render-only derived data,
   // rebuilt with the map in UploadEnvironment; created here because it is a
   // render bind-group entry (renderBGL 45).
-  UploadHorizon(device, queue, worldMapWords);
+  UploadHorizon(device, queue, worldMapWords, trees);
 
   // The worldgen column cache (worldgen.wgsl's block; WriteGenList). Sized for
   // the widest list: kGenColMax chunk-columns of 256 cached columns each —
@@ -1487,14 +1487,22 @@ void FlushQueuedUploads(const rhi::Device& device, const rhi::Queue& queue) {
 }  // namespace
 
 void Simulation::UploadHorizon(const rhi::Device& device, const rhi::Queue& queue,
-                               const std::vector<uint32_t>& worldMapWords) {
+                               const std::vector<uint32_t>& worldMapWords,
+                               const TreeAtlas& trees) {
   FlushQueuedUploads(device, queue);
   std::vector<uint32_t> words;
   // The seed the per-sample treeline's jitter is read at: the world's, once
   // streaming has set it (the default world's before, at Init -- the jitter
   // is +-30 m of paint 7 km off, and every environment reload re-bakes).
   const uint32_t seed = (world_ && world_->WorldSeed() != 0u) ? world_->WorldSeed() : sandvox::kDefaultSeed;
-  horizon::Build(worldmap::CurrentWorldMap(), worldMapWords, seed, words);
+  const auto hzT0 = std::chrono::steady_clock::now();
+  horizon::Build(worldmap::CurrentWorldMap(), worldMapWords, seed, words, &trees);
+  std::printf("horizon: %ux%u samples, %.1f MiB, canopy plane %s, built in %.0f ms\n",
+              words[horizon::kHValid] ? words[horizon::kHNX] : 0u,
+              words[horizon::kHValid] ? words[horizon::kHNZ] : 0u,
+              words.size() * 4.0 / (1024.0 * 1024.0),
+              words[horizon::kHCanopy] ? "on" : "off",
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - hzT0).count());
   // THE LIGHT MAP rides the pyramid (horizon.h kL*): sized on its samples,
   // header zeroed (the kernels set the valid words), the sky visibility due
   // again and the sun's horizon stale. A buffer that had to grow rebinds both
@@ -1573,7 +1581,7 @@ void Simulation::UploadEnvironment(const rhi::Device& device, const rhi::Queue& 
   if (rebind) BuildSimBindGroups(device);
   // The horizon is the map's too: rebuilt from the map the caller has just
   // installed as CurrentWorldMap (ReloadEnvironment sets it before this).
-  UploadHorizon(device, queue, worldMapWords);
+  UploadHorizon(device, queue, worldMapWords, trees);
   // The tree lattice is a PRELUDE CONSTANT (TREE_TILE / TREE_SCAN /
   // TREE_CAND_MAX size worldgen's candidate array), so a reload that changed
   // the finest biome tile or the widest species has to recompile the shaders

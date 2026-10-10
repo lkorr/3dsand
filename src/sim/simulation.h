@@ -74,7 +74,7 @@ class Simulation {
   // and the packed map words: built and uploaded (grow-only). Init and
   // UploadEnvironment call it; render-only, so nothing the sim reads moves.
   void UploadHorizon(const rhi::Device& device, const rhi::Queue& queue,
-                     const std::vector<uint32_t>& worldMapWords);
+                     const std::vector<uint32_t>& worldMapWords, const TreeAtlas& trees);
 
   // A dense (denseGen = true) worldgen reads the column cache like `list`
   // does, so the caller runs WriteGenList over every slot first
