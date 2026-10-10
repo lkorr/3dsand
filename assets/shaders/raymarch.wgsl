@@ -13846,6 +13846,8 @@ const HZ_H_MIP : u32 = 16u;
 const HZ_H_SKIN : u32 = 32u;
 const HZ_H_TL_PLANE : u32 = 288u;  // horizon.h kHTlPlane (kHSkin + 256)
 const HZ_H_WATER : u32 = 289u;     // horizon.h kHWater: per-sample lake / river coverage (W1)
+const HZ_H_CANOPY : u32 = 290u;    // horizon.h kHCanopy: per-sample forest canopy (cov | mix | A | B)
+const HZ_H_CANOPY_MATS : u32 = 291u;  // horizon.h kHCanopyMats: the canopy material table
 // horizon.h kL* (the light map; horizon_light.wgsl writes it).
 const HZ_L_SKY_VALID : u32 = 0u;
 const HZ_L_SUN_VALID : u32 = 1u;
@@ -14080,10 +14082,47 @@ fn hzAlbedo(p : vec2f, y : f32, n : vec3f) -> vec3f {
   var alb = paletteMean(materials[horizon[HZ_H_SKIN + b]]);
   let tanS = sqrt(max(1.0 - n.y * n.y, 0.0)) / max(n.y, 0.05);
   alb = mix(alb, paletteMean(materials[horizon[HZ_H_MAT_STONE]]), smoothstep(0.9, 1.5, tanS));
+  // THE FOREST (horizon.h kHCanopy): the share of the ground under crowns, in
+  // the crowns' colour -- what the level-8 cells beside it paint, averaged.
+  let cn = hzCanopyAt(p);
+  alb = mix(alb, cn.rgb, cn.a);
   let tl = hzTreelineAt(p);
   alb = mix(alb, paletteMean(materials[horizon[HZ_H_MAT_SNOW]]),
             smoothstep(tl - 8.0, tl + 8.0, y));
   return alb;
+}
+
+// THE FOREST at sample-space point p (horizon::Build's canopy plane): rgb =
+// the crowns' colour, a = the share of the ground they cover, bilinear (the
+// colour weighted by coverage, so a forest edge fades rather than tinting the
+// meadow beside it). A sample's colour is the mix of its two heaviest canopy
+// materials, each resolved through the far palette and drawn at its palette
+// mean -- exactly how a level-8 canopy cell (treeCanopyAt) is painted once
+// its jitter has faded. An old header (no plane) has no forest.
+fn hzCanopyAt(p : vec2f) -> vec4f {
+  let base = horizon[HZ_H_CANOPY];
+  if (base == 0u) { return vec4f(0.0); }
+  let mt = horizon[HZ_H_CANOPY_MATS];
+  let nn = hzN();
+  let q = clamp(p, vec2f(0.0), vec2f(nn - vec2<i32>(1)));
+  let i = max(min(vec2<i32>(floor(q)), nn - vec2<i32>(2)), vec2<i32>(0));
+  let f = q - vec2f(i);
+  var acc = vec3f(0.0);
+  var cov = 0.0;
+  for (var k = 0; k < 4; k++) {
+    let c = min(i + vec2<i32>(k & 1, k >> 1), nn - vec2<i32>(1));
+    let w = horizon[base + u32(c.y * nn.x + c.x)];
+    let wb = select(1.0 - f.x, f.x, (k & 1) != 0) * select(1.0 - f.y, f.y, (k >> 1) != 0);
+    let a = f32(w & 0xFFu) / 255.0 * wb;
+    if (a <= 0.0) { continue; }
+    let mA = farPalMat(&materials, matFarPal(&materials, horizon[mt + ((w >> 16u) & 0xFFu)]));
+    let mB = farPalMat(&materials, matFarPal(&materials, horizon[mt + (w >> 24u)]));
+    acc += a * mix(paletteMean(materials[mA]), paletteMean(materials[mB]),
+                   f32((w >> 8u) & 0xFFu) / 255.0);
+    cov += a;
+  }
+  if (cov <= 0.0) { return vec4f(0.0); }
+  return vec4f(acc / cov, cov);
 }
 
 // THE COLUMN'S TREELINE at sample-space point p (map v2 A1's treelineAt,

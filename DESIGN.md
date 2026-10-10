@@ -17230,6 +17230,35 @@ compute span excluded): `peaksea` (the massif 10 km off, drawn by the pyramid
 walk) 15.36 vs 15.22 ms, i.e. ~0.14 ms; `summit` within the ±0.3 ms noise.
 The pyramid for the 20 km `default` map is ~832^2 samples, ~4 MiB.
 
+**The forest on the horizon (2026-10-10, F12 ticket 2026-10-10_10-44-29).**
+Levels 5-8 paint tree crowns into the ground colour (`farSurfaceMat` ->
+`treeCanopyAt`), but the horizon had no tree term, and `hzSeamWeight`
+repainted the level-8 crowns with the bare skin over the last 900 m — so past
+~5.6 km a forest was a plain of grass. `horizon::Build` now bakes a CANOPY
+PLANE (`kHCanopy`, one word per sample: coverage u8 | mix u8 | material A u8 |
+material B u8, indices into a 256-slot material table at `kHCanopyMats`) from
+the loaded tree atlas and the packed biome records — the same words
+`treeInfoBare` / `canopyOf` read: per (biome, species) the tile chance times
+the weighted pick, through the species' and the row's altitude bands, slope
+(from the AVG field, `Land.slope`'s Q8 units), patch threshold (passes
+(255 - t)/256), the crown disc `crownR` thinned by the shade punch; the
+EXPECTED covered share is `1 - exp(-sum lambda)` (crowns from different tiles
+are independent), coloured by the two heaviest canopy materials (leaf proxy
+and autumn, `1/autumnChance`). Zero over the treeline, under the sea, and
+scaled by `1 - water coverage` on map lakes and rivers; rows that only grow
+near a pond (`nearWaterMax`) count as none. `hzAlbedo` blends it (bilinear,
+colour weighted by coverage) after the steep-rock term and before snow, each
+material through the far palette at its palette mean — what a level-8 canopy
+cell paints — so the seam band keeps the forest and meets the cascade's
+speckle at its mean. COLOUR ONLY (owner decision): no height bump. Cost: 4 bytes a
+sample, 2.65 MiB on `default`'s 833^2 grid (the buffer 10.8 -> 13.4 MiB with
+the water plane); the whole `Build` measured 215-514 ms on load (the
+`horizon:` startup line prints size and time at every build). Known limit:
+a GREEN forest over a green skin barely shows (`leaves` #3c8f36 against
+`grass` #4e9b3a), because the cascades read as forest mostly through crown
+geometry and shading, which colour-only cannot carry; autumn, conifer and
+mixed stands read clearly.
+
 **Peak preservation at levels 6-8.** A cascade cell is solid when its CENTRE
 sample is, so a summit or a knife ridge between two sample columns was shaved
 by up to a whole cell (25.6 m at level 8). `far` and `fardown` now raise a
