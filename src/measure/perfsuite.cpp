@@ -3328,6 +3328,37 @@ bool CamSeam(Scene& s, uint32_t& tick, std::string&) {
 bool CamSeamVeg(Scene& s, uint32_t& tick, std::string&) {
   return CamSeamAt(s, tick, SeamVegPose());
 }
+
+// AN F12 TICKET'S CAMERA (2026-10-10, ticket 2026-10-10_11-00-47). Every
+// camera above is a fixture; a perf ticket is a place. SANDVOX_BUDGET_AT takes
+// the report's `--at x,y,z,yaw,pitch` verbatim (voxels, degrees), recentres the
+// window and far field on it as play does, and prices THAT frame with the
+// arms and the RENDER_STATS table — attribution at the reported scene instead
+// of at the fixture that resembles it. Runs on whatever map the process loaded
+// (unset SANDVOX_MAP = the game's map, as the ticket was). Noon unless
+// SANDVOX_BUDGET_SUN_DEG re-times it (a negative elevation is night). Put LAST:
+// it leaves the window relocated.
+bool CamAt(Scene& s, uint32_t& tick, std::string& why) {
+  const char* e = std::getenv("SANDVOX_BUDGET_AT");
+  float v[5] = {0, 0, 0, 0, 0};
+  if (!e || std::sscanf(e, "%f,%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3], &v[4]) != 5) {
+    why = "set SANDVOX_BUDGET_AT=x,y,z,yawDeg,pitchDeg (a ticket's --at line)";
+    return false;
+  }
+  s.stream.OnRegen();
+  CentreWindowOnEye(s.ctx, s.world, s.sim, v[0], v[1], v[2], 120);
+  s.eye = {v[0], v[1], v[2]};
+  s.cam.yaw = v[3] * 0.0174532925f;
+  s.cam.pitch = v[4] * 0.0174532925f;
+  char note[256];
+  std::snprintf(note, sizeof note, "--at %.2f,%.2f,%.2f,%.1f,%.1f on map '%s'", v[0],
+                v[1], v[2], v[3], v[4], worldmap::CurrentWorldMap().name.c_str());
+  s.note = note;
+  tick = FindNoonTick(CurrentTuning());
+  return true;
+}
+const char* const kArmsAt[] = {"baseline", "noshadow", "noreflect", "reflgate",
+                               "nogodray", "godshadow0", "halfres", nullptr};
 // THE PEAKS SUMMIT (map v2 H1). On the `peaks` test map's 1,400 m summit
 // looking out over the range: the far cascade, the cascade-to-horizon seam,
 // the horizon past it and the height fog in one frame -- the camera the
@@ -3402,6 +3433,9 @@ const BudgetCam kBudgetCams[] = {
     {"peaksea", "3 m over the sea 10 km south of the peaks summit: the massif "
                 "is past the cascades, drawn by the horizon (loads peaks; last)",
      CamPeakSea, kArmsSummit},
+    {"at", "a ticket's --at camera from SANDVOX_BUDGET_AT (not in the default "
+           "set; leaves the window relocated: last)",
+     CamAt, kArmsAt},
 };
 constexpr int kBudgetCamCount =
     (int)(sizeof(kBudgetCams) / sizeof(kBudgetCams[0]));

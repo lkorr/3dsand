@@ -4394,10 +4394,12 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
       out.t = tCur;
       break;
     }
-    // Liquid depth cap: past this much water even blue is gone (exp(-0.2*24)
-    // ~ 0.8%), so the bed cannot affect the pixel and the march can stop.
-    // Purely a perf bound on very deep water, ~24 m of path.
-    if (out.liqPath * VOXEL_METERS > 24.0) {
+    // Liquid depth cap: LIQ_VIS_M (render.subVisibility, 10 m) of path. Both
+    // liquid shades fade transmission to exactly 0 by that distance
+    // (liqVisFade), so whatever lies past it cannot affect the pixel and the
+    // march stops. Was a fixed 24 m: ticket 2026-10-10_11-00-47 measured a
+    // deep lake's pixels spending ~240 water steps each to reach it.
+    if (out.liqPath * VOXEL_METERS > LIQ_VIS_M) {
       out.saturated = true;
       out.t = tCur;
       break;
@@ -4458,7 +4460,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
         out.mediaTau += dT;
         rsAdd(RS_MEDIA, 1u);
         out.mediaTint += cellTint * dT;
-        if (out.liqPath * VOXEL_METERS > 24.0) {
+        if (out.liqPath * VOXEL_METERS > LIQ_VIS_M) {
           out.saturated = true;
           out.t = tCur;
           sat = true;
@@ -4542,7 +4544,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
           }
         } else {
           out.liqPath += sg;
-          if (out.liqPath * VOXEL_METERS > 24.0) {
+          if (out.liqPath * VOXEL_METERS > LIQ_VIS_M) {
             out.saturated = true;
             out.t = tCur;
             sat = true;
@@ -8577,6 +8579,20 @@ fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
 
 // Index of refraction, air -> water. Drives both the Schlick F0 below and the
 // refract() bend.
+// ---- THE LIQUID VISIBILITY DISTANCE (ticket 2026-10-10_11-00-47) ----------
+// render.subVisibility is a HARD distance: past it no liquid path shows what is
+// behind it. The primary march stops every liquid path there (trace(), the
+// depth cap), and both liquid shades multiply their transmission by this fade,
+// which is 1 out to 40% of the distance (the look in front of it is unchanged)
+// and reaches exactly 0 AT it -- so the stop is never seen as an edge: the
+// pixel has already become the medium's own in-scatter colour by then.
+const LIQ_VIS_M : f32 = TUNE_SUB_VISIBILITY;
+// Where siltMotes spreads its slabs on a ray the cap stopped (shadeSubmerged).
+const SILT_OPEN_SPAN_M : f32 = 24.0;
+fn liqVisFade(distM : f32) -> f32 {
+  return 1.0 - smoothstep(0.4 * LIQ_VIS_M, LIQ_VIS_M, distM);
+}
+
 const WATER_IOR : f32 = 1.333;
 // Schlick F0 for that IOR: ((1-n)/(1+n))^2 = 0.0204. Water reflects only ~2%
 // head-on but ~100% at grazing — that spread IS the look, and it's exactly
@@ -10196,7 +10212,9 @@ fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
   // with depth on top of it.
   // Per liquid, so a murky one goes blind close in and a clear one does not.
   let extinction = absorbK + vec3f(1.0 / prof.visM);
-  let trans = exp(-extinction * distM);
+  // ...and the hard visibility distance on top: 0 at LIQ_VIS_M, where the
+  // primary march stopped (liqVisFade).
+  let trans = exp(-extinction * distM) * liqVisFade(distM);
   var color = behind * trans + ambientWater * (vec3f(1.0) - trans);
   // The water veil (gV* globals): the eye is in the medium, so a raster body
   // at any distance sits in the same column, under no surface and no caustic.
@@ -10228,7 +10246,15 @@ fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
     // Motes are lit by the same shaft integral, so ones inside a beam flare
     // and ones in shadow stay dim — which is what makes the beams look like
     // they occupy space rather than being painted over the image.
-    let motes = siltMotes(ro, rd, max(pathVox, 1.0), shafts) * prof.clarity;
+    // The motes' four slabs sit at fixed FRACTIONS of the path, so a ray the
+    // visibility cap stopped (LIQ_VIS_M, 10 m) would pull them 2.4x closer than
+    // the 24 m the old cap spread them over -- and the near slabs' noise
+    // projects into big soft blobs instead of specks. A capped ray keeps the
+    // old 24 m span (SILT_OPEN_SPAN_M): open water looks as it did. A ray that
+    // met the bed or a wall short of the cap is unchanged either way.
+    var moteSpan = max(pathVox, 1.0);
+    if (pathVox * VOXEL_METERS >= LIQ_VIS_M - 0.1) { moteSpan = SILT_OPEN_SPAN_M / VOXEL_METERS; }
+    let motes = siltMotes(ro, rd, moteSpan, shafts) * prof.clarity;
     color += ambientWater * motes * 2.0 + vec3f(motes * 0.05);
   }
 
@@ -10550,7 +10576,10 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     absorbK += (vec3f(1.0) - sol.tint) * (sol.a * SOL_LOOK_ABSORB);
     scatter = mix(scatter, sol.tint * SOL_LOOK_SCATTER, sol.a);
   }
-  let trans = exp(-absorbK * depthM);
+  // liqVisFade: the march stopped at LIQ_VIS_M of water, so the column must be
+  // fully opaque by then or the stop shows as an edge (whatever the stopped
+  // ray resolved would leak through at exp(-0.2 * 10) = 13% blue).
+  let trans = exp(-absorbK * depthM) * liqVisFade(depthM);
 
   // What comes back up: the bed (plus its caustics), filtered by the water
   // column, plus the column's own in-scattered light (which is what keeps

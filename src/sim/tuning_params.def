@@ -307,11 +307,15 @@ TP_V3(render, subScatter, TUNE_SUB_SCATTER, 0.055f, 0.19f, 0.24f)
 TP_F(render, subScatterGain, TUNE_SUB_SCATTER_GAIN, 1.0f, 0.0f, 4.0f)
 // Distance (metres) at which the far view has fully faded to the scatter
 // colour. This is the underwater equivalent of fog distance and it is the
-// single knob that says "murky pond" vs "clear tropical water".
+// single knob that says "murky pond" vs "clear tropical water". It is a HARD
+// distance since 2026-10-10 (ticket 2026-10-10_11-00-47, owner: 10 m): the
+// submerged shade fades transmission to exactly 0 by it, and the raymarch
+// stops every liquid path there (primary march, refraction) -- so it is
+// also the perf bound on a deep lake, where it replaced a fixed 24 m cap.
 // A visibility of 0 divides by zero in the shader's fade and takes the
 // whole submerged view to NaN, which renders as a black screen the moment
 // the player's head goes under. Floor it well clear of that.
-TP_F(render, subVisibility, TUNE_SUB_VISIBILITY, 11.0f, 0.5f, 60.0f)
+TP_F(render, subVisibility, TUNE_SUB_VISIBILITY, 10.0f, 0.5f, 60.0f)
 // Screen-edge darkening while submerged — a cheap, strong "you are in a
 // medium" cue that costs one dot product.
 TP_F(render, subVignette, TUNE_SUB_VIGNETTE, 0.34f, 0.0f, 1.0f)
