@@ -15113,7 +15113,12 @@ whole mixer: still is `tread`; a stroke takes over between 0.15 and 0.55 of
 the reference swim speed (0.28 of the def's top speed: the player's full swim);
 past that each direction gets its squared share of the body-frame velocity, so
 forward-and-down is part crawl and part dive and the body pitches part way. At
-the surface an upward push is treading, not swimming up. The pipeline finds the
+the surface an upward push is treading, not swimming up, and a descent counts
+toward the dive only up to the horizontal travel (sinking straight down is the
+tread going under). Entering starts on the mix the velocity asks for, and a
+stroke still fading out is resumed, never reset. The avatar's gate is HELD
+0.35 s past its condition while wet (`kSwimExitGrace`): the surface bob and a
+wader's toe-taps flicker it. The pipeline finds the
 waterline itself (`World::KindAt` up the body's own column) and, while the top
 of the body is out, settles the DRAWN body so the water crosses it where the
 blended clips want it (pose.cpp `kSwimWaterShare`: 0.76 of the standing height

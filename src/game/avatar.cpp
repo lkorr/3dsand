@@ -72,6 +72,11 @@ constexpr float kGaitCoyoteLegLengths = 0.5f;
 // of its five samples wet (see the note where swimming_ is set). Space held
 // while moving at the surface lifts the body to 0.2 (measured, --shot-swim).
 constexpr float kSwimPoseSubmersion = 0.19f;
+// How long the swim pose outlives its condition while the body is still wet
+// (see where swimming_ is set): longer than a surface bob's dip below the
+// line or a wader's toe-tap on the bottom, short enough that standing up in
+// the shallows hands back to the walk within a step.
+constexpr float kSwimExitGrace = 0.35f;
 
 ParticleSpawn MakeDroplet(Vec3 posVoxel, Vec3 vel, uint32_t material,
                           bool micro, int lifeTicks, int microScale) {
@@ -536,6 +541,7 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // get-up at a tuck.
     airPoseEligible_ = false;
     swimming_ = false;
+    swimHold_ = 0.0f;
     pose_.airFrac = 0.0f;
     pose_.airLandW = 0.0f;
     pose_.airLeanPitch = pose_.airLeanRoll = 0.0f;
@@ -551,6 +557,7 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     crouchWant_ = false;
     airPoseEligible_ = false;
     swimming_ = false;
+    swimHold_ = 0.0f;
     playerVel_ = Vec3{};
     PosePipeline(AvatarPoseInputs(/*grounded=*/true, Vec3{}), dt, world, tick);
     SubmitPose(dt, /*writeXf=*/true);
@@ -580,10 +587,25 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // the bottom and below kSwimSubmersion, and that is exactly the tread. So
     // a body the water holds up -- wet at all and with no floor -- swims too.
     // (Where the surface is, the pipeline finds for itself.)
-    swimming_ = (player.swimming ||
-                 (player.inLiquid && !player.grounded &&
-                  player.submersion >= kSwimPoseSubmersion)) &&
-                !player.fly && !player.hanging && player.mantleTimer <= 0.0f;
+    //
+    // HELD, NOT SAMPLED: every input here flickers. A surface swimmer's
+    // submersion rides the 0.75 line, and a body at chest depth taps the
+    // bottom (grounded for a tick) between bobs. Each lapse used to drop the
+    // stroke for a tick and restart it from the tread -- the one-frame
+    // stutter in a straight swim, and the stammer wading out of the shallows.
+    // So the pose lets go only after the condition has been false for
+    // kSwimExitGrace while the body is still wet; leaving the water, flying,
+    // grabbing a ledge or climbing out ends it at once.
+    const bool swimHard =
+        player.inLiquid && !player.fly && !player.hanging && player.mantleTimer <= 0.0f;
+    const bool swimCond =
+        swimHard && (player.swimming ||
+                     (!player.grounded && player.submersion >= kSwimPoseSubmersion));
+    if (swimCond)
+      swimHold_ = kSwimExitGrace;
+    else
+      swimHold_ = swimHard ? std::max(0.0f, swimHold_ - dt) : 0.0f;
+    swimming_ = swimCond || swimHold_ > 0.0f;
     // A ledge climb is the hang's continuation: same lip, same wall.
     climbActive_ = player.mantleFromHang && player.mantleTimer > 0.0f;
     climbRise_ = climbActive_ ? player.LedgeClimbRise() : 0.0f;

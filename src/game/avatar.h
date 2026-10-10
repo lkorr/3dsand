@@ -551,6 +551,10 @@ class PlayerAvatar : public Mob {
   // Mirrored out of Player the same way, for PoseInputs::swim: the water is
   // carrying the body (not wading, not flying, not climbing out).
   bool swimming_ = false;
+  // Seconds the swim pose is still held after its condition lapsed while the
+  // body is wet (avatar.cpp, kSwimExitGrace): the gate's inputs flicker at the
+  // surface and at wading depth, and every lapse used to restart the stroke.
+  float swimHold_ = 0.0f;
   // Was the support a LEDGE HANG last tick? Losing that support must not fire
   // the "jump" clip — the arms are already up in the hang pose.
   bool wasHanging_ = false;
