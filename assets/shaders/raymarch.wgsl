@@ -6883,8 +6883,52 @@ fn cloudHistTexel(p : vec2<u32>) -> CloudPx {
   if (i + 2u >= arrayLength(&cloudHist)) { return CloudPx(vec3f(0.0), 1.0, 1.0); }
   let rg = unpack2x16float(cloudHist[i]);
   let bt = unpack2x16float(cloudHist[i + 1u]);
-  let d = unpack2x16float(cloudHist[i + 2u]);
-  return CloudPx(vec3f(rg.x, rg.y, bt.x), bt.y, d.x);
+  // Word 2 = Td (10 bits) | extinction span (2 x 11 bits): cloud.wgsl packTdSpan.
+  return CloudPx(vec3f(rg.x, rg.y, bt.x), bt.y, f32(cloudHist[i + 2u] & 1023u) / 1023.0);
+}
+// The cloud image IN FRONT OF a surface `tHitM` metres along the ray, for the
+// deck composite over hit pixels. Each texel's march recorded where along its
+// ray the extinction happened ([near, far], cloud.wgsl gExtSpan); the share of
+// that span in front of the hit scales the texel's optical depth (T^f, and
+// the in-scatter by the same opacity ratio) BEFORE the bilinear blend. That
+// one rule is the soft line where a slope climbs into the deck (a hit just
+// past the deck's near edge has a sliver of cloud in front of it, not the
+// whole column), keeps the deck seen from above off a cliff standing in front
+// of it, and is a depth-aware upsample for free: a sky texel's far span does
+// not bleed onto a near silhouette.
+fn cloudScreenAtHit(fragXY : vec2f, tHitM : f32) -> CloudPx {
+  let div = f32(max(CL.resDiv, 1u));
+  let f = clamp(fragXY / div - 0.5, vec2f(0.0),
+                vec2f(f32(CL.lowW) - 1.001, f32(CL.lowH) - 1.001));
+  let i0 = vec2<u32>(floor(f));
+  let fr = f - floor(f);
+  let i1 = min(i0 + vec2<u32>(1u), vec2<u32>(CL.lowW - 1u, CL.lowH - 1u));
+  var o = CloudPx(vec3f(0.0), 0.0, 0.0);
+  for (var k = 0u; k < 4u; k++) {
+    let p = vec2<u32>(select(i0.x, i1.x, (k & 1u) != 0u), select(i0.y, i1.y, k >= 2u));
+    let w = select(1.0 - fr.x, fr.x, (k & 1u) != 0u) * select(1.0 - fr.y, fr.y, k >= 2u);
+    let idx = CL.histCur + (p.y * CL.lowW + p.x) * 3u;
+    var c = vec3f(0.0);
+    var t = 1.0;
+    if (idx + 2u < arrayLength(&cloudHist)) {
+      let rg = unpack2x16float(cloudHist[idx]);
+      let bt = unpack2x16float(cloudHist[idx + 1u]);
+      let sw = cloudHist[idx + 2u];
+      let a = exp2(f32((sw >> 10u) & 2047u) / 2047.0 * 17.0);
+      let b = exp2(f32(sw >> 21u) / 2047.0 * 17.0);
+      let tex = clamp(bt.y, 0.0, 1.0);
+      // A degenerate span (one layer at one distance: the horizon fill, the
+      // cirrus) still ramps over 2% of its distance rather than stepping.
+      let share = clamp((tHitM - a) / max(b - a, a * 0.02 + 1.0), 0.0, 1.0);
+      t = exp2(share * log2(max(tex, 1e-6)));
+      let k1 = select(share, (1.0 - t) / (1.0 - tex), tex < 0.999);
+      c = max(vec3f(rg.x, rg.y, bt.x), vec3f(0.0)) * k1;
+    }
+    o.c += c * w;
+    o.t += t * w;
+  }
+  o.td = o.t;
+  return o;
 }
 
 // ---- THE RAIN SHADOW MAP, read side (rain_map.wgsl writes it) ---------------
@@ -15221,7 +15265,7 @@ fn fs(in : VSOut) -> FSOut {
     let deckLo = CL.baseM - cloudBaseJitterM(CL.thicknessM);
     let hitYM = (R.camPos.y + rd.y * tDepth) * VOXEL_METERS;
     if (CL.camM.y > deckLo || hitYM > deckLo) {
-      let cs = cloudScreenAt(in.pos.xy);
+      let cs = cloudScreenAtHit(in.pos.xy, tDepth * VOXEL_METERS);
       color = color * cs.t + cs.c;
     }
   }
