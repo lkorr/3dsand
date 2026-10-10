@@ -445,7 +445,27 @@ void Overlay::DrawHUD(const UIState& s) {
 
   // ---- body condition: the paper doll, directly above the hp bar -----------
   const float figureH = DrawBodyFigure(s, x, yStack, w);
-  const float yTop = yStack - figureH;
+  float yTop = yStack - figureH;
+
+  // ---- swim stamina: a thin bar on top of the doll -------------------------
+  // Only while afloat or refilling (UIState::swimStaminaShow). Water blue,
+  // going to ember in the last fifth, where the body is about to sink.
+  if (s.playerAlive && s.swimStaminaShow) {
+    const float sh = 8.0f;
+    const float sy = std::floor(yTop - gap - sh);
+    const float frac = std::clamp(s.swimStamina, 0.0f, 1.0f);
+    const ImVec2 p(x, sy), q(x + w, sy + sh);
+    d->AddRectFilled(ImVec2(p.x - 2, p.y - 2), ImVec2(q.x + 2, q.y + 2),
+                     IM_COL32(0, 0, 0, 110), 3.0f);
+    d->AddRectFilled(p, q, IM_COL32(18, 20, 28, 220), 2.0f);
+    const ImU32 fill = frac > 0.2f ? IM_COL32(70, 150, 215, 235)
+                                   : ui::Mix(IM_COL32(200, 70, 50, 235),
+                                             IM_COL32(70, 150, 215, 235), frac / 0.2f);
+    if (frac > 0.0f)
+      d->AddRectFilled(p, ImVec2(std::floor(p.x + w * frac), q.y), fill, 2.0f);
+    d->AddRect(p, q, IM_COL32(255, 255, 255, 45), 2.0f);
+    yTop = sy - 2.0f;
+  }
   sHudTop = yTop - (s.playerAlive ? 8.0f : 30.0f);
 
   if (!s.playerAlive) {

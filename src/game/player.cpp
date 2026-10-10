@@ -1168,7 +1168,19 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     // swimming proper is unchanged; what changes is the shallow end.
     float accel =
         inLiquid ? (1.0f + (T().liquidGravityScale - 1.0f) * submersion) : 1.0f;
-    if (!blindFall) vel.y -= gravity * accel * dt;
+    // SWIM STAMINA (see player.h). Afloat = wet with no footing, whether
+    // treading, crawling or under. While any is left and Ctrl is not asking
+    // to go down, the water holds the body: under (`swimming`) the residual
+    // weight is dropped so the body keeps its depth, and nearer the surface
+    // the tread thrust below is applied as though Space were held, which
+    // settles the box at exactly the float a held Space always gave.
+    const bool afloat = inLiquid && !onGround;
+    if (afloat)
+      swimStamina = std::max(0.0f, swimStamina - dt / std::max(T().swimStaminaTime, 0.1f));
+    else
+      swimStamina = std::min(1.0f, swimStamina + dt / std::max(T().swimStaminaRegenTime, 0.1f));
+    const bool buoyed = afloat && swimStamina > 0.0f && !in.Held(TB_CROUCH);
+    if (!blindFall && !(buoyed && swimming)) vel.y -= gravity * accel * dt;
 
     // Wade speed also scales with submersion: ankle-deep water should barely
     // slow you, chest-deep should be the authored liquidSpeedScale.
@@ -1314,7 +1326,9 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
         // hovering with only its feet wet. Scaled, thrust and buoyancy fall off
         // together and the body settles AT the waterline, which is what
         // floating is.
-        if (in.Held(TB_JUMP)) vel.y += (T().swimUp / kVoxelMeters) * submersion * dt;
+        // `buoyed && !swimming` is the implied tread (swim stamina, above).
+        if (in.Held(TB_JUMP) || (buoyed && !swimming))
+          vel.y += (T().swimUp / kVoxelMeters) * submersion * dt;
         if (in.Held(TB_CROUCH)) vel.y -= (T().swimDown / kVoxelMeters) * submersion * dt;
       }
     }

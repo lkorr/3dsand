@@ -101,6 +101,8 @@ const TUNING_SCHEMA = [
       {k:'flySprint', n:'fly sprint', d:'Noclip speed with shift — the get-across-the-map speed.', step:0.5, u:'m/s'},
       {k:'swimUp', n:'swim up', d:'Upward thrust while holding space in liquid.', step:0.25, u:'m/s²'},
       {k:'swimDown', n:'swim down', d:'Downward thrust while holding ctrl in liquid.', step:0.25, u:'m/s²'},
+      {k:'swimStaminaTime', n:'swim stamina', d:'Seconds afloat before swim stamina runs out. While any is left the body does not sink on its own (treads at the surface, holds depth under it); at zero it sinks unless Space is held.', step:1, u:'s'},
+      {k:'swimStaminaRegenTime', n:'swim stamina regen', d:'Seconds standing or out of the water to refill an empty swim stamina bar.', step:0.5, u:'s'},
       {k:'liquidGravityScale', n:'buoyancy', d:'Gravity multiplier in liquid. 0.25 means you sink at a quarter weight; 0 floats.', step:0.01},
       {k:'liquidSpeedScale', n:'wade speed', d:'Horizontal speed multiplier in liquid.', step:0.01},
       {k:'liquidAccel', n:'liquid accel', d:'Steering authority in liquid — low is sluggish.', step:0.1, u:'/s'},

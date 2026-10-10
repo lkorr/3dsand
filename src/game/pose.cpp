@@ -623,7 +623,8 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   // ---- the swim family (PoseInputs::swim, 2026-10-09) ----------------------
   // Seven library clips (assets/anims: tread, swim, swim_back, swim_side and
   // its derived .mirror, swim_up, swim_down), all full-body OVERRIDES on one
-  // 1200 ms period, played together while the body swims and blended by
+  // 1600 ms period (each 100 ms key interval stretched by one 30 Hz tick,
+  // 2026-10-10), played together while the body swims and blended by
   // WEIGHT on which way it is going in its own frame. The override blend is a
   // weighted mean, so the weights are the whole mixer: still is `tread`, a
   // forward-and-down travel is part `swim` and part `swim_down` (the body

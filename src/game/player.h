@@ -309,6 +309,14 @@ class Player {
   // movement input or when not swimming. Under water the body travels along
   // it and the avatar's pose points the body along it (PoseInputs::swimAim).
   Vec3 swimAim{};
+  // SWIM STAMINA, 0..1 (2026-10-10). Drains while afloat (in liquid with no
+  // footing) over player.swimStaminaTime seconds and refills over
+  // player.swimStaminaRegenTime once the body stands or leaves the water.
+  // While any is left the water holds the body up: a swimmer near the
+  // surface treads on its own (the Space thrust, implied) and one under it
+  // holds its depth, so nothing sinks unless Ctrl asks it to. At zero the
+  // passive sink comes back. The HUD draws it above the paper doll.
+  float swimStamina = 1.0f;
   // THE DROP IS RATE-LIMITED BY THE MIRROR: the body is descending faster than
   // the CPU mirror can answer for the cells beneath it, so this frame's fall is
   // clamped to the distance the mirror does vouch for and gravity is not added

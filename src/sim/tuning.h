@@ -136,6 +136,11 @@ struct Tuning {
     float gravity = TPD(player, gravity);
     float jumpSpeed = TPD(player, jumpSpeed);
     float swimUp = TPD(player, swimUp), swimDown = TPD(player, swimDown);
+    // Swim stamina (Player::swimStamina): seconds afloat to drain a full bar,
+    // seconds out of the water / standing to refill an empty one. While any
+    // is left the body does not sink on its own.
+    float swimStaminaTime = TPD(player, swimStaminaTime);
+    float swimStaminaRegenTime = TPD(player, swimStaminaRegenTime);
     float maxFall = TPD(player, maxFall);
     float fallDamageSpeed = TPD(player, fallDamageSpeed);
     float fallSplatSpeed = TPD(player, fallSplatSpeed);

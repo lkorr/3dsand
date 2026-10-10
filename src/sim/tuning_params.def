@@ -1450,6 +1450,10 @@ TP_F(player, gravity, NO_WGSL, 9.81f, 0.0f, 40.0f)
 TP_F(player, jumpSpeed, NO_WGSL, 5.25f, 0.0f, 15.0f)
 TP_F(player, swimUp, NO_WGSL, 17.5f, 0.0f, 60.0f)
 TP_F(player, swimDown, NO_WGSL, 7.5f, 0.0f, 60.0f)
+// Swim stamina (Player::swimStamina): seconds afloat from full to empty, and
+// seconds out of the water (or standing) from empty to full.
+TP_F(player, swimStaminaTime, NO_WGSL, 60.0f, 1.0f, 600.0f)
+TP_F(player, swimStaminaRegenTime, NO_WGSL, 8.0f, 0.5f, 120.0f)
 TP_F(player, maxFall, NO_WGSL, 30.0f, 1.0f, 120.0f)
 TP_F(player, fallDamageSpeed, NO_WGSL, 8.0f, 0.0f, 60.0f)
 TP_F(player, fallSplatSpeed, NO_WGSL, 25.0f, 1.0f, 120.0f)

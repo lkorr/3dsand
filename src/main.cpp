@@ -16413,6 +16413,9 @@ int main(int argc, char** argv) {
         ui.healthMax = avatar.HealthMax();
         ui.healthCap = avatar.HealthCap();
         ui.playerAlive = avatar.IsAlive();
+        ui.swimStamina = player.swimStamina;
+        ui.swimStaminaShow = !player.fly && (player.swimStamina < 1.0f ||
+                                             (player.inLiquid && !player.grounded));
         // Body-condition readout: one figure slot per limb, keyed by the
         // limb's authored TAG and side suffix rather than by part name, so any
         // humanoid rig fills the same figure. A limb the rig does not have

@@ -453,6 +453,8 @@ const TUNING_PARAMS = {
   'player.jumpSpeed':{t:'f',def:5.25,min:0,max:15},
   'player.swimUp':{t:'f',def:17.5,min:0,max:60},
   'player.swimDown':{t:'f',def:7.5,min:0,max:60},
+  'player.swimStaminaTime':{t:'f',def:60,min:1,max:600},
+  'player.swimStaminaRegenTime':{t:'f',def:8,min:0.5,max:120},
   'player.maxFall':{t:'f',def:30,min:1,max:120},
   'player.fallDamageSpeed':{t:'f',def:8,min:0,max:60},
   'player.fallSplatSpeed':{t:'f',def:25,min:1,max:120},

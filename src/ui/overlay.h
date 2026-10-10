@@ -672,6 +672,11 @@ struct UIState {
   // bar that quietly rescaled itself.
   int32_t healthCap = 0;
   bool playerAlive = true;
+  // Swim stamina (Player::swimStamina), 0..1, and whether its bar shows:
+  // drawn above the paper doll while the body is afloat or the bar is not
+  // full, hidden otherwise.
+  float swimStamina = 1.0f;
+  bool swimStaminaShow = false;
 
   // ---- THE DEATH HOLD -------------------------------------------------------
   // A dead player is no longer rebuilt on a timer. The body stays where it
