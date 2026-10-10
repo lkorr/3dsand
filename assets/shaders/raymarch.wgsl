@@ -992,9 +992,16 @@ var<private> gFragXY : vec2f = vec2f(0.0);
 // (0.5 near / 1 far), surface distance / 50 m, Fresnel; 6 = refracted luma,
 // reflection luma / 2, bed lit luma / 2; 7 = foam, pre-aerial colour luma / 2,
 // path to the bed / 30 m. 8 = a far hit's level / 8, liquid, refined (0.5 a
-// feature) -- which representation drew a distant pixel. 0 = off and
-// const-folded away.
+// feature) -- which representation drew a distant pixel. MPM SEAM (ticket
+// 2026-10-10 10:50, the lake slab): 9 = which shade owns the water pixel
+// (1 = shadeMpmFluid, 0.5 = shadeWater, 0.25 = shadeFarWater), the fluid
+// hit's settled share (mfLake's input), the MPM shade's foam; 10 = settled
+// share, churn, column / 40 voxels.
+// 0 = off and const-folded away.
 const SEAM_DBG : u32 = 0u;
+// The MPM terms (SEAM_DBG 9-10): caFrac, foam, settled share (fs), churn; colVox.
+var<private> gDbgM0 : vec4f = vec4f(0.0);
+var<private> gDbgM1 : f32 = 0.0;
 // The water frames' terms (SEAM_DBG 5-7), set by both water shades.
 var<private> gDbgW0 : vec4f = vec4f(0.0);   // side, distance (vox), fresnel, foam
 var<private> gDbgW1 : vec4f = vec4f(0.0);   // refracted, reflection, lit, pre-aerial (luma)
@@ -10786,6 +10793,29 @@ fn floatingOnLiquid(cell : vec3<i32>, mat : u32) -> f32 {
   return 0.0;
 }
 
+// The cell of the liquid a film floats on: the first cell below `cell` that is
+// not its own material, within floatingOnLiquid's 3-cell probe. Only
+// meaningful where floatingOnLiquid returned > 0 (it found exactly this cell).
+fn floatBedCell(cell : vec3<i32>, mat : u32) -> vec3<i32> {
+  var c = cell - vec3<i32>(0, 1, 0);
+  for (var i = 1; i < 3; i++) {
+    if (voxMat(voxWordAt(c)) != mat) { break; }
+    c.y -= 1;
+  }
+  return c;
+}
+
+// How much of the carrying water's wave slope a floating slick takes on. Under
+// 1 because oil genuinely calms water (it damps the short capillary waves —
+// the old sailors' trick), and because the ticket asked for a SLIGHT slosh.
+const OIL_SLOSH_SLOPE : f32 = 0.55;
+// Metres the film's thickness field is displaced per unit of wave slope: the
+// stretch-and-squeeze that makes the bands ripple with the swell. At the
+// field's ~0.45-0.8 cycles/m, a 0.04 slope moves the pattern ~0.2-0.3 cycle:
+// enough that the bands visibly wobble with the waves, not enough to scramble
+// them (4.0 measured as motion you had to diff frames to see).
+const OIL_SLOSH_WARP : f32 = 10.0;
+
 // ---- thin-film interference (the rainbow sheen on oil) ----
 // The one thing everybody recognises oil by. A film microns thick makes light
 // reflected off its TOP surface interfere with light reflected off its BOTTOM,
@@ -10801,8 +10831,21 @@ fn floatingOnLiquid(cell : vec3<i32>, mat : u32) -> f32 {
 // Thickness varies via the same value-noise field the rest of the renderer
 // uses, animated slowly: a real slick's film is dragged around by the fluid
 // under it, and a uniform film would show one flat colour rather than bands.
-fn filmIridescence(p : vec3f, cosI : f32) -> vec3f {
+//
+// SLOSHED BY THE WATER UNDER IT (bug report 2026-10-10 10:59). `slope` is the
+// wave slope of the water the slick floats on (shadeViscous's slosh block,
+// zero off water and on side faces). A real slick is stretched and squeezed by
+// the swell carrying it, so its film thickness — and with it the band pattern —
+// ripples in step with the waves: the sample point is displaced along the slope
+// (OIL_SLOSH_WARP metres per unit slope) and the whole film drifts with the
+// analytic current the water's own wave phase is advected by. The field is
+// sampled in XZ only: the old pm.y term changed the pattern by a step at every
+// cell of partial fullness, which drew the cell grid into the rainbow.
+fn filmIridescence(p : vec3f, cosI : f32, slope : vec2f) -> vec3f {
   let pm = p * VOXEL_METERS;
+  let flowMS = currentAt(p, &R).xz * VOXEL_METERS;
+  let q = vec2f(pm.x, pm.z) - flowMS * (R.time * TUNE_WAVE_FLOW_SCALE) +
+          slope * OIL_SLOSH_WARP;
   // Two octaves at different rates so the bands drift and stretch rather than
   // sliding rigidly, which is what reads as liquid rather than as a scrolling
   // texture.
@@ -10811,8 +10854,10 @@ fn filmIridescence(p : vec3f, cosI : f32) -> vec3f {
   // viewing distance, and the field aliases into a shimmering moire that reads
   // as a broken screen rather than as oil. A real film's thickness varies over
   // tens of centimetres, so the bands should be broad, soft and few.
-  let t1 = valueNoise(vec3f(pm.x * 0.45, pm.y * 0.45 + R.time * 0.05, pm.z * 0.45), 1.0);
-  let t2 = valueNoise(vec3f(pm.z * 0.8 - R.time * 0.03, pm.x * 0.8, pm.y * 0.8), 1.0);
+  // Time is the noise's third axis now that height no longer is, so the bands
+  // still evolve in place rather than only translating.
+  let t1 = valueNoise(vec3f(q.x * 0.45, R.time * 0.05, q.y * 0.45), 1.0);
+  let t2 = valueNoise(vec3f(q.y * 0.8 - R.time * 0.03, q.x * 0.8, 7.3 + R.time * 0.02), 1.0);
   let thick = mix(t1, t2, 0.4) * TUNE_OIL_FILM_SCALE;
   // Optical path difference grows as the ray slants through the film, which is
   // why the bands crowd toward a grazing view. That angular term is most of
@@ -10986,6 +11031,27 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     n = normalize(n + vec3f(sin(pm.x * 9.0 + R.time * 0.6),
                             sin(pm.y * 10.0 + R.time * 0.45),
                             cos(pm.z * 11.0 + R.time * 0.5)) * wob);
+  }
+  // ---- a slick rides the waves of the water it floats on ----
+  // (bug report 2026-10-10 10:59.) A film of oil on a lake is carried by the
+  // lake's swell, so its top surface takes the WATER's wave slope — from
+  // waterWaveNormal itself, the one law shadeWater and shadeFarWater share, fed
+  // the carrying water's depth and fetch exactly as waterNormal feeds it, so the
+  // slick and the open water round it move as one surface. Scaled down
+  // (OIL_SLOSH_SLOPE) and by how firmly the oil floats; up-facing only, as
+  // waterNormal restricts its field. The slope also warps the film's thickness
+  // field below (filmIridescence), which is what makes the rainbow ripple.
+  var filmSlope = vec2f(0.0);
+  if (upFacing && !underwater && oily > 0.01) {
+    let floatW = floatingOnLiquid(cell, mat);
+    if (floatW > 0.01) {
+      let wc = floatBedCell(cell, mat);
+      let wm = voxMat(voxWordAt(wc));
+      let wn = waterWaveNormal(hitP, vec2f(0.0), waterDepthM(wc, wm),
+                               waterOpenness(wc, wm), vec2f(0.0));
+      filmSlope = -wn.xz / max(wn.y, 0.2) * (OIL_SLOSH_SLOPE * floatW * oily);
+      n = normalize(n + vec3f(-filmSlope.x, 0.0, -filmSlope.y));
+    }
   }
   if (underwater) { n = -n; }
 
@@ -11207,7 +11273,7 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // Scaled by `oily`, so blood never gets a drop of it.
     let onWater = floatingOnLiquid(cell, mat);
     if (oily > 0.01 && onWater > 0.01 && !underwater) {
-      color += filmIridescence(hitP, cosI) * oily * onWater * fres *
+      color += filmIridescence(hitP, cosI, filmSlope) * oily * onWater * fres *
                TUNE_OIL_IRIDESCENCE;
     }
   }
@@ -12115,6 +12181,16 @@ fn fluidGradientColor(base : vec3f, thickM : f32) -> vec3f {
 // cell, so 2 is conservative. This is the whole reason the seam ring exists.
 const FLUID_SEAM_SHELL : i32 = 2;
 
+// fs()'s ownership rule (ticket 2026-10-10 10:50): a fluid-march hit whose
+// sampled density is at least this share SETTLED voxel water is the lake's own
+// surface and is shaded by the lake's shade, not by shadeMpmFluid. A half:
+// the surface is the lake's where most of what makes it is the lake.
+const MPM_LAKE_SETTLED : f32 = 0.5;
+// shadeMpmFluid's answer to "how much of this surface is a calm raft of
+// particles floating on the lake" (caFrac * calm, its own two terms), for fs()
+// to hand that share of the pixel to shadeWater. Set on every call.
+var<private> gMpmLakeW : f32 = 0.0;
+
 // Chunk classification for the march: 0 = nothing here, 1 = the chunk owns a
 // node block, 2 = SEAM RING — no block of its own, but a face neighbour has
 // one, so the isosurface can reach FLUID_SEAM_SHELL cells in from that face.
@@ -12870,6 +12946,7 @@ fn traceRefraction(p : vec3f, rdr : vec3f, waterVox : f32,
 // would.
 fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
                  caPath : f32, sceneBehind : vec3f) -> vec3f {
+  gMpmLakeW = 0.0;
   let hitP = ro + rd * fh.t;
   // Colour/velocity sampled half a cell INTO the body so a grazing entry does
   // not read the empty half of the boundary cells.
@@ -12997,6 +13074,7 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   // surface, and tilting a wall with it pushes the normal into the terrain.
   let calm = 1.0 - clamp(churn * 3.0, 0.0, 1.0);
   let rippleW = clamp(max(s.settled, caFrac * calm), 0.0, 1.0);
+  gMpmLakeW = clamp(caFrac * calm, 0.0, 1.0);
   if (rippleW > 0.01 && n.y > 0.25) {
     let slope = rippleSlope(vec2f(hitP.x, hitP.z) * VOXEL_METERS, R.time,
                             waterRippleFootprint(hitP)) * rippleW;
@@ -13116,6 +13194,7 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   let fieldFoam = s.foam * max(TUNE_FLUID_FOAM_FIELD, 0.0);
   let churnFoam = mix(churn, smoothstep(0.35, 0.80, churn), caFrac);
   var foam = TUNE_FLUID_FOAM * max(churnFoam, fieldFoam);
+  if (SEAM_DBG >= 9u) { gDbgM0 = vec4f(caFrac, foam, gDbgM0.z, churn); gDbgM1 = colVox; }
   if (foam > 0.003) {
     // Animated fbm break-up so it reads as bubbles and streaks being dragged
     // along rather than as white paint. Scaled by the texture knob: at 0 the
@@ -14405,6 +14484,7 @@ fn fs(in : VSOut) -> FSOut {
   var mf : FluidHit;
   mf.hit = false;
   mf.blocky = false;
+  var mfLake = false;   // the hit surface is settled lake water (see below)
   if (SPEC_FLUID && R.fluidCount > 0u) {
     // windowExitT, NOT h.tExit — the fine march's stop is not the extent of
     // the sim-resident data the fluid lives in. See windowExitT's note.
@@ -14416,6 +14496,26 @@ fn fs(in : VSOut) -> FSOut {
       mf = fluidMarchBlocky(R.camPos, rd, sceneT, 1u);
     } else if (mode >= 3) {
       mf = fluidMarchBlocky(R.camPos, rd, sceneT, 0u);
+    }
+    // ---- IS THIS FLUID SURFACE THE LAKE'S? (ticket 2026-10-10 10:50) ----
+    // The march draws an isosurface over SETTLED voxel water as well as over
+    // live particles (fluidCellAt's virtual mass), in every chunk the block map
+    // marks plus its seam ring. Where that surface is made of settled water it
+    // IS the lake's own surface, and the lake already has an owner: shadeWater
+    // near, shadeFarWater past the handoff. Letting shadeMpmFluid draw it as
+    // well repainted whole chunks of a disturbed lake in a second water model —
+    // the pond's foam field, the MPM Fresnel and reflection, ripples without
+    // the swell, the authored bright blue wherever the near trace had not
+    // measured the column — which is exactly the chunk-shaped slab the owner
+    // reported after blowing up a lake bed (SEAM_DBG 9 measured it: MPM-shaded
+    // pixels filled the marked chunks edge to edge, foam ~0.3 across them).
+    // So the MPM shade keeps only the surfaces its PARTICLES make: the sampled
+    // share of settled water decides, at the same point shadeMpmFluid samples.
+    if (mf.hit) {
+      let lp = select(R.camPos + rd * (mf.t + 0.5), R.camPos, mf.inside);
+      let lakeShare = fluidSampleAt(lp).settled;
+      mfLake = lakeShare >= MPM_LAKE_SETTLED;
+      if (SEAM_DBG >= 9u) { gDbgM0.z = lakeShare; }
     }
     if (fluidStage() == 4u) {   // the bench's STEP HEATMAP (fluidStage note)
       var dbg : FSOut;
@@ -14505,7 +14605,7 @@ fn fs(in : VSOut) -> FSOut {
   // draws over it — which is exactly what a splash should do.
   // The MPM shade always records a veil (it only ever holds non-viscous
   // liquid), so under WATER_VEIL its interface writes no depth either.
-  if (!WATER_VEIL && SPEC_FLUID && mf.hit && mf.t > 0.05 &&
+  if (!WATER_VEIL && SPEC_FLUID && mf.hit && !mfLake && mf.t > 0.05 &&
       (tDepth < 0.0 || mf.t < tDepth)) {
     tDepth = mf.t;
   }
@@ -15595,7 +15695,7 @@ fn fs(in : VSOut) -> FSOut {
       // apart. `caShadedLiquid` below carries the answer to the MPM path, so
       // the two cannot drift back out of agreement the way two independent
       // tests did.
-      let mpmOwned = SPEC_FLUID && mf.hit
+      let mpmOwned = SPEC_FLUID && mf.hit && !mfLake
                      && materials[lm].moveEvery <= 1u
                      && (mf.inside || mf.t <= h.liqT + 1.0);
 
@@ -15731,7 +15831,7 @@ fn fs(in : VSOut) -> FSOut {
   //     Fresnel and specular glint and all, tens of voxels under the real
   //     surface. It cannot be a real interface: the ray was inside water before
   //     it got there, which is precisely what caShadedLiquid records.
-  if (SPEC_FLUID && mf.hit && !caShadedLiquid) {
+  if (SPEC_FLUID && mf.hit && !caShadedLiquid && !mfLake) {
     let caMatRaw = select(MAT_AIR, voxMat(voxWordAt(unpackWinCell(h.liqCell))), h.liqT > 0.0);
     // caMatRaw IS the liquid cell's material whenever liqT > 0.05 > 0.
     let viscousNearer = h.liqT > 0.05 && h.liqT < mf.t
@@ -15749,9 +15849,54 @@ fn fs(in : VSOut) -> FSOut {
       if (caMatRaw != MAT_AIR && materials[caMatRaw].klass == CLASS_LIQUID &&
           !isViscousLiquid(materials[caMatRaw])) {
         caMat = caMatRaw;
-        caPath = h.liqPath;
+        // + liqExtra: the column the fine march did not get to measure because
+        // the handoff cut it off (farWaterBed) — the same addition every CA
+        // shade above makes. Without it a raft of particles on a lake past
+        // ~20 m saw a sliver of its column, caFrac collapsed to the authored
+        // MPM look, and the raft drew as a bright blue slab (ticket 10-50-10).
+        caPath = h.liqPath + liqExtra;
+      } else if (caMatRaw == MAT_AIR && !h.hit && far.hit &&
+                 materials[far.mat].klass == CLASS_LIQUID &&
+                 !isViscousLiquid(materials[far.mat])) {
+        // The near trace crossed no liquid at all but the cascade's first hit
+        // is water: the particles float on a lake the near field never reached
+        // (past the handoff). Its column is the gap down to that water plus
+        // the cascade's own path to the bed under it.
+        caMat = far.mat;
+        let fb = farWaterBed(far.level & 0xFFu, R.camPos + rd * (far.t + 0.01), rd);
+        caPath = max(far.t - mf.t, 0.0) + fb.path;
       }
+      let behindMpm = color;
       color = shadeMpmFluid(R.camPos, rd, mf, caMat, caPath, color);
+      if (SEAM_DBG >= 5u) { gDbgW0.x = 2.0; }
+      // ---- A CALM RAFT ON THE LAKE IS THE LAKE (ticket 2026-10-10 10:50) ----
+      // mfLake handed the settled surface to the lake's shade; this is the
+      // other half. Disturbed lake water is excited into particles a whole
+      // block at a time, and once it stops moving it is a raft of lake water
+      // floating on its own column, represented as particles for a while —
+      // still drawn by shadeMpmFluid's model (its foam field, its Fresnel, its
+      // reflection), so the excited chunks stayed visible as a chunk-shaped
+      // patch long after the water was still. Its calm share (caFrac * calm,
+      // shadeMpmFluid's own two terms, so a moving pour keeps its look) is
+      // shaded by shadeWater itself, at the PARTICLE surface, over the CA
+      // column under it: the same law the lake around it is drawn with, so
+      // the boundary is only where the water genuinely moves. The veil terms
+      // blend by the same weight.
+      let lakeW = gMpmLakeW;
+      if (lakeW > 0.01 && !mf.inside && h.liqT > 0.05 && caMat == caMatRaw) {
+        let mK = gVK; let mS = gVScatter; let mA = gVAbsorb; let mD = gVDelta;
+        let mC = gVCurv;
+        let wHit = R.camPos + rd * mf.t;
+        let wCol = shadeWater(wHit, rd, caMat, unpackWinCell(h.liqCell), 1, -1.0,
+                              caPath + max(h.liqT - mf.t, 0.0), 1.0, behindMpm,
+                              mf.t, false);
+        color = mix(color, wCol, lakeW);
+        gVK = mix(mK, gVK, lakeW);
+        gVScatter = mix(mS, gVScatter, lakeW);
+        gVAbsorb = mix(mA, gVAbsorb, lakeW);
+        gVDelta = mix(mD, gVDelta, lakeW);
+        gVCurv = mix(mC, gVCurv, lakeW);
+      }
       if (!mf.inside) { color = applyAerial(color, rd, mf.t); }
       if (WATER_VEIL) {
         writeWaterVeil(in.pos.xy, select(mf.t, 0.0, mf.inside),
@@ -15812,7 +15957,7 @@ fn fs(in : VSOut) -> FSOut {
     // !caShadedLiquid: the pane guard's case, where the fluid march's
     // "interface" (and its `inside`) is a chunk face inside settled water, not
     // a surface — the CA liquid above already clipped that ray.
-    if (SPEC_FLUID && mf.hit && !caShadedLiquid) {
+    if (SPEC_FLUID && mf.hit && !caShadedLiquid && !mfLake) {
       if (mf.inside) { eyeWet = true; }
       else if (mf.t > 0.05 && (rainT < 0.0 || mf.t < rainT)) { rainT = mf.t; }
     }
@@ -15883,6 +16028,13 @@ fn fs(in : VSOut) -> FSOut {
   if (SEAM_DBG == 5u) { gDbg = vec4f(gDbgW0.x, gDbgW0.y * VOXEL_METERS / 50.0, gDbgW0.z, 1.0); }
   else if (SEAM_DBG == 6u) { gDbg = vec4f(gDbgW1.x, gDbgW1.y * 0.5, gDbgW1.z * 0.5, 1.0); }
   else if (SEAM_DBG == 7u) { gDbg = vec4f(gDbgW0.w, gDbgW1.w * 0.5, min(gDbgWPath / 30.0, 1.0), 1.0); }
+  else if (SEAM_DBG == 9u) {
+    let own = select(select(select(0.0, 0.25, gDbgW0.x == 1.0), 0.5, gDbgW0.x == 0.5),
+                     1.0, gDbgW0.x == 2.0);
+    gDbg = vec4f(own, gDbgM0.z, gDbgM0.y, 1.0);
+  } else if (SEAM_DBG == 10u) {
+    gDbg = vec4f(gDbgM0.z, gDbgM0.w, min(gDbgM1 / 40.0, 1.0), 1.0);
+  }
   if (SEAM_DBG != 0u) { out.color = vec4f(gDbg.xyz, 1.0); }
   out.depth = depth;
   return out;
