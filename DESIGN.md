@@ -18832,7 +18832,32 @@ each, never a march):
   weighted by `render.cloudFogMix`;
 - the shared hemisphere ambient (`ambientAtP`): greys and flattens by
   `RenderParams.overcast`, and takes a cold flash from `RenderParams.lightning`;
-- a camera at or above the deck base: the same image composited OVER hit pixels.
+- a camera at or above the deck base, or a hit above it: the same image
+  composited OVER hit pixels, TRUNCATED AT THE HIT (`cloudScreenAtHit`, below).
+
+**A hit pixel takes only the cloud in front of it** (2026-10-09, tickets
+`15-11-18` and `15-14-31`). Each screen-march texel records WHERE along its ray
+the extinction happened — the first and last deck sample that held cloud,
+widened by the rain, horizon fill and cirrus it added (`gExtSpan`) — as two
+11-bit log2 distances packed beside a 10-bit Td in history word 2 (no new
+words; `packTdSpan`). The composite over a hit at distance t scales each
+texel's optical depth by the share of that span in front of t (T^f, the
+in-scatter by the same opacity ratio) BEFORE the bilinear blend. So a slope
+climbing into the deck takes a sliver of cloud at the base and grades into it
+higher up; the deck seen from above stays off a cliff standing in front of it;
+and the upsample is depth-aware for free (a sky texel's far span does not bleed
+onto a near silhouette). It was the WHOLE column on every hit above the base: a
+hard line where the hit crossed `deckLo`, and from above the deck a false ledge
+of cloud painted across the face of the mountain the camera stood on. The second
+half of the cause: `terrainHitM`'s geometric ground search grew by a fixed 1.12
+over 40 steps, i.e. reached only 1.9 km, so no summit further off ever stopped
+the march. The growth is now fitted to the search distance (56 steps for the
+screen, 28 for the env map), and the search runs only as far as the deck's far
+side or the rain's reach. A screen ray that stops at the ground also drops the
+horizon fill and the cirrus (both behind it); the env map keeps them, as the fog
+target the fogged ground must meet. Cost: within noise of before (cloud pass
+1.3-1.8 ms mean in the two ticket views at 1600x900 under overcast, `--frames`
+pass attribution, before and after alike).
 
 **Precipitation, tier 1 only.** Rain curtains hang under raining cells in the
 march (with the primary and secondary RAINBOW at 42°/51° from the anti-solar
