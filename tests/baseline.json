@@ -253,7 +253,7 @@
   "_solute_about": "The solute layer (src/test/selftest_solute.cpp, docs/PLAN_solutes.md). THRESHOLDS, not observations. solute.maxSpread: the widest concentration spread (units, max - min over FULL cells) a settled pond may keep. It is not 1: integer pair exchange stops at |dm| <= 1 per PAIR, and the four strides bound the slope, so the body-wide spread is the pond's hop diameter -- measured 3 over a 12 x 12 x 4 pond at ~7 units a cell. solute-evap.maxDiscard: units the brine-on-lava fixture may discard; every one is the sub-eighth remainder of a precipitation a NEIGHBOUR rule forced (molten salt quenching brine to steam), where the brine cell cannot push its mass on. The balance line (powder + molten + dissolved + discarded == placed) is exact and is the real assertion. solute.ticks / solute-dilute.ticks / solute-evap.ticks: fixture lengths.",
   "solute.maxSpread": "4",
   "solute-blood.ticks": "4500",
-  "solute-blood.mixBy": "600",
+  "solute-blood.mixBy": "100",
   "_bloodCloud_about": "Ticket 2026-10-11 01:29:42 (blood underwater strobes). A blood cloud poured mid-column into a 33x33x14 basin, drawn from inside the water and from above. strobe = share of the cloud's pixels changing > 12 between two consecutive frames of a still world, minus the clean control's share. Measured 2026-10-11: 888d07e's 12 camera+frame-dithered samples 0.041 below / 0.040 above; the slab walk 0.000 / 0.000. sim: centroid 0.019 vox/tick, rms radius 0.112 vox/tick (the cloud only diffuses). Above, the cloud is ~2-3% of the frame (0.020-0.029 run to run: the clean/blood mask also catches some surface animation), red shift +41..+67.",
   "bloodCloud.heartUnits": "160",
   "bloodCloud.settleTicks": "300",

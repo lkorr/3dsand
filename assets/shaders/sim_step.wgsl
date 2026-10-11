@@ -1255,8 +1255,10 @@ fn solTryMix(c : vec3<i32>, idx : u32, w : u32, s : u32, slotIdx : u32,
   let rr = hash3(T.seed ^ 0x3C1D8B0Du, T.tick, slotIdx);
   let rot = (rr >> 12u) % 6u;
   var waiting = false;
+  var sinkInto = false;
   for (var i = 0u; i < 6u; i = i + 1u) {
-    let n = c + faceDir((i + rot) % 6u);
+    let fi = (i + rot) % 6u;
+    let n = c + faceDir(fi);
     if (!inBounds(n)) { continue; }
     let nw = voxWordAt(n);
     let nmat = voxMat(nw);
@@ -1275,6 +1277,7 @@ fn solTryMix(c : vec3<i32>, idx : u32, w : u32, s : u32, slotIdx : u32,
     if (solSpeciesOf(nv) == s &&
         2u * solMassOf(nv) * 8u >= solCap(s, 8u) * (voxState(nw) + 1u)) {
       waiting = true;
+      if (all(faceDir(fi) == vec3<i32>(0, -1, 0))) { sinkInto = true; }
       continue;
     }
     if (probe) {
@@ -1299,8 +1302,43 @@ fn solTryMix(c : vec3<i32>, idx : u32, w : u32, s : u32, slotIdx : u32,
     markDirty(c);
     return true;
   }
-  // Only dense cloud against it: the cloud is diluting (diffusion, halfLife),
-  // so look again -- bounded, it cannot stay dense.
+  // Only dense cloud against it. If the cloud is directly BELOW, the source
+  // SINKS INTO IT: the two cells swap (voxel and solute value both), so the
+  // blood goes down a cell and the cloudy water it had just made comes up.
+  // Without this, blood poured onto a pond MOUNDED on the surface -- the first
+  // layer mixed into a dense cloud, and every cell landing on it waited for the
+  // slow diffusion to thin it. Now a pour plunges through its own cloud until
+  // it meets clean water, where it mixes as above, so the cloud forms IN the
+  // water and nothing stands on it. Downward only: a pool of blood lying
+  // BESIDE water still dissolves at the slow front the refusal above keeps
+  // (it does not chain sideways), and a sinking cell can never come back up,
+  // so the swap cannot oscillate; it is bounded by the depth of the water.
+  // Both writes are within the lattice's one-cell reach (tryMove's pair).
+  // A cell in a chunk with no page (a sentinel) cannot be written: wait, as
+  // before, rather than count a fault.
+  let bt = voxIndexAndWord(c + vec3<i32>(0, -1, 0));
+  if (sinkInto && !probe && idx != PT_NO_WORD && bt.x != PT_NO_WORD) {
+    let b = c + vec3<i32>(0, -1, 0);
+    if (!solWritable(c)) {
+      atomicStore(&solMeta[SOLM_REQ_FLAG + voxSlotOfCell(c)], 1u);
+      markDirtyR(c, DIRTY_R_SOLUTE);
+      return false;
+    }
+    let bw = bt.y;
+    let stamp = stampFor(T.tick, P.substep);
+    voxStore(bt.x, packVoxKeepStain(voxMat(w), voxState(w), stamp, w));
+    voxStore(idx, packVoxKeepStain(voxMat(bw), voxState(bw), stamp, bw));
+    markVoxActive(bt.x);
+    markVoxActive(idx);
+    solSwap(c, b, w, bw);
+    markDirtyR(c, DIRTY_R_MOVE);
+    markDirtyR(b, DIRTY_R_MOVE);
+    solMarkFan(c);
+    solMarkFan(b);
+    return true;
+  }
+  // Otherwise the cloud is diluting (diffusion, halfLife), so look again --
+  // bounded, it cannot stay dense.
   if (waiting) { markDirtyR(c, DIRTY_R_REACT); }
   return false;
 }

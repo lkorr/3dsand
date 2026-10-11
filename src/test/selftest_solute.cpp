@@ -1383,8 +1383,8 @@ Status GateSolutePayout(Ctx& c, std::string& detail) {
 // BLOOD IN WATER: the one LIQUID source species (solutes.json `blood`). A
 // sealed 20 x 20 pond six deep; on tick 12 a radius-2 blood sphere is PAINTED
 // under the surface (a BrushOp in paint mode -- exactly what a wound's drip is,
-// so this is the underwater-wound path, sim_mutate.wgsl paintTakes) and nine
-// blood cells are dropped on the surface (what a flung voxel lands as).
+// so this is the underwater-wound path, sim_mutate.wgsl paintTakes) and a 3 x 3
+// x 3 mound of blood is dropped on the surface (what a pour lands as).
 // Asserted, each failing differently:
 //   mixed  no blood VOXEL left in the box by tick `mixBy` -- every one became
 //          water carrying its blood (sim_step.wgsl solTryMix);
@@ -1424,6 +1424,11 @@ Status GateSoluteBlood(Ctx& c, std::string& detail) {
   const int px = 96, py = 120, pz = 96;
   const Box box{px - 10, px + 9, pz - 10, pz + 9, py, py + 10, true};
   const int layers = 6;
+  // The surface drop is a MOUND, kMound cells high: what a pour lands as. Only
+  // its bottom layer touches clean water; the rest lands on the dense cloud
+  // that layer became, which mixing refuses, so the pour must SINK through it
+  // (solTryMix's swap) or it stands on the surface waiting on diffusion.
+  const int kMound = 3;
   const int kTicks = (int)BaselineNumber("solute-blood.ticks", 2100);
   const int mixBy = (int)BaselineNumber("solute-blood.mixBy", 90);
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
@@ -1432,9 +1437,11 @@ Status GateSoluteBlood(Ctx& c, std::string& detail) {
   const std::vector<CellOp> pond = box.Layers(water, py + 1, layers, 7u);
   const std::vector<BrushOp> wound = {{px, py + 3, pz, 2, blood, 0u, 0u, 0u}};
   std::vector<CellOp> drops;
-  for (int z = pz + 4; z < pz + 7; z++)
-    for (int x = px + 4; x < px + 7; x++)
-      drops.push_back({World::SlotCellIndex({x, py + 1 + layers, z}), (blood & 0xFFFu) | (7u << 12)});
+  for (int y = 0; y < kMound; y++)
+    for (int z = pz + 4; z < pz + 7; z++)
+      for (int x = px + 4; x < px + 7; x++)
+        drops.push_back(
+            {World::SlotCellIndex({x, py + 1 + layers + y, z}), (blood & 0xFFFu) | (7u << 12)});
 
   uint32_t t = 54000;
   support::TickCursor ticker{c, t, {px >> 4, py >> 4, pz >> 4}};
@@ -1492,7 +1499,7 @@ Status GateSoluteBlood(Ctx& c, std::string& detail) {
   RecordObserved("solute-blood.goneAt", (double)goneAt);
   RecordObserved("solute-blood.peakCells", (double)peakCells);
   detail = Format(
-      "blood painted under %d layers of %d x %d water + %zu cells on top: %llu blood "
+      "blood painted under %d layers of %d x %d water + %zu-cell mound on top: %llu blood "
       "eighths in, every blood voxel mixed by tick %d (allow %d)%s; cloud peaked at %u "
       "cells / %u units; water eighths %llu -> %llu (allow +0..+%llu) %s; mass gone "
       "from tick %d (%s, %u page / %u uniform slots); ledger dissolved %u discarded "

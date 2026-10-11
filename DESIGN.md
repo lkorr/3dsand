@@ -1719,7 +1719,12 @@ liquid (blood, the only one). A blood cell touching one of its `solvents`
 (water) BECOMES that solvent at its own fullness and carries
 `fullness x yield/8` (capped at saturation) as mass (`solTryMix`) -- volume
 kept, no bubble, the cloud starts where the blood stood; a source already
-carrying another species is refused. Two feeds make it reach the water: a
+carrying another species is refused. A solvent already a dense cloud (half
+saturation) is refused too, so a pool beside water does not chain-mix; but a
+source resting ON its own dense cloud SWAPS DOWN into it (voxel + solute), so
+a pour plunges through the cloud it made to clean water instead of mounding
+on the surface (2026-10-11; gate `solute-blood` drops a 3-high mound,
+`mixBy` 100: 240 ticks before the swap, 50 after). Two feeds make it reach the water: a
 whole-voxel LIQUID particle buried in a liquid it is denser than rejoins the
 grid in that cell instead of being shoved up a cell a tick
 (`sim_particle.wgsl`, the burial block -- what made exploded blood climb to
