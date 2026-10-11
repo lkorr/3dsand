@@ -89,6 +89,24 @@ constexpr int kStreamGradBaseline = 32;
 // Stream primitives one window may carry. Half the cap, so a drain seeded in
 // the same tick can always still find a slot — rule 2 charged before emission.
 constexpr int kStreamMaxPrims = 16;
+// A slab stream's fade past its half-height, cells. Mirrors CPRIM_SLAB_FADE
+// in common.wgsl.
+constexpr int kCurrentSlabFade = 3;
+// ---- the map-river half of the stream arm ---------------------------------
+// Voxels of centreline arc between river primitives, and each one's axial
+// reach (so the axial tents partition unity along the channel). 6.4 m.
+constexpr int kRiverPrimStride = 64;
+// Half-span of arc the surface fall is measured over: a reach is flat between
+// weirs, so a short baseline would read 0 on most of the river and a step's
+// whole drop at the rest.
+constexpr float kRiverSlopeBaseline = 160.0f;
+// Half-span of arc the flow DIRECTION is taken over: short, so a bend turns the
+// current where the channel turns.
+constexpr float kRiverTangentHalf = 24.0f;
+// m/s. The floor is what an authored river flows at down a reach the bake laid
+// flat (most of them); the cap keeps a waterfall's reach from becoming a jet.
+constexpr float kRiverMinFlowMs = 0.4f;
+constexpr float kRiverMaxFlowMs = 3.0f;
 // Owner handles. The stream arm is one owner (it is retired and rebuilt whole
 // when the window moves); each body's drain owns two consecutive handles.
 constexpr uint64_t kStreamOwnerId = 0x57524541u;      // 'STREA'
@@ -113,6 +131,11 @@ struct CurrentPrim {
   int32_t reach = 32;                       // world cells (axial)
   int32_t swirlQ = 1 << 16;                 // tangential share, Q16.16 (vortex)
   int32_t riseQ = 0;                        // axial share, Q16.16 (vortex)
+  // A STREAM'S half-height, world cells; 0 = the round profile. Non-zero makes
+  // it a SLAB: width `radius` measured horizontally, height +-slab about y,
+  // fading out kCurrentSlabFade cells past it. Rides the swirl word on the GPU
+  // (a stream has no swirl). The axis must be horizontal.
+  int32_t slab = 0;
   uint32_t kind = kCurrentPrimStream;
   uint32_t flags = 0;                       // kCurrentPrimSim
   uint32_t spawnTick = 0;                   // for the attack ramp
@@ -177,6 +200,11 @@ class CurrentPrimSystem {
   // charged BEFORE emission (rule 2), so a caller learns its current did not
   // happen instead of silently displacing someone else's.
   bool Spawn(const CurrentPrim& p);
+  // APPEND, never refresh: for an arm that emits MANY primitives under one
+  // owner handle (the stream arm, retired whole on a window move). Spawn's
+  // refresh-by-owner would overwrite the first one each time and leave the
+  // whole arm a single primitive. Same cap, same refusal.
+  bool SpawnUnowned(const CurrentPrim& p);
 
   void RetireOwner(uint64_t ownerId);
   void Clear();
@@ -205,6 +233,12 @@ class CurrentPrimSystem {
   // of (seed, window, tuning) and re-probing it every tick would be ~1,600
   // terrain hashes a tick for an answer that cannot have changed.
   void SeedStreams(const World& world, uint32_t seed, uint32_t tick);
+  // The stream arm's MAP-RIVER half: map.json rivers[] along their baked
+  // centrelines, downstream, nearest the window centre first. Called by
+  // SeedStreams before its lattice; returns how many it emitted, which the
+  // lattice's share of kStreamMaxPrims is charged against.
+  int SeedMapRivers(int baseX, int baseZ, uint32_t seed, uint32_t tick,
+                    float scale);
 
   // THE DRAIN ARM (components 6 + 8). While a governed body's drain window is
   // live, a SINK at the hole plus a VORTEX about the vertical through it. The
@@ -234,6 +268,9 @@ class CurrentPrimSystem {
   // outside any legal origin so the first call always builds.
   IVec3 streamOrigin_{1 << 30, 1 << 30, 1 << 30};
   uint32_t streamSeed_ = 0;
+  // How many stream primitives the last build put on the list, so a list that
+  // has since lost some (see SeedStreams) is rebuilt rather than trusted.
+  size_t streamBuilt_ = 0;
 };
 
 // THE live list. A global for exactly the reason WindPrims() and WaterBodies()

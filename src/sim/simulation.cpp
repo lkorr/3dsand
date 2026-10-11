@@ -4978,13 +4978,19 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     pool.Add([this, d] { windStreakDraw_ = device_.CreateRenderPipeline(d); });
 
     // The CURRENT field's arrows (water plan component 8). Same pipeline
-    // state, same depth rule, same argument for it — a different field.
+    // state as the wind's EXCEPT the depth rule: NOT depth tested, the
+    // wireframes' rule. Every non-zero current arrow is INSIDE water, and the
+    // world's depth stands at the liquid interface, so a tested arrow was
+    // hidden by the very surface it annotates — the overlay drew nothing from
+    // anywhere but underwater. The wind's "through the ground misleads"
+    // argument does not carry over: there is no current in the ground to
+    // mistake for one above it.
     d.label = "debugCurrentDraw";
     d.vertexModule = debugCurModule_;
     d.vertexEntry = "vsCurArrow";
     d.fragmentModule = debugCurModule_;
     d.fragmentEntry = "fsCurArrow";
-    d.depth = dsWind;
+    d.depth = dsNone;
     pool.Add([this, d] { debugCurrentDraw_ = device_.CreateRenderPipeline(d); });
 
     // The vessel's pour-point sphere (DrawPourMarker). The wireframes' module

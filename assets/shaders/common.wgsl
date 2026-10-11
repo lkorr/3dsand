@@ -4182,6 +4182,9 @@ fn windAmbQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
 // anything into itself. A property of the shape, so a constant and not a knob.
 const CPRIM_INFLOW : f32 = 0.22;
 const CPRIM_INFLOW_Q8 : i32 = 56;   // the same 0.22, Q8, for the integer path
+// A slab stream's fade past its half-height, cells (see currentPrimEvalF).
+// Mirrored as kCurrentSlabFade in currentprim.h for CurrentAtCpu.
+const CPRIM_SLAB_FADE : i32 = 3;
 
 // Exact integer floor(sqrt(v)), v in [0, 2^30). Restoring binary method,
 // constant time, no float and no table.
@@ -4247,6 +4250,25 @@ fn currentPrimEvalF(p : vec3f, w0 : vec4<i32>, w1 : vec4<i32>,
   let d = p - pos;
   let d2 = dot(d, d);
   let rr = rad * rad;
+
+  // A SLAB STREAM (w2.z > 0, the swirl word a stream has no other use for):
+  // a map river. Its width is `rad`, measured HORIZONTALLY off the axis, and
+  // its height is +-w2.z cells about the centre, full strength through the
+  // water column and gone CPRIM_SLAB_FADE cells past it. Without it a 36 m
+  // river's flow reached 18 m into the sky above it, because the radial
+  // profile below is round. The axis is horizontal for every slab (the
+  // seeder's contract), so `ax` is a horizontal distance too.
+  if (kind == CPRIM_STREAM && w2.z > 0) {
+    let th = f32(w2.z);
+    let dyA = abs(d.y);
+    if (dyA > th) { return vec3f(0.0); }
+    let sax = dot(d, dir);
+    if (abs(sax) > len) { return vec3f(0.0); }
+    let h2 = max(0.0, d.x * d.x + d.z * d.z - sax * sax);
+    if (h2 > rr) { return vec3f(0.0); }
+    let vW = clamp((th - dyA) / f32(CPRIM_SLAB_FADE), 0.0, 1.0);
+    return dir * (s * (1.0 - h2 / rr) * (1.0 - abs(sax) / len) * vW);
+  }
 
   if (kind == CPRIM_SINK || kind == CPRIM_SOURCE) {
     if (d2 > rr) { return vec3f(0.0); }
@@ -4372,6 +4394,24 @@ fn currentPrimEvalQ(p : vec3<i32>, w0 : vec4<i32>, w1 : vec4<i32>,
   let d2 = d.x * d.x + d.y * d.y + d.z * d.z;
   let rr = rad * rad;
   let core = max(rad / 8, 1);              // currentPrimEvalF's rad * 0.125
+
+  // The slab stream, currentPrimEvalF's block transcribed. th <= 512 (the
+  // CPU clamps it to kCurrentPrimMaxExtent), so (th - dy) * 1024 < 2^20.
+  if (kind == CPRIM_STREAM && w2.z > 0) {
+    let th = w2.z;
+    let dyA = abs(d.y);
+    if (dyA > th) { return vec3<i32>(0); }
+    let sax = (d.x * dir.x + d.y * dir.y + d.z * dir.z) / 65536;
+    if (abs(sax) > len) { return vec3<i32>(0); }
+    let h2 = max(0, d.x * d.x + d.z * d.z - sax * sax);
+    if (h2 > rr) { return vec3<i32>(0); }
+    let rad10 = 1024 - (h2 * 1024) / rr;
+    let ax10 = 1024 - (abs(sax) * 1024) / len;
+    let v10 = clamp(((th - dyA) * 1024) / CPRIM_SLAB_FADE, 0, 1024);
+    let w10 = (((rad10 * ax10) / 1024) * v10) / 1024;
+    let sw = (sQ / 1024) * w10;
+    return vec3<i32>(wq(dir.x, sw), wq(dir.y, sw), wq(dir.z, sw));
+  }
 
   if (kind == CPRIM_SINK || kind == CPRIM_SOURCE) {
     if (d2 > rr) { return vec3<i32>(0); }

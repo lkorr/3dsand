@@ -40,6 +40,8 @@
 //      or meadow): ticked to <= rivers.maxAwake (32) awake chunks and HELD
 //      there rivers.holdTicks more, at most rivers.maxAwakeWater of them over
 //      water or banks; WHERE they are and WHICH field moves when it fails.
+//   I. CURRENT: the map-river arm of the current field puts several stream
+//      primitives on main and the field there runs downstream.
 //   H. THE SITE INDEX on `default` with a 10 km test river + a lake: loads,
 //      the worst cell list and the bake's time reported.
 // A top-down picture of the window as generated goes to build/rivers_top.bmp
@@ -61,6 +63,7 @@
 #include <nlohmann/json.hpp>
 
 #include "sim/biomes.h"
+#include "sim/currentprim.h"
 #include "sim/horizon.h"
 #include "sim/treeatlas.h"
 #include "sim/weather.h"
@@ -399,6 +402,44 @@ Status GateRivers(Ctx& c, std::string& detail) {
     std::printf("rivers: C lake: %s (%d columns inside under level %d hold it, %d wrong; %d wet outside)%s\n", cOk ? "PASS" : "FAIL",
                 inWet, lakeLevel, inWrong, outWet, why.c_str());
     if (!cOk) problems.push_back(Format("C: lake inside %d wrong %d outside %d%s", inWet, inWrong, outWet, why.c_str()));
+  }
+
+  // ---- I. the current field runs downstream (currentprim.cpp SeedMapRivers) ----
+  // A window centred on main's middle sample: the map-river arm must put more
+  // than one stream primitive there (the lattice arm's shared owner handle
+  // once collapsed every stream to ONE), and the CPU field just under the
+  // surface at that sample must point along the centreline, downstream, at no
+  // less than the authored floor.
+  {
+    using sandvox::CurrentPrims;
+    const auto& L = rMain->line;
+    const size_t mid = L.size() / 2;
+    const size_t ta = mid >= 4 ? mid - 4 : 0, tb = std::min(L.size() - 1, mid + 4);
+    float tx = static_cast<float>(L[tb][0] - L[ta][0]), tz = static_cast<float>(L[tb][1] - L[ta][1]);
+    const float tl = std::max(std::sqrt(tx * tx + tz * tz), 1e-3f);
+    tx /= tl;
+    tz /= tl;
+    CurrentPrims().Clear();
+    const int bx = L[mid][0] - static_cast<int>(kWorldN) / 2;
+    const int bz = L[mid][1] - static_cast<int>(kWorldN) / 2;
+    const int n = CurrentPrims().SeedMapRivers(bx, bz, kDefaultSeed, 100, 1.2f);
+    CurrentPrims().Tick(100 + sandvox::kCurrentPrimAttack);
+    const Vec3 v = sandvox::CurrentAtCpu(
+        Vec3{L[mid][0] + 0.5f, L[mid][2] - 1.5f, L[mid][1] + 0.5f});
+    const float speed = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+    const float along = v.x * tx + v.z * tz;
+    const float floorCells = sandvox::kRiverMinFlowMs / kVoxelMeters;
+    // The slab: nothing in the air over the river (it once reached 18 m up).
+    // 24 cells, not 4: the reach upstream stands a weir or two higher, and its
+    // slab is flat over its own 64 voxels of channel.
+    const Vec3 sky = sandvox::CurrentAtCpu(Vec3{L[mid][0] + 0.5f, L[mid][2] + 24.5f, L[mid][1] + 0.5f});
+    const float skySpeed = std::sqrt(sky.x * sky.x + sky.y * sky.y + sky.z * sky.z);
+    const bool iOk = n >= 2 && speed >= floorCells * 0.9f && along >= 0.9f * speed && skySpeed == 0.0f;
+    std::printf("rivers: I current: %s (%d river primitive(s) in the window; at main's middle %.1f cells/s, %.2f of it "
+                "downstream, floor %.1f; 24 cells over the surface %.2f)\n",
+                iOk ? "PASS" : "FAIL", n, speed, speed > 0.0f ? along / speed : 0.0f, floorCells, skySpeed);
+    if (!iOk) problems.push_back(Format("I: current %d prims, %.1f cells/s, along %.1f", n, speed, along));
+    CurrentPrims().Clear();
   }
 
   // ---- the world on the GPU ----

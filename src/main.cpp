@@ -21082,6 +21082,14 @@ int main(int argc, char** argv) {
         // the EncodeShadowResolve above steps it once more by the same dt.
         sim.DrawWindStreaks(srp, WindStreakDrawCount(CurrentTuning()),
                             (uint32_t)CurrentTuning().wind.streakTrail);
+        // The F4 field arrows, likewise: without them a --at picture of the
+        // wind or current overlay was a picture of no overlay at all.
+        sim.DrawWindField(srp, ui.fieldViz == UIState::kFieldVizWind
+                                   ? WindDebugArrowCount(CurrentTuning())
+                                   : 0u);
+        sim.DrawCurrentField(srp, ui.fieldViz == UIState::kFieldVizCurrent
+                                      ? CurrentDebugArrowCount()
+                                      : 0u);
         overlay.RenderRecorded(srp);
         srp.End();
         ctx.queue.Submit(senc.Finish());
