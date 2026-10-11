@@ -376,6 +376,24 @@ class PlayerAvatar : public Mob {
     instancesDirty_ = false;
     return next;
   }
+  // ---- THE DRAWN BODY BETWEEN TICKS -----------------------------------------
+  // The rig is posed and stepped at 30 Hz, and until 2026-10-11 it was DRAWN
+  // at 30 Hz too: only its translation rode the tick interpolation
+  // (renderOffset_), so under a camera that moves every frame the pose and
+  // the facing advanced in steps. Standing it hardly shows; a swimmer lies
+  // along its heading with arms sweeping ~40 degrees a tick, and a turn
+  // swung its whole length round in jumps (the owner's "glitches and tweaks
+  // out when turning, it needs continuous movement").
+  //
+  // So each limb's last two read-backs are kept RELATIVE TO THE PLAYER
+  // (SnapshotRender, once per tick after the step), and the draw blends
+  // them by the same alpha the camera uses, about the same interpolated
+  // anchor the offset already gives. One tick latent, as the translation
+  // always was. Render-only: colliders, rays and strikes keep limb.xf.
+  void SnapshotRender(const Vec3& anchor);
+  void SetRenderAlpha(float alpha) { renderAlpha_ = alpha; }
+  // Mob::AppendXforms' slot walk exactly, with the blend above.
+  void AppendXforms(std::vector<BodyXformGpu>& out) const;
   // Parts to SKIP when drawing — first person hides the body but keeps the
   // arms. Empty in third person. Set by main.cpp from the camera mode.
   void SetHiddenParts(const std::vector<uint8_t>& hidden);
@@ -514,6 +532,15 @@ class PlayerAvatar : public Mob {
   }
 
  private:
+  // SnapshotRender's two ticks: each limb's read-back, position relative to
+  // the player it was posed around. `body` 0 = no limb in that slot then.
+  struct RenderKey {
+    Vec3 rel{};
+    Quat rot{};
+    uint64_t body = 0;
+  };
+  std::vector<RenderKey> renderPrev_, renderCur_;
+  float renderAlpha_ = 1.0f;
   // Damage state read from a save (LoadState), applied at the end of the next
   // Spawn() — the rig it applies to only exists once Spawn has built it.
   struct SavedState {

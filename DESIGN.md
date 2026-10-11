@@ -10889,6 +10889,12 @@ a detached speckle becomes a floating scrap of flesh in the world.
   colliders, the reach tests and every strike keep reading the posed
   transforms. `bodyYOffset` is `viewYOffset` minus the crouch's eye-height
   bank, since a crouch moves the eye inside a body that has not moved.
+  (2026-10-11) The avatar's POSE rides the same alpha: `PlayerAvatar::
+  SnapshotRender` keeps each limb's last two read-backs relative to the
+  player, and `PlayerAvatar::AppendXforms` draws them blended (position lerp,
+  rotation nlerp, snapping a limb whose two ticks are >12 voxels or >120
+  degrees apart). Before it the limbs and the facing advanced at 30 Hz under
+  a per-frame camera, which a flat swimmer's sweeping arms made plain.
   The gate walks a 1-in-4 staircase sampling five frames per tick and bounds
   the largest single-FRAME change in drawn eye height, the largest downward
   one, and the drift between the drawn eye and the drawn body (~0 by
@@ -15443,7 +15449,10 @@ box rides wherever buoyancy and the thrust put it, which with Space held is
 waist-out. The
 avatar retires its idle/walk/run/fall/hang family under it (idle is additive
 and would sway the stroke). A rig missing some of the clips swims with the
-rest; a clip-owned state (crawl, stumps) keeps the body. In third person the
+rest. The water SUSPENDS a dismemberment state (crawl, stumps, squirm;
+2026-10-11): while `swim` is set no state is selected, so a footless body
+strokes at full swim speed instead of hobbling on stumps through the lake, and
+the state crossfades back the tick it leaves the water. In third person the
 body faces its travel, so the back/side clips show in first person and through
 a turn. Look-iteration: `--shot-swim` (harness lake, one BMP per phase).
 

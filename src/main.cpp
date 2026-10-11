@@ -8210,7 +8210,9 @@ int main(int argc, char** argv) {
   // --shot-swim: into the harness lake, a little above its waterline, so the
   // first thing the body does is splash in and float.
   if (g_shotSwim) {
-    const int li = World::WaterSiteIndex(kHarnessLakeSite);
+    // SANDVOX_SHOT_SWIM_SITE=<water site id>: another lake (with SANDVOX_MAP).
+    const char* swimSite = std::getenv("SANDVOX_SHOT_SWIM_SITE");
+    const int li = World::WaterSiteIndex(swimSite ? swimSite : kHarnessLakeSite);
     const World::PondDisc lake =
         li >= 0 ? World::WaterSiteDisc(li, kDefaultSeed) : World::PondDisc{};
     if (lake.present && lake.surf >= 0) {
@@ -8502,7 +8504,7 @@ int main(int argc, char** argv) {
     }
     // --shot-swim photographs the STROKE: a sword in the fist puts that arm
     // in its guard and hides half of it, so the harness swims empty-handed.
-    if (g_shotSwim) {
+    if (g_shotSwim && !std::getenv("SANDVOX_SHOT_SWIM_ARMED")) {
       ItemStack& rh = kit.equip.slots[EquipSlotOfHand(Hand::Right)];
       if (!rh.Empty()) {
         hotbar.Add(rh);
@@ -11661,6 +11663,19 @@ int main(int argc, char** argv) {
         g_shotJumpPath = "screenshot_swim_up.bmp";
         upTaken = true;
       }
+      // SANDVOX_SHOT_SWIM_EVERY=<N>: a picture every N frames through the
+      // crawl and dive windows (screenshot_swim_f<frame>.bmp), for a pose
+      // that only goes wrong in motion.
+      static const int swimEvery = std::getenv("SANDVOX_SHOT_SWIM_EVERY")
+                                       ? std::atoi(std::getenv("SANDVOX_SHOT_SWIM_EVERY"))
+                                       : 0;
+      static char swimEveryPath[64];
+      if (!g_shotJumpPath && swimEvery > 0 && frameCounter >= kShotSwimTreadEnd &&
+          frameCounter < kShotSwimDiveEnd && frameCounter % (uint64_t)swimEvery == 0) {
+        std::snprintf(swimEveryPath, sizeof(swimEveryPath), "screenshot_swim_f%llu.bmp",
+                      (unsigned long long)frameCounter);
+        g_shotJumpPath = swimEveryPath;
+      }
       if (g_shotJumpPath)
         std::printf("--shot-swim: %s  frame %llu  swimming=%d submersion=%.2f vel=(%.1f %.1f %.1f) m/s\n",
                     g_shotJumpPath, (unsigned long long)frameCounter, (int)player.swimming,
@@ -14111,6 +14126,24 @@ int main(int argc, char** argv) {
       ui.fly = false;
       camMode = CameraMode::Third;
       const uint64_t f = frameCounter;
+      // SANDVOX_SHOT_SWIM_SEVER=<part,part,...>: lose those parts (by rig
+      // name) as the body hits the water, e.g. foot.L,foot.R: a footless swim.
+      static bool swimSevered = false;
+      if (!swimSevered && avatar.Spawned() && f > 60) {
+        swimSevered = true;
+        if (const char* sv = std::getenv("SANDVOX_SHOT_SWIM_SEVER")) {
+          std::string list = sv;
+          size_t at = 0;
+          while (at <= list.size()) {
+            const size_t comma = std::min(list.find(',', at), list.size());
+            const std::string part = list.substr(at, comma - at);
+            if (!part.empty())
+              std::printf("--shot-swim: sever %s -> %d\n", part.c_str(),
+                          (int)avatar.SeverByName(part));
+            at = comma + 1;
+          }
+        }
+      }
       const bool tread = f < kShotSwimTreadEnd;
       const bool crawl = f >= kShotSwimTreadEnd && f < kShotSwimCrawlEnd;
       const bool down = f >= kShotSwimCrawlEnd && f < kShotSwimDownEnd;
@@ -14143,6 +14176,28 @@ int main(int argc, char** argv) {
         pin.forward = 1.0f;
         pin.strafe = 0.0f;
         pin.SetHeld(TB_CROUCH, false);
+      }
+      // SANDVOX_SHOT_SWIM_SPIN=<rad per frame>: the crawl and dive phases are
+      // W alone with the camera turning at that rate (the "swim forward and
+      // slowly spin round" report); SANDVOX_SHOT_SWIM_FP=1 does it in first
+      // person. Read the result off SANDVOX_SWIM_TRACE=1.
+      static const char* spinEnv = std::getenv("SANDVOX_SHOT_SWIM_SPIN");
+      static float spinYaw = 0.6f;
+      if (spinEnv && (crawl || dive)) {
+        spinYaw += (float)std::atof(spinEnv);
+        // SANDVOX_SHOT_SWIM_SWEEP=<frames>: instead of turning, hold each of
+        // 16 headings for that many frames (straight swims at fixed angles).
+        if (const char* sw = std::getenv("SANDVOX_SHOT_SWIM_SWEEP"))
+          spinYaw = 0.6f + 0.39269908f *
+                               (float)((f - kShotSwimTreadEnd) / (uint64_t)std::max(1, std::atoi(sw)));
+        cam.yaw = spinYaw;
+        pin.forward = 1.0f;
+        pin.strafe = 0.0f;
+        if (std::getenv("SANDVOX_SHOT_SWIM_FP")) camMode = CameraMode::First;
+        if (std::getenv("SANDVOX_SHOT_SWIM_TIRED")) player.swimStamina = 0.0f;
+        if (std::getenv("SANDVOX_SHOT_SWIM_SPRINT")) pin.SetHeld(TB_SPRINT, true);
+        if (const char* pe = std::getenv("SANDVOX_SHOT_SWIM_PITCH"))
+          cam.pitch = (float)std::atof(pe);
       }
     }
     // --autofly: hold W+sprint in fly mode, no human at the keyboard. Exists to
@@ -15924,6 +15979,7 @@ int main(int argc, char** argv) {
       // Render-only, applied in ONE place (Mob::AppendXforms) — the colliders,
       // the reach tests and every strike still read the posed transforms.
       avatar.SetRenderOffset(player.RenderBodyOffset(tickAlpha));
+      avatar.SetRenderAlpha(tickAlpha);
       // First-person part-hiding mask, hoisted so the portrait pass below can
       // restore it after drawing the whole body. See the note at its fill.
       std::vector<uint8_t> hide;

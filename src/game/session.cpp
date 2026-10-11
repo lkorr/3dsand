@@ -5763,6 +5763,9 @@ static void PhaseO(TickAuthorityCtx& w, WorldScratch& ws,
       // a ragdolled player is being placed by the body, not the solver)
       if (!player.fly && !avatarRagdolled)
         player.ApplyPush(phys.PlayerPushOut(playerBody, player.pos), kindAt);
+      // The tick's final limb read-back, about where the player ended it: what
+      // the draw blends toward between now and the next tick (avatar.h).
+      if (avatar.Spawned()) avatar.SnapshotRender(player.pos);
   }
 }
 

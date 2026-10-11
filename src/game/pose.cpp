@@ -377,8 +377,33 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   // places (Sever, recursive DetachLimb, Die), and this is a handful of
   // comparisons. On a transition the outgoing clip blends out while the new
   // one blends in over its own blendInMs — a crossfade for free.
+  // The swim family's clips, resolved once per clip table (used here and by
+  // "the swim family" below).
   {
-    const int want = AnimSelectState(sk, st);
+    static const char* const kSwimNames[PoseDrive::kSwimClips] = {
+        "tread", "swim", "swim_back", "swim_side", "swim_side.mirror",
+        "swim_up", "swim_down"};
+    if (pose_.swimClipsKey != (const void*)sk.clips.data() ||
+        pose_.swimClipsCount != sk.clips.size()) {
+      pose_.swimClipsKey = sk.clips.data();
+      pose_.swimClipsCount = sk.clips.size();
+      for (int k = 0; k < PoseDrive::kSwimClips; k++)
+        pose_.swimClip[k] = sk.FindClip(kSwimNames[k]);
+    }
+  }
+  // THE WATER SUSPENDS THE DISMEMBERMENT STATE (2026-10-11). Every one of
+  // those states is a way of getting along the GROUND without what was lost
+  // (the stump walk, the crawl, the squirm), and each owns the whole pose
+  // (disableGait), so a footless body in a lake hobbled on stumps through the
+  // water and never swam. A body the water holds needs no feet: while the
+  // driver says it swims, no state is selected, its clip blends out under
+  // the strokes and it costs no speed (AvatarLocomotion reads the state). The
+  // state comes back the tick the body leaves the water, with the same
+  // crossfade any state change has. Missing limbs are simply not drawn
+  // stroking: the swim clips pose parts that are gone.
+  const bool swimSuspendsState = in.swim && pose_.swimClip[0] >= 0;
+  {
+    const int want = swimSuspendsState ? -1 : AnimSelectState(sk, st);
     if (want != st.locoState) {
       if (st.locoState >= 0 && !sk.states[st.locoState].clip.empty()) {
         const int old = sk.FindClip(sk.states[st.locoState].clip);
@@ -640,25 +665,14 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   // sets `swim` from its controller, and an NPC driver that grows swimming
   // sets the same field.
   {
-    static const char* const kSwimNames[PoseDrive::kSwimClips] = {
-        "tread", "swim", "swim_back", "swim_side", "swim_side.mirror",
-        "swim_up", "swim_down"};
-    if (pose_.swimClipsKey != (const void*)sk.clips.data() ||
-        pose_.swimClipsCount != sk.clips.size()) {
-      pose_.swimClipsKey = sk.clips.data();
-      pose_.swimClipsCount = sk.clips.size();
-      for (int k = 0; k < PoseDrive::kSwimClips; k++)
-        pose_.swimClip[k] = sk.FindClip(kSwimNames[k]);
-    }
     auto isSwimClip = [&](int ci) {
       if (ci < 0) return false;
       for (int k = 0; k < PoseDrive::kSwimClips; k++)
         if (pose_.swimClip[k] == ci) return true;
       return false;
     };
-    // A clip-owned state (crawl, stumps, sleep) keeps the body: a legless
-    // swimmer is a later question, and blending a crawl with a crawl stroke
-    // is neither.
+    // A clip-owned state no longer holds a swimmer: the water suspended it
+    // above, so `clipOwnsPose` is false whenever `in.swim` is.
     const bool swimNow = in.swim && !clipOwnsPose && pose_.swimClip[0] >= 0;
     // THE WATERLINE, over the body's own column: the first non-liquid cell
     // above liquid, scanned up from the soles to twice the body's height. Not

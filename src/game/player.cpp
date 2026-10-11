@@ -617,13 +617,20 @@ float StepSlide(Vec3& pos, float dx, float dz, const Player::Box& b,
 // lower half of the box (the legs). No press back down: the water holds the
 // body, and buoyancy and the tread settle it from there. Whatever still
 // blocks with the legs lifted clear is a wall at the torso, and stops it.
-// Returns the height lifted in voxels (0 if the flat slide won).
+// Returns the height lifted in voxels (0 if the flat slide won), and in
+// `blockedX`/`blockedZ` whether the path it took was stopped on that axis --
+// the sweeps' own answer. (The caller used to infer it by comparing the
+// distance moved with the distance asked for, to 1e-4 voxel. Kilometres
+// from the origin a float position cannot hold that: at x = 5877 one ulp is
+// 0.0005, so open water "blocked" an axis on random ticks, the velocity
+// snapped to the grid and back, and the body -- which faces its travel --
+// flipped between the two headings every tick. Owner's report 2026-10-11.)
 float SwimSlide(Vec3& pos, float dx, float dz, const Player::Box& b,
-                const Player::KindFn& kindAt) {
+                const Player::KindFn& kindAt, bool& blockedX, bool& blockedZ) {
   const Vec3 start = pos;
   Vec3 flat = start;
-  const bool blockedX = SweepAxis(flat, dx, 0, b, kindAt);
-  const bool blockedZ = SweepAxis(flat, dz, 2, b, kindAt);
+  blockedX = SweepAxis(flat, dx, 0, b, kindAt);
+  blockedZ = SweepAxis(flat, dz, 2, b, kindAt);
   if (!blockedX && !blockedZ) {
     pos = flat;
     return 0.0f;
@@ -635,11 +642,13 @@ float SwimSlide(Vec3& pos, float dx, float dz, const Player::Box& b,
     if (lift > reach) break;
     Vec3 up = start;
     if (SweepAxis(up, lift, 1, b, kindAt)) break;  // ceiling: no higher try
-    SweepAxis(up, dx, 0, b, kindAt);
-    SweepAxis(up, dz, 2, b, kindAt);
+    const bool upX = SweepAxis(up, dx, 0, b, kindAt);
+    const bool upZ = SweepAxis(up, dz, 2, b, kindAt);
     // StepSlide's rule: a lift is only worth taking if it got farther.
     if (FlatDist2(start, up) > FlatDist2(start, flat) + 1e-6f) {
       pos = up;
+      blockedX = upX;
+      blockedZ = upZ;
       return lift;
     }
   }
@@ -1437,11 +1446,11 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     if (!onGround && inLiquid && mantleTimer <= 0.0f) {
       // Afloat: the legs ride over the floor (SwimSlide). The axis it still
       // could not make loses its velocity, as the airborne slide's does.
-      const Vec3 before = pos;
-      const float wantX = vel.x * dt, wantZ = vel.z * dt;
-      BankVerticalSnap(SwimSlide(pos, wantX, wantZ, b, kindAt));
-      if (std::abs(pos.x - before.x) < std::abs(wantX) - 1e-4f) vel.x = 0;
-      if (std::abs(pos.z - before.z) < std::abs(wantZ) - 1e-4f) vel.z = 0;
+      bool blockedX = false, blockedZ = false;
+      BankVerticalSnap(SwimSlide(pos, vel.x * dt, vel.z * dt, b, kindAt,
+                                 blockedX, blockedZ));
+      if (blockedX) vel.x = 0;
+      if (blockedZ) vel.z = 0;
     } else if (!onGround) {
       // Airborne: plain slide, no stepping (both Quake and Source refuse to
       // step while off the ground).

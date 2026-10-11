@@ -1319,6 +1319,62 @@ bool PlayerAvatar::LoadState(const uint8_t* data, size_t len,
   return true;
 }
 
+// ---- the drawn body between ticks (avatar.h SnapshotRender) -----------------
+
+void PlayerAvatar::SnapshotRender(const Vec3& anchor) {
+  renderPrev_.swap(renderCur_);
+  renderCur_.resize(limbs_.size());
+  for (size_t i = 0; i < limbs_.size(); i++) {
+    const MobLimb& l = limbs_[i];
+    renderCur_[i].rel = l.xf.pos - anchor;
+    renderCur_[i].rot = Quat{l.xf.quat[0], l.xf.quat[1], l.xf.quat[2], l.xf.quat[3]};
+    renderCur_[i].body = l.body;
+  }
+  // A rig that changed shape (spawn, a sever, an item taken up) has no
+  // previous tick to blend from: draw the new one as it is.
+  if (renderPrev_.size() != renderCur_.size()) renderPrev_ = renderCur_;
+}
+
+void PlayerAvatar::AppendXforms(std::vector<BodyXformGpu>& out) const {
+  // A limb whose two ticks are this far apart was placed, not moved (a
+  // respawn, the get-up's hand-over, a teleport): blending would draw it
+  // sweeping through the space between, so it is drawn where it is.
+  constexpr float kSnapVox = 12.0f;
+  constexpr float kSnapCos = 0.5f;  // quaternion dot: 120 degrees apart
+  const float a = std::clamp(renderAlpha_, 0.0f, 1.0f);
+  const bool blend = a < 1.0f && renderCur_.size() == limbs_.size() &&
+                     renderPrev_.size() == limbs_.size();
+  for (size_t i = 0; i < limbs_.size(); i++) {
+    const MobLimb& limb = limbs_[i];
+    if (!limb.body) continue;
+    if (out.size() >= kMaxBodySlots) return;
+    BodyTransform xf = limb.xf;
+    if (blend) {
+      const RenderKey& p = renderPrev_[i];
+      const RenderKey& c = renderCur_[i];
+      // Both ticks must be THIS limb (a slot re-filled since keeps its new
+      // body), and the current key must still be what xf says (it is, unless
+      // something placed the limb after the step).
+      const Quat now{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+      const Vec3 d = p.rel - c.rel;
+      if (p.body == limb.body && c.body == limb.body &&
+          std::fabs(QuatDot(c.rot, now)) > 0.9999f && d.len() < kSnapVox &&
+          std::fabs(QuatDot(p.rot, c.rot)) > kSnapCos) {
+        // xf.pos + renderOffset_ is the current key about the interpolated
+        // anchor; walking it back by (1 - a) of the step puts it at
+        // lerp(prev, cur, a) about that same anchor.
+        xf.pos = xf.pos + d * (1.0f - a);
+        const Quat q = QuatNlerp(p.rot, c.rot, a);
+        xf.quat[0] = q.x;
+        xf.quat[1] = q.y;
+        xf.quat[2] = q.z;
+        xf.quat[3] = q.w;
+      }
+    }
+    rigrender::AppendXform(out, xf, renderOffset_);
+  }
+}
+
 // ---- queries ----------------------------------------------------------------
 
 bool PlayerAvatar::PartWorldTransform(int part, Vec3& outPos,
