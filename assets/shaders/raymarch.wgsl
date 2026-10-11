@@ -4056,10 +4056,16 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
             cellTint = vec3f(1.0, 0.05, 0.05);
             cellOp = 1.0;
           }
-          if (out.mediaMat == 0u) {
+          // A LIQUID latches mediaMat/mediaSurf in the deferred interface
+          // record below, once the segment confirms the ray reached the fill
+          // line. Latching here let a ray that only grazed the AIR above a
+          // 1/8 cell (rd.y < 0, so liqInAir is false) stamp mediaSurf 0.125
+          // onto the lake surface it hit next: shadeWater faded that surface's
+          // Fresnel as a film, and the cell's whole cube showed up as an
+          // unreflective box (ticket 2026-10-11_16-29-01).
+          if (out.mediaMat == 0u && k != CLASS_LIQUID) {
             out.mediaMat = mat;
-            out.mediaSurf = select(1.0, f32(voxState(w) + 1u) / 8.0,
-                                   k == CLASS_LIQUID);
+            out.mediaSurf = 1.0;
           }
           if (k == CLASS_LIQUID) {
             cellLiq = 1.0;
@@ -4305,6 +4311,10 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
       // Deferred liquid-interface recording: only record liqT once the
       // segment confirms the ray actually entered water in this cell.
       if (out.liqT == 0.0 && waterFrac > 0.0) {
+        if (out.mediaMat == 0u) {
+          out.mediaMat = mat;   // marchCell is this iteration's cell
+          out.mediaSurf = wy - f32(marchCell.y);
+        }
         if (wy < f32(marchCell.y) + 1.0 - 1e-4 && y0 > wy + 1e-4) {
           // Entered above the fractional water surface — the interface is
           // at the Y plane where the ray descends to waterY.
