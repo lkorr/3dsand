@@ -307,6 +307,14 @@ struct Movement {
   // HEIGHT, within this many voxels of the anchor's (it then asks for that
   // altitude; the swim drive keeps it inside the water whatever it asks).
   float wanderDepth = 0.0f;
+  // FIGURE EIGHTS (2026-10-11): each leg may instead be `wanderFigure8Laps`
+  // laps of a figure eight round the anchor, `wanderFigure8Size` x the radius
+  // from the crossing to each loop's far end (which is also each loop's turn
+  // radius, so keep it above the body's turning circle). The chance is drawn
+  // per leg; 0 = never.
+  float wanderFigure8 = 0.0f;
+  float wanderFigure8Size = 0.8f;
+  float wanderFigure8Laps = 1.0f;
   // ---- TACTICAL FOOTWORK (2026-09-27) --------------------------------------
   // Dodge's drive, as a multiplier on walk speed (split between a back-step
   // and a side-step). Above 1 is a burst — a dodge at walking pace is not one.
@@ -545,7 +553,24 @@ struct OrbitTuning {
                                 // Approach (the band) brings it in
   uint32_t lapMin = 90;         // ticks of circling before a pass may begin...
   uint32_t lapMax = 200;        // ...drawn per lap
-  float reverseChance = 0.3f;   // per lap: turn round and pace the other way
+  float reverseChance = 0.3f;   // per lap (and per whim): turn round and pace
+                                // the other way
+  // THE RADIUS AS A RANGE (2026-10-11): when radiusMax > 0, each lap and each
+  // whim draws its radius uniformly in [radiusMin, radiusMax] instead of
+  // radius +- radiusJitter (`radius` stays the nominal: it switches the
+  // creature on and names its size). The body eases onto a new radius at
+  // `radiusEase` vox/s (0 = at once) so a redraw is a widening spiral, not a
+  // swerve.
+  float radiusMin = 0.0f;
+  float radiusMax = 0.0f;
+  float radiusEase = 0.0f;
+  // WHIMS: between lap ends, every whimMin..whimMax ticks (drawn) the lap
+  // redraws its radius and turns round with `reverseChance`. 0 = no whims.
+  uint32_t whimMin = 0;
+  uint32_t whimMax = 0;
+  // A spent lap ends in a pass with this chance, else it is another lap: a
+  // memoryless tail on the wait between passes, so they cannot be counted.
+  float chargeChance = 1.0f;
   // ---- the pass ----
   float chargeSpeed = 2.2f;     // x walk speed down the line (the body's own
                                 // burst ceiling still caps it: SwimDef::burst)
@@ -1143,6 +1168,9 @@ struct Brain {
   // counter-clockwise seen from above), and the tick a pass may start.
   // `orbitReadyAt` 0 = not armed (the first circling tick draws a lap).
   float orbitR = 0.0f;
+  float orbitRGoal = 0.0f;        // the drawn radius orbitR eases onto
+  uint32_t orbitWhimAt = 0;       // next whim (0 = none booked)
+  uint32_t orbitWhim = 0;         // whims drawn; their hash key
   float orbitH = 0.0f;
   int orbitSign = 0;
   uint32_t orbitReadyAt = 0;
@@ -1192,6 +1220,14 @@ struct Brain {
   uint32_t wanderLeg = 0;         // legs walked; the goal's hash key
   uint32_t wanderPauseUntil = 0;  // standing still (coiled) until this tick
   uint32_t wanderLegSince = 0;    // the tick this leg began (stuck guard)
+  // A figure-eight leg (Movement::wanderFigure8): the curve's centre, its
+  // axis heading, its half-width, and the carrot's parameter and end.
+  bool fig8 = false;
+  Vec3 fig8Centre{};
+  float fig8Rot = 0.0f;
+  float fig8A = 0.0f;
+  float fig8Phase = 0.0f;
+  float fig8End = 0.0f;
 
   void Reset() {
     *this = Brain{profile};

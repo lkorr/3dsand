@@ -285,9 +285,12 @@ TuneMode TuneModeOf(Tune t) {
 //     // ---- the swimmers (2026-10-10); every key optional --------------------
 //     // perception: "minImmersion" (a target must be this wet), "scentRange",
 //     //             "scentPull" (a bleeding body in the water, felt unseen)
-//     // movement.wander: "depth" (a volumetric body draws each leg's height)
+//     // movement.wander: "depth" (a volumetric body draws each leg's height),
+//     //             "figure8", "figure8Size", "figure8Laps" (Movement)
 //     "orbit": { "radius": 19, "speed": 0.7, "height": 6, "engage": 2.0,
 //                "lapMin": 150, "lapMax": 320, "reverseChance": 0.4,
+//                "radiusMin": 31, "radiusMax": 104, "radiusEase": 18,
+//                "whimMin": 60, "whimMax": 240, "chargeChance": 0.7,
 //                "chargeSpeed": 2.6, "turnInSpeed": 1.0, "lineUp": 0.45,
 //                "lead": 0.8, "lockDist": 5, "overrun": 14, "peel": 0.55,
 //                "biteCone": 0.6, "biteLead": 7, ... },   // OrbitTuning
@@ -487,6 +490,12 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
             std::max(pr.movement.wanderPauseMin, w.value("pauseMax", 180u));
         pr.movement.wanderArrive = std::max(0.5f, w.value("arrive", 2.0f));
         pr.movement.wanderDepth = std::max(0.0f, w.value("depth", 0.0f));
+        pr.movement.wanderFigure8 =
+            std::clamp(w.value("figure8", 0.0f), 0.0f, 1.0f);
+        pr.movement.wanderFigure8Size =
+            std::clamp(w.value("figure8Size", 0.8f), 0.1f, 2.0f);
+        pr.movement.wanderFigure8Laps =
+            std::clamp(w.value("figure8Laps", 1.0f), 0.25f, 8.0f);
       }
     }
     if (p.contains("attack")) {
@@ -550,6 +559,12 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
       o.lapMin = q.value("lapMin", 90u);
       o.lapMax = std::max(o.lapMin, q.value("lapMax", 200u));
       o.reverseChance = std::clamp(q.value("reverseChance", 0.3f), 0.0f, 1.0f);
+      o.radiusMin = std::max(0.0f, q.value("radiusMin", 0.0f));
+      o.radiusMax = std::max(o.radiusMin, q.value("radiusMax", 0.0f));
+      o.radiusEase = std::max(0.0f, q.value("radiusEase", 0.0f));
+      o.whimMin = q.value("whimMin", 0u);
+      o.whimMax = std::max(o.whimMin, q.value("whimMax", 0u));
+      o.chargeChance = std::clamp(q.value("chargeChance", 1.0f), 0.0f, 1.0f);
       o.chargeSpeed = std::max(0.0f, q.value("chargeSpeed", 2.2f));
       o.turnInSpeed = std::max(0.0f, q.value("turnInSpeed", 1.0f));
       o.lineUp = std::clamp(q.value("lineUp", 0.45f), 0.02f, 3.0f);
@@ -725,6 +740,11 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
         << (p.movement.wanderDepth > 0.0f
                 ? ", \"depth\": " + num(p.movement.wanderDepth)
                 : std::string())
+        << (p.movement.wanderFigure8 > 0.0f
+                ? ", \"figure8\": " + num(p.movement.wanderFigure8) +
+                      ", \"figure8Size\": " + num(p.movement.wanderFigure8Size) +
+                      ", \"figure8Laps\": " + num(p.movement.wanderFigure8Laps)
+                : std::string())
         << " }";
     o << " },\n";
     o << "      \"attack\": { \"styles\": [";
@@ -765,6 +785,11 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
         << ", \"engage\": " << num(t.engage)
         << ", \"lapMin\": " << t.lapMin << ", \"lapMax\": " << t.lapMax
         << ", \"reverseChance\": " << num(t.reverseChance)
+        << ", \"radiusMin\": " << num(t.radiusMin)
+        << ", \"radiusMax\": " << num(t.radiusMax)
+        << ", \"radiusEase\": " << num(t.radiusEase)
+        << ", \"whimMin\": " << t.whimMin << ", \"whimMax\": " << t.whimMax
+        << ", \"chargeChance\": " << num(t.chargeChance)
         << ", \"chargeSpeed\": " << num(t.chargeSpeed)
         << ", \"turnInSpeed\": " << num(t.turnInSpeed)
         << ", \"lineUp\": " << num(t.lineUp)
@@ -1429,6 +1454,45 @@ namespace {
 // target -- a shark that has just driven through you curves round and comes
 // back, it does not reverse on the spot. Between passes a lap may turn round
 // (`reverseChance`): that is the pacing back and forth.
+//
+// A lap's radius from one uniform draw: the [radiusMin, radiusMax] range when
+// the profile gives one, else radius +- radiusJitter. Never tighter than most
+// of the body's own length: an orbit inside it is a creature chasing its tail.
+float LapRadius(const OrbitTuning& ob, const SelfView& self, float u) {
+  const float r = ob.radiusMax > 0.0f
+                      ? ob.radiusMin + (ob.radiusMax - ob.radiusMin) * u
+                      : ob.radius * (1.0f + ob.radiusJitter * (2.0f * u - 1.0f));
+  return std::max(r, std::max(2.0f, self.length * 0.75f));
+}
+
+// The next whim (OrbitTuning::whimMin..whimMax ticks out), or none.
+void BookWhim(Brain& b, const OrbitTuning& ob, const SelfView& self,
+              uint32_t tick) {
+  if (ob.whimMax == 0) {
+    b.orbitWhimAt = 0;
+    return;
+  }
+  b.orbitWhim++;
+  const uint32_t h = rng::Hash3((uint32_t)self.id ^ kSaltOrbit, b.orbitWhim, 21u);
+  const uint32_t span = ob.whimMax - ob.whimMin + 1u;
+  b.orbitWhimAt = tick + std::max(1u, ob.whimMin + h % std::max(1u, span));
+}
+
+// A WHIM, mid-lap: a new radius to ease onto and maybe the other way round.
+// The lap's clock (orbitReadyAt) is untouched -- a whim changes how it
+// circles, not when it strikes.
+void Whim(Brain& b, const OrbitTuning& ob, const SelfView& self,
+          uint32_t tick) {
+  const uint32_t h = rng::Hash3((uint32_t)self.id ^ kSaltOrbit, b.orbitWhim, 22u);
+  b.orbitRGoal = LapRadius(ob, self, (float)(h & 0xFFFFu) / 65535.0f);
+  if (ob.radiusEase <= 0.0f) b.orbitR = b.orbitRGoal;
+  if ((float)(h >> 16) / 65535.0f < ob.reverseChance) {
+    b.orbitSign = -b.orbitSign;
+    b.reversals++;
+  }
+  BookWhim(b, ob, self, tick);
+}
+
 void DrawLap(Brain& b, const OrbitTuning& ob, const SelfView& self,
              uint32_t tick, bool followBody) {
   b.orbitLap++;
@@ -1437,13 +1501,12 @@ void DrawLap(Brain& b, const OrbitTuning& ob, const SelfView& self,
   const float u1 = (float)(h1 & 0xFFFFu) / 65535.0f;
   const float u2 = (float)((h1 >> 16) & 0xFFFFu) / 65535.0f;
   const float u3 = (float)(h2 & 0xFFFFu) / 65535.0f;
-  // Never tighter than most of the body's own length: an orbit inside it is a
-  // creature chasing its tail.
-  b.orbitR = std::max(ob.radius * (1.0f + ob.radiusJitter * (2.0f * u1 - 1.0f)),
-                      std::max(2.0f, self.length * 0.75f));
+  b.orbitRGoal = LapRadius(ob, self, u1);
+  if (b.orbitR <= 0.0f || ob.radiusEase <= 0.0f) b.orbitR = b.orbitRGoal;
   b.orbitH = ob.height + ob.heightJitter * (2.0f * u2 - 1.0f);
   const uint32_t span = ob.lapMax - ob.lapMin + 1u;
   b.orbitReadyAt = tick + ob.lapMin + (h2 >> 16) % std::max(1u, span);
+  BookWhim(b, ob, self, tick);
   if (followBody || b.orbitSign == 0) {
     // Which way round is the body already going: the tangential share of its
     // facing. sin(heading - bearing-from-target) > 0 is the bearing growing.
@@ -1921,16 +1984,33 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
     brain.orbitBearingValid = false;
   } else if (orbiter) {
     if (brain.orbitReadyAt == 0) DrawLap(brain, ob, self, tick, true);
+    // The radius eases onto its draw (OrbitTuning::radiusEase).
+    if (brain.orbitR != brain.orbitRGoal) {
+      const float step = ob.radiusEase * dt;
+      const float gap = brain.orbitRGoal - brain.orbitR;
+      brain.orbitR = std::abs(gap) <= step || step <= 0.0f
+                         ? brain.orbitRGoal
+                         : brain.orbitR + (gap > 0.0f ? step : -step);
+    }
     const float engageR = brain.orbitR * ob.engage;
     if (brain.passPhase != 0) {
       raw[(int)Intent::Charge] = 1.0f;
     } else {
       raw[(int)Intent::Orbit] = d <= engageR ? 1.0f : 0.25f;
+      if (brain.orbitWhimAt != 0 && tick >= brain.orbitWhimAt)
+        Whim(brain, ob, self, tick);
+      // Whether this lap ends in a pass is one draw per lap, so it holds
+      // steady while the arbiter weighs it.
+      const bool lapStrikes =
+          ob.chargeChance >= 1.0f ||
+          (float)(rng::Hash3((uint32_t)self.id ^ kSaltOrbit, brain.orbitLap,
+                             13u) & 0xFFFFu) / 65535.0f < ob.chargeChance;
       if (tick >= brain.orbitReadyAt) {
-        if (brain.visible && (tick >= readyAt || riposteNow) && d <= engageR)
+        if (lapStrikes && brain.visible && (tick >= readyAt || riposteNow) &&
+            d <= engageR)
           raw[(int)Intent::Charge] = 1.0f;
-        // A spent lap with no pass to throw (the clock, the line of sight)
-        // is another lap -- and maybe the other way round.
+        // A spent lap with no pass to throw (the clock, the line of sight,
+        // the lap's own draw) is another lap -- and maybe the other way round.
         else
           DrawLap(brain, ob, self, tick, false);
       }
@@ -1972,6 +2052,15 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
                rng::Hash3((uint32_t)self.id ^ 0x3A11D3u, brain.wanderLeg, 7u) %
                    std::max(1u, span);
       };
+      // The figure eight: x = a sin t, z = a/2 sin 2t in its own frame -- two
+      // loops of turn radius `a` meeting in a straight crossing.
+      auto fig8At = [&](float t) {
+        const float lx = brain.fig8A * std::sin(t);
+        const float lz = 0.5f * brain.fig8A * std::sin(2.0f * t);
+        const float cr = std::cos(brain.fig8Rot), sr = std::sin(brain.fig8Rot);
+        return Vec3{brain.fig8Centre.x + lx * cr - lz * sr, brain.fig8Centre.y,
+                    brain.fig8Centre.z + lx * sr + lz * cr};
+      };
       auto newGoal = [&]() {
         brain.wanderLeg++;
         const uint32_t h =
@@ -1990,6 +2079,29 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
         brain.wanderGoal = Vec3{brain.wanderAnchor.x + std::cos(ang) * d, gy,
                                 brain.wanderAnchor.z + std::sin(ang) * d};
         brain.wanderLegSince = tick;
+        // ...or a FIGURE EIGHT round the anchor, at that height, its axis
+        // turned by the leg's draw, entered at the curve's point nearest the
+        // body so it does not first swim across to the start.
+        brain.fig8 = false;
+        if (mv.wanderFigure8 > 0.0f) {
+          const uint32_t hf =
+              rng::Hash3((uint32_t)self.id ^ 0x3A11D3u, brain.wanderLeg, 13u);
+          if ((float)(hf & 0xFFFFu) / 65535.0f < mv.wanderFigure8) {
+            brain.fig8 = true;
+            brain.fig8Centre = Vec3{brain.wanderAnchor.x, gy, brain.wanderAnchor.z};
+            brain.fig8Rot = (float)(hf >> 16) * (6.2831853f / 65536.0f);
+            brain.fig8A = mv.wanderRadius * mv.wanderFigure8Size;
+            float best = 1e30f, bestT = 0.0f;
+            for (int k = 0; k < 64; k++) {
+              const float t = (float)k * (6.2831853f / 64.0f);
+              const float dd = PlanarDist(foot, fig8At(t));
+              if (dd < best) best = dd, bestT = t;
+            }
+            brain.fig8Phase = bestT;
+            brain.fig8End = bestT + 6.2831853f * mv.wanderFigure8Laps;
+            brain.wanderGoal = fig8At(bestT);
+          }
+        }
       };
       // Rest, then walk the next leg; the leg's clock starts when the rest
       // ends, so the stuck guard below never counts standing still.
@@ -2005,16 +2117,34 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       // wall, a drop, a crowd): give it up like an arrival.
       const float legSpeed =
           std::max(0.5f, self.speed * std::max(0.05f, mv.wanderSpeed));
+      // (A figure eight's lap is ~6.1 a long.)
+      const float legLen = brain.fig8
+                               ? 6.1f * brain.fig8A * mv.wanderFigure8Laps
+                               : 2.0f * mv.wanderRadius;
       const uint32_t legBudget =
-          (uint32_t)(2.0f * 30.0f * (2.0f * mv.wanderRadius) / legSpeed) + 60u;
+          (uint32_t)(2.0f * 30.0f * legLen / legSpeed) + 60u;
       const bool resting = tick < brain.wanderPauseUntil;
-      if (!resting && (dist <= mv.wanderArrive ||
-                       tick - brain.wanderLegSince > legBudget))
+      if (brain.fig8 && !resting) {
+        // A carrot on the curve: it moves on while the body is within `look`
+        // of it, so the eight is swum at the body's own pace.
+        const float look = std::max(2.0f * mv.wanderArrive, 0.3f * brain.fig8A);
+        for (int k = 0; k < 64 && brain.fig8Phase < brain.fig8End &&
+                        PlanarDist(foot, fig8At(brain.fig8Phase)) < look;
+             k++)
+          brain.fig8Phase += 0.04f;
+        brain.wanderGoal = fig8At(brain.fig8Phase);
+        if (brain.fig8Phase >= brain.fig8End ||
+            tick - brain.wanderLegSince > legBudget)
+          restThenWalk();
+      } else if (!resting && (dist <= mv.wanderArrive ||
+                              tick - brain.wanderLegSince > legBudget)) {
         restThenWalk();
+      }
       r.active = true;
       r.verb = Intent::Wander;
       r.goal = brain.wanderGoal;
-      r.final = true;
+      // A figure eight's goal is a carrot, never a place to arrive and slow.
+      r.final = !brain.fig8;
       r.arriveRadius = mv.wanderArrive;
       r.speed = mv.wanderSpeed;
       r.hold = tick < brain.wanderPauseUntil;

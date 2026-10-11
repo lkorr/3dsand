@@ -15067,7 +15067,16 @@ verb set so every older profile is untouched:
   as it circles), its length (`lapMin..lapMax` ticks before a pass may begin),
   and its direction -- the way the body is already going on the first lap and
   after a pass, and turned round with `reverseChance` between passes: the
-  pacing back and forth.
+  pacing back and forth. With `radiusMax` set the radius is drawn uniformly
+  in `radiusMin..radiusMax` instead (the shark: 31..104, 1.2x..4x its nominal
+  26), and the body eases onto each draw at `radiusEase` vox/s, so a redraw is
+  a spiral out or in rather than a swerve. WHIMS (`whimMin..whimMax` ticks,
+  drawn) redraw the radius and roll `reverseChance` mid-lap without touching
+  the lap's clock; and a spent lap ends in a pass only with `chargeChance`,
+  else it is another lap -- a memoryless tail on the wait between passes.
+  (Idle, `movement.wander.figure8` makes a share of the wander legs laps of a
+  figure eight round the anchor -- `x = a sin t, z = a/2 sin 2t`, chased as a
+  carrot that moves on while the body is near it.)
 - **Charge**: the pass. (1) TURN-IN: curve off the circle toward where the
   target WILL be (`lead` of its motion over the run), at `turnInSpeed` but no
   faster than the speed whose turning circle reaches it (`v = 0.65 w d /

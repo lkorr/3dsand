@@ -324,15 +324,21 @@ Status GateAquatic(Ctx& c, std::string& detail) {
   const uint64_t dry = spawnVictim(padTop);
   const uint64_t shark2 = spawnAt(dShark, poolC + Vec3{-10.0f, 7.0f, 0.0f});
   int targeted = 0;
-  Vec3 cStart{}, cEnd{};
-  if (const Mob* m = mobs.FindMobById(shark2)) cStart = CentreOf(*m);
+  // PATROLLED = the path swum, not start-to-end: a figure-eight wander leg
+  // (movement.wander.figure8) is a closed loop that ends where it began.
+  Vec3 cPrev{};
+  float patrol = 0.0f;
+  if (const Mob* m = mobs.FindMobById(shark2)) cPrev = CentreOf(*m);
   const int kMedium = (int)BaselineNumber("aquaticMediumTicks", 360);
   for (int i = 0; i < kMedium; i++) {
     support::RunTicks(rig, 1);
     if (const ai::Brain* b = mobs.MobBrain(shark2); b && b->hasTarget) targeted++;
+    if (const Mob* m = mobs.FindMobById(shark2)) {
+      const Vec3 cNow = CentreOf(*m);
+      patrol += (cNow - cPrev).len();
+      cPrev = cNow;
+    }
   }
-  if (const Mob* m = mobs.FindMobById(shark2)) cEnd = CentreOf(*m);
-  const float patrol = (cEnd - cStart).len();
   const bool cOk = dry != 0 && targeted == 0 && patrol >= 6.0f;
 
   // ======== D. OUT OF THE WATER ==============================================
