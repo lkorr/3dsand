@@ -1087,6 +1087,9 @@ static void PhaseB(TickAuthorityCtx& w, WorldScratch& ws,
         // reason: what it trades against is the sieve's per-entry GPU cost,
         // which a shader edit can move by more than 2x without a rebuild.
         far.SetPlaneCap((uint32_t)CurrentTuning().render.farPlaneFillRate);
+        // ...and the smallest slice a tick that fills planes at all takes
+        // (Tuning::Render::farPlaneBatch: a far tick has a fixed cost).
+        far.SetPlaneBatch((uint32_t)CurrentTuning().render.farPlaneBatch);
         // far-field cascades track the same interest set (render-only)
         if (!farBlind && !w.harness.pinWindow && !w.harness.farInert)
           far.Update(interest);

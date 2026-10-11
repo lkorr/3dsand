@@ -79,6 +79,12 @@ class FarField {
   void SetPlaneCap(uint32_t n) {
     planeCap_ = n ? (n > kFarListCap ? kFarListCap : n) : 1u;
   }
+  // The smallest slice a tick with plane work takes when its deadlines would
+  // allow less (render.farPlaneBatch; PLANE PACING below has why a slice has
+  // a floor at all).
+  void SetPlaneBatch(uint32_t n) {
+    planeBatch_ = n ? (n > kFarListCap ? kFarListCap : n) : 1u;
+  }
 
   // ---- AT MOST ONE BULK SLICE PER FRAME ----------------------------------
   // Stream::BeginFrame's rule (stream.h R4), for the same reason and with the
@@ -142,6 +148,9 @@ class FarField {
   uint64_t RefillsIssued() const { return refills_; }
   uint64_t GapResetsIssued() const { return gapResets_; }
   uint64_t PlanesIssued() const { return planes_; }
+  // Surface-map COLUMNS dispatched (entries carrying kFarListMapBit): the
+  // `farmap` pass's whole workload, which is per column and not per entry.
+  uint64_t MapColsIssued() const { return mapCols_; }
   // The largest origin gap Update has had to close, in level chunks, and the
   // level it happened on. kFarNChunk is where a step becomes a reset.
   uint32_t WorstGap() const { return worstGap_; }
@@ -209,6 +218,25 @@ class FarField {
   // (the UBO is written at the top of the NEXT PrepareTick), never early.
   uint32_t FaceWord(uint32_t k) const;   // the packed w (the selftest reads it)
 
+  // ---- IS A LEVEL HANDING OFF ON ITS BOX FACE? (2026-10-11) ---------------
+  // traceFar hands level k to k+1 on a SPHERE about the eye of
+  // (kFarNChunk/2 - margin) level chunks (raymarch.wgsl
+  // FAR_SPHERE_MARGIN_CHUNKS), unless the VALID box face is nearer, in which
+  // case the handoff is that face: a flat plane, drawn as a straight seam
+  // line (owner ticket 2026-10-11_12-10-09). This is the distance, in fine
+  // voxels, from `eyeVox` to level k's (0-based) nearest valid face, so the
+  // harness can count the frames a seam would show at a given margin; < 0
+  // when the level has no valid box (a reset in flight).
+  float NearestValidFaceVox(uint32_t k, const float eyeVox[3]) const;
+  // The sphere radius at margin `m`, fine voxels, for level k (0-based).
+  static float HandoffSphereVox(uint32_t k, int m) {
+    return (float)(((int)kFarNChunk / 2 - m) * (int)kChunk) *
+           (float)(1u << (k + 1 + kFarShiftBase));
+  }
+  // raymarch.wgsl / ray_start.wgsl FAR_SPHERE_MARGIN_CHUNKS, mirrored for the
+  // harness's count only (nothing renders from this one).
+  static constexpr int kSphereMarginChunks = 3;
+
  private:
   void ResetLevel(uint32_t k, IVec3 desired);        // origin jump + full refill
   // Drop everything level k still has queued. Only ResetLevel calls it, and
@@ -222,7 +250,15 @@ class FarField {
   // One incoming plane. `skipSa[a]` >= 0 names the slot layer an EARLIER
   // plane of the same Update already queued on axis a (a diagonal step): the
   // line where the two planes cross is queued once, by the earlier plane.
-  void EnqueuePlane(uint32_t k, int axis, int wcoord, const int skipSa[3]);
+  // `due` is the tick by which its last entry must be dispatched (PlaneDue).
+  void EnqueuePlane(uint32_t k, int axis, int wcoord, const int skipSa[3],
+                    uint64_t due);
+  // The tick a plane stepped NOW on (level k, axis) must have landed by, from
+  // how often that face has been stepping (PLANE PACING, below).
+  uint64_t PlaneDue(uint32_t k, int axis);
+  // Entries the play path pops this tick: the least that still lands every
+  // queued plane by its due tick, never more than planeCap_.
+  uint32_t PlaneQuota() const;
   void Enqueue(uint32_t k, uint32_t slot);           // queue + per-level counter
   // A direction reversal on `axis` makes the newest pending plane with slot
   // layer `sa` redundant: drop its remaining entries and release its face.
@@ -249,6 +285,7 @@ class FarField {
     int sa;              // slot layer on `axis`; -1 for a reset
     uint32_t remaining;  // entries of this plane still in queue_[level]
     uint32_t epoch;      // epoch_[level] when queued; stale after a reset
+    uint64_t due;        // tick its last entry must go by (0 = at once: a reset)
   };
   std::deque<PlaneRec> recs_[kFarLevels];
   uint32_t faces_[kFarLevels][3][2] = {};  // planes queued per level face
@@ -315,6 +352,53 @@ class FarField {
   // DEFAULT now, not a constant: render.farPlaneFillRate owns it, so the next
   // time the sieve's cost moves this does not need a rebuild to follow.
   static constexpr uint32_t kPlayFillCap = 256;
+  // ---- PLANE PACING: A DEADLINE, NOT A BURST (2026-10-11) -----------------
+  // Owner ticket 2026-10-11_12-10-09: hitches flying at NORMAL speed. With the
+  // cap at 1,024 every incoming plane landed in ONE tick, and the in-flight
+  // harness (`--frames` worst-frame table, SANDVOX_AT_FLY=13.75,0,0) measured
+  // what one tick of plane costs: farFill 28-50 ms + farMapFill 27-33 ms +
+  // farCoverFill 4-13 ms, i.e. 75-97 ms of GPU, against 7.7 planes a second at
+  // 13.75 m/s — every frame that took one was a 100-215 ms frame, and 77 of
+  // 595 frames took one. The cap was right about what it was raised for (a
+  // plane that does not land before the next one queues is a backlog, and a
+  // backlog is the coalesced reset of 2026-10-08) and wrong about WHEN the
+  // work has to happen: a plane has until the player crosses the next level
+  // chunk on that axis — that is when the box steps again and the face this
+  // plane is excluding comes inside the handoff sphere (raymarch.wgsl
+  // FAR_SPHERE_MARGIN_CHUNKS) — and level 1 at a fly crosses one every ~7
+  // ticks, level 2 every ~14, level 3 every ~28.
+  //
+  // So every plane carries a DUE tick and the play path pops the least that
+  // lands every queued plane by its due (PlaneQuota: the max over the queue,
+  // in drain order, of entries-ahead / ticks-left), capped at planeCap_. The
+  // due is half the face's measured step period (PlaneDue): the plane lands
+  // while the player is at most half-way across the chunk, which keeps the
+  // excluded slab outside the sphere with the other half to spare, and the
+  // coarser levels — whose planes cost the same per entry and cross half as
+  // often — spread over twice as many ticks each. The MEAN is untouched
+  // (the same entries, the same ticks); what moves is that a 1,024-entry
+  // plane becomes ~150 entries a tick instead of 1,024 at once.
+  static constexpr uint32_t kPlaneDefaultDue = 4;     // ticks, no step history
+  static constexpr uint32_t kPlaneMaxDue = 30;        // ticks (1 s): never longer
+  static constexpr uint32_t kPlanePeriodForget = 120; // ticks: older = a fresh start
+  // ---- ...AND A FLOOR UNDER THE SLICE: a far tick has a FIXED cost --------
+  // Paced at the bare deadline rate a level-1 plane went out ~150 entries a
+  // tick, and every one of those ticks paid the far passes' fixed latency —
+  // the slowest workgroup of each of farFill / farCoverFill / farMapFill, in
+  // series. Fitted from the same harness (SANDVOX_FRAMES_CSV, after the sweep
+  // went to four lanes a word): farFill 4.0 ms + 4.9 us/entry, farCoverFill
+  // 2.3 ms + 3.5 us/entry, farMapFill 2.8 ms + 95 us/column — ~9 ms a tick
+  // before the first entry. So the quota is never less than planeBatch_
+  // (or what is queued): a plane goes out in four slices of 256, not seven
+  // of ~150, and lands sooner, which is the direction the seam wants anyway.
+  // And X planes queue their surface-map columns FIRST (EnqueuePlane), so
+  // only a plane's first slice pays farMapFill. (`farcover` then went to four
+  // lanes as well and its fixed cost fell to ~1.2 ms; Tuning::Render::
+  // farPlaneBatch has the measured arms.)
+  uint32_t planeBatch_ = 256;
+  uint64_t tick_ = 0;                                 // PrepareTick(drain) calls
+  uint64_t lastStep_[kFarLevels][3] = {};             // tick + 1; 0 = never
+  uint32_t period_[kFarLevels][3] = {};               // ticks between steps; 0 = unknown
   // THE RESET CAP, and why it is no longer kFarListCap in the game
   // (2026-09-10). A full refill is kFarLevels x kFarNumChunks = 262,144 sieve
   // entries. kFarListCap (4,096) slices that into 64 ticks of 267 ms —
@@ -329,6 +413,7 @@ class FarField {
   uint32_t bulkCap_ = kFarListCap;
   uint64_t resets_ = 0, gapResets_ = 0, planes_ = 0, refills_ = 0;
   uint64_t coalesced_ = 0;
+  uint64_t mapCols_ = 0;
   uint64_t reversalDrops_ = 0, edgeDedupes_ = 0;
   uint32_t worstGap_ = 0, worstGapLevel_ = 0;
   uint32_t planeCap_ = kPlayFillCap;

@@ -1071,6 +1071,7 @@ const TUNING_PARAMS = {
   'render.fogLerpPerFrame':{t:'f',def:0.08,min:0.005,max:1},
   'render.farRefillRate':{t:'i',def:1024,min:1,max:4096},
   'render.farPlaneFillRate':{t:'i',def:1024,min:1,max:4096},
+  'render.farPlaneBatch':{t:'i',def:256,min:1,max:4096},
   'render.renderScale':{t:'f',def:1,min:0.25,max:1},
   'render.maxRenderMPix':{t:'f',def:1.5,min:0,max:16},
   'render.upscaleLinear':{t:'i',def:1,min:0,max:1},

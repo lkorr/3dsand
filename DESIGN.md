@@ -16021,9 +16021,43 @@ where you hear from either (§12b, "The ears are on the character").
   Levels are filled on the GPU by sampling `genCell()` at stride
   (worldgen.wgsl `far` — the "sieve"), recentered with hysteresis like the
   streaming window, and refilled a plane at a time (managed by
-  `sim/farfield`; planes drain at `render.farPlaneFillRate` (256) in play, a
-  wholesale reset at `render.farRefillRate` in the game and at `kFarListCap`
-  in the headless drain loops).
+  `sim/farfield`; planes drain on DEADLINES in play — at least
+  `render.farPlaneBatch` (256), at most `render.farPlaneFillRate` (1024) a
+  tick, see "Plane fills are paced" below — a wholesale reset at
+  `render.farRefillRate` in the game and at `kFarListCap` in the headless
+  drain loops).
+  **Plane fills are paced, and the far passes are four lanes wide
+  (2026-10-11).** Owner ticket 2026-10-11_12-10-09: hitches flying at normal
+  speed. The in-flight harness (`SANDVOX_AT_FLY`, plus
+  `SANDVOX_FRAMES_STATS_FROM` to cut the startup refill out of the
+  percentiles and the `--frames` worst-frame table / `SANDVOX_FRAMES_CSV`
+  that say what each slow frame dispatched) put every one of the 100-215 ms
+  frames on a tick that filled a whole plane: 1,024 entries at once was
+  75-97 ms of GPU (farFill 28-50 + farMapFill 27-33 + farCoverFill 4-13), 7.7
+  times a second at 13.75 m/s. Three causes, three fixes. (1) Each far pass
+  cost the latency of its SLOWEST workgroup, not its entry count — a fit of
+  the per-frame rows gave farFill ~8.7 ms + 9 us/entry — because one thread
+  built four columns (the sweep, `farcover`) or sixteen sub-columns
+  (`farmap`, which also ran only 32 workgroups a plane) in series: `far` and
+  `farcover` are now 256 threads, one column per lane, assembling each
+  farVox word in workgroup memory (`far`) or with byte-masked atomics
+  (`farcover`), and `farmap` is dispatched 16 workgroups deep per entry (one
+  sub-column per thread); same calls, same bytes. (2) A plane landed in one
+  tick although it has until the player crosses the next level chunk on
+  that axis (the moment the face would come inside the handoff sphere):
+  `FarField` stamps each plane with a DUE tick, half the face's measured
+  step period (`PlaneDue`), and pops the least that meets every due in
+  drain order (`PlaneQuota`), never more than `farPlaneFillRate`. (3) A far
+  tick still has a few ms of fixed cost, so a tick that fills at all takes
+  at least `render.farPlaneBatch` entries, and an X plane queues its 32
+  surface-map columns first so only its first slice runs `farMapFill`'s
+  heavy path. Same harness, 595 frames of flight: frame mean 21.7 -> 17.5
+  ms, p95 77 -> 38, p99 93 -> 48, frames over 50 ms 73 -> 5, total far GPU
+  4.05 -> 2.64 s (the arms are on `Tuning::Render::farPlaneBatch`).
+  `SANDVOX_FAR_NO_PACING=1` is the unpaced A/B arm. What is left is the MEAN:
+  ~33 us of GPU per entry across the passes, most of it the 32 entries of a
+  level-chunk column each recomputing the same 256 column prologues — the
+  far column cache below is still the lever.
   **The sieve skips the sky (2026-09-12).** `far` ran a full `genCellCol` for
   all 4,096 cells of a level chunk whatever its altitude, and a level box is
   `kFarN` cells tall — 13 km at level 8 against a few hundred metres of
@@ -16257,18 +16291,18 @@ where you hear from either (§12b, "The ears are on the character").
   window over the 512³ far grid; this table said 1 until 2026-09-28, which was
   stale since kFarN went 512) and `kVoxelMeters = 0.10` that gives (level:
   cell size, where it hands the ray to the next level — a SPHERE about the
-  eye, 14 level chunks (the box half less the recentre hysteresis; the box
-  itself is 16 chunks half — see "each level hands off on a sphere" below) —
-  and the smallest edit it can show):
+  eye, 13 level chunks (the box half less the recentre hysteresis less one
+  chunk for a plane in flight; the box itself is 16 chunks half — see "each
+  level hands off on a sphere" below) — and the smallest edit it can show):
 
   | level | cell | hands off at (box half) | smallest visible edit |
   |---|---|---|---|
-  | 1 | 2 vox (0.2 m) | 44.8 m (51 m) | ~0.2 m — a brush stroke |
-  | 2 | 4 vox (0.4 m) | 90 m (102 m) | ~0.4 m — a doorway |
-  | 3 | 8 vox (0.8 m) | 179 m (205 m) | ~0.8 m — a small crater |
-  | 4 | 16 vox (1.6 m) | 358 m (410 m) | ~1.6 m — a room, a big blast |
-  | 5 | 32 vox (3.2 m) | 717 m (819 m) | ~3 m — a tower, a quarry |
-  | 6–8 | 64–256 vox | 1.4–2.9 km, level 8 its box (6.6 km) | 6–26 m — terrain-scale work only |
+  | 1 | 2 vox (0.2 m) | 41.6 m (51 m) | ~0.2 m — a brush stroke |
+  | 2 | 4 vox (0.4 m) | 83 m (102 m) | ~0.4 m — a doorway |
+  | 3 | 8 vox (0.8 m) | 166 m (205 m) | ~0.8 m — a small crater |
+  | 4 | 16 vox (1.6 m) | 333 m (410 m) | ~1.6 m — a room, a big blast |
+  | 5 | 32 vox (3.2 m) | 666 m (819 m) | ~3 m — a tower, a quarry |
+  | 6–8 | 64–256 vox | 1.3–2.7 km, level 8 its box (6.6 km) | 6–26 m — terrain-scale work only |
 
   The SURFACE of pristine terrain is no longer bound by this table: the far
   surface map below draws each surface cell as its 2x2 true-height
@@ -16580,10 +16614,23 @@ where you hear from either (§12b, "The ears are on the character").
     hash replaced, with the dither off (split-screen A/B in one frame) and
     with the refine at 0, 2 and 8. A sphere is crossed head-on by every ray,
     so the flip is a circle the dither dissolves. Radius = box half less the
-    2-chunk recentre hysteresis (14 level chunks; 13, one chunk more margin,
-    was tried first and cost 8% of every level's range), so a settled plane
-    refill lands beyond the handoff; a plane still queued pulls the valid face
-    in for the few ticks it takes to land. The outermost level keeps its box.
+    2-chunk recentre hysteresis less ONE MORE chunk (13 level chunks,
+    `FAR_SPHERE_MARGIN_CHUNKS` 3, in `raymarch.wgsl` and `ray_start.wgsl`).
+    It was 14 from 2026-09-28 (13 had been tried first and cost 8% of every
+    level's range), on the reading that "a plane still queued pulls the valid
+    face in for the few ticks it takes to land". It does, and those ticks are
+    the bug: a landed leading face is 14..15 chunks out, a QUEUED one 13..14,
+    i.e. inside a 14-chunk sphere, so for every step of every level the level
+    handed off on its flat box face instead of the sphere. Owner ticket
+    2026-10-11_12-10-09, flying: "three expanding lines where different
+    stages of the lod seam are" — levels 1, 2 and 3. The `--frames` harness
+    counts it now (`box-face handoffs`, `FarField::NearestValidFaceVox`): at
+    the ticket's camera, 595 frames of flight at 13.75 m/s, a 14-chunk sphere
+    was breached in 41 / 52 / 46 frames on levels 1 / 2 / 3 with the old
+    one-tick plane fills and ~200+ each once the fills are paced (below); a
+    13-chunk sphere in 0. The 13-chunk sphere holds as long as a plane lands
+    within one level chunk of travel, which the plane pacing schedules for.
+    The outermost level keeps its box.
   - A traversal bug found on the way (not the moire): a level whose step
     budget died inside a chunk's cell walk handed the next level the NEXT
     chunk's entry, leaving up to 16 cells marched by nobody. Fixed (`tDied`).

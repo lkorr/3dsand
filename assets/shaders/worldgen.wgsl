@@ -7075,14 +7075,37 @@ var<workgroup> wgFarCov : atomic<u32>;
 // `fardownFeat`'s loose-top pass: 1 when the chunk, or the bottom row of the
 // chunk above it, holds LOOSE matter (farIsLoose, the rule's prefilter).
 var<workgroup> wgFarLay : atomic<u32>;
+// `far`'s output words while its four column lanes assemble them: word
+// (owner, row) at owner * CHUNK + row, each lane OR-ing in its own byte (see
+// FOUR LANES PER WORD below).
+const FAR_SWEEP_OWNERS : u32 = 64u;
+var<workgroup> wgFarWords : array<atomic<u32>, FAR_SWEEP_OWNERS * CHUNK>;
 
-@compute @workgroup_size(64)
+// ---- FOUR LANES PER WORD (2026-10-11) ---------------------------------------
+// The sweep was 64 threads per entry, each owning one farVox word per row and
+// building its FOUR columns in series. Its cost was then the latency of one
+// thread's four column prologues, not the entry count: fitting the in-flight
+// harness's per-frame GPU rows (ticket 2026-10-11_12-10-09, SANDVOX_FRAMES_CSV)
+// gave farFill ~ 8.7 ms + 9 us per entry -- a dispatch of 150 entries cost
+// nearly what a dispatch of 1,024 did, because either way the GPU waited on
+// the slowest surface thread's four genColumn + colPrologue + tree candidate
+// chains, with the rest of the machine idle. That floor is what made every
+// incoming plane one 30-50 ms tick and what stopped the plane fills from being
+// spread over ticks (FarField's PLANE PACING) without paying it per tick.
+// Now 256 threads: lane b = li / 64 of owner li % 64 builds column x0 + b only,
+// ORs its byte into the owner's words in workgroup memory, and after one
+// barrier lane 0 stores the whole words exactly as before. Same columns, same
+// calls, same bytes; a quarter of the serial chain.
+@compute @workgroup_size(256)
 fn far(@builtin(workgroup_id) wg : vec3<u32>,
        @builtin(local_invocation_index) li : u32) {
   if (wg.x >= T.farCount) { return; }
   if (li == 0u) {
     atomicStore(&wgFarCount, 0u);
     atomicStore(&wgFarTop, 0u);
+  }
+  for (var i = li; i < FAR_SWEEP_OWNERS * CHUNK; i += 256u) {
+    atomicStore(&wgFarWords[i], 0u);
   }
   workgroupBarrier();
 
@@ -7100,15 +7123,18 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   //
   // A level chunk is 16^3 = 4096 cells but only 256 DISTINCT (x, z) columns:
   // the sample point is `(cc << shift) + half`, so fine.x and fine.z depend on
-  // cc.x and cc.z alone. Thread `li` owns ONE z row and FOUR consecutive x —
-  // exactly the four cells that pack into one farVox word — so it builds each
-  // of its four columns once, reuses it for the 16 rows above, and writes
-  // whole 32-bit words with no byte-granular read-modify-write and no
-  // cross-thread sharing. (Workgroup memory for 256 Cols would cost occupancy
-  // on a kernel whose job is bandwidth.)
+  // cc.x and cc.z alone. OWNER `own` (64 of them) owns ONE z row and FOUR
+  // consecutive x — exactly the four cells that pack into one farVox word —
+  // and its four LANES (FOUR LANES PER WORD above) build one of those columns
+  // each, reuse it for the 16 rows above, and meet in wgFarWords, so the
+  // global stores are still whole 32-bit words with no byte-granular
+  // read-modify-write. (Workgroup memory for 256 Cols would cost occupancy
+  // on a kernel whose job is bandwidth; 64 x 16 words does not.)
   var count = 0u;
-  let zi = li / 4u;              // this thread's z within the level chunk
-  let x0 = (li % 4u) * 4u;       // and the first of its four x
+  let own = li % FAR_SWEEP_OWNERS;   // which word column this thread fills
+  let b = li / FAR_SWEEP_OWNERS;     // which of its four x (byte b of the word)
+  let zi = own / 4u;             // this thread's z within the level chunk
+  let x0 = (own % 4u) * 4u;      // and the first of its owner's four x
   let step = 1 << shift;
   let half = 1 << (shift - 1u);
   // The row samples of this level chunk, lowest and highest (fine voxels).
@@ -7117,16 +7143,15 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   let yHi = ((base.y + i32(CHUNK) - 1) << shift) + half;
   // ---- COLUMN-OUTER, ROW-INNER ------------------------------------------------
   //
-  // The four columns are walked ONE AT A TIME, each with its sixteen rows
-  // inside, and the sixteen output words are assembled in `words` byte by
-  // byte. With one column live at a time the thread can hold genChunk's whole
-  // COLUMN PROLOGUE for it (pond candidates, cave bands, tree candidates, the
-  // canopy memo) and call genCellIn with the valid flags set, exactly as
-  // genChunk does -- the flags pick the other spelling of the SAME function,
-  // so the bytes are the unhoisted ones.
-  var words : array<u32, CHUNK>;   // one output word per row; zero-initialised
+  // One column per thread, its sixteen rows inside, each row's byte OR-ed
+  // into the owner's word in wgFarWords. With one column live the thread can
+  // hold genChunk's whole COLUMN PROLOGUE for it (pond candidates, cave bands,
+  // tree candidates, the canopy memo) and call genCellIn with the valid flags
+  // set, exactly as genChunk does -- the flags pick the other spelling of the
+  // SAME function, so the bytes are the unhoisted ones. (The braces are the
+  // old per-column loop's body, kept as a scope.)
   var top = 0u;   // one plus the highest row with a non-empty cell, this thread
-  for (var b = unrollFenceU(); b < 4u; b++) {
+  {
     let cc0 = base + vec3<i32>(i32(x0 + b), 0, i32(zi));
     // the sieve's sample column: the fine-voxel centre of the cell footprint
     let fx = (cc0.x << shift) + half;
@@ -7244,10 +7269,16 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
       // farOcc counts NON-EMPTY cells, which now includes blocker-only ones —
       // it gates empty-space skipping for every far reader, and a reader that
       // hits on the flag must not have its chunk skipped out from under it.
-      if (byteV != 0u) { count += 1u; top = max(top, yi + 1u); }
-      words[yi] |= byteV << (b * 8u);
+      if (byteV != 0u) {
+        count += 1u;
+        top = max(top, yi + 1u);
+        atomicOr(&wgFarWords[own * CHUNK + yi], byteV << (b * 8u));
+      }
     }
   }
+  atomicAdd(&wgFarCount, count);
+  atomicMax(&wgFarTop, top);
+  workgroupBarrier();
   let planeBase = ((level - 1u) * FAR_VOX + slot * CHUNK_VOL) / 4u;
   // The cell index in this level chunk is x + y*CHUNK + z*CHUNK*CHUNK (see the
   // `farpatch` entry's unpack), so in words of four x-consecutive cells that is
@@ -7256,15 +7287,15 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   // form used.
   // Every row is stored UNCONDITIONALLY: this slot may hold the bytes of the
   // level chunk that used to live in it, and a row above the sky ceiling still
-  // has to be cleared to the air it now is.
-  for (var yi = 0u; yi < CHUNK; yi++) {
-    atomicStore(&farVox[planeBase + zi * (CHUNK * CHUNK / 4u) +
-                        yi * (CHUNK / 4u) + li % 4u],
-                words[yi]);
+  // has to be cleared to the air it now is. Lane 0 of each owner stores its
+  // sixteen assembled words (the barrier above made every lane's byte land).
+  if (b == 0u) {
+    for (var yi = 0u; yi < CHUNK; yi++) {
+      atomicStore(&farVox[planeBase + zi * (CHUNK * CHUNK / 4u) +
+                          yi * (CHUNK / 4u) + own % 4u],
+                  atomicLoad(&wgFarWords[own * CHUNK + yi]));
+    }
   }
-  atomicAdd(&wgFarCount, count);
-  atomicMax(&wgFarTop, top);
-  workgroupBarrier();
   if (li == 0u) {
     // farOcc only ever gates EMPTY-SPACE SKIPPING, so it must never be too
     // small and may be too large: an over-count costs one marched level chunk,
@@ -7482,7 +7513,15 @@ fn coverTreesAt(m0 : u32, m1 : u32, p : vec3<i32>) -> u32 {
   return MAT_AIR;
 }
 
-@compute @workgroup_size(64)
+// 256 THREADS, FOUR LANES PER WORD (2026-10-11), for the reason `far` has
+// them: the pass cost the latency of its slowest workgroup -- up to four
+// tree tiles (landAt + pondScan each) and four cell columns per thread, in
+// series -- ~2-3 ms a dispatch however few entries it carried, paid again on
+// every slice once the plane fills were paced (farfield.h PLANE PACING).
+// A tile per thread, a column per lane. The lanes of one word write
+// DIFFERENT bytes of it, so the stores are byte-masked atomics on farVox
+// (only this workgroup touches this slot's words in this dispatch).
+@compute @workgroup_size(256)
 fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
             @builtin(local_invocation_index) li : u32) {
   if (wg.x >= T.farCount) { return; }
@@ -7518,7 +7557,7 @@ fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
   let nAx = min(fdiv(hi.x, TREE_TILE) + TREE_SCAN - tx0 + 1, WG_COVER_AXIS);
   let nAz = min(fdiv(hi.y, TREE_TILE) + TREE_SCAN - tz0 + 1, WG_COVER_AXIS);
   let maxReach = treeMaxReach();
-  for (var i = i32(li); i < nAx * nAz; i += 64) {
+  for (var i = i32(li); i < nAx * nAz; i += 256) {
     var e = coverTreeNone();
     let s = treeSite(tx0 + i % nAx, tz0 + i / nAx, T.seed);
     if (s.wx + maxReach >= lo.x && s.wx - maxReach <= hi.x &&
@@ -7590,21 +7629,23 @@ fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
   let nTrees = workgroupUniformLoad(&wgCoverN);
   if (nTrees == 0u) { return; }
 
-  // ---- the cells: the sweep's own ownership (one z row, four x per thread,
-  // the sixteen words those four columns pack into), so the stores need no
-  // byte read-modify-write and no other thread touches the words.
-  let zi = li / 4u;
-  let x0 = (li % 4u) * 4u;
+  // ---- the cells: the sweep's own ownership (one z row, four x per OWNER,
+  // the sixteen words those four columns pack into), one column per LANE:
+  // lane b of owner `own` reads and rewrites byte b of those words only.
+  let own = li % 64u;
+  let b = li / 64u;
+  let zi = own / 4u;
+  let x0 = (own % 4u) * 4u;
   let planeBase = ((level - 1u) * FAR_VOX + slot * CHUNK_VOL) / 4u;
-  var words : array<u32, CHUNK>;
+  let wordBase = planeBase + zi * (CHUNK * CHUNK / 4u) + own % 4u;
+  var bytes : array<u32, CHUNK>;   // this lane's byte of each row's word
   for (var yi = 0u; yi < CHUNK; yi++) {
-    words[yi] = atomicLoad(&farVox[planeBase + zi * (CHUNK * CHUNK / 4u) + yi * (CHUNK / 4u) + li % 4u]);
+    bytes[yi] = (atomicLoad(&farVox[wordBase + yi * (CHUNK / 4u)]) >> (b * 8u)) & 0xFFu;
   }
-  var changed = 0u;   // bit yi: row yi's word was rewritten
   var added = 0u;
   var top = 0u;
   let step = 1 << shift;
-  for (var b = 0u; b < 4u; b++) {
+  {
     let cx0 = f0.x + i32(x0 + b) * step;
     let cz0 = f0.z + i32(zi) * step;
     // The trees that reach this cell column, as a mask over the compact list,
@@ -7622,9 +7663,10 @@ fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
       yb = min(yb, e.base + 1);
       yt = max(yt, e.vtop);
     }
-    if ((m0 | m1) == 0u) { continue; }
-    for (var yi = 0u; yi < CHUNK; yi++) {
-      let byteV = (words[yi] >> (b * 8u)) & 0xFFu;
+    // (No trees reach this column: the loop below runs zero times.)
+    let anyTree = (m0 | m1) != 0u;
+    for (var yi = 0u; yi < CHUNK && anyTree; yi++) {
+      let byteV = bytes[yi];
       if (farCellSlot(byteV) != 0u) { continue; }       // the centre found matter
       let c0 = vec3<i32>(cx0, f0.y + i32(yi) * step, cz0);
       if (c0.y + step - 1 < yb || c0.y > yt) { continue; }
@@ -7636,16 +7678,14 @@ fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
       }
       let pick = farCoverPick(acc, level);
       if (pick == 0u) { continue; }
-      words[yi] = (words[yi] & ~(0xFFu << (b * 8u))) | (pick << (b * 8u));
-      changed |= 1u << yi;
+      // This lane's byte only: the other three lanes of the word may be
+      // rewriting theirs in the same instant.
+      let w = wordBase + yi * (CHUNK / 4u);
+      atomicAnd(&farVox[w], ~(0xFFu << (b * 8u)));
+      atomicOr(&farVox[w], pick << (b * 8u));
       if (byteV == 0u) { added += 1u; }   // a blocker cell was already counted
       top = max(top, yi + 1u);
     }
-  }
-  for (var yi = 0u; yi < CHUNK; yi++) {
-    if ((changed & (1u << yi)) == 0u) { continue; }
-    atomicStore(&farVox[planeBase + zi * (CHUNK * CHUNK / 4u) + yi * (CHUNK / 4u) + li % 4u],
-                words[yi]);
   }
   atomicAdd(&wgCoverAdd, added);
   atomicMax(&wgCoverTop, top);
@@ -7690,8 +7730,23 @@ fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
 // sits ABOVE the map's top as a plain cell (the union rule, traceFar).
 //
 // Separate entry point for the compile-time reason `farpatch` is (its own
-// genColumn + genCellIn copies); same dispatch extent, and an entry without the
-// flag returns at once.
+// genColumn + genCellIn copies); same dispatch extent IN X, and an entry
+// without the flag returns at once.
+//
+// ---- SIXTEEN WORKGROUPS PER COLUMN, NOT ONE (2026-10-11) -------------------
+// "~1/8 of the sieve's column work" above is the TOTAL, and the total was
+// never the problem: one workgroup per map entry put a whole column's 1,024
+// sub-columns on 64 threads, sixteen genColumn + genCellCol + feature rolls
+// in series per thread, and an X/Z plane carries only 32 such entries. So the
+// pass ran 32 workgroups on a GPU with room for a thousand and took as long as
+// ONE thread's sixteen columns: 27-33 ms of GPU per plane, measured with the
+// in-flight harness (ticket 2026-10-11_12-10-09, `--frames` worst-frame
+// table), as long as the 1,024-entry sieve beside it -- half of every
+// 100-200 ms flying hitch. The row is now dispatched (farCount, 16)
+// (pass_table.def farMapFill) and workgroup wg.y takes every 16th block of 64
+// sub-columns, so each thread does ONE: same work, sixteen times the
+// parallelism. The stride is read from num_workgroups, so a dispatch of any
+// height still covers the whole column.
 // THE COVER BIT (LOD-seam package E, 2026-09-28). A column plant (grass, a
 // flower, moss: any MATF_MICRO material) standing on the sub-column's top is
 // dropped by every far writer (farCellIsSolid), so past the handoff a meadow
@@ -7825,6 +7880,7 @@ fn farFeatFill(col : ptr<function, Col>, ponds : ptr<function, PondSet>, cover :
 
 @compute @workgroup_size(64)
 fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
+          @builtin(num_workgroups) nwg : vec3<u32>,
           @builtin(local_invocation_index) li : u32) {
   if (wg.x >= T.farCount) { return; }
   let packed = farList[wg.x];
@@ -7839,7 +7895,7 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
   let wsh = shift - 1u;               // fine voxels per sub-column, as a shift
   let hw = (1 << wsh) >> 1;           // its centre column (0 at level 1)
   let n = 2u * CHUNK;                 // sub-columns per axis under the chunk
-  for (var i = li + unrollFenceU(); i < n * n; i += 64u) {
+  for (var i = wg.y * 64u + li + unrollFenceU(); i < n * n; i += 64u * nwg.y) {
     let m = vec2<i32>(base.x * 2 + i32(i % n), base.z * 2 + i32(i / n));
     let fx = (m.x << wsh) + hw;
     let fz = (m.y << wsh) + hw;

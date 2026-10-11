@@ -5724,7 +5724,7 @@ const FAR_HIT_FEAT_CARD : u32 = 0x400u; // ... drawn as a blade card
 // The last feature level's handoff sphere (traceFar's tLvlOut), metres, and
 // the band ahead of it where the features go.
 const FAR_FEAT_END_M : f32 =
-    f32(((i32(FAR_NCHUNK) / 2 - 2) * i32(CHUNK)) << (FAR_FEAT_LEVELS + FAR_SHIFT_BASE)) *
+    f32(((i32(FAR_NCHUNK) / 2 - FAR_SPHERE_MARGIN_CHUNKS) * i32(CHUNK)) << (FAR_FEAT_LEVELS + FAR_SHIFT_BASE)) *
     VOXEL_METERS * 0.97;
 const FAR_FEAT_START_M : f32 = FAR_FEAT_END_M * 0.75;
 fn farFeatKeep(tFine : f32) -> f32 {
@@ -5960,10 +5960,22 @@ fn farHfAO(level : u32, fineV : vec3<i32>, n : vec3<i32>, a1 : i32, a2 : i32,
   return clamp(1.0 - (occ / 3.0) * TUNE_AO_STRENGTH * reach, 0.0, 1.0);
 }
 
-// farfield.cpp kHyst (2 level chunks): the nearest a box face can be. A
+// THE HANDOFF SPHERE SITS ONE CHUNK INSIDE THE NEAREST VALID FACE.
+// farfield.cpp kHyst (2 level chunks) keeps a LANDED leading face 14..15
+// level chunks out, and this was 2 (sphere at 14), on the reading that "a
 // plane still queued pulls the VALID face one chunk nearer for the few ticks
-// it takes to land; then the box exit is the handoff, as before.
-const FAR_SPHERE_MARGIN_CHUNKS : i32 = 2;
+// it takes to land". It does, and for those ticks the face is at 13..14 --
+// INSIDE the sphere -- and the level hands off on its box face, a flat plane,
+// instead of the dithered sphere. In flight that is every step of every level:
+// owner ticket 2026-10-11_12-10-09, "three expanding lines where different
+// stages of the lod seam are" (levels 1, 2 and 3, at ~42, ~84 and ~168 m,
+// each flashing as its plane queued and snapping out as it landed). 3 puts
+// the sphere at 13 chunks, so a queued plane's face stays outside it as long
+// as the plane lands within one level chunk of travel -- which farfield.h's
+// PLANE PACING schedules for (half a chunk, by the face's step period). The
+// price is 1/14 of each level's range handed to the next level out, the same
+// trade the margin made the first time.
+const FAR_SPHERE_MARGIN_CHUNKS : i32 = 3;
 
 // ---- THE RAY-START MAP, read side (ray_start.wgsl has the argument) ---------
 // RAY_START false folds every read away and fs() marches from the camera as it
@@ -5974,10 +5986,11 @@ const RS_NONE : f32 = 1e30;      // ray_start.wgsl agrees
 // The margins the conservative argument needs (ray_start.wgsl WHY IT IS
 // CONSERVATIVE): the pixel's entry into the cell a sample hit differs from the
 // sample's by at most the cell's diagonal. A fine voxel's is 1.73 voxels; a
-// cascade cell's is sqrt(3) s, and s <= t / 112 everywhere — level k draws
-// from its predecessor's sphere (112 s) to its own (224 s), and a dithered
-// seam's overlap holds level k+1 cells at t ~ 112 s' — so 1.55% of t. The
-// margins keep ~30% over those bounds. They are not free: every cascade step a
+// cascade cell's is sqrt(3) s, and s <= t / 104 everywhere — level k draws
+// from its predecessor's sphere (104 s) to its own (208 s; 112 / 224 until
+// FAR_SPHERE_MARGIN_CHUNKS went to 3), and a dithered seam's overlap holds
+// level k+1 cells at t ~ 104 s' — so 1.67% of t. The margins keep ~20% over
+// those bounds. They are not free: every cascade step a
 // pixel re-walks costs ~0.2 ms of frame at 1080p (4% measured 13.8 far steps a
 // pixel on the cascade camera against the exact-start bound's 5.9).
 const RS_NEAR_ABS : f32 = 2.25;  // fine voxels
@@ -6114,12 +6127,13 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     // level-k march had left its VALID BOX a few cells earlier; identical
     // with the dither hash changed or off and with the refine at 0/2/8). A
     // sphere about the eye is crossed head-on by every ray, so the flip is a
-    // circle the dither dissolves, never a lattice. Radius: the nearest the
-    // box face can be (half the box less the recentre hysteresis), so a
-    // settled plane refill
-    // happens beyond the handoff and is rarely seen as a pop. (13 chunks
-    // was tried first; 14 keeps 8% more of each level's range.) The outermost
-    // level keeps its box: nothing takes over behind it.
+    // circle the dither dissolves, never a lattice. Radius: one chunk inside
+    // the nearest a VALID box face can be while a plane is landing
+    // (FAR_SPHERE_MARGIN_CHUNKS has why), so plane refills happen beyond the
+    // handoff and are never drawn as the box face. (13 chunks was tried
+    // first, then 14 for 8% more range — which put the face of every queued
+    // plane inside the sphere: ticket 2026-10-11_12-10-09's lines.) The
+    // outermost level keeps its box: nothing takes over behind it.
     var tLvlOut = min(min(tmax.x, min(tmax.y, tmax.z)), tCeil / s);
     if (level < FAR_LEVELS) {
       tLvlOut = min(tLvlOut, f32((i32(FAR_NCHUNK) / 2 - FAR_SPHERE_MARGIN_CHUNKS) *

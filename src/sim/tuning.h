@@ -4812,6 +4812,30 @@ struct Tuning {
     //   it landed before the level had to be thrown away. Hot-reloads on F5.
     int farPlaneFillRate = TPD(render, farPlaneFillRate);
 
+    // ---- THE TRAVEL FILL IS PACED, AND THE PACE HAS A FLOOR (2026-10-11) ----
+    // Owner ticket 2026-10-11_12-10-09: hitches flying at NORMAL speed. Every
+    // incoming plane landed in one tick at the rate above, 75-97 ms of GPU
+    // (farFill + farMapFill + farCoverFill) in that tick, 7.7 times a second
+    // at 13.75 m/s. Planes now drain on DEADLINES (farfield.h PLANE PACING:
+    // half the face's step period, the time before the face would come
+    // inside the handoff sphere) and the rate above is only the ceiling. This
+    // is the floor: a far tick has ~9 ms of FIXED cost on an RTX 3060 Ti (the
+    // three passes' slowest workgroups, in series), so a tick that fills at
+    // all takes at least this many entries. Measured with the in-flight
+    // harness at the ticket's camera (SANDVOX_AT_FLY=13.75,0,0.12 after a
+    // 900-frame hold, 595 frames of flight, `--frames` + SANDVOX_FRAMES_CSV),
+    // frame wall p50 / p95 / p99, frames > 50 ms, total far GPU:
+    //   before (1024 at once, 64-thread far/farcover/farmap)
+    //                                  11.7 / 77.3 / 92.8 ms, 73, 4.05 s
+    //   kernels split, unpaced         12.2 / 56.9 / 72.7 ms, 43, 2.55 s
+    //   paced, floor 512               12.6 / 46.8 / 62.5 ms, 18, 2.84 s
+    //   paced, floor 256               16.4 / 40.2 / 53.4 ms,  9, 3.24 s
+    //   ...+ farcover in four lanes    14.7 / 37.6 / 48.0 ms,  5, 2.64 s
+    // (frame mean 21.7 -> 17.5 ms over the same flight). Lower it if a moving
+    // frame still hitches; raise it if the far fill's total GPU climbs (every
+    // extra slice pays the passes' fixed latency again).
+    int farPlaneBatch = TPD(render, farPlaneBatch);
+
     // budgets
     int primarySteps = TPD(render, primarySteps);
     int farSteps = TPD(render, farSteps);

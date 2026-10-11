@@ -940,6 +940,7 @@
     "farSteps": 896,
     "farRefillRate": 1024,
     "farPlaneFillRate": 1024,
+    "farPlaneBatch": 256,
     "farShadowReach": 24,
     "farBlockerHitLevel": 0,
     "farRefineLevel": 2,
