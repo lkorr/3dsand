@@ -1130,6 +1130,159 @@ Status GateWindField(Ctx& c, std::string& detail) {
     ok = ok && pass;
   }
 
+  // ---- lee: the rotor behind a crest keeps the air MOVING ------------------
+  // Ticket 2026-10-09_15-09-01: on a hilltop with the streak radius maxed,
+  // one side's streaks drew a few metres and the other's ran far. The lee
+  // term braked the mean along a straight line through zero, so at the
+  // default strength the lowest metres behind a steep crest were near-still
+  // air and a streak there barely moved. It is a rotation now (common.wgsl
+  // windLeeF). The claim, in a strong wind over the probe columns whose
+  // ground falls away downwind steeper than 2 x leeSlope (the lee at full
+  // share): the mean speed a streak follows through the 0.5-6 m spawn band is
+  // at least windField.leeTravelMin of the windward columns' (ground RISING
+  // downwind past leeSlope), and at most windField.leeStallMax of the lee
+  // samples are near-still (< 0.2 x the open ground's). "before" = the same
+  // samples under the old brake (FieldProbe::leeLegacy). Four headings, so
+  // both faces of every hill count. The SITE is the window's table;
+  // SANDVOX_WIND_LEE_AT=x,z (world voxels; SANDVOX_MAP for the map) puts it
+  // anywhere -- the ticket's hill is -14245,-60152 on default.
+  {
+    Tuning t = base;
+    t.wind.intensity = 0.85f;
+    t.wind.wanderLight = t.wind.wanderStrong = 0.0f;
+    int32_t so[3] = {o3[0], o3[1], o3[2]};
+    int32_t sx = cx, sz = cz;
+    if (const char* at = std::getenv("SANDVOX_WIND_LEE_AT")) {
+      int ax = 0, az = 0;
+      if (std::sscanf(at, "%d,%d", &ax, &az) == 2) {
+        sx = ax;
+        sz = az;
+        so[0] = (int32_t)std::floor((double)(ax - (int)kWorldN / 2) / (double)kChunk);
+        so[2] = (int32_t)std::floor((double)(az - (int)kWorldN / 2) / (double)kChunk);
+      }
+    }
+    const float s0 = t.wind.leeSlope;
+    const float hts[5] = {0.5f, 1.0f, 2.0f, 4.0f, 6.0f};
+    const int kL = 56, kStep = 32;   // 56 x 3.2 m = +-90 m, inside the 204.8 m table
+    struct Acc { double v = 0, old = 0; int n = 0; };
+    Acc lee, ww, open;
+    std::vector<std::pair<float, float>> leeSamples;   // (now, before), m/s
+    std::vector<int32_t> xyz, col, q;
+    std::vector<float> slope;
+    std::vector<windfield::FieldProbe> pr, qs;
+    for (int dir = 0; dir < 4; dir++) {
+      t.wind.windDirDeg = 90.0f * (float)dir;
+      const float rad = t.wind.windDirDeg * 3.14159265f / 180.0f;
+      const float ux = std::sin(rad), uz = std::cos(rad);   // downwind, heading 0 = +Z
+      // Each column's ground, and 16 voxels up- and downwind of it.
+      xyz.clear();
+      for (int j = 0; j < kL; j++)
+        for (int i = 0; i < kL; i++) {
+          const int32_t x = sx - kL / 2 * kStep + i * kStep, z = sz - kL / 2 * kStep + j * kStep;
+          for (int k = -1; k <= 1; k++) {
+            xyz.push_back(x + (int32_t)std::lround(16.0f * (float)k * ux));
+            xyz.push_back(0);
+            xyz.push_back(z + (int32_t)std::lround(16.0f * (float)k * uz));
+          }
+        }
+      pr.assign(xyz.size() / 3, {});
+      windfield::ProbeMany(t, seed, tick, kWindNoDayPhase, so, xyz.data(), (int)pr.size(), pr.data());
+      col.clear();
+      slope.clear();
+      for (size_t c = 0; c + 2 < pr.size(); c += 3) {
+        if (!pr[c].inTable || !pr[c + 1].inTable || !pr[c + 2].inTable) continue;
+        slope.push_back((pr[c + 2].groundY - pr[c].groundY) / 32.0f);
+        col.push_back(xyz[3 * (c + 1)]);
+        col.push_back((int32_t)std::floor(pr[c + 1].groundY));
+        col.push_back(xyz[3 * (c + 1) + 2]);
+      }
+      q.clear();
+      for (size_t c = 0; c < slope.size(); c++)
+        for (float h : hts) {
+          q.push_back(col[3 * c]);
+          q.push_back(col[3 * c + 1] + (int32_t)std::lround(h * 10.0f));
+          q.push_back(col[3 * c + 2]);
+        }
+      qs.assign(q.size() / 3, {});
+      windfield::ProbeMany(t, seed, tick, kWindNoDayPhase, so, q.data(), (int)qs.size(), qs.data());
+      for (size_t c = 0; c < slope.size(); c++) {
+        Acc* a = slope[c] < -2.0f * s0 ? &lee
+               : slope[c] > s0 ? &ww
+               : std::fabs(slope[c]) < 0.1f ? &open : nullptr;
+        if (!a) continue;
+        for (size_t k = 0; k < 5; k++) {
+          const windfield::FieldProbe& p = qs[c * 5 + k];
+          const float base0 = p.refSpeed * p.ramp;   // the mean before the lee term
+          const float vNew = base0 * std::hypot(p.leeMean, p.leeRise);
+          const float vOld = base0 * std::fabs(p.leeLegacy);
+          a->v += vNew;
+          a->old += vOld;
+          a->n++;
+          if (a == &lee) leeSamples.push_back({vNew, vOld});
+        }
+      }
+    }
+    const float vLee = lee.n ? (float)(lee.v / lee.n) : 0.0f;
+    const float vLeeOld = lee.n ? (float)(lee.old / lee.n) : 0.0f;
+    const float vWw = ww.n ? (float)(ww.v / ww.n) : 0.0f;
+    const float vOpen = open.n ? (float)(open.v / open.n) : 0.0f;
+    const float stillV = 0.2f * (open.n >= 20 ? vOpen : vWw);
+    int still = 0, stillOld = 0;
+    for (const auto& sm : leeSamples) {
+      if (sm.first < stillV) still++;
+      if (sm.second < stillV) stillOld++;
+    }
+    const float share = lee.n ? (float)still / (float)lee.n : 0.0f;
+    const float shareOld = lee.n ? (float)stillOld / (float)lee.n : 0.0f;
+    const float ratio = vWw > 0.0f ? vLee / vWw : 0.0f;
+    const float ratioOld = vWw > 0.0f ? vLeeOld / vWw : 0.0f;
+    const float life = t.wind.streakLife;
+    const float need = (float)BaselineNumber("windField.leeTravelMin", 0.35);
+    const float stillMax = (float)BaselineNumber("windField.leeStallMax", 0.10);
+    const bool sampled = lee.n >= 20 && ww.n >= 20;
+    // THE ROTOR ITSELF, asserted on any table (the harness has no steep
+    // lee): over the whole lee share 0..1 the mean's size never falls under
+    // windField.leeRotorMinFrac x leeReverse (the old brake reached 0), the
+    // open field (share 0) is the identity bit for bit, and the full share
+    // is the old full rotor's reversed leeReverse.
+    float rotMin = 9.0f, legMin = 9.0f;
+    for (int k = 0; k <= 64; k++) {
+      const windfield::LeeRotor r = windfield::LeeRotorAt((float)k / 64.0f, t);
+      rotMin = std::min(rotMin, std::hypot(r.along, r.rise));
+      legMin = std::min(legMin, std::fabs(r.legacy));
+    }
+    const windfield::LeeRotor r0 = windfield::LeeRotorAt(0.0f, t);
+    const windfield::LeeRotor r1 = windfield::LeeRotorAt(1.0f, t);
+    const float rotNeed =
+        (float)BaselineNumber("windField.leeRotorMinFrac", 0.7) * t.wind.leeReverse;
+    const bool rotPass = rotMin >= rotNeed && r0.along == 1.0f && r0.rise == 0.0f &&
+                         std::fabs(r1.along + t.wind.leeReverse) < 0.02f;
+    std::snprintf(buf, sizeof buf,
+                  "lee rotor over share 0..1: min |U| %.2f x the mean (>= %.2f; the old brake's "
+                  "%.2f), share 0 -> (%.4f, %.4f), share 1 -> along %+.2f up %.2f %s",
+                  rotMin, rotNeed, legMin, r0.along, r0.rise, r1.along, r1.rise,
+                  rotPass ? "ok" : "FAIL");
+    note(buf);
+    RecordObserved("windField.leeRotorMin", rotMin);
+    ok = ok && rotPass;
+    const bool pass = !sampled || (ratio >= need && share <= stillMax);
+    std::snprintf(buf, sizeof buf,
+                  "lee (site %d,%d; samples lee %d windward %d open %d): streak travel over a "
+                  "%.1f s life: lee %.1f m, windward %.1f m, open %.1f m -> lee/windward %.2f "
+                  "(>= %.2f), near-still %.0f%% (<= %.0f%%) | before (the brake): lee %.1f m, "
+                  "lee/windward %.2f, near-still %.0f%% %s",
+                  sx, sz, lee.n, ww.n, open.n, life, vLee * life, vWw * life, vOpen * life, ratio,
+                  need, share * 100.0f, stillMax * 100.0f, vLeeOld * life, ratioOld,
+                  shareOld * 100.0f,
+                  !sampled ? "(too little relief: not asserted)" : pass ? "ok" : "FAIL");
+    note(buf);
+    if (sampled) {
+      RecordObserved("windField.leeOverWindward", ratio);
+      RecordObserved("windField.leeStallShare", share);
+    }
+    ok = ok && pass;
+  }
+
   detail = out;
   std::printf("wind-field: %s\n  %s\n", ok ? "PASS" : "FAIL", out.c_str());
   return ok ? Status::Pass : Status::Fail;

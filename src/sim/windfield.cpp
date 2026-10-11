@@ -780,9 +780,25 @@ void MirrorLocal(const MirrorParams& T, const MRamp& rq, int32_t out[3]) {
   for (int i = 0; i < 3; i++) out[i] = Mwq(v[i], rq.tr.edge);
 }
 
+// windLeeQ: the lee rotor as a ROTATION of the mean (common.wgsl windLeeF's
+// note). meanMul = along, riseMul = up (x the mean speed), gustMul = bands.
+// legacyMul is the pre-2026-10-11 brake (1 - l (1 + rev)) the wind-field
+// gate's lee claim reports as "before"; nothing else reads it.
+constexpr int32_t kLeeRiseQ = 32768;   // common.wgsl WIND_LEE_RISE_Q
+// The rotor at lee share l (Q16, 0..65536): windLeeQ's last four lines.
+void LeeRotorQ(int32_t l, int32_t revQ, int32_t gustQ, int32_t& meanMul, int32_t& riseMul,
+               int32_t& gustMul, int32_t& legacyMul) {
+  const int32_t m = 65536 - Mwq(l, 65536 - revQ);
+  const int32_t th = l >> 1;
+  meanMul = Mwq(m, MirrorSinQ(th + 16384));
+  riseMul = Mwq(kLeeRiseQ, Mwq(m, MirrorSinQ(th)));
+  gustMul = 65536 + Mwq(l, gustQ);
+  legacyMul = 65536 - Mwq(l, 65536 + revQ);
+}
 void MirrorLee(const MirrorParams& T, const MRamp& rq, int32_t dlx, int32_t dlz,
-               int32_t& meanMul, int32_t& gustMul) {
-  meanMul = gustMul = 65536;
+               int32_t& meanMul, int32_t& riseMul, int32_t& gustMul, int32_t& legacyMul) {
+  meanMul = gustMul = legacyMul = 65536;
+  riseMul = 0;
   const int32_t lee = T.wfLeeQ;
   if (lee <= 0 || rq.tr.edge <= 0) return;
   const int32_t sa = Mwq(rq.tr.gx, dlx) + Mwq(rq.tr.gz, dlz);
@@ -790,15 +806,14 @@ void MirrorLee(const MirrorParams& T, const MRamp& rq, int32_t dlx, int32_t dlz,
   const int32_t f = std::clamp(((-sa - s0) / std::max(s0 >> 8, 1)) * 256, 0, 65536);
   int32_t l = Mwq(Mwq(lee, f), 65536 - MirrorDepthFrac(rq.hQ10, T.wfLeeDepth));
   l = Mwq(l, rq.tr.edge);
-  meanMul = 65536 - Mwq(l, 65536 + T.wfLeeRevQ);
-  gustMul = 65536 + Mwq(l, T.wfLeeGustQ);
+  LeeRotorQ(l, T.wfLeeRevQ, T.wfLeeGustQ, meanMul, riseMul, gustMul, legacyMul);
 }
 
 // The mirror, split into the pieces the probe reports. Q16.16 cells/s.
 struct MSample {
   MRamp rq;
   int32_t dlx = 0, dlz = 65536;
-  int32_t leeMean = 65536, leeGust = 65536;
+  int32_t leeMean = 65536, leeRise = 0, leeGust = 65536, leeLegacy = 65536;
   int32_t mean[3] = {}, bands[3] = {}, extra[3] = {};
   int32_t b1a = 0;   // the base band's along component, unscaled (the gate tracks its crest)
 };
@@ -810,8 +825,10 @@ MSample MirrorSample(const MirrorParams& T, const MirrorConsts& C, int32_t px, i
   const int32_t dx = T.windDirQ[0], dz = T.windDirQ[1];
   MirrorWander(T, C, px, pz, dx, dz, o.dlx, o.dlz);
   const int32_t cwx = -o.dlz, cwz = o.dlx;
-  MirrorLee(T, o.rq, o.dlx, o.dlz, o.leeMean, o.leeGust);
-  const int32_t spd = Mwq(Mwq(T.windSpeedQ, alt), o.leeMean);
+  MirrorLee(T, o.rq, o.dlx, o.dlz, o.leeMean, o.leeRise, o.leeGust, o.leeLegacy);
+  const int32_t spd0 = Mwq(T.windSpeedQ, alt);
+  const int32_t spd = Mwq(spd0, o.leeMean);
+  const int32_t rise = Mwq(spd0, o.leeRise);
   const int32_t amp = Mwq(Mwq(T.windGustQ, alt), o.leeGust);
   const uint32_t tick = T.tick, adv = T.wfAdvPhase;
   const int32_t b1a = MirrorSinQ((int32_t)(MirrorPhaseQ(px, pz, dx, dz, C.k100) - adv -
@@ -834,7 +851,7 @@ MSample MirrorSample(const MirrorParams& T, const MirrorConsts& C, int32_t px, i
   MirrorThermal(T, C, px, pz, th);
   MirrorLocal(T, o.rq, loc);
   for (int i = 0; i < 3; i++) {
-    o.extra[i] = Mwq(th[i], alt) + loc[i];
+    o.extra[i] = Mwq(th[i], alt) + (i == 1 ? rise : 0) + loc[i];
     o.bands[i] = Mwq(C.w1, w1[i]) + Mwq(C.w2, w2[i]);
   }
   o.mean[0] = Mwq(o.dlx, spd);
@@ -870,6 +887,8 @@ void ProbeMany(const Tuning& t, uint32_t seed, uint32_t tick, uint32_t dayPhase,
     o.ramp = (float)s.rq.ramp / 65536.0f;
     o.leeMean = (float)s.leeMean / 65536.0f;
     o.leeGust = (float)s.leeGust / 65536.0f;
+    o.leeRise = (float)s.leeRise / 65536.0f;
+    o.leeLegacy = (float)s.leeLegacy / 65536.0f;
     for (int i = 0; i < 3; i++) {
       o.mean[i] = (float)s.mean[i] * toMs;
       o.bands[i] = (float)s.bands[i] * toMs;
@@ -885,6 +904,13 @@ void ProbeMany(const Tuning& t, uint32_t seed, uint32_t tick, uint32_t dayPhase,
     o.gustExcess = ml > 1e-6f ? (o.bands[0] * o.mean[0] + o.bands[2] * o.mean[2]) / ml : 0.0f;
     o.q = q;
   }
+}
+
+LeeRotor LeeRotorAt(float share, const Tuning& t) {
+  const int32_t l = (int32_t)std::lround(std::clamp(share, 0.0f, 1.0f) * 65536.0f);
+  int32_t a = 0, r = 0, g = 0, o = 0;
+  LeeRotorQ(l, Q16(t.wind.leeReverse), Q16(t.wind.leeGust), a, r, g, o);
+  return {a / 65536.0f, r / 65536.0f, g / 65536.0f, o / 65536.0f};
 }
 
 FieldProbe Probe(const Tuning& t, uint32_t seed, uint32_t tick, uint32_t dayPhase,

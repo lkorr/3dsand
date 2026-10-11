@@ -186,7 +186,7 @@ struct UIState {
     float intensity = 0, gale = 0, convective = 0, stability = 0, coupling = 1;
     float refSpeed = 0, gustAmp = 0, gustFrac = 0, headingDeg = 0, localHeadingDeg = 0;
     float totalMs = 0, meanMs = 0, gustExcess = 0, extraMs = 0;
-    float haglM = 0, groundY = 0, profile = 0, exposure = 0, expMul = 1, ramp = 1, leeMean = 1;
+    float haglM = 0, groundY = 0, profile = 0, exposure = 0, expMul = 1, ramp = 1, leeMean = 1, leeRise = 0;
     float wanderDeg = 0, thermalMs = 0, slopeMs = 0, seaMs = 0;
     float stormPhase = -1, envelope = 1, jumpDeg = 0;
     uint32_t terrQueries = 0;

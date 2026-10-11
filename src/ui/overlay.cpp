@@ -2331,7 +2331,7 @@ void Overlay::DrawDevWorld(UIState& s) {
                             "total horizontal speed, the mean after the ramp, the gust bands along the\n"
                             "mean right now, and the thermal + slope + sea terms. Primitives excluded.");
       ImGui::Text("%.1f m above ground (y %.0f)  profile %.2f", r.haglM, r.groundY, r.profile);
-      ImGui::Text("exposure %+.2f -> x%.2f  ramp x%.2f  lee x%.2f", r.exposure, r.expMul, r.ramp, r.leeMean);
+      ImGui::Text("exposure %+.2f -> x%.2f  ramp x%.2f  lee x%.2f up %.2f", r.exposure, r.expMul, r.ramp, r.leeMean, r.leeRise);
       ImGui::TextDisabled("stability %+.2f  coupling %.2f  meander %.0f deg  heading here %.0f", r.stability,
                           r.coupling, r.wanderDeg, r.localHeadingDeg);
       ImGui::TextDisabled("thermal %.1f  slope %+.1f  sea %+.1f m/s  gust frac %.2f", r.thermalMs, r.slopeMs,
@@ -2470,6 +2470,8 @@ void Overlay::DrawDevWorld(UIState& s) {
       changed |= EditableSliderFloat("streaks##wnd", &w.streakAlpha, 0.0f, 1.0f, "%.2f");
       ImGui::SetItemTooltip("Gust streaks: master visibility. 0 skips the pass entirely (live).");
       changed |= ImGui::SliderInt("streak count##wnd", &w.streakCount, 0, (int)kWindStreakCap);
+      ImGui::SetItemTooltip("Slots at a 20 m radius: a larger radius scales them by its area\n"
+                            "(the same density over the bigger disc), up to the pool.");
       changed |= EditableSliderFloat("spawn threshold##wnd", &w.streakThreshold, 0.0f, 20.0f, "%.1f m/s");
       ImGui::SetItemTooltip("A streak is born only where the gust excess (bands along the mean,\n"
                             "plus primitives) passes this. Calm days show nothing.");
@@ -2480,6 +2482,9 @@ void Overlay::DrawDevWorld(UIState& s) {
       changed |= EditableSliderFloat("trail spacing##wnd", &w.streakSpacing, 0.01f, 0.2f, "%.3f s");
       changed |= EditableSliderFloat("lifetime##wnd", &w.streakLife, 0.2f, 6.0f, "%.1f s");
       changed |= EditableSliderFloat("radius##wnd", &w.streakRadius, 2.0f, 60.0f, "%.0f m");
+      ImGui::SetItemTooltip("Live slots now: %u streaks + %u current tracers (pool %u).",
+                            WindStreakSlots(CurrentTuning()), CurrentStreakSlots(CurrentTuning()),
+                            kWindStreakCap);
       changed |= EditableSliderFloat("width##wnd", &w.streakWidth, 0.005f, 0.2f, "%.3f m");
       ImGui::TextDisabled("arrows: F4 or Debug draw; spacing/radius (F5) %.0f/%.0f vox", w.dbgWindSpacing,
                           w.dbgWindRadius);

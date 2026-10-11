@@ -121,7 +121,9 @@ struct FieldProbe {
   float exposure = 0.0f;       // s in [-1, 1]: ridge > 0, hollow < 0
   float expMul = 1.0f;         // the exposure factor it produced
   float ramp = 1.0f;           // profile x exposure x altitude term
-  float leeMean = 1.0f, leeGust = 1.0f;
+  // The lee rotor's multipliers of the mean: along the heading, up (x the
+  // mean speed), the gust bands; leeLegacy = the pre-2026-10-11 along brake.
+  float leeMean = 1.0f, leeRise = 0.0f, leeGust = 1.0f, leeLegacy = 1.0f;
   float mean[3] = {}, bands[3] = {}, extra[3] = {}, total[3] = {};
   float band1 = 0.0f;          // the base band's along-wind component, unscaled
   float refSpeed = 0.0f;       // the weather's mean at the reference height
@@ -130,6 +132,11 @@ struct FieldProbe {
   float gustExcess = 0.0f;     // gust bands along the local mean, m/s
   WindStateQ q;                // the weather words behind all of it
 };
+// The lee rotor's multipliers at a lee SHARE (0..1) -- the integer mirror's
+// own arithmetic (common.wgsl windLeeQ), for the wind-field gate's sweep:
+// along / up / gust multipliers of the mean, and the pre-2026-10-11 brake.
+struct LeeRotor { float along = 1, rise = 0, gust = 1, legacy = 1; };
+LeeRotor LeeRotorAt(float share, const Tuning& t);
 FieldProbe Probe(const Tuning& t, uint32_t seed, uint32_t tick, uint32_t dayPhase,
                  const int32_t origin[3], int32_t x, int32_t y, int32_t z);
 // The same for n cells (xyz packed), resolving the weather once.

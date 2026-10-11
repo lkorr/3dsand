@@ -2611,8 +2611,14 @@ constexpr uint32_t kWindProfKnots = 16;
 // The fixed particle pool: kWindStreakCap slots of kWindStreakStride vec4f
 // rows (position+age, life/strength/ring head/timer, then the trail ring of
 // kWindStreakTrail positions). Must match STREAK_TRAIL_MAX / STREAK_STRIDE in
-// the shader (check_invariants `windstreak`). ~590 KiB; never hashed.
-constexpr uint32_t kWindStreakCap = 2048;
+// the shader (check_invariants `windstreak`). ~3.4 MiB; never hashed.
+// 12288 since 2026-10-11 (was 2048): the live count scales with the streak
+// radius's AREA (wind.h WindStreakSlots), so the default 1024 at 20 m is 9216
+// at the 60 m maximum plus the current tracers' 2304 -- a maxed radius was the
+// same 1024 spread over 9x the ground (ticket 2026-10-09_15-09-01). The pool
+// costs only its live slots: the update is one thread per LIVE slot, the draw
+// one instance each, and dead slots return on their first branch.
+constexpr uint32_t kWindStreakCap = 12288;
 constexpr uint32_t kWindStreakTrail = 16;
 constexpr uint32_t kWindStreakStride = 18;
 static_assert(kWindStreakStride == 2 + kWindStreakTrail, "streak row layout");
