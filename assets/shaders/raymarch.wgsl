@@ -5516,6 +5516,26 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
   return acc / (cellVox * cellVox * cellVox);
 }
 
+// Where the ray leaves the LONG-RANGE gas box (fine voxels from `ro`; 0 if it
+// starts outside and never enters, which can only make the caller's "all gas
+// is in front of X" test pass when there is no gas on the ray at all). Every
+// gas sample the renderer draws -- trace()'s voxels, the band, the fine box,
+// the wide box -- lies inside this box (the window and the fine box are inside
+// it on every axis), so nothing past this t can tint the pixel. fs() uses it to
+// order the cloud deck behind the gas (see "A SUMMIT IN THE DECK").
+fn gasBoxExitT(ro : vec3f, rdIn : vec3f) -> f32 {
+  var rd = rdIn;
+  if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
+  if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
+  if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
+  let inv = 1.0 / rd;
+  let lo = vec3f(gasFarOuterOriginVox());
+  let t0 = (lo - ro) * inv;
+  let t1 = (lo + GAS_FAROUT_EDGE - ro) * inv;
+  let tx = max(t0, t1);
+  return max(min(tx.x, min(tx.y, tx.z)), 0.0);
+}
+
 // ---- THE VALID BOX (2026-09-10): the box a far reader may march ------------
 // A level's box is toroidal: when its origin steps one level chunk toward the
 // player, the incoming face's SLOTS are the outgoing face's, and they keep the
@@ -15908,6 +15928,51 @@ fn fs(in : VSOut) -> FSOut {
     }
   }
 
+  // ---- A SUMMIT IN THE DECK, SEEN FROM UNDER IT: the cloud goes on FIRST ----
+  // (ticket 2026-10-10_03-25-09: "distant mountains through the smoke".) The
+  // deck composite further down ("THE DECK BETWEEN THE CAMERA AND THE GROUND")
+  // lays the cloud standing in front of a hit over the FINISHED colour, i.e.
+  // over the gas, the water and the ice as well. For an eye above or inside
+  // the deck that is the right order (the cloud is nearer than the ground and
+  // everything on it). For an eye UNDER the deck it is backwards: the cloud in
+  // front of a summit lies past the ray's crossing of the deck base, and every
+  // gas sample the renderer can draw lies inside the long-range gas box, which
+  // the ray has usually left by then. Laid last, the summit's cloud -- nearly
+  // opaque on an overcast deck -- painted over the smoke plume between the eye
+  // and the mountain, so the plume vanished exactly over the summits that rose
+  // into the deck and stayed over the sky beside them (the sky branch draws its
+  // clouds into `color` BEFORE the gas, which is why the two disagreed). The
+  // tell in the owner's shot was a dead-level line across the plume at the
+  // deck base's height on the distant range.
+  //
+  // So when the eye is under the deck and the whole gas box lies in front of
+  // the deck along this ray, the cloud is composited HERE, over the backdrop
+  // alone, and the gas, liquid and translucent blocks below lay their nearer
+  // media over it in order. Otherwise (eye in or above the deck, or a deck low
+  // enough to reach into the gas box) the late composite keeps doing it. On a
+  // pixel with no gas, liquid or ice in front of the summit both orders give
+  // the same colour, so nothing changes away from the case this fixes.
+  var deckDone = false;
+  if ((R.weatherFlags & RWF_CLOUDS) != 0u) {
+    var tBack = -1.0;
+    if (h.hit || h.saturated) { tBack = h.t; }
+    else if (far.hit) { tBack = far.t; }
+    else if (hz.hit) { tBack = hz.t; }
+    let deckLo = CL.baseM - cloudBaseJitterM(CL.thicknessM);
+    if (tBack >= 0.0 && rd.y > 1e-6 && CL.camM.y <= deckLo) {
+      let hitYM = (R.camPos.y + rd.y * tBack) * VOXEL_METERS;
+      // Where the ray rises through the deck base (fine voxels), and where it
+      // leaves the long-range gas box -- the box every drawn gas sample lives
+      // in (the window and the fine box are inside it).
+      let tDeck = (deckLo / VOXEL_METERS - R.camPos.y) / rd.y;
+      if (hitYM > deckLo && gasBoxExitT(R.camPos, rd) <= tDeck) {
+        let cs = cloudScreenAtHit(in.pos.xy, tBack * VOXEL_METERS);
+        color = color * cs.t + cs.c;
+        deckDone = true;
+      }
+    }
+  }
+
   // ---- gas tint along the ray ----
   // Gases stay pure participating media: smoke and steam have no interface to
   // reflect off, so the accumulated tau/tint is the whole story. mediaTau and
@@ -16256,7 +16321,9 @@ fn fs(in : VSOut) -> FSOut {
   // front of it is in that same image. A hit under the base with the eye under
   // it is nearer than any cloud (a straight segment between two points below
   // a plane stays below it): skipped, the common case, no fetch.
-  if ((R.weatherFlags & RWF_CLOUDS) != 0u && tDepth >= 0.0) {
+  // (Already done, in front of the gas, for a summit seen from under the deck:
+  // `deckDone`, "A SUMMIT IN THE DECK" above.)
+  if ((R.weatherFlags & RWF_CLOUDS) != 0u && tDepth >= 0.0 && !deckDone) {
     let deckLo = CL.baseM - cloudBaseJitterM(CL.thicknessM);
     let hitYM = (R.camPos.y + rd.y * tDepth) * VOXEL_METERS;
     if (CL.camM.y > deckLo || hitYM > deckLo) {

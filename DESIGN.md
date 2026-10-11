@@ -19541,6 +19541,22 @@ search runs only as far as the deck's far side or the rain's reach. A screen ray
 that stops at the ground also drops the horizon fill and the cirrus (both behind
 it).
 
+**Seen from under the deck, a summit's cloud goes on BEFORE the gas** (2026-10-11,
+ticket `2026-10-10_03-25-09`: "distant mountains through the smoke"). The hit
+composite used to be the last thing laid over the finished pixel, so for an eye
+under the deck the near-opaque cloud standing on a distant summit painted over
+the smoke plume between the eye and the mountain: the plume vanished exactly
+over the summits that rose into the deck, cut off along a dead-level line at
+the deck base's height, and stayed over the sky beside them (the sky branch
+draws its clouds into the backdrop before the gas). Now, when the eye is under
+the deck base, the hit is above it, and the ray has left the long-range gas box
+(`gasBoxExitT`, the box every drawn gas sample lives in) before it rises
+through the base, `fs()` composites the cloud over the backdrop (`h`/`far`/`hz`
+hit) BEFORE the gas, liquid and ice blocks, and those lay their nearer media
+over it in order. Otherwise (eye in or above the deck, or a deck low enough to
+reach into the gas box) the composite stays last, as before. A pixel with
+nothing in front of the summit gets the same colour either way.
+
 **The ground cut is for hit pixels; sky pixels refuse it** (2026-10-10, ticket
 `22-19-35`). The pyramid is not the terrain the frame draws — 25.6 m posts that
 bridge notches and stand over or shave real crests, and nothing at all where a
