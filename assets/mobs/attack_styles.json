@@ -7383,16 +7383,16 @@
     {
       "name": "shark_bite",
       "label": "Shark bite",
-      "//": "THE SHARK'S BITE, thrown FROM A CHARGE (ai_behavior.cpp Intent::Charge): the run carries the jaws to the target and this stroke only opens and shuts them. The windup is the GAPE -- `clip` plays the sidecar's `shark_bite`, an override on the lower jaw that drops it 42 degrees over 170 ms -- and the cut SNAPS it shut. `reach` 24 is the commit distance the pass decides from (centre to target), not how far the jaws travel on their own; `biteAnywhere`: the teeth close on whatever they meet on the way through. The jaws' natural weapon (shark.json `natural`) makes it a MOUTHFUL: a 2-voxel tear at full speed that also takes the neighbouring limbs inside 1.25 of it.",
+      "//": "THE SHARK'S BITE, thrown FROM A CHARGE (ai_behavior.cpp Intent::Charge): the run carries the jaws to the target and this stroke only opens and shuts them. The windup is the GAPE -- `clip` plays the sidecar's `shark_bite`, an override on the lower jaw that drops it 42 degrees over 170 ms -- and the cut SNAPS it shut. `reach` 40 is the commit distance the pass decides from (centre to target), not how far the jaws travel on their own; `biteAnywhere`: the teeth close on whatever they meet on the way through. The jaws' natural weapon (shark.json `natural`) makes it a MOUTHFUL: a 2-voxel tear at full speed that also takes the neighbouring limbs inside 1.25 of it.",
       "weapon": "jaws",
       "biteAnywhere": true,
-      "reach": 24,
+      "reach": 40,
       "target": { "leg": 0.4, "arm": 0.25, "spine": 0.22, "hand": 0.08, "head": 0.05 },
       "targetProne": { "leg": 0.4, "arm": 0.25, "spine": 0.22, "hand": 0.08, "head": 0.05 },
       "jitter": { "az": 0.04, "el": 0.04, "tempo": 0.12 },
       "clip": "shark_bite",
       "frames": [
-        { "name": "windup", "ticks": 6, "az": 0, "el": 0.05, "reach": -0.1, "ease": "chase" },
+        { "name": "windup", "ticks": 4, "az": 0, "el": 0.05, "reach": -0.1, "ease": "chase" },
         { "name": "cut", "ticks": 5, "az": 0, "el": -0.05, "reach": 0.15, "cuts": true },
         { "name": "recover", "ticks": 10, "az": 0, "el": 0, "reach": 0, "from": "body", "ease": "chase", "lean": "hold" }
       ],

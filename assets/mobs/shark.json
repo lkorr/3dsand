@@ -116,23 +116,23 @@
       }
     }
   },
-  "//speed": "World voxels per second at a cruise: 1.4 m/s. The charge is the behaviour's chargeSpeed (2.6x) under the body's own burst ceiling (swim.burst 2.8x): about 3.6 m/s, four times what a swimming man manages.",
-  "speed": 14,
+  "//speed": "World voxels per second at a cruise: 3.5 m/s. It circles at the behaviour's orbit.speed (1.3x, ~4.5 m/s, a lap in ~3 s) and charges at chargeSpeed (5x) under the body's own burst ceiling (swim.burst 5x): about 17.5 m/s -- a mako's burst. accel 300 takes it from the circle to the top of the run inside half a second; brake 160 is the glide that carries it ~80 voxels past you before it swings back onto the next lap.",
+  "speed": 35,
   "locomotion": {
-    "turnRate": 2.3,
-    "turnAccel": 9,
-    "turnRateMoving": 0.85,
+    "turnRate": 3.6,
+    "turnAccel": 16,
+    "turnRateMoving": 1.0,
     "driveAlignFull": 0.6,
     "driveAlignZero": 2.4
   },
   "//swim": "MobDef::SwimDef. A slow pitch (it does not stand on its tail), a soft accel and a softer brake (it glides), fins that hold it on its line, neutral buoyancy. surfaceGap 0.5: the back cruises half a voxel under, so the dorsal fin cuts the surface when it rides high; a charge may lift the back 1.5 over (breach) to take a man treading water. Out of the water: 10 s of breath, then 25 hp a second; it flops toward water it can feel within 10 voxels.",
   "swim": {
-    "pitchRate": 1.1,
+    "pitchRate": 1.8,
     "maxPitch": 0.9,
-    "accel": 22,
-    "brake": 9,
-    "sideGrip": 4,
-    "burst": 2.8,
+    "accel": 300,
+    "brake": 160,
+    "sideGrip": 7,
+    "burst": 5,
     "buoyancy": 1,
     "surfaceGap": 0.2,
     "bedGap": 1,
@@ -157,7 +157,7 @@
       "maxCurvature": 0.06,
       "bendHalfLife": 0.25,
       "beatHz": 0.55,
-      "slip": 0.7,
+      "slip": 1.0,
       "ampIdle": 0.45,
       "ampSpeed": 0.8,
       "parts": [

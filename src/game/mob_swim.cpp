@@ -57,6 +57,11 @@ namespace {
 // The Schmitt pair on the body's wet share (Mob::swimming_).
 constexpr float kSwimEnter = 0.55f;
 constexpr float kSwimLeave = 0.30f;
+// The longest piece of one tick's swim move resolved at once, cells (the
+// body samples sit ~5 apart down a shark; a body is ~3 across), and the most
+// pieces a tick is cut into.
+constexpr float kMaxSubstep = 2.0f;
+constexpr int kMaxSubsteps = 8;
 // How far the waterline / bed scans reach from the body's centre, cells.
 constexpr int kColumnScan = 24;
 // A stranded body lies this far over on its flank (radians).
@@ -364,51 +369,63 @@ void MobSystem::DriveSwim(Mob& mob, const MobDef& def, World& world, float dt) {
     }
     return n;
   };
-  const int rockNow = rockAt(c);
-  auto fits = [&](Vec3 nc) {
-    if (BlockedByMob(mob, def, nc.x, nc.z)) return false;
-    const int n = rockAt(nc);
-    return n == 0 || n <= rockNow - (rockNow > 0 ? 0 : 1);
-  };
-  const Vec3 step = v * dt;
-  Vec3 nc = c + step;
-  // GLANCE OFF: a refused step is first tried turned aside -- a fish that
-  // meets a wall or a body at speed slides past it with most of its speed,
-  // it does not stop dead (a charge goes past its victim, not into it). The
-  // side it is already turning to first; the velocity turns with the step.
-  if (!fits(nc)) {
-    const float side = mob.turnVel_ >= 0.0f ? 1.0f : -1.0f;
-    for (float a : {0.35f, -0.35f, 0.7f, -0.7f, 1.05f, -1.05f, 1.4f, -1.4f}) {
-      const float r = a * side;
-      const float cr = std::cos(r), sr = std::sin(r);
-      const Vec3 st{step.x * cr + step.z * sr, step.y, -step.x * sr + step.z * cr};
-      if (!fits(c + st)) continue;
-      nc = c + st;
-      v = Vec3{v.x * cr + v.z * sr, v.y, -v.x * sr + v.z * cr} * 0.92f;
-      mob.swimGlances_++;
-      break;
-    }
-  }
-  if (!fits(nc)) {
-    // Each axis alone, longest first, and what refuses its axis loses that
-    // velocity: a fish grazing a wall slides along it.
-    nc = c;
-    float comp[3] = {step.x, step.y, step.z};
-    int order[3] = {0, 1, 2};
-    std::sort(order, order + 3, [&](int a, int b) {
-      return std::fabs(comp[a]) > std::fabs(comp[b]);
-    });
-    for (int a : order) {
-      if (comp[a] == 0.0f) continue;
-      Vec3 trial = nc;
-      (a == 0 ? trial.x : a == 1 ? trial.y : trial.z) += comp[a];
-      if (fits(trial)) {
-        nc = trial;
-      } else {
-        (a == 0 ? v.x : a == 1 ? v.y : v.z) = 0.0f;
-        mob.swimBumps_++;
+  // SUBSTEPPED: the box is only sampled where a step ENDS, so a step longer
+  // than the gap between samples could pass through a thin wall or a body. A
+  // charge at 5x a fast cruise covers six voxels a tick; the move is cut into
+  // pieces of at most kMaxSubstep, each resolved (and glanced) on its own.
+  const int nSub = std::clamp(
+      (int)std::ceil((v * dt).len() / kMaxSubstep), 1, kMaxSubsteps);
+  const float subDt = dt / (float)nSub;
+  Vec3 nc = c;
+  for (int sub = 0; sub < nSub; sub++) {
+    const Vec3 p0 = nc;
+    const int rockNow = rockAt(p0);
+    auto fits = [&](Vec3 q) {
+      if (BlockedByMob(mob, def, q.x, q.z)) return false;
+      const int n = rockAt(q);
+      return n == 0 || n <= rockNow - (rockNow > 0 ? 0 : 1);
+    };
+    const Vec3 step = v * subDt;
+    Vec3 np = p0 + step;
+    // GLANCE OFF: a refused step is first tried turned aside -- a fish that
+    // meets a wall or a body at speed slides past it with most of its speed,
+    // it does not stop dead (a charge goes past its victim, not into it). The
+    // side it is already turning to first; the velocity turns with the step.
+    if (!fits(np)) {
+      const float side = mob.turnVel_ >= 0.0f ? 1.0f : -1.0f;
+      for (float a : {0.35f, -0.35f, 0.7f, -0.7f, 1.05f, -1.05f, 1.4f, -1.4f}) {
+        const float r = a * side;
+        const float cr = std::cos(r), sr = std::sin(r);
+        const Vec3 st{step.x * cr + step.z * sr, step.y, -step.x * sr + step.z * cr};
+        if (!fits(p0 + st)) continue;
+        np = p0 + st;
+        v = Vec3{v.x * cr + v.z * sr, v.y, -v.x * sr + v.z * cr} * 0.92f;
+        mob.swimGlances_++;
+        break;
       }
     }
+    if (!fits(np)) {
+      // Each axis alone, longest first, and what refuses its axis loses that
+      // velocity: a fish grazing a wall slides along it.
+      np = p0;
+      float comp[3] = {step.x, step.y, step.z};
+      int order[3] = {0, 1, 2};
+      std::sort(order, order + 3, [&](int a, int b) {
+        return std::fabs(comp[a]) > std::fabs(comp[b]);
+      });
+      for (int a : order) {
+        if (comp[a] == 0.0f) continue;
+        Vec3 trial = np;
+        (a == 0 ? trial.x : a == 1 ? trial.y : trial.z) += comp[a];
+        if (fits(trial)) {
+          np = trial;
+        } else {
+          (a == 0 ? v.x : a == 1 ? v.y : v.z) = 0.0f;
+          mob.swimBumps_++;
+        }
+      }
+    }
+    nc = np;
   }
   // THE WATERLINE IS A CEILING: a body does not swim out of the water by
   // asking. Its back may just break the surface; a charge's run may lift it

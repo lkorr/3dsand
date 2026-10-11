@@ -15015,7 +15015,11 @@ order, each tick:
    each axis alone. A body already partly in rock (the yaw is not collision
    checked, as the walker's is not) may move while no MORE of it goes in --
    `MoveNoDeeper`'s rule. The waterline is a hard ceiling (the back may just
-   break it) except by `breach` on a charge's run.
+   break it) except by `breach` on a charge's run. The move is SUBSTEPPED into
+   pieces of at most 2 voxels (`kMaxSubstep`, up to 8 a tick), each resolved
+   and glanced on its own: the box is sampled only where a step ends, and a
+   shark's charge covers ~6 voxels a tick, more than the gap between its
+   samples or the width of a man.
 6. **It banks**: the coordinated-turn lean `atan(v w / g)`, scaled by `bank`.
 
 **The pose**: `PoseInputs::attitude` (pitch, roll) is composed on the root in
@@ -15129,8 +15133,10 @@ back `limbs` (names, parents, hp, tags, anchors), `root`, the jaws' `edge`,
 authored. A new fish is a sidecar and `node scripts/gen_fish.mjs <name>`.
 
 **The two creatures.** SHARK (`assets/mobs/shark.*`): 2.2 m at 40 art
-voxels/m, eight limbs, ~770 hp, cruise 1.4 m/s, charge 2.6x; circles at
-19 voxels for 5-11 s a lap, paces, charges, bites (`shark_bite`: 70 hp at
+voxels/m, eight limbs, ~770 hp, cruise 3.5 m/s, charge 5x (~17.5 m/s,
+accel 300 vox/s^2 so the run tops out inside half a second, brake 160 so it
+glides ~80 voxels past before swinging back); circles at 26 voxels at 1.3x
+cruise (~3 s a lap, 4-9 s before a pass may begin), paces, charges, bites (`shark_bite`: 70 hp at
 jaw force 0.85, a 2.6 x 0.45-voxel hole and a 1.15 mouthful), goes past;
 blood in the water makes it bolder; under a quarter of its life it breaks
 off. PIRANHA (`assets/mobs/piranha.*`): 0.38 m at 80/m, ~34 hp, quick to
