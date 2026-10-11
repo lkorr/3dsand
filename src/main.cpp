@@ -17321,6 +17321,7 @@ int main(int argc, char** argv) {
         wr.expMul = fp.expMul;
         wr.ramp = fp.ramp;
         wr.leeMean = fp.leeMean;
+        wr.leeRise = fp.leeRise;
         wr.terrQueries = windfield::TerrainQueries();
       }
 

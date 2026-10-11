@@ -3908,8 +3908,10 @@ struct Tuning {
     float thermalPeriod = TPD(wind, thermalPeriod);
     // LEE TURBULENCE: past leeOnset intensity, the lee slope of a steep drop
     // (ground descending downwind steeper than leeSlope) gets a gust boost
-    // (leeGust) and some reverse flow (leeReverse), in a layer leeDepth
-    // metres deep. leeStrength scales it all.
+    // (leeGust) and a ROTOR, in a layer leeDepth metres deep: the mean turns
+    // up and then back up the slope, to leeReverse x itself at full share
+    // (common.wgsl windLeeF; it turns, it never stalls). leeStrength scales
+    // it all.
     float leeOnset = TPD(wind, leeOnset);
     float leeStrength = TPD(wind, leeStrength);
     float leeSlope = TPD(wind, leeSlope);

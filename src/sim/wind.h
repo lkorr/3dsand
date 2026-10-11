@@ -274,16 +274,42 @@ inline uint32_t WindDebugArrowCount(const Tuning& t) {
 // The pool is split by slot index: [0, wind) are gust streaks, [wind, wind +
 // current) are current tracers. A kind whose alpha is 0 owns no slots, so the
 // other kind starts at slot 0 rather than leaving dead slots dispatched.
+//
+// THE COUNTS ARE A DENSITY. wind.streakCount / currentStreakCount are the slots
+// at a streak radius of kWindStreakRefRadiusM; past it they scale with the
+// spawn disc's AREA, (radius / ref)^2, so a maxed 60 m radius keeps the 20 m
+// density instead of spreading the same 1024 over 9x the ground (ticket
+// 2026-10-09_15-09-01: "one side of the hill has only a few metres of
+// trail"). A smaller radius keeps the authored count (a denser disc, as
+// before). The two kinds are clamped together to the pool, each to its share
+// of it, and the tracers to the 12 bits streakN[3] carries them in.
+constexpr float kWindStreakRefRadiusM = 20.0f;
+inline float WindStreakAreaScale(const Tuning& t) {
+  const float r = t.wind.streakRadius / kWindStreakRefRadiusM;
+  return r > 1.0f ? r * r : 1.0f;
+}
+inline uint32_t StreakScaledCount(int authored, float scale) {
+  if (authored <= 0) return 0u;
+  const double v = (double)authored * (double)scale + 0.5;
+  return v >= (double)kWindStreakCap ? kWindStreakCap : (uint32_t)v;
+}
+inline uint32_t CurrentStreakWanted(const Tuning& t) {
+  if (t.wind.currentStreakAlpha <= 0.0f) return 0u;
+  const uint32_t n = StreakScaledCount(t.wind.currentStreakCount, WindStreakAreaScale(t));
+  return n > 0xFFFu ? 0xFFFu : n;
+}
 inline uint32_t WindStreakSlots(const Tuning& t) {
   if (t.wind.streakAlpha <= 0.0f) return 0u;
-  const int n = t.wind.streakCount < 0 ? 0 : t.wind.streakCount;
-  return (uint32_t)(n > (int)kWindStreakCap ? (int)kWindStreakCap : n);
+  const uint32_t want = StreakScaledCount(t.wind.streakCount, WindStreakAreaScale(t));
+  const uint32_t cur = CurrentStreakWanted(t);
+  if (want + cur <= kWindStreakCap) return want;
+  // Over the pool: both kinds shrink in proportion.
+  return (uint32_t)(((uint64_t)want * kWindStreakCap) / (uint64_t)(want + cur));
 }
 inline uint32_t CurrentStreakSlots(const Tuning& t) {
-  if (t.wind.currentStreakAlpha <= 0.0f) return 0u;
-  const int n = t.wind.currentStreakCount < 0 ? 0 : t.wind.currentStreakCount;
-  const int room = (int)kWindStreakCap - (int)WindStreakSlots(t);
-  return (uint32_t)(n > room ? room : n);
+  const uint32_t n = CurrentStreakWanted(t);
+  const uint32_t room = kWindStreakCap - WindStreakSlots(t);
+  return n > room ? room : n;
 }
 // Instances for the streak draw: both kinds' slots, or 0 when both alphas are
 // off — the SAME count Simulation::EncodeShadowResolve dispatches the update

@@ -2932,15 +2932,35 @@ fn windLocalF(rp : WindRampF, R : ptr<uniform, RenderParams>) -> vec3f {
   return v * rp.tr.edge;
 }
 
-// (mean multiplier, gust multiplier) of the lee rotor at a sample.
-fn windLeeF(rp : WindRampF, dl : vec2f, R : ptr<uniform, RenderParams>) -> vec2f {
-  if ((*R).wfLeeQ <= 0 || rp.tr.edge <= 0.0) { return vec2f(1.0); }
+// THE LEE ROTOR is a ROTATION of the mean, not a brake (ticket
+// 2026-10-09_15-09-01). With l the local lee share (strength x how far the
+// downwind slope is past wfLeeSlopeQ x the layer's depth fade, 0..1) the mean
+// turns by pi * l in the (along, up) plane and its size goes 1 -> leeReverse:
+//   along = m cos(pi l),  up = WIND_LEE_RISE x m sin(pi l),  m = 1 - l (1 - rev)
+// so the layer reads, from its top down: full wind, a RISING limb mid-layer
+// (where the separated flow climbs back into the stream), and at the ground
+// the reversed flow blowing back up the slope. Until then it was
+// along = 1 - l (1 + rev): the same two ends, but a straight line through
+// ZERO -- at the default strength 0.8 the lee's lowest metres were stalled air
+// (|U| 0.08 x the mean), so the gust streaks there drew a few metres and
+// stopped while the other side of the hill ran full length. Real lee air
+// separates and recirculates; it does not stop. The end points are unchanged
+// (l = 0 is the open field exactly, l = 1 the old full rotor), only the path
+// between them is. Returns (along multiplier, rise multiplier, gust
+// multiplier); the rise is x the mean speed, upward.
+const WIND_LEE_RISE : f32 = 0.5;
+const WIND_LEE_RISE_Q : i32 = 32768;   // the same 0.5, Q16, for windLeeQ
+
+fn windLeeF(rp : WindRampF, dl : vec2f, R : ptr<uniform, RenderParams>) -> vec3f {
+  if ((*R).wfLeeQ <= 0 || rp.tr.edge <= 0.0) { return vec3f(1.0, 0.0, 1.0); }
   let lee = f32((*R).wfLeeQ) * (1.0 / 65536.0);
   let sa = rp.tr.gx * dl.x + rp.tr.gz * dl.y;   // < 0: the ground falls away downwind
   let s0 = max(f32((*R).wfLeeSlopeQ) * (1.0 / 65536.0), 1e-3);
   let l = lee * clamp((-sa - s0) / s0, 0.0, 1.0) *
           (1.0 - min(rp.hagl / f32(max((*R).wfLeeDepth, 1)), 1.0)) * rp.tr.edge;
-  return vec2f(1.0 - l * (1.0 + f32((*R).wfLeeRevQ) * (1.0 / 65536.0)),
+  let m = 1.0 - l * (1.0 - f32((*R).wfLeeRevQ) * (1.0 / 65536.0));
+  let th = 3.14159265 * l;
+  return vec3f(m * cos(th), WIND_LEE_RISE * m * sin(th),
                1.0 + l * f32((*R).wfLeeGustQ) * (1.0 / 65536.0));
 }
 
@@ -2970,8 +2990,10 @@ fn windSampleAt(p : vec3f, t : f32, ph : f32,
   s.crossw = vec2f(-dl.y, dl.x);
   let lee = windLeeF(rp, dl, R);
   s.mean = dl * ((*R).windSpeed * alt * lee.x);
-  s.amp = (*R).windGust * alt * lee.y;
-  s.extra = windThermalF(p, R) * alt + windLocalF(rp, R);
+  s.amp = (*R).windGust * alt * lee.z;
+  // The rotor's rising limb rides `extra` (the mean is XZ only).
+  s.extra = windThermalF(p, R) * alt + windLocalF(rp, R) +
+            vec3f(0.0, (*R).windSpeed * alt * lee.y, 0.0);
   // Travelling gust phase. `gp` is the distance DOWNWIND in radians of the
   // base band; `adv` is how far the AIR has travelled, in the same radians —
   // K * integral(U dt), summed on the CPU (windfield.h AdvPhase) because U
@@ -3888,10 +3910,13 @@ fn windLocalQ(rq : WindRampQ, T : ptr<uniform, TickParams>) -> vec3<i32> {
   return vec3<i32>(wq(v.x, rq.tr.edge), wq(v.y, rq.tr.edge), wq(v.z, rq.tr.edge));
 }
 
-// (mean multiplier, gust multiplier), Q16.
-fn windLeeQ(rq : WindRampQ, dl : vec2<i32>, T : ptr<uniform, TickParams>) -> vec2<i32> {
+// (along multiplier, rise multiplier, gust multiplier), Q16 -- windLeeF's
+// rotation in integers: the angle pi * l is l / 2 in BAM (65536 = 2 pi),
+// windSinQ gives sin and (+16384) cos. l = 0 returns (65536, 0, 65536) exactly
+// (windSinQ is exact at 0 and 90 degrees), so the open field is bit-identical.
+fn windLeeQ(rq : WindRampQ, dl : vec2<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
   let lee = (*T).wfLeeQ;
-  if (lee <= 0 || rq.tr.edge <= 0) { return vec2<i32>(65536, 65536); }
+  if (lee <= 0 || rq.tr.edge <= 0) { return vec3<i32>(65536, 0, 65536); }
   let sa = wq(rq.tr.gx, dl.x) + wq(rq.tr.gz, dl.y);
   let s0 = max((*T).wfLeeSlopeQ, 256);
   // (-sa - s0) / s0 as Q16, staged through Q8 so a cliff-steep slope (tens of
@@ -3899,7 +3924,9 @@ fn windLeeQ(rq : WindRampQ, dl : vec2<i32>, T : ptr<uniform, TickParams>) -> vec
   let f = clamp(((-sa - s0) / max(s0 >> 8u, 1)) * 256, 0, 65536);
   var l = wq(wq(lee, f), 65536 - windDepthFracQ(rq.hQ10, (*T).wfLeeDepth));
   l = wq(l, rq.tr.edge);
-  return vec2<i32>(65536 - wq(l, 65536 + (*T).wfLeeRevQ),
+  let m = 65536 - wq(l, 65536 - (*T).wfLeeRevQ);
+  let th = l >> 1u;
+  return vec3<i32>(wq(m, windSinQ(th + 16384)), wq(WIND_LEE_RISE_Q, wq(m, windSinQ(th))),
                    65536 + wq(l, (*T).wfLeeGustQ));
 }
 
@@ -4087,8 +4114,10 @@ fn windAmbQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
   let dl = windWanderQ(p, d, T);
   let cw = vec2<i32>(-dl.y, dl.x);       // 90 degrees to its left
   let lee = windLeeQ(rq, dl, T);
-  let spd = wq(wq((*T).windSpeedQ, alt), lee.x);
-  let amp = wq(wq((*T).windGustQ, alt), lee.y);
+  let spd0 = wq((*T).windSpeedQ, alt);
+  let spd = wq(spd0, lee.x);
+  let rise = wq(spd0, lee.y);            // the lee rotor's rising limb (windLeeF)
+  let amp = wq(wq((*T).windGustQ, alt), lee.z);
 
   // Band components in the (along, cross, up) frame. Five spatial phases,
   // five advection offsets and six evolution clocks, exactly as windSampleAt
@@ -4123,7 +4152,7 @@ fn windAmbQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
   // The regime's additive terms, scaled by the ramp like the mean they sit
   // beside (windMeanWS's `extra`).
   let th = windThermalQ(p, T);
-  let extra = vec3<i32>(wq(th.x, alt), wq(th.y, alt), wq(th.z, alt)) + windLocalQ(rq, T);
+  let extra = vec3<i32>(wq(th.x, alt), wq(th.y, alt) + rise, wq(th.z, alt)) + windLocalQ(rq, T);
   // windMeanWS() + the 0.7/0.3 mix, then the primitive sum. The primitives are
   // ADDED to the ambient field rather than replacing it, which is what makes a
   // fan feel like it is blowing INTO weather instead of switching the weather

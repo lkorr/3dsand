@@ -19775,6 +19775,29 @@ would move the sim. `wind.streakGround` (default on, `RenderParams.streakN[3]`
 bit 0) switches it; the `heat-updraft` gate's probe turns it off, because it
 reads one streak step back as `windAt`.
 
+**The lee rotor turns the air, it does not stop it (2026-10-11, same ticket's
+other half).** Past the regime's lee onset a slope falling away downwind
+steeper than `wind.leeSlope` has a lee share `l` (strength x slope excess x
+the `leeDepth` layer fade). The mean used to be braked along a straight line,
+`1 - l (1 + leeReverse)`, which crosses ZERO: at the default strength 0.8 the
+lowest metres behind a steep crest were near-still air and a streak there drew
+a few metres while the other face's ran far. It is now a ROTATION in the
+(along, up) plane, `common.wgsl windLeeF`/`windLeeQ` and the C++ mirror's
+`MirrorLee`: angle `pi l`, size `1 - l (1 - leeReverse)`, the up part x 0.5
+(`WIND_LEE_RISE`) -- full wind at the layer top, a rising limb mid-layer,
+reversed flow up the slope at the ground. Same end points (l = 0 is the open
+field bit-for-bit, l = 1 the old full rotor), so the hash moves only where a
+lee is active (strong wind, steep downwind slope). `wind-field` asserts the
+rotor on any table (`windfield::LeeRotorAt` swept over share 0..1: min |U|
+0.33 x the mean vs the old brake's 0, share 0 the identity) and measures it on
+real relief: streak travel over a lifetime, lee vs windward vs open, plus the
+"before" brake from `FieldProbe::leeLegacy`; `SANDVOX_WIND_LEE_AT=x,z` (with
+`SANDVOX_MAP`) runs it on any hill. **The streak counts are a density**:
+`wind.streakCount`/`currentStreakCount` are the slots at a 20 m radius and
+scale with the radius's area past it (`wind.h WindStreakSlots`), in a pool of
+`kWindStreakCap` = 12288 (was 2048, so a maxed 60 m radius spread the same
+1024 over 9x the ground).
+
 **Streaks are air; the pool also draws the CURRENT (2026-10-10).** The update
 reads the cell under each streak (`voxWordAt`; the row declares
 `R(Voxels) R(Materials) R(PageTable)`): a gust streak is never born in liquid
