@@ -4483,6 +4483,14 @@ class Mob {
   // One limp tick of the arrest measurement TakeRagdollImpact drains. See the
   // long note at its definition.
   void TickRagdollArrest(float dt);
+  // THE AIR (ticket 2026-10-09_15-16-57): a loose rig moving faster than
+  // player.maxFall (the controller's terminal velocity) is brought back to
+  // it, the same Δv on every simulated limb (so it never bends the rig).
+  // Returns the Δv applied (zero at or under vt). `vCom` is the rig's
+  // mass-weighted velocity, vox/s; see the note at the definition.
+  Vec3 ApplyRigAirDrag(Vec3 vCom, float dt);
+  // The rig's mass-weighted centre-of-mass velocity (held pieces excluded).
+  bool RigComVelocity(Vec3& out) const;
   // Re-derive origin_/heading_ from where the pelvis lies, make every limb
   // kinematic again where it is, and start the blend (RagdollPhase::GetUp).
   void BeginGetUp(World& world);

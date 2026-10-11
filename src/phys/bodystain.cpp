@@ -102,6 +102,68 @@ CellDist BuildCellDist(const std::vector<IVec3>& seeds, int pad) {
   };
   for (const IVec3& v : seeds)
     f.d[idx(v.x - f.lo.x, v.y - f.lo.y, v.z - f.lo.z)] = 0;
+  // ---- BOUNDED: ONLY THE RIM THE CALLER CAN READ ----------------------------
+  //
+  // Every reader compares the distance against a reach under `pad` cells and
+  // skips anything at or past it (StainWoundAs, SoakCut), so the field only
+  // has to be EXACT up to 3 * pad chamfer units; beyond that kFar reads the
+  // same. That is a Dial (bucket) Dijkstra over the 26-neighbourhood with the
+  // same 3-4-5 weights, from the seeds that touch a non-seed cell -- O(the
+  // crater's surface times the rim), where the two raster sweeps below are
+  // O(the box) x 13 x 2. A lethal landing craters every limb at once and a
+  // splat's crater is most of a limb on an 8x skin lattice, so the sweeps were
+  // ~7 ms of the splat tick (ticket 2026-10-09_15-16-57, SANDVOX_SPLAT_PROF
+  // "woundStain"). Within the bound the two give IDENTICAL values (checked
+  // over random seed sets: a 3x3x3 chamfer mask in an unobstructed box is the
+  // weighted shortest path, which is what Dijkstra computes).
+  // SANDVOX_CELLDIST_SWEEP=1: the full two-sweep field (the A/B arm).
+  static const bool kSweep = [] {
+    const char* e = std::getenv("SANDVOX_CELLDIST_SWEEP");
+    return e != nullptr && e[0] != '0';
+  }();
+  if (!kSweep) {
+    const int cutoff = 3 * pad;
+    std::vector<std::vector<uint32_t>> bucket((size_t)cutoff + 1);
+    auto inBox = [&](int x, int y, int z) {
+      return x >= 0 && y >= 0 && z >= 0 && x < dx && y < dy && z < dz;
+    };
+    for (const IVec3& v : seeds) {
+      const int x = v.x - f.lo.x, y = v.y - f.lo.y, z = v.z - f.lo.z;
+      bool rim = false;
+      for (int oz = -1; oz <= 1 && !rim; oz++)
+        for (int oy = -1; oy <= 1 && !rim; oy++)
+          for (int ox = -1; ox <= 1 && !rim; ox++)
+            if (inBox(x + ox, y + oy, z + oz) && f.d[idx(x + ox, y + oy, z + oz)] != 0)
+              rim = true;
+      if (rim) bucket[0].push_back((uint32_t)idx(x, y, z));
+    }
+    // A seed listed twice (duplicate cells) is relaxed twice; harmless.
+    for (int b = 0; b <= cutoff; b++) {
+      for (size_t k = 0; k < bucket[b].size(); k++) {
+        const uint32_t i = bucket[b][k];
+        if (f.d[i] != (uint16_t)b) continue;  // improved since it was queued
+        const int x = (int)(i % (uint32_t)dx);
+        const int y = (int)((i / (uint32_t)dx) % (uint32_t)dy);
+        const int z = (int)(i / ((uint32_t)dx * (uint32_t)dy));
+        for (int oz = -1; oz <= 1; oz++)
+          for (int oy = -1; oy <= 1; oy++)
+            for (int ox = -1; ox <= 1; ox++) {
+              const int m = (ox != 0) + (oy != 0) + (oz != 0);
+              if (m == 0) continue;
+              const int nx = x + ox, ny = y + oy, nz = z + oz;
+              if (!inBox(nx, ny, nz)) continue;
+              const int nc = b + (m == 1 ? 3 : m == 2 ? 4 : 5);
+              if (nc > cutoff) continue;
+              const size_t ni = idx(nx, ny, nz);
+              if (nc < (int)f.d[ni]) {
+                f.d[ni] = (uint16_t)nc;
+                bucket[nc].push_back((uint32_t)ni);
+              }
+            }
+      }
+    }
+    return f;
+  }
   // The 13 neighbours that precede (z,y,x) in the forward sweep; the backward
   // sweep uses their negations. Weight 3 across a face, 4 an edge, 5 a corner.
   static const int kPred[13][3] = {

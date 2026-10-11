@@ -36,6 +36,58 @@ using nlohmann::json;
 
 namespace {
 
+// SANDVOX_SPLAT_PROF=<ms>: a lethal landing (Mob::ApplyFallDamage) or a
+// MobSystem::PreTick slower than that prints where it went, stage by stage
+// (ticket 2026-10-09_15-16-57: "the splat hitches"). Off: one branch a mark.
+struct StageClock {
+  double ms = 0.0, t0 = 0.0, last = 0.0;
+  char buf[768];
+  int n = 0;
+  static double Now() {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+  static double Threshold() {
+    static const double v = [] {
+      const char* e = std::getenv("SANDVOX_SPLAT_PROF");
+      const double ms = e ? std::atof(e) : 0.0;
+      // ...and the burn profiler's stages with it, so a slow BurnLimbs names
+      // its own part (burnprof.h; otherwise only --burn-npc turns it on).
+      if (ms > 0.0) burnprof::Get().on = true;
+      return ms;
+    }();
+    return v;
+  }
+  StageClock() : ms(Threshold()) {
+    buf[0] = 0;
+    if (ms > 0.0) t0 = last = Now();
+  }
+  // Sub-stage accumulators a caller several frames down adds into (the
+  // splat's per-limb CarveLimb and StainWound inside CarveRadialAll).
+  static double& Acc(int k) {
+    static thread_local double a[4] = {};
+    return a[k & 3];
+  }
+  void Mark(const char* nm) {
+    if (ms <= 0.0) return;
+    const double t = Now();
+    if (n < 700) n += std::snprintf(buf + n, sizeof buf - (size_t)n, " %s %.2f", nm, t - last);
+    last = t;
+  }
+  void Report(const char* what, uint32_t tick) {
+    if (ms <= 0.0) return;
+    const double total = Now() - t0;
+    if (total < ms) return;
+    std::string bp;
+    const burnprof::Profile& p = burnprof::Get();
+    for (int i = 0; i < burnprof::kCount; i++)
+      if (p.cur[i] >= 500.0)
+        bp += " " + std::string(burnprof::Name(i)) + " " + std::to_string((int)(p.cur[i] / 100.0) / 10.0);
+    std::printf("[splatprof] %s tick %u: %.2f ms =%s%s%s\n", what, tick, total, buf,
+                bp.empty() ? "" : " | burnprof ms:", bp.c_str());
+  }
+};
+
 // Quaternion helpers now live in game/anim.h (CPU gameplay floats: legal
 // outside the hashed grid domain, see debris.h). Thin aliases keep the
 // existing call sites readable.
@@ -8750,14 +8802,17 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // A PLAYER WHO DIED LAST TICK LEAVES A CORPSE IN mobs_ (AdoptDeadAvatar).
   // Before the risings, so a bite booked on the avatar rises from the moved
   // corpse under its new id; outside every loop over mobs_, since it pushes.
+  StageClock sc;
   for (Mob* av : avatars_)
     if (av != nullptr) AdoptDeadAvatar(*av);
+  sc.Mark("adoptDeadAvatar");
   // THE CORPSES WHOSE CLOCK CAME ROUND STAND UP — FIRST, before any pass has
   // touched the dead this tick, so what gets up is the body exactly as it lay
   // at the end of the last one (the rot in it does not get one more tick's say
   // on the risen lattice). Outside every loop over mobs_: this spawns, and a
   // spawn pushes to the vector those loops walk by index.
   ServiceRisings(tick);
+  sc.Mark("risings");
   // Runtime defs nothing has held for kDefIdleSweeps sweeps give their bricks
   // back (EvictUnusedDefs). After the risings, which may have composed.
   if (tick % kDefSweepTicks == 0) EvictUnusedDefs(-1, kDefIdleSweeps);
@@ -8774,7 +8829,9 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // Per-voxel burning and dissolution, once per TICK — never per frame. The
   // pass writes fire into the hashed grid, so running it off the render clock
   // would make the world a function of frame rate.
+  sc.Mark("artShocks");
   BurnLimbs(tick, world, cellOps, spawns);
+  sc.Mark("burnLimbs");
   // Severed flesh's drips from last tick's StainDeadFlesh (WetOneLimb),
   // dropped rather than carried when the tick is full, as Mob's are.
   for (const ParticleSpawn& s : pendingSpawns_) {
@@ -8786,6 +8843,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // (The dead Mobs burn inside BurnLimbs, as rigs.) ...and severed flesh --
   // limbs and gobbets that left a rig -- through the same limb pass.
   BurnDeadFlesh(tick, world, cellOps, spawns);
+  sc.Mark("burnDeadFlesh");
   // Bursts from before last tick have been seen by everyone who is going to
   // see them (StainLimbs this tick, the avatar's own PreTick whichever side
   // of this it runs on). A harness with no avatar never marks doneAvatar, so
@@ -8880,6 +8938,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // The cauterise scans of every wound the loop will bleed, across the pool.
   PrecomputeWoundCharred(tick);
 
+  sc.Mark("actors");
   burnprof::Scope bpMobLoop(burnprof::kMobLoop);
   for (size_t mi = 0; mi < mobs_.size();) {
     Mob& mob = mobs_[mi];
@@ -9223,10 +9282,12 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // bursts (splatter). After every wound has bled, so a gout reaches the
   // creature beside it on the tick it happens.
   bpMobLoop.Stop();
+  sc.Mark("mobLoop");
   {
     burnprof::Scope bpStain(burnprof::kStain);
     StainLimbs(tick, world);
   }
+  sc.Mark("stain");
   // THE BODY QUERY for this tick (mob_shock.cpp): every limb where it stands
   // after this tick's drive, asked of the field SubmitTick's elecQuery row
   // reads; answered K + 1 ticks from now, at the fixed latency.
@@ -9240,6 +9301,8 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     burnprof::Scope bpDeadSleep(burnprof::kDeadSleep);
     UpdateDeadSleep(world, tick);
   }
+  sc.Mark("query+deadSleep");
+  sc.Report("MobSystem::PreTick", tick);
   // ---- GRADUAL SKIN TINT (the 60-second corpse-to-zombie palette fade) ----
   //
   // Each dedicated palette entry lerps from the living colour to the undead
@@ -10276,10 +10339,11 @@ constexpr float kArrestTickFloorVox = 10.0f;  // 1 m/s lost in one tick
 constexpr uint8_t kArrestRunTicks = 4;        // 0.13 s at 30 Hz
 }  // namespace
 
-void Mob::TickRagdollArrest(float dt) {
+bool Mob::RigComVelocity(Vec3& out) const {
   // The rig's centre-of-mass velocity. Held limbs are excluded for the same
   // reason every other ragdoll path excludes them: a severed piece mid-hold is
   // kinematic and is not part of this body's momentum any more.
+  if (!phys_) return false;
   Vec3 mom{};
   float massSum = 0.0f;
   for (const MobLimb& l : limbs_) {
@@ -10290,8 +10354,52 @@ void Mob::TickRagdollArrest(float dt) {
     mom += lv * m;
     massSum += m;
   }
-  if (massSum <= 0.0f) return;
-  const Vec3 vel = mom * (1.0f / massSum);
+  if (massSum <= 0.0f) return false;
+  out = mom * (1.0f / massSum);
+  return true;
+}
+
+// ---- THE AIR: a loose rig has a terminal velocity -----------------------------
+//
+// The controller has one (player.maxFall, 53.5 m/s); a limp or dead rig had
+// none -- Jolt's debrisLinearDamping puts it near 200 m/s -- so a body that
+// went limp off a 2 km mountain went on accelerating to 75 m/s, past 90% of
+// physics.cpp's 80 m/s safety ceiling. There every limb tripped the runaway
+// net one at a time (now judged relative to the rig, see SweepRunawayRigs),
+// Jolt's per-body clamp bent the rig, and the arrest measured the damping as
+// a 27 m/s impact in open air (ticket 2026-10-09_15-16-57).
+//
+// The CONTROLLER'S terminal velocity, applied the way the controller applies
+// it (Player::Update clamps the fall at maxFall): the rig falls freely until
+// its centre of mass reaches vt, and from there each tick takes back what
+// gravity added -- the same Δv on every simulated limb (a uniform change of
+// velocity puts no load on any joint). So going limp does not change how fast
+// the camera falls, and a rig under vt -- every ordinary tumble, launch and
+// short fall -- is bit-identical to before (a quadratic drag here changed the
+// `freefall` gate's 150 m drop and every knife-edge ragdoll arm with it). The
+// take-back is capped at three ticks of gravity, so a body thrown faster than
+// vt slows over a few ticks instead of stopping in one.
+Vec3 Mob::ApplyRigAirDrag(Vec3 vCom, float dt) {
+  const float vt = MetresToCells(std::max(CurrentTuning().player.maxFall, 1.0f));
+  const float speed = vCom.len();
+  if (!phys_ || speed <= vt) return Vec3{};
+  const float g = MetresToCells(CurrentTuning().physics.gravity);
+  const float dvLen = std::min(speed - vt, 3.0f * g * dt);
+  const Vec3 dv = vCom * (-dvLen / speed);
+  for (MobLimb& l : limbs_) {
+    // Worn followers take their host's velocity (DriveWornShells); held
+    // pieces are kinematic.
+    if (!l.body || l.holdSeconds > 0 || l.wornHost >= 0) continue;
+    Vec3 lv{}, la{};
+    if (!phys_->GetBodyVelocities(l.body, lv, la)) continue;
+    phys_->SetBodyVelocities(l.body, lv + dv, la);
+  }
+  return dv;
+}
+
+void Mob::TickRagdollArrest(float dt) {
+  Vec3 vel{};
+  if (!RigComVelocity(vel)) return;
 
   if (ragdollVelValid_) {
     // Where the rig WOULD be going if nothing had touched it. Subtracting the
@@ -10336,7 +10444,10 @@ void Mob::TickRagdollArrest(float dt) {
       if (ragdollArrestQuiet_ < 255) ragdollArrestQuiet_++;
     }
   }
-  ragdollLastVel_ = vel;
+  // The air's Δv is ours, applied now: the reference the next tick measures
+  // braking against is the velocity the rig LEAVES this tick with, so drag is
+  // never read as an arrest.
+  ragdollLastVel_ = vel + ApplyRigAirDrag(vel, dt);
   ragdollVelValid_ = true;
 }
 
@@ -10980,6 +11091,8 @@ bool Mob::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
               center.y, center.z, lethal ? " LETHAL" : "");
 
   if (lethal) {
+    StageClock sc;
+    StageClock::Acc(0) = StageClock::Acc(1) = 0.0;
     // --- splat: carve voxels out of the body, sever some limbs, die ---
     //
     // The carve blows chunks out of every live limb as a blast would, but with
@@ -10989,6 +11102,12 @@ bool Mob::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
         pt.fallSplatCarveBase + impactMs * pt.fallSplatCarvePerMs;
     CarveRadialAll(center, carveRadius, world, spawns, /*power=*/0.0f,
                    DamageCtx(DamageCause::Fall), /*splatMs=*/impactMs);
+    {
+      char nm[96];
+      std::snprintf(nm, sizeof nm, "carve(limbCarve %.2f woundStain %.2f)", StageClock::Acc(0),
+                    StageClock::Acc(1));
+      sc.Mark(nm);
+    }
 
     // Sever roughly half the remaining severable limbs at random.
     std::vector<int> severable;
@@ -11009,8 +11128,10 @@ bool Mob::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
           limbs_[i].holdSeconds = 0.0f;
       }
     }
+    sc.Mark("sever");
     if (alive_) deathCause_ = "fall";
     Die();
+    sc.Mark("die");
 
     // Radial impulse scatters debris outward from the impact -- and, like an
     // explosion's, skips every living creature's limbs (MobSystem::
@@ -11036,6 +11157,7 @@ bool Mob::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
       phys_->ApplyRadialImpulse(center, pt.fallSplatImpulseRadius,
                                 impactMs * pt.fallSplatImpulsePerMs, &skip);
     }
+    sc.Mark("impulse");
 
     // Blood micro-spray burst -- of what the BODY is mostly made of.
     const uint32_t splatFluid = BodyFluid();
@@ -11078,6 +11200,8 @@ bool Mob::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
         ops.push_back({(int)std::floor(center.x), (int)std::floor(center.y),
                        (int)std::floor(center.z), 2, splatFluid, 0, 0, 0});
     }
+    sc.Mark("spray");
+    sc.Report("ApplyFallDamage(lethal)", tick);
     return true;
   }
 
@@ -24882,6 +25006,7 @@ bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
     if (field->on && spallData.radius <= 0.0f) spallPtr = nullptr;
 
     Mob::CarveReport rep{};
+    const double tCarve0 = StageClock::Threshold() > 0.0 ? StageClock::Now() : 0.0;
     const bool alive = CarveLimb(
         (int)i, ctx, world, spawns, eject,
         [&, cBody, seed, jitterScale, chunk, falloffExp, blob, field,
@@ -24979,6 +25104,7 @@ bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
           };
         },
         spallPtr, &rep);
+    if (tCarve0 > 0.0) StageClock::Acc(0) += StageClock::Now() - tCarve0;
     // SEVERED OR DEAD: nothing below may touch `limbs_` (CutLimb's contract).
     if (!alive) return true;
     // ---- A CRATER IS A WOUND, AND THE WOUND IS THE CRATER -------------------
@@ -25010,8 +25136,10 @@ bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
     // `gore.craterStainRim` cells past the removed cells themselves is the
     // rule that actually says "where voxels were removed".
     if (rep.count == 0 || rep.cells.empty()) return true;
+    const double tStain0 = tCarve0 > 0.0 ? StageClock::Now() : 0.0;
     StainWound((int)i, rep.centreLocal, 0.0f, seed ^ 0xC7A7E7u, &rep.cells,
                gt.craterStainRim);
+    if (tStain0 > 0.0) StageClock::Acc(1) += StageClock::Now() - tStain0;
     return true;
   }
   return false;
@@ -27149,6 +27277,11 @@ void Mob::TickDeadLimp(float dt) {
   const int rl = def_ ? def_->rootLimb : -1;
   if (rl >= 0 && rl < (int)limbs_.size() && limbs_[rl].body)
     origin_ = limbs_[rl].xf.pos - limbs_[rl].restOffset;
+  // ...and the air, as a limp rig has it (ApplyRigAirDrag): a corpse falling
+  // off a mountain reaches the same terminal velocity, not the safety
+  // ceiling. Only an awake rig is asked (a sleeping one is not falling).
+  Vec3 vCom{};
+  if (RigActive() && RigComVelocity(vCom)) ApplyRigAirDrag(vCom, dt);
 }
 
 // The mean density of limb `li`'s matter, weighted by cell VOLUME so a worn

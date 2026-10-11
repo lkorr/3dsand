@@ -1611,7 +1611,42 @@ void Physics::SweepRunawayRigs() {
     runaway_.peakSpeedVox =
         std::max(runaway_.peakSpeedVox, speed / kVoxelMeters);
     const uint32_t idx = id.GetIndex();
-    if (spin < spinBar && speed < speedBar) {
+    // A RIG THAT IS MERELY FAST IS NOT DRIVEN. The motor this net exists for
+    // is the constraint graph feeding a piece energy, and what that produces
+    // is a piece moving AGAINST the pieces it is jointed to. A whole rig
+    // falling at the ceiling (a 2 km drop off a mountain reaches it in about
+    // eight seconds) has every limb near the ceiling and none of them moving
+    // relative to the others -- and the net damped them to 20% one limb at a
+    // time, which tore the rig, read as a 27 m/s arrest in open air and
+    // splatted the body there (ticket 2026-10-09_15-16-57, `freefall-slope`
+    // on the real mountain: "AIR: manifolds static 0 dyn 0"). So the LINEAR
+    // bar is measured against the mean velocity of the body's joint
+    // partners; the angular bar (the runaway's actual signature, every piece
+    // at 47.1 rad/s) is unchanged. SANDVOX_RUNAWAY_ABS_SPEED=1 is the
+    // absolute-speed arm.
+    float linHot = speed;
+    if (speed >= speedBar && spin < spinBar && joints_) {
+      static const bool kAbsSpeed = [] {
+        const char* e = std::getenv("SANDVOX_RUNAWAY_ABS_SPEED");
+        return e != nullptr && e[0] != '0';
+      }();
+      auto bit = kAbsSpeed ? joints_->byBody.end() : joints_->byBody.find(FromBodyID(id));
+      if (bit != joints_->byBody.end() && !bit->second.empty()) {
+        const uint64_t self = FromBodyID(id);
+        JPH::Vec3 sum = JPH::Vec3::sZero();
+        int nPart = 0;
+        for (uint64_t j : bit->second) {
+          auto je = joints_->joints.find(j);
+          if (je == joints_->joints.end()) continue;
+          const uint64_t other = je->second.bodyA == self ? je->second.bodyB : je->second.bodyA;
+          if (other == 0 || other == self) continue;
+          sum += bi.GetLinearVelocity(ToBodyID(other));
+          nPart++;
+        }
+        if (nPart > 0) linHot = (v - sum / (float)nPart).Length();
+      }
+    }
+    if (spin < spinBar && linHot < speedBar) {
       auto it = hotSteps_.find(idx);
       if (it == hotSteps_.end()) continue;
       if (it->second <= 1)
