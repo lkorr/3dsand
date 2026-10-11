@@ -296,6 +296,31 @@ fn blocksParticle(c : vec3<i32>, passLiquid : bool, micro : bool) -> bool {
 // by overwriting the water it is floating on, which would look exactly like
 // sinking. `patient` is the escape hatch at the end of PART_FLOAT_PATIENCE —
 // see the settle block in integrate.
+// ---- THE DENSITY A BURIED LIQUID BIDS WITH, for integrate AND resolve -------
+// (ticket 2026-10-11 01:28:09, "an explosion in the water left a bunch of
+// frozen water particles".) A liquid particle buried in a DIFFERENT liquid of
+// its own density (blood in water) rejoins the grid in that cell, so it bids
+// as one unit denser than it is. A liquid in ITS OWN liquid (water ejecta the
+// crater's refill flowed over) does not: overwriting a water cell with a water
+// cell would delete a cell of water, so it keeps the strict test, climbs to
+// the surface a cell a tick as it always did, and lands on top.
+//
+// THE TWO PASSES MUST ASK THE SAME QUESTION. 888d07e put the +1 into
+// integrate's burial bid only; resolve re-checked the claimed cell with the
+// plain density, refused every one of those bids, zeroed the particle's
+// velocity and left it alive -- and integrate bid again the next tick. Water
+// in water and blood in water hung in the lake forever as opaque cubes (gate
+// blast-water: 67 of them frozen IN a liquid cell from +50 to +400 ticks).
+// One function for both passes is what keeps that from coming back.
+fn rejoinDensity(myMat : u32, myDensity : i32, w : u32) -> i32 {
+  let hm = voxMat(w);
+  if (hm != myMat && materials[myMat].klass == CLASS_LIQUID &&
+      materials[hm].klass == CLASS_LIQUID) {
+    return myDensity + 1;
+  }
+  return myDensity;
+}
+
 fn canOccupy(w : u32, myDensity : i32, patient : bool) -> bool {
   let m = voxMat(w);
   if (m == MAT_AIR) { return true; }
@@ -716,11 +741,12 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
     // in the water. Without this, liquids have no fluid lift, so this block
     // shoved blood up one cell a tick to the surface, where it landed ON the
     // water and dried away. A LIGHTER liquid (oil) still rises: that one is
-    // right. An EQUAL one rejoins too (myDensity + 1): blood is water's
-    // density since 2026-10-10 so a cloud does not fall as a column, and the
-    // strict test would have sent it climbing to the surface again.
+    // right. An EQUAL one rejoins too when it is ANOTHER liquid (blood is
+    // water's density since 2026-10-10 so a cloud does not fall as a column,
+    // and the strict test would have sent it climbing to the surface again)
+    // -- see rejoinDensity, which resolve applies to the same bid.
     if (materials[myMat].klass == CLASS_LIQUID && startKlass == CLASS_LIQUID &&
-        canOccupy(startWord, myDensity + 1, false)) {
+        canOccupy(startWord, rejoinDensity(myMat, myDensity, startWord), false)) {
       p.flags |= PFLAG_PENDING;
       let ss = claimSlot(claimCellId(startCell));
       atomicMax(&claim[ss], particlePriority(p));
@@ -1227,7 +1253,8 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
                  isPowderMat(p.payload & 0xFFFu)) &&
                 matFluidLift(materials[p.payload & 0xFFFu]) > 0u;
 
-  if (won && canOccupy(hereWord, myDensity, patient)) {
+  if (won && canOccupy(hereWord, rejoinDensity(p.payload & 0xFFFu, myDensity, hereWord),
+                       patient)) {
     // rejoin the grid; stamp 0xFF = "hasn't acted", falls next tick
     let mat = p.payload & 0xFFFu;
     var state = (p.payload >> 12u) & 0xFu;

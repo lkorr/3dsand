@@ -82,6 +82,7 @@
 #include "sim/currentprim.h"
 #include "test/selftest.h"
 #include "test/support.h"
+#include "test/tickrig.h"
 
 using namespace sandvox;
 
@@ -3518,6 +3519,138 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- blast-water --------------------------------------------------------------
+// A BLAST IN A POND GIVES ITS WATER BACK (ticket 2026-10-11 01:28:09: "cast an
+// explosion in the water and it created what looks like a bunch of frozen water
+// particles"). An open stone basin, 41 x 41 and eight deep, with an explosion
+// two cells under the surface in the middle of it. The liquid the blast throws
+// out (sim_explode.wgsl: TUNE_EJECT_LIQUID of the destroyed water cells become
+// ballistic particles) must land and rejoin the grid -- in the pond, on the
+// rim, on the ground round it -- and no ejecta particle may still be alive
+// `blastWater.ticks` after the blast.
+//
+// The census is ATTRIBUTED, not a bare count: every live non-micro particle is
+// read back with the cell it stands in, so a failure says which of "still in
+// flight", "resting with zero velocity IN a liquid cell" (buried: a rejoin bid
+// that resolve refuses every tick -- the frozen cubes), "resting in air" or
+// "inside something else" it is, and the MLS-MPM live count is printed beside
+// it so a stuck MPM raft cannot pass for a stuck CA particle or vice versa.
+Status GateBlastWater(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // A POND, not a puddle: the crater must refill to the same level, or a
+  // buried particle is freed by the level dropping (a 21 x 21 x 5 basin
+  // emptied enough to free them in ~100 ticks and hid the bug). Geometry and
+  // blast in baseline.json so the fixture tunes without a rebuild.
+  const int cx = 160, cz = 288;
+  const int kHalf = (int)BaselineNumber("blastWater.half", 20);
+  const int kDeep = (int)BaselineNumber("blastWater.deep", 8);
+  const int kBlastR = (int)BaselineNumber("blastWater.radius", 5);
+  const int kBlastPow = (int)BaselineNumber("blastWater.power", 400);
+  const int fy = FixtureYOver(cx - kHalf - 1, cz - kHalf - 1, cx + kHalf + 1, cz + kHalf + 1,
+                              kDefaultSeed, 1);
+  const int wallTop = fy + kDeep + 2;
+  std::vector<CellOp> build, fill;
+  for (int z = cz - kHalf - 1; z <= cz + kHalf + 1; z++)
+    for (int x = cx - kHalf - 1; x <= cx + kHalf + 1; x++)
+      for (int y = fy; y <= wallTop + 12; y++) {
+        const bool wall = std::abs(x - cx) > kHalf || std::abs(z - cz) > kHalf;
+        const bool solid = (y <= wallTop && wall) || y == fy;
+        build.push_back({World::SlotCellIndex({x, y, z}), solid ? (uint32_t)kMatStone : 0u});
+        if (!wall && y >= fy + 1 && y <= fy + kDeep)
+          fill.push_back({World::SlotCellIndex({x, y, z}), PackVoxNew(kMatWater, 7u)});
+      }
+  const int kBlastAt = 20;
+  const int kTicks = (int)BaselineNumber("blastWater.ticks", 400);
+  const int maxLeft = (int)BaselineNumber("blastWater.maxLiquidLeft", 0);
+  uint32_t t = 64000;
+  support::TickCursor ticker{c, t, {cx >> 4, fy >> 4, cz >> 4}};
+
+  struct Census {
+    uint32_t live = 0, micro = 0, liquid = 0, flying = 0, frozenInLiquid = 0,
+             restInAir = 0, restOther = 0;
+  };
+  std::vector<uint32_t> vbuf((size_t)kChunkVol);
+  auto census = [&]() {
+    Census k;
+    ctx.WaitIdle();
+    uint32_t counts[2] = {};
+    ReadCountsSync(ctx, world, counts);
+    const uint32_t n = std::min(counts[sim.Page()], kParticleCap);
+    k.live = n;
+    if (n == 0) return k;
+    std::vector<ParticleSpawn> ps(n);
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, world.particles[sim.Page()], 0, ps.data(),
+                          (size_t)n * sizeof(ParticleSpawn), "blastWaterParts");
+    uint32_t lastSlot = 0xFFFFFFFFu;
+    for (const ParticleSpawn& p : ps) {
+      if ((p.flags & kPFlagAlive) == 0u) continue;
+      if (p.flags & kPFlagMicro) { k.micro++; continue; }
+      const uint32_t m = p.payload & 0xFFFu;
+      if (m >= c.mats.size() || c.mats[m].gpu.klass != CLASS_LIQUID) continue;
+      k.liquid++;
+      if (p.vx != 0 || p.vy != 0 || p.vz != 0) { k.flying++; continue; }
+      const IVec3 cell{p.px >> 8, p.py >> 8, p.pz >> 8};
+      if (!world.CellInWindow(cell)) { k.restOther++; continue; }
+      const uint32_t slot = World::SlotChunkIndex({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+      if (slot != lastSlot) {
+        ReadVoxelsSync(ctx, world, slot, 1, vbuf.data(), "blastWaterVox");
+        lastSlot = slot;
+      }
+      const uint32_t w = vbuf[(size_t)(((cell.z & 15) * 16 + (cell.y & 15)) * 16 + (cell.x & 15))];
+      const uint32_t hm = w & 0xFFFu;
+      if (hm == kMatAir) k.restInAir++;
+      else if (hm < c.mats.size() && c.mats[hm].gpu.klass == CLASS_LIQUID) k.frozenInLiquid++;
+      else k.restOther++;
+    }
+    return k;
+  };
+
+  uint32_t peakLiquid = 0;
+  int clearAt = -1;
+  std::string trace;
+  for (int i = 0; i <= kBlastAt + kTicks; i++) {
+    support::TickOps o;
+    if (i == 0) o.cells = build;
+    if (i == 2) o.cells = fill;
+    if (i == kBlastAt) o.exps.push_back({cx, fy + kDeep - 2, cz, kBlastR, kBlastPow, 0, 0, 0});
+    ticker(o);
+    if (i > kBlastAt && (i - kBlastAt) % 50 == 0) {
+      const Census k = census();
+      peakLiquid = std::max(peakLiquid, k.liquid);
+      if (k.liquid == 0 && clearAt < 0) clearAt = i - kBlastAt;
+      if (k.liquid != 0) clearAt = -1;
+      uint32_t fa[kFluidArgsWords] = {};
+      ReadFluidArgsSync(ctx, world, fa);
+      trace += Format("%s+%d: %u liquid (%u flying, %u frozen in liquid, %u resting in "
+                      "air, %u other), MPM %u", trace.empty() ? "" : "; ", i - kBlastAt,
+                      k.liquid, k.flying, k.frozenInLiquid, k.restInAir, k.restOther,
+                      fa[7]);
+    }
+  }
+  const Census end = census();
+  uint32_t fa[kFluidArgsWords] = {};
+  ReadFluidArgsSync(ctx, world, fa);
+  const uint32_t mpmLive = fa[7];   // FA_LIVE
+  RecordObserved("blastWater.liquidLeft", (double)end.liquid);
+  RecordObserved("blastWater.peakLiquid", (double)peakLiquid);
+  const bool thrown = peakLiquid > 0;   // a vacuous pass is a fixture failure
+  const bool ok = thrown && (int)end.liquid <= maxLeft;
+  detail = Format(
+      "blast r%d two under a %dx%dx%d pond: liquid ejecta %u alive at the end of %d ticks "
+      "(allow %d; %u frozen IN a liquid cell, %u resting in air, %u other, %u flying), "
+      "clear from +%d, peak sampled %u%s; MPM live %u | %s",
+      kBlastR, 2 * kHalf + 1, 2 * kHalf + 1, kDeep, end.liquid, kTicks, maxLeft, end.frozenInLiquid, end.restInAir, end.restOther,
+      end.flying, clearAt, peakLiquid, thrown ? "" : " (none sampled: blast threw no water?)",
+      mpmLive, trace.c_str());
+  std::printf("blast-water: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 
@@ -3834,6 +3967,8 @@ const std::vector<Gate>& WaterGates() {
       // gate leaves behind: pass P is pure arithmetic and pass S
       // rebuilds the world itself for each of its three arms.
       {"current", "sim", {}, false, GateCurrent},
+      // Own worldgen and its own basin; leaves a drained pond at (160, ., 288).
+      {"blast-water", "sim", {}, false, GateBlastWater},
   };
   return g;
 }
