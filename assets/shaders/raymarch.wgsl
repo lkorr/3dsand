@@ -9288,18 +9288,137 @@ fn waterFoam(hitP : vec3f, pathM : f32, simFoam : f32) -> f32 {
 }
 const WATER_FOAM_COLOR : vec3f = vec3f(0.92, 0.95, 0.97);
 
+// THE STAR FIELD'S MEAN RADIANCE, analytically: what starField averages to
+// over any solid angle much larger than a star cell. Per layer it is
+// (stars per steradian) x (PSF integral per star) x E[brightness]:
+//   stars/sr      ~ K_cells * density^2 * sparsity      (cells the unit
+//                   sphere crosses at that scale, times occupancy)
+//   PSF integral  = core^2 * pi * (1/2.2 + 0.1/0.35)    (core = size*pxAng*..)
+//   E[...]        = E[(0.62+0.85m)^2 (0.2+2.2m)], m = u^4  = 0.684
+// and layer 1 is 2.249x layer 0 (2.7^2 cells, 1.7x occupancy, 0.72^2 PSF,
+// 0.35 gain). K_cells was CALIBRATED, not assumed: a Monte Carlo of
+// starField's exact cell/jitter/PSF code over 4e7 random directions measured
+// 0.587 of the naive 1.5 cells per unit area (a star whose jittered centre
+// projects outside its own cell's patch is never seen), giving the single
+// constant 4.55 below. Twinkle averages out (zero-mean sine). The colour is
+// the mean of starField's temperature mix. Like starField it is in PIXEL
+// units (the PSF is sized in pixels), so the mean tracks what the direct sky
+// shows when averaged over the screen, at any resolution.
+const STAR_MEAN_K : f32 = 4.55;
+const STAR_MEAN_COL : vec3f = vec3f(0.88, 0.815, 0.81);
+fn starMeanRadiance(dir : vec3f) -> vec3f {
+  let pxAng = max(R.tanHalfFov * 2.0 / max(R.viewPx, 1.0), 1e-7);
+  let core = TUNE_STAR_SIZE * pxAng;
+  return STAR_MEAN_COL * (STAR_MEAN_K * TUNE_STAR_DENSITY * TUNE_STAR_DENSITY *
+         TUNE_STAR_SPARSITY * core * core * TUNE_STAR_BRIGHTNESS) *
+         smoothstep(-0.02, 0.16, dir.y);
+}
+
+// The starfield seen through a reflected lobe `blur` radians wide (see
+// reflectionSkyBlur): the crisp field scaled by how much of a star's peak
+// survives the lobe, plus the mean for the energy the lobe spread out.
+// mix(mean, field, w) conserves the field's average exactly, so the far lake
+// is neither darker nor brighter than the sky it reflects, only smoother.
+fn reflectedStars(d : vec3f, blur : f32) -> vec3f {
+  if (blur <= 0.0) { return starField(d); }
+  let pxAng = max(R.tanHalfFov * 2.0 / max(R.viewPx, 1.0), 1e-7);
+  // starField's Gaussian core exp(-2.2 x^2) has sigma = core / sqrt(4.4).
+  let sigP = 0.477 * TUNE_STAR_SIZE * pxAng;
+  // Linear (streak) law: the grazing lobe is stretched along the view.
+  let w = sigP * inverseSqrt(sigP * sigP + blur * blur);
+  var c = starMeanRadiance(d) * (1.0 - w);
+  // Below ~1% a star's surviving peak is far under the airglow it sits on;
+  // skip the field evaluation (the common case: every distant water pixel).
+  if (w > 0.01) { c += starField(d) * w; }
+  return c;
+}
+
+// The width of a water pixel's reflected lobe, radians: twice the RMS slope
+// the wave field hides inside this pixel's footprint. Per band, the hidden
+// share is the larger of (a) what waveSlope's footprint fade removed from the
+// normal and (b) the slope variance a box filter of the footprint width
+// leaves inside the pixel for a sinusoid, 1 - sinc^2(k f / 2) — so a band
+// half-resolved still roughens the mirror instead of counting as flat.
+// `openness` is the fetch scale waterWaveNormal applies (1 = open water).
+// Night only: in daylight there are no point sources in reflectionSky and
+// the sun is waterGlint's business, so the loop is skipped.
+fn waterReflBlur(hitP : vec3f, openness : f32) -> f32 {
+  if (dayWeight() >= 0.999 || openness <= 0.0) { return 0.0; }
+  let f = waterRippleFootprint(hitP);
+  var v = 0.0;
+  var waves = rippleWaves();
+  for (var i = 0; i < RIPPLE_BANDS; i++) {
+    let w = waves[i];
+    let k = 6.28318 / w.len;
+    let s = w.amp * TUNE_RIPPLE_AMP_SCALE * openness * k;
+    let x = k * f * 0.5;
+    let sinc = select(sin(x) / x, 1.0, x < 1e-4);
+    let faded = smoothstep(w.len * 0.28, w.len * 0.85, f);
+    v += 0.5 * s * s * max(1.0 - sinc * sinc, faded);
+  }
+  return 2.0 * sqrt(v);
+}
+
 // Sky-only reflection fallback plus a horizon-grounded haze, used when a
 // reflected ray finds nothing. A raw skyColor() lookup below the horizon
 // returns the ground-ward gradient, which reads as a bright band; clamping the
 // reflected direction's downward component keeps distant reflections plausible.
 fn reflectionSky(rd : vec3f) -> vec3f {
+  return reflectionSkyBlur(rd, 0.0);
+}
+
+// ---- THE NIGHT SKY IN A ROUGH MIRROR (ticket 2026-10-10_11-34-37) ----------
+// A lake reflected individual stars out to the far shore, one crisp pixel each,
+// scattered wherever a ripple normal happened to point. That is not what a lake
+// at night looks like, and the reason is the same one the ripple mip
+// (waterRippleFootprint) exists for:
+//
+//  * A water surface is a mirror whose ROUGHNESS is the wave-slope
+//    distribution inside one pixel's footprint. Every wave shorter than the
+//    footprint is not "flattened", it is AVERAGED: its slopes still tilt the
+//    mirror, so the pixel receives the sky integrated over a lobe whose width
+//    is twice the sub-pixel slope spread (a normal tilt of a reflects the ray
+//    by 2a). waveSlope fades those bands out of the NORMAL; this puts the
+//    energy they carried back as a BLUR of the reflected sky.
+//  * A star is a point. Convolved with that lobe its peak falls as
+//    psf / lobe while its energy stays — spread over the lobe as the star
+//    field's average radiance. At grazing view the footprint stretches along
+//    the view and the lobe is a streak rather than a disc, so the peak falls
+//    as the LINEAR width ratio, not its square. With this wave table (slope
+//    ~0.01-0.02 at ampScale 0.35) the lobe is a few milliradians at 5 m and
+//    tens of milliradians across a lake, against a star PSF of ~0.5 mrad: a
+//    few bright stars survive faintly in the near, calm metres and are gone
+//    by a few tens of metres, which is what an observer sees on a lake that
+//    is not glassy.
+//  * What distant night water then shows is the SMOOTH sky — the horizon
+//    airglow band at the grazing reflected angles (reflectionSkyBlur clamps
+//    d.y to 0.02, i.e. the horizon gradient), the galaxy/nebula glow, plus the
+//    unresolved starlight as a faint uniform lift — all of it times Fresnel
+//    (2% head-on, rising to grazing), which the caller already applies.
+//  * The moon is NOT reflected here: its reflection is waterGlint's Blinn lobe
+//    on the rippled normal, which at grazing elongates along the vertical
+//    through the moon — the glitter path — rather than mirroring the disc.
+//
+// `blur` is the reflected-lobe width in RADIANS (waterReflBlur); 0 = a perfect
+// mirror and reproduces the old lookup exactly.
+fn reflectionSkyBlur(rd : vec3f, blur : f32) -> vec3f {
   var d = rd;
   if (d.y < 0.02) { d.y = 0.02; }
   // Body-free: the sun and moon discs are handled by the dedicated glint lobe
   // below, which is shaped for a rippled surface. Reflecting the real disc
   // here as well would double it AND scatter single-pixel fireflies wherever
   // a ripple normal happens to line up.
-  let sky = skyColorNoBodies(normalize(d));
+  //
+  // skyColorNoBodiesU spelled out, so the star layer can take the blur: the
+  // same airglow, the same veil, the same day fade.
+  let dn = normalize(d);
+  let dayW = dayWeight();
+  let g = skyAirglowV(dn, dayW);
+  var sky = g.c;
+  if (dayW < 0.999) {
+    sky += reflectedStars(dn, blur) * (1.0 - dayW) * (1.0 - g.veil);
+  }
+  sky = max(sky, vec3f(0.0));
   if ((R.weatherFlags & RWF_CLOUDS) == 0u) { return sky; }
   let e = cloudEnvAt(normalize(d), &CL, &cloudMaps);
   return sky * e.a + e.rgb;
@@ -9312,7 +9431,7 @@ fn reflectionSky(rd : vec3f) -> vec3f {
 // screen-space reflections explicitly can't do this). Budget is small — a
 // reflected ray off water is nearly always either sky or the near shore, and
 // this runs per water pixel.
-fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
+fn traceReflection(p : vec3f, n : vec3f, rd : vec3f, blur : f32) -> vec3f {
   let rr = reflect(rd, n);
   // A reflected ray pointing DOWN came from a normal that the ripples tilted
   // past the view ray; it has nothing valid to reflect. Take the sky, but
@@ -9323,7 +9442,7 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
   // pixels back and forth across the threshold and the surface breaks into
   // per-pixel speckle instead of reading as one continuous sheet.
   let horizon = smoothstep(-0.06, 0.02, rr.y);
-  if (horizon <= 0.0) { return reflectionSky(rr); }
+  if (horizon <= 0.0) { return reflectionSkyBlur(rr, blur); }
   // Step budget, not distance: this is one secondary ray per water pixel and a
   // lake can fill the screen, so this number is a direct frame-time multiplier
   // on water-heavy views. Rays that run out return sky, which is what a long
@@ -9347,12 +9466,12 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
   let h = traceOpaque(p + n * 0.05, rr, TUNE_REFLECTION_STEPS, 1e30,
                       &occupancy, &materials);
   rsAdd(RS_REFLECT, h.steps);
-  if (!h.hit) { return reflectionSky(rr); }
+  if (!h.hit) { return reflectionSkyBlur(rr, blur); }
 
   // Reflected geometry is seen across the water plus its own distance, so it
   // takes aerial perspective too — without this, a reflected far hillside is
   // sharper than the real one and the reflection reads as a decal.
-  return mix(reflectionSky(rr), applyAerial(shadeSecondaryHit(h), rr, h.t),
+  return mix(reflectionSkyBlur(rr, blur), applyAerial(shadeSecondaryHit(h), rr, h.t),
              horizon);
 }
 
@@ -10416,7 +10535,7 @@ fn shadeTranslucent(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // and the one where you are looking THROUGH the ice anyway — take the cheap
   // path; grazing views still get the real reflection.
   var refl : vec3f;
-  if (fres > TUNE_ICE_REFLECT_MIN) { refl = traceReflection(hitP, n, rd); }
+  if (fres > TUNE_ICE_REFLECT_MIN) { refl = traceReflection(hitP, n, rd, 0.0); }
   else { refl = reflectionSky(reflect(rd, n)); }
 
   // ---- specular glint ----
@@ -10769,10 +10888,14 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // weight the difference between a real reflection and a sky sample is not
     // resolvable, and this is what stops a screenful of water from firing a
     // full-budget ray per pixel for no visible return.
+    // The reflected lobe's width (waterReflBlur): the sub-pixel wave slopes
+    // turn this mirror rough with distance, so the stars in the reflected
+    // sky average out instead of landing one crisp pixel each on the lake.
+    let reflBlur = waterReflBlur(hitP, waterOpenness(cell, mat));
     if (fres > TUNE_REFLECTION_CUTOFF) {
-      reflection = traceReflection(hitP, n, rd);
+      reflection = traceReflection(hitP, n, rd, reflBlur);
     } else {
-      reflection = reflectionSky(reflect(rd, n));
+      reflection = reflectionSkyBlur(reflect(rd, n), reflBlur);
     }
   } else {
     reflection = reflectionSky(reflect(rd, n));
@@ -11358,7 +11481,7 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // scale (that is what a slick IS: a film that spreads flat), and the
     // reflection is the DOMINANT term in its look rather than a garnish, so it
     // earns the ray far sooner.
-    reflection = traceReflection(hitP, n, rd);
+    reflection = traceReflection(hitP, n, rd, 0.0);
   } else {
     // The cheap fallback: a plain sky lookup. On a POOL that is a fine stand-in
     // for a traced ray, but on a droplet or a thin trail it is the other half
@@ -13273,7 +13396,12 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   let calm = 1.0 - clamp(churn * 3.0, 0.0, 1.0);
   let rippleW = clamp(max(s.settled, caFrac * calm), 0.0, 1.0);
   gMpmLakeW = clamp(caFrac * calm, 0.0, 1.0);
+  // The rough-mirror lobe of that same ripple field (waterReflBlur), for the
+  // reflection below -- the MPM half of a lake must lose its stars exactly
+  // where the CA half does.
+  var mpmReflBlur = 0.0;
   if (rippleW > 0.01 && n.y > 0.25) {
+    mpmReflBlur = waterReflBlur(hitP, rippleW);
     let slope = rippleSlope(vec2f(hitP.x, hitP.z) * VOXEL_METERS, R.time,
                             waterRippleFootprint(hitP)) * rippleW;
     n = normalize(n + vec3f(-slope.x, 0.0, -slope.y));
@@ -13340,9 +13468,9 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   if (TUNE_FLUID_REFLECT > 0.01 && n.y > 0.25 &&
       fres > TUNE_REFLECTION_CUTOFF && colVox > 1.0) {
     // A real traced bounce — the shore, the tower, the debris beside the pool.
-    reflection = traceReflection(hitP, n, rd);
+    reflection = traceReflection(hitP, n, rd, mpmReflBlur);
   } else {
-    reflection = reflectionSky(reflect(rd, n));
+    reflection = reflectionSkyBlur(reflect(rd, n), mpmReflBlur);
   }
   reflection *= TUNE_FLUID_REFLECT;
 
@@ -13583,7 +13711,11 @@ fn shadeFarWater(hitP : vec3f, rd : vec3f, m : Material, nFace : vec3f,
   }
   let trans = exp(-optics.absorbK * depthM);
   let refracted = lit * trans + optics.scatter * (vec3f(1.0) - trans);
-  let reflection = reflectionSky(reflect(rd, n));
+  // Same rough-mirror lobe as shadeWater's open water (waterReflBlur): the
+  // cascade is always far, so this is where the stars average out.
+  var reflBlur = 0.0;
+  if (up) { reflBlur = waterReflBlur(hitP, 1.0); }
+  let reflection = reflectionSkyBlur(reflect(rd, n), reflBlur);
   var color = mix(refracted, reflection, fres);
   dbgWater(fres, refracted, reflection, lit, depthM);
   if (up) {

@@ -17333,6 +17333,30 @@ where you hear from either (§12b, "The ears are on the character").
     on the bed, which is what they physically are.
   - **Sun glint** as a tight specular lobe that gets *tighter* with distance to
     match the ripple damping, and shoreline foam masked by the ripple field.
+    At night the key light is the brighter moon, so the same lobe on the
+    rippled normal is the moon's glitter path (a Blinn half-vector lobe
+    elongates along the vertical through the light at grazing view); the moon
+    DISC is never mirrored (`reflectionSky` is body-free).
+  - **The night sky in a rough mirror** (ticket 2026-10-10_11-34-37,
+    `reflectionSkyBlur` / `waterReflBlur` / `reflectedStars` in
+    `raymarch.wgsl`). Research note: a water surface is a mirror whose
+    roughness is the wave-slope distribution inside one pixel's footprint, so
+    the reflected radiance is the sky PRE-FILTERED over a lobe twice the
+    sub-pixel slope spread. Point stars convolved with that lobe lose their
+    peak (linearly in the width ratio at grazing, where the lobe is a streak)
+    while their energy survives as the star field's mean radiance; distant
+    night water therefore shows the smooth sky (horizon airglow at the grazing
+    reflected angles, galaxy/nebula glow) plus a faint uniform starlight lift,
+    all times Fresnel, and only near, calm water shows a few bright stars,
+    faintly. Implementation: per band, the slope variance the footprint hides
+    is max(waveSlope's fade, 1 - sinc²(k·f/2)); the lobe is 2·RMS of that.
+    `reflectedStars` = mix(starMeanRadiance, starField, w), which conserves the
+    field's average, and skips `starField` below w = 1%. `starMeanRadiance` is
+    analytic (density² × sparsity × PSF integral × E[magnitude]), its one
+    constant calibrated by a Monte Carlo of starField's own code. Night only
+    (day weight < 0.999); every water surface takes it — CA water (fetch-scaled),
+    the cascade's `shadeFarWater`, and the MPM lake surface — ice and blood
+    keep a perfect mirror.
 
   One consequence worth flagging: the media saturation early-out
   (`MEDIA_TAU_MAX`) is a SMOKE optimization and had to be scoped to gases.
