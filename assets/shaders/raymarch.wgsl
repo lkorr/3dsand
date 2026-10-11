@@ -996,7 +996,11 @@ var<private> gFragXY : vec2f = vec2f(0.0);
 // 2026-10-10 10:50, the lake slab): 9 = which shade owns the water pixel
 // (1 = shadeMpmFluid, 0.5 = shadeWater, 0.25 = shadeFarWater), the fluid
 // hit's settled share (mfLake's input), the MPM shade's foam; 10 = settled
-// share, churn, column / 40 voxels.
+// share, churn, column / 40 voxels. FAR CANOPY (2026-10-11, ticket
+// 2026-10-10_10-44-29): 11 = a cascade hit's level / 8 (0 for the horizon),
+// its canopy (a crown cell 1 / the horizon's coverage), 1 = a horizon hit --
+// the L8 / horizon seam strip is measured against a normal frame with it.
+// Every channel is tonemapped on the way out: decode levels by clustering.
 // 0 = off and const-folded away.
 const SEAM_DBG : u32 = 0u;
 // The MPM terms (SEAM_DBG 9-10): caFrac, foam, settled share (fs), churn; colVox.
@@ -14125,6 +14129,9 @@ const HZ_H_TL_PLANE : u32 = 288u;  // horizon.h kHTlPlane (kHSkin + 256)
 const HZ_H_WATER : u32 = 289u;     // horizon.h kHWater: per-sample lake / river coverage (W1)
 const HZ_H_CANOPY : u32 = 290u;    // horizon.h kHCanopy: per-sample forest canopy (cov | mix | A | B)
 const HZ_H_CANOPY_MATS : u32 = 291u;  // horizon.h kHCanopyMats: the canopy material table
+const HZ_H_CANOPY_H : u32 = 292u;     // horizon.h kHCanopyH: per-sample crown dome height (u8 x unit)
+const HZ_H_CANOPY_HMAX : u32 = 293u;  // horizon.h kHCanopyHMax: the largest raise anywhere, voxels
+const HZ_CANOPY_H_UNIT : f32 = 2.0;   // horizon.h kCanopyHUnit
 // horizon.h kL* (the light map; horizon_light.wgsl writes it).
 const HZ_L_SKY_VALID : u32 = 0u;
 const HZ_L_SUN_VALID : u32 = 1u;
@@ -14147,6 +14154,49 @@ const HZ_BLEND_M : f32 = 1500.0;
 // The level-8 cells within this many metres of the box face take the
 // horizon's paint, so the two representations meet in colour (hzSeamWeight).
 const HZ_SEAM_M : f32 = 900.0;
+
+// ---- THE FAR CANOPY RULE (2026-10-11, ticket 2026-10-10_10-44-29) --------
+// Past ~410 m a forest is not trees but a canopy MASS, and a mass reads by its
+// shade, not its hue (`leaves` and `grass` are ~15 % apart). ONE rule for the
+// two far representations, so the level-8 -> horizon seam stays invisible:
+//  * GEOMETRY. The cascades from level 5 hold the crown as cells from the
+//    ground up to its dome (worldgen.wgsl farCanopyAt / farCanopyCell); the
+//    horizon raises its surface by coverage x the dome's disc mean, per
+//    sample (hzCanopyBump; horizon::Build bakes the height from the same
+//    atlas words). Centre-sampled cells under a crown show that raise in
+//    expectation, so the two surfaces meet at one mean height.
+//  * SHADE. A crown at range is porous foliage full of its own shadow: a
+//    level-5+ cell of crown matter, and the horizon's canopy colour, are
+//    darkened by CANOPY_SHADE -- what a crown's interior self-shadow and AO
+//    leave of an upward face. The cascade cells it reaches are whole cells of
+//    one material, so the horizon's coverage-weighted mix(skin, crown x shade)
+//    is their average. The cascade ramps it in over level 4's outer band
+//    (farCanopyShadeW), where crowns are still shapes, so it never steps on a
+//    level boundary.
+//  * EDGES. A sample's coverage is broken by a mean-preserving hash
+//    (hzCanopyCovW): +-CANOPY_EDGE_NOISE x min(cov, 1 - cov), so a forest's
+//    margin is ragged, as the cascade's individual crowns make it, and its
+//    interior and the open meadow are untouched.
+//  * RELIEF. The horizon's normal takes the bump's gradient and a per-sample
+//    crown tilt (CANOPY_ROUGH x coverage), faded out once a sample is under
+//    ~2 px, so a forest has a lit and a shaded side as the cascade's crown
+//    cells do.
+const CANOPY_SHADE : f32 = 0.6;
+const CANOPY_EDGE_NOISE : f32 = 1.0;
+const CANOPY_ROUGH : f32 = 0.35;
+// How much of CANOPY_SHADE a cascade crown hit at hitP takes: 0 inside 65 %
+// of level 4's half-extent, 1 from level 4's box edge (level 5) out.
+fn farCanopyShadeW(hitP : vec3f) -> f32 {
+  let l4 = f32((FAR_N / 2u) << farCellShift(4u));
+  return smoothstep(0.65 * l4, l4, length(hitP.xz - R.camPos.xz));
+}
+// Is material id `m` crown matter as the far field sees it: its far slot is a
+// COVER slot (worldgen.wgsl farCoverWord, the far palette entry's tagMask) --
+// the foliage the canopy proxies and the cover rule are made of.
+fn farIsCanopy(m : u32) -> bool {
+  let s = matFarPal(&materials, m);
+  return s != 0u && s < FAR_PAL_BLOCKER && materials[FAR_PALETTE_BASE + s].tagMask != 0u;
+}
 
 fn hzI(w : u32) -> i32 { return bitcast<i32>(horizon[w]); }
 fn hzLo(w : u32) -> f32 { return f32(bitcast<i32>(w << 16u) >> 16u); }   // MAX
@@ -14235,6 +14285,9 @@ fn traceHorizon(ro : vec3f, rd : vec3f, tStart : f32) -> HzHit {
   let tb = (nMax - o) * inv;
   let tEn = max(max(min(ta.x, tb.x), min(ta.y, tb.y)), T0);
   let tEx = min(min(max(ta.x, tb.x), max(ta.y, tb.y)), T1);
+  // The canopy's raise (hzCanopyBump) stands over the MAX the pyramid holds:
+  // the skip test pads every cell by the largest raise anywhere.
+  let bumpMax = hzCanopyBumpMax();
   if (tEn < tEx) {
     let L = i32(horizon[HZ_H_LEVELS]);
     var lvl = L - 1;
@@ -14254,7 +14307,7 @@ fn traceHorizon(ro : vec3f, rd : vec3f, tStart : f32) -> HzHit {
       let eps = 1e-3 + T * 2e-6;
       // The whole cell's surface is under the ray across it: skip it, and try
       // the coarser level next (the cheap way back up the pyramid).
-      if (min(yA, yB) > hzLo(hzCellW(u32(lvl), c))) {
+      if (min(yA, yB) > hzLo(hzCellW(u32(lvl), c)) + bumpMax) {
         T = max(Te, T) + eps;
         lvl = min(lvl + 1, L - 1);
         continue;
@@ -14266,9 +14319,14 @@ fn traceHorizon(ro : vec3f, rd : vec3f, tStart : f32) -> HzHit {
       let w10 = hzSampleW(c + vec2<i32>(1, 0));
       let w01 = hzSampleW(c + vec2<i32>(0, 1));
       let w11 = hzSampleW(c + vec2<i32>(1, 1));
-      let hc = mix(max(vec4f(hzHi(w00), hzHi(w10), hzHi(w01), hzHi(w11)),
+      var hc = mix(max(vec4f(hzHi(w00), hzHi(w10), hzHi(w01), hzHi(w11)),
                        vec4f(hzSeaAt(sea, wB))),
                    vec4f(hzLo(w00), hzLo(w10), hzLo(w01), hzLo(w11)), wB);
+      // THE CANOPY (hzCanopyBump): the forest's mass on the ground.
+      if (bumpMax > 0.0) {
+        hc += vec4f(hzCanopyBump(c), hzCanopyBump(c + vec2<i32>(1, 0)),
+                    hzCanopyBump(c + vec2<i32>(0, 1)), hzCanopyBump(c + vec2<i32>(1, 1)));
+      }
       let cf = vec2f(c);
       // y - surface along the segment: the first sign change, found on four
       // sub-steps and refined by bisection (the bilinear is a quadratic in T;
@@ -14361,8 +14419,9 @@ fn hzAlbedo(p : vec2f, y : f32, n : vec3f) -> vec3f {
   alb = mix(alb, paletteMean(materials[horizon[HZ_H_MAT_STONE]]), smoothstep(0.9, 1.5, tanS));
   // THE FOREST (horizon.h kHCanopy): the share of the ground under crowns, in
   // the crowns' colour -- what the level-8 cells beside it paint, averaged.
+  // Darkened by the crowns' own shade (CANOPY_SHADE, the far canopy rule).
   let cn = hzCanopyAt(p);
-  alb = mix(alb, cn.rgb, cn.a);
+  alb = mix(alb, cn.rgb * CANOPY_SHADE, cn.a);
   let tl = hzTreelineAt(p);
   alb = mix(alb, paletteMean(materials[horizon[HZ_H_MAT_SNOW]]),
             smoothstep(tl - 8.0, tl + 8.0, y));
@@ -14374,7 +14433,7 @@ fn hzAlbedo(p : vec2f, y : f32, n : vec3f) -> vec3f {
 // colour weighted by coverage, so a forest edge fades rather than tinting the
 // meadow beside it). A sample's colour is the mix of its two heaviest canopy
 // materials, each resolved through the far palette and drawn at its palette
-// mean -- exactly how a level-8 canopy cell (treeCanopyAt) is painted once
+// mean -- exactly how a level-8 canopy cell (farCanopyAt) is painted once
 // its jitter has faded. An old header (no plane) has no forest.
 fn hzCanopyAt(p : vec2f) -> vec4f {
   let base = horizon[HZ_H_CANOPY];
@@ -14390,7 +14449,7 @@ fn hzCanopyAt(p : vec2f) -> vec4f {
     let c = min(i + vec2<i32>(k & 1, k >> 1), nn - vec2<i32>(1));
     let w = horizon[base + u32(c.y * nn.x + c.x)];
     let wb = select(1.0 - f.x, f.x, (k & 1) != 0) * select(1.0 - f.y, f.y, (k >> 1) != 0);
-    let a = f32(w & 0xFFu) / 255.0 * wb;
+    let a = hzCanopyCovW(w, c) * wb;
     if (a <= 0.0) { continue; }
     let mA = farPalMat(&materials, matFarPal(&materials, horizon[mt + ((w >> 16u) & 0xFFu)]));
     let mB = farPalMat(&materials, matFarPal(&materials, horizon[mt + (w >> 24u)]));
@@ -14400,6 +14459,66 @@ fn hzCanopyAt(p : vec2f) -> vec4f {
   }
   if (cov <= 0.0) { return vec4f(0.0); }
   return vec4f(acc / cov, cov);
+}
+
+// A sample's canopy coverage, 0..1, broken at a forest's margin by a
+// mean-preserving hash (the far canopy rule's EDGES): the plane's coverage
+// plus up to +-CANOPY_EDGE_NOISE x min(cov, 1 - cov), so 0 and 1 stay put.
+fn hzCanopyCovW(w : u32, c : vec2<i32>) -> f32 {
+  let cov = f32(w & 0xFFu) / 255.0;
+  let n = f32(hash3(0xCA0B7u, bitcast<u32>(c.x), bitcast<u32>(c.y)) & 0xFFFFu) / 32767.5 - 1.0;
+  return clamp(cov + n * CANOPY_EDGE_NOISE * min(cov, 1.0 - cov), 0.0, 1.0);
+}
+fn hzCanopyCovS(c : vec2<i32>) -> f32 {
+  let base = horizon[HZ_H_CANOPY];
+  if (base == 0u) { return 0.0; }
+  let nn = hzN();
+  let q = clamp(c, vec2<i32>(0), nn - vec2<i32>(1));
+  return hzCanopyCovW(horizon[base + u32(q.y * nn.x + q.x)], q);
+}
+// The crowns' dome mean height at SAMPLE c, fine voxels (horizon.h
+// kHCanopyH); 0 without the plane or where nothing grows.
+fn hzCanopyH(c : vec2<i32>) -> f32 {
+  let hb = horizon[HZ_H_CANOPY_H];
+  if (hb == 0u || horizon[HZ_H_CANOPY] == 0u) { return 0.0; }
+  let nn = hzN();
+  let q = clamp(c, vec2<i32>(0), nn - vec2<i32>(1));
+  let idx = u32(q.y * nn.x + q.x);
+  return f32((horizon[hb + (idx >> 2u)] >> ((idx & 3u) * 8u)) & 0xFFu) * HZ_CANOPY_H_UNIT;
+}
+// The canopy's raise at SAMPLE c, fine voxels: coverage x the crowns' dome
+// mean height. 0 without the planes.
+fn hzCanopyBump(c : vec2<i32>) -> f32 {
+  let h = hzCanopyH(c);
+  if (h <= 0.0) { return 0.0; }
+  return hzCanopyCovS(c) * h;
+}
+fn hzCanopyBumpMax() -> f32 {
+  if (horizon[HZ_H_CANOPY_H] == 0u) { return 0.0; }
+  return f32(horizon[HZ_H_CANOPY_HMAX]);
+}
+// THE CANOPY'S RELIEF at sample-space point p, as a slope (fine voxels of
+// rise per fine voxel; the far canopy rule's RELIEF): the derivative of the
+// bilinear raise across the sample cell p is in, plus a hashed crown tilt
+// per sample scaled by its coverage (CANOPY_ROUGH), bilinear. One read of the
+// cell's four samples serves both.
+fn hzCanopyRelief(p : vec2f) -> vec2f {
+  let i = vec2<i32>(floor(p));
+  let f = p - floor(p);
+  var b : vec4f;
+  var tilt = vec2f(0.0);
+  for (var k = 0; k < 4; k++) {
+    let c = i + vec2<i32>(k & 1, k >> 1);
+    let h = hzCanopyH(c);
+    var cov = 0.0;
+    if (h > 0.0) { cov = hzCanopyCovS(c); }
+    b[k] = cov * h;
+    let wb = select(1.0 - f.x, f.x, (k & 1) != 0) * select(1.0 - f.y, f.y, (k >> 1) != 0);
+    let hs = hash3(0x7117Bu, bitcast<u32>(c.x), bitcast<u32>(c.y));
+    tilt += (wb * cov) * (vec2f(f32(hs & 0xFFFFu), f32(hs >> 16u)) / 32767.5 - vec2f(1.0));
+  }
+  let gb = vec2f(mix(b.y - b.x, b.w - b.z, f.y), mix(b.z - b.x, b.w - b.y, f.x)) / hzS();
+  return gb + tilt * CANOPY_ROUGH;
 }
 
 // THE COLUMN'S TREELINE at sample-space point p (map v2 A1's treelineAt,
@@ -14512,10 +14631,19 @@ fn shadeHorizon(hz : HzHit, rd : vec3f) -> vec3f {
   let fpS = hz.t * 2.0 * R.tanHalfFov / max(R.viewPx, 1.0) / S;
   let l = clamp(i32(floor(log2(max(fpS, 1e-4)))), -1, i32(horizon[HZ_H_LEVELS]) - 1);
   let e = 0.5 * select(f32(1 << u32(max(l, 0))), 1.0, l < 0);
-  let gx = (hzAvgAt(l, hz.p + vec2f(e, 0.0), sea) - hzAvgAt(l, hz.p - vec2f(e, 0.0), sea)) /
+  var gx = (hzAvgAt(l, hz.p + vec2f(e, 0.0), sea) - hzAvgAt(l, hz.p - vec2f(e, 0.0), sea)) /
            (2.0 * e * S);
-  let gz = (hzAvgAt(l, hz.p + vec2f(0.0, e), sea) - hzAvgAt(l, hz.p - vec2f(0.0, e), sea)) /
+  var gz = (hzAvgAt(l, hz.p + vec2f(0.0, e), sea) - hzAvgAt(l, hz.p - vec2f(0.0, e), sea)) /
            (2.0 * e * S);
+  // THE CANOPY'S RELIEF (the far canopy rule): the raise's own slope and the
+  // crowns' tilt, while a sample is still ~2 px or more (fpS < 0.5); gone by
+  // 4 samples a pixel, where it would only alias.
+  let wR = 1.0 - smoothstep(0.5, 4.0, fpS);
+  if (wR > 0.0 && hzCanopyBumpMax() > 0.0) {
+    let g = hzCanopyRelief(hz.p) * wR;
+    gx += g.x;
+    gz += g.y;
+  }
   let n = normalize(vec3f(-gx, 1.0, -gz));
   var color = vec3f(0.0);
   // Under the sea plane on average: open water, by the far field's own law.
@@ -14986,6 +15114,12 @@ fn fs(in : VSOut) -> FSOut {
       // calmed independently if a coarser cascade ever needs it.
       if (smoothAlb.x >= 0.0) { albedo = mix(albedo, smoothAlb, wN); }
       albedo *= surfaceGrainFp(fineV, TUNE_GRAIN_AMP_FAR, voxPx);
+      // THE FAR CANOPY RULE's shade (CANOPY_SHADE): crown matter from level 5
+      // out is a canopy mass full of its own shadow, as the horizon paints it.
+      if (!fFeat && m.klass != CLASS_LIQUID) {
+        let wCs = farCanopyShadeW(hitP);
+        if (wCs > 0.0 && farIsCanopy(far.mat)) { albedo *= mix(1.0, CANOPY_SHADE, wCs); }
+      }
       // THE HORIZON SEAM (H1): the outermost level's cells near its box face
       // ease into the far horizon's paint (hzAlbedo), so the cascade and the
       // horizon past it meet in one colour rather than on a line.
@@ -15211,6 +15345,9 @@ fn fs(in : VSOut) -> FSOut {
         gDbg = vec4f(f32(flv) / 8.0, select(0.0, 1.0, m.klass == CLASS_LIQUID),
                      select(select(0.0, 0.5, fFeat), 1.0, fRefined), 1.0);
       }
+      if (SEAM_DBG == 11u) {
+        gDbg = vec4f(f32(flv) / 8.0, select(0.0, 1.0, farIsCanopy(far.mat)), 0.0, 1.0);
+      }
       // ---- the frozen fire's breath (farEmberPlasma) ----
       // A cascade ember is a fire the window left behind: nothing about it
       // moves any more. The plasma field crawls and pulses over its emission,
@@ -15242,6 +15379,9 @@ fn fs(in : VSOut) -> FSOut {
     } else if (hz.hit) {
       // The map past the cascades (shadeHorizon: lit and fogged there).
       color = shadeHorizon(hz, rd);
+      if (SEAM_DBG == 11u) {
+        gDbg = vec4f(0.0, hzCanopyAt((R.camPos.xz + rd.xz * hz.t - hzOrigin()) / hzS()).a, 1.0, 1.0);
+      }
     } else {
       // THE CLOUDS, over the sky they stand in front of, with the stars, the
       // moons and the sun disc all behind them — the z-order the SkyLayer

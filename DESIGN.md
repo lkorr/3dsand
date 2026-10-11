@@ -16320,11 +16320,13 @@ where you hear from either (§12b, "The ears are on the character").
   — `genCell` at y = `surfHeightAt(x,z)` — instead of the body material the
   center sample lands on. Without this every distant hillside read as stone
   with grass contour stripes, because the grass skin is 1 voxel thick and a
-  coarse center sample almost never hits it. At levels ≥ 5 (cells 2 m+, wider
-  than a tree) surface cells under a crown's XZ footprint take the leaf
-  material instead (`treeCanopyAt`) — trees too thin to survive center
-  sampling are flattened into the terrain, so the far forest keeps its canopy
-  color. **A submerged column's surface cell wears its FLUID (2026-10-10,
+  coarse center sample almost never hits it. At levels ≥ 5 (cells 3.2 m+,
+  wider than a tree) a column under a crown's XZ footprint is CROWN MATTER
+  from the ground up to the crown's dome (`farCanopyAt`: its surface cell and
+  every air-sampled cell in (h, dome] take the leaf material) — trees too
+  thin to survive center sampling become a canopy mass with a height, so the
+  far forest keeps its colour AND its silhouette (2026-10-11, "The forest on
+  the horizon" in §9 has the rule). **A submerged column's surface cell wears its FLUID (2026-10-10,
   ticket 2026-10-09_22-16-05).** The skin rule had one hole: a column whose
   fluid surface and bed round to the same cell boundary has no fluid cell at
   all at that level (the cell over the bed centre-samples above the
@@ -17602,11 +17604,71 @@ cell paints — so the seam band keeps the forest and meets the cascade's
 speckle at its mean. COLOUR ONLY (owner decision): no height bump. Cost: 4 bytes a
 sample, 2.65 MiB on `default`'s 833^2 grid (the buffer 10.8 -> 13.4 MiB with
 the water plane); the whole `Build` measured 215-514 ms on load (the
-`horizon:` startup line prints size and time at every build). Known limit:
-a GREEN forest over a green skin barely shows (`leaves` #3c8f36 against
-`grass` #4e9b3a), because the cascades read as forest mostly through crown
-geometry and shading, which colour-only cannot carry; autumn, conifer and
-mixed stands read clearly.
+`horizon:` startup line prints size and time at every build). That
+colour-only pass (owner decision of the day) left a GREEN forest over a green
+skin a plain (`leaves` #3c8f36 against `grass` #4e9b3a), at the horizon and
+already from level 5 (~410 m), where `farSurfaceMat` flattened crowns into
+the ground colour. Closed by the canopy rule below.
+
+**The far canopy rule: mass and shade (2026-10-11, same ticket, owner
+decision: both).** A forest at kilometre range reads by its MASS -- a
+silhouette, and the shade it casts on itself -- not by its hue. One rule,
+applied by both far representations, so the level-8 -> horizon seam stays
+where it was:
+- **Height.** The crown proxy has a DOME: over a column a crown covers,
+  `top(d) = base + above - (above - crownY) d^2 / crownR^2` (the species'
+  vertical reach over its trunk's ground at the trunk, its measured leaf
+  centroid at the rim; atlas words `TA_S_ABOVE` / `TA_S_CROWN_Y`). From level
+  5 the cascades hold the column as crown matter from the ground to the dome
+  (worldgen.wgsl `farCanopyAt` / `farCanopyCell`, in the sieve, `fardown` and
+  `farpatch` alike -- the `far-downsample` agreement; `farCanopyRows` gates
+  the 5x5 tree scan to level chunks that can hold a surface or dome cell, a
+  superset of the cells that read it, so two producers visiting different
+  rows of a column agree). The horizon raises its surface by coverage x the
+  dome's DISC MEAN, `(above + crownY) / 2`, baked per sample by
+  `horizon::Build` from the same words (`kHCanopyH`, u8 in 2-voxel units,
+  coverage-weighted over the sample's species; `kHCanopyHMax` pads the
+  pyramid walk's skip test so a canopy is never stepped over; +0.7 MiB on
+  `default`). A centre-sampled cell under a crown shows that disc mean in
+  expectation at every level, so the two surfaces meet at one mean height.
+  The heights are NOT in the pyramid's MAX/AVG: the light map, the clouds'
+  ground and the near field's terrain-scale sun horizon still see bare ground
+  (a forest's own shadow is the cascade's at that range).
+- **Shade.** Crown matter at range is porous foliage full of its own shadow:
+  a cascade hit whose far slot is a COVER slot (the far palette entry's
+  `tagMask`, the cover rule's foliage) and the horizon's canopy colour are
+  multiplied by `CANOPY_SHADE` (0.6, raymarch.wgsl; the owner's 0.55-0.7
+  band, judged at the ticket camera day and night). The cascade ramps it in
+  over level 4's outer band (65-100 % of 409.6 m, `farCanopyShadeW`), where
+  crowns are still shapes, so it never steps on a level boundary; the horizon
+  mixes `skin -> crown x shade` by coverage, which is those cells' average.
+- **Edges.** The horizon's per-sample coverage takes a mean-preserving hash,
+  `+- min(cov, 1 - cov)` (`hzCanopyCovW`): a forest's margin is ragged like
+  the cascade's individual crowns, its interior and the open meadow unchanged.
+- **Relief.** The horizon normal adds the raise's own gradient and a hashed
+  per-sample crown tilt (`CANOPY_ROUGH` 0.35 x coverage), faded out from 0.5
+  to 4 samples a pixel so 30 km of forest does not alias.
+- **Measured** (ticket camera, 1600x900, fc4061c + this change built, before = the same
+  exe on fc4061c's assets): the L8 -> horizon strip (6 px each side of the
+  box face, every screen column, `SEAM_DBG 11` = which representation and its
+  canopy; step minus the in-cascade distance gradient), all ground, noon
+  -2.65 -> -1.24 luma, night +2.38 -> +2.94; forest only (horizon coverage
+  > ~0.5 and >= 40 % crown cells below), noon +3.8 -> +3.9, night +1.1 ->
+  +1.2 -- the seam did not move. Worldgen far entries +1 % SPIR-V
+  (far 22961 -> 23184 instructions).
+  Cost (`--render-budget`, 1920x1080, exclusive lock, single samples, ~0.2-0.3 ms
+  run to run; before = the same exe on fc4061c's assets): the ticket camera
+  (`at` with `SANDVOX_BUDGET_AT` = its `--at` at pitch -15, noon) 2.96 ->
+  3.35 ms, ~+0.4 (3.24 with the walk's skip test unpadded: ~0.1 is the pad,
+  the rest the level-0 raise and the relief); `summit` 3.73 -> 3.80
+  (horizon share, baseline - `nohorizon`, 0.19 -> 0.21), `peaksea` 9.86 ->
+  9.99 (0.09 -> 0.26), `cascade` 4.84 -> 5.06 (4.54 in another boot).
+- **Known limits.** The canopy is procgen's, as the flattening before it
+  was: a felled tree's crown stays in levels 5+ (`fardown` and `farpatch`
+  paint the procgen dome too, which is what keeps them byte-equal to the
+  sieve). The horizon has no shadow between crowns, so a dense forest reads
+  ~4 luma brighter just past the level-8 face than just inside it at noon
+  (unchanged by this pass: it was the same before it).
 
 **Peak preservation at levels 6-8.** A cascade cell is solid when its CENTRE
 sample is, so a summit or a knife ridge between two sample columns was shaved
