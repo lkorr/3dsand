@@ -180,6 +180,8 @@ void Build(const worldmap::WorldMapData& m, const std::vector<uint32_t>& wm, uin
   // counted: a few landmarks are nothing at this scale.
   std::vector<uint32_t> canopy;
   std::vector<uint32_t> canopyMats;
+  std::vector<uint8_t> canopyH;   // kHCanopyH: dome mean height / kCanopyHUnit
+  int canopyHMax = 0;
   if (trees && trees->speciesCount > 0 && wm.size() > worldmap::kHBiomeRecords &&
       trees->words.size() > (size_t)treeatlas::kHCondTable) {
     using namespace treeatlas;
@@ -213,6 +215,7 @@ void Build(const worldmap::WorldMapData& m, const std::vector<uint32_t>& wm, uin
       }
     }
     canopy.assign(ns, 0u);
+    canopyH.assign(ns, 0u);
     bool any = false;
     std::vector<std::pair<uint32_t, double>> mats;    // (material, lambda)
     std::vector<std::pair<double, uint32_t>> byW;     // (lambda, material), merged
@@ -231,6 +234,7 @@ void Build(const worldmap::WorldMapData& m, const std::vector<uint32_t>& wm, uin
                                                      std::abs(avgAt(i, j + 1) - avgAt(i, j - 1))) / (2.0 * S));
         mats.clear();
         double lam = 0.0;
+        double lamH = 0.0;   // sum of lambda x the species' dome mean height
         for (int s = 0; s < nsp; s++) {
           const double p = pick[(size_t)b * nsp + s];
           if (p <= 0.0) continue;
@@ -256,6 +260,11 @@ void Build(const worldmap::WorldMapData& m, const std::vector<uint32_t>& wm, uin
           const double l = p * pass * 3.14159265358979 * r * r * (1.0 - punch / 8.0) / (T * T);
           if (l <= 0.0) continue;
           lam += l;
+          // worldgen.wgsl canopyTopOf: above at the trunk, crownY (clamped to
+          // above) at the rim, quadratic between -- disc mean (above + cy) / 2.
+          const int above = (int)sp(s, kSAbove);
+          const int cy = std::min((int)sp(s, kSCrownY), above);
+          lamH += l * 0.5 * (double)(above + cy);
           const uint32_t ac = sp(s, kSAutumnChance);
           const double fa = ac ? 1.0 / (double)ac : 0.0;
           mats.push_back({cm, l * (1.0 - fa)});
@@ -288,10 +297,13 @@ void Build(const worldmap::WorldMapData& m, const std::vector<uint32_t>& wm, uin
           }
         }
         canopy[k] = (uint32_t)c8 | ((uint32_t)t8 << 8) | ((uint32_t)a << 16) | ((uint32_t)bb << 24);
+        const int hq = std::clamp((int)std::lround(lamH / lam / kCanopyHUnit), 0, 255);
+        canopyH[k] = (uint8_t)hq;
+        canopyHMax = std::max(canopyHMax, hq * (int)kCanopyHUnit);
         any = true;
       }
     }
-    if (!any) canopy.clear();
+    if (!any) { canopy.clear(); canopyH.clear(); }
   }
 
   // ---- the cell pyramid ----
@@ -393,6 +405,12 @@ void Build(const worldmap::WorldMapData& m, const std::vector<uint32_t>& wm, uin
     out[kHCanopyMats] = (uint32_t)out.size();
     canopyMats.resize(kCanopyMatSlots, 0u);
     out.insert(out.end(), canopyMats.begin(), canopyMats.end());
+    out[kHCanopyH] = (uint32_t)out.size();
+    const size_t hw = (ns + 3) / 4;
+    const size_t at = out.size();
+    out.resize(at + hw, 0u);
+    std::memcpy(out.data() + at, canopyH.data(), ns);
+    out[kHCanopyHMax] = (uint32_t)canopyHMax;
   }
 }
 

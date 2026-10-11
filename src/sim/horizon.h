@@ -87,7 +87,21 @@ enum : uint32_t {
   // forest is the colour the level-8 cells beside it are.
   kHCanopyMats = kHCanopy + 1,
   kCanopyMatSlots = 256,
-  kHeaderWords = kHCanopyMats + 1,
+  // word offset: nx * nz per-sample CANOPY HEIGHTS, u8, four per word,
+  // little-endian (2026-10-11, the same ticket's height bump): the mean
+  // height of the crown DOME over the trunk's ground, in units of
+  // kCanopyHUnit voxels, weighted over the sample's species by their share of
+  // the coverage. worldgen.wgsl farCanopyAt's dome is above at the trunk and
+  // crownY at the rim, so its disc mean is (above + crownY) / 2 -- the
+  // expected raise a centre-sampled cascade cell under that crown shows. The
+  // horizon raises its surface by coverage x this (raymarch.wgsl
+  // hzCanopyBump). 0 = no plane (old header / no canopy).
+  kHCanopyH = kHCanopyMats + 1,
+  // i32: an upper bound on any sample's raise, voxels (the march's skip test
+  // adds it to a cell's MAX, so a canopy is never stepped over).
+  kHCanopyHMax = kHCanopyH + 1,
+  kHeaderWords = kHCanopyHMax + 1,
+  kCanopyHUnit = 2,
   kMaxLevels = 16,
 };
 
