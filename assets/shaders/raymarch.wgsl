@@ -10518,18 +10518,34 @@ fn solLookAt(cell : vec3<i32>, mat : u32) -> SolLook {
 // entry-cell look drew the cloud only where it touched the surface, and the
 // submerged view (which has no entry cell) never drew it at all.
 //
-// SOL_PATH_N cells sampled evenly along the liquid path (capped at the
-// visibility distance, where the march stopped), offset by a per-pixel,
-// per-frame dither so TAA integrates a cloud thinner than the spacing instead
-// of banding it. The result is the PATH-AVERAGE strength: the shades apply it
-// over the full depth as absorption, so the optical depth is that of the cloud
-// actually crossed (Beer-Lambert: tau = INTEGRAL c ds = c_avg x L). Tint and
-// glow are strength-weighted, so a red cloud in clean water stays red.
+// HOW IT WALKS: one sample per cell SLAB of the ray's dominant axis -- at the
+// ray's crossing of each mid-plane (x = k + 0.5, or y, or z) -- weighted by
+// the length of path that slab covers. The sample points are a pure function
+// of the ray and the world grid: no frame index, no dither. The result is the
+// PATH-AVERAGE strength: the shades apply it over the full depth as
+// absorption, so the optical depth is that of the cloud actually crossed
+// (Beer-Lambert: tau = INTEGRAL c ds = c_avg x L). Tint and glow are
+// strength-weighted, so a red cloud in clean water stays red.
 //
-// After the march, in the shades only -- not per DDA step (the register cliff
-// the entry-cell note above is about). Cost on clean water: SOL_PATH_N table
-// loads, each EMPTY -> return.
-const SOL_PATH_N : u32 = 12u;
+// WHY NOT A FEW DITHERED SAMPLES (ticket 2026-10-11 01:29:42, "blood
+// underwater strobes"). The first version took 12 samples evenly over the
+// path -- one per ~8 cells over the 100-cell cap -- offset by a dither seeded
+// from pcg(ro ^ frameIdx). For a submerged eye ro is the CAMERA, so the
+// offset was the same for every pixel of a frame and new every frame: a cloud
+// a few cells thick was hit or missed by the whole screen at once and its
+// extent jumped frame to frame, and at renderScale 1 there is no TAA to
+// average it (nor would TAA average a whole-screen offset). The slab walk
+// visits every cell the ray crosses along its major axis (it can skip a
+// corner a minor axis clips, which a cloud of voxel cells does not show), so
+// the integral is the same every frame and moves only when the view does.
+//
+// Bounded by the same cap: span <= LIQ_VIS_M (100 cells), so at most ~101
+// slab samples, and only inside chunks that hold dissolved matter -- a chunk
+// with no solute (solTable entry 0, the common case) is skipped to its far
+// face in one step, so clean water pays one table load per 16-cell chunk
+// crossed (<= ~8) where it paid 12. After the march, in the shades only --
+// not per DDA step (the register cliff the entry-cell note above is about).
+const SOL_PATH_MAX_STEPS : u32 = 160u;
 
 fn solPathLook(ro : vec3f, rd : vec3f, pathVox : f32, mat : u32) -> SolLook {
   var o : SolLook;
@@ -10538,30 +10554,55 @@ fn solPathLook(ro : vec3f, rd : vec3f, pathVox : f32, mat : u32) -> SolLook {
   o.tint = vec3f(0.0);
   let span = min(max(pathVox, 0.0), LIQ_VIS_M / VOXEL_METERS);
   if (span <= 0.0) { return o; }
-  let seed = pcg(bitcast<u32>(ro.x) ^ pcg(bitcast<u32>(ro.z) ^ pcg(bitcast<u32>(ro.y) ^ R.frameIdx)));
-  let jit = f32(seed & 0xFFFFu) / 65536.0;
-  let stepV = span / f32(SOL_PATH_N);
+  // The dominant axis, its ray component and origin coordinate.
+  let ad = abs(rd);
+  var dM = rd.x;
+  var oM = ro.x;
+  if (ad.y > ad.x && ad.y >= ad.z) { dM = rd.y; oM = ro.y; }
+  else if (ad.z > ad.x && ad.z > ad.y) { dM = rd.z; oM = ro.z; }
+  let dt = 1.0 / max(abs(dM), 1e-4);          // path per slab (1 .. sqrt 3)
+  let pos = dM > 0.0;
+  // The first mid-plane at or ahead of the origin along the axis.
+  let h0 = select(floor(oM + 0.5) - 0.5, ceil(oM - 0.5) + 0.5, pos);
+  var t = (h0 - oM) / dM;
+  // A zero component would make the chunk-exit division -inf on the near
+  // side; a tiny POSITIVE stand-in picks the far face and gives +huge.
+  let rdS = select(rd, vec3f(1e-30), abs(rd) < vec3f(1e-30));
   var wsum = 0.0;
-  for (var i = 0u; i < SOL_PATH_N; i = i + 1u) {
-    let p = ro + rd * ((f32(i) + jit) * stepV);
-    let s = solLookAt(vec3<i32>(floor(p)), mat);
-    if (s.a > 0.0 || s.g > 0.0) {
-      let w = max(s.a, s.g);
-      o.tint += s.tint * w;
-      wsum += w;
-      o.a += s.a;
-      o.g += s.g;
+  for (var i = 0u; i < SOL_PATH_MAX_STEPS; i = i + 1u) {
+    if (t - 0.5 * dt >= span) { break; }
+    let cell = vec3<i32>(floor(ro + rd * t));
+    if (solTable[voxSlotOfCell(cell)] == 0u) {
+      // No dissolved matter anywhere in this chunk: jump to its far face,
+      // then to the first mid-plane past it.
+      let cmin = vec3f(cell - (cell & vec3<i32>(CHUNK_MASK)));
+      let face = select(cmin, cmin + f32(CHUNK), rdS > vec3f(0.0));
+      let te = (face - ro) / rdS;
+      let tExit = min(te.x, min(te.y, te.z));
+      let cM = oM + dM * tExit;
+      let h = select(ceil(cM + 0.5) - 1.5, floor(cM - 0.5) + 1.5, pos);
+      t = max((h - oM) / dM, t + dt);
+      continue;
     }
+    // The stretch of path this slab stands for, clipped to [0, span].
+    let w = max(min(t + 0.5 * dt, span) - max(t - 0.5 * dt, 0.0), 0.0);
+    let s = solLookAt(cell, mat);
+    if (w > 0.0 && (s.a > 0.0 || s.g > 0.0)) {
+      let k = max(s.a, s.g) * w;
+      o.tint += s.tint * k;
+      wsum += k;
+      o.a += s.a * w;
+      o.g += s.g * w;
+    }
+    t += dt;
   }
   if (wsum <= 0.0) { return o; }
   o.tint /= wsum;
-  // Averaged over the WHOLE path (a sample on clean water counts as zero),
-  // scaled to the span sampled: a path longer than the visibility cap only
-  // shows what is inside the cap.
-  let inv = 1.0 / f32(SOL_PATH_N);
-  let frac = span / max(pathVox, span);
-  o.a *= inv * frac;
-  o.g *= inv * frac;
+  // Averaged over the WHOLE path (clean water counts as zero): a path longer
+  // than the visibility cap only shows what is inside the cap.
+  let inv = 1.0 / max(pathVox, span);
+  o.a *= inv;
+  o.g *= inv;
   return o;
 }
 
@@ -13113,6 +13154,18 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
                               WATER_ABSORB, WATER_SCATTER);
     absorb = mix(absorb, co.absorbK, caFrac);
     body = mix(body, co.scatter, caFrac);
+  }
+  // Dissolved matter along the column (solPathLook), as shadeWater and
+  // shadeSubmerged apply it: a blood cloud under a swimmer whose wake excited
+  // the surface into particles was drawn by this shade with no solute look at
+  // all, so it vanished wherever the water moved (ticket 2026-10-11 01:29:42,
+  // "hardly visible from beneath the surface"). The solvent is the CA liquid
+  // under the particles, or the particles' own.
+  let sol = solPathLook(hitP, rd, colVox, select(s.mat, caMat, caMat != MAT_AIR));
+  if (sol.a > 0.0) {
+    let solK = (vec3f(1.0) - sol.tint) * (sol.a * SOL_LOOK_ABSORB);
+    body = mix(body, sol.tint * SOL_LOOK_SCATTER, solScatterShare(sol, solK, absorb));
+    absorb += solK;
   }
   let trans = exp(-absorb * thickM);
   // The water veil (gV* globals): the same two coefficients a raster body in

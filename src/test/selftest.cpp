@@ -1277,6 +1277,11 @@ const char* const kOrder[] = {
     "solute-pour", "solute-payout", "solute-blood",
     // The render half: tinted and glowing pools drawn to build/solute_look.bmp.
     "solute-look",
+    // The blood cloud drawn from below and above the surface (own worldgen,
+    // own basin at (224, ., 224); nothing after it reads that region).
+    "blood-cloud",
+    // A blast in a pond gives its water back (own worldgen, own basin).
+    "blast-water",
     "snapshot-latency",
     // Spells in hand: real casts through the tick, so it fires bolts into the
     // harness window and leaves their marks. Late, where nothing after it

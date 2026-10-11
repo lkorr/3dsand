@@ -1510,6 +1510,278 @@ Status GateSoluteBlood(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- blood-cloud --------------------------------------------------------------
+// THE BLOOD CLOUD, DRAWN (ticket 2026-10-11 01:29:42: "blood underwater strobes;
+// on the surface the blood is hardly visible from beneath the surface"). A deep
+// open stone basin of water with a blood CLOUD poured into the middle of the
+// column (CellOpSolute: mass straight into the water, the state a wound's mixed
+// blood reaches), photographed from INSIDE the water looking across at it and
+// from ABOVE the surface looking down into it.
+//
+// Asserted, each failing differently:
+//   sim     the cloud does not jump: over `bloodCloud.simTicks` ticks after the
+//           pour the mass centroid moves at most `maxCentroidStep` voxels a
+//           tick and its rms radius at most `maxSpreadStep` voxels a tick
+//           a tick -- the solute-layer readback that says whether a flicker on
+//           screen could be the SIM at all;
+//   strobe  the frame does not: of the cloud's pixels, the share that changes
+//           between two CONSECUTIVE frames of the same still world and camera
+//           exceeds the clean-water control's share by at most `maxStrobe`
+//           (raymarch.wgsl solPathLook once offset every sample of a submerged
+//           frame by one camera-and-frame-seeded dither: the cloud's extent
+//           jumped frame to frame);
+//   seen    the cloud moves at least `minFracBelow` / `minFracAbove` of the
+//           frame against the clean-water frame, toward red, from either side
+//           of the surface.
+// Frames: build/blood_cloud_{below,above}.bmp (and _clean_). Thresholds in
+// tests/baseline.json (bloodCloud.*). Render-only but for the sim claim.
+Status GateBloodCloud(Ctx& c, std::string& detail) {
+  const uint32_t water = MatNamed(c, "water");
+  const SoluteDef* sd = CurrentSoluteNamed("blood");
+  if (!water || !sd) {
+    detail = "needs water and a `blood` species in solutes.json";
+    return Status::Fail;
+  }
+  FixtureTuning tune;
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  // 33 x 33 inside, 14 of water, open-topped so the sun reaches the bed.
+  const int cx = 224, cz = 224, kHalf = 16, kDeep = 14;
+  const int fy = FixtureYOver(cx - kHalf - 1, cz - kHalf - 1, cx + kHalf + 1, cz + kHalf + 1,
+                              kDefaultSeed, 1);
+  const Box box{cx - kHalf, cx + kHalf, cz - kHalf, cz + kHalf, fy, fy + kDeep + 3, false};
+  const int surfY = fy + kDeep;            // top water cell
+  const int cy = fy + 1 + kDeep / 2;       // cloud centre, mid-column
+  const int kR = 4;
+  const uint32_t heart = (uint32_t)BaselineNumber("bloodCloud.heartUnits", 160);
+  std::vector<CellOp> pour[3];
+  int nPour = 0;
+  for (int z = -kR; z <= kR; z++)
+    for (int y = -kR; y <= kR; y++)
+      for (int x = -kR; x <= kR; x++) {
+        const int r2 = x * x + y * y + z * z;
+        if (r2 > kR * kR) continue;
+        // Denser at the heart: `heartUnits` of mass a cell (blood's saturation
+        // is 255: 160 is c ~0.6, the core of a fresh wound's cloud), then 3/5
+        // and 3/10 of it toward the rim.
+        const uint32_t units = r2 <= 4 ? heart : r2 <= 9 ? heart * 3u / 5u : heart * 3u / 10u;
+        pour[nPour % 3].push_back({World::SlotCellIndex({cx + x, cy + y, cz + z}),
+                                   CellOpSolute(sd->species, units)});
+        nPour++;
+      }
+
+  uint32_t t = 63000;
+  support::TickCursor ticker{c, t, {cx >> 4, cy >> 4, cz >> 4}};
+  // Long enough for the fill's MPM excitation to settle back into a still
+  // lake: the photograph is of a cloud in still water.
+  const int kSettle = (int)BaselineNumber("bloodCloud.settleTicks", 300);
+  for (int i = 0; i < kSettle; i++)
+    ticker({}, i == 0 ? box.Build((uint32_t)kMatStone)
+                      : i == 2 ? box.Layers(water, fy + 1, kDeep, 7u) : std::vector<CellOp>{});
+
+  const Tuning base = CurrentTuning();
+  uint32_t noonTick = 0;
+  {
+    float bestUp = -2.0f;
+    for (uint32_t s = 0; s < 200000u; s += 64u) {
+      const float up = ComputeSky(base, (double)s).sunDir[1];
+      if (up > bestUp) { bestUp = up; noonTick = s; }
+    }
+  }
+  const uint32_t W = c.width, H = c.height;
+  auto aim = [](const Vec3& eye, const Vec3& at) {
+    Camera cam;
+    const float dx = at.x - eye.x, dy = at.y - eye.y, dz = at.z - eye.z;
+    cam.yaw = std::atan2(dz, dx);
+    cam.pitch = std::atan2(dy, std::sqrt(dx * dx + dz * dz));
+    return cam;
+  };
+  // Inside the water near the west wall, level with the cloud, looking across.
+  const Vec3 eyeBelow{(float)(cx - kHalf + 2) + 0.5f, (float)cy + 0.5f, (float)cz - 3.5f};
+  // Above the surface to the south-west, looking down into the column.
+  const Vec3 eyeAbove{(float)cx - 11.5f, (float)surfY + 9.5f, (float)cz - 11.5f};
+  const Vec3 core{(float)cx + 0.5f, (float)cy + 0.5f, (float)cz + 0.5f};
+  const Camera camBelow = aim(eyeBelow, core), camAbove = aim(eyeAbove, core);
+
+  rhi::Buffer shot = CreateBuffer(c.ctx.device, (uint64_t)W * H * 4,
+                                  rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                                  "bloodCloudShot");
+  // kWarm frames, then the LAST TWO read back: consecutive frames of a still
+  // world and a still camera (WriteRenderParams advances frameIdx each call).
+  // The warm frames are also the COST probe: wall time per frame over them,
+  // drained before and after (the solute walk runs only on liquid pixels, so
+  // the blood arm minus the clean arm is what the cloud costs this view).
+  auto render = [&](const Vec3& eye, const Camera& cam, std::vector<uint8_t>& f1,
+                    std::vector<uint8_t>& f2, double& msPerFrame) -> bool {
+    const int kWarm = 20;
+    c.ctx.WaitIdle();
+    double t0 = NowSeconds();
+    for (int f = 0; f < kWarm + 2; f++) {
+      if (f == 4) { c.ctx.WaitIdle(); t0 = NowSeconds(); }
+      if (f == kWarm) {
+        c.ctx.WaitIdle();
+        msPerFrame = (NowSeconds() - t0) * 1000.0 / (kWarm - 4);
+      }
+      // Sun shadows off, as solute-look: the claim is the medium, and the
+      // staggered shadow refresh would otherwise differ between the two frames.
+      WriteRenderParams(c.ctx.queue, c.world, eye, cam, (float)W / H, false, 0.0f,
+                        kFarFogDensity, (float)H, noonTick);
+      rhi::CommandEncoder enc = c.ctx.device.CreateCommandEncoder();
+      c.sim.EncodeShadowResolve(enc);
+      rhi::RenderPass rp =
+          c.sim.BeginRenderPass(enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+      c.sim.DrawWorld(rp);
+      rp.End();
+      if (f >= kWarm) {
+        rhi::TexelCopyTexture srcT{};
+        srcT.texture = c.offscreen;
+        rhi::TexelCopyBuffer dstB{};
+        dstB.buffer = shot;
+        dstB.bytesPerRow = W * 4;
+        dstB.rowsPerImage = H;
+        enc.CopyTextureToBuffer(srcT, dstB, rhi::Extent3D{W, H, 1});
+      }
+      c.ctx.queue.Submit(enc.Finish());
+      if (f >= kWarm) {
+        std::vector<uint8_t>& out = f == kWarm ? f1 : f2;
+        out.assign((size_t)W * H * 4, 0);
+        if (!rhi::ReadBufferBlocking(c.ctx.device, shot, 0, out.data(), out.size()))
+          return false;
+      }
+    }
+    return true;
+  };
+  std::vector<uint8_t> cb1, cb2, ca1, ca2;   // clean below / above
+  double msCB = 0, msCA = 0, msBB = 0, msBA = 0;
+  if (!render(eyeBelow, camBelow, cb1, cb2, msCB) || !render(eyeAbove, camAbove, ca1, ca2, msCA)) {
+    detail = "render/readback failed (clean)";
+    return Status::Fail;
+  }
+
+  // ---- the pour, then the SIM claim: does the cloud itself jump? ----
+  for (int i = 0; i < 3; i++) ticker({}, pour[i]);
+  const int kSimTicks = (int)BaselineNumber("bloodCloud.simTicks", 30);
+  double maxStep = 0.0, maxRgStep = 0.0, prevX = 0, prevY = 0, prevZ = 0, prevRg = 0;
+  double rg0 = 0, rg1 = 0;
+  uint32_t cells0 = 0, cells1 = 0;
+  uint64_t mass0 = 0, mass1 = 0;
+  for (int i = 0; i <= kSimTicks; i++) {
+    if (i > 0) ticker({}, {});
+    SoluteLayer L;
+    ReadSoluteLayer(c, L);
+    double sx = 0, sy = 0, sz = 0, s2 = 0;
+    uint64_t m = 0;
+    uint32_t n = 0;
+    for (uint32_t slot : box.Chunks()) {
+      if (L.table[slot] == 0u) continue;
+      const IVec3 wc = c.world.SlotToWorldChunk(slot);
+      for (uint32_t k = 0; k < kChunkVol; k++) {
+        const uint32_t v = L.Value(slot, k);
+        if ((v >> 8) != sd->species || (v & 0xFFu) == 0u) continue;
+        const uint32_t mm = v & 0xFFu;
+        const double qx = wc.x * 16 + (int)(k % 16) - cx, qy = wc.y * 16 + (int)((k / 16) % 16) - cy,
+                     qz = wc.z * 16 + (int)(k / 256) - cz;
+        sx += (double)mm * qx;
+        sy += (double)mm * qy;
+        sz += (double)mm * qz;
+        s2 += (double)mm * (qx * qx + qy * qy + qz * qz);
+        m += mm;
+        n++;
+      }
+    }
+    if (m == 0) break;
+    sx /= (double)m; sy /= (double)m; sz /= (double)m;
+    const double rg = std::sqrt(std::max(s2 / (double)m - (sx * sx + sy * sy + sz * sz), 0.0));
+    if (i == 0) { mass0 = m; cells0 = n; rg0 = rg; }
+    else {
+      const double d = std::sqrt((sx - prevX) * (sx - prevX) + (sy - prevY) * (sy - prevY) +
+                                 (sz - prevZ) * (sz - prevZ));
+      maxStep = std::max(maxStep, d);
+      maxRgStep = std::max(maxRgStep, std::fabs(rg - prevRg));
+    }
+    prevX = sx; prevY = sy; prevZ = sz; prevRg = rg;
+    mass1 = m; cells1 = n; rg1 = rg;
+  }
+
+  std::vector<uint8_t> bb1, bb2, ba1, ba2;   // blood below / above
+  if (!render(eyeBelow, camBelow, bb1, bb2, msBB) || !render(eyeAbove, camAbove, ba1, ba2, msBA)) {
+    detail = "render/readback failed (blood)";
+    return Status::Fail;
+  }
+  WriteBmpFile("build/blood_cloud_below.bmp", bb2, W, H);
+  WriteBmpFile("build/blood_cloud_above.bmp", ba2, W, H);
+  WriteBmpFile("build/blood_cloud_clean_below.bmp", cb2, W, H);
+  WriteBmpFile("build/blood_cloud_clean_above.bmp", ca2, W, H);
+
+  auto px = [&](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b, size_t p) {
+    const size_t i = p * 4;
+    return std::max({std::abs((int)a[i] - (int)b[i]), std::abs((int)a[i + 1] - (int)b[i + 1]),
+                     std::abs((int)a[i + 2] - (int)b[i + 2])});
+  };
+  struct View { double frac, strobe, ctlStrobe, red; size_t n; };
+  // Cloud mask = pixels the blood moved by more than 12 against the clean
+  // frame. strobe = the share of those that move by more than 12 between the
+  // two consecutive blood frames; ctlStrobe the same pixels' share in the
+  // clean pair (whatever else in the frame is per-frame noise).
+  auto judge = [&](const std::vector<uint8_t>& c1, const std::vector<uint8_t>& c2,
+                   const std::vector<uint8_t>& b1, const std::vector<uint8_t>& b2) {
+    View v{0, 0, 0, 0, 0};
+    size_t flick = 0, ctl = 0;
+    double red = 0;
+    for (size_t p = 0; p < (size_t)W * H; p++) {
+      if (px(b2, c2, p) <= 12) continue;
+      v.n++;
+      if (px(b1, b2, p) > 12) flick++;
+      if (px(c1, c2, p) > 12) ctl++;
+      const size_t i = p * 4;
+      red += ((double)b2[i] - (double)b2[i + 2]) - ((double)c2[i] - (double)c2[i + 2]);
+    }
+    v.frac = (double)v.n / (double)((size_t)W * H);
+    v.strobe = v.n ? (double)flick / (double)v.n : 0.0;
+    v.ctlStrobe = v.n ? (double)ctl / (double)v.n : 0.0;
+    v.red = v.n ? red / (double)v.n : 0.0;
+    return v;
+  };
+  const View below = judge(cb1, cb2, bb1, bb2), above = judge(ca1, ca2, ba1, ba2);
+
+  const double maxStrobe = BaselineNumber("bloodCloud.maxStrobe", 0.02);
+  const double minBelow = BaselineNumber("bloodCloud.minFracBelow", 0.05);
+  const double minAbove = BaselineNumber("bloodCloud.minFracAbove", 0.02);
+  const double minRed = BaselineNumber("bloodCloud.minRedShift", 8.0);
+  const double maxCStep = BaselineNumber("bloodCloud.maxCentroidStep", 0.25);
+  const double maxNStep = BaselineNumber("bloodCloud.maxSpreadStep", 0.25);
+  const bool simOk = mass0 > 0 && maxStep <= maxCStep && maxRgStep <= maxNStep;
+  const bool strobeOk = below.strobe - below.ctlStrobe <= maxStrobe &&
+                        above.strobe - above.ctlStrobe <= maxStrobe;
+  const bool seenOk = below.frac >= minBelow && above.frac >= minAbove &&
+                      below.red >= minRed && above.red >= minRed;
+  RecordObserved("bloodCloud.strobeBelow", below.strobe);
+  RecordObserved("bloodCloud.strobeAbove", above.strobe);
+  RecordObserved("bloodCloud.fracBelow", below.frac);
+  RecordObserved("bloodCloud.fracAbove", above.frac);
+  RecordObserved("bloodCloud.centroidStep", maxStep);
+  RecordObserved("bloodCloud.msBelowClean", msCB);
+  RecordObserved("bloodCloud.msBelowBlood", msBB);
+  RecordObserved("bloodCloud.msAboveClean", msCA);
+  RecordObserved("bloodCloud.msAboveBlood", msBA);
+  detail = Format(
+      "SIM %d pour cells, mass %llu -> %llu over %d ticks, %u -> %u cells, rms radius "
+      "%.2f -> %.2f; centroid step max %.3f vox/tick (allow %.2f), radius step max %.3f "
+      "(allow %.2f) %s | "
+      "BELOW %.3f of frame (min %.3f), red shift %+.1f, strobe %.3f vs clean %.3f | "
+      "ABOVE %.3f of frame (min %.3f), red shift %+.1f, strobe %.3f vs clean %.3f "
+      "(strobe allow +%.3f, red min %.1f) | frame ms below clean %.2f / blood %.2f, above "
+      "clean %.2f / blood %.2f (wall, not gated) | frames build/blood_cloud_{below,above}.bmp",
+      nPour, (unsigned long long)mass0, (unsigned long long)mass1, kSimTicks, cells0, cells1,
+      rg0, rg1, maxStep, maxCStep, maxRgStep, maxNStep, simOk ? "steady" : "JUMPS", below.frac,
+      minBelow, below.red, below.strobe, below.ctlStrobe, above.frac, minAbove, above.red,
+      above.strobe, above.ctlStrobe, maxStrobe, minRed, msCB, msBB, msCA, msBA);
+  const bool ok = simOk && strobeOk && seenOk;
+  std::printf("blood-cloud: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SoluteGates() {
@@ -1524,6 +1796,7 @@ const std::vector<Gate>& SoluteGates() {
       {"solute-pour", "sim", {}, false, GateSolutePour, false},
       {"solute-payout", "sim", {}, false, GateSolutePayout, false},
       {"solute-blood", "sim", {}, false, GateSoluteBlood, false},
+      {"blood-cloud", "render", {}, false, GateBloodCloud, true},
   };
   return g;
 }
