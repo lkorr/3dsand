@@ -10146,9 +10146,8 @@ fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
   // through it. Before the ambient below, which is lit from scatterCol.
   let sol = solPathLook(ro, rd, pathVox, mat);
   if (sol.a > 0.0) {
-    let solK = (vec3f(1.0) - sol.tint) * (sol.a * SOL_LOOK_ABSORB);
-    scatterCol = mix(scatterCol, sol.tint * SOL_LOOK_SCATTER, solScatterShare(sol, solK, absorbK));
-    absorbK += solK;
+    scatterCol = mix(scatterCol, sol.tint * SOL_LOOK_SCATTER, solScatterShare(sol, sol.k, absorbK));
+    absorbK = absorbK * (1.0 - sol.f) + sol.k;
   }
 
   // The scatter colour is lit by the key light, so a pond at night is dark
@@ -10462,6 +10461,28 @@ struct SolLook {
   tint : vec3f,   // the species colour, 0..1 per channel
   a    : f32,     // how far toward it: tintStrength/255 x c/ref
   g    : f32,     // emission: glow/255 x c/ref
+  k    : vec3f,   // extinction per metre the solute ADDS to the body
+  f    : f32,     // share of the cell that is the source LIQUID, not solvent
+}
+
+// A LIQUID dissolved in a liquid (blood in water) is not a dye: the cell is a
+// MIXTURE, `f` of it blood and 1 - f water, where f is the blood's mass over
+// what a full cell of blood mixes into (yieldPerVoxel / 8 per eighth, the
+// species row's word 0). Its optics are that interpolation, per cell: the
+// solvent's extinction x (1 - f) plus the source liquid's x f -- the source's
+// OWN extinction, the one its voxel is drawn with, so a cell that has just
+// mixed (f ~ 1) is exactly as dark as the blood it was and fades only as the
+// blood spreads and decays (ticket: "goes from very dark blood to half
+// transparent the tick it becomes a solute"; the dye rule below gave a full
+// cell ~12 /m against blood's ~43 /m). Linear in f is Beer-Lambert for a
+// mixture, so a path-average f over the column integrates exactly.
+//
+// The source's extinction: a viscous liquid (blood) is drawn by shadeViscous
+// with a grey (opacity x TUNE_BLOOD_ABSORB); any other liquid by liquidOptics.
+fn solSourceK(src : u32) -> vec3f {
+  let sm = materials[src & 0xFFFu];
+  if (isViscousLiquid(sm)) { return vec3f((f32(sm.opacity) / 255.0) * TUNE_BLOOD_ABSORB); }
+  return liquidOptics(sm).absorbK;
 }
 
 // How hard a full-strength solute colours the liquid body. Absorption of the
@@ -10478,6 +10499,8 @@ fn solLookAt(cell : vec3<i32>, mat : u32) -> SolLook {
   o.a = 0.0;
   o.g = 0.0;
   o.tint = vec3f(0.0);
+  o.k = vec3f(0.0);
+  o.f = 0.0;
   let e = solTable[voxSlotOfCell(cell)];
   if (e == 0u) { return o; }
   let lo = vec3<u32>(cell & vec3<i32>(CHUNK_MASK));
@@ -10508,6 +10531,15 @@ fn solLookAt(cell : vec3<i32>, mat : u32) -> SolLook {
   o.tint = vec3f(f32((t >> 16u) & 0xFFu), f32((t >> 8u) & 0xFFu), f32(t & 0xFFu)) / 255.0;
   o.a = c * f32(solSpec[rb + 7u]) / 255.0;
   o.g = c * f32(solSpec[rb + 8u]) / 255.0;
+  // A liquid source mixes (see SolLook); anything else dyes the solvent.
+  let src = solSpec[rb + 15u];
+  if (src != 0u && src < 4096u && materials[src].klass == CLASS_LIQUID) {
+    o.f = min(f32(mass) / f32(max(solSpec[rb], 1u) * full), 1.0);
+    o.k = solSourceK(src) * o.f;
+    o.a = max(o.a, o.f);
+  } else {
+    o.k = (vec3f(1.0) - o.tint) * (o.a * SOL_LOOK_ABSORB);
+  }
   return o;
 }
 
@@ -10552,6 +10584,8 @@ fn solPathLook(ro : vec3f, rd : vec3f, pathVox : f32, mat : u32) -> SolLook {
   o.a = 0.0;
   o.g = 0.0;
   o.tint = vec3f(0.0);
+  o.k = vec3f(0.0);
+  o.f = 0.0;
   let span = min(max(pathVox, 0.0), LIQ_VIS_M / VOXEL_METERS);
   if (span <= 0.0) { return o; }
   // The dominant axis, its ray component and origin coordinate.
@@ -10593,6 +10627,8 @@ fn solPathLook(ro : vec3f, rd : vec3f, pathVox : f32, mat : u32) -> SolLook {
       wsum += k;
       o.a += s.a * w;
       o.g += s.g * w;
+      o.k += s.k * w;
+      o.f += s.f * w;
     }
     t += dt;
   }
@@ -10603,6 +10639,8 @@ fn solPathLook(ro : vec3f, rd : vec3f, pathVox : f32, mat : u32) -> SolLook {
   let inv = 1.0 / max(pathVox, span);
   o.a *= inv;
   o.g *= inv;
+  o.k *= inv;
+  o.f *= inv;
   return o;
 }
 
@@ -10693,9 +10731,8 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // anywhere in the column shows, not only one touching the surface.
   let sol = solPathLook(hitP, rd, pathVox, mat);
   if (sol.a > 0.0) {
-    let solK = (vec3f(1.0) - sol.tint) * (sol.a * SOL_LOOK_ABSORB);
-    scatter = mix(scatter, sol.tint * SOL_LOOK_SCATTER, solScatterShare(sol, solK, absorbK));
-    absorbK += solK;
+    scatter = mix(scatter, sol.tint * SOL_LOOK_SCATTER, solScatterShare(sol, sol.k, absorbK));
+    absorbK = absorbK * (1.0 - sol.f) + sol.k;
   }
   // liqVisFade: the march stopped at LIQ_VIS_M of water, so the column must be
   // fully opaque by then or the stop shows as an edge (whatever the stopped
@@ -13163,9 +13200,8 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   // under the particles, or the particles' own.
   let sol = solPathLook(hitP, rd, colVox, select(s.mat, caMat, caMat != MAT_AIR));
   if (sol.a > 0.0) {
-    let solK = (vec3f(1.0) - sol.tint) * (sol.a * SOL_LOOK_ABSORB);
-    body = mix(body, sol.tint * SOL_LOOK_SCATTER, solScatterShare(sol, solK, absorb));
-    absorb += solK;
+    body = mix(body, sol.tint * SOL_LOOK_SCATTER, solScatterShare(sol, sol.k, absorb));
+    absorb = absorb * (1.0 - sol.f) + sol.k;
   }
   let trans = exp(-absorb * thickM);
   // The water veil (gV* globals): the same two coefficients a raster body in
