@@ -820,12 +820,16 @@
       "neighborBecomes": "air"
     },
     {
-      "note": "blood dries away so pools go back to sleep (PLAN #B5, rule 2). DRYING: it soaks into the ground / dries in the open, which a flask has neither of -- the alchemy bench never fires it inside a vessel.",
+      "note": "blood dries away so pools go back to sleep (PLAN #B5, rule 2). DRYING: it soaks into the ground / dries in the open, which a flask has neither of -- the alchemy bench never fires it inside a vessel. ONLY WHERE IT TOUCHES AIR (2026-10-10): blood under water waits to MIX into it (solutes.json blood, sim_step.wgsl solTryMix, which refuses a neighbour already a dense cloud), and a submerged cell that dried left an air bubble and lost the water's volume -- measured, 57 eighths out of the solute-blood pond. A pool in the open dries from its exposed face down.",
       "self": "blood",
       "decay": true,
       "becomes": "air",
       "chance": 8,
-      "drying": true
+      "drying": true,
+      "scaleByNeighbors": {
+        "neighbor": "air",
+        "scaleMax": 1
+      }
     },
     {
       "note": "======== DAY/NIGHT INTERACTIONS ========================================\nThese carry the light conditions added with the day/night cycle:\n  \"needsSky\": true   the cell must have open sky above it (bounded probe up)\n  \"when\": \"day\"      only while the sun is up  |  \"night\" only while it is down\n  \"minLight\": 0-255  a floor on daylight strength (255 = only at high noon)\n\nAll three are integer and derived from the tick-based day phase, so they are\nas deterministic as every other rule (CLAUDE.md rule 1).\n\nSLEEP DISCIPLINE (rule 2): a rule whose light condition is UNMET does not hold\nits chunk awake, so a pond sleeps all night instead of spinning. The engine\nwakes every chunk on the tick daylight switches on or off (Simulation::\nEncodeWakeAll), which is a few ticks per in-game day. Chances are kept low so\nthese are a slow background weathering, not a strobe."

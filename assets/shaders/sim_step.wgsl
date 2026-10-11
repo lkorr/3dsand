@@ -1254,11 +1254,29 @@ fn solTryMix(c : vec3<i32>, idx : u32, w : u32, s : u32, slotIdx : u32,
   if (solValueAt(c) != 0u) { return false; }
   let rr = hash3(T.seed ^ 0x3C1D8B0Du, T.tick, slotIdx);
   let rot = (rr >> 12u) % 6u;
+  var waiting = false;
   for (var i = 0u; i < 6u; i = i + 1u) {
     let n = c + faceDir((i + rot) % 6u);
     if (!inBounds(n)) { continue; }
-    let nmat = voxMat(voxWordAt(n));
+    let nw = voxWordAt(n);
+    let nmat = voxMat(nw);
     if (!solIsLiquidMat(nmat) || !solIsSolvent(nmat, s)) { continue; }
+    // A solvent that is already a DENSE cloud of this species does not take
+    // more: it is, near enough, still the source liquid. Without this the
+    // mixing CHAINED -- each blood cell that mixed became water, which the
+    // next blood cell touched and mixed with, so the water front climbed a
+    // whole pool of blood a cell a tick and the pool turned to water from
+    // the inside. Now a pool meeting water dissolves only where the water
+    // against it is under half the species' saturation, i.e. as fast as the
+    // diffusion carries the cloud away: a slow front, and the blood keeps
+    // flowing as a liquid meanwhile (it is water's density, materials.json,
+    // so it does not fall through the water as a column).
+    let nv = solValueAt(n);
+    if (solSpeciesOf(nv) == s &&
+        2u * solMassOf(nv) * 8u >= solCap(s, 8u) * (voxState(nw) + 1u)) {
+      waiting = true;
+      continue;
+    }
     if (probe) {
       markDirtyR(c, DIRTY_R_REACT);
       return false;
@@ -1281,6 +1299,9 @@ fn solTryMix(c : vec3<i32>, idx : u32, w : u32, s : u32, slotIdx : u32,
     markDirty(c);
     return true;
   }
+  // Only dense cloud against it: the cloud is diluting (diffusion, halfLife),
+  // so look again -- bounded, it cannot stay dense.
+  if (waiting) { markDirtyR(c, DIRTY_R_REACT); }
   return false;
 }
 

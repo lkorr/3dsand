@@ -716,9 +716,11 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
     // in the water. Without this, liquids have no fluid lift, so this block
     // shoved blood up one cell a tick to the surface, where it landed ON the
     // water and dried away. A LIGHTER liquid (oil) still rises: that one is
-    // right.
+    // right. An EQUAL one rejoins too (myDensity + 1): blood is water's
+    // density since 2026-10-10 so a cloud does not fall as a column, and the
+    // strict test would have sent it climbing to the surface again.
     if (materials[myMat].klass == CLASS_LIQUID && startKlass == CLASS_LIQUID &&
-        canOccupy(startWord, myDensity, false)) {
+        canOccupy(startWord, myDensity + 1, false)) {
       p.flags |= PFLAG_PENDING;
       let ss = claimSlot(claimCellId(startCell));
       atomicMax(&claim[ss], particlePriority(p));

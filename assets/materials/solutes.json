@@ -122,16 +122,16 @@
       "solvents": ["aqua_regia"]
     },
     {
-      "//": "BLOOD IN WATER (2026-10-10). The one LIQUID source: a blood cell touching water MIXES (sim_step.wgsl solTryMix) -- it becomes a water cell of its own fullness carrying its blood as mass, so the volume stays and the cloud starts where the blood was. yieldPerVoxel 248 because a full cell holds 255 at most (31 a fullness eighth fits exactly). dissolveChance 250: blood meeting water clouds within a few ticks, before it can sink to the bed or dry. diffusivity 40 billows it a body-length in a few seconds; halfLife 10 s FADES it wherever it is (spread or not), and the floor takes the faint tail once the chunk stalls, so a fight in a lake leaves it clear again within a minute. densityPerUnit 12: bloody water is a little heavier, so a thick cloud sags. Tint is blood's own palette red; tintStrength 230 so a fresh cloud is near-opaque and a thin one a pink haze. No precipitatesTo: bloody water that dries leaves nothing, like blood itself.",
+      "//": "BLOOD IN WATER (2026-10-10). The one LIQUID source: a blood cell touching water MIXES (sim_step.wgsl solTryMix) -- it becomes a water cell of its own fullness carrying its blood as mass, so the volume stays and the cloud starts where the blood was. yieldPerVoxel 248 because a full cell holds 255 at most (31 a fullness eighth fits exactly). dissolveChance 250: blood meeting clean water clouds within a few ticks. It does NOT chain through a pool (solTryMix refuses water already a dense cloud), and blood is water's density (materials.json), so it neither sinks as a column nor mixes a whole pool at once: it dissolves at its edge and the cloud spreads every way by diffusion. diffusivity 2 (was 40 until 2026-10-10: the four-stride pair exchange spread one cell over ~1000 within a second, so a wound's cloud thinned to invisible the tick it mixed -- \"turns into water colour instantly\") lets it hang as a cloud and billow slowly, like ink; halfLife 25 s FADES it wherever it is (spread or not), and the floor takes the faint tail once the chunk stalls, so a fight in a lake leaves it clear again within a couple of minutes. densityPerUnit 0 (was 12): solTrySink swaps a denser cell down EVERY tick, so a weighted cloud fell straight to the bed as a column instead of hanging and spreading; the blood liquid is water's density too, so nothing about blood in water has a downward bias. Tint is blood's own palette red; tintStrength 230 so a fresh cloud is near-opaque and a thin one a pink haze. No precipitatesTo: bloody water that dries leaves nothing, like blood itself.",
       "name": "blood",
       "from": "blood",
       "yieldPerVoxel": 248,
       "saturation": 255,
       "dissolveChance": 250,
-      "diffusivity": 40,
+      "diffusivity": 2,
       "floor": 4,
-      "halfLife": 10,
-      "densityPerUnit": 12,
+      "halfLife": 25,
+      "densityPerUnit": 0,
       "tint": "#5a0606",
       "tintStrength": 230,
       "solvents": ["water"]
