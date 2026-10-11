@@ -8392,7 +8392,7 @@ Status GatePlayerCorpse(Ctx& c, std::string& detail) {
 // ---------------------------------------------------------------------------
 // Owner, 2026-10-09: "corpses should slightly float in water with a bit of
 // buoyancy, depending on the material the corpse is made out of. So robots
-// obviously wouldn't float." Before Mob::FloatDeadLimbs a corpse fell through a
+// obviously wouldn't float." Before Mob::FloatLimpLimbs a corpse fell through a
 // lake as if it were air (liquids are not in the collider) and lay on the bed.
 //
 // One stamped basin (stone bed and walls, 14 layers of water, air above),
@@ -8407,6 +8407,13 @@ Status GatePlayerCorpse(Ctx& c, std::string& detail) {
 //   * AUTOMATON (tinker, brass) must SINK to the bed;
 //   * ANDROID (courier, synth shell) must SINK too;
 //   * SYLVAN (deku, wood) must ride at least as high as the human.
+// And a LIVE human knocked limp (StartRagdoll, held down for the whole arm)
+// must float like the corpse plus ragdoll.limpWaterLift: owner, 2026-10-10,
+// "ragdoll physics in water should be basically identical to corpse physics
+// in water with a soft upward drifting force applied". Before that a limp
+// creature fell through the water to the bed. Its pelvis must stay off the
+// bed, end within the band of the waterline, and ride no lower than the
+// corpse's.
 // Each arm reports its mean limb density, so a failure says whether the matter
 // or the push is wrong. Thresholds in tests/baseline.json (corpseFloat*).
 Status GateCorpseFloat(Ctx& c, std::string& detail) {
@@ -8509,7 +8516,7 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
     float lowest = 1e9f;    // the pelvis's lowest centre of mass
     float final = -1;       // ...and where it ended
     int asleepAt = -1;      // first tick seen asleep after it went in
-    uint32_t pushes = 0;    // FloatDeadLimbs limb-impulses
+    uint32_t pushes = 0;    // FloatLimpLimbs limb-impulses
     bool rigActive = true;  // Jolt still moving it at the end
     const char* why = "";   // DeadAwakeReason at the end
     std::string trace;      // pelvis y every 60 ticks (rule 6)
@@ -8577,6 +8584,43 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
       a.why = w ? w : "";
     }
   }
+  // THE LIVE LIMP ARM. Same basin, same drop; StartRagdoll instead of Die,
+  // with a minimum longer than the watch so the get-up never starts and what
+  // is measured is the limp body in the water.
+  Arm limp{"limp human", "human"};
+  bool limpHeld = false;
+  if (const int d = mobs.FindDef(limp.def); d >= 0) {
+    mobs.Reset();
+    c.debris.Reset();
+    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) { o.cells = basin; });
+    support::RunTicks(rig, 20);
+    const uint64_t id = mobs.Spawn(d, {site.x, waterTop + 3, site.z});
+    Mob* m = id ? mobs.FindMobById(id) : nullptr;
+    if (m && m->Def() && m->Def()->rootLimb >= 0) {
+      mobs.SetMobBehavior(id, "dummy");
+      const int root = m->Def()->rootLimb;
+      const int kLimpTicks = (int)BaselineNumber("corpseFloatLimpTicks", 300);
+      m->StartRagdoll(kLimpTicks / 30.0f + 30.0f, "corpse-float limp arm");
+      limp.ran = true;
+      for (int i = 0; i < kLimpTicks; i++) {
+        support::RunTicks(rig, 1);
+        m = mobs.FindMobById(id);
+        if (!m) break;
+        Vec3 com{};
+        const uint64_t h = mobs.LimbBody(id, root);
+        if (h && c.phys.BodyCenterOfMass(h, com)) {
+          limp.lowest = std::min(limp.lowest, com.y);
+          limp.final = com.y;
+          if (i % 30 == 0) limp.trace += Format(" %.1f", com.y);
+        }
+      }
+      if (m) {
+        limp.pushes = m->FloatedLimbs();
+        limp.surf = m->FloatSurfaceY();
+        limpHeld = m->Alive() && m->Ragdoll() == Mob::RagdollPhase::Limp;
+      }
+    }
+  }
   mobs.Reset();
   c.debris.Reset();
   PrepareWorld(c);
@@ -8593,8 +8637,13 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
   // Riding higher = less of it under the surface it was pushed against.
   const bool sylvanOk =
       !sy.ran || (sy.final - sy.surf) >= (hu.final - hu.surf) - 0.5f;
+  const bool limpOk = !limp.ran ||
+                      (limpHeld && limp.pushes > 0 &&
+                       limp.lowest >= (float)(bedY + 4) &&
+                       std::fabs(limp.final - (float)(waterTop + 1)) <= band &&
+                       limp.final >= hu.final - 0.5f);
   const bool ok = humanOk && sank(au) && (!au.ran || au.asleepAt >= 0) &&
-                  sank(an) && sylvanOk;
+                  sank(an) && sylvanOk && limpOk;
   auto line = [&](const Arm& a) {
     if (!a.ran) return Format("%s: (no def %s); ", a.label, a.def);
     return Format("%s: surface y%.0f, ", a.label, a.surf) + Format("rho %.0f, pelvis lowest y%.1f final y%.1f, %u pushes, "
@@ -8605,7 +8654,13 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
   };
   detail = Format("site [%s] bed y%d waterline y%d | ", siteWhy.c_str(), bedY,
                   waterTop) + line(hu) +
-           line(au) + line(an) + line(sy);
+           line(au) + line(an) + line(sy) +
+           (limp.ran ? Format("limp human: %s, surface y%.0f, pelvis lowest "
+                              "y%.1f final y%.1f, %u pushes, y every 30:%s",
+                              limpHeld ? "held limp" : "NOT LIMP AT END",
+                              limp.surf, limp.lowest, limp.final, limp.pushes,
+                              limp.trace.c_str())
+                     : std::string("limp human: (no def)"));
   std::printf("corpse-float: %s %s\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
@@ -10508,7 +10563,7 @@ const std::vector<Gate>& WoundGates() {
       {"severed-hand", "mob", {}, false, GateSeveredHand, false},
       {"corpse-sleep", "mob", {}, false, GateCorpseSleep, false},
       {"corpse-cap", "mob", {}, false, GateCorpseCap, false},
-      // A corpse in water floats or sinks by its matter (Mob::FloatDeadLimbs).
+      // A corpse in water floats or sinks by its matter (Mob::FloatLimpLimbs).
       {"corpse-float", "mob", {}, false, GateCorpseFloat, false},
       {"player-corpse", "mob", {}, false, GatePlayerCorpse, false},
   };

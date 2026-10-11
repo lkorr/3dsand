@@ -511,6 +511,8 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // held at zero so the landing edge below cannot fire "land" or a fall
     // clip against a body that is lying down.
     TickRagdollLimp(world, dt);
+    // ...and floats in water like a corpse, drifting up (the NPC loop's line).
+    FloatLimpLimbs(world, dt, false, CurrentTuning().ragdoll.limpWaterLift);
     // ---- A LIMP BODY STILL HITS THE GROUND -------------------------------
     //
     // The driven branch bills impact damage off Player::impactDeltaV, which is

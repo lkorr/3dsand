@@ -12704,7 +12704,7 @@ debris for the network). All of that is gone.
   `SplatterDeadFlesh` over `ForEachDeadFlesh`, the living limb passes through
   `FleshView`.
 - **A corpse in water floats or sinks by its matter (2026-10-09;
-  `Mob::FloatDeadLimbs`, gate `corpse-float`).** Liquids are not in the
+  `Mob::FloatLimpLimbs`, gate `corpse-float`).** Liquids are not in the
   collider, so before this a corpse fell through a lake and lay on the bed.
   Now `DebrisSystem::FloatBodies`' rule runs per LIMB of a dead rig: Jolt's
   buoyancy impulse at the waterline the CPU mirror shows, with the ratio

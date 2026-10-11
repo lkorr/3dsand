@@ -1739,6 +1739,7 @@ TP_F(ragdoll, getUpPitchDeg, NO_WGSL, 60.0f, 0.0f, 90.0f)
 TP_F(ragdoll, getUpDropFrac, NO_WGSL, 0.45f, 0.0f, 1.0f)
 TP_F(ragdoll, devSeconds, NO_WGSL, 3.0f, 0.5f, 30.0f)
 TP_F(ragdoll, corpseAirFraction, NO_WGSL, 0.07f, 0.0f, 0.5f)
+TP_F(ragdoll, limpWaterLift, NO_WGSL, 0.8f, 0.0f, 5.0f)
 
 
 // ==== gore ====

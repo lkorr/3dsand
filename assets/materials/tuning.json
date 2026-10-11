@@ -233,7 +233,8 @@
     "getUpPitchDeg": 60,
     "getUpDropFrac": 0.45,
     "devSeconds": 3,
-    "corpseAirFraction": 0.07
+    "corpseAirFraction": 0.07,
+    "limpWaterLift": 0.8
   },
   "debris": {
     "minBodyVoxels": 8,

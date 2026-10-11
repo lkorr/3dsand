@@ -9007,7 +9007,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       }
       // Woken by the world changing round it (not by its own rig moving):
       // water may have arrived, and a corpse asleep on a flooded bank must be
-      // lifted (FloatDeadLimbs' `rouse`).
+      // lifted (FloatLimpLimbs' `rouse`).
       bool roused = false;
       if (mob.deadAsleep_) {
         if (mob.RigActive() || mob.DeadWakeKey(world) != mob.deadWakeKey_) {
@@ -9026,7 +9026,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       mob.RegisterTerrainAnchor();
       deadAnchors_++;
       mob.TickDeadLimp(dt);
-      mob.FloatDeadLimbs(world, dt, roused);
+      mob.FloatLimpLimbs(world, dt, roused, 0.0f);
       // Wounds pay out and close; nothing refills them (the open stump's pump
       // is `alive_`-gated in BleedTick), and DrainBlood cannot kill twice.
       mob.BleedTick(tick, world, ops, spawns, bleedOps);
@@ -9079,6 +9079,12 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // still runs — a body knocked flat goes on bleeding from where it lies.
     if (mob.alive_ && mob.ragdoll_ == Mob::RagdollPhase::Limp) {
       mob.TickRagdollLimp(world, dt);
+      // ---- A LIMP BODY IN WATER FLOATS, AS A CORPSE DOES ------------------
+      // Liquids are not in the collider: without this a creature knocked
+      // into a lake fell through it to the bed. Same per-limb Archimedes as
+      // the dead branch, plus the soft lift that drifts it to the surface.
+      mob.FloatLimpLimbs(world, dt, false,
+                         CurrentTuning().ragdoll.limpWaterLift);
       // ---- ...AND A LIMP BODY HITS THE GROUND (W2-H) ----------------------
       // The arrest TickRagdollLimp just measured is billed, exactly as the
       // avatar's limp branch bills it (PlayerAvatar::Update): one function,
@@ -27182,7 +27188,8 @@ float Mob::LimbFloatDensity(int li) {
   return host.floatRho;
 }
 
-// DebrisSystem::FloatBodies, for a corpse. Liquids are not in the collider, so
+// DebrisSystem::FloatBodies, for a limp rig (dead, or alive and knocked
+// down — PreTick's dead and limp branches, PlayerAvatar::Update's). Liquids are not in the collider, so
 // without this a body fell through a lake as though it were air and lay on the
 // bed. Per LIMB rather than per body: Jolt finds each limb's submerged volume
 // from its own collider and the joints do the rest, so a floating corpse lies
@@ -27192,7 +27199,7 @@ float Mob::LimbFloatDensity(int li) {
 // Cost: an asleep limb is skipped before any read (a corpse at rest on the bed
 // or on the surface stays asleep, rule 2); an awake dry limb is two mirror
 // reads. The surface walk is capped like FloatBodies'.
-void Mob::FloatDeadLimbs(World& world, float dt, bool rouse) {
+void Mob::FloatLimpLimbs(World& world, float dt, bool rouse, float liftMs2) {
   if (!phys_ || !sys_) return;
   const float air = CurrentTuning().ragdoll.corpseAirFraction;
   const float linDrag = CurrentTuning().physics.waterLinearDrag;
@@ -27245,6 +27252,23 @@ void Mob::FloatDeadLimbs(World& world, float dt, bool rouse) {
     if (phys_->ApplyBuoyancy(l.body, (float)surfY, buoy, linDrag, angDrag, dt)) {
       floatedLimbs_++;
       floatSurfaceY_ = (float)surfY;
+      // THE LIVE BODY'S LIFT: a velocity step straight up, scaled by the
+      // limb's submerged fraction (its bounds against the waterline), so it
+      // fades out as the limb breaks the surface and the body settles a
+      // little higher than a corpse would rather than bobbing. Water drag
+      // above caps the rise to a drift.
+      if (liftMs2 > 0.0f) {
+        const float topY = MetresToCells(bmax[1]);
+        const float keel = MetresToCells(bmin[1]);
+        const float sub = std::clamp(((float)surfY - keel) /
+                                         std::max(topY - keel, 1e-3f),
+                                     0.0f, 1.0f);
+        Vec3 lin{}, ang{};
+        if (sub > 0.0f && phys_->GetBodyVelocities(l.body, lin, ang)) {
+          lin.y += MetresToCells(liftMs2) * sub * dt;
+          phys_->SetBodyVelocities(l.body, lin, ang);
+        }
+      }
     }
   }
 }

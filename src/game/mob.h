@@ -2774,11 +2774,11 @@ class Mob {
   // (PreTick), 2 the chunks round it changed, 3 Jolt active after the step
   // (PostStep), 4 a drying visit wrote something else; 0 = never.
   uint8_t DeadWokeHow() const { return deadWokeHow_; }
-  // Limb-ticks FloatDeadLimbs has pushed up, ever (diagnostic, for gates).
+  // Limb-ticks FloatLimpLimbs has pushed up, ever (diagnostic, for gates).
   uint32_t FloatedLimbs() const { return floatedLimbs_; }
-  // The waterline FloatDeadLimbs last pushed against (-1 = never).
+  // The waterline FloatLimpLimbs last pushed against (-1 = never).
   float FloatSurfaceY() const { return floatSurfaceY_; }
-  // FloatDeadLimbs' rhoLimb before the air fraction: the mean density (kg/m^3)
+  // FloatLimpLimbs' rhoLimb before the air fraction: the mean density (kg/m^3)
   // of limb `limbIndex`'s matter plus its worn shells, cached on the limb by
   // its voxel count.
   float LimbFloatDensity(int limbIndex);
@@ -4438,7 +4438,7 @@ class Mob {
   // nothing else — no settle test, no get-up (a body with no pelvis left does
   // not stand up either), no arrest and therefore no fall damage.
   void TickDeadLimp(float dt);
-  // ARCHIMEDES FOR A CORPSE (DebrisSystem::FloatBodies' rule, per limb): every
+  // ARCHIMEDES FOR A LIMP RIG (DebrisSystem::FloatBodies' rule, per limb): every
   // dynamic limb touching liquid gets Jolt's buoyancy impulse with the ratio
   // rhoLiquid / rhoLimb, where rhoLimb is the mean density of what the limb
   // (and anything worn on it) is MADE of, less ragdoll.corpseAirFraction for
@@ -4446,7 +4446,12 @@ class Mob {
   // rides high. `rouse` (the corpse was just woken by the world changing
   // round it) activates a sleeping wet limb once, so water arriving over a
   // corpse at rest lifts it; otherwise a sleeping limb is left asleep.
-  void FloatDeadLimbs(World& world, float dt, bool rouse);
+  // Corpses and LIVE limp ragdolls both run it — the same matter floats the
+  // same way whether or not it is breathing. `liftMs2` adds a soft upward
+  // acceleration (m/s^2) on top, scaled by how much of each limb is under the
+  // waterline: a knocked-down creature drifts toward the surface instead of
+  // hanging at a corpse's equilibrium (ragdoll.limpWaterLift; 0 for corpses).
+  void FloatLimpLimbs(World& world, float dt, bool rouse, float liftMs2);
   // Every sleep criterion (MobSystem's note on kDeadSleepTicks) as of now.
   // The criteria themselves, asleep or not (DeadAwakeReason adds the asleep
   // report on top).

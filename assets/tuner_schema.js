@@ -974,6 +974,7 @@ const TUNING_SCHEMA = [
       {k:'getUpPitchDeg', n:'get-up crouch pitch', d:'How far forward the body is pitched about its feet at the start of the get-up \u2014 the on-hands-and-knees shape it rises out of.', step:1, u:'\u00b0'},
       {k:'getUpDropFrac', n:'get-up crouch drop', d:'How far the hips start below standing height, as a fraction of the rig\u2019s hip height.', step:0.01},
       {k:'corpseAirFraction', n:'corpse air fraction', d:'How much of a dead body is gas (lungs, gut), taken off the mean density of what each limb is made of when it lies in water. Human tissue is a little denser than water, so 0 sinks a corpse slowly and 0.07 floats it low in the water. Matter still decides: an iron or brass body sinks whatever this is, a wooden one floats high.', step:0.01},
+      {k:'limpWaterLift', n:'limp water lift', d:'A live creature knocked limp in water floats exactly like a corpse (same density, same air fraction), plus this soft upward push on each limb, scaled by how much of the limb is under water: it drifts to the surface instead of hanging where a corpse would. Water drag caps the rise at roughly this over the water linear drag. 0 = float like a corpse.', step:0.05, u:'m/s²'},
       {k:'devSeconds', n:'dev button hold', d:'How long the dev panel\u2019s \u201cragdoll me\u201d keeps the player limp before the get-up may begin.', step:0.5, u:'s'},
     ],
   },
