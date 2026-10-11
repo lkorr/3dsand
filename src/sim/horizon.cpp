@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "sim/treeatlas.h"
 #include "sim/world.h"
 #include "sim/worldmap.h"
 
@@ -50,7 +51,7 @@ uint64_t LightWords(const std::vector<uint32_t>& w) {
 }
 
 void Build(const worldmap::WorldMapData& m, const std::vector<uint32_t>& wm, uint32_t seed,
-           std::vector<uint32_t>& out) {
+           std::vector<uint32_t>& out, const TreeAtlas* trees) {
   out.assign(kHeaderWords, 0u);
   if (!m.Loaded() || m.height.empty()) return;   // kHValid stays 0
 
@@ -155,6 +156,144 @@ void Build(const worldmap::WorldMapData& m, const std::vector<uint32_t>& wm, uin
         water[k] = (uint32_t)std::min(cov[k], 255) | ((uint32_t)(uint16_t)ClampI16(lvl[k]) << 16);
   }
 
+  // ---- THE FOREST (ticket 2026-10-10_10-44-29) ----
+  // Past the cascades a forest was a plain of grass: the horizon had no tree
+  // term, and its seam band repainted the level-8 crowns with the bare skin.
+  // COLOUR ONLY: per sample, the EXPECTED share of columns a crown covers and
+  // the crowns' colour, by the far cascades' own rule (worldgen.wgsl
+  // treeInfoBare + canopyOf, read off the SAME atlas words and biome records
+  // the shader reads):
+  //   a lattice tile (TREE_TILE) holds a trunk with the biome's Q16 chance;
+  //   the species is a weighted pick from the biome's row; a pick its gates
+  //   refuse (species / row altitude band, slope, the row's patch field)
+  //   grows nothing; a grown tree paints a disc of crownR in its far proxy
+  //   material, thinned by the shade punch (an airy crown loses 1/8 of its
+  //   columns per step), and 1-in-autumnChance trees wear the autumn colour.
+  // Crowns from different tiles are independent, so the covered share is
+  // 1 - exp(-sum lambda). Gates the sample cannot see are approximated: the
+  // ground is the AVG of the posts (no terrain noise), the slope the AVG's
+  // central difference, the patch field passes (255 - threshold) / 256 of
+  // the time, and a row that only grows within reach of a pond (nearWaterMax)
+  // grows none -- ponds are procedural and a few metres wide. No trees over
+  // the treeline, under the sea, or on the share of the sample a map lake or
+  // river covers (the water plane above). Authored tree sites are not
+  // counted: a few landmarks are nothing at this scale.
+  std::vector<uint32_t> canopy;
+  std::vector<uint32_t> canopyMats;
+  if (trees && trees->speciesCount > 0 && wm.size() > worldmap::kHBiomeRecords &&
+      trees->words.size() > (size_t)treeatlas::kHCondTable) {
+    using namespace treeatlas;
+    const std::vector<uint32_t>& A = trees->words;
+    const int nsp = (int)A[kHSpeciesCount];
+    const int nbA = (int)A[kHBiomeCount];
+    const uint32_t bTab = A[kHBiomeTable], sDir = A[kHSpeciesDir], cTab = A[kHCondTable];
+    const uint32_t wmCount = wm[worldmap::kHBiomeCount], wmRecs = wm[worldmap::kHBiomeRecords];
+    const double T = (double)std::max(trees->lattice.tile, 1);
+    auto sp = [&](int i, int w) { return A[sDir + (size_t)i * kSpeciesWords + w]; };
+    // Material id -> its slot in the table.
+    auto slotOf = [&](uint32_t mat) -> int {
+      for (size_t k = 0; k < canopyMats.size(); k++)
+        if (canopyMats[k] == mat) return (int)k;
+      if (canopyMats.size() >= kCanopyMatSlots) return -1;
+      canopyMats.push_back(mat);
+      return (int)canopyMats.size() - 1;
+    };
+    // Per (biome, species): the share of lattice tiles that pick it, before
+    // its gates -- chance * w / total, the two rolls of treeInfoBare.
+    std::vector<double> pick((size_t)std::max(nbA, 0) * nsp, 0.0);
+    for (int b = 0; b < nbA && (uint32_t)b < wmCount; b++) {
+      const uint32_t chance = wm[wmRecs + (size_t)b * worldmap::kBiomeRecWords + worldmap::kB_TreeChanceQ16];
+      const uint32_t* row = &A[bTab + (size_t)b * (1 + nsp)];
+      if (row[0] == 0u || chance == 0u) continue;
+      uint32_t prev = 0;
+      for (int i = 0; i < nsp; i++) {
+        const uint32_t w = row[1 + i] - prev;
+        prev = row[1 + i];
+        pick[(size_t)b * nsp + i] = (double)std::min(chance, 65536u) / 65536.0 * (double)w / (double)row[0];
+      }
+    }
+    canopy.assign(ns, 0u);
+    bool any = false;
+    std::vector<std::pair<uint32_t, double>> mats;    // (material, lambda)
+    std::vector<std::pair<double, uint32_t>> byW;     // (lambda, material), merged
+    auto avgAt = [&](int ii, int jj) {
+      return UnAvg(samples[(size_t)std::clamp(jj, 0, nz - 1) * nx + std::clamp(ii, 0, nx - 1)]);
+    };
+    for (int j = 0; j < nz; j++) {
+      for (int i = 0; i < nx; i++) {
+        const size_t k = (size_t)j * nx + i;
+        const int b = biome[k];
+        if (b >= nbA) continue;
+        const int h = UnAvg(samples[k]);
+        if (h <= sea || h >= tline[k]) continue;
+        // Land.slope's units: |dh/dx| + |dh/dz| in Q8.
+        const int slope = (int)std::lround(256.0 * (std::abs(avgAt(i + 1, j) - avgAt(i - 1, j)) +
+                                                     std::abs(avgAt(i, j + 1) - avgAt(i, j - 1))) / (2.0 * S));
+        mats.clear();
+        double lam = 0.0;
+        for (int s = 0; s < nsp; s++) {
+          const double p = pick[(size_t)b * nsp + s];
+          if (p <= 0.0) continue;
+          const uint32_t cm = sp(s, kSCanopyMat);
+          if (cm == 0u) continue;   // no far proxy (the bush, the dead tree)
+          const int minY = (int)sp(s, kSMinY), maxY = (int)sp(s, kSMaxY);
+          if (minY >= 0 && h < minY) continue;
+          if (maxY >= 0 && h > maxY) continue;
+          const int mSl = (int)sp(s, kSMaxSlope);
+          if (mSl > 0 && slope > mSl) continue;
+          const uint32_t* c = &A[cTab + ((size_t)b * nsp + s) * kCondWords];
+          const int rMinY = (int32_t)c[kCMinY], rMaxY = (int32_t)c[kCMaxY], rSl = (int32_t)c[kCMaxSlope];
+          if (rMinY >= 0 && h < rMinY) continue;
+          if (rMaxY >= 0 && h > rMaxY) continue;
+          if (rSl > 0 && rSl < 1024 && slope > rSl) continue;
+          if ((int32_t)c[kCNearWaterMax] >= 0) continue;
+          double pass = 1.0;
+          const int rPatch = (int)c[kCPatchThreshold];
+          if (rPatch > 0) pass = std::max(0.0, (255.0 - rPatch) / 256.0);
+          const int shade = (int)sp(s, kSShade);
+          const int punch = shade < 160 ? std::clamp((160 - shade) / 24, 0, 5) : 0;
+          const double r = (double)sp(s, kSCrownR);
+          const double l = p * pass * 3.14159265358979 * r * r * (1.0 - punch / 8.0) / (T * T);
+          if (l <= 0.0) continue;
+          lam += l;
+          const uint32_t ac = sp(s, kSAutumnChance);
+          const double fa = ac ? 1.0 / (double)ac : 0.0;
+          mats.push_back({cm, l * (1.0 - fa)});
+          if (ac) mats.push_back({sp(s, kSAutumn0 + 1), l * fa});
+        }
+        if (lam <= 0.0) continue;
+        double cov = 1.0 - std::exp(-lam);
+        if (!water.empty()) cov *= 1.0 - (double)(water[k] & 0xFFu) / 255.0;
+        const int c8 = (int)std::lround(cov * 255.0);
+        if (c8 <= 0) continue;
+        // The two heaviest materials (merged by id), and B's share of the pair.
+        std::sort(mats.begin(), mats.end());
+        byW.clear();
+        for (size_t q = 0; q < mats.size(); q++) {
+          if (q > 0 && mats[q].first == mats[q - 1].first) byW.back().first += mats[q].second;
+          else byW.push_back({mats[q].second, mats[q].first});
+        }
+        std::sort(byW.begin(), byW.end(), [](const auto& x, const auto& y) {
+          return x.first != y.first ? x.first > y.first : x.second < y.second;
+        });
+        const int a = slotOf(byW[0].second);
+        if (a < 0) continue;
+        int bb = a;
+        int t8 = 0;
+        if (byW.size() > 1 && byW[1].first > 0.0) {
+          const int s2 = slotOf(byW[1].second);
+          if (s2 >= 0) {
+            bb = s2;
+            t8 = (int)std::lround(255.0 * byW[1].first / (byW[0].first + byW[1].first));
+          }
+        }
+        canopy[k] = (uint32_t)c8 | ((uint32_t)t8 << 8) | ((uint32_t)a << 16) | ((uint32_t)bb << 24);
+        any = true;
+      }
+    }
+    if (!any) canopy.clear();
+  }
+
   // ---- the cell pyramid ----
   // Level 0: (nx-1) x (nz-1) cells between samples. Each level halves (rounding
   // up) until one cell covers everything.
@@ -247,6 +386,13 @@ void Build(const worldmap::WorldMapData& m, const std::vector<uint32_t>& wm, uin
   if (!water.empty()) {
     out[kHWater] = (uint32_t)out.size();
     out.insert(out.end(), water.begin(), water.end());
+  }
+  if (!canopy.empty()) {
+    out[kHCanopy] = (uint32_t)out.size();
+    out.insert(out.end(), canopy.begin(), canopy.end());
+    out[kHCanopyMats] = (uint32_t)out.size();
+    canopyMats.resize(kCanopyMatSlots, 0u);
+    out.insert(out.end(), canopyMats.begin(), canopyMats.end());
   }
 }
 

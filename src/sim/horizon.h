@@ -39,6 +39,7 @@
 #include <vector>
 
 namespace worldmap { struct WorldMapData; }
+struct TreeAtlas;
 
 namespace horizon {
 
@@ -73,7 +74,20 @@ enum : uint32_t {
   // horizon paints that share of the sample as water; a lake-covered sample
   // also lifts its MAX / AVG to the lake's level (a flat lake at distance).
   kHWater = kHTlPlane + 1,
-  kHeaderWords = kHWater + 1,
+  // word offset: nx * nz per-sample FOREST CANOPY words (ticket
+  // 2026-10-10_10-44-29): coverage u8 (0..255, the EXPECTED share of the
+  // sample's columns under a tree crown, by the rule the far cascades paint
+  // crowns with -- treeCanopyAt) | mix u8 << 8 (share of material B) |
+  // material A u8 << 16 | material B u8 << 24, A / B indices into the
+  // kHCanopyMats table. 0 = no plane (no atlas / no trees anywhere).
+  kHCanopy = kHWater + 1,
+  // word offset: kCanopyMatSlots canopy MATERIAL ids (the species' far proxy
+  // and its autumn colour, as treeCanopyAt returns them); the shader resolves
+  // each through the far palette and paints its palette mean, so the horizon's
+  // forest is the colour the level-8 cells beside it are.
+  kHCanopyMats = kHCanopy + 1,
+  kCanopyMatSlots = 256,
+  kHeaderWords = kHCanopyMats + 1,
   kMaxLevels = 16,
 };
 
@@ -118,9 +132,10 @@ inline constexpr int kSampleLog2 = 8;
  * paints exactly the materials worldgen lays). `seed` is the world seed the
  * per-sample treeline's jitter is read at (worldmap::TreelineAt, which reads
  * the INSTALLED map: `map` must be CurrentWorldMap()). A map with no height
- * plane packs a header with kHValid = 0.
+ * plane packs a header with kHValid = 0. `trees` (optional) is the loaded tree
+ * atlas the forest canopy plane (kHCanopy) is baked from; null = no canopy.
  */
 void Build(const worldmap::WorldMapData& map, const std::vector<uint32_t>& worldMapWords,
-           uint32_t seed, std::vector<uint32_t>& out);
+           uint32_t seed, std::vector<uint32_t>& out, const TreeAtlas* trees = nullptr);
 
 }  // namespace horizon

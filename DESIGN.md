@@ -4321,6 +4321,34 @@ that path draws. `subClearHigh` moved 0.82 -> 0.78 so that water (clarity
 0.787) is fully clear on every path; at 0.82 it was 93% clear, which the
 submerged comment had always claimed was 100%.
 
+THE VISIBILITY DISTANCE IS HARD (2026-10-10, F12 ticket 2026-10-10_11-00-47:
+~30 fps under a lake at night, ~40 on its surface). `render.subVisibility`
+(owner decision: 10 m) is now what its tuner text always said — the distance
+past which nothing shows — not a 1/e length. `liqVisFade` (raymarch.wgsl)
+multiplies the transmission of BOTH liquid shades (`shadeSubmerged`,
+`shadeWater`) by 1 out to 40% of it and 0 at it, and `trace()` stops every
+liquid path there (`LIQ_VIS_M`, was a fixed 24 m). The fade is what makes the
+stop invisible: the pixel is already the medium's in-scatter colour where the
+march ends. God rays inherit the shorter path (they march `min(path, 14 m)`);
+silt motes keep their old 24 m slab spread on a capped ray
+(`SILT_OPEN_SPAN_M`), since four slabs at fractions of 10 m read as blobs.
+Far water (`FAR_WATER_PATH_MAX_M`) and the MPM refraction trace are untouched.
+Attribution, `--render-budget --budget-cams at` (`SANDVOX_BUDGET_AT=<the
+ticket's --at>`, `SANDVOX_BUDGET_SUN_DEG=-25`, 1920x1080, same exe):
+
+| camera | before | after | primary steps/px | what the rest is |
+|---|---|---|---|---|
+| submerged (shot 1) | 24.08 ms | 14.25 ms | 268 -> 148 | god rays 2.9 ms (moonlit: the key light is the moon at night, so `kd.y < 0.08` never skips them), clouds 1.6 |
+| surface (shot 2) | 19.55 ms | 16.00 ms | 116 -> 74 | pre 4.0 (ray_start 1.6, clouds 2.3), reflection 0.9 |
+
+In play (`--frames 900 --at`, 1600x900 = the ticket's 0.57 x 2880x1623
+pixel count, `rm_world` p50): submerged 14.48 -> 8.61 ms, surface 12.23 ->
+9.38 ms; both cameras now sit on the 60 Hz vsync floor (whole-frame p50 16.8 /
+17.0 ms). Active chunks p50/p95 0/0 at both cameras: the lake reservoir stage
+does not keep an idle lake awake (its miss path marks only a cell
+`stillWant` says can still change). Next lever if water is ever hot again: a
+UNIFORM-water chunk crossed analytically instead of ~16 run-loop steps.
+
 THE RENDER SEAM: ONE LAKE, TWO REPRESENTATIONS (2026-08-25). The virtual-mass
 blend above lets the isosurface reach over SETTLED voxel water, which closes the
 geometric gap — and hands this shade a body of water the CA owns, described by
@@ -4381,6 +4409,29 @@ enforces it. It replaced two independent tests that had to agree and did not:
   surface first cannot meet another interface behind it, which `caShadedLiquid`
   already records.
 
+WHO SHADES A LAKE'S SURFACE (2026-10-10, ticket 10-50-10: "blow up the bed
+under a lake and whole chunks of it go blocky"). Everything above made
+`shadeMpmFluid` IMITATE `shadeWater` over settled water, one measured term at a
+time, and it never converged: the march draws its isosurface over the settled
+lake in every block-map chunk plus the seam ring, so after a disturbance whole
+chunks of calm lake were repainted by a second water model — the pond's
+decaying foam FIELD (~0.3 across the marked chunks, measured with `SEAM_DBG 9`),
+the MPM Fresnel and reflection, ripples without the swell, and wherever the
+near trace had not measured the column (past the 20.5 m handoff, or a cut-off
+`liqPath`) `caFrac` collapsed to the authored bright blue. The rule now is
+OWNERSHIP, not imitation: a fluid hit whose sampled density is at least
+`MPM_LAKE_SETTLED` (half) settled voxel water is the LAKE'S surface, and the
+lake's shade draws it (`mfLake` in `fs`: no MPM shade, no MPM interface for
+the CA ownership test, the rain stop or the depth write). `shadeMpmFluid` keeps
+the surfaces its particles make — the pour, the splash, a raft standing proud
+of the lake — and for those the CA column now includes `liqExtra` (the far
+bed past the handoff) and, when the near trace crossed no liquid at all, the
+cascade's own water under them, so a raft past 20 m blends to the lake instead
+of the authored blue. Instruments: `SEAM_DBG 9` (owner per water pixel, caFrac,
+foam) and `10` (settled share, churn, column). Repro without a C++ hook:
+`--shot-fluid-pond` on a map with an authored lake at the pond site
+(`SANDVOX_MAP`), since the harness map has no pond there.
+
 Two smaller repairs in the same pass: `fluidSampleAt` gained the virtual-mass
 term (settled liquid accumulates in its own material's colour), without which
 a node carrying only settled mass divided by the colour floor and shaded BLACK — the dark rim
@@ -4392,19 +4443,19 @@ made a pour into a lake absorb like a puddle.
 DRAW MODES — `render.fluidSurface` is a MODE, not a boolean, and it kept its
 name because 0 and 1 still mean what they always did (no `tuning.json`
 migration). `0` = one raster cube per particle, the solver-debug view and the
-only mode drawn CPU-side; `1` = the smooth isosurface above; **`2` = VOXELIZED
-at half a cell — the field quantized to a 2x2x2 sub-voxel lattice, which is one
-sub-voxel per particle at rest density, and THE DEFAULT**; `3` = VOXELIZED on
+only mode drawn CPU-side; **`1` = the smooth isosurface above, THE DEFAULT**;
+`2` = VOXELIZED at half a cell — the field quantized to a 2x2x2 sub-voxel
+lattice, which is one sub-voxel per particle at rest density; `3` = VOXELIZED on
 the sim lattice, one cube per world cell. The voxelized modes exist to answer a
 look question the isosurface cannot — *what does MPM water look like if it
 still reads as VOXELS?* — and mode 3 in particular makes a pour
 indistinguishable from CA water at a glance while the motion underneath is
 still the full MPM solve.
 
-Mode 2 is the default because this is a voxel engine: water that reads as
-voxels is the house style, and the smooth Splash surface — which is the more
-expensive march *and* the one that visually disagrees with every other surface
-in the world — is the opt-in look rather than the assumed one. Half a cell, not
+Mode 2 was the default until 2026-10-10, on the argument that this is a voxel
+engine and water that reads as voxels is the house style; the owner switched
+the shipped look to the smooth isosurface (mode 1) with the lake-slab ticket
+(below, "who shades a lake's surface"). Half a cell, not
 a whole one, because it is the resolution the solver already works at (8
 particles per cell on a 2x2x2 lattice), so it is the finest quantization that
 carries real information rather than interpolation.
@@ -17050,6 +17101,69 @@ where you hear from either (§12b, "The ears are on the character").
     rule off vs on in one binary, every camera within +-0.1 ms (noon 5.83 /
     5.77, seam 5.92 / 5.89, seamveg 9.56 / 9.54, cascade 4.89 / 4.80).
     Render-only; the world hash is unchanged (ef7d9a06).
+  **A THIN LAYER KEEPS ITS FOOTPRINT: THE LOOSE TOP (2026-10-10; worldgen.wgsl
+  `farRunTop` + the pass in `fardownFeat`, faredits.h `SetLooseSource`; gate
+  `far-layer`; ticket 2026-10-10_11-01-58).** The third exception to "a cell
+  is its centre sample", and the general one. A layer thinner than a cell --
+  oil on a lake, snow, ash or spilled sand on the ground, a puddle on a floor
+  -- reached a level only where one of that level's centre ROWS landed in it:
+  a 1-voxel slick at row y showed at exactly the one level whose centres sit
+  at y (y = 570 at the ticket's lake: level 2 only), and every other level
+  drew the water under it, so the slick appeared, vanished and reappeared as
+  the camera backed away. THE RULE: a cell whose centre voxel is far-solid
+  takes the material of T, the top voxel of the far-solid run that starts at
+  its centre, when the run ends inside the cell's reach (T in [c, c+step-1],
+  the voxel over T not far-solid), T is LOOSE (a far-solid liquid or powder)
+  and T lies above the ground contract h; and a cell whose centre is above h
+  and whose run does not end in a loose T is its centre's own material (what
+  `fardown` writes there anyway -- this is how a layer comes OFF again). So
+  every level's surface cell over a column wears what the near field shows
+  on top of it, the footprint at level k is the layer sampled at level k's
+  centre COLUMNS (the same disc to within one cell at every level), and no
+  cell changes SHAPE -- only its colour follows the column's top. What it
+  leaves alone, by construction: a run ending at the ground (T <= h: a sand
+  skin, a road or river tint, a flattened canopy -- procgen's business), a
+  standing fluid's top (the sieve's `wetTop` already paints it), and SOLID
+  tops (a tree, a stalk, a roof, ice: centre-sampled, as before). At levels
+  1-2 a cell the container rule claims is left to it. Producers: the live
+  pass in `fardownFeat` (procgen-free but for one `landColumn` per cell whose
+  byte would change; exact prefilter: no loose voxel in the chunk or on the
+  bottom row of the chunk above, no pass) -- EVERY dirty chunk whose rows
+  meet a cell's reach evaluates it and writes the same byte, because `fardown`
+  will not rerun for the centre's chunk when only the layer above it moved
+  (its signature covers its own voxels; the first cut left a spreading
+  slick's old cells oiled); and the CPU twin in `FarEdits::Sweep`, which
+  substitutes the top's material into the centre word (and its slot into the
+  ground field, so `farpatch`'s skin rule paints the layer), seeing the noted
+  chunk plus the chunk ABOVE when the eviction batch holds it (a window shift
+  across x or z evicts whole columns; a load's rebuild has none), and files
+  no ground word for a column whose ground has a loose layer on it. The
+  sieve is unchanged: pristine procgen has no loose matter above h but its
+  fluids, which it already paints. **Measured** (`far-layer`: a 128 x 128
+  glass tub in the sky, 15 voxels of water, a one-voxel oil disc on a
+  64-multiple row): oil cells drawn / oiled sample columns, levels 1-5,
+  before 0/1191, 0/295, 0/70, 0/20, 0/4; after 1191/1191, 294/295 (the one
+  is a container cell: the rim froze against the glass), 70/70, 20/20, 4/4,
+  footprint area 0.87-1.08x the fine slick, and the same after a patched
+  refill. At the ticket's lake, backing away at 20 m/s from 12 m: before, the
+  slick is gone at 32 m (level 1), a disc at 52-72 m (level 2), a sliver at
+  92 m and gone past it; after, one disc at every distance whose apparent
+  width x distance stays within 4 %. Cost: the follow-up's farDown rows stay
+  under the pass table's 0.05 ms/frame floor in both arms at the ticket's
+  lake; render untouched; render-only, world hash unchanged (ef7d9a06).
+  **Left open:** (a) a centre at or under h whose layer goes away while the
+  layer's chunk is the only one that changed keeps the layer's colour until
+  the centre's chunk next downsamples (putting a skin back needs procgen);
+  (b) a REFILL of a level (startup, load, teleport, F5) that lands over a
+  resident chunk which is asleep erases that chunk's downsample of ANY edit
+  until it is dirty again -- `sigClear_` only helps dirty chunks, and the
+  index only holds evicted ones (seen as the slick vanishing past level 2
+  when it was poured before the startup refill drained; not this rule's, and
+  not fixed here); (c) the far oil reads pale grey-lilac where the near field
+  shows brown iridescence (far liquid shading, a colour seam, not footprint).
+  `SANDVOX_AT_SLICK=x,y,z,r[,material]` (+ `SANDVOX_AT_SLICK_AFTER=<ticks>`)
+  lays a one-voxel liquid disc in an `--at` run; with `SANDVOX_AT_FLY` it
+  reproduces the ticket's walk-away.
   **The far SURFACE MAP (LOD-seam package A, 2026-09-28).** Centre sampling
   is the cascade's resolution limit and the window edge is where it shows: a
   level-1 cell is a 20 cm cube standing where the near field draws four 10 cm
@@ -17449,6 +17563,35 @@ summit,peaksea --budget-arms baseline,nohorizon` (fragment time, the `pre`
 compute span excluded): `peaksea` (the massif 10 km off, drawn by the pyramid
 walk) 15.36 vs 15.22 ms, i.e. ~0.14 ms; `summit` within the ±0.3 ms noise.
 The pyramid for the 20 km `default` map is ~832^2 samples, ~4 MiB.
+
+**The forest on the horizon (2026-10-10, F12 ticket 2026-10-10_10-44-29).**
+Levels 5-8 paint tree crowns into the ground colour (`farSurfaceMat` ->
+`treeCanopyAt`), but the horizon had no tree term, and `hzSeamWeight`
+repainted the level-8 crowns with the bare skin over the last 900 m — so past
+~5.6 km a forest was a plain of grass. `horizon::Build` now bakes a CANOPY
+PLANE (`kHCanopy`, one word per sample: coverage u8 | mix u8 | material A u8 |
+material B u8, indices into a 256-slot material table at `kHCanopyMats`) from
+the loaded tree atlas and the packed biome records — the same words
+`treeInfoBare` / `canopyOf` read: per (biome, species) the tile chance times
+the weighted pick, through the species' and the row's altitude bands, slope
+(from the AVG field, `Land.slope`'s Q8 units), patch threshold (passes
+(255 - t)/256), the crown disc `crownR` thinned by the shade punch; the
+EXPECTED covered share is `1 - exp(-sum lambda)` (crowns from different tiles
+are independent), coloured by the two heaviest canopy materials (leaf proxy
+and autumn, `1/autumnChance`). Zero over the treeline, under the sea, and
+scaled by `1 - water coverage` on map lakes and rivers; rows that only grow
+near a pond (`nearWaterMax`) count as none. `hzAlbedo` blends it (bilinear,
+colour weighted by coverage) after the steep-rock term and before snow, each
+material through the far palette at its palette mean — what a level-8 canopy
+cell paints — so the seam band keeps the forest and meets the cascade's
+speckle at its mean. COLOUR ONLY (owner decision): no height bump. Cost: 4 bytes a
+sample, 2.65 MiB on `default`'s 833^2 grid (the buffer 10.8 -> 13.4 MiB with
+the water plane); the whole `Build` measured 215-514 ms on load (the
+`horizon:` startup line prints size and time at every build). Known limit:
+a GREEN forest over a green skin barely shows (`leaves` #3c8f36 against
+`grass` #4e9b3a), because the cascades read as forest mostly through crown
+geometry and shading, which colour-only cannot carry; autumn, conifer and
+mixed stands read clearly.
 
 **Peak preservation at levels 6-8.** A cascade cell is solid when its CENTRE
 sample is, so a summit or a knife ridge between two sample columns was shaved
@@ -24228,7 +24371,11 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   raised toward level + 1 (the sill). Touched columns lose the sediment wedge
   and the caves (`Col.wet`), and lay the bed / shore material (a powder keeps
   to its step line in `cols`). Keep-outs: no trunk within half-width +
-  max(bank, crown) of a river or band + crown of a shore; no cover, tile
+  max(bank, crown) of a river or band + crown of a shore, nor inside a
+  lake's polygon where its ground is under the level (`siteBlocksTrunk`
+  asks `lakeTest` at the trunk, so the far cascades' crowns -- which read
+  only `treeInfoBare` -- agree with the near field, which drops tree cells
+  over water; an island keeps its trees); no cover, tile
   plant, tarn or cactus in a channel or a shore band. **Far:** the cascades
   see the water through genColumn; `roadTint` paints a cell water where a
   river is narrower than it (down to a sixteenth of the cell); the horizon
