@@ -739,8 +739,83 @@ struct MobDef {
     float turnBend = 1.0f;      // share of the turn's path curvature bent in
     float maxCurvature = 0.25f; // 1/vox ceiling on that bend
     float bendHalfLife = 0.2f;  // seconds; the bend eases, a turn is a sweep
+    // ---- THE PHASE SOURCE (2026-10-10, the swimmers) ---------------------
+    // `beatHz` 0 (every slither block): the phase is the ODOMETER, above --
+    // a body that pushes on the ground goes exactly as far as its wave.
+    // > 0: the phase is a CLOCK at `beatHz + v / (slip * lambda)` beats a
+    // second. A fish pushes on water, which gives way, so its wave runs
+    // faster than the body (slip = body speed / wave speed, about 0.7 for a
+    // cruising fish) and the tail beats even while it hangs still. Amplitude
+    // then rides the effort: `ampIdle` of it at rest, all of it from
+    // `ampSpeed` x def.speed up.
+    float beatHz = 0.0f;
+    float slip = 0.7f;
+    float ampIdle = 0.35f;
+    float ampSpeed = 0.6f;
   };
   SlitherDef slither;
+  // ---- A BODY THE WATER CARRIES (MobSystem::DriveSwim; 2026-10-10) ---------
+  //
+  // Sidecar `swim`. A creature with this block is AQUATIC: while enough of it
+  // is in liquid (`immersion`, Mob::SenseWater) it is not a walker at all --
+  // no ground snap, no gravity, no gait -- but a body with a 3D velocity, a
+  // PITCH as well as a heading, a thrust along its own axis, fins that bleed
+  // off sideslip, and a buoyancy that cancels gravity in the share of it that
+  // is wet. It keeps itself between the waterline and the bed, feels ahead of
+  // itself for rock, and banks into its turns. OUT of liquid it falls, lands,
+  // lies on its side, flops toward the nearest water it can feel, and after
+  // `breathSeconds` starts to suffocate (DamageCause::Asphyxia).
+  //
+  // Nothing here knows what a shark is: every number is a body's, every
+  // length is world voxels, and a creature opts in with this one block. The
+  // behaviour layer steers it exactly as it steers a walker (desired heading,
+  // a drive scale) plus one more output, an ALTITUDE (ai::IntentOut), which a
+  // walker ignores.
+  struct SwimDef {
+    bool present = false;
+    float pitchRate = 1.6f;    // rad/s the nose may rise or fall
+    float maxPitch = 1.0f;     // rad either way
+    float accel = 30.0f;       // vox/s^2 of thrust along the axis
+    float brake = 14.0f;       // vox/s^2 the water takes off a body easing up
+    float sideGrip = 5.0f;     // 1/s: how fast sideslip decays (the fins)
+    float burst = 2.5f;        // ceiling on the drive, x def.speed (a charge)
+    float buoyancy = 1.0f;     // share of gravity cancelled while wet
+    float surfaceGap = 1.0f;   // vox the back keeps under the waterline
+    float bedGap = 1.0f;       // vox the belly keeps over the bed
+    float breach = 0.0f;       // vox a CHARGE may lift its back above the
+                               // waterline (a surface strike); 0 = never
+    float feel = 6.0f;         // vox ahead of the snout it feels for rock
+    float bank = 0.5f;         // roll into a turn, share of the turn's lean
+    float maxRoll = 0.9f;      // rad
+    // Out of the water.
+    float breathSeconds = 8.0f;   // dry seconds before it starts to suffocate
+    float suffocateHp = 4.0f;     // hp a second after that
+    float flopMin = 0.35f;        // seconds between flops...
+    float flopMax = 1.2f;         // ...drawn per flop
+    float flopRise = 1.4f;        // m/s up
+    float flopSpeed = 1.2f;       // m/s along the ground (toward water if felt)
+    float flopReach = 8.0f;       // vox it can feel water from, lying there
+    // The undulation it swims with: a `slither` block in all but name, with
+    // the clock phase (`beatHz` > 0). Optional; absent = a stiff body.
+    SlitherDef wave;
+    // DERIVED at load: half the ROOT segment's width and height (world
+    // voxels) -- the trunk's section without the fins, which is what a body
+    // lying on its flank rests on (PoseInputs::bodyDrop).
+    float trunkHalfW = 0.5f;
+    float trunkHalfH = 0.5f;
+  };
+  SwimDef swim;
+  // THE BODY'S GIRTH FOR CONTACT, world voxels (MobSystem::BodyCapsule).
+  // 0 = derived from the rest box, as every creature always was. A body whose
+  // box is mostly FINS (a shark's pectorals span four times its trunk) would
+  // otherwise be a fat disc that keeps its own jaws four voxels off anything
+  // it bites; sidecar `capsuleRadius`, and a swimmer derives it from its
+  // trunk (SwimDef::trunkHalfW/H) when the sidecar is silent.
+  float capsuleRadius = 0.0f;
+  // Does the head turn to look at a target between strokes (Mob::SetAimLook)?
+  // A fish looks with its whole body, and a shark's head swivelling on a
+  // rigid trunk reads as broken. Sidecar `headLook`, default true.
+  bool headLook = true;
   // Where the eyes sit, as an offset from the head limb's ANCHOR (neck joint)
   // in art voxels, engine frame. Authored in the sidecar's top-level "eyeLocal"
   // array; converted to world voxels at load by ArtToWorld(). The camera rides
@@ -1989,6 +2064,7 @@ struct BiteHit {
   float radiusScale = 1.0f;  // StrikeProfile::biteRadius: the weapon's own
                              // multiple of gore.biteRadius (fangs < 1)
   float stainScale = 1.0f;   // StrikeProfile::biteStain: the rim's multiple
+  float mouthful = 0.0f;     // StrikeProfile::biteMouthful: 0 = one limb
   uint16_t infectMat = 0;    // material the tear rewrites exposed flesh to
   uint16_t infectStain = 0;  // LIQUID whose stain it smears over the hole
   uint32_t seed = 0;         // tear + stain draw key
@@ -3573,6 +3649,46 @@ class Mob {
   // uphill.
   bool Airborne() const { return airborne_; }
   float FallVelocity() const { return fallVel_; }
+  // ---- THE SWIMMER'S STATE (MobDef::SwimDef; MobSystem::DriveSwim) --------
+  // Read by the pose (attitude, wave), the gates and the dev readout. All
+  // CPU-float gameplay state like the heading: never hashed, never saved (a
+  // loaded fish re-senses the water on its first tick).
+  bool Swimming() const { return swimming_; }
+  // An open wound is still paying out blood (MobLimb::bleedBudget): what a
+  // shark smells in the water (ai::Actor::bleeding).
+  bool Bleeding() const {
+    for (const MobLimb& l : limbs_)
+      if (l.body != 0 && l.bleedBudget >= 1.0f) return true;
+    return false;
+  }
+  float Immersion() const { return immersion_; }
+  float SwimPitch() const { return pitch_; }
+  float SwimRoll() const { return roll_; }
+  Vec3 SwimVelocity() const { return swimVel_; }
+  float DrySeconds() const { return drySeconds_; }
+  uint32_t Flops() const { return flops_; }
+  uint32_t SwimFelt() const { return swimFelt_; }
+  uint32_t MouthfulLimbs() const { return mouthfulLimbs_; }
+  uint32_t MouthfulCells() const { return mouthfulCells_; }
+  uint32_t SwimBumps() const { return swimBumps_; }
+  uint32_t SwimGlances() const { return swimGlances_; }
+  // The body's 3D forward: the heading tipped by the swim pitch. Equal to
+  // Facing() for every body that does not swim.
+  Vec3 Forward3() const {
+    const float cp = std::cos(pitch_);
+    return Vec3{std::sin(heading_) * cp, std::sin(pitch_),
+                std::cos(heading_) * cp};
+  }
+  // The waterline / bed the last sense found over the body's column (world
+  // voxels; `known` false = the mirror could not answer).
+  bool SurfaceKnown() const { return surfaceKnown_; }
+  float SurfaceY() const { return surfaceY_; }
+  bool BedKnown() const { return bedKnown_; }
+  float BedY() const { return bedY_; }
+  // A launch while the water carries the body is a SURGE, not a leap (the
+  // lunge of a swimmer's style): added to the swim velocity, capped by the
+  // def's burst. Mob::Launch routes here while swimming.
+  void SwimSurge(Vec3 vel);
   // ---- ROTATE A PART (AND A SHARE OF THE SPINE) TOWARD A DIRECTION -------
   //
   // MOVED DOWN FROM PlayerAvatar (avatar.cpp's head-look block), because a
@@ -4144,8 +4260,10 @@ class Mob {
   // root's lateral offset, so the posed chain lies on a sine path that is
   // fixed in the world while the body moves along it. A part an OVERRIDE clip
   // owns (the strike's coil) is handed to the clip by its blend weight. No-op
-  // on a def with no `slither` block.
-  void ApplySlither(const PoseInputs& in, float dt);
+  // on a def with no `slither` block. `sd` is the def's slither, or its
+  // swim.wave for a swimmer (the same wave on a clock: SlitherDef::beatHz).
+  void ApplySlither(const MobDef::SlitherDef& sd, const PoseInputs& in,
+                    float dt);
 
   // Does this cell carry a body's weight? THE definition of "solid" for
   // locomotion, shared by the ground probe, the footprint collider and the
@@ -5483,6 +5601,44 @@ class Mob {
   // ground. The latch says "this air is mine" for that one edge.
   Vec3 airVel_{};
   bool launched_ = false;
+  // ---- THE WATER CARRIES IT (MobDef::SwimDef; MobSystem::SenseWater /
+  // DriveSwim / TickStranded) -------------------------------------------------
+  // `swimming_` is the mode: entered at kSwimEnter of the body wet, left
+  // under kSwimLeave (a Schmitt pair, so a fish at the waterline does not
+  // flicker between swimming and falling). While it holds, `swimVel_` is the
+  // body's whole velocity (world voxels/s, 3D) and `pitch_` its nose angle
+  // (rad, + up); `roll_` is the bank, presentation. Out of the water the
+  // walker's `airborne_`/`fallVel_` take over and `drySeconds_` counts toward
+  // suffocation.
+  bool swimming_ = false;
+  float immersion_ = 0.0f;
+  Vec3 swimVel_{};
+  float pitch_ = 0.0f;
+  float roll_ = 0.0f;
+  float rollSide_ = 1.0f;       // which flank a stranded body lies on
+  bool surfaceKnown_ = false, bedKnown_ = false;
+  float surfaceY_ = 0.0f, bedY_ = 0.0f;
+  // What the behaviour layer asked of the body's height this tick
+  // (ai::IntentOut::altitude): the CENTRE's world y, or unset (hold depth).
+  bool altitudeSet_ = false;
+  float altitudeWant_ = 0.0f;
+  // A charge may lift the back over the waterline by SwimDef::breach.
+  bool breachOk_ = false;
+  // Out of the water.
+  float drySeconds_ = 0.0f;
+  float suffocateOwed_ = 0.0f;   // hp accrued, spent in whole points
+  uint32_t nextFlopTick_ = 0;
+  uint32_t flops_ = 0;
+  float flopKick_ = 0.0f;        // 1 on a flop, decays: the pose's thrash
+  // Diagnostics (rule 6): ticks the swim drive's feel found its line blocked
+  // and steered off it; axis components the move resolve refused.
+  uint32_t swimFelt_ = 0;
+  uint32_t swimBumps_ = 0;
+  uint32_t swimGlances_ = 0;   // refused steps taken turned aside instead
+  // A mouthful's reach (StrikeProfile::biteMouthful), as THIS body took it:
+  // extra limbs torn and skin cells removed from them, ever.
+  uint32_t mouthfulLimbs_ = 0;
+  uint32_t mouthfulCells_ = 0;
   // What this creature is looking at between strokes (Mob::SetAimLook).
   Vec3 aimLook_{};
   bool aimLookValid_ = false;
@@ -8342,6 +8498,33 @@ class MobSystem {
     int stepUpCells = 2;
   };
   GroundSense SenseGround(const Mob& mob, const MobDef& def, World& world) const;
+
+  // ---- THE SWIMMER'S LOCOMOTION (MobDef::SwimDef; DESIGN.md "Swimmers") ----
+  // SenseWater: how much of the body is in liquid, and the waterline and bed
+  // over it, off the CPU mirror; flips the Schmitt pair that is the swim mode
+  // (Mob::swimming_). DriveSwim: one tick of the water carrying the body --
+  // pitch toward the altitude asked for, thrust along the 3D axis, fins
+  // against sideslip, buoyancy against gravity, the waterline and the bed as
+  // soft walls, rock felt ahead and steered round, the move resolved against
+  // the body's own samples and other bodies. TickStranded: out of the water --
+  // gravity (UpdateFall), lying on a flank, flopping toward water, and the
+  // breath running out. All three are no-ops on a def with no `swim` block.
+  void SenseWater(Mob& mob, const MobDef& def, World& world);
+  void DriveSwim(Mob& mob, const MobDef& def, World& world, float dt);
+  void TickStranded(Mob& mob, const MobDef& def, World& world,
+                    const GroundSense& sense, uint32_t tick, float dt);
+  // Is this world cell rock to a swimming body (solid, or powder)? Unknown
+  // (outside the mirror) is NOT rock -- a swimmer is never fenced in by the
+  // edge of what the CPU can see, as a walker is not (ai_nav.h rule 1).
+  bool SwimBlockedAt(const Mob& mob, IVec3 cell) const;
+  // Share of a body's column in liquid at three heights (feet, middle, eyes),
+  // off the chunk cache: what a watcher can tell about any body's wetness
+  // (ai::Actor::immersion). Unknown cells count as dry.
+  float BodyImmersion(const Mob& mob) const;
+  // The body a SWIMMING mob's live stroke is closing its jaws on, through the
+  // windup and the cut; nullptr otherwise. BlockedByMob and CrowdPush let the
+  // two touch for that window.
+  const Mob* SwimStrikeTarget(const Mob& mob) const;
 
   // ---- executing an authored attack (game/strokes.h) ----------------------
   // Called from PreTick's per-mob loop, between the steering stages and the

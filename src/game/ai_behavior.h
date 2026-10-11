@@ -149,6 +149,21 @@ enum class Intent : uint8_t {
   // owner's business (game/demon_cast.h, the creature spell kit): this layer
   // only decides "near enough, facing, and the cadence says now".
   Cast,
+  // ---- THE CIRCLING HUNTER (2026-10-10; OrbitTuning, the profile's `orbit`
+  // block) ------------------------------------------------------------------
+  // ORBIT: circle the target NOSE-FIRST along the circle (a shark, a wolf, a
+  // vulture) rather than sidestepping round it facing in (CircleStrafe, a
+  // duelist's footwork) -- pure pursuit of a point a lookahead ahead on the
+  // circle, so the radius corrects itself and the path is a curve, never a
+  // polygon; reversing now and then ("pacing").
+  // CHARGE: the pass. Curve off the circle onto the target, accelerate down
+  // the line to where it WILL be, bite on the way through (the attack request
+  // is fired from the run, no stop, no facing lock), keep going past it on
+  // the heading the run locked, then hand back to Orbit to come round again.
+  // Either verb works for a walker (yaw only) and for a swimmer (which also
+  // gets an altitude, IntentOut::altitude).
+  Orbit,
+  Charge,
   Count,
 };
 // The activity verb for a schedule row's `do` ("sleep" -> Intent::Sleep), or
@@ -214,6 +229,19 @@ struct Perception {
   // There is no attacker attribution on a wound, so "the nearest stranger
   // when it hurt" is the honest approximation; see DESIGN.md §16.P7.
   uint32_t provokeTicks = 240;
+  // ---- THE MEDIUM (2026-10-10, the swimmers) -------------------------------
+  // `minImmersion`: a stranger is only a TARGET while at least this share of
+  // it is in liquid (Actor::immersion). 0 = anywhere, every profile before
+  // this one. A shark does not hunt a man on the bank; it hunts the one who
+  // wades in -- and loses him (the alert decays) when he climbs out.
+  float minImmersion = 0.0f;
+  // `scentRange`: a BLEEDING stranger (Actor::bleeding) that is itself in
+  // liquid is perceived out to this range with no cone and no line of sight
+  // -- blood in the water. 0 = off. It is acquired like a seen target (still
+  // subject to minImmersion) and is preferred over a dry one by
+  // `stickiness`'s arithmetic: `scentPull` voxels nearer than it is.
+  float scentRange = 0.0f;
+  float scentPull = 0.0f;
 };
 
 struct Movement {
@@ -275,6 +303,10 @@ struct Movement {
   uint32_t wanderPauseMin = 60;   // ticks
   uint32_t wanderPauseMax = 180;  // ticks
   float wanderArrive = 2.0f;      // world voxels, planar: "there"
+  // A VOLUMETRIC body (SelfView::volumetric: a swimmer) also draws each leg's
+  // HEIGHT, within this many voxels of the anchor's (it then asks for that
+  // altitude; the swim drive keeps it inside the water whatever it asks).
+  float wanderDepth = 0.0f;
   // ---- TACTICAL FOOTWORK (2026-09-27) --------------------------------------
   // Dodge's drive, as a multiplier on walk speed (split between a back-step
   // and a side-step). Above 1 is a burst — a dodge at walking pace is not one.
@@ -489,6 +521,49 @@ struct AttackTuning {
   int32_t riposteTicks = -1;
 };
 
+// ---- HOW A CIRCLING HUNTER HUNTS (2026-10-10; Intent::Orbit / Intent::Charge)
+//
+// The profile's `orbit` block. A shark and a shoal of piranha are the same
+// two verbs with different numbers: the shark circles wide and slow, paces
+// back and forth, then curves in and drives THROUGH you at two and a half
+// times its cruise with its jaws open; a piranha circles a body-length out
+// and darts in every second for a nip. Defaults are a creature that never
+// orbits (`radius` 0), so every older profile is unchanged.
+//
+// THE PASS IS ITS OWN ATTACK CLOCK'S CUSTOMER. A charge fires its bite
+// through the ordinary attack request (styles, cadence, the stroke system),
+// but from the RUN: no FaceTarget commit, no stopped feet -- a shark that
+// stops to bite is not a shark. One bite per pass.
+struct OrbitTuning {
+  float radius = 0.0f;          // world voxels, centre to centre; 0 = never
+  float radiusJitter = 0.2f;    // each lap's radius drawn within +-this share
+  float speed = 0.7f;           // x walk speed while circling
+  float height = 0.0f;          // vox above the target's centre to circle at
+  float heightJitter = 0.0f;    // +- per lap
+  float lookahead = 0.6f;       // rad ahead on the circle the nose chases
+  float engage = 2.5f;          // x radius: inside this it circles; outside,
+                                // Approach (the band) brings it in
+  uint32_t lapMin = 90;         // ticks of circling before a pass may begin...
+  uint32_t lapMax = 200;        // ...drawn per lap
+  float reverseChance = 0.3f;   // per lap: turn round and pace the other way
+  // ---- the pass ----
+  float chargeSpeed = 2.2f;     // x walk speed down the line (the body's own
+                                // burst ceiling still caps it: SwimDef::burst)
+  float turnInSpeed = 1.0f;     // x walk speed while it curves onto the line
+  float lineUp = 0.45f;         // rad: nose this close to the intercept = the run
+  float lead = 1.0f;            // share of the target's motion led over the run
+  float lockDist = 6.0f;        // vox: inside this the line stops homing
+  float overrun = 10.0f;        // vox past the target before the pass is over
+  float peel = 0.5f;            // rad the line turns off the target once the
+                                // bite is thrown: it goes PAST, not into
+  float biteCone = 0.6f;        // rad off the snout's line a bite may still be
+                                // thrown at (the head reaches round)
+  uint32_t passMax = 150;       // ticks: a pass that has not ended by then ends
+  uint32_t biteLead = 6;        // ticks of travel the bite is thrown ahead of
+                                // contact (the gape has to open in time)
+  float hitHeight = 0.0f;       // vox above the target's centre the run aims at
+};
+
 // ---- TUNE: what a holding RULE may do to the fighter, besides weights -------
 //
 // Intent weights say WHAT a creature does; these say HOW. A rule's `tune` map
@@ -585,6 +660,11 @@ enum class Fact : uint8_t {
   Shocked,          // ticks of shock stun left (0 = not stunned). While > 0
                     // the body's intent is overridden (no move, no attack);
                     // a rule may still read it (e.g. flee the water after)
+  // ---- (2026-10-10, the swimmers) -------------------------------------------
+  Immersion,        // 0..1: how much of ME is in liquid (a fish on the bank)
+  TargetImmersion,  // 0..1: how much of the TARGET is (Actor::immersion)
+  TargetBleeding,   // 0/1: the target has an open, bleeding wound -- the
+                    // frenzy a piranha profile's rules key on
   Count,
 };
 const char* FactName(Fact f);
@@ -630,6 +710,7 @@ struct Profile {
   AttackTuning attack;
   Defense defense;
   CastTuning cast;   // D4: magic (empty = never casts)
+  OrbitTuning orbit; // the circling hunter (radius 0 = never orbits)
   IntentTuning intents[(int)Intent::Count];
   // Flat score bonus the current intent keeps. See the arbiter note above.
   float hysteresis = 0.22f;
@@ -727,6 +808,17 @@ struct Actor {
   // Its profile is `aggro: "hostile"` -- it attacks strangers unprovoked.
   // What Fact::Hostiles counts and what a fleeing villager runs from.
   bool hostile = false;
+  // ---- WHERE IT IS, AS A FISH SEES IT (2026-10-10) -------------------------
+  // `immersion`: share of the body in liquid, 0..1 (MobSystem::PreTick samples
+  // three heights down the body's column). `bleeding`: an open wound is
+  // still paying out (Mob::Bleeding). Perception::minImmersion /
+  // scentRange and the Immersion / TargetBleeding facts read them. Defaults
+  // are a dry, unhurt body -- what a gate's hand-built actor list gets.
+  float immersion = 0.0f;
+  bool bleeding = false;
+  // Its velocity, world voxels/sec, when the publisher knows it (0 = unknown;
+  // the brain's own low-passed estimate is used instead).
+  Vec3 velocity{};
 };
 
 // Everything Think() may read about the outside world.
@@ -838,6 +930,21 @@ struct SelfView {
   // (cast_out severed) -- Cast scores 0. Both false with no fence.
   bool targetFenced = false;
   bool castFenced = false;
+  // ---- A BODY THAT MOVES IN THREE DIMENSIONS (2026-10-10, the swimmers) -----
+  // `volumetric`: the water carries this body (Mob::Swimming), so distances
+  // are measured in 3D, the ground navigator is not asked (there is no floor
+  // to route over -- the swim drive feels for rock itself), and every moving
+  // verb also says what HEIGHT it wants (IntentOut::altitude). False = a
+  // walker, exactly as before. `immersion` is Fact::Immersion.
+  bool volumetric = false;
+  float immersion = 0.0f;
+  float pitch = 0.0f;   // the nose's angle above level (rad); 0 for a walker
+  // The body's own velocity, world voxels/sec (a swimmer's whole 3D one; a
+  // walker's measured planar one). What a charge's bite is timed against.
+  Vec3 velocity{};
+  // The body's length along its facing (world voxels): an orbit tighter than
+  // this is a body chasing its own tail.
+  float length = 0.0f;
   Vec3 Centre() const {
     return Vec3{origin.x + size.x * 0.5f, origin.y + size.y * 0.5f,
                 origin.z + size.z * 0.5f};
@@ -1031,6 +1138,32 @@ struct Brain {
   int circleSign = 0;            // -1 / +1, redrawn on a cadence
   uint32_t circleUntil = 0;
 
+  // ---- the circling hunter (OrbitTuning; Intent::Orbit / Charge) ----
+  // The lap: its drawn radius and height, its direction (`orbitSign`, + =
+  // counter-clockwise seen from above), and the tick a pass may start.
+  // `orbitReadyAt` 0 = not armed (the first circling tick draws a lap).
+  float orbitR = 0.0f;
+  float orbitH = 0.0f;
+  int orbitSign = 0;
+  uint32_t orbitReadyAt = 0;
+  uint32_t orbitLap = 0;          // laps drawn; the draws' hash key
+  // The pass: 0 = none, 1 = turning in, 2 = the run, 3 = the overrun.
+  int passPhase = 0;
+  uint32_t passSince = 0;
+  float passHeading = 0.0f;       // the line, once locked (phase 2 close / 3)
+  float passAlt = 0.0f;
+  bool passLocked = false;
+  bool passBit = false;           // this pass has thrown its bite
+  uint32_t passBiteTick = 0;      // ...on this tick
+  float passClosest = 1e9f;       // nearest the muzzle came this pass
+  // Diagnostics the gates assert on (rule 6: every bare count with a cause).
+  uint32_t passes = 0;            // passes begun
+  uint32_t passBites = 0;         // ...that threw a bite
+  uint32_t reversals = 0;         // laps that turned round
+  float orbitSwept = 0.0f;        // radians swept round the target circling
+  float lastOrbitBearing = 0.0f;  // the target->body bearing last circling tick
+  bool orbitBearingValid = false;
+
   // ---- navigation ----
   NavPath path;
   uint32_t nextRepathTick = 0;
@@ -1083,6 +1216,15 @@ struct IntentOut {
   // WHICH DIRECTION the body translates relative to that heading.
   float driveScale = 0;
   float driveStrafe = 0;   // lateral, + = the mob's own right
+  // ---- ...AND, FOR A BODY THAT CAN LEAVE THE FLOOR, A HEIGHT (2026-10-10) --
+  // The world y the body's CENTRE should travel toward (SelfView::volumetric
+  // only; a walker never sets it and would ignore it). Unset = hold the
+  // depth it has. The swim drive turns it into a pitch, bounded by the
+  // body's own pitch rate and kept inside the water whatever is asked.
+  bool altitudeSet = false;
+  float altitude = 0;
+  // A charge's run may break the surface (MobDef::SwimDef::breach).
+  bool breach = false;
   bool attack = false;
   AttackRequest request;
   // ---- the weapon arm, when not attacking (2026-09-27) ----

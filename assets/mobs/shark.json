@@ -1,0 +1,641 @@
+{
+  "//": "THE SHARK (DESIGN.md \"Swimmers\"). A 2.2 m requiem shark: a swimmer by its `swim` block (MobSystem::DriveSwim -- 3D velocity, pitch, buoyancy, banking, feeling for rock, stranding on the bank), a circling hunter by its behaviour (behaviors.json `shark`: Intent::Orbit / Intent::Charge), and a mouthful by its jaws (natural `strike.mouthful`). Nothing in C++ knows it is a shark. The .vox, `root`, every limb (names, parents, hp, anchors), the jaws' `edge` and `swim.wave.parts` are WRITTEN by `node scripts/gen_fish.mjs shark` from the `fishgen` block at the bottom; edit that, not them.",
+  "artVoxelsPerMetre": 40,
+  "bleed": {
+    "material": "blood",
+    "perDamage": 1.5
+  },
+  "sounds": {
+    "dismember": "dismember",
+    "bleed": "bleed"
+  },
+  "//anatomy": "Skin, flesh, two of muscle speckled with blood, and a cartilage core (bone: the engine has no cartilage, and a shark's skeleton breaks like one). The head is skin over a skull with a brain in the back of it; the jaw is skin, a voxel of bone and muscle; the pectorals are skin over flesh.",
+  "anatomy": {
+    "layers": [
+      {
+        "material": "skin",
+        "depth": 1,
+        "keep": true
+      },
+      {
+        "material": "flesh",
+        "depth": 1
+      },
+      {
+        "material": "muscle",
+        "depth": 2,
+        "speckle": {
+          "material": "blood",
+          "fraction": 0.05
+        }
+      },
+      {
+        "material": "bone"
+      }
+    ],
+    "limbs": {
+      "head": {
+        "layers": [
+          {
+            "material": "skin",
+            "depth": 1,
+            "keep": true
+          },
+          {
+            "material": "flesh",
+            "depth": 1
+          },
+          {
+            "material": "bone",
+            "depth": 1
+          },
+          {
+            "material": "muscle"
+          }
+        ],
+        "carve": [
+          {
+            "material": "brain",
+            "where": "muscle",
+            "box": {
+              "x": [
+                0.35,
+                0.65
+              ],
+              "y": [
+                0.5,
+                0.85
+              ],
+              "z": [
+                0.05,
+                0.4
+              ]
+            }
+          }
+        ]
+      },
+      "jaw": {
+        "layers": [
+          {
+            "material": "skin",
+            "depth": 1,
+            "keep": true
+          },
+          {
+            "material": "bone",
+            "depth": 1
+          },
+          {
+            "material": "muscle"
+          }
+        ]
+      },
+      "fin.L": {
+        "layers": [
+          {
+            "material": "skin",
+            "depth": 1,
+            "keep": true
+          },
+          {
+            "material": "flesh"
+          }
+        ]
+      },
+      "fin.R": {
+        "layers": [
+          {
+            "material": "skin",
+            "depth": 1,
+            "keep": true
+          },
+          {
+            "material": "flesh"
+          }
+        ]
+      }
+    }
+  },
+  "//speed": "World voxels per second at a cruise: 1.4 m/s. The charge is the behaviour's chargeSpeed (2.6x) under the body's own burst ceiling (swim.burst 2.8x): about 3.6 m/s, four times what a swimming man manages.",
+  "speed": 14,
+  "locomotion": {
+    "turnRate": 2.3,
+    "turnAccel": 9,
+    "turnRateMoving": 0.85,
+    "driveAlignFull": 0.6,
+    "driveAlignZero": 2.4
+  },
+  "//swim": "MobDef::SwimDef. A slow pitch (it does not stand on its tail), a soft accel and a softer brake (it glides), fins that hold it on its line, neutral buoyancy. surfaceGap 0.5: the back cruises half a voxel under, so the dorsal fin cuts the surface when it rides high; a charge may lift the back 1.5 over (breach) to take a man treading water. Out of the water: 10 s of breath, then 25 hp a second; it flops toward water it can feel within 10 voxels.",
+  "swim": {
+    "pitchRate": 1.1,
+    "maxPitch": 0.9,
+    "accel": 22,
+    "brake": 9,
+    "sideGrip": 4,
+    "burst": 2.8,
+    "buoyancy": 1,
+    "surfaceGap": 0.2,
+    "bedGap": 1,
+    "breach": 1.5,
+    "feel": 7,
+    "bank": 0.7,
+    "maxRoll": 0.8,
+    "breathSeconds": 10,
+    "suffocateHp": 25,
+    "flopMin": 0.5,
+    "flopMax": 1.4,
+    "flopRise": 1.2,
+    "flopSpeed": 1,
+    "flopReach": 10,
+    "//wave": "CARANGIFORM: a stiff front (ampHead 0.08) and the swing growing all the way to the tail (ampRamp 1), a body-length wave on a clock -- 0.55 beats a second hanging still, plus the speed over slip x wavelength cruising -- so the tail beats faster than the body goes. The turn lays the body on its arc (turnBend), capped low: a shark is stiff.",
+    "wave": {
+      "wavelength": 1.05,
+      "amplitude": 0.075,
+      "ampHead": 0.08,
+      "ampRamp": 1,
+      "turnBend": 1,
+      "maxCurvature": 0.06,
+      "bendHalfLife": 0.25,
+      "beatHz": 0.55,
+      "slip": 0.7,
+      "ampIdle": 0.45,
+      "ampSpeed": 0.8,
+      "parts": [
+        "head",
+        "body1",
+        "body2",
+        "body3",
+        "tail"
+      ]
+    },
+    "trunkHalfW": 1.569,
+    "trunkHalfH": 1.861
+  },
+  "headLook": false,
+  "aimSpineShare": 0.15,
+  "aimLeanBodies": 0.03,
+  "//natural": "THE JAWS. An AIM effector on the head (no chain owns it), the edge running from the gape to the snout along the mouth line. A MOUTHFUL: biteRadius 4.5 x gore.biteRadius is a 0.8..2.0-voxel tear across the speed ramp (a charge lands near the top of it), and mouthful 1.25 takes the same tear out of every other limb of the victim inside 1.25 of it -- the thigh with the hip, the hand with the wrist. 90 hp at full speed, the extra limbs sharing half as much again.",
+  "natural": [
+    {
+      "name": "jaws",
+      "part": "head",
+      "edge": {
+        "from": [
+          5.5,
+          4.25,
+          1.5
+        ],
+        "to": [
+          5.5,
+          4.68,
+          15
+        ],
+        "halfWidth": 4.03
+      },
+      "strike": {
+        "blunt": 8,
+        "bite": 55,
+        "biteRadius": 2.6,
+        "biteStain": 1.3,
+        "mouthful": 1.15,
+        "biteForce": 0.85
+      }
+    }
+  ],
+  "behavior": "shark",
+  "//chase": "MENACE (MobDef::chaseClip): while it is engaged and not mid-bite the jaw hangs a few degrees open. An override on the jaw only, with restFill so the ramp is a slow drop and not a snap.",
+  "chaseClip": "shark_menace",
+  "chaseRampMs": 700,
+  "chaseRange": 50,
+  "states": [],
+  "clips": {
+    "shark_bite": {
+      "durationMs": 700,
+      "loop": false,
+      "mode": "override",
+      "mask": [
+        "jaw"
+      ],
+      "blendInMs": 40,
+      "blendOutMs": 220,
+      "tracks": {
+        "jaw": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "cubicOut"
+            },
+            {
+              "t": 170,
+              "q": [
+                0.3584,
+                0,
+                0,
+                0.9336
+              ],
+              "ease": "cubicIn"
+            },
+            {
+              "t": 215,
+              "q": [
+                -0.0175,
+                0,
+                0,
+                0.9998
+              ],
+              "ease": "linear"
+            },
+            {
+              "t": 330,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "linear"
+            },
+            {
+              "t": 700,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "linear"
+            }
+          ]
+        }
+      }
+    },
+    "shark_menace": {
+      "durationMs": 3200,
+      "loop": true,
+      "mode": "override",
+      "restFill": true,
+      "mask": [
+        "jaw"
+      ],
+      "blendInMs": 300,
+      "blendOutMs": 300,
+      "tracks": {
+        "jaw": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                0.0698,
+                0,
+                0,
+                0.9976
+              ],
+              "ease": "linear"
+            },
+            {
+              "t": 1600,
+              "q": [
+                0.1132,
+                0,
+                0,
+                0.9936
+              ],
+              "ease": "linear"
+            },
+            {
+              "t": 3200,
+              "q": [
+                0.0698,
+                0,
+                0,
+                0.9976
+              ],
+              "ease": "linear"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "//fishgen": "THE BODY, FOR scripts/gen_fish.mjs. `profile` stations are [t, halfWidth, halfHeight, centreline] as shares of the BODY length (peduncle t=0 .. snout t=1); `segments` cut it by station, tail first; `jaw` is the mouth line from the gape to the tip as [t, share of the local half-height from the centre line]; fins are plates (`dorsal`/`anal` keels, `pelvic`/`pectoral` pairs -- `limbs` makes the pectorals their own limbs -- and a heterocercal `caudal`: [length share, angle rad] per lobe); `coat` is countershading plus eyes, five gill slits, nostrils and teeth.",
+  "fishgen": {
+    "length": 2.2,
+    "caudalBack": 0.17,
+    "flat": 2.3,
+    "profile": [
+      [
+        0,
+        0.016,
+        0.026,
+        0.004
+      ],
+      [
+        0.08,
+        0.026,
+        0.04,
+        0.004
+      ],
+      [
+        0.25,
+        0.052,
+        0.072,
+        0.003
+      ],
+      [
+        0.45,
+        0.078,
+        0.098,
+        0
+      ],
+      [
+        0.6,
+        0.086,
+        0.102,
+        0
+      ],
+      [
+        0.74,
+        0.08,
+        0.088,
+        0.002
+      ],
+      [
+        0.86,
+        0.064,
+        0.062,
+        0.006
+      ],
+      [
+        0.95,
+        0.04,
+        0.034,
+        0.01
+      ],
+      [
+        1,
+        0.01,
+        0.01,
+        0.014
+      ]
+    ],
+    "segments": [
+      [
+        "tail",
+        0.17
+      ],
+      [
+        "body3",
+        0.4
+      ],
+      [
+        "body2",
+        0.6
+      ],
+      [
+        "body1",
+        0.79
+      ],
+      [
+        "head",
+        1
+      ]
+    ],
+    "root": "body2",
+    "jaw": {
+      "gape": [
+        0.815,
+        -0.3
+      ],
+      "tip": [
+        0.955,
+        -0.62
+      ]
+    },
+    "fins": [
+      {
+        "kind": "dorsal",
+        "t": [
+          0.5,
+          0.64
+        ],
+        "height": 0.14,
+        "sweep": 0.55,
+        "thick": 2
+      },
+      {
+        "kind": "dorsal",
+        "t": [
+          0.13,
+          0.17
+        ],
+        "height": 0.035,
+        "sweep": 0.4,
+        "thick": 1
+      },
+      {
+        "kind": "anal",
+        "t": [
+          0.12,
+          0.16
+        ],
+        "height": 0.03,
+        "sweep": 0.4,
+        "thick": 1
+      },
+      {
+        "kind": "pelvic",
+        "t": [
+          0.3,
+          0.35
+        ],
+        "length": 0.05,
+        "droop": 0.9,
+        "sweep": 0.6,
+        "rootY": 0.75,
+        "thick": 1
+      },
+      {
+        "kind": "pectoral",
+        "t": [
+          0.66,
+          0.74
+        ],
+        "length": 0.19,
+        "droop": 0.5,
+        "sweep": 0.45,
+        "rootY": 0.5,
+        "thick": 2,
+        "limbs": true
+      },
+      {
+        "kind": "caudal",
+        "upper": [
+          0.24,
+          0.62
+        ],
+        "lower": [
+          0.13,
+          0.8
+        ],
+        "chord": 0.06,
+        "thick": 2,
+        "fork": 0.3
+      }
+    ],
+    "coat": {
+      "back": "#5d6e7c",
+      "back2": "#53636f",
+      "belly": "#ebe9e1",
+      "belly2": "#dedbd1",
+      "line": 0.42,
+      "fin": "#4f5f6c",
+      "finTip": "#2c363f",
+      "eye": "#060607",
+      "eyeT": 0.905,
+      "eyeY": 0.22,
+      "eyeR": 1,
+      "gills": {
+        "n": 5,
+        "t": [
+          0.745,
+          0.8
+        ],
+        "y": [
+          -0.55,
+          0.35
+        ],
+        "color": "#36414a",
+        "curve": 1
+      },
+      "mouth": "#6b2a30",
+      "teeth": "#f2eee2",
+      "nostrilT": 0.975,
+      "nostril": "#222a31",
+      "noise": 0.1
+    },
+    "hp": {
+      "head": 110,
+      "jaw": 40,
+      "body1": 160,
+      "body2": 200,
+      "body3": 140,
+      "tail": 90,
+      "fin": 30
+    }
+  },
+  "root": "body2",
+  "limbs": [
+    {
+      "name": "tail",
+      "parent": "body3",
+      "joint": "ball",
+      "anchor": [
+        16.5,
+        10.7,
+        26.41
+      ],
+      "hp": 90,
+      "severable": true,
+      "tag": "tail",
+      "severImpactSpeed": 14
+    },
+    {
+      "name": "body3",
+      "parent": "body2",
+      "joint": "ball",
+      "anchor": [
+        16.5,
+        10.48,
+        43.2
+      ],
+      "hp": 140,
+      "severable": true,
+      "tag": "spine",
+      "severImpactSpeed": 14
+    },
+    {
+      "name": "body2",
+      "hp": 200,
+      "severable": false,
+      "vital": true,
+      "tag": "spine"
+    },
+    {
+      "name": "body1",
+      "parent": "body2",
+      "joint": "ball",
+      "anchor": [
+        16.5,
+        10.45,
+        57.8
+      ],
+      "hp": 160,
+      "severable": true,
+      "tag": "spine",
+      "severImpactSpeed": 14
+    },
+    {
+      "name": "head",
+      "parent": "body1",
+      "joint": "ball",
+      "anchor": [
+        16.5,
+        10.7,
+        71.67
+      ],
+      "hp": 110,
+      "severable": true,
+      "vital": true,
+      "tag": "head",
+      "severImpactSpeed": 18
+    },
+    {
+      "name": "jaw",
+      "parent": "head",
+      "joint": "ball",
+      "hp": 40,
+      "severable": true,
+      "tag": "jaw",
+      "severImpactSpeed": 14,
+      "anchor": [
+        16.5,
+        9.25,
+        73.5
+      ]
+    },
+    {
+      "name": "fin.L",
+      "parent": "body1",
+      "joint": "ball",
+      "hp": 30,
+      "severable": true,
+      "tag": "fin",
+      "severImpactSpeed": 10,
+      "anchor": [
+        21.24,
+        7.25,
+        67.52
+      ]
+    },
+    {
+      "name": "fin.R",
+      "parent": "body1",
+      "joint": "ball",
+      "hp": 30,
+      "severable": true,
+      "tag": "fin",
+      "severImpactSpeed": 10,
+      "anchor": [
+        11.76,
+        7.25,
+        67.52
+      ]
+    }
+  ]
+}

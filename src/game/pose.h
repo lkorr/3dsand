@@ -150,6 +150,22 @@ struct PoseInputs {
   // water the pipeline points the body along it (PoseDrive::swimPitch); at
   // the surface, and with it zero, the velocity mix alone poses the swim.
   Vec3 swimAim{};
+  // ---- A BODY THAT IS NOT UPRIGHT BY NATURE (MobDef::SwimDef, 2026-10-10) --
+  // `attitude`: the driver owns the whole body's pitch and roll -- a fish
+  // pitched along its dive and banked into its turn, or lying on its flank on
+  // the bank. Composed on the ROOT in the rig frame straight after the clip
+  // blend, so every segment and the wave ride it. `attPitch` + = nose up;
+  // `attRoll` is a rotation about the body's own long axis, + lifting its
+  // LEFT side (the air lean's convention). `bodyDrop` lowers the drawn body
+  // (world voxels) -- a trunk rolled onto its flank rests lower than it
+  // stands. `swimWave` runs the def's swim.wave instead of its slither;
+  // `waveKick` 0..1 is a flop's thrash (more swing, faster beat).
+  bool attitude = false;
+  float attPitch = 0.0f;
+  float attRoll = 0.0f;
+  float bodyDrop = 0.0f;
+  bool swimWave = false;
+  float waveKick = 0.0f;
   // Anything else a driver needs to solve, AFTER the leg IK, the weapon arm
   // and the hang palms and BEFORE the anatomical clamp (so it is clamped like
   // everything else). Empty on both current drivers.

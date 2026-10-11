@@ -127,6 +127,8 @@ const std::vector<Gate>& CellarGates();   // selftest_demon_cellar.cpp (demons D
 const std::vector<Gate>& ClearingGates();
 // The F12 ticket files (ui/bugreport.h): report.md parse/append, CPU only.
 const std::vector<Gate>& BugReportGates();
+// The swimmers (selftest_aquatic.cpp): a shark's hunt, a shoal, stranding.
+const std::vector<Gate>& AquaticGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -1175,6 +1177,10 @@ const char* const kOrder[] = {
     // synth shell) by what it is made of. Ticks the world and regenerates it
     // on the way out.
     "corpse-float",
+    // The swimmers: a shark circles and charges a man in a stamped pool,
+    // piranha nip him, a dry man is ignored, a fish out of water flops and
+    // suffocates. Ticks the world and regenerates it on the way out.
+    "aquatic",
     // The player's corpse is a dead Mob too (P2b): moved into mobs_ at the
     // PreTick after the death, whole respawn, sleeps, a cut reaches it. Ticks
     // the world and regenerates it on the way out, as corpse-sleep does.
@@ -1333,7 +1339,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(), &ItemStageGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates()})
+                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

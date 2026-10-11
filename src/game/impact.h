@@ -78,6 +78,22 @@ struct StrikeProfile {
   // a zombie's ragged, messy tear. A snake's fangs inject: the venom belongs
   // in the puncture, not in a wide green ring round it (owner, 2026-10-07).
   float biteStain = 1.0f;
+  // A MOUTHFUL, NOT A PUNCTURE (2026-10-10, the shark). 0 = the bite tears
+  // the one limb its teeth met, as every jaw always has. > 0: the same tear,
+  // a ball this many times the hole's own radius about the contact, is also
+  // taken out of every OTHER limb of the victim it reaches -- a shark that
+  // closes on a hip takes the top of the thigh with it, one that closes on a
+  // forearm takes the hand. Each limb is charged its share of the bite's hp,
+  // bleeds, and severs by collapse exactly as a bitten limb does.
+  float biteMouthful = 0.0f;
+  // THE JAWS CLOSE UNDER THEIR OWN FORCE (2026-10-10). 0 = the bite is as
+  // strong as the swing is fast, like every blade and fist: power from the
+  // melee speed ramp (melee.minSpeedMps .. fullSpeedMps), which is why a
+  // zombie's bite and a snake's strike land at a fraction of it. > 0: a FLOOR
+  // on that power, and the sweep runs however slowly the head is moving -- a
+  // shark's bite is its jaw muscles, not the speed of its nose, and a shark
+  // nosing a body at a crawl still takes a mouthful out of it.
+  float biteForce = 0.0f;
   uint16_t infectMat = 0;   // material the tear REWRITES exposed flesh to (0 = none)
   uint16_t infectStain = 0; // LIQUID whose stain the tear smears over the hole (0 = none)
 

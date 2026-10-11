@@ -4498,6 +4498,310 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
 }
 
 // ===========================================================================
+// --shot-aquatic <def>[*N][,<def>[*N]...][+<victim>]   (2026-10-10, swimmers)
+//
+// THE HUNT, PHOTOGRAPHED AND TRACED. A stone pool dug into the harness ground
+// (48 x 48, 16 deep) through the op stream, the named swimmers dropped into it
+// round its middle, a victim standing on the floor in the middle with the
+// water at its chest (a statue: `dummy` profile), and the game's own tick run
+// for SANDVOX_AQUATIC_TICKS (default 900). One trace line every 10 ticks per
+// swimmer -- its intent, the pass phase, the 3D gap, its depth under the
+// waterline, pitch and bank -- and a frame every SANDVOX_AQUATIC_EVERY ticks
+// (default 90) from above the pool's rim (aquatic_NN.bmp), plus a final
+// close-up of the victim (aquatic_victim.bmp), and two close-ups of each of the
+// first four bites (aquatic_biteN_a/b.bmp: the gape, the snap). What the victim
+// lost is printed per limb at the end, and what each bite stroke did when it
+// ends. `+none` = no victim (idle swimming, wander). SANDVOX_AQUATIC_R = the
+// pool's half-width (default 40); SANDVOX_AQUATIC_STROKES=1 prints the jaws'
+// gap to the victim every tick of a stroke; SANDVOX_PASS_TRACE=1 (any run)
+// prints every tick of every charge's geometry.
+// ===========================================================================
+int RunAquaticShot(GpuContext& ctx, World& world, Simulation& sim,
+                   Physics& phys, DebrisSystem& debris, MobSystem& mobs,
+                   const ItemLibrary& items, const std::string& spec,
+                   Stream& stream, const std::vector<MaterialDef>& mats) {
+  std::string swimmers = spec, victimName = "human";
+  if (size_t p = swimmers.find('+'); p != std::string::npos) {
+    victimName = swimmers.substr(p + 1);
+    swimmers = swimmers.substr(0, p);
+  }
+  struct Want { int def; int n; };
+  std::vector<Want> wants;
+  for (size_t s = 0; s < swimmers.size();) {
+    size_t e = swimmers.find(',', s);
+    if (e == std::string::npos) e = swimmers.size();
+    std::string nm = swimmers.substr(s, e - s);
+    s = e + 1;
+    int n = 1;
+    if (size_t st = nm.find('*'); st != std::string::npos) {
+      n = std::max(1, atoi(nm.c_str() + st + 1));
+      nm = nm.substr(0, st);
+    }
+    const int d = mobs.FindOrComposeDef(nm);
+    if (d < 0) {
+      std::fprintf(stderr, "--shot-aquatic: no mob def named \"%s\"\n", nm.c_str());
+      return 1;
+    }
+    wants.push_back({d, n});
+  }
+  const int ticks = std::max(30, std::getenv("SANDVOX_AQUATIC_TICKS")
+                                     ? atoi(std::getenv("SANDVOX_AQUATIC_TICKS"))
+                                     : 900);
+  const int every = std::max(10, std::getenv("SANDVOX_AQUATIC_EVERY")
+                                     ? atoi(std::getenv("SANDVOX_AQUATIC_EVERY"))
+                                     : 90);
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  const int sx = 137, sz = 139;
+  const int h = World::TerrainHeight(sx, sz, kDefaultSeed);
+  const int R = std::getenv("SANDVOX_AQUATIC_R") ? atoi(std::getenv("SANDVOX_AQUATIC_R")) : 40;
+  constexpr int kDepth = 16, kAir = 14;
+  const int floorY = h - kDepth;        // the stone floor's top layer
+  const int waterTop = h - 1;           // the topmost water layer
+  std::vector<CellOp> pool;
+  for (int x = sx - R; x <= sx + R; x++)
+    for (int z = sz - R; z <= sz + R; z++)
+      for (int y = floorY - 1; y <= h + kAir; y++) {
+        const IVec3 cc{x, y, z};
+        if (!world.CellInWindow(cc)) continue;
+        const bool wall = std::abs(x - sx) >= R - 1 || std::abs(z - sz) >= R - 1;
+        uint32_t w = PackVoxNew(0u, 0u);
+        if (y <= floorY || (wall && y <= h)) w = PackVoxNew(kMatStone, 0u);
+        else if (y <= waterTop && !wall) w = (kMatWater & 0xFFFu) | (7u << 12);
+        pool.push_back({World::SlotCellIndex(cc), w});
+      }
+  uint32_t t = 6000;
+  support::TickRig rig(
+      support::TickEngine{ctx, world, sim, stream, phys, mobs, debris, mats, items},
+      t, IVec3{sx >> 4, waterTop >> 4, sz >> 4});
+  for (size_t off = 0; off < pool.size(); off += 60000) {
+    const size_t n = std::min<size_t>(60000, pool.size() - off);
+    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) {
+      o.cells.assign(pool.begin() + (ptrdiff_t)off,
+                     pool.begin() + (ptrdiff_t)(off + n));
+    });
+  }
+  support::RunTicks(rig, 30);   // the water settles; the fetch cache sees it
+  std::printf("--shot-aquatic: pool at (%d,%d), floor y%d, water to y%d, %zu "
+              "cells\n", sx, sz, floorY, waterTop, pool.size());
+
+  uint64_t victim = 0;
+  if (victimName != "none") {
+    const int vd = mobs.FindOrComposeDef(victimName);
+    if (vd >= 0) {
+      const Vec3 vs = mobs.Defs()[vd].worldSize;
+      victim = mobs.Spawn(vd, {sx - (int)(vs.x * 0.5f), floorY + 1,
+                               sz - (int)(vs.z * 0.5f)});
+      if (victim) mobs.SetMobBehavior(victim, "dummy");
+    }
+  }
+  std::vector<uint64_t> ids;
+  int k = 0;
+  for (const Want& w : wants)
+    for (int i = 0; i < w.n; i++, k++) {
+      const Vec3 ws = mobs.Defs()[w.def].worldSize;
+      const float a = 0.7f + (float)k * 2.39996f;
+      const float rr = 15.0f + 2.0f * (float)(k % 3);
+      const IVec3 at{sx + (int)(std::cos(a) * rr - ws.x * 0.5f),
+                     floorY + 4 + (k % 4) * 2,
+                     sz + (int)(std::sin(a) * rr - ws.z * 0.5f)};
+      if (const uint64_t id = mobs.Spawn(w.def, at)) ids.push_back(id);
+    }
+  std::printf("--shot-aquatic: %zu swimmers, victim %llu\n", ids.size(),
+              (unsigned long long)victim);
+  std::vector<uint32_t> victim0;
+  if (const Mob* vm = mobs.FindMobById(victim))
+    for (int li = 0; li < vm->LimbCount(); li++)
+      victim0.push_back(mobs.LimbVoxelCount(victim, li));
+
+  const uint32_t W = 1280, H = 720;
+  const uint32_t ticksPerDay = TicksPerDay(CurrentTuning());
+  const uint32_t shotTick =
+      (uint32_t)((double)g_shotTimeOfDay * (double)ticksPerDay) % ticksPerDay;
+  auto shoot = [&](Vec3 eye, Vec3 target, const char* path) {
+    if (MicroBodySet* mbs = debris.MicroSet(); mbs != nullptr && mbs->dirty)
+      sim.UploadMicroBodies(ctx.queue, *mbs);
+    BodyRegistry bodyReg(debris, mobs, nullptr);
+    std::vector<BodyXformGpu> xf;
+    bodyReg.BuildXforms(xf);
+    if (!xf.empty())
+      ctx.queue.WriteBuffer(world.bodyXforms, 0, xf.data(),
+                            xf.size() * sizeof(BodyXformGpu));
+    std::vector<MicroBodyInstGpu> microInsts;
+    bodyReg.BuildMicroInsts(microInsts);
+    std::vector<BodyVoxInst> inst;
+    bodyReg.BuildInstances(inst);
+    if (!inst.empty())
+      ctx.queue.WriteBuffer(world.bodyInstances, 0, inst.data(),
+                            inst.size() * sizeof(BodyVoxInst));
+    const Vec3 look = (target - eye).normalized();
+    Camera cam;
+    cam.yaw = std::atan2(look.z, look.x);
+    cam.pitch = std::asin(std::clamp(look.y, -1.0f, 1.0f));
+    WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, true, 0.0f,
+                      kFarFogDensity, 1080.0f, shotTick);
+    rhi::Texture tex = ctx.device.CreateTexture(
+        {W, H, 1}, rhi::TextureFormat::RGBA8Unorm,
+        rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
+        "aquaticShot");
+    const uint32_t microCount = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeShadowResolve(enc);
+    rhi::RenderPass rp = sim.BeginRenderPass(
+        enc, tex.CreateView(), rhi::TextureFormat::RGBA8Unorm, W, H);
+    sim.DrawWorld(rp);
+    sim.DrawBodies(rp, (uint32_t)inst.size());
+    sim.DrawMicroBodies(rp, microCount);
+    rp.End();
+    rhi::Buffer buf = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                                   rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                                   "aquaticShot");
+    rhi::TexelCopyTexture srcT{};
+    srcT.texture = tex;
+    rhi::TexelCopyBuffer dstB{};
+    dstB.buffer = buf;
+    dstB.bytesPerRow = W * 4;
+    dstB.rowsPerImage = H;
+    enc.CopyTextureToBuffer(srcT, dstB, rhi::Extent3D{W, H, 1});
+    ctx.queue.Submit(enc.Finish());
+    std::vector<uint8_t> px((size_t)W * H * 4, 0);
+    rhi::ReadBufferBlocking(ctx.device, buf, 0, px.data(), px.size());
+    if (WriteBmpFile(path, px, W, H)) std::printf("wrote %s\n", path);
+  };
+  const Vec3 poolC{(float)sx + 0.5f, (float)(floorY + waterTop) * 0.5f,
+                   (float)sz + 0.5f};
+  int frame = 0;
+  // Close-ups of a bite: when a swimmer throws one, the gape a few ticks on
+  // and the snap after it, from its flank, at most four bites.
+  std::vector<uint32_t> bitesSeen(ids.size(), 0);
+  struct Close { int at; uint64_t id; int n; };
+  std::vector<Close> closes;
+  int closeShots = 0;
+  // What each bite stroke DID (strokes.h NpcStroke's tallies, which a Reset
+  // clears at the stroke's end): sampled while it is live, printed when it
+  // ends -- "it threw a bite and nothing happened" has four causes.
+  struct StrokeTally { bool live = false; int sweeps = 0, bodies = 0, cast = 0, air = 0, body = 0; float tip = 0; };
+  std::vector<StrokeTally> tallies(ids.size());
+  for (int i = 1; i <= ticks; i++) {
+    support::RunTicks(rig, 1);
+    for (size_t q = 0; q < ids.size(); q++) {
+      const NpcStroke* st = mobs.MobStroke(ids[q]);
+      StrokeTally& tl = tallies[q];
+      if (st != nullptr && st->Active()) {
+        // Where the jaws are against the victim, every live tick of a stroke:
+        // the tip's gap to the victim's nearest voxel, and the victim's state.
+        static const bool kStrokeTrace = std::getenv("SANDVOX_AQUATIC_STROKES") != nullptr;
+        if (Mob* sm = mobs.FindMobById(ids[q]); kStrokeTrace && sm != nullptr && victim != 0) {
+          Vec3 eb{}, et{};
+          float ehw = 0.0f;
+          float gap = -1.0f;
+          if (sm->WeaponEdge(eb, et, ehw))
+            if (const Mob* vm = mobs.FindMobById(victim)) {
+              gap = 1e9f;
+              for (int li = 0; li < vm->LimbCount(); li++)
+                gap = std::min(gap, (mobs.LimbNearestVoxelWorld(victim, li, et) - et).len());
+            }
+          const Mob* vm = mobs.FindMobById(victim);
+          std::printf("    t%4d stroke phase %d tick %d | jaw tip (%.1f %.1f %.1f) gap %.2f "
+                      "| victim %s ragdoll %d at (%.1f %.1f %.1f) | target pt (%.1f %.1f %.1f)\n",
+                      i, (int)st->phase, st->phaseTick, et.x, et.y, et.z, gap,
+                      vm && vm->Alive() ? "alive" : "dead", vm ? (int)vm->Ragdoll() : -1,
+                      vm ? vm->Origin().x + vm->Def()->worldSize.x * 0.5f : 0.0f,
+                      vm ? vm->Origin().y + vm->Def()->worldSize.y * 0.5f : 0.0f,
+                      vm ? vm->Origin().z + vm->Def()->worldSize.z * 0.5f : 0.0f,
+                      st->targetPoint.x, st->targetPoint.y, st->targetPoint.z);
+        }
+        tl.live = true;
+        tl.sweeps = std::max(tl.sweeps, st->sweeps);
+        tl.bodies = std::max(tl.bodies, st->bodiesHit);
+        tl.cast = std::max(tl.cast, st->probesCast);
+        tl.air = std::max(tl.air, st->probesAir);
+        tl.body = std::max(tl.body, st->probesBody);
+        tl.tip = std::max(tl.tip, st->topTipSpeed);
+      } else if (tl.live) {
+        std::printf("  t%4d #%llu stroke ended: %d sweeps, %d bodies hit, probes "
+                    "%d cast / %d air / %d on a body, tip %.1f vox/s\n",
+                    i, (unsigned long long)ids[q], tl.sweeps, tl.bodies, tl.cast,
+                    tl.air, tl.body, tl.tip);
+        tl = StrokeTally{};
+      }
+    }
+    for (size_t q = 0; q < ids.size(); q++) {
+      const ai::Brain* b = mobs.MobBrain(ids[q]);
+      if (b != nullptr && b->passBites > bitesSeen[q]) {
+        bitesSeen[q] = b->passBites;
+        if (closeShots < 4) {
+          closes.push_back({i + 4, ids[q], closeShots});
+          closes.push_back({i + 9, ids[q], closeShots});
+          closeShots++;
+        }
+      }
+    }
+    for (const Close& cl : closes) {
+      if (cl.at != i) continue;
+      const Mob* m = mobs.FindMobById(cl.id);
+      if (m == nullptr || m->Def() == nullptr) continue;
+      const Vec3 f3 = m->Forward3();
+      const Vec3 rt{f3.z, 0.0f, -f3.x};
+      const Vec3 c = m->Origin() + m->Def()->worldSize * 0.5f;
+      const Vec3 head = c + f3 * (m->Def()->worldSize.z * 0.35f);
+      char path[64];
+      std::snprintf(path, sizeof path, "aquatic_bite%d_%c.bmp", cl.n,
+                    cl.at == i && (&cl - closes.data()) % 2 == 0 ? 'a' : 'b');
+      shoot(head + rt * (m->Def()->worldSize.z * 0.75f) + Vec3{0.0f, 4.0f, 0.0f},
+            head, path);
+    }
+    if (i % 10 == 0)
+      for (uint64_t id : ids) {
+        const Mob* m = mobs.FindMobById(id);
+        if (m == nullptr || m->Def() == nullptr) {
+          std::printf("  t%4d #%llu gone\n", i, (unsigned long long)id);
+          continue;
+        }
+        const ai::Brain* b = mobs.MobBrain(id);
+        const Vec3 c = m->Origin() + m->Def()->worldSize * 0.5f;
+        std::printf("  t%4d #%llu %-8s pass %d %s d %5.1f c(%6.1f %6.1f %6.1f) "
+                    "under %4.1f v %5.1f pitch %+5.2f roll %+5.2f imm %.2f "
+                    "swept %5.1f passes %u bites %u felt %u hp %.0f\n",
+                    i, (unsigned long long)id,
+                    b ? ai::IntentName(b->intent) : "-", b ? b->passPhase : 0,
+                    m->Swimming() ? "swim" : "DRY ", b ? b->targetDist : 0.0f,
+                    c.x, c.y, c.z,
+                    m->SurfaceKnown() ? m->SurfaceY() - c.y : -1.0f,
+                    m->SwimVelocity().len(), m->SwimPitch(), m->SwimRoll(),
+                    m->Immersion(), b ? b->orbitSwept : 0.0f,
+                    b ? b->passes : 0u, b ? b->passBites : 0u, m->SwimFelt(),
+                    mobs.TotalHp(id));
+      }
+    if (i % every == 0 && frame < 40) {
+      char path[64];
+      std::snprintf(path, sizeof path, "aquatic_%02d.bmp", frame++);
+      // From above the rim, a quarter of the way round each frame: the pool
+      // in the middle of the frame, the surface tilted toward the camera.
+      const float a = 0.6f + 0.35f * (float)frame;
+      const Vec3 eye = poolC + Vec3{std::cos(a) * 34.0f, 30.0f, std::sin(a) * 34.0f};
+      shoot(eye, poolC, path);
+    }
+  }
+  if (victim != 0) {
+    const Vec3 vc = mobs.MobOrigin(victim) + Vec3{2.0f, 12.0f, 2.0f};
+    shoot(vc + Vec3{12.0f, 9.0f, 12.0f}, vc, "aquatic_victim.bmp");
+    std::printf("--shot-aquatic: victim %s, hp %.0f, per limb (lost / at spawn):",
+                mobs.IsAlive(victim) ? "ALIVE" : "DEAD", mobs.TotalHp(victim));
+    if (const Mob* vm = mobs.FindMobById(victim))
+      for (int li = 0; li < vm->LimbCount() && li < (int)victim0.size(); li++) {
+        const uint32_t now = mobs.LimbVoxelCount(victim, li);
+        if (now != victim0[(size_t)li])
+          std::printf(" %d:%d/%u", li, (int)victim0[(size_t)li] - (int)now,
+                      victim0[(size_t)li]);
+      }
+    std::printf("\n");
+  }
+  return ctx.ReportVkValidation("--shot-aquatic") > 0 ? 1 : 0;
+}
+
+// ===========================================================================
 // --shot-strike <attacker>[:limb,...][+item,...] <style> [<target>[...]]
 //
 // ONE BLOW, PHOTOGRAPHED AND COUNTED. --shot-mob answers "what does this body
@@ -5560,6 +5864,7 @@ int main(int argc, char** argv) {
   bool telemetryEnabled = false;
   uint16_t telemetryPort = 8080;
   std::string shotMob;  // --shot-mob <def>[:limb|+item[#RRGGBB],...][@x,z] (pose/wardrobe look)
+  std::string shotAquatic;  // --shot-aquatic <def>[*N][,...][+victim] (the swimmers' hunt)
   // --shot-strike <attacker>[:limb,...][+item,...] <style> [<target>[...]]:
   // the IMPACT look-iteration harness. Three words rather than one colon-
   // separated string because two of them are creature specs that already use
@@ -6050,6 +6355,13 @@ int main(int argc, char** argv) {
     else if (a == "--shot-mob") {
       if (i + 1 >= argc) { std::fprintf(stderr, "--shot-mob requires a mob def\n"); return 1; }
       shotMob = argv[++i];
+    }
+    else if (a == "--shot-aquatic") {
+      if (i + 1 >= argc) {
+        std::fprintf(stderr, "--shot-aquatic wants <def>[*N][,<def>[*N]][+victim|+none]\n");
+        return 1;
+      }
+      shotAquatic = argv[++i];
     }
     else if (a == "--shot-strike") {
       if (i + 2 >= argc) {
@@ -6800,7 +7112,8 @@ int main(int argc, char** argv) {
   }
   if (!selftest && !shot && !shotWaterfall && !shotDebrisPond && !measure && !perf &&
       !fluidBench && !shaderStats &&
-      shotMob.empty() && voxdumpArgs.empty() && !voxserve && exportEdits.empty()) {
+      shotMob.empty() && shotAquatic.empty() && voxdumpArgs.empty() && !voxserve &&
+      exportEdits.empty()) {
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     if (winSizeOverride) glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
@@ -6871,11 +7184,13 @@ int main(int argc, char** argv) {
         selftest || verify || measure || perf || renderBudget || budgetArms ||
         shot || shotFrames || shotWaterfall || shotDebrisPond || shotFluid ||
         shotFluidPond ||
-        fluidBench || shaderStats || !shotMob.empty() || !sweepParam.empty();
+        fluidBench || shaderStats || !shotMob.empty() || !shotAquatic.empty() ||
+        !sweepParam.empty();
     const bool rendersHorizon =
         shot || shotFrames || shotWaterfall || shotDebrisPond || shotFluid ||
         shotFluidPond ||
-        !shotMob.empty() || measure || perf || renderBudget || budgetArms ||
+        !shotMob.empty() || !shotAquatic.empty() || measure || perf ||
+        renderBudget || budgetArms ||
         shaderStats || suiteAcceptance ||
         (selftest && stOpt.only.empty() && !stOpt.list && sweepParam.empty());
     const bool eager = (!checkedOutput && !voxelTool) || rendersHorizon;
@@ -7089,7 +7404,8 @@ int main(int argc, char** argv) {
         selftest || verify || measure || perf || renderBudget || budgetArms ||
         shot || shotFrames || shotWaterfall || shotDebrisPond || shotFluid ||
         shotFluidPond ||
-        fluidBench || shaderStats || !shotMob.empty() || !sweepParam.empty();
+        fluidBench || shaderStats || !shotMob.empty() || !shotAquatic.empty() ||
+        !sweepParam.empty();
     const bool voxelTool = voxserve || !voxdumpArgs.empty() || !exportEdits.empty();
     sim.AllowDeferredFar(!checkedOutput || voxelTool);
     // The specialized raymarch variant follows the same rule and for the same
@@ -7144,6 +7460,9 @@ int main(int argc, char** argv) {
   if (!shotMob.empty())
     return RunMobShot(ctx, world, sim, phys, debris, mobs, items, shotMob,
                       stream, mats);
+  if (!shotAquatic.empty())
+    return RunAquaticShot(ctx, world, sim, phys, debris, mobs, items,
+                          shotAquatic, stream, mats);
   if (!shotStrikeA.empty())
     return RunStrikeShot(ctx, world, sim, phys, debris, mobs, items,
                          shotStrikeA, shotStrikeStyle, shotStrikeB,

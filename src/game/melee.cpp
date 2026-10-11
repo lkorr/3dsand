@@ -836,6 +836,7 @@ StrikeParts BuildStrikeParts(const EdgeSweep& s, const Vec3& at,
   p.bite.power = power;
   p.bite.radiusScale = s.strike.biteRadius;
   p.bite.stainScale = s.strike.biteStain;
+  p.bite.mouthful = s.strike.biteMouthful;
   // THE STRUCK KIND IS NOT HANDED DOWN (2026-09-16): whether teeth REACH flesh
   // depends on what the garment in the way is made of and which limb is under
   // it, and only the thing that was struck knows either.
@@ -1253,10 +1254,17 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
   // over the tick, in world voxels/sec.
   const Vec3 travel = s.bNow - s.bPrev;
   out.tipSpeed = travel.len() / s.dt;
-  if (out.tipSpeed <= t.minSpeed) return out;
+  // JAWS THAT CLOSE UNDER THEIR OWN FORCE (StrikeProfile::biteForce) bite
+  // however slowly the head is moving, at no less than that share of full
+  // power. Every other edge keeps the speed gate.
+  const float jawForce = s.strike.bite > 0.0f
+                             ? std::clamp(s.strike.biteForce, 0.0f, 1.0f)
+                             : 0.0f;
+  if (out.tipSpeed <= t.minSpeed && jawForce <= 0.0f) return out;
   out.power = std::clamp(
       (out.tipSpeed - t.minSpeed) / std::max(t.fullSpeed - t.minSpeed, 1e-3f),
       0.0f, 1.0f);
+  out.power = std::max(out.power, jawForce);
   // THE EDGE HAS TO LEAD. A blade travelling in its own flat is a club: the
   // same speed through the same point does a fraction of the damage, and the
   // difference is the entire reason the stroke driver bothers to roll the

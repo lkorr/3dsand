@@ -14918,6 +14918,203 @@ depending on where I stand; it goes up a ramp as one inclined plank").**
   the plank (`SANDVOX_PRONE_RIGID=1`) is 0% and 95%. `SANDVOX_DRAPE_DEBUG=1`
   prints each segment's joint, supports, wanted and achieved slope per tick.
 
+### Swimmers: the shark and the piranha (2026-10-10; `src/game/mob_swim.cpp`, sidecar `swim`, `ai::Intent::Orbit` / `Charge`, `scripts/gen_fish.mjs`, gate `aquatic`)
+
+The first creatures that live in the water. Owner ask: a medium shark that
+paces round you in a circle, then curves in and charges through you taking a
+large bite, and a small hostile piranha that takes very small bites -- with
+the physics and the rules general enough that more fish are content, not
+code. Nothing in C++ knows what a shark is; every piece below is a mechanism
+a creature opts into with data, and the shark and the piranha are the same
+mechanisms on different numbers.
+
+**A body the water carries** (`MobDef::SwimDef`, sidecar `swim`;
+`MobSystem::SenseWater` / `DriveSwim` / `TickStranded`, `game/mob_swim.cpp`).
+An aquatic creature samples its own wetness every tick -- four points down
+its 3D axis and one on its back, the 3x3x3 mirror first (fresh every tick)
+then the fetch cache the walk drive's ground probe reads, rock neither wet
+nor dry -- and the mode is a Schmitt pair (in at 55% wet, out under 30%), so a
+fish whose dorsal fin breaks the surface does not flicker. While the water
+has it, it is not a walker at all: no ground snap, no gravity, no gait. In
+order, each tick:
+1. **The height it wants becomes a pitch.** The behaviour layer may now say
+   what height a body's centre should travel toward (`ai::IntentOut::
+   altitude`, set by every moving verb for a `SelfView::volumetric` body);
+   the drive turns that into `atan(dy / run)` with the run at least a body
+   length, bounded by `maxPitch`. The waterline and the bed are SOFT walls a
+   voxel early (`surfaceGap`, `bedGap`; the waterline and bed are scanned
+   over the body's column).
+2. **It feels ahead** -- `feel` voxels plus a third of a second of travel down
+   the wanted 3D line from the snout. Rock is a wall, and so is AIR above the
+   waterline (a fish does not swim out by asking); blocked, it takes the
+   nearest clear line of a fan of sixteen (yaw, pitch, both), turning the way
+   it already turns first so two equal escapes do not make it dither.
+3. **Steer.** The yaw is the walker's own `Steer` (turn rate, ramp,
+   `turnRateMoving`); the pitch has its own rate (`pitchRate`).
+4. **Thrust, fins, buoyancy.** Thrust along the 3D axis toward drive x
+   `def.speed` (`accel` up, `brake` down; a turn keeps 35% of the drive so a
+   turn is a curve, never a pivot); sideslip decays at `sideGrip` (the fins
+   hold the line); gravity is cancelled in the wet share by `buoyancy`. The
+   crowd's push (ApplyCrowdSpacing's `driveStrafe_`) is a sidestep of the fins.
+5. **The move** is resolved against samples down the body's own axis and a
+   body-height either side of its middle, and against other bodies
+   (`BlockedByMob`). A refused step is first tried TURNED ASIDE (+-20..80
+   degrees, the turning side first; the velocity turns with it): a fish that
+   meets a wall or a body at speed glances off with most of its speed. Then
+   each axis alone. A body already partly in rock (the yaw is not collision
+   checked, as the walker's is not) may move while no MORE of it goes in --
+   `MoveNoDeeper`'s rule. The waterline is a hard ceiling (the back may just
+   break it) except by `breach` on a charge's run.
+6. **It banks**: the coordinated-turn lean `atan(v w / g)`, scaled by `bank`.
+
+**The pose**: `PoseInputs::attitude` (pitch, roll) is composed on the root in
+the rig frame straight after the clip blend, so every segment rides it; the
+undulation is the snake's `ApplySlither` -- the same wave on the same chain
+geometry -- with its phase on a CLOCK (`SlitherDef::beatHz`): a fish pushes
+on water, which gives way, so the "odometer" runs at the WAVE's speed
+`c = f lambda`, `f = beatHz + v / (slip lambda)` -- the crests run down the
+body faster than it travels and the tail beats while it hangs still;
+amplitude rides the effort (`ampIdle` .. full by `ampSpeed` x speed) and a
+flop whips it. A carangiform fish is `ampHead` 0.08, `ampRamp` 1 (the swing
+grows all the way to the tail). `headLook: false`: a fish looks with its whole
+body.
+
+**Out of the water** (`TickStranded`): the walker's gravity (`UpdateFall`)
+and ground settle with a drive of zero (it cannot walk, whatever a verb
+asks); the body eased onto a flank (roll 1.45, `PoseInputs::bodyDrop` lowers
+it by the trunk's height minus its width); a FLOP every `flopMin..flopMax`
+seconds -- a `Launch` toward the nearest liquid it can feel along eight
+bearings within `flopReach`, at body height and DOWN over an edge (a fish on
+a ledge feels the water below it), else anywhere, and it may land on its
+other flank; and after `breathSeconds` the breath runs out at `suffocateHp`
+a second through `SpendHp` with the new **`DamageCause::Asphyxia`** (Electric's
+sever/bleed rows: hp, no wound, no bleed; "suffocated" on the death screen).
+A breach is a real arc: leaving the water hands the swim velocity to the
+walker's ballistic state, and entering it again hands it back, damped.
+
+**The circling hunter** (`ai::OrbitTuning`, the profile's `orbit` block;
+`Intent::Orbit`, `Intent::Charge`). Two verbs, appended at the end of the
+verb set so every older profile is untouched:
+- **Orbit**: nose-first round the target (where `CircleStrafe` sidesteps
+  round it facing in, a duelist's footwork) -- PURE PURSUIT of a point
+  `lookahead` radians further round the circle than the body is, so from
+  outside it spirals in, from inside it spirals out, on it the nose leads the
+  tangent: the radius corrects itself and the path is a curve. A lap is drawn
+  per (id, lap): its radius (+-`radiusJitter`), its height over the target
+  (`height`: the shark circles SIX voxels above a man's middle, which the
+  waterline clamps to just under the surface -- the dorsal fin cuts the water
+  as it circles), its length (`lapMin..lapMax` ticks before a pass may begin),
+  and its direction -- the way the body is already going on the first lap and
+  after a pass, and turned round with `reverseChance` between passes: the
+  pacing back and forth.
+- **Charge**: the pass. (1) TURN-IN: curve off the circle toward where the
+  target WILL be (`lead` of its motion over the run), at `turnInSpeed` but no
+  faster than the speed whose turning circle reaches it (`v = 0.65 w d /
+  (2 sin err)`: a target inside the turning circle is orbited, not charged);
+  a turn-in that has not lined up in half of `passMax` is abandoned for
+  another lap. (2) THE RUN: inside `lineUp` of the line, drive at
+  `chargeSpeed` (the body's own `swim.burst` caps it); inside `lockDist` of
+  the target's skin the line stops homing. THE BITE IS THROWN FROM THE RUN --
+  an ordinary attack request (styles, cadence, the stroke system), but with no
+  commit: no FaceTarget lock, no planted feet -- once the snout is
+  `biteLead` ticks of its ACTUAL closing speed from the skin and the jaws'
+  line runs through the body (the target's half-width plus a mouth either
+  side of it; an angle to the target's CENTRE says nothing at that range).
+  (3) THE OVERRUN: once the jaws have closed the line turns `peel` off its
+  own the way the next lap runs, and holds until `overrun` voxels out; then
+  the next lap begins the way the body is going. One bite per pass.
+  `SANDVOX_PASS_TRACE=1` prints every tick of every pass's geometry.
+
+**Contact for a bite** (`MobSystem::SwimStrikeTarget`). Through a swimmer's
+windup and cut its stroke's target is not a wall to it, and it is not
+spaced off by the crowd push, either way round: two capsules otherwise held
+the jaws a body-width off what they were closing on, and the victim was
+shoved out of its own bite. Only a swimmer: a walker's pounce is meant to
+stop at contact. And a body whose rest box is mostly FINS is not a fat disc:
+`MobDef::capsuleRadius` (sidecar `capsuleRadius`; a swimmer derives it from
+its trunk, `swim.trunkHalfW/H`, which `gen_fish.mjs` writes from the profile's
+widest section) -- a shark's pectorals span four times its trunk.
+
+**What it hunts** (`ai::Perception`): `minImmersion` -- a stranger is only a
+target while that much of it is in liquid (`ai::Actor::immersion`, sampled at
+three heights down every actor's column off the mirror and the cache, never
+asking for a fetch: a watcher's question must not queue behind a ground
+probe); climb out and it loses you as it loses a target behind a wall.
+`scentRange` / `scentPull` -- a BLEEDING body (`Actor::bleeding`,
+`Mob::Bleeding`) in the water is felt from further than it is seen, with no
+cone and no line of sight, and preferred over a dry one. New rule facts
+`immersion`, `targetImmersion`, `targetBleeding`: the piranha's FRENZY is one
+rule (`targetBleeding > 0` -> cadence x0.45, speed x1.25), the shark's
+boldness another. A swimmer's distances are 3D (`ai::SelfView::volumetric`),
+it never asks the ground navigator (there is no floor to route over; the
+drive feels its own way), and its idle wander draws each leg's height too
+(`wander.depth`).
+
+**The bite: a mouthful, and jaws that close by their own force.** Two strike
+profile fields on the natural weapon. `strike.biteForce` (0..1): a floor on
+the blow's power, and the sweep runs however slowly the head is moving --
+every bite in the engine was as strong as the swing was fast (the melee speed
+ramp, 0.9..20 m/s), which put a shark's 3 m/s nose at a tenth of its bite;
+a bite is jaw muscle. `strike.mouthful`: the same torn ball also comes out of
+every OTHER limb of the victim within `mouthful` hole-radii of the bite --
+at 0.7 of the hole, and half that again on a VITAL limb (a carve charges hp
+per voxel, and a mouthful through a torso stopped hearts in one closing of
+the jaws). Collected by handle, run on every exit of `Mob::BiteHit`, bled and
+severed-by-collapse as a bitten limb is. `strike.biteRadius` now reaches 8.
+Measured in the gate: a shark bite takes about 290 art voxels across two
+limbs; a piranha nip about 2.
+
+**The bodies are a table** (`scripts/gen_fish.mjs`, the sidecar's `fishgen`
+block). A cross-section profile along the body ([t, half-width, half-height,
+centre line] from the peduncle to the snout), cut into segments by station,
+a lower JAW split off the head along a mouth line (its own limb, hinged at
+the gape: the bite clip drops it 42 degrees and snaps it shut), and fins as
+tapering plates -- dorsal and anal keels, pelvic and pectoral pairs (the
+pectorals can be their own limbs: they flap and come off), a forked or
+heterocercal caudal -- coated with countershading, eyes, gill slits,
+nostrils, teeth along the mouth line, spots, a coloured throat. It writes
+back `limbs` (names, parents, hp, tags, anchors), `root`, the jaws' `edge`,
+`swim.wave.parts` and the trunk section; everything else in the sidecar is
+authored. A new fish is a sidecar and `node scripts/gen_fish.mjs <name>`.
+
+**The two creatures.** SHARK (`assets/mobs/shark.*`): 2.2 m at 40 art
+voxels/m, eight limbs, ~770 hp, cruise 1.4 m/s, charge 2.6x; circles at
+19 voxels for 5-11 s a lap, paces, charges, bites (`shark_bite`: 70 hp at
+jaw force 0.85, a 2.6 x 0.45-voxel hole and a 1.15 mouthful), goes past;
+blood in the water makes it bolder; under a quarter of its life it breaks
+off. PIRANHA (`assets/mobs/piranha.*`): 0.38 m at 80/m, ~34 hp, quick to
+turn and to accelerate; circles a body-width out on 0.3-1.3 s laps and darts
+in for a NIP (`piranha_nip`: 4 hp, a 0.55 hole -- a couple of a human's art
+voxels); in a shoal they spread round the victim and frenzy once it bleeds
+(and nip each other when a dart crosses a neighbour). Both spawn from the dev
+panel's Mob tool (place one in a lake) and F1 -> Creatures; no biome spawns
+creatures yet.
+
+**`--shot-aquatic <def>[*N][,...][+victim|+none]`** (main.cpp) stamps a stone
+pool into the harness ground, drops the swimmers round a victim standing
+chest-deep (a `dummy` statue), runs the real tick, traces every swimmer every
+10 ticks (intent, pass phase, gap, depth under the waterline, pitch, bank,
+passes, bites) and every bite stroke's tally, and writes frames
+(`aquatic_NN.bmp`) and close-ups of the first bites' gape and snap
+(`aquatic_biteN_a/b.bmp`).
+
+**Gate `aquatic`** (`src/test/selftest_aquatic.cpp`), one stamped pool, four
+claims: A the shark swims every tick and never leaves the water's slab,
+sweeps at least half a lap before its first pass, charges (peak speed
+>= 1.7x cruise), bites from the run, takes real chunks of the man across
+more than one limb, and goes PAST him after every bite (10+ voxels away
+within 75 ticks); B six piranha nip many times, each nip a small fraction of
+a shark bite; C a man standing dry on the bank is never targeted while the
+shark patrols; D a piranha on a ledge over the water lies on its flank, flops
+and gets itself back in, and one on the dry bank suffocates (Asphyxia).
+Thresholds in `tests/baseline.json` (`aquatic*`).
+
+**Not yet**: no biome spawns them; the wave yaws only (a pitch wave for a
+whale-like fluke is one more axis); a stranded fish's lower pectoral pokes
+into the ground; schooling is the crowd push alone (no alignment term); a
+remote peer's ghost fish is posed from its owner's limb transforms, which
+carry the attitude, but the swim state itself is not on the wire.
+
 ### Combat feel: hit-stop, hit flash, and the three melee cues (2026-08-31; `sim/tuning.h` `Tuning::CombatFx`, `audio/cues.*`, `assets/shaders/microbody.wgsl`)
 
 **Everything in this section is PRESENTATION, and the separation is

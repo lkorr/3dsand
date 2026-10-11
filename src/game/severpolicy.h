@@ -125,6 +125,11 @@ inline constexpr CauseRow kCauseRows[] = {
   // sets hair alight burns through FlushBurn, which books Burn, not this row.
   {DamageCause::Electric, false, true,  BleedRate::None,    false, true,  true,  true,  false, JointRule::Always,     false, true,  true,  true,  false, false, false},
   {DamageCause::Electric, true,  true,  BleedRate::None,    false, true,  true,  true,  false, JointRule::IfInfected, true,  false, false, false, true,  false, false},
+  // ASPHYXIA (a fish out of water, Mob::TickBreath): Electric's rows, for
+  // Electric's reason -- suffocating opens no wound, so it charges no bleed
+  // budget and nothing it charges carves.
+  {DamageCause::Asphyxia, false, true,  BleedRate::None,    false, true,  true,  true,  false, JointRule::Always,     false, true,  true,  true,  false, false, false},
+  {DamageCause::Asphyxia, true,  true,  BleedRate::None,    false, true,  true,  true,  false, JointRule::IfInfected, true,  false, false, false, true,  false, false},
 };
 // clang-format on
 

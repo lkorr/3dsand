@@ -37,6 +37,9 @@ enum class DamageCause : uint8_t {
               // `infect` block with "cause": "burn" -- the rot -- books Burn)
   Electric,   // a shock: the charge field through a body (MobSystem::ApplyShocks,
               // docs/PLAN_electricity.md E4). Hp only -- no wound, no bleed
+  Asphyxia,   // a body that cannot breathe where it is: a fish stranded out of
+              // water (Mob::TickBreath, MobDef::SwimDef::breathSeconds). Hp
+              // only -- no wound, no bleed, Electric's rows
   Count
 };
 
@@ -57,6 +60,7 @@ constexpr const char* DamageCauseName(DamageCause c) {
     case DamageCause::Fall: return "fall";
     case DamageCause::Infection: return "infection";
     case DamageCause::Electric: return "electric";
+    case DamageCause::Asphyxia: return "asphyxia";
     case DamageCause::Count: break;
   }
   return "?";

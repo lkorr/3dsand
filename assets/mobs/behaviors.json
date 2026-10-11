@@ -605,6 +605,63 @@
         "dodge": { "weight": 1.5, "cooldownTicks": 10, "minDwellTicks": 6 },
         "goto": { "weight": 1.0, "cooldownTicks": 0, "minDwellTicks": 0 }
       }
+    },
+    {
+      "comment": "THE SHARK (assets/mobs/shark.json, DESIGN.md \"Swimmers\"). A circling hunter: it never stops to bite. It comes in on its band (approach), then ORBITS the target nose-first -- a lap at 14 voxels give or take a fifth, 0.7 of its cruise, a voxel below the target's middle -- and PACES: every lap may turn it round and send it back the other way. When the lap is spent and its attack clock is ready it CHARGES: curves off the circle onto where you will be, drives down the line at 2.6x its cruise (its burst ceiling, swim.burst, caps it), throws the bite seven ticks short of contact so the jaws are open when they arrive, and goes THROUGH -- the line locks inside 5 voxels -- out to 14 past you, then curves round onto the next lap the way it was already going.",
+      "//medium": "minImmersion 0.3: a man on the bank or wading to the ankles is not prey; one in to the waist is. Climb out and it loses you (the alert decays) and goes back to patrolling. scentRange 90: a BLEEDING body in the water is felt from three times as far as it is seen, without a line of sight, and is preferred over a dry one by 30 voxels -- blood in the water.",
+      "//rules": "Blood in the water makes it bolder (laps a third shorter through the cadence, a little faster); badly hurt, it breaks off.",
+      "name": "shark",
+      "label": "Shark",
+      "color": 3233844352,
+      "faction": "sea",
+      "hysteresis": 0.3,
+      "perception": { "sightRange": 48, "fovDegrees": 320, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 150, "keepRangeScale": 1.4, "minImmersion": 0.3, "scentRange": 90, "scentPull": 30 },
+      "movement": { "mobile": true, "rangeMin": 0, "rangeMax": 30, "bandSlack": 3, "approachSpeed": 1.0, "strafeSpeed": 0, "retreatSpeed": 0, "fleeSpeed": 1.6, "circleTendency": 0,
+                    "wander": { "radius": 28, "speed": 0.55, "pauseMin": 0, "pauseMax": 20, "arrive": 4, "depth": 4 } },
+      "orbit": { "radius": 19, "radiusJitter": 0.15, "speed": 0.7, "height": 6, "heightJitter": 1, "lookahead": 0.55, "engage": 2.0,
+                 "lapMin": 150, "lapMax": 320, "reverseChance": 0.4,
+                 "chargeSpeed": 2.6, "turnInSpeed": 1.0, "lineUp": 0.45, "lead": 0.8, "lockDist": 5, "overrun": 14, "peel": 0.55, "biteCone": 0.6, "passMax": 150, "biteLead": 7, "hitHeight": 0 },
+      "attack": { "styles": ["shark_bite"], "reach": 24, "aimTolerance": 3.2, "cadenceTicks": 60, "jitterTicks": 30, "commitTicks": 6, "disengageTicks": 0, "pursueSpeed": 0, "leadTicks": 0 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "wander": { "weight": 0.5, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 0.1, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "approach": { "weight": 1.3, "cooldownTicks": 0, "minDwellTicks": 10 },
+        "orbit": { "weight": 1.0, "cooldownTicks": 0, "minDwellTicks": 20 },
+        "charge": { "weight": 2.5, "cooldownTicks": 30, "minDwellTicks": 8 },
+        "flee": { "weight": 0.0, "cooldownTicks": 0, "minDwellTicks": 30 }
+      },
+      "rules": [
+        { "note": "blood in the water: bolder", "when": { "targetBleeding": ">0" }, "tune": { "cadence": 0.65, "speed": 1.1 } },
+        { "note": "badly hurt: break off", "when": { "hp": "<0.25" }, "weight": { "flee": 3.0, "charge": 0 } }
+      ]
+    },
+    {
+      "comment": "THE PIRANHA (assets/mobs/piranha.json). The SAME two verbs as the shark with a piranha's numbers: it circles a body-width out on short, jittery laps that reverse two times in five, and darts in every half second or so for a NIP -- a hole a couple of art voxels across (strike.biteRadius 0.55) -- overrunning by a body length and coming straight back. One is a nuisance. A shoal is a death by a thousand cuts, and the crowd spacing (MobSystem::ApplyCrowdSpacing, the swim drive's sidestep) spreads them round the victim instead of stacking them on one spot.",
+      "//frenzy": "FRENZY: once the target bleeds (Fact::TargetBleeding) every piranha in range smells it (scentRange 60, no line of sight needed), laps shrink through the cadence (x0.45) and it swims harder. That is the whole feeding frenzy -- one rule, no code.",
+      "name": "piranha",
+      "label": "Piranha",
+      "color": 3224399999,
+      "faction": "sea",
+      "hysteresis": 0.25,
+      "perception": { "sightRange": 22, "fovDegrees": 360, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 120, "keepRangeScale": 1.5, "minImmersion": 0.2, "scentRange": 60, "scentPull": 15 },
+      "movement": { "mobile": true, "rangeMin": 0, "rangeMax": 10, "bandSlack": 1.5, "approachSpeed": 1.0, "strafeSpeed": 0, "retreatSpeed": 0, "circleTendency": 0,
+                    "wander": { "radius": 8, "speed": 0.5, "pauseMin": 0, "pauseMax": 15, "arrive": 1.5, "depth": 2 } },
+      "orbit": { "radius": 4.5, "radiusJitter": 0.35, "speed": 0.8, "height": 0, "heightJitter": 3, "lookahead": 0.75, "engage": 2.2,
+                 "lapMin": 10, "lapMax": 40, "reverseChance": 0.4,
+                 "chargeSpeed": 2.4, "turnInSpeed": 1.3, "lineUp": 0.6, "lead": 0.5, "lockDist": 1.5, "overrun": 5, "peel": 0.6, "biteCone": 0.9, "passMax": 50, "biteLead": 3, "hitHeight": 0 },
+      "attack": { "styles": ["piranha_nip"], "reach": 10, "aimTolerance": 3.2, "cadenceTicks": 16, "jitterTicks": 12, "commitTicks": 4, "disengageTicks": 0, "pursueSpeed": 0, "leadTicks": 0 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "wander": { "weight": 0.5, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 0.1, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "approach": { "weight": 1.3, "cooldownTicks": 0, "minDwellTicks": 6 },
+        "orbit": { "weight": 1.0, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "charge": { "weight": 2.5, "cooldownTicks": 6, "minDwellTicks": 4 }
+      },
+      "rules": [
+        { "note": "FRENZY: blood in the water", "when": { "targetBleeding": ">0" }, "tune": { "cadence": 0.45, "speed": 1.25 } }
+      ]
     }
   ]
 }

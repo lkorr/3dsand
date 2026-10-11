@@ -1826,8 +1826,11 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
     // is the rig's origin, so the lateral offset has to be put on it rather
     // than inherited). Nothing here is per-creature code: any rig that names
     // a chain gets the wave.
-    if (j.contains("slither") && j["slither"].is_object()) {
-      const json& sj = j["slither"];
+    // ONE PARSER, TWO KEYS: the snake's `slither` and a swimmer's `swim.wave`
+    // are the same wave on the same chain geometry; only the phase source
+    // differs (SlitherDef::beatHz), and that is one more number in the block.
+    auto parseWave = [&](const json& sj, const char* what,
+                         MobDef::SlitherDef& out) {
       MobDef::SlitherDef sd;
       const float prefabInv = 1.0f / (float)def.skinScale;
       float zTip = -1e9f, zTail = 1e9f;
@@ -1837,7 +1840,7 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
         const int pi = sk.FindPart(pn);
         const int mi = FindModel(def.prefab, pn);
         if (pi < 0 || mi < 0) {
-          log += jp + ": slither names unknown part \"" + pn + "\"\n";
+          log += jp + ": " + what + " names unknown part \"" + pn + "\"\n";
           continue;
         }
         const PrefabModel& m = def.prefab.models[mi];
@@ -1865,11 +1868,71 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
         num("turnBend", sd.turnBend, 0.0f, 2.0f);
         num("maxCurvature", sd.maxCurvature, 0.0f, 2.0f);
         num("bendHalfLife", sd.bendHalfLife, 0.01f, 2.0f);
-        def.slither = std::move(sd);
+        num("beatHz", sd.beatHz, 0.0f, 12.0f);
+        num("slip", sd.slip, 0.1f, 1.0f);
+        num("ampIdle", sd.ampIdle, 0.0f, 1.0f);
+        num("ampSpeed", sd.ampSpeed, 0.05f, 4.0f);
+        out = std::move(sd);
       } else {
-        log += jp + ": slither needs at least three parts laid along +Z\n";
+        log += jp + ": " + what + " needs at least three parts laid along +Z\n";
+      }
+    };
+    if (j.contains("slither") && j["slither"].is_object())
+      parseWave(j["slither"], "slither", def.slither);
+
+    // ---- A BODY THE WATER CARRIES (mob.h MobDef::SwimDef) ----------------
+    // Every number clamped to a range a body can have; an unknown key is
+    // ignored like every other block's.
+    if (j.contains("swim") && j["swim"].is_object()) {
+      const json& wj = j["swim"];
+      MobDef::SwimDef& sw = def.swim;
+      sw.present = true;
+      auto num = [&](const char* k, float& v, float lo, float hi) {
+        v = std::clamp(wj.value(k, v), lo, hi);
+      };
+      num("pitchRate", sw.pitchRate, 0.0f, 12.0f);
+      num("maxPitch", sw.maxPitch, 0.0f, 1.55f);
+      num("accel", sw.accel, 0.0f, 1000.0f);
+      num("brake", sw.brake, 0.0f, 1000.0f);
+      num("sideGrip", sw.sideGrip, 0.0f, 60.0f);
+      num("burst", sw.burst, 0.0f, 8.0f);
+      num("buoyancy", sw.buoyancy, 0.0f, 3.0f);
+      num("surfaceGap", sw.surfaceGap, -16.0f, 32.0f);   // < 0: the back rides out
+      num("bedGap", sw.bedGap, 0.0f, 32.0f);
+      num("breach", sw.breach, 0.0f, 32.0f);
+      num("feel", sw.feel, 0.0f, 32.0f);
+      num("bank", sw.bank, 0.0f, 4.0f);
+      num("maxRoll", sw.maxRoll, 0.0f, 1.55f);
+      num("breathSeconds", sw.breathSeconds, 0.0f, 3600.0f);
+      num("suffocateHp", sw.suffocateHp, 0.0f, 1000.0f);
+      num("flopMin", sw.flopMin, 0.05f, 30.0f);
+      num("flopMax", sw.flopMax, sw.flopMin, 30.0f);
+      num("flopRise", sw.flopRise, 0.0f, 10.0f);
+      num("flopSpeed", sw.flopSpeed, 0.0f, 10.0f);
+      num("flopReach", sw.flopReach, 0.0f, 24.0f);
+      if (wj.contains("wave") && wj["wave"].is_object())
+        parseWave(wj["wave"], "swim.wave", sw.wave);
+      // The trunk's own section, fins excluded (SwimDef::trunkHalfW): the
+      // sidecar's when it states one (gen_fish.mjs writes the profile's
+      // widest section), else the root segment's box -- which includes any
+      // fin on that segment, so it is the fallback, not the rule.
+      if (wj.contains("trunkHalfW") && wj.contains("trunkHalfH")) {
+        sw.trunkHalfW = std::clamp(wj.value("trunkHalfW", 0.5f), 0.1f, 64.0f);
+        sw.trunkHalfH = std::clamp(wj.value("trunkHalfH", 0.5f), 0.1f, 64.0f);
+      } else if (def.rootLimb >= 0 && def.rootLimb < (int)def.limbs.size()) {
+        const int rm = FindModel(def.prefab, def.limbs[def.rootLimb].name);
+        if (rm >= 0) {
+          const PrefabModel& m = def.prefab.models[rm];
+          const float inv = 1.0f / (float)def.skinScale;
+          sw.trunkHalfW = std::max(0.25f, (float)m.size.x * inv * 0.5f);
+          sw.trunkHalfH = std::max(0.25f, (float)m.size.y * inv * 0.5f);
+        }
       }
     }
+    def.headLook = j.value("headLook", def.headLook);
+    def.capsuleRadius = std::max(0.0f, j.value("capsuleRadius", 0.0f));
+    if (def.capsuleRadius <= 0.0f && def.swim.present)
+      def.capsuleRadius = std::max(def.swim.trunkHalfW, def.swim.trunkHalfH);
 
     // ---- sockets: where a held ITEM attaches (mob.h MobSocketDef) --------
     //
@@ -1976,8 +2039,14 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
           nw.strike.bluntCarve = s2.value("bluntCarve", 0.0f);
           nw.strike.armorBreak = s2.value("armorBreak", 0.0f);
           nw.strike.bite = s2.value("bite", 0.0f);
+          // Up to 8 (2026-10-10): a shark's jaws take a mouthful, not a
+          // nip -- 8 x gore.biteRadius is a 3.6-voxel ball at full power.
           nw.strike.biteRadius =
-              std::clamp(s2.value("biteRadius", 1.0f), 0.05f, 4.0f);
+              std::clamp(s2.value("biteRadius", 1.0f), 0.05f, 8.0f);
+          nw.strike.biteMouthful =
+              std::clamp(s2.value("mouthful", 0.0f), 0.0f, 3.0f);
+          nw.strike.biteForce =
+              std::clamp(s2.value("biteForce", 0.0f), 0.0f, 1.0f);
           nw.strike.biteStain =
               std::clamp(s2.value("biteStain", 1.0f), 0.0f, 4.0f);
         }
@@ -7084,6 +7153,15 @@ void MobSystem::PublishCombatant(const Mob& m, ai::Actor& a) const {
   float hw = 0.0f;
   a.haveTip = a.armed && m.WeaponEdge(eb, et, hw);
   if (a.haveTip) a.tip = et;
+  // WHERE IT IS, AS A FISH SEES IT (ai::Actor::immersion / bleeding):
+  // Perception::minImmersion and scentRange, Fact::TargetImmersion /
+  // TargetBleeding. Three cells down the body's column for every actor, the
+  // swimmer's own sense for a swimmer.
+  a.immersion = m.def_ != nullptr && m.def_->swim.present ? m.immersion_
+                                                          : BodyImmersion(m);
+  a.bleeding = m.Bleeding();
+  a.velocity = m.swimming_ ? m.swimVel_
+                           : Vec3{m.anim_.velocity.x, 0.0f, m.anim_.velocity.z};
 }
 
 float MobSystem::AttackReachOf(const Mob& mob) const {
@@ -7165,6 +7243,20 @@ static void MobBasis(const Mob& mob, Vec3& right, Vec3& up, Vec3& fwd) {
   fwd = fwd.len() > 1e-4f ? fwd.normalized() : Vec3{0, 0, 1};
   right = fwd.cross(up);
   right = right.len() > 1e-4f ? right.normalized() : Vec3{-1, 0, 0};
+  // A SWIMMER'S FRAME PITCHES WITH IT (MobDef::SwimDef). Its body is posed
+  // nose-up or nose-down about its own lateral axis (PoseInputs::attitude),
+  // so a bite expressed about level would ask the jaws for an elevation the
+  // head does not have -- the prone body's problem above, about the other
+  // axis. Same chirality: right = fwd x up, up = right x fwd.
+  if (mob.Swimming() && std::fabs(mob.SwimPitch()) > 1e-4f) {
+    const Vec3 f3 = mob.Forward3();
+    Vec3 r3 = f3.cross(Vec3{0, 1, 0});
+    if (r3.len() > 1e-4f) {
+      fwd = f3.normalized();
+      right = r3.normalized();
+      up = right.cross(fwd).normalized();
+    }
+  }
 }
 
 void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
@@ -7436,7 +7528,11 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     const ai::Profile* lpr = behaviors_.At(mob.ai_.profile);
     const bool fromHead = lpr != nullptr && lpr->attack.muzzleCone > 0.0f;
     Vec3 to = st.targetPoint - (fromHead ? shoulder : centre);
-    to.y = 0;
+    // A SWIMMER SURGES IN 3D (Mob::SwimSurge): there is no ground to leap
+    // off and nothing to fall back onto, so the lunge goes straight at the
+    // point, vertical and all, and the water's drag takes it back off.
+    const bool surge = mob.Swimming();
+    if (!surge) to.y = 0;
     if (fromHead) {
       const Vec3 fw = mob.Facing();
       if (to.x * fw.x + to.z * fw.z <= 0.0f) to = Vec3{};
@@ -7497,8 +7593,12 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     const float mag = std::min(MetresPerSecToCells(sty->lunge.speed) * scale,
                                std::max(0.0f, want));
     const Vec3 dir = dist > 1e-3f ? to * (1.0f / dist) : mob.Facing();
-    mob.Launch(Vec3{dir.x * mag, MetresPerSecToCells(sty->lunge.rise) * scale,
-                    dir.z * mag});
+    if (surge)
+      mob.SwimSurge(dir * std::min(MetresPerSecToCells(sty->lunge.speed) * scale,
+                                   std::max(0.0f, dist / std::max(airTime, 1e-3f))));
+    else
+      mob.Launch(Vec3{dir.x * mag, MetresPerSecToCells(sty->lunge.rise) * scale,
+                      dir.z * mag});
   }
 
   // ---- 4. drive the phase — the SHARED runner (game/strokes.cpp) -----------
@@ -7584,6 +7684,8 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
                              float dt) {
   mob.driveScale_ = 1.0f;
   mob.driveStrafe_ = 0.0f;
+  mob.altitudeSet_ = false;   // a swimmer holds its depth unless asked
+  mob.breachOk_ = false;
   // ---- SHOCKED (docs/PLAN_electricity.md E4) --------------------------------
   // A stunned body neither moves nor attacks: the drive is zeroed, the heading
   // held, any stroke in flight dropped and any attack the AI asks for this
@@ -7638,7 +7740,10 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     // that says its blow leaves from the head (AttackTuning::muzzleCone): the
     // striking joint projected on the heading. The rest length of the body
     // ahead of the centre when the pose cannot answer.
-    if (prof != nullptr && prof->attack.muzzleCone > 0.0f) {
+    // ...and for a circling hunter, whose pass measures the bite from the
+    // jaws (ai_behavior.cpp Intent::Charge).
+    if (prof != nullptr &&
+        (prof->attack.muzzleCone > 0.0f || prof->orbit.radius > 0.0f)) {
       const Vec3 c = mob.origin_ + def.worldSize * 0.5f;
       const Vec3 fw = mob.Facing();
       Vec3 pv{};
@@ -7651,6 +7756,15 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     // (ai_behavior.h "RULES"): the facts a creature's character can hinge on.
     mob.BodyFacts(self.hpFrac, self.burningFrac, self.limbsLost);
     self.shocked = (float)mob.StunTicksLeft(tick);
+    // A BODY THE WATER CARRIES (MobDef::SwimDef): 3D distances, no ground
+    // navigator, and an altitude to ask for (ai_behavior.h SelfView).
+    self.volumetric = def.swim.present && mob.swimming_;
+    self.immersion = mob.immersion_;
+    self.pitch = self.volumetric ? mob.pitch_ : 0.0f;
+    self.velocity = mob.swimming_ ? mob.swimVel_
+                                  : Vec3{mob.anim_.velocity.x, 0.0f,
+                                         mob.anim_.velocity.z};
+    self.length = def.worldSize.z;
     // What is in its hand: a held item arms it AND lets it guard (the parry
     // test is blade on blade — MobSystem::FindParry skips anything unarmed).
     self.armed = !mob.HeldItem().empty();
@@ -7695,13 +7809,18 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
       // out of Think, because it is not an INTENT — the AI has no opinion
       // about necks, and giving it one would be the closed-ended-system rule
       // 4 failure in miniature.
-      if (mob.ai_.hasTarget && mob.ai_.visible)
+      // A body that looks with its whole self (MobDef::headLook false: a
+      // fish) does not turn its head on its trunk.
+      if (mob.ai_.hasTarget && mob.ai_.visible && def.headLook)
         mob.SetAimLook(mob.ai_.targetPos);
       else
         mob.ClearAimLook();
       mob.desiredHeading_ = out.desiredHeading;
       mob.driveScale_ = out.driveScale;
       mob.driveStrafe_ = out.driveStrafe;
+      mob.altitudeSet_ = out.altitudeSet;
+      mob.altitudeWant_ = out.altitude;
+      mob.breachOk_ = out.breach;
       // A CONTAINED DEMON'S BLOW ACROSS ITS RING IS REFUSED (mobfence.h).
       if (out.attack &&
           !fence_.Allows(mob.id_, MobFence::Blow, mob.origin_.x + def.worldSize.x * 0.5f,
@@ -8029,6 +8148,14 @@ MobSystem::Capsule MobSystem::BodyCapsule(const MobDef& def) {
   Capsule c;
   const float hx = std::max(0.0f, def.worldSize.x * 0.5f);
   const float hz = std::max(0.0f, def.worldSize.z * 0.5f);
+  // AN AUTHORED (or swimmer-derived) GIRTH (MobDef::capsuleRadius): the
+  // segment runs the body's length, the radius is the trunk's.
+  if (def.capsuleRadius > 0.0f) {
+    c.alongFacing = hz >= hx;
+    c.radius = def.capsuleRadius;
+    c.halfLen = std::max(0.0f, std::max(hx, hz) - def.capsuleRadius);
+    return c;
+  }
   const float a = std::max(hx, hz), b = std::min(hx, hz);
   const float disc = BodyRadius(def);
   c.alongFacing = hz >= hx;
@@ -8164,8 +8291,12 @@ Vec3 MobSystem::CrowdPush(const Mob& self, const MobDef& selfDef) const {
   // the crowd, and an NPC that walked through it was the list-shaped bug this
   // package removes. The avatars add at most kMaxPlayerProxies more entries.
   // An unspawned avatar (no limbs) is not standing anywhere.
+  const Mob* biting = SwimStrikeTarget(self);
   ForEachCreature([&](const Mob& other) {
     if (&other == &self) return;
+    // A swimmer's jaws closing on it, either way round: no spacing (the
+    // victim is not shoved out of the bite it is about to take).
+    if (&other == biting || SwimStrikeTarget(other) == &self) return;
     if (!other.alive_ || other.def_ == nullptr || other.limbs_.empty()) return;
     // A limp body is lying down and is not part of a crowd — it is scenery,
     // and the walk drive steps over prone things rather than round them.
@@ -8269,9 +8400,16 @@ bool MobSystem::BlockedByMob(const Mob& self, const MobDef& def, float cx,
   const Capsule capSelf = BodyCapsuleOf(self, def);
   const float rSelf = capSelf.radius;
   const Vec3 cNow = BodyCentre(self, def);
+  // A SWIMMER'S BITE REACHES SKIN (MobSystem::SwimStrikeTarget): through the
+  // windup and the cut its stroke's target is not a wall to it, or the two
+  // capsules keep its jaws a body-width off what they are closing on. Only a
+  // swimmer: a walker's pounce is MEANT to stop at contact (StepStroke's
+  // lunge note) and does.
+  const Mob* biting = SwimStrikeTarget(self);
   // Every creature (CrowdPush's note): a player's body is a body.
   return FirstCreature([&](const Mob& other) -> bool {
     if (&other == &self) return false;
+    if (&other == biting || SwimStrikeTarget(other) == &self) return false;
     if (!other.alive_ || other.def_ == nullptr || other.limbs_.empty())
       return false;
     if (other.ragdoll_ != Mob::RagdollPhase::None) return false;
@@ -8567,6 +8705,28 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
   in.gaitClips = true;
   in.guardPump = mob.stroke_.Active() &&
                  mob.stroke_.phase == NpcStroke::Phase::Guard;
+  // ---- AN AQUATIC BODY (MobDef::SwimDef) -----------------------------------
+  // Never grounded (it has no gait to plant and no feet to own its height:
+  // the driver's origin IS the body, in the water and on the bank alike), no
+  // air pose, no stride clips. What it has instead is an ATTITUDE -- the swim
+  // pitch and bank, or lying on its flank -- and its wave on a clock.
+  if (def.swim.present) {
+    if (mob.swimming_) in.velocity = mob.swimVel_;
+    in.grounded = false;
+    in.airPoseEligible = false;
+    in.height = PoseInputs::Height::FromDriver;
+    in.tiltFromGround = false;
+    in.gaitClips = false;
+    in.attitude = true;
+    in.attPitch = mob.pitch_;
+    in.attRoll = mob.roll_;
+    // On a flank the trunk rests on its half-WIDTH, not its half-height.
+    in.bodyDrop = mob.swimming_ ? 0.0f
+                                : (def.swim.trunkHalfH - def.swim.trunkHalfW) *
+                                      std::fabs(std::sin(mob.roll_));
+    in.swimWave = true;
+    in.waveKick = mob.flopKick_;
+  }
   mob.PosePipeline(in, dt, world, tick);
 }
 
@@ -8946,7 +9106,15 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       // THIS is the NPC driver — the block the avatar replaces with player
       // input; everything else in this loop is shared Mob mechanics.
       burnprof::Scope bpSense(burnprof::kSense);
-      GroundSense sense = SenseGround(mob, def, world);
+      // AN AQUATIC BODY FIRST ASKS WHETHER THE WATER HAS IT (MobDef::SwimDef):
+      // while it does there is no floor to sense -- the AI gets an empty fan
+      // (no ground, so Deflect is a no-op) and the swim drive feels for rock
+      // in three dimensions itself.
+      const bool aquatic = def.swim.present;
+      if (aquatic) SenseWater(mob, def, world);
+      const bool swimNow = aquatic && mob.swimming_;
+      GroundSense sense =
+          swimNow ? GroundSense{} : SenseGround(mob, def, world);
       bpSense.Stop();
       // THE ARBITER RAN. Counted here and nowhere else: a ghost gate that
       // measured "it did not move" would pass on a creature whose AI ran and
@@ -8965,12 +9133,22 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       ApplyCrowdSpacing(mob, def);
       bpCrowd.Stop();
       burnprof::Scope bpDrive(burnprof::kDrive);
-      float align = Steer(mob, def, dt);
-      // Gravity first: a falling creature does not walk. UpdateFall may flip
-      // the mob into a ragdoll mid-air, in which case this tick's pose is the
-      // last one the driver submits and the limbs are dynamic from the next.
-      const bool falling = UpdateFall(mob, def, sense, dt);
-      if (!falling) DriveLocomotion(mob, def, sense, align, dt);
+      if (swimNow) {
+        // THE WATER CARRIES IT: steer, pitch, thrust, resolve (DriveSwim
+        // runs Steer itself, after it has felt ahead for rock).
+        DriveSwim(mob, def, world, dt);
+      } else if (aquatic) {
+        // OUT OF ITS ELEMENT: no walking -- gravity, the flank, the flop and
+        // the breath running out.
+        TickStranded(mob, def, world, sense, tick, dt);
+      } else {
+        float align = Steer(mob, def, dt);
+        // Gravity first: a falling creature does not walk. UpdateFall may flip
+        // the mob into a ragdoll mid-air, in which case this tick's pose is the
+        // last one the driver submits and the limbs are dynamic from the next.
+        const bool falling = UpdateFall(mob, def, sense, dt);
+        if (!falling) DriveLocomotion(mob, def, sense, align, dt);
+      }
       bpDrive.Stop();
       if (mob.ragdoll_ == Mob::RagdollPhase::Limp) {
         mob.BleedTick(tick, world, ops, spawns, bleedOps);
@@ -10695,6 +10873,7 @@ bool Mob::SpendHp(float amount, const DamageCtx& ctx) {
   const float total = std::floor(SpendableHp());
   if (total <= 0.0f || amount >= total) {
     if (ctx.cause == DamageCause::Fall) deathCause_ = "fall";
+    if (ctx.cause == DamageCause::Asphyxia) deathCause_ = "suffocated";
     Die();
     return false;
   }
@@ -25293,6 +25472,94 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
   CarveReport rep{};
   const uint32_t seed = (uint32_t)id_ * 2654435761u + (uint32_t)li * 40503u +
                         hit.seed;
+
+  // ---- A MOUTHFUL (StrikeProfile::biteMouthful, 2026-10-10) ---------------
+  //
+  // The jaws close on more than the limb the probe met. Every OTHER limb of
+  // this body whose collider comes within `mouthful` hole-radii of the bite's
+  // centre loses the same torn ball -- charged its share of the bite, bled,
+  // and severed by collapse exactly as the bitten limb is. Run on EVERY exit
+  // below (whatever became of the limb the teeth met: a bite that took a hand
+  // clean off still took the wrist with it), after the bitten limb's own
+  // wound, and collected by HANDLE first, because a carve rebuilds bodies
+  // and a sever reshapes `limbs_` under any index held across it.
+  const Vec3 biteCentreW = limbs_[li].xf.pos + Rotate(q, centre);
+  struct Mouthful {
+    std::function<void()> f;
+    ~Mouthful() {
+      if (f) f();
+    }
+  } mouthful;
+  if (hit.mouthful > 0.0f && biteR * hit.mouthful >= 0.5f) {
+    // `R` is the REACH (which limbs the jaws close on), `rTear` the hole each
+    // of them loses: the teeth at the edge of the mouth take less than the
+    // middle of it, and a VITAL limb at the edge (the torso beside a bitten
+    // hip) half of that -- a mouthful maims, it does not stop a heart in one
+    // closing of the jaws through the hp a carve charges per voxel.
+    mouthful.f = [this, &hit, &world, &spawns, bodyHandle, biteCentreW,
+                  R = biteR * hit.mouthful, rTear = biteR * 0.7f, seed]() {
+      if (rigReleased_ || phys_ == nullptr) return;
+      const Tuning::Gore& g2 = CurrentTuning().gore;
+      struct Piece {
+        uint64_t body;
+        Vec3 local;
+        float r;
+      };
+      std::vector<Piece> pieces;
+      for (size_t i = 0; i < limbs_.size(); i++) {
+        const MobLimb& L = limbs_[i];
+        if (L.body == 0 || L.body == bodyHandle || L.holdSeconds > 0) continue;
+        // Cloth and hair are the bitten slot's business, not a mouthful's.
+        if (IsWornSlot((int)i) || IsBloodless((int)i)) continue;
+        BodyTransform xf{};
+        if (!phys_->GetTransform(L.body, xf)) continue;
+        const Quat lq{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+        const float inv = 1.0f / (float)std::max(1u, PhysScaleOf(L));
+        const Vec3 lc = RotateInv(lq, biteCentreW - xf.pos);
+        // The nearest point of the limb's box to the bite.
+        const Vec3 nearL{std::clamp(lc.x, 0.0f, (float)L.size.x * inv),
+                         std::clamp(lc.y, 0.0f, (float)L.size.y * inv),
+                         std::clamp(lc.z, 0.0f, (float)L.size.z * inv)};
+        if ((nearL - lc).len() > R) continue;
+        const bool vital = i < limbDefs_.size() && limbDefs_[i].vital;
+        pieces.push_back({L.body, lc, vital ? rTear * 0.5f : rTear});
+      }
+      if (pieces.empty()) return;
+      const DamageCtx bt(DamageCause::Bite);
+      const float share = hit.hp * 0.5f / (float)pieces.size();
+      const float rimX =
+          std::max(0.0f, g2.craterStainRim * g2.biteStainScale * hit.stainScale);
+      uint32_t k = 0;
+      for (const Piece& pc : pieces) {
+        k++;
+        if (!alive_ && rigReleased_) break;
+        auto indexOf = [&](uint64_t h) {
+          for (size_t i = 0; i < limbs_.size(); i++)
+            if (limbs_[i].body == h) return (int)i;
+          return -1;
+        };
+        if (indexOf(pc.body) < 0) continue;
+        Damage(pc.body, share, biteCentreW, /*impactSpeed=*/0.0f, bt);
+        const int lj = indexOf(pc.body);
+        if (lj < 0) continue;
+        CarveReport r2{};
+        const uint32_t s2 = seed ^ (0x6D0F7u * k);
+        const bool kept = CarveBlob(lj, bt, pc.local, pc.r, g2.biteBlob, s2, world,
+                                    spawns, &r2);
+        mouthfulLimbs_++;
+        mouthfulCells_ += r2.count;
+        if (!kept || r2.count == 0 || r2.cells.empty() || rimX <= 0.0f) continue;
+        const int lk = indexOf(pc.body);
+        if (lk < 0) continue;
+        if (hit.infectMat != 0)
+          StainWoundAs(lk, r2.centreLocal, 0.0f, s2 ^ 0x120FEC7u, hit.infectMat,
+                       hit.infectStain, &r2.cells, rimX);
+        else
+          StainWound(lk, r2.centreLocal, 0.0f, s2 ^ 0x7EA12u, &r2.cells, rimX);
+      }
+    };
+  }
+
   const bool survived =
       CarveBlob(li, bite, centre, biteR, gt.biteBlob, seed, world, spawns, &rep);
   if (kBiteDebug)
@@ -32297,6 +32564,11 @@ StrikeProfile Mob::StrikeProfileFor(const MobNaturalWeaponDef& nw) const {
 }
 
 void Mob::Launch(Vec3 vel) {
+  // In the water a launch is a surge: there is nothing to leap off.
+  if (swimming_) {
+    SwimSurge(vel);
+    return;
+  }
   airborne_ = true;
   launched_ = true;
   fallVel_ = vel.y;

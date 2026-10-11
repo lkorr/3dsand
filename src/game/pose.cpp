@@ -845,13 +845,34 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
     pose_.swimPitchApplied = a;
   }
 
+  // ---- THE DRIVER'S ATTITUDE: a body that is not upright by nature --------
+  // (PoseInputs::attitude; MobDef::SwimDef.) Roll about the body's own long
+  // axis first, then pitch the rolled body about its lateral one: a fish
+  // banks INTO a dive rather than diving and then corkscrewing. On the root,
+  // in the rig frame, before the wave and before every per-part stage, so all
+  // of them ride it. Pitch + is nose up, which is a NEGATIVE turn about model
+  // +X (+X takes +Z to -Y: scripts/geometry.py).
+  if (in.attitude && def.rootLimb >= 0 && def.rootLimb < (int)sk.parts.size() &&
+      (def.rootLimb >= (int)st.partAlive.size() || st.partAlive[def.rootLimb]) &&
+      (std::fabs(in.attPitch) > 1e-5f || std::fabs(in.attRoll) > 1e-5f)) {
+    Transform& root = st.local[def.rootLimb];
+    const Quat att = Mul(AxisAngle({1, 0, 0}, -in.attPitch),
+                         AxisAngle({0, 0, 1}, in.attRoll));
+    root.rot = QuatNormalize(Mul(att, root.rot));
+  }
+
   // ---- the legless body's locomotion: lateral undulation -------------------
   // Straight after the clips, so a clip that OWNS a segment (the strike's
   // coil) is read from the blend it just made, and before everything that
   // rotates a part about its joint (aim, hit react) so those compose on top
   // of the wave rather than being overwritten by it. Data-gated on the def's
   // `slither` block: one test on every other rig.
-  if (def.slither.present) ApplySlither(in, dt);
+  // A SWIMMER'S WAVE IS THE SAME WAVE ON A CLOCK (MobDef::SwimDef::wave):
+  // the driver asks for it (PoseInputs::swimWave), a slither body keeps its own.
+  if (in.swimWave && def.swim.wave.present)
+    ApplySlither(def.swim.wave, in, dt);
+  else if (def.slither.present)
+    ApplySlither(def.slither, in, dt);
 
   // ---- procedural layer: the legacy phase swing ----------------------------
   // dummy.json has swingAmp/swingPhase and no chains; running it HERE rather
@@ -1124,6 +1145,12 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   }
   if (!clipOwnsPose) proneConform_.clear();
   pose_.bodyPlaced = true;
+  // A trunk rolled onto its flank rests lower than it stands
+  // (PoseInputs::bodyDrop). Only where the height was SET this tick (the
+  // driver-pinned air branch, ParkGaitForAir); the eased branches would bank
+  // it tick after tick.
+  if (in.bodyDrop != 0.0f && !in.grounded && !clipOwnsPose && driverHeight)
+    bodyY_ -= in.bodyDrop;
 
   // ---- stage 5: leg IK, strictly a POST-PROCESS on the flattened pose -------
   // IK is never a blended layer: blending two IK results gives a pose that
@@ -1327,10 +1354,10 @@ struct SlitherTimer {
 uint64_t SlitherPoseCalls() { return g_slitherCalls.load(); }
 uint64_t SlitherPoseNanos() { return g_slitherNanos.load(); }
 
-void Mob::ApplySlither(const PoseInputs& in, float dt) {
+void Mob::ApplySlither(const MobDef::SlitherDef& sd, const PoseInputs& in,
+                       float dt) {
   if (def_ == nullptr) return;
   const SlitherTimer timer;   // the `snake` gate's cost readout
-  const MobDef::SlitherDef& sd = def_->slither;
   const AnimSkeleton& sk = skel_;
   AnimState& st = anim_;
   const size_t n = std::min(sk.parts.size(), st.local.size());
@@ -1346,7 +1373,26 @@ void Mob::ApplySlither(const PoseInputs& in, float dt) {
   }
   const float lambda = std::max(0.5f, sd.wavelength * sd.length);
   const float k = 6.2831853f / lambda;
-  pose_.slitherOdo += vFwd * dt;
+  // ---- THE PHASE SOURCE (SlitherDef::beatHz) -------------------------------
+  // The odometer for a body that pushes on the ground. On a CLOCK for one that
+  // pushes on water: the "odometer" then runs at the WAVE's speed, c = f x
+  // lambda with f = beatHz + v / (slip x lambda), so the same phase arithmetic
+  // below sends the crests down the body faster than it travels and the tail
+  // beats while the body hangs still. Amplitude rides the effort, and a flop
+  // (PoseInputs::waveKick) whips it.
+  float ampScale = 1.0f;
+  if (sd.beatHz > 0.0f) {
+    const float v3 = in.velocity.len();
+    const float kick = std::clamp(in.waveKick, 0.0f, 1.0f);
+    const float c = sd.beatHz * lambda * (1.0f + 2.0f * kick) +
+                    v3 / std::max(sd.slip, 0.1f);
+    pose_.slitherOdo += c * dt;
+    const float ref = std::max(0.5f, sd.ampSpeed * def_->speed);
+    ampScale = (sd.ampIdle + (1.0f - sd.ampIdle) * std::clamp(v3 / ref, 0.0f, 1.0f)) *
+               (1.0f + 1.6f * kick);
+  } else {
+    pose_.slitherOdo += vFwd * dt;
+  }
   // Wrapped to keep the float precise over a long life; the wave is periodic.
   if (std::fabs(pose_.slitherOdo) > 64.0f * lambda)
     pose_.slitherOdo = std::fmod(pose_.slitherOdo, lambda);
@@ -1363,7 +1409,7 @@ void Mob::ApplySlither(const PoseInputs& in, float dt) {
         (want - pose_.slitherKappa) * HalfLifeK(dt, sd.bendHalfLife);
   }
 
-  const float A = sd.amplitude * sd.length;
+  const float A = sd.amplitude * sd.length * ampScale;
   const float phase = k * pose_.slitherOdo;
   const float ramp = std::max(1e-3f, sd.ampRamp * sd.length);
   const float sPivot = sd.zTip - def_->worldSize.z * 0.5f;
@@ -2795,7 +2841,9 @@ Vec3 Mob::BodyVelocity() const {
 }
 
 Vec3 Mob::DriverVelocity() const {
-  // An NPC in the air is its ballistic state; on the ground its measured walk.
+  // A swimmer's is the water's (MobSystem::DriveSwim); an NPC in the air is
+  // its ballistic state; on the ground its measured walk.
+  if (swimming_) return swimVel_;
   if (airborne_) return Vec3{airVel_.x, fallVel_, airVel_.z};
   return anim_.velocity;
 }
@@ -2826,6 +2874,11 @@ void Mob::AddBodyVelocity(Vec3 vps) {
 }
 
 void Mob::AddDriverVelocity(Vec3 vps) {
+  // ---- A SWIMMER: the water carries the push (MobSystem::DriveSwim) -------
+  if (swimming_) {
+    swimVel_ = swimVel_ + vps;
+    return;
+  }
   // ---- LIVE NPC: the ballistic state UpdateFall integrates ----------------
   // A LIFT IS NOT A FALL: an upward push must not land the body on the ground
   // it is rising off this tick (the `launched_` latch) and must not go limp for

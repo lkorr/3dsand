@@ -1,0 +1,526 @@
+{
+  "//": "THE PIRANHA (DESIGN.md \"Swimmers\"). A 38 cm red-bellied piranha: the same swimmer as the shark (the `swim` block) on a piranha's numbers -- quick to turn, quick to accelerate, a fast tail -- and the same circling hunter (behaviors.json `piranha`: Orbit / Charge) on short darting laps. Its jaws NIP: a hole a couple of art voxels across, where the shark's take a mouthful. It is meant in numbers: spawn a shoal. The .vox, `root`, the limbs, the jaws' `edge` and `swim.wave.parts` are WRITTEN by `node scripts/gen_fish.mjs piranha` from `fishgen`; edit that, not them.",
+  "artVoxelsPerMetre": 80,
+  "bleed": {
+    "material": "blood",
+    "perDamage": 2
+  },
+  "sounds": {
+    "dismember": "dismember",
+    "bleed": "bleed"
+  },
+  "anatomy": {
+    "layers": [
+      {
+        "material": "skin",
+        "depth": 1,
+        "keep": true
+      },
+      {
+        "material": "flesh",
+        "depth": 1
+      },
+      {
+        "material": "muscle",
+        "depth": 1,
+        "speckle": {
+          "material": "blood",
+          "fraction": 0.06
+        }
+      },
+      {
+        "material": "bone"
+      }
+    ],
+    "limbs": {
+      "jaw": {
+        "layers": [
+          {
+            "material": "skin",
+            "depth": 1,
+            "keep": true
+          },
+          {
+            "material": "bone"
+          }
+        ]
+      }
+    }
+  },
+  "speed": 11,
+  "locomotion": {
+    "turnRate": 4.5,
+    "turnAccel": 30,
+    "turnRateMoving": 0.8,
+    "driveAlignFull": 0.7,
+    "driveAlignZero": 2.6
+  },
+  "//swim": "Quick everything: it turns at 3.6 rad/s moving, reaches its cruise in a fifth of a second and stops nearly as fast; a strong grip on its line. Out of the water it flops hard and often, and suffocates in six seconds at 2 hp a second (it has about 35).",
+  "swim": {
+    "pitchRate": 3,
+    "maxPitch": 1.1,
+    "accel": 60,
+    "brake": 30,
+    "sideGrip": 8,
+    "burst": 2.6,
+    "buoyancy": 1,
+    "surfaceGap": 0.3,
+    "bedGap": 0.4,
+    "breach": 0.5,
+    "feel": 3,
+    "bank": 0.5,
+    "maxRoll": 0.7,
+    "breathSeconds": 6,
+    "suffocateHp": 2,
+    "flopMin": 0.2,
+    "flopMax": 0.7,
+    "flopRise": 1,
+    "flopSpeed": 0.8,
+    "flopReach": 6,
+    "wave": {
+      "wavelength": 1.1,
+      "amplitude": 0.1,
+      "ampHead": 0.1,
+      "ampRamp": 1,
+      "turnBend": 1,
+      "maxCurvature": 0.3,
+      "bendHalfLife": 0.12,
+      "beatHz": 2.2,
+      "slip": 0.6,
+      "ampIdle": 0.4,
+      "ampSpeed": 0.7,
+      "parts": [
+        "head",
+        "body1",
+        "body2",
+        "tail"
+      ]
+    },
+    "trunkHalfW": 0.27,
+    "trunkHalfH": 0.9
+  },
+  "headLook": false,
+  "aimSpineShare": 0.1,
+  "aimLeanBodies": 0.05,
+  "//natural": "A NIP: biteRadius 0.55 x gore.biteRadius is a 0.1..0.25-voxel hole -- one to two of a human's art voxels -- for 4 hp at full speed. No mouthful.",
+  "natural": [
+    {
+      "name": "jaws",
+      "part": "head",
+      "edge": {
+        "from": [
+          2.5,
+          4.2,
+          0.92
+        ],
+        "to": [
+          2.5,
+          3.56,
+          5
+        ],
+        "halfWidth": 1.48
+      },
+      "strike": {
+        "blunt": 0.3,
+        "bite": 4,
+        "biteRadius": 0.55,
+        "biteStain": 0.7,
+        "biteForce": 0.7
+      }
+    }
+  ],
+  "behavior": "piranha",
+  "chaseClip": "piranha_gnash",
+  "chaseRampMs": 200,
+  "chaseRange": 20,
+  "states": [],
+  "clips": {
+    "piranha_nip": {
+      "durationMs": 330,
+      "loop": false,
+      "mode": "override",
+      "mask": [
+        "jaw"
+      ],
+      "blendInMs": 20,
+      "blendOutMs": 120,
+      "tracks": {
+        "jaw": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "cubicOut"
+            },
+            {
+              "t": 90,
+              "q": [
+                0.3827,
+                0,
+                0,
+                0.9239
+              ],
+              "ease": "cubicIn"
+            },
+            {
+              "t": 130,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "linear"
+            },
+            {
+              "t": 330,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "linear"
+            }
+          ]
+        }
+      }
+    },
+    "piranha_gnash": {
+      "durationMs": 600,
+      "loop": true,
+      "mode": "override",
+      "restFill": true,
+      "mask": [
+        "jaw"
+      ],
+      "blendInMs": 100,
+      "blendOutMs": 150,
+      "tracks": {
+        "jaw": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "cubicOut"
+            },
+            {
+              "t": 120,
+              "q": [
+                0.1736,
+                0,
+                0,
+                0.9848
+              ],
+              "ease": "cubicIn"
+            },
+            {
+              "t": 200,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "linear"
+            },
+            {
+              "t": 600,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "linear"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "fishgen": {
+    "length": 0.38,
+    "caudalBack": 0.2,
+    "flat": 2,
+    "profile": [
+      [
+        0,
+        0.03,
+        0.07,
+        0
+      ],
+      [
+        0.15,
+        0.05,
+        0.15,
+        0
+      ],
+      [
+        0.4,
+        0.08,
+        0.27,
+        0
+      ],
+      [
+        0.62,
+        0.09,
+        0.3,
+        0
+      ],
+      [
+        0.8,
+        0.08,
+        0.25,
+        -0.02
+      ],
+      [
+        0.92,
+        0.06,
+        0.17,
+        -0.045
+      ],
+      [
+        1,
+        0.035,
+        0.08,
+        -0.07
+      ]
+    ],
+    "segments": [
+      [
+        "tail",
+        0.28
+      ],
+      [
+        "body2",
+        0.56
+      ],
+      [
+        "body1",
+        0.8
+      ],
+      [
+        "head",
+        1
+      ]
+    ],
+    "root": "body2",
+    "jaw": {
+      "gape": [
+        0.83,
+        -0.25
+      ],
+      "tip": [
+        1,
+        -0.5
+      ]
+    },
+    "fins": [
+      {
+        "kind": "dorsal",
+        "t": [
+          0.38,
+          0.55
+        ],
+        "height": 0.13,
+        "sweep": 0.3,
+        "thick": 1
+      },
+      {
+        "kind": "dorsal",
+        "t": [
+          0.13,
+          0.17
+        ],
+        "height": 0.05,
+        "sweep": 0.2,
+        "thick": 1
+      },
+      {
+        "kind": "anal",
+        "t": [
+          0.12,
+          0.4
+        ],
+        "height": 0.1,
+        "sweep": 0.25,
+        "thick": 1
+      },
+      {
+        "kind": "pelvic",
+        "t": [
+          0.42,
+          0.47
+        ],
+        "length": 0.07,
+        "droop": 1,
+        "sweep": 0.4,
+        "rootY": 0.85,
+        "thick": 1
+      },
+      {
+        "kind": "pectoral",
+        "t": [
+          0.74,
+          0.79
+        ],
+        "length": 0.12,
+        "droop": 0.6,
+        "sweep": 0.6,
+        "rootY": 0.4,
+        "thick": 1
+      },
+      {
+        "kind": "caudal",
+        "upper": [
+          0.3,
+          0.55
+        ],
+        "lower": [
+          0.3,
+          0.55
+        ],
+        "chord": 0.1,
+        "thick": 1,
+        "fork": 0.35
+      }
+    ],
+    "coat": {
+      "back": "#6f7d82",
+      "back2": "#8f9ca1",
+      "belly": "#d84a2a",
+      "belly2": "#c23c22",
+      "line": 0.36,
+      "fin": "#5d6669",
+      "finTip": "#1e2224",
+      "eye": "#0b0a0a",
+      "eyeRing": "#c2281e",
+      "eyeT": 0.9,
+      "eyeY": 0.25,
+      "eyeR": 0.9,
+      "gills": {
+        "n": 1,
+        "t": [
+          0.8,
+          0.8
+        ],
+        "y": [
+          -0.6,
+          0.6
+        ],
+        "color": "#4a3a38",
+        "curve": 1.5
+      },
+      "mouth": "#4a1f1f",
+      "teeth": "#f5f3ea",
+      "teethAlways": true,
+      "spots": {
+        "color": "#2b2f31",
+        "y": [
+          0.45,
+          0.9
+        ],
+        "t": [
+          0.3,
+          0.8
+        ],
+        "density": 0.06
+      },
+      "throat": {
+        "color": "#e0532f",
+        "below": 0.42,
+        "t": [
+          0.55,
+          1
+        ]
+      },
+      "shine": "#cfd8dc",
+      "noise": 0.12
+    },
+    "hp": {
+      "head": 8,
+      "jaw": 3,
+      "body1": 8,
+      "body2": 10,
+      "tail": 5
+    }
+  },
+  "root": "body2",
+  "limbs": [
+    {
+      "name": "tail",
+      "parent": "body2",
+      "joint": "ball",
+      "anchor": [
+        4.5,
+        7.2,
+        11.72
+      ],
+      "hp": 5,
+      "severable": true,
+      "tag": "tail",
+      "severImpactSpeed": 14
+    },
+    {
+      "name": "body2",
+      "hp": 10,
+      "severable": false,
+      "vital": true,
+      "tag": "spine"
+    },
+    {
+      "name": "body1",
+      "parent": "body2",
+      "joint": "ball",
+      "anchor": [
+        4.5,
+        7.2,
+        18.44
+      ],
+      "hp": 8,
+      "severable": true,
+      "tag": "spine",
+      "severImpactSpeed": 14
+    },
+    {
+      "name": "head",
+      "parent": "body1",
+      "joint": "ball",
+      "anchor": [
+        4.5,
+        6.72,
+        24.2
+      ],
+      "hp": 8,
+      "severable": true,
+      "vital": true,
+      "tag": "head",
+      "severImpactSpeed": 18
+    },
+    {
+      "name": "jaw",
+      "parent": "head",
+      "joint": "ball",
+      "hp": 3,
+      "severable": true,
+      "tag": "jaw",
+      "severImpactSpeed": 14,
+      "anchor": [
+        4.5,
+        5.2,
+        24.92
+      ]
+    }
+  ]
+}

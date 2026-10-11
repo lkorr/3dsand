@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 
@@ -25,6 +27,7 @@ constexpr uint32_t kSaltCircle = 0xC141u;
 constexpr uint32_t kSaltReact = 0x8EAC7u;
 constexpr uint32_t kSaltFeint = 0xFE17u;
 constexpr uint32_t kSaltDodge = 0xD0D6u;
+constexpr uint32_t kSaltOrbit = 0x0B17u;
 
 float WrapPi(float a) { return std::remainder(a, kTau); }
 
@@ -36,6 +39,16 @@ float BearingTo(const Vec3& from, const Vec3& to) {
 float PlanarDist(const Vec3& a, const Vec3& b) {
   const float dx = a.x - b.x, dz = a.z - b.z;
   return std::sqrt(dx * dx + dz * dz);
+}
+
+// THE DISTANCE A BODY CARES ABOUT: planar for a walker (its band is footwork
+// on a floor, and a target on a balcony above it is not "further"), the whole
+// 3D gap for a body the water carries (SelfView::volumetric) -- a shark ten
+// voxels under a swimmer is not in biting range of him.
+float BodyDist(const SelfView& self, const Vec3& a, const Vec3& b) {
+  if (!self.volumetric) return PlanarDist(a, b);
+  const float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+  return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
 // The faction intern table. Names are content and ids are runtime, exactly as
@@ -126,6 +139,8 @@ const char* IntentName(Intent i) {
     case Intent::Eat: return "eat";
     case Intent::Goto: return "goto";
     case Intent::Cast: return "cast";
+    case Intent::Orbit: return "orbit";
+    case Intent::Charge: return "charge";
     default: return "?";
   }
 }
@@ -171,6 +186,9 @@ const char* FactName(Fact f) {
     case Fact::PressRank: return "pressRank";
     case Fact::Hostiles: return "hostiles";
     case Fact::Shocked: return "shocked";
+    case Fact::Immersion: return "immersion";
+    case Fact::TargetImmersion: return "targetImmersion";
+    case Fact::TargetBleeding: return "targetBleeding";
     default: return "?";
   }
 }
@@ -264,6 +282,16 @@ TuneMode TuneModeOf(Tune t) {
 //     "defense": { "skill": 0.5, "reactTicks": 8, "reactJitter": 6,
 //                  "margin": 2.5, "guardStance": 0.3, "guardReach": 0.85,
 //                  "holdTicks": 4 },
+//     // ---- the swimmers (2026-10-10); every key optional --------------------
+//     // perception: "minImmersion" (a target must be this wet), "scentRange",
+//     //             "scentPull" (a bleeding body in the water, felt unseen)
+//     // movement.wander: "depth" (a volumetric body draws each leg's height)
+//     "orbit": { "radius": 19, "speed": 0.7, "height": 6, "engage": 2.0,
+//                "lapMin": 150, "lapMax": 320, "reverseChance": 0.4,
+//                "chargeSpeed": 2.6, "turnInSpeed": 1.0, "lineUp": 0.45,
+//                "lead": 0.8, "lockDist": 5, "overrun": 14, "peel": 0.55,
+//                "biteCone": 0.6, "biteLead": 7, ... },   // OrbitTuning
+//     // with intents "orbit" and "charge" weighted (ai_behavior.h Intent).
 //     // rules may also carry "tune": { "cadence": 0.7, "band": 3, ... } --
 //     // HOW it fights while the rule holds. Names in TuneName.
 //     "rules": [ { "when": { "hp": "<0.35" }, "weight": { "guard": 3 },
@@ -424,6 +452,10 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
       pr.perception.stickiness = q.value("stickiness", 0.0f);
       pr.perception.preferWeak = q.value("preferWeak", 0.0f);
       pr.perception.provokeTicks = q.value("provokeTicks", 240u);
+      pr.perception.minImmersion =
+          std::clamp(q.value("minImmersion", 0.0f), 0.0f, 1.0f);
+      pr.perception.scentRange = std::max(0.0f, q.value("scentRange", 0.0f));
+      pr.perception.scentPull = q.value("scentPull", 0.0f);
     }
     if (p.contains("movement")) {
       const auto& q = p["movement"];
@@ -454,6 +486,7 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
         pr.movement.wanderPauseMax =
             std::max(pr.movement.wanderPauseMin, w.value("pauseMax", 180u));
         pr.movement.wanderArrive = std::max(0.5f, w.value("arrive", 2.0f));
+        pr.movement.wanderDepth = std::max(0.0f, w.value("depth", 0.0f));
       }
     }
     if (p.contains("attack")) {
@@ -502,6 +535,32 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
       pr.defense.guardReach =
           std::clamp(q.value("guardReach", 0.85f), 0.2f, 1.0f);
       pr.defense.holdTicks = q.value("holdTicks", 4u);
+    }
+    // The circling hunter (OrbitTuning). Absent = never orbits.
+    if (p.contains("orbit") && p["orbit"].is_object()) {
+      const auto& q = p["orbit"];
+      OrbitTuning& o = pr.orbit;
+      o.radius = std::max(0.0f, q.value("radius", 0.0f));
+      o.radiusJitter = std::clamp(q.value("radiusJitter", 0.2f), 0.0f, 0.9f);
+      o.speed = std::max(0.0f, q.value("speed", 0.7f));
+      o.height = q.value("height", 0.0f);
+      o.heightJitter = std::max(0.0f, q.value("heightJitter", 0.0f));
+      o.lookahead = std::clamp(q.value("lookahead", 0.6f), 0.05f, 1.5f);
+      o.engage = std::max(1.0f, q.value("engage", 2.5f));
+      o.lapMin = q.value("lapMin", 90u);
+      o.lapMax = std::max(o.lapMin, q.value("lapMax", 200u));
+      o.reverseChance = std::clamp(q.value("reverseChance", 0.3f), 0.0f, 1.0f);
+      o.chargeSpeed = std::max(0.0f, q.value("chargeSpeed", 2.2f));
+      o.turnInSpeed = std::max(0.0f, q.value("turnInSpeed", 1.0f));
+      o.lineUp = std::clamp(q.value("lineUp", 0.45f), 0.02f, 3.0f);
+      o.lead = std::clamp(q.value("lead", 1.0f), 0.0f, 2.0f);
+      o.lockDist = std::max(0.0f, q.value("lockDist", 6.0f));
+      o.overrun = std::max(0.0f, q.value("overrun", 10.0f));
+      o.peel = std::clamp(q.value("peel", 0.5f), 0.0f, 1.5f);
+      o.biteCone = std::clamp(q.value("biteCone", 0.6f), 0.05f, 2.0f);
+      o.passMax = std::max(10u, q.value("passMax", 150u));
+      o.biteLead = q.value("biteLead", 6u);
+      o.hitHeight = q.value("hitHeight", 0.0f);
     }
     // D4: magic (CastTuning). Absent = never casts.
     if (p.contains("cast") && p["cast"].is_object()) {
@@ -631,7 +690,13 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
       << ", \"keepRangeScale\": " << num(p.perception.keepRangeScale)
       << ", \"stickiness\": " << num(p.perception.stickiness)
       << ", \"preferWeak\": " << num(p.perception.preferWeak)
-      << ", \"provokeTicks\": " << p.perception.provokeTicks << " },\n";
+      << ", \"provokeTicks\": " << p.perception.provokeTicks;
+    if (p.perception.minImmersion > 0.0f)
+      o << ", \"minImmersion\": " << num(p.perception.minImmersion);
+    if (p.perception.scentRange > 0.0f)
+      o << ", \"scentRange\": " << num(p.perception.scentRange)
+        << ", \"scentPull\": " << num(p.perception.scentPull);
+    o << " },\n";
     o << "      \"movement\": { \"mobile\": "
       << (p.movement.mobile ? "true" : "false")
       << ", \"rangeMin\": " << num(p.movement.rangeMin)
@@ -656,7 +721,11 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
         << ", \"speed\": " << num(p.movement.wanderSpeed)
         << ", \"pauseMin\": " << p.movement.wanderPauseMin
         << ", \"pauseMax\": " << p.movement.wanderPauseMax
-        << ", \"arrive\": " << num(p.movement.wanderArrive) << " }";
+        << ", \"arrive\": " << num(p.movement.wanderArrive)
+        << (p.movement.wanderDepth > 0.0f
+                ? ", \"depth\": " + num(p.movement.wanderDepth)
+                : std::string())
+        << " }";
     o << " },\n";
     o << "      \"attack\": { \"styles\": [";
   for (size_t i = 0; i < p.attack.styles.size(); i++)
@@ -684,6 +753,30 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
       << ", \"guardStance\": " << num(p.defense.guardStance)
       << ", \"guardReach\": " << num(p.defense.guardReach)
       << ", \"holdTicks\": " << p.defense.holdTicks << " },\n";
+    // The orbit block, only for a creature that orbits (OrbitTuning).
+    if (p.orbit.radius > 0.0f) {
+      const OrbitTuning& t = p.orbit;
+      o << "      \"orbit\": { \"radius\": " << num(t.radius)
+        << ", \"radiusJitter\": " << num(t.radiusJitter)
+        << ", \"speed\": " << num(t.speed)
+        << ", \"height\": " << num(t.height)
+        << ", \"heightJitter\": " << num(t.heightJitter)
+        << ", \"lookahead\": " << num(t.lookahead)
+        << ", \"engage\": " << num(t.engage)
+        << ", \"lapMin\": " << t.lapMin << ", \"lapMax\": " << t.lapMax
+        << ", \"reverseChance\": " << num(t.reverseChance)
+        << ", \"chargeSpeed\": " << num(t.chargeSpeed)
+        << ", \"turnInSpeed\": " << num(t.turnInSpeed)
+        << ", \"lineUp\": " << num(t.lineUp)
+        << ", \"lead\": " << num(t.lead)
+        << ", \"lockDist\": " << num(t.lockDist)
+        << ", \"overrun\": " << num(t.overrun)
+        << ", \"peel\": " << num(t.peel)
+        << ", \"biteCone\": " << num(t.biteCone)
+        << ", \"passMax\": " << t.passMax
+        << ", \"biteLead\": " << t.biteLead
+        << ", \"hitHeight\": " << num(t.hitHeight) << " },\n";
+    }
     // D4: the cast block, only for a creature that casts (CastTuning).
     if (!p.cast.spells.empty()) {
       o << "      \"cast\": { \"spells\": [";
@@ -794,7 +887,7 @@ const Actor* FindActor(const WorldView& v, uint64_t id) {
 // can rank the cheap survivors before it asks any line (its note).
 bool PerceivesNoLine(const SelfView& self, const Profile& pr, const Actor& a,
                      float range, float& outDist) {
-  outDist = PlanarDist(self.Centre(), a.centre);
+  outDist = BodyDist(self, self.Centre(), a.centre);
   if (outDist > range) return false;
   if (pr.perception.fovDegrees < 359.9f) {
     const float bearing = BearingTo(self.Centre(), a.centre);
@@ -851,6 +944,7 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
     float score, d;
     const Actor* a;
     uint32_t order;
+    bool scent;   // perceived by its blood in the water: no line asked
   };
   thread_local std::vector<Cand> cands;
   cands.clear();
@@ -863,8 +957,28 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
     const bool current = b.hasTarget && a.id == b.targetId;
     if (neutral && !current && !provoked) continue;
     const float range = current ? keep : acquire;
-    if (!PerceivesNoLine(self, pr, a, range, d)) continue;
+    // THE MEDIUM (Perception::minImmersion): not a target while it is not in
+    // the water this creature hunts in. A held target that climbs out is
+    // dropped from the candidates and the alert decays as for one that broke
+    // the line of sight.
+    if (pr.perception.minImmersion > 0.0f &&
+        a.immersion < pr.perception.minImmersion)
+      continue;
+    // BLOOD IN THE WATER (Perception::scentRange): a bleeding body that is
+    // itself in liquid is felt from further than it is seen, with no cone and
+    // no line -- and pulls harder than a dry one.
+    const float scentR = pr.perception.scentRange;
+    bool scent = false;
+    if (scentR > 0.0f && a.bleeding && a.immersion >= 0.25f) {
+      const float ds = BodyDist(self, self.Centre(), a.centre);
+      if (ds <= std::max(scentR, range)) {
+        scent = true;
+        d = ds;
+      }
+    }
+    if (!scent && !PerceivesNoLine(self, pr, a, range, d)) continue;
     float score = d;
+    if (scent) score -= pr.perception.scentPull;
     if (current) score -= pr.perception.stickiness;
     // Whoever is fighting ME is the one a provoked neutral answers.
     if (neutral && a.targetId == self.id) score -= 1000.0f;
@@ -873,13 +987,13 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
     // The all-tests loop kept an actor only on `score < best` from 1e30: a
     // NaN, or a score at or past 1e30, was never kept, so it is not a candidate.
     if (!(score < 1e30f)) continue;
-    cands.push_back({score, d, &a, order});
+    cands.push_back({score, d, &a, order, scent});
   }
   std::sort(cands.begin(), cands.end(), [](const Cand& x, const Cand& y) {
     return x.score < y.score || (x.score == y.score && x.order < y.order);
   });
   for (const Cand& c : cands) {
-    if (!PerceivesLine(self, pr, v, *c.a)) continue;
+    if (!c.scent && !PerceivesLine(self, pr, v, *c.a)) continue;
     best = c.a;
     bestDist = c.d;
     break;
@@ -913,7 +1027,7 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
     return;
   }
   b.targetPos = b.lastSeenPos;
-  b.targetDist = PlanarDist(self.Centre(), b.targetPos);
+  b.targetDist = BodyDist(self, self.Centre(), b.targetPos);
 }
 
 // ---------------------------------------------------------------------------
@@ -958,6 +1072,9 @@ void TrackTargetMotion(Brain& b, const SelfView& self, uint32_t tick, float dt) 
   if (usable) {
     float ix = (b.targetPos.x - b.prevTargetPos.x) / dt;
     float iz = (b.targetPos.z - b.prevTargetPos.z) / dt;
+    // A SWIMMER LEADS IN 3D (SelfView::volumetric): its quarry dives and
+    // surfaces. A walker keeps the planar estimate -- a jump is not a course.
+    float iy = self.volumetric ? (b.targetPos.y - b.prevTargetPos.y) / dt : 0.0f;
     // A SANITY CEILING, not a tuning knob. A body that is launched by a blast,
     // knocked back by a mace or moved by a gate fixture differences into
     // hundreds of voxels a second, and one such sample through the low pass
@@ -968,12 +1085,14 @@ void TrackTargetMotion(Brain& b, const SelfView& self, uint32_t tick, float dt) 
       ix *= cap / m;
       iz *= cap / m;
     }
+    iy = std::clamp(iy, -cap, cap);
     // A gait bobs and yaws the body centre by a fraction of a voxel every tick,
     // which the raw difference reports as several voxels a second of sideways
     // drift. Unfiltered, the aim point wanders by about that much per tick and
     // a lead is worse than none.
     constexpr float kAlpha = 0.25f;
     b.targetVel.x += (ix - b.targetVel.x) * kAlpha;
+    b.targetVel.y += (iy - b.targetVel.y) * kAlpha;
     b.targetVel.z += (iz - b.targetVel.z) * kAlpha;
   } else {
     b.targetVel = Vec3{};
@@ -1226,6 +1345,9 @@ void EvaluateRules(Brain& b, const Profile& pr, const SelfView& self,
       facing = (std::sin(tgt->heading) * dx + std::cos(tgt->heading) * dz) / len;
   }
   f[(int)Fact::TargetFacingMe] = facing;
+  f[(int)Fact::Immersion] = self.immersion;
+  f[(int)Fact::TargetImmersion] = tgt != nullptr ? tgt->immersion : 0.0f;
+  f[(int)Fact::TargetBleeding] = tgt != nullptr && tgt->bleeding ? 1.0f : 0.0f;
 
   // THE QUEUE AROUND ONE TARGET. Allies are anyone of our faction who has
   // named the same target (Actor::targetId); rank is how many of them stand
@@ -1296,6 +1418,46 @@ float EffectiveWeight(const Brain& b, const Profile& pr, int i) {
 
 }  // namespace
 
+namespace {
+
+// THE CIRCLING HUNTER'S LAP (OrbitTuning): this lap's radius and height, how
+// long it circles before a pass may begin, and which way round. Counter-based
+// on (id, lap), so a replayed hunt circles the same laps.
+//
+// THE DIRECTION FOLLOWS THE BODY. On the first lap, and on every lap after a
+// pass, the orbit goes the way the body is already travelling round the
+// target -- a shark that has just driven through you curves round and comes
+// back, it does not reverse on the spot. Between passes a lap may turn round
+// (`reverseChance`): that is the pacing back and forth.
+void DrawLap(Brain& b, const OrbitTuning& ob, const SelfView& self,
+             uint32_t tick, bool followBody) {
+  b.orbitLap++;
+  const uint32_t h1 = rng::Hash3((uint32_t)self.id ^ kSaltOrbit, b.orbitLap, 11u);
+  const uint32_t h2 = rng::Hash3((uint32_t)self.id ^ kSaltOrbit, b.orbitLap, 12u);
+  const float u1 = (float)(h1 & 0xFFFFu) / 65535.0f;
+  const float u2 = (float)((h1 >> 16) & 0xFFFFu) / 65535.0f;
+  const float u3 = (float)(h2 & 0xFFFFu) / 65535.0f;
+  // Never tighter than most of the body's own length: an orbit inside it is a
+  // creature chasing its tail.
+  b.orbitR = std::max(ob.radius * (1.0f + ob.radiusJitter * (2.0f * u1 - 1.0f)),
+                      std::max(2.0f, self.length * 0.75f));
+  b.orbitH = ob.height + ob.heightJitter * (2.0f * u2 - 1.0f);
+  const uint32_t span = ob.lapMax - ob.lapMin + 1u;
+  b.orbitReadyAt = tick + ob.lapMin + (h2 >> 16) % std::max(1u, span);
+  if (followBody || b.orbitSign == 0) {
+    // Which way round is the body already going: the tangential share of its
+    // facing. sin(heading - bearing-from-target) > 0 is the bearing growing.
+    const Vec3 c = self.Centre();
+    const float theta = BearingTo(b.targetPos, c);
+    b.orbitSign = std::sin(self.heading - theta) >= 0.0f ? 1 : -1;
+  } else if (u3 < ob.reverseChance) {
+    b.orbitSign = -b.orbitSign;
+    b.reversals++;
+  }
+}
+
+}  // namespace
+
 bool Think(Brain& brain, const Library& lib, const SelfView& self,
            const GroundView& ground, const WorldView& view, uint32_t tick,
            float dt, IntentOut& out) {
@@ -1311,6 +1473,8 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   out.guard = false;
   out.cancelSwing = false;
   out.cast = false;
+  out.altitudeSet = false;
+  out.breach = false;
 
   NoteHurt(brain, self, tick);
   Perceive(brain, pr, self, view, tick);
@@ -1744,6 +1908,34 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
                          tick >= brain.commitUntil && d >= ct.rangeMin &&
                          d <= ct.rangeMax && aimErr <= ct.aimTolerance;
   if (castReady) raw[(int)Intent::Cast] = 1.0f;
+  // ---- THE CIRCLING HUNTER (OrbitTuning; Intent::Orbit / Charge) ----------
+  // Orbit scores inside `engage` x radius (Approach and the band bring the
+  // body in from further); a pass scores once the lap is spent and the attack
+  // clock is ready, and then HOLDS until the pass ends (the actuator ends it).
+  // Losing the target forgets the lap and any pass in progress.
+  const OrbitTuning& ob = pr.orbit;
+  const bool orbiter = ob.radius > 0.0f && pr.movement.mobile;
+  if (!brain.hasTarget) {
+    brain.orbitReadyAt = 0;
+    brain.passPhase = 0;
+    brain.orbitBearingValid = false;
+  } else if (orbiter) {
+    if (brain.orbitReadyAt == 0) DrawLap(brain, ob, self, tick, true);
+    const float engageR = brain.orbitR * ob.engage;
+    if (brain.passPhase != 0) {
+      raw[(int)Intent::Charge] = 1.0f;
+    } else {
+      raw[(int)Intent::Orbit] = d <= engageR ? 1.0f : 0.25f;
+      if (tick >= brain.orbitReadyAt) {
+        if (brain.visible && (tick >= readyAt || riposteNow) && d <= engageR)
+          raw[(int)Intent::Charge] = 1.0f;
+        // A spent lap with no pass to throw (the clock, the line of sight)
+        // is another lap -- and maybe the other way round.
+        else
+          DrawLap(brain, ob, self, tick, false);
+      }
+    }
+  }
   // THE DAY'S ACTIVITY (P7): exactly the verb the schedule row names, at a
   // flat 1, while the resident layer has a routine on this brain. Everything
   // about WHEN it loses -- to a fight, to a fright -- is the profile's
@@ -1788,8 +1980,14 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
         const float u = (float)((h >> 16) & 0xFFFFu) / 65535.0f;
         // sqrt: uniform over the disc's AREA; floored so a leg is a walk.
         const float d = mv.wanderRadius * std::max(0.35f, std::sqrt(u));
-        brain.wanderGoal = Vec3{brain.wanderAnchor.x + std::cos(ang) * d,
-                                foot.y,
+        float gy = foot.y;
+        if (self.volumetric && mv.wanderDepth > 0.0f) {
+          const uint32_t hy =
+              rng::Hash3((uint32_t)self.id ^ 0x3A11D3u, brain.wanderLeg, 9u);
+          const float uy = (float)(hy & 0xFFFFu) / 65535.0f;
+          gy = brain.wanderAnchor.y + mv.wanderDepth * (2.0f * uy - 1.0f);
+        }
+        brain.wanderGoal = Vec3{brain.wanderAnchor.x + std::cos(ang) * d, gy,
                                 brain.wanderAnchor.z + std::sin(ang) * d};
         brain.wanderLegSince = tick;
       };
@@ -1855,6 +2053,8 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
     raw[(int)Intent::CircleStrafe] = raw[(int)Intent::RequestAttack] = 0.0f;
   }
   if (self.castFenced) raw[(int)Intent::Cast] = 0.0f;
+  if (self.targetFenced)
+    raw[(int)Intent::Orbit] = raw[(int)Intent::Charge] = 0.0f;
 
   // ---- arbitrate ----------------------------------------------------------
   // Weight, then the three dampers (see the header). The incumbent's bonus is
@@ -1932,6 +2132,13 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   if ((brain.intent == Intent::Guard || brain.intent == Intent::Dodge) &&
       responding)
     brain.defendedOnset = brain.blowOnset;
+  // A PASS THE ARBITER TOOK AWAY (a read blow, a rule, a commit) is over: the
+  // next one begins from the turn-in, not from half a run.
+  if (brain.intent != Intent::Charge && brain.passPhase != 0) {
+    brain.passPhase = 0;
+    DrawLap(brain, ob, self, tick, true);
+  }
+  if (brain.intent != Intent::Orbit) brain.orbitBearingValid = false;
 
   // ---- actuate ------------------------------------------------------------
   // The ONLY thing any branch below may produce is a desired heading and a
@@ -1951,7 +2158,10 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       break;
 
     case Intent::Approach: {
-      UpdatePath(brain, pr, self, view, tick, brain.targetPos);
+      // A SWIMMER HAS NO FLOOR TO ROUTE OVER: straight at it, and the swim
+      // drive feels its own way round rock (MobSystem::DriveSwim).
+      if (self.volumetric) brain.path.Clear();
+      else UpdatePath(brain, pr, self, view, tick, brain.targetPos);
       const Vec3 wp = SteerPoint(brain, brain.targetPos);
       const float want = BearingTo(self.Foot(), wp);
       // THE FAN STAYS, EVEN ON A PLANNED ROUTE — and this is the one place the
@@ -2278,7 +2488,8 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
         out.driveScale = 0;
         break;
       }
-      UpdatePath(brain, pr, self, view, tick, r.goal);
+      if (self.volumetric) brain.path.Clear();
+      else UpdatePath(brain, pr, self, view, tick, r.goal);
       const Vec3 wp = SteerPoint(brain, r.goal);
       out.desiredHeading = Deflect(BearingTo(foot, wp), self.heading, ground);
       float drive = sp * std::max(0.0f, r.speed) * spd;
@@ -2290,8 +2501,247 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       break;
     }
 
+    case Intent::Orbit: {
+      // ---- NOSE-FIRST ROUND THE CIRCLE -------------------------------------
+      // Pure pursuit of a point `lookahead` radians further round the circle
+      // than the body is: from outside the circle that point is inward of the
+      // nose and the body spirals in, from inside it is outward, on it the
+      // nose leads the tangent -- so the radius corrects itself and the path
+      // is a curve, never the polygon a tangent-plus-correction walks.
+      const Vec3 tc = brain.targetPos;
+      const float theta = BearingTo(tc, centre);
+      if (brain.orbitBearingValid)
+        brain.orbitSwept += std::abs(WrapPi(theta - brain.lastOrbitBearing));
+      brain.lastOrbitBearing = theta;
+      brain.orbitBearingValid = true;
+      const float ahead = theta + (float)brain.orbitSign * ob.lookahead;
+      const Vec3 goal{tc.x + std::sin(ahead) * brain.orbitR, tc.y,
+                      tc.z + std::cos(ahead) * brain.orbitR};
+      out.desiredHeading = Deflect(BearingTo(centre, goal), self.heading, ground);
+      out.driveScale = sp * ob.speed * spd;
+      if (self.volumetric) {
+        out.altitudeSet = true;
+        out.altitude = tc.y + brain.orbitH;
+      }
+      break;
+    }
+
+    case Intent::Charge: {
+      // ---- THE PASS ---------------------------------------------------------
+      // 1 TURN-IN: curve off the circle toward where the target WILL be, at
+      //   `turnInSpeed` -- the turn rate makes it a curve, not a pivot.
+      // 2 THE RUN: nose within `lineUp` of the line, so drive at chargeSpeed.
+      //   Inside `lockDist` the line stops homing: the body is committed and
+      //   goes THROUGH, which is the whole difference between a charge and a
+      //   creature that stops on top of you.
+      // 3 THE OVERRUN: past the closest point, keep the locked line until
+      //   `overrun` voxels out (or passMax ticks), then the pass is over and
+      //   the next lap begins the way the body is going.
+      // THE BITE IS THROWN FROM THE RUN, `biteLead` ticks of travel short of
+      // the target so the gape is open when the jaws arrive, through the
+      // ordinary attack request -- but with NO commit: no FaceTarget lock and
+      // no planted feet, the run carries the jaws.
+      if (brain.passPhase == 0) {
+        brain.passPhase = 1;
+        brain.passSince = tick;
+        brain.passLocked = false;
+        brain.passBit = false;
+        brain.passClosest = 1e9f;
+        brain.passes++;
+      }
+      const uint32_t age = tick - brain.passSince;
+      const float runV =
+          std::max(1.0f, self.speed * std::max(ob.chargeSpeed, 0.1f) * spd);
+      Vec3 tvel = brain.haveTargetVel ? brain.targetVel : Vec3{};
+      if (tgtActor != nullptr && tgtActor->velocity.len() > 1e-3f)
+        tvel = tgtActor->velocity;
+      if (!self.volumetric) tvel.y = 0.0f;
+      const float tHit = d / runV;
+      Vec3 P = brain.targetPos + tvel * (tHit * ob.lead);
+      P.y += ob.hitHeight;
+      const float want = BearingTo(centre, P);
+      const float err = std::abs(WrapPi(want - self.heading));
+      // THE SNOUT TO THE TARGET'S SKIN, not centre to centre: the front of
+      // the body along its 3D facing (a shark's nose is eleven voxels ahead of
+      // its middle), and the target's own half-width off the other end.
+      const float cp = std::cos(self.pitch);
+      const Vec3 fw3{std::sin(self.heading) * cp, std::sin(self.pitch),
+                     std::cos(self.heading) * cp};
+      const float snoutFwd =
+          std::max(self.muzzleFwd, self.length > 0.0f ? self.length * 0.5f : 0.0f);
+      const Vec3 muzzle = centre + fw3 * snoutFwd;
+      const float tR = tgtActor != nullptr ? std::max(0.5f, tgtActor->radius * 0.8f) : 1.5f;
+      const float dm = std::max(0.0f, BodyDist(self, muzzle, brain.targetPos) - tR);
+      if (brain.passPhase == 1 && err <= ob.lineUp) brain.passPhase = 2;
+      // A TURN-IN THAT CANNOT LINE UP IS ABANDONED: the target was inside the
+      // body's turning circle the whole way round (the slow-down below should
+      // have prevented it), and another lap is a better plan than a spiral.
+      if (brain.passPhase == 1 && age > ob.passMax / 2) {
+        brain.passPhase = 0;
+        DrawLap(brain, ob, self, tick, true);
+        out.desiredHeading = self.heading;
+        out.driveScale = sp * ob.speed * spd;
+        break;
+      }
+      if (brain.passPhase >= 2 && !brain.passLocked && dm <= ob.lockDist) {
+        brain.passLocked = true;
+        brain.passHeading = want;
+        brain.passAlt = P.y;
+      }
+      brain.passClosest = std::min(brain.passClosest, dm);
+      if (brain.passPhase == 2 && brain.passLocked &&
+          dm > brain.passClosest + 1.0f)
+        brain.passPhase = 3;
+      const float heading = brain.passLocked ? brain.passHeading : want;
+      out.desiredHeading = Deflect(heading, self.heading, ground);
+      float drive = brain.passPhase == 1 ? ob.turnInSpeed : ob.chargeSpeed;
+      // THE TURN-IN SLOWS TO MAKE ITS TURN. A body at speed v turning at w
+      // draws a circle of radius v/w, and a target inside that circle is never
+      // lined up -- it orbits it instead, which is the one thing a charge must
+      // not do. The circle that leaves on the nose's line and passes through
+      // the target has radius d / (2 sin err); the speed that turns that
+      // tightly is w x that radius (with a margin, and a floor so the body
+      // still glides through the turn).
+      if (brain.passPhase == 1 && err > 0.05f && self.turnRate > 0.0f) {
+        const float rNeed = d / (2.0f * std::max(std::sin(std::min(err, 1.5707963f)), 0.05f));
+        const float vTurn = 0.65f * self.turnRate * rNeed;
+        drive = std::min(drive, std::max(0.3f, vTurn / std::max(1.0f, self.speed)));
+      }
+      out.driveScale = sp * drive * spd;
+      if (self.volumetric) {
+        out.altitudeSet = true;
+        out.altitude = brain.passLocked ? brain.passAlt : P.y;
+        out.breach = brain.passPhase >= 2;
+      }
+      // ---- the bite, from the run ----
+      // THE JAWS' OWN CONE: how far off the nose the target is as seen from
+      // the snout. A bite is thrown in the turn-in too, if the target is in
+      // reach and inside `biteCone` of where the jaws point -- a head can
+      // reach round to what the body is still turning onto.
+      // ...OR WHETHER THE JAWS' LINE RUNS THROUGH THE BODY AT ALL: close in,
+      // an angle to the target's CENTRE says nothing (a man two voxels off a
+      // shark's nose is 45 degrees off it and squarely in its mouth). The
+      // target's half-width plus a mouth either side of the line, and not
+      // behind the snout.
+      float snoutErr = 3.14159265f;
+      bool onLine = false;
+      {
+        const Vec3 toS = brain.targetPos - muzzle;
+        const float l = toS.len();
+        if (l > 1e-3f)
+          snoutErr = std::acos(std::clamp(fw3.dot(toS * (1.0f / l)), -1.0f, 1.0f));
+        const float ahead = toS.dot(fw3);
+        const float lateral = (toS - fw3 * ahead).len();
+        onLine = ahead > -tR && lateral <= tR + 1.5f;
+      }
+      const bool jawsOn = onLine || snoutErr <= ob.biteCone;
+      if (!brain.passBit && brain.visible && (brain.passPhase >= 2 || jawsOn)) {
+        // Timed against the speed the body HAS, along the line to the target
+        // (a run still accelerating covers far less than its ceiling): the
+        // jaws should be open when they arrive, not seven ticks of top speed
+        // short of it.
+        const Vec3 toT = brain.targetPos - muzzle;
+        const float closing =
+            toT.len() > 1e-3f
+                ? std::max(0.0f, self.velocity.dot(toT * (1.0f / toT.len())))
+                : 0.0f;
+        const float trigger =
+            std::max(closing, 0.25f * runV) * (float)ob.biteLead *
+                std::max(dt, 1e-4f) +
+            1.0f;
+        if (dm <= trigger && jawsOn) {
+          brain.passBit = true;
+          brain.passBites++;
+          const uint32_t jit =
+              pr.attack.jitterTicks == 0
+                  ? 0
+                  : rng::Hash3((uint32_t)self.id ^ kSaltAttack, tick, 1) %
+                        pr.attack.jitterTicks;
+          brain.nextAttackTick = tick + pr.attack.cadenceTicks + jit;
+          brain.attackInterval = pr.attack.cadenceTicks + jit;
+          brain.lastAttackTick = tick;
+          brain.attacksIssued++;
+          out.attack = true;
+          out.request.mobId = self.id;
+          out.request.targetId = brain.targetId;
+          out.request.style =
+              pr.attack.styles.empty() ? std::string() : pr.attack.styles[0];
+          out.request.targetPoint = P;
+          out.request.tick = tick;
+          out.request.commitTicks = pr.attack.commitTicks;
+          out.request.distance = d;
+          brain.passBiteTick = tick;
+        }
+      }
+      // SANDVOX_PASS_TRACE=1: one line per tick of a pass -- the phase, the
+      // gaps, the line it wants against the one it has, and the drive (rule
+      // 6: "the charge missed" has a dozen causes and they are all geometry).
+      {
+        static const bool kPassTrace = std::getenv("SANDVOX_PASS_TRACE") != nullptr;
+        if (kPassTrace)
+          std::printf("pass #%llu t%u ph %d d %.1f dm %.1f err %+.2f want %+.2f "
+                      "hd %+.2f lock %d bit %d drive %.2f v %.1f P(%.1f %.1f %.1f) "
+                      "c(%.1f %.1f %.1f)\n",
+                      (unsigned long long)self.id, tick, brain.passPhase, d, dm,
+                      WrapPi(want - self.heading), want, self.heading,
+                      (int)brain.passLocked, (int)brain.passBit, out.driveScale,
+                      self.velocity.len(), P.x, P.y, P.z, centre.x, centre.y,
+                      centre.z);
+      }
+      // ...AND PEELS OFF ONCE THE JAWS HAVE CLOSED. The line holds through the
+      // gape and the snap (biteLead ticks of travel plus the cut); then the
+      // body goes PAST, on a line turned `peel` off its own the way the next
+      // lap will run, so it brushes by instead of ramming the body it bit.
+      if (brain.passBit && brain.passPhase != 3 &&
+          tick >= brain.passBiteTick + ob.biteLead + 6u) {
+        brain.passPhase = 3;
+        brain.passLocked = true;
+        brain.passHeading = self.heading + (float)brain.orbitSign * ob.peel;
+        brain.passAlt = P.y;
+      }
+      // ---- ...and the pass ends ----
+      const bool past = brain.passPhase == 3 && d >= ob.overrun;
+      if (past || age >= ob.passMax) {
+        brain.passPhase = 0;
+        DrawLap(brain, ob, self, tick, true);
+      }
+      break;
+    }
+
     default:
       break;
+  }
+
+  // ---- A SWIMMER SAYS WHAT HEIGHT IT WANTS (IntentOut::altitude) -----------
+  // The verbs that close on, keep to or swing at a target ask for its height;
+  // a day verb for its goal's (the goal is a FOOT point, the altitude is the
+  // centre's). Flee, guard, dodge and idle hold the depth they have.
+  if (self.volumetric && !out.altitudeSet) {
+    switch (brain.intent) {
+      case Intent::FaceTarget:
+      case Intent::Approach:
+      case Intent::HoldRange:
+      case Intent::CircleStrafe:
+      case Intent::RequestAttack:
+        if (brain.hasTarget) {
+          out.altitudeSet = true;
+          out.altitude = brain.targetPos.y;
+        }
+        break;
+      case Intent::Sleep:
+      case Intent::Work:
+      case Intent::Wander:
+      case Intent::Socialize:
+      case Intent::Eat:
+      case Intent::Goto:
+        if (brain.routine.active) {
+          out.altitudeSet = true;
+          out.altitude = brain.routine.goal.y + self.size.y * 0.5f;
+        }
+        break;
+      default:
+        break;
+    }
   }
 
   // ---- ...AND THE FEET KEEP MOVING THROUGH THE SWING ----------------------

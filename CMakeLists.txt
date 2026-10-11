@@ -524,6 +524,8 @@ add_library(sandvox_core OBJECT
   src/game/prefab.cpp
   src/game/mob.cpp
   src/game/mob_shock.cpp
+  # A body the water carries (MobDef::SwimDef): the swimmers' locomotion.
+  src/game/mob_swim.cpp
   # The death screen's peel: depth layers of a corpse's bricks, drawn as
   # clones (render only) and read as strata.
   src/game/autopsy.cpp
@@ -685,6 +687,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_elec_mob.cpp
   src/test/selftest_dye.cpp
   src/test/selftest_wound.cpp
+  src/test/selftest_aquatic.cpp
   src/test/selftest_solute.cpp
   src/test/selftest_heat.cpp
   src/test/selftest_impact.cpp
