@@ -3170,8 +3170,12 @@ Status GateFreefall(Ctx& c, std::string& detail) {
 //
 // Claims, each attributed to the tick it failed on (CLAUDE.md rule 6):
 //   (A) NO RIG HOLDS. UntunnelRig holds a rig whose step ends in a chunk with
-//       no collider yet; a held rig hangs in the air for a tick. With the
-//       lookahead serving the body's whole extent there should be none.
+//       no collider yet; a held rig hangs in the air for a tick. None on a
+//       chunk the lookahead listed at least kSnapshotLatency + 1 ticks ahead
+//       (a budget failure); a hold on a chunk listed later than that (the rig
+//       bounced off the face into a chunk nothing pointed at) is bounded by
+//       `freefallSlope.maxLateHolds` -- only the fetch round trip separates
+//       that one from its patch.
 //   (B) NOTHING RELEASED into unvouched space.
 //   (C) NO ARREST IN OPEN AIR. A tick in which the pelvis lost more than
 //       `freefallSlope.airArrestMs` m/s (beyond gravity) while the nearest
@@ -3180,6 +3184,26 @@ Status GateFreefall(Ctx& c, std::string& detail) {
 //       Each is reported with what the colliders round the pelvis were built
 //       on (TerrainEntry outMask = a neighbour that was outside the window).
 //   (D) IT GETS DOWN: the body descends at least half the face.
+//   (E) NO LINEAR RUNAWAY-NET ACTION. Physics::SweepRunawayRigs slows a
+//       jointed body that sits at 90% of its velocity ceiling; a rig that is
+//       merely FALLING fast must never trip it (its limbs damped one at a time
+//       read as a 27 m/s arrest in open air and splatted the body there).
+//       Trips at the ANGULAR bar (a limb the solver keeps at 47.1 rad/s after
+//       an impact -- the net's own case) are recorded with the part, not
+//       failed: `spinDamps` in the report.
+//
+// TWO ARMS (round 2 of the ticket, 2026-10-11). The first round's single arm
+// started 60 m above the face's middle and met it at ~45 m/s; the owner's real
+// mountain (`default`, 2 km) is a different regime, reproduced with
+// SANDVOX_FREEFALL_SITE below: the rig reached 75 m/s in open air, the runaway
+// net fired on every limb and the body burst with "manifolds static 0 dyn 0",
+// and grazing the face at 60 m/s it was held 22 ticks waiting for patches.
+//   graze:    the round-1 arm (start 60 m above the face's middle).
+//   terminal: 300 m higher, barely drifting toward the face, so the rig is at
+//             terminal velocity long before it meets it. Adds (F): the limp
+//             rig's speed stays within `freefallSlope.terminalSlack` of
+//             player.maxFall (Mob::ApplyRigAirDrag -- the controller's own
+//             terminal velocity, so going limp does not speed the fall up).
 // SANDVOX_FREEFALL_DUMP=1 prints every tick's row.
 constexpr int kSlopeMaxTicks = 900;  // 30 s at 30 Hz
 
@@ -3198,11 +3222,26 @@ Status GateFreefallSlope(Ctx& c, std::string& detail) {
     return fail("tree atlas did not load: " + log);
   const worldmap::WorldMapData real = worldmap::CurrentWorldMap();  // a COPY
   if (!real.Loaded()) return fail("no world map loaded");
+  // SANDVOX_FREEFALL_SITE=<map>,x,y,z,vx,vy,vz (voxels, voxels/s): drop the
+  // body there instead -- the owner's real mountain, e.g. the ticket's
+  // `default,5700,19830,-69483,0,0,40`. A diagnostic arm: the PASS/FAIL
+  // claims are the gate's, the face numbers (zMid, hFoot) the site's column.
+  struct Site { char map[64] = "peaks"; float x = 0, y = 0, z = 0, vx = 0, vy = 0, vz = 0; bool set = false; } site;
+  if (const char* e = std::getenv("SANDVOX_FREEFALL_SITE")) {
+    char m[64] = {};
+    if (std::sscanf(e, "%63[^,],%f,%f,%f,%f,%f,%f", m, &site.x, &site.y, &site.z, &site.vx, &site.vy,
+                    &site.vz) == 7) {
+      std::snprintf(site.map, sizeof site.map, "%s", m);
+      site.set = true;
+    } else {
+      return fail(std::string("SANDVOX_FREEFALL_SITE unreadable: ") + e);
+    }
+  }
   worldmap::WorldMapData pk;
   std::vector<uint32_t> words;
-  if (!worldmap::LoadWorldMap(dir, "peaks", set, c.mats.size(), kDefaultSeed, pk, log) ||
+  if (!worldmap::LoadWorldMap(dir, site.map, set, c.mats.size(), kDefaultSeed, pk, log) ||
       !worldmap::PackWorldMap(set, pk, words, log))
-    return fail("the peaks map did not load: " + log);
+    return fail(std::string("the ") + site.map + " map did not load: " + log);
   const IVec3 savedOrigin = c.world.WindowOrigin();
   c.ctx.WaitIdle();
   worldmap::SetCurrentWorldMap(pk);
@@ -3221,10 +3260,22 @@ Status GateFreefallSlope(Ctx& c, std::string& detail) {
   const int hMid = World::TerrainHeight(fx, zMid, kDefaultSeed);
   const int hTop = World::TerrainHeight(fx, zMid + 400, kDefaultSeed);
   const int hFoot = World::TerrainHeight(fx, zMid - 400, kDefaultSeed);
-  const float startX = (float)fx + 0.5f;
-  const float startZ = (float)(zMid - 40) + 0.5f;
-  const float startY = (float)(hMid + 600) + Player::kHalfY;
-  const IVec3 startChunk{ifloor(startX) >> 4, ifloor(startY) >> 4, ifloor(startZ) >> 4};
+  const float startX = site.set ? site.x : (float)fx + 0.5f;
+  const float startZ = site.set ? site.z : (float)(zMid - 40) + 0.5f;
+  const float startY = site.set ? site.y : (float)(hMid + 600) + Player::kHalfY;
+  if (site.set) {
+    // The column profile along the push, so a dump says what the body met.
+    std::printf("freefall-slope: site %s (%.1f,%.1f,%.1f) v (%.1f,%.1f,%.1f) vox/s; ground under it %d\n",
+                site.map, site.x, site.y, site.z, site.vx, site.vy, site.vz,
+                World::TerrainHeight(ifloor(site.x), ifloor(site.z), kDefaultSeed));
+    const float hl = std::sqrt(site.vx * site.vx + site.vz * site.vz);
+    const float ux = hl > 0 ? site.vx / hl : 0.0f, uz = hl > 0 ? site.vz / hl : 1.0f;
+    std::string prof;
+    for (int d = -40; d <= 2400; d += 80)
+      prof += Format(" %d:%d", d, World::TerrainHeight(ifloor(site.x + ux * d), ifloor(site.z + uz * d),
+                                                       kDefaultSeed));
+    std::printf("freefall-slope: ground along the push (dist:height)%s\n", prof.c_str());
+  }
   const float g = CurrentTuning().player.gravity / kVoxelMeters;
   const double airArrestMs = BaselineNumber("freefallSlope.airArrestMs", 6.0);
   const double airClearVox = BaselineNumber("freefallSlope.airClearVox", 24.0);
@@ -3244,172 +3295,447 @@ Status GateFreefallSlope(Ctx& c, std::string& detail) {
     return best;
   };
 
-  c.debris.Reset();
-  c.debris.ResetUntunnelProbe();
-  c.mobs.Reset(true);
-  c.mobs.ClearRisings();
-  c.stream.OnRegen();
-  c.world.SetWindowOrigin({startChunk.x - (int)kNChunk / 2, startChunk.y - (int)kNChunk / 2,
-                           startChunk.z - (int)kNChunk / 2});
-  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
-  c.ctx.WaitIdle();
-
   struct Row {
     Vec3 hips, hv;
     int limp = 0, held = 0, alive = 1, bills = 0;
     float clear = 0.0f, lost = 0.0f;
     int outPatches = 0;  // patches round the pelvis built against an out-of-window neighbour
     float ms = 0.0f;
+    // Where the tick's physics went (attribution for a slow graze/splat):
+    // the Jolt step, its CCD and collide spans, contacts against terrain,
+    // and the terrain colliders built (count, shape + add wall us).
+    float stepMs = 0.0f, ccdMs = 0.0f, findMs = 0.0f, solveMs = 0.0f;
+    uint32_t statMan = 0, ccdBodies = 0, meshes = 0, tris = 0;
+    float meshUs = 0.0f;
+    uint32_t damped = 0;  // runaway-net damps this tick (Physics::Runaway)
+    float spin = 0.0f;    // the fastest-spinning part's rad/s, and which
+    std::string spinPart;
+    int needAgo = -1;     // a held tick: how long before it the chunk was first listed
     std::string why;     // a held tick: the unvouched chunk and its NeedProbe
   };
-  std::vector<Row> rows;
-  std::string crossing;
-  uint32_t bordersBefore = c.debris.Settle().terrainBorderStale;
-  c.debris.EnableNeedProbe(true);
-  {
-    support::TickRig rig(c, 92000u, startChunk);
-    rig.Authority().harness.pinWindow = false;
-    rig.Authority().harness.haveSubmitChunk = false;
-    PlayerSession& s = rig.Session();
-    s.avatar.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
-    s.avatar.SetDefs(&c.mobs.Defs(), kAvatarDefName);
-    c.mobs.SetAvatar(&s.avatar);
-    s.player.fly = false;
-    s.player.grounded = false;
-    // A step toward the face (+z), the way a jump off a ledge carries one.
-    s.player.vel = Vec3{0.0f, 0.0f, 30.0f};
-    s.player.pos = Vec3{startX, startY, startZ};
-    s.player.SnapRender();
-    const int hips = s.avatar.PartIndex("hips");
-    uint32_t prevHolds = c.debris.Untunnel().rigHolds;
-    uint32_t prevBills = 0;
-    Vec3 prevHv{};
-    bool havePrev = false;
-    int stillTicks = 0;
-    for (int i = 0; i < kSlopeMaxTicks; i++) {
-      const double t0 = NowSeconds();
-      support::RunTicks(rig, 1);
-      Row r;
-      r.ms = (float)((NowSeconds() - t0) * 1000.0);
-      const uint32_t h = c.debris.Untunnel().rigHolds;
-      r.held = (int)(h - prevHolds);
-      prevHolds = h;
-      if (r.held) {
-        const IVec3 uc = c.debris.Untunnel().lastChunk;
-        const uint32_t now = rig.tick;
-        auto ago = [&](uint32_t t) { return t == 0 ? -1 : (int)(now - t); };
-        if (const DebrisSystem::NeedRec* nr = c.debris.NeedProbe(uc))
-          r.why = Format("unvouched (%d,%d,%d): need -%d rank %u req -%d cached -%d built -%d "
-                         "| ceil %u budget %u sky %u gather %u build %u",
-                         uc.x, uc.y, uc.z, ago(nr->firstNeeded), nr->firstRank,
-                         ago(nr->firstRequested), ago(nr->firstCached), ago(nr->firstBuilt),
-                         nr->ceilingCut, nr->budgetDenied, nr->skyskipped, nr->gatherDeferred,
-                         nr->buildDeferred);
-        else
-          r.why = Format("unvouched (%d,%d,%d): never listed", uc.x, uc.y, uc.z);
-      }
-      r.limp = s.avatar.Spawned() && s.avatar.Ragdolled() ? 1 : 0;
-      r.alive = s.avatar.Spawned() && s.avatar.Alive() ? 1 : 0;
-      const uint32_t bills = s.avatar.Spawned() ? s.avatar.FallsBilled() : prevBills;
-      r.bills = (int)(bills - prevBills);
-      prevBills = bills;
-      Vec3 hp = s.player.pos;
-      Quat hq{};
-      if (hips >= 0 && s.avatar.Spawned()) s.avatar.PartWorldTransform(hips, hp, hq);
-      r.hips = hp;
-      Vec3 lin{}, ang{};
-      const uint64_t hb = hips >= 0 && s.avatar.Spawned() ? s.avatar.PartBody(hips) : 0;
-      if (hb != 0 && c.phys.GetBodyVelocities(hb, lin, ang)) r.hv = lin;
-      else r.hv = s.player.vel;
-      r.clear = clearance(hp);
-      if (havePrev) {
-        const Vec3 expect = prevHv + Vec3{0.0f, -g * kTickDt, 0.0f};
-        r.lost = (expect - r.hv).len() * kVoxelMeters;  // m/s
-      }
-      {
-        const IVec3 pc{ifloor(hp.x) >> 4, ifloor(hp.y) >> 4, ifloor(hp.z) >> 4};
-        for (int dz = -1; dz <= 1; dz++)
-          for (int dy = -1; dy <= 1; dy++)
-            for (int dx = -1; dx <= 1; dx++) {
-              uint32_t om = 0, mm = 0;
-              if (c.debris.TerrainBorder({pc.x + dx, pc.y + dy, pc.z + dz}, om, mm) && om != 0)
-                r.outPatches++;
+  const float vTerminal = CurrentTuning().player.maxFall / kVoxelMeters;
+  const double terminalSlack = BaselineNumber("freefallSlope.terminalSlack", 1.1);
+  const double maxLateHolds = BaselineNumber("freefallSlope.maxLateHolds", 6.0);
+  std::string fails;
+  auto check = [&](bool ok, const std::string& what) {
+    if (!ok) fails += (fails.empty() ? "" : "; ") + what;
+  };
+  std::string armsDetail;
+  float splatMsWorst = 0.0f;
+
+  // ONE ARM: drop the player from (sx,sy,sz) with v0, follow it down, check.
+  auto runArm = [&](const char* arm, float sx, float sy, float sz, Vec3 v0, uint32_t tick0,
+                    bool graze) {
+    const IVec3 armChunk{ifloor(sx) >> 4, ifloor(sy) >> 4, ifloor(sz) >> 4};
+    c.debris.Reset();
+    c.debris.ResetUntunnelProbe();
+    c.phys.ResetRunawayProbe();
+    c.world.ResetFetchProbe();
+    c.mobs.Reset(true);
+    c.mobs.ClearRisings();
+    c.stream.OnRegen();
+    c.world.SetWindowOrigin({armChunk.x - (int)kNChunk / 2, armChunk.y - (int)kNChunk / 2,
+                             armChunk.z - (int)kNChunk / 2});
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+
+    std::vector<Row> rows;
+    std::string crossing;
+    uint32_t bordersBefore = c.debris.Settle().terrainBorderStale;
+    const uint32_t urgentBefore = c.debris.Settle().terrainUrgentBuilds;
+    c.debris.EnableNeedProbe(true);
+    {
+      support::TickRig rig(c, tick0, armChunk);
+      rig.Authority().harness.pinWindow = false;
+      rig.Authority().harness.haveSubmitChunk = false;
+      PlayerSession& s = rig.Session();
+      s.avatar.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+      s.avatar.SetDefs(&c.mobs.Defs(), kAvatarDefName);
+      c.mobs.SetAvatar(&s.avatar);
+      s.player.fly = false;
+      s.player.grounded = false;
+      // A step toward the face (+z), the way a jump off a ledge carries one.
+      s.player.vel = v0;
+      s.player.pos = Vec3{sx, sy, sz};
+      s.player.SnapRender();
+      const int hips = s.avatar.PartIndex("hips");
+      uint32_t prevHolds = c.debris.Untunnel().rigHolds;
+      uint32_t prevBills = 0, prevDamped = 0;
+      Vec3 prevHv{};
+      bool havePrev = false;
+      int stillTicks = 0;
+      for (int i = 0; i < kSlopeMaxTicks; i++) {
+        const Physics::MeshStats m0 = c.phys.Meshes();
+        const double t0 = NowSeconds();
+        support::RunTicks(rig, 1);
+        Row r;
+        r.ms = (float)((NowSeconds() - t0) * 1000.0);
+        {
+          const Physics::StepStats& st = c.phys.LastStep();
+          r.stepMs = (float)st.ms;
+          r.ccdMs = st.phaseWallMs[(int)Physics::StepPhase::Ccd];
+          r.findMs = st.phaseWallMs[(int)Physics::StepPhase::FindCollisions];
+          r.solveMs = st.phaseWallMs[(int)Physics::StepPhase::SolveVelocity] +
+                      st.phaseWallMs[(int)Physics::StepPhase::SolvePosition];
+          r.statMan = st.manifoldsStatic;
+          for (int k = 0; k < Physics::kRoleCols; k++) r.ccdBodies += st.ccdBodies[k];
+          const Physics::MeshStats& m1 = c.phys.Meshes();
+          r.meshes = (uint32_t)(m1.meshes - m0.meshes);
+          r.tris = (uint32_t)(m1.tris - m0.tris);
+          r.meshUs = (float)((m1.shapeUs - m0.shapeUs) + (m1.addUs - m0.addUs) +
+                             (m1.removeUs - m0.removeUs));
+          const uint32_t dmp = c.phys.Runaway().damped + c.phys.Runaway().cut;
+          r.damped = dmp - prevDamped;
+          prevDamped = dmp;
+        }
+        const uint32_t h = c.debris.Untunnel().rigHolds;
+        r.held = (int)(h - prevHolds);
+        prevHolds = h;
+        if (r.held) {
+          const IVec3 uc = c.debris.Untunnel().lastChunk;
+          const uint32_t now = rig.tick;
+          auto ago = [&](uint32_t t) { return t == 0 ? -1 : (int)(now - t); };
+          if (const DebrisSystem::NeedRec* nr = c.debris.NeedProbe(uc)) {
+            r.needAgo = ago(nr->firstNeeded);
+            r.why = Format("unvouched (%d,%d,%d): need -%d rank %u req -%d cached -%d built -%d "
+                           "| ceil %u budget %u sky %u gather %u build %u",
+                           uc.x, uc.y, uc.z, ago(nr->firstNeeded), nr->firstRank,
+                           ago(nr->firstRequested), ago(nr->firstCached), ago(nr->firstBuilt),
+                           nr->ceilingCut, nr->budgetDenied, nr->skyskipped, nr->gatherDeferred,
+                           nr->buildDeferred);
+          } else {
+            r.why = Format("unvouched (%d,%d,%d): never listed", uc.x, uc.y, uc.z);
+          }
+        }
+        r.limp = s.avatar.Spawned() && s.avatar.Ragdolled() ? 1 : 0;
+        r.alive = s.avatar.Spawned() && s.avatar.Alive() ? 1 : 0;
+        const uint32_t bills = s.avatar.Spawned() ? s.avatar.FallsBilled() : prevBills;
+        r.bills = (int)(bills - prevBills);
+        prevBills = bills;
+        Vec3 hp = s.player.pos;
+        Quat hq{};
+        if (hips >= 0 && s.avatar.Spawned()) s.avatar.PartWorldTransform(hips, hp, hq);
+        r.hips = hp;
+        Vec3 lin{}, ang{};
+        const uint64_t hb = hips >= 0 && s.avatar.Spawned() ? s.avatar.PartBody(hips) : 0;
+        if (hb != 0 && c.phys.GetBodyVelocities(hb, lin, ang)) r.hv = lin;
+        else r.hv = s.player.vel;
+        r.clear = clearance(hp);
+        if (s.avatar.Spawned())
+          for (int pi = 0; pi < s.avatar.PartCount(); pi++) {
+            const uint64_t pb = s.avatar.PartBody(pi);
+            Vec3 pl{}, pa{};
+            if (pb == 0 || !c.phys.GetBodyVelocities(pb, pl, pa)) continue;
+            if (pa.len() > r.spin) {
+              r.spin = pa.len();
+              r.spinPart = s.avatar.PartName(pi) ? s.avatar.PartName(pi) : "?";
             }
+          }
+        if (havePrev) {
+          const Vec3 expect = prevHv + Vec3{0.0f, -g * kTickDt, 0.0f};
+          // (At terminal velocity Mob::ApplyRigAirDrag takes back one tick of
+          // gravity, ~0.33 m/s: far under airArrestMs, so it needs no term.)
+          r.lost = (expect - r.hv).len() * kVoxelMeters;  // m/s
+        }
+        {
+          const IVec3 pc{ifloor(hp.x) >> 4, ifloor(hp.y) >> 4, ifloor(hp.z) >> 4};
+          for (int dz = -1; dz <= 1; dz++)
+            for (int dy = -1; dy <= 1; dy++)
+              for (int dx = -1; dx <= 1; dx++) {
+                uint32_t om = 0, mm = 0;
+                if (c.debris.TerrainBorder({pc.x + dx, pc.y + dy, pc.z + dz}, om, mm) && om != 0)
+                  r.outPatches++;
+              }
+        }
+        // THE CROSSING (as `freefall` reports it): the first tick the pelvis is
+        // inside the landform, and what every collision source said about the
+        // chunks round it at that moment.
+        if (crossing.empty() && hp.y < (float)World::TerrainHeight(ifloor(hp.x), ifloor(hp.z),
+                                                                   kDefaultSeed) - 8.0f) {
+          const IVec3 pc{ifloor(hp.x) >> 4, ifloor(hp.y) >> 4, ifloor(hp.z) >> 4};
+          crossing = Format("%s: crossed the ground at tick %d (pelvis chunk (%d,%d,%d), linearCast %d):",
+                            arm, i, pc.x, pc.y, pc.z, hb != 0 && c.phys.UsesLinearCast(hb) ? 1 : 0);
+          const WorldSnapshot& sn = c.world.Snap();
+          for (int dy = 1; dy >= -1; dy--) {
+            const IVec3 q{pc.x, pc.y + dy, pc.z};
+            uint32_t om = 0, mm = 0;
+            const bool body = c.debris.TerrainBorder(q, om, mm);
+            const uint32_t occ = sn.valid && sn.occupancy.size() >= kNumChunks
+                                     ? sn.occupancy[World::SlotChunkIndex(q)] : 0xFFFFFFFFu;
+            crossing += Format(" [y%+d built %u body %d out %x miss %x vouched %d cached %d sky %d occ %u]",
+                               dy, c.debris.TerrainBuiltVersion(q), body ? 1 : 0, om, mm,
+                               c.debris.ColliderVouched(q) ? 1 : 0, c.world.Cached(q) ? 1 : 0,
+                               c.debris.SkyKnown(q) ? 1 : 0, occ);
+          }
+        }
+        // AN ARREST WITH NOTHING NEAR: what the body could have met. The Jolt
+        // step's manifolds (terrain vs body-body, by role pair), the runaway
+        // net's damps, and every terrain patch with a body round the pelvis --
+        // its border guesses and how much matter its own cached chunk holds.
+        if (r.lost > (float)airArrestMs && r.clear > (float)airClearVox) {
+          const Physics::StepStats& st = c.phys.LastStep();
+          r.why += Format(" AIR: manifolds static %u dyn %u, runaway damps %u;", st.manifoldsStatic,
+                          st.manifoldsDyn, r.damped);
+          for (int a = 0; a < Physics::kRoleCols; a++)
+            for (int b = a; b < Physics::kRoleCols; b++)
+              if (const uint32_t n = st.rolePairs[a * Physics::kRoleCols + b])
+                r.why += Format(" pair %d-%d x%u;", a, b, n);
+          const IVec3 pc{ifloor(hp.x) >> 4, ifloor(hp.y) >> 4, ifloor(hp.z) >> 4};
+          for (int dz = -1; dz <= 1; dz++)
+            for (int dy = -1; dy <= 1; dy++)
+              for (int dx = -1; dx <= 1; dx++) {
+                const IVec3 q{pc.x + dx, pc.y + dy, pc.z + dz};
+                uint32_t om = 0, mm = 0;
+                if (!c.debris.TerrainBorder(q, om, mm)) continue;
+                const CachedChunk* cc = c.world.Cached(q);
+                int solid = -1;
+                if (cc && cc->voxels.size() == kChunkVol) {
+                  solid = 0;
+                  for (uint32_t w : cc->voxels) {
+                    const uint32_t m = w & 0xFFFu;
+                    if (m != 0u && m < c.mats.size() && c.mats[m].gpu.klass == CLASS_SOLID) solid++;
+                  }
+                }
+                r.why += Format(" patch(%d,%d,%d) v%u out %x miss %x inWin %d solid %d;", dx, dy, dz,
+                                c.debris.TerrainBuiltVersion(q), om, mm,
+                                c.world.ChunkInWindow(q) ? 1 : 0, solid);
+              }
+        }
+        prevHv = r.hv;
+        havePrev = true;
+        rows.push_back(r);
+        // Settled: a limp (or dead) body that has stopped for two seconds.
+        if (r.limp && r.hv.len() * kVoxelMeters < 0.5f) stillTicks++;
+        else stillTicks = 0;
+        if (stillTicks >= 60) break;
       }
-      // THE CROSSING (as `freefall` reports it): the first tick the pelvis is
-      // inside the landform, and what every collision source said about the
-      // chunks round it at that moment.
-      if (crossing.empty() && hp.y < (float)World::TerrainHeight(ifloor(hp.x), ifloor(hp.z),
-                                                                 kDefaultSeed) - 8.0f) {
-        const IVec3 pc{ifloor(hp.x) >> 4, ifloor(hp.y) >> 4, ifloor(hp.z) >> 4};
-        crossing = Format("crossed the ground at tick %d (pelvis chunk (%d,%d,%d), linearCast %d):",
-                          i, pc.x, pc.y, pc.z, hb != 0 && c.phys.UsesLinearCast(hb) ? 1 : 0);
-        const WorldSnapshot& sn = c.world.Snap();
-        for (int dy = 1; dy >= -1; dy--) {
-          const IVec3 q{pc.x, pc.y + dy, pc.z};
-          uint32_t om = 0, mm = 0;
-          const bool body = c.debris.TerrainBorder(q, om, mm);
-          const uint32_t occ = sn.valid && sn.occupancy.size() >= kNumChunks
-                                   ? sn.occupancy[World::SlotChunkIndex(q)] : 0xFFFFFFFFu;
-          crossing += Format(" [y%+d built %u body %d out %x miss %x vouched %d cached %d sky %d occ %u]",
-                             dy, c.debris.TerrainBuiltVersion(q), body ? 1 : 0, om, mm,
-                             c.debris.ColliderVouched(q) ? 1 : 0, c.world.Cached(q) ? 1 : 0,
-                             c.debris.SkyKnown(q) ? 1 : 0, occ);
+      c.mobs.SetAvatar(nullptr);
+      if (s.avatar.Spawned()) s.avatar.Despawn();
+    }
+    c.debris.EnableNeedProbe(false);
+    const uint32_t borders = c.debris.Settle().terrainBorderStale - bordersBefore;
+    const uint32_t urgentBuilds = c.debris.Settle().terrainUrgentBuilds - urgentBefore;
+    // WHAT THE HELD-FOR CHUNKS HELD, read from the mirror cache now that they
+    // have landed: the material in each, by count (attribution for (A)).
+    std::string heldWhat;
+    {
+      std::vector<IVec3> seen;
+      for (const Row& r : rows) {
+        if (!r.held || !r.alive) continue;
+        int ux, uy, uz;
+        if (std::sscanf(r.why.c_str(), "unvouched (%d,%d,%d)", &ux, &uy, &uz) != 3) continue;
+        const IVec3 uc{ux, uy, uz};
+        bool dup = false;
+        for (const IVec3& q : seen) dup = dup || (q.x == uc.x && q.y == uc.y && q.z == uc.z);
+        if (dup || seen.size() >= 6) continue;
+        seen.push_back(uc);
+        const CachedChunk* cc = c.world.Cached(uc);
+        if (!cc || cc->voxels.size() != kChunkVol) {
+          heldWhat += Format(" (%d,%d,%d): not cached;", uc.x, uc.y, uc.z);
+          continue;
+        }
+        std::map<uint32_t, int> n;
+        for (uint32_t w : cc->voxels)
+          if ((w & 0xFFFu) != 0u) n[w & 0xFFFu]++;
+        heldWhat += Format(" (%d,%d,%d):", uc.x, uc.y, uc.z);
+        if (n.empty()) heldWhat += " empty";
+        for (const auto& [m, k] : n)
+          heldWhat += Format(" %s(class %u) x%d", m < c.mats.size() ? c.mats[m].name.c_str() : "?",
+                             m < c.mats.size() ? c.mats[m].gpu.klass : 99u, k);
+        heldWhat += ";";
+      }
+    }
+    const auto ut = c.debris.Untunnel();
+    const auto rw = c.phys.Runaway();
+    // The engine's fetch FIFO over the arm (World::FetchReport): a held chunk
+    // that was requested in time and never cached was queued behind the
+    // per-tick readback cap, or dropped -- this says which.
+    const std::string fetchRep = c.world.FetchReport();
+
+    // ---- the analysis ---------------------------------------------------------
+    int holds = 0, firstHold = -1, airArrests = 0, firstAir = -1, contacts = 0, firstContact = -1;
+    int airBills = 0, outAtAir = 0, splatAway = 0, splatAwayAt = -1, damped = 0, firstDamp = -1;
+    int splatAt = -1, budgetHolds = 0, lateHolds = 0, firstLate = -1, spinDamped = 0;
+    int firstSpin = -1;
+    float worstAir = 0.0f, peakLimp = 0.0f;
+    int worstAirAt = -1, peakLimpAt = -1;
+    std::string billList;
+    for (int i = 0; i < (int)rows.size(); i++) {
+      const Row& r = rows[i];
+      // A HOLD IS ONE OF TWO THINGS, and the needAgo of its chunk says which.
+      // Listed at least kSnapshotLatency + 1 ticks ahead, the patch had time
+      // to be fetched and built and was not: the budgets' fault, and the
+      // sustained "skipping down the face" (22 in a row at 60 m/s on the real
+      // mountain before the in-flight and urgent-lane fixes). Listed later --
+      // the rig BOUNCED and turned into a chunk no lookahead pointed at --
+      // only the fetch round trip separates it from its patch: counted and
+      // bounded (`freefallSlope.maxLateHolds`), not zero.
+      // While the body is ALIVE: UntunnelRig's counter is the world's, and
+      // after a splat it is the radial impulse's pieces flying out in
+      // directions no lookahead pointed at (measured on the real mountain:
+      // 12 of 16 holds were the corpse's pieces in the 20 ticks after it).
+      if (r.held && r.alive) {
+        holds++;
+        if (r.needAgo >= (int)World::kSnapshotLatency + 1) {
+          budgetHolds++;
+          if (firstHold < 0) firstHold = i;
+        } else {
+          lateHolds++;
+          if (firstLate < 0) firstLate = i;
         }
       }
-      prevHv = r.hv;
-      havePrev = true;
-      rows.push_back(r);
-      // Settled: a limp (or dead) body that has stopped for two seconds.
-      if (r.limp && r.hv.len() * kVoxelMeters < 0.5f) stillTicks++;
-      else stillTicks = 0;
-      if (stillTicks >= 60) break;
-    }
-    c.mobs.SetAvatar(nullptr);
-    if (s.avatar.Spawned()) s.avatar.Despawn();
-  }
-  c.debris.EnableNeedProbe(false);
-  const uint32_t borders = c.debris.Settle().terrainBorderStale - bordersBefore;
-  // WHAT THE HELD-FOR CHUNKS HELD, read from the mirror cache now that they
-  // have landed: the material in each, by count (attribution for (A)).
-  std::string heldWhat;
-  {
-    std::vector<IVec3> seen;
-    for (const Row& r : rows) {
-      if (!r.held) continue;
-      int ux, uy, uz;
-      if (std::sscanf(r.why.c_str(), "unvouched (%d,%d,%d)", &ux, &uy, &uz) != 3) continue;
-      const IVec3 uc{ux, uy, uz};
-      bool dup = false;
-      for (const IVec3& q : seen) dup = dup || (q.x == uc.x && q.y == uc.y && q.z == uc.z);
-      if (dup || seen.size() >= 6) continue;
-      seen.push_back(uc);
-      const CachedChunk* cc = c.world.Cached(uc);
-      if (!cc || cc->voxels.size() != kChunkVol) {
-        heldWhat += Format(" (%d,%d,%d): not cached;", uc.x, uc.y, uc.z);
-        continue;
+      // While the body is ALIVE: after the splat the net is on the pieces a
+      // radial impulse flung (its own job, not this claim's). And split by
+      // which bar tripped: a LINEAR trip is a fast rig misread as a driven
+      // one (this ticket); an ANGULAR one is a limb the solver keeps
+      // spinning at the 47.1 rad/s clamp -- the net's own case, recorded
+      // here with the part that spun.
+      if (r.damped && r.alive) {
+        // (The previous row too: the step that CUTS a spinning limb zeroes it,
+        // so the cut tick no longer shows the spin that caused it.)
+        const float spinBar = 0.9f * Physics::MaxBodySpinRad();
+        if (r.spin >= spinBar || (i > 0 && rows[i - 1].spin >= spinBar)) {
+          spinDamped += (int)r.damped;
+          if (firstSpin < 0) firstSpin = i;
+        } else {
+          damped += (int)r.damped;
+          if (firstDamp < 0) firstDamp = i;
+        }
       }
-      std::map<uint32_t, int> n;
-      for (uint32_t w : cc->voxels)
-        if ((w & 0xFFFu) != 0u) n[w & 0xFFFu]++;
-      heldWhat += Format(" (%d,%d,%d):", uc.x, uc.y, uc.z);
-      if (n.empty()) heldWhat += " empty";
-      for (const auto& [m, k] : n)
-        heldWhat += Format(" %s(class %u) x%d", m < c.mats.size() ? c.mats[m].name.c_str() : "?",
-                           m < c.mats.size() ? c.mats[m].gpu.klass : 99u, k);
-      heldWhat += ";";
+      if (r.clear < 6.0f && firstContact < 0) firstContact = i;
+      if (r.clear < 6.0f) contacts++;
+      if (r.limp && r.alive && r.clear > (float)airClearVox && r.hv.len() > peakLimp) {
+        peakLimp = r.hv.len();
+        peakLimpAt = i;
+      }
+      // A bill is made in the tick's PreTick, from the arrest the PREVIOUS
+      // step produced, at the pelvis as that step left it: the previous row's.
+      const float billClear = i > 0 ? rows[i - 1].clear : r.clear;
+      if (r.bills)
+        billList += Format(" t%d(clear %.0f%s)", i, billClear, r.alive ? "" : " dead");
+      // THE SPLAT IS WHERE THE BODY HIT. A lethal bill (the tick the body dies
+      // of a fall) with the pelvis clear of every landform cell is a body that
+      // burst away from what killed it -- after bouncing off it, or lying still
+      // beside it (Mob::TakeRagdollImpact's lethal exception).
+      if (r.bills && !r.alive && i > 0 && rows[i - 1].alive) {
+        splatAt = i;
+        if (billClear > 8.0f) {
+          splatAway++;
+          if (splatAwayAt < 0) splatAwayAt = i;
+        }
+      }
+      // Skip the tick the avatar goes limp (a hand-over from the controller's
+      // velocity to the solver's) and the death tick (a splat reseeds the rig).
+      const bool handover = i > 0 && (rows[i - 1].limp != r.limp || rows[i - 1].alive != r.alive);
+      if (i == 0 || handover) continue;
+      if (billClear > (float)airClearVox && r.bills) airBills++;
+      if (r.lost > (float)airArrestMs && r.clear > (float)airClearVox) {
+        airArrests++;
+        if (firstAir < 0) firstAir = i;
+        outAtAir += r.outPatches;
+        if (r.lost > worstAir) { worstAir = r.lost; worstAirAt = i; }
+      }
     }
+    // THE SPLAT'S COST: the tick the body died on and the one after it (the
+    // pieces' first step), wall clock. Recorded, not asserted (a machine-load
+    // number); the report names it so a hitch has a number beside it.
+    float splatMs = 0.0f;
+    for (int i = splatAt; i >= 0 && i <= splatAt + 1 && i < (int)rows.size(); i++)
+      splatMs = std::max(splatMs, rows[i].ms);
+    splatMsWorst = std::max(splatMsWorst, splatMs);
+    const float startHipsY = rows.empty() ? 0.0f : rows.front().hips.y;
+    float lowest = startHipsY;
+    for (const Row& r : rows) lowest = std::min(lowest, r.hips.y);
+    const float descended = startHipsY - lowest;
+    auto rowAt = [&](int i) -> std::string {
+      if (i < 0 || i >= (int)rows.size()) return "-";
+      const Row& r = rows[i];
+      return Format("tick %d: hips (%.1f,%.1f,%.1f) v (%.1f,%.1f,%.1f) m/s lost %.1f m/s clear %.1f "
+                    "limp %d alive %d held %d bills %d damped %u spin %.1f %s outPatches %d %.1f ms [step %.2f "
+                    "ccd %.2f find %.2f solve %.2f static %u ccdB %u meshes %u tris %u %.2f ms] %s",
+                    i, r.hips.x, r.hips.y, r.hips.z, r.hv.x * kVoxelMeters, r.hv.y * kVoxelMeters,
+                    r.hv.z * kVoxelMeters, r.lost, r.clear, r.limp, r.alive, r.held, r.bills,
+                    r.damped, r.spin, r.spinPart.c_str(), r.outPatches, r.ms, r.stepMs, r.ccdMs, r.findMs, r.solveMs, r.statMan,
+                    r.ccdBodies, r.meshes, r.tris, r.meshUs * 0.001f, r.why.c_str());
+    };
+    const std::string pre = std::string("freefallSlope.") + arm + ".";
+    RecordObserved((pre + "rigHolds").c_str(), (double)holds);
+    RecordObserved((pre + "lateHolds").c_str(), (double)lateHolds);
+    RecordObserved((pre + "spinDamps").c_str(), (double)spinDamped);
+    RecordObserved((pre + "airArrests").c_str(), (double)airArrests);
+    RecordObserved((pre + "descendedVox").c_str(), (double)descended);
+    RecordObserved((pre + "runawayDamps").c_str(), (double)damped);
+    RecordObserved((pre + "peakLimpMs").c_str(), (double)(peakLimp * kVoxelMeters));
+    RecordObserved((pre + "splatTickMs").c_str(), (double)splatMs);
+
+    auto armCheck = [&](bool ok, const std::string& what) {
+      check(ok, std::string(arm) + ": " + what);
+    };
+    if (graze) armCheck(firstContact >= 0, "the body never came within 6 voxels of the face");
+    armCheck(budgetHolds == 0,
+             Format("%d rig-held ticks (UntunnelRig) on a chunk listed in time, first [%s]",
+                    budgetHolds, rowAt(firstHold).c_str()));
+    armCheck(lateHolds <= (int)maxLateHolds,
+             Format("%d rig-held ticks on chunks listed too late to fetch (a bounce), over "
+                    "freefallSlope.maxLateHolds %.0f, first [%s]",
+                    lateHolds, maxLateHolds, rowAt(firstLate).c_str()));
+    armCheck(ut.released == 0, Format("%u bodies released into unvouched space", ut.released));
+    armCheck(airArrests == 0 && airBills == 0,
+             Format("%d arrests and %d billed impacts in open air (worst %.1f m/s at [%s]; %d "
+                    "patches round the pelvis built against an out-of-window neighbour at those "
+                    "ticks)",
+                    airArrests, airBills, worstAir, rowAt(worstAirAt).c_str(), outAtAir));
+    armCheck(splatAway == 0, Format("the lethal splat went off %d time(s) clear of the ground, "
+                                    "first [%s]", splatAway, rowAt(splatAwayAt).c_str()));
+    armCheck(damped == 0,
+             Format("the runaway net slowed or cut %d bodies at their LINEAR bar while the body "
+                    "was alive (run peak %.0f vox/s, %.1f rad/s, %u cut), first [%s]", damped,
+                    rw.peakSpeedVox, rw.peakSpinRad, rw.cut, rowAt(firstDamp).c_str()));
+    if (graze)
+      armCheck(site.set || descended >= 0.5f * (float)(hMid - hFoot),
+               Format("descended only %.0f voxels of a face %d tall (last [%s])", descended,
+                      hTop - hFoot, rowAt((int)rows.size() - 1).c_str()));
+    else
+      armCheck(peakLimp <= (float)terminalSlack * vTerminal && peakLimp >= 0.8f * vTerminal,
+               Format("limp rig peaked at %.1f m/s in open air, terminal velocity (player.maxFall) "
+                      "%.1f m/s, slack x%.2f [%s]",
+                      peakLimp * kVoxelMeters, vTerminal * kVoxelMeters, terminalSlack,
+                      rowAt(peakLimpAt).c_str()));
+    if (!crossing.empty()) check(false, crossing);
+    armsDetail += Format(" | %s: start y%.0f, %d ticks, first contact tick %d, %d ticks within 6 "
+                         "vox of the face, descended %.0f vox, peak limp %.1f m/s, rig holds %d "
+                         "(%d late, released %u), open-air arrests %d, runaway damps %d linear / "
+                         "%d spin (first spin [%s]), border re-gathers %u, urgent builds %u, splat "
+                         "tick %.1f ms, fall bills:%s | held-for chunks:%s%s%s",
+                         arm, sy, (int)rows.size(), firstContact, contacts, descended,
+                         peakLimp * kVoxelMeters, holds, lateHolds, ut.released, airArrests, damped,
+                         spinDamped, firstSpin >= 0 ? rowAt(firstSpin).substr(0, 160).c_str() : "-",
+                         borders, urgentBuilds, splatMs,
+                         billList.empty() ? " none" : billList.c_str(),
+                         heldWhat.empty() ? " none" : heldWhat.c_str(),
+                         holds > 0 ? " | " : "", holds > 0 ? fetchRep.c_str() : "");
+    if (std::getenv("SANDVOX_FREEFALL_DUMP"))
+      for (size_t i = 0; i < rows.size(); i++)
+        std::printf("  fs %s %s\n", arm, rowAt((int)i).c_str());
+  };
+
+  if (site.set) {
+    runArm("site", startX, startY, startZ, Vec3{site.vx, site.vy, site.vz}, 92000u, true);
+  } else {
+    runArm("graze", startX, startY, startZ, Vec3{0.0f, 0.0f, 30.0f}, 92000u, true);
+    // 300 m higher and barely drifting toward the face: terminal velocity is
+    // reached in open air, then the rig meets the face at it.
+    runArm("terminal", startX, startY + 3000.0f, startZ - 20.0f, Vec3{0.0f, 0.0f, 8.0f}, 94000u,
+           false);
   }
-  const auto ut = c.debris.Untunnel();
 
   // ---- the pristine world back (as `altitude` does) --------------------------
-  std::string restoreWhy;
   {
     biomes::EnvironmentStamp stamp;
     std::string l;
     if (!ReloadEnvironment(c.ctx, c.sim, c.mats, stamp, l)) {
       worldmap::SetCurrentWorldMap(real);
-      restoreWhy = "ReloadEnvironment REFUSED afterwards: " + l;
+      check(false, "ReloadEnvironment REFUSED afterwards: " + l);
     }
     c.stream.OnRegen();
     c.world.SetWindowOrigin(savedOrigin);
@@ -3417,92 +3743,14 @@ Status GateFreefallSlope(Ctx& c, std::string& detail) {
     c.ctx.WaitIdle();
     DrainFullRefill(c.ctx, c.world, c.sim, IVec3{108 >> 4, 122 >> 4, 108 >> 4});
   }
-
-  // ---- the analysis -----------------------------------------------------------
-  int holds = 0, firstHold = -1, airArrests = 0, firstAir = -1, contacts = 0, firstContact = -1;
-  int airBills = 0, outAtAir = 0, splatAway = 0, splatAwayAt = -1;
-  float worstAir = 0.0f;
-  int worstAirAt = -1;
-  std::string billList;
-  for (int i = 0; i < (int)rows.size(); i++) {
-    const Row& r = rows[i];
-    if (r.held) { holds++; if (firstHold < 0) firstHold = i; }
-    if (r.clear < 6.0f && firstContact < 0) firstContact = i;
-    if (r.clear < 6.0f) contacts++;
-    // A bill is made in the tick's PreTick, from the arrest the PREVIOUS
-    // step produced, at the pelvis as that step left it: the previous row's.
-    const float billClear = i > 0 ? rows[i - 1].clear : r.clear;
-    if (r.bills)
-      billList += Format(" t%d(clear %.0f%s)", i, billClear, r.alive ? "" : " dead");
-    // THE SPLAT IS WHERE THE BODY HIT. A lethal bill (the tick the body dies
-    // of a fall) with the pelvis clear of every landform cell is a body that
-    // burst away from what killed it -- after bouncing off it, or lying still
-    // beside it (Mob::TakeRagdollImpact's lethal exception).
-    if (r.bills && !r.alive && i > 0 && rows[i - 1].alive && billClear > 8.0f) {
-      splatAway++;
-      if (splatAwayAt < 0) splatAwayAt = i;
-    }
-    // Skip the tick the avatar goes limp (a hand-over from the controller's
-    // velocity to the solver's) and the death tick (a splat reseeds the rig).
-    const bool handover = i > 0 && (rows[i - 1].limp != r.limp || rows[i - 1].alive != r.alive);
-    if (i == 0 || handover) continue;
-    if (billClear > (float)airClearVox && r.bills) airBills++;
-    if (r.lost > (float)airArrestMs && r.clear > (float)airClearVox) {
-      airArrests++;
-      if (firstAir < 0) firstAir = i;
-      outAtAir += r.outPatches;
-      if (r.lost > worstAir) { worstAir = r.lost; worstAirAt = i; }
-    }
-  }
-  const float startHipsY = rows.empty() ? 0.0f : rows.front().hips.y;
-  float lowest = startHipsY;
-  for (const Row& r : rows) lowest = std::min(lowest, r.hips.y);
-  const float descended = startHipsY - lowest;
-  auto rowAt = [&](int i) -> std::string {
-    if (i < 0 || i >= (int)rows.size()) return "-";
-    const Row& r = rows[i];
-    return Format("tick %d: hips (%.1f,%.1f,%.1f) v (%.1f,%.1f,%.1f) m/s lost %.1f m/s clear %.1f "
-                  "limp %d alive %d held %d bills %d outPatches %d %.1f ms %s",
-                  i, r.hips.x, r.hips.y, r.hips.z, r.hv.x * kVoxelMeters, r.hv.y * kVoxelMeters,
-                  r.hv.z * kVoxelMeters, r.lost, r.clear, r.limp, r.alive, r.held, r.bills,
-                  r.outPatches, r.ms, r.why.c_str());
-  };
-  RecordObserved("freefallSlope.rigHolds", (double)holds);
-  RecordObserved("freefallSlope.airArrests", (double)airArrests);
-  RecordObserved("freefallSlope.descendedVox", (double)descended);
-
-  std::string fails;
-  auto check = [&](bool ok, const std::string& what) {
-    if (!ok) fails += (fails.empty() ? "" : "; ") + what;
-  };
-  check(restoreWhy.empty(), restoreWhy);
-  check(steepest >= 16, Format("the face is not steep at x %d (steepest %d over 4 voxels)", fx, steepest));
-  check(firstContact >= 0, "the body never came within 6 voxels of the face");
-  check(holds == 0, Format("%d rig-held ticks (UntunnelRig), first [%s]", holds, rowAt(firstHold).c_str()));
-  check(ut.released == 0, Format("%u bodies released into unvouched space", ut.released));
-  check(airArrests == 0 && airBills == 0,
-        Format("%d arrests and %d billed impacts in open air (worst %.1f m/s at [%s]; %d patches "
-               "round the pelvis built against an out-of-window neighbour at those ticks)",
-               airArrests, airBills, worstAir, rowAt(worstAirAt).c_str(), outAtAir));
-  check(splatAway == 0, Format("the lethal splat went off %d time(s) clear of the ground, first [%s]",
-                               splatAway, rowAt(splatAwayAt).c_str()));
-  check(descended >= 0.5f * (float)(hMid - hFoot),
-        Format("descended only %.0f voxels of a face %d tall (last [%s])", descended, hTop - hFoot,
-               rowAt((int)rows.size() - 1).c_str()));
-  detail = Format("face x %d z %d (mid y%d, foot y%d, top y%d, steepest %d/4 vox), %d ticks, "
-                  "first contact tick %d, %d ticks within 6 vox of the face, descended %.0f vox, "
-                  "rig holds %d (released %u), open-air arrests %d, border re-gathers %u, "
-                  "fall bills:%s | held-for chunks:%s",
-                  fx, zMid, hMid, hFoot, hTop, steepest, (int)rows.size(), firstContact, contacts,
-                  descended, holds, ut.released, airArrests, borders,
-                  billList.empty() ? " none" : billList.c_str(),
-                  heldWhat.empty() ? " none" : heldWhat.c_str());
-  check(crossing.empty(), crossing);
-  if (!fails.empty()) detail += " | " + fails;
+  check(site.set || steepest >= 16,
+        Format("the face is not steep at x %d (steepest %d over 4 voxels)", fx, steepest));
+  RecordObserved("freefallSlope.splatTickMs", (double)splatMsWorst);
+  detail = Format("face x %d z %d (mid y%d, foot y%d, top y%d, steepest %d/4 vox)%s", fx, zMid, hMid,
+                  hFoot, hTop, steepest, armsDetail.c_str());
+  if (!fails.empty()) detail += " || " + fails;
   const bool ok = fails.empty();
   std::printf("freefall-slope: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
-  if (std::getenv("SANDVOX_FREEFALL_DUMP"))
-    for (size_t i = 0; i < rows.size(); i++) std::printf("  fs %s\n", rowAt((int)i).c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 

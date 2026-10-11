@@ -1225,6 +1225,9 @@ class DebrisSystem {
     // of the window, or not yet cached) became readable (TerrainEntry
     // outMask / missMask).
     uint32_t terrainBorderStale = 0;
+    // First builds a fast creature anchor's urgent lane took past the build
+    // budget (ManageTerrain, kTerrainUrgentBuilds).
+    uint32_t terrainUrgentBuilds = 0;
   };
   const SettleProbe& Settle() const { return settle_; }
   // Diagnostic: the mirror version the terrain collider for `wc` was last
@@ -1895,6 +1898,12 @@ class DebrisSystem {
     // ColliderVouched honours that verdict for the rest of the tick
     // (debris.cpp, "ONE VERDICT PER TICK").
     uint32_t skyTick = 0;
+    // The tick this system last asked for the chunk while it had NO cached
+    // copy. The World's queue coalesces only while a request is QUEUED; once
+    // drained into a readback it is in flight for kSnapshotLatency ticks and
+    // a fresh request queued a duplicate copy (and spent this system's fetch
+    // budget again) every one of them (ManageTerrain, "IN FLIGHT").
+    uint32_t fetchReqTick = 0;
   };
   // One patch this tick's terrain sweep decided to rebuild, captured by value
   // so the polygonize + Jolt shape build can run on worker threads after the
@@ -2284,6 +2293,9 @@ class DebrisSystem {
   std::vector<uint32_t> terrainNeedOrder_;
   std::vector<std::pair<IVec3, float>> terrainNeedTmp_;
   std::vector<float> terrainNeedGrid_;  // per-body chunk grid, min distance
+  // ...and the chunks a FAST creature anchor reaches within the next few
+  // ticks (ManageTerrain, "THE URGENT LANE"), packed keys, sorted per tick.
+  std::vector<uint64_t> terrainUrgent_;
   // ---- THE FLOOD'S LABEL MAP: dense per chunk, shared across one tick -----
   //
   // Was an unordered_map keyed by packed world cell: a hash probe per cell

@@ -7948,6 +7948,76 @@ neighbors, so this needs an explicit connectivity pass:
      - **The limp hand-over is seated**: `PlayerAvatar::RagdollFollow` keeps
        the capsule's offset from the pelvis on the first limp tick and eases
        it to the 0.2 m lift, rather than popping half a voxel up.
+  6. **Round 2: the real mountain (2026-10-11, same ticket).** The round-1
+     gate meets the `peaks` face at ~45 m/s; the owner's mountain (`default`,
+     2 km) is reproduced by `SANDVOX_FREEFALL_SITE=default,5700.3,19860,-69420,0,0,60
+     --gate freefall-slope` (any map, any start), and there the rig was held
+     22 ticks in a row grazing the face at 60 m/s and burst in open air at
+     y 11,446 with **no contact at all** ("AIR: manifolds static 0 dyn 0").
+     Physics and collider builds were never the cost (Jolt step p99 0.9 ms,
+     patch builds <= 1.9 ms a tick); what read as stutter was the body
+     standing still in mid-air. Four causes, each attributed by the gate's
+     per-tick rows (step / CCD / manifolds / patches built / runaway damps /
+     the fastest-spinning part):
+     - **A falling rig tripped the runaway net.** No terminal velocity: a limp
+       rig reached 75 m/s, past 90% of the 80 m/s ceiling, the net damped its
+       limbs to 20% one at a time, and the arrest read that as a 27 m/s impact
+       and splatted the body. Two fixes: `Mob::ApplyRigAirDrag` gives a loose
+       rig (limp or dead) the controller's own terminal velocity
+       (`player.maxFall`), applied as the controller applies it — free fall
+       up to vt, then each tick takes back what gravity added (at most three
+       ticks of it) — as one uniform Δv on every simulated limb (no joint
+       load). A rig under vt is untouched, so ordinary tumbles stay
+       bit-identical (a quadratic drag from vt/2 was tried first and slowed
+       the `freefall` gate's 150 m drop below its own terminal check). The
+       arrest's reference velocity includes that Δv, so it is never braking. And `SweepRunawayRigs` judges the
+       LINEAR bar against the mean velocity of the body's joint partners — a
+       rig moving fast as a whole is not driven (`SANDVOX_RUNAWAY_ABS_SPEED=1`
+       is the old arm). The angular bar is unchanged.
+     - **Terrain fetches were requested up to five times.** The World's queue
+       coalesces only while a request is QUEUED; drained into a readback it is
+       in flight for `kSnapshotLatency` ticks and `ManageTerrain` asked again
+       every one of them — duplicate 16 KiB copies, and the terrain fetch
+       budget spent ~4x per chunk, so the chunk the rig entered next was
+       refused it (rank 62-82, "budget 3-9"). `TerrainEntry::fetchReqTick`
+       waits `kSnapshotLatency + 2` ticks before renewing
+       (`SANDVOX_TERRAIN_REFETCH=1` = old arm).
+     - **The build budget went to rock interiors.** An 18^3 occupancy box that
+       is entirely whole matter has no surface; it was charged a build anyway.
+       Now it is handled like sky: no polygonize, no charge, no body.
+     - **The urgent lane.** A creature anchor moving faster than 15 m/s marks
+       its own box and the chunks its sweep reaches within 64 voxels as
+       urgent; a NEVER-BUILT urgent chunk may exceed the fetch / gather /
+       build budgets by 16 / 16 / 10 a tick (`SettleProbe::terrainUrgentBuilds`,
+       `SANDVOX_NO_TERRAIN_URGENT=1`). Rebuilds keep the six-a-tick budget
+       (a stale patch still vouches), and slow bodies never enter the lane.
+     Result on the real mountain: 0 open-air arrests, 0 runaway damps, the rig
+     holds terminal velocity (54 m/s) and grazes 1 km down the face before a
+     39 m/s impact on it splats it ON the face; holds while alive 22 -> 4 (two
+     on chunks first listed after a BOUNCE — fewer than
+     `kSnapshotLatency + 1` ticks before arrival, only a fetch round trip from
+     their patch — one on a chunk no anchor box listed, one requested nine
+     ticks ahead and still uncached at arrival with the fetch FIFO showing no
+     drop; both singletons unexplained). The gate now runs two arms on `peaks`
+     (`graze`, and `terminal` 300 m higher), counts holds and damps only while
+     the body is alive (after a splat the counter is the flung pieces'), and
+     splits holds into budget (must be 0) and late (bounded by
+     `freefallSlope.maxLateHolds`); its report carries the arm's
+     `World::FetchReport` when anything was held.
+     **The splat** cost ~7-12 ms in one tick, most of it `StainWound`'s crater
+     distance field (`BuildCellDist`: two 13-neighbour sweeps over the whole
+     crater box, and a lethal landing craters every limb). It is now a bounded
+     bucket Dijkstra over the rim the readers can see (exact within
+     `3 * pad`, identical values; `SANDVOX_CELLDIST_SWEEP=1` = old arm):
+     the `terminal` arm's splat, same tick both arms, 7.2 -> 2.6 ms
+     (woundStain 5.3 -> 1.4).
+     `SANDVOX_SPLAT_PROF=<ms>` prints a slow lethal landing / mob PreTick by
+     stage, with the burn profiler's stages beside it.
+     **Open:** after a hard graze a hand (or a whole arm) can windmill at
+     Jolt's 47.1 rad/s clamp in open air; the net then damps it and, 45 steps
+     on, cuts the wrist — a hand flies off a living body mid-fall. The gate
+     records it (`spinDamps`, with the part) and does not fail on it; the fix
+     is limp-rig joint damping, a tuning change that moves every ragdoll.
 
 ### A corpse in armour is not allowed to be a motor (2026-09-13; `Physics::SweepRunawayRigs`, gate `corpse-armor`)
 
@@ -8003,8 +8073,10 @@ injected past the sweep.
 
 1. **The linear ceiling comes down from Jolt's 500 m/s to 80 m/s.** 500 m/s is
    8.3 m — 83 voxels — of `LinearCast` sweep in one 60 Hz step. Nothing in this
-   world legitimately exceeds 32 m/s (terminal velocity for a fall the height of
-   the whole residency window); `physics.explosionMaxSpeed` is 30 and
+   world legitimately exceeds the falling body's terminal velocity,
+   `player.maxFall` (53.5 m/s; a limp or dead rig has it too since 2026-10-11,
+   `Mob::ApplyRigAirDrag` — before that a 2 km fall reached 75 m/s and tripped
+   the net below); `physics.explosionMaxSpeed` is 30 and
    `ragdoll.maxLaunchSpeed` is 14. **The angular ceiling deliberately stays at
    Jolt's value**, because ω = v/r makes a one-voxel ball rolling at 5 m/s
    legitimately 100 rad/s, and a lower cap would make every pebble skid.
@@ -8018,7 +8090,10 @@ injected past the sweep.
    just means it is fed again next step. A corpse that comes apart is a far
    better outcome than a game that stops. **Jointed bodies only:** a body with
    nothing attached has nobody to feed it, and damping every rolling pebble
-   would be a more visible bug than the one being fixed.
+   would be a more visible bug than the one being fixed. **The linear bar is
+   RELATIVE** (2026-10-11): a body's speed is measured against the mean
+   velocity of its joint partners, because a motor drives a piece against the
+   pieces it is jointed to, and a whole rig falling fast is not driven.
 3. **An unusable transform is repaired, not narrated.** It used to be a
    `fprintf` on the argument that the position is already gone and the real fix
    is upstream. Both halves are true and it is still the wrong call, because the

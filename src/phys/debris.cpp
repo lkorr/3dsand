@@ -4,6 +4,7 @@
 #include "sim/bytestream.h"  // nothing here encodes; net/debrissync.h does
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -182,6 +183,23 @@ static uint32_t TerrainBuildsPerTick() {
 // chunks with matter in them.
 constexpr float kTerrainLookaheadSeconds = 0.35f;
 constexpr float kTerrainLookaheadVox = 192.0f;
+// THE URGENT LANE (ticket 2026-10-09_15-16-57, round 2). A creature anchor
+// moving faster than kTerrainUrgentSpeedVox marks the chunks its own box
+// overlaps and the ones its sweep reaches within kTerrainUrgentReachVox as
+// urgent; an urgent chunk that has NEVER been built may exceed the fetch,
+// gather and build budgets by these counts a tick. Measured on the `peaks`
+// cliff at terminal velocity: the patch the rig entered next was cached five
+// ticks ahead and then deferred by the six-a-tick build budget six times
+// running ("build 6") while the budget polygonized chunks it would reach
+// later -- and the rig was held in mid-air. First builds only: a stale patch
+// still vouches (UntunnelRig holds only on NO collider), so rebuilds keep the
+// walking-hitch budget exactly as it was, and a slow body (anything walking,
+// a fire's debris) never enters the lane.
+constexpr float kTerrainUrgentSpeedVox = 150.0f;   // 15 m/s
+constexpr float kTerrainUrgentReachVox = 64.0f;    // ~3 ticks at 60 m/s
+constexpr uint32_t kTerrainUrgentFetches = 16;
+constexpr uint32_t kTerrainUrgentGathers = 16;
+constexpr uint32_t kTerrainUrgentBuilds = 10;
 // Consecutive steps a body may be held at a collider boundary before it is let
 // through anyway. Half a second at 60 Hz: long enough that the patch normally
 // lands first, short enough that a starved readback reads as a stutter rather
@@ -6108,6 +6126,12 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
   // (which only the A* planner reads, through the fetch) is the last.
   std::vector<std::pair<IVec3, float>>& needed = terrainNeed_;
   needed.clear();
+  terrainUrgent_.clear();
+  // SANDVOX_NO_TERRAIN_URGENT=1: no urgent lane (the A/B arm, one binary).
+  static const bool urgentOff = [] {
+    const char* e = std::getenv("SANDVOX_NO_TERRAIN_URGENT");
+    return e != nullptr && e[0] != '0';
+  }();
   {
   PhaseTimer ptNeed(prof_, Phase::TerrainNeed);
   // THE BOX A THING CAN ACTUALLY TOUCH, and the distance is measured to that
@@ -6389,6 +6413,9 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
             // (`freefall-slope`, 2026-10-09: "budget 5" on the held chunk).
             if (h > 0.0f) d2 += t * t;
             needed.push_back({wc, d2});
+            if (!urgentOff && h > 0.0f && speed >= kTerrainUrgentSpeedVox &&
+                t <= kTerrainUrgentReachVox)
+              terrainUrgent_.push_back(World::PackChunkKey(wc));
           }
     }
   };
@@ -6406,6 +6433,9 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     const size_t before = needed.size();
     needAround(a.pos, a.radius);
     if (prof_.on) prof_.anchorChunks += needed.size() - before;
+    if (!urgentOff && a.vel.len() >= kTerrainUrgentSpeedVox)
+      for (size_t k = before; k < needed.size(); k++)
+        terrainUrgent_.push_back(World::PackChunkKey(needed[k].first));
     needHorizon(a.pos, a.radius, a.horizon);
     sweepAhead(a.pos, a.vel, a.radius);
   }
@@ -6478,11 +6508,17 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
       if (i >= kTerrainNeedCeiling) r.ceilingCut++;
     }
   if (needed.size() > kTerrainNeedCeiling) needed.resize(kTerrainNeedCeiling);
+  std::sort(terrainUrgent_.begin(), terrainUrgent_.end());
+  terrainUrgent_.erase(std::unique(terrainUrgent_.begin(), terrainUrgent_.end()),
+                       terrainUrgent_.end());
   }  // end Phase::TerrainNeed
 
   uint32_t builds = 0;
   uint32_t fetchesThisTick = 0;
   uint32_t gathers = 0;
+  // The urgent lane's own counts (kTerrainUrgent*), spent only past the
+  // ordinary budgets and only by a never-built chunk a fast anchor needs now.
+  uint32_t urgentFetches = 0, urgentGathers = 0, urgentBuilds = 0;
   if (FILE* tf = DebrisTrace()) {
     uint64_t hn = 0;
     for (const auto& nd : needed) hn = TraceF(TraceIV(hn, nd.first), nd.second);
@@ -6501,6 +6537,9 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     t.lastNeeded = tick;
     const CachedChunk* cc = world.Cached(wc);
     NeedRec* probe = needProbeOn_ ? &needProbe_[World::PackChunkKey(wc)] : nullptr;
+    const bool urgent = t.builtVersion == 0 && !terrainUrgent_.empty() &&
+                        std::binary_search(terrainUrgent_.begin(), terrainUrgent_.end(),
+                                           World::PackChunkKey(wc));
     if (probe && cc && probe->firstCached == 0) probe->firstCached = tick;
     // Known-empty sky needs no patch, so it costs no fetch: the budget below
     // goes to the ground a falling body is about to reach (SkyKnown).
@@ -6510,15 +6549,44 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
       continue;
     }
     if (!cc) {
+      // IN FLIGHT. A chunk asked for within the last kSnapshotLatency + 2
+      // ticks is on its way (queued, or drained into a readback that lands at
+      // T + kSnapshotLatency). Asking again queued a SECOND copy the moment
+      // the first left the queue, so a chunk cost this budget -- and the
+      // engine's 64-per-tick readback -- up to five times before it landed,
+      // and on a cliff face at 60 m/s, where every chunk the rig enters holds
+      // rock, the chunk it entered next was refused the budget until it was
+      // too late to build (`freefall-slope` on the real mountain: rank 62-82,
+      // "budget 3-9", held 22 ticks). Past the window the request is renewed:
+      // a fetch that was dropped (streamed out, a reset) is not waited on.
+      // SANDVOX_TERRAIN_REFETCH=1 is the ask-every-tick arm.
+      static const bool refetchEveryTick = [] {
+        const char* e = std::getenv("SANDVOX_TERRAIN_REFETCH");
+        return e != nullptr && e[0] != '0';
+      }();
+      // ...and only while the snapshot that would carry it is still to come:
+      // once a valid snapshot at or past the request tick has published and
+      // the chunk is still not cached, the fetch was dropped (a world reset
+      // bumped the snapshot epoch, the slot streamed out) or is queued behind
+      // the engine's per-tick cap, and asking again is right (a still-queued
+      // request coalesces in World::RequestChunkFetch).
+      if (!refetchEveryTick && t.fetchReqTick != 0 && tick >= t.fetchReqTick &&
+          tick - t.fetchReqTick <= World::kSnapshotLatency + 2u && snap.valid &&
+          snap.tick < t.fetchReqTick)
+        continue;
       // THE FETCH BUDGET. World::kFetchPerTick is 64 for the whole engine and
       // a felled tree used to ask for 454 in one tick; everything else that
       // needs the mirror -- the player's own 3x3x3, an island scan's
       // EventReady, another body's ground -- then waited behind it. Asking for
       // fewer than arrive costs nothing: the queue is deduped and the chunks
       // this tick declined are the head of the next sweep.
-      if (fetchesThisTick < kTerrainFetchPerTick) {
+      const bool urgentFetch = fetchesThisTick >= kTerrainFetchPerTick && urgent &&
+                               urgentFetches < kTerrainUrgentFetches;
+      if (fetchesThisTick < kTerrainFetchPerTick || urgentFetch) {
         world.RequestChunkFetch(wc, World::FetchSource::Terrain);
-        fetchesThisTick++;
+        if (urgentFetch) urgentFetches++;
+        else fetchesThisTick++;
+        t.fetchReqTick = tick;
         if (probe && probe->firstRequested == 0) probe->firstRequested = tick;
       } else if (probe) {
         probe->budgetDenied++;
@@ -6643,11 +6711,16 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     // tick. Charged ahead of the build budget because a gather that ends in
     // "identical surface" or "sky" never reaches that one.
     if (gathers >= kTerrainGatherPerTick) {
-      settle_.terrainGatherDeferred++;
-      if (probe) probe->gatherDeferred++;
-      continue;
+      if (urgent && urgentGathers < kTerrainUrgentGathers) {
+        urgentGathers++;
+      } else {
+        settle_.terrainGatherDeferred++;
+        if (probe) probe->gatherDeferred++;
+        continue;
+      }
+    } else {
+      gathers++;
     }
-    gathers++;
     IVec3 origin{wc.x * (int)kChunk, wc.y * (int)kChunk, wc.z * (int)kChunk};
     pst.To(Phase::TerrainGather);
     if (prof_.on) prof_.gathers++;
@@ -6747,10 +6820,20 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     // instead of ~50 KB of mesh is the smaller half of the win.
     uint64_t h = 1469598103934665603ull;  // FNV-1a over the occupancy words
     bool anyOcc = false;
+    int occCells = 0;
     for (uint32_t i = 0; i < kMcOccWords; i++) {
       h = (h ^ occ[i]) * 1099511628211ull;
       anyOcc = anyOcc || occ[i] != 0u;
+      occCells += std::popcount(occ[i]);
     }
+    // BURIED: every sample of the 18^3 box is whole matter, so the surface is
+    // empty exactly as it is for sky -- the polygonizer would return no
+    // triangles and the entry would hold no body. It was charged a build
+    // anyway, and the mountain a falling body grazes is mostly this: the
+    // budget went to rock interiors while the face the rig was about to
+    // enter waited (`freefall-slope`, real mountain). Not with a partial
+    // powder cell in it (the weighted surface is the polygonizer's call).
+    const bool buried = occCells == kMcOccCells && !anyPartial;
     // A partial cell's MASS moves the weighted surface without flipping a bit,
     // so it is part of the identity too -- folded only when there is one, so
     // a box of whole cells hashes exactly as before.
@@ -6767,7 +6850,7 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
       settle_.terrainSame++;
       continue;
     }
-    if (!anyOcc) {  // sky: nothing to mesh, nothing to charge
+    if (!anyOcc || buried) {  // sky or buried: nothing to mesh, nothing to charge
       // ...but a patch that HAD ground and lost all of it leaves whatever was
       // asleep on it in mid-air: wake what touched it, as a rebuild would.
       if (t.handle)
@@ -6786,11 +6869,17 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
       continue;
     }
     if (builds >= TerrainBuildsPerTick()) {
-      settle_.terrainDeferred++;
-      if (probe) { probe->buildDeferred++; if (probe->firstBuilt == tick) probe->firstBuilt = 0; }
-      continue;
+      if (urgent && urgentBuilds < kTerrainUrgentBuilds) {
+        urgentBuilds++;
+        settle_.terrainUrgentBuilds++;
+      } else {
+        settle_.terrainDeferred++;
+        if (probe) { probe->buildDeferred++; if (probe->firstBuilt == tick) probe->firstBuilt = 0; }
+        continue;
+      }
+    } else {
+      builds++;
     }
-    builds++;
     settle_.terrainBuilds++;
 
     // DEFERRED to after the sweep, where the tick's builds run in parallel
