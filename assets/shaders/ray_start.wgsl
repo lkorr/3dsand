@@ -310,7 +310,7 @@ fn rsSkyTileClip(level : u32, roL : vec3f, rd : vec3f, inv : vec3f, tIn : f32, t
   return vec2f(max(tIn, first - 1e-3), tOut);
 }
 
-const FAR_SPHERE_MARGIN_CHUNKS : i32 = 2;   // raymarch.wgsl, same name
+const FAR_SPHERE_MARGIN_CHUNKS : i32 = 3;   // raymarch.wgsl, same name
 const FAR_DITHER_MAX : f32 = 0.5;           // raymarch.wgsl farDither's ceiling
 
 fn rayStartFarByte(level : u32, c : vec3<i32>) -> u32 {
@@ -442,7 +442,8 @@ fn rayStartFar(ro : vec3f, rd : vec3f, inv : vec3f, tStart : f32) -> f32 {
 // march can meet is wide enough on screen for the lattice argument above.
 // k = R.viewPx / (2 tan(fovY / 2)) is px per fine voxel at t = 1.
 //
-// THE SHIPPED TIER (RS_LAW_PX = 3): k >= 3 * 224 = 672 — a 2-px square lattice,
+// THE SHIPPED TIER (RS_LAW_PX = 3): k >= 3 * 208 = 624 (3 * 224 = 672 until the
+// handoff sphere moved one chunk in, 2026-10-11) — a 2-px square lattice,
 // one ray per 2x2 block through its corner, a 5x5 min. Exactly what landed
 // 2026-09-28, untouched. It holds at 1920x1080 and the shipped fovY 1.35 by
 // 0.4% (k = 675): the game's OWN 1600x900 window (k = 562) has never had it,
@@ -468,8 +469,8 @@ fn rayStartFar(ro : vec3f, rd : vec3f, inv : vec3f, tStart : f32) -> f32 {
 //     every pixel of the block with the stagger (5x5 reaches only 2 on one side
 //     of an odd row), so the bound holds with room.
 // And the two halves are trusted separately:
-//   * THE CASCADE HALF needs its cells >= 2.5 px everywhere: k >= 2.5 * 224 =
-//     560 (rayStartFarOk). Below that this pass does not march it, writes
+//   * THE CASCADE HALF needs its cells >= 2.5 px everywhere: k >= 2.5 * 208 =
+//     520 (rayStartFarOk; 560 at the old 224-cell sphere). Below that this pass does not march it, writes
 //     RS_NONE for "nothing fine", and the reader does not read rs1.
 //   * THE FINE HALF needs no global law at all: every fine cell a pixel skips
 //     lies nearer than its start, so capping the start at k / 2.5 (fs(),

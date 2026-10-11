@@ -780,6 +780,40 @@ std::vector<double> g_frameGpuSeries[sandvox::kPerfNodeCount];
 // did not run is a zero for it, padded at print time.
 std::map<std::string, std::vector<double>> g_frameGpuPassSeries;
 size_t g_frameGpuFrames = 0;
+// ---- WHERE THE WARM-UP ENDS, AND WHICH FRAME WAS THE BAD ONE (2026-10-11) --
+// Every --frames percentile excluded the first 60 frames as warm-up, which is
+// right for a standing camera and wrong for the in-flight repro (SANDVOX_AT_FLY
+// with _AFTER): the startup horizon refill (262k sieve entries) drains for
+// hundreds of frames and owned the far rows' p99, so "what spikes while I fly"
+// could not be read off the run. SANDVOX_FRAMES_STATS_FROM=<frame> moves the
+// cut. And a percentile says THAT the frame was slow, not WHY: the worst
+// frames are kept with what that frame actually dispatched (sieve entries,
+// surface-map columns, window shifts) and its biggest GPU passes, so one run
+// attributes the hitch instead of a series of elimination runs (CLAUDE.md
+// rule 6).
+uint64_t FramesStatsFrom() {
+  static const uint64_t from = [] {
+    const char* e = std::getenv("SANDVOX_FRAMES_STATS_FROM");
+    return e ? (uint64_t)std::strtoull(e, nullptr, 10) : (uint64_t)60;
+  }();
+  return from;
+}
+struct HarnessFrameRec {
+  uint32_t live = 0;          // liveFrameNo, the key the GPU sample comes back on
+  double wallMs = 0;
+  uint32_t farEntries = 0;    // sieve entries dispatched by this frame's ticks
+  uint32_t farMapCols = 0;    // ...of which surface-map columns (farmap work)
+  uint32_t shifts = 0;        // residency window shifts in this frame
+  uint32_t ticks = 0;         // ticks this frame ran
+  double gpuMs = -1;          // < 0: the timestamps never landed
+  std::vector<std::pair<double, std::string>> top;   // biggest GPU passes
+};
+std::vector<HarnessFrameRec> g_frameRecs;
+uint32_t g_lastFrameTicks = 0;   // ticksThisFrame, for the record above
+// Frames in which a level's VALID box face was nearer than its handoff sphere
+// (FarField::NearestValidFaceVox) — a seam drawn as the box face instead of
+// the dithered sphere. [margin 2 | the shipped margin][level 1..3].
+uint32_t g_faceBreach[2][3] = {};
 // P2-D: WHICH cause and WHICH arm (support.h SnapshotStallStats). Accumulated
 // over the harness frames only, like the three counters above.
 sandvox::SnapshotStallStats g_frameStallStats{};
@@ -12436,7 +12470,13 @@ int main(int argc, char** argv) {
       static float atFly[3] = {0, 0, 0};
       static int atShotEvery = 0;
       static int atFlyAfter = 0;   // SANDVOX_AT_FLY_AFTER=N: hold still N frames first
+      // SANDVOX_AT_SHOT_FROM=N: no _SHOT_EVERY pictures before frame N, so an
+      // in-flight sequence at a short stride does not also write one for
+      // every frame of the hold.
+      static uint64_t atShotFrom = 0;
       if (frameCounter == 1) {
+        if (const char* sf = std::getenv("SANDVOX_AT_SHOT_FROM"))
+          atShotFrom = (uint64_t)std::strtoull(sf, nullptr, 10);
         if (const char* fa = std::getenv("SANDVOX_AT_FLY_AFTER")) atFlyAfter = std::atoi(fa);
         if (const char* fv = std::getenv("SANDVOX_AT_FLY"))
           std::sscanf(fv, "%f,%f,%f", &atFly[0], &atFly[1], &atFly[2]);
@@ -12452,7 +12492,8 @@ int main(int argc, char** argv) {
       cam.pitch = g_atPitchDeg * 0.0174532925f;
       static std::string atShotName;
       if (frameCounter == g_harnessFrames - 8) g_shotJumpPath = "screenshot_at.bmp";
-      else if (atShotEvery > 0 && frameCounter % (uint64_t)atShotEvery == 0) {
+      else if (atShotEvery > 0 && frameCounter >= atShotFrom &&
+               frameCounter % (uint64_t)atShotEvery == 0) {
         atShotName = "screenshot_at_" + std::to_string(frameCounter) + ".bmp";
         g_shotJumpPath = atShotName.c_str();
       }
@@ -12943,7 +12984,7 @@ int main(int argc, char** argv) {
     // block), and reads 100+ while the screen updates at <10.
     // Skip the first 60 frames: worldgen and first-use pipeline creation are
     // startup cost, not the steady-state stall being measured.
-    if (g_harnessFrames > 0 && frameCounter > 60) {
+    if (g_harnessFrames > 0 && frameCounter > FramesStatsFrom()) {
       g_frameMs.push_back(dt * 1000.0);
       // Snapshot-latent by ~2 ticks, which is irrelevant at percentile scale.
       if (world.Snap().valid)
@@ -15861,6 +15902,7 @@ int main(int argc, char** argv) {
       if (g_harnessFrames > 0) g_tickWallMs.push_back(lastTickMs);
     }
     if (g_harnessFrames > 0) g_frameTickHist[std::min(ticksThisFrame, 4)]++;
+    g_lastFrameTicks = (uint32_t)ticksThisFrame;
     if (ui.paused) accumulator = std::min(accumulator, (double)kTickDt);
 
     // ---- render ----
@@ -21259,7 +21301,35 @@ int main(int argc, char** argv) {
       frameDeclines = TakeReadbackDeclines();
       frameStallStats = TakeSnapshotStallStats();
     }
-    if (g_harnessFrames > 0 && frameCounter > 60) {
+    if (g_harnessFrames > 0) {
+      // Deltas of the run counters, taken every frame (warm-up included) so
+      // the first recorded frame's delta is its own and not the warm-up's.
+      static uint64_t prevFar = 0, prevMap = 0, prevShifts = 0;
+      const uint64_t nowMap = far.MapColsIssued(), nowShifts = stream.Timings().shifts;
+      if (frameCounter > FramesStatsFrom()) {
+        HarnessFrameRec rec;
+        rec.live = liveFrameNo;
+        rec.wallMs = frameWallMs;
+        rec.farEntries = (uint32_t)(g_farEntries - prevFar);
+        rec.farMapCols = (uint32_t)(nowMap - prevMap);
+        rec.shifts = (uint32_t)(nowShifts - prevShifts);
+        rec.ticks = g_lastFrameTicks;
+        g_frameRecs.push_back(std::move(rec));
+        const Vec3 e = player.EyePos();
+        const float eye[3] = {e.x, e.y, e.z};
+        for (uint32_t k = 0; k < 3; k++) {
+          const float d = far.NearestValidFaceVox(k, eye);
+          if (d < 0) continue;
+          if (d < FarField::HandoffSphereVox(k, 2)) g_faceBreach[0][k]++;
+          if (d < FarField::HandoffSphereVox(k, FarField::kSphereMarginChunks))
+            g_faceBreach[1][k]++;
+        }
+      }
+      prevFar = g_farEntries;
+      prevMap = nowMap;
+      prevShifts = nowShifts;
+    }
+    if (g_harnessFrames > 0 && frameCounter > FramesStatsFrom()) {
       for (int i = 0; i < sandvox::kPerfScopeCount; i++) {
         g_frameScopeSum[i] += frameScope[i];
         if (frameScope[i] > g_frameScopeMax[i]) g_frameScopeMax[i] = frameScope[i];
@@ -21389,13 +21459,26 @@ int main(int argc, char** argv) {
         // frames hold the startup horizon refill (262k far entries at
         // kFarListCap per tick) and would own every GPU p99 otherwise.
         if (g_harnessFrames > 0 && livePending.front().s.gpuValid &&
-            livePending.front().frame > 60) {
+            livePending.front().frame > FramesStatsFrom()) {
           for (int n = 0; n < sandvox::kPerfNodeCount; n++)
             g_frameGpuSeries[n].push_back(livePending.front().s.gpuMs[n]);
           // Per pass: sum this frame's spans by name, then append one
           // value per pass (padding to the frame count happens at print).
           std::map<std::string, double> perPass;
           for (const auto& pr : livePending.front().passes) perPass[pr.first] += pr.second;
+          // The worst-frame table's GPU half (HarnessFrameRec): the frame's
+          // total and its biggest passes, matched on the live frame number.
+          for (auto it = g_frameRecs.rbegin(); it != g_frameRecs.rend(); ++it) {
+            if (it->live != livePending.front().frame) continue;
+            it->gpuMs = 0;
+            for (const auto& pr : perPass) {
+              it->gpuMs += pr.second;
+              it->top.push_back({pr.second, pr.first});
+            }
+            std::sort(it->top.begin(), it->top.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+            break;
+          }
           for (const auto& pr : perPass) {
             std::vector<double>& v = g_frameGpuPassSeries[pr.first];
             v.resize(g_frameGpuFrames, 0.0);
@@ -21835,6 +21918,70 @@ int main(int argc, char** argv) {
                 (unsigned long long)far.PlanesIssued(),
                 kFarNChunk * kFarNChunk, far.WorstGap(),
                 far.WorstGapLevel(), kFarNChunk);
+    // THE WORST FRAMES, each with what it dispatched (HarnessFrameRec). A
+    // p99 is a rank; this is the cause attached to it.
+    if (!g_frameRecs.empty()) {
+      std::vector<const HarnessFrameRec*> worst;
+      for (const HarnessFrameRec& r : g_frameRecs) worst.push_back(&r);
+      std::sort(worst.begin(), worst.end(),
+                [](const HarnessFrameRec* a, const HarnessFrameRec* b) { return a->wallMs > b->wallMs; });
+      if (worst.size() > 12) worst.resize(12);
+      size_t withFar = 0, withMap = 0;
+      double farMs = 0, quietMs = 0;
+      size_t quiet = 0;
+      for (const HarnessFrameRec& r : g_frameRecs) {
+        if (r.farEntries) { withFar++; farMs += r.wallMs; }
+        else { quiet++; quietMs += r.wallMs; }
+        if (r.farMapCols) withMap++;
+      }
+      // SANDVOX_FRAMES_CSV=<file>: every recorded frame, one row each, with
+      // the far passes in their own columns -- what a cost model (GPU ms vs
+      // entries dispatched) is fitted from, which twelve rows cannot give.
+      if (const char* csvPath = std::getenv("SANDVOX_FRAMES_CSV")) {
+        if (FILE* f = std::fopen(csvPath, "w")) {
+          const char* cols[] = {"farFill", "farCoverFill", "farMapFill", "farPatchFill",
+                                "farDown", "rm_world"};
+          std::fprintf(f, "live,wallMs,ticks,far,mapCols,shifts,gpuMs");
+          for (const char* c : cols) std::fprintf(f, ",%s", c);
+          std::fprintf(f, "\n");
+          for (const HarnessFrameRec& r : g_frameRecs) {
+            std::fprintf(f, "%u,%.3f,%u,%u,%u,%u,%.3f", r.live, r.wallMs, r.ticks,
+                         r.farEntries, r.farMapCols, r.shifts, r.gpuMs);
+            for (const char* c : cols) {
+              double v = 0;
+              for (const auto& t : r.top)
+                if (t.second == c) v += t.first;
+              std::fprintf(f, ",%.3f", v);
+            }
+            std::fprintf(f, "\n");
+          }
+          std::fclose(f);
+        }
+      }
+      std::printf("    box-face handoffs (a valid face nearer than the level's handoff "
+                  "sphere: a straight seam line) over %zu frames: margin 2 (pre-2026-10-11) "
+                  "L1 %u L2 %u L3 %u | margin %d (shipped) L1 %u L2 %u L3 %u\n",
+                  g_frameRecs.size(), g_faceBreach[0][0], g_faceBreach[0][1], g_faceBreach[0][2],
+                  FarField::kSphereMarginChunks, g_faceBreach[1][0], g_faceBreach[1][1],
+                  g_faceBreach[1][2]);
+      std::printf("    worst frames (from frame %llu): %zu frames, %zu dispatched sieve "
+                  "entries (mean %.1f ms), %zu did not (mean %.1f ms), %zu filled "
+                  "surface-map columns\n",
+                  (unsigned long long)FramesStatsFrom(), g_frameRecs.size(), withFar,
+                  withFar ? farMs / (double)withFar : 0.0, quiet,
+                  quiet ? quietMs / (double)quiet : 0.0, withMap);
+      for (const HarnessFrameRec* r : worst) {
+        std::printf("      live %5u  %6.1f ms  ticks %u  far %4u (map cols %3u)  shifts %u  gpu ",
+                    r->live, r->wallMs, r->ticks, r->farEntries, r->farMapCols, r->shifts);
+        if (r->gpuMs < 0) std::printf("(no timestamps)");
+        else {
+          std::printf("%6.1f ms:", r->gpuMs);
+          for (size_t ti = 0; ti < r->top.size() && ti < 5; ti++)
+            std::printf(" %s %.1f", r->top[ti].second.c_str(), r->top[ti].first);
+        }
+        std::printf("\n");
+      }
+    }
         std::printf("    snapshot stalls (blocking WaitIdle on the frame path):"
                     " %llu over %llu frames (%.1f%% of frames) | readback "
                     "requests the ring refused: %llu\n",

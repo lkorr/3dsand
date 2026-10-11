@@ -1679,7 +1679,13 @@ PASS(farCoverFill, "farCoverFill", PT_FARFILL, PIPE_FAR_COVER_FILL, K_COMPUTE, D
 // A(FarVox) A(FarOcc) since LOD-seam package F: a cactus stalk the map
 // raises its column to is also MARKED into the level's cells (farmap), after
 // the sweep wrote them and before the patch rewrites an edited chunk's.
-PASS(farMapFill, "farMapFill", PT_FARFILL, PIPE_FAR_MAP_FILL, K_COMPUTE, D_FARCOUNT,1,1,
+// SIXTEEN workgroups per entry in y (2026-10-11): a map entry is 1,024
+// sub-columns of genColumn work and an X/Z plane has only 32 of them, so one
+// workgroup each left the GPU nearly idle for 27-33 ms a plane while 64
+// threads ground through sixteen columns apiece (worldgen.wgsl `farmap` has
+// the measurement). wg.y splits the column; entries without the map bit
+// return on their first load, all sixteen of them.
+PASS(farMapFill, "farMapFill", PT_FARFILL, PIPE_FAR_MAP_FILL, K_COMPUTE, D_FARCOUNT,16,1,
      GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
      USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO) A(FarMap)
           A(FarVox) A(FarOcc) R(TreeAtlas) R(WorldMap)))

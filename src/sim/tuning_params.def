@@ -2537,6 +2537,10 @@ TP_I(render, farRefillRate, NO_WGSL, 1024, 1, kFarListCap)
 // player left it, and farList is the dispatch's own ceiling. 1024 since
 // 2026-10-08 (tuning.h has the measurement).
 TP_I(render, farPlaneFillRate, NO_WGSL, 1024, 1, kFarListCap)
+// The travel fill's per-tick FLOOR (farfield.h A FLOOR UNDER THE SLICE).
+// 1 is pure deadline pacing; the top is the farList ceiling, at which every
+// tick with plane work takes everything queued up to farPlaneFillRate.
+TP_I(render, farPlaneBatch, NO_WGSL, 256, 1, kFarListCap)
 // A scale above 1 would be supersampling the most expensive shader in the
 // engine; below a quarter the frame is 400x225 and the UI text on top is
 // larger than the terrain. Present mode is an enum; fpsCap 0 = off.

@@ -69,8 +69,61 @@ void FarField::DropPendingPlane(uint32_t k, int axis, int sa) {
   }
 }
 
+uint64_t FarField::PlaneDue(uint32_t k, int axis) {
+  // THE FACE'S STEP PERIOD, measured rather than derived from a velocity: the
+  // gap between this face's steps IS the time the next plane has, and it
+  // already folds in the level's chunk size, the speed and the direction
+  // (a diagonal crosses each axis less often). One step of history is enough;
+  // a gap past kPlanePeriodForget is a player who stopped and set off again,
+  // whose old period says nothing.
+  const uint64_t stamp = tick_ + 1;   // 0 is "never"
+  uint32_t p = 0;
+  if (lastStep_[k][axis] != 0) {
+    const uint64_t gap = stamp - lastStep_[k][axis];
+    if (gap <= kPlanePeriodForget) p = (uint32_t)gap;
+  }
+  lastStep_[k][axis] = stamp;
+  period_[k][axis] = p;
+  uint32_t due;
+  if (p) due = p / 2;
+  // No history on this level yet (the first step after a stop): a coarser
+  // level crosses half as often as the one inside it, so twice that level's
+  // period, halved, is the inner level's period itself.
+  else if (k > 0 && period_[k - 1][axis]) due = period_[k - 1][axis];
+  else due = kPlaneDefaultDue;
+  due = std::clamp<uint32_t>(due, 1u, kPlaneMaxDue);
+  return tick_ + due;
+}
+
+uint32_t FarField::PlaneQuota() const {
+  // Earliest-deadline arithmetic over the queue IN DRAIN ORDER (finest level
+  // first, each level FIFO): everything ahead of a plane, plus the plane
+  // itself, has to be dispatched by that plane's due tick, so the rate this
+  // tick must be at least (entries up to and including it) / (ticks it has
+  // left). The max over the queue is the least rate that misses no deadline.
+  // A reset's record is due at once (due 0), which makes the quota the full
+  // cap whenever a reset sits ahead — the behaviour the bulk-slice fallback
+  // in PrepareTick already wanted for a second tick in one frame.
+  // SANDVOX_FAR_NO_PACING=1 is the A/B arm: every tick takes the whole cap,
+  // the behaviour before the deadlines.
+  static const bool noPacing = std::getenv("SANDVOX_FAR_NO_PACING") != nullptr;
+  if (noPacing) return planeCap_;
+  uint64_t ahead = 0, need = 1;
+  for (uint32_t k = 0; k < kFarLevels; k++) {
+    for (const PlaneRec& r : recs_[k]) {
+      ahead += r.remaining;
+      const uint64_t left = r.due > tick_ ? r.due - tick_ : 1;
+      need = std::max(need, (ahead + left - 1) / left);
+    }
+  }
+  // The floor (farfield.h, A FLOOR UNDER THE SLICE): a tick that dispatches
+  // at all pays the passes' fixed latency, so it takes at least a batch.
+  need = std::max<uint64_t>(need, std::min<uint64_t>(ahead, planeBatch_));
+  return (uint32_t)std::min<uint64_t>(need, planeCap_);
+}
+
 void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord,
-                            const int skipSa[3]) {
+                            const int skipSa[3], uint64_t due) {
   int m = (int)kFarNChunk - 1;
   int sa = wcoord & m;
   // ---- A REVERSAL REFILLS THE SAME SLOTS -----------------------------------
@@ -89,6 +142,13 @@ void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord,
   const int side = wcoord == oa + (int)kFarNChunk - 1 ? 1 : 0;
   planes_++;
   uint32_t n = 0;
+  // TWO PASSES: the plane's surface-map columns first, then the rest. The
+  // fill of a column's map has to land no later than any `farpatch` of that
+  // column (below), which column-contiguous order also gave; FIRST gives it
+  // and puts all of a plane's farMapFill work in its first slice, so the
+  // slices after it skip that pass's fixed latency (farfield.h PLANE PACING).
+  // A Z plane already ran its map row first; an X plane interleaved it.
+  for (int pass = 0; pass < 2; pass++)
   for (int b = 0; b < (int)kFarNChunk; b++) {
     for (int a = 0; a < (int)kFarNChunk; a++) {
       int s[3];
@@ -104,6 +164,7 @@ void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord,
       // lands no later than any `farpatch` of the same column (which clears
       // map entries over edited cells and must not be overwritten after).
       const bool mapFill = axis != 1 && s[1] == 0;
+      if (mapFill != (pass == 0)) continue;
       // ---- A DIAGONAL STEP QUEUES THE CROSSING LINE ONCE -----------------
       // Two planes of one Update cross in a line of kFarNChunk slots. The
       // earlier plane already holds it, earlier in this level's FIFO, so its
@@ -123,7 +184,7 @@ void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord,
       n++;
     }
   }
-  recs_[k].push_back({k, axis, side, sa, n, epoch_[k]});
+  recs_[k].push_back({k, axis, side, sa, n, epoch_[k], due});
   faces_[k][axis][side]++;
   uboDirty_ = true;
 }
@@ -159,7 +220,7 @@ void FarField::ResetLevel(uint32_t k, IVec3 desired) {
   // level is invalid until the reset lands — so it stops owning a face.
   epoch_[k]++;
   for (int a = 0; a < 3; a++) faces_[k][a][0] = faces_[k][a][1] = 0;
-  recs_[k].push_back({k, -1, 0, -1, kFarNumChunks, epoch_[k]});
+  recs_[k].push_back({k, -1, 0, -1, kFarNumChunks, epoch_[k], 0});
 }
 
 void FarField::FullRefill(const InterestSet& interest) {
@@ -227,7 +288,7 @@ uint32_t FarField::RefillBox(IVec3 lo, IVec3 hi) {
       }
     // A record like a plane's, owning no face (axis -1): PrepareTick's
     // front-record bookkeeping needs every queued entry to belong to one.
-    recs_[k].push_back({k, -1, 0, -1, cnt, epoch_[k]});
+    recs_[k].push_back({k, -1, 0, -1, cnt, epoch_[k], tick_ + kPlaneDefaultDue});
     total += cnt;
   }
   return total;
@@ -292,6 +353,19 @@ float FarField::SafeRadiusMeters() const {
   return best;
 }
 
+float FarField::NearestValidFaceVox(uint32_t k, const float eyeVox[3]) const {
+  if (bulkPending_[k] > 0) return -1.0f;
+  const float span = (float)(kChunk << (k + 1 + kFarShiftBase));   // one level chunk
+  const int o[3] = {origins_[k].x, origins_[k].y, origins_[k].z};
+  float best = 1e30f;
+  for (int a = 0; a < 3; a++) {
+    const float lo = (float)(o[a] + (int)faces_[k][a][0]) * span;
+    const float hi = (float)(o[a] + (int)kFarNChunk - (int)faces_[k][a][1]) * span;
+    best = std::min(best, std::min(eyeVox[a] - lo, hi - eyeVox[a]));
+  }
+  return best;
+}
+
 uint32_t FarField::FaceWord(uint32_t k) const {
   // Layout documented at the declaration (farfield.h) and at the reader
   // (raymarch.wgsl farBox): the 5-bit field (axis * 2 + side) holds the planes
@@ -341,7 +415,7 @@ void FarField::Update(const InterestSet& interest) {
       uboDirty_ = true;
       // incoming plane: the window's leading face after the shift
       int wcoord = dir > 0 ? *o + (int)kFarNChunk - 1 : *o;
-      EnqueuePlane(k, axis, wcoord, stepSa);
+      EnqueuePlane(k, axis, wcoord, stepSa, PlaneDue(k, axis));
       stepSa[axis] = wcoord & ((int)kFarNChunk - 1);
     }
 
@@ -399,7 +473,15 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
   }
   // The UBO above is published either way — a caller that is not draining
   // still has to tell the renderer which levels it may march.
-  if (!drain || PendingFills() == 0) return 0;
+  if (!drain) return 0;
+  // The pacing clock (PlaneDue / PlaneQuota) counts DRAINING ticks, the ones
+  // that could have dispatched: `now` is the tick Update just stamped its
+  // planes with, and the next Update stamps the one after it.
+  struct Advance {
+    uint64_t& t;
+    ~Advance() { t++; }
+  } advance{tick_};
+  if (PendingFills() == 0) return 0;
   // A reset (teleport, load, the startup horizon) drains at the bulk cap; in
   // play, incoming planes drain at kPlayFillCap (see farfield.h).
   bool bulk = false;
@@ -412,8 +494,11 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
     if (bulkThisFrame_) bulk = false;
     else bulkThisFrame_ = true;
   }
+  // Planes drain on their deadlines (PlaneQuota), not at the cap: the cap is
+  // the most a tick may take, and spending it on a plane that had six more
+  // ticks to land is the 100 ms flying hitch (farfield.h PLANE PACING).
   const uint32_t cap = (uint32_t)std::min(
-      PendingFills(), (size_t)(bulk ? bulkCap_ : planeCap_));
+      PendingFills(), (size_t)(bulk ? bulkCap_ : PlaneQuota()));
   list_.clear();
   list_.reserve(cap);
   patchHeader_.clear();
@@ -460,6 +545,7 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
       if (n) patchPayload_.insert(patchPayload_.end(), patch->begin(), patch->end());
 
       list_.push_back((k << kFarSlotShift) | slot | mapBit);
+      if (mapBit) mapCols_++;
       q.pop_front();
       // A refill of cells a resident chunk owns undoes that chunk's last
       // downsample: clear the signatures on the NEXT PrepareTick (sigClear_).
