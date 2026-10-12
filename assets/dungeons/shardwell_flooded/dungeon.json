@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "extends": "shardwell",
+  "name": "The Shardwell (flooded)",
+  "palette": {"variant": "granite"},
+  "pieces": {
+    "p11": {"params": {"sumpDepth": 3.6, "waterLevel": 1, "sills": true, "ledge": 1.2, "moisture": 1, "decay": 0.7}},
+    "p12": {"params": {"moisture": 0.95, "decay": 0.9, "lightCount": 0}},
+    "p13": {"remove": "branch"},
+    "p8": {"params": {"moisture": 0.9, "lightCount": 0, "lightType": "none"}},
+    "p9": {"params": {"moisture": 0.8, "lightCount": 0, "lightType": "none"}}
+  },
+  "refsPatch": {"set": {"glimmer_dead": {"props": {"count": 4}}}},
+  "about": "A VARIANT (not placed on any map): the same mine in plain granite, the deep level's sump risen over its sills and its lamps out, the dark north drift fallen in for good (the winze's top station opens on rubble).",
+  "refs": "refs.json"
+}

@@ -108,6 +108,151 @@ export function normalizeDungeon(d) {
   o.props = o.props || [];
   return o;
 }
+// =============================================================================
+// VARIANTS (dungeon inheritance, D8): a dungeon.json may say
+//   "extends": "<base id>"          the base: assets/dungeons/<base>/dungeon.json
+//   "name", "seed", "style"         overrides
+//   "palette": {slot: name, variant?, kits?}   merged over the base's palette
+//   "pieces": {"<id>": {params: {partial}, seed?, type?, kit?, remove?: true|'branch'}}
+//   "add": [full piece objects, links included]
+//   "entrance": {piece, socket}     override
+//   "addProps": [props], "removeProps": [prop ids]
+//   "refsPatch": {add: [refs], remove: [names], set: {name: {props partial, pos?, yaw?, base?}}}
+// resolveDungeon flattens the chain into an ordinary dungeon (no `extends`).
+// =============================================================================
+export const VARIANT_MAX_DEPTH = 8;
+/** Is this dungeon.json a variant (has `extends`)? */
+export const isVariant = (d) => !!(d && typeof d.extends === 'string' && d.extends);
+
+/**
+ * resolveDungeon(d, loadBase) -> {dungeon, chain, removed}
+ *   d        : a dungeon.json object (variant or not)
+ *   loadBase : (id) -> the raw dungeon.json object of `id` (throws / null if missing)
+ * dungeon : the flattened, normalized dungeon (an ordinary one: no `extends`);
+ * chain   : the ids walked, base first ([] for a plain dungeon);
+ * removed : the placed pieces (dungeon frame) the variant chain removed --
+ *           resolveVariantRefs drops the base refs that stood in them.
+ * Refuses a cycle and a chain deeper than VARIANT_MAX_DEPTH.
+ */
+export function resolveDungeon(d, loadBase, _seen) {
+  if (!isVariant(d)) return {dungeon: normalizeDungeon(d), chain: [], removed: []};
+  const seen = _seen || [];
+  if (seen.includes(d.extends)) throw new Error('variant cycle: ' + seen.concat(d.extends).join(' -> '));
+  if (seen.length >= VARIANT_MAX_DEPTH) throw new Error('variant chain deeper than ' + VARIANT_MAX_DEPTH + ': ' + seen.concat(d.extends).join(' -> '));
+  const raw = loadBase(d.extends);
+  if (!raw) throw new Error('variant extends "' + d.extends + '", which has no dungeon.json');
+  const baseRes = resolveDungeon(raw, loadBase, seen.concat(d.extends));
+  const base = baseRes.dungeon;
+  const out = JSON.parse(JSON.stringify(base));
+  for (const k of ['name', 'seed', 'style']) if (d[k] !== undefined) out[k] = d[k];
+  if (d.palette) {
+    const pal = Object.assign({}, out.palette || {});
+    for (const [k, v] of Object.entries(d.palette)) {
+      if (k === 'kits' && v && typeof v === 'object') {
+        pal.kits = Object.assign({}, pal.kits || {});
+        for (const [kk, vv] of Object.entries(v)) pal.kits[kk] = Object.assign({}, pal.kits[kk] || {}, vv);
+      } else pal[k] = v;
+    }
+    out.palette = pal;
+  }
+  // Piece edits, then removals (a removed piece's links go with it), then adds.
+  const removedIds = new Set();
+  for (const [id, e] of Object.entries(d.pieces || {})) {
+    const pc = out.pieces.find(p => p.id === id);
+    if (!pc) throw new Error('variant edits piece "' + id + '", which the base (' + d.extends + ') does not have');
+    if (e.remove) { removedIds.add(id); if (e.remove === 'branch') pc._branch = true; continue; }
+    if (e.kit) pc.kit = e.kit;
+    if (e.type && e.type !== pc.type) { pc.type = e.type; pc.params = {}; pc.version = undefined; }
+    if (e.params) pc.params = Object.assign({}, pc.params, e.params);
+    if (e.seed !== undefined) pc.seed = e.seed >>> 0;
+    if (e.pos) pc.pos = e.pos.slice();
+    if (e.yaw !== undefined) pc.yaw = e.yaw;
+    if (e.links) pc.links = Object.assign({}, pc.links || {}, e.links);
+    if (e.label) pc.label = e.label;
+  }
+  // 'branch': the piece and everything only reachable from the entrance through it.
+  if ([...removedIds].some(id => out.pieces.find(p => p.id === id)._branch)) {
+    const adj = new Map(out.pieces.map(p => [p.id, new Set()]));
+    for (const p of out.pieces) for (const L of Object.values(p.links || {})) if (L && adj.has(L.piece)) { adj.get(p.id).add(L.piece); adj.get(L.piece).add(p.id); }
+    const ent = (d.entrance && d.entrance.piece) || (out.entrance && out.entrance.piece) || (out.pieces[0] && out.pieces[0].id);
+    const seenP = new Set([ent]), q = [ent];
+    while (q.length) for (const n of adj.get(q.shift()) || []) if (!seenP.has(n) && !removedIds.has(n)) { seenP.add(n); q.push(n); }
+    for (const p of out.pieces) if (!seenP.has(p.id)) removedIds.add(p.id);
+  }
+  const removedPlaced = out.pieces.filter(p => removedIds.has(p.id)).map(p => placePiece(out, p));
+  out.pieces = out.pieces.filter(p => !removedIds.has(p.id));
+  for (const p of out.pieces) {
+    delete p._branch;
+    if (!p.links) continue;
+    for (const [sn, L] of Object.entries(p.links)) if (L && removedIds.has(L.piece)) delete p.links[sn];
+    if (!Object.keys(p.links).length) delete p.links;
+  }
+  for (const p of d.add || []) {
+    if (out.pieces.some(q => q.id === p.id)) throw new Error('variant adds piece "' + p.id + '", which the base already has (give it a fresh id)');
+    out.pieces.push(JSON.parse(JSON.stringify(p)));
+    for (const [sn, L] of Object.entries(p.links || {})) {
+      const other = out.pieces.find(q => q.id === L.piece);
+      if (other) other.links = Object.assign({}, other.links || {}, {[L.socket]: {piece: p.id, socket: sn}});
+    }
+  }
+  if (d.entrance !== undefined) out.entrance = d.entrance;
+  if (out.entrance && removedIds.has(out.entrance.piece)) out.entrance = null;
+  const dropProps = new Set(d.removeProps || []);
+  out.props = (out.props || []).filter(p => !removedIds.has(p.piece) && !dropProps.has(p.id)).concat(JSON.parse(JSON.stringify(d.addProps || [])));
+  delete out.detail;                                     // a base's hand detail is its own (SVED v3 is per dungeon dir)
+  out.refs = d.refs || 'refs.json';
+  return {dungeon: normalizeDungeon(out), chain: baseRes.chain.concat(d.extends), removed: baseRes.removed.concat(removedPlaced)};
+}
+
+/**
+ * The refs of a variant (D8): the base's refs (editor form: {name, kind, pos,
+ * yaw, props, base?}, anchor frame), then
+ *   - every ADOPTED WAYNODE (kind waynode, named wn_<piece>_<node>) re-adopted
+ *     from the variant's own compiled program (waynodes move with geometry);
+ *   - refs standing inside a removed piece dropped (with a note);
+ *   - the variant's refsPatch applied: remove, set (props merged), add.
+ * -> {refs, notes}. Pure: the caller reads / writes the files.
+ */
+export function resolveVariantRefs(baseRefs, variant, program, removedPlaced, entranceDungeonPos) {
+  const notes = [];
+  const A = entranceDungeonPos || (program.entrance && program.entrance.dungeonPos) || [0, 0, 0];
+  const wn = (n) => 'wn_' + n.replace(/\//g, '_');
+  const adopted = baseRefs.some(r => r.kind === 'waynode' && /^wn_/.test(r.name));
+  let refs = baseRefs.filter(r => !(r.kind === 'waynode' && /^wn_/.test(r.name))).map(r => JSON.parse(JSON.stringify(r)));
+  // inside a removed piece? (its carves' un-noised shapes, anchor frame)
+  const inRemoved = (pos) => removedPlaced.some(pc => pc.prims.some(p => p.op === 'carve' && primContains(p, [pos[0] + A[0] + 0.5, pos[1] + A[1] + 0.5, pos[2] + A[2] + 0.5])));
+  refs = refs.filter(r => {
+    if (!inRemoved(r.pos)) return true;
+    notes.push('ref ' + r.name + ' (' + r.kind + ') stood in a removed piece: dropped');
+    return false;
+  });
+  if (adopted) {
+    const W = program.waynodes.filter(w => !w.pit);
+    const pitNames = new Set(program.waynodes.filter(w => w.pit).map(w => w.name));
+    const ways = W.map(w => ({name: wn(w.name), kind: 'waynode', pos: w.pos.slice(), yaw: 0, props: {links: w.links.filter(l => !pitNames.has(l)).map(wn)}}));
+    refs = ways.concat(refs);
+  }
+  const P = variant.refsPatch || {};
+  const names = new Set(refs.map(r => r.name));
+  for (const n of P.remove || []) { if (!names.has(n)) notes.push('refsPatch removes ' + n + ', which the base does not have'); refs = refs.filter(r => r.name !== n); }
+  for (const [n, s] of Object.entries(P.set || {})) {
+    const r = refs.find(x => x.name === n);
+    if (!r) { notes.push('refsPatch sets ' + n + ', which the base does not have'); continue; }
+    if (s.props) r.props = Object.assign({}, r.props || {}, s.props);
+    if (s.pos) r.pos = s.pos.slice();
+    if (s.yaw !== undefined) r.yaw = s.yaw;
+    if (s.base) r.base = s.base;
+  }
+  for (const r of P.add || []) {
+    if (refs.some(x => x.name === r.name)) { notes.push('refsPatch adds ' + r.name + ', which already exists: replaced'); refs = refs.filter(x => x.name !== r.name); }
+    refs.push(JSON.parse(JSON.stringify(Object.assign({yaw: 0, props: {}}, r))));
+  }
+  // links to waynodes that are gone
+  const live = new Set(refs.map(r => r.name));
+  for (const r of refs) if (r.kind === 'waynode' && r.props && r.props.links) r.props.links = r.props.links.filter(l => live.has(l));
+  return {refs, notes};
+}
+
 /** A piece's effective seed: explicit, or derived from the dungeon seed + id. */
 export function pieceSeed(d, piece) { return piece.seed ? piece.seed >>> 0 : hashN(d.seed >>> 0, 'piece', String(piece.id)); }
 
@@ -400,6 +545,16 @@ function toShellPrim(p, res, kit, seedOf) {
   }
   if (p.op === 'carve' && p.blend) o.blend = Math.min(256, p.blend);
   if (p.op === 'skin') o.skin = Math.max(1, Math.min(64, p.skin || 2));
+  // The 3.4.1 EXTRAS (the PRMX block): a fill masked to open space lands only
+  // where the cell is still AIR (a heap, a fallen block, a floor in a bowl
+  // never turns the buried rock inside a wall to rubble), and a checker floor
+  // is a fill / skin with a second material on alternate squares.
+  if (p.op === 'fill' && p.mask === 'air') o.openOnly = true;
+  if ((p.op === 'fill' || p.op === 'skin') && p.pattern && p.pattern.kind === 'checker' && p.pattern.mat2) {
+    const m2 = res(kit, p.pattern.mat2);
+    o.mat2 = m2.mat; used.push(m2.mat);
+    o.checker = Math.max(1, Math.min(256, Math.round(p.pattern.size || 4)));
+  }
   return {o, used};
 }
 function shellScatter(s, res, kit, seed) {
@@ -420,19 +575,63 @@ export function shellPrimBounds(o) {
   const pad = (o.noise ? o.noise.amp : 0) + (o.blend || 0) + (o.skin || 0);
   return {min: mn.map(v => v - pad), max: mx.map(v => v + pad)};
 }
-/** Worst count of boxes touching one 64^3 cell, over two grid alignments
- *  (the map placement is unknown here). -> {max, at}. */
-function perCellMax(boxes) {
+/** The engine's index boxes of a prim (src/sim/dungeon.cpp InflationOf +
+ *  LocalBoxes, mirrored so the per-cell limit is checked as the packer counts
+ *  it): inflation 3 + 2 noise amp (+ blend + 2 for a carve, + the ore / moss
+ *  band of its scatter), times the axis ratio of an elongated ellipsoid /
+ *  cylinder / vault; capsules and tubes get one box per segment. */
+export function shellIndexBoxes(o) {
+  let e = 3 + (o.noise && o.noise.amp ? 2 * o.noise.amp : 0);
+  if (o.op === 'carve') e += (o.blend || 0) + 2;
+  let band = 0;
+  for (const c of o.scatter || []) {
+    if (c.kind === 'ore_vein') band = Math.max(band, c.size[1] + 1);
+    if (c.kind === 'moss' || c.kind === 'puddle') band = Math.max(band, 3);
+  }
+  e += band;
+  if (o.shape === 'ellipsoid' || o.shape === 'cylinder' || o.shape === 'vault') {
+    const AX = {x: 0, y: 1, z: 2};
+    let lo = Infinity, hi = 0;
+    for (let k = 0; k < 3; k++) {
+      if (o.shape === 'cylinder' && AX[o.axis] === k) continue;
+      if (o.shape === 'vault' && (AX[o.axis] === k || k === 1)) continue;
+      const h = o.max[k] - o.min[k] + 1;
+      lo = Math.min(lo, h); hi = Math.max(hi, h);
+    }
+    if (o.shape === 'vault') { lo = Math.min(lo, Math.max(o.rise, 1)); hi = Math.max(hi, Math.max(o.rise, 1)); }
+    if (lo !== Infinity && lo > 0) e = Math.min(256, e * Math.floor((hi + lo - 1) / lo));
+  }
+  if (o.shape === 'capsule' || o.shape === 'tube') {
+    const pts = o.shape === 'capsule' ? [o.a, o.b] : o.pts, rr = o.shape === 'capsule' ? [o.r, o.r] : o.r;
+    const out = [];
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const r = Math.max(rr[i], rr[i + 1]) + e;
+      out.push({min: [0, 1, 2].map(k => Math.min(pts[i][k], pts[i + 1][k]) - r), max: [0, 1, 2].map(k => Math.max(pts[i][k], pts[i + 1][k]) + r)});
+    }
+    return out;
+  }
+  const mn = o.min.map(v => v - e), mx = o.max.map(v => v + e);
+  if (o.shape === 'ramp') mn[1] = o.min[1] - (o.below || 0) - e;
+  return [{min: mn, max: mx}];
+}
+/** Worst count of items (each a list of boxes, counted once a cell) touching
+ *  one 64^3 cell, over four grid alignments (the map placement is unknown
+ *  here). -> {max, at}. */
+function perCellMax(items) {
   let best = {max: 0, at: null};
-  for (const off of [0, 32]) {
+  for (const off of [0, 16, 32, 48]) {
     const cnt = new Map();
-    for (const b of boxes) {
-      const lo = b.min.map(v => Math.floor((v + off) / 64)), hi = b.max.map(v => Math.floor((v + off) / 64));
-      if ((hi[0] - lo[0] + 1) * (hi[1] - lo[1] + 1) * (hi[2] - lo[2] + 1) > 4096) continue;
-      for (let x = lo[0]; x <= hi[0]; x++) for (let y = lo[1]; y <= hi[1]; y++) for (let z = lo[2]; z <= hi[2]; z++) {
-        const k = x + ',' + y + ',' + z, n = (cnt.get(k) || 0) + 1;
+    for (const it of items) {
+      const mine = new Set();
+      for (const b of (Array.isArray(it) ? it : [it])) {
+        const lo = b.min.map(v => Math.floor((v + off) / 64)), hi = b.max.map(v => Math.floor((v + off) / 64));
+        if ((hi[0] - lo[0] + 1) * (hi[1] - lo[1] + 1) * (hi[2] - lo[2] + 1) > 4096) continue;
+        for (let x = lo[0]; x <= hi[0]; x++) for (let y = lo[1]; y <= hi[1]; y++) for (let z = lo[2]; z <= hi[2]; z++) mine.add(x + ',' + y + ',' + z);
+      }
+      for (const k of mine) {
+        const n = (cnt.get(k) || 0) + 1;
         cnt.set(k, n);
-        if (n > best.max) best = {max: n, at: [x * 64 - off, y * 64 - off, z * 64 - off]};
+        if (n > best.max) { const c = k.split(',').map(Number); best = {max: n, at: [c[0] * 64 - off, c[1] * 64 - off, c[2] * 64 - off]}; }
       }
     }
   }
@@ -453,6 +652,14 @@ function perCellMax(boxes) {
  */
 export function compile(dIn, opts) {
   opts = opts || {};
+  let variantOf = null;
+  if (isVariant(dIn)) {
+    if (!opts.loadBase) throw new Error('compile: a variant (extends "' + dIn.extends + '") needs opts.loadBase');
+    const r = resolveDungeon(dIn, opts.loadBase);
+    variantOf = {extends: dIn.extends, chain: r.chain};
+    if (opts.sourceText === undefined) opts = Object.assign({}, opts, {sourceText: JSON.stringify(dIn)});
+    dIn = r.dungeon;
+  }
   const {d, placed, links, problems} = assemble(dIn);
   const res = matResolver(d);
   const errors = problems.map(p => ({piece: p.piece, msg: p.msg}));
@@ -540,8 +747,22 @@ export function compile(dIn, opts) {
     const tagged = [L.a, L.b].find(s => s.tags && s.tags.includes('door'));
     if (!tagged || !L.compat.ok) continue;
     const yaw = (({'0,0,1': 0, '1,0,0': 90, '0,0,-1': 180, '-1,0,0': 270})[tagged.dir.join(',')]) || 0;
-    refs.push({kind: 'door', id: tagged.piece + '_door_' + tagged.name, pos: T(tagged.pos), yaw, piece: tagged.piece, suggested: true,
-               props: {width: Math.min(L.a.w, L.b.w), height: Math.min(L.a.h, L.b.h)}});
+    // refs_doors.h: a door's pos is the leaf's BOTTOM cell on the HINGE side
+    // (hinge "left": the leaf runs along HeadingAxis(yaw + 90) from it), in
+    // its front layer. The socket pos is the CENTRE of the opening's floor
+    // line, so the hinge cell is half a leaf to one side of it, and the front
+    // layer is the cell just inside the tagged piece (a socket is a lattice
+    // plane: for a +axis socket the inside cell is pos - 1).
+    const width = Math.min(L.a.w, L.b.w);
+    const along = rotV(quarter(yaw + 90), [0, 0, 1]);
+    const p0 = tagged.pos.slice();
+    for (let k = 0; k < 3; k += 2) {
+      if (tagged.dir[k] > 0) p0[k] -= 1;
+      if (along[k] > 0) p0[k] -= Math.floor(width / 2);
+      else if (along[k] < 0) p0[k] += Math.ceil(width / 2) - 1;
+    }
+    refs.push({kind: 'door', id: tagged.piece + '_door_' + tagged.name, pos: T(p0), yaw, piece: tagged.piece, suggested: true,
+               props: {width, height: Math.min(L.a.h, L.b.h), hinge: 'left'}});
   }
   if (opts.materials) {
     const known = new Set(opts.materials);
@@ -552,7 +773,7 @@ export function compile(dIn, opts) {
   const pb = prims.map(shellPrimBounds);
   const ib = instances.map(ins => { const t = templates[ins.template], q = quarter(ins.yaw), sx = q & 1 ? t.size[2] : t.size[0], sz = q & 1 ? t.size[0] : t.size[2];
     return {min: ins.pos.slice(), max: [ins.pos[0] + sx - 1, ins.pos[1] + t.size[1] - 1, ins.pos[2] + sz - 1]}; });
-  const pc1 = perCellMax(pb), pc2 = perCellMax(ib);
+  const pc1 = perCellMax(prims.map(shellIndexBoxes)), pc2 = perCellMax(ib);
   if (pc1.max > LIMIT_PRIMS_PER_CELL) errors.push({piece: null, msg: pc1.max + ' prims touch one 64^3 cell near ' + pc1.at.join(',') + ' (the engine takes ' + LIMIT_PRIMS_PER_CELL + ')'});
   if (pc2.max > LIMIT_INSTANCES_PER_CELL) errors.push({piece: null, msg: pc2.max + ' prop instances touch one 64^3 cell near ' + pc2.at.join(',') + ' (the engine takes ' + LIMIT_INSTANCES_PER_CELL + ')'});
   pb.forEach((b, i) => { for (let k = 0; k < 3; k++) if (b.max[k] - b.min[k] + 1 > 2048 + 2 * 64) { errors.push({piece: prims[i].piece, msg: 'prim ' + i + ' is over 2048 cells on an axis'}); break; } });
@@ -574,6 +795,10 @@ export function compile(dIn, opts) {
     // ---- D2 extras (not read by the engine) ----
     name: d.name, style: d.style, seed: d.seed,
     generator: {tool: 'dungeongen', compiler: COMPILER_VERSION, types: sortObj(typeVersions)},
+    // the RESOLVED source (base included for a variant): what --check compares
+    // to tell a variant whose base moved. sourceHash stays the engine's (the
+    // dungeon.json bytes beside the shell).
+    source: Object.assign({resolvedHash: sourceHashOf(dungeonJsonText(dIn))}, variantOf ? {extends: variantOf.extends, chain: variantOf.chain} : {}),
     entrance: {piece: ent.piece, socket: ent.name, dir: ent.dir.slice(), dungeonPos: A},
     bounds: bounds || {min: [0, 0, 0], max: [0, 0, 0]},
     limits: {primsPerCell: pc1.max, instancesPerCell: pc2.max},
@@ -600,8 +825,27 @@ export function sourceHashOf(text) {
 }
 /** The same hash as 8 hex digits (display). */
 export function hashSource(text) { return sourceHashOf(text).toString(16).padStart(8, '0'); }
+/** The canonical on-disk text of a VARIANT dungeon.json (D8): its own keys
+ *  only, in a stable order, one piece edit / added piece a line. */
+export function variantJsonText(v) {
+  const J = (x) => JSON.stringify(x);
+  const L = ['{'];
+  const keys = ['version', 'extends', 'name', 'style', 'seed', 'palette', 'entrance'].filter(k => v[k] !== undefined);
+  for (const k of keys) L.push('  ' + J(k) + ': ' + J(k === 'version' ? (v.version || DUNGEON_VERSION) : v[k]) + ',');
+  const pe = Object.keys(v.pieces || {});
+  if (pe.length) { L.push('  "pieces": {'); pe.forEach((id, i) => L.push('    ' + J(id) + ': ' + J(v.pieces[id]) + (i + 1 < pe.length ? ',' : ''))); L.push('  },'); }
+  for (const k of ['add', 'addProps']) if ((v[k] || []).length) { L.push('  ' + J(k) + ': ['); v[k].forEach((p, i) => L.push('    ' + J(p) + (i + 1 < v[k].length ? ',' : ''))); L.push('  ],'); }
+  if ((v.removeProps || []).length) L.push('  "removeProps": ' + J(v.removeProps) + ',');
+  if (v.refsPatch) L.push('  "refsPatch": ' + J(v.refsPatch) + ',');
+  if (v.about) L.push('  "about": ' + J(v.about) + ',');
+  L.push('  "refs": ' + J(v.refs || 'refs.json'));
+  L.push('}');
+  return L.join('\n') + '\n';
+}
+
 /** The canonical on-disk text of a dungeon.json (what the tuner writes). */
 export function dungeonJsonText(d) {
+  if (isVariant(d)) return variantJsonText(d);
   const n = normalizeDungeon(d);
   const J = (v) => JSON.stringify(v);
   const L = ['{'];
@@ -663,7 +907,7 @@ export function buildWaygraph(placed, links) {
 // the shell files
 // =============================================================================
 const SHELL_HEAD = ['format', 'version', 'dungeon', 'sourceHash', 'anchor', 'keepOut', 'naturalCaves', 'materials'];
-const SHELL_EXTRA = ['name', 'style', 'seed', 'generator', 'entrance', 'bounds', 'limits', 'usedMaterials'];
+const SHELL_EXTRA = ['name', 'style', 'seed', 'generator', 'source', 'entrance', 'bounds', 'limits', 'usedMaterials'];
 const SHELL_LISTS = ['pieces', 'waynodes', 'refs', 'sockets', 'errors', 'warnings'];
 /** shell.json text: the 3.4.1 shell first (one prim / template / instance a
  *  line, stable key order), then the D2 extras. The ONE place the program's
@@ -713,6 +957,7 @@ export function emitShellBin(program) {
     w[18] = p.blend || 0; w[19] = p.skin || 0;
     w[20] = p.level !== undefined ? p.level : -2147483648;
     w[21] = p.firm !== undefined ? S(p.firm) : 0xFFFFFFFF;
+    if (p.mat2 !== undefined) S(p.mat2);                 // interned now: the table is written before the PRMX block
     if (p.shape === 'tube') { w[22] = tube.length; w[23] = p.pts.length; p.pts.forEach((q, i) => tube.push([q[0], q[1], q[2], p.r[i]])); }
     const sc = p.scatter || [];
     w[24] = sc.length ? scat.length : 0; w[25] = sc.length;
@@ -743,6 +988,12 @@ export function emitShellBin(program) {
   for (const t of tpls) { push(t.id); t.size.forEach(push); push(t.pal.length); t.pal.forEach(push); push(t.vox.length); for (const v of t.vox) v.forEach(push); }
   push(insts.length); for (const i of insts) { push(i.t); i.pos.forEach(push); push(i.q); push(i.id); }
   push(pieceIds.length); pieceIds.forEach(push);
+  // PRMX (3.4.1 extras), only when some prim uses one: flags (bit 0 openOnly),
+  // mat2 string, checker cells, 0. A reader that meets END! here has none.
+  if (program.prims.some(p => p.openOnly || p.mat2 !== undefined || p.checker)) {
+    push(0x584D5250); push(program.prims.length);
+    for (const p of program.prims) { push(p.openOnly ? 1 : 0); push(p.mat2 !== undefined ? S(p.mat2) : 0xFFFFFFFF); push(p.checker || 0); push(0); }
+  }
   push(0x21444E45);
   flushWords();
   return Uint8Array.from(bytes);
@@ -768,6 +1019,11 @@ export function validate(dIn, opts) {
   opts = opts || {};
   const out = [];
   const add = (severity, code, piece, msg, at) => out.push(Object.assign({severity, code, piece, msg}, at ? {at} : {}));
+  if (isVariant(dIn)) {
+    // a variant is validated as what it resolves to
+    if (!opts.loadBase) { add('error', 'variant', null, 'a variant (extends "' + dIn.extends + '") needs its base to validate'); return out; }
+    try { dIn = resolveDungeon(dIn, opts.loadBase).dungeon; } catch (e) { add('error', 'variant', null, e.message); return out; }
+  }
   let asm;
   try { asm = assemble(dIn); } catch (e) { add('error', 'load', null, e.message); return out; }
   const {d, placed, links, problems} = asm;
