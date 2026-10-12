@@ -23559,7 +23559,14 @@ grantkot.com/ll -- not MLS-MPM, which is heavier and buys nothing at this scale.
 **Powders**: a falling-sand CA, one grain per pixel.
 - A grain reads the smoothed liquid field (the same splat the renderer
   draws) to decide whether it sinks, how fast (mass gap, viscosity), or
-  floats.
+  floats. Every such rule asks ONE predicate, `GrainFloats` (flasksim.cpp),
+  and a TIE FLOATS, as in the world (`canDisplace`: a powder enters only a
+  strictly lighter liquid). Until 2026-10-11 the sink rules asked `ml < mg`
+  and the rise rules `ml > mg`, so tephra (density 1000, water's) did
+  neither: it hung mid-column as resting grains -- walls -- and an upturned
+  flask held its water in that lattice in mid-air, asleep. Gate
+  `alchemy-neutral` (a tie, a floater and a sinker poured into water: each
+  ends at its end, and the flask turned over empties).
 - Moving into liquid shoves that pixel's particles into the pixel the grain
   left.
 - RESTING grains are walls to the liquid. A particle that ends a step in a

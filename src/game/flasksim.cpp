@@ -19,6 +19,21 @@ namespace {
 
 constexpr float kLiquidThresh = 0.28f;
 
+// DOES A GRAIN OF MASS mg FLOAT IN LIQUID OF (mean) MASS ml? A TIE FLOATS,
+// as in the world (sim_step.wgsl canDisplace: a powder enters only a STRICTLY
+// lighter liquid, so tephra, density 1000, lies on water). Every rule in
+// StepGrains and CollideLiquid that asks "sink or float" asks THIS, so none
+// can take the tie the other way. They used to split: the sinking rules
+// wanted ml < mg and the rising ones ml > mg, so a powder exactly as dense as
+// its liquid did neither -- tephra stirred into water hung wherever it entered
+// as resting grains, which are walls to the liquid, and a flask turned over
+// kept its water hovering in that lattice of walls in mid-air, asleep, for
+// good (ticket 2026-10-11_22-20-52; gate alchemy-neutral). The tolerance is
+// for the smoothed field's rounding: the nearest real pair, 990 vs 1000, is
+// 5% apart in mass.
+constexpr float kNeutralTol = 1e-3f;
+inline bool GrainFloats(float ml, float mg) { return ml >= mg * (1.0f - kNeutralTol); }
+
 inline V2 operator+(V2 a, V2 b) { return {a.x + b.x, a.y + b.y}; }
 inline V2 operator-(V2 a, V2 b) { return {a.x - b.x, a.y - b.y}; }
 inline V2 operator*(V2 a, float s) { return {a.x * s, a.y * s}; }
@@ -1401,7 +1416,7 @@ void FlaskSim::CollideLiquid() {
     {
       const uint8_t side = inside_.empty() ? 0 : inside_[(size_t)y * W + x];
       const int gi0 = grid_[(size_t)y * W + x] - 1;
-      const bool sinks = gi0 >= 0 && mass_[psub_[i]] > mass_[grains_[gi0].sub];
+      const bool sinks = gi0 >= 0 && GrainFloats(mass_[psub_[i]], mass_[grains_[gi0].sub]);
       int to = -1;
       for (int pass = 0; pass < 2 && to < 0; pass++) {
         const int dir = (pass == 0) != sinks ? 1 : -1;
@@ -1905,7 +1920,7 @@ void FlaskSim::StepGrains() {
         // The liquid round it takes the drag back.
         PayDrag(g, dv, mg);
         relLiq = V2{g.vx - lr.x, g.vy - lr.y};
-        wetStill = ml >= mg && Len(lr) < 0.25f;
+        wetStill = GrainFloats(ml, mg) && Len(lr) < 0.25f;
         if (g.vx == 0 && g.vy == 0) g.vy = -1e-4f;   // still in the flung state
       } else {
         // Gravity takes it to grainMaxFall and no further; a grain already
@@ -2051,7 +2066,7 @@ void FlaskSim::StepGrains() {
         // Sinking needs liquid to sink INTO: a wet grain over an air gap (a
         // pocket in a bed) is left to the CA, which drops it into the gap.
         int cb = 0;
-        if (!held && ml < mg) LiquidMassAt(g.x, g.y - 1, &cb, nullptr);
+        if (!held && !GrainFloats(ml, mg)) LiquidMassAt(g.x, g.y - 1, &cb, nullptr);
         // A HELD grain is lifted only by flow ACROSS or OFF what holds it,
         // and only from the bed's surface (no grain on it): a hard slosh
         // scours the top, but liquid falling ONTO a bed pushes it into its
@@ -2064,7 +2079,7 @@ void FlaskSim::StepGrains() {
         const V2 scour{lr.x, std::max(lr.y, 0.0f)};
         const bool surface = g.y + 1 >= H || !grid_[(size_t)(g.y + 1) * W + g.x];
         const bool scoured = surface && Len(scour) > kEntrainHeld;
-        if ((!held && ((ml < mg && cb) || g.home < 0 || sp > kEntrainFree)) || scoured) {
+        if ((!held && ((!GrainFloats(ml, mg) && cb) || g.home < 0 || sp > kEntrainFree)) || scoured) {
           const V2 go = held ? scour : lr;
           g.vx = go.x;
           g.vy = std::min(go.y, follow);
@@ -2105,7 +2120,7 @@ void FlaskSim::StepGrains() {
     {
       int cu;
       const float mUp = LiquidMassAt(g.x, g.y + 1, &cu, nullptr);
-      if (cu && mUp > mg) {
+      if (cu && GrainFloats(mUp, mg)) {
         if (GrainFree(g.x, g.y + 1) && (Rand() & 3) == 0) MoveGrain(gi, g.x, g.y + 1);
         continue;
       }
@@ -2117,7 +2132,7 @@ void FlaskSim::StepGrains() {
       int c;
       float ml = LiquidMassAt(tx, ty, &c, nullptr);
       if (c) {
-        if (ml >= mg) {
+        if (GrainFloats(ml, mg)) {
           // FLOATING POWDER SPREADS. It floats on this liquid -- but a grain
           // coming DOWN A SLOPE (diagonally, from air) may settle into the
           // liquid's TOP pixel (air over it), as powder poured on water
@@ -2166,7 +2181,7 @@ void FlaskSim::StepGrains() {
         if (grid_[(size_t)yy * W + g.x]) continue;
         int cl;
         const float ml = LiquidMassAt(g.x, yy, &cl, nullptr);
-        floating = cl && ml > mg;
+        floating = cl && GrainFloats(ml, mg);
         break;
       }
       if (floating) {
@@ -2211,11 +2226,11 @@ void FlaskSim::StepGrains() {
         // the liquid (at the liquid's settling pace). Held to air only, the
         // dirt a pour left on the shoulder of an upturned flask, coated in
         // slime, lay there on a 34-degree slope for ever.
-        const bool sunk = ch && mh < mg;
+        const bool sunk = ch && !GrainFloats(mh, mg);
         if (ch && !sunk) continue;
         int cd;
         const float mdn = LiquidMassAt(tx + dd, g.y - 1, &cd, nullptr);
-        const bool slope = GrainFree(tx + dd, g.y - 1) && (!cd || (sunk && mdn < mg));
+        const bool slope = GrainFree(tx + dd, g.y - 1) && (!cd || (sunk && !GrainFloats(mdn, mg)));
         const bool way = s0 * dd > 0;
         const float chance = sunk ? cfg_.grainSlumpChance * std::clamp(WetSettle(g, mh, (size_t)g.y * W + tx) / 0.3f, 0.1f, 1.0f)
                                   : cfg_.grainSlumpChance;

@@ -2193,6 +2193,85 @@ Status GateAlchemyCoherence(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// A POWDER IN WATER GOES TO ONE END, AND A MIXED FLASK POURS OUT (ticket
+// 2026-10-11_22-20-52: "i put tephra in some water and instead of settling to
+// the bottom or staying at the top ... it got stuck in the middle, then trying
+// to pour everything out the water + tephra clumps got stuck"). Tephra's
+// density is water's, 1000, and the bench's sink rules asked ml < mg while its
+// rise rules asked ml > mg: the tie did neither, so the grains hung where they
+// entered as RESTING grains -- walls to the liquid -- and a flask turned over
+// kept its water hovering in that lattice in mid-air, asleep, for good. A tie
+// now floats, as in the world (flasksim.cpp GrainFloats).
+//
+// Per arm (tephra = the tie, charcoal = floats, sand = sinks), 20 eighths of
+// the powder are poured from above into 68 eighths of water in a 128-eighth
+// flask (the ticket's flask) and left 15 s. At least alchemy.neutralEndFracMin
+// of the grains must be in the half of the liquid's height it belongs to (the
+// top for a powder no denser than water, the bottom otherwise). Then the flask
+// is turned over high up: after 10 s at most alchemy.neutralPourLeftMax of its
+// units may still be in it. Before the fix (lab, 2026-10-11): tephra 74 of
+// 240 grains mid-column and 75 of 88 units still in the upturned flask after
+// 20 s; after, 231 of 240 in the top band and all of it out in 2.9 s.
+Status GateAlchemyNeutral(Ctx& c, std::string& detail) {
+  const int water = MatId(c, "water");
+  if (water < 0) { detail = "missing water"; return Status::Fail; }
+  const double endMin = BaselineNumber("alchemy.neutralEndFracMin", 0.9);
+  const double leftMax = BaselineNumber("alchemy.neutralPourLeftMax", 0.05);
+  bool ok = true;
+  for (const char* name : {"tephra", "charcoal", "sand"}) {
+    const int pow = MatId(c, name);
+    if (pow < 0) { detail += Format("%smissing %s", detail.empty() ? "" : " | ", name); ok = false; continue; }
+    const bool floats = c.mats[pow].gpu.density <= c.mats[water].gpu.density;
+    Composition both, in;
+    both.Add((uint16_t)water, 68);
+    both.Add((uint16_t)pow, 20);
+    in.Add((uint16_t)water, 68);
+    auto subs = alchemy::SubstancesFor(c.mats, {&both});
+    FlaskSim s(BenchConfig());
+    s.SetSubstances(subs);
+    const int v = s.AddVessel(BenchFlask(128), {{240, 4}, 0}, in);
+    const int slot = s.SlotOf((uint16_t)pow);
+    const float top = 4 + s.Shape(v).height + 12;
+    int emitted = 0;
+    const int want = 20 * 12;   // BenchConfig: 12 units an eighth, one grain a unit
+    for (int f = 0; f < 60 * 15; f++) {
+      if (emitted < want) emitted += s.EmitGrains(slot, {240, top}, std::min(2, want - emitted), {0, -0.5f});
+      s.Step(4);
+    }
+    float ly0 = 1e9f, ly1 = -1e9f;
+    for (V2 p : s.Positions()) { ly0 = std::min(ly0, p.y); ly1 = std::max(ly1, p.y); }
+    std::vector<V2> gp;
+    s.GrainPositions(gp);
+    const float mid = 0.5f * (ly0 + ly1);
+    int atEnd = 0;
+    for (V2 g : gp) atEnd += floats ? g.y >= mid : g.y < mid;
+    const double endFrac = gp.empty() ? 0.0 : (double)atEnd / gp.size();
+    if (std::string(name) == "tephra") Shot(s, "alchemy_neutral.bmp");
+    const uint32_t total = s.Count().vessel[v].Total();
+    double outAt = -1;
+    for (int f = 0; f < 600; f++) {
+      s.SetVesselXform(v, {{240, 200}, std::min(3.0f, 3.0f * f / 60.0f)});
+      s.Step(4);
+      if (outAt < 0 && s.Count().vessel[v].Total() * 20 <= total) outAt = f / 60.0;
+    }
+    const uint32_t left = s.Count().vessel[v].Total();
+    const double leftFrac = total ? (double)left / total : 1.0;
+    if (std::string(name) == "tephra") {
+      RecordObserved("alchemy.neutralEndFrac", endFrac);
+      RecordObserved("alchemy.neutralPourLeft", leftFrac);
+    }
+    const bool armOk = gp.size() == (size_t)want && endFrac >= endMin && leftFrac <= leftMax;
+    ok = ok && armOk;
+    detail += Format("%s%s (%s): %zu grains, %.0f%% in the %s half; upturned: %u of %u units left after 10 s "
+                     "(95%% out at %.2f s)%s",
+                     detail.empty() ? "" : " | ", name, floats ? "floats" : "sinks", gp.size(), 100 * endFrac,
+                     floats ? "top" : "bottom", left, total, outAt, armOk ? "" : " FAIL");
+  }
+  detail += Format(" | min %.0f%% at its end, max %.0f%% left", 100 * endMin, 100 * leftMax);
+  std::printf("alchemy-neutral: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ETHER POURED INTO A HOT EMPTY FLASK (owner, 2026-09-29: "turns into ignited
 // ether right when entering the glass and a few reactions go off that
 // completely tank and destroy frame rate"). A flask on the burner, heated
@@ -2447,6 +2526,7 @@ const std::vector<Gate>& AlchemyGates() {
       {"alchemy-lift", "player", {}, false, GateAlchemyLift},
       {"alchemy-place", "player", {}, false, GateAlchemyPlace},
       {"alchemy-coherence", "player", {}, false, GateAlchemyCoherence},
+      {"alchemy-neutral", "player", {}, false, GateAlchemyNeutral},
       // Bench chemistry (package C): the world's rules on the bench.
       {"alchemy-react", "player", {}, false, GateAlchemyReact},
       {"alchemy-keeps", "player", {}, false, GateAlchemyKeeps},
