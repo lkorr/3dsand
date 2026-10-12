@@ -97,6 +97,21 @@ function rails(b, z0, z1, g, sp, y0, key) {
   b.fill('box', {min: [hg, y0 + 1, z0], max: [hg + 1, y0 + 2, z1]}, {mat: 'rail', layer: 3, noise: null});
 }
 
+/** OVERBREAK: the blasted rock outside the timber line. A real drift is not
+ *  the clean box its sets stand in: the shot breaks the rock back unevenly
+ *  above the ribs. A carve box `ob` wider than [x0, x1) on each side and up to
+ *  `top` + ob/2, its sides and crown displaced by noise of amplitude ob, and
+ *  its lower edge starting ob above the floor so the noise never digs under
+ *  the floor slab (the lower ribs stay where the posts stand). The ends are
+ *  pulled in by ob so the joins stay the sockets' business. 0 = off (the
+ *  carve is not emitted: an older dungeon generates exactly as before). */
+function overbreak(b, P, x0, x1, top, z0, z1) {
+  const ob = Math.min(32, b.m(P.overbreak || 0));
+  if (ob < 2 || z1 - z0 <= 2 * ob + 2) return -1;
+  return b.carve('box', {min: [x0 - ob, ob, z0 + ob], max: [x1 + ob, top + Math.round(ob / 2), z1 - ob]},
+                 {noise: {amp: ob, scale: Math.max(4, b.m(P.overbreakScale || 1.6)), octaves: 2, seedKey: 'overbreak'}, tag: 'overbreak'});
+}
+
 /** A straight timbered drift section along +Z; shared by drift, collapse,
  *  camp approaches. Returns {room, setsZ}. */
 function driftBody(b, P, z0, z1, W, H, C, key, opt) {
@@ -104,6 +119,7 @@ function driftBody(b, P, z0, z1, W, H, C, key, opt) {
   const hw = Math.round(W / 2);
   const room = b.room('box', {min: [-hw, 0, z0], max: [hw, H, z1]});
   if (C >= 2) b.room('vault', {min: [-hw + 2, H - 1, z0], max: [hw - 2, H + C, z1], axis: 'z', rise: C + 1});
+  overbreak(b, P, -hw, hw, H + C, z0, z1);
   b.floor(-hw, z0, hw, z1, 0);
   const t = b.m(P.beam || 0.25, 2);
   const S = Math.max(t + 4, b.m(P.setSpacing || 1.8));
@@ -127,7 +143,10 @@ const ROWS_TIMBER = [
   {k: 'sag', n: 'sagging caps', min: 0, max: 1, step: 0.05, def: 0.2, d: 'Chance a cap bows under the load (an extra block under its middle).'},
   {k: 'broken', n: 'broken sets', min: 0, max: 1, step: 0.05, def: 0.1, d: 'Chance a set lost a post or its cap (decay adds to it); a fallen cap heaps rubble.'},
   {k: 'lagging', n: 'lagging', min: 0, max: 1, step: 0.05, def: 0.3, d: 'Chance a bay has plank lagging laid over its caps.'},
-  {k: 'lampSpacing', n: 'lamp spacing (m)', min: 1, max: 20, step: 0.5, def: 6, d: 'Lamp hooks on every Nth cap; the light count picks among them.'}
+  {k: 'lampSpacing', n: 'lamp spacing (m)', min: 1, max: 20, step: 0.5, def: 6, d: 'Lamp hooks on every Nth cap; the light count picks among them.'},
+  {sec: 'Rock'},
+  {k: 'overbreak', n: 'overbreak (m)', min: 0, max: 3, step: 0.1, def: 0, d: 'How far the blasted rock breaks back outside the timber line, unevenly, above the ribs (0 = the walls are the clean box the sets stand in). The single biggest cure for a drift that reads as a box.'},
+  {k: 'overbreakScale', n: 'overbreak scale (m)', min: 0.4, max: 6, step: 0.1, def: 1.6, d: 'Feature size of the broken rock: small = shattered, large = slabby.'}
 ];
 const ROWS_RAIL = [
   {sec: 'Rails'},
@@ -215,6 +234,7 @@ const JUNCTION = {
     const z0 = A, z1 = A + hub, zc = Math.round((z0 + z1) / 2);
     driftBody(b, P, 0, z0, W, H, C, 'in');
     const hubRoom = b.room('box', {min: [-hh, 0, z0], max: [hh, H + Math.round(C / 2), z1]});
+    overbreak(b, P, -hh, hh, H + C, z0, z1);
     if (C >= 2) b.room('ellipsoid', {min: [-hh, H - C, z0], max: [hh, H + C, z1]});
     b.floor(-hh, z0, hh, z1, 0);
     const arms = {T: ['left', 'right'], X: ['left', 'right', 'out'], L: [P.side], Y: ['out']}[P.shape];
@@ -282,6 +302,11 @@ const INCLINE = {
     const R = Math.max(1, Math.round(b.m(P.rise, 1) / stepH)) * stepH;
     const dir = sgn > 0 ? '+z' : '-z', y0 = sgn > 0 ? 0 : -R;
     const main = b.flight('carve', dir, -hw, hw, 0, L, y0, R, stepH, {height: H}, {tag: 'room'});
+    // Overbreak along the incline: the same flight (so the same floor profile)
+    // lifted ob off it, wider by ob a side, noisy (see overbreak()).
+    const obv = Math.min(32, b.m(P.overbreak || 0));
+    if (obv >= 2) b.flight('carve', dir, -hw - obv, hw + obv, 0, L, y0 + obv, R, stepH, {height: H - Math.round(obv / 2)},
+                           {noise: {amp: obv, scale: Math.max(4, b.m(P.overbreakScale || 1.6)), octaves: 2, seedKey: 'overbreak'}, tag: 'overbreak'});
     b.flight('fill', dir, -hw, hw, 0, L, y0, R, stepH, {below: 2}, {mat: 'floor', layer: 2, noise: null});
     if (P.mode === 'rails') {
       const hg = Math.round(b.m(0.6, 4) / 2);
@@ -443,6 +468,7 @@ const STOPE = {
     {k: 'pillarSpacing', n: 'pillar spacing (m)', min: 2, max: 15, step: 0.1, def: 5, d: 'Room-and-pillar grid; pillars are rock left standing.'},
     {k: 'pillarSize', n: 'pillar size (m)', min: 0, max: 4, step: 0.1, def: 1.4, d: '0 = no pillars.'},
     {k: 'robbed', n: 'robbed pillars', min: 0, max: 1, step: 0.05, def: 0.15, d: 'Chance a pillar was mined thin (an hourglass).'},
+    {k: 'pillarRough', n: 'pillar roughness', min: 0, max: 4, step: 0.1, def: 0.6, d: 'Wall roughness of the pillars, times the piece’s wall roughness (high = blasted, irregular rock left standing; low = dressed square pillars).'},
     {sec: 'Workings'},
     {k: 'benches', n: 'benches', min: 0, max: 4, step: 1, int: true, def: 1, d: 'Terraced floor steps toward the back.'},
     {k: 'scaffolds', n: 'scaffolds', min: 0, max: 6, step: 1, int: true, def: 2, d: 'Timber working platforms against the walls.'},
@@ -496,7 +522,7 @@ const STOPE = {
         const x = Math.round(-hw + (W * (ix + 1)) / (nx + 1)) + b.jit(sp * 0.2, 'pil', ix, iz, 'x');
         const z = Math.round(z0 + (L * (iz + 1)) / (nz + 1)) + b.jit(sp * 0.2, 'pil', ix, iz, 'z');
         const h = Math.round(ps / 2);
-        b.fill('rbox', {min: [x - h, -1, z - h], max: [x + h, H + C + 2, z + h], r: Math.round(h / 3)}, {mat: 'wall', layer: 2, noise: 0.6});
+        b.fill('rbox', {min: [x - h, -1, z - h], max: [x + h, H + C + 2, z + h], r: Math.round(h / 3)}, {mat: 'wall', layer: 2, noise: P.pillarRough});
         if (b.r('pil', ix, iz, 'robbed') < P.robbed)
           b.carve('box', {min: [x - h - 2, Math.round(H * 0.35), z - h - 2], max: [x + h + 2, Math.round(H * 0.65), z + h + 2]}, {layer: 3, noise: 0.8, blend: 3});
         pillars.push([x, z, h]);
@@ -669,6 +695,7 @@ const CAMP = {
     const z0 = T, z1 = T + L;
     b.room('box', {min: [-hw, 0, z0], max: [hw, H, z1]});
     if (C >= 2) b.room('vault', {min: [-hw + 2, H - 1, z0], max: [hw - 2, H + C, z1], axis: 'z', rise: C + 1});
+    overbreak(b, P, -hw, hw, H + C, z0, z1);
     b.floor(-hw, z0, hw, z1, 0, {mat: 'trim'});
     const t = b.m(P.beam, 2), S = Math.max(t + 4, b.m(P.setSpacing));
     for (let i = 0, z = z0 + 2; z + t <= z1; i++, z += S) timberSet(b, P, 'camp', i, z, hw, H, t);
@@ -732,7 +759,10 @@ const ADIT = {
     {k: 'headboard', n: 'headboard sign', kind: 'bool', def: true, d: 'A plank sign over the portal (a marker ref carries its text).'},
     {k: 'boarded', n: 'boarded up', min: 0, max: 1, step: 0.05, def: 0, d: 'Planks nailed across the portal (fraction of its height; leave a gap to squeeze through).'},
     {k: 'spoilHeap', n: 'spoil heap', min: 0, max: 1, step: 0.05, def: 0.5, d: 'Waste rock tipped beside the cut.'},
-    {k: 'railsOut', n: 'rails out', kind: 'bool', def: true, d: 'The track runs out through the cut.'}
+    {k: 'railsOut', n: 'rails out', kind: 'bool', def: true, d: 'The track runs out through the cut.'},
+    {k: 'apronLength', n: 'apron (m)', min: 0, max: 8, step: 0.1, def: 4, d: 'How far the levelled floor runs out in front of the cut (it is a slab: where the ground falls away it stands proud, so keep it short there).'},
+    {k: 'headwallLean', n: 'headwall lean', min: 0, max: 2, step: 0.05, def: 0, d: 'The cut’s steps above the portal break back into the hill by this much per unit of height (0 = one flat face over the portal).'},
+    {k: 'cutRough', n: 'cut roughness', min: 0, max: 4, step: 0.1, def: 0.6, d: 'Wall roughness of the cut faces, times the piece’s wall roughness.'}
   ]),
   PRESETS: {
     working: {params: {}},
@@ -748,11 +778,17 @@ const ADIT = {
     for (let k = 0; k <= steps; k++) {
       const half = hw + 2 + Math.round(k * sh * P.cutFlare);
       const y0 = k * sh, y1 = k === steps ? CH + b.m(8) : (k + 1) * sh;
-      b.carve('box', {min: [-half, y0, -b.m(2)], max: [half, y1, CL + (k === 0 ? 1 : 0)]}, {layer: 1, noise: 0.6, blend: 6, tag: k === 0 ? 'room' : 'apron'});
+      // headwallLean: the steps above the portal's head break back into the
+      // hill, so the face over the portal is a stepped slope, not one plane.
+      const lean = k > 0 ? Math.max(0, Math.round((y0 - (H + C + b.m(0.6))) * P.headwallLean)) : 0;
+      b.carve('box', {min: [-half, y0, -b.m(2)], max: [half, y1, CL + (k === 0 ? 1 : 0) + lean]}, {layer: 1, noise: P.cutRough, blend: 6, tag: k === 0 ? 'room' : 'apron'});
     }
-    // Apron floor out of the cut: a slab with a little berm under it.
-    b.fill('box', {min: [-hw - 4, -b.m(1.5), -b.m(4)], max: [hw + 4, 0, CL]}, {mat: 'floor', noise: 'floor', layer: 2, mask: 'air'});
-    b.floor(-hw - 2, -b.m(4), hw + 2, CL, 0);
+    // Apron floor out of the cut: a slab with a little berm under it. On
+    // ground that falls away in front of the cut, a long apron stands proud
+    // as a pedestal: shorten it (apronLength) instead.
+    const AP = b.m(P.apronLength);
+    b.fill('box', {min: [-hw - 4, -b.m(1.5), -AP], max: [hw + 4, 0, CL]}, {mat: 'floor', noise: 'floor', layer: 2, mask: 'air'});
+    b.floor(-hw - 2, -AP, hw + 2, CL, 0);
     // The tunnel.
     driftBody(b, P, CL, CL + L, W, H, C, 'adit');
     const t = b.m(P.beam, 2);
@@ -783,7 +819,7 @@ const ADIT = {
       const R = Math.round(b.m(1.5) + P.spoilHeap * b.m(3.5));
       b.mound(side * (hw + R), 0, -Math.round(R * 0.6), R, R, R, {mat: 'spoil'});
     }
-    if (P.rails) rails(b, P.railsOut ? -b.m(3) : CL, CL + L, b.m(P.gauge, 4), b.m(P.sleeperSpacing, 3), 0, 'adit');
+    if (P.rails) rails(b, P.railsOut ? -Math.min(b.m(3), AP) : CL, CL + L, b.m(P.gauge, 4), b.m(P.sleeperSpacing, 3), 0, 'adit');
     b.lightSpot([-hw - t - 1, H - 2, CL - 1], 'wall', '-z');
     b.lightSpot([hw + t + 1, H - 2, CL - 1], 'wall', '-z');
     b.wayChain('w', [[0, 0, -b.m(2)], [0, 0, CL], [0, 0, CL + Math.round(L / 2)], [0, 0, CL + L - 2]], ['socket:surface'], ['socket:in']);

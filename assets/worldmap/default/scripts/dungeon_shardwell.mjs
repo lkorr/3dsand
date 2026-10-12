@@ -80,9 +80,9 @@ const setLen = (pid, key, metres) => { const p = d.pieces.find(q => q.id === pid
 // beside the cut, the track running out onto the crater floor.
 d.pieces.push(G.newPiece(d, {kit: 'mines', type: 'adit_entrance', preset: 'abandoned', params: {
   width: 3.0, height: 2.7, length: 10, ceiling: 0.4,
-  cutLength: 8, cutHeight: 7, cutFlare: 0.35, portal: 'timber', headboard: true, boarded: 0.35,
+  cutLength: 8, cutHeight: 7, cutFlare: 0.35, headwallLean: 0.6, cutRough: 0.8, apronLength: 0.6, portal: 'timber', headboard: true, boarded: 0.35,
   spoilHeap: 1, railsOut: true, rails: true, gauge: 0.6, sleeperSpacing: 0.7,
-  setSpacing: 1.5, beam: 0.3, sag: 0.45, broken: 0.25, lagging: 0.5,
+  setSpacing: 1.5, beam: 0.3, sag: 0.45, broken: 0.25, lagging: 0.5, overbreak: 0.5, overbreakScale: 1.2,
   decay: 0.45, moisture: 0.1, wallRough: 0.55, wallScale: 1.1, floorUneven: 0.35, asym: 0.6,
   lightCount: 1, lightType: 'lantern', warmth: 1, blend: 6}}));
 d.entrance = {piece: 'p0', socket: 'surface'};
@@ -90,7 +90,7 @@ d.entrance = {piece: 'p0', socket: 'surface'};
 // --- main haulage drift: still lit, the best-kept timber in the mine.
 const p1 = at('p0', 'in', T('mines', 'drift', 'haulage', {
   width: 3.0, height: 2.7, length: 23, ceiling: 0.5,
-  setSpacing: 2.2, beam: 0.3, sag: 0.3, broken: 0.08, lagging: 0.7, lampSpacing: 4.4,
+  setSpacing: 2.2, beam: 0.3, sag: 0.3, broken: 0.08, lagging: 0.7, lampSpacing: 4.4, overbreak: 0.6, overbreakScale: 2.0,
   rails: true, gauge: 0.6, sleeperSpacing: 0.65, niches: 0.35, nicheDepth: 1.4, spoil: 0.25,
   decay: 0.2, moisture: 0.1, deco: 0.7, wallRough: 0.45, wallScale: 1.4, floorUneven: 0.3, asym: 0.45,
   lightCount: 4, lightType: 'lantern', warmth: 0.9, blend: 6}));
@@ -98,19 +98,19 @@ const p1 = at('p0', 'in', T('mines', 'drift', 'haulage', {
 // --- the hub: a timbered crossing, wider and taller than the drifts.
 const p2 = at(p1, 'out', T('mines', 'junction', 'crossroads', {
   shape: 'X', width: 3.0, height: 2.8, length: 3, ceiling: 1.2, hubPad: 1.6, cornerPosts: true,
-  setSpacing: 1.8, beam: 0.35, sag: 0.2, broken: 0.1, rails: true, gauge: 0.6,
+  setSpacing: 1.8, beam: 0.35, sag: 0.2, broken: 0.1, rails: true, gauge: 0.6, overbreak: 1.0, overbreakScale: 2.4,
   decay: 0.3, moisture: 0.15, wallRough: 0.5, wallScale: 1.8, asym: 0.5, lightCount: 2, lightType: 'lantern', blend: 8}));
 
 // --- north: an older, narrower drift to the miners' camp (candles).
 const p3 = at(p2, 'left', T('mines', 'drift', 'narrow_old', {
   width: 2.2, height: 2.2, length: 11, ceiling: 0.2,
-  setSpacing: 1.1, beam: 0.2, sag: 0.65, broken: 0.3, lagging: 0.25, rails: false, niches: 0.5, nicheDepth: 1.0, spoil: 0.4,
+  setSpacing: 1.1, beam: 0.2, sag: 0.65, broken: 0.3, lagging: 0.25, overbreak: 0.9, overbreakScale: 0.9, rails: false, niches: 0.5, nicheDepth: 1.0, spoil: 0.4,
   decay: 0.55, moisture: 0.35, deco: 0.6, wallRough: 0.7, wallScale: 0.9, floorUneven: 0.45, asym: 0.7,
   lightCount: 1, lightType: 'candles', warmth: 1, blend: 6}));
 const p4 = at(p3, 'out', T('mines', 'camp', 'bunkroom', {
   width: 6.5, length: 8.5, height: 2.6, ceiling: 0.6,
   bunks: 4, table: true, crates: 5, stove: true, tools: 2, exits: 'dead end',
-  setSpacing: 2.4, beam: 0.3, sag: 0.35, broken: 0.15,
+  setSpacing: 2.4, beam: 0.3, sag: 0.35, broken: 0.15, overbreak: 0.4, overbreakScale: 1.5,
   decay: 0.35, moisture: 0.1, deco: 0.8, wallRough: 0.5, wallScale: 1.6, asym: 0.5,
   lightCount: 2, lightType: 'candles', warmth: 1, blend: 6}));
 
@@ -119,49 +119,49 @@ const p4 = at(p3, 'out', T('mines', 'camp', 'bunkroom', {
 const p5 = at(p2, 'right', T('mines', 'collapse', 'sealed', {
   width: 3.0, height: 2.7, length: 13, ceiling: 0.3,
   blockage: 1, coneLength: 9, boulders: 5, cavity: 3.2, looseCeiling: true,
-  setSpacing: 1.7, beam: 0.3, sag: 0.8, broken: 0.6, lagging: 0.2,
+  setSpacing: 1.7, beam: 0.3, sag: 0.8, broken: 0.6, lagging: 0.2, overbreak: 1.4, overbreakScale: 1.1,
   decay: 0.9, moisture: 0.3, wallRough: 0.6, wallScale: 1.3, asym: 0.7, lightCount: 0, lightType: 'none', blend: 6}));
 const p6 = at(p5, 'out', T('mines', 'junction', 'bend_old', {
   shape: 'L', side: 'left', width: 2.6, height: 2.4, length: 2.5, ceiling: 0.4, hubPad: 0.4, cornerPosts: false,
-  setSpacing: 1.4, beam: 0.25, sag: 0.7, broken: 0.55, rails: false,
+  setSpacing: 1.4, beam: 0.25, sag: 0.7, broken: 0.55, rails: false, overbreak: 0.8, overbreakScale: 1.0,
   decay: 0.8, moisture: 0.45, wallRough: 0.65, wallScale: 1.1, asym: 0.7, lightCount: 0, lightType: 'none', blend: 6}));
 
 // --- west: the haulage incline down to the deep level (rails, steep).
 const p7 = at(p2, 'out', T('mines', 'incline', 'haulage_up', {
   direction: 'down', mode: 'rails', rise: 18, length: 36.2, width: 3.0, height: 2.8,
-  setSpacing: 2.6, beam: 0.3, sag: 0.25, broken: 0.12, lagging: 0.4, handrail: true,
+  setSpacing: 2.6, beam: 0.3, sag: 0.25, broken: 0.12, lagging: 0.4, handrail: true, overbreak: 0.7, overbreakScale: 1.8,
   decay: 0.3, moisture: 0.25, wallRough: 0.45, wallScale: 1.5, floorUneven: 0.1, asym: 0.4,
   lightCount: 2, lightType: 'lantern', warmth: 0.7, blend: 6}));
 
 // --- the deep level.
 const p8 = at(p7, 'out', T('mines', 'drift', 'standard', {
   width: 3.0, height: 2.7, length: 6, ceiling: 0.6,
-  setSpacing: 1.9, beam: 0.3, sag: 0.3, broken: 0.15, lagging: 0.5, lampSpacing: 3.8,
+  setSpacing: 1.9, beam: 0.3, sag: 0.3, broken: 0.15, lagging: 0.5, lampSpacing: 3.8, overbreak: 0.8, overbreakScale: 1.4,
   rails: true, gauge: 0.6, sleeperSpacing: 0.6, niches: 0, spoil: 0.35,
   decay: 0.35, moisture: 0.4, deco: 0.5, wallRough: 0.5, wallScale: 1.2, floorUneven: 0.3, asym: 0.5,
   lightCount: 1, lightType: 'lantern', warmth: 0.6, blend: 6}));
 const p9 = at(p8, 'out', T('mines', 'junction', 'crossroads', {
   shape: 'X', width: 3.0, height: 2.8, length: 2.6, ceiling: 1.8, hubPad: 2.2, cornerPosts: true,
-  setSpacing: 2.0, beam: 0.35, sag: 0.4, broken: 0.25, rails: true, gauge: 0.6,
+  setSpacing: 2.0, beam: 0.35, sag: 0.4, broken: 0.25, rails: true, gauge: 0.6, overbreak: 1.3, overbreakScale: 2.6,
   decay: 0.45, moisture: 0.45, wallRough: 0.6, wallScale: 2.2, asym: 0.6, lightCount: 1, lightType: 'lantern', warmth: 0.5, blend: 10}));
 
 // The Glimmer: the crystal stope, room-and-pillar, scaffolds still up.
 const p10 = at(p9, 'left', T('mines', 'stope', 'crystal_gallery', {
   width: 24, length: 26, height: 6.5, ceiling: 3.2,
-  oreType: 'palette', oreDensity: 0.75, pillarSpacing: 7.5, pillarSize: 2.4, robbed: 0.35,
+  oreType: 'palette', oreDensity: 0.3, pillarSpacing: 7.5, pillarSize: 2.6, pillarRough: 2.6, robbed: 0.35,
   benches: 1, scaffolds: 3, scaffoldHeight: 3.2, exits: 'dead end',
   decay: 0.35, moisture: 0.3, deco: 0.7, wallRough: 0.85, wallScale: 2.6, floorUneven: 0.5, asym: 0.8,
-  lightCount: 3, lightType: 'crystal', warmth: 0.3, blend: 12}));
+  lightCount: 3, lightType: 'lantern', warmth: 0.6, blend: 12}));
 
 // The drowned sump, then the stope it drowned.
 const p11 = at(p9, 'out', T('mines', 'flooded_sump', 'sump', {
   width: 9, length: 12, height: 3.4, ceiling: 1.4,
   sumpDepth: 3.2, waterLevel: 0.9, sills: false, ledge: 1.6, pumpGear: true,
   decay: 0.5, moisture: 0.95, deco: 0.6, wallRough: 0.75, wallScale: 1.9, floorUneven: 0.4, asym: 0.7,
-  lightCount: 1, lightType: 'crystal', warmth: 0, blend: 8}));
+  lightCount: 1, lightType: 'lantern', warmth: 0, blend: 8}));
 const p12 = at(p11, 'out', T('mines', 'stope', 'worked_out', {
   width: 15, length: 17, height: 4.2, ceiling: 1.6,
-  oreType: 'palette', oreDensity: 0.12, pillarSpacing: 5.2, pillarSize: 1.5, robbed: 0.75,
+  oreType: 'palette', oreDensity: 0.12, pillarSpacing: 5.2, pillarSize: 1.7, pillarRough: 2.0, robbed: 0.75,
   benches: 2, scaffolds: 1, scaffoldHeight: 2.2, exits: 'dead end',
   decay: 0.8, moisture: 0.6, deco: 0.35, wallRough: 0.8, wallScale: 1.7, floorUneven: 0.6, asym: 0.8,
   lightCount: 0, lightType: 'none', blend: 10}));
@@ -182,7 +182,7 @@ if (arm6.dir[2] !== 1 || east9.dir[0] !== 1) throw new Error('the loop assumes p
 const northLen = (east9.pos[2] - wzFoot.pos[2]) - arm6.pos[2];
 const p13 = at(p6, 'left', T('mines', 'drift', 'abandoned', {
   width: 2.6, height: 2.4, length: northLen / 10, ceiling: 0.3,
-  setSpacing: 1.3, beam: 0.25, sag: 0.85, broken: 0.55, lagging: 0.15, rails: true, gauge: 0.6, sleeperSpacing: 0.8,
+  setSpacing: 1.3, beam: 0.25, sag: 0.85, broken: 0.55, lagging: 0.15, overbreak: 1.1, overbreakScale: 1.2, rails: true, gauge: 0.6, sleeperSpacing: 0.8,
   niches: 0.3, nicheDepth: 1.1, spoil: 0.75,
   decay: 0.8, moisture: 0.5, deco: 0.4, wallRough: 0.7, wallScale: 1.0, floorUneven: 0.5, asym: 0.8,
   lightCount: 0, lightType: 'none', blend: 6}));
@@ -191,7 +191,7 @@ const foot = sock(p14, 'foot');
 const eastLen = foot.pos[0] - east9.pos[0];
 const p15 = at(p9, 'right', T('mines', 'drift', 'narrow_old', {
   width: 2.4, height: 2.4, length: eastLen / 10, ceiling: 0.4,
-  setSpacing: 1.6, beam: 0.25, sag: 0.55, broken: 0.35, lagging: 0.3, rails: false, niches: 0.25, nicheDepth: 1.3, spoil: 0.5,
+  setSpacing: 1.6, beam: 0.25, sag: 0.55, broken: 0.35, lagging: 0.3, overbreak: 0.9, overbreakScale: 0.8, rails: false, niches: 0.25, nicheDepth: 1.3, spoil: 0.5,
   decay: 0.6, moisture: 0.6, deco: 0.5, wallRough: 0.6, wallScale: 1.4, floorUneven: 0.4, asym: 0.6,
   lightCount: 0, lightType: 'none', blend: 6}));
 {
