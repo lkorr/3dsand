@@ -812,6 +812,12 @@ struct MobDef {
   // it bites; sidecar `capsuleRadius`, and a swimmer derives it from its
   // trunk (SwimDef::trunkHalfW/H) when the sidecar is silent.
   float capsuleRadius = 0.0f;
+  // HOW HARD ITS POSED BODY SHOVES LOOSE THINGS (sidecar `bodyPush`,
+  // 2026-10-11): < 1 makes its living limbs soft pushers (Physics::
+  // SetSoftPushers) -- they pass through a corpse or a crate and give it this
+  // share of the momentum instead of ploughing it aside at animation speed.
+  // 1 = every creature before this. Piranha 0.1.
+  float bodyPush = 1.0f;
   // Does the head turn to look at a target between strokes (Mob::SetAimLook)?
   // A fish looks with its whole body, and a shark's head swivelling on a
   // rigid trunk reads as broken. Sidecar `headLook`, default true.
@@ -6646,9 +6652,18 @@ class MobSystem {
   // `reachHeight` (world voxels above the victim's feet, 0 = no limit): only
   // limbs whose centre is at or below it are drawn, unless none is -- a snake
   // lying on the ground draws a foot, not a thigh it cannot rise to.
+  // `attackerAt` (world voxels, the attacker's centre): what a
+  // `targetNearest` style measures from; null = no position, table draw.
   static int PickTargetLimb(const AttackStyle& sty, const Mob& victim,
                             uint64_t attackerId, float attackerProne,
-                            uint32_t tick, float reachHeight = 0.0f);
+                            uint32_t tick, float reachHeight = 0.0f,
+                            const Vec3* attackerAt = nullptr);
+  // The live anatomy limb of `victim` whose centre is nearest `from` (on a
+  // counted corpse: nearest with meat left), -1 if none. targetNearest and
+  // ai::Perception::nearestPart both ask this.
+  static int NearestLimbTo(const Mob& victim, Vec3 from);
+  // ai::WorldView::aimPart: the world centre of NearestLimbTo.
+  bool NearestPartOf(uint64_t actorId, Vec3 from, Vec3& out);
   // The item library, so an NPC's sweep can read the damage, carve bonus and
   // HEFT of whatever is in its fist. By POINTER and not owned: items reload on
   // R and a copy here would be a second, stale library. The Mob stores its held

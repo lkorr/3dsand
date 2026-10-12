@@ -1983,6 +1983,7 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
     }
     def.headLook = j.value("headLook", def.headLook);
     def.capsuleRadius = std::max(0.0f, j.value("capsuleRadius", 0.0f));
+    def.bodyPush = std::clamp(j.value("bodyPush", 1.0f), 0.0f, 1.0f);
     if (def.capsuleRadius <= 0.0f && def.swim.present)
       def.capsuleRadius = std::max(def.swim.trunkHalfW, def.swim.trunkHalfH);
 
@@ -2101,6 +2102,7 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
               std::clamp(s2.value("biteForce", 0.0f), 0.0f, 1.0f);
           nw.strike.biteCarrion =
               std::clamp(s2.value("carrion", 1.0f), 1.0f, 4.0f);
+          nw.strike.push = std::clamp(s2.value("push", 1.0f), 0.0f, 4.0f);
           nw.strike.biteStain =
               std::clamp(s2.value("biteStain", 1.0f), 0.0f, 4.0f);
         }
@@ -6367,9 +6369,40 @@ void MobSystem::ReportNoStroke(const Mob& mob, const ai::Profile* pr,
 // worn shell or a held sword is a rig slot and aiming at one would be aiming
 // at somebody's coat. An absent table, an unknown tag, or a victim with
 // nothing left returns -1, which every caller reads as today's chest.
+int MobSystem::NearestLimbTo(const Mob& victim, Vec3 from) {
+  int best = -1;
+  float bestD = 1e30f;
+  const bool counted = !victim.alive_ && victim.carrionKnown_;
+  for (int i = 0; i < victim.AppendedBase() && i < (int)victim.limbs_.size(); i++) {
+    if (!victim.LimbAlive(i) || victim.IsBloodless(i)) continue;
+    if (counted && (i >= (int)victim.carrionLimb_.size() ||
+                    victim.carrionLimb_[(size_t)i] == 0))
+      continue;
+    Vec3 c{};
+    if (!victim.LimbCentreWorld(i, c)) continue;
+    const float d = (c - from).len();
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+    }
+  }
+  return best;
+}
+
+bool MobSystem::NearestPartOf(uint64_t actorId, Vec3 from, Vec3& out) {
+  const Mob* v = FindCombatantById(actorId);
+  if (v == nullptr) return false;
+  const int li = NearestLimbTo(*v, from);
+  return li >= 0 && v->LimbCentreWorld(li, out);
+}
+
 int MobSystem::PickTargetLimb(const AttackStyle& sty, const Mob& victim,
                               uint64_t attackerId, float attackerProne,
-                              uint32_t tick, float reachHeight) {
+                              uint32_t tick, float reachHeight,
+                              const Vec3* attackerAt) {
+  // ---- WHATEVER IS NEAREST (AttackStyle::targetNearest, 2026-10-11) ------
+  if (sty.targetNearest && attackerAt != nullptr)
+    if (const int li = NearestLimbTo(victim, *attackerAt); li >= 0) return li;
   // ---- A CORPSE IS EATEN WHERE THE MEAT IS (2026-10-11) -------------------
   // A carrion eater (ai::Perception::carrion) at a body: any limb that still
   // has edible cells, uniformly, whatever the style's table -- the table is
@@ -6809,8 +6842,10 @@ void MobSystem::StartStroke(Mob& mob, int styleIndex, uint64_t targetId,
         : prone > 0.0f && mob.def_ != nullptr
             ? mob.def_->worldSize.y + 1.0f
             : 0.0f;
+    const Vec3 at = mob.origin_ + (mob.def_ != nullptr ? mob.def_->worldSize * 0.5f
+                                                       : Vec3{});
     st.targetLimb =
-        PickTargetLimb(sty, *victim, mob.id_, prone, tick, reachH);
+        PickTargetLimb(sty, *victim, mob.id_, prone, tick, reachH, &at);
     // ---- ...AND THE BLOW IS THEN AIMED AT IT (2026-09-19) -----------------
     //
     // UNTIL NOW THE DRAW STEERED NOTHING. `targetLimb` was recorded, reported
@@ -7885,6 +7920,10 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     wv.probe.ctx = &pctx;
     wv.lineOfSight = &AiLineOfSight;
     wv.losCtx = &pctx;
+    wv.aimPart = [](void* ctx, uint64_t id, Vec3 from, Vec3& out) {
+      return static_cast<MobSystem*>(ctx)->NearestPartOf(id, from, out);
+    };
+    wv.aimCtx = this;
 
     ai::IntentOut out;
     if (ai::Think(mob.ai_, behaviors_, self, gv, wv, tick, dt, out)) {
@@ -8991,6 +9030,16 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     const Mob& av = *avatars_[i];
     if (!av.alive_ || av.def_ == nullptr) continue;
     PublishCombatant(av, actors_[i]);
+  }
+  // ---- SOFT PUSHERS (MobDef::bodyPush): this tick's posed limbs ---------
+  if (phys_ != nullptr) {
+    std::vector<std::pair<uint64_t, float>> soft;
+    for (const Mob& m : mobs_) {
+      if (!m.alive_ || m.def_ == nullptr || m.def_->bodyPush >= 1.0f) continue;
+      for (const MobLimb& l : m.limbs_)
+        if (l.body != 0) soft.push_back({l.body, m.def_->bodyPush});
+    }
+    phys_->SetSoftPushers(std::move(soft));
   }
   // ---- THE DEAD, AS A SCAVENGER SEES THEM (ai::Perception::carrion) -------
   // Only while some living creature eats them: a corpse is otherwise no

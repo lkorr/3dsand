@@ -917,7 +917,7 @@ void ResolveOnLooseMatter(uint64_t body, const StrikeParts& p,
 
 void StrikeReact(uint64_t body, const Vec3& dirWorld, const Vec3& atWorld,
                  float hp, float power, Physics& phys, MobSystem& mobs,
-                 DebrisSystem& debris) {
+                 DebrisSystem& debris, float push) {
   const Tuning::CombatFx& fx = CurrentTuning().combatfx;
   if (!fx.hitReact || body == 0 || dirWorld.len() < 1e-4f) return;
   // RIG-POSED: the spring, exactly as before. HitReact self-refuses for a limp
@@ -944,7 +944,10 @@ void StrikeReact(uint64_t body, const Vec3& dirWorld, const Vec3& atWorld,
                      std::max(fx.hitReactRefDamage, 0.1f),
                  0.0f, std::max(fx.hitReactMaxScale, 1.0f));
   if (scale <= 1e-3f) return;
-  phys.ApplyImpulseAt(body, dirWorld, fx.hitReactImpulse * scale, atWorld);
+  // ...times the weapon's own StrikeProfile::push.
+  const float shove = fx.hitReactImpulse * scale * std::max(0.0f, push);
+  if (shove <= 1e-4f) return;
+  phys.ApplyImpulseAt(body, dirWorld, shove, atWorld);
 }
 
 // How far back along a blow's travel the sweep looks for ARMOUR in the way of
@@ -989,7 +992,7 @@ bool ResolveOnCreature(const CreatureBlow& b, Physics& phys, MobSystem& mobs,
   // off and a reaction resolved after that would be handed a slot that no
   // longer belongs to the creature it was measured on. The FLESH handle.
   StrikeReact(b.reactBody, b.sweepDir, b.at, strike.Total(), b.power, phys,
-              mobs, debris);
+              mobs, debris, strike.push);
 
   // ---- 1. THE CUT PART — a creature's whole wound model ---------------
   //
@@ -1878,7 +1881,7 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       if (kind == StruckKind::Debris) {
         // 0. The body answers (see the note above the parts).
         StrikeReact(struckBody, sweepDir, at, s.strike.Total(), power, phys,
-                    mobs, debris);
+                    mobs, debris, s.strike.push);
         // ---- A CORPSE'S ARMOUR IS IN THE WAY TOO (2026-09-20) ------------
         //
         // The march-back retarget above runs only for LIVING flesh, because it
@@ -2047,7 +2050,7 @@ RemoteHitOutcome ApplyRemoteLooseHit(const MeleeHit& h, Physics& phys,
     if (const uint64_t r = debris.HandleOfGlobalId(h.c.reactBodyGid)) react = r;
   // 0. The body answers, as the sweep's loose branch does first.
   StrikeReact(react, sweepDir, at, h.c.strike.Total(), h.c.power, phys, mobs,
-              debris);
+              debris, h.c.strike.push);
   const Mob* attacker = mobs.ResolveCombatant(h.c.attacker);
   MobSystem::CoatContact coat;
   coat.haft = h.c.Has(MeleeHitCore::kHaft);

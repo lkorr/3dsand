@@ -7404,6 +7404,7 @@
       "//": "A NIP, thrown from a dart (Intent::Charge on a piranha's numbers): a fast gape-and-snap of the lower jaw (`piranha_nip` clip), the teeth closing on whatever they meet. The hole is the jaws' own (piranha.json `natural`: biteRadius 0.55 -- a couple of art voxels). `reach` 10 is the dart's commit distance.",
       "weapon": "jaws",
       "biteAnywhere": true,
+      "targetNearest": true,
       "reach": 10,
       "target": { "leg": 0.35, "foot": 0.15, "arm": 0.2, "hand": 0.15, "spine": 0.15 },
       "targetProne": { "leg": 0.35, "foot": 0.15, "arm": 0.2, "hand": 0.15, "spine": 0.15 },

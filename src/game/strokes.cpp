@@ -456,6 +456,7 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
     st.reachHeight = std::max(0.0f, s.value("reachHeight", 0.0f));
     st.fromStance = s.value("fromStance", false);
     st.biteAnywhere = s.value("biteAnywhere", false);
+    st.targetNearest = s.value("targetNearest", false);
     // A prone table with no upright one to fall back to would make the style
     // aim at the chest while standing and at the legs while crawling, which
     // is a content bug that looks like a targeting bug.

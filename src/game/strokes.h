@@ -668,6 +668,12 @@ struct AttackStyle {
   // three strikes in a row touched the man and none of them bit. With this
   // set the bite lands on first contact; the draw still decides the aim.
   bool biteAnywhere = false;
+  // GO FOR WHATEVER IS NEAREST (style key `targetNearest`, 2026-10-11): the
+  // stroke's limb is the victim's live anatomy limb nearest the attacker
+  // (on a corpse a carrion eater has counted: nearest with meat left), not a
+  // draw from the `target` table. A shoal round a man takes the hand, the
+  // foot, the face -- whatever each fish is beside -- not all the hips.
+  bool targetNearest = false;
   // AN AUTHORED BODY ANIMATION TO PLAY WITH THE STROKE, by name (empty = none).
   // The stroke program drives the WEAPON ARM through the melee driver; this is
   // everything else — the step, the shoulder drop, the off hand — keyframed in

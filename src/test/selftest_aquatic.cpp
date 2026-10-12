@@ -401,6 +401,22 @@ Status GateAquatic(Ctx& c, std::string& detail) {
   const uint64_t corpse = spawnVictim(poolC);
   if (Mob* m = mobs.FindMobById(corpse)) m->Die();
   support::RunTicks(rig, 20);
+  // THE CONTROL ARM: the same corpse alone for 300 ticks -- what the water
+  // and the float do to him with no fish (its path, beside the shoal's).
+  float alonePath = 0.0f;
+  {
+    Vec3 prev{};
+    bool had = false;
+    for (int i = 0; i < 300; i++) {
+      support::RunTicks(rig, 1);
+      Vec3 p{};
+      if (const Mob* m = mobs.FindMobById(corpse); m && m->LimbCentreWorld(m->Def()->rootLimb, p)) {
+        if (had) alonePath += (p - prev).len();
+        prev = p;
+        had = true;
+      }
+    }
+  }
   shoal.clear();
   for (int k = 0; k < 6; k++) {
     const float a = 0.3f + (float)k * 1.047f;
@@ -421,12 +437,25 @@ Status GateAquatic(Ctx& c, std::string& detail) {
   // those cuts touched, how near the fish was, where the corpse floats.
   uint32_t cutTicksE = 0, bodiesE = 0;
   float nearSum = 0.0f, corpseY = 0.0f;
+  // HOW FAR THE FEEDING SHOVES HIM: the pelvis's path and its fastest tick.
+  float corpsePath = 0.0f, corpseTop = 0.0f;
+  Vec3 corpsePrev{};
+  bool corpseHad = false;
   std::vector<int> lastHit(shoal.size(), 0);
   for (int i = 0; i < kCarrion; i++) {
     support::RunTicks(rig, 1);
     Vec3 cc{};
     if (const Mob* m = mobs.FindMobById(corpse))
-      if (m->LimbCentreWorld(m->Def()->rootLimb, cc)) corpseY = cc.y;
+      if (m->LimbCentreWorld(m->Def()->rootLimb, cc)) {
+        corpseY = cc.y;
+        if (corpseHad) {
+          const float step = (cc - corpsePrev).len();
+          corpsePath += step;
+          corpseTop = std::max(corpseTop, step);
+        }
+        corpsePrev = cc;
+        corpseHad = true;
+      }
     for (size_t k = 0; k < shoal.size(); k++) {
       const NpcStroke* st = mobs.MobStroke(shoal[k]);
       const Mob* f = mobs.FindMobById(shoal[k]);
@@ -484,7 +513,7 @@ Status GateAquatic(Ctx& c, std::string& detail) {
       "(%.1f hp to asphyxia) | E carrion %s: %u nips on a corpse, %u fish-ticks on it, "
       "lost %u voxels over %d limbs, meat/bone %.2f -> %.3f (eats to %.3f: stripped at "
       "tick %d, let go at %d) [%u cut fish-ticks at it, %u bodies touched, %.1f from its "
-      "pelvis on average; pelvis y %+.1f over the water's top; meat cells %u -> %u, bone and the rest %.0f -> %.0f]",
+      "pelvis on average; pelvis y %+.1f over the water's top; meat cells %u -> %u, bone and the rest %.0f -> %.0f; pelvis swam %.0f voxels, fastest %.2f a tick; alone, %.1f voxels in 300 ticks]",
       siteWhy.c_str(), aOk ? "PASS" : "FAIL", swimShare * 100.0f, outOfWater, worstLow,
       worstHigh, sweptAtFirstPass, passes, peakV, cruise > 0 ? peakV / cruise : 0.0f,
       bites, wentPast, lostA, limbsA, hpLostA, victimEnd.c_str(), bOk ? "PASS" : "FAIL",
@@ -496,9 +525,10 @@ Status GateAquatic(Ctx& c, std::string& detail) {
       cutTicksE, bodiesE, cutTicksE ? nearSum / (float)cutTicksE : 0.0f,
       corpseY - (float)(waterTop + 1), meat0, meatEnd,
       ratio0 > 0.0f ? (float)meat0 / ratio0 : 0.0f,
-      ratioEnd > 0.0f ? (float)meatEnd / ratioEnd : 0.0f);
+      ratioEnd > 0.0f ? (float)meatEnd / ratioEnd : 0.0f, corpsePath, corpseTop, alonePath);
   return aOk && bOk && cOk && dOk && eOk ? Status::Pass : Status::Fail;
 }
+
 
 // ============================================================================
 // A WALKER SWIMS (2026-10-11; game/mob_afloat.cpp): gate `npc-swim`.

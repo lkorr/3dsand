@@ -253,6 +253,12 @@ struct Perception {
   // FURTHER than it is, so a swimmer still turns on the living.
   float carrion = 0.0f;
   float carrionPull = 0.0f;
+  // ---- THE NEAREST PART, NOT THE MIDDLE (2026-10-11, the piranha) ---------
+  // true: once the target is seen and its motion tracked, `targetPos` is the
+  // centre of its body part nearest this creature (WorldView::aimPart), so a
+  // swimmer lines up on the hand or the head it is beside instead of every
+  // fish converging on the hips. Distances follow it.
+  bool nearestPart = false;
 };
 
 struct Movement {
@@ -871,6 +877,10 @@ struct WorldView {
   // "is there rock between these two points" with everything else that asks.
   bool (*lineOfSight)(void* ctx, Vec3 from, Vec3 to) = nullptr;
   void* losCtx = nullptr;
+  // Perception::nearestPart: the world centre of actor `id`'s body part
+  // nearest `from` (false = no answer; the actor's centre stands).
+  bool (*aimPart)(void* ctx, uint64_t id, Vec3 from, Vec3& out) = nullptr;
+  void* aimCtx = nullptr;
 };
 
 // The mob, as the AI sees itself. A view rather than a Mob& so this file has no

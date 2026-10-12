@@ -646,7 +646,7 @@
       "color": 3224399999,
       "faction": "sea",
       "hysteresis": 0.25,
-      "perception": { "sightRange": 22, "fovDegrees": 360, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 120, "keepRangeScale": 1.5, "minImmersion": 0.2, "scentRange": 60, "scentPull": 15, "carrion": 0.03, "carrionPull": 8 },
+      "perception": { "sightRange": 22, "fovDegrees": 360, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 120, "keepRangeScale": 1.5, "minImmersion": 0.2, "scentRange": 60, "scentPull": 15, "carrion": 0.03, "carrionPull": 8, "nearestPart": true },
       "movement": { "mobile": true, "rangeMin": 0, "rangeMax": 10, "bandSlack": 1.5, "approachSpeed": 1.0, "strafeSpeed": 0, "retreatSpeed": 0, "circleTendency": 0,
                     "wander": { "radius": 8, "speed": 0.5, "pauseMin": 0, "pauseMax": 15, "arrive": 1.5, "depth": 2 } },
       "orbit": { "radius": 4.5, "radiusJitter": 0.35, "speed": 0.8, "height": 0, "heightJitter": 3, "lookahead": 0.75, "engage": 2.2,

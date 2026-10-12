@@ -595,16 +595,66 @@ struct Physics::ContactImpls final : public JPH::ContactListener {
     for (auto& r : pairNs) r.store(0, std::memory_order_relaxed);
     for (auto& r : pairCalls) r.store(0, std::memory_order_relaxed);
   }
+  // ---- SOFT PUSHERS (Physics::SetSoftPushers) ----------------------------
+  // Sorted by body id; read-only during Update. `softPushes` is written
+  // under `mu` and applied, sorted, by Physics::Step after Update.
+  std::vector<std::pair<uint32_t, float>> softPushers;
+  struct SoftPush {
+    uint32_t body = 0, pusher = 0;
+    JPH::Vec3 impulse = JPH::Vec3::sZero();
+    JPH::RVec3 at = JPH::RVec3::sZero();
+  };
+  std::vector<SoftPush> softPushes;
+  float SoftScaleOf(const JPH::Body& b) const {
+    if (softPushers.empty() || !b.IsKinematic()) return 1.0f;
+    const uint32_t id = b.GetID().GetIndexAndSequenceNumber();
+    auto it = std::lower_bound(
+        softPushers.begin(), softPushers.end(), id,
+        [](const std::pair<uint32_t, float>& e, uint32_t v) { return e.first < v; });
+    return it != softPushers.end() && it->first == id ? it->second : 1.0f;
+  }
+  // True (and the contact made pass-through) when one side is a soft pusher
+  // and the other is dynamic. `added`: record the one nudge.
+  bool Soften(const JPH::Body& b1, const JPH::Body& b2,
+              const JPH::ContactManifold& m, JPH::ContactSettings& cs,
+              bool added) {
+    const float s1 = b2.IsDynamic() ? SoftScaleOf(b1) : 1.0f;
+    const float s2 = b1.IsDynamic() ? SoftScaleOf(b2) : 1.0f;
+    if (s1 >= 1.0f && s2 >= 1.0f) return false;
+    cs.mIsSensor = true;
+    if (!added) return true;
+    // The pusher is the soft side; the normal points from body 1 to body 2.
+    const bool pusherIs1 = s1 < 1.0f;
+    const JPH::Body& pb = pusherIs1 ? b1 : b2;
+    const JPH::Body& db = pusherIs1 ? b2 : b1;
+    const float scale = std::max(0.0f, pusherIs1 ? s1 : s2);
+    const JPH::Vec3 n = pusherIs1 ? m.mWorldSpaceNormal : -m.mWorldSpaceNormal;
+    const JPH::RVec3 p = m.GetWorldSpaceContactPointOn1(0);
+    const float closing = (pb.GetPointVelocity(p) - db.GetPointVelocity(p)).Dot(n);
+    const float invM = db.GetMotionProperties()->GetInverseMass();
+    if (closing <= 0.0f || invM <= 0.0f || scale <= 0.0f) return true;
+    SoftPush sp;
+    sp.body = db.GetID().GetIndexAndSequenceNumber();
+    sp.pusher = pb.GetID().GetIndexAndSequenceNumber();
+    sp.impulse = n * (scale * closing / invM);
+    sp.at = p;
+    std::lock_guard<std::mutex> lk(mu);
+    if (softPushes.size() < kCollectCeiling) softPushes.push_back(sp);
+    return true;
+  }
+
   void OnContactPersisted(const JPH::Body& b1, const JPH::Body& b2,
                           const JPH::ContactManifold& m,
-                          JPH::ContactSettings&) override {
+                          JPH::ContactSettings& cs) override {
     CountManifold(b1, b2, m);
+    Soften(b1, b2, m, cs, /*added=*/false);
   }
 
   void OnContactAdded(const JPH::Body& b1, const JPH::Body& b2,
                       const JPH::ContactManifold& m,
-                      JPH::ContactSettings&) override {
+                      JPH::ContactSettings& cs) override {
     CountManifold(b1, b2, m);
+    if (Soften(b1, b2, m, cs, /*added=*/true)) return;
     // YOUR OWN BODY MUST NOT FIRE DEBRIS IMPACTS. The OWNED and EXEMPT layers
     // exist precisely to split a player's limbs out of contact handling, and
     // a player proxy is teleported onto its player every tick so its contacts
@@ -1879,6 +1929,29 @@ void Physics::Step(float dt) {
     lastStep_.ccdRefused = layers_->ccdScope.refused.load();
   }
   if (contacts_) contacts_->Finish();
+  // THE SOFT PUSHERS' NUDGES (SetSoftPushers): collected by the job threads
+  // in whatever order they raced, applied here in a total order.
+  softPushesLast_ = 0;
+  if (contacts_ && !contacts_->softPushes.empty()) {
+    auto& v = contacts_->softPushes;
+    std::sort(v.begin(), v.end(), [](const ContactImpls::SoftPush& a,
+                                     const ContactImpls::SoftPush& b) {
+      if (a.body != b.body) return a.body < b.body;
+      if (a.pusher != b.pusher) return a.pusher < b.pusher;
+      if (a.at.GetX() != b.at.GetX()) return a.at.GetX() < b.at.GetX();
+      if (a.at.GetY() != b.at.GetY()) return a.at.GetY() < b.at.GetY();
+      return a.at.GetZ() < b.at.GetZ();
+    });
+    JPH::BodyInterface& bi = system_->GetBodyInterface();
+    for (const ContactImpls::SoftPush& sp : v) {
+      const JPH::BodyID id(sp.body);
+      if (!bi.IsAdded(id) || bi.GetMotionType(id) != JPH::EMotionType::Dynamic)
+        continue;
+      bi.AddImpulse(id, sp.impulse, sp.at);
+      softPushesLast_++;
+    }
+    v.clear();
+  }
   if (contacts_) {
     lastStep_.manifoldsDyn = contacts_->manifoldsDyn.load();
     for (int i = 0; i < kRoleCols * kRoleCols; i++)
@@ -3044,6 +3117,23 @@ bool Physics::IsBodyDynamic(uint64_t handle) const {
   const JPH::BodyID id = ToBodyID(handle);
   if (!bi.IsAdded(id)) return false;
   return bi.GetMotionType(id) == JPH::EMotionType::Dynamic;
+}
+
+void Physics::SetSoftPushers(std::vector<std::pair<uint64_t, float>> pushers) {
+  if (!contacts_) return;
+  auto& dst = contacts_->softPushers;
+  dst.clear();
+  dst.reserve(pushers.size());
+  for (const auto& e : pushers)
+    if (e.first != 0 && e.second < 1.0f)
+      dst.push_back({ToBodyID(e.first).GetIndexAndSequenceNumber(), e.second});
+  std::sort(dst.begin(), dst.end());
+  dst.erase(std::unique(dst.begin(), dst.end(),
+                        [](const std::pair<uint32_t, float>& a,
+                           const std::pair<uint32_t, float>& b) {
+                          return a.first == b.first;
+                        }),
+            dst.end());
 }
 
 bool Physics::ApplyImpulseAt(uint64_t handle, Vec3 dir, float impulse,

@@ -339,6 +339,19 @@ class Physics {
   // ineffective, it is a claim about ownership that is false.
   // Returns true if an impulse actually landed.
   bool ApplyImpulseAt(uint64_t handle, Vec3 dir, float impulse, Vec3 atVoxel);
+  // ---- SOFT PUSHERS (2026-10-11, the piranha) ------------------------------
+  // A posed (kinematic) body has infinite mass to the solver, so a creature's
+  // limb swept into a corpse or a crate shoves it out of the way at whatever
+  // speed the animation moves -- a shoal feeding on a body flung it round the
+  // pool. Each entry (handle, scale < 1) makes that body's contacts with
+  // DYNAMIC bodies pass-through, and instead each NEW contact gives the other
+  // body `scale` of the momentum the limb's closing speed would have given it
+  // (scale x its mass x the closing speed, along the contact normal), applied
+  // after the step in a sorted, deterministic order. Replaced wholesale; set
+  // between steps only (the job threads read it during Update).
+  void SetSoftPushers(std::vector<std::pair<uint64_t, float>> pushers);
+  // Nudges the last step gave (diagnostic).
+  uint32_t SoftPushesLastStep() const { return softPushesLast_; }
 
   // ---- mob locomotion plumbing (PLAN §B4) ----
   // Requires the body to have been created with allowKinematic.
@@ -932,6 +945,7 @@ class Physics {
   std::unique_ptr<LayerImpls> layers_;
   struct ContactImpls;  // Jolt ContactListener + its bounded buffer
   std::unique_ptr<ContactImpls> contacts_;
+  uint32_t softPushesLast_ = 0;
   std::vector<uint64_t> dynamicBodies_;  // handles of live debris bodies
   struct JointImpls;                     // Jolt constraint refs (impl detail)
   std::unique_ptr<JointImpls> joints_;

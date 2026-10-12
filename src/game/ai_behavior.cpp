@@ -462,6 +462,7 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
       pr.perception.scentPull = q.value("scentPull", 0.0f);
       pr.perception.carrion = std::max(0.0f, q.value("carrion", 0.0f));
       pr.perception.carrionPull = q.value("carrionPull", 0.0f);
+      pr.perception.nearestPart = q.value("nearestPart", false);
     }
     if (p.contains("movement")) {
       const auto& q = p["movement"];
@@ -717,6 +718,7 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
     if (p.perception.carrion > 0.0f)
       o << ", \"carrion\": " << num(p.perception.carrion)
         << ", \"carrionPull\": " << num(p.perception.carrionPull);
+    if (p.perception.nearestPart) o << ", \"nearestPart\": true";
     o << " },\n";
     o << "      \"movement\": { \"mobile\": "
       << (p.movement.mobile ? "true" : "false")
@@ -1558,6 +1560,17 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   NoteHurt(brain, self, tick);
   Perceive(brain, pr, self, view, tick);
   TrackTargetMotion(brain, self, tick, dt);
+  // THE NEAREST PART (Perception::nearestPart): after the motion is tracked
+  // on the body's centre, so the velocity estimate does not jump between
+  // limbs as the nearest one changes.
+  if (pr.perception.nearestPart && brain.hasTarget && brain.visible &&
+      view.aimPart != nullptr) {
+    Vec3 part{};
+    if (view.aimPart(view.aimCtx, brain.targetId, self.Centre(), part)) {
+      brain.targetPos = part;
+      brain.targetDist = BodyDist(self, self.Centre(), part);
+    }
+  }
   EvaluateRules(brain, pr, self, view, tick);
   const float* tn = brain.tune;
   const float spd = tn[(int)Tune::Speed];

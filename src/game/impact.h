@@ -100,6 +100,11 @@ struct StrikeProfile {
   // would take half an hour to strip a man: a dead body does not pull away,
   // so the jaws close, shake and tear a real piece out.
   float biteCarrion = 1.0f;
+  // HOW HARD THE BLOW SHOVES A LOOSE BODY (2026-10-11): a multiple of the
+  // solver-owned half of the hit reaction (StrikeReact's impulse on a corpse,
+  // a ragdoll, a crate). 1 = every weapon before this. A piranha's 0.1: a
+  // shoal feeding on a corpse was flinging it round the pool.
+  float push = 1.0f;
   uint16_t infectMat = 0;   // material the tear REWRITES exposed flesh to (0 = none)
   uint16_t infectStain = 0; // LIQUID whose stain the tear smears over the hole (0 = none)
 
