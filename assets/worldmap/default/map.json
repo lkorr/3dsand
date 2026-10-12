@@ -159,7 +159,17 @@
     }
   ],
   "dungeons": [
-    { "id": "teeth_caves", "name": "The Verdant Teeth sea caves", "dungeon": "teeth_caves", "at": [-78684,89590], "yOffset": 0, "yaw": 90 }
+    { "id": "teeth_caves", "name": "The Verdant Teeth sea caves", "dungeon": "teeth_caves", "at": [-78684,89590], "yOffset": 0, "yaw": 90 },
+    {
+      "id": "shardwell",
+      "name": "The Shardwell",
+      "dungeon": "shardwell",
+      "at": [67209, -49564],
+      "yOffset": 0,
+      "yaw": 270,
+      "about": "The abandoned crystal mine (package D6, assets/worldmap/default/scripts/dungeon_shardwell.mjs): the adit is driven west into the foot of the Shardwell crater's 100 m quartzite cliff, 48 m west of the marker; yaw 270 sends the dungeon's +Z (into the hill) to world -X. Two levels (the adit level at the anchor's ground, the deep level 18 m below), 150 m long under the Shardspire caprock."
+    },
+    { "id": "heather_cairn", "name": "The Tarn Cairn", "dungeon": "heather_cairn", "at": [-56045, -33555], "yOffset": -147, "yaw": 180 }
   ],
   "roads": [
     {
@@ -5449,16 +5459,5 @@
       }
     ]
   },
-  "dungeons": [
-    {
-      "id": "shardwell",
-      "name": "The Shardwell",
-      "dungeon": "shardwell",
-      "at": [67209, -49564],
-      "yOffset": 0,
-      "yaw": 270,
-      "about": "The abandoned crystal mine (package D6, assets/worldmap/default/scripts/dungeon_shardwell.mjs): the adit is driven west into the foot of the Shardwell crater's 100 m quartzite cliff, 48 m west of the marker; yaw 270 sends the dungeon's +Z (into the hill) to world -X. Two levels (the adit level at the anchor's ground, the deep level 18 m below), 150 m long under the Shardspire caprock."
-    }
-  ],
   "editLayer": "default_ground"
 }

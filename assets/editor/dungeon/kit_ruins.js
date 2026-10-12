@@ -50,6 +50,26 @@ const TILE_ROWS = [
   {k: 'tileSize', n: 'tile size (m)', min: 0.3, max: 3, step: 0.1, def: 1, d: 'Checker square size.'}
 ];
 
+/** LIQUIDS. A carve's liquid `level` is a y in the frame the prim is
+ *  written in, and the core's piece transform (dgutil xformPrim) and the
+ *  compiler's anchor shift do not carry it (they move min/max, not `level`),
+ *  so a piece placed at any y but 0 got the wrong water line: a sunken hall
+ *  two levels down came out full to its vault and drained into the stairs.
+ *  Until the core translates `level`, a ruins carve with water is TWO boxes:
+ *  the air above the line (the room) and the liquid below it, whose `level`
+ *  is LIQ_ALL (every cell of it is liquid, in any frame) -- the water line is
+ *  then the boxes' shared face, which the transform does carry. No noise on
+ *  the liquid box, no blend between them: the surface is flat and owned by
+ *  one carve. Returns the AIR prim's index (the room scatter goes on it). */
+const LIQ_ALL = 1 << 19;
+function wetBox(b, min, max, top, liquid, airOpts, room) {
+  const airMin = [min[0], Math.max(min[1], top + 1), min[2]];
+  const air = room ? b.room('box', {min: airMin, max}, airOpts) : b.carve('box', {min: airMin, max}, airOpts);
+  if (top + 1 > min[1]) b.carve('box', {min, max: [max[0], Math.min(max[1], top + 1), max[2]]},
+    Object.assign({}, airOpts || {}, {liquid, level: LIQ_ALL, noise: null, blend: 0, tag: 'water'}));
+  return air;
+}
+
 /** A column. Returns {broken, h}. style: round|square|fluted|broken. */
 function column(b, P, x, z, y0, H, R, style, key) {
   const broken = style === 'broken' || b.r('col', key, 'broken') < P.decay * 0.35;
@@ -98,12 +118,23 @@ function floorPattern(b, P, x0, z0, x1, z1, y, aisle) {
 }
 
 /** Ceiling falls: a hole up into the vault, a rubble heap, a few blocks. */
-function ceilingFalls(b, P, n, x0, z0, x1, z1, fy, H, key) {
+function ceilingFalls(b, P, n, x0, z0, x1, z1, fy, H, key, focus) {
+  // focus (hall `collapseFocus` > 0): the falls crowd round one point along the
+  // length; 0 keeps the old uniform spread exactly (same keys, same ranges).
+  const f = focus && focus.amount > 0 ? focus : null;
+  const cav = P.fallCavity !== undefined ? b.m(P.fallCavity) : Infinity;
+  const out = [];
   for (let i = 0; i < n; i++) {
     const r = b.ri(b.m(1.2), b.m(2.8), 'fall', key, i, 'r');
     const x = b.ri(x0 + r, Math.max(x0 + r + 1, x1 - r), 'fall', key, i, 'x');
-    const z = b.ri(z0 + r, Math.max(z0 + r + 1, z1 - r), 'fall', key, i, 'z');
-    b.carve('ellipsoid', {min: [x - r, H - r, z - r], max: [x + r, H + r * 2, z + r]}, {noise: 3, layer: 1, tag: 'room'});
+    let za = z0 + r, zb = Math.max(z0 + r + 1, z1 - r);
+    if (f) {
+      const zc = z0 + (z1 - z0) * f.at, half = Math.max(r + 2, (z1 - z0) * (1 - f.amount) / 2 + r);
+      za = Math.max(za, Math.round(zc - half)); zb = Math.max(za + 1, Math.min(zb, Math.round(zc + half)));
+    }
+    const z = b.ri(za, zb, 'fall', key, i, 'z');
+    out.push([x, z, r]);
+    b.carve('ellipsoid', {min: [x - r, H - r, z - r], max: [x + r, H + Math.min(r * 2, cav), z + r]}, {noise: 3, layer: 1, tag: 'room'});
     b.mound(x, fy, z, Math.round(r * 1.6), Math.round(r * 1.6), r);
     const nb = b.ri(1, 3, 'fall', key, i, 'nb');
     for (let k = 0; k < nb; k++) {
@@ -112,6 +143,7 @@ function ceilingFalls(b, P, n, x0, z0, x1, z1, fy, H, key) {
       b.fill('box', {min: [bx, fy, bz], max: [bx + s, fy + Math.max(2, s - 2), bz + Math.round(s * 1.3)]}, {mat: 'wall', layer: 4, noise: null, mask: 'air'});
     }
   }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -135,17 +167,22 @@ const HALL_ROWS = ROWS_DOOR.concat([
 ], TILE_ROWS, [
   {sec: 'Ruin'},
   {k: 'collapse', n: 'collapse', min: 0, max: 1, step: 0.05, def: 0.15, d: 'Ceiling falls: holes up into the vault, rubble heaps, fallen blocks.'},
-  {k: 'exits', n: 'exits', kind: 'enum', options: ['through', 'dead end', 'sides', 'all'], def: 'through', d: 'Doorways besides the origin: the far end, the two sides, or all three.'}
+  {k: 'collapseFocus', n: 'collapse focus', min: 0, max: 1, step: 0.05, def: 0,
+   d: '0 = falls anywhere in the hall; towards 1 they crowd round `collapse at` (a hall fallen in at one end), and the columns there are broken and toppled.'},
+  {k: 'collapseAt', n: 'collapse at', min: 0, max: 1, step: 0.05, def: 0.5, d: 'Where along the hall (0 = the entrance, 1 = the far end) a focused collapse lies.'},
+  {k: 'fallCavity', n: 'roof cavity (m)', min: 0.5, max: 6, step: 0.1, def: 6, d: 'How far a ceiling fall may break up above the vault (keep it under the ground cover).'},
+  {k: 'exits', n: 'exits', kind: 'enum', options: ['through', 'dead end', 'sides', 'all', 'left', 'right', 'through+left', 'through+right'], def: 'through',
+   d: 'Doorways besides the origin: the far end (through), the left / right side wall, or combinations.'}
 ]);
 
 function hallBody(b, P, fy, waterLevel) {
-  const wet = waterLevel !== null && waterLevel !== undefined ? {liquid: 'liquid', level: waterLevel} : {};
+  const wetTop = waterLevel !== null && waterLevel !== undefined ? waterLevel : null;
   const W = b.m(P.width, 30), L = b.m(P.length, 30), H = b.m(P.height, 20), C = b.m(P.ceiling);
   const hw = Math.round(W / 2), T = b.m(P.wallThick, 4);
   const dw = Math.round(b.m(P.doorWidth, 10) / 2), dh = b.m(P.doorHeight, 18);
   const z0 = T, z1 = T + L, zc = Math.round((z0 + z1) / 2);
   b.doorway(0, z0 + 1, 0, 0, dw * 2, dh, 'arch', {rise: Math.min(dw, b.m(0.8))});
-  const room = b.room('box', {min: [-hw, fy, z0], max: [hw, H, z1]}, wet);
+  const room = wetTop !== null ? wetBox(b, [-hw, fy, z0], [hw, H, z1], wetTop, 'liquid', {}, true) : b.room('box', {min: [-hw, fy, z0], max: [hw, H, z1]});
   b.skin('box', {min: [-hw, fy, z0], max: [hw, H, z1]}, {skin: 3, mat: 'wall', noise: 'wall', layer: 1});
   const ncol = Number(P.columnRows) ? P.columnCount : 0;
   const bays = [];
@@ -170,10 +207,13 @@ function hallBody(b, P, fy, waterLevel) {
   if (P.columnRows === '2' || P.columnRows === '4') xs.push(-Math.round(aisle / 2), Math.round(aisle / 2));
   if (P.columnRows === '4') { const o = Math.round(aisle / 2 + (hw - aisle / 2) / 2); xs.push(-o, o); }
   const colZ = bays.slice(1, ncol + 1);
+  // A focused collapse: where the roof came down the columns went with it.
+  const focusZ = z0 + L * P.collapseAt, focusR = L * (1 - P.collapseFocus) / 2 + b.m(3);
   xs.forEach((x, ri) => colZ.forEach((z, ci) => {
     if (Math.abs(x) + R + 2 > hw) return;
     const cx = x + b.jit(2, 'colx', ri, ci), cz = z + b.jit(3, 'colz', ri, ci);
-    column(b, P, cx, cz, fy, H + Math.round(C / 2) + 2 - fy, R, P.columnStyle, ri * 64 + ci);
+    const felled = P.collapseFocus > 0 && P.collapse > 0 && Math.abs(cz - focusZ) < focusR && b.r('col', ri * 64 + ci, 'felled') < 0.35 + 0.65 * P.collapse;
+    column(b, P, cx, cz, fy, H + Math.round(C / 2) + 2 - fy, R, felled ? 'broken' : P.columnStyle, ri * 64 + ci);
     b.lightSpot([cx + (x < 0 ? R + 1 : -R - 1), fy + b.m(2), cz], 'wall', x < 0 ? '+x' : '-x');
   }));
   // Wall lights between bays.
@@ -185,7 +225,9 @@ function hallBody(b, P, fy, waterLevel) {
   // Niches + statues, banners.
   if (P.niches) for (let i = 0; i + 1 < bays.length; i++) for (const s of [-1, 1]) {
     const z = Math.round((bays[i] + bays[i + 1]) / 2), nw = b.m(0.7), nd = b.m(0.8);
-    b.carve('box', {min: [s * hw, fy + b.m(0.5), z - nw], max: [s * (hw + nd), fy + b.m(3), z + nw]}, Object.assign({layer: 3, noise: null, blend: 0, tag: 'niche'}, wet));
+    const nmin = [Math.min(s * hw, s * (hw + nd)), fy + b.m(0.5), z - nw], nmax = [Math.max(s * hw, s * (hw + nd)), fy + b.m(3), z + nw];
+    if (wetTop !== null) wetBox(b, nmin, nmax, wetTop, 'liquid', {layer: 3, noise: null, blend: 0, tag: 'niche'});
+    else b.carve('box', {min: nmin, max: nmax}, {layer: 3, noise: null, blend: 0, tag: 'niche'});
     if (b.r('niche', i, s) < P.deco + 0.3) b.prop('ruins/statue', {height: 2.2}, [s * (hw + Math.round(nd / 2)), fy + b.m(0.5), z], s < 0 ? 90 : 270);
   }
   for (let i = 0; i < P.banners; i++) {
@@ -202,9 +244,12 @@ function hallBody(b, P, fy, waterLevel) {
     daisTop = fy + dh2;
     if (P.deco > 0.2) for (const s of [-1, 1]) b.prop('ruins/brazier', {lit: 'light'}, [s * Math.round(hw * 0.5), daisTop, z1 - Math.round(dd / 2)], 180, {light: true});
   }
-  ceilingFalls(b, P, Math.round(P.collapse * L / b.m(6)), -hw, z0, hw, z1, fy, H + C, 'hall');
+  ceilingFalls(b, P, Math.round(P.collapse * L / b.m(6)), -hw, z0, hw, z1, fy, H + C, 'hall', {amount: P.collapseFocus, at: P.collapseAt});
   // Exits.
   const ex = P.exits;
+  const exThrough = ex === 'through' || ex === 'all' || ex === 'through+left' || ex === 'through+right';
+  const exSides = ex === 'sides' || ex === 'all' ? [[-1, 'left'], [1, 'right']]
+    : ex === 'left' || ex === 'through+left' ? [[-1, 'left']] : ex === 'right' || ex === 'through+right' ? [[1, 'right']] : [];
   const ways = [];
   // A sunken (flooded) hall keeps its doors at the sill level, y = 0.
   const exitY = fy < 0 ? 0 : daisTop, sideY = fy < 0 ? 0 : fy;
@@ -214,13 +259,13 @@ function hallBody(b, P, fy, waterLevel) {
   for (let z = z0 + b.m(1.5); z < z1 - b.m(1.5); z += b.m(4)) pts.push([0, fy, z]);
   const names = b.wayChain('c', pts.length ? pts : [[0, fy, zc]], ['door'], []);
   const last = names[names.length - 1];
-  if (ex === 'through' || ex === 'all') {
+  if (exThrough) {
     b.carve('vault', {min: [-dw, exitY, z1 - (P.dais && fy >= 0 ? b.m(P.daisDepth) + 2 : 1)], max: [dw, exitY + dh, z1 + T], axis: 'z', rise: Math.min(dw, b.m(0.8))}, {layer: 3, noise: null, tag: 'door'});
     b.socket('out', [0, exitY, z1 + T], '+z', dw * 2, dh, 'arch', ['door']);
     b.way('back', [0, exitY, z1 + Math.round(T / 2)], [last, 'socket:out']);
     ways.push('back');
   }
-  if (ex === 'sides' || ex === 'all') for (const [s, nm] of [[-1, 'left'], [1, 'right']]) {
+  for (const [s, nm] of exSides) {
     b.carve('vault', {min: [s < 0 ? -hw - T : hw - 1, sideY, zc - dw], max: [s < 0 ? -hw + 1 : hw + T, sideY + dh, zc + dw], axis: 'x', rise: Math.min(dw, b.m(0.8))}, {layer: 3, noise: null, tag: 'door'});
     b.socket(nm, [s * (hw + T), sideY, zc], s < 0 ? '-x' : '+x', dw * 2, dh, 'arch', ['door']);
     b.way(nm, [s * (hw - b.m(1)), sideY, zc], ['socket:' + nm]);
@@ -246,7 +291,9 @@ const HALL = {
     nave: {params: {}},
     hypostyle: {params: {columnRows: '4', columnCount: 6, width: 18, length: 24, height: 5, vault: 'flat', columnStyle: 'square', tilePattern: 'checker', banners: 0, dais: false}},
     domed_hall: {params: {vault: 'dome', ceiling: 6, width: 14, length: 14, columnRows: '2', columnCount: 2, columnStyle: 'fluted', aisleWidth: 8, tilePattern: 'runner'}},
-    fallen_nave: {params: {columnStyle: 'fluted', decay: 0.85, collapse: 0.7, banners: 1, moisture: 0.5, lightCount: 1, vault: 'groin'}}
+    fallen_nave: {params: {columnStyle: 'fluted', decay: 0.85, collapse: 0.7, banners: 1, moisture: 0.5, lightCount: 1, vault: 'groin'}},
+    half_fallen: {params: {columnStyle: 'fluted', columnCount: 6, length: 30, collapse: 0.6, collapseFocus: 0.65, collapseAt: 0.8, fallCavity: 2.5,
+                           vault: 'groin', niches: true, banners: 3, exits: 'through+left', decay: 0.6}}
   },
   build(b, P) { hallBody(b, P, 0); }
 };
@@ -273,7 +320,7 @@ const FLOODED_HALL = {
     const run = Math.max(S + 2, Math.round(S * 1.5)), sh = Math.max(1, Math.round(S / Math.max(1, Math.round(S / 2))));
     // Solid flights down from the door sills to the sunken floor.
     b.flight('fill', '-z', -h.dw - 2, h.dw + 2, h.z0, h.z0 + run, -S, S, sh, {below: S}, {mat: 'trim', layer: 3, noise: null});
-    if (P.exits === 'through' || P.exits === 'all') b.flight('fill', '+z', -h.dw - 2, h.dw + 2, h.z1 - run, h.z1, -S, S, sh, {below: S}, {mat: 'trim', layer: 4, noise: null});
+    if (['through', 'all', 'through+left', 'through+right'].includes(P.exits)) b.flight('fill', '+z', -h.dw - 2, h.dw + 2, h.z1 - run, h.z1, -S, S, sh, {below: S}, {mat: 'trim', layer: 4, noise: null});
     for (const n of b.waynodes) if (n.pos[1] < 0) n.swim = wl > n.pos[1] + b.m(1.2);
   }
 };
@@ -579,8 +626,9 @@ const PIT_ROOM = {
     const D = b.m(P.pitDepth, 6), px = Math.round(pw / 2), pz0 = zc - Math.round(pl / 2), pz1 = pz0 + pl;
     // The pit liquid is the pit carve's own (PLAN 3.4.1 `level`): born full, flat, at rest.
     const lv = Math.min(-2, -D + Math.max(1, Math.round(P.liquidLevel * D)));
-    const wet = P.liquid !== 'none' ? {liquid: P.liquid === 'lava' ? 'lava' : 'liquid', level: lv} : {};
-    const pit = b.carve('box', {min: [-px, -D, pz0], max: [px, 1, pz1]}, Object.assign({layer: 3, noise: 0.5, blend: 2, tag: 'room'}, wet));
+    const pitOpts = {layer: 3, noise: 0.5, blend: 2, tag: 'room'};
+    const pit = P.liquid !== 'none' ? wetBox(b, [-px, -D, pz0], [px, 1, pz1], lv, P.liquid === 'lava' ? 'lava' : 'liquid', pitOpts)
+                                    : b.carve('box', {min: [-px, -D, pz0], max: [px, 1, pz1]}, pitOpts);
     b.skin('box', {min: [-px, -D, pz0], max: [px, 0, pz1]}, {skin: 2, mat: 'wall', layer: 4});
     if (P.spikes) {
       // Spikes are a stalagmite scatter in the accent metal: no prim per spike.
@@ -752,6 +800,38 @@ const COLLAPSED = {
   }
 };
 
+/** The cairn (ruin_entrance): rough drums of stone narrowing upward, each
+ *  course nudged off the last, a slab set upright on top, a few stones at
+ *  the foot. Fills only (it stands on whatever is there); its foundation
+ *  runs down to the paving, at most 4 m, so it never floats on a brow lower
+ *  than the author guessed. */
+function cairn(b, P) {
+  const H = b.m(P.cairn, 4), R = b.m(P.cairnRadius, 4);
+  const cx = b.m(P.cairnX), cz = b.m(P.cairnZ), y0 = b.m(P.cairnLift);
+  const n = Math.max(3, Math.round(P.cairn / 0.55));
+  const slot = (k) => P.cairnStone !== 'mixed' ? P.cairnStone : b.pick(['loose', 'wall', 'trim', 'loose'], 'cairn', k, 'mat');
+  const found = Math.min(Math.max(0, y0) + b.m(0.5), b.m(4));
+  let x = cx, z = cz, y = y0;
+  for (let k = 0; k < n; k++) {
+    const t = k / n, r = Math.max(2, Math.round(R * Math.pow(1 - t, 0.75) + 1));
+    const h = Math.max(2, Math.round(H / n) + b.ri(-1, 1, 'cairn', k, 'h'));
+    const lo = k === 0 ? y - found : y;
+    b.fill('cylinder', {min: [x - r, lo, z - r], max: [x + r, y + h, z + r], axis: 'y'}, {mat: slot(k), layer: 4, noise: 1.6, tag: 'cairn'});
+    y += h;
+    x += b.ri(-1, 1, 'cairn', k, 'dx'); z += b.ri(-1, 1, 'cairn', k, 'dz');
+  }
+  // the capstone: a slab stood on end
+  const sw = Math.max(2, Math.round(R * 0.35)), sh = Math.max(4, Math.round(H * 0.3));
+  const along = b.r('cairn', 'cap') < 0.5;
+  b.fill('box', {min: [x - (along ? 1 : sw), y - 1, z - (along ? sw : 1)], max: [x + (along ? 2 : sw), y + sh, z + (along ? sw : 2)]}, {mat: 'statue', layer: 4, noise: null, tag: 'cairn'});
+  // fallen stones round the foot
+  for (let i = 0; i < 4; i++) {
+    const a = b.r('cairn', 'st', i) * Math.PI * 2, d = R + b.ri(2, 8, 'cairn', 'st', i, 'd'), s = b.ri(3, 6, 'cairn', 'st', i, 's');
+    const sx = cx + Math.round(Math.cos(a) * d), sz = cz + Math.round(Math.sin(a) * d);
+    b.fill('box', {min: [sx, y0 - b.m(0.5), sz], max: [sx + s, y0 + Math.max(2, s - 2), sz + s + 1]}, {mat: slot(100 + i), layer: 4, noise: null, tag: 'cairn'});
+  }
+}
+
 const RUIN_ENTRANCE = {
   type: 'ruin_entrance', label: 'Ruin entrance', version: 1, surface: true,
   size: {width: {min: 1.5, max: 8, def: 3, n: 'stair width (m)'}, length: null, height: {min: 2, max: 6, def: 3, n: 'headroom (m)'}, ceiling: null},
@@ -764,19 +844,31 @@ const RUIN_ENTRANCE = {
     {k: 'foot', n: 'foot passage (m)', min: 1, max: 10, step: 0.1, def: 2, d: 'Level run at the bottom before the inner socket.'},
     {sec: 'Colonnade', note: 'Above ground: a paved platform round the stairwell, columns along it, a parapet.'},
     {k: 'platform', n: 'platform margin (m)', min: 1, max: 12, step: 0.1, def: 3, d: 'Paving beyond the stairwell on each side (the terrain-blend apron: the ground above it is cleared and the gaps under it filled).'},
+    {k: 'apronHeight', n: 'apron clearance (m)', min: 0.5, max: 12, step: 0.1, def: 8,
+     d: 'How high the ground over the platform is cleared. High on a hillside (the platform is cut into the slope); low in a hollow or a sunken way, where a tall clearance would slot a box into the banks.'},
     {k: 'columns', n: 'columns per side', min: 0, max: 12, step: 1, int: true, def: 4, d: ''},
     {k: 'columnHeight', n: 'column height (m)', min: 1, max: 12, step: 0.1, def: 4.5, d: ''},
     {k: 'columnStyle', n: 'column style', kind: 'enum', options: ['round', 'square', 'fluted', 'broken'], def: 'fluted', d: ''},
     {k: 'lintels', n: 'lintels', kind: 'bool', def: true, d: 'Stone beams along the tops of standing column pairs.'},
     {k: 'toppled', n: 'toppled columns', min: 0, max: 8, step: 1, int: true, def: 2, d: 'Columns lying on the paving.'},
     {k: 'parapet', n: 'parapet (m)', min: 0, max: 2, step: 0.1, def: 0.8, d: 'Low wall along the stairwell edges.'},
-    {k: 'overgrowth', n: 'overgrowth', min: 0, max: 1, step: 0.05, def: 0.5, d: 'Ivy and moss on the paving and stones.'}
+    {k: 'overgrowth', n: 'overgrowth', min: 0, max: 1, step: 0.05, def: 0.5, d: 'Ivy and moss on the paving and stones.'},
+    {sec: 'Cairn', note: 'A heap of stones raised over the ruin by later hands: rough courses narrowing to a capstone. Off by default.'},
+    {k: 'cairn', n: 'cairn height (m)', min: 0, max: 10, step: 0.1, def: 0, d: '0 = no cairn.'},
+    {k: 'cairnRadius', n: 'cairn radius (m)', min: 0.6, max: 6, step: 0.1, def: 1.8, d: 'Radius of the bottom course.'},
+    {k: 'cairnX', n: 'cairn across (m)', min: -30, max: 30, step: 0.1, def: 4.5, d: 'Sideways from the stair axis (+ = right, looking down the stair).'},
+    {k: 'cairnZ', n: 'cairn along (m)', min: -20, max: 40, step: 0.1, def: -1.5, d: 'Along the stair from the anchor (+ = over the stair, into the hill).'},
+    {k: 'cairnLift', n: 'cairn base (m)', min: -2, max: 30, step: 0.1, def: 0,
+     d: 'Height of the foot of the cairn above the paving: lift it onto the brow above a ruin set into a slope. Its foundation runs down to the paving (at most 4 m), so a guess a little high still stands on stones.'},
+    {k: 'cairnStone', n: 'cairn stone', kind: 'enum', options: ['mixed', 'trim', 'wall', 'loose'], def: 'mixed', d: 'Palette slot of the courses; mixed = seeded per course.'}
   ],
   PRESETS: {
     colonnade: {params: {}},
     grand_portico: {params: {width: 5, drop: 10, platform: 6, columns: 6, columnHeight: 7, columnStyle: 'round', toppled: 1, decay: 0.3, overgrowth: 0.2, lightCount: 4}},
     sunken_stair: {params: {width: 2, drop: 5, platform: 1.5, columns: 0, toppled: 0, parapet: 1.2, overgrowth: 0.8, lightType: 'none', lightCount: 0}},
-    toppled_ruin: {params: {columns: 5, columnStyle: 'broken', toppled: 5, lintels: false, decay: 0.9, overgrowth: 0.9}}
+    toppled_ruin: {params: {columns: 5, columnStyle: 'broken', toppled: 5, lintels: false, decay: 0.9, overgrowth: 0.9}},
+    hollow_way_cairn: {params: {width: 3.2, drop: 10, platform: 2.5, apronHeight: 2.2, columns: 3, columnHeight: 5.2, toppled: 2,
+                                cairn: 3.3, cairnRadius: 2.9, cairnX: 0, cairnZ: 16, cairnLift: 10, overgrowth: 0.7}}
   },
   build(b, P) {
     const W = b.m(P.width, 10), H = b.m(P.height, 18), hw = Math.round(W / 2);
@@ -784,7 +876,7 @@ const RUIN_ENTRANCE = {
     const open = Math.round((run * Math.min(H, D)) / D);     // where the stair's headroom goes under grade
     const PM = b.m(P.platform, 6), pz0 = -PM, pz1 = open + Math.round(PM / 2);
     // Apron: clear the ground above the platform, fill the gaps under it, pave it.
-    b.carve('box', {min: [-hw - PM, 0, pz0], max: [hw + PM, b.m(8), pz1]}, {layer: 1, noise: 0.5, blend: 10, tag: 'apron'});
+    b.carve('box', {min: [-hw - PM, 0, pz0], max: [hw + PM, b.m(P.apronHeight, 2), pz1]}, {layer: 1, noise: 0.5, blend: 10, tag: 'apron'});
     b.fill('box', {min: [-hw - PM, -b.m(1.5), pz0], max: [hw + PM, 0, pz1]}, {mat: 'floor', layer: 2, noise: 'floor', mask: 'air'});
     b.fill('box', {min: [-hw - PM, -2, pz0], max: [hw + PM, 0, pz1]}, {mat: 'floor', layer: 2, noise: null});
     // The stair (carved after the paving so it cuts through it).
@@ -825,6 +917,7 @@ const RUIN_ENTRANCE = {
       b.scatter.push({prim: apron, kind: 'moss', density: +(P.overgrowth * 0.9).toFixed(3), size: [1, 4], surface: 'floor', mat: 'veg', seedKey: 'overgrowth'});
       b.scatter.push({prim: apron, kind: 'moss', density: +(P.overgrowth * 0.6).toFixed(3), size: [2, 6], surface: 'wall', mat: 'veg', seedKey: 'ivy'});
     }
+    if (P.cairn > 0) cairn(b, P);
     b.wayChain('w', [[0, 0, -b.m(1)], [0, -Math.round(R / 2), Math.round(run / 2)], [0, -R, run + Math.round(foot / 2)]], ['socket:surface'], ['socket:in']);
     b.socket('surface', [0, 0, 0], '-z', W + 2 * PM, H, 'rect', ['surface']);
     b.socket('in', [0, -R, run + foot], '+z', W, H, 'arch', ['door']);
