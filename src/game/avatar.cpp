@@ -1412,7 +1412,7 @@ bool PlayerAvatar::PartPosedWorld(int part, Vec3& outPos, Quat& outRot) const {
   return true;
 }
 
-bool PlayerAvatar::HeadEyeWorld(Vec3& out) const {
+bool PlayerAvatar::HeadEyeWorld(Vec3& out, Quat* outRot) const {
   if (!spawned_ || !alive_ || def_ == nullptr || !def_->hasEyeLocal)
     return false;
   const int head = parts_.head;
@@ -1432,6 +1432,7 @@ bool PlayerAvatar::HeadEyeWorld(Vec3& out) const {
   // voxels, rest frame (MobDef::eyeLocal); the posed rotation carries both.
   out = corner + Rotate(q, limbs_[(size_t)head].anchorLimb +
                               def_->eyeLocal * def_->ArtToWorld());
+  if (outRot) *outRot = q;
   return true;
 }
 

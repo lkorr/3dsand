@@ -125,6 +125,8 @@
     "crawlTurnRate": 0.8,
     "crawlLookYaw": 100,
     "firstPersonHeadHalflife": 0.05,
+    "ragdollLookSteer": 55,
+    "ragdollLookReturn": 1.2,
     "headLookYaw": 70,
     "headLookReleaseYaw": 50,
     "headLookPitchUp": 55,

@@ -560,6 +560,8 @@ const TUNING_PARAMS = {
   'avatar.crawlTurnRate':{t:'f',def:0.8,min:0.05,max:40},
   'avatar.crawlLookYaw':{t:'f',def:100,min:10,max:180},
   'avatar.firstPersonHeadHalflife':{t:'f',def:0.05,min:0,max:0.5},
+  'avatar.ragdollLookSteer':{t:'f',def:55,min:0,max:180},
+  'avatar.ragdollLookReturn':{t:'f',def:1.2,min:0,max:10},
   'avatar.headLookYaw':{t:'f',def:70,min:0,max:110},
   'avatar.headLookReleaseYaw':{t:'f',def:50,min:0,max:110},
   'avatar.headLookPitchUp':{t:'f',def:55,min:0,max:89},

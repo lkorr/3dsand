@@ -1599,6 +1599,10 @@ TP_F(avatar, crawlTurnRate, NO_WGSL, 0.8f, 0.05f, 40.0f)
 TP_F(avatar, crawlLookYaw, NO_WGSL, 100.0f, 10.0f, 180.0f)
 // Seconds. 0 = the eye snaps to the head every frame (30 Hz steps).
 TP_F(avatar, firstPersonHeadHalflife, NO_WGSL, 0.05f, 0.0f, 0.5f)
+// Degrees the mouse may steer the ragdoll view away from the head's face.
+TP_F(avatar, ragdollLookSteer, NO_WGSL, 55.0f, 0.0f, 180.0f)
+// Seconds. 0 = the steer offset never drifts back to the face.
+TP_F(avatar, ragdollLookReturn, NO_WGSL, 1.2f, 0.0f, 10.0f)
 // 0 is meaningful (body always faces the camera, the old behaviour); the
 // ceiling stops a value that would let the head face backwards.
 // + a hand-written rule in LoadTuning

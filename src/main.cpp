@@ -8004,6 +8004,12 @@ int main(int argc, char** argv) {
   // Weight (0..1) of the avatar.firstPersonForward push: eased out while the
   // body is ragdolled, so the eye stays inside the tumbling head.
   float fpFwdW = 1.0f;
+  // First-person RAGDOLL look (avatar.ragdollLookSteer): while the body is
+  // limp the view turns with the head, and the mouse only steers a clamped
+  // offset from where the face points. `head` is the eased head rotation,
+  // `yaw`/`pitch` the offset in the head's own frame. Render-side input only,
+  // like the mouse it replaces.
+  struct { bool active = false; Quat head{0, 0, 0, 1}; float yaw = 0, pitch = 0; } rdLook;
   float& respawnTimer = session.respawnTimer;
   // Night-ambience rarity roll. Deliberately a plain PRNG and NOT the sim's
   // counter-based hash: this decides whether a mood bed plays, never anything
@@ -13538,6 +13544,69 @@ int main(int argc, char** argv) {
           cam.yaw += dy * 0.25f;
           cam.pitch += (pitchT - cam.pitch) * 0.25f;
         }
+      }
+    }
+    // RAGDOLLED, THE HEAD OWNS THE VIEW (first person). The look is the
+    // head's face direction turned by a small offset in the HEAD's frame:
+    // the mouse steers that offset within avatar.ragdollLookSteer degrees
+    // and it drifts back to the face over avatar.ragdollLookReturn, so a
+    // tumble down a mountain spins the view with the skull while the player
+    // can still lean it toward where they want to look. The offset is seeded
+    // from the current view on going limp, so nothing jumps; on getting up
+    // the view is simply left where the head put it. Rest frame of a limb:
+    // face +Z, crown +Y (heading 0 = +Z). Off under a scripted harness: the
+    // eased head is wall-clock smoothed and those runs own the camera.
+    {
+      Vec3 rdEye;
+      Quat hq;
+      const bool rdWant = camMode == CameraMode::First && avatar.Spawned() &&
+                          avatar.Ragdolled() && !ui.demonTalk.active &&
+                          !harnessInput && !g_fellSiteSet &&
+                          avatar.HeadEyeWorld(rdEye, &hq);
+      if (!rdWant) {
+        rdLook.active = false;
+      } else {
+        const auto& at = CurrentTuning().avatar;
+        if (!rdLook.active) {
+          rdLook.head = hq;
+          const Vec3 l = QuatRotateInv(hq, cam.Forward());
+          rdLook.yaw = std::atan2(-l.x, l.z);
+          rdLook.pitch = std::asin(std::clamp(l.y, -1.0f, 1.0f));
+          rdLook.active = true;
+        } else {
+          // The head is posed at the tick rate; ease it like the eye position.
+          const float hl = at.firstPersonHeadHalflife;
+          const float k = hl <= 1e-4f ? 1.0f : 1.0f - std::exp2(-dt / hl);
+          rdLook.head = QuatNormalize(QuatSlerp(rdLook.head, hq, k));
+        }
+        // Mouse steers the offset. The cap never pulls an offset that is
+        // already outside it (the seed can be) -- it only stops the mouse
+        // pushing further out.
+        if (captured) {
+          const float sens = CurrentTuning().camera.mouseSensitivity;
+          const float lim = at.ragdollLookSteer * (3.14159265f / 180.0f);
+          auto steer = [](float& o, float d, float cap) {
+            const float c = std::max(cap, std::fabs(o));
+            o = std::clamp(o + d, -c, c);
+          };
+          steer(rdLook.yaw, (float)(mx - mx0) * sens, lim);
+          steer(rdLook.pitch, -(float)(my - my0) * sens, std::min(lim, 1.4f));
+        }
+        if (at.ragdollLookReturn > 1e-4f) {
+          const float r = std::exp2(-dt / at.ragdollLookReturn);
+          rdLook.yaw *= r;
+          rdLook.pitch *= r;
+        }
+        const float cp = std::cos(rdLook.pitch);
+        const Vec3 local{-std::sin(rdLook.yaw) * cp, std::sin(rdLook.pitch),
+                         std::cos(rdLook.yaw) * cp};
+        const Vec3 look = QuatRotate(rdLook.head, local);
+        // cam.yaw is never wrapped; keep it continuous so nothing easing
+        // toward it sees a 2*pi jump.
+        const float yawNew = std::atan2(look.z, look.x);
+        cam.yaw += std::remainder(yawNew - cam.yaw, 6.2831853f);
+        const float pc = CurrentTuning().camera.pitchClamp;
+        cam.pitch = std::clamp(std::asin(std::clamp(look.y, -1.0f, 1.0f)), -pc, pc);
       }
     }
     // The look delta is ACCUMULATED into the tick command (N2) rather than

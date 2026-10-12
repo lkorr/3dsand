@@ -364,8 +364,10 @@ class PlayerAvatar : public Mob {
   // camera rides this, so a crawl puts the eye near the floor where the head
   // is. While RAGDOLLED (limp or getting up) it is the head's actual
   // transform instead -- the body is not where the animation says. False with
-  // no head, no eyeLocal, or a dead body.
-  bool HeadEyeWorld(Vec3& out) const;
+  // no head, no eyeLocal, or a dead body. `outRot`, when given, gets the
+  // same transform's rotation (rest frame: face +Z, crown +Y) -- the
+  // ragdoll camera turns with it.
+  bool HeadEyeWorld(Vec3& out, Quat* outRot = nullptr) const;
 
   // ---- render plumbing ----
   // Inherited from Mob (identical slot walk to MobSystem's), except that the

@@ -584,6 +584,12 @@ struct Tuning {
     // poses so it tracks the head (a crawl puts it near the floor, out in
     // front of the body) without stepping at the tick rate.
     float firstPersonHeadHalflife = TPD(avatar, firstPersonHeadHalflife);
+    // RAGDOLLED IN FIRST PERSON THE VIEW TURNS WITH THE HEAD. The mouse
+    // steers an offset from the face direction, in the head's own frame, of
+    // at most ragdollLookSteer degrees; the offset decays back to the face
+    // with half-life ragdollLookReturn seconds (0 = it stays where steered).
+    float ragdollLookSteer = TPD(avatar, ragdollLookSteer);
+    float ragdollLookReturn = TPD(avatar, ragdollLookReturn);
     // ---- head look ---------------------------------------------------------
     // How far the HEAD may yaw toward the camera away from the body's facing,
     // in degrees (PlayerAvatar::SetLook clamps to it). It does NOT drive the
