@@ -16228,7 +16228,8 @@ fn fs(in : VSOut) -> FSOut {
   //
   // Liquids used to be tinted here too, and that is precisely why water looked
   // like blue fog — an absorbing volume with no surface. They now take the
-  // shadeWater() path below instead.
+  // shadeWater() path below instead — and since trace() still ADDS them to the
+  // accumulators, the gas block below subtracts their share again.
   //
   // ---- AND THE OUTER BOX JOINS THE SAME ACCUMULATOR (§2.5) ----------------
   // The three locals below start as copies of the near march's fields and the
@@ -16278,6 +16279,29 @@ fn fs(in : VSOut) -> FSOut {
   // happen inside trace()'s loop, which is exactly what
   // gotcha-raymarch-register-cliff says not to do for a soft volumetric.
   if (mediaMat != 0u && materials[mediaMat].klass == CLASS_GAS) {
+    // ---- TAKE THE LIQUID BACK OUT (ticket 2026-10-11_21-54-18) ----
+    // trace() still sums every non-opaque LIQUID cell into mediaTau/mediaTint
+    // (its fire-dimming term reads the total), and mediaMat latches whichever
+    // medium the ray met first. So a ray that crossed ANY gas before a liquid
+    // -- the near-invisible hydrogen a sodium pour gives off, the smoke over a
+    // burning shore -- arrived here with the water's own path folded in: its
+    // deep-volume palette (#3a78e8) at its opacity, composited as fog. Every
+    // water cell behind a wisp of gas came out a saturated blue cube, while
+    // shadeWater drew the same water properly on top of it. The water's share
+    // is exactly liqPath x its opacity, in its palette average -- the same
+    // arithmetic every liquid branch of trace() adds -- so it comes back out
+    // here, and the gas is shaded by the gas alone. Exact for a ray through
+    // one liquid; a ray through two (lye into water) removes the first one's
+    // share at the first one's opacity and clamps, which leaves at most a
+    // faint residual of the second.
+    if (h.liqPath > 0.0 && h.liqT > 0.0) {
+      let lqm = materials[voxMat(voxWordAt(unpackWinCell(h.liqCell)))];
+      if (lqm.klass == CLASS_LIQUID) {
+        let lqTau = min(h.liqPath * f32(lqm.opacity) / 255.0, mediaTau);
+        mediaTint = max(mediaTint - liquidAlbedo(lqm) * lqTau, vec3f(0.0));
+        mediaTau -= lqTau;
+      }
+    }
     let mm = materials[mediaMat];
     var mc = (unpackColor(mm.color0) + unpackColor(mm.color1)) * 0.5;
     if (mediaTau > 1e-5) { mc = mediaTint / mediaTau; }
