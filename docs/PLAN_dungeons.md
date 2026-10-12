@@ -1,9 +1,18 @@
 # PLAN — Dungeons (kit pieces, stitched layouts, placed in the world map)
 
-Status: DRAFT 2026-10-12 (orchestrator). Owner answers recorded in §0. This
-document is the FORMAT CONTRACT the parallel packages build against: §3 is
-frozen once wave 1 launches; a package that needs to change it says so on the
-board and the orchestrator amends this file, never a package alone.
+Status: LANDED 2026-10-12 (packages D1-D9 merged; see the amendments and
+§9/§10 reports below). §3 + its amendments are the format contract.
+Architecture truth now lives in DESIGN.md §9h (engine) and §16.D3 (entities);
+the human workflow in docs/EDITOR_GUIDE.md §16-17.
+
+**Portability (owner, 2026-10-12): the default map is temporary.** Dungeon
+assets are map-free (`assets/dungeons/<id>/`, each example rebuilt by its own
+`build.mjs`); a map only holds `dungeons[]` placement entries (any number,
+the same dungeon several times). Variants (`"extends"`) compile to their own
+shell + refs. Putting a dungeon into a new map: `node scripts/place_dungeon.mjs
+--map <map> --dungeon <id> --at x,z [--yaw] [--write]`, or the World map
+page's Dungeon tool (EDITOR_GUIDE §17.4b). The `dungeon-portability` checks
+in `dungeon-format`/`dungeon-gen` place every real asset on the harness map.
 
 ## 0. What the owner asked for (2026-10-12)
 
