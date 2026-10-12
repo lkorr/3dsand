@@ -48,8 +48,10 @@ class FarPlumes {
  public:
   // One column's worth of frozen fire.
   struct Emitter {
-    int32_t x, y, z;    // world voxel: the column's CENTRE in x/z, the TOPMOST
-                        // hot voxel in y (smoke leaves from the top of a fire)
+    int32_t x, y, z;    // world voxel: the column's CENTRE in x/z, the LOWEST
+                        // hot voxel in y (the plume stands on the base of the
+                        // fire and rises through it; it was the topmost until
+                        // 2026-10-11, which floated a tree's smoke off its crown)
     uint32_t strength;  // hot voxels in the column, 1..kGasFarEmitStrengthMax
   };
 

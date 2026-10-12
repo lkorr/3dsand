@@ -3346,7 +3346,11 @@ synthesizes their plumes. Both halves are deliberately small:
   the CPU ever sees an evicted chunk's voxels. It aggregates per gasOuter COLUMN
   FOOTPRINT: a cell is 8 voxels and a chunk is 16, so a burning chunk
   contributes at most FOUR emitters however much of it is alight, each carrying
-  the column's hot-voxel count and its topmost hot voxel. What counts as fire is
+  the column's hot-voxel count and its LOWEST hot voxel -- the plume stands on
+  the base of the fire and rises through it (it was the topmost until
+  2026-10-11: ticket 22-25-46, a burning tree's far smoke began above its crown
+  with sky between the fire and the smoke; the wide clusters likewise take their
+  lowest member's y, not their topmost's). What counts as fire is
   READ OFF THE REACTION TABLE (`SmokeSourceTable`, `materials.h`; since
   rule-unification W1-B1, 2026-09-24): a material whose own bucket DECAYS to
   or EMITS `fire` or `smoke` — exactly the materials that put smoke into the
@@ -3762,8 +3766,8 @@ moves, which is the point: what shrank is the column, not the opacity.
 
 And a second route to the same picture was closed on the CPU side: the wide
 bucket **coarsening added in round five is now capped at two doublings**. Merging
-buckets CONCENTRATES MASS AT ONE POSITION — an aggregate stands at its topmost
-member's coordinate and carries the SUM of its members' strengths, which the
+buckets CONCENTRATES MASS AT ONE POSITION — an aggregate stands at its members'
+centroid (lowest y since 2026-10-11) and carries the SUM of its members' strengths, which the
 shader reads as "how big is this fire" — so unbounded coarsening could collapse
 a scatter of small fires into one record drawing a 4x-height column somewhere
 none of them was. At x4 the bucket is 25.6 m, a genuinely local cluster.
