@@ -58,7 +58,7 @@ for (const k of G.STYLES) {
 }
 const want = {caves: ['mouth', 'tunnel', 'cavern', 'shaft', 'chasm', 'grotto_pool', 'crawl', 'rubble_choke'],
               mines: ['adit_entrance', 'drift', 'junction', 'incline', 'shaft', 'stope', 'collapse', 'flooded_sump', 'camp'],
-              ruins: ['ruin_entrance', 'hall', 'corridor', 'stair', 'crypt', 'pit_room', 'sanctum', 'flooded_hall', 'collapsed_passage']};
+              ruins: ['ruin_entrance', 'hall', 'corridor', 'turn', 'junction', 'stair', 'crypt', 'pit_room', 'sanctum', 'flooded_hall', 'collapsed_passage']};
 for (const k in want) for (const t of want[k]) ok(!!G.getKit(k).TYPES[t], k + ' has §4 type ' + t);
 
 /* ---- 2 + 3. every type x preset ---------------------------------------------- */
@@ -76,7 +76,7 @@ for (const k of G.STYLES) for (const t of G.getKit(k).TYPE_ORDER) {
     nGen++;
     ok(r.prims.length > 0 && r.sockets.length > 0, tag + ': prims + sockets');
     ok(r.sockets.some(s => s.pos[0] === 0 && s.pos[1] === 0 && s.pos[2] === 0), tag + ': an origin socket at (0,0,0)');
-    ok(!!T.surface === !!r.surface || t === 'shaft', tag + ': surface flag');
+    ok(!!T.surface === !!r.surface || t === 'shaft' || r.params.keyLight === 'shaft', tag + ': surface flag');
     const carves = r.prims.filter(p => p.op === 'carve');
     for (const s of r.sockets) {
       const unit = s.dir.filter(v => v !== 0).length === 1 && s.dir.every(v => v === 0 || v === 1 || v === -1);
@@ -143,7 +143,8 @@ section('one slider does not reshuffle unrelated choices');
   ok(J(sets(c)) === J(sets(dd)), 'drift: niche frequency does not move a single timber set');
   const C = G.getType('caves', 'cavern');
   const m2 = C.generate({mushrooms: 2, lightType: 'crystal'}, 4), m6 = C.generate({mushrooms: 6, lightType: 'crystal'}, 4);
-  ok(J(m2.prims) === J(m6.prims), 'cavern: mushroom count leaves the shell untouched');
+  const noFoot = (r) => r.prims.filter(p => p.tag !== 'footing').map(J);
+  ok(J(noFoot(m2)) === J(noFoot(m6)), 'cavern: mushroom count leaves the shell untouched (but for the patch footings)');
   const mush = (r) => r.props.filter(p => p.prop === 'caves/glow_mushroom_patch' && !p.light).map(p => J(p.pos));
   ok(mush(m2).every((x, i) => mush(m6)[i] === x), 'cavern: the first mushroom patches stay put when more are added');
   const H = G.getType('ruins', 'hall');
@@ -245,7 +246,16 @@ function readBin(u8) {
   for (let i = 0; i < ntp; i++) { const id = S(U32()), size = [I32(), I32(), I32()], npl = U32(), pal = []; for (let k = 0; k < npl; k++) pal.push(S(U32())); const nv = U32(), vox = []; for (let k = 0; k < nv; k++) vox.push([I32(), I32(), I32(), I32()]); tpl.push({id, size, palette: pal, voxels: vox}); }
   const ni = U32(), ins = []; for (let i = 0; i < ni; i++) ins.push({template: U32(), pos: [I32(), I32(), I32()], yaw: U32() * 90, id: S(U32())});
   const npc = U32(); const pcs = []; for (let i = 0; i < npc; i++) pcs.push(S(U32()));
-  if (U32() !== 0x21444E45) throw new Error('no END!');
+  let tag = U32();
+  const ext = [];
+  if (tag === 0x584D5250) {                       // PRMX: the 3.4.1 extras
+    const nx = U32();
+    if (nx !== np) throw new Error('PRMX count ' + nx + ' != prims ' + np);
+    for (let i = 0; i < nx; i++) { const fl = U32(), m2 = U32(), ck = I32(); U32(); ext.push({openOnly: (fl & 1) === 1, mat2: S(m2), checker: ck}); }
+    tag = U32();
+  }
+  if (tag !== 0x21444E45) throw new Error('no END!');
+  out.extras = ext;
   if (at !== u8.length) throw new Error('trailing bytes');
   const OPS = ['carve', 'fill', 'skin', 'keep'], SH = ['box', 'rbox', 'ellipsoid', 'cylinder', 'capsule', 'ramp', 'vault', 'tube'];
   const KINDS = ['rubble', 'stalagmite', 'stalactite', 'crystal', 'moss', 'puddle', 'bones', 'ore_vein'], SURF = ['floor', 'ceil', 'wall', 'any'];
@@ -318,6 +328,241 @@ section('the sample dungeon');
   const binPath = join(ROOT, 'assets/dungeons/_d2_sample/shell.bin');
   const want2 = G.emitShellBin(prog);
   ok(existsSync(binPath) && Buffer.compare(readFileSync(binPath), Buffer.from(want2)) === 0, '_d2_sample/shell.bin is current');
+}
+
+/* ---- 11. D8 variety sliders --------------------------------------------------- */
+section('D8 variety: every new slider has a visible, deterministic effect and keeps the sockets');
+{
+  const gen = (k, t, params, seed) => G.getType(k, t).generate(params, seed || 7);
+  const sk = (r) => J(r.sockets.map(s => [s.name, s.pos, s.dir, s.w, s.h]));
+  const room = (r) => { let bb = null; for (const p of r.prims) if (p.op === 'carve' && p.tag !== 'apron') bb = U.boxUnion(bb, U.shapeBounds(p)); return bb; };
+  const carveCount = (r, f) => r.prims.filter(p => p.op === 'carve' && (!f || f(p))).length;
+  /** slider `key` from `lo` to `hi` on k/t (base params): the prims change, twice the same, sockets as given. */
+  const effect = (k, t, key, lo, hi, base, sockets) => {
+    const a = gen(k, t, Object.assign({}, base || {}, {[key]: lo})), b = gen(k, t, Object.assign({}, base || {}, {[key]: hi})), b2 = gen(k, t, Object.assign({}, base || {}, {[key]: hi}));
+    ok(J(a.prims) !== J(b.prims), k + '/' + t + ': ' + key + ' ' + lo + ' -> ' + hi + ' changes the shell');
+    ok(J(b.prims) === J(b2.prims) && J(b.props) === J(b2.props), k + '/' + t + ': ' + key + ' ' + hi + ' generates the same twice');
+    if (sockets !== false) ok(sk(a) === sk(b), k + '/' + t + ': ' + key + ' leaves every socket where it was');
+    return [a, b];
+  };
+  // wander: sockets stay put, the carve widens sideways with the amplitude (monotone)
+  for (const [k, t, base] of [['mines', 'drift', {length: 24}], ['mines', 'collapse', {length: 20}], ['ruins', 'corridor', {length: 24, alcoves: 0}],
+                              ['caves', 'tunnel', {length: 24, meander: 0}], ['caves', 'crawl', {length: 14, meander: 0}], ['mines', 'adit_entrance', {length: 20}]]) {
+    const r0 = gen(k, t, Object.assign({}, base, {wander: 0})), r1 = gen(k, t, Object.assign({}, base, {wander: 1.5})), r2 = gen(k, t, Object.assign({}, base, {wander: 3.5}));
+    ok(sk(r0) === sk(r1) && sk(r0) === sk(r2), k + '/' + t + ': wander leaves every socket where it was');
+    const w = (r) => { const b = room(r); return b.max[0] - b.min[0]; };
+    ok(w(r0) < w(r1) && w(r1) <= w(r2), k + '/' + t + ': wander 0 -> 1.5 -> 3.5 m widens the swept carve (' + [w(r0), w(r1), w(r2)].join(' -> ') + ')');
+    ok(J(gen(k, t, Object.assign({}, base, {wander: 2})).prims) === J(gen(k, t, Object.assign({}, base, {wander: 2})).prims), k + '/' + t + ': wander deterministic');
+  }
+  effect('mines', 'drift', 'wanderWave', 8, 30, {length: 24, wander: 2});
+  // slope: the far socket rises by exactly the slope, the near one stays
+  for (const [k, t, far] of [['mines', 'drift', 'out'], ['ruins', 'corridor', 'out'], ['mines', 'collapse', 'out'], ['caves', 'cavern', 'out']]) {
+    const a = gen(k, t, {slope: 0}), b = gen(k, t, {slope: 2.3});
+    const fa = a.sockets.find(s => s.name === far), fb = b.sockets.find(s => s.name === far);
+    ok(fb.pos[1] - fa.pos[1] === 23 && J(a.sockets.find(s => s.name === 'in').pos) === J(b.sockets.find(s => s.name === 'in').pos),
+       k + '/' + t + ': slope 2.3 m lifts the far socket by 23 voxels (' + fa.pos[1] + ' -> ' + fb.pos[1] + '), the origin stays');
+  }
+  effect('ruins', 'corridor', 'slopeSteps', 0, 3, {slope: 2, length: 20}, false);
+  effect('mines', 'drift', 'slopeSteps', 0, 2, {slope: 1.5, length: 20}, false);
+  // width / height variation: the shell changes, the ends (sockets) do not
+  for (const [k, t] of [['mines', 'drift'], ['ruins', 'corridor'], ['caves', 'crawl'], ['caves', 'tunnel'], ['ruins', 'collapsed_passage']]) {
+    effect(k, t, 'widthVar', 0, 0.5, {length: 24});
+    effect(k, t, 'heightVar', 0, 0.5, {length: 24});
+  }
+  // jitter: the repeated elements move (sets, ribs, columns, loculi), sockets do not
+  {
+    const zs = (r) => r.prims.filter(p => p.op === 'fill' && p.mat === 'support' && p.shape === 'box').map(p => p.min[2]);
+    const [a, b] = effect('mines', 'drift', 'jitter', 0, 1, {length: 24, broken: 0, sag: 0});
+    ok(J(zs(a)) !== J(zs(b)), 'drift: jitter moves the timber sets');
+    effect('ruins', 'corridor', 'jitter', 0, 1, {length: 24, archSpacing: 2.5});
+    effect('ruins', 'hall', 'jitter', 0, 1, {columnCount: 6});
+    effect('ruins', 'crypt', 'jitter', 0, 1, {});
+    effect('mines', 'stope', 'jitter', 0, 1, {});
+    effect('mines', 'incline', 'jitter', 0, 1, {length: 20});
+    ok(J(gen('mines', 'drift', {jitter: 0}).prims) === J(gen('mines', 'drift', {}).prims), 'drift: jitter 0 is the regular drift');
+  }
+  // bays + lobe: more carves / a bigger room, the doors stay
+  for (const [k, t] of [['caves', 'cavern'], ['mines', 'stope'], ['mines', 'camp'], ['ruins', 'hall'], ['ruins', 'crypt'], ['ruins', 'sanctum'], ['caves', 'grotto_pool'], ['ruins', 'pit_room'], ['mines', 'flooded_sump']]) {
+    const r0 = gen(k, t, {bays: 0}), r3 = gen(k, t, {bays: 3});
+    ok(carveCount(r3) > carveCount(r0) && sk(r0) === sk(r3), k + '/' + t + ': bays 0 -> 3 add carves (' + carveCount(r0) + ' -> ' + carveCount(r3) + '), sockets kept');
+    const l0 = room(gen(k, t, {lobe: 0})), l1 = room(gen(k, t, {lobe: 0.8}));
+    ok((l1.max[0] - l1.min[0]) > (l0.max[0] - l0.min[0]), k + '/' + t + ': lobe 0 -> 0.8 widens the room (' + (l0.max[0] - l0.min[0]) + ' -> ' + (l1.max[0] - l1.min[0]) + ')');
+  }
+  // a bay never cuts a side door: a 3-exit cavern / an all-exits hall with many bays still validates its sockets
+  {
+    const r = gen('caves', 'cavern', {exits: 3, bays: 6, lobe: 1});
+    const side = r.sockets.filter(s => s.name === 'left' || s.name === 'right');
+    ok(side.length === 2, 'cavern exits 3 + bays 6: both side sockets present');
+  }
+  // key lights
+  {
+    const sh = gen('caves', 'cavern', {keyLight: 'shaft', keyHeight: 30});
+    const tube = sh.prims.find(p => p.tag === 'apron' && p.op === 'carve');
+    ok(sh.surface && tube && U.shapeBounds(tube).max[1] >= 290, 'cavern keyLight shaft: a carve to 30 m, the piece becomes a surface piece');
+    const fire = gen('mines', 'stope', {keyLight: 'fire'}), crys = gen('ruins', 'hall', {keyLight: 'crystals'});
+    ok(fire.prims.some(p => p.mat === 'candle_flame' && p.tag === 'keylight') && !fire.surface, 'stope keyLight fire: a bed of flame, not a surface piece');
+    ok(crys.prims.some(p => p.mat === 'crystal' && p.tag === 'keylight'), 'hall keyLight crystals: crystal prisms');
+    const vol = (r) => r.prims.filter(p => p.tag === 'keylight' && p.mat === 'candle_flame').reduce((a, p) => { const b = U.shapeBounds(p); return a + (b.max[0] - b.min[0]) * (b.max[1] - b.min[1]) * (b.max[2] - b.min[2]); }, 0);
+    ok(vol(gen('mines', 'stope', {keyLight: 'fire', keySize: 0.9})) > vol(gen('mines', 'stope', {keyLight: 'fire', keySize: 0.1})), 'keySize grows the fire');
+    ok(J(gen('ruins', 'hall', {keyLight: 'none'}).prims) === J(gen('ruins', 'hall', {}).prims), 'keyLight none is the plain room');
+  }
+  // light power: bigger emitters; light density: more lights in a big room
+  {
+    const fl = (r) => r.prims.filter(p => p.tag === 'light' && (p.mat === 'light' || p.mat === 'lightCool')).reduce((a, p) => { const b = U.shapeBounds(p); return a + (b.max[0] - b.min[0]) * (b.max[1] - b.min[1]) * (b.max[2] - b.min[2]); }, 0);
+    ok(fl(gen('ruins', 'corridor', {lightType: 'torch', lightPower: 1})) > 4 * fl(gen('ruins', 'corridor', {lightType: 'torch', lightPower: 0})), 'torch: lightPower 1 is a flame over 4x the volume of lightPower 0');
+    const cr = (r) => r.prims.filter(p => p.tag === 'light').reduce((a, p) => a + (p.r || 0), 0);
+    ok(cr(gen('caves', 'cavern', {lightType: 'crystal', lightPower: 1})) > cr(gen('caves', 'cavern', {lightType: 'crystal', lightPower: 0.2})), 'crystal: lightPower grows the lumps');
+    const lp = gen('mines', 'drift', {lightPower: 0.8}).props.filter(p => p.light);
+    ok(lp.length && lp.every(p => p.params.glow === 0.8), 'lantern lights carry lightPower as the lantern\'s glow');
+    const nl = (r) => r.refs.filter(x => x.kind === 'light').length;
+    const big = {width: 30, length: 36, lightCount: 2};
+    ok(nl(gen('caves', 'cavern', Object.assign({lightDensity: 1}, big))) > nl(gen('caves', 'cavern', Object.assign({lightDensity: 0}, big))) &&
+       nl(gen('caves', 'cavern', Object.assign({lightDensity: 0}, big))) === 2, 'lightDensity adds lights by floor area (0 = exactly the count)');
+    const a = gen('ruins', 'hall', {lightCount: 3, lightDensity: 0}), b = gen('ruins', 'hall', {lightCount: 3});
+    ok(J(a.refs) === J(b.refs), 'lightDensity 0 keeps the mount list (and the seeded picks) of the plain piece');
+  }
+  // anchored lights: on a rough wall a crystal lump is rooted behind the mount
+  {
+    const r = gen('caves', 'cavern', {lightType: 'crystal', lightPower: 0.5, wallRough: 1, floorUneven: 1});
+    const lumps = r.prims.filter(p => p.tag === 'light' && p.shape === 'capsule');
+    ok(lumps.length > 0 && lumps.every(p => p.a[1] < p.b[1]), 'crystal lights on a rough floor are capsules rooted below the mount (' + lumps.length + ')');
+  }
+  // kit sliders
+  effect('caves', 'tunnel', 'xsec', 0, 0.8, {length: 20});
+  effect('caves', 'tunnel', 'canyon', 0, 0.8, {length: 20});
+  effect('caves', 'tunnel', 'pockets', 0, 3, {length: 20});
+  effect('caves', 'tunnel', 'breakdown', 0, 0.8, {length: 20});
+  {
+    const [, b] = effect('mines', 'drift', 'vein', 0, 0.8, {length: 20});
+    ok(b.prims.some(p => p.op === 'skin' && p.tag === 'vein' && p.mat === 'ore'), 'drift vein: an ore SKIN band (never a fill in the passage)');
+  }
+  effect('ruins', 'hall', 'settle', 0, 0.8, {});
+  effect('ruins', 'hall', 'breach', 0, 0.8, {});
+  effect('ruins', 'corridor', 'breach', 0, 0.8, {length: 20});
+  effect('ruins', 'crypt', 'settle', 0, 0.8, {});
+  {
+    const r = gen('ruins', 'hall', {settle: 0.8});
+    ok(r.prims.some(p => p.tag === 'settle' && p.shape === 'ramp' && p.mask === 'air'), 'settle: tilted slabs are open-space-only ramps');
+  }
+  // ruins turn / junction: the out socket is at the end of the out arm, facing away
+  {
+    const tl = gen('ruins', 'turn', {side: 'left'}), tr = gen('ruins', 'turn', {side: 'right'});
+    ok(tl.sockets.find(s => s.name === 'out').dir[0] === -1 && tr.sockets.find(s => s.name === 'out').dir[0] === 1, 'ruins turn: left turns to -x, right to +x');
+    const jx = gen('ruins', 'junction', {shape: 'X'});
+    ok(['in', 'left', 'right', 'out'].every(n => jx.sockets.some(s => s.name === n)), 'ruins junction X: four sockets');
+  }
+}
+
+/* ---- 12. compiler extras + fractional flights + doors -------------------------- */
+section('compiler: openOnly, checker, door refs, fractional flights');
+{
+  const one = (k, t, params) => { const d = G.newDungeon({name: 'x', style: k, seed: 3}); d.pieces.push(G.newPiece(d, {kit: k, type: t, params})); return d; };
+  const pr = G.compile(one('mines', 'collapse', {}), {id: 'x', materials: NAMES});
+  ok(pr.prims.some(p => p.op === 'fill' && p.openOnly && p.mat === 'gravel'), 'a rubble heap (mask air) compiles to an openOnly fill');
+  ok(pr.prims.every(p => !p.openOnly || p.op === 'fill'), 'openOnly only on fills');
+  const ck = G.compile(one('ruins', 'hall', {tilePattern: 'checker', tileSize: 0.8}), {id: 'x', materials: NAMES});
+  const cp = ck.prims.find(p => p.checker);
+  ok(cp && cp.mat2 === 'chalk_rock' && cp.checker === 8 && cp.op === 'fill', 'a checker floor compiles to mat2 + checker (' + (cp ? cp.mat + '/' + cp.mat2 + ' ' + cp.checker : 'none') + ')');
+  const bin = readBin(G.emitShellBin(ck));
+  const ex = bin.extras || [];
+  ok(ex.length === ck.prims.length && ck.prims.every((p, i) => ex[i].openOnly === !!p.openOnly && ex[i].mat2 === p.mat2 && ex[i].checker === (p.checker || 0)), 'the PRMX block reads back to the json extras');
+  const stripped = Object.assign({}, ck, {prims: ck.prims.map(p => { const q = Object.assign({}, p); delete q.openOnly; delete q.mat2; delete q.checker; return q; })});
+  ok(readBin(G.emitShellBin(stripped)).extras.length === 0, 'no extras -> no PRMX block (END! straight after the pieces)');
+  // the door ref: hinge cell + width covers the opening, in the tagged piece
+  {
+    let d = G.newDungeon({name: 'door', style: 'ruins', seed: 4});
+    d.pieces.push(G.newPiece(d, {kit: 'ruins', type: 'corridor', params: {width: 2.4}}));
+    d = G.attachPiece(d, {piece: 'p0', socket: 'out'}, {kit: 'ruins', type: 'crypt', params: {doorWidth: 2.2}}).dungeon;
+    const p = G.compile(d, {id: 'door', materials: NAMES});
+    const door = p.refs.find(r => r.kind === 'door');
+    const s = p.sockets.find(q => q.piece === 'p1' && q.name === 'in');
+    const w = door.props.width;
+    // yaw = the tagged socket's facing; along = HeadingAxis(yaw + 90)
+    const along = U.rotV(U.quarter(door.yaw + 90), [0, 0, 1]);
+    const cells = Array.from({length: w}, (_, i) => door.pos[0] + along[0] * i);
+    const lo = Math.min(...cells), hi = Math.max(...cells);
+    ok(lo === s.pos[0] - Math.floor(s.w / 2) && hi === lo + w - 1, 'door ref: the leaf from the hinge cell covers the opening exactly (' + lo + '..' + hi + ' for an opening centred on ' + s.pos[0] + ', ' + s.w + ' wide)');
+  }
+  // fractional flights: a run that does not divide reaches the far socket with no flat remainder
+  for (const L of [11.3, 12.7, 20.9]) {
+    const r = G.getType('mines', 'incline').generate({mode: 'stairs', rise: 3.1, length: L, stepHeight: 0.2}, 1);
+    const ramps = r.prims.filter(p => p.shape === 'ramp' && p.op === 'carve');
+    const flats = r.prims.filter(p => p.tag === 'flat');
+    const run = ramps.reduce((a, p) => a + (p.max[2] - p.min[2]), 0);
+    ok(flats.length === 0 && run === Math.round(L * 10), 'incline ' + L + ' m: the treads share the whole run (' + run + ' cells, ' + ramps.length + ' ramps, no flat landing)');
+  }
+}
+
+/* ---- 13. variants (dungeon inheritance) ------------------------------------------ */
+section('variants: extends, piece edits, removals, cycles, staleness');
+{
+  const base = JSON.parse(sampleText);
+  const bases = {base: base};
+  const load = (id) => bases[id] || null;
+  // palette only
+  const v1 = {version: 1, extends: 'base', palette: {variant: 'basalt', kits: {ruins: {variant: 'dark'}}}};
+  const r1 = G.resolveDungeon(v1, load);
+  ok(J(r1.dungeon.pieces) === J(G.normalizeDungeon(base).pieces) && r1.dungeon.palette.variant === 'basalt' && r1.dungeon.palette.kits.ruins.variant === 'dark', 'palette-only variant: same pieces, palette merged');
+  const c1 = G.compile(v1, {id: 'v1', materials: NAMES, loadBase: load});
+  ok(c1.errors.length === 0 && c1.source.extends === 'base' && J(c1.source.chain) === J(['base']), 'palette-only variant compiles clean, its shell says what it extends');
+  // piece params
+  const pid = base.pieces[1].id;
+  const v2 = {version: 1, extends: 'base', pieces: {[pid]: {params: {width: base.pieces[1].params.width + 0.6}}}};
+  const r2 = G.resolveDungeon(v2, load).dungeon;
+  ok(r2.pieces.find(p => p.id === pid).params.width === Math.round((base.pieces[1].params.width + 0.6) * 10) / 10 &&
+     J(r2.pieces.filter(p => p.id !== pid)) === J(G.normalizeDungeon(base).pieces.filter(p => p.id !== pid)), 'piece-param variant: only that piece\'s param moved');
+  // removed branch: the piece and everything only reachable through it go, links to it are cut
+  const nb = G.normalizeDungeon(base);
+  const leafPar = nb.pieces.find(p => p.links && Object.keys(p.links).length && p.id !== (nb.entrance && nb.entrance.piece));
+  const v3 = {version: 1, extends: 'base', pieces: {[leafPar.id]: {remove: 'branch'}}};
+  const r3 = G.resolveDungeon(v3, load);
+  ok(!r3.dungeon.pieces.some(p => p.id === leafPar.id) && r3.removed.length >= 1 && r3.dungeon.pieces.every(p => !p.links || Object.values(p.links).every(L => r3.dungeon.pieces.some(q => q.id === L.piece))),
+     'removed-branch variant: ' + r3.removed.length + ' piece(s) gone, no link points at them');
+  const v3v = G.validate(v3, {loadBase: load});
+  ok(!v3v.some(i => i.severity === 'error' && i.code === 'link'), 'removed-branch variant validates without dangling links');
+  // cycle refusal + depth
+  const cyc = {a: {version: 1, extends: 'b'}, b: {version: 1, extends: 'a'}};
+  let threw = '';
+  try { G.resolveDungeon(cyc.a, (id) => cyc[id]); } catch (e) { threw = e.message; }
+  ok(/cycle/.test(threw), 'a variant cycle is refused (' + threw + ')');
+  const deep = {}; for (let i = 0; i < 12; i++) deep['d' + i] = {version: 1, extends: i === 11 ? 'base' : 'd' + (i + 1)}; deep.base = base;
+  threw = ''; try { G.resolveDungeon(deep.d0, (id) => deep[id]); } catch (e) { threw = e.message; }
+  ok(/deeper than/.test(threw), 'a chain deeper than ' + G.VARIANT_MAX_DEPTH + ' is refused');
+  // a chain of two resolves to the same as the flattened edits
+  const v4 = {version: 1, extends: 'v2', palette: {variant: 'basalt'}};
+  bases.v2 = v2;
+  const r4 = G.resolveDungeon(v4, load);
+  ok(J(r4.chain) === J(['base', 'v2']) && r4.dungeon.pieces.find(p => p.id === pid).params.width === r2.pieces.find(p => p.id === pid).params.width, 'a variant of a variant flattens the chain');
+  // staleness: the variant's own bytes are the engine's sourceHash; its resolvedHash moves when the BASE moves
+  const t1 = G.compile(v2, {id: 'v2', loadBase: load, sourceText: G.dungeonJsonText(v2)});
+  const base2 = JSON.parse(sampleText); base2.pieces[0].params.decay = (base2.pieces[0].params.decay || 0) + 0.1;
+  const t2 = G.compile(v2, {id: 'v2', loadBase: (id) => id === 'base' ? base2 : null, sourceText: G.dungeonJsonText(v2)});
+  ok(t1.sourceHash === t2.sourceHash && t1.source.resolvedHash !== t2.source.resolvedHash && G.emitShellJson(t1) !== G.emitShellJson(t2),
+     'base change: the variant\'s sourceHash (its own bytes) stays, its resolvedHash and shell move -> --check flags it');
+  // refs: waynodes re-adopted, refs in removed pieces dropped, patch applied
+  const prog3 = G.compile(v3, {id: 'v3', loadBase: load});
+  const baseProg = G.compile(base, {id: 'base'});
+  const wn = (n) => 'wn_' + n.replace(/\//g, '_');
+  const removedPiece = r3.removed[0];
+  const inside = removedPiece.waynodes[0].pos.map((v, i) => v - baseProg.entrance.dungeonPos[i]);
+  const bRefs = baseProg.waynodes.map(w => ({name: wn(w.name), kind: 'waynode', pos: w.pos, yaw: 0, props: {links: w.links.map(wn)}}))
+    .concat([{name: 'chest_gone', kind: 'container', pos: inside, yaw: 0, props: {}}, {name: 'keep_me', kind: 'marker', pos: [0, 0, 0], yaw: 0, props: {tags: ['a']}}]);
+  const rr = G.resolveVariantRefs(bRefs, Object.assign({}, v3, {refsPatch: {set: {keep_me: {props: {tags: ['b']}}}, add: [{name: 'new_one', kind: 'marker', pos: [1, 0, 1]}]}}), prog3, r3.removed, prog3.entrance.dungeonPos);
+  ok(!rr.refs.some(r => r.name === 'chest_gone') && rr.refs.find(r => r.name === 'keep_me').props.tags[0] === 'b' && rr.refs.some(r => r.name === 'new_one'),
+     'variant refs: a ref in a removed piece dropped, refsPatch set + add applied');
+  ok(rr.refs.filter(r => r.kind === 'waynode').length === prog3.waynodes.filter(w => !w.pit).length, 'variant refs: the waynodes are re-adopted from the variant\'s own geometry');
+  // the shipped example variants are current
+  for (const vid of ['shardwell_flooded', 'teeth_caves_ice', 'heather_cairn_overgrown']) {
+    const f = join(ROOT, 'assets/dungeons', vid, 'dungeon.json');
+    if (!ok(existsSync(f), 'example variant ' + vid + ' exists')) continue;
+    const text = readFileSync(f, 'utf8'), vj = JSON.parse(text);
+    const loadDisk = (id) => { const p = join(ROOT, 'assets/dungeons', id, 'dungeon.json'); return existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : null; };
+    const prog = G.compile(vj, {id: vid, sourceText: text, materials: NAMES, loadBase: loadDisk});
+    ok(G.isVariant(vj) && prog.errors.length === 0, vid + ': a variant of ' + vj.extends + ', compiles clean');
+    ok(readFileSync(join(ROOT, 'assets/dungeons', vid, 'shell.json'), 'utf8').replace(/\r/g, '') === G.emitShellJson(prog), vid + ': shell.json current');
+    const vv = G.validate(vj, {materials: NAMES, loadBase: loadDisk});
+    ok(!vv.some(i => i.severity === 'error'), vid + ': validates with no errors ' + J(vv.filter(i => i.severity === 'error').slice(0, 2)));
+  }
 }
 
 console.log('\n' + (fails ? 'FAILED ' + fails + ' of ' + count : 'all ' + count + ' checks passed'));

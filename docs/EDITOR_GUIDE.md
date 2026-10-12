@@ -2569,6 +2569,38 @@ far walls and the floors show). **solid** shows the rock block.
   break). A folded section opens with a click. While you DRAG a slider the
   view refreshes coarse; on release it fills in at full detail. Only the rock
   the change touches is fetched again; the old picture stays until it lands.
+- **Variety** (the section that keeps pieces from reading as kit blocks;
+  every row at 0 is the plain piece, and the sockets never move):
+  - **wander** / **wander wavelength** (passages): the centreline bends
+    sideways and comes back -- zero, and square, at both ends, so the piece
+    still snaps. A drift follows its vein, a ruin corridor bends at its ribs,
+    a cave tube adds it to its own meander.
+  - **slope** / **slope steps** (passages, caverns): the floor climbs or
+    falls from the origin to the far end; the far sockets move with it.
+    0 steps = a smooth grade; n = terraces (a short flight at each step in
+    a built passage).
+  - **width / height variation**: the space swells and narrows, the roof
+    rises and dips along the length (the ends keep the socket size).
+  - **irregularity**: uneven spacing of anything repeated (timber sets, ribs,
+    columns, pillars, niches, burial loculi) and per-element lean, sag,
+    racking, breaks and missing ones.
+  - **side bays**, **bay depth**, **offset lobe** (rooms): alcoves and side
+    chapels cut into the side walls at seeded places (never through a side
+    door), and one side bulging out into a second space.
+  - kit rows: caves tunnels **cross-section change**, **canyon trench**,
+    **side pockets**, **breakdown**; mine drifts **vein** (an ore band on
+    one rib); ruins **settled floor** (tilted, sunk and missing slabs) and
+    **wall breaches** (a stretch of wall fallen in mid-room).
+- **Light**: **light power** makes each light bigger (a fire basket, a lamp
+  with a big flame, a full brazier bowl, a crystal lump a metre across) --
+  light carries as far as the glowing SURFACE is big, so a candle flame
+  lights only its alcove; **light density** adds lights by floor area so a
+  big room is lit like a small one. Rooms have a **key light**: **shaft**
+  (a chimney / oculus up to the sky -- set **shaft height** so it reaches the
+  ground, and it only lights a room when it is short and wide), **fire** (a
+  big fire in a ring of stones) or **crystals** (a cluster of big glowing
+  crystals), placed with **key light at / across** and sized by **key light
+  size**.
 - **preset** applies a named set of sliders; ★ marks your own.
   **Save as preset** stores the current sliders under a name
   (`assets/dungeons/presets/<kit>.json`); your presets show in the stitcher's
@@ -2719,6 +2751,38 @@ bare ground at the anchor) and `yaw`. **Open in Dungeons tab** opens it in the
 stitcher's **in world** view: the real terrain round the entrance, the dungeon
 x-rayed beneath, the ground-breach checks on. Save the map to keep it (the
 Dungeons tab reads the saved map.json).
+
+### 17.4a Variants: one dungeon, several looks
+
+A dungeon can be a VARIANT of another: its `dungeon.json` says
+`"extends": "<base id>"` and lists only what differs -- a `palette`, piece
+slider edits (`"pieces": {"p11": {"params": {"waterLevel": 1}}}`), pieces
+removed (`"remove": true`, or `"branch"` to drop everything beyond it too),
+pieces added (`"add"`), and a `refsPatch` (add / remove / change refs). It
+compiles into its own shell, and its `refs.json` is GENERATED from the base's
+(waynodes follow the variant's rock, refs in removed pieces go): edit the
+variant's `dungeon.json`, never that file. When the base changes,
+`node scripts/compile_dungeon.mjs --all --check` says the variant is stale;
+`--all` recompiles bases first. Examples: `shardwell_flooded`,
+`teeth_caves_ice`, `heather_cairn_overgrown` (not placed on any map).
+
+### 17.4b Putting a dungeon (or a variant) into a new map
+
+A dungeon is built map-free (the examples: `assets/dungeons/<id>/build.mjs`).
+To place it:
+
+    node scripts/place_dungeon.mjs --map <map> --dungeon <id> --at x,z --yaw 90
+
+It reads that map's ground over the dungeon's footprint and prints the rock
+over every piece, where any key-light shaft comes out, and the validation
+panel with the real ground (rooms breaking the surface, carves under water).
+When it is clean, add `--write` to add the entry to that map's `dungeons[]`.
+If the entrance sits where a road or site cuts the ground, pass the bare
+ground height with `--ground-y`. Sliders that fit a piece to its ground (a
+cave mouth's apron, an adit's cut, a ruin entrance's apron height and cairn,
+a shaft's height) are adjusted with `--set p0.apronHeight=6 --as <new id>`:
+that writes a variant for this map and places it. The World map page's
+Dungeon tool (17.4) then shows and moves it like any other.
 
 ### 17.5 Checking the tab itself
 

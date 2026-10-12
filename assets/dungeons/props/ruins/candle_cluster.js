@@ -5,7 +5,8 @@ export default defineProp({
   SCHEMA: [LIT_ROW, MOUNT_ROW,
     {k: 'count', n: 'candles', min: 1, max: 20, step: 1, int: true, def: 6, d: ''},
     {k: 'spread', n: 'spread (m)', min: 0.1, max: 1, step: 0.05, def: 0.3, d: ''},
-    {k: 'tallest', n: 'tallest (m)', min: 0.1, max: 0.6, step: 0.05, def: 0.35, d: ''}],
+    {k: 'tallest', n: 'tallest (m)', min: 0.1, max: 0.6, step: 0.05, def: 0.35, d: ''},
+    {k: 'flame', n: 'flame size', min: 0, max: 1, step: 0.05, def: 0, d: '0 = one-voxel flames; 1 = taller flames, and the melted mass glows where the wicks crowd (a vigil that lights its alcove).'}],
   PRESETS: {cluster: {params: {}}, vigil: {params: {count: 16, spread: 0.7}}, stubs: {params: {count: 4, tallest: 0.12}}, wall_sconce: {params: {mount: 'wall', count: 3}}},
   draw(g, P, seed) {
     const sp = Math.round(P.spread * 10), top = Math.max(1, Math.round(P.tallest * 10));
@@ -17,7 +18,10 @@ export default defineProp({
       const x = Math.round((frand(seed, 'c', i, 'x') * 2 - 1) * sp), z = z0 + Math.round((frand(seed, 'c', i, 'z') * 2 - 1) * sp);
       const h = 1 + Math.round(frand(seed, 'c', i, 'h') * (top - 1));
       g.box(x, y0, z, x + 1, y0 + h, z + 1, 'tallow');
-      if (P.lit !== 'none') g.set(x, y0 + h, z, '@' + P.lit);
+      if (P.lit !== 'none') {
+        const fh = 1 + Math.round(P.flame * 2);
+        g.box(x, y0 + h, z, x + 1, y0 + h + fh, z + 1, '@' + P.lit);
+      }
     }
   }
 });

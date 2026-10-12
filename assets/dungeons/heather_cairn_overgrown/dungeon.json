@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "extends": "heather_cairn",
+  "name": "The Tarn Cairn (overgrown)",
+  "palette": {"veg": "ivy"},
+  "pieces": {
+    "p0": {"params": {"overgrowth": 1, "decay": 0.85, "moisture": 0.8, "toppled": 4}},
+    "p1": {"params": {"moisture": 0.8, "decay": 0.6, "settle": 0.7}},
+    "p2": {"params": {"moisture": 0.85, "decay": 0.85, "collapse": 0.8, "settle": 0.9, "breach": 0.8}},
+    "p3": {"params": {"moisture": 0.8, "decay": 0.8}},
+    "p5": {"params": {"moisture": 0.75, "decay": 0.8}},
+    "p8": {"params": {"moisture": 0.8, "decay": 0.95}},
+    "p11": {"params": {"waterLevel": 1, "moisture": 1}},
+    "p14": {"params": {"moisture": 0.6, "decay": 0.6, "settle": 0.6}}
+  },
+  "about": "A VARIANT (not placed on any map): the same ruin a century on -- ivy over the court, moss and puddles everywhere, more of the hall fallen in, the cistern brim-full.",
+  "refs": "refs.json"
+}
