@@ -824,6 +824,16 @@ constexpr uint64_t kPlayerActorBase = 1ull << 62;
 constexpr uint64_t kPlayerActorId = kPlayerActorBase;
 // Is this actor id a player's? The ONE test; do not open-code the band.
 constexpr bool IsPlayerActorId(uint64_t id) { return id >= kPlayerActorBase; }
+// LOOSE FLESH AS AN ACTOR (2026-10-11): a severed limb, or a piece of a corpse
+// whose rig went to debris, is `kLooseActorBase | <debris global id>` -- what a
+// carrion eater (Perception::carrion) sees beside the corpses it already ate.
+// Bit 60: below the player-corpse band (61) and the player band (62), above
+// every debris global id (`ownerAtCreate << 48 | serial`) and mob id.
+constexpr uint64_t kLooseActorBase = 1ull << 60;
+constexpr bool IsLooseActorId(uint64_t id) {
+  return id < (1ull << 61) && (id & kLooseActorBase) != 0;
+}
+constexpr uint64_t LooseActorGlobalId(uint64_t id) { return id & ~kLooseActorBase; }
 
 struct Actor {
   uint64_t id = 0;          // mob id, or kPlayerActorBase + player index

@@ -400,10 +400,15 @@ class DebrisSystem {
   // direction (game/mob.h BluntHit draws the same distinction for the living):
   // a shallow ragged dent at `radiusVoxels`, which is what caves a corpse's
   // skull in. `seed` keys the rim so a replayed blow dents identically.
+  // `meatOnly` (a scavenger's bite, StrikeProfile::biteCarrion): a material
+  // table, nonzero = edible; every cell it does not mark is KEPT, so the
+  // teeth strip a severed piece to the bone as they do a corpse
+  // (Mob::CarveBlob's meatOnly).
   bool BluntBody(uint64_t handle, Vec3 atVoxel, float radiusVoxels,
                  uint32_t seed, World& world,
                  std::vector<ParticleSpawn>& spawns,
-                 DamageCause cause = DamageCause::Blunt);
+                 DamageCause cause = DamageCause::Blunt,
+                 const std::vector<uint8_t>* meatOnly = nullptr);
 
   // ---- A GARMENT ON A CORPSE IS A FOLLOWER, NOT A JOINTED BODY -------------
   //

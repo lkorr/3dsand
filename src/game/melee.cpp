@@ -837,7 +837,7 @@ StrikeParts BuildStrikeParts(const EdgeSweep& s, const Vec3& at,
   p.bite.radiusScale = s.strike.biteRadius;
   p.bite.stainScale = s.strike.biteStain;
   p.bite.mouthful = s.strike.biteMouthful;
-  p.bite.carrionScale = s.strike.biteCarrion;
+  p.bite.carrion = s.strike.biteCarrion;
   p.bite.swallow = s.strike.biteSwallow;
   // THE STRUCK KIND IS NOT HANDED DOWN (2026-09-16): whether teeth REACH flesh
   // depends on what the garment in the way is made of and which limb is under
@@ -865,7 +865,8 @@ void ResolveOnLooseMatter(uint64_t body, const StrikeParts& p,
                           const StrikeProfile& profile, float power,
                           bool firstContact, bool biteAllowed,
                           DebrisSystem& debris, World& world,
-                          std::vector<ParticleSpawn>& spawns, bool* bitten) {
+                          std::vector<ParticleSpawn>& spawns, bool* bitten,
+                          const std::vector<uint8_t>* edible) {
   const Tuning::Gore& goreT = CurrentTuning().gore;
   // A stab lands once per stroke (see firstContact in MeleeSweepDamage).
   if (profile.cut > 0.0f && (!p.cut.stab || firstContact))
@@ -911,7 +912,13 @@ void ResolveOnLooseMatter(uint64_t body, const StrikeParts& p,
       !(bitten != nullptr && *bitten)) {
     debris.BluntBody(body, p.bite.at,
                      goreT.biteRadius * profile.biteRadius * power, p.bite.seed,
-                     world, spawns, DebrisSystem::DamageCause::Bite);
+                     world, spawns, DebrisSystem::DamageCause::Bite,
+                     // A scavenger's teeth take the meat and leave the bone,
+                     // on a severed piece as on a corpse (Mob::BiteHit).
+                     profile.biteCarrion && edible != nullptr &&
+                             !edible->empty() && debris.BodyIsDeadFlesh(body)
+                         ? edible
+                         : nullptr);
     if (bitten != nullptr) *bitten = true;
   }
 }
@@ -1109,7 +1116,7 @@ void ResolveLooseBlow(uint64_t hb, const StrikeParts& parts,
   // rebuild its collider under a new handle.
   const uint64_t looseGid = debris.GlobalIdOf(hb);
   ResolveOnLooseMatter(hb, parts, strike, power, firstContact, biteAllowed,
-                       debris, world, spawns, bitten);
+                       debris, world, spawns, bitten, &mobs.EdibleTable());
   // ---- THE COAT MOVES ON LOOSE MATTER TOO (2026-10-01) ----------------------
   // A corpse's arm, a severed hand, a dropped sword: the striker's coat goes
   // onto the voxels it met, theirs comes back, a cut-open corpse piece smears
@@ -1830,7 +1837,8 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // one this test is off and first contact wins.
       const bool wrongTarget =
           (s.bitePrefer != 0 && hb != s.bitePrefer && s.biteHoldout) ||
-          (s.biteVictim != 0 && (owner == nullptr || owner->Id() != s.biteVictim));
+          (s.biteVictim != 0 && (owner == nullptr || owner->Id() != s.biteVictim)) ||
+          (s.biteVictimBody != 0 && hb != s.biteVictimBody);
 
       // ---- STRIKE n OF THIS STROKE ON THIS CREATURE (melee.h victimHits) --
       //

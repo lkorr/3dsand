@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <span>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -2071,7 +2072,7 @@ struct BiteHit {
                              // multiple of gore.biteRadius (fangs < 1)
   float stainScale = 1.0f;   // StrikeProfile::biteStain: the rim's multiple
   float mouthful = 0.0f;     // StrikeProfile::biteMouthful: 0 = one limb
-  float carrionScale = 1.0f; // StrikeProfile::biteCarrion: radius x on a corpse
+  bool carrion = false;      // StrikeProfile::biteCarrion: meat only on a corpse
   float swallow = 0.0f;      // StrikeProfile::biteSwallow: share of the tear eaten
   uint16_t infectMat = 0;    // material the tear rewrites exposed flesh to
   uint16_t infectStain = 0;  // LIQUID whose stain it smears over the hole
@@ -8591,6 +8592,19 @@ class MobSystem {
   // CARRION (ai::Perception::carrion): recount a corpse's edible cells per
   // limb into Mob::carrionLimb_ / fleshRatio_. Edible = matEdible_.
   void RefreshCarrion(Mob& corpse) const;
+ public:
+  // matEdible_, for the loose half of a scavenger's bite (melee.cpp
+  // ResolveOnLooseMatter: meat only on a severed piece).
+  const std::vector<uint8_t>& EdibleTable() const { return matEdible_; }
+ private:
+  // ...and the same count for a severed piece (the loose-flesh actors in
+  // PreTick), cached by debris global id until its lattice changes.
+  struct LooseMeat {
+    uint32_t geomGen = 0;
+    size_t cells = 0;
+    float ratio = 0.0f;
+  };
+  std::unordered_map<uint64_t, LooseMeat> looseMeat_;
   // The body a SWIMMING mob's live stroke is closing its jaws on, through the
   // windup and the cut; nullptr otherwise. BlockedByMob and CrowdPush let the
   // two touch for that window.

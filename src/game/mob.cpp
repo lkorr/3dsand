@@ -2102,8 +2102,7 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
               std::clamp(s2.value("mouthful", 0.0f), 0.0f, 3.0f);
           nw.strike.biteForce =
               std::clamp(s2.value("biteForce", 0.0f), 0.0f, 1.0f);
-          nw.strike.biteCarrion =
-              std::clamp(s2.value("carrion", 1.0f), 1.0f, 4.0f);
+          nw.strike.biteCarrion = s2.value("carrion", false);
           nw.strike.push = std::clamp(s2.value("push", 1.0f), 0.0f, 4.0f);
           nw.strike.biteSwallow =
               std::clamp(s2.value("swallow", 0.0f), 0.0f, 1.0f);
@@ -6394,6 +6393,16 @@ int MobSystem::NearestLimbTo(const Mob& victim, Vec3 from) {
 }
 
 bool MobSystem::NearestPartOf(uint64_t actorId, Vec3 from, Vec3& out) {
+  // A severed piece is one part: its centre of mass.
+  if (ai::IsLooseActorId(actorId)) {
+    if (debris_ == nullptr || phys_ == nullptr) return false;
+    const uint64_t h =
+        debris_->HandleOfGlobalId(ai::LooseActorGlobalId(actorId));
+    BodyTransform xf{};
+    if (h == 0 || !phys_->GetTransform(h, xf)) return false;
+    out = xf.pos;
+    return true;
+  }
   const Mob* v = FindCombatantById(actorId);
   if (v == nullptr) return false;
   const int li = NearestLimbTo(*v, from);
@@ -7506,6 +7515,14 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     // for biteAnywhere, which is "any limb of the victim", not "anybody".
     if (const Mob* victim = FindCombatantById(st.targetId))
       sw.biteVictim = victim->Id();
+    // ...or a severed piece (ai::kLooseActorBase), by this tick's handle (a
+    // carve rebuilds it under a new one). Gone = a handle nothing has, so the
+    // bite lands on nobody rather than on the shoal.
+    else if (ai::IsLooseActorId(st.targetId) && debris_ != nullptr) {
+      const uint64_t h =
+          debris_->HandleOfGlobalId(ai::LooseActorGlobalId(st.targetId));
+      sw.biteVictimBody = h != 0 ? h : ~0ull;
+    }
     // A FIST IS PART OF THE ARM THAT THROWS IT (melee.h selfMounted), and
     // probes along its TRAVEL. A set of JAWS does not: its edge already points
     // out of the face -- that is what the Aim effector spends the whole stroke
@@ -9092,6 +9109,84 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       a.bleeding = m.Bleeding();
       a.fleshRatio = m.fleshRatio_;
       actors_.push_back(std::move(a));
+    }
+    // ...AND THE PIECES (2026-10-11): a severed limb, and every piece of a
+    // corpse whose rig went to debris, is food the same way -- an actor in the
+    // ai::kLooseActorBase band, its meat counted with the corpse's rule
+    // (matEdible_ over everything else, the fine skin where there is one).
+    // Recounted only when its lattice changed (geomGen, size), so a piece
+    // nobody bites costs a lookup. Sorted by id: debris storage order is not
+    // a fact the candidate ranking may depend on.
+    if (!eater || debris_ == nullptr) {
+      looseMeat_.clear();
+    } else {
+      const Mob* eaterMob = nullptr;
+      for (const Mob& m : mobs_)
+        if (m.alive_ && m.def_ != nullptr && !m.PlayerControlled()) {
+          const ai::Profile* pr = behaviors_.At(m.ai_.profile);
+          if (pr != nullptr && pr->perception.carrion > 0.0f) {
+            eaterMob = &m;
+            break;
+          }
+        }
+      const size_t nMat = matEdible_.size();
+      const size_t first = actors_.size();
+      std::unordered_map<uint64_t, LooseMeat> keep;
+      debris_->ForEachDeadFlesh([&](DebrisSystem::FleshLattice& f) {
+        if (f.id == 0 || f.xf == nullptr) return;
+        const size_t n = f.skin != nullptr ? f.skin->size()
+                         : f.coll != nullptr ? f.coll->size()
+                                             : 0;
+        LooseMeat lm{};
+        auto it = looseMeat_.find(f.id);
+        if (it != looseMeat_.end() && it->second.geomGen == f.geomGen &&
+            it->second.cells == n) {
+          lm = it->second;
+        } else {
+          uint64_t e = 0, o = 0;
+          auto count = [&](uint32_t mat) {
+            if (mat == 0) return;
+            if (mat < nMat && matEdible_[mat] != 0)
+              e++;
+            else
+              o++;
+          };
+          if (f.skin != nullptr)
+            for (const PrefabVoxel& v : *f.skin) count(v.material);
+          else if (f.coll != nullptr)
+            for (const DebrisVoxel& v : *f.coll) count(v.payload & 0xFFFu);
+          lm.geomGen = f.geomGen;
+          lm.cells = n;
+          lm.ratio = e == 0   ? 0.0f
+                     : o == 0 ? 1e9f
+                              : (float)((double)e / (double)o);
+        }
+        keep[f.id] = lm;
+        if (!(lm.ratio > 0.0f)) return;
+        const Vec3 c = f.xf->pos;
+        const float ps = (float)std::max(1u, f.physScale);
+        const float ex = (float)std::max(f.hi.x - f.lo.x, f.hi.z - f.lo.z) / ps;
+        const float ey = (float)(f.hi.y - f.lo.y) / ps;
+        ai::Actor a;
+        a.id = ai::kLooseActorBase | f.id;
+        a.centre = c;
+        a.radius = std::max(0.5f, 0.5f * ex);
+        a.height = std::max(0.5f, ey);
+        a.faction = ~0u;
+        if (const Mob* src = f.creature != 0 ? FindMobById(f.creature)
+                                             : nullptr)
+          if (const ai::Profile* pr = behaviors_.At(src->ai_.profile))
+            a.faction = ai::FactionId(pr->faction);
+        a.alive = false;
+        a.hpFrac = 0.0f;
+        a.immersion =
+            eaterMob != nullptr ? PointImmersion(*eaterMob, c) : 1.0f;
+        a.fleshRatio = lm.ratio;
+        actors_.push_back(std::move(a));
+      });
+      looseMeat_.swap(keep);
+      std::sort(actors_.begin() + (ptrdiff_t)first, actors_.end(),
+                [](const ai::Actor& x, const ai::Actor& y) { return x.id < y.id; });
     }
   }
   bpActors.Stop();
@@ -25964,11 +26059,9 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
   // a finger cannot be bitten from the far side. No authored field and no
   // per-limb table: it moves a thigh's hole half a voxel and changes nothing
   // there, and it is the entire bite on a hand.
-  // A corpse is torn by StrikeProfile::biteCarrion more (it does not pull
-  // away from the jaws).
+  // The same hole dead or alive (owner 2026-10-11).
   const float biteR = gt.biteRadius * std::max(0.0f, hit.radiusScale) *
-                      (0.4f + 0.6f * power) *
-                      (alive_ ? 1.0f : std::max(1.0f, hit.carrionScale));
+                      (0.4f + 0.6f * power);
   Vec3 centre = local;
   {
     const MobLimb& lb = limbs_[li];
@@ -26112,10 +26205,10 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
     };
   }
 
-  // A SCAVENGER'S teeth in a corpse (StrikeProfile::biteCarrion > 1) take the
+  // A SCAVENGER'S teeth in a corpse (StrikeProfile::biteCarrion) take the
   // meat and leave the bone: what a shoal leaves behind is a skeleton.
   // ...and the skeleton stays in one piece (DamageCtx::keepWhole).
-  const bool meatOnly = !alive_ && hit.carrionScale > 1.0f;
+  const bool meatOnly = !alive_ && hit.carrion;
   DamageCtx feed = bite;
   feed.keepWhole = meatOnly;
   feed.swallow = hit.swallow;

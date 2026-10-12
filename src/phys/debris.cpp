@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <climits>
+#include <memory>
 #include <unordered_set>
 
 #include "phys/bodystain.h"
@@ -5856,7 +5858,8 @@ void DebrisSystem::PulpTick(uint32_t tick, World& world,
 bool DebrisSystem::BluntBody(uint64_t handle, Vec3 atVoxel, float radiusVoxels,
                              uint32_t seed, World& world,
                              std::vector<ParticleSpawn>& spawns,
-                             DamageCause cause) {
+                             DamageCause cause,
+                             const std::vector<uint8_t>* meatOnly) {
   if (!phys_ || radiusVoxels <= 0.0f) return false;
   size_t bi = 0;
   for (; bi < bodies_.size(); bi++)
@@ -5881,7 +5884,52 @@ bool DebrisSystem::BluntBody(uint64_t handle, Vec3 atVoxel, float radiusVoxels,
     const Vec3 cLocal = cBody * sc;
     const float rLocal2 = r2 * sc * sc;
     const float jMul = (float)jScale / sc;
+    // MEAT ONLY: a dense box of "keep" over the lattice asked for, taken
+    // now, before DamageBody edits the lists.
+    std::shared_ptr<std::vector<uint8_t>> bone;
+    int lo[3] = {0, 0, 0}, dim[3] = {0, 0, 0};
+    if (meatOnly != nullptr) {
+      const Body& bb = bodies_[bi];
+      const bool useSkin = bb.HasFineSkin() && (uint32_t)sc == jScale;
+      int hi[3] = {INT_MIN, INT_MIN, INT_MIN};
+      lo[0] = lo[1] = lo[2] = INT_MAX;
+      auto grow = [&](int x, int y, int z) {
+        lo[0] = std::min(lo[0], x); hi[0] = std::max(hi[0], x);
+        lo[1] = std::min(lo[1], y); hi[1] = std::max(hi[1], y);
+        lo[2] = std::min(lo[2], z); hi[2] = std::max(hi[2], z);
+      };
+      if (useSkin)
+        for (const PrefabVoxel& v : bb.skinVoxels) grow(v.x, v.y, v.z);
+      else
+        for (const DebrisVoxel& v : bb.voxels) grow(v.x, v.y, v.z);
+      if (lo[0] <= hi[0]) {
+        for (int a = 0; a < 3; a++) dim[a] = hi[a] - lo[a] + 1;
+        bone = std::make_shared<std::vector<uint8_t>>(
+            (size_t)dim[0] * dim[1] * dim[2], 0u);
+        const size_t nMat = meatOnly->size();
+        auto mark = [&](int x, int y, int z, uint32_t mat) {
+          const bool edible = mat < nMat && (*meatOnly)[mat] != 0;
+          if (!edible)
+            (*bone)[((size_t)(z - lo[2]) * dim[1] + (y - lo[1])) * dim[0] +
+                    (x - lo[0])] = 1u;
+        };
+        if (useSkin)
+          for (const PrefabVoxel& v : bb.skinVoxels)
+            mark(v.x, v.y, v.z, v.material);
+        else
+          for (const DebrisVoxel& v : bb.voxels)
+            mark(v.x, v.y, v.z, v.payload & 0xFFFu);
+      }
+    }
     return [=](float vx, float vy, float vz) {
+      if (bone) {
+        const int x = (int)std::floor(vx) - lo[0], y = (int)std::floor(vy) - lo[1],
+                  z = (int)std::floor(vz) - lo[2];
+        if (x >= 0 && y >= 0 && z >= 0 && x < dim[0] && y < dim[1] &&
+            z < dim[2] &&
+            (*bone)[((size_t)z * dim[1] + y) * dim[0] + x] != 0)
+          return true;
+      }
       Vec3 c{vx + 0.5f, vy + 0.5f, vz + 0.5f};
       Vec3 dv = c - cLocal;
       float d2 = dv.dot(dv);

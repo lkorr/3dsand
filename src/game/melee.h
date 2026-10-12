@@ -815,6 +815,10 @@ struct EdgeSweep {
   // shoal bled to death in the `aquatic` gate's carrion part. 0 = anybody: a
   // fabricated sweep, the player's fist, a stroke that named no victim.
   uint64_t biteVictim = 0;
+  // ...or the LOOSE BODY it was thrown at (a severed limb a carrion eater
+  // picked: ai::kLooseActorBase), by this tick's handle. Same rule: nonzero =
+  // the bite lands on that body and nothing else.
+  uint64_t biteVictimBody = 0;
   // ---- IS THE EDGE PART OF THE WIELDER? (2026-09-15) --------------------
   //
   // A HELD BLADE IS A THING YOU POINT; A FIST IS A THING YOU THROW, and the

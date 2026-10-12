@@ -94,12 +94,11 @@ struct StrikeProfile {
   // shark's bite is its jaw muscles, not the speed of its nose, and a shark
   // nosing a body at a crawl still takes a mouthful out of it.
   float biteForce = 0.0f;
-  // TEETH IN A CORPSE (2026-10-11): the hole's radius is multiplied by this
-  // when the body bitten is DEAD. 1 = the same nip as on the living. A
-  // piranha's nip is a couple of art voxels, and a shoal feeding at that rate
-  // would take half an hour to strip a man: a dead body does not pull away,
-  // so the jaws close, shake and tear a real piece out.
-  float biteCarrion = 1.0f;
+  // A SCAVENGER'S TEETH (2026-10-11): in a CORPSE the bite takes the meat
+  // and leaves the bone, and the skeleton stays in one piece. The hole is the
+  // SAME size dead or alive (owner 2026-10-11: a corpse multiplier on the
+  // radius was dropped; the piranha's biteRadius carries the whole size).
+  bool biteCarrion = false;
   // HOW HARD THE BLOW SHOVES A LOOSE BODY (2026-10-11): a multiple of the
   // solver-owned half of the hit reaction (StrikeReact's impulse on a corpse,
   // a ragdoll, a crate). 1 = every weapon before this. A piranha's 0.1: a
