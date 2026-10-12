@@ -60,7 +60,16 @@ const DG_H_KEEP_Y1 : u32 = 21u;
 const DG_H_KEEP_Z1 : u32 = 22u;
 const DG_H_FLAGS : u32 = 23u;        // DG_FLAG_* (the gates' switch)
 const DG_FLAG_EVAL_OFF : u32 = 1u;   // no list is ever found: the keep boxes and sky ceilings only
-const DG_H_WORDS : u32 = 24u;
+const DG_FLAG_SURF_OFF : u32 = 2u;   // the surface rects are not read (dungeon-gen's "what would grow" arm)
+const DG_H_SURF : u32 = 24u;         // absolute offset of the surface rects (DG_R_WORDS each), 0 = none
+const DG_H_SURF_N : u32 = 25u;
+const DG_H_SURF_X0 : u32 = 26u;      // union of the surface rects (inclusive; x1 < x0 = none)
+const DG_H_SURF_Z0 : u32 = 27u;
+const DG_H_SURF_X1 : u32 = 28u;
+const DG_H_SURF_Z1 : u32 = 29u;
+const DG_H_WORDS : u32 = 30u;
+const DG_R_WORDS : u32 = 4u;         // a surface rect: x0 z0 x1 z1 (world, inclusive)
+const DG_TREE_CLEAR : i32 = 8;       // a crown keeps this far (Chebyshev) off a surface rect
 const DG_D_ORIGIN_X : u32 = 0u;      // world cell of local cell (0,0,0)
 const DG_D_ORIGIN_Y : u32 = 1u;
 const DG_D_ORIGIN_Z : u32 = 2u;
@@ -202,6 +211,31 @@ fn dgColTop(x : i32, z : i32) -> i32 {
     if (x >= dgI(r) && x <= dgI(r + 3u) && z >= dgI(r + 2u) && z <= dgI(r + 5u)) { top = max(top, dgI(r + 4u)); }
   }
   return top;
+}
+// THE SURFACE KEEP-OUT (D9; dungeon.h SurfaceRects): is column (x, z) within
+// `r` (Chebyshev) of the footprint where a dungeon's prims / props reach the
+// ground? treeInfoBare refuses a lattice tree whose crown square (its reach +
+// DG_TREE_CLEAR) meets one -- so an entrance carved through a forest cuts no
+// trunk and leaves no crown floating over the hole, near or far (every tree
+// producer asks treeInfoBare) -- and the ground cover / tile plants / cacti
+// grow nothing inside one (r = 0: the rects already carry the prims'
+// inflation). It is TERRAIN, not the evaluator: it holds with the evaluator
+// off too, so the dungeon-gen twin's input already lacks those trees. The CPU
+// twin (dungeon.cpp dgSurfNear) is the same text.
+fn dgSurfNear(x : i32, z : i32, r : i32) -> bool {
+  let b = dgBlock();
+  if (b == 0u || (worldMap[b + DG_H_FLAGS] & DG_FLAG_SURF_OFF) != 0u) { return false; }
+  if (x < dgI(b + DG_H_SURF_X0) - r || x > dgI(b + DG_H_SURF_X1) + r || z < dgI(b + DG_H_SURF_Z0) - r ||
+      z > dgI(b + DG_H_SURF_Z1) + r) {
+    return false;
+  }
+  let o = worldMap[b + DG_H_SURF];
+  let n = worldMap[b + DG_H_SURF_N];
+  for (var k = 0u; k < n; k++) {
+    let q = o + k * DG_R_WORDS;
+    if (x >= dgI(q) - r && x <= dgI(q + 2u) + r && z >= dgI(q + 1u) - r && z <= dgI(q + 3u) + r) { return true; }
+  }
+  return false;
 }
 // THE CAVE KEEP-OUT (PLAN_dungeons §2.2): does the band [f, c] of column
 // (x, z) reach into a dungeon's keep box (its bounds + keepOut)? caveBands
@@ -477,6 +511,40 @@ fn dgCarveAt(x : i32, y : i32, z : i32) -> i32 {
   if (lst == 0u) { return DG_BIG; }
   return dgCarveIn(lst, x, y, z);
 }
+// IS THE CELL SOLID once the dungeon is applied (D9)? The scatter probes'
+// support test: dgCell's steps 1 and 3 on solidity alone -- the carve field,
+// then the ordered fill / keep / re-carve, later wins -- with TERRAIN solid
+// at or under the column's ground `gh` and open above it. So a feature stands
+// on a floor FILL inside its carve's noise (the carve field alone called that
+// carved) and never on the open sky over a surface piece (the carve field
+// alone called that rock). Skins, scatter and props do not change solidity
+// here. The probe's column ground stands in for its neighbours' (one cell).
+fn dgSolidAt(x : i32, y : i32, z : i32, gh : i32) -> bool {
+  let lst = dgListAt(x, y, z);
+  if (lst == 0u) { return y <= gh; }
+  let n = min(worldMap[lst], DG_LIST_MAX);
+  var c = DG_BIG;
+  var st = 0u;
+  var kept = false;
+  for (var k = 0u; k < n; k++) {
+    let p = worldMap[lst + 1u + k];
+    let op = worldMap[p + DG_P_FLAGS] & 3u;
+    if (op == DG_OP_SKIN) { continue; }
+    let d = dgPrimD(p, x, y, z);
+    if (op == DG_OP_CARVE) { c = dgSmin(c, d, i32(worldMap[p + DG_P_BLEND] & 0xFFFFu)); }
+    if (d < 0) {
+      if (op == DG_OP_FILL) { st = 2u; }
+      else if (op == DG_OP_KEEP) { st = 3u; kept = true; }
+      else if (!kept) { st = 1u; }
+    }
+  }
+  if (st == 0u) {
+    if (c < 0) { return false; }
+    return y <= gh;
+  }
+  if (st == 3u) { return y <= gh; }
+  return st == 2u;
+}
 // What a carved cell holds: air, or the carve's liquid at or under its level.
 fn dgCarveWord(p : u32, x : i32, y : i32, z : i32) -> u32 {
   let lm = worldMap[p + DG_P_MATS] & 0xFFFu;
@@ -508,8 +576,14 @@ fn dgPropCell(ir : u32, x : i32, y : i32, z : i32) -> u32 {
   return DG_PROP_NONE;
 }
 // One scatter rule of prim p over the cell (word w so far, terrain word tw,
-// the prim's own distance dOwn, the carve field c). PLAN §3.4.1 "Scatter".
-fn dgScatter(s : u32, p : u32, dOwn : i32, c : i32, w : u32, tw : u32, x : i32, y : i32, z : i32) -> u32 {
+// the prim's own distance dOwn, the carve field c, the column's ground height
+// gh). PLAN §3.4.1 "Scatter". SUPPORT IS SOLID GROUND (D9): a floor / ceiling
+// feature grows only from a cell dgSolidAt calls solid (a fill, a kept
+// pillar, or terrain at or under the ground -- never the open sky over a
+// surface piece, which the carve field alone called rock); the band kinds work
+// only on terrain at or under it, and a puddle only strictly under it (the top
+// ground cell's side neighbours may be a lower column's air).
+fn dgScatter(s : u32, p : u32, dOwn : i32, c : i32, w : u32, tw : u32, x : i32, y : i32, z : i32, gh : i32) -> u32 {
   let kind = worldMap[s + DG_S_KIND] & 255u;
   let surf = (worldMap[s + DG_S_KIND] >> 8u) & 255u;
   let dens = worldMap[s + DG_S_DENS];
@@ -528,7 +602,7 @@ fn dgScatter(s : u32, p : u32, dOwn : i32, c : i32, w : u32, tw : u32, x : i32, 
   // `sp` lattice in the local XZ plane.
   let band = kind == DG_SC_MOSS || kind == DG_SC_ORE || kind == DG_SC_PUDDLE;
   if (band) {
-    if (w != tw || c < 0 || (tw & 0xFFFu) == 0u || dOwn < 0) { return w; }
+    if (w != tw || c < 0 || (tw & 0xFFFu) == 0u || dOwn < 0 || y > gh) { return w; }
   } else {
     if (w != 0u || dOwn >= 0) { return w; }
   }
@@ -573,7 +647,7 @@ fn dgScatter(s : u32, p : u32, dOwn : i32, c : i32, w : u32, tw : u32, x : i32, 
       nProbe = hh;
     }
   }
-  // THE PROBES, as ONE rolled loop (one inlined copy of the carve field): the
+  // THE PROBES, as ONE rolled loop (one inlined copy of dgSolidAt): the
   // band kinds ask the six face neighbours (bit 0 up, 1 down, 2..5 the
   // sides); a floor / ceiling feature walks down (up) its own height for the
   // first solid cell it can grow from -- every cell between is carved, so the
@@ -594,7 +668,7 @@ fn dgScatter(s : u32, p : u32, dOwn : i32, c : i32, w : u32, tw : u32, x : i32, 
     } else {
       dy = select(i + 1, -1 - i, down);
     }
-    if (dgCarveAt(x + dx, y + dy, z + dz) < 0) { mask = mask | (1u << u32(i)); }
+    if (!dgSolidAt(x + dx, y + dy, z + dz, gh)) { mask = mask | (1u << u32(i)); }
     else if (!band) { found = true; break; }
   }
   if (!band) {
@@ -604,7 +678,7 @@ fn dgScatter(s : u32, p : u32, dOwn : i32, c : i32, w : u32, tw : u32, x : i32, 
   if (kind == DG_SC_PUDDLE) {
     // A floor cell under air whose four sides and underside are solid: one
     // cell of liquid, contained by construction (PLAN: "puddle").
-    if ((mask & 1u) != 0u && (mask & 62u) == 0u) { return dgWord(mat, x, y, z); }
+    if ((mask & 1u) != 0u && (mask & 62u) == 0u && y < gh) { return dgWord(mat, x, y, z); }
     return w;
   }
   // MOSS: the first solid cell behind the surface on the authored side(s), in
@@ -631,7 +705,8 @@ fn dgFillMat(p : u32, x : i32, z : i32) -> u32 {
   return m;
 }
 // THE CELL (PLAN §3.4.1 "Op semantics"): terrain word tw in, the word out.
-fn dgCell(lst : u32, x : i32, y : i32, z : i32, tw : u32) -> u32 {
+// gh = the column's ground height (genColumn's h == World::TerrainHeight).
+fn dgCell(lst : u32, x : i32, y : i32, z : i32, tw : u32, gh : i32) -> u32 {
   let nAll = worldMap[lst];
   let n = min(nAll, DG_LIST_MAX);
   var dd : array<i32, DG_LIST_MAX>;
@@ -681,7 +756,7 @@ fn dgCell(lst : u32, x : i32, y : i32, z : i32, tw : u32) -> u32 {
     let p = worldMap[lst + 1u + k];
     let ns = (worldMap[p + DG_P_FLAGS] >> 12u) & 15u;
     for (var j = 0u; j < ns; j++) {
-      w = dgScatter(worldMap[p + DG_P_SCAT] + j * DG_S_WORDS, p, dd[k], c, w, tw, x, y, z);
+      w = dgScatter(worldMap[p + DG_P_SCAT] + j * DG_S_WORDS, p, dd[k], c, w, tw, x, y, z, gh);
     }
   }
   // 5. the props, later wins: CARVE clears, template air leaves alone.

@@ -118,6 +118,42 @@
       "yOffset": 0,
       "yaw": 90,
       "about": "The dungeon-format / dungeon-gen gates' fixture (docs/PLAN_dungeons.md D1): assets/dungeons/_fixture, turned a quarter so the local frame is exercised. On flat-ish land 2 km east of the pad (ground 149..204 over its footprint, the anchor near the low end, so every room is under the ground) and 3.8 km from the spawn: no other gate's ground moves."
+    },
+    {
+      "id": "teeth_caves",
+      "name": "The Verdant Teeth sea caves (portability)",
+      "dungeon": "teeth_caves",
+      "at": [-6000, -4000],
+      "yOffset": 0,
+      "yaw": 90,
+      "about": "PORTABILITY (D9; dungeon-format / dungeon-gen E + F): every real asset under assets/dungeons/ is placed on the harness map too, so a gate runs it in place on ground it was not authored for. 400+ m south of the pad and the window: no other gate's ground moves."
+    },
+    {
+      "id": "shardwell",
+      "name": "The Shardwell (portability)",
+      "dungeon": "shardwell",
+      "at": [-1500, -5000],
+      "yOffset": 0,
+      "yaw": 0,
+      "about": "PORTABILITY (D9): see teeth_caves."
+    },
+    {
+      "id": "heather_cairn",
+      "name": "The Tarn Cairn (portability, A)",
+      "dungeon": "heather_cairn",
+      "at": [2500, -4000],
+      "yOffset": 0,
+      "yaw": 180,
+      "about": "PORTABILITY (D9): see teeth_caves. Placed TWICE (with heather_cairn_b, another yaw): dungeon-gen F holds the two to the same carve in their local frames, dungeon-entities holds their refs and signals apart."
+    },
+    {
+      "id": "heather_cairn_b",
+      "name": "The Tarn Cairn (portability, B)",
+      "dungeon": "heather_cairn",
+      "at": [5500, -4000],
+      "yOffset": 0,
+      "yaw": 90,
+      "about": "PORTABILITY (D9): the second placement of heather_cairn (see heather_cairn)."
     }
   ]
 }
