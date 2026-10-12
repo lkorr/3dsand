@@ -526,6 +526,8 @@ add_library(sandvox_core OBJECT
   src/game/mob_shock.cpp
   # A body the water carries (MobDef::SwimDef): the swimmers' locomotion.
   src/game/mob_swim.cpp
+  # NPC swimming for walkers with the swim clips (game/mob_afloat.cpp).
+  src/game/mob_afloat.cpp
   # The death screen's peel: depth layers of a corpse's bricks, drawn as
   # clones (render only) and read as strata.
   src/game/autopsy.cpp

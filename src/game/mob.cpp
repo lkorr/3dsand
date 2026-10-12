@@ -8734,8 +8734,8 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
   // `airborne_` does not flicker (UpdateFall owns it), so it needs no coyote.
   in.grounded = !mob.airborne_;
   // Off the ground and actually in the air: a lunge, a blast before the limp,
-  // a lift, a ledge walked off. (A swimming NPC does not exist yet; when it
-  // does, water is support here as it is for the player.)
+  // a lift, a ledge walked off. (A swimming walker is not: the block below
+  // clears it, as the avatar does for the player.)
   in.airPoseEligible = mob.airborne_;
   // THE FEET OWN AN NPC'S DRAWN HEIGHT: its origin is a ground snap that
   // climbs a step in one tick, and the foot average is what eases it.
@@ -8782,6 +8782,32 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
                                       std::fabs(std::sin(mob.roll_));
     in.swimWave = true;
     in.waveKick = mob.flopKick_;
+  }
+  // ---- A WALKER SWIMMING (game/mob_afloat.cpp) -----------------------------
+  // The player's swim family (Mob::PosePipeline): the driver says it swims
+  // and how it is moving, and the pose finds the waterline and mixes the
+  // strokes. Not grounded, no air pose, no stride clips, no chase stance, the
+  // driver's origin is the body's height -- exactly what the avatar feeds it.
+  // UNDER the surface the stroke has a direction (PoseInputs::swimAim): the
+  // travel itself, so a dive lies the body along it as the player's
+  // look-steered stroke does. At the surface none, as for the player.
+  if (!def.swim.present && mob.swimming_ &&
+      mob.ragdoll_ == Mob::RagdollPhase::None) {
+    const float H = std::max(def.worldSize.y, 1.0f);
+    in.swim = true;
+    in.velocity = mob.swimVel_;
+    in.grounded = false;
+    in.airPoseEligible = false;
+    in.height = PoseInputs::Height::FromDriver;
+    in.tiltFromGround = false;
+    in.gaitClips = false;
+    in.chaseWant = false;
+    in.guardPump = false;
+    const bool under =
+        !mob.surfaceKnown_ || mob.origin_.y + 0.9f * H < mob.surfaceY_;
+    const float sp = mob.swimVel_.len();
+    if (under && sp > 0.15f * std::max(def.speed, 0.01f))
+      in.swimAim = mob.swimVel_ * (1.0f / sp);
   }
   mob.PosePipeline(in, dt, world, tick);
 }
@@ -9182,6 +9208,15 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       const bool aquatic = def.swim.present;
       if (aquatic) SenseWater(mob, def, world);
       const bool swimNow = aquatic && mob.swimming_;
+      // A WALKER THE WATER HOLDS UP (game/mob_afloat.cpp): a rig with the
+      // swim family's clips swims deep water instead of walking its bed. Its
+      // AI keeps the ground sense (the fan still says where the shore is).
+      const bool afloatRig = !aquatic && CanSwimAfloat(mob, def);
+      if (afloatRig)
+        SenseAfloat(mob, def, world);
+      else if (!aquatic && mob.swimming_)
+        LeaveAfloat(mob, def);   // the rig lost its clips (a hot reload)
+      const bool afloatNow = afloatRig && mob.swimming_;
       GroundSense sense =
           swimNow ? GroundSense{} : SenseGround(mob, def, world);
       bpSense.Stop();
@@ -9210,6 +9245,10 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
         // OUT OF ITS ELEMENT: no walking -- gravity, the flank, the flop and
         // the breath running out.
         TickStranded(mob, def, world, sense, tick, dt);
+      } else if (afloatNow) {
+        // SWIMMING: steer, stroke, float or dive, climb out (DriveAfloat runs
+        // Steer itself).
+        DriveAfloat(mob, def, world, dt);
       } else {
         float align = Steer(mob, def, dt);
         // Gravity first: a falling creature does not walk. UpdateFall may flip

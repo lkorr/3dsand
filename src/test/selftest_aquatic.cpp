@@ -58,29 +58,13 @@ uint32_t MatIdOf(Ctx& c, const char* n) {
 
 Vec3 CentreOf(const Mob& m) { return m.Origin() + m.Def()->worldSize * 0.5f; }
 
-Status GateAquatic(Ctx& c, std::string& detail) {
-  IdCounterScope idScope(c.mobs);
-  MobSystem& mobs = c.mobs;
-  const uint32_t mStone = MatIdOf(c, "stone"), mWater = MatIdOf(c, "water");
-  const int dShark = mobs.FindDef("shark"), dPiranha = mobs.FindDef("piranha"),
-            dHuman = mobs.FindDef("human");
-  if (!mStone || !mWater || dShark < 0 || dPiranha < 0 || dHuman < 0) {
-    detail = "missing stone / water / shark / piranha / human";
-    return Status::Fail;
-  }
-  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
-  c.ctx.WaitIdle();
-  mobs.Reset();
-  c.debris.Reset();
-
-  // ---- THE SITE: dry ground, chosen off the GPU's own voxels --------------
-  // corpse-float's lesson: the harness map's fixture lake relevels a basin
-  // stamped inside it, and high ground freezes. The first candidate with no
-  // liquid near it wins; every rejection is in the detail.
-  constexpr int R = 34, kDepth = 16;
-  IVec3 site{};
-  int hMin = 0, hMax = 0;
-  std::string siteWhy;
+// THE SITE: dry ground, chosen off the GPU's own voxels, for a pool of
+// half-width `R` dug `kDepth` below the lowest ground (gates `aquatic` and
+// `npc-swim`). corpse-float's lesson: the harness map's fixture lake relevels
+// a basin stamped inside it, and high ground freezes. The first candidate with
+// no liquid near it wins; every rejection is in `siteWhy`.
+bool PickDrySite(Ctx& c, int R, int kDepth, IVec3& site, int& hMin, int& hMax,
+                 std::string& siteWhy) {
   bool sited = false;
   {
     std::vector<uint32_t> ch(kChunkVol, 0);
@@ -123,7 +107,30 @@ Status GateAquatic(Ctx& c, std::string& detail) {
       break;
     }
   }
-  if (!sited) {
+  return sited;
+}
+
+Status GateAquatic(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  MobSystem& mobs = c.mobs;
+  const uint32_t mStone = MatIdOf(c, "stone"), mWater = MatIdOf(c, "water");
+  const int dShark = mobs.FindDef("shark"), dPiranha = mobs.FindDef("piranha"),
+            dHuman = mobs.FindDef("human");
+  if (!mStone || !mWater || dShark < 0 || dPiranha < 0 || dHuman < 0) {
+    detail = "missing stone / water / shark / piranha / human";
+    return Status::Fail;
+  }
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  mobs.Reset();
+  c.debris.Reset();
+
+  // ---- THE SITE: dry ground, chosen off the GPU's own voxels (PickDrySite).
+  constexpr int R = 34, kDepth = 16;
+  IVec3 site{};
+  int hMin = 0, hMax = 0;
+  std::string siteWhy;
+  if (!PickDrySite(c, R, kDepth, site, hMin, hMax, siteWhy)) {
     detail = "no dry, flat site: " + siteWhy;
     return Status::Fail;
   }
@@ -403,12 +410,201 @@ Status GateAquatic(Ctx& c, std::string& detail) {
   return aOk && bOk && cOk && dOk ? Status::Pass : Status::Fail;
 }
 
+// ============================================================================
+// A WALKER SWIMS (2026-10-11; game/mob_afloat.cpp): gate `npc-swim`.
+//
+// One stamped pool too deep to stand in (kDepth over a human's 0.92 standing
+// height share) with a LOW BANK on its +x side -- stone one voxel over the
+// waterline, a dry pad beyond it -- and three claims, each on a fresh human:
+//
+//   A. IT FLOATS. A human with a statue's profile (`dummy`) put on the bed must
+//      come up and tread: the water carries it (Mob::swimming_), its soles
+//      settle within npcSwimFloatTol of the float height (kAfloatShare under
+//      the waterline), and the pose is the swim family with the tread leading.
+//   B. IT SWIMS OUT. A zombie in the middle with the player's point on the pad
+//      must swim to the bank (the crawl leading the mix on the way) and climb
+//      out onto it: dry, standing at the bank's height, inside npcSwimOutTicks.
+//   C. IT DIVES. A zombie with the player's point on the bed must go under
+//      for it -- its whole body below the waterline -- with the stroke
+//      pitched along the dive (PoseDrive::swimPitch past npcSwimPitchMin).
+//
+// One line per part in the detail names what was measured (rule 6).
+// Thresholds in tests/baseline.json (npcSwim*). Ticks the world and
+// regenerates it on the way out, as `aquatic` does.
+// ============================================================================
+Status GateNpcSwim(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  MobSystem& mobs = c.mobs;
+  const uint32_t mStone = MatIdOf(c, "stone"), mWater = MatIdOf(c, "water");
+  const int dHuman = mobs.FindDef("human");
+  if (!mStone || !mWater || dHuman < 0) {
+    detail = "missing stone / water / human";
+    return Status::Fail;
+  }
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  mobs.Reset();
+  c.debris.Reset();
+
+  constexpr int R = 22, kDepth = 28, kBankHalf = 7, kPadLen = 16;
+  IVec3 site{};
+  int hMin = 0, hMax = 0;
+  std::string siteWhy;
+  if (!PickDrySite(c, R, kDepth, site, hMin, hMax, siteWhy)) {
+    detail = "no dry, flat site: " + siteWhy;
+    return Status::Fail;
+  }
+  const int bedY = hMin - kDepth - 1;      // the floor's top stone layer
+  const int waterTop = bedY + kDepth;      // the topmost water layer
+  const int surfY = waterTop + 1;          // the first air cell: the waterline
+  const int wallTop = hMax + 2;
+  // THE BANK: the +x wall's middle stretch topped one voxel over the water,
+  // so a body standing on it has its soles at surfY + 1.
+  auto inBank = [&](int x, int z) {
+    return x >= site.x + R - 1 && std::abs(z - site.z) <= kBankHalf;
+  };
+  std::vector<CellOp> pool;
+  for (int x = site.x - R; x <= site.x + R + kPadLen; x++)
+    for (int z = site.z - R; z <= site.z + R; z++) {
+      const bool inPool = x <= site.x + R;
+      if (!inPool && std::abs(z - site.z) > kBankHalf) continue;
+      for (int y = bedY - 1; y <= wallTop + 30; y++) {
+        const IVec3 cc{x, y, z};
+        if (!c.world.CellInWindow(cc)) continue;
+        const bool wall = inPool && (std::abs(x - site.x) >= R - 1 ||
+                                     std::abs(z - site.z) >= R - 1);
+        uint32_t w = PackVoxNew(0u, 0u);
+        if (inBank(x, z)) {
+          if (y <= surfY) w = PackVoxNew(mStone, 0u);
+        } else if (y <= bedY || (wall && y <= wallTop)) {
+          w = PackVoxNew(mStone, 0u);
+        } else if (y <= waterTop && inPool && !wall) {
+          w = (mWater & 0xFFFu) | (7u << 12);
+        }
+        pool.push_back({World::SlotCellIndex(cc), w});
+      }
+    }
+  support::TickRig rig(c, 75000u, IVec3{site.x >> 4, waterTop >> 4, site.z >> 4});
+  for (size_t off = 0; off < pool.size(); off += 60000) {
+    const size_t n = std::min<size_t>(60000, pool.size() - off);
+    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) {
+      o.cells.assign(pool.begin() + (ptrdiff_t)off, pool.begin() + (ptrdiff_t)(off + n));
+    });
+  }
+  support::RunTicks(rig, 30);
+
+  const Vec3 hs = mobs.Defs()[dHuman].worldSize;
+  const float H = std::max(hs.y, 1.0f);
+  const float floatY = (float)surfY - 0.72f * H;   // mob_afloat.cpp kAfloatShare
+  auto spawnOnBed = [&](float x, float z, const char* profile) -> uint64_t {
+    const uint64_t id = mobs.Spawn(dHuman, {ifloor(x - hs.x * 0.5f), bedY + 1,
+                                            ifloor(z - hs.z * 0.5f)});
+    if (id) mobs.SetMobBehavior(id, profile);
+    return id;
+  };
+  // The player's point, far out of the way, for the part that wants none.
+  auto parkPlayer = [&]() {
+    mobs.SetPlayerActor(Vec3{(float)site.x - 400.0f, (float)hMax + 400.0f,
+                             (float)site.z},
+                        3.0f, 17.0f, false);
+  };
+
+  // ======== A. IT FLOATS =====================================================
+  const float floatTol = (float)BaselineNumber("npcSwimFloatTol", 2.5);
+  parkPlayer();
+  const uint64_t a = spawnOnBed((float)site.x - 6.0f, (float)site.z, "dummy");
+  support::RunTicks(rig, (int)BaselineNumber("npcSwimFloatTicks", 120));
+  bool aSwim = false, aPose = false;
+  float aY = 0.0f, aTread = 0.0f;
+  if (const Mob* m = mobs.FindMobById(a)) {
+    aSwim = m->Swimming();
+    aY = m->Origin().y;
+    aPose = m->Pose().swimOn;
+    aTread = m->Pose().swimW[0];
+  }
+  const bool aOk = a != 0 && aSwim && std::fabs(aY - floatY) <= floatTol && aPose &&
+                   aTread >= 0.5f;
+
+  // ======== B. IT SWIMS OUT ==================================================
+  mobs.Reset();
+  c.debris.Reset();
+  support::RunTicks(rig, 2);
+  const int kOut = (int)BaselineNumber("npcSwimOutTicks", 900);
+  const Vec3 padPoint{(float)(site.x + R + kPadLen / 2), (float)(surfY + 1) + 8.0f,
+                      (float)site.z + 0.5f};
+  mobs.SetPlayerActor(padPoint, 3.0f, 17.0f, true);
+  const uint64_t b = spawnOnBed((float)site.x + 4.0f, (float)site.z, "zombie");
+  int swamB = 0, outAt = -1, targetedB = 0;
+  float crawlPeak = 0.0f, bestX = -1e9f;
+  for (int i = 0; i < kOut && outAt < 0; i++) {
+    support::RunTicks(rig, 1);
+    const Mob* m = mobs.FindMobById(b);
+    if (m == nullptr) break;
+    bestX = std::max(bestX, m->Origin().x + hs.x * 0.5f);
+    if (const ai::Brain* br = mobs.MobBrain(b); br != nullptr && br->hasTarget)
+      targetedB++;
+    if (m->Swimming()) {
+      swamB++;
+      crawlPeak = std::max(crawlPeak, m->Pose().swimW[1]);
+    } else if (swamB > 0 && m->Origin().x + hs.x * 0.5f >= (float)(site.x + R - 1) &&
+               m->Origin().y >= (float)(surfY + 1) - 0.5f) {
+      outAt = i;
+    }
+  }
+  const bool bOk = b != 0 && swamB > 0 && crawlPeak >= 0.5f && outAt >= 0;
+
+  // ======== C. IT DIVES ======================================================
+  mobs.Reset();
+  c.debris.Reset();
+  support::RunTicks(rig, 2);
+  const int kDive = (int)BaselineNumber("npcSwimDiveTicks", 300);
+  const float pitchMin = (float)BaselineNumber("npcSwimPitchMin", 0.3);
+  const Vec3 bedPoint{(float)site.x + 8.0f, (float)(bedY + 1) + 8.0f, (float)site.z + 0.5f};
+  mobs.SetPlayerActor(bedPoint, 3.0f, 17.0f, true);
+  const uint64_t d = spawnOnBed((float)site.x - 8.0f, (float)site.z, "zombie");
+  int swamC = 0, underC = 0;
+  float headLow = 1e9f, pitchPeak = 0.0f;
+  for (int i = 0; i < kDive; i++) {
+    support::RunTicks(rig, 1);
+    const Mob* m = mobs.FindMobById(d);
+    if (m == nullptr) break;
+    if (!m->Swimming()) continue;
+    swamC++;
+    const float top = m->Origin().y + H;
+    headLow = std::min(headLow, top - (float)surfY);
+    if (top < (float)surfY) underC++;
+    pitchPeak = std::max(pitchPeak, std::fabs(m->Pose().swimPitch));
+  }
+  const bool cOk = d != 0 && swamC > 0 && underC > 0 && pitchPeak >= pitchMin;
+  RecordObserved("npcSwimOutTick", (double)outAt);
+
+  mobs.Reset();
+  c.debris.Reset();
+  parkPlayer();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  detail = Format(
+      "site %s, H %.1f, bed %d, waterline %d | A floats %s: swimming %d, soles %.2f "
+      "vs float %.2f (tol %.1f), swim pose %d, tread %.2f | B swims out %s: %d ticks "
+      "swimming (%d with a target), crawl peak %.2f, out on the bank at tick %d of %d "
+      "(got to x %+.1f of the bank) | C dives %s: %d ticks swimming, %d with the head under (lowest %+.1f "
+      "vs the waterline), stroke pitch peak %.2f rad (min %.2f)",
+      siteWhy.c_str(), H, bedY, surfY, aOk ? "PASS" : "FAIL", (int)aSwim, aY, floatY,
+      floatTol, (int)aPose, aTread, bOk ? "PASS" : "FAIL", swamB, targetedB, crawlPeak, outAt, kOut,
+      bestX - (float)(site.x + R - 1), cOk ? "PASS" : "FAIL", swamC, underC, headLow,
+      pitchPeak, pitchMin);
+  return aOk && bOk && cOk ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& AquaticGates() {
   static const std::vector<Gate> g = {
       // The swimmers: a shark's hunt, a piranha shoal, the medium, stranding.
       {"aquatic", "mob", {}, false, GateAquatic, false},
+      // A walker swims: floats and treads, swims out over a low bank, dives.
+      {"npc-swim", "mob", {}, false, GateNpcSwim, false},
   };
   return g;
 }

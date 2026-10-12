@@ -8545,6 +8545,19 @@ class MobSystem {
   // two touch for that window.
   const Mob* SwimStrikeTarget(const Mob& mob) const;
 
+  // ---- A WALKER THE WATER HOLDS UP (game/mob_afloat.cpp; 2026-10-11) -------
+  // NPC swimming for a rig with the swim family's clips and no `swim` block.
+  // CanSwimAfloat: does this creature swim rather than walk the bed (the tread
+  // clip resolved, not a fish, not a slither). SenseAfloat: waterline, bed,
+  // wet share and the Schmitt pair on the water depth that is Mob::swimming_.
+  // DriveAfloat: steer and stroke at water speed, float at the waterline or
+  // dive for an engaged target below it, resolve like the walk, climb out onto
+  // a bank within a step of the surface. LeaveAfloat: hand back to the walker.
+  bool CanSwimAfloat(const Mob& mob, const MobDef& def) const;
+  void SenseAfloat(Mob& mob, const MobDef& def, World& world);
+  void DriveAfloat(Mob& mob, const MobDef& def, World& world, float dt);
+  void LeaveAfloat(Mob& mob, const MobDef& def);
+
   // ---- executing an authored attack (game/strokes.h) ----------------------
   // Called from PreTick's per-mob loop, between the steering stages and the
   // animation. The long note at their definitions says why the order within a

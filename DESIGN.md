@@ -15519,7 +15519,7 @@ The inputs are the facts only a driver has:
 | look target | the camera's head-look goal (`SetLook`) | none (`ApplyStrikeAim` looks at `aimLook_`) |
 | aim target | `strikeAim` on (a no-op without an Aim effector) | `strikeAim` on |
 | extras | held crouch, ledge-hang lip | `chaseWant` |
-| `swim` | the water carries the body: `Player::swimming`, or wet with no footing (Space at the surface floats the box only 0.2..0.4 under); not fly / hanging / mantling | false: NPCs have no submersion or swim locomotion yet |
+| `swim` | the water carries the body: `Player::swimming`, or wet with no footing (Space at the surface floats the box only 0.2..0.4 under); not fly / hanging / mantling | `swimming_` on a walker with the swim clips (`game/mob_afloat.cpp`, below); `velocity` = `swimVel_`, `height` `FromDriver`, no stride clips, no chase stance, and UNDER the surface `swimAim` = the travel's direction |
 
 **The swim family (2026-10-09).** While `swim` is set the pipeline plays seven
 library clips at once (`assets/anims`: `tread`, `swim`, `swim_back`,
@@ -15550,6 +15550,28 @@ strokes at full swim speed instead of hobbling on stumps through the lake, and
 the state crossfades back the tick it leaves the water. In third person the
 body faces its travel, so the back/side clips show in first person and through
 a turn. Look-iteration: `--shot-swim` (harness lake, one BMP per phase).
+A prone stroke has little neck left (2026-10-11): the crawl and the dive key
+the head 20 and 25 degrees back over the torso, and while swimming the head
+look's UPWARD goal (the look plus the stroke pitch it hands back) is held to
+20 degrees, blended in by the crawl + dive weight (pose.cpp
+`kSwimHeadUpProne`) -- a third-person camera looking straight up over a
+surface crawl folded the head back into the shoulders.
+
+**NPCs swim (2026-10-11; `src/game/mob_afloat.cpp`, gate `npc-swim`).** A
+walker whose rig resolves the `tread` clip and has no `swim` / `slither` block
+stops walking a lake's bed: a Schmitt pair on the water depth over its column
+(in at 0.92 of its standing height, out under 0.80) sets `Mob::swimming_`, the
+same "the water carries it" flag the fish use, so the driver velocity, a blow's
+push and a lunge-as-surge already route right (everything FISH is gated on
+`def.swim.present`, never on `swimming_` alone). `DriveAfloat` keeps the walk's
+`Steer` and forward / strafe drive at the player's water speed and
+acceleration (`player.liquidSpeedScale` / `liquidAccel`), floats the soles
+0.72 of the standing height under the waterline (the tread's water share, so
+the pose's lift has nothing to correct), dives to an ENGAGED target's height
+when it is under the surface below (no breath limit yet), resolves the move
+with the walk's footing rules, and hauls out onto a bank that stands within a
+step of the waterline. The pose is the swim family above, fed the same way the
+avatar feeds it.
 
 What stays per driver is the part that is genuinely per driver: the player's
 clip family (idle/walk/run/jump/land/fall/hang, the stride-locked clip rate,

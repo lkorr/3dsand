@@ -1181,6 +1181,11 @@ const char* const kOrder[] = {
     // piranha nip him, a dry man is ignored, a fish out of water flops and
     // suffocates. Ticks the world and regenerates it on the way out.
     "aquatic",
+    // A walker swims (game/mob_afloat.cpp): a human floats and treads in a
+    // stamped pool too deep to stand in, a zombie swims out over a low bank
+    // and climbs onto it, one dives for a point on the bed. Ticks the world
+    // and regenerates it on the way out.
+    "npc-swim",
     // The player's corpse is a dead Mob too (P2b): moved into mobs_ at the
     // PreTick after the death, whole respawn, sleeps, a cut reaches it. Ticks
     // the world and regenerates it on the way out, as corpse-sleep does.

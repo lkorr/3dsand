@@ -173,6 +173,16 @@ constexpr float kSwimLiftHalflife = 0.15f;
 constexpr float kSwimCrawlPitch = 70.9f * 3.14159265f / 180.0f;
 constexpr float kSwimAimFwdMin = 0.01f;
 constexpr float kSwimPitchHalflife = 0.2f;
+// THE NECK HAS LITTLE ROOM IN A PRONE STROKE. The crawl and the dive already
+// key the head back (swim.json / swim_down.json: 20 and 25 degrees over the
+// torso) to see ahead of a body lying in the water, so the look's own
+// `avatar.headLookPitchUp` on top of that folded the head back into the
+// shoulders: third person, crawling at the surface with the camera looking up,
+// the head rolled backwards inside the torso. While swimming, the head look's
+// UPWARD goal -- the look plus the stroke pitch it hands back -- is held to
+// this much, blended in by the prone strokes' weight (swim + swim_down); the
+// tread, the backstroke and the side stroke keep the full range. Radians.
+constexpr float kSwimHeadUpProne = 20.0f * 3.14159265f / 180.0f;
 
 // ---- THE AIRBORNE POSE, IN LEG LENGTHS AND ARM REACHES ---------------------
 //
@@ -986,8 +996,16 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
     // A swimmer's body already pitched along the stroke (swimPitchApplied,
     // + = forward) carries the head down with it; the look hands that back,
     // so the gaze still goes where the driver says rather than twice as far.
-    const float goalPitch =
+    float goalPitch =
         (in.haveLook ? in.lookPitch : 0.0f) + pose_.swimPitchApplied;
+    // ...and a prone stroke has little neck to look up with (kSwimHeadUpProne).
+    if (pose_.swimOn) {
+      const float prone =
+          std::clamp(pose_.swimW[1] + pose_.swimW[6], 0.0f, 1.0f);
+      const float upFull = av.headLookPitchUp * (3.14159265f / 180.0f);
+      goalPitch = std::min(goalPitch,
+                           upFull + (kSwimHeadUpProne - upFull) * prone);
+    }
     pose_.lookYaw += (goalYaw - pose_.lookYaw) * k;
     pose_.lookPitch += (goalPitch - pose_.lookPitch) * k;
     int head = -1;
