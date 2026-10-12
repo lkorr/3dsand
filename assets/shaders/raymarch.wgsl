@@ -975,6 +975,69 @@ var<private> gRsOn : bool = false;
 // image from inside applyAerial (skyBackdrop, short-range mode). Set first
 // thing in fs(); nothing outside fs() calls applyAerial.
 var<private> gFragXY : vec2f = vec2f(0.0);
+
+// ---- THE EYE'S SKY: is the camera in an ENCLOSED space? (D9, 2026-10-12) ----
+// The air between the eye and a surface scatters SKYLIGHT toward the eye, which
+// is why aerial perspective converges on the airglow in that direction. In a
+// room the sky cannot reach -- a dungeon hall 15 m under a moor, a sealed
+// cave, a windowless cellar -- there is no skylight to scatter, so the old law
+// painted the far end of a hall the bright grey of the overcast above it from
+// ~25 m on (docs/dungeons/heather_cairn/game_columned_hall.png). The same goes
+// for the cascade cells past the window edge: their closed-form indirect light
+// (farOpenness) assumes an open sky, which is why the hall's far end in the
+// cascade was lit like a hillside.
+//
+// The eye's own measurement is the openness grid's (sim_openness.wgsl): walk
+// DOWN from the camera to the first block holding matter (16 blocks, 6.4 m, so
+// a flying camera in a tall hall still finds its floor) and read that block's
+// +Y face -- exactly opennessAtBody's probe, with a longer reach. The result
+// is a 0..1 SKY WEIGHT k:
+//   * 1 EXACTLY where the floor's sky share is >= EYE_SKY_OPEN_HI, where there
+//     is no measurement (-1: off the grid, airborne, openness off) and where
+//     render.opennessStrength is 0 -- so every outdoor frame is bit-identical
+//     to before; only a camera whose floor sees (almost) no sky moves;
+//   * eased to 0 by EYE_SKY_OPEN_LO.
+// Readers: applyAerial's fog TARGET (mix toward render.enclosedAmbient, the
+// light an enclosed face keeps -- fog in a dark room is darkness) and the
+// far-hit shade's sky terms (openF, the bounce). The fog FRACTION is
+// untouched: what the air hides is still hidden, it just is not sky-coloured.
+// Uniform per frame in effect (same addresses for every pixel), computed once
+// per pixel on first use.
+// Render-only, never hashed.
+const EYE_SKY_OPEN_LO : f32 = 0.02;
+const EYE_SKY_OPEN_HI : f32 = 0.12;
+const EYE_SKY_WALK : u32 = 16u;
+var<private> gEyeSkyK : f32 = -1.0;
+fn eyeSkyKCompute() -> f32 {
+  if (TUNE_OPENNESS_STRENGTH <= 0.0) { return 1.0; }
+  var c = vec3<i32>(floor(R.camPos));
+  for (var i = 0u; i < EYE_SKY_WALK; i++) {
+    let idx = chunkIndexW(c);
+    let lo = vec3<u32>(c & vec3<i32>(i32(CHUNK) - 1));
+    let sbit = subOccBitLocal(lo);
+    if ((occupancy[subOccIndex(idx, 1u, sbit >> 5u)] & (1u << (sbit & 31u))) != 0u) {
+      let b = opennessByteAt(c, 3u, &openness, &opennessGen);   // face 3 = +Y
+      if (b < 0) { return 1.0; }
+      let raw = f32(b) * (1.0 / OPEN_MAX);
+      if (raw >= EYE_SKY_OPEN_HI) { return 1.0; }
+      return smoothstep(EYE_SKY_OPEN_LO, EYE_SKY_OPEN_HI, raw);
+    }
+    c.y -= i32(SUBOCC_BLOCK);
+  }
+  return 1.0;
+}
+fn eyeSkyK() -> f32 {
+  if (gEyeSkyK < 0.0) { gEyeSkyK = eyeSkyKCompute(); }
+  return gEyeSkyK;
+}
+// THE HIT'S OWN SKY, for the fog target: an enclosed eye looking out of a
+// doorway at a sunlit hillside must still fog that hillside toward the sky.
+// Set by the primary shade before it fogs -- near and cascade hits alike from
+// farHitBuried (is there rock, by the far map, over the air in front of the
+// face?) -- and 0 ("no word: the eye decides") otherwise. The fog
+// target's sky weight is max(eyeSkyK(), gHitSky): 1 wherever either is open.
+var<private> gHitSky : f32 = 0.0;
+fn fogSkyK() -> f32 { return max(eyeSkyK(), gHitSky); }
 // ---- THE SEAM INSTRUMENTS (2026-10-09; DESIGN.md "Features take their
 // indirect light from the cascade") ----
 // SEAM_HANDOFF is render.lodHandoffDist as every reader in this shader and in
@@ -7493,6 +7556,10 @@ fn applyAerial(color : vec3f, rd : vec3f, tFine : f32) -> vec3f {
     }
     airlight = mix(airlight, hz, R.fogHaze * (1.0 - f * f));
   }
+  // AN ENCLOSED EYE (eyeSkyK): no skylight to scatter, so the air fogs toward
+  // the light an enclosed face keeps. k == 1 (every open-sky frame) skips it.
+  let k = fogSkyK();
+  if (k < 1.0) { airlight = mix(TUNE_ENCLOSED_AMBIENT, airlight, k); }
   return mix(color, airlight, f);
 }
 
@@ -14156,6 +14223,21 @@ fn farSurfAt(level : u32, hitP : vec3f, grad : bool) -> FarSurf {
 // of riser when heading UPHILL on that axis (a riser faces downhill). The
 // ALBEDO of the averaged staircase is skin and sub-skin in these shares; its
 // LIGHTING is the smooth heightfield normal's, so the relief survives.
+// How BURIED a cascade hit is (D9): 0 = the air in front of its face is
+// under the open sky, 1 = under rock (the column one sub-column out along `n`
+// has its heightfield top FAR_BURIED_LO..HI fine voxels or more above the
+// hit, plus two sub-columns of slack), -1 = the map does not vouch for that
+// column (an edit, a ruin, outside the level): no answer.
+const FAR_BURIED_LO : f32 = 24.0;
+const FAR_BURIED_HI : f32 = 48.0;
+fn farHitBuried(level : u32, hitP : vec3f, n : vec3f) -> f32 {
+  let w = f32(1u << (farCellShift(level) - 1u));
+  let fs = farSurfAt(level, hitP + n * w, false);
+  if (!fs.ok) { return -1.0; }
+  let depth = f32(farMapTop(fs.e) + 1) - hitP.y;
+  let pad = 2.0 * w;
+  return smoothstep(FAR_BURIED_LO + pad, FAR_BURIED_HI + pad, depth);
+}
 fn farRiserShare(g : vec2f, rd : vec3f) -> f32 {
   let wT = max(-rd.y, 0.0);
   let wR = select(0.0, abs(g.x * rd.x), g.x * rd.x > 0.0) +
@@ -15403,6 +15485,35 @@ fn fs(in : VSOut) -> FSOut {
       // The terrain past ~50 m that hides the sky (S1, hzSkyVis): a cascade
       // cell on a gorge floor is not under an open sky.
       openF *= hzSkyVis(hitP);
+      // A BURIED CASCADE HIT (D9, 2026-10-12): the closed forms above are
+      // for terrain under the sky, but the cascade also holds the far end of
+      // a dungeon hall 15 m under a moor, which they lit like a hillside (the
+      // bright grey past the window edge in docs/dungeons/heather_cairn/
+      // game_columned_hall.png). The test is the map's: the column on the AIR
+      // side of the face (one sub-column out along n) has its heightfield top
+      // well over the hit -- rock overhead, not sky. Outdoors that column's
+      // top is at or under the hit (a cliff's air side is the ground below
+      // it, a tread is its own column), so the weight is 0 and nothing moves.
+      // Where the map does not vouch for the column, the eye decides
+      // (eyeSkyK: 1 under any open sky). Features (crowns, trunks) stand on
+      // the heightfield and are never buried. Also feeds the fog target
+      // (gHitSky).
+      if (!fFeat && m.klass != CLASS_LIQUID) {
+        let bw = farHitBuried(flv, hitP, n);
+        if (bw >= 0.0) {
+          openF *= 1.0 - bw;
+          featBounce *= 1.0 - bw;
+          gHitSky = 1.0 - bw;
+        } else {
+          let eyeK = eyeSkyK();
+          if (eyeK < 1.0) {
+            openF *= eyeK;
+            featBounce *= eyeK;
+          }
+        }
+      } else {
+        gHitSky = 1.0;
+      }
       // Same wrapped diffuse as the near field — a different falloff here is a
       // visible brightness step at the window seam.
       var lambert = select(wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP),
@@ -15784,6 +15895,15 @@ fn fs(in : VSOut) -> FSOut {
     // ~50 m scale what the grid measured. No measurement stays no measurement.
     var openRaw = opennessAt(openCell, hp, openN, &openness, &opennessGen);
     if (openRaw >= 0.0) { openRaw *= hzSkyVis(hp); }
+    // The fog target's say from this hit (gHitSky): the far map's burial
+    // test at level 1 (farHitBuried), NOT the openness byte. The byte's fan
+    // stops at render.opennessReach (12 m), so a face far down a 34 m hall
+    // whose diagonals run the length of it reads partly "open", and taking
+    // that for sky fogged the vault at the end of the Tarn Cairn's hall blue.
+    // No map answer is 0 -- "the eye decides". (Under an open sky the eye
+    // says 1, so outdoors this changes nothing.)
+    let nb = farHitBuried(1u, hp, openN);
+    gHitSky = select(0.0, 1.0 - nb, nb >= 0.0);
     var lambert = wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP);
     let dbgLamPreN = lambert;
     var dbgShN = 1.0;
