@@ -16210,8 +16210,39 @@ where you hear from either (§12b, "The ears are on the character").
   4.05 -> 2.64 s (the arms are on `Tuning::Render::farPlaneBatch`).
   `SANDVOX_FAR_NO_PACING=1` is the unpaced A/B arm. What is left is the MEAN:
   ~33 us of GPU per entry across the passes, most of it the 32 entries of a
-  level-chunk column each recomputing the same 256 column prologues — the
-  far column cache below is still the lever.
+  level-chunk column each recomputing the same 256 column prologues.
+  **The column stack (2026-10-12, same ticket).** That is now shared, and
+  without a cache buffer or a pre-pass: `FarField::PrepareTick` sorts each
+  tick's list (stable) by (level, slot x, slot z), so a level-chunk column's
+  entries are one contiguous RUN, and `far`'s workgroup for the run's first
+  entry fills the whole run (worldgen.wgsl THE COLUMN STACK; every other
+  workgroup of the run returns on its first load). Its threads build genColumn
+  and the prologue ONCE over the union of the run's rows, then walk the
+  entries, each re-applying ITS OWN gates to the shared answer (cave bands
+  zeroed, tree set emptied, canopy memo 0, canopy volume none, corner-max
+  `btop` only for the entry holding that row) -- so every genCellIn call sees
+  the arguments it saw per entry, and the bytes are the per-entry sweep's.
+  Z planes now enqueue y innermost like X planes, so a 256-entry slice is
+  eight whole columns. Proof of exactness: `SANDVOX_FAR_DIGEST=1 --gate
+  far-fog` digests the whole cascade after a full refill (runs of 32):
+  c3757b404adc2604 before and after, and the same with unsorted runs of one;
+  `far-*` gates PASS, world hash unchanged. Measured `--perf --scenario
+  peaks-route` (1,024 entries every tick, one exe, two asset trees,
+  `SANDVOX_GPU_TIMER_SERIAL=1`): farFill 3.93 -> 2.59 ms/tick, farField node
+  p50 6.02 -> 5.22, p95 13.85 -> 10.07, max 21.2 -> 16.4 ms; frame p95 31.9
+  -> 27.9, p99 35.2 -> 30.7. The same sharing in `farcover` (the tree tile
+  scan once per run) was tried and REVERTED: farCoverFill 128 -> 299 us/tick,
+  because its per-entry early-outs already leave most entries trivial and the
+  run serialises the rest. What is left: `farMapFill` (~100 us per surface-map
+  column, ~2.9 ms/tick on peaks-route, ~20% of it the voxel-over-the-top
+  lookup's one-shot tree scan) is now the largest far pass, then the sim tick
+  itself (~9 ms GPU on a tick frame) and window shifts. Two instruments came
+  with it: `SANDVOX_GPU_TIMER_SERIAL=1` (vk_record.cpp; pass spans begin at
+  ALL_COMMANDS, so a pass is not charged its predecessor's tail -- an empty
+  farMapFill read 3 ms a tick at TOP_OF_PIPE) and `SANDVOX_FRAMES_PASSES=<file>`
+  (every pass of every `--frames` frame). NOTE the per-frame pass rows are
+  matched on the frame the TIMESTAMPS came back for, which is not always the
+  frame whose far entries the CSV row counts: attribute with run totals.
   **The sieve skips the sky (2026-09-12).** `far` ran a full `genCellCol` for
   all 4,096 cells of a level chunk whatever its altitude, and a level box is
   `kFarN` cells tall — 13 km at level 8 against a few hundred metres of
@@ -16254,8 +16285,8 @@ where you hear from either (§12b, "The ears are on the character").
   end, 14 coalesced level resets) -- demand is ~2x the cap once the eye moves
   on three axes, and the lever is the per-entry cost: an X/Z plane is 32
   entries stacked on each level-chunk column, every one recomputing the same
-  256 `genColumn`s (a far column cache, as `cols` is for genChunk, would cut
-  that up to 32x; `far`'s compile cliff is why it is its own package). And
+  256 `genColumn`s (fixed 2026-10-12 by the column stack, see "Plane fills
+  are paced" above: one prologue per run of a column's entries). And
   the page pool peaks at 88.5% (32,616 of 36,864): 29,438 FULL chunks hold a
   page, 25,510 of them not cpuDirty. `SANDVOX_PT_DEBUG=1` attributes it
   (Stream::ApplyGenVerdict / HarvestDemotes): of 2.73 M generated slots,
