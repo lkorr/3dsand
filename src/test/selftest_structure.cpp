@@ -57,6 +57,7 @@
 #include "measure/perfsuite.h"
 #include "sim/biomes.h"
 #include "sim/materials.h"
+#include "sim/pass_table.h"
 #include "sim/stream.h"
 #include "sim/treeatlas.h"
 #include "sim/weather.h"
@@ -1557,6 +1558,111 @@ Status GateLodSeam(Ctx& c, std::string& detail) {
   const Vec3 eye{(float)eyeCell.x + 0.5f, (float)eyeCell.y + 18.0f, (float)eyeCell.z + 0.5f};
   const IVec3 eyeChunk{eyeCell.x >> 4, eyeCell.y >> 4, eyeCell.z >> 4};
 
+  // ---- THE STATE THE FRAMES ARE DRAWN UNDER (attribution, printed every run) ----
+  // The gate passed standalone and failed after the far / shadow-cache gates
+  // (2026-10-12 integration): the near arm read ~27 luma brighter on leaves.
+  // So it prints what it inherits -- the derived render caches an earlier gate
+  // leaves VALID across a worldgen, every render.* row that differs from the
+  // shipped tuning.json, the weather pin and the raymarch mode flags -- and
+  // then resets the caches itself (below), so its verdict is order-free.
+  auto countNonZero = [&](const rhi::Buffer& buf, uint64_t bytes) -> uint64_t {
+    using U2 = rhi::BufferUsage;
+    const uint64_t kStep = 8ull << 20;
+    rhi::Buffer st = CreateBuffer(ctx.device, kStep, U2::MapRead | U2::CopyDst, "lodSeamProbe");
+    std::vector<uint32_t> w(kStep / 4);
+    uint64_t n = 0;
+    for (uint64_t off = 0; off < bytes; off += kStep) {
+      const uint64_t len = std::min(kStep, bytes - off);
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      enc.CopyBufferToBuffer(buf, off, st, 0, len);
+      ctx.queue.Submit(enc.Finish());
+      if (!rhi::ReadBufferBlocking(ctx.device, st, 0, w.data(), len)) break;
+      for (uint64_t i = 0; i < len / 4; i++) n += w[i] != 0u ? 1 : 0;
+    }
+    return n;
+  };
+  {
+    Tuning disk;
+    std::string renderDiff;
+    if (LoadTuning(AssetDir() + "/materials/tuning.json", disk)) {
+      const Tuning& cur = CurrentTuning();
+      int nd = 0;
+#define LS_ROW(g, m)                                                    \
+  if (std::string(#g) == "render" && !(cur.g.m == disk.g.m)) {        \
+    nd++;                                                              \
+    renderDiff += Format(" render." #m " %g->%g", (double)disk.g.m,    \
+                         (double)cur.g.m);                             \
+  }
+#define TP_F(g, m, n, d, lo, hi) LS_ROW(g, m)
+#define TP_I(g, m, n, d, lo, hi) LS_ROW(g, m)
+#define TP_U(g, m, n, d, lo, hi) LS_ROW(g, m)
+#define TP_B(g, m, n, d) LS_ROW(g, m)
+#define TP_S(g, m, n, d)
+#define TP_V3(g, m, n, x, y, z)
+#include "sim/tuning_params.def"
+#undef TP_V3
+#undef TP_S
+#undef TP_B
+#undef TP_U
+#undef TP_I
+#undef TP_F
+#undef LS_ROW
+      if (nd == 0) renderDiff = " none";
+    } else {
+      renderDiff = " (tuning.json did not load)";
+    }
+    ctx.WaitIdle();
+    const uint64_t scBytes = world.shadowCache.Size();
+    const uint64_t irBytes = world.irradiance.Size();
+    const uint64_t scLive = countNonZero(world.shadowCache, scBytes);
+    const uint64_t irLive = countNonZero(world.irradiance, irBytes);
+    const uint64_t ogBytes = world.opennessGen.Size();
+    const uint64_t ogLive = countNonZero(world.opennessGen, ogBytes);
+    std::printf("lod-seam state: inherited shadow cache %llu of %llu words non-zero, irradiance "
+                "grid %llu of %llu, openness stamps %llu of %llu; render.* vs tuning.json:%s; "
+                "shadowCache %d giStrength %.2f "
+                "handoff %.1f; weather '%s' autoCycle %d; shortRange %d\n",
+                (unsigned long long)scLive, (unsigned long long)(scBytes / 4),
+                (unsigned long long)irLive, (unsigned long long)(irBytes / 4),
+                (unsigned long long)ogLive, (unsigned long long)(ogBytes / 4), renderDiff.c_str(), base.render.shadowCache, base.render.giStrength,
+                base.render.lodHandoffDist, weather::Last().fromName.c_str(),
+                base.weather.autoCycle ? 1 : 0, ShortRangeMode() ? 1 : 0);
+  }
+  // THE DERIVED CACHES START COLD. The shadow cache keys its slots on world
+  // cell faces and a VALID patch survives a worldgen; since the staggered
+  // refresh a valid patch is re-cast every 4th frame into a 16-sample mean, so
+  // an earlier gate's (or this gate's previous sky's) verdicts keep shading
+  // these cells for ~64 frames -- longer than an arm. It is zeroed before
+  // EVERY arm (a fresh patch publishes its centre ray at once), so near and
+  // far start from the same state. The irradiance grid is zeroed once, here,
+  // BEFORE the fixture's ticks, whose openness walk refills it the way the
+  // game's would. Both are render-only and disposable (selftest_render.cpp
+  // ZeroShadowCache / ZeroIrradianceGrid, for gi-bounce and cave-time).
+  //
+  // THE OPENNESS GRID IS THE ONE THAT BIT (2026-10-12, the failing suite
+  // prefix: near leaves +28 luma, ground +16, dusk too). Its bytes and per-slot
+  // stamps survive a worldgen at the same window origin (far-contain and
+  // far-cover regenerate at (0,0,0) too, with other worlds), and the rolling
+  // refresh only re-marches a slot whose column was TOUCHED since it was last
+  // walked (sim_openness.wgsl `refresh`), compared on T.tick -- and this
+  // gate's ticks restart at 1 under stamps written at much larger ticks. So
+  // the near arm shaded this forest with another world's sky. Cleared to the
+  // cold start (all zero, world.cpp's allocation state) with the irradiance
+  // grid, before the ticks whose walk rebuilds both.
+  auto coldCache = [&](bool derived) {
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    enc.FillTracked(pass::Buf::ShadowCache, world.shadowCache);
+    if (derived) {
+      enc.FillTracked(pass::Buf::Irradiance, world.irradiance);
+      enc.FillTracked(pass::Buf::Openness, world.openness);
+      enc.FillTracked(pass::Buf::OpennessGen, world.opennessGen);
+    }
+    ctx.queue.Submit(enc.Finish());
+    ctx.WaitIdle();
+  };
+
+  coldCache(true);
+
   // The openness grid is written by the tick's derived rows (the rolling
   // refresh covers the window in kNumChunks / opennessChunksPerFrame ticks);
   // the far cascade by a full refill.
@@ -1602,6 +1708,7 @@ Status GateLodSeam(Ctx& c, std::string& detail) {
     SetCurrentTuning(t);
     weather::SetOverride(sky.preset);
     weather::Snap();
+    coldCache(false);
     auto copyOut = [&](const rhi::CommandEncoder& enc, const rhi::Texture& tex,
                        const rhi::Buffer& into) {
       rhi::TexelCopyTexture srcT{};

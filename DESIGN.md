@@ -17030,6 +17030,24 @@ where you hear from either (§12b, "The ears are on the character").
     cascade 2.93 -> 2.93; the noon number swung 5.6-9.9 between boots of the
     same tree, so read it as "up to ~1 ms on the overlook, nothing on the
     cascade camera".
+  - **Order-free (2026-10-12, found at integration).** The gate passed
+    standalone and failed after the far-* gates + shadow-cache: near leaves
+    +28 luma, so leaf/bark read -33/-23. Its state line (printed every run:
+    inherited shadow-cache / irradiance / openness-stamp counts, every
+    render.* row off tuning.json, weather pin, mode flags) showed no tuning
+    or weather leak; the cause was the OPENNESS GRID. Its bytes and per-slot
+    stamps survive a worldgen at the same window origin (far-contain and
+    far-cover also regenerate at (0,0,0), other worlds), and the rolling
+    refresh re-marches a slot only if its column was touched since it was
+    walked, compared on T.tick -- while the gate's ticks restart at 1 under
+    stamps written at larger ticks. The near arm shaded the forest with
+    another world's sky. The gate now cold-starts (zeroes) openness +
+    stamps + irradiance before its ticks and the shadow cache before every
+    arm. Zeroing the shadow cache and irradiance alone did NOT fix it
+    (measured). After the prefix and standalone now agree within ~1 luma on
+    leaf/bark and ~4 on ground. Note for the engine: the game itself never
+    rewinds T.tick, but a regenerate at an unchanged window origin (a map
+    reload) would inherit the same stale openness until touched.
   - **Still open, pinned as known residuals** (`lodSeam.max.<sky>.<class>`,
     measured + ~2): sunlit and overcast ground stays +10..+25 brighter far.
     The table says the far OPENNESS of open ground is still ~1.3x the near
