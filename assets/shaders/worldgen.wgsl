@@ -6017,9 +6017,93 @@ fn farContainedBy(mat : u32, fine : vec3<i32>, shift : u32, base : vec3<i32>,
       }
       seen |= select(0u, 1u, k == FAR_CK_LIQUID) | select(0u, 2u, k == FAR_CK_OPEN);
     }
-    if (seen == 3u) { res = cand; found = true; }
+    // ...and is neither floating on the liquid nor a lone speck (both below).
+    if (seen == 3u && !farFloatsOn(p, base, pageBase) && farDespeck(cand, p) == cand) {
+      res = cand;
+      found = true;
+    }
   }
   return res;
+}
+
+// ---- A WALL THAT FLOATS ON A LIQUID HOLDS NOTHING (ticket 2026-10-11_22-09-52)
+// A cloth scrap, a plank, a corpse's debris floating on a lake is a wall
+// voxel with water under or beside it and air over it -- exactly the
+// container shape -- so the rule above took it for a basin wall and painted
+// its WHOLE level-1/2 cell with it: every scrap on the water read 2x / 4x its
+// size past the LOD handoff. A wall holds liquid BESIDE or ABOVE it, never
+// under it. So a candidate is refused when the first non-wall voxel straight
+// below it, within FAR_FLOAT_REACH, is LIQUID: it rests on the liquid. A
+// trough wall stands on its floor (walls all the way down, or the ground), a
+// trough on legs has open air under its floor, a lake bank stands on ground
+// -- all unchanged. A raft thicker than the reach counts as standing (it is
+// bigger than a level-2 cell anyway). Same walk, same classes, same reach in
+// FarEdits::ContainedBy; an unseen voxel ends the walk as OPEN on both sides.
+const FAR_FLOAT_REACH : i32 = 4;   // faredits.h kFloatReach
+fn farFloatsOn(p : vec3<i32>, base : vec3<i32>, pageBase : u32) -> bool {
+  for (var d = i32(unrollFenceU()) + 1; d <= FAR_FLOAT_REACH; d++) {
+    let k = farContainKind(farContainLookup(p - vec3<i32>(0, d, 0), base, pageBase));
+    if (k != FAR_CK_WALL) { return k == FAR_CK_LIQUID; }
+  }
+  return false;
+}
+
+// ---- A LONE VOXEL IS DRAWN AS ITS SURROUNDINGS (ticket 2026-10-11_22-09-52)
+// The centre rule draws a level-k cell as the voxel at its centre, so a voxel
+// with nothing like it around -- a cloth scrap on a lake, a blood drop, a
+// flake of ash, a dropped item's last voxel -- became a whole 2^k cube
+// wherever it happened to sit on a centre: 8x its volume at level 1, 64x at
+// level 2. A SPECK is a far-solid, non-cover voxel none of whose 26
+// neighbours holds its far slot (cover -- leaf -- is the cover rule's, which
+// keeps a crown's density on purpose). Its cell is drawn as if the speck were
+// not there: as the far slot most of its six face neighbours hold (nothing
+// counting as a slot of its own; ties to the first in farFaceDir order), so a
+// scrap IN the water's top layer is water, one lying ON the water or on the
+// ground is air, an ore fleck in stone is stone. Anything the window does
+// not hold counts as support (never despeck on a guess). A real object --
+// two voxels touching, by a face, an edge or a corner -- is never a speck.
+//
+// Every live producer applies it to its centre: `fardown`, the loose top
+// (centre and top), the container pass, the claim check, and the CPU twin
+// FarEdits::Despeck for an evicted chunk's patch (which sees only that chunk:
+// a speck whose support is across a chunk face stays a downsample-only
+// answer). The SIEVE does not: it would need 26 genCellIn per centre, and
+// pristine procgen's lone non-leaf voxels are a stamp's ornament at most.
+// Returns `mat` unchanged, or the substitute (MAT_AIR for nothing).
+fn farSpeckSlot(m : u32) -> u32 {
+  return select(0u, matFarPal(&materials, m), farCellIsSolid(m));
+}
+fn farDespeck(mat : u32, fine : vec3<i32>) -> u32 {
+  if (!farCellIsSolid(mat)) { return mat; }
+  let s = matFarPal(&materials, mat);
+  if (s == 0u || farCoverWord(s) != 0u) { return mat; }
+  // The six faces first: bulk matter leaves on the first or second read.
+  var fs = FarCoverAcc(0u, 0u);   // the six face slots, 8 bits each
+  for (var j = unrollFenceU() + 1u; j <= 6u; j++) {
+    let q = fine + farFaceDir(j);
+    if (!inWindow(q, T.origin)) { return mat; }
+    let sj = farSpeckSlot(voxWordAt(q) & 0xFFFu);
+    if (sj == s) { return mat; }
+    farCoverPut(&fs, j - 1u, sj);
+  }
+  // ...then the twenty edges and corners (the 3x3x3 less the centre and faces).
+  for (var i = unrollFenceU(); i < 27u; i++) {
+    let o = vec3<i32>(i32(i % 3u) - 1, i32((i / 3u) % 3u) - 1, i32(i / 9u) - 1);
+    if (abs(o.x) + abs(o.y) + abs(o.z) < 2) { continue; }
+    let q = fine + o;
+    if (!inWindow(q, T.origin)) { return mat; }
+    if (farSpeckSlot(voxWordAt(q) & 0xFFFu) == s) { return mat; }
+  }
+  var bestJ = 0u;
+  var bestN = 0u;
+  for (var j = unrollFenceU(); j < 6u; j++) {
+    let sj = farCoverAt(fs, j);
+    var n = 0u;
+    for (var k = 0u; k < 6u; k++) { n += select(0u, 1u, farCoverAt(fs, k) == sj); }
+    if (n > bestN) { bestN = n; bestJ = j; }
+  }
+  if (farCoverAt(fs, bestJ) == 0u) { return MAT_AIR; }
+  return voxWordAt(fine + farFaceDir(bestJ + 1u)) & 0xFFFu;
 }
 
 // ---- the conservative "any blocker" bit (13.2.2) --------------------------
@@ -8414,8 +8498,9 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
         // records it, which is the behaviour every reader had before the flag
         // existed.
         var byteV = farBlockerBitAt(topC, cc, shift, T.seed);
-        // live grid (the sample point is inside this chunk, hence resident)
-        let mat = voxWordAt(fine) & 0xFFFu;
+        // live grid (the sample point is inside this chunk, hence resident);
+        // a lone speck there is drawn as its surroundings (farDespeck)
+        let mat = farDespeck(voxWordAt(fine) & 0xFFFu, fine);
         if (farCellIsSolid(mat)) {
           // Same skin rule as the sieve — the skin is looked up from PRISTINE
           // procgen (genColumn) — but told what the LIVE ground at (x, h, z)
@@ -8570,7 +8655,9 @@ fn fardownClaim(@builtin(workgroup_id) wg : vec3<u32>,
         qz = (m.y << wsh) + i32((fw >> 13u) & 1u);
       }
       for (var y = lo; y <= hi; y++) {
-        let wm = voxWordAt(vec3<i32>(qx, y, qz)) & 0xFFFu;
+        // A lone speck on the ground (farDespeck) breaks no claim: the cells
+        // under the map do not draw it either.
+        let wm = farDespeck(voxWordAt(vec3<i32>(qx, y, qz)) & 0xFFFu, vec3<i32>(qx, y, qz));
         let solid = farCellIsSolid(wm);
         // ...and the claim's COLOUR (2026-10-02): a refined hit is painted
         // with the entry's skin slot, so a top voxel that is solid but no
@@ -8914,11 +9001,14 @@ fn fardownFeat(@builtin(workgroup_id) wg : vec3<u32>,
         if (t == FAR_NO_TOP) { continue; }
         // The answer, before h is known: a loose T's material, else the
         // centre's own (what `fardown` writes for a centre above the ground).
-        var m = voxWordAt(fine) & 0xFFFu;
+        // A lone speck is neither a centre nor a top (farDespeck): a single
+        // blood drop must not paint a whole cell's column at any level.
+        var m = farDespeck(voxWordAt(fine) & 0xFFFu, fine);
         var loose = false;
         if (t != FAR_RUN_ON) {
-          let tm = voxWordAt(vec3<i32>(fine.x, t, fine.z)) & 0xFFFu;
-          if (farIsLoose(tm)) { m = tm; loose = true; }
+          let tp = vec3<i32>(fine.x, t, fine.z);
+          let tm = voxWordAt(tp) & 0xFFFu;
+          if (farIsLoose(tm) && farDespeck(tm, tp) == tm) { m = tm; loose = true; }
         }
         let slotT = matFarPal(&materials, m);
         if (slotT == 0u) { continue; }
@@ -8935,7 +9025,7 @@ fn fardownFeat(@builtin(workgroup_id) wg : vec3<u32>,
         // centre at or under h is procgen's skin business: silent.
         if (!((loose && t > L.h) || fine.y > L.h)) { continue; }
         if (shift <= FAR_CONTAIN_MAX_SHIFT) {
-          let centre = voxWordAt(fine) & 0xFFFu;
+          let centre = farDespeck(voxWordAt(fine) & 0xFFFu, fine);
           let cpe = pageTable[voxSlotOfCell(fine)];
           let cbase = (fine >> vec3<u32>(CHUNK_SHIFT)) * i32(CHUNK);
           if (farContainedBy(centre, fine, shift, cbase, cpe) != centre) { continue; }
@@ -9013,7 +9103,8 @@ fn fardownFeat(@builtin(workgroup_id) wg : vec3<u32>,
       let cc = fine >> vec3<u32>(shift);
       if (!farInBox(cc, origin)) { continue; }
       let lf = vec3<u32>(fine - base);
-      let centre = voxels[pageBase + (lf.z * CHUNK + lf.y) * CHUNK + lf.x] & 0xFFFu;
+      // the centre `fardown` drew: a lone speck already gave way (farDespeck)
+      let centre = farDespeck(voxels[pageBase + (lf.z * CHUNK + lf.y) * CHUNK + lf.x] & 0xFFFu, fine);
       let mat = farContainedBy(centre, fine, shift, base, pe);
       if (mat == centre) { continue; }
       let byteV = farCellByte(matFarPal(&materials, mat), 0u);

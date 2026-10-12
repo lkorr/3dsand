@@ -17220,6 +17220,39 @@ where you hear from either (§12b, "The ears are on the character").
   window generation; a basin's outer CORNER column touches walls, not liquid,
   so a cell holding only it and outside air stays empty (a one-cell notch);
   liquid in a vessel or a body is not in the voxel grid and not in scope.
+  **Refined 2026-10-11 (ticket 2026-10-11_22-09-52): a wall that FLOATS holds
+  nothing.** A cloth scrap, a plank or a corpse's debris floating on a lake
+  is a wall voxel with liquid under or beside it and air over it -- the
+  container shape -- so the rule painted the WHOLE level-1/2 cell with every
+  scrap on the water: scattered robe voxels read 2x / 4x their size just past
+  the handoff. A wall holds liquid beside or above it, never under it, so a
+  candidate whose first non-wall voxel straight below (within
+  `FAR_FLOAT_REACH` = 4, `FarEdits::kFloatReach`) is LIQUID is refused, and so
+  is a lone SPECK (next paragraph). Troughs, wells and lake banks stand on
+  walls or ground and are untouched.
+  **A LONE VOXEL IS DRAWN AS ITS SURROUNDINGS (2026-10-11; worldgen.wgsl
+  `farDespeck`, faredits.h `Despeck`; gate `far-contain`'s speck half).** The
+  general half of the same ticket: centre sampling made any lone voxel that
+  sat on a cell centre a whole 2^k cube (8x its volume at level 1, 64x at
+  level 2) -- a scrap on a lake, a blood drop, a flake of ash, an item's last
+  voxel, anywhere. A SPECK is a far-solid voxel whose far slot is not cover
+  (leaf keeps the cover rule's density) and which no voxel of its 3x3x3
+  neighbourhood shares that slot with; any two voxels touching by a face, an
+  edge or a corner are an object, never specks. A speck's cell is drawn as
+  the far slot most of its six face neighbours hold (not-far-solid counts as
+  a slot of its own; ties to the first in +x,-x,+y,-y,+z,-z order): a scrap IN
+  a water surface is water, one ON water or ground is air, an ore fleck is
+  its rock. Anything the producer cannot see counts as support. Applied at
+  EVERY level by every live producer -- `fardown`'s centre, the loose top
+  (centre and top: one drop paints no cell), the container pass, the surface
+  map's claim check -- and by `FarEdits::Sweep` / `ContainedBy` for an
+  evicted chunk's patch (one chunk visible: a speck supported only across a
+  chunk face is a downsample-only answer). The SIEVE does not apply it (26
+  genCellIn per centre); pristine procgen has no lone non-leaf voxels but a
+  stamp's ornament, and a dirty stamp chunk may then lose such an ornament
+  at distance -- the intended direction. `fardown`'s skip signature covers its
+  own voxels only, so a speck whose support changes only across a chunk face
+  keeps its old cell until that chunk next changes.
   `--at x,y,z,yaw,pitch --frames N` reproduces a report's camera into
   `screenshot_at.bmp`; `SANDVOX_AT_FARPROBE=x,y,z[,level]` prints the cascade
   bytes and patch words around a voxel on that frame.

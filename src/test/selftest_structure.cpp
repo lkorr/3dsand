@@ -937,6 +937,38 @@ Status GateFarContain(Ctx& c, std::string& detail) {
 
   // ---- the oracle: per cell, from the live voxels -------------------------
   BoxRead rd{{}, &c.ctx, &c.world};
+  FarEdits& edits = c.stream.Edits();
+  // A container wall, as the rule (and its 2026-10-11 refinements) defines
+  // it: a wall voxel with a liquid and an open face neighbour, NOT floating on
+  // the liquid (the first non-wall voxel below it within kFloatReach is not
+  // liquid) and not a lone speck (FarEdits::Despeck).
+  auto matAtOf = [](BoxRead& r) {
+    return [&r](int x, int y, int z) -> int {
+      const uint32_t w = r.Word({x, y, z});
+      return w == 0xFFFFFFFFu ? FarEdits::kMatAtUnseen : (int)(w & 0xFFFu);
+    };
+  };
+  auto isContainer = [&](BoxRead& r, IVec3 q) {
+    if (kindOf(r.Mat(q)) != kWall) return false;
+    const IVec3 nb[6] = {{q.x + 1, q.y, q.z}, {q.x - 1, q.y, q.z}, {q.x, q.y + 1, q.z},
+                         {q.x, q.y - 1, q.z}, {q.x, q.y, q.z + 1}, {q.x, q.y, q.z - 1}};
+    bool liq = false, open = false;
+    for (const IVec3& n : nb) {
+      const uint8_t k = kindOf(r.Mat(n));
+      liq = liq || k == kLiquid;
+      open = open || k == kOpen;
+    }
+    if (!liq || !open) return false;
+    for (int d = 1; d <= FarEdits::kFloatReach; d++) {
+      const uint8_t k = kindOf(r.Mat({q.x, q.y - d, q.z}));
+      if (k != kWall) {
+        if (k == kLiquid) return false;
+        break;
+      }
+    }
+    const uint32_t m = r.Mat(q);
+    return edits.Despeck(m, q.x, q.y, q.z, matAtOf(r)) == m;
+  };
   struct CellInfo {
     int level;
     IVec3 cc;
@@ -955,17 +987,7 @@ Status GateFarContain(Ctx& c, std::string& detail) {
           for (int z = 0; z < step; z++)
             for (int y = 0; y < step; y++)
               for (int x = 0; x < step; x++) {
-                const IVec3 q{c0.x + x, c0.y + y, c0.z + z};
-                if (kindOf(rd.Mat(q)) != kWall) continue;
-                const IVec3 nb[6] = {{q.x + 1, q.y, q.z}, {q.x - 1, q.y, q.z}, {q.x, q.y + 1, q.z},
-                                     {q.x, q.y - 1, q.z}, {q.x, q.y, q.z + 1}, {q.x, q.y, q.z - 1}};
-                bool liq = false, open = false;
-                for (const IVec3& n : nb) {
-                  const uint8_t k = kindOf(rd.Mat(n));
-                  liq = liq || k == kLiquid;
-                  open = open || k == kOpen;
-                }
-                ci.hasContainer = ci.hasContainer || (liq && open);
+                ci.hasContainer = ci.hasContainer || isContainer(rd, {c0.x + x, c0.y + y, c0.z + z});
               }
           cells.push_back(ci);
         }
@@ -1020,7 +1042,6 @@ Status GateFarContain(Ctx& c, std::string& detail) {
   const std::vector<uint32_t> D = readArm();
   const uint32_t probeD = haveProbe ? FarVoxByte(c.ctx, c.world, 1, probeCell) : 0;
   // ---- P: the CPU patch -----------------------------------------------------
-  FarEdits& edits = c.stream.Edits();
   edits.Clear();
   {
     std::vector<uint32_t> words(kChunkVol);
@@ -1079,11 +1100,89 @@ Status GateFarContain(Ctx& c, std::string& detail) {
         Format("producers disagree: sieve!=downsample %d, patch!=downsample %d of %zu cells; first %s", diffSD,
                diffSP, cells.size(), firstDiff.c_str()));
 
+  // ---- SPECKS ON THE WATER (ticket 2026-10-11_22-09-52) -----------------------
+  // Scattered cloth scraps on a lake read 2x / 4x their size past the LOD
+  // handoff: a scrap floating on water is a wall with liquid under it and air
+  // over it, so the container rule painted its whole level-1/2 cell with it,
+  // and one on a cell centre was that cell by the centre rule. Nine single
+  // cloth voxels, three apart (never neighbours): the outer x columns lying
+  // ON the trough's water, the middle one IN its top layer, on both parities
+  // of level 1 (two of them on a level-1 cell centre); then
+  // the downsample (D2) and the CPU patch (P2). Over every level-1/2 cell of
+  // the box:
+  //   (d) no cell reads cloth unless it holds a cloth voxel that is not a
+  //       lone speck (FarEdits::Despeck on the live voxels) -- in both arms;
+  //   (e) D2 == P2 byte for byte;
+  //   (f) not vacuous: specks survived the ticks in some level-1 and some
+  //       level-2 cell, and at least one sat on a level-1 cell centre.
+  const uint32_t mCloth = MatId(c.mats, "cloth");
+  const uint32_t clothSlot = c.mats[mCloth].farPalSlot;
+  std::vector<CellOp> speckOps;
+  for (int i = 0; i < 3; i++)
+    for (int j = 0; j < 3; j++) {
+      const int x = wlo.x + 1 + 3 * i, z = wlo.z + 1 + 3 * j;
+      if (x > whi.x || z > whi.z) continue;
+      const IVec3 q{x, (i & 1) == 0 ? whi.y + 1 : whi.y, z};
+      speckOps.push_back(CellOp{World::SlotCellIndex(q), mCloth});
+    }
+  for (uint32_t t = 4; t <= 6; t++) {
+    std::vector<CellOp> ops;
+    if (t == 4) ops = speckOps;
+    SubmitTick(c.ctx, c.world, c.sim, t, kDefaultSeed, {}, {}, ops, false, wc, false, false);
+  }
+  c.ctx.WaitIdle();
+  const std::vector<uint32_t> D2 = readArm();
+  edits.Clear();
+  {
+    std::vector<uint32_t> words(kChunkVol);
+    ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex(wc), 1, words.data(), "farContainSpeck");
+    edits.NoteChunk(wc, words.data());
+  }
+  DrainFullRefill(c.ctx, c.world, c.sim, wc);
+  const std::vector<uint32_t> P2 = readArm();
+  edits.Clear();
+  BoxRead rd2{{}, &c.ctx, &c.world};
+  int speckCells[3] = {0, 0, 0}, speckCentres = 0, inflated = 0, diffDP = 0, clothVox = 0;
+  std::string firstInfl, firstDP;
+  for (size_t i = 0; i < cells.size(); i++) {
+    const CellInfo& ci = cells[i];
+    const int shift = (int)(ci.level + kFarShiftBase), step = 1 << shift;
+    const IVec3 c0{ci.cc.x << shift, ci.cc.y << shift, ci.cc.z << shift};
+    bool real = false, speck = false;
+    for (int z = 0; z < step; z++)
+      for (int y = 0; y < step; y++)
+        for (int x = 0; x < step; x++) {
+          const IVec3 q{c0.x + x, c0.y + y, c0.z + z};
+          if (rd2.Mat(q) != mCloth) continue;
+          if (ci.level == 1) clothVox++;
+          const bool sp = edits.Despeck(mCloth, q.x, q.y, q.z, matAtOf(rd2)) != mCloth;
+          speck = speck || sp;
+          real = real || !sp;
+          if (sp && ci.level == 1 && x == step / 2 && y == step / 2 && z == step / 2) speckCentres++;
+        }
+    if (speck) speckCells[ci.level]++;
+    const auto where = [&]() {
+      return Format("L%d cell (%d,%d,%d): D %02x P %02x", ci.level, ci.cc.x, ci.cc.y, ci.cc.z, D2[i], P2[i]);
+    };
+    if (!real && ((D2[i] & 0xFFu) == clothSlot || (P2[i] & 0xFFu) == clothSlot) && inflated++ == 0)
+      firstInfl = where();
+    if (D2[i] != P2[i] && diffDP++ == 0) firstDP = where();
+  }
+  check(speckCells[1] > 0 && speckCells[2] > 0 && speckCentres > 0,
+        Format("vacuous specks: %d cloth voxels left, speck cells L1 %d L2 %d, %d on a level-1 centre", clothVox,
+               speckCells[1], speckCells[2], speckCentres));
+  check(inflated == 0, Format("%d cells drawn as cloth from lone specks; first %s", inflated, firstInfl.c_str()));
+  check(diffDP == 0, Format("speck arms disagree: downsample!=patch %d of %zu; first %s", diffDP, cells.size(),
+                            firstDP.c_str()));
+
   Restore(c, savedOrigin);
   detail = Format("trough chunk (%d,%d,%d): container cells L1 %d (%d off-centre) L2 %d (%d off-centre), "
-                  "%d walls lost | %d pool cells, %d lost | S/D/P disagree %d/%d of %zu | probe %02x->%02x/%02x",
+                  "%d walls lost | %d pool cells, %d lost | S/D/P disagree %d/%d of %zu | probe %02x->%02x/%02x"
+                  " | specks: %d cloth voxels, speck cells L1 %d L2 %d (%d on an L1 centre), %d inflated, "
+                  "D2/P2 disagree %d",
                   wc.x, wc.y, wc.z, contain[1], fired[1], contain[2], fired[2], wallBad, pools, poolBad, diffSD,
-                  diffSP, cells.size(), probeS, probeD, probeP);
+                  diffSP, cells.size(), probeS, probeD, probeP, clothVox, speckCells[1], speckCells[2],
+                  speckCentres, inflated, diffDP);
   for (const std::string& w : why) detail += " | FAIL: " + w;
   std::printf("far-contain: %s (%s)\n", why.empty() ? "PASS" : "FAIL", detail.c_str());
   return why.empty() ? Status::Pass : Status::Fail;
@@ -1290,6 +1389,9 @@ Status GateFarCover(Ctx& c, std::string& detail) {
   // bare SubmitTick is what puts the chunk through `fardown`. The op is the
   // proof it ran: a leaf at a level-1 cell centre becomes glass (solid for
   // solid, so no island breaks off), and that cell must then read glass.
+  // TWO voxels of glass, the centre and the one under it in the same cell: a
+  // lone glass voxel is a SPECK (worldgen.wgsl farDespeck) and is drawn as
+  // the leaf around it, which is that rule working, not the arm failing.
   IVec3 probe{-1, -1, -1};
   for (int z = 0; z < 8 && probe.x < 0; z++)
     for (int y = 0; y < 8 && probe.x < 0; y++)
@@ -1301,7 +1403,10 @@ Status GateFarCover(Ctx& c, std::string& detail) {
                        wc.z * 16 + 2 * probe.z + 1};
   for (uint32_t t = 1; t <= 3; t++) {
     std::vector<CellOp> ops;
-    if (t == 1 && haveProbe) ops.push_back(CellOp{World::SlotCellIndex(probeVox), kMatGlass});
+    if (t == 1 && haveProbe) {
+      ops.push_back(CellOp{World::SlotCellIndex(probeVox), kMatGlass});
+      ops.push_back(CellOp{World::SlotCellIndex({probeVox.x, probeVox.y - 1, probeVox.z}), kMatGlass});
+    }
     SubmitTick(c.ctx, c.world, c.sim, t, kDefaultSeed, {}, {}, ops, false, wc, false, false);
   }
   c.ctx.WaitIdle();
