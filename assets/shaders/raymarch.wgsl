@@ -8775,9 +8775,41 @@ fn rippleWaves() -> array<Ripple, RIPPLE_BANDS> {
 // vectors to be functions of position, which is a different field.
 //
 // `flowMS` is the current at this point in METRES per second. The wave phase
-// is evaluated at `position - current*t`, so the pattern drifts and stretches
-// downstream — which is what makes a flowing surface look like it is going
-// somewhere rather than like a texture scrolling over still water.
+// is evaluated at `position - current*age`, so the pattern drifts downstream —
+// which is what makes a flowing surface look like it is going somewhere rather
+// than like a texture scrolling over still water.
+//
+// TWO-PHASE FLOW ADVECTION (ticket 2026-10-11_18-39-38, "strobing in the water
+// while moving in it every second or so"). The advection used to be
+// `position - current * R.time`, with R.time the seconds since launch. That
+// product is unbounded, so the surface became a function of the current's
+// EXACT value times a number in the thousands:
+//   * any change in the current is a change in phase of (change * R.time)
+//     metres. The stream arm is rewritten on every window move (a chunk of
+//     travel, about once a second swimming), and each rewrite ramped the
+//     river under the player from 0 back to full over six ticks: a 1 m/s
+//     river 800 s into a session swept its waves through 800 m of phase in a
+//     fifth of a second. That was the strobe. (The ramp is gone too, see
+//     CurrentPrimEnvelope; this is the half that makes the surface robust to
+//     whatever the field does next.)
+//   * any SPATIAL change in the current — two reaches flowing at different
+//     speeds, the slab's edge fade — shears the phase by (gradient * R.time),
+//     so a river's waves compressed without bound the longer the game ran and
+//     ended as per-pixel sparkle.
+// The standard cure (the flow-map technique): two copies of the field, each
+// advected by `current * age` with an age that runs 0..WAVE_FLOW_CYCLE_S and
+// restarts, half a cycle apart, each weighted to zero at its own restart. The
+// displacement is now bounded by current * cycle, so a change in the current
+// moves the surface by at most that much and the shear stops growing. The two
+// slopes are blended variance-preserving (divided by the weights' L2 norm), so
+// the chop does not flatten at the half-way point of the crossfade. Still
+// water (|current| ~ 0, every pond and lake) takes ONE evaluation, exactly as
+// before.
+const WAVE_FLOW_CYCLE_S : f32 = 4.0;
+// The second copy's sample offset, metres: not a multiple of any band's
+// wavelength, so the two copies are different patterns and the crossfade does
+// not just fade one pattern into itself shifted.
+const WAVE_FLOW_LAYER_SHIFT : vec2f = vec2f(3.71, -2.29);
 fn waveSlope(pWorldM : vec2f, t : f32, footM : f32, depthM : f32,
              flowMS : vec2f) -> vec2f {
   // Shore fade. A sum of sinusoids cannot reflect off a bank, and shallow
@@ -8785,8 +8817,34 @@ fn waveSlope(pWorldM : vec2f, t : f32, footM : f32, depthM : f32,
   // one. Without it the waves march straight through the shoreline.
   let shore = smoothstep(0.0, max(TUNE_WAVE_SHORE_DEPTH, 1e-3), depthM);
   if (shore <= 0.0) { return vec2f(0.0); }
-  // Advected sample point — component 8 feeding component 9, and ~free.
-  let pAdv = pWorldM - flowMS * (t * TUNE_WAVE_FLOW_SCALE);
+  // Advected sample point — component 8 feeding component 9.
+  let v = flowMS * TUNE_WAVE_FLOW_SCALE;
+  var slope : vec2f;
+  if (dot(v, v) < 1e-8) {
+    slope = waveBands(pWorldM, t, footM, depthM, shore);
+  } else {
+    let tau = t / WAVE_FLOW_CYCLE_S;
+    let f0 = fract(tau);
+    let f1 = fract(tau + 0.5);
+    let w0 = 1.0 - abs(2.0 * f0 - 1.0);   // 0 at copy 0's restart
+    let w1 = 1.0 - w0;                    // 0 at copy 1's (half a cycle on)
+    let s0 = waveBands(pWorldM - v * (f0 * WAVE_FLOW_CYCLE_S), t, footM, depthM, shore);
+    let s1 = waveBands(pWorldM + WAVE_FLOW_LAYER_SHIFT - v * (f1 * WAVE_FLOW_CYCLE_S),
+                       t, footM, depthM, shore);
+    slope = (s0 * w0 + s1 * w1) * inverseSqrt(w0 * w0 + w1 * w1);
+  }
+  // ---- impact ripples ----
+  // A ripple is the memory of an event, so this is the one part of the field
+  // that reads state — a BOUNDED ring, evaluated as a pure function of
+  // (eventList, t). See kWaveImpactCap and the note over WaveImpactRing.
+  // Not advected, and outside the blend (it is one field, not two copies).
+  if (R.waveImpactCount > 0u) { slope += waveImpactSlope(pWorldM, t, shore); }
+  return slope;
+}
+
+// The Gerstner band sum at an (already advected) point. `shore` is
+// waveSlope's shore fade, > 0.
+fn waveBands(pAdv : vec2f, t : f32, footM : f32, depthM : f32, shore : f32) -> vec2f {
   var num = vec2f(0.0);   // d(height)/d(position), the plain sinusoid part
   var sharp = 0.0;        // the Gerstner denominator: 1 - sum(Q*k*A*sin)
   var slope = vec2f(0.0);
@@ -8844,11 +8902,6 @@ fn waveSlope(pWorldM : vec2f, t : f32, footM : f32, depthM : f32,
   // Clamped well away from zero: a steepness knob turned past the point where
   // the wave would fold over on itself must saturate, not divide by nothing.
   slope = num / max(1.0 - sharp, 0.35);
-  // ---- impact ripples ----
-  // A ripple is the memory of an event, so this is the one part of the field
-  // that reads state — a BOUNDED ring, evaluated as a pure function of
-  // (eventList, t). See kWaveImpactCap and the note over WaveImpactRing.
-  if (R.waveImpactCount > 0u) { slope += waveImpactSlope(pWorldM, t, shore); }
   return slope;
 }
 
@@ -11286,8 +11339,22 @@ const OIL_SLOSH_WARP : f32 = 10.0;
 fn filmIridescence(p : vec3f, cosI : f32, slope : vec2f) -> vec3f {
   let pm = p * VOXEL_METERS;
   let flowMS = currentAt(p, &R).xz * VOXEL_METERS;
-  let q = vec2f(pm.x, pm.z) - flowMS * (R.time * TUNE_WAVE_FLOW_SCALE) +
-          slope * OIL_SLOSH_WARP;
+  // The drift is the waves' bounded two-phase advection (waveSlope's note,
+  // WAVE_FLOW_CYCLE_S), not current * R.time: the unbounded product strobed
+  // the film on every change of the current exactly as it strobed the waves.
+  let v = flowMS * TUNE_WAVE_FLOW_SCALE;
+  let q0 = vec2f(pm.x, pm.z) + slope * OIL_SLOSH_WARP;
+  if (dot(v, v) < 1e-8) { return filmBands(q0, cosI); }
+  let tau = R.time / WAVE_FLOW_CYCLE_S;
+  let f0 = fract(tau);
+  let f1 = fract(tau + 0.5);
+  let w0 = 1.0 - abs(2.0 * f0 - 1.0);
+  return mix(filmBands(q0 + WAVE_FLOW_LAYER_SHIFT - v * (f1 * WAVE_FLOW_CYCLE_S), cosI),
+             filmBands(q0 - v * (f0 * WAVE_FLOW_CYCLE_S), cosI), w0);
+}
+
+// The interference colour of the film at an (already drifted) point.
+fn filmBands(q : vec2f, cosI : f32) -> vec3f {
   // Two octaves at different rates so the bands drift and stretch rather than
   // sliding rigidly, which is what reads as liquid rather than as a scrolling
   // texture.

@@ -89,7 +89,15 @@ int32_t CurrentPrimEnvelope(const CurrentPrim& p, uint32_t tick) {
   // and make a drain's whirlpool permanently one sixth of its strength.
   int32_t env = 1024;
   const uint32_t age = tick - p.spawnTick;
-  if (kCurrentPrimAttack > 0 && age < kCurrentPrimAttack)
+  // A STREAM HAS NO ATTACK (ticket 2026-10-11_18-39-38). The ramp exists so an
+  // EVENT's swirl does not switch on between two frames. A stream is terrain:
+  // it was flowing before the stream arm wrote it down, and the arm rewrites
+  // the whole list on EVERY window move (one chunk of travel, about once a
+  // second when swimming), so an attack here dropped the river under the
+  // player to zero and ramped it back for six ticks per move. The wave phase
+  // is advected by this field, so each of those ramps strobed the surface.
+  if (kCurrentPrimAttack > 0 && age < kCurrentPrimAttack &&
+      p.kind != kCurrentPrimStream)
     env = (int32_t)((age * 1024) / kCurrentPrimAttack);
   // RELEASE, from seenTick. This is the plan's "Gamma must decay when flow
   // stops": while the seeder keeps asserting the primitive, `since` is 0 and
@@ -245,7 +253,10 @@ void CurrentPrimSystem::Tick(uint32_t tick) {
 // A +-1 difference — the actual trap — would give it 2.0.
 void CurrentPrimSystem::SeedStreams(const World& world, uint32_t seed,
                                     uint32_t tick) {
-  const IVec3 origin = world.WindowOrigin();
+  SeedStreamsAt(world.WindowOrigin(), seed, tick);
+}
+
+void CurrentPrimSystem::SeedStreamsAt(IVec3 origin, uint32_t seed, uint32_t tick) {
   // Scheduled by the WINDOW, not by convenience: the answer is a pure function
   // of (seed, window, tuning) and cannot change between window moves, so
   // re-probing it every tick would be ~1,600 terrain hashes a tick for a
@@ -296,8 +307,17 @@ void CurrentPrimSystem::SeedStreams(const World& world, uint32_t seed,
   if (std::getenv("SANDVOX_CURRENT_TRACE"))
     std::fprintf(stderr, "current: tick %u window base (%d,%d) rivers in map %zu -> %d river prims\n",
                  tick, base, baseZ, worldmap::CurrentWorldMap().rivers.size(), emitted);
-  for (int oz = kStreamProbeStride / 2; oz < span; oz += kStreamProbeStride) {
-    for (int ox = kStreamProbeStride / 2; ox < span; ox += kStreamProbeStride) {
+  // THE LATTICE IS WORLD-ALIGNED: probes sit on x, z == stride/2 (mod stride)
+  // in WORLD cells. It used to start at the window's own corner, which moves a
+  // chunk at a time, so every window move put every probe 16 cells somewhere
+  // else and the field under the player changed with it. World-aligned, a
+  // probe that is still in the window after the move is the same primitive.
+  auto firstProbe = [](int b) {
+    const int s = kStreamProbeStride;
+    return (((s / 2 - b) % s) + s) % s;
+  };
+  for (int oz = firstProbe(baseZ); oz < span; oz += kStreamProbeStride) {
+    for (int ox = firstProbe(base); ox < span; ox += kStreamProbeStride) {
       if (emitted >= kStreamMaxPrims) return;
       const int x = base + ox, z = baseZ + oz;
       const World::Column c = World::TerrainColumn(x, z, seed);

@@ -76,6 +76,8 @@ constexpr uint32_t kCurrentPrimForever = 0xFFFFFFFFu;
 // Ticks a primitive fades IN over. Short, because a drain's swirl genuinely
 // spins up fast once the water starts moving; the fade exists so a seeded
 // vortex does not switch a 5 m/s tangential field on between two frames.
+// STREAMS SKIP IT (CurrentPrimEnvelope): they are terrain, re-written on every
+// window move, and a ramp there zeroed the river under the player once a chunk.
 constexpr uint32_t kCurrentPrimAttack = 6;
 
 // ---- the stream arm's probe schedule --------------------------------------
@@ -178,7 +180,8 @@ float CurrentGammaToCoreMs(float gammaM2s, int radiusCells);
 void CurrentPrimBounds(const CurrentPrim& p, IVec3& lo, IVec3& hi);
 
 // The envelope, Q10 (1024 = full strength): attack over kCurrentPrimAttack
-// ticks, then a linear release over `decayTicks` measured from `seenTick`.
+// ticks (not for a stream), then a linear release over `decayTicks` measured
+// from `seenTick`.
 int32_t CurrentPrimEnvelope(const CurrentPrim& p, uint32_t tick);
 
 // Resolve one primitive to its GPU form at `tick`. Exposed for the selftest.
@@ -233,6 +236,9 @@ class CurrentPrimSystem {
   // of (seed, window, tuning) and re-probing it every tick would be ~1,600
   // terrain hashes a tick for an answer that cannot have changed.
   void SeedStreams(const World& world, uint32_t seed, uint32_t tick);
+  // The same, for a window at `origin` (chunks) -- all SeedStreams reads off
+  // the World. Lets a gate move the window without a World to move.
+  void SeedStreamsAt(IVec3 origin, uint32_t seed, uint32_t tick);
   // The stream arm's MAP-RIVER half: map.json rivers[] along their baked
   // centrelines, downstream, nearest the window centre first. Called by
   // SeedStreams before its lattice; returns how many it emitted, which the
