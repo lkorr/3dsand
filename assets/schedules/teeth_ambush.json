@@ -1,0 +1,6 @@
+{
+  "about": "Verdant Teeth sea caves: the dead man waiting on the far side of the rock bridge (dungeon teeth_caves).",
+  "rows": [
+    {"from": "00:00", "to": "24:00", "do": "ambush", "at": "ambush_bridge", "radius": 6}
+  ]
+}

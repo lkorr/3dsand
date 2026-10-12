@@ -177,6 +177,7 @@ function caveRoom(b, P, key) {
   const D = b.m(1.5);
   const main = b.room('ellipsoid', {min: [-hw, -D, z0], max: [hw, H + C, z1]});
   const n = P.clusters || 0;
+  const ells = [{min: [-hw, -D, z0], max: [hw, H + C, z1]}];
   for (let i = 0; i < n; i++) {
     const rx = Math.round(hw * (0.35 + 0.4 * b.r(key, 'cl', i, 'rx')));
     const rz = Math.round((L / 2) * (0.3 + 0.4 * b.r(key, 'cl', i, 'rz')));
@@ -184,7 +185,22 @@ function caveRoom(b, P, key) {
     const x = Math.round((b.r(key, 'cl', i, 'x') * 2 - 1) * (hw - rx * 0.5));
     const z = zc + Math.round((b.r(key, 'cl', i, 'z') * 2 - 1) * (L / 2 - rz * 0.5));
     b.room('ellipsoid', {min: [x - rx, -D, z - rz], max: [x + rx, -D + 2 * ry, z + rz]});
+    ells.push({min: [x - rx, -D, z - rz], max: [x + rx, -D + 2 * ry, z + rz]});
   }
+  /** The highest carved roof over column (x, z) among the room's ellipsoids
+   *  (un-noised), or null where none covers it: what a hanging feature roots in. */
+  const ceilAt = (x, z) => {
+    let best = null;
+    for (const e of ells) {
+      const cx = (e.min[0] + e.max[0]) / 2, cz = (e.min[2] + e.max[2]) / 2, cy = (e.min[1] + e.max[1]) / 2;
+      const ax = (e.max[0] - e.min[0]) / 2, az = (e.max[2] - e.min[2]) / 2, ay = (e.max[1] - e.min[1]) / 2;
+      const q = 1 - ((x - cx) / ax) ** 2 - ((z - cz) / az) ** 2;
+      if (q <= 0) continue;
+      const y = cy + ay * Math.sqrt(q);
+      if (best === null || y > best) best = y;
+    }
+    return best;
+  };
   // Floor: fill the bowl up to a flat floor (flatten 1) or part way.
   const fy = -Math.round(D * (1 - (P.flatten === undefined ? 0.8 : P.flatten)));
   b.fill('box', {min: [-hw - 4, -D - 4, z0], max: [hw + 4, fy, z1]}, {mat: 'floor', noise: 'floor', layer: 2, mask: 'air'});
@@ -198,7 +214,52 @@ function caveRoom(b, P, key) {
     const m = margin || 0;
     return [Math.round(u * sc * Math.max(1, k * hw - m)), fy, zc + Math.round(v * sc * Math.max(1, (k * L) / 2 - m))];
   };
-  return {W, L, H, C, hw, mR, A, z0, z1, zc, D, fy, main, k, floorAt};
+  return {W, L, H, C, hw, mR, A, z0, z1, zc, D, fy, main, k, floorAt, ceilAt};
+}
+
+/** FANGS: the big speleothems a scatter rule cannot make (a scatter spike is
+ *  at most 3.2 m). Tapered tubes of the support material: stalactites rooted
+ *  in the roof (the root is pushed past the carve's noise so it is never a
+ *  floating island), stalagmites grown from the floor, and the odd pair that
+ *  has met in the middle as a waisted column. Every fang is keyed by its index,
+ *  so raising the count adds fangs and moves none. */
+const ROWS_FANGS = [
+  {sec: 'Fangs', note: 'Big tapered stalactites and stalagmites (prims, not scatter): the cave\'s teeth. Use them sparingly in big rooms; each one is a prim.'},
+  {k: 'fangs', n: 'fangs', min: 0, max: 16, step: 1, int: true, def: 0, d: 'How many big speleothems.'},
+  {k: 'fangLength', n: 'fang length (m)', min: 1, max: 20, step: 0.1, def: 5, d: 'Longest fang (each is 40-100% of it, and never more than the room allows).'},
+  {k: 'fangGirth', n: 'fang girth (m)', min: 0.2, max: 3, step: 0.05, def: 0.8, d: 'Root radius of the biggest fang.'},
+  {k: 'fangUp', n: 'from the floor', min: 0, max: 1, step: 0.05, def: 0.35, d: 'Share of the fangs that grow up from the floor (the rest hang).'},
+  {k: 'fangJoin', n: 'joined columns', min: 0, max: 1, step: 0.05, def: 0.15, d: 'Share of the fangs that are a stalactite met by its stalagmite (a waisted column).'}
+];
+function fangs(b, P, f) {
+  if (!P.fangs) return;
+  const amp = (b.wallNoise() || {amp: 0}).amp;
+  const Lmax = b.m(P.fangLength, 10), G = Math.max(3, b.m(P.fangGirth));
+  for (let i = 0; i < P.fangs; i++) {
+    const g = Math.max(3, Math.round(G * (0.5 + 0.5 * b.r('fang', i, 'g'))));
+    const [x, , z] = f.floorAt(...disc(b, 'fang', i), g + 6);
+    if (Math.abs(x) < f.mR + g + 6) continue;                      // keep the way through clear
+    const roof = f.ceilAt(x, z);
+    if (roof === null) continue;
+    const span = Math.round(roof - f.fy);
+    if (span < 12) continue;
+    const len = Math.min(Math.round(Lmax * (0.4 + 0.6 * b.r('fang', i, 'len'))), Math.round(span * 0.8));
+    const u = b.r('fang', i, 'kind');
+    const lean = () => [b.jit(Math.round(g * 0.8), 'fang', i, 'lx'), b.jit(Math.round(g * 0.8), 'fang', i, 'lz')];
+    const [lx, lz] = lean();
+    const root = Math.round(roof + amp * 2 + 6);                    // buried past the roof's noise
+    if (u < P.fangJoin) {
+      // A column: wide root above, wide foot below, waisted where they met.
+      const mid = Math.round(f.fy + span * (0.35 + 0.3 * b.r('fang', i, 'mid')));
+      b.fill('spline_tube', {pts: [[x, root, z], [x + lx, mid, z + lz], [x, f.fy - 4, z]], radii: [g + 2, Math.max(2, Math.round(g * 0.4)), g + 3]}, {mat: 'support', layer: 2, noise: 0.25, tag: 'fang'});
+    } else if (u < P.fangJoin + P.fangUp) {
+      const top = f.fy + Math.min(len, Math.round(span * 0.6));
+      b.fill('spline_tube', {pts: [[x, f.fy - 4, z], [x + Math.round(lx / 2), Math.round((f.fy + top) / 2), z + Math.round(lz / 2)], [x + lx, top, z + lz]], radii: [g + 2, Math.max(2, Math.round(g * 0.55)), 1]}, {mat: 'support', layer: 2, noise: 0.2, tag: 'fang'});
+    } else {
+      const tip = Math.round(roof - len);
+      b.fill('spline_tube', {pts: [[x, root, z], [x + Math.round(lx / 2), Math.round((roof + tip) / 2), z + Math.round(lz / 2)], [x + lx, tip, z + lz]], radii: [g, Math.max(2, Math.round(g * 0.5)), 1]}, {mat: 'support', layer: 2, noise: 0.2, tag: 'fang'});
+    }
+  }
 }
 /** A seeded point in the unit disc (keyed). */
 function disc(b, ...key) {
@@ -248,17 +309,19 @@ const CAVERN = {
     {k: 'mushrooms', n: 'mushroom patches', min: 0, max: 10, step: 1, int: true, def: 2, d: 'Glowing mushroom patches (props; glowcaps are lights).'},
     {k: 'pool', n: 'pool', min: 0, max: 1, step: 0.05, def: 0.25, d: 'Size of a still pool in a floor dip (0 = none).'},
     {k: 'boulders', n: 'breakdown blocks', min: 0, max: 10, step: 1, int: true, def: 2, d: 'Fallen roof blocks on the floor.'}
-  ]),
+  ], ROWS_FANGS),
   PRESETS: {
     chamber: {params: {}},
     great_dome: {params: {width: 36, length: 40, height: 10, ceiling: 16, clusters: 5, columns: 4, stalactites: 0.5, flowstone: 0.6, lightCount: 6, exits: 3}},
     crystal_geode: {params: {width: 12, length: 14, height: 5, ceiling: 6, clusters: 1, crystals: 1, lightType: 'crystal', lightCount: 6, flowstone: 0, pool: 0}},
     fungal_grotto: {params: {mushrooms: 8, moisture: 0.8, pool: 0.4, lightType: 'fungus', lightCount: 5, stalagmites: 0.05}},
-    breakdown_hall: {params: {width: 24, length: 30, boulders: 10, decay: 0.9, flatten: 0.4, columns: 0, ceiling: 7}}
+    breakdown_hall: {params: {width: 24, length: 30, boulders: 10, decay: 0.9, flatten: 0.4, columns: 0, ceiling: 7}},
+    fanged_hall: {params: {width: 34, length: 40, height: 9, ceiling: 14, clusters: 4, columns: 1, stalactites: 0.6, stalLength: 2.4, flowstone: 0.5, fangs: 10, fangLength: 9, fangGirth: 1.4, lightCount: 5, exits: 3}}
   },
   build(b, P) {
     const f = caveRoom(b, P, 'cav');
     formations(b, P, f.main);
+    fangs(b, P, f);
     for (let i = 0; i < P.columns; i++) {
       const r = b.ri(b.m(0.4), b.m(1.2), 'col', i, 'r');
       const [x, , z] = f.floorAt(...disc(b, 'col', i), r * 2);
@@ -307,7 +370,7 @@ const GROTTO = {
     {k: 'beach', n: 'beach', min: 0, max: 1, step: 0.05, def: 0.4, d: 'Sand on the shore (the beach slot).'},
     {k: 'island', n: 'island', kind: 'bool', def: false, d: 'A rock island in the middle.'},
     {k: 'glow', n: 'glow fungus', min: 0, max: 1, step: 0.05, def: 0.5, d: 'Glowing fungus scatter on the walls.'}
-  ]),
+  ], ROWS_FANGS),
   PRESETS: {
     still_pool: {params: {}},
     underground_lake: {params: {width: 30, length: 36, height: 6, ceiling: 8, poolSize: 0.9, poolDepth: 5, glow: 0.3, exits: 2, beach: 0.1}},
@@ -317,6 +380,7 @@ const GROTTO = {
   build(b, P) {
     const f = caveRoom(b, P, 'grot');
     formations(b, P, f.main);
+    fangs(b, P, f);
     const pr = Math.round(Math.min(f.hw, f.L / 2) * P.poolSize), pd = b.m(P.poolDepth, 3);
     const pz = f.zc + Math.round(f.L * 0.1);
     const lvl = Math.min(f.fy - 1, f.fy - pd + Math.max(1, Math.round(P.waterLevel * pd)));
@@ -424,37 +488,63 @@ const SHAFT = {
     {k: 'ledgeWidth', n: 'ledge width (m)', min: 0.3, max: 3, step: 0.1, def: 0.8, d: ''},
     {k: 'rope', n: 'rope ladder', kind: 'bool', def: true, d: 'A rope ladder down from the lip (climbable in the nav graph; without one the drop is one-way).'},
     {k: 'surfaceTop', n: 'opens at the surface', kind: 'bool', def: false, d: 'A pothole: the top is at grade (an entrance piece).'},
-    {k: 'footPool', n: 'plunge pool (m)', min: 0, max: 4, step: 0.1, def: 0, d: 'Water at the bottom.'}
+    {k: 'footPool', n: 'plunge pool (m)', min: 0, max: 4, step: 0.1, def: 0, d: 'Water at the bottom.'},
+    {sec: 'Entry', note: 'top = the shaft is entered from above (a vertical socket: a pothole, or a floor opening). side = a PITCH: a short passage at floor level ends at a lip and the floor drops away -- the origin socket is horizontal, so the shaft hangs off any passage or room exit.'},
+    {k: 'entry', n: 'entry', kind: 'enum', options: ['top', 'side'], def: 'top', d: 'Where the shaft is entered (see the note).'},
+    {k: 'lipLength', n: 'lip passage (m)', min: 0.5, max: 12, step: 0.1, def: 3, d: 'side: length of the approach passage before the drop.'},
+    {k: 'lipWidth', n: 'lip passage width (m)', min: 1.2, max: 8, step: 0.1, def: 3, d: 'side: width (and height) of the approach passage: the origin socket\'s size.'},
+    {k: 'lipBrow', n: 'brow over the drop (m)', min: 0, max: 8, step: 0.1, def: 1.5, d: 'side: how far the roof of the shaft head rises above the lip (a dome over the drop).'}
   ],
   PRESETS: {
     pitch: {params: {}},
     deep_pothole: {params: {length: 40, width: 5, wander: 3, ledges: 5, surfaceTop: true, lightCount: 0}},
     narrow_drop: {params: {width: 1.6, length: 8, ledges: 0, rope: false}},
-    plunge: {params: {length: 20, footPool: 2.5, moisture: 0.9, ledges: 3, width: 4}}
+    plunge: {params: {length: 20, footPool: 2.5, moisture: 0.9, ledges: 3, width: 4}},
+    lip_pitch: {params: {entry: 'side', length: 18, width: 4, wander: 1.5, ledges: 3, lipLength: 4, lipWidth: 2.8, lipBrow: 2.5}}
   },
   build(b, P) {
     const R = Math.round(b.m(P.width, 6) / 2), D = b.m(P.length, 10), Hf = b.m(P.height, 10), wand = b.m(P.wander);
-    b.surface = P.surfaceTop;
+    const side = P.entry === 'side';
+    b.surface = P.surfaceTop && !side;
+    // side entry: the whole shaft moves +Z past an approach passage (oz); a top
+    // entry is the original piece, bit for bit (oz = 0, no extra prims).
+    const Lp = side ? b.m(P.lipLength, 4) : 0, Wp = side ? b.m(P.lipWidth, 12) : 0;
+    const oz = side ? Lp + R : 0;
+    const Z = (p) => [p[0], p[1], p[2] + oz];
     const n = Math.max(3, Math.round(D / b.m(3)) + 1);
     const pts = [], radii = [];
     for (let i = 0; i < n; i++) {
       const t = i / (n - 1);
       const env = Math.sin(Math.PI * t);
-      pts.push([Math.round(wand * env * (b.r('sw', i, 'x') * 2 - 1)), Math.round(-D * t), Math.round(wand * env * (b.r('sw', i, 'z') * 2 - 1))]);
+      pts.push([Math.round(wand * env * (b.r('sw', i, 'x') * 2 - 1)), Math.round(-D * t), Math.round(wand * env * (b.r('sw', i, 'z') * 2 - 1)) + oz]);
       radii.push(i === 0 ? R : Math.round(R * (0.85 + 0.3 * b.r('sw', i, 'r'))));
     }
+    if (side) {
+      // The head: the first point lifts by the brow so the roof domes over the
+      // drop (a round tube's top at y = 0 would leave a lip of rock at head height).
+      const brow = b.m(P.lipBrow);
+      pts.unshift([0, Math.max(brow, Math.round(Wp / 2)), oz]);
+      radii.unshift(R);
+    }
     const shaft = b.room('spline_tube', {pts, radii});
+    if (side) {
+      // The approach: a rough passage, floor at y = 0, from the socket to the lip.
+      const hw = Math.round(Wp / 2);
+      b.room('rbox', {min: [-hw, 0, -2], max: [hw, Wp, Lp + Math.round(R / 2)], r: Math.round(Wp / 3)}, {blend: Math.max(P.blend, 6)});
+      b.floor(-hw - 2, -2, hw + 2, Lp, 0);
+    }
     // The foot chamber and its side exit.
-    const fc = b.room('ellipsoid', {min: [-R - 6, -D - b.m(0.5), -R - 6], max: [R + 6, -D + Hf, R + 6 + b.m(2)]});
-    b.fill('box', {min: [-R - 10, -D - b.m(1), -R - 10], max: [R + 10, -D, R + 10 + b.m(4)]}, {mat: 'floor', layer: 2, noise: 'floor', mask: 'air'});
+    const fc = b.room('ellipsoid', {min: Z([-R - 6, -D - b.m(0.5), -R - 6]), max: Z([R + 6, -D + Hf, R + 6 + b.m(2)])});
+    b.fill('box', {min: Z([-R - 10, -D - b.m(1), -R - 10]), max: Z([R + 10, -D, R + 10 + b.m(4)])}, {mat: 'floor', layer: 2, noise: 'floor', mask: 'air'});
     const Rx = Math.max(Math.round(b.m(1.4)), Math.min(R, b.m(1.5)));
-    b.carve('capsule', {a: [0, -D + Rx, R], b: [0, -D + Rx, R + 6 + b.m(3)], r: Rx}, {tag: 'door', blend: Math.max(P.blend, 4)});
+    b.carve('capsule', {a: Z([0, -D + Rx, R]), b: Z([0, -D + Rx, R + 6 + b.m(3)]), r: Rx}, {tag: 'door', blend: Math.max(P.blend, 4)});
     if (P.footPool > 0) {
       const pd = b.m(P.footPool);
-      b.carve('ellipsoid', {min: [-R, -D - pd, -R], max: [R, -D + 2, R]}, {layer: 3, noise: 0.3, tag: 'room', liquid: 'liquid', level: -D - 2});
+      b.carve('ellipsoid', {min: Z([-R, -D - pd, -R]), max: Z([R, -D + 2, R])}, {layer: 3, noise: 0.3, tag: 'room', liquid: 'liquid', level: -D - 2});
     }
+    const p0 = side ? 1 : 0;           // pts index of the lip (side: pts[0] is the brow)
     for (let k = 0; k < P.ledges; k++) {
-      const i = 1 + Math.floor(b.r('ledge', k) * (n - 2));
+      const i = p0 + 1 + Math.floor(b.r('ledge', k) * (n - 2));
       const p = pts[i], r = radii[i], lw = b.m(P.ledgeWidth, 3);
       const dir = b.ri(0, 3, 'ledge', k, 'dir');
       const [dx, dz] = [[1, 0], [-1, 0], [0, 1], [0, -1]][dir];
@@ -462,15 +552,22 @@ const SHAFT = {
       b.fill('ellipsoid', {min: [cx - lw - (dz ? b.m(1) : 0), p[1] - 4, cz - lw - (dx ? b.m(1) : 0)], max: [cx + lw + (dz ? b.m(1) : 0), p[1], cz + lw + (dx ? b.m(1) : 0)]}, {mat: 'wall', layer: 2, noise: 0.4});
     }
     formations(b, Object.assign({}, P, {stalactites: 0, stalagmites: 0.3, stalLength: 0.8}), fc);
-    if (P.rope) b.ladder('caves/rope_ladder', P.length, [pts[0][0], -D, pts[0][2] - R + 2], 0);
-    if (P.surfaceTop) b.carve('ellipsoid', {min: [-R * 2, -R, -R * 2], max: [R * 2, R * 2, R * 2]}, {layer: 1, noise: 1.2, blend: 8, tag: 'apron'});
-    b.lightSpot([0, -D, R + 4], 'floor', '+y');
-    b.lightSpot([R - 2, Math.round(-D / 2), 0], 'wall', '-x');
-    b.way('top', [0, 0, 0], ['socket:top', 'foot'], {climb: true, ladder: P.rope});
-    b.way('foot', [0, -D, 0], ['top', 'exit'], {climb: true, ladder: P.rope});
-    b.way('exit', [0, -D, R + 6 + b.m(2)], ['foot', 'socket:foot']);
-    b.socket('top', [0, 0, 0], '+y', 2 * R, 2 * R, 'shaft', P.surfaceTop ? ['surface'] : []);
-    b.socket('foot', [0, -D, R + 6 + b.m(3) + Rx], '+z', 2 * Rx, 2 * Rx, 'round');
+    // side: the rope hangs from the lip, a third of the way out over the drop
+    // (clear of the near wall's wander, which is up to `wander` on each axis).
+    if (P.rope) b.ladder('caves/rope_ladder', P.length, side ? [0, -D, oz - R + Math.max(2, Math.round(R * 0.35))] : [pts[0][0], -D, pts[0][2] - R + 2], 0);
+    if (P.surfaceTop && !side) b.carve('ellipsoid', {min: [-R * 2, -R, -R * 2], max: [R * 2, R * 2, R * 2]}, {layer: 1, noise: 1.2, blend: 8, tag: 'apron'});
+    b.lightSpot(Z([0, -D, R + 4]), 'floor', '+y');
+    b.lightSpot(Z([R - 2, Math.round(-D / 2), 0]), 'wall', '-x');
+    if (side) {
+      b.lightSpot([Math.round(Wp / 2) - 2, 0, Math.round(Lp / 2)], 'floor', '+y');
+      b.way('lip', [0, 0, Math.max(2, Lp - 4)], ['socket:in', 'top']);
+      b.way('top', [0, 0, oz - R + 2], ['lip', 'foot'], {climb: true, ladder: P.rope});
+    } else b.way('top', [0, 0, 0], ['socket:top', 'foot'], {climb: true, ladder: P.rope});
+    b.way('foot', Z([0, -D, 0]), ['top', 'exit'], {climb: true, ladder: P.rope});
+    b.way('exit', Z([0, -D, R + 6 + b.m(2)]), ['foot', 'socket:foot']);
+    if (side) b.socket('in', [0, 0, 0], '-z', Wp, Wp, 'rough');
+    else b.socket('top', [0, 0, 0], '+y', 2 * R, 2 * R, 'shaft', P.surfaceTop ? ['surface'] : []);
+    b.socket('foot', Z([0, -D, R + 6 + b.m(3) + Rx]), '+z', 2 * Rx, 2 * Rx, 'round');
     void shaft;
   }
 };
@@ -525,8 +622,10 @@ const CHASM = {
         for (const z of [zc - cw - 4, zc + cw + 3]) b.fill('box', {min: [s < 0 ? -bw - 2 : bw, 0, z], max: [s < 0 ? -bw : bw + 2, b.m(1.1), z + 2]}, {mat: 'timber', layer: 4, noise: null});
       }
     } else cross = false;
-    b.lightSpot([-hw + 2, 0, zc - cw - 6], 'floor', '+y');
-    b.lightSpot([hw - 2, 0, zc + cw + 6], 'floor', '+y');
+    // Inset by the room's corner rounding: a spot in the rounded floor corner is in rock.
+    const ins = Math.min(hw - 1, Math.round(Math.min(W, H) / 3) + 2);
+    b.lightSpot([-hw + ins, 0, zc - cw - 6], 'floor', '+y');
+    b.lightSpot([hw - ins, 0, zc + cw + 6], 'floor', '+y');
     if (cross) b.wayChain('w', [[0, 0, 3], [0, 0, zc - cw - 3], [0, 0, zc], [0, 0, zc + cw + 3], [0, 0, L - 3]], ['socket:in'], ['socket:out']);
     else { b.wayChain('n', [[0, 0, 3], [0, 0, zc - cw - 3]], ['socket:in'], []); b.wayChain('f', [[0, 0, zc + cw + 3], [0, 0, L - 3]], [], ['socket:out']); b.notes.push('no bridge: the far side is unreachable on foot'); }
     b.way('deep', [0, -CD, zc], [], {pit: true});
