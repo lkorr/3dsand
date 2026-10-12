@@ -12810,6 +12810,17 @@ debris for the network). All of that is gone.
   wooden sylvan (~610) rides high. Asleep limbs are skipped (a corpse at rest
   costs nothing); a corpse woken by the chunks round it changing activates
   its wet limbs once, so water arriving over a corpse lifts it.
+- **A loose rig falling into water goes in, metres deep (2026-10-11;
+  `Mob::FloatLimpLimbs`, gate `water-entry`).** Jolt's per-limb drag is
+  quadratic and clamped never to reverse a velocity, so at fall speeds every
+  limb stopped dead in the tick it touched water and the arrest billed the
+  fall as a landing ON the surface. Above `ragdoll.waterEntrySpeed` (4 m/s)
+  the per-limb linear drag is off (buoyancy and angular drag stay) and the rig
+  takes one uniform dv per tick, `v1 = v0 / (1 + f v0 dt / L)` -- the exact
+  tick of dv/dt = -v^2/L, f = the rig's submerged mass fraction, L =
+  `ragdoll.waterEntryLength` (2 m). Speed falls as exp(-depth/L): a 10 m fall
+  goes ~2.2 m under, a 25 m/s one ~4.3 m. The arrest is not reseeded, so the
+  braking is still billed and a terminal-velocity entry still splats.
 - **A body lying in water stays wet, so a wet corpse can sleep (2026-10-09;
   `BodyBurnState::washTouch` / `soaking`).** The contact walk in
   `StainOneLimb` records when a WASHER liquid (water) is against a limb (it

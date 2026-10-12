@@ -27611,11 +27611,40 @@ void Mob::FloatLimpLimbs(World& world, float dt, bool rouse, float liftMs2) {
   auto isLiquid = [&](uint32_t m) {
     return m != 0 && m < mg.size() && mg[m].klass == CLASS_LIQUID;
   };
+  // ---- FALLING IN: the rig is braked as ONE body (ragdoll.waterEntry*) ----
+  //
+  // Jolt's drag is quadratic and clamped so it never reverses a velocity, and
+  // at fall speeds the clamp is all there is: every limb lost its whole
+  // velocity in the tick its keel touched water, so a body off a cliff
+  // stopped dead on the surface and the arrest billed the fall as a landing
+  // on it. Above waterEntrySpeed the per-limb linear drag is off (buoyancy and
+  // angular drag stay) and the rig takes one uniform dv instead, from
+  // dv/dt = -v^2 / L scaled by the rig's submerged mass fraction, integrated
+  // exactly over the tick: v1 = v0 / (1 + f v0 dt / L). Speed falls as
+  // exp(-depth / L), so the body goes metres deep; a uniform dv puts no load
+  // on a joint (ApplyRigAirDrag's argument). The arrest is NOT reseeded: the
+  // braking is billed, so an entry hard enough still kills.
+  //
+  // An ENTRY, not a speed: the brake arms only for a rig coming in from dry
+  // (waterSettled_ clear) and disarms once it has brought the rig down to
+  // waterEntrySpeed, until the rig is out of the water again. Keyed on speed
+  // alone it held a brass corpse SINKING at exactly waterEntrySpeed (the
+  // brake's floor, with Jolt's drag off) instead of its own slower terminal,
+  // and the corpse hit the bed hard enough never to sleep (corpse-float).
+  const auto& rgd = CurrentTuning().ragdoll;
+  const float entryVox = MetresToCells(std::max(rgd.waterEntrySpeed, 0.1f));
+  Vec3 vCom{};
+  const bool entering =
+      !waterSettled_ && RigComVelocity(vCom) && vCom.len() > entryVox;
+  float massAll = 0.0f, massWet = 0.0f;
+  bool anyWet = false;
   for (size_t i = 0; i < limbs_.size(); i++) {
     const MobLimb& l = limbs_[i];
     // Followers and held pieces are kinematic; ApplyBuoyancy would refuse
     // them anyway, and a shell's matter is already in its host's density.
     if (!l.body || l.wornHost >= 0 || l.holdSeconds > 0) continue;
+    const float limbMass = entering ? std::max(phys_->BodyMass(l.body), 1e-3f) : 0.0f;
+    massAll += limbMass;
     const bool active = phys_->IsActive(l.body);
     if (!active && !rouse) continue;
     Vec3 com;
@@ -27639,20 +27668,23 @@ void Mob::FloatLimpLimbs(World& world, float dt, bool rouse, float liftMs2) {
     if (!active) phys_->ActivateBody(l.body);  // rouse: the water came to it
     const float rhoB = std::max(1.0f, LimbFloatDensity((int)i) * (1.0f - air));
     const float buoy = (float)mg[mat].density / rhoB;
-    if (phys_->ApplyBuoyancy(l.body, (float)surfY, buoy, linDrag, angDrag, dt)) {
+    // The limb's submerged fraction (its bounds against the waterline).
+    const float topY = MetresToCells(bmax[1]);
+    const float keel = MetresToCells(bmin[1]);
+    const float sub = std::clamp(((float)surfY - keel) /
+                                     std::max(topY - keel, 1e-3f),
+                                 0.0f, 1.0f);
+    if (phys_->ApplyBuoyancy(l.body, (float)surfY, buoy,
+                             entering ? 0.0f : linDrag, angDrag, dt)) {
       floatedLimbs_++;
       floatSurfaceY_ = (float)surfY;
+      massWet += limbMass * sub;
+      anyWet = true;
       // THE LIVE BODY'S LIFT: a velocity step straight up, scaled by the
-      // limb's submerged fraction (its bounds against the waterline), so it
-      // fades out as the limb breaks the surface and the body settles a
-      // little higher than a corpse would rather than bobbing. Water drag
-      // above caps the rise to a drift.
+      // limb's submerged fraction, so it fades out as the limb breaks the
+      // surface and the body settles a little higher than a corpse would
+      // rather than bobbing. Water drag above caps the rise to a drift.
       if (liftMs2 > 0.0f) {
-        const float topY = MetresToCells(bmax[1]);
-        const float keel = MetresToCells(bmin[1]);
-        const float sub = std::clamp(((float)surfY - keel) /
-                                         std::max(topY - keel, 1e-3f),
-                                     0.0f, 1.0f);
         Vec3 lin{}, ang{};
         if (sub > 0.0f && phys_->GetBodyVelocities(l.body, lin, ang)) {
           lin.y += MetresToCells(liftMs2) * sub * dt;
@@ -27660,6 +27692,25 @@ void Mob::FloatLimpLimbs(World& world, float dt, bool rouse, float liftMs2) {
         }
       }
     }
+  }
+  if (!anyWet) {
+    waterSettled_ = false;  // out of the water: the next one is an entry
+  } else if (!entering) {
+    waterSettled_ = true;   // in, and slow: Jolt's per-limb drag from here
+  } else if (massWet > 0.0f && massAll > 0.0f) {
+    const float frac = std::min(massWet / massAll, 1.0f);
+    const float speed = vCom.len();
+    const float lenVox = MetresToCells(std::max(rgd.waterEntryLength, 0.01f));
+    const float v1 = std::max(speed / (1.0f + frac * speed * dt / lenVox), entryVox);
+    const Vec3 dv = vCom * ((v1 - speed) / speed);
+    for (MobLimb& l : limbs_) {
+      if (!l.body || l.holdSeconds > 0 || l.wornHost >= 0) continue;
+      Vec3 lv{}, la{};
+      if (!phys_->GetBodyVelocities(l.body, lv, la)) continue;
+      phys_->SetBodyVelocities(l.body, lv + dv, la);
+    }
+    waterEntryTicks_++;
+    if (v1 <= entryVox) waterSettled_ = true;
   }
 }
 

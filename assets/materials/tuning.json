@@ -234,7 +234,9 @@
     "getUpDropFrac": 0.45,
     "devSeconds": 3,
     "corpseAirFraction": 0.07,
-    "limpWaterLift": 0.8
+    "limpWaterLift": 0.8,
+    "waterEntryLength": 2,
+    "waterEntrySpeed": 4
   },
   "debris": {
     "minBodyVoxels": 8,

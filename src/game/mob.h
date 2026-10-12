@@ -2785,6 +2785,8 @@ class Mob {
   uint32_t FloatedLimbs() const { return floatedLimbs_; }
   // The waterline FloatLimpLimbs last pushed against (-1 = never).
   float FloatSurfaceY() const { return floatSurfaceY_; }
+  // Ticks FloatLimpLimbs braked the rig as a water ENTRY (diagnostic).
+  uint32_t WaterEntryTicks() const { return waterEntryTicks_; }
   // FloatLimpLimbs' rhoLimb before the air fraction: the mean density (kg/m^3)
   // of limb `limbIndex`'s matter plus its worn shells, cached on the limb by
   // its voxel count.
@@ -5279,6 +5281,11 @@ class Mob {
   uint8_t deadWokeHow_ = 0;    // see DeadWokeHow()
   uint32_t floatedLimbs_ = 0;  // see FloatedLimbs()
   float floatSurfaceY_ = -1;   // see FloatSurfaceY()
+  uint32_t waterEntryTicks_ = 0;  // see WaterEntryTicks()
+  // FloatLimpLimbs: the rig is in water and its entry brake has finished (or
+  // it came in slower than ragdoll.waterEntrySpeed). Cleared when no limb is
+  // wet, so the next fall in is braked as an entry again.
+  bool waterSettled_ = false;
   int16_t dryWokeLimb_ = -1;
   // Which of StainTick's passes wrote on its last run, and on which limb
   // (bits: 1 contact, 2 rain, 4 dry, 8 wet). Attribution for DeadAwakeReason.

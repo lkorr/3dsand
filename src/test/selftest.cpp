@@ -1177,6 +1177,10 @@ const char* const kOrder[] = {
     // synth shell) by what it is made of. Ticks the world and regenerates it
     // on the way out.
     "corpse-float",
+    // A limp human handed the speed of a fall into a deep stamped basin goes
+    // metres under instead of stopping on the surface. Ticks the world and
+    // regenerates it on the way out.
+    "water-entry",
     // The swimmers: a shark circles and charges a man in a stamped pool,
     // piranha nip him, a dry man is ignored, a fish out of water flops and
     // suffocates. Ticks the world and regenerates it on the way out.

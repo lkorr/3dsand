@@ -8387,6 +8387,52 @@ Status GatePlayerCorpse(Ctx& c, std::string& detail) {
 //      loose dead flesh in DebrisSystem now, and the newest is still a corpse;
 //   C. the living cap is untouched by the dead: kMaxMobs creatures still
 //      spawn beside the corpses, and the next one is refused.
+// The first FixtureSite candidate with no liquid within 8 voxels of an R-wide
+// basin and ground no higher than `maxGround`; every rejection is appended to
+// `siteWhy`. Shared by corpse-float and water-entry (see corpse-float for why
+// each condition exists).
+static bool FindDryLowSite(Ctx& c, int R, int maxGround, IVec3& site, int& hMax,
+                           std::string& siteWhy) {
+  std::vector<uint32_t> ch(kChunkVol, 0);
+  for (int inset : {480, 400, 380, 300, 250, 200, 150, 100}) {
+    const IVec3 s = FixtureSite(c.world, inset);
+    int h = 0, hLo = 1 << 30;
+    for (int x = s.x - R; x <= s.x + R; x++)
+      for (int z = s.z - R; z <= s.z + R; z++) {
+        const int th = World::TerrainHeight(x, z, kDefaultSeed);
+        h = std::max(h, th);
+        hLo = std::min(hLo, th);
+      }
+    if (h > maxGround) {
+      siteWhy += Format("%d: ground y%d; ", inset, h);
+      continue;
+    }
+    uint32_t wet = 0;
+    constexpr int kMargin = 8;
+    for (int cy = (hLo - 4) >> 4; cy <= (h + 32) >> 4; cy++)
+      for (int cz = (s.z - R - kMargin) >> 4; cz <= (s.z + R + kMargin) >> 4; cz++)
+        for (int cx = (s.x - R - kMargin) >> 4; cx <= (s.x + R + kMargin) >> 4; cx++) {
+          if (!c.world.ChunkInWindow({cx, cy, cz})) continue;
+          ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex({cx, cy, cz}), 1,
+                         ch.data(), "corpseFloatSite");
+          for (uint32_t w : ch) {
+            const uint32_t mm = w & 0xFFFu;
+            if (mm && mm < c.mats.size() && c.mats[mm].gpu.klass == CLASS_LIQUID)
+              wet++;
+          }
+        }
+    if (wet > 0) {
+      siteWhy += Format("%d: %u liquid cells near; ", inset, wet);
+      continue;
+    }
+    site = s;
+    hMax = h;
+    siteWhy += Format("%d: chosen", inset);
+    return true;
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // corpse-float: a dead body in water floats or sinks by what it is made of
 // ---------------------------------------------------------------------------
@@ -8441,47 +8487,7 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
   IVec3 site{};
   int hMax = 0;
   std::string siteWhy;
-  bool sited = false;
-  {
-    std::vector<uint32_t> ch(kChunkVol, 0);
-    for (int inset : {480, 400, 380, 300, 250, 200, 150, 100}) {
-      const IVec3 s = FixtureSite(c.world, inset);
-      int h = 0, hLo = 1 << 30;
-      for (int x = s.x - R; x <= s.x + R; x++)
-        for (int z = s.z - R; z <= s.z + R; z++) {
-          const int th = World::TerrainHeight(x, z, kDefaultSeed);
-          h = std::max(h, th);
-          hLo = std::min(hLo, th);
-        }
-      if (h > maxGround) {
-        siteWhy += Format("%d: ground y%d; ", inset, h);
-        continue;
-      }
-      uint32_t wet = 0;
-      constexpr int kMargin = 8;
-      for (int cy = (hLo - 4) >> 4; cy <= (h + 32) >> 4; cy++)
-        for (int cz = (s.z - R - kMargin) >> 4; cz <= (s.z + R + kMargin) >> 4; cz++)
-          for (int cx = (s.x - R - kMargin) >> 4; cx <= (s.x + R + kMargin) >> 4; cx++) {
-            if (!c.world.ChunkInWindow({cx, cy, cz})) continue;
-            ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex({cx, cy, cz}), 1,
-                           ch.data(), "corpseFloatSite");
-            for (uint32_t w : ch) {
-              const uint32_t mm = w & 0xFFFu;
-              if (mm && mm < c.mats.size() && c.mats[mm].gpu.klass == CLASS_LIQUID)
-                wet++;
-            }
-          }
-      if (wet > 0) {
-        siteWhy += Format("%d: %u liquid cells near; ", inset, wet);
-        continue;
-      }
-      site = s;
-      hMax = h;
-      siteWhy += Format("%d: chosen", inset);
-      sited = true;
-      break;
-    }
-  }
+  const bool sited = FindDryLowSite(c, R, maxGround, site, hMax, siteWhy);
   if (!sited) {
     detail = "no dry, low site: " + siteWhy;
     return Status::Fail;
@@ -8662,6 +8668,147 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
                               limp.trace.c_str())
                      : std::string("limp human: (no def)"));
   std::printf("corpse-float: %s %s\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// water-entry: a limp body that falls into water goes IN, metres deep
+// ---------------------------------------------------------------------------
+// Owner, 2026-10-11: "if ragdolling from high up and falling into water, the
+// character needs to fall into it and go in a certain amount; right now they
+// just splat against the surface ... falling into water should apply a counter
+// force that slows you down pretty quickly, so you fall a few meters deep at
+// least. its ok if from extremely high heights hitting the water still kills
+// you." Jolt's per-limb water drag stopped every limb in the tick it touched
+// the surface, and the arrest billed the whole fall as a landing on it.
+// Mob::FloatLimpLimbs now brakes the rig as one body above
+// ragdoll.waterEntrySpeed (ragdoll.waterEntryLength).
+//
+// One stamped basin, deep enough that no arm reaches the bed (the bed would be
+// a landing, and the claim is about the WATER). A live human knocked limp two
+// metres over the surface is handed the speed of a fall:
+//   * 14 m/s (a 10 m fall): its pelvis goes waterEntryMinDepthSoft voxels under
+//     the waterline and it SURVIVES;
+//   * fallSplatSpeed and maxFall (terminal): pelvis at least
+//     waterEntryMinDepthHard voxels under. Alive or not is reported, not
+//     asserted: owner, "ok if ... still kills you".
+// Every arm reports its entry-brake ticks and a pelvis-depth trace (rule 6).
+Status GateWaterEntry(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  MobSystem& mobs = c.mobs;
+  const uint32_t mStone = MatIdOf(c, "stone"), mWater = MatIdOf(c, "water");
+  if (!mStone || !mWater) {
+    detail = "stone / water missing from materials.json";
+    return Status::Fail;
+  }
+  PrepareWorld(c);
+  mobs.Reset();
+  c.debris.Reset();
+  constexpr int R = 15;
+  const int kDepth = (int)BaselineNumber("waterEntryBasinDepth", 90);
+  IVec3 site{};
+  int hMax = 0;
+  std::string siteWhy;
+  if (!FindDryLowSite(c, R, (int)BaselineNumber("corpseFloatMaxGround", 205),
+                      site, hMax, siteWhy)) {
+    detail = "no dry, low site: " + siteWhy;
+    return Status::Fail;
+  }
+  const int bedY = hMax + 1;
+  const int waterTop = bedY + kDepth;
+  std::vector<CellOp> basin;
+  for (int x = site.x - R; x <= site.x + R; x++)
+    for (int z = site.z - R; z <= site.z + R; z++)
+      for (int y = bedY - 1; y <= waterTop + 30; y++) {
+        const IVec3 cc{x, y, z};
+        if (!c.world.CellInWindow(cc)) continue;
+        const bool wall = std::abs(x - site.x) >= R - 1 ||
+                          std::abs(z - site.z) >= R - 1;
+        uint32_t w = PackVoxNew(0u, 0u);
+        if (y <= bedY || (wall && y <= waterTop + 4)) w = PackVoxNew(mStone, 0u);
+        else if (y <= waterTop) w = (mWater & 0xFFFu) | (7u << 12);
+        basin.push_back({World::SlotCellIndex(cc), w});
+      }
+  const IVec3 pchunk{site.x >> 4, waterTop >> 4, site.z >> 4};
+  support::TickRig rig(c, 72000u, pchunk);
+  // kMaxCellOpsPerTick: the stamp goes in over as many ticks as it needs.
+  auto stamp = [&]() {
+    const size_t step = kMaxCellOpsPerTick / 2;
+    for (size_t at = 0; at < basin.size(); at += step) {
+      const size_t end = std::min(basin.size(), at + step);
+      support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) {
+        o.cells.assign(basin.begin() + at, basin.begin() + end);
+      });
+    }
+    support::RunTicks(rig, 20);  // the water settles; the mirror fetches it
+  };
+
+  const int d = mobs.FindDef("human");
+  if (d < 0) {
+    detail = "no human def";
+    return Status::Fail;
+  }
+  const float surface = (float)(waterTop + 1);
+  struct Arm {
+    float ms;
+    bool ran = false, alive = false;
+    float deepest = 0;          // voxels of pelvis below the waterline, max
+    uint32_t brakeTicks = 0;    // Mob::WaterEntryTicks
+    std::string trace;          // pelvis depth every 3 ticks for 30 ticks
+  };
+  Arm arms[] = {{14.0f}, {CurrentTuning().player.fallSplatSpeed},
+                {CurrentTuning().player.maxFall}};
+  const int kTicks = 90;
+  for (Arm& a : arms) {
+    mobs.Reset();
+    c.debris.Reset();
+    stamp();
+    const uint64_t id = mobs.Spawn(d, {site.x, waterTop + 20, site.z});
+    Mob* m = id ? mobs.FindMobById(id) : nullptr;
+    if (!m || !m->Def() || m->Def()->rootLimb < 0) continue;
+    mobs.SetMobBehavior(id, "dummy");
+    const int root = m->Def()->rootLimb;
+    m->StartRagdoll(kTicks / 30.0f + 30.0f, "water-entry");
+    m->SetLimbVelocities(Vec3{0.0f, -a.ms / kVoxelMeters, 0.0f});
+    a.ran = true;
+    for (int i = 0; i < kTicks; i++) {
+      support::RunTicks(rig, 1);
+      m = mobs.FindMobById(id);
+      if (!m) break;
+      Vec3 com{};
+      const uint64_t h = mobs.LimbBody(id, root);
+      if (h && c.phys.BodyCenterOfMass(h, com)) {
+        a.deepest = std::max(a.deepest, surface - com.y);
+        if (i < 30 && i % 3 == 0) a.trace += Format(" %.0f", surface - com.y);
+      }
+    }
+    if (m) {
+      a.alive = m->Alive();
+      a.brakeTicks = m->WaterEntryTicks();
+    }
+  }
+  mobs.Reset();
+  c.debris.Reset();
+  PrepareWorld(c);
+
+  const float soft = (float)BaselineNumber("waterEntryMinDepthSoft", 20);
+  const float hard = (float)BaselineNumber("waterEntryMinDepthHard", 30);
+  const float bedRoom = (float)(kDepth - 4);
+  bool ok = true;
+  detail = Format("site [%s] bed y%d waterline y%d |", siteWhy.c_str(), bedY,
+                  waterTop);
+  for (size_t i = 0; i < 3; i++) {
+    const Arm& a = arms[i];
+    const float need = i == 0 ? soft : hard;
+    const bool armOk = a.ran && a.brakeTicks > 0 && a.deepest >= need &&
+                       a.deepest < bedRoom && (i != 0 || a.alive);
+    ok = ok && armOk;
+    detail += Format(" %s %.1f m/s: pelvis %.0f vox deep (need %.0f, bed at "
+                     "%d), %u brake ticks, %s, depth every 3:%s;",
+                     armOk ? "ok" : "BAD", a.ms, a.deepest, need, kDepth,
+                     a.brakeTicks, a.alive ? "alive" : "dead", a.trace.c_str());
+  }
+  std::printf("water-entry: %s %s\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -10565,6 +10712,7 @@ const std::vector<Gate>& WoundGates() {
       {"corpse-cap", "mob", {}, false, GateCorpseCap, false},
       // A corpse in water floats or sinks by its matter (Mob::FloatLimpLimbs).
       {"corpse-float", "mob", {}, false, GateCorpseFloat, false},
+      {"water-entry", "mob", {}, false, GateWaterEntry, false},
       {"player-corpse", "mob", {}, false, GatePlayerCorpse, false},
   };
   return g;

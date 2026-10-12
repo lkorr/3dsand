@@ -671,6 +671,8 @@ const TUNING_PARAMS = {
   'ragdoll.devSeconds':{t:'f',def:3,min:0.5,max:30},
   'ragdoll.corpseAirFraction':{t:'f',def:0.07,min:0,max:0.5},
   'ragdoll.limpWaterLift':{t:'f',def:0.8,min:0,max:5},
+  'ragdoll.waterEntryLength':{t:'f',def:2,min:0.1,max:10},
+  'ragdoll.waterEntrySpeed':{t:'f',def:4,min:0.5,max:20},
   'gore.microLifeTicks':{t:'i',def:70,min:1,max:255},
   'gore.microScale':{t:'i',def:4,min:2,max:6},
   'gore.bleedSprayPerDrip':{t:'f',def:3,min:0,max:24},

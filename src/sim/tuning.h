@@ -1001,6 +1001,17 @@ struct Tuning {
     // to the surface and rides a little higher there. Water drag caps the
     // rise (about lift / physics.waterLinearDrag m/s). 0 = float as a corpse.
     float limpWaterLift = TPD(ragdoll, limpWaterLift);
+    // FALLING INTO WATER (Mob::FloatLimpLimbs): a limp or dead rig moving
+    // faster than waterEntrySpeed (m/s) is braked as ONE body, every limb the
+    // same dv, by dv/dt = -v^2 / waterEntryLength (m) times the rig's
+    // submerged mass fraction. Speed falls as exp(-depth / length), so from
+    // terminal velocity the body goes ~2.6 lengths deep before Jolt's per-limb
+    // water drag takes over at waterEntrySpeed. Before this the per-limb drag
+    // stopped every limb in the tick it touched water and the body splatted on
+    // the surface. The arrest still sums the braking, so a hard enough entry is
+    // still billed as a landing (player.fallSplatSpeed).
+    float waterEntryLength = TPD(ragdoll, waterEntryLength);
+    float waterEntrySpeed = TPD(ragdoll, waterEntrySpeed);
   } ragdoll;
 
   // ---- debris / island -> rigidbody conversion ----
