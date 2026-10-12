@@ -109,6 +109,7 @@
 #include "sim/windprim.h"
 #include "sim/currentprim.h"
 #include "sim/world.h"
+#include "sim/dungeon.h"
 #include "sim/worldedit.h"
 #include "sim/worldio.h"
 #include "telemetry.h"
@@ -5938,6 +5939,9 @@ int main(int argc, char** argv) {
   // --mapcheck <name> — load one map exactly as the game would and print its
   // load warnings / refusal as JSON (the World map page's warnings panel).
   std::string mapcheckName;
+  // --dungeon-bake <id> -- assets/dungeons/<id>/shell.json -> shell.bin with the
+  // engine's own writer (docs/PLAN_dungeons.md §3.4.1). GPU-free.
+  std::string dungeonBake;
   // --edit-script <file.jsonl> — apply editor commands headlessly and save
   // (PLAN_world_editor P5, editor/commands.h). --edit-commands lists them.
   std::string editScript;
@@ -6595,6 +6599,10 @@ int main(int argc, char** argv) {
       g_shotEditor = true;
       g_harnessFrames = kShotEdLast;
     }
+    else if (a == "--dungeon-bake") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--dungeon-bake wants a dungeon id\n"); return 1; }
+      dungeonBake = argv[++i];
+    }
     else if (a == "--mapcheck") {
       if (i + 1 >= argc) { std::fprintf(stderr, "--mapcheck wants a map name\n"); return 1; }
       mapcheckName = argv[++i];
@@ -6724,6 +6732,33 @@ int main(int argc, char** argv) {
   // line: the load warnings (unknown site kinds, missing stamps / species,
   // overlapping footprints, ...) or the refusal. Exit 0 either way -- a
   // refused map is an answer, not a crash; the tuner shows it.
+  if (!dungeonBake.empty()) {
+    // The shell.json twin -> shell.bin, then read back and held to the json by
+    // CONTENT (dungeon::SameContent): what the `dungeon-format` gate asserts.
+    const std::string dir = AssetDir() + "/dungeons/" + dungeonBake;
+    std::ifstream f(dir + "/shell.json", std::ios::binary);
+    if (!f) { std::fprintf(stderr, "--dungeon-bake: no %s/shell.json\n", dir.c_str()); return 1; }
+    const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    dungeon::Shell sh, back;
+    std::string err;
+    if (!dungeon::ParseShellJson(text, sh, err)) { std::fprintf(stderr, "--dungeon-bake: %s\n", err.c_str()); return 1; }
+    const std::vector<uint8_t> bin = dungeon::WriteShellBin(sh);
+    if (!dungeon::ReadShellBin(bin.data(), bin.size(), back, err) || !dungeon::SameContent(sh, back, &err)) {
+      std::fprintf(stderr, "--dungeon-bake: the binary does not read back as the json: %s\n", err.c_str());
+      return 1;
+    }
+    std::ofstream o(dir + "/shell.bin", std::ios::binary | std::ios::trunc);
+    o.write(reinterpret_cast<const char*>(bin.data()), static_cast<std::streamsize>(bin.size()));
+    uint32_t src = 0;
+    const bool haveSrc = dungeon::SourceHashOfFile(dir + "/dungeon.json", src);
+    const std::string state = !haveSrc ? " (no dungeon.json)"
+                              : src == sh.sourceHash ? " (current)"
+                                                     : " -- STALE: dungeon.json hashes " + std::to_string(src);
+    std::printf("dungeon-bake: %s/shell.bin, %zu bytes, %zu prims, %zu templates, %zu instances; sourceHash %u%s\n",
+                dir.c_str(), bin.size(), sh.prims.size(), sh.templates.size(), sh.instances.size(), sh.sourceHash,
+                state.c_str());
+    return o ? 0 : 1;
+  }
   if (!mapcheckName.empty()) {
     Tuning tune;
     LoadTuning(AssetDir() + "/materials/tuning.json", tune);

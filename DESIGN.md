@@ -25427,6 +25427,106 @@ map it edits, not tuning's `world.mapLayer`. `/api/voxregion?layer=@map` now
 sends `LAYER @map` (it sent the map layer's NAME, which loaded that one file
 and left every locale's layer out of the 3D preview).
 
+## 9h. Dungeons: a primitive program carved by worldgen (added 2026-10-12; `docs/PLAN_dungeons.md`, `src/sim/dungeon.*`, `assets/shaders/worldgen_dungeon.wgsli`, gates `dungeon-format` / `dungeon-gen`)
+
+A dungeon is **worldgen input**, like a stamp: it regenerates identically
+from the map, is not saved, and damage to it is ordinary chunk edits. Its
+shell (rock carved into rooms, floors, vaults, stairs, supports, rubble and
+dressing) is NOT baked voxels but a **primitive program**: tens of records per
+piece (`carve` / `fill` / `skin` / `keep` over `box` / `rbox` / `ellipsoid` /
+`cylinder` / `capsule` / `tube` / `ramp` / `vault`, with noise, a smooth-min
+blend between carves, scatter rules and prop instances) that genChunk
+rasterises per cell. A baked 150 m dungeon would be tens of millions of
+voxels of CellOps or >1 MB/tick of patches; the program is kilobytes for any
+size and costs nothing until a chunk inside it generates. The JS generators
+(`assets/editor/dungeon/`) decide LAYOUT; WGSL decides VOXELS. The format is
+`docs/PLAN_dungeons.md` §3.4 + the D1 amendment §3.4.1 (`shell.json`, and its
+binary twin `shell.bin`, which the engine loads; `--dungeon-bake <id>`
+rewrites the .bin from the .json with the engine's writer).
+
+**Placement** (`map.json dungeons[]`, `worldmap.h DungeonDef`, resolved in
+`LoadWorldMap` beside the locales): the shell's anchor cell lands on the BARE
+ground cell at `at`, plus `yOffset`, and every local cell at that + R(yaw)
+(local - anchor), R the linear quarter turn about the anchor cell -- the rule
+the dungeon refs use too (`src/world/dungeon_refs.*`, PLAN §3.7), so shell,
+props, detail and entities agree cell for cell. Noise and scatter are evaluated in the LOCAL frame,
+so a dungeon is the same voxels wherever it is placed -- the tuner's isolated
+preview IS the in-situ one. A missing or refused asset (unknown material, a
+limit, an index cell over its list caps) is a load WARNING and the dungeon is
+not placed. A stale `shell.bin` (its `sourceHash` is not FNV-1a of the
+`dungeon.json` beside it) loads with a warning and fails `dungeon-format`.
+
+**The GPU block** (`worldMap` word `kHDungeon`, `dungeon.h PackDungeons`): one
+record per placed dungeon (origin, yaw, inflated world box, keep box), the
+prims as 20-word records in local coordinates (tube segments 16 words each,
+with their own inflated boxes), scatter rules, prop templates rotated into
+world frame and deduplicated (the stamp run-list format, mat `0xFFF` = the
+CARVE code), instance records, and a **sparse 3D index**: an open-addressed
+hash (<= half full, longest probe recorded) of 64^3 index cells -> the list of
+prims and instances whose inflated bounds touch the cell (identical lists
+shared). Its size is proportional to the cells a dungeon touches; nothing goes
+through the 2D site lattice. Inflation covers everything that can make a cell
+outside a prim differ: 2x the noise amplitude, the blend, the firm shell, the
+scatter bands, and for an elongated ellipse the axis ratio (its distance
+estimate under-reads by it). Limits: 64 prims / 32 instances per index cell.
+
+**The evaluation** (`dgCell`, §3.4.1 "Op semantics"): the carve field C is
+the smooth union (blend = the polynomial smooth-min radius, in array order) of
+the carve prims' signed distances, integer, in quarter voxels (the sqrt is an
+integer Newton); C < 0 is AIR, or the carve's liquid at or under its `level`.
+A powder or liquid terrain cell within 2 voxels outside the carve becomes the
+carve's `firm` material, so nothing spills on the birth tick. Then fill /
+keep / skin / late carve in array order (later wins; `keep` restores the
+terrain cell and is not re-cut later), then the prims' scatter rules (rubble
+piles at the material's repose run, stalagmites / stalactites / crystals grown
+from the first solid within their height, moss and ore in the solid band
+behind the surface, one-cell puddles contained by construction, bones), then
+prop instances (later wins; CARVE clears, template air leaves the world
+alone). C at a neighbour (the scatter's floor search) is computed from THAT
+cell's own list, so C is a function of the cell alone. The output word for a
+placed material is exactly genCellIn's (the positional palette jitter,
+liquids full, STAMP_NEVER), so a filled stone wall is indistinguishable from
+the stone it replaced and stays JITTER-compressible.
+
+**Where it runs.** genChunk asks for the chunk's list once (a 16^3 chunk lies
+in one 64^3 index cell) and runs `dgCell` on the TERRAIN word after the top
+cell's grains (the grains read the terrain word above, so the dungeon's
+output is a pure function of the terrain word -- the CPU twin's input). `cols`
+raises a column's sky ceiling (`CCW_TOP`) to the box top of any dungeon over
+it, so surface ruins are not sky-skipped. `far` evaluates `dgCellCoarse`
+(carve, fill, keep, props; no skin / scatter / firm, which are sub-cell at
+every cascade level) per sample on the columns the dungeons' box covers, and
+raises its sky ceiling the same way: surface pieces appear in the cascades;
+underground matter is not drawn from afar. `caveBands` turns off a natural
+cave band that reaches into a dungeon's keep box (bounds + `keepOut`, default
+24; `naturalCaves: true` opts out), and the magma table goes with it (it only
+floods carved band cells). **Cost**: a map with no dungeon pays one header
+word per chunk; a chunk outside the index-cell range a compare; in range with
+no list one probe; only listed chunks pay the evaluator. The evaluator lives
+in its own file, `worldgen_dungeon.wgsli`, which `AssembleShaderSource` and
+`check_shaders.sh` append to worldgen.wgsl's body. Measured compile cost: see
+the D1 report in `docs/PLAN_dungeons.md`.
+
+**Determinism**: integer throughout, hash3 noise, list order = prim order;
+the block between `MIRROR-BEGIN dungeon` markers is token-for-token
+`dungeon.cpp`'s CPU twin (`check_invariants.py` "dungeon mirror", which also
+holds every `DG_*` layout const to `dungeon.h`), and `dungeon-gen` holds the
+GPU to the twin cell by cell (its evaluator-OFF arm -- `kDgFlagEvalOff`,
+`worldmap::SetDungeonsEnabled(false)` -- is the exact terrain word the twin
+is fed, caves already suppressed).
+
+**Hand detail** (`assets/dungeons/<id>/detail.svedit`, SVED v3): cells in the
+dungeon's local frame, resolved at `WorldEdits::Resolve` through every
+placement of that asset in the map in force, after the map's and the locales'
+layers (`MapEditLayerFiles` lists it); applied as CellOps through the
+MutationQueue like every edit layer. Writer: `WorldEdits::WriteDungeonLocal`.
+
+**Preview**: `--voxserve DUNGEON ISOLATE | PLACE | MAP | CLEAR` (§5.0 of the
+plan) installs a scratch program (`worldmap::SetScratchDungeon`) and reloads
+the environment, so the next REGION is real genChunk with it carved;
+`tuner_server.py` `POST /api/dungeon/preview` forwards it and folds the
+scratch into the region cache key (and replays it after a voxserve respawn).
+
 ## 10. Networking — the model of record (decided 2026-09-10)
 
 Until 2026-09-10 this section said "both classic models are viable, decide at

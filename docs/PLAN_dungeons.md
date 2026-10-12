@@ -232,14 +232,17 @@ with the engine's own writer (handy while D2's binary writer is young).
 - Everything in the shell is in the DUNGEON LOCAL FRAME: integer voxel
   CELLS, Y up. Boxes are INCLUSIVE cell ranges `min..max`. A point (`a`, `b`,
   tube `pts`, `anchor`) names a CELL and means that cell's centre.
-- `anchor` = the local cell of the entrance socket. Placement (map
-  `dungeons[]`, §3.1): `world = Rot(yaw, local - anchor) + (at.x,
-  groundY + 1 + yOffset, at.z)`, `groundY = BareGroundHeight(at.x, at.z)`
+- `anchor` = the local cell of the entrance socket (shell.json / shell.bin
+  always carry it). Placement (map `dungeons[]`, §3.1) -- THE SAME RULE AS
+  D3's refs (§3.7 D3 AMENDMENT, `src/world/dungeon_refs.*`): `world = (at.x,
+  BareGroundHeight(at.x, at.z) + yOffset, at.z) + R(yaw) · (local - anchor)`
   (the same bare ground a locale anchor reads). With `yOffset` 0 the anchor
-  cell is the FIRST AIR CELL over the bare ground.
-- `Rot(q, (x, y, z))`, q = yaw / 90 (quarter turns only), rotates CELLS
-  about +Y:  q0 `(x, z)`,  q1 `(z, -1 - x)`,  q2 `(-1 - x, -1 - z)`,
-  q3 `(-1 - z, x)`; y unchanged. (q1 takes local +Z to world +X.)
+  cell IS the ground cell at `at`.
+- `R(q)`, q = yaw / 90 (quarter turns only), is LINEAR on cell coordinates
+  (a rotation about the anchor cell): q0 `(x, z)`, q1 `(z, -x)`, q2
+  `(-x, -z)`, q3 `(-z, x)`; y unchanged. (q1 takes local +Z to world +X.)
+  [Corrected 2026-10-12 to D3's rule: the first D1 text had a `-1` cell
+  rotation and the anchor one cell up; no data was written against it.]
 - Noise and scatter are evaluated in LOCAL coordinates, so a dungeon is the
   same voxels wherever and however it is placed (only its world position
   moves). The tuner's isolated preview is therefore exactly the in-situ one.
@@ -268,6 +271,13 @@ LOG2 of the lattice cell in voxels 1..10, octaves 1..3, seed u32), `blend`
 firm-shell material, below), `piece` (optional string, informational: the
 piece id), `scatter` (optional array, ≤ 4 rules). `mat` is required for fill
 and skin, optional for carve (absent = air; else a LIQUID), absent for keep.
+Optional EXTRAS (added after D2's first pass, 2026-10-12): `openOnly: true`
+on a fill = it lands only where the cell is still AIR at that point of the
+ordered pass (the carve's or the sky's) -- a rubble heap or a fallen block
+must not turn the buried rock inside a wall into gravel; `mat2` + `checker`
+(cells, 1..256) on a fill or a skin = a checker of `checker`-cell squares in
+the dungeon's LOCAL XZ plane, `mat` on the even squares ((⌊x/c⌋ + ⌊z/c⌋)
+even) and `mat2` on the odd ones (tiled floors).
 Shapes:
 
 | shape | fields | the solid it describes |
@@ -341,7 +351,7 @@ a cell not listed is template-air ("leave the world alone"). Sizes ≤ 256 on
 each axis. `Instance` = `{ "template": <index into templates>, "pos": [x, y,
 z], "yaw": 0|90|180|270, "id": "x12" }`: the template rotated by yaw
 (template-local `(x, z)` → q1 `(z, nx−1−x)`, q2 `(nx−1−x, nz−1−z)`, q3
-`(nz−1−z, x)`, i.e. `Rot` re-based to the footprint's min corner) lands
+`(nz−1−z, x)`, i.e. `R` re-based to the footprint's min corner) lands
 with its rotated footprint's MIN CELL at `pos`. Any y; no pad, no sink band.
 The JS dedupes identical (prop, params, seed) into one template; the engine
 additionally shares identical packed (template, total yaw) blocks.
@@ -366,7 +376,10 @@ TEMPLATES: n, then per template `id string, nx, ny, nz, nPalette, palette
 strings…, nVoxels, nVoxels × (x, y, z, p)`; INSTANCES: n, then n × (template,
 x, y, z, yaw/90, id string); then `'END!'` (0x21444E45). Prim `piece` strings
 go in a trailing PIECES block before `'END!'`: n (== prims) × piece string.
-Unused fields are 0.
+Then, ONLY when some prim uses an extra, the EXTRAS block, still before
+`'END!'`: `'PRMX'` (0x584D5250), n (== prims), n × 4 words (flags: bit 0
+openOnly; mat2 string or 0xFFFFFFFF; checker; 0). A reader that sees
+`'END!'` where `'PRMX'` could be has no extras. Unused fields are 0.
 
 ### 3.5 Props (L2)
 

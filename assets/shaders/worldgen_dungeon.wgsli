@@ -1,0 +1,731 @@
+// worldgen_dungeon.wgsli -- THE DUNGEON LAYER of worldgen (docs/PLAN_dungeons.md
+// §2, §3.4, §3.4.1 D1 AMENDMENT; DESIGN.md "Dungeons").
+//
+// NOT A SHADER OF ITS OWN. gpu/resources.cpp AssembleShaderSource appends this
+// file to worldgen.wgsl's body (and scripts/check_shaders.sh does the same), so
+// it shares worldgen's bindings (worldMap, materials, T) and helpers (hash3,
+// vsmooth, q15frac, vbilerp, fdiv, reposeRunOf, packVox). The extension is
+// `.wgsli` so the per-shader loops never try to compile it alone. It is a file
+// of its own so the dungeon evaluator stays in one place in an ~9k-line kernel,
+// and so its edits and worldgen.wgsl's do not collide.
+//
+// WHAT IT EVALUATES. A placed dungeon is a PRIMITIVE PROGRAM (prims: carve /
+// fill / skin / keep over box / rbox / ellipsoid / cylinder / capsule / ramp /
+// vault shapes, world-space-continuous noise on their surfaces, a smooth-min
+// blend between carves, scatter rules, prop templates) packed by
+// src/sim/dungeon.cpp into the worldMap buffer behind header word
+// WM_H_DUNGEON. genChunk asks for the chunk's LIST once (a hash probe on the
+// 64^3 index cell holding it -- every 16^3 chunk lies in exactly one), and when
+// there is one runs dgCell over each cell's terrain word. `far` does the same
+// per sample on the columns the dungeons' world box covers, so a surface ruin
+// is in the cascades; nothing else draws them (underground matter is not
+// visible from afar). caveBands reads dgCaveKeep: the natural cave bands, and
+// with them the magma table, are off inside every dungeon's keep box.
+//
+// COST (rule 2): a map with no dungeon pays one header word per chunk; a chunk
+// outside every dungeon's index-cell range pays a range compare; a chunk in the
+// range with no list pays one probe (the table is <= half full). Only cells of
+// listed chunks pay the evaluator.
+//
+// DETERMINISM (rule 1): integer arithmetic throughout (the sqrt is integer
+// Newton), noise from hash3, evaluation order = list order = prim order. The
+// block between the MIRROR markers is token-for-token the CPU twin in
+// src/sim/dungeon.cpp (scripts/check_invariants.py "dungeon mirror"), which the
+// `dungeon-gen` gate holds to the GPU cell by cell.
+
+// ---- the block layout (src/sim/dungeon.h kDg*; check_invariants.py) --------
+const WM_H_DUNGEON : u32 = 66u;      // worldmap.h kHDungeon: block offset, 0 = no dungeons
+const DG_H_COUNT : u32 = 0u;         // placed dungeons
+const DG_H_RECS : u32 = 1u;          // absolute offset of the dungeon records
+const DG_H_HASH : u32 = 2u;          // absolute offset of the index hash table
+const DG_H_HASH_MASK : u32 = 3u;     // capacity - 1 (a power of two)
+const DG_H_PROBE_MAX : u32 = 4u;     // the longest probe any key needs
+const DG_H_CELL_X0 : u32 = 5u;       // index-cell range every list lies in (inclusive)
+const DG_H_CELL_Y0 : u32 = 6u;
+const DG_H_CELL_Z0 : u32 = 7u;
+const DG_H_CELL_X1 : u32 = 8u;
+const DG_H_CELL_Y1 : u32 = 9u;
+const DG_H_CELL_Z1 : u32 = 10u;
+const DG_H_GEN_X0 : u32 = 11u;       // union of the dungeons' world boxes (inclusive)
+const DG_H_GEN_Y0 : u32 = 12u;
+const DG_H_GEN_Z0 : u32 = 13u;
+const DG_H_GEN_X1 : u32 = 14u;
+const DG_H_GEN_Y1 : u32 = 15u;
+const DG_H_GEN_Z1 : u32 = 16u;
+const DG_H_KEEP_X0 : u32 = 17u;      // union of the keep boxes (bounds + keepOut)
+const DG_H_KEEP_Y0 : u32 = 18u;
+const DG_H_KEEP_Z0 : u32 = 19u;
+const DG_H_KEEP_X1 : u32 = 20u;
+const DG_H_KEEP_Y1 : u32 = 21u;
+const DG_H_KEEP_Z1 : u32 = 22u;
+const DG_H_FLAGS : u32 = 23u;        // DG_FLAG_* (the gates' switch)
+const DG_FLAG_EVAL_OFF : u32 = 1u;   // no list is ever found: the keep boxes and sky ceilings only
+const DG_H_WORDS : u32 = 24u;
+const DG_D_ORIGIN_X : u32 = 0u;      // world cell of local cell (0,0,0)
+const DG_D_ORIGIN_Y : u32 = 1u;
+const DG_D_ORIGIN_Z : u32 = 2u;
+const DG_D_YAW : u32 = 3u;           // quarter turns: world = Rot(yaw, local) + origin
+const DG_D_BOX : u32 = 4u;           // world box x0 y0 z0 x1 y1 z1 (inflated, inclusive)
+const DG_D_KEEP : u32 = 10u;         // keep box x0 y0 z0 x1 y1 z1 (x1 < x0: none)
+const DG_D_WORDS : u32 = 16u;
+const DG_P_FLAGS : u32 = 0u;         // op 0..1 | shape 4..7 | axis 8..9 | scatter n 12..15 | noise octaves 16..17 | noise log2 20..23
+const DG_P_MATS : u32 = 1u;          // mat 0..11 | firm 16..27
+const DG_P_AX : u32 = 2u;            // A: centre (Q2) | capsule a (Q2) | ramp min (cells)
+const DG_P_AY : u32 = 3u;
+const DG_P_AZ : u32 = 4u;
+const DG_P_BX : u32 = 5u;            // B: half extent (Q2) | capsule b (Q2) | ramp max (cells)
+const DG_P_BY : u32 = 6u;
+const DG_P_BZ : u32 = 7u;
+const DG_P_P0 : u32 = 8u;            // rbox r | vault rise (Q2) | ramp stepH | tube: first segment (abs offset)
+const DG_P_P1 : u32 = 9u;            // ramp stepD | tube: segment count
+const DG_P_P2 : u32 = 10u;           // ramp height | below << 16
+const DG_P_LEVEL : u32 = 11u;        // carve liquid surface, local y (i32)
+const DG_P_NAMP : u32 = 12u;         // noise amplitude, Q2
+const DG_P_NSEED : u32 = 13u;
+const DG_P_BLEND : u32 = 14u;        // blend Q2 0..15 | skin Q2 16..31
+const DG_P_SCAT : u32 = 15u;         // absolute offset of the first scatter rule
+const DG_P_DREC : u32 = 16u;         // absolute offset of the dungeon record
+const DG_P_PAT : u32 = 17u;          // checker: mat2 0..11 | tile (cells) 16..31; 0 = none
+const DG_PF_OPEN_ONLY : u32 = 16777216u;   // DG_P_FLAGS bit 24: the fill lands only in air
+const DG_P_WORDS : u32 = 20u;
+const DG_S_KIND : u32 = 0u;          // kind 0..7 | surface << 8
+const DG_S_DENS : u32 = 1u;          // density, Q16
+const DG_S_SIZE : u32 = 2u;          // size min | max << 16
+const DG_S_MAT : u32 = 3u;
+const DG_S_SEED : u32 = 4u;
+const DG_S_SPACING : u32 = 5u;
+const DG_S_WORDS : u32 = 8u;
+const DG_T_WORDS : u32 = 16u;        // tube segment: a xyz, b xyz, ra, rb, box min xyz, box max xyz (Q2, local)
+const DG_I_BLK : u32 = 0u;          // absolute offset of the (rotated) template block
+const DG_I_X : u32 = 1u;             // world cell of the template's min corner
+const DG_I_Y : u32 = 2u;
+const DG_I_Z : u32 = 3u;
+const DG_I_WORDS : u32 = 4u;
+const DG_E_WORDS : u32 = 4u;         // hash entry: cx, cy, cz, list (0 = empty)
+const DG_CELL_LOG2 : u32 = 6u;       // the index cell: 64^3 voxels
+const DG_LIST_MAX : u32 = 64u;       // prims per index cell the evaluator reads
+const DG_OP_CARVE : u32 = 0u;
+const DG_OP_FILL : u32 = 1u;
+const DG_OP_SKIN : u32 = 2u;
+const DG_OP_KEEP : u32 = 3u;
+const DG_SHAPE_BOX : u32 = 0u;
+const DG_SHAPE_RBOX : u32 = 1u;
+const DG_SHAPE_ELLIPSOID : u32 = 2u;
+const DG_SHAPE_CYLINDER : u32 = 3u;
+const DG_SHAPE_CAPSULE : u32 = 4u;
+const DG_SHAPE_RAMP : u32 = 5u;
+const DG_SHAPE_VAULT : u32 = 6u;
+const DG_SC_RUBBLE : u32 = 0u;
+const DG_SC_STALAGMITE : u32 = 1u;
+const DG_SC_STALACTITE : u32 = 2u;
+const DG_SC_CRYSTAL : u32 = 3u;
+const DG_SC_MOSS : u32 = 4u;
+const DG_SC_PUDDLE : u32 = 5u;
+const DG_SC_BONES : u32 = 6u;
+const DG_SC_ORE : u32 = 7u;
+const DG_SURF_FLOOR : u32 = 0u;
+const DG_SURF_CEIL : u32 = 1u;
+const DG_SURF_WALL : u32 = 2u;
+const DG_CARVE_MAT : u32 = 4095u;    // a template cell that clears to AIR
+const DG_PROP_NONE : u32 = 4294967295u;
+const DG_BIG : i32 = 1048576;
+const DG_FIRM_Q2 : i32 = 8;          // the firm shell: 2 voxels outside the carve
+const DG_Q2_CLAMP : i32 = 8192;      // 2048 voxels: every squared Q2 sum stays < 2^31
+
+// ---- helpers both sides spell for themselves (dungeon.cpp has its own) ----
+fn dgI(i : u32) -> i32 { return bitcast<i32>(worldMap[i]); }
+// The class test the firm shell needs: the terrain cell flows.
+fn dgFlowy(m : u32) -> bool {
+  let k = materials[m].klass;
+  return m != MAT_AIR && (k == CLASS_POWDER || k == CLASS_LIQUID);
+}
+// A dungeon-placed voxel: the SAME word genCellIn's tail makes for this
+// material at this cell (palette jitter from the one positional hash, liquids
+// full, STAMP_NEVER), so a filled wall of stone is indistinguishable from the
+// stone it replaced and a buried keep stays JITTER-compressible.
+fn dgWord(m : u32, x : i32, y : i32, z : i32) -> u32 {
+  if (m == MAT_AIR) { return 0u; }
+  let rnd = hash3(T.seed ^ 0xC0FFEEu, bitcast<u32>(x) ^ (bitcast<u32>(z) << 12u), bitcast<u32>(y));
+  var state = rnd % 3u;
+  if (materials[m].klass == CLASS_LIQUID) { state = LIQ_FULL_STATE; }
+  return packVox(m, state, STAMP_NEVER);
+}
+
+// ---- the lookups outside the evaluator ---------------------------------------
+fn dgBlock() -> u32 { return worldMap[WM_H_DUNGEON]; }
+fn dgHash(cx : i32, cy : i32, cz : i32) -> u32 {
+  return (bitcast<u32>(cx) * 73856093u) ^ (bitcast<u32>(cy) * 19349663u) ^ (bitcast<u32>(cz) * 83492791u);
+}
+// The list of index cell (cx, cy, cz): 0 = no prim or prop touches it.
+fn dgListOfCell(cx : i32, cy : i32, cz : i32) -> u32 {
+  let b = dgBlock();
+  if (b == 0u || (worldMap[b + DG_H_FLAGS] & DG_FLAG_EVAL_OFF) != 0u) { return 0u; }
+  if (cx < dgI(b + DG_H_CELL_X0) || cy < dgI(b + DG_H_CELL_Y0) || cz < dgI(b + DG_H_CELL_Z0) ||
+      cx > dgI(b + DG_H_CELL_X1) || cy > dgI(b + DG_H_CELL_Y1) || cz > dgI(b + DG_H_CELL_Z1)) {
+    return 0u;
+  }
+  let tab = worldMap[b + DG_H_HASH];
+  let mask = worldMap[b + DG_H_HASH_MASK];
+  let pmax = worldMap[b + DG_H_PROBE_MAX];
+  var i = dgHash(cx, cy, cz) & mask;
+  for (var k = 0u; k <= pmax; k++) {
+    let e = tab + i * DG_E_WORDS;
+    let lst = worldMap[e + 3u];
+    if (lst == 0u) { return 0u; }
+    if (dgI(e) == cx && dgI(e + 1u) == cy && dgI(e + 2u) == cz) { return lst; }
+    i = (i + 1u) & mask;
+  }
+  return 0u;
+}
+fn dgListAt(x : i32, y : i32, z : i32) -> u32 {
+  return dgListOfCell(x >> DG_CELL_LOG2, y >> DG_CELL_LOG2, z >> DG_CELL_LOG2);
+}
+// Is column (x, z) inside the union of the dungeons' world boxes? `far`'s
+// per-column gate: outside it no sample row probes the index.
+fn dgColIn(x : i32, z : i32) -> bool {
+  let b = dgBlock();
+  if (b == 0u) { return false; }
+  return x >= dgI(b + DG_H_GEN_X0) && x <= dgI(b + DG_H_GEN_X1) &&
+         z >= dgI(b + DG_H_GEN_Z0) && z <= dgI(b + DG_H_GEN_Z1);
+}
+// The highest cell a dungeon can put matter in over column (x, z) -- its world
+// box's top -- for the sky ceilings (`cols` CCW_TOP, `far` skyCeil): a ruin
+// standing above the ground is not sky. -2^20 where no box covers the column.
+fn dgColTop(x : i32, z : i32) -> i32 {
+  if (!dgColIn(x, z)) { return -DG_BIG; }
+  let b = dgBlock();
+  let recs = worldMap[b + DG_H_RECS];
+  let n = worldMap[b + DG_H_COUNT];
+  var top = -DG_BIG;
+  for (var k = 0u; k < n; k++) {
+    let r = recs + k * DG_D_WORDS + DG_D_BOX;
+    if (x >= dgI(r) && x <= dgI(r + 3u) && z >= dgI(r + 2u) && z <= dgI(r + 5u)) { top = max(top, dgI(r + 4u)); }
+  }
+  return top;
+}
+// THE CAVE KEEP-OUT (PLAN_dungeons §2.2): does the band [f, c] of column
+// (x, z) reach into a dungeon's keep box (its bounds + keepOut)? caveBands
+// turns such a band off, and with it the lava it would have flooded.
+fn dgCaveKeep(x : i32, z : i32, f : i32, c : i32) -> bool {
+  let b = dgBlock();
+  if (b == 0u) { return false; }
+  if (x < dgI(b + DG_H_KEEP_X0) || x > dgI(b + DG_H_KEEP_X1) || z < dgI(b + DG_H_KEEP_Z0) ||
+      z > dgI(b + DG_H_KEEP_Z1) || c < dgI(b + DG_H_KEEP_Y0) || f > dgI(b + DG_H_KEEP_Y1)) {
+    return false;
+  }
+  let recs = worldMap[b + DG_H_RECS];
+  let n = worldMap[b + DG_H_COUNT];
+  for (var k = 0u; k < n; k++) {
+    let r = recs + k * DG_D_WORDS + DG_D_KEEP;
+    if (x >= dgI(r) && x <= dgI(r + 3u) && z >= dgI(r + 2u) && z <= dgI(r + 5u) &&
+        c >= dgI(r + 1u) && f <= dgI(r + 4u)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// MIRROR-BEGIN dungeon
+// Integer square root, floor: Newton from above (the start is a power of two
+// over the root, so the iterates fall monotonically to it).
+fn dgIsqrt(v : u32) -> u32 {
+  if (v < 2u) { return v; }
+  var x = 1u << ((firstLeadingBit(v) >> 1u) + 1u);
+  for (var i = 0u; i < 8u; i++) {
+    let y = (x + v / x) >> 1u;
+    if (y >= x) { break; }
+    x = y;
+  }
+  return x;
+}
+fn dgClampQ(v : i32) -> i32 { return clamp(v, -DG_Q2_CLAMP, DG_Q2_CLAMP); }
+// Box distance from the per-axis outside distances q (Q2): exact.
+fn dgBox3(qx : i32, qy : i32, qz : i32) -> i32 {
+  let ox = min(max(qx, 0), DG_Q2_CLAMP);
+  let oy = min(max(qy, 0), DG_Q2_CLAMP);
+  let oz = min(max(qz, 0), DG_Q2_CLAMP);
+  return i32(dgIsqrt(u32(ox * ox + oy * oy + oz * oz))) + min(max(qx, max(qy, qz)), 0);
+}
+fn dgBox2(qa : i32, qb : i32) -> i32 {
+  let oa = min(max(qa, 0), 16384);
+  let ob = min(max(qb, 0), 16384);
+  return i32(dgIsqrt(u32(oa * oa + ob * ob))) + min(max(qa, qb), 0);
+}
+// A coordinate over a semi-axis, Q12 (4096 = on the surface), clamped at 4x.
+fn dgNorm(d : i32, h : i32) -> i32 { return clamp((d * 4096) / max(h, 1), -16384, 16384); }
+// Ellipsoid / elliptic-section distance: the normalised radius scaled by the
+// shortest semi-axis -- never more than the true distance (the packer inflates
+// an elongated shape's index bounds by the ratio for that reason).
+fn dgEll(k : i32, h : i32) -> i32 { return ((k - 4096) * h) >> 12u; }
+
+// Quarter-turn rotation of cell coordinates (PLAN §3.4.1 / §3.7 R), linear:
+// q1 (x, z) -> (z, -x). world = R(yaw) local + origin.
+fn dgRotX(q : u32, x : i32, z : i32) -> i32 {
+  if (q == 1u) { return z; }
+  if (q == 2u) { return -x; }
+  if (q == 3u) { return -z; }
+  return x;
+}
+fn dgRotZ(q : u32, x : i32, z : i32) -> i32 {
+  if (q == 1u) { return -x; }
+  if (q == 2u) { return -z; }
+  if (q == 3u) { return x; }
+  return z;
+}
+// A world cell in a prim's dungeon's LOCAL frame (the inverse turn).
+fn dgLocalX(dr : u32, x : i32, z : i32) -> i32 {
+  let qi = (4u - worldMap[dr + DG_D_YAW]) & 3u;
+  return dgRotX(qi, x - dgI(dr + DG_D_ORIGIN_X), z - dgI(dr + DG_D_ORIGIN_Z));
+}
+fn dgLocalZ(dr : u32, x : i32, z : i32) -> i32 {
+  let qi = (4u - worldMap[dr + DG_D_YAW]) & 3u;
+  return dgRotZ(qi, x - dgI(dr + DG_D_ORIGIN_X), z - dgI(dr + DG_D_ORIGIN_Z));
+}
+
+// 3D value noise, Q14 0..16383, on a 2^csl lattice of LOCAL cells.
+fn dgNoise3(x : i32, y : i32, z : i32, csl : u32, seed : u32) -> i32 {
+  let gx = x >> csl;
+  let gy = y >> csl;
+  let gz = z >> csl;
+  let mask = i32((1u << csl) - 1u);
+  let sx = vsmooth(q15frac(x & mask, csl));
+  let sy = vsmooth(q15frac(y & mask, csl));
+  let sz = vsmooth(q15frac(z & mask, csl));
+  let s0 = seed ^ (u32(gy) * 0x9E3779B1u);
+  let s1 = seed ^ (u32(gy + 1) * 0x9E3779B1u);
+  let a00 = i32(hash3(s0, u32(gx), u32(gz)) & 0x3FFFu);
+  let a10 = i32(hash3(s0, u32(gx + 1), u32(gz)) & 0x3FFFu);
+  let a01 = i32(hash3(s0, u32(gx), u32(gz + 1)) & 0x3FFFu);
+  let a11 = i32(hash3(s0, u32(gx + 1), u32(gz + 1)) & 0x3FFFu);
+  let b00 = i32(hash3(s1, u32(gx), u32(gz)) & 0x3FFFu);
+  let b10 = i32(hash3(s1, u32(gx + 1), u32(gz)) & 0x3FFFu);
+  let b01 = i32(hash3(s1, u32(gx), u32(gz + 1)) & 0x3FFFu);
+  let b11 = i32(hash3(s1, u32(gx + 1), u32(gz + 1)) & 0x3FFFu);
+  let n0 = vbilerp(a00, a10, a01, a11, sx, sz);
+  let n1 = vbilerp(b00, b10, b01, b11, sx, sz);
+  return n0 + (((n1 - n0) * sy) >> 15u);
+}
+// The surface displacement, Q2, positive = the solid shrinks. Octave o has
+// half the amplitude and half the cell of octave o - 1.
+fn dgDisp(p : u32, lx : i32, ly : i32, lz : i32) -> i32 {
+  let fl = worldMap[p + DG_P_FLAGS];
+  let oct = (fl >> 16u) & 3u;
+  if (oct == 0u) { return 0; }
+  var csl = (fl >> 20u) & 15u;
+  var amp = dgI(p + DG_P_NAMP);
+  let seed = worldMap[p + DG_P_NSEED];
+  var d = 0;
+  for (var o = 0u; o < oct; o++) {
+    d += ((dgNoise3(lx, ly, lz, csl, seed + o * 0x632BE5ABu) - 8192) * amp) >> 13u;
+    amp = amp >> 1u;
+    if (csl > 1u) { csl -= 1u; }
+  }
+  return d;
+}
+
+// The stair profile's solid, in CELLS, as an L-infinity distance in Q2.
+fn dgRampD(p : u32, lx : i32, ly : i32, lz : i32) -> i32 {
+  let dir = (worldMap[p + DG_P_FLAGS] >> 8u) & 3u;
+  let x0 = dgI(p + DG_P_AX);
+  let y0 = dgI(p + DG_P_AY);
+  let z0 = dgI(p + DG_P_AZ);
+  let x1 = dgI(p + DG_P_BX);
+  let y1 = dgI(p + DG_P_BY);
+  let z1 = dgI(p + DG_P_BZ);
+  var t = lx - x0;
+  var span = x1 - x0;
+  if (dir == 1u) { t = x1 - lx; }
+  if (dir == 2u) { t = lz - z0; span = z1 - z0; }
+  if (dir == 3u) { t = z1 - lz; span = z1 - z0; }
+  let prof = y0 + (clamp(t, 0, span) / max(dgI(p + DG_P_P1), 1)) * dgI(p + DG_P_P0);
+  let hb = worldMap[p + DG_P_P2];
+  let lo = prof - i32(hb >> 16u);
+  let hi = min(prof + i32(hb & 0xFFFFu) - 1, y1);
+  let px = lx * 4 + 2;
+  let py = ly * 4 + 2;
+  let pz = lz * 4 + 2;
+  let dx = max(x0 * 4 - px, px - (x1 + 1) * 4);
+  let dy = max(lo * 4 - py, py - (hi + 1) * 4);
+  let dz = max(z0 * 4 - pz, pz - (z1 + 1) * 4);
+  return max(dx, max(dy, dz));
+}
+// One tapered segment of a tube (Q2): the closest point of a-b by a Q8
+// fraction, the radius lerped by the same fraction. The packer splits a
+// segment so no axis spans more than 256 cells (the products stay < 2^31).
+fn dgSegD(s : u32, px : i32, py : i32, pz : i32) -> i32 {
+  let ax = dgI(s);
+  let ay = dgI(s + 1u);
+  let az = dgI(s + 2u);
+  let bax = dgI(s + 3u) - ax;
+  let bay = dgI(s + 4u) - ay;
+  let baz = dgI(s + 5u) - az;
+  let pax = dgClampQ(px - ax);
+  let pay = dgClampQ(py - ay);
+  let paz = dgClampQ(pz - az);
+  let len2 = bax * bax + bay * bay + baz * baz;
+  let t = clamp(pax * bax + pay * bay + paz * baz, 0, len2);
+  let tq = (t << 8u) / max(len2, 1);
+  let ex = pax - ((bax * tq) >> 8u);
+  let ey = pay - ((bay * tq) >> 8u);
+  let ez = paz - ((baz * tq) >> 8u);
+  let ra = dgI(s + 6u);
+  let rb = dgI(s + 7u);
+  return i32(dgIsqrt(u32(ex * ex + ey * ey + ez * ez))) - (ra + (((rb - ra) * tq) >> 8u));
+}
+// A capsule or a tube: the HARD minimum over its segments (so a densified
+// spline has no smooth-min bulge at every joint), each segment skipped unless
+// the cell is inside its inflated box -- outside it the segment cannot decide
+// anything, exactly as a prim outside a cell's list cannot.
+fn dgTubeD(p : u32, px : i32, py : i32, pz : i32) -> i32 {
+  let s0 = worldMap[p + DG_P_P0];
+  let n = worldMap[p + DG_P_P1];
+  var d = DG_BIG;
+  for (var k = 0u; k < n; k++) {
+    let s = s0 + k * DG_T_WORDS;
+    if (px < dgI(s + 8u) || py < dgI(s + 9u) || pz < dgI(s + 10u) || px > dgI(s + 11u) ||
+        py > dgI(s + 12u) || pz > dgI(s + 13u)) {
+      continue;
+    }
+    d = min(d, dgSegD(s, px, py, pz));
+  }
+  return d;
+}
+// The shape's signed distance at local cell (lx, ly, lz), Q2, negative inside.
+fn dgShapeD(p : u32, lx : i32, ly : i32, lz : i32) -> i32 {
+  let fl = worldMap[p + DG_P_FLAGS];
+  let shape = (fl >> 4u) & 15u;
+  let axis = (fl >> 8u) & 3u;
+  if (shape == DG_SHAPE_RAMP) { return dgRampD(p, lx, ly, lz); }
+  let px = lx * 4 + 2;
+  let py = ly * 4 + 2;
+  let pz = lz * 4 + 2;
+  if (shape == DG_SHAPE_CAPSULE) { return dgTubeD(p, px, py, pz); }
+  let dx = dgClampQ(px - dgI(p + DG_P_AX));
+  let dy = dgClampQ(py - dgI(p + DG_P_AY));
+  let dz = dgClampQ(pz - dgI(p + DG_P_AZ));
+  let hx = dgI(p + DG_P_BX);
+  let hy = dgI(p + DG_P_BY);
+  let hz = dgI(p + DG_P_BZ);
+  if (shape == DG_SHAPE_BOX) { return dgBox3(abs(dx) - hx, abs(dy) - hy, abs(dz) - hz); }
+  if (shape == DG_SHAPE_RBOX) {
+    let r = dgI(p + DG_P_P0);
+    return dgBox3(abs(dx) - (hx - r), abs(dy) - (hy - r), abs(dz) - (hz - r)) - r;
+  }
+  if (shape == DG_SHAPE_ELLIPSOID) {
+    let nx = dgNorm(dx, hx);
+    let ny = dgNorm(dy, hy);
+    let nz = dgNorm(dz, hz);
+    return dgEll(i32(dgIsqrt(u32(nx * nx + ny * ny + nz * nz))), min(hx, min(hy, hz)));
+  }
+  if (shape == DG_SHAPE_CYLINDER) {
+    var du = dy;
+    var dv = dz;
+    var hu = hy;
+    var hv = hz;
+    var da = dx;
+    var ha = hx;
+    if (axis == 1u) { du = dx; hu = hx; da = dy; ha = hy; }
+    if (axis == 2u) { dv = dy; hv = hy; da = dz; ha = hz; du = dx; hu = hx; }
+    let nu = dgNorm(du, hu);
+    let nv = dgNorm(dv, hv);
+    let dr = dgEll(i32(dgIsqrt(u32(nu * nu + nv * nv))), min(hu, hv));
+    return dgBox2(dr, abs(da) - ha);
+  }
+  // DG_SHAPE_VAULT: walls up to the springing line, a half-ellipse over it.
+  let rise = dgI(p + DG_P_P0);
+  var du = dz;
+  var hu = hz;
+  var da = dx;
+  var ha = hx;
+  if (axis == 2u) { du = dx; hu = hx; da = dz; ha = hz; }
+  let wall = hy - rise;
+  let rect = dgBox2(abs(du) - hu, max(-hy - dy, dy - wall));
+  let nu = dgNorm(du, hu);
+  let nv = dgNorm(dy - wall, rise);
+  let ell = max(dgEll(i32(dgIsqrt(u32(nu * nu + nv * nv))), min(hu, max(rise, 1))), wall - dy);
+  return dgBox2(max(min(rect, ell), -hy - dy), abs(da) - ha);
+}
+// One prim's distance at a WORLD cell: its shape in its dungeon's frame, plus
+// the noise.
+fn dgPrimD(p : u32, x : i32, y : i32, z : i32) -> i32 {
+  let dr = worldMap[p + DG_P_DREC];
+  let lx = dgLocalX(dr, x, z);
+  let ly = y - dgI(dr + DG_D_ORIGIN_Y);
+  let lz = dgLocalZ(dr, x, z);
+  return dgShapeD(p, lx, ly, lz) + dgDisp(p, lx, ly, lz);
+}
+// Polynomial smooth minimum, radius k (Q2): exact min where |a - b| >= k.
+fn dgSmin(a : i32, b : i32, k : i32) -> i32 {
+  if (k <= 0) { return min(a, b); }
+  let h = max(k - abs(a - b), 0);
+  return min(a, b) - (h * h) / (4 * k);
+}
+// The carve field C at a world cell, from THAT cell's own list (so C is a
+// function of the cell alone, whichever neighbour asks).
+fn dgCarveIn(lst : u32, x : i32, y : i32, z : i32) -> i32 {
+  let n = min(worldMap[lst], DG_LIST_MAX);
+  var c = DG_BIG;
+  for (var k = 0u; k < n; k++) {
+    let p = worldMap[lst + 1u + k];
+    if ((worldMap[p + DG_P_FLAGS] & 3u) != DG_OP_CARVE) { continue; }
+    c = dgSmin(c, dgPrimD(p, x, y, z), i32(worldMap[p + DG_P_BLEND] & 0xFFFFu));
+  }
+  return c;
+}
+fn dgCarveAt(x : i32, y : i32, z : i32) -> i32 {
+  let lst = dgListAt(x, y, z);
+  if (lst == 0u) { return DG_BIG; }
+  return dgCarveIn(lst, x, y, z);
+}
+// What a carved cell holds: air, or the carve's liquid at or under its level.
+fn dgCarveWord(p : u32, x : i32, y : i32, z : i32) -> u32 {
+  let lm = worldMap[p + DG_P_MATS] & 0xFFFu;
+  if (lm == 0u) { return 0u; }
+  if (y - dgI(worldMap[p + DG_P_DREC] + DG_D_ORIGIN_Y) > dgI(p + DG_P_LEVEL)) { return 0u; }
+  return dgWord(lm, x, y, z);
+}
+// The cell of a prop instance's template at world (x, y, z): its material,
+// DG_CARVE_MAT, or DG_PROP_NONE (template air: leave the world alone). The
+// stamp run-list format (worldmap.h kStamp_*), any y.
+fn dgPropCell(ir : u32, x : i32, y : i32, z : i32) -> u32 {
+  let blk = worldMap[ir + DG_I_BLK];
+  let lx = x - dgI(ir + DG_I_X);
+  let ly = y - dgI(ir + DG_I_Y);
+  let lz = z - dgI(ir + DG_I_Z);
+  let nx = i32(worldMap[blk]);
+  if (lx < 0 || ly < 0 || lz < 0 || lx >= nx || ly >= i32(worldMap[blk + 1u]) || lz >= i32(worldMap[blk + 2u])) {
+    return DG_PROP_NONE;
+  }
+  let ci = worldMap[blk + 3u] + u32(lz * nx + lx) * 2u;
+  let runOff = worldMap[ci];
+  let cnt = worldMap[ci + 1u];
+  for (var k = 0u; k < cnt; k++) {
+    let r = worldMap[runOff + k];
+    let y0 = i32((r >> 16u) & 2047u);
+    if (ly < y0) { return DG_PROP_NONE; }
+    if (ly < y0 + i32((r >> 27u) & 31u)) { return r & 0xFFFu; }
+  }
+  return DG_PROP_NONE;
+}
+// One scatter rule of prim p over the cell (word w so far, terrain word tw,
+// the prim's own distance dOwn, the carve field c). PLAN §3.4.1 "Scatter".
+fn dgScatter(s : u32, p : u32, dOwn : i32, c : i32, w : u32, tw : u32, x : i32, y : i32, z : i32) -> u32 {
+  let kind = worldMap[s + DG_S_KIND] & 255u;
+  let surf = (worldMap[s + DG_S_KIND] >> 8u) & 255u;
+  let dens = worldMap[s + DG_S_DENS];
+  let smin = i32(worldMap[s + DG_S_SIZE] & 0xFFFFu);
+  let smax = i32(worldMap[s + DG_S_SIZE] >> 16u);
+  let mat = worldMap[s + DG_S_MAT];
+  let seed = worldMap[s + DG_S_SEED];
+  let dr = worldMap[p + DG_P_DREC];
+  let lx = dgLocalX(dr, x, z);
+  let ly = y - dgI(dr + DG_D_ORIGIN_Y);
+  let lz = dgLocalZ(dr, x, z);
+  if (kind == DG_SC_MOSS || kind == DG_SC_ORE || kind == DG_SC_PUDDLE) {
+    // THE SOLID BAND behind this prim's surface: untouched, non-air terrain.
+    if (w != tw || c < 0 || (tw & 0xFFFu) == 0u || dOwn < 0) { return w; }
+    if (kind == DG_SC_ORE) {
+      if (dOwn > smax * 4) { return w; }
+      if (dgNoise3(lx, ly, lz, 3u, seed) > 16383 - i32(dens >> 2u)) { return dgWord(mat, x, y, z); }
+      return w;
+    }
+    if (dOwn > DG_FIRM_Q2) { return w; }
+    let up = dgCarveAt(x, y + 1, z) < 0;
+    if (kind == DG_SC_PUDDLE) {
+      // A floor cell whose four sides and underside are solid: one cell of
+      // liquid, contained by construction (PLAN: "puddle").
+      if (!up) { return w; }
+      let sp = max(i32(worldMap[s + DG_S_SPACING]), 4);
+      let gx = fdiv(lx, sp);
+      let gz = fdiv(lz, sp);
+      let h = hash3(seed ^ 0xD6A1u, u32(gx), u32(gz));
+      if ((h & 0xFFFFu) >= dens) { return w; }
+      let r = min(smin + i32((h >> 16u) % u32(max(smax - smin + 1, 1))), (sp - 1) / 2);
+      let h2 = hash3(seed ^ 0x51A7u, u32(gx), u32(gz));
+      let span = max(sp - 2 * r, 1);
+      let ax = abs(lx - (gx * sp + r + i32(h2 % u32(span))));
+      let az = abs(lz - (gz * sp + r + i32((h2 >> 16u) % u32(span))));
+      if (max(max(ax, az), (3 * (ax + az)) / 4) > r) { return w; }
+      if (dgCarveAt(x + 1, y, z) < 0 || dgCarveAt(x - 1, y, z) < 0 || dgCarveAt(x, y, z + 1) < 0 ||
+          dgCarveAt(x, y, z - 1) < 0 || dgCarveAt(x, y - 1, z) < 0) {
+        return w;
+      }
+      return dgWord(mat, x, y, z);
+    }
+    // MOSS: the first solid cell behind the surface on the authored side(s),
+    // in patches.
+    var face = false;
+    if (surf == DG_SURF_FLOOR) { face = up; }
+    else if (surf == DG_SURF_CEIL) { face = dgCarveAt(x, y - 1, z) < 0; }
+    else {
+      face = dgCarveAt(x + 1, y, z) < 0 || dgCarveAt(x - 1, y, z) < 0 || dgCarveAt(x, y, z + 1) < 0 ||
+             dgCarveAt(x, y, z - 1) < 0;
+      if (surf != DG_SURF_WALL) { face = face || up || dgCarveAt(x, y - 1, z) < 0; }
+    }
+    if (face && dgNoise3(lx, ly, lz, 3u, seed) < i32(dens >> 2u)) { return dgWord(mat, x, y, z); }
+    return w;
+  }
+  // THE FLOOR / CEILING FEATURES: an air cell inside this prim, on a lattice.
+  if (w != 0u || dOwn >= 0) { return w; }
+  let sp = max(i32(worldMap[s + DG_S_SPACING]), 4);
+  let gx = fdiv(lx, sp);
+  let gz = fdiv(lz, sp);
+  let h = hash3(seed ^ 0xD6A1u, u32(gx), u32(gz));
+  if ((h & 0xFFFFu) >= dens) { return w; }
+  let size = smin + i32((h >> 16u) % u32(max(smax - smin + 1, 1)));
+  var run = 1;
+  var r = max(size / 3, 1);
+  if (kind == DG_SC_RUBBLE) { run = reposeRunOf(mat); r = size * run; }
+  if (kind == DG_SC_CRYSTAL) { r = max(size / 2, 1); }
+  if (kind == DG_SC_BONES) { r = size; }
+  r = min(r, (sp - 1) / 2);
+  let h2 = hash3(seed ^ 0x51A7u, u32(gx), u32(gz));
+  let span = max(sp - 2 * r, 1);
+  let ax = abs(lx - (gx * sp + r + i32(h2 % u32(span))));
+  let az = abs(lz - (gz * sp + r + i32((h2 >> 16u) % u32(span))));
+  let od = max(max(ax, az), (3 * (ax + az)) / 4);
+  if (od > r) { return w; }
+  var hh = 1;
+  if (kind == DG_SC_RUBBLE) { hh = size - od / run; }
+  else if (kind != DG_SC_BONES) { hh = (size * (r - od)) / max(r, 1); }
+  if (hh < 1) { return w; }
+  if (kind == DG_SC_BONES && (hash3(seed ^ 0xB0E5u, u32(lx), u32(lz)) & 1u) == 0u) { return w; }
+  var down = true;
+  if (kind == DG_SC_STALACTITE) { down = false; }
+  if (kind == DG_SC_CRYSTAL) {
+    if (surf == DG_SURF_CEIL) { down = false; }
+    else if (surf != DG_SURF_FLOOR && ((h2 >> 31u) & 1u) == 1u) { down = false; }
+  }
+  // Grown from the first solid cell within the feature's height below (or
+  // above): every cell between is carved, so the column is contiguous.
+  for (var k = 1; k <= hh; k++) {
+    var yy = y - k;
+    if (!down) { yy = y + k; }
+    if (dgCarveAt(x, yy, z) >= 0) { return dgWord(mat, x, y, z); }
+  }
+  return w;
+}
+
+// A fill's / skin's material at a world cell: `mat`, or the checker of
+// `tile`-cell squares in the dungeon's LOCAL XZ plane alternating mat / mat2.
+fn dgFillMat(p : u32, x : i32, z : i32) -> u32 {
+  let m = worldMap[p + DG_P_MATS] & 0xFFFu;
+  let pat = worldMap[p + DG_P_PAT];
+  let tile = i32(pat >> 16u);
+  if (tile == 0) { return m; }
+  let dr = worldMap[p + DG_P_DREC];
+  let cx = fdiv(dgLocalX(dr, x, z), tile);
+  let cz = fdiv(dgLocalZ(dr, x, z), tile);
+  if (((cx + cz) & 1) != 0) { return pat & 0xFFFu; }
+  return m;
+}
+// THE CELL (PLAN §3.4.1 "Op semantics"): terrain word tw in, the word out.
+fn dgCell(lst : u32, x : i32, y : i32, z : i32, tw : u32) -> u32 {
+  let nAll = worldMap[lst];
+  let n = min(nAll, DG_LIST_MAX);
+  var dd : array<i32, DG_LIST_MAX>;
+  var c = DG_BIG;
+  var own = DG_BIG;
+  var ownP = 0u;
+  for (var k = 0u; k < n; k++) {
+    let p = worldMap[lst + 1u + k];
+    let d = dgPrimD(p, x, y, z);
+    dd[k] = d;
+    if ((worldMap[p + DG_P_FLAGS] & 3u) == DG_OP_CARVE) {
+      c = dgSmin(c, d, i32(worldMap[p + DG_P_BLEND] & 0xFFFFu));
+      if (d < own) { own = d; ownP = p; }
+    }
+  }
+  let tm = tw & 0xFFFu;
+  var w = tw;
+  // 1. the carve; 2. the firm shell round it.
+  if (c < 0) {
+    w = dgCarveWord(ownP, x, y, z);
+  } else if (c < DG_FIRM_Q2 && ownP != 0u && dgFlowy(tm)) {
+    w = dgWord(worldMap[ownP + DG_P_MATS] >> 16u, x, y, z);
+  }
+  // 3. the ordered pass, later wins; a kept cell is not re-cut.
+  var kept = false;
+  for (var k = 0u; k < n; k++) {
+    if (dd[k] >= 0) { continue; }
+    let p = worldMap[lst + 1u + k];
+    let op = worldMap[p + DG_P_FLAGS] & 3u;
+    if (op == DG_OP_FILL) {
+      if ((worldMap[p + DG_P_FLAGS] & DG_PF_OPEN_ONLY) == 0u || (w & 0xFFFu) == 0u) {
+        w = dgWord(dgFillMat(p, x, z), x, y, z);
+      }
+    } else if (op == DG_OP_KEEP) {
+      w = tw;
+      kept = true;
+    } else if (op == DG_OP_SKIN) {
+      if (c >= 0 && c <= i32(worldMap[p + DG_P_BLEND] >> 16u) && tm != 0u) {
+        w = dgWord(dgFillMat(p, x, z), x, y, z);
+      }
+    } else if (!kept) {
+      w = dgCarveWord(p, x, y, z);
+    }
+  }
+  // 4. scatter, prim by prim.
+  for (var k = 0u; k < n; k++) {
+    let p = worldMap[lst + 1u + k];
+    let ns = (worldMap[p + DG_P_FLAGS] >> 12u) & 15u;
+    for (var j = 0u; j < ns; j++) {
+      w = dgScatter(worldMap[p + DG_P_SCAT] + j * DG_S_WORDS, p, dd[k], c, w, tw, x, y, z);
+    }
+  }
+  // 5. the props, later wins: CARVE clears, template air leaves alone.
+  let ni = worldMap[lst + 1u + nAll];
+  for (var k = 0u; k < ni; k++) {
+    let m = dgPropCell(worldMap[lst + 2u + nAll + k], x, y, z);
+    if (m == DG_CARVE_MAT) { w = 0u; }
+    else if (m != DG_PROP_NONE) { w = dgWord(m, x, y, z); }
+  }
+  return w;
+}
+// MIRROR-END dungeon
+
+// THE FAR FIELD'S CELL (`far`): steps 1, 3 and 5 of dgCell -- the carve, the
+// ordered fill / keep / re-carve, the props -- without the firm shell, the
+// skin and the scatter, which are thinner than any cascade cell (2+ voxels)
+// and are most of dgCell's code. `far` is the engine's compile cliff
+// (check_shaders.sh's SPIR-V ceiling): it pays for the shapes, not the dressing.
+// Render-only, so it needs no twin; where a dressing cell would differ the
+// cascade shows the shell's own material, which is what a coarse cell is.
+fn dgCellCoarse(lst : u32, x : i32, y : i32, z : i32, tw : u32) -> u32 {
+  let nAll = worldMap[lst];
+  let n = min(nAll, DG_LIST_MAX);
+  var c = DG_BIG;
+  var own = DG_BIG;
+  var ownP = 0u;
+  for (var k = 0u; k < n; k++) {
+    let p = worldMap[lst + 1u + k];
+    if ((worldMap[p + DG_P_FLAGS] & 3u) != DG_OP_CARVE) { continue; }
+    let d = dgPrimD(p, x, y, z);
+    c = dgSmin(c, d, i32(worldMap[p + DG_P_BLEND] & 0xFFFFu));
+    if (d < own) { own = d; ownP = p; }
+  }
+  var w = tw;
+  if (c < 0) { w = dgCarveWord(ownP, x, y, z); }
+  var kept = false;
+  for (var k = 0u; k < n; k++) {
+    let p = worldMap[lst + 1u + k];
+    let op = worldMap[p + DG_P_FLAGS] & 3u;
+    if (op == DG_OP_SKIN) { continue; }
+    if (op == DG_OP_CARVE && (kept || c >= 0)) { continue; }
+    if (dgPrimD(p, x, y, z) >= 0) { continue; }
+    if (op == DG_OP_FILL) {
+      if ((worldMap[p + DG_P_FLAGS] & DG_PF_OPEN_ONLY) == 0u || (w & 0xFFFu) == 0u) {
+        w = dgWord(dgFillMat(p, x, z), x, y, z);
+      }
+    }
+    else if (op == DG_OP_KEEP) { w = tw; kept = true; }
+    else { w = dgCarveWord(p, x, y, z); }
+  }
+  let ni = worldMap[lst + 1u + nAll];
+  for (var k = 0u; k < ni; k++) {
+    let m = dgPropCell(worldMap[lst + 2u + nAll + k], x, y, z);
+    if (m == DG_CARVE_MAT) { w = 0u; }
+    else if (m != DG_PROP_NONE) { w = dgWord(m, x, y, z); }
+  }
+  return w;
+}

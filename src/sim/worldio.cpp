@@ -509,7 +509,7 @@ WorldgenFingerprint ComputeWorldgenFingerprint(const std::string& assetDir,
   {
     const worldmap::WorldMapData& cm = worldmap::CurrentWorldMap();
     fp.parts[4] = worldmap::HashEditLayerFiles(
-        worldmap::MapEditLayerFiles(assetDir, cm.name, cm.editLayer, cm.locales));
+        worldmap::MapEditLayerFiles(assetDir, cm.name, cm.editLayer, cm.locales, worldmap::DungeonAssetsOf(cm)));
   }
   // [5] the material NAME table, in id order, NUL-separated.
   {

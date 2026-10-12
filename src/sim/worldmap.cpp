@@ -20,6 +20,7 @@
 #include <nlohmann/json.hpp>
 
 #include "sim/biomes.h"
+#include "sim/dungeon.h"
 #include "sim/rng.h"
 #include "sim/treeatlas.h"   // ReadTreeSpeciesHeaders: a tree site's species index + reach
 #include "sim/tuning.h"
@@ -747,6 +748,60 @@ bool ParseLocales(const json& j, std::vector<LocaleDef>& out, std::string& err,
   }
   return true;
 }
+// map.json `dungeons` -> `out`, table order (PLAN_dungeons §3.1). False + `err`
+// on a malformed entry; the ASSET is loaded later and a missing one is only a
+// warning (the dungeon is then not placed).
+bool ParseDungeons(const json& j, std::vector<DungeonDef>& out, std::string& err) {
+  out.clear();
+  if (!j.contains("dungeons")) return true;
+  if (!j["dungeons"].is_array()) { err = "dungeons must be an array"; return false; }
+  for (const json& d : j["dungeons"]) {
+    DungeonDef g;
+    if (!d.is_object() || !d.contains("id") || !d["id"].is_string()) { err = "a dungeon needs an \"id\""; return false; }
+    g.id = d["id"].get<std::string>();
+    const std::string who = "dungeon \"" + g.id + "\": ";
+    if (!LocaleIdOk(g.id)) { err = who + "the id is its asset dir and ref group: [a-z0-9_-]+"; return false; }
+    for (const DungeonDef& o : out)
+      if (o.id == g.id) { err = who + "two dungeons with this id"; return false; }
+    g.name = d.value("name", g.id);
+    g.asset = d.value("dungeon", g.id);
+    if (!LocaleIdOk(g.asset)) { err = who + "\"dungeon\" names an asset dir: [a-z0-9_-]+"; return false; }
+    if (!d.contains("at") || !d["at"].is_array() || d["at"].size() != 2 || !d["at"][0].is_number() ||
+        !d["at"][1].is_number()) {
+      err = who + "needs at: [x, z] (the anchor column, world voxels)";
+      return false;
+    }
+    g.ax = d["at"][0].get<int>();
+    g.az = d["at"][1].get<int>();
+    g.yOffset = d.contains("yOffset") && d["yOffset"].is_number() ? d["yOffset"].get<int>() : 0;
+    const int yaw = d.contains("yaw") && d["yaw"].is_number() ? d["yaw"].get<int>() : 0;
+    if (yaw % 90 != 0) { err = who + "yaw must be a quarter turn (0, 90, 180, 270)"; return false; }
+    g.yawQ = ((yaw / 90) % 4 + 4) % 4;
+    out.push_back(std::move(g));
+  }
+  return true;
+}
+
+// The scratch dungeon (voxserve DUNGEON) and the gates' enable switch.
+std::unique_ptr<ScratchDungeon>& ScratchSlot() {
+  static std::unique_ptr<ScratchDungeon> s;
+  return s;
+}
+bool& DungeonsOn() {
+  static bool on = true;
+  return on;
+}
+}  // namespace
+
+void SetScratchDungeon(const ScratchDungeon* s) {
+  if (s) ScratchSlot() = std::make_unique<ScratchDungeon>(*s);
+  else ScratchSlot().reset();
+}
+const ScratchDungeon* ScratchDungeonSlot() { return ScratchSlot().get(); }
+void SetDungeonsEnabled(bool on) { DungeonsOn() = on; }
+bool DungeonsEnabled() { return DungeonsOn(); }
+
+namespace {
 std::string LocaleLayerStem(const LocaleDef& l) { return l.editLayer.empty() ? std::string("ground") : l.editLayer; }
 }  // namespace
 
@@ -794,7 +849,8 @@ std::map<std::string, int> LocaleRefYOffsets(const std::string& assetDir, const 
 std::vector<std::pair<std::string, std::string>> MapEditLayerFiles(const std::string& assetDir,
                                                                    const std::string& mapName,
                                                                    const std::string& editLayer,
-                                                                   const std::vector<LocaleDef>& locales) {
+                                                                   const std::vector<LocaleDef>& locales,
+                                                                   const std::vector<std::string>& dungeonAssets) {
   std::vector<std::pair<std::string, std::string>> out;
   if (!editLayer.empty()) out.push_back({assetDir + "/worldedits/" + editLayer + ".svedit", editLayer + ".svedit"});
   for (const LocaleDef& l : locales) {
@@ -803,6 +859,32 @@ std::vector<std::pair<std::string, std::string>> MapEditLayerFiles(const std::st
     std::error_code ec;
     if (std::filesystem::is_regular_file(p, ec)) out.push_back({p, l.id + "/" + stem + ".svedit"});
   }
+  std::set<std::string> seen;
+  for (const std::string& a : dungeonAssets) {
+    if (a.empty() || !seen.insert(a).second) continue;
+    const std::string p = assetDir + "/dungeons/" + a + "/detail.svedit";
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(p, ec)) out.push_back({p, "dungeon:" + a + "/detail.svedit"});
+  }
+  return out;
+}
+
+std::vector<std::string> ReadDungeonAssets(const std::string& assetDir, const std::string& mapName) {
+  std::vector<std::string> out;
+  std::ifstream f(assetDir + "/worldmap/" + mapName + "/map.json");
+  if (!f) return out;
+  json j;
+  try { f >> j; } catch (const std::exception&) { return out; }
+  std::vector<DungeonDef> ds;
+  std::string err;
+  if (!ParseDungeons(j, ds, err)) return out;
+  for (const DungeonDef& g : ds) out.push_back(g.asset);
+  return out;
+}
+
+std::vector<std::string> DungeonAssetsOf(const WorldMapData& m) {
+  std::vector<std::string> out;
+  for (const DungeonDef& g : m.dungeons) out.push_back(g.asset);
   return out;
 }
 
@@ -878,6 +960,55 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
           warn("locale \"" + l.id + "\": editLayer locales/" + l.id + "/" + l.editLayer +
                ".svedit does not exist; the locale has no edit layer");
       }
+  }
+  // ---- DUNGEONS (docs/PLAN_dungeons.md §3.1, sim/dungeon.h) --------------------
+  // Parsed and their programs loaded + resolved here; ANCHORED (the bare ground
+  // at `at` for `seed`) at the site-pad bake below, beside the locales. A
+  // dungeon whose asset is missing or refuses is a WARNING and is not placed:
+  // a map must still boot while a dungeon is being authored.
+  {
+    std::string derr;
+    if (!ParseDungeons(j, out.dungeons, derr)) {
+      log += at + derr + "\n";
+      return false;
+    }
+    if (const ScratchDungeon* sd = ScratchDungeonSlot()) {
+      bool replaced = false;
+      for (DungeonDef& g : out.dungeons)
+        if (sd->replaceMapEntry && g.id == sd->def.id) {
+          g.shell = sd->def.shell;
+          g.res = sd->def.res;
+          g.shellPath = sd->def.shellPath;
+          g.shellHash = sd->def.shellHash;
+          replaced = true;
+        }
+      if (!replaced) out.dungeons.push_back(sd->def);
+    }
+    for (DungeonDef& g : out.dungeons) {
+      if (g.shell) continue;   // the scratch program, already loaded
+      auto shell = std::make_shared<dungeon::Shell>();
+      std::string serr, used;
+      if (!dungeon::LoadShellAsset(assetDir, g.asset, *shell, serr, &used)) {
+        warn("dungeon \"" + g.id + "\": " + serr + " -- not placed");
+        continue;
+      }
+      if (used.size() > 11 && used.compare(used.size() - 11, 11, "shell.json") == 0)
+        warn("dungeon \"" + g.id + "\": no shell.bin, loaded " + used + " (compile the dungeon to write the .bin)");
+      uint32_t srcHash = 0;
+      const std::string dj = assetDir + "/dungeons/" + g.asset + "/dungeon.json";
+      if (dungeon::SourceHashOfFile(dj, srcHash) && srcHash != shell->sourceHash)
+        warn("dungeon \"" + g.id + "\": shell is STALE (dungeon.json hash " + std::to_string(srcHash) +
+             ", the shell was compiled from " + std::to_string(shell->sourceHash) + ") -- recompile it");
+      auto res = std::make_shared<dungeon::Resolved>();
+      if (!dungeon::ResolveShell(*shell, set.matNames, set.matClass, *res, serr)) {
+        warn("dungeon \"" + g.id + "\": " + serr + " -- not placed");
+        continue;
+      }
+      g.shellPath = used;
+      if (!dungeon::SourceHashOfFile(used, g.shellHash)) g.shellHash = 0;
+      g.shell = std::move(shell);
+      g.res = std::move(res);
+    }
   }
   // ---- terrain (P-G): the numbers that used to be worldgen.* --------------------
   // Every length is authored at `refVoxelsPerMetre` voxels to the metre and
@@ -2162,6 +2293,48 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       st.padY += off;
       st.refY += off;
     }
+    // THE DUNGEONS' ANCHORS (PLAN_dungeons §2.1): the bare ground at `at`, the
+    // same resolution a locale anchor takes, so the whole dungeon rides the
+    // ground AT THE ANCHOR, rigidly. The scratch ISOLATE dungeon names its y.
+    const ScratchDungeon* scratch = ScratchDungeonSlot();
+    for (DungeonDef& g : out.dungeons) {
+      if (!g.shell || !g.res) continue;
+      const bool absY = scratch && scratch->absoluteY && !scratch->replaceMapEntry && g.id == scratch->def.id;
+      g.groundY = absY ? scratch->anchorY - 1 : BareGroundHeight(g.ax, g.az, seed);
+      // PLAN §2.1 / §3.7 (D3's world/dungeon_refs.*): the anchor cell lands at
+      // (at.x, bare ground + yOffset, at.z) -- the GROUND cell itself at
+      // yOffset 0 -- and the rest at base + R(yaw) (local - anchor).
+      const std::array<int, 3> base{g.ax, absY ? scratch->anchorY : g.groundY + g.yOffset, g.az};
+      dungeon::Placed pl;
+      pl.shell = g.shell;
+      pl.res = g.res;
+      pl.yawQ = g.yawQ;
+      pl.origin = dungeon::OriginFor(*g.shell, g.yawQ, base);
+      dungeon::PlacedBounds(pl);
+      {
+        // A trial pack of this dungeon alone: a program the index cannot hold
+        // (a cell over the list limits) is a warning, not a refused map.
+        std::vector<uint32_t> trial(kHeaderWords, 0u);
+        std::string perr;
+        if (!dungeon::PackDungeons({pl}, trial, perr)) {
+          warn("dungeon \"" + g.id + "\": " + perr + " -- not placed");
+          g.shell.reset();
+          g.res.reset();
+          continue;
+        }
+      }
+      g.origin = pl.origin;
+      g.boxMin = pl.boxMin;
+      g.boxMax = pl.boxMax;
+      g.keepMin = pl.keepMin;
+      g.keepMax = pl.keepMax;
+      g.resolved = true;
+      std::printf("world map: '%s' dungeon '%s' anchor (%d,%d): ground y%d, origin (%d,%d,%d) yaw %d, box "
+                  "(%d,%d,%d)..(%d,%d,%d), %zu prims, %zu props\n",
+                  name.c_str(), g.id.c_str(), g.ax, g.az, g.groundY, g.origin[0], g.origin[1], g.origin[2],
+                  g.yawQ * 90, g.boxMin[0], g.boxMin[1], g.boxMin[2], g.boxMax[0], g.boxMax[1], g.boxMax[2],
+                  g.shell->prims.size(), g.shell->instances.size());
+    }
     // ---- THE ROAD PROFILES (map v2 R1, worldmap.h kSiteRoad) ------------------
     // Per road, deterministic integer arithmetic on the BARE ground (no road
     // and no pad in it: landColumnBare), sampled every kRoadStep voxels along
@@ -2445,6 +2618,13 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     const uint32_t sh = out.structureHash;
     hsh = FnvBytes(hsh, reinterpret_cast<const uint8_t*>(&sh), sizeof sh);
   }
+  // ...and each placed dungeon's program (its file bytes; the placement is in
+  // map.json already), only when there is one.
+  for (const DungeonDef& g : out.dungeons)
+    if (g.Placed()) {
+      const uint32_t dh = g.shellHash ^ (static_cast<uint32_t>(g.origin[1]) * 0x9E3779B1u);
+      hsh = FnvBytes(hsh, reinterpret_cast<const uint8_t*>(&dh), sizeof dh);
+    }
   out.contentHash = hsh;
   return true;
 }
@@ -2474,6 +2654,22 @@ std::string MapCheckJson(const std::string& name, bool ok, const WorldMapData& m
   for (const LocaleDef& l : m.locales)
     ls.push_back({{"id", l.id}, {"groundY", l.groundY}, {"anchorY", l.ay}, {"delta", l.Delta()}});
   j["locales"] = ls;
+  // PLAN_dungeons: each dungeon as placed for the check's seed (the World map
+  // page's dungeons layer draws the box and the anchor).
+  json dg = json::array();
+  for (const DungeonDef& g : m.dungeons) {
+    json o = {{"id", g.id}, {"name", g.name}, {"asset", g.asset}, {"at", {g.ax, g.az}}, {"yOffset", g.yOffset},
+              {"yaw", g.yawQ * 90}, {"placed", g.Placed()}};
+    if (g.Placed()) {
+      o["groundY"] = g.groundY;
+      o["origin"] = {g.origin[0], g.origin[1], g.origin[2]};
+      o["box"] = {{"min", {g.boxMin[0], g.boxMin[1], g.boxMin[2]}}, {"max", {g.boxMax[0], g.boxMax[1], g.boxMax[2]}}};
+      o["prims"] = g.shell->prims.size();
+      o["props"] = g.shell->instances.size();
+    }
+    dg.push_back(o);
+  }
+  j["dungeons"] = dg;
   j["siteCellMax"] = static_cast<int>(kSiteCellMax);
   j["siteCellWorst"] = m.siteCellWorst;
   // Map v2 R1: each road as the engine baked it -- the map page's profile
@@ -2695,6 +2891,33 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
   if (!map.sculpt.empty()) {
     W[kHSculpt] = U(static_cast<int>(W.size()));
     W.insert(W.end(), map.sculpt.begin(), map.sculpt.end());
+  }
+  // ---- the dungeon block (PLAN_dungeons §3.4; sim/dungeon.h PackDungeons) ----
+  // Nothing for a map without placed dungeons: kHDungeon stays 0, the one word
+  // worldgen's dungeon layer reads per chunk.
+  {
+    std::vector<dungeon::Placed> placed;
+    for (const DungeonDef& g : map.dungeons) {
+      if (!g.Placed()) continue;
+      dungeon::Placed pl;
+      pl.id = g.id;
+      pl.shell = g.shell;
+      pl.res = g.res;
+      pl.yawQ = g.yawQ;
+      pl.origin = g.origin;
+      pl.boxMin = g.boxMin;
+      pl.boxMax = g.boxMax;
+      pl.keepMin = g.keepMin;
+      pl.keepMax = g.keepMax;
+      placed.push_back(std::move(pl));
+    }
+    dungeon::PackStats ds;
+    if (!dungeon::PackDungeons(placed, W, log, &ds, !DungeonsEnabled())) return false;
+    if (!placed.empty())
+      std::printf("world map: %zu dungeon(s) packed: %u prims, %u props (%u templates), %u index cells, %u list "
+                  "words, hash %u (probe <= %u), %u words, worst list %u\n",
+                  placed.size(), ds.prims, ds.instances, ds.templates, ds.indexCells, ds.listWords, ds.hashCap,
+                  ds.probeMax, ds.words, ds.worstList);
   }
   W[kHContentHash] = 0u;
   W[kHContentHash] = FnvWords(W) ^ map.contentHash;

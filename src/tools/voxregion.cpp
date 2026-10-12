@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "sim/biomes.h"
+#include "sim/dungeon.h"
 #include "sim/chunkstore.h"
 #include "sim/mattable.h"
 #include "sim/pagetable.h"
@@ -478,8 +479,6 @@ bool ParseReq(const std::vector<long long>& v, VoxRegionReq& req) {
 // ---------------------------------------------------------------------------
 // map-overhaul P7: the export, the swatch, and the helpers they share.
 
-namespace {
-
 // Generate `chunks` — all inside the residency window whose min chunk is
 // `origin`, so every one has its own slot — and hand each chunk's words to
 // `fn`. Pages are recycled batch by batch exactly as BuildVoxRegion does; this
@@ -535,6 +534,8 @@ void GenerateChunks(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
     if (base + n < chunks.size()) world.pages->ResetAllEmpty(ctx.queue);
   }
 }
+
+namespace {
 
 // Bits that are per-tick scratch (stamp 16..18, excite 19..23) or a transient
 // CPU flag (31): a stored chunk and a generated one may differ there without
@@ -746,6 +747,125 @@ bool BuildBiomeSwatch(GpuContext& ctx, World& world, Simulation& sim,
   Put32(out, 20, (uint32_t)z0);
   Put32(out, 24, sizeVox);
   Put32(out, 28, lod);
+  return true;
+}
+
+// ---- the dungeon preview (docs/PLAN_dungeons.md §5.0) ----------------------
+bool PreviewDungeon(GpuContext& ctx, Simulation& sim, const std::vector<MaterialDef>& mats,
+                    const DungeonPreviewReq& req, std::string& info, uint32_t& prims, std::string& err) {
+  prims = 0;
+  if (req.mode == "CLEAR") {
+    worldmap::SetScratchDungeon(nullptr);
+    biomes::EnvironmentStamp stamp;
+    std::string elog;
+    if (!ReloadEnvironment(ctx, sim, mats, stamp, elog)) { err = "environment reload failed: " + elog; return false; }
+    info = "{\"ok\":true,\"cleared\":true}";
+    return true;
+  }
+  auto shell = std::make_shared<dungeon::Shell>();
+  std::string used;
+  if (!dungeon::LoadShellPath(req.src, *shell, err, &used)) return false;
+  std::vector<std::string> names;
+  std::vector<uint32_t> klass;
+  for (const MaterialDef& m : mats) {
+    names.push_back(m.name);
+    klass.push_back(m.gpu.klass);
+  }
+  auto res = std::make_shared<dungeon::Resolved>();
+  if (!dungeon::ResolveShell(*shell, names, klass, *res, err)) return false;
+  worldmap::ScratchDungeon sd;
+  sd.def.id = req.mode == "MAP" ? req.id : std::string("_scratch");
+  sd.def.name = shell->dungeon;
+  sd.def.asset = shell->dungeon;
+  sd.def.shell = shell;
+  sd.def.res = res;
+  sd.def.shellPath = used;
+  dungeon::SourceHashOfFile(used, sd.def.shellHash);
+  sd.def.yawQ = ((req.yaw / 90) % 4 + 4) % 4;
+  if (req.mode == "MAP") {
+    sd.replaceMapEntry = true;
+    bool found = false;
+    for (const worldmap::DungeonDef& g : worldmap::CurrentWorldMap().dungeons) found = found || g.id == req.id;
+    if (!found) { err = "the loaded map places no dungeon '" + req.id + "'"; return false; }
+  } else if (req.mode == "PLACE") {
+    sd.def.ax = req.x;
+    sd.def.az = req.z;
+    sd.def.yOffset = req.yOffset;
+  } else if (req.mode == "ISOLATE") {
+    // A ROCK BLOCK: under the map's spawn column, the box's top 400 voxels
+    // under the ground -- below both cave bands (h - 310 at the deepest), so
+    // the program is carved out of plain stone and nothing else is near it.
+    const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+    sd.def.ax = m.spawnX;
+    sd.def.az = m.spawnZ;
+    dungeon::Placed probe;
+    probe.shell = shell;
+    probe.res = res;
+    probe.yawQ = sd.def.yawQ;
+    probe.origin = dungeon::OriginFor(*shell, sd.def.yawQ, {0, 0, 0});
+    dungeon::PlacedBounds(probe);
+    const int ground = worldmap::BareGroundHeight(m.spawnX, m.spawnZ, kDefaultSeed);
+    sd.absoluteY = true;
+    sd.anchorY = ground - 400 - probe.boxMax[1];
+  } else {
+    err = "DUNGEON mode must be ISOLATE, PLACE, MAP or CLEAR";
+    return false;
+  }
+  worldmap::SetScratchDungeon(&sd);
+  biomes::EnvironmentStamp stamp;
+  std::string elog;
+  if (!ReloadEnvironment(ctx, sim, mats, stamp, elog)) {
+    worldmap::SetScratchDungeon(nullptr);
+    err = "environment reload failed: " + elog;
+    return false;
+  }
+  const worldmap::DungeonDef* g = nullptr;
+  for (const worldmap::DungeonDef& d : worldmap::CurrentWorldMap().dungeons)
+    if (d.id == sd.def.id) g = &d;
+  std::string warns = "[";
+  for (const std::string& w : worldmap::CurrentWorldMap().warnings)
+    if (w.find("dungeon") != std::string::npos) {
+      std::string e;
+      for (char ch : w) {
+        if (ch == '"' || ch == '\\') e += '\\';
+        if ((unsigned char)ch >= 0x20) e += ch;
+      }
+      warns += (warns.size() > 1 ? ",\"" : "\"") + e + "\"";
+    }
+  warns += "]";
+  if (!g || !g->Placed()) {
+    err = "the scratch dungeon was not placed: " + warns;
+    return false;
+  }
+  dungeon::Placed pl;
+  pl.shell = g->shell;
+  pl.res = g->res;
+  pl.yawQ = g->yawQ;
+  pl.origin = g->origin;
+  pl.boxMin = g->boxMin;
+  pl.boxMax = g->boxMax;
+  pl.keepMin = g->keepMin;
+  pl.keepMax = g->keepMax;
+  std::vector<uint32_t> trial(worldmap::kHeaderWords, 0u);
+  dungeon::PackStats ps;
+  std::string perr;
+  dungeon::PackDungeons({pl}, trial, perr, &ps);
+  const int ax = dungeon::RotX(g->yawQ, shell->anchor[0], shell->anchor[2]) + g->origin[0];
+  const int az = dungeon::RotZ(g->yawQ, shell->anchor[0], shell->anchor[2]) + g->origin[2];
+  const int ay = shell->anchor[1] + g->origin[1];
+  auto v3 = [](const std::array<int, 3>& v) {
+    return "[" + std::to_string(v[0]) + "," + std::to_string(v[1]) + "," + std::to_string(v[2]) + "]";
+  };
+  info = "{\"ok\":true,\"id\":\"" + g->id + "\",\"mode\":\"" + req.mode + "\",\"seed\":" + std::to_string(kDefaultSeed) +
+         ",\"origin\":" + v3(g->origin) + ",\"yaw\":" + std::to_string(g->yawQ * 90) +
+         ",\"anchor\":[" + std::to_string(ax) + "," + std::to_string(ay) + "," + std::to_string(az) + "]" +
+         ",\"groundY\":" + std::to_string(g->groundY) + ",\"bounds\":{\"min\":" + v3(g->boxMin) + ",\"max\":" +
+         v3(g->boxMax) + "},\"keep\":{\"min\":" + v3(g->keepMin) + ",\"max\":" + v3(g->keepMax) +
+         "},\"prims\":" + std::to_string(shell->prims.size()) + ",\"instances\":" +
+         std::to_string(shell->instances.size()) + ",\"templates\":" + std::to_string(ps.templates) +
+         ",\"indexCells\":" + std::to_string(ps.indexCells) + ",\"listWords\":" + std::to_string(ps.listWords) +
+         ",\"warnings\":" + warns + "}";
+  prims = (uint32_t)shell->prims.size();
   return true;
 }
 
@@ -964,6 +1084,42 @@ int RunVoxServe(GpuContext& ctx, World& world, Simulation& sim,
       if (!ExportSaveEdits(ctx, world, sim, live, dir, seed, outp, report)) { fail(report); continue; }
       std::fprintf(stderr, "export: %s\n", report.c_str());
       ok(0);
+      continue;
+    }
+    if (cmd == "DUNGEON") {
+      // docs/PLAN_dungeons.md §5.0: a scratch dungeon program, re-packed into
+      // the world map, so every later REGION is real genChunk with it carved.
+      DungeonPreviewReq dr;
+      std::string paths, infoPath;
+      dr.mode = tok.size() >= 2 ? tok[1] : std::string();
+      bool parsed = false;
+      if (dr.mode == "CLEAR") {
+        parsed = true;
+      } else if (dr.mode == "ISOLATE" && tok.size() >= 4) {
+        dr.seed = (uint32_t)std::strtoul(tok[2].c_str(), nullptr, 10);
+        parsed = SplitPaths(tail(3), dr.src, infoPath);
+      } else if (dr.mode == "PLACE" && tok.size() >= 8) {
+        dr.x = std::atoi(tok[2].c_str());
+        dr.z = std::atoi(tok[3].c_str());
+        dr.yOffset = std::atoi(tok[4].c_str());
+        dr.yaw = std::atoi(tok[5].c_str());
+        dr.seed = (uint32_t)std::strtoul(tok[6].c_str(), nullptr, 10);
+        parsed = SplitPaths(tail(7), dr.src, infoPath);
+      } else if (dr.mode == "MAP" && tok.size() >= 5) {
+        dr.id = tok[2];
+        dr.seed = (uint32_t)std::strtoul(tok[3].c_str(), nullptr, 10);
+        parsed = SplitPaths(tail(4), dr.src, infoPath);
+      }
+      if (!parsed) {
+        fail("DUNGEON wants ISOLATE <seed> <src>|<info> | PLACE <x> <z> <yOffset> <yaw> <seed> <src>|<info> | "
+             "MAP <id> <seed> <src>|<info> | CLEAR");
+        continue;
+      }
+      std::string info, err;
+      uint32_t prims = 0;
+      if (!PreviewDungeon(ctx, sim, live, dr, info, prims, err)) { fail(err); continue; }
+      if (!infoPath.empty() && !WriteFileBytes(infoPath, info.data(), info.size(), err)) { fail(err); continue; }
+      ok(prims);
       continue;
     }
     if (cmd == "SWATCH") {

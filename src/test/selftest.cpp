@@ -44,6 +44,9 @@ const std::vector<Gate>& RiverGates();
 const std::vector<Gate>& LakeSettleGates();
 // Locales (docs/PLAN_map_v2.md L1): CPU only, a synthetic map in a temp dir.
 const std::vector<Gate>& LocaleGates();
+// Dungeons (docs/PLAN_dungeons.md D1): the asset format (CPU) and the fixture
+// through genChunk against the CPU twin (GPU).
+const std::vector<Gate>& DungeonGates();
 const std::vector<Gate>& AltitudeGates();
 // The Node generator data gates (test_mobgen / test_anatomy / test_environment.mjs),
 // shelled out to through scripts/generator_parity.mjs. No World, no GPU.
@@ -294,6 +297,10 @@ const char* const kOrder[] = {
     // ordinary group does not, overlapping layers resolve map-then-locale.
     // CPU only; the loaded map is put back as it was.
     "locale",
+    // Dungeons (docs/PLAN_dungeons.md D1): every assets/dungeons/* loads, its
+    // shell.bin is its shell.json's twin and current with its dungeon.json,
+    // SVED v3 resolves through the placement. CPU only, nothing left behind.
+    "dungeon-format",
     // Map v2 A1: nothing absolute-Y that should be relative, on the `peaks`
     // fixture (window, per-biome treeline, lapse rate, lava clearance, valley
     // sediment, cliff rock + settle). The `clearing` exit: reload, put the
@@ -710,6 +717,10 @@ const char* const kOrder[] = {
     // two above and with their exit contract (switch back, reload the
     // environment, regenerate the window at the origin it found).
     "harrowby-cellar",
+    // Dungeons D1: the harness map's fixture through genChunk, held cell for
+    // cell to the CPU twin, then settled round its chamber. Same exit contract
+    // (reload the environment, regenerate the window at the origin it found).
+    "dungeon-gen",
     // REFERENCES (PLAN_world_editor.md P1). After `corpse-save` for the same
     // exit contract: mobs and debris reset, id counter restored, park function
     // removed, store cleared, and worldgen regenerated at the origin the gate
@@ -1346,7 +1357,7 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &MapV2Gates(), &RiverGates(), &LakeSettleGates(), &LocaleGates(), &AltitudeGates(), &GeneratorGates(), &ScaleGates(),
+    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &MapV2Gates(), &RiverGates(), &LakeSettleGates(), &LocaleGates(), &DungeonGates(), &AltitudeGates(), &GeneratorGates(), &ScaleGates(),
                           &SimGates(), &CaGates(), &GasGates(), &TicketGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),

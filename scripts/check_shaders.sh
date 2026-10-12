@@ -564,7 +564,13 @@ fn ptTick() -> u32 { return ${u}.tick; }"
   { printf '%s\n\n' "$PRELUDE_TEXT"
     [ -n "$ptseed" ] && printf '%s\n' "$ptseed"
     [ -n "$wgpre" ] && printf '%s\n' "$wgpre"
-    cat "$commonSrc"; printf '\n'; cat "$f"; } > "$combined"
+    cat "$commonSrc"; printf '\n'; cat "$f"
+    # worldgen's dungeon layer lives in its own file (gpu/resources.cpp
+    # AssembleShaderSource appends it the same way; .wgsli so the per-shader
+    # loop never compiles it alone).
+    if [ "$name" = "worldgen.wgsl" ] && [ -f "$SHADER_DIR/worldgen_dungeon.wgsli" ]; then
+      printf '\n'; cat "$SHADER_DIR/worldgen_dungeon.wgsli"
+    fi; } > "$combined"
 
   # `-f wgsl` parses, resolves, and validates, then re-emits WGSL we discard.
   # (`-f none` is advertised in --help but rejected by this build.) A missing
@@ -734,7 +740,13 @@ if [ -f "$WORLDGEN_COMBINED" ]; then
   # ceiling as the sweep it came out of rather than riding on it.
   # `farmap` is the surface-map fill (LOD-seam package A): one genColumn, one
   # rolled genCellIn and the canopy scan — smaller than the sweep it rides.
-  for spec in "far:25000" "farpatch:25000" "fardown:25000" "farmap:25000"; do
+  # `far` 25000 -> 28000 (2026-10-12, dungeons D1): the far sweep evaluates
+  # the dungeon layer's shapes per sample (worldgen_dungeon.wgsli
+  # dgCellCoarse, the PLAN's "surface pieces must appear far away"): 22,813 ->
+  # 26,359 instructions. The dressing half of the evaluator (skin, scatter,
+  # firm shell) is deliberately NOT reachable from `far`; the measured cold
+  # driver compile before/after is in docs/PLAN_dungeons.md (D1 report).
+  for spec in "far:28000" "farpatch:25000" "fardown:25000" "farmap:25000"; do
     ep="${spec%%:*}"; ceil="${spec##*:}"
     spv="$TMP/worldgen_${ep}.spv"
     if ! "$TINT_BIN" -f spirv -ep "$ep" -o "$spv" "$WORLDGEN_COMBINED" >/dev/null 2>&1; then

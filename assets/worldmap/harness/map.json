@@ -108,5 +108,16 @@
       "about": "An AUTHORED lake (P-F): same place on every seed, the spawn_lake preset's geometry. Placed on the map, not relative to the spawn; the spawn-site gate checks the spawn stays off it."
     }
   ],
-  "rules": []
+  "rules": [],
+  "dungeons": [
+    {
+      "id": "fixture",
+      "name": "Engine fixture dungeon",
+      "dungeon": "_fixture",
+      "at": [-2000, 3200],
+      "yOffset": 0,
+      "yaw": 90,
+      "about": "The dungeon-format / dungeon-gen gates' fixture (docs/PLAN_dungeons.md D1): assets/dungeons/_fixture, turned a quarter so the local frame is exercised. 2.5 km from the pad, the lakes and the spawn, so no other gate's ground moves."
+    }
+  ]
 }
