@@ -1,6 +1,7 @@
 #include "game/mob.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -29,6 +30,7 @@
 #include "sim/reactcpu.h"
 #include "sim/rainexpo.h"  // RainExposedCpu: the rain fall-line lattice
 #include "sim/rng.h"
+#include "sim/solutes.h"  // rinseSlow: blood-soaked water rinses slowly
 #include "sim/scale.h"   // SkinScaleFor / NeededArtUpsample / MetresToCells
 #include "sim/tuning.h"
 
@@ -2103,6 +2105,8 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
           nw.strike.biteCarrion =
               std::clamp(s2.value("carrion", 1.0f), 1.0f, 4.0f);
           nw.strike.push = std::clamp(s2.value("push", 1.0f), 0.0f, 4.0f);
+          nw.strike.biteSwallow =
+              std::clamp(s2.value("swallow", 0.0f), 0.0f, 1.0f);
           nw.strike.biteStain =
               std::clamp(s2.value("biteStain", 1.0f), 0.0f, 4.0f);
         }
@@ -17074,7 +17078,30 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
       }
       for (const DebrisVoxel& v : limb.voxels) after[ci(v) >> 6] = 0ull;
     }
-    LimbVoxelsToParticles(limb, PhysScaleOf(limb), removed, world, spawns);
+    // SWALLOWED (DamageCtx::swallow): that share of the torn cells is eaten,
+    // not shed. Keyed on the cell, the limb and how much it had left, so a
+    // replay drops the same ones. A COPY: `removed` still says where the
+    // wound is (the bleed centroid below).
+    if (ctx.swallow > 0.0f && !removed.empty()) {
+      std::vector<DebrisVoxel> shed = removed;
+      const uint32_t keep16 = (uint32_t)std::lround(
+          (1.0f - std::clamp(ctx.swallow, 0.0f, 1.0f)) * 65536.0f);
+      const uint32_t key = (uint32_t)id_ * 2654435761u ^
+                           (uint32_t)limbIndex * 40503u ^ limb.voxelsCharged;
+      shed.erase(
+          std::remove_if(shed.begin(), shed.end(),
+                         [&](const DebrisVoxel& v) {
+                           const uint32_t cell =
+                               ((uint32_t)(uint8_t)v.x) |
+                               ((uint32_t)(uint8_t)v.y << 8) |
+                               ((uint32_t)(uint8_t)v.z << 16);
+                           return (Hash3(key, cell, 0x5A11Du) & 0xFFFFu) >= keep16;
+                         }),
+          shed.end());
+      LimbVoxelsToParticles(limb, PhysScaleOf(limb), shed, world, spawns);
+    } else {
+      LimbVoxelsToParticles(limb, PhysScaleOf(limb), removed, world, spawns);
+    }
   }
   MarkInstancesDirty();
   // The lattice changed, so the burnt fraction may have (a cut can take
@@ -24475,6 +24502,66 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       outTab[t] = Rotate(q, Vec3{(float)(t % 3 - 1), (float)((t / 3) % 3 - 1),
                                  (float)(t / 9 - 1)});
     const uint32_t ubx = (uint32_t)bd.x, uby = (uint32_t)bd.y;
+    // ---- BLOOD-SOAKED WATER RINSES BLOOD OFF SLOWLY (2026-10-11) ----------
+    // A washer carrying dissolved matter (the solute layer: a corpse bleeding
+    // into a pond) takes that matter's coat off rinseSlow times more slowly at
+    // the species' full look (lookFull, else saturation), linearly from clean (solutes.json `rinseSlow`,
+    // blood 16). The concentration is the chunk's MEAN over its liquid -- the
+    // one figure the CPU has (World::SoluteAgg, asked for here on every visit
+    // so a body lying in the pool keeps it fresh); a chunk not answered yet
+    // reads as clean. x16 fixed point, memoized per chunk for the sweep.
+    IVec3 slowChunk{INT_MIN, INT_MIN, INT_MIN};
+    uint32_t slowQ = 16u, slowMat = 0u;
+    auto rinseSlowAt = [&](IVec3 cc) {
+      const IVec3 wc = ChunkOfCell(cc.x, cc.y, cc.z);
+      if (wc.x == slowChunk.x && wc.y == slowChunk.y && wc.z == slowChunk.z) return;
+      slowChunk = wc;
+      slowQ = 16u;
+      slowMat = 0u;
+      if (sweepOut) {
+        StainEvt ev;
+        ev.k = sweepK;
+        ev.fetch = 2;
+        ev.chunk = wc;
+        sweepOut->push_back(ev);
+      } else {
+        world.RequestSoluteAgg(wc);
+      }
+      uint32_t agg = 0;
+      if (!world.SoluteAgg(wc, agg)) return;
+      const uint32_t species = agg >> 24, mass = agg & 0xFFFFFFu;
+      if (species == 0 || mass == 0) return;
+      const SoluteDef* sd = CurrentSoluteById(species);
+      if (sd == nullptr || sd->rinseSlow <= 1.0f || sd->from == 0) return;
+      // The liquid's volume in eighths (the state nibble is fullness - 1).
+      uint64_t eighths = (uint64_t)kChunkVol * 8u;
+      if (const CachedChunk* ch = world.Cached(wc); ch && ch->voxels.size() == kChunkVol) {
+        eighths = 0;
+        for (const uint32_t w : ch->voxels) {
+          const uint32_t m = w & 0xFFFu;
+          if (m != 0 && m < matGpu_.size() && matGpu_[m].klass == CLASS_LIQUID)
+            eighths += ((w >> 12) & 0xFu) + 1u;
+        }
+        if (eighths == 0) return;
+      }
+      const float conc = std::min(255.0f, (float)mass * 8.0f / (float)eighths);
+      // FULL is where the water LOOKS fully bloody (lookFull), else the
+      // saturation: the owner's "fully saturated" is what they see.
+      const uint32_t full = sd->lookFull != 0 ? sd->lookFull : sd->saturation;
+      const float f = std::min(1.0f, conc / (float)std::max(1u, full));
+      slowQ = (uint32_t)std::lround(16.0f * (1.0f + (sd->rinseSlow - 1.0f) * f));
+      slowMat = sd->from;
+      // SANDVOX_RINSE_TRACE=1: the first 40 chunks a rinse found dirty water
+      // in, with the concentration and the slow-down it read off them.
+      static const bool kTrace = std::getenv("SANDVOX_RINSE_TRACE") != nullptr;
+      static std::atomic<int> traced{0};
+      if (kTrace && traced.fetch_add(1) < 40)
+        std::printf("rinse trace t%u: chunk (%d,%d,%d) %s mass %u over %llu eighths "
+                    "-> conc %.1f of %u, rinse x1/%.2f\n",
+                    tick, wc.x, wc.y, wc.z, sd->name.c_str(), mass,
+                    (unsigned long long)eighths, (double)conc, full,
+                    (double)slowQ / 16.0);
+    };
     // A wrapping cursor rather than `(start + k) % ns` per sample, and two
     // divisions for the cell's coordinates rather than three: this loop is the
     // contact pass's whole cost while a crowd stands in a pool (68 ns a sample
@@ -24538,6 +24625,15 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       const size_t vi = e - 1;
       const uint16_t cur = v.Stain(vi);
       uint16_t next = cur;
+      if (c.wash && BodyStainAmt(cur) != 0) {
+        // Only the coat of the matter the water carries is held on: blood in
+        // bloody water. A second roll on the hash's upper bits passes 16 in
+        // slowQ, so clean water (16) is the roll above alone.
+        rinseSlowAt(cw);
+        if (slowQ > 16u && BodyStainMat(cur) == slowMat &&
+            ((h >> 10) & 0xFFFFu) * slowQ >= 16u * 65536u)
+          continue;
+      }
       if (c.wash) {
         // The material is KEPT while the amount comes down: a half-rinsed arm
         // is still bloody. Only a voxel that comes out clean is left WET.
@@ -24570,6 +24666,10 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   bool changed = false, owned = false;
   for (const StainEvt& ev : *evts) {
     if (ev.k >= count) break;
+    if (ev.fetch == 2) {
+      world.RequestSoluteAgg(ev.chunk);
+      continue;
+    }
     if (ev.fetch) {
       world.RequestChunkFetch(ev.chunk);
       continue;
@@ -25976,7 +26076,8 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
         pieces.push_back({L.body, lc, vital ? rTear * 0.5f : rTear});
       }
       if (pieces.empty()) return;
-      const DamageCtx bt(DamageCause::Bite);
+      DamageCtx bt(DamageCause::Bite);
+      bt.swallow = hit.swallow;
       const float share = hit.hp * 0.5f / (float)pieces.size();
       const float rimX =
           std::max(0.0f, g2.craterStainRim * g2.biteStainScale * hit.stainScale);
@@ -26017,6 +26118,7 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
   const bool meatOnly = !alive_ && hit.carrionScale > 1.0f;
   DamageCtx feed = bite;
   feed.keepWhole = meatOnly;
+  feed.swallow = hit.swallow;
   const bool survived = CarveBlob(li, feed, centre, biteR, gt.biteBlob, seed,
                                   world, spawns, &rep, meatOnly);
   if (kBiteDebug)

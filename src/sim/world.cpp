@@ -100,7 +100,9 @@ constexpr uint64_t kElecQueryOff = kElecSnapOff + kElecSnapBytes;
 // ...and their grids (wave 2 package B: P | air for every cell of each body's
 // box, the boxes' words back to back), copied only as far as this tick used.
 constexpr uint64_t kElecQueryGridOff = kElecQueryOff + kElecQueryResBytes;
-constexpr uint64_t kSlotBytes = kElecQueryGridOff + kElecQueryGridBytes;
+// The solute aggregates asked for (World::RequestSoluteAgg): one word each.
+constexpr uint64_t kSolAggOff = kElecQueryGridOff + kElecQueryGridBytes;
+constexpr uint64_t kSlotBytes = kSolAggOff + (uint64_t)World::kSolAggPerTick * 4;
 
 // Every WorldSnapshot the pipeline hands around is pre-sized: the readback
 // callback memcpys straight into these arrays. One definition, so the published
@@ -586,6 +588,21 @@ const CachedChunk* World::Cached(IVec3 worldChunk) const {
   return it == cache_.end() ? nullptr : &it->second;
 }
 
+void World::RequestSoluteAgg(IVec3 worldChunk) {
+  if (!ChunkInWindow(worldChunk)) return;
+  const uint64_t key = PackChunkKey(worldChunk);
+  if (solAggQueued_.count(key)) return;
+  solAggQueued_[key] = 1;
+  solAggQueue_.push_back(worldChunk);
+}
+
+bool World::SoluteAgg(IVec3 worldChunk, uint32_t& agg) const {
+  auto it = solAgg_.find(PackChunkKey(worldChunk));
+  if (it == solAgg_.end()) return false;
+  agg = it->second.second;
+  return true;
+}
+
 // ---- THE RING DEPTH, AS AN A/B ARM IN ONE BINARY (P2-D) -------------------
 //
 // kReadbackSlots is derived from the pipeline depth (world.h) and that is the
@@ -691,6 +708,20 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
   // strictly cheaper than today, since a sentinel chunk costs a 4-byte table
   // read instead of a 16 KiB GPU->CPU copy, which also reduces the readback
   // traffic kFetchPerTick exists to bound.
+  // The solute aggregates asked for: one tracked 4-byte copy each, out of
+  // solMeta at the SLOT's word (a chunk that streamed out since the ask drops,
+  // as a fetch does).
+  s.solAggIds.clear();
+  while (!solAggQueue_.empty() && s.solAggIds.size() < kSolAggPerTick) {
+    const IVec3 wc = solAggQueue_.front();
+    solAggQueue_.pop_front();
+    solAggQueued_.erase(PackChunkKey(wc));
+    if (!ChunkInWindow(wc)) continue;
+    enc.CopyTracked(pass::Buf::SolMeta, solMeta,
+                    ((uint64_t)kSolMAgg + SlotChunkIndex(wc)) * 4, s.buf,
+                    kSolAggOff + s.solAggIds.size() * 4, 4);
+    s.solAggIds.push_back(wc);
+  }
   s.fetchSentinel.assign(s.fetchIds.size(), 0u);
   for (size_t i = 0; i < s.fetchIds.size(); i++) {
     const uint32_t slotIdx = SlotChunkIndex(s.fetchIds[i]);
@@ -1339,6 +1370,12 @@ void World::KickReadback() {
             std::memcpy(dst, p + kFetchOff + i * kChunkBytes, kChunkBytes);
           }
         }
+        out.solAggKeys.clear();
+        out.solAggWords.resize(sl.solAggIds.size());
+        for (size_t i = 0; i < sl.solAggIds.size(); i++) {
+          out.solAggKeys.push_back(PackChunkKey(sl.solAggIds[i]));
+          std::memcpy(&out.solAggWords[i], p + kSolAggOff + i * 4, 4);
+        }
         // SANDVOX_FETCH_LAND_EARLY=1: the pre-2026-10-03 arm, landing in the
         // callback (GPU-timing latency). A/B in one binary only.
         static const bool kLandEarly = [] {
@@ -1378,6 +1415,17 @@ void World::LandFetches(WorldSnapshot& s) {
     }
   }
   s.fetchKeys.clear();
+  for (size_t i = 0; i < s.solAggKeys.size() && i < s.solAggWords.size(); i++) {
+    auto& e = solAgg_[s.solAggKeys[i]];
+    if (e.first <= s.tick) e = {s.tick, s.solAggWords[i]};
+  }
+  s.solAggKeys.clear();
+  if (solAgg_.size() > 1024) {
+    for (auto it = solAgg_.begin(); it != solAgg_.end();) {
+      if (it->second.first + 600 < s.tick) it = solAgg_.erase(it);
+      else ++it;
+    }
+  }
   // bound the cache (drop chunks far in the past)
   if (cache_.size() > 1024) {
     for (auto it = cache_.begin(); it != cache_.end();) {
@@ -1470,6 +1518,7 @@ void World::InvalidateSnapshot() {
   // contents for any later reader whose tick numbers are LOWER than the gate
   // that filled the entry (2026-09-13, see the header).
   cache_.clear();
+  solAgg_.clear();
   // Everything parsed but unpublished describes the dead world too. Recycle
   // the storage rather than freeing it: the pool is what keeps the steady
   // state at kSnapshotLatency + 1 WorldSnapshots instead of a fresh 780 KiB

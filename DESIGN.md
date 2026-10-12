@@ -1869,6 +1869,16 @@ species shows its FULL look at -- `c` and `f` are taken against it -- so a
 potent species (blood: 48) still reads once dilute. Render-only; packed in
 bits 16..23 of the tintStrength word.
 
+**The CPU's one view of the layer** (2026-10-11): `World::RequestSoluteAgg` /
+`SoluteAgg` -- solCompact's per-chunk aggregate word `(species << 24) | mass`,
+copied 4 bytes a chunk for the chunks asked about (`kSolAggPerTick`), landed
+with the fetches at the fixed snapshot latency. Its consumer is the body
+contact pass (`MobSystem::StainOneLimb`): solutes.json `rinseSlow` makes a
+washer carrying the species rinse ITS coat off that many times more slowly at
+`lookFull` (blood 16), linearly from clean, against the chunk's mean
+concentration over its liquid. Per-chunk, not per-cell: a thin cloud round one
+corpse barely registers; a pool soaked red does. `SANDVOX_RINSE_TRACE=1`.
+
 **The bench's concentration conditions** (package G): `BuildBenchChemistry`
 compiles a solute-conditioned rule instead of skipping it -- `ChemRule::
 soluteSpecies/soluteMin/soluteMax`, resolved by name as UploadSolutes does --

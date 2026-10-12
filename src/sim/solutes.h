@@ -60,6 +60,14 @@ struct SoluteDef {
   // reference that was invisible from above (ticket 2026-10-11 17:47:32).
   // Render-only; never reaches the sim.
   uint32_t lookFull = 0;
+  // A SOLVENT THICK WITH THIS RINSES LESS (2026-10-11): a body washing in a
+  // liquid carrying the species at its FULL LOOK (lookFull, else the
+  // saturation) is rinsed this many times more slowly, linearly in
+  // concentration from 1 (clean). Blood 16: a pool a
+  // corpse has soaked red barely takes blood off you. CPU-only (MobSystem::
+  // StainOneLimb), read against the chunk's mean concentration as the CPU
+  // knows it (World::SoluteAgg).
+  float rinseSlow = 1.0f;
   uint32_t glow = 0;             // 0..255 emission added at saturation
   uint16_t precipitatesTo = 0;   // material a solvent leaves when it evaporates/boils away (0 = nothing)
   std::vector<uint16_t> solvents;       // liquids it dissolves into

@@ -1500,7 +1500,7 @@ struct StainEvt {
   uint32_t k = 0;       // sample index
   uint32_t vi = 0;      // voxel written
   uint16_t next = 0;    // its new coat word
-  uint8_t fetch = 0;    // 1 = a chunk fetch (`chunk`), not a write
+  uint8_t fetch = 0;    // 1 = a chunk fetch (`chunk`), 2 = a solute-agg ask; not a write
   IVec3 chunk{};
 };
 struct StainPre {
@@ -2072,6 +2072,7 @@ struct BiteHit {
   float stainScale = 1.0f;   // StrikeProfile::biteStain: the rim's multiple
   float mouthful = 0.0f;     // StrikeProfile::biteMouthful: 0 = one limb
   float carrionScale = 1.0f; // StrikeProfile::biteCarrion: radius x on a corpse
+  float swallow = 0.0f;      // StrikeProfile::biteSwallow: share of the tear eaten
   uint16_t infectMat = 0;    // material the tear rewrites exposed flesh to
   uint16_t infectStain = 0;  // LIQUID whose stain it smears over the hole
   uint32_t seed = 0;         // tear + stain draw key

@@ -92,6 +92,10 @@ bool LoadSolutes(const std::string& path, const std::vector<MaterialDef>& mats,
     d.tintStrength = std::min(255u, r.value("tintStrength", 0u));
     d.lookFull = r.value("lookFull", 0u);
     if (d.lookFull > 255u) errors += where + "lookFull must be 0..255 (0 = the saturation)\n";
+    d.rinseSlow = r.value("rinseSlow", 1.0f);
+    if (!(d.rinseSlow >= 1.0f && d.rinseSlow <= 256.0f))
+      errors += where + "rinseSlow must be 1..256 (1 = rinses like clean water)\n";
+    d.rinseSlow = std::clamp(d.rinseSlow, 1.0f, 256.0f);
     d.glow = std::min(255u, r.value("glow", 0u));
     if (r.contains("tint")) {
       bool ok = false;

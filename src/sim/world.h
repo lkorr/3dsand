@@ -4594,6 +4594,11 @@ struct WorldSnapshot {
   // 2026-10-03): finding L1 again, on the one store N1 did not move.
   std::vector<uint64_t> fetchKeys;    // PackChunkKey, request order
   std::vector<uint32_t> fetchWords;   // kChunkVol words per key
+  // ...and the solute aggregates asked for (World::RequestSoluteAgg): one
+  // solMeta[kSolMAgg + slot] word, (species << 24) | mass, per key. Landed
+  // with the fetches, at the same fixed latency.
+  std::vector<uint64_t> solAggKeys;
+  std::vector<uint32_t> solAggWords;
   uint32_t ticketFarKilled = 0;
   uint32_t ticketParked = 0;
   // ---- MLS-MPM fluid (seam) ----
@@ -5010,6 +5015,21 @@ class World {
   // tick whose post-sim state the data reflects.
   const CachedChunk* Cached(IVec3 worldChunk) const;
   static constexpr uint32_t kFetchPerTick = 64;  // 1 MB/tick ceiling
+  // ---- WHAT IS DISSOLVED IN A CHUNK, AS THE CPU MAY KNOW IT (2026-10-11) ---
+  //
+  // The solute layer is GPU-owned (the kSol* block) and the fetch cache holds
+  // voxel words only, so nothing on the CPU could tell clean water from water
+  // a corpse has been bleeding into. A body rinsing in a pool needs exactly
+  // that (MobSystem::StainOneLimb: blood-soaked water rinses blood off slowly).
+  // One word per chunk -- solCompact's aggregate, (species << 24) | total mass
+  // -- copied for the chunks somebody ASKED about, kSolAggPerTick a slot: 4
+  // bytes each, so no budget to speak of. The ask is a request, like a fetch:
+  // the answer lands kSnapshotLatency later, and a consumer that keeps asking
+  // keeps it fresh. SoluteAgg returns false for a chunk never answered (read
+  // that as "nothing known", not as clean).
+  void RequestSoluteAgg(IVec3 worldChunk);
+  bool SoluteAgg(IVec3 worldChunk, uint32_t& agg) const;
+  static constexpr uint32_t kSolAggPerTick = 64;
   // Copies the next-tick dirty buffer into the pending slot (caller knows
   // which of dirty[0]/dirty[1] that is this tick).
   void EncodeDirtyCopy(const rhi::CommandEncoder& enc, const rhi::Buffer& dirtyNext);
@@ -5931,6 +5951,7 @@ class World {
     uint32_t epoch = 0;  // pipeline epoch at encode time (see snapEpoch_)
     uint32_t seq = 0;    // ticksEncoded_ at encode time (WorldSnapshot::submitSeq)
     std::vector<IVec3> fetchIds;  // world chunks riding this slot
+    std::vector<IVec3> solAggIds; // RequestSoluteAgg chunks riding this slot
     // Sentinel slots are not copied at all (§2.1a); their table entry is
     // recorded here at encode time and their 4,096 words are synthesized on
     // consumption. 0 means "a real copy was issued for this index".
@@ -6020,6 +6041,11 @@ class World {
   uint32_t fetchTick_ = 0;  // tick of the last EncodeReadbacks: request stamp
   FetchProbe fetchProbe_{};
   std::unordered_map<uint64_t, CachedChunk> cache_;     // packed world key
+  // RequestSoluteAgg's queue (deduplicated) and its answers: packed world key
+  // -> (tick the word reflects, the word).
+  std::deque<IVec3> solAggQueue_;
+  std::unordered_map<uint64_t, uint8_t> solAggQueued_;
+  std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> solAgg_;
 
   // CPU mirror of the page table — the authority for every C++ translation.
   // The GPU buffer is written FROM this, never read back into it: the table is

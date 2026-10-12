@@ -128,7 +128,8 @@
         "biteStain": 0.7,
         "biteForce": 0.7,
         "carrion": 3.17,
-        "push": 0.1
+        "push": 0.1,
+        "swallow": 0.75
       }
     }
   ],

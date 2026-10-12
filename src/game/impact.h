@@ -105,6 +105,11 @@ struct StrikeProfile {
   // a ragdoll, a crate). 1 = every weapon before this. A piranha's 0.1: a
   // shoal feeding on a corpse was flinging it round the pool.
   float push = 1.0f;
+  // WHAT THE TEETH TAKE, THEY EAT (2026-10-11): this fraction (0..1) of the
+  // voxels a bite tears out is swallowed -- gone -- instead of falling into
+  // the world as gore particles. 0 = every torn voxel is shed, as every jaw
+  // before this. A piranha's 0.75.
+  float biteSwallow = 0.0f;
   uint16_t infectMat = 0;   // material the tear REWRITES exposed flesh to (0 = none)
   uint16_t infectStain = 0; // LIQUID whose stain the tear smears over the hole (0 = none)
 

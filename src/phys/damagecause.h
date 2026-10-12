@@ -92,6 +92,11 @@ struct DamageCtx {
   // (Mob::BiteHit, meat only) eats the flesh off a skeleton; the skeleton
   // stays articulated instead of coming apart as the meat goes.
   bool keepWhole = false;
+  // SWALLOWED, NOT SHED (2026-10-11): this fraction (0..1) of the cells the
+  // carve takes VANISH instead of leaving as particles (Mob::CarveLimb's
+  // eject). Teeth that eat what they bite -- a piranha's -- leave no gobbets
+  // in the water. Drawn per cell from a hash of the cell and the limb.
+  float swallow = 0.0f;
 
   constexpr DamageCtx() = default;
   constexpr DamageCtx(DamageCause c, float sev = 1.0f)
