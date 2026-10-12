@@ -1,0 +1,5 @@
+{
+  "//": "Not a package: exists ONLY so Node treats the prop generator .js files in this directory as ES modules, as the browser already does (same as assets/editor/package.json). No dependencies.",
+  "type": "module",
+  "private": true
+}
