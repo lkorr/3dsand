@@ -26,6 +26,8 @@
 //      one on the dry bank out of reach of any water must suffocate --
 //      hp lost to DamageCause::Asphyxia, and dead inside the time its own
 //      numbers allow.
+//   E. CARRION. A dead man and a fresh shoal: they target the corpse and
+//      nip the meat off it (Perception::carrion).
 //
 // One line per part in the detail names what was measured (rule 6). Thresholds
 // in tests/baseline.json (aquatic*). Ticks the world and regenerates it on the
@@ -386,6 +388,86 @@ Status GateAquatic(Ctx& c, std::string& detail) {
                    maxRollBank >= 1.0f && flopsBank >= 2 && deadAt >= 0 &&
                    asphyxia > 0.0f;
 
+  // ======== E. CARRION =======================================================
+  // A dead man in the pool and a fresh shoal (ai::Perception::carrion). They
+  // must take him as a target although he is dead, and NIP the meat off him:
+  // the corpse loses art voxels and its meat-to-bone ratio falls. The release
+  // at the skeleton is the same Perceive test with the ratio under the
+  // profile's `carrion`, and is not run to the end here (a whole man is a
+  // long meal).
+  mobs.Reset();
+  c.debris.Reset();
+  support::RunTicks(rig, 2);
+  const uint64_t corpse = spawnVictim(poolC);
+  if (Mob* m = mobs.FindMobById(corpse)) m->Die();
+  support::RunTicks(rig, 20);
+  shoal.clear();
+  for (int k = 0; k < 6; k++) {
+    const float a = 0.3f + (float)k * 1.047f;
+    shoal.push_back(spawnAt(dPiranha, poolC + Vec3{std::cos(a) * 11.0f, 5.0f + (float)(k % 3),
+                                                   std::sin(a) * 11.0f}));
+  }
+  const std::vector<uint32_t> v0E = limbCounts(corpse);
+  const int kCarrion = (int)BaselineNumber("aquaticCarrionTicks", 1200);
+  float ratio0 = -1.0f, ratioEnd = -1.0f;
+  uint32_t onCorpse = 0;
+  // STRIPPED: the first tick the meat ratio is at or under what the profile
+  // eats down to; RELEASED: the first tick after that no fish holds him.
+  const ai::Profile* prP = mobs.Behaviors().At(mobs.Behaviors().Find("piranha"));
+  const float eatsTo = prP != nullptr ? prP->perception.carrion : 0.0f;
+  int strippedAt = -1, releasedAt = -1;
+  uint32_t meat0 = 0, meatEnd = 0;
+  // WHERE THE NIPS WENT (rule 6): fish-ticks in a cut at the corpse, bodies
+  // those cuts touched, how near the fish was, where the corpse floats.
+  uint32_t cutTicksE = 0, bodiesE = 0;
+  float nearSum = 0.0f, corpseY = 0.0f;
+  std::vector<int> lastHit(shoal.size(), 0);
+  for (int i = 0; i < kCarrion; i++) {
+    support::RunTicks(rig, 1);
+    Vec3 cc{};
+    if (const Mob* m = mobs.FindMobById(corpse))
+      if (m->LimbCentreWorld(m->Def()->rootLimb, cc)) corpseY = cc.y;
+    for (size_t k = 0; k < shoal.size(); k++) {
+      const NpcStroke* st = mobs.MobStroke(shoal[k]);
+      const Mob* f = mobs.FindMobById(shoal[k]);
+      if (st == nullptr || f == nullptr) continue;
+      if (st->phase == NpcStroke::Phase::Cut && st->targetId == corpse) {
+        cutTicksE++;
+        nearSum += (CentreOf(*f) - cc).len();
+        if (st->bodiesHit > lastHit[k]) bodiesE += (uint32_t)(st->bodiesHit - lastHit[k]);
+      }
+      lastHit[k] = st->bodiesHit;
+    }
+    int holding = 0;
+    for (uint64_t id : shoal)
+      if (const ai::Brain* b = mobs.MobBrain(id); b && b->hasTarget && b->targetId == corpse)
+        holding++;
+    onCorpse += (uint32_t)holding;
+    if (const Mob* m = mobs.FindMobById(corpse)) {
+      if (ratio0 < 0.0f) {
+        ratio0 = m->FleshRatio();
+        meat0 = m->CarrionCells();
+      }
+      ratioEnd = m->FleshRatio();
+      meatEnd = m->CarrionCells();
+      if (strippedAt < 0 && ratioEnd >= 0.0f && ratioEnd <= eatsTo) strippedAt = i;
+    }
+    if (strippedAt >= 0 && releasedAt < 0 && holding == 0) {
+      releasedAt = i;
+      break;
+    }
+  }
+  uint32_t nipsE = 0;
+  for (uint64_t id : shoal)
+    if (const ai::Brain* b = mobs.MobBrain(id)) nipsE += b->passBites;
+  int limbsE = 0;
+  const uint32_t lostE = limbLoss(corpse, v0E, limbsE);
+  const bool eOk = corpse != 0 && !mobs.IsAlive(corpse) &&
+                   nipsE >= (uint32_t)BaselineNumber("aquaticCarrionNipsMin", 20) &&
+                   lostE >= (uint32_t)BaselineNumber("aquaticCarrionVoxelsMin", 60) &&
+                   ratio0 > 0.0f && ratioEnd < ratio0;
+  RecordObserved("aquaticCarrionVoxels", (double)lostE);
+
   mobs.Reset();
   c.debris.Reset();
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
@@ -399,15 +481,23 @@ Status GateAquatic(Ctx& c, std::string& detail) {
       "nip against the shark's %.1f a bite | C medium %s: shark targeted the dry man "
       "%d/%d ticks, patrolled %.1f | D stranded %s: ledge fish rolled %.2f, %u flops, back "
       "in the water at tick %d; bank fish rolled %.2f, %u flops, dead at tick %d of %s "
-      "(%.1f hp to asphyxia)",
+      "(%.1f hp to asphyxia) | E carrion %s: %u nips on a corpse, %u fish-ticks on it, "
+      "lost %u voxels over %d limbs, meat/bone %.2f -> %.3f (eats to %.3f: stripped at "
+      "tick %d, let go at %d) [%u cut fish-ticks at it, %u bodies touched, %.1f from its "
+      "pelvis on average; pelvis y %+.1f over the water's top; meat cells %u -> %u, bone and the rest %.0f -> %.0f]",
       siteWhy.c_str(), aOk ? "PASS" : "FAIL", swimShare * 100.0f, outOfWater, worstLow,
       worstHigh, sweptAtFirstPass, passes, peakV, cruise > 0 ? peakV / cruise : 0.0f,
       bites, wentPast, lostA, limbsA, hpLostA, victimEnd.c_str(), bOk ? "PASS" : "FAIL",
       nips, swimmingB,
       lostB, limbsB, hpLostB, perBitePiranha, perBiteShark, cOk ? "PASS" : "FAIL",
       targeted, kMedium, patrol, dOk ? "PASS" : "FAIL", maxRollLedge, flopsLedge,
-      backInAt, maxRollBank, flopsBank, deadAt, cause, asphyxia);
-  return aOk && bOk && cOk && dOk ? Status::Pass : Status::Fail;
+      backInAt, maxRollBank, flopsBank, deadAt, cause, asphyxia, eOk ? "PASS" : "FAIL",
+      nipsE, onCorpse, lostE, limbsE, ratio0, ratioEnd, eatsTo, strippedAt, releasedAt,
+      cutTicksE, bodiesE, cutTicksE ? nearSum / (float)cutTicksE : 0.0f,
+      corpseY - (float)(waterTop + 1), meat0, meatEnd,
+      ratio0 > 0.0f ? (float)meat0 / ratio0 : 0.0f,
+      ratioEnd > 0.0f ? (float)meatEnd / ratioEnd : 0.0f);
+  return aOk && bOk && cOk && dOk && eOk ? Status::Pass : Status::Fail;
 }
 
 // ============================================================================

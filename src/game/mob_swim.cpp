@@ -159,6 +159,55 @@ float MobSystem::BodyImmersion(const Mob& m) const {
   return (float)wet / 3.0f;
 }
 
+float MobSystem::PointImmersion(const Mob& m, Vec3 centre) const {
+  if (world_ == nullptr) return 0.0f;
+  CellCache cache{*world_, m.ClassOf(), /*fetch=*/false};
+  int wet = 0;
+  for (float dy : {-1.5f, 0.0f, 1.5f})
+    if (cache.At(Vec3{centre.x, centre.y + dy, centre.z}) == CellKind::Liquid)
+      wet++;
+  return (float)wet / 3.0f;
+}
+
+// ---------------------------------------------------------------------------
+// CARRION: how much meat is left on a corpse (ai::Perception::carrion).
+// ---------------------------------------------------------------------------
+// Every anatomy limb (worn shells and hair are not food), the fine skin
+// lattice where the limb has one (it is the truth there; the coarse lattice
+// is its collider), a tombstone (material 0) is a cell already gone. The
+// ratio is edible over everything else -- bone, mostly -- so a skeleton reads
+// near 0 and a fresh human reads several; a boneless body with meat on it
+// reads 1e9.
+void MobSystem::RefreshCarrion(Mob& m) const {
+  m.carrionLimb_.assign(m.limbs_.size(), 0u);
+  uint64_t edible = 0, other = 0;
+  const size_t nMat = matEdible_.size();
+  for (int i = 0; i < m.AppendedBase() && i < (int)m.limbs_.size(); i++) {
+    const MobLimb& L = m.limbs_[(size_t)i];
+    if (L.body == 0 || m.IsBloodless(i)) continue;
+    uint32_t e = 0, o = 0;
+    auto count = [&](uint32_t mat) {
+      if (mat == 0) return;
+      if (mat < nMat && matEdible_[mat] != 0)
+        e++;
+      else
+        o++;
+    };
+    if (L.HasFineSkin()) {
+      for (const PrefabVoxel& v : L.skinVoxels) count(v.material);
+    } else {
+      for (const DebrisVoxel& v : L.voxels) count(v.payload & 0xFFFu);
+    }
+    m.carrionLimb_[(size_t)i] = e;
+    edible += e;
+    other += o;
+  }
+  m.fleshRatio_ = edible == 0  ? 0.0f
+                  : other == 0 ? 1e9f
+                               : (float)((double)edible / (double)other);
+  m.carrionKnown_ = true;
+}
+
 // ---------------------------------------------------------------------------
 // SenseWater: the wet share, the mode, and the waterline / bed over the body.
 // ---------------------------------------------------------------------------

@@ -242,6 +242,17 @@ struct Perception {
   // `stickiness`'s arithmetic: `scentPull` voxels nearer than it is.
   float scentRange = 0.0f;
   float scentPull = 0.0f;
+  // ---- CARRION (2026-10-11, the piranha) -----------------------------------
+  // > 0: a CORPSE is a target too, while it still has meat on it -- while
+  // its edible cells (organic, not alight: Actor::fleshRatio) outnumber its
+  // inedible ones (bone, mostly) by more than this ratio. A shoal that killed
+  // a man keeps at him until he is a skeleton, then goes back to patrolling.
+  // 0 = the dead are not food, every profile before this one. A corpse is
+  // acquired like a living stranger (range, cone, line, minImmersion, its own
+  // blood in the water) but never preferred over one: `carrionPull` voxels
+  // FURTHER than it is, so a swimmer still turns on the living.
+  float carrion = 0.0f;
+  float carrionPull = 0.0f;
 };
 
 struct Movement {
@@ -841,6 +852,12 @@ struct Actor {
   // are a dry, unhurt body -- what a gate's hand-built actor list gets.
   float immersion = 0.0f;
   bool bleeding = false;
+  // ---- A CORPSE, AS A SCAVENGER SEES IT (2026-10-11) -----------------------
+  // Only a dead body has `alive == false` AND a fleshRatio: its edible cells
+  // over its inedible ones (MobSystem::RefreshCarrion; a boneless body with
+  // any meat reads 1e9). 0 = not food -- the default, and what every living
+  // actor carries. Read only by Perception::carrion.
+  float fleshRatio = 0.0f;
   // Its velocity, world voxels/sec, when the publisher knows it (0 = unknown;
   // the brain's own low-passed estimate is used instead).
   Vec3 velocity{};

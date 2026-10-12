@@ -284,7 +284,8 @@ TuneMode TuneModeOf(Tune t) {
 //                  "holdTicks": 4 },
 //     // ---- the swimmers (2026-10-10); every key optional --------------------
 //     // perception: "minImmersion" (a target must be this wet), "scentRange",
-//     //             "scentPull" (a bleeding body in the water, felt unseen)
+//     //             "scentPull" (a bleeding body in the water, felt unseen),
+//     //             "carrion", "carrionPull" (a corpse with meat left is food)
 //     // movement.wander: "depth" (a volumetric body draws each leg's height),
 //     //             "figure8", "figure8Size", "figure8Laps" (Movement)
 //     "orbit": { "radius": 19, "speed": 0.7, "height": 6, "engage": 2.0,
@@ -459,6 +460,8 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
           std::clamp(q.value("minImmersion", 0.0f), 0.0f, 1.0f);
       pr.perception.scentRange = std::max(0.0f, q.value("scentRange", 0.0f));
       pr.perception.scentPull = q.value("scentPull", 0.0f);
+      pr.perception.carrion = std::max(0.0f, q.value("carrion", 0.0f));
+      pr.perception.carrionPull = q.value("carrionPull", 0.0f);
     }
     if (p.contains("movement")) {
       const auto& q = p["movement"];
@@ -711,6 +714,9 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
     if (p.perception.scentRange > 0.0f)
       o << ", \"scentRange\": " << num(p.perception.scentRange)
         << ", \"scentPull\": " << num(p.perception.scentPull);
+    if (p.perception.carrion > 0.0f)
+      o << ", \"carrion\": " << num(p.perception.carrion)
+        << ", \"carrionPull\": " << num(p.perception.carrionPull);
     o << " },\n";
     o << "      \"movement\": { \"mobile\": "
       << (p.movement.mobile ? "true" : "false")
@@ -976,7 +982,12 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
   uint32_t order = 0;
   for (const Actor& a : *v.actors) {
     order++;
-    if (!a.alive || a.id == self.id) continue;
+    if (a.id == self.id) continue;
+    // CARRION (Perception::carrion): the dead are food while there is meat
+    // on them, and only to a profile that eats them.
+    const bool carrion = !a.alive && pr.perception.carrion > 0.0f &&
+                         a.fleshRatio > pr.perception.carrion;
+    if (!a.alive && !carrion) continue;
     if (a.faction == self.faction) continue;
     float d = 0;
     const bool current = b.hasTarget && a.id == b.targetId;
@@ -1004,6 +1015,7 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
     if (!scent && !PerceivesNoLine(self, pr, a, range, d)) continue;
     float score = d;
     if (scent) score -= pr.perception.scentPull;
+    if (carrion) score += pr.perception.carrionPull;
     if (current) score -= pr.perception.stickiness;
     // Whoever is fighting ME is the one a provoked neutral answers.
     if (neutral && a.targetId == self.id) score -= 1000.0f;
@@ -1046,7 +1058,11 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
     return;
   }
   const Actor* held = FindActor(v, b.targetId);
-  if (held != nullptr && !held->alive) {
+  // A held corpse is dropped as soon as there is no meat left on it (at
+  // once, to a creature that does not eat the dead).
+  if (held != nullptr && !held->alive &&
+      !(pr.perception.carrion > 0.0f &&
+        held->fleshRatio > pr.perception.carrion)) {
     b.hasTarget = false;
     b.targetId = 0;
     return;

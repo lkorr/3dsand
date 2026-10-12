@@ -94,6 +94,12 @@ struct StrikeProfile {
   // shark's bite is its jaw muscles, not the speed of its nose, and a shark
   // nosing a body at a crawl still takes a mouthful out of it.
   float biteForce = 0.0f;
+  // TEETH IN A CORPSE (2026-10-11): the hole's radius is multiplied by this
+  // when the body bitten is DEAD. 1 = the same nip as on the living. A
+  // piranha's nip is a couple of art voxels, and a shoal feeding at that rate
+  // would take half an hour to strip a man: a dead body does not pull away,
+  // so the jaws close, shake and tear a real piece out.
+  float biteCarrion = 1.0f;
   uint16_t infectMat = 0;   // material the tear REWRITES exposed flesh to (0 = none)
   uint16_t infectStain = 0; // LIQUID whose stain the tear smears over the hole (0 = none)
 

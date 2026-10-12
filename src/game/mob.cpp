@@ -2099,6 +2099,8 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
               std::clamp(s2.value("mouthful", 0.0f), 0.0f, 3.0f);
           nw.strike.biteForce =
               std::clamp(s2.value("biteForce", 0.0f), 0.0f, 1.0f);
+          nw.strike.biteCarrion =
+              std::clamp(s2.value("carrion", 1.0f), 1.0f, 4.0f);
           nw.strike.biteStain =
               std::clamp(s2.value("biteStain", 1.0f), 0.0f, 4.0f);
         }
@@ -2565,6 +2567,7 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   matSelfActive_.clear();
   matHasPair_.clear();
   matHot_.clear();
+  matEdible_.clear();
   matInfectious_.clear();
   infectSpec_.clear();
   coatInfects_.clear();
@@ -2673,6 +2676,14 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     classOf_.push_back((m.gpu.flags & kMatFlagPassable) ? (uint32_t)CLASS_GAS
                                                         : m.gpu.klass);
     matGpu_.push_back(m.gpu);
+    {
+      bool organic = false, hot = false;
+      for (const std::string& t : m.tags) {
+        if (t == "organic") organic = true;
+        if (t == "hot") hot = true;
+      }
+      matEdible_.push_back(organic && !hot ? 1u : 0u);
+    }
     // AN INFECTION IS A MATERIAL WITH AN `infect` BLOCK (B1). The legacy tag
     // is honoured as well, so a table predating the block still rots.
     matInfectious_.push_back(
@@ -6359,6 +6370,24 @@ void MobSystem::ReportNoStroke(const Mob& mob, const ai::Profile* pr,
 int MobSystem::PickTargetLimb(const AttackStyle& sty, const Mob& victim,
                               uint64_t attackerId, float attackerProne,
                               uint32_t tick, float reachHeight) {
+  // ---- A CORPSE IS EATEN WHERE THE MEAT IS (2026-10-11) -------------------
+  // A carrion eater (ai::Perception::carrion) at a body: any limb that still
+  // has edible cells, uniformly, whatever the style's table -- the table is
+  // about where a LIVE body is worth biting, and a shoal that only ever went
+  // for the legs would leave a corpse with a fleshed torso and head forever.
+  // `carrionLimb_` is only counted while a carrion eater is alive, so every
+  // other attacker of the dead keeps the table.
+  if (!victim.alive_ && victim.carrionKnown_) {
+    int meat[64];
+    uint32_t n = 0;
+    for (int i = 0; i < victim.AppendedBase() &&
+                    i < (int)victim.carrionLimb_.size() && n < 64u;
+         i++)
+      if (victim.LimbAlive(i) && victim.carrionLimb_[(size_t)i] > 0)
+        meat[n++] = i;
+    if (n > 0)
+      return meat[rng::Hash3((uint32_t)attackerId ^ 0x7A6A0u, tick, 2) % n];
+  }
   // ---- WHICH TABLE: THE ATTACKER'S POSTURE PICKS IT (2026-09-17) ----------
   //
   // `attackerProne` is the attacker's active loco state's `groundAlign`
@@ -7434,6 +7463,10 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     // ...unless the style bites whatever it meets (AttackStyle::biteAnywhere).
     sw.biteHoldout = st.phaseTick + 1 < st.cutTicks &&
                      !(sty != nullptr && sty->biteAnywhere);
+    // ...and never on a bystander (melee.h EdgeSweep::biteVictim) -- not even
+    // for biteAnywhere, which is "any limb of the victim", not "anybody".
+    if (const Mob* victim = FindCombatantById(st.targetId))
+      sw.biteVictim = victim->Id();
     // A FIST IS PART OF THE ARM THAT THROWS IT (melee.h selfMounted), and
     // probes along its TRAVEL. A set of JAWS does not: its edge already points
     // out of the face -- that is what the Aim effector spends the whole stroke
@@ -8958,6 +8991,55 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     const Mob& av = *avatars_[i];
     if (!av.alive_ || av.def_ == nullptr) continue;
     PublishCombatant(av, actors_[i]);
+  }
+  // ---- THE DEAD, AS A SCAVENGER SEES THEM (ai::Perception::carrion) -------
+  // Only while some living creature eats them: a corpse is otherwise no
+  // actor at all, as it always was. Appended AFTER the players' block so the
+  // player index -> actor index identity above is untouched. Alive = false
+  // keeps every other reader of the list (allies, enemies, flank, queue)
+  // blind to it; only Perceive's carrion test reads `fleshRatio`. The meat
+  // is recounted every kCarrionRecount ticks per corpse, staggered by id.
+  {
+    bool eater = false;
+    for (const Mob& m : mobs_) {
+      if (!m.alive_ || m.def_ == nullptr || m.PlayerControlled()) continue;
+      const ai::Profile* pr = behaviors_.At(m.ai_.profile);
+      if (pr != nullptr && pr->perception.carrion > 0.0f) {
+        eater = true;
+        break;
+      }
+    }
+    constexpr uint32_t kCarrionRecount = 15;
+    for (Mob& m : mobs_) {
+      if (!eater) {
+        m.carrionKnown_ = false;
+        continue;
+      }
+      if (m.alive_ || m.rigReleased_ || m.def_ == nullptr || m.limbs_.empty())
+        continue;
+      if (!m.carrionKnown_ ||
+          (tick + (uint32_t)m.id_) % kCarrionRecount == 0)
+        RefreshCarrion(m);
+      if (!(m.fleshRatio_ > 0.0f)) continue;
+      const int rl = m.def_->rootLimb;
+      Vec3 c{};
+      if (rl < 0 || !m.LimbCentreWorld(rl, c)) continue;
+      const ai::Profile* pr = behaviors_.At(m.ai_.profile);
+      ai::Actor a;
+      a.id = m.id_;
+      a.centre = c;
+      // Lying down: about as tall as it was wide.
+      a.radius = 0.5f * std::max(m.def_->worldSize.x, m.def_->worldSize.z);
+      a.height = std::max(1.0f, m.def_->worldSize.x);
+      a.faction = pr != nullptr ? ai::FactionId(pr->faction) : ~0u;
+      a.alive = false;
+      a.hpFrac = 0.0f;
+      a.heading = m.heading_;
+      a.immersion = PointImmersion(m, c);
+      a.bleeding = m.Bleeding();
+      a.fleshRatio = m.fleshRatio_;
+      actors_.push_back(std::move(a));
+    }
   }
   bpActors.Stop();
 
@@ -25481,13 +25563,61 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
 
 bool Mob::CarveBlob(int limbIndex, const DamageCtx& ctx, Vec3 centreLocal,
                     float radiusWorld, float blob, uint32_t seed, World& world,
-                    std::vector<ParticleSpawn>& spawns, CarveReport* report) {
+                    std::vector<ParticleSpawn>& spawns, CarveReport* report,
+                    bool meatOnly) {
   if (limbIndex < 0 || limbIndex >= (int)limbs_.size() || radiusWorld <= 0.0f)
     return true;
   const uint32_t skinScale = std::max(1u, SkinScaleOf(limbs_[limbIndex]));
-  return CarveLimb(limbIndex, ctx, world, spawns, /*eject=*/true,
-                   BlobCarveFactory({centreLocal}, {radiusWorld},
-                                    std::max(0.5f, blob), seed, skinScale),
+  LimbCarveFactory f = BlobCarveFactory({centreLocal}, {radiusWorld},
+                                        std::max(0.5f, blob), seed, skinScale);
+  // MEAT ONLY: wrap the blob so every cell that is not edible is KEPT. The
+  // material is looked up in a dense box over whichever lattice the factory is
+  // asked for (CarveLimb asks once at the collider's scale and once at the
+  // skin's), built when it is asked -- before CarveLimb touches the lists.
+  if (meatOnly && sys_ != nullptr && !sys_->matEdible_.empty()) {
+    const MobLimb* L = &limbs_[limbIndex];
+    const std::vector<uint8_t>* edible = &sys_->matEdible_;
+    const bool fine = L->HasFineSkin();
+    f = [inner = std::move(f), L, edible, fine, skinScale](float scale)
+        -> LimbCarveKeep {
+      LimbCarveKeep k = inner(scale);
+      const bool useSkin = fine && (uint32_t)scale == skinScale;
+      int lo[3] = {INT_MAX, INT_MAX, INT_MAX}, hi[3] = {INT_MIN, INT_MIN, INT_MIN};
+      auto grow = [&](int x, int y, int z) {
+        lo[0] = std::min(lo[0], x); hi[0] = std::max(hi[0], x);
+        lo[1] = std::min(lo[1], y); hi[1] = std::max(hi[1], y);
+        lo[2] = std::min(lo[2], z); hi[2] = std::max(hi[2], z);
+      };
+      if (useSkin)
+        for (const PrefabVoxel& v : L->skinVoxels) grow(v.x, v.y, v.z);
+      else
+        for (const DebrisVoxel& v : L->voxels) grow(v.x, v.y, v.z);
+      if (lo[0] > hi[0]) return k;
+      const int nx = hi[0] - lo[0] + 1, ny = hi[1] - lo[1] + 1,
+                nz = hi[2] - lo[2] + 1;
+      auto meat = std::make_shared<std::vector<uint8_t>>((size_t)nx * ny * nz, 0u);
+      auto mark = [&](int x, int y, int z, uint32_t m) {
+        if (m != 0 && m < edible->size() && (*edible)[m] != 0)
+          (*meat)[((size_t)(z - lo[2]) * ny + (size_t)(y - lo[1])) * nx +
+                  (size_t)(x - lo[0])] = 1u;
+      };
+      if (useSkin)
+        for (const PrefabVoxel& v : L->skinVoxels)
+          mark(v.x, v.y, v.z, v.material & 0xFFFu);
+      else
+        for (const DebrisVoxel& v : L->voxels)
+          mark(v.x, v.y, v.z, v.payload & 0xFFFu);
+      const int x0 = lo[0], y0 = lo[1], z0 = lo[2];
+      return [k = std::move(k), meat, x0, y0, z0, nx, ny, nz](int x, int y, int z) {
+        if (k(x, y, z)) return true;
+        const int ix = x - x0, iy = y - y0, iz = z - z0;
+        if (ix < 0 || iy < 0 || iz < 0 || ix >= nx || iy >= ny || iz >= nz)
+          return true;
+        return (*meat)[((size_t)iz * ny + (size_t)iy) * nx + (size_t)ix] == 0u;
+      };
+    };
+  }
+  return CarveLimb(limbIndex, ctx, world, spawns, /*eject=*/true, f,
                    /*spall=*/nullptr, report);
 }
 
@@ -25619,8 +25749,11 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
   // a finger cannot be bitten from the far side. No authored field and no
   // per-limb table: it moves a thigh's hole half a voxel and changes nothing
   // there, and it is the entire bite on a hand.
+  // A corpse is torn by StrikeProfile::biteCarrion more (it does not pull
+  // away from the jaws).
   const float biteR = gt.biteRadius * std::max(0.0f, hit.radiusScale) *
-                      (0.4f + 0.6f * power);
+                      (0.4f + 0.6f * power) *
+                      (alive_ ? 1.0f : std::max(1.0f, hit.carrionScale));
   Vec3 centre = local;
   {
     const MobLimb& lb = limbs_[li];
@@ -25763,8 +25896,14 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
     };
   }
 
-  const bool survived =
-      CarveBlob(li, bite, centre, biteR, gt.biteBlob, seed, world, spawns, &rep);
+  // A SCAVENGER'S teeth in a corpse (StrikeProfile::biteCarrion > 1) take the
+  // meat and leave the bone: what a shoal leaves behind is a skeleton.
+  // ...and the skeleton stays in one piece (DamageCtx::keepWhole).
+  const bool meatOnly = !alive_ && hit.carrionScale > 1.0f;
+  DamageCtx feed = bite;
+  feed.keepWhole = meatOnly;
+  const bool survived = CarveBlob(li, feed, centre, biteR, gt.biteBlob, seed,
+                                  world, spawns, &rep, meatOnly);
   if (kBiteDebug)
     std::printf(
         "bite %s: hp %.2f power %.2f | at (%.2f,%.2f,%.2f) local "

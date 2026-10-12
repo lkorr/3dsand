@@ -806,6 +806,15 @@ struct EdgeSweep {
   // Set by the stroke runner, which is the only thing that knows how many cut
   // ticks are left (strokes.h StrokeCursor::phaseTick / cutTicks).
   bool biteHoldout = false;
+  // ...AND ONLY ON THE CREATURE IT WAS THROWN AT (2026-10-11). Nonzero = the
+  // Mob::Id() of the stroke's victim, and the bite lands on nobody else -- not
+  // even on the last cut tick, when the holdout above is off and first
+  // contact otherwise wins, and on every tick of a biteAnywhere style (which
+  // means any limb OF THE VICTIM). Six piranha (biteAnywhere) closing on one
+  // corpse from every side spent their bites on EACH OTHER: three of the
+  // shoal bled to death in the `aquatic` gate's carrion part. 0 = anybody: a
+  // fabricated sweep, the player's fist, a stroke that named no victim.
+  uint64_t biteVictim = 0;
   // ---- IS THE EDGE PART OF THE WIELDER? (2026-09-15) --------------------
   //
   // A HELD BLADE IS A THING YOU POINT; A FIST IS A THING YOU THROW, and the

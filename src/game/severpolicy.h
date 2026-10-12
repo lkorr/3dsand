@@ -217,6 +217,14 @@ constexpr SeverPolicy SeverPolicyOf(const DamageCtx& ctx, Tissue t) {
   p.deathBurnt = r.deathBurnt;
   p.vitalHpZeroDetaches = t == Tissue::Rotten && r.rottenVitalDetach;
   p.byBlade = r.byBlade;
+  if (ctx.keepWhole) {
+    p.impactSevers = false;
+    p.collapseSevers = false;
+    p.carriesChildren = false;
+    p.cutThrough = false;
+    p.joint = JointRule::Never;
+    p.hpZeroSeversAny = false;
+  }
   return p;
 }
 

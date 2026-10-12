@@ -102,7 +102,7 @@
   "headLook": false,
   "aimSpineShare": 0.1,
   "aimLeanBodies": 0.05,
-  "//natural": "A NIP: biteRadius 0.55 x gore.biteRadius is a 0.1..0.25-voxel hole -- one to two of a human's art voxels -- for 4 hp at full speed. No mouthful.",
+  "//natural": "A NIP: biteRadius 0.7 x gore.biteRadius is a 0.12..0.3-voxel hole -- two or three of a human's art voxels -- for 4 hp at full speed. No mouthful, and NO blunt: a blunt share stamps a bruise about a voxel across on every nip, which swamped the hole and made a shoal read as a beating (owner, 2026-10-11). `carrion` 2: in a CORPSE the hole is twice as wide (eight times the meat) -- a dead body does not pull away, and at a nip's size a shoal would take half an hour to strip a man to the bone.",
   "natural": [
     {
       "name": "jaws",
@@ -121,11 +121,11 @@
         "halfWidth": 1.48
       },
       "strike": {
-        "blunt": 0.3,
         "bite": 4,
-        "biteRadius": 0.55,
+        "biteRadius": 0.7,
         "biteStain": 0.7,
-        "biteForce": 0.7
+        "biteForce": 0.7,
+        "carrion": 2
       }
     }
   ],

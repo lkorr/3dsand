@@ -837,6 +837,7 @@ StrikeParts BuildStrikeParts(const EdgeSweep& s, const Vec3& at,
   p.bite.radiusScale = s.strike.biteRadius;
   p.bite.stainScale = s.strike.biteStain;
   p.bite.mouthful = s.strike.biteMouthful;
+  p.bite.carrionScale = s.strike.biteCarrion;
   // THE STRUCK KIND IS NOT HANDED DOWN (2026-09-16): whether teeth REACH flesh
   // depends on what the garment in the way is made of and which limb is under
   // it, and only the thing that was struck knows either.
@@ -1823,8 +1824,9 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // authored `target` weight a lie about where wounds ended up. Held only
       // while there are cut ticks left to find the drawn limb in; on the last
       // one this test is off and first contact wins.
-      const bool wrongTarget = s.bitePrefer != 0 && hb != s.bitePrefer &&
-                               s.biteHoldout;
+      const bool wrongTarget =
+          (s.bitePrefer != 0 && hb != s.bitePrefer && s.biteHoldout) ||
+          (s.biteVictim != 0 && (owner == nullptr || owner->Id() != s.biteVictim));
 
       // ---- STRIKE n OF THIS STROKE ON THIS CREATURE (melee.h victimHits) --
       //

@@ -2065,6 +2065,7 @@ struct BiteHit {
                              // multiple of gore.biteRadius (fangs < 1)
   float stainScale = 1.0f;   // StrikeProfile::biteStain: the rim's multiple
   float mouthful = 0.0f;     // StrikeProfile::biteMouthful: 0 = one limb
+  float carrionScale = 1.0f; // StrikeProfile::biteCarrion: radius x on a corpse
   uint16_t infectMat = 0;    // material the tear rewrites exposed flesh to
   uint16_t infectStain = 0;  // LIQUID whose stain it smears over the hole
   uint32_t seed = 0;         // tear + stain draw key
@@ -3676,6 +3677,14 @@ class Mob {
   uint32_t SwimFelt() const { return swimFelt_; }
   uint32_t MouthfulLimbs() const { return mouthfulLimbs_; }
   uint32_t MouthfulCells() const { return mouthfulCells_; }
+  // A corpse's meat over its bone as the carrion eaters last counted it
+  // (MobSystem::RefreshCarrion); -1 = not counted (no eater alive).
+  float FleshRatio() const { return carrionKnown_ ? fleshRatio_ : -1.0f; }
+  uint32_t CarrionCells() const {
+    uint32_t n = 0;
+    for (uint32_t c : carrionLimb_) n += c;
+    return n;
+  }
   uint32_t SwimBumps() const { return swimBumps_; }
   uint32_t SwimGlances() const { return swimGlances_; }
   // The body's 3D forward: the heading tipped by the swim pitch. Equal to
@@ -4593,9 +4602,13 @@ class Mob {
   // other radius here. `report` receives the removed cells so a caller can
   // soak exactly the hole it made. Returns false when the limb did not survive
   // (CarveLimb's contract: nothing may touch `limbs_` after that).
+  // `meatOnly` (2026-10-11, a scavenger feeding on a corpse): the blob takes
+  // only EDIBLE cells (MobSystem::matEdible_) and leaves the bone, so a
+  // picked-clean corpse is a skeleton and not a heap of crumbs.
   bool CarveBlob(int limbIndex, const DamageCtx& ctx, Vec3 centreLocal,
                  float radiusWorld, float blob, uint32_t seed, World& world,
-                 std::vector<ParticleSpawn>& spawns, CarveReport* report);
+                 std::vector<ParticleSpawn>& spawns, CarveReport* report,
+                 bool meatOnly = false);
   // The blob predicate itself, over a LIST of bites. A member (rather than the
   // free function it reads as) only because LimbCarveFactory is protected here;
   // static because it captures nothing of the creature. Mob::RotAtSpawn hands
@@ -5658,6 +5671,15 @@ class Mob {
   // extra limbs torn and skin cells removed from them, ever.
   uint32_t mouthfulLimbs_ = 0;
   uint32_t mouthfulCells_ = 0;
+  // ---- CARRION (2026-10-11): how much meat is left on THIS CORPSE ---------
+  // Derived from the lattice by MobSystem::RefreshCarrion on a cadence, and
+  // only while something that eats the dead is alive (ai::Perception::
+  // carrion). Not saved: a loaded corpse recounts on its first PreTick.
+  // `carrionLimb_[i]` = limb i's edible cells (the bite's limb draw skips the
+  // picked-clean ones), `fleshRatio_` = ai::Actor::fleshRatio.
+  bool carrionKnown_ = false;
+  float fleshRatio_ = 0.0f;
+  std::vector<uint32_t> carrionLimb_;
   // What this creature is looking at between strokes (Mob::SetAimLook).
   Vec3 aimLook_{};
   bool aimLookValid_ = false;
@@ -8540,6 +8562,12 @@ class MobSystem {
   // off the chunk cache: what a watcher can tell about any body's wetness
   // (ai::Actor::immersion). Unknown cells count as dry.
   float BodyImmersion(const Mob& mob) const;
+  // The same three samples about a POINT (a corpse lies down, so the column
+  // over its walk anchor says nothing): `centre` and +-1.5 voxels in y.
+  float PointImmersion(const Mob& mob, Vec3 centre) const;
+  // CARRION (ai::Perception::carrion): recount a corpse's edible cells per
+  // limb into Mob::carrionLimb_ / fleshRatio_. Edible = matEdible_.
+  void RefreshCarrion(Mob& corpse) const;
   // The body a SWIMMING mob's live stroke is closing its jaws on, through the
   // windup and the cut; nullptr otherwise. BlockedByMob and CrowdPush let the
   // two touch for that window.
@@ -8756,6 +8784,9 @@ class MobSystem {
   std::vector<MatBurst> matStruck_, matBurst_;
   std::vector<uint8_t> matShell_;
   std::vector<uint8_t> matHot_;         // carries tag:hot
+  // tag:organic and not tag:hot -- what a carrion eater counts as meat on a
+  // corpse (MobSystem::RefreshCarrion). Bone carries neither tag.
+  std::vector<uint8_t> matEdible_;
   // mat -> its electric.resist (0 = insulator), for the shock's wet coat and
   // conducting armour (mob_shock.cpp). Rebuilt with the rest on a reload.
   std::vector<uint16_t> matElecResist_;

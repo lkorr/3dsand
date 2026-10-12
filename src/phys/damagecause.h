@@ -86,6 +86,12 @@ struct DamageCtx {
   DamageCause cause = DamageCause::Other;
   bool eaten = false;
   float severity = 1.0f;
+  // KEEP THE LIMB WHOLE (2026-10-11): the carve takes cells and nothing
+  // structural -- no collapse, joint, cut-through or impact sever
+  // (severpolicy.h SeverPolicyOf). A scavenger feeding on a corpse
+  // (Mob::BiteHit, meat only) eats the flesh off a skeleton; the skeleton
+  // stays articulated instead of coming apart as the meat goes.
+  bool keepWhole = false;
 
   constexpr DamageCtx() = default;
   constexpr DamageCtx(DamageCause c, float sev = 1.0f)
