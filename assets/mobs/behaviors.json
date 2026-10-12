@@ -649,17 +649,17 @@
       "perception": { "sightRange": 22, "fovDegrees": 360, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 120, "keepRangeScale": 1.5, "minImmersion": 0.2, "scentRange": 60, "scentPull": 15, "carrion": 0.03, "carrionPull": 8, "nearestPart": true },
       "movement": { "mobile": true, "rangeMin": 0, "rangeMax": 10, "bandSlack": 1.5, "approachSpeed": 1.0, "strafeSpeed": 0, "retreatSpeed": 0, "circleTendency": 0,
                     "wander": { "radius": 8, "speed": 0.5, "pauseMin": 0, "pauseMax": 15, "arrive": 1.5, "depth": 2 } },
-      "orbit": { "radius": 4.5, "radiusJitter": 0.35, "speed": 0.8, "height": 0, "heightJitter": 3, "lookahead": 0.75, "engage": 2.2,
-                 "lapMin": 10, "lapMax": 40, "reverseChance": 0.4,
-                 "chargeSpeed": 2.4, "turnInSpeed": 1.3, "lineUp": 0.6, "lead": 0.5, "lockDist": 1.5, "overrun": 5, "peel": 0.6, "biteCone": 0.9, "passMax": 50, "biteLead": 3, "hitHeight": 0 },
-      "attack": { "styles": ["piranha_nip"], "reach": 10, "aimTolerance": 3.2, "cadenceTicks": 16, "jitterTicks": 12, "commitTicks": 4, "disengageTicks": 0, "pursueSpeed": 0, "leadTicks": 0 },
+      "orbit": { "radius": 4.5, "radiusJitter": 0.35, "speed": 0.8, "height": 0, "heightJitter": 3, "lookahead": 0.75, "engage": 4,
+                 "lapMin": 4, "lapMax": 16, "reverseChance": 0.4,
+                 "chargeSpeed": 2.4, "turnInSpeed": 1.3, "lineUp": 0.6, "lead": 0.5, "lockDist": 1.5, "overrun": 2.5, "peel": 0.6, "biteCone": 0.9, "passMax": 50, "biteLead": 3, "hitHeight": 0 },
+      "attack": { "styles": ["piranha_nip"], "reach": 10, "aimTolerance": 3.2, "cadenceTicks": 6, "jitterTicks": 5, "commitTicks": 4, "disengageTicks": 0, "pursueSpeed": 0, "leadTicks": 0 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "wander": { "weight": 0.5, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.1, "cooldownTicks": 0, "minDwellTicks": 0 },
         "approach": { "weight": 1.3, "cooldownTicks": 0, "minDwellTicks": 6 },
         "orbit": { "weight": 1.0, "cooldownTicks": 0, "minDwellTicks": 8 },
-        "charge": { "weight": 2.5, "cooldownTicks": 6, "minDwellTicks": 4 }
+        "charge": { "weight": 2.5, "cooldownTicks": 2, "minDwellTicks": 4 }
       },
       "rules": [
         { "note": "FRENZY: blood in the water", "when": { "targetBleeding": ">0" }, "tune": { "cadence": 0.45, "speed": 1.25 } },

@@ -104,7 +104,7 @@
   "bodyPush": 0.1,
   "aimSpineShare": 0.1,
   "aimLeanBodies": 0.05,
-  "//natural": "A NIP: biteRadius 0.7 x gore.biteRadius is a 0.12..0.3-voxel hole -- two or three of a human's art voxels -- for 4 hp at full speed. No mouthful, and NO blunt: a blunt share stamps a bruise about a voxel across on every nip, which swamped the hole and made a shoal read as a beating (owner, 2026-10-11). `carrion` 3.17: in a CORPSE the hole is 3.17x as wide (32 times the meat, owner 2026-10-11: 4x what x2 took); `push` 0.1: a nip shoves a body a tenth as hard as a sword's reaction would -- a dead body does not pull away, and at a nip's size a shoal would take half an hour to strip a man to the bone.",
+  "//natural": "A NIP: biteRadius 1.0 x gore.biteRadius is a 0.17..0.42-voxel hole -- three or four of a human's art voxels across (owner 2026-10-11: 0.7 still read as too small) -- for 4 hp at full speed. No mouthful, and NO blunt: a blunt share stamps a bruise about a voxel across on every nip, which swamped the hole and made a shoal read as a beating (owner, 2026-10-11). `carrion` 3.17: in a CORPSE the hole is 3.17x as wide (32 times the meat, owner 2026-10-11: 4x what x2 took); `push` 0.1: a nip shoves a body a tenth as hard as a sword's reaction would -- a dead body does not pull away, and at a nip's size a shoal would take half an hour to strip a man to the bone.",
   "natural": [
     {
       "name": "jaws",
@@ -124,7 +124,7 @@
       },
       "strike": {
         "bite": 4,
-        "biteRadius": 0.7,
+        "biteRadius": 1.0,
         "biteStain": 0.7,
         "biteForce": 0.7,
         "carrion": 3.17,

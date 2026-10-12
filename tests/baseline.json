@@ -450,7 +450,7 @@
   "aquaticShoalTicks": "900",
   "aquaticNipsMin": "15",
   "aquaticShoalHpMin": "30",
-  "aquaticNipRatioMax": "0.15",
+  "aquaticNipRatioMax": "0.35",
   "aquaticMediumTicks": "360",
   "aquaticStrandTicks": "900",
   "_npcSwim_about": "THRESHOLDS for `npc-swim` (a walker swims: game/mob_afloat.cpp). npcSwimFloatTicks: how long the statue human is left in the deep pool before it is read. npcSwimFloatTol: how far its soles may sit from the float height (waterline - 0.72 x standing height), voxels. npcSwimOutTicks: the zombie's time to swim to the low bank and climb out. npcSwimDiveTicks: how long the diving zombie is watched. npcSwimPitchMin: the dive's stroke pitch (PoseDrive::swimPitch), radians, at least.",
