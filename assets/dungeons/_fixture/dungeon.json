@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "name": "Engine fixture (D1)",
+  "about": "THE ENGINE'S HAND-WRITTEN FIXTURE (docs/PLAN_dungeons.md D1): not built with the kit generators -- shell.json beside it is written by hand to exercise every op and shape the engine evaluates, and it is placed on the HARNESS map for the dungeon-format / dungeon-gen gates. Editing this file makes shell.bin STALE (its sourceHash), which dungeon-format reports; re-stamp shell.json's sourceHash and run `sandvox --dungeon-bake _fixture`.",
+  "style": "ruins",
+  "seed": 4242,
+  "palette": { "wall": "limestone", "floor": "flagstone", "trim": "cobble", "support": "timber", "rubble": "gravel" },
+  "pieces": [
+    { "id": "p0", "kit": "fixture", "type": "stair_entrance", "pos": [0, 0, 0], "yaw": 0,
+      "about": "a stair cut down from the surface along +x, 60 cells over 120" },
+    { "id": "p1", "kit": "fixture", "type": "vaulted_corridor", "pos": [118, -60, 0], "yaw": 0,
+      "about": "a 400-cell barrel-vaulted corridor with two timber sets, a cobble skin and an ore scatter" },
+    { "id": "p2", "kit": "fixture", "type": "chamber", "pos": [520, -62, 0], "yaw": 0,
+      "about": "a rounded chamber with a natural-rock pillar (keep), a flagstone floor, rubble piles, stalactites and an alcove prop" },
+    { "id": "p3", "kit": "fixture", "type": "stair", "pos": [600, -62, 60], "yaw": 0,
+      "about": "stairs down along +z, 2 up every 3" },
+    { "id": "p4", "kit": "fixture", "type": "lower_vault", "pos": [600, -114, 140], "yaw": 0,
+      "about": "a vault along +z: moss, puddles, bones" }
+  ],
+  "entrance": { "piece": "p0", "socket": "surface" },
+  "props": [ { "id": "x0", "prop": "fixture/alcove", "params": {}, "pos": [677, -60, -4], "yaw": 90, "piece": "p2" } ]
+}

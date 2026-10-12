@@ -7,6 +7,7 @@
 #include <fstream>
 #include <tuple>
 
+#include "sim/dungeon.h"
 #include "sim/faredits.h"
 #include "sim/worldmap.h"
 
@@ -111,11 +112,13 @@ bool WorldEdits::LoadFiles(const std::vector<std::string>& paths, std::string& e
     // Parse into a scratch copy first, so a malformed file leaves nothing of
     // itself behind: whole files or none.
     const auto before = cols_;
+    const size_t dn = dcells_.size();
     const size_t vc = voxelCount_;
     const bool rel = relative_;
     std::string e;
     if (!ParseInto(b, path, e)) {
       cols_ = before;
+      dcells_.resize(dn);
       voxelCount_ = vc;
       relative_ = rel;
       err += (err.empty() ? "" : "; ") + e;
@@ -135,8 +138,8 @@ bool WorldEdits::ParseInto(const std::vector<uint8_t>& b, const std::string& pat
     return false;
   }
   const uint32_t ver = Rd32(b.data() + 4);
-  if (ver != 1 && ver != 2) {
-    err = path + ": SVED version " + std::to_string(ver) + ", expected 1 or 2";
+  if (ver != 1 && ver != 2 && ver != 3) {
+    err = path + ": SVED version " + std::to_string(ver) + ", expected 1, 2 or 3";
     return false;
   }
   const uint32_t count = Rd32(b.data() + 8);
@@ -149,6 +152,21 @@ bool WorldEdits::ParseInto(const std::vector<uint8_t>& b, const std::string& pat
     err = path + ": " + why;
     return false;
   };
+  if (ver == 3) {
+    // DUNGEON-LOCAL (docs/PLAN_dungeons.md §3.6): {i32 lx, ly, lz, u32 word}
+    // in the frame of the dungeon whose asset dir holds the file. Resolved
+    // through the map's placement of it, which moves with the seed and the
+    // map, so the layer re-resolves like a relative one.
+    const std::string dungeon = std::filesystem::path(path).parent_path().filename().string();
+    if (b.size() < 32 + static_cast<size_t>(count) * 16) return fail("truncated dungeon-local cell list");
+    for (uint32_t i = 0; i < count; i++) {
+      const uint8_t* q = b.data() + 32 + static_cast<size_t>(i) * 16;
+      dcells_.push_back({dungeon, (int32_t)Rd32(q), (int32_t)Rd32(q + 4), (int32_t)Rd32(q + 8), CleanWord(Rd32(q + 12))});
+      voxelCount_++;
+    }
+    relative_ = true;
+    return true;
+  }
   for (uint32_t i = 0; i < count; i++) {
     if (ver == 1) {
       if (p + 16 > b.size()) return fail("truncated chunk header");
@@ -197,6 +215,8 @@ bool WorldEdits::ParseInto(const std::vector<uint8_t>& b, const std::string& pat
 
 void WorldEdits::Clear() {
   cols_.clear();
+  dcells_.clear();
+  unplacedDungeon_ = 0;
   relative_ = false;
   fileSeed_ = 0;
   resolved_ = false;
@@ -235,6 +255,24 @@ void WorldEdits::Resolve(uint32_t seed) {
       byChunk_[Key(wc)].push_back({li, c.word});
       coords_[Key(wc)] = wc;
     }
+  }
+  // THE DUNGEON DETAIL LAYERS (SVED v3), after every column cell: each cell
+  // through every placement of its dungeon's asset in the map in force.
+  unplacedDungeon_ = 0;
+  for (const DungeonCell& d : dcells_) {
+    bool any = false;
+    for (const worldmap::DungeonDef& g : worldmap::CurrentWorldMap().dungeons) {
+      if (!g.Placed() || g.asset != d.dungeon) continue;
+      any = true;
+      const int x = dungeon::RotX(g.yawQ, d.x, d.z) + g.origin[0];
+      const int y = d.y + g.origin[1];
+      const int z = dungeon::RotZ(g.yawQ, d.x, d.z) + g.origin[2];
+      const IVec3 wc{x >> 4, y >> 4, z >> 4};
+      const uint32_t li = (uint32_t)(x & 15) + (uint32_t)(y & 15) * kChunk + (uint32_t)(z & 15) * kChunk * kChunk;
+      byChunk_[Key(wc)].push_back({li, d.word});
+      coords_[Key(wc)] = wc;
+    }
+    if (!any) unplacedDungeon_++;
   }
   // Ascending local index per chunk, so the op stream is a pure function of the
   // file's CONTENT rather than of its authoring order — two layers with the
@@ -275,7 +313,7 @@ void WorldEdits::ResolvedCells(std::vector<AbsCell>& out) const {
 }
 
 void WorldEdits::QueueChunk(IVec3 wc, uint32_t seed) {
-  if (cols_.empty()) return;
+  if (Empty()) return;
   Resolve(seed);
   if (byChunk_.find(Key(wc)) == byChunk_.end()) return;
   pending_.push_back(wc);
@@ -285,7 +323,7 @@ void WorldEdits::QueueWindow(const World& world) {
   // Every whole-window (re)generation also (re)seeds the far field's base, so
   // the horizon agrees with the layer the window is about to receive — and
   // loses a layer the map no longer names.
-  if (cols_.empty()) {
+  if (Empty()) {
     // Unconditionally: the base also carries the map stamps' container cells
     // (faredits.h SetBase), which a map without a layer still has.
     if (world.farEdits) world.farEdits->SetBase({});
@@ -445,6 +483,29 @@ bool WorldEdits::WriteRelative(const std::string& path,
   return WriteBytes(path, b, err);
 }
 
+bool WorldEdits::WriteDungeonLocal(const std::string& path, const std::vector<AbsCell>& localCells,
+                                   std::string& err) {
+  // Sorted (y, z, x) so the file is a function of its content; a cell named
+  // twice keeps its last word, as Resolve would.
+  std::map<std::tuple<int, int, int>, uint32_t> cells;
+  for (const AbsCell& c : localCells) cells[{c.y, c.z, c.x}] = CleanWord(c.word);
+  std::vector<uint8_t> b(32, 0);
+  Put32(b, 0, kMagic);
+  Put32(b, 4, 3);
+  Put32(b, 8, (uint32_t)cells.size());
+  Put32(b, 12, (uint32_t)cells.size());
+  for (const auto& [k, w] : cells) {
+    Push32(b, (uint32_t)std::get<2>(k));
+    Push32(b, (uint32_t)std::get<0>(k));
+    Push32(b, (uint32_t)std::get<1>(k));
+    Push32(b, w);
+  }
+  std::error_code ec;
+  const std::filesystem::path p(path);
+  if (p.has_parent_path()) std::filesystem::create_directories(p.parent_path(), ec);
+  return WriteBytes(path, b, err);
+}
+
 WorldEdits& WorldEditLayer() {
   static WorldEdits g;
   return g;
@@ -516,7 +577,8 @@ void LoadWorldEditLayerForMap(const std::string& assetDir) {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
   std::vector<std::string> paths;
   std::string label;
-  for (const auto& [path, nm] : worldmap::MapEditLayerFiles(assetDir, m.name, m.editLayer, m.locales)) {
+  for (const auto& [path, nm] :
+       worldmap::MapEditLayerFiles(assetDir, m.name, m.editLayer, m.locales, worldmap::DungeonAssetsOf(m))) {
     paths.push_back(path);
     label += (label.empty() ? "'" : " + '") + nm + "'";
   }

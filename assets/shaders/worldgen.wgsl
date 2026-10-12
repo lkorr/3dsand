@@ -3943,6 +3943,13 @@ fn caveBands(x : i32, z : i32, h : i32, biome : u32, seed : u32) -> CaveBands {
   // Depth is the only thing the fill may depend on (caveFill): a lava test
   // on the cavern MASK would stand a lava wall against open air.
   b.top2 = h - vlen(40);
+  // THE DUNGEONS' KEEP-OUT (docs/PLAN_dungeons.md §2.2): a band reaching into
+  // a dungeon's bounds + keepOut is off for the column -- the whole band, so
+  // the cut stays a column band (no floaters) and the magma table under it
+  // (caveFill floods carved cells only) goes with it. One header word when the
+  // map places no dungeon (worldgen_dungeon.wgsli dgCaveKeep).
+  if (b.on1 && dgCaveKeep(x, z, b.f1, b.c1)) { b.on1 = false; }
+  if (b.on2 && dgCaveKeep(x, z, b.f2, min(b.c2, b.top2))) { b.on2 = false; }
   return b;
 }
 
@@ -6369,6 +6376,11 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
         colNoTrees(&trees);
       }
       let canopyArg = max(bitcast<i32>(colCache[cw + CCW_CANOPY]), 0);
+      // THE DUNGEON LAYER (worldgen_dungeon.wgsli): this chunk's index list,
+      // the same for every column of it (a 16^3 chunk lies in one 64^3 index
+      // cell). 0 -- the map places no dungeon, or none reaches here -- and the
+      // cells below are exactly the terrain's.
+      let dgL = dgListOfCell(base.x >> DG_CELL_LOG2, base.y >> DG_CELL_LOG2, base.z >> DG_CELL_LOG2);
       // TOP DOWN, so the cell above is known when the ground cell is reached
       // (`wUp`); stores are per cell and the tallies are sums and ORs, so the
       // order is not observable. ly == CHUNK is the extra cell above.
@@ -6386,7 +6398,11 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
             w = (w & ~0xF000u) | ((topMass + 2u) << 12u);
           }
         }
+        // `wUp` is the TERRAIN word above: the top cell's grains are the
+        // terrain's whatever a dungeon makes of the cells, so the dungeon's
+        // output is a pure function of the terrain word (the CPU twin's input).
         wUp = w;
+        if (dgL != 0u) { w = dgCell(dgL, wx, y, wz, w); }
         let i = lx + ly * CHUNK + lz * CHUNK * CHUNK;
         // Chunk-linear: the slot's page resolved once, per §2.1's second entry
         // point. genChunk overwrites the WHOLE chunk, so the CPU materializes
@@ -6956,6 +6972,9 @@ fn cols(@builtin(workgroup_id) wg : vec3<u32>,
     colTop = max(colTop, col.fluidTop);
     colTop = max(colTop, col.pond + 1);
     colTop = max(colTop, wmSiteTopAt(x, z));
+    // A dungeon's matter over the ground (a ruin's walls, an entrance's arch):
+    // its world box's top, over every column the box covers.
+    colTop = max(colTop, dgColTop(x, z));
     colTop = max(colTop, trees.top);
     if (wmFlag(col.biome, WM_BF_CACTI)) { colTop = max(colTop, wgCactColTop(x, z, bx, bz)); }
     ccStore(blk + CC_HDR + ci * CC_WORDS, &col, &cave, ponds.n, canopy, colTop, trees.top);
@@ -7285,6 +7304,10 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
       can = farCanopyAt(fx, fz, T.seed, &ponds);
     }
     skyCeil = max(skyCeil, can.top);
+    // A DUNGEON's surface matter (a ruin, an entrance arch): its box's top over
+    // the columns it covers, and those columns ask the index per row below.
+    let dgCol = dgColIn(fx, fz);
+    if (dgCol) { skyCeil = max(skyCeil, dgColTop(fx, fz)); }
     // THE BURIED ROWS (map v2 P1): a sample at or under colDeepStoneTop that
     // the cave bands leave solid is M_STONE -- genCellIn's own answer there,
     // by colDeepStoneTop's enumeration of its chain -- so it is answered
@@ -7304,11 +7327,26 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
         mat = genCellIn(&col, &cave, true, &trees, true, &ponds, canopyArg,
                         fine.x, fine.y, fine.z, T.seed) & 0xFFFu;
       }
+      // THE DUNGEON at the sample (worldgen_dungeon.wgsli dgCellCoarse: the
+      // shapes and props of genChunk's dgCell, without the sub-cell dressing),
+      // on the centre sample's material. A cell the dungeon
+      // changed keeps its own colour (no surface-skin repaint below).
+      var dgHit = false;
+      if (dgCol) {
+        let dl = dgListAt(fine.x, fine.y, fine.z);
+        if (dl != 0u) {
+          let dm = dgCellCoarse(dl, fine.x, fine.y, fine.z, mat) & 0xFFFu;
+          dgHit = dm != mat;
+          mat = dm;
+        }
+      }
       // The conservative flag first: it is what a cell keeps when the centre
       // sample found nothing (common.wgsl FAR_PAL_BLOCKER), on the hoisted
       // topC/btop.
       var byteV = farBlockerBand(yRow, topC, btop, step);
-      if (farCellIsSolid(mat)) {
+      if (dgHit && farCellIsSolid(mat)) {
+        byteV = farCellByte(matFarPal(&materials, mat), byteV);
+      } else if (farCellIsSolid(mat)) {
         // shape from the center sample, color from the surface skin (phase 4).
         // What lands in the byte is the skin material's FAR PALETTE SLOT, not
         // its id (common.wgsl farCellByte), and it replaces the blocker: a

@@ -43,6 +43,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -153,11 +154,45 @@ int RunVoxDump(GpuContext& ctx, World& world, Simulation& sim,
 //                              one-biome map, sizeVox square, as an 'SVSW'
 //                              bundle of SVVX regions (BuildBiomeSwatch)
 //
+// DUNGEONS (docs/PLAN_dungeons.md §5.0, the D1 amendment is the contract):
+//
+//   DUNGEON ISOLATE <seed> <src>|<info>      the program alone, in solid rock
+//   DUNGEON PLACE <x> <z> <yOffset> <yaw> <seed> <src>|<info>   in situ anywhere
+//   DUNGEON MAP <id> <seed> <src>|<info>     replaces the map's dungeon <id>
+//   DUNGEON CLEAR                            drops the scratch program
+//                              <src> = a dungeon.json / shell.json / shell.bin;
+//                              <info> gets the placement as JSON (the box to
+//                              REGION over). Ack "OK <prims> <ms>". The anchor
+//                              resolves at the environment's seed (kDefaultSeed,
+//                              ReloadEnvironment's), whatever <seed> says.
+//
 // RELOAD is what makes a slider move the world: worldgen reads tuning through
 // CurrentTuning(), so a live server would otherwise answer forever with the
 // parameters it booted on. The tuner sends it after every save.
 int RunVoxServe(GpuContext& ctx, World& world, Simulation& sim,
                 const std::vector<MaterialDef>& mats);
+
+// Generate `chunks` (all inside the residency window whose min chunk is
+// `origin`) through the real genChunk and hand each chunk's kChunkVol words to
+// `fn`, RAW (no edit layer). Clobbers the window origin and the page table; the
+// caller regenerates its world afterwards. The export's, the swatch's and the
+// `dungeon-gen` gate's generator.
+void GenerateChunks(GpuContext& ctx, World& world, Simulation& sim, uint32_t seed, IVec3 origin,
+                    const std::vector<IVec3>& chunks, const std::function<void(IVec3, const uint32_t*)>& fn);
+
+// One DUNGEON request (above): load + resolve the program at `src`, install it
+// as the scratch dungeon (worldmap::SetScratchDungeon) and reload the
+// environment, so the next genChunk carves it. `info` = the placement JSON.
+// CLEAR uninstalls it. The environment is left with the scratch installed.
+struct DungeonPreviewReq {
+  std::string mode;            // ISOLATE | PLACE | MAP | CLEAR
+  int x = 0, z = 0, yOffset = 0, yaw = 0;
+  std::string id;              // MAP: the map entry replaced
+  uint32_t seed = 0;
+  std::string src;
+};
+bool PreviewDungeon(GpuContext& ctx, Simulation& sim, const std::vector<MaterialDef>& mats,
+                    const DungeonPreviewReq& req, std::string& info, uint32_t& prims, std::string& err);
 
 // ---- the edit-layer export (map-overhaul P7) ------------------------------
 // Every chunk a save stores (ChunkStore at `saveDir`), diffed against what

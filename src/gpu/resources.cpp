@@ -735,6 +735,14 @@ bool AssembleShaderSource(const std::string& shaderDir, const std::string& name,
     std::fprintf(stderr, "cannot read %s/%s\n", shaderDir.c_str(), name.c_str());
     return false;
   }
+  // THE DUNGEON LAYER (docs/PLAN_dungeons.md; worldgen_dungeon.wgsli's header):
+  // worldgen's body continues in its own file, appended here and by
+  // scripts/check_shaders.sh. Absent = an older asset tree, which then has no
+  // dungeon calls to resolve either.
+  if (name == "worldgen.wgsl") {
+    std::string dg;
+    if (ReadFileText(shaderDir + "/worldgen_dungeon.wgsli", dg)) body += "\n" + dg;
+  }
   // The seed accessor the page block's JITTER synthesis calls. Empty unless
   // this shader addresses voxels, which is exactly when the block survives.
   std::string ptSeed;

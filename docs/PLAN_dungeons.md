@@ -218,6 +218,169 @@ entries proportional to touched chunks only. Engine package owns the exact
 packing; the JS side owns `shell.json` semantics. Material names resolve at
 load (`materials.json`), never ids in files.
 
+### 3.4.1 `shell.json` / `shell.bin` schema — D1 AMENDMENT (2026-10-12)
+
+D1 (engine) owns this section; D2 emits exactly this. It refines §3.4 without
+changing its meaning. Engine loader: `src/sim/dungeon.{h,cpp}`
+(`ParseShellJson`, `ReadShellBin`, `WriteShellBin`); the `dungeon-format`
+gate holds every `assets/dungeons/*/shell.bin` to its `shell.json` twin
+(CONTENT equality, not bytes) and to its `dungeon.json` (the hash).
+`sandvox.exe --dungeon-bake <id>` rewrites `shell.bin` from `shell.json`
+with the engine's own writer (handy while D2's binary writer is young).
+
+**Frames and conventions.**
+- Everything in the shell is in the DUNGEON LOCAL FRAME: integer voxel
+  CELLS, Y up. Boxes are INCLUSIVE cell ranges `min..max`. A point (`a`, `b`,
+  tube `pts`, `anchor`) names a CELL and means that cell's centre.
+- `anchor` = the local cell of the entrance socket (shell.json / shell.bin
+  always carry it). Placement (map `dungeons[]`, §3.1) -- THE SAME RULE AS
+  D3's refs (§3.7 D3 AMENDMENT, `src/world/dungeon_refs.*`): `world = (at.x,
+  BareGroundHeight(at.x, at.z) + yOffset, at.z) + R(yaw) · (local - anchor)`
+  (the same bare ground a locale anchor reads). With `yOffset` 0 the anchor
+  cell IS the ground cell at `at`.
+- `R(q)`, q = yaw / 90 (quarter turns only), is LINEAR on cell coordinates
+  (a rotation about the anchor cell): q0 `(x, z)`, q1 `(z, -x)`, q2
+  `(-x, -z)`, q3 `(-z, x)`; y unchanged. (q1 takes local +Z to world +X.)
+  [Corrected 2026-10-12 to D3's rule: the first D1 text had a `-1` cell
+  rotation and the anchor one cell up; no data was written against it.]
+- Noise and scatter are evaluated in LOCAL coordinates, so a dungeon is the
+  same voxels wherever and however it is placed (only its world position
+  moves). The tuner's isolated preview is therefore exactly the in-situ one.
+- Material references are strings: a key of `materials` (a SLOT), else a
+  name from `materials.json`. Unknown = the dungeon does not load
+  (`dungeon-format` fails, the map warns and skips it).
+
+```jsonc
+{ "format": "sandvox-dungeon-shell", "version": 1,
+  "dungeon": "shardwell",              // == the asset dir name
+  "sourceHash": 3735928559,            // u32 FNV-1a of dungeon.json's bytes with every '\r' removed
+  "anchor": [0, 0, 0],                 // local cell of the entrance socket
+  "keepOut": 24,                       // natural caves/lava suppressed within bounds + this (voxels)
+  "naturalCaves": false,               // true = the caves kit opts in: no suppression
+  "materials": { "wall": "limestone", "floor": "flagstone", "rubble": "gravel", ... },
+  "prims": [ Prim, ... ],              // ARRAY ORDER IS PRIORITY ORDER (see "evaluation")
+  "props": { "templates": [ Template, ... ], "instances": [ Instance, ... ] } }
+```
+
+**Prim** — common fields: `op` (`carve|fill|skin|keep`), `shape`, `mat`,
+`noise` (optional `{amp, scale, octaves, seed}`: amp voxels 0..64, scale =
+LOG2 of the lattice cell in voxels 1..10, octaves 1..3, seed u32), `blend`
+(carve only: smooth-min radius in voxels with the carve prims before it,
+0..256), `skin` (skin op: wall-layer thickness, voxels 1..64), `level`
+(carve with a liquid `mat`: local y of the flat surface), `firm` (carve: the
+firm-shell material, below), `piece` (optional string, informational: the
+piece id), `scatter` (optional array, ≤ 4 rules). `mat` is required for fill
+and skin, optional for carve (absent = air; else a LIQUID), absent for keep.
+Optional EXTRAS (added after D2's first pass, 2026-10-12): `openOnly: true`
+on a fill = it lands only where the cell is still AIR at that point of the
+ordered pass (the carve's or the sky's) -- a rubble heap or a fallen block
+must not turn the buried rock inside a wall into gravel; `mat2` + `checker`
+(cells, 1..256) on a fill or a skin = a checker of `checker`-cell squares in
+the dungeon's LOCAL XZ plane, `mat` on the even squares ((⌊x/c⌋ + ⌊z/c⌋)
+even) and `mat2` on the odd ones (tiled floors).
+Shapes:
+
+| shape | fields | the solid it describes |
+|---|---|---|
+| `box` | `min`, `max` | the cell box |
+| `rbox` | `min`, `max`, `r` | the box with edges rounded by `r` (clamped to half the shortest side) |
+| `ellipsoid` | `min`, `max` | the ellipsoid inscribed in the box |
+| `cylinder` | `min`, `max`, `axis` `x\|y\|z` | the (elliptic) cylinder inscribed in the box along `axis` |
+| `capsule` | `a`, `b`, `r` | segment a–b swept by radius r (cells; any length — the engine splits at 256) |
+| `tube` | `pts` [[x,y,z],...], `r` [..] (one per point) | a polyline of tapered capsules (radius lerps along each segment); the JS densifies its own spline, the engine joins straight segments |
+| `ramp` | `min`, `max`, `dir` `+x\|-x\|+z\|-z`, `stepH`, `stepD`, `height`, `below` | stairs: the floor PROFILE starts at `min.y` at the edge opposite `dir` and rises `stepH` every `stepD` cells along `dir` (`stepD` ≥ 1; 1/2 = a smooth 1-in-2 ramp). The solid is the cells of the XZ footprint with `profile − below ≤ y < profile + height` (and `y ≤ max.y`). Carve with `height` = headroom → a stair passage; fill with `below` = thickness, `height` 0 → a solid flight under a hall. `profile` = the walking surface (first air cell) |
+| `vault` | `min`, `max`, `axis` `x\|z`, `rise` | a barrel vault running along `axis`: walls from `min.y` to `max.y − rise`, then a half-ellipse of half-span = half the cross width and height `rise` |
+
+Limits (refused by the loader with the prim's index): every box axis ≤ 2048
+cells, radii ≤ 512, `rise` ≤ the box height, |local coord| ≤ 2^20, at most
+64 prims and 32 prop instances whose inflated bounds touch one 64³ cell.
+
+**Op semantics — the evaluation, per cell** (`worldgen.wgsl` `dgCell`, CPU
+twin `dungeon.cpp` `EvalCell`; d = the shape's signed distance + noise,
+negative inside):
+1. `C` = the smooth union, in array order, of every `carve` prim's d
+   (`blend` = the smooth-min radius of each prim with the union before it).
+   `C < 0` → the cell is carved: AIR, or the carve's LIQUID (`mat` a liquid,
+   with `level` = local y: carved cells at or below it are that liquid, full).
+   The carve that "owns" a carved cell (liquid, firm) is the one with the
+   smallest own d.
+2. THE FIRM SHELL (rest, rule 2): a terrain cell within 2 voxels outside the
+   carve (0 ≤ C < 2) that is a POWDER or a LIQUID becomes the owning carve's
+   `firm` material (prim field `firm`; default slot `wall`, else `stone`), so
+   no sand / sediment / lake water spills into a carve on its birth tick.
+3. Then every non-carve prim, and every carve prim again, in ARRAY ORDER,
+   later wins: `fill` (d < 0) → `mat` (or the checker; `openOnly`: only if the cell is air at that point); `keep` (d < 0) → the TERRAIN cell back
+   (natural rock — a pillar), and a kept cell is not re-cut by any LATER
+   carve; `skin` (d < 0 inside the skin prim's shape, the cell solid terrain
+   and not carved, and C ≤ `skin` voxels) → `mat` — the wall layer;
+   `carve` (own d < 0, not kept) → air/liquid again (a doorway through an
+   earlier fill). The smooth-min fillet of step 1 is NOT re-cut by step 3.
+4. Scatter rules of each prim (below), in array order.
+5. Prop instances (§3.5), in array order, last wins.
+Outside every prim's inflated bounds the world is untouched, bit for bit.
+
+**Scatter** rule fields: `kind`, `density` (0..1), `size` [min, max]
+(cells, ≤ 32), `surface` (`floor|ceil|wall|any`), `mat` (string; default by
+kind: rubble→slot `rubble` else `gravel`; stalagmite/stalactite→`wall` else
+`stone`; crystal→`crystal`; moss→`moss` else `moss_patch`; puddle→`water`;
+bones→`bone`; ore_vein→`ore` else `iron`), `seed` (u32), `spacing`
+(optional lattice cell, cells; default 2·size.max·(repose run)+4). A rule
+applies to the cells INSIDE its prim (own d < 0 for floor/ceil kinds; the
+solid band behind the prim's carve surface for moss/ore). Kinds, all born at
+rest:
+
+- `rubble` (floor): square-ish piles on a lattice, height = size, flanks at
+  the material's angle of repose (`materials[].repose`), grown up from the
+  carve floor below (the first solid within the pile's height).
+- `stalagmite` / `stalactite` / `crystal`: cones of height = size and base
+  radius size/3 (crystal size/2) standing on the floor / hanging from the
+  ceiling (`crystal` follows `surface`; `wall` and `any` pick floor or
+  ceiling per spike).
+- `moss`: the first solid cell behind a carve surface on the `surface`
+  side(s), patchy (value noise against `density`).
+- `puddle`: floor cells whose four side neighbours and the cell below are
+  solid become the liquid (one cell deep, contained by construction).
+- `bones`: one-cell scatter lying on the floor, discs of radius = size.
+- `ore_vein`: solid cells within `size` voxels behind the carve surface
+  where 3D value noise exceeds the density threshold.
+
+**Props.** `Template` = `{ "id": "mines/ore_cart#3a9f", "size": [nx, ny, nz],
+"palette": ["@carve", "plank", "wall", ...], "voxels": [[x, y, z, p], ...] }`
+— `p` indexes `palette`; `"@carve"` is the CARVE CODE (the cell becomes AIR);
+a cell not listed is template-air ("leave the world alone"). Sizes ≤ 256 on
+each axis. `Instance` = `{ "template": <index into templates>, "pos": [x, y,
+z], "yaw": 0|90|180|270, "id": "x12" }`: the template rotated by yaw
+(template-local `(x, z)` → q1 `(z, nx−1−x)`, q2 `(nx−1−x, nz−1−z)`, q3
+`(nz−1−z, x)`, i.e. `R` re-based to the footprint's min corner) lands
+with its rotated footprint's MIN CELL at `pos`. Any y; no pad, no sink band.
+The JS dedupes identical (prop, params, seed) into one template; the engine
+additionally shares identical packed (template, total yaw) blocks.
+
+**`shell.bin`** (little-endian, every field 4 bytes): `'SVDG'`
+(0x47445653), version 1, sourceHash, flags (bit 0 naturalCaves), anchor
+x y z, keepOut; STRINGS: n, then per string u32 byteLength + UTF-8 bytes
+padded with zeros to 4; MATERIALS: n, then n × (slot string, material
+string); PRIMS: n, then n × 26 words —
+`[0] op (0 carve 1 fill 2 skin 3 keep) [1] shape (0 box 1 rbox 2 ellipsoid
+3 cylinder 4 capsule 5 ramp 6 vault 7 tube) [2] mat string (0xFFFFFFFF none)
+[3..5] min | a [6..8] max | b [9] r | rise | stepH [10] axis (0 x 1 y 2 z) |
+dir (0 +x 1 -x 2 +z 3 -z) [11] stepD [12] height [13] below [14] noise amp
+[15] noise scale [16] noise octaves (0 = no noise) [17] noise seed
+[18] blend [19] skin [20] level (i32; INT32_MIN = none) [21] firm string
+[22] tube first point [23] tube point count [24] first scatter [25] scatter
+count`; TUBE POINTS: n, then n × (x, y, z, r); SCATTER: n, then n × 8 words
+`kind (0 rubble 1 stalagmite 2 stalactite 3 crystal 4 moss 5 puddle 6 bones
+7 ore_vein), density Q16 (floor(d·65536+0.5)), size min, size max, surface
+(0 floor 1 ceil 2 wall 3 any), mat string, seed, spacing (0 = default)`;
+TEMPLATES: n, then per template `id string, nx, ny, nz, nPalette, palette
+strings…, nVoxels, nVoxels × (x, y, z, p)`; INSTANCES: n, then n × (template,
+x, y, z, yaw/90, id string); then `'END!'` (0x21444E45). Prim `piece` strings
+go in a trailing PIECES block before `'END!'`: n (== prims) × piece string.
+Then, ONLY when some prim uses an extra, the EXTRAS block, still before
+`'END!'`: `'PRMX'` (0x584D5250), n (== prims), n × 4 words (flags: bit 0
+openOnly; mat2 string or 0xFFFFFFFF; checker; 0). A reader that sees
+`'END!'` where `'PRMX'` could be has no extras. Unused fields are 0.
+
 ### 3.5 Props (L2)
 
 `assets/dungeons/props/<kit>/<name>.js|.vox`: generated props are tiny pure
@@ -234,6 +397,14 @@ v2 header; per entry `{i32 lx, ly, lz, u32 word}` in the DUNGEON local frame,
 transformed by the placement at load. Applied as CellOps through the
 MutationQueue after genChunk, exactly as edit layers are today. Authoring cap:
 the editor warns over 200k voxels (that is what the shell/props are for).
+
+D1 AMENDMENT: the header is v2's 32 bytes with version = 3, `count` = the
+number of entries, flags 0; entries follow as `i32 lx, ly, lz, u32 word`.
+The DUNGEON a v3 file belongs to is its parent directory's name
+(`assets/dungeons/<id>/detail.svedit`); a v3 file elsewhere, or for a dungeon
+the map does not place, contributes nothing (load warning). Detail layers
+apply after the map's and the locales' layers, in `dungeons[]` order.
+Writer: `WorldEdits::WriteDungeonLocal` (C++).
 
 ### 3.7 Entities (L4) — `refs.json`, ids `dungeon/<id>/<name>`
 
@@ -313,6 +484,41 @@ Modules under `assets/editor/dungeon/`. Preview always comes from
 `DUNGEON <json>` (load a scratch dungeon/piece program, no map needed,
 optionally anchored at a map column so the TERRAIN around it is real) and the
 existing region fetch. WorldView renders it.
+
+### 5.0 `--voxserve` dungeon protocol — D1 AMENDMENT (2026-10-12)
+
+Line protocol as the rest of voxserve (`src/tools/voxregion.h`): one ack
+line `OK <n> <ms>` / `ERR <msg>`; paths are the REMAINDER of the line,
+two paths separated by `|`. `<src>` is a path to a `dungeon.json` (its
+sibling `shell.bin`, else `shell.json`, is loaded), a `shell.json` or a
+`shell.bin`. The tuner writes an unsaved program to a temp file first.
+
+```
+DUNGEON ISOLATE <seed> <src>|<info.json>
+    the program alone, in solid rock: anchored at a fixed column far from
+    every map feature and deep enough that no ground, cave or lava is within
+    reach (a cut-away rock block). The map's own dungeons stay.
+DUNGEON PLACE <x> <z> <yOffset> <yaw> <seed> <src>|<info.json>
+    in situ at an arbitrary map column, on the real terrain.
+DUNGEON MAP <id> <seed> <src>|<info.json>
+    replaces the map's own dungeons[] entry <id> (its anchor, yaw, yOffset)
+    with this program: editing a placed dungeon in place.
+DUNGEON CLEAR
+    drops the scratch program; the map's dungeons are what they were.
+```
+
+Each loads the program, re-packs the world map with it (a scratch dungeon
+id `_scratch`, or the replaced id) and uploads it, so every later `REGION`
+returns real genChunk voxels with the dungeon carved in. `info.json` =
+`{ ok, id, seed, origin: [x,y,z] (world cell of local 0,0,0), yaw, anchor:
+[x,y,z] (world), groundY, bounds: {min, max} (world, inclusive, inflated),
+keep: {min, max}, prims, instances, templates, indexCells, listWords,
+warnings: [..] }` — the box to request regions over. The ack's `<n>` is the
+prim count. `tuner_server.py`: `POST /api/dungeon/preview` with JSON
+`{mode: "isolate"|"place"|"map"|"clear", seed, shell?: <shell.json object>,
+src?: <asset-relative path>, id?, at?: [x, z], yOffset?, yaw?}` → the
+`info.json` object (the server writes `shell` to a temp file when given);
+then the existing `/api/voxregion` (REGION) calls fetch voxels.
 
 ### 5.1 Kit page (piece designer)
 Style + piece type list → slider panel (built from `SCHEMA`), presets, seed
@@ -421,3 +627,58 @@ ARCH_NODES, rebuilds the main exe.
   the save system's entity split), never in voxels.
 - Arbitrary size vs the site lattice: dungeons do NOT go through the 2D site
   lattice (`kSiteCellMax`); they have their own 3D chunk index.
+
+## 9. D1 report (engine shell, 2026-10-12)
+
+Landed on branch `worktree-agent-a3caddfa571ce1f41`: `src/sim/dungeon.*`
+(format, resolution, placement, `PackDungeons`, the CPU twin),
+`assets/shaders/worldgen_dungeon.wgsli` (appended to worldgen.wgsl by
+`AssembleShaderSource` / `check_shaders.sh`), the `map.json dungeons[]` parse
+and anchor in `worldmap.cpp`, SVED v3 in `worldedit.*`, voxserve `DUNGEON`
+(§5.0) + `tuner_server.py POST /api/dungeon/preview`, `--dungeon-bake`, the
+`_fixture` (written by `scripts/gen_dungeon_fixture.py`) on the harness map,
+gates `dungeon-format` / `dungeon-gen`, DESIGN.md §9h.
+
+**Pipeline compile, cold** (same exe, fresh CWD AND private shader / pipeline
+caches per arm, `SANDVOX_SHADER_TIMING=1`, `__GL_SHADER_DISK_CACHE=0`,
+exclusive locks; base assets = dd56aa1):
+
+| worldgen entry | before | after | |
+|---|---:|---:|---|
+| `main` | 6.7 s | 9.6 s | +2.9 s (the full `dgCell`) |
+| `list` | 7.3 s | 9.9 s | +2.6 s |
+| `cols` | 52.1 s | 51.0 s | noise (only `dgColTop`) |
+| `far` | 78.0 s | 71.2 s | noise (`dgCellCoarse`); SPIR-V 22,813 -> 26,511 instructions, ceiling raised 25k -> 28k |
+| `farpatch` / `fardown` / `farmap` | 65 / 69 / 72 s | 58 / 59 / 62 s | noise (only the cave keep-out) |
+
+The first version cost `main`/`list` +18 s each: `dgScatter` called the carve
+field from ~12 sites and the driver inlines every one. Rolling the probes into
+ONE loop (one inlined copy of the carve field) took it to +2.9 s. Keep
+`dgCarveAt` / `dgPrimD` at one call site per kernel path.
+
+**Residency** (the window round the fixture's chamber, after 120 settle ticks):
+5,133 pages with the dungeon vs 4,645 with the evaluator off: +488 pages
+(+10.5 %), 13.9 % of the pool. **Rest**: 0 chunks awake after the settle.
+**Twin**: 671,744 fixture cells and 827,392 cells of D2's `_d2_sample` (328
+prims, 36 props) bit-identical to the CPU twin (the only differences are the
+45 wet-bank stain soaks round the fixture's puddles, a separate post-pass).
+The determinism hash does not move (`ef7d9a06`): the fixture is 2 km from the
+harness window and a map with no dungeon packs no block.
+
+**Known limitations** (for D2 / D4 and the orchestrator):
+- Floor / ceiling scatter searches the CARVE FIELD for its support, not the
+  final voxels: a feature can stand on a fill the carve cut (fine) but also
+  "on" open sky where a carve meets the surface. Keep stalactites off
+  `surface: true` pieces.
+- A puddle's containment is checked against the carve field; terrain air next
+  to it (a surface piece) is not seen.
+- The firm shell turns powder / liquid within 2 voxels of a carve to `firm`,
+  but a tree whose trunk a carve cuts keeps its crown (the island detector may
+  later drop it as debris). Entrances through forest want a clearing.
+- Far field: shapes and props only (`dgCellCoarse`); underground pieces are
+  not drawn from afar, and the far surface map (`farmap`) does not see a ruin
+  above the ground (the cascades do).
+- 64 prims / 32 prop instances per 64^3 index cell; elongated ellipses /
+  cylinders / vaults inflate their index bounds by their axis ratio (<= 256).
+- voxserve resolves the anchor at the environment's seed (kDefaultSeed),
+  whatever the DUNGEON command's `<seed>`.

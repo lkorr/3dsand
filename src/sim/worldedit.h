@@ -107,7 +107,7 @@ class WorldEdits {
   bool LoadFiles(const std::vector<std::string>& paths, std::string& err);
   void Clear();
 
-  bool Empty() const { return cols_.empty(); }
+  bool Empty() const { return cols_.empty() && dcells_.empty(); }
   // True when any loaded cell is ground-relative.
   bool Relative() const { return relative_; }
   size_t VoxelCount() const { return voxelCount_; }
@@ -179,6 +179,15 @@ class WorldEdits {
   static bool WriteRelative(const std::string& path,
                             const std::vector<AbsCell>& cells, uint32_t seed,
                             std::string& err);
+  // v3: DUNGEON-LOCAL (docs/PLAN_dungeons.md §3.6): cells in the dungeon's own
+  // frame, `cells[i].{x,y,z}` LOCAL coordinates. The dungeon is the file's
+  // parent directory (assets/dungeons/<id>/detail.svedit); the map's placement
+  // of it turns the cells into world cells at Resolve, rigidly.
+  static bool WriteDungeonLocal(const std::string& path, const std::vector<AbsCell>& localCells,
+                                std::string& err);
+  // Cells the loaded v3 files hold whose dungeon the map does not place (they
+  // apply nowhere), counted at the last Resolve.
+  size_t UnplacedDungeonCells() const { return unplacedDungeon_; }
 
   static constexpr uint32_t kMagic = 0x44455653u;   // 'SVED'
   static constexpr uint32_t kFlagRelative = 1u;
@@ -201,6 +210,16 @@ class WorldEdits {
   // The FILE, as read: per column, ordered (x, z) so resolution order is a
   // function of content.
   std::map<std::pair<int32_t, int32_t>, std::vector<ColCell>> cols_;
+  // v3 (dungeon-local) cells, in file order: resolved through the CURRENT
+  // map's placement of `dungeon` after the column cells (so a detail layer
+  // wins over the map's and the locales' layers on a shared cell).
+  struct DungeonCell {
+    std::string dungeon;
+    int32_t x, y, z;
+    uint32_t word;
+  };
+  std::vector<DungeonCell> dcells_;
+  size_t unplacedDungeon_ = 0;
   bool relative_ = false;
   uint32_t fileSeed_ = 0;
 

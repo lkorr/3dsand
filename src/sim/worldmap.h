@@ -61,6 +61,7 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -215,6 +216,11 @@ enum : uint32_t {
   // treeMaxTop gives the sky early-outs (cacti: per column, worldgen.wgsl
   // cactusColTop). Read by the GPU only.
   kHTreelineMax = 65,
+  // THE DUNGEON BLOCK (docs/PLAN_dungeons.md, sim/dungeon.h PackDungeons): the
+  // word offset of the placed dungeons' records, prims, templates and sparse
+  // 64^3 chunk index; 0 = the map places none, and then worldgen's dungeon
+  // layer is this one word per chunk (worldgen_dungeon.wgsli).
+  kHDungeon = 66,
   kHeaderWords = 72,    // padded, like treeatlas::kFileHeaderWords
 };
 
@@ -814,6 +820,7 @@ enum : uint32_t {
 }  // namespace worldmap
 
 namespace biomes { struct BiomeSet; struct BiomeDef; struct WaterPresetDef; }
+namespace dungeon { struct Shell; struct Resolved; }
 
 namespace worldmap {
 
@@ -964,13 +971,69 @@ std::map<std::string, int> LocaleRefYOffsets(const std::string& assetDir, const 
 // exists on disk. (path, name) -- `name` is what the save fingerprint and the
 // environment stamp hash the bytes under ("<layer>.svedit",
 // "<locale>/<stem>.svedit").
+// Then (PLAN_dungeons §3.6) each dungeon ASSET's detail layer
+// (assets/dungeons/<asset>/detail.svedit, SVED v3) that exists, in
+// `dungeonAssets` order (duplicates once): named "dungeon:<asset>/detail.svedit".
 std::vector<std::pair<std::string, std::string>> MapEditLayerFiles(const std::string& assetDir,
                                                                    const std::string& mapName,
                                                                    const std::string& editLayer,
-                                                                   const std::vector<LocaleDef>& locales);
+                                                                   const std::vector<LocaleDef>& locales,
+                                                                   const std::vector<std::string>& dungeonAssets = {});
+// The asset dir names of map.json's dungeons[] (PLAN_dungeons §3.1), table
+// order, read from disk ("" entries skipped; a malformed list reads as none).
+std::vector<std::string> ReadDungeonAssets(const std::string& assetDir, const std::string& mapName);
+// The same for a loaded map: its dungeons[]' assets, placed or not.
+struct WorldMapData;
+std::vector<std::string> DungeonAssetsOf(const WorldMapData& m);
 // sandvox::HashOneFile over those files, folded in order (h * FNV prime ^ next):
 // exactly HashOneFile of the map layer when the map has no locale layers.
 uint32_t HashEditLayerFiles(const std::vector<std::pair<std::string, std::string>>& files);
+
+// ---- dungeons (docs/PLAN_dungeons.md §3.1; sim/dungeon.h) --------------------
+// map.json `dungeons[]`: {id, name?, dungeon?, at: [x, z], yOffset?, yaw?}. The
+// asset assets/dungeons/<dungeon or id>/ (shell.bin, else shell.json) is
+// loaded and its materials resolved by LoadWorldMap; a missing or refused
+// asset is a LOAD WARNING and the dungeon is not placed. The anchor resolves
+// like a locale's: the bare ground at `at` for the load seed; the shell's
+// anchor cell lands on (at.x, groundY + yOffset, at.z) and every local cell at
+// that + R(yaw) (local - anchor), R the LINEAR quarter turn (dungeon.h RotX),
+// the rule D3's refs use (PLAN §3.7).
+struct DungeonDef {
+  std::string id, name, asset;
+  int ax = 0, az = 0, yOffset = 0, yawQ = 0;
+  // RESOLVED by LoadWorldMap for its seed.
+  int groundY = 0;
+  bool resolved = false;
+  std::array<int, 3> origin{};               // world cell of the shell's local (0,0,0)
+  std::array<int, 3> boxMin{}, boxMax{};     // world, inflated, inclusive
+  std::array<int, 3> keepMin{}, keepMax{};   // caves + lava off in here (max < min: none)
+  std::string shellPath;                     // what was loaded
+  uint32_t shellHash = 0;                    // FNV of its bytes (the map's content hash folds it)
+  std::shared_ptr<const dungeon::Shell> shell;   // null = not placed
+  std::shared_ptr<const dungeon::Resolved> res;
+  bool Placed() const { return shell != nullptr && res != nullptr && resolved; }
+};
+// THE SCRATCH DUNGEON (voxserve DUNGEON, PLAN §5.0): when set, LoadWorldMap
+// places this program too -- under `id` (replacing a map entry of that id, at
+// that entry's anchor, when `replaceMapEntry`) or at its own anchor. The
+// tuner's preview path; null clears it.
+struct ScratchDungeon {
+  DungeonDef def;                            // id, at, yOffset, yawQ (+ shell / res set)
+  bool replaceMapEntry = false;
+  // Anchor y given absolutely (ISOLATE): the anchor cell lands at this world y
+  // instead of groundY + 1 + yOffset.
+  bool absoluteY = false;
+  int anchorY = 0;
+};
+void SetScratchDungeon(const ScratchDungeon* s);
+const ScratchDungeon* ScratchDungeonSlot();
+// The gates' switch: when false, PackWorldMap packs the dungeon block with its
+// EVALUATOR OFF (dungeon.h kDgFlagEvalOff): the keep boxes still turn the caves
+// off and the sky ceilings still rise, but no cell is carved -- the
+// `dungeon-gen` gate's terrain arm, the exact input the CPU twin is fed.
+// Default true.
+void SetDungeonsEnabled(bool on);
+bool DungeonsEnabled();
 
 // ---- the loaded map (P2) ---------------------------------------------------
 /** assets/worldmap/<name>/{map.json,map.svmap}, parsed and resolved. */
@@ -1212,6 +1275,9 @@ struct WorldMapData {
   std::string editLayer;
   // map.json `locales[]` (L1), table order, RESOLVED for the load seed.
   std::vector<LocaleDef> locales;
+  // map.json `dungeons[]` (PLAN_dungeons §3.1), table order, then the scratch
+  // dungeon if one is set. Only Placed() ones are packed.
+  std::vector<DungeonDef> dungeons;
   bool Loaded() const { return extentW > 0 && extentH > 0; }
   /** SITE cell coordinates of a world voxel column (arithmetic shift: floors). */
   void CellOf(int x, int z, int* cx, int* cz) const {

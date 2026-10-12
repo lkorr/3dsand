@@ -37,6 +37,11 @@ happens in this process rather than in the page:
   POST /api/voxreload         re-read tuning.json + shaders + environment in the
                               voxel server (a region request does it by itself
                               when the files under _world_signature moved)
+  POST /api/dungeon/preview   install a scratch DUNGEON program in the voxel
+                              server ({mode: isolate|place|map|clear, shell|src,
+                              id?, at?, yOffset?, yaw?, map?}; docs/PLAN_dungeons.md
+                              5.0) -> the engine's placement JSON (the box to
+                              /api/voxregion over); regions carry it until clear
   GET  /api/worldedits        list assets/worldedits/*.svedit
   GET  /api/worldmap/terrain-defaults   map.json terrain defaults (worldmap.h)
   GET  /api/worldmap/check?name=    the SAVED map's load warnings / refusal
@@ -777,6 +782,13 @@ class VoxServe:
         # A request for another map restarts the process (one alive at a time:
         # each holds a Vulkan device and a page pool).
         self.map = None
+        # THE SCRATCH DUNGEON (docs/PLAN_dungeons.md 5.0): the last DUNGEON
+        # command and the map it was issued on, replayed after a respawn on that
+        # map so a region never comes back without the program the key says it
+        # carries. `scratch_key` is folded into every region's cache key.
+        self.scratch_line = None
+        self.scratch_map = None
+        self.scratch_key = ""
 
     def _spawn(self, map_name):
         if not os.path.isfile(EXE):
@@ -804,6 +816,13 @@ class VoxServe:
         self.proc = p
         self.sig = sig
         self.map = map_name
+        if self.scratch_line and self.scratch_map == map_name:
+            p.stdin.write(self.scratch_line + "\n")
+            p.stdin.flush()
+            while True:
+                ack = p.stdout.readline()
+                if not ack or ack.startswith("OK ") or ack.startswith("ERR "):
+                    break
 
     def _ensure(self, map_name):
         if self.proc is not None and self.proc.poll() is None:
@@ -972,10 +991,35 @@ def _world_signature(name=None):
         except OSError:
             names = []
         paths += [os.path.join(sd, n) for n in names]
+    # The programs of the dungeons the map places (docs/PLAN_dungeons.md):
+    # genChunk carves them, so a recompiled shell is a different world.
+    if d:
+        for a in _map_dungeon_assets(d):
+            for fn in ("shell.bin", "shell.json"):
+                fp = os.path.join(ASSETS, "dungeons", a, fn)
+                if os.path.isfile(fp):
+                    paths.append(fp)
+                    break
     for path in paths:
         h.update(os.path.basename(path).encode("utf-8") + b"\0")
         h.update(_file_digest(path))
     return h.hexdigest()[:16]
+
+
+def _map_dungeon_assets(map_dir):
+    """map.json dungeons[]' asset dir names (the `dungeon` field, else the id)."""
+    try:
+        with open(os.path.join(map_dir, "map.json"), "r", encoding="utf-8") as f:
+            j = json.load(f)
+    except (OSError, ValueError):
+        return []
+    out = []
+    for d in j.get("dungeons") or []:
+        if isinstance(d, dict):
+            a = d.get("dungeon") or d.get("id")
+            if isinstance(a, str) and re.fullmatch(r"[a-z0-9_-]+", a):
+                out.append(a)
+    return out
 
 
 def _tuning_map():
@@ -1791,8 +1835,10 @@ class Handler(BaseHTTPRequestHandler):
             ldig = _map_layers_region_digest(mname, ox, oy, oz, nx * lod, ny * lod, nz * lod)
         else:
             ldig = _layer_region_digest(layer, ox, oy, oz, nx * lod, ny * lod, nz * lod)
-        key = hashlib.sha1(("%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%s" % (
-            ox, oy, oz, nx, ny, nz, lod, seed, sig, layer, ldig)
+        scratch = _voxserve.scratch_key if _voxserve.scratch_map == mname else ""
+        key = hashlib.sha1(("%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%s%s" % (
+            ox, oy, oz, nx, ny, nz, lod, seed, sig, layer, ldig,
+            ("," + scratch) if scratch else "")
         ).encode()).hexdigest()
         cached = os.path.join(VOXCACHE, key + ".gz")
         want_gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
@@ -1845,6 +1891,81 @@ class Handler(BaseHTTPRequestHandler):
         if want_gz:
             return self._send_blob(packed, gz=True)
         return self._send_blob(blob)
+
+    def _dungeon_preview(self):
+        """POST /api/dungeon/preview (docs/PLAN_dungeons.md 5.0): install a
+        scratch dungeon program in the voxel server -- `mode` isolate (alone in
+        solid rock), place (at `at` [x, z], `yOffset`, `yaw`), map (replacing the
+        map's dungeon `id` in place) or clear -- from `shell` (a shell.json
+        object; written to a temp file) or `src` (an asset-relative path to a
+        dungeon.json / shell.json / shell.bin). Answers the engine's placement
+        JSON (origin, yaw, anchor, bounds: the box to /api/voxregion over)."""
+        b = self._body()
+        mode = str(b.get("mode") or "").lower()
+        mname = str(b.get("map") or "") or _tuning_map()
+        if not _worldmap_dir(mname):
+            return self._json(400, {"ok": False, "error": "bad map name"})
+        try:
+            seed = int(b.get("seed") or 1337)
+        except (TypeError, ValueError):
+            seed = 1337
+        os.makedirs(VOXTMP, exist_ok=True)
+        if mode == "clear":
+            ok, msg = _voxserve.command("DUNGEON CLEAR", map_name=mname)
+            if not ok:
+                return self._json(500, {"ok": False, "error": msg})
+            _voxserve.scratch_line = None
+            _voxserve.scratch_map = None
+            _voxserve.scratch_key = ""
+            return self._json(200, {"ok": True, "cleared": True})
+        if isinstance(b.get("shell"), dict):
+            src = os.path.join(VOXTMP, "dungeon_scratch_shell.json")
+            with open(src, "w", encoding="utf-8") as f:
+                json.dump(b["shell"], f)
+        elif isinstance(b.get("src"), str):
+            rel = b["src"].replace("\\", "/")
+            if ".." in rel.split("/") or os.path.isabs(rel):
+                return self._json(400, {"ok": False, "error": "src is an asset-relative path"})
+            src = os.path.join(ASSETS, rel)
+            if not os.path.isfile(src):
+                return self._json(404, {"ok": False, "error": "no such file: assets/" + rel})
+        else:
+            return self._json(400, {"ok": False, "error": "give `shell` (an object) or `src` (a path)"})
+        info = os.path.join(VOXTMP, "dungeon_scratch_info.json")
+        paths = src.replace("\\", "/") + "|" + info.replace("\\", "/")
+        if mode == "isolate":
+            line = "DUNGEON ISOLATE %d %s" % (seed, paths)
+        elif mode == "place":
+            at = b.get("at") or [0, 0]
+            try:
+                line = "DUNGEON PLACE %d %d %d %d %d %s" % (int(at[0]), int(at[1]), int(b.get("yOffset") or 0),
+                                                          int(b.get("yaw") or 0), seed, paths)
+            except (TypeError, ValueError, IndexError):
+                return self._json(400, {"ok": False, "error": "place wants at: [x, z], yOffset, yaw"})
+        elif mode == "map":
+            did = str(b.get("id") or "")
+            if not re.fullmatch(r"[a-z0-9_-]+", did):
+                return self._json(400, {"ok": False, "error": "map wants the dungeon id"})
+            line = "DUNGEON MAP %s %d %s" % (did, seed, paths)
+        else:
+            return self._json(400, {"ok": False, "error": "mode must be isolate, place, map or clear"})
+        try:
+            ok, msg = _voxserve.command(line, map_name=mname)
+        except Exception as e:
+            return self._json(503, {"ok": False, "error": str(e)})
+        if not ok:
+            return self._json(500, {"ok": False, "error": msg})
+        try:
+            with open(info, "r", encoding="utf-8") as f:
+                out = json.load(f)
+            with open(src, "rb") as f:
+                content = f.read()
+        except (OSError, ValueError) as e:
+            return self._json(500, {"ok": False, "error": repr(e)})
+        _voxserve.scratch_line = line
+        _voxserve.scratch_map = mname
+        _voxserve.scratch_key = hashlib.sha1(line.encode("utf-8") + b"\0" + content).hexdigest()[:16]
+        return self._json(200, out)
 
     def _voxpalette(self):
         out = os.path.join(VOXTMP, "palette.json")
@@ -2606,6 +2727,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True})
 
         # ---- the voxel view ----
+        if p == "/api/dungeon/preview":
+            return self._dungeon_preview()
+
         if p == "/api/voxreload":
             # Worldgen's tuning values are WGSL consts baked at pipeline build,
             # so a live server keeps answering with the parameters it booted on

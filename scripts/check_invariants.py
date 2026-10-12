@@ -3464,6 +3464,61 @@ def check_elec_mirror():
                         "in world.h kDirtyReasonName")
 
 
+
+# ------------------------------------------------------------ dungeon layer
+def check_dungeon_mirror():
+    """worldgen_dungeon.wgsli's evaluator (dgCell and everything it calls,
+    between `MIRROR-BEGIN dungeon` markers) is token-for-token the CPU twin in
+    src/sim/dungeon.cpp, and every DG_* layout const the shader declares has
+    the same value in the twin (bound there to dungeon.h's kDg* enums). The
+    `dungeon-gen` gate compares the two cell by cell on the GPU; this catches
+    the drift at edit time, before anyone builds."""
+    wgsl, cpp, hdr = (read("assets/shaders/worldgen_dungeon.wgsli"), read("src/sim/dungeon.cpp"),
+                      read("src/sim/dungeon.h"))
+    wmh = read("src/sim/worldmap.h")
+    if not (wgsl and cpp and hdr and wmh):
+        return
+    checked.append("dungeon mirror")
+    tunes = _tune_map()
+    a, b = _mirror_blocks(wgsl, "dungeon"), _mirror_blocks(cpp, "dungeon")
+    if len(a) != 1 or len(b) != 1:
+        problems.append("dungeon mirror: expected exactly one `MIRROR-BEGIN dungeon` block in "
+                        f"worldgen_dungeon.wgsli ({len(a)}) and dungeon.cpp ({len(b)})")
+    else:
+        wa = re.sub(r"array<\s*i32\s*,\s*(\w+)\s*>", r"[\1]", a[0])
+        ta = _normalise(wa, True, tunes)
+        tb = _normalise(b[0], False, tunes)
+        if ta != tb:
+            i = 0
+            while i < min(len(ta), len(tb)) and ta[i] == tb[i]:
+                i += 1
+            lo = max(0, i - 8)
+            problems.append(
+                f"dungeon mirror: worldgen_dungeon.wgsli and dungeon.cpp diverge at token {i} "
+                f"(of {len(ta)}/{len(tb)}).\n"
+                f"      wgsl: ...{' '.join(ta[lo:i + 8])}\n"
+                f"      cpp : ...{' '.join(tb[lo:i + 8])}")
+    # The layout consts.
+    enum = {}
+    for m in re.finditer(r"\b(k[A-Z]\w*)\s*=\s*(0x[0-9a-fA-F]+|\d+)u?\b", hdr + "\n" + wmh):
+        enum.setdefault(m.group(1), int(m.group(2), 0))
+    twin = {}
+    for m in re.finditer(r"\b((?:DG|WM)_[A-Z0-9_]+)\s*=\s*([A-Za-z0-9_:]+)", cpp):
+        rhs = m.group(2).split("::")[-1]
+        if re.fullmatch(r"0x[0-9a-fA-F]+u?|\d+u?", rhs):
+            twin[m.group(1)] = int(rhs.rstrip("uU"), 0)
+        elif rhs in enum:
+            twin[m.group(1)] = enum[rhs]
+    for m in re.finditer(r"const\s+((?:DG|WM)_\w+)\s*:\s*[iu]32\s*=\s*(-?\d+)u?\s*;", wgsl):
+        name, val = m.group(1), int(m.group(2))
+        if name not in twin:
+            problems.append(f"dungeon layout: worldgen_dungeon.wgsli declares {name} = {val} but "
+                            f"dungeon.cpp's twin has no {name}")
+        elif twin[name] != val:
+            problems.append(f"dungeon layout: worldgen_dungeon.wgsli {name} = {val} but dungeon.cpp "
+                            f"binds it to {twin[name]}")
+
+
 ALL = {
     "solute": check_solute_mirror,
     "heat": check_heat_mirror,
@@ -3482,6 +3537,7 @@ ALL = {
     "treeatlas": check_tree_atlas,
     "biomes": check_biome_order,
     "worldmap": check_worldmap_layout,
+    "dungeon": check_dungeon_mirror,
     "runword": check_run_word_layout,
     "sound": check_sound_slots,
     "substeps": check_fluid_substeps,
@@ -3548,6 +3604,9 @@ RELEVANT = {
     "src/test/selftest_water.cpp": ["waterledger"],
     "src/sim/world.cpp": ["worldgen"],
     "assets/shaders/worldgen.wgsl": ["worldgen", "treeatlas"],
+    "assets/shaders/worldgen_dungeon.wgsli": ["dungeon"],
+    "src/sim/dungeon.cpp": ["dungeon"],
+    "src/sim/dungeon.h": ["dungeon"],
     "src/sim/treeatlas.h": ["treeatlas"],
     "assets/editor/treegen.js": ["treeatlas"],
     "src/sim/simulation.cpp": ["counts", "capool"],

@@ -503,11 +503,20 @@ EnvironmentStamp StampEnvironment(const std::string& assetDir, const std::string
     std::vector<worldmap::LocaleDef> locales;
     std::string lerr;
     worldmap::ReadLocales(assetDir, mapName, locales, lerr);   // malformed = none: the loader refuses it anyway
-    s.edits = worldmap::HashEditLayerFiles(worldmap::MapEditLayerFiles(assetDir, mapName, editLayer, locales));
+    s.edits = worldmap::HashEditLayerFiles(worldmap::MapEditLayerFiles(
+        assetDir, mapName, editLayer, locales, worldmap::ReadDungeonAssets(assetDir, mapName)));
   }
   // .svsculpt (P5): the sculpt layer is part of the map. A map without one
   // hashes exactly as it did before the layer existed.
   s.map = HashMapFiles(assetDir + "/worldmap/" + mapName);
+  // ...and the programs of the dungeons it places (PLAN_dungeons): a
+  // recompiled shell is a different world. Nothing for a map with none.
+  for (const std::string& a : worldmap::ReadDungeonAssets(assetDir, mapName))
+    for (const char* f : {"shell.bin", "shell.json"})
+      if (std::filesystem::is_regular_file(assetDir + "/dungeons/" + a + "/" + f)) {
+        s.map = (s.map * 16777619u) ^ sandvox::HashOneFile(assetDir + "/dungeons/" + a + "/" + f, a + "/" + f);
+        break;
+      }
   // The water presets are a worldgen input since P-E (their flora rows are
   // packed into the same buffer as the biome records), so they are part of
   // the `biomes` stamp: an edited preset must light the apply button too.
