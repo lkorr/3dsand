@@ -25530,6 +25530,50 @@ the environment, so the next REGION is real genChunk with it carved;
 `tuner_server.py` `POST /api/dungeon/preview` forwards it and folds the
 scratch into the region cache key (and replays it after a voxserve respawn).
 
+**D9 additions (2026-10-12).**
+- **The surface keep-out.** At placement `dungeon::SurfaceRects` samples
+  every prim's (but `keep`'s) and prop's inflated box on the world's 8-voxel
+  lattice against the bare ground. A column counts where the box top is at or
+  above ground - 2. The counted samples make one XZ rect per prim; contained
+  rects are dropped and the rest merged down to 32 per dungeon.
+  - The rects ride in the block (`DG_H_SURF*`). `dgSurfNear` refuses a
+    lattice tree whose crown square comes within `reach + DG_TREE_CLEAR` (8)
+    of one. It does this in `treeInfoBare`, the one tile gate every tree
+    producer reads, so near and far agree.
+  - Ground cover, tile plants and cacti grow nothing inside a rect.
+  - So an entrance through a forest cuts no trunk and leaves no crown
+    floating.
+  - It is TERRAIN, not the evaluator: it holds with `kDgFlagEvalOff`, so the
+    twin's input already lacks those trees. `kDgFlagSurfOff`
+    (`worldmap::SetDungeonSurfaceKeep(false)`) is the gate's "what would have
+    been cut" arm.
+  - Ponds are deliberately NOT keyed on it (`siteKeepOut` is unchanged), so
+    the CPU height mirror and the anchor's bare ground are untouched.
+- **Scatter support is solid matter, not the carve field.**
+  - `dgCell` takes the column's ground `gh` (genColumn's h, ==
+    `World::TerrainHeight`).
+  - The scatter probes ask `dgSolidAt`: dgCell's steps 1 and 3 on solidity
+    alone (carve field, then ordered fill / keep / re-carve), with terrain
+    solid at or under `gh`.
+  - A stalactite therefore no longer hangs from the open sky over a surface
+    piece, and a feature can stand on a floor fill inside its carve's noise.
+  - The band kinds (moss, ore, puddle) work only at or under `gh`, and a
+    puddle only strictly under it.
+- **Multi-placement.** One asset may be placed any number of times, on any
+  map (`dungeons[]` entries have their own `id`).
+  - The packer shares a prim's scatter rules and tube segments between
+    placements (they are local-frame). Templates were already shared.
+  - Only the 20-word prim records and the index entries are per placement.
+    The records point at their placement's record, so de-duplicating them
+    would need a format change for ~80 bytes a prim.
+  - The harness map places every real asset, plus `heather_cairn` twice
+    (`heather_cairn_b`, another yaw). `dungeon-format` asserts that.
+  - `dungeon-gen` runs every placement through the twin (E). It holds the
+    two cairns to the same carve field in their local frames (F).
+  - It also asserts that no placement cuts above-ground matter with the keep
+    on, and that the keep is not vacuous: some entrance would cut a tree
+    without it (G).
+
 ## 10. Networking — the model of record (decided 2026-09-10)
 
 Until 2026-09-10 this section said "both classic models are viable, decide at

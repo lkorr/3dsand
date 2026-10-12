@@ -21,7 +21,23 @@
 //                       E  loot: the chest's first open rolls cave_cache
 //                          seeded by its id, == a direct roll;
 //                       F  spawner + patrol: a spawned creature walks its
-//                          patrol schedule's waynode route in order.
+//                          patrol schedule's waynode route in order;
+//                       G  dart -> wall (D9): one lever springs two darts
+//                          along the same heading -- one into the door
+//                          wall with a body behind it (no hit, the bolt
+//                          stops at the wall's face), one down open floor
+//                          at a body (a hit);
+//                       M  MULTI-PLACEMENT (D9): the same fixture placed a
+//                          second time (`entfix_b`, another column, the
+//                          opposite quarter turn) and a REAL asset
+//                          (assets/dungeons/heather_cairn's dungeon.json +
+//                          refs.json + shell.json, copied into the scratch
+//                          dir) placed twice (`cairn_a` yaw 0, `cairn_b`
+//                          yaw 90): every ref of every placement lands at
+//                          ITS placement's transform under ITS group's
+//                          prefix, no prop string names another
+//                          placement, and a lever pulled in `entfix` raises
+//                          its signal there and nowhere else.
 //                     The whole fixture runs TWICE from a fresh worldgen and
 //                     the traces (spawns, gate rows, trap ops, loot, patrol
 //                     visits, door phases) must be identical. Thresholds:
@@ -32,6 +48,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -73,6 +90,10 @@ constexpr const char* kSchedText = R"JSON({
 // The placement: anchor column and the quarter turn.
 constexpr int kAX = 150, kAZ = 300, kYaw = 90;
 const std::string kG = "dungeon/entfix/";
+// M: the second placement of the fixture, outside the window (its refs load
+// but never activate), and the real asset placed twice, further out.
+constexpr int kBX = 2200, kBZ = 300, kBYaw = 270;
+constexpr const char* kRealAsset = "heather_cairn";
 
 uint32_t MatId(const Ctx& c, const char* name) {
   for (size_t i = 0; i < c.mats.size(); i++)
@@ -124,6 +145,14 @@ refs::RefGroupFile FixtureGroup() {
   add("spawner_f", "spawner", {10, 0, 44}, 180,
       J{{"mobs", J::array({J{{"base", "human"}, {"weight", 1}}, J{{"base", "dummy"}, {"weight", 2}}})},
         {"count", 2}, {"radius", 1.2}, {"behavior", "dummy"}});
+  // G: one lever, two darts heading local +Z. dart_wall_g's line meets the
+  // door wall (local z 20, stone at x 0..5) after 8 cells of air; a body
+  // stands behind it. dart_open_g's line crosses open pad to a body.
+  add("lever_g", "lever", {48, 0, 2}, 0, J{{"signal", "darts"}});
+  add("dart_wall_g", "trap", {2, 3, 12}, 0,
+      J{{"type", "dart"}, {"on", "darts"}, {"range", 40}, {"damage", 5}});
+  add("dart_open_g", "trap", {44, 3, 10}, 0,
+      J{{"type", "dart"}, {"on", "darts"}, {"range", 30}, {"damage", 5}});
   return g;
 }
 
@@ -154,7 +183,26 @@ bool WriteAssets(Fixture& f, std::string& why) {
   J map = J::object();
   map["dungeons"] = J::array({J{{"id", "entfix"}, {"name", "Entities fixture"},
                                 {"dungeon", "_entities_fixture"}, {"at", J::array({kAX, kAZ})},
-                                {"yOffset", yOffset}, {"yaw", kYaw}}});
+                                {"yOffset", yOffset}, {"yaw", kYaw}},
+                              J{{"id", "entfix_b"}, {"name", "Entities fixture, again"},
+                                {"dungeon", "_entities_fixture"}, {"at", J::array({kBX, kBZ})},
+                                {"yaw", kBYaw}},
+                              J{{"id", "cairn_a"}, {"dungeon", kRealAsset}, {"at", J::array({-1800, 2600})}, {"yaw", 0}},
+                              J{{"id", "cairn_b"}, {"dungeon", kRealAsset}, {"at", J::array({2600, -1800})}, {"yaw", 90}}});
+  // M: the real asset's own files (refs.json, and the dungeon.json / shell.json
+  // the anchor is read from), copied as they ship.
+  {
+    std::error_code cec;
+    fs::create_directories(f.root + "/dungeons/" + kRealAsset, cec);
+    for (const char* n : {"dungeon.json", "refs.json", "shell.json"}) {
+      fs::copy_file(fs::path(AssetDir()) / "dungeons" / kRealAsset / n, fs::path(f.root) / "dungeons" / kRealAsset / n,
+                    fs::copy_options::overwrite_existing, cec);
+      if (cec) {
+        why = std::string("could not copy assets/dungeons/") + kRealAsset + "/" + n + ": " + cec.message();
+        return false;
+      }
+    }
+  }
   if (!WriteText(f.root + "/worldmap/harness/map.json", map.dump(2)) ||
       !WriteText(f.root + "/dungeons/_entities_fixture/dungeon.json",
                  "{ \"version\": 1, \"name\": \"Entities fixture\", \"refs\": \"refs.json\" }\n") ||
@@ -300,13 +348,16 @@ RunResult RunFixture(Ctx& c) {
   st.BindChunkStore(&c.stream.Store());
 
   // ---- A. placement ----
-  if (st.Dungeons().size() != 1 || !st.Dungeons()[0].resolved) {
-    fail(Format("A: %zu placement(s), resolved %d", st.Dungeons().size(),
-                st.Dungeons().empty() ? 0 : (int)st.Dungeons()[0].resolved));
+  bool allResolved = st.Dungeons().size() == 4;
+  for (const refs::DungeonPlacement& d : st.Dungeons()) allResolved &= d.resolved;
+  if (!allResolved || st.Dungeons()[0].id != "entfix") {
+    fail(Format("A: %zu placement(s) (want 4: entfix, entfix_b, cairn_a, cairn_b), resolved %d",
+                st.Dungeons().size(), (int)allResolved));
     leave(&st);
     return out;
   }
   f.place = st.Dungeons()[0];
+  const refs::DungeonPlacement placeB = st.Dungeons()[1];
   const refs::Ref* lever = st.Find(kG + "lever_a");
   const refs::Ref* door = st.Find(kG + "door_c");
   if (lever == nullptr || door == nullptr) {
@@ -334,8 +385,82 @@ RunResult RunFixture(Ctx& c) {
     door = st.Find(kG + "door_c");
   }
   for (const std::string& w : st.Warnings())
-    if (w.find("dungeon") != std::string::npos && w.find("entfix") != std::string::npos)
+    if (w.find("dungeon") != std::string::npos &&
+        (w.find("entfix") != std::string::npos || w.find("cairn") != std::string::npos))
       fail("A: load warning: " + w);
+
+  // ---- M. multi-placement, store side (before any tick) ----
+  std::string mLine;
+  {
+    // The file each placement was made from, in the dungeon-local frame.
+    struct FileRef {
+      std::string name;   // the id past "dungeon/<asset>/"
+      IVec3 pos;
+      int yaw;
+    };
+    auto fileRefs = [&](const std::string& path, const std::string& asset) {
+      std::vector<FileRef> v;
+      std::ifstream fin(path, std::ios::binary);
+      const std::string txt((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
+      const J j = J::parse(txt, nullptr, false);
+      if (j.is_discarded() || !j.contains("refs")) return v;
+      const std::string pre = "dungeon/" + asset + "/";
+      for (const J& r : j["refs"]) {
+        const std::string id = r.value("id", std::string());
+        if (id.compare(0, pre.size(), pre) != 0 || !r.contains("pos")) continue;
+        v.push_back({id.substr(pre.size()),
+                     IVec3{(int)r["pos"][0].get<double>(), (int)r["pos"][1].get<double>(), (int)r["pos"][2].get<double>()},
+                     (int)r.value("yaw", 0.0)});
+      }
+      return v;
+    };
+    // A prop string that names a dungeon ref must name one of ITS group.
+    std::function<int(const J&, const std::string&)> foreign = [&](const J& j, const std::string& own) -> int {
+      if (j.is_string()) {
+        const std::string v = j.get<std::string>();
+        return v.compare(0, 8, "dungeon/") == 0 && v.compare(0, own.size() + 1, own + "/") != 0 ? 1 : 0;
+      }
+      int n = 0;
+      if (j.is_array() || j.is_object())
+        for (const J& e : j) n += foreign(e, own);
+      return n;
+    };
+    int checked = 0, misplaced = 0, missing = 0, leaks = 0;
+    std::string firstBad;
+    for (const refs::DungeonPlacement& d : st.Dungeons()) {
+      const std::vector<FileRef> fr = fileRefs(f.root + "/dungeons/" + d.dungeon + "/" + d.refsFile, d.dungeon);
+      if (fr.empty()) {
+        fail("M: placement " + d.id + ": its refs file has no refs");
+        continue;
+      }
+      for (const auto& [id, r] : st.All())
+        if (r.group == d.Group()) leaks += foreign(r.props, d.Group());
+      for (const FileRef& l : fr) {
+        const refs::Ref* r = st.Find(d.Group() + "/" + l.name);
+        checked++;
+        if (r == nullptr) {
+          missing++;
+          if (firstBad.empty()) firstBad = d.Group() + "/" + l.name + " missing";
+          continue;
+        }
+        const IVec3 w = d.ToWorld(l.pos);
+        if (r->pos.x != w.x || r->pos.y != w.y || r->pos.z != w.z || r->yaw != d.YawToWorld(l.yaw) ||
+            r->group != d.Group()) {
+          misplaced++;
+          if (firstBad.empty())
+            firstBad = Format("%s at (%d,%d,%d) yaw %d, want (%d,%d,%d) yaw %d", r->id.c_str(), r->pos.x, r->pos.y,
+                              r->pos.z, r->yaw, w.x, w.y, w.z, d.YawToWorld(l.yaw));
+        }
+      }
+    }
+    if (missing || misplaced || leaks)
+      fail(Format("M: %d refs checked over %zu placements: %d missing, %d misplaced, %d prop strings naming another "
+                  "placement's refs (first: %s)",
+                  checked, st.Dungeons().size(), missing, misplaced, leaks, firstBad.c_str()));
+    mLine = Format("M %d refs over %zu placements (entfix yaw %d, entfix_b yaw %d, cairn_a 0, cairn_b 90) at their "
+                   "transforms, %d leaks",
+                   checked, st.Dungeons().size(), f.place.yaw, placeB.yaw, leaks);
+  }
 
   // ---- the schedule, the build ----
   {
@@ -383,6 +508,12 @@ RunResult RunFixture(Ctx& c) {
     if (gs.raised == gs.height && gs.height > 0) break;
   }
   tickN(2);
+  // M: the pull raised entfix's gate_a and NOT entfix_b's (a group's signal).
+  const bool sigA = refs::SignalLevel(st, "dungeon/entfix", "gate_a");
+  const bool sigB = refs::SignalLevel(st, "dungeon/entfix_b", "gate_a");
+  if (!sigA || sigB)
+    fail(Format("M: after entfix's lever pull, signal gate_a is %s in entfix and %s in entfix_b (want on / off)",
+                sigA ? "on" : "off", sigB ? "on" : "off"));
   const int barsOpen = CountMat(c, gLo, gHi, iron);
   if (gs.raised != gs.height || barsOpen != 0)
     fail(Format("B: after the pull the gate is raised %d/%d with %d iron cells left in its box (want 0)",
@@ -545,12 +676,53 @@ RunResult RunFixture(Ctx& c) {
     }
   }
 
+  // ---- G. darts stop at walls ----
+  std::string gLine;
+  {
+    // FIXTURE SETUP, not a phase call: one body behind the door wall on the
+    // walled dart's line, one in the open on the other's.
+    const int def = c.mobs.FindDef("dummy");
+    const Vec3 ws = def >= 0 ? c.mobs.Defs()[(size_t)def].worldSize : Vec3{};
+    auto stand = [&](IVec3 local) -> uint64_t {
+      const IVec3 at = f.place.ToWorld(local);
+      const uint64_t id =
+          def >= 0 ? c.mobs.Spawn(def, {at.x - (int)(ws.x * 0.5f), at.y, at.z - (int)(ws.z * 0.5f)}) : 0;
+      if (id != 0) c.mobs.SetMobBehavior(id, "dummy");
+      return id;
+    };
+    const uint64_t behind = stand({2, 0, 30}), open = stand({44, 0, 22});
+    if (behind == 0 || open == 0) fail("G: could not spawn the dart targets");
+    tickN(3);
+    st.QueueDevUse(kG + "lever_g");
+    refs::TrapStatus tw, to;
+    for (int k = 0; k < 10; k++) {
+      tickN(1);
+      if (refs::TrapStatusOf(kG + "dart_wall_g", tw) && tw.fires > 0 && refs::TrapStatusOf(kG + "dart_open_g", to) &&
+          to.fires > 0)
+        break;
+    }
+    refs::TrapStatusOf(kG + "dart_wall_g", tw);
+    refs::TrapStatusOf(kG + "dart_open_g", to);
+    Mix(out.trace, tw.hits);
+    Mix(out.trace, to.hits);
+    Mix(out.trace, (int64_t)std::lround(tw.wallT * 2.0f));
+    // The wall's face is 8 cells down the line (z 12 -> 20): 7.5.
+    if (tw.fires != 1 || tw.hits != 0 || std::fabs(tw.wallT - 7.5f) > 0.01f)
+      fail(Format("G: the walled dart fired %u, hit %u (want 0), stopped at %.1f (want 7.5: the door wall) [%s]", tw.fires,
+                  tw.hits, tw.wallT, tw.note.c_str()));
+    if (to.fires != 1 || to.hits != 1 || to.wallT < 29.9f)
+      fail(Format("G: the open dart fired %u, hit %u (want 1), flew %.1f (want its 30 range) [%s]", to.fires, to.hits,
+                  to.wallT, to.note.c_str()));
+    gLine = Format("darts: walled %u hits, stopped at %.1f | open %u hit", tw.hits, tw.wallT, to.hits);
+  }
+
   out.detail = Format(
       "gate %d bars, open in %d ticks, shut in %d | collapse %d stone -> %d (%d gravel) in %d ticks | door "
       "%s -> %s | loot [%s] | patrol %u nodes in %d ticks [%s] | spawner_f [%s]",
       barsBuilt, openTicks + 1, closeTicks + 1, stoneBefore, stoneAfter, gravelAfter, collapseTicks + 1,
       refusedLocked ? "refused" : "NOT refused", refs::DoorPhaseName(ds.phase), lootText.c_str(),
-      rs.patrolArrivals, patrolTicks + 1, visits.c_str(), spawnText.c_str());
+      rs.patrolArrivals, patrolTicks + 1, visits.c_str(), spawnText.c_str()) +
+      " | " + gLine + " | " + mLine;
   RecordObserved("dungeon.patrolTicks", (double)(patrolTicks + 1));
   rig.reset();
   leave(&st);

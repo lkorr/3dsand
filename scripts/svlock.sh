@@ -34,8 +34,10 @@
 #   ...
 #   svlock_release "$SVLOCK_GPU"        # or let the EXIT trap do it
 
-SVLOCK_COMPILE="C:/sv-compile-lock"
-SVLOCK_GPU="C:/sv-gpu-lock"
+# The *_DIR overrides exist for scripts/test_svlock_fair.sh, which runs the
+# real functions against private lock directories. Nothing else sets them.
+SVLOCK_COMPILE="${SVLOCK_COMPILE_DIR:-C:/sv-compile-lock}"
+SVLOCK_GPU="${SVLOCK_GPU_DIR:-C:/sv-gpu-lock}"
 SVLOCK_STALE_SEC="${SVLOCK_STALE_SEC:-600}"   # 10 min — kill a stuck lock
 
 declare -A SVLOCK_HB=()      # dir -> heartbeat pid, for the locks we hold
@@ -85,11 +87,60 @@ svlock_cleanup_stale() {
 
 # Blocks until acquired. Installs an EXIT trap that releases every lock this
 # shell holds, and starts a heartbeat for this one.
+# ---- FAIRNESS: the waiters' queue (2026-10-12) ------------------------------
+# The lock alone is a free-for-all, and the free-for-all had a loser: run.sh
+# polled every 2 s while tuner_server.py's per-request voxserve acquisitions
+# poll every 50 ms, so a Dungeons / World-map tab streaming regions re-took
+# the lock within milliseconds of every release and game runs queued 10+
+# minutes behind it. So a waiter ANNOUNCES itself: a ticket file in
+# "$dir.queue/" holding the epoch-ms it started waiting (+ who, for the status
+# line), its mtime touched every poll while it waits. An acquirer -- this
+# file, and RunLock in tuner_server.py, which spells the same rule -- may
+# mkdir only when no LIVE ticket started before its own (ties by file name);
+# one with no ticket yet counts as starting NOW, so anybody already queued
+# goes first. Oldest first: a plain FIFO across bash and Python alike.
+# A ticket untouched for SVLOCK_TICKET_STALE_SEC belongs to a waiter that died
+# (Ctrl-C, a tool timeout's kill) and is deleted by whoever passes it, so a
+# dead waiter holds the queue for at most that long. Pids are not used: an
+# MSYS $$ is not a Windows pid Python could test, and an mtime needs no test.
+# None of this touches the lock directory itself: the stale / orphan rules
+# above and the heartbeat below are exactly what they were. A checkout whose
+# svlock.sh predates the queue still takes the lock, just without a ticket
+# (it neither waits its turn nor is waited for).
+SVLOCK_POLL="${SVLOCK_POLL:-0.5}"
+SVLOCK_TICKET_STALE_SEC="${SVLOCK_TICKET_STALE_SEC:-15}"
+SVLOCK_TICKETS=()            # our own tickets (removed on acquire and on EXIT)
+
+# 0 = no live ticket in queue dir $1 is ahead of ours ($2 = our ticket path or
+# "", $3 = our start in epoch-ms or ""). Deletes the stale ones it passes.
+svlock_my_turn() {
+  local q=$1 mine=$2 start=$3 f st now age
+  [ -d "$q" ] || return 0
+  now=$(date +%s)
+  for f in "$q"/*; do
+    [ -f "$f" ] || continue
+    [ "$f" = "$mine" ] && continue
+    case "$f" in *.tmp) continue;; esac
+    age=$(( now - $(stat -c %Y "$f" 2>/dev/null || echo "$now") ))
+    if [ "$age" -gt "$SVLOCK_TICKET_STALE_SEC" ]; then rm -f "$f"; continue; fi
+    st=$(cut -d' ' -f1 "$f" 2>/dev/null || true)
+    case "$st" in ''|*[!0-9]*) continue;; esac     # unreadable this instant: ignore
+    [ -z "$start" ] && return 1
+    if [ "$st" -lt "$start" ] || { [ "$st" -eq "$start" ] && [[ "$f" < "$mine" ]]; }; then return 1; fi
+  done
+  return 0
+}
+
 svlock_acquire() {
-  local dir=$1 who=$2 waited=0
+  local dir=$1 who=$2 waited=0 q="$1.queue" ticket="" start=""
   while true; do
     svlock_cleanup_stale "$dir"
-    if mkdir "$dir" 2>/dev/null; then
+    if svlock_my_turn "$q" "$ticket" "$start" && mkdir "$dir" 2>/dev/null; then
+      if [ -n "$ticket" ]; then
+        rm -f "$ticket"
+        local i
+        for i in "${!SVLOCK_TICKETS[@]}"; do [ "${SVLOCK_TICKETS[$i]}" = "$ticket" ] && unset 'SVLOCK_TICKETS[$i]'; done
+      fi
       # ts BEFORE pid: the stale check only looks at directories with a pid
       # file, so the timestamp must already be there when it does.
       date +%s > "$dir/ts"
@@ -124,11 +175,27 @@ svlock_acquire() {
       SVLOCK_HB[$dir]=$!
       return 0
     fi
+    if [ -z "$ticket" ]; then
+      # Join the queue. Written to a temp name and renamed, so a reader never
+      # sees a ticket without its start time. The EXIT trap removes it if we
+      # die waiting (and releases whatever else this shell already holds).
+      mkdir -p "$q" 2>/dev/null || true
+      start=$(date +%s%3N)
+      ticket="$q/sh$$-$RANDOM"
+      if echo "$start $who" > "$ticket.tmp" 2>/dev/null && mv -f "$ticket.tmp" "$ticket" 2>/dev/null; then
+        SVLOCK_TICKETS+=("$ticket")
+        trap svlock_release_all EXIT
+      else
+        ticket=""; start=""          # no queue dir (read-only C:?): wait the old way
+      fi
+    else
+      touch "$ticket" 2>/dev/null || true
+    fi
     if [ "$waited" -eq 0 ]; then
       echo "$SVLOCK_TAG: waiting for $(basename "$dir") (held by: $(cat "$dir/who" 2>/dev/null || echo unknown))..."
     fi
     waited=$(( waited + 1 ))
-    sleep 2
+    sleep "$SVLOCK_POLL"
   done
 }
 
@@ -149,7 +216,9 @@ svlock_release() {
 }
 
 svlock_release_all() {
-  local d
+  local d t
+  for t in "${SVLOCK_TICKETS[@]}"; do rm -f "$t"; done
+  SVLOCK_TICKETS=()
   for d in "${!SVLOCK_HB[@]}"; do svlock_release "$d"; done
 }
 
@@ -161,7 +230,7 @@ svlock_release_all() {
 # builds still overlap our COMPILE phase (CPU contention only — nothing an
 # old build does to the exe can hurt a compile). Delete this once no worktree
 # is on the old scripts.
-SVLOCK_LEGACY="C:/sv-build-lock"
+SVLOCK_LEGACY="${SVLOCK_LEGACY_DIR:-C:/sv-build-lock}"
 svlock_acquire_gpu() {
   local who=$1
   svlock_acquire "$SVLOCK_GPU" "$who"
@@ -182,5 +251,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     else
       printf '%-22s free\n' "$(basename "$d")"
     fi
+    for t in "$d.queue"/*; do
+      [ -f "$t" ] || continue
+      case "$t" in *.tmp) continue;; esac
+      st=$(cut -d' ' -f1 "$t" 2>/dev/null); st=${st:-0}
+      printf '  queued: %s (waiting %ss)\n' "$(cut -d' ' -f2- "$t" 2>/dev/null)" "$(( $(date +%s) - st / 1000 ))"
+    done
   done
 fi

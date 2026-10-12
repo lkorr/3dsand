@@ -727,8 +727,78 @@ WORLDMAP_DIR = os.path.join(ASSETS, "worldmap")
 #
 # Mirrors run.sh exactly, including the 10-minute stale sweep, because two
 # implementations of one mutex that disagree about staleness is not a mutex.
-RUNLOCK_DIR = "C:/sv-gpu-lock"
+#
+# FAIRNESS (2026-10-12): "none of the starvation" was true for the server and
+# false for everyone else. A tab streaming regions polls this lock every 50 ms
+# and re-takes it within milliseconds of each release, while run.sh polled
+# every 2 s -- game runs and gates queued 10+ minutes behind a Dungeons tab.
+# svlock.sh's WAITERS' QUEUE is the fix and this class obeys it: a waiter
+# leaves a ticket in RUNLOCK_DIR + ".queue" (epoch-ms it started waiting, who;
+# mtime touched while it waits; stale after RUNLOCK_TICKET_STALE_SEC), and
+# nobody takes the lock while a live ticket older than its own is queued.
+# svlock.sh says why at length; the two must agree on the directory, the
+# ticket format and the stale window.
+RUNLOCK_DIR = os.environ.get("SVLOCK_GPU_DIR") or "C:/sv-gpu-lock"
 RUNLOCK_STALE_SEC = 600
+RUNLOCK_TICKET_STALE_SEC = 15
+# How long a region / dungeon-preview request waits for the GPU lock before it
+# answers 503 `busy` (the page retries): see _voxregion.
+REGION_LOCK_SEC = 25.0
+
+
+class LockBusy(TimeoutError):
+    """The GPU lock stayed with somebody else past the request's patience.
+    Not a voxel-server failure: the caller answers 503 `busy` and the page
+    retries, the live --voxserve process is NOT killed (it was healthy; killing
+    it made every timed-out request pay a respawn under the same contention)."""
+
+
+def runlock_holder():
+    """'who (Ns)' of the GPU lock's holder and the queue length, for messages."""
+    try:
+        with open(os.path.join(RUNLOCK_DIR, "who")) as f:
+            who = f.read().strip() or "?"
+    except OSError:
+        who = "?"
+    try:
+        with open(os.path.join(RUNLOCK_DIR, "ts")) as f:
+            age = "%ds" % (time.time() - int(f.read().strip() or 0))
+    except (OSError, ValueError):
+        age = "?"
+    try:
+        q = len([n for n in os.listdir(RUNLOCK_DIR + ".queue") if not n.endswith(".tmp")])
+    except OSError:
+        q = 0
+    return "%s, %s%s" % (who, age, (", %d queued" % q) if q else "")
+
+
+def _runlock_my_turn(qdir, mine, start):
+    """svlock.sh svlock_my_turn: no live ticket ahead of ours (mine = our
+    ticket's path or None, start = its epoch-ms or None = now)."""
+    try:
+        names = os.listdir(qdir)
+    except OSError:
+        return True
+    now = time.time()
+    for n in names:
+        if n.endswith(".tmp"):
+            continue
+        f = os.path.join(qdir, n).replace("\\", "/")
+        if mine is not None and f == mine:
+            continue
+        try:
+            if now - os.path.getmtime(f) > RUNLOCK_TICKET_STALE_SEC:
+                os.remove(f)
+                continue
+            with open(f) as fh:
+                st = int((fh.read().split() or ["x"])[0])
+        except (OSError, ValueError):
+            continue
+        if start is None:
+            return False
+        if st < start or (st == start and f < mine):
+            return False
+    return True
 
 
 class RunLock:
@@ -737,9 +807,41 @@ class RunLock:
     def __init__(self, who, timeout=180.0):
         self.who = who
         self.timeout = timeout
+        self.ticket = None
+        self.start = None
+
+    def _join_queue(self):
+        qdir = RUNLOCK_DIR + ".queue"
+        try:
+            os.makedirs(qdir, exist_ok=True)
+            self.start = int(time.time() * 1000)
+            t = "%s/py%d-%d-%d" % (qdir, os.getpid(), threading.get_ident() & 0xFFFFFF, self.start % 100000)
+            with open(t + ".tmp", "w") as f:
+                f.write("%d tuner:%s" % (self.start, self.who))
+            os.replace(t + ".tmp", t)
+            self.ticket = t
+            self._touched = time.time()
+        except OSError:
+            self.ticket = self.start = None
+
+    def _leave_queue(self):
+        if self.ticket:
+            try:
+                os.remove(self.ticket)
+            except OSError:
+                pass
+        self.ticket = self.start = None
 
     def __enter__(self):
+        try:
+            return self._enter()
+        except BaseException:
+            self._leave_queue()
+            raise
+
+    def _enter(self):
         deadline = time.time() + self.timeout
+        qdir = RUNLOCK_DIR + ".queue"
         while True:
             try:
                 ts = 0
@@ -759,15 +861,27 @@ class RunLock:
                     shutil.rmtree(RUNLOCK_DIR, ignore_errors=True)
             except OSError:
                 pass
-            try:
-                os.mkdir(RUNLOCK_DIR)
-            except FileExistsError:
+            got = False
+            if _runlock_my_turn(qdir, self.ticket, self.start):
+                try:
+                    os.mkdir(RUNLOCK_DIR)
+                    got = True
+                except FileExistsError:
+                    pass
+            if not got:
                 if time.time() > deadline:
-                    raise TimeoutError("build/run lock held for >%ds" % self.timeout)
+                    raise LockBusy("waiting for the GPU lock (held by %s) for >%ds" % (runlock_holder(), self.timeout))
+                if self.ticket is None:
+                    self._join_queue()
+                elif time.time() - self._touched > 1.0:
+                    try:
+                        os.utime(self.ticket, None)
+                    except OSError:
+                        pass
+                    self._touched = time.time()
                 time.sleep(0.05)
                 continue
-            except OSError as e:
-                raise
+            self._leave_queue()
             # ts FIRST and pid LAST: a holder killed half way through these
             # writes (a test harness's server torn down mid-boot) must leave a
             # lock one of the two sweeps above can see -- with pid written first
@@ -784,7 +898,16 @@ class RunLock:
             return self
 
     def __exit__(self, *exc):
-        shutil.rmtree(RUNLOCK_DIR, ignore_errors=True)
+        # Only the OWNER releases (svlock.sh's rule): a lock stolen as stale
+        # while we held it is the new holder's, and deleting it would let the
+        # next build.sh link over that holder's live run.
+        try:
+            with open(os.path.join(RUNLOCK_DIR, "pid")) as f:
+                mine = f.read().strip() == str(os.getpid())
+        except OSError:
+            mine = False
+        if mine:
+            shutil.rmtree(RUNLOCK_DIR, ignore_errors=True)
         return False
 
 
@@ -821,7 +944,7 @@ class VoxServe:
         self.scratch_map = None
         self.scratch_key = ""
 
-    def _spawn(self, map_name):
+    def _spawn(self, map_name, lock_timeout=180.0):
         if not os.path.isfile(EXE):
             raise RuntimeError("build/Release/sandvox.exe not built yet — press Build")
         os.makedirs(VOXTMP, exist_ok=True)
@@ -830,7 +953,7 @@ class VoxServe:
         sig = _world_signature(map_name)
         env = _exe_env(dict(os.environ, SANDVOX_MAP=map_name))
         # The boot is the expensive, GPU-heavy part, so it holds the run mutex.
-        with RunLock("voxserve-boot"):
+        with RunLock("voxserve-boot", timeout=lock_timeout):
             p = subprocess.Popen(
                 [EXE, "--voxserve"], cwd=ROOT, env=env,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -855,7 +978,7 @@ class VoxServe:
                 if not ack or ack.startswith("OK ") or ack.startswith("ERR "):
                     break
 
-    def _ensure(self, map_name):
+    def _ensure(self, map_name, lock_timeout=180.0):
         if self.proc is not None and self.proc.poll() is None:
             # "*": any map will do (PALETTE -- the material table is no map's;
             # RELOAD from /api/voxreload).
@@ -863,25 +986,34 @@ class VoxServe:
                 return
             self._stop_locked()     # another map: this process cannot answer for it
         self.proc = None
-        self._spawn(_tuning_map() if map_name == "*" else map_name)
+        self._spawn(_tuning_map() if map_name == "*" else map_name, lock_timeout)
 
-    def command(self, line, hold_lock=True, map_name=None):
+    def command(self, line, hold_lock=True, map_name=None, lock_timeout=180.0):
         """Send one command, return (ok, payload_bytes_or_message).
 
         `hold_lock=False` is for commands that touch no GPU (PING), so a
         liveness check does not queue behind somebody's build. `map_name`
         None = tuning's world.mapLayer (what the game loads).
         """
-        return self.commands([line], hold_lock, map_name)
+        return self.commands([line], hold_lock, map_name, lock_timeout)
 
-    def commands(self, lines, hold_lock=True, map_name=None):
+    def commands(self, lines, hold_lock=True, map_name=None, lock_timeout=180.0):
         """Send several commands as ONE uninterrupted sequence and return the
         last one's (ok, message); the first failure stops the sequence. For
         state a later command depends on (LAYER before REGION, P7): another
-        request thread must not get in between."""
+        request thread must not get in between.
+
+        GPU-lock contention is NOT a failure of the process: past
+        `lock_timeout` the answer is (False, "busy: ...") with the live
+        --voxserve left alone (it used to be killed like a dead one, so every
+        timed-out request then paid a respawn under the same contention).
+        Callers answer 503 with `busy: true`; the pages retry."""
         want = map_name or _tuning_map()
         with self.lock:
-            self._ensure(want)
+            try:
+                self._ensure(want, lock_timeout)
+            except LockBusy as e:
+                return False, "busy: " + str(e)
             def _round_trip(line):
                 self.proc.stdin.write(line + "\n")
                 self.proc.stdin.flush()
@@ -904,10 +1036,12 @@ class VoxServe:
                 return ack
             try:
                 if hold_lock:
-                    with RunLock("voxserve"):
+                    with RunLock("voxserve", timeout=lock_timeout):
                         ack = _all()
                 else:
                     ack = _all()
+            except LockBusy as e:
+                return False, "busy: " + str(e)
             except Exception as e:
                 # A dead server is recoverable: the next request respawns it.
                 try:
@@ -921,14 +1055,14 @@ class VoxServe:
                 return False, ack[4:]
             return True, ack[3:]
 
-    def sync(self, sig, map_name=None):
+    def sync(self, sig, map_name=None, lock_timeout=180.0):
         """RELOAD a live server whose files are not `sig`. A dead one -- or one
         generating another map -- needs nothing: the next command respawns it
         on the current files of the map it asks for."""
         want = map_name or _tuning_map()
         if self.proc is None or self.proc.poll() is not None or self.map != want or self.sig == sig:
             return True, ""
-        ok, msg = self.command("RELOAD", map_name=want)
+        ok, msg = self.command("RELOAD", map_name=want, lock_timeout=lock_timeout)
         if ok:
             self.sig = sig
         return ok, msg
@@ -1082,6 +1216,8 @@ def _dungeon_list():
             e["name"] = j.get("name") or n
             e["style"] = j.get("style") or ""
             e["pieces"] = len(j.get("pieces") or [])
+            # A VARIANT (D8: `extends` + overrides): the tab opens it as overrides of its base.
+            e["extends"] = j.get("extends") or ""
         except (OSError, ValueError) as ex:
             e["error"] = str(ex)
         out.append(e)
@@ -2012,16 +2148,25 @@ class Handler(BaseHTTPRequestHandler):
         cmd = "REGION %d %d %d %d %d %d %d %d %s" % (
             ox, oy, oz, nx, ny, nz, lod, seed, raw.replace("\\", "/"))
         try:
-            ok, msg = _voxserve.sync(sig, mname)
+            ok, msg = _voxserve.sync(sig, mname, REGION_LOCK_SEC)
             if not ok:
-                return self._json(503, {"ok": False, "error": "reload: " + msg})
+                return self._json(503, {"ok": False, "busy": msg.startswith("busy: "), "error": "reload: " + msg})
             # LAYER @map, not the layer's name: the map's own layer AND every
             # locale's (L1), merged as the game merges them.
+            # A SHORT lock patience: a region is ~10 ms of GPU, and a viewer
+            # holding six fetches open for three minutes behind somebody's
+            # selftest learns nothing. Past it the answer is 503 `busy` and
+            # WorldView retries the region (its 5 s failure backoff), saying
+            # why on its status line.
             ok, msg = _voxserve.commands(["LAYER " + ("@map" if sel == "@map" else (layer or "-")), cmd],
-                                         map_name=mname)
+                                         map_name=mname, lock_timeout=REGION_LOCK_SEC)
+        except LockBusy as e:
+            return self._json(503, {"ok": False, "busy": True, "error": "busy: " + str(e)})
         except Exception as e:
             return self._json(503, {"ok": False, "error": str(e)})
         if not ok:
+            if msg.startswith("busy: "):
+                return self._json(503, {"ok": False, "busy": True, "error": msg})
             return self._json(500, {"ok": False, "error": msg})
         try:
             with open(raw, "rb") as f:
@@ -2103,10 +2248,16 @@ class Handler(BaseHTTPRequestHandler):
         else:
             return self._json(400, {"ok": False, "error": "mode must be isolate, place, map or clear"})
         try:
-            ok, msg = _voxserve.command(line, map_name=mname)
+            ok, msg = _voxserve.command(line, map_name=mname, lock_timeout=REGION_LOCK_SEC)
+        except LockBusy as e:
+            return self._json(503, {"ok": False, "busy": True, "error": "busy: " + str(e)})
         except Exception as e:
             return self._json(503, {"ok": False, "error": str(e)})
         if not ok:
+            # `busy`: the GPU lock, not the program -- the page re-posts it
+            # (ui_core.js Previewer) and says it is waiting.
+            if msg.startswith("busy: "):
+                return self._json(503, {"ok": False, "busy": True, "error": msg})
             return self._json(500, {"ok": False, "error": msg})
         try:
             with open(info, "r", encoding="utf-8") as f:

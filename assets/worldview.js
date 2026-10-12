@@ -889,6 +889,14 @@
   // host cannot answer for makes the answer no.
   WorldView.prototype._buried = function (n) {
     if (!this.groundAt || n.level < 1) return false;
+    // view.keepBox (world {min, max}; unset = none, the default): a box the
+    // ground rule must not cull -- the Dungeons tab's in-world view, whose
+    // dungeon IS under the ground and must stream, while the rock round it
+    // (the margin columns, tens of buried regions) need not.
+    var kb = this.view.keepBox;
+    if (kb && n.rx * n.e <= kb.max[0] && (n.rx + 1) * n.e > kb.min[0] &&
+        n.ry * n.e <= kb.max[1] && (n.ry + 1) * n.e > kb.min[1] &&
+        n.rz * n.e <= kb.max[2] && (n.rz + 1) * n.e > kb.min[2]) return false;
     // Memoized per key until invalidate(): a node that is NOT buried is asked
     // again every update while it waits in the queue.
     var memo = this._buriedMemo || (this._buriedMemo = new Map());
@@ -1086,7 +1094,12 @@
              ' s: it waits for the machine-wide GPU lock while another sandvox run holds it)';
     // Recent failures only: one that has since been retried successfully is
     // history, and a stale error beside a full picture is a false alarm.
-    if (s.lastError && this._failAt.size)
+    // A `busy` answer (tuner_server.py: the GPU lock stayed with another run
+    // past the request's patience) is a queue, not a failure: say so.
+    if (s.lastError && this._failAt.size && /^busy: /.test(s.lastError))
+      out += ' · ' + this._failAt.size + ' region(s) waiting for the GPU lock, retrying (' +
+             s.lastError.replace(/^busy: waiting for the GPU lock \(held by /, 'held by ').replace(/\) for >\d+s$/, '') + ')';
+    else if (s.lastError && this._failAt.size)
       out += ' · ' + this._failAt.size + ' region(s) failing, retrying: ' + s.lastError;
     return out;
   };
@@ -1116,7 +1129,8 @@
     this._reqT0.set(key + '@' + gen, t0);
     fetch('/api/voxregion?' + q).then(function (r) {
       if (!r.ok) return r.json().catch(function () { return {}; }).then(function (j) {
-        throw new Error(j.error || ('HTTP ' + r.status));
+        var m = j.error || ('HTTP ' + r.status);
+        throw new Error(j.busy && !/^busy: /.test(m) ? 'busy: ' + m : m);
       });
       return r.arrayBuffer();
     }).then(function (buf) {

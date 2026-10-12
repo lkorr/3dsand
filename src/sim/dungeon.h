@@ -33,6 +33,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -174,12 +175,29 @@ struct Placed {
   std::array<int, 3> origin{};      // world cell of local (0, 0, 0)
   std::array<int, 3> boxMin{}, boxMax{};     // world, inflated, inclusive
   std::array<int, 3> keepMin{}, keepMax{};   // world; keepMax < keepMin = none
+  // THE SURFACE RECTS (D9): world XZ rects {x0, z0, x1, z1} (inclusive) of the
+  // columns where some prim / prop of this dungeon reaches the ground
+  // (SurfaceRects). Worldgen grows no tree whose crown comes near one and no
+  // ground cover inside one (worldgen_dungeon.wgsli dgSurfNear), so an
+  // entrance carved through a forest leaves no cut trunk and no floating crown.
+  std::vector<std::array<int, 4>> surf;
 };
 // The world box + keep box of a shell placed with `yawQ` at `origin`
 // (inflated by noise, blend, skin, scatter, the firm shell).
 void PlacedBounds(Placed& p);
 // Anchor -> origin: the world cell `base` the anchor cell lands on.
 std::array<int, 3> OriginFor(const Shell& s, int yawQ, std::array<int, 3> base);
+// The surface rects of a placed dungeon (Placed::surf; call after
+// PlacedBounds). `groundAt(x, z)` is the ground height of a column (the map
+// loader passes BareGroundHeight). Each prim (but `keep` / `skin`) and prop
+// instance is sampled on the world's 8-voxel lattice over its RAW shape box
+// (+ noise + blend / 4 + 2, not the index inflation); a column counts where
+// the box reaches ground - kDgSurfSlack, and for a curved or noisy prim only
+// where its own distance (the twin's) comes within 2 voxels of a cell between
+// there and its top. The counted 8x8 tiles (+2 cells) become row runs stacked
+// into rects, merged (least added area first) down to kDgSurfPerDungeon.
+// Deterministic: integer arithmetic on the shell and the ground.
+void SurfaceRects(Placed& p, const std::function<int(int, int)>& groundAt);
 
 // ---- the GPU block (worldgen_dungeon.wgsli DG_*; check_invariants.py) -----
 enum : uint32_t {
@@ -187,8 +205,14 @@ enum : uint32_t {
   kDgH_CellX0 = 5, kDgH_CellY0 = 6, kDgH_CellZ0 = 7, kDgH_CellX1 = 8, kDgH_CellY1 = 9, kDgH_CellZ1 = 10,
   kDgH_GenX0 = 11, kDgH_GenY0 = 12, kDgH_GenZ0 = 13, kDgH_GenX1 = 14, kDgH_GenY1 = 15, kDgH_GenZ1 = 16,
   kDgH_KeepX0 = 17, kDgH_KeepY0 = 18, kDgH_KeepZ0 = 19, kDgH_KeepX1 = 20, kDgH_KeepY1 = 21, kDgH_KeepZ1 = 22,
-  kDgH_Flags = 23, kDgFlagEvalOff = 1,
-  kDgH_Words = 24,
+  kDgH_Flags = 23, kDgFlagEvalOff = 1, kDgFlagSurfOff = 2,
+  kDgH_Surf = 24, kDgH_SurfN = 25, kDgH_SurfX0 = 26, kDgH_SurfZ0 = 27, kDgH_SurfX1 = 28, kDgH_SurfZ1 = 29,
+  kDgH_Words = 30,
+  kDgR_Words = 4,              // a surface rect: x0 z0 x1 z1 (world, inclusive)
+  kDgSurfStep = 8,             // SurfaceRects' sampling lattice (voxels)
+  kDgSurfSlack = 2,            // a box top this far under the ground still "reaches" it
+  kDgSurfPerDungeon = 48,      // rects per dungeon after merging
+  kDgTreeClear = 8,            // a crown keeps this far (Chebyshev, voxels) off a surface rect
   kDgD_OriginX = 0, kDgD_OriginY = 1, kDgD_OriginZ = 2, kDgD_Yaw = 3, kDgD_Box = 4, kDgD_Keep = 10,
   kDgD_Words = 16,
   kDgP_Flags = 0, kDgP_Mats = 1, kDgP_AX = 2, kDgP_AY = 3, kDgP_AZ = 4, kDgP_BX = 5, kDgP_BY = 6,
@@ -207,21 +231,29 @@ enum : uint32_t {
 struct PackStats {
   uint32_t prims = 0, instances = 0, templates = 0, indexCells = 0, listWords = 0;
   uint32_t hashCap = 0, probeMax = 0, words = 0, worstList = 0;
+  std::vector<uint32_t> primOff;   // each packed prim record's offset, in pack order
 };
 // Append the block to `W` and point W[kHDungeon] at it (left 0 for none).
 // False + `log` when a cell's list is over kDgListMax / kDgInstMax.
 // `evalOff` packs everything but sets kDgFlagEvalOff (worldmap.h
 // SetDungeonsEnabled): no list is ever found, so no cell is evaluated.
+// `surfOff` sets kDgFlagSurfOff: the surface rects are packed but no tree or
+// cover reads them (the `dungeon-gen` gate's "what would grow there" arm).
 bool PackDungeons(const std::vector<Placed>& dungeons, std::vector<uint32_t>& W,
-                  std::string& log, PackStats* stats = nullptr, bool evalOff = false);
+                  std::string& log, PackStats* stats = nullptr, bool evalOff = false, bool surfOff = false);
 
 // ---- the CPU twin -----------------------------------------------------------
 // dgCell over the packed words `W` (a whole worldMap buffer), for terrain word
 // `tw` at world cell (x, y, z): the word the GPU writes. `mats` supplies the
 // class / repose words (MaterialGpu) the shader reads from `materials`; `seed`
 // is T.seed (the palette jitter).
+// `gh` = the column's ground height (genColumn's h; World::TerrainHeight on
+// the CPU): scatter grows only from support at or under it (D9).
 uint32_t TwinCell(const std::vector<uint32_t>& W, const std::vector<MaterialDef>& mats, uint32_t seed,
-                  int x, int y, int z, uint32_t tw);
+                  int x, int y, int z, uint32_t tw, int gh);
+// worldgen_dungeon.wgsli dgSurfNear: is column (x, z) within `r` (Chebyshev)
+// of a surface rect? (false when the block has none, or kDgFlagSurfOff.)
+bool TwinSurfNear(const std::vector<uint32_t>& W, int x, int z, int r);
 // The list offset dgListAt would find (0 = none), and the carve field there.
 uint32_t TwinListAt(const std::vector<uint32_t>& W, int x, int y, int z);
 int TwinCarveAt(const std::vector<uint32_t>& W, const std::vector<MaterialDef>& mats, uint32_t seed,

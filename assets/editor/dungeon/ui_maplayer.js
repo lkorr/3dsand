@@ -198,7 +198,8 @@ export function createDungeonLayer(C) {
       const openBtn = el('button', {title: 'the Dungeons tab, in world: the real terrain round the entrance, the dungeon x-rayed beneath (save the map first)'}, 'Open in Dungeons tab');
       openBtn.addEventListener('click', () => {
         if (C.check && C.savedJson && JSON.stringify(C.map().json.dungeons || []) !== JSON.stringify((C.savedJson() || {}).dungeons || [])) C.toast('the map has unsaved dungeon changes: the Dungeons tab reads the SAVED map.json', true);
-        if (window.__tunerDungeons) window.__tunerDungeons.open(e.dungeon || e.id, {world: true}); else C.toast('the Dungeons tab did not load', true);
+        // {map, id}: THIS map's entry, whichever map the page is on (the tab shows that placement in world).
+        if (window.__tunerDungeons) window.__tunerDungeons.open(e.dungeon || e.id, {world: {map: C.map().name, id: e.id}}); else C.toast('the Dungeons tab did not load', true);
       });
       const del = el('button', {}, 'Delete');
       del.addEventListener('click', () => edit(() => { J().dungeons = entries().filter(x => x !== e); st.sel = null; }));

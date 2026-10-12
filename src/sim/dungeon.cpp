@@ -849,6 +849,11 @@ bool ResolveShell(const Shell& s, const std::vector<std::string>& matNames, cons
 // ============================================================================
 namespace {
 struct Box { std::array<int, 3> lo{}, hi{}; };
+int fdivFloor(int a, int b) {
+  int q = a / b;
+  if ((a % b) != 0 && ((a < 0) != (b < 0))) q -= 1;
+  return q;
+}
 // One tube segment, local cells.
 struct Seg { std::array<int, 3> a{}, b{}; int ra = 0, rb = 0; };
 
@@ -1003,6 +1008,153 @@ void PlacedBounds(Placed& pl) {
   }
 }
 
+namespace {
+using Rect = std::array<int, 4>;   // x0 z0 x1 z1, inclusive
+int64_t RectArea(const Rect& r) { return int64_t(r[2] - r[0] + 1) * int64_t(r[3] - r[1] + 1); }
+Rect RectUnion(const Rect& a, const Rect& b) {
+  return {std::min(a[0], b[0]), std::min(a[1], b[1]), std::max(a[2], b[2]), std::max(a[3], b[3])};
+}
+bool RectHas(const Rect& a, const Rect& b) { return a[0] <= b[0] && a[1] <= b[1] && a[2] >= b[2] && a[3] >= b[3]; }
+}  // namespace
+
+// The twin's distance of the prim record at `off` in `W`, at a world cell
+// (defined after the twin, below).
+int TwinPrimDistance(const std::vector<uint32_t>& W, uint32_t off, int x, int y, int z);
+
+namespace {
+// A prim's RAW shape box, local cells: the solid itself + its noise + a
+// quarter of its blend (the smooth-min fillet's reach) + 2 -- NOT the index
+// inflation (scatter bands, the firm shell, and the ellipse ratio, which
+// exists only because the distance estimate under-reads).
+Box RawLocalBox(const Shell& s, const Prim& p) {
+  Box b;
+  if (p.shape == kShapeCapsule || p.shape == kShapeTube) {
+    bool any = false;
+    for (const Seg& g : SegmentsOf(s, p)) {
+      const int r = std::max(g.ra, g.rb);
+      for (int c = 0; c < 3; c++) {
+        const int lo = std::min(g.a[c], g.b[c]) - r, hi = std::max(g.a[c], g.b[c]) + r;
+        b.lo[c] = any ? std::min(b.lo[c], lo) : lo;
+        b.hi[c] = any ? std::max(b.hi[c], hi) : hi;
+      }
+      any = true;
+    }
+    if (!any) b.lo = b.hi = p.a;
+  } else {
+    b.lo = p.a;
+    b.hi = p.b;
+    if (p.shape == kShapeRamp) b.lo[1] = p.a[1] - p.below;
+  }
+  const int e = 2 + (p.noiseOct > 0 ? p.noiseAmp : 0) + (p.op == kOpCarve ? p.blend / 4 : 0);
+  for (int c = 0; c < 3; c++) {
+    b.lo[c] -= e;
+    b.hi[c] += e;
+  }
+  return b;
+}
+}  // namespace
+
+void SurfaceRects(Placed& pl, const std::function<int(int, int)>& groundAt) {
+  const Shell& s = *pl.shell;
+  pl.surf.clear();
+  const int S = kDgSurfStep, half = S / 2;
+  const int slack = static_cast<int>(kDgSurfSlack);
+  std::map<std::pair<int, int>, int> memo;   // the ground on the world's S lattice
+  auto ground = [&](int x, int z) {
+    auto it = memo.find({x, z});
+    if (it != memo.end()) return it->second;
+    const int g = groundAt(x, z);
+    memo.emplace(std::make_pair(x, z), g);
+    return g;
+  };
+  // The program alone, packed, so a curved prim's own distance can be asked
+  // (the twin's dgPrimD, noise included).
+  std::vector<uint32_t> W(worldmap::kHeaderWords, 0u);
+  PackStats ps;
+  std::string perr;
+  Placed alone = pl;
+  alone.surf.clear();
+  const bool packed = PackDungeons({alone}, W, perr, &ps) && ps.primOff.size() == s.prims.size();
+  // THE MARKED SAMPLES: lattice columns (multiples of S) where some prim or
+  // prop puts matter or air at or over the ground.
+  std::set<std::pair<int, int>> marked;
+  // Lattice point L's TILE is the columns L - half .. L + half - 1; every
+  // tile meeting the box is tested, at the box column nearest L.
+  auto consider = [&](const Box& b, int primIdx, bool curved) {
+    const int x0 = fdivFloor(b.lo[0] - half + 1 + S - 1, S) * S, z0 = fdivFloor(b.lo[2] - half + 1 + S - 1, S) * S;
+    auto test = [&](int L, int M) {
+      const int x = std::clamp(L, b.lo[0], b.hi[0]), z = std::clamp(M, b.lo[2], b.hi[2]);
+      const int g = ground(L, M);
+      if (b.hi[1] < g - slack) return;                  // wholly under the ground here
+      if (!curved || !packed || primIdx < 0) {
+        marked.insert({L, M});
+        return;
+      }
+      // A curved / noisy solid: does it come within 6 voxels (a tile's
+      // half-width + 2: the shape may bulge between lattice columns) of a
+      // cell between ground - slack and its top, at this column? Every 4th y.
+      const int ylo = std::max(b.lo[1], g - slack), yhi = b.hi[1];
+      const int step = std::max(4, (yhi - ylo) / 128);
+      for (int y = ylo; y <= yhi; y += step) {
+        if (TwinPrimDistance(W, ps.primOff[static_cast<size_t>(primIdx)], x, y, z) < 4 * (half + 2)) {
+          marked.insert({L, M});
+          return;
+        }
+      }
+    };
+    for (int M = z0; M - half <= b.hi[2]; M += S)
+      for (int L = x0; L - half <= b.hi[0]; L += S) test(L, M);
+  };
+  for (size_t i = 0; i < s.prims.size(); i++) {
+    const Prim& p = s.prims[i];
+    if (p.op == kOpKeep || p.op == kOpSkin) continue;   // neither adds matter nor air of its own
+    const bool curved = p.shape == kShapeEllipsoid || p.shape == kShapeCylinder || p.shape == kShapeVault ||
+                        p.shape == kShapeCapsule || p.shape == kShapeTube || p.noiseOct > 0;
+    consider(ToWorld(RawLocalBox(s, p), pl.yawQ, pl.origin), static_cast<int>(i), curved);
+  }
+  for (const Instance& in : s.instances) consider(ToWorld(InstanceLocalBox(s, in), pl.yawQ, pl.origin), -1, false);
+  // THE RECTS: each marked sample covers its S x S tile, + 2 cells. Row runs
+  // first, then runs stacked on identical runs of the row below; then, while
+  // over the budget, merge the pair whose union adds the least area. A merge
+  // only ever GROWS the keep-out (conservative), never shrinks it.
+  std::map<int, std::vector<int>> rows;   // z -> sorted x
+  for (const auto& [x, z] : marked) rows[z].push_back(x);
+  std::vector<Rect> rects;
+  std::map<std::pair<int, int>, size_t> open;   // (x0, x1) of a run in the previous row -> its rect
+  int prevZ = INT_MIN;
+  for (auto& [z, xs] : rows) {
+    std::map<std::pair<int, int>, size_t> next;
+    for (size_t i = 0; i < xs.size();) {
+      size_t j = i;
+      while (j + 1 < xs.size() && xs[j + 1] == xs[j] + S) j++;
+      const std::pair<int, int> run{xs[i], xs[j]};
+      auto it = open.find(run);
+      if (it != open.end() && prevZ == z - S) {
+        rects[it->second][3] = z + half - 1 + 2;
+        next.emplace(run, it->second);
+      } else {
+        rects.push_back({xs[i] - half - 2, z - half - 2, xs[j] + half - 1 + 2, z + half - 1 + 2});
+        next.emplace(run, rects.size() - 1);
+      }
+      i = j + 1;
+    }
+    open = std::move(next);
+    prevZ = z;
+  }
+  while (rects.size() > kDgSurfPerDungeon) {
+    size_t bi = 0, bj = 1;
+    int64_t best = INT64_MAX;
+    for (size_t i = 0; i < rects.size(); i++)
+      for (size_t j = i + 1; j < rects.size(); j++) {
+        const int64_t g = RectArea(RectUnion(rects[i], rects[j])) - RectArea(rects[i]) - RectArea(rects[j]);
+        if (g < best) { best = g; bi = i; bj = j; }
+      }
+    rects[bi] = RectUnion(rects[bi], rects[bj]);
+    rects.erase(rects.begin() + static_cast<std::ptrdiff_t>(bj));
+  }
+  pl.surf = rects;
+}
+
 // ============================================================================
 // the GPU block
 // ============================================================================
@@ -1057,7 +1209,7 @@ std::vector<uint32_t> PackTemplate(const Template& t, const std::vector<uint32_t
 }  // namespace
 
 bool PackDungeons(const std::vector<Placed>& ds, std::vector<uint32_t>& W, std::string& log, PackStats* stats,
-                  bool evalOff) {
+                  bool evalOff, bool surfOff) {
   PackStats st;
   if (W.size() <= worldmap::kHDungeon) W.resize(worldmap::kHeaderWords, 0u);
   W[worldmap::kHDungeon] = 0u;
@@ -1068,7 +1220,8 @@ bool PackDungeons(const std::vector<Placed>& ds, std::vector<uint32_t>& W, std::
   const uint32_t base = static_cast<uint32_t>(W.size());
   W.resize(base + kDgH_Words, 0u);
   W[base + kDgH_Count] = U(static_cast<int>(ds.size()));
-  W[base + kDgH_Flags] = evalOff ? static_cast<uint32_t>(kDgFlagEvalOff) : 0u;
+  W[base + kDgH_Flags] = (evalOff ? static_cast<uint32_t>(kDgFlagEvalOff) : 0u) |
+                         (surfOff ? static_cast<uint32_t>(kDgFlagSurfOff) : 0u);
   // ---- the dungeon records ----
   const uint32_t recs = static_cast<uint32_t>(W.size());
   W[base + kDgH_Recs] = recs;
@@ -1106,6 +1259,27 @@ bool PackDungeons(const std::vector<Placed>& ds, std::vector<uint32_t>& W, std::
     W[base + kDgH_KeepX0 + c] = U(keepAny ? keep.lo[c] : 1);
     W[base + kDgH_KeepX1 + c] = U(keepAny ? keep.hi[c] : 0);
   }
+  // ---- the surface rects (SurfaceRects), every dungeon's, with their union ----
+  {
+    std::vector<Rect> all;
+    for (const Placed& pl : ds) all.insert(all.end(), pl.surf.begin(), pl.surf.end());
+    W[base + kDgH_SurfN] = U(static_cast<int>(all.size()));
+    W[base + kDgH_Surf] = 0u;
+    Rect u{1, 1, 0, 0};
+    if (!all.empty()) {
+      const uint32_t off = static_cast<uint32_t>(W.size());
+      W[base + kDgH_Surf] = off;
+      u = all[0];
+      for (const Rect& r : all) {
+        for (int k = 0; k < 4; k++) W.push_back(U(r[k]));
+        u = RectUnion(u, r);
+      }
+    }
+    W[base + kDgH_SurfX0] = U(u[0]);
+    W[base + kDgH_SurfZ0] = U(u[1]);
+    W[base + kDgH_SurfX1] = U(u[2]);
+    W[base + kDgH_SurfZ1] = U(u[3]);
+  }
   // ---- prims, scatter, tube segments, templates, instances; and the cells ----
   using Key = std::tuple<int, int, int>;   // (cz, cy, cx): a fixed order
   std::map<Key, std::pair<std::vector<uint32_t>, std::vector<uint32_t>>> cells;   // prims, instances
@@ -1120,6 +1294,20 @@ bool PackDungeons(const std::vector<Placed>& ds, std::vector<uint32_t>& W, std::
         }
   };
   std::map<std::vector<uint32_t>, uint32_t> blocks;   // a packed template (relative) -> its offset
+  // MULTI-PLACEMENT (D9): a prim's scatter rules and tube segments are in its
+  // LOCAL frame, so two placements of one asset (or two prims alike) share
+  // them -- only the 20-word prim record (it names its placement's record) and
+  // the index entries are per placement. Templates were already shared above.
+  std::map<std::vector<uint32_t>, uint32_t> shared;   // a scatter / segment run -> its offset
+  auto place = [&](const std::vector<uint32_t>& run) -> uint32_t {
+    if (run.empty()) return 0u;
+    auto it = shared.find(run);
+    if (it != shared.end()) return it->second;
+    const uint32_t off = static_cast<uint32_t>(W.size());
+    W.insert(W.end(), run.begin(), run.end());
+    shared.emplace(run, off);
+    return off;
+  };
   for (size_t d = 0; d < ds.size(); d++) {
     const Placed& pl = ds[d];
     const Shell& s = *pl.shell;
@@ -1128,38 +1316,39 @@ bool PackDungeons(const std::vector<Placed>& ds, std::vector<uint32_t>& W, std::
     for (size_t i = 0; i < s.prims.size(); i++) {
       const Prim& p = s.prims[i];
       // Scatter rules first (the prim record points at them).
-      const uint32_t scat = static_cast<uint32_t>(W.size());
+      std::vector<uint32_t> sc(static_cast<size_t>(p.scatterCount) * kDgS_Words, 0u);
       for (uint32_t k = 0; k < p.scatterCount; k++) {
         const Scatter& c = s.scatter[p.scatterFirst + k];
-        const size_t at = W.size();
-        W.resize(at + kDgS_Words, 0u);
-        W[at + kDgS_Kind] = c.kind | (c.surface << 8);
-        W[at + kDgS_Dens] = c.densityQ16;
-        W[at + kDgS_Size] = U(c.sizeMin) | (U(c.sizeMax) << 16);
-        W[at + kDgS_Mat] = rs.scatterMat[p.scatterFirst + k];
-        W[at + kDgS_Seed] = c.seed;
-        W[at + kDgS_Spacing] = U(c.spacing > 0 ? c.spacing : 2 * c.sizeMax * 3 + 4);
+        const size_t at = static_cast<size_t>(k) * kDgS_Words;
+        sc[at + kDgS_Kind] = c.kind | (c.surface << 8);
+        sc[at + kDgS_Dens] = c.densityQ16;
+        sc[at + kDgS_Size] = U(c.sizeMin) | (U(c.sizeMax) << 16);
+        sc[at + kDgS_Mat] = rs.scatterMat[p.scatterFirst + k];
+        sc[at + kDgS_Seed] = c.seed;
+        sc[at + kDgS_Spacing] = U(c.spacing > 0 ? c.spacing : 2 * c.sizeMax * 3 + 4);
       }
+      const uint32_t scat = place(sc);
       // Tube segments (capsule = one segment), Q2 local, with their boxes.
       uint32_t seg0 = 0, segN = 0;
       const bool tube = p.shape == kShapeCapsule || p.shape == kShapeTube;
       if (tube) {
         const int e = InflationOf(s, p);
-        seg0 = static_cast<uint32_t>(W.size());
+        std::vector<uint32_t> sg;
         for (const Seg& g : SegmentsOf(s, p)) {
-          const size_t at = W.size();
-          W.resize(at + kDgT_Words, 0u);
+          const size_t at = sg.size();
+          sg.resize(at + kDgT_Words, 0u);
           const int rq = (std::max(g.ra, g.rb) + e) * 4;
           for (int c = 0; c < 3; c++) {
-            W[at + c] = U(g.a[c] * 4 + 2);
-            W[at + 3 + c] = U(g.b[c] * 4 + 2);
-            W[at + 8 + c] = U(std::min(g.a[c], g.b[c]) * 4 + 2 - rq);
-            W[at + 11 + c] = U(std::max(g.a[c], g.b[c]) * 4 + 2 + rq);
+            sg[at + c] = U(g.a[c] * 4 + 2);
+            sg[at + 3 + c] = U(g.b[c] * 4 + 2);
+            sg[at + 8 + c] = U(std::min(g.a[c], g.b[c]) * 4 + 2 - rq);
+            sg[at + 11 + c] = U(std::max(g.a[c], g.b[c]) * 4 + 2 + rq);
           }
-          W[at + 6] = U(g.ra * 4);
-          W[at + 7] = U(g.rb * 4);
+          sg[at + 6] = U(g.ra * 4);
+          sg[at + 7] = U(g.rb * 4);
           segN++;
         }
+        seg0 = place(sg);
       }
       const uint32_t off = static_cast<uint32_t>(W.size());
       W.resize(off + kDgP_Words, 0u);
@@ -1202,6 +1391,7 @@ bool PackDungeons(const std::vector<Placed>& ds, std::vector<uint32_t>& W, std::
       r[kDgP_DRec] = drec;
       for (const Box& b : LocalBoxes(s, p)) touch(ToWorld(b, pl.yawQ, pl.origin), off, false);
       st.prims++;
+      st.primOff.push_back(off);
     }
     for (size_t i = 0; i < s.instances.size(); i++) {
       const Instance& in = s.instances[i];
@@ -1371,7 +1561,10 @@ constexpr uint32_t DG_H_GEN_X0 = kDgH_GenX0, DG_H_GEN_Y0 = kDgH_GenY0, DG_H_GEN_
                    DG_H_KEEP_X1 = kDgH_KeepX1, DG_H_KEEP_Y1 = kDgH_KeepY1, DG_H_KEEP_Z1 = kDgH_KeepZ1,
                    DG_H_WORDS = kDgH_Words, DG_D_BOX = kDgD_Box, DG_D_KEEP = kDgD_Keep, DG_D_WORDS = kDgD_Words,
                    DG_P_WORDS = kDgP_Words, DG_I_WORDS = kDgI_Words, DG_H_FLAGS = kDgH_Flags,
-                   DG_FLAG_EVAL_OFF = kDgFlagEvalOff;
+                   DG_FLAG_EVAL_OFF = kDgFlagEvalOff, DG_FLAG_SURF_OFF = kDgFlagSurfOff, DG_H_SURF = kDgH_Surf,
+                   DG_H_SURF_N = kDgH_SurfN, DG_H_SURF_X0 = kDgH_SurfX0, DG_H_SURF_Z0 = kDgH_SurfZ0,
+                   DG_H_SURF_X1 = kDgH_SurfX1, DG_H_SURF_Z1 = kDgH_SurfZ1, DG_R_WORDS = kDgR_Words;
+constexpr int DG_TREE_CLEAR = kDgTreeClear;
 constexpr uint32_t DG_D_ORIGIN_X = kDgD_OriginX, DG_D_ORIGIN_Y = kDgD_OriginY, DG_D_ORIGIN_Z = kDgD_OriginZ,
                    DG_D_YAW = kDgD_Yaw;
 constexpr uint32_t DG_P_FLAGS = kDgP_Flags, DG_P_MATS = kDgP_Mats, DG_P_AX = kDgP_AX, DG_P_AY = kDgP_AY,
@@ -1428,6 +1621,21 @@ uint32_t dgListOfCell(int cx, int cy, int cz) {
 }
 uint32_t dgListAt(int x, int y, int z) {
   return dgListOfCell(x >> DG_CELL_LOG2, y >> DG_CELL_LOG2, z >> DG_CELL_LOG2);
+}
+// worldgen_dungeon.wgsli dgSurfNear.
+bool dgSurfNear(int x, int z, int r) {
+  const uint32_t b = worldMap[WM_H_DUNGEON];
+  if (b == 0u || (worldMap[b + DG_H_FLAGS] & DG_FLAG_SURF_OFF) != 0u) return false;
+  if (x < dgI(b + DG_H_SURF_X0) - r || x > dgI(b + DG_H_SURF_X1) + r || z < dgI(b + DG_H_SURF_Z0) - r ||
+      z > dgI(b + DG_H_SURF_Z1) + r)
+    return false;
+  const uint32_t o = worldMap[b + DG_H_SURF];
+  const uint32_t n = worldMap[b + DG_H_SURF_N];
+  for (uint32_t k = 0u; k < n; k++) {
+    const uint32_t q = o + k * DG_R_WORDS;
+    if (x >= dgI(q) - r && x <= dgI(q + 2u) + r && z >= dgI(q + 1u) - r && z <= dgI(q + 3u) + r) return true;
+  }
+  return false;
 }
 
 // MIRROR-BEGIN dungeon
@@ -1682,6 +1890,40 @@ int dgCarveAt(int x, int y, int z) {
   if (lst == 0u) { return DG_BIG; }
   return dgCarveIn(lst, x, y, z);
 }
+// IS THE CELL SOLID once the dungeon is applied (D9)? The scatter probes'
+// support test: dgCell's steps 1 and 3 on solidity alone -- the carve field,
+// then the ordered fill / keep / re-carve, later wins -- with TERRAIN solid
+// at or under the column's ground `gh` and open above it. So a feature stands
+// on a floor FILL inside its carve's noise (the carve field alone called that
+// carved) and never on the open sky over a surface piece (the carve field
+// alone called that rock). Skins, scatter and props do not change solidity
+// here. The probe's column ground stands in for its neighbours' (one cell).
+bool dgSolidAt(int x, int y, int z, int gh) {
+  const uint32_t lst = dgListAt(x, y, z);
+  if (lst == 0u) { return y <= gh; }
+  const uint32_t n = min(worldMap[lst], DG_LIST_MAX);
+  int c = DG_BIG;
+  uint32_t st = 0u;
+  bool kept = false;
+  for (uint32_t k = 0u; k < n; k++) {
+    const uint32_t p = worldMap[lst + 1u + k];
+    const uint32_t op = worldMap[p + DG_P_FLAGS] & 3u;
+    if (op == DG_OP_SKIN) { continue; }
+    const int d = dgPrimD(p, x, y, z);
+    if (op == DG_OP_CARVE) { c = dgSmin(c, d, int(worldMap[p + DG_P_BLEND] & 0xFFFFu)); }
+    if (d < 0) {
+      if (op == DG_OP_FILL) { st = 2u; }
+      else if (op == DG_OP_KEEP) { st = 3u; kept = true; }
+      else if (!kept) { st = 1u; }
+    }
+  }
+  if (st == 0u) {
+    if (c < 0) { return false; }
+    return y <= gh;
+  }
+  if (st == 3u) { return y <= gh; }
+  return st == 2u;
+}
 // What a carved cell holds: air, or the carve's liquid at or under its level.
 uint32_t dgCarveWord(uint32_t p, int x, int y, int z) {
   const uint32_t lm = worldMap[p + DG_P_MATS] & 0xFFFu;
@@ -1713,8 +1955,14 @@ uint32_t dgPropCell(uint32_t ir, int x, int y, int z) {
   return DG_PROP_NONE;
 }
 // One scatter rule of prim p over the cell (word w so far, terrain word tw,
-// the prim's own distance dOwn, the carve field c). PLAN §3.4.1 "Scatter".
-uint32_t dgScatter(uint32_t s, uint32_t p, int dOwn, int c, uint32_t w, uint32_t tw, int x, int y, int z) {
+// the prim's own distance dOwn, the carve field c, the column's ground height
+// gh). PLAN §3.4.1 "Scatter". SUPPORT IS SOLID GROUND (D9): a floor / ceiling
+// feature grows only from a cell dgSolidAt calls solid (a fill, a kept
+// pillar, or terrain at or under the ground -- never the open sky over a
+// surface piece, which the carve field alone called rock); the band kinds work
+// only on terrain at or under it, and a puddle only strictly under it (the top
+// ground cell's side neighbours may be a lower column's air).
+uint32_t dgScatter(uint32_t s, uint32_t p, int dOwn, int c, uint32_t w, uint32_t tw, int x, int y, int z, int gh) {
   const uint32_t kind = worldMap[s + DG_S_KIND] & 255u;
   const uint32_t surf = (worldMap[s + DG_S_KIND] >> 8u) & 255u;
   const uint32_t dens = worldMap[s + DG_S_DENS];
@@ -1733,7 +1981,7 @@ uint32_t dgScatter(uint32_t s, uint32_t p, int dOwn, int c, uint32_t w, uint32_t
   // `sp` lattice in the local XZ plane.
   const bool band = kind == DG_SC_MOSS || kind == DG_SC_ORE || kind == DG_SC_PUDDLE;
   if (band) {
-    if (w != tw || c < 0 || (tw & 0xFFFu) == 0u || dOwn < 0) { return w; }
+    if (w != tw || c < 0 || (tw & 0xFFFu) == 0u || dOwn < 0 || y > gh) { return w; }
   } else {
     if (w != 0u || dOwn >= 0) { return w; }
   }
@@ -1778,7 +2026,7 @@ uint32_t dgScatter(uint32_t s, uint32_t p, int dOwn, int c, uint32_t w, uint32_t
       nProbe = hh;
     }
   }
-  // THE PROBES, as ONE rolled loop (one inlined copy of the carve field): the
+  // THE PROBES, as ONE rolled loop (one inlined copy of dgSolidAt): the
   // band kinds ask the six face neighbours (bit 0 up, 1 down, 2..5 the
   // sides); a floor / ceiling feature walks down (up) its own height for the
   // first solid cell it can grow from -- every cell between is carved, so the
@@ -1799,7 +2047,7 @@ uint32_t dgScatter(uint32_t s, uint32_t p, int dOwn, int c, uint32_t w, uint32_t
     } else {
       dy = select(i + 1, -1 - i, down);
     }
-    if (dgCarveAt(x + dx, y + dy, z + dz) < 0) { mask = mask | (1u << uint32_t(i)); }
+    if (!dgSolidAt(x + dx, y + dy, z + dz, gh)) { mask = mask | (1u << uint32_t(i)); }
     else if (!band) { found = true; break; }
   }
   if (!band) {
@@ -1809,7 +2057,7 @@ uint32_t dgScatter(uint32_t s, uint32_t p, int dOwn, int c, uint32_t w, uint32_t
   if (kind == DG_SC_PUDDLE) {
     // A floor cell under air whose four sides and underside are solid: one
     // cell of liquid, contained by construction (PLAN: "puddle").
-    if ((mask & 1u) != 0u && (mask & 62u) == 0u) { return dgWord(mat, x, y, z); }
+    if ((mask & 1u) != 0u && (mask & 62u) == 0u && y < gh) { return dgWord(mat, x, y, z); }
     return w;
   }
   // MOSS: the first solid cell behind the surface on the authored side(s), in
@@ -1836,7 +2084,8 @@ uint32_t dgFillMat(uint32_t p, int x, int z) {
   return m;
 }
 // THE CELL (PLAN §3.4.1 "Op semantics"): terrain word tw in, the word out.
-uint32_t dgCell(uint32_t lst, int x, int y, int z, uint32_t tw) {
+// gh = the column's ground height (genColumn's h == World::TerrainHeight).
+uint32_t dgCell(uint32_t lst, int x, int y, int z, uint32_t tw, int gh) {
   const uint32_t nAll = worldMap[lst];
   const uint32_t n = min(nAll, DG_LIST_MAX);
   int dd[DG_LIST_MAX];
@@ -1886,7 +2135,7 @@ uint32_t dgCell(uint32_t lst, int x, int y, int z, uint32_t tw) {
     const uint32_t p = worldMap[lst + 1u + k];
     const uint32_t ns = (worldMap[p + DG_P_FLAGS] >> 12u) & 15u;
     for (uint32_t j = 0u; j < ns; j++) {
-      w = dgScatter(worldMap[p + DG_P_SCAT] + j * DG_S_WORDS, p, dd[k], c, w, tw, x, y, z);
+      w = dgScatter(worldMap[p + DG_P_SCAT] + j * DG_S_WORDS, p, dd[k], c, w, tw, x, y, z, gh);
     }
   }
   // 5. the props, later wins: CARVE clears, template air leaves alone.
@@ -1907,13 +2156,22 @@ uint32_t TwinListAt(const std::vector<uint32_t>& W, int x, int y, int z) {
   return twin::dgListAt(x, y, z);
 }
 uint32_t TwinCell(const std::vector<uint32_t>& W, const std::vector<MaterialDef>& mats, uint32_t seed, int x, int y,
-                  int z, uint32_t tw) {
+                  int z, uint32_t tw, int gh) {
   const uint32_t lst = TwinListAt(W, x, y, z);
   if (lst == 0u) return tw;
   twin::worldMap = W.data();
   twin::gMats = &mats;
   twin::gSeed = seed;
-  return twin::dgCell(lst, x, y, z, tw);
+  return twin::dgCell(lst, x, y, z, tw, gh);
+}
+int TwinPrimDistance(const std::vector<uint32_t>& W, uint32_t off, int x, int y, int z) {
+  twin::worldMap = W.data();
+  return twin::dgPrimD(off, x, y, z);
+}
+bool TwinSurfNear(const std::vector<uint32_t>& W, int x, int z, int r) {
+  if (W.size() <= worldmap::kHDungeon || W[worldmap::kHDungeon] == 0u) return false;
+  twin::worldMap = W.data();
+  return twin::dgSurfNear(x, z, r);
 }
 int TwinCarveAt(const std::vector<uint32_t>& W, const std::vector<MaterialDef>& mats, uint32_t seed, int x, int y,
                 int z) {

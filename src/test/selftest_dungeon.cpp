@@ -31,6 +31,7 @@
 //                   Exit: the evaluator back on, the environment reloaded, the
 //                   window regenerated at the origin it found.
 #include <algorithm>
+#include <climits>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -118,7 +119,14 @@ Status GateDungeonFormat(Ctx& c, std::string& detail) {
     try { dj = nlohmann::json::parse(text); } catch (const std::exception& e) {
       djOk = check(false, who + "dungeon.json does not parse: " + e.what());
     }
-    if (djOk) {
+    if (djOk && dj.contains("extends") && dj["extends"].is_string()) {
+      // A VARIANT (D8: `extends` + overrides) lists only what differs, so it has
+      // no piece list of its own; compile_dungeon.mjs resolved it into the shell
+      // checked below. Here: its base is a dungeon on disk.
+      const std::string base = dj["extends"].get<std::string>();
+      check(fs::is_regular_file(dir.parent_path() / base / "dungeon.json"),
+            who + "extends \"" + base + "\", which has no dungeon.json");
+    } else if (djOk) {
       std::set<std::string> pieces;
       for (const auto& p : dj.value("pieces", nlohmann::json::array()))
         if (p.is_object() && p.contains("id") && p["id"].is_string()) pieces.insert(p["id"].get<std::string>());
@@ -238,8 +246,38 @@ Status GateDungeonFormat(Ctx& c, std::string& detail) {
       fs::remove_all(tmp, ec);
     }
   }
+  // PORTABILITY (D9): the selftest's map places every real asset (a dir with a
+  // dungeon.json whose name does not start with '_'), and one of them twice
+  // at another yaw, so dungeon-gen runs each in place and checks the pair.
+  std::string placeLine;
+  {
+    const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+    if (m.name == "harness") {
+      int twice = 0;
+      std::string missing;
+      for (const fs::path& dir : dirs) {
+        const std::string id = dir.filename().string();
+        if (id.empty() || id[0] == '_' || !fs::is_regular_file(dir / "dungeon.json")) continue;
+        int n = 0;
+        std::set<int> yaws;
+        for (const worldmap::DungeonDef& g : m.dungeons)
+          if (g.asset == id && g.Placed()) {
+            n++;
+            yaws.insert(g.yawQ);
+          }
+        if (n == 0) missing += (missing.empty() ? "" : ", ") + id;
+        if (n >= 2 && yaws.size() >= 2) twice++;
+        placeLine += Format("%s%s x%d", placeLine.empty() ? "" : ", ", id.c_str(), n);
+      }
+      check(missing.empty(), "the harness map does not place (or could not place) real dungeon asset(s): " + missing +
+                                 " -- add a dungeons[] entry (assets/worldmap/harness/map.json)");
+      check(twice > 0, "the harness map places no real asset twice at two yaws (portability: dungeon-gen F)");
+      placeLine = "harness places " + placeLine;
+    }
+  }
   RecordObserved("dungeon.assets", static_cast<double>(loaded));
-  detail = Format("%d dungeon asset(s): %s | %d map placement(s) | %s", loaded, lines.c_str(), mapRefs, svedLine.c_str());
+  detail = Format("%d dungeon asset(s): %s | %d map placement(s) | %s | %s", loaded, lines.c_str(), mapRefs, svedLine.c_str(),
+                  placeLine.c_str());
   if (!why.empty()) {
     detail += " | FAIL: " + why[0];
     for (size_t i = 1; i < why.size() && i < 6; i++) detail += " | " + why[i];
@@ -300,6 +338,7 @@ Status GateDungeonGen(Ctx& c, std::string& detail) {
   };
   auto restore = [&]() {
     worldmap::SetScratchDungeon(nullptr);
+    worldmap::SetDungeonSurfaceKeep(true);
     refs::ResetResidents();
     c.debris.Reset();
     c.mobs.Reset();
@@ -336,6 +375,25 @@ Status GateDungeonGen(Ctx& c, std::string& detail) {
                  dungeon::RotZ(fx.yawQ, lx, lz) + fx.origin[2]};
   };
 
+  // Every placed dungeon of the map (the fixture and, D9, each real asset the
+  // harness map places -- one of them twice, at another yaw), as COPIES: the
+  // environment reloads below.
+  std::vector<worldmap::DungeonDef> placedAll;
+  for (const worldmap::DungeonDef& g : worldmap::CurrentWorldMap().dungeons)
+    if (g.Placed()) placedAll.push_back(g);
+  auto worldOf = [](const worldmap::DungeonDef& g, int lx, int ly, int lz) {
+    return IVec3{dungeon::RotX(g.yawQ, lx, lz) + g.origin[0], ly + g.origin[1], dungeon::RotZ(g.yawQ, lx, lz) + g.origin[2]};
+  };
+  // THE GROUND of a column (genColumn's h; dgCell's `gh`), memoised.
+  std::map<std::pair<int, int>, int> ghMemo;
+  auto groundOf = [&](int x, int z) {
+    auto it = ghMemo.find({x, z});
+    if (it != ghMemo.end()) return it->second;
+    const int g = World::TerrainHeight(x, z, kDefaultSeed);
+    ghMemo.emplace(std::make_pair(x, z), g);
+    return g;
+  };
+
   // ---- A. the twin, over chunks across the whole layout ----------------------
   // Points of interest in the fixture's LOCAL frame (shell.json's comments):
   // each brings its chunk and the +1 chunk on every axis.
@@ -345,11 +403,40 @@ Status GateDungeonGen(Ctx& c, std::string& detail) {
       {530, -61, 55},  {600, -80, 100}, {600, -60, 62},  {600, -112, 180}, {576, -100, 200}, {600, -90, 250},
       {300, -100, 0},  {-60, -40, -60}, {600, -140, 0}};
   std::set<std::tuple<int, int, int>> chunkSet;
-  for (const auto& q : poi) {
-    const IVec3 w = toWorld(q[0], q[1], q[2]);
+  std::map<std::tuple<int, int, int>, size_t> chunkOwner;   // first placement that asked (index into placedAll)
+  auto want2 = [&](std::set<std::tuple<int, int, int>>& into, const IVec3& w, size_t owner) {
     for (int dz = 0; dz <= 1; dz++)
       for (int dy = 0; dy <= 1; dy++)
-        for (int dx = 0; dx <= 1; dx++) chunkSet.insert({FloorDiv16(w.x) + dx, FloorDiv16(w.y) + dy, FloorDiv16(w.z) + dz});
+        for (int dx = 0; dx <= 1; dx++) {
+          const std::tuple<int, int, int> k{FloorDiv16(w.x) + dx, FloorDiv16(w.y) + dy, FloorDiv16(w.z) + dz};
+          into.insert(k);
+          chunkOwner.emplace(k, owner);
+        }
+  };
+  size_t fxIdx = 0;
+  for (size_t gi = 0; gi < placedAll.size(); gi++) {
+    const worldmap::DungeonDef& g = placedAll[gi];
+    if (g.id == fx.id) {
+      fxIdx = gi;
+      for (const auto& q : poi) want2(chunkSet, toWorld(q[0], q[1], q[2]), gi);
+      continue;
+    }
+    // E (D9: every OTHER placement of the map, in place): chunks round a
+    // sample of its prims.
+    const dungeon::Shell& sh = *g.shell;
+    const size_t np = sh.prims.size();
+    const size_t stride = std::max<size_t>(1, np / 24);
+    for (size_t i = 0; i < np; i += stride) {
+      const dungeon::Prim& pr = sh.prims[i];
+      std::array<int, 3> lc{};
+      if (pr.shape == dungeon::kShapeTube && pr.tubeCount > 0) {
+        const dungeon::TubePt& t = sh.tube[pr.tubeFirst];
+        lc = {t.x, t.y, t.z};
+      } else {
+        for (int a = 0; a < 3; a++) lc[a] = (pr.a[a] + pr.b[a]) / 2;
+      }
+      want2(chunkSet, worldOf(g, lc[0], lc[1], lc[2]), gi);
+    }
   }
   // Grouped by 32-chunk window block: GenerateChunks wants every chunk of a
   // call inside one window.
@@ -370,47 +457,65 @@ Status GateDungeonGen(Ctx& c, std::string& detail) {
   if (!reload(true)) { restore(); return finish("no environment (evaluator on)"); }
   generate(chunkSet, D);
   std::vector<uint32_t> W;
-  {
+  auto packCpu = [&](std::vector<uint32_t>& out) {
     biomes::BiomeSet set;
     std::string log;
-    check(biomes::LoadBiomeSet(ad, c.mats, set, log) && worldmap::PackWorldMap(set, worldmap::CurrentWorldMap(), W, log),
+    check(biomes::LoadBiomeSet(ad, c.mats, set, log) && worldmap::PackWorldMap(set, worldmap::CurrentWorldMap(), out, log),
           "the CPU pack of the world map failed: " + log);
-  }
+  };
+  packCpu(W);
   auto matId = [&](const char* n) -> uint32_t {
     for (size_t i = 0; i < c.mats.size(); i++)
       if (c.mats[i].name == n) return static_cast<uint32_t>(i);
     return 0xFFFFu;
   };
   long long cells = 0, listed = 0, mism = 0, carved = 0, changedSolid = 0, caveInKeep = 0, soaked = 0;
-  std::map<uint32_t, long long> byMat;   // material of a cell the dungeon changed to non-air
+  std::map<uint32_t, long long> byMat;   // material of a FIXTURE cell the dungeon changed to non-air
+  std::vector<long long> pCells(placedAll.size(), 0), pChanged(placedAll.size(), 0), pMism(placedAll.size(), 0),
+      pSoak(placedAll.size(), 0), pUnbound(placedAll.size(), 0);
+  // THE GROUND BOUND's effect (D9): cells whose word differs from what the
+  // same twin makes with no ground (gh = +inf, the pre-D9 rule: scatter grew
+  // from any uncarved cell, open sky included) -- the stalactites / rubble /
+  // puddles the bound refused, per placement.
+  constexpr int kNoGround = 1 << 28;
   std::string firstMism;
   for (const auto& [key, dw] : D) {
     const std::vector<uint32_t>& tw = T[key];
+    const size_t owner = chunkOwner.count(key) ? chunkOwner[key] : fxIdx;
+    const bool isFx = owner == fxIdx;
     const int bx = std::get<0>(key) * 16, by = std::get<1>(key) * 16, bz = std::get<2>(key) * 16;
     for (uint32_t i = 0; i < kChunkVol; i++) {
       const int x = bx + static_cast<int>(i % kChunk), y = by + static_cast<int>((i / kChunk) % kChunk),
                 z = bz + static_cast<int>(i / (kChunk * kChunk));
       cells++;
+      pCells[owner]++;
       if (dungeon::TwinListAt(W, x, y, z) != 0u) listed++;
-      const uint32_t exp = dungeon::TwinCell(W, c.mats, kDefaultSeed, x, y, z, tw[i]);
+      const uint32_t exp = dungeon::TwinCell(W, c.mats, kDefaultSeed, x, y, z, tw[i], groundOf(x, z));
+      if (dungeon::TwinCell(W, c.mats, kDefaultSeed, x, y, z, tw[i], kNoGround) != exp) pUnbound[owner]++;
       // THE WET BANKS (worldgen.wgsl `wetbanks`, in the same gen dispatch,
       // after genChunk) soak the stone round a generated liquid -- a puddle's
       // walls -- which the twin of dgCell does not model: a difference in the
       // stain bits ALONE, on the same material and state, is that pass.
       if (exp != dw[i] && (exp & ~kStainBits) == (dw[i] & ~kStainBits) && (exp & kStainBits) == 0u) {
         soaked++;
+        pSoak[owner]++;
       } else if (exp != dw[i]) {
+        pMism[owner]++;
         if (mism++ == 0)
-          firstMism = Format("(%d,%d,%d): terrain %08x, GPU %08x, twin %08x", x, y, z, tw[i], dw[i], exp);
+          firstMism = Format("%s (%d,%d,%d): terrain %08x, GPU %08x, twin %08x", placedAll[owner].id.c_str(), x, y, z,
+                             tw[i], dw[i], exp);
       }
       if (dw[i] != tw[i]) {
-        if ((dw[i] & 0xFFFu) == 0u) carved++;
-        else { changedSolid++; byMat[dw[i] & 0xFFFu]++; }
+        pChanged[owner]++;
+        if (isFx) {
+          if ((dw[i] & 0xFFFu) == 0u) carved++;
+          else { changedSolid++; byMat[dw[i] & 0xFFFu]++; }
+        }
       }
       // C. no natural cave inside the keep box: an air cell well under the
       // ground in the evaluator-off arm (the dungeon is not drawn there).
-      if (x >= fx.keepMin[0] && x <= fx.keepMax[0] && y >= fx.keepMin[1] && y <= fx.keepMax[1] && z >= fx.keepMin[2] &&
-          z <= fx.keepMax[2] && (tw[i] & 0xFFFu) == 0u && y < World::TerrainHeight(x, z, kDefaultSeed) - 16)
+      if (isFx && x >= fx.keepMin[0] && x <= fx.keepMax[0] && y >= fx.keepMin[1] && y <= fx.keepMax[1] &&
+          z >= fx.keepMin[2] && z <= fx.keepMax[2] && (tw[i] & 0xFFFu) == 0u && y < groundOf(x, z) - 16)
         caveInKeep++;
     }
   }
@@ -424,6 +529,26 @@ Status GateDungeonGen(Ctx& c, std::string& detail) {
   check(byMat[mCobble] > 0, "the corridor's cobble skin laid nothing");
   check(byMat[mTimber] > 0, "the corridor's timber sets laid nothing");
   check(byMat[mPlank] > 0, "the alcove prop's shelf laid nothing");
+  // D9: the chamber's rubble stands on its flagstone floor FILL, which lies
+  // inside the chamber carve's noise (dgSolidAt; before, the carve field
+  // called the fill "carved" and no pile found support).
+  // Over the WHOLE chamber floor (the twin, on stone terrain: the sampled
+  // chunks above see a fraction of it).
+  long long floorGravel = 0, floorAir = 0;
+  {
+    const uint32_t mStone = matId("stone");
+    for (int lz = -60; lz <= 60; lz++)
+      for (int lx = 520; lx <= 680; lx++)
+        for (int ly = -66; ly <= -54; ly++) {
+          const IVec3 w = toWorld(lx, ly, lz);
+          const uint32_t o = dungeon::TwinCell(W, c.mats, kDefaultSeed, w.x, w.y, w.z, mStone, groundOf(w.x, w.z));
+          if ((o & 0xFFFu) == mGravel) floorGravel++;
+          if ((o & 0xFFFu) == 0u) floorAir++;
+        }
+  }
+  check(byMat[mGravel] > 0 || floorGravel > 0,
+        Format("the chamber's rubble scatter laid nothing (sampled 0; whole floor via the twin %lld gravel, %lld air)", floorGravel,
+               floorAir));
   // The kept pillar: its axis cells inside the chamber's carve stay terrain.
   int keptSolid = 0, keptN = 0;
   for (int ly = -58; ly <= -24; ly += 4) {
@@ -439,112 +564,231 @@ Status GateDungeonGen(Ctx& c, std::string& detail) {
   const std::string aLine = Format(
       "A twin: %lld cells in %zu chunks, %lld listed, %lld mismatches (+%lld wet-bank soaks) | B ops: %lld carved, %lld laid (flagstone %lld, cobble "
       "%lld, timber %lld, plank %lld; scatter: gravel %lld, limestone %lld, moss %lld, water %lld, bone %lld, iron %lld), pillar "
-      "%d/%d kept | C caves in keep %lld",
+      "%d/%d kept, %lld scatter cells refused by the ground bound, chamber floor (twin) %lld gravel | C caves in keep %lld",
       cells, D.size(), listed, mism, soaked, carved, changedSolid, byMat[mFlag], byMat[mCobble], byMat[mTimber], byMat[mPlank],
-      byMat[mGravel], byMat[mLime], byMat[mMoss], byMat[mWater], byMat[mBone], byMat[mIron], keptSolid, keptN, caveInKeep);
+      byMat[mGravel], byMat[mLime], byMat[mMoss], byMat[mWater], byMat[mBone], byMat[mIron], keptSolid, keptN,
+      pUnbound[fxIdx], floorGravel, caveInKeep);
 
-  // ---- E. every OTHER compiled asset, alone ----------------------------------
-  // Each assets/dungeons/<id>/ with a shell.bin (D2's compiled samples, the
-  // examples), placed as the voxserve scratch would place it on harness land
-  // 4 km from the fixture: the twin over chunks round a sample of its prims.
+  // ---- E. every OTHER placement of the map, in place (D9) --------------------
+  // The twin above already covered their chunks; here each must have changed
+  // something, and is reported on its own.
   std::string eLine;
+  for (size_t gi = 0; gi < placedAll.size(); gi++) {
+    if (gi == fxIdx) continue;
+    const worldmap::DungeonDef& g = placedAll[gi];
+    check(pChanged[gi] > 0, Format("E %s (%s): the dungeon changed no cell of its sampled chunks", g.id.c_str(), g.asset.c_str()));
+    eLine += Format("%s%s=%s yaw %d at (%d,%d) ground y%d: %zu prims %zu surface rects, %lld cells, %lld changed, %lld mismatches "
+                    "(+%lld soaks), %lld refused by the ground bound",
+                    eLine.empty() ? "" : "; ", g.id.c_str(), g.asset.c_str(), g.yawQ * 90, g.ax, g.az, g.groundY,
+                    g.shell->prims.size(), g.surf.size(), pCells[gi], pChanged[gi], pMism[gi], pSoak[gi], pUnbound[gi]);
+  }
+  if (eLine.empty()) eLine = "no other placement";
+
+  // ---- F. PORTABILITY (D9): one asset placed twice is the same dungeon -------
+  // The carve field is evaluated in each placement's LOCAL frame, so at the
+  // same local cell two placements of one asset must agree whatever their
+  // anchor and yaw: sampled over every prim's box (a 5^3 lattice each),
+  // through the packed block's own records (the twin -- which A holds to the
+  // GPU cell by cell).
+  std::string fLine;
   {
-    std::vector<fs::path> dirs;
-    std::error_code ec;
-    for (const auto& e : fs::directory_iterator(fs::path(ad) / "dungeons", ec))
-      if (e.is_directory() && e.path().filename() != "_fixture" && fs::is_regular_file(e.path() / "shell.bin"))
-        dirs.push_back(e.path());
-    std::sort(dirs.begin(), dirs.end());
-    std::vector<std::string> names;
-    std::vector<uint32_t> klass;
-    for (const MaterialDef& m : c.mats) {
-      names.push_back(m.name);
-      klass.push_back(m.gpu.klass);
-    }
-    int k = 0;
-    for (const fs::path& dir : dirs) {
-      const std::string id = dir.filename().string();
-      auto sh = std::make_shared<dungeon::Shell>();
-      auto rs = std::make_shared<dungeon::Resolved>();
-      std::string err, used;
-      const bool eOk = dungeon::LoadShellPath(dir.string(), *sh, err, &used) &&
-                       dungeon::ResolveShell(*sh, names, klass, *rs, err);
-      if (!check(eOk, "E " + id + ": " + err)) continue;
-      worldmap::ScratchDungeon sd;
-      sd.def.id = "_gate_" + id;
-      sd.def.asset = id;
-      sd.def.shell = sh;
-      sd.def.res = rs;
-      sd.def.shellPath = used;
-      sd.def.ax = -2000 + 1500 * k++;
-      sd.def.az = -2000;
-      worldmap::SetScratchDungeon(&sd);
-      if (!reload(true)) { worldmap::SetScratchDungeon(nullptr); continue; }
-      const worldmap::DungeonDef* g = nullptr;
-      for (const worldmap::DungeonDef& d : worldmap::CurrentWorldMap().dungeons)
-        if (d.id == sd.def.id && d.Placed()) g = &d;
-      if (!check(g != nullptr, "E " + id + ": not placed (" + (worldmap::CurrentWorldMap().warnings.empty()
-                                                                     ? std::string("?")
-                                                                     : worldmap::CurrentWorldMap().warnings.back()) + ")")) {
-        worldmap::SetScratchDungeon(nullptr);
-        continue;
-      }
-      const worldmap::DungeonDef gd = *g;
-      std::set<std::tuple<int, int, int>> want;
-      const size_t np = sh->prims.size();
-      const size_t stride = std::max<size_t>(1, np / 24);
-      for (size_t i = 0; i < np; i += stride) {
-        const dungeon::Prim& pr = sh->prims[i];
-        std::array<int, 3> lc{};
-        if (pr.shape == dungeon::kShapeTube && pr.tubeCount > 0) {
-          const dungeon::TubePt& t = sh->tube[pr.tubeFirst];
-          lc = {t.x, t.y, t.z};
-        } else {
-          for (int a = 0; a < 3; a++) lc[a] = (pr.a[a] + pr.b[a]) / 2;
+    int pairs = 0;
+    long long fN = 0, fCarved = 0, fBad = 0;
+    std::string fFirst;
+    for (size_t a = 0; a < placedAll.size(); a++)
+      for (size_t b = a + 1; b < placedAll.size(); b++) {
+        const worldmap::DungeonDef& A = placedAll[a];
+        const worldmap::DungeonDef& B = placedAll[b];
+        if (A.asset != B.asset) continue;
+        pairs++;
+        check(A.yawQ != B.yawQ || A.ax != B.ax || A.az != B.az,
+              Format("F %s and %s: two placements of %s on the same anchor and yaw", A.id.c_str(), B.id.c_str(), A.asset.c_str()));
+        const dungeon::Shell& sh = *A.shell;
+        for (const dungeon::Prim& pr : sh.prims) {
+          std::array<int, 3> lo{}, hi{};
+          if (pr.shape == dungeon::kShapeTube || pr.shape == dungeon::kShapeCapsule) {
+            if (pr.shape == dungeon::kShapeCapsule) {
+              for (int k = 0; k < 3; k++) { lo[k] = std::min(pr.a[k], pr.b[k]) - pr.r; hi[k] = std::max(pr.a[k], pr.b[k]) + pr.r; }
+            } else {
+              if (pr.tubeCount == 0) continue;
+              const dungeon::TubePt& t = sh.tube[pr.tubeFirst];
+              lo = {t.x - t.r, t.y - t.r, t.z - t.r};
+              hi = {t.x + t.r, t.y + t.r, t.z + t.r};
+            }
+          } else {
+            lo = pr.a;
+            hi = pr.b;
+          }
+          for (int iz = 0; iz < 5; iz++)
+            for (int iy = 0; iy < 5; iy++)
+              for (int ix = 0; ix < 5; ix++) {
+                const int lx = lo[0] + ((hi[0] - lo[0]) * ix) / 4, ly = lo[1] + ((hi[1] - lo[1]) * iy) / 4,
+                          lz = lo[2] + ((hi[2] - lo[2]) * iz) / 4;
+                // world = R(yaw) local + origin (origin already holds the anchor).
+                const IVec3 wa2 = worldOf(A, lx, ly, lz);
+                const IVec3 wb2 = worldOf(B, lx, ly, lz);
+                const int ca = dungeon::TwinCarveAt(W, c.mats, kDefaultSeed, wa2.x, wa2.y, wa2.z);
+                const int cb = dungeon::TwinCarveAt(W, c.mats, kDefaultSeed, wb2.x, wb2.y, wb2.z);
+                fN++;
+                if (ca < 0) fCarved++;
+                if ((ca < 0) != (cb < 0)) {
+                  if (fBad++ == 0)
+                    fFirst = Format("local (%d,%d,%d): %s carve %d at (%d,%d,%d), %s carve %d at (%d,%d,%d)", lx, ly, lz,
+                                    A.id.c_str(), ca, wa2.x, wa2.y, wa2.z, B.id.c_str(), cb, wb2.x, wb2.y, wb2.z);
+                }
+              }
         }
-        const int wx = dungeon::RotX(gd.yawQ, lc[0], lc[2]) + gd.origin[0];
-        const int wy = lc[1] + gd.origin[1];
-        const int wz = dungeon::RotZ(gd.yawQ, lc[0], lc[2]) + gd.origin[2];
-        for (int dz = 0; dz <= 1; dz++)
-          for (int dy = 0; dy <= 1; dy++)
-            for (int dx = 0; dx <= 1; dx++) want.insert({FloorDiv16(wx) + dx, FloorDiv16(wy) + dy, FloorDiv16(wz) + dz});
+        fLine += Format("%s%s == %s (yaw %d / %d)", fLine.empty() ? "" : ", ", A.id.c_str(), B.id.c_str(), A.yawQ * 90,
+                        B.yawQ * 90);
       }
-      std::map<std::tuple<int, int, int>, std::vector<uint32_t>> Te, De;
-      reload(false);
-      generate(want, Te);
-      reload(true);
-      generate(want, De);
-      std::vector<uint32_t> We;
+    check(pairs > 0, "F: the map places no asset twice (the harness map should: heather_cairn + heather_cairn_b)");
+    check(fBad == 0, Format("F: %lld of %lld sampled local cells carve differently in two placements of one asset; first %s", fBad,
+                            fN, fFirst.c_str()));
+    check(pairs == 0 || fCarved > 0, "F: no sampled local cell is carved (the sample missed the program)");
+    fLine = Format("F portability: %d pair(s) [%s], %lld local cells (%lld carved), %lld disagree", pairs, fLine.c_str(), fN,
+                   fCarved, fBad);
+  }
+
+  // ---- G. TREES AT THE ENTRANCES (D9) ----------------------------------------
+  // Every placement's surface rects (dungeon.h SurfaceRects: where its prims /
+  // props reach the ground), +16 columns, from under the ground to 20 m over
+  // it, generated in four arms: the surface keep on / off x the evaluator on /
+  // off.
+  //   would-be  = above-ground matter the dungeon WOULD cut with the keep off,
+  //               and how much of it is TREE (wood / bark / leaves / needles):
+  //               the check is not vacuous only if some entrance is in trees;
+  //   cut       = above-ground matter the dungeon cuts with the keep on (0:
+  //               no trunk cut, no crown left floating);
+  //   in rects  = above-ground matter standing inside a rect, keep on (0);
+  //   reach     = every cell the keep removed is within a tree's reach of a
+  //               rect by the CPU twin's dgSurfNear (TwinSurfNear).
+  std::string gLine;
+  {
+    std::set<std::tuple<int, int, int>> gSet;
+    std::map<std::tuple<int, int, int>, size_t> gOwner;
+    size_t nRects = 0;
+    // Per CHUNK COLUMN over the rects (+16), the layers from 1.6 m under its
+    // lowest ground sample to 6.4 m over its highest: where a trunk meets the
+    // ground and a carve could cut it (a cut trunk is cut at the rim; the
+    // crown it would leave floating is above). Bounded, so the four arms stay
+    // a few thousand chunks over every placement.
+    std::map<std::pair<int, int>, size_t> gCols;
+    for (size_t gi = 0; gi < placedAll.size(); gi++)
+      for (const auto& r : placedAll[gi].surf) {
+        nRects++;
+        for (int cz = FloorDiv16(r[1] - 16); cz <= FloorDiv16(r[3] + 16); cz++)
+          for (int cx = FloorDiv16(r[0] - 16); cx <= FloorDiv16(r[2] + 16); cx++) gCols.emplace(std::make_pair(cx, cz), gi);
+      }
+    for (const auto& [cc, gi] : gCols) {
+      int lo = INT_MAX, hi = INT_MIN;
+      for (int dz = 0; dz <= 15; dz += 5)
+        for (int dx = 0; dx <= 15; dx += 5) {
+          const int g = groundOf(cc.first * 16 + dx, cc.second * 16 + dz);
+          lo = std::min(lo, g);
+          hi = std::max(hi, g);
+        }
+      for (int cy = FloorDiv16(lo - 16); cy <= FloorDiv16(hi + 64); cy++) {
+        gSet.insert({cc.first, cy, cc.second});
+        gOwner.emplace(std::make_tuple(cc.first, cy, cc.second), gi);
+      }
+    }
+    const auto gT0 = std::chrono::steady_clock::now();
+    std::printf("dungeon-gen G: %zu rects, %zu chunk columns, %zu chunks x4 arms\n", nRects, gCols.size(), gSet.size());
+    std::fflush(stdout);
+    check(!fx.surf.empty(), "G: the fixture has no surface rect (its entrance stair should break the ground)");
+    std::map<std::tuple<int, int, int>, std::vector<uint32_t>> T1, D1, T0, D0;
+    reload(false);
+    generate(gSet, T1);
+    reload(true);
+    generate(gSet, D1);
+    worldmap::SetDungeonSurfaceKeep(false);
+    reload(false);
+    generate(gSet, T0);
+    reload(true);
+    generate(gSet, D0);
+    worldmap::SetDungeonSurfaceKeep(true);
+    reload(true);
+    std::vector<uint32_t> Wg;
+    packCpu(Wg);
+    std::vector<bool> treeMat(c.mats.size(), false);
+    for (size_t m = 0; m < c.mats.size(); m++) {
+      const std::string& n = c.mats[m].name;
+      treeMat[m] = n.find("wood") != std::string::npos || n.find("bark") != std::string::npos ||
+                   n.find("lea") != std::string::npos || n.find("needle") != std::string::npos;
+    }
+    std::vector<long long> pWould(placedAll.size(), 0), pWouldTree(placedAll.size(), 0), pCut(placedAll.size(), 0),
+        pRemoved(placedAll.size(), 0);
+    long long inRects = 0, twinBad = 0;
+    std::string cutFirst, rectFirst;
+    // Per chunk column, per voxel column: the ground and "inside a rect", once.
+    struct ColInfo {
+      std::array<int, kChunk * kChunk> g{};
+      std::array<bool, kChunk * kChunk> r{};
+    };
+    std::map<std::pair<int, int>, ColInfo> colInfo;
+    const ColInfo* cur = nullptr;
+    auto above = [&](uint32_t w, int ci, int y) {
+      const uint32_t m = w & 0xFFFu;
+      return m != 0u && m < c.mats.size() && c.mats[m].gpu.klass != CLASS_LIQUID && y > cur->g[ci];
+    };
+    for (const auto& [key, t1] : T1) {
+      const size_t gi = gOwner[key];
+      const std::vector<uint32_t>& d1 = D1[key];
+      const std::vector<uint32_t>& t0 = T0[key];
+      const std::vector<uint32_t>& d0 = D0[key];
+      const int bx = std::get<0>(key) * 16, by = std::get<1>(key) * 16, bz = std::get<2>(key) * 16;
       {
-        biomes::BiomeSet set;
-        std::string log;
-        biomes::LoadBiomeSet(ad, c.mats, set, log);
-        worldmap::PackWorldMap(set, worldmap::CurrentWorldMap(), We, log);
+        auto it = colInfo.find({bx, bz});
+        if (it == colInfo.end()) {
+          ColInfo ci;
+          for (int k = 0; k < 256; k++) {
+            const int x = bx + k % 16, z = bz + k / 16;
+            ci.g[k] = groundOf(x, z);
+            bool inR = false;
+            for (const auto& g : placedAll)
+              for (const auto& r : g.surf) inR = inR || (x >= r[0] && x <= r[2] && z >= r[1] && z <= r[3]);
+            ci.r[k] = inR;
+          }
+          it = colInfo.emplace(std::make_pair(bx, bz), ci).first;
+        }
+        cur = &it->second;
       }
-      long long ec2 = 0, em = 0, ech = 0, esoak = 0;
-      std::string first;
-      for (const auto& [key, dw] : De) {
-        const std::vector<uint32_t>& tw = Te[key];
-        const int bx = std::get<0>(key) * 16, by = std::get<1>(key) * 16, bz = std::get<2>(key) * 16;
-        for (uint32_t i = 0; i < kChunkVol; i++) {
-          const int x = bx + static_cast<int>(i % kChunk), y = by + static_cast<int>((i / kChunk) % kChunk),
-                    z = bz + static_cast<int>(i / (kChunk * kChunk));
-          ec2++;
-          const uint32_t exp = dungeon::TwinCell(We, c.mats, kDefaultSeed, x, y, z, tw[i]);
-          if (exp != dw[i] && (exp & ~kStainBits) == (dw[i] & ~kStainBits) && (exp & kStainBits) == 0u)
-            esoak++;
-          else if (exp != dw[i] && em++ == 0)
-            first = Format("(%d,%d,%d): terrain %08x, GPU %08x, twin %08x", x, y, z, tw[i], dw[i], exp);
-          if (dw[i] != tw[i]) ech++;
+      for (uint32_t i = 0; i < kChunkVol; i++) {
+        const int x = bx + static_cast<int>(i % kChunk), y = by + static_cast<int>((i / kChunk) % kChunk),
+                  z = bz + static_cast<int>(i / (kChunk * kChunk));
+        const int ci = static_cast<int>(i % kChunk) + static_cast<int>(i / (kChunk * kChunk)) * 16;
+        if (d0[i] != t0[i] && above(t0[i], ci, y)) {
+          pWould[gi]++;
+          if (treeMat[t0[i] & 0xFFFu]) pWouldTree[gi]++;
+        }
+        if (d1[i] != t1[i] && above(t1[i], ci, y)) {
+          if (pCut[gi]++ == 0 && cutFirst.empty())
+            cutFirst = Format("%s (%d,%d,%d) %s", placedAll[gi].id.c_str(), x, y, z, c.mats[t1[i] & 0xFFFu].name.c_str());
+        }
+        if (t0[i] != t1[i]) {
+          pRemoved[gi]++;
+          if (!dungeon::TwinSurfNear(Wg, x, z, 160)) twinBad++;
+        }
+        if (cur->r[ci] && above(t1[i], ci, y)) {
+          if (inRects++ == 0) rectFirst = Format("(%d,%d,%d) %s", x, y, z, c.mats[t1[i] & 0xFFFu].name.c_str());
         }
       }
-      check(em == 0, Format("E %s: %lld of %lld cells differ from the CPU twin; first %s", id.c_str(), em, ec2, first.c_str()));
-      check(ech > 0, Format("E %s: the dungeon changed no cell of the %zu sampled chunks", id.c_str(), De.size()));
-      eLine += Format("%s%s: %zu prims, %lld cells in %zu chunks, %lld changed, %lld mismatches (+%lld wet-bank soaks)",
-                      eLine.empty() ? "" : "; ", id.c_str(), np, ec2, De.size(), ech, em, esoak);
-      worldmap::SetScratchDungeon(nullptr);
     }
-    if (dirs.empty()) eLine = "no other compiled asset";
+    long long wouldTree = 0, cut = 0;
+    std::string per;
+    for (size_t gi = 0; gi < placedAll.size(); gi++) {
+      wouldTree += pWouldTree[gi];
+      cut += pCut[gi];
+      per += Format("%s%s %zu rects: would-be %lld (tree %lld), cut %lld, keep removed %lld", per.empty() ? "" : "; ",
+                    placedAll[gi].id.c_str(), placedAll[gi].surf.size(), pWould[gi], pWouldTree[gi], pCut[gi], pRemoved[gi]);
+    }
+    check(wouldTree > 0, "G: with the surface keep off no entrance would cut a tree: the check is vacuous (place one in trees)");
+    check(cut == 0, Format("G: the dungeons cut %lld above-ground cells (trees / cover) with the surface keep on; first %s", cut,
+                           cutFirst.c_str()));
+    check(inRects == 0, Format("G: %lld above-ground matter cells stand inside the surface rects; first %s", inRects, rectFirst.c_str()));
+    check(twinBad == 0, Format("G: %lld cells the keep removed lie outside every rect's reach (GPU dgSurfNear vs the twin)", twinBad));
+    gLine = Format("G trees: %zu rects, %zu chunks x4 arms (%.1f s), in rects %lld, outside reach %lld; %s", nRects, gSet.size(),
+                   std::chrono::duration<double>(std::chrono::steady_clock::now() - gT0).count(), inRects, twinBad, per.c_str());
   }
 
   // ---- D. rest, residency, reproducibility ------------------------------------
@@ -614,7 +858,7 @@ Status GateDungeonGen(Ctx& c, std::string& detail) {
   return finish(Format("fixture at (%d,%d) yaw %d, origin (%d,%d,%d), box (%d,%d,%d)..(%d,%d,%d) | ", fx.ax, fx.az,
                        fx.yawQ * 90, fx.origin[0], fx.origin[1], fx.origin[2], fx.boxMin[0], fx.boxMin[1], fx.boxMin[2],
                        fx.boxMax[0], fx.boxMax[1], fx.boxMax[2]) +
-                aLine + " | E others: " + eLine + " | " + dLine);
+                aLine + " | E others: " + eLine + " | " + fLine + " | " + gLine + " | " + dLine);
 }
 
 }  // namespace

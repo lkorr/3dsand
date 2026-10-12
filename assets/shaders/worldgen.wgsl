@@ -3037,6 +3037,10 @@ fn treeInfoBare(s : TreeSite, land : Land, seed : u32) -> Tree {
   // A clearing's box keeps crowns off too, and its feather band thins the
   // edge (clearingRefuses, same call).
   if (siteBlocksTrunk(t.wx, t.wz, h, t.reach, seed)) { return t; }
+  // No crown near a dungeon's surface footprint (worldgen_dungeon.wgsli
+  // dgSurfNear): an entrance or a ruin top carved through a forest would cut
+  // the trunk and leave the crown floating.
+  if (dgSurfNear(t.wx, t.wz, t.reach + DG_TREE_CLEAR)) { return t; }
 
   t.sp = sp;
   t.above = i32(taSpecies(sp, TA_S_ABOVE));
@@ -3519,7 +3523,7 @@ fn cactusInfoBare(tx : i32, tz : i32, seed : u32) -> Cactus {
   let h = baseHeight(c.wx, c.wz, seed);
   c.base = h;
   if (h >= treelineAt(c.wx, c.wz, seed)) { return c; }
-  if (siteKeepOut(c.wx, c.wz) || sitePadNear(c.wx, c.wz, 0)) { return c; }
+  if (siteKeepOut(c.wx, c.wz) || sitePadNear(c.wx, c.wz, 0) || dgSurfNear(c.wx, c.wz, 2)) { return c; }
 
   // Density and mix are the biome's (cover.cactusChance / saguaroFraction,
   // both percents, packed by worldmap.cpp): the flag says whether, the
@@ -4115,7 +4119,7 @@ fn plantSiteAt(cx : i32, cz : i32, seed : u32, needCover : bool) -> PlantSite {
   var ps : PlantSite;
   ps.ok = false;
   ps.h = 0;
-  if (siteKeepOut(cx, cz)) { return ps; }
+  if (siteKeepOut(cx, cz) || dgSurfNear(cx, cz, 3)) { return ps; }   // 3: a tile plant's footprint overhangs its centre
   if (!wmFlag(biomeAt(cx, cz, seed), WM_BF_GROUND_FLORA)) { return ps; }
   var L : LandCol;
   landColumn(cx, cz, seed, &L);
@@ -5528,7 +5532,7 @@ fn genCellIn(col : ptr<function, Col>,
   // row an author pins to one map's altitudes. Steep rock grows nothing
   // (coverRowPick).
   if (GROUND_COVER && mat == MAT_AIR && y > h && !inRim && pond < 0 &&
-      !siteKeepOut(x, z)) {
+      !siteKeepOut(x, z) && !dgSurfNear(x, z, 0)) {
     // The row is a property of the COLUMN (coverRowPick); only "is this cell
     // inside its stalk" depends on y.
     let cp = coverRowPick(col, ponds, canopyMemo, x, z, seed);
@@ -6402,7 +6406,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
         // terrain's whatever a dungeon makes of the cells, so the dungeon's
         // output is a pure function of the terrain word (the CPU twin's input).
         wUp = w;
-        if (dgL != 0u) { w = dgCell(dgL, wx, y, wz, w); }
+        if (dgL != 0u) { w = dgCell(dgL, wx, y, wz, w, col.h); }
         let i = lx + ly * CHUNK + lz * CHUNK * CHUNK;
         // Chunk-linear: the slot's page resolved once, per §2.1's second entry
         // point. genChunk overwrites the WHOLE chunk, so the CPU materializes
@@ -7931,7 +7935,7 @@ fn farFeatFill(col : ptr<function, Col>, ponds : ptr<function, PondSet>, cover :
     var mat = MAT_AIR;
     var head = MAT_AIR;
     var hgt = 0;
-    if (!siteKeepOut(x, z)) {
+    if (!siteKeepOut(x, z) && !dgSurfNear(x, z, 0)) {
       let cp = coverRowPick(col, ponds, canopy, x, z, seed);
       if (x == fx && z == fz) {
         // What genCellIn actually put over the sample column's top.

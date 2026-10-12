@@ -58,8 +58,12 @@
 //                           region; spikes of material ("iron") rise IfAir
 //                           from the region's floor for duration (1 s).
 //           dart            one bolt from pos along yaw: damage (15), range
-//                           (120 voxels); the first body on the line is hit
-//                           (CPU, no wall test); a micro particle shows it.
+//                           (120 voxels); the first body on the line BEFORE
+//                           THE FIRST WALL is hit (D9: the line is walked
+//                           through the CPU mirror, collision classes; up to
+//                           8 solid cells the launcher starts in are its
+//                           housing; Unknown = open, as for projectiles); a
+//                           micro particle shows it, and dies at the wall.
 //           flood           the region filled with liquid ("water") IfAir,
 //                           ONCE: a bounded volume, never a source.
 //           fire_vent       fire ("fire") IfAir at hashed cells of the
@@ -131,6 +135,7 @@ struct TrapStatus {
   uint32_t cells = 0;           // collapse: cells converted; flood/fire/spikes: cells written
   uint32_t ops = 0;             // CellOps emitted in total
   uint32_t hits = 0;            // bodies damaged
+  float wallT = -1.0f;          // dart: range the last bolt flew before a solid cell (-1 = not fired)
   std::string note;
 };
 bool TrapStatusOf(const std::string& id, TrapStatus& out);

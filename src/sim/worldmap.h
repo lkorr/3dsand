@@ -1007,6 +1007,7 @@ struct DungeonDef {
   std::array<int, 3> origin{};               // world cell of the shell's local (0,0,0)
   std::array<int, 3> boxMin{}, boxMax{};     // world, inflated, inclusive
   std::array<int, 3> keepMin{}, keepMax{};   // caves + lava off in here (max < min: none)
+  std::vector<std::array<int, 4>> surf;      // surface rects x0 z0 x1 z1 (dungeon.h Placed::surf)
   std::string shellPath;                     // what was loaded
   uint32_t shellHash = 0;                    // FNV of its bytes (the map's content hash folds it)
   std::shared_ptr<const dungeon::Shell> shell;   // null = not placed
@@ -1034,6 +1035,12 @@ const ScratchDungeon* ScratchDungeonSlot();
 // Default true.
 void SetDungeonsEnabled(bool on);
 bool DungeonsEnabled();
+// The `dungeon-gen` gate's other switch: when false the surface rects are
+// packed with dungeon.h kDgFlagSurfOff, so trees and cover grow over the
+// dungeons' surface footprints as if there were none (the "what would have
+// been cut" arm). Default true.
+void SetDungeonSurfaceKeep(bool on);
+bool DungeonSurfaceKeep();
 
 // ---- the loaded map (P2) ---------------------------------------------------
 /** assets/worldmap/<name>/{map.json,map.svmap}, parsed and resolved. */

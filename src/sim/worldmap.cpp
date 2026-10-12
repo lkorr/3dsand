@@ -800,6 +800,12 @@ void SetScratchDungeon(const ScratchDungeon* s) {
 const ScratchDungeon* ScratchDungeonSlot() { return ScratchSlot().get(); }
 void SetDungeonsEnabled(bool on) { DungeonsOn() = on; }
 bool DungeonsEnabled() { return DungeonsOn(); }
+bool& DungeonSurfOn() {
+  static bool on = true;
+  return on;
+}
+void SetDungeonSurfaceKeep(bool on) { DungeonSurfOn() = on; }
+bool DungeonSurfaceKeep() { return DungeonSurfOn(); }
 
 namespace {
 std::string LocaleLayerStem(const LocaleDef& l) { return l.editLayer.empty() ? std::string("ground") : l.editLayer; }
@@ -2328,12 +2334,16 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       g.boxMax = pl.boxMax;
       g.keepMin = pl.keepMin;
       g.keepMax = pl.keepMax;
+      // THE SURFACE RECTS (D9): where the program reaches the ground, on the
+      // same bare ground the anchor reads. Trees and cover keep off them.
+      dungeon::SurfaceRects(pl, [&](int x, int z) { return BareGroundHeight(x, z, seed); });
+      g.surf = pl.surf;
       g.resolved = true;
       std::printf("world map: '%s' dungeon '%s' anchor (%d,%d): ground y%d, origin (%d,%d,%d) yaw %d, box "
-                  "(%d,%d,%d)..(%d,%d,%d), %zu prims, %zu props\n",
+                  "(%d,%d,%d)..(%d,%d,%d), %zu prims, %zu props, %zu surface rects\n",
                   name.c_str(), g.id.c_str(), g.ax, g.az, g.groundY, g.origin[0], g.origin[1], g.origin[2],
                   g.yawQ * 90, g.boxMin[0], g.boxMin[1], g.boxMin[2], g.boxMax[0], g.boxMax[1], g.boxMax[2],
-                  g.shell->prims.size(), g.shell->instances.size());
+                  g.shell->prims.size(), g.shell->instances.size(), g.surf.size());
     }
     // ---- THE ROAD PROFILES (map v2 R1, worldmap.h kSiteRoad) ------------------
     // Per road, deterministic integer arithmetic on the BARE ground (no road
@@ -2909,10 +2919,11 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
       pl.boxMax = g.boxMax;
       pl.keepMin = g.keepMin;
       pl.keepMax = g.keepMax;
+      pl.surf = g.surf;
       placed.push_back(std::move(pl));
     }
     dungeon::PackStats ds;
-    if (!dungeon::PackDungeons(placed, W, log, &ds, !DungeonsEnabled())) return false;
+    if (!dungeon::PackDungeons(placed, W, log, &ds, !DungeonsEnabled(), !DungeonSurfaceKeep())) return false;
     if (!placed.empty())
       std::printf("world map: %zu dungeon(s) packed: %u prims, %u props (%u templates), %u index cells, %u list "
                   "words, hash %u (probe <= %u), %u words, worst list %u\n",
