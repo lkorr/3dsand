@@ -5449,5 +5449,16 @@
       }
     ]
   },
+  "dungeons": [
+    {
+      "id": "shardwell",
+      "name": "The Shardwell",
+      "dungeon": "shardwell",
+      "at": [67209, -49564],
+      "yOffset": 0,
+      "yaw": 270,
+      "about": "The abandoned crystal mine (package D6, assets/worldmap/default/scripts/dungeon_shardwell.mjs): the adit is driven west into the foot of the Shardwell crater's 100 m quartzite cliff, 48 m west of the marker; yaw 270 sends the dungeon's +Z (into the hill) to world -X. Two levels (the adit level at the anchor's ground, the deep level 18 m below), 150 m long under the Shardspire caprock."
+    }
+  ],
   "editLayer": "default_ground"
 }

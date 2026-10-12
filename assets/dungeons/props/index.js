@@ -10,6 +10,7 @@ import lantern from './mines/lantern.js';
 import pickaxe_rack from './mines/pickaxe_rack.js';
 import table from './mines/table.js';
 import ladder from './mines/ladder.js';
+import lever from './mines/lever.js';
 import altar from './ruins/altar.js';
 import statue from './ruins/statue.js';
 import sarcophagus from './ruins/sarcophagus.js';
@@ -27,7 +28,7 @@ import rope_ladder from './caves/rope_ladder.js';
 import sea_chest from './caves/sea_chest.js';
 import driftwood from './caves/driftwood.js';
 
-const LIST = [ore_cart, rail_segment, bunk, crate, barrel, lantern, pickaxe_rack, table, ladder,
+const LIST = [ore_cart, rail_segment, bunk, crate, barrel, lantern, pickaxe_rack, table, ladder, lever,
               altar, statue, sarcophagus, brazier, candle_cluster, broken_column, bones, urn, banner,
               glow_mushroom_patch, bone_pile, crystal_cluster, campfire_remains, rope_ladder, sea_chest, driftwood];
 

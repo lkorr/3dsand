@@ -1,0 +1,6 @@
+{
+  "about": "The Shardwell (dungeon): the dead shift boss walking his round on the adit level, back and forth.",
+  "rows": [
+    {"from":"00:00","to":"24:00","do":"patrol","route":["wn_p1_w1","wn_p1_w4","wn_p2_hub","wn_p2_l0","wn_p3_w1","wn_p3_w2"],"mode":"pingpong","wait":4}
+  ]
+}
