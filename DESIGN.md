@@ -21746,7 +21746,23 @@ list.
 ### 9d.4 The consumers, and the third transcription
 
 * **Render surface advection** -- component 9 evaluates wave phase at
-  `position - current*t`. This is what makes flow read as flow.
+  `position - current*age`. This is what makes flow read as flow. `age` is NOT
+  the session clock: it is the two-phase flow-map age (`raymarch.wgsl`
+  `WAVE_FLOW_CYCLE_S`, 4 s), two copies of the field half a cycle apart, each
+  faded to zero at its own restart and blended variance-preserving. With
+  `current * R.time` (until 2026-10-11) any change in the current moved the
+  waves by `change * seconds-since-launch` -- the stream arm is rewritten on
+  every window move, so a swimmer saw the river strobe about once a second
+  (ticket 2026-10-11_18-39-38) -- and any spatial change sheared them without
+  bound until a long session's river was per-pixel sparkle. Still water takes
+  the single-copy path and is unchanged. The oil film's drift uses the same
+  two-phase age.
+* **Streams have no attack ramp** (`CurrentPrimEnvelope`). The attack is for
+  events (a drain spinning up); a stream is terrain and is re-emitted on every
+  window move, so a ramp there zeroed the current under the player once a
+  chunk. The lattice probes are WORLD-aligned (`x, z == 32 mod 64`), so a
+  probe that survives a window move is the same primitive; the `rivers` gate's
+  pass J reads the field under main's middle on the tick of four moves.
 * **Foam on convergence lines** -- `currentConvergeAt`, a central difference of
   the field. Four evaluations of a function that early-outs to one compare
   outside the AABB, so a still lake pays nothing. Deliberately NOT a symbolic
