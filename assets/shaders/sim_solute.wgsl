@@ -529,13 +529,15 @@ fn solDiffuse(@builtin(workgroup_id) wg : vec3<u32>,
 //      (§3.3.1): integer diffusion quantizes to a halt below one unit, and
 //      without this a creature's worth of blood in a lake would freeze in
 //      blotches forever. Only STALLED chunks, so a plume still spreading loses
-//      nothing and a body held above the floor conserves exactly;
+//      nothing and a body held above the floor conserves exactly. Only
+//      CONSERVED species: a fading one's floor is a per-cell erosion (3);
 //   3. a species with a halfLife (solutes.json; blood) FADES: each cell loses
 //      mass * decayQ / 65536 a tick, stochastically rounded, wherever it is --
 //      spread or not, stalled or not. Also discarded and counted. A chunk
 //      still holding fading mass keeps itself awake (DIRTY_R_SOLUTE) so the
-//      fade runs to the end: bounded, since the mass only goes down and the
-//      dilution floor takes the tail once the chunk stalls (rule 2);
+//      fade runs to the end: bounded, since the mass only goes down. A cell
+//      under the floor also loses one unit with SOL_FLOOR_FADE / 65536 a tick,
+//      per cell, never chunk by chunk -- rule 2's cut drew a cube;
 //   4. the chunk's aggregate (species, total mass) is republished;
 //   5. a chunk whose 4096 values are all equal becomes SOL_UNIFORM (or
 //      SOL_EMPTY when the value is 0) and its page goes back on the stack.
@@ -553,6 +555,16 @@ var<workgroup> cmpFading : atomic<u32>;
 // floor word (Simulation::UploadSolutes; solutes.h decayQ). 0 = conserved.
 // Declared here, beside its only reader, not in the mirrored block.
 fn solDecayQ(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 4u] >> 16u; }
+// A fading species' sub-floor erosion: the chance x 65536 a tick that a cell
+// under the floor loses one unit (256 = 1/256: ~8.5 s a unit at 30 Hz). It
+// must stay well under the diffusion's own pace: at 2048 (1/32) it ate a
+// bleeding stump's halo as fast as the pair exchange pushed it out, and the
+// cloud sat round the body as ~120 cells of speckle instead of spreading
+// (SANDVOX_STUMP_PROBE=1 --gate stump-underwater, 2026-10-11: 0 -> ~3000
+// cells, 128 -> ~1700, 256 -> ~1000-1700, 512 -> ~450, 2048 -> ~120). The
+// floor of it is the clear-up time: solute-blood's cloud is gone at tick
+// 2520 at 256, 4740 at 128 (over the gate's 4500).
+const SOL_FLOOR_FADE : u32 = 256u;
 
 fn solCellOfLocal(base : vec3<i32>, local : u32) -> vec3<i32> {
   return base + vec3<i32>(i32(local & 15u), i32((local >> 4u) & 15u), i32(local >> 8u));
@@ -603,20 +615,33 @@ fn solCompact(@builtin(workgroup_id) wg : vec3<u32>,
         let vw = voxWordAt(c);
         let m = voxMat(vw);
         let s = solSpeciesOf(v);
+        let dq = solDecayQ(s);
         if (!solIsLiquidMat(m) || !solIsSolvent(m, s)) {
           discarded += solMassOf(v);
           v = 0u;
-        } else if (stalled && solMassOf(v) * 8u < solFloor(s) * (voxState(vw) + 1u)) {
+        } else if (dq == 0u && stalled && solMassOf(v) * 8u < solFloor(s) * (voxState(vw) + 1u)) {
           discarded += solMassOf(v);
           v = 0u;
         }
         // 3. the fade. Keyed by the SLOT cell index (an identity, never the
         // page), so it is as deterministic as the diffusion's rounding.
-        let dq = solDecayQ(s);
         if (v != 0u && dq != 0u) {
           let mm = solMassOf(v);
-          let rnd = hash3(T.seed ^ 0xFADEB10Du, T.tick, slot * CHUNK_VOL + wi * 2u + h) & 0xFFFFu;
-          let loss = min((mm * dq + rnd) >> 16u, mm);
+          let hv = hash3(T.seed ^ 0xFADEB10Du, T.tick, slot * CHUNK_VOL + wi * 2u + h);
+          var loss = min((mm * dq + (hv & 0xFFFFu)) >> 16u, mm);
+          // A FADING species' floor is a per-cell fade, not rule 2's cut. The
+          // cut zeroes every sub-floor cell of a chunk on the tick its stall
+          // clock runs out, and the blood column the renderer integrates made
+          // that a 16^3 cube of cloud blinking out (owner, 2026-10-11). Here a
+          // cell under the floor loses one more unit with SOL_FLOOR_FADE/65536
+          // a tick wherever it is, stalled or not: whether a cell erodes
+          // depends on its own concentration only, so the thin rim of a cloud
+          // thins away smoothly across chunk faces. Still bounded: the mass
+          // only goes down.
+          if (mm - loss != 0u && (mm - loss) * 8u < solFloor(s) * (voxState(vw) + 1u) &&
+              (hv >> 16u) < SOL_FLOOR_FADE) {
+            loss += 1u;
+          }
           discarded += loss;
           v = solPack(s, mm - loss);
           if (v != 0u) { fading = true; }

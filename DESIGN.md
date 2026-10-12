@@ -1739,8 +1739,12 @@ spent with no deposit (an effect, not matter).
 rides the high half of the floor word, `UploadSolutes`), counted as
 discarded, and a chunk still holding fading mass marks itself
 `DIRTY_R_SOLUTE` so the fade runs to the end -- bounded, since mass only goes
-down and the floor takes the tail. That is what makes a blood cloud thin out
-and be gone in tens of seconds rather than only spread.
+down. A fading species' floor is NOT the stalled-chunk cut below: a cell
+under it loses one more unit with `SOL_FLOOR_FADE`/65536 a tick, per cell,
+stalled or not (the cut zeroed a whole chunk's faint rim on one tick, and the
+renderer's blood column drew that as a 16^3 cube blinking out). That is what
+makes a blood cloud thin out and be gone in tens of seconds rather than only
+spread.
 
 **Diffusion** (`solDiffuse`) is pair exchange: three axis dispatches a tick,
 pairs at stride 1/2/4/8 (cycled by tick), parity alternating, the equalising
@@ -1749,7 +1753,7 @@ amount rounded half-down and the rate (`diffusivity` / 256 x `sim.soluteDiffusio
 the integer fixpoint flat (stride 1 alone stalls in a ramp: spread 13 measured,
 3-4 with strides). A chunk idle for 24 consecutive dispatches (every axis,
 parity and stride) is STALLED: the dilution floor (`floor`) discards what is
-below it and the chunk stops keeping itself awake. Dirty reasons 26 `solute`
+below it (conserved species only; see Fade) and the chunk stops keeping itself awake. Dirty reasons 26 `solute`
 and 27 `solute-back` (a pair owned by the -axis neighbour, which must be woken
 for a whole phase cycle). The partner reads those face pairs ONLY when their
 owner is not writing them in the same dispatch (owner off the dirty list, or
