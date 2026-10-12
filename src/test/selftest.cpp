@@ -1008,7 +1008,7 @@ const char* const kOrder[] = {
     // regenerates it on the way out.
     "corpse-crossheat", "garment-burn", "corpse-worn", "corpse-splatter", "vessel-grid", "vessel-sand", "pour-water", "vessel-mpm", "vessel-break",
     "alchemy-layers", "alchemy-pour", "alchemy-cost", "alchemy-shake", "alchemy-resort", "alchemy-spawn", "alchemy-remember", "alchemy-sand-carry", "alchemy-soak",
-    "alchemy-lift", "alchemy-place", "alchemy-coherence",
+    "alchemy-lift", "alchemy-place", "alchemy-coherence", "alchemy-neutral",
     // Bench chemistry (package C): CPU-only FlaskSims over the world's tables.
     "alchemy-react", "alchemy-keeps", "alchemy-evaporate", "alchemy-gas-carry", "alchemy-gas-vent", "alchemy-stopper", "alchemy-dissolve", "alchemy-electrolysis", "alchemy-explode", "alchemy-ether-fire",
     "alchemy-brine-electrolysis", "alchemy-electrify-powder",
