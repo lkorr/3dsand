@@ -49,7 +49,8 @@ export const PLACEMENT = {id: ID, name: 'The Verdant Teeth sea caves', dungeon: 
 let d = G.newDungeon({name: 'The Verdant Teeth sea caves', style: 'caves', seed: 61873});
 // Jungle karst palette: pale limestone, white flowstone, ferns on the sills,
 // vines hanging from the brows, wet moss, cold cyan / violet crystal.
-d.palette = {variant: 'limestone', soil: 'shore_mud', hang: 'vine_hang', veg: 'fern', moss: 'wet_moss', trim: 'chalk_rock'};
+// light = candle_flame: the smugglers' fire baskets and lanterns burn warm against the caves' cold crystal.
+d.palette = {variant: 'limestone', soil: 'shore_mud', hang: 'vine_hang', veg: 'fern', moss: 'wet_moss', trim: 'chalk_rock', light: 'candle_flame'};
 
 const ids = {};
 function first(name, spec) {
@@ -77,9 +78,9 @@ attach('crawl', 'passage', 'out', {kit: 'caves', type: 'crawl', params: {
   width: 2.2, height: 1.05, length: 7, meander: 1.2, pinches: 2, pinch: 0.8, floorRubble: 0.6, rise: 0.4, wallRough: 0.4, moisture: 0.3, decay: 0.5}});
 attach('hollow', 'crawl', 'out', {kit: 'caves', type: 'cavern', params: {
   mouth: 2.2, width: 24, length: 17, height: 8, ceiling: 18, clusters: 4, flatten: 0.75, exits: 3,
-  stalactites: 0.55, stalagmites: 0.25, stalLength: 2.8, columns: 2, flowstone: 0.8, crystals: 0.5, mushrooms: 0, pool: 0, boulders: 5,
+  stalactites: 0.55, stalagmites: 0.25, stalLength: 2.8, columns: 2, flowstone: 0.8, crystals: 0.8, mushrooms: 0, pool: 0, boulders: 5,
   fangs: 8, fangLength: 11, fangGirth: 1.3, fangUp: 0.3, fangJoin: 0.25,
-  wallRough: 0.85, wallScale: 4, floorUneven: 0.6, moisture: 0.45, decay: 0.45, lightCount: 6, lightType: 'crystal', warmth: 0.15, blend: 12, asym: 0.9}});
+  wallRough: 0.85, wallScale: 4, floorUneven: 0.6, moisture: 0.45, decay: 0.45, lightCount: 8, lightType: 'crystal', warmth: 0.25, blend: 12, asym: 0.9}});
 attach('geode', 'hollow', 'out', {kit: 'caves', type: 'cavern', params: {
   mouth: 2.2, width: 8, length: 7, height: 3, ceiling: 3.5, clusters: 2, flatten: 0.85, exits: 0, crystals: 1, mushrooms: 0, pool: 0, boulders: 0, columns: 0,
   flowstone: 0.2, stalactites: 0.4, stalLength: 0.8, wallRough: 0.55, wallScale: 1.2, lightCount: 5, lightType: 'crystal', warmth: 0.6, moisture: 0.1, decay: 0.1, blend: 6}});
@@ -101,9 +102,9 @@ attach('rift', 'descent', 'out', {kit: 'caves', type: 'chasm', params: {
   wallRough: 0.8, wallScale: 2.6, moisture: 0.6, decay: 0.3, lightCount: 2, lightType: 'fungus', warmth: 0.5, blend: 10, asym: 0.6}});
 attach('maw', 'rift', 'out', {kit: 'caves', type: 'cavern', params: {
   mouth: 4.6, width: 38, length: 46, height: 9, ceiling: 15, clusters: 6, flatten: 0.7, exits: 3,
-  stalactites: 0.7, stalagmites: 0.35, stalLength: 3, columns: 3, flowstone: 0.7, crystals: 0.1, mushrooms: 6, pool: 0.35, boulders: 8,
+  stalactites: 0.7, stalagmites: 0.35, stalLength: 3, columns: 3, flowstone: 0.7, crystals: 0.6, mushrooms: 10, pool: 0.35, boulders: 8,
   fangs: 14, fangLength: 12, fangGirth: 1.8, fangUp: 0.35, fangJoin: 0.2,
-  wallRough: 1, wallScale: 5, floorUneven: 0.8, moisture: 0.6, decay: 0.6, lightCount: 4, lightType: 'fungus', warmth: 0.85, blend: 14, asym: 1}});
+  wallRough: 1, wallScale: 5, floorUneven: 0.8, moisture: 0.6, decay: 0.6, lightCount: 8, lightType: 'fungus', warmth: 0.85, blend: 14, asym: 1}});
 attach('grotto', 'maw', 'left', {kit: 'caves', type: 'grotto_pool', params: {
   mouth: 3.2, width: 18, length: 20, height: 4, ceiling: 7, clusters: 3, exits: 0, poolSize: 0.75, poolDepth: 3, waterLevel: 0.9, beach: 0.3, island: true, glow: 1,
   stalactites: 0.65, stalLength: 2.2, fangs: 5, fangLength: 5, fangGirth: 0.7, fangUp: 0, fangJoin: 0,
@@ -148,6 +149,12 @@ P('x_bones2', 'caves/bone_pile', {radius: 0.7, height: 0.3, skulls: 1, gore: 0.1
 // The sea's leavings on the beach of the sump.
 P('x_drift1', 'caves/driftwood', {length: 3.2, girth: 0.25, logs: 3, root: true, kelp: 0.6, sink: 1}, off(way('sump/shore'), 20, 0, 24), 0, 'sump', 16);
 P('x_drift2', 'caves/driftwood', {length: 1.8, girth: 0.18, logs: 1, root: false, kelp: 0.3, sink: 1}, off(way('sump/shore'), -26, 0, -16), 90, 'sump', 17);
+// The smugglers' fire baskets in the Maw (iron tripods) and a lantern at the foot of the pitch.
+P('x_basket1', 'ruins/brazier', {style: 'iron', height: 1.1, bowl: 0.45, lit: 'light'}, [-900, way('maw/c')[1], 400], 0, 'maw', 21);
+P('x_basket2', 'ruins/brazier', {style: 'iron', height: 0.9, bowl: 0.4, lit: 'light'}, [-1100, way('maw/c')[1], 480], 0, 'maw', 22);
+P('x_basket3', 'ruins/brazier', {style: 'iron', height: 1.2, bowl: 0.5, lit: 'light'}, [-960, way('maw/c')[1], 300], 0, 'maw', 23);
+P('x_lamp_pitch', 'mines/lantern', {mount: 'floor', lit: 'light'}, off(way('pitch/exit'), 23, 1, 4), 0, 'pitch', 24);
+P('x_lamp_stash', 'mines/lantern', {mount: 'floor', lit: 'light'}, off(way('stash/c'), -4, 0, 10), 0, 'stash', 25);
 // The rope the smugglers left at the mouth of the Hollow's pitch is the shaft's own ladder.
 
 const refs = [];
