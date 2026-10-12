@@ -296,7 +296,17 @@ void OnTerminate() {
   WriteCrashReport(nullptr, detail);
 }
 
+// FatalAbort's text, for OnAbort. Static storage: the abort path must not
+// allocate.
+char gFatalReason[1024];
+
 void OnAbort(int) {
+  if (gFatalReason[0]) {
+    char detail[1100];
+    snprintf(detail, sizeof(detail), "abort() — FATAL: %s", gFatalReason);
+    WriteCrashReport(nullptr, detail);
+    return;
+  }
   WriteCrashReport(nullptr,
                    "abort() — a deliberate fatal assertion; the reason was "
                    "printed to stderr just above this report");
@@ -318,6 +328,13 @@ double ProcessCpuSeconds() {
     return (double)(((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime) * 1e-7;
   };
   return toSec(k) + toSec(u);
+}
+
+void FatalAbort(const char* text) {
+  fputs(text, stderr);
+  fflush(stderr);
+  snprintf(gFatalReason, sizeof(gFatalReason), "%s", text);
+  std::abort();
 }
 
 void InstallCrashHandler() {

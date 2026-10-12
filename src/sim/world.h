@@ -2100,6 +2100,13 @@ constexpr uint32_t kSolMDiscarded = 7;   // units discarded (floor / destroyed /
 constexpr uint32_t kSolMConverted = 8;   // units spent converting a solvent
 constexpr uint32_t kSolMFaultSlot = 9;   // first fault: slot + 1
 constexpr uint32_t kSolMFaultTick = 10;  // first fault: tick
+// The first fault's detail (sim_*.wgsl solFault), so the FATAL names the
+// writer and not only the chunk: the cell's chunk-local index | the writing
+// module's SOL_WRITER << 16 (1 sim_step, 2 sim_solute, 3 sim_mutate,
+// 4 sim_elec, 5 sim_fluid_seam), the table entry it met, the value it stored.
+constexpr uint32_t kSolMFaultCell = 28;
+constexpr uint32_t kSolMFaultEntry = 29;
+constexpr uint32_t kSolMFaultValue = 30;
 constexpr uint32_t kSolMPoured = 11;     // units added by solute cell ops (pours)
 constexpr uint32_t kSolMScooped = 12;    // units removed by scoop clears, monotonic
 constexpr uint32_t kSolMSeamRefused = 13; // MPM excites refused: the cell carried solute
@@ -2120,6 +2127,8 @@ constexpr uint32_t kSolMPourLost = 15;
 // mass stays on the cleared cell and solCompact discards it, counted).
 constexpr uint32_t kSolMScoopBySpecies = 20;
 constexpr uint32_t kSolScoopSpecies = 8;
+static_assert(kSolMScoopBySpecies + kSolScoopSpecies <= kSolMFaultCell,
+              "the scoop ledger runs into the fault detail words");
 constexpr uint32_t kSolMArgs = 16;       // [16..18] solAlloc indirect args staging
 // pass_table.def's copy_solArgs row copies from byte 64 as a literal.
 static_assert(kSolMArgs * 4 == 64, "pass_table.def copy_solArgs offset");
@@ -4568,6 +4577,9 @@ struct WorldSnapshot {
   uint32_t solScooped = 0;
   uint32_t solFaultSlot = 0;
   uint32_t solFaultTick = 0;
+  uint32_t solFaultCell = 0;   // kSolMFaultCell: local | writer << 16
+  uint32_t solFaultEntry = 0;
+  uint32_t solFaultValue = 0;
   // Monotonic units per species (1..kSolScoopSpecies) the vessels' clears took.
   uint32_t solScoopedBy[kSolScoopSpecies] = {};
   // ---- reaction effects (pageFaults [40..63], kPageFaultReactFx*) ----
