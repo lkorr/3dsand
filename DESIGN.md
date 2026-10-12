@@ -27822,6 +27822,111 @@ villagers sent to one marker shoulder each other off it all evening, so each
 regular has his own place (a prop naming a ref beats the tag).
 
 
+### 16.D3 Dungeon entities: spawners, signals, gates, traps, keys, loot (added 2026-10-12)
+
+`docs/PLAN_dungeons.md` §3.7, package D3. The gameplay layer (L4) of a
+dungeon is REFS — the §16 store, kinds and deltas, nothing new underneath —
+so everything above holds: authored by name, active while in the window, id
+order, voxel changes only as ops, state only as deltas.
+
+**A dungeon's ref group** (`world/dungeon_refs.*`). `map.json dungeons[]`
+places `assets/dungeons/<dungeon>/refs.json` as the group `dungeon/<id>`. The
+file is in the DUNGEON-LOCAL frame; the store holds world positions and
+transforms on load and back on every write (the split a locale's
+anchor-relative y already made): `world = anchorWorld + R(yaw)·(local −
+anchorLocal)`, `anchorWorld = (at.x, BareGroundHeight(at) + yOffset, at.z)`,
+R a quarter turn of heading (R(90): (x, z) → (z, −x)) about the anchor CELL,
+ref yaw += placement yaw. `anchorLocal` is `shell.json "anchor"`, else
+`dungeon.json "anchorLocal"`, else 0. A placement read before its map is the
+loaded one sits at y = yOffset and moves onto its ground at the next Update
+(`RefStore::FollowDungeons`). File ids are `dungeon/<dungeon>/…`; a placement
+whose id differs re-prefixes ids and every prop string naming one, and takes
+it back off on write. `GroupOfId` gives a two-part group for `dungeon/…`
+ids, so `dungeon/` is reserved. worldmap.cpp (D1) parses the same array for
+the shell; both sides read the file independently (the structures pattern).
+
+**Signals** are named per GROUP: a level is ON while any emitter of that name
+in the group is on. Emitters: `lever` (use toggles, or a `pulse`; delta = its
+state) and `plate` (a body's feet in its box; `latch` saves it). Receivers
+name the signal in `props.on` (`invert` flips): a `door` with `on` is worked
+by the signal (open while on) and not by hand — `DoorDrive`, the door's own
+open/close, lock ignored; a `gate` slides; a `trap` fires on the rising edge.
+The level is recomputed per tick from deltas + live plates, so a save/load or
+the window leaving cannot desynchronise an emitter from its receivers.
+
+**gate (portcullis).** Bars of `material` in a door-like frame (pos = a
+bottom end cell, yaw = face). BUILT ONCE by IfAir CellOps the first time it
+activates — the shell need not carry it, and it never overwrites what is
+there; the `built` flag is the delta so it is never rebuilt. Each step of the
+slide is the DIFF between two row offsets (`Solid(raised, i, j) = j ≥ raised
+&& Pattern(i, j − raised)`): conditional clears where bars leave, IfAir writes
+where they arrive. A player's block in the way stays. Delta: raised rows.
+It must hang from rock over its top row (a lintel or the ceiling): lifted
+bars over air are an island and island detection drops them as debris.
+
+**traps** act only through the OpBatch. `collapse_floor` converts every SOLID
+cell of the region whose material names a POWDER `rubble` twin
+(materials.json already pairs them: stone → gravel, …; no new material was
+needed) — read off the fetch cache like a door's leaf, then a conditional
+clear one tick and the twin IfAir the next (no "replace if" op exists; the
+two-tick form loses nothing and creates nothing), at most 8192 cells per pair
+of ticks. `flood` writes ONE bounded volume of liquid IfAir (≤16384 cells,
+once): never a source, so growth stays subcritical. `fire_vent` places ≤64
+fire cells per 3 ticks for `duration`. `spikes` charge `SpendHp` (Blade) on
+every body in the box and raise IfAir spikes that retract by conditional
+clears. `dart` is a CPU hitscan along yaw (first body on the line; NO wall
+test — the CPU has no voxels there) with a micro particle for the eye. Delta:
+fires + done; a collapse interrupted by the window finishes on return.
+
+**key / locks.** `ItemKind::Key` (items.json `kind: "key"`, `unlocks` =
+keyId, default its id; art `scripts/gen_key_items.py`). A `key` ref is a use
+that puts the item into the user's kit (taken = delta) — not drawn; dress it
+with a prop or put the key in loot instead. `door.props.lock` = keyId: the
+use checks the kit (bag, hotbar, equipment), and the first success ORs
+`kDoorUnlockedBit` into the door's delta state word — kept when the door
+closes (`ClearDoorDelta`), so the key is asked for once. An NPC treats a
+locked or signal-worked door as a failed edge and re-plans.
+
+**loot** (`world/loot.*`, `assets/loot/<table>.json`): `rolls`, weighted
+`rows` (an item-less row is an empty draw), `always` rows with `chance`; row
+fields are the mob pack's (`item`, `count` n | [min,max], `dye`). A container
+with `props.loot` rolls ONCE on first open, seeded by `RefHash(id)`, integer
+weights, separate hash keys for count / pick / amount — then the bag is the
+delta like any chest.
+
+**spawner.** Slots `0..count-1`; a creature's `Mob::RefId` is the derived id
+`<spawner>/s<slot>`. Which base and where are `rng::Hash3(RefHash(id),
+serial)` — never the tick — so spawn N is the same creature at the same spot
+on every run (`PlanSpawn`, pure, used by the gate and the editor). At most one
+spawn per spawner per tick, never more than `count` alive; dead slots refill
+per `respawn` (never | ticks:N | onLeave = on re-activation). A creature
+missing 600 ticks while its spawner is active counts dead. `trigger
+onEnter(<region>)` waits for a player's feet in a region box. Out of the
+window the spawner is inactive and costs nothing; its creatures park like any
+mob. Delta: serial, triggered, per-slot (serial, state, deadTick).
+
+**Monster schedule rows** (`schedule.h`): `guard`, `patrol` (`route`, `mode`
+loop|pingpong, `wait`), `lair`, `ambush`, run by the resident layer
+(`refs_npc.cpp StepResident`) for npc refs and — through `StepScheduled` and
+a stand-in npc ref carrying the spawner's props — for spawned creatures. They
+COOPERATE with hostile profiles rather than replacing them: the routine verb
+is Goto (Sleep for a lair asleep) at a flat 1 × the profile's weight, so the
+hostile melee profiles gained `goto`/`sleep` weights of 0.6 — below their
+`approach` (1.1–1.4), so a target always wins and losing it hands the row
+back (the stray check walks it home). `lair`/`ambush` narrow perception with
+`ai::Brain::acquireCap` (a NEW target only within `radius`; a held one keeps
+the profile's keep range) until SPRUNG (a target, or hurt in the last 5 s);
+calm 10 s, they go back and lie in wait. "Noise" is not modelled beyond
+being hurt. An `00:00`→`24:00` row is all day.
+
+**Rule 2.** The kinds share ONE tick (on `gate`) that returns at once when no
+dungeon entity is active and no door is signal-worked; per active entity it
+is a few compares (plates: one feet-in-box per body).
+
+Gate: `dungeon-entities` (`src/test/selftest_dungeon_entities.cpp`) — a
+scratch dungeon placed at a quarter turn on the harness map, run twice from a
+fresh worldgen with identical traces.
+
 ## 17. Demons (docs/PLAN_demons.md, added 2026-10-04)
 
 ### Demons — the race, the name, the salt circle, containment (D1; `game/demon.*`, `game/demon_circle.*`, `game/mobfence.h`)

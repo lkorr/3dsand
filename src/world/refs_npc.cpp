@@ -91,6 +91,17 @@ struct Resident {
   bool wanderGoing = false;
   Vec3 wanderGoal{};
   uint32_t wanderUntil = 0, wanderSeq = 0;
+  // ---- the monster rows (dungeons D3) ----
+  // patrol: the route node walked to (index into Row::Route), the pingpong
+  // direction, and the end of the pause at the node it stands on (0 = not
+  // waiting).
+  int patrolIdx = 0;
+  int patrolDir = 1;
+  uint32_t patrolWaitUntil = 0;
+  // lair / ambush: SPRUNG = awake / out of hiding (a target, or hurt); calm
+  // again `kCalmTicks` after the last target, then back to the spot.
+  bool sprung = false;
+  uint32_t calmSince = 0;
 };
 
 struct ResidentsWorld {
@@ -146,6 +157,14 @@ bool GroundKnown(World& world, const std::string& id, IVec3 cell, uint32_t tick)
   }
   return known;
 }
+
+// ---- the monster rows (dungeons D3) ------------------------------------------------
+// A sprung lair / ambush creature with nothing to fight for this long goes
+// back to its spot and lies in wait again (10 s).
+constexpr uint32_t kCalmTicks = 300;
+// Hurt this recently = awake, whatever its radius says (the "noise").
+constexpr uint32_t kHurtWakeTicks = 150;
+
 
 // ---- anchors ---------------------------------------------------------------------
 
@@ -380,8 +399,27 @@ bool DoorCacheFresh(World* world, const DoorGeom& g, uint32_t since, uint32_t ti
 
 // ---- one villager's tick -------------------------------------------------------------
 
+// A patrol route's node by name: an exact ref id, else a sibling of the npc
+// ("<parent>/<name>"), else a ref of its group ("<group>/<name>").
+Anchor RouteNode(const RefStore& s, const Ref& npc, const std::string& name) {
+  Anchor a;
+  const Ref* t = s.Find(name);
+  const size_t cut = npc.id.rfind('/');
+  if (t == nullptr && cut != std::string::npos) t = s.Find(npc.id.substr(0, cut) + "/" + name);
+  if (t == nullptr) t = s.Find(npc.group + "/" + name);
+  if (t == nullptr) {
+    a.why = "route: no waynode \"" + name + "\" (tried the id, a sibling and " + npc.group + "/" +
+            name + ")";
+    return a;
+  }
+  AnchorOfRef(s, *t, a);
+  a.how = "route " + t->id;
+  return a;
+}
+
 float ArriveRadius(const std::string& act) {
-  if (act == "sleep") return 4.0f;
+  if (act == "sleep" || act == "lair") return 4.0f;
+  if (act == "patrol") return kNodeRadius;
   if (act == "socialize") return 6.0f;
   if (act == "wander") return 5.0f;
   if (act == "goto") return 4.0f;
@@ -490,8 +528,8 @@ bool DoorStep(RefCtx& c, Resident& R, const Vec3& foot, ai::Routine& rt, const s
   DoorStatus ds;
   const DoorPhase ph = PhaseOfDoor(R.st.door, &ds);
   if (ph == DoorPhase::Broken) return true;
-  if (ph == DoorPhase::Closed && g.locked) {
-    Replan(c, R, foot, "door " + R.st.door + " is locked");
+  if (ph == DoorPhase::Closed && (DoorLockedNow(c.refs, *d) || !g.on.empty())) {
+    Replan(c, R, foot, "door " + R.st.door + (g.on.empty() ? " is locked" : " is worked by a signal"));
     return false;
   }
   if (c.tick - R.doorWaitSince > kDoorTimeoutTicks) {
@@ -602,6 +640,33 @@ void StepResident(RefCtx& c, const Ref& r) {
       R.replansThisRow = 0;
       R.wanderGoing = false;
       R.wanderUntil = 0;
+      R.sprung = false;
+      R.patrolWaitUntil = 0;
+      R.patrolDir = 1;
+    }
+    // PATROL: the anchor is the route node being walked to. A new row starts
+    // at the node nearest the feet; an edit keeps the node it was on.
+    if (rw.act == "patrol") {
+      const std::vector<std::string> route = rw.Route();
+      if (route.empty()) {
+        R.st.anchor.ok = false;
+        R.st.anchor.why = "patrol: the row has no route";
+      } else {
+        if (!sameRow) {
+          float bestD = 1e30f;
+          for (size_t i = 0; i < route.size(); i++) {
+            const Anchor n = RouteNode(*c.refs, r, route[i]);
+            const float d = n.ok ? Planar(foot, n.foot) : 1e30f;
+            if (d < bestD) {
+              bestD = d;
+              R.patrolIdx = (int)i;
+            }
+          }
+        }
+        R.patrolIdx = std::clamp(R.patrolIdx, 0, (int)route.size() - 1);
+        R.st.anchor = RouteNode(*c.refs, r, route[(size_t)R.patrolIdx]);
+        R.st.patrolNode = R.st.anchor.refId;
+      }
     }
     R.st.note.clear();
     Plan(c, R, foot);
@@ -640,6 +705,25 @@ void StepResident(RefCtx& c, const Ref& r) {
     R.bestTick = c.tick;   // no stuck clock while fighting or running
     m->SetActivity("");
   }
+  // ---- THE MONSTER ROWS' EYES (D3): a sleeper / an ambusher sees a NEW
+  //      target only within its radius until it is SPRUNG (a target, or
+  //      hurt); calm for kCalmTicks, it lies in wait again. Everyone else
+  //      sees with the profile's own sightRange. ----
+  br->acquireCap = -1.0f;
+  if (rw.act == "lair" || rw.act == "ambush") {
+    const bool hurt = br->everHurt && c.tick - br->hurtTick <= kHurtWakeTicks;
+    if (br->hasTarget || hurt) {
+      if (!R.sprung) R.st.springs++;
+      R.sprung = true;
+      R.calmSince = c.tick;
+    } else if (R.sprung && c.tick - R.calmSince > kCalmTicks) {
+      R.sprung = false;
+      if (R.st.phase == ResidentPhase::AtAnchor) R.st.arrivedTick = 0;
+      Plan(c, R, foot);   // back to the spot
+    }
+    if (!R.sprung) br->acquireCap = rw.Radius() * 10.0f;
+  }
+  R.st.sprung = R.sprung;
 
   const Anchor& A = R.st.anchor;
   const float radius = ArriveRadius(rw.act);
@@ -761,6 +845,54 @@ void StepResident(RefCtx& c, const Ref& r) {
     if (!busy && fromAnchor <= radius + 2.0f) m->SetActivity("sleep");
     return;
   }
+  // ---- the monster rows (D3) ----
+  if (rw.act == "lair") {
+    // Asleep on the spot until something comes within the radius.
+    if (!busy && !R.sprung && fromAnchor <= radius + 2.0f) {
+      rt.verb = ai::Intent::Sleep;
+      m->SetActivity("sleep");
+    } else {
+      m->SetActivity("");
+    }
+    return;
+  }
+  if (rw.act == "ambush") {
+    m->SetActivity("");
+    if (!busy && !R.sprung) rt.hold = true;   // perfectly still
+    return;
+  }
+  if (rw.act == "patrol") {
+    m->SetActivity("");
+    const std::vector<std::string> route = rw.Route();
+    if (busy || route.empty()) return;
+    if (R.patrolWaitUntil == 0) {
+      // Arrived at node patrolIdx: note it, pause.
+      R.st.patrolArrivals++;
+      R.st.patrolVisits.push_back(R.st.anchor.refId);
+      if (R.st.patrolVisits.size() > 32) R.st.patrolVisits.erase(R.st.patrolVisits.begin());
+      R.patrolWaitUntil = c.tick + std::max<uint32_t>(1, (uint32_t)std::lround(rw.WaitSec() * 30.0f));
+    }
+    if (c.tick < R.patrolWaitUntil) return;
+    // On to the next node: loop wraps, pingpong turns at the ends.
+    const int n = (int)route.size();
+    if (n > 1) {
+      if (rw.PingPong()) {
+        if (R.patrolIdx + R.patrolDir >= n || R.patrolIdx + R.patrolDir < 0) R.patrolDir = -R.patrolDir;
+        R.patrolIdx += R.patrolDir;
+      } else {
+        R.patrolIdx = (R.patrolIdx + 1) % n;
+      }
+    }
+    R.patrolWaitUntil = 0;
+    R.st.anchor = RouteNode(*c.refs, r, route[(size_t)R.patrolIdx]);
+    R.st.patrolNode = R.st.anchor.refId;
+    R.st.arrivedTick = 0;
+    R.bad.clear();
+    R.replansThisRow = 0;
+    Plan(c, R, foot);
+    return;
+  }
+  // guard: stands its post facing the anchor's yaw (work's pose).
   m->SetActivity("");
   if (rw.act == "socialize") {
     // Face the nearest other villager in reach, else the anchor's yaw.
@@ -878,7 +1010,15 @@ Anchor ResolveAnchor(const RefStore& s, const Ref& npc, const std::string& atIn)
       }
     }
     if (best == nullptr) {
-      a.why = "'" + at + "' is not a prop on " + npc.id + ", not a ref id and no ref has it as a tag";
+      // D3: a bare NAME in the npc's own group ("wn_post" in a dungeon's
+      // refs file means "dungeon/<id>/wn_post").
+      if (const Ref* g = s.Find(npc.group + "/" + at); g != nullptr) {
+        AnchorOfRef(s, *g, a);
+        a.how = "group ref " + at;
+        return a;
+      }
+      a.why = "'" + at + "' is not a prop on " + npc.id + ", not a ref id, not a ref of group " +
+              npc.group + " and no ref has it as a tag";
       return a;
     }
     target = best->id;
@@ -1012,6 +1152,15 @@ void ResetResidents() {
   W().npcs.clear();
   W().askedAt.clear();
 }
+
+void StepScheduled(RefCtx& c, const Ref& asNpc) {
+  if (c.refs == nullptr || c.mobs == nullptr) return;
+  W().store = c.refs;
+  W().lastTick = c.tick;
+  StepResident(c, asNpc);
+}
+
+void ForgetResident(const std::string& id) { W().npcs.erase(id); }
 
 // ---- the kinds -------------------------------------------------------------------------
 

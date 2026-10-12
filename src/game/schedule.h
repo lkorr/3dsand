@@ -26,6 +26,24 @@
 //   radius     metres (wander: how far from the anchor it strays;
 //              socialize: how far it looks for someone to face). Default 3.
 //   note       free text for the author; kept, never read.
+//
+// THE MONSTER ROWS (dungeons D3, docs/PLAN_dungeons.md 3.7; driven by
+// world/refs_npc.cpp, cooperating with a hostile behaviour profile: a target
+// takes the creature off the row -- the profile fights -- and losing it
+// hands the row back, which walks it home):
+//   guard      hold `at` (a waynode / marker / role / tag), face its yaw,
+//              engage on sight (the profile's own sight), return after.
+//   patrol     walk `route` (waynodes, in order) -- `mode` "loop" (default:
+//              a->b->c->a) or "pingpong" (a->b->c->b) -- pausing `wait`
+//              seconds (default 2) at each; engage on sight, then resume
+//              from the nearest route node.
+//   lair       go to `at` and SLEEP there (lie down): a new target is seen
+//              only within `radius` metres (default 3) -- or once it is
+//              hurt; awake with nothing to fight for 10 s, it sleeps again.
+//   ambush     go to `at` and hold perfectly still: a new target is seen
+//              only within `radius` metres (default 3); after a fight it
+//              walks back and lies in wait again.
+//   An "00:00" -> "24:00" row is all day.
 // Unknown keys on a row or at the top level are KEPT and written back.
 //
 // FIRST MATCH WINS where rows overlap (and Validate says so); a minute no row
@@ -58,6 +76,11 @@ struct Row {
   std::string note;
   Json extra = Json::object();   // unknown keys, file order
   float Radius() const { return radius < 0.0f ? 3.0f : radius; }
+  // patrol: the waynodes (`route`), "pingpong" vs "loop" (`mode`), and the
+  // pause at each node (`wait`, seconds, default 2). Read from `extra`.
+  std::vector<std::string> Route() const;
+  bool PingPong() const;
+  float WaitSec() const;
   bool Covers(int minute) const;
 };
 

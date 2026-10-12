@@ -951,8 +951,11 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
   // sitting on the boundary is acquired and dropped on alternate ticks, which
   // makes the whole arbiter above it oscillate for reasons that look like a bug
   // in the arbiter.
-  const float acquire = pr.perception.sightRange;
-  const float keep = acquire * std::max(1.0f, pr.perception.keepRangeScale);
+  const float keep = pr.perception.sightRange * std::max(1.0f, pr.perception.keepRangeScale);
+  // A sleeper's / an ambusher's cap (Brain::acquireCap) narrows only what is
+  // NEWLY seen; what it already hunts is kept to the profile's keep range.
+  const float acquire = b.acquireCap >= 0.0f ? std::min(pr.perception.sightRange, b.acquireCap)
+                                             : pr.perception.sightRange;
 
   // NEAREST, ADJUSTED (Perception::stickiness / preferWeak). Both are 0 on a
   // profile that does not author them, and then `score == d` exactly — the

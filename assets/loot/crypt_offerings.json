@@ -1,0 +1,16 @@
+{
+  "about": "Grave goods: what the old temple buried with its dead. Robes and sashes, a mace or a blade, now and then a key. Dungeons D3 (src/world/loot.h).",
+  "rolls": [1, 2],
+  "rows": [
+    { "item": "robe", "weight": 3, "dye": "#3a2f4a" },
+    { "item": "sash", "weight": 3 },
+    { "item": "hood", "weight": 2, "dye": "#2b2b2b" },
+    { "item": "mace", "weight": 1 },
+    { "item": "shortsword", "weight": 1 },
+    { "item": "bone_key", "weight": 1 },
+    { "weight": 4 }
+  ],
+  "always": [
+    { "item": "flask", "chance": 0.25 }
+  ]
+}

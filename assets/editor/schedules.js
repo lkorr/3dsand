@@ -9,13 +9,19 @@
  * allowlists schedules/). Press R in the game to reload; the in-game References
  * page (npc selected) edits the same files and shows the villager living it.
  *
+ * MONSTER ROWS (dungeons D3): guard / patrol / lair / ambush. A patrol row
+ * carries `route` (waynode names, comma separated here), `mode` (loop |
+ * pingpong) and `wait` (seconds at each node) in the row's extra keys, edited
+ * in the "route" column. A row from 00:00 to 00:00 is saved as 00:00 -> 24:00:
+ * ALL DAY (a guard that never leaves its post).
+ *
  * WRITER. `writeSchedule` produces the canonical layout the C++ writer
  * (schedule::Write) produces — extra top-level keys first, then one row per
  * line, keys from, to, do, at, radius, note — so saving here and saving in the
  * game give byte-identical files.
  */
 
-const ACTS = ['sleep', 'work', 'wander', 'socialize', 'eat', 'goto'];
+const ACTS = ['sleep', 'work', 'wander', 'socialize', 'eat', 'goto', 'guard', 'patrol', 'lair', 'ambush'];
 const ACT_HELP = {
   sleep: 'walk to the anchor (a bed) and lie down on it',
   work: 'stand at the anchor facing its yaw',
@@ -23,6 +29,10 @@ const ACT_HELP = {
   socialize: 'stand at the anchor facing the nearest other villager',
   eat: 'stand at the anchor (home: its hearth) facing its yaw',
   goto: 'go there and stand',
+  guard: 'MONSTER: hold the anchor facing its yaw; fight what it sees, then walk back',
+  patrol: 'MONSTER: walk `route` (waynodes) in order, loop or pingpong, pausing `wait` s at each; fight what it sees, then resume',
+  lair: 'MONSTER: sleep at the anchor; wakes for what comes within `radius` metres, or when hurt',
+  ambush: 'MONSTER: hold perfectly still at the anchor until prey is within `radius` metres',
 };
 
 let H = null;
@@ -43,7 +53,10 @@ export function clockText(min) {
   min = ((min % 1440) + 1440) % 1440;
   return String(Math.floor(min / 60)).padStart(2, '0') + ':' + String(min % 60).padStart(2, '0');
 }
+// "00:00" -> "24:00" is ALL DAY (schedule.cpp keeps it as [0, 1440)).
+function allDay(r) { return parseClock(r.from) === 0 && String(r.to || '').trim() === '24:00'; }
 function covers(r, m) {
+  if (allDay(r)) return true;
   const f = parseClock(r.from), t = parseClock(r.to);
   if (f < 0 || t < 0 || f === t) return false;
   return f < t ? (m >= f && m < t) : (m >= f || m < t);
@@ -55,6 +68,11 @@ export function validate(d) {
     if (parseClock(r.from) < 0) out.push(`rows[${i}].from: want a time like "06:30"`);
     if (parseClock(r.to) < 0) out.push(`rows[${i}].to: want a time like "06:30"`);
     if (!ACTS.includes(r.do)) out.push(`rows[${i}].do: '${r.do}' is not an activity`);
+    const ex = r.extra || {};
+    if (r.do === 'patrol' && !(Array.isArray(ex.route) && ex.route.length))
+      out.push(`rows[${i}].route: a patrol row needs a route (a list of waynodes); it holds \`at\` instead`);
+    if (ex.mode !== undefined && ex.mode !== 'loop' && ex.mode !== 'pingpong')
+      out.push(`rows[${i}].mode: want "loop" or "pingpong"`);
   });
   let gap = -1;
   for (let m = 0; m <= 1440; m++) {
@@ -91,7 +109,7 @@ export function writeSchedule(d) {
   d.rows.forEach((r, i) => {
     o += i ? ',\n    ' : '\n    ';
     const f = parseClock(r.from), t = parseClock(r.to);
-    o += '{ "from": "' + clockText(f) + '", "to": "' + (t === 0 && f !== 0 ? '24:00' : clockText(t)) +
+    o += '{ "from": "' + clockText(f) + '", "to": "' + ((t === 0 && f !== 0) || allDay(r) ? '24:00' : clockText(t)) +
          '", "do": ' + JSON.stringify(r.do);
     if (r.at) o += ', "at": ' + JSON.stringify(r.at);
     if (r.radius !== undefined && r.radius !== '' && r.radius !== null) o += ', "radius": ' + (+r.radius);
@@ -179,7 +197,7 @@ function paintDoc() {
   box.append(about);
   const tbl = el('table', {class: 'schedtbl'});
   tbl.append(el('tr', {}, el('th', {}, 'from'), el('th', {}, 'to'), el('th', {}, 'do'), el('th', {}, 'at'),
-                el('th', {}, 'radius m'), el('th', {}, 'note'), el('th', {}, '')));
+                el('th', {}, 'radius m'), el('th', {}, 'route (patrol)'), el('th', {}, 'note'), el('th', {}, '')));
   const dl = el('datalist', {id: 'schedAtList'});
   for (const s of ['home', 'bed', 'work', 'gather', 'hearth']) dl.append(el('option', {value: s}));
   box.append(dl);
@@ -187,7 +205,13 @@ function paintDoc() {
     const tr = el('tr', {});
     const time = (k) => {
       const inp = el('input', {type: 'time', value: clockText(Math.max(0, parseClock(r[k])))});
-      inp.addEventListener('change', () => { r[k] = inp.value || '00:00'; setDirty(true); paintChecks(); });
+      inp.addEventListener('change', () => {
+        r[k] = inp.value || '00:00';
+        // 00:00 to 00:00 is a whole day, written "24:00".
+        if (k === 'to' && r.to === '00:00' && parseClock(r.from) === 0) r.to = '24:00';
+        setDirty(true);
+        paintChecks();
+      });
       return inp;
     };
     const act = el('select', {title: ACT_HELP[r.do] || ''});
@@ -200,12 +224,34 @@ function paintDoc() {
     rad.addEventListener('input', () => { r.radius = rad.value === '' ? undefined : +rad.value; setDirty(true); });
     const note = el('input', {type: 'text', value: r.note, placeholder: 'note'});
     note.addEventListener('input', () => { r.note = note.value; setDirty(true); });
+    // THE PATROL (D3): route, mode, wait -- kept in the row's extra keys.
+    r.extra = r.extra || {};
+    const route = el('input', {type: 'text', value: Array.isArray(r.extra.route) ? r.extra.route.join(', ') : '',
+                               placeholder: r.do === 'patrol' ? 'wn_a, wn_b, wn_c' : '',
+                               title: 'patrol: the waynodes, in order (ref ids, or names in the npc\'s group)',
+                               style: 'width:140px'});
+    route.disabled = r.do !== 'patrol';
+    route.addEventListener('input', () => {
+      const names = route.value.split(',').map(s => s.trim()).filter(Boolean);
+      if (names.length) r.extra.route = names; else delete r.extra.route;
+      setDirty(true);
+      paintChecks();
+    });
+    const mode = el('select', {title: 'patrol: loop a->b->c->a, or pingpong a->b->c->b'});
+    for (const m of ['loop', 'pingpong']) { const o = el('option', {value: m}, m); if ((r.extra.mode || 'loop') === m) o.selected = true; mode.append(o); }
+    mode.disabled = r.do !== 'patrol';
+    mode.addEventListener('change', () => { if (mode.value === 'loop') delete r.extra.mode; else r.extra.mode = mode.value; setDirty(true); });
+    const wait = el('input', {type: 'number', step: '0.5', min: '0', value: r.extra.wait ?? '', placeholder: '2',
+                              title: 'patrol: seconds at each node', style: 'width:50px'});
+    wait.disabled = r.do !== 'patrol';
+    wait.addEventListener('input', () => { if (wait.value === '') delete r.extra.wait; else r.extra.wait = +wait.value; setDirty(true); });
+    act.addEventListener('change', () => { route.disabled = mode.disabled = wait.disabled = r.do !== 'patrol'; });
     const up = el('button', {title: 'move up'}, '↑');
     up.addEventListener('click', () => { if (i > 0) { [doc.rows[i - 1], doc.rows[i]] = [doc.rows[i], doc.rows[i - 1]]; setDirty(true); paintDoc(); } });
     const del = el('button', {title: 'delete row'}, '×');
     del.addEventListener('click', () => { doc.rows.splice(i, 1); setDirty(true); paintDoc(); });
     tr.append(el('td', {}, time('from')), el('td', {}, time('to')), el('td', {}, act), el('td', {}, at),
-              el('td', {}, rad), el('td', {}, note), el('td', {}, up, del));
+              el('td', {}, rad), el('td', {}, route, mode, wait), el('td', {}, note), el('td', {}, up, del));
     tbl.append(tr);
   });
   box.append(tbl);

@@ -2416,3 +2416,130 @@ Design aids, all printing to the console (km coordinates):
 For daylight aerial engine shots of a place, `--at` with
 `SANDVOX_AT_MINUTE=<minute of day>` (e.g. 720) holds the sky at that hour, and
 `SANDVOX_WEATHER=clear` clears it.
+
+
+## 16. Dungeon entities: monsters, levers, gates, traps, keys and loot
+
+A dungeon's gameplay things — its monsters and spawners, doors and gates,
+levers and pressure plates, traps, keys and chests — are **references**, the
+same placed things as §10, kept in one file per dungeon:
+`assets/dungeons/<dungeon>/refs.json`. (The Dungeons tab is where you will
+place them by clicking; until then this file is edited by hand or with the
+References page, and everything below is what each line means.)
+
+### Positions are in the DUNGEON's own frame
+
+Every `pos` in that file is measured from the dungeon's own origin, not the
+world: the dungeon is placed on the map by `map.json` `dungeons[]` (anchor
+column, `yOffset`, `yaw`), and the game turns and moves every ref with it.
+Turn the dungeon a quarter on the map and its levers, doors and waynodes turn
+with it. A ref's `yaw` is likewise relative to the dungeon. Ids are
+`dungeon/<dungeon>/<name>`; a name in a prop (a waynode link, a route, a
+region) can be just `<name>` — it is looked up in the same dungeon.
+
+### Boxes
+
+Plates, regions and traps cover a BOX: `"size": [across, up, deep]` in voxels
+(10 voxels = 1 m), starting at the ref's `pos` and running to its RIGHT,
+UP and FORWARD (its `yaw` is forward). Turn the ref and the box turns.
+
+### Levers, plates and what they work (signals)
+
+A **signal** is a name. A lever or plate sends it; doors, gates and traps
+that say `"on": "<name>"` listen. Signals belong to their dungeon.
+
+| kind | props |
+|---|---|
+| `lever` | `signal` (default: the lever's own name), `startOn` (true/false), `pulse` (seconds: a lever that springs back; 0 = it stays where you put it), `label` (the prompt). Use it to pull it. |
+| `plate` | `signal` (default: its own name), `size` (default [8, 2, 8]), `latch` (true: once stepped on it stays down), `who` (`any` / `player` / `mob`). It is ON while someone's feet are on it. |
+| `door` | as §10.1, plus `on` (a signal opens it and shuts it; it will not move by hand) and `lock` (see keys). |
+| `gate` | a portcullis of bars. `pos` = one bottom corner, `yaw` = the way it faces. `width` (20), `height` (30), `thickness` (1), `material` (`iron`), `pattern` (`bars` / `solid`), `spacing` (3), `speed` (ticks per row, 2), `on`, `invert` (true: open when the signal is OFF). It is built the first time you come near and slides up while its signal is on. Put solid rock (a lintel, the ceiling) right above its top row: bars lifted into thin air fall down as loose debris. |
+
+So a lever that opens a gate is two lines:
+
+```json
+{ "id": "dungeon/crypt/lever_1", "kind": "lever", "pos": [2, 0, 2], "props": { "signal": "sanctum" } },
+{ "id": "dungeon/crypt/gate_1", "kind": "gate", "pos": [6, 0, 8], "props": { "width": 24, "height": 30, "on": "sanctum" } }
+```
+
+### Traps
+
+`"kind": "trap"` with `type`, `on` (a signal — a plate's name works, since a
+plate sends its own name), and `region` (a `[x, y, z]` box from the trap's
+pos, or the name of a `region` or `plate` ref). They fire when the signal
+comes ON.
+
+| `type` | what happens | extra props |
+|---|---|---|
+| `collapse_floor` | every solid floor cell in the region that has a powder twin turns into it — stone into gravel, sandstone into sand… — and falls. Build the floor over a drop. Once. | `from` (only this material), `to` (turn it into this instead) |
+| `spikes` | everyone standing in the region is hurt; spikes jump up and go back down | `damage` (25), `material` (`iron`), `duration` (1 s), `cooldown` (3 s) |
+| `dart` | one dart from the trap's pos straight along its yaw; the first body in line is hit | `damage` (15), `range` (120 voxels), `cooldown` |
+| `flood` | the region fills with water (or `material`), once — a set amount, not a spring | `material` |
+| `fire_vent` | fire bursts in the region | `duration` (2 s), `material` (`fire`), `cooldown` |
+
+`once` (true/false) overrides whether it can fire again (collapse and flood
+default to once).
+
+A `region` ref is just a named box: `{ "kind": "region", "props": { "size": [20, 10, 20] } }`.
+
+### Keys and locked doors
+
+Give the door `"lock": "bone_key"`. Anyone with a **bone_key** item in their
+pack opens it; after that it stays unlocked. The keys are items:
+`iron_key`, `bone_key`, `old_key` (new ones: a row of `kind: "key"` in
+`assets/items/items.json`, with `"unlocks": "<lock name>"` if the lock name is
+not the item's own id, and art from `scripts/gen_key_items.py`).
+
+Put a key in the world with a `key` ref — `{ "kind": "key", "props": { "item": "bone_key" } }`
+(use it to pick it up; the ref itself is invisible, so set it on a prop: an
+altar, a corpse, a table) — or put the key in a chest's loot table.
+
+### Chests with loot
+
+A `container` with `"loot": "crypt_offerings"` is filled from
+`assets/loot/crypt_offerings.json` the first time it is opened — the same
+things every time for that chest, on every machine. Tables shipped:
+`mine_supplies`, `crypt_offerings`, `cave_cache`. A table:
+
+```json
+{ "rolls": [1, 3],
+  "rows": [ { "item": "flask", "weight": 3 }, { "item": "dagger", "weight": 1, "count": [1, 2] }, { "weight": 4 } ],
+  "always": [ { "item": "pouch", "chance": 0.5 } ] }
+```
+
+`rolls` draws are made from `rows` by weight (a row with no item draws
+nothing); every `always` row is tried once with its `chance`. `dye` works on
+any row ("#6b5a3e").
+
+### Monsters: placed, or from a spawner
+
+A single placed monster is an `npc` ref (§10.2) with a hostile
+`behavior` (`zombie`, `swordsman`, `guardian`, …). A **spawner** makes them:
+
+| prop | meaning |
+|---|---|
+| `mobs` | `[{"base": "zombie", "weight": 2}, {"base": "human", "weight": 1}]` (or the ref's `base` for one kind) |
+| `count` | how many alive at once (1–16) |
+| `radius` | metres around the spawner they appear in |
+| `respawn` | `never`, `onLeave` (the dead come back when you return), or `ticks:N` (N ticks after one dies; 30 ticks = 1 s) |
+| `trigger` | `always`, or `onEnter(<region name>)` — nothing until a player walks into that region |
+| `behavior`, `schedule`, `outfit`, `weapon` | as an npc ref; a schedule's roles are props on the spawner |
+
+The same spawner always makes the same creatures in the same places.
+
+### Monster schedules: guard, patrol, lair, ambush
+
+Schedules (§10.2) have four monster activities. A monster fights whatever it
+sees (its behaviour decides how); when it loses its target it goes back to
+the row.
+
+| `do` | what it does | fields |
+|---|---|---|
+| `guard` | stands at `at`, facing that ref's yaw | `at` |
+| `patrol` | walks the waynodes in `route` in order, pausing at each | `route` (`["wn_a", "wn_b", "wn_c"]`), `mode` (`loop` or `pingpong`), `wait` (seconds, 2) |
+| `lair` | goes to `at` and sleeps; wakes only for someone within `radius` metres, or when hurt | `at`, `radius` |
+| `ambush` | holds perfectly still at `at` until someone is within `radius` metres | `at`, `radius` |
+
+For a monster that does the same thing all day use one row from `00:00` to
+`24:00` (on the Schedules page: from 00:00 to 00:00). The Schedules page's
+"route (patrol)" column holds `route`, `mode` and `wait`.

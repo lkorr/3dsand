@@ -30,11 +30,21 @@
 //          side it opens toward, facing the door, the hinge is on their left),
 //          openAngle (degrees, default 95), locked (bool), autoClose (seconds,
 //          0 = never).
+//          DUNGEONS (D3, world/refs_dungeon.h): lock ("<keyId>": a key item
+//          whose keyId matches, anywhere in the user's kit, turns it ONCE --
+//          the delta remembers it unlocked, so the key is not asked for
+//          again); on ("<signal>": the door is WORKED by that signal of its
+//          group -- open while the signal is on, shut while it is off -- and
+//          will not move by hand).
 //
 // CONTAINER: a Bag owned by the ref. Initial contents from props.items
 // ([{"item": "bread", "count": 3}, ...]); once anything is taken or put, the
 // whole bag is the ref's delta and the props no longer matter. Opened by the
 // use verb into the loot panel (take one / take all / put by drag).
+// props.loot ("<table>", D3: assets/loot/<table>.json, world/loot.h): on the
+// FIRST open the table is rolled -- seeded by RefHash(id), so the same chest
+// holds the same things everywhere -- on top of props.items, and the result
+// becomes the delta at once.
 //
 // BED: an anchor. pos is the mattress cell where the HEAD lies, yaw points
 // from head to foot, props.length (cells, default 18). The player's use says
@@ -72,6 +82,8 @@ struct DoorGeom {
   IVec3 pos{};                // the ref's pos: hinge-side bottom cell, front layer
   IVec3 lo{}, hi{};           // the leaf box, inclusive cell AABB
   bool locked = false;
+  std::string lock;           // props.lock: the keyId that opens it ("" = none)
+  std::string on;             // props.on: the signal that works it ("" = by hand)
   float autoCloseSec = 0.0f;
   std::vector<IVec3> Cells() const;   // every cell of the box, i-j-k order
   Vec3 Center() const;                // the closed leaf's centre
@@ -102,7 +114,24 @@ struct DoorStatus {
 };
 bool DoorStatusOf(const std::string& id, DoorStatus& out);
 
+// ---- D3: locks, keys and signals ------------------------------------------------
+// Is the door locked right now: props.locked, or props.lock with no key
+// turned in it yet (the delta's unlocked bit).
+bool DoorLockedNow(RefStore* s, const Ref& r);
+// Remember that a key turned in this door's lock (the delta, saved).
+bool DoorUnlock(RefStore& s, const Ref& r);
+// The name of the first key item in `kit` (bag, hotbar, equipment) whose
+// ItemDef::keyId is `keyId`, or "".
+std::string KeyInKit(const Kit& kit, const ItemLibrary& lib, const std::string& keyId);
+// A SIGNAL drives the door (refs_dungeon.cpp): open = swing it open (ignoring
+// any lock: the mechanism is on the other side), !open = close it. A no-op
+// when it is already going that way or is broken.
+void DoorDrive(RefCtx& c, const Ref& r, bool open);
+
 // ---- containers ---------------------------------------------------------------
+// props.loot: roll the table into the container ONCE (no delta yet), on top
+// of props.items. True when it rolled now. Called by the use verb.
+bool ContainerRollLoot(RefStore& s, const Ref& r, const ItemLibrary* lib);
 // The contents as they are now: the delta if there is one, else props.items
 // (names the library lacks are skipped when `lib` is given).
 void ContainerContents(RefStore& s, const Ref& r, const ItemLibrary* lib, Bag& out);

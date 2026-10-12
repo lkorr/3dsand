@@ -40,6 +40,7 @@ void RegisterP1Kinds() {
 void RegisterDoorKinds();       // world/refs_doors.cpp (P6)
 void RegisterResidentKinds();   // world/refs_npc.cpp (P7)
 void RegisterReadableKinds();   // world/refs_readable.cpp (demons D2)
+void RegisterDungeonKinds();    // world/refs_dungeon.cpp (dungeons D3)
 
 void RegisterAllKinds() {
   static bool done = false;
@@ -53,6 +54,8 @@ void RegisterAllKinds() {
   structures::RegisterStructureKinds();   // P4: structure (world/structures.h)
   RegisterResidentKinds();       // P7: npc, waynode
   RegisterReadableKinds();       // demons D2: readable (a book, a note)
+  // dungeons D3: lever, plate, region, gate, trap, key, spawner
+  RegisterDungeonKinds();
 }
 
 }  // namespace refs

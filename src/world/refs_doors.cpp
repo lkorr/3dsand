@@ -18,6 +18,7 @@
 #include "sim/bytestream.h"
 #include "sim/materials.h"
 #include "sim/world.h"
+#include "world/loot.h"
 
 namespace refs {
 
@@ -26,6 +27,11 @@ namespace {
 constexpr float kPi = 3.14159265358979f;
 constexpr uint32_t kTickHz = 30;            // the fixed sim rate (support.h kTickDt)
 constexpr uint32_t kDoorOpen = 1, kDoorBroken = 2;
+// D3: OR'd into the delta's state word once a key has turned in the lock
+// (props.lock). The low byte is the phase word above; a v1 save never sets
+// it, so it reads as "still locked" -- which is what it was.
+constexpr uint32_t kDoorUnlockedBit = 0x100;
+constexpr uint32_t kDoorStateMask = 0xFF;
 constexpr uint32_t kRefetchTicks = 15;      // re-ask the cache this often while waiting
 // "Home": the hinge within ~3.4 degrees of shut, turning slower than ~17 deg/s.
 constexpr float kHomeRad = 0.06f;
@@ -131,13 +137,41 @@ void EncodeOpen(const DoorLive& L, std::vector<uint8_t>& b) {
   }
 }
 
+// Has a key turned in this door's lock (the delta's kDoorUnlockedBit)?
+bool UnlockedInDelta(RefStore* s, const std::string& id) {
+  if (s == nullptr) return false;
+  const RefDelta* d = s->Delta(id);
+  if (d == nullptr || d->kind != "door" || d->bytes.size() < 4) return false;
+  ByteReader rd{d->bytes.data(), d->bytes.size()};
+  uint32_t state = 0;
+  rd.U32(state);
+  return (state & kDoorUnlockedBit) != 0;
+}
+
 void SetOpenDelta(RefCtx& c, const Ref& r, const DoorLive& L) {
+  const bool unlocked = UnlockedInDelta(c.refs, r.id);
   std::vector<uint8_t> b;
   EncodeOpen(L, b);
+  if (unlocked) b[1] |= (uint8_t)(kDoorUnlockedBit >> 8);   // little-endian state word
   c.refs->SetDelta(r.id, "door", 1, std::move(b));
 }
 
-// The saved state: 0 = closed/none, kDoorOpen (+cells), kDoorBroken.
+// A door that went home: no delta -- unless its lock was opened, which is
+// remembered on its own (the key is not asked for twice).
+void ClearDoorDelta(RefStore* s, const std::string& id) {
+  if (s == nullptr) return;
+  if (!UnlockedInDelta(s, id)) {
+    s->ClearDelta(id);
+    return;
+  }
+  std::vector<uint8_t> b;
+  ByteWriter w{b};
+  w.U32(kDoorUnlockedBit);
+  s->SetDelta(id, "door", 1, std::move(b));
+}
+
+// The saved state: 0 = closed/none, kDoorOpen (+cells), kDoorBroken. The
+// unlocked bit is masked off (UnlockedInDelta reads it).
 uint32_t DecodeDelta(RefStore* s, const std::string& id,
                      std::vector<std::pair<IVec3, uint32_t>>* cells) {
   if (s == nullptr) return 0;
@@ -146,6 +180,7 @@ uint32_t DecodeDelta(RefStore* s, const std::string& id,
   ByteReader rd{d->bytes.data(), d->bytes.size()};
   uint32_t state = 0;
   rd.U32(state);
+  state &= kDoorStateMask;
   if (state == kDoorOpen && cells != nullptr) {
     uint32_t n = 0;
     rd.U32(n);
@@ -238,7 +273,7 @@ void Break(RefCtx& c, const Ref& r, DoorLive& L, const std::string& why) {
   if (c.refs != nullptr) {
     std::vector<uint8_t> b;
     ByteWriter w{b};
-    w.U32(kDoorBroken);
+    w.U32(kDoorBroken | (UnlockedInDelta(c.refs, r.id) ? kDoorUnlockedBit : 0u));
     c.refs->SetDelta(r.id, "door", 1, std::move(b));
     c.refs->Warn("refs: " + r.id + ": " + why + "; it is not a door any more");
   }
@@ -439,7 +474,7 @@ void TickDoor(RefCtx& c, const Ref& r, DoorLive& L) {
   L.cells.clear();
   L.phase = DoorPhase::Closed;
   L.note = "closed";
-  if (c.refs != nullptr) c.refs->ClearDelta(r.id);
+  ClearDoorDelta(c.refs, r.id);
 }
 
 DoorStatus StatusOf(RefCtx* c, const DoorLive& L) {
@@ -557,6 +592,9 @@ DoorGeom DoorGeometry(const Ref& r) {
   g.hi = hi;
   g.locked = r.props.contains("locked") && r.props["locked"].is_boolean() &&
              r.props["locked"].get<bool>();
+  if (r.props.contains("lock") && r.props["lock"].is_string())
+    g.lock = r.props["lock"].get<std::string>();
+  if (r.props.contains("on") && r.props["on"].is_string()) g.on = r.props["on"].get<std::string>();
   g.autoCloseSec = std::max(0.0f, PropFloat(r, "autoClose", 0.0f));
   g.ok = true;
   return g;
@@ -586,6 +624,70 @@ bool DoorStatusOf(const std::string& id, DoorStatus& out) {
   return true;
 }
 
+// ---- D3: locks, keys and signals ------------------------------------------------------
+bool DoorLockedNow(RefStore* s, const Ref& r) {
+  const DoorGeom g = DoorGeometry(r);
+  if (g.locked) return true;
+  if (g.lock.empty()) return false;
+  return !UnlockedInDelta(s, r.id);
+}
+
+std::string KeyInKit(const Kit& kit, const ItemLibrary& lib, const std::string& keyId) {
+  auto match = [&](const ItemStack& st) {
+    if (st.Empty()) return false;
+    const ItemDef* d = lib.Of(st);
+    return d != nullptr && d->kind == ItemKind::Key && d->keyId == keyId;
+  };
+  for (const ItemStack& st : kit.bag.slots)
+    if (match(st)) return st.name;
+  for (const ItemStack& st : kit.hotbar.slots)
+    if (match(st)) return st.name;
+  for (const ItemStack& st : kit.equip.slots)
+    if (match(st)) return st.name;
+  return std::string();
+}
+
+bool DoorUnlock(RefStore& s, const Ref& r) {
+  if (r.kind != "door") return false;
+  std::vector<uint8_t> b;
+  if (const RefDelta* d = s.Delta(r.id); d != nullptr && d->kind == "door" && d->bytes.size() >= 4) {
+    b = d->bytes;
+  } else {
+    ByteWriter w{b};
+    w.U32(0);
+  }
+  b[1] |= (uint8_t)(kDoorUnlockedBit >> 8);
+  s.SetDelta(r.id, "door", 1, std::move(b));
+  return true;
+}
+
+void DoorDrive(RefCtx& c, const Ref& r, bool open) {
+  const DoorGeom g = DoorGeometry(r);
+  if (!g.ok) return;
+  DoorWorld& D = Doors();
+  auto it = D.live.find(r.id);
+  const bool broken = it != D.live.end() ? it->second.phase == DoorPhase::Broken
+                                          : DecodeDelta(c.refs, r.id, nullptr) == kDoorBroken;
+  if (broken) return;
+  const DoorPhase ph = it == D.live.end() ? DoorPhase::Closed : it->second.phase;
+  if (open) {
+    if (ph == DoorPhase::Closed) {
+      DoorLive& L = D.live[r.id];
+      L = DoorLive{};
+      D.last.erase(r.id);
+      StartOpen(c, r, L, g);
+    } else if (ph == DoorPhase::Closing || ph == DoorPhase::Settling) {
+      DoorLive& L = it->second;
+      L.phase = DoorPhase::Open;
+      L.openedAt = c.tick;
+      L.note = "open";
+      if (c.phys != nullptr) c.phys->SetJointMotorTarget(L.joint, L.target);
+    }
+  } else if (ph == DoorPhase::Open) {
+    StartClose(c, it->second);
+  }
+}
+
 // ---- containers ----------------------------------------------------------------------
 std::string ContainerTitle(const Ref& r) {
   if (r.props.contains("title") && r.props["title"].is_string())
@@ -609,6 +711,26 @@ void ContainerContents(RefStore& s, const Ref& r, const ItemLibrary* lib, Bag& o
     if (lib != nullptr && lib->Find(it.name) < 0) continue;
     out.Add(it);
   }
+}
+
+bool ContainerRollLoot(RefStore& s, const Ref& r, const ItemLibrary* lib) {
+  if (r.kind != "container" || !r.props.contains("loot") || !r.props["loot"].is_string()) return false;
+  if (const RefDelta* d = s.Delta(r.id); d != nullptr && d->kind == "container") return false;
+  const std::string name = r.props["loot"].get<std::string>();
+  const loot::Table* t = loot::Find(name);
+  Bag bag;
+  ContainerContents(s, r, lib, bag);   // props.items, if any, come first
+  if (t == nullptr) {
+    s.Warn("refs: " + r.id + ": props.loot: no loot table \"" + name + "\" (assets/loot)");
+  } else {
+    std::vector<std::string> skipped;
+    loot::Roll(*t, RefHash(r.id), lib, bag, &skipped);
+    for (const std::string& it : skipped)
+      s.Warn("refs: " + r.id + ": loot table \"" + name + "\" names \"" + it +
+             "\", which is not an item (assets/items/items.json)");
+  }
+  ContainerSetContents(s, r, bag);   // rolled ONCE: from now on the bag is the delta
+  return true;
 }
 
 void ContainerSetContents(RefStore& s, const Ref& r, const Bag& bag) {
@@ -708,6 +830,10 @@ void RegisterDoorKinds() {
       p.push_back("props.locked: true or false");
     if (r.props.contains("autoClose") && !r.props["autoClose"].is_number())
       p.push_back("props.autoClose: seconds (0 = never)");
+    if (r.props.contains("lock") && !r.props["lock"].is_string())
+      p.push_back("props.lock: the keyId a key item unlocks (text), e.g. \"bone_key\"");
+    if (r.props.contains("on") && !r.props["on"].is_string())
+      p.push_back("props.on: the signal that opens it (text)");
   };
   door.activate = [](RefCtx& c, const Ref& r) -> Activation {
     DoorWorld& D = Doors();
@@ -787,9 +913,10 @@ void RegisterDoorKinds() {
     const DoorGeom g = DoorGeometry(r);
     if (!g.ok) return "";
     auto it = Doors().live.find(r.id);
+    if (!g.on.empty()) return "";   // worked by a signal, not by hand (D3)
     if (it == Doors().live.end()) {
       if (DecodeDelta(c.refs, r.id, nullptr) == kDoorBroken) return "Broken door";
-      return g.locked ? "Locked" : "Open door";
+      return DoorLockedNow(c.refs, r) ? "Locked" : "Open door";
     }
     switch (it->second.phase) {
       case DoorPhase::Opening: return "";
@@ -797,7 +924,7 @@ void RegisterDoorKinds() {
       case DoorPhase::Closing:
       case DoorPhase::Settling: return "Open door";
       case DoorPhase::Broken: return "Broken door";
-      default: return g.locked ? "Locked" : "Open door";
+      default: return DoorLockedNow(c.refs, r) ? "Locked" : "Open door";
     }
   };
   door.onUse = [](RefCtx& c, const Ref& r, RefUse& u) {
@@ -814,10 +941,26 @@ void RegisterDoorKinds() {
       u.message = "The door is broken off its hinges.";
       return;
     }
+    if (!g.on.empty()) {
+      u.message = "It will not move by hand; something else works it.";
+      return;
+    }
     if (it == D.live.end() || it->second.phase == DoorPhase::Closed) {
       if (g.locked) {
         u.message = "It is locked.";
         return;
+      }
+      // A KEYED LOCK (D3): the key anywhere in the user's kit turns it, once.
+      if (!g.lock.empty() && !UnlockedInDelta(c.refs, r.id)) {
+        std::string key;
+        if (u.session != nullptr && c.items != nullptr)
+          key = KeyInKit(u.session->kit(), *c.items, g.lock);
+        if (key.empty()) {
+          u.message = "It is locked.";
+          return;
+        }
+        if (c.refs != nullptr) DoorUnlock(*c.refs, r);
+        u.message = "You unlock it with the " + key + ".";
       }
       DoorLive& L = D.live[r.id];
       L = DoorLive{};
@@ -882,6 +1025,8 @@ void RegisterDoorKinds() {
       p.push_back("props.title: text");
     if (r.props.contains("locked") && !r.props["locked"].is_boolean())
       p.push_back("props.locked: true or false");
+    if (r.props.contains("loot") && !r.props["loot"].is_string())
+      p.push_back("props.loot: a loot table name (assets/loot/<name>.json)");
   };
   // props.locked: the door rule for a chest (P8, Osric's strongbox). A locked
   // chest says so and does not open -- no keys yet, exactly like a door.
@@ -893,11 +1038,12 @@ void RegisterDoorKinds() {
     return chestLocked(r) ? "Locked " + Lower(ContainerTitle(r))
                           : "Search " + Lower(ContainerTitle(r));
   };
-  box.onUse = [chestLocked](RefCtx&, const Ref& r, RefUse& u) {
+  box.onUse = [chestLocked](RefCtx& c, const Ref& r, RefUse& u) {
     if (chestLocked(r)) {
       u.message = "The " + Lower(ContainerTitle(r)) + " is locked.";
       return;
     }
+    if (c.refs != nullptr) ContainerRollLoot(*c.refs, r, c.items);
     u.openContainer = r.id;
   };
   box.useRadius = 5.0f;

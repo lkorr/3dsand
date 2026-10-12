@@ -1,0 +1,14 @@
+{
+  "about": "Something hidden in a cave by somebody who meant to come back: a vessel, a blade, a change of clothes. Dungeons D3 (src/world/loot.h).",
+  "rolls": [2, 3],
+  "rows": [
+    { "item": "flask", "weight": 3 },
+    { "item": "pouch", "weight": 2 },
+    { "item": "dagger", "weight": 2 },
+    { "item": "sword", "weight": 1 },
+    { "item": "jerkin", "weight": 2 },
+    { "item": "trousers", "weight": 2 },
+    { "item": "shoes", "weight": 1 },
+    { "weight": 2 }
+  ]
+}

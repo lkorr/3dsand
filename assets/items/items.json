@@ -191,6 +191,22 @@
         "applyCells": 4
       },
       "desc": "A drawstring leather pouch for anything that pours but is not wet: sand, ash, dust, seed. Right button to scoop, left to scatter it where you look."
+    },
+    {
+      "//": "KEYS (dungeons D3, docs/PLAN_dungeons.md 3.7): kind key = carried, never held or worn. A door whose props.lock names this key's keyId opens for whoever has it in the kit (bag or hotbar). `unlocks` names the keyId; absent = the item's own id. Art: scripts/gen_key_items.py.",
+      "id": "iron_key",
+      "kind": "key",
+      "desc": "A plain iron key. Somewhere there is a door that has been waiting for it."
+    },
+    {
+      "id": "bone_key",
+      "kind": "key",
+      "desc": "A key carved from a long bone. The crypts of the old temple were locked with these."
+    },
+    {
+      "id": "old_key",
+      "kind": "key",
+      "desc": "A heavy black key, its bit worn smooth by a century of turning."
     }
   ]
 }

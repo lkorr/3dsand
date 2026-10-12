@@ -111,6 +111,8 @@
       "movement": { "mobile": true, "rangeMin": 7, "rangeMax": 11, "bandSlack": 1.4, "approachSpeed": 1.0, "strafeSpeed": 0.5, "retreatSpeed": 0.75, "circleTendency": 0.75, "circleHoldTicks": 34, "repathTicks": 10, "navRadius": 30 },
       "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "diag_tr_bl", "thrust"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 22, "commitTicks": 10, "disengageTicks": 26, "pursueSpeed": 0.7, "leadTicks": 15 },
       "intents": {
+        "goto": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "sleep": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
         "approach": { "weight": 1.15, "cooldownTicks": 0, "minDwellTicks": 8 },
@@ -132,6 +134,8 @@
       "//attack": "aimTolerance 0.55 -> 0.95 and cadence 48 -> 40 (2026-09-19). THE CONE IS HOW FAR OFF ITS NOSE A THING MAY BE AND STILL BE ATTACKED, and a zombie is the creature with the least business being fussy about it: 0.55 rad is a 63-degree window that a target sidestepping at contact range leaves in a handful of ticks, so the cadence came up and nothing came out of it. 0.95 is most of a hemisphere in front, which is also what the bite's own lateral sweep now covers -- the two are the same claim about how wide the mouth's approach is, one at the decision and one at the stroke. The cadence comes down with it because a swing that is now allowed to be thrown is one the creature should be throwing: 40 ticks is 1.33 s between attempts, still far slower than the duelist's 34.",
       "attack": { "styles": ["bite_lunge", "bite", "horizontal_r", "horizontal_l", "overhead"], "reach": 9, "aimTolerance": 0.95, "cadenceTicks": 40, "jitterTicks": 20, "commitTicks": 14, "disengageTicks": 0, "pursueSpeed": 0.9, "leadTicks": 12 },
       "intents": {
+        "goto": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "sleep": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.5, "cooldownTicks": 0, "minDwellTicks": 4 },
         "approach": { "weight": 1.4, "cooldownTicks": 0, "minDwellTicks": 8 },
@@ -194,6 +198,8 @@
       "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "diag_tr_bl", "diag_tl_br", "diag_br_tl", "diag_bl_tr", "thrust"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 20, "commitTicks": 10, "disengageTicks": 22, "pursueSpeed": 0.7, "leadTicks": 15, "feintChance": 0.12, "feintTicks": 6, "feintFollowTicks": 10, "riposteTicks": 4 },
       "defense": { "skill": 0.55, "reactTicks": 7, "reactJitter": 6, "margin": 2.5, "guardStance": 0.25, "guardReach": 0.85, "holdTicks": 4 },
       "intents": {
+        "goto": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "sleep": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
         "approach": { "weight": 1.15, "cooldownTicks": 0, "minDwellTicks": 8 },
@@ -230,6 +236,8 @@
       "attack": { "styles": ["thrust", "thrust", "horizontal_r", "horizontal_l", "diag_tr_bl", "diag_tl_br"], "reach": 10, "aimTolerance": 0.35, "cadenceTicks": 30, "jitterTicks": 18, "commitTicks": 9, "disengageTicks": 26, "pursueSpeed": 0.75, "leadTicks": 14, "feintChance": 0.22, "feintTicks": 5, "feintFollowTicks": 9, "riposteTicks": 3 },
       "defense": { "skill": 0.65, "reactTicks": 6, "reactJitter": 5, "margin": 3.0, "guardStance": 0, "guardReach": 0.85, "holdTicks": 3 },
       "intents": {
+        "goto": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "sleep": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
         "approach": { "weight": 1.15, "cooldownTicks": 0, "minDwellTicks": 8 },
@@ -263,6 +271,8 @@
       "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "thrust"], "reach": 7, "aimTolerance": 0.5, "cadenceTicks": 26, "jitterTicks": 14, "commitTicks": 8, "disengageTicks": 8, "pursueSpeed": 0.9, "leadTicks": 12, "feintChance": 0.15, "feintTicks": 5, "feintFollowTicks": 8, "riposteTicks": 2 },
       "defense": { "skill": 0.5, "reactTicks": 5, "reactJitter": 6, "margin": 2.0, "guardStance": 0, "guardReach": 0.8, "holdTicks": 3 },
       "intents": {
+        "goto": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "sleep": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
         "approach": { "weight": 1.3, "cooldownTicks": 0, "minDwellTicks": 8 },
@@ -294,6 +304,8 @@
       "attack": { "styles": ["overhead", "horizontal_r", "horizontal_l", "diag_tr_bl", "diag_tl_br"], "reach": 9, "aimTolerance": 0.6, "cadenceTicks": 28, "jitterTicks": 12, "commitTicks": 10, "disengageTicks": 0, "pursueSpeed": 1.0, "leadTicks": 14, "feintChance": 0, "feintTicks": 6, "feintFollowTicks": 10, "riposteTicks": 2 },
       "defense": { "skill": 0.15, "reactTicks": 9, "reactJitter": 6, "margin": 2.0, "guardStance": 0, "guardReach": 0.85, "holdTicks": 3 },
       "intents": {
+        "goto": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "sleep": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.5, "cooldownTicks": 0, "minDwellTicks": 4 },
         "approach": { "weight": 1.45, "cooldownTicks": 0, "minDwellTicks": 8 },
@@ -323,6 +335,8 @@
       "attack": { "styles": ["thrust", "overhead", "horizontal_r", "horizontal_l", "diag_tr_bl"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 44, "jitterTicks": 18, "commitTicks": 10, "disengageTicks": 20, "pursueSpeed": 0.55, "leadTicks": 15, "feintChance": 0.05, "feintTicks": 6, "feintFollowTicks": 10, "riposteTicks": 2 },
       "defense": { "skill": 0.65, "reactTicks": 6, "reactJitter": 5, "margin": 3.0, "guardStance": 0.6, "guardReach": 0.9, "holdTicks": 5 },
       "intents": {
+        "goto": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "sleep": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
         "approach": { "weight": 1.1, "cooldownTicks": 0, "minDwellTicks": 8 },
@@ -383,6 +397,8 @@
       "defense": { "skill": 0.5, "reactTicks": 7, "reactJitter": 6, "margin": 2.5, "guardStance": 0.2, "guardReach": 0.85, "holdTicks": 4 },
       "cast": { "spells": ["firebolt", "firebolt", "gust"], "rangeMin": 12, "rangeMax": 44, "cadenceTicks": 120, "jitterTicks": 60, "firstDelayTicks": 30, "commitTicks": 8, "aimTolerance": 0.5, "mana": 600, "regenPerMille": 400, "maxLive": 1 },
       "intents": {
+        "goto": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "sleep": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
         "approach": { "weight": 1.15, "cooldownTicks": 0, "minDwellTicks": 8 },

@@ -119,6 +119,8 @@ const std::vector<Gate>& DialogueGates();
 const std::vector<Gate>& RefsGates();
 // NPC residents (docs/PLAN_world_editor.md P7, world/refs_npc.h).
 const std::vector<Gate>& NpcGates();
+// Dungeon entities (docs/PLAN_dungeons.md §3.7, world/refs_dungeon.h).
+const std::vector<Gate>& DungeonEntityGates();
 const std::vector<Gate>& StructureGates();
 // The in-game editor's command layer (docs/PLAN_world_editor.md P5,
 // editor/commands.h).
@@ -758,6 +760,10 @@ const char* const kOrder[] = {
     // at the origin they found on the way out).
     "npc-schedule",
     "npc-catchup",
+    // Dungeons D3: same exit contract as the npc gates (it builds a pad at
+    // absolute coordinates, runs the fixture twice from a fresh worldgen and
+    // regenerates at the origin it found on the way out).
+    "dungeon-entities",
     // Armour reactivity, right after `mob-burn` and for the same reasons: it
     // lights real fires and pours real acid at absolute coordinates, and it
     // regenerates the world on the way out so the gates after it still find
@@ -1368,7 +1374,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(), &ItemStageGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates()})
+                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &DungeonEntityGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;
