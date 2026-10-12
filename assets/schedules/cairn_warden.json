@@ -1,6 +1,6 @@
 {
   "about": "The Tarn Cairn (dungeon heather_cairn): the warden stands before the sanctum door all day, facing the way in (the marker its `post` role names).",
   "rows": [
-    { "from": "00:00", "to": "24:00", "do": "guard", "at": "post" }
+    {"from": "00:00", "to": "24:00", "do": "guard", "at": "post"}
   ]
 }

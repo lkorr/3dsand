@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "extends": "teeth_caves",
+  "name": "The Verdant Teeth (frozen)",
+  "palette": {"variant": "ice", "soil": "snow", "hang": "rime_crystal", "veg": "heath_shrub", "moss": "rime_crystal", "trim": "rime_crystal", "light": "candle_flame"},
+  "pieces": {
+    "p0": {"params": {"moisture": 0.2, "lip": 0.3}},
+    "p10": {"params": {"mushrooms": 2, "moisture": 0.2, "lightType": "crystal", "lightPower": 0.8}},
+    "p11": {"params": {"glow": 0.2, "lightType": "crystal", "lightPower": 0.7}}
+  },
+  "about": "A VARIANT (not placed on any map): the sea caves in a glacier -- ice walls, rime for moss and flowstone, snow on the beaches, crystal light instead of fungus.",
+  "refs": "refs.json"
+}

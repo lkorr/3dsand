@@ -119,7 +119,15 @@ Status GateDungeonFormat(Ctx& c, std::string& detail) {
     try { dj = nlohmann::json::parse(text); } catch (const std::exception& e) {
       djOk = check(false, who + "dungeon.json does not parse: " + e.what());
     }
-    if (djOk) {
+    if (djOk && dj.contains("extends")) {
+      // A VARIANT (D8: `extends` + overrides only): its pieces live in the base
+      // chain, resolved by compile_dungeon.mjs into the variant's own shell.
+      // Here: the base exists; the compiled shell's anchor (step b on) is
+      // what the entrance resolved to.
+      const std::string base = dj["extends"].is_string() ? dj["extends"].get<std::string>() : std::string();
+      check(!base.empty() && base != id && fs::is_regular_file(fs::path(ad) / "dungeons" / base / "dungeon.json"),
+            who + "extends \"" + base + "\", which is not a dungeon asset");
+    } else if (djOk) {
       std::set<std::string> pieces;
       for (const auto& p : dj.value("pieces", nlohmann::json::array()))
         if (p.is_object() && p.contains("id") && p["id"].is_string()) pieces.insert(p["id"].get<std::string>());

@@ -1,48 +1,47 @@
-/* dungeon_heather_cairn.mjs — THE TARN CAIRN (map `default`, dungeon
- * `heather_cairn`), package D7 of docs/PLAN_dungeons.md: the example RUIN
- * dungeon, authored THROUGH THE TOOLS -- the same dungeongen.js API the
- * tuner's Dungeons tab calls (newPiece / attachPiece / validate / compile)
- * and the same refs.json writer (ui_entities.js writeRefs), so opening
+/* build.mjs — THE TARN CAIRN (dungeon `heather_cairn`), package D7 of
+ * docs/PLAN_dungeons.md and the D8 variety pass: the example RUIN dungeon,
+ * authored THROUGH THE TOOLS -- the same dungeongen.js API the tuner's
+ * Dungeons tab calls (newPiece / attachPiece / validate / compile) and the
+ * same refs.json writer (ui_entities.js writeRefs), so opening
  * assets/dungeons/heather_cairn/ in the tab shows exactly this.
  *
- *   node assets/worldmap/default/scripts/dungeon_heather_cairn.mjs            write + validate
- *   node assets/worldmap/default/scripts/dungeon_heather_cairn.mjs --dry      validate only
- *   node assets/worldmap/default/scripts/dungeon_heather_cairn.mjs --hm <f>   ground check against
- *        a `sandvox --heightmap` file (the tab's in-world check reads the same numbers)
+ *   node assets/dungeons/heather_cairn/build.mjs          write + validate (map-free)
+ *   node assets/dungeons/heather_cairn/build.mjs --dry    validate only
  *
- * THE STORY. Heatherhigh's Tarn Way climbs the moor in a sunken hollow way
- * and ends, blind, at the head of its cutting. There a broken colonnade
- * stands round a stairwell, a cairn heaped by later hands on the paving
- * beside it. The stair goes down ten metres into the saddle to a narthex
- * under a low dome. East, into the ridge: the long columned hall, its far
- * half fallen in. South of the hall the crypt galleries (bone niches, the
- * walking dead) and the noble tomb where the bone key lies on a sarcophagus.
- * West of the narthex, a robbed side chapel. Past the hall's ruined end a
- * switchback goes down to the second level: the drowned cistern, the pit
- * room whose bridge gives way under a pressure plate, and the sanctum behind
- * the bone-key door, watched by its warden.
+ * MAP-FREE. Its home placement (the default map: the head of Heatherhigh's
+ * Tarn Way cutting, where the road cuts 14.7 m into the hill) is made and
+ * ground-checked by scripts/place_dungeon.mjs ("Portability" in
+ * docs/PLAN_dungeons.md):
+ *   node scripts/place_dungeon.mjs --map default --dungeon heather_cairn --at -56045,-33555 --yaw 180 --yOffset -147 --ground-y 5053 --write
+ * (--ground-y: the road's cutting lowers the terrain column the heightmap
+ * reports; placement is relative to the BARE ground there.) The sliders tuned
+ * to that ground -- the ones a new map adjusts -- are the entrance's
+ * `apronHeight` (how high the paving is cleared: low in a sunken way) and its
+ * cairn (`cairnLift`, `cairnZ`: the cairn stands on the brow above the stair),
+ * plus the narthex oculus's `keyHeight`:
+ *   node scripts/place_dungeon.mjs ... --set p0.apronHeight=6 --set p0.cairnLift=0 --as heather_cairn_hill
+ *
+ * THE STORY. A hollow way climbs the moor and ends, blind, at the head of its
+ * cutting. There a broken colonnade stands round a stairwell, a cairn heaped
+ * by later hands on the brow above it. The stair goes down ten metres to a
+ * narthex under a low dome, a ring of daylight falling through its oculus.
+ * East, into the ridge: the long columned hall, its floor heaved, a wall
+ * fallen in, its far half caved. South of the hall the crypt galleries (bone
+ * niches, smashed and robbed, the walking dead) and the noble tomb where the
+ * bone key lies on a sarcophagus. West of the narthex, a robbed side chapel.
+ * Past the hall's ruined end a stair goes down to the second level: the
+ * drowned cistern of leaning columns, the pit room whose bridge gives way
+ * under a pressure plate, and the sanctum behind the bone-key door, watched
+ * by its warden.
  *
  * Every number is a slider a person could have set in the tab; the layout is
  * explicit (no grow), seeds are the derived ones unless a reroll was kept.
  */
-import * as G from '../../../editor/dungeon/dungeongen.js';
-import * as E from '../../../editor/dungeon/ui_entities.js';
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { G, MATS, writeSchedules, writeDungeon, report, adoptWaynodes } from '../../../scripts/dungeon_build_lib.mjs';
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const ASSETS = join(HERE, '..', '..', '..');
 const ID = 'heather_cairn';
-const OUT = join(ASSETS, 'dungeons', ID);
 const args = process.argv.slice(2);
 const DRY = args.includes('--dry');
-const hmArg = args.indexOf('--hm') >= 0 ? args[args.indexOf('--hm') + 1] : null;
-
-// The placement (map.json dungeons[]): the head of the Tarn Way's cutting.
-// yOffset: the anchor is the BARE ground (the hill before the road cut it),
-// 14.7 m above the cutting's floor here; the ruin stands on the road.
-export const PLACE = {id: ID, name: 'The Tarn Cairn', dungeon: ID, at: [-56045, -33555], yOffset: -147, yaw: 180};
 
 let d = G.newDungeon({name: 'The Tarn Cairn', style: 'ruins', seed: 51336});
 // The temple palette, moorland-dressed: heather, not ivy, on the paving; a
@@ -50,61 +49,76 @@ let d = G.newDungeon({name: 'The Tarn Cairn', style: 'ruins', seed: 51336});
 d.palette = {variant: 'temple', veg: 'heather', tile2: 'basalt', moss: 'old_moss'};
 
 const at = (ref, spec) => { d = G.attachPiece(d, ref, Object.assign({fit: true, checkOverlap: true}, spec)).dungeon; return d.pieces[d.pieces.length - 1].id; };
+// Lights that carry: a brazier with a full bowl, candles that make a vigil's glow.
+const LIT = {lightPower: 0.7};
 
 // ---- level 0: the surface ruin -------------------------------------------------
 d.pieces.push(G.newPiece(d, {kit: 'ruins', type: 'ruin_entrance', params: {
   width: 3.2, height: 3.2, drop: 12, pitch: 0.55, stepHeight: 0.22, foot: 2.5,
   platform: 2.5, apronHeight: 2.2, columns: 3, columnHeight: 5.2, columnStyle: 'fluted', lintels: true, toppled: 2,
-  parapet: 0.7, overgrowth: 0.7, decay: 0.6, moisture: 0.4, lightCount: 2, lightType: 'brazier', asym: 0.5,
+  parapet: 0.7, overgrowth: 0.7, decay: 0.6, moisture: 0.4, lightCount: 2, lightType: 'brazier', asym: 0.5, jitter: 0.7, lightPower: 0.6,
   // the cairn stands on the brow of the saddle, above the stair's head: seen from the Tarn Way
   cairn: 3.3, cairnRadius: 2.9, cairnX: -1.5, cairnZ: 18, cairnLift: 11.4, cairnStone: 'mixed'}}));
 d.entrance = {piece: 'p0', socket: 'surface'};
 
 // ---- level 1 -------------------------------------------------------------------
-const narthex = at({piece: 'p0', socket: 'in'}, {kit: 'ruins', type: 'hall', params: {
+const narthex = at({piece: 'p0', socket: 'in'}, {kit: 'ruins', type: 'hall', params: Object.assign({
   width: 9, length: 8, height: 4.2, ceiling: 3.2, vault: 'dome', columnRows: '0', dais: false, banners: 0,
-  tilePattern: 'runner', exits: 'sides', decay: 0.35, moisture: 0.3, lightCount: 2, lightType: 'candles', doorWidth: 3.2, doorHeight: 3.2}});
+  tilePattern: 'runner', settle: 0.45, jitter: 0.5,
+  keyLight: 'shaft', keySize: 0.6, keyHeight: 20, keyAt: 0.55,
+  exits: 'sides', decay: 0.35, moisture: 0.3, lightCount: 2, lightType: 'candles', doorWidth: 3.2, doorHeight: 3.2}, LIT)});
 
-const hall = at({piece: narthex, socket: 'left'}, {kit: 'ruins', type: 'hall', params: {
+const hall = at({piece: narthex, socket: 'left'}, {kit: 'ruins', type: 'hall', params: Object.assign({
   width: 13, length: 34, height: 6.5, ceiling: 3.5, vault: 'groin', columnRows: '2', columnCount: 6, columnRadius: 0.55,
   columnStyle: 'fluted', aisleWidth: 6.5, dais: false, banners: 3, niches: true, tilePattern: 'border',
-  collapse: 0.6, collapseFocus: 0.6, collapseAt: 0.8, fallCavity: 2.5, exits: 'through+left', decay: 0.65, moisture: 0.35, lightCount: 7, lightType: 'brazier', asym: 0.4}});
+  collapse: 0.6, collapseFocus: 0.6, collapseAt: 0.8, fallCavity: 2.5, exits: 'through+left',
+  settle: 0.65, breach: 0.55, jitter: 0.75, bays: 1, bayDepth: 2.4,
+  keyLight: 'fire', keySize: 0.45, keyAt: 0.08, keySide: 0,
+  decay: 0.65, moisture: 0.35, lightCount: 7, lightDensity: 0.2, lightType: 'brazier', asym: 0.4}, LIT)});
 
-// crypt wing off the hall's right side
+// crypt wing off the hall's side: a bent, settled passage, a flight lower
 const cryptCorr = at({piece: hall, socket: 'left'}, {kit: 'ruins', type: 'corridor', params: {
   width: 2.2, length: 9, height: 2.6, profile: 'pointed', archSpacing: 1.8, ribDepth: 2, alcoves: 0.7, pairAlcoves: false,
+  wander: 0.8, wanderWave: 10, jitter: 0.6, settle: 0.5, slope: -0.5, slopeSteps: 0,
   tilePattern: 'plain', decay: 0.55, moisture: 0.45, lightCount: 0, lightType: 'none'}});
 // the crypts lie a flight lower than the hall: a steep, narrow, worn stair
 const cryptStair = at({piece: cryptCorr, socket: 'out'}, {kit: 'ruins', type: 'stair', params: {
-  kind: 'straight', direction: 'down', width: 2, height: 2.6, rise: 2.4, pitch: 0.8, stepHeight: 0.3, landing: 0.8, decay: 0.7, moisture: 0.5, lightCount: 0, lightType: 'none'}});
+  kind: 'straight', direction: 'down', width: 2, height: 2.6, rise: 1.9, pitch: 0.8, stepHeight: 0.3, landing: 0.8, decay: 0.7, moisture: 0.5, lightCount: 0, lightType: 'none'}});
 const gallery = at({piece: cryptStair, socket: 'out'}, {kit: 'ruins', type: 'crypt', preset: 'bone_gallery', params: {
   width: 3.2, length: 22, height: 3.4, ceiling: 1.2, tiers: 4, nicheCols: 9, nicheWidth: 1.1, nicheHeight: 0.5,
-  filled: 0.75, ossuary: 0.7, guardians: false, exits: 'through', lightCount: 0, lightType: 'none', decay: 0.55, moisture: 0.5}});
-const tomb = at({piece: gallery, socket: 'out'}, {kit: 'ruins', type: 'crypt', preset: 'noble_tomb', params: {
+  filled: 0.75, ossuary: 0.7, guardians: false, exits: 'through', jitter: 0.8, settle: 0.45, breach: 0.3,
+  lightCount: 0, lightType: 'none', decay: 0.55, moisture: 0.5}});
+const tomb = at({piece: gallery, socket: 'out'}, {kit: 'ruins', type: 'crypt', preset: 'noble_tomb', params: Object.assign({
   width: 8, length: 9, height: 3.4, ceiling: 2.6, tiers: 1, nicheCols: 3, nicheWidth: 2, sarcophagi: 3, ossuary: 0.1,
-  keyNiche: true, exits: 'dead end', lightCount: 1, lightType: 'candles', decay: 0.3}});
+  keyNiche: true, exits: 'dead end', settle: 0.3, bays: 1, bayDepth: 1.8, jitter: 0.4,
+  lightCount: 1, lightType: 'candles', decay: 0.3}, LIT)});
 
-// west of the narthex: a robbed side chapel
+// west of the narthex: a robbed side chapel, through a passage that has sagged
 const westCorr = at({piece: narthex, socket: 'right'}, {kit: 'ruins', type: 'collapsed_passage', params: {
-  width: 2.6, length: 8, height: 2.8, falls: 1, blockage: 0.35, blocks: 3, cracks: 0.7, cavity: 1.2}});
+  width: 2.6, length: 8, height: 2.8, falls: 1, blockage: 0.35, blocks: 3, cracks: 0.7, cavity: 1.2, widthVar: 0.3, heightVar: 0.3}});
 const chapel = at({piece: westCorr, socket: 'out'}, {kit: 'ruins', type: 'crypt', preset: 'plundered', params: {
-  width: 5, length: 6, height: 3, ceiling: 1.8, tiers: 2, nicheCols: 3, sarcophagi: 1, exits: 'dead end', lightCount: 0, lightType: 'none'}});
+  width: 5, length: 6, height: 3, ceiling: 1.8, tiers: 2, nicheCols: 3, sarcophagi: 1, exits: 'dead end',
+  settle: 0.75, breach: 0.5, jitter: 0.8, lightCount: 0, lightType: 'none'}});
 
 // ---- level 2: down from the hall's fallen end -----------------------------------
 const fall = at({piece: hall, socket: 'out'}, {kit: 'ruins', type: 'collapsed_passage', params: {
-  width: 2.8, length: 10, height: 3, falls: 2, blockage: 0.4, blocks: 5, cracks: 0.6, cavity: 2}});
-const down = at({piece: fall, socket: 'out'}, {kit: 'ruins', type: 'stair', params: {
-  kind: 'straight', direction: 'down', width: 2.6, height: 3, rise: 9, pitch: 0.6, landing: 1.5, stepHeight: 0.24, lightCount: 1, lightType: 'candles', decay: 0.5}});
-const cistern = at({piece: down, socket: 'out'}, {kit: 'ruins', type: 'flooded_hall', preset: 'cistern', params: {
+  width: 2.8, length: 10, height: 3, falls: 2, blockage: 0.4, blocks: 5, cracks: 0.6, cavity: 2, widthVar: 0.25, heightVar: 0.35}});
+const down = at({piece: fall, socket: 'out'}, {kit: 'ruins', type: 'stair', params: Object.assign({
+  kind: 'straight', direction: 'down', width: 2.6, height: 3, rise: 9, pitch: 0.6, landing: 1.5, stepHeight: 0.24, lightCount: 1, lightType: 'candles', decay: 0.5}, LIT)});
+const cistern = at({piece: down, socket: 'out'}, {kit: 'ruins', type: 'flooded_hall', preset: 'cistern', params: Object.assign({
   width: 14, length: 20, height: 5, ceiling: 2.5, columnCount: 4, sunk: 2.2, waterLevel: 0.9, columnStyle: 'square',
-  exits: 'left', lightCount: 5, lightType: 'crystal', warmth: 0.3, decay: 0.5, moisture: 0.9}});
-const pit = at({piece: cistern, socket: 'left'}, {kit: 'ruins', type: 'pit_room', params: {
+  jitter: 0.75, breach: 0.35,
+  exits: 'left', lightCount: 5, lightType: 'crystal', warmth: 0.3, decay: 0.5, moisture: 0.9}, LIT)});
+const pit = at({piece: cistern, socket: 'left'}, {kit: 'ruins', type: 'pit_room', params: Object.assign({
   width: 11, length: 13, height: 6, ceiling: 2, pitWidth: 0.6, pitLength: 0.62, pitDepth: 7, ledge: 1.4,
-  bridge: 'stone', bridgeWidth: 1.6, lightCount: 4, lightType: 'brazier'}});
-const approach = at({piece: pit, socket: 'out'}, {kit: 'ruins', type: 'corridor', preset: 'wide_gallery', params: {
-  width: 3.2, length: 10, height: 3.6, ceiling: 1.6, archSpacing: 3.2, alcoves: 0.6, pairAlcoves: true, lightCount: 4, lightType: 'brazier', tilePattern: 'runner'}});
-const sanctum = at({piece: approach, socket: 'out'}, {kit: 'ruins', type: 'sanctum', preset: 'great_sanctum', params: {
-  width: 14, length: 14, height: 7, ceiling: 6, pillarRing: 8, statues: 4, braziers: 4, tilePattern: 'border', lightCount: 6, decay: 0.3}});
+  bridge: 'stone', bridgeWidth: 1.6, bays: 1, bayDepth: 1.5, lightCount: 4, lightType: 'brazier'}, LIT)});
+const approach = at({piece: pit, socket: 'out'}, {kit: 'ruins', type: 'corridor', preset: 'wide_gallery', params: Object.assign({
+  width: 3.2, length: 10, height: 3.6, ceiling: 1.6, archSpacing: 3.2, alcoves: 0.6, pairAlcoves: true,
+  wander: 1.0, wanderWave: 12, jitter: 0.5, settle: 0.3,
+  lightCount: 4, lightType: 'brazier', tilePattern: 'runner'}, LIT)});
+const sanctum = at({piece: approach, socket: 'out'}, {kit: 'ruins', type: 'sanctum', preset: 'great_sanctum', params: Object.assign({
+  width: 14, length: 14, height: 7, ceiling: 6, pillarRing: 8, statues: 4, braziers: 4, tilePattern: 'border', jitter: 0.5, settle: 0.25,
+  lightCount: 6, decay: 0.3}, LIT)});
 
 // ---- hand-placed props (the Props palette) -------------------------------------
 // Everything below is in the DUNGEON frame = the anchor frame (the entrance
@@ -135,11 +149,11 @@ prop('ruins/door', {width: DW, height: DH, thickness: 2, style: 'iron_bound', st
 const rc = rotCell(doorYaw / 90, 0, 0);
 const doorRefPos = [doorOrigin[0] + rc[0], doorOrigin[1], doorOrigin[2] + rc[1]];
 
-// LIGHT AND DRESSING by hand (the pieces' own light sliders place the small
-// wall braziers; these are the author's): great braziers where the story
-// wants the eye, candles where someone still keeps a vigil. Positions are in
-// each piece's own frame (origin socket at 0,0,0, body along +Z) and carried
-// into the dungeon frame by the piece's transform, as the tab does.
+// LIGHT AND DRESSING by hand (the pieces' own light sliders place the wall
+// braziers; these are the author's): great braziers where the story wants the
+// eye, candles where someone still keeps a vigil. Positions are in each
+// piece's own frame (origin socket at 0,0,0, body along +Z) and carried into
+// the dungeon frame by the piece's transform, as the tab does.
 const inPiece = (id, c, yaw) => {
   const pc = d.pieces.find(p => p.id === id), qq = (pc.yaw / 90) & 3;
   const r = rotCell(qq, c[0], c[2]);
@@ -147,13 +161,12 @@ const inPiece = (id, c, yaw) => {
 };
 const lightAt = (id, propId, params, c, yaw) => { const t = inPiece(id, c, yaw); return prop(propId, params, t.pos, t.yaw, id); };
 // the sanctum: four great braziers down the nave of the pillar ring, a vigil at the dais
-for (const z of [55, 115]) for (const s of [-1, 1]) lightAt(sanctum, 'ruins/brazier', {height: 1.5, bowl: 0.7, style: 'stone'}, [s * 46, 0, z]);
-for (const s of [-1, 1]) lightAt(sanctum, 'ruins/candle_cluster', {count: 14, spread: 0.6, tallest: 0.4}, [s * 22, 9, 178]);
-// the hall: two great braziers inside its door, a pair of tripods halfway down the aisle
-for (const s of [-1, 1]) lightAt(hall, 'ruins/brazier', {height: 1.4, bowl: 0.65}, [s * 20, 0, 26]);
-for (const s of [-1, 1]) lightAt(hall, 'ruins/brazier', {style: 'iron', height: 1.1, bowl: 0.5}, [s * 22, 0, 150]);
+for (const z of [55, 115]) for (const s of [-1, 1]) lightAt(sanctum, 'ruins/brazier', {height: 1.5, bowl: 0.7, style: 'stone', fire: 0.9}, [s * 46, 0, z]);
+for (const s of [-1, 1]) lightAt(sanctum, 'ruins/candle_cluster', {count: 14, spread: 0.6, tallest: 0.4, flame: 0.8}, [s * 22, 9, 178]);
+// the hall: a pair of tripods halfway down the aisle (the fire burns inside its door)
+for (const s of [-1, 1]) lightAt(hall, 'ruins/brazier', {style: 'iron', height: 1.1, bowl: 0.5, fire: 0.8}, [s * 22, 0, 150]);
 // the narthex: votive candles either side of the crossing
-for (const s of [-1, 1]) lightAt(narthex, 'ruins/candle_cluster', {count: 9, spread: 0.45}, [s * 36, 0, 30]);
+for (const s of [-1, 1]) lightAt(narthex, 'ruins/candle_cluster', {count: 9, spread: 0.45, flame: 0.6}, [s * 36, 0, 30]);
 // the narthex: a weathered colossus against the far wall, the first thing the stair shows you
 lightAt(narthex, 'ruins/statue', {height: 3.4, pose: 'arms_raised', plinth: 0.6, weathering: 0.6}, [0, 0, 80], 180);
 // the court: one column snapped at head height, its drums across the paving
@@ -161,7 +174,7 @@ lightAt('p0', 'ruins/broken_column', {radius: 0.35, stump: 2.1, drums: 2, fluted
 // the pit: what the bridge has already taken
 lightAt(pit, 'ruins/bones', {}, [6, -70, 80], 30);
 // the noble tomb: stub candles beside the sarcophagus that holds the key
-lightAt(tomb, 'ruins/candle_cluster', {count: 4, tallest: 0.12, spread: 0.2}, [-18, 0, 55]);
+lightAt(tomb, 'ruins/candle_cluster', {count: 4, tallest: 0.12, spread: 0.2, flame: 0.5}, [-18, 0, 55]);
 
 // ---- entities (refs.json) ------------------------------------------------------
 const refs = [];
@@ -169,11 +182,7 @@ const ref = (name, kind, pos, yaw, props, base) => { const r = {name, kind, pos:
 const progNow = G.compile(d, {id: ID});
 const sug = (id) => { const r = progNow.refs.find(x => x.id === id); if (!r) throw new Error('no suggestion ' + id); return r; };
 // Waynodes (the tab's "Adopt waynodes": wn_<piece>_<node>) -- patrol routes name them.
-const wn = (n) => 'wn_' + n.replace(/\//g, '_');
-for (const w of progNow.waynodes) {
-  if (w.pit) continue;
-  ref(wn(w.name), 'waynode', w.pos, 0, {links: w.links.filter(l => !progNow.waynodes.find(o => o.name === l && o.pit)).map(wn)});
-}
+const wn = adoptWaynodes(progNow, ref);
 // The sanctum door, locked with the bone key.
 ref('sanctum_door', 'door', doorRefPos, doorYaw, {width: DW, height: DH, thickness: 2, hinge: 'left', lock: 'bone_key', openAngle: 100});
 // The key: in the noble tomb, lying on the middle sarcophagus's effigy.
@@ -227,69 +236,18 @@ ref('hall_watch', 'npc', progNow.waynodes.find(w => w.name === hallNodes[1]).pos
   ref('bridge_plate', 'plate', mid.pos, 0, {size: mid.size, latch: true, who: 'any'});
   ref('bridge_collapse', 'trap', span.pos, 0, {type: 'collapse_floor', on: 'bridge_plate', region: 'bridge_span'});
 }
-d.refs = 'refs.json';
 
-// ---- report ----------------------------------------------------------------------
-const MATS = JSON.parse(readFileSync(join(ASSETS, 'materials', 'materials.json'), 'utf8')).materials.map(m => m.id);
-const prog = G.compile(d, {id: ID, materials: MATS});
-for (const e of prog.errors) console.log('COMPILE ERROR', e.piece, e.msg);
-const q = Math.round(PLACE.yaw / 90) & 3;
-const rot = (x, z) => [[x, z], [z, -x], [-x, -z], [-z, x]][q];
-const toWorld = (p) => { const [x, z] = rot(p[0], p[2]); return [PLACE.at[0] + x, p[1], PLACE.at[1] + z]; };
-for (const pc of prog.pieces) {
-  const a = toWorld(pc.bounds.min), b = toWorld(pc.bounds.max);
-  console.log(pc.id.padEnd(4), pc.type.padEnd(18), 'y', pc.bounds.min[1], '..', pc.bounds.max[1], ' world x', Math.min(a[0], b[0]), '..', Math.max(a[0], b[0]), ' z', Math.min(a[2], b[2]), '..', Math.max(a[2], b[2]));
-}
-const B = prog.bounds;
-console.log('bounds', JSON.stringify(B), 'extent m', [0, 1, 2].map(i => ((B.max[i] - B.min[i]) / 10).toFixed(1)).join(' x '));
-console.log('prims', prog.prims.length, 'instances', prog.props.instances.length, 'worst cell', JSON.stringify(prog.limits), 'refs', refs.length);
-
-// Ground (anchor frame), from a `sandvox --heightmap` file.
-let groundAt = null, waterAt = null;
-if (hmArg && existsSync(hmArg)) {
-  const buf = readFileSync(hmArg), dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const n = dv.getUint32(8, true), span = dv.getUint32(12, true), cx = dv.getInt32(16, true), cz = dv.getInt32(20, true);
-  const hAt = (wx, wz) => {
-    const i = Math.floor((wx - (cx - span / 2)) / span * n), j = Math.floor((wz - (cz - span / 2)) / span * n);
-    if (i < 0 || j < 0 || i >= n || j >= n) return null;
-    const o = 48 + (j * n + i) * 8;
-    return {g: dv.getInt32(o, true), w: dv.getInt16(o + 4, true)};
-  };
-  const bare = args.indexOf('--bare') >= 0 ? Number(args[args.indexOf('--bare') + 1]) : 5053;
-  const Y0 = bare + PLACE.yOffset;
-  groundAt = (x, z) => { const w = toWorld([x + 0.5, 0, z + 0.5]); const r = hAt(w[0], w[2]); return r ? r.g - Y0 : Infinity; };
-  waterAt = (x, z) => { const w = toWorld([x + 0.5, 0, z + 0.5]); const r = hAt(w[0], w[2]); return r && r.w !== -32768 ? r.g + r.w - Y0 : null; };
-  for (const pc of prog.pieces) {
-    if (pc.surface) continue;
-    let worst = Infinity;
-    for (let x = pc.bounds.min[0]; x <= pc.bounds.max[0]; x += 8) for (let z = pc.bounds.min[2]; z <= pc.bounds.max[2]; z += 8) worst = Math.min(worst, groundAt(x, z) - pc.bounds.max[1]);
-    console.log('  cover (box top)', pc.id, pc.type, (worst / 10).toFixed(1), 'm');
-  }
-}
-const cat = {keys: [{id: 'bone_key', unlocks: 'bone_key'}, {id: 'iron_key', unlocks: 'iron_key'}, {id: 'old_key', unlocks: 'old_key'}]};
-const issues = G.validate(d, {materials: MATS, groundAt, waterAt, refs: E.forValidate(refs, cat), keyItems: cat.keys})
-  .concat(E.refProblems(refs, null, new Set(prog.waynodes.map(w => w.name))));
-for (const v of issues) if (v.severity !== 'info') console.log(v.severity.padEnd(5), v.code.padEnd(11), String(v.piece || v.ref || '-').padEnd(5), v.msg);
-console.log('validation:', issues.filter(v => v.severity === 'error').length, 'errors,', issues.filter(v => v.severity === 'warn').length, 'warnings');
-
+// ---- outputs ---------------------------------------------------------------------
 const SCHEDULES = {
   cairn_warden: {about: 'The Tarn Cairn (dungeon heather_cairn): the warden stands before the sanctum door all day, facing the way in (the marker its `post` role names).',
                  rows: [{from: '00:00', to: '24:00', do: 'guard', at: 'post'}]},
   cairn_hall_watch: {about: 'The Tarn Cairn (dungeon heather_cairn): one of the dead walking the columned hall, door to the fallen end and back.',
                      rows: [{from: '00:00', to: '24:00', do: 'patrol', route, mode: 'pingpong', wait: 3}]}
 };
-if (!DRY) {
-  mkdirSync(OUT, {recursive: true});
-  const text = G.dungeonJsonText(d);
-  writeFileSync(join(OUT, 'dungeon.json'), text);
-  const p2 = G.compile(JSON.parse(text), {id: ID, sourceText: text, materials: MATS});
-  writeFileSync(join(OUT, 'shell.json'), G.emitShellJson(p2));
-  writeFileSync(join(OUT, 'shell.bin'), G.emitShellBin(p2));
-  writeFileSync(join(OUT, 'refs.json'), E.writeRefs(ID, 'The Tarn Cairn: built by assets/worldmap/default/scripts/dungeon_heather_cairn.mjs (edit there or in the Dungeons tab).', refs));
-  const J = JSON.stringify;
-  for (const [n, sc] of Object.entries(SCHEDULES))
-    writeFileSync(join(ASSETS, 'schedules', n + '.json'), '{\n  "about": ' + J(sc.about) + ',\n  "rows": [\n' +
-      sc.rows.map(r => '    ' + J(r).replace(/,"/g, ', "').replace(/":/g, '": ').replace(/^\{/, '{ ').replace(/\}$/, ' }')).join(',\n') + '\n  ]\n}\n');
-  console.log('wrote', OUT);
+if (DRY) {
+  d.refs = 'refs.json';
+  process.exit(report(ID, d, refs, G.compile(d, {id: ID, materials: MATS})) ? 1 : 0);
 }
-export { d, prog, refs };
+writeSchedules(SCHEDULES);
+const prog = writeDungeon(ID, d, refs, 'The Tarn Cairn: built by assets/dungeons/heather_cairn/build.mjs (edit there or in the Dungeons tab).');
+process.exit(report(ID, d, refs, prog) ? 1 : 0);

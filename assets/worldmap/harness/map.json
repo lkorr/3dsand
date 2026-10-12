@@ -154,6 +154,33 @@
       "yOffset": 0,
       "yaw": 90,
       "about": "PORTABILITY (D9): the second placement of heather_cairn (see heather_cairn)."
+    },
+    {
+      "id": "teeth_caves_ice",
+      "name": "The Verdant Teeth, ice variant (portability)",
+      "dungeon": "teeth_caves_ice",
+      "at": [-6000, -8000],
+      "yOffset": 0,
+      "yaw": 90,
+      "about": "PORTABILITY (D9): D8's VARIANT assets (extends) are placed too, so dungeon-gen runs their compiled shells in place."
+    },
+    {
+      "id": "shardwell_flooded",
+      "name": "The Shardwell, flooded variant (portability)",
+      "dungeon": "shardwell_flooded",
+      "at": [-1500, -9500],
+      "yOffset": 0,
+      "yaw": 0,
+      "about": "PORTABILITY (D9): see teeth_caves_ice."
+    },
+    {
+      "id": "heather_cairn_overgrown",
+      "name": "The Tarn Cairn, overgrown variant (portability)",
+      "dungeon": "heather_cairn_overgrown",
+      "at": [3000, -8000],
+      "yOffset": 0,
+      "yaw": 270,
+      "about": "PORTABILITY (D9): see teeth_caves_ice."
     }
   ]
 }

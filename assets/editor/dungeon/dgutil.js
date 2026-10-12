@@ -260,8 +260,9 @@ export const LIGHT_TYPES = ['none', 'torch', 'lantern', 'candles', 'brazier', 'c
  * to null drops that row (a shaft has no "length", say). `u` overrides the
  * defaults of the other universal rows; `lights` is the kit's light list.
  */
-export function universalSchema(size, u, lights) {
+export function universalSchema(size, u, lights, flags) {
   u = u || {};
+  flags = flags || {};
   const S = (k, n, d, base) => {
     const o = size && size[k];
     if (o === null) return null;
@@ -277,15 +278,37 @@ export function universalSchema(size, u, lights) {
     {k: 'floorUneven', n: 'floor unevenness', min: 0, max: 1, step: 0.05, def: 0.2, d: 'Bumps in the floor slab (noise amplitude, scaled by the kit).'},
     {k: 'wallRough', n: 'wall roughness', min: 0, max: 1, step: 0.05, def: 0.3, d: 'Noise amplitude on carved walls, scaled by the kit (caves rough, ruins dressed).'},
     {k: 'wallScale', n: 'roughness scale (m)', min: 0.3, max: 8, step: 0.1, def: 1.5, d: 'Feature size of the wall noise.'},
+    // VARIETY (D8): what breaks the "connected blocks" look. Every row at its
+    // default is the regular piece the kit drew before these rows existed.
+    {sec: 'Variety', note: 'Break the kit look. Every row at 0 is the regular piece. The sockets stay where they are (wander is zero, with zero slope, at both ends), except slope, which lifts the far ones.'},
+    flags.passage ? {k: 'wander', n: 'wander (m)', min: 0, max: 8, step: 0.1, def: 0, d: 'Sideways S-curve of the passage centreline: the passage bends and comes back. Zero at both ends, so it still snaps.'} : null,
+    flags.passage ? {k: 'wanderWave', n: 'wander wavelength (m)', min: 4, max: 60, step: 0.5, def: 16, d: 'Length of one full bend of the wander (two harmonics, so it never repeats exactly).'} : null,
+    flags.slope ? {k: 'slope', n: 'slope (m)', min: -8, max: 8, step: 0.1, def: 0, d: 'Height gained from the origin socket to the far end (negative = falls). The far sockets move with the floor.'} : null,
+    flags.slope ? {k: 'slopeSteps', n: 'slope steps', min: 0, max: 8, step: 1, int: true, def: 0, d: '0 = a smooth grade; n = the slope is taken in n steps (terraces, a worn stair in a passage).'} : null,
+    {k: 'widthVar', n: 'width variation', min: 0, max: 0.6, step: 0.05, def: 0, d: 'The space swells and narrows along its length (fraction of the width). The ends keep the socket size.'},
+    {k: 'heightVar', n: 'height variation', min: 0, max: 0.6, step: 0.05, def: 0, d: 'The roof rises and dips along the length (fraction of the height).'},
+    {k: 'jitter', n: 'irregularity', min: 0, max: 1, step: 0.05, def: 0, d: 'Uneven spacing of repeated things (timber sets, ribs, columns, niches) and per-element lean, sag, breaks and missing ones.'},
+    flags.room ? {k: 'bays', n: 'side bays', min: 0, max: 6, step: 1, int: true, def: 0, d: 'Alcoves / side bays cut into the walls at irregular places: the room is no longer a box.'} : null,
+    flags.room ? {k: 'bayDepth', n: 'bay depth (m)', min: 0.5, max: 8, step: 0.1, def: 2, d: 'How far a side bay goes back into the rock (each is 60-140% of it).'} : null,
+    flags.room ? {k: 'lobe', n: 'offset lobe', min: 0, max: 1, step: 0.05, def: 0, d: 'One side of the room bulges out into a second, offset space (a side chamber, a transept, a worked-out pocket). 0 = none.'} : null,
     {sec: 'Age', note: 'Decay and moisture are applied by the core to every piece the same way, plus whatever the kit does with them.'},
     {k: 'decay', n: 'decay / age', min: 0, max: 1, step: 0.05, def: 0.25, d: 'Rubble on floors, broken trim and supports, collapsed corners.'},
     {k: 'moisture', n: 'moisture', min: 0, max: 1, step: 0.05, def: 0.2, d: 'Moss on walls and ceilings, puddles in floor dips.'},
     {k: 'deco', n: 'deco density', min: 0, max: 1, step: 0.05, def: 0.5, d: 'How much of the suggested furniture and clutter is placed.'},
-    {sec: 'Light', note: 'Underground is dark; a light is an emissive voxel. Count is clamped to the mount points the piece offers.'},
+    {sec: 'Light', note: 'Underground is dark; a light is an emissive voxel. Light spreads through the irradiance grid in 0.4 m blocks: a glowing SURFACE a block or more across lights a room, a one-voxel flame barely lights its bracket. Count is clamped to the mount points the piece offers.'},
     {k: 'lightCount', n: 'lights', min: 0, max: 16, step: 1, int: true, def: 2, d: 'Number of lights placed at the piece\'s mount points.'},
     {k: 'lightType', n: 'light type', kind: 'enum', options: lights || LIGHT_TYPES, def: lights ? lights[0] : 'torch',
      d: 'torch = a bracket and a flame; lantern / candles / brazier = props; crystal = an emissive crystal lump; fungus = glowcaps.'},
     {k: 'warmth', n: 'light warmth', min: 0, max: 1, step: 0.05, def: 0.8, d: 'Chance each light uses the warm light material (else the cool one).'},
+    {k: 'lightPower', n: 'light power', min: 0, max: 1, step: 0.05, def: 0, d: 'Size of each light: 0 = the small flame / lamp / lump; 1 = a torch fire 0.4 m across, a lamp with a big flame, a full fire bowl, a crystal lump a metre across. Bigger glowing surfaces carry further.'},
+    {k: 'lightDensity', n: 'light density', min: 0, max: 1, step: 0.05, def: 0, d: 'Adds lights by floor area so a big room is lit like a small one (1 = about one light per 25 m2). 0 = exactly the light count.'},
+    flags.room ? {sec: 'Key light', note: 'One strong light that makes a big space readable.'} : null,
+    flags.room ? {k: 'keyLight', n: 'key light', kind: 'enum', options: ['none', 'shaft', 'fire', 'crystals'], def: 'none',
+                  d: 'shaft = a light shaft up through the roof to the sky (set its height so it reaches the ground: the piece then opens at the surface); fire = a big fire in a ring of stones; crystals = a cluster of big glowing crystals.'} : null,
+    flags.room ? {k: 'keySize', n: 'key light size', min: 0, max: 1, step: 0.05, def: 0.5, d: 'Width of the shaft / the fire / the crystal cluster.'} : null,
+    flags.room ? {k: 'keyHeight', n: 'shaft height (m)', min: 2, max: 80, step: 0.5, def: 12, d: 'shaft: how high above the floor the shaft is cut (tuned to the ground over this room: it is a slider the placer adjusts per map).'} : null,
+    flags.room ? {k: 'keyAt', n: 'key light at', min: 0, max: 1, step: 0.05, def: 0.5, d: 'Where along the room (0 = the entrance end, 1 = the far end).'} : null,
+    flags.room ? {k: 'keySide', n: 'key light across', min: -1, max: 1, step: 0.05, def: 0, d: 'Across the room (-1 = the left wall, +1 = the right).'} : null,
     {sec: 'Join', note: 'How this piece meets its neighbours.'},
     {k: 'blend', n: 'blend radius (vox)', min: 0, max: 16, step: 1, int: true, def: 4, d: 'Smooth-min radius of this piece\'s carves against neighbouring carves.'},
     {k: 'asym', n: 'symmetry break', min: 0, max: 1, step: 0.05, def: 0.2, d: 'Seeded offsets on positions and sizes that would otherwise be mirror-exact.'}
@@ -361,6 +384,239 @@ export class Builder {
   jit(amount, ...k) { return Math.round((this.r('asym', ...k) * 2 - 1) * amount * this.P.asym); }
   /** Deco count: `base` at deco 0.5, 0 at deco 0, 2x at deco 1. */
   deco(base) { return Math.round(base * this.P.deco * 2); }
+
+  // ---- VARIETY (D8) ------------------------------------------------------------
+  // Every helper returns the regular piece's value when its slider is 0, so a
+  // kit can call them unconditionally and an old dungeon generates as before.
+
+  /** Sideways offset (voxels) of a passage centreline at z on [0, L]: zero
+   *  WITH ZERO SLOPE at both ends (sin^2 envelope), so the sockets stay on the
+   *  axis and the join stays square to them. Two harmonics, seeded phases. */
+  wanderX(z, L, key) {
+    const A = this.m(this.P.wander || 0);
+    if (!A || L <= 0) return 0;
+    const lam = Math.max(20, this.m(this.P.wanderWave || 16));
+    const t = Math.min(1, Math.max(0, z / L));
+    const env = Math.sin(Math.PI * t) ** 2;
+    const p1 = this.r('wander', key || '', 'p1') * Math.PI * 2, p2 = this.r('wander', key || '', 'p2') * Math.PI * 2;
+    const w = 0.8 * Math.sin(p1 + (2 * Math.PI * z) / lam) + 0.35 * Math.sin(p2 + (2 * Math.PI * z) / (lam * 0.41));
+    return Math.round((A * env * w) / 1.15);
+  }
+  /** Floor height (voxels) at z on [0, L] from the slope rows: a smooth grade
+   *  or `slopeSteps` terraces. 0 at z <= 0, the full slope at z >= L. */
+  slopeY(z, L) {
+    const R = this.m(this.P.slope || 0);
+    if (!R || L <= 0) return 0;
+    const t = Math.min(1, Math.max(0, z / L)), n = this.P.slopeSteps | 0;
+    return n > 0 ? Math.round((R * Math.floor(t * n + 0.5)) / n) : Math.round(R * t);
+  }
+  /** The slope's full rise in voxels (where the far sockets go). */
+  slopeR() { return this.m(this.P.slope || 0); }
+  /** Smooth seeded value noise in [-1, 1] along z (cells of `cell` voxels). */
+  vnoise(z, cell, ...key) {
+    const c = Math.max(1, cell), i = Math.floor(z / c), f = z / c - i, s = f * f * (3 - 2 * f);
+    const a = this.r('vn', ...key, i) * 2 - 1, b = this.r('vn', ...key, i + 1) * 2 - 1;
+    return a + (b - a) * s;
+  }
+  /** Width / height multiplier at z for the widthVar / heightVar rows (1 at
+   *  0). `pin` (0..1) fades the variation out toward the ends (the sockets). */
+  varAt(row, z, L, key, pin) {
+    const v = this.P[row] || 0;
+    if (!v) return 1;
+    let env = 1;
+    if (pin !== undefined && L > 0) {
+      const t = Math.min(1, Math.max(0, z / L));
+      env = Math.min(1, Math.min(t, 1 - t) / Math.max(0.01, pin));
+    }
+    return 1 + v * env * this.vnoise(z, this.m(3.5), row, key || '');
+  }
+  /** Stations along [z0, z1]: nominal spacing S from z0 + first (default S/2),
+   *  each gap stretched or shrunk by up to 45 % and each station nudged by
+   *  `jitter` (keyed per index: raising jitter moves stations, it never
+   *  reorders them). jitter 0 = the regular row the kits drew before. */
+  stations(z0, z1, S, key, first) {
+    const J = this.P.jitter || 0, out = [];
+    let z = z0 + (first === undefined ? Math.round(S / 2) : first);
+    for (let i = 0; z <= z1 && i < 4096; i++) {
+      out.push(Math.round(z));
+      z += S * (1 + 0.9 * J * (this.r('stn', key || '', i) - 0.5));
+    }
+    return out;
+  }
+  /** `chance` scaled by jitter: per-element breaks / missing / lean. */
+  odd(chance, ...key) { return (this.P.jitter || 0) > 0 && this.r('odd', ...key) < chance * this.P.jitter; }
+
+  /** Cut [z0, z1] into segments about segLen long (irregular with jitter).
+   *  Each {z0, z1, zm, x: wander at zm, y: slope at zm, w, h: width / height
+   *  multipliers}; the first and last keep w = h = 1 and x = 0 so the sockets
+   *  keep their exact opening. Segments overlap by one cell. */
+  segments(z0, z1, segLen, key) {
+    const span = z1 - z0;
+    const n = Math.max(1, Math.round(span / Math.max(4, segLen)));
+    const cuts = [z0];
+    for (let i = 1; i < n; i++) cuts.push(Math.round(z0 + (span * (i + 0.5 * (this.P.jitter || 0) * (this.r('seg', key || '', i) - 0.5))) / n));
+    cuts.push(z1);
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const a = cuts[i], b = cuts[i + 1], zm = Math.round((a + b) / 2);
+      const end = i === 0 || i === n - 1;
+      out.push({i, z0: i === 0 ? a : a - 1, z1: b + (i === n - 1 ? 0 : 1), zm, end,
+                x: end ? 0 : this.wanderX(zm - z0, span, key), y: this.slopeY(zm - z0, span),
+                y0: this.slopeY(a - z0, span), y1: this.slopeY(b - z0, span),
+                w: end ? 1 : this.varAt('widthVar', zm - z0, span, key), h: end ? 1 : this.varAt('heightVar', zm - z0, span, key)});
+    }
+    return out;
+  }
+
+  /** A footing under a floor-standing prop / light on a rough floor: fills only
+   *  AIR (openOnly) from `depth` below the prop's floor cell up to it, so the
+   *  prop never floats over a noise dip; buried rock is untouched. */
+  footing(pos, r, depth, mat, tag) {
+    const d = Math.max(2, Math.round(depth === undefined ? (this.floorNoise() ? this.floorNoise().amp : 0) + 3 : depth));
+    this.fill('cylinder', {min: [pos[0] - r, pos[1] - d, pos[2] - r], max: [pos[0] + r + 1, pos[1], pos[2] + r + 1], axis: 'y'},
+              {mat: mat || 'floor', noise: null, layer: 3, mask: 'air', tag: tag || 'footing'});
+  }
+
+  /** Room variety (bays + an offset lobe) for a room whose interior is the box
+   *  f = {x0, x1, z0, z1, y (floor), H (clear height), kind: 'cave'|'mine'|'built',
+   *  floorAt?(z)}; the kit's own walls are left alone. Returns the carves. */
+  roomVariety(f) {
+    const P = this.P, out = [];
+    const kind = f.kind || 'cave';
+    const L = f.z1 - f.z0, W = f.x1 - f.x0;
+    const yAt = (z) => (f.floorAt ? f.floorAt(z) : f.y);
+    const wall = (side, z0, z1, depth, h, key, room) => {
+      // a volume out of the side wall `side` (-1 left = x0, +1 right = x1)
+      const xw = side < 0 ? f.x0 : f.x1, y = yAt((z0 + z1) / 2);
+      const xa = side < 0 ? xw - depth : xw - 2, xb = side < 0 ? xw + 2 : xw + depth;
+      let i;
+      if (kind === 'cave') {
+        i = this.carve('ellipsoid', {min: [side < 0 ? xa : xw - Math.round(depth * 0.5), y - 4, z0], max: [side < 0 ? xw + Math.round(depth * 0.5) : xb, y + h, z1]},
+                       {tag: room ? 'room' : 'niche', noise: 1.1, blend: Math.max(P.blend, 6)});
+        this.fill('box', {min: [Math.min(xa, xb) - 2, y - 6, z0 - 2], max: [Math.max(xa, xb) + 2, y, z1 + 2]}, {mat: 'floor', noise: 'floor', layer: 2, mask: 'air', tag: 'bayfloor'});
+      } else if (kind === 'mine') {
+        i = this.carve('box', {min: [xa, y, z0], max: [xb, y + h, z1]}, {tag: room ? 'room' : 'niche', noise: {amp: Math.max(3, Math.round(depth * 0.25)), scale: this.m(1.2), octaves: 2, seedKey: 'baymine'}, blend: 3});
+        this.floor(xa, z0, xb, z1, y);
+      } else {
+        const rise = Math.max(2, Math.min(Math.round((z1 - z0) / 2), Math.round(h * 0.35)));
+        i = this.carve('vault', {min: [xa, y, z0], max: [xb, y + h, z1], axis: 'x', rise}, {tag: room ? 'room' : 'niche', noise: null, blend: 0, layer: 3});
+        this.skin('vault', {min: [xa, y, z0], max: [xb, y + h, z1], axis: 'x', rise}, {skin: 2, mat: 'wall', layer: 1});
+        this.floor(xa, z0, xb, z1, y, {layer: 3});
+      }
+      out.push(i);
+      return i;
+    };
+    // A volume may not cut a side doorway (f.doors: [{side, z, w}]): it moves
+    // to the other wall, else it is left out.
+    const doors = f.doors || [];
+    const clear = (side, za, zb) => !doors.some(dr => dr.side === side && za < dr.z + dr.w / 2 + this.m(1.2) && zb > dr.z - dr.w / 2 - this.m(1.2));
+    const pickSide = (side, za, zb) => clear(side, za, zb) ? side : clear(-side, za, zb) ? -side : 0;
+    // Side bays: irregular places along the long walls.
+    const nb = P.bays | 0;
+    for (let k = 0; k < nb; k++) {
+      const bw = Math.round(this.m(1.4) + this.r('bay', k, 'w') * Math.min(this.m(3.6), L * 0.35));
+      const zc = Math.round(f.z0 + bw / 2 + 2 + this.r('bay', k, 'z') * Math.max(1, L - bw - 4));
+      const side = pickSide(this.r('bay', k, 'side') < 0.5 ? -1 : 1, zc - bw / 2, zc + bw / 2);
+      if (!side) continue;
+      const depth = Math.max(4, Math.round(this.m(P.bayDepth || 2) * (0.6 + 0.8 * this.r('bay', k, 'd'))));
+      const h = Math.max(this.m(1.4), Math.round(f.H * (0.55 + 0.45 * this.r('bay', k, 'h'))));
+      wall(side, zc - Math.round(bw / 2), zc + Math.round(bw / 2), depth, h, 'bay' + k, false);
+    }
+    // The lobe: one side bulges into a second space, offset along the room.
+    if ((P.lobe || 0) > 0) {
+      const lw = Math.max(this.m(2), Math.round(L * (0.3 + 0.35 * P.lobe)));
+      const zc = Math.round(f.z0 + lw / 2 + this.r('lobe', 'z') * Math.max(1, L - lw));
+      const side = pickSide(this.r('lobe', 'side') < 0.5 ? -1 : 1, zc - lw / 2, zc + lw / 2);
+      const depth = Math.max(this.m(1.5), Math.round(W * (0.25 + 0.55 * P.lobe)));
+      const h = Math.max(this.m(1.6), Math.round(f.H * (0.7 + 0.3 * this.r('lobe', 'h'))));
+      if (side) wall(side, zc - Math.round(lw / 2), zc + Math.round(lw / 2), depth, h, 'lobe', true);
+    }
+    return out;
+  }
+
+  /** Extra floor light mounts on a ~5 m grid over a room (only with
+   *  lightDensity > 0, so a piece without it keeps its mount list -- and with
+   *  it, its seeded light picks -- exactly). f as roomVariety; skip(x, z) ->
+   *  true drops a spot (a pillar, a pit, the way through). */
+  gridSpots(f, skip) {
+    if (!((this.P.lightDensity || 0) > 0)) return;
+    const step = this.m(5), ins = this.m(1.2);
+    for (let z = f.z0 + ins; z <= f.z1 - ins; z += step) for (let x = f.x0 + ins; x <= f.x1 - ins; x += step) {
+      const xx = Math.round(x + this.jit(this.m(1), 'gs', x, z, 'x')), zz = Math.round(z + this.jit(this.m(1), 'gs', x, z, 'z'));
+      if (skip && skip(xx, zz)) continue;
+      const yy = f.floorAt ? f.floorAt(zz) : f.y;
+      // only where the room really is (a bowl narrows toward its floor)
+      if (!this.prims.some(p => p.op === 'carve' && p.tag === 'room' && !p.mat && primContains(p, [xx + 0.5, yy + 1.5, zz + 0.5]))) continue;
+      this.lightSpot([xx, yy, zz], 'floor', '+y');
+    }
+  }
+
+  /** The KEY LIGHT of a room (keyLight / keySize / keyHeight / keyAt / keySide):
+   *  f = {x0, x1, z0, z1, y (floor), roof (the roof's local y over the room),
+   *  kind, floorAt?(z)}. shaft = a carve up through the roof to keyHeight (the
+   *  piece becomes a surface piece: the shaft is MEANT to break the ground);
+   *  fire = a ring of stones round a bed of flame with tongues; crystals = big
+   *  glowing prisms rooted in the floor. */
+  keyLight(f) {
+    const P = this.P;
+    if (!P.keyLight || P.keyLight === 'none') return;
+    const S = P.keySize === undefined ? 0.5 : P.keySize;
+    const x = Math.round((f.x0 + f.x1) / 2 + (P.keySide || 0) * (f.x1 - f.x0) * 0.38);
+    const z = Math.round(f.z0 + (f.z1 - f.z0) * (0.12 + 0.76 * (P.keyAt === undefined ? 0.5 : P.keyAt)));
+    const y = f.floorAt ? f.floorAt(z) : f.y;
+    if (P.keyLight === 'shaft') {
+      const r = Math.max(6, Math.round(this.m(0.8 + 2.2 * S)));
+      const top = y + Math.max(this.m(P.keyHeight || 12), (f.roof || y) - y + r + 4);
+      const kind = f.kind || 'cave';
+      if (kind === 'built') {
+        // an oculus: a round well straight up from the vault crown
+        this.carve('cylinder', {min: [x - r, Math.round((f.roof || y) - 4), z - r], max: [x + r, top, z + r], axis: 'y'}, {tag: 'apron', noise: null, blend: 0, layer: 3});
+        this.skin('cylinder', {min: [x - r, Math.round((f.roof || y) - 4), z - r], max: [x + r, top, z + r], axis: 'y'}, {skin: 2, mat: 'wall', layer: 1});
+      } else if (kind === 'mine') {
+        this.carve('box', {min: [x - r, Math.round((f.roof || y) - 4), z - r], max: [x + r, top, z + r]}, {tag: 'apron', noise: 0.6, blend: 3});
+      } else {
+        const dx = this.jit(r, 'keyshaft', 'x'), dz = this.jit(r, 'keyshaft', 'z');
+        const pts = [[x, Math.round((f.roof || y) - r), z], [x + dx, Math.round(((f.roof || y) + top) / 2), z + dz], [x - Math.round(dx / 2), top, z - Math.round(dz / 2)]];
+        this.carve('spline_tube', {pts, radii: [r + 4, r, Math.round(r * 1.3)]}, {tag: 'apron', noise: 1.1, blend: Math.max(P.blend, 8)});
+      }
+      // The pool of daylight on the floor: moss / ferns where it lands.
+      this.surface = true;
+      this.notes.push('key light shaft: cut to ' + ((top - y) / this.vpm).toFixed(1) + ' m above the floor; the piece is a surface piece');
+      this.ref('light', [x, y, z], {name: 'key_shaft', props: {type: 'shaft'}});
+      return;
+    }
+    if (P.keyLight === 'fire') {
+      const r = Math.max(3, Math.round(this.m(0.35 + 0.9 * S)));
+      // stones round the fire, then the bed of flame, then tongues
+      this.fill('cylinder', {min: [x - r - 3, y - 3, z - r - 3], max: [x + r + 4, y + 3, z + r + 4], axis: 'y'}, {mat: 'loose', noise: null, layer: 4, tag: 'keylight'});
+      this.fill('cylinder', {min: [x - r, y - 3, z - r], max: [x + r + 1, y + 3, z + r + 1], axis: 'y'}, {mat: 'candle_flame', noise: null, layer: 4, tag: 'keylight'});
+      const nt = 3 + Math.round(S * 4);
+      for (let i = 0; i < nt; i++) {
+        const a = this.r('tongue', i, 'a') * Math.PI * 2, d = Math.sqrt(this.r('tongue', i, 'd')) * (r - 1);
+        const tx = x + Math.round(Math.cos(a) * d), tz = z + Math.round(Math.sin(a) * d);
+        const th = Math.round(this.m(0.3) + this.r('tongue', i, 'h') * this.m(0.5 + S));
+        const tw = 1 + Math.round(this.r('tongue', i, 'w') * 2);
+        this.fill('box', {min: [tx - tw, y + 3, tz - tw], max: [tx + tw, y + 3 + th, tz + tw]}, {mat: 'candle_flame', noise: null, layer: 4, tag: 'keylight'});
+      }
+      this.ref('light', [x, y, z], {name: 'key_fire', props: {type: 'fire', warm: true}});
+      return;
+    }
+    // crystals: big prisms leaning out of a common quartz root
+    const n = 3 + Math.round(S * 4), Lm = this.m(1.2 + 2.6 * S);
+    this.fill('ellipsoid', {min: [x - 8, y - 10, z - 8], max: [x + 9, y + 4, z + 9]}, {mat: 'quartzite', noise: 0.3, layer: 4, tag: 'keylight'});
+    for (let i = 0; i < n; i++) {
+      // prisms fanning out of the root, each its own (they must read as
+      // separate crystals, not one glowing lump)
+      const a = ((i + this.r('kc', i, 'a')) / n) * Math.PI * 2, lean = 0.3 + 0.55 * this.r('kc', i, 'lean');
+      const len = Math.round(Lm * (0.45 + 0.55 * this.r('kc', i, 'len')));
+      const rr = Math.max(2, Math.round(len / 11));
+      const bx = x + Math.round(Math.cos(a) * 4), bz = z + Math.round(Math.sin(a) * 4);
+      const tip = [bx + Math.round(Math.cos(a) * lean * len), y + Math.round(len * (1 - lean * 0.45)), bz + Math.round(Math.sin(a) * lean * len)];
+      this.fill('spline_tube', {pts: [[bx, y - 6, bz], [Math.round((bx + tip[0]) / 2), Math.round((y + tip[1]) / 2), Math.round((bz + tip[2]) / 2)], tip], radii: [rr + 1, rr, 1]},
+                {mat: i % 3 === 2 ? 'gem_arcane' : 'crystal', noise: null, layer: 4, tag: 'keylight'});
+    }
+    this.ref('light', [x, y, z], {name: 'key_crystals', props: {type: 'crystal', warm: false}});
+  }
 
   wallNoise(mult) {
     const amp = Number((this.P.wallRough * this.kit.roughMax * (mult === undefined ? 1 : mult)).toFixed(2));
@@ -470,18 +726,42 @@ export class Builder {
    *  Returns the rise actually built (a whole number of steps). */
   flight(op, dir, a0, a1, s0, s1, y0, R, stepH, band, o) {
     const h = Math.max(1, Math.round(stepH)), n = Math.max(1, Math.round(R / h)), RR = n * h;
-    const Lt = s1 - s0, d = Math.max(1, Math.floor(Lt / (n + 1))), Lr = Math.min(Lt, (n + 1) * d);
+    const Lt = s1 - s0, d = Math.max(1, Math.floor(Lt / (n + 1)));
     const onZ = dir[1] === 'z', up = dir[0] === '+';
-    const r0 = up ? s0 : s1 - Lr, r1 = up ? s0 + Lr : s1;
     const height = band.height || 0, below = band.below || 0;
     const box3 = (u0, u1, ylo, yhi) => onZ ? {min: [a0, ylo, u0], max: [a1, yhi, u1]} : {min: [u0, ylo, a0], max: [u1, yhi, a1]};
-    const g = box3(r0, r1, y0, y0 + RR + Math.max(1, height));
-    const first = this.prim(op, 'ramp', Object.assign(g, {dir, stepH: h, stepD: d, height, below}), o);
+    // FRACTIONAL SLOPES (D8): the n + 1 treads share the run exactly. A run
+    // that is not a multiple of n + 1 used to end in a flat landing the size of
+    // the remainder (a stair that stopped short of its socket and a lip at the
+    // top); now `rem` of the treads are one cell deeper, so the run need not
+    // divide. Two ramp prims (the deep treads first, from the low end), the
+    // same profile the single ramp would have had otherwise.
+    const rem = Lt >= (n + 1) ? Lt - (n + 1) * d : 0;
+    const Lr = Math.min(Lt, (n + 1) * d + rem);
+    const r0 = up ? s0 : s1 - Lr, r1 = up ? s0 + Lr : s1;
+    let first;
+    if (rem > 0) {
+      // treads 0..rem-1 of depth d+1 from the LOW end, then n+1-rem of depth d.
+      const LA = rem * (d + 1);
+      const lo0 = up ? r0 : r1 - LA, lo1 = up ? r0 + LA : r1;
+      const hi0 = up ? r0 + LA : r0, hi1 = up ? r1 : r1 - LA;
+      first = this.prim(op, 'ramp', Object.assign(box3(lo0, lo1, y0, y0 + (rem - 1) * h + Math.max(1, height)), {dir, stepH: h, stepD: d + 1, height, below}), o);
+      this.prim(op, 'ramp', Object.assign(box3(hi0, hi1, y0 + rem * h, y0 + RR + Math.max(1, height)), {dir, stepH: h, stepD: d, height, below}), o);
+    } else {
+      first = this.prim(op, 'ramp', Object.assign(box3(r0, r1, y0, y0 + RR + Math.max(1, height)), {dir, stepH: h, stepD: d, height, below}), o);
+    }
     if (Lr < Lt) {
       const t0 = up ? s0 + Lr : s0, t1 = up ? s1 : s1 - Lr;
       this.prim(op, 'box', box3(t0, t1, y0 + RR - below, y0 + RR + height), Object.assign({}, o, {tag: (o && o.tag) || 'flat'}));
     }
-    return {rise: RR, prim: first, stepD: d};
+    return {rise: RR, prim: first, stepD: d, rem, profile: (u) => {
+      // walking-surface height (above y0) at an along-coordinate u (absolute)
+      const v = up ? u - r0 : r1 - 1 - u;
+      if (v < 0) return 0;
+      const LA = rem * (d + 1);
+      const k = v < LA ? Math.floor(v / (d + 1)) : rem + Math.floor((v - LA) / d);
+      return Math.min(n, k) * h;
+    }};
   }
 
   /** A chain of waynodes prefix0..N-1 through pts; the first also links
@@ -557,9 +837,22 @@ export class Builder {
    *  never moves the ones already there. */
   placeLights() {
     const P = this.P;
-    if (P.lightType === 'none' || P.lightCount <= 0 || !this.lightSpots.length) return;
+    if (P.lightType === 'none' || !this.lightSpots.length) return;
+    // How many: the count, or more by floor area (lightDensity). The area is the
+    // XZ extent of the room carves; one light per ~25 m2 at density 1.
+    let want = P.lightCount;
+    if ((P.lightDensity || 0) > 0) {
+      let bb = null;
+      for (const p of this.prims) if (p.op === 'carve' && p.tag === 'room') bb = boxUnion(bb, shapeBounds(p));
+      const area = bb ? ((bb.max[0] - bb.min[0]) * (bb.max[2] - bb.min[2])) / (this.vpm * this.vpm) : 0;
+      want = Math.max(want, Math.round((P.lightDensity * area) / 25));
+    }
+    if (want <= 0) return;
+    const pw = P.lightPower || 0;
+    // Rough walls / floors: a light's root must reach the rock past the noise.
+    const wallAmp = (this.wallNoise() || {amp: 0}).amp, floorAmp = (this.floorNoise() || {amp: 0}).amp;
     const order = this.lightSpots.map((s, i) => ({s, i, k: this.r('lightpick', i)})).sort((a, b) => a.k - b.k || a.i - b.i);
-    const n = Math.min(P.lightCount, order.length);
+    const n = Math.min(want, order.length);
     for (let j = 0; j < n; j++) {
       const {s, i} = order[j];
       const warm = this.r('lightwarm', i) < P.warmth;
@@ -567,17 +860,36 @@ export class Builder {
       const L = (this.kit.lights && this.kit.lights[P.lightType]) || {};
       const up = dirVec(s.out);
       const p = s.pos;
+      const into = s.mount === 'floor' ? floorAmp + 2 : wallAmp + 2;      // how far a root must reach behind the mount
       if (P.lightType === 'torch') {
-        // A bracket (support) out of the wall and a 2-voxel flame on it.
-        const base = [p[0] + up[0], p[1], p[2] + up[2]];
-        this.fill('box', {min: [Math.min(p[0], base[0]), p[1] - 1, Math.min(p[2], base[2])], max: [Math.max(p[0], base[0]) + 1, p[1], Math.max(p[2], base[2]) + 1]}, {mat: 'support', layer: 3, noise: null, tag: 'light'});
-        this.fill('box', {min: [base[0], p[1], base[2]], max: [base[0] + 1, p[1] + 2, base[2] + 1]}, {mat: slot, layer: 3, noise: null, tag: 'light'});
+        // A bracket (support) out of the wall and a flame on it; the bracket's
+        // root runs back into the wall past its noise. lightPower widens the
+        // flame to a fire basket (up to 4 x 6 x 4 voxels).
+        const fw = 1 + Math.round(pw * 3), fh = 2 + Math.round(pw * 4);
+        const back = pw > 0 ? Math.round(into) : 0;
+        const reach = 1 + Math.round(pw * 2);
+        const base = [p[0] + up[0] * reach, p[1], p[2] + up[2] * reach];
+        const root = [p[0] - up[0] * back, p[1], p[2] - up[2] * back];
+        this.fill('box', {min: [Math.min(root[0], base[0]), p[1] - 1, Math.min(root[2], base[2])], max: [Math.max(root[0], base[0]) + 1, p[1], Math.max(root[2], base[2]) + 1]}, {mat: 'support', layer: 3, noise: null, tag: 'light'});
+        const h0 = Math.floor((fw - 1) / 2);
+        const fx0 = base[0] - (up[0] ? (up[0] > 0 ? 0 : fw - 1) : h0), fz0 = base[2] - (up[2] ? (up[2] > 0 ? 0 : fw - 1) : h0);
+        if (pw > 0) this.fill('box', {min: [fx0, p[1] - 1, fz0], max: [fx0 + fw, p[1], fz0 + fw]}, {mat: 'iron', layer: 3, noise: null, tag: 'light'});
+        this.fill('box', {min: [pw > 0 ? fx0 : base[0], p[1], pw > 0 ? fz0 : base[2]], max: [(pw > 0 ? fx0 : base[0]) + fw, p[1] + fh, (pw > 0 ? fz0 : base[2]) + fw]}, {mat: slot, layer: 3, noise: null, tag: 'light'});
       } else if (P.lightType === 'crystal') {
-        const r = 2 + Math.floor(this.r('lightsz', i) * 3);
-        this.fill('ellipsoid', {min: [p[0] - r, p[1] - r, p[2] - r], max: [p[0] + r, p[1] + r + 1, p[2] + r]}, {mat: warm ? 'crystal_spire' : 'lightCool', layer: 3, noise: null, tag: 'light'});
+        const r = Math.round((2 + Math.floor(this.r('lightsz', i) * 3)) * (1 + 1.6 * pw));
+        const mat = pw > 0 ? (warm ? 'crystal' : 'lightCool') : (warm ? 'crystal_spire' : 'lightCool');
+        if (pw > 0 || into > 3) {
+          // ANCHORED: a capsule from inside the rock behind the mount out to
+          // the lump, so a rough wall or floor never leaves it an island.
+          const a = [p[0] - up[0] * Math.round(into + r * 0.5), p[1] - up[1] * Math.round(into + r * 0.5), p[2] - up[2] * Math.round(into + r * 0.5)];
+          this.fill('capsule', {a, b: [p[0] + up[0] * Math.round(r * 0.3), p[1] + up[1] * Math.round(r * 0.3), p[2] + up[2] * Math.round(r * 0.3)], r}, {mat, layer: 3, noise: null, tag: 'light'});
+        } else this.fill('ellipsoid', {min: [p[0] - r, p[1] - r, p[2] - r], max: [p[0] + r, p[1] + r + 1, p[2] + r]}, {mat, layer: 3, noise: null, tag: 'light'});
       } else if (L.prop) {
         const yaw = s.out === '+x' ? 90 : s.out === '-x' ? 270 : s.out === '-z' ? 180 : 0;
-        this.prop(L.prop, Object.assign({}, L.params || {}, {lit: slot, mount: s.mount}), s.pos, yaw, {light: true});
+        const pp = Object.assign({}, L.params || {}, {lit: slot, mount: s.mount});
+        if (pw > 0) Object.assign(pp, L.power ? L.power(pw) : {});
+        this.prop(L.prop, pp, s.pos, yaw, {light: true});
+        if (s.mount === 'floor' && floorAmp >= 1) this.footing(s.pos, 3, floorAmp + 3, null, 'light');
       }
       this.ref('light', p, {props: {type: P.lightType, warm}});
     }
@@ -595,7 +907,7 @@ export function defineKit(kit, defs) {
   kit.TYPE_ORDER = kit.TYPE_ORDER || [];
   for (const t of defs) {
     t.kit = kit.name;
-    t.SCHEMA = universalSchema(t.size, t.u, kit.lightTypes).concat(t.rows || []);
+    t.SCHEMA = universalSchema(t.size, t.u, kit.lightTypes, {passage: !!t.passage, room: !!t.room, slope: !!t.slope}).concat(t.rows || []);
     t.defaults = () => defaultsOf(t.SCHEMA);
     t.normalize = (src) => normalizeParams(t.SCHEMA, src);
     t.generate = (params, seed, ctx) => {

@@ -766,7 +766,7 @@ modules: no DOM, no Math.random, the same code in Node and the tuner.
 |---|---|
 | caves | `mouth` (hillside / sinkhole / seacave; surface), `tunnel`, `cavern`, `shaft` (optionally a surface pothole), `chasm`, `grotto_pool`, `crawl`, `rubble_choke` |
 | mines | `adit_entrance` (surface), `drift`, `junction` (T / X / L / Y: §4's crosscut), `incline`, `shaft` (optional surface collar + headframe), `stope`, `collapse`, `flooded_sump`, `camp` |
-| ruins | `ruin_entrance` (surface), `hall`, `corridor`, `stair` (straight / switchback / square spiral), `crypt`, `pit_room`, `sanctum`, `flooded_hall`, `collapsed_passage` |
+| ruins | `ruin_entrance` (surface), `hall`, `corridor`, `turn` (D8), `junction` (D8), `stair` (straight / switchback / square spiral), `crypt`, `pit_room`, `sanctum`, `flooded_hall`, `collapsed_passage` |
 
 Universal sliders (core-supplied rows, same effect in every kit): width,
 length, height, ceiling rise, floor unevenness, wall roughness + scale,
@@ -812,14 +812,11 @@ solids, light slots are emissive, mine supports burn.
    several palettes); `materials` is the style's resolved palette.
 4. **Liquids are carves with `mat` + `level`** (pools, sumps, flooded halls,
    pit water / lava, chasm streams), never fills.
-5. **Dropped at emission (no 3.4.1 field):** `mask: 'air'` on fills (rubble
-   heaps, boulders, cave floors, toppled columns meant "fill open space
-   only"; the engine fills the whole shape, so a heap's buried half turns
-   rock to rubble inside the wall: buried, so at rest, but D1 may want a
-   `mask` later) and the floor `pattern` (checker; `border` / `runner` are
-   real boxes and survive). Noise amplitude rounds to whole voxels (ruins'
-   dressed walls mostly lose theirs, intended); `scale` = log2 of the
-   voxel feature size.
+5. ~~Dropped at emission~~ (D8: emitted since the 3.4.1 extras landed):
+   `mask: 'air'` on fills compiles to `openOnly`, the floor `pattern`
+   (checker) to `mat2` + `checker`; `border` / `runner` are real boxes.
+   Noise amplitude rounds to whole voxels (ruins' dressed walls mostly lose
+   theirs, intended); `scale` = log2 of the voxel feature size.
 6. **Skins** are emitted inflated by their thickness (3.4.1 paints inside
    the skin prim's own shape). **Ramps** follow 3.4.1; the generator cuts
    the footprint to (steps + 1) x stepD and adds a flat box for any
@@ -864,6 +861,156 @@ missing key / key behind its own lock, dead signal, surface breach; taper
 on a near-miss join, refusal of a far one; shell.bin reads back to the
 JSON; every prop x preset; the sample is current and clean.
 `node scripts/compile_dungeon.mjs --all --check` is the staleness check.
+
+### D8 — variety, light, compiler fixes (2026-10-12)
+
+The three example authors all hit the same wall: rooms read as boxes and
+tubes joined at right angles, drifts dead straight with evenly spaced
+timber, every floor flat and one height per level, and underground too dark
+to read. D8 fixed it in the generators. **Every new row defaults to the
+piece the kit drew before** (an old dungeon generates the same prims, but
+for the bug fixes below); the presets named after them show them off.
+
+**Universal rows (dgutil `universalSchema`, by type flag).** Section
+*Variety*: `widthVar`, `heightVar` (the space swells / dips along its
+length; the end segments keep the socket size), `jitter` (irregular spacing
+of repeated things -- timber sets, ribs, columns, pillars, niches, loculi --
+and per-element lean, rack, sag, break, missing). Passage types
+(`passage: true`) add `wander` + `wanderWave` (a two-harmonic S-curve of the
+centreline, zero WITH ZERO SLOPE at both ends, so the sockets never move and
+joins stay square). Types with `slope: true` add `slope` (m gained from the
+origin socket to the far end; the far sockets move by exactly that) and
+`slopeSteps` (0 = a smooth grade, n = terraces / short flights). Room types
+(`room: true`) add `bays` + `bayDepth` (alcoves / side chapels cut into the
+side walls at seeded places, never through a side doorway) and `lobe` (one
+side bulges into an offset second space), and the *Key light* section
+(below). Every kit: `lightPower`, `lightDensity` (below).
+
+Builder helpers the kits call: `wanderX`, `slopeY`, `varAt`, `vnoise`,
+`stations` (jittered rows), `odd` (jitter-scaled per-element chance),
+`segments` (a passage cut into wandering / sloping / swelling segments),
+`roomVariety`, `keyLight`, `gridSpots`, `footing`.
+
+**Per kit.**
+- caves: `tunnel` -- `xsec` (a second, offset bore unions in per point: the
+  section changes as you walk), `canyon` (a vadose trench below the floor,
+  keyhole section), `pockets`, `breakdown`; the floor flatten is open-space
+  only. `cavern` -- `slope` tilts the floor (exits ride it). New presets
+  `keyhole_canyon`, `breakdown_crawlway`, `twisting_squeeze`,
+  `lit_shaft_chamber`, `tilted_breakdown`, `sunlit_pool`.
+- mines: `driftBody` is a chain of segments when varied (one box when not,
+  exactly as before): the floor, overbreak, track and sets follow the wander
+  and grade (the floor and rails on a grade are one-voxel ramps). `vein` --
+  an ore band SKINNED on one rib (never a fill in the passage), the reason a
+  drift wanders. Sets: missing, racked (upper half of both posts and the cap
+  stand off), sag depth / offset. Stope pillars: robbed out entirely, varied
+  girth. New presets `vein_follower`, `crooked_old`, `racked_fall`,
+  `crooked_adit`, `irregular_workings`, `lived_in`, `broken_sump`.
+- ruins: `settle` (floor patches cut out and replaced by tilted / sunk /
+  missing slabs; open-space fills), `breach` (a stretch of side wall fallen
+  in mid-room: a ragged hole into the rock, its spill and facing blocks),
+  columns lean (three offset drums) or are missing, the corridor bends AT ITS
+  RIBS (each bay a little off the last; a rib spans both openings, a bend
+  never shuts the way) and takes slope as steps; the collapsed passage sags
+  (`widthVar` / `heightVar` = bellied walls and vault). New types **`turn`**
+  (an L corner: groin-vaulted crossing, `corner` square / apse / column, a
+  corner shrine) and **`junction`** (T / X / Y crossing, groin or dome
+  crown, corner columns). New presets `settled_ruin`, `oculus_hall`,
+  `leaning_cistern`, `bent_descent`, `terraced_gallery`, `broken_catacomb`,
+  `sunlit_pit`, `oculus_shrine`, `sagging_fall`.
+
+**Light (how it actually propagates, and what that means for a kit).** An
+emissive voxel lights the world through the irradiance grid (DESIGN §9.y):
+emission is part of the radiance of the 4x4x4-voxel BLOCK FACE it sits on
+(an EMA over that face's patches), and a receiver's gather reads the block
+faces its nine rays hit, up to ~a room away. So light carries in proportion
+to the glowing SURFACE: a 1 x 2 voxel candle flame is a few percent of one
+block face and lights its bracket; a 4 x 6 x 4 flame lights a room. The glow
+field (§9.g) is the same story for bodies, coarser. Hence:
+`lightPower` (0..1) scales each light's emitter -- torch flame 1 -> 4 wide
+(an iron basket), lantern `glow`, brazier `fire` (the whole bowl a bed of
+flame with tongues), candle `flame`, glow-mushroom `glow` (bright glowcap
+caps instead of the dim glowcap_giant), crystal lumps 2.6x the radius and
+`crystal` (emission 120) instead of `crystal_spire` (70). `lightDensity`
+adds lights by floor area (one per ~25 m2 at 1) on a 5 m grid of extra floor
+mounts (added only when it is > 0, so the seeded picks of an old piece do not
+move). The KEY LIGHT of a room (`keyLight` none / shaft / fire / crystals,
+`keySize`, `keyHeight`, `keyAt`, `keySide`): `shaft` = a carve up through the
+roof to `keyHeight` (a cave chimney, a mine raise, a built OCULUS) -- the
+piece becomes a surface piece, since the shaft is meant to break the ground,
+and daylight then reaches the floor through openness + the GI bounce; it
+only lights a room when it is short and wide (a 50 m chimney is a pinprick:
+use crystals there). `fire` = a ring of stones round a bed of candle_flame
+with tongues; `crystals` = big crystal / gem_arcane prisms from a quartz root.
+All key-light emitters are static, untagged materials (no fire spread, rule 2).
+
+**Compiler + bug fixes.**
+- 3.4.1 EXTRAS are emitted: `mask: 'air'` fills -> `openOnly` (rubble heaps,
+  fallen caps, lagging, floor fills in bowls, boulders, settled slabs no
+  longer turn buried rock to gravel); checker floors -> `mat2` + `checker`;
+  `emitShellBin` writes the `PRMX` block (interning `mat2` before the string
+  table) only when some prim uses an extra.
+- Suggested door refs: `pos` is the leaf's hinge cell (refs_doors.h), half a
+  leaf to the side of the socket centre, in the tagged piece's front layer;
+  `props.hinge: 'left'`.
+- `Builder.flight` spreads a run that does not divide over its treads (two
+  ramp prims, `rem` treads one cell deeper) instead of a flat remainder, and
+  returns `profile(u)` (the incline's set heights read it).
+- Lights anchor into rock: a crystal lump on a rough surface is a capsule
+  rooted behind its mount past the noise; a torch bracket's root runs into
+  the wall; floor light props and cave crystal / mushroom props get an
+  open-space `footing` under them.
+- Test: `scripts/test_dungeongen.mjs` sections 11-13 (every new slider:
+  visible, deterministic, sockets kept; extras; doors; flights; variants).
+
+### Portability: variants, map-free builds, placement (D8)
+
+**Variants (dungeon inheritance).** A `dungeon.json` may say
+`"extends": "<base id>"` with optional `name`, `seed`, `style`, `palette`
+(merged over the base's, `kits` per kit), `entrance`, `pieces: {"<id>":
+{params: {partial}, seed?, type?, kit?, pos?, yaw?, links?, remove?: true |
+'branch'}}` (`'branch'` also removes every piece then cut off from the
+entrance), `add: [full piece objects]` (links are mirrored onto the pieces
+they name), `addProps`, `removeProps`, and `refsPatch: {add: [refs],
+remove: [names], set: {name: {props partial, pos?, yaw?, base?}}}`.
+`resolveDungeon(d, loadBase)` flattens a chain (cycles refused, depth <= 8)
+into an ordinary dungeon; `compile` / `validate` take `{loadBase}` and
+resolve first. `scripts/compile_dungeon.mjs` compiles bases before variants;
+a variant gets ITS OWN `shell.json` / `shell.bin` AND a generated
+`refs.json` (the base's refs, every adopted waynode re-adopted from the
+variant's geometry, refs standing in removed pieces dropped, the refsPatch
+applied, stamped "GENERATED ... edit the variant's dungeon.json"), so the
+engine and the refs loader need no change. Hashes: `sourceHash` is still the
+FNV of the variant's own `dungeon.json` bytes (the engine's contract);
+`shell.json`'s extra `source: {resolvedHash, extends, chain}` covers the
+resolved source, so `--all --check` flags a variant whose BASE moved.
+Examples (assets, not placed): `shardwell_flooded`, `teeth_caves_ice`,
+`heather_cairn_overgrown`.
+
+**Map-free builds.** The examples' authoring scripts are
+`assets/dungeons/<id>/build.mjs` (shared helpers:
+`scripts/dungeon_build_lib.mjs`): they write the dungeon, its refs and the
+schedules and validate it ALONE. Nothing in them names a map.
+
+**Placement.** `scripts/place_dungeon.mjs --map <name> --dungeon <id> --at
+x,z [--yaw] [--yOffset] [--id] [--name] [--ground-y y] [--write]` reads the
+map's ground over the footprint (`sandvox --heightmap` with
+`SANDVOX_MAP=<name>`, through `run.sh`), prints the least rock over every
+piece, where each key-light shaft comes out (and the `keyHeight` that would
+make it meet the ground), the full validation panel with the real ground,
+and with `--write` adds / updates only that map's `dungeons[]` entry
+(keeping its other fields). Map-tuned sliders (a cave mouth's apron and
+drop, an adit's cut, the ruin entrance's `apronHeight` / cairn lift, a
+shaft's `keyHeight`) are piece sliders, and `--set <piece>.<param>=<v> ...
+--as <variant id>` writes them as a VARIANT for that map and places it.
+`--ground-y`: the heightmap reports the terrain column (roads, pads); the
+placement is relative to the BARE ground, so where a road cuts the anchor
+column pass the bare height (the tab's in-world view prints it as groundY).
+The default map's three placements are recreated by:
+
+    node scripts/place_dungeon.mjs --map default --dungeon teeth_caves --at -78684,89590 --yaw 90 --write
+    node scripts/place_dungeon.mjs --map default --dungeon shardwell --at 67209,-49564 --yaw 270 --write
+    node scripts/place_dungeon.mjs --map default --dungeon heather_cairn --at -56045,-33555 --yaw 180 --yOffset -147 --ground-y 5053 --write
 
 ### Known gaps
 
