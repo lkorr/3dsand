@@ -443,6 +443,8 @@ class FarField {
   // runs.
   std::vector<uint32_t> list_;
   std::vector<uint32_t> patchHeader_;
+  // PrepareTick's column grouping scratch (THE COLUMN STACK, worldgen.wgsl).
+  std::vector<uint32_t> order_, sortList_, sortHeader_;
   std::vector<uint32_t> patchPayload_;
   uint32_t lastPatchWords_ = 0;
 };

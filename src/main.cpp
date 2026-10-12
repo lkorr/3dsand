@@ -22027,6 +22027,21 @@ int main(int argc, char** argv) {
           std::fclose(f);
         }
       }
+      // SANDVOX_FRAMES_PASSES=<file>: EVERY pass of every recorded frame, one
+      // row each (live,pass,ms) -- the per-class attribution ("what does a
+      // tick frame with a far slice cost that a tick frame without one does
+      // not") that the six named CSV columns cannot give. Pair it with
+      // SANDVOX_GPU_TIMER_SERIAL=1 (vk_record.cpp) for spans that do not
+      // overlap their predecessor.
+      if (const char* pp = std::getenv("SANDVOX_FRAMES_PASSES")) {
+        if (FILE* f = std::fopen(pp, "w")) {
+          std::fprintf(f, "live,pass,ms\n");
+          for (const HarnessFrameRec& r : g_frameRecs)
+            for (const auto& t : r.top)
+              std::fprintf(f, "%u,%s,%.4f\n", r.live, t.second.c_str(), t.first);
+          std::fclose(f);
+        }
+      }
       std::printf("    box-face handoffs (a valid face nearer than the level's handoff "
                   "sphere: a straight seam line) over %zu frames: margin 2 (pre-2026-10-11) "
                   "L1 %u L2 %u L3 %u | margin %d (shipped) L1 %u L2 %u L3 %u\n",

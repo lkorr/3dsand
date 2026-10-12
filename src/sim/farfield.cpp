@@ -148,9 +148,17 @@ void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord,
   // and puts all of a plane's farMapFill work in its first slice, so the
   // slices after it skip that pass's fixed latency (farfield.h PLANE PACING).
   // A Z plane already ran its map row first; an X plane interleaved it.
+  // Y INNERMOST for the X and Z planes (2026-10-11): a plane drains in slices
+  // (PLANE PACING), and `far` shares one column prologue between the entries
+  // of a level-chunk column that land in the same slice (worldgen.wgsl THE
+  // COLUMN STACK). An X plane's `a` is already y; a Z plane's was x, which
+  // put eight rows of 32 columns in a 256-entry slice instead of eight whole
+  // columns. Order within a plane changes no byte.
   for (int pass = 0; pass < 2; pass++)
-  for (int b = 0; b < (int)kFarNChunk; b++) {
-    for (int a = 0; a < (int)kFarNChunk; a++) {
+  for (int u = 0; u < (int)kFarNChunk; u++) {
+    for (int v = 0; v < (int)kFarNChunk; v++) {
+      const int a = axis == 2 ? u : v;
+      const int b = axis == 2 ? v : u;
       int s[3];
       s[axis] = sa;
       s[(axis + 1) % 3] = a;
@@ -581,6 +589,36 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
   }
   const uint32_t count = (uint32_t)list_.size();
   if (count == 0) return 0;   // first entry alone blew the budget: cannot happen
+  // ---- ONE LEVEL-CHUNK COLUMN, ONE CONTIGUOUS RUN (2026-10-11) ------------
+  // `far` builds a column's prologue once for a RUN of consecutive entries on
+  // the same level-chunk column (worldgen.wgsl THE COLUMN STACK), so the
+  // tick's entries are grouped by (level, slot x, slot z), stable, so a
+  // column's entries keep their queue order. Order inside one tick's dispatch
+  // carries no meaning -- every far pass runs all of its entries as one
+  // dispatch, behind a barrier from the pass before -- so this moves no byte;
+  // the patch header pairs move with their entries because `farpatch`
+  // indexes them by dispatch index.
+  {
+    order_.resize(count);
+    for (uint32_t i = 0; i < count; i++) order_[i] = i;
+    auto colKey = [&](uint32_t i) {
+      const uint32_t e = list_[i] & ~kFarListMapBit;
+      const uint32_t s = e & kFarSlotMask;
+      return ((e >> kFarSlotShift) << 16) |
+             ((s / (kFarNChunk * kFarNChunk)) << 8) | (s % kFarNChunk);
+    };
+    std::stable_sort(order_.begin(), order_.end(),
+                     [&](uint32_t a, uint32_t b) { return colKey(a) < colKey(b); });
+    sortList_.resize(count);
+    sortHeader_.resize((size_t)count * 2);
+    for (uint32_t i = 0; i < count; i++) {
+      sortList_[i] = list_[order_[i]];
+      sortHeader_[2 * i] = patchHeader_[2 * order_[i]];
+      sortHeader_[2 * i + 1] = patchHeader_[2 * order_[i] + 1];
+    }
+    list_.swap(sortList_);
+    patchHeader_.swap(sortHeader_);
+  }
   queue.WriteBuffer(world_->farList, 0, list_.data(), count * 4);
   // The header is written for EVERY dispatched entry, always — the kernel
   // indexes it by dispatch index and a stale pair points the patch loop at

@@ -577,7 +577,18 @@ void Recorder::TimerOpen(const char* group) {
   if (timerPool_ == VK_NULL_HANDLE || !timerAlloc_ || !group) return;
   uint32_t b = 0, e = 0;
   if (!timerAlloc_(group, b, e)) return;  // pool full: this group goes untimed
-  be_.Fns().CmdWriteTimestamp2(cmd_, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, timerPool_, b);
+  // SANDVOX_GPU_TIMER_SERIAL=1: begin at ALL_COMMANDS instead, i.e. after the
+  // previous pass has drained. A TOP_OF_PIPE begin latches while the pass
+  // before is still running, so back-to-back passes behind a barrier OVERLAP
+  // and the later one is charged the earlier one's tail: in the far chain an
+  // empty farMapFill (every entry returning on its first load) read 3 ms a
+  // tick. The serial arm costs the drain a barrier would mostly have paid
+  // anyway; it is for attribution, not for a frame-time number.
+  static const bool serial = std::getenv("SANDVOX_GPU_TIMER_SERIAL") != nullptr;
+  be_.Fns().CmdWriteTimestamp2(cmd_,
+                               serial ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+                                      : VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                               timerPool_, b);
   timerGroup_ = group;
   timerEndIdx_ = e;
 }
