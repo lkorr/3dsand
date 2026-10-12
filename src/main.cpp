@@ -1458,7 +1458,13 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
   for (auto& c : ui.coats) c = {};
   ui.coatCount = 0;
   ui.stainHudMin = CurrentTuning().coat.hudMinFrac;
-  const MobDef* def = avatar.Def();
+  // NO RIG, NO READOUT (overlay.h bodyValid: "false until the avatar has
+  // spawned"). Fly mode DESPAWNS the rig (session.cpp "FLY MODE HAS NO
+  // BODY") but keeps its def, and this read `def != nullptr` alone: every
+  // limb of the absent rig then reported !PartAlive -> severed, so a flying
+  // player -- every `--at` harness shot, which forces fly -- wore a "MAIMED"
+  // doll of sixteen lost limbs over an "hp 0" bar (D9, the dungeon shots).
+  const MobDef* def = avatar.Spawned() ? avatar.Def() : nullptr;
   ui.bodyValid = def != nullptr;
   if (!def) return;
   const uint64_t mobId = avatar.Id();
@@ -16975,7 +16981,10 @@ int main(int argc, char** argv) {
       // handles, so refilling it would replace the readout of the body that
       // died with a readout of nothing. Thawed by the respawn below.
       if (!deathFrozen) {
-        ui.health = playerHealth.Get();
+        // A despawned (flying) rig has no parts to sum, so TotalHealth() is 0;
+        // the body it gets back on landing is a NEW rig at full health, which
+        // is what the bar shows meanwhile -- not a dying man.
+        ui.health = avatar.Spawned() || !avatar.IsAlive() ? playerHealth.Get() : avatar.HealthMax();
         ui.healthMax = avatar.HealthMax();
         ui.healthCap = avatar.HealthCap();
         ui.playerAlive = avatar.IsAlive();

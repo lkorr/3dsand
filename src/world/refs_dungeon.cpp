@@ -236,6 +236,7 @@ struct TrapLive {
   size_t cursor = 0;
   std::vector<std::pair<IVec3, uint32_t>> placed;   // spikes: cells to retract
   uint32_t cells = 0, ops = 0, hits = 0;
+  float wallT = -1.0f;   // dart: how far the last bolt flew before a wall (voxels; -1 = never fired)
   std::string note;
 };
 
@@ -499,8 +500,45 @@ void Fire(RefCtx& c, const Ref& r, TrapLive& L) {
     const IVec3 f = HeadingAxis(r.yaw);
     const Vec3 o{(float)r.pos.x + 0.5f, (float)r.pos.y + 0.5f, (float)r.pos.z + 0.5f};
     const float range = PropFloat(r, "range", 120.0f);
+    // THE BOLT STOPS AT THE FIRST WALL (D9; D3 hit any body on the line, so a
+    // dart in one room struck a player in the next through the rock). The
+    // line is axis-aligned, so it is walked cell by cell from the cell in
+    // front of the launcher: the first SOLID cell caps the range for both the
+    // hit test and the particle. Read from the CPU mirror (World::KindAt,
+    // collision classes: passable vegetation is air), the same contract every
+    // body's collision has; an Unknown cell (outside the mirror) is open, as
+    // it is for projectiles -- so a dart fired far from every player can
+    // still pass a wall the CPU cannot see (a limitation, not a hit through a
+    // wall anyone is standing at).
+    float wallT = range;
+    if (c.world != nullptr && c.mats != nullptr) {
+      static thread_local const std::vector<MaterialDef>* clsFor = nullptr;
+      static thread_local size_t clsN = 0;
+      static thread_local std::vector<uint32_t> cls;
+      if (clsFor != c.mats || clsN != c.mats->size()) {
+        cls = BuildCollisionClasses(*c.mats);
+        clsFor = c.mats;
+        clsN = c.mats->size();
+      }
+      // A launcher is usually SET INTO its wall ("dart_wall"): the solid cells
+      // it starts in -- up to kDartBore of them -- are its own housing, and
+      // the bolt is stopped only by a solid cell after open air.
+      constexpr int kDartBore = 8;
+      const int steps = (int)std::ceil(range);
+      bool open = false;
+      for (int t = 0; t <= steps; t++) {
+        const IVec3 cell{r.pos.x + f.x * t, r.pos.y, r.pos.z + f.z * t};
+        const bool solid = c.world->KindAt(cell, cls) == CellKind::Solid;
+        if (!solid) { open = true; continue; }
+        if (open || t >= kDartBore) {
+          wallT = std::max(0.0f, (float)t - 0.5f);   // the wall's near face
+          break;
+        }
+      }
+    }
+    L.wallT = wallT;
     Mob* best = nullptr;
-    float bestT = range;
+    float bestT = wallT;
     for (BodyRef& b : Bodies(c, true, true)) {
       const float dx = b.foot.x - o.x, dz = b.foot.z - o.z;
       const float t = dx * (float)f.x + dz * (float)f.z;
@@ -527,11 +565,11 @@ void Fire(RefCtx& c, const Ref& r, TrapLive& L) {
         p.vy = 0;
         p.vz = (int32_t)std::lround((float)f.z * speed * 256.0f);
         p.payload = mat;
-        p.flags = kPFlagMicro | ParticleMicroBits(4, (int)std::min(255.0f, range / speed + 2.0f));
+        p.flags = kPFlagMicro | ParticleMicroBits(4, (int)std::min(255.0f, wallT / speed + 1.0f));
         c.ops->spawns.push_back(p);
       }
     }
-    L.note = best != nullptr ? "a dart hit" : "a dart flew";
+    L.note = best != nullptr ? "a dart hit" : (wallT < range ? "a dart struck a wall" : "a dart flew");
   } else {
     L.note = "unknown trap type \"" + type + "\"";
   }
@@ -1004,6 +1042,7 @@ bool TrapStatusOf(const std::string& id, TrapStatus& out) {
   out.cells = L.cells;
   out.ops = L.ops;
   out.hits = L.hits;
+  out.wallT = L.wallT;
   out.note = L.note;
   out.type.clear();
   if (DW().idxFor != nullptr)
