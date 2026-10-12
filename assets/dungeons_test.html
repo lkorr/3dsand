@@ -90,7 +90,10 @@ const ID = Q.get('id') || '_d4_check';
   probe = () => 'kit view: ' + K.view.status.textContent + ' | ' + wvs(K.view) + ' | ' + W.document.querySelector('#view-dungeons .dg-pages .st').textContent;
   ok = await until(() => K.st.program && K.view.wv && K.view.wv.pal, 30000);
   say(ok, 'kit page: ' + (K.st.program ? K.st.kit + '/' + K.st.type + ' compiled, ' + K.st.program.prims.length + ' prims, ' + K.st.program.sockets.length + ' sockets' : 'no program'));
-  ok = await until(() => { const s = K.view.wv.stats; return s.ready >= Math.max(4, s.live * 0.9) && !K.view.wv.inflight && s.quads > 0; }, 90000, 300);
+  // READY = the page's own test (ui_kit.js ready()): THIS program installed
+  // in the voxel server, streamed and meshed -- not "some regions are ready",
+  // which passed on the previous program's regions mid-install.
+  ok = await until(() => K.ready() && K.view.wv.stats.quads > 0, 90000, 300);
   const ks = K.view.wv.stats;
   say(ok, 'kit page: DUNGEON ISOLATE regions streamed + meshed (' + ks.ready + '/' + ks.live + ' regions, ' + ks.quads + ' quads, ' + ks.fetches + ' fetches)');
   await sleep(300);
@@ -100,7 +103,7 @@ const ID = Q.get('id') || '_d4_check';
   const before = K.view.wv.stats.fetches;
   K.st.params = Object.assign({}, K.st.params, {width: (K.st.params.width || 3) + 1});
   await K.run(true);
-  ok = await until(() => K.view.wv.stats.fetches > before && K.view.wv.staleCount() === 0 && !K.view.wv.inflight, 60000, 300);
+  ok = await until(() => K.view.wv.stats.fetches > before && K.ready(), 60000, 300);
   say(ok, 'kit page: a slider change re-previews by soft refresh (' + (K.view.wv.stats.fetches - before) + ' region refetches)');
 
   /* ---- Dungeon page: snap, grow, undo, entities, save ---- */
@@ -166,7 +169,7 @@ const ID = Q.get('id') || '_d4_check';
   ok = await until(() => S.d.pieces.length === 2 + nProp, 5000);
   say(ok, 'keep: the dungeon has ' + S.d.pieces.length + ' pieces');
   // wait for the voxels of the grown dungeon
-  ok = await until(() => { const s = St.view.wv && St.view.wv.stats; return s && s.ready >= Math.max(4, s.live * 0.9) && !St.view.wv.inflight && s.quads > 0; }, 120000, 300);
+  ok = await until(() => St.ready() && St.view.wv.stats.quads > 0, 120000, 300);
   say(ok, 'dungeon page: the stitched dungeon streams + meshes (' + (St.view.wv ? St.view.wv.stats.ready + '/' + St.view.wv.stats.live : '-') + ' regions)');
   await sleep(300);
   px = pixels(St.view);

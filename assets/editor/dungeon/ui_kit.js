@@ -22,7 +22,7 @@ export function createKitPage(T) {
   const view = new View3D({draw, onClick});
   let propView = null, propHost = null;
   const ui = {};
-  let timer = 0, dragging = false;
+  let timer = 0, dragging = false, pend = false, running = false;
 
   /* ---- layout ---- */
   function build() {
@@ -152,10 +152,19 @@ export function createKitPage(T) {
   }
   function regen(final) {
     clearTimeout(timer);
-    timer = setTimeout(() => run(final), final ? 0 : 60);
+    pend = true;
+    timer = setTimeout(() => { pend = false; run(final); }, final ? 0 : 60);
   }
+  /** READY: the piece on screen is the current program, installed and
+   *  streamed (ui_stitch.js ready() says why "regions ready" alone is not). */
+  function ready() { return !!st.program && !pend && !running && pv.holds(st.program) && view.settled(); }
   async function run(final) {
+    running = true;
+    try { await runInner(final); } finally { running = false; }
+  }
+  async function runInner(final) {
     if (!T.isActive()) return;
+    view.previewer = pv;
     const t0 = performance.now();
     let prog;
     try { prog = DG.compile(dungeonOf(), {id: '_kit_preview'}); }
@@ -285,6 +294,6 @@ export function createKitPage(T) {
     view.start();
   }
   function deactivate() { view.stop(); if (propView) propView.stop(); }
-  return {activate, deactivate, view, st, setKit, setType, run, presets: kitPresets,
+  return {activate, deactivate, view, st, ready, pv, setKit, setType, run, presets: kitPresets,
           setUserPresets(p) { st.userPresets = p; if (built && st.type) renderPresets(); }};
 }

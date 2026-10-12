@@ -61,6 +61,9 @@ export function createStitchPage(T) {
                            () => rebuild({voxels: true}));
   const ui = {};
   let built = false, compileT = 0, validT = 0, previewT = 0, materials = null;
+  // READINESS (ready(), below): a compile or a preview queued on a timer, or a
+  // preview() between its install and its ROI / refresh, is work not yet visible.
+  let pendC = false, pendP = false, inPreview = false;
 
   /* =========================================================================
    * layout
@@ -77,6 +80,7 @@ export function createStitchPage(T) {
     const bar = h('div', {class: 'dg-bar'},
       h('label', {}, 'dungeon ', ui.listSel),
       h('button', {onclick: newDungeon}, 'New'), ui.save, h('button', {onclick: duplicate, title: 'save a copy under a new id'}, 'Duplicate'),
+      h('button', {onclick: newVariant, title: 'a VARIANT of this (saved) dungeon: a dungeon.json that extends it and stores only what differs -- changes to the base still reach it'}, 'New variant…'),
       h('button', {onclick: revert, title: 'throw away unsaved changes'}, 'Revert'),
       h('span', {}, '│'), h('label', {}, 'name ', ui.name), h('label', {}, 'style ', ui.style), h('label', {}, 'seed ', ui.seed),
       h('span', {}, '│'), ui.undo, ui.redo,
@@ -125,27 +129,52 @@ export function createStitchPage(T) {
                    tog('labels', 'labels', 'name every ref'), tog('waynodes', 'showWay', 'the generated walking graph'), tog('suggested', 'showSug', 'what the pieces suggest (doors, chests, traps, lights)'));
     for (const b of ui.vbar.querySelectorAll('button[data-v]')) b.classList.toggle('on', b.dataset.v === S.view);
   }
-  function setViewMode(m) {
-    if (m === 'world' && !placementOf()) {
+  /** sel: which placement to show in world -- {map, id} (the World map page's
+   *  "Open in Dungeons tab" names its own map and entry), else the one already
+   *  on screen, else one on the game's map, else the first. */
+  function setViewMode(m, sel) {
+    if (m === 'world' && !placementOf(sel)) {
       const at = prompt('This dungeon is not placed on a map yet. Preview it at which map column? "x, z" (world voxels) -- or place it on Environment > World map (Dungeons tool).', '0, 0');
       if (!at) return;
       const v = at.split(/[ ,]+/).map(Number);
       if (v.length < 2 || !v.every(isFinite)) return;
       S.world = {map: '', entry: {id: '_scratch', at: [Math.round(v[0]), Math.round(v[1])], yaw: 0, yOffset: 0}, scratch: true};
-    } else if (m === 'world') S.world = placementOf();
+    } else if (m === 'world') S.world = placementOf(sel);
     S.view = m;
     for (const b of ui.vbar.querySelectorAll('button[data-v]')) b.classList.toggle('on', b.dataset.v === m);
     ui.worldBox.style.display = m === 'world' ? '' : 'none';
-    if (m === 'world') {
-      const e = S.world.entry;
-      ui.worldBox.replaceChildren(h('span', {class: 'dg-chip'}, (S.world.map ? S.world.map + ': ' : 'scratch: ') + e.at.join(', ') + ' yaw ' + (e.yaw || 0) + ' yOff ' + (e.yOffset || 0)));
-    }
+    if (m === 'world') renderWorldBox();
     S.infoKey = '';
+    S.heights = null;
     schedulePreview(0);
   }
-  function placementOf() {
+  /** The in-world chip: which placement (any map) is shown, switchable. */
+  function renderWorldBox() {
+    const e = S.world.entry, P = placementsOf();
+    const label = (p) => p.map + ': ' + p.id + ' @ ' + (p.at || []).join(', ') + ' yaw ' + (p.yaw || 0) + (p.yOffset ? ' yOff ' + p.yOffset : '');
+    if (P.length > 1 || (P.length && S.world.scratch)) {
+      const s = h('select', {title: 'which placement to show: every map that places this dungeon (Environment > World map > Dungeons tool)', onchange: () => {
+        if (s.value === '_scratch') { S.world = null; placementOverride = true; setViewMode('world', {map: '\u0000'}); placementOverride = false; return; }
+        const [map, id] = s.value.split('\u0001'); setViewMode('world', {map, id});
+      }}, ...P.map(p => h('option', {value: p.map + '\u0001' + p.id}, label(p))), h('option', {value: '_scratch'}, 'a scratch column…'));
+      s.value = S.world.scratch ? '_scratch' : S.world.map + '\u0001' + e.id;
+      ui.worldBox.replaceChildren(s);
+    } else {
+      ui.worldBox.replaceChildren(h('span', {class: 'dg-chip'}, S.world.scratch ? 'scratch: ' + e.at.join(', ') + ' yaw ' + (e.yaw || 0) + ' yOff ' + (e.yOffset || 0) : label(Object.assign({map: S.world.map}, e))));
+    }
+  }
+  let placementOverride = false;
+  function placementsOf() {
     const L = S.list.find(x => x.id === S.id);
-    const p = L && L.placements && L.placements[0];
+    return (L && L.placements) || [];
+  }
+  function placementOf(sel) {
+    if (placementOverride) return null;      // "a scratch column…": ask for one
+    const P = placementsOf();
+    let p = null;
+    if (sel && sel.map) p = P.find(x => x.map === sel.map && (!sel.id || x.id === sel.id)) || null;
+    if (!p && S.world && !S.world.scratch) p = P.find(x => x.map === S.world.map && x.id === S.world.entry.id) || null;
+    if (!p) p = P.find(x => x.map === S.gameMap) || P[0] || null;
     return p ? {map: p.map, entry: p} : null;
   }
 
@@ -217,7 +246,9 @@ export function createStitchPage(T) {
   function rebuild(opts) {
     opts = opts || {};
     clearTimeout(compileT);
+    pendC = true;
     compileT = setTimeout(() => {
+      pendC = false;
       compileNow();
       if (opts.voxels !== false) schedulePreview(opts.fast ? 30 : 120);
       scheduleValidate();
@@ -265,13 +296,61 @@ export function createStitchPage(T) {
   }
   function schedulePreview(ms) {
     clearTimeout(previewT);
-    previewT = setTimeout(preview, ms === undefined ? 120 : ms);
+    pendP = true;
+    previewT = setTimeout(() => { pendP = false; preview(); }, ms === undefined ? 120 : ms);
   }
   async function preview() {
+    inPreview = true;
+    try { await previewInner(); } finally { inPreview = false; }
+  }
+  /** THE ROI of the in-world view: the dungeon's bounds + a terrain margin,
+   *  and up to the real ground over its footprint (+ a little sky) once the
+   *  heights are known -- not a fixed 11 m slab of sky over a 150 m dungeon. */
+  const WORLD_PAD = 96;
+  function worldRoi() {
+    const b = S.prog.bounds;
+    let top = Math.max(b.max[1], 0) + 64;
+    if (S.heights) {
+      let g = -Infinity;
+      const st = 16;
+      for (let x = b.min[0] - WORLD_PAD; x <= b.max[0] + WORLD_PAD; x += st)
+        for (let z = b.min[2] - WORLD_PAD; z <= b.max[2] + WORLD_PAD; z += st) {
+          const w = S.heights.frame.pt([x + 0.5, 0, z + 0.5]), r = S.heights.hm.at(w[0], w[2]);
+          if (r) g = Math.max(g, r.ground - S.heights.frame.origin[1], r.water === null ? -Infinity : r.water - S.heights.frame.origin[1]);
+        }
+      if (isFinite(g)) top = Math.max(b.max[1], g) + 32;
+    }
+    return {min: [b.min[0] - WORLD_PAD, b.min[1] - 24, b.min[2] - WORLD_PAD], max: [b.max[0] + WORLD_PAD, top, b.max[2] + WORLD_PAD]};
+  }
+  /** In world: the ground the WorldView culls buried rock by (the margin
+   *  columns' deep regions are synthesised, never fetched), and the box it
+   *  must NOT cull (the dungeon + the walls of the cut-away hole). */
+  function worldCull() {
+    const wv = view.wv;
+    if (!wv) return;
+    if (S.view !== 'world' || !S.heights || !S.prog) { wv.groundAt = null; wv.view.keepBox = null; return; }
+    const H = S.heights;
+    wv.groundAt = (x, z) => { const r = H.hm.at(x, z); return r ? Math.max(r.ground, r.water === null ? -Infinity : r.water) : null; };
+    const b = S.prog.bounds, k = view.frame.box([b.min[0] - 48, b.min[1] - 48, b.min[2] - 48], [b.max[0] + 48, b.max[1] + 48, b.max[2] + 48]);
+    wv.view.keepBox = {min: k.min.map(Math.floor), max: k.max.map(Math.ceil)};
+  }
+  /** READY: the program on screen IS the current one -- compiled, installed in
+   *  the voxel server, its regions streamed, meshed and refined to the last
+   *  pass. (The old harness test -- "the view's regions are ready" -- passed
+   *  on the PREVIOUS program's regions while the new one was still being
+   *  installed.) */
+  function ready() {
+    return !!S.prog && !pendC && !pendP && !inPreview && pv.holds(S.prog) && view.settled();
+  }
+  async function previewInner() {
     if (!T.isActive() || !S.prog) return;
     if (!S.d.pieces.length && !(S.proposal)) { ui.empty.style.display = ''; ui.empty.textContent = emptyText(); view.dirty = true; return; }
     ui.empty.style.display = 'none';
     if (!view.ensure()) { T.setStatus(view.error, true); return; }
+    view.previewer = pv;
+    // Coarse first, then refine, in world (the expensive view: a 150 m
+    // dungeon + its terrain); the isolated x-ray stays one pass.
+    view.progressive = S.view === 'world' ? [0.3, 0.6, 1.0] : null;
     const place = S.view === 'world' && S.world
       ? (S.world.scratch || S.world.map === '' ? {mode: 'place', at: S.world.entry.at, yOffset: S.world.entry.yOffset || 0, yaw: S.world.entry.yaw || 0}
                                                  : {mode: 'map', id: S.world.entry.id, map: S.world.map})
@@ -290,10 +369,11 @@ export function createStitchPage(T) {
       const key = JSON.stringify(place);
       const moved = view.setFrame(r.info.origin, r.info.yaw || 0);
       const b = S.prog.bounds;
-      if (S.view === 'world') view.setRoi([b.min[0] - 160, b.min[1] - 24, b.min[2] - 160], [b.max[0] + 160, Math.max(b.max[1], 0) + 110, b.max[2] + 160], 0);
+      if (S.view === 'world') { const R = worldRoi(); view.setRoi(R.min, R.max, 0); }
       else view.setRoi(b.min, b.max, 24);
       applyClip();
-      if (moved || key !== S.infoKey) { view.invalidate(); if (key !== S.infoKey || !S.framed) { frameAll(); S.framed = true; } S.infoKey = key; S.heights = null; maybeHeights(); }
+      worldCull();
+      if (moved || key !== S.infoKey) { view.invalidate(); if (key !== S.infoKey || !S.framed) { frameAll(); S.framed = true; } S.infoKey = key; S.heights = null; worldCull(); maybeHeights(); }
       else view.refresh(r.boxes);
       view.extraStatus = S.prog.prims.length + ' prims · compile ' + (S.compileMs || 0).toFixed(0) + ' ms' + (r.boxes === 'all' ? '' : ' · refreshed ' + r.boxes.length + ' box(es)');
     } catch (e) {
@@ -357,10 +437,14 @@ export function createStitchPage(T) {
     if (!S.info || S.view !== 'world' || !S.prog) return;
     const b = S.prog.bounds, f = makeFrame(S.info.origin, S.info.yaw || 0);
     const wb = f.box(b.min, b.max);
-    const span = Math.max(wb.max[0] - wb.min[0], wb.max[2] - wb.min[2]) + 64;
+    const span = Math.max(wb.max[0] - wb.min[0], wb.max[2] - wb.min[2]) + 2 * WORLD_PAD + 64;   // the in-world ROI's margin too (worldRoi, worldCull)
     try {
       const hm = await api.heights((wb.min[0] + wb.max[0]) / 2, (wb.min[2] + wb.max[2]) / 2, span, Math.min(512, Math.max(64, Math.round(span / 2))), S.world && S.world.map);
       S.heights = {hm, frame: f};
+      // The ground is known now: tighten the in-world ROI to it and let the
+      // view cull the buried margin (a soft change: the octree rebuilds next
+      // frame, nothing resident is dropped).
+      if (S.view === 'world' && S.prog && view.wv) { const R = worldRoi(); view.setRoi(R.min, R.max, 0); worldCull(); }
       validateNow();
     } catch (e) { T.setStatus('ground for validation: ' + e.message, true); }
   }
@@ -849,6 +933,7 @@ export function createStitchPage(T) {
         S.d.pieces.length + ' pieces · ' + S.refs.length + ' refs · ' + (S.d.props || []).length + ' props · ' + S.prog.prims.length + ' prims · ' +
         fmtM(S.prog.bounds.max[0] - S.prog.bounds.min[0]) + ' × ' + fmtM(S.prog.bounds.max[1] - S.prog.bounds.min[1]) + ' × ' + fmtM(S.prog.bounds.max[2] - S.prog.bounds.min[2])),
         h('div', {class: 'dg-hint'}, 'Click a piece, a socket frame, a ref marker or a prop. Keys: arrows / PgUp / PgDn move (Shift ×10), R turns, Delete removes, F frames, G grows from a socket, Ctrl+Z / Ctrl+Y, Ctrl+S.'));
+      if (S.variant) out.push(h('h4', {}, 'Variant of ' + S.variant.base), variantSummary());
       out.push(h('h4', {}, 'Entrance'), h('div', {class: 'dg-hint'}, S.prog.entrance.piece ? S.prog.entrance.piece + '.' + S.prog.entrance.socket + (S.d.entrance ? '' : ' (the first surface socket)') : 'none yet'));
       out.push(h('h4', {}, 'Palette'), paletteEditor());
       const pl = S.list.find(x => x.id === S.id);
@@ -878,6 +963,15 @@ export function createStitchPage(T) {
     if (!p) return [h('div', {class: 'dg-hint'}, 'piece ' + id + ' is part of the PROPOSAL: keep it to edit it')];
     const T0 = DG.getType(p.kit, p.type);
     const out = [h('h4', {}, id + ' · ' + p.kit + '/' + p.type), h('div', {class: 'dg-hint'}, T0.label + ' v' + T0.version + ' · pos ' + p.pos.join(', ') + ' (dungeon frame) · yaw ' + p.yaw + '°')];
+    if (S.variant) {
+      // A VARIANT: is this piece the base's, an override of it, or the variant's own?
+      const st = pieceState(id);
+      const what = st === 'inherited' ? 'inherited from ' + S.variant.base + ' unchanged'
+                 : st === 'added' ? 'added by this variant (not in ' + S.variant.base + ')'
+                 : 'OVERRIDDEN: ' + Object.keys(pieceOverride(S.variant.baseFlat.pieces.find(x => x.id === id), p) || {}).join(', ') + ' differ from ' + S.variant.base;
+      out.push(h('div', {class: 'dg-field'}, h('span', {class: 'dg-chip', style: st === 'overridden' ? 'color:var(--yellow,#e8c35a)' : st === 'added' ? 'color:var(--green,#7bd88f)' : ''}, st), ' ', what,
+        st === 'overridden' ? h('button', {style: 'margin-left:6px', title: 'throw away this variant\'s changes to the piece: the base\'s piece again', onclick: () => revertPiece(id)}, 'Revert to base') : null));
+    }
     out.push(h('div', {class: 'dg-btns'},
       h('button', {onclick: () => turnPiece(id, 1), title: 'R'}, 'Turn ↻'), h('button', {onclick: () => turnPiece(id, -1), title: 'Shift+R'}, 'Turn ↺'),
       h('button', {onclick: () => resnap(id), title: 'put it back on its link'}, 'Re-snap'),
@@ -896,7 +990,8 @@ export function createStitchPage(T) {
       hist.push('slider ' + id + '.' + k, 'sl:' + id + ':' + k);
       p.params = T0.normalize(Object.assign({}, p.params, {[k]: v}));
       clearTimeout(compileT);
-      compileT = setTimeout(() => { compileNow(); schedulePreview(final ? 0 : 60); scheduleValidate(); renderBottom(); renderHeader(); view.dirty = true; }, final ? 0 : 40);
+      pendC = true;
+      compileT = setTimeout(() => { pendC = false; compileNow(); schedulePreview(final ? 0 : 60); scheduleValidate(); renderBottom(); renderHeader(); view.dirty = true; }, final ? 0 : 40);
     }, {closed: ['Surface', 'Age', 'Light', 'Join']});
     out.push(sp.root);
     const sk = S.sockets.filter(s => s.piece === id);
@@ -1142,15 +1237,191 @@ export function createStitchPage(T) {
   }
   async function refreshList() {
     try { const j = await api.list(); S.list = j.dungeons; S.gameMap = j.gameMap; } catch (e) { S.list = []; T.setStatus('dungeon list: ' + e.message, true); }
-    ui.listSel.replaceChildren(h('option', {value: ''}, S.id ? '' : '(new, unsaved)'), ...S.list.map(d => h('option', {value: d.id}, d.id + (d.name && d.name !== d.id ? ' — ' + d.name : '') + (d.placements.length ? ' ⌂' : ''))));
+    ui.listSel.replaceChildren(h('option', {value: ''}, S.id ? '' : '(new, unsaved)'), ...S.list.map(d => h('option', {value: d.id}, d.id + (d.name && d.name !== d.id ? ' — ' + d.name : '') + (d.extends ? '  (variant of ' + d.extends + ')' : '') + (d.placements.length ? ' ⌂' : ''))));
     ui.listSel.value = S.id;
   }
+  /* =========================================================================
+   * VARIANTS (dungeon.json `extends`, package D8's inheritance)
+   * ======================================================================
+   * A variant's dungeon.json is the base's id + OVERRIDES: name / seed /
+   * palette (and style / entrance / props when changed), `pieces: {<id>:
+   * {params: {partial}, seed?, type?, ..., remove: true}}`, `add: [piece]`,
+   * `refsPatch: {add: [ref], remove: [name], set: {<name>: {fields}}}`. The
+   * page edits the FLATTENED dungeon (S.d = base + overrides, what compiles
+   * and previews) and writes the overrides back on save -- never the
+   * flattening, so a later change to the base still reaches the variant.
+   * dungeongen.js resolveDungeon(d, loadBase) is the resolver (D8). Without it
+   * (a tree where D8 has not landed) a variant opens READ-ONLY through the
+   * local resolver below, which reads the same fields for display only. */
+  const canResolve = typeof DG.resolveDungeon === 'function';
+  const stable = (v) => JSON.stringify(v, (k, x) => x && typeof x === 'object' && !Array.isArray(x) ? Object.keys(x).sort().reduce((o, kk) => (o[kk] = x[kk], o), {}) : x);
+  const same = (a, b) => stable(a === undefined ? null : a) === stable(b === undefined ? null : b);
+  const clone = (v) => v === undefined ? undefined : JSON.parse(JSON.stringify(v));
+  async function rawOf(id) {
+    const j = await api.get(id);
+    return {raw: JSON.parse(j.dungeon), refs: j.refs};
+  }
+  async function localResolve(raw, depth) {
+    if (!raw.extends) return clone(raw);
+    if ((depth || 0) > 8) throw new Error('extends chain deeper than 8 (a cycle?)');
+    const out = await localResolve((await rawOf(raw.extends)).raw, (depth || 0) + 1);
+    delete out.extends;
+    for (const k of ['name', 'seed', 'palette', 'style', 'entrance', 'props']) if (raw[k] !== undefined) out[k] = clone(raw[k]);
+    const ov = raw.pieces && !Array.isArray(raw.pieces) ? raw.pieces : {};
+    out.pieces = (out.pieces || []).filter(p => !(ov[p.id] && ov[p.id].remove)).map(p => {
+      const o = ov[p.id];
+      if (!o) return p;
+      const q = Object.assign({}, p, clone(o));
+      delete q.remove;
+      q.params = Object.assign({}, p.params || {}, clone(o.params) || {});
+      return q;
+    });
+    for (const p of raw.add || []) out.pieces.push(clone(p));
+    return out;
+  }
+  async function flatten(raw) {
+    const r = canResolve ? await DG.resolveDungeon(raw, async (bid) => (await rawOf(bid)).raw) : await localResolve(raw);
+    const d = DG.normalizeDungeon(r);
+    delete d.extends;
+    return d;
+  }
+  function applyRefsPatch(refs, rp) {
+    if (!rp) return refs;
+    const gone = new Set(rp.remove || []);
+    const out = refs.filter(r => !gone.has(r.name)).map(r => rp.set && rp.set[r.name] ? Object.assign({}, r, clone(rp.set[r.name])) : r);
+    for (const r of rp.add || []) out.push(clone(r));
+    return out;
+  }
+  /** The overrides of piece p against the base's piece b (null = none). */
+  function pieceOverride(b, p) {
+    if (!b || !p) return null;
+    const o = {}, params = {};
+    for (const k of new Set([...Object.keys(b.params || {}), ...Object.keys(p.params || {})]))
+      if (!same((b.params || {})[k], (p.params || {})[k])) params[k] = clone(p.params[k]);
+    if (Object.keys(params).length) o.params = params;
+    for (const k of new Set([...Object.keys(b), ...Object.keys(p)])) {
+      if (k === 'id' || k === 'params') continue;
+      if (!same(b[k], p[k])) o[k] = clone(p[k]);
+    }
+    return Object.keys(o).length ? o : null;
+  }
+  function pieceState(id) {
+    const b = S.variant && S.variant.baseFlat.pieces.find(x => x.id === id);
+    if (!b) return 'added';
+    return pieceOverride(b, piece(id)) ? 'overridden' : 'inherited';
+  }
+  function revertPiece(id) {
+    const b = S.variant && S.variant.baseFlat.pieces.find(x => x.id === id);
+    if (!b) return;
+    edit('revert ' + id + ' to base', () => { const i = S.d.pieces.findIndex(x => x.id === id); if (i >= 0) S.d.pieces[i] = DG.normalizePiece(clone(b)); });
+    renderInspector();
+  }
+  function refsPatchOf(base, refs) {
+    const bn = new Map(base.map(r => [r.name, r])), rn = new Map(refs.map(r => [r.name, r]));
+    const rp = {add: [], remove: [], set: {}};
+    for (const r of base) if (!rn.has(r.name)) rp.remove.push(r.name);
+    for (const r of refs) {
+      const b = bn.get(r.name);
+      if (!b) { rp.add.push(clone(r)); continue; }
+      const d = {};
+      for (const k of new Set([...Object.keys(b), ...Object.keys(r)])) if (!same(b[k], r[k])) d[k] = clone(r[k]);
+      if (Object.keys(d).length) rp.set[r.name] = d;
+    }
+    if (!rp.add.length) delete rp.add;
+    if (!rp.remove.length) delete rp.remove;
+    if (!Object.keys(rp.set).length) delete rp.set;
+    return Object.keys(rp).length ? rp : null;
+  }
+  /** The variant's dungeon.json object: the base id + what differs from it. */
+  function variantRaw() {
+    const V = S.variant, B = V.baseFlat, D = S.d;
+    const RE = ['extends', 'name', 'seed', 'palette', 'style', 'entrance', 'props', 'pieces', 'add', 'refsPatch'];
+    const o = {};
+    for (const [k, v] of Object.entries(V.raw)) if (!RE.includes(k)) o[k] = v;     // version, refs, label...
+    o.extends = V.base;
+    for (const k of ['name', 'seed', 'palette', 'style', 'entrance', 'props']) if (!same(D[k], B[k])) o[k] = clone(D[k]);
+    const pieces = {}, add = [], dp = new Set(D.pieces.map(p => p.id));
+    for (const b of B.pieces) if (!dp.has(b.id)) pieces[b.id] = {remove: true};
+    for (const p of D.pieces) {
+      const b = B.pieces.find(x => x.id === p.id);
+      if (!b) { add.push(clone(p)); continue; }
+      const ov = pieceOverride(b, p);
+      if (ov) pieces[p.id] = ov;
+    }
+    if (Object.keys(pieces).length) o.pieces = pieces;
+    if (add.length) o.add = add;
+    const rp = refsPatchOf(V.baseRefs, S.refs);
+    if (rp) o.refsPatch = rp;
+    if (S.refs.length && !o.refs) o.refs = 'refs.json';
+    return o;
+  }
+  function variantSummary() {
+    const V = S.variant;
+    const st = S.d.pieces.map(p => [p.id, pieceState(p.id)]);
+    const n = (s) => st.filter(x => x[1] === s).map(x => x[0]);
+    const removed = V.baseFlat.pieces.filter(b => !S.d.pieces.some(p => p.id === b.id)).map(b => b.id);
+    const rp = refsPatchOf(V.baseRefs, S.refs) || {};
+    return h('div', {class: 'dg-hint'},
+      (V.readOnly ? 'READ-ONLY here: this tree\'s dungeongen.js has no resolveDungeon (package D8\'s inheritance is not merged), so the variant is shown through a display-only resolver and cannot be saved. ' : '') +
+      'Pieces: ' + n('inherited').length + ' inherited, ' + n('overridden').length + ' overridden' + (n('overridden').length ? ' (' + n('overridden').join(', ') + ')' : '') +
+      ', ' + n('added').length + ' added' + (n('added').length ? ' (' + n('added').join(', ') + ')' : '') +
+      ', ' + removed.length + ' removed' + (removed.length ? ' (' + removed.join(', ') + ')' : '') +
+      '. Refs: +' + (rp.add || []).length + ' −' + (rp.remove || []).length + ' ~' + Object.keys(rp.set || {}).length +
+      '. Saving writes only these OVERRIDES to dungeon.json (plus the compiled shell + refs); edit ' + V.base + ' itself to change what every variant inherits.');
+  }
+  async function newVariant() {
+    if (S.variant) { toast('a variant of a variant: open ' + S.variant.base + ' or save this one first, then make the variant of it'); }
+    if (!S.id || !S.list.some(x => x.id === S.id)) { toast('save the dungeon first: a variant extends a dungeon on disk', true); return; }
+    if (dirty() && !confirm('The variant extends the SAVED ' + S.id + '; your unsaved changes stay out of it. Continue?')) return;
+    if (!canResolve) { toast('this tree\'s dungeongen.js has no resolveDungeon (D8\'s dungeon inheritance): variants can be viewed here but not made', true); return; }
+    const id = (prompt('New variant of ' + S.id + ': its id (assets/dungeons/<id>/):', S.id + '_b') || '').trim();
+    if (!id) return;
+    if (!ID_RE.test(id) || id === 'props' || id === 'presets' || S.list.some(x => x.id === id)) { toast('bad or existing id', true); return; }
+    const base = S.id;
+    let b;
+    try { b = await rawOf(base); } catch (e) { toast('variant: ' + e.message, true); return; }
+    const raw = {extends: base, name: (S.d.name || base) + ' (variant)'};
+    try { await openVariant(id, raw, b); } catch (e) { toast('variant: ' + e.message, true); return; }
+    S.saved = '';
+    ui.listSel.replaceChildren(h('option', {value: id}, id + ' (new variant)'), ...S.list.map(x => h('option', {value: x.id}, x.id)));
+    ui.listSel.value = id;
+    renderHeader();
+    toast('new variant ' + id + ' of ' + base + ': change what differs and Save (only the overrides are written)');
+  }
+  /** Load variant `id` whose raw dungeon.json is `raw`; `b` = its base's {raw, refs}. */
+  async function openVariant(id, raw, b, ownRefs) {
+    const baseFlat = await flatten(b.raw);
+    const flat = await flatten(raw);
+    let baseRefs = [];
+    try { baseRefs = E.readRefs(b.refs).refs; } catch (e) { baseRefs = []; }
+    let rr;
+    try { rr = ownRefs ? E.readRefs(ownRefs) : {about: '', refs: applyRefsPatch(baseRefs, raw.refsPatch)}; }
+    catch (e) { rr = {about: '', refs: applyRefsPatch(baseRefs, raw.refsPatch)}; }
+    load(id, flat, rr);
+    S.variant = {raw, base: raw.extends, baseFlat, baseRefs, readOnly: !canResolve};
+    if (!canResolve) T.setStatus(id + ' extends ' + raw.extends + ': shown READ-ONLY (this tree has no dungeongen.js resolveDungeon)', true);
+    renderInspector();
+  }
+
   async function open(id) {
     if (!id) return;
     if (dirty() && (S.d.pieces.length || S.refs.length) && !confirm('Leave the unsaved changes to ' + (S.id || 'this dungeon') + '?')) { ui.listSel.value = S.id; return; }
     let j;
     try { j = await api.get(id); } catch (e) { toast('open ' + id + ': ' + e.message, true); return; }
     let d, rr;
+    try {
+      const raw = JSON.parse(j.dungeon);
+      if (raw && raw.extends) {
+        await openVariant(id, raw, await rawOf(raw.extends), j.refs);
+        if (S.view === 'world') setViewMode(placementOf() ? 'world' : 'xray');
+        return;
+      }
+    } catch (e) {
+      toast(id + ': the variant does not resolve: ' + e.message, true);
+      T.setStatus(id + ': variant does not resolve (' + e.message + ')', true);
+      ui.listSel.value = S.id;
+      return;
+    }
     try { d = DG.normalizeDungeon(JSON.parse(j.dungeon)); }
     catch (e) {
       // e.g. D1's _fixture: a hand-written shell whose pieces name no kit
@@ -1164,6 +1435,7 @@ export function createStitchPage(T) {
     if (S.view === 'world') setViewMode(placementOf() ? 'world' : 'xray');
   }
   function load(id, d, rr) {
+    S.variant = null;          // openVariant sets it after the load
     S.id = id; S.d = d; S.refs = rr.refs; S.about = rr.about; S.sel = null; S.proposal = null; S.tool = null; showGhost();
     try { S.A = DG.compile(d, {}).entrance.dungeonPos.slice(); } catch (e) { S.A = [0, 0, 0]; }
     S.saved = sig(); S.framed = false; S.infoKey = ''; S.ymin = S.ymax = null;
@@ -1206,8 +1478,12 @@ export function createStitchPage(T) {
   async function save() {
     if (!S.id) { const id = (prompt('Save as (dungeon id):', 'new_dungeon') || '').trim(); if (!id || !ID_RE.test(id)) return; S.id = id; }
     if (S.proposal) { toast('keep or discard the grow proposal first', true); return; }
+    if (S.variant && S.variant.readOnly) { toast(S.id + ' is a variant and this tree\'s dungeongen.js cannot resolve variants (no resolveDungeon): not saved', true); return; }
     if (S.refs.length && !S.d.refs) S.d.refs = 'refs.json';
-    const text = DG.dungeonJsonText(S.d);
+    // A VARIANT writes its overrides, not the flattening (variantRaw); the
+    // shell + refs it writes beside them are the flattened dungeon's, which is
+    // what compile_dungeon.mjs resolves the overrides to (the --check below).
+    const text = S.variant ? JSON.stringify(variantRaw(), null, 2) + '\n' : DG.dungeonJsonText(S.d);
     const prog = DG.compile(S.d, {id: S.id, sourceText: text, materials});
     const errs = S.issues.filter(i => i.severity === 'error');
     if ((prog.errors.length || errs.length) && !confirm((prog.errors.length + errs.length) + ' error(s) in the validation panel (first: ' + ((prog.errors[0] || errs[0]).msg) + ').\nThe engine refuses a shell over its limits. Save anyway?')) return;
@@ -1225,7 +1501,7 @@ export function createStitchPage(T) {
 
   /* ---- playtest ---- */
   async function playtest() {
-    const pl = placementOf();
+    const pl = S.view === 'world' && S.world && !S.world.scratch ? S.world : placementOf();   // the placement on screen, on whichever map
     if (!S.id || !pl) { toast('Playtest needs the dungeon SAVED and PLACED on a map (Environment > World map > Dungeons tool)', true); return; }
     if (dirty()) { if (!confirm('Save first? The game loads the files on disk.')) return; await save(); }
     try {
@@ -1265,7 +1541,7 @@ export function createStitchPage(T) {
       const first = (S.list.find(x => !x.id.startsWith('_')) || S.list[0] || {}).id;
       if (first) await open(first); else rebuild({voxels: true});
     } else if (pv.stale()) { S.infoKey = ''; schedulePreview(0); }
-    if (opts && opts.world) setViewMode('world');
+    if (opts && opts.world) setViewMode('world', typeof opts.world === 'object' ? opts.world : null);
     view.start();
     renderPalette();
   }
@@ -1276,6 +1552,6 @@ export function createStitchPage(T) {
     S.saved = '';
     renderHeader();
   }
-  return {activate, deactivate, view, S, open, save, attachAt, growAt, create, firstPiece, adoptWaynodes, adoptSuggestions, keepProposal, discardProposal, select, hist, placeRef, placeProp,
+  return {activate, deactivate, view, S, ready, pv, open, save, attachAt, growAt, create, firstPiece, adoptWaynodes, adoptSuggestions, keepProposal, discardProposal, select, hist, placeRef, placeProp,
           refreshList, setViewMode, presetsChanged: () => { if (built) renderPalette(); }, dirty, compileNow, validateNow};
 }

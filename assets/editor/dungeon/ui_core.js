@@ -61,7 +61,13 @@ async function jfetch(url, opts) {
   catch (e) { throw new Error('the tuner server is not reachable (' + e.message + ')'); }
   let j = null;
   try { j = await r.json(); } catch (e) { j = null; }
-  if (!r.ok || !j || j.ok === false) throw new Error((j && j.error) || ('HTTP ' + r.status + ' for ' + url.split('?')[0]));
+  if (!r.ok || !j || j.ok === false) {
+    const e = new Error((j && j.error) || ('HTTP ' + r.status + ' for ' + url.split('?')[0]));
+    // `busy`: the voxel server could not get the machine-wide GPU lock in
+    // time (tuner_server.py LockBusy). A queue, not a failure: callers retry.
+    e.busy = !!(j && j.busy);
+    throw e;
+  }
   return j;
 }
 const post = (url, body) => jfetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
@@ -149,22 +155,35 @@ export function makeFrame(origin, yaw) {
 // back re-installs its own (a cache hit: same program, same region keys).
 let OWNER = null;
 export class Previewer {
-  constructor(name) { this.name = name; this.busy = false; this.want = null; this.installed = null; this.info = null; this.key = ''; }
+  constructor(name) {
+    this.name = name; this.busy = false; this.want = null; this.installed = null; this.info = null; this.key = '';
+    this.retryW = null; this.retryT = 0; this.tries = 0;
+    // One line for the view's status bar: '' when nothing is going on.
+    this.status = '';
+  }
   /** program: a compiled shell; place: {mode:'isolate'} | {mode:'place', at, yOffset, yaw, map?} | {mode:'map', id, map?}.
    *  -> {info, boxes: 'all' | [{min,max} local], program} once installed (the latest request wins). */
   install(program, place) {
     const key = JSON.stringify(place);
     return new Promise((resolve, reject) => {
       if (this.want) this.want.resolve(null);       // superseded
+      if (this.retryW) { this.retryW.resolve(null); this.retryW = null; clearTimeout(this.retryT); }
       this.want = {program, place, key, resolve, reject};
       this._pump();
     });
   }
+  /** Nothing queued, nothing in flight, nothing waiting to retry. */
+  idle() { return !this.busy && !this.want && !this.retryW; }
+  /** Is `program` THE program the voxel server holds for this page? (the
+   *  readiness test: regions streamed before an install finished show the
+   *  previous program, which is how a "ready" could pass too early). */
+  holds(program) { return this.idle() && OWNER === this && this.installed === program; }
   async _pump() {
     if (this.busy || !this.want) return;
     const w = this.want;
     this.want = null;
     this.busy = true;
+    this.status = 'installing the program in the voxel server' + (this.tries ? ' (try ' + (this.tries + 1) + ')' : '');
     try {
       const body = Object.assign({seed: 1337, shell: w.program}, w.place);
       const info = await api.preview(body);
@@ -172,9 +191,30 @@ export class Previewer {
       const boxes = prev ? diffBoxes(prev, w.program) : 'all';
       this.installed = w.program; this.info = info; this.key = w.key;
       OWNER = this;
+      this.tries = 0;
+      this.status = '';
       w.resolve({info, boxes, program: w.program});
     } catch (e) {
-      w.reject(e);
+      if (e.busy && !this.want) {
+        // THE GPU LOCK, NOT THE PROGRAM: another sandvox run (a gate, the
+        // game, a link) holds it past the server's patience. Wait and post the
+        // same program again rather than failing the preview -- unless a newer
+        // one arrives meanwhile, which supersedes this one (install()).
+        this.tries++;
+        this.status = 'waiting for the machine-wide GPU lock to install the program: ' +
+          e.message.replace(/^busy: /, '') + ' · retry ' + this.tries;
+        this.retryW = w;
+        this.retryT = setTimeout(() => {
+          if (this.retryW !== w) return;
+          this.retryW = null;
+          if (!this.want) this.want = w; else w.resolve(null);
+          this._pump();
+        }, 2000);
+      } else {
+        this.tries = 0;
+        this.status = '';
+        w.reject(e);
+      }
     } finally {
       this.busy = false;
       if (this.want) this._pump();
@@ -451,7 +491,27 @@ export class View3D {
     this.wv.cam.dist = dist || 90;
     this.dirty = true;
   }
-  invalidate() { if (this.wv) { this.wv.invalidate(1337); this.dirty = true; } }
+  invalidate() {
+    if (!this.wv) return;
+    this.wv.invalidate(1337);
+    this.dirty = true;
+    // PROGRESSIVE REFINEMENT: a fresh picture starts at the coarsest pass
+    // (few lod-8 / lod-4 regions: the whole dungeon in seconds, even when
+    // every region queues for the GPU lock) and steps to full detail as each
+    // pass finishes streaming (_tick). The regions of a coarse pass are the
+    // fine pass's fallback, so nothing is fetched twice.
+    if (this.progressive) { this.stage = 0; this.wv.view.detail = this.progressive[0]; }
+  }
+  /** Has everything the current tree wants landed and meshed? */
+  streamIdle() {
+    const wv = this.wv;
+    if (!wv || !wv.pal || !wv.tree) return false;
+    const s = wv.stats;
+    return s.live > 0 && s.ready >= s.live && !wv.inflight && !s.queued && !wv.staleCount() && !s.meshing;
+  }
+  /** Streamed AND refined to the last pass (the harness's readiness, with the
+   *  page's own "the program is installed" test on top). */
+  settled() { return this.streamIdle() && (!this.progressive || this.stage === undefined || this.stage >= this.progressive.length - 1); }
   /** Refetch (softly) the regions of local inclusive boxes. */
   refresh(boxes) {
     if (!this.wv) return;
@@ -463,7 +523,13 @@ export class View3D {
     this.dirty = true;
   }
   /** Coarse while dragging, full on release. */
-  coarse(on) { if (this.wv) { this.wv.view.detail = on ? 0.3 : 1.0; this.dirty = true; } }
+  coarse(on) {
+    if (!this.wv) return;
+    const P = this.progressive;
+    if (!on && P) this.stage = P.length - 1;      // a release goes straight to the finest pass
+    this.wv.view.detail = on ? 0.3 : (P ? P[P.length - 1] : 1.0);
+    this.dirty = true;
+  }
 
   start() { if (!this.raf) { this._last = 0; this.raf = requestAnimationFrame(t => this._tick(t)); } }
   stop() { if (this.raf) cancelAnimationFrame(this.raf); this.raf = 0; }
@@ -480,11 +546,31 @@ export class View3D {
     this._last = now;
     this.wv.step(dt);
     this.wv.update();
+    this._refine();
     const s = this._sig();
     if (s !== this.lastSig || this.dirty) { this.lastSig = s; this.dirty = false; this.draw(); }
-    const st = this.wv.streamStatus() + (this.wv.staleCount() ? ' · refreshing ' + this.wv.staleCount() : '');
-    const line = (this.error ? this.error + ' · ' : '') + st + (this.extraStatus ? ' · ' + this.extraStatus : '');
+    const line = this.statusLine();
     if (this.status.textContent !== line) this.status.textContent = line;
+  }
+  /** Step the progressive passes: the next one once this one has streamed. */
+  _refine() {
+    const P = this.progressive;
+    if (!P || !this.wv || this.stage === undefined || this.stage >= P.length - 1) return;
+    if (this.wv.view.detail !== P[this.stage]) return;    // coarse() (a drag) owns it now
+    if (!this.streamIdle()) return;
+    this.stage++;
+    this.wv.view.detail = P[this.stage];
+    this.dirty = true;
+  }
+  /** The status line: the previewer's phase, the stream, the pass, the host's. */
+  statusLine() {
+    const wv = this.wv;
+    if (!wv) return this.error || '';
+    const pv = this.previewer && this.previewer.status;
+    const P = this.progressive;
+    const pass = P && this.stage !== undefined && this.stage < P.length - 1 ? ' · coarse pass ' + (this.stage + 1) + '/' + P.length : '';
+    const st = wv.streamStatus() + (wv.staleCount() ? ' · refreshing ' + wv.staleCount() : '') + pass;
+    return (this.error ? this.error + ' · ' : '') + (pv ? pv + ' · ' : '') + st + (this.extraStatus ? ' · ' + this.extraStatus : '');
   }
   /** One frame's work without requestAnimationFrame (a headless harness whose
    *  virtual clock stands still while its fetches are pending gets no frames). */
@@ -492,8 +578,9 @@ export class View3D {
     if (!this.wv) return;
     if (!this.wv.pal) this._palette();
     this.wv.update();
+    this._refine();
     this.draw();
-    this.status.textContent = this.wv.streamStatus();
+    this.status.textContent = this.statusLine();
   }
   /** Render now (the harness calls it too). */
   draw() {
