@@ -1227,6 +1227,9 @@ void World::KickReadback() {
           out.solScooped = sm[kSolMScooped];
           out.solFaultSlot = sm[kSolMFaultSlot];
           out.solFaultTick = sm[kSolMFaultTick];
+          out.solFaultCell = sm[kSolMFaultCell];
+          out.solFaultEntry = sm[kSolMFaultEntry];
+          out.solFaultValue = sm[kSolMFaultValue];
           for (uint32_t k = 0; k < kSolScoopSpecies; k++)
             out.solScoopedBy[k] = sm[kSolMScoopBySpecies + k];
           // THE REACTION-EFFECT RECORD (world.h kPageFaultReactFx*): this

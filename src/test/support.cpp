@@ -5,6 +5,7 @@
 #include "test/support.h"
 
 #include "sim/pagetable.h"
+#include "crash.h"  // FatalAbort: a FATAL reason survives into crash.log
 
 #include <algorithm>
 #include <chrono>
@@ -2410,16 +2411,16 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       // gone. Aborting at detection names the moment; continuing would be a
       // world that differs between machines with nothing to say why.
       if (sn.solExhausted != 0) {
-        std::fprintf(stderr,
-                     "FATAL: solute page pool exhausted at tick %u (%u refused "
-                     "pops): pool %u pages, high water %u, free %u. Mass in "
-                     "flight: dissolved %u, discarded %u, precipitated %u. The "
-                     "pool is sized in world.h (kSolutePoolPages = kNumSlots / "
-                     "kSolPoolDivisor); this is genuine demand past it.\n",
-                     sn.tick, sn.solExhausted, kSolutePoolPages, sn.solHighWater,
-                     sn.solFree, sn.solDissolved, sn.solDiscarded, sn.solPrecip);
-        std::fflush(stderr);
-        std::abort();
+        char msg[512];
+        std::snprintf(msg, sizeof(msg),
+                      "FATAL: solute page pool exhausted at tick %u (%u refused "
+                      "pops): pool %u pages, high water %u, free %u. Mass in "
+                      "flight: dissolved %u, discarded %u, precipitated %u. The "
+                      "pool is sized in world.h (kSolutePoolPages = kNumSlots / "
+                      "kSolPoolDivisor); this is genuine demand past it.\n",
+                      sn.tick, sn.solExhausted, kSolutePoolPages, sn.solHighWater,
+                      sn.solFree, sn.solDissolved, sn.solDiscarded, sn.solPrecip);
+        FatalAbort(msg);
       }
       // ...AND SO IS A SOLUTE STORE FAULT (world.h kSolMFaults; the check
       // every solute shader's solFault comment names). The allocator promises
@@ -2429,14 +2430,37 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       if (sn.solFaults != 0) {
         const uint32_t slot = sn.solFaultSlot ? sn.solFaultSlot - 1u : 0u;
         const IVec3 wc = sn.solFaultSlot ? world.SlotToWorldChunk(slot) : IVec3{0, 0, 0};
-        std::fprintf(stderr,
-                     "FATAL: %u solute store(s) refused by a chunk with no page; "
-                     "the first at tick %u in slot %u (world chunk %d,%d,%d). The "
-                     "writer reached past the chunks solWant paged for it "
-                     "(sim_solute.wgsl solWant / solFault).\n",
-                     sn.solFaults, sn.solFaultTick, slot, wc.x, wc.y, wc.z);
-        std::fflush(stderr);
-        std::abort();
+        // WHO and WHAT (world.h kSolMFaultCell..Value): the cell, the module
+        // that stored, the sentinel it met and the value it tried to write.
+        const uint32_t local = sn.solFaultCell & 0xFFFu;
+        const uint32_t writer = sn.solFaultCell >> 16;
+        static const char* const kWriters[] = {"?", "sim_step (the CA)",
+                                               "sim_solute (diffuse/compact/scoop)",
+                                               "sim_mutate (pour)", "sim_elec",
+                                               "sim_fluid_seam"};
+        const IVec3 cell{wc.x * int(kChunk) + int(local & 15u),
+                         wc.y * int(kChunk) + int((local >> 4) & 15u),
+                         wc.z * int(kChunk) + int(local >> 8)};
+        const uint32_t e = sn.solFaultEntry, v = sn.solFaultValue;
+        char entry[64];
+        if (e == 0u)
+          std::snprintf(entry, sizeof(entry), "EMPTY");
+        else if (e & kSolUniformBit)
+          std::snprintf(entry, sizeof(entry), "UNIFORM(species %u mass %u)",
+                        (e >> 8) & 0xFFu, e & 0xFFu);
+        else
+          std::snprintf(entry, sizeof(entry), "0x%08x", e);
+        char msg[768];
+        std::snprintf(msg, sizeof(msg),
+                      "FATAL: %u solute store(s) refused by a chunk with no page; "
+                      "the first at tick %u in slot %u (world chunk %d,%d,%d), "
+                      "cell %d,%d,%d, by %s: entry %s, value species %u mass %u. "
+                      "The writer reached past the chunks solWant paged for it "
+                      "(sim_solute.wgsl solWant / solFault).\n",
+                      sn.solFaults, sn.solFaultTick, slot, wc.x, wc.y, wc.z, cell.x,
+                      cell.y, cell.z, kWriters[writer < 6u ? writer : 0u], entry,
+                      (v >> 8) & 0xFFu, v & 0xFFu);
+        FatalAbort(msg);
       }
       sim.NoteSnapshot(sn.tick, sn.activeChunks, sn.particleCount);
       // The heat walk still owed (pend list, off-phase recomputes): no proof

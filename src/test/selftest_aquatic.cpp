@@ -731,7 +731,9 @@ Status GateNpcSwim(Ctx& c, std::string& detail) {
 //   * 2x: the wet total over the run is gore.underwaterBleedRate times the
 //     dry total, within stumpWetRatioTol.
 // Each window's count is in the detail (rule 6); SANDVOX_BLEED_TRACE=1 names
-// the decision behind each wound every 15 ticks.
+// the decision behind each wound every 15 ticks; SANDVOX_STUMP_PROBE=1 prints,
+// per window, where the drips were painted and where the dissolved blood sits
+// (cells, mass, rms radius about the wound).
 // ---------------------------------------------------------------------------
 Status GateStumpUnderwater(Ctx& c, std::string& detail) {
   IdCounterScope idScope(c.mobs);
@@ -833,6 +835,15 @@ Status GateStumpUnderwater(Ctx& c, std::string& detail) {
     a.win.assign((size_t)(kTicks / kWin), 0u);
     a.mixed.assign((size_t)(kTicks / kWin), 0u);
     uint32_t d0 = dissolved();
+    // SANDVOX_STUMP_PROBE=1 (rule 6): per window, WHERE the drips were painted
+    // (centroid + bounding box) against the creature's root, and where the
+    // dissolved blood sits (mass centroid, rms radius about the drip centroid,
+    // cells carrying any). "The cloud appears round the body, not at the
+    // wound" is then either the drip position or something after it.
+    static const bool kProbe = std::getenv("SANDVOX_STUMP_PROBE") != nullptr;
+    double px = 0, py = 0, pz = 0;
+    int pn = 0, bx0 = INT_MAX, by0 = INT_MAX, bz0 = INT_MAX, bx1 = INT_MIN, by1 = INT_MIN,
+        bz1 = INT_MIN;
     for (int i = 0; i < kTicks; i++) {
       support::RunTicks(rig, 1);
       const OpBatch& tb = rig.LastBatch();
@@ -841,7 +852,56 @@ Status GateStumpUnderwater(Ctx& c, std::string& detail) {
         if (tb.ops[k].material == bleedMat) {
           a.total++;
           if ((size_t)(i / kWin) < a.win.size()) a.win[(size_t)(i / kWin)]++;
+          if (kProbe) {
+            const BrushOp& o = tb.ops[k];
+            px += o.x; py += o.y; pz += o.z; pn++;
+            bx0 = std::min(bx0, o.x); by0 = std::min(by0, o.y); bz0 = std::min(bz0, o.z);
+            bx1 = std::max(bx1, o.x); by1 = std::max(by1, o.y); bz1 = std::max(bz1, o.z);
+          }
         }
+      if (kProbe && (i + 1) % kWin == 0 && mobs.IsAlive(id)) {
+        c.ctx.WaitIdle();
+        std::vector<uint32_t> tab(kNumSlots), pool((size_t)kSolutePoolPages * kSolWordsPerPage);
+        rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.solTable, 0, tab.data(),
+                              tab.size() * 4, "probeSolTable");
+        rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.solPool, 0, pool.data(),
+                              pool.size() * 4, "probeSolPool");
+        const Vec3 dc = pn ? Vec3{(float)(px / pn), (float)(py / pn), (float)(pz / pn)}
+                           : Vec3{0, 0, 0};
+        double mx = 0, my = 0, mz = 0, mm = 0, r2 = 0;
+        int cells = 0;
+        for (int x = site.x - R; x <= site.x + R; x++)
+          for (int z = site.z - R; z <= site.z + R; z++)
+            for (int y = bedY; y <= waterTop; y++) {
+              const IVec3 cc{x, y, z};
+              if (!c.world.CellInWindow(cc)) continue;
+              const uint32_t ci = World::SlotCellIndex(cc);
+              const uint32_t slot = ci / kChunkVol, local = ci % kChunkVol;
+              const uint32_t e = tab[slot];
+              uint32_t v = 0;
+              if (e & kSolUniformBit) v = e & 0xFFFFu;
+              else if (e != 0u)
+                v = (pool[(size_t)(e & kSolPageMask) * kSolWordsPerPage + (local >> 1)] >>
+                     ((local & 1u) * 16u)) & 0xFFFFu;
+              const double m = (double)(v & 0xFFu);
+              if (m == 0) continue;
+              cells++;
+              mm += m; mx += m * x; my += m * y; mz += m * z;
+              const double dx = x + 0.5 - dc.x, dy = y + 0.5 - dc.y, dz = z + 0.5 - dc.z;
+              r2 += m * (dx * dx + dy * dy + dz * dz);
+            }
+        const Vec3 root = mobs.MobRootPos(id);
+        std::printf("stump probe t%d: drips %d centroid (%.1f %.1f %.1f) box x%d..%d "
+                    "y%d..%d z%d..%d | root (%.1f %.1f %.1f) | solute %d cells mass %.0f "
+                    "centroid (%.1f %.1f %.1f) rms about drips %.1f\n",
+                    i + 1, pn, dc.x, dc.y, dc.z, bx0, bx1, by0, by1, bz0, bz1, root.x,
+                    root.y, root.z, cells, mm, mm ? mx / mm : 0, mm ? my / mm : 0,
+                    mm ? mz / mm : 0, mm ? std::sqrt(r2 / mm) : 0);
+        px = py = pz = 0;
+        pn = 0;
+        bx0 = by0 = bz0 = INT_MAX;
+        bx1 = by1 = bz1 = INT_MIN;
+      }
       if ((i + 1) % kWin == 0 && (size_t)(i / kWin) < a.mixed.size()) {
         const uint32_t d1 = dissolved();
         a.mixed[(size_t)(i / kWin)] = d1 - d0;

@@ -217,6 +217,10 @@ const SOLM_DISCARDED : u32 = 7u;
 const SOLM_CONVERTED : u32 = 8u;
 const SOLM_FAULT_SLOT : u32 = 9u;
 const SOLM_FAULT_TICK : u32 = 10u;
+// The first fault's detail (world.h kSolMFaultCell/Entry/Value).
+const SOLM_FAULT_CELL : u32 = 28u;
+const SOLM_FAULT_ENTRY : u32 = 29u;
+const SOLM_FAULT_VALUE : u32 = 30u;
 const SOLM_POURED : u32 = 11u;
 const SOLM_SCOOPED : u32 = 12u;
 const SOLM_SEAM_REFUSED : u32 = 13u;
@@ -276,11 +280,18 @@ fn solWritable(c : vec3<i32>) -> bool {
 // promises a page to every chunk a tick can write, so a refusal is a bug, and
 // the count is what says so (SubmitTick aborts on it: support.cpp). A
 // write of the value the sentinel already implies is not a write at all.
-fn solFault(slot : u32) {
+// The first fault also records WHO and WHAT (SubmitTick prints it): the
+// cell, the writing module (SOL_WRITER, declared beside each copy of this
+// block), the table entry it met and the value it tried to store -- a bare
+// slot named the chunk but not the writer, and the writers are many.
+fn solFault(slot : u32, c : vec3<i32>, e : u32, v : u32) {
   let prev = atomicAdd(&solMeta[SOLM_FAULTS], 1u);
   if (prev == 0u) {
     atomicStore(&solMeta[SOLM_FAULT_SLOT], slot + 1u);
     atomicStore(&solMeta[SOLM_FAULT_TICK], T.tick);
+    atomicStore(&solMeta[SOLM_FAULT_CELL], solLocalOf(c) | (SOL_WRITER << 16u));
+    atomicStore(&solMeta[SOLM_FAULT_ENTRY], e);
+    atomicStore(&solMeta[SOLM_FAULT_VALUE], v);
   }
 }
 fn solStoreAt(c : vec3<i32>, v : u32) -> bool {
@@ -289,7 +300,7 @@ fn solStoreAt(c : vec3<i32>, v : u32) -> bool {
   let local = solLocalOf(c);
   if ((e & SOL_PAGE_BIT) == 0u) {
     if (solCellValue(e, local) == v) { return true; }
-    solFault(slot);
+    solFault(slot, c, e, v);
     return false;
   }
   let wi = (e & SOL_PAGE_MASK) * SOL_WORDS_PER_PAGE + (local >> 1u);
@@ -344,6 +355,9 @@ fn solRuleAllows(ri : u32, c : vec3<i32>, w : u32) -> bool {
   return conc >= ((cond >> 8u) & 0xFFu) && conc <= ((cond >> 16u) & 0xFFu);
 }
 // MIRROR-END solute
+// This module's id in a solute store fault record (solFault): 1 sim_step,
+// 2 sim_solute, 3 sim_mutate, 4 sim_elec, 5 sim_fluid_seam.
+const SOL_WRITER : u32 = 1u;
 
 // ---- THE TEMPERATURE LAYER (sim_heat.wgsl, src/sim/heat.h) ------------------
 // The CA READS the local excess X of a cell's block (heatPool, written by last
