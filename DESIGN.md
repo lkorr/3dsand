@@ -25504,8 +25504,11 @@ floods carved band cells). **Cost**: a map with no dungeon pays one header
 word per chunk; a chunk outside the index-cell range a compare; in range with
 no list one probe; only listed chunks pay the evaluator. The evaluator lives
 in its own file, `worldgen_dungeon.wgsli`, which `AssembleShaderSource` and
-`check_shaders.sh` append to worldgen.wgsl's body. Measured compile cost: see
-the D1 report in `docs/PLAN_dungeons.md`.
+`check_shaders.sh` append to worldgen.wgsl's body. Measured cold compile cost
+(PLAN §9): `main` / `list` +2.9 s / +2.6 s, `far` within noise. **Keep the carve
+field at ONE call site per kernel path** (`dgScatter`'s probes are one rolled
+loop for that reason): the driver inlines every call, and twelve call sites
+were +18 s per entry. Residency round the fixture's chamber: +10.5 % pages.
 
 **Determinism**: integer throughout, hash3 noise, list order = prim order;
 the block between `MIRROR-BEGIN dungeon` markers is token-for-token

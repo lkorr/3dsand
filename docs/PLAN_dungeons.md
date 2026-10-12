@@ -283,7 +283,7 @@ Shapes:
 | shape | fields | the solid it describes |
 |---|---|---|
 | `box` | `min`, `max` | the cell box |
-| `rbox` | `min`, `max`, `r` | the box with edges rounded by `r` |
+| `rbox` | `min`, `max`, `r` | the box with edges rounded by `r` (clamped to half the shortest side) |
 | `ellipsoid` | `min`, `max` | the ellipsoid inscribed in the box |
 | `cylinder` | `min`, `max`, `axis` `x\|y\|z` | the (elliptic) cylinder inscribed in the box along `axis` |
 | `capsule` | `a`, `b`, `r` | segment a–b swept by radius r (cells; any length — the engine splits at 256) |
@@ -309,7 +309,7 @@ negative inside):
    `firm` material (prim field `firm`; default slot `wall`, else `stone`), so
    no sand / sediment / lake water spills into a carve on its birth tick.
 3. Then every non-carve prim, and every carve prim again, in ARRAY ORDER,
-   later wins: `fill` (d < 0) → `mat`; `keep` (d < 0) → the TERRAIN cell back
+   later wins: `fill` (d < 0) → `mat` (or the checker; `openOnly`: only if the cell is air at that point); `keep` (d < 0) → the TERRAIN cell back
    (natural rock — a pillar), and a kept cell is not re-cut by any LATER
    carve; `skin` (d < 0 inside the skin prim's shape, the cell solid terrain
    and not carved, and C ≤ `skin` voxels) → `mat` — the wall layer;
@@ -627,3 +627,58 @@ ARCH_NODES, rebuilds the main exe.
   the save system's entity split), never in voxels.
 - Arbitrary size vs the site lattice: dungeons do NOT go through the 2D site
   lattice (`kSiteCellMax`); they have their own 3D chunk index.
+
+## 9. D1 report (engine shell, 2026-10-12)
+
+Landed on branch `worktree-agent-a3caddfa571ce1f41`: `src/sim/dungeon.*`
+(format, resolution, placement, `PackDungeons`, the CPU twin),
+`assets/shaders/worldgen_dungeon.wgsli` (appended to worldgen.wgsl by
+`AssembleShaderSource` / `check_shaders.sh`), the `map.json dungeons[]` parse
+and anchor in `worldmap.cpp`, SVED v3 in `worldedit.*`, voxserve `DUNGEON`
+(§5.0) + `tuner_server.py POST /api/dungeon/preview`, `--dungeon-bake`, the
+`_fixture` (written by `scripts/gen_dungeon_fixture.py`) on the harness map,
+gates `dungeon-format` / `dungeon-gen`, DESIGN.md §9h.
+
+**Pipeline compile, cold** (same exe, fresh CWD AND private shader / pipeline
+caches per arm, `SANDVOX_SHADER_TIMING=1`, `__GL_SHADER_DISK_CACHE=0`,
+exclusive locks; base assets = dd56aa1):
+
+| worldgen entry | before | after | |
+|---|---:|---:|---|
+| `main` | 6.7 s | 9.6 s | +2.9 s (the full `dgCell`) |
+| `list` | 7.3 s | 9.9 s | +2.6 s |
+| `cols` | 52.1 s | 51.0 s | noise (only `dgColTop`) |
+| `far` | 78.0 s | 71.2 s | noise (`dgCellCoarse`); SPIR-V 22,813 -> 26,511 instructions, ceiling raised 25k -> 28k |
+| `farpatch` / `fardown` / `farmap` | 65 / 69 / 72 s | 58 / 59 / 62 s | noise (only the cave keep-out) |
+
+The first version cost `main`/`list` +18 s each: `dgScatter` called the carve
+field from ~12 sites and the driver inlines every one. Rolling the probes into
+ONE loop (one inlined copy of the carve field) took it to +2.9 s. Keep
+`dgCarveAt` / `dgPrimD` at one call site per kernel path.
+
+**Residency** (the window round the fixture's chamber, after 120 settle ticks):
+5,133 pages with the dungeon vs 4,645 with the evaluator off: +488 pages
+(+10.5 %), 13.9 % of the pool. **Rest**: 0 chunks awake after the settle.
+**Twin**: 671,744 fixture cells and 827,392 cells of D2's `_d2_sample` (328
+prims, 36 props) bit-identical to the CPU twin (the only differences are the
+45 wet-bank stain soaks round the fixture's puddles, a separate post-pass).
+The determinism hash does not move (`ef7d9a06`): the fixture is 2 km from the
+harness window and a map with no dungeon packs no block.
+
+**Known limitations** (for D2 / D4 and the orchestrator):
+- Floor / ceiling scatter searches the CARVE FIELD for its support, not the
+  final voxels: a feature can stand on a fill the carve cut (fine) but also
+  "on" open sky where a carve meets the surface. Keep stalactites off
+  `surface: true` pieces.
+- A puddle's containment is checked against the carve field; terrain air next
+  to it (a surface piece) is not seen.
+- The firm shell turns powder / liquid within 2 voxels of a carve to `firm`,
+  but a tree whose trunk a carve cuts keeps its crown (the island detector may
+  later drop it as debris). Entrances through forest want a clearing.
+- Far field: shapes and props only (`dgCellCoarse`); underground pieces are
+  not drawn from afar, and the far surface map (`farmap`) does not see a ruin
+  above the ground (the cascades do).
+- 64 prims / 32 prop instances per 64^3 index cell; elongated ellipses /
+  cylinders / vaults inflate their index bounds by their axis ratio (<= 256).
+- voxserve resolves the anchor at the environment's seed (kDefaultSeed),
+  whatever the DUNGEON command's `<seed>`.

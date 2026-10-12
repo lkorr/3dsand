@@ -776,8 +776,7 @@ bool ResolveShell(const Shell& s, const std::vector<std::string>& matNames, cons
       if (!coordOk(p.a) || !coordOk(p.b)) return bad(i, "a coordinate is past 2^20");
       for (int k = 0; k < 3; k++)
         if (p.b[k] < p.a[k] || p.b[k] - p.a[k] + 1 > 2048) return bad(i, "box axis " + std::to_string(k) + " must be 1..2048 cells (min <= max)");
-      const int minHalf2 = std::min({p.b[0] - p.a[0] + 1, p.b[1] - p.a[1] + 1, p.b[2] - p.a[2] + 1});
-      if (p.shape == kShapeRBox && (p.r < 0 || 2 * p.r > minHalf2)) return bad(i, "rbox r must be 0..half the shortest side");
+      if (p.shape == kShapeRBox && (p.r < 0 || p.r > 512)) return bad(i, "rbox r must be 0..512 (it is clamped to half the shortest side)");
       if (p.shape == kShapeVault) {
         if (p.axis != 0 && p.axis != 2) return bad(i, "a vault runs along x or z");
         if (p.r < 0 || p.r > p.b[1] - p.a[1] + 1) return bad(i, "vault rise must be 0..the box height");
@@ -1188,7 +1187,10 @@ bool PackDungeons(const std::vector<Placed>& ds, std::vector<uint32_t>& W, std::
           r[kDgP_AX + c] = U((p.a[c] + p.b[c] + 1) * 2);
           r[kDgP_BX + c] = U((p.b[c] - p.a[c] + 1) * 2);
         }
-        r[kDgP_P0] = U(p.r * 4);   // rbox r / vault rise, Q2
+        // rbox r (clamped to half the shortest side: past it the rounding is a
+        // capsule-ish box, which is what an author asking for more meant) / vault rise, Q2.
+        const int minHalfQ2 = std::min({(p.b[0] - p.a[0] + 1) * 2, (p.b[1] - p.a[1] + 1) * 2, (p.b[2] - p.a[2] + 1) * 2});
+        r[kDgP_P0] = U(p.shape == kShapeRBox ? std::min(p.r * 4, minHalfQ2) : p.r * 4);
       }
       int level = p.level;
       if (p.op == kOpCarve && rs.primMat[i] != 0 && level == kNoLevel) level = INT_MAX;
@@ -1318,6 +1320,7 @@ inline uint32_t min(uint32_t a, uint32_t b) { return a < b ? a : b; }
 inline uint32_t max(uint32_t a, uint32_t b) { return a > b ? a : b; }
 inline int abs(int a) { return a < 0 ? -a : a; }
 inline int clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+inline int select(int f, int t, bool cond) { return cond ? t : f; }   // WGSL's argument order
 inline uint32_t firstLeadingBit(uint32_t v) {
   uint32_t b = 0;
   while (v >>= 1) b++;
@@ -1719,92 +1722,103 @@ uint32_t dgScatter(uint32_t s, uint32_t p, int dOwn, int c, uint32_t w, uint32_t
   const int smax = int(worldMap[s + DG_S_SIZE] >> 16u);
   const uint32_t mat = worldMap[s + DG_S_MAT];
   const uint32_t seed = worldMap[s + DG_S_SEED];
+  const int sp = max(int(worldMap[s + DG_S_SPACING]), 4);
   const uint32_t dr = worldMap[p + DG_P_DREC];
   const int lx = dgLocalX(dr, x, z);
   const int ly = y - dgI(dr + DG_D_ORIGIN_Y);
   const int lz = dgLocalZ(dr, x, z);
-  if (kind == DG_SC_MOSS || kind == DG_SC_ORE || kind == DG_SC_PUDDLE) {
-    // THE SOLID BAND behind this prim's surface: untouched, non-air terrain.
+  // THE SOLID BAND kinds (moss, ore, puddle) work on untouched, non-air
+  // terrain just behind this prim's surface; the others on an air cell inside
+  // it. Every kind's lattice feature, if it has one, is one disc per cell of a
+  // `sp` lattice in the local XZ plane.
+  const bool band = kind == DG_SC_MOSS || kind == DG_SC_ORE || kind == DG_SC_PUDDLE;
+  if (band) {
     if (w != tw || c < 0 || (tw & 0xFFFu) == 0u || dOwn < 0) { return w; }
-    if (kind == DG_SC_ORE) {
-      if (dOwn > smax * 4) { return w; }
-      if (dgNoise3(lx, ly, lz, 3u, seed) > 16383 - int(dens >> 2u)) { return dgWord(mat, x, y, z); }
-      return w;
-    }
-    if (dOwn > DG_FIRM_Q2) { return w; }
-    const bool up = dgCarveAt(x, y + 1, z) < 0;
-    if (kind == DG_SC_PUDDLE) {
-      // A floor cell whose four sides and underside are solid: one cell of
-      // liquid, contained by construction (PLAN: "puddle").
-      if (!up) { return w; }
-      const int sp = max(int(worldMap[s + DG_S_SPACING]), 4);
-      const int gx = fdiv(lx, sp);
-      const int gz = fdiv(lz, sp);
-      const uint32_t h = hash3(seed ^ 0xD6A1u, uint32_t(gx), uint32_t(gz));
-      if ((h & 0xFFFFu) >= dens) { return w; }
-      const int r = min(smin + int((h >> 16u) % uint32_t(max(smax - smin + 1, 1))), (sp - 1) / 2);
-      const uint32_t h2 = hash3(seed ^ 0x51A7u, uint32_t(gx), uint32_t(gz));
-      const int span = max(sp - 2 * r, 1);
-      const int ax = abs(lx - (gx * sp + r + int(h2 % uint32_t(span))));
-      const int az = abs(lz - (gz * sp + r + int((h2 >> 16u) % uint32_t(span))));
-      if (max(max(ax, az), (3 * (ax + az)) / 4) > r) { return w; }
-      if (dgCarveAt(x + 1, y, z) < 0 || dgCarveAt(x - 1, y, z) < 0 || dgCarveAt(x, y, z + 1) < 0 ||
-          dgCarveAt(x, y, z - 1) < 0 || dgCarveAt(x, y - 1, z) < 0) {
-        return w;
-      }
-      return dgWord(mat, x, y, z);
-    }
-    // MOSS: the first solid cell behind the surface on the authored side(s),
-    // in patches.
-    bool face = false;
-    if (surf == DG_SURF_FLOOR) { face = up; }
-    else if (surf == DG_SURF_CEIL) { face = dgCarveAt(x, y - 1, z) < 0; }
-    else {
-      face = dgCarveAt(x + 1, y, z) < 0 || dgCarveAt(x - 1, y, z) < 0 || dgCarveAt(x, y, z + 1) < 0 ||
-             dgCarveAt(x, y, z - 1) < 0;
-      if (surf != DG_SURF_WALL) { face = face || up || dgCarveAt(x, y - 1, z) < 0; }
-    }
-    if (face && dgNoise3(lx, ly, lz, 3u, seed) < int(dens >> 2u)) { return dgWord(mat, x, y, z); }
+  } else {
+    if (w != 0u || dOwn >= 0) { return w; }
+  }
+  int n3 = 0;
+  if (kind == DG_SC_MOSS || kind == DG_SC_ORE) { n3 = dgNoise3(lx, ly, lz, 3u, seed); }
+  if (kind == DG_SC_ORE) {
+    if (dOwn <= smax * 4 && n3 > 16383 - int(dens >> 2u)) { return dgWord(mat, x, y, z); }
     return w;
   }
-  // THE FLOOR / CEILING FEATURES: an air cell inside this prim, on a lattice.
-  if (w != 0u || dOwn >= 0) { return w; }
-  const int sp = max(int(worldMap[s + DG_S_SPACING]), 4);
-  const int gx = fdiv(lx, sp);
-  const int gz = fdiv(lz, sp);
-  const uint32_t h = hash3(seed ^ 0xD6A1u, uint32_t(gx), uint32_t(gz));
-  if ((h & 0xFFFFu) >= dens) { return w; }
-  const int size = smin + int((h >> 16u) % uint32_t(max(smax - smin + 1, 1)));
-  int run = 1;
-  int r = max(size / 3, 1);
-  if (kind == DG_SC_RUBBLE) { run = reposeRunOf(mat); r = size * run; }
-  if (kind == DG_SC_CRYSTAL) { r = max(size / 2, 1); }
-  if (kind == DG_SC_BONES) { r = size; }
-  r = min(r, (sp - 1) / 2);
-  const uint32_t h2 = hash3(seed ^ 0x51A7u, uint32_t(gx), uint32_t(gz));
-  const int span = max(sp - 2 * r, 1);
-  const int ax = abs(lx - (gx * sp + r + int(h2 % uint32_t(span))));
-  const int az = abs(lz - (gz * sp + r + int((h2 >> 16u) % uint32_t(span))));
-  const int od = max(max(ax, az), (3 * (ax + az)) / 4);
-  if (od > r) { return w; }
-  int hh = 1;
-  if (kind == DG_SC_RUBBLE) { hh = size - od / run; }
-  else if (kind != DG_SC_BONES) { hh = (size * (r - od)) / max(r, 1); }
-  if (hh < 1) { return w; }
-  if (kind == DG_SC_BONES && (hash3(seed ^ 0xB0E5u, uint32_t(lx), uint32_t(lz)) & 1u) == 0u) { return w; }
+  if (band && dOwn > DG_FIRM_Q2) { return w; }
+  int nProbe = 6;
   bool down = true;
-  if (kind == DG_SC_STALACTITE) { down = false; }
-  if (kind == DG_SC_CRYSTAL) {
-    if (surf == DG_SURF_CEIL) { down = false; }
-    else if (surf != DG_SURF_FLOOR && ((h2 >> 31u) & 1u) == 1u) { down = false; }
+  if (kind != DG_SC_MOSS) {
+    const int gx = fdiv(lx, sp);
+    const int gz = fdiv(lz, sp);
+    const uint32_t h = hash3(seed ^ 0xD6A1u, uint32_t(gx), uint32_t(gz));
+    if ((h & 0xFFFFu) >= dens) { return w; }
+    const int size = smin + int((h >> 16u) % uint32_t(max(smax - smin + 1, 1)));
+    int run = 1;
+    int r = max(size / 3, 1);
+    if (kind == DG_SC_RUBBLE) { run = reposeRunOf(mat); r = size * run; }
+    if (kind == DG_SC_CRYSTAL) { r = max(size / 2, 1); }
+    if (kind == DG_SC_BONES || kind == DG_SC_PUDDLE) { r = size; }
+    r = min(r, (sp - 1) / 2);
+    const uint32_t h2 = hash3(seed ^ 0x51A7u, uint32_t(gx), uint32_t(gz));
+    const int span = max(sp - 2 * r, 1);
+    const int ax = abs(lx - (gx * sp + r + int(h2 % uint32_t(span))));
+    const int az = abs(lz - (gz * sp + r + int((h2 >> 16u) % uint32_t(span))));
+    const int od = max(max(ax, az), (3 * (ax + az)) / 4);
+    if (od > r) { return w; }
+    if (!band) {
+      int hh = 1;
+      if (kind == DG_SC_RUBBLE) { hh = size - od / run; }
+      else if (kind != DG_SC_BONES) { hh = (size * (r - od)) / max(r, 1); }
+      if (hh < 1) { return w; }
+      if (kind == DG_SC_BONES && (hash3(seed ^ 0xB0E5u, uint32_t(lx), uint32_t(lz)) & 1u) == 0u) { return w; }
+      if (kind == DG_SC_STALACTITE) { down = false; }
+      if (kind == DG_SC_CRYSTAL) {
+        if (surf == DG_SURF_CEIL) { down = false; }
+        else if (surf != DG_SURF_FLOOR && ((h2 >> 31u) & 1u) == 1u) { down = false; }
+      }
+      nProbe = hh;
+    }
   }
-  // Grown from the first solid cell within the feature's height below (or
-  // above): every cell between is carved, so the column is contiguous.
-  for (int k = 1; k <= hh; k++) {
-    int yy = y - k;
-    if (!down) { yy = y + k; }
-    if (dgCarveAt(x, yy, z) >= 0) { return dgWord(mat, x, y, z); }
+  // THE PROBES, as ONE rolled loop (one inlined copy of the carve field): the
+  // band kinds ask the six face neighbours (bit 0 up, 1 down, 2..5 the
+  // sides); a floor / ceiling feature walks down (up) its own height for the
+  // first solid cell it can grow from -- every cell between is carved, so the
+  // column is contiguous.
+  uint32_t mask = 0u;
+  bool found = false;
+  for (int i = 0; i < nProbe; i++) {
+    int dx = 0;
+    int dy = 0;
+    int dz = 0;
+    if (band) {
+      if (i == 0) { dy = 1; }
+      else if (i == 1) { dy = -1; }
+      else if (i == 2) { dx = 1; }
+      else if (i == 3) { dx = -1; }
+      else if (i == 4) { dz = 1; }
+      else { dz = -1; }
+    } else {
+      dy = select(i + 1, -1 - i, down);
+    }
+    if (dgCarveAt(x + dx, y + dy, z + dz) < 0) { mask = mask | (1u << uint32_t(i)); }
+    else if (!band) { found = true; break; }
   }
+  if (!band) {
+    if (found) { return dgWord(mat, x, y, z); }
+    return w;
+  }
+  if (kind == DG_SC_PUDDLE) {
+    // A floor cell under air whose four sides and underside are solid: one
+    // cell of liquid, contained by construction (PLAN: "puddle").
+    if ((mask & 1u) != 0u && (mask & 62u) == 0u) { return dgWord(mat, x, y, z); }
+    return w;
+  }
+  // MOSS: the first solid cell behind the surface on the authored side(s), in
+  // patches.
+  bool face = mask != 0u;
+  if (surf == DG_SURF_FLOOR) { face = (mask & 1u) != 0u; }
+  else if (surf == DG_SURF_CEIL) { face = (mask & 2u) != 0u; }
+  else if (surf == DG_SURF_WALL) { face = (mask & 60u) != 0u; }
+  if (face && n3 < int(dens >> 2u)) { return dgWord(mat, x, y, z); }
   return w;
 }
 

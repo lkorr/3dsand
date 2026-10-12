@@ -32,6 +32,8 @@
 //                   window regenerated at the origin it found.
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -45,7 +47,9 @@
 #include <nlohmann/json.hpp>
 
 #include "phys/debris.h"
+#include "game/camera.h"
 #include "sim/biomes.h"
+#include "sim/tuning.h"
 #include "sim/chunkstore.h"
 #include "sim/dungeon.h"
 #include "sim/pagetable.h"
@@ -135,12 +139,16 @@ Status GateDungeonFormat(Ctx& c, std::string& detail) {
     dungeon::Shell B, J;
     std::string err;
     if (!check(!bin.empty(), who + "no shell.bin (the engine loads the .bin; compile the dungeon)")) continue;
-    if (!check(dungeon::ReadShellBin(bin.data(), bin.size(), B, err), who + "shell.bin: " + err)) continue;
+    const bool binOk = dungeon::ReadShellBin(bin.data(), bin.size(), B, err);
+    if (!check(binOk, who + "shell.bin: " + err)) continue;
     // c. the json twin says the same.
     std::string jt;
     if (ReadAll(dir / "shell.json", jt)) {
-      if (check(dungeon::ParseShellJson(jt, J, err), who + "shell.json: " + err))
-        check(dungeon::SameContent(J, B, &err), who + "shell.bin and shell.json differ: " + err);
+      const bool jsonOk = dungeon::ParseShellJson(jt, J, err);
+      if (check(jsonOk, who + "shell.json: " + err)) {
+        const bool same = dungeon::SameContent(J, B, &err);
+        check(same, who + "shell.bin and shell.json differ: " + err);
+      }
     }
     // d. current with dungeon.json.
     check(B.sourceHash == src, who + Format("shell.bin is STALE: compiled from dungeon.json hash %u, the file hashes %u "
@@ -149,7 +157,8 @@ Status GateDungeonFormat(Ctx& c, std::string& detail) {
     // e. materials + limits; f. the index limits (a trial pack, alone).
     auto shell = std::make_shared<dungeon::Shell>(B);
     auto res = std::make_shared<dungeon::Resolved>();
-    if (!check(dungeon::ResolveShell(*shell, names, klass, *res, err), who + err)) continue;
+    const bool resOk = dungeon::ResolveShell(*shell, names, klass, *res, err);
+    if (!check(resOk, who + err)) continue;
     dungeon::Placed pl;
     pl.shell = shell;
     pl.res = res;
@@ -157,15 +166,18 @@ Status GateDungeonFormat(Ctx& c, std::string& detail) {
     dungeon::PlacedBounds(pl);
     std::vector<uint32_t> W(worldmap::kHeaderWords, 0u);
     dungeon::PackStats ps;
-    check(dungeon::PackDungeons({pl}, W, err, &ps), who + err);
+    const bool packOk = dungeon::PackDungeons({pl}, W, err, &ps);
+    check(packOk, who + err);
     // g. the engine's writers round-trip.
     {
       dungeon::Shell R1, R2;
       const std::vector<uint8_t> b2 = dungeon::WriteShellBin(B);
       std::string e1, e2;
-      check(dungeon::ReadShellBin(b2.data(), b2.size(), R1, e1) && dungeon::SameContent(B, R1, &e1),
+      const bool rt1 = dungeon::ReadShellBin(b2.data(), b2.size(), R1, e1) && dungeon::SameContent(B, R1, &e1);
+      const bool rt2 = dungeon::ParseShellJson(dungeon::ShellToJson(B), R2, e2) && dungeon::SameContent(B, R2, &e2);
+      check(rt1,
             who + "WriteShellBin does not round-trip: " + e1);
-      check(dungeon::ParseShellJson(dungeon::ShellToJson(B), R2, e2) && dungeon::SameContent(B, R2, &e2),
+      check(rt2,
             who + "ShellToJson does not round-trip: " + e2);
     }
     loaded++;
@@ -231,8 +243,10 @@ Status GateDungeonFormat(Ctx& c, std::string& detail) {
   if (!why.empty()) {
     detail += " | FAIL: " + why[0];
     for (size_t i = 1; i < why.size() && i < 6; i++) detail += " | " + why[i];
+    std::printf("dungeon-format: FAIL (%s)\n", detail.c_str());
     return Status::Fail;
   }
+  std::printf("dungeon-format: PASS (%s)\n", detail.c_str());
   return Status::Pass;
 }
 
@@ -240,6 +254,32 @@ Status GateDungeonFormat(Ctx& c, std::string& detail) {
 // dungeon-gen
 // ============================================================================
 int FloorDiv16(int v) { return v >> 4; }
+
+// SANDVOX_DUNGEON_SHOT=<path.bmp>: a picture from inside the settled fixture
+// (the harness-cellar recipe: warm frames so the shadow cache and the
+// irradiance grid catch up, the last one grabbed). Render only.
+void DungeonShot(Ctx& c, Vec3 eye, Vec3 at, const std::string& path, int frames) {
+  const Vec3 d = at - eye;
+  const float len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+  Camera cam;
+  cam.yaw = std::atan2(d.z, d.x);
+  cam.pitch = std::asin(std::clamp(d.y / std::max(len, 1e-3f), -1.0f, 1.0f));
+  const uint32_t noon = (uint32_t)(0.5 * (double)TicksPerDay(CurrentTuning()));
+  for (int f = 0; f < frames; f++) {
+    WriteRenderParams(c.ctx.queue, c.world, eye, cam, (float)c.width / c.height, true, 11.7f, kFarFogDensity,
+                      (float)c.height, noon);
+    rhi::CommandEncoder enc = c.ctx.device.CreateCommandEncoder();
+    c.sim.EncodeShadowResolve(enc);
+    rhi::RenderPass rp = c.sim.BeginRenderPass(enc, c.view, rhi::TextureFormat::RGBA8Unorm, c.width, c.height);
+    c.sim.DrawWorld(rp);
+    rp.End();
+    c.ctx.queue.Submit(enc.Finish());
+  }
+  c.ctx.WaitIdle();
+  c.Grab(path.c_str());
+}
+// The voxel word's stain bits (amount 24..27, type 28..30).
+constexpr uint32_t kStainBits = 0x7F000000u;
 
 Status GateDungeonGen(Ctx& c, std::string& detail) {
   std::vector<std::string> why;
@@ -276,8 +316,10 @@ Status GateDungeonGen(Ctx& c, std::string& detail) {
     if (!why.empty()) {
       detail += " | FAIL: " + why[0];
       for (size_t i = 1; i < why.size() && i < 6; i++) detail += " | " + why[i];
+      std::printf("dungeon-gen: FAIL (%s)\n", detail.c_str());
       return Status::Fail;
     }
+    std::printf("dungeon-gen: PASS (%s)\n", detail.c_str());
     return Status::Pass;
   };
   if (!reload(true)) { restore(); return finish("no environment"); }
@@ -339,7 +381,7 @@ Status GateDungeonGen(Ctx& c, std::string& detail) {
       if (c.mats[i].name == n) return static_cast<uint32_t>(i);
     return 0xFFFFu;
   };
-  long long cells = 0, listed = 0, mism = 0, carved = 0, changedSolid = 0, caveInKeep = 0;
+  long long cells = 0, listed = 0, mism = 0, carved = 0, changedSolid = 0, caveInKeep = 0, soaked = 0;
   std::map<uint32_t, long long> byMat;   // material of a cell the dungeon changed to non-air
   std::string firstMism;
   for (const auto& [key, dw] : D) {
@@ -351,7 +393,13 @@ Status GateDungeonGen(Ctx& c, std::string& detail) {
       cells++;
       if (dungeon::TwinListAt(W, x, y, z) != 0u) listed++;
       const uint32_t exp = dungeon::TwinCell(W, c.mats, kDefaultSeed, x, y, z, tw[i]);
-      if (exp != dw[i]) {
+      // THE WET BANKS (worldgen.wgsl `wetbanks`, in the same gen dispatch,
+      // after genChunk) soak the stone round a generated liquid -- a puddle's
+      // walls -- which the twin of dgCell does not model: a difference in the
+      // stain bits ALONE, on the same material and state, is that pass.
+      if (exp != dw[i] && (exp & ~kStainBits) == (dw[i] & ~kStainBits) && (exp & kStainBits) == 0u) {
+        soaked++;
+      } else if (exp != dw[i]) {
         if (mism++ == 0)
           firstMism = Format("(%d,%d,%d): terrain %08x, GPU %08x, twin %08x", x, y, z, tw[i], dw[i], exp);
       }
@@ -389,10 +437,10 @@ Status GateDungeonGen(Ctx& c, std::string& detail) {
   check(keptN > 0 && keptSolid == keptN, Format("the kept pillar: %d of %d axis cells are the terrain's (want all)", keptSolid, keptN));
   check(caveInKeep == 0, Format("%lld natural cave cells under the ground inside the keep box (want 0)", caveInKeep));
   const std::string aLine = Format(
-      "A twin: %lld cells in %zu chunks, %lld listed, %lld mismatches | B ops: %lld carved, %lld laid (flagstone %lld, cobble "
+      "A twin: %lld cells in %zu chunks, %lld listed, %lld mismatches (+%lld wet-bank soaks) | B ops: %lld carved, %lld laid (flagstone %lld, cobble "
       "%lld, timber %lld, plank %lld; scatter: gravel %lld, limestone %lld, moss %lld, water %lld, bone %lld, iron %lld), pillar "
       "%d/%d kept | C caves in keep %lld",
-      cells, D.size(), listed, mism, carved, changedSolid, byMat[mFlag], byMat[mCobble], byMat[mTimber], byMat[mPlank],
+      cells, D.size(), listed, mism, soaked, carved, changedSolid, byMat[mFlag], byMat[mCobble], byMat[mTimber], byMat[mPlank],
       byMat[mGravel], byMat[mLime], byMat[mMoss], byMat[mWater], byMat[mBone], byMat[mIron], keptSolid, keptN, caveInKeep);
 
   // ---- E. every OTHER compiled asset, alone ----------------------------------
@@ -419,10 +467,9 @@ Status GateDungeonGen(Ctx& c, std::string& detail) {
       auto sh = std::make_shared<dungeon::Shell>();
       auto rs = std::make_shared<dungeon::Resolved>();
       std::string err, used;
-      if (!check(dungeon::LoadShellPath(dir.string(), *sh, err, &used) &&
-                     dungeon::ResolveShell(*sh, names, klass, *rs, err),
-                 "E " + id + ": " + err))
-        continue;
+      const bool eOk = dungeon::LoadShellPath(dir.string(), *sh, err, &used) &&
+                       dungeon::ResolveShell(*sh, names, klass, *rs, err);
+      if (!check(eOk, "E " + id + ": " + err)) continue;
       worldmap::ScratchDungeon sd;
       sd.def.id = "_gate_" + id;
       sd.def.asset = id;
@@ -474,7 +521,7 @@ Status GateDungeonGen(Ctx& c, std::string& detail) {
         biomes::LoadBiomeSet(ad, c.mats, set, log);
         worldmap::PackWorldMap(set, worldmap::CurrentWorldMap(), We, log);
       }
-      long long ec2 = 0, em = 0, ech = 0;
+      long long ec2 = 0, em = 0, ech = 0, esoak = 0;
       std::string first;
       for (const auto& [key, dw] : De) {
         const std::vector<uint32_t>& tw = Te[key];
@@ -484,15 +531,17 @@ Status GateDungeonGen(Ctx& c, std::string& detail) {
                     z = bz + static_cast<int>(i / (kChunk * kChunk));
           ec2++;
           const uint32_t exp = dungeon::TwinCell(We, c.mats, kDefaultSeed, x, y, z, tw[i]);
-          if (exp != dw[i] && em++ == 0)
+          if (exp != dw[i] && (exp & ~kStainBits) == (dw[i] & ~kStainBits) && (exp & kStainBits) == 0u)
+            esoak++;
+          else if (exp != dw[i] && em++ == 0)
             first = Format("(%d,%d,%d): terrain %08x, GPU %08x, twin %08x", x, y, z, tw[i], dw[i], exp);
           if (dw[i] != tw[i]) ech++;
         }
       }
       check(em == 0, Format("E %s: %lld of %lld cells differ from the CPU twin; first %s", id.c_str(), em, ec2, first.c_str()));
       check(ech > 0, Format("E %s: the dungeon changed no cell of the %zu sampled chunks", id.c_str(), De.size()));
-      eLine += Format("%s%s: %zu prims, %lld cells in %zu chunks, %lld changed, %lld mismatches", eLine.empty() ? "" : "; ",
-                      id.c_str(), np, ec2, De.size(), ech, em);
+      eLine += Format("%s%s: %zu prims, %lld cells in %zu chunks, %lld changed, %lld mismatches (+%lld wet-bank soaks)",
+                      eLine.empty() ? "" : "; ", id.c_str(), np, ec2, De.size(), ech, em, esoak);
       worldmap::SetScratchDungeon(nullptr);
     }
     if (dirs.empty()) eLine = "no other compiled asset";
@@ -532,6 +581,21 @@ Status GateDungeonGen(Ctx& c, std::string& detail) {
   }
   reload(true);
   settleRun(&h1, &active, &pagesOn);
+  if (const char* shot = std::getenv("SANDVOX_DUNGEON_SHOT"); shot && *shot) {
+    // In the chamber looking down the corridor-side wall at the pillar, then
+    // up the stair from the lower vault, then down the entrance from outside.
+    auto at3 = [&](int lx, int ly, int lz) {
+      const IVec3 w = toWorld(lx, ly, lz);
+      return Vec3{(float)w.x + 0.5f, (float)w.y + 0.5f, (float)w.z + 0.5f};
+    };
+    std::string base = shot;
+    const size_t dot = base.rfind('.');
+    base = dot == std::string::npos ? base : base.substr(0, dot);
+    const int frames = (int)BaselineNumber("dungeon.shotFrames", 12);
+    DungeonShot(c, at3(665, -45, 40), at3(600, -40, 0), base + "_chamber.bmp", frames);
+    DungeonShot(c, at3(600, -96, 230), at3(600, -100, 150), base + "_vault.bmp", frames);
+    DungeonShot(c, at3(500, -44, 0), at3(380, -46, 0), base + "_corridor.bmp", frames);
+  }
   settleRun(&h2, nullptr, nullptr);
   const uint32_t pool = c.world.pages ? c.world.pages->PoolPages() : 0u;
   const double maxActive = BaselineNumber("dungeon.maxActive", 32);

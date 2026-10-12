@@ -2300,7 +2300,7 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     for (DungeonDef& g : out.dungeons) {
       if (!g.shell || !g.res) continue;
       const bool absY = scratch && scratch->absoluteY && !scratch->replaceMapEntry && g.id == scratch->def.id;
-      g.groundY = absY ? scratch->anchorY - 1 : BareGroundHeight(g.ax, g.az, seed);
+      g.groundY = absY ? scratch->anchorY : BareGroundHeight(g.ax, g.az, seed);
       // PLAN §2.1 / §3.7 (D3's world/dungeon_refs.*): the anchor cell lands at
       // (at.x, bare ground + yOffset, at.z) -- the GROUND cell itself at
       // yOffset 0 -- and the rest at base + R(yaw) (local - anchor).

@@ -114,10 +114,10 @@
       "id": "fixture",
       "name": "Engine fixture dungeon",
       "dungeon": "_fixture",
-      "at": [-2000, 3200],
+      "at": [2528, -224],
       "yOffset": 0,
       "yaw": 90,
-      "about": "The dungeon-format / dungeon-gen gates' fixture (docs/PLAN_dungeons.md D1): assets/dungeons/_fixture, turned a quarter so the local frame is exercised. 2.5 km from the pad, the lakes and the spawn, so no other gate's ground moves."
+      "about": "The dungeon-format / dungeon-gen gates' fixture (docs/PLAN_dungeons.md D1): assets/dungeons/_fixture, turned a quarter so the local frame is exercised. On flat-ish land 2 km east of the pad (ground 149..204 over its footprint, the anchor near the low end, so every room is under the ground) and 3.8 km from the spawn: no other gate's ground moves."
     }
   ]
 }
