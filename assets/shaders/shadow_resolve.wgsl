@@ -322,7 +322,8 @@ fn farShadowTC(level0 : u32, roFine : vec3f, rdIn : vec3f, tStartFine : f32,
             } else {
               vc.z += stepv.z; vCur = vMax.z; vMax.z += tDelta.z; eAx = 2;
             }
-            if (vCur >= tOut || vCur >= tExit) { break; }
+            // raymarch.wgsl traceFar, THE CELL CURSOR STAYS IN THE VALID BOX.
+            if (vCur >= tOut || vCur >= tExit || !farInValid(vc, box)) { break; }
             if (stepv.y > 0 && vc.y >= yTopRow) { break; }
           }
         }

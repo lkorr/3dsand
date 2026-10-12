@@ -417,7 +417,8 @@ fn rayStartFar(ro : vec3f, rd : vec3f, inv : vec3f, tStart : f32) -> f32 {
             } else {
               vc.z += stepv.z; vCur = vMax.z; vMax.z += tDelta.z;
             }
-            if (vCur >= tOut || vCur >= tExit) { break; }
+            // raymarch.wgsl traceFar, THE CELL CURSOR STAYS IN THE VALID BOX.
+            if (vCur >= tOut || vCur >= tExit || !farInValid(vc, box)) { break; }
           }
         }
       }
