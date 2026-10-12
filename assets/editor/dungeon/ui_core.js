@@ -685,7 +685,8 @@ export const CSS = `
 .dg-item{padding:3px 6px;cursor:pointer;font-family:var(--mono);font-size:12px;display:flex;gap:6px;align-items:center;border:1px solid transparent}
 .dg-item:hover{background:var(--card2);border-color:var(--line2)}
 .dg-item.sel{background:#1d3a6e;border-color:var(--acc)}
-.dg-item .tag{font-size:10px;color:var(--faint);margin-left:auto}
+.dg-item .tag{font-size:10px;color:var(--faint);margin-left:auto;white-space:nowrap}
+.dg-sock.sel{background:var(--card2);color:var(--acc)}
 .dg-item .sw{width:8px;height:8px;flex:none}
 .dg-item[draggable=true]{cursor:grab}
 .dg-center{display:flex;flex-direction:column;min-width:0;min-height:0}

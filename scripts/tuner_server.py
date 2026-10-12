@@ -768,9 +768,14 @@ class RunLock:
                 continue
             except OSError as e:
                 raise
-            for name, val in (("pid", str(os.getpid())),
+            # ts FIRST and pid LAST: a holder killed half way through these
+            # writes (a test harness's server torn down mid-boot) must leave a
+            # lock one of the two sweeps above can see -- with pid written first
+            # and ts never, neither the stale (ts) nor the orphan (no pid) rule
+            # fires and the lock blocks every run on the machine for good.
+            for name, val in (("ts", str(int(time.time()))),
                               ("who", "tuner:" + self.who),
-                              ("ts", str(int(time.time())))):
+                              ("pid", str(os.getpid()))):
                 try:
                     with open(os.path.join(RUNLOCK_DIR, name), "w") as f:
                         f.write(val)

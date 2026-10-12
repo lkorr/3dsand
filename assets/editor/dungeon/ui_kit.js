@@ -94,7 +94,7 @@ export function createKitPage(T) {
   }
   function renderTypes() {
     ui.types.replaceChildren(...DG.listTypes(st.kit).map(t => h('div', {class: 'dg-item' + (t.type === st.type ? ' sel' : ''), onclick: () => setType(t.type), 'data-type': t.type, title: t.type},
-      t.label, t.surface ? h('span', {class: 'tag'}, 'surface') : h('span', {class: 'tag'}, t.presets.length + ' presets'))));
+      t.label, t.surface ? h('span', {class: 'tag'}, 'surface') : h('span', {class: 'tag', title: t.presets.length + ' presets'}, t.presets.length + 'p'))));
   }
   function setType(type, params) {
     st.type = type;

@@ -276,6 +276,10 @@ export function createStitchPage(T) {
       ? (S.world.scratch || S.world.map === '' ? {mode: 'place', at: S.world.entry.at, yOffset: S.world.entry.yOffset || 0, yaw: S.world.entry.yaw || 0}
                                                  : {mode: 'map', id: S.world.entry.id, map: S.world.map})
       : {mode: 'isolate'};
+    // Which map the voxel server generates: a map placement's own (DUNGEON MAP
+    // replaces that map's entry), else tuning's world.mapLayer. The regions must
+    // be asked of the same map or they come back without the program.
+    view.wv.mapName = place.mode === 'map' ? (place.map || '') : '';
     const slow = setTimeout(() => T.setStatus('installing the program in the voxel server: it is waiting for the machine-wide GPU lock (another sandvox run holds it)'), 1500);
     try {
       const r = await pv.install(S.prog, place);
@@ -370,6 +374,9 @@ export function createStitchPage(T) {
       const p = DG.newPiece(S.d, {kit: spec.kit, type: spec.type, preset: spec.preset || undefined, params: specParams(spec)});
       S.d.pieces.push(p);
       if (S.d.style !== spec.kit && !S.d.pieces.slice(0, -1).length) S.d.style = spec.kit;
+      // an entrance piece's surface socket IS the entrance (the anchor the map places)
+      const surf = DG.generatePiece(S.d, p).sockets.find(x => (x.tags || []).includes('surface'));
+      if (surf && !S.d.entrance) S.d.entrance = {piece: p.id, socket: surf.name};
       S.sel = {t: 'piece', id: p.id};
     });
     S.framed = false;
@@ -1072,14 +1079,25 @@ export function createStitchPage(T) {
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.fillStyle = '#0b0e13'; g.fillRect(0, 0, W, H);
     g.font = '11px "Cascadia Code", Consolas, monospace'; g.textBaseline = 'middle';
-    const nb = Math.max(1, L.bands.length), bh = (H - 8) / nb, cw = Math.max(70, (W - 90) / Math.max(1, L.maxHop + 1));
+    const nb = Math.max(1, L.bands.length), bh = (H - 8) / nb, cw = Math.max(60, (W - 100) / Math.max(1, L.maxHop + 1));
     S.graphHit = [];
     L.bands.forEach((b, i) => {
       g.fillStyle = i % 2 ? '#10141b' : '#0d1117'; g.fillRect(0, 4 + i * bh, W, bh);
       g.fillStyle = '#5c667a'; g.fillText('y ' + fmtM(b.y), 6, 4 + i * bh + bh / 2);
       S.graphHit.push({x0: 0, y0: 4 + i * bh, x1: 80, y1: 4 + (i + 1) * bh, band: b});
     });
-    const at = (id) => { const p = L.pos.get(id); return [90 + p.col * cw + p.sub * 10, 4 + p.band * bh + bh / 2 + p.sub * 8]; };
+    // Node boxes: left to right by hops in each band, never overlapping (a
+    // later node in the same band starts after the one before it ends).
+    const rect = new Map(), cursor = new Map();
+    const label = (pc) => pc.id + ' ' + pc.type;
+    const order = S.prog.pieces.slice().sort((x, y) => { const a = L.pos.get(x.id), b = L.pos.get(y.id); return a.band - b.band || a.col - b.col || a.sub - b.sub; });
+    for (const pc of order) {
+      const p = L.pos.get(pc.id), w = Math.max(54, g.measureText(label(pc)).width + 12);
+      const x0 = Math.max(90 + p.col * cw, cursor.get(p.band) || 0);
+      cursor.set(p.band, x0 + w + 10);
+      rect.set(pc.id, {x0, w, y: 4 + p.band * bh + bh / 2});
+    }
+    const at = (id) => { const r = rect.get(id); return [r.x0 + r.w / 2, r.y]; };
     for (const Lk of S.links) {
       const a = at(Lk.a.piece), b = at(Lk.b.piece);
       g.strokeStyle = !Lk.compat.ok ? '#ff6b6b' : Lk.compat.taper ? '#ffb454' : '#7cf03a'; g.lineWidth = 2;
@@ -1091,7 +1109,7 @@ export function createStitchPage(T) {
       const [x, y] = at(pc.id);
       const sel = S.sel && ((S.sel.t === 'piece' && S.sel.id === pc.id) || (S.sel.t === 'socket' && S.sel.piece === pc.id));
       const kitCol = {caves: '#5fa8d3', mines: '#d39a5f', ruins: '#b7a6e8'}[pc.kit] || '#aaa';
-      const w = Math.max(54, g.measureText(pc.id + ' ' + pc.type).width + 10);
+      const w = rect.get(pc.id).w;
       g.fillStyle = sel ? '#1d3a6e' : ghosts.has(pc.id) ? '#2a1d44' : '#1a2029'; g.fillRect(Math.round(x - w / 2), Math.round(y - 9), Math.round(w), 18);
       g.strokeStyle = sel ? '#6ea8fe' : kitCol; g.lineWidth = sel ? 2 : 1; g.strokeRect(Math.round(x - w / 2) + 0.5, Math.round(y - 9) + 0.5, Math.round(w), 18);
       g.fillStyle = kitCol; g.fillRect(Math.round(x - w / 2) + 2, Math.round(y - 7), 3, 14);
@@ -1133,7 +1151,14 @@ export function createStitchPage(T) {
     let j;
     try { j = await api.get(id); } catch (e) { toast('open ' + id + ': ' + e.message, true); return; }
     let d, rr;
-    try { d = DG.normalizeDungeon(JSON.parse(j.dungeon)); } catch (e) { toast(id + '/dungeon.json: ' + e.message, true); return; }
+    try { d = DG.normalizeDungeon(JSON.parse(j.dungeon)); }
+    catch (e) {
+      // e.g. D1's _fixture: a hand-written shell whose pieces name no kit
+      toast(id + ' cannot be edited here: ' + e.message + ' (its shell.json is hand-written, not built from the kits)', true);
+      T.setStatus(id + ': not built from the kits (' + e.message + ')', true);
+      ui.listSel.value = S.id;
+      return;
+    }
     try { rr = E.readRefs(j.refs); } catch (e) { toast(id + '/refs.json does not parse: ' + e.message, true); rr = {about: '', refs: []}; }
     load(id, d, rr);
     if (S.view === 'world') setViewMode(placementOf() ? 'world' : 'xray');
@@ -1213,7 +1238,7 @@ export function createStitchPage(T) {
       const a = info.anchor;
       let at, yawDeg, pitch;
       if (dl[1] !== 0) { at = [a[0] + 0.5, a[1] + 24, a[2] + 0.5]; yawDeg = 0; pitch = -70; }
-      else { at = [a[0] + 0.5 + dw[0] * 26, a[1] + 18, a[2] + 0.5 + dw[1] * 26]; yawDeg = Math.atan2(-dw[1], -dw[0]) * 180 / Math.PI; pitch = -8; }
+      else { at = [a[0] + 0.5 + dw[0] * 26, a[1] + 30, a[2] + 0.5 + dw[1] * 26]; yawDeg = Math.atan2(-dw[1], -dw[0]) * 180 / Math.PI; pitch = -8; }
       const r = await api.play({mode: 'dungeon', at, yaw: yawDeg, pitch, map: pl.map});
       toast('launched the game (pid ' + r.pid + ') at the entrance of ' + S.id + ' on ' + pl.map + ': --at ' + at.map(v => v.toFixed(1)).join(','));
       schedulePreview(0);

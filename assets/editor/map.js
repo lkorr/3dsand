@@ -3777,6 +3777,8 @@ export function _preview() { return preview; }
 export function _job() { return mainJob; }
 // E4 test seams (the locales)
 export function _lc() { return LC; }
+// Dungeons D4 test seam (the placed dungeons layer)
+export function _dgl() { return DGL; }
 export function _heights() { return heights; }
 export function _fetchHeights() { return fetchHeights(); }
 export function _groundAt(x, z) { return groundAt(x, z); }

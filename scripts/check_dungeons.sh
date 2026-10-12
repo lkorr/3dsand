@@ -106,14 +106,13 @@ else
 fi
 
 if [ -n "$SHOTS" ]; then
+  # Real-time screenshots over the DevTools protocol (scripts/cdp_shot.mjs):
+  # Chrome's own --screenshot waits on a virtual clock that a page streaming
+  # voxels on requestAnimationFrame never lets run out.
   mkdir -p "$SHOTS"
-  SHOTCOMMON=(--headless=new --disable-gpu --use-angle=swiftshader-webgl
-              --enable-unsafe-swiftshader "--user-data-dir=$PROF" --no-first-run
-              --virtual-time-budget=120000 --window-size=1600,1000)
-  "$CHROME" "${SHOTCOMMON[@]}" --screenshot="$SHOTS/dungeons_kit.png" \
-    "http://127.0.0.1:$PORT/tuner.html?tab=dungeons&dgpage=kit" 2>/dev/null || true
-  "$CHROME" "${SHOTCOMMON[@]}" --screenshot="$SHOTS/dungeons_stitch.png" \
-    "http://127.0.0.1:$PORT/tuner.html?tab=dungeons&dungeon=$ID" 2>/dev/null || true
+  READY="(() => { const d = window.__tunerDungeons; const p = d && (d.page() === 'kit' ? d.kit : d.stitch); const v = p && p.view.wv; if (!v || !(p.S ? p.S.prog : p.st.program)) return false; const s = v.stats; if (!(s.live > 0 && s.ready >= s.live && !v.inflight && !v.staleCount() && !s.queued)) { window.__dgStable = 0; return false; } return (window.__dgStable = (window.__dgStable || 0) + 1) >= 4; })()"
+  node "$ROOT/scripts/cdp_shot.mjs" "http://127.0.0.1:$PORT/tuner.html?tab=dungeons&dgpage=kit"     --wait "$READY" --shot "$SHOTS/dungeons_kit.png" --timeout 300 || true
+  node "$ROOT/scripts/cdp_shot.mjs" "http://127.0.0.1:$PORT/tuner.html?tab=dungeons&dungeon=$ID"     --wait "$READY" --run "(() => { const st = window.__tunerDungeons.stitch; st.select({t: 'piece', id: 'p1'}); st.S.showWay = true; return 1; })()"     --wait "$READY" --shot "$SHOTS/dungeons_stitch.png" --timeout 300 || true
   echo "check_dungeons: screenshots in $SHOTS"
 fi
 

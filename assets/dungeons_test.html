@@ -125,6 +125,37 @@ const ID = Q.get('id') || '_d4_check';
   say(linkedNow >= 2, 'snap: both sides of the join draw as linked (' + linkedNow + ' linked sockets)');
   const tip = S.sockets.find(s => s.piece === 'p1' && s.state === 'open');
   say(!!tip, 'the drift ends in an open socket (' + (tip ? tip.name : '-') + ')');
+  await until(() => { const v = St.view.wv; return v && v.mvp && v.stats.live > 0; }, 60000, 300);
+  // DRAG AND DROP: a palette item dragged onto an open socket's frame snaps there
+  // (synthetic DragEvents through the real handlers: dragstart on the palette
+  // item, dragover + drop on the view at the socket's projected centre).
+  {
+    const openS = S.sockets.filter(s => s.state === 'open' && !s.tags.includes('surface'));
+    const before = S.d.pieces.length;
+    St.view.frameBox(S.prog.bounds.min, S.prog.bounds.max, {k: 1.4});
+    let dropped = false, why = 'no open socket on screen (' + openS.length + ' open)';
+    W.document.querySelector('#view-dungeons .dg-tabs2 button').click();     // the Pieces palette
+    await sleep(100);
+    const item = [...W.document.querySelectorAll('#view-dungeons .dg-item[draggable=true]')].find(e => JSON.parse(e.dataset.spec).type === 'crawl' || JSON.parse(e.dataset.spec).type === 'drift');
+    for (const s of openS) {
+      St.view.draw();
+      const c = s.dir[1] ? s.pos : [s.pos[0], s.pos[1] + s.h / 2, s.pos[2]];
+      const q = St.view.project(c);
+      if (!q || !item) continue;
+      const r = St.view.canvas.getBoundingClientRect();
+      const dt = new W.DataTransfer();
+      item.dispatchEvent(new W.DragEvent('dragstart', {bubbles: true, dataTransfer: dt}));
+      const at = {bubbles: true, cancelable: true, dataTransfer: dt, clientX: r.left + q[0], clientY: r.top + q[1]};
+      St.view.el.dispatchEvent(new W.DragEvent('dragover', at));
+      why = 'drop target ' + JSON.stringify(S.drop) + ' for ' + s.piece + '.' + s.name;
+      St.view.el.dispatchEvent(new W.DragEvent('drop', at));
+      item.dispatchEvent(new W.DragEvent('dragend', {bubbles: true, dataTransfer: dt}));
+      dropped = await until(() => S.d.pieces.length === before + 1, 3000);
+      if (dropped) { why = 'onto ' + s.piece + '.' + s.name; break; }
+    }
+    say(dropped, 'drag and drop: a palette piece dropped on an open socket snaps there (' + why + ')');
+    if (dropped) { St.hist.doUndo(); await until(() => S.d.pieces.length === before, 3000); }
+  }
   St.growAt({piece: 'p1', socket: tip.name});
   ok = await until(() => S.proposal && S.proposal.result.pieces.length > 0 && S.prog && S.prog.pieces.length > 2, 8000);
   say(ok, 'grow: a proposal appears (' + (S.proposal ? S.proposal.result.pieces.length : 0) + ' ghosted pieces' + (S.proposal && S.proposal.result.notes.length ? '; ' + S.proposal.result.notes.join('; ') : '') + ')');
@@ -147,6 +178,27 @@ const ID = Q.get('id') || '_d4_check';
   St.hist.doRedo();
   ok = await until(() => S.d.pieces.length === 2 + nProp, 3000);
   say(ok, 'redo: ' + S.d.pieces.length + ' pieces again');
+  // CLICK TO PLACE: arm a kind in the Entities palette, click the view where the
+  // x-ray pick finds a floor (a pixel over the middle of piece p1).
+  {
+    const tabs = W.document.querySelectorAll('#view-dungeons .dg-tabs2 button');
+    tabs[2].click();
+    await sleep(100);
+    const it = [...W.document.querySelectorAll('#view-dungeons .dg-item[draggable=true]')].find(e => JSON.parse(e.dataset.spec).kind === 'marker');
+    it.click();
+    const before = S.refs.length;
+    const pc = S.prog.pieces.find(p => p.id === 'p1');
+    St.view.draw();
+    const q = St.view.project([(pc.bounds.min[0] + pc.bounds.max[0]) / 2, pc.bounds.min[1] + 2, (pc.bounds.min[2] + pc.bounds.max[2]) / 2]);
+    const r = St.view.canvas.getBoundingClientRect();
+    const ev = (t) => new W.PointerEvent(t, {bubbles: true, cancelable: true, clientX: r.left + q[0], clientY: r.top + q[1], button: 0, pointerId: 1});
+    St.view.canvas.dispatchEvent(ev('pointerdown'));
+    St.view.canvas.dispatchEvent(ev('pointerup'));
+    const placed = await until(() => S.refs.length === before + 1, 3000);
+    const m = placed ? S.refs[S.refs.length - 1] : null;
+    say(placed, 'click to place: an armed marker lands where the x-ray pick hits (' + (m ? m.name + ' at ' + m.pos.join(',') : 'nothing placed; hit ' + JSON.stringify(St.view.pickVoxel(q[0], q[1]))) + ')');
+    if (placed) { St.hist.doUndo(); await until(() => S.refs.length === before, 3000); }
+  }
   // entities: a lever wired to a gate
   const p1 = S.prog.pieces.find(p => p.id === 'p1');
   const c = [Math.round((p1.bounds.min[0] + p1.bounds.max[0]) / 2), Math.round(p1.bounds.min[1] + 6), Math.round((p1.bounds.min[2] + p1.bounds.max[2]) / 2)];

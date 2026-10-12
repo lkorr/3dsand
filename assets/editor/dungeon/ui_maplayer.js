@@ -89,7 +89,7 @@ export function createDungeonLayer(C) {
       // facing tick (the placement's +Z: heading = yaw)
       const f = rotQ(q(e), 0, 1);
       g.fillRect(x + f[0] * 14 - 1, z + f[1] * 14 - 1, 3, 3);
-      const depth = sh && sh.bounds ? ' ' + (sh.bounds.min[1] / 10).toFixed(0) + '..' + (sh.bounds.max[1] / 10).toFixed(0) + ' m' : sh && sh.missing ? ' (no shell)' : '';
+      const depth = sh && sh.bounds ? '  depth ' + (-sh.bounds.min[1] / 10).toFixed(1) + ' m' + (sh.bounds.max[1] > 4 ? ', up ' + (sh.bounds.max[1] / 10).toFixed(1) + ' m' : '') : sh && sh.missing ? ' (no shell)' : '';
       g.fillStyle = sel ? '#ffd866' : '#ead6ff';
       g.fillText((e.name || e.id) + depth + (e.yOffset ? ' yOff ' + e.yOffset : ''), x + 14, z - 12);
     }
@@ -226,5 +226,6 @@ export function createDungeonLayer(C) {
       'The footprint is each piece\'s box from the SAVED shell.json, shaded by depth band; recompile (save in the Dungeons tab) to refresh it. Saving the map moves the world hash (a dungeon is worldgen input).']
   });
 
-  return {st, buildPanel, sync, afterRestore, paint, loadList, refresh: () => { st.shells.clear(); loadList(); C.paint(); }};
+  return {st, buildPanel, sync, afterRestore, paint, loadList, entries, ctx: C, down, move, up, onKey,
+          refresh: () => { st.shells.clear(); loadList(); C.paint(); }};
 }
