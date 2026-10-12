@@ -57,6 +57,16 @@
 // rng::Hash3 on (ref hash, tick). No wall clock. Resident state is CPU
 // scratch, never saved: after a load a villager simply re-plans from where
 // it stands.
+//
+// THE MONSTER ROWS (dungeons D3; schedule.h guard / patrol / lair / ambush)
+// run through the same day: the row's anchor, the route over the waynodes,
+// the arbiter's activity verb (Goto; Sleep for a lair asleep). What makes
+// them a MONSTER's is the profile: a hostile one fights what it sees (the
+// arbiter's own verbs outscore the routine), and losing the target hands the
+// row back, which walks it home. A lair / ambush row caps how far a NEW
+// target is seen (ai::Brain::acquireCap = radius) until it is sprung. A
+// spawner's creatures (world/refs_dungeon.h) are driven by StepScheduled
+// with a stand-in npc ref, so they take the same rows.
 
 #pragma once
 
@@ -160,6 +170,14 @@ struct ResidentStatus {
   // Counters (gates): doors this villager opened / closed, anchors reached,
   // routes re-planned after a failed leg.
   uint32_t doorOpens = 0, doorCloses = 0, arrivals = 0, replans = 0;
+  // D3 monster rows: the patrol's current node, the nodes it has stood on
+  // (newest last, at most 32), how many it has reached; a lair / ambush's
+  // sprung state and how many times it was sprung.
+  std::string patrolNode;
+  std::vector<std::string> patrolVisits;
+  uint32_t patrolArrivals = 0;
+  bool sprung = false;
+  uint32_t springs = 0;
 };
 bool ResidentStatusOf(const std::string& refId, ResidentStatus& out);
 // Every villager the layer is driving, id order.
@@ -173,5 +191,12 @@ bool ScheduledPlace(const RefStore& s, const Ref& npc, uint32_t tick, Vec3& foot
                     float& heading);
 // Forget every villager's plan (a load, a gate's reset).
 void ResetResidents();
+// D3: drive one creature by the schedule on `asNpc` -- a STAND-IN npc ref
+// (never in the store) whose id is the creature's Mob::RefId, whose props
+// carry `schedule` and the roles, and whose group resolves bare names. A
+// spawner's creatures tick through here.
+void StepScheduled(RefCtx& c, const Ref& asNpc);
+// Forget one driven creature's plan (its spawner went dormant).
+void ForgetResident(const std::string& id);
 
 }  // namespace refs

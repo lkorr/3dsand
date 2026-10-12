@@ -75,6 +75,23 @@ void TickRefs(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t tick
     if (p.s != nullptr && p.s->talk.active && p.s->talk.speaker.mobId != 0)
       talkers.push_back({p.s->talk.speaker.mobId, p.s->player.EyePos()});
   ctx.talkers = &talkers;
+  // D3: the player bodies a plate, a trap box or an ambusher tests against,
+  // in session order. A harness body (a fly-mode camera, no avatar) is not
+  // a body: it stands on no plate.
+  std::vector<RefCtx::Body> bodies;
+  for (size_t i = 0; i < players.size(); i++) {
+    const PlayerSession* ps = players[i].s;
+    if (ps == nullptr || ps->player.fly) continue;
+    RefCtx::Body b;
+    b.foot = Vec3{ps->player.pos.x, ps->player.pos.y - Player::kHalfY, ps->player.pos.z};
+    b.halfXZ = Player::kHalfXZ;
+    b.height = 2.0f * Player::kHalfY;
+    b.mob = const_cast<PlayerAvatar*>(&ps->avatar);
+    b.session = (uint32_t)i;
+    b.alive = ps->avatar.IsAlive();
+    bodies.push_back(b);
+  }
+  ctx.players = &bodies;
   s.Update(ctx, w.world.WindowOrigin());
 
   // THE USE VERB, per session in index order (the op-order rule: session 0's

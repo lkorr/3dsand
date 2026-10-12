@@ -563,6 +563,8 @@ bool LoadItems(const std::string& dir, size_t materialCount,
     d.reach = it.value("reach", 9.0f) *
               ((float)kVoxelsPerMetre / (float)kLegacyAuthoringVoxelsPerMetre);
     d.weaponClass = it.value("weaponClass", "");
+    // A KEY (dungeons D3): which lock it opens. Default: its own id.
+    if (d.kind == ItemKind::Key) d.keyId = it.value("unlocks", d.name);
     // ---- VESSELS (game/container.h) ----------------------------------------
     // `holds` by CLASS NAME, so what a vessel takes up is authored, not a
     // material list: a flask holds every liquid there is or will be.

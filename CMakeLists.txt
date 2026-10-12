@@ -622,6 +622,11 @@ add_library(sandvox_core OBJECT
   src/world/refs_npc.cpp
   # demons D2: the `readable` kind (a book / note whose use opens a dialogue).
   src/world/refs_readable.cpp
+  # dungeons D3: dungeon ref groups (local frame), the entity kinds (spawner,
+  # lever, plate, gate, trap, key, region) and loot tables.
+  src/world/dungeon_refs.cpp
+  src/world/refs_dungeon.cpp
+  src/world/loot.cpp
   # The acceptance gate. support.cpp holds the sim/render plumbing that main.cpp
   # and the gates share; each selftest_*.cpp is one domain's gates. Split out of
   # main.cpp so `--gate <name>` can run one in seconds and so two agents editing
@@ -700,6 +705,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_dialogue.cpp
   src/test/selftest_refs.cpp
   src/test/selftest_npc.cpp
+  src/test/selftest_dungeon_entities.cpp
   src/test/selftest_structure.cpp
   src/test/selftest_editor.cpp
   src/test/selftest_village.cpp

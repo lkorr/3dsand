@@ -50,8 +50,10 @@ std::string Num(float v) {
 }  // namespace
 
 const std::vector<std::string>& Activities() {
-  static const std::vector<std::string> k = {"sleep", "work", "wander",
-                                             "socialize", "eat", "goto"};
+  // The first six are a villager's day (P7); the last four a monster's
+  // (dungeons D3, docs/PLAN_dungeons.md 3.7: world/refs_npc.cpp drives them).
+  static const std::vector<std::string> k = {"sleep", "work",  "wander", "socialize", "eat",
+                                             "goto",  "guard", "patrol", "lair",      "ambush"};
   return k;
 }
 
@@ -73,6 +75,23 @@ std::string ClockText(int minute) {
   char b[8];
   std::snprintf(b, sizeof b, "%02d:%02d", minute / 60, minute % 60);
   return b;
+}
+
+std::vector<std::string> Row::Route() const {
+  std::vector<std::string> out;
+  if (extra.contains("route") && extra["route"].is_array())
+    for (const Json& v : extra["route"])
+      if (v.is_string()) out.push_back(v.get<std::string>());
+  return out;
+}
+
+bool Row::PingPong() const {
+  return extra.contains("mode") && extra["mode"].is_string() && extra["mode"] == "pingpong";
+}
+
+float Row::WaitSec() const {
+  if (extra.contains("wait") && extra["wait"].is_number()) return std::max(0.0f, extra["wait"].get<float>());
+  return 2.0f;
 }
 
 bool Row::Covers(int minute) const {
@@ -147,17 +166,22 @@ bool Parse(const std::string& name, const std::string& text, const std::string& 
     };
     clock("from", row.from);
     clock("to", row.to);
-    if (ok && row.to == 1440) row.to = 0;
+    // "00:00" to "24:00" is ALL DAY (a guard that never leaves its post):
+    // kept as [0, 1440), which Covers every minute. Any other "24:00" is
+    // midnight.
+    if (ok && row.to == 1440 && row.from != 0) row.to = 0;
     if (ok && row.from == 1440) row.from = 0;
     if (!r.contains("do") || !r["do"].is_string()) {
       problems.push_back(RowLabel(label, i, "do") +
-                         "want an activity (sleep, work, wander, socialize, eat, goto) -- row skipped");
+                         "want an activity (sleep, work, wander, socialize, eat, goto, guard, "
+                         "patrol, lair, ambush) -- row skipped");
       ok = false;
     } else {
       row.act = r["do"].get<std::string>();
       if (!IsActivity(row.act)) {
         problems.push_back(RowLabel(label, i, "do") + "'" + row.act +
-                           "' is not an activity (sleep, work, wander, socialize, eat, goto) -- row skipped");
+                           "' is not an activity (sleep, work, wander, socialize, eat, goto, guard, "
+                           "patrol, lair, ambush) -- row skipped");
         ok = false;
       }
     }
@@ -171,6 +195,24 @@ bool Parse(const std::string& name, const std::string& text, const std::string& 
       else problems.push_back(RowLabel(label, i, "radius") + "want metres >= 0");
     }
     if (r.contains("note") && r["note"].is_string()) row.note = r["note"].get<std::string>();
+    // The monster rows' own fields (dungeons D3). Kept in `extra` (written
+    // back verbatim, read through Row::Route / Mode / WaitSec), validated here.
+    if (r.contains("route")) {
+      bool good = r["route"].is_array() && !r["route"].empty();
+      if (good)
+        for (const Json& v : r["route"]) good &= v.is_string();
+      if (!good)
+        problems.push_back(RowLabel(label, i, "route") +
+                           "want a list of waynodes, e.g. [\"dungeon/x/wn_a\", \"wn_b\"]");
+    }
+    if (ok && row.act == "patrol" && !r.contains("route"))
+      problems.push_back(RowLabel(label, i, "route") +
+                         "a patrol row needs a route (a list of waynodes); it holds `at` instead");
+    if (r.contains("mode") &&
+        (!r["mode"].is_string() || (r["mode"] != "loop" && r["mode"] != "pingpong")))
+      problems.push_back(RowLabel(label, i, "mode") + "want \"loop\" or \"pingpong\"");
+    if (r.contains("wait") && (!r["wait"].is_number() || r["wait"].get<float>() < 0.0f))
+      problems.push_back(RowLabel(label, i, "wait") + "want seconds >= 0");
     for (auto it = r.begin(); it != r.end(); ++it) {
       const std::string& k = it.key();
       if (k == "from" || k == "to" || k == "do" || k == "at" || k == "radius" || k == "note")
@@ -193,7 +235,8 @@ std::string Write(const Schedule& s) {
     const Row& r = s.rows[i];
     o += i ? ",\n    " : "\n    ";
     o += "{ \"from\": \"" + ClockText(r.from) + "\", \"to\": \"" +
-         (r.to == 0 && r.from != 0 ? std::string("24:00") : ClockText(r.to)) + "\", \"do\": " +
+         ((r.to == 0 && r.from != 0) || r.to == 1440 ? std::string("24:00") : ClockText(r.to)) +
+         "\", \"do\": " +
          Json(r.act).dump();
     if (!r.at.empty()) o += ", \"at\": " + Json(r.at).dump();
     if (r.radius >= 0.0f) o += ", \"radius\": " + Num(r.radius);

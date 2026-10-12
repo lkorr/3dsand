@@ -1,0 +1,35 @@
+{
+  "comment": "A plain iron key, the sort a gaoler carries by the dozen. Regenerate with scripts/gen_key_items.py. WHICH LOCK it opens is items.json's `unlocks` (default: the item id).",
+  "name": "iron_key",
+  "model": "iron_key",
+  "artVoxelsPerMetre": 80,
+  "hp": 20,
+  "severable": false,
+  "grip": {
+    "held_right": {
+      "translation": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        0,
+        -90,
+        0
+      ],
+      "scale": 1.0
+    }
+  },
+  "hilt": {
+    "min": [
+      0,
+      0,
+      0
+    ],
+    "size": [
+      7,
+      2,
+      7
+    ]
+  }
+}

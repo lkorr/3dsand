@@ -1247,6 +1247,12 @@ struct Brain {
 
   // ---- the schedule's ask (P7) ----
   Routine routine;
+  // A CAP ON HOW FAR A NEW TARGET IS SEEN (dungeons D3, world/refs_npc.h):
+  // world voxels, < 0 = the profile's own sightRange. Written every tick by
+  // the resident layer for a `lair` row (a sleeper wakes only for what comes
+  // within its radius) or an `ambush` row (still until the prey is close);
+  // a target already held keeps the profile's keep range. Never saved.
+  float acquireCap = -1.0f;
   // ---- the profile's own idle wander (Movement::wanderRadius) ----
   // `wanderOwned`: the routine above was written by Think's generic wander
   // (not by a resident layer), so Think may also take it back.

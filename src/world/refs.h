@@ -68,7 +68,9 @@
 #include <vector>
 
 #include "math3d.h"
+#include "world/dungeon_refs.h"
 
+class Mob;
 class MobSystem;
 class World;
 class ChunkStore;
@@ -110,6 +112,8 @@ struct Ref {
 // FNV-1a 32 of the id. Collisions are detected at load (a warning names both).
 uint32_t RefHash(const std::string& id);
 // "harrowby/smithy/door" -> "harrowby". "" when the id has no '/'.
+// A DUNGEON id (dungeons D3, world/dungeon_refs.h) has a two-part group:
+// "dungeon/shardwell/lever_a" -> "dungeon/shardwell".
 std::string GroupOfId(const std::string& id);
 // Ids are `group/name[/slot...]`, each part [a-z0-9_-]+. False + why.
 bool ValidId(const std::string& id, std::string* why = nullptr);
@@ -175,6 +179,19 @@ struct RefCtx {
     Vec3 eye{};
   };
   const std::vector<Talker>* talkers = nullptr;
+  // Dungeons D3 (world/refs_dungeon.h): every PLAYER BODY this tick, in
+  // session order -- what a pressure plate, a trap's box, a spawner's
+  // trigger region and an ambusher's radius test against. NPC bodies come
+  // from `mobs`. Null in a store-only gate.
+  struct Body {
+    Vec3 foot{};          // the sole, world voxels (centre of the footprint)
+    float halfXZ = 3.0f;  // half the footprint, voxels
+    float height = 17.0f; // voxels
+    Mob* mob = nullptr;   // the avatar (hp, SpendHp); null when it has none
+    uint32_t session = 0;
+    bool alive = true;
+  };
+  const std::vector<Body>* players = nullptr;
 };
 
 // One use of one ref by one player (the §2.5 verb).
@@ -313,6 +330,13 @@ class RefStore {
   void RefreshDerived();
   const std::string& Dir() const { return dir_; }
   const std::string& MapName() const { return map_; }
+  // DUNGEONS (D3, world/dungeon_refs.h): map.json `dungeons[]`, each placed
+  // as the group "dungeon/<id>" from assets/dungeons/<dungeon>/refs.json in
+  // the dungeon's LOCAL frame. The store holds world positions; LoadMap /
+  // Reload transform in, every group-file write transforms back. A placement
+  // read before its map was the loaded one sits at y = yOffset until the
+  // next Update finds the map and moves the group onto its ground.
+  const std::vector<DungeonPlacement>& Dungeons() const { return dungeons_; }
 
   // ---- reading -------------------------------------------------------------
   const Ref* Find(const std::string& id) const;
@@ -400,6 +424,8 @@ class RefStore {
   bool WriteGroupFile(const std::string& group, std::string* err);
   // L1: follow CurrentWorldMap()'s resolved locale offsets (see LoadMap).
   void FollowLocales();
+  // D3: resolve unresolved dungeon placements once their map is loaded.
+  void FollowDungeons();
   void Index();
   void EnsurePulled(const Ref& r);
   void Activate(RefCtx& ctx, const Ref& r);
@@ -414,6 +440,8 @@ class RefStore {
   std::string assetDir_, map_, dir_;
   // L1: group -> the y its refs' file y take (a locale group); see LoadMap.
   std::map<std::string, int> yOff_;
+  // D3: the dungeon placements of map_ (their groups are "dungeon/<id>").
+  std::vector<DungeonPlacement> dungeons_;
   std::map<std::string, RefGroupFile> groups_;
   std::vector<std::string> groupOrder_;
   std::map<std::string, Ref> refs_;

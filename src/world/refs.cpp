@@ -68,7 +68,13 @@ uint32_t RefHash(const std::string& id) {
 
 std::string GroupOfId(const std::string& id) {
   const size_t s = id.find('/');
-  return s == std::string::npos ? std::string() : id.substr(0, s);
+  if (s == std::string::npos) return std::string();
+  // A dungeon's group is "dungeon/<id>" (D3, world/dungeon_refs.h).
+  if (id.compare(0, s, "dungeon") == 0) {
+    const size_t t = id.find('/', s + 1);
+    if (t != std::string::npos) return id.substr(0, t);
+  }
+  return id.substr(0, s);
 }
 
 bool ValidId(const std::string& id, std::string* why) {
@@ -385,6 +391,54 @@ void ReadDir(const std::string& dir, std::map<std::string, RefGroupFile>& groups
     groups[g.group] = std::move(g);
   }
 }
+// D3: every placed dungeon's ref group (world/dungeon_refs.h), read from its
+// asset dir in the dungeon-local frame and transformed into the world. The
+// group is "dungeon/<placement id>"; ids are re-prefixed when the placement
+// id differs from the dungeon asset.
+void ReadDungeons(const std::string& assetDir, const std::vector<DungeonPlacement>& ps,
+                  std::map<std::string, RefGroupFile>& groups, std::vector<std::string>& order,
+                  std::map<std::string, Ref>& refs, std::vector<std::string>& warn) {
+  for (const DungeonPlacement& p : ps) {
+    const std::string label = "dungeons/" + p.dungeon + "/" + p.refsFile;
+    const std::string path = assetDir + "/" + label;
+    std::string text;
+    if (!ReadFile(path, text)) continue;   // a dungeon with no entities
+    RefGroupFile g;
+    if (!ParseGroup(text, label, g, warn)) continue;
+    g.group = p.Group();
+    if (groups.count(g.group)) {
+      warn.push_back(label + ": group \"" + g.group + "\" already exists; skipped");
+      continue;
+    }
+    std::vector<Ref> kept;
+    for (Ref& r : g.refs) {
+      Json idj = r.id;
+      RewritePrefix(idj, p.FilePrefix(), p.Group());
+      r.id = idj.get<std::string>();
+      RewritePrefix(r.props, p.FilePrefix(), p.Group());
+      if (GroupOfId(r.id) != g.group) {
+        warn.push_back(label + ": " + r.id + ": id: a dungeon ref's id must start with \"" +
+                       p.FilePrefix() + "/\"; skipped");
+        continue;
+      }
+      r.group = g.group;
+      r.hash = RefHash(r.id);
+      r.pos = p.ToWorld(r.pos);
+      r.yaw = p.YawToWorld(r.yaw);
+      if (refs.count(r.id)) {
+        warn.push_back(label + ": " + r.id + ": id: already used by refs/" + refs[r.id].group +
+                       ".json; this one is skipped (ids are map-wide)");
+        continue;
+      }
+      refs[r.id] = r;
+      kept.push_back(r);
+    }
+    g.refs = std::move(kept);
+    order.push_back(g.group);
+    groups[g.group] = std::move(g);
+  }
+}
+
 }  // namespace
 
 namespace {
@@ -505,6 +559,11 @@ void RefStore::LoadMap(const std::string& assetDir, const std::string& mapName) 
   std::vector<std::string> warn;
   yOff_ = worldmap::LocaleRefYOffsets(assetDir_, map_, &warn);
   ReadDir(dir_, groups_, groupOrder_, refs_, warn, yOff_);
+  dungeons_ = ReadDungeonPlacements(assetDir_, map_, &warn);
+  if (!dungeons_.empty() && !ResolveDungeonPlacements(dungeons_, map_))
+    warn.push_back("dungeons: the world map '" + map_ +
+                   "' is not the loaded one, so its dungeons' refs sit at y = yOffset until it is");
+  ReadDungeons(assetDir_, dungeons_, groups_, groupOrder_, refs_, warn);
   DeriveInto(refs_, &warn);
   for (const std::string& w : warn) Warn(w);
   for (const auto& [id, r] : refs_) ValidateRef(r, "refs/" + r.group + ".json");
@@ -521,6 +580,9 @@ void RefStore::Reload(RefCtx& ctx) {
   std::vector<std::string> warn;
   yOff_ = worldmap::LocaleRefYOffsets(assetDir_, map_, &warn);
   ReadDir(dir_, groups, order, refs, warn, yOff_);
+  dungeons_ = ReadDungeonPlacements(assetDir_, map_, &warn);
+  ResolveDungeonPlacements(dungeons_, map_);
+  ReadDungeons(assetDir_, dungeons_, groups, order, refs, warn);
   DeriveInto(refs, &warn);
   // What changed in the AUTHORED lines, for the kinds that care whether or
   // not the ref is active (RefKind::onEdit; a structure is worldgen input).
@@ -601,6 +663,8 @@ const RefGroupFile* RefStore::Group(const std::string& g) const {
 }
 
 std::string RefStore::GroupPath(const std::string& g) const {
+  if (const DungeonPlacement* dp = PlacementOfGroup(dungeons_, g); dp != nullptr)
+    return (fs::path(assetDir_) / "dungeons" / dp->dungeon / dp->refsFile).string();
   return (fs::path(dir_) / (g + ".json")).string();
 }
 
@@ -681,9 +745,46 @@ void RefStore::FollowLocales() {
     std::printf("refs: locale '%s' follows its ground: %+d voxels\n", g.c_str(), d);
 }
 
+void RefStore::FollowDungeons() {
+  bool pending = false;
+  for (const DungeonPlacement& p : dungeons_) pending |= !p.resolved;
+  if (!pending) return;
+  std::vector<DungeonPlacement> fresh = dungeons_;
+  if (!ResolveDungeonPlacements(fresh, map_)) return;
+  // group -> (old placement, new placement)
+  std::map<std::string, std::pair<DungeonPlacement, DungeonPlacement>> moved;
+  for (size_t i = 0; i < fresh.size(); i++)
+    if (fresh[i].groundY != dungeons_[i].groundY)
+      moved[fresh[i].Group()] = {dungeons_[i], fresh[i]};
+  for (auto& [id, r] : refs_) {
+    if (!r.derivedFrom.empty()) continue;
+    auto m = moved.find(r.group);
+    if (m == moved.end()) continue;
+    if (active_.count(id) && !prev_.count(id)) prev_[id] = r;
+    r.pos = m->second.second.ToWorld(m->second.first.ToLocal(r.pos));
+    reapply_.insert(id);
+  }
+  for (auto& [g, file] : groups_) {
+    auto m = moved.find(g);
+    if (m == moved.end()) continue;
+    for (Ref& r : file.refs) r.pos = m->second.second.ToWorld(m->second.first.ToLocal(r.pos));
+  }
+  for (const auto& [g, pq] : moved)
+    std::printf("refs: dungeon '%s' found its ground: anchor y%d\n", g.c_str(),
+                pq.second.AnchorWorld().y);
+  dungeons_ = std::move(fresh);
+  if (!moved.empty()) {
+    SyncDerived(false);
+    Index();
+    haveOrigin_ = false;
+    revision_++;
+  }
+}
+
 void RefStore::Update(RefCtx& ctx, IVec3 wo) {
   lastTick_ = ctx.tick;
   FollowLocales();
+  FollowDungeons();
   const bool moved = !haveOrigin_ || wo.x != lastOrigin_.x || wo.y != lastOrigin_.y ||
                      wo.z != lastOrigin_.z;
   if (!moved && retry_.empty() && reapply_.empty() && graveyard_.empty()) return;
@@ -855,7 +956,7 @@ bool RefStore::WriteGroupFile(const std::string& group, std::string* err) {
     return false;
   }
   std::error_code ec;
-  fs::create_directories(dir_, ec);
+  fs::create_directories(fs::path(GroupPath(group)).parent_path(), ec);
   const std::string path = GroupPath(group);
   const std::string tmp = path + ".tmp";
   {
@@ -864,9 +965,22 @@ bool RefStore::WriteGroupFile(const std::string& group, std::string* err) {
       if (err) *err = "could not write " + path;
       return false;
     }
-    // A locale's group goes back to anchor-relative y (ReadDir added it).
+    // A locale's group goes back to anchor-relative y (ReadDir added it); a
+    // dungeon's back into its local frame and file ids (ReadDungeons).
     const auto off = yOff_.find(group);
-    if (off == yOff_.end()) {
+    if (const DungeonPlacement* dp = PlacementOfGroup(dungeons_, group); dp != nullptr) {
+      RefGroupFile g = it->second;
+      g.group = dp->FilePrefix();
+      for (Ref& r : g.refs) {
+        r.pos = dp->ToLocal(r.pos);
+        r.yaw = dp->YawToLocal(r.yaw);
+        Json idj = r.id;
+        RewritePrefix(idj, dp->Group(), dp->FilePrefix());
+        r.id = idj.get<std::string>();
+        RewritePrefix(r.props, dp->Group(), dp->FilePrefix());
+      }
+      f << WriteGroup(g);
+    } else if (off == yOff_.end()) {
       f << WriteGroup(it->second);
     } else {
       RefGroupFile g = it->second;
@@ -988,6 +1102,8 @@ bool RefStore::DropGroupIfEmpty(const std::string& group, std::string* err) {
     if (err) *err = "group \"" + group + "\" still holds refs";
     return false;
   }
+  // A dungeon's refs file belongs to the dungeon asset: emptied, it stays.
+  if (PlacementOfGroup(dungeons_, group) != nullptr) return true;
   std::error_code ec;
   fs::remove(GroupPath(group), ec);
   groups_.erase(it);

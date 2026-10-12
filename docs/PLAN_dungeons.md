@@ -259,6 +259,37 @@ Positions in the dungeon local frame, transformed at load. New/extended kinds
 - Schedules: `assets/schedules/*.json` rows gain `do: guard | patrol | lair | ambush`
   (`at:` a waynode / marker tag; `patrol` takes `route: [waynode...]`).
 
+**D3 AMENDMENT (2026-10-12, package D3; the orchestrator confirms or reverts
+at merge).** What D3 had to decide that §3.7 left open — D1/D2/D4 must agree:
+
+1. **The refs transform**: `world = anchorWorld + R(yaw)·(local − anchorLocal)`,
+   `anchorWorld = (at.x, BareGroundHeight(at) + yOffset, at.z)`, R a quarter
+   turn of HEADING (R(90): (x, z) → (z, −x)) about the anchor CELL (cell
+   indices rotate as integers; the anchor cell maps to itself); a ref's yaw
+   += the placement yaw. `anchorLocal` = `shell.json` `"anchor": [x,y,z]`
+   (D1/D2: please write it — the entrance socket's local position), else
+   `dungeon.json` `"anchorLocal"`, else `[0,0,0]`. D1's shell transform
+   must use the same R and the same pivot, or refs drift from rock by up to
+   a voxel per axis.
+2. **Ids** in refs.json are `dungeon/<dungeon>/<name>`; the group is
+   `dungeon/<placement id>`, and a placement whose id differs from its
+   dungeon re-prefixes ids and prop strings. `dungeon/` is a reserved id
+   prefix (two-part group).
+3. **Kinds / props** (exact names, for D4's placement UI): see
+   `src/world/refs_dungeon.h` and DESIGN.md §16.D3. Additions to §3.7: a
+   `region` kind (a named box, `props.size`); boxes are `size: [sx,sy,sz]`
+   in the ref's right/up/forward frame; a trap's `region` is such a size
+   or a region/plate ref name; a lever's start state is `startOn` (`on` is
+   the receivers' signal prop); a plate's default signal is its own name;
+   `door.props.on` makes a door signal-worked.
+4. **Collapse twins**: no new material — materials.json's existing
+   `rubble` field already names each static material's powder twin
+   (stone → gravel, …); `collapse_floor` uses it (`to` overrides).
+5. **Keys** are `ItemKind::Key` items (`kind: "key"`, `unlocks`); shipped
+   `iron_key`, `bone_key`, `old_key`.
+6. **Patrol fields**: `route`, `mode` (`loop` | `pingpong`), `wait` (s);
+   `lair`/`ambush` use `radius` (m). `"00:00"`→`"24:00"` is an all-day row.
+
 ## 4. The three kits (starting piece lists; sliders are examples, not limits)
 
 Universal sliders on every piece (core supplies them): size (w/l/h), ceiling

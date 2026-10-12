@@ -86,6 +86,11 @@ enum class ItemKind : uint8_t {
   // (game/container.h). WHAT it holds is data (`container.holds`), so a flask
   // and a pouch are two rows of one kind, not two systems.
   Container,
+  // ---- carried, never held or worn (dungeons D3, world/refs_dungeon.h) ----
+  // A KEY: it does nothing in a hand; having one in the kit (bag or hotbar)
+  // is what opens a door whose `props.lock` names its keyId
+  // (ItemDef::keyId, items.json `unlocks`, default the item's own id).
+  Key,
 };
 
 // Is this kind WORN (a set of shells over the body) rather than merely carried?
@@ -109,13 +114,14 @@ inline const char* ItemKindName(ItemKind k) {
     case ItemKind::ArmorBelt: return "armor_belt";
     case ItemKind::Trinket: return "trinket";
     case ItemKind::Container: return "container";
+    case ItemKind::Key: return "key";
     case ItemKind::None: break;
   }
   return "none";
 }
 
 inline ItemKind ItemKindFromName(const std::string& s) {
-  for (int i = 1; i <= (int)ItemKind::Container; i++) {
+  for (int i = 1; i <= (int)ItemKind::Key; i++) {
     const ItemKind k = (ItemKind)i;
     if (s == ItemKindName(k)) return k;
   }
@@ -440,6 +446,9 @@ struct ItemDef {
   // "blunt" (strokes.h WEAPON FORMS). Authored in items.json; absent or
   // unknown swings the styles' own frames.
   std::string weaponClass;
+  // ItemKind::Key only: the lock this key opens (a door's `props.lock`).
+  // items.json `unlocks`; absent = the item's own id.
+  std::string keyId;
 
   // ---- HEFT: how much weapon is behind the edge ---------------------------
   //
