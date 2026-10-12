@@ -65,7 +65,7 @@ d.entrance = {piece: 'p0', socket: 'surface'};
 const narthex = at({piece: 'p0', socket: 'in'}, {kit: 'ruins', type: 'hall', params: Object.assign({
   width: 9, length: 8, height: 4.2, ceiling: 3.2, vault: 'dome', columnRows: '0', dais: false, banners: 0,
   tilePattern: 'runner', settle: 0.45, jitter: 0.5,
-  keyLight: 'shaft', keySize: 0.35, keyHeight: 12, keyAt: 0.55,
+  keyLight: 'shaft', keySize: 0.6, keyHeight: 20, keyAt: 0.55,
   exits: 'sides', decay: 0.35, moisture: 0.3, lightCount: 2, lightType: 'candles', doorWidth: 3.2, doorHeight: 3.2}, LIT)});
 
 const hall = at({piece: narthex, socket: 'left'}, {kit: 'ruins', type: 'hall', params: Object.assign({

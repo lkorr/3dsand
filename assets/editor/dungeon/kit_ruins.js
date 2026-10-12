@@ -189,6 +189,9 @@ function breaches(b, P, x0, x1, z0, z1, y, H, key) {
     const xw = side < 0 ? x0 : x1;
     const xa = side < 0 ? xw - dep : xw - 3, xb = side < 0 ? xw + 3 : xw + dep;
     b.carve('ellipsoid', {min: [xa, y - 2, zc - Math.round(w / 2)], max: [xb, y + hh, zc + Math.round(w / 2)]}, {layer: 3, noise: 2.6, blend: 3, tag: 'room'});
+    // the hole's floor: open-space only, so the noisy bottom never drops below the room's floor
+    // (only behind the wall line: never a ledge inside the room, nor over water)
+    b.fill('box', {min: [side < 0 ? xa - 4 : xw, y - 12, zc - Math.round(w / 2) - 4], max: [side < 0 ? xw : xb + 4, y, zc + Math.round(w / 2) + 4]}, {mat: 'floor', layer: 4, noise: null, mask: 'air', tag: 'breachfloor'});
     // the spill: a heap against the breach, flanks at repose, into the room
     b.mound(xw - side * Math.round(w * 0.2), y, zc, Math.round(w * 0.55), Math.round(w * 0.6), Math.round(hh * 0.45), {mat: 'rubble'});
     const nb = 2 + b.ri(0, 2, 'breach', key, i, 'nb');
@@ -343,11 +346,14 @@ function hallBody(b, P, fy, waterLevel) {
     : ex === 'left' || ex === 'through+left' ? [[-1, 'left']] : ex === 'right' || ex === 'through+right' ? [[1, 'right']] : [];
   // D8: breaches keep clear of the side doors' stretch of wall.
   const bz0 = z0 + b.m(1), bz1 = z1 - (P.dais ? b.m(P.daisDepth) : b.m(1));
-  if (!exSides.length) breaches(b, P, -hw, hw, bz0, bz1, fy, H, 'hall');
+  // In a flooded hall a breach starts above the water line: a hole below it
+  // would be air beside standing water, and the water would run into it.
+  const by = wetTop !== null ? Math.max(fy, wetTop + 4) : fy, bH = H - (by - fy);
+  if (!exSides.length) breaches(b, P, -hw, hw, bz0, bz1, by, bH, 'hall');
   else {
     // breach only on a wall without a door, or away from it
-    breaches(b, P, -hw, hw, bz0, Math.max(bz0 + 1, zc - dw - b.m(1.5)), fy, H, 'hallA');
-    breaches(b, P, -hw, hw, Math.min(bz1 - 1, zc + dw + b.m(1.5)), bz1, fy, H, 'hallB');
+    breaches(b, P, -hw, hw, bz0, Math.max(bz0 + 1, zc - dw - b.m(1.5)), by, bH, 'hallA');
+    breaches(b, P, -hw, hw, Math.min(bz1 - 1, zc + dw + b.m(1.5)), bz1, by, bH, 'hallB');
   }
   const ways = [];
   // A sunken (flooded) hall keeps its doors at the sill level, y = 0.

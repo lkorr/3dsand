@@ -495,7 +495,7 @@ export class Builder {
                        {tag: room ? 'room' : 'niche', noise: 1.1, blend: Math.max(P.blend, 6)});
         this.fill('box', {min: [Math.min(xa, xb) - 2, y - 6, z0 - 2], max: [Math.max(xa, xb) + 2, y, z1 + 2]}, {mat: 'floor', noise: 'floor', layer: 2, mask: 'air', tag: 'bayfloor'});
       } else if (kind === 'mine') {
-        i = this.carve('box', {min: [xa, y, z0], max: [xb, y + h, z1]}, {tag: room ? 'room' : 'niche', noise: 0.9, blend: 3});
+        i = this.carve('box', {min: [xa, y, z0], max: [xb, y + h, z1]}, {tag: room ? 'room' : 'niche', noise: {amp: Math.max(3, Math.round(depth * 0.25)), scale: this.m(1.2), octaves: 2, seedKey: 'baymine'}, blend: 3});
         this.floor(xa, z0, xb, z1, y);
       } else {
         const rise = Math.max(2, Math.min(Math.round((z1 - z0) / 2), Math.round(h * 0.35)));
@@ -605,11 +605,14 @@ export class Builder {
     const n = 3 + Math.round(S * 4), Lm = this.m(1.2 + 2.6 * S);
     this.fill('ellipsoid', {min: [x - 8, y - 10, z - 8], max: [x + 9, y + 4, z + 9]}, {mat: 'quartzite', noise: 0.3, layer: 4, tag: 'keylight'});
     for (let i = 0; i < n; i++) {
-      const a = this.r('kc', i, 'a') * Math.PI * 2, lean = 0.15 + 0.55 * this.r('kc', i, 'lean');
+      // prisms fanning out of the root, each its own (they must read as
+      // separate crystals, not one glowing lump)
+      const a = ((i + this.r('kc', i, 'a')) / n) * Math.PI * 2, lean = 0.3 + 0.55 * this.r('kc', i, 'lean');
       const len = Math.round(Lm * (0.45 + 0.55 * this.r('kc', i, 'len')));
-      const rr = Math.max(2, Math.round(len / 7));
-      const tip = [x + Math.round(Math.cos(a) * lean * len), y + Math.round(len * (1 - lean * 0.5)), z + Math.round(Math.sin(a) * lean * len)];
-      this.fill('spline_tube', {pts: [[x, y - 6, z], [Math.round((x + tip[0]) / 2), Math.round((y + tip[1]) / 2), Math.round((z + tip[2]) / 2)], tip], radii: [rr + 1, rr, 1]},
+      const rr = Math.max(2, Math.round(len / 11));
+      const bx = x + Math.round(Math.cos(a) * 4), bz = z + Math.round(Math.sin(a) * 4);
+      const tip = [bx + Math.round(Math.cos(a) * lean * len), y + Math.round(len * (1 - lean * 0.45)), bz + Math.round(Math.sin(a) * lean * len)];
+      this.fill('spline_tube', {pts: [[bx, y - 6, bz], [Math.round((bx + tip[0]) / 2), Math.round((y + tip[1]) / 2), Math.round((bz + tip[2]) / 2)], tip], radii: [rr + 1, rr, 1]},
                 {mat: i % 3 === 2 ? 'gem_arcane' : 'crystal', noise: null, layer: 4, tag: 'keylight'});
     }
     this.ref('light', [x, y, z], {name: 'key_crystals', props: {type: 'crystal', warm: false}});

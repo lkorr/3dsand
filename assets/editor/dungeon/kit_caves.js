@@ -472,7 +472,10 @@ const CAVERN = {
     }
     if (P.pool > 0) {
       const pr = Math.round(Math.min(f.hw, f.L / 2) * 0.6 * P.pool) + 4, pd = Math.max(4, Math.round(pr * 0.35));
-      const [px, py, pz] = f.floorAt(...disc(b, 'pool'), pr);
+      const [px, py0, pz] = f.floorAt(...disc(b, 'pool'), pr);
+      // on a sloped / terraced floor the pool sits at the LOWEST floor round
+      // it, or its water would stand above the lower side and spill (rule 2)
+      const py = f.SR ? Math.min(py0, f.yAt(pz - pr), f.yAt(pz + pr)) : py0;
       b.carve('ellipsoid', {min: [px - pr, py - pd, pz - pr], max: [px + pr, py + pd, pz + pr]}, {layer: 3, noise: 0.25, tag: 'room', liquid: 'liquid', level: py - 2});
     }
     for (let i = 0; i < 8; i++) {

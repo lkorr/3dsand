@@ -209,15 +209,15 @@ function driftBody(b, P, z0, z1, W, H, C, key, opt) {
   // in the overbreak above it and can never fill the passage.
   if ((P.vein || 0) > 0) {
     const side = b.r('vein', key, 'side') < 0.5 ? -1 : 1;
-    const th = Math.max(3, Math.round(b.m(0.25) + P.vein * b.m(0.8)));
+    const th = Math.max(2, Math.round(b.m(0.12) + P.vein * b.m(0.35)));
     const ob = Math.min(32, b.m(P.overbreak || 0));
     const list = segs || [{z0, z1, x: 0, y: 0, hw, H}];
     list.forEach((g, k) => {
-      const yc = (g.y || 0) + Math.round((g.H || H) * (0.35 + 0.3 * b.r('vein', key, 'y', k)));
+      const yc = (g.y || 0) + Math.round((g.H || H) * (0.3 + 0.45 * b.r('vein', key, 'y', k)));
       const xw = g.x + side * (g.hw || hw);
       const xa = side < 0 ? xw - ob - 8 : xw - 6, xb = side < 0 ? xw + 6 : xw + ob + 8;
       b.skin('box', {min: [xa, yc - th, g.z0], max: [xb, yc + th, g.z1]},
-             {skin: 3, mat: opt.oreMat || 'ore', layer: 1, noise: {amp: Math.max(2, Math.round(th * 0.6)), scale: b.m(0.9), octaves: 2, seedKey: 'vein'}, tag: 'vein'});
+             {skin: 2, mat: opt.oreMat || 'ore', layer: 1, noise: {amp: Math.max(3, Math.round(th * 1.3)), scale: b.m(0.6), octaves: 2, seedKey: 'vein'}, tag: 'vein'});
     });
   }
   return {room, setsZ, t, hw, segs, at: segAt};

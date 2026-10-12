@@ -104,7 +104,7 @@ attach('maw', 'rift', 'out', {kit: 'caves', type: 'cavern', params: {
   stalactites: 0.7, stalagmites: 0.35, stalLength: 3, columns: 3, flowstone: 0.7, crystals: 0.6, mushrooms: 10, pool: 0.35, boulders: 8,
   fangs: 14, fangLength: 12, fangGirth: 1.8, fangUp: 0.35, fangJoin: 0.2,
   slope: -2.4, slopeSteps: 2, bays: 3, bayDepth: 5, lobe: 0.55,
-  keyLight: 'shaft', keySize: 0.9, keyHeight: 30, keyAt: 0.45, keySide: -0.1,
+  keyLight: 'fire', keySize: 0.75, keyAt: 0.42, keySide: -0.15,
   wallRough: 1, wallScale: 5, floorUneven: 0.8, moisture: 0.6, decay: 0.6, lightCount: 8, lightType: 'fungus', warmth: 0.85, lightPower: 0.6, lightDensity: 0.25, blend: 14, asym: 1}});
 attach('grotto', 'maw', 'left', {kit: 'caves', type: 'grotto_pool', params: {
   mouth: 3.2, width: 18, length: 20, height: 4, ceiling: 7, clusters: 3, exits: 0, poolSize: 0.75, poolDepth: 3, waterLevel: 0.9, beach: 0.3, island: true, glow: 1,

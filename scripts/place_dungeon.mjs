@@ -98,7 +98,7 @@ function heightmaps(jobs) {
   const q = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
   const script = jobs.map((j, i) => q(exe) + ' --heightmap ' + [j.cx, j.cz, j.span, j.res].join(',') + ' --heightmap-out ' + q(outs[i])).join(' && ');
   const env = Object.assign({}, process.env, {SANDVOX_ASSET_DIR: ASSETS, SANDVOX_MAP: MAP, SANDVOX_NO_CRASH_DIALOG: '1'});
-  const r = spawnSync('bash', [join(ROOT, 'scripts', 'run.sh'), 'bash', '-c', script], {env, encoding: 'utf8'});
+  const r = spawnSync('bash', [process.env.SANDVOX_RUN_SH || join(ROOT, 'scripts', 'run.sh'), 'bash', '-c', script], {env, encoding: 'utf8'});
   if (r.status !== 0 || outs.some(o => !existsSync(o))) { console.error('heightmap failed: ' + (r.stderr || r.stdout || r.error)); process.exit(1); }
   return outs.map(readMap);
 }
