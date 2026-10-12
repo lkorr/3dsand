@@ -10791,8 +10791,51 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   const int ms = std::max(2, gore.microScale);
   const float dropletVox = 1.0f / (float)(ms * ms * ms);
   bool wantedDrip = false;   // counted once per creature (the turn rule below)
+  // ---- SANDVOX_BLEED_TRACE=1 (CLAUDE.md rule 6) ------------------------------
+  // "The stump stopped bleeding" has a dozen causes that all look like no
+  // blood: cauterised, stanched, detached, out of budget, not this wound's
+  // turn in the shared pot, the pot spent, the tick's op cap, the drip
+  // painting nothing. Every open wound prints, every 15 ticks, its state as
+  // the iteration began and the LAST thing that decided it on this tick. The
+  // printer copies everything up front: DrainBlood may kill and reshape
+  // limbs_, and it must never read `limb` on the way out.
+  static const bool kBleedTrace = [] {
+    const char* e = std::getenv("SANDVOX_BLEED_TRACE");
+    return e != nullptr && e[0] != '0';
+  }();
+  struct BleedTrace {
+    bool on = false;
+    uint64_t id = 0;
+    std::string name = "?";
+    uint32_t tick = 0;
+    bool stump = false, wet = false;
+    float budget = 0;
+    int gush = 0;
+    uint32_t period = 0, fluid = 0;
+    float wx = 0, wy = 0, wz = 0;
+    const char* why = "not a drip tick";
+    ~BleedTrace() {
+      if (on)
+        std::printf("bleed trace t%u mob %llu %s: stump %d budget %.2f gush %d "
+                    "fluid %u wound (%.1f,%.1f,%.1f) wet %d period %u -> %s\n",
+                    tick, (unsigned long long)id, name.c_str(), stump ? 1 : 0, (double)budget,
+                    gush, fluid, (double)wx, (double)wy, (double)wz, wet ? 1 : 0,
+                    period, why);
+    }
+  };
   for (size_t li = 0; li < limbs_.size(); li++) {
     MobLimb& limb = limbs_[li];
+    BleedTrace tr;
+    if (kBleedTrace && tick % 15 == 0 &&
+        (limb.stumpOpen || limb.bleedBudget >= 1.0f || limb.gushTicks > 0)) {
+      tr.on = true;
+      tr.id = id_;
+      if (li < limbDefs_.size()) tr.name = limbDefs_[li].name;
+      tr.tick = tick;
+      tr.stump = limb.stumpOpen;
+      tr.budget = limb.bleedBudget;
+      tr.gush = limb.gushTicks;
+    }
     // A GARMENT DOES NOT BLEED. Damage() tops up a bleed budget on whatever
     // slot the blow met, and a blunt hit through plate meets the SHELL first
     // (game/impact.h): its budget is charged so the hp accounting stays one
@@ -10802,6 +10845,7 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // `bloodless` base limb) is refused for the same reason: see IsBloodless.
     if (IsBloodless((int)li)) {
       limb.bleedBudget = 0.0f;
+      tr.why = "bloodless";
       continue;
     }
     // A CLOSED WOUND FORGETS WHAT IT LEAKED, so the next one is decided by
@@ -10816,6 +10860,7 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
             : 0u;
     Quat lq{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2],
             limb.xf.quat[3]};
+    tr.fluid = fluid;
 
     // ---- the dismemberment gout ----
     // Front-loaded: emission is proportional to the REMAINING countdown, so
@@ -10893,7 +10938,10 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       // (not per `want`): a droplet the spawn budget refused never left the
       // body. DrainBlood may kill the creature and reshape limbs_, after which
       // `limb` is a dangling reference and nothing below may run.
-      if (gushed && !DrainBlood((float)gushed * dropletVox)) return;
+      if (gushed && !DrainBlood((float)gushed * dropletVox)) {
+        tr.why = "gout killed it";
+        return;
+      }
     }
 
     // ---- THE CAUTERISE RULE (docs/PLAN_magic_grammar.md §7) --------------
@@ -10907,6 +10955,7 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       limb.bleedBudget = 0.0f;
       limb.stumpOpen = false;
       limb.gushTicks = 0;
+      tr.why = "CAUTERISED (WoundCharredAt)";
       continue;
     }
 
@@ -10924,10 +10973,16 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
         (limb.bleedBudget >= 1.0f || limb.stumpOpen)) {
       const Vec3 wq = limb.body ? limb.xf.pos + Rotate(lq, limb.woundLocal)
                                 : bodyFrame(limb.anchorRoot);
-      if (WaterAt(world, wq))
+      const bool wet = WaterAt(world, wq);
+      if (wet)
         dripPeriod = std::max(
             1u, (uint32_t)std::lround((float)dripPeriod / gore.underwaterBleedRate));
+      tr.wet = wet;
+      tr.wx = wq.x;
+      tr.wy = wq.y;
+      tr.wz = wq.z;
     }
+    tr.period = dripPeriod;
 
     // ---- THE STUMP THAT NEVER CLOSES (gore.stumpBleedsOpen) ----
     // A lost limb is a clock. Top the wound back up to one clump so the drip
@@ -11000,7 +11055,10 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
           std::clamp(limb.bleedBudget / cap, 0.0f, 1.0f)});
     }
 
-    if (limb.bleedBudget < 1.0f) continue;
+    if (limb.bleedBudget < 1.0f) {
+      if (tr.on) tr.why = "budget < 1 (nothing owed)";
+      continue;
+    }
     // Drip period, tunable. Modulo rather than a mask because the tuner
     // offers every period, not just powers of two; the divisor is clamped
     // >= 1 at load so this cannot divide by zero. (Tested before the op
@@ -11027,10 +11085,14 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       if (sys_->bleedWantPrev_ > pot) {
         const uint32_t turns = (sys_->bleedWantPrev_ + pot - 1) / pot;
         const uint32_t phase = (uint32_t)(id_ * 2654435761ull >> 7);
-        if ((phase + tick / dripPeriod) % turns != 0) continue;
+        if ((phase + tick / dripPeriod) % turns != 0) {
+          tr.why = "not its turn in the shared pot";
+          continue;
+        }
       }
       if (bleedOps >= gore.bleedOpsPerTick) {
         sys_->bleedStarved_++;
+        tr.why = "pot spent (bleedOpsPerTick)";
         continue;
       }
     } else if (bleedOps >= gore.bleedOpsPerTick) {
@@ -11053,7 +11115,10 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // the budget is debited by the volume actually painted (1/7/33/123) and
     // not by 1. Charging the real cost is what keeps bleedBudgetCap a true
     // bound on matter entering the CA once clump size leaves 0 (rule 2).
-    if (ops.size() >= kMaxOpsPerTick) break;  // charge the CAP before emitting
+    if (ops.size() >= kMaxOpsPerTick) {  // charge the CAP before emitting
+      tr.why = "tick op cap full (kMaxOpsPerTick)";
+      break;
+    }
     ops.push_back({ifloor(w.x), ifloor(w.y), ifloor(w.z), clumpR,
                    fluid, 0 /*paint into air*/, 0, 0});
     const float clumpVox = (float)BleedClumpVoxels(clumpR);
@@ -11114,6 +11179,7 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     }
     // The drip and its spray, as hp. Last thing in the iteration for the
     // reason given at the gout: a kill here invalidates `limb`.
+    tr.why = "DRIPPED";
     if (!DrainBlood(clumpVox + (float)sprayed * dropletVox)) return;
   }
 
@@ -27038,6 +27104,10 @@ void Mob::DetachLimb(int limbIndex, bool adopt, bool keepJoint) {
   // is itself cut off has no wound left on this body (its parent's does, and
   // Sever() opens that one), and a detached limb that kept `stumpOpen` would
   // drip forever at its rest-pose anchor from a body it is no longer on.
+  if (limb.stumpOpen && std::getenv("SANDVOX_BLEED_TRACE"))
+    std::printf("bleed trace: mob %llu %s DETACHED with an open stump\n",
+                (unsigned long long)id_,
+                limbIndex < (int)limbDefs_.size() ? limbDefs_[limbIndex].name.c_str() : "?");
   limb.stumpOpen = false;
   // Hair leaving the rig leaves whole: debris never re-tucks, so a severed
   // ponytail would otherwise be drawn with the part the hood hid missing for
@@ -29024,6 +29094,9 @@ uint32_t MobSystem::CoatEffectsOn(Mob& mob, int limb, uint32_t mat,
     if (fx == "stanch") {
       if (l.bleedBudget > 0.0f || l.stumpOpen || l.gushTicks > 0)
         did |= kRemedyStanch;
+      if (l.stumpOpen && std::getenv("SANDVOX_BLEED_TRACE"))
+        std::printf("bleed trace: mob %llu limb %d STANCHED by material %u\n",
+                    (unsigned long long)mob.Id(), limb, mat);
       l.bleedBudget = 0.0f;
       l.stumpOpen = false;
       l.gushTicks = 0;
@@ -32617,15 +32690,23 @@ float Mob::BleedWeightOf(uint32_t mat) const {
 bool Mob::WaterAt(const World& world, Vec3 w) const {
   if (sys_ == nullptr || sys_->washerClass_.empty()) return false;
   const std::vector<uint32_t>& cls = sys_->washerClass_;
+  auto water = [&](IVec3 c) {
+    if (!world.CellInWindow(c)) return false;
+    const CellKind k = world.KindAt(c, cls);
+    if (k != CellKind::Unknown) return k == CellKind::Liquid;
+    const CachedChunk* cc = world.Cached({c.x >> 4, c.y >> 4, c.z >> 4});
+    if (cc == nullptr || cc->voxels.size() != kChunkVol) return false;
+    const uint32_t li = ((uint32_t)(c.z & 15) * kChunk + (uint32_t)(c.y & 15)) * kChunk +
+                        (uint32_t)(c.x & 15);
+    return World::KindOfWord(cc->voxels[li], cls) == CellKind::Liquid;
+  };
+  // The cell ABOVE counts too: the wound's own cell is, half the time, the
+  // blood voxel its last drip just painted (it mixes back into water a tick
+  // later), and a wound with water over it is under water whatever it is
+  // standing in. Asking only the one cell made a submerged stump flicker
+  // between the wet and dry rates (1.4x instead of 2x, gate stump-underwater).
   const IVec3 c{ifloor(w.x), ifloor(w.y), ifloor(w.z)};
-  if (!world.CellInWindow(c)) return false;
-  const CellKind k = world.KindAt(c, cls);
-  if (k != CellKind::Unknown) return k == CellKind::Liquid;
-  const CachedChunk* cc = world.Cached({c.x >> 4, c.y >> 4, c.z >> 4});
-  if (cc == nullptr || cc->voxels.size() != kChunkVol) return false;
-  const uint32_t li = ((uint32_t)(c.z & 15) * kChunk + (uint32_t)(c.y & 15)) * kChunk +
-                      (uint32_t)(c.x & 15);
-  return World::KindOfWord(cc->voxels[li], cls) == CellKind::Liquid;
+  return water(c) || water(IVec3{c.x, c.y + 1, c.z});
 }
 
 // ---- WHAT A WOUND LEAKS (mob.h, materials.h bleedFluid) ---------------------

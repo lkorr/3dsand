@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "game/mob.h"
+#include "gpu/rhi.h"
 #include "sim/tuning.h"
 #include "sim/worldgen_run.h"
 #include "test/selftest.h"
@@ -717,6 +718,186 @@ Status GateNpcSwim(Ctx& c, std::string& detail) {
   return aOk && bOk && cOk ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// A STUMP UNDER WATER NEVER STOPS (2026-10-11, the owner's shark bite): gate
+// `stump-underwater`.
+//
+// "It bled at the right rate for three seconds and then stopped completely."
+// A man in a pool with a leg severed, and the same man on the dry bank beside
+// it: the blood the creature emits (its drip ops, the mob phase's own span of
+// the batch) is counted per 60-tick window. Claims:
+//   * NEVER STOPS: under water, every window after the first has drips while
+//     the man is alive (gore.stumpBleedsOpen).
+//   * 2x: the wet total over the run is gore.underwaterBleedRate times the
+//     dry total, within stumpWetRatioTol.
+// Each window's count is in the detail (rule 6); SANDVOX_BLEED_TRACE=1 names
+// the decision behind each wound every 15 ticks.
+// ---------------------------------------------------------------------------
+Status GateStumpUnderwater(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  MobSystem& mobs = c.mobs;
+  const uint32_t mStone = MatIdOf(c, "stone"), mWater = MatIdOf(c, "water");
+  const int dHuman = mobs.FindDef("human");
+  if (!mStone || !mWater || dHuman < 0) {
+    detail = "missing stone / water / human";
+    return Status::Fail;
+  }
+  const uint32_t bleedMat = mobs.Defs()[dHuman].bleedMat;
+  int legIdx = -1;
+  for (size_t li = 0; li < mobs.Defs()[dHuman].limbs.size(); li++)
+    if (mobs.Defs()[dHuman].limbs[li].name == "legU.L") legIdx = (int)li;
+  if (legIdx < 0 || bleedMat == 0) {
+    detail = "human has no legU.L or does not bleed";
+    return Status::Fail;
+  }
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  mobs.Reset();
+  c.debris.Reset();
+
+  constexpr int R = 12, kDepth = 28, kPadLen = 14, kPadHalf = 6;
+  IVec3 site{};
+  int hMin = 0, hMax = 0;
+  std::string siteWhy;
+  if (!PickDrySite(c, R + kPadLen, kDepth, site, hMin, hMax, siteWhy)) {
+    detail = "no dry, flat site: " + siteWhy;
+    return Status::Fail;
+  }
+  const int bedY = hMin - kDepth - 1;
+  const int waterTop = bedY + kDepth;
+  const int surfY = waterTop + 1;
+  const int wallTop = hMax + 2;
+  // The pool, and a dry stone pad off its +x wall topped at the waterline.
+  std::vector<CellOp> pool;
+  for (int x = site.x - R; x <= site.x + R + kPadLen; x++)
+    for (int z = site.z - R; z <= site.z + R; z++) {
+      const bool inPool = x <= site.x + R;
+      if (!inPool && std::abs(z - site.z) > kPadHalf) continue;
+      for (int y = bedY - 1; y <= wallTop + 30; y++) {
+        const IVec3 cc{x, y, z};
+        if (!c.world.CellInWindow(cc)) continue;
+        const bool wall = inPool && (std::abs(x - site.x) >= R - 1 ||
+                                     std::abs(z - site.z) >= R - 1);
+        uint32_t w = PackVoxNew(0u, 0u);
+        if (!inPool) {
+          if (y <= surfY) w = PackVoxNew(mStone, 0u);
+        } else if (y <= bedY || (wall && y <= wallTop)) {
+          w = PackVoxNew(mStone, 0u);
+        } else if (y <= waterTop && !wall) {
+          w = (mWater & 0xFFFu) | (7u << 12);
+        }
+        pool.push_back({World::SlotCellIndex(cc), w});
+      }
+    }
+  support::TickRig rig(c, 76000u, IVec3{site.x >> 4, waterTop >> 4, site.z >> 4});
+  for (size_t off = 0; off < pool.size(); off += 60000) {
+    const size_t n = std::min<size_t>(60000, pool.size() - off);
+    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) {
+      o.cells.assign(pool.begin() + (ptrdiff_t)off, pool.begin() + (ptrdiff_t)(off + n));
+    });
+  }
+  support::RunTicks(rig, 30);
+  mobs.SetPlayerActor(Vec3{(float)site.x - 400.0f, (float)hMax + 400.0f, (float)site.z},
+                      3.0f, 17.0f, false);
+
+  const Vec3 hs = mobs.Defs()[dHuman].worldSize;
+  const int kTicks = (int)BaselineNumber("stumpWetTicks", 600);
+  constexpr int kWin = 60;
+  // The solute ledger's monotonic "units dissolved" word: blood that REACHED
+  // the water (a drip that painted onto a standing blood voxel took nothing).
+  auto dissolved = [&]() {
+    c.ctx.WaitIdle();
+    uint32_t v = 0;
+    rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.solMeta,
+                          (uint64_t)kSolMDissolved * 4, &v, 4, "stumpDissolved");
+    return v;
+  };
+  struct Arm {
+    std::vector<uint32_t> win, mixed;
+    uint32_t total = 0;
+    int deathTick = -1;
+    bool spawned = false;
+  };
+  auto run = [&](Vec3 feet) {
+    Arm a;
+    mobs.Reset();
+    c.debris.Reset();
+    support::RunTicks(rig, 2);
+    const uint64_t id = mobs.Spawn(dHuman, {ifloor(feet.x - hs.x * 0.5f), ifloor(feet.y),
+                                            ifloor(feet.z - hs.z * 0.5f)});
+    if (!id) return a;
+    a.spawned = true;
+    mobs.SetMobBehavior(id, "dummy");
+    support::RunTicks(rig, 30);   // settle (a floater rises to its float height)
+    mobs.Sever(id, legIdx);
+    a.win.assign((size_t)(kTicks / kWin), 0u);
+    a.mixed.assign((size_t)(kTicks / kWin), 0u);
+    uint32_t d0 = dissolved();
+    for (int i = 0; i < kTicks; i++) {
+      support::RunTicks(rig, 1);
+      const OpBatch& tb = rig.LastBatch();
+      const auto& mp = rig.MobPhase();
+      for (size_t k = mp.ops0; k < mp.ops1 && k < tb.ops.size(); k++)
+        if (tb.ops[k].material == bleedMat) {
+          a.total++;
+          if ((size_t)(i / kWin) < a.win.size()) a.win[(size_t)(i / kWin)]++;
+        }
+      if ((i + 1) % kWin == 0 && (size_t)(i / kWin) < a.mixed.size()) {
+        const uint32_t d1 = dissolved();
+        a.mixed[(size_t)(i / kWin)] = d1 - d0;
+        d0 = d1;
+      }
+      if (!mobs.IsAlive(id)) {
+        a.deathTick = i;
+        break;
+      }
+    }
+    return a;
+  };
+  const Arm wet = run(Vec3{(float)site.x + 0.5f, (float)(bedY + 1), (float)site.z + 0.5f});
+  const Arm dry = run(Vec3{(float)(site.x + R + kPadLen / 2) + 0.5f, (float)(surfY + 1),
+                           (float)site.z + 0.5f});
+
+  mobs.Reset();
+  c.debris.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  auto list = [&](const std::vector<uint32_t>& v) {
+    std::string s;
+    for (uint32_t n : v) s += Format("%u ", n);
+    return s;
+  };
+  // NEVER STOPS: every window after the first (the sever's) has blood while
+  // the man lives -- a window cut short by death is not counted.
+  bool never = wet.spawned && !wet.win.empty();
+  for (size_t w = 1; w < wet.win.size(); w++) {
+    if (wet.deathTick >= 0 && (int)((w + 1) * kWin) > wet.deathTick) break;
+    if (wet.win[w] == 0) never = false;
+  }
+  // ...AND IT REACHES THE WATER: blood dissolves in every such window. The
+  // emitted count alone passed while the owner watched it stop: the drips
+  // were painting onto a blood voxel stuck at the wound, which takes nothing.
+  bool reaches = wet.spawned && !wet.mixed.empty();
+  for (size_t w = 1; w < wet.mixed.size(); w++) {
+    if (wet.deathTick >= 0 && (int)((w + 1) * kWin) > wet.deathTick) break;
+    if (wet.mixed[w] == 0) reaches = false;
+  }
+  const float want = CurrentTuning().gore.underwaterBleedRate;
+  const float tol = (float)BaselineNumber("stumpWetRatioTol", 0.35);
+  const float ratio = dry.total > 0 ? (float)wet.total / (float)dry.total : 0.0f;
+  const bool faster = dry.spawned && dry.total > 0 && std::fabs(ratio - want) <= tol;
+  detail = Format(
+      "wet stump %s: %u drips, per %d ticks [%s], blood units dissolved [%s] %s, "
+      "died %d | dry stump: %u drips [%s], died %d | ratio %.2f (want %.2f +- "
+      "%.2f) %s",
+      never ? "NEVER STOPS" : "STOPPED", wet.total, kWin, list(wet.win).c_str(),
+      list(wet.mixed).c_str(), reaches ? "REACHES THE WATER" : "NOT REACHING THE WATER",
+      wet.deathTick, dry.total, list(dry.win).c_str(), dry.deathTick, (double)ratio,
+      (double)want, (double)tol, faster ? "ok" : "FAIL");
+  return never && reaches && faster ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& AquaticGates() {
@@ -725,6 +906,8 @@ const std::vector<Gate>& AquaticGates() {
       {"aquatic", "mob", {}, false, GateAquatic, false},
       // A walker swims: floats and treads, swims out over a low bank, dives.
       {"npc-swim", "mob", {}, false, GateNpcSwim, false},
+      // An amputation under water bleeds on, at underwaterBleedRate x dry.
+      {"stump-underwater", "mob", {}, false, GateStumpUnderwater, false},
   };
   return g;
 }
