@@ -6434,7 +6434,19 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
             } else {
               vc.z += stepv.z; vCur = vMax.z; vMax.z += tDelta.z; axis = 2;
             }
-            if (vCur >= tOut || vCur >= tExit) { break; }
+            // ---- THE CELL CURSOR STAYS IN THE VALID BOX (ticket 2026-10-11_20-18-12) ----
+            // vMax is ACCUMULATED (+= tDelta) from the chunk's seed while tExit
+            // is the box plane solved directly, so at the box face the two can
+            // disagree by an ulp-scale sliver: the cursor steps onto the cell
+            // just OUTSIDE the box with vCur a hair under tExit and tests it.
+            // farByteAt is toroidal, so that cell is the OPPOSITE face's data
+            // -- at the outermost level, the land behind the camera -- and a
+            // row of it was drawn as dark specks along the level-8 box's edge
+            // over open sea (a straight line across the ocean seen from a
+            // mountain). The integer test is exact; tExit alone is not. Every
+            // nested far cursor carries it: traceFar, farShadowMarch,
+            // shadow_resolve's farShadowT, ray_start's far walk.
+            if (vCur >= tOut || vCur >= tExit || !farInValid(vc, box)) { break; }
           }
         }
       }
@@ -6807,7 +6819,10 @@ fn farShadowMarch(level0 : u32, roFine : vec3f, rdIn : vec3f,
             } else {
               vc.z += stepv.z; vCur = vMax.z; vMax.z += tDelta.z; eAx = 2;
             }
-            if (vCur >= tOut || vCur >= tExit) { break; }
+            // Never test a cell outside the valid box: traceFar's cell cursor
+            // has why (an accumulated vMax can step past tExit's plane, and
+            // the toroidal read is the opposite face's data).
+            if (vCur >= tOut || vCur >= tExit || !farInValid(vc, box)) { break; }
             if (stepv.y > 0 && vc.y >= yTopRow) { break; }
           }
         }
