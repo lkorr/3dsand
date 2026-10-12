@@ -483,7 +483,7 @@
     {"op":"fill","shape":"box","min":[-332,-172,897],"max":[-331,-141,898],"mat":"timber","piece":"p10"},
     {"op":"fill","shape":"box","min":[-332,-172,909],"max":[-331,-141,910],"mat":"timber","piece":"p10"},
     {"op":"fill","shape":"box","min":[-332,-140,897],"max":[-303,-140,910],"mat":"plank","piece":"p10"},
-    {"op":"carve","shape":"rbox","min":[-29,-212,1100],"max":[44,-180,1199],"r":4,"mat":"water","level":-4,"noise":{"amp":2,"scale":4,"octaves":2,"seed":1023179622},"blend":2,"piece":"p11"},
+    {"op":"carve","shape":"rbox","min":[-29,-212,1100],"max":[44,-180,1199],"r":4,"mat":"water","level":-184,"noise":{"amp":2,"scale":4,"octaves":2,"seed":1023179622},"blend":2,"piece":"p11"},
     {"op":"carve","shape":"box","min":[-44,-165,1282],"max":[-23,-154,1303],"noise":{"amp":3,"scale":4,"octaves":2,"seed":1023179622},"blend":3,"piece":"p12"},
     {"op":"carve","shape":"box","min":[-31,-165,1326],"max":[-10,-154,1347],"noise":{"amp":3,"scale":4,"octaves":2,"seed":1023179622},"blend":3,"piece":"p12"},
     {"op":"carve","shape":"box","min":[21,-165,1276],"max":[42,-154,1297],"noise":{"amp":3,"scale":4,"octaves":2,"seed":1023179622},"blend":3,"piece":"p12"},
