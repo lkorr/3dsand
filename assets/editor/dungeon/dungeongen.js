@@ -896,7 +896,7 @@ export function validate(dIn, opts) {
           let top = null;
           for (let y = b.max[1]; y >= b.min[1]; y--) if (primContains(p, [x + 0.5, y + 0.5, z + 0.5])) { top = y; break; }
           if (top === null) continue;
-          const ty = top - A[1] + amp;
+          const ty = Math.round(top - A[1] + amp);
           if (ty >= lim) hit = {kind: 'surface', at: [ax, ty, az]};
           else if (w !== null && w > g && ty >= g - cover && !pc.flooded) hit = {kind: 'water', at: [ax, ty, az]};
         }

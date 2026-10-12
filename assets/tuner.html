@@ -1882,6 +1882,7 @@
   <button data-tab="models">Models</button>
   <button data-tab="characters">Characters</button>
   <button data-tab="environment">Environment</button>
+  <button data-tab="dungeons">Dungeons</button>
   <button data-tab="audio">Audio</button>
   <button data-tab="dialogue">Dialogue</button>
   <span class="tabsep"></span>
@@ -2279,6 +2280,9 @@
   <!-- DIALOGUE - branching conversations, assets/dialogue/*.json. Built by
        assets/editor/dialogue.js (PLAN_world_editor P3). -->
   <section class="view" id="view-dialogue"></section>
+  <!-- DUNGEONS - the kit designer + the stitcher (docs/PLAN_dungeons.md 5).
+       Built by assets/editor/dungeon/ui_main.js (package D4). -->
+  <section class="view" id="view-dungeons"></section>
 
   <!-- NOTES — markdown pages autosaved to notes/ -->
   <section class="view" id="view-notes">
@@ -2718,7 +2722,7 @@ document.querySelectorAll('nav.tabs button').forEach(b=>{
     document.querySelectorAll('nav.tabs button').forEach(x=>x.classList.toggle('active',x===b));
     document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id==='view-'+activeTab));
     // wiki and notes render with whatever is loaded, including nothing.
-    if((mat&&rx)||['tuning','models','characters','environment','wiki','notes','engine','alchemy','dialogue'].includes(activeTab))renderAll();
+    if((mat&&rx)||['tuning','models','characters','environment','wiki','notes','engine','alchemy','dialogue','dungeons'].includes(activeTab))renderAll();
   });
 });
 // DEEP LINK: ?tab=environment opens a tab; &voxels=1 additionally opens the
@@ -5593,6 +5597,9 @@ function renderAll(){
   // Dialogue owns its own DOM and reads assets/dialogue/ through the server;
   // it needs no JSON loaded at all.
   if(activeTab==='dialogue'){if(window.__tunerDialogue)window.__tunerDialogue.activate();return;}
+  // Dungeons (docs/PLAN_dungeons.md 5) owns its DOM, its 3D views and its
+  // files (assets/dungeons/ through the server); it needs no JSON loaded.
+  if(activeTab==='dungeons'){if(window.__tunerDungeonsTab)window.__tunerDungeonsTab.activate();return;}
   // Characters (the generator + breeding page) owns its own DOM and needs only
   // materials.json (for the .vox palette) and tuning.json (for the two player
   // speeds the gait derivation reads), so it returns before the mat/rx guard
@@ -8745,7 +8752,7 @@ const ARCH_NODES={
     sym:['Simulation::EncodeWorldgen','Simulation::EncodeGenList','Simulation::EncodePageFill','caveFill','landColumn','colHeightAt','World::TerrainHeight','vnoise2d','caveBands','treeCandsInto','VEGETATION'],
     doc:['DESIGN.md','docs/RESEARCH_worldgen.md'],
     rule:1,
-    children:['worldMap','altitude','voxView','trees','biomes','structures'],
+    children:['worldMap','altitude','voxView','trees','biomes','structures','dungeonSys'],
     wip:'The terrain is authored on the MAP (P-G 2026-09-07; map v2 2026-10-08, see World Map v2): the authored height plane is the ground, map.json `terrain` is the seeded noise on it (range rung through each biome&rsquo;s curve, hill/detail/grain with per-biome multipliers, attenuation fed by the plane&rsquo;s continuous gradient), then the sculpt layer (sculpt.svsculpt, 0.8 m samples; gate `sculpt`), roads and site pads. Sites are per-cell LISTS on the 102.4 m site cell (up to 128 since roads, more refuses the load), every reader testing the site&rsquo;s own footprint; load warnings on the map page&rsquo;s Load check panel (`--mapcheck`). The sea is the map&rsquo;s <code>seaLevelY</code>. Remaining: 3D caves behind a province mask (today two masked 2D bands, <code>caveBands</code>, band 2 now relative to the column&rsquo;s ground); flooded caves below sea level and the LAVA_LID plug they need (<code>caveFill</code> knows only the magma table).',
     details:'Purity is what lets a chunk be evicted without saving and regenerated identically later — and what lets the JITTER sentinel stand in for a whole chunk of never-touched terrain. A chunk the player has DUG is not representable by any sentinel and must go to a real page.<br><br><b>THE HEIGHT CONTRACT:</b> <code>World::TerrainHeight(x,z,seed)</code> &equiv; <code>genColumn(x,z,seed).h</code>, exactly. The GROUND — octaves, authored pool floors and rims, the pond bowl carve, the tarn berm — not the topmost solid voxel, which would include canopy and ruin walls and cannot be mirrored cheaply. <code>surfHeightAt</code> was a fourth height function that hand-copied this and had already drifted; it is gone. <code>check_invariants.py</code> token-compares the <code>MIRROR-BEGIN</code> blocks in the shader and in world.cpp, and the <code>terrain</code> gate&rsquo;s pass C1 compares CPU and GPU per voxel.<br><br><b>Q14 noise:</b> <code>vnoise2d</code> takes its cell as a LOG2 SHIFT, so <code>fdiv</code> becomes <code>&gt;&gt;</code> and <code>fmodp</code> becomes <code>&amp;</code> — zero integer divides where the legacy <code>vnoise</code> did five, and 14 bits of value instead of 8 (at a 1024-voxel amplitude an 8-bit LSB is a FOUR-VOXEL terrace). The legacy noise stays for the 14 decorative fields that call it. <code>&gt;&gt;</code> on a negative signed int is arithmetic in WGSL and in C++20 alike — that is the one place the two languages could have diverged.<br><br><b>Column hoists:</b> cave bands and tree candidates are pure in (x,z) and are computed once per column in <code>genChunk</code>, not once per cell. A buried column was recomputing <code>caveAt</code> 16 times (~93% of a buried chunk&rsquo;s worldgen cost), and <code>treeAt</code>&rsquo;s world-wide <code>TREE_MAX_TOP</code> reject became <code>cands.top</code>, a correct LOCAL ceiling that survives a wider terrain band. The <code>far</code> cascade sieve is column-major too: one thread owns one z row and four x, so 256 columns replace 4096.<br><br><b>Lava at rest (12c187c):</b> <code>caveFill(y)</code> routes every carve: lava at/below <code>LAVA_LEVEL=-80</code>, air above. The lateral boundary is stone at every level, so the only lava/air interface is one flat plane. This cut active-chunk count under flight from 521 → 23 (p50) and pool high-water by 11%.<br><br><b>Perched tarns:</b> a pond&rsquo;s waterline comes from its own CENTRE column and the annulus outside the disc is FORCED to <code>surf + pondBerm</code>, so containment is STRUCTURAL rather than a rim-sampling density — and 192 hashes per pond OR shore column become 8. Two rule-2 traps came with it, both reported by <code>ca-skip</code> rather than by anything near worldgen: the parabolic bowl is steepest at its rim, so <code>pondDepth</code> is now clamped against <code>pondRadiusMin</code> or the sand bed sits over the angle of repose and avalanches forever; and snow is a POWDER, so the authored pool rims now suppress it (<code>!inRim</code>) or it slides onto the lava and <code>snow + tag:hot &rarr; water</code> lights a front that never goes out.<br><br><b>THE OCTAVE LADDER (package C):</b> five rungs, lacunarity 4, persistence 1/4, so every rung has the SAME amplitude/wavelength ratio of 0.5 — detail without extra slope. Octaves are CENTRED deviations, which is what makes <code>baseHeight</code> the world&rsquo;s MEAN and leaves as much room below the datum for basins as above it for mountains. iq&rsquo;s derivative attenuation divides each rung by <code>1 + fbmAtten*|g|&sup2;</code> against the gradient accumulated above it: that is a rule-2 mechanism, not a look knob, because plain fBm sums five 0.5 slopes into 2.5 and puts the entire world above the CA&rsquo;s angle of repose.<br><br><b>The calm home area</b> fades only the two COARSE octaves toward the origin — fading the whole deviation would pin spawn to an exact plane 64 m across. The fade WIDTH is load-bearing: a ramp of magnitude A over width W adds slope up to 1.5&middot;A/W, and the <code>terrain</code> gate&rsquo;s pass A4 measures it so nobody has to guess.<br><br><b>A LOOSE COVER IS BORN AT REST TOO (2026-09-09).</b> The sediment wedge&rsquo;s slope gate was the only one: the desert / ocean <b>sand cap</b> was four voxels of POWDER laid on ground of any steepness, and those two biomes also author their SKIN as sand, which the skin branch assumed was solid. Measured on raw worldgen output (<code>--voxdump</code>, no CA): <b>1,249 of 10,539 sand cells</b> in a 128&times;96&times;128 box at the authored lake had a legal CA down-move on tick 0 and <b>418 went straight into the water</b> &mdash; which is why freshly streamed lake terrain stayed awake for seconds. The water itself was born perfectly at rest; it only churned because the bank fell into it. <code>looseCoverDepth</code> now keeps the LOOSE part of a cover at full depth on ground the sediment wedge calls flat (worldgen.sedSlope), tapers it to zero at the CA&rsquo;s own angle of repose (256 Q8), and hands the rest to the biome&rsquo;s <code>cover.firmSkin</code> (<code>WM_B_FIRM_COVER</code>; desert and ocean say <b>sandstone</b>, a new material that far-aliases sand). On flat ground the loose depth is the full authored 4 and nothing changes. The skin half is gated on the AUTHORED CLASS, so a solid skin (grass, snow, mud) is bit-identical. <b>Two authored discontinuities force it to zero outright</b>, because neither is in the noise field and the analytic gradient reads both as level plateau: a water body&rsquo;s bermed / excavated bank (<code>Col.nearWater</code>) and the annulus of an authored pool (<code>inRim</code>). <code>nearWater</code> is deliberately NOT <code>shore.onShore</code> &mdash; that flag carries the shore feature&rsquo;s bluff cut, which turns itself off on exactly the tallest cut wall in the world.<br><br><b>The sediment wedge</b> puts metres of dirt over gravel on low flat ground and none on ridges. Both powders, so its slope gate reads the LANDFORM gradient (through the hill octave) rather than the full one: d(slope)/dcolumn for the grain octave is 96 Q8 — the whole gate range in ONE step — which turns a 24-voxel wedge into a 24-voxel cliff. Gated on the landform instead, 108 chunks still awake at tick 120 became 8.<br><br><b>Trees are metre-true again:</b> <code>VOX_PER_M</code> was a hardcoded 16, correct when a voxel was 6.25 cm and left behind when the world moved to 10 cm. Every tree was 1.6&times; its own table&rsquo;s documented size for that whole interval. <b>worldgen.vegetation</b> (2026-09-05): the kill-switch for every plant the file places. A TP_U row, so a WGSL constant (<code>VEGETATION</code>); gated at the SOURCE of each feature so the candidate scans and the far crown proxy agree the world is bare. The Worldgen tab&rsquo;s <b>Vegetation: ON/OFF</b> button flips it; F7 reloads + regenerates.'},
 
@@ -9578,6 +9585,43 @@ const ARCH_NODES={
     files:['src/ui/overlay.h','src/ui/overlay.cpp'],
     sym:['UIState','Overlay::Draw'],
     details:'<code>UIState</code> is the whole contract — <code>main.cpp</code> owns the values, the overlay only reads and edits them. The crosshair material comes from the <code>sim_pick</code> readback and is one tick latent; <code>hoverMat == 0</code> means the ray left the window.<br><br><b>p95/p99 (9c23db8):</b> a 512-frame ring sorted on the 0.5 s boundary that already drives avg/worst. Over ~15–50 frames p99 IS the max, so 512 frames (~5–11 s) puts p99 at the ~6th worst frame — a useful intermediate between avg and worst.<br><br><b>The body paper doll (2026-10-10):</b> the stick figure above the hp bar became a panel as wide as the bar. Left: the body as a 36x76 pixel grid seen from behind (<code>UIState::kDollRect</code>), each limb filled from its OWN voxels projected front-on (<code>FillBodyUI</code> bins them in the same walk as the tissue tally, via <code>PlayerAvatar::ForEachPartVoxel</code>), so holes, char, rot, bruises and coat show where they are on the limb; burning cells flicker with rising embers and an ember rim, bleeding limbs pulse and drip, a severed limb is its silhouette in dried blood, a limb that just lost hp flashes. The per-limb frame is a high-water mark of the first sighting, so a hole stays a hole. Right: one word for the worst condition (ON FIRE / BLEEDING / the infection / MAIMED / CRITICAL), a pixel icon per condition with a pip per limb, the coat strip (replaced the old stained-% text line), and a heart-monitor sweep whose rate and colour follow the hp pool. <code>SANDVOX_SHOT_HUD_HURT=1 --shot-inventory</code> photographs it hurt in <code>screenshot_hud.bmp</code>.'},
+
+  // ------------------------------------------------------------- dungeons
+  dungeonSys:{label:'Dungeons',tag:'gen',
+    desc:'Dungeons (docs/PLAN_dungeons.md, 2026-10-12): connected reusable PIECES driven by sliders (caves, mines, ruins), stitched at sockets, carved into the real world as WORLDGEN INPUT. Four layers: L1 shell (a primitive program the GPU rasterises in genChunk), L2 props (templates), L3 hand detail (SVED v3), L4 entities (a ref group). Authored in the tuner&rsquo;s Dungeons tab, placed by map.json dungeons[].',
+    files:['docs/PLAN_dungeons.md','assets/dungeons/'],
+    doc:['docs/PLAN_dungeons.md','DESIGN.md','docs/EDITOR_GUIDE.md'],
+    rule:1,
+    children:['dungeonShell','dungeonKits','dungeonEntities','dungeonEditor'],
+    wip:'Waves 1+2 (D1 engine, D2 kits, D3 entities, D4 editor) on the dungeons integration branch; wave 3 = three example dungeons built with the tab (teeth_caves, shardwell, heather_cairn) on Tirnhallow POIs.',
+    details:'<b>The seam rule:</b> pieces are unioned in ONE smooth-min carve field with world-space noise, and a near-miss socket join gets an auto taper, so corridors flow into chambers without a plane. <b>Rest:</b> rubble is born at repose, pools full, nothing awake. <b>Arbitrary size:</b> a sparse 64&sup3; chunk index; a chunk with no dungeon pays one hash probe.'},
+
+  dungeonShell:{label:'Dungeon shell (D1 engine)',tag:'gpu',
+    desc:'map.json dungeons[] + assets/dungeons/&lt;id&gt;/shell.bin (shell.json twin): carve / fill / skin / keep prims (box, rbox, ellipsoid, cylinder, capsule, tube, ramp, vault), noise, blend, scatter, prop templates with a carve code, evaluated per cell in worldgen (worldgen_dungeon.wgsli) with a CPU twin; natural caves and lava kept out; voxserve DUNGEON ISOLATE / PLACE / MAP / CLEAR for the tuner.',
+    files:['src/sim/dungeon.h','src/sim/dungeon.cpp','assets/shaders/worldgen_dungeon.wgsli','src/test/selftest_dungeon.cpp','scripts/gen_dungeon_fixture.py'],
+    sym:['ParseShellJson','ReadShellBin','PackDungeons','EvalCell','dgCell','dgCellCoarse'],
+    tst:['dungeon-format','dungeon-gen'],
+    doc:['docs/PLAN_dungeons.md','DESIGN.md']},
+
+  dungeonKits:{label:'Dungeon kits + compiler (D2)',tag:'cpu',
+    desc:'Pure JS (Node and browser): dungeongen.js (transforms, sockets, taper, compile to the 3.4.1 shell, validate, grow), kit_caves / kit_mines / kit_ruins (every piece type of PLAN 4, SCHEMA sliders + presets, universal sliders), props/ generators. compile_dungeon.mjs writes shell.json + shell.bin; test_dungeongen.mjs pins it.',
+    files:['assets/editor/dungeon/dungeongen.js','assets/editor/dungeon/dgutil.js','assets/editor/dungeon/kit_caves.js','assets/editor/dungeon/kit_mines.js','assets/editor/dungeon/kit_ruins.js','assets/dungeons/props/index.js','scripts/compile_dungeon.mjs','scripts/test_dungeongen.mjs'],
+    sym:['compile','emitShellJson','emitShellBin','validate','grow','attachPiece','snapTransform','socketCompat'],
+    doc:['docs/PLAN_dungeons.md']},
+
+  dungeonEntities:{label:'Dungeon entities (D3)',tag:'cpu',
+    desc:'The L4 refs of a dungeon (assets/dungeons/&lt;id&gt;/refs.json, the anchor frame, group dungeon/&lt;placement&gt;): spawner, lever, plate, gate, trap (collapse_floor, spikes, dart, flood, fire_vent), key, region; door lock / on; container loot (assets/loot/); schedule rows guard / patrol / lair / ambush.',
+    files:['src/world/refs_dungeon.h','src/world/refs_dungeon.cpp','src/world/dungeon_refs.h','src/world/dungeon_refs.cpp','src/world/loot.h','src/world/loot.cpp','src/test/selftest_dungeon_entities.cpp'],
+    sym:['refs::RegisterDungeonKinds','refs::PlanSpawn','refs::SignalLevel','refs::ReadDungeonPlacements'],
+    tst:['dungeon-entities'],
+    doc:['DESIGN.md','docs/EDITOR_GUIDE.md']},
+
+  dungeonEditor:{label:'Dungeons tab (D4 editor)',tag:'cpu',
+    desc:'The tuner&rsquo;s Dungeons tab: a KIT page (one piece type alone in rock via DUNGEON ISOLATE, sliders, presets, seed, sockets as coloured frames, prop previews, save as preset) and the STITCHER (drag a type onto an open socket and it snaps; gizmo move / quarter turns with broken links in red and re-snap; live sliders that soft-refresh only the regions the change touched, coarse while dragging; Grow proposals ghosted until kept; entities with signal wires, key threads, patrol routes; x-ray / solid / in-world views, y-range slicing, isolate; a live validation panel; a level-banded graph; undo for everything; save; playtest). The World map page gains a Dungeon tool (dungeons[] placement).',
+    files:['assets/editor/dungeon/ui_main.js','assets/editor/dungeon/ui_core.js','assets/editor/dungeon/ui_kit.js','assets/editor/dungeon/ui_stitch.js','assets/editor/dungeon/ui_entities.js','assets/editor/dungeon/ui_maplayer.js','assets/worldview.js','scripts/tuner_server.py','assets/dungeons_test.html','scripts/check_dungeons.sh'],
+    sym:['createKitPage','createStitchPage','createDungeonLayer','View3D','Previewer','diffBoxes','WorldView.refreshBox'],
+    doc:['docs/EDITOR_GUIDE.md','docs/PLAN_dungeons.md'],
+    details:'<b>One generator.</b> The tab compiles with the same dungeongen.js the compiler script runs; Save writes dungeon.json + shell.json + shell.bin + refs.json through POST /api/dungeon and the server asks <code>compile_dungeon.mjs &lt;id&gt; --check</code> whether they are current.<br><br><b>Responsive previews.</b> The voxel server holds one scratch program; the tab diffs the new program against the installed one by prim / instance content and calls <code>WorldView.refreshBox</code> on just those boxes: the old voxels keep drawing until the new ones land (worldview.js gained a clip box for x-ray, an ROI that limits the octree to the dungeon, overlay-on-top lines and the soft refresh).<br><br><b>Server routes:</b> GET /api/dungeons, GET/POST /api/dungeon?id=, GET /api/dungeon/catalog, POST /api/dungeon/preset, POST /api/play {mode: dungeon}. <code>SANDVOX_EXE</code> lets a worktree borrow another checkout&rsquo;s exe (its assets via SANDVOX_ASSET_DIR).<br><br><b>Check:</b> <code>bash scripts/check_dungeons.sh</code> (headless Chrome: tab, kit preview pixels, snap, grow, undo / redo, wires, save + compile --check).'},
 
   // ---------------------------------------------------------------- tools
   toolsSys:{label:'Tools & Telemetry',tag:'cpu',
@@ -11233,6 +11277,7 @@ function renderEngine(){
   const recentSec=el('div',{class:'status-section'});
   recentSec.appendChild(el('h4',{},'Recently Landed'));
   const recentItems=[
+    {label:'Dungeons tab: design pieces, stitch dungeons, place them in the world (D4)',desc:'2026-10-12, docs/PLAN_dungeons.md &sect;5. A new top-level tuner tab over the D1 engine and the D2 kits. KIT page: one piece type alone in a cut-away rock block (voxserve DUNGEON ISOLATE), its sliders by section, presets (and your own, assets/dungeons/presets/), seed reroll, sockets drawn as coloured labelled frames, prop previews. DUNGEON page: drag a piece onto an open socket and it snaps and links; gizmo / arrow keys move, R turns, broken links go red, re-snap; a selected piece&rsquo;s sliders recompile live and refresh only the touched regions (coarse while dragging); Grow from a socket shows a ghosted proposal to keep / reroll / discard; entities (mobs, spawners, doors, gates, levers, plates, traps, keys, chests, regions, waynodes) with signal wires, key threads and patrol routes drawn; x-ray, solid and in-world views, level slicing, isolate; live validation (click to fly); a level-banded graph; undo for everything; Save (dungeon.json + shell + refs.json); Playtest at the entrance. World map page: a Dungeon tool (dungeons[] footprints per level, drag the anchor, R turns). Check: <code>bash scripts/check_dungeons.sh</code>.'},
     {label:'NPCs swim; the swimming head stops folding back',desc:'2026-10-11, owner ask. A walker with the swim clips (every human-rig NPC) no longer walks a lake&rsquo;s bed: past chin-deep it floats at the waterline and strokes with the player&rsquo;s swim family (tread, crawl, back, side, up, down), dives for an engaged target under the surface, and hauls out onto a bank within a step of the water (<code>src/game/mob_afloat.cpp</code>, gate <code>npc-swim</code>). The crawl and dive keep the head 20 degrees further forward, and a prone stroke&rsquo;s upward head look is held to 20 degrees, so looking straight up over a third-person crawl no longer rolls the head back into the torso.'},
     {label:'Shark circles wide and unpredictably, figure-eights when idle',desc:'2026-10-11, owner ask. Orbit radius drawn per lap AND per mid-lap whim anywhere in 31..104 voxels (1.2x..4x the old 26), eased at 18 vox/s so a redraw is a spiral; whims every 2..8 s may reverse it; a spent lap ends in a pass only 70% of the time (laps 1.5..9 s), so the wait between passes has a long tail. New orbit keys radiusMin/radiusMax/radiusEase/whimMin/whimMax/chargeChance and wander keys figure8/figure8Size/figure8Laps (generic, default off). sightRange 48 &rarr; 90 to keep the target across a wide lap.'},
     {label:'Distant water stops reflecting individual stars',desc:'2026-10-11, F12 ticket 2026-10-10_11-34-37. Water reflects the night sky through a rough-mirror lobe sized by the wave slopes its pixel footprint hides; stars fade into the star field&rsquo;s mean radiance with distance and grazing angle, leaving the horizon airglow and a faint lift. Render-only, no hash move. Raymarch <code>reflectionSkyBlur</code> / <code>waterReflBlur</code>; DESIGN.md water rendering.'},
@@ -11877,6 +11922,22 @@ try{
   console.error('dialogue tab failed to initialise',e);
   const s=document.querySelector('#view-dialogue');
   if(s)s.textContent='the dialogue editor failed to load: '+(e.message||e);
+}
+</script>
+<!-- The Dungeons tab (docs/PLAN_dungeons.md 5, package D4): its own module and
+     its own try/catch like the Dialogue tab. It draws through
+     assets/worldview.js (a plain script) and imports the pure generator
+     library assets/editor/dungeon/dungeongen.js. -->
+<script type="module">
+try{
+  const dg=await import('./editor/dungeon/ui_main.js');
+  dg.attach(document.querySelector('#view-dungeons'));
+  window.__tunerDungeonsTab=dg;
+  if(typeof activeTab!=='undefined'&&activeTab==='dungeons')dg.activate();
+}catch(e){
+  console.error('dungeons tab failed to initialise',e);
+  const s=document.querySelector('#view-dungeons');
+  if(s)s.textContent='the dungeons editor failed to load: '+(e.message||e);
 }
 </script>
 <script>

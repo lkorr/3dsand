@@ -1,0 +1,234 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>dungeons tab harness</title>
+<!--
+  dungeons_test.html — the Dungeons tab end to end in a real browser
+  (docs/PLAN_dungeons.md 6, package D4). Driven by scripts/check_dungeons.sh.
+
+  It loads the REAL tuner.html in an iframe against the real tuner server and
+  voxel server, then asserts what no gate can see:
+    - the tab opens and both pages build
+    - the Kit page previews a piece: DUNGEON ISOLATE through /api/dungeon/preview,
+      regions streamed, meshed, and PIXELS on the canvas that are not background
+    - the stitcher: a first piece, a SNAP (attachPiece onto an open socket makes
+      a link that resolves), a GROW proposal with pieces, keep, UNDO restores the
+      piece count, REDO brings it back
+    - entities: a lever + a gate wired by a signal, no dead-signal issue
+    - SAVE writes assets/dungeons/<id>/ (the shell script then runs
+      `node scripts/compile_dungeon.mjs <id> --check` on it)
+  The verdict goes to <pre id="out"> for --dump-dom.
+-->
+<style>body{background:#0e1116;color:#cfd8e3;font:13px/1.5 monospace;margin:0}
+pre#out{padding:12px;white-space:pre-wrap}
+iframe{position:absolute;left:0;top:0;width:1400px;height:900px;border:0;opacity:0.02}</style>
+<pre id="out">running…</pre>
+<iframe id="f" src="tuner.html?tab=dungeons"></iframe>
+<script>
+const out = document.getElementById('out');
+const lines = [];
+let fail = 0;
+function say(ok, s) { lines.push((ok ? 'PASS  ' : 'FAIL  ') + s); if (!ok) fail++; out.textContent = lines.join('\n'); progress(); }
+// progress to build/perfview_result.txt (the server's /api/testresult), so a
+// long run can be watched from the shell
+let lastProg = 0, probe = null;
+function progress(extra) {
+  const t = Date.now();
+  if (extra && t - lastProg < 3000) return;
+  lastProg = t;
+  fetch('/api/testresult', {method: 'POST', body: lines.join('\n') + (extra ? '\n... ' + extra : '')}).catch(() => {});
+}
+function note(s) { lines.push('      ' + s); out.textContent = lines.join('\n'); }
+// Real time, not timer time (see tabs_test.html): a fetch holds virtual time.
+async function sleep(ms) {
+  const t0 = Date.now();
+  do { try { await fetch('/api/sleep?ms=40', {cache: 'no-store'}); } catch (e) { return; } } while (Date.now() - t0 < ms);
+}
+async function until(fn, ms, step) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    try { if (await fn()) return true; } catch (e) {}
+    for (const v of views) { try { v.pump(); } catch (e) {} }
+    if (probe) progress(probe());
+    await sleep(step || 150);
+  }
+  return false;
+}
+function pixels(view) {
+  view.draw();
+  const gl = view.wv.gl, cv = view.canvas;
+  const px = new Uint8Array(cv.width * cv.height * 4);
+  gl.readPixels(0, 0, cv.width, cv.height, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  let n = 0;
+  for (let i = 0; i < px.length; i += 4) if (Math.abs(px[i] - 14) + Math.abs(px[i + 1] - 17) + Math.abs(px[i + 2] - 21) > 24) n++;
+  return {n, total: cv.width * cv.height};
+}
+// The views' own loop is requestAnimationFrame, which a headless virtual clock
+// stalls while fetches are pending (and this harness always has one): pump them.
+const views = [];
+const Q = new URLSearchParams(location.search);
+const ID = Q.get('id') || '_d4_check';
+(async () => {
+  const f = document.getElementById('f');
+  await new Promise(r => f.addEventListener('load', r, {once: true}));
+  const W = f.contentWindow;
+  W.prompt = () => null; W.confirm = () => true;
+  let ok = await until(() => W.__tunerDungeons && W.__tunerDungeons.stitch, 20000);
+  say(ok, 'Dungeons tab module attached (window.__tunerDungeons)');
+  if (!ok) return finish();
+  const DT = W.__tunerDungeons;
+  const tabBtn = W.document.querySelector('nav.tabs button[data-tab="dungeons"]');
+  say(!!tabBtn, 'nav has a Dungeons tab button');
+  tabBtn.click();
+  ok = await until(() => W.document.querySelector('#view-dungeons .dg-pages') && W.getComputedStyle(W.document.querySelector('#view-dungeons')).display !== 'none', 8000);
+  say(ok, 'the tab opens and shows its page bar');
+
+  /* ---- Kit page: a piece previews ---- */
+  await DT.show('kit');
+  const K = DT.kit;
+  views.push(K.view);
+  const wvs = (v) => { const w = v.wv; if (!w) return 'no wv'; const s = w.stats; return 'inflight ' + w.inflight + ' pending ' + w.pending.size + ' fetches ' + s.fetches + ' errors ' + s.errors + ' ' + s.lastError + ' ms ' + Math.round(s.ms) + ' t ' + Date.now(); };
+  probe = () => 'kit view: ' + K.view.status.textContent + ' | ' + wvs(K.view) + ' | ' + W.document.querySelector('#view-dungeons .dg-pages .st').textContent;
+  ok = await until(() => K.st.program && K.view.wv && K.view.wv.pal, 30000);
+  say(ok, 'kit page: ' + (K.st.program ? K.st.kit + '/' + K.st.type + ' compiled, ' + K.st.program.prims.length + ' prims, ' + K.st.program.sockets.length + ' sockets' : 'no program'));
+  ok = await until(() => { const s = K.view.wv.stats; return s.ready >= Math.max(4, s.live * 0.9) && !K.view.wv.inflight && s.quads > 0; }, 90000, 300);
+  const ks = K.view.wv.stats;
+  say(ok, 'kit page: DUNGEON ISOLATE regions streamed + meshed (' + ks.ready + '/' + ks.live + ' regions, ' + ks.quads + ' quads, ' + ks.fetches + ' fetches)');
+  await sleep(300);
+  let px = pixels(K.view);
+  say(px.n > px.total * 0.01, 'kit page: pixel readback shows the piece (' + px.n + ' / ' + px.total + ' non-background px)');
+  // a slider move refreshes softly (no invalidate): stale regions refetch
+  const before = K.view.wv.stats.fetches;
+  K.st.params = Object.assign({}, K.st.params, {width: (K.st.params.width || 3) + 1});
+  await K.run(true);
+  ok = await until(() => K.view.wv.stats.fetches > before && K.view.wv.staleCount() === 0 && !K.view.wv.inflight, 60000, 300);
+  say(ok, 'kit page: a slider change re-previews by soft refresh (' + (K.view.wv.stats.fetches - before) + ' region refetches)');
+
+  /* ---- Dungeon page: snap, grow, undo, entities, save ---- */
+  await DT.show('dungeon');
+  const St = DT.stitch, S = St.S;
+  views.length = 0; views.push(St.view);
+  probe = () => 'stitch view: ' + St.view.status.textContent + ' | ' + wvs(St.view) + ' | ' + W.document.querySelector('#view-dungeons .dg-pages .st').textContent;
+  ok = await until(() => S.list && ui0(), 20000);
+  function ui0() { return W.document.querySelector('#view-dungeons .dg-stmain'); }
+  say(ok, 'dungeon page built (' + (S.list ? S.list.length : 0) + ' dungeons on disk)');
+  St.create(ID, 'mines', 'D4 harness dungeon');
+  St.firstPiece({t: 'piece', kit: 'mines', type: 'adit_entrance'});
+  ok = await until(() => S.d.pieces.length === 1 && S.prog && S.prog.pieces.length === 1, 5000);
+  say(ok, 'first piece: mines/adit_entrance');
+  const open0 = S.sockets.filter(s => s.state === 'open' && !s.tags.includes('surface'));
+  say(open0.length > 0, 'the entrance has an open socket: ' + open0.map(s => s.piece + '.' + s.name).join(', '));
+  St.attachAt({piece: open0[0].piece, socket: open0[0].name}, {t: 'piece', kit: 'mines', type: 'drift'});
+  ok = await until(() => S.d.pieces.length === 2 && S.prog.pieces.length === 2, 5000);
+  const L = S.links.filter(l => !l.auto && l.compat.ok);
+  say(ok && L.length >= 1 && !S.broken.size, 'snap: drift attached, ' + L.length + ' link(s) resolve, ' + S.broken.size + ' broken');
+  const linkedNow = S.sockets.filter(s => s.state === 'linked').length;
+  say(linkedNow >= 2, 'snap: both sides of the join draw as linked (' + linkedNow + ' linked sockets)');
+  const tip = S.sockets.find(s => s.piece === 'p1' && s.state === 'open');
+  say(!!tip, 'the drift ends in an open socket (' + (tip ? tip.name : '-') + ')');
+  await until(() => { const v = St.view.wv; return v && v.mvp && v.stats.live > 0; }, 60000, 300);
+  // DRAG AND DROP: a palette item dragged onto an open socket's frame snaps there
+  // (synthetic DragEvents through the real handlers: dragstart on the palette
+  // item, dragover + drop on the view at the socket's projected centre).
+  {
+    const openS = S.sockets.filter(s => s.state === 'open' && !s.tags.includes('surface'));
+    const before = S.d.pieces.length;
+    St.view.frameBox(S.prog.bounds.min, S.prog.bounds.max, {k: 1.4});
+    let dropped = false, why = 'no open socket on screen (' + openS.length + ' open)';
+    W.document.querySelector('#view-dungeons .dg-tabs2 button').click();     // the Pieces palette
+    await sleep(100);
+    const item = [...W.document.querySelectorAll('#view-dungeons .dg-item[draggable=true]')].find(e => JSON.parse(e.dataset.spec).type === 'crawl' || JSON.parse(e.dataset.spec).type === 'drift');
+    for (const s of openS) {
+      St.view.draw();
+      const c = s.dir[1] ? s.pos : [s.pos[0], s.pos[1] + s.h / 2, s.pos[2]];
+      const q = St.view.project(c);
+      if (!q || !item) continue;
+      const r = St.view.canvas.getBoundingClientRect();
+      const dt = new W.DataTransfer();
+      item.dispatchEvent(new W.DragEvent('dragstart', {bubbles: true, dataTransfer: dt}));
+      const at = {bubbles: true, cancelable: true, dataTransfer: dt, clientX: r.left + q[0], clientY: r.top + q[1]};
+      St.view.el.dispatchEvent(new W.DragEvent('dragover', at));
+      why = 'drop target ' + JSON.stringify(S.drop) + ' for ' + s.piece + '.' + s.name;
+      St.view.el.dispatchEvent(new W.DragEvent('drop', at));
+      item.dispatchEvent(new W.DragEvent('dragend', {bubbles: true, dataTransfer: dt}));
+      dropped = await until(() => S.d.pieces.length === before + 1, 3000);
+      if (dropped) { why = 'onto ' + s.piece + '.' + s.name; break; }
+    }
+    say(dropped, 'drag and drop: a palette piece dropped on an open socket snaps there (' + why + ')');
+    if (dropped) { St.hist.doUndo(); await until(() => S.d.pieces.length === before, 3000); }
+  }
+  St.growAt({piece: 'p1', socket: tip.name});
+  ok = await until(() => S.proposal && S.proposal.result.pieces.length > 0 && S.prog && S.prog.pieces.length > 2, 8000);
+  say(ok, 'grow: a proposal appears (' + (S.proposal ? S.proposal.result.pieces.length : 0) + ' ghosted pieces' + (S.proposal && S.proposal.result.notes.length ? '; ' + S.proposal.result.notes.join('; ') : '') + ')');
+  const ghostBar = W.document.querySelector('#view-dungeons .dg-ghostbar');
+  say(ghostBar && ghostBar.style.display !== 'none', 'grow: the Keep / Reroll / Discard bar is shown');
+  const nProp = S.proposal ? S.proposal.result.pieces.length : 0;
+  St.keepProposal();
+  ok = await until(() => S.d.pieces.length === 2 + nProp, 5000);
+  say(ok, 'keep: the dungeon has ' + S.d.pieces.length + ' pieces');
+  // wait for the voxels of the grown dungeon
+  ok = await until(() => { const s = St.view.wv && St.view.wv.stats; return s && s.ready >= Math.max(4, s.live * 0.9) && !St.view.wv.inflight && s.quads > 0; }, 120000, 300);
+  say(ok, 'dungeon page: the stitched dungeon streams + meshes (' + (St.view.wv ? St.view.wv.stats.ready + '/' + St.view.wv.stats.live : '-') + ' regions)');
+  await sleep(300);
+  px = pixels(St.view);
+  say(px.n > px.total * 0.01, 'dungeon page: pixel readback (' + px.n + ' non-background px)');
+  St.S.hist = St.hist;
+  St.hist.doUndo();
+  ok = await until(() => S.d.pieces.length === 2, 3000);
+  say(ok, 'undo: back to 2 pieces');
+  St.hist.doRedo();
+  ok = await until(() => S.d.pieces.length === 2 + nProp, 3000);
+  say(ok, 'redo: ' + S.d.pieces.length + ' pieces again');
+  // CLICK TO PLACE: arm a kind in the Entities palette, click the view where the
+  // x-ray pick finds a floor (a pixel over the middle of piece p1).
+  {
+    const tabs = W.document.querySelectorAll('#view-dungeons .dg-tabs2 button');
+    tabs[2].click();
+    await sleep(100);
+    const it = [...W.document.querySelectorAll('#view-dungeons .dg-item[draggable=true]')].find(e => JSON.parse(e.dataset.spec).kind === 'marker');
+    it.click();
+    const before = S.refs.length;
+    const pc = S.prog.pieces.find(p => p.id === 'p1');
+    St.view.draw();
+    const q = St.view.project([(pc.bounds.min[0] + pc.bounds.max[0]) / 2, pc.bounds.min[1] + 2, (pc.bounds.min[2] + pc.bounds.max[2]) / 2]);
+    const r = St.view.canvas.getBoundingClientRect();
+    const ev = (t) => new W.PointerEvent(t, {bubbles: true, cancelable: true, clientX: r.left + q[0], clientY: r.top + q[1], button: 0, pointerId: 1});
+    St.view.canvas.dispatchEvent(ev('pointerdown'));
+    St.view.canvas.dispatchEvent(ev('pointerup'));
+    const placed = await until(() => S.refs.length === before + 1, 3000);
+    const m = placed ? S.refs[S.refs.length - 1] : null;
+    say(placed, 'click to place: an armed marker lands where the x-ray pick hits (' + (m ? m.name + ' at ' + m.pos.join(',') : 'nothing placed; hit ' + JSON.stringify(St.view.pickVoxel(q[0], q[1]))) + ')');
+    if (placed) { St.hist.doUndo(); await until(() => S.refs.length === before, 3000); }
+  }
+  // entities: a lever wired to a gate
+  const p1 = S.prog.pieces.find(p => p.id === 'p1');
+  const c = [Math.round((p1.bounds.min[0] + p1.bounds.max[0]) / 2), Math.round(p1.bounds.min[1] + 6), Math.round((p1.bounds.min[2] + p1.bounds.max[2]) / 2)];
+  const lever = St.placeRef('lever', c, 0);
+  lever.props.signal = 'gate_a';
+  const gate = St.placeRef('gate', [c[0] - 8, c[1], c[2] + 20], 0);
+  gate.props.on = 'gate_a';
+  St.validateNow();
+  const dead = S.issues.filter(i => i.code === 'signal');
+  say(S.refs.length === 2 && !dead.length, 'entities: lever + gate wired on "gate_a" (' + dead.length + ' signal issues)');
+  gate.props.on = 'nobody';
+  St.validateNow();
+  say(S.issues.some(i => i.code === 'signal' && i.severity === 'error'), 'validation: a gate on a dead signal is an error');
+  gate.props.on = 'gate_a';
+  St.validateNow();
+  const errs = S.issues.filter(i => i.severity === 'error');
+  note('validation: ' + errs.length + ' error(s), ' + S.issues.filter(i => i.severity === 'warn').length + ' warning(s)' + (errs.length ? ': ' + errs.map(e => e.msg).slice(0, 3).join(' | ') : ''));
+  // save
+  await St.save();
+  ok = await until(async () => { const r = await fetch('/api/dungeon?id=' + ID, {cache: 'no-store'}); const j = await r.json(); return j.ok && j.shell && j.refs; }, 15000);
+  say(ok, 'save: assets/dungeons/' + ID + '/ dungeon.json + shell.json + refs.json are on disk');
+  const lst = await (await fetch('/api/dungeons', {cache: 'no-store'})).json();
+  say(lst.dungeons.some(d => d.id === ID && d.shell && d.refs), 'save: /api/dungeons lists it with shell.bin + refs.json');
+  say(!St.dirty(), 'save: the page reads saved');
+  finish();
+})().catch(e => { say(false, 'harness threw: ' + (e && e.stack || e)); finish(); });
+function finish() {
+  lines.push('', 'RESULT ' + (fail ? 'FAIL(' + fail + ')' : 'OK'));
+  out.textContent = lines.join('\n');
+  document.title = fail ? 'FAIL' : 'OK';
+  fetch('/api/testresult', {method: 'POST', body: out.textContent}).catch(() => {});
+}
+</script>
