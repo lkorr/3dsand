@@ -2752,18 +2752,6 @@ stitcher's **in world** view: the real terrain round the entrance, the dungeon
 x-rayed beneath, the ground-breach checks on. Save the map to keep it (the
 Dungeons tab reads the saved map.json).
 
-The same dungeon can be placed **any number of times, on any map**: each
-`dungeons[]` entry has its own id; its entities get their own ref group
-(`dungeon/<placement id>`), so a lever in one copy never opens a gate in
-another. The page writes the `dungeons[]` of the map you have open, and **Open in
-Dungeons tab** opens THAT placement. The tab's in-world view has a picker over
-every placement on every map, or a scratch column.
-
-Worldgen keeps **trees and ground cover off the entrance**. A tree whose crown
-would reach where the dungeon breaks the ground does not grow, so a ruin top or
-a mine adit in a forest stands in a clearing, with no cut trunk and no crown
-floating over the hole.
-
 ### 17.4a Variants: one dungeon, several looks
 
 A dungeon can be a VARIANT of another: its `dungeon.json` says
@@ -2796,9 +2784,21 @@ a shaft's height) are adjusted with `--set p0.apronHeight=6 --as <new id>`:
 that writes a variant for this map and places it. The World map page's
 Dungeon tool (17.4) then shows and moves it like any other.
 
-### 17.4.1 Variants
+The same dungeon can be placed **any number of times, on any map**: each
+`dungeons[]` entry has its own id; its entities get their own ref group
+(`dungeon/<placement id>`), so a lever in one copy never opens a gate in
+another. The page writes the `dungeons[]` of the map you have open, and **Open in
+Dungeons tab** opens THAT placement. The tab's in-world view has a picker over
+every placement on every map, or a scratch column.
 
-**New variant…** makes a dungeon that `extends` another: same pieces, with
+Worldgen keeps **trees and ground cover off the entrance**. A tree whose crown
+would reach where the dungeon breaks the ground does not grow, so a ruin top or
+a mine adit in a forest stands in a clearing, with no cut trunk and no crown
+floating over the hole.
+
+### 17.4c Variants in the tab
+
+(Format: 17.4a.) **New variant…** makes a dungeon that `extends` another: same pieces, with
 your changes on top (seed, name, palette, per-piece slider overrides, pieces
 removed or added, entity patches). The stitcher shows each piece as inherited,
 overridden or added. **Revert to base** drops a piece's overrides, and saving
@@ -2806,7 +2806,7 @@ writes only the overrides, so later edits to the base still reach the variant.
 (Variant editing needs the core library's `resolveDungeon`. Until it is
 present, variants open read-only with a message.)
 
-### 17.4.2 Previews when the GPU is busy
+### 17.4d Previews when the GPU is busy
 
 The preview server shares the GPU with game runs and builds. The lock is
 first-come-first-served, so a waiting game run is no longer starved by the
