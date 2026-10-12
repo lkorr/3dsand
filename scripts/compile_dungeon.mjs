@@ -51,7 +51,7 @@ for (const id of ids) {
   for (const e of prog.errors) console.error('  ERROR ' + (e.piece || '-') + ': ' + e.msg);
   if (prog.errors.length) bad++;
   if (flag('--check')) {
-    const cur = existsSync(out) ? readFileSync(out, 'utf8') : null;
+    const cur = existsSync(out) ? readFileSync(out, 'utf8').replace(/\r/g, '') : null;   // a CRLF checkout is not stale
     const curBin = existsSync(outBin) ? readFileSync(outBin) : null;
     const binOk = curBin && Buffer.compare(curBin, Buffer.from(bin)) === 0;
     if (cur !== json || !binOk) { console.error(id + ': shell ' + (cur !== json ? 'json' : 'bin') + ' is STALE (run node scripts/compile_dungeon.mjs ' + id + ')'); bad++; }

@@ -314,7 +314,7 @@ section('the sample dungeon');
   const v = G.validate(sample, {materials: NAMES});
   ok(!v.some(i => i.severity === 'error'), '_d2_sample validates with no errors ' + J(v.filter(i => i.severity === 'error').slice(0, 3)));
   const shellPath = join(ROOT, 'assets/dungeons/_d2_sample/shell.json');
-  ok(existsSync(shellPath) && readFileSync(shellPath, 'utf8') === G.emitShellJson(prog), '_d2_sample/shell.json is current (else: node scripts/compile_dungeon.mjs _d2_sample)');
+  ok(existsSync(shellPath) && readFileSync(shellPath, 'utf8').replace(/\r/g, '') === G.emitShellJson(prog), '_d2_sample/shell.json is current (else: node scripts/compile_dungeon.mjs _d2_sample)');
   const binPath = join(ROOT, 'assets/dungeons/_d2_sample/shell.bin');
   const want2 = G.emitShellBin(prog);
   ok(existsSync(binPath) && Buffer.compare(readFileSync(binPath), Buffer.from(want2)) === 0, '_d2_sample/shell.bin is current');
