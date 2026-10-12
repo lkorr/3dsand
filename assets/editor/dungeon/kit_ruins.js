@@ -338,7 +338,7 @@ const CORRIDOR = {
         if (b.r('alc', i, s, 'deco') < P.deco) {
           const what = b.pick(['ruins/urn', 'ruins/candle_cluster', 'ruins/bones', 'ruins/urn'], 'alc', i, s, 'what');
           b.prop(what, {}, [s * (hw + Math.round(ad / 2)), b.m(0.7), z], s < 0 ? 90 : 270);
-          if (what === 'ruins/urn' && b.r('alc', i, s, 'loot') < 0.3) b.ref('container', [s * (hw + Math.round(ad / 2)), b.m(0.7), z], {name: 'urn' + i, props: {loot: 'tomb_offering'}});
+          if (what === 'ruins/urn' && b.r('alc', i, s, 'loot') < 0.3) b.ref('container', [s * (hw + Math.round(ad / 2)), b.m(0.7), z], {name: 'urn' + i, props: {loot: 'crypt_offerings'}});
         }
       }
     });
@@ -519,13 +519,13 @@ const CRYPT = {
     });
     if (P.keyNiche && niches.length) {
       const n = niches[Math.floor(b.r('keyniche') * niches.length)];
-      b.ref('container', n.pos, {name: 'key_niche', props: {loot: 'crypt_key', tags: ['key_holder']}});
+      b.ref('container', n.pos, {name: 'key_niche', props: {loot: 'crypt_offerings', tags: ['key_holder']}});
     }
     if (P.ossuary > 0) b.scatter.push({prim: room, kind: 'bones', density: +(P.ossuary * 0.8).toFixed(3), size: [1, 3], surface: 'floor', mat: 'bone', seedKey: 'ossuary'});
     for (let i = 0; i < P.sarcophagi; i++) {
       const z = Math.round(z0 + (L * (i + 1)) / (P.sarcophagi + 1));
       b.prop('ruins/sarcophagus', {broken: b.r('sarc', i) < P.decay * 0.6}, [b.jit(4, 'sarc', i), 0, z], 0);
-      b.ref('container', [0, 0, z], {name: 'sarcophagus' + i, props: {loot: 'tomb_offering'}});
+      b.ref('container', [0, 0, z], {name: 'sarcophagus' + i, props: {loot: 'crypt_offerings'}});
     }
     if (P.guardians) b.ref('spawner', [0, 0, Math.round((z0 + z1) / 2)], {name: 'guardians', props: {mobs: [{base: 'human', weight: 1}], count: 2, radius: Math.round(hw * 0.8), respawn: 'never', behavior: 'guard'}});
     for (let z = z0 + b.m(1.5); z < z1; z += b.m(3)) { b.lightSpot([-hw + 1, b.m(1.6), z], 'wall', '+x'); b.lightSpot([hw - 1, b.m(1.6), z], 'wall', '-x'); }
@@ -692,7 +692,7 @@ const SANCTUM = {
         column(b, P, x, z, 0, H + 2, b.m(0.35, 2), 'round', 'ring' + i);
       }
     }
-    if (P.deco > 0.3) b.ref('container', [Math.round(hw * 0.5), top, altarZ], {name: 'offering_chest', props: {loot: 'sanctum'}});
+    if (P.deco > 0.3) b.ref('container', [Math.round(hw * 0.5), top, altarZ], {name: 'offering_chest', props: {loot: 'crypt_offerings'}});
     for (const s of [-1, 1]) for (let z = z0 + b.m(1.5); z < z1; z += b.m(4)) b.lightSpot([s * (hw - 1), b.m(2.2), z], 'wall', s < 0 ? '+x' : '-x');
     b.socket('in', [0, 0, 0], '-z', dw * 2, dh, 'arch', ['door']);
     const pts = [[0, 0, Math.round(T / 2)], [0, 0, z0 + b.m(1.5)], [0, 0, zc], [b.m(1.2), top, altarZ - b.m(1.2)]];

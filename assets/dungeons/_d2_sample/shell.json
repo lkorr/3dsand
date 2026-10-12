@@ -503,7 +503,7 @@
     {"kind":"light","pos":[312,-63,323],"yaw":90,"props":{"type":"fungus","warm":true},"id":"p7_light1","piece":"p7","suggested":true},
     {"kind":"light","pos":[378,-63,323],"yaw":90,"props":{"type":"fungus","warm":true},"id":"p7_light2","piece":"p7","suggested":true},
     {"kind":"marker","pos":[0,-45,605],"yaw":0,"props":{"tags":["altar"]},"id":"p9_altar","piece":"p9","suggested":true},
-    {"kind":"container","pos":[25,-45,615],"yaw":0,"props":{"loot":"sanctum"},"id":"p9_offering_chest","piece":"p9","suggested":true},
+    {"kind":"container","pos":[25,-45,615],"yaw":0,"props":{"loot":"crypt_offerings"},"id":"p9_offering_chest","piece":"p9","suggested":true},
     {"kind":"light","pos":[-49,-32,485],"yaw":0,"props":{"type":"brazier","warm":true},"id":"p9_light2","piece":"p9","suggested":true},
     {"kind":"light","pos":[49,-32,485],"yaw":0,"props":{"type":"brazier","warm":true},"id":"p9_light3","piece":"p9","suggested":true},
     {"kind":"light","pos":[49,-32,565],"yaw":0,"props":{"type":"brazier","warm":true},"id":"p9_light4","piece":"p9","suggested":true},

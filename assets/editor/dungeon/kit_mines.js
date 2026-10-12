@@ -159,7 +159,7 @@ const DRIFT = {
         const what = b.pick(['mines/crate', 'mines/barrel', 'mines/crate'], 'niche', i, 'what');
         const at = [side * (hw + Math.round(D / 2)), 0, zm];
         b.prop(what, {}, at, side < 0 ? 90 : 270);
-        if (what === 'mines/crate') b.ref('container', at, {name: 'niche_crate' + i, props: {loot: 'mine_common'}});
+        if (what === 'mines/crate') b.ref('container', at, {name: 'niche_crate' + i, props: {loot: 'mine_supplies'}});
       }
     }
     const pts = [];
@@ -645,7 +645,7 @@ const CAMP = {
       if (x > hw - 6) break;
       const what = b.r('crate', i) < 0.6 ? 'mines/crate' : 'mines/barrel';
       b.prop(what, {}, [x, 0, z1 - 6], 180);
-      if (what === 'mines/crate' && i === 0) b.ref('container', [x, 0, z1 - 6], {name: 'stores', props: {loot: 'mine_camp'}});
+      if (what === 'mines/crate' && i === 0) b.ref('container', [x, 0, z1 - 6], {name: 'stores', props: {loot: 'mine_supplies'}});
     }
     for (let i = 0; i < P.tools; i++) b.prop('mines/pickaxe_rack', {}, [hw - 2, 0, z0 + b.m(1) + i * b.m(1.3)], 270);
     if (P.stove) {

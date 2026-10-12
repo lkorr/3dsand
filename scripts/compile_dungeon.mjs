@@ -39,6 +39,13 @@ for (const id of ids) {
   const text = readFileSync(src, 'utf8');
   let d;
   try { d = JSON.parse(text); } catch (e) { console.error(id + ': dungeon.json does not parse: ' + e.message); bad++; continue; }
+  // A hand-written shell (D1's _fixture: kit "fixture") has no generator to recompile it from;
+  // --all skips it, naming it, instead of dying on the unknown kit. Its gate is dungeon-format.
+  const foreign = (d.pieces || []).map(pc => pc.kit).filter(k => !DG.KITS[k]);
+  if (foreign.length) {
+    if (flag('--all')) { console.log(id + ': skipped (hand-written shell; kit ' + foreign[0] + ' has no generator)'); continue; }
+    console.error(id + ': unknown kit ' + foreign[0]); bad++; continue;
+  }
   const prog = DG.compile(d, {id, sourceText: text, materials: MATS});
   const json = DG.emitShellJson(prog);
   const bin = DG.emitShellBin(prog);

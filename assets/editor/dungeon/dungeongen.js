@@ -811,8 +811,12 @@ export function validate(dIn, opts) {
   // Refs are in the ANCHOR frame (refs.json is authored on the compiled frame).
   const A = ent.pos;
   const toD = (p) => [p[0] + A[0], p[1] + A[1], p[2] + A[2]];
-  const locks = refs.filter(r => r.kind === 'door' || r.kind === 'gate').filter(r => r.props && r.props.lock);
-  const keys = refs.filter(r => r.kind === 'key' && r.props && r.props.keyId);
+  const locks = refs.filter(r => r.kind === 'door' || r.kind === 'gate' || r.kind === 'container').filter(r => r.props && r.props.lock);
+  // A key grants props.keyId, else its item's `unlocks` (opts.keyItems: [{id, unlocks}]),
+  // else the item id itself -- the rule refs_dungeon.cpp applies (items.json `unlocks`).
+  const keyItems = new Map((opts.keyItems || []).map(k => [k.id, k.unlocks || k.id]));
+  const keys = refs.filter(r => r.kind === 'key' && r.props && (r.props.keyId || r.props.item))
+    .map(r => r.props.keyId ? r : Object.assign({}, r, {props: Object.assign({}, r.props, {keyId: keyItems.get(r.props.item) || r.props.item})}));
   const lockNode = new Map(locks.map(r => [r, nearest(toD(r.pos || [0, 0, 0]))]));
   const keyNode = new Map(keys.map(r => [r, nearest(toD(r.pos || [0, 0, 0]))]));
   const reach = (blocked) => {
