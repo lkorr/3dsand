@@ -1001,7 +1001,11 @@ var<private> gFragXY : vec2f = vec2f(0.0);
 // its canopy (a crown cell 1 / the horizon's coverage), 1 = a horizon hit --
 // the L8 / horizon seam strip is measured against a normal frame with it.
 // Every channel is tonemapped on the way out: decode levels by clustering.
-// 0 = off and const-folded away.
+// LOD-SEAM GATE (2026-10-12, `--gate lod-seam` prints the per-class medians
+// and means of whichever frame this is): 12 = the sun shadow's stages
+// (gDbgSh): raw, after the LOD lift, after the lift cap; 13 = a far pixel's
+// shadow-cache patch: no opinion (1), its value, 0.5. 0 = off and
+// const-folded away.
 const SEAM_DBG : u32 = 0u;
 // The MPM terms (SEAM_DBG 9-10): caFrac, foam, settled share (fs), churn; colVox.
 var<private> gDbgM0 : vec4f = vec4f(0.0);
@@ -1019,6 +1023,10 @@ fn dbgWater(fres : f32, refr : vec3f, refl : vec3f, lit : vec3f, pathM : f32) {
 }
 const SEAM_HANDOFF : f32 = TUNE_LOD_HANDOFF_DIST;
 var<private> gDbg : vec4f = vec4f(0.0);
+// SEAM_DBG 12: the SUN SHADOW's three stages on both paths -- the raw value
+// (the near cache / the cascade march), after lodShadowLift, after
+// shadowLiftCap (what multiplies the lambert). Unshadowed faces read 1/1/1.
+var<private> gDbgSh : vec3f = vec3f(1.0);
 fn dbgLum(c : vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
 fn dbgRec(isFar : bool, mat : u32, t : f32, alb : vec3f, sh : f32, ao : f32, open : f32,
           lamPre : f32, lam : f32, col : vec3f, gi : vec3f, face : f32) {
@@ -6624,6 +6632,25 @@ fn shadowWindowExitT(ro : vec3f, rd : vec3f) -> f32 {
 // farShadowCover). `cov` is only meaningful when t >= 0.
 struct FarShadowHit { t : f32, cov : f32 };
 
+// ---- PARTIAL COVERS ACCUMULATE (2026-10-12, `--gate lod-seam`) ------------
+// farShadowCover estimates how much of the sun disc ONE blocker cell covers,
+// from where the ray crossed it, and the march used to stop there: a ray that
+// clipped the corner of the first leaf cell it met came back nearly lit
+// however much crown stood behind that cell. A porous crown is exactly that
+// case on every ray -- 20 cm cells with gaps, entered at a corner -- so the
+// far shadow under a tree's edge read lit (0.96 in the gate's far arm, where
+// the near cache, sixteen jittered rays through the voxels, read ~0.4), and
+// the ground just past the 20.5 m sphere was sunnier than the same ground one
+// voxel inside it. Now the march keeps going after a partial cover and the
+// covers combine as independent occluders do, 1 - prod(1 - c_i), to
+// FAR_SHADOW_COVER_HITS blockers or until under FAR_SHADOW_OPEN_MIN of the
+// disc is left. A full cover (every solid blocker met face-on) still returns
+// on the spot, so terrain and walls are unchanged; the distance is the FIRST
+// blocker's, which is what the softening law wants. shadow_resolve.wgsl's
+// farShadowTC MUST AGREE (its far patches publish this march).
+const FAR_SHADOW_COVER_HITS : i32 = 4;
+const FAR_SHADOW_OPEN_MIN : f32 = 0.05;
+
 // ---- THE FAR PENUMBRA, WITHOUT A SECOND RAY ---------------------------------
 // The near field's shadow is soft because shadow_resolve.wgsl jitters its ray
 // across the solar disc and averages 16 frames of verdicts. A far pixel gets
@@ -6697,6 +6724,8 @@ fn farShadowMarch(level0 : u32, roFine : vec3f, rdIn : vec3f,
   let reachF = TUNE_FAR_SHADOW_REACH / VOXEL_METERS;
   var tF = tStartFine;
   var budget = FAR_SHADOW_STEP_CAP;
+  var open = 1.0;   // the sun disc no blocker so far has covered
+  var hits = 0;
 
   for (var level = level0; level <= FAR_LEVELS; level++) {
     if (tF >= reachF || budget <= 0) { break; }
@@ -6796,9 +6825,21 @@ fn farShadowMarch(level0 : u32, roFine : vec3f, rdIn : vec3f,
             rsAdd(RS_FAR_SHADOW, 1u);
             budget -= 1;
             if (farShadowBlocked(level, vc)) {
-              out.t = vCur * s;
-              out.cov = farShadowCover(level, vc, eAx, vCur, vMax, rd, stepv, s);
-              return out;
+              // PARTIAL COVERS ACCUMULATE (FAR_SHADOW_COVER_HITS): the first
+              // blocker's distance is the shadow's, the cover is every
+              // blocker's together.
+              let cv = farShadowCover(level, vc, eAx, vCur, vMax, rd, stepv, s);
+              if (hits == 0) { out.t = vCur * s; }
+              open *= 1.0 - cv;
+              hits += 1;
+              out.cov = 1.0 - open;
+              // Only where this march is the far pixels' shadow (FAR_SHADOW_CACHE
+              // off): with the cache on, the patches publish shadow_resolve's
+              // farShadowTC, which accumulates, and this march only serves the
+              // near continuation past 999 m -- where carrying the
+              // accumulation cost fs 40 registers (128 -> 168) for nothing.
+              if (FAR_SHADOW_CACHE || open < FAR_SHADOW_OPEN_MIN ||
+                  hits >= FAR_SHADOW_COVER_HITS) { return out; }
             }
             if (vMax.x < vMax.y && vMax.x < vMax.z) {
               vc.x += stepv.x; vCur = vMax.x; vMax.x += tDelta.x; eAx = 0;
@@ -6902,6 +6943,7 @@ fn farShadowCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
   let sub = shadowPackSub(ix, iy) | select(0u, FAR_SC_REFINED, refined) | FAR_SC_FLAG |
             ((level - 1u) << FAR_SC_LEVEL_SHIFT);
   let r = farSlotRead(farScPackCell(cell, face), sub, R.frameIdx & 15u);
+  if (SEAM_DBG == 13u) { gDbgSh = vec3f(select(1.0, 0.0, r.y > 0.0), r.x, 0.5); }
   return select(1.0, r.x, r.y > 0.0);
 }
 
@@ -13969,16 +14011,14 @@ fn farBandNearWeight(tFine : f32) -> f32 {
 //
 // So a feature's face takes its sky from the cascade: the fan sim_openness
 // measures with (the normal and four 45-degree diagonals of the face's own
-// hemisphere), point-sampled in the hit's own level every 2 fine voxels to
-// 16, then every 12 to 64 (the same 6.4 m at every level: a level's cell
-// count halves as its cells double, and repeats are skipped; the near walk
-// reaches render.opennessReach, 12 m), a ray closed by the first
-// MATERIAL cell (never the blocker flag, as for AO and shadows). Weights are
-// the near quadrature's: the normal's cone 0.36, each diagonal 0.16. The
-// result scales the openness and the bounce together, the two indirect terms
-// the near grid carries. The heightfield never takes it (fSurf): its look is
-// the calibrated closed form, bit-identical. Past FAR_SKY_FADE_END_M the
-// cascade's trees are cells wider than a lobe (and flattened into the skin at
+// hemisphere), each ray walked by farFanRay (the hit's own level to 1.6 m,
+// then every cell of the level two coarser out to the near walk's reach,
+// render.opennessReach), a ray closed by the first MATERIAL cell (never the
+// blocker flag, as for AO and shadows). Weights are the near quadrature's:
+// the normal 1/3, each diagonal 1/6. The result scales the openness and the
+// bounce together, the two indirect terms the near grid carries. The
+// heightfield takes the UP fan instead (farGroundOver + farSkyFan, below).
+// Past FAR_SKY_FADE_END_M the cascade's trees are cells wider than a lobe (and flattened into the skin at
 // level 5), so the term eases out with distance, never on a level boundary.
 const FAR_SKY_FADE_START_M : f32 = 60.0;
 const FAR_SKY_FADE_END_M : f32 = 110.0;
@@ -13994,37 +14034,80 @@ fn farSkySolid(level : u32, c : vec3<i32>, b : FarBox) -> bool {
   if (top != 0u && (c.y & (i32(CHUNK) - 1)) >= i32(top)) { return false; }
   return farPalAt(level, c) != 0u;
 }
-fn farFeatureSky(level : u32, cell : vec3<i32>, ni : vec3<i32>, tFine : f32) -> f32 {
-  let fade = 1.0 - smoothstep(FAR_SKY_FADE_START_M, FAR_SKY_FADE_END_M, tFine * VOXEL_METERS);
-  if (fade <= 0.0) { return 1.0; }
-  let b = farBox(level);
-  let shift = farCellShift(level);
+// ONE RAY OF A FAR SKY FAN: 1 open, 0 closed by a material cell. Shared by
+// the feature fan and the ground fan (farSkyFan), so the two read the cascade
+// one way.
+//
+// THE REACH IS THE NEAR WALK'S (render.opennessReach, 12 m) and THE OUTER
+// PART IS MARCHED, NOT SKIPPED (2026-10-12, `--gate lod-seam`). The fan used to
+// stop at 6.4 m and sample every 12 fine voxels past 16: it stepped through
+// 1-2 m crown lobes and between trunks, where the near grid -- which walks
+// EVERY 40 cm block (sim_openness, traceOpaque's coarse mode) -- found leaves.
+// Now two stretches, each in cells of its own size so a ray tests every cell
+// it crosses at that size: the hit's own level every cell to 16 fine voxels
+// (a lobe's shell is a cell or two thick), then the level TWO coarser (80 cm
+// from a level-1 hit) every cell to the reach -- the cover rule keeps a
+// crown's density at levels 1-4. ~21 samples a ray at level 1, fewer where a
+// ray that does not descend climbs over its level's SKY CEILING (farSkyCeil:
+// open).
+//
+// TRIED AND TAKEN OUT (no measurable change in the gate, +cost): the near
+// walk's two other rules -- an unblocked ray marching straight up from its
+// endpoint ("an unblocked ray is not sky"), and a side face's down-diagonal
+// re-aimed 63 degrees up.
+//
+// `minFine`: only cells whose bottom is at or over this fine-voxel height
+// count (the up ray over a heightfield skips the column's own terrain; -1e9 =
+// every cell).
+const FAR_SKY_REACH_V : i32 = i32(TUNE_OPENNESS_REACH / VOXEL_METERS);
+// THE NEAR WALK'S QUADRATURE (sim_openness OPEN_WEIGHT_TOTAL): the normal
+// weighted double, 2/6, each diagonal 1/6. Was 0.36 / 0.16.
+const FAR_SKY_W_UP : f32 = 1.0 / 3.0;
+const FAR_SKY_W_DIAG : f32 = 1.0 / 6.0;
+fn farFanRay(level : u32, cell : vec3<i32>, d : vec3<i32>, minFine : f32) -> f32 {
+  // ONE flat loop over both stretches, and nothing per stretch held across
+  // it: fs sits at the 128-register occupancy cliff (--shader-stats), and a
+  // nested three-stretch version of this took it to 168 on its own.
+  let l2 = min(level + 2u, FAR_LEVELS);
+  let s0 = farCellShift(level);
+  let s2 = farCellShift(l2);
+  let nIn = max(1, 16 >> s0);
+  let k2a = (16 >> s2) + 1;
+  let nAll = nIn + max(k2a, FAR_SKY_REACH_V >> s2) - k2a + 1;
+  let o2 = ((cell << vec3<u32>(s0)) + vec3<i32>(i32(1u << s0) >> 1u)) >> vec3<u32>(s2);
+  for (var j = 1; j <= nAll; j++) {
+    let inner = j <= nIn;
+    let lv = select(l2, level, inner);
+    let c = select(o2 + d * (j - nIn + k2a - 1), cell + d * j, inner);
+    if (d.y >= 0 && f32(c.y) >= farSkyCeil(lv)) { return 1.0; }
+    if (f32(c.y << select(s2, s0, inner)) < minFine) { continue; }
+    if (farSkySolid(lv, c, farBox(lv))) { return 0.0; }
+  }
+  return 1.0;
+}
+// THE FAN: the face's normal (FAR_SKY_W_UP) and its four 45-degree diagonals
+// (FAR_SKY_W_DIAG each), one call site for both users -- a feature's face
+// (a feature's fan) and the heightfield's up fan (farGroundOver) --
+// for the register reason above. `upMin` applies to the normal ray only.
+fn farSkyFan(level : u32, cell : vec3<i32>, ni : vec3<i32>, upMin : f32) -> f32 {
   // Two tangents of the face, integer: t1 is x unless the normal is x.
   let t1 = select(vec3<i32>(1, 0, 0), vec3<i32>(0, 0, 1), ni.x != 0);
   let t2 = vec3<i32>(ni.y * t1.z - ni.z * t1.y, ni.z * t1.x - ni.x * t1.z,
                      ni.x * t1.y - ni.y * t1.x);
   var vis = 0.0;
   for (var r = 0; r < 5; r++) {
+    // From the hit cell's centre: k cells along the normal and k along the
+    // tangent (the 45-degree ray from the face centre lands in that cell).
     var d = ni;
     if (r == 1) { d = ni + t1; } else if (r == 2) { d = ni - t1; }
     else if (r == 3) { d = ni + t2; } else if (r == 4) { d = ni - t2; }
-    var open = 1.0;
-    var kPrev = 0;
-    for (var j = 1; j <= 12; j++) {
-      // 2, 4, .. 16 fine voxels densely (a crown lobe's shell is a cell or
-      // two thick: a doubling stride stepped over it), then every 12 to 64.
-      let k = max(1, select(2 * j, 16 + 12 * (j - 8), j > 8) >> shift);
-      if (k == kPrev) { continue; }
-      kPrev = k;
-      // From the hit cell's centre: k cells along the normal and k along the
-      // tangent (the 45-degree ray from the face centre lands in that cell).
-      // The normal's first sample is the front cell, empty by construction.
-      let c = cell + d * k;
-      if (farSkySolid(level, c, b)) { open = 0.0; break; }
-    }
-    vis += select(0.16, 0.36, r == 0) * open;
+    vis += select(FAR_SKY_W_DIAG, FAR_SKY_W_UP, r == 0) *
+           farFanRay(level, cell, d, select(-1e9, upMin, r == 0));
   }
-  return mix(1.0, vis, fade);
+  return vis;
+}
+fn farSkyFade(tFine : f32) -> f32 {
+  return 1.0 - smoothstep(FAR_SKY_FADE_START_M, FAR_SKY_FADE_END_M, tFine * VOXEL_METERS);
 }
 // THE BOUNCE A FEATURE'S FACE GETS FROM THE GROUND falls off with its height
 // over it. farGiBounce is a lit tread one cell in front of the face; the near
@@ -14043,6 +14126,67 @@ fn farFeatureBounce(hAbove : f32, tFine : f32) -> f32 {
   let fade = 1.0 - smoothstep(FAR_SKY_FADE_START_M, FAR_SKY_FADE_END_M, tFine * VOXEL_METERS);
   let k = mix(1.0, FAR_BOUNCE_HIGH, smoothstep(FAR_BOUNCE_NEAR_V, FAR_BOUNCE_HIGH_V, hAbove));
   return mix(1.0, k, fade);
+}
+
+// ---- THE SKY OVER THE FAR GROUND (lod-seam gate, 2026-10-12) ----
+// The feature fan's other half (THE SKY OVER A FAR FEATURE, above). The
+// heightfield's closed form (farOpenness: an up face sees the whole sky, a
+// riser 0.6 of it) is what the near grid
+// measures on FLAT OPEN ground, which is where it was calibrated, and wrong
+// everywhere else: grass under a crown, in a clearing ringed by 10 m trees, in
+// a hollow between two rises. The near grid's fan (sim_openness: the normal
+// and four 45-degree diagonals, render.opennessReach) lands on whatever is
+// there, leaves or hillside, and that grass is lit by the slice of sky it
+// leaves; the closed form lit it by all of it. Measured by `--gate lod-seam`
+// (the same pixels shaded near and far, a forest clearing): ground +21..29
+// luma brighter far in every sky, the openness term 1 against the near
+// grid's ~0.6, and through shadowLiftCap (which caps a shadow's lift by the
+// openness) the noon tree shadows on it lifted with it.
+//
+// So a heightfield face and a card take farOpenness x the fraction of the UP
+// hemisphere the cascade leaves open, by the feature fan's quadrature and
+// marches (farSkyFan / farFanRay: the near walk's weights and reach). The
+// fan is the UP one whatever the face (a riser keeps its closed form for the
+// ground in front of it, which the up fan cannot see), and the up ray counts
+// only cells a cell over the column's heightfield top (`groundTop`, fine
+// voxels): a refined hit sits inside its level cell, whose neighbour above
+// may still hold the slope's own terrain.
+//
+// THE COST BOUND: a chunk-word prefilter over the fan's whole footprint (the
+// prefilter below; a column-only one was tried first and was wrong -- the
+// diagonals of a clearing's grass land in the crowns AROUND it, which the
+// column over it does not hold), then farSkySolid's per-sample one and the
+// level's SKY CEILING (farSkyCeil). Eases out over the same 60-110 m as
+// the feature fan (farSkyFade; never on a level boundary).
+//
+// Does anything stand over the heightfield hit within the fan's reach? (the
+// prefilter: false = every ray open, the fan is skipped). The fan stays
+// inside the two-levels-coarser chunk round the hit and its four side
+// neighbours, one chunk row up; open if none of them holds anything over the
+// hit's row there (+1 row of terrain relief) -- up to ten farOcc words, which
+// every pixel of a meadow shares -- or if the hit is over its level's sky
+// ceiling.
+fn farGroundOver(level : u32, cell : vec3<i32>) -> bool {
+  if (f32(cell.y + 1) >= farSkyCeil(level)) { return false; }
+  let shift = farCellShift(level);
+  let l2 = min(level + 2u, FAR_LEVELS);
+  let b2 = farBox(l2);
+  let o2 = ((cell << vec3<u32>(shift)) + vec3<i32>(i32(1u << shift) >> 1u)) >>
+           vec3<u32>(farCellShift(l2));
+  let ch = i32(CHUNK);
+  for (var i = 0; i < 10; i++) {
+    let side = i >> 1;
+    var off = vec3<i32>(0, (i & 1) * ch, 0);
+    if (side == 1) { off.x = ch; } else if (side == 2) { off.x = -ch; }
+    else if (side == 3) { off.z = ch; } else if (side == 4) { off.z = -ch; }
+    let pr = o2 + off;
+    if (!farInValid(pr, b2)) { continue; }
+    let occ = farOcc[farOccIndex(l2, pr)];
+    if (occ == 0u) { continue; }
+    let top = farOccTop(occ);
+    if (top == 0u || (pr.y >> 4u) * ch + i32(top) - 1 > o2.y + 1) { return true; }
+  }
+  return false;
 }
 
 // ---- THE FOOTPRINT FADE: detail below a pixel (package E) ----
@@ -15285,7 +15429,7 @@ fn fs(in : VSOut) -> FSOut {
       // Is this hit the HEIGHTFIELD (its sub-column's skin / sub-skin), or
       // something standing on it (a crown, a trunk, a wall, a boulder)? The
       // far field's closed-form indirect terms are calibrated for the first;
-      // the second takes its sky from the cascade (farFeatureSky, below).
+      // the second takes its sky from the cascade (farSkyFan, below).
       var fSurf = false;
       var groundY = -1e9;   // the column's heightfield top (fine voxels), if mapped
       if (m.klass != CLASS_LIQUID && !fFeat) {
@@ -15382,18 +15526,30 @@ fn fs(in : VSOut) -> FSOut {
       // Read before the sun: the shadow's lift cap wants it, as the near's does.
       // A card reads the GROUND's openness, as a near micro hit does.
       var openF = select(farOpenness(nSh), 1.0, fCard);
-      // A FEATURE's sky (farFeatureSky): the fraction of its face's
+      // A FEATURE's sky (farSkyFan): the fraction of its face's
       // hemisphere the cascade's own cells leave open. Scales the far
       // openness here and the far bounce below (`featSky`), so a face inside a
       // crown is lit like one: the near field's measured grid says the same
       // one voxel inside the handoff.
+      // The heightfield and its cards take the UP fan (farGroundOver), behind
+      // its prefilter; ONE farSkyFan call site for both (registers).
       var featSky = 1.0;
       var featBounce = 1.0;
-      if (!fSurf && !fFeat && m.klass != CLASS_LIQUID) {
-        featSky = farFeatureSky(flv, far.cell, vec3<i32>(round(n)), far.t);
+      let skyFade = farSkyFade(far.t);
+      let fanFeat = !fSurf && !fFeat && m.klass != CLASS_LIQUID;
+      let fanGround = (fSurf || fCard) && m.klass != CLASS_LIQUID;
+      if (skyFade > 0.0 && (fanFeat || (fanGround && farGroundOver(flv, far.cell)))) {
+        // The ground's up ray counts from one cell over its column's
+        // heightfield top (a refined hit's neighbour above may be its slope).
+        let upMin = select(select(groundY + sL, f32(far.cell.y + 1) * sL, groundY < -1e8),
+                           -1e9, fanFeat);
+        let fanN = select(vec3<i32>(0, 1, 0), vec3<i32>(round(n)), fanFeat);
+        featSky = mix(1.0, farSkyFan(flv, far.cell, fanN, upMin), skyFade);
         openF *= featSky;
-        featBounce = featSky * farFeatureBounce(select(hitP.y - groundY, 0.0, groundY < -1e8),
-                                                far.t);
+        if (fanFeat) {
+          featBounce = featSky * farFeatureBounce(select(hitP.y - groundY, 0.0, groundY < -1e8),
+                                                  far.t);
+        }
       }
       let bandW = select(farBandNearWeight(far.t), 0.0, fCard);
       if (bandW > 0.0 && inBounds(fineV)) {
@@ -15467,11 +15623,13 @@ fn fs(in : VSOut) -> FSOut {
           let tb = farHfShadow(flv, hitP + n * 0.02, keyLightDir());
           if (tb >= 0.0) { sh = min(sh, mix(1.0, shadowFromOpaqueHit(true, tb, 0u), hfW)); }
         }
+        if (SEAM_DBG == 12u) { gDbgSh.x = sh; }
         if (sh < 1.0) {
           // Shading LOD (see lodShadeFade): the staircase's contact shadow
           // is an artefact of the sampling at this projected size.
           sh = lodShadowLift(sh, far.t);
         }
+        if (SEAM_DBG == 12u) { gDbgSh.y = sh; }
         // THE TERRAIN-SCALE SUN (S1, hzSunShade): a ridge farther than the
         // march reaches. After the LOD lift, which is for contact shadows:
         // a mountain's is a cast shadow at the near law's depth.
@@ -15485,6 +15643,7 @@ fn fs(in : VSOut) -> FSOut {
           lambert *= sh;
         }
         dbgShF = sh;
+        if (SEAM_DBG == 12u) { gDbgSh.z = sh; }
       }
       // Cloud shadow (common.wgsl cloudSunAt): the deck's shadow crossing the
       // distant hills, from the same map the near field reads — so a cloud
@@ -15841,7 +16000,9 @@ fn fs(in : VSOut) -> FSOut {
       }
       // Shading LOD: contact shadows lift with projected size; a cast
       // shadow keeps its depth while its pool is pixels wide (lodShadowLift).
+      if (SEAM_DBG == 12u) { gDbgSh.x = sh; }
       sh = lodShadowLift(sh, h.t);
+      if (SEAM_DBG == 12u) { gDbgSh.y = sh; }
       // A ridge past every march's reach (S1, hzSunShade): the same cast-
       // shadow depth as the far field's, so a mountain's shadow crosses the
       // window seam as one shadow.
@@ -15852,6 +16013,7 @@ fn fs(in : VSOut) -> FSOut {
       // for the ambient term below.
       lambert *= shadowLiftCap(sh, openRaw);
       dbgShN = shadowLiftCap(sh, openRaw);
+      if (SEAM_DBG == 12u) { gDbgSh.z = dbgShN; }
     }
     // THE CLOUDS' SHADOW: one bilinear lookup in the per-frame cloud shadow
     // map (cloud.wgsl `shadow`). Applied to the direct term only, like every
@@ -16653,6 +16815,7 @@ fn fs(in : VSOut) -> FSOut {
   }
   var out : FSOut;
   out.color = vec4f(color, 1.0);
+  if (SEAM_DBG == 12u || SEAM_DBG == 13u) { gDbg = vec4f(gDbgSh, 1.0); }
   if (SEAM_DBG == 5u) { gDbg = vec4f(gDbgW0.x, gDbgW0.y * VOXEL_METERS / 50.0, gDbgW0.z, 1.0); }
   else if (SEAM_DBG == 6u) { gDbg = vec4f(gDbgW1.x, gDbgW1.y * 0.5, gDbgW1.z * 0.5, 1.0); }
   else if (SEAM_DBG == 7u) { gDbg = vec4f(gDbgW0.w, gDbgW1.w * 0.5, min(gDbgWPath / 30.0, 1.0), 1.0); }

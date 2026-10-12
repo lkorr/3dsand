@@ -28,6 +28,12 @@
 //                     empty-centre cell whose sub-samples are mostly leaf
 //                     reads leaf at levels 1-4; downsample and CPU patch match
 //                     the oracle exactly, the sieve (tree atlas) nearly.
+//   lod-seam          The near/far HANDOFF, per material class and sky: the
+//                     same pixels shaded near (render.lodHandoffDist) and far
+//                     (the handoff pulled in to 8 m), far - near luma per
+//                     class (leaf, bark, open ground, ground under a canopy)
+//                     under noon / afternoon / dusk / overcast, against
+//                     tolerances in tests/baseline.json. Draws.
 //
 // All run on the HARNESS map through worldmap::SetStructureOverride (the
 // harness refs dir is the refs gates' fixture), both restore the environment
@@ -46,12 +52,14 @@
 #include <unordered_map>
 #include <vector>
 
+#include "game/camera.h"
 #include "gpu/resources.h"
 #include "measure/perfsuite.h"
 #include "sim/biomes.h"
 #include "sim/materials.h"
 #include "sim/stream.h"
 #include "sim/treeatlas.h"
+#include "sim/weather.h"
 #include "sim/worldgen_run.h"
 #include "sim/worldmap.h"
 #include "test/selftest.h"
@@ -1089,6 +1097,64 @@ Status GateFarContain(Ctx& c, std::string& detail) {
   return why.empty() ? Status::Pass : Status::Fail;
 }
 
+// THE FOREST FIXTURE (far-cover, lod-seam): env-truth's synthetic one-biome
+// map, FOREST everywhere (flat authored ground, no sites, no pad), so the
+// window is sure to hold crowns whatever the harness map paints at its origin.
+// Install regenerates the window at origin (0,0,0); Restore puts the real
+// environment, the window origin and its worldgen back.
+struct ForestFixture {
+  worldmap::WorldMapData real;
+  bool Install(Ctx& c, const char* name, uint32_t contentHash, std::string& err) {
+    const std::string dir = AssetDir();
+    biomes::BiomeSet set;
+    TreeAtlas atlas;
+    std::string log;
+    real = worldmap::CurrentWorldMap();
+    int forest = -1;
+    if (biomes::LoadBiomeSet(dir, c.mats, set, log) &&
+        LoadTreeAtlas(dir + "/trees", c.mats, set, atlas, log))
+      for (const biomes::BiomeDef& b : set.biomes)
+        if (b.name == "forest") forest = b.index;
+    if (forest < 0 || !real.Loaded()) {
+      err = "no forest biome / tree atlas / world map to grow the fixture on: " + log;
+      return false;
+    }
+    worldmap::WorldMapData syn = real;
+    std::fill(syn.biome.begin(), syn.biome.end(), static_cast<uint8_t>(forest));
+    std::fill(syn.height.begin(), syn.height.end(), static_cast<int16_t>(syn.terrain.baseHeight));
+    syn.sites.clear();
+    syn.siteIndex.assign(syn.siteIndex.size(), 0);
+    syn.padX0 = syn.padZ0 = 0;
+    syn.padX1 = syn.padZ1 = -1;
+    syn.spawnX = syn.spawnZ = (int)kWorldN / 2;
+    syn.spawnAuthored = true;
+    syn.name = name;
+    syn.contentHash = contentHash;
+    std::vector<uint32_t> words;
+    if (!worldmap::PackWorldMap(set, syn, words, log)) {
+      err = "the forest map did not pack: " + log;
+      return false;
+    }
+    worldmap::SetCurrentWorldMap(syn);
+    c.ctx.WaitIdle();
+    c.sim.UploadEnvironment(c.ctx.device, c.ctx.queue, atlas, words);
+    c.stream.OnRegen();
+    c.world.SetWindowOrigin({0, 0, 0});
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    return true;
+  }
+  void Restore(Ctx& c, IVec3 savedOrigin) {
+    biomes::EnvironmentStamp stamp;
+    std::string rlog;
+    if (!ReloadEnvironment(c.ctx, c.sim, c.mats, stamp, rlog)) worldmap::SetCurrentWorldMap(real);
+    c.stream.OnRegen();
+    c.world.SetWindowOrigin(savedOrigin);
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+  }
+};
+
 // ---- far-cover -------------------------------------------------------------
 // THE COVER RULE (worldgen.wgsl farCoverPick / `farcover`, faredits.h
 // CoverPick; DESIGN.md "Far crowns keep their coverage"; ticket
@@ -1123,59 +1189,19 @@ Status GateFarCover(Ctx& c, std::string& detail) {
     return ok;
   };
   const IVec3 savedOrigin = c.world.WindowOrigin();
-  // THE GROUND: env-truth's synthetic one-biome map, FOREST everywhere (flat
-  // authored ground, no sites, no pad), so the window is sure to hold crowns
-  // whatever the harness map paints at its origin.
-  const std::string dir = AssetDir();
-  biomes::BiomeSet set;
-  TreeAtlas atlas;
-  std::string log;
-  const worldmap::WorldMapData real = worldmap::CurrentWorldMap();
-  int forest = -1;
-  if (biomes::LoadBiomeSet(dir, c.mats, set, log) &&
-      LoadTreeAtlas(dir + "/trees", c.mats, set, atlas, log))
-    for (const biomes::BiomeDef& b : set.biomes)
-      if (b.name == "forest") forest = b.index;
-  if (forest < 0 || !real.Loaded()) {
-    detail = "no forest biome / tree atlas / world map to grow the fixture on: " + log;
-    return Status::Fail;
-  }
+  ForestFixture forestMap;
   {
-    worldmap::WorldMapData syn = real;
-    std::fill(syn.biome.begin(), syn.biome.end(), static_cast<uint8_t>(forest));
-    std::fill(syn.height.begin(), syn.height.end(), static_cast<int16_t>(syn.terrain.baseHeight));
-    syn.sites.clear();
-    syn.siteIndex.assign(syn.siteIndex.size(), 0);
-    syn.padX0 = syn.padZ0 = 0;
-    syn.padX1 = syn.padZ1 = -1;
-    syn.spawnX = syn.spawnZ = (int)kWorldN / 2;
-    syn.spawnAuthored = true;
-    syn.name = "far-cover:forest";
-    syn.contentHash = 0xC0FE7u;
-    std::vector<uint32_t> words;
-    if (!worldmap::PackWorldMap(set, syn, words, log)) {
-      detail = "the forest map did not pack: " + log;
+    std::string err;
+    if (!forestMap.Install(c, "far-cover:forest", 0xC0FE7u, err)) {
+      detail = err;
       return Status::Fail;
     }
-    worldmap::SetCurrentWorldMap(syn);
-    c.ctx.WaitIdle();
-    c.sim.UploadEnvironment(c.ctx.device, c.ctx.queue, atlas, words);
   }
-  c.stream.OnRegen();
-  c.world.SetWindowOrigin({0, 0, 0});
-  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
-  c.ctx.WaitIdle();
   FarEdits& edits = c.stream.Edits();
   edits.Clear();
   auto restore = [&]() {
     edits.Clear();
-    biomes::EnvironmentStamp stamp;
-    std::string rlog;
-    if (!ReloadEnvironment(c.ctx, c.sim, c.mats, stamp, rlog)) worldmap::SetCurrentWorldMap(real);
-    c.stream.OnRegen();
-    c.world.SetWindowOrigin(savedOrigin);
-    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
-    c.ctx.WaitIdle();
+    forestMap.Restore(c, savedOrigin);
   };
   auto farSolid = [&](uint32_t m) {
     if (m == kMatAir || m >= c.mats.size()) return false;
@@ -1390,6 +1416,456 @@ Status GateFarCover(Ctx& c, std::string& detail) {
   return why.empty() ? Status::Pass : Status::Fail;
 }
 
+// ---- lod-seam ---------------------------------------------------------------
+// THE NEAR/FAR HANDOFF, MEASURED PER MATERIAL CLASS AND PER SKY (ticket
+// 2026-10-09_14-23-01: "a sphere around me inside which things render more
+// realistically", and the owner's note that it keeps coming back for new
+// materials, biomes and lighting). The instrument the earlier passes of that
+// ticket used by hand, made a gate:
+//
+//   THE SAME PIXELS, SHADED BOTH WAYS. The near arm draws with the shipped
+//   render.lodHandoffDist (20.5 m): every pixel in the band [farHandoff + 2,
+//   handoff - 1.5] m is a NEAR hit. The far arm draws the same camera with
+//   the handoff pulled in to lodSeam.farHandoffM (8 m), so the very same
+//   pixels are FAR hits -- the cascade's shade of the same voxels. Per-pixel
+//   far - near luma IS the seam, with no "different trees on each side"
+//   confound. (The far arm's band blend ends at farHandoff + 1.8 m, so the
+//   band measured is the far LAW, not the blend.)
+//
+//   PER CLASS, by the near hit's voxel (read back): leaf (farCover
+//   materials), bark (bark / wood), ground in the open, ground under a canopy
+//   (leaf or bark anywhere above it in the column), plant (micro). A pixel
+//   counts only where both arms hit and agree on the distance within
+//   lodSeam.depthAgreeM (silhouettes the coarser cells moved are not shading).
+//
+//   PER SKY: noon, afternoon (sun ~20 degrees), dusk (sun just under the
+//   horizon) and overcast noon -- the four lights the seam has been reported
+//   under.
+//
+// The verdict is far - near luma (0..255) per class and sky -- the MEDIAN for
+// leaf and bark, the MEAN for ground (blades included: the far field draws
+// grass as cover statistics, so only an area's mean is like for like) -- for
+// every class with at least lodSeam.minPx pixels, against lodSeam.maxAbsMedian
+// (lodSeam.maxAbsMedian_<class>, then lodSeam.max.<sky>.<class> override it).
+// Plants alone are reported, never judged. Leaf, bark and open ground at noon
+// must have pixels, or the fixture is vacuous. Frames: build/lodseam_<sky>_
+// {near,far}.bmp and the class mask build/lodseam_classes.bmp (view 0); every
+// value is recorded. A per-class R/G/B table follows the verdict: with
+// raymarch.wgsl's SEAM_DBG set (3: openness / lit / raw lambert, 12: the sun
+// shadow's stages) it is the attribution of whatever the verdict says.
+//
+// The scene is far-cover's forest fixture (a synthetic all-forest map at the
+// window origin), four headings from one clearing. The far arm costs one
+// raymarch compile the first time a tuning is seen (only the shaders that
+// read render.lodHandoffDist are rebuilt, and the SPIR-V cache keeps it).
+Status GateLodSeam(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const uint32_t W = c.width, H = c.height;
+  const float aspect = (float)W / (float)H;
+  const Tuning base = CurrentTuning();
+  const float halfExtentM = (float)kWorldN * kVoxelMeters * 0.5f;
+  const float nearHandoff = base.render.lodHandoffDist;
+  const float farHandoff = (float)BaselineNumber("lodSeam.farHandoffM", 8.0);
+  if (nearHandoff >= halfExtentM || farHandoff + 4.0f > nearHandoff) {
+    detail = Format("no handoff to measure: render.lodHandoffDist %.1f m (window half extent %.1f, "
+                    "far arm %.1f)", nearHandoff, halfExtentM, farHandoff);
+    return Status::Skip;
+  }
+  const float bandLo = farHandoff + 2.0f, bandHi = nearHandoff - 1.5f;
+  const uint32_t frames = (uint32_t)BaselineNumber("lodSeam.frames", 32);
+  const double agreeM = BaselineNumber("lodSeam.depthAgreeM", 0.3);
+  const size_t minPx = (size_t)BaselineNumber("lodSeam.minPx", 200);
+
+  const IVec3 savedOrigin = world.WindowOrigin();
+  ForestFixture forestMap;
+  {
+    std::string err;
+    if (!forestMap.Install(c, "lod-seam:forest", 0x10D5EA4u, err)) {
+      detail = err;
+      return Status::Fail;
+    }
+  }
+  bool farShaders = false;
+  struct Restore {
+    Ctx& c;
+    const Tuning& base;
+    ForestFixture& fx;
+    IVec3 origin;
+    bool& farShaders;
+    ~Restore() {
+      SetCurrentTuning(base);
+      if (farShaders) c.sim.ReloadShaders(c.ctx.device);
+      weather::SetOverride("");
+      weather::Snap();
+      fx.Restore(c, origin);
+    }
+  } restore{c, base, forestMap, savedOrigin, farShaders};
+
+  // ---- the classes, by material ---------------------------------------------
+  enum { kLeaf, kBark, kGroundOpen, kGroundCanopy, kPlant, kNCls };
+  static const char* kClsName[kNCls] = {"leaf", "bark", "ground_open", "ground_canopy", "plant"};
+  auto matClass = [&](uint32_t m) -> int {
+    if (m == kMatAir || m >= c.mats.size()) return -1;
+    const MaterialDef& d = c.mats[m];
+    if ((d.gpu.flags & kMatFlagMicro) != 0) return kPlant;
+    if (d.farCover) return kLeaf;
+    if (d.name.find("bark") != std::string::npos || d.name.find("wood") != std::string::npos)
+      return kBark;
+    if (d.gpu.klass == CLASS_SOLID || d.gpu.klass == CLASS_POWDER) return kGroundOpen;
+    return -1;
+  };
+  BoxRead box;
+  box.ctx = &ctx;
+  box.world = &world;
+  // Leaf or bark anywhere in the column above a ground cell (from 0.4 m up).
+  std::unordered_map<uint32_t, bool> canopyMemo;
+  auto underCanopy = [&](IVec3 g) {
+    const uint32_t key = ((uint32_t)g.x << 16) ^ (uint32_t)g.z;
+    auto it = canopyMemo.find(key);
+    if (it != canopyMemo.end()) return it->second;
+    bool cov = false;
+    for (int y = g.y + 4; y < (int)kWorldN && !cov; y++) {
+      const int k = matClass(box.Mat({g.x, y, g.z}));
+      cov = k == kLeaf || k == kBark;
+    }
+    canopyMemo.emplace(key, cov);
+    return cov;
+  };
+
+  // ---- the ground under the camera: a column open to the sky near the centre
+  IVec3 eyeCell{-1, -1, -1};
+  for (int ring = 0; ring <= 12 && eyeCell.x < 0; ring++)
+    for (int dz = -ring; dz <= ring && eyeCell.x < 0; dz++)
+      for (int dx = -ring; dx <= ring && eyeCell.x < 0; dx++) {
+        if (std::max(std::abs(dx), std::abs(dz)) != ring) continue;
+        const int x = (int)kWorldN / 2 + dx * 6, z = (int)kWorldN / 2 + dz * 6;
+        for (int y = (int)kWorldN - 1; y > 0; y--) {
+          const uint32_t m = box.Mat({x, y, z});
+          if (m == kMatAir) continue;
+          const int k = matClass(m);
+          if (k == kPlant) continue;
+          if (k == kGroundOpen) eyeCell = {x, y, z};
+          break;
+        }
+      }
+  if (eyeCell.x < 0) {
+    detail = "no ground open to the sky near the window centre";
+    return Status::Fail;
+  }
+  const Vec3 eye{(float)eyeCell.x + 0.5f, (float)eyeCell.y + 18.0f, (float)eyeCell.z + 0.5f};
+  const IVec3 eyeChunk{eyeCell.x >> 4, eyeCell.y >> 4, eyeCell.z >> 4};
+
+  // The openness grid is written by the tick's derived rows (the rolling
+  // refresh covers the window in kNumChunks / opennessChunksPerFrame ticks);
+  // the far cascade by a full refill.
+  {
+    uint32_t tick = 0;
+    support::TickCursor tc(c, tick, eyeChunk);
+    const int n = (int)(kNumChunks / (uint32_t)std::max(1, base.render.opennessChunksPerFrame)) + 8;
+    for (int i = 0; i < n; i++) tc();
+    ctx.WaitIdle();
+  }
+  DrainFullRefill(ctx, world, sim, eyeChunk);
+
+  // ---- the skies ----------------------------------------------------------------
+  struct Sky { const char* name; const char* preset; uint32_t tick; float sunY; };
+  const uint32_t dayTicks = TicksPerDayFromTuning(base);
+  auto findTick = [&](float targetY, bool below) {
+    // The first tick after noon whose sun is at/under targetY.
+    for (float f = 0.5f; f < 1.0f; f += 0.001f) {
+      const uint32_t tk = (uint32_t)(dayTicks * f);
+      const float y = SkyForTick(base, tk).sunDir[1];
+      if (below ? y < targetY : y <= targetY) return tk;
+    }
+    return (uint32_t)(dayTicks * 0.75f);
+  };
+  std::vector<Sky> skies = {
+      {"noon", "clear", (uint32_t)(dayTicks * 0.5f), 0.0f},
+      {"afternoon", "clear", findTick(0.34f, false), 0.0f},
+      {"dusk", "clear", findTick(-0.03f, true), 0.0f},
+      {"overcast", "overcast", (uint32_t)(dayTicks * 0.5f), 0.0f},
+  };
+  for (Sky& s : skies) s.sunY = SkyForTick(base, s.tick).sunDir[1];
+
+  // ---- one arm: `frames` frames of a view, the last read back -------------------
+  using U = rhi::BufferUsage;
+  rhi::Buffer shot = CreateBuffer(ctx.device, (uint64_t)W * H * 4, U::MapRead | U::CopyDst,
+                                  "lodSeamShot");
+  rhi::Buffer dshot = CreateBuffer(ctx.device, (uint64_t)W * H * 4, U::MapRead | U::CopyDst,
+                                   "lodSeamDepth");
+  auto render = [&](const Camera& cam, const Sky& sky, std::vector<uint8_t>& img,
+                    std::vector<float>& dep) -> bool {
+    Tuning t = CurrentTuning();
+    t.weather.autoCycle = false;
+    SetCurrentTuning(t);
+    weather::SetOverride(sky.preset);
+    weather::Snap();
+    auto copyOut = [&](const rhi::CommandEncoder& enc, const rhi::Texture& tex,
+                       const rhi::Buffer& into) {
+      rhi::TexelCopyTexture srcT{};
+      srcT.texture = tex;
+      rhi::TexelCopyBuffer dstB{};
+      dstB.buffer = into;
+      dstB.bytesPerRow = W * 4;
+      dstB.rowsPerImage = H;
+      enc.CopyTextureToBuffer(srcT, dstB, rhi::Extent3D{W, H, 1});
+    };
+    for (uint32_t f = 0; f < frames; f++) {
+      WriteRenderParams(ctx.queue, world, eye, cam, aspect, true, 0.0f, kFarFogDensity,
+                        (float)H, sky.tick);
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeShadowResolve(enc);
+      rhi::RenderPass rp = sim.BeginRenderPass(enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+      sim.DrawWorld(rp);
+      rp.End();
+      if (f + 1 == frames) {
+        copyOut(enc, c.offscreen, shot);
+        copyOut(enc, sim.DepthTexture(), dshot);
+      }
+      ctx.queue.Submit(enc.Finish());
+    }
+    ctx.WaitIdle();
+    img.assign((size_t)W * H * 4, 0);
+    dep.assign((size_t)W * H, 0.0f);
+    return rhi::ReadBufferBlocking(ctx.device, shot, 0, img.data(), img.size()) &&
+           rhi::ReadBufferBlocking(ctx.device, dshot, 0, dep.data(), dep.size() * 4);
+  };
+  auto luma = [](const std::vector<uint8_t>& img, size_t p) -> float {
+    return 0.299f * img[p * 4] + 0.587f * img[p * 4 + 1] + 0.114f * img[p * 4 + 2];
+  };
+  // Reversed-Z: depth = KNEAR / viewZ (common.wgsl, voxels); ray distance =
+  // viewZ / (ray . forward).
+  constexpr float kKnearVox = 0.4f;
+  const float th = std::tan(base.camera.fovY * 0.5f);
+  auto rayDir = [&](const Camera& cam, uint32_t x, uint32_t y, float ySign) {
+    const float nx = ((float)x + 0.5f) / (float)W * 2.0f - 1.0f;
+    const float ny = ySign * (1.0f - ((float)y + 0.5f) / (float)H * 2.0f);
+    const Vec3 f = cam.Forward(), r = cam.Right(), u = cam.Up();
+    Vec3 d{f.x + r.x * nx * th * aspect + u.x * ny * th, f.y + r.y * nx * th * aspect + u.y * ny * th,
+           f.z + r.z * nx * th * aspect + u.z * ny * th};
+    const float l = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+    d.x /= l; d.y /= l; d.z /= l;
+    return d;
+  };
+  auto rayT = [&](const Camera& cam, const Vec3& d, float depth) {
+    const Vec3 f = cam.Forward();
+    return kKnearVox / depth / std::max(1e-4f, d.x * f.x + d.y * f.y + d.z * f.z);
+  };
+
+  // ---- the views -------------------------------------------------------------------
+  const float yaws[] = {0.4f, 2.0f, 3.6f, 5.2f};
+  constexpr int kViews = 4;
+  // cls: the near hit's class; g: the ground class a plant pixel also
+  // counts toward (-1 for everything else).
+  struct Px { uint32_t p; int cls; float t; int g; };
+  std::vector<std::vector<Px>> px(kViews);
+  // near luma per view x sky x selected pixel
+  std::vector<std::vector<std::vector<float>>> nearL(kViews,
+                                                     std::vector<std::vector<float>>(skies.size()));
+  // ... and its RGB, for the per-channel table (with SEAM_DBG on in
+  // raymarch.wgsl the channels ARE the shading terms: the attribution).
+  std::vector<std::vector<std::vector<uint32_t>>> nearC(
+      kViews, std::vector<std::vector<uint32_t>>(skies.size()));
+  auto rgbAt = [](const std::vector<uint8_t>& img, size_t p) -> uint32_t {
+    return (uint32_t)img[p * 4] | ((uint32_t)img[p * 4 + 1] << 8) | ((uint32_t)img[p * 4 + 2] << 16);
+  };
+  size_t misses = 0, probed = 0;
+  float ySign = 1.0f;
+  for (int v = 0; v < kViews; v++) {
+    Camera cam;
+    cam.yaw = yaws[v];
+    cam.pitch = -0.08f;
+    for (size_t s = 0; s < skies.size(); s++) {
+      std::vector<uint8_t> img;
+      std::vector<float> dep;
+      if (!render(cam, skies[s], img, dep)) {
+        detail = "near readback failed";
+        return Status::Fail;
+      }
+      if (v == 0) WriteBmpFile(std::string("build/lodseam_") + skies[s].name + "_near.bmp", img, W, H);
+      if (s == 0) {
+        // The pixel's voxel: 0.3 voxel past the hit along the ray lands
+        // inside the cell the ray entered. The NDC y sign is the one whose
+        // probes find matter (decided on view 0).
+        auto classify = [&](float sign, bool keep, size_t& miss, size_t& n) {
+          for (uint32_t y = 0; y < H; y += keep ? 1 : 7)
+            for (uint32_t x = 0; x < W; x += keep ? 1 : 7) {
+              const size_t p = (size_t)y * W + x;
+              if (dep[p] <= 1e-7f) continue;
+              const Vec3 d = rayDir(cam, x, y, sign);
+              const float t = rayT(cam, d, dep[p]);
+              const float tm = t * kVoxelMeters;
+              if (tm < bandLo || tm > bandHi) continue;
+              const IVec3 cell{(int)std::floor(eye.x + d.x * (t + 0.3f)),
+                               (int)std::floor(eye.y + d.y * (t + 0.3f)),
+                               (int)std::floor(eye.z + d.z * (t + 0.3f))};
+              const uint32_t m = box.Mat(cell);
+              n++;
+              int k = matClass(m);
+              if (k < 0) { miss++; continue; }
+              if (!keep) continue;
+              if (k == kGroundOpen && underCanopy(cell)) k = kGroundCanopy;
+              const int g = k == kPlant ? (underCanopy(cell) ? kGroundCanopy : kGroundOpen) : -1;
+              px[v].push_back({(uint32_t)p, k, t, g});
+            }
+        };
+        if (v == 0) {
+          size_t mUp = 0, nUp = 0, mDn = 0, nDn = 0;
+          classify(1.0f, false, mUp, nUp);
+          classify(-1.0f, false, mDn, nDn);
+          ySign = (nDn && (double)mDn / nDn < (nUp ? (double)mUp / nUp : 1.0)) ? -1.0f : 1.0f;
+        }
+        classify(ySign, true, misses, probed);
+      }
+      nearL[v][s].resize(px[v].size());
+      nearC[v][s].resize(px[v].size());
+      for (size_t i = 0; i < px[v].size(); i++) {
+        nearL[v][s][i] = luma(img, px[v][i].p);
+        nearC[v][s][i] = rgbAt(img, px[v][i].p);
+      }
+      if (v == 0 && s == 0) {
+        // The class mask of view 0, for eyes: one colour per class.
+        static const uint8_t kCol[kNCls][3] = {
+            {40, 200, 40}, {150, 90, 30}, {230, 230, 120}, {60, 60, 220}, {230, 60, 230}};
+        std::vector<uint8_t> mask((size_t)W * H * 4, 0);
+        for (const Px& q : px[0])
+          for (int ch = 0; ch < 3; ch++) mask[q.p * 4 + ch] = kCol[q.cls][ch];
+        WriteBmpFile("build/lodseam_classes.bmp", mask, W, H);
+      }
+    }
+  }
+
+  // ---- the far arm: the same views, the handoff pulled in ------------------------
+  {
+    Tuning t = CurrentTuning();
+    t.render.lodHandoffDist = farHandoff;
+    SetCurrentTuning(t);
+    farShaders = true;
+    if (!sim.ReloadShaders(ctx.device)) {
+      detail = "far-arm shader reload failed";
+      return Status::Fail;
+    }
+  }
+  std::vector<std::vector<std::vector<float>>> diffs(skies.size(),
+                                                     std::vector<std::vector<float>>(kNCls));
+  std::vector<std::vector<double>> nearSum(skies.size(), std::vector<double>(kNCls, 0.0));
+  // Per sky x class: near R,G,B then far R,G,B (0..255).
+  std::vector<std::vector<std::vector<std::vector<float>>>> chans(
+      skies.size(), std::vector<std::vector<std::vector<float>>>(
+                        kNCls, std::vector<std::vector<float>>(6)));
+  size_t disagree = 0, farSky = 0;
+  for (int v = 0; v < kViews; v++) {
+    Camera cam;
+    cam.yaw = yaws[v];
+    cam.pitch = -0.08f;
+    for (size_t s = 0; s < skies.size(); s++) {
+      std::vector<uint8_t> img;
+      std::vector<float> dep;
+      if (!render(cam, skies[s], img, dep)) {
+        detail = "far readback failed";
+        return Status::Fail;
+      }
+      if (v == 0) WriteBmpFile(std::string("build/lodseam_") + skies[s].name + "_far.bmp", img, W, H);
+      for (size_t i = 0; i < px[v].size(); i++) {
+        const Px& q = px[v][i];
+        if (dep[q.p] <= 1e-7f) { if (s == 0) farSky++; continue; }
+        const uint32_t x = q.p % W, y = q.p / W;
+        const float tF = rayT(cam, rayDir(cam, x, y, ySign), dep[q.p]);
+        if (std::fabs(tF - q.t) * kVoxelMeters > agreeM) { if (s == 0) disagree++; continue; }
+        diffs[s][q.cls].push_back(luma(img, q.p) - nearL[v][s][i]);
+        nearSum[s][q.cls] += nearL[v][s][i];
+        if (q.g >= 0) {
+          diffs[s][q.g].push_back(luma(img, q.p) - nearL[v][s][i]);
+          nearSum[s][q.g] += nearL[v][s][i];
+        }
+        const uint32_t nc = nearC[v][s][i], fc = rgbAt(img, q.p);
+        for (int ch = 0; ch < 3; ch++) {
+          chans[s][q.cls][ch].push_back((float)((nc >> (8 * ch)) & 0xFFu));
+          chans[s][q.cls][3 + ch].push_back((float)((fc >> (8 * ch)) & 0xFFu));
+        }
+      }
+    }
+  }
+
+  // ---- verdict ----------------------------------------------------------------------
+  std::vector<std::string> why;
+  std::string table;
+  const double maxAbsAll = BaselineNumber("lodSeam.maxAbsMedian", 3.0);
+  for (size_t s = 0; s < skies.size(); s++) {
+    table += Format(" | %s (sun y %.2f):", skies[s].name, skies[s].sunY);
+    for (int k = 0; k < kNCls; k++) {
+      std::vector<float>& d = diffs[s][k];
+      if (d.empty()) { table += Format(" %s -", kClsName[k]); continue; }
+      // THE STATISTIC. Leaf and bark: the MEDIAN, per pixel -- a crown cell
+      // and the voxels under it are the same surface, and the median shrugs
+      // off the silhouettes the coarser cells move. Ground (blades included):
+      // the MEAN -- the far field draws grass as cover statistics (a tint in
+      // proportion to coverage, cards), not blade for blade, so only the
+      // area's mean brightness is like for like. Plants alone are reported,
+      // never judged: a near blade against whatever the far pixel drew there.
+      double mean = 0.0;
+      for (float x : d) mean += x;
+      mean /= (double)d.size();
+      std::nth_element(d.begin(), d.begin() + d.size() / 2, d.end());
+      const double medv = d[d.size() / 2];
+      const bool ground = k == kGroundOpen || k == kGroundCanopy;
+      const double med = ground ? mean : medv;
+      const double meanNear = nearSum[s][k] / (double)d.size();
+      table += Format(" %s %+.1f%s (n %zu, near %.0f)", kClsName[k], med, ground ? " mean" : "",
+                      d.size(), meanNear);
+      RecordObserved(Format("lodSeam.%s.%sObserved", skies[s].name, kClsName[k]).c_str(), med);
+      if (k == kPlant || d.size() < minPx) continue;
+      // The tolerance: lodSeam.max.<sky>.<class>, else lodSeam.maxAbsMedian_<class>,
+      // else lodSeam.maxAbsMedian. Per-sky rows pin a KNOWN residual (named
+      // in tests/baseline.json) so the gate still catches it growing.
+      const double limCls =
+          BaselineNumber(Format("lodSeam.maxAbsMedian_%s", kClsName[k]).c_str(), maxAbsAll);
+      const double lim =
+          BaselineNumber(Format("lodSeam.max.%s.%s", skies[s].name, kClsName[k]).c_str(), limCls);
+      if (std::fabs(med) > lim)
+        why.push_back(Format("%s %s %+.1f > %.1f", skies[s].name, kClsName[k], med, lim));
+    }
+  }
+  // THE CHANNEL TABLE: median R/G/B of each class, near then far. In a
+  // normal frame that is colour; with raymarch.wgsl's SEAM_DBG set it is the
+  // shading terms of that debug frame (2: albedo / shadow / AO; 3: openness /
+  // lit lambert / raw lambert; 4: colour / bounce / face), so one run names
+  // the term a class's seam is made of.
+  for (size_t s = 0; s < skies.size(); s++) {
+    std::string row = Format("lod-seam channels %-9s", skies[s].name);
+    for (int k = 0; k < kNCls; k++) {
+      if (chans[s][k][0].empty()) continue;
+      float m[6];
+      double mu[6];
+      for (int ch = 0; ch < 6; ch++) {
+        std::vector<float>& v = chans[s][k][ch];
+        mu[ch] = 0.0;
+        for (float x : v) mu[ch] += x;
+        mu[ch] /= (double)v.size();
+        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+        m[ch] = v[v.size() / 2];
+      }
+      row += Format(" | %s median near %.0f/%.0f/%.0f far %.0f/%.0f/%.0f, mean near "
+                    "%.1f/%.1f/%.1f far %.1f/%.1f/%.1f",
+                    kClsName[k], m[0], m[1], m[2], m[3], m[4], m[5], mu[0], mu[1], mu[2], mu[3],
+                    mu[4], mu[5]);
+    }
+    std::printf("%s\n", row.c_str());
+  }
+  for (int k : {kLeaf, kBark, kGroundOpen})
+    if (diffs[0][k].size() < minPx)
+      why.push_back(Format("vacuous: noon %s has %zu px (< %zu)", kClsName[k], diffs[0][k].size(), minPx));
+  detail = Format("band %.1f-%.1f m, handoff %.1f vs %.1f m, eye (%d,%d,%d), %zu px probed (%zu "
+                  "unclassified, y sign %+.0f), %zu far-sky, %zu depth-disagree; median far-near luma%s",
+                  bandLo, bandHi, nearHandoff, farHandoff, eyeCell.x, eyeCell.y, eyeCell.z, probed,
+                  misses, ySign, farSky, disagree, table.c_str());
+  for (const std::string& w : why) detail += " | FAIL: " + w;
+  std::printf("lod-seam: %s (%s)\n", why.empty() ? "PASS" : "FAIL", detail.c_str());
+  return why.empty() ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& StructureGates() {
@@ -1399,6 +1875,8 @@ const std::vector<Gate>& StructureGates() {
       {"structure-door", "world", {}, false, GateStructureDoor, /*needsRender=*/false},
       {"far-contain", "render", {}, false, GateFarContain, /*needsRender=*/false},
       {"far-cover", "render", {}, false, GateFarCover, /*needsRender=*/false},
+      // Draws: the same pixels near and far, four skies (ticket 2026-10-09_14-23-01).
+      {"lod-seam", "render", {}, false, GateLodSeam, /*needsRender=*/true},
   };
   return g;
 }

@@ -732,6 +732,11 @@ const char* const kOrder[] = {
     // The far cover rule on a procgen crown at the harness origin: regenerates
     // the window there and restores the origin it found, like far-contain.
     "far-cover",
+    // The near/far handoff, the same pixels shaded both ways under four
+    // skies on far-cover's forest fixture; same exit contract (environment
+    // restored, window regenerated at the origin it found, tuning + shaders
+    // + weather pin restored).
+    "lod-seam",
     // P5 editor: editor-commands is CPU-only (scratch refs + a _gate asset);
     // editor-struct-edit installs a turned house like structure-reload and
     // keeps its exit contract (override cleared, window regenerated).

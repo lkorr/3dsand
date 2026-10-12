@@ -16971,6 +16971,74 @@ where you hear from either (§12b, "The ears are on the character").
     `lodShadowLift` raises to ~0.33, which happens to match. The sea's
     shadeWater / shadeFarWater seam is untouched by this (closed separately,
     next).
+  **The handoff, measured per class and sky: `--gate lod-seam` (2026-10-12,
+  ticket 2026-10-09_14-23-01).** The same-pixel experiment above, made a
+  gate so a seam that comes back for a new material, biome or light is a red
+  line rather than an owner ticket. On far-cover's forest fixture (a
+  synthetic all-forest map at the window origin, four headings from a
+  clearing), each sky is drawn twice: the shipped handoff (near) and the
+  handoff pulled in to `lodSeam.farHandoffM` 8 m (far: only the shaders that
+  read `render.lodHandoffDist` recompile), and far - near luma of the pixels
+  at 10-19 m is binned by the NEAR hit's voxel (read back): leaf (`farCover`
+  materials), bark (bark/wood), ground in the open, ground under a canopy
+  (leaf or bark anywhere above it in the column), plants (micro; folded into
+  their ground class, reported alone). Leaf and bark are judged by the
+  MEDIAN, ground by the MEAN (the far field draws grass as cover
+  statistics, so only an area mean is like for like), against
+  `tests/baseline.json` `lodSeam.*`. Skies: noon, afternoon (sun ~20
+  degrees), dusk (just under the horizon), overcast noon. A per-class R/G/B
+  table follows; with `SEAM_DBG` 3 / 12 / 13 set it is the attribution
+  (openness / lit / raw lambert; the sun shadow's raw / lifted / capped
+  stages; a far shadow patch's validity and value). Frames and the class
+  mask are written to `build/lodseam_*.bmp`.
+  - **What it found** (before, the shipped code): leaf noon +4.1, bark +8.8;
+    ground +28 (open) / +41 (under a canopy) at noon and afternoon, +11 / +13
+    at dusk, +37 / +41 overcast. Three causes, attributed with the table:
+  - **The far ground's openness** was the closed form (an up face sees all
+    the sky) everywhere: under crowns and in a clearing ringed by them, where
+    the near grid's fan lands on leaves. The heightfield and its cards now
+    take farOpenness x the cascade's UP fan (`farGroundOver` + `farSkyFan`),
+    behind a chunk-word prefilter over the fan's footprint (open ground pays
+    up to ten shared `farOcc` words). The up ray counts only cells a cell over
+    the column's heightfield top.
+  - **The far fan** (features and ground, `farFanRay`) reached 6.4 m and
+    sampled every 12 fine voxels past 16, stepping through crown lobes and
+    between trunks; it now marches EVERY cell -- the hit's level to 1.6 m,
+    then the level two coarser -- to `render.opennessReach` (the near walk's
+    12 m), with the near walk's weights (1/3, 1/6) and the level's sky
+    ceiling as the early-out. Tried and taken out (no change in the gate):
+    the near walk's endpoint up-march and its re-aimed down-diagonal.
+  - **The far shadow under a crown's edge was lit.** `farShadowCover`
+    estimates how much of the sun disc ONE blocker covers from where the ray
+    crossed it, and the march stopped there: a ray clipping the corner of the
+    first leaf cell came back ~lit however much crown stood behind it, and
+    the shadow cache's far patches (patch centres, one ray) hit that case
+    systematically -- `SEAM_DBG` 13: patches VALID at 0.96 where the per-pixel
+    march and the near cache read ~0.4. Partial covers now accumulate as
+    independent occluders, 1 - prod(1 - c), to 4 blockers or 5 % of the disc
+    (`farShadowTC` in shadow_resolve.wgsl; the fragment shader's
+    `farShadowMarch` carries it only with `FAR_SHADOW_CACHE` off, because
+    there it would serve only the near continuation past 999 m and cost fs
+    40 registers, 128 -> 168, the occupancy cliff).
+  - **Measured** after (same fixture, same boot type): leaf noon -2.2,
+    afternoon -2.2, dusk -1.6, overcast -1.6; bark -1.6 / -1.9 / -1.1 /
+    -1.0; ground open +16.2 / +10.1 / +3.0 / +24.8; ground under a canopy
+    +14.8 / +6.2 / -0.5 / +17.0 (noon / afternoon / dusk / overcast). Dusk is
+    closed (the ticket's "grass under canopy +12..16 at dusk"). fs back at
+    128 registers. `--render-budget` (exclusive, `--verify` boots, single
+    samples, before -> after): noon 5.62 -> 6.88 ms, seamveg 9.28 -> 9.53,
+    cascade 2.93 -> 2.93; the noon number swung 5.6-9.9 between boots of the
+    same tree, so read it as "up to ~1 ms on the overlook, nothing on the
+    cascade camera".
+  - **Still open, pinned as known residuals** (`lodSeam.max.<sky>.<class>`,
+    measured + ~2): sunlit and overcast ground stays +10..+25 brighter far.
+    The table says the far OPENNESS of open ground is still ~1.3x the near
+    grid's (and it loosens `shadowLiftCap` with it); the near walk's 40 cm
+    block DDA is more conservative than the far point samples on rough
+    ground. The overcast arm also shows a direct-light (cloud) factor that
+    differs between the two arms (near ~0.09, far ~0.24 of the clear value)
+    that is not attributed yet -- a gate-instrument suspect (the gate draws
+    no cloud passes of its own) as much as a shading one.
   **The far water IS shadeWater (2026-10-10).** The near and far water
   shades had been written twice and agreed by calibration. They now share
   the surface law term for term: `waterWaveNormal` (macro slope + Gerstner
