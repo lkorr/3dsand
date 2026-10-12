@@ -429,7 +429,7 @@
   "source": {"resolvedHash":862544023},
   "entrance": {"piece":"p0","socket":"surface","dir":[0,0,-1],"dungeonPos":[0,0,0]},
   "bounds": {"min":[-578,-91,-40],"max":[628,116,679]},
-  "limits": {"primsPerCell":40,"instancesPerCell":5},
+  "limits": {"primsPerCell":48,"instancesPerCell":5},
   "usedMaterials": ["candle_flame","chalk_rock","cinder","cloth","cobble","crystal","crystal_spire","dirt","fern","flagstone","glowcap","glowcap_giant","glowcap_gill","gold","gravel","iron","ivy","limestone","moss_hang","mushroom_stem","old_moss","packed_gravel","plank","quartzite","tallow","timber","water","wet_moss"],
   "pieces": [
     {"id":"p0","kit":"ruins","type":"ruin_entrance","surface":true,"flooded":false,"bounds":{"min":[-56,-66,-41],"max":[55,90,125]},"prims":78},

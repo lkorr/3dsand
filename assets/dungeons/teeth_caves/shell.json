@@ -528,7 +528,7 @@
   "source": {"resolvedHash":3283340949},
   "entrance": {"piece":"p0","socket":"surface","dir":[0,0,-1],"dungeonPos":[0,0,0]},
   "bounds": {"min":[-1756,-383,-85],"max":[257,352,944]},
-  "limits": {"primsPerCell":28,"instancesPerCell":7},
+  "limits": {"primsPerCell":36,"instancesPerCell":7},
   "usedMaterials": ["ash","bone","brass","candle_flame","chalk_rock","charred_wood","cloth","cobble","crystal","crystal_spire","dirt","fern","gem_arcane","glowcap","glowcap_cluster","glowcap_giant","glowcap_gill","gravel","iron","kelp","leather","limestone","mushroom_stem","plank","quartzite","sand","shore_mud","timber","vine_hang","water","wet_moss","wood"],
   "pieces": [
     {"id":"p0","kit":"caves","type":"mouth","surface":true,"flooded":false,"bounds":{"min":[-92,-58,-85],"max":[84,91,144]},"prims":7},

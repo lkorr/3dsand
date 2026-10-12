@@ -575,19 +575,63 @@ export function shellPrimBounds(o) {
   const pad = (o.noise ? o.noise.amp : 0) + (o.blend || 0) + (o.skin || 0);
   return {min: mn.map(v => v - pad), max: mx.map(v => v + pad)};
 }
-/** Worst count of boxes touching one 64^3 cell, over two grid alignments
- *  (the map placement is unknown here). -> {max, at}. */
-function perCellMax(boxes) {
+/** The engine's index boxes of a prim (src/sim/dungeon.cpp InflationOf +
+ *  LocalBoxes, mirrored so the per-cell limit is checked as the packer counts
+ *  it): inflation 3 + 2 noise amp (+ blend + 2 for a carve, + the ore / moss
+ *  band of its scatter), times the axis ratio of an elongated ellipsoid /
+ *  cylinder / vault; capsules and tubes get one box per segment. */
+export function shellIndexBoxes(o) {
+  let e = 3 + (o.noise && o.noise.amp ? 2 * o.noise.amp : 0);
+  if (o.op === 'carve') e += (o.blend || 0) + 2;
+  let band = 0;
+  for (const c of o.scatter || []) {
+    if (c.kind === 'ore_vein') band = Math.max(band, c.size[1] + 1);
+    if (c.kind === 'moss' || c.kind === 'puddle') band = Math.max(band, 3);
+  }
+  e += band;
+  if (o.shape === 'ellipsoid' || o.shape === 'cylinder' || o.shape === 'vault') {
+    const AX = {x: 0, y: 1, z: 2};
+    let lo = Infinity, hi = 0;
+    for (let k = 0; k < 3; k++) {
+      if (o.shape === 'cylinder' && AX[o.axis] === k) continue;
+      if (o.shape === 'vault' && (AX[o.axis] === k || k === 1)) continue;
+      const h = o.max[k] - o.min[k] + 1;
+      lo = Math.min(lo, h); hi = Math.max(hi, h);
+    }
+    if (o.shape === 'vault') { lo = Math.min(lo, Math.max(o.rise, 1)); hi = Math.max(hi, Math.max(o.rise, 1)); }
+    if (lo !== Infinity && lo > 0) e = Math.min(256, e * Math.floor((hi + lo - 1) / lo));
+  }
+  if (o.shape === 'capsule' || o.shape === 'tube') {
+    const pts = o.shape === 'capsule' ? [o.a, o.b] : o.pts, rr = o.shape === 'capsule' ? [o.r, o.r] : o.r;
+    const out = [];
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const r = Math.max(rr[i], rr[i + 1]) + e;
+      out.push({min: [0, 1, 2].map(k => Math.min(pts[i][k], pts[i + 1][k]) - r), max: [0, 1, 2].map(k => Math.max(pts[i][k], pts[i + 1][k]) + r)});
+    }
+    return out;
+  }
+  const mn = o.min.map(v => v - e), mx = o.max.map(v => v + e);
+  if (o.shape === 'ramp') mn[1] = o.min[1] - (o.below || 0) - e;
+  return [{min: mn, max: mx}];
+}
+/** Worst count of items (each a list of boxes, counted once a cell) touching
+ *  one 64^3 cell, over four grid alignments (the map placement is unknown
+ *  here). -> {max, at}. */
+function perCellMax(items) {
   let best = {max: 0, at: null};
-  for (const off of [0, 32]) {
+  for (const off of [0, 16, 32, 48]) {
     const cnt = new Map();
-    for (const b of boxes) {
-      const lo = b.min.map(v => Math.floor((v + off) / 64)), hi = b.max.map(v => Math.floor((v + off) / 64));
-      if ((hi[0] - lo[0] + 1) * (hi[1] - lo[1] + 1) * (hi[2] - lo[2] + 1) > 4096) continue;
-      for (let x = lo[0]; x <= hi[0]; x++) for (let y = lo[1]; y <= hi[1]; y++) for (let z = lo[2]; z <= hi[2]; z++) {
-        const k = x + ',' + y + ',' + z, n = (cnt.get(k) || 0) + 1;
+    for (const it of items) {
+      const mine = new Set();
+      for (const b of (Array.isArray(it) ? it : [it])) {
+        const lo = b.min.map(v => Math.floor((v + off) / 64)), hi = b.max.map(v => Math.floor((v + off) / 64));
+        if ((hi[0] - lo[0] + 1) * (hi[1] - lo[1] + 1) * (hi[2] - lo[2] + 1) > 4096) continue;
+        for (let x = lo[0]; x <= hi[0]; x++) for (let y = lo[1]; y <= hi[1]; y++) for (let z = lo[2]; z <= hi[2]; z++) mine.add(x + ',' + y + ',' + z);
+      }
+      for (const k of mine) {
+        const n = (cnt.get(k) || 0) + 1;
         cnt.set(k, n);
-        if (n > best.max) best = {max: n, at: [x * 64 - off, y * 64 - off, z * 64 - off]};
+        if (n > best.max) { const c = k.split(',').map(Number); best = {max: n, at: [c[0] * 64 - off, c[1] * 64 - off, c[2] * 64 - off]}; }
       }
     }
   }
@@ -729,7 +773,7 @@ export function compile(dIn, opts) {
   const pb = prims.map(shellPrimBounds);
   const ib = instances.map(ins => { const t = templates[ins.template], q = quarter(ins.yaw), sx = q & 1 ? t.size[2] : t.size[0], sz = q & 1 ? t.size[0] : t.size[2];
     return {min: ins.pos.slice(), max: [ins.pos[0] + sx - 1, ins.pos[1] + t.size[1] - 1, ins.pos[2] + sz - 1]}; });
-  const pc1 = perCellMax(pb), pc2 = perCellMax(ib);
+  const pc1 = perCellMax(prims.map(shellIndexBoxes)), pc2 = perCellMax(ib);
   if (pc1.max > LIMIT_PRIMS_PER_CELL) errors.push({piece: null, msg: pc1.max + ' prims touch one 64^3 cell near ' + pc1.at.join(',') + ' (the engine takes ' + LIMIT_PRIMS_PER_CELL + ')'});
   if (pc2.max > LIMIT_INSTANCES_PER_CELL) errors.push({piece: null, msg: pc2.max + ' prop instances touch one 64^3 cell near ' + pc2.at.join(',') + ' (the engine takes ' + LIMIT_INSTANCES_PER_CELL + ')'});
   pb.forEach((b, i) => { for (let k = 0; k < 3; k++) if (b.max[k] - b.min[k] + 1 > 2048 + 2 * 64) { errors.push({piece: prims[i].piece, msg: 'prim ' + i + ' is over 2048 cells on an axis'}); break; } });

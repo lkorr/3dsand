@@ -446,7 +446,7 @@
   "source": {"resolvedHash":3569827615,"extends":"teeth_caves","chain":["teeth_caves"]},
   "entrance": {"piece":"p0","socket":"surface","dir":[0,0,-1],"dungeonPos":[0,0,0]},
   "bounds": {"min":[-1756,-383,-85],"max":[257,352,944]},
-  "limits": {"primsPerCell":28,"instancesPerCell":5},
+  "limits": {"primsPerCell":36,"instancesPerCell":5},
   "usedMaterials": ["ash","bone","brass","candle_flame","charred_wood","cloth","cobble","crystal","dirt","gem_arcane","glacier_ice","glowcap","glowcap_cluster","glowcap_giant","glowcap_gill","heath_shrub","ice","iron","kelp","leather","mushroom_stem","plank","quartzite","rime_crystal","snow","timber","water","wet_moss","wood"],
   "pieces": [
     {"id":"p0","kit":"caves","type":"mouth","surface":true,"flooded":false,"bounds":{"min":[-92,-58,-85],"max":[84,91,144]},"prims":7},

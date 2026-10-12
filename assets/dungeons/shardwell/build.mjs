@@ -196,8 +196,8 @@ if (arm6.dir[2] !== 1 || east9.dir[0] !== 1) throw new Error('the loop assumes p
 const northLen = (east9.pos[2] - wzFoot.pos[2]) - arm6.pos[2];
 const p13 = at(p6, 'left', T('mines', 'drift', 'abandoned', {
   width: 2.6, height: 2.4, length: northLen / 10, ceiling: 0.3,
-  setSpacing: 1.5, beam: 0.25, sag: 0.85, broken: 0.55, lagging: 0.15, overbreak: 1.1, overbreakScale: 1.2, rails: true, gauge: 0.6, sleeperSpacing: 0.9,
-  niches: 0.3, nicheDepth: 1.1, spoil: 0.75, wander: 1.4, wanderWave: 13, jitter: 1, heightVar: 0.2, vein: 0.4,
+  setSpacing: 1.5, beam: 0.25, sag: 0.85, broken: 0.55, lagging: 0.15, overbreak: 1.1, overbreakScale: 1.2, rails: false, gauge: 0.6, sleeperSpacing: 1.2,
+  niches: 0.3, nicheDepth: 1.1, spoil: 0.75, wander: 1.4, wanderWave: 13, jitter: 0.7, heightVar: 0.2, vein: 0.4,
   decay: 0.8, moisture: 0.5, deco: 0.4, wallRough: 0.7, wallScale: 1.0, floorUneven: 0.5, asym: 0.8,
   lightCount: 0, lightType: 'none', blend: 6}));
 const p14 = at(p13, 'out', T('mines', 'shaft', 'level_winze', WZ));

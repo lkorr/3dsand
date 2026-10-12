@@ -867,7 +867,7 @@
   "source": {"resolvedHash":509820872},
   "entrance": {"piece":"p0","socket":"surface","dir":[0,0,-1],"dungeonPos":[0,0,0]},
   "bounds": {"min":[-911,-284,-313],"max":[210,158,392]},
-  "limits": {"primsPerCell":34,"instancesPerCell":10},
+  "limits": {"primsPerCell":43,"instancesPerCell":18},
   "usedMaterials": ["basalt","bone","candle_flame","charred_wood","cinder","cloth","cobble","crystal","door_wood","flagstone","gold","gravel","heather","iron","limestone","old_moss","quartzite","tallow","timber","water"],
   "pieces": [
     {"id":"p0","kit":"ruins","type":"ruin_entrance","surface":true,"flooded":false,"bounds":{"min":[-52,-126,-36],"max":[51,158,248]},"prims":53},

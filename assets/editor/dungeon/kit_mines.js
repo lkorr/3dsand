@@ -178,9 +178,12 @@ function driftBody(b, P, z0, z1, W, H, C, key, opt) {
       const shw = Math.round(hw * g.w), sH = Math.round(H * g.h);
       g.hw = shw; g.H = sH;
       const ya = smooth ? Math.min(g.y0, g.y1) : g.y, yb = smooth ? Math.max(g.y0, g.y1) : g.y;
-      const r = b.room('box', {min: [g.x - shw, ya, g.z0], max: [g.x + shw, yb + sH, g.z1]});
+      // (no per-segment vault: a short, wide vault's index bounds are inflated
+      // by its axis ratio, and a chain of them overruns the engine's 64 prims
+      // a cell. The back is the box raised by half the rise; the overbreak
+      // breaks it.)
+      const r = b.room('box', {min: [g.x - shw, ya, g.z0], max: [g.x + shw, yb + sH + (C >= 2 ? Math.round(C / 2) : 0), g.z1]});
       if (k === 0) room = r;
-      if (C >= 2) b.room('vault', {min: [g.x - shw + 2, yb + sH - 1, g.z0], max: [g.x + shw - 2, yb + sH + C, g.z1], axis: 'z', rise: C + 1});
       overbreak(b, P, g.x - shw, g.x + shw, sH + C + (yb - ya), g.z0, g.z1, ya, k === 0, k === segs.length - 1);
       if (smooth && g.y1 !== g.y0) b.flight('fill', g.y1 > g.y0 ? '+z' : '-z', g.x - shw, g.x + shw, g.z0, g.z1, ya, yb - ya, 1, {below: 2}, {mat: 'floor', layer: 2, noise: null});
       else b.floor(g.x - shw, g.z0, g.x + shw, g.z1, g.y);
