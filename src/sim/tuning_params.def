@@ -1962,6 +1962,11 @@ TP_F(gore, contactMinTravel, NO_WGSL, 2.0f, 0.0f, 100.0f)
 // mistake anyone means; zero is a legitimate "blood is cosmetic again".
 TP_F(gore, bleedHpPerVoxel, NO_WGSL, 0.6f, 0.0f, 5.0f)
 TP_B(gore, stumpBleedsOpen, NO_WGSL, true)
+// Multipliers on a rate, so negative is meaningless; the stump gain
+// saturates at 1 / bleedVoxelGain (one clump per drip period), and the
+// underwater rate divides the drip period, so 1 is "no change".
+TP_F(gore, stumpBleedGain, NO_WGSL, 2.0f, 0.0f, 8.0f)
+TP_F(gore, underwaterBleedRate, NO_WGSL, 2.0f, 1.0f, 4.0f)
 // + a hand-written rule in LoadTuning
 TP_F(gore, burnCapMidFraction, NO_WGSL, 0.40f, 0.05f, 0.95f)
 TP_F(gore, burnCapMidHealth, NO_WGSL, 0.333f, 0.0f, 1.0f)

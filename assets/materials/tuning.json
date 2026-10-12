@@ -318,6 +318,8 @@
     "woundImpactSeverScale": 0,
     "bleedHpPerVoxel": 0.600000024,
     "stumpBleedsOpen": true,
+    "stumpBleedGain": 2,
+    "underwaterBleedRate": 2,
     "burnCapMidFraction": 0.400000006,
     "burnCapMidHealth": 0.333000004,
     "burnDeathFraction": 0.699999988,

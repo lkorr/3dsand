@@ -2749,8 +2749,12 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   // the two materials, not of who is doing the staining.
   {
     std::vector<uint8_t> cls(mats.size(), 0u);
+    washerClass_.assign(mats.size(), 3u);
     for (size_t mi = 0; mi < mats.size(); mi++) {
-      if (mats[mi].gpu.stainPack & kStainPackWashesBit) cls[mi] |= kBodyCoatWashes;
+      if (mats[mi].gpu.stainPack & kStainPackWashesBit) {
+        cls[mi] |= kBodyCoatWashes;
+        washerClass_[mi] = 2u;  // Mob::WaterAt
+      }
       if (matCorrodes_[mi]) cls[mi] |= kBodyCoatCorrodes;
     }
     SetBodyCoatClasses(std::move(cls));
@@ -10736,6 +10740,25 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       continue;
     }
 
+    // ---- A WOUND UNDER WATER BLEEDS FASTER (gore.underwaterBleedRate) ----
+    // 2026-10-11, the owner bitten by a shark: a stump's drip under water
+    // dissolves into the lake as a thin cloud, and at one voxel every couple
+    // of drip periods it read as "the bleeding stopped". Under water the drip
+    // period is divided by the rate, so the stump's top-up and the drip run
+    // that much more often and the wound trails a stream. It is real blood
+    // (DrainBlood charges every drop), so a swimmer bleeds out faster too; a
+    // finite wound pays out the same total, sooner. The wound cell is asked,
+    // not the body: a stump held above the surface bleeds at the dry rate.
+    uint32_t dripPeriod = (uint32_t)std::max(1, gore.bleedDripTicks);
+    if (gore.underwaterBleedRate > 1.0f &&
+        (limb.bleedBudget >= 1.0f || limb.stumpOpen)) {
+      const Vec3 wq = limb.body ? limb.xf.pos + Rotate(lq, limb.woundLocal)
+                                : bodyFrame(limb.anchorRoot);
+      if (WaterAt(world, wq))
+        dripPeriod = std::max(
+            1u, (uint32_t)std::lround((float)dripPeriod / gore.underwaterBleedRate));
+    }
+
     // ---- THE STUMP THAT NEVER CLOSES (gore.stumpBleedsOpen) ----
     // A lost limb is a clock. Top the wound back up to one clump so the drip
     // below always has something to spend, for as long as the creature is
@@ -10749,14 +10772,21 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // a whole one every tick, so halving the gain halves what an amputation
     // puts on the floor. At gain 1 it is exactly the old refill (a drip
     // spends one clump per period and this puts one back).
+    //
+    // ...TIMES gore.stumpBleedGain (2026-10-11): an open stump is an artery,
+    // not a cut, and at the halved volume dial it dripped one voxel every
+    // other period. The product saturates at one clump per period -- the
+    // budget holds one clump and the drip spends one -- so past
+    // 1 / bleedVoxelGain this knob does nothing more.
     if (limb.stumpOpen && alive_ && gore.stumpBleedsOpen &&
-        tick % (uint32_t)std::max(1, gore.bleedDripTicks) == 0) {
+        tick % dripPeriod == 0) {
       const float clumpVox =
           (float)BleedClumpVoxels(std::max(0, gore.bleedClumpRadius));
       if (limb.bleedBudget < clumpVox)
         limb.bleedBudget =
             std::min(clumpVox, limb.bleedBudget +
                                    clumpVox * std::max(0.0f, gore.bleedVoxelGain) *
+                                       std::max(0.0f, gore.stumpBleedGain) *
                                        limb.woundScale);
     }
 
@@ -10805,8 +10835,8 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // offers every period, not just powers of two; the divisor is clamped
     // >= 1 at load so this cannot divide by zero. (Tested before the op
     // budget since 2026-10-04 -- nothing between the two had a side effect --
-    // so a wound that WANTS to drip can be counted below.)
-    const uint32_t dripPeriod = (uint32_t)std::max(1, gore.bleedDripTicks);
+    // so a wound that WANTS to drip can be counted below.) `dripPeriod` is
+    // this wound's, shortened above when it is under water.
     if (tick % dripPeriod != 0) continue;
     // ---- A SHARED BUDGET IS TAKEN IN TURNS (2026-10-04, the 64 cap) ------
     // bleedOpsPerTick is ONE pot for every limb of every creature, spent in
@@ -32304,6 +32334,20 @@ void MobSystem::PushBodyBurst(Vec3 atVoxel, uint32_t mat, int radius,
 float Mob::BleedWeightOf(uint32_t mat) const {
   if (sys_ == nullptr || mat == 0 || mat >= sys_->matBleed_.size()) return 1.0f;
   return sys_->matBleed_[mat];
+}
+
+bool Mob::WaterAt(const World& world, Vec3 w) const {
+  if (sys_ == nullptr || sys_->washerClass_.empty()) return false;
+  const std::vector<uint32_t>& cls = sys_->washerClass_;
+  const IVec3 c{ifloor(w.x), ifloor(w.y), ifloor(w.z)};
+  if (!world.CellInWindow(c)) return false;
+  const CellKind k = world.KindAt(c, cls);
+  if (k != CellKind::Unknown) return k == CellKind::Liquid;
+  const CachedChunk* cc = world.Cached({c.x >> 4, c.y >> 4, c.z >> 4});
+  if (cc == nullptr || cc->voxels.size() != kChunkVol) return false;
+  const uint32_t li = ((uint32_t)(c.z & 15) * kChunk + (uint32_t)(c.y & 15)) * kChunk +
+                      (uint32_t)(c.x & 15);
+  return World::KindOfWord(cc->voxels[li], cls) == CellKind::Liquid;
 }
 
 // ---- WHAT A WOUND LEAKS (mob.h, materials.h bleedFluid) ---------------------

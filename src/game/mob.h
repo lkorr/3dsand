@@ -2845,6 +2845,12 @@ class Mob {
   float MaterialHardness(uint32_t mat) const;
   // materials.json `bleed` of `mat`: how much a wound in it bleeds, 1 = flesh.
   float BleedWeightOf(uint32_t mat) const;
+  // Is the world cell at `w` a WASHER liquid (materials.json `washes`: water,
+  // not a puddle of blood or oil)? The wound-under-water test BleedTick reads
+  // for gore.underwaterBleedRate. The 3x3x3 mirror first, then the fetch
+  // cache WITHOUT asking for a chunk (a wound is not worth a fetch request);
+  // anything unknown is dry.
+  bool WaterAt(const World& world, Vec3 w) const;
   // ---- A BODY OF MATTER THAT IS NOT FLESH (materials.h shell / struck /
   // burst; the robot rows, DESIGN.md "Robots are matter") ------------------
   // True when `mat` is authored `"shell": true`: a blow carves it on this
@@ -8853,6 +8859,10 @@ class MobSystem {
   std::vector<float> coatRestore_, coatRestoreRate_;
   std::vector<float> matBareBlood_;   // MaterialDef::bareBlood
   std::vector<float> matBleed_;       // MaterialDef::bleed (wound bleed weight)
+  // A KindOfWord class table in which only WASHER liquids (water) are class 2
+  // and everything else is gas: Mob::WaterAt's "is this water" through the
+  // world's own mirror/cache readers.
+  std::vector<uint32_t> washerClass_;
   std::vector<uint32_t> matFluid_;    // MaterialDef::bleedFluid (0 = no opinion)
   std::vector<int32_t> coatContact_;  // MaterialDef::coatContact (-1 = stain chance)
   // (MobSystem::CoatBeneath -- "a corrosive coat displaces one that is not;

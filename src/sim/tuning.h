@@ -1909,6 +1909,18 @@ struct Tuning {
     // because the process is bounded by the creature's own hp — the drip ends
     // at death, and a corpse does not bleed. Off restores the finite stump.
     bool stumpBleedsOpen = TPD(gore, stumpBleedsOpen);
+    // HOW HARD AN OPEN STUMP BLEEDS, as a multiplier on its top-up (which is
+    // already scaled by bleedVoxelGain and the wound's material weight). An
+    // amputation is an artery: at the halved volume dial the stump dripped
+    // one voxel every other period and under water that read as stopped.
+    // Saturates at one clump per drip period (product with bleedVoxelGain
+    // >= 1); at the defaults that is 7.5 voxels/s.
+    float stumpBleedGain = TPD(gore, stumpBleedGain);
+    // A WOUND UNDER WATER BLEEDS this many times faster: the drip period is
+    // divided by it while the wound's cell is water (Mob::WaterAt), so the
+    // blood trails a stream instead of a thin cloud. Real blood -- it costs hp
+    // at bleedHpPerVoxel like any drop. 1 = no difference.
+    float underwaterBleedRate = TPD(gore, underwaterBleedRate);
 
     // ========================================================================
     // G. BURNS CAP HEALTH — the more of the body is burnt, the less it can hold

@@ -790,6 +790,8 @@ const TUNING_PARAMS = {
   'gore.contactMinTravel':{t:'f',def:2,min:0,max:100},
   'gore.bleedHpPerVoxel':{t:'f',def:0.6,min:0,max:5},
   'gore.stumpBleedsOpen':{t:'b',def:true},
+  'gore.stumpBleedGain':{t:'f',def:2,min:0,max:8},
+  'gore.underwaterBleedRate':{t:'f',def:2,min:1,max:4},
   'gore.burnCapMidFraction':{t:'f',def:0.4,min:0.05,max:0.95},
   'gore.burnCapMidHealth':{t:'f',def:0.333,min:0,max:1},
   'gore.burnDeathFraction':{t:'f',def:0.7,min:0.05,max:1},

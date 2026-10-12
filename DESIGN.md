@@ -9145,7 +9145,13 @@ to ONE clump every tick for as long as the creature lives, so a lost limb is a
 clock: the drip's own cadence and op budget bound the rate, `DrainBlood` turns
 it into hp, and death ends it. Bounded under rule 2 by the creature's own hp —
 at the defaults (30 Hz, a drip every 4 ticks, clump radius 0, 0.6 hp/voxel) a
-body bleeds out at 4.5 hp/s from one stump. Topped up to a clump rather than to
+body bleeds out at 4.5 hp/s from one stump. The top-up per drip period is
+`bleedVoxelGain × stumpBleedGain × woundScale` of a clump, saturating at one
+(2026-10-11: at the halved volume dial the stump had dripped a voxel every
+other period). A wound whose cell is WATER (`Mob::WaterAt`, the `washes`
+liquids) drips `underwaterBleedRate` times as often — top-up and drip both —
+so a swimmer trails a stream rather than a cloud too thin to see, and bleeds
+out that much faster. Topped up to a clump rather than to
 the wound cap so a stump that cannot drip this tick (out of ops) does not bank
 blood for later; cleared by `DetachLimb` so a stump that is itself cut off does
 not drip forever at its rest-pose anchor from a body it is no longer on. Fire
