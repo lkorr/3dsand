@@ -50,6 +50,26 @@ const TILE_ROWS = [
   {k: 'tileSize', n: 'tile size (m)', min: 0.3, max: 3, step: 0.1, def: 1, d: 'Checker square size.'}
 ];
 
+/** LIQUIDS. A carve's liquid `level` is a y in the frame the prim is
+ *  written in, and the core's piece transform (dgutil xformPrim) and the
+ *  compiler's anchor shift do not carry it (they move min/max, not `level`),
+ *  so a piece placed at any y but 0 got the wrong water line: a sunken hall
+ *  two levels down came out full to its vault and drained into the stairs.
+ *  Until the core translates `level`, a ruins carve with water is TWO boxes:
+ *  the air above the line (the room) and the liquid below it, whose `level`
+ *  is LIQ_ALL (every cell of it is liquid, in any frame) -- the water line is
+ *  then the boxes' shared face, which the transform does carry. No noise on
+ *  the liquid box, no blend between them: the surface is flat and owned by
+ *  one carve. Returns the AIR prim's index (the room scatter goes on it). */
+const LIQ_ALL = 1 << 19;
+function wetBox(b, min, max, top, liquid, airOpts, room) {
+  const airMin = [min[0], Math.max(min[1], top + 1), min[2]];
+  const air = room ? b.room('box', {min: airMin, max}, airOpts) : b.carve('box', {min: airMin, max}, airOpts);
+  if (top + 1 > min[1]) b.carve('box', {min, max: [max[0], Math.min(max[1], top + 1), max[2]]},
+    Object.assign({}, airOpts || {}, {liquid, level: LIQ_ALL, noise: null, blend: 0, tag: 'water'}));
+  return air;
+}
+
 /** A column. Returns {broken, h}. style: round|square|fluted|broken. */
 function column(b, P, x, z, y0, H, R, style, key) {
   const broken = style === 'broken' || b.r('col', key, 'broken') < P.decay * 0.35;
@@ -156,13 +176,13 @@ const HALL_ROWS = ROWS_DOOR.concat([
 ]);
 
 function hallBody(b, P, fy, waterLevel) {
-  const wet = waterLevel !== null && waterLevel !== undefined ? {liquid: 'liquid', level: waterLevel} : {};
+  const wetTop = waterLevel !== null && waterLevel !== undefined ? waterLevel : null;
   const W = b.m(P.width, 30), L = b.m(P.length, 30), H = b.m(P.height, 20), C = b.m(P.ceiling);
   const hw = Math.round(W / 2), T = b.m(P.wallThick, 4);
   const dw = Math.round(b.m(P.doorWidth, 10) / 2), dh = b.m(P.doorHeight, 18);
   const z0 = T, z1 = T + L, zc = Math.round((z0 + z1) / 2);
   b.doorway(0, z0 + 1, 0, 0, dw * 2, dh, 'arch', {rise: Math.min(dw, b.m(0.8))});
-  const room = b.room('box', {min: [-hw, fy, z0], max: [hw, H, z1]}, wet);
+  const room = wetTop !== null ? wetBox(b, [-hw, fy, z0], [hw, H, z1], wetTop, 'liquid', {}, true) : b.room('box', {min: [-hw, fy, z0], max: [hw, H, z1]});
   b.skin('box', {min: [-hw, fy, z0], max: [hw, H, z1]}, {skin: 3, mat: 'wall', noise: 'wall', layer: 1});
   const ncol = Number(P.columnRows) ? P.columnCount : 0;
   const bays = [];
@@ -205,7 +225,9 @@ function hallBody(b, P, fy, waterLevel) {
   // Niches + statues, banners.
   if (P.niches) for (let i = 0; i + 1 < bays.length; i++) for (const s of [-1, 1]) {
     const z = Math.round((bays[i] + bays[i + 1]) / 2), nw = b.m(0.7), nd = b.m(0.8);
-    b.carve('box', {min: [s * hw, fy + b.m(0.5), z - nw], max: [s * (hw + nd), fy + b.m(3), z + nw]}, Object.assign({layer: 3, noise: null, blend: 0, tag: 'niche'}, wet));
+    const nmin = [Math.min(s * hw, s * (hw + nd)), fy + b.m(0.5), z - nw], nmax = [Math.max(s * hw, s * (hw + nd)), fy + b.m(3), z + nw];
+    if (wetTop !== null) wetBox(b, nmin, nmax, wetTop, 'liquid', {layer: 3, noise: null, blend: 0, tag: 'niche'});
+    else b.carve('box', {min: nmin, max: nmax}, {layer: 3, noise: null, blend: 0, tag: 'niche'});
     if (b.r('niche', i, s) < P.deco + 0.3) b.prop('ruins/statue', {height: 2.2}, [s * (hw + Math.round(nd / 2)), fy + b.m(0.5), z], s < 0 ? 90 : 270);
   }
   for (let i = 0; i < P.banners; i++) {
@@ -269,7 +291,9 @@ const HALL = {
     nave: {params: {}},
     hypostyle: {params: {columnRows: '4', columnCount: 6, width: 18, length: 24, height: 5, vault: 'flat', columnStyle: 'square', tilePattern: 'checker', banners: 0, dais: false}},
     domed_hall: {params: {vault: 'dome', ceiling: 6, width: 14, length: 14, columnRows: '2', columnCount: 2, columnStyle: 'fluted', aisleWidth: 8, tilePattern: 'runner'}},
-    fallen_nave: {params: {columnStyle: 'fluted', decay: 0.85, collapse: 0.7, banners: 1, moisture: 0.5, lightCount: 1, vault: 'groin'}}
+    fallen_nave: {params: {columnStyle: 'fluted', decay: 0.85, collapse: 0.7, banners: 1, moisture: 0.5, lightCount: 1, vault: 'groin'}},
+    half_fallen: {params: {columnStyle: 'fluted', columnCount: 6, length: 30, collapse: 0.6, collapseFocus: 0.65, collapseAt: 0.8, fallCavity: 2.5,
+                           vault: 'groin', niches: true, banners: 3, exits: 'through+left', decay: 0.6}}
   },
   build(b, P) { hallBody(b, P, 0); }
 };
@@ -602,8 +626,9 @@ const PIT_ROOM = {
     const D = b.m(P.pitDepth, 6), px = Math.round(pw / 2), pz0 = zc - Math.round(pl / 2), pz1 = pz0 + pl;
     // The pit liquid is the pit carve's own (PLAN 3.4.1 `level`): born full, flat, at rest.
     const lv = Math.min(-2, -D + Math.max(1, Math.round(P.liquidLevel * D)));
-    const wet = P.liquid !== 'none' ? {liquid: P.liquid === 'lava' ? 'lava' : 'liquid', level: lv} : {};
-    const pit = b.carve('box', {min: [-px, -D, pz0], max: [px, 1, pz1]}, Object.assign({layer: 3, noise: 0.5, blend: 2, tag: 'room'}, wet));
+    const pitOpts = {layer: 3, noise: 0.5, blend: 2, tag: 'room'};
+    const pit = P.liquid !== 'none' ? wetBox(b, [-px, -D, pz0], [px, 1, pz1], lv, P.liquid === 'lava' ? 'lava' : 'liquid', pitOpts)
+                                    : b.carve('box', {min: [-px, -D, pz0], max: [px, 1, pz1]}, pitOpts);
     b.skin('box', {min: [-px, -D, pz0], max: [px, 0, pz1]}, {skin: 2, mat: 'wall', layer: 4});
     if (P.spikes) {
       // Spikes are a stalagmite scatter in the accent metal: no prim per spike.
@@ -819,6 +844,8 @@ const RUIN_ENTRANCE = {
     {k: 'foot', n: 'foot passage (m)', min: 1, max: 10, step: 0.1, def: 2, d: 'Level run at the bottom before the inner socket.'},
     {sec: 'Colonnade', note: 'Above ground: a paved platform round the stairwell, columns along it, a parapet.'},
     {k: 'platform', n: 'platform margin (m)', min: 1, max: 12, step: 0.1, def: 3, d: 'Paving beyond the stairwell on each side (the terrain-blend apron: the ground above it is cleared and the gaps under it filled).'},
+    {k: 'apronHeight', n: 'apron clearance (m)', min: 0.5, max: 12, step: 0.1, def: 8,
+     d: 'How high the ground over the platform is cleared. High on a hillside (the platform is cut into the slope); low in a hollow or a sunken way, where a tall clearance would slot a box into the banks.'},
     {k: 'columns', n: 'columns per side', min: 0, max: 12, step: 1, int: true, def: 4, d: ''},
     {k: 'columnHeight', n: 'column height (m)', min: 1, max: 12, step: 0.1, def: 4.5, d: ''},
     {k: 'columnStyle', n: 'column style', kind: 'enum', options: ['round', 'square', 'fluted', 'broken'], def: 'fluted', d: ''},
@@ -839,7 +866,9 @@ const RUIN_ENTRANCE = {
     colonnade: {params: {}},
     grand_portico: {params: {width: 5, drop: 10, platform: 6, columns: 6, columnHeight: 7, columnStyle: 'round', toppled: 1, decay: 0.3, overgrowth: 0.2, lightCount: 4}},
     sunken_stair: {params: {width: 2, drop: 5, platform: 1.5, columns: 0, toppled: 0, parapet: 1.2, overgrowth: 0.8, lightType: 'none', lightCount: 0}},
-    toppled_ruin: {params: {columns: 5, columnStyle: 'broken', toppled: 5, lintels: false, decay: 0.9, overgrowth: 0.9}}
+    toppled_ruin: {params: {columns: 5, columnStyle: 'broken', toppled: 5, lintels: false, decay: 0.9, overgrowth: 0.9}},
+    hollow_way_cairn: {params: {width: 3.2, drop: 10, platform: 2.5, apronHeight: 2.2, columns: 3, columnHeight: 5.2, toppled: 2,
+                                cairn: 3.3, cairnRadius: 2.9, cairnX: 0, cairnZ: 16, cairnLift: 10, overgrowth: 0.7}}
   },
   build(b, P) {
     const W = b.m(P.width, 10), H = b.m(P.height, 18), hw = Math.round(W / 2);
@@ -847,7 +876,7 @@ const RUIN_ENTRANCE = {
     const open = Math.round((run * Math.min(H, D)) / D);     // where the stair's headroom goes under grade
     const PM = b.m(P.platform, 6), pz0 = -PM, pz1 = open + Math.round(PM / 2);
     // Apron: clear the ground above the platform, fill the gaps under it, pave it.
-    b.carve('box', {min: [-hw - PM, 0, pz0], max: [hw + PM, b.m(8), pz1]}, {layer: 1, noise: 0.5, blend: 10, tag: 'apron'});
+    b.carve('box', {min: [-hw - PM, 0, pz0], max: [hw + PM, b.m(P.apronHeight, 2), pz1]}, {layer: 1, noise: 0.5, blend: 10, tag: 'apron'});
     b.fill('box', {min: [-hw - PM, -b.m(1.5), pz0], max: [hw + PM, 0, pz1]}, {mat: 'floor', layer: 2, noise: 'floor', mask: 'air'});
     b.fill('box', {min: [-hw - PM, -2, pz0], max: [hw + PM, 0, pz1]}, {mat: 'floor', layer: 2, noise: null});
     // The stair (carved after the paving so it cuts through it).

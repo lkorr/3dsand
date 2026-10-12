@@ -54,10 +54,10 @@ const at = (ref, spec) => { d = G.attachPiece(d, ref, Object.assign({fit: true, 
 // ---- level 0: the surface ruin -------------------------------------------------
 d.pieces.push(G.newPiece(d, {kit: 'ruins', type: 'ruin_entrance', params: {
   width: 3.2, height: 3.2, drop: 12, pitch: 0.55, stepHeight: 0.22, foot: 2.5,
-  platform: 2.5, columns: 3, columnHeight: 5.2, columnStyle: 'fluted', lintels: true, toppled: 2,
+  platform: 2.5, apronHeight: 2.2, columns: 3, columnHeight: 5.2, columnStyle: 'fluted', lintels: true, toppled: 2,
   parapet: 0.7, overgrowth: 0.7, decay: 0.6, moisture: 0.4, lightCount: 2, lightType: 'brazier', asym: 0.5,
   // the cairn stands on the brow of the saddle, above the stair's head: seen from the Tarn Way
-  cairn: 4.2, cairnRadius: 2.2, cairnX: -1.5, cairnZ: 14.5, cairnLift: 12.2, cairnStone: 'mixed'}}));
+  cairn: 3.3, cairnRadius: 2.9, cairnX: -1.5, cairnZ: 18, cairnLift: 11.4, cairnStone: 'mixed'}}));
 d.entrance = {piece: 'p0', socket: 'surface'};
 
 // ---- level 1 -------------------------------------------------------------------
@@ -154,6 +154,12 @@ for (const s of [-1, 1]) lightAt(hall, 'ruins/brazier', {height: 1.4, bowl: 0.65
 for (const s of [-1, 1]) lightAt(hall, 'ruins/brazier', {style: 'iron', height: 1.1, bowl: 0.5}, [s * 22, 0, 150]);
 // the narthex: votive candles either side of the crossing
 for (const s of [-1, 1]) lightAt(narthex, 'ruins/candle_cluster', {count: 9, spread: 0.45}, [s * 36, 0, 30]);
+// the narthex: a weathered colossus against the far wall, the first thing the stair shows you
+lightAt(narthex, 'ruins/statue', {height: 3.4, pose: 'arms_raised', plinth: 0.6, weathering: 0.6}, [0, 0, 80], 180);
+// the court: one column snapped at head height, its drums across the paving
+lightAt('p0', 'ruins/broken_column', {radius: 0.35, stump: 2.1, drums: 2, fluted: true}, [-30, 0, 62], 90);
+// the pit: what the bridge has already taken
+lightAt(pit, 'ruins/bones', {}, [6, -70, 80], 30);
 // the noble tomb: stub candles beside the sarcophagus that holds the key
 lightAt(tomb, 'ruins/candle_cluster', {count: 4, tallest: 0.12, spread: 0.2}, [-18, 0, 55]);
 
@@ -187,7 +193,8 @@ ref('warden', 'npc', post, doorYaw, {name: 'the Cairn Warden', behavior: 'guardi
   weapon: 'mace', outfit: ['robe#2f2a36', 'hood#1f1c22', 'boots']}, 'human');
 // The hall watch: one of the dead walking the nave, door to the fallen end and back.
 const hallNodes = progNow.waynodes.filter(w => w.name.startsWith(hall + '/c')).map(w => w.name);
-const route = [hallNodes[0], hallNodes[Math.floor(hallNodes.length / 2)], hallNodes[hallNodes.length - 3]].map(wn);
+// the door, the middle of the nave, and the last node short of the fallen end
+const route = [hallNodes[0], hallNodes[2], hallNodes[hallNodes.length - 3]].map(wn);
 ref('hall_watch', 'npc', progNow.waynodes.find(w => w.name === hallNodes[1]).pos, 0, {name: 'a hollow-eyed watcher', behavior: 'zombie', schedule: 'cairn_hall_watch',
   outfit: ['robe#3a2f4a', 'sash']}, 'zombie');
 // The crypt dead: wake when someone steps into the bone gallery.

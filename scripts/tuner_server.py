@@ -1123,6 +1123,19 @@ def _dungeon_catalog():
             if sub in ("effects", "pool") or sub.startswith(".") or not os.path.isdir(sd):
                 continue
             mobs += stems(sd, ".vox")
+            # A variant with no art of its own (assets/mobs/human/zombie.json:
+            # `extends` the human, wears the zombie effect) is a def too: the
+            # engine resolves it by stem, so the pickers and the validation
+            # panel must not call it unknown.
+            for n in stems(sd, ".json"):
+                if n in mobs:
+                    continue
+                try:
+                    with open(os.path.join(sd, n + ".json"), "r", encoding="utf-8") as f:
+                        if isinstance(json.load(f).get("extends"), str):
+                            mobs.append(n)
+                except (OSError, ValueError, AttributeError):
+                    pass
     except OSError:
         pass
     behaviors = []
