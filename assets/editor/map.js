@@ -112,6 +112,7 @@ import {createClimateLayer} from './mapclimate.js';
 import {createCoastLayer} from './mapcoast.js';
 import {BIOME_COLORS} from './climate.js';
 import {createWaterLayer} from './mapwater.js';
+import {createDungeonLayer} from './dungeon/ui_maplayer.js';
 
 // Display colours by biome NAME (the table lives in climate.js, pure, so the
 // Node previews draw the same; worldbuilder B1's fourteen are in it); anything
@@ -137,6 +138,7 @@ let OL = null;             // the overlays (mapoverlay.js): slope / flow / lakes
 let CLM = null;            // the climate panel (mapclimate.js): climate inputs, overlays, Generate biomes, the Lock tool
 let CST = null;            // the coast tools (mapcoast.js): wobble / beach / cliff / smooth
 let WL = null;             // the rivers + lakes (mapwater.js): rivers[] / lakes[], the River + Lake tools, the live bake
+let DGL = null;            // the placed dungeons (dungeon/ui_maplayer.js): dungeons[], the Dungeon tool (PLAN_dungeons 5.3)
 let previewPending = false; // the preview pane opens in its voxel view on the page's first activate()
 // THE TOOL REGISTRY (maptools.js): every tool, built-in or a layer's, is one
 // registerTool({...}) call; `locale: true` puts it on the LOCALE page (a
@@ -493,6 +495,7 @@ function restore(s) {
   if (RL) RL.afterRestore();
   if (WL) WL.afterRestore();
   if (LC) LC.afterRestore();
+  if (DGL) DGL.afterRestore();
 }
 function pushUndo(e) { undo.push(e); if (undo.length > 60) undo.shift(); redo = []; }
 /** The map's terrain block, created from the defaults if the file has none. */
@@ -758,6 +761,7 @@ function syncCheck() {
   }
   if (VL) VL.sync();
   if (LC) LC.sync();
+  if (DGL) DGL.sync();
   if (WL) WL.sync();
 }
 function buildCheckPanel() {
@@ -3543,6 +3547,7 @@ export function attach(hooks) {
   CLM = createClimateLayer(C);
   CST = createCoastLayer(C);
   WL = createWaterLayer(C);
+  DGL = createDungeonLayer(C);
   registerTeleport(C);
   els.dispBar.append(el('span', {style: 'width:6px'}), ...OL.displayControls());
   els.tools = {};
@@ -3577,7 +3582,7 @@ export function attach(hooks) {
   els.worldPanels = [RL.buildPanel(), GL.buildPanel(), CLM.buildPanel(), WL.buildPanel()];
   els.legend = buildLegend(el, VEC.iconCanvas, {land: LAND_LUT, sea: SEA_LUT});
   style.textContent += els.legend.css;
-  const side = el('div', {class: 'mapside'}, els.legend.panel, buildCheckPanel(), LC.buildPanel(), els.worldPanels[0], els.worldPanels[1], els.worldPanels[2], els.vecPanel, els.htPanel, els.terrainPanel, buildSitesPanel());
+  const side = el('div', {class: 'mapside'}, els.legend.panel, buildCheckPanel(), LC.buildPanel(), DGL.buildPanel(), els.worldPanels[0], els.worldPanels[1], els.worldPanels[2], els.vecPanel, els.htPanel, els.terrainPanel, buildSitesPanel());
   root.append(el('div', {class: 'mapbody'}, main, side));
   // The PREVIEW pane (P-I): the heightmap and voxel views tuner.html keeps in
   // #wgPreviewHost, adopted under the map as previews.
@@ -3712,7 +3717,7 @@ export function saveFromHost() {
   if (tuningTouched && H.saveTuning) { H.saveTuning(); tuningTouched = false; }
 }
 export function activate() {
-  if (map) { syncTerrain(); syncSites(); publishTerrain(); syncLines(); syncHeightTools(); VL.sync(); LC.sync(); RL.sync(); GL.sync(); CLM.sync(); WL.sync(); }
+  if (map) { syncTerrain(); syncSites(); publishTerrain(); syncLines(); syncHeightTools(); VL.sync(); LC.sync(); RL.sync(); GL.sync(); CLM.sync(); WL.sync(); DGL.sync(); }
   // First showing: open the preview in its voxel view (the deep link's recipe,
   // tuner.html tunerDeepLink). wvToggle / wvOn are tuner.html globals.
   if (previewPending) {

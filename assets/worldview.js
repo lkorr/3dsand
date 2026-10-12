@@ -396,6 +396,12 @@
     'uniform int uIsolate;',          // material id to isolate, -1 = none
     'uniform float uAlpha;',
     'uniform float uSeaY;',
+    // A CLIP BOX in world voxels (the Dungeons tab's x-ray): 0 = off, 1 = draw
+    // only inside the box (a dungeon carved in rock shows its own surfaces,
+    // backface culling makes the near walls see-through), 2 = cut the column
+    // over the box's footprint above max.y (real terrain round a hole down to
+    // the dungeon).
+    'uniform int uClipMode; uniform vec3 uClipMin; uniform vec3 uClipMax;',
     'in vec3 vSample; flat in int vFace; in vec3 vWorld;',
     'out vec4 oCol;',
     '',
@@ -431,6 +437,9 @@
     '  uint w = cellAt(cell);',
     '  uint mat = w & 4095u;',
     '  if (mat == 0u) discard;',
+    '  if (uClipMode == 1 && (any(lessThan(vWorld, uClipMin)) || any(greaterThan(vWorld, uClipMax)))) discard;',
+    '  if (uClipMode == 2 && vWorld.x >= uClipMin.x && vWorld.x <= uClipMax.x && vWorld.z >= uClipMin.z &&',
+    '      vWorld.z <= uClipMax.z && vWorld.y > uClipMax.y) discard;',
     '  if (uIsolate >= 0 && int(mat) != uIsolate) discard;',
     '  uint meta = texelFetch(uPal, ivec2(int(mat), 3), 0).r;',
     '  uint state = (w >> 12) & 15u;',
@@ -594,8 +603,21 @@
       sliceAxis: 1,
       slicePos: 0,
       sliceThick: 0,
-      wire: false
+      wire: false,
+      // OPTIONAL HOST HOOKS (the Dungeons tab; off = the old behaviour):
+      //   clip  : null | {mode: 1|2, min: [x,y,z], max: [x,y,z]} world voxels
+      //           (see uClipMode in FS_VOX)
+      //   roi   : null | {min, max}: the octree only grows nodes that touch this
+      //           box, so a dungeon preview fetches the dungeon and not a ring
+      //           of 512-voxel roots round it
+      //   overlayOnTop : host overlay lines ignore depth (sockets through rock)
+      clip: null,
+      roi: null,
+      overlayOnTop: false
     };
+    // SOFT REFRESH (refreshBox): a region whose staleSeq is past the seq it was
+    // fetched at keeps drawing and is fetched again; the reply replaces it.
+    this.refreshSeq = 0;
 
     this.cam = {
       // World VOXEL coordinates throughout. Metres are a display unit here; the
@@ -647,7 +669,7 @@
     this.progFar = makeProgram(gl, VS_FAR, FS_FAR, ['aPos', 'aCol', 'aNrm']);
     this.uVox = uniforms(gl, this.progVox,
       ['uMVP', 'uRegionOrigin', 'uLod', 'uVox', 'uPal', 'uDims', 'uEye', 'uLight',
-       'uAO', 'uGrid', 'uMode', 'uIsolate', 'uAlpha', 'uSeaY']);
+       'uAO', 'uGrid', 'uMode', 'uIsolate', 'uAlpha', 'uSeaY', 'uClipMode', 'uClipMin', 'uClipMax']);
     this.uLine = uniforms(gl, this.progLine, ['uMVP']);
     this.uFar = uniforms(gl, this.progFar, ['uMVP', 'uLight', 'uEye', 'uFade']);
     this.lineVBO = gl.createBuffer();
@@ -782,6 +804,21 @@
     var R = Math.max(0, this.view.reach | 0);
     var refY = orbit ? this.cam.target[1] : eye[1];
     var nodes = new Map(), roots = [], leaves = [];
+    var roi = this.view.roi;
+    function touches(L, rx, ry, rz) {
+      if (!roi) return true;
+      var e = REGION_N << L;
+      return rx * e <= roi.max[0] && (rx + 1) * e > roi.min[0] &&
+             ry * e <= roi.max[1] && (ry + 1) * e > roi.min[1] &&
+             rz * e <= roi.max[2] && (rz + 1) * e > roi.min[2];
+    }
+    function outside(L, rx, ry, rz, parent, octant) {
+      var e = REGION_N << L;
+      var n = {key: regionKey(L, rx, ry, rz), level: L, rx: rx, ry: ry, rz: rz, e: e,
+               d: Infinity, parent: parent, octant: octant, kids: null, outside: true};
+      nodes.set(n.key, n);
+      return n;
+    }
     function visit(L, rx, ry, rz, parent, octant) {
       var e = REGION_N << L;
       var n = {key: regionKey(L, rx, ry, rz), level: L, rx: rx, ry: ry, rz: rz, e: e,
@@ -790,13 +827,24 @@
       nodes.set(n.key, n);
       if (L > 0 && n.d < detail * e) {
         n.kids = [];
-        for (var k = 0; k < 8; k++)
-          n.kids.push(visit(L - 1, rx * 2 + (k & 1), ry * 2 + ((k >> 1) & 1),
-                            rz * 2 + ((k >> 2) & 1), n, k));
+        for (var k = 0; k < 8; k++) {
+          var kx = rx * 2 + (k & 1), ky = ry * 2 + ((k >> 1) & 1), kz = rz * 2 + ((k >> 2) & 1);
+          // Outside the ROI a child is known EMPTY without asking (synthesised
+          // by update), so its parent's fallback rule still sees it complete.
+          if (!touches(L - 1, kx, ky, kz)) { n.kids.push(outside(L - 1, kx, ky, kz, n, k)); continue; }
+          n.kids.push(visit(L - 1, kx, ky, kz, n, k));
+        }
       } else {
         leaves.push(n);
       }
       return n;
+    }
+    if (roi) {
+      for (var oz = Math.floor(roi.min[2] / eT); oz <= Math.floor(roi.max[2] / eT); oz++)
+        for (var oy = Math.floor(roi.min[1] / eT); oy <= Math.floor(roi.max[1] / eT); oy++)
+          for (var ox = Math.floor(roi.min[0] / eT); ox <= Math.floor(roi.max[0] / eT); ox++)
+            roots.push(visit(T, ox, oy, oz, null, -1));
+      return {roots: roots, nodes: nodes, leaves: leaves, top: T, foci: foci};
     }
     var cx = Math.floor(eye[0] / eT), cz = Math.floor(eye[2] / eT);
     for (var z = cz - R; z <= cz + R; z++) {
@@ -958,6 +1006,14 @@
     var want = [], ready = 0;
     t.nodes.forEach(function (n) {
       var r = self.regions.get(n.key);
+      if (!r && n.outside) r = self._synthEmpty(n);
+      if (r && r.staleSeq > (r.fetchedSeq || 0) && !r.local && !self.pending.has(n.key)) {
+        // Soft refresh: keep drawing the old one, ask again.
+        r.lastLive = frame;
+        if (r.empty || r.meshed) ready++;
+        want.push(n);
+        return;
+      }
       if (!r && n.parent) {
         var par = self.regions.get(n.parent.key);
         // Top-down: a child waits for its parent, whose octant mask says
@@ -1038,7 +1094,8 @@
   WorldView.prototype._pump = function () {
     while (this.inflight < this.maxInflight && this.queue.length) {
       var n = this.queue.shift();
-      if (this.regions.has(n.key) || this.pending.has(n.key)) continue;
+      var have = this.regions.get(n.key);
+      if ((have && !(have.staleSeq > (have.fetchedSeq || 0))) || this.pending.has(n.key)) continue;
       this._fetch(n);
     }
   };
@@ -1052,7 +1109,7 @@
             '&lod=' + lod + '&seed=' + this.seed +
             '&layer=' + encodeURIComponent(this.layerSel || '@map') +
             (this.mapName ? '&map=' + encodeURIComponent(this.mapName) : '');
-    var gen = this.gen;
+    var gen = this.gen, seq = this.refreshSeq;
     this.inflight++;
     this.pending.set(key, gen);
     var t0 = performance.now();
@@ -1073,7 +1130,7 @@
       self.stats.slowMs = ms > 1500 ? ms : 0;
       if (gen !== self.gen) { self._settle(key, gen); return; }
       self._post({cmd: 'decode', key: key, buf: buf,
-                  meta: {level: n.level, rx: n.rx, ry: n.ry, rz: n.rz, gen: gen}}, [buf]);
+                  meta: {level: n.level, rx: n.rx, ry: n.ry, rz: n.rz, gen: gen, seq: seq}}, [buf]);
     }).catch(function (e) {
       self._failAt.set(key, performance.now());
       self.stats.errors++;
@@ -1116,14 +1173,28 @@
       var meta = m.meta;
       this._settle(m.key, meta.gen);
       this._failAt.delete(m.key);
-      if (meta.gen !== this.gen || this.regions.has(m.key)) return;
+      var old = this.regions.get(m.key);
+      if (meta.gen !== this.gen || (old && !(old.staleSeq > (old.fetchedSeq || 0)))) return;
+      if (old) {
+        this._freeRegion(old); this.regions.delete(m.key);
+        // Children synthesised from the OLD octant mask (empty / buried) are
+        // re-decided from the new one.
+        var e0 = (REGION_N << meta.level), o0 = [meta.rx * e0, meta.ry * e0, meta.rz * e0], self0 = this, gone = [];
+        this.regions.forEach(function (q) {
+          if (!q.local || q.cells || q.level >= meta.level) return;
+          if (q.origin[0] >= o0[0] && q.origin[0] < o0[0] + e0 && q.origin[1] >= o0[1] && q.origin[1] < o0[1] + e0 &&
+              q.origin[2] >= o0[2] && q.origin[2] < o0[2] + e0) gone.push(q);
+        });
+        gone.forEach(function (q) { self0._freeRegion(q); self0.regions.delete(q.key); });
+      }
       var r = {
         key: m.key, level: meta.level, rx: meta.rx, ry: meta.ry, rz: meta.rz,
         lod: m.head.lod, nx: m.head.nx, ny: m.head.ny, nz: m.head.nz,
         origin: [m.head.ox, m.head.oy, m.head.oz],
         cells: m.cells, empty: false, oct: m.head.oct, tex: null, op: null, fl: null,
         meshing: false, meshed: false, dirty: true, gen: this.gen, rev: 0,
-        lastLive: this._frame
+        lastLive: this._frame, fetchedSeq: meta.seq || 0,
+        staleSeq: old ? old.staleSeq : 0
       };
       // The SAVED layer is already in the region: the voxel server applies it
       // (P7). What only this page knows is the UNSAVED strokes, so those are
@@ -1379,6 +1450,33 @@
     this.drawRev++;
   };
 
+  // SOFT REFRESH of a world box (the Dungeons tab: one piece's slider moved,
+  // the voxel server already carries the new program). Every region touching
+  // the box keeps drawing and is fetched again, coarse and fine alike; the
+  // reply replaces it. Regions synthesised as empty / buried inside the box
+  // are dropped (the new program may have put something there). A request in
+  // flight from before this call lands still stale and is asked again.
+  WorldView.prototype.refreshBox = function (min, max) {
+    var seq = ++this.refreshSeq, self = this, drop = [];
+    this.regions.forEach(function (r) {
+      var e = r.nx * r.lod;
+      if (r.origin[0] > max[0] || r.origin[0] + e <= min[0] || r.origin[1] > max[1] ||
+          r.origin[1] + r.ny * r.lod <= min[1] || r.origin[2] > max[2] || r.origin[2] + r.nz * r.lod <= min[2]) return;
+      if (r.local && !r.cells) { drop.push(r); return; }
+      if (!r.local) r.staleSeq = seq;
+    });
+    drop.forEach(function (r) { self._freeRegion(r); self.regions.delete(r.key); });
+    if (this._buriedMemo) this._buriedMemo.clear();
+    this.drawRev++;
+    return seq;
+  };
+  // How many resident regions are still waiting on a soft refresh.
+  WorldView.prototype.staleCount = function () {
+    var n = 0;
+    this.regions.forEach(function (r) { if (r.staleSeq > (r.fetchedSeq || 0)) n++; });
+    return n;
+  };
+
   // ---- camera -------------------------------------------------------------
   WorldView.prototype.camEye = function () {
     if (this.cam.mode === 'orbit') {
@@ -1557,6 +1655,10 @@
       this.view.mode === 'class' ? 1 : (this.view.mode === 'height' ? 2 : 0));
     gl.uniform1i(this.uVox.uIsolate, this.view.isolate);
     gl.uniform1f(this.uVox.uSeaY, (this.opts.seaY || 1024));
+    var clip = this.view.clip;
+    gl.uniform1i(this.uVox.uClipMode, clip ? (clip.mode | 0) : 0);
+    gl.uniform3fv(this.uVox.uClipMin, clip ? clip.min : [0, 0, 0]);
+    gl.uniform3fv(this.uVox.uClipMax, clip ? clip.max : [0, 0, 0]);
     gl.uniform1i(this.uVox.uVox, 0);
     gl.uniform1i(this.uVox.uPal, 1);
     gl.activeTexture(gl.TEXTURE1);
@@ -1774,7 +1876,9 @@
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.depthMask(false);
+    if (this.view.overlayOnTop) gl.disable(gl.DEPTH_TEST);
     gl.drawArrays(gl.LINES, 0, a.length / 7);
+    gl.enable(gl.DEPTH_TEST);
     gl.depthMask(true);
     gl.disable(gl.BLEND);
     gl.bindVertexArray(null);

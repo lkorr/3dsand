@@ -2543,3 +2543,189 @@ the row.
 For a monster that does the same thing all day use one row from `00:00` to
 `24:00` (on the Schedules page: from 00:00 to 00:00). The Schedules page's
 "route (patrol)" column holds `route`, `mode` and `wait`.
+
+## 17. The Dungeons tab: designing pieces, stitching a dungeon, placing it
+
+A dungeon is a set of PIECES (corridors, chambers, shafts, stairs, entrances),
+each one a generator driven by sliders, joined at SOCKETS, carved into the real
+world by worldgen (docs/PLAN_dungeons.md). The tuner's **Dungeons** tab is where
+you build one. It has two pages (the buttons top left): **Kit** and **Dungeon**.
+Everything you see in 3D is the engine's own worldgen (the voxel server), not a
+JavaScript imitation, so the preview is the dungeon.
+
+Scale: 10 voxels = 1 m. A 3 m corridor is 30 voxels wide.
+
+### 17.1 The Kit page: one piece alone
+
+Pick a **style** (caves, mines, ruins) and a **piece type** from the list on
+the left. The piece appears alone, carved into a block of solid rock far from
+anything else, in **x-ray**: the rock is see-through and you see the carved
+space's own surfaces (the walls nearest you are see-through from outside, the
+far walls and the floors show). **solid** shows the rock block.
+
+- The **sliders** on the right are the type's own (beam spacing, pillar
+  count, water level...) plus the universal ones every piece has (size, wall
+  roughness, decay, moisture, deco density, lights, blend radius, symmetry
+  break). A folded section opens with a click. While you DRAG a slider the
+  view refreshes coarse; on release it fills in at full detail. Only the rock
+  the change touches is fetched again; the old picture stays until it lands.
+- **preset** applies a named set of sliders; ★ marks your own.
+  **Save as preset** stores the current sliders under a name
+  (`assets/dungeons/presets/<kit>.json`); your presets show in the stitcher's
+  palette too.
+- **seed** / **Reroll**: the same sliders, other seeded choices (which beams
+  are broken, where rubble falls). One slider never reshuffles unrelated
+  choices.
+- **palette**: which materials the slots (wall, floor, support, rubble...)
+  resolve to.
+- **Sockets** (the coloured frames, listed top right): where another piece can
+  join. Amber = an opening, pale green = a surface socket (an entrance's). The
+  label says its name and opening (w×h voxels); the short line points out of
+  the piece. Click one in the list to fly to it.
+- **waynodes** (blue dots and lines) are the walking graph the piece makes;
+  **suggestions** (lilac squares) are the lights, chests, doors and traps the
+  piece proposes (the stitcher can adopt them).
+- **Props** (left, below the types): the prop generators (carts, bunks,
+  altars, braziers...), previewed alone with their own sliders.
+
+### 17.2 The Dungeon page: building one
+
+**Start.** Pick a dungeon in the **dungeon** list (assets/dungeons/), or
+**New** (an id: lowercase, digits, `_`, `-`; and a style). An empty dungeon
+says so in the view: drag an ENTRANCE type (caves "Cave mouth", mines "Adit
+entrance", ruins "Ruin entrance") from the **Pieces** palette into the view.
+
+**Add pieces.** Every open socket draws as an amber frame with a small `o`
+square. Drag a piece type from the palette onto one: the nearest open socket
+lights white as you drag over it, and on release the piece SNAPS there,
+turned to face it, sized to the opening and linked both ways (the frames go
+green). Without a drag: click the socket's square, then pick a type under
+**Attach a piece here** in the inspector. A type in the palette has a `▸ n`
+that unfolds its presets (drag a preset to use it). If a piece would overlap
+another you are asked; the validation panel keeps reporting an overlap you
+accepted.
+
+**Select and edit.** Click a piece (its rock in the view, its `p` square, or
+its node in the Graph) to select it. The inspector shows its sliders, LIVE:
+the dungeon recompiles and the view refreshes only that piece's rock. Also
+there: Turn ↻ / ↺, Re-snap, Reroll (its own seed), Seed 0 (derive it from the
+dungeon seed), Delete, "place the piece's own props", and a preset picker.
+
+**Move and turn.** A selected piece, ref or prop shows a GIZMO: three arrows
+(x red, y green, z blue) with squares at their tips; drag a square to slide
+along that axis (Shift: steps of 10). Or the keys: arrows move in x / z,
+PageUp / PageDown in y (Shift ×10), R turns a quarter (Shift+R back), Delete
+removes, F frames it. A piece moved off its link keeps the link, but the join
+turns RED (`!`) and the validation panel says so; **Re-snap** puts it back on
+its first link. **Unlink** (socket inspector) cuts a join.
+
+**The entrance** is the socket the map places at the ground (the first surface
+socket unless you choose): select a socket → **Make entrance**. Refs stay
+glued to the rock when the entrance moves.
+
+**Grow a branch (layout assist).** Select an open socket; under **Grow a
+branch** set how many pieces, how much it branches (0 = one chain, 1 = every
+new socket keeps growing), a seed, the kit and which types may appear; **cap
+the ends** closes left-over openings with dead-end pieces. **Grow** (or G)
+shows the PROPOSAL: real voxels, the new pieces in purple boxes, and a bar at
+the top of the view: **Keep** (Enter), **Reroll** (another seed) or
+**Discard** (Esc). Nothing is written until you keep it.
+
+**The view.**
+- **x-ray**: only the dungeon's own surfaces (look into every room from
+  outside). **solid**: the rock block. **in world**: the map's real terrain
+  round the entrance, with a hole cut down to the dungeon (the dungeon must be
+  placed on a map, 17.4, or you are asked for a map column to try it at).
+- **y** (two sliders): only a range of heights, a level at a time. **all**
+  resets. In the Graph, clicking a level band's label slices to it.
+- **isolate piece**: only the selected piece.
+- **orbit / fly**: drag to look, wheel to zoom, WASD / Q E to move (Shift
+  faster), double-click orbits a point. **frame** (F) shows everything.
+- **labels** names every ref; **waynodes** draws the generated walking graph;
+  **suggested** shows what the pieces suggest.
+
+**Entities** (the Entities palette). Click a kind to arm it, then click in the
+view where it goes (on a floor: it stands on it; on a wall: in front of it).
+Shift+click places several; Esc stops. Or drag one in. A new ref faces away
+from the camera. The kinds and their props are §16's; the inspector shows the
+fields with pickers (mob defs, behaviours, schedules, loot tables, key items,
+signals, regions). In the view:
+- **signal wires**: a dashed amber line from every lever / plate to every
+  door, gate and trap whose `on` is its signal, labelled with the signal. A
+  receiver whose signal nothing sends shows `? <signal>` in red; a signal
+  nobody listens to says so.
+- **key threads**: a gold dashed line from a key to the doors / chests it
+  unlocks.
+- **boxes**: regions, plates, trap regions, door leaves and gates draw their
+  box; a selected region / plate / trap has a ◢ handle at its far corner:
+  drag it across the floor to resize (the height is in the inspector).
+- **patrol routes**: a creature whose schedule has a `patrol` row draws its
+  route over the waynodes in cyan. The inspector shows the schedule's rows
+  (guard / patrol / lair / ambush...) editable in place; **pick in view**
+  builds a route by clicking waynode refs in order (Enter ends). **new** next
+  to the schedule picker writes a new schedule file for that creature; **Save
+  schedule** writes it (a schedule is a shared file: every creature naming
+  it walks it).
+- Patrol routes need WAYNODE REFS: **Adopt waynodes** turns every generated
+  waynode into one (`wn_<piece>_<node>`). **Adopt suggestions** turns the
+  pieces' suggested doors, chests, traps (with their region) and spawners
+  into refs; select one suggestion (tick "suggested") to adopt only it.
+
+**Props** (the Props palette): click to arm, click a floor. Lights are props
+(lantern, brazier, candles, crystal, glow fungus). A selected prop has its
+own sliders, Turn and Reroll.
+
+**Validation** (bottom panel, always live): errors ✖ and warnings ⚠: open
+sockets ending in rock, overlapping pieces, joins that do not meet or cannot
+join, unreachable pieces, a lock with no key or a key behind its own lock,
+dead signals, slopes too steep to walk, props inside rock, engine limits,
+unknown materials / mobs / schedules / loot tables, and, once the dungeon is
+placed (in world), rooms that break the ground or come too close under a
+lake. Click a line to select what it names and fly to it. Tick **info** for
+the notes (auto tapers, auto links).
+
+**Graph** (bottom panel): pieces as nodes, left to right by steps from the
+entrance, stacked in LEVEL bands by floor height; edges green (joined), amber
+(joined through a taper), red (refused); an amber corner = an open socket, a
+red corner = an error. Click a node to select and frame it.
+
+**Undo / redo**: Ctrl+Z / Ctrl+Y (or the buttons) undo EVERYTHING on this page:
+pieces, sliders, links, refs, props, kept proposals. A slider drag is one step.
+
+**Save** (Ctrl+S) writes `assets/dungeons/<id>/dungeon.json`, the compiled
+`shell.json` + `shell.bin` (the compiler `node scripts/compile_dungeon.mjs`
+runs the same code) and `refs.json`; the status line reports whether the
+compiler agrees the shell is current. Errors in the validation panel ask
+before saving (the engine refuses a shell over its limits). **Duplicate**
+saves a copy under a new id; **Revert** throws away unsaved changes. A dungeon
+placed on a map is worldgen input: saving one moves the world hash
+(rebaseline: a notification, not a regression).
+
+### 17.3 Playtest
+
+**▶ Playtest** launches the game standing outside the entrance, facing in. It
+needs the dungeon SAVED and PLACED on a map (17.4); unsaved changes are saved
+first. The game loads the map the placement is on.
+
+### 17.4 Placing a dungeon in the world (Environment → World map)
+
+The World map page has a **Dungeon** tool. Pick a dungeon in the strip above
+the map and click where its entrance goes: a door badge marks the ANCHOR, and
+the dungeon's footprint is drawn per level (each piece's box, shaded by depth
+band, from the saved shell). Drag the badge to move it; R / Shift+R turns it a
+quarter; Delete removes it. The **Dungeons** panel on the right edits the
+placement: id, name, which dungeon, `at` (x, z), `yOffset` (voxels above the
+bare ground at the anchor) and `yaw`. **Open in Dungeons tab** opens it in the
+stitcher's **in world** view: the real terrain round the entrance, the dungeon
+x-rayed beneath, the ground-breach checks on. Save the map to keep it (the
+Dungeons tab reads the saved map.json).
+
+### 17.5 Checking the tab itself
+
+`bash scripts/check_dungeons.sh` drives the real tab in headless Chrome: the
+tab opens, a piece previews (pixels read back), a slider soft-refreshes, a
+snap links, a grow proposal appears, undo / redo, a wired lever and gate, a
+dead signal is an error, save, and `node scripts/compile_dungeon.mjs <id>
+--check` on what it saved. `--shots <dir>` also writes screenshots of both
+pages. A worktree with no build of its own:
+`SANDVOX_EXE=<another checkout's sandvox.exe> bash scripts/check_dungeons.sh`.

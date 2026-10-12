@@ -42,6 +42,19 @@ happens in this process rather than in the page:
                               id?, at?, yOffset?, yaw?, map?}; docs/PLAN_dungeons.md
                               5.0) -> the engine's placement JSON (the box to
                               /api/voxregion over); regions carry it until clear
+  GET  /api/dungeons          every assets/dungeons/<id>/ (name, style, pieces,
+                              shell / refs present) + where each map places it
+  GET  /api/dungeon?id=       its dungeon.json, refs.json, shell.json (text)
+  POST /api/dungeon?id=       {dungeon, shellJson, shellBin (base64), refs?}:
+                              the Dungeons tab's save (compiled in the page by
+                              dungeongen.js); answers compile_dungeon.mjs --check
+  GET  /api/dungeon/catalog   the tab's pickers: loot tables, schedules, mob
+                              defs, behaviours, key items, user presets
+  POST /api/dungeon/preset    {kit, type, name, params} -> assets/dungeons/presets/<kit>.json
+  POST /api/play {mode: "dungeon", at: [x,y,z], yaw, pitch, map?}: the game at
+                              a dungeon's entrance (--at; SANDVOX_MAP=map)
+  SANDVOX_EXE=<path>          run another checkout's sandvox.exe (a JS-only
+                              worktree); it gets SANDVOX_ASSET_DIR = these assets
   GET  /api/worldedits        list assets/worldedits/*.svedit
   GET  /api/worldmap/terrain-defaults   map.json terrain defaults (worldmap.h)
   GET  /api/worldmap/check?name=    the SAVED map's load warnings / refusal
@@ -602,7 +615,20 @@ def build_cmd():
     the PyInstaller extraction directory's parent: Temp/scripts/build.sh."""
     return [bash_exe(), os.path.join(ROOT, "scripts", "build.sh")]
 
-EXE = os.path.join(ROOT, "build", "Release", "sandvox.exe")
+# SANDVOX_EXE points the tuner at another checkout's binary -- a worktree that
+# changed only JS / JSON / WGSL has no build of its own (CLAUDE.md "a
+# WGSL/tuning worktree needs NO BUILD AT ALL"). Every launch below then also
+# gets SANDVOX_ASSET_DIR = THIS checkout's assets (_exe_env), so the borrowed
+# exe generates this tree's world, not the one it was compiled beside.
+EXE = os.environ.get("SANDVOX_EXE") or os.path.join(ROOT, "build", "Release", "sandvox.exe")
+
+
+def _exe_env(env=None):
+    """os.environ (or `env`) plus SANDVOX_ASSET_DIR when the exe is borrowed."""
+    env = dict(os.environ if env is None else env)
+    if os.environ.get("SANDVOX_EXE") and not env.get("SANDVOX_ASSET_DIR"):
+        env["SANDVOX_ASSET_DIR"] = ASSETS
+    return env
 
 # Build state, shared with the poller. Guarded because ThreadingHTTPServer
 # handles the build POST and the status GETs on different threads.
@@ -797,7 +823,7 @@ class VoxServe:
         # Taken BEFORE the boot reads the files: a save during the boot then
         # shows as a mismatch and the next request reloads.
         sig = _world_signature(map_name)
-        env = dict(os.environ, SANDVOX_MAP=map_name)
+        env = _exe_env(dict(os.environ, SANDVOX_MAP=map_name))
         # The boot is the expensive, GPU-heavy part, so it holds the run mutex.
         with RunLock("voxserve-boot"):
             p = subprocess.Popen(
@@ -1020,6 +1046,109 @@ def _map_dungeon_assets(map_dir):
             if isinstance(a, str) and re.fullmatch(r"[a-z0-9_-]+", a):
                 out.append(a)
     return out
+
+
+def _dungeon_dir(did):
+    """assets/dungeons/<id>, or None unless `id` is a dungeon asset name."""
+    if not isinstance(did, str) or not re.fullmatch(r"[a-z0-9_-]{1,48}", did) or did in ("props", "presets"):
+        return None
+    return os.path.join(ASSETS, "dungeons", did)
+
+
+def _dungeon_list():
+    """Every assets/dungeons/<id>/dungeon.json (name, style, piece count,
+    whether shell / refs exist) and where every map places one."""
+    root = os.path.join(ASSETS, "dungeons")
+    out = []
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        names = []
+    for n in names:
+        d = _dungeon_dir(n)
+        if not d or not os.path.isfile(os.path.join(d, "dungeon.json")):
+            continue
+        e = {"id": n, "name": n, "style": "", "pieces": 0,
+             "shell": os.path.isfile(os.path.join(d, "shell.bin")),
+             "refs": os.path.isfile(os.path.join(d, "refs.json")), "placements": []}
+        try:
+            with open(os.path.join(d, "dungeon.json"), "r", encoding="utf-8") as f:
+                j = json.load(f)
+            e["name"] = j.get("name") or n
+            e["style"] = j.get("style") or ""
+            e["pieces"] = len(j.get("pieces") or [])
+        except (OSError, ValueError) as ex:
+            e["error"] = str(ex)
+        out.append(e)
+    by = {e["id"]: e for e in out}
+    try:
+        maps = sorted(os.listdir(WORLDMAP_DIR))
+    except OSError:
+        maps = []
+    for m in maps:
+        mp = os.path.join(WORLDMAP_DIR, m, "map.json")
+        try:
+            with open(mp, "r", encoding="utf-8") as f:
+                mj = json.load(f)
+        except (OSError, ValueError):
+            continue
+        for pl in mj.get("dungeons") or []:
+            if not isinstance(pl, dict):
+                continue
+            a = pl.get("dungeon") or pl.get("id")
+            if a in by:
+                by[a]["placements"].append({"map": m, "id": pl.get("id"), "at": pl.get("at"),
+                                            "yaw": pl.get("yaw", 0), "yOffset": pl.get("yOffset", 0)})
+    return {"ok": True, "dungeons": out, "gameMap": _tuning_map()}
+
+
+def _dungeon_catalog():
+    """What the Dungeons tab's entity pickers offer: loot tables, schedules,
+    mob defs (prototype + variant stems), behaviour profiles, key items, and
+    the user presets (assets/dungeons/presets/<kit>.json)."""
+    def stems(d, ext):
+        try:
+            return sorted(os.path.splitext(n)[0] for n in os.listdir(d) if n.endswith(ext))
+        except OSError:
+            return []
+    mobs = stems(os.path.join(ASSETS, "mobs"), ".vox")
+    try:
+        for sub in sorted(os.listdir(os.path.join(ASSETS, "mobs"))):
+            sd = os.path.join(ASSETS, "mobs", sub)
+            if sub in ("effects", "pool") or sub.startswith(".") or not os.path.isdir(sd):
+                continue
+            mobs += stems(sd, ".vox")
+    except OSError:
+        pass
+    behaviors = []
+    try:
+        with open(os.path.join(ASSETS, "mobs", "behaviors.json"), "r", encoding="utf-8") as f:
+            behaviors = [p.get("name") for p in json.load(f).get("profiles") or [] if isinstance(p, dict) and p.get("name")]
+    except (OSError, ValueError):
+        pass
+    keys, items = [], []
+    try:
+        with open(os.path.join(ASSETS, "items", "items.json"), "r", encoding="utf-8") as f:
+            ij = json.load(f)
+        for it in (ij.get("items") if isinstance(ij, dict) else ij) or []:
+            if isinstance(it, dict) and it.get("id"):
+                items.append(it["id"])
+                if it.get("kind") == "key":
+                    keys.append({"id": it["id"], "unlocks": it.get("unlocks") or it["id"]})
+    except (OSError, ValueError):
+        pass
+    presets = {}
+    pd = os.path.join(ASSETS, "dungeons", "presets")
+    for k in stems(pd, ".json"):
+        try:
+            with open(os.path.join(pd, k + ".json"), "r", encoding="utf-8") as f:
+                presets[k] = json.load(f)
+        except (OSError, ValueError):
+            pass
+    return {"ok": True, "loot": stems(os.path.join(ASSETS, "loot"), ".json"),
+            "schedules": stems(os.path.join(ASSETS, "schedules"), ".json"),
+            "mobs": sorted(set(mobs)), "behaviors": behaviors, "keys": keys, "items": sorted(items),
+            "presets": presets}
 
 
 def _tuning_map():
@@ -1619,7 +1748,7 @@ class Handler(BaseHTTPRequestHandler):
         # `map=` (map v2 E4): the heights of THAT map (SANDVOX_MAP, which
         # worldmap::ActiveMapName honours) -- the page's map, not necessarily
         # tuning's world.mapLayer. Absent = tuning's, as before.
-        env = dict(os.environ)
+        env = _exe_env()
         mname = (q.get("map") or [""])[0]
         if mname:
             if not _worldmap_dir(mname):
@@ -1967,6 +2096,120 @@ class Handler(BaseHTTPRequestHandler):
         _voxserve.scratch_key = hashlib.sha1(line.encode("utf-8") + b"\0" + content).hexdigest()[:16]
         return self._json(200, out)
 
+    # ---- the Dungeons tab (docs/PLAN_dungeons.md 5) -------------------------
+    def _dungeon_get(self):
+        """GET /api/dungeon?id= -> {ok, id, dungeon: text, refs: text|null,
+        shell: text|null} (the files as stored)."""
+        did = (self._query().get("id") or [""])[0]
+        d = _dungeon_dir(did)
+        if not d:
+            return self._json(400, {"ok": False, "error": "bad dungeon id"})
+        src = os.path.join(d, "dungeon.json")
+        if not os.path.isfile(src):
+            return self._json(404, {"ok": False, "error": "no assets/dungeons/%s/dungeon.json" % did})
+        out = {"ok": True, "id": did}
+        for key, fn in (("dungeon", "dungeon.json"), ("refs", None), ("shell", "shell.json")):
+            if fn is None:
+                fn = "refs.json"
+                try:
+                    with open(src, "r", encoding="utf-8") as f:
+                        fn = json.load(f).get("refs") or "refs.json"
+                except (OSError, ValueError):
+                    pass
+                if not re.fullmatch(r"[A-Za-z0-9_.-]+\.json", fn):
+                    fn = "refs.json"
+            fp = os.path.join(d, fn)
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    out[key] = f.read()
+            except OSError:
+                out[key] = None
+        return self._json(200, out)
+
+    def _dungeon_post(self):
+        """POST /api/dungeon?id= {dungeon: text, shellJson: text, shellBin:
+        base64, refs?: text|null} -- the tab compiles in the browser with the
+        SAME dungeongen.js scripts/compile_dungeon.mjs runs; this writes the
+        files (each parsed first, write-then-rename) and then asks
+        `compile_dungeon.mjs <id> --check` whether they are current."""
+        import base64
+        did = (self._query().get("id") or [""])[0]
+        d = _dungeon_dir(did)
+        if not d:
+            return self._json(400, {"ok": False, "error": "bad dungeon id (a-z 0-9 _ -; not 'props')"})
+        b = self._body()
+        try:
+            text = b["dungeon"]
+            dj = json.loads(text)
+            shell = b["shellJson"]
+            json.loads(shell)
+            binb = base64.b64decode(b["shellBin"])
+        except (KeyError, TypeError, ValueError) as e:
+            return self._json(400, {"ok": False, "error": "want dungeon, shellJson, shellBin: " + repr(e)})
+        if binb[:4] != b"SVDG" or binb[-4:] != b"END!":
+            return self._json(400, {"ok": False, "error": "shellBin is not an SVDG shell"})
+        refs = b.get("refs")
+        if refs is not None:
+            try:
+                rj = json.loads(refs)
+                if not isinstance(rj, dict) or not isinstance(rj.get("refs"), list):
+                    raise ValueError("a refs file is {group, refs: [...]}")
+            except ValueError as e:
+                return self._json(400, {"ok": False, "error": "refs: " + str(e)})
+        os.makedirs(d, exist_ok=True)
+        files = [("dungeon.json", text.encode("utf-8")), ("shell.json", shell.encode("utf-8")), ("shell.bin", binb)]
+        if refs is not None:
+            rf = dj.get("refs") or "refs.json"
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+\.json", rf):
+                rf = "refs.json"
+            files.append((rf, refs.encode("utf-8")))
+        try:
+            for fn, data in files:
+                tmp = os.path.join(d, fn + ".tmp")
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                os.replace(tmp, os.path.join(d, fn))
+        except OSError as e:
+            return self._json(500, {"ok": False, "error": str(e)})
+        check = ""
+        try:
+            r = subprocess.run(["node", os.path.join(ROOT, "scripts", "compile_dungeon.mjs"), did, "--check"],
+                               cwd=ROOT, capture_output=True, text=True, timeout=60,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            check = ((r.stdout or "") + (r.stderr or "")).strip()
+            current = r.returncode == 0
+        except Exception as e:
+            check, current = "compile_dungeon.mjs not run: " + repr(e), None
+        return self._json(200, {"ok": True, "id": did, "written": [fn for fn, _ in files],
+                                "current": current, "check": check})
+
+    def _dungeon_preset(self):
+        """POST /api/dungeon/preset {kit, type, name, params}: a user preset,
+        kept beside the kits in assets/dungeons/presets/<kit>.json
+        ({type: {name: {params}}}) -- the kit modules stay pure code."""
+        b = self._body()
+        kit, typ, name, params = b.get("kit"), b.get("type"), b.get("name"), b.get("params")
+        if not all(isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9_ -]{1,40}", v) for v in (kit, typ, name)) \
+                or not isinstance(params, dict):
+            return self._json(400, {"ok": False, "error": "want kit, type, name (letters, digits, _ - space) and params"})
+        pd = os.path.join(ASSETS, "dungeons", "presets")
+        os.makedirs(pd, exist_ok=True)
+        fp = os.path.join(pd, kit + ".json")
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                j = json.load(f)
+        except (OSError, ValueError):
+            j = {}
+        if params.get("_delete"):
+            (j.get(typ) or {}).pop(name, None)
+        else:
+            j.setdefault(typ, {})[name] = {"params": params}
+        with open(fp + ".tmp", "w", encoding="utf-8", newline="\n") as f:
+            json.dump(j, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(fp + ".tmp", fp)
+        return self._json(200, {"ok": True, "presets": j})
+
     def _voxpalette(self):
         out = os.path.join(VOXTMP, "palette.json")
         os.makedirs(VOXTMP, exist_ok=True)
@@ -2297,6 +2540,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True, "terrain": map_terrain.terrain_defaults(ROOT)})
             except Exception as e:  # noqa: BLE001
                 return self._json(500, {"ok": False, "error": str(e)})
+        if p == "/api/dungeons":
+            return self._json(200, _dungeon_list())
+        if p == "/api/dungeon":
+            return self._dungeon_get()
+        if p == "/api/dungeon/catalog":
+            return self._json(200, _dungeon_catalog())
         if p == "/api/worldmaps":
             maps = []
             try:
@@ -2729,6 +2978,10 @@ class Handler(BaseHTTPRequestHandler):
         # ---- the voxel view ----
         if p == "/api/dungeon/preview":
             return self._dungeon_preview()
+        if p == "/api/dungeon":
+            return self._dungeon_post()
+        if p == "/api/dungeon/preset":
+            return self._dungeon_preset()
 
         if p == "/api/voxreload":
             # Worldgen's tuning values are WGSL consts baked at pipeline build,
@@ -3059,7 +3312,25 @@ class Handler(BaseHTTPRequestHandler):
             body = self._body()
             mode = body.get("mode", "game")
             scene = body.get("scene", "basin")
-            if mode == "game":
+            env = _exe_env()
+            if mode == "dungeon":
+                # PLAYTEST (the Dungeons tab): the game at the entrance of a
+                # placed dungeon. Numbers only, formatted here; the map is a
+                # checked name.
+                try:
+                    at = [float(v) for v in body.get("at")][:3]
+                    yaw, pitch = float(body.get("yaw") or 0), float(body.get("pitch") or 0)
+                    if len(at) != 3 or any(abs(v) > 1e7 for v in at):
+                        raise ValueError("at")
+                except (TypeError, ValueError):
+                    return self._json(400, {"ok": False, "error": "dungeon play wants at: [x, y, z], yaw, pitch"})
+                mname = str(body.get("map") or "")
+                if mname:
+                    if not _worldmap_dir(mname):
+                        return self._json(400, {"ok": False, "error": "bad map name"})
+                    env["SANDVOX_MAP"] = mname
+                argv = [EXE, "--at", "%.2f,%.2f,%.2f,%.1f,%.1f" % (at[0], at[1], at[2], yaw, pitch), "--telemetry"]
+            elif mode == "game":
                 argv = [EXE, "--telemetry"]
             elif mode == "lab":
                 if scene not in ("basin", "hill", "faucet", "pool", "slosh"):
@@ -3070,7 +3341,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"ok": False,
                                         "error": "unknown mode %r" % (mode,)})
             try:
-                q = subprocess.Popen(argv, cwd=ROOT, shell=False)
+                q = subprocess.Popen(argv, cwd=ROOT, shell=False, env=env)
                 _play_procs.append(q)
                 return self._json(200, {"ok": True, "pid": q.pid})
             except Exception as e:
