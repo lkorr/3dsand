@@ -1857,6 +1857,18 @@ surface (which refuses solute cells anyway) do not read it, the glow lights
 nothing but its own pixels (it is not a glow-field source), and a brine whose
 top cell is fresher than its bottom shows the top.
 
+*Superseded in part (2026-10-11):* the look is now read ALONG the path
+(`solPathLook`, a slab walk, ticket 01:29:42) by all three liquid shades --
+`shadeWater`, `shadeSubmerged`, `shadeMpmFluid` -- and COMPOSITED FRONT TO
+BACK into one equivalent (absorb, scatter) body (ticket 17:47:32), so a cloud
+near the eye covers the water behind it rather than being averaged over the
+column. A LIQUID source (blood) mixes optics instead of dyeing: `f` of the
+cell is the source, extinction `baseK x (1 - f) + sourceK x f`.
+solutes.json `lookFull` (0..255, 0 = the saturation) is the concentration a
+species shows its FULL look at -- `c` and `f` are taken against it -- so a
+potent species (blood: 48) still reads once dilute. Render-only; packed in
+bits 16..23 of the tintStrength word.
+
 **The bench's concentration conditions** (package G): `BuildBenchChemistry`
 compiles a solute-conditioned rule instead of skipping it -- `ChemRule::
 soluteSpecies/soluteMin/soluteMax`, resolved by name as UploadSolutes does --

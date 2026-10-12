@@ -1539,8 +1539,11 @@ Status GateSoluteBlood(Ctx& c, std::string& detail) {
 //           jumped frame to frame);
 //   seen    the cloud moves at least `minFracBelow` / `minFracAbove` of the
 //           frame against the clean-water frame, toward red, from either side
-//           of the surface.
-// Frames: build/blood_cloud_{below,above}.bmp (and _clean_). Thresholds in
+//           of the surface;
+//   graze   (ticket 2026-10-11 17:47:32) a thin dilute sheet just under the
+//           surface, seen from 6 cells up at ~-16 degrees, moves the pixels it
+//           touches toward red by `minRedGraze` against the ball-only frame.
+// Frames: build/blood_cloud_{below,above,graze}.bmp (and _clean_, _graze_ball). Thresholds in
 // tests/baseline.json (bloodCloud.*). Render-only but for the sim claim.
 Status GateBloodCloud(Ctx& c, std::string& detail) {
   const uint32_t water = MatNamed(c, "water");
@@ -1659,8 +1662,34 @@ Status GateBloodCloud(Ctx& c, std::string& detail) {
     }
     return true;
   };
-  std::vector<uint8_t> cb1, cb2, ca1, ca2;   // clean below / above
-  double msCB = 0, msCA = 0, msBB = 0, msBA = 0;
+  // GRAZING, from just over the surface (ticket 2026-10-11 17:47:32: "a cloud
+  // of blood beneath the surface ... above the surface it's practically
+  // invisible"). The owner's eye stood ~6 cells over a lake looking ~16-18
+  // degrees down at a cloud right under a floating corpse; at that angle the
+  // surface reflects ~35% sky and the steep `above` view above never saw it.
+  // A second cloud is poured for this view only, after the other two are
+  // photographed: a THIN, DILUTE sheet just under the surface, the shape a
+  // floating corpse's drip takes once it has spread. The dense ball above was
+  // always visible from here; what was not is a layer whose optical depth is
+  // small along a steep ray -- the shades applied the path-AVERAGE look as one
+  // homogeneous column, which spread the sheet's in-scatter over the metres of
+  // clean water behind it instead of laying it in front (solPathLook).
+  const Vec3 eyeGraze{(float)(cx - kHalf) + 1.5f, (float)surfY + 6.5f, (float)(cz - kHalf) + 1.5f};
+  const Vec3 grazeAt{(float)cx + 0.5f, (float)surfY + 0.5f, (float)cz + 0.5f};
+  const Camera camGraze = aim(eyeGraze, grazeAt);
+  const uint32_t sheetUnits = (uint32_t)BaselineNumber("bloodCloud.sheetUnits", 12);
+  const int kSheetR = 8;
+  std::vector<CellOp> pourShallow;
+  for (int z = -kSheetR; z <= kSheetR; z++)
+    for (int y = -2; y <= -1; y++)          // the two cells under the top water cell
+      for (int x = -kSheetR; x <= kSheetR; x++) {
+        if (x * x + z * z > kSheetR * kSheetR) continue;
+        pourShallow.push_back({World::SlotCellIndex({cx + x, surfY + y, cz + z}),
+                               CellOpSolute(sd->species, sheetUnits)});
+      }
+
+  std::vector<uint8_t> cb1, cb2, ca1, ca2, cg1, cg2;   // clean below / above, graze ball-only
+  double msCB = 0, msCA = 0, msBB = 0, msBA = 0, msCG = 0, msBG = 0;
   if (!render(eyeBelow, camBelow, cb1, cb2, msCB) || !render(eyeAbove, camAbove, ca1, ca2, msCA)) {
     detail = "render/readback failed (clean)";
     return Status::Fail;
@@ -1721,6 +1750,44 @@ Status GateBloodCloud(Ctx& c, std::string& detail) {
   WriteBmpFile("build/blood_cloud_clean_below.bmp", cb2, W, H);
   WriteBmpFile("build/blood_cloud_clean_above.bmp", ca2, W, H);
 
+  // The grazing control is the ball alone (photographed now, before the
+  // sheet), so the shift measured is the SHEET's, in front of it.
+  if (!render(eyeGraze, camGraze, cg1, cg2, msCG)) {
+    detail = "render/readback failed (graze control)";
+    return Status::Fail;
+  }
+  // The sheet, two ticks to land, then the grazing photograph.
+  ticker({}, pourShallow);
+  for (int i = 0; i < 2; i++) ticker({}, {});
+  // What of the sheet is there to draw: blood mass in the top 3 water layers
+  // within the sheet's radius (a sheet that never landed is not a render bug).
+  uint64_t sheetMass = 0;
+  uint32_t sheetCells = 0;
+  {
+    SoluteLayer L;
+    ReadSoluteLayer(c, L);
+    for (uint32_t slot : box.Chunks()) {
+      if (L.table[slot] == 0u) continue;
+      const IVec3 wc = c.world.SlotToWorldChunk(slot);
+      for (uint32_t k = 0; k < kChunkVol; k++) {
+        const uint32_t v = L.Value(slot, k);
+        if ((v >> 8) != sd->species || (v & 0xFFu) == 0u) continue;
+        const int qx = wc.x * 16 + (int)(k % 16) - cx, qy = wc.y * 16 + (int)((k / 16) % 16),
+                  qz = wc.z * 16 + (int)(k / 256) - cz;
+        if (qy < surfY - 2 || qy > surfY || qx * qx + qz * qz > kSheetR * kSheetR) continue;
+        sheetMass += v & 0xFFu;
+        sheetCells++;
+      }
+    }
+  }
+  std::vector<uint8_t> bg1, bg2;
+  if (!render(eyeGraze, camGraze, bg1, bg2, msBG)) {
+    detail = "render/readback failed (graze)";
+    return Status::Fail;
+  }
+  WriteBmpFile("build/blood_cloud_graze.bmp", bg2, W, H);
+  WriteBmpFile("build/blood_cloud_graze_ball.bmp", cg2, W, H);
+
   auto px = [&](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b, size_t p) {
     const size_t i = p * 4;
     return std::max({std::abs((int)a[i] - (int)b[i]), std::abs((int)a[i + 1] - (int)b[i + 1]),
@@ -1751,6 +1818,10 @@ Status GateBloodCloud(Ctx& c, std::string& detail) {
     return v;
   };
   const View below = judge(cb1, cb2, bb1, bb2), above = judge(ca1, ca2, ba1, ba2);
+  const View graze = judge(cg1, cg2, bg1, bg2);
+  // The grazing view's claim: the pixels the SHEET moved (against the
+  // ball-only control) moved toward red by at least `minRedGraze`.
+  const double grazeRed = graze.red;
 
   const double maxStrobe = BaselineNumber("bloodCloud.maxStrobe", 0.02);
   const double minBelow = BaselineNumber("bloodCloud.minFracBelow", 0.05);
@@ -1761,8 +1832,10 @@ Status GateBloodCloud(Ctx& c, std::string& detail) {
   const bool simOk = mass0 > 0 && maxStep <= maxCStep && maxRgStep <= maxNStep;
   const bool strobeOk = below.strobe - below.ctlStrobe <= maxStrobe &&
                         above.strobe - above.ctlStrobe <= maxStrobe;
+  const double minGraze = BaselineNumber("bloodCloud.minRedGraze", 10.0);
   const bool seenOk = below.frac >= minBelow && above.frac >= minAbove &&
-                      below.red >= minRed && above.red >= minRed;
+                      below.red >= minRed && above.red >= minRed && grazeRed >= minGraze;
+  RecordObserved("bloodCloud.redGraze", grazeRed);
   RecordObserved("bloodCloud.strobeBelow", below.strobe);
   RecordObserved("bloodCloud.strobeAbove", above.strobe);
   RecordObserved("bloodCloud.fracBelow", below.frac);
@@ -1778,12 +1851,16 @@ Status GateBloodCloud(Ctx& c, std::string& detail) {
       "(allow %.2f) %s | "
       "BELOW %.3f of frame (min %.3f), red shift %+.1f, strobe %.3f vs clean %.3f | "
       "ABOVE %.3f of frame (min %.3f), red shift %+.1f, strobe %.3f vs clean %.3f "
-      "(strobe allow +%.3f, red min %.1f) | frame ms below clean %.2f / blood %.2f, above "
-      "clean %.2f / blood %.2f (wall, not gated) | frames build/blood_cloud_{below,above}.bmp",
+      "(strobe allow +%.3f, red min %.1f) | GRAZE sheet %zu cells x %u poured, %u cells / mass "
+      "%llu in the top 3 layers; red shift %+.1f (min %.1f) over %.3f of "
+      "frame | frame ms below clean %.2f / blood %.2f, above "
+      "clean %.2f / blood %.2f (wall, not gated) | frames build/blood_cloud_{below,above,graze}.bmp",
       nPour, (unsigned long long)mass0, (unsigned long long)mass1, kSimTicks, cells0, cells1,
       rg0, rg1, maxStep, maxCStep, maxRgStep, maxNStep, simOk ? "steady" : "JUMPS", below.frac,
       minBelow, below.red, below.strobe, below.ctlStrobe, above.frac, minAbove, above.red,
-      above.strobe, above.ctlStrobe, maxStrobe, minRed, msCB, msBB, msCA, msBA);
+      above.strobe, above.ctlStrobe, maxStrobe, minRed, pourShallow.size(), sheetUnits, sheetCells,
+      (unsigned long long)sheetMass, grazeRed, minGraze, graze.frac, msCB,
+      msBB, msCA, msBA);
   const bool ok = simOk && strobeOk && seenOk;
   std::printf("blood-cloud: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;

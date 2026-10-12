@@ -52,6 +52,14 @@ struct SoluteDef {
   int32_t densityPerUnit = 0;    // density modifier: density += (densityPerUnit * c) >> 8  (4.2)
   uint32_t tint = 0;             // 0x00RRGGBB, linear palette colour the solvent shifts toward
   uint32_t tintStrength = 0;     // 0..255 at saturation
+  // The concentration (0..255 per full cell) at which the species shows its
+  // FULL look -- tint, glow, and for a liquid source (blood) the source's own
+  // optics. 0 = the saturation (or the lowest converts cMin), as before. A
+  // POTENT species sets it low so a dilute cloud still reads: blood in a lake
+  // is a few per cent of saturation once it spreads, and at the saturation
+  // reference that was invisible from above (ticket 2026-10-11 17:47:32).
+  // Render-only; never reaches the sim.
+  uint32_t lookFull = 0;
   uint32_t glow = 0;             // 0..255 emission added at saturation
   uint16_t precipitatesTo = 0;   // material a solvent leaves when it evaporates/boils away (0 = nothing)
   std::vector<uint16_t> solvents;       // liquids it dissolves into

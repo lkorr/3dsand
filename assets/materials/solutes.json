@@ -134,6 +134,8 @@
       "densityPerUnit": 0,
       "tint": "#5a0606",
       "tintStrength": 230,
+      "//lookFull": "2026-10-11, ticket 17:47:32 (blood cloud invisible from above). The concentration a cell shows its FULL blood look at (render-only). At the saturation reference (255) a corpse's spread drip -- a few units a cell -- drew as a few per cent blood and vanished from above the surface. Real blood is potent: a little turns a lot of water red. 48 = a cell a fifth blood already looks like blood; lower is redder and murkier (a swimmer inside sees less), higher is fainter. Hot-reloads with R.",
+      "lookFull": 48,
       "solvents": ["water"]
     }
   ]

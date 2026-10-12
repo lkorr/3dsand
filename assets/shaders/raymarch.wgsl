@@ -10306,16 +10306,14 @@ fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
   // hand-tuned coefficients blended in at the clear end. See submergedProfile:
   // there is no "is this water" test anywhere in here, only "how clear is it".
   let prof = submergedProfile(m);
-  var absorbK = prof.absorbK;
-  var scatterCol = prof.scatter;
   // Dissolved matter round a submerged eye (solPathLook): the same body rule
   // as shadeWater, so swimming into a blood cloud reddens and darkens the view
-  // through it. Before the ambient below, which is lit from scatterCol.
-  let sol = solPathLook(ro, rd, pathVox, mat);
-  if (sol.a > 0.0) {
-    scatterCol = mix(scatterCol, sol.tint * SOL_LOOK_SCATTER, solScatterShare(sol, sol.k, absorbK));
-    absorbK = absorbK * (1.0 - sol.f) + sol.k;
-  }
+  // through it. Before the ambient below, which is lit from scatterCol. The
+  // base body it composites the cloud into is the FULL extinction (the
+  // visibility term included), so a cloud near the eye covers the murk.
+  let sol = solPathLook(ro, rd, pathVox, mat,
+                        prof.absorbK + vec3f(1.0 / prof.visM), prof.scatter);
+  let scatterCol = sol.scatter;
 
   // The scatter colour is lit by the key light, so a pond at night is dark
   // water rather than the same daytime turquoise at lower brightness.
@@ -10386,7 +10384,7 @@ fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
   // 1/e ~ 37% original), and the per-channel absorption still tilts the hue
   // with depth on top of it.
   // Per liquid, so a murky one goes blind close in and a clear one does not.
-  let extinction = absorbK + vec3f(1.0 / prof.visM);
+  let extinction = sol.absorbK;
   // ...and the hard visibility distance on top: 0 at LIQ_VIS_M, where the
   // primary march stopped (liqVisFade).
   let trans = exp(-extinction * distM) * liqVisFade(distM);
@@ -10686,6 +10684,11 @@ fn solLookAt(cell : vec3<i32>, mat : u32) -> SolLook {
       (solSpec[SOLS_MAT_BASE + (mat & 0xFFFu)] & (1u << (7u + s))) == 0u) { return o; }
   let rb = SOLS_BASE + s * SOLS_STRIDE;
   var refc = max(solSpec[rb + 1u], 1u);
+  // lookFull (solutes.json, bits 16..23 of the tintStrength word): the
+  // concentration a POTENT species shows its full look at, below the
+  // saturation. 0 = not set. Blood sets it so a spread cloud still reads.
+  let look = (solSpec[rb + 7u] >> 16u) & 0xFFu;
+  if (look != 0u) { refc = min(refc, look); }
   let nc = min(solSpec[rb + 10u], 4u);
   for (var k = 0u; k < nc; k = k + 1u) {
     let row = solSpec[rb + 11u + k];
@@ -10696,12 +10699,17 @@ fn solLookAt(cell : vec3<i32>, mat : u32) -> SolLook {
   let c = min(f32(mass * 8u) / f32(full * refc), 1.0);
   let t = solSpec[rb + 6u];   // 0x00RRGGBB
   o.tint = vec3f(f32((t >> 16u) & 0xFFu), f32((t >> 8u) & 0xFFu), f32(t & 0xFFu)) / 255.0;
-  o.a = c * f32(solSpec[rb + 7u]) / 255.0;
+  o.a = c * f32(solSpec[rb + 7u] & 0xFFu) / 255.0;
   o.g = c * f32(solSpec[rb + 8u]) / 255.0;
   // A liquid source mixes (see SolLook); anything else dyes the solvent.
   let src = solSpec[rb + 15u];
   if (src != 0u && src < 4096u && materials[src].klass == CLASS_LIQUID) {
-    o.f = min(f32(mass) / f32(max(solSpec[rb], 1u) * full), 1.0);
+    // The source's share of the cell: mass over what a full cell of the
+    // source mixes into (word 0 x 8 = yieldPerVoxel), or over lookFull if
+    // that is lower -- a potent source looks like itself sooner.
+    var whole = max(solSpec[rb], 1u) * 8u;
+    if (look != 0u) { whole = min(whole, look); }
+    o.f = min(f32(mass * 8u) / f32(whole * full), 1.0);
     o.k = solSourceK(src) * o.f;
     o.a = max(o.a, o.f);
   } else {
@@ -10720,11 +10728,11 @@ fn solLookAt(cell : vec3<i32>, mat : u32) -> SolLook {
 // HOW IT WALKS: one sample per cell SLAB of the ray's dominant axis -- at the
 // ray's crossing of each mid-plane (x = k + 0.5, or y, or z) -- weighted by
 // the length of path that slab covers. The sample points are a pure function
-// of the ray and the world grid: no frame index, no dither. The result is the
-// PATH-AVERAGE strength: the shades apply it over the full depth as
-// absorption, so the optical depth is that of the cloud actually crossed
-// (Beer-Lambert: tau = INTEGRAL c ds = c_avg x L). Tint and glow are
-// strength-weighted, so a red cloud in clean water stays red.
+// of the ray and the world grid: no frame index, no dither. The slabs are
+// composited front to back (SolColumn, below), so the optical depth is that
+// of the cloud actually crossed AND a cloud near the eye covers what is
+// behind it. Tint and glow are strength-weighted, so a red cloud in clean
+// water stays red.
 //
 // WHY NOT A FEW DITHERED SAMPLES (ticket 2026-10-11 01:29:42, "blood
 // underwater strobes"). The first version took 12 samples evenly over the
@@ -10746,14 +10754,64 @@ fn solLookAt(cell : vec3<i32>, mat : u32) -> SolLook {
 // not per DDA step (the register cliff the entry-cell note above is about).
 const SOL_PATH_MAX_STEPS : u32 = 160u;
 
-fn solPathLook(ro : vec3f, rd : vec3f, pathVox : f32, mat : u32) -> SolLook {
-  var o : SolLook;
-  o.a = 0.0;
-  o.g = 0.0;
+// WHAT THE WALK RETURNS: the column as ONE equivalent homogeneous body, in
+// the coefficients the shades already speak -- `absorbK` and `scatter` such
+// that  lit x T + scatter x (1 - T),  T = exp(-absorbK x depth), is exactly
+// the front-to-back integral below. So the three shades, the liqVisFade and
+// the raster-body veil (gVAbsorb / gVScatter) keep their one formula.
+//
+// FRONT TO BACK, NOT A PATH AVERAGE (ticket 2026-10-11 17:47:32, "a cloud of
+// blood beneath the surface, but above the surface it's practically
+// invisible"). The first version averaged the solute over the path and the
+// shades applied that average to the whole column, so a cloud's in-scatter
+// was weighted by its share of the column's TOTAL extinction wherever it
+// stood in it. A thin dilute sheet just under the surface (a floating
+// corpse's drip once it has spread) is in FRONT of metres of clean water:
+// its share of a 10 m column is a few per cent and it vanished, while a
+// swimmer looking ALONG the same sheet crossed metres of it and saw it fine.
+// Integrated in order, the sheet lays its own (1 - exp(-tau)) of red over
+// everything behind it, whatever the depth: measured in the blood-cloud
+// gate's graze arm.
+//
+// Per slab: extinction  k = baseK x (1 - f) + k_sol  (the mixture rule,
+// SolLook), in-scatter = base scatter moved toward the tint by the solute's
+// share of THAT slab's extinction (solScatterShare). Clean stretches between
+// samples -- skipped chunks, solute-free cells, the tail past the visibility
+// cap -- are one closed-form step of the base body each.
+struct SolColumn {
+  any     : bool,   // some dissolved matter was crossed (else use the base body)
+  tint    : vec3f,  // the glow colour, strength-weighted over the path
+  g       : f32,    // path-average emission
+  absorbK : vec3f,  // the equivalent body (see above)
+  scatter : vec3f,
+}
+
+// How far one slab's in-scatter moves toward the tint. The tint's absorption
+// darkens the column, and with a deep or unseen bed the eye then sees mostly
+// the in-scatter -- so a scatter left at the water's own blue turned a dense
+// red cloud into darker BLUE water. The in-scatter takes the tint by the
+// solute's share of the slab's extinction (luminance-weighted), never less
+// than the strength-only mix (s.a), so an evenly mixed solution looks as it
+// did.
+fn solScatterShare(a : f32, solK : vec3f, baseK : vec3f) -> f32 {
+  let lw = vec3f(0.2126, 0.7152, 0.0722);
+  let ks = dot(solK, lw);
+  let share = ks / max(ks + dot(baseK, lw), 1e-4);
+  return clamp(max(a, share), 0.0, 1.0);
+}
+
+// `baseK` / `baseS`: the body without solute -- what the shade would use if
+// this returned !any. Lengths in voxels, coefficients per metre.
+fn solPathLook(ro : vec3f, rd : vec3f, pathVox : f32, mat : u32,
+               baseK : vec3f, baseS : vec3f) -> SolColumn {
+  var o : SolColumn;
+  o.any = false;
   o.tint = vec3f(0.0);
-  o.k = vec3f(0.0);
-  o.f = 0.0;
-  let span = min(max(pathVox, 0.0), LIQ_VIS_M / VOXEL_METERS);
+  o.g = 0.0;
+  o.absorbK = baseK;
+  o.scatter = baseS;
+  let path = max(pathVox, 0.0);
+  let span = min(path, LIQ_VIS_M / VOXEL_METERS);
   if (span <= 0.0) { return o; }
   // The dominant axis, its ray component and origin coordinate.
   let ad = abs(rd);
@@ -10769,13 +10827,17 @@ fn solPathLook(ro : vec3f, rd : vec3f, pathVox : f32, mat : u32) -> SolLook {
   // A zero component would make the chunk-exit division -inf on the near
   // side; a tiny POSITIVE stand-in picks the far face and gives +huge.
   let rdS = select(rd, vec3f(1e-30), abs(rd) < vec3f(1e-30));
+  var T = vec3f(1.0);        // transmittance from the entry to `done`
+  var L = vec3f(0.0);        // in-scatter gathered so far
+  var done = 0.0;            // path integrated so far, voxels
   var wsum = 0.0;
   for (var i = 0u; i < SOL_PATH_MAX_STEPS; i = i + 1u) {
     if (t - 0.5 * dt >= span) { break; }
     let cell = vec3<i32>(floor(ro + rd * t));
     if (solTable[voxSlotOfCell(cell)] == 0u) {
       // No dissolved matter anywhere in this chunk: jump to its far face,
-      // then to the first mid-plane past it.
+      // then to the first mid-plane past it. The stretch is integrated as
+      // clean body when the next solute slab (or the tail) is reached.
       let cmin = vec3f(cell - (cell & vec3<i32>(CHUNK_MASK)));
       let face = select(cmin, cmin + f32(CHUNK), rdS > vec3f(0.0));
       let te = (face - ro) / rdS;
@@ -10785,44 +10847,52 @@ fn solPathLook(ro : vec3f, rd : vec3f, pathVox : f32, mat : u32) -> SolLook {
       t = max((h - oM) / dM, t + dt);
       continue;
     }
-    // The stretch of path this slab stands for, clipped to [0, span].
-    let w = max(min(t + 0.5 * dt, span) - max(t - 0.5 * dt, 0.0), 0.0);
+    // The stretch of path this slab stands for, clipped to [done, span].
+    let a0 = max(t - 0.5 * dt, done);
+    let a1 = min(t + 0.5 * dt, span);
     let s = solLookAt(cell, mat);
-    if (w > 0.0 && (s.a > 0.0 || s.g > 0.0)) {
-      let k = max(s.a, s.g) * w;
-      o.tint += s.tint * k;
-      wsum += k;
-      o.a += s.a * w;
-      o.g += s.g * w;
-      o.k += s.k * w;
-      o.f += s.f * w;
+    if (a1 > a0 && (s.a > 0.0 || s.g > 0.0)) {
+      // Clean body up to the slab...
+      if (a0 > done) {
+        let e = exp(-baseK * ((a0 - done) * VOXEL_METERS));
+        L += T * baseS * (vec3f(1.0) - e);
+        T *= e;
+      }
+      // ...then the slab as its mixture.
+      let kb = baseK * (1.0 - s.f);
+      let k = kb + s.k;
+      let sc = mix(baseS, s.tint * SOL_LOOK_SCATTER, solScatterShare(s.a, s.k, kb));
+      let e = exp(-k * ((a1 - a0) * VOXEL_METERS));
+      L += T * sc * (vec3f(1.0) - e);
+      T *= e;
+      done = a1;
+      let wk = max(s.a, s.g) * (a1 - a0);
+      o.tint += s.tint * wk;
+      wsum += wk;
+      o.g += s.g * (a1 - a0);
+      o.any = true;
     }
     t += dt;
   }
-  if (wsum <= 0.0) { return o; }
-  o.tint /= wsum;
-  // Averaged over the WHOLE path (clean water counts as zero): a path longer
-  // than the visibility cap only shows what is inside the cap.
-  let inv = 1.0 / max(pathVox, span);
-  o.a *= inv;
-  o.g *= inv;
-  o.k *= inv;
-  o.f *= inv;
+  if (!o.any) { return o; }
+  // The clean tail, to the full path the shade will apply (past the cap the
+  // liqVisFade takes it to the scatter anyway).
+  if (path > done) {
+    let e = exp(-baseK * ((path - done) * VOXEL_METERS));
+    L += T * baseS * (vec3f(1.0) - e);
+    T *= e;
+  }
+  o.tint /= max(wsum, 1e-6);
+  o.g /= max(path, span);
+  // Back to one body over the path's metres: absorbK from T, scatter from L.
+  // A channel with no extinction to speak of keeps the base scatter (its
+  // L / (1 - T) is 0/0 and contributes nothing either way).
+  let Tc = max(T, vec3f(1e-12));
+  let depthM = max(path * VOXEL_METERS, 1e-4);
+  o.absorbK = -log(Tc) / depthM;
+  let opa = vec3f(1.0) - Tc;
+  o.scatter = select(baseS, L / max(opa, vec3f(1e-6)), opa > vec3f(1e-5));
   return o;
-}
-
-// How far the body's in-scatter moves toward the tint. The tint's absorption
-// darkens the column, and with a deep or unseen bed the eye then sees mostly
-// the in-scatter -- so a scatter left at the water's own blue turned a dense
-// red cloud into darker BLUE water. The in-scatter takes the tint by the
-// solute's share of the column's extinction (luminance-weighted), never less
-// than the old strength-only mix (sol.a), so an evenly mixed solution looks
-// as it did.
-fn solScatterShare(sol : SolLook, solK : vec3f, baseK : vec3f) -> f32 {
-  let lw = vec3f(0.2126, 0.7152, 0.0722);
-  let ks = dot(solK, lw);
-  let share = ks / max(ks + dot(baseK, lw), 1e-4);
-  return clamp(max(sol.a, share), 0.0, 1.0);
 }
 
 fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
@@ -10896,11 +10966,10 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // brine or ink is seen through the same colour.
   // Read along the refracted-free primary path (solPathLook), so a cloud
   // anywhere in the column shows, not only one touching the surface.
-  let sol = solPathLook(hitP, rd, pathVox, mat);
-  if (sol.a > 0.0) {
-    scatter = mix(scatter, sol.tint * SOL_LOOK_SCATTER, solScatterShare(sol, sol.k, absorbK));
-    absorbK = absorbK * (1.0 - sol.f) + sol.k;
-  }
+  // Composited front to back into one equivalent body (SolColumn).
+  let sol = solPathLook(hitP, rd, pathVox, mat, absorbK, scatter);
+  absorbK = sol.absorbK;
+  scatter = sol.scatter;
   // liqVisFade: the march stopped at LIQ_VIS_M of water, so the column must be
   // fully opaque by then or the stop shows as an edge (whatever the stopped
   // ray resolved would leak through at exp(-0.2 * 10) = 13% blue).
@@ -13369,11 +13438,9 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   // all, so it vanished wherever the water moved (ticket 2026-10-11 01:29:42,
   // "hardly visible from beneath the surface"). The solvent is the CA liquid
   // under the particles, or the particles' own.
-  let sol = solPathLook(hitP, rd, colVox, select(s.mat, caMat, caMat != MAT_AIR));
-  if (sol.a > 0.0) {
-    body = mix(body, sol.tint * SOL_LOOK_SCATTER, solScatterShare(sol, sol.k, absorb));
-    absorb = absorb * (1.0 - sol.f) + sol.k;
-  }
+  let sol = solPathLook(hitP, rd, colVox, select(s.mat, caMat, caMat != MAT_AIR), absorb, body);
+  absorb = sol.absorbK;
+  body = sol.scatter;
   let trans = exp(-absorb * thickM);
   // The water veil (gV* globals): the same two coefficients a raster body in
   // this column is dimmed by. Delta is refined below once `behind` is known.

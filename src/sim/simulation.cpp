@@ -1865,7 +1865,9 @@ void Simulation::UploadSolutes(const rhi::Queue& queue, const std::vector<Solute
     r[4] = std::min<uint32_t>(d.floor, 0xFFFFu) | (std::min<uint32_t>(d.decayQ, 0xFFFFu) << 16);
     r[5] = (uint32_t)d.densityPerUnit;
     r[6] = d.tint;
-    r[7] = d.tintStrength;
+    // tintStrength in the low byte, lookFull (the render's full-look
+    // concentration, 0 = the saturation) in bits 16..23: the row is full.
+    r[7] = std::min<uint32_t>(d.tintStrength, 255u) | (std::min<uint32_t>(d.lookFull, 255u) << 16);
     r[8] = d.glow;
     r[9] = d.precipitatesTo;
     const uint32_t nc = std::min<uint32_t>((uint32_t)d.converts.size(), kSolConvertsMax);
