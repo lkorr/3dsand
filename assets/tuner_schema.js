@@ -981,6 +981,7 @@ const TUNING_SCHEMA = [
       {k:'waterEntryLength', n:'water entry depth', d:'A limp or dead body falling into water is slowed as one body, harder the faster it goes and the more of it is under: speed falls by a factor of e every this many metres. From terminal velocity it goes about 2.6 of these deep before ordinary water drag takes over. A hard enough entry is still billed as a landing.', step:0.1, u:'m'},
       {k:'waterEntrySpeed', n:'water entry speed', d:'Above this speed a body entering water is braked by the entry rule (water entry depth); below it, by ordinary per-limb water drag.', step:0.5, u:'m/s'},
       {k:'devSeconds', n:'dev button hold', d:'How long the dev panel\u2019s \u201cragdoll me\u201d keeps the player limp before the get-up may begin.', step:0.5, u:'s'},
+      {k:'spinDamping', n:'limp limb spin damping', d:'How quickly a limp or dead body’s limbs stop spinning. Debris uses physics angular damping; ragdolls use this. Higher keeps a flung hand from whirling at the solver’s spin ceiling after a hard graze.', step:0.05, u:'/s'},
     ],
   },
 

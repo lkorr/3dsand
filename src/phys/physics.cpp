@@ -3482,6 +3482,19 @@ void Physics::SetBodyRole(uint64_t handle, BodyRole role, uint64_t owner) {
   // The collider follows the role (a corpse is one convex a limb), before any of
   // the early returns below.
   ApplyCorpseCollider(handle);
+  // Limp and dead limbs spin down faster than debris (ragdoll.spinDamping):
+  // a hard graze could leave a hand at the 47 rad/s ceiling until the runaway
+  // net cut the wrist (ticket 2026-10-09_15-16-57). Every other role keeps
+  // the debris value it was created with, so a role change back restores it.
+  {
+    const bool rag = role == BodyRole::RigLimp || role == BodyRole::RigDead;
+    const auto& tune = CurrentTuning();
+    const float damp = rag ? tune.ragdoll.spinDamping
+                           : tune.physics.debrisAngularDamping;
+    JPH::BodyLockWrite lock(system_->GetBodyLockInterface(), id);
+    if (lock.Succeeded() && lock.GetBody().IsDynamic())
+      lock.GetBody().GetMotionProperties()->SetAngularDamping(damp);
+  }
   const int slot = OwnerSlot(owner);
   auto pendingAt = std::find(pendingRelease_.begin(), pendingRelease_.end(), handle);
   const bool pending = pendingAt != pendingRelease_.end();

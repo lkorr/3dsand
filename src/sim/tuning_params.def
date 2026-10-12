@@ -1742,6 +1742,10 @@ TP_F(ragdoll, getUpSeconds, NO_WGSL, 1.5f, 0.1f, 6.0f)
 TP_F(ragdoll, getUpPitchDeg, NO_WGSL, 60.0f, 0.0f, 90.0f)
 TP_F(ragdoll, getUpDropFrac, NO_WGSL, 0.45f, 0.0f, 1.0f)
 TP_F(ragdoll, devSeconds, NO_WGSL, 3.0f, 0.5f, 30.0f)
+// Angular damping (/s) on a limp or dead rig's limbs, replacing debris' 0.15.
+// A hard graze could leave a hand spinning at Jolt's 47 rad/s ceiling until
+// the runaway net cut the wrist (ticket 2026-10-09_15-16-57).
+TP_F(ragdoll, spinDamping, NO_WGSL, 0.8f, 0.0f, 5.0f)
 TP_F(ragdoll, corpseAirFraction, NO_WGSL, 0.07f, 0.0f, 0.5f)
 TP_F(ragdoll, limpWaterLift, NO_WGSL, 0.8f, 0.0f, 5.0f)
 // A loose rig entering water above waterEntrySpeed (m/s) is braked as one
