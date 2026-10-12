@@ -19,6 +19,7 @@ import broken_column from './ruins/broken_column.js';
 import bones from './ruins/bones.js';
 import urn from './ruins/urn.js';
 import banner from './ruins/banner.js';
+import door from './ruins/door.js';
 import glow_mushroom_patch from './caves/glow_mushroom_patch.js';
 import bone_pile from './caves/bone_pile.js';
 import crystal_cluster from './caves/crystal_cluster.js';
@@ -26,7 +27,7 @@ import campfire_remains from './caves/campfire_remains.js';
 import rope_ladder from './caves/rope_ladder.js';
 
 const LIST = [ore_cart, rail_segment, bunk, crate, barrel, lantern, pickaxe_rack, table, ladder,
-              altar, statue, sarcophagus, brazier, candle_cluster, broken_column, bones, urn, banner,
+              altar, statue, sarcophagus, brazier, candle_cluster, broken_column, bones, urn, banner, door,
               glow_mushroom_patch, bone_pile, crystal_cluster, campfire_remains, rope_ladder];
 
 export const PROPS = {};

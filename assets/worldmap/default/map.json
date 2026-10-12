@@ -5446,5 +5446,8 @@
       }
     ]
   },
-  "editLayer": "default_ground"
+  "editLayer": "default_ground",
+  "dungeons": [
+    { "id": "heather_cairn", "name": "The Tarn Cairn", "dungeon": "heather_cairn", "at": [-56045, -33555], "yOffset": -147, "yaw": 180 }
+  ]
 }

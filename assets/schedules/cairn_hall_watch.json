@@ -1,0 +1,6 @@
+{
+  "about": "The Tarn Cairn (dungeon heather_cairn): one of the dead walking the columned hall, door to the fallen end and back.",
+  "rows": [
+    { "from": "00:00", "to": "24:00", "do": "patrol", "route": ["wn_p2_c0", "wn_p2_c4", "wn_p2_c5"], "mode": "pingpong", "wait": 3 }
+  ]
+}
