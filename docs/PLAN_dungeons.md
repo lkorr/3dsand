@@ -920,6 +920,19 @@ Branch `worktree-agent-ab944579306ce5fe1` off `dungeons` (af74adc).
   (`<lock>.queue/` tickets; `scripts/test_svlock_fair.py`). Variants and
   any-map placement are in the UI; variant editing waits for D8's
   `resolveDungeon`.
-- **Hash.** The harness determinism hash is not expected to move: every
-  placement is 400+ m from the window. The default map's worldgen moves
-  (trees near the three example entrances, scatter). Rebaseline once at merge.
+- **Underground haze** (`raymarch.wgsl`, render-only). The fog colour now
+  mixes toward `render.enclosedAmbient` instead of the sky. The weight is the
+  larger of two tests, and the fog amount is unchanged:
+  - `eyeSkyK`: the openness of the floor under the camera.
+  - `farHitBuried`: the far map's surface stands over the hit.
+
+  Buried far hits also lose sky and bounce light. Results:
+  - The Tarn Cairn hall's far-end crop mean dropped from 133 to 36.
+  - Outdoor `--shot` frames are unchanged within run-to-run noise.
+  - A view out through a doorway from a dark room still fogs to sky.
+
+  Bodies still fog via `common.wgsl bodyAirFog`, which was not touched.
+- **Hash.** The harness determinism hash did NOT move (`ef7d9a06`, final
+  `--verify`), because every placement is 400+ m from the window. The default
+  map's worldgen does move: trees near the three example entrances, and
+  scatter. Rebaseline once at merge.
