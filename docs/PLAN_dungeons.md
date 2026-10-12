@@ -682,3 +682,164 @@ harness window and a map with no dungeon packs no block.
   cylinders / vaults inflate their index bounds by their axis ratio (<= 256).
 - voxserve resolves the anchor at the environment's seed (kDefaultSeed),
   whatever the DUNGEON command's `<seed>`.
+
+## D2 NOTES — the JS generator library (2026-10-12)
+
+Package D2 (Node-only). Everything below is in `assets/editor/dungeon/`,
+`assets/dungeons/props/`, `scripts/compile_dungeon.mjs`,
+`scripts/make_dungeon_sample.mjs`, `scripts/test_dungeongen.mjs`. Pure ES
+modules: no DOM, no Math.random, the same code in Node and the tuner.
+
+### Modules and API (what D4 builds on)
+
+- `dgutil.js` — counter hash (`hashN`, `frand(seed, ...key)`, `strHash`),
+  quarter-turn transforms (`rotV`, `xformP` for continuous points, `xformCell`
+  for cells = 3.4.1 `Rot`, `xformPrim`), shape containment (`primContains`,
+  `shapeBounds`, `primReach`, `rampProfile`), the schema row vocabulary
+  (`universalSchema`, `normalizeParams`, `defaultsOf`), the piece `Builder`,
+  and `defineKit`.
+- `kit_caves.js`, `kit_mines.js`, `kit_ruins.js` — `KIT = {name, label,
+  PALETTES, DEFAULT_PALETTE, lightTypes, GROW, CAPS, TYPES, TYPE_ORDER, ...}`;
+  each `TYPES[t] = {type, label, version, surface?, SCHEMA, PRESETS,
+  defaults(), normalize(src), generate(params, seed, ctx) -> §3.3 result,
+  migrate?(params, fromVersion)}`.
+- `dungeongen.js` (core): `listTypes(kit)`, `getType(kit, type)`,
+  `pieceSchema(kit, type)`, `presetParams(kit, type, preset)`,
+  `newDungeon({name, style, seed})`, `newPiece(d, {kit, type, preset?,
+  params?, id?, pos?, yaw?, seed?})`, `nextPieceId(d)`, `normalizePiece(p)`,
+  `migratePiece(p)`, `normalizeDungeon(d)`, `pieceSeed(d, p)`,
+  `generatePiece(d, p)` (local frame), `placePiece(d, p)` (dungeon frame),
+  `socketsOf(d)`, `socketCompat(a, b) -> {ok, taper, reason}`,
+  `snapTransform(targetSocket, localSocket) -> {pos, yaw}`,
+  `resolveLinks(d)`, `taperPrims(a, b, blend)`, `attachPiece(d, {piece,
+  socket}, {kit, type, preset?, params?, fit?, checkOverlap?}) -> {dungeon,
+  piece}`, `grow(d, {piece, socket}, {count, kit?, branch, seed, types?,
+  close?}) -> {pieces, links, open, notes}`, `applyProposal(d, proposal)`,
+  `compile(d, {id, sourceText, materials}) -> program`,
+  `emitShellJson(program)`, `emitShellBin(program) -> Uint8Array`,
+  `validate(d, {refs, groundAt, waterAt, minCover, materials}) ->
+  [{severity, code, piece, msg, at?}]`, `resolvePalette(d, kit)`,
+  `bakeProp(propId, params, seed, resolve)`, `instancePos(tpl, pos, yaw)`,
+  `dungeonJsonText(d)` (the canonical file text), `sourceHashOf(text)`,
+  `PROPS`, `PROP_IDS`.
+- `assets/dungeons/props/index.js` — `PROPS['<kit>/<name>']`; each prop
+  `{id, name, kit, label, version, SCHEMA, PRESETS, generate(params, seed) ->
+  {cells: [{x, y, z, mat}]}}`, drawn with `propkit.js` (`Grid`, `CARVE`).
+  mines: ore_cart, rail_segment, bunk, crate, barrel, lantern, pickaxe_rack,
+  table, ladder; ruins: altar, statue, sarcophagus, brazier, candle_cluster,
+  broken_column, bones, urn, banner; caves: glow_mushroom_patch, bone_pile,
+  crystal_cluster, campfire_remains, rope_ladder.
+
+### Piece types (every one of §4; 3-5 presets each)
+
+| kit | types |
+|---|---|
+| caves | `mouth` (hillside / sinkhole / seacave; surface), `tunnel`, `cavern`, `shaft` (optionally a surface pothole), `chasm`, `grotto_pool`, `crawl`, `rubble_choke` |
+| mines | `adit_entrance` (surface), `drift`, `junction` (T / X / L / Y: §4's crosscut), `incline`, `shaft` (optional surface collar + headframe), `stope`, `collapse`, `flooded_sump`, `camp` |
+| ruins | `ruin_entrance` (surface), `hall`, `corridor`, `stair` (straight / switchback / square spiral), `crypt`, `pit_room`, `sanctum`, `flooded_hall`, `collapsed_passage` |
+
+Universal sliders (core-supplied rows, same effect in every kit): width,
+length, height, ceiling rise, floor unevenness, wall roughness + scale,
+decay, moisture, deco density, light count / type / warmth, blend radius,
+symmetry break. A type may relabel or drop a size row (a shaft's "length"
+is its depth) and sets its own defaults.
+
+### Palettes (slot -> material NAME, by variant)
+
+- caves (`limestone` default, `basalt`, `ice`, `sea`): wall, floor, ceil,
+  trim (flowstone), support (columns), rubble, accent, light, lightCool,
+  liquid, ore, moss, fungus, veg, hang, beach, soil, loose.
+- mines (`granite` default, `sandstone`, `basalt`, `crystal`): wall, floor,
+  ceil, trim (planks), support (`timber`: burns), rubble, accent, light,
+  lightCool, liquid, ore, moss, rail, spoil, loose.
+- ruins (`temple` default, `sandstone`, `dark`, `marble`): wall, floor,
+  ceil, trim, support (columns), rubble, accent, light, lightCool, liquid,
+  ore, moss, tile2, veg, statue, cloth, loose.
+
+`dungeon.palette = {variant?, <slot>: name, kits: {<kit>: {variant?, <slot>:
+name}}}`; top-level slots apply to the dungeon's style kit. The test pins:
+every slot names a real material, rubble is a powder, walls are static
+solids, light slots are emissive, mine supports burn.
+
+### Contract assumptions and deviations (read before merging D1 + D2)
+
+1. **Frames.** A piece's origin socket is at (0,0,0) facing -Z, body to +Z,
+   floor at y = 0. A socket `pos` is the centre of the FLOOR LINE of its
+   opening (a lattice point); a vertical socket's is the centre of the
+   opening plane. Props / refs / waynodes are CELLS and rotate with 3.4.1
+   `Rot`; prim boxes rotate as continuous half-open boxes (the same thing).
+   The compiled shell is translated so the ENTRANCE socket is the origin:
+   `anchor` is always `[0,0,0]`.
+2. **dungeon.json additions** (optional; the engine ignores them): piece
+   `version` (the migration hook), `autoProps: false` (drop that piece's
+   suggested props), `label`; prop `seed`; `palette.variant` /
+   `palette.kits`. `entrance: null` = the first socket tagged `surface`.
+3. **shell.json = 3.4.1** plus D2 extras the engine ignores: name, style,
+   seed, generator, entrance, bounds, limits, usedMaterials, pieces,
+   waynodes, refs, sockets, errors, warnings; prim extra `tag`; instance
+   extra `piece`. `naturalCaves` is true only when every piece is a caves
+   piece. Every `mat` is a resolved material NAME (a mixed-kit dungeon has
+   several palettes); `materials` is the style's resolved palette.
+4. **Liquids are carves with `mat` + `level`** (pools, sumps, flooded halls,
+   pit water / lava, chasm streams), never fills.
+5. **Dropped at emission (no 3.4.1 field):** `mask: 'air'` on fills (rubble
+   heaps, boulders, cave floors, toppled columns meant "fill open space
+   only"; the engine fills the whole shape, so a heap's buried half turns
+   rock to rubble inside the wall: buried, so at rest, but D1 may want a
+   `mask` later) and the floor `pattern` (checker; `border` / `runner` are
+   real boxes and survive). Noise amplitude rounds to whole voxels (ruins'
+   dressed walls mostly lose theirs, intended); `scale` = log2 of the
+   voxel feature size.
+6. **Skins** are emitted inflated by their thickness (3.4.1 paints inside
+   the skin prim's own shape). **Ramps** follow 3.4.1; the generator cuts
+   the footprint to (steps + 1) x stepD and adds a flat box for any
+   remainder, so the uncapped profile never overshoots.
+7. **Scatter**: 3.4.1's 0..1 density, size clamped to 32. Over four rules
+   on one carve ride on twins of that carve (same shape, noise, liquid;
+   blend 0; `tag: 'scatter'`) placed right after it: union and re-cut
+   unchanged.
+8. **Props**: template `id` = `<kit>/<name>#<8 hex>`, `'@carve'` first in
+   the palette when used, voxels template-local; an instance's `pos` is the
+   rotated footprint's MIN cell. Ladders longer than 20 m are stacked
+   segments (a template is at most 256 cells).
+9. **Engine limits** are checked at compile (64 prims / 32 instances per
+   64^3 cell at grid alignments 0 and 32 — the placement is not known here;
+   2048 cells an axis); `validate` reports them as `limit` errors.
+10. **shell.bin** is written by `emitShellBin` per the 3.4.1 layout (8 words
+    a scatter rule). D1's `ReadShellBin` at fe0c156 reads 10 — reported on
+    the board; until fixed, `--dungeon-bake` rewrites the .bin. The test
+    reads the .bin back with a JS reader of the documented layout.
+11. **Suggested refs** (`program.refs`, `suggested: true`, anchor frame; D3/D4
+    decide what becomes refs.json): `light`, `container` (`props.loot`:
+    `mine_common`, `mine_camp`, `tomb_offering`, `crypt_key`, `sanctum` —
+    placeholders for D3's tables), `marker` (`tags`: bed / sign / altar),
+    `trap` (`collapse_floor` + `region`, `spikes`), `spawner` (`mobs:
+    [{base: 'human'}]`, `behavior: 'guard'`), and a `door` at every linked
+    socket tagged `door` (ruins doorways, the mine camp).
+12. **Waynodes** are `<piece>/<node>`; joins replace `socket:<name>`. Extra
+    flags: `climb` (+ `ladder`; without a ladder a shaft is a one-way drop),
+    `swim`, `dig` (a sealed choke), `crawl`, `pit` (not walkable).
+13. **validate** frames: `refs`, `groundAt`, `waterAt` are in the ANCHOR
+    frame (= the shell's frame = refs.json's frame).
+
+### Verification
+
+`node scripts/test_dungeongen.mjs` — 2,800 checks: every type x preset (x2
+seeds) generates and compiles alone with zero errors under the engine
+limits; sockets well-formed, carved just inside, outward-facing; slider
+monotonicity; one slider never moves unrelated seeded choices; compile
+byte-identical twice (json + bin); grow reproducible by seed and clean in
+all three kits; validate catches overlap, open socket, unreachable piece,
+missing key / key behind its own lock, dead signal, surface breach; taper
+on a near-miss join, refusal of a far one; shell.bin reads back to the
+JSON; every prop x preset; the sample is current and clean.
+`node scripts/compile_dungeon.mjs --all --check` is the staleness check.
+
+### Known gaps
+
+- No GPU proof yet that the voxels match intent (D1's isolate preview /
+  `dungeon-gen`); the JS containment is the un-noised mirror only.
+- `grow` sizes a piece to its socket (`fit`) but does not steer depth or
+  read terrain.
+- The spiral stair is a square newel stair; switchbacks turn one way.
+- Loot table / spawner names in suggested refs are placeholders for D3.
