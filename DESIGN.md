@@ -17497,8 +17497,14 @@ where you hear from either (§12b, "The ears are on the character").
   the tint fixes any of those. Liquids now carry BOTH halves: the volume terms
   (`mediaTau`/`mediaTint`) still accumulate, and `trace()` additionally records
   where the ray first crossed into liquid (`liqT`/`liqCell`/`liqAxis`) plus the
-  total distance travelled inside it (`liqPath`). `shadeWater()` then builds a
-  real air/water interface there:
+  total distance travelled inside it (`liqPath`). The volume terms are no
+  longer a COLOUR for liquids: `fs()`'s gas composite subtracts the liquid's
+  share (`liqPath` x its opacity, in its palette average) before shading the
+  gas, because `mediaMat` latches the first medium met and a ray that crossed
+  any gas before water otherwise painted the water's deep palette as fog
+  (ticket 2026-10-11_21-54-18: saturated blue cubes in the hydrogen over a
+  sodium blast). `fireGlow`'s dimming still reads the full sum. `shadeWater()`
+  then builds a real air/water interface there:
   - **Normal from the fullness field, not the voxel face.** The liquid state
     nibble is fill level in eighths (§4), so the liquid column height varies
     cell to cell and its gradient is the true macro slope of the surface —
