@@ -1,0 +1,6 @@
+{
+  "about": "The Shardwell (dungeon): the watchman automaton at the foot of the haulage incline.",
+  "rows": [
+    {"from":"00:00","to":"24:00","do":"guard","at":"watch_post"}
+  ]
+}

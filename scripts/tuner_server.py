@@ -1116,6 +1116,13 @@ def _dungeon_catalog():
             return sorted(os.path.splitext(n)[0] for n in os.listdir(d) if n.endswith(ext))
         except OSError:
             return []
+    def mobs_subdirs():
+        try:
+            return [s for s in sorted(os.listdir(os.path.join(ASSETS, "mobs")))
+                    if s not in ("effects", "pool") and not s.startswith(".")
+                    and os.path.isdir(os.path.join(ASSETS, "mobs", s))]
+        except OSError:
+            return []
     mobs = stems(os.path.join(ASSETS, "mobs"), ".vox")
     try:
         for sub in sorted(os.listdir(os.path.join(ASSETS, "mobs"))):
@@ -1125,6 +1132,16 @@ def _dungeon_catalog():
             mobs += stems(sd, ".vox")
     except OSError:
         pass
+    # A def with no .vox of its own (human/zombie.json: `extends` the human and
+    # draws its body) is a mob def all the same -- the engine names it by stem.
+    for d in [os.path.join(ASSETS, "mobs")] + [os.path.join(ASSETS, "mobs", s) for s in mobs_subdirs()]:
+        for st in stems(d, ".json"):
+            try:
+                with open(os.path.join(d, st + ".json"), "r", encoding="utf-8") as f:
+                    if "extends" in json.load(f):
+                        mobs.append(st)
+            except (OSError, ValueError, TypeError):
+                pass
     behaviors = []
     try:
         with open(os.path.join(ASSETS, "mobs", "behaviors.json"), "r", encoding="utf-8") as f:

@@ -1,0 +1,6 @@
+{
+  "about": "The Shardwell (dungeon): the Glimmer's dead, asleep in the crystal stope until someone comes close.",
+  "rows": [
+    {"from":"00:00","to":"24:00","do":"lair","at":"glimmer_heart","radius":7}
+  ]
+}

@@ -67,6 +67,24 @@ function timberSet(b, P, key, i, z, hw, H, t, opt) {
   return {broken, mode};
 }
 
+/** Translate everything a piece has drawn so far by t (voxels): a type that is
+ *  easiest to draw round some other point re-bases onto its origin socket. */
+function shiftBuilder(b, t) {
+  const S = (v) => v.map((x, i) => x + t[i]);
+  for (const p of b.prims) {
+    for (const k of ['min', 'max', 'a', 'b']) if (p[k]) p[k] = S(p[k]);
+    if (p.pts) p.pts = p.pts.map(S);
+  }
+  for (const s of b.sockets) s.pos = S(s.pos);
+  for (const p of b.props) p.pos = S(p.pos);
+  for (const r of b.refs) {
+    r.pos = S(r.pos);
+    if (r.props && r.props.region && r.props.region.min) r.props.region = {min: S(r.props.region.min), max: S(r.props.region.max)};
+  }
+  for (const w of b.waynodes) w.pos = S(w.pos);
+  for (const l of b.lightSpots) l.pos = S(l.pos);
+}
+
 /** Rails along +Z from z0 to z1 (floor y0), gauge g, sleepers every sp. */
 function rails(b, z0, z1, g, sp, y0, key) {
   y0 = y0 || 0;
@@ -302,19 +320,26 @@ const SHAFT = {
     {k: 'surfaceTop', n: 'surface collar', kind: 'bool', def: false, d: 'The shaft opens at the surface: a stone collar, and a headframe if asked. Makes this an entrance piece.'},
     {k: 'headframe', n: 'headframe', kind: 'bool', def: true, d: 'Timber A-frame and wheel over a surface collar.'},
     {k: 'cage', n: 'cage at the foot', kind: 'bool', def: false, d: 'An iron hoist cage standing at the bottom.'},
-    {k: 'sump', n: 'sump water (m)', min: 0, max: 3, step: 0.1, def: 0, d: 'Water standing below the foot station floor.'}
+    {k: 'sump', n: 'sump water (m)', min: 0, max: 3, step: 0.1, def: 0, d: 'Water standing below the foot station floor.'},
+    {sec: 'Between two levels', note: 'A WINZE: the shaft starts from a station on an upper drift instead of opening upward, so it joins two levels with horizontal sockets (the collar station is the origin socket: drop the piece on an upper drift and it hangs down from it).'},
+    {k: 'collarStation', n: 'collar station', kind: 'bool', def: false, d: 'A station cut at the collar (the origin socket, facing -Z); the shaft rises a little above it and has no top (+Y) socket. Ignored with a surface collar.'},
+    {k: 'headroom', n: 'headroom (m)', min: 0, max: 6, step: 0.1, def: 1.2, d: 'How far the shaft is cut above the collar station\'s ceiling (room for the windlass).'},
+    {k: 'windlass', n: 'windlass', kind: 'bool', def: true, d: 'A timber windlass (two posts and a drum) over the collar, and collar timbers round the hole.'},
+    {k: 'footSide', n: 'foot station side', kind: 'enum', options: ['+z', '+x', '-x', '-z'], def: '+z', d: 'Which wall of the shaft the foot station is cut from (+z = opposite the collar station, -z = under it).'}
   ],
   PRESETS: {
     winze: {params: {}},
     main_shaft: {params: {width: 3.6, length: 30, landings: 2, surfaceTop: true, headframe: true, cage: true, lightCount: 4}},
     ladderway: {params: {width: 1.8, length: 12, landings: 0, cribSpacing: 1, decay: 0.4}},
-    drowned: {params: {length: 20, sump: 2.5, ladder: false, decay: 0.7, moisture: 0.9, broken: 0.4}}
+    drowned: {params: {length: 20, sump: 2.5, ladder: false, decay: 0.7, moisture: 0.9, broken: 0.4}},
+    level_winze: {params: {collarStation: true, length: 18, landings: 0, footSide: '-x', width: 2.6, cribSpacing: 1.6, decay: 0.45, lightCount: 1}}
   },
   build(b, P) {
     const S = b.m(P.width, 10), D = b.m(P.length, 20), H = b.m(P.height, 14), sd = b.m(P.stationDepth, 8);
     const hs = Math.round(S / 2);
     b.surface = P.surfaceTop;
-    const top = P.surfaceTop ? b.m(1) : 0;
+    const winze = P.collarStation && !P.surfaceTop;
+    const top = P.surfaceTop ? b.m(1) : winze ? H + b.m(P.headroom) : 0;
     b.room('box', {min: [-hs, -D, -hs], max: [hs, top, hs]});
     // Cribbing: square frames.
     const cs = b.m(P.cribSpacing, 4);
@@ -342,6 +367,20 @@ const SHAFT = {
       return mid;
     };
     const ways = [];
+    // A winze's collar station first, so it is the socket a drop attaches by.
+    const collarMid = winze ? station('collar', 0, '-z') : null;
+    if (winze && P.windlass) {
+      // Collar sills along the two side walls (flush with the station floor),
+      // two posts on them and a drum across the hole.
+      const wh = Math.max(8, Math.min(top - 2, b.m(1.5)));
+      for (const s of [-1, 1]) {
+        const x0 = s < 0 ? -hs : hs - 2;
+        b.fill('box', {min: [x0, -2, -hs], max: [x0 + 2, 0, hs]}, {mat: 'support', layer: 3, noise: null});
+        b.fill('box', {min: [x0, 0, -1], max: [x0 + 2, wh, 1]}, {mat: 'support', layer: 3, noise: null});
+      }
+      b.fill('cylinder', {min: [-hs + 2, wh - 6, -2], max: [hs - 2, wh - 2, 2], axis: 'x'}, {mat: 'support', layer: 3, noise: null});
+      b.fill('box', {min: [-1, Math.round(-D / 3), -1], max: [0, wh - 4, 0]}, {mat: 'trim', layer: 3, noise: null, tag: 'rope'});
+    }
     // The foot: a floor across the shaft at -D (above the sump if any).
     const sump = b.m(P.sump);
     if (sump > 0) {
@@ -349,7 +388,7 @@ const SHAFT = {
       // planking over the sump
       b.fill('box', {min: [-hs, -D - 1, -hs], max: [hs, -D, hs]}, {mat: 'trim', layer: 3, noise: null});
     } else b.fill('box', {min: [-hs, -D - 2, -hs], max: [hs, -D, hs]}, {mat: 'floor', noise: 'floor', layer: 2});
-    const foot = station('foot', -D, '+z');
+    const foot = station('foot', -D, P.footSide);
     ways.push({name: 'foot', pos: foot, sock: 'foot'});
     for (let k = 0; k < P.landings; k++) {
       const y = -D + Math.round((D * (k + 1)) / (P.landings + 1));
@@ -380,8 +419,15 @@ const SHAFT = {
       links.push(i + 1 < order.length ? order[i + 1].name : 'top');
       b.way(w.name, w.pos, links, {climb: true, ladder: P.ladder});
     });
-    b.way('top', [0, 0, 0], [order[order.length - 1].name, 'socket:top'], {climb: true, ladder: P.ladder});
-    b.socket('top', [0, 0, 0], '+y', S, S, 'shaft');
+    if (!winze) {
+      b.way('top', [0, 0, 0], [order[order.length - 1].name, 'socket:top'], {climb: true, ladder: P.ladder});
+      b.socket('top', [0, 0, 0], '+y', S, S, 'shaft');
+      return;
+    }
+    b.way('top', [0, 0, -hs + 1], [order[order.length - 1].name, 'collar'], {climb: true, ladder: P.ladder});
+    b.way('collar', collarMid, ['top', 'socket:collar']);
+    // Re-base so the collar socket is the origin (the drop / attach socket).
+    shiftBuilder(b, [0, 0, hs + sd]);
   }
 };
 
@@ -583,7 +629,8 @@ const SUMP = {
     b.carve('rbox', {min: [px0, -SD, pz0], max: [hw, 1, pz1], r: 4}, Object.assign({layer: 3, noise: 0.8, blend: 2}, wet));
     if (lvl > 0) { b.prims[roomI].mat = 'liquid'; b.prims[roomI].level = lvl - 1; }   // standing over the floor, behind the sills
     if (P.pumpGear && P.deco > 0.2) {
-      b.prop('mines/barrel', {}, [-hw + 3, 0, z0 + 4], 90);
+      // Clear of the room's rounded corner (r 6), or it stands in rock.
+      b.prop('mines/barrel', {}, [-hw + 6, 0, z0 + 6], 90);
       b.ladder('mines/ladder', P.sumpDepth + 0.3, [px0 + 2, -SD, Math.round((pz0 + pz1) / 2)], 90);
     }
     b.lightSpot([-hw + 2, b.m(1.8), Math.round((z0 + z1) / 2)], 'wall', '+x');
