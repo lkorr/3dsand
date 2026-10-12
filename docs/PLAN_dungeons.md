@@ -697,15 +697,14 @@ The determinism hash does not move (`ef7d9a06`): the fixture is 2 km from the
 harness window and a map with no dungeon packs no block.
 
 **Known limitations** (for D2 / D4 and the orchestrator):
-- Floor / ceiling scatter searches the CARVE FIELD for its support, not the
+- ~~Floor / ceiling scatter searches the CARVE FIELD for its support, not the
   final voxels: a feature can stand on a fill the carve cut (fine) but also
-  "on" open sky where a carve meets the surface. Keep stalactites off
-  `surface: true` pieces.
-- A puddle's containment is checked against the carve field; terrain air next
-  to it (a surface piece) is not seen.
-- The firm shell turns powder / liquid within 2 voxels of a carve to `firm`,
-  but a tree whose trunk a carve cuts keeps its crown (the island detector may
-  later drop it as debris). Entrances through forest want a clearing.
+  "on" open sky where a carve meets the surface.~~ FIXED D9: `dgSolidAt`.
+- ~~A puddle's containment is checked against the carve field; terrain air next
+  to it (a surface piece) is not seen.~~ FIXED D9 (solidity + under the ground).
+- ~~The firm shell turns powder / liquid within 2 voxels of a carve to `firm`,
+  but a tree whose trunk a carve cuts keeps its crown.~~ FIXED D9: the surface
+  keep-out (no tree near where a dungeon reaches the ground).
 - Far field: shapes and props only (`dgCellCoarse`); underground pieces are
   not drawn from afar, and the far surface map (`farmap`) does not see a ruin
   above the ground (the cascades do).
@@ -874,3 +873,53 @@ JSON; every prop x preset; the sample is current and clean.
   read terrain.
 - The spiral stair is a square newel stair; switchbacks turn one way.
 - Loot table / spawner names in suggested refs are placeholders for D3.
+
+## 10. D9 report (engine + tool fixes, 2026-10-12)
+
+Branch `worktree-agent-ab944579306ce5fe1` off `dungeons` (af74adc).
+
+- **Trees at entrances.** `dungeon::SurfaceRects` (placement time, the bare
+  ground) marks the 8-voxel lattice tiles where a prim reaches the ground. It
+  uses the raw shape box, plus noise, blend / 4 and 2; curved or noisy prims
+  are tested by their own twin distance at the column. Props count the same
+  way. Row runs become rects, at most 48 per dungeon.
+  - Packed at `DG_H_SURF*`. `worldgen_dungeon.wgsli dgSurfNear` gates
+    `treeInfoBare` (crown square `reach + 8`), ground cover (`genCellIn`,
+    `farFeatFill`), tile plants (+3) and cacti (+2).
+  - Terrain-side: it holds with the evaluator off.
+  - `dungeon-gen` G runs four arms over every placement's rects. With the
+    keep off, the harness placements would cut 90k tree cells
+    (teeth_caves 76k). With it on they cut 0 cells, and nothing above ground
+    stands inside a rect. ~12 s of the gate.
+- **Scatter support.** `dgCell(..., gh)` with the column ground; the probes
+  use `dgSolidAt` (the ordered pass on solidity, terrain solid at or under
+  `gh`).
+  - No stalactite from open sky; puddles only under the ground.
+  - The gate's B line reports the ground bound's effect per placement
+    (shardwell on flat harness land: 59 cells).
+  - It also reports the fixture chamber's rubble over the whole floor (587
+    gravel cells via the twin). The sampled chunks happen to miss the piles,
+    so "gravel 0" in the sample is not a bug.
+- **Multi-placement / portability.**
+  - The packer shares scatter and tube runs across placements.
+  - The harness map places teeth_caves, shardwell, heather_cairn and
+    heather_cairn_b (the second at another yaw).
+  - `dungeon-format` asserts that coverage.
+  - `dungeon-gen` E checks every placement against the twin (0 mismatches).
+  - F samples 60k local cells: the two cairns' carve fields agree everywhere.
+  - D3's side (ref groups, signals, spawner ids, saves) was already keyed by
+    placement. `dungeon-entities` M now proves it with real heather_cairn
+    files placed twice.
+- **`--at` "MAIMED hp 0"** was the HUD reading fly mode's despawned rig, not
+  a spawn bug (main.cpp `FillBodyUI`). The `--at` play spawn still has no
+  safe-spawn search.
+- **Darts** walk their line through the CPU mirror and stop at walls. Outside
+  the mirror they still pass, as projectiles do.
+- **Tab / lock.** `ready()` is now a real readiness test. Busy installs
+  retry. In-world streams bounds + margin, coarse first. The GPU lock is FCFS
+  (`<lock>.queue/` tickets; `scripts/test_svlock_fair.py`). Variants and
+  any-map placement are in the UI; variant editing waits for D8's
+  `resolveDungeon`.
+- **Hash.** The harness determinism hash is not expected to move: every
+  placement is 400+ m from the window. The default map's worldgen moves
+  (trees near the three example entrances, scatter). Rebaseline once at merge.

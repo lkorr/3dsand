@@ -2720,6 +2720,39 @@ stitcher's **in world** view: the real terrain round the entrance, the dungeon
 x-rayed beneath, the ground-breach checks on. Save the map to keep it (the
 Dungeons tab reads the saved map.json).
 
+The same dungeon can be placed **any number of times, on any map**: each
+`dungeons[]` entry has its own id; its entities get their own ref group
+(`dungeon/<placement id>`), so a lever in one copy never opens a gate in
+another. The page writes the `dungeons[]` of the map you have open, and **Open in
+Dungeons tab** opens THAT placement. The tab's in-world view has a picker over
+every placement on every map, or a scratch column.
+
+Worldgen keeps **trees and ground cover off the entrance**. A tree whose crown
+would reach where the dungeon breaks the ground does not grow, so a ruin top or
+a mine adit in a forest stands in a clearing, with no cut trunk and no crown
+floating over the hole.
+
+### 17.4.1 Variants
+
+**New variant…** makes a dungeon that `extends` another: same pieces, with
+your changes on top (seed, name, palette, per-piece slider overrides, pieces
+removed or added, entity patches). The stitcher shows each piece as inherited,
+overridden or added. **Revert to base** drops a piece's overrides, and saving
+writes only the overrides, so later edits to the base still reach the variant.
+(Variant editing needs the core library's `resolveDungeon`. Until it is
+present, variants open read-only with a message.)
+
+### 17.4.2 Previews when the GPU is busy
+
+The preview server shares the GPU with game runs and builds. The lock is
+first-come-first-served, so a waiting game run is no longer starved by the
+tab's quick region requests. When the lock is held, the status line says
+**waiting for the GPU lock, held by …** and the install retries every 2 s
+instead of failing.
+
+The in-world view streams only the dungeon's bounds plus a terrain margin. It
+draws a coarse pass first and refines it in three steps ("coarse pass n/3").
+
 ### 17.5 Checking the tab itself
 
 `bash scripts/check_dungeons.sh` drives the real tab in headless Chrome: the
