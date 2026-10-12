@@ -464,6 +464,7 @@ export function compile(dIn, opts) {
     const o = Object.assign({}, p);
     for (const k of ['min', 'max', 'a', 'b']) if (o[k]) o[k] = T(o[k]);
     if (o.pts) o.pts = o.pts.map(T);
+    if (o.level !== undefined) o.level -= A[1];            // a liquid's surface is a local Y too
     return o;
   };
   const used = new Set();

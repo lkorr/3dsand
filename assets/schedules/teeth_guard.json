@@ -1,0 +1,6 @@
+{
+  "about": "Verdant Teeth sea caves: the drowned smuggler who stands at the foot of the pitch (dungeon teeth_caves).",
+  "rows": [
+    {"from": "00:00", "to": "24:00", "do": "guard", "at": "post_pitch"}
+  ]
+}

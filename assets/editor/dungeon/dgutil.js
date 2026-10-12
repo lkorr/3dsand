@@ -120,6 +120,10 @@ export function xformPrim(q, t, p) {
   if (o.a) o.a = xformCell(q, t, o.a);
   if (o.b) o.b = xformCell(q, t, o.b);
   if (o.pts) o.pts = o.pts.map(pt => xformCell(q, t, pt));
+  // A liquid carve's `level` is a local Y: it moves with the piece (quarter
+  // turns never touch Y). Without this every pool in a piece placed off y = 0
+  // was born at its own piece-local height -- a sump 22 m down filled to the brim.
+  if (o.level !== undefined) o.level += t[1];
   if (o.axis) o.axis = rotAxis(q, o.axis);
   if (o.dir) o.dir = rotDir(q, o.dir);
   return o;

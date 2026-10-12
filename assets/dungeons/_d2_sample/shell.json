@@ -310,7 +310,7 @@
     {"op":"fill","shape":"box","min":[-393,-30,344],"max":[-392,-30,354],"mat":"timber","piece":"p5"},
     {"op":"fill","shape":"box","min":[-550,-29,353],"max":[-391,-29,353],"mat":"iron","piece":"p5"},
     {"op":"fill","shape":"box","min":[-550,-29,346],"max":[-391,-29,346],"mat":"iron","piece":"p5"},
-    {"op":"carve","shape":"ellipsoid","min":[315,-69,362],"max":[346,-58,393],"mat":"water","level":-5,"noise":{"amp":2,"scale":5,"octaves":3,"seed":4229579280},"blend":4,"piece":"p7","tag":"room","scatter":[{"kind":"rubble","density":0.15,"size":[1,3],"surface":"floor","mat":"gravel","seed":2884258010},{"kind":"moss","density":0.315,"size":[1,3],"surface":"wall","mat":"wet_moss","seed":1296212102},{"kind":"puddle","density":0.052,"size":[3,10],"surface":"floor","mat":"water","seed":4148902155}]},
+    {"op":"carve","shape":"ellipsoid","min":[315,-69,362],"max":[346,-58,393],"mat":"water","level":-65,"noise":{"amp":2,"scale":5,"octaves":3,"seed":4229579280},"blend":4,"piece":"p7","tag":"room","scatter":[{"kind":"rubble","density":0.15,"size":[1,3],"surface":"floor","mat":"gravel","seed":2884258010},{"kind":"moss","density":0.315,"size":[1,3],"surface":"wall","mat":"wet_moss","seed":1296212102},{"kind":"puddle","density":0.052,"size":[3,10],"surface":"floor","mat":"water","seed":4148902155}]},
     {"op":"fill","shape":"box","min":[-44,-55,476],"max":[43,-55,481],"mat":"chalk_rock","piece":"p9"},
     {"op":"fill","shape":"box","min":[-44,-55,628],"max":[43,-55,633],"mat":"chalk_rock","piece":"p9"},
     {"op":"fill","shape":"box","min":[-44,-55,476],"max":[-39,-55,633],"mat":"chalk_rock","piece":"p9"},

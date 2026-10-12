@@ -1,0 +1,6 @@
+{
+  "about": "Verdant Teeth sea caves: the drowned crew walking the Maw from the bridge to the sump passage and back (dungeon teeth_caves).",
+  "rows": [
+    {"from": "00:00", "to": "24:00", "do": "patrol", "route": ["wn_p9_w4", "wn_p10_door", "wn_p10_c", "wn_p10_x_out", "wn_p14_w2"], "mode": "pingpong", "wait": 3}
+  ]
+}

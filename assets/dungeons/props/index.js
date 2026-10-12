@@ -24,10 +24,12 @@ import bone_pile from './caves/bone_pile.js';
 import crystal_cluster from './caves/crystal_cluster.js';
 import campfire_remains from './caves/campfire_remains.js';
 import rope_ladder from './caves/rope_ladder.js';
+import sea_chest from './caves/sea_chest.js';
+import driftwood from './caves/driftwood.js';
 
 const LIST = [ore_cart, rail_segment, bunk, crate, barrel, lantern, pickaxe_rack, table, ladder,
               altar, statue, sarcophagus, brazier, candle_cluster, broken_column, bones, urn, banner,
-              glow_mushroom_patch, bone_pile, crystal_cluster, campfire_remains, rope_ladder];
+              glow_mushroom_patch, bone_pile, crystal_cluster, campfire_remains, rope_ladder, sea_chest, driftwood];
 
 export const PROPS = {};
 for (const p of LIST) PROPS[p.id] = p;

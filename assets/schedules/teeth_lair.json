@@ -1,0 +1,6 @@
+{
+  "about": "Verdant Teeth sea caves: the snake asleep on the bones in the den; wakes for anyone within 5 m (dungeon teeth_caves).",
+  "rows": [
+    {"from": "00:00", "to": "24:00", "do": "lair", "at": "lair_nest", "radius": 5}
+  ]
+}

@@ -1122,7 +1122,9 @@ def _dungeon_catalog():
             sd = os.path.join(ASSETS, "mobs", sub)
             if sub in ("effects", "pool") or sub.startswith(".") or not os.path.isdir(sd):
                 continue
-            mobs += stems(sd, ".vox")
+            # A variant is its .json sidecar; the .vox is optional (zombie.json
+            # `extends` human and has none), so the sidecar names it too.
+            mobs += stems(sd, ".vox") + stems(sd, ".json")
     except OSError:
         pass
     behaviors = []
