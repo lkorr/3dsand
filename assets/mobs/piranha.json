@@ -104,7 +104,7 @@
   "bodyPush": 0.1,
   "aimSpineShare": 0.1,
   "aimLeanBodies": 0.05,
-  "//natural": "A NIP: biteRadius 3.17 x gore.biteRadius -- the same hole in the living as in a corpse (owner 2026-10-11: it was 1.0 alive and x3.17 dead; now one size) -- for 4 hp at full speed. No mouthful, and NO blunt: a blunt share stamps a bruise about a voxel across on every nip, which swamped the hole and made a shoal read as a beating (owner, 2026-10-11). `carrion` true: in a CORPSE the teeth take the meat and leave the skeleton whole; `push` 0.1: a nip shoves a body a tenth as hard as a sword's reaction would -- a dead body does not pull away, and at a nip's size a shoal would take half an hour to strip a man to the bone.",
+  "//natural": "A NIP: biteRadius 2.0 x gore.biteRadius -- the same hole in the living as in a corpse (owner 2026-10-11: it was 1.0 alive and x3.17 dead; now one size, 2.0) -- for 4 hp at full speed. No mouthful, and NO blunt: a blunt share stamps a bruise about a voxel across on every nip, which swamped the hole and made a shoal read as a beating (owner, 2026-10-11). `carrion` true: in a CORPSE the teeth take the meat and leave the skeleton whole; `push` 0.1: a nip shoves a body a tenth as hard as a sword's reaction would -- a dead body does not pull away, and at a nip's size a shoal would take half an hour to strip a man to the bone.",
   "natural": [
     {
       "name": "jaws",
@@ -124,7 +124,7 @@
       },
       "strike": {
         "bite": 4,
-        "biteRadius": 3.17,
+        "biteRadius": 2.0,
         "biteStain": 0.7,
         "biteForce": 0.7,
         "carrion": true,
