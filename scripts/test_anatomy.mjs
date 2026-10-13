@@ -153,7 +153,7 @@ console.log('human.vox');
  * The chest's organ, baked as a stand-in and rewritten to `heart` at load
  * (DEFAULT_ANATOMY limbs.torso + `becomes`). Pinned here because the C++
  * charge (materials.json heart.organHp) is calibrated against this exact
- * count: 15% of 112 cells takes the human's 180-hp torso to 0. A recipe edit
+ * count: 15% of 25 cells takes the human's 180-hp torso to 0. A recipe edit
  * that moves the count has to move that figure with it. */
 console.log('human heart');
 {
@@ -199,11 +199,11 @@ console.log('human heart');
       sumZ += z + 0.5;
     }
   });
-  ok(heart === 112, `the stock human's heart is 112 cells (${heart}) -- heart.organHp is calibrated to it`);
+  ok(heart === 25, `the stock human's heart is 25 cells (${heart}) -- heart.organHp is calibrated to it`);
   ok(elsewhere === 0, `the heart is in the torso only (${elsewhere} elsewhere)`);
   ok(notFlesh === 0, `every heart cell was organ fill: no rib, sternum, spine or muscle wall lost to it (${notFlesh})`);
-  ok(heart > 0 && left / heart >= 0.6 && left < heart,
-     `left of the midline, not all of it (${left}/${heart} on the +x, left, side)`);
+  ok(heart > 0 && left === heart,
+     `wholly left of the midline (${left}/${heart} on the +x, left, side)`);
   ok(torsoDim && heart > 0 && sumZ / heart > torsoDim.z * 0.4,
      `toward the front of the chest (mean z ${(sumZ / Math.max(1, heart)).toFixed(2)} of ${torsoDim && torsoDim.z})`);
 }

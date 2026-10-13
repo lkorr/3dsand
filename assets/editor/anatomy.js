@@ -76,6 +76,10 @@
  *    than the muscle layer" grows with the limb, so a muscular arm was a bone
  *    log with a skin on it, while the deepest cells of each slice are a thin
  *    rod however thick the meat around it is.
+ *  - `"round": true` makes the box an ELLIPSOID: the cell centre must also lie
+ *    inside the ellipsoid inscribed in the box (over the axes the box states;
+ *    an unstated axis is unconstrained). It is what makes an organ a lump and
+ *    not a brick -- the heart.
  *  - A recipe-level `carve` is the DEFAULT for every limb with neither a
  *    `carve` nor `layers` of its own (`"carve": []` opts a limb out).
  */
@@ -171,14 +175,22 @@ export const DEFAULT_ANATOMY = {
     // sternum down the front of the cage and a spine down the whole back.
     //
     // ...AND A HEART IN IT (2026-10-12, docs/PLAN_projectiles.md package A).
-    // Inside the cage (depth 4+, so never in place of a rib, the sternum or the
-    // muscle wall at depth 3), behind the sternum, a third right and two thirds
-    // LEFT of the midline (+x is the creature's left: the L arm is the +x
-    // one), at the middle of the cage's height, from the front of the hollow
-    // back to the spine -- and down the spine's left side, because the rule
-    // runs BEFORE the spine's and the spine's (last match wins) takes back
-    // every cell of its own. On the stock human: 6 x 7 cells in front of the
-    // spine two deep, plus a 2-wide lobe four deep beside it, 112 cells.
+    // Inside the cage (depth 4..6: never in place of a rib, the sternum or the
+    // muscle wall at depth 3, and at most three cells thick however deep the
+    // chest), in the front of the hollow, WHOLLY LEFT of the midline (+x is
+    // the creature's left: the L arm is the +x one -- so the viewer's right
+    // seen from the front) and high in the cage. `round` makes it the
+    // ellipsoid inscribed in its box, a lump rather than a brick.
+    //
+    // SIZE IS THE OWNER'S CALL, NOT ANATOMY'S (2026-10-13, after two rounds of
+    // "far too large"). A real heart is ~0.45% of the body below the neck; the
+    // first cut (front of the hollow back to the spine, a lobe down its left
+    // side) was 0.53% on the stock human and 0.8-0.9% on the deep-chested
+    // characters, the second (a 6 x 7 x 2 front slab, 84 cells) 0.39% -- and
+    // still read as a block filling the chest, because these chests are
+    // stylised thin and narrow. Asked for half the radius: now ~3 x 5 x 3 on
+    // the stock human, 25 cells (0.12%). heart.organHp is calibrated to that
+    // count (test_anatomy.mjs pins it).
     //
     // Painted as the STAND-IN `mushroom_large`, because `heart` is past what a
     // .vox can paint (ids 0..127); `becomes` below rewrites every stand-in
@@ -194,8 +206,8 @@ export const DEFAULT_ANATOMY = {
           box: { y: [0.42, 0.94] }, stripe: { axis: 'y', period: 4, width: 2 } },
         { material: 'bone', where: 'bone', depth: [3, 3],
           box: { x: [0.45, 0.55], y: [0.42, 0.94], z: [0.5, 1] } },
-        { material: 'mushroom_large', where: 'bone', depth: [4, 254],
-          box: { x: [0.4, 0.7], y: [0.57, 0.77], z: [0.33, 1] } },
+        { material: 'mushroom_large', where: 'bone', depth: [4, 6], round: true,
+          box: { x: [0.53, 0.7], y: [0.63, 0.77], z: [0.4, 1] } },
         { material: 'bone', where: 'bone',
           box: { x: [0.4, 0.6], z: [0, 0.5] } },
       ],
@@ -398,6 +410,7 @@ export function carveFor(recipe, limbName) {
       stripe: axis >= 0 && (s.period | 0) > 0
         ? { axis, period: s.period | 0, width: s.width | 0 } : null,
       core: Number.isInteger(c.core) && c.core >= 0 ? c.core : null,
+      round: c.round === true,
     });
   }
   return out;
@@ -477,12 +490,18 @@ export function carveMatches(c, whereId, layerId, lx, ly, lz, dim, depth,
   // `core`: { depth, max } of this cell from `coreField`.
   if (c.core != null && (!core || core.depth < core.max - c.core)) return false;
   const l = [lx, ly, lz], n = [dim.x, dim.y, dim.z];
+  let e2 = 0;   // `round`: sum of squared offsets, in half-widths of the box
   for (let a = 0; a < 3; a++) {
     const r = c.box[['x', 'y', 'z'][a]];
     if (!r) continue;
     const f = (l[a] + 0.5) / n[a];
     if (f < r[0] || f >= r[1]) return false;
+    if (c.round) {
+      const u = (2 * f - r[0] - r[1]) / (r[1] - r[0]);
+      e2 += u * u;
+    }
   }
+  if (c.round && e2 > 1) return false;
   if (c.stripe && (l[c.stripe.axis] % c.stripe.period) >= c.stripe.width)
     return false;
   return true;
