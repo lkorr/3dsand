@@ -1814,6 +1814,12 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
       std::vector<Vec3> tipPath, basePath;
       BladeRead prev = readBlade();
       int sweptTicks = 0;
+      // WHAT THE SWEEP ITSELF SAID (rule 6): a "0 of 0" with the edge 0.05
+      // voxels from the head is either probes that found nothing or a sweep
+      // that never ran its probes, and EdgeSweepResult tells those apart.
+      EdgeSweepResult sumRes;
+      float tipSpeedMax = 0, powerMax = 0, alignMin = 1;
+      int gatedTicks = 0, arrestedTicks = 0;
       for (int i = 0; i < 18; i++) {
         drive(-34.0f, 0, true);
         const BladeRead b = readBlade();
@@ -1842,9 +1848,60 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
           sw.tick = (uint32_t)i;
           sw.valid = true;
           std::vector<ParticleSpawn> spawns;
-          MeleeSweepDamage(sw, melee.tuning, avatar, phys, mobs, debris, world,
-                           spawns);
+          mobs.ClearCutBites();
+          const EdgeSweepResult r = MeleeSweepDamage(
+              sw, melee.tuning, avatar, phys, mobs, debris, world, spawns);
           sweptTicks++;
+          sumRes.bodiesHit += r.bodiesHit;
+          sumRes.probesCast += r.probesCast;
+          sumRes.probesAir += r.probesAir;
+          sumRes.probesSelf += r.probesSelf;
+          sumRes.probesBody += r.probesBody;
+          sumRes.probesCovered += r.probesCovered;
+          tipSpeedMax = std::max(tipSpeedMax, r.tipSpeed);
+          powerMax = std::max(powerMax, r.power);
+          if (r.probesCast > 0) alignMin = std::min(alignMin, r.edgeAlign);
+          if (r.probesCast == 0 && !r.arrested) gatedTicks++;
+          if (r.arrested) arrestedTicks++;
+          if (r.probesBody > 0 || r.bodiesHit > 0) {
+            uint32_t nearNow = 0, nearArt = 0;
+            for (size_t li = 0; li < dd.limbs.size(); li++)
+              if (mobs.LimbBody(tid, (int)li)) {
+                nearNow += mobs.LimbVoxelCount(tid, (int)li);
+                nearArt += mobs.LimbArtVoxelCount(tid, (int)li);
+              }
+            const MobSystem::CutBite& cb = mobs.LastCutBite();
+            // The first contact, against the near body's limbs: which one
+            // it was, and how far its nearest sampled voxel is.
+            std::string nearest = "-";
+            if (r.hasHitAt) {
+              float bd = 1e9f;
+              for (size_t li = 0; li < dd.limbs.size(); li++) {
+                if (!mobs.LimbBody(tid, (int)li)) continue;
+                for (uint32_t k = 0; k < 32; k++) {
+                  const float d =
+                      (mobs.LimbVoxelPos(tid, (int)li, k * 7919u) - r.hitAt)
+                          .len();
+                  if (d < bd) {
+                    bd = d;
+                    nearest = Format("%s %.2f", dd.limbs[li].name.c_str(), d);
+                  }
+                }
+              }
+            }
+            std::printf(
+                "swing-plane E (tick %2d): speed %.1f power %.2f align %.2f "
+                "-> %d bodies hit (%d probes on a body), first at "
+                "(%.1f,%.1f,%.1f) nearest near-body limb [%s], near body now "
+                "%u vox (art %u) %.1f hp, far %.1f hp, dead-flesh %d; "
+                "kerf: %u cuts, depth %.2f, budget %.2f, carve kept %u of "
+                "%u\n",
+                i, r.tipSpeed, r.power, r.edgeAlign, r.bodiesHit,
+                r.probesBody, r.hitAt.x, r.hitAt.y, r.hitAt.z, nearest.c_str(),
+                nearNow, nearArt, mobs.TotalHp(tid),
+                farId ? mobs.TotalHp(farId) : 0.0f, (int)r.hitDeadFlesh,
+                cb.cuts, cb.depth, cb.budget, cb.kept, cb.before);
+          }
         }
         prev = b;
       }
@@ -1901,6 +1958,11 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
       const bool struck = hitNear > 0;
       const bool spared = farId != 0 && farTotal > 0 && farLost == 0;
       hitOk = struck && spared;
+      // RED SINCE first-parent 5a23e96..e959c65 (tests/BASELINE.md,
+      // 2026-10-12 "combat package E"): the cut lands on the skin lattice,
+      // about 3 art voxels a tick at a 0.1-voxel kerf, but empties no
+      // COLLIDER cell, and the collider is what LimbVoxelCount reads. See the
+      // "E (tick N)" lines above.
       check(struck, "a real swing wounds the limbs the edge passed through");
       check(spared,
             "...and leaves a body outside the arc completely alone");
@@ -1919,6 +1981,15 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
           "swept ticks, tip box (%.1f,%.1f,%.1f)..(%.1f,%.1f,%.1f)\n",
           hitNear, wounded, nearVox, farLost, farTotal, sweptTicks, lo.x, lo.y,
           lo.z, hi.x, hi.y, hi.z);
+      std::printf(
+          "swing-plane E (sweep): %d bodies hit; probes %d cast / %d air / %d "
+          "self / %d body / %d covered; tip speed max %.1f vox/s (minSpeed "
+          "%.1f), power max %.2f, edge align min %.2f; %d ticks gated before "
+          "any probe, %d arrested by a parry\n",
+          sumRes.bodiesHit, sumRes.probesCast, sumRes.probesAir,
+          sumRes.probesSelf, sumRes.probesBody, sumRes.probesCovered,
+          tipSpeedMax, melee.tuning.minSpeed, powerMax, alignMin, gatedTicks,
+          arrestedTicks);
       // HOW CLOSE THE EDGE ACTUALLY CAME, when nothing was wounded. "0 of 0"
       // alone cannot distinguish a geometric miss (fixture/arc fault) from
       // probes that passed through the body without hitting it (sweep fault),
