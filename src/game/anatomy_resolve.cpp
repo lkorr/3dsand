@@ -56,6 +56,7 @@ struct Carve {
   int depthMin = 0, depthMax = 254;
   int stripeAxis = -1, stripePeriod = 0, stripeWidth = 0;
   int core = -1;           // -1 = no `core` test
+  bool round = false;      // `round`: the ellipsoid inscribed in the box
 };
 
 std::vector<Carve> CarveFor(const nlohmann::json& recipe,
@@ -117,6 +118,9 @@ std::vector<Carve> CarveFor(const nlohmann::json& recipe,
       const double v = c["core"].get<double>();
       if (v >= 0 && v == std::floor(v)) e.core = (int)v;
     }
+    // JS: c.round === true.
+    e.round = c.contains("round") && c["round"].is_boolean() &&
+              c["round"].get<bool>();
     out.push_back(std::move(e));
   }
   return out;
@@ -131,11 +135,18 @@ bool CarveMatches(const Carve& c, int whereId, int layerId, const int l[3],
   if (c.core >= 0 && (coreDepth < 0 || coreDepth < coreMax - c.core))
     return false;
   const int n[3] = {size.x, size.y, size.z};
+  double e2 = 0;   // `round`: sum of squared offsets, in half-widths of the box
   for (int a = 0; a < 3; a++) {
     if (!c.hasBox[a]) continue;
     const double f = (l[a] + 0.5) / n[a];
     if (f < c.box[a][0] || f >= c.box[a][1]) return false;
+    if (c.round) {
+      const double u = (2 * f - c.box[a][0] - c.box[a][1]) /
+                       (c.box[a][1] - c.box[a][0]);
+      e2 += u * u;
+    }
   }
+  if (c.round && e2 > 1) return false;
   if (c.stripeAxis >= 0 && l[c.stripeAxis] % c.stripePeriod >= c.stripeWidth)
     return false;
   return true;

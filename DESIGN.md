@@ -10730,15 +10730,15 @@ of its own: enough of it gone takes the limb's hp to 0 and the existing
 vital-limb rule kills, the death named for the organ ("heart destroyed",
 `Mob::OrganDeathCause`). `brain` 3.5 (it was the global
 `gore.brainHpPerVoxel` until the heart needed a figure of its own; same
-number, same charge bit for bit); `heart` 14.25, calibrated so 15% of the
-stock human's 84 heart cells takes its 180-hp torso to 0. The heart is a
+number, same charge bit for bit); `heart` 48, calibrated so 15% of the
+stock human's 25 heart cells takes its 180-hp torso to 0. The heart is a
 torso `carve` rule inside the cage (depth 4..6, so it never displaces a rib,
-the sternum or the muscle wall, and is at most three cells thick): behind the
-sternum, two thirds left of the midline, in the front half of the hollow
-only. Sized to a real heart's share of the body — ~0.45% of the volume below
-the neck; the stock human's is 0.39% — and capped in depth so it does not
-grow with a deep chest (the first cut ran back to the spine and reached
-0.8–0.9% on the deep-chested characters). `heart` is id 223 — past what a `.vox` can paint (≤ 127)
+the sternum or the muscle wall, and is at most three cells thick): a `round`
+rule (the ellipsoid inscribed in its box) in the front of the hollow, wholly
+left of the midline and high in the cage, ~3 x 5 x 3 cells on the stock
+human. Its size is the owner's call, not anatomy's: a real heart is ~0.45%
+of the body below the neck, but on these stylised thin chests even that read
+as a block filling the cavity, so it is 0.12%. `heart` is id 223 — past what a `.vox` can paint (≤ 127)
 but inside a micro brick's 8-bit material (≤ 255), which is why it was
 INSERTED after `hair` rather than appended (saves remap by name) — so the
 bake paints the stand-in `mushroom_large` and the recipe's `becomes`

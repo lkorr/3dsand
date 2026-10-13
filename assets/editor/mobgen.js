@@ -4804,10 +4804,10 @@ export function anatomyRecipe(race = 'human') {
                  'the chest with solid bone, so `carve` hollows it to flesh ' +
                  '(the organs), walls it in muscle at depth 3, and puts bone ' +
                  'back as ribs, a sternum and a spine. The HEART sits in the ' +
-                 'front half of the hollow behind the sternum, two thirds ' +
-                 'left of the midline, at most three cells thick (depth ' +
-                 '4..6) and never back to the spine -- sized to a real ' +
-                 'heart\'s share of the body (~0.4% of it below the neck), ' +
+                 'front of the hollow, wholly left of the midline (the ' +
+                 'viewer\'s right) and high in the cage, a rounded lump ' +
+                 '(`round`: the ellipsoid in its box) at most three cells ' +
+                 'thick (depth 4..6), ~3 x 5 x 3 on the stock human, ' +
                  'painted as the stand-in ' +
                  '`mushroom_large` (a .vox paints ids 0..127 only) that ' +
                  '`becomes` turns to `heart` at load. Like the brain it costs ' +
