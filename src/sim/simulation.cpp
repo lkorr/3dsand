@@ -14,6 +14,7 @@
 
 #include "gpu/resources.h"
 #include "sim/bodyreact.h"  // CatchFormTable (what a coat flame lights, §6 clause 2c)
+#include "sim/farfield.h"   // FarField::ListMapCount: the `farmap` extent
 #include "sim/farplumes.h"  // FarPlumes::SetMaterials (what a frozen fire is)
 #include "sim/pagetable.h"
 #include "sim/rainexpo.h"  // the rain lattice (rainFall / rainExpo extents)
@@ -3312,6 +3313,11 @@ void Simulation::EncodeFarFill(const rhi::CommandEncoder& enc, uint32_t count) {
   if (!farFill_ || !farCoverFill_ || !farMapFill_ || !farPatchFill_) return;
   RecordCtx cx{};
   cx.farCount = count;
+  // The map entries PrepareTick appended after the list (farfield.h
+  // ListMapCount); never more than the list itself.
+  cx.farMapCount = std::min(FarField::ListMapCount(), count);
+  // ...and the column runs' first entries after them: the sweep's extent.
+  cx.farHeadCount = std::min(FarField::ListHeadCount(), count);
   RecordTable(enc, pass::Table::FarFill, &cx);
 }
 

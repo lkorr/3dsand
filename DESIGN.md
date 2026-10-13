@@ -16501,6 +16501,38 @@ where you hear from either (§12b, "The ears are on the character").
   (every pass of every `--frames` frame). NOTE the per-frame pass rows are
   matched on the frame the TIMESTAMPS came back for, which is not always the
   frame whose far entries the CSV row counts: attribute with run totals.
+  **The far passes launch only the workgroups that work (2026-10-13).** That
+  "empty farMapFill read 3 ms a tick" was NOT a timer artifact: with
+  `SANDVOX_GPU_TIMER_SERIAL=1` the 969 peaks-route ticks with far entries and
+  no map column still billed `farMapFill` 3.09 ms each. The extent was
+  `D_FARCOUNT` x 16 -- 16,384 workgroups of a 128-register, spilling kernel
+  on a 1,024-entry tick -- and all but 32 x 16 returned on their first load;
+  the launches were the cost. Likewise `far`: one 256-thread workgroup per
+  entry, of which only a column run's first does anything (THE COLUMN
+  STACK). `FarField::PrepareTick` now appends to the uploaded list the tick's
+  map entries (`farmap` dispatches over exactly those, `D_FARMAPCOUNT`,
+  reading `farList[farCount + i]`) and each run's first index (`far`
+  dispatches over those, `D_FARHEADCOUNT`, finding them after the map
+  entries through the tail header at `3 x kFarListCap`, worldgen.wgsl
+  `FAR_LIST_TAIL_HDR`); `farcover` and `farpatch` keep one workgroup per
+  entry (their per-entry work is real, and `farpatch` indexes the patch
+  header by `wg.x`). The shaders keep their old guards (the map bit, the
+  head test), so the change is the extent alone: whole-cascade digests after
+  a full refill are identical with the old extents
+  (`SANDVOX_FARMAP_LEGACY=1 SANDVOX_FAR_ALLWG=1`, one exe) and the new
+  (farVox 7299172eaabebecb, farMap 83198352c095ec12; `SANDVOX_FAR_DIGEST=1
+  --gate far-fog` now digests farMap too). Measured, arms interleaved in one
+  exe, n=3 each: peaks-route `farMapFill` 3.10-3.30 -> 1.06-1.09 ms a frame,
+  `farFill` 2.88-3.07 -> 2.01-2.10, farField node p50 5.72-6.16 -> 2.95-2.99
+  / p95 10.7-11.4 -> 7.7-8.0, frame p50 17.9-18.9 -> 15.3-15.9 / p95
+  30.4-31.0 -> 26.7-27.5 ms; the 2026-10-11_12-10-09 ticket-camera flight
+  (595 frames at 13.75 m/s) farField mean 9.37-9.44 -> 6.33-6.57 ms a frame,
+  frame p50 20.1-21.0 -> 17.8-18.3, p95 40.0-42.6 -> 36.3-37.8, frames over
+  33 ms 16.5-17.1% -> 9.9-11.3%. What is left on that flight is the map
+  fill's real work (`farMapFill` p99 still 12-13 ms on a plane's first slice,
+  where its 32 columns land) and the sweep's runs. `--perf` scenarios that
+  drive the far field print `farMapFill by level` (frames of one level's map
+  columns: mean ms, us per column) for that next step.
   **The sieve skips the sky (2026-09-12).** `far` ran a full `genCellCol` for
   all 4,096 cells of a level chunk whatever its altitude, and a level box is
   `kFarN` cells tall — 13 km at level 8 against a few hundred metres of

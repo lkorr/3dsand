@@ -465,8 +465,11 @@ void Stream::ShiftAxis(int axis, int dir) {
   EvictSlots(slots, /*filter=*/true);
   // The plane's dissolved mass leaves with it (before the origin moves, while
   // SlotToWorldChunk still names the chunks that are leaving).
+  const double sT1 = PtNowMs();
   EvictSolutes(slots);
-  timing_.evictMs += PtNowMs() - sT0;
+  const double sT2 = PtNowMs();
+  timing_.evictMs += sT2 - sT0;
+  timing_.evictSolMs += sT2 - sT1;
 
   IVec3 no = o;
   if (axis == 0) no.x += dir;

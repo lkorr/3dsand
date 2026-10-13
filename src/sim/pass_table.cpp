@@ -225,6 +225,7 @@ namespace {
 #define C_GENCOUNT  Cond::GenCount
 #define C_DENSEWG   Cond::DenseWorldgen
 #define C_FARCOUNT  Cond::FarCount
+#define C_FARMAPCOUNT Cond::FarMapCount
 #define C_FLUIDSPAWN Cond::FluidSpawn
 #define C_WINDWAKE  Cond::WindWake
 #define C_CAACTIVE  Cond::CaActive
@@ -277,6 +278,8 @@ namespace {
 #define D_GENCOUNT  (uint32_t)DispatchSel::GenCount
 #define D_GENCOLS   (uint32_t)DispatchSel::GenColCount
 #define D_FARCOUNT  (uint32_t)DispatchSel::FarCount
+#define D_FARMAPCOUNT (uint32_t)DispatchSel::FarMapCount
+#define D_FARHEADCOUNT (uint32_t)DispatchSel::FarHeadCount
 #define IND_DISPATCHARGS  (uint32_t)DispatchSel::IndDispatchArgs
 #define IND_PDISPATCHARGS (uint32_t)DispatchSel::IndPDispatchArgs
 #define D_FLUIDSPAWN      (uint32_t)DispatchSel::FluidSpawnSel

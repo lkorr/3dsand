@@ -145,6 +145,7 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::GenCount:  return cx.genCount > 0;
     case pass::Cond::DenseWorldgen: return cx.denseWorldgen;
     case pass::Cond::FarCount:  return cx.farCount > 0;
+    case pass::Cond::FarMapCount: return cx.farMapCount > 0;
     case pass::Cond::FluidSpawn: return cx.fluidSpawnCount > 0;
     case pass::Cond::WindWake:  return cx.windWakeCount > 0;
     case pass::Cond::CaActive:  return cx.caActive;
@@ -208,6 +209,8 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
     case pass::DispatchSel::GenCount: return cx.genCount;
     case pass::DispatchSel::GenColCount: return cx.genColCount;
     case pass::DispatchSel::FarCount: return cx.farCount;
+    case pass::DispatchSel::FarMapCount: return cx.farMapCount;
+    case pass::DispatchSel::FarHeadCount: return cx.farHeadCount;
     case pass::DispatchSel::WindWakeSel: return (cx.windWakeCount + 63) / 64;
     case pass::DispatchSel::FluidSpawnSel: return (cx.fluidSpawnCount + 63) / 64;
     // One WORKGROUP per listed chunk (the reduce and the shave walk a

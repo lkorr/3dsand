@@ -481,6 +481,8 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
   }
   // The UBO above is published either way — a caller that is not draining
   // still has to tell the renderer which levels it may march.
+  listMapCount_ = 0;   // whatever returns 0 below dispatches no `farmap`
+  listHeadCount_ = 0;
   if (!drain) return 0;
   // The pacing clock (PlaneDue / PlaneQuota) counts DRAINING ticks, the ones
   // that could have dispatched: `now` is the tick Update just stamped its
@@ -553,7 +555,10 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
       if (n) patchPayload_.insert(patchPayload_.end(), patch->begin(), patch->end());
 
       list_.push_back((k << kFarSlotShift) | slot | mapBit);
-      if (mapBit) mapCols_++;
+      if (mapBit) {
+        mapCols_++;
+        mapColsLevel_[k]++;
+      }
       q.pop_front();
       // A refill of cells a resident chunk owns undoes that chunk's last
       // downsample: clear the signatures on the NEXT PrepareTick (sigClear_).
@@ -619,7 +624,44 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
     list_.swap(sortList_);
     patchHeader_.swap(sortHeader_);
   }
-  queue.WriteBuffer(world_->farList, 0, list_.data(), count * 4);
+  // THE MAP ENTRIES AGAIN, AFTER THE LIST: `farmap` dispatches over exactly
+  // these (farList[count + i]) instead of 16 workgroups per listed entry that
+  // mostly returned on their first load (pass_table.def farMapFill). In list
+  // order, so a column's map fill keeps landing before its patch.
+  // SANDVOX_FARMAP_LEGACY=1 is the A/B arm: the tail is the WHOLE list, so the
+  // extent is one workgroup column per entry and every non-map entry returns
+  // on its bit test -- the pre-2026-10-13 dispatch, from the same exe and
+  // shader (the far digest and the perf rows compare the two).
+  static const bool legacy = std::getenv("SANDVOX_FARMAP_LEGACY") != nullptr;
+  listOut_.assign(list_.begin(), list_.end());
+  for (uint32_t i = 0; i < count; i++)
+    if (legacy || (list_[i] & kFarListMapBit)) listOut_.push_back(list_[i]);
+  listMapCount_ = (uint32_t)listOut_.size() - count;
+  // ...THEN EACH RUN'S FIRST INDEX: the sweep (`far`) fills a level-chunk
+  // column's whole run from its first entry's workgroup (worldgen.wgsl THE
+  // COLUMN STACK), so it dispatches one workgroup per run, not per entry.
+  // farSameColumn's test, word for word; an index this misses would be a
+  // column never filled, so the shader keeps its own head test as the guard
+  // in the other direction. SANDVOX_FAR_ALLWG=1 lists every index (the
+  // pre-2026-10-13 extent: the A/B arm).
+  static const bool allWg = std::getenv("SANDVOX_FAR_ALLWG") != nullptr;
+  auto sameColumn = [](uint32_t a, uint32_t b) {
+    const uint32_t la = (a & ~kFarListMapBit) >> kFarSlotShift;
+    const uint32_t lb = (b & ~kFarListMapBit) >> kFarSlotShift;
+    const uint32_t sa = a & kFarSlotMask, sb = b & kFarSlotMask;
+    return la == lb && sa % kFarNChunk == sb % kFarNChunk &&
+           sa / (kFarNChunk * kFarNChunk) == sb / (kFarNChunk * kFarNChunk);
+  };
+  const size_t headBase = listOut_.size();
+  for (uint32_t i = 0; i < count; i++)
+    if (allWg || i == 0 || !sameColumn(list_[i - 1], list_[i])) listOut_.push_back(i);
+  listHeadCount_ = (uint32_t)(listOut_.size() - headBase);
+  queue.WriteBuffer(world_->farList, 0, listOut_.data(), listOut_.size() * 4);
+  // The tail header at 3 x kFarListCap: the map count, so `far` can find the
+  // heads after the map entries (worldgen.wgsl FAR_LIST_TAIL_HDR).
+  static_assert(kFarListCap == 4096, "worldgen.wgsl FAR_LIST_TAIL_HDR is 3 x 4096");
+  const uint32_t hdr[2] = {listMapCount_, listHeadCount_};
+  queue.WriteBuffer(world_->farList, (uint64_t)kFarListTailHdr * 4, hdr, sizeof hdr);
   // The header is written for EVERY dispatched entry, always — the kernel
   // indexes it by dispatch index and a stale pair points the patch loop at
   // another entry's payload. 8 bytes per entry, so <= 32 KiB in the fullest

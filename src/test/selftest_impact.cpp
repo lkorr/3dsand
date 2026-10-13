@@ -2599,15 +2599,20 @@ Status GateWoodBleed(Ctx& c, std::string& detail) {
 // Every cut arm also counts what the body EMITTED for 60 ticks after the cut
 // (droplets + paint ops), which must be all the expected fluid and none of
 // the other: the wound state and the emitters agree, not just the state.
+// A seventh arm cuts a HELD BOW instead of the forearm (Mob::LeaksNothing,
+// 2026-10-13): its staff_wood authors syrup, and a stab that caught it leaked
+// syrup out of a man made of flesh. A prop opens no budget and emits nothing.
 struct FluidProbe {
   uint32_t wound = 0;      // the cut limb's wound fluid (or the stump's)
+  float budget = 0.0f;     // the cut limb's bleed budget right after the cut
   uint32_t piece = 0;      // sever: the severed piece's debris bleed material
   int want = 0, other = 0; // emitted voxels of the expected / any other liquid
   bool ok = false;
 };
 
 FluidProbe ProbeBleedFluid(Ctx& c, int defIndex, int limb, uint32_t rewriteTo,
-                           bool sever, uint32_t expect, std::string& why) {
+                           bool sever, uint32_t expect, std::string& why,
+                           const ItemDef* held = nullptr) {
   FluidProbe r;
   MobSystem& mobs = c.mobs;
   mobs.Reset();
@@ -2615,6 +2620,13 @@ FluidProbe ProbeBleedFluid(Ctx& c, int defIndex, int limb, uint32_t rewriteTo,
   const uint64_t id = mobs.Spawn(defIndex, FixtureSite(c.world, 445));
   if (!id) { why = "spawn refused"; return r; }
   mobs.SetMobBehavior(id, "dummy");
+  // HELD: the blade meets the item in the right fist, not the forearm.
+  if (held) {
+    if (!mobs.EquipItem(id, held)) { why = "EquipItem refused"; return r; }
+    const Mob* m = mobs.FindMobById(id);
+    limb = m ? m->HeldSlot(Hand::Right) : -1;
+    if (limb < 0) { why = "no held slot"; return r; }
+  }
   auto isFluid = [&](uint32_t m) {
     return m != 0 && m < c.mats.size() && c.mats[m].gpu.klass == CLASS_LIQUID;
   };
@@ -2661,6 +2673,7 @@ FluidProbe ProbeBleedFluid(Ctx& c, int defIndex, int limb, uint32_t rewriteTo,
             0x0B1EEDu, spawns);
     if (!mobs.LimbBody(id, limb)) { why = "the forearm came off"; return r; }
     r.wound = mobs.LimbWoundFluid(id, limb);
+    r.budget = mobs.LimbBleedBudget(id, limb);
   }
   for (int i = 0; i < 60; i++) tick(3100u + (uint32_t)i, true);
   mobs.Reset();
@@ -2723,6 +2736,17 @@ Status GateBleedFluid(Ctx& c, std::string& detail) {
   arm("human", human, 0, false, blood, 0);
   arm("human wood-arm", human, wood, false, syrup, 0);
   arm("human wood-arm severed", human, wood, true, blood, syrup);
+  if (const ItemDef* bow = c.items.Named("bow")) {
+    const FluidProbe r =
+        ProbeBleedFluid(c, human, 0, 0, false, 0, why, bow);
+    const bool good = r.ok && r.wound == 0 && r.budget == 0.0f && r.other == 0;
+    detail += Format("human held bow: wound %s, budget %.2f, emitted %d%s; ",
+                     name(r.wound).c_str(), r.budget, r.other,
+                     good ? "" : r.ok ? " [A PROP BLED]" : (" [" + why + "]").c_str());
+    ok = ok && good;
+  } else {
+    detail += "(no bow item: held-prop arm skipped) ";
+  }
   if (deku >= 0) {
     arm("deku", deku, 0, false, syrup, 0);
     arm("deku flesh-arm", deku, flesh, false, blood, 0);
