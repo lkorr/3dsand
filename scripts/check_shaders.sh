@@ -268,6 +268,7 @@ W_WCURVEMAXY="$(cpp_const kWaterCurveMaxY)"
 W_WSWEEPHDR="$(cpp_const kWaterSweepHeaderWords)"
 W_WCURVEWORDS="$(cpp_const kWaterCurveWords)"
 W_WSCRATCHWORDS="$(cpp_const kWaterSweepScratchWords)"
+W_WSPLITWET="$(cpp_const kWaterSplitWetWord)"
 # Derived in world.h from the caps above, so derive them the same way rather
 # than scraping a comment.
 W_WCURVEBASE=$((W_WBCAP * W_WBSTATE))
@@ -383,6 +384,7 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const WATER_CURVE_WORDS : u32 = ${W_WCURVEWORDS}u;" \
   "const WATER_CURVE_BASE : u32 = ${W_WCURVEBASE}u;" \
   "const WATER_SCRATCH_BASE : u32 = ${W_WSCRATCHBASE}u;" \
+  "const WATER_SPLIT_WET_WORD : u32 = ${W_WSPLITWET}u;" \
   "const WATER_RELEVEL_DEPTH_MAX : i32 = ${W_WRVDEPTHMAX};" \
   "const WATER_RELEVEL_BUCKETS : u32 = ${W_WRVBUCKETS}u;" \
   "const WATER_RELEVEL_HIST_BASE : u32 = ${W_WRVHISTBASE}u;" \

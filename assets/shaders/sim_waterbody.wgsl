@@ -249,6 +249,21 @@ fn wbClearHist(b : u32) {
   }
 }
 
+// ---- M5: a VACATED slot forgets its split map ------------------------------
+// Called at the four points a slot's ledger is wiped because its body LEFT
+// (withdrawn, refused-and-withdrawn, released, past the body count) -- and
+// deliberately NOT at adoption, where the map is still the truth about the
+// body re-adopting under it. The map lives in the slot's curve block, which no
+// ledger wipe touched, so the next body to be given this slot -- a probe
+// restored from a save, a basin that sorted into it -- read a split map drawn
+// over SOMEBODY ELSE'S disc and owned whichever cells it happened to name.
+// `wbOwns` treats SW_COMPS <= 1 as "no split", so one word is the whole reset:
+// the map words are stale but unread until the sweep publishes a new one, and
+// `wbSplit` reads SW_COMPS the same way before it trusts them for continuity.
+fn wbForgetSplit(b : u32) {
+  swSet(b, SW_COMPS, 0);
+}
+
 // ============================================================================
 // W2 — THE FLUX STORE'S WORD MAP (docs/PLAN_water_relevel.md §4.1).
 //
@@ -498,6 +513,7 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
     if (wbGet(b, WBS_STATE) != WB_CANDIDATE) {
       for (var w = 0u; w < WATERBODY_STATE_WORDS; w++) { wbSet(b, w, 0); }
       wbClearHist(b);
+      wbForgetSplit(b);
     }
     return;
   }
@@ -537,6 +553,7 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
       // is the immediate clear rather than WB_RELEASING.
       for (var w = 0u; w < WATERBODY_STATE_WORDS; w++) { wbSet(b, w, 0); }
       wbClearHist(b);
+      wbForgetSplit(b);
       return;
     }
     if ((flags & WBF_REPROBE) != 0) {
@@ -586,7 +603,9 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
     if (sweepIdx >= 0 && sweepIdx < i32(WATER_CURVE_MAXY)) {
       swSet(b, SW_AREA0 + u32(sweepIdx), 0);
     }
-    for (var sw = 0u; sw < WATER_SPLIT_CELLS / 32u; sw++) {
+    // BOTH bitmaps: OPEN [0, WATER_SPLIT_WET_WORD) and WET after it (world.h
+    // kWaterSweepScratchWords says why there are two).
+    for (var sw = 0u; sw < 2u * WATER_SPLIT_WET_WORD; sw++) {
       atomicStore(&waterBodyState[WATER_SCRATCH_BASE + sw], 0);
     }
   }
@@ -645,6 +664,7 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
     if (st == WB_CANDIDATE || st == WB_MEASURING) {
       for (var w = 0u; w < WATERBODY_STATE_WORDS; w++) { wbSet(b, w, 0); }
       wbClearHist(b);
+      wbForgetSplit(b);
       return;
     }
   }
@@ -696,7 +716,21 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
       // CANDIDATE would re-run the ONE whole-footprint pass every
       // `sim.waterBodyQuietTicks` forever, which is the cost §8.4 exists to
       // delete.
-      wbSet(b, WBS_STATE, select(WB_CANDIDATE, WB_REFUSED, discovered));
+      //
+      // A SPLIT CHILD IS NEVER STICKY, discovered parent or not. The sticky
+      // refusal is a verdict on whether the PROBE is a body at all, and it is
+      // lifted only by new liquid evidence. A child's question is different —
+      // "is my component a pool yet" — and the answer changes with the SPLIT
+      // MAP, not with evidence: a child proposed on the dig tick measures
+      // before the sweep has published any map (it owns nothing, sum 0), and
+      // parked in WB_REFUSED it would never adopt the pool the map then hands
+      // it, because digging is not liquid evidence and no WBF_REPROBE comes.
+      // As a candidate it re-measures every `sim.waterBodyQuietTicks`, which is
+      // what an authored basin's child has always done, and the CPU proposes a
+      // child only while its parent's dig latch is live (kWaterDrainHotTicks),
+      // so the cost is bounded by the dig and is zero at rest.
+      let sticky = discovered && (flags & WBF_CHILD) == 0;
+      wbSet(b, WBS_STATE, select(WB_CANDIDATE, WB_REFUSED, sticky));
       wbSet(b, WBS_QUIET, 0);
       // THE MEASUREMENT SURVIVES A REFUSAL, and only for a discovered probe.
       // WB_REFUSED is sticky, so whatever a gate or the overlay reads later is
@@ -706,7 +740,7 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
       // atomicMax identity) from "it found a pool too small" from "it found a
       // wide film with no volume". An authored basin clears LEVEL as before,
       // because it returns to WB_CANDIDATE and the next arming overwrites it.
-      if (!discovered) { wbSet(b, WBS_LEVEL, 0); }
+      if (!sticky) { wbSet(b, WBS_LEVEL, 0); }
       return;
     }
     wbSet(b, WBS_VOLUME, vol);
@@ -1223,6 +1257,7 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (st == WB_RELEASING && debit == 0) {
     for (var w = 0u; w < WATERBODY_STATE_WORDS; w++) { wbSet(b, w, 0); }
     wbClearHist(b);
+    wbForgetSplit(b);
     return;
   }
   wbSet(b, WBS_STATE, st);
@@ -2594,6 +2629,20 @@ fn wbSweep(@builtin(workgroup_id) wg : vec3<u32>,
       if (gi < WATER_SPLIT_CELLS) {
         atomicOr(&waterBodyState[WATER_SCRATCH_BASE + (gi >> 5u)],
                  i32(1u << (gi & 31u)));
+        // ...and the WET bit, set by the body's own liquid only. Openness
+        // decides what is CONNECTED (air has to count: a cone the CA left
+        // below the level is air at the level and still the same pool), but it
+        // cannot say which component is the POOL. A discovered probe's disc is
+        // a padded circle round some evidence and takes in whatever hillside
+        // lies inside it; where that ground dips under the level it is open,
+        // disconnected and dry, and the split used to rank it by grid index
+        // and hand it to the parent (`--gate waterbody` pass N arm 2: the
+        // parent got a 9-cell dry speck, the child all 1,113 wet columns).
+        if (m == g.w) {
+          atomicOr(&waterBodyState[WATER_SCRATCH_BASE + WATER_SPLIT_WET_WORD +
+                                   (gi >> 5u)],
+                   i32(1u << (gi & 31u)));
+        }
       }
     }
   } else if (d2 <= g.z + 2 * radius + 1) {
@@ -2619,6 +2668,10 @@ fn wbSweep(@builtin(workgroup_id) wg : vec3<u32>,
 var<workgroup> gLabel : array<u32, 2304>;
 var<workgroup> gRoots : array<u32, 8>;
 var<workgroup> gSize : array<u32, 8>;
+// Per root: grid cells holding the body's liquid at the swept level, and the
+// overlap with each component of the PREVIOUS map ([root * 3 + comp]).
+var<workgroup> gWet : array<u32, 8>;
+var<workgroup> gPrev : array<u32, 24>;
 var<workgroup> gPick : array<u32, 4>;
 var<workgroup> gRootCount : atomic<u32>;
 var<workgroup> gChanged : atomic<u32>;
@@ -2750,26 +2803,59 @@ var<workgroup> gMapDirty : atomic<u32>;
   }
   let converged = atomicLoad(&gChanged) == 0u;
 
-  // ---- roots, in ascending index order ------------------------------------
+  // ---- roots, and WHICH COMPONENT IS WHOSE ---------------------------------
   // A cell is a ROOT when it labelled itself, which after the fixpoint means it
   // is the smallest index in its component. Collected by ONE thread in a single
   // ascending scan, so the ranking is a property of the grid rather than of
   // which invocation got there first — the same reason the ledger's hole key is
   // an atomicMin over a packed position rather than a first-writer-wins.
   //
-  // SIZED, and then the small ones DROPPED, which the first version did not do
-  // and paid for. Ranking the first four roots by grid index alone made
-  // component 0 whatever component happened to touch the lowest-numbered grid
-  // cell — and at the top of a disc that is a SPECK: two or three open cells
-  // where the circle's edge clips a grid cell. The parent inherited the speck,
-  // the child inherited the entire lake, and the parent was left holding a
-  // debit against a pool with no water in it. So: collect up to eight roots,
-  // count what each actually owns, keep the ones over a floor, and take the
-  // three largest. Ties break by grid index, and the kept roots are numbered in
-  // ASCENDING index order, so the whole assignment is a pure function of the
-  // bitmap.
+  // Three numbers per root: SIZE (open grid cells), WET (grid cells holding
+  // the body's own liquid at this level — the sweep's second bitmap) and
+  // PREV[c] (cells the previous published map gave component c). Then:
+  //
+  //   KEEP up to three, wettest first. A component under WB_SPLIT_MIN_CELLS
+  //   grid cells is an artefact of the downsample (the disc's edge clipping a
+  //   grid cell) and folds back into the parent, as before. Among the rest the
+  //   ones holding WATER are kept before the dry ones, then by size, then by
+  //   grid index. Dry components are still NAMED when there is room: a child
+  //   pool that has drained below its parent's level is dry at the parent's
+  //   level, and folding it into the parent would hand the parent both sides
+  //   of the partition and let the relevel pour water through the wall.
+  //
+  //   NUMBER them so component 0 is THE PARENT'S POOL. Component 0 is the
+  //   parent body — its ledger, its level, its relevel credit — so it must be
+  //   the water that ledger describes. It was "lowest grid index", which is a
+  //   property of the terrain and not of the water, and on a discovered probe
+  //   (a padded disc round some evidence, taking in whatever hillside is
+  //   inside it) the lowest index was a 9-cell dry speck where the ground dips
+  //   under the level: the parent governed nothing, the child got all 1,113
+  //   wet columns as a fresh CANDIDATE, and the pool never levelled
+  //   (`--gate waterbody` pass N arm 2). So:
+  //     * a FIRST split (the previous map was not a split: SW_COMPS <= 1, so
+  //       the parent owned the whole disc) numbers by the keep order — the
+  //       wettest component is 0 and the parent keeps the water it had;
+  //     * a RE-publication keeps IDENTITY: each index c goes to the kept
+  //       component that overlaps the previous map's component c the most,
+  //       and only a component that overlaps none takes a free index (keep
+  //       order). Without this two pools whose wet areas cross as their levels
+  //       part would swap indices — and with them their bodies' levels and
+  //       ledgers — which is the reason "lowest index" was chosen in the first
+  //       place. Identity now comes from the map's own history instead.
+  //   Ties break by keep order, which itself ends on grid index, so the whole
+  //   assignment is a pure function of the two bitmaps and the previous map.
+  //
+  // Nothing here moves an eighth. Ownership decides which ledger re-measures
+  // which cells; the re-audits that follow are voxel sums (pass B's argument).
   if (t == 0u) {
-    for (var r = 0u; r < 8u; r++) { gRoots[r] = 0xFFFFFFFFu; gSize[r] = 0u; }
+    for (var r = 0u; r < 8u; r++) {
+      gRoots[r] = 0xFFFFFFFFu;
+      gSize[r] = 0u;
+      gWet[r] = 0u;
+      gPrev[r * 3u] = 0u;
+      gPrev[r * 3u + 1u] = 0u;
+      gPrev[r * 3u + 2u] = 0u;
+    }
     var n = 0u;
     for (var i = 0u; i < WATER_SPLIT_CELLS; i++) {
       if (gLabel[i] == i) {
@@ -2777,46 +2863,73 @@ var<workgroup> gMapDirty : atomic<u32>;
         n = n + 1u;
       }
     }
+    let prevSplit = swGet(b, SW_COMPS) > 1;
     for (var i = 0u; i < WATER_SPLIT_CELLS; i++) {
       let lab = gLabel[i];
       if (lab == 0xFFFFFFFFu) { continue; }
+      let wet = (u32(atomicLoad(&waterBodyState[WATER_SCRATCH_BASE +
+                                                WATER_SPLIT_WET_WORD +
+                                                (i >> 5u)])) >> (i & 31u)) & 1u;
+      var prev = WB_COMP_NONE;
+      if (prevSplit) { prev = wbSplitAt(b, i); }
       for (var r = 0u; r < 8u; r++) {
-        if (gRoots[r] == lab) { gSize[r] = gSize[r] + 1u; }
+        if (gRoots[r] == lab) {
+          gSize[r] = gSize[r] + 1u;
+          gWet[r] = gWet[r] + wet;
+          if (prev < 3u) { gPrev[r * 3u + prev] = gPrev[r * 3u + prev] + 1u; }
+        }
       }
     }
-    // A component under WB_SPLIT_MIN_CELLS grid cells is not a pool, it is an
-    // artefact of the downsample. Folding it back into the parent is the same
-    // safe degradation every refusal here takes — the CA handles a puddle.
-    for (var q = 0u; q < 4u; q++) { gPick[q] = 0xFFFFFFFFu; }
+    // KEEP: slots into gRoots, in keep order.
+    var keep = array<u32, 3>(8u, 8u, 8u);
     var kept = 0u;
     for (var q = 0u; q < 3u; q++) {
-      var best = 0xFFFFFFFFu;
-      var bestSize = 0u;
+      var best = 8u;
       for (var r = 0u; r < 8u; r++) {
         if (gRoots[r] == 0xFFFFFFFFu) { continue; }
         if (gSize[r] < WB_SPLIT_MIN_CELLS) { continue; }
         var taken = false;
         for (var q2 = 0u; q2 < q; q2++) {
-          if (gPick[q2] == gRoots[r]) { taken = true; }
+          if (keep[q2] == r) { taken = true; }
         }
         if (taken) { continue; }
-        if (gSize[r] > bestSize) { bestSize = gSize[r]; best = gRoots[r]; }
-      }
-      if (best != 0xFFFFFFFFu) { gPick[q] = best; kept = kept + 1u; }
-    }
-    // Number the kept roots by ascending grid index, so "component 0" is a
-    // property of the terrain and not of which one happened to be largest this
-    // tick — a component that swapped index with its sibling would swap the two
-    // pools' ledgers.
-    for (var a = 0u; a + 1u < 3u; a++) {
-      for (var bq = 0u; bq + 1u < 3u - a; bq++) {
-        if (gPick[bq] > gPick[bq + 1u]) {
-          let tmp = gPick[bq];
-          gPick[bq] = gPick[bq + 1u];
-          gPick[bq + 1u] = tmp;
+        // `r` ascends with grid index, so strict comparisons leave a full tie
+        // with the lower index.
+        var better = best == 8u;
+        if (!better) {
+          if (gWet[r] != gWet[best]) {
+            better = gWet[r] > gWet[best];
+          } else {
+            better = gSize[r] > gSize[best];
+          }
         }
+        if (better) { best = r; }
+      }
+      if (best != 8u) { keep[q] = best; kept = kept + 1u; }
+    }
+    // NUMBER: comp c -> slot into gRoots.
+    var compOf = array<u32, 3>(8u, 8u, 8u);
+    var used = array<bool, 3>(false, false, false);
+    if (prevSplit) {
+      for (var c = 0u; c < kept; c++) {
+        var best = 3u;
+        var bestOv = 0u;
+        for (var q = 0u; q < kept; q++) {
+          if (used[q]) { continue; }
+          let ov = gPrev[keep[q] * 3u + c];
+          if (ov > bestOv) { bestOv = ov; best = q; }
+        }
+        if (best < 3u) { compOf[c] = keep[best]; used[best] = true; }
       }
     }
+    for (var c = 0u; c < kept; c++) {
+      if (compOf[c] != 8u) { continue; }
+      for (var q = 0u; q < kept; q++) {
+        if (!used[q]) { compOf[c] = keep[q]; used[q] = true; break; }
+      }
+    }
+    for (var q = 0u; q < 4u; q++) { gPick[q] = 0xFFFFFFFFu; }
+    for (var c = 0u; c < kept; c++) { gPick[c] = gRoots[compOf[c]]; }
     atomicStore(&gRootCount, kept);
   }
   workgroupBarrier();

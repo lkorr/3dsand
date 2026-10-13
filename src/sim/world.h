@@ -2863,7 +2863,20 @@ static_assert(kWaterCurveWords == kWaterSweepHeaderWords + kWaterCurveMaxY +
 // SHARED scratch, not per body: exactly one basin is swept per tick (the
 // schedule is `basinId % N == tick % N`, plan §3.4), so the openness bitmap the
 // label propagation reads has one writer and one reader per tick.
-constexpr uint32_t kWaterSweepScratchWords = 128;
+//
+// TWO BITMAPS, one bit per grid cell each (2026-10-12): [0, 72) is OPEN (air
+// or the body's liquid at the swept level -- what connectivity runs on) and
+// [72, 144) is WET (the body's liquid itself at that level -- what decides
+// which component is the body's POOL). Open alone could not tell a pool from
+// the dry hillside a discovered probe's padded disc takes in, and ranking
+// components by grid index alone handed the parent the hillside
+// (`--gate waterbody` pass N arm 2). kWaterSplitWetWord is where the second
+// half starts. Literals, because scripts/check_shaders.sh scrapes them.
+constexpr uint32_t kWaterSplitWetWord = 72;
+constexpr uint32_t kWaterSweepScratchWords = 144;
+static_assert(kWaterSplitWetWord * 32 == kWaterSplitCells &&
+                  kWaterSweepScratchWords == 2 * kWaterSplitWetWord,
+              "the sweep scratch is two whole-word bitmaps over the grid");
 constexpr uint32_t kWaterCurveBase = kWaterBodyCap * kWaterBodyStateWords;
 constexpr uint32_t kWaterSweepScratchBase =
     kWaterCurveBase + kWaterBodyCap * kWaterCurveWords;

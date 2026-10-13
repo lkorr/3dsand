@@ -1476,3 +1476,51 @@ Merged on `baseline-repair` (7 worktree packages): 26 of the 30 inherited reds a
 - waterbody (pass N arm 2) — a player-dug pool splits into two components and the relevel counts 0 surface columns; water-relevel design work. See "Baseline repair C".
 - swing-plane E — the swing wounds (hp 1107 -> 1092.6) but cuts ~0.1 vox deep, never emptying a collider cell the gate counts; introduced in 5a23e96..e959c65 (demons D5 / fight64 round 3 S, F, C). See "combat package E".
 - damage-sources — the fixture's left forearm stands in the stone's path, so the cuirass is never struck; introduced in 9848dbd..1dd67ac, pose vs fixture is the owner's call. See "combat package E".
+
+## 2026-10-12 — waterbody pass N arm 2 FIXED: the split handed a dug pool's parent the dry hillside (`waterbody` -> pass, hash unmoved)
+
+`waterbody` flipped to **pass**; `determinismHash` ef7d9a06 unmoved (the
+determinism script digs into no water body). One `--verify
+waterbody,current,determinism`: all three PASS.
+
+**Cause (made to say so first, rule 6).** A new arm-2 attribution line decodes
+the parent's published split map the way `wbOwns` reads it and counts the real
+wet columns under each component: `c0 9/0/0/0 c1 300/1113/101769/314` (grid
+cells / wet columns / eighths / wet at the map level) — the PARENT owned
+component 0, a 9-grid-cell DRY speck, and the child owned every wet column but
+sat in `candidate, quiet 0` for all 120 ticks. A discovered probe's disc is a
+padded circle round the evidence, so it takes in hillside that dips under the
+pool's level; the crater makes the basin curve-dirty, the M5 sweep finds that
+dry pocket as a second OPEN component (openness = air or water), and `wbSplit`
+numbered components by ascending grid index, so the speck became component 0.
+That is the "re-adopt-from-scratch can be handed the EMPTY component" finding
+W-D flagged, arriving through the first split rather than a ladder restart.
+
+**Fix (engine).** `wbSweep` writes a WET bitmap beside the open one (shared
+scratch `kWaterSweepScratchWords` 128 -> 144, `WATER_SPLIT_WET_WORD` in the
+prelude + `check_shaders.sh`). `wbSplit` keeps up to three components
+wettest-first (then size, then index; dry ones still named so a drained child
+stays separate), and numbers them so a FIRST split gives component 0 the
+wettest and a RE-publication keeps identity by overlap with the previous map.
+Three holes closed beside it: `wbForgetSplit` resets `SW_COMPS` when a slot is
+vacated (a stale map was read by the next body given the slot); a split child
+is never parked in sticky `WB_REFUSED` (it measures before any map exists and
+digging is not liquid evidence, so nothing would lift it); `waterbody.cpp`
+rebuilds `children_` every tick (it was cleared only by a relabel and held 120
+copies of one child by the end of arm 2).
+
+**The gate, two changes, both evidence-backed.** (1) A new assertion: after the
+crater the parent must govern most wet columns — measured 100%. (2) The
+top-surface walk (`SweepBasin`) now applies `wbColumnSurface`'s air-above rule,
+which its own comment already claimed to mirror: with the ownership fixed the
+arm read 4 eighths, and the ROOF line showed the max was 2 columns of the pool's
+water seeped under a SANDSTONE lip (id 129) on the bank at +1, while the 1,094
+columns the kernel levels spanned 3. Roofed columns are now reported, not
+judged. Crater spread 16 -> **3 eighths against `waterbodyDiscoverSpread` 3** —
+AT the budget, and a diagnostic 120 further ticks held 3, so that budget is
+where W1 converges on this pool, not slack. A ceiling-of-mean relevel target was
+tried to tighten it and made passes R (5 eighths, 58 chunks awake) and S (ring
+never asleep) worse; reverted, left as an open question.
+
+Pre-existing and untouched: `check_pass_table.py` fails on `sim_fluid.wgsl:alloc`
+(row `fluidAlloc` reads `T` and `pageTable` undeclared) at d4b0636.

@@ -21118,6 +21118,33 @@ cells are folded back into the parent for the same reason: at the top of a disc
 the circle's edge clips two or three cells, and ranking components by grid index
 alone once handed the parent that speck and the child the entire lake.
 
+**Component 0 is the parent's POOL, and identity survives re-publication
+(2026-10-12).** Openness (air or the body's liquid) is what connectivity has to
+run on — a cone the CA left below the level is air AT the level and still the
+same pool — but it cannot say which component holds the water. So the sweep
+writes a second bitmap, WET (the body's own liquid at the swept level; the
+shared scratch is two bitmaps, `kWaterSweepScratchWords` = 144), and `wbSplit`
+keeps up to three components wettest-first (then by size, then by grid index;
+dry ones are still named when there is room, because a child pool that drained
+below its parent's level is dry at the parent's level and folding it into the
+parent would let the relevel pour water through the partition). Numbering: on a
+FIRST split (the previous map was not a split, so the parent owned the whole
+disc) component 0 is the wettest — the parent keeps the water its ledger,
+level and credit describe; on a RE-publication each index goes to the kept
+component overlapping the previous map's component of that index the most, so
+two pools whose wet areas cross as their levels part do not swap ledgers. The
+grid-index rule this replaces handed a discovered probe's PARENT a 9-cell dry
+speck of hillside its padded disc took in and its CHILD all 1,113 wet columns
+as a fresh candidate (`--gate waterbody` pass N arm 2, red from at least 13adc66
+until 2026-10-12). Two more holes closed with it: a slot whose body LEFT forgets
+its split map (`wbForgetSplit` resets `SW_COMPS` at the four ledger wipes that
+mean "this body is gone", not at adoption), so the next body given the slot does
+not read a map drawn over somebody else's disc; and a split CHILD is never parked
+in the sticky `WB_REFUSED` — a child proposed on the dig tick measures before
+any map exists, and digging is not liquid evidence, so nothing would ever have
+lifted it. The CPU's child list is rebuilt every tick (it was cleared only by a
+relabel and gained one stale copy per tick for the life of the dig latch).
+
 **A split is not new arithmetic.** Nothing divides anybody's water. The map
 changes which cells each body OWNS and the existing ladder does the rest: the
 child's adoption reduce measures its own voxels, the parent's re-audit
@@ -21495,17 +21522,16 @@ the GPU re-adopts by re-measuring, at exactly the same 109,016 eighths. And pass
 R's crater, bored into the CREATED body, leaves it flat to 2 eighths with 0 page
 faults — W1 reaching a body the player made, which is the owner's actual ask.
 
-**One interaction found and not fixed here.** The crater makes the probe's basin
-curve-dirty, which arms M5's sweep; this pool's disc holds a second open region
-(its water reached 1,107 columns against the 1,089 dug, so it found a way out
-sideways), the sweep names two components, and the child adopts the water while
-the parent keeps component 0. That is M5 working as designed for an ADOPTED
-body — but a body that has to RE-ADOPT from scratch under a live split map can
-end up with the empty component and refuse. A real load does not reproduce it
-(the ledger buffer comes back zeroed with the world, so no stale map survives),
-so pass N runs its round trip before the crater rather than after. Whether M5's
-ladder restart under a live map deserves its own fix is a question for the split
-machinery, not for discovery.
+**One interaction found here, FIXED 2026-10-12 in the split machinery.** The
+crater makes the probe's basin curve-dirty, which arms M5's sweep; the probe's
+padded disc takes in hillside that dips under the level, so the sweep names a
+second, DRY component — and numbering by grid index gave it to the PARENT,
+while the child got the pool as a fresh candidate that never went quiet while
+the CA settled the crater. Nobody relevelled: the "created pool never levels
+flat" of pass N arm 2. `wbSplit` now makes component 0 the wettest component on
+a first split and keeps identity on re-publication, a vacated slot forgets its
+map, and a child is never sticky-refused (§5b.6). Pass N still runs its round
+trip before the crater, because that arm is about the registry.
 
 ### 5b.11 W3: what disturbs the surface (added 2026-09-14)
 

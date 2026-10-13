@@ -375,6 +375,7 @@ static std::string BuildShaderConstantPrelude() {
   o << "const WATER_CURVE_WORDS : u32 = " << kWaterCurveWords << "u;\n";
   o << "const WATER_CURVE_BASE : u32 = " << kWaterCurveBase << "u;\n";
   o << "const WATER_SCRATCH_BASE : u32 = " << kWaterSweepScratchBase << "u;\n";
+  o << "const WATER_SPLIT_WET_WORD : u32 = " << kWaterSplitWetWord << "u;\n";
   // W1: the relevel histogram, past the sweep scratch in the same buffer
   // (docs/PLAN_water_relevel.md §3.2). WATER_RELEVEL_HIST_BASE is arithmetic
   // over four other caps, which is exactly why it is generated and never

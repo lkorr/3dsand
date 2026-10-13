@@ -132,6 +132,21 @@ struct VoxelTruth {
   int topMinAt[3] = {0, 0, 0};
   int topMaxAt[3] = {0, 0, 0};
   std::vector<uint32_t> topBelowMax;  // [k] = columns whose top is k eighths under topMaxE
+  // ROOFED columns are NOT in the top set (2026-10-12). `wbColumnSurface`
+  // requires AIR over the cell it calls a free surface — a roofed pocket, water
+  // under a ledge or in a crevice of the bank, is not lake surface, and that
+  // is the rule's stated reason for existing ("keeps this rule out of the caves
+  // that open under a bank"). This walk had mirrored only half of it ("nothing
+  // of ours above"), so it judged the relevel on columns the relevel is
+  // designed never to touch: pass N arm 2 read 4 eighths against a budget of
+  // 3 because two columns of the dug pool's water had seeped under a
+  // SANDSTONE lip on the bank (id 129) at +1 over the pool, while the 1,094
+  // columns the kernel owns spanned 3. Counted here instead, with the material
+  // over the highest of them and the spread INCLUDING them, so a gate line
+  // still shows what was left out.
+  uint32_t topRoofed = 0;
+  uint32_t topRoofMat = 0;
+  int topAllMinE = 0, topAllMaxE = 0;
   uint32_t chunks = 0;       // chunks actually read
 };
 
@@ -169,12 +184,18 @@ VoxelTruth SweepBasin(Ctx& c, const WaterBasin& b, const WaterBodyDesc& d,
   const int y0 = yHiOverride >= yLoOverride ? yLoOverride : d.lo.y;
   const int y1 = yHiOverride >= yLoOverride ? yHiOverride : d.hi.y;
   std::vector<uint8_t> full;   // per (x,z,y) of the AABB: eighths, 0 = not ours
+  std::vector<uint16_t> other; // per (x,z,y): material id of a NON-air cell not ours
   const int nx = d.hi.x - d.lo.x + 1;
   const int nz = d.hi.z - d.lo.z + 1;
   const int ny = y1 - y0 + 2;
   full.assign((size_t)nx * nz * ny, 0u);
+  other.assign((size_t)nx * nz * ny, 0u);
   auto at = [&](int x, int y, int z) -> uint8_t& {
     return full[(size_t)((y - y0) * nz + (z - d.lo.z)) * nx + (x - d.lo.x)];
+  };
+  auto roofAt = [&](int x, int y, int z) -> uint16_t {
+    if (y - y0 >= ny) return 0;
+    return other[(size_t)((y - y0) * nz + (z - d.lo.z)) * nx + (x - d.lo.x)];
   };
 
   for (int cy = y0 >> 4; cy <= ((y1 + 1) >> 4); cy++) {
@@ -197,7 +218,12 @@ VoxelTruth SweepBasin(Ctx& c, const WaterBasin& b, const WaterBodyDesc& d,
               const int64_t dx = x - b.cx, dz = z - b.cz;
               if (!noDisc && dx * dx + dz * dz > b.discD2Max) continue;
               const uint32_t w = chunk[(size_t)(lz * 16 + ly) * 16 + lx];
-              if ((w & 0xFFFu) != matId) continue;
+              if ((w & 0xFFFu) != matId) {
+                if ((w & 0xFFFu) != kMatAir)
+                  other[(size_t)((y - y0) * nz + (z - d.lo.z)) * nx + (x - d.lo.x)] =
+                      (uint16_t)(w & 0xFFFu);
+                continue;
+              }
               at(x, y, z) = (uint8_t)(((w >> 12) & 0xFu) + 1u);
             }
           }
@@ -231,14 +257,25 @@ VoxelTruth SweepBasin(Ctx& c, const WaterBasin& b, const WaterBodyDesc& d,
   // bounded the way `wbBandFloor` bounds it: never below the basin floor, so a
   // pocket the shader cannot see is not a column the gate judges it on.
   const int yTopLo = std::max(y0, b.floorY + 1);
+  int allMin = 1 << 30, allMax = -(1 << 30), roofTop = 0;
   for (int z = d.lo.z; z <= d.hi.z; z++) {
     for (int x = d.lo.x; x <= d.hi.x; x++) {
       for (int y = y1; y >= yTopLo; y--) {
         const uint8_t e = at(x, y, z);
         if (e == 0) continue;
         if (at(x, y + 1, z) != 0) break;   // our own liquid above: not a surface
-        t.topCells++;
         const int e8 = y * 8 + (int)e;
+        allMin = std::min(allMin, e8);
+        allMax = std::max(allMax, e8);
+        const uint16_t roof = roofAt(x, y + 1, z);
+        if (roof != 0) {
+          // Roofed: `wbColumnSurface`'s `break` — this column has no free
+          // surface in the band, whatever lies under it.
+          if (t.topRoofed == 0 || e8 > roofTop) { roofTop = e8; t.topRoofMat = roof; }
+          t.topRoofed++;
+          break;
+        }
+        t.topCells++;
         if (e8 < t.topMinE) { t.topMinAt[0] = x; t.topMinAt[1] = y; t.topMinAt[2] = z; }
         if (e8 > t.topMaxE) { t.topMaxAt[0] = x; t.topMaxAt[1] = y; t.topMaxAt[2] = z; }
         t.topMinE = std::min(t.topMinE, e8);
@@ -252,6 +289,7 @@ VoxelTruth SweepBasin(Ctx& c, const WaterBasin& b, const WaterBodyDesc& d,
     t.surfaceMinE = 0; t.surfaceMaxE = 0;
   }
   if (t.topCells == 0) { t.topMinE = 0; t.topMaxE = 0; }
+  if (allMax >= allMin) { t.topAllMinE = allMin; t.topAllMaxE = allMax; }
   if (t.topCells > 0) {
     t.topBelowMax.assign((size_t)std::min(t.topMaxE - t.topMinE, 63) + 1, 0u);
     for (int z = d.lo.z; z <= d.hi.z; z++)
@@ -260,6 +298,7 @@ VoxelTruth SweepBasin(Ctx& c, const WaterBasin& b, const WaterBodyDesc& d,
           const uint8_t e = at(x, y, z);
           if (e == 0) continue;
           if (at(x, y + 1, z) != 0) break;
+          if (roofAt(x, y + 1, z) != 0) break;   // roofed: not in the top set
           const int k = std::min(t.topMaxE - (y * 8 + (int)e), 63);
           t.topBelowMax[(size_t)k]++;
           break;
@@ -411,6 +450,142 @@ LedgerView ReadLedger(Ctx& c) {
   v.w.assign((size_t)kWaterBodyStateTotalWords, 0);
   ReadWaterLedgerSync(c.ctx, c.world, v.w.data());
   return v;
+}
+
+const char* LedgerStateName(int32_t st);
+
+// ---- WHO OWNS WHICH COMPONENT, AND WHERE THE WATER IS (rule 6) -------------
+//
+// A split basin is a map from grid cell to component plus a body per
+// component, and "the body measures 0 surface columns" is four different bugs
+// depending on which component holds the water. This decodes the PARENT's
+// published map exactly as `wbOwns` reads it (disc, grid step, 2-bit cells,
+// WB_COMP_NONE), walks the real voxels of the disc, and reports per raw map
+// value (0..2, 3 = NONE): grid cells, columns holding this basin's liquid,
+// those columns' eighths, and how many of them hold liquid AT the mapped
+// level. Then every live slot over the basin (parent and split children) with
+// the component it governs and the ledger words that say what it made of it.
+// Permanent: it is one line and it only runs on a failure.
+struct SplitWho {
+  bool read = false;
+  int comps = 0;                        // SW_COMPS of the parent's map
+  uint32_t wetCols[4] = {0, 0, 0, 0};   // by raw map value, 3 = NONE
+  std::string line;
+  // Wet columns the PARENT governs: map value 0 plus NONE (which `wbOwns`
+  // hands to component 0), or every column when the map is not a split.
+  uint32_t ParentWet() const {
+    return comps <= 1 ? AllWet() : wetCols[0] + wetCols[3];
+  }
+  uint32_t AllWet() const {
+    return wetCols[0] + wetCols[1] + wetCols[2] + wetCols[3];
+  }
+};
+SplitWho SplitAttribution(Ctx& c, const LedgerView& lv, uint32_t basinId,
+                          uint32_t matId, int yLo, int yHi) {
+  SplitWho out;
+  const WaterBasin* b = WaterBodies().Basin(basinId);
+  const WaterBodyDesc* pd = WaterBodies().Find(basinId);
+  if (!b || !pd || pd->gpuSlot >= kWaterBodyCap) {
+    out.line = "split: no parent slot";
+    return out;
+  }
+  const uint32_t ps = pd->gpuSlot;
+  int radius = (int)std::sqrt((double)std::max(b->discD2Max, 0));
+  while ((int64_t)(radius + 1) * (radius + 1) <= b->discD2Max) radius++;
+  while ((int64_t)radius * radius > b->discD2Max) radius--;
+  const int step = std::max(1, (2 * radius + 1 + (int)kWaterSplitGrid - 1) /
+                                   (int)kWaterSplitGrid);
+  const int comps = lv.Sw(ps, SW_COMPS);
+  const int mapY = lv.Sw(ps, SW_MAPY);
+  auto rawAt = [&](int x, int z) -> int {
+    const int gx = (x - (b->cx - radius)) / step;
+    const int gz = (z - (b->cz - radius)) / step;
+    if (gx < 0 || gz < 0 || gx >= (int)kWaterSplitGrid ||
+        gz >= (int)kWaterSplitGrid)
+      return 3;
+    const uint32_t gi = (uint32_t)gz * kWaterSplitGrid + (uint32_t)gx;
+    const uint32_t w = (uint32_t)lv.Sw(
+        ps, kWaterSweepHeaderWords + kWaterCurveMaxY + (gi >> 4));
+    return (int)((w >> ((gi & 15u) * 2u)) & 3u);
+  };
+  uint32_t grid[4] = {0, 0, 0, 0};
+  for (uint32_t gi = 0; gi < kWaterSplitCells; gi++) {
+    const uint32_t w = (uint32_t)lv.Sw(
+        ps, kWaterSweepHeaderWords + kWaterCurveMaxY + (gi >> 4));
+    grid[(w >> ((gi & 15u) * 2u)) & 3u]++;
+  }
+  // Columns: the voxel truth of the disc, chunk by chunk.
+  uint32_t cols[4] = {0, 0, 0, 0}, atMap[4] = {0, 0, 0, 0};
+  uint64_t eighths[4] = {0, 0, 0, 0};
+  World& world = c.world;
+  std::vector<uint32_t> chunk(kChunkVol);
+  const int x0 = b->cx - radius, x1 = b->cx + radius;
+  const int z0 = b->cz - radius, z1 = b->cz + radius;
+  const int nxs = x1 - x0 + 1, nzs = z1 - z0 + 1;
+  std::vector<uint32_t> colE((size_t)nxs * nzs, 0u);
+  std::vector<uint8_t> colAt((size_t)nxs * nzs, 0u);
+  for (int cy = yLo >> 4; cy <= (yHi >> 4); cy++)
+    for (int cz = z0 >> 4; cz <= (z1 >> 4); cz++)
+      for (int cx = x0 >> 4; cx <= (x1 >> 4); cx++) {
+        const IVec3 wc{cx, cy, cz};
+        if (!world.ChunkInWindow(wc)) continue;
+        ReadVoxelsSync(c.ctx, world, World::SlotChunkIndex(wc), 1, chunk.data(),
+                       "waterbodySplitWho");
+        for (int ly = 0; ly < 16; ly++) {
+          const int y = cy * 16 + ly;
+          if (y < yLo || y > yHi) continue;
+          for (int lz = 0; lz < 16; lz++)
+            for (int lx = 0; lx < 16; lx++) {
+              const int x = cx * 16 + lx, z = cz * 16 + lz;
+              if (x < x0 || x > x1 || z < z0 || z > z1) continue;
+              const int64_t dx = x - b->cx, dz = z - b->cz;
+              if (dx * dx + dz * dz > b->discD2Max) continue;
+              const uint32_t w = chunk[(size_t)(lz * 16 + ly) * 16 + lx];
+              if ((w & 0xFFFu) != matId) continue;
+              const size_t k = (size_t)(z - z0) * nxs + (x - x0);
+              colE[k] += ((w >> 12) & 0xFu) + 1u;
+              if (y == mapY) colAt[k] = 1;
+            }
+        }
+      }
+  for (int z = z0; z <= z1; z++)
+    for (int x = x0; x <= x1; x++) {
+      const size_t k = (size_t)(z - z0) * nxs + (x - x0);
+      if (colE[k] == 0) continue;
+      const int r = rawAt(x, z);
+      cols[r]++;
+      eighths[r] += colE[k];
+      atMap[r] += colAt[k];
+    }
+  std::string s = Format(
+      "split attribution: parent slot %u map %d comps at y%d (gen %d), grid "
+      "step %d r%d; by map value [grid cells / wet columns / eighths / wet at "
+      "map y]:",
+      ps, comps, mapY, lv.Sw(ps, SW_MAPGEN), step, radius);
+  for (int r = 0; r < 4; r++)
+    s += Format(" %s %u/%u/%llu/%u", r == 3 ? "NONE" : Format("c%d", r).c_str(),
+                grid[r], cols[r], (unsigned long long)eighths[r], atMap[r]);
+  s += " | bodies:";
+  auto body = [&](const WaterBodyDesc& d) {
+    if (d.basinId != basinId || d.gpuSlot >= kWaterBodyCap) return;
+    const uint32_t k = d.gpuSlot;
+    s += Format(
+        " [slot %u %s comp %u: %s, quiet %d, level %d, rsum %d, volume %d, "
+        "rarea %d, relevel count %d, given/taken %d/%d, adopt t%d]",
+        k, d.isChild ? "child" : "parent", d.component,
+        LedgerStateName(lv.At(k, WBS_STATE)), lv.At(k, WBS_QUIET),
+        lv.At(k, WBS_LEVEL), lv.At(k, WBS_RSUM), lv.At(k, WBS_VOLUME),
+        lv.At(k, WBS_RAREA_W), lv.At(k, WBS_RVCOUNT_W),
+        lv.At(k, WBS_RVGIVENT_W), lv.At(k, WBS_RVTAKENT_W),
+        lv.At(k, WBS_ADOPTTICK));
+  };
+  for (const WaterBodyDesc& d : WaterBodies().Bodies()) body(d);
+  for (const WaterBodyDesc& d : WaterBodies().Children()) body(d);
+  out.read = true;
+  out.comps = comps;
+  for (int r = 0; r < 4; r++) out.wetCols[r] = cols[r];
+  out.line = s;
+  return out;
 }
 
 const char* LedgerStateName(int32_t st) {
@@ -2283,26 +2458,27 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
 
     // ---- ARM 2: pass R's crater, in the DISCOVERED body ------------------
     //
-    // LAST, not second as §8.5 lists it, and the reordering is a finding rather
-    // than a convenience. Boring the crater lands a mutation in a chunk the
-    // probe LABELLED, which sets the basin's curve-dirty latch for 900 ticks —
-    // and a curve-dirty basin is what arms M5's sweep. The sweep then publishes
-    // a split map at the body's live level, this pool's disc holds a second
-    // open region (the pit's water reached 1,107 columns against the 1,089 that
-    // were dug, so it found a way out sideways), and the parent is handed
-    // component 0 while the child adopts the water.
+    // LAST, not second as §8.5 lists it. Boring the crater lands a mutation in
+    // a chunk the probe LABELLED, which sets the basin's curve-dirty latch for
+    // 900 ticks — and a curve-dirty basin is what arms M5's sweep. The sweep
+    // then publishes a split map at the body's live level, because the probe's
+    // disc (a padded circle round the evidence) takes in hillside that dips
+    // under the level: a second, DRY, open region. Arm 4 is a statement about
+    // the registry round-tripping and is run on a body nobody has dug into.
     //
-    // That is M5 behaving as designed for an ADOPTED body, and it made arm 4 —
-    // run in between — report a refusal with `reduce sum 0, 2 components mapped
-    // at y=198`. But arm 4 is a statement about the REGISTRY round-tripping,
-    // and a real load does not reproduce that situation at all: LoadWorld
-    // restores the grid and the ledger buffer comes back zeroed, so no stale
-    // split map survives for a re-adopting body to lose to. Running the round
-    // trip on a body nobody has dug into tests what §8.5 asks; running it after
-    // the crater tested M5's split under a ladder restart, which is a real
-    // question and not this package's.
+    // THIS ARM WAS RED FROM AT LEAST 13adc66 UNTIL 2026-10-12, and the cause is
+    // the second assertion below. `wbSplit` numbered components by grid index,
+    // the dry region (9 grid cells, 0 wet columns) had the lower index, so the
+    // PARENT was handed it as component 0 and the child got all 1,113 wet
+    // columns as a fresh CANDIDATE that never went quiet while the CA settled
+    // the crater: nobody relevelled the pool. The split now ranks components by
+    // the WATER they hold and keeps component identity across re-publications
+    // (sim_waterbody.wgsl wbSplit), so the parent keeps its pool — asserted
+    // here directly, not only through the spread it produces.
     int64_t nSpread = -1;
     uint32_t nPf = 0;
+    double nParentWetPct = -1.0;
+    uint32_t nRoofed = 0;
     if (nSlot < kWaterBodyCap && nState == WB_ADOPTED) {
       const WaterBasin* pb = WaterBodies().Basin(nProbeBasin);
       const WaterBodyDesc* pd = WaterBodies().Find(nProbeBasin);
@@ -2337,6 +2513,21 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
         const bool armedAfterCrater = WaterBodies().Gpu().writesThisTick;
         tick = RunQuietTicks(c, tick, nRelevelTicks);
         const LedgerView rv1 = ReadLedger(c);
+        // WHO GOVERNS THE WATER (rule 6, and an assertion of its own). The
+        // parent is the body whose ledger, level and relevel credit describe
+        // this pool; after a split it must still own most of the wet columns.
+        const SplitWho who = SplitAttribution(c, rv1, nProbeBasin, matId,
+                                              nWaterBot - nCraterDepth, gyMax + 1);
+        if (who.read) {
+          nParentWetPct = who.AllWet() == 0
+                              ? -1.0
+                              : 100.0 * (double)who.ParentWet() / (double)who.AllWet();
+          if (who.AllWet() > 0 && 2u * who.ParentWet() < who.AllWet())
+            fail(Format("pass N arm 2: the split handed the PARENT %u of %u wet "
+                        "columns — component 0 is not the pool the parent's "
+                        "ledger describes. %s",
+                        who.ParentWet(), who.AllWet(), who.line.c_str()));
+        }
         uint32_t ownChunks = 0;
         for (uint32_t e : WaterBodies().Gpu().chunks) ownChunks += (e >> 16) == nSlot;
         const std::string rvWhy = Format(
@@ -2367,6 +2558,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
                "body after the crater");
         } else {
           nSpread = (int64_t)nv.topMaxE - (int64_t)nv.topMinE;
+          nRoofed = nv.topRoofed;
           if ((double)nSpread > nSpreadMax)
             fail(Format(
                 "pass N arm 2: the CREATED body's surface is still %lld eighths "
@@ -2382,6 +2574,13 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
             std::string hist;
             for (size_t k = 0; k < nv.topBelowMax.size(); k++)
               if (nv.topBelowMax[k]) hist += Format(" -%zu:%u", k, nv.topBelowMax[k]);
+            fail(Format("pass N arm 2 ROOF: %u roofed columns left out of %u "
+                        "(highest under mat %u), spread with them %d (%d..%d) | "
+                        "ledger: mean %d, take cut %d, give cut %d, credit %d",
+                        nv.topRoofed, nv.topCells + nv.topRoofed, nv.topRoofMat,
+                        nv.topAllMaxE - nv.topAllMinE, nv.topAllMinE, nv.topAllMaxE,
+                        rv1.At(nSlot, WBS_RVMEAN_W), rv1.At(nSlot, WBS_RVTAKECUT_W),
+                        rv1.At(nSlot, WBS_RVGIVECUT_W), rv1.At(nSlot, WBS_RVCREDIT_W)));
             fail(Format("pass N arm 2 WHERE: top max %d at (%d,%d,%d), min %d at (%d,%d,%d); "
                         "pit x%d..%d z%d..%d (crater x%d..%d z%d..%d y%d..%d); %u top "
                         "columns by eighths under the top:%s; %s",
@@ -2391,6 +2590,23 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
                         nx + nCraterHalf, nz - nCraterHalf, nz + nCraterHalf,
                         nWaterBot - nCraterDepth, nWaterBot - 1, nv.topCells, hist.c_str(),
                         rvWhy.c_str()));
+            fail("pass N arm 2 WHO: " + who.line);
+            // CONVERGING OR STUCK (rule 6): the same window again, after the
+            // verdict, so one failing run says whether a longer window would
+            // have passed. Diagnostic only — every pass after this one is
+            // skipped on a failure, so the extra ticks reach nothing.
+            tick = RunQuietTicks(c, tick, nRelevelTicks);
+            const VoxelTruth nv2 = SweepBasin(c, pbCopy, pdCopy, matId,
+                                              nWaterBot - nCraterDepth, gyMax);
+            const LedgerView rv2 = ReadLedger(c);
+            fail(Format("pass N arm 2 LATER: %u ticks further the spread is %d "
+                        "(%d with %u roofed columns), relevel given/taken "
+                        "%d/%d cumulative, mean %d, credit %d",
+                        nRelevelTicks, nv2.topMaxE - nv2.topMinE,
+                        nv2.topAllMaxE - nv2.topAllMinE, nv2.topRoofed,
+                        rv2.At(nSlot, WBS_RVGIVENT_W),
+                        rv2.At(nSlot, WBS_RVTAKENT_W), rv2.At(nSlot, WBS_RVMEAN_W),
+                        rv2.At(nSlot, WBS_RVCREDIT_W)));
           }
         }
         if (nPf != 0)
@@ -2410,6 +2626,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     // recorded value sharing a key with a budget is a --rebaseline that quietly
     // overwrites the budget with whatever the last run measured.
     RecordObserved("waterbodyDiscoverSpreadOn", (double)nSpread);
+    RecordObserved("waterbodyDiscoverParentWetPct", nParentWetPct);
     // ONE LINE, and it names every term §8.5 asks for plus the ones a failure
     // needs to tell itself apart (CLAUDE.md rule 6): "no body appeared" is a
     // different bug from "a body appeared and measured the wrong pool" and from
@@ -2424,14 +2641,16 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
         "DISCOVERY(pit %dx%dx%d at %d,%d y%d..%d) bodies %llu / adopted-tick %d "
         "/ refused %d | poured %lld -> measured %d eighths, surface %d cells "
         "(floor %d), level %d, state %s, slot %u | crater %dx%dx%d spread %lld "
-        "eighths (budget %.0f), %u page faults | NEGATIVE arm: %lld eighths "
+        "eighths (budget %.0f, %u roofed columns left out), parent holds %.1f%% of "
+        "the wet columns, %u page faults | NEGATIVE arm: %lld eighths "
         "(half of %d) left %llu probes%s | ROUND TRIP: cleared %s, %llu "
         "restored, %s, volume %d -> %d | %u evictions, %llu evidence cells",
         nHalf * 2 + 1, nHalf * 2 + 1, nDepth - 1, nx, nz, nWaterBot, nWaterTop,
         (unsigned long long)nRegistry, nAdoptTick, nRefused, (long long)nPoured,
         nVolume, nRArea, nt.sim.waterAdoptMinArea, nLevel,
         LedgerStateName(nState), nSlot, nCraterHalf * 2 + 1,
-        nCraterHalf * 2 + 1, nCraterDepth, (long long)nSpread, nSpreadMax, nPf,
+        nCraterHalf * 2 + 1, nCraterDepth, (long long)nSpread, nSpreadMax,
+        nRoofed, nParentWetPct, nPf,
         (long long)nPoured2, nt.sim.waterDiscoverMinEighths,
         (unsigned long long)nRegistry2, nGhost ? " + a ghost slot" : "",
         nCleared ? "yes" : "no", (unsigned long long)nRegistry3,

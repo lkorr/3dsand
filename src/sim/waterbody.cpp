@@ -996,6 +996,17 @@ void WaterBodySystem::Classify(const World& world, uint32_t tick) {
   // A SECOND PASS, after every parent has its slot, and deliberately: children
   // must not push a parent past the cap, because an unproposed PARENT is a
   // whole lake handed back to the CA to buy a pool that may never exist.
+  //
+  // RE-DERIVED EVERY TICK, like every parent's slot above — so the list starts
+  // EMPTY. It used to be cleared only by Relabel (a window move or a registry
+  // change), while this loop pushed one child per tick: `--gate waterbody`
+  // pass N arm 2 ended with 120 copies of one child, every one claiming slot 2,
+  // and BuildGpu's last-writer-wins `bySlot` hid it. Hidden is not harmless:
+  // when the dig latch expires the copies stay, keep a child proposed with no
+  // dirty parent, and claim whatever slot they last held over the body the
+  // ladder gives that slot next. Nothing is carried in a child — its ledger is
+  // the GPU's — so rebuilding the list loses nothing.
+  children_.clear();
   for (size_t oi = 0; oi < order.size() && kWaterBodyChildren > 0; oi++) {
     const size_t i = order[oi];
     const WaterBodyDesc& d = bodies_[i];
