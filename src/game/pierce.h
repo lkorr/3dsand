@@ -80,3 +80,32 @@ PierceFlight PierceAlongRay(Physics& phys, MobSystem& mobs, DebrisSystem& debris
                             const Penetrator& pen,
                             const std::vector<uint64_t>& ignore = {},
                             const std::string& embedItem = {});
+
+// ---- A SPELL FLIGHT'S MATTER MEETS A BODY (docs/PLAN_projectiles.md D) -------
+//
+// The owner's half of SpellBodyProbe::matterHit (game/spell.h): the VM says
+// what is flying (its matter, mass, speed, point) and over which segment; this
+// resolves the strike through the body systems and answers where the flight
+// stopped, or how fast it left the far side.
+//
+//   Pierce  PierceAlongRay with the matter as the Penetrator. Through every
+//           body met: `through`, at the residual speed. Stopped inside a
+//           creature: the leftover matter acts on the wound -- a matter a body
+//           can wear coats the channel's floor (PourOnBody), a tag:hot one
+//           lights the struck limb (IgniteLimb) -- else it is the VM's to drop.
+//   Scour   the same, its energy capped at `scourBins` bins of skin-hard
+//           matter at its tip (priced by this tuning's gore.pierceCellJ), and
+//           always stopped: grit does not fly on through a man.
+//   Splash  never penetrates. The first creature's skin under the ray takes a
+//           disc of coat (MobSystem::PickBody + PourOnBody, the pour brush's
+//           writers), and the coat's own rules do the rest; `tookMatter`.
+//   Touch   (never sent by the VM, which keeps the old bodyHit rule for a gas)
+//           the first body only: where it was met, nothing done to it.
+//
+// `ignore` = the caster's own bodies. Nothing here writes the world: gore
+// leaves through `spawns` (rule 3). Deterministic for a given physics state.
+struct SpellBodyShot;
+struct SpellBodyStrike;
+void SpellMatterStrike(Physics& phys, MobSystem& mobs, DebrisSystem& debris, World& world,
+                       std::vector<ParticleSpawn>& spawns, const SpellBodyShot& shot,
+                       const std::vector<uint64_t>& ignore, SpellBodyStrike& out);

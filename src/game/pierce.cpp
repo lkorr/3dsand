@@ -15,6 +15,7 @@
 
 #include "game/anim.h"  // QuatRotate / QuatRotateInv
 #include "game/mob.h"
+#include "game/spell.h"  // SpellBodyShot / SpellBodyStrike (SpellMatterStrike)
 #include "phys/debris.h"
 #include "phys/physics.h"
 #include "sim/tuning.h"
@@ -360,4 +361,187 @@ PierceFlight PierceAlongRay(Physics& phys, MobSystem& mobs, DebrisSystem& debris
   f.travelled = maxDistVox;
   f.endWorld = fromWorld + d * maxDistVox;
   return f;
+}
+
+namespace {
+
+// The first CREATURE SKIN (or loose body) on a segment, for a matter that does
+// not go in: CastRayBody body by body (PierceAlongRay's walk, its capsule
+// rule), and for a creature the nearest of its own voxels under the ray
+// (MobSystem::PickBody) -- a collider met with no voxel under the ray is passed
+// by, as a channel with no matter on its axis is. `pick.hit` false and
+// `body` 0 = nothing met.
+struct FirstBody {
+  uint64_t body = 0;
+  uint64_t mobId = 0;
+  Vec3 at{};
+  MobSystem::BodyRayHit pick;
+};
+FirstBody FirstBodyOn(Physics& phys, MobSystem& mobs, Vec3 from, Vec3 d, float len,
+                      const std::vector<uint64_t>& ignore) {
+  FirstBody fb;
+  std::vector<uint64_t> skip = ignore;
+  float at = 0.0f;
+  for (int k = 0; k < 2 * kPierceMaxBodies; k++) {
+    const float remain = len - at;
+    if (remain <= 1e-3f) break;
+    float frac = 1.0f;
+    const uint64_t body = phys.CastRayBody(from + d * at, d, remain, frac, skip);
+    if (body == 0) break;
+    skip.push_back(body);
+    const float hitAt = at + std::clamp(frac, 0.0f, 1.0f) * remain;
+    bool capsule = false;
+    for (const Mob* av : mobs.Avatars())
+      if (av != nullptr && av->CollisionOwner() == body) capsule = true;
+    if (capsule) continue;
+    int li = -1;
+    if (Mob* m = mobs.FindOwner(body, &li)) {
+      // From a little in front of the collider (KerfFrame's `back`), over a
+      // body's depth past it: the skin cell the ray actually meets.
+      const float back = std::min(kPierceBackVox, hitAt);
+      const Vec3 o = from + d * (hitAt - back);
+      const MobSystem::BodyRayHit pk = mobs.PickBody(m->Id(), o, d, back + 8.0f);
+      if (!pk.hit) continue;  // the box merge's convex radius, not the matter
+      fb.body = body;
+      fb.mobId = m->Id();
+      fb.pick = pk;
+      fb.at = pk.pos;
+      return fb;
+    }
+    fb.body = body;  // loose matter (a crate, a severed piece): its collider
+    fb.at = from + d * hitAt;
+    return fb;
+  }
+  return fb;
+}
+
+}  // namespace
+
+void SpellMatterStrike(Physics& phys, MobSystem& mobs, DebrisSystem& debris, World& world,
+                       std::vector<ParticleSpawn>& spawns, const SpellBodyShot& shot,
+                       const std::vector<uint64_t>& ignore, SpellBodyStrike& out) {
+  out = SpellBodyStrike{};
+  const Vec3 seg = shot.to - shot.from;
+  const float len = seg.len();
+  if (len < 1e-4f || shot.kind == SpellMatterKind::None) return;
+  const Vec3 d = seg * (1.0f / len);
+  const Tuning& tune = CurrentTuning();
+  // What it carried in, whatever it does with it (the report's number).
+  out.energyJ = 0.5f * std::max(shot.massKg, 0.0f) * shot.speedMps * shot.speedMps;
+
+  if (shot.kind == SpellMatterKind::Splash || shot.kind == SpellMatterKind::Touch) {
+    const FirstBody fb = FirstBodyOn(phys, mobs, shot.from, d, len, ignore);
+    if (fb.body == 0) return;
+    out.hit = true;
+    out.bodies = 1;
+    out.at = fb.at;
+    out.mobId = fb.mobId;
+    out.limb = fb.pick.limb;
+    // A SPLASH: the coat on the skin under the ray, the pour brush's own
+    // writers (accumulate up to a full coat, a washer rinses first, the
+    // material's coat.effects run on every limb it touched). Its own rules do
+    // the rest on later ticks: acid eats, lava sears and lights, water wets.
+    if (shot.kind == SpellMatterKind::Splash && fb.mobId != 0 && shot.coatAmount > 0) {
+      const float hp0 = mobs.TotalHp(fb.mobId);
+      uint32_t marked = 0;
+      mobs.PourOnBody(fb.mobId, fb.pick, d, std::max(0.1f, shot.splashRadius), shot.material,
+                      shot.coatAmount, shot.tick, &marked);
+      out.coated = marked;
+      out.tookMatter = marked > 0;
+      out.hp = std::max(0.0f, hp0 - mobs.TotalHp(fb.mobId));
+    }
+    return;
+  }
+
+  // ---- PIERCE / SCOUR: the matter as a point -----------------------------------
+  Penetrator pen;
+  pen.massKg = shot.massKg;
+  pen.speedMps = shot.speedMps;
+  pen.tipRadius = shot.tipRadius;
+  pen.hardness = shot.hardness;
+  pen.sharpness = shot.sharpness;
+  pen.material = shot.material;
+  pen.seed = shot.seed;
+  const bool scour = shot.kind == SpellMatterKind::Scour;
+  if (scour && shot.scourBins > 0) {
+    // A SCOUR spends at most `scourBins` bins of skin-hard matter (hardness
+    // gear.cutHardnessRef, the convention KerfBite's table keeps) at its own
+    // tip: a full bin is pi r^2 fine cells. Whatever the grit carried past
+    // that is not a deeper wound.
+    const PierceCost pc = PierceCostOf(tune);
+    const float tipHard = pen.hardness > 0.0f ? pen.hardness : 0.0f;
+    const float r = std::max(pen.tipRadius, 0.25f);
+    const float capJ = (float)shot.scourBins * 3.14159265f * r * r *
+                       PierceCellJ(pc, pc.hardRef, tipHard, pen.sharpness, 1.0f);
+    if (pen.EnergyJ() > capJ) pen.speedMps = pen.SpeedFor(capJ);
+  }
+  out.energyJ = pen.EnergyJ();
+  const PierceFlight f =
+      PierceAlongRay(phys, mobs, debris, world, spawns, shot.from, d, len, pen, ignore);
+  if (f.hits.empty()) return;
+  out.hit = true;
+  out.bodies = (uint32_t)f.hits.size();
+  const PierceHit& first = f.hits.front();
+  out.mobId = first.mobId;
+  out.limb = first.limb;
+  out.outcome = (uint8_t)first.r.outcome;
+  out.depthVox = first.r.depth;
+  for (const PierceHit& h : f.hits) {
+    out.cells += h.r.cells;
+    out.hp += h.r.hpCharged;
+    out.killed = out.killed || h.r.killed;
+    for (const PierceMatCells& pm : h.r.byMat) {
+      bool merged = false;
+      for (SpellBodyStrike::MatCells& mc : out.byMat)
+        if (mc.mat == pm.mat) {
+          mc.cells += pm.cells;
+          merged = true;
+        }
+      if (!merged) out.byMat.push_back({pm.mat, pm.cells});
+    }
+    if (h.r.hit)
+      out.spentJ += h.r.outcome == PierceOutcome::Exited
+                        ? std::max(0.0f, h.r.energyIn - h.r.energyLeft)
+                        : h.r.energyIn;
+  }
+  if (!f.stopped && !scour) {
+    // THROUGH: it flies on from the far side of the last body it left (which
+    // may lie past this tick's segment) at what it has left.
+    out.through = true;
+    out.exitSpeedMps = f.speedMps;
+    out.at = f.endWorld;
+    const PierceHit& last = f.hits.back();
+    if ((last.r.stopWorld - shot.from).dot(d) > (out.at - shot.from).dot(d))
+      out.at = last.r.stopWorld;
+    return;
+  }
+  // STOPPED (or a scour, which always stops): in the last body it met, at the
+  // channel's end -- or, for grit that went clean through something thin, at
+  // the first body's entry, where it struck.
+  const PierceHit& last = f.hits.back();
+  out.at = f.stopped ? f.endWorld : first.r.entryWorld;
+  // THE LEFTOVER MATTER ACTS ON THE WOUND, through what a body already does
+  // with it. Only inside a creature that is still there to hold it.
+  if (!f.stopped || last.mobId == 0 || !last.r.hit || last.r.severed) return;
+  if (last.r.outcome == PierceOutcome::Glanced) return;  // nothing got in
+  if (shot.coatAmount > 0) {
+    // A matter a body can wear coats the floor of the channel: the cells the
+    // axis meets past where it stopped, and the wound's rim round them.
+    const float back = 2.0f;
+    const Vec3 o = out.at - d * back;
+    const MobSystem::BodyRayHit pk = mobs.PickBody(last.mobId, o, d, back + 4.0f);
+    if (pk.hit) {
+      uint32_t marked = 0;
+      mobs.PourOnBody(last.mobId, pk, d, std::max(0.1f, shot.splashRadius * 0.5f),
+                      shot.material, shot.coatAmount, shot.tick, &marked);
+      out.coated = marked;
+      out.tookMatter = marked > 0;
+    }
+  }
+  if (shot.hot && last.limb >= 0) {
+    // A HOT lump lit inside the wound: the limb's own burn rules from there
+    // (IgniteLimb resolves what each voxel burns into; bone simply refuses).
+    const uint32_t lit = mobs.IgniteLimb(last.mobId, last.limb, 4u);
+    out.tookMatter = out.tookMatter || lit > 0;
+  }
 }

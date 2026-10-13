@@ -14,6 +14,7 @@
 #include "game/demon_seals.h"
 #include "game/demon_talk.h"
 #include "game/mob.h"
+#include "game/pierce.h"  // SpellMatterStrike: a creature's spell matter meets a body
 #include "game/session.h"
 #include "phys/debris.h"
 #include "phys/physics.h"
@@ -208,6 +209,9 @@ struct ProbeCtx {
   std::span<SessionTick> players;
   uint64_t caster = 0;
   std::vector<uint64_t> ownBodies;   // the caster's limbs: a ray from its chest
+  // The tick's particle stream: the gore a spell's matter tears out of a body
+  // (docs/PLAN_projectiles.md D) leaves with the batch, as a wound's does.
+  std::vector<ParticleSpawn>* gore = nullptr;
 };
 
 PlayerSession* SessionFor(std::span<SessionTick> players, uint64_t id) {
@@ -232,6 +236,15 @@ SpellBodyProbe MakeProbe(ProbeCtx& pc) {
     out = from + dir * (frac * len);
     return true;
   };
+  // THE MATTER IS THE PROJECTILE (docs/PLAN_projectiles.md D): the creature's
+  // matter strikes a body the way the player's does, its own limbs ignored.
+  if (pc.gore != nullptr)
+    bp.matterHit = [](void* c, const SpellBodyShot& shot, SpellBodyStrike& r) {
+      ProbeCtx& p = *(ProbeCtx*)c;
+      SpellMatterStrike(p.w->phys, p.w->mobs, p.w->debris, p.w->world, *p.gore, shot,
+                        p.ownBodies, r);
+      return r.hit;
+    };
   bp.bodyIdAt = [](void* c, Vec3 from, float radius, uint64_t& id, Vec3& out) {
     ProbeCtx& p = *(ProbeCtx*)c;
     MobSystem& mobs = p.w->mobs;
@@ -695,6 +708,7 @@ MobCastOutcome ServeImpl(TickAuthorityCtx& w, std::span<SessionTick> players,
   pc.w = &w;
   pc.players = players;
   pc.caster = req.mobId;
+  pc.gore = &out.spawns;
   if (const Mob* mob = w.mobs.FindMobById(req.mobId); mob && mob->Def())
     for (int i = 0; i < (int)mob->Def()->limbs.size(); i++)
       if (const uint64_t h = w.mobs.LimbBody(req.mobId, i)) pc.ownBodies.push_back(h);
@@ -1097,6 +1111,7 @@ void MobCastTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t t
     pc.w = &w;
     pc.players = players;
     pc.caster = c.mobId;
+    pc.gore = &out.spawns;
     if (!c.gone)
       if (const Mob* mob = w.mobs.FindMobById(c.mobId); mob && mob->Def())
         for (int i = 0; i < (int)mob->Def()->limbs.size(); i++)

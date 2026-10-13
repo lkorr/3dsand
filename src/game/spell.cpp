@@ -726,6 +726,21 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
       rr("graft", b.rateGraft);
       rr("explode", b.rateExplode);
       rr("wind", b.rateWind);
+      rr("kinetic", b.rateKinetic);
+    }
+    // THE MATTER PROJECTILE (docs/PLAN_projectiles.md D): one block, so the
+    // numbers that make a stone a projectile sit together.
+    if (bj.contains("matterProjectile") && bj["matterProjectile"].is_object()) {
+      const json& m = bj["matterProjectile"];
+      auto rm = [&](const char* k, int32_t& dst) {
+        if (m.contains(k) && m[k].is_number_integer()) dst = m[k].get<int32_t>();
+      };
+      rm("lumpMl", b.matterLumpMl);
+      rm("pierceBodyMille", b.pierceBodyMille);
+      rm("powderSharpMille", b.powderSharpMille);
+      rm("powderTipMille", b.powderTipMille);
+      rm("scourBins", b.scourBins);
+      rm("splashRadiusMille", b.splashRadiusMille);
     }
   }
   // Rule 2: these are hard engine ceilings, so a content edit cannot author an
@@ -749,6 +764,13 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
   b.rateGraft = ClampI(b.rateGraft, 0, 1000);
   b.rateExplode = ClampI(b.rateExplode, 0, 1000);
   b.rateWind = ClampI(b.rateWind, 0, 1000);
+  b.rateKinetic = ClampI(b.rateKinetic, 0, 100000);
+  b.matterLumpMl = ClampI(b.matterLumpMl, 1, 100000);
+  b.pierceBodyMille = ClampI(b.pierceBodyMille, 0, 10000);
+  b.powderSharpMille = ClampI(b.powderSharpMille, 1, 1000);
+  b.powderTipMille = ClampI(b.powderTipMille, 250, 8000);
+  b.scourBins = ClampI(b.scourBins, 1, 16);
+  b.splashRadiusMille = ClampI(b.splashRadiusMille, 100, 8000);
   b.anythingSurchargeMille = ClampI(b.anythingSurchargeMille, 0, 10000);
   b.maxStatusTicks = ClampI(b.maxStatusTicks, 1, 18000);
   b.maxStatusPerCaster = ClampI(b.maxStatusPerCaster, 1, 32);
@@ -969,6 +991,14 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
         d.ticks = ClampI(g.value("ticks", 90), 1, b.maxStatusTicks);
         d.body = g.value("body", false);
         d.resolveOnExpiry = g.value("resolveOnExpiry", false);
+        // The point its matter strikes a body with (docs/PLAN_projectiles.md
+        // D): tip radius in fine cells, sharpness 0..1.
+        if (g.contains("penetrator") && g["penetrator"].is_object()) {
+          const json& pj = g["penetrator"];
+          d.tipMille = ClampI((int32_t)std::lround(pj.value("tip", 1.5) * 1000.0), 250, 16000);
+          d.sharpMille =
+              ClampI((int32_t)std::lround(pj.value("sharpness", 0.3) * 1000.0), 1, 1000);
+        }
         // The look: render-only, so a bad value is a default and not an error.
         d.look.shape = d.body ? LookShape::Spark : LookShape::Ball;
         if (g.contains("look") && g["look"].is_object()) {
@@ -1145,6 +1175,21 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
   for (size_t i = 0; i < mats.size(); i++)
     out.crumbles[i] = mats[i].gpu.klass == CLASS_POWDER &&
                       (mats[i].gpu.flags & kMatFlagWander) == 0u;
+  // The matter as a projectile (docs/PLAN_projectiles.md D): what a flight
+  // made of it weighs, how hard its point is, what class decides how it
+  // meets a body, and whether a body can wear it (a stain slot, at the
+  // amount its stain block authors -- the default liquid coat included).
+  out.matterPhys.assign(mats.size(), SpellMatterPhys{});
+  for (size_t i = 1; i < mats.size(); i++) {
+    SpellMatterPhys& mp = out.matterPhys[i];
+    const MaterialDef& md = mats[i];
+    mp.density = std::max<int32_t>(0, md.gpu.density);
+    mp.hardness = (int32_t)std::min<uint32_t>(md.gpu.hardness, 255u);
+    mp.klass = (uint8_t)std::min<uint32_t>(md.gpu.klass, 3u);
+    const uint32_t amt = (md.gpu.stainPack >> kStainPackAmtShift) & kStainPackAmtMask;
+    mp.coatAmount = md.stainSlot != 0 ? (uint8_t)std::max<uint32_t>(1u, amt) : 0;
+    for (const std::string& t : md.tags) mp.hot = mp.hot || t == "hot";
+  }
 
   // THE GESTURES (game/spellgesture.h): gestures.json BESIDE this file, so
   // every caller that loads the glyphs — the game, the tuner's server, every
@@ -2236,6 +2281,90 @@ int32_t EffectVolume(const GlyphLibrary& lib, const EffectInst& e) {
   }
 }
 
+// ---- THE MATTER IS THE PROJECTILE (spell.h; docs/PLAN_projectiles.md D) -------
+
+const char* SpellMatterKindName(SpellMatterKind k) {
+  switch (k) {
+    case SpellMatterKind::None: return "none";
+    case SpellMatterKind::Pierce: return "pierce";
+    case SpellMatterKind::Scour: return "scour";
+    case SpellMatterKind::Splash: return "splash";
+    case SpellMatterKind::Touch: return "touch";
+  }
+  return "?";
+}
+
+SpellMatter FlightMatter(const GlyphLibrary& lib, const DeliveryRec& d,
+                         const std::vector<EffectInst>& payload) {
+  SpellMatter m;
+  // A bomb is a rigid body the owner made (its own material, its own
+  // physics); only a free flight flies as its payload's matter.
+  if (d.mech != DeliveryMech::Flight || d.body) return m;
+  int64_t best = -1;
+  for (const EffectInst& e : payload) {
+    // Free matter that lands with the carrier: a Spray item on hit. The
+    // wildcard has no matter until it lands, so it has no mass in flight.
+    if (e.verb != SpellVerb::Spray || !e.complete || e.anyA || e.matA == 0) continue;
+    if (e.timing.trigger != SpellTrigger::Hit) continue;
+    const SpellMatterPhys mp = lib.MatterPhys(e.matA);
+    const int64_t s = std::max<int64_t>(0, e.Scale());
+    // density kg/m^3 == mg/mL.
+    const int64_t mg = (int64_t)mp.density * lib.budgets.matterLumpMl * s / 1000;
+    m.massMg += mg;
+    // The CORE is the heaviest item; the first of equals (canonical order).
+    if (mg > best) {
+      best = mg;
+      m.material = e.matA;
+      m.scaleMille = (int32_t)std::min<int64_t>(s, 0x3FFFFFFF);
+    }
+  }
+  if (m.material == 0) return m;
+  const SpellMatterPhys mp = lib.MatterPhys(m.material);
+  if (mp.klass == CLASS_SOLID) m.kind = SpellMatterKind::Pierce;
+  else if (mp.klass == CLASS_POWDER) m.kind = SpellMatterKind::Scour;
+  else m.kind = mp.coatAmount ? SpellMatterKind::Splash : SpellMatterKind::Touch;
+  return m;
+}
+
+float SpellSpeedMps(int32_t speedFx) {
+  return (float)speedFx * (float)kTicksPerSecond / ((float)kSpellFxOne * (float)kVoxelsPerMetre);
+}
+
+namespace {
+// The energy a flight instance is priced on, MILLIJOULES, integer (a price is
+// authoritative, thesis 3), the pierce mod's body bonus folded in. Staged
+// divisions so the worst authored case (gold x6 at the 512-voxel ceiling)
+// stays inside int64.
+int64_t KineticMilliJ(const GlyphLibrary& lib, const DeliveryRec& d,
+                      const std::vector<EffectInst>& payload) {
+  const SpellMatter m = FlightMatter(lib, d, payload);
+  if (m.kind == SpellMatterKind::None || m.massMg <= 0) return 0;
+  // mm/s: fx voxels/tick x 30 ticks/s x 1000 mm/m / (256 x voxels/m).
+  const int64_t vmm = (int64_t)std::max(0, d.speedFx) * kTicksPerSecond * 1000 /
+                      ((int64_t)kSpellFxOne * kVoxelsPerMetre);
+  // mJ = 1/2 x mg x (mm/s)^2 / 1e9, in two halves.
+  int64_t mj = std::min<int64_t>(m.massMg, (int64_t)1 << 40) * vmm / 1000;
+  mj = mj * vmm / 1000000 / 2;
+  const int64_t bonus = 1000 + (int64_t)std::max(0, d.pierce) * lib.budgets.pierceBodyMille;
+  mj = std::min<int64_t>(mj, (int64_t)1 << 44) * bonus / 1000;
+  return mj;
+}
+}  // namespace
+
+int32_t KineticMana(const GlyphLibrary& lib, const DeliveryRec& d,
+                    const std::vector<EffectInst>& payload) {
+  const int64_t mj = KineticMilliJ(lib, d, payload);
+  if (mj <= 0 || lib.budgets.rateKinetic <= 0) return 0;
+  // rate is mana per kJ = per 1e6 mJ; rounded to the nearest mana.
+  const int64_t v = (mj * lib.budgets.rateKinetic + 500000) / 1000000;
+  return v > 0x3FFFFFFF ? 0x3FFFFFFF : (int32_t)v;
+}
+
+float KineticJoules(const GlyphLibrary& lib, const DeliveryRec& d,
+                    const std::vector<EffectInst>& payload) {
+  return (float)KineticMilliJ(lib, d, payload) / 1000.0f;
+}
+
 namespace {
 
 // The trail's share of a record's tariff: marks x the per-mark tariff of what
@@ -2340,6 +2469,12 @@ int32_t EffectTariffIn(const GlyphLibrary& lib, const EffectInst& e, bool withCa
       const int32_t inst = RecInstances(lib, d);
       const int32_t L = std::min((int32_t)d.lanes.size(), inst);
       int32_t t = 0;
+      // THE KINETIC TERM (docs/PLAN_projectiles.md D): what each bolt's MATTER
+      // weighs, at the speed its own record flies, priced per kJ. Carry-side
+      // only, so the HUD shows it in `carry`, and added AFTER this box's carry
+      // multiplier (the multiplier is on what the payload does; this is what
+      // moving it costs) -- an outer carrier's carry still composes on it.
+      int32_t kin = 0;
       for (int32_t i = 0; i < L; i++) {
         int32_t li = shared;
         for (const EffectInst& x : d.lanes[i].extra)
@@ -2349,12 +2484,20 @@ int32_t EffectTariffIn(const GlyphLibrary& lib, const EffectInst& e, bool withCa
         // is every sentence that existed before per-branch splitting.
         t = SatAdd(t, SatMul(SatAdd(li, TrailTariffOf(lib, d.lanes[i].rec, withCarry)),
                              LaneSplit(lib, d, i)));
+        if (withCarry) {
+          std::vector<EffectInst> pay = e.inner;
+          pay.insert(pay.end(), d.lanes[i].extra.begin(), d.lanes[i].extra.end());
+          kin = SatAdd(kin, SatMul(KineticMana(lib, d.lanes[i].rec, pay), LaneSplit(lib, d, i)));
+        }
       }
-      if (inst > L)
+      if (inst > L) {
         t = SatAdd(t, SatMul(SatAdd(shared, TrailTariffOf(lib, d, withCarry)), inst - L));
+        if (withCarry) kin = SatAdd(kin, SatMul(KineticMana(lib, d, e.inner), inst - L));
+      }
       if (withCarry) {
         const int64_t v = (int64_t)t * d.carryMille / 1000;
         t = v > 0x3FFFFFFF ? 0x3FFFFFFF : (int32_t)v;
+        t = SatAdd(t, kin);
       }
       return t;
     }
@@ -3137,8 +3280,11 @@ std::string LaunchSentence(const GlyphLibrary& lib, const EffectInst& e,
 
   std::vector<std::string> parts;
   for (const EffectInst& p : e.inner) parts.push_back(EffectPhrase(lib, p));
+  // An empty carrier has no matter, so it has no mass and nothing to strike
+  // with: it hits nothing and does nothing (the old "knocks what it hit" was
+  // never true -- a flight dealt no damage of its own).
   if (parts.empty())
-    parts.push_back(d.mech == DeliveryMech::Flight ? "does nothing but knock what it hit"
+    parts.push_back(d.mech == DeliveryMech::Flight ? "does nothing, having nothing in it"
                                                    : "does nothing");
   std::string body;
   for (size_t i = 0; i < parts.size(); i++) {
@@ -3146,6 +3292,38 @@ std::string LaunchSentence(const GlyphLibrary& lib, const EffectInst& e,
     body += parts[i];
   }
   std::string out = head + "; " + trig + join + (fan ? "each " : "it ") + body;
+  // THE MATTER IS THE PROJECTILE (docs/PLAN_projectiles.md D): what a body
+  // it runs into meets, in the numbers the price is made of.
+  const SpellMatter mt = FlightMatter(lib, d, e.inner);
+  if (mt.kind != SpellMatterKind::None) {
+    int mg = -1;
+    for (const EffectInst& p : e.inner)
+      if (p.verb == SpellVerb::Spray && p.matA == mt.material && mg < 0) mg = p.glyphA;
+    const std::string what = MatName(lib, mg, mt.material, false);
+    char num[96];
+    std::snprintf(num, sizeof num, "%.2f kg of %s at %.0f m/s (%.0f J)",
+                  (double)mt.massMg / 1e6, what.c_str(), (double)SpellSpeedMps(d.speedFx),
+                  (double)KineticJoules(lib, d, e.inner));
+    std::string verb;
+    switch (mt.kind) {
+      case SpellMatterKind::Pierce:
+        verb = "a body in the way is driven through as far as that buys against what it is "
+               "made of";
+        break;
+      case SpellMatterKind::Scour:
+        verb = "a body in the way is scoured, never deeper than the skin and what is under it";
+        break;
+      case SpellMatterKind::Splash:
+        verb = "a body in the way is splashed with it, never pierced";
+        break;
+      default:
+        verb = "a body in the way takes it as the ground would";
+        break;
+    }
+    out += std::string("; ") + (fan ? "each" : "it") + " flies as " + num + ": " + verb;
+    if (d.pierce > 0 && (mt.kind == SpellMatterKind::Pierce || mt.kind == SpellMatterKind::Scour))
+      out += " (its pierce adds to that against bodies)";
+  }
   // And what each lane of THIS carrier carries on top (rule 4), as a trailing
   // clause so the sentence it is embedded in still ends where its caller says.
   for (size_t li = 0; li < d.lanes.size(); li++)
@@ -4614,6 +4792,11 @@ void SpellSystem::Tick(uint32_t tick, World& world,
 
     bool impactSurface = false;
     bool expiredNow = false;
+    // The flight ended on a BODY through the matter path (below), what kind of
+    // matter met it, and whether the body kept the core matter (a coat).
+    bool bodyStop = false, bodyTookCore = false;
+    uint32_t bodyCore = 0;
+    SpellMatterKind bodyKind = SpellMatterKind::None;
     if (p.resting) {
       // A fused bolt sits where it landed until the fuse runs out.
       if (--p.fuseLeft <= 0) {
@@ -4719,22 +4902,119 @@ void SpellSystem::Tick(uint32_t tick, World& world,
       }
       // BODIES. Mobs, debris and other casters are not in the voxel grid, so
       // the sweep above cannot see them: one ray over this tick's segment
-      // (up to the wall it stopped at, if it stopped) asks the owner. A body
-      // on the way resolves the cast on the body, whatever the record said
-      // about bounces or piercing -- flesh is what a bolt is for.
-      if (p.alive && bodies && bodies->bodyHit) {
+      // (up to the wall it stopped at, if it stopped) asks the owner.
+      //
+      // THE MATTER IS THE PROJECTILE (docs/PLAN_projectiles.md D). A flight
+      // carrying matter asks `matterHit`, and the owner resolves the whole
+      // strike through the body systems: a solid is driven through by its
+      // energy against what the body is made of and may come out the far
+      // side still flying; a powder scours; a liquid splashes a coat; a gas
+      // touches. A flight with no matter keeps the old rule: a body on the
+      // way resolves the cast on the body, whatever the record said about
+      // bounces or piercing.
+      if (p.alive && bodies && (bodies->bodyHit || bodies->matterHit)) {
         const SpellFxVec segEnd = impact ? impactAt : p.pos;
         const Vec3 a{SpellFxToFloat(tickStart.x), SpellFxToFloat(tickStart.y),
                      SpellFxToFloat(tickStart.z)};
         const Vec3 bEnd{SpellFxToFloat(segEnd.x), SpellFxToFloat(segEnd.y),
                         SpellFxToFloat(segEnd.z)};
-        Vec3 hit;
-        if (bodies->bodyHit(bodies->ctx, a, bEnd, p.casterId, hit)) {
-          impact = true;
-          impactSurface = true;
-          impactAt = {SpellFxFromFloat(hit.x), SpellFxFromFloat(hit.y), SpellFxFromFloat(hit.z)};
-          p.pos = impactAt;
-          p.resting = false;
+        const SpellMatter mt = bodies->matterHit
+                                   ? FlightMatter(*lib_, p.cast.delivery, p.cast.payload)
+                                   : SpellMatter{};
+        // A gas (or a liquid no body can wear) TOUCHES: it takes the old rule
+        // below unchanged, bit for bit -- the NPC firebolt is one of these.
+        if (mt.kind != SpellMatterKind::None && mt.kind != SpellMatterKind::Touch) {
+          const SpellBudgets& bud = lib_->budgets;
+          const GlyphDef& dg = lib_->Delivery(p.cast.delivery.glyph);
+          const SpellMatterPhys mp = lib_->MatterPhys(mt.material);
+          const int64_t spFx = IntSqrt((int64_t)p.vel.x * p.vel.x + (int64_t)p.vel.y * p.vel.y +
+                                       (int64_t)p.vel.z * p.vel.z);
+          SpellBodyShot shot;
+          shot.from = a;
+          shot.to = bEnd;
+          shot.casterId = p.casterId;
+          shot.kind = mt.kind;
+          shot.material = mt.material;
+          // The pierce mod's energy against bodies, as MASS: the residual
+          // speed a channel hands back is then the flight's own.
+          const int64_t bonus =
+              1000 + (int64_t)std::max(0, p.cast.delivery.pierce) * bud.pierceBodyMille;
+          shot.massKg = (float)((double)mt.massMg * (double)bonus / 1e9);
+          shot.speedMps = SpellSpeedMps((int32_t)std::min<int64_t>(spFx, kMaxSpeedFx));
+          shot.tipRadius = (float)dg.tipMille / 1000.0f;
+          shot.sharpness = (float)dg.sharpMille / 1000.0f;
+          shot.hardness = (float)mp.hardness;
+          shot.hot = mp.hot;
+          if (mt.kind == SpellMatterKind::Scour) {
+            shot.sharpness *= (float)bud.powderSharpMille / 1000.0f;
+            shot.tipRadius *= (float)bud.powderTipMille / 1000.0f;
+            shot.scourBins = bud.scourBins;
+          }
+          // A body can wear it (a stain slot) at its authored amount x the
+          // matter scale, at least one level, at most a full coat; 0 = never.
+          shot.coatAmount =
+              mp.coatAmount == 0
+                  ? 0u
+                  : (uint32_t)ClampI(
+                        (int32_t)(((int64_t)mp.coatAmount * mt.scaleMille + 500) / 1000), 1, 15);
+          shot.splashRadius =
+              (float)ScaleRadiusCbrtMille(bud.splashRadiusMille, mt.scaleMille) / 1000.0f;
+          shot.seed = Hash3(p.seq, tick, (uint32_t)p.casterId);
+          shot.tick = tick;
+          SpellBodyStrike r;
+          bodies->matterHit(bodies->ctx, shot, r);
+          if (r.hit) {
+            if (strikeLog_.size() >= kStrikeLogMax) strikeLog_.erase(strikeLog_.begin());
+            SpellStrikeLog lg;
+            lg.shot = shot;
+            lg.r = r;
+            lg.deliveryGlyph = p.cast.delivery.glyph;
+            lg.casterId = p.casterId;
+            strikeLog_.push_back(lg);
+            // THROUGH: on from the far side at what is left, in the flight's
+            // own fixed point. Too slow to matter = it stops where it left.
+            const int32_t exitFx =
+                r.through ? (int32_t)std::min<double>(
+                                (double)r.exitSpeedMps * (double)kSpellFxOne *
+                                        (double)kVoxelsPerMetre / (double)kTicksPerSecond +
+                                    0.5,
+                                (double)kMaxSpeedFx)
+                          : 0;
+            if (r.through && exitFx >= kSpellFxOne / 8) {
+              p.vel = Unit(p.vel, exitFx);
+              // The channel ran through the whole body, which may reach past
+              // this tick's segment: the flight continues from its far side
+              // (never past a wall the sweep already stopped at).
+              if (!impact) {
+                const SpellFxVec ex{SpellFxFromFloat(r.at.x), SpellFxFromFloat(r.at.y),
+                                    SpellFxFromFloat(r.at.z)};
+                const int64_t along = (int64_t)(ex.x - p.pos.x) * p.vel.x +
+                                      (int64_t)(ex.y - p.pos.y) * p.vel.y +
+                                      (int64_t)(ex.z - p.pos.z) * p.vel.z;
+                if (along > 0) p.pos = ex;
+              }
+            } else {
+              impact = true;
+              impactSurface = true;
+              impactAt = {SpellFxFromFloat(r.at.x), SpellFxFromFloat(r.at.y),
+                          SpellFxFromFloat(r.at.z)};
+              p.pos = impactAt;
+              p.resting = false;
+              bodyStop = true;
+              bodyKind = mt.kind;
+              bodyCore = mt.material;
+              bodyTookCore = r.tookMatter;
+            }
+          }
+        } else if (bodies->bodyHit) {
+          Vec3 hit;
+          if (bodies->bodyHit(bodies->ctx, a, bEnd, p.casterId, hit)) {
+            impact = true;
+            impactSurface = true;
+            impactAt = {SpellFxFromFloat(hit.x), SpellFxFromFloat(hit.y), SpellFxFromFloat(hit.z)};
+            p.pos = impactAt;
+            p.resting = false;
+          }
         }
       }
     }
@@ -4745,8 +5025,36 @@ void SpellSystem::Tick(uint32_t tick, World& world,
       std::vector<EffectInst> hit = ItemsOn(p.cast.payload, SpellTrigger::Hit);
       if (expiredNow)
         for (const EffectInst& x : ItemsOn(p.cast.payload, SpellTrigger::Expire)) hit.push_back(x);
-      resolve(p.cast, hit, impactAt, p.pos, p.vel, p.instability, p.gen, p.casterId,
-              (uint32_t)tick, impactSurface);
+      if (bodyStop && bodyKind != SpellMatterKind::Touch) {
+        // THE MATTER ENDED ON A BODY (docs/PLAN_projectiles.md D). The effects
+        // resolve here as they always did. The matter does not fly on: what
+        // the body holds now (a splash's coat) is gone from the payload, and
+        // the rest -- a lump that stopped in the wound, a scour's grit, a
+        // second matter word -- is DROPPED at the point it stopped, with no
+        // velocity, rather than sprayed on through the body.
+        std::vector<EffectInst> rest, drop;
+        for (const EffectInst& x : hit) {
+          const bool matter = x.verb == SpellVerb::Spray && x.complete && !x.anyA &&
+                              x.matA != 0 && x.timing.delay == 0;
+          if (!matter) rest.push_back(x);
+          else if (!(bodyTookCore && x.matA == bodyCore)) drop.push_back(x);
+        }
+        resolve(p.cast, rest, impactAt, p.pos, p.vel, p.instability, p.gen, p.casterId,
+                (uint32_t)tick, impactSurface);
+        if (!drop.empty()) {
+          if (opsUsed < kSpellOpsPerTick) {
+            const size_t before = out.ops.size();
+            ApplySpellEffect(*lib_, drop, impactAt, {0, 0, 0}, 1000, out, &probe, p.instability,
+                             (uint32_t)tick ^ 0xD0D0u);
+            opsUsed += (int)(out.ops.size() - before);
+          } else {
+            opsDropped_++;
+          }
+        }
+      } else {
+        resolve(p.cast, hit, impactAt, p.pos, p.vel, p.instability, p.gen, p.casterId,
+                (uint32_t)tick, impactSurface);
+      }
       p.alive = false;
     } else if (expiredNow && HasTrigger(p.cast.payload, SpellTrigger::Expire)) {
       // A bolt that hit nothing still has an ending, and that is an event.

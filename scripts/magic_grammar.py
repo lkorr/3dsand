@@ -554,7 +554,7 @@ def launch_sentence(b, that):
         join = ' '
     parts = [phrase(p) for p in lane_items(b, 0) if sort_of(p) in ('E', 'M')]
     if not parts:
-        parts = ['does nothing but knock what it hit' if mech_of(d) == 'flight'
+        parts = ['does nothing, having nothing in it' if mech_of(d) == 'flight'
                  else 'does nothing']
     out = '%s; %s%s%s %s' % (head, trig, join, 'each' if fan > 1 else 'it',
                              ' and '.join(parts))
