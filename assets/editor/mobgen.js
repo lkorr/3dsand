@@ -4803,7 +4803,9 @@ export function anatomyRecipe(race = 'human') {
       '//torso': 'A ribcage, not a bone brick: the depth schedule would fill ' +
                  'the chest with solid bone, so `carve` hollows it to flesh ' +
                  '(the organs), walls it in muscle at depth 3, and puts bone ' +
-                 'back as ribs, a sternum and a spine. The HEART sits in the ' +
+                 'back as ribs, a sternum and a spine, its back face notched ' +
+                 'every other row through its depth into vertebrae, with ' +
+                 'spinous tips. The HEART sits in the ' +
                  'front of the hollow, wholly left of the midline (the ' +
                  'viewer\'s right) and high in the cage, a rounded lump ' +
                  '(`round`: the ellipsoid in its box) at most three cells ' +

@@ -80,6 +80,14 @@
  *    inside the ellipsoid inscribed in the box (over the axes the box states;
  *    an unstated axis is unconstrained). It is what makes an organ a lump and
  *    not a brick -- the heart.
+ *  - `"mid": { "x": [lo, hi] }` is a box in CELLS from the limb's centre line:
+ *    the cell centre's distance |l + 0.5 - n / 2| must lie in [lo, hi) on
+ *    each axis it states. A feature one or two cells across cannot be a
+ *    fraction -- [0.4, 0.6] of the width is two cells on a 12-wide chest and
+ *    six on a 30-wide one, with the notches lopsided -- while `mid` is the
+ *    same size on every body, symmetric by construction (an even width has
+ *    half-cell offsets, an odd one whole ones), and lines up across limbs
+ *    that are centred on each other. The spine is written in it.
  *  - A recipe-level `carve` is the DEFAULT for every limb with neither a
  *    `carve` nor `layers` of its own (`"carve": []` opts a limb out).
  */
@@ -208,8 +216,63 @@ export const DEFAULT_ANATOMY = {
           box: { x: [0.45, 0.55], y: [0.42, 0.94], z: [0.5, 1] } },
         { material: 'mushroom_large', where: 'bone', depth: [4, 6], round: true,
           box: { x: [0.53, 0.7], y: [0.63, 0.77], z: [0.4, 1] } },
-        { material: 'bone', where: 'bone',
-          box: { x: [0.4, 0.6], z: [0, 0.5] } },
+        { material: 'bone', where: 'bone', depth: [3, 5],
+          mid: { x: [0, 2] }, box: { z: [0, 0.5] } },
+        // VERTEBRAE, NOT A BEAM (owner's hand edit of human.vox, 2026-10-13,
+        // codified, then carried through the column). The column above is a
+        // solid 4-wide bar; every other row its two outer columns are notched
+        // out THROUGH ITS WHOLE DEPTH, back face to the front of the bodies, so
+        // whichever layer a peel exposes the column is stacked segments joined
+        // by a 2-wide core: from behind the centre pair stands proud as the
+        // spinous ridge, from the front the bodies read as a stack of spools,
+        // from the side the gaps are the intervertebral spaces. Period 2 is the
+        // anatomy, not a style: ~24 vertebrae over a 60 cm spine is ~1.5 cells
+        // each at this body's scale. Where a rib meets the column the BACK face
+        // is filled back in (the rib stripe again, inside the spine box, depth
+        // 3 only): the rib articulates with the transverse process.
+        //
+        // No y floor, on purpose: the bottom rows of the torso and the waist
+        // rows of the hips are the SAME cells in two models (they overlap at
+        // the waist seam), so a notch the hips has and the torso does not is
+        // covered by the torso's bone -- the waist read as un-notched until
+        // both were carved. Both stripes are limb-local and every body here
+        // has even limb offsets, so the two models notch the same rows.
+        //
+        // IN CELLS, NOT FRACTIONS (`mid`): the column is 4 wide (3 on an odd
+        // width) and the three bone layers nearest the back (depth 3..5) on
+        // every body. As fractions it was 2 wide with no notch at all on a
+        // 12-wide chest, 6 wide with lopsided notches on a 30-wide one, and 1
+        // to 7 deep with the body; and since limbs are centred on each other
+        // the torso's column and the hips' land on the same prefab cells.
+        // The column's z box stays the back HALF (0.5), not looser: depth is
+        // measured from the nearest surface, and at 0.55 the cells 3..5 in
+        // from the CHEST joined the column (and took four heart cells). The
+        // tips' 0.4 is loose on purpose -- a slim body whose back sits a few
+        // cells into its box has its depth-2 layer past 0.35.
+        { material: 'muscle', where: 'bone', depth: [3, 5],
+          mid: { x: [1, 2] }, box: { z: [0, 0.5] },
+          stripe: { axis: 'y', period: 2, width: 1 } },
+        { material: 'bone', where: 'bone', depth: [3, 3],
+          mid: { x: [0, 2] }, box: { y: [0.42, 0.94], z: [0, 0.5] },
+          stripe: { axis: 'y', period: 4, width: 2 } },
+        // THE BODIES ARE NARROWER THAN THE ARCH (owner's hand edit, 2026-10-13,
+        // codified): the column's FRONT layer (depth 5, the vertebral bodies)
+        // loses its outer cells on every row, so the front of the spine is a
+        // 2-wide rod behind the 4-wide arches -- seen from the side the arch
+        // and spinous ridge stand behind a slimmer stack of bodies, as in a
+        // real vertebra, and a peel from the chest finds a rod, not a plank.
+        { material: 'muscle', where: 'bone', depth: [5, 5],
+          mid: { x: [1, 2] }, box: { z: [0, 0.5] } },
+        // SPINOUS PROCESSES: on each vertebra row (the odd ones, between the
+        // notches) the centre pair reaches one cell further back, into the
+        // muscle layer at depth 2, so the ridge is bumps under the skin and
+        // not a flat strip. Two rules because a stripe has no phase: bone on
+        // every row, then the even rows given back to the muscle.
+        { material: 'bone', where: 'muscle', depth: [2, 2],
+          mid: { x: [0, 1] }, box: { z: [0, 0.4] } },
+        { material: 'muscle', where: 'muscle', depth: [2, 2],
+          mid: { x: [0, 1] }, box: { z: [0, 0.4] },
+          stripe: { axis: 'y', period: 2, width: 1 } },
       ],
     },
     // A PELVIS, NOT A BONE BRICK. The hips are the widest limb, so depth alone
@@ -237,8 +300,74 @@ export const DEFAULT_ANATOMY = {
           box: { x: [0.65, 1], y: [0, 0.25] } },
         { material: 'bone', where: 'bone', depth: [3, 3],
           box: { x: [0.4, 0.6], y: [0, 0.25], z: [0.5, 1] } },
-        { material: 'bone', where: 'bone',
-          box: { x: [0.4, 0.6], y: [0.15, 1], z: [0, 0.5] } },
+        { material: 'bone', where: 'bone', depth: [3, 5],
+          mid: { x: [0, 2] }, box: { y: [0.15, 1], z: [0, 0.5] } },
+        // ...SHAPED LIKE ONE (owner's hand edit of human.vox, 2026-10-13,
+        // codified). The bands above make a correct ring but a boxy one; these
+        // take its corners off and give the front its profile. In order:
+        //  - the LUMBAR spine in the waist (above the skin seam, y >= 0.7) is
+        //    segmented like the torso's -- notched through its depth every
+        //    other row, spinous tips on the rows between -- and must be, since
+        //    these rows are the torso's bottom rows too (see the torso); the
+        //    sacrum below it is one fused bone and stays solid;
+        //  - the ILIAC CREST is rounded: its top row loses the back corners
+        //    (x 0.2..0.35 each side), the row under it the inner two of them,
+        //    so the crest falls away from the sacrum towards the flanks
+        //    instead of ending in a square rim;
+        //  - the FRONT of the brim is a W, not a flat bar: one row above it
+        //    the bone rises at the anterior iliac spines (x ~0.3 each side,
+        //    two rows high at the outer cell) and at the pubic tubercles
+        //    (x 0.45..0.55), with the inguinal dips between them;
+        //  - an OBTURATOR gap at the front of each socket's top row, under the
+        //    brim;
+        //  - the PUBIC ARCH under the symphysis is a rounded bar: muscle over
+        //    its row, then bone back inside the inscribed ellipse, which drops
+        //    its four corners.
+        // The W bands are 0.07 / 0.05 tall rather than 0.05 / 0.05 so a short
+        // pelvis (16 rows: 0.0625 a row) still has a row centre in each.
+        { material: 'muscle', where: 'bone', depth: [3, 5],
+          mid: { x: [1, 2] }, box: { y: [0.7, 1], z: [0, 0.5] },
+          stripe: { axis: 'y', period: 2, width: 1 } },
+        // The lumbar bodies are the torso's rod (its front layer narrowed on
+        // every row, as there), and the LOWER SACRUM tapers: its front layer
+        // narrows to the centre pair from the brim down to the sockets (y
+        // 0.25..0.45), given to the pelvic organs, while the upper sacrum
+        // stays its full width (owner's hand edit, 2026-10-13).
+        { material: 'muscle', where: 'bone', depth: [5, 5],
+          mid: { x: [1, 2] }, box: { y: [0.7, 1], z: [0, 0.5] } },
+        { material: 'flesh', where: 'bone', depth: [5, 5],
+          mid: { x: [1, 2] }, box: { y: [0.25, 0.45], z: [0, 0.5] } },
+        { material: 'bone', where: 'muscle', depth: [2, 2],
+          mid: { x: [0, 1] }, box: { y: [0.7, 1], z: [0, 0.4] } },
+        { material: 'muscle', where: 'muscle', depth: [2, 2],
+          mid: { x: [0, 1] }, box: { y: [0.7, 1], z: [0, 0.4] },
+          stripe: { axis: 'y', period: 2, width: 1 } },
+        { material: 'muscle', where: 'bone', depth: [3, 3],
+          box: { x: [0.2, 0.35], y: [0.6, 0.65] } },
+        { material: 'muscle', where: 'bone', depth: [3, 3],
+          box: { x: [0.65, 0.8], y: [0.6, 0.65] } },
+        { material: 'muscle', where: 'bone', depth: [3, 3],
+          box: { x: [0.25, 0.35], y: [0.55, 0.6] } },
+        { material: 'muscle', where: 'bone', depth: [3, 3],
+          box: { x: [0.65, 0.75], y: [0.55, 0.6] } },
+        { material: 'bone', where: 'bone', depth: [3, 3],
+          box: { x: [0.25, 0.35], y: [0.35, 0.42], z: [0.6, 1] } },
+        { material: 'bone', where: 'bone', depth: [3, 3],
+          box: { x: [0.45, 0.55], y: [0.35, 0.42], z: [0.6, 1] } },
+        { material: 'bone', where: 'bone', depth: [3, 3],
+          box: { x: [0.65, 0.75], y: [0.35, 0.42], z: [0.6, 1] } },
+        { material: 'bone', where: 'bone', depth: [3, 3],
+          box: { x: [0.25, 0.3], y: [0.42, 0.47], z: [0.6, 1] } },
+        { material: 'bone', where: 'bone', depth: [3, 3],
+          box: { x: [0.7, 0.75], y: [0.42, 0.47], z: [0.6, 1] } },
+        { material: 'muscle', where: 'bone',
+          box: { x: [0.3, 0.35], y: [0.2, 0.25], z: [0.6, 1] } },
+        { material: 'muscle', where: 'bone',
+          box: { x: [0.65, 0.7], y: [0.2, 0.25], z: [0.6, 1] } },
+        { material: 'muscle', where: 'bone',
+          box: { x: [0.4, 0.6], y: [0.15, 0.2], z: [0.25, 0.75] } },
+        { material: 'bone', where: 'bone', round: true,
+          box: { x: [0.4, 0.6], y: [0.15, 0.2], z: [0.25, 0.75] } },
       ],
     },
   },
@@ -399,6 +528,7 @@ export function carveFor(recipe, limbName) {
   for (const c of src) {
     if (!c || !c.material) continue;
     const b = c.box || {};
+    const m = c.mid || {};
     const dep = Array.isArray(c.depth) ? c.depth : [];
     const s = c.stripe;
     const axis = s ? ['x', 'y', 'z'].indexOf(s.axis) : -1;
@@ -411,6 +541,7 @@ export function carveFor(recipe, limbName) {
         ? { axis, period: s.period | 0, width: s.width | 0 } : null,
       core: Number.isInteger(c.core) && c.core >= 0 ? c.core : null,
       round: c.round === true,
+      mid: { x: range(m.x), y: range(m.y), z: range(m.z) },
     });
   }
   return out;
@@ -502,6 +633,12 @@ export function carveMatches(c, whereId, layerId, lx, ly, lz, dim, depth,
     }
   }
   if (c.round && e2 > 1) return false;
+  for (let a = 0; a < 3; a++) {
+    const r = c.mid && c.mid[['x', 'y', 'z'][a]];
+    if (!r) continue;
+    const off = Math.abs(l[a] + 0.5 - n[a] * 0.5);
+    if (off < r[0] || off >= r[1]) return false;
+  }
   if (c.stripe && (l[c.stripe.axis] % c.stripe.period) >= c.stripe.width)
     return false;
   return true;
