@@ -98,6 +98,17 @@ struct VoxRegionReq {
   // map-overhaul P7) — what the game does to every chunk it generates. Off
   // only for the biome swatch, whose synthetic map has no layer.
   bool applyEdits = true;
+  // THE ROCK SKIP (BuildVoxRegion): a chunk genChunk proved UNIFORM or JITTER
+  // is synthesised on the CPU instead of read back. Exact; off only so the
+  // voxregion gate can hold the two paths byte-identical.
+  bool synthSentinels = true;
+  // THE CLIP: an optional world-voxel box (inclusive). A chunk wholly outside
+  // it is neither generated nor read back, and its samples are AIR. The
+  // viewer's ROI (worldview.js view.roi): everything outside it is drawn as
+  // air anyway, and a 512-voxel root over a dungeon ROI is ~3x the dungeon's
+  // volume, every voxel of which genChunk used to evaluate.
+  bool clip = false;
+  int32_t clipMin[3] = {0, 0, 0}, clipMax[3] = {0, 0, 0};
 };
 
 // Generates the region and writes the 'SVVX' binary into `out`. False + `err`
@@ -128,8 +139,9 @@ int RunVoxDump(GpuContext& ctx, World& world, Simulation& sim,
 // give the tuner its cache for free — a re-request of a box the camera already
 // visited never reaches this process.
 //
-//   REGION <ox> <oy> <oz> <nx> <ny> <nz> <lod> <seed> <outPath>
+//   REGION <ox> <oy> <oz> <nx> <ny> <nz> <lod> <seed> [CLIP <x0> <y0> <z0> <x1> <y1> <z1>] <outPath>
 //     -> "OK <bytes> <ms>"  or  "ERR <message>"
+//     CLIP = VoxRegionReq::clip, world voxels inclusive.
 //   PALETTE <outPath>          -> "OK <bytes> 0"
 //   RELOAD                     -> "OK 0 <ms>"   re-reads tuning.json
 //   PING                       -> "OK 0 0"

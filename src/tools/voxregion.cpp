@@ -2,12 +2,14 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -261,11 +263,33 @@ bool BuildVoxRegion(GpuContext& ctx, World& world, Simulation& sim,
   // Order the box's chunks BY SLOT. Consecutive slots share one readback and
   // one page run, and the box's own x order is not slot order once the box
   // straddles the mod-kNChunk wrap.
-  std::vector<uint32_t> order(chunkCount);
-  for (uint32_t i = 0; i < chunkCount; i++) order[i] = i;
+  //
+  // Only the chunks that touch the CLIP box (VoxRegionReq::clip) are listed
+  // at all: the rest are never generated, and their samples stay the 0 (air)
+  // `grid` was made with.
+  std::vector<uint32_t> order;
+  order.reserve(chunkCount);
+  for (uint32_t i = 0; i < chunkCount; i++) {
+    if (req.clip) {
+      const int c[3] = {cmin.x + (int)(i % cdx), cmin.y + (int)((i / cdx) % cdy),
+                        cmin.z + (int)(i / (cdx * cdy))};
+      bool in = true;
+      for (int a = 0; a < 3; a++)
+        in = in && c[a] * (int)kChunk + (int)kChunk - 1 >= req.clipMin[a] &&
+             c[a] * (int)kChunk <= req.clipMax[a];
+      if (!in) continue;
+    }
+    order.push_back(i);
+  }
+  const uint32_t liveCount = (uint32_t)order.size();
   std::sort(order.begin(), order.end(),
             [&](uint32_t a, uint32_t b) { return slotOf[a] < slotOf[b]; });
 
+  // SANDVOX_VOXPROF=1: one stderr line per region with where the time went.
+  static const bool prof = std::getenv("SANDVOX_VOXPROF") != nullptr;
+  double tGen = 0, tVerdict = 0, tRead = 0, tDown = 0, tSynth = 0, tReset = 0;
+  uint32_t nRead = 0, nSynth = 0, nSky = 0;
+  const double tAll0 = NowSeconds();
   Tally tally;
   std::vector<uint32_t> scratch;
   std::vector<uint32_t> verdict;   // genAct, one word per batch position
@@ -274,8 +298,8 @@ bool BuildVoxRegion(GpuContext& ctx, World& world, Simulation& sim,
   const uint32_t poolBatch = std::max(64u, world.pages->PoolPages() / 2u);
   const uint32_t kBatch = std::min(2048u, poolBatch);
 
-  for (uint32_t base = 0; base < chunkCount; base += kBatch) {
-    const uint32_t n = std::min(kBatch, chunkCount - base);
+  for (uint32_t base = 0; base < liveCount; base += kBatch) {
+    const uint32_t n = std::min(kBatch, liveCount - base);
     std::vector<uint32_t> batchSlots(n);
     for (uint32_t k = 0; k < n; k++) {
       batchSlots[k] = slotOf[order[base + k]];
@@ -291,11 +315,14 @@ bool BuildVoxRegion(GpuContext& ctx, World& world, Simulation& sim,
     gp.origin[2] = cmin.z;
     gp.labMode = World::LabWorld() ? 1u : 0u;
     ctx.queue.WriteBuffer(world.tickUBO, 0, &gp, sizeof(gp));
+    double tp0 = NowSeconds();
     {
       rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
       sim.EncodeGenList(enc, n);
       ctx.queue.Submit(enc.Finish());
     }
+    tGen += NowSeconds() - tp0;
+    tp0 = NowSeconds();
 
     // ---- THE SKY SKIP. genChunk publishes each listed chunk's page-table
     // class into genAct (world.h kGenVerdict*; SubmitWorldgen demotes on the
@@ -307,9 +334,33 @@ bool BuildVoxRegion(GpuContext& ctx, World& world, Simulation& sim,
     verdict.resize(n);
     rhi::ReadbackBlocking(ctx.device, ctx.queue, world.genAct, 0, verdict.data(),
                           (size_t)n * 4, "voxVerdict");
+    tVerdict += NowSeconds() - tp0;
     auto boxChunk = [&](uint32_t boxIdx) {
       return IVec3{cmin.x + (int)(boxIdx % cdx), cmin.y + (int)((boxIdx / cdx) % cdy),
                    cmin.z + (int)(boxIdx / (cdx * cdy))};
+    };
+    // THE ROCK SKIP, the sky skip's twin and the bigger of the two under a
+    // dungeon: an isolated program sits in a solid block, so a coarse box
+    // round it is almost all buried stone, and every one of those chunks was
+    // 16 KiB of readback plus 4,096 tally votes to learn what the verdict
+    // already said. The kernel verified every word against the sentinel's
+    // synthesis (the Classify mirror, at THIS request's seed -- SetWorldSeed
+    // above), and SynthWordAt is that synthesis on the CPU; the page-roundtrip
+    // gate pins the two together. So the samples come straight from it: every
+    // cell of a block carries the one material, the majority is that
+    // material, and "the first cell carrying the winner" is the block's min
+    // corner. Returns the chunk's sentinel entry, or 0 = read it back (mixed,
+    // unpublished, sky, or patched by the edit layer).
+    auto sentinelOf = [&](uint32_t i) -> uint32_t {
+      if (!req.synthSentinels) return 0u;
+      const uint32_t v = verdict[i];
+      if ((v & kGenVerdictValid) == 0u) return 0u;
+      const uint32_t cls = (v >> kGenVerdictClassShift) & kGenVerdictClassMask;
+      const uint32_t mat = (v >> kGenVerdictMatShift) & kPtMatMask;
+      if (mat == kMatAir) return 0u;
+      if (cls != kGenVerdictUniform && cls != kGenVerdictJitter) return 0u;
+      if (edits && edits->HasChunk(boxChunk(order[base + i]))) return 0u;
+      return kPtSentinelBit | (cls == kGenVerdictJitter ? kPtJitterBit : 0u) | mat;
     };
     auto skyChunk = [&](uint32_t i) {
       const uint32_t v = verdict[i];
@@ -318,20 +369,47 @@ bool BuildVoxRegion(GpuContext& ctx, World& world, Simulation& sim,
       return (v & kGenVerdictValid) != 0u &&
              ((v >> kGenVerdictClassShift) & kGenVerdictClassMask) == kGenVerdictEmpty;
     };
+    // Per batch position: 0 = read back, 1 = sky, 2 = synthesised.
+    std::vector<uint8_t> how(n, 0);
+    tp0 = NowSeconds();
+    for (uint32_t i = 0; i < n; i++) {
+      if (skyChunk(i)) { how[i] = 1; nSky++; continue; }
+      const uint32_t entry = sentinelOf(i);
+      if (!entry) continue;
+      how[i] = 2;
+      nSynth++;
+      const uint32_t boxIdx = order[base + i];
+      const uint32_t cx = boxIdx % cdx, cy = (boxIdx / cdx) % cdy, cz = boxIdx / (cdx * cdy);
+      const IVec3 wc = boxChunk(boxIdx);
+      const uint32_t sx0 = cx * spc, sy0 = cy * spc, sz0 = cz * spc;
+      for (uint32_t sk = 0; sk < spc; sk++)
+        for (uint32_t sj = 0; sj < spc; sj++) {
+          uint32_t* row = &grid[((size_t)(sz0 + sk) * ny + (sy0 + sj)) * nx + sx0];
+          for (uint32_t si = 0; si < spc; si++)
+            row[si] = SynthWordAt(entry, wc.x * (int)kChunk + (int)(si * lod),
+                                  wc.y * (int)kChunk + (int)(sj * lod),
+                                  wc.z * (int)kChunk + (int)(sk * lod), req.seed);
+        }
+    }
+    tSynth += NowSeconds() - tp0;
 
-    // Read back in maximal runs of consecutive non-sky slots. ReadVoxelsSync
+    // Read back in maximal runs of consecutive read-back slots. ReadVoxelsSync
     // already coalesces consecutive PAGES inside a run and synthesises
     // sentinels, so this only has to find the slot runs.
     uint32_t k = 0;
     while (k < n) {
-      if (skyChunk(k)) { k++; continue; }
+      if (how[k]) { k++; continue; }
       uint32_t run = 1;
-      while (k + run < n && !skyChunk(k + run) &&
+      while (k + run < n && !how[k + run] &&
              batchSlots[k + run] == batchSlots[k] + run)
         run++;
       scratch.resize((size_t)run * kChunkVol);
+      tp0 = NowSeconds();
       ReadVoxelsSync(ctx, world, batchSlots[k], run, scratch.data(),
                      "voxregion");
+      tRead += NowSeconds() - tp0;
+      nRead += run;
+      tp0 = NowSeconds();
       for (uint32_t r = 0; r < run; r++) {
         const uint32_t boxIdx = order[base + k + r];
         const uint32_t cx = boxIdx % cdx, cy = (boxIdx / cdx) % cdy,
@@ -361,6 +439,7 @@ bool BuildVoxRegion(GpuContext& ctx, World& world, Simulation& sim,
                   tally.Winner();
             }
       }
+      tDown += NowSeconds() - tp0;
       k += run;
     }
 
@@ -371,8 +450,16 @@ bool BuildVoxRegion(GpuContext& ctx, World& world, Simulation& sim,
     // later request depends on what is resident now. Classifying each chunk
     // into a sentinel (what SubmitWorldgen does) would buy compression for a
     // pool that is about to be thrown away, at a Classify per chunk.
-    if (base + n < chunkCount) world.pages->ResetAllEmpty(ctx.queue);
+    tp0 = NowSeconds();
+    if (base + n < liveCount) world.pages->ResetAllEmpty(ctx.queue);
+    tReset += NowSeconds() - tp0;
   }
+  if (prof)
+    std::fprintf(stderr,
+                 "voxprof lod %u chunks %u/%u: read %u synth %u sky %u | gen %.1f verdict(+gpu) %.1f "
+                 "synth %.1f read %.1f down %.1f reset %.1f total %.1f ms\n",
+                 lod, liveCount, chunkCount, nRead, nSynth, nSky, tGen * 1e3, tVerdict * 1e3, tSynth * 1e3,
+                 tRead * 1e3, tDown * 1e3, tReset * 1e3, (NowSeconds() - tAll0) * 1e3);
 
   // ---- RLE + header.
   out.clear();
@@ -751,14 +838,78 @@ bool BuildBiomeSwatch(GpuContext& ctx, World& world, Simulation& sim,
 }
 
 // ---- the dungeon preview (docs/PLAN_dungeons.md §5.0) ----------------------
+//
+// THE FAST PATH. Every slider move in the Dungeons tab installs a new program,
+// and a full ReloadEnvironment for it was ~2.5 s on Tirnhallow: the map load
+// (plane tiles, roads, rivers: 1.4 s), the horizon bake (0.5 s; off in this
+// process now, sim/horizon.h) and the environment stamp nobody read (0.4 s).
+// None of it depends on a dungeon. So once a full reload has installed a
+// program, a program of the SAME SHAPE (mode + id) re-places only its own
+// entry on a copy of the loaded map (worldmap::ReplaceScratchDungeon: the
+// anchor rule LoadWorldMap uses, the content hash it would fold) and re-packs
+// (~50 ms). The biome set and the tree atlas the pack and the upload need are
+// loaded once and kept.
+//
+// VALID ONLY WHILE THE FILES ARE THE ONES THE LAST FULL RELOAD READ. Every
+// other command that re-reads the environment (RELOAD, SWATCH, CLEAR) drops it,
+// and the tuner sends RELOAD whenever the world's files changed
+// (tuner_server.py VoxServe.sync -- the dungeon route syncs before it posts).
+namespace {
+struct DungeonFast {
+  bool valid = false;
+  bool replaceMapEntry = false;
+  std::string id;
+  std::unique_ptr<biomes::BiomeSet> set;
+  std::unique_ptr<TreeAtlas> trees;
+};
+DungeonFast& Fast() {
+  static DungeonFast f;
+  return f;
+}
+}  // namespace
+
+void InvalidateDungeonFastPath() {
+  Fast().valid = false;
+  Fast().set.reset();
+  Fast().trees.reset();
+}
+
+namespace {
+// The fast path itself; false = take the full reload (nothing was replaced).
+bool PreviewDungeonFast(GpuContext& ctx, Simulation& sim, const std::vector<MaterialDef>& mats,
+                        const worldmap::ScratchDungeon& sd) {
+  DungeonFast& f = Fast();
+  if (!f.valid || f.replaceMapEntry != sd.replaceMapEntry || f.id != sd.def.id) return false;
+  std::string log;
+  if (!f.set) {
+    auto set = std::make_unique<biomes::BiomeSet>();
+    if (!biomes::LoadBiomeSet(AssetDir(), mats, *set, log)) return false;
+    f.set = std::move(set);
+  }
+  if (!f.trees) {
+    auto trees = std::make_unique<TreeAtlas>();
+    if (!LoadTreeAtlas(AssetDir() + "/trees", mats, *f.set, *trees, log)) return false;
+    f.trees = std::move(trees);
+  }
+  worldmap::WorldMapData m = worldmap::CurrentWorldMap();
+  if (!worldmap::ReplaceScratchDungeon(m, kDefaultSeed, log)) return false;
+  std::vector<uint32_t> words;
+  if (!worldmap::PackWorldMap(*f.set, m, words, log)) return false;
+  ctx.WaitIdle();
+  worldmap::SetCurrentWorldMap(std::move(m));
+  sim.UploadEnvironment(ctx.device, ctx.queue, *f.trees, words);
+  return true;
+}
+}  // namespace
+
 bool PreviewDungeon(GpuContext& ctx, Simulation& sim, const std::vector<MaterialDef>& mats,
                     const DungeonPreviewReq& req, std::string& info, uint32_t& prims, std::string& err) {
   prims = 0;
   if (req.mode == "CLEAR") {
+    InvalidateDungeonFastPath();
     worldmap::SetScratchDungeon(nullptr);
-    biomes::EnvironmentStamp stamp;
     std::string elog;
-    if (!ReloadEnvironment(ctx, sim, mats, stamp, elog)) { err = "environment reload failed: " + elog; return false; }
+    if (!ReloadEnvironment(ctx, sim, mats, elog)) { err = "environment reload failed: " + elog; return false; }
     info = "{\"ok\":true,\"cleared\":true}";
     return true;
   }
@@ -812,12 +963,17 @@ bool PreviewDungeon(GpuContext& ctx, Simulation& sim, const std::vector<Material
     return false;
   }
   worldmap::SetScratchDungeon(&sd);
-  biomes::EnvironmentStamp stamp;
-  std::string elog;
-  if (!ReloadEnvironment(ctx, sim, mats, stamp, elog)) {
-    worldmap::SetScratchDungeon(nullptr);
-    err = "environment reload failed: " + elog;
-    return false;
+  if (!PreviewDungeonFast(ctx, sim, mats, sd)) {
+    InvalidateDungeonFastPath();
+    std::string elog;
+    if (!ReloadEnvironment(ctx, sim, mats, elog)) {
+      worldmap::SetScratchDungeon(nullptr);
+      err = "environment reload failed: " + elog;
+      return false;
+    }
+    Fast().valid = true;
+    Fast().replaceMapEntry = sd.replaceMapEntry;
+    Fast().id = sd.def.id;
   }
   const worldmap::DungeonDef* g = nullptr;
   for (const worldmap::DungeonDef& d : worldmap::CurrentWorldMap().dungeons)
@@ -982,6 +1138,7 @@ int RunVoxServe(GpuContext& ctx, World& world, Simulation& sim,
     if (cmd == "QUIT") return 0;
     if (cmd == "PING") { ok(0); continue; }
     if (cmd == "RELOAD") {
+      InvalidateDungeonFastPath();
       std::string msg;
       if (!ReloadTuningAndShaders(ctx, sim, msg)) { fail(msg); continue; }
       // Materials too: a colour edit has to reach the palette, and a material
@@ -1033,11 +1190,20 @@ int RunVoxServe(GpuContext& ctx, World& world, Simulation& sim,
       std::vector<long long> v;
       for (int i = 1; i <= 8; i++) v.push_back(std::strtoll(tok[i].c_str(), nullptr, 10));
       ParseReq(v, req);
+      size_t pathTok = 9;
+      if (tok.size() >= 17 && tok[9] == "CLIP") {
+        req.clip = true;
+        for (int a = 0; a < 3; a++) {
+          req.clipMin[a] = (int32_t)std::strtol(tok[10 + a].c_str(), nullptr, 10);
+          req.clipMax[a] = (int32_t)std::strtol(tok[13 + a].c_str(), nullptr, 10);
+        }
+        pathTok = 16;
+      }
       applyLayer();
       std::vector<uint8_t> buf;
       std::string err;
       if (!BuildVoxRegion(ctx, world, sim, req, buf, err)) { fail(err); continue; }
-      if (!WriteFileBytes(tail(9), buf.data(), buf.size(), err)) {
+      if (!WriteFileBytes(tail(pathTok), buf.data(), buf.size(), err)) {
         fail(err);
         continue;
       }
@@ -1123,6 +1289,7 @@ int RunVoxServe(GpuContext& ctx, World& world, Simulation& sim,
       continue;
     }
     if (cmd == "SWATCH") {
+      InvalidateDungeonFastPath();
       std::string json, outp;
       if (tok.size() < 5 || !SplitPaths(tail(4), json, outp)) {
         fail("SWATCH wants <biome> <seed> <sizeVox> <biomeJson|->|<out>");

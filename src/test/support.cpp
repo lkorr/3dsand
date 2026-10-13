@@ -2740,11 +2740,18 @@ bool g_harnessSnapshotDrain = false;
 void SetHarnessSnapshotDrain(bool on) { g_harnessSnapshotDrain = on; }
 bool HarnessSnapshotDrain() { return g_harnessSnapshotDrain; }
 
-bool ReloadEnvironment(GpuContext& ctx, Simulation& sim,
-                       const std::vector<MaterialDef>& mats,
-                       biomes::EnvironmentStamp& stamp, std::string& log) {
+namespace {
+bool ReloadEnvironmentImpl(GpuContext& ctx, Simulation& sim,
+                           const std::vector<MaterialDef>& mats,
+                           biomes::EnvironmentStamp* stamp, std::string& log) {
   const std::string assetDir = AssetDir();
   const std::string mapName = worldmap::ActiveMapName(CurrentTuning().world.mapLayer);
+  static const bool prof = std::getenv("SANDVOX_VOXPROF") != nullptr;
+  double tp = NowSeconds();
+  auto lap = [&](const char* what) {
+    if (prof) std::fprintf(stderr, "envprof %s %.1f ms\n", what, (NowSeconds() - tp) * 1e3);
+    tp = NowSeconds();
+  };
   // The same three loads, in the same order and with the same refusals, as
   // boot (main.cpp): the biome set first because it is the id space the other
   // two are laid out in.
@@ -2759,29 +2766,48 @@ bool ReloadEnvironment(GpuContext& ctx, Simulation& sim,
     log += "environment reload: biome files are invalid -- kept the old tables\n";
     return false;
   }
+  lap("biomes");
   worldmap::WorldMapData map;
   std::vector<uint32_t> words;
-  if (!worldmap::LoadWorldMap(assetDir, mapName, set, mats.size(), kDefaultSeed, map, log) ||
-      !worldmap::PackWorldMap(set, map, words, log)) {
+  const bool loaded = worldmap::LoadWorldMap(assetDir, mapName, set, mats.size(), kDefaultSeed, map, log);
+  lap("map load");
+  if (!loaded || !worldmap::PackWorldMap(set, map, words, log)) {
     log += "environment reload: world map '" + mapName + "' failed to load -- kept the old tables\n";
     return false;
   }
+  lap("map pack");
   TreeAtlas trees;
   if (!LoadTreeAtlas(assetDir + "/trees", mats, set, trees, log)) {
     log += "environment reload: tree atlas failed to load -- kept the old tables\n";
     return false;
   }
+  lap("trees");
   // Everything parsed and validated: now, and only now, replace. The CPU
   // twins (World::MapBiomeAt, TerrainHeight's site pads) read the current map
   // through worldmap::CurrentWorldMap, so the two sides flip together.
   ctx.WaitIdle();
   worldmap::SetCurrentWorldMap(std::move(map));
   sim.UploadEnvironment(ctx.device, ctx.queue, trees, words);
+  lap("upload");
   // The edit layer is the map's (P7): re-read it beside the map it belongs
   // to. The caller's SubmitWorldgen queues it and re-seeds the far field.
   LoadWorldEditLayerForMap(assetDir);
-  stamp = biomes::StampEnvironment(assetDir, mapName, worldmap::CurrentWorldMap().editLayer);
+  lap("editlayer");
+  if (stamp) *stamp = biomes::StampEnvironment(assetDir, mapName, worldmap::CurrentWorldMap().editLayer);
+  lap("stamp");
   return true;
+}
+}  // namespace
+
+bool ReloadEnvironment(GpuContext& ctx, Simulation& sim,
+                       const std::vector<MaterialDef>& mats,
+                       biomes::EnvironmentStamp& stamp, std::string& log) {
+  return ReloadEnvironmentImpl(ctx, sim, mats, &stamp, log);
+}
+
+bool ReloadEnvironment(GpuContext& ctx, Simulation& sim,
+                       const std::vector<MaterialDef>& mats, std::string& log) {
+  return ReloadEnvironmentImpl(ctx, sim, mats, nullptr, log);
 }
 
 bool ApplyStructureChanges(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,

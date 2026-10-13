@@ -152,4 +152,14 @@ inline constexpr int kSampleLog2 = 8;
 void Build(const worldmap::WorldMapData& map, const std::vector<uint32_t>& worldMapWords,
            uint32_t seed, std::vector<uint32_t>& out, const TreeAtlas* trees = nullptr);
 
+/**
+ * Off = Build packs the header-only "no horizon" form (kHValid = 0) that every
+ * consumer already handles for a map without a height plane. For processes
+ * that never draw: --voxserve / --voxdump / --export-edits (main.cpp) paid a
+ * ~0.5 s bake on Tirnhallow at boot and again on every environment reload --
+ * every dungeon preview install -- for a pyramid only the raymarch reads.
+ */
+void SetBuildEnabled(bool on);
+bool BuildEnabled();
+
 }  // namespace horizon

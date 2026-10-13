@@ -18660,6 +18660,23 @@ floor, a room floor and the ground under an overhang all have AIR in the block
 in front of them, so they march. **The conservative direction for a lighting
 grid is the one that never darkens something wrongly.**
 
+**...and "no opinion" on a VISIBLE face is not conservative, it is daylight**
+(2026-10-12, ticket 16-39-15). The skip above was later replaced by looking at
+the voxels: `openValueAt` walks columns of the face inward to find a real
+air-over-blocker transition and starts its rays there. It walked only the 2x2
+quincunx, and a one-voxel riser that runs along a row no quincunx column
+crosses — every step of a cave roof — came back unmeasured. The reader drops
+an unmeasured tap, and when all four drop it returns -1, which means "pre-P0
+look": full sky ambient, and `shadowLiftCap` passes the shadow lift (0.45 for
+a blocker past `shadowSoftFar`) straight through. In a sealed dungeon with a
+low sun that was scattered daylit slivers along the ceiling and floor steps,
+with openness 0 on every other face of the cave. The walk now tries the
+quincunx first, exactly as before, and only if it finds nothing walks the
+other columns; a face with no exposed column in ANY of them has no surface
+facing that way, so no pixel can land on it. "No opinion" is still the right
+answer for a slot nobody has walked, where the honest fallback is the open
+look; it is never right for a face somebody is looking at.
+
 **THE AMBIENT IS A SUM, NOT A FLOORED PRODUCT** (2026-09-11). The reader used
 to be `ambientAt(n) * ao * max(openness, render.opennessFloor)`, with the floor
 at 0.3 standing in for the bounce light P1 could not yet carry. The bug was not
@@ -19072,6 +19089,29 @@ At 12 it crosses a room, and it is free: the cost is (rays × steps) /
 `giCachePeriod`, so doubling the period 8 → 16 absorbed the entire increase —
 0.78 ms on the noon overlook, against 0.79 ms before. What buys the reach is
 LATENCY: the bounce now trails the sun by up to 16 frames rather than 8.
+
+**A hit is one block, not the whole cone** (2026-10-12, ticket 16-50-41,
+`gi_gather.wgsl` `giFacePlane`). The quadrature credits each ray's cone with
+the radiance of what the ray hit. That is right for a wall or a floor at any
+distance and wrong by orders of magnitude for a small bright source: a 40 cm
+candle block 8 m away subtends ~0.003 sr of a ring ray's 0.68, but the one
+ray that hit it lit the whole cone with it while the face beside it, whose
+nine rays all missed, got nothing — a dungeon wall carried a soft 40 cm square
+of candle colour every few blocks, metres from any candle. The hit block now
+gets the share of the cone it COVERS, `cov = SUBOCC_BLOCK² (|dx|+|dy|+|dz|) /
+(t² Ω)` (Ω = 0.84 sr for the normal's cone, 0.68 for each ring ray), and the
+rest of the cone takes the MEDIAN of the eight block-faces around the hit in
+that face's plane (a neighbour with no surface at the hit's depth is looked
+for one block nearer and one further). Per face plane, because a floor seen at
+45° continues across x and z, not across the plane perpendicular to the ray.
+The median and not the mean: a row of candles on a shelf is three of eight
+neighbours, and a mean painted 3/8 of the cone in candle at any distance; the
+median drops whatever fills less than half the ring and passes a lit floor, a
+sunlit wall or a lava pool whole. Hits closer than one block per cone width
+(`cov` = 1) skip the neighbours and are bit-for-bit the old estimator; so is
+any extended surface at any distance. `gi-bounce` moved from R +17.3 G +33.4
+B +9.5 to R +15.6 G +32.1 B +8.8. This is the prefilter "why there is no mip
+pyramid" below asked for, at one level and in the compute pass.
 
 **Two obvious improvements were built and both removed the same day, for the
 same reason: this fragment shader has no register headroom.** (1) A three-level
@@ -22006,6 +22046,40 @@ merges almost nothing here, because worldgen's palette jitter gives every
 adjacent stone cell a different variant: a 64³ region of plain rock becomes ~25k
 unmergeable quads. Merging on exposure alone makes a flat plain a handful of
 quads whatever it is made of — measured 2.6k quads per region against ~25k — and
+What a request does NOT pay for (the Dungeons-tab speed pass, 2026-10-12;
+numbers are Shardwell isolated, one machine):
+
+* **Sky and rock are never read back.** genChunk publishes each chunk's
+  page-table class (`genAct`, world.h kGenVerdict*). EMPTY chunks are air; a
+  UNIFORM or JITTER chunk's samples are synthesised on the CPU by `SynthWordAt`
+  (majority = the one material, first-cell = the block's min corner) — exact,
+  the `voxregion` gate holds both lods byte-identical to the readback path. An
+  isolated dungeon's box is ~96% buried stone: lod 8 1.6 s → 0.44 s, lod 4
+  0.38 → 0.06 s, lod 1 48 → 10 ms. What is left at lod 8 is genChunk itself
+  over 512³ cells.
+* **Outside the viewer's ROI is not generated.** `REGION … CLIP` /
+  `/api/voxregion?clip=` (worldview.js sends `view.roi`): chunks wholly outside
+  are air, which is what the viewer draws there anyway. A 512³ root over a
+  dungeon ROI is ~3× the dungeon's volume.
+* **A dungeon edit does not reload the map.** `PreviewDungeon` re-places a
+  program of the same shape on the loaded map (`worldmap::ReplaceScratchDungeon`
+  — LoadWorldMap's anchor rule and content-hash fold; `dungeon-format` holds
+  its packed words identical to a full load) and re-packs: ~2.5 s → ~0.1 s per
+  slider move. Valid while the files are the ones the last full reload read:
+  RELOAD/SWATCH/CLEAR drop it and the tuner RELOADs on any signature change.
+* **No game boot.** The voxel tools dispatch straight after sim init (no Jolt,
+  mobs, items, streamer, far field: −2.2 s) and build no far horizon
+  (`horizon::SetBuildEnabled(false)`: −0.5 s at boot and per reload).
+* **No boot for the palette.** `/api/voxpalette` is cached on disk by the
+  material files + the exe, and a hit starts the server's boot in the
+  background, so a 3D view's first draw does not wait out a boot it does not
+  need yet.
+
+Where the time goes, without guessing: `SANDVOX_VOXPROF=1` makes the server
+print one `voxprof` line per region (chunks generated / read back /
+synthesised / sky, and ms for gen, verdict wait, readback, downsample) and
+`envprof` laps through `ReloadEnvironment`, on stderr.
+
 the material stays exact per voxel, jitter included. The same texture pays for
 per-fragment ambient occlusion (which therefore survives the merging, unlike
 baked vertex AO) and for the voxel edge lines that fade in when cells are big

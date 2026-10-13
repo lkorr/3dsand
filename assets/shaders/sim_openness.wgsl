@@ -142,23 +142,37 @@ fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
   // rough wall in the block in front of it -- came out as hard-edged
   // alternating slabs of full sky and pitch black (2026-09-02).
   //
-  // So look at the voxels. Four columns of the face (the 2x2 sub-centres),
-  // each walked inward from the cell just outside the block: the first
-  // air-over-blocker transition is a surface somebody can see, and the air
-  // cell of it is where the rays start. At most 4 x (SUBOCC_BLOCK + 1) word
-  // reads, none for a block whose neighbour is open air (the old origin is
-  // exact then). Only a face with NO exposed column in those four is
-  // unmeasured (255), and that face is buried for every practical purpose.
+  // So look at the voxels. The columns of the face, the 2x2 sub-centres
+  // first and then the rest (see EVERY COLUMN below), each walked inward from
+  // the cell just outside the block: the first air-over-blocker transition is
+  // a surface somebody can see, and the air cell of it is where the rays
+  // start. 4 x (SUBOCC_BLOCK + 1) word reads when the quincunx finds one, none
+  // for a block whose neighbour is open air (the old origin is exact then).
+  // Only a face with NO exposed column at all is unmeasured (255), and no
+  // pixel can land on such a face.
   let outer = blockMin + select(vec3<i32>(0), abs(ni) * (i32(SUBOCC_BLOCK) - 1),
                                 (face & 1u) != 0u);
   var ro = centre + n * (half + 0.5);
   if (openBlockBlocked(vec3<i32>(floor(ro)))) {
     var found = false;
+    // EVERY COLUMN, THE QUINCUNX FIRST (ticket 2026-10-12_16-39-15). The
+    // 2x2 quincunx alone cannot see a surface narrower than a block: a
+    // one-voxel riser on a cave ceiling sits in a row no probe walks, so the
+    // face came back "no opinion", the reader turned "no opinion" into open
+    // sky (opennessAt -> -1), and shadowLiftCap let the far-blocker lift and
+    // the sky ambient onto it -- scattered daylit slivers along every step of
+    // a sealed cave's roof. Sweep 0 is the quincunx exactly as before, so every
+    // face it measured keeps its origin and its byte; sweep 1 walks the other
+    // columns only for a face sweep 0 could not place, which is the rare
+    // case and the only one whose answer changes. A face with no exposed
+    // column in ANY row has no visible surface facing that way at all.
     let q = i32(SUBOCC_BLOCK) / 4;
-    for (var ui = 0; ui < 2 && !found; ui++) {
-      for (var vi = 0; vi < 2 && !found; vi++) {
-        let u = q + ui * (i32(SUBOCC_BLOCK) / 2);
-        let v = q + vi * (i32(SUBOCC_BLOCK) / 2);
+    let qs = i32(SUBOCC_BLOCK) / 2;
+    for (var sweep = 0; sweep < 2 && !found; sweep++) {
+    for (var u = 0; u < i32(SUBOCC_BLOCK) && !found; u++) {
+      for (var v = 0; v < i32(SUBOCC_BLOCK) && !found; v++) {
+        let quin = ((u - q) % qs) == 0 && ((v - q) % qs) == 0;
+        if (quin != (sweep == 0)) { continue; }
         let c0 = outer + t0i * u + t1i * v + ni;   // just outside the block
         var prevAir = !isRayBlocker(materials[voxMat(voxWordAt(c0))]);
         for (var k = 1; k <= i32(SUBOCC_BLOCK); k++) {
@@ -172,6 +186,7 @@ fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
           prevAir = !blocker;
         }
       }
+    }
     }
     // 256, not 255, so the caller can tell "no opinion" from a face that
     // marched: P1's irradiance keeps a different word for each. The caller

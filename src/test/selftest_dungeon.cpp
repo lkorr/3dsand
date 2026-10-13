@@ -276,9 +276,68 @@ Status GateDungeonFormat(Ctx& c, std::string& detail) {
       placeLine = "harness places " + placeLine;
     }
   }
+  // THE PREVIEW FAST PATH (voxregion.cpp PreviewDungeon): a program re-placed
+  // on the loaded map by worldmap::ReplaceScratchDungeon must pack to exactly
+  // the words -- and fold exactly the content hash -- a full LoadWorldMap
+  // makes with that program installed. Both scratch shapes: the scratch's own
+  // entry (PLACE / ISOLATE) and a map entry replaced (MAP). CPU only.
+  std::string fastLine = "fast path: not run (no two placed assets)";
+  {
+    const worldmap::WorldMapData& cur = worldmap::CurrentWorldMap();
+    std::vector<std::string> assets;
+    for (const worldmap::DungeonDef& g : cur.dungeons)
+      if (g.Placed() && std::find(assets.begin(), assets.end(), g.asset) == assets.end()) assets.push_back(g.asset);
+    biomes::BiomeSet set;
+    std::string blog;
+    if (assets.size() >= 2 && biomes::LoadBiomeSet(ad, c.mats, set, blog)) {
+      auto program = [&](const std::string& asset, worldmap::DungeonDef& d) {
+        auto shell = std::make_shared<dungeon::Shell>();
+        auto res = std::make_shared<dungeon::Resolved>();
+        std::string err, used;
+        if (!dungeon::LoadShellAsset(ad, asset, *shell, err, &used) ||
+            !dungeon::ResolveShell(*shell, names, klass, *res, err))
+          return check(false, "fast path: " + asset + ": " + err);
+        d.shell = shell;
+        d.res = res;
+        d.shellPath = used;
+        dungeon::SourceHashOfFile(used, d.shellHash);
+        return true;
+      };
+      const std::string mapName = cur.name;
+      int same = 0;
+      for (int shape = 0; shape < 2; shape++) {
+        worldmap::ScratchDungeon a, b;
+        a.replaceMapEntry = b.replaceMapEntry = shape == 1;
+        a.def.id = b.def.id = shape == 1 ? cur.dungeons.front().id : std::string("_scratch");
+        a.def.ax = b.def.ax = cur.spawnX;
+        a.def.az = b.def.az = cur.spawnZ;
+        b.def.yawQ = 1;
+        if (!program(assets[0], a.def) || !program(assets[1], b.def)) break;
+        worldmap::WorldMapData ma, mb;
+        std::vector<uint32_t> wFast, wFull;
+        std::string l1, l2, l3;
+        worldmap::SetScratchDungeon(&a);
+        const bool la = worldmap::LoadWorldMap(ad, mapName, set, c.mats.size(), kDefaultSeed, ma, l1);
+        worldmap::SetScratchDungeon(&b);
+        const bool lb = worldmap::LoadWorldMap(ad, mapName, set, c.mats.size(), kDefaultSeed, mb, l2);
+        const bool fast = la && worldmap::ReplaceScratchDungeon(ma, kDefaultSeed, l3);
+        worldmap::SetScratchDungeon(nullptr);
+        const bool packed = fast && lb && worldmap::PackWorldMap(set, ma, wFast, l3) &&
+                            worldmap::PackWorldMap(set, mb, wFull, l3);
+        if (check(packed, Format("fast path shape %d: load/replace/pack failed: %s%s%s", shape, l1.c_str(), l2.c_str(),
+                                 l3.c_str())) &&
+            check(wFast == wFull && ma.contentHash == mb.contentHash,
+                  Format("fast path shape %d: re-placed map packs %zu words (content %08x), a full load %zu (%08x)",
+                         shape, wFast.size(), ma.contentHash, wFull.size(), mb.contentHash)))
+          same++;
+      }
+      fastLine = Format("fast path: %d/2 scratch shapes pack identically to a full load (%s -> %s)", same,
+                        assets[0].c_str(), assets[1].c_str());
+    }
+  }
   RecordObserved("dungeon.assets", static_cast<double>(loaded));
-  detail = Format("%d dungeon asset(s): %s | %d map placement(s) | %s | %s", loaded, lines.c_str(), mapRefs, svedLine.c_str(),
-                  placeLine.c_str());
+  detail = Format("%d dungeon asset(s): %s | %d map placement(s) | %s | %s | %s", loaded, lines.c_str(), mapRefs,
+                  svedLine.c_str(), placeLine.c_str(), fastLine.c_str());
   if (!why.empty()) {
     detail += " | FAIL: " + why[0];
     for (size_t i = 1; i < why.size() && i < 6; i++) detail += " | " + why[i];

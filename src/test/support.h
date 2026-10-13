@@ -188,6 +188,11 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
 bool ReloadEnvironment(GpuContext& ctx, Simulation& sim,
                        const std::vector<MaterialDef>& mats,
                        biomes::EnvironmentStamp& stamp, std::string& log);
+// The same, without the environment STAMP (a content hash of every file it
+// read, ~0.4 s on Tirnhallow): for a caller that would discard it -- the
+// voxel server's dungeon preview.
+bool ReloadEnvironment(GpuContext& ctx, Simulation& sim,
+                       const std::vector<MaterialDef>& mats, std::string& log);
 
 // ---- THE LIVE RE-APPLY OF PLACED STRUCTURES (PLAN_world_editor P4) --------
 // A structure ref was placed / moved / turned / deleted, or its asset changed

@@ -91,6 +91,7 @@ Status GateVoxRegion(Ctx& c, std::string& detail) {
   std::string notes;
   auto check = [&](bool ok, const std::string& msg) {
     if (!ok) { failures++; notes += (notes.empty() ? "" : "; ") + msg; }
+    return ok;
   };
 
   // ---- A: lod 1 is EXACT against a direct readback -----------------------
@@ -223,6 +224,54 @@ Status GateVoxRegion(Ctx& c, std::string& detail) {
       }
     } else {
       check(false, "lod-4 build: " + e2);
+    }
+  }
+
+  // ---- B2: the rock skip and the clip are exact ----------------------------
+  //
+  // The rock skip synthesises the chunks genChunk proved UNIFORM / JITTER
+  // instead of reading them back; the box straddles the surface, so its lower
+  // chunks are buried stone and take that path. Both lods must come out
+  // BYTE-identical to the readback path. The clip keeps the chunks that touch
+  // its box exactly as they were and makes every other sample air.
+  if (built && grid.size() == 64ull * 64 * 64) {
+    for (uint32_t lod : {1u, 4u}) {
+      VoxRegionReq a = req;
+      a.lod = lod;
+      a.nx = a.ny = a.nz = 64 / lod;
+      VoxRegionReq b = a;
+      b.synthSentinels = false;
+      std::vector<uint8_t> ba, bb;
+      std::string ea, eb;
+      const bool okA = BuildVoxRegion(ctx, world, sim, a, ba, ea);
+      const bool okB = BuildVoxRegion(ctx, world, sim, b, bb, eb);
+      check(okA && okB, "rock-skip A/B build: " + ea + eb);
+      check(!okA || !okB || ba == bb,
+            "lod-" + std::to_string(lod) + " region with the rock skip differs from the readback path");
+    }
+    VoxRegionReq c = req;
+    c.clip = true;
+    c.clipMin[0] = req.ox + 20; c.clipMin[1] = req.oy; c.clipMin[2] = req.oz;
+    c.clipMax[0] = req.ox + 63; c.clipMax[1] = req.oy + 40; c.clipMax[2] = req.oz + 63;
+    std::vector<uint8_t> bc;
+    std::string ec;
+    std::vector<uint32_t> gc;
+    VoxRegionReq hc{};
+    std::string why;
+    if (check(BuildVoxRegion(ctx, world, sim, c, bc, ec), "clip build: " + ec) &&
+        check(DecodeRegion(bc, hc, gc, why), "clip decode: " + why)) {
+      // Chunk granularity: the clip keeps x chunks 1..3 (16..63 touches 20..63)
+      // and y chunks 0..2 (0..47 touches 0..40).
+      size_t bad = 0;
+      for (uint32_t z = 0; z < 64; z++)
+        for (uint32_t y = 0; y < 64; y++)
+          for (uint32_t x = 0; x < 64; x++) {
+            const size_t i = ((size_t)z * 64 + y) * 64 + x;
+            const bool in = x >= 16 && y < 48;
+            const uint32_t want = in ? (grid[i] & ~kStampBits) : 0u;
+            if ((gc[i] & ~kStampBits) != want) bad++;
+          }
+      check(bad == 0, std::to_string(bad) + " clipped samples differ (inside = the unclipped words, outside = air)");
     }
   }
 
