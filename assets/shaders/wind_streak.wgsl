@@ -9,13 +9,18 @@
 // one thread per live slot (render.streakCount, <= the cap), the draw one
 // instance per slot, and at master alpha 0 neither is recorded at all.
 //
-// SPAWN ONLY IN GUSTS. A dead slot tries to respawn a few times a second at a
-// random point in a disc around the camera, low over the terrain table's
-// ground. It is born only with probability smoothstep(threshold, threshold +
-// span, excess), where the EXCESS is the gust bands' component along the local
-// mean plus the magnitude of any wind primitive there — the part of the wind
-// above its mean. So a calm day spawns nothing, a breezy one the odd streak in
-// its strongest gusts, and a gale a sky full of them.
+// SPAWN WHERE THE WIND IS STRONG (2026-10-11). A dead slot tries to respawn a
+// few times a second at a random point in a VOLUME round the camera: a disc
+// of the pool's radius, from just over the terrain table's ground up to one
+// radius over the eye (and down to one radius under it when flying). It is
+// born with probability smoothstep(threshold, threshold + span, |windAt|) --
+// the SPEED of the field there, shelter, primitives and heat included. So
+// streaks are seen wherever the field runs fast: aloft, where the profile
+// makes it fastest, as well as over the grass. Until this date the band was
+// the 0.2-6.2 m surface layer (most of them under 2 m) gated on the gust
+// EXCESS over the mean; with the ground boundary below that glued every
+// streak to the terrain and none were ever seen in the sky (owner: "they just
+// race along surfaces and seem bounded to those surfaces").
 //
 // THEY FOLLOW THE FIELD. Each streak is advected by windAt(p, t) — the same
 // function the debug arrows sample, primitives and (since 2026-10-02) the heat
@@ -84,11 +89,12 @@ const STREAK_SALT : u32 = 0x57EAu;
 const STREAK_SPAWN_RATE : f32 = 5.0;
 // The ground as the flow's boundary (the advection step's note): the depth
 // over which a streak's vertical speed follows the terrain table's slope,
-// fading linearly to none (voxels: 40 m, so the whole 0.2-6.2 m spawn band
-// follows at >= 85%); the steepest slope it follows (a 56-degree face; a cliff
+// fading linearly to none (voxels: 12 m -- the layer the ground actually
+// deflects; at 40 m every streak in the low band rode the terrain's shape and
+// read as bound to it); the steepest slope it follows (a 56-degree face; a cliff
 // cell's gradient is clamped to this); and the clearance a step that ends
 // under the table's ground is put back to (the spawn band's own floor).
-const STREAK_FOLLOW_DEPTH : f32 = 400.0;
+const STREAK_FOLLOW_DEPTH : f32 = 120.0;
 const STREAK_FOLLOW_MAX_SLOPE : f32 = 1.5;
 const STREAK_FLOOR : f32 = 2.0;
 
@@ -134,15 +140,6 @@ fn streakU01(a : u32, b : u32) -> f32 {
 
 fn streakAlive(h0 : vec4f, h1 : vec4f) -> bool { return h1.x > 0.0 && h0.w < h1.x; }
 
-// The vertical half-reach of the band: from the eye down to the surface
-// layer's 6.2 m top. The band never follows the camera up (owner report
-// 2026-10-08: flying at 365 m at night, a box of white wisps round the eye
-// filled the whole view -- "straight line wispy visuals that shouldn't be
-// here"). Streaks are air seen against the ground; high up they stay down
-// there and the draw's vertical fade hides them.
-fn streakVertReach(ground : f32) -> f32 {
-  return max(R.camPos.y - ground + 62.0, 62.0);
-}
 
 @compute @workgroup_size(64)
 fn update(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -172,28 +169,18 @@ fn update(@builtin(global_invocation_id) gid : vec3<u32>) {
     var p = vec3f(R.camPos.x + cos(ang) * rr, 0.0, R.camPos.z + sin(ang) * rr);
     let tr = windTerrF(p, &R);
     let ground = select(R.camPos.y - 17.0, tr.h, tr.edge > 0.0);
-    // HEIGHT. The surface layer, 0.2 .. 6.2 m up and most of them low,
-    // because that is where the gusts are seen against the grass. Wherever
-    // the camera is (streakVertReach says why it does not follow a flier).
-    // A camera far above the band spawns nothing: the draw would fade every
-    // one of them out anyway.
-    if (R.camPos.y - ground > 2.0 * radius + 62.0) { return; }
-    let hq = streakU01(4u, i);
-    p.y = ground + 2.0 + hq * hq * 60.0;
+    // HEIGHT. Uniform from just over the ground to one radius over the eye,
+    // clipped to one radius under it: standing, the air up to ~20 m over the
+    // head; flying, a box round the eye that never goes underground.
+    let lo = max(ground + STREAK_FLOOR, R.camPos.y - radius);
+    let hi = max(R.camPos.y + radius, lo);
+    p.y = lo + streakU01(4u, i) * (hi - lo);
     if (streakCellLiquid(p)) { return; }        // air, not water (header)
-    let s = windSampleAt(p, R.time, 0.0, &R);
-    let bands = windBandWS(s, s.b1) * WIND_BAND_W1 + windBandWS(s, s.b2) * WIND_BAND_W2;
-    let m = windMeanWS(s);
-    let ml = length(m.xz);
-    var ex = length(windPrimAt(p, &R));
-    // Sheltered by the draft volume like the advection below: indoors, in a
-    // cave or in the lee of a wall the gust excess shrinks with the wind, so
-    // a still room spawns nothing instead of streaks that hang in place.
-    let full = m + bands;
-    let fl = length(full.xz);
-    let shelter = select(1.0, length(draftApplyF(p, full, &R).xz) / fl, fl > 1e-3);
-    if (ml > 1e-3) { ex += dot(bands.xz, m.xz) / ml * min(shelter, 1.5); }
-    let pr = smoothstep(R.streakA.y, R.streakA.y + max(R.streakA.z, 1e-3), ex);
+    // THE SPEED of the field the streak will be advected by: windAt is the
+    // draft-sheltered ambient plus primitives plus heat, so a still room or
+    // the lee of a wall spawns nothing instead of streaks that hang in place.
+    let ws = length(windAt(p, R.time, &R));
+    let pr = smoothstep(R.streakA.y, R.streakA.y + max(R.streakA.z, 1e-3), ws);
     if (streakU01(5u, i) >= pr) { return; }
     h0 = vec4f(p, 0.0);
     h1 = vec4f(R.streakB.x * (0.7 + 0.6 * streakU01(6u, i)), pr, 0.0, 0.0);
@@ -276,10 +263,8 @@ fn update(@builtin(global_invocation_id) gid : vec3<u32>) {
   // Out of the pool's reach, or into the ground: done (age = life).
   let d = p.xz - R.camPos.xz;
   var dead = hitWall || dot(d, d) > radius * radius * 1.69;
-  // ...or out of it vertically: the band's own reach (streakVertReach).
-  let tr = windTerrF(p, &R);
-  let groundHere = select(R.camPos.y - 17.0, tr.h, tr.edge > 0.0);
-  if (abs(p.y - R.camPos.y) > streakVertReach(groundHere) * 1.3) { dead = true; }
+  // ...or out of it vertically: the spawn volume's own reach.
+  if (abs(p.y - R.camPos.y) > radius * 1.3) { dead = true; }
   if (dead) { h0.w = h1.x; }
   streaks[base] = h0;
   streaks[base + 1u] = vec4f(h1.x, h1.y, f32(head), timer);
@@ -439,12 +424,9 @@ fn vsStreak(@builtin(vertex_index) vi : u32,
   // Gone within a metre of the eye, full by four: a streak that close is a
   // slab across the screen, not a wisp.
   let near = smoothstep(10.0, 40.0, dist);
-  // Horizontal reach, plus any vertical distance past the surface band's own
-  // 6.2 m: on the ground nothing changes, high up a streak far above or below
-  // the eye fades like one far off to the side.
-  let dyEx = max(abs(q.y - R.camPos.y) - 62.0, 0.0);
-  let far = 1.0 - smoothstep(R.streakA.w * 0.6, R.streakA.w,
-                             length(vec2f(length(q.xz - R.camPos.xz), dyEx)));
+  // The pool's reach in 3-D: a streak far above or below the eye fades like
+  // one far off to the side (the spawn volume is a radius tall either way).
+  let far = 1.0 - smoothstep(R.streakA.w * 0.6, R.streakA.w, dist);
   // The one air law (common.wgsl airFogTauS): the height fog plus the
   // loading fog, along the ray from the eye to the streak.
   let fog = exp(-airFogTauS(R.camPos.y, R.hfogDensity, R.hfogFalloff, R.hfogBaseY,

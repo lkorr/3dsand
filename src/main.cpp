@@ -127,6 +127,7 @@
 #include "test/tickrig.h"   // support::TickRig: the --shot-* harnesses tick TickAuthority
 #include "test/treefixture.h"
 #include "ui/bugreport.h"
+#include "ui/framering.h"
 #include "ui/item_stage.h"
 #include "ui/map_ui.h"
 #include "ui/overlay.h"
@@ -8432,6 +8433,14 @@ int main(int argc, char** argv) {
   // way the conversation does.
   bool bugShotPending = false;
   bool bugWasOpen = false, bugPausedBefore = false, bugCaptureBefore = true;
+  // The last second for F12's contact sheet (ui/framering.h). While it runs,
+  // every frame renders into `bugFrameTex` (copyable) and is blitted to the
+  // swapchain, so the frame can also be blitted down into the ring.
+  // SANDVOX_NO_BUG_RING=1 renders straight to the swapchain as before.
+  const bool bugRingOn = std::getenv("SANDVOX_NO_BUG_RING") == nullptr;
+  BugFrameRing bugRing;
+  rhi::Texture bugFrameTex;
+  uint32_t bugFrameW = 0, bugFrameH = 0;
   std::string bugContext;  // the world at the report's FIRST picture
   // (G has no KeyEdge: it is a hold-aware binding — tap to take, hold to
   // drag or, with a throwable vessel in hand, to throw — see the block by
@@ -13219,6 +13228,9 @@ int main(int argc, char** argv) {
           ui.bug.text = "scripted report: the first picture, then 'add another' and a second.";
           ui.bug.tags = {"ui"};
           ui.bug.wantAddAnother = true;
+          // The second picture files the last second's contact sheet (the
+          // panel's "1 s" toggle, which carries to the next picture).
+          ui.bug.preferSheet = true;
         }
         if (f == 175) g_shotJumpPath = "screenshot_bugreport_panel.bmp";
         if (f == 180) ui.bug.wantSubmit = true;
@@ -16174,15 +16186,29 @@ int main(int argc, char** argv) {
       bugShotPending = false;
       ui.bug.hideForShot = false;
     }
-    if (bugShotNow) {
-      bugShotTex = ctx.device.CreateTexture(
-          {ctx.width, ctx.height, 1}, ctx.surfaceFormat,
-          // CopyDst too: the scaled-render path BLITS the world up into it.
-          rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc |
-              rhi::TextureUsage::CopyDst,
-          "bugShot");
-      target = bugShotTex.CreateView();
+    // The frame ring keeps the copyable target every frame, not just F12's.
+    const bool bugRedirect = target && ctx.SwapchainBlittable() && (bugShotNow || bugRingOn);
+    const double bugRingNow = NowSeconds();
+    if (bugRedirect) {
+      if (!bugFrameTex || bugFrameW != ctx.width || bugFrameH != ctx.height) {
+        bugFrameTex = ctx.device.CreateTexture(
+            {ctx.width, ctx.height, 1}, ctx.surfaceFormat,
+            // CopyDst too: the scaled-render path BLITS the world up into it.
+            rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc |
+                rhi::TextureUsage::CopyDst,
+            "bugFrame");
+        bugFrameW = ctx.width;
+        bugFrameH = ctx.height;
+      }
+      if (bugRingOn) bugRing.Ensure(ctx.device, ctx.width, ctx.height, ctx.surfaceFormat);
+      bugShotTex = bugFrameTex;
+      target = bugFrameTex.CreateView();
     }
+    // A tile is due, or this is the F12 frame (always the sheet's last tile).
+    // Frozen while the panel is up: the frames worth keeping are the ones
+    // BEFORE the key, and a paused world under the panel would overwrite them.
+    const bool bugRingCapture =
+        bugRedirect && bugRingOn && (bugShotNow || (!ui.bug.open && bugRing.Due(bugRingNow)));
     if (target) {
       // RenderEyePos, not EyePos, and the difference is now TWO corrections
       // rather than one:
@@ -21207,7 +21233,8 @@ int main(int argc, char** argv) {
           liveStatsOn && telemetry.HasClient() &&
           liveStats.Encode(enc, world, liveFrameNo);
       double tPresent0 = NowSeconds();
-      if (bugShotNow) enc.BlitTexture(target, swapTarget);
+      if (bugRingCapture) bugRing.Capture(enc, target, bugRingNow);
+      if (bugRedirect) enc.BlitTexture(target, swapTarget);
       ctx.queue.Submit(enc.Finish());
       if (bugShotNow) {
         // A user-pressed key, once: the blocking readback is a one-frame
@@ -21283,7 +21310,16 @@ int main(int argc, char** argv) {
                 yawD, pitchD);
             where = wbuf;
           }
-          BugReportAddShot(ui, std::move(px), W, H, std::move(where));
+          std::vector<uint8_t> sheet;
+          uint32_t sheetW = 0, sheetH = 0;
+          std::string sheetNote;
+          if (bugRingOn &&
+              !bugRing.ReadSheet(ctx.device, ctx.queue,
+                                 ctx.surfaceFormat == rhi::TextureFormat::BGRA8Unorm,
+                                 bugRingNow, sheet, sheetW, sheetH, sheetNote))
+            std::fprintf(stderr, "bug report: frame ring read failed; the still only\n");
+          BugReportAddShot(ui, std::move(px), W, H, std::move(where), std::move(sheet), sheetW,
+                           sheetH, std::move(sheetNote));
           ui.bug.open = true;
           ui.bug.collecting = false;
           ui.bug.focusText = true;

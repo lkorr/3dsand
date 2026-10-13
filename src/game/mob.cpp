@@ -11090,9 +11090,11 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // (DrainBlood charges every drop), so a swimmer bleeds out faster too; a
     // finite wound pays out the same total, sooner. The wound cell is asked,
     // not the body: a stump held above the surface bleeds at the dry rate.
+    // AMPUTATIONS ONLY (owner, 2026-10-11): an ordinary cut or bite under
+    // water bleeds at the dry rate; applying the rate to every wound made a
+    // swimmer with a scratch trail far too much blood.
     uint32_t dripPeriod = (uint32_t)std::max(1, gore.bleedDripTicks);
-    if (gore.underwaterBleedRate > 1.0f &&
-        (limb.bleedBudget >= 1.0f || limb.stumpOpen)) {
+    if (gore.underwaterBleedRate > 1.0f && limb.stumpOpen) {
       const Vec3 wq = limb.body ? limb.xf.pos + Rotate(lq, limb.woundLocal)
                                 : bodyFrame(limb.anchorRoot);
       const bool wet = WaterAt(world, wq);

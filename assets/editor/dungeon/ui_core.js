@@ -403,7 +403,7 @@ export class View3D {
     const wv = this.wv;
     wv.view.showFar = false; wv.view.showAxes = false; wv.view.overlayOnTop = true;
     wv.view.levels = 4; wv.view.detail = 1.0; wv.view.grid = 0.6;
-    wv.cam.mode = 'orbit'; wv.cam.speed = 60;
+    wv.cam.mode = 'orbit'; wv.cam.speed = 60; wv.cam.orbitAlongLook = true;
     wv.onError = () => { this.dirty = true; };
     this._bind();
     this._palette();

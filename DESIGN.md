@@ -15296,7 +15296,7 @@ authored. A new fish is a sidecar and `node scripts/gen_fish.mjs <name>`.
 **The two creatures.** SHARK (`assets/mobs/shark.*`): 2.2 m at 40 art
 voxels/m, eight limbs, ~770 hp, cruise 3.5 m/s, charge 5x (~17.5 m/s,
 accel 300 vox/s^2 so the run tops out inside half a second, brake 160 so it
-glides ~80 voxels past before swinging back); circles at 26 voxels at 1.3x
+glides ~80 voxels past before swinging back); circles at 22 voxels at 1.3x
 cruise (~3 s a lap, 4-9 s before a pass may begin), paces, charges, bites (`shark_bite`: 70 hp at
 jaw force 0.85, a 2.6 x 0.45-voxel hole and a 1.15 mouthful), goes past;
 blood in the water makes it bolder; under a quarter of its life it breaks
@@ -20134,12 +20134,24 @@ but a tracer does: streaks born over a windward slope ran into the terrain
 table within metres and died while still fading in, so a hill's windward face
 showed none and its lee showed them full length. The streak step now takes the
 no-penetration vertical `U . grad(h)` off the same table (slope clamped to
-1.5, fading over 40 m of height), slides along the ground if a step still ends
+1.5, fading over 12 m of height -- 40 m until 2026-10-11), slides along the ground if a step still ends
 just under it, and dies only on a step that ends DEEP under it (a wall). Not
 added to `windAt` itself: that would have to be mirrored into `windAtQ` and
 would move the sim. `wind.streakGround` (default on, `RenderParams.streakN[3]`
 bit 0) switches it; the `heat-updraft` gate's probe turns it off, because it
 reads one streak step back as `windAt`.
+
+**Streaks spawn wherever the field is FAST, not only near the ground
+(2026-10-11).** Spawn is a volume round the eye (a disc of `streakRadius`,
+from 0.2 m over the table's ground to one radius over the eye, clipped to one
+radius under it) gated on `|windAt|` against `wind.streakThreshold`/`streakSpan`
+(now a SPEED, 5 / 7 m/s). It was a 0.2-6.2 m surface band, most under 2 m,
+gated on the gust EXCESS over the mean: together with the ground boundary
+(then fading over 40 m) every streak hugged the terrain and none showed in the
+sky, where the wind profile makes the field fastest. Vertical despawn and the
+draw's fade are the 3-D pool radius. Note this partly undoes de4a214's "stay on
+the ground" call for a flier at altitude: high wind aloft now draws streaks
+round the eye there too.
 
 **The lee rotor turns the air, it does not stop it (2026-10-11, same ticket's
 other half).** Past the regime's lee onset a slope falling away downwind
@@ -22074,18 +22086,6 @@ Regions are never held at full resolution CPU-side — a lod-16 box spans 512³
 voxels (512 MiB of words) and yields 128 KiB of samples, downsampled per chunk
 as each is read back.
 
-### 9c.3 Geometry and material are separate (`assets/worldview.js`)
-
-The browser's mesher merges on ONE bit — "is this face exposed" — and carries no
-colour at all. Each region uploads its cells as an `R16UI` 3D texture and the
-fragment shader reads the cell just inside the face and looks the colour up in a
-palette texture.
-
-This is the load-bearing decision. A conventional coloured-quad greedy mesher
-merges almost nothing here, because worldgen's palette jitter gives every
-adjacent stone cell a different variant: a 64³ region of plain rock becomes ~25k
-unmergeable quads. Merging on exposure alone makes a flat plain a handful of
-quads whatever it is made of — measured 2.6k quads per region against ~25k — and
 What a request does NOT pay for (the Dungeons-tab speed pass, 2026-10-12;
 numbers are Shardwell isolated, one machine):
 
@@ -22120,6 +22120,18 @@ print one `voxprof` line per region (chunks generated / read back /
 synthesised / sky, and ms for gen, verdict wait, readback, downsample) and
 `envprof` laps through `ReloadEnvironment`, on stderr.
 
+### 9c.3 Geometry and material are separate (`assets/worldview.js`)
+
+The browser's mesher merges on ONE bit — "is this face exposed" — and carries no
+colour at all. Each region uploads its cells as an `R16UI` 3D texture and the
+fragment shader reads the cell just inside the face and looks the colour up in a
+palette texture.
+
+This is the load-bearing decision. A conventional coloured-quad greedy mesher
+merges almost nothing here, because worldgen's palette jitter gives every
+adjacent stone cell a different variant: a 64³ region of plain rock becomes ~25k
+unmergeable quads. Merging on exposure alone makes a flat plain a handful of
+quads whatever it is made of — measured 2.6k quads per region against ~25k — and
 the material stays exact per voxel, jitter included. The same texture pays for
 per-fragment ambient occlusion (which therefore survives the merging, unlike
 baked vertex AO) and for the voxel edge lines that fade in when cells are big

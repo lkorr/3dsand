@@ -16,6 +16,7 @@
 
 #include "test/selftest.h"
 #include "ui/bugreport.h"
+#include "ui/framering.h"
 
 namespace selftest {
 namespace {
@@ -185,6 +186,42 @@ Status GateBugReportMd(Ctx&, std::string& detail) {
       std::printf("  bugreport-md: shot_2 mosaic[0] = 0x%08x (want 0xffc82828)\n", px[0]);
     check(loaded && !px.empty() && (px[0] & 0xFF) == 40 && ((px[0] >> 16) & 0xFF) == 200,
           "and reads back its colour");
+  }
+
+  // ---- 5. the 1 s contact sheet (ui/framering.h) -----------------------------
+  {
+    // Five 4x2 tiles, tile k filled with k*50: a 4-wide grid, 2 px gutters.
+    std::vector<std::vector<uint8_t>> t(5, std::vector<uint8_t>(4 * 2 * 4));
+    std::vector<const uint8_t*> tp;
+    for (int k = 0; k < 5; k++) {
+      for (auto& b : t[k]) b = (uint8_t)(k * 50);
+      tp.push_back(t[k].data());
+    }
+    std::vector<uint8_t> sheet;
+    uint32_t sw = 0, sh = 0;
+    ComposeContactSheet(tp, 4, 2, 4, sheet, sw, sh);
+    check(sw == 4 * 4 + 3 * 2 && sh == 2 * 2 + 2, "the sheet is 4 tiles wide, 2 rows, gutters");
+    auto at = [&](uint32_t x, uint32_t y) { return sheet[((size_t)y * sw + x) * 4]; };
+    check(at(0, 0) == 0 && at(6, 0) == 50 && at(18, 1) == 150 && at(0, 4) == 200 &&
+              at(4, 0) == 0 && sheet[3] == 255,
+          "tiles land oldest-first in reading order, gutter black, alpha opaque");
+
+    // A shot with "1 s" picked files the sheet and its tile note.
+    UIState::BugReportUI r;
+    r.text = "sheet";
+    UIState::BugReportUI::Shot s = Solid(64, 32, 1, 2, 3, "- eye: sheet\n");
+    s.sheet = sheet;
+    s.sheetW = sw;
+    s.sheetH = sh;
+    s.sheetNote = "- contact sheet: test\n";
+    s.useSheet = true;
+    r.shots.push_back(s);
+    std::string dir, err;
+    check(WriteBugReport(root.string(), r, "", dir, err), "a sheet report writes");
+    const std::string md = ReadAll(fs::path(dir) / "report.md");
+    check(md.find("### Shot 1 (22x6)") != std::string::npos &&
+              md.find("- contact sheet: test\n- eye: sheet\n") != std::string::npos,
+          "the sheet is the filed picture, its note ahead of the camera lines");
   }
   fs::remove_all(root, ec);
 

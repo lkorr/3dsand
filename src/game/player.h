@@ -415,7 +415,7 @@ class Player {
   // Live HUD readout: the lip probe runs EVERY walk frame — grounded, rising,
   // space or not — so the dev panel can say "a lip is in reach and here is the
   // latch gate that refused" rather than the player inferring it. Costs one
-  // LedgeGrabAhead per frame (~a hundred cell reads), nothing when flying.
+  // LedgeGrabAhead per frame (~two hundred cell reads), nothing when flying.
   bool ledgeInReach = false;  // a grabbable lip is within hand reach right now
   IVec3 ledgeLip{};           // which lip (valid while ledgeInReach or hanging)
   // Seconds spent in the current hang. The pull-up honours W only after

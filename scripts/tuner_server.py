@@ -943,6 +943,14 @@ class VoxServe:
         self.scratch_line = None
         self.scratch_map = None
         self.scratch_key = ""
+        # Bumped before a DUNGEON command is sent and again once scratch_key
+        # names it (odd = an install is under way). A region reads the key when
+        # it ARRIVES but runs only after the lock: if a new program went in
+        # between, its voxels would be cached under the OLD program's key and
+        # served whenever that dungeon is opened again (the Dungeons tab
+        # "stuck on the previous dungeon"). Such a region is answered, never
+        # cached.
+        self.scratch_gen = 0
 
     def _spawn(self, map_name, lock_timeout=180.0):
         if not os.path.isfile(EXE):
@@ -1106,6 +1114,7 @@ def _palette_key():
 
 
 _warm_lock = threading.Lock()
+_scratch_gen_lock = threading.Lock()
 _warm_busy = False
 
 
@@ -2222,6 +2231,7 @@ class Handler(BaseHTTPRequestHandler):
             ldig = _map_layers_region_digest(mname, ox, oy, oz, nx * lod, ny * lod, nz * lod)
         else:
             ldig = _layer_region_digest(layer, ox, oy, oz, nx * lod, ny * lod, nz * lod)
+        gen0 = _voxserve.scratch_gen
         scratch = _voxserve.scratch_key if _voxserve.scratch_map == mname else ""
         key = hashlib.sha1(("%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%s%s%s" % (
             ox, oy, oz, nx, ny, nz, lod, seed, sig, layer, ldig,
@@ -2284,12 +2294,13 @@ class Handler(BaseHTTPRequestHandler):
         # reply ~1.7x the size -- over a loopback hop the bytes are free and
         # the 35 ms is not (a cold dungeon view is hundreds of regions).
         packed = gzip.compress(blob, 1)
-        try:
-            with open(cached, "wb") as f:
-                f.write(packed)
-            _voxcache_sweep()
-        except OSError:
-            pass
+        if gen0 % 2 == 0 and _voxserve.scratch_gen == gen0:
+            try:
+                with open(cached, "wb") as f:
+                    f.write(packed)
+                _voxcache_sweep()
+            except OSError:
+                pass
         if want_gz:
             return self._send_blob(packed, gz=True)
         return self._send_blob(blob)
@@ -2313,12 +2324,22 @@ class Handler(BaseHTTPRequestHandler):
             seed = 1337
         os.makedirs(VOXTMP, exist_ok=True)
         if mode == "clear":
-            ok, msg = _voxserve.command("DUNGEON CLEAR", map_name=mname)
+            with _scratch_gen_lock:
+                _voxserve.scratch_gen |= 1              # odd: the program is changing
+            ok, msg = False, "DUNGEON CLEAR raised"
+            try:
+                ok, msg = _voxserve.command("DUNGEON CLEAR", map_name=mname)
+            finally:
+                if ok:
+                    _voxserve.scratch_line = None
+                    _voxserve.scratch_map = None
+                    _voxserve.scratch_key = ""
+                else:
+                    _voxserve.scratch_key = "?" + os.urandom(8).hex()
+                with _scratch_gen_lock:
+                    _voxserve.scratch_gen += 1
             if not ok:
                 return self._json(500, {"ok": False, "error": msg})
-            _voxserve.scratch_line = None
-            _voxserve.scratch_map = None
-            _voxserve.scratch_key = ""
             return self._json(200, {"ok": True, "cleared": True})
         if isinstance(b.get("shell"), dict):
             src = os.path.join(VOXTMP, "dungeon_scratch_shell.json")
@@ -2357,7 +2378,21 @@ class Handler(BaseHTTPRequestHandler):
             # dungeon fast path, voxregion.cpp), so it must be the current one.
             ok, msg = _voxserve.sync(_world_signature(mname), mname, REGION_LOCK_SEC)
             if ok:
-                ok, msg = _voxserve.command(line, map_name=mname, lock_timeout=REGION_LOCK_SEC)
+                with _scratch_gen_lock:
+                    _voxserve.scratch_gen |= 1          # odd: installing
+                installed = False
+                try:
+                    ok, msg = _voxserve.command(line, map_name=mname, lock_timeout=REGION_LOCK_SEC)
+                    installed = ok
+                finally:
+                    if not installed:
+                        # Busy = the lock was never taken, nothing changed. Any
+                        # other failure may have left the server holding we do
+                        # not know what: a key no cached region can carry.
+                        if not (not ok and msg.startswith("busy: ")):
+                            _voxserve.scratch_key = "?" + os.urandom(8).hex()
+                        with _scratch_gen_lock:
+                            _voxserve.scratch_gen += 1
         except LockBusy as e:
             return self._json(503, {"ok": False, "busy": True, "error": "busy: " + str(e)})
         except Exception as e:
@@ -2374,10 +2409,15 @@ class Handler(BaseHTTPRequestHandler):
             with open(src, "rb") as f:
                 content = f.read()
         except (OSError, ValueError) as e:
+            _voxserve.scratch_key = "?" + os.urandom(8).hex()
+            with _scratch_gen_lock:
+                _voxserve.scratch_gen += 1
             return self._json(500, {"ok": False, "error": repr(e)})
         _voxserve.scratch_line = line
         _voxserve.scratch_map = mname
         _voxserve.scratch_key = hashlib.sha1(line.encode("utf-8") + b"\0" + content).hexdigest()[:16]
+        with _scratch_gen_lock:
+            _voxserve.scratch_gen += 1                  # even: scratch_key names what is installed
         return self._json(200, out)
 
     # ---- the Dungeons tab (docs/PLAN_dungeons.md 5) -------------------------

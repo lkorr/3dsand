@@ -9,7 +9,9 @@
 // THE BUG REPORT (F12): screenshots + a description, filed into one folder.
 //
 //   F12        photograph the frame as presented (HUD, panels, TAA and all),
-//              then pause and open the report panel over it.
+//              then pause and open the report panel over it. The last second
+//              is kept too, as a 4x4 contact sheet (ui/framering.h); each
+//              picture's "1 s" toggle files the sheet instead of the still.
 //   add another  fold the panel away and give the game back; the next F12
 //              appends a picture to the SAME report. Shift+F12 opens the panel
 //              without taking one.
@@ -44,9 +46,12 @@ void DrawBugReport(UIState& s);
 // Append one screenshot (RGBA8, top row first) to the open report and build
 // its pixel-mosaic thumbnail. `where` is that picture's camera (eye, view,
 // crosshair, the `--at` line that starts the game there), written under its
-// heading in report.md.
+// heading in report.md. `sheet` (optional) is the last second as a contact
+// sheet (ui/framering.h) with `sheetNote` naming its tiles; the panel lets the
+// owner file that instead of the still, per picture.
 void BugReportAddShot(UIState& s, std::vector<uint8_t> rgba, uint32_t w, uint32_t h,
-                      std::string where);
+                      std::string where, std::vector<uint8_t> sheet = {},
+                      uint32_t sheetW = 0, uint32_t sheetH = 0, std::string sheetNote = {});
 
 // Write the report. With `r.target` empty: a NEW folder <root>/<stamp>/ with
 // report.md (the text, the shots inline, and `context` as a trailing section)

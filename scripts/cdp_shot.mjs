@@ -68,7 +68,7 @@ await cmd('Emulation.setDeviceMetricsOverride', {width: size[0], height: size[1]
 await cmd('Page.navigate', {url});
 await sleep(1500);
 for (const s of steps) {
-  if (s.run) { const r = await evalJs(s.run); if (r.error) console.error('cdp_shot: --run threw: ' + r.error); }
+  if (s.run) { const r = await evalJs(s.run); if (r.error) console.error('cdp_shot: --run threw: ' + r.error); else if (typeof r.value === 'string') console.log('cdp_shot: run -> ' + r.value); }
   if (s.wait) {
     // A wait that never comes true still gets its picture: leave 20 s of the
     // budget for the shots after it.

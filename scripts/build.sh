@@ -241,17 +241,33 @@ svlock_acquire_gpu "link:$(basename "$ROOT")"
 # game open). The tuner's /api/heightmap also launches the exe OUTSIDE this
 # lock (a ~150 ms GPU-free run per map redraw), so an instance can appear
 # mid-link; the link therefore retries ONCE after a second kill+wait.
+#
+# Only THIS tree's output exe is killed (by full path), never every image named
+# sandvox.exe: the link can only collide with the file it overwrites, and the
+# old machine-wide kill shot the owner's game (launched from the tuner in the
+# main checkout) whenever any worktree agent linked -- mid pipeline compile, so
+# the driver cache never got saved and every relaunch paid the compile again
+# (2026-10-10). Also [[gotcha-selftest-killed-by-image-name]].
+OUT_EXE_WIN="$(cygpath -w "$ROOT/build/$CONFIG/sandvox.exe" 2>/dev/null || echo "$ROOT/build/$CONFIG/sandvox.exe")"
+own_sandvox_pids() {
+  SV_EXE="$OUT_EXE_WIN" powershell -NoProfile -Command \
+    "Get-CimInstance Win32_Process -Filter \"Name='sandvox.exe'\" | Where-Object { \$_.ExecutablePath -and ([IO.Path]::GetFullPath(\$_.ExecutablePath) -ieq [IO.Path]::GetFullPath(\$env:SV_EXE)) } | ForEach-Object { \$_.ProcessId }" \
+    2>/dev/null | tr -d '\r'
+}
 kill_sandvox_and_wait() {
-  taskkill //F //IM sandvox.exe 2>/dev/null || true
-  local waited=0
-  while tasklist //FI "IMAGENAME eq sandvox.exe" 2>/dev/null | grep -q -i 'sandvox\.exe'; do
-    if [ "$waited" -ge 100 ]; then   # 10 s: something is not dying; link anyway
-      echo "build.sh: a sandvox.exe is still alive 10 s after taskkill; linking anyway" >&2
+  local pid pids
+  pids="$(own_sandvox_pids)"
+  [ -z "$pids" ] && return 0
+  for pid in $pids; do taskkill //F //PID "$pid" >/dev/null 2>&1 || true; done
+  local start=$SECONDS
+  while [ -n "$(own_sandvox_pids)" ]; do
+    if [ $(( SECONDS - start )) -ge 10 ]; then   # something is not dying; link anyway
+      echo "build.sh: $OUT_EXE_WIN is still running 10 s after taskkill; linking anyway" >&2
       break
     fi
-    sleep 0.1; waited=$(( waited + 1 ))
+    sleep 0.1
   done
-  [ "$waited" -gt 0 ] && echo "build.sh: waited $(( waited * 100 )) ms for the old sandvox.exe to exit"
+  echo "build.sh: killed this tree's running sandvox.exe ($pids) before linking"
   return 0
 }
 kill_sandvox_and_wait

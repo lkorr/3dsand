@@ -600,19 +600,17 @@ bool LoadBugShotMosaic(const std::string& path, uint32_t cells, uint32_t& w, uin
   return LoadMosaicWic(std::filesystem::path(path), cells, w, h, tw, th, thumb, err);
 }
 
-void BugReportAddShot(UIState& s, std::vector<uint8_t> rgba, uint32_t w, uint32_t h,
-                      std::string where) {
-  UIState::BugReportUI::Shot sh;
-  sh.w = w;
-  sh.h = h;
-  sh.where = std::move(where);
-  sh.tw = kThumbCells;
-  sh.th = std::max(1u, (uint32_t)std::lround((double)kThumbCells * h / std::max(1u, w)));
-  sh.thumb.resize((size_t)sh.tw * sh.th);
-  for (uint32_t ty = 0; ty < sh.th; ty++)
-    for (uint32_t tx = 0; tx < sh.tw; tx++) {
-      const uint32_t x0 = tx * w / sh.tw, x1 = std::max(x0 + 1, (tx + 1) * w / sh.tw);
-      const uint32_t y0 = ty * h / sh.th, y1 = std::max(y0 + 1, (ty + 1) * h / sh.th);
+// The panel's pixel mosaic of an RGBA8 picture: kThumbCells wide, each cell
+// the mean of the pixels under it.
+static void BuildThumb(const std::vector<uint8_t>& rgba, uint32_t w, uint32_t h, uint32_t& tw,
+                       uint32_t& th, std::vector<uint32_t>& thumb) {
+  tw = kThumbCells;
+  th = std::max(1u, (uint32_t)std::lround((double)kThumbCells * h / std::max(1u, w)));
+  thumb.resize((size_t)tw * th);
+  for (uint32_t ty = 0; ty < th; ty++)
+    for (uint32_t tx = 0; tx < tw; tx++) {
+      const uint32_t x0 = tx * w / tw, x1 = std::max(x0 + 1, (tx + 1) * w / tw);
+      const uint32_t y0 = ty * h / th, y1 = std::max(y0 + 1, (ty + 1) * h / th);
       uint64_t r = 0, g = 0, bl = 0, n = 0;
       for (uint32_t y = y0; y < y1 && y < h; y++)
         for (uint32_t x = x0; x < x1 && x < w; x++) {
@@ -623,11 +621,41 @@ void BugReportAddShot(UIState& s, std::vector<uint8_t> rgba, uint32_t w, uint32_
           n++;
         }
       n = std::max<uint64_t>(n, 1);
-      sh.thumb[(size_t)ty * sh.tw + tx] =
-          IM_COL32((int)(r / n), (int)(g / n), (int)(bl / n), 255);
+      thumb[(size_t)ty * tw + tx] = IM_COL32((int)(r / n), (int)(g / n), (int)(bl / n), 255);
     }
+}
+
+void BugReportAddShot(UIState& s, std::vector<uint8_t> rgba, uint32_t w, uint32_t h,
+                      std::string where, std::vector<uint8_t> sheet, uint32_t sheetW,
+                      uint32_t sheetH, std::string sheetNote) {
+  UIState::BugReportUI::Shot sh;
+  sh.w = w;
+  sh.h = h;
+  sh.where = std::move(where);
+  BuildThumb(rgba, w, h, sh.tw, sh.th, sh.thumb);
   sh.rgba = std::move(rgba);
+  if (!sheet.empty() && sheetW && sheetH) {
+    sh.sheetW = sheetW;
+    sh.sheetH = sheetH;
+    BuildThumb(sheet, sheetW, sheetH, sh.sheetTw, sh.sheetTh, sh.sheetThumb);
+    sh.sheet = std::move(sheet);
+    sh.sheetNote = std::move(sheetNote);
+    sh.useSheet = s.bug.preferSheet;
+  }
   s.bug.shots.push_back(std::move(sh));
+}
+
+// What a shot files: the still, or (when picked and held) the sheet, with
+// the sheet's tile ages ahead of the camera lines.
+struct Filed {
+  const std::vector<uint8_t>& px;
+  uint32_t w, h;
+  std::string where;
+};
+static Filed FiledShot(const UIState::BugReportUI::Shot& sh) {
+  if (sh.useSheet && !sh.sheet.empty())
+    return {sh.sheet, sh.sheetW, sh.sheetH, sh.sheetNote + sh.where};
+  return {sh.rgba, sh.w, sh.h, sh.where};
 }
 
 // The report's tags as stored: normalized, de-duplicated, in pick order.
@@ -661,10 +689,10 @@ bool AppendBugReport(const std::string& dirS, const UIState::BugReportUI& r, std
   std::string sections;
   std::vector<fs::path> written;
   for (size_t i = 0; i < r.shots.size(); i++) {
-    const auto& sh = r.shots[i];
+    const Filed sh = FiledShot(r.shots[i]);
     const int n = top + 1 + (int)i;
     const fs::path png = dir / ("shot_" + std::to_string(n) + ".png");
-    if (!WritePng(png, sh.rgba, sh.w, sh.h, err)) {
+    if (!WritePng(png, sh.px, sh.w, sh.h, err)) {
       for (const auto& p : written) fs::remove(p, ec);  // only the files THIS save made
       return false;
     }
@@ -716,8 +744,8 @@ bool WriteBugReport(const std::string& root, const UIState::BugReportUI& r,
     return false;
   }
   for (size_t i = 0; i < r.shots.size(); i++) {
-    const auto& sh = r.shots[i];
-    if (!WritePng(dir / ("shot_" + std::to_string(i + 1) + ".png"), sh.rgba, sh.w, sh.h, err))
+    const Filed sh = FiledShot(r.shots[i]);
+    if (!WritePng(dir / ("shot_" + std::to_string(i + 1) + ".png"), sh.px, sh.w, sh.h, err))
       return false;
   }
   const std::string text = TrimRight(r.text);
@@ -731,8 +759,10 @@ bool WriteBugReport(const std::string& root, const UIState::BugReportUI& r,
   if (!tags.empty()) md << "tags: " << JoinTags(tags) << "\n\n";
   md << (text.empty() ? std::string("(no description)") : text) << "\n\n";
   md << "## Screenshots\n\n";
-  for (size_t i = 0; i < r.shots.size(); i++)
-    md << BugReportShotSection((int)i + 1, r.shots[i].w, r.shots[i].h, r.shots[i].where);
+  for (size_t i = 0; i < r.shots.size(); i++) {
+    const Filed sh = FiledShot(r.shots[i]);
+    md << BugReportShotSection((int)i + 1, sh.w, sh.h, sh.where);
+  }
   md << "## Context (at the first shot)\n\n" << context;
   if (!md.good()) {
     err = "write report.md";
@@ -803,17 +833,24 @@ void DrawBugReport(UIState& s) {
     const uint32_t* px;
     int n;          // the number it has (or will have) in the ticket
     int removable;  // index into r.shots, or -1
+    bool hasSheet;  // a picture taken now with the last second held
   };
   std::vector<Pic> pics;
   int nextN = 1;
   if (cur)
     for (const auto& sh : cur->shots) {
-      pics.push_back({sh.tw, sh.th, sh.w, sh.h, sh.ok ? sh.thumb.data() : nullptr, sh.n, -1});
+      pics.push_back(
+          {sh.tw, sh.th, sh.w, sh.h, sh.ok ? sh.thumb.data() : nullptr, sh.n, -1, false});
       nextN = std::max(nextN, sh.n + 1);
     }
   for (size_t i = 0; i < r.shots.size(); i++) {
     const auto& sh = r.shots[i];
-    pics.push_back({sh.tw, sh.th, sh.w, sh.h, sh.thumb.data(), nextN + (int)i, (int)i});
+    const bool hasSheet = !sh.sheet.empty();
+    if (sh.useSheet && hasSheet)
+      pics.push_back({sh.sheetTw, sh.sheetTh, sh.sheetW, sh.sheetH, sh.sheetThumb.data(),
+                      nextN + (int)i, (int)i, true});
+    else
+      pics.push_back({sh.tw, sh.th, sh.w, sh.h, sh.thumb.data(), nextN + (int)i, (int)i, hasSheet});
   }
 
   ImGui::PushFont(ui::FontLarge());
@@ -1026,10 +1063,24 @@ void DrawBugReport(UIState& s) {
       std::snprintf(cap, sizeof cap, "#%d  %ux%u%s", p.n, p.w, p.h, isNew ? "  new" : "");
     else
       std::snprintf(cap, sizeof cap, "#%d", p.n);
+    // "1 s" files the contact sheet of the last second instead of the
+    // still (ui/framering.h); the choice carries to the next picture.
+    const float sheetBtnW = p.hasSheet ? 46.0f : 0.0f;
     ui::ShadowText(dl, ImVec2(a.x, a.y + p.th * cell + 6), isNew ? ui::ColGoldHi() : ui::ColParch(),
-                   Fit(cap, thumbW - (p.removable >= 0 ? 30.0f : 0.0f)).c_str());
+                   Fit(cap, thumbW - (p.removable >= 0 ? 30.0f : 0.0f) - sheetBtnW).c_str());
     if (p.removable >= 0) {
       ImGui::PushID((int)i);
+      if (p.hasSheet) {
+        auto& shot = r.shots[(size_t)p.removable];
+        if (ui::Button("##sheet", ImVec2(a.x + thumbW - 26 - sheetBtnW, a.y + p.th * cell + 4),
+                       "1 s", shot.useSheet)) {
+          shot.useSheet = !shot.useSheet;
+          r.preferSheet = shot.useSheet;
+        }
+        if (ImGui::IsItemHovered())
+          ui::Tip(shot.useSheet ? "filing the last 1 s as a 4x4 sheet; click for the single frame"
+                                : "filing the single frame; click for the last 1 s as a 4x4 sheet");
+      }
       if (ui::Button("##rm", ImVec2(a.x + thumbW - 26, a.y + p.th * cell + 4), "x"))
         r.wantRemove = p.removable;
       if (ImGui::IsItemHovered()) ui::Tip("remove this picture");

@@ -49,7 +49,7 @@ export function createStitchPage(T) {
   const S = {
     id: '', d: DG.newDungeon({name: 'Untitled', style: 'mines', seed: 1}), refs: [], about: '', A: [0, 0, 0],
     saved: '', prog: null, placed: [], sockets: [], links: [], broken: new Set(), issues: [], refIssues: [],
-    sel: null, tool: null, view: 'xray', ymin: null, ymax: null, isolate: false, world: null, showSug: false, showWay: false, labels: false,
+    sel: null, tool: null, view: 'xray', ymin: null, ymax: null, isolate: false, world: null, keepSurface: false, overlay: true, showSug: false, showWay: false, labels: false,
     proposal: null, cat: {mobs: [], schedules: [], loot: [], behaviors: [], keys: [], items: [], presets: {}},
     schedules: {}, schedDirty: new Set(), list: [], drop: null, drag: null, heights: null, infoKey: '', btab: 'valid', showInfo: false,
     grow: {count: 4, branch: 0.3, seed: 1, kit: '', types: null, close: true}
@@ -64,6 +64,11 @@ export function createStitchPage(T) {
   // READINESS (ready(), below): a compile or a preview queued on a timer, or a
   // preview() between its install and its ROI / refresh, is work not yet visible.
   let pendC = false, pendP = false, inPreview = false;
+  // Bumped by load(): an install that was already in flight when another
+  // dungeon opened resolves with the OLD program and must not claim the view
+  // (it set infoKey, so the new dungeon's install took the soft-refresh path:
+  // no invalidate, no reframe -- the view stayed on the previous dungeon).
+  let loadSeq = 0;
 
   /* =========================================================================
    * layout
@@ -120,12 +125,18 @@ export function createStitchPage(T) {
       const wv = view.wv; if (!wv) return;
       if (wv.cam.mode === 'orbit') { wv.cam.pos = wv.camEye(); wv.cam.mode = 'fly'; } else { const f = wv.camForward(); wv.cam.target = [0, 1, 2].map(i => wv.cam.pos[i] + f[i] * 80); wv.cam.dist = 80; wv.cam.mode = 'orbit'; }
       ui.cam.textContent = wv.cam.mode === 'orbit' ? 'orbit' : 'fly'; view.dirty = true; }}, 'orbit');
-    const tog = (label, key, title) => { const c = h('input', {type: 'checkbox', checked: S[key], onchange: () => { S[key] = c.checked; view.dirty = true; }}); return h('label', {title}, c, label); };
+    const tog = (label, key, title) => { const c = ui[key + 'Box'] = h('input', {type: 'checkbox', checked: S[key], onchange: () => { S[key] = c.checked; view.dirty = true; }}); return h('label', {title}, c, label); };
     ui.worldBox = h('span', {style: 'display:none'});
+    // In world, the ground over the dungeon is cut away by default (x-ray from
+    // above); "keep surface" leaves it on, so flying in through the entrance
+    // is what the game shows.
+    const surf = h('input', {type: 'checkbox', checked: S.keepSurface, onchange: () => { S.keepSurface = surf.checked; applyClip(); }});
+    ui.surfBox = h('label', {style: 'display:none', title: 'keep the terrain over the dungeon (fly in through the entrance as in the game); off = the ground above it is cut away'}, surf, 'keep surface');
     ui.vbar.append(mode('x-ray', 'xray', 'only the dungeon\'s own surfaces: rock is see-through'), mode('solid', 'solid', 'the rock block it is carved into'),
-                   mode('in world', 'world', 'the map\'s real terrain round the entrance, a hole cut down to the dungeon'), ui.worldBox,
+                   mode('in world', 'world', 'the map\'s real terrain round the entrance, a hole cut down to the dungeon'), ui.worldBox, ui.surfBox,
                    h('span', {}, ' y '), ui.ymin, ui.ymax, ui.yout, h('button', {onclick: () => { S.ymin = S.ymax = null; syncY(); applyClip(); }, title: 'all levels'}, 'all'),
                    ui.iso, ui.cam, h('button', {onclick: frameAll, title: 'F'}, 'frame'),
+                   tog('overlay', 'overlay', 'every box, socket, marker, label and the gizmo drawn over the voxels (off = just the voxels; H toggles)'),
                    tog('labels', 'labels', 'name every ref'), tog('waynodes', 'showWay', 'the generated walking graph'), tog('suggested', 'showSug', 'what the pieces suggest (doors, chests, traps, lights)'));
     for (const b of ui.vbar.querySelectorAll('button[data-v]')) b.classList.toggle('on', b.dataset.v === S.view);
   }
@@ -142,7 +153,7 @@ export function createStitchPage(T) {
     } else if (m === 'world') S.world = placementOf(sel);
     S.view = m;
     for (const b of ui.vbar.querySelectorAll('button[data-v]')) b.classList.toggle('on', b.dataset.v === m);
-    ui.worldBox.style.display = m === 'world' ? '' : 'none';
+    ui.worldBox.style.display = ui.surfBox.style.display = m === 'world' ? '' : 'none';
     if (m === 'world') renderWorldBox();
     S.infoKey = '';
     S.heights = null;
@@ -361,9 +372,10 @@ export function createStitchPage(T) {
     view.wv.mapName = place.mode === 'map' ? (place.map || '') : '';
     const slow = setTimeout(() => T.setStatus('installing the program in the voxel server: it is waiting for the machine-wide GPU lock (another sandvox run holds it)'), 1500);
     try {
+      const seq = loadSeq;
       const r = await pv.install(S.prog, place);
       clearTimeout(slow);
-      if (!r) return;
+      if (!r || seq !== loadSeq) return;
       T.setStatus('');
       S.info = r.info;
       const key = JSON.stringify(place);
@@ -394,7 +406,11 @@ export function createStitchPage(T) {
       if (pc) box = {min: pc.bounds.min.map(v => v - 2), max: pc.bounds.max.map(v => v + 2)};
     }
     const lo = S.ymin === null ? -Infinity : S.ymin, hi = S.ymax === null ? Infinity : S.ymax;
-    if (S.view === 'world') view.setClip('cut', box, lo, S.ymax === null ? -6 : hi);
+    // The streamed box's walls are the clip, not rock: never drawn (the owner
+    // read them as a stone cube round the dungeon, in "solid" too).
+    if (view.wv) view.wv.view.roiOpen = true;
+    if (S.view === 'world' && S.keepSurface && S.ymax === null) view.setClip('solid', null);
+    else if (S.view === 'world') view.setClip('cut', box, lo, S.ymax === null ? -6 : hi);
     else view.setClip(S.view === 'solid' ? 'solid' : 'xray', box, lo, hi);
     syncY();
   }
@@ -650,7 +666,7 @@ export function createStitchPage(T) {
   }
   function draw(D) {
     const P = S.prog;
-    if (!P) return;
+    if (!P || !S.overlay) return;
     const ghosts = ghostIds();
     const selP = S.sel && (S.sel.t === 'piece' ? S.sel.id : S.sel.t === 'socket' ? S.sel.piece : null);
     for (const pc of P.pieces) {
@@ -885,6 +901,7 @@ export function createStitchPage(T) {
     if (document.activeElement === view.canvas && 'wasdqe'.includes(k.toLowerCase()) && !e.ctrlKey) return;
     const s = S.sel;
     if (k === 'f' || k === 'F') { if (s) flyToSel(); else frameAll(); return; }
+    if ((k === 'h' || k === 'H') && !e.ctrlKey) { S.overlay = !S.overlay; if (ui.overlayBox) ui.overlayBox.checked = S.overlay; view.dirty = true; return; }
     if (!s) return;
     if (k === 'Delete' || k === 'Backspace') { e.preventDefault(); deleteSel(); return; }
     const step = e.shiftKey ? 10 : 1;
@@ -1450,6 +1467,7 @@ export function createStitchPage(T) {
     S.id = id; S.d = d; S.refs = rr.refs; S.about = rr.about; S.sel = null; S.proposal = null; S.tool = null; showGhost();
     try { S.A = DG.compile(d, {}).entrance.dungeonPos.slice(); } catch (e) { S.A = [0, 0, 0]; }
     S.saved = sig(); S.framed = false; S.infoKey = ''; S.ymin = S.ymax = null;
+    loadSeq++;
     hist.clear();
     ui.listSel.value = id;
     for (const r of S.refs) if ((r.kind === 'npc' || r.kind === 'spawner') && r.props.schedule) loadSchedule(r.props.schedule);

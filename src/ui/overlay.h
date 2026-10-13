@@ -1461,7 +1461,17 @@ struct UIState {
       uint32_t tw = 0, th = 0;       // the mosaic thumbnail, in cells
       std::vector<uint32_t> thumb;   // IM_COL32 order
       std::string where;             // markdown lines: the camera at THIS picture
+      // The last second as a contact sheet (ui/framering.h), taken with the
+      // still; `useSheet` picks which one is filed. Empty = no ring held.
+      uint32_t sheetW = 0, sheetH = 0;
+      std::vector<uint8_t> sheet;
+      uint32_t sheetTw = 0, sheetTh = 0;
+      std::vector<uint32_t> sheetThumb;
+      std::string sheetNote;         // markdown lines: tile layout + ages
+      bool useSheet = false;
     };
+    // The last still/sheet choice, offered to the next picture.
+    bool preferSheet = false;
     bool open = false;          // the panel is up: world paused, cursor free
     bool collecting = false;    // "add another": panel folded, F12 appends
     bool hideForShot = false;   // this frame is the photograph: draw none of it

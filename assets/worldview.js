@@ -402,6 +402,11 @@
     // over the box's footprint above max.y (real terrain round a hole down to
     // the dungeon).
     'uniform int uClipMode; uniform vec3 uClipMin; uniform vec3 uClipMax;',
+    // THE ROI IS NOT AIR (view.roiOpen): past the streamed box the server sends
+    // air, so the rock round a dungeon ends in six flat walls -- a stone cube
+    // the world does not have. With roiOpen a face whose air side lies outside
+    // the box is dropped: the block reads as cut away, not walled in.
+    'uniform int uRoiOpen; uniform vec3 uRoiMin; uniform vec3 uRoiMax;',
     'in vec3 vSample; flat in int vFace; in vec3 vWorld;',
     'out vec4 oCol;',
     '',
@@ -440,6 +445,8 @@
     '  if (uClipMode == 1 && (any(lessThan(vWorld, uClipMin)) || any(greaterThan(vWorld, uClipMax)))) discard;',
     '  if (uClipMode == 2 && vWorld.x >= uClipMin.x && vWorld.x <= uClipMax.x && vWorld.z >= uClipMin.z &&',
     '      vWorld.z <= uClipMax.z && vWorld.y > uClipMax.y) discard;',
+    '  if (uRoiOpen == 1) { vec3 a = vWorld + fn * 0.05;',
+    '    if (any(lessThan(a, uRoiMin)) || any(greaterThan(a, uRoiMax))) discard; }',
     '  if (uIsolate >= 0 && int(mat) != uIsolate) discard;',
     '  uint meta = texelFetch(uPal, ivec2(int(mat), 3), 0).r;',
     '  uint state = (w >> 12) & 15u;',
@@ -610,9 +617,12 @@
       //   roi   : null | {min, max}: the octree only grows nodes that touch this
       //           box, so a dungeon preview fetches the dungeon and not a ring
       //           of 512-voxel roots round it
+      //   roiOpen : faces whose air side is outside `roi` are not drawn (that
+      //           air is the clip, not the world: see uRoiOpen in FS_VOX)
       //   overlayOnTop : host overlay lines ignore depth (sockets through rock)
       clip: null,
       roi: null,
+      roiOpen: false,
       overlayOnTop: false
     };
     // SOFT REFRESH (refreshBox): a region whose staleSeq is past the seq it was
@@ -626,7 +636,11 @@
       pos: [0, 1040, -60], yaw: 0, pitch: -0.35,
       mode: 'fly',                // fly | orbit
       target: [0, 1024, 0], dist: 90,
-      speed: 40                   // voxels / second
+      speed: 40,                  // voxels / second
+      // Orbit WASD: false = slide the orbit point over the ground (a map);
+      // true = move it along the LOOK, pitch included (the Dungeons tab, where
+      // "down" is a direction you fly in, not a ground you walk on).
+      orbitAlongLook: false
     };
 
     this.edit = new EditLayer();
@@ -669,7 +683,8 @@
     this.progFar = makeProgram(gl, VS_FAR, FS_FAR, ['aPos', 'aCol', 'aNrm']);
     this.uVox = uniforms(gl, this.progVox,
       ['uMVP', 'uRegionOrigin', 'uLod', 'uVox', 'uPal', 'uDims', 'uEye', 'uLight',
-       'uAO', 'uGrid', 'uMode', 'uIsolate', 'uAlpha', 'uSeaY', 'uClipMode', 'uClipMin', 'uClipMax']);
+       'uAO', 'uGrid', 'uMode', 'uIsolate', 'uAlpha', 'uSeaY', 'uClipMode', 'uClipMin', 'uClipMax',
+       'uRoiOpen', 'uRoiMin', 'uRoiMax']);
     this.uLine = uniforms(gl, this.progLine, ['uMVP']);
     this.uFar = uniforms(gl, this.progFar, ['uMVP', 'uLight', 'uEye', 'uFade']);
     this.lineVBO = gl.createBuffer();
@@ -1686,6 +1701,10 @@
     gl.uniform1i(this.uVox.uClipMode, clip ? (clip.mode | 0) : 0);
     gl.uniform3fv(this.uVox.uClipMin, clip ? clip.min : [0, 0, 0]);
     gl.uniform3fv(this.uVox.uClipMax, clip ? clip.max : [0, 0, 0]);
+    var roiO = this.view.roiOpen && this.view.roi;
+    gl.uniform1i(this.uVox.uRoiOpen, roiO ? 1 : 0);
+    gl.uniform3fv(this.uVox.uRoiMin, roiO ? roiO.min : [0, 0, 0]);
+    gl.uniform3fv(this.uVox.uRoiMax, roiO ? roiO.max : [0, 0, 0]);
     gl.uniform1i(this.uVox.uVox, 0);
     gl.uniform1i(this.uVox.uPal, 1);
     gl.activeTexture(gl.TEXTURE1);
@@ -2240,12 +2259,15 @@
     var f = this.camForward();
     var right = screenRight(f);
     if (this.cam.mode === 'orbit') {
-      // Orbit: WASD slides the point you orbit over the ground, QE lifts it,
+      // Orbit: WASD slides the point you orbit over the ground (or along the
+      // look, cam.orbitAlongLook), QE lifts it,
       // at a pace that follows the zoom.
       var t = this.cam.target, fl = Math.hypot(f[0], f[2]) || 1;
-      var fx = f[0] / fl, fz = f[2] / fl, so = sp * Math.max(1, this.cam.dist / 60);
-      if (k['w']) { t[0] += fx * so; t[2] += fz * so; }
-      if (k['s']) { t[0] -= fx * so; t[2] -= fz * so; }
+      var free = this.cam.orbitAlongLook;
+      var fx = free ? f[0] : f[0] / fl, fy = free ? f[1] : 0, fz = free ? f[2] : f[2] / fl;
+      var so = sp * Math.max(1, this.cam.dist / 60);
+      if (k['w']) { t[0] += fx * so; t[1] += fy * so; t[2] += fz * so; }
+      if (k['s']) { t[0] -= fx * so; t[1] -= fy * so; t[2] -= fz * so; }
       if (k['d']) { t[0] += right[0] * so; t[2] += right[2] * so; }
       if (k['a']) { t[0] -= right[0] * so; t[2] -= right[2] * so; }
       if (k['e']) t[1] += so;

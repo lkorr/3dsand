@@ -222,7 +222,8 @@ struct Tuning {
     // LedgeGrabAhead + the hanging block in Player::Update).
     //
     // How far above the crown of the head the hands reach (meters). A 1.7 m
-    // body's standing reach is ~2.25 m, so ~0.55 past the top. Physical like
+    // body's standing reach is ~2.25 m, so ~0.55 past the top; the default
+    // 0.75 is deliberately generous (2026-10-11) so near misses catch. Physical like
     // stepUp, so voxel-size changes never change how much real wall is
     // grabbable. 0 disables ledge grabbing entirely.
     float ledgeReach = TPD(player, ledgeReach);
@@ -3986,8 +3987,10 @@ struct Tuning {
     // GUST STREAKS (wind_streak.wgsl; render-only, never hashed; live through
     // RenderParams, no F5). streakAlpha is the master visibility: 0 records
     // neither the update pass nor the draw. A streak is born only where the
-    // gust excess (the bands along the local mean, plus primitives) passes
-    // streakThreshold m/s, with certainty by threshold + streakSpan; it lives
+    // wind SPEED (windAt: shelter, primitives, heat) passes streakThreshold
+    // m/s, with certainty by threshold + streakSpan, anywhere in a volume from
+    // the ground to streakRadius over the eye (since 2026-10-11; it was the
+    // gust excess in a 0.2-6.2 m surface band); it lives
     // streakLife s within streakRadius m of the camera, drawn as a ribbon of
     // streakTrail points pushed every streakSpacing s, streakWidth m wide.
     float streakAlpha = TPD(wind, streakAlpha);

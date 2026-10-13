@@ -473,14 +473,20 @@ bool LedgeGrabAhead(const Vec3& pos, const Vec3& dir, const Player::Box& b,
   const int yLo = ifloor(pos.y + 0.5f * Player::kHalfY);
   const int yHi = ifloor(pos.y + Player::kHalfY + reachUp);
   // Depths from the COLLISION box face (that is what is pressed against the
-  // wall); lateral hand columns at the FIGURE's shoulder width, since the
-  // hands are art and reach past the box.
-  const float depths[2] = {b.hx + 0.6f, b.hx + 1.4f};
-  const float lats[3] = {0.0f, -0.6f * Player::kHalfXZ, 0.6f * Player::kHalfXZ};
+  // wall); lateral hand columns out to the FIGURE's full width, since the
+  // hands are art and reach past the box. The probe used to stop 1.4 voxels
+  // past the face at +-0.6 of the half-width, so a jump that drifted a hand's
+  // width short of the wall, or caught it on a hand rather than square, found
+  // nothing (owner 2026-10-11: "too narrow"). It now reaches ~35 cm out and
+  // across the whole body; a lip caught at depth draws the body in to it
+  // (the anchor below), so the hang still looks pressed to the wall.
+  const float depths[4] = {b.hx + 0.6f, b.hx + 1.4f, b.hx + 2.4f, b.hx + 3.5f};
+  const float lats[5] = {0.0f, -0.6f * Player::kHalfXZ, 0.6f * Player::kHalfXZ,
+                         -1.0f * Player::kHalfXZ, 1.0f * Player::kHalfXZ};
 
   bool found = false;
   IVec3 bestLip{};
-  float bestAx = 0, bestAz = 0, bestLat = 0;
+  float bestAx = 0, bestAz = 0, bestLat = 0, bestAhead = 0;
   for (float ahead : depths) {
     for (float lat : lats) {
       const float ax = pos.x + dir.x * ahead + perp.x * lat;
@@ -505,6 +511,7 @@ bool LedgeGrabAhead(const Vec3& pos, const Vec3& dir, const Player::Box& b,
           bestAx = ax;
           bestAz = az;
           bestLat = lat;
+          bestAhead = ahead;
         }
         break;  // solid with solid above: wall past reach, column refuses
       }
@@ -516,11 +523,15 @@ bool LedgeGrabAhead(const Vec3& pos, const Vec3& dir, const Player::Box& b,
     out->lip = bestLip;
     // Dangle straight down from where the winning hand caught: same x/z as
     // the body (shifted to the hand's column), head ledgeHangDrop below the
-    // lip. No pull toward the wall — the sweep-driven settle cannot penetrate
-    // anything, and drifting the body sideways on latch reads as suction.
-    out->anchor = {pos.x + perp.x * bestLat,
+    // lip. Toward the wall only by how much farther out than the nearest
+    // probe the lip was caught (0 for a body already pressed to the face):
+    // a hand catching a lip at arm's length pulls the body in, it does not
+    // dangle in mid-air. The sweep-driven settle cannot penetrate anything,
+    // so an over-estimate just stops at the face.
+    const float pullIn = bestAhead - depths[0];
+    out->anchor = {pos.x + perp.x * bestLat + dir.x * pullIn,
                    lipTop - T().ledgeHangDrop / kVoxelMeters - Player::kHalfY,
-                   pos.z + perp.z * bestLat};
+                   pos.z + perp.z * bestLat + dir.z * pullIn};
     // Standing on the lip, centered over the probe point — the same shape
     // WaterLedgeAhead hands back, consumed by the same mantle.
     out->stand = {bestAx, lipTop + Player::kHalfY, bestAz};
