@@ -1468,3 +1468,11 @@ lattice while the wound model works on the skin lattice
 (`LimbArtVoxelCount`), and a 4-8 m/s cut is shallow by tuning (`gore.cutDepth`
 0.08 + 0.15 x power, unchanged since 09-14). Counting art voxels would make E
 pass at its current depth. That is a change to the claim, so it was not made.
+
+## 2026-10-12 — baseline repair wave: what stays known-failing (orchestrator)
+
+Merged on `baseline-repair` (7 worktree packages): 26 of the 30 inherited reds are green, determinism ef7d9a06 unmoved. Four are marked `fail` in baseline.json pending OWNER decisions, each attributed above:
+- rain-fire — clear-sky arm is a coin flip on a one-voxel leaf sheet (30..71% across 5 sites); options: run 800 ticks / floor ~25% / thicker fuel bed. See "Baseline repair C".
+- waterbody (pass N arm 2) — a player-dug pool splits into two components and the relevel counts 0 surface columns; water-relevel design work. See "Baseline repair C".
+- swing-plane E — the swing wounds (hp 1107 -> 1092.6) but cuts ~0.1 vox deep, never emptying a collider cell the gate counts; introduced in 5a23e96..e959c65 (demons D5 / fight64 round 3 S, F, C). See "combat package E".
+- damage-sources — the fixture's left forearm stands in the stone's path, so the cuirass is never struck; introduced in 9848dbd..1dd67ac, pose vs fixture is the owner's call. See "combat package E".
