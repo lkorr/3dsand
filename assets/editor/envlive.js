@@ -196,6 +196,12 @@ export const LIVE = {
     'planes.height': R('mapHeightAt: the AUTHORED absolute height, i16 voxels on 2^log2 posts, Catmull-Rom; tiles planes/height/<tx>_<tz>.svt'),
     'planes.biome': R('mapBiomeAt / biomeMixAt: biome cells of 2^log2 voxels; tiles planes/biome/<tx>_<tz>.svt'),
     'ridges[]': N('editor', 'baked into planes.height; the engine reads the plane'),
+    // map v2 E3 (9159815): loaded + validated by LoadWorldMap, but neither
+    // shapes worldgen -- data for the map page and later systems.
+    'regions[]': R('worldmap.cpp LoadWorldMap (WorldMapData::Region): named polygons {id, name, colour, points [[x, z]...]}, validated at load; worldmap::RegionAt answers which region a column is in. Data only: nothing in worldgen reads them'),
+    'markers[]': R('worldmap.cpp LoadWorldMap (WorldMapData::Marker): map annotations {id, name, icon, at [x, z]}, validated at load (an unknown icon is a warning). Data only: nothing in worldgen reads them'),
+    // PLAN_dungeons §3.1: the map places its dungeons.
+    'dungeons[]': R('worldmap.cpp ParseDungeons (DungeonDef): {id, name?, dungeon (the assets/dungeons/<dir>), at [x, z] anchor column, yOffset?, yaw (quarter turns)} -- each placed dungeon’s shell is carved into worldgen through the dungeon layer (docs/PLAN_dungeons.md)'),
     // docs/PLAN_worldbuilder.md W1: rivers and lakes in the engine; ranges /
     // climate / gen are the editor's own re-bake inputs (2.4).
     'rivers[]': R('worldbuilder W1 rivers: {id, name?, points [[x, z, w, d] | [x, z]...] source first, smooth?, bed?, joins?, stepVox?, bank?, profile? U|V} -- worldwater.cpp bakes the surface from the bare ground (running min, flat reaches stepping down by stepVox, the mouth at the sea / the lake / the parent it joins) and cuts kSiteRiver pieces; waterApply carves the channel, holds the banks and builds a weir at every step, so the water is born at rest (DESIGN.md, the world map rivers)'),
