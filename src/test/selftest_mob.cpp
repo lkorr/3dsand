@@ -15452,6 +15452,641 @@ Status GateNetPlayerMelee(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- net-shield ------------------------------------------------------------
+//
+// SHIELDS ACROSS THE WIRE (2026-10-13; game/mob_shield.cpp, melee.cpp
+// ResolveShieldBlock / ChipShield). net-melee's two machines: A (the suite's
+// systems, THE REAL TICK) owns a creature with a sword and a round shield; B
+// holds it as a ghost and owns the wielder that strikes it. Claims:
+//
+//   A. DRESSED AND RAISED AS ITS OWNER HAS IT. B's ghost holds the shield as a
+//      shield in the same rig slot; raised on A, the ghost's shield sits where
+//      A's streamed pose put it, and reads as a guard to B's watchers
+//      (MobPose::kShieldUp -> Mob::ShieldUpForWatchers).
+//   B. THE ATTACKER JUDGES THE BLOCK, THE OWNER PAYS. A blade swept on B
+//      through the ghost's boards is ARRESTED on B (a shield BlockEvent), the
+//      ghost's shield is chipped there as presentation with no gore submitted,
+//      and one record is queued; on A the real shield loses hp and voxels, a
+//      shield BlockEvent is pushed, the parry is counted, and the body behind
+//      it is untouched.
+//   C. A HEAVY BLOW BEATS THE GUARD OPEN ON THE OWNER, and the ghost shows it:
+//      a mace swept on B staggers A's shield (still wanted up, it falls), and
+//      once the poses cross the ghost no longer reads as guarding.
+//   D. A BREAK REACHES THE GHOST. Worn down on A, the next block from B breaks
+//      it there; the LIVE creature's gear change re-sends its announce
+//      (MobSystem::GearKeyOf) and B's ghost lets go of the shield -- and keeps
+//      its sword -- owning no debris for it.
+// Leaves the suite as net-melee does.
+Status GateNetShield(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.SetNextIdCounter(1);
+  c.mobs.SetItems(&c.items);
+  c.mobs.MeleeWire() = MobSystem::MeleeWireStats{};
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int defIndex = AiHumanoidDef(c.mobs);
+  const ItemDef* sword = c.items.Named("sword");
+  const ItemDef* round = c.items.Named("round_shield");
+  if (defIndex < 0 || sword == nullptr || round == nullptr) {
+    detail = "no held_right humanoid def, or no sword / round_shield item";
+    return Status::Fail;
+  }
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  constexpr uint32_t kPeer = 1;
+
+  // ---- machine B (net-melee's construction) -------------------------------
+  Physics farPhys;
+  farPhys.Init();
+  DebrisSystem farDebris;
+  farDebris.Init(&farPhys, &c.world, c.mats, c.reactions);
+  farDebris.SetMicroSet(c.debris.MicroSet());
+  farDebris.SetLocalPlayerId(kPeer);
+  MobSystem far;
+  far.Init(&farPhys, &c.world, &farDebris, c.mats, c.reactions);
+  far.SetMicroSet(c.mobs.MicroSet());
+  far.SetDefFactory(c.mobs.DefFactory());
+  far.SetDefs(std::vector<MobDef>(c.mobs.Defs()));
+  far.SetBehaviors(ai::Library(c.mobs.Behaviors()));
+  far.SetAttackStyles(StyleLibrary(c.mobs.AttackStyles()));
+  far.SetItems(&c.items);
+  far.SetLocalPlayerId(kPeer);
+  far.SetIdBand(kPeer);
+
+  const IVec3 pchunk{spot.x >> 4, spot.y >> 4, spot.z >> 4};
+  ::net::EntitySync entA, entB;
+  entA.Connect(0, kPeer);
+  entB.Connect(kPeer, 0);
+  {
+    ::net::PeerView mine{0, pchunk, c.world.WindowOrigin(), true};
+    ::net::PeerView peer{kPeer, pchunk, c.world.WindowOrigin(), true};
+    entA.SetPeers(mine, &peer);
+    entB.SetPeers(peer, &mine);
+  }
+  auto cleanup = [&]() {
+    far.Reset();
+    farDebris.Reset();
+    c.mobs.ClearAttackRequests();
+    c.mobs.ClearBlockEvents();
+    c.debris.Reset();
+    c.mobs.Reset();
+    c.mobs.MeleeWire() = MobSystem::MeleeWireStats{};
+  };
+
+  uint32_t tick = 9700;
+  uint64_t bAuthored = 0;
+  support::TickCursor stepA{c, tick, pchunk};
+  ::net::EntityBatch toA;
+  auto cross = [](::net::EntitySync& from, MobSystem& m, DebrisSystem& d,
+                  uint32_t label) {
+    ::net::EntityBatch out;
+    from.Build(m, d, label, out);
+    std::vector<uint8_t> bytes;
+    out.Encode(bytes);
+    ::net::EntityBatch in;
+    in.Decode(bytes.data(), bytes.size());
+    return in;
+  };
+  // B's block events, collected across steps (B runs no frame loop to drain).
+  int shieldBlocksOnA = 0;
+  auto step = [&]() {
+    entA.NoteRemote(::net::EntityBatch(toA));
+    entA.ApplyForTick(tick + 1, c.mobs, c.debris, nullptr);
+    stepA.chunk = pchunk;
+    stepA();
+    for (const BlockEvent& ev : c.mobs.BlockEvents())
+      if (ev.shield) shieldBlocksOnA++;
+    c.mobs.ClearBlockEvents();
+    entB.NoteRemote(cross(entA, c.mobs, c.debris, tick));
+    entB.ApplyForTick(tick, far, farDebris, nullptr);
+    std::vector<ParticleSpawn> bSp;
+    std::vector<CellOp> bCells;
+    std::vector<BrushOp> bOps;
+    far.PreTick(tick, c.world, bOps, bCells, bSp);
+    farDebris.PreTick(tick, c.world, bCells, bSp);
+    // DIRECT PHASE CALLS ON PURPOSE (W2-O): net-melee's reason -- B has no
+    // session; this is the one call TickAuthority makes for it.
+    ApplyRemoteMeleeHits(farPhys, far, farDebris, c.world, bSp, tick);
+    farPhys.Step(kTickDt);
+    farDebris.PostStep();
+    far.PostStep();
+    bAuthored += bOps.size() + bCells.size();
+    toA = cross(entB, far, farDebris, tick + 1);
+  };
+  MeleeTuning mt;
+  ApplyMeleeTuning(mt, CurrentTuning());
+
+  std::string why;
+  const uint64_t subject =
+      AiSpawn(c, defIndex, {spot.x, spot.y + 1, spot.z}, "dummy", why);
+  if (subject == 0 || !c.mobs.EquipItem(subject, sword) ||
+      !c.mobs.EquipItem(subject, round, "held_left")) {
+    detail = why.empty() ? "fixture: spawn or equip refused" : why;
+    cleanup();
+    return Status::Fail;
+  }
+  const uint64_t wielderId =
+      far.Spawn(defIndex, {spot.x + 12, spot.y + 1, spot.z + 12});
+  far.SetMobOwner(wielderId, kPeer);
+  for (int i = 0; i < 10; i++) step();
+  Mob* sm = c.mobs.FindMobById(subject);
+  const Mob* ghost = far.FindMobById(subject);
+  if (sm == nullptr || ghost == nullptr || !ghost->IsGhost() ||
+      far.FindMobById(wielderId) == nullptr) {
+    detail = "fixture: no subject on A or no ghost of it on B";
+    cleanup();
+    return Status::Fail;
+  }
+  // The body behind the shield: the base limbs only (a shield and a sword
+  // are appended slots), every voxel of them.
+  auto flesh = [](MobSystem& m, uint64_t id) {
+    const Mob* mm = m.FindMobById(id);
+    int64_t n = 0;
+    for (int li = 0; mm != nullptr && li < mm->AppendedBase(); li++)
+      n += m.LimbSkinVoxelCount(id, li);
+    return n;
+  };
+  // A blade swept on B through the GHOST's shield, from in front of its face
+  // (local +X) to behind it in one tick (8 voxels: past full speed), an edge
+  // 0.8 voxels long across the boards at local height `yOff` off the centre.
+  auto sweepShieldOnB = [&](float yOff, const StrikeProfile& prof,
+                            std::vector<ParticleSpawn>& spawns,
+                            EdgeSweepResult& res) -> bool {
+    const Mob* g = far.FindMobById(subject);
+    const int gs = g != nullptr ? g->HeldSlot(Hand::Left) : -1;
+    BodyTransform xf{};
+    if (gs < 0 || !farPhys.GetTransform(far.LimbBody(subject, gs), xf))
+      return false;
+    const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+    const float sc = (float)std::max(1u, round->scale);
+    const float cy = round->size.y * 0.5f / sc, cz = round->size.z * 0.5f / sc;
+    auto W = [&](float x, float y, float z) {
+      return xf.pos + QuatRotate(q, Vec3{x, y, z});
+    };
+    EdgeSweep sw;
+    sw.aPrev = W(5.0f, cy + yOff, cz - 0.4f);
+    sw.bPrev = W(5.0f, cy + yOff, cz + 0.4f);
+    sw.aNow = W(-3.0f, cy + yOff, cz - 0.4f);
+    sw.bNow = W(-3.0f, cy + yOff, cz + 0.4f);
+    sw.dt = kTickDt;
+    sw.halfWidth = 0.15f;
+    sw.strike = prof;
+    sw.tick = tick;
+    sw.valid = true;
+    res = MeleeSweepDamage(sw, mt, *far.FindMobById(wielderId), farPhys, far,
+                           farDebris, c.world, spawns);
+    return true;
+  };
+  StrikeProfile swordHit;
+  swordHit.cut = 14.0f;
+  swordHit.blunt = 2.0f;
+  StrikeProfile maceHit;
+  maceHit.blunt = 16.0f;
+  maceHit.armorBreak = 0.8f;
+
+  // ======== A: dressed and raised as its owner has it =====================
+  sm->SetShieldWant(true);
+  for (int i = 0; i < 12; i++) step();
+  ghost = far.FindMobById(subject);
+  const int slotA = sm->HeldSlot(Hand::Left);
+  const int slotB = ghost != nullptr ? ghost->HeldSlot(Hand::Left) : -1;
+  const bool sameSlot = slotA >= 0 && slotB == slotA && ghost->IsShieldSlot(slotB) &&
+                        ghost->SlotName(slotB) == sm->SlotName(slotA);
+  double placeErr = -1.0;
+  if (sameSlot) {
+    BodyTransform xa{}, xb{};
+    if (c.phys.GetTransform(c.mobs.LimbBody(subject, slotA), xa) &&
+        farPhys.GetTransform(far.LimbBody(subject, slotB), xb))
+      placeErr = (xa.pos - xb.pos).len();
+  }
+  const bool raisedA = sm->ShieldRaise() >= 1.0f;
+  const bool guardB = ghost != nullptr && ghost->ShieldUpForWatchers();
+  const double placeTol = BaselineNumber("netShieldPlaceVox", 0.25);
+  const bool okA = sameSlot && raisedA && guardB && placeErr >= 0.0 &&
+                   placeErr <= placeTol;
+
+  // ======== B: the attacker judges the block, the owner pays ===============
+  bool okB = false, arrestedB = false, eventB = false;
+  float hpA0 = 0, hpA1 = 0;
+  uint32_t voxA0 = 0, voxA1 = 0, voxB0 = 0, voxB1 = 0;
+  int64_t fleshA0 = 0, fleshA1 = 0;
+  uint64_t queuedB = 0, parriesA = 0;
+  size_t goreB = 0;
+  int blocksA = 0;
+  if (okA) {
+    hpA0 = c.mobs.LimbHp(subject, slotA);
+    voxA0 = c.mobs.LimbVoxelCount(subject, slotA);
+    voxB0 = far.LimbVoxelCount(subject, slotB);
+    fleshA0 = flesh(c.mobs, subject);
+    const uint64_t q0 = far.MeleeWire().queued;
+    const uint64_t p0 = c.mobs.MeleeWire().parries;
+    far.ClearBlockEvents();
+    std::vector<ParticleSpawn> sp;
+    EdgeSweepResult r;
+    if (sweepShieldOnB(1.5f, swordHit, sp, r)) {
+      arrestedB = r.arrested && r.block.shield && r.block.blockerId == subject;
+      for (const BlockEvent& ev : far.BlockEvents())
+        eventB = eventB || (ev.shield && ev.blockerId == subject);
+      goreB = sp.size();
+      voxB1 = far.LimbVoxelCount(subject, slotB);
+      queuedB = far.MeleeWire().queued - q0;
+      shieldBlocksOnA = 0;
+      for (int i = 0; i < 3; i++) step();
+      blocksA = shieldBlocksOnA;
+      parriesA = c.mobs.MeleeWire().parries - p0;
+      hpA1 = c.mobs.LimbHp(subject, slotA);
+      voxA1 = c.mobs.LimbVoxelCount(subject, slotA);
+      fleshA1 = flesh(c.mobs, subject);
+    }
+    okB = arrestedB && eventB && voxB1 < voxB0 && goreB == 0 && queuedB == 1 &&
+          parriesA == 1 && blocksA >= 1 && hpA1 < hpA0 && voxA1 < voxA0 &&
+          fleshA1 == fleshA0;
+  }
+
+  // ======== C: a heavy blow beats the guard open on the owner =============
+  bool okC = false, arrestedC = false, staggerA = false, fellA = false,
+       guardAfter = true;
+  if (okA) {
+    sm->SetShieldWant(true);
+    std::vector<ParticleSpawn> sp;
+    EdgeSweepResult r;
+    if (sweepShieldOnB(-1.5f, maceHit, sp, r)) {
+      arrestedC = r.arrested && r.block.shield;
+      // The record reaches A two ticks after the blow (B's Build, then A's
+      // tick); a beaten guard drops at twice the lowering rate, so three
+      // ticks more puts the round shield (5-tick lower) well down.
+      for (int i = 0; i < 5; i++) step();
+      staggerA = sm->ShieldStaggerTicks() > 0;
+      fellA = sm->ShieldWant() && sm->ShieldRaise() < 0.5f;
+      for (int i = 0; i < 2; i++) step();
+      ghost = far.FindMobById(subject);
+      guardAfter = ghost != nullptr && ghost->ShieldUpForWatchers();
+    }
+    okC = arrestedC && staggerA && fellA && !guardAfter;
+  }
+
+  // ======== D: a break reaches the ghost ===================================
+  bool okD = false, brokeA = false, ghostLetGo = false, ghostKeptSword = false;
+  int wears = 0;
+  uint64_t reannounces = 0;
+  uint32_t bOwned0 = farDebris.BodyCount() - farDebris.GhostCount();
+  uint32_t bOwned1 = bOwned0;
+  if (okA) {
+    // DIRECT PHASE CALLS ON PURPOSE (W2-O): the owner's own wear, applied
+    // straight to the shield so the break lands on the NEXT peer blow
+    // rather than on whichever of twenty swept ones the holes allow.
+    while (wears < 40 && sm->HoldsShield() &&
+           c.mobs.LimbHp(subject, sm->HeldSlot(Hand::Left)) > 4.0f) {
+      const int s = sm->HeldSlot(Hand::Left);
+      BodyTransform xf{};
+      c.phys.GetTransform(c.mobs.LimbBody(subject, s), xf);
+      c.mobs.ApplyShieldBlock(*sm, s, xf.pos, Vec3{0, 0, 1}, swordHit, 1.0f,
+                              200.0f, 1.0f);
+      wears++;
+    }
+    c.mobs.ClearBlockEvents();
+    for (int i = 0; i < 2; i++) step();
+    const uint64_t re0 = entA.Stats().gearReannounces;
+    sm->ClearLostGear();
+    std::vector<ParticleSpawn> sp;
+    EdgeSweepResult r;
+    sweepShieldOnB(0.6f, swordHit, sp, r);
+    for (int i = 0; i < 3; i++) step();
+    bool brokenReported = false;
+    for (const Mob::LostGear& lg : sm->LostGearEvents())
+      brokenReported = brokenReported || (lg.broken && lg.item == round->name);
+    brokeA = !sm->HoldsShield() && brokenReported;
+    for (int i = 0; i < 4; i++) step();
+    ghost = far.FindMobById(subject);
+    ghostLetGo = ghost != nullptr && !ghost->HoldsShield() &&
+                 ghost->HeldSlot(Hand::Left) < 0;
+    ghostKeptSword = ghost != nullptr && ghost->HeldSlot(Hand::Right) >= 0 &&
+                     ghost->HeldItem(Hand::Right) == sword->name;
+    reannounces = entA.Stats().gearReannounces - re0;
+    bOwned1 = farDebris.BodyCount() - farDebris.GhostCount();
+    okD = brokeA && ghostLetGo && ghostKeptSword && reannounces >= 1 &&
+          bOwned1 == bOwned0;
+  }
+
+  const bool okNoOps = bAuthored == 0;
+  const bool ok = okA && okB && okC && okD && okNoOps;
+  detail = Format(
+      "A dressed+raised=%d (slot A %d / B %d shield %d, place %.3f vox (tol "
+      "%.2f), raised on A %d, guard on B %d) | B block=%d (arrested on B %d, "
+      "B event %d, ghost shield vox %u->%u, B gore %zu, queued %llu | A shield "
+      "hp %.1f->%.1f vox %u->%u, parries %llu, shield blocks on A %d, flesh "
+      "%lld->%lld) | C stagger=%d (arrested %d, staggered on A %d, fell %d, "
+      "ghost guard after %d) | D break=%d (%d wears, broke on A %d, ghost let go "
+      "%d, kept sword %d, gear re-announces %llu, B owned %u->%u) | B authored "
+      "%llu ops",
+      okA ? 1 : 0, slotA, slotB, sameSlot ? 1 : 0, placeErr, placeTol,
+      raisedA ? 1 : 0, guardB ? 1 : 0, okB ? 1 : 0, arrestedB ? 1 : 0,
+      eventB ? 1 : 0, voxB0, voxB1, goreB, (unsigned long long)queuedB,
+      (double)hpA0, (double)hpA1, voxA0, voxA1, (unsigned long long)parriesA,
+      blocksA, (long long)fleshA0, (long long)fleshA1, okC ? 1 : 0,
+      arrestedC ? 1 : 0, staggerA ? 1 : 0, fellA ? 1 : 0, guardAfter ? 1 : 0,
+      okD ? 1 : 0, wears, brokeA ? 1 : 0, ghostLetGo ? 1 : 0,
+      ghostKeptSword ? 1 : 0, (unsigned long long)reannounces, bOwned0,
+      bOwned1, (unsigned long long)bAuthored);
+  std::printf("net-shield: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  cleanup();
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- net-player-shield -----------------------------------------------------
+//
+// A PEER PLAYER'S SHIELD (2026-10-13). net-player-melee's two machines: A (the
+// suite's systems) holds a RemotePlayers ghost of B's player and an NPC of its
+// own, the wielder; B (a second MobSystem on its own Physics) has a registered
+// PlayerAvatar holding a sword and a round shield, its raise stepped as B's
+// session steps it. Claims:
+//
+//   A. DRESSED AS ITS OWNER. A's ghost of B holds the shield as a shield in
+//      the rig slot B's avatar holds it in.
+//   B. RAISED, IT IS A GUARD ON THE FAR SIDE. B raises (Mob::SetShieldWant +
+//      StepShield, the session's two calls); A's ghost reads as guarding
+//      (MobPose::kShieldUp) and A's NPCs see the peer actor as ai::Action::
+//      Guard (RemotePlayersAppendActors).
+//   C. A BLOW ON A PEER'S SHIELD IS THE PEER'S. A blade swept on A through the
+//      ghost's raised shield is ARRESTED on A and chipped there as
+//      presentation; the record reaches B, whose shield loses hp and voxels,
+//      the parry counted -- and B's body behind it untouched.
+// Leaves the suite as net-player-melee does.
+Status GateNetPlayerShield(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.SetNextIdCounter(1);
+  c.mobs.SetItems(&c.items);
+  c.mobs.MeleeWire() = MobSystem::MeleeWireStats{};
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int defIndex = AiHumanoidDef(c.mobs);
+  const ItemDef* sword = c.items.Named("sword");
+  const ItemDef* round = c.items.Named("round_shield");
+  if (defIndex < 0 || sword == nullptr || round == nullptr) {
+    detail = "no held_right humanoid def, or no sword / round_shield item";
+    return Status::Fail;
+  }
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot =
+      AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  constexpr uint32_t kPeer = 1;
+  const IVec3 pchunk{spot.x >> 4, spot.y >> 4, spot.z >> 4};
+
+  // ---- machine B (net-player-melee's construction) ------------------------
+  Physics farPhys;
+  farPhys.Init();
+  DebrisSystem farDebris;
+  farDebris.Init(&farPhys, &c.world, c.mats, c.reactions);
+  farDebris.SetMicroSet(c.debris.MicroSet());
+  farDebris.SetLocalPlayerId(kPeer);
+  MobSystem far;
+  far.Init(&farPhys, &c.world, &farDebris, c.mats, c.reactions);
+  far.SetMicroSet(c.mobs.MicroSet());
+  far.SetDefFactory(c.mobs.DefFactory());
+  far.SetDefs(std::vector<MobDef>(c.mobs.Defs()));
+  far.SetBehaviors(ai::Library(c.mobs.Behaviors()));
+  far.SetAttackStyles(StyleLibrary(c.mobs.AttackStyles()));
+  far.SetItems(&c.items);
+  far.SetIdBand(kPeer);
+  far.SetLocalPlayerId(kPeer);
+  far.MeleeWire() = MobSystem::MeleeWireStats{};
+
+  ::net::EntitySync entA, entB;
+  entA.Connect(0, kPeer);
+  entB.Connect(kPeer, 0);
+  {
+    ::net::PeerView va{0, pchunk, c.world.WindowOrigin(), true};
+    ::net::PeerView vb{kPeer, pchunk, c.world.WindowOrigin(), true};
+    entA.SetPeers(va, &vb);
+    entB.SetPeers(vb, &va);
+  }
+  PlayerAvatar avB;
+  avB.Init(&farPhys, &c.world, &farDebris, c.mats, &far);
+  avB.SetDefs(&far.Defs(), kAvatarDefName);
+  RemotePlayers remotes;
+  RemotePlayer& rb = remotes.Upsert(kPeer);
+  auto cleanup = [&]() {
+    remotes.Clear(c.phys);
+    c.mobs.SetAvatars({});
+    far.SetAvatar(nullptr);
+    avB.Despawn();
+    far.Reset();
+    farDebris.Reset();
+    c.mobs.ClearPlayerActor();
+    c.mobs.ClearAttackRequests();
+    c.mobs.ClearBlockEvents();
+    c.debris.Reset();
+    c.mobs.Reset();
+    c.mobs.MeleeWire() = MobSystem::MeleeWireStats{};
+  };
+  if (!avB.HasDef()) {
+    cleanup();
+    detail = std::string("no mob def named \"") + kAvatarDefName + "\"";
+    return Status::Fail;
+  }
+  Player plB;
+  plB.fly = false;
+  plB.grounded = true;
+  plB.pos = Vec3{(float)spot.x + 0.5f,
+                 (float)(World::TerrainHeight(spot.x, spot.z, kDefaultSeed) + 2) +
+                     Player::kHalfY,
+                 (float)spot.z + 0.5f};
+  if (!avB.Spawn(plB, 0.0f) || !avB.EquipItem(sword) ||
+      !avB.EquipItem(round, Hand::Left)) {
+    cleanup();
+    detail = "B's avatar would not spawn or take the sword and shield";
+    return Status::Fail;
+  }
+  far.SetAvatar(&avB);
+  const uint64_t wielderId =
+      c.mobs.Spawn(defIndex, {spot.x - 14, spot.y + 1, spot.z});
+
+  // ---- one tick of both machines (net-player-melee's step) ----------------
+  uint32_t tick = 9800;
+  ::net::EntityBatch fromB;
+  bool haveFromB = false;
+  PlayerState stB{};
+  bool haveStB = false;
+  // DIRECT PHASE CALLS ON PURPOSE (W2-O): net-player-melee's reason -- A's
+  // tick runs the peer-ghost seams with NO local player, and B has no world
+  // of its own. B also steps its shield as its session would (SetShieldWant
+  // is set by the claims below; StepShield is the session's per-tick call).
+  auto step = [&]() {
+    const uint32_t t = tick + 1;
+    if (haveFromB) {
+      entA.NoteRemote(::net::EntityBatch(fromB));
+      haveFromB = false;
+    }
+    entA.ApplyForTick(t, c.mobs, c.debris, nullptr);
+    {
+      ::net::PlayerBody pb;
+      if (entA.TakePeerBody(pb)) rb.NoteBody(std::move(pb));
+    }
+    if (haveStB) rb.Apply(stB);
+    if (remotes.dirty) RemotePlayersSyncAvatars(remotes, c.mobs, {});
+    {
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      std::vector<BrushOp> ops;
+      c.mobs.PreTick(t, c.world, ops, cellOps, spawns);
+      RemotePlayersPreTick(remotes, t, kTickDt, c.world, c.phys, c.mobs,
+                           c.debris, c.mats, kAvatarDefName);
+      if (remotes.dirty) RemotePlayersSyncAvatars(remotes, c.mobs, {});
+      c.debris.PreTick(t, c.world, cellOps, spawns);
+      tick = t;
+      SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, ops, {}, cellOps,
+                 false, pchunk, true, false, spawns);
+      c.ctx.WaitIdle();
+      c.ctx.ProcessEvents();
+    }
+    c.phys.Step(kTickDt);
+    c.debris.PostStep();
+    c.mobs.PostStep();
+    RemotePlayersPostStep(remotes);
+    ::net::EntityBatch sentA;
+    {
+      ::net::EntityBatch out;
+      entA.Build(c.mobs, c.debris, tick, out);
+      std::vector<uint8_t> bytes;
+      out.Encode(bytes);
+      sentA.Decode(bytes.data(), bytes.size());
+    }
+    entB.NoteRemote(::net::EntityBatch(sentA));
+    entB.ApplyForTick(tick, far, farDebris, nullptr);
+    {
+      std::vector<ParticleSpawn> bSp;
+      std::vector<CellOp> bCells;
+      std::vector<BrushOp> bOps;
+      far.PreTick(tick, c.world, bOps, bCells, bSp);
+      if (avB.Spawned() && avB.IsAlive()) {
+        avB.StepShield();
+        avB.PreTick(tick, plB, 0.0f, kTickDt, c.world, bOps, bCells, bSp);
+      }
+      farDebris.PreTick(tick, c.world, bCells, bSp);
+      ApplyRemoteMeleeHits(farPhys, far, farDebris, c.world, bSp, tick);
+    }
+    farPhys.Step(kTickDt);
+    farDebris.PostStep();
+    far.PostStep();
+    if (avB.Spawned() && avB.IsAlive()) avB.PostStep();
+    {
+      ::net::EntityBatch out;
+      entB.Build(far, farDebris, tick, out);
+      std::vector<uint8_t> bytes;
+      out.Encode(bytes);
+      fromB.Clear();
+      fromB.Decode(bytes.data(), bytes.size());
+      haveFromB = true;
+    }
+    stB = PlayerState{};
+    stB.tick = tick;
+    stB.playerId = kPeer;
+    stB.pos = plB.pos;
+    stB.Set(PlayerState::kGrounded, true);
+    stB.Set(PlayerState::kAlive, !avB.Spawned() || avB.IsAlive());
+    haveStB = true;
+  };
+  MeleeTuning mt;
+  ApplyMeleeTuning(mt, CurrentTuning());
+  auto flesh = [](MobSystem& m, uint64_t id) {
+    const Mob* mm = m.FindMobById(id);
+    int64_t n = 0;
+    for (int li = 0; mm != nullptr && li < mm->AppendedBase(); li++)
+      n += m.LimbSkinVoxelCount(id, li);
+    return n;
+  };
+  for (int i = 0; i < 12; i++) step();
+
+  // ======== A: dressed as its owner ========================================
+  Mob& ghost = rb.avatar;
+  const int slotB = avB.HeldSlot(Hand::Left), slotA = ghost.HeldSlot(Hand::Left);
+  const bool okA = slotB >= 0 && slotA == slotB && ghost.IsShieldSlot(slotA) &&
+                   ghost.SlotName(slotA) == avB.SlotName(slotB);
+
+  // ======== B: raised, it is a guard on the far side =======================
+  avB.SetShieldWant(true);
+  for (int i = 0; i < 12; i++) step();
+  const bool raisedB = avB.ShieldRaise() >= 1.0f;
+  const bool guardA = ghost.ShieldUpForWatchers();
+  std::vector<MobSystem::PlayerActorDesc> actors;
+  RemotePlayersAppendActors(remotes, actors);
+  const bool actorGuard =
+      !actors.empty() && actors[0].action == (uint8_t)ai::Action::Guard;
+  const bool okB = raisedB && guardA && actorGuard;
+
+  // ======== C: a blow on a peer's shield is the peer's =====================
+  bool okC = false, arrestedA = false;
+  float hpB0 = 0, hpB1 = 0;
+  uint32_t voxB0 = 0, voxB1 = 0, voxA0 = 0, voxA1 = 0;
+  int64_t fleshB0 = 0, fleshB1 = 0;
+  uint64_t parriesB = 0;
+  size_t goreA = 0;
+  if (okA) {
+    BodyTransform xf{};
+    if (c.phys.GetTransform(c.mobs.LimbBody(ghost.Id(), slotA), xf)) {
+      hpB0 = far.LimbHp(avB.Id(), slotB);
+      voxB0 = far.LimbVoxelCount(avB.Id(), slotB);
+      voxA0 = c.mobs.LimbVoxelCount(ghost.Id(), slotA);
+      fleshB0 = flesh(far, avB.Id());
+      const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+      const float sc = (float)std::max(1u, round->scale);
+      const float cy = round->size.y * 0.5f / sc, cz = round->size.z * 0.5f / sc;
+      auto W = [&](float x, float y, float z) {
+        return xf.pos + QuatRotate(q, Vec3{x, y, z});
+      };
+      EdgeSweep sw;
+      sw.aPrev = W(5.0f, cy + 1.5f, cz - 0.4f);
+      sw.bPrev = W(5.0f, cy + 1.5f, cz + 0.4f);
+      sw.aNow = W(-3.0f, cy + 1.5f, cz - 0.4f);
+      sw.bNow = W(-3.0f, cy + 1.5f, cz + 0.4f);
+      sw.dt = kTickDt;
+      sw.halfWidth = 0.15f;
+      sw.strike.cut = 14.0f;
+      sw.strike.blunt = 2.0f;
+      sw.tick = tick;
+      sw.valid = true;
+      std::vector<ParticleSpawn> sp;
+      const uint64_t p0 = far.MeleeWire().parries;
+      const Mob* w = c.mobs.FindMobById(wielderId);
+      const EdgeSweepResult r =
+          MeleeSweepDamage(sw, mt, *w, c.phys, c.mobs, c.debris, c.world, sp);
+      arrestedA = r.arrested && r.block.shield && r.block.blockerId == ghost.Id();
+      goreA = sp.size();
+      voxA1 = c.mobs.LimbVoxelCount(ghost.Id(), slotA);
+      for (int i = 0; i < 4; i++) step();
+      parriesB = far.MeleeWire().parries - p0;
+      hpB1 = far.LimbHp(avB.Id(), slotB);
+      voxB1 = far.LimbVoxelCount(avB.Id(), slotB);
+      fleshB1 = flesh(far, avB.Id());
+    }
+    okC = arrestedA && goreA == 0 && voxA1 < voxA0 && parriesB == 1 &&
+          hpB1 < hpB0 && voxB1 < voxB0 && fleshB1 == fleshB0;
+  }
+
+  const bool ok = okA && okB && okC;
+  detail = Format(
+      "A dressed=%d (shield slot A %d / B %d) | B guard on the far side=%d "
+      "(raised on B %d, ghost guard %d, actor action guard %d) | C peer's "
+      "shield=%d (arrested on A %d, A gore %zu, ghost shield vox %u->%u | B "
+      "parries %llu, shield hp %.1f->%.1f vox %u->%u, flesh %lld->%lld)",
+      okA ? 1 : 0, slotA, slotB, okB ? 1 : 0, raisedB ? 1 : 0, guardA ? 1 : 0,
+      actorGuard ? 1 : 0, okC ? 1 : 0, arrestedA ? 1 : 0, goreA, voxA0, voxA1,
+      (unsigned long long)parriesB, (double)hpB0, (double)hpB1, voxB0, voxB1,
+      (long long)fleshB0, (long long)fleshB1);
+  std::printf("net-player-shield: %s (%s)\n", ok ? "PASS" : "FAIL",
+              detail.c_str());
+  cleanup();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- net-player-corpse -----------------------------------------------------
 //
 // A REMOTE PLAYER'S DEATH, ON THE MACHINE WATCHING IT (PLAN_corpse_is_a_mob.md
@@ -17972,6 +18607,14 @@ const std::vector<Gate>& MobGates() {
       // and parries with its sword), blows on a player and on a peer's loose
       // matter applied by the owner (net::PlayerBody, game/meleehit.h).
       {"net-player-melee", "mob", {}, false, GateNetPlayerMelee,
+       /*needsRender=*/false},
+      // Shields across the wire (game/mob_shield.cpp): a peer's blade judged
+      // against a ghost's shield, the owner paying (wear, stagger, break), and
+      // a live creature's broken shield leaving its ghost (GearKeyOf).
+      {"net-shield", "mob", {}, false, GateNetShield, /*needsRender=*/false},
+      // ...and a peer PLAYER's shield: dressed, raised as a guard on the far
+      // side, a blow on it paid by its owner.
+      {"net-player-shield", "mob", {}, false, GateNetPlayerShield,
        /*needsRender=*/false},
       // A REMOTE player's death and respawn as the other machine sees them,
       // and an NPC corpse changing hands through ScanHandoffs.

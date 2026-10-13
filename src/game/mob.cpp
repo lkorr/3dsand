@@ -9190,7 +9190,8 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     }
     // A SHIELD UP is a guard to anyone watching (Fact::TargetGuarding), so a
     // profile can answer it -- feint, circle, wait it out -- with data.
-    if (a.action == ai::Action::None && m.ShieldRaise() >= 0.5f)
+    // (ShieldUpForWatchers: a ghost's comes from its owner's pose.)
+    if (a.action == ai::Action::None && m.ShieldUpForWatchers())
       a.action = ai::Action::Guard;
     actors_.push_back(std::move(a));
   }
@@ -31281,6 +31282,7 @@ void Mob::PlaceFromOwnerPose(const ::net::MobPose& p, float dt) {
   ghostPose_ = p;
   haveGhostPose_ = true;
   ghostBladeLive_ = (p.flags & ::net::MobPose::kBladeLive) != 0;
+  ghostShieldUp_ = (p.flags & ::net::MobPose::kShieldUp) != 0;
   spellLight_[0] = p.spellLight[0];
   spellLight_[1] = p.spellLight[1];
   DropLimbsOwnerLacks(p);
@@ -31493,6 +31495,10 @@ void MobSystem::BuildPoseOf(const Mob& mob, uint32_t tick,
       (m->swinging_ || (!m->PlayerControlled() &&
                         m->stroke_.phase == NpcStroke::Phase::Guard)))
     out.flags |= ::net::MobPose::kBladeLive;
+  // THE SHIELD IS UP (MobPose::kShieldUp): its pose rides `limbs` below; this
+  // says it is a guard, for the far side's watchers.
+  if (m->alive_ && m->ShieldUpForWatchers())
+    out.flags |= ::net::MobPose::kShieldUp;
   // The light in each fist (Mob::SpellLight): what the arm's pose cannot say.
   if (m->alive_) {
     out.spellLight[0] = m->spellLight_[0];
@@ -31540,6 +31546,7 @@ bool MobSystem::ApplyPose(const ::net::MobPose& p) {
   m->ghostPose_ = p;
   m->haveGhostPose_ = true;
   m->ghostBladeLive_ = (p.flags & ::net::MobPose::kBladeLive) != 0;
+  m->ghostShieldUp_ = (p.flags & ::net::MobPose::kShieldUp) != 0;
   m->spellLight_[0] = p.spellLight[0];
   m->spellLight_[1] = p.spellLight[1];
   // ---- A LIMB THE OWNER NO LONGER HAS (2026-10-08) -------------------------
@@ -31704,10 +31711,14 @@ Mob* MobSystem::ApplyAnnounce(const ::net::MobAnnounce& a) {
              now.gear[k].equipSlot == a.gear[k].equipSlot &&
              now.gear[k].held == a.gear[k].held &&
              now.gear[k].dye == a.gear[k].dye;
-    if (!same) {
-      ApplyWireGear(*have, a.gear);
-      instancesDirty_ = true;
-    }
+    // RedressFromWire, not ApplyWireGear alone: the re-announce is how a
+    // LIVE creature's gear change reaches its ghost (net::EntitySync re-sends
+    // it on a MobSystem::GearKeyOf change), and a change is as often a piece
+    // LOST -- a shield broken, a sword knocked from the hand -- as one put
+    // on. Adding the list on top of what the ghost wears would leave the
+    // broken shield in its fist; stripping and re-dressing in rig-slot order
+    // is what lines the slots up with the pose stream again.
+    if (!same) RedressFromWire(*have, a.gear);
     // NOT re-pinned: an id we hold may have arrived by HANDOFF, in which case
     // the record is here and the ownership function is entitled to it. Only a
     // creature born from an announce carries the pin.
@@ -31927,6 +31938,43 @@ bool MobSystem::ApplyGone(const ::net::MobGone& g) {
 }
 
 // ---- THE DEAD ON THE WIRE (PLAN_corpse_is_a_mob.md P2c) ---------------------
+
+uint64_t MobSystem::GearKeyOf(uint64_t mobId) const {
+  const Mob* m = nullptr;
+  for (const Mob& c : mobs_)
+    if (c.id_ == mobId) { m = &c; break; }
+  if (m == nullptr) return 0;
+  // FNV-1a over what CaptureGear would list, in the same two walks and with
+  // the same "is it still on the body" tests, so the key moves exactly when
+  // the announce's gear list would.
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+  auto mixStr = [&](const std::string& s) {
+    for (char ch : s) mix((uint8_t)ch);
+    mix(0xFFu);
+  };
+  for (size_t pi = 0; pi < m->worn_.size(); pi++) {
+    const Mob::WornPiece& p = m->worn_[pi];
+    const int idSlot = m->IdentityShellOf((int)pi);
+    if (idSlot < 0 || idSlot >= (int)m->limbs_.size() ||
+        !m->limbs_[(size_t)idSlot].body)
+      continue;
+    mixStr(p.item);
+    mix((uint64_t)(uint32_t)p.equipSlot);
+    mix((uint64_t)(uint32_t)idSlot);
+    mix(m->limbs_[(size_t)idSlot].dye);
+  }
+  for (int hk = 0; hk < kHands; hk++) {
+    const Mob::HeldHand& hh = m->held_[hk];
+    if (hh.slot < 0 || hh.slot >= (int)m->limbs_.size() ||
+        !m->limbs_[(size_t)hh.slot].body || hh.item.empty() || hh.borrowed)
+      continue;
+    mixStr(hh.item);
+    mix(1u + (uint32_t)hk);
+    mix((uint64_t)(uint32_t)hh.slot);
+  }
+  return h;
+}
 
 uint64_t MobSystem::StateKey(uint64_t mobId) const {
   const Mob* m = nullptr;

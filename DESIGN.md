@@ -23709,11 +23709,41 @@ guard open and enough sword blows breaking it (not fewer than
 guardian raises its shield, still swings, and never has a stroke in windup or
 cut with the shield above `shieldStrikeBelow`.
 
+**Across the wire (2026-10-13, gates `net-shield`, `net-player-shield`).**
+Nothing about a block needed a new record. A held shield has a body, so its
+POSE already rides `MobPose::limbs` (an NPC's and a peer player's alike), and
+the attacker judges the block against that pose (`game/meleehit.h` rule 2,
+the parry's rule): the stroke is arrested on the attacker's machine and a
+`MeleeHitKind::Parry` record naming the shield's slot goes to the owner, whose
+`ApplyOneRemoteHit` runs the same `ResolveShieldBlock` from the same inputs --
+the chip, the trauma through, the wear, the stagger, the break. Three things
+were added:
+
+- **The chip is presentation on the attacker's machine too** (`ChipShield`, the
+  rule-4 carve a peer's flesh gets): the attacker sees the notch at once and
+  its next blade meets the shield the owner has, with the gore to a sink.
+- **A guard is a fact a pose cannot say**, so `MobPose::kShieldUp` carries it
+  and a ghost latches it (`Mob::ShieldUpForWatchers`): a peer's raised shield
+  reads as `ai::Action::Guard` to the NPCs watching it (the creature actors and
+  `RemotePlayersAppendActors`), the same as a local one.
+- **A LIVE creature's gear change now reaches its ghost.** Its announce went
+  out once, so a shield broken (or a sword knocked from the hand, a cuirass cut
+  loose) on the owner stayed in the ghost's fist for as long as it stayed in
+  view. `net::EntitySync::Build` re-sends the announce when
+  `MobSystem::GearKeyOf` (CaptureGear's walk without the damage lattices: a few
+  integer mixes per piece, cheap every tick) moves, and `ApplyAnnounce`'s
+  "already here" branch now re-dresses through `RedressFromWire` (strip, then
+  rig-slot order) instead of adding the list on top -- which could not remove
+  anything. A peer PLAYER's gear already rode `net::PlayerBody`.
+
+Not carried: the raise itself (a ghost steps none; its pose is the owner's), a
+creature's raise and pending attack across a HANDOFF (the new owner starts
+lowered, as it starts with no stroke), and chips the owner's OWN fights leave
+on a live creature's shield (live lattices do not stream, the same limit as
+flesh).
+
 **Not yet:** a shield bash; carrying a shield on the back; a shield hit by an
-explosion or a spell is carved like any held item but is not a "block"; a
-ghost's shield on a peer's machine is posed by its owner's stream but its
-raise is not streamed, so the attacker's judgement of the block uses the pose
-it was sent.
+explosion or a spell is carved like any held item but is not a "block".
 
 ### Ground items are debris that remember their name
 
@@ -27060,7 +27090,9 @@ sword could not be seen or parried and a blow aimed at the arm the peer had
 raised met one the ghost held at its side. The owner now streams its avatar as
 it streams a creature: the per-limb `MobPose` every tick (held and worn slots,
 `kBladeLive`) and its gear in rig-slot order when it changes and on a 1 s
-keyframe (entity batch v4). The ghost is re-dressed from the gear
+keyframe (entity batch v4). (A creature's gear rides its announce, re-sent
+when `MobSystem::GearKeyOf` changes since 2026-10-13 -- see "Shields" in
+§8c.) The ghost is re-dressed from the gear
 (`MobSystem::RedressFromWire`, shared with a corpse's `MobState`) so its slots
 are numbered as the owner's, and after its local animation -- kept as the
 fallback while no pose is fresher than `RemotePlayer::kBodyFreshTicks` -- every

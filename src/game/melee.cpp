@@ -1355,21 +1355,17 @@ MeleeHit MakeWireHit(const Mob& wielder, Mob& target, uint64_t hb,
 //      mace on a shield still hurts the man behind it.
 //   3. THE REST (MobSystem::ApplyShieldBlock): item hp, the flinch, the guard
 //      beaten open, the break.
-BlockEvent ResolveShieldBlock(Mob& holder, int slot, const EdgeSweep& s,
-                              const Vec3& at, const Vec3& seg,
-                              const Vec3& sweepDir, float radius, float power,
-                              float tipSpeed, uint32_t hitSeed, MobSystem& mobs,
-                              World& world, std::vector<ParticleSpawn>& spawns) {
-  BlockEvent ev;
-  ev.shield = true;
-  Hand hand = Hand::Left;
-  if (!holder.IsHeldSlot(slot, &hand)) return ev;
-  const ItemDef::ShieldSpec* specP = holder.HeldShieldSpec();
-  const float through = specP != nullptr ? specP->bluntThrough : 0.0f;
-  const StrikeParts parts =
-      BuildStrikeParts(s, at, seg, sweepDir, radius, power, tipSpeed, hitSeed);
+// 1 alone, for BOTH machines: the chip is GEOMETRY, and a blow on a PEER's
+// shield is chipped here as presentation (gore to a sink the caller throws
+// away) exactly as a blow on a peer's flesh is carved here, so the attacker
+// sees the notch at once and its next blade meets the shield its owner has.
+// The owner then applies the same chip from the same inputs (the Parry record
+// carries them), the deterministic kerf landing in the slot's own frame.
+void ChipShield(Mob& holder, int slot, const StrikeParts& parts,
+                const EdgeSweep& s, const Vec3& at, float power,
+                MobSystem& mobs, World& world,
+                std::vector<ParticleSpawn>& spawns) {
   const uint64_t holderId = holder.Id();
-  // ---- 1. THE CHIP --------------------------------------------------------
   if (s.strike.cut > 0.0f) {
     const uint64_t b = mobs.LimbBody(holderId, slot);
     KerfCut cut = parts.cut;
@@ -1394,6 +1390,24 @@ BlockEvent ResolveShieldBlock(Mob& holder, int slot, const EdgeSweep& s,
       mobs.CarveLimbRadial(b, at, r, /*ragged=*/true, /*eject=*/true, world,
                            spawns, DamageCtx(DamageCause::Blunt, power));
   }
+}
+
+BlockEvent ResolveShieldBlock(Mob& holder, int slot, const EdgeSweep& s,
+                              const Vec3& at, const Vec3& seg,
+                              const Vec3& sweepDir, float radius, float power,
+                              float tipSpeed, uint32_t hitSeed, MobSystem& mobs,
+                              World& world, std::vector<ParticleSpawn>& spawns) {
+  BlockEvent ev;
+  ev.shield = true;
+  Hand hand = Hand::Left;
+  if (!holder.IsHeldSlot(slot, &hand)) return ev;
+  const ItemDef::ShieldSpec* specP = holder.HeldShieldSpec();
+  const float through = specP != nullptr ? specP->bluntThrough : 0.0f;
+  const StrikeParts parts =
+      BuildStrikeParts(s, at, seg, sweepDir, radius, power, tipSpeed, hitSeed);
+  const uint64_t holderId = holder.Id();
+  // ---- 1. THE CHIP --------------------------------------------------------
+  ChipShield(holder, slot, parts, s, at, power, mobs, world, spawns);
   // ---- 2. THE TRAUMA BEHIND IT --------------------------------------------
   if (s.strike.blunt > 0.0f && through > 0.0f) {
     const int arm = holder.ShieldArmPart(hand);
@@ -1530,6 +1544,19 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
             Vec3{}, sweepDir, cb - ca, s.flatNow, s, radius, power,
             out.tipSpeed, 1.0f, hitSeed, out.power * out.edgeAlign, 0.0f, 0u,
             phys, mobs));
+        // ...and the CHIP here too, as presentation (rule 4: the attacker
+        // sees the wound at once), AFTER the record: a carve rebuilds the slot
+        // under a new handle, and the record is framed on the one it struck.
+        // Its spawns go to a sink -- the owner's chip submits the matter.
+        // The sound is this machine's: the struck voxel rings or thuds.
+        const uint32_t struck = sh.holder->ShellMaterialAt(sh.slot, sh.at);
+        out.block.ring =
+            struck == 0u || sh.holder->MaterialHardness(struck) >= 100.0f;
+        std::vector<ParticleSpawn> ghostSink;
+        ChipShield(*sh.holder, sh.slot,
+                   BuildStrikeParts(s, sh.at, cb - ca, sweepDir, radius, power,
+                                    out.tipSpeed, hitSeed),
+                   s, sh.at, power, mobs, world, ghostSink);
       } else {
         const BlockEvent ev = ResolveShieldBlock(
             *sh.holder, sh.slot, s, sh.at, cb - ca, sweepDir, radius, power,

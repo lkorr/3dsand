@@ -301,6 +301,9 @@ class EntitySync {
     uint64_t meleeOut = 0, meleeIn = 0;   // game/meleehit.h records
     uint64_t bodiesOut = 0, bodiesIn = 0; // PlayerBody records
     uint64_t gearOut = 0;                 // ...of which carried the gear
+    // A LIVING creature's announce re-sent because its gear changed
+    // (MobSystem::GearKeyOf; counted in announcesOut too).
+    uint64_t gearReannounces = 0;
     uint64_t batchesOut = 0, batchesIn = 0, bytesOut = 0;
     uint64_t applyMisses = 0;   // poses for an id we do not hold
     // ...and the two refusals that are NOT defects, split out of it by
@@ -351,6 +354,10 @@ class EntitySync {
   };
   std::unordered_map<uint64_t, uint32_t> mobPoseSent_;
   std::unordered_map<uint64_t, DeadSent> mobStateSent_;
+  // ...and for a LIVE one, the gear key its last announce described
+  // (MobSystem::GearKeyOf): a change re-sends the announce, which is how a
+  // shield broken or a blade knocked loose on the owner leaves the ghost.
+  std::unordered_map<uint64_t, uint64_t> mobGearSent_;
 
   // Ghost id -> the tick we last saw a pose/announce for it. Rule 3's clock.
   std::unordered_map<uint64_t, uint32_t> ghostMobSeen_, ghostBodySeen_;

@@ -685,6 +685,9 @@ const char* const kOrder[] = {
     // net-player-corpse's two machines and exit contract (avatars, mobs,
     // debris, id counter reset; machine B and its avatar destroyed).
     "net-player-melee",
+    // Shields across the wire: net-melee's / net-player-melee's two machines
+    // and exit contracts (machine B and its avatar destroyed before return).
+    "net-shield", "net-player-shield",
     // The same exit contract as `net-corpse` (mobs, debris and id counter
     // reset) plus: the ghost avatar list and BOTH ownership closures it
     // installs through ScanHandoffs are cleared before it returns.
