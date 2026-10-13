@@ -1790,6 +1790,14 @@ struct UIState {
   // hand, -1 otherwise (game/container.h ContainerThrowCharge). Written by the
   // tick; the HUD draws the meter under the crosshair, shaking at full.
   float throwCharge = -1.0f;
+  // THE BOW (game/arrows.h): with a bow in hand, the draw 0..1 (the eased
+  // fraction that scales the arrow's speed; 0 = in hand, not drawn) and the
+  // arrows left in the kit; -1 / -1 with no bow in either hand. `bowMinDraw`
+  // is where a release starts to loose at all. Written by the tick; the HUD
+  // draws a pixel bow under the crosshair whose string comes back with it.
+  float bowDraw = -1.0f;
+  float bowMinDraw = 0.0f;
+  int arrowsLeft = -1;
   // THE SHOCK (MobSystem::ApplyShocks; wave 2 package E). Written by the tick
   // (TickAuthority's stun pass) for the HUD's pixel cue under the crosshair:
   // the stun's ticks left (0 = not stunned) and how many ticks ago this body

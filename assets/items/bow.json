@@ -1,0 +1,36 @@
+{
+  "comment": "A braced self longbow of yew, a waxed linen string, a leather grip. Held like any weapon (kind melee, weaponClass bow), but LMB DRAWS it: hold to draw, release to shoot (game/arrows.h). Draw speed and time are items.json's `bow` block. Regenerate with scripts/gen_bow_items.py.",
+  "name": "bow",
+  "model": "bow",
+  "artVoxelsPerMetre": 80,
+  "hp": 25,
+  "severable": true,
+  "severImpactSpeed": 6.0,
+  "grip": {
+    "held_right": {
+      "translation": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        90,
+        -90,
+        0
+      ],
+      "scale": 1
+    }
+  },
+  "hilt": {
+    "min": [
+      42,
+      3,
+      0
+    ],
+    "size": [
+      13,
+      3,
+      3
+    ]
+  }
+}

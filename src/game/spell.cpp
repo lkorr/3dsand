@@ -9,6 +9,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "game/flightprobe.h"  // FlightSolidAt: the grid probe arrows share
 #include "game/lightning.h"
 #include "sim/rng.h"
 
@@ -4450,21 +4451,9 @@ void SpellSystem::Tick(uint32_t tick, World& world,
   //      exactly, for a cell nobody has fetched yet -- so at worst a bolt
   //      lands ON THE GROUND, never under it, and never through it.
   // Out-of-window space stays solid (DESIGN.md section 3).
+  // (The probe is shared with arrows: game/flightprobe.h.)
   auto solidAt = [&](int32_t x, int32_t y, int32_t z) {
-    if (!world.CellInWindow({(int)x, (int)y, (int)z})) return true;
-    const CellKind k = world.KindAt({(int)x, (int)y, (int)z}, classOf);
-    if (k != CellKind::Unknown) return k == CellKind::Solid;
-    const IVec3 wc{x >> 4, y >> 4, z >> 4};
-    if (const CachedChunk* cc = world.Cached(wc); cc && cc->voxels.size() == kChunkVol) {
-      const uint32_t mat =
-          cc->voxels[(size_t)(((z & 15) * (int)kChunk + (y & 15)) * (int)kChunk + (x & 15))] &
-          0xFFFu;
-      if (mat == 0 || mat >= classOf.size()) return false;
-      // Solid and powder both stop a flight, exactly as World::KindAt says.
-      return classOf[mat] == 0u || classOf[mat] == 1u;
-    }
-    world.RequestChunkFetch(wc);
-    return y <= World::TerrainHeight(x, z, seed);
+    return FlightSolidAt(world, classOf, seed, x, y, z);
   };
   // Ask for the chunks a flight is about to cross: its own and a few along the
   // velocity. Coalesced by World (one request per chunk per readback), bounded

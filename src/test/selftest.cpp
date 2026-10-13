@@ -979,6 +979,11 @@ const char* const kOrder[] = {
     // and into a harder skin; the numbers per material are the output. Fresh
     // spawns on pristine ground; its last arm ticks the bleed.
     "pierce",
+    // ...and the BOW AND ITS ARROWS on the real tick (docs/PLAN_projectiles.md
+    // C): embed + ride + death + sever, through-and-through, the ground, the
+    // pull-out, the flat damage, a volley twice, the draw/release input path.
+    // Fresh spawns on pristine ground; regenerates it on the way out.
+    "arrow",
     // ...and a coat on the blade goes INTO the wound it cuts, from the voxels
     // that touched only, and comes back carrying the wound's fluid; a mace
     // coats the surface, a fist coats what it hits, and the blade keeps its

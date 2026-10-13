@@ -21,6 +21,7 @@
 // is a pure function of its lattice and the projectile.
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "math3d.h"
@@ -63,8 +64,19 @@ inline constexpr float kPierceBackVox = 1.0f;
 // for `maxDistVox` world voxels. `ignore` = bodies the ray must not meet (the
 // shooter's own). Every hit is resolved in place -- hp, wounds, gore, death --
 // before the next body is cast for.
+//
+// A BODY ANOTHER MACHINE OWNS (a peer's creature or player, a peer's loose
+// body) is NOT carved for real here: the hit is routed to its owner as a
+// MeleeHitKind::Pierce record (game/meleehit.h, applied by
+// ApplyRemoteMeleeHits) and the channel runs on the ghost as presentation,
+// gore discarded -- melee's rule 4. `embedItem` rides that record: the item
+// that stays in the limb on the owner if the point embeds there (an arrow,
+// Mob::EmbedArrow; "" = nothing). A body this machine owns is the caller's to
+// embed in, from the returned hits. An arrow already stuck in a body
+// (Mob::IsArrowSlot) is passed by, not struck.
 PierceFlight PierceAlongRay(Physics& phys, MobSystem& mobs, DebrisSystem& debris,
                             World& world, std::vector<ParticleSpawn>& spawns,
                             Vec3 fromWorld, Vec3 dirWorld, float maxDistVox,
                             const Penetrator& pen,
-                            const std::vector<uint64_t>& ignore = {});
+                            const std::vector<uint64_t>& ignore = {},
+                            const std::string& embedItem = {});

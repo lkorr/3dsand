@@ -70,6 +70,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "game/arrows.h"
 #include "game/avatar.h"
 #include "game/brush.h"
 #include "game/camera.h"
@@ -728,6 +729,14 @@ struct PlayerSession {
   // fixed at the release so the delay cannot add charge.
   int throwLaunchIn = 0;
   float throwLaunchSpeed = 0.0f;
+  // ---- THE BOW (game/arrows.h, session.cpp PhaseG's bow block) ----
+  // Ticks the hand's button has been held with a bow in that hand and an
+  // arrow to nock (0 = not drawing), and WHICH hand (-1 = none). Counted on
+  // the tick from TickInput's held mask, loosed on the tick the button is
+  // let go: a replay or a peer reads the same draw from the same command.
+  // Changing what is in the hand cancels the draw.
+  int bowDrawTicks = 0;
+  int bowHand = -1;
 
   // ---- melee ----
   MeleeState melee;
@@ -952,6 +961,10 @@ struct TickAuthorityCtx {
   // spawns in phase L so it travels to the peer like any gore authored here.
   // Always empty without a connected peer.
   std::vector<ParticleSpawn> remoteBlastGore;
+  // THE ARROWS IN FLIGHT (game/arrows.h): every session's bow looses into
+  // this one list (PhaseG), stepped once a tick in phase K's slot. The
+  // world's, not a player's: an arrow in the air belongs to nobody.
+  ArrowFlights arrows;
   uint32_t fluidCueMat = 0;
   uint32_t lastFluidTick = 0;
   // The liquid the mpm tool's keys 1-4 pour (UIState::fluidPour indexes it;
@@ -1343,8 +1356,11 @@ struct TickAuthorityCtx {
 // from the hotbar selection on their own.
 struct HandNow {
   const ItemDef* item = nullptr;   // what the kit's hand slot holds, or null
-  bool weapon = false;             // ItemKind::Melee
+  bool weapon = false;             // ItemKind::Melee (never a bow)
   bool vessel = false;             // a container (flask, pouch)
+  // A BOW (ItemDef::IsBow, game/arrows.h): this hand's button DRAWS while
+  // held and SHOOTS on release; it is never a weapon a stroke swings.
+  bool bow = false;
   // An EMPTY hand holding an equipped spell (PlayerCaster::hand): its button
   // casts, so it never punches. Never on a ruined arm.
   bool spell = false;

@@ -67,6 +67,8 @@
 #include "game/mob.h"
 #include "game/melee.h"  // hit-drive swings the real sweep
 #include "game/pierce.h"  // pierce: PierceAlongRay, the projectile entry point
+#include "game/arrows.h"  // arrow: the bow, the flights, the embed
+#include "game/worlditems.h"  // arrow: a stuck arrow is a ground item
 #include "game/anim.h"   // QuatRotate: a joint anchor is body-local
 #include "game/bodyreg.h"  // heal-restore's optional picture sequence
 #include "gpu/resources.h"  // CreateBuffer, ditto
@@ -11263,6 +11265,551 @@ Status GatePierce(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// arrow: the bow and its arrows, through the real tick
+// ---------------------------------------------------------------------------
+// docs/PLAN_projectiles.md package C (game/arrows.h). Every arrow below is an
+// ordinary flight in the rig's TickAuthorityCtx::arrows, stepped by THE tick
+// (support::RunTicks), against a fresh fixture human posed like the pierce
+// gate's, aimed from its own measured geometry:
+//
+//   (a) EMBED: half draw into the upper arm stops in it, an arrow slot exists
+//       on THAT limb, and it rides the limb -- its pose in the limb's frame is
+//       unchanged after the creature is killed and its corpse has fallen (the
+//       limb moved, the arrow went with it), and after the arm is severed the
+//       arrow is a debris body strapped to the severed piece and registered
+//       as the item.
+//   (b) THROUGH: full draw at the torso goes through it (Exited) and the
+//       flight carries on past the body.
+//   (c) TERRAIN: an arrow into the ground sticks there as a registered,
+//       motionless ground item, and the ground pickup takes it.
+//   (d) PULL-OUT: G's take (PullArrowToKit) on an embedded arrow puts it in
+//       the kit and the slot is gone.
+//   (e) FLAT DAMAGE ONLY WHEN IT GOT IN: every embedded/through hit charged
+//       at least the arrow's `damage`; a glance charged less than it.
+//   (f) A 5-ARROW VOLLEY replayed on a fresh world is bit-identical.
+//   (g) THE INPUT PATH: a bow in the rig's kit hand, TB_ATTACK held past a
+//       full draw and released, looses one arrow at the full draw speed and
+//       spends one from the pack; a tap under minDraw looses nothing.
+//
+// PRINTED, for the owner's numbers (decision 1, and "a couple of arrows to
+// the head, not always one"): full-draw arrows to kill through the torso and
+// through the head. The torso count is asserted against arrowTorsoKillMin..
+// arrowTorsoKillMax (baseline.json), the calibration the `damage` row aims at.
+Status GateArrow(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  const int human = mobs.FindDef("human");
+  const ItemDef* arrowDef = c.items.Named("arrow");
+  const ItemDef* bowDef = c.items.Named("bow");
+  if (human < 0 || arrowDef == nullptr || !arrowDef->IsAmmo() ||
+      bowDef == nullptr || !bowDef->IsBow()) {
+    detail = "no `human` def, or no bow + arrow in the item library";
+    return Status::Fail;
+  }
+  const int arrowIdx = c.items.Find("arrow"), bowIdx = c.items.Find("bow");
+  const float fullVox = bowDef->bow.drawSpeed;
+  const int torsoKillMin = (int)BaselineNumber("arrowTorsoKillMin", 3);
+  const int torsoKillMax = (int)BaselineNumber("arrowTorsoKillMax", 5);
+  const float rideTol = (float)BaselineNumber("arrowRideTolVox", 0.05);
+  const float fallMin = (float)BaselineNumber("arrowFallMinVox", 1.0);
+  const int volleyTicks = (int)BaselineNumber("arrowVolleyTicks", 40);
+
+  // THE GROUND REGISTRY the game binds (main.cpp): shed gear and stuck arrows
+  // land in it, a released body leaves it.
+  WorldItems ground;
+  c.debris.SetOnBodyGone([&ground](uint64_t h) { ground.OnBodyGone(h); });
+  mobs.SetOnItemShed(
+      [&ground](uint64_t h, const ItemInstance& it) { ground.Add(h, it); });
+  struct Unhook {
+    MobSystem& m;
+    DebrisSystem& d;
+    ~Unhook() {
+      m.SetOnItemShed(nullptr);
+      d.SetOnBodyGone(nullptr);
+    }
+  } unhook{mobs, c.debris};
+
+  bool ok = true;
+  std::string why, lines;
+  auto fail = [&](const std::string& s) {
+    ok = false;
+    why += " | " + s;
+  };
+  auto limbNamed = [&](const char* nm) {
+    const auto& L = mobs.Defs()[human].limbs;
+    for (size_t i = 0; i < L.size(); i++)
+      if (L[i].name == nm) return (int)i;
+    return -1;
+  };
+  auto centroid = [&](uint64_t id, int li) {
+    Vec3 sum{};
+    for (uint32_t k = 0; k < 512; k++)
+      sum += mobs.LimbVoxelPos(id, li, k * 7919u);
+    return sum * (1.0f / 512.0f);
+  };
+  const int head = limbNamed("head"), torso = limbNamed("torso");
+  const int arm = limbNamed("armU.L") >= 0 ? limbNamed("armU.L")
+                                           : limbNamed("armU.R");
+  const int leg = limbNamed("legU.R");
+  if (head < 0 || torso < 0 || arm < 0) {
+    detail = "the human has no head / torso / upper arm";
+    return Status::Fail;
+  }
+
+  // ---- ONE FIXTURE ------------------------------------------------------------
+  // A fresh spawn on pristine ground, its aim frame measured off its own
+  // limbs (the pierce gate's), and a rig on the real tick at a fixed clock.
+  struct Fixture {
+    uint64_t id = 0;
+    IVec3 chunk{};
+    Vec3 headC{}, torsoC{}, armC{}, legC{}, side{}, front{};
+    std::unique_ptr<support::TickRig> rig;
+  };
+  auto fixture = [&](uint32_t clock) {
+    Fixture f;
+    // A FRESH PROCESS'S STATE for the same live set (mob-cap64-twice's
+    // reset): every body torn down first, then the Jolt id history, creature
+    // ids and the per-tick inputs the tick re-derives -- Jolt orders contact
+    // constraints by body id, so ids are simulation input (physics.h
+    // ResetBodyIdHistory).
+    mobs.Reset();
+    c.debris.Reset();
+    c.phys.ResetBirthOrdinals();
+    c.phys.ResetBodyIdHistory();
+    mobs.SetNextIdCounter(1);
+    mobs.SetWeatherRain(0u);
+    mobs.SetRainSlope(0, 0);
+    mobs.SetDayPhase(0u);
+    PrepareWorld(c);
+    Target t;
+    t.defIndex = human;
+    t.limb = 0;
+    f.id = SpawnTarget(c, t, 170, f.chunk);
+    if (!f.id) return f;
+    f.headC = centroid(f.id, head);
+    f.torsoC = centroid(f.id, torso);
+    f.armC = centroid(f.id, arm);
+    if (leg >= 0) f.legC = centroid(f.id, leg);
+    Vec3 side = f.torsoC - f.armC;
+    side.y = 0.0f;
+    f.side = side.len() > 1e-3f ? side.normalized() : Vec3{1, 0, 0};
+    f.front = Vec3{0, 1, 0}.cross(f.side).normalized();
+    f.rig = std::make_unique<support::TickRig>(c, clock, f.chunk);
+    f.rig->Authority().ground = &ground;
+    return f;
+  };
+  constexpr float kStandOff = 12.0f;
+  auto shoot = [&](Fixture& f, Vec3 at, Vec3 dir, float speedVox,
+                   uint32_t seed) {
+    return f.rig->Authority().arrows.Launch(*arrowDef, at - dir * kStandOff,
+                                            dir, speedVox, Vec3{}, seed, {});
+  };
+  // The events of one arrow (by its seed), in order.
+  auto eventsOf = [&](Fixture& f, uint32_t seed) {
+    std::vector<ArrowEvent> out;
+    for (const ArrowEvent& e : f.rig->Authority().arrows.Events())
+      if (e.seed == seed) out.push_back(e);
+    return out;
+  };
+  // A body's pose relative to another's: (offset in its frame, rotation).
+  struct Rel {
+    Vec3 p{};
+    Quat q{};
+    bool ok = false;
+  };
+  auto relOf = [&](uint64_t body, uint64_t host) {
+    Rel r;
+    BodyTransform a{}, h{};
+    if (!c.phys.GetTransform(body, a) || !c.phys.GetTransform(host, h)) return r;
+    const Quat qh{h.quat[0], h.quat[1], h.quat[2], h.quat[3]};
+    const Quat qa{a.quat[0], a.quat[1], a.quat[2], a.quat[3]};
+    r.p = QuatRotateInv(qh, a.pos - h.pos);
+    r.q = QuatMul(QuatConj(qh), qa);
+    r.ok = true;
+    return r;
+  };
+  auto relDiff = [](const Rel& a, const Rel& b) {
+    const float dq = 1.0f - std::fabs(QuatDot(a.q, b.q));
+    return (a.p - b.p).len() + dq * 100.0f;
+  };
+  // (e)'s ledger: every hit that got IN must have charged the flat hp.
+  int inHits = 0, inHitsShort = 0;
+  auto auditHits = [&](const std::vector<ArrowEvent>& ev) {
+    for (const ArrowEvent& e : ev)
+      if (e.kind == ArrowEvent::Kind::Hit && e.r.hit && !e.r.missed &&
+          e.r.outcome != PierceOutcome::Glanced && e.r.cells > 0 &&
+          !e.r.loose) {
+        inHits++;
+        if (e.r.hpCharged + 1e-3f < arrowDef->arrow.damage) inHitsShort++;
+      }
+  };
+
+  // ======== (a) EMBED, RIDE, DIE, SEVER ========================================
+  {
+    Fixture f = fixture(70000);
+    if (!f.id) {
+      detail = "the fixture human did not spawn";
+      return Status::Fail;
+    }
+    const uint32_t seed = 0xA0001u;
+    shoot(f, f.armC, f.side, 0.5f * fullVox, seed);
+    support::RunTicks(*f.rig, 2);
+    const std::vector<ArrowEvent> ev = eventsOf(f, seed);
+    auditHits(ev);
+    const ArrowEvent* emb = nullptr;
+    for (const ArrowEvent& e : ev)
+      if (e.kind == ArrowEvent::Kind::Embedded) emb = &e;
+    Mob* m = mobs.FindCreature(f.id);
+    if (emb == nullptr || m == nullptr) {
+      std::string seen;
+      for (const ArrowEvent& e : ev)
+        seen += Format(" kind %d outcome %s;", (int)e.kind,
+                       PierceOutcomeName(e.r.outcome));
+      fail("(a) half draw into the arm did not embed:" + seen);
+    } else {
+      const int slot = emb->slot;
+      const bool onLimb = m->IsArrowSlot(slot) && m->WornHostOf(slot) == arm;
+      if (!onLimb)
+        fail(Format("(a) the arrow slot %d is not an arrow on armU (host %d)",
+                    slot, m->WornHostOf(slot)));
+      const uint64_t arrowBody = mobs.LimbBody(f.id, slot);
+      const uint64_t armBody0 = mobs.LimbBody(f.id, arm);
+      const Rel r0 = relOf(arrowBody, armBody0);
+      BodyTransform armX0{};
+      c.phys.GetTransform(armBody0, armX0);
+      // Kill it; the corpse falls (the limb moves a lot), the arrow rides.
+      m->Die();
+      support::RunTicks(*f.rig, 45);
+      const uint64_t armBody1 = mobs.LimbBody(f.id, arm);
+      const uint64_t arrowBody1 = mobs.LimbBody(f.id, slot);
+      BodyTransform armX1{};
+      c.phys.GetTransform(armBody1, armX1);
+      const float armMoved = (armX1.pos - armX0.pos).len();
+      const Rel r1 = relOf(arrowBody1, armBody1);
+      const bool stillThere = arrowBody1 != 0 && m->IsArrowSlot(slot);
+      const float drift = r0.ok && r1.ok ? relDiff(r0, r1) : 1e9f;
+      float depthCm = 0.0f, hpIn = 0.0f;
+      for (const ArrowEvent& e : ev)
+        if (e.kind == ArrowEvent::Kind::Hit &&
+            e.r.outcome == PierceOutcome::Embedded) {
+          depthCm = e.r.depth * kVoxelMeters * 100.0f;
+          hpIn = e.r.hpCharged;
+        }
+      lines += Format(
+          "(a) armU half draw: embedded %.1f cm (hp %.1f), slot %d on armU; "
+          "dead and fallen, arm moved %.2f vox, arrow drift in the arm's frame "
+          "%.4f | ",
+          depthCm, hpIn, slot, armMoved, drift);
+      if (!stillThere) fail("(a) the arrow is gone from the corpse");
+      if (armMoved < fallMin)
+        fail(Format("(a) the dead arm moved only %.2f vox (< %.2f): nothing "
+                    "was shown to ride",
+                    armMoved, fallMin));
+      if (!(drift <= rideTol))
+        fail(Format("(a) the arrow drifted %.4f in the arm's frame (> %.3f)",
+                    drift, rideTol));
+      // ...and comes off WITH the arm.
+      mobs.Sever(f.id, arm);
+      support::RunTicks(*f.rig, 2);
+      const WorldItem* wi = ground.Find(arrowBody1);
+      const uint64_t strapHost = c.debris.WornHostOf(arrowBody1);
+      lines += Format("severed: arrow body %s, strapped to the arm piece %s | ",
+                      wi && wi->name == "arrow" ? "registered" : "UNREGISTERED",
+                      strapHost == armBody1 ? "yes" : "NO");
+      if (!wi || wi->name != "arrow")
+        fail("(a) the severed arm's arrow is not a registered ground item");
+      if (strapHost != armBody1)
+        fail("(a) the severed arm's arrow is not strapped to the arm piece");
+    }
+  }
+
+  // ======== (b) THROUGH, (d) PULL-OUT, torso arrows to kill ====================
+  int torsoKill = -1;
+  {
+    Fixture f = fixture(71000);
+    if (!f.id) {
+      detail = "the fixture human did not spawn (torso)";
+      return Status::Fail;
+    }
+    // (d): half draw into the torso embeds; G's take pulls it into the kit.
+    const uint32_t s0 = 0xB0001u;
+    const Vec3 torsoAim = f.torsoC - f.side * 0.6f;   // off the midline
+    shoot(f, torsoAim, f.front, 0.5f * fullVox, s0);
+    support::RunTicks(*f.rig, 2);
+    auditHits(eventsOf(f, s0));
+    int slot = -1;
+    for (const ArrowEvent& e : eventsOf(f, s0))
+      if (e.kind == ArrowEvent::Kind::Embedded) slot = e.slot;
+    Mob* m = mobs.FindCreature(f.id);
+    if (slot < 0 || m == nullptr) {
+      fail("(d) half draw into the torso did not embed");
+    } else {
+      Kit kit;
+      const uint64_t ab = mobs.LimbBody(f.id, slot);
+      std::string got;
+      const bool pulled = PullArrowToKit(mobs, ab, kit, c.items, &got);
+      const int inKit = KitAmmoCount(kit, "arrow");
+      lines += Format("(d) pulled the torso arrow: %s, kit %d, %d left in it | ",
+                      pulled ? "yes" : "NO", inKit, m->EmbeddedArrowCount());
+      if (!pulled || inKit != 1 || m->EmbeddedArrowCount() != 0)
+        fail("(d) the pull-out did not move the arrow into the kit");
+    }
+    // (b) + the count: full draw through the torso until it dies (bounded).
+    // The aim is re-measured before every shot: the creature is alive and
+    // the real tick runs between them.
+    std::string seq;
+    for (int k = 0; k < 10 && mobs.IsAlive(f.id); k++) {
+      const uint32_t sk = 0xB0100u + (uint32_t)k;
+      const Vec3 tC = centroid(f.id, torso), aC = centroid(f.id, arm);
+      Vec3 sd = tC - aC;
+      sd.y = 0.0f;
+      sd = sd.len() > 1e-3f ? sd.normalized() : f.side;
+      const Vec3 fr = Vec3{0, 1, 0}.cross(sd).normalized();
+      const Vec3 off = Vec3{0, 1, 0} * (0.5f * (float)(k % 3) - 0.5f);
+      shoot(f, tC - sd * 0.6f + off, fr, fullVox, sk);
+      support::RunTicks(*f.rig, 3);
+      const std::vector<ArrowEvent> ev = eventsOf(f, sk);
+      auditHits(ev);
+      const ArrowEvent* first = nullptr;
+      bool after = false;
+      for (const ArrowEvent& e : ev) {
+        if (first == nullptr && e.kind == ArrowEvent::Kind::Hit && e.mobId == f.id)
+          first = &e;
+        else if (first != nullptr)
+          after = true;
+      }
+      // ...still in the air past the body counts as flying on.
+      for (const ArrowFlight& fl : f.rig->Authority().arrows.Flights())
+        if (fl.seed == sk && first != nullptr) after = true;
+      seq += first ? Format("%s%.0f", k ? "," : "", first->r.hpCharged)
+                   : std::string(k ? ",miss" : "miss");
+      if (k == 0) {
+        const bool through =
+            first != nullptr && first->r.outcome == PierceOutcome::Exited;
+        lines += Format("(b) full draw at the torso: %s, then %s | ",
+                        first ? PierceOutcomeName(first->r.outcome) : "no hit",
+                        after ? "it flew on" : "NOTHING after it");
+        if (!through || !after)
+          fail("(b) a full-draw arrow did not go through the torso and on");
+      }
+      if (!mobs.IsAlive(f.id)) torsoKill = k + 1;
+    }
+    lines += Format("torso: %d full-draw arrows killed (hp per arrow %s) | ",
+                    torsoKill, seq.c_str());
+    RecordObserved("arrowTorsoKill", (double)torsoKill);
+    if (torsoKill < torsoKillMin || torsoKill > torsoKillMax)
+      fail(Format("torso arrows to kill %d outside %d..%d", torsoKill,
+                  torsoKillMin, torsoKillMax));
+  }
+
+  // ======== the head: printed for the owner, not asserted ======================
+  {
+    Fixture f = fixture(72000);
+    int headKill = -1;
+    std::string seq;
+    for (int k = 0; f.id && k < 8 && mobs.IsAlive(f.id); k++) {
+      const uint32_t sk = 0xC0100u + (uint32_t)k;
+      const Vec3 hC = centroid(f.id, head), tC = centroid(f.id, torso),
+                 aC = centroid(f.id, arm);
+      Vec3 sd = tC - aC;
+      sd.y = 0.0f;
+      sd = sd.len() > 1e-3f ? sd.normalized() : f.side;
+      const Vec3 off = Vec3{0, 1, 0} * (0.25f * (float)(k % 3) - 0.25f);
+      shoot(f, hC + off, sd, fullVox, sk);
+      support::RunTicks(*f.rig, 3);
+      const std::vector<ArrowEvent> ev = eventsOf(f, sk);
+      auditHits(ev);
+      float hp = 0.0f;
+      for (const ArrowEvent& e : ev)
+        if (e.kind == ArrowEvent::Kind::Hit && e.mobId == f.id) hp += e.r.hpCharged;
+      seq += Format("%s%.0f", k ? "," : "", hp);
+      if (!mobs.IsAlive(f.id)) headKill = k + 1;
+    }
+    RecordObserved("arrowHeadKill", (double)headKill);
+    lines += Format("head: %d full-draw arrows killed (hp per arrow %s) | ",
+                    headKill, seq.c_str());
+  }
+
+  // ======== (e) the glance + (c) TERRAIN ========================================
+  {
+    Fixture f = fixture(73000);
+    // (e) THE GLANCE, on the fresh pose: a spent arrow on the torso -- through
+    // the one entry point the flights use -- charges less than the flat damage.
+    {
+      std::vector<ParticleSpawn> spawns;
+      Penetrator slow = ArrowPenetrator(*arrowDef, 1.5f, 0xE001u);
+      const PierceFlight pf =
+          PierceAlongRay(c.phys, mobs, c.debris, c.world, spawns,
+                         f.torsoC - f.side * 0.6f - f.front * kStandOff,
+                         f.front, 2.0f * kStandOff, slow);
+      const PierceHit* g = pf.hits.empty() ? nullptr : &pf.hits.front();
+      lines += Format("(e) a spent arrow (1.5 m/s): %s, hp %.2f (flat %.0f) | ",
+                      g ? PierceOutcomeName(g->r.outcome) : "no hit",
+                      g ? g->r.hpCharged : 0.0f, arrowDef->arrow.damage);
+      if (g == nullptr || g->r.outcome != PierceOutcome::Glanced ||
+          g->r.hpCharged >= arrowDef->arrow.damage)
+        fail("(e) a glance was charged the flat damage (or did not glance)");
+    }
+    // Down into the ground a body-length off to the side, steeply.
+    const Vec3 dir = (f.side * -1.0f + Vec3{0, -1.2f, 0}).normalized();
+    const Vec3 aim = f.torsoC - f.side * 14.0f;
+    const uint32_t s0 = 0xD0001u;
+    f.rig->Authority().arrows.Launch(*arrowDef, aim - dir * 6.0f, dir, fullVox,
+                                     Vec3{}, s0, {});
+    support::RunTicks(*f.rig, 4);
+    uint64_t stuck = 0;
+    for (const ArrowEvent& e : eventsOf(f, s0))
+      if (e.kind == ArrowEvent::Kind::Stuck) stuck = e.body;
+    BodyTransform x0{}, x1{};
+    const bool have = stuck && c.phys.GetTransform(stuck, x0);
+    support::RunTicks(*f.rig, 30);
+    const bool still = stuck && c.phys.GetTransform(stuck, x1) &&
+                       (x1.pos - x0.pos).len() < 1e-3f;
+    const WorldItem* wi = stuck ? ground.Find(stuck) : nullptr;
+    // THE GROUND PICKUP, as main.cpp's take does it: the registry's instance
+    // into the kit, then the body goes (its release hook drops the entry).
+    Kit kit;
+    bool picked = false;
+    if (wi != nullptr) {
+      const ItemStack one = KitStackFrom(wi->One(), c.items);
+      picked = kit.bag.Add(one) >= 0 && c.debris.DestroyBody(stuck);
+    }
+    const bool gone = stuck && ground.Find(stuck) == nullptr;
+    lines += Format("(c) into the ground: %s, %s, %s, picked up %s (kit %d) | ",
+                    have ? "stuck" : "NOT STUCK", still ? "motionless" : "MOVED",
+                    wi ? "registered" : "UNREGISTERED", picked && gone ? "yes" : "NO",
+                    KitAmmoCount(kit, "arrow"));
+    if (!have || !still || wi == nullptr || !picked || !gone ||
+        KitAmmoCount(kit, "arrow") != 1)
+      fail("(c) the ground shot did not stick as a pickable, motionless item");
+  }
+  lines += Format("(e) %d hits got in, %d charged under the flat %.0f | ",
+                  inHits, inHitsShort, arrowDef->arrow.damage);
+  if (inHits == 0 || inHitsShort != 0)
+    fail("(e) a hit that got in was not charged the arrow's damage");
+
+  // ======== (f) THE VOLLEY, TWICE ==============================================
+  // Every fact the volley produced, one line each in a fixed order, the bits
+  // of every float: the digest is these lines, and a mismatch NAMES the first
+  // line that differs (CLAUDE.md rule 6: attribution, not a bare count).
+  auto volley = [&](std::string& summary, std::vector<std::string>& facts) {
+    facts.clear();
+    Fixture f = fixture(74000);
+    if (!f.id) return uint64_t{0};
+    const Vec3 aims[5] = {f.headC, f.torsoC - f.side * 0.6f, f.armC,
+                          leg >= 0 ? f.legC : f.torsoC, f.torsoC + f.side * 0.6f};
+    const Vec3 dirs[5] = {f.side, f.front, f.side, f.front, f.front * -1.0f};
+    const float speeds[5] = {fullVox, 0.5f * fullVox, fullVox, 0.7f * fullVox,
+                             fullVox};
+    for (int k = 0; k < 5; k++)
+      shoot(f, aims[k], dirs[k], speeds[k], 0xF0000u + (uint32_t)k);
+    support::RunTicks(*f.rig, volleyTicks);
+    auto bits = [](float v) {
+      uint32_t u;
+      std::memcpy(&u, &v, 4);
+      return u;
+    };
+    int embedded = 0, stuck = 0, hits = 0;
+    for (const ArrowEvent& e : f.rig->Authority().arrows.Events()) {
+      facts.push_back(Format(
+          "event kind %d tick %u seed %x mob %llu limb %d slot %d at "
+          "%08x,%08x,%08x outcome %s cells %u carved %u depth %08x hp %08x",
+          (int)e.kind, e.tick, e.seed, (unsigned long long)e.mobId, e.limb,
+          e.slot, bits(e.at.x), bits(e.at.y), bits(e.at.z),
+          PierceOutcomeName(e.r.outcome), e.r.cells, e.r.carved,
+          bits(e.r.depth), bits(e.r.hpCharged)));
+      if (e.kind == ArrowEvent::Kind::Embedded) embedded++;
+      if (e.kind == ArrowEvent::Kind::Stuck) stuck++;
+      if (e.kind == ArrowEvent::Kind::Hit) hits++;
+    }
+    facts.push_back(Format("total hp %08x", bits(mobs.TotalHp(f.id))));
+    // Where every arrow stuck in the body is, now, and the limb it is in.
+    if (Mob* m = mobs.FindCreature(f.id))
+      for (int s = m->AppendedBase(); s < m->LimbCount(); s++)
+        if (m->IsArrowSlot(s)) {
+          BodyTransform x{}, hx{};
+          c.phys.GetTransform(mobs.LimbBody(f.id, s), x);
+          c.phys.GetTransform(mobs.LimbBody(f.id, m->WornHostOf(s)), hx);
+          facts.push_back(Format(
+              "arrow slot %d host %d at %08x,%08x,%08x host at %08x,%08x,%08x",
+              s, m->WornHostOf(s), bits(x.pos.x), bits(x.pos.y), bits(x.pos.z),
+              bits(hx.pos.x), bits(hx.pos.y), bits(hx.pos.z)));
+        }
+    uint64_t h = 1469598103934665603ull;
+    for (const std::string& s : facts)
+      for (char ch : s) {
+        h ^= (uint8_t)ch;
+        h *= 1099511628211ull;
+      }
+    summary = Format("%d hits, %d embedded, %d stuck, hp %.2f", hits, embedded,
+                     stuck, mobs.TotalHp(f.id));
+    return h;
+  };
+  std::string v1, v2;
+  std::vector<std::string> f1, f2;
+  const uint64_t d1 = volley(v1, f1), d2 = volley(v2, f2);
+  lines += Format("(f) volley of 5: %s; digest %016llx vs %016llx %s | ",
+                  v1.c_str(), (unsigned long long)d1, (unsigned long long)d2,
+                  d1 == d2 && d1 != 0 ? "IDENTICAL" : "DIFFER");
+  if (d1 == 0 || d1 != d2) {
+    size_t k = 0;
+    while (k < f1.size() && k < f2.size() && f1[k] == f2[k]) k++;
+    fail(Format("(f) the volley did not replay bit-identically: first "
+                "difference at fact %zu of %zu/%zu: [%s] vs [%s]",
+                k, f1.size(), f2.size(), k < f1.size() ? f1[k].c_str() : "-",
+                k < f2.size() ? f2[k].c_str() : "-"));
+  }
+
+  // ======== (g) THE INPUT PATH: draw, hold, release ============================
+  {
+    Fixture f = fixture(75000);
+    PlayerSession& s = f.rig->Session();
+    Kit& kit = s.kit();
+    kit.equip.slots[EquipSlotOfHand(Hand::Right)] = StackOf(c.items, bowIdx);
+    kit.bag.Add(StackOf(c.items, arrowIdx, 3));
+    ArrowFlights& fl = f.rig->Authority().arrows;
+    const uint64_t launched0 = fl.stats.launched;
+    auto hold = [&](int ticks, bool down) {
+      support::RunTicks(*f.rig, ticks, [&](uint32_t, support::TickOps& o) {
+        o.intent.handsUp = true;
+        if (down) o.input.SetHeld(TB_ATTACK, true);
+      });
+    };
+    // A tap: one tick down, then up. Under minDraw: nothing flies.
+    hold(1, true);
+    hold(1, false);
+    const uint64_t afterTap = fl.stats.launched - launched0;
+    const int ammoAfterTap = KitAmmoCount(kit, "arrow");
+    // A full draw, held a little past it, then let go.
+    hold(bowDef->bow.drawTicks + 3, true);
+    // The HUD's draw (UIState::bowDraw, written by the tick) at full; the
+    // speed a full draw looses at is BowArrowSpeed of it, the bow's
+    // drawSpeed exactly (the eased fraction is 1 there).
+    const float drawn = f.rig->Authority().ui.bowDraw;
+    hold(1, false);
+    const uint64_t afterDraw = fl.stats.launched - launched0;
+    const int ammoAfterDraw = KitAmmoCount(kit, "arrow");
+    lines += Format("(g) input: tap loosed %llu (pack %d); full draw %.2f "
+                    "loosed %llu (pack %d)",
+                    (unsigned long long)afterTap, ammoAfterTap, drawn,
+                    (unsigned long long)afterDraw, ammoAfterDraw);
+    if (afterTap != 0 || ammoAfterTap != 3)
+      fail("(g) a tap under minDraw loosed an arrow");
+    if (afterDraw != 1 || ammoAfterDraw != 2 || drawn < 0.999f)
+      fail("(g) a full draw and release did not loose exactly one arrow");
+  }
+
+  mobs.Reset();
+  c.debris.Reset();
+  PrepareWorld(c);
+  detail = Format("arrow %.0f g, flat %.0f hp, full draw %.0f m/s; %s%s",
+                  arrowDef->arrow.massKg * 1000.0f, arrowDef->arrow.damage,
+                  CellsToMetres(fullVox), lines.c_str(), why.c_str());
+  std::printf("arrow: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 const std::vector<Gate>& WoundGates() {
   static const std::vector<Gate> g = {
       {"wound-chip", "mob", {}, false, GateWoundChip, /*needsRender=*/false},
@@ -11284,6 +11831,10 @@ const std::vector<Gate>& WoundGates() {
       // A point driven through: arrows at three energies, through an arm into
       // the torso, and a harder skin that stops what goes through a man.
       {"pierce", "mob", {}, false, GatePierce, false},
+      // The bow and its arrows on the real tick: embed and ride, through and
+      // on, stick in the ground, pull out, flat damage only when it got in, a
+      // volley twice, and the draw/release input path.
+      {"arrow", "mob", {}, false, GateArrow, false},
       {"wound-rebleed", "mob", {}, false, GateWoundRebleed, false},
       {"corpse-blunt", "mob", {}, false, GateCorpseBlunt, false},
       {"bruise-is-skin", "mob", {}, false, GateBruiseIsSkin, false},

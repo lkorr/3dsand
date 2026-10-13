@@ -85,6 +85,19 @@ charged, so decision 1 has its numbers.
 
 ## Arrows and bows (package C, after A+B)
 
+**STATUS (2026-10-12): DONE on branch worktree-agent-a817365c4a9b142d0**
+(DESIGN.md "The bow and its arrows"). Bow + arrow items (kind `ammo`, art
+from `scripts/gen_bow_items.py`), flat `damage` 35 via `Penetrator::hp`,
+starting kit (bow on the hotbar, 30 arrows in the pack), draw/release through
+TickInput's held mask in PhaseG, `bow_draw` clip, pixel HUD bow, CPU integer
+flights in `TickAuthorityCtx::arrows` (`game/arrows.*`) sharing the spell
+VM's grid probe (`game/flightprobe.h`), embedded arrows as follower slots at
+an angle (`Mob::EmbedArrow`, `MobLimb::wornRotated`), terrain shots as
+kinematic ground items, G pull-out (`PullArrowToKit`), peers' bodies routed
+as `MeleeHitKind::Pierce`, gate `arrow`, `--shot-mob human:>N`. Open: embedded
+arrows are not saved and do not cross a handoff; the shooter does not see an
+arrow stuck in a peer's creature.
+
 - Items: `bow` (weaponClass "bow": drawSpeedMps, drawTimeMs) and `arrow`
   (massKg, tipRadius, head material, stack count; carried in the pack).
   Art as `.vox` + sidecar like every other item.

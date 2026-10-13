@@ -1666,6 +1666,18 @@ struct MobLimb {
   // Stable across RemoveAppendedSlots: a host is always a BASE limb, and the
   // shift only renumbers appended slots.
   int wornHost = -1;
+  // ---- A FOLLOWER AT AN ANGLE (an embedded arrow, Mob::EmbedArrow) ----------
+  //
+  // A garment shares its host's rotation exactly, so DriveWornShells only has
+  // to carry the rigid OFFSET. An arrow stuck in a limb points wherever it
+  // flew, so it also carries a fixed rotation RELATIVE to the host (host
+  // frame -> its own): its world rotation is host * wornRot, and its corner is
+  // reached the same two steps a shell's is (the host's anchor through the
+  // host, then back off by `anchorLimb` through the slot's own rotation).
+  // False on every garment, which therefore takes the original arithmetic
+  // untouched.
+  bool wornRotated = false;
+  Quat wornRot{0, 0, 0, 1};
   float hp = 0;
   std::vector<DebrisVoxel> voxels;
   IVec3 size{};
@@ -3093,6 +3105,36 @@ class Mob {
   bool HoldingAnything() const {
     return held_[0].slot >= 0 || held_[1].slot >= 0;
   }
+  // ---- ARROWS STUCK IN THIS BODY (docs/PLAN_projectiles.md C, game/arrows.h)
+  //
+  // An arrow that EMBEDS stays in the limb it stopped in: an appended slot of
+  // its own (tag "arrow", named "arrow:<item>"), a FOLLOWER of the struck limb
+  // exactly as a worn shell is (MobLimb::wornHost) but at the angle it flew in
+  // at (MobLimb::wornRotated / wornRot), kinematic, on the PROP layer (it
+  // touches nothing; every ray still sees it, which is how G finds it) and with
+  // NO physics joint -- debris.h StrapBody's note is the whole reason. It rides
+  // the limb alive, rides it dead (corpses are Mobs: DriveWornShells keeps
+  // posing followers), and on a sever it goes with the piece as a strapped
+  // debris body registered as the item (ShedGearBeforeDetach), so G picks it
+  // off the severed arm too. Not saved: a save drops it (open issue).
+  //
+  // `tipWorld` is where the point stopped (PierceResult::stopWorld) and
+  // `dirWorld` the way it was going; the art's point (ItemDef::ArrowSpec::tip)
+  // is put there along that axis. Returns the slot, or -1 (no such limb, the
+  // creature is at kMaxEmbeddedArrows, no art, physics refused).
+  int EmbedArrow(const ItemDef& item, int hostLimb, Vec3 tipWorld,
+                 Vec3 dirWorld);
+  bool IsArrowSlot(int slot) const {
+    return slot >= baseLimbs_ && slot < (int)limbDefs_.size() &&
+           limbDefs_[slot].tag == "arrow";
+  }
+  // The item an arrow slot is ("arrow"), or "" for any other slot.
+  std::string ArrowItemOf(int slot) const;
+  int EmbeddedArrowCount() const;
+  // Take the arrow out (G): the slot and its body are removed. Nothing else
+  // happens to the wound (owner, 2026-10-12: no plug/bleed coupling).
+  bool PullArrow(int slot);
+  static constexpr int kMaxEmbeddedArrows = 8;
   Hand StrikeHand() const { return strikeHand_; }
   // Point the driver's fall-back at this hand's held item. A stroke's
   // ArmForStyle sets it; a caller that only wants the ready pose on the other

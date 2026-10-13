@@ -247,7 +247,8 @@ PierceFlight PierceAlongRay(Physics& phys, MobSystem& mobs, DebrisSystem& debris
                             World& world, std::vector<ParticleSpawn>& spawns,
                             Vec3 fromWorld, Vec3 dirWorld, float maxDistVox,
                             const Penetrator& pen,
-                            const std::vector<uint64_t>& ignore) {
+                            const std::vector<uint64_t>& ignore,
+                            const std::string& embedItem) {
   PierceFlight f;
   f.speedMps = pen.speedMps;
   const float dl = dirWorld.len();
@@ -289,10 +290,46 @@ PierceFlight PierceAlongRay(Physics& phys, MobSystem& mobs, DebrisSystem& debris
     h.body = body;
     h.along = hitAt;
     int li = -1;
+    // A BODY ANOTHER MACHINE OWNS (game/meleehit.h, MeleeHitKind::Pierce): the
+    // record for its owner, in the struck body's own frame and taken BEFORE
+    // the channel's carve rebuilds it under a new handle; the same channel
+    // then runs here as PRESENTATION (rule 4: the shooter sees the wound and
+    // flies on with what it left), its gore to a sink nobody submits.
+    auto wireFor = [&](CombatantRef target, const std::string& slot) {
+      MeleeHit wire;
+      wire.c.target = target;
+      wire.c.kind = (uint32_t)MeleeHitKind::Pierce;
+      BodyTransform xf{};
+      phys.GetTransform(body, xf);
+      const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+      wire.c.at = QuatRotateInv(q, origin - xf.pos);
+      wire.c.sweepDir = QuatRotateInv(q, d);
+      wire.c.pierce = cur;
+      wire.slot = slot;
+      wire.embedItem = embedItem;
+      return wire;
+    };
+    std::vector<ParticleSpawn> ghostGore;
     if (Mob* m = mobs.FindOwner(body, &li)) {
+      // AN ARROW ALREADY IN THE BODY is not the body (Mob::EmbedArrow): passed
+      // by like a capsule, so the point goes on to the flesh it is stuck in.
+      if (li >= 0 && m->IsArrowSlot(li)) continue;
       h.mobId = m->Id();
       h.limb = li;
-      mobs.PierceLimb(body, origin, d, cur, world, spawns, h.r);
+      if (MobSystem::OwnedHere(*m)) {
+        mobs.PierceLimb(body, origin, d, cur, world, spawns, h.r);
+      } else {
+        MeleeHit wire = wireFor(mobs.RefOf(*m), m->SlotName(li));
+        mobs.PierceLimb(body, origin, d, cur, world, ghostGore, h.r);
+        if (h.r.hit && !h.r.missed && !wire.slot.empty())
+          mobs.QueueMeleeHit(std::move(wire));
+      }
+    } else if (debris.IsGhost(body)) {
+      MeleeHit wire = wireFor(
+          CombatantRef{CombatantRef::kBody, debris.GlobalIdOf(body)}, {});
+      debris.PierceBody(body, origin, d, cur, world, ghostGore, h.r);
+      if (h.r.hit && !h.r.missed && wire.c.target.id != 0)
+        mobs.QueueMeleeHit(std::move(wire));
     } else {
       debris.PierceBody(body, origin, d, cur, world, spawns, h.r);
     }

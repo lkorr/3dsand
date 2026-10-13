@@ -9770,6 +9770,9 @@ Physics::BodyRole Mob::LimbRole(size_t i) const {
   if (i >= limbs_.size()) return R::Debris;
   const MobLimb& l = limbs_[i];
   if (l.holdSeconds > 0) return R::SeveredHold;
+  // AN ARROW STUCK IN THE BODY is a prop in every phase (Mob::EmbedArrow): it
+  // rides its limb, touches nothing, and every ray still sees it.
+  if (l.wornHost >= 0 && IsArrowSlot((int)i)) return R::HeldProp;
   if (!alive_) return R::RigDead;
   // A GARMENT IS A FOLLOWER in every phase a live creature has (wornHost):
   // kinematic, posed by DriveWornShells, never handed to the solver.
@@ -9890,6 +9893,14 @@ ItemInstance Mob::ShedGearBeforeDetach(int limbIndex) {
     }
     report(std::move(lg));
     hh.Clear();
+    return shed;
+  }
+  // AN ARROW STUCK IN THE LIMB leaves with it as the item it is
+  // (Mob::EmbedArrow): DetachLimb straps it to the severed piece and registers
+  // the body as this item, so G pulls it off the piece on the ground.
+  if (IsArrowSlot(limbIndex)) {
+    shed.name = ArrowItemOf(limbIndex);
+    shed.count = 1;
     return shed;
   }
   if (!IsWornSlot(limbIndex)) return shed;
@@ -12251,10 +12262,14 @@ void Mob::DriveWornShells() {
     // off to this shell's own corner. `anchorLimb` on a shell is that same
     // anchor measured from the shell's corner, which is what makes the pair a
     // rigid offset rather than a per-frame fit.
-    const Quat q{host.xf.quat[0], host.xf.quat[1], host.xf.quat[2],
-                 host.xf.quat[3]};
+    const Quat qh{host.xf.quat[0], host.xf.quat[1], host.xf.quat[2],
+                  host.xf.quat[3]};
+    // A follower AT AN ANGLE (an embedded arrow, MobLimb::wornRotated) turns
+    // by its fixed rotation relative to the host; a garment takes the host's
+    // own, by exactly the arithmetic it always had.
+    const Quat q = shell.wornRotated ? QuatMul(qh, shell.wornRot) : qh;
     const Vec3 pos =
-        host.xf.pos + Rotate(q, host.anchorLimb) - Rotate(q, shell.anchorLimb);
+        host.xf.pos + Rotate(qh, host.anchorLimb) - Rotate(q, shell.anchorLimb);
     const float quat[4] = {q.x, q.y, q.z, q.w};
     if (!phys_->SetBodyTransform(shell.body, pos, quat)) continue;
     // The host's velocities, so the garment agrees with the limb inside it
@@ -12376,7 +12391,9 @@ void Mob::SyncHairTuck() {
   if (head >= 0 && limbs_[(size_t)head].body) {
     for (size_t k = (size_t)nBase; k < limbs_.size(); k++) {
       const MobLimb& s = limbs_[k];
-      if (s.wornHost == head && s.body && s.holdSeconds <= 0)
+      // An arrow in the head is not headgear: it tucks no hair.
+      if (s.wornHost == head && s.body && s.holdSeconds <= 0 &&
+          !IsArrowSlot((int)k))
         shells.push_back((int)k);
     }
   }
@@ -27834,6 +27851,15 @@ void Mob::ReleaseRigToDebris() {
     // DebrisSystem's now: loose Debris, clear of the player first, then debris
     // like any other — the same rule a severed piece follows (Mob::Die's note).
     phys_->SetBodyRole(limb.body, Physics::BodyRole::Debris);
+    // AN ARROW STUCK IN THE HEAP is still the item it is (Mob::EmbedArrow):
+    // strapped below like a garment, and registered so G can take it.
+    if (IsArrowSlot((int)i)) {
+      ItemInstance arrow;
+      arrow.name = ArrowItemOf((int)i);
+      arrow.count = 1;
+      if (sys_ && sys_->onItemShed_) sys_->onItemShed_(limb.body, arrow);
+      debris_->MarkItemBody(limb.body);
+    }
     limb.skinVoxels.clear();
     limb.carved = false;  // brick ownership moved with the body (see DetachLimb)
     // ...and the index with it. The avatar keeps its limb list past death,
@@ -32604,6 +32630,144 @@ int Mob::AppendWornShell(const ItemDef& item, const ItemCover& cover,
   anim_.partAlive.resize(skel_.parts.size(), 1);
   anim_.springs.resize(skel_.parts.size(), SpringState{});
   return slot;
+}
+
+// ---- AN ARROW STUCK IN A LIMB (mob.h EmbedArrow) ----------------------------
+//
+// A worn shell's slot with three differences, each for one reason:
+//   - it is AT AN ANGLE to its host (wornRotated/wornRot): an arrow points the
+//     way it flew, a garment the way the limb does;
+//   - its body is on the PROP layer (HeldProp), not the shell's: a stick
+//     poking out of a man must not shove the debris it brushes or the player
+//     standing beside him, and every ray (G's look ray, a blade's probes,
+//     another arrow) still sees it;
+//   - its host is always a BASE limb. A hit on a garment shell embeds in the
+//     limb the shell is strapped to (the shell rides that limb too), and a
+//     hit on a held item embeds nowhere. Base hosts are what keep `wornHost`
+//     stable across RemoveAppendedSlots (MobLimb::wornHost's last note).
+int Mob::EmbedArrow(const ItemDef& item, int hostLimb, Vec3 tipWorld,
+                    Vec3 dirWorld) {
+  if (!phys_ || !item.IsAmmo() || item.voxels.empty()) return -1;
+  if (hostLimb < 0 || hostLimb >= (int)limbs_.size()) return -1;
+  int host = hostLimb;
+  if (host >= baseLimbs_) {
+    if (IsHeldSlot(host) || IsArrowSlot(host)) return -1;
+    host = limbs_[(size_t)host].wornHost;
+    if (host < 0 || host >= baseLimbs_) return -1;
+  }
+  if (!limbs_[(size_t)host].body || limbs_[(size_t)host].holdSeconds > 0)
+    return -1;
+  // BOUNDED (rule 2): a pincushion past the cap breaks the new arrow instead.
+  if (EmbeddedArrowCount() >= kMaxEmbeddedArrows) return -1;
+  const float dl = dirWorld.len();
+  if (!(dl > 1e-6f)) return -1;
+  const Vec3 d = dirWorld * (1.0f / dl);
+
+  // The host as it stands NOW: the channel's carve may just have rebuilt it
+  // under a new handle and rebased its corner (anchorLimb moved with it, so
+  // the anchor in the world did not).
+  {
+    MobLimb& h = limbs_[(size_t)host];
+    phys_->GetTransform(h.body, h.xf);
+  }
+  const uint32_t itemScale = item.scale ? item.scale : 1u;
+  const float inv = 1.0f / (float)itemScale;
+  // +x (the arrow's axis, nock to point) onto the flight; the point onto the
+  // stop.
+  const Quat qa = QuatNormalize(QuatFromTo(Vec3{1, 0, 0}, d));
+  const Vec3 cornerW = tipWorld - QuatRotate(qa, item.arrow.tip);
+
+  const int slot = (int)limbs_.size();
+  limbs_.push_back(MobLimb{});
+  limbDefs_.push_back(MobLimbDef{});
+  skel_.parts.push_back(AnimPart{});
+  hidden_.push_back(0);
+
+  MobLimbDef& ld = limbDefs_[(size_t)slot];
+  ld.name = "arrow:" + item.name;
+  ld.parent = limbDefs_[(size_t)host].name;   // DetachLimb's recursion finds it
+  ld.joint = Physics::JointType::Fixed;
+  ld.hp = item.hp;
+  ld.severable = true;
+  ld.vital = false;
+  ld.bloodless = true;   // wood and steel: it never bleeds, a carve never drips
+  // Not a figure tag (BodySlotFor -1): the HUD body diagram counts the
+  // creature's wounds, not what is stuck in them.
+  ld.tag = "arrow";
+  ld.microModel = item.microModel;
+
+  AnimPart& ap = skel_.parts[(size_t)slot];
+  ap.name = ld.name;
+  ap.parent = host;
+  ap.tag = ld.tag;
+  ap.rest = Transform{};
+  ap.anchorLocal = skel_.parts[(size_t)host].anchorLocal;
+
+  const MobLimb& h = limbs_[(size_t)host];
+  const Quat qh{h.xf.quat[0], h.xf.quat[1], h.xf.quat[2], h.xf.quat[3]};
+  const Vec3 anchorW = h.xf.pos + Rotate(qh, h.anchorLimb);
+  MobLimb& p = limbs_[(size_t)slot];
+  p.hp = item.hp;
+  p.size = item.size;
+  p.microModel = item.microModel;
+  p.ownSkinScale = itemScale;
+  p.ownPhysScale = itemScale;
+  p.restOffset = h.restOffset;
+  p.anchorRoot = h.anchorRoot;
+  // THE SAME TWO STEPS A SHELL TAKES (DriveWornShells): reach the host's
+  // anchor through the host, back off to this slot's corner through its OWN
+  // rotation. anchorLimb is that anchor in the arrow's frame from its corner.
+  p.anchorLimb = QuatRotateInv(qa, anchorW - cornerW);
+  p.wornRotated = true;
+  p.wornRot = QuatNormalize(QuatMul(QuatConj(qh), qa));
+  p.voxels.reserve(item.voxels.size());
+  for (const PrefabVoxel& v : item.voxels) {
+    const uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
+    p.voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, v.color,
+                        (uint16_t)(v.material | (variant << 12))});
+  }
+  BodyTransform bxf{};
+  bxf.pos = cornerW;
+  bxf.quat[0] = qa.x; bxf.quat[1] = qa.y; bxf.quat[2] = qa.z; bxf.quat[3] = qa.w;
+  p.body = phys_->CreateDebrisBodyXf(p.voxels, bxf, DensityOf(), true, inv);
+  if (p.body == 0) {
+    limbs_.pop_back();
+    skel_.parts.pop_back();
+    limbDefs_.pop_back();
+    hidden_.pop_back();
+    return -1;
+  }
+  phys_->SetBodyKinematic(p.body, true);
+  p.xf = bxf;
+  p.wornHost = host;
+  phys_->SetBodyRole(p.body, LimbRole((size_t)slot), CollisionOwner());
+  anim_.partAlive.resize(skel_.parts.size(), 1);
+  anim_.springs.resize(skel_.parts.size(), SpringState{});
+  MarkInstancesDirty();
+  return slot;
+}
+
+std::string Mob::ArrowItemOf(int slot) const {
+  if (!IsArrowSlot(slot)) return std::string();
+  const std::string& n = limbDefs_[(size_t)slot].name;   // "arrow:<item>"
+  const size_t c = n.find(':');
+  return c == std::string::npos ? std::string() : n.substr(c + 1);
+}
+
+int Mob::EmbeddedArrowCount() const {
+  int n = 0;
+  for (int i = baseLimbs_; i < (int)limbs_.size(); i++)
+    if (IsArrowSlot(i) && limbs_[(size_t)i].body) n++;
+  return n;
+}
+
+bool Mob::PullArrow(int slot) {
+  if (!IsArrowSlot(slot) || !limbs_[(size_t)slot].body ||
+      limbs_[(size_t)slot].holdSeconds > 0)
+    return false;
+  RemoveAppendedSlots(slot, 1);
+  MarkInstancesDirty();
+  return true;
 }
 
 // THE KIT'S WAY ON AND OFF (mob.h WearItem). The rig half is WearOnRig; this

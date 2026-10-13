@@ -1,0 +1,36 @@
+{
+  "comment": "A war arrow: a spruce shaft, goose fletching (the red cock feather up), a steel bodkin. Ammunition (kind ammo): carried in the pack, shot from a bow, and what sticks out of whatever it embeds in. Regenerate with scripts/gen_bow_items.py. The point is the art's foremost cell (its material is the head's hardness); flight numbers are items.json's `arrow` block.",
+  "name": "arrow",
+  "model": "arrow",
+  "artVoxelsPerMetre": 80,
+  "hp": 6,
+  "severable": true,
+  "severImpactSpeed": 3.0,
+  "grip": {
+    "held_right": {
+      "translation": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        90,
+        -90,
+        0
+      ],
+      "scale": 1
+    }
+  },
+  "hilt": {
+    "min": [
+      24,
+      0,
+      0
+    ],
+    "size": [
+      10,
+      5,
+      5
+    ]
+  }
+}

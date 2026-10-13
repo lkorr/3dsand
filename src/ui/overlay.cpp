@@ -719,6 +719,74 @@ void Overlay::DrawHUD(const UIState& s) {
     }
     py += ph + 14.0f;
   }
+  // ---- the bow: a pixel bow under the crosshair whose string comes back ----
+  //
+  // With a bow in either hand (UIState::bowDraw >= 0; game/arrows.h): a
+  // braced bow drawn on the 2 px grid, 15 blocks tall, the stave bowing to
+  // the right of a string whose middle is pulled back to the left by the
+  // draw, with the nocked arrow across it. Under it, the draw as a bar (a
+  // notch where a release starts to loose at all) and the arrows left. At a
+  // FULL draw it holds still and the arrow's head goes ember -- the one state
+  // to catch without reading anything. No arrows: the count is cinnabar and
+  // there is no arrow on the string.
+  if (s.bowDraw >= 0.0f) {
+    const float b = 2.0f;                   // the pixel
+    const int rows = 15, mid = 7;
+    const float draw = std::clamp(s.bowDraw, 0.0f, 1.0f);
+    const bool full = draw >= 0.999f;
+    const bool nocked = s.arrowsLeft > 0;
+    const int pull = (int)std::lround(draw * 6.0f);   // blocks the string comes back
+    char count[16];
+    std::snprintf(count, sizeof count, "x%d", std::max(0, s.arrowsLeft));
+    const ImVec2 cs = ImGui::CalcTextSize(count);
+    const float glyphW = 13 * b;            // string pulled 6 + stave bow 4 + head 3
+    const float barW = 13 * b, barH = 4.0f;
+    const float inner = glyphW + 8.0f + cs.x;
+    const float x0 = std::floor((disp.x - inner) * 0.5f);
+    const float y0 = py;
+    const float tabH = rows * b + 4.0f + barH;
+    d->AddRectFilled(ImVec2(x0 - 6, y0 - 4), ImVec2(x0 + inner + 6, y0 + tabH + 4),
+                     IM_COL32(0, 0, 0, 170));
+    d->AddRect(ImVec2(x0 - 6, y0 - 4), ImVec2(x0 + inner + 6, y0 + tabH + 4),
+               full ? ui::ColEmber() : ui::ColBronze(), 0.0f, 0, 2.0f);
+    // Block (c, r): column 0 is the string at full draw, the stave's tips sit
+    // at column 6, its belly bows out to column 10.
+    auto px = [&](int c, int r, ImU32 col) {
+      d->AddRectFilled(ImVec2(x0 + c * b, y0 + r * b),
+                       ImVec2(x0 + (c + 1) * b, y0 + (r + 1) * b), col);
+    };
+    for (int r = 0; r < rows; r++) {
+      const float u = (float)(r - mid) / (float)mid;
+      const int stave = 6 + (int)std::lround(4.0f * (1.0f - u * u));
+      px(stave, r, (r == 0 || r == rows - 1) ? ui::ColGoldDim() : ui::ColGold());
+      if (std::abs(r - mid) <= 1) px(stave + 1, r, ui::ColBronze());  // the grip
+      // The string: a V from the tips to the nock, `pull` blocks back.
+      const int str = 6 - (int)std::lround((float)pull * (1.0f - std::fabs(u)));
+      px(str, r, ui::ColParch());
+    }
+    if (nocked) {
+      // The arrow on the string, its head past the stave.
+      const int nock = 6 - pull;
+      for (int c = nock; c <= 12; c++) px(c, mid, ui::ColGoldPale());
+      px(13 - 1, mid - 1, full ? ui::ColEmber() : ui::ColSteel());
+      px(13 - 1, mid + 1, full ? ui::ColEmber() : ui::ColSteel());
+      px(12, mid, full ? ui::ColEmber() : ui::ColSteel());
+      px(nock - 1 < 0 ? 0 : nock - 1, mid - 1, ui::ColBloodHi());  // fletching
+      px(nock - 1 < 0 ? 0 : nock - 1, mid + 1, ui::ColBloodHi());
+    }
+    // The draw as a bar, with the least-draw notch.
+    const float by = y0 + rows * b + 4.0f;
+    d->AddRectFilled(ImVec2(x0, by), ImVec2(x0 + barW, by + barH), ui::ColDeep());
+    d->AddRectFilled(ImVec2(x0, by), ImVec2(x0 + std::floor(barW * draw / b) * b, by + barH),
+                     full ? ui::ColEmber() : ui::ColGold());
+    const float nx = x0 + std::floor(barW * std::clamp(s.bowMinDraw, 0.0f, 1.0f) / b) * b;
+    d->AddRectFilled(ImVec2(nx, by - 2), ImVec2(nx + b, by + barH + 2), ui::ColParchDim());
+    const float tx = x0 + glyphW + 8.0f;
+    const float ty = y0 + std::floor((rows * b - cs.y) * 0.5f);
+    d->AddText(ImVec2(tx + 1, ty + 1), IM_COL32(0, 0, 0, 190), count);
+    d->AddText(ImVec2(tx, ty), nocked ? ui::ColGoldPale() : ui::ColBloodHi(), count);
+    py += tabH + 12.0f;
+  }
   // APPLY MODE (TB_APPLY): say it is on, and whose skin LMB would brush.
   if (s.applyShown) {
     const std::string t = s.applyTarget.empty() ? std::string("apply - aim at a body")

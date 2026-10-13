@@ -161,12 +161,38 @@ inline const std::vector<PrefabVoxel>* ItemGroundVoxels(const ItemDef& d,
 // a thing you just dropped is whatever the library says it is.
 // `inst` is WHICH one of `def` this is (its dye, what it holds, what it has
 // been through) and is registered whole; its name is `def`'s.
+//
+// DropItemToWorldXf is the same thing at a whole TRANSFORM, and optionally
+// KINEMATIC (`stuck`): an arrow standing in the ground where it struck
+// (game/arrows.h), or one about to be strapped to the loose body it embedded
+// in (DebrisSystem::StrapBody needs a body that may be made kinematic). A
+// stuck item is still an ordinary ground item -- registered, G picks it up --
+// it just does not fall until somebody takes it.
+inline uint64_t DropItemToWorldXf(const ItemDef& def, const ItemInstance& inst,
+                                  const BodyTransform& at, Vec3 vel,
+                                  Physics& phys, DebrisSystem& debris,
+                                  MicroBodySet* micro, WorldItems& reg,
+                                  const std::vector<PrefabVoxel>* lattice,
+                                  bool stuck);
 inline uint64_t DropItemToWorld(const ItemDef& def, const ItemInstance& inst,
                                 Vec3 at, Vec3 vel, Physics& phys,
                                 DebrisSystem& debris, MicroBodySet* micro,
                                 WorldItems& reg,
                                 const std::vector<PrefabVoxel>* lattice =
                                     nullptr) {
+  BodyTransform xf{};
+  xf.pos = at;
+  xf.quat[3] = 1;
+  return DropItemToWorldXf(def, inst, xf, vel, phys, debris, micro, reg,
+                           lattice, /*stuck=*/false);
+}
+
+inline uint64_t DropItemToWorldXf(const ItemDef& def, const ItemInstance& inst,
+                                  const BodyTransform& at, Vec3 vel,
+                                  Physics& phys, DebrisSystem& debris,
+                                  MicroBodySet* micro, WorldItems& reg,
+                                  const std::vector<PrefabVoxel>* lattice,
+                                  bool stuck) {
   const uint32_t dye = inst.dye;
   uint32_t scale = 1;
   const std::vector<PrefabVoxel>* authored = ItemGroundVoxels(def, scale);
@@ -205,16 +231,18 @@ inline uint64_t DropItemToWorld(const ItemDef& def, const ItemInstance& inst,
         coats.push_back({i, f->second});
       }
   }
-  BodyTransform xf{};
-  xf.pos = at;
-  xf.quat[3] = 1;
+  const BodyTransform xf = at;
   const float pitch = 1.0f / (float)std::max(1u, scale);
   // allowKinematic=false: a dropped item is DYNAMIC from the first frame. It
-  // has left the rig and nothing is animating it any more.
+  // has left the rig and nothing is animating it any more. A STUCK one is
+  // the exception the variant exists for, and may be made kinematic.
   const uint64_t body =
-      phys.CreateDebrisBodyXf(vox, xf, debris.DensityOf(), false, pitch);
+      phys.CreateDebrisBodyXf(vox, xf, debris.DensityOf(), stuck, pitch);
   if (!body) return 0;
-  phys.SetBodyVelocity(body, vel);
+  if (stuck)
+    phys.SetBodyKinematic(body, true);
+  else
+    phys.SetBodyVelocity(body, vel);
   // Thrown from the eye — which is INSIDE the player's capsule proxy (3
   // voxels of half-width against a 2-voxel throw). A loose role clears the
   // player before it is ordinary debris, or the proxy shoves the player away

@@ -4163,6 +4163,42 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
         std::fprintf(stderr, "--shot-mob: no clip \"%s\"\n", nm.c_str() + 1);
       continue;
     }
+    // ">N" SHOOTS IT: N arrows (game/arrows.h) at the bow's half draw into its
+    // torso, arms, thighs and head from around it, through the real flight
+    // and the real embed (Mob::EmbedArrow), so what arrows sticking out of a
+    // body look like is a screenshot rather than a live session.
+    if (!nm.empty() && nm[0] == '>') {
+      const ItemDef* ad = items.Named("arrow");
+      const ItemDef* bd = items.Named("bow");
+      if (ad == nullptr || !ad->IsAmmo()) {
+        std::fprintf(stderr, "--shot-mob: no arrow item to shoot\n");
+        continue;
+      }
+      const int n = std::clamp(std::atoi(nm.c_str() + 1), 1, 8);
+      const float spd = 0.5f * (bd && bd->IsBow() ? bd->bow.drawSpeed
+                                                  : MetresPerSecToCells(65.0f));
+      static const char* const kAim[8] = {"torso", "armU.L", "legU.R", "armU.R",
+                                          "torso", "legU.L", "hips", "head"};
+      for (int k = 0; k < n; k++) {
+        int li = -1;
+        for (size_t i = 0; i < def.limbs.size(); i++)
+          if (def.limbs[i].name == kAim[k]) li = (int)i;
+        if (li < 0 || !mobs.LimbBody(id, li)) continue;
+        Vec3 cc{};
+        for (uint32_t s = 0; s < 256; s++) cc += mobs.LimbVoxelPos(id, li, s * 7919u);
+        cc = cc * (1.0f / 256.0f);
+        const float a = 0.9f + 0.55f * (float)k;   // around the front quarter
+        const Vec3 dir = Vec3{std::cos(a), -0.08f, std::sin(a)}.normalized();
+        rig.Authority().arrows.Launch(*ad, cc - dir * 10.0f, dir, spd, Vec3{},
+                                      0x5A0700u + (uint32_t)k, {});
+      }
+      mobTick();
+      mobTick();
+      Mob* sm = mobs.FindCreature(id);
+      std::printf("--shot-mob: shot %d arrows, %d stuck in it\n", n,
+                  sm ? sm->EmbeddedArrowCount() : 0);
+      continue;
+    }
     // "^N" SETS IT ON FIRE: N surface voxels on every limb (MobSystem::
     // IgniteLimb, the spell/test entry point), then the settle ticks below
     // let it spread. What a burning body looks like -- painted voxels
@@ -8628,12 +8664,15 @@ int main(int argc, char** argv) {
       if (home < 0 && it.kind == ItemKind::Melee &&
           kit.equip.InHand(Hand::Right).Empty())
         home = EquipSlotOfHand(Hand::Right);
+      // ...and as many as the row's `startCount` says, as ONE stack: thirty
+      // arrows are a quiver, not thirty slots.
+      const ItemStack st = StackOf(items, i, it.startCount);
       if (home >= 0)
         kit.equip.slots[home] = StackOf(items, i);
-      else if (ItemKindIsWorn(it.kind))
-        kit.bag.Add(StackOf(items, i));        // armour, into the pack
+      else if (ItemKindIsWorn(it.kind) || it.kind == ItemKind::Ammo)
+        kit.bag.Add(st);        // armour, and the arrows: into the pack
       else
-        hotbar.Add(StackOf(items, i));
+        hotbar.Add(st);
     }
     // --shot-swim photographs the STROKE: a sword in the fist puts that arm
     // in its guard and hides half of it, so the harness swims empty-handed.
@@ -13954,6 +13993,10 @@ int main(int argc, char** argv) {
       // sword in its hand answers as the corpse (MobSystem::FindOwner).
       if (const WorldItem* w = lookBody ? ground.Find(lookBody) : nullptr) {
         ui.lookPrompt = "G  pick up " + w->name;
+      } else if (lookBody && IsEmbeddedArrowBody(mobs, lookBody)) {
+        // AN ARROW STUCK IN A BODY, living or dead (game/arrows.h): G pulls
+        // it out, before the corpse's loot claims the key.
+        ui.lookPrompt = "G  pull out the arrow";
       } else if (const Mob* c = lookBody ? mobs.FindOwner(lookBody) : nullptr;
                  c != nullptr && c->Lootable()) {
         std::vector<LootPiece> pieces;
@@ -14059,6 +14102,19 @@ int main(int argc, char** argv) {
     }
     auto takeE = [&]() {
       const uint64_t hit = lookBody;
+      // AN ARROW STUCK IN A CREATURE (game/arrows.h PullArrowToKit): out of
+      // the body and into the pack, ahead of the corpse's loot panel -- the
+      // prompt above promised exactly this. Room first; a full pack refuses.
+      if (hit && IsEmbeddedArrowBody(mobs, hit)) {
+        std::string got;
+        bool noRoom = false;
+        if (PullArrowToKit(mobs, hit, kit, items, &got, &noRoom))
+          ui.kitMessage = "pulled out the " + got;
+        else if (noRoom)
+          ui.kitMessage = "you have no room for that";
+        ui.kitMessageAge = 0.0f;
+        return;
+      }
       const WorldItem* w = hit ? ground.Find(hit) : nullptr;
       const Mob* corpse = (w || !hit) ? nullptr : mobs.FindOwner(hit);
       if (corpse && !corpse->Lootable()) corpse = nullptr;

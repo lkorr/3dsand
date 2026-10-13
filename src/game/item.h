@@ -91,6 +91,11 @@ enum class ItemKind : uint8_t {
   // is what opens a door whose `props.lock` names its keyId
   // (ItemDef::keyId, items.json `unlocks`, default the item's own id).
   Key,
+  // ---- carried, never held or worn: what a ranged weapon SHOOTS ----
+  // (docs/PLAN_projectiles.md C, game/arrows.h). An arrow: it stacks in the
+  // pack, a bow in hand spends one per shot, and its `arrow` block is the
+  // penetrator it flies as (ItemDef::ArrowSpec).
+  Ammo,
 };
 
 // Is this kind WORN (a set of shells over the body) rather than merely carried?
@@ -115,13 +120,14 @@ inline const char* ItemKindName(ItemKind k) {
     case ItemKind::Trinket: return "trinket";
     case ItemKind::Container: return "container";
     case ItemKind::Key: return "key";
+    case ItemKind::Ammo: return "ammo";
     case ItemKind::None: break;
   }
   return "none";
 }
 
 inline ItemKind ItemKindFromName(const std::string& s) {
-  for (int i = 1; i <= (int)ItemKind::Key; i++) {
+  for (int i = 1; i <= (int)ItemKind::Ammo; i++) {
     const ItemKind k = (ItemKind)i;
     if (s == ItemKindName(k)) return k;
   }
@@ -538,6 +544,43 @@ struct ItemDef {
   bool IsContainer() const {
     return kind == ItemKind::Container && container.capacity > 0;
   }
+
+  // ---- RANGED: THE BOW AND WHAT IT SHOOTS (docs/PLAN_projectiles.md C) ------
+  //
+  // A BOW is kind Melee -- it rides a hand slot, a sheath, the hotbar, like
+  // any weapon -- and `weaponClass: "bow"` with a `bow` block in items.json is
+  // what takes it OUT of the stroke system: with one in a hand that hand's
+  // button draws (held) and shoots (released) instead of swinging
+  // (session.cpp ResolveHands -> HandNow::bow, game/arrows.h).
+  struct BowSpec {
+    bool has = false;
+    float drawSpeed = 0.0f;   // world voxels/s at full draw (`drawSpeedMps`)
+    int drawTicks = 24;       // ticks to a full draw (`drawTimeMs`, at 30 Hz)
+    float minDraw = 0.15f;    // least draw fraction that looses at all
+    std::string ammo;         // the item id it shoots
+  } bow;
+  bool IsBow() const { return bow.has && kind == ItemKind::Melee; }
+
+  // AMMUNITION (ItemKind::Ammo): the penetrator it flies as (phys/kerf.h).
+  // Everything but the speed, which is the bow's; the POINT is the art's.
+  struct ArrowSpec {
+    bool has = false;
+    float massKg = 0.03f;
+    float tipRadius = 1.0f;   // FINE cells (kPierceRefCellsPerMetre)
+    float sharpness = 1.0f;
+    float hardness = 0.0f;    // 0 = the head material's (below)
+    float damage = 0.0f;      // flat hp on getting IN (Penetrator::hp)
+    // DERIVED AT LOAD from the art (melee.cpp LoadItems): the material of the
+    // foremost cell along +x -- the head -- and that cell's front-face centre
+    // in the item's own frame (world voxels from the lattice origin, the frame
+    // a body built from `voxels` has). The arrow's axis is the frame's +x.
+    uint32_t headMaterial = 0;
+    Vec3 tip{};
+    float length = 0.0f;      // world voxels, nock to point
+  } arrow;
+  bool IsAmmo() const { return arrow.has && kind == ItemKind::Ammo; }
+  // How many the stub starting kit hands out (main.cpp), as ONE stack.
+  int startCount = 1;
 };
 
 // Cells <-> the eighths a ContainerSpec counts in.
