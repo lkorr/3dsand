@@ -9058,8 +9058,11 @@ AS THAT MATTER, and what it does to a body is decided by what it is made of.
   skin-hard matter at that tip, and always stopped -- grit takes a shallow
   wound, never a channel.
 - **Liquid SPLASHES, never penetrates**: the first creature's skin under the
-  ray takes a coat disc (`splashRadiusMille` 1.2 voxels, cube-root of the
-  scale) at the material's own authored stain amount x the scale, through the
+  ray takes a coat disc (`SplashRadiusMille`: `splashRadiusMille` 0.2 voxel
+  x the scale, LINEAR, floor 0.1, ceiling `splashRadiusMaxMille` 3 voxels --
+  one voxel of lava is a 2 cm drop, only a big cast drenches; it was 1.2
+  voxels growing as the cube root, 596 skin cells at x1, until the owner's
+  2026-10-13 report) at the material's own authored stain amount x the scale, through the
   pour brush's writers (`MobSystem::PickBody` + `PourOnBody`), and the coat's
   own rules do the rest -- acid eats (its reactions on the voxel it sits on),
   lava sears and lights (`lava + tag:organic -> fire`, the hot-coat rule),
