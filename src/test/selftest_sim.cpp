@@ -4352,13 +4352,16 @@ Status GateRainFire(Ctx& c, std::string& detail) {
     return Status::Fail;
   }
   const std::string prevPin = weather::Override();
-  // THE WIND IS PINNED CALM, as rain-stain's is. Since the weather drives the
+  // THE WIND IS PINNED CALM, as rain-stain's is: since the weather drives the
   // wind and its ramp reads height above the ground (2026-09-30), the sheet
-  // -- 24 over the footprint's highest ground -- stands in a real breeze
-  // under every sky, and a fire leans downwind: measured 2026-10-12, the
-  // clear arm burnt the -x half of the sheet (blocks 18-25 of 25) and left
-  // the +x half at 0-1, 36% overall. Which way the air carries a fire is the
-  // wind gates' claim; this one's is what the rain does to it.
+  // -- 24 over the footprint's highest ground -- stands in a breeze under
+  // every sky, and which way the air carries a fire is the wind gates' claim,
+  // not this one's. Measured 2026-10-12 it is NOT what holds the clear arm
+  // under rainFireClearPctMin: auto wind 36%, calm 43%, and the lopsided burn
+  // map is the same in both -- a one-voxel leaf sheet burns near its
+  // percolation threshold (SANDVOX_RAINFIRE_DIAG=1: the same clear arm at
+  // four other harness sites burnt 56 / 71 / 30 / 65%, fronts dying out at
+  // random). See tests/BASELINE.md 2026-10-12.
   const Tuning savedTune = CurrentTuning();
   {
     Tuning t = savedTune;

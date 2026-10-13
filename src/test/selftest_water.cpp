@@ -2341,9 +2341,15 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
         for (uint32_t e : WaterBodies().Gpu().chunks) ownChunks += (e >> 16) == nSlot;
         const std::string rvWhy = Format(
             "GPU chunk list %zu entries (cap %u), %u of them slot %u's, %u bodies; "
-            "relevel count %d; ",
+            "relevel count %d; state %s -> %s, quiet %d -> %d, level %d -> %d; "
+            "sweep: %d components mapped at y=%d, spill %d, split %d; ",
             WaterBodies().Gpu().chunks.size(), kWaterChunkCap, ownChunks, nSlot,
-            WaterBodies().Gpu().bodyCount, rv1.At(nSlot, WBS_RVCOUNT_W)) + Format(
+            WaterBodies().Gpu().bodyCount, rv1.At(nSlot, WBS_RVCOUNT_W),
+            LedgerStateName(rv0.At(nSlot, WBS_STATE)),
+            LedgerStateName(rv1.At(nSlot, WBS_STATE)), rv0.At(nSlot, WBS_QUIET),
+            rv1.At(nSlot, WBS_QUIET), rv0.At(nSlot, WBS_LEVEL), rv1.At(nSlot, WBS_LEVEL),
+            rv1.Sw(nSlot, SW_COMPS), rv1.Sw(nSlot, SW_MAPY), rv1.Sw(nSlot, SW_SPILLY),
+            rv1.Sw(nSlot, SW_SPLITY)) + Format(
             "crater cells in labelled chunks %u/%zu, footprint armed after the crater %s, "
             "at the end %s; slot %u relevel given/taken %d/%d -> %d/%d, credit %d, capped %d",
             craterLabelled, crater.size(), armedAfterCrater ? "yes" : "NO",
