@@ -26576,11 +26576,29 @@ in one 64^3 index cell) and runs `dgCell` on the TERRAIN word after the top
 cell's grains (the grains read the terrain word above, so the dungeon's
 output is a pure function of the terrain word -- the CPU twin's input). `cols`
 raises a column's sky ceiling (`CCW_TOP`) to the box top of any dungeon over
-it, so surface ruins are not sky-skipped. `far` evaluates `dgCellCoarse`
-(carve, fill, keep, props; no skin / scatter / firm, which are sub-cell at
-every cascade level) per sample on the columns the dungeons' box covers, and
-raises its sky ceiling the same way: surface pieces appear in the cascades;
-underground matter is not drawn from afar. `caveBands` turns off a natural
+it, so surface ruins are not sky-skipped. `far` evaluates genChunk's own
+`dgCell` per sample on the columns the dungeons' box covers, and raises its
+sky ceiling the same way, so a cascade cell is the voxel genChunk puts at its
+sample. **The far field runs the near field's generator (2026-10-13, ticket
+`2026-10-12_16-36-34`).** Until then `far` called `dgCellCoarse` (carve,
+fill, keep, props; no skin / scatter / firm) on the reading that the dressing
+is sub-cell at every cascade level. It is not: a crystal vein is a two-voxel
+SKIN, a crystal or a stalagmite a cone voxels across, a rubble pile a metre
+wide, and a centre sample that lands in one must say so. With the dressing
+missing the sieve drew the bare shell for every dressing material, and the
+first LOD seam (20.5 m) was where it went: the owner walked toward crystals
+that appeared on the walls as he came. Measured at the ticket camera with
+the lod-seam method (the same pixels 10-19 m away shaded near, and far with
+the handoff pulled in to 8 m; `SEAM_DBG 15`): of the pixels the near field
+shades crystal the far field kept 26 %, and keeps 72 % now -- the rest is
+the cell size moving a patch's edge by a voxel, and the far crystal area went
+37 % -> 112 % of the near field's. `far` 26,359 -> 28,787 SPIR-V
+instructions. `far-parity` holds every level-1..3 sample over the harness
+map's dungeons to the voxel genChunk generates there, so a generator branch
+the sieve does not run is a red gate, for any material. What this does NOT
+change: a cascade cell is still its centre sample, so a feature one voxel
+thin is drawn at level 1 only where a centre lands in it (see "What is
+representable, honestly" in §9). `caveBands` turns off a natural
 cave band that reaches into a dungeon's keep box (bounds + `keepOut`, default
 24; `naturalCaves: true` opts out), and the magma table goes with it (it only
 floods carved band cells). **Cost**: a map with no dungeon pays one header

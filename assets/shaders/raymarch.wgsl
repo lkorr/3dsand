@@ -1056,11 +1056,18 @@ fn fogSkyK() -> f32 { return max(eyeSkyK(), gHitSky); }
 // no opinion at all (1: the pixel shades as full sun), the raw cached value,
 // and why a tap had none (1 = a slot found but not valid, 0.5 = no slot:
 // claimed this frame, set full or stolen); a FAR pixel's patch writes (no
-// opinion, value, 0.25). 0 = off and const-folded away.
+// opinion, value, 0.25). LOD BAND (2026-10-13, ticket 2026-10-12_16-36-34):
+// 15 = the final colour of the pixels whose surface (near or far) is 10-19 m
+// from the eye and black elsewhere, so two arms with the handoff at 20.5 and
+// at 8 m compare the SAME band as near and as far, colour for colour (a
+// material's pixel count per arm is how much of it the far field kept).
+// 0 = off and const-folded away.
 const SEAM_DBG : u32 = 0u;
 // SEAM_DBG 14: per-pixel tap verdicts of shadowSlotRead (valid, found but
 // invalid, not found / claimed, stolen at registration).
 var<private> gDbgSc : vec4f = vec4f(0.0);
+// SEAM_DBG 15: the surface distance dbgRec saw (fine voxels; -1 = none).
+var<private> gDbgT : f32 = -1.0;
 // The MPM terms (SEAM_DBG 9-10): caFrac, foam, settled share (fs), churn; colVox.
 var<private> gDbgM0 : vec4f = vec4f(0.0);
 var<private> gDbgM1 : f32 = 0.0;
@@ -1084,6 +1091,7 @@ var<private> gDbgSh : vec3f = vec3f(1.0);
 fn dbgLum(c : vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
 fn dbgRec(isFar : bool, mat : u32, t : f32, alb : vec3f, sh : f32, ao : f32, open : f32,
           lamPre : f32, lam : f32, col : vec3f, gi : vec3f, face : f32) {
+  gDbgT = t;
   if (SEAM_DBG == 1u) { gDbg = vec4f(select(0.5, 1.0, isFar), f32(mat & 255u) / 255.0, t * VOXEL_METERS / 50.0, 1.0); }
   else if (SEAM_DBG == 2u) { gDbg = vec4f(dbgLum(alb), sh, ao, 1.0); }
   else if (SEAM_DBG == 3u) { gDbg = vec4f(open, lam, lamPre, 1.0); }
@@ -17317,6 +17325,10 @@ fn fs(in : VSOut) -> FSOut {
     gDbg = vec4f(own, gDbgM0.z, gDbgM0.y, 1.0);
   } else if (SEAM_DBG == 10u) {
     gDbg = vec4f(gDbgM0.z, gDbgM0.w, min(gDbgM1 / 40.0, 1.0), 1.0);
+  }
+  if (SEAM_DBG == 15u) {
+    let bandM = gDbgT * VOXEL_METERS;
+    gDbg = select(vec4f(0.0, 0.0, 0.0, 1.0), vec4f(color, 1.0), bandM >= 10.0 && bandM <= 19.0);
   }
   if (SEAM_DBG != 0u) { out.color = vec4f(gDbg.xyz, 1.0); }
   out.depth = depth;

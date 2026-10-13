@@ -30,7 +30,12 @@
 //                        settle (generation and settle reproducible).
 //                   Exit: the evaluator back on, the environment reloaded, the
 //                   window regenerated at the origin it found.
+//   far-parity      GPU. Every level-1..3 cascade sample (out of the ground band) round the
+//                   harness map's dungeons and under the window is the voxel
+//                   genChunk generates there (the far field runs the near
+//                   field's generator; ticket 2026-10-12_16-36-34).
 #include <algorithm>
+#include <array>
 #include <climits>
 #include <chrono>
 #include <cmath>
@@ -48,11 +53,13 @@
 #include <nlohmann/json.hpp>
 
 #include "phys/debris.h"
+#include "gpu/resources.h"
 #include "game/camera.h"
 #include "sim/biomes.h"
 #include "sim/tuning.h"
 #include "sim/chunkstore.h"
 #include "sim/dungeon.h"
+#include "sim/faredits.h"
 #include "sim/pagetable.h"
 #include "sim/stream.h"
 #include "sim/world.h"
@@ -921,12 +928,268 @@ Status GateDungeonGen(Ctx& c, std::string& detail) {
                 aLine + " | E others: " + eLine + " | " + fLine + " | " + gLine + " | " + dLine);
 }
 
+
+// ============================================================================
+// far-parity
+// ============================================================================
+// THE FAR FIELD RUNS THE NEAR FIELD'S GENERATOR (ticket 2026-10-12_16-36-34,
+// "crystals don't exist past the first LOD seam"). A cascade cell is its
+// centre sample, so wherever the sieve (worldgen.wgsl `far`) fills a cell
+// from procgen, its byte must name the far slot of the voxel genChunk puts at
+// that sample -- whatever produced the voxel. The sieve called a reduced
+// dungeon evaluator (dgCellCoarse: no skin, scatter or firm shell) and so drew
+// the bare shell where genChunk lays crystal veins, moss, rubble, puddles and
+// ore: two-thirds of the crystal the near field shows was gone past 20.5 m.
+//
+// For each region -- the harness map's real dungeons round a sample of their
+// prims, plus a stretch of natural caves under the gate window -- the cascade
+// is refilled round it from procgen alone (no edit index), every level-1..3
+// cell in boxes round the region's points whose sample voxel is OUT OF THE
+// GROUND'S BAND (more than a cell under its column's ground or two over it:
+// the band is where farSurfaceMat paints the skin and the stalk / blocker
+// rules work; an empty-sample cell the cover rule filled with leaf is skipped
+// too, that rule adds to empty cells by design) is read back, the chunks
+// holding the samples are generated through the real genChunk
+// (GenerateChunks), and the two are compared by far slot. Mismatches are
+// counted by the voxel's material: a generator branch the sieve does not run
+// is a red line naming the material it drops. farParity.maxMismatch.
+//
+// Exit contract as dungeon-gen: the window regenerated at the origin it found
+// (GenerateChunks clobbers it) and the cascade refilled round it.
+Status GateFarParity(Ctx& c, std::string& detail) {
+  std::vector<std::string> why;
+  auto check = [&](bool ok, const std::string& w) {
+    if (!ok && why.size() < 8) why.push_back(w);
+    return ok;
+  };
+  const IVec3 savedOrigin = c.world.WindowOrigin();
+  FarEdits& edits = c.stream.Edits();
+  edits.Clear();
+  auto farSolid = [&](uint32_t m) {
+    if (m == kMatAir || m >= c.mats.size()) return false;
+    const MaterialDef& d = c.mats[m];
+    return d.gpu.klass != CLASS_GAS && (d.gpu.flags & kMatFlagMicro) == 0;
+  };
+  // The far slots the cover rule fills empty cells with (farCover).
+  std::vector<bool> slotCover(256, false);
+  for (const MaterialDef& d : c.mats)
+    if (d.farCover && d.farPalSlot < 256) slotCover[d.farPalSlot] = true;
+  // ---- the regions ----------------------------------------------------------
+  struct Region {
+    std::string name;
+    IVec3 centre;
+    std::vector<IVec3> pts;
+  };
+  std::vector<Region> regions;
+  auto worldOf = [](const worldmap::DungeonDef& g, int lx, int ly, int lz) {
+    return IVec3{dungeon::RotX(g.yawQ, lx, lz) + g.origin[0], ly + g.origin[1],
+                 dungeon::RotZ(g.yawQ, lx, lz) + g.origin[2]};
+  };
+  for (const worldmap::DungeonDef& g : worldmap::CurrentWorldMap().dungeons) {
+    if (!g.Placed()) continue;
+    if (g.asset != "shardwell" && g.asset != "teeth_caves" && g.asset != "_fixture") continue;
+    const dungeon::Shell& sh = *g.shell;
+    Region r;
+    r.name = g.id;
+    bool first = true;
+    // Prim centres within level 1's reach of the first one (its box is
+    // +-512 voxels round the player chunk): SKIN prims first (a crystal vein
+    // is one), then prims carrying scatter (crystals, moss, rubble, puddles,
+    // ore), then the rest -- the dressing is what this gate is for.
+    std::vector<size_t> order;
+    for (int pass = 0; pass < 3; pass++)
+      for (size_t i = 0; i < sh.prims.size(); i++) {
+        const dungeon::Prim& pq = sh.prims[i];
+        const int cls = pq.op == dungeon::kOpSkin ? 0 : (pq.scatterCount > 0 ? 1 : 2);
+        if (cls == pass) order.push_back(i);
+      }
+    for (size_t oi = 0; oi < order.size() && r.pts.size() < 12; oi++) {
+      const dungeon::Prim& pr = sh.prims[order[oi]];
+      std::array<int, 3> lc{};
+      if (pr.shape == dungeon::kShapeTube) {
+        if (pr.tubeCount == 0) continue;
+        const dungeon::TubePt& t = sh.tube[pr.tubeFirst];
+        lc = {t.x, t.y, t.z};
+      } else {
+        for (int a = 0; a < 3; a++) lc[a] = (pr.a[a] + pr.b[a]) / 2;
+      }
+      const IVec3 w = worldOf(g, lc[0], lc[1], lc[2]);
+      // Under the ground: a dressing op works on terrain rock, and a piece
+      // the harness map's flat ground leaves standing in the air has none.
+      if (w.y > World::TerrainHeight(w.x, w.z, kDefaultSeed) - 24) continue;
+      if (first) {
+        r.centre = w;
+        first = false;
+      }
+      if (std::abs(w.x - r.centre.x) > 300 || std::abs(w.y - r.centre.y) > 300 ||
+          std::abs(w.z - r.centre.z) > 300)
+        continue;
+      r.pts.push_back(w);
+    }
+    if (!r.pts.empty()) regions.push_back(r);
+  }
+  {
+    // Natural caves (cave flora: crystals on the deep band's floors and
+    // ceilings) under the gate window's centre.
+    Region r;
+    r.name = "caves";
+    const int cx = savedOrigin.x * 16 + 256, cz = savedOrigin.z * 16 + 256;
+    const int h = World::TerrainHeight(cx, cz, kDefaultSeed);
+    r.centre = IVec3{cx, h - 120, cz};
+    for (int k = 0; k < 6; k++) r.pts.push_back(IVec3{cx - 150 + k * 60, h - 40 - k * 25, cz + 120 - k * 50});
+    regions.push_back(r);
+  }
+  check(regions.size() >= 2,
+        Format("%zu regions (want the harness map's dungeons and the caves)", regions.size()));
+
+  // ---- per region: refill, read, generate, compare -------------------------
+  long long compared = 0, mism = 0, dressing = 0;
+  std::map<uint32_t, long long> mismByMat, cellsByMat;
+  std::string first, regionLine;
+  std::map<std::pair<int, int>, int> hMemo;
+  auto groundOf = [&](int x, int z) {
+    auto it = hMemo.find({x, z});
+    if (it != hMemo.end()) return it->second;
+    const int g = World::TerrainHeight(x, z, kDefaultSeed);
+    hMemo.emplace(std::make_pair(x, z), g);
+    return g;
+  };
+  for (const Region& r : regions) {
+    const IVec3 playerChunk{r.centre.x >> 4, r.centre.y >> 4, r.centre.z >> 4};
+    DrainFullRefill(c.ctx, c.world, c.sim, playerChunk);
+    struct Cell {
+      uint32_t level;
+      IVec3 cc, sample;
+    };
+    std::vector<Cell> cells;
+    std::set<std::tuple<int, int, int, int>> seen;
+    for (uint32_t level = 1; level <= 3; level++) {
+      const int shift = (int)(level + kFarShiftBase), step = 1 << shift, half = step >> 1;
+      const int K = level == 1 ? 6 : (level == 2 ? 4 : 3);
+      for (const IVec3& p : r.pts) {
+        const IVec3 pc{p.x >> shift, p.y >> shift, p.z >> shift};
+        for (int dz = -K; dz <= K; dz++)
+          for (int dy = -K; dy <= K; dy++)
+            for (int dx = -K; dx <= K; dx++) {
+              const IVec3 cc{pc.x + dx, pc.y + dy, pc.z + dz};
+              if (!seen.insert({(int)level, cc.x, cc.y, cc.z}).second) continue;
+              const IVec3 sm{(cc.x << shift) + half, (cc.y << shift) + half, (cc.z << shift) + half};
+              // Not the ground's band: the cell holding the column's ground
+              // and the one over it, where farSurfaceMat paints the skin and
+              // the stalk / cover / blocker rules work.
+              const int gh = groundOf(sm.x, sm.z);
+              if (sm.y >= gh - step && sm.y <= gh + 2 * step) continue;
+              cells.push_back({level, cc, sm});
+            }
+      }
+    }
+    // The cascade bytes, one copy per level chunk.
+    std::map<std::tuple<uint32_t, int, int, int>, std::vector<uint8_t>> lchunks;
+    auto wrapv = [](int v) { return (uint32_t)(v & (int)(kFarN - 1)); };
+    for (const Cell& e : cells) {
+      const auto key = std::make_tuple(e.level, e.cc.x >> 4, e.cc.y >> 4, e.cc.z >> 4);
+      if (lchunks.count(key)) continue;
+      const uint32_t x = wrapv(e.cc.x), y = wrapv(e.cc.y), z = wrapv(e.cc.z);
+      const uint32_t ch = ((z >> 4) * kFarNChunk + (y >> 4)) * kFarNChunk + (x >> 4);
+      const uint64_t off = (uint64_t)(e.level - 1) * kFarVox + (uint64_t)ch * kChunkVol;
+      rhi::Buffer staging = CreateBuffer(c.ctx.device, kChunkVol,
+                                         rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "farParity");
+      rhi::CommandEncoder enc = c.ctx.device.CreateCommandEncoder();
+      enc.CopyBufferToBuffer(c.world.farVox, off, staging, 0, kChunkVol);
+      c.ctx.queue.Submit(enc.Finish());
+      std::vector<uint8_t> bytes(kChunkVol);
+      rhi::ReadBufferBlocking(c.ctx.device, staging, 0, bytes.data(), kChunkVol);
+      lchunks.emplace(key, std::move(bytes));
+    }
+    // The generated voxels, through the real genChunk.
+    std::set<std::tuple<int, int, int>> want;
+    for (const Cell& e : cells) want.insert({e.sample.x >> 4, e.sample.y >> 4, e.sample.z >> 4});
+    std::map<std::tuple<int, int, int>, std::vector<uint32_t>> gen;
+    {
+      std::map<std::tuple<int, int, int>, std::vector<IVec3>> groups;
+      for (const auto& [x, y, z] : want) groups[{x >> 5, y >> 5, z >> 5}].push_back(IVec3{x, y, z});
+      for (const auto& [blk, list] : groups) {
+        const IVec3 origin{std::get<0>(blk) * 32, std::get<1>(blk) * 32, std::get<2>(blk) * 32};
+        GenerateChunks(c.ctx, c.world, c.sim, kDefaultSeed, origin, list, [&](IVec3 wc, const uint32_t* w) {
+          gen[{wc.x, wc.y, wc.z}] = std::vector<uint32_t>(w, w + kChunkVol);
+        });
+      }
+    }
+    long long rCmp = 0, rMism = 0;
+    for (const Cell& e : cells) {
+      const auto git = gen.find({e.sample.x >> 4, e.sample.y >> 4, e.sample.z >> 4});
+      if (git == gen.end()) continue;
+      const uint32_t li = (uint32_t)((e.sample.x & 15) + (e.sample.y & 15) * 16 + (e.sample.z & 15) * 256);
+      const uint32_t m = git->second[li] & 0xFFFu;
+      const uint32_t wantSlot = farSolid(m) ? c.mats[m].farPalSlot : 0u;
+      const auto& lb = lchunks[std::make_tuple(e.level, e.cc.x >> 4, e.cc.y >> 4, e.cc.z >> 4)];
+      const uint32_t lo = (uint32_t)((((e.cc.z & 15) * 16) + (e.cc.y & 15)) * 16 + (e.cc.x & 15));
+      const uint32_t got = FarCellSlot(lb[lo]);
+      // A cell the sieve's sample left EMPTY that a later fill rule claimed
+      // (the cover rule's leaf, a stalk's mark): those rules ADD to empty
+      // cells by design, so they are not a disagreement about the sample.
+      if (wantSlot == 0u && got != 0u && got < slotCover.size() && slotCover[got]) continue;
+      compared++;
+      rCmp++;
+      cellsByMat[m]++;
+      if (got != wantSlot) {
+        mism++;
+        rMism++;
+        mismByMat[m]++;
+        if (first.empty())
+          first = Format("%s level %u cell (%d,%d,%d) sample (%d,%d,%d): genChunk %s (slot %u), cascade slot %u",
+                         r.name.c_str(), e.level, e.cc.x, e.cc.y, e.cc.z, e.sample.x, e.sample.y, e.sample.z,
+                         m < c.mats.size() ? c.mats[m].name.c_str() : "?", wantSlot, got);
+      }
+    }
+    regionLine += Format("%s%s %lld/%lld", regionLine.empty() ? "" : ", ", r.name.c_str(), rMism, rCmp);
+  }
+  // Samples on materials only the dungeon dressing lays: the gate is vacuous
+  // for the defect it was written for if it saw none.
+  for (const char* n : {"crystal", "old_moss", "gravel", "water"}) {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) dressing += cellsByMat[(uint32_t)i];
+  }
+  const long long maxMism = (long long)BaselineNumber("farParity.maxMismatch", 0);
+  check(compared > 0, "no cell compared");
+  check(dressing > 0, "no sample landed in dungeon dressing (crystal, old_moss, gravel, water): the gate is vacuous");
+  check(mism <= maxMism, Format("%lld of %lld cascade samples are not genChunk's voxel (max %lld); first: %s", mism,
+                                compared, maxMism, first.c_str()));
+  std::string byMat;
+  {
+    std::vector<std::pair<long long, uint32_t>> v;
+    for (const auto& [m, n] : mismByMat) v.push_back({n, m});
+    std::sort(v.rbegin(), v.rend());
+    for (size_t i = 0; i < v.size() && i < 6; i++)
+      byMat += Format("%s%s %lld", byMat.empty() ? "" : ", ",
+                      v[i].second < c.mats.size() ? c.mats[v[i].second].name.c_str() : "?", v[i].first);
+  }
+  // ---- exit: the window regenerated where it was, the cascade round it -----
+  c.world.SetWindowOrigin(savedOrigin);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  DrainFullRefill(c.ctx, c.world, c.sim,
+                  IVec3{savedOrigin.x + (int)kNChunk / 2, savedOrigin.y + (int)kNChunk / 2,
+                        savedOrigin.z + (int)kNChunk / 2});
+  detail = Format("%lld samples (levels 1-3, off the ground band), %lld mismatches [%s]%s%s; %lld on dressing materials",
+                  compared, mism, regionLine.c_str(), byMat.empty() ? "" : " by material: ", byMat.c_str(),
+                  dressing);
+  if (!why.empty()) {
+    for (const std::string& w : why) detail += " | FAIL: " + w;
+    std::printf("far-parity: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  std::printf("far-parity: PASS (%s)\n", detail.c_str());
+  return Status::Pass;
+}
+
 }  // namespace
 
 const std::vector<Gate>& DungeonGates() {
   static const std::vector<Gate> g = {
       {"dungeon-format", "world", {}, false, GateDungeonFormat, /*needsRender=*/false},
       {"dungeon-gen", "world", {}, false, GateDungeonGen, /*needsRender=*/false},
+      {"far-parity", "render", {}, false, GateFarParity, /*needsRender=*/false},
   };
   return g;
 }

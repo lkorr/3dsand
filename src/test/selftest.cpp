@@ -723,6 +723,11 @@ const char* const kOrder[] = {
     // cell to the CPU twin, then settled round its chamber. Same exit contract
     // (reload the environment, regenerate the window at the origin it found).
     "dungeon-gen",
+    // The far field's generator (ticket 2026-10-12_16-36-34): the cascade's
+    // underground samples round the harness map's dungeons held to genChunk's
+    // voxels. Same exit contract (the window regenerated at the origin it
+    // found, the cascade refilled round it).
+    "far-parity",
     // REFERENCES (PLAN_world_editor.md P1). After `corpse-save` for the same
     // exit contract: mobs and debris reset, id counter restored, park function
     // removed, store cleared, and worldgen regenerated at the origin the gate

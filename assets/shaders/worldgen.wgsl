@@ -7497,15 +7497,33 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
         mat = genCellIn(&col, &cave, true, &trees, true, &ponds, canopyArg,
                         fine.x, fine.y, fine.z, T.seed) & 0xFFFu;
       }
-      // THE DUNGEON at the sample (worldgen_dungeon.wgsli dgCellCoarse: the
-      // shapes and props of genChunk's dgCell, without the sub-cell dressing),
-      // on the centre sample's material. A cell the dungeon
-      // changed keeps its own colour (no surface-skin repaint below).
+      // THE DUNGEON at the sample: genChunk's own dgCell, skin, scatter and
+      // firm shell included, on the centre sample's material -- so a cascade
+      // cell is the voxel genChunk puts at its sample, whatever the dungeon
+      // made of it. A cell the dungeon changed keeps its own colour (no
+      // surface-skin repaint below).
+      //
+      // THE FAR FIELD RUNS THE NEAR FIELD'S GENERATOR (2026-10-13, ticket
+      // 2026-10-12_16-36-34: "crystals don't exist past the first LOD seam;
+      // walking forward they appear on the walls"). This was dgCellCoarse, the
+      // evaluator without its dressing, on the reading that skins, scatter
+      // and firm shells are thinner than any cascade cell. They are not: a
+      // crystal vein is a two-voxel SKIN, a crystal or a stalagmite a cone
+      // several voxels across, a rubble pile a metre wide -- and a centre
+      // sample that lands in one has to say so. With the dressing missing the
+      // sieve drew the bare shell for EVERY dressing material, and the first
+      // seam was where it went: at the ticket camera, of the pixels 10-19 m
+      // away that the near field shades crystal, the far field (handoff pulled
+      // in to 8 m, the lod-seam method) kept 26 %, and 72 % with this call
+      // (the rest is the cell size moving patch edges by a voxel; total
+      // crystal area 37 % -> 112 % of the near field's). `far-parity` holds
+      // every sample over the harness map's dungeons to genChunk's voxel.
+      // Cost: `far` 26,359 -> 28,787 SPIR-V instructions (check_shaders.sh).
       var dgHit = false;
       if (dgCol) {
         let dl = dgListAt(fine.x, fine.y, fine.z);
         if (dl != 0u) {
-          let dm = dgCellCoarse(dl, fine.x, fine.y, fine.z, mat) & 0xFFFu;
+          let dm = dgCell(dl, fine.x, fine.y, fine.z, mat, col.h) & 0xFFFu;
           dgHit = dm != mat;
           mat = dm;
         }

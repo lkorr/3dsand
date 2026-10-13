@@ -748,7 +748,12 @@ if [ -f "$WORLDGEN_COMBINED" ]; then
   # 26,359 instructions. The dressing half of the evaluator (skin, scatter,
   # firm shell) is deliberately NOT reachable from `far`; the measured cold
   # driver compile before/after is in docs/PLAN_dungeons.md (D1 report).
-  for spec in "far:28000" "farpatch:25000" "fardown:25000" "farmap:25000"; do
+  # `far` 28000 -> 32000 (2026-10-13, ticket 2026-10-12_16-36-34): it IS now
+  # -- the sieve calls genChunk's own dgCell, because the dressing is not
+  # thinner than a cascade cell (a crystal vein is a two-voxel skin, a crystal
+  # a cone voxels across) and the far field drew the bare shell for every
+  # dressing material: 26,359 -> 28,787 instructions.
+  for spec in "far:32000" "farpatch:25000" "fardown:25000" "farmap:25000"; do
     ep="${spec%%:*}"; ceil="${spec##*:}"
     spv="$TMP/worldgen_${ep}.spv"
     if ! "$TINT_BIN" -f spirv -ep "$ep" -o "$spv" "$WORLDGEN_COMBINED" >/dev/null 2>&1; then
