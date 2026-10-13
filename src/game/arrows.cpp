@@ -110,6 +110,36 @@ Penetrator ArrowPenetrator(const ItemDef& a, float speedMps, uint32_t seed) {
   return p;
 }
 
+Vec3 ArrowHoldover(Vec3 from, Vec3 to, float speedVox) {
+  const float perTick = speedVox / (float)kArrowTicksPerSecond;
+  if (!(perTick > 1e-3f)) return to;
+  // Ticks of flight along the straight line, and what Tick's integrator (the
+  // velocity loses g BEFORE each step) drops over them: g (1 + 2 + .. + n).
+  const float n = (to - from).len() / perTick;
+  const float g = (float)kArrowGravityFx / (float)kSpellFxOne;   // voxels/tick^2
+  return Vec3{to.x, to.y + g * n * (n + 1.0f) * 0.5f, to.z};
+}
+
+// ---- THE BOW IN A CREATURE'S HAND ------------------------------------------------
+
+const ItemDef* HeldBow(const Mob& m, const ItemLibrary& items, Hand* handOut) {
+  for (Hand h : {Hand::Right, Hand::Left}) {
+    const std::string& name = m.HeldItem(h);
+    if (name.empty()) continue;
+    const ItemDef* d = items.Named(name);
+    if (d != nullptr && d->IsBow()) {
+      if (handOut) *handOut = h;
+      return d;
+    }
+  }
+  return nullptr;
+}
+
+int MobShotsLeft(const Mob& m, const ItemLibrary& items) {
+  const ItemDef* bow = HeldBow(m, items);
+  return bow != nullptr ? KitAmmoCount(m.GetKit(), bow->bow.ammo) : 0;
+}
+
 // ---- AMMUNITION IN THE KIT -------------------------------------------------------
 
 int KitAmmoCount(const Kit& kit, const std::string& ammo) {

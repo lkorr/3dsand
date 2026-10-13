@@ -573,7 +573,7 @@ struct UIState {
       aiDisengageTicks = 22;
   float aiHysteresis = 0.22f;
   // One per ai::Intent, in enum order (main.cpp static_asserts the count).
-  static constexpr int kAiIntents = 18;   // + `cast` (demons D4), `orbit` + `charge` (swimmers)
+  static constexpr int kAiIntents = 19;   // + `cast` (demons D4), `orbit` + `charge` (swimmers), `shoot` (archers)
   float aiIntentWeight[kAiIntents] = {};
   int aiIntentCooldown[kAiIntents] = {};
   int aiIntentDwell[kAiIntents] = {};

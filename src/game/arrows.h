@@ -51,12 +51,14 @@
 #include <string>
 #include <vector>
 
+#include "game/hand.h"
 #include "game/item.h"
 #include "game/pierce.h"
 #include "game/spell.h"  // SpellFxVec / kSpellFxOne: the flight's fixed point
 #include "math3d.h"
 
 class Physics;
+class Mob;
 class MobSystem;
 class DebrisSystem;
 class World;
@@ -75,12 +77,27 @@ float BowArrowSpeed(const ItemDef& bow, int ticks);
 // The penetrator an arrow flies as, at `speedMps`.
 Penetrator ArrowPenetrator(const ItemDef& arrow, float speedMps, uint32_t seed);
 
+// THE DROP, PAID IN ADVANCE: the point to aim at so an arrow loosed from
+// `from` at `speedVox` world voxels/s comes down onto `to` -- `to` raised by
+// what this flight's own gravity takes off it on the way (the integrator's
+// n(n+1)/2 ticks of kArrowGravity over the straight-line flight of n ticks).
+// What a creature's aim adds (game/mob_archery.cpp); the player aims by eye.
+Vec3 ArrowHoldover(Vec3 from, Vec3 to, float speedVox);
+
 // ---- AMMUNITION IN THE KIT -------------------------------------------------------
 // How many of `ammo` the kit carries (bag, hotbar, equipment), and take one:
 // hotbar first, then the bag (the quiver at hand before the pack). False when
 // there is none.
 int KitAmmoCount(const Kit& kit, const std::string& ammo);
 bool KitTakeAmmo(Kit& kit, const std::string& ammo);
+
+// ---- THE BOW IN A CREATURE'S HAND (the NPC archers, game/mob_archery.h) ----------
+// The bow a creature holds -- the right hand's, else the left's -- or null.
+// `handOut` = which. And the shots it can loose now: arrows in its own kit for
+// that bow (0 with no bow). The AI's SelfView::ammo and the owner's draw both
+// ask these two, so "can it shoot" has one answer.
+const ItemDef* HeldBow(const Mob& m, const ItemLibrary& items, Hand* handOut = nullptr);
+int MobShotsLeft(const Mob& m, const ItemLibrary& items);
 
 // ---- G ON AN ARROW STUCK IN A CREATURE -----------------------------------------
 // `body` is what the look ray hit. If it is an arrow slot (Mob::IsArrowSlot)

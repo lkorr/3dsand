@@ -169,3 +169,38 @@ is the projectile"). How it came out:
 lead aim (reuse the caster aim/lead code), ammo, back off when crowded. An
 `archer` profile; NPCs armed with a bow through the existing weapon paths
 (`props.weapon`, spawn panel). Gate `archer`.
+
+**Status (2026-10-13): built, on its worktree branch** (DESIGN.md "Creatures
+that shoot"). How it came out:
+
+- **AI** (`ai_behavior.*`): `ai::RangedTuning` (the `ranged` block: band
+  `rangeMin..rangeMax`, shot window `minRange..maxRange`, cadence + jitter,
+  first-sight delay, aimTolerance, `draw` share, hold + jitter, `spread`,
+  `lead` / `leadCap`, `aimRaise`, `quiver`, `bow`), a new `shoot` intent
+  emitting `ai::ShootRequest` (the cast seam's twin), facts `ammo` and
+  `cornered`. While the creature can shoot (bow in hand + arrows in its kit)
+  the band is the ranged one and is not slid onto swing reach; a drawn bow
+  forces FaceTarget.
+- **Owner** (`game/mob_archery.*`, `MobArcheryTick` right after
+  `MobCastTick`): the draw (the player's `bow_draw` clip, the bow's
+  drawTimeMs x `draw`, a hashed hold; `Mob::BowDrawn` refuses swing and
+  guard and tips the torso with the aim pitch), the aim (`MobTargetNow` +
+  `ai::LeadPoint` -- the casters' lead, factored out of `AimFor` bit for bit
+  -- + `ArrowHoldover`, the flight's own drop, + a hashed spread scaled by
+  `Tune::Aim`), the loose through `ArrowFlights::Launch` from the bow fist.
+  Out of arrows: bow to the bag, sheathed sidearm to the hand.
+- **Arming**: `ArmArcher` at spawn -- the F1 AI panel's new `archer` preset
+  (bow + the picked weapon as sidearm + 12 arrows), `npc` refs and dungeon
+  spawners whose behaviour has a `ranged` block. No placed NPC or village
+  changed.
+- **Gate `archer`**: draws (clip on, BowDrawn >= the bow's draw,
+  FaceTarget), looses at 650 vox/s and gets into a dummy 60 voxels off within
+  `archer.hitTicks` (+51); backs off 24.6 voxels from one 9 off without
+  drawing or swinging; with 2 arrows looses exactly 2, then nothing, bow in
+  the bag, sword drawn, closes 60 -> 8.5; replays bit for bit. World hash
+  unmoved (ef7d9a06).
+- **Open**: a draw in progress is not saved; the archer stands still while
+  drawn; no neutral (village watch) archer profile and no placed archer yet
+  (content); arrows hitting the PLAYER are package C's path (the avatar's
+  limbs through `PierceLimb`) and are not in the gate (the harness body has
+  no avatar).

@@ -535,6 +535,7 @@ add_library(sandvox_core OBJECT
   # The bow and its arrows: the draw's numbers, the kit's ammunition, and the
   # arrows in flight (docs/PLAN_projectiles.md C).
   src/game/arrows.cpp
+  src/game/mob_archery.cpp
   # The death screen's peel: depth layers of a corpse's bricks, drawn as
   # clones (render only) and read as strata.
   src/game/autopsy.cpp
@@ -702,6 +703,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_elec_mob.cpp
   src/test/selftest_dye.cpp
   src/test/selftest_wound.cpp
+  src/test/selftest_archer.cpp
   src/test/selftest_aquatic.cpp
   src/test/selftest_solute.cpp
   src/test/selftest_heat.cpp

@@ -141,6 +141,7 @@ const char* IntentName(Intent i) {
     case Intent::Cast: return "cast";
     case Intent::Orbit: return "orbit";
     case Intent::Charge: return "charge";
+    case Intent::Shoot: return "shoot";
     default: return "?";
   }
 }
@@ -189,6 +190,8 @@ const char* FactName(Fact f) {
     case Fact::Immersion: return "immersion";
     case Fact::TargetImmersion: return "targetImmersion";
     case Fact::TargetBleeding: return "targetBleeding";
+    case Fact::Ammo: return "ammo";
+    case Fact::Cornered: return "cornered";
     default: return "?";
   }
 }
@@ -296,6 +299,14 @@ TuneMode TuneModeOf(Tune t) {
 //                "lead": 0.8, "lockDist": 5, "overrun": 14, "peel": 0.55,
 //                "biteCone": 0.6, "biteLead": 7, ... },   // OrbitTuning
 //     // with intents "orbit" and "charge" weighted (ai_behavior.h Intent).
+//     // ---- the archers (2026-10-13); RangedTuning, intent "shoot" -----------
+//     "ranged": { "rangeMin": 40, "rangeMax": 80, "minRange": 14,
+//                 "maxRange": 160, "cadenceTicks": 45, "jitterTicks": 20,
+//                 "firstDelayTicks": 20, "aimTolerance": 0.35, "draw": 1.0,
+//                 "holdTicks": 4, "holdJitter": 6, "spread": 0.02,
+//                 "lead": 1.0, "leadCap": 12, "aimRaise": 0.15,
+//                 "quiver": 12, "bow": "bow" },
+//     // rules may read the facts "ammo" and "cornered".
 //     // rules may also carry "tune": { "cadence": 0.7, "band": 3, ... } --
 //     // HOW it fights while the rule holds. Names in TuneName.
 //     "rules": [ { "when": { "hp": "<0.35" }, "weight": { "guard": 3 },
@@ -598,6 +609,28 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
       pr.cast.regenPerMille = std::max(0, q.value("regenPerMille", 220));
       pr.cast.maxLive = std::clamp(q.value("maxLive", 2), 0, 8);
     }
+    // The archers (RangedTuning). Absent = never shoots.
+    if (p.contains("ranged") && p["ranged"].is_object()) {
+      const auto& q = p["ranged"];
+      RangedTuning& r = pr.ranged;
+      r.rangeMin = std::max(0.0f, q.value("rangeMin", 0.0f));
+      r.rangeMax = std::max(r.rangeMin, q.value("rangeMax", 0.0f));
+      r.minRange = std::max(0.0f, q.value("minRange", 0.0f));
+      r.maxRange = std::max(r.minRange, q.value("maxRange", 0.0f));
+      r.cadenceTicks = std::max(1u, q.value("cadenceTicks", 45u));
+      r.jitterTicks = q.value("jitterTicks", 20u);
+      r.firstDelayTicks = q.value("firstDelayTicks", 20u);
+      r.aimTolerance = std::clamp(q.value("aimTolerance", 0.35f), 0.02f, 3.2f);
+      r.draw = std::clamp(q.value("draw", 1.0f), 0.05f, 1.0f);
+      r.holdTicks = q.value("holdTicks", 4u);
+      r.holdJitter = q.value("holdJitter", 6u);
+      r.spread = std::clamp(q.value("spread", 0.02f), 0.0f, 0.5f);
+      r.lead = std::clamp(q.value("lead", 1.0f), 0.0f, 2.0f);
+      r.leadCap = std::max(0.0f, q.value("leadCap", 12.0f));
+      r.aimRaise = std::clamp(q.value("aimRaise", 0.15f), -0.5f, 0.5f);
+      r.quiver = std::clamp(q.value("quiver", 12), 0, 999);
+      r.bow = q.value("bow", std::string("bow"));
+    }
     if (p.contains("intents") && p["intents"].is_object()) {
       for (auto& [k, v] : p["intents"].items()) {
         const Intent in = IntentFromName(k);
@@ -825,6 +858,27 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
         << ", \"mana\": " << p.cast.mana
         << ", \"regenPerMille\": " << p.cast.regenPerMille
         << ", \"maxLive\": " << p.cast.maxLive << " },\n";
+    }
+    // The archers: the ranged block, only for a creature that shoots.
+    if (p.ranged.maxRange > 0.0f) {
+      const RangedTuning& r = p.ranged;
+      o << "      \"ranged\": { \"rangeMin\": " << num(r.rangeMin)
+        << ", \"rangeMax\": " << num(r.rangeMax)
+        << ", \"minRange\": " << num(r.minRange)
+        << ", \"maxRange\": " << num(r.maxRange)
+        << ", \"cadenceTicks\": " << r.cadenceTicks
+        << ", \"jitterTicks\": " << r.jitterTicks
+        << ", \"firstDelayTicks\": " << r.firstDelayTicks
+        << ", \"aimTolerance\": " << num(r.aimTolerance)
+        << ", \"draw\": " << num(r.draw)
+        << ", \"holdTicks\": " << r.holdTicks
+        << ", \"holdJitter\": " << r.holdJitter
+        << ", \"spread\": " << num(r.spread)
+        << ", \"lead\": " << num(r.lead)
+        << ", \"leadCap\": " << num(r.leadCap)
+        << ", \"aimRaise\": " << num(r.aimRaise)
+        << ", \"quiver\": " << r.quiver
+        << ", \"bow\": \"" << Escaped(r.bow) << "\" },\n";
     }
     o << "      \"intents\": {\n";
     bool first = true;
@@ -1394,6 +1448,8 @@ void EvaluateRules(Brain& b, const Profile& pr, const SelfView& self,
   f[(int)Fact::Immersion] = self.immersion;
   f[(int)Fact::TargetImmersion] = tgt != nullptr ? tgt->immersion : 0.0f;
   f[(int)Fact::TargetBleeding] = tgt != nullptr && tgt->bleeding ? 1.0f : 0.0f;
+  f[(int)Fact::Ammo] = (float)std::max(0, self.ammo);
+  f[(int)Fact::Cornered] = self.cornered ? 1.0f : 0.0f;
 
   // THE QUEUE AROUND ONE TARGET. Allies are anyone of our faction who has
   // named the same target (Actor::targetId); rank is how many of them stand
@@ -1542,6 +1598,20 @@ void DrawLap(Brain& b, const OrbitTuning& ob, const SelfView& self,
 
 }  // namespace
 
+// The flight time is the straight line over the projectile's speed (a 30 Hz
+// tick), and only the PLANAR motion is led: a target's vertical velocity is a
+// stride's bob or a jump, and leading either puts the aim in the sky. Written
+// once for the creature casters (game/demon_cast.cpp AimFor, share 1, cap 8 --
+// the arithmetic it had inline, kept bit for bit) and the archers.
+Vec3 LeadPoint(Vec3 from, Vec3 to, Vec3 targetVel, float speedPerTick,
+               float share, float cap) {
+  const float t = (to - from).len() / std::max(0.5f, speedPerTick) / 30.0f;   // seconds
+  Vec3 lead{targetVel.x * t * share, 0.0f, targetVel.z * t * share};
+  const float m = lead.len();
+  if (m > cap) lead = lead * (cap / m);
+  return to + lead;
+}
+
 bool Think(Brain& brain, const Library& lib, const SelfView& self,
            const GroundView& ground, const WorldView& view, uint32_t tick,
            float dt, IntentOut& out) {
@@ -1557,6 +1627,7 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   out.guard = false;
   out.cancelSwing = false;
   out.cast = false;
+  out.shoot = false;
   out.altitudeSet = false;
   out.breach = false;
 
@@ -1654,6 +1725,18 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   // only at the outer edge, so HoldRange gives ground without needing an
   // intent of its own.
   float lo = pr.movement.rangeMin, hi = pr.movement.rangeMax;
+  // ---- AN ARCHER WITH ARROWS STANDS WHERE IT SHOOTS FROM (RangedTuning) ----
+  // While it can loose (a bow in hand, arrows for it) the band is the ranged
+  // block's, and the weapon slide below does not touch it: that slide puts a
+  // band inside what the held item can STRIKE, and a bow's swing reach says
+  // nothing about where an archer stands. Out of arrows it is the melee band
+  // again, slid onto whatever is in its hand now (the sidearm it drew).
+  const RangedTuning& rt = pr.ranged;
+  const bool shooting = rt.maxRange > 0.0f && rt.rangeMax > 0.0f && self.ammo > 0;
+  if (shooting) {
+    lo = rt.rangeMin;
+    hi = rt.rangeMax;
+  }
 
   // ---- THE BAND FOLLOWS THE WEAPON (2026-09-16) ---------------------------
   //
@@ -1693,7 +1776,7 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   // than its author asked. A zombie's longest drawable style is a 23-voxel
   // lunging bite, and widening its band onto that would have it orbit at 23
   // and pounce from across a field — a different creature. It keeps 2..7.
-  if (self.strikeReach > 0.0f && hi > lo) {
+  if (!shooting && self.strikeReach > 0.0f && hi > lo) {
     const float ceiling = self.strikeReach + self.size.z * 0.5f;
     if (hi > ceiling) {
       const float shift = hi - ceiling;
@@ -2003,6 +2086,20 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
                          tick >= brain.commitUntil && d >= ct.rangeMin &&
                          d <= ct.rangeMax && aimErr <= ct.aimTolerance;
   if (castReady) raw[(int)Intent::Cast] = 1.0f;
+  // ---- A BOW (RangedTuning) -----------------------------------------------
+  // The cast's shape: the clock arms on the first tick with a target
+  // (firstDelayTicks), then runs on its own cadence. "In the shot window,
+  // seen, facing, the string not already back" only: the draw, the aim and
+  // the loose are the owner's (game/mob_archery.h). Never while a swing is
+  // committed, and never with no arrow to nock (`shooting`).
+  if (shooting && brain.hasTarget && brain.nextShotTick == 0)
+    brain.nextShotTick = tick + rt.firstDelayTicks;
+  const bool shootReady =
+      shooting && brain.hasTarget && brain.visible && !self.drawing &&
+      brain.nextShotTick != 0 && tick >= brain.nextShotTick &&
+      tick >= brain.commitUntil && d >= rt.minRange && d <= rt.maxRange &&
+      aimErr <= rt.aimTolerance * tn[(int)Tune::Aim];
+  if (shootReady) raw[(int)Intent::Shoot] = 1.0f;
   // ---- THE CIRCLING HUNTER (OrbitTuning; Intent::Orbit / Charge) ----------
   // Orbit scores inside `engage` x radius (Approach and the band bring the
   // body in from further); a pass scores once the lap is spent and the attack
@@ -2265,6 +2362,11 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   // the body has promised the stroke system it will hold its facing, so no
   // amount of utility may spin it mid-swing.
   if (tick < brain.commitUntil) winner = Intent::FaceTarget;
+  // ...AND SO DOES A DRAWN BOW (SelfView::drawing): the owner is aiming down
+  // this body's facing, so it holds it -- and its feet -- until the loose.
+  // The owner owns the draw's length (the bow's drawTimeMs), so this is a
+  // flag rather than a commit window this layer would have to guess.
+  if (self.drawing) winner = Intent::FaceTarget;
 
   if (winner != brain.intent) {
     // Leaving an intent starts its cooldown. Charged on EXIT rather than on
@@ -2542,6 +2644,31 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       out.castRequest.targetVel = brain.haveTargetVel ? brain.targetVel : Vec3{};
       out.castRequest.tick = tick;
       out.castRequest.distance = d;
+      break;
+    }
+
+    case Intent::Shoot: {
+      // ---- ONE ARROW PER CADENCE (RangedTuning) -----------------------------
+      // The Cast shape: the clock advances HERE whatever the owner makes of
+      // the request (a hand that cannot draw, an arrow that would not fit in
+      // the air), so a refused archer does not ask every tick. No commit
+      // window: the draw holds the facing through SelfView::drawing, for as
+      // long as the bow says, from the next tick on.
+      out.desiredHeading = bearing;
+      const uint32_t jit =
+          rt.jitterTicks == 0
+              ? 0
+              : rng::Hash3((uint32_t)self.id ^ 0xA2C0E7u, tick, 7) % rt.jitterTicks;
+      brain.nextShotTick = tick + rt.cadenceTicks + jit;
+      brain.lastShotTick = tick;
+      brain.shotsIssued++;
+      out.shoot = true;
+      out.shootRequest.mobId = self.id;
+      out.shootRequest.targetId = brain.targetId;
+      out.shootRequest.targetPoint = brain.targetPos;
+      out.shootRequest.targetVel = brain.haveTargetVel ? brain.targetVel : Vec3{};
+      out.shootRequest.tick = tick;
+      out.shootRequest.distance = d;
       break;
     }
 

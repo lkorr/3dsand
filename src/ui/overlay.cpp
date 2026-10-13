@@ -1970,6 +1970,10 @@ void Overlay::DrawDevSpawn(UIState& s) {
           {"brawler", "brawler", "rushes inside, weaves, punishes whiffs", nullptr},
           {"berserker", "berserker", "relentless; worse when hurt", nullptr},
           {"guardian", "guardian", "turtles, parries, counters", nullptr},
+          {"archer", "archer",
+           "keeps its distance and shoots: a bow, a quiver, and the\n"
+           "weapon picked above as its sidearm for when the arrows run out",
+           nullptr},
       };
       const float w = CellWidth(4);
       int k = 0;
@@ -3333,7 +3337,8 @@ void Overlay::Draw(UIState& s) {
                                               "work",     "wander",
                                               "socialize", "eat",
                                               "goto",      "cast",
-                                              "orbit",     "charge"};
+                                              "orbit",     "charge",
+                                              "shoot"};
               static_assert(sizeof(kIntent) / sizeof(kIntent[0]) ==
                             (size_t)UIState::kAiIntents);
               for (int k = 0; k < UIState::kAiIntents; k++) {

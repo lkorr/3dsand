@@ -13,6 +13,7 @@
 #include "game/equipment.h"
 #include "game/item.h"
 #include "game/mob.h"
+#include "game/mob_archery.h"  // ArmArcher: an archer profile arms itself
 #include "game/session.h"
 #include "phys/damagecause.h"
 #include "sim/bytestream.h"
@@ -766,6 +767,9 @@ void Dress(RefCtx& c, const Ref& r, uint64_t id) {
     if (it == nullptr || !c.mobs->EquipItem(id, it))
       c.refs->Warn("refs: " + r.id + ": props.weapon: no item \"" + weapon + "\" to hold");
   }
+  // An archer profile arms itself (game/mob_archery.h ArmArcher): its bow and
+  // a quiver. Every other profile is untouched.
+  ArmArcher(*c.mobs, id, *c.items);
 }
 
 // One spawn into slot `si`. False = not now (ground unknown, crowd full).

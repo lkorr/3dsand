@@ -3546,6 +3546,19 @@ class Mob {
   };
   void SetCastBusy(bool b) { castBusy_ = b; }
   bool CastBusy() const { return castBusy_; }
+  // ---- A BOW DRAWN (game/mob_archery.h, the NPC archers, 2026-10-13) --------
+  // Set by MobArcheryTick while the string is back: the arms are the
+  // bow_draw clip's (no swing, no guard -- MobSystem::PreTick and ApplyAiArm
+  // refuse both, as for CastBusy), the AI holds the facing
+  // (ai::SelfView::drawing), and the pose tips the torso with `aimPitch`
+  // (radians, + up: the clip's pitchFollow, the player's look in the same
+  // convention). Presentation + scheduling: never saved, never hashed.
+  void SetBowDraw(bool on, float aimPitch = 0.0f) {
+    bowDraw_ = on;
+    bowAimPitch_ = on ? aimPitch : 0.0f;
+  }
+  bool BowDrawn() const { return bowDraw_; }
+  float BowAimPitch() const { return bowAimPitch_; }
   void SetCastArm(const CastArm& a) { castArm_ = a; }
   const CastArm& GetCastArm() const { return castArm_; }
   // THE LIGHT IN THE FIST: the colour (0xAABBGGRR) of the spell this hand
@@ -5939,6 +5952,8 @@ class Mob {
   };
   HeldHand held_[kHands];
   bool castBusy_ = false;   // SetCastBusy
+  bool bowDraw_ = false;    // SetBowDraw
+  float bowAimPitch_ = 0.0f;
   uint32_t spellLight_[kHands] = {0, 0};   // SetSpellLight
   CastArm castArm_;         // SetCastArm
   // Which hand the stroke driver serves (SetStrikeHand / ArmForStyle).
@@ -6812,6 +6827,10 @@ class MobSystem {
   // Same contract as the attack seam: at most one per mob per tick, bounded.
   const std::vector<ai::CastRequest>& CastRequests() const { return casts_; }
   void ClearCastRequests() { casts_.clear(); }
+  // ---- the SHOOT seam (the NPC archers: game/mob_archery.h MobArcheryTick
+  // drains it). Same contract: at most one per mob per tick, bounded.
+  const std::vector<ai::ShootRequest>& ShootRequests() const { return shoots_; }
+  void ClearShootRequests() { shoots_.clear(); }
 
   // Spawn def at a world cell (mob min corner; caller picks ground). 0 = fail,
   // including when kMaxMobs LIVING creatures already stand (the dead do not
@@ -9167,6 +9186,7 @@ class MobSystem {
   std::vector<ai::Actor> playerActors_;
   std::vector<ai::AttackRequest> attacks_;
   std::vector<ai::CastRequest> casts_;   // D4: drained by MobCastTick
+  std::vector<ai::ShootRequest> shoots_; // the archers: drained by MobArcheryTick
   // THE FENCE (game/mobfence.h, docs/PLAN_demons.md D1): asked by the walk
   // drive before a move and by the attack seam before a blow is queued.
   // Installed by the demon system while a demon is contained; empty otherwise.

@@ -15,6 +15,7 @@
 #include "game/equipment.h"
 #include "game/item.h"
 #include "game/mob.h"
+#include "game/mob_archery.h"  // ArmArcher: an archer profile arms itself
 #include "sim/bytestream.h"
 #include "sim/rng.h"
 #include "sim/world.h"
@@ -1289,6 +1290,10 @@ void RegisterResidentKinds() {
         if (it == nullptr || !mobs.EquipItem(id, it))
           c.refs->Warn("refs: " + r.id + ": props.weapon: no item \"" + weapon + "\" to hold");
       }
+      // AN ARCHER IS ARMED BY ITS PROFILE (game/mob_archery.h): a behaviour
+      // with a `ranged` block gets its bow (props.weapon "bow" is already one)
+      // and a quiver. Every other profile is untouched.
+      ArmArcher(mobs, id, *c.items);
     }
     std::vector<uint8_t> b;
     ByteWriter wr{b};

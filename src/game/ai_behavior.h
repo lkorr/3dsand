@@ -164,6 +164,14 @@ enum class Intent : uint8_t {
   // gets an altitude, IntentOut::altitude).
   Orbit,
   Charge,
+  // ---- THE ARCHER (2026-10-13, docs/PLAN_projectiles.md E; RangedTuning,
+  // the profile's `ranged` block) -------------------------------------------
+  // Emit a ShootRequest: "near enough, facing, an arrow on the string's
+  // cadence". The Cast shape. The DRAW, the aim and the loose are the
+  // owner's (game/mob_archery.h, MobArcheryTick, right after phase H): this
+  // layer only decides when, and holds the facing while the string is back
+  // (SelfView::drawing).
+  Shoot,
   Count,
 };
 // The activity verb for a schedule row's `do` ("sleep" -> Intent::Sleep), or
@@ -408,6 +416,72 @@ struct CastTuning {
   // casters stay bounded however eager their cadence).
   int32_t maxLive = 2;
 };
+
+// ---- HOW A CREATURE SHOOTS (2026-10-13, docs/PLAN_projectiles.md E) --------
+//
+// The `ranged` block of a profile: an ARCHER. It shoots only while it CAN --
+// a bow in a hand and arrows for it in its kit (SelfView::ammo, the owner's
+// count) -- and while it can, two things change and nothing else does:
+//
+//   * THE BAND is this block's (rangeMin..rangeMax) instead of movement's,
+//     and it is NOT slid onto the weapon's strike reach (a bow's swing reach
+//     says nothing about where an archer stands). HoldRange keeps it: inside
+//     rangeMin it backs off facing the target, past rangeMax it closes.
+//   * The SHOOT verb scores, on its own cadence, with the target between
+//     minRange and maxRange, visible, and the nose within aimTolerance.
+//
+// Out of arrows it is the creature its movement / attack blocks describe:
+// the melee band, the attack verb (the owner has drawn its sheathed sidearm
+// if it had one -- game/mob_archery.h). Whether it brawls with arrows left
+// (a target in its face, its back to a wall) is its RULES' business: the
+// `ammo` and `cornered` facts exist for exactly that.
+//
+// THE DRAW, the aim and the loose are the owner's (MobArcheryTick): the
+// bow's own drawTimeMs x `draw`, a hold of `holdTicks` + a hash-RNG jitter,
+// then the loose through the SAME ArrowFlights the player's bow looses into,
+// aimed where the target WILL be (LeadPoint, the casters' lead) and high by
+// the drop the flight's own gravity will take (ArrowHoldover), with a
+// counter-based error of up to `spread` radians each axis (scaled by the
+// rules' Tune::Aim). Defaults are a creature that never shoots (maxRange 0),
+// so every older profile is unchanged.
+struct RangedTuning {
+  // The footwork band while it can shoot, centre-to-centre, world voxels.
+  float rangeMin = 0.0f;
+  float rangeMax = 0.0f;
+  // The shot window: a draw starts only with the target between these.
+  // maxRange 0 = never shoots.
+  float minRange = 0.0f;
+  float maxRange = 0.0f;
+  // Ticks between shots (from the request) + a hash-RNG jitter in [0, jitter).
+  uint32_t cadenceTicks = 45;
+  uint32_t jitterTicks = 20;
+  // Ticks after first seeing a target before the first draw.
+  uint32_t firstDelayTicks = 20;
+  float aimTolerance = 0.35f;   // radians off the nose a draw may start at
+  // Share of the bow's full draw (ItemDef::BowSpec::drawTicks) it draws to;
+  // the arrow leaves at BowArrowSpeed of that, the player's own curve.
+  float draw = 1.0f;
+  // Ticks it holds at the draw before the loose (+ [0, holdJitter]).
+  uint32_t holdTicks = 4;
+  uint32_t holdJitter = 6;
+  float spread = 0.02f;         // radians: the loose's error, each axis, at most
+  float lead = 1.0f;            // share of the target's motion led
+  float leadCap = 12.0f;        // world voxels: the most it leads
+  float aimRaise = 0.15f;       // share of the target's height above its centre
+  // What ArmArcher (game/mob_archery.h) hands a creature spawned with this
+  // profile: the bow (when it holds none) and arrows up to `quiver`.
+  int32_t quiver = 12;
+  std::string bow = "bow";
+};
+
+// WHERE A MOVING TARGET WILL BE when a projectile from `from` at
+// `speedPerTick` world voxels per tick gets there: `to` moved along the
+// target's PLANAR velocity (`targetVel`, voxels/sec) for the flight time, x
+// `share`, the lead bounded at `cap` voxels so a sprint does not throw the
+// aim into the next field. The creature casters' lead (game/demon_cast.cpp
+// AimFor) and the archers' (game/mob_archery.cpp) are this one function.
+Vec3 LeadPoint(Vec3 from, Vec3 to, Vec3 targetVel, float speedPerTick,
+               float share, float cap);
 
 struct AttackTuning {
   // AUTHORED STYLE IDS, passed through to the stroke system untouched. THIS
@@ -707,6 +781,12 @@ enum class Fact : uint8_t {
   TargetImmersion,  // 0..1: how much of the TARGET is (Actor::immersion)
   TargetBleeding,   // 0/1: the target has an open, bleeding wound -- the
                     // frenzy a piranha profile's rules key on
+  // ---- (2026-10-13, the archers: RangedTuning) -----------------------------
+  Ammo,             // shots I can loose right now: arrows in my kit for the
+                    // bow in my hand (SelfView::ammo; 0 with no bow)
+  Cornered,         // 0/1: the step straight back is refused (the ground fan's
+                    // rear probe is blocked) -- an archer that cannot give
+                    // ground fights where it stands
   Count,
 };
 const char* FactName(Fact f);
@@ -753,6 +833,7 @@ struct Profile {
   Defense defense;
   CastTuning cast;   // D4: magic (empty = never casts)
   OrbitTuning orbit; // the circling hunter (radius 0 = never orbits)
+  RangedTuning ranged; // the archer (maxRange 0 = never shoots)
   IntentTuning intents[(int)Intent::Count];
   // Flat score bonus the current intent keeps. See the arbiter note above.
   float hysteresis = 0.22f;
@@ -1007,6 +1088,16 @@ struct SelfView {
   // The body's length along its facing (world voxels): an orbit tighter than
   // this is a body chasing its own tail.
   float length = 0.0f;
+  // ---- A BOW (2026-10-13, RangedTuning; game/mob_archery.h) ---------------
+  // `ammo`: shots this body can loose now -- arrows in its kit for the bow in
+  // its hand, 0 with no bow (Fact::Ammo). `drawing`: the string is back (the
+  // owner's draw is running): the arbiter holds FaceTarget through it.
+  // `cornered`: the ground fan's rear probe is blocked (Fact::Cornered). All
+  // default to a creature with no bow, so a caller that knows nothing about
+  // bows gets every profile's old behaviour.
+  int ammo = 0;
+  bool drawing = false;
+  bool cornered = false;
   Vec3 Centre() const {
     return Vec3{origin.x + size.x * 0.5f, origin.y + size.y * 0.5f,
                 origin.z + size.z * 0.5f};
@@ -1049,6 +1140,18 @@ struct CastRequest {
   uint64_t targetId = 0;
   Vec3 targetPoint{};       // the target's centre, world voxels, at the decision
   Vec3 targetVel{};         // its low-passed velocity, voxels/sec (Brain::targetVel)
+  uint32_t tick = 0;
+  float distance = 0;       // centre-to-centre at the decision
+};
+
+// One NPC SHOOT request (RangedTuning, the archers): the cast seam's shape for
+// a bow. Drained by the owner (game/mob_archery.h MobArcheryTick), which draws
+// the string, aims at the live target and looses through ArrowFlights.
+struct ShootRequest {
+  uint64_t mobId = 0;
+  uint64_t targetId = 0;
+  Vec3 targetPoint{};       // the target's centre, world voxels, at the decision
+  Vec3 targetVel{};         // its low-passed velocity, voxels/sec
   uint32_t tick = 0;
   float distance = 0;       // centre-to-centre at the decision
 };
@@ -1196,6 +1299,12 @@ struct Brain {
   uint32_t lastCastTick = 0;
   uint32_t castsIssued = 0;
 
+  // ---- the shot clock (RangedTuning) ----
+  // 0 = not armed yet: the first tick with a target books firstDelayTicks.
+  uint32_t nextShotTick = 0;
+  uint32_t lastShotTick = 0;
+  uint32_t shotsIssued = 0;
+
   // ---- footwork ----
   int circleSign = 0;            // -1 / +1, redrawn on a cadence
   uint32_t circleUntil = 0;
@@ -1318,6 +1427,9 @@ struct IntentOut {
   // ---- magic (D4) ----
   bool cast = false;
   CastRequest castRequest;
+  // ---- a bow (RangedTuning) ----
+  bool shoot = false;
+  ShootRequest shootRequest;
 };
 
 // One tick of AI for one creature. Returns false when the mob has no profile,

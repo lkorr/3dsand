@@ -71,6 +71,7 @@
 #include <vector>
 
 #include "game/arrows.h"
+#include "game/mob_archery.h"
 #include "game/avatar.h"
 #include "game/brush.h"
 #include "game/camera.h"
@@ -965,6 +966,10 @@ struct TickAuthorityCtx {
   // this one list (PhaseG), stepped once a tick in phase K's slot. The
   // world's, not a player's: an arrow in the air belongs to nobody.
   ArrowFlights arrows;
+  // THE NPC ARCHERS' DRAWN BOWS (game/mob_archery.h): the shoot requests
+  // phase H's mobs.PreTick issues are served here right after it, and what
+  // they loose goes into `arrows` above, like the player's.
+  MobArcheryWorld archers;
   uint32_t fluidCueMat = 0;
   uint32_t lastFluidTick = 0;
   // The liquid the mpm tool's keys 1-4 pour (UIState::fluidPour indexes it;

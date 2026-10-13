@@ -12126,6 +12126,8 @@ Status GateSpellPierce(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+Status GateArcher(Ctx& c, std::string& detail);   // selftest_archer.cpp
+
 const std::vector<Gate>& WoundGates() {
   static const std::vector<Gate> g = {
       {"wound-chip", "mob", {}, false, GateWoundChip, /*needsRender=*/false},
@@ -12151,6 +12153,11 @@ const std::vector<Gate>& WoundGates() {
       // on, stick in the ground, pull out, flat damage only when it got in, a
       // volley twice, and the draw/release input path.
       {"arrow", "mob", {}, false, GateArrow, false},
+      // ...and NPC ARCHERS (game/mob_archery.h, selftest_archer.cpp): an
+      // `archer` draws, looses through the same flights and gets into a
+      // dummy; backs off from one inside its minRange; stops at 0 arrows and
+      // draws its sidearm; a scene replays bit for bit.
+      {"archer", "mob", {}, false, GateArcher, false},
       // ...and a SPELL's matter as the point: a stone projectile embeds, a
       // stone bolt goes deeper, water/acid/lava splash a coat that acts.
       {"spell-pierce", "mob", {}, false, GateSpellPierce, false},

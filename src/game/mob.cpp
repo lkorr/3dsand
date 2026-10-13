@@ -16,6 +16,7 @@
 
 #include "game/burnprof.h"
 #include "game/item.h"
+#include "game/arrows.h"  // MobShotsLeft: an NPC archer's arrows (ai::SelfView::ammo)
 #include "game/anatomy_resolve.h"
 #include "game/dye.h"
 #include "game/rigrender.h"
@@ -3960,6 +3961,7 @@ void MobSystem::Reset(bool rewindIds) {
   // a Reset simply drops them (game/mob.h AttackRequests).
   attacks_.clear();
   casts_.clear();   // D4
+  shoots_.clear();  // the archers
   actors_.clear();
   blocks_.clear();
   strikes_.clear();
@@ -7830,7 +7832,8 @@ void MobSystem::ApplyAiArm(Mob& mob, const MobDef& def,
                            const ai::IntentOut& out) {
   NpcStroke& st = mob.stroke_;
   // A spell in the hand (Mob::CastBusy): the arm is the cast's; no guard.
-  if (mob.castBusy_) return;
+  // A drawn bow (Mob::BowDrawn): the arms are the draw's.
+  if (mob.castBusy_ || mob.bowDraw_) return;
   if (out.cancelSwing && st.phase == NpcStroke::Phase::Windup) {
     // The bluff ends where a dropped guard does: released, faded, no return
     // pose (a feint has no follow-through to settle out of).
@@ -7953,6 +7956,16 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     // test is blade on blade — MobSystem::FindParry skips anything unarmed).
     self.armed = !mob.HeldItem().empty();
     self.canGuard = self.armed && mob.HeldSlot() >= 0;
+    // A BOW (the NPC archers, game/mob_archery.h): the shots it can loose now
+    // (arrows in its kit for the bow in its hand), whether the string is
+    // back, and whether the step straight back is refused -- the fan's rear
+    // probe (Fact::Cornered).
+    // Asked only of a profile that shoots: the count is two library lookups
+    // and a kit walk, and nobody else's brain reads it.
+    if (items_ != nullptr && prof != nullptr && prof->ranged.maxRange > 0.0f)
+      self.ammo = MobShotsLeft(mob, *items_);
+    self.drawing = mob.bowDraw_;
+    self.cornered = sense.haveGround && !sense.clear[GroundSense::kProbeCount / 2];
     // THE FENCE, as the scorer sees it (demons D6 item 10; mobfence.h Reach /
     // Cast): asked once, uncounted, about last tick's target.
     if (fence_.allow != nullptr && mob.ai_.hasTarget) {
@@ -8015,12 +8028,16 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
                          mob.origin_.z + def.worldSize.z * 0.5f, out.request.targetPoint.x,
                          out.request.targetPoint.z))
         out.attack = false;
-      // A SPELL IN THE HAND (Mob::CastBusy): no swing through a cast.
-      if (mob.castBusy_) out.attack = false;
+      // A SPELL IN THE HAND (Mob::CastBusy): no swing through a cast. A
+      // DRAWN BOW (Mob::BowDrawn) neither.
+      if (mob.castBusy_ || mob.bowDraw_) out.attack = false;
       if (out.attack && attacks_.size() < kMaxMobs * 2)
         attacks_.push_back(std::move(out.request));
       // D4: a cast request (game/demon_cast.h drains it after this phase).
       if (out.cast && casts_.size() < kMaxMobs) casts_.push_back(out.castRequest);
+      // The archers: a shoot request (game/mob_archery.h drains it after this
+      // phase, beside the casts).
+      if (out.shoot && shoots_.size() < kMaxMobs) shoots_.push_back(out.shootRequest);
       ApplyAiArm(mob, def, out);
       return;
     }
@@ -8883,7 +8900,7 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
     const AttackStyle* sty = styles_.At(mob.stroke_.style);
     if (sty != nullptr && sty->fromStance) striking = false;
   }
-  in.chaseWant = !striking &&
+  in.chaseWant = !striking && !mob.bowDraw_ &&
                  (mob.stanceHold_ ||
                   (mob.ai_.hasTarget && mob.ai_.intent != ai::Intent::Idle &&
                    (def.chaseRange <= 0.0f ||
@@ -8940,6 +8957,20 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
     const float sp = mob.swimVel_.len();
     if (under && sp > 0.15f * std::max(def.speed, 0.01f))
       in.swimAim = mob.swimVel_ * (1.0f / sp);
+  }
+  // ---- A DRAWN BOW (game/mob_archery.h) -------------------------------------
+  // The bow_draw clip (the player's own, on the same rig) owns the arms; the
+  // LOOK carries the aim's pitch, so the clip's pitchFollow tips the torso and
+  // both arms with it exactly as the player's look does -- the arrow on the
+  // string points where it will fly. The body already faces the target (the
+  // AI holds FaceTarget through the draw), so the look's yaw is nothing. The
+  // strike aim is off for the draw: the head looks with the look instead of
+  // being turned onto the target a second time.
+  if (mob.bowDraw_) {
+    in.haveLook = true;
+    in.lookYaw = 0.0f;
+    in.lookPitch = mob.bowAimPitch_;
+    in.strikeAim = false;
   }
   mob.PosePipeline(in, dt, world, tick);
 }

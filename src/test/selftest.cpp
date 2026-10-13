@@ -984,6 +984,11 @@ const char* const kOrder[] = {
     // pull-out, the flat damage, a volley twice, the draw/release input path.
     // Fresh spawns on pristine ground; regenerates it on the way out.
     "arrow",
+    // ...and NPC ARCHERS (docs/PLAN_projectiles.md E): an `archer` draws,
+    // looses and gets into a dummy, backs off from one too close, stops at 0
+    // arrows and draws its sidearm, and replays bit for bit. Every scene
+    // regenerates the world and rewinds the ids; so does the way out.
+    "archer",
     // ...and a coat on the blade goes INTO the wound it cuts, from the voxels
     // that touched only, and comes back carrying the wound's fluid; a mace
     // coats the surface, a fist coats what it hits, and the blade keeps its

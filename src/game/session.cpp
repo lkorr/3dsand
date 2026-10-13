@@ -1542,7 +1542,18 @@ static void PhaseD(TickAuthorityCtx& w, WorldScratch& ws,
                 : *profile != '\0' ? std::string(profile)
                 : d.behavior.empty() ? std::string("duelist")
                                      : d.behavior;
-            if (!mobs.SetMobBehavior(nid, prof)) {
+            const bool behaved = mobs.SetMobBehavior(nid, prof);
+            // AN ARCHER IS ARMED BY ITS PROFILE (game/mob_archery.h ArmArcher):
+            // a `ranged` block hands it the profile's bow (the weapon picked
+            // above becomes its sidearm, in the sheath) and a quiver. Any
+            // other profile: untouched.
+            if (behaved) {
+              std::string anote;
+              if (ArmArcher(mobs, nid, items, &anote) >= 0)
+                std::printf("AI panel: %s armed as an archer: %s\n",
+                            d.name.c_str(), anote.c_str());
+            }
+            if (!behaved) {
               // A NAMED PROFILE THAT IS NOT LOADED leaves the creature on the
               // legacy wander, where it walks off and never fights — and it
               // did it silently. The panel is a dev tool; say so.
@@ -6126,6 +6137,10 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
   // into this tick's streams; its blinks. Nothing to do (and no world) until a
   // creature first asks.
   MobCastTick(w, players, tick, out);
+  // ...and SHOOT (game/mob_archery.h, the NPC archers): the shoot requests the
+  // same PreTick issued start draws, every drawn bow steps, and a loose goes
+  // into w.arrows -- stepped in phase K's slot with the players' arrows.
+  MobArcheryTick(w, players, tick);
   tprof.Mark("H");
   for (size_t i = 0; i < players.size(); i++)
     PhaseI(w, ws, players[i], scratch[i], tick, out);
