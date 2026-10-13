@@ -696,6 +696,35 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
     }
   }
 
+  // ---- A SHIELD RAISED (Mob::StepShield, item.h ShieldSpec::clip) ----------
+  // The spec's clip on the shield's hand (the right-authored clip, its
+  // derived mirror for a left fist -- Mob::HandClip), at a WEIGHT of the raise
+  // itself: the clips are `restFill`, so a weight of w is w of the way from
+  // the arm's rest to the raised pose, and the arm is exactly as far up as
+  // the mechanics say at whatever rate this shield comes up. One instance
+  // kept alive while it is up (the chase pose's reason, above); retired at
+  // zero, and on a change of hand or of shield.
+  {
+    Hand sh;
+    std::string want;
+    if (shieldRaise_ > 0.0f && ShieldHand(sh))
+      want = HandClip(held_[HandIndex(sh)].shieldSpec.clip, sh);
+    if (!shieldClip_.empty() && shieldClip_ != want) {
+      const int old = sk.FindClip(shieldClip_);
+      for (ClipInstance& inst : st.clips)
+        if (inst.clip == old) inst.stopping = true;
+    }
+    const int ci = want.empty() ? -1 : sk.FindClip(want);
+    if (ci >= 0) {
+      for (ClipInstance& inst : st.clips)
+        if (inst.clip == ci) inst.stopping = false;
+      PlayClipIndex(ci);
+      for (ClipInstance& inst : st.clips)
+        if (inst.clip == ci) inst.weight = Smooth01(shieldRaise_);
+    }
+    shieldClip_ = ci >= 0 ? want : std::string();
+  }
+
   // ---- the swim family (PoseInputs::swim, 2026-10-09) ----------------------
   // Seven library clips (assets/anims: tread, swim, swim_back, swim_side and
   // its derived .mirror, swim_up, swim_down), all full-body OVERRIDES on one

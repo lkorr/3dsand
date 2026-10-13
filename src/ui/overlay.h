@@ -469,6 +469,11 @@ struct UIState {
   // with, and a picker that cannot express it would need a second button.
   std::vector<std::string> aiWeaponNames;
   int aiWeaponPick = 0;
+  // ...and what goes in the OTHER fist: "nothing" or a shield (every
+  // ItemKind::Shield in the library, by name, rebuilt on R like the weapons).
+  // A random human takes one some of the time (session.cpp's spawn).
+  std::vector<std::string> aiOffhandNames;
+  int aiOffhandPick = 0;
   // ---- F1 Spawn tab: GIVE YOURSELF A FILLED VESSEL --------------------------
   // Every container item (flask, pouch, ...) and, per vessel, every material
   // its `container.holds` classes admit -- both BY NAME and rebuilt by main.cpp

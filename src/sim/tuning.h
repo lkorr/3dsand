@@ -2288,6 +2288,18 @@ struct Tuning {
     float blockNudgeAz = TPD(melee, blockNudgeAz);
     //   open, azimuth and elevation, at power 1
     float blockNudgeEl = TPD(melee, blockNudgeEl);
+    // ---- SHIELDS (item.h ShieldSpec, game/mob_shield.cpp) -----------------
+    // The raise a shield must be at or below before the OTHER hand may begin
+    // a stroke (Mob::ShieldBlocksStrike): you cannot swing behind a raised
+    // shield. A press made while it holds is banked until the shield is down.
+    float shieldStrikeBelow = TPD(melee, shieldStrikeBelow);
+    // Metres of slack on the shield's lattice, added to the blade's own
+    // half-width, in MobSystem::FindShieldBlock.
+    float shieldContactM = TPD(melee, shieldContactM);
+    // The flinch behind a guard beaten open, x the ordinary block flinch.
+    float shieldStaggerReact = TPD(melee, shieldStaggerReact);
+    // The plate dent a mace leaves, scaled for a shield.
+    float shieldDentScale = TPD(melee, shieldDentScale);
     // ---- ONE STROKE, DIMINISHING STRIKES (game/melee.h EdgeSweep::victimHits)
     // The hp multiplier on each strike after the first that one stroke lands
     // on the same creature, compounding: strike n does repeatHitScale^(n-1).

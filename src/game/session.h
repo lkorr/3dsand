@@ -745,6 +745,15 @@ struct PlayerSession {
   // stance would pick now. Presentation only: the draw count above is the
   // shot.
   std::string bowClip;
+  // ---- A SHIELD (item.h ItemKind::Shield, session.cpp's shield block) ----
+  // The shield hand's button HELD raises it (Mob::SetShieldWant; the rig
+  // steps the raise). A press of the OTHER hand's strike while it is up is
+  // banked (strikeQueued) and drops the shield: `shieldYield` holds it down
+  // until that strike has begun and the button has been let go, and
+  // `shieldStrikeWait` drops a banked strike that waited past a second (a
+  // shield the stagger holds up cannot hold a press forever).
+  bool shieldYield = false;
+  int shieldStrikeWait = 0;
 
   // ---- melee ----
   MeleeState melee;
@@ -1373,6 +1382,9 @@ struct HandNow {
   // A BOW (ItemDef::IsBow, game/arrows.h): this hand's button DRAWS while
   // held and SHOOTS on release; it is never a weapon a stroke swings.
   bool bow = false;
+  // A SHIELD (ItemDef::IsShield): this hand's button RAISES it while held
+  // (session.cpp's shield block); never a weapon, never `ready`.
+  bool shield = false;
   // An EMPTY hand holding an equipped spell (PlayerCaster::hand): its button
   // casts, so it never punches. Never on a ruined arm.
   bool spell = false;

@@ -96,6 +96,15 @@ enum class ItemKind : uint8_t {
   // pack, a bow in hand spends one per shot, and its `arrow` block is the
   // penetrator it flies as (ItemDef::ArrowSpec).
   Ammo,
+  // ---- held, and RAISED rather than swung (2026-10-13) ----
+  // A SHIELD rides a hand slot like a weapon, but its hand's button raises it
+  // instead of swinging it (session.cpp, the shield block), and its `shield`
+  // block is how fast it comes up and what holding it up costs
+  // (ItemDef::ShieldSpec). What it STOPS is its own voxels: a blade whose
+  // swept edge meets the shield's live lattice is arrested
+  // (MobSystem::FindShieldBlock), raised or not. Appended LAST so every kind
+  // number before it -- and every range test above -- is unchanged.
+  Shield,
 };
 
 // Is this kind WORN (a set of shells over the body) rather than merely carried?
@@ -121,13 +130,14 @@ inline const char* ItemKindName(ItemKind k) {
     case ItemKind::Container: return "container";
     case ItemKind::Key: return "key";
     case ItemKind::Ammo: return "ammo";
+    case ItemKind::Shield: return "shield";
     case ItemKind::None: break;
   }
   return "none";
 }
 
 inline ItemKind ItemKindFromName(const std::string& s) {
-  for (int i = 1; i <= (int)ItemKind::Ammo; i++) {
+  for (int i = 1; i <= (int)ItemKind::Shield; i++) {
     const ItemKind k = (ItemKind)i;
     if (s == ItemKindName(k)) return k;
   }
@@ -579,6 +589,51 @@ struct ItemDef {
     float length = 0.0f;      // world voxels, nock to point
   } arrow;
   bool IsAmmo() const { return arrow.has && kind == ItemKind::Ammo; }
+
+  // ---- A SHIELD (ItemKind::Shield, 2026-10-13) -----------------------------
+  //
+  // WHAT IT BLOCKS IS NOT HERE. A shield stops a blade by being where the
+  // blade is going: its own lattice, in its live pose, is the hitbox
+  // (MobSystem::FindShieldBlock), so a buckler covers a fist's width and a
+  // heater shield a torso because that is how big they ARE, and a shield
+  // hacked or burnt through has a hole a blade passes. No block chance, no
+  // damage reduction, no arc.
+  //
+  // WHAT IS HERE IS WHAT HOLDING IT UP COSTS, because that is the half the
+  // geometry cannot state, and it is per shield: a buckler snaps up and
+  // barely slows you, a heater shield is a slab of iron on one arm. While the
+  // shield is RAISED (session.cpp's shield block for the player, the AI's
+  // guard verb for an NPC -- Mob::SetShieldWant), all four apply in
+  // proportion to how far up it is (Mob::ShieldRaise):
+  //   * the other hand cannot start a stroke (melee.shieldStrikeBelow);
+  //   * the walk is scaled by `moveScale`;
+  //   * the body turns no faster than `turnRate` -- the shield faces where
+  //     the BODY faces, so a fighter who circles you outpaces your guard;
+  //   * a blow heavier than `stability` beats the guard open: the shield is
+  //     knocked down and cannot come back up for `staggerTicks`
+  //     (Mob::StaggerShield). Heavy weapons are the answer to a shield.
+  // And every block costs the shield: real voxels carved out where the blow
+  // landed (hardness decides how much, Mob::CutLimb's shell rule), item hp
+  // (`wear` x melee.blockItemDamage of the blow), and `bluntThrough` of the
+  // blow's trauma reaches the arm behind it. At hp 0 it breaks apart
+  // (Mob::BreakHeld). Wood burns because it IS wood (the burn pass reads a
+  // held slot like any limb).
+  struct ShieldSpec {
+    bool has = false;
+    int raiseTicks = 6;         // to full height (`raiseMs`, at 30 Hz)
+    int lowerTicks = 5;         // back down (`lowerMs`)
+    float moveScale = 0.6f;     // walk multiplier at full raise
+    float turnRate = 3.0f;      // rad/s body turn cap at full raise (`turnDegPerSec`)
+    float wear = 1.0f;          // x melee.blockItemDamage of a blow, in item hp
+    float stability = 12.0f;    // a blow's impact (BlockImpact) it holds against
+    int staggerTicks = 18;      // guard beaten open for (`staggerMs`)
+    float bluntThrough = 0.3f;  // of the blunt part, onto the arm behind it
+    // The pose (an assets/anims clip authored for a shield in the RIGHT fist;
+    // the left plays its derived mirror, Mob::HandClip). Its weight follows
+    // the raise, so the arm is exactly as far up as the mechanics say.
+    std::string clip = "shield_raise";
+  } shield;
+  bool IsShield() const { return shield.has && kind == ItemKind::Shield; }
   // How many the stub starting kit hands out (main.cpp), as ONE stack.
   int startCount = 1;
 };

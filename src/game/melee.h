@@ -602,6 +602,14 @@ struct BlockEvent {
   uint64_t blockerBody = 0;  // the item's Jolt body, so a caller can charge it
   Vec3 at{};                 // world voxels, where the blades met
   float power = 0;           // 0..1, speed x edge alignment of the blow
+  // ---- A SHIELD STOPPED IT (MobSystem::FindShieldBlock, 2026-10-13) ----
+  bool shield = false;
+  // What it struck rings (metal: a clang) or does not (wood, leather: a
+  // thud). Read off the struck voxel's material, so a shield whose iron face
+  // is hacked through to the boards starts to thud.
+  bool ring = true;
+  bool staggered = false;    // the blow beat the guard open (StaggerShield)
+  bool broke = false;        // ...and the shield came apart (BreakHeld)
 };
 
 // A BLOW LANDED ON A CREATURE (2026-09-28). Pushed by MeleeSweepDamage, only

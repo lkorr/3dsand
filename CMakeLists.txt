@@ -536,6 +536,7 @@ add_library(sandvox_core OBJECT
   # arrows in flight (docs/PLAN_projectiles.md C).
   src/game/arrows.cpp
   src/game/mob_archery.cpp
+  src/game/mob_shield.cpp
   # The death screen's peel: depth layers of a corpse's bricks, drawn as
   # clones (render only) and read as strata.
   src/game/autopsy.cpp
