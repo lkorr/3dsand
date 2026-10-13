@@ -738,6 +738,13 @@ struct PlayerSession {
   // Changing what is in the hand cancels the draw.
   int bowDrawTicks = 0;
   int bowHand = -1;
+  // The draw clip actually playing ("" = none): bow_draw standing,
+  // bow_draw_crouch crouched (the bow laid flat), either one's .mirror for a
+  // left-hand bow. Kept so a stance change mid-draw swaps one for the other,
+  // and so the loose stops the clip that was started rather than the one the
+  // stance would pick now. Presentation only: the draw count above is the
+  // shot.
+  std::string bowClip;
 
   // ---- melee ----
   MeleeState melee;

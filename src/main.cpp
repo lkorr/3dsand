@@ -423,6 +423,17 @@ constexpr uint64_t kShotCrawlShotsAt = 330;  // third-person stroke window
 constexpr uint64_t kShotCrawlShotsEnd = 400;
 constexpr uint64_t kShotCrawlFirst = 420;    // first person from here
 constexpr uint64_t kShotCrawlLast = 520;
+// `--shot-archery`: the BOW and the SNEAK's look-iteration harness (the
+// bow_draw / bow_draw_crouch clips, the held crouch's `sneak` overlay). A bow
+// in the right fist; strafe to turn the body side-on, draw standing (third
+// person, then first person level / up / down), loose and photograph the
+// arrow's first frames, tap Ctrl into the crouch, sneak side-on and
+// three-quarter-front, then draw crouched (third and first person) and loose.
+// Every picture is screenshot_archery_<what>.bmp. `g_shotArcheryDraw` is the
+// scripted LMB (the frame's mouse sample is replaced by it).
+bool g_shotArchery = false;
+bool g_shotArcheryDraw = false;
+constexpr uint64_t kShotArcheryLast = 560;
 constexpr uint64_t kShotSwimTreadEnd = 280;   // Space held at the surface
 constexpr uint64_t kShotSwimCrawlEnd = 420;   // forward at the surface
 constexpr uint64_t kShotSwimDownEnd = 500;    // Ctrl alone
@@ -4112,6 +4123,32 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   };
 
   for (int i = 0; i < 20; i++) mobTick();  // healthy walk first: live gait pose
+  // ">N" / ">N~": N arrows at the creature's torso, arms, thighs and head from
+  // around its front quarter, `standOff` voxels out along each line, at
+  // `draw` x the bow's full-draw speed (game/arrows.h, the real flight).
+  int inAirVolley = 0;
+  auto loose = [&](int n, float standOff, float draw) {
+    const ItemDef* ad = items.Named("arrow");
+    const ItemDef* bd = items.Named("bow");
+    if (ad == nullptr || !ad->IsAmmo()) return;
+    const float spd = draw * (bd && bd->IsBow() ? bd->bow.drawSpeed
+                                                : MetresPerSecToCells(50.0f));
+    static const char* const kAim[8] = {"torso", "armU.L", "legU.R", "armU.R",
+                                        "torso", "legU.L", "hips", "head"};
+    for (int k = 0; k < n && k < 8; k++) {
+      int li = -1;
+      for (size_t i = 0; i < def.limbs.size(); i++)
+        if (def.limbs[i].name == kAim[k]) li = (int)i;
+      if (li < 0 || !mobs.LimbBody(id, li)) continue;
+      Vec3 cc{};
+      for (uint32_t s = 0; s < 256; s++) cc += mobs.LimbVoxelPos(id, li, s * 7919u);
+      cc = cc * (1.0f / 256.0f);
+      const float a = 0.9f + 0.55f * (float)k;   // around the front quarter
+      const Vec3 dir = Vec3{std::cos(a), -0.08f, std::sin(a)}.normalized();
+      rig.Authority().arrows.Launch(*ad, cc - dir * standOff, dir, spd, Vec3{},
+                                    0x5A0700u + (uint32_t)k, {});
+    }
+  };
   std::vector<uint64_t> droppedBodies;       // "_item" drops, logged at the shot
   std::vector<std::string> pendingDrops;     // "_item=mat:frac", dropped later
   for (size_t start = 0; start < limbCsv.size();) {
@@ -4167,31 +4204,22 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     // torso, arms, thighs and head from around it, through the real flight
     // and the real embed (Mob::EmbedArrow), so what arrows sticking out of a
     // body look like is a screenshot rather than a live session.
+    // ">N~" keeps them IN THE AIR instead: N full-draw arrows loosed from
+    // three metres out AFTER the settle ticks below, and the pictures taken
+    // one tick later, so what a flight looks like (game/arrows.h
+    // AppendRenderBodies) is a screenshot too.
+    if (!nm.empty() && nm[0] == '>' && nm.find('~') != std::string::npos) {
+      inAirVolley = std::clamp(std::atoi(nm.c_str() + 1), 1, 8);
+      continue;
+    }
     if (!nm.empty() && nm[0] == '>') {
       const ItemDef* ad = items.Named("arrow");
-      const ItemDef* bd = items.Named("bow");
       if (ad == nullptr || !ad->IsAmmo()) {
         std::fprintf(stderr, "--shot-mob: no arrow item to shoot\n");
         continue;
       }
       const int n = std::clamp(std::atoi(nm.c_str() + 1), 1, 8);
-      const float spd = 0.5f * (bd && bd->IsBow() ? bd->bow.drawSpeed
-                                                  : MetresPerSecToCells(65.0f));
-      static const char* const kAim[8] = {"torso", "armU.L", "legU.R", "armU.R",
-                                          "torso", "legU.L", "hips", "head"};
-      for (int k = 0; k < n; k++) {
-        int li = -1;
-        for (size_t i = 0; i < def.limbs.size(); i++)
-          if (def.limbs[i].name == kAim[k]) li = (int)i;
-        if (li < 0 || !mobs.LimbBody(id, li)) continue;
-        Vec3 cc{};
-        for (uint32_t s = 0; s < 256; s++) cc += mobs.LimbVoxelPos(id, li, s * 7919u);
-        cc = cc * (1.0f / 256.0f);
-        const float a = 0.9f + 0.55f * (float)k;   // around the front quarter
-        const Vec3 dir = Vec3{std::cos(a), -0.08f, std::sin(a)}.normalized();
-        rig.Authority().arrows.Launch(*ad, cc - dir * 10.0f, dir, spd, Vec3{},
-                                      0x5A0700u + (uint32_t)k, {});
-      }
+      loose(n, 10.0f, 0.5f);
       mobTick();
       mobTick();
       Mob* sm = mobs.FindCreature(id);
@@ -4274,6 +4302,12 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   // enough for the loco crossfade to finish and the sever spray to land, but
   // short enough that a crawler hasn't dragged itself in among the trees
   for (int i = 0; i < 90; i++) mobTick();
+  if (inAirVolley > 0) {
+    loose(inAirVolley, 30.0f, 1.0f);
+    mobTick();
+    std::printf("--shot-mob: %d arrows loosed, %zu in the air at the shot\n",
+                inAirVolley, rig.Authority().arrows.Live());
+  }
   std::printf("--shot-mob: %s locoState=%d clips=%d\n", spec.c_str(),
               mobs.LocoState(id), mobs.ActiveClips(id));
   {
@@ -4434,6 +4468,10 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     sim.UploadMicroBodies(ctx.queue, *mbs);
 
   BodyRegistry bodyReg(debris, mobs, nullptr);
+  // The arrows still in the air (">N~"), where the last tick left them.
+  std::vector<RenderOnlyBody> flightBodies;
+  rig.Authority().arrows.AppendRenderBodies(items, 1.0f, flightBodies);
+  bodyReg.SetRenderOnly(&flightBodies);
   std::vector<BodyXformGpu> xf;
   bodyReg.BuildXforms(xf);
   if (!xf.empty())
@@ -6309,6 +6347,12 @@ int main(int argc, char** argv) {
       g_shotCrawl = true;
       g_harnessFrames = kShotCrawlLast;
     }
+    // `--shot-archery`: the bow draw, standing and crouched, and the sneak.
+    // See the note at g_shotArchery.
+    else if (a == "--shot-archery") {
+      g_shotArchery = true;
+      g_harnessFrames = kShotArcheryLast;
+    }
     // `--duel-dummy` is the melee FEEL harness: a sword-armed human standing
     // three metres in front of the spawn, with nothing driving it. Mobs have no
     // AI yet, so "stands still" is simply the default and this flag is only a
@@ -7048,7 +7092,7 @@ int main(int argc, char** argv) {
     // body. Forced here rather than in tuning.json because it feeds the shader
     // constant prelude and therefore worldgen — it has to be true before the
     // first chunk is generated, not toggled later.
-    if (g_shotJump || g_shotSwim || g_shotCrawl) {
+    if (g_shotJump || g_shotSwim || g_shotCrawl || g_shotArchery) {
       tune.debug.vegetation = 0;
       tune.debug.groundCover = 0;
     }
@@ -8676,6 +8720,16 @@ int main(int argc, char** argv) {
     }
     // --shot-swim photographs the STROKE: a sword in the fist puts that arm
     // in its guard and hides half of it, so the harness swims empty-handed.
+    // --shot-archery: the BOW in the right fist (whatever the stub kit put
+    // there goes to the hotbar); the arrows are already in the pack.
+    if (g_shotArchery) {
+      const int bi = items.Find("bow");
+      ItemStack& rh = kit.equip.slots[EquipSlotOfHand(Hand::Right)];
+      if (bi >= 0) {
+        if (!rh.Empty()) hotbar.Add(rh);
+        rh = StackOf(items, bi);
+      }
+    }
     if (g_shotSwim && !std::getenv("SANDVOX_SHOT_SWIM_ARMED")) {
       ItemStack& rh = kit.equip.slots[EquipSlotOfHand(Hand::Right)];
       if (!rh.Empty()) {
@@ -8845,7 +8899,37 @@ int main(int argc, char** argv) {
       std::snprintf(fl.name, sizeof fl.name, "%s", avatar.PartName(i));
       deathBody.limbs.push_back(fl);
     }
-    deathBody.have = !deathBody.boxes.Empty() && !deathBody.limbs.empty();
+    // ...AND EVERY PART THAT CAME OFF BEFORE THE END (owner, 2026-10-13: a
+    // fall down a mountain or a blast severs limbs, and they "eventually
+    // disappear out of sight"). A part severed even one tick before Die() has
+    // no PartBody, so the loop above never saw it, and the portrait drew it
+    // LIVE as world debris: still staining, still rolling downhill, and gone
+    // from the picture the moment it left the window. It is the body that
+    // died, so it is photographed like the rest: pose where it lay at the
+    // instant of death, brick cloned with the others below. No joint to pin
+    // by (haveAnchor false): it is not on one.
+    for (int i = 0; i < parts; i++) {
+      uint64_t h = avatar.PartSeveredBody(i);
+      BodyTransform cur;
+      // A carve since the sever rebuilt it under a new handle.
+      for (int hop = 0; hop < 16 && h && !phys.GetTransform(h, cur); hop++)
+        h = phys.Successor(h);
+      if (!h || !phys.GetTransform(h, cur)) continue;
+      bool dup = false;
+      for (const DeathBody::Limb& o : deathBody.limbs) dup |= o.body == h;
+      if (dup) continue;
+      DeathBody::Limb fl;
+      fl.body = h;
+      fl.xf.pos[0] = cur.pos.x; fl.xf.pos[1] = cur.pos.y; fl.xf.pos[2] = cur.pos.z;
+      std::memcpy(fl.xf.quat, cur.quat, sizeof fl.xf.quat);
+      fl.lastLive = cur;
+      fl.haveLive = true;
+      fl.isLimb = avatar.Def() && i < (int)avatar.Def()->limbs.size();
+      fl.figSlot = fl.isLimb ? BodySlotFor(avatar.PartName(i), avatar.PartTag(i)) : -1;
+      std::snprintf(fl.name, sizeof fl.name, "%s", avatar.PartName(i));
+      deathBody.limbs.push_back(fl);
+    }
+    deathBody.have =!deathBody.boxes.Empty() && !deathBody.limbs.empty();
     deathFrozen = true;
   });
   // The blade's position last tick, so the sweep has something to sweep FROM.
@@ -11792,7 +11876,7 @@ int main(int argc, char** argv) {
           g_shotDemon ||     // ...or the demon it summoned
           g_shotEditor ||    // ...or the house it placed
           g_shotSpawn ||     // (a picture, not a reload test: the compile would own the run)
-          g_shotCrawl;
+          g_shotCrawl || g_shotArchery;
       if (frameCounter == g_harnessFrames / 2 && !noReload) {
         std::printf("--frames harness: triggering shader reload (F5 path)\n");
         ui.reloadShaders = true;
@@ -13161,6 +13245,14 @@ int main(int argc, char** argv) {
           }
           std::printf("--shot-inventory: blasting beside the player's head\n");
         } else {
+          // SANDVOX_SHOT_DEATH_SEVER=<part>: that part comes off FIRST, a
+          // beat before the head (bug report 2026-10-13: limbs lost before
+          // the end were drawn live, kept staining, and vanished from the
+          // photograph once they left the window). See _VANISH below.
+          if (const char* pre = std::getenv("SANDVOX_SHOT_DEATH_SEVER")) {
+            avatar.SeverByName(pre);
+            std::printf("--shot-inventory: severed %s before the killing blow\n", pre);
+          }
           avatar.SeverByName("head");
         }
         std::printf("--shot-inventory: took the player's head off "
@@ -13182,6 +13274,18 @@ int main(int argc, char** argv) {
       // ...and PEELED two layers (the autopsy, game/autopsy.h): the picture
       // shows the flesh and muscle under the skin, the gear gone.
       if (frameCounter == kShotInvDeathTurnAt) {
+        // SANDVOX_SHOT_DEATH_VANISH=1: every body of the death leaves the
+        // world (debris reset, the corpse removed) - what a corpse rolling
+        // out of the window does to it. The turned picture must still show
+        // the whole photographed body, severed parts included.
+        if (std::getenv("SANDVOX_SHOT_DEATH_VANISH")) {
+          debris.Reset();
+          for (uint32_t i = mobs.MobCount(); i-- > 0;) {
+            const uint64_t mid = mobs.MobIdAt(i);
+            if (mid && !mobs.IsAlive(mid)) mobs.RemoveMob(mid);
+          }
+          std::printf("--shot-inventory: every body of the death removed from the world\n");
+        }
         ui.portraitYaw = 1.4f;
         ui.autopsy.peel = 2;
         // ...from nearly straight above (the pitch reaches the poles now).
@@ -14475,6 +14579,114 @@ int main(int argc, char** argv) {
       cam.pitch = -0.12f;
       pin.SetPressed(TB_JUMP, frameCounter == kShotJumpAtFrame);
     }
+    // --shot-archery: the script (g_shotArchery). Frame windows, each picture
+    // near the end of its window so the blend into that pose has finished.
+    if (g_shotArchery) {
+      const uint64_t f = frameCounter;
+      if (f == 1) {
+        ui.visible = false;
+        CelestialClock& sky = Celestial();
+        sky.SetScale(2.0f, tick);
+        sky.SetScale(1.0f, tick);
+        const int64_t tpd = (int64_t)TicksPerDay(CurrentTuning());
+        sky.ticks = tpd * 42 / 100;
+        sky.prevTicks = sky.ticks;
+        sky.rem = 0;
+      }
+      player.fly = false;
+      ui.fly = false;
+      ui.tool = UIState::kToolMelee;   // the hands own LMB
+      ui.magicMode = false;
+      // The windows. Strafing turns the third-person body to its travel, so
+      // a strafe right then a stop leaves it side-on to the camera.
+      const bool fpStand = f >= 215 && f < 262;
+      const bool fpCrouch = f >= 452 && f < 500;
+      camMode = (fpStand || fpCrouch) ? CameraMode::First : CameraMode::Third;
+      pin.forward = 0.f;
+      pin.strafe = 0.f;
+      if (f >= 60 && f < 110) pin.strafe = 1.f;              // turn side-on
+      if (f >= 300 && f < 345) pin.strafe = 1.f;             // sneak, side-on
+      if (f >= 345 && f < 380) { pin.strafe = 1.f; pin.forward = -0.6f; }  // 3/4 front
+      if (f >= 380 && f < 392) pin.strafe = 1.f;             // square up again
+      pin.SetHeld(TB_SPRINT, false);
+      pin.SetHeld(TB_JUMP, false);
+      pin.SetPressed(TB_JUMP, false);
+      // A TAP of Ctrl toggles the crouch (a hold would go prone).
+      pin.SetHeld(TB_CROUCH, f == 280);
+      pin.SetPressed(TB_CROUCH, f == 280);
+      g_shotArcheryDraw = (f >= 150 && f < 250) || (f >= 400 && f < 492);
+      // The sneak EMPTY-HANDED (its arms are the sneak's own, not a held
+      // weapon's), the bow back in the fist for the crouched draw.
+      {
+        static ItemStack stowed;
+        ItemStack& rh = kit.equip.slots[EquipSlotOfHand(Hand::Right)];
+        if (f == 286 && !rh.Empty()) {
+          stowed = rh;
+          rh = ItemStack{};
+        }
+        if (f == 386 && rh.Empty() && !stowed.Empty()) {
+          rh = stowed;
+          stowed = ItemStack{};
+        }
+      }
+      cam.yaw = 0.6f;
+      cam.pitch = -0.12f;
+      // The draws from in front as well: the body holds the heading the
+      // strafe gave it (third person faces its travel), so turning the
+      // camera round three-quarters shows it from its front-left.
+      if ((f >= 206 && f < 215) || (f >= 441 && f < 452)) cam.yaw = 0.6f + 2.3f;
+      if (fpStand || fpCrouch) cam.pitch = 0.0f;
+      if (f >= 227 && f < 238) cam.pitch = 0.40f;   // aiming up
+      if (f >= 238 && f < 250) cam.pitch = -0.40f;  // aiming down
+      static char path[96];
+      auto shot = [&](const char* what) {
+        std::snprintf(path, sizeof(path), "screenshot_archery_%s.bmp", what);
+        g_shotJumpPath = path;
+      };
+      auto shotF = [&](const char* what) {
+        std::snprintf(path, sizeof(path), "screenshot_archery_%s_f%llu.bmp", what,
+                      (unsigned long long)f);
+        g_shotJumpPath = path;
+      };
+      if (f == 140) shot("tp_stand");
+      if (f == 204) shot("tp_draw");
+      if (f == 214) shot("tp_draw_front");
+      if (f == 226) shot("fp_draw");
+      if (f == 237) shot("fp_draw_up");
+      if (f == 249) shot("fp_draw_down");
+      if (f >= 250 && f < 258) shotF("fp_loose");
+      if (f == 296) shot("tp_crouch");
+      if (f >= 320 && f < 345 && (f - 320) % 8 == 0) shotF("tp_sneak_side");
+      if (f >= 358 && f < 380 && (f - 358) % 8 == 0) shotF("tp_sneak_front");
+      if (f == 398) shot("tp_crouch_still");
+      if (f == 439) shot("tp_crouch_draw");
+      if (f == 451) shot("tp_crouch_draw_front");
+      if (f == 480) shot("fp_crouch_draw");
+      if (f >= 492 && f < 500) shotF("fp_crouch_loose");
+      if (f == 540) shot("tp_end");
+      if (g_shotJumpPath) {
+        std::printf("--shot-archery: %s crouch=%d prone=%d draw=%d\n", g_shotJumpPath,
+                    (int)player.crouching, (int)player.prone, (int)g_shotArcheryDraw);
+        // Where the arms are against the eye, in ART cells in the body's own
+        // frame (x = its left, z = ahead): the numbers the clip generator
+        // (scripts/gen_archery_clips.py) predicts, to compare with.
+        Vec3 headEye{};
+        if (avatar.Spawned() && avatar.HeadEyeWorld(headEye)) {
+          const float h = avatar.Heading();
+          const float art = 80.0f * kVoxelMeters;   // art cells per world voxel
+          for (const char* nm : {"armU.L", "armL.L", "hand.L", "armU.R", "armL.R", "hand.R"}) {
+            Vec3 a{};
+            const int pi = avatar.PartIndex(nm);
+            if (pi < 0 || !avatar.PartAnchorWorld(pi, a)) continue;
+            const Vec3 d = a - headEye;
+            const float fwd = d.x * std::sin(h) + d.z * std::cos(h);
+            const float left = d.x * std::cos(h) - d.z * std::sin(h);
+            std::printf("    %-7s rel eye: left %6.1f up %6.1f ahead %6.1f\n", nm,
+                        left * art, d.y * art, fwd * art);
+          }
+        }
+      }
+    }
     // --shot-crawl: the crawl script (g_shotCrawl). Walk, a Ctrl press held
     // into prone, then crawl nearly side-on; first person from
     // kShotCrawlFirst. Morning sun, no dev panel.
@@ -15506,6 +15718,7 @@ int main(int argc, char** argv) {
       accumulator = (double)fixedTicksPerFrame * kTickDt;
     int ticksThisFrame = 0;
     bool mouseL = captured && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+    if (g_shotArchery) mouseL = g_shotArcheryDraw;   // the harness's scripted draw
     bool mouseR = captured && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
     // LMB routes to the active tool: continuous for brush/laser, click-edge
     // for one-shot tools (prefab stamp, mob spawn)
@@ -16480,6 +16693,21 @@ int main(int argc, char** argv) {
             // (the base rig is ParentsFirst, an appended slot's host is an
             // earlier slot), so one forward pass reaches every descendant.
             if (p.head >= 0 && p.head < (int)hide.size()) hide[p.head] = 1;
+            // THE STRING HAND OF A DRAWN BOW (bow_draw*): it is hooked under
+            // the jaw, a hand's breadth from the eye. The pose keeps it out of
+            // the view at any held aim, but the draw follows the look on an
+            // eased pitch and a fast flick down outruns it -- the forearm
+            // swept up across the bottom of the view for a tenth of a second.
+            // Hidden while the draw lasts, with whatever it wears; the bow arm
+            // stays (it is the view).
+            if (session.bowDrawTicks > 0 && session.bowHand >= 0) {
+              const bool bowLeft = HandAt(session.bowHand) == Hand::Left;
+              for (const char* nm : {bowLeft ? "armL.R" : "armL.L",
+                                     bowLeft ? "hand.R" : "hand.L"}) {
+                const int pi = avatar.PartIndex(nm);
+                if (pi >= 0 && pi < (int)hide.size()) hide[pi] = 1;
+              }
+            }
             for (int i = 0; i < (int)hide.size(); i++) {
               const int par = avatar.PartParent(i);
               if (par >= 0 && par < (int)hide.size() && hide[par] == 1)
@@ -17299,8 +17527,14 @@ int main(int argc, char** argv) {
           for (DeathBody::Limb& fl : deathBody.limbs) {
             Vec3 aLimb;
             int model = -1;
-            if (!mobs.LimbAnchorByBody(fl.body, aLimb, &model)) continue;
-            if (fl.haveAnchor) {
+            // A part still on the corpse is a mob limb; one severed before
+            // (or by) the killing blow is debris, and its brick is that
+            // body's. Before 2026-10-13 a part that was not a mob limb was
+            // skipped here, so it was never photographed: drawn live, it
+            // went on staining and vanished when it left the window.
+            const bool onCorpse = mobs.LimbAnchorByBody(fl.body, aLimb, &model);
+            if (!onCorpse) model = debris.MicroModelOf(fl.body);
+            if (onCorpse && fl.haveAnchor) {
               const Quat q{fl.xf.quat[0], fl.xf.quat[1], fl.xf.quat[2], fl.xf.quat[3]};
               const Vec3 corner = fl.anchorWorld - QuatRotate(q, aLimb);
               fl.xf.pos[0] = corner.x; fl.xf.pos[1] = corner.y; fl.xf.pos[2] = corner.z;
@@ -19743,7 +19977,10 @@ int main(int argc, char** argv) {
       // numbers spelled out, so drawing the corner chrome underneath it is two
       // readouts of the same thing fighting for the same corner.
       // ...and while talking: the conversation panel sits where the hotbar is.
-      if (!ui.inventoryOpen && !ui.talk.open && !ui.worldMap.open && !editorMode.Active()) overlay.DrawHUD(ui);
+      // (--shot-archery photographs a pose: the bow meter sits on the figure.)
+      if (!ui.inventoryOpen && !ui.talk.open && !ui.worldMap.open && !editorMode.Active() &&
+          !g_shotArchery)
+        overlay.DrawHUD(ui);
       overlay.Draw(ui);
       DrawBugReport(ui);  // F12 (ui/bugreport.h): over everything, or nothing in the shot frame
       // ---- THE EDITOR (F8): its panels, overlays and input, then its world
@@ -20590,6 +20827,13 @@ int main(int argc, char** argv) {
         g_bodyStats.microUploadMaxUs = std::max(g_bodyStats.microUploadMaxUs, us);
       }
       BodyRegistry bodyReg(debris, mobs, &avatar, &mbSet);
+      // THE ARROWS IN FLIGHT (game/arrows.h AppendRenderBodies): drawn as
+      // render-only bodies after every real one, at the camera's own tick
+      // interpolation. Without this a shot was invisible until it stuck.
+      static std::vector<RenderOnlyBody> flightBodies;
+      flightBodies.clear();
+      tickCtx.arrows.AppendRenderBodies(items, tickAlpha, flightBodies);
+      bodyReg.SetRenderOnly(&flightBodies);
       const auto bodyT0 = std::chrono::steady_clock::now();
       // WHO ELSE IS HOLDING MY ARM. One index sweep while everything is
       // healthy, a named report the moment two entities point at one brick
@@ -20838,7 +21082,10 @@ int main(int argc, char** argv) {
         std::vector<int> slotLimb;
         std::vector<std::pair<uint32_t, int>> extraSlots;  // slot, limb index
         const size_t bodyXfLive = bodyXf.size();
-        if (deathFrozen && deathBody.have && !bodyXf.empty()) {
+        // NOT gated on the world having any bodies left: a corpse that rolled
+        // out of the window with every piece of it leaves bodyXf empty, and
+        // the photograph is then nothing BUT the appended slots below.
+        if (deathFrozen && deathBody.have) {
           // EVERY slot, not the debris range: the corpse is a dead Mob in
           // mobs_ now (MobSystem::AdoptDeadAvatar) and draws through mob
           // slots, while a limb severed before death is still debris.
@@ -21154,11 +21401,17 @@ int main(int argc, char** argv) {
                                 frameCounter == kShotInvDeathShot ||
                                 frameCounter == kShotInvDeathTurnShot))
           std::printf("--shot-inventory: portrait cube=%zu micro=%u "
-                      "eye=(%.1f %.1f %.1f) target=(%.1f %.1f %.1f)%s\n",
+                      "eye=(%.1f %.1f %.1f) target=(%.1f %.1f %.1f)%s"
+                      " photo parts=%zu frozen=%d lost=%zu\n",
                       (size_t)pDrawn, pMicro, portraitCam.eye.x, portraitCam.eye.y,
                       portraitCam.eye.z, portraitCam.target.x,
                       portraitCam.target.y, portraitCam.target.z,
-                      posedDead ? "  [death pose]" : "");
+                      posedDead ? "  [death pose]" : "",
+                      deathFrozen ? deathBody.limbs.size() : (size_t)0,
+                      deathFrozen ? (int)std::count_if(deathBody.limbs.begin(), deathBody.limbs.end(),
+                                                       [](const DeathBody::Limb& l) { return l.frozenModel >= 0; })
+                                  : 0,
+                      extraSlots.size());
         ctx.queue.Submit(pEnc.Finish());
 
         // Put the world back: the real hide mask, its instances, the corpse's

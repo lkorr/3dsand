@@ -10880,12 +10880,16 @@ Status GateLiquidCoats(Ctx& c, std::string& detail) {
 // fixture, along a ray aimed from the body's own measured geometry:
 //
 //   HEAD   sideways through the head's centroid at three energies: a thrown
-//          stone (GLANCES), a half-draw arrow (stops in the skull -- no brain
-//          cell taken), a full-draw arrow (breaches into the brain).
+//          stone (GLANCES), a half-draw arrow (stops short of the brain), a
+//          full-draw arrow (breaches into the brain and STAYS there --
+//          Embedded, not out the far side).
 //   ARM    sideways through the upper arm's centroid toward the torso's: at
-//          full draw it goes THROUGH the arm (Exited) and on into the torso;
-//          at half draw it embeds in the arm.
-//   TORSO  front to back, a little off the midline, at full draw: reported.
+//          full draw it EMBEDS in the arm (owner, 2026-10-13: an arrow stays
+//          in what it hits; until then it went through and on into the
+//          torso); at half draw it embeds shallower.
+//   TORSO  front to back, a little off the midline, at full draw: EMBEDS.
+//   HAND   sideways through the hanging hand: printed, not asserted -- the
+//          thin matter a full draw is ALLOWED to pass through.
 //   HARD   the same torso shot into a body whose skin is harder than skin
 //          (the automaton's brass, the sylvan's bark): it must NOT exit, and
 //          must stop shallower than the human's channel.
@@ -10983,7 +10987,8 @@ Status GatePierce(Ctx& c, std::string& detail) {
   };
 
   // ---- ONE SHOT ON A FRESH SPAWN ---------------------------------------------
-  // `aim`: 0 head (sideways), 1 arm -> torso, 2 torso (front, off the midline).
+  // `aim`: 0 head (sideways), 1 arm -> torso, 2 torso (front, off the midline),
+  // 3 hand (sideways through the hanging hand).
   struct Shot {
     PierceFlight f;
     uint64_t id = 0;
@@ -11029,6 +11034,13 @@ Status GatePierce(Ctx& c, std::string& detail) {
       sh.aimLimb = arm;
       dir = side;  // level, through the arm's centroid, on into the torso
       from = armC - side * kStandOff;
+    } else if (aim == 3) {
+      const int hand = limbNamed(d, "hand.L") >= 0 ? limbNamed(d, "hand.L")
+                                                   : limbNamed(d, "hand.R");
+      if (hand < 0 || !mobs.LimbBody(sh.id, hand)) return sh;
+      sh.aimLimb = hand;
+      dir = side;  // level, through the hand's centroid, toward the hip
+      from = centroid(sh.id, hand) - side * kStandOff;
     } else {
       sh.aimLimb = torso;
       dir = front;
@@ -11085,13 +11097,15 @@ Status GatePierce(Ctx& c, std::string& detail) {
       fail("half draw: did not meet the head");
     else if (b->r.outcome != PierceOutcome::Embedded ||
              cellsOf(b->r, "brain") > 0)
-      fail("half draw was not stopped by the skull");
+      fail("half draw was not stopped short of the brain");
     const PierceHit* f = first(hFull);
     if (!hFull.ran || !f || f->limb != hFull.aimLimb)
       fail("full draw: did not meet the head");
     else if (cellsOf(f->r, "brain") <
              (uint32_t)BaselineNumber("pierceBrainMinCells", 1))
       fail("full draw did not reach the brain");
+    else if (f->r.outcome != PierceOutcome::Embedded)
+      fail("full draw did not stay in the head (it went out the far side)");
   }
   // ---- ...AND HOW MUCH OF THAT IS WHERE THE AXIS CROSSED THE LATTICE --------
   // The PRICE of a channel is per depth (PierceChannel), but the brain charge
@@ -11150,12 +11164,14 @@ Status GatePierce(Ctx& c, std::string& detail) {
     const PierceHit* b = first(aFull);
     if (!aFull.ran || !b || b->limb != aFull.aimLimb)
       fail("arm full: did not meet the arm");
-    else if (b->r.outcome != PierceOutcome::Exited)
-      fail("full draw did not go through the arm");
-    else if (aFull.f.hits.size() < 2 || aFull.f.hits[1].mobId != b->mobId ||
-             aFull.f.hits[1].limb != aFull.torso ||
-             aFull.f.hits[1].r.cells == 0)
-      fail("through the arm, it did not go on into the torso");
+    else if (b->r.outcome != PierceOutcome::Embedded || !aFull.f.stopped)
+      fail("full draw did not stay in the arm (it went through)");
+  }
+  // ---- THE HAND: thin matter, printed -----------------------------------------
+  {
+    const Shot hd = shoot(human, 3, penAt(arrow, fullMps));
+    audit(hd);
+    lines += Format("HAND full: %s | ", describe(human, hd.f).c_str());
   }
 
   // ---- TORSO, HUMAN AND HARD ------------------------------------------------
@@ -11165,6 +11181,8 @@ Status GatePierce(Ctx& c, std::string& detail) {
   const PierceHit* th = first(tHuman);
   if (!tHuman.ran || !th || th->limb != tHuman.aimLimb)
     fail("torso: did not meet the torso");
+  else if (th->r.outcome != PierceOutcome::Embedded || !tHuman.f.stopped)
+    fail("full draw did not stay in the torso (it went through)");
   int hardRan = 0;
   for (const char* nm : {"tinker", "dryad"}) {
     const int d = mobs.FindDef(nm);
@@ -11279,8 +11297,13 @@ Status GatePierce(Ctx& c, std::string& detail) {
 //       limb moved, the arrow went with it), and after the arm is severed the
 //       arrow is a debris body strapped to the severed piece and registered
 //       as the item.
-//   (b) THROUGH: full draw at the torso goes through it (Exited) and the
-//       flight carries on past the body.
+//   (b) A FULL DRAW STAYS IN: full draw at the torso EMBEDS (owner,
+//       2026-10-13: an arrow buries itself in a chest; until then it went
+//       through). ...and THROUGH, as a MECHANISM: the same torso shot at
+//       arrowThroughSpeedX x the full-draw speed -- a speed no bow gives, so
+//       this is the residual-speed hand-off itself being tested (the thing a
+//       hand, a scrap or a heavier launcher will lean on), not a calibration --
+//       exits (Exited) and the flight carries on past the body.
 //   (c) TERRAIN: an arrow into the ground sticks there as a registered,
 //       motionless ground item, and the ground pickup takes it.
 //   (d) PULL-OUT: G's take (PullArrowToKit) on an embedded arrow puts it in
@@ -11314,6 +11337,7 @@ Status GateArrow(Ctx& c, std::string& detail) {
   const float rideTol = (float)BaselineNumber("arrowRideTolVox", 0.05);
   const float fallMin = (float)BaselineNumber("arrowFallMinVox", 1.0);
   const int volleyTicks = (int)BaselineNumber("arrowVolleyTicks", 40);
+  const float throughX = (float)BaselineNumber("arrowThroughSpeedX", 3.0);
 
   // THE GROUND REGISTRY the game binds (main.cpp): shed gear and stuck arrows
   // land in it, a released body leaves it.
@@ -11555,7 +11579,7 @@ Status GateArrow(Ctx& c, std::string& detail) {
       if (!pulled || inKit != 1 || m->EmbeddedArrowCount() != 0)
         fail("(d) the pull-out did not move the arrow into the kit");
     }
-    // (b) + the count: full draw through the torso until it dies (bounded).
+    // (b) + the count: full draw into the torso until it dies (bounded).
     // The aim is re-measured before every shot: the creature is alive and
     // the real tick runs between them.
     std::string seq;
@@ -11572,26 +11596,26 @@ Status GateArrow(Ctx& c, std::string& detail) {
       const std::vector<ArrowEvent> ev = eventsOf(f, sk);
       auditHits(ev);
       const ArrowEvent* first = nullptr;
-      bool after = false;
-      for (const ArrowEvent& e : ev) {
+      for (const ArrowEvent& e : ev)
         if (first == nullptr && e.kind == ArrowEvent::Kind::Hit && e.mobId == f.id)
           first = &e;
-        else if (first != nullptr)
-          after = true;
-      }
-      // ...still in the air past the body counts as flying on.
-      for (const ArrowFlight& fl : f.rig->Authority().arrows.Flights())
-        if (fl.seed == sk && first != nullptr) after = true;
       seq += first ? Format("%s%.0f", k ? "," : "", first->r.hpCharged)
                    : std::string(k ? ",miss" : "miss");
       if (k == 0) {
-        const bool through =
-            first != nullptr && first->r.outcome == PierceOutcome::Exited;
-        lines += Format("(b) full draw at the torso: %s, then %s | ",
+        const bool stayed =
+            first != nullptr && first->r.outcome == PierceOutcome::Embedded;
+        bool embedded = false, flying = false;
+        for (const ArrowEvent& e : ev)
+          embedded |= e.kind == ArrowEvent::Kind::Embedded && e.mobId == f.id;
+        for (const ArrowFlight& fl : f.rig->Authority().arrows.Flights())
+          flying |= fl.seed == sk;
+        lines += Format("(b) full draw at the torso: %s %.1f cm%s%s | ",
                         first ? PierceOutcomeName(first->r.outcome) : "no hit",
-                        after ? "it flew on" : "NOTHING after it");
-        if (!through || !after)
-          fail("(b) a full-draw arrow did not go through the torso and on");
+                        first ? first->r.depth * kVoxelMeters * 100.0f : 0.0f,
+                        embedded ? ", an arrow slot in it" : "",
+                        flying ? ", STILL FLYING" : "");
+        if (!stayed || !embedded || flying)
+          fail("(b) a full-draw arrow did not stay in the torso");
       }
       if (!mobs.IsAlive(f.id)) torsoKill = k + 1;
     }
@@ -11601,6 +11625,37 @@ Status GateArrow(Ctx& c, std::string& detail) {
     if (torsoKill < torsoKillMin || torsoKill > torsoKillMax)
       fail(Format("torso arrows to kill %d outside %d..%d", torsoKill,
                   torsoKillMin, torsoKillMax));
+  }
+  // (b) THROUGH, the mechanism: far faster than any draw, the same torso
+  // line -- out the back, and still flying past the body.
+  {
+    Fixture f = fixture(71500);
+    if (!f.id) {
+      detail = "the fixture human did not spawn (through)";
+      return Status::Fail;
+    }
+    const uint32_t sk = 0xB0200u;
+    shoot(f, f.torsoC - f.side * 0.6f, f.front, throughX * fullVox, sk);
+    support::RunTicks(*f.rig, 2);
+    const std::vector<ArrowEvent> ev = eventsOf(f, sk);
+    auditHits(ev);
+    const ArrowEvent* first = nullptr;
+    bool after = false;
+    for (const ArrowEvent& e : ev) {
+      if (first == nullptr && e.kind == ArrowEvent::Kind::Hit && e.mobId == f.id)
+        first = &e;
+      else if (first != nullptr)
+        after = true;
+    }
+    for (const ArrowFlight& fl : f.rig->Authority().arrows.Flights())
+      if (fl.seed == sk && first != nullptr) after = true;
+    const bool through =
+        first != nullptr && first->r.outcome == PierceOutcome::Exited;
+    lines += Format("(b) at %.1fx the full draw: %s, then %s | ", throughX,
+                    first ? PierceOutcomeName(first->r.outcome) : "no hit",
+                    after ? "it flew on" : "NOTHING after it");
+    if (!through || !after)
+      fail("(b) a far-faster arrow did not go through the torso and on");
   }
 
   // ======== the head: printed for the owner, not asserted ======================
@@ -11828,6 +11883,10 @@ Status GateArrow(Ctx& c, std::string& detail) {
 //                     after.
 //   acid projectile   a coat, and the acid then eats what it sits on.
 //   lava projectile   a coat, and the wound burns (burn hp / fire / cells).
+//                     ...a DROP at x1: at most spellPierceSplashX1MaxCells
+//                     coated skin cells on the whole body; x0.25 still
+//                     lands; x4 coats spellPierceSplashX4MinRatio times more
+//                     (the splash's width grows linearly with the matter).
 //   sand bolt         a powder: a scour that stops in the first body.
 //   price             stone bolt > stone projectile > stone lob, by the kinetic
 //                     term; the NPC kits' words priced with it and without.
@@ -11907,7 +11966,48 @@ Status GateSpellPierce(Ctx& c, std::string& detail) {
     float hp0 = 0, hpHit = 0, hpEnd = 0, burnHp = 0;
     uint32_t vox0 = 0, voxHit = 0, voxEnd = 0;
     uint32_t coatHit = 0, fireEnd = 0;
+    // THE SPLASH'S FOOTPRINT, WHOLE BODY (owner 2026-10-13: "the lava splashed
+    // on the character is too wide"): coated cells on every limb and how many
+    // limbs wear any at the hit, then after the settle the coat left, what
+    // burnt (fire + the flesh/undercloth/hair/cloth burn chain) and what is
+    // gone -- so "the splash was wide" and "the fire spread" are two numbers.
+    uint32_t bodyCoatHit = 0, limbsCoatHit = 0, bodyCoatEnd = 0, bodyBurntEnd = 0;
+    uint32_t bodyVox0 = 0, bodyVoxEnd = 0;
+    // ...and at the SKIN's resolution: a drop-sized coat works on the fine
+    // lattice (1.25 cm) and can eat or sear there without taking a single
+    // cell of the coarse collider the `vox` counts above are made of.
+    uint32_t bodySkin0 = 0, bodySkinEnd = 0;
     int ticksToHit = -1;
+  };
+  // Every base limb of the fixture, summed: the splash is not the torso's.
+  auto bodySum = [&](uint64_t id, auto&& per) {
+    uint32_t n = 0;
+    const size_t nl = mobs.Defs()[human].limbs.size();
+    for (size_t li = 0; li < nl; li++) n += per(id, (int)li);
+    return n;
+  };
+  auto bodyCells = [&](uint64_t id) {
+    return bodySum(id, [&](uint64_t m, int li) { return mobs.LimbVoxelCount(m, li); });
+  };
+  // Live skin cells (a burn's material-0 tombstones are not skin).
+  auto bodySkin = [&](uint64_t id) {
+    return bodySum(id, [&](uint64_t m, int li) {
+      const uint32_t n = mobs.LimbSkinVoxelCount(m, li), dead = mobs.LimbMaterialCount(m, li, 0);
+      return n > dead ? n - dead : 0u;
+    });
+  };
+  std::vector<uint32_t> burntMats;
+  for (const char* nm : {"fire", "flesh_cooked", "flesh_burning", "flesh_charred",
+                         "undercloth_seared", "undercloth_burning", "undercloth_charred",
+                         "hair_burning", "cloth_burning", "cloth_charred"})
+    for (uint32_t i = 0; i < (uint32_t)c.mats.size(); i++)
+      if (c.mats[i].name == nm) burntMats.push_back(i);
+  auto bodyBurnt = [&](uint64_t id) {
+    return bodySum(id, [&](uint64_t m, int li) {
+      uint32_t k = 0;
+      for (uint32_t bm : burntMats) k += mobs.LimbMaterialCount(m, li, bm);
+      return k;
+    });
   };
   auto shoot = [&](const std::string& words, uint32_t coatMat) -> Shot {
     Shot s;
@@ -11940,6 +12040,8 @@ Status GateSpellPierce(Ctx& c, std::string& detail) {
     const Vec3 from = torsoC - side * 0.6f - front * 10.0f;
     s.hp0 = mobs.TotalHp(s.id);
     s.vox0 = mobs.LimbVoxelCount(s.id, s.torso);
+    s.bodyVox0 = bodyCells(s.id);
+    s.bodySkin0 = bodySkin(s.id);
     const CastList cl = speak(lib, words);
     CasterState cs;
     cs.mana = cs.manaMax = 1 << 20;
@@ -11963,10 +12065,25 @@ Status GateSpellPierce(Ctx& c, std::string& detail) {
     s.hpHit = mobs.TotalHp(s.id);
     s.voxHit = mobs.LimbVoxelCount(s.id, s.torso);
     s.coatHit = coatMat ? mobs.LimbCoatMatCount(s.id, s.torso, coatMat, 1) : 0;
+    if (coatMat) {
+      s.bodyCoatHit = bodySum(s.id, [&](uint64_t m, int li) {
+        return mobs.LimbCoatMatCount(m, li, coatMat, 1);
+      });
+      s.limbsCoatHit = bodySum(s.id, [&](uint64_t m, int li) {
+        return mobs.LimbCoatMatCount(m, li, coatMat, 1) > 0 ? 1u : 0u;
+      });
+    }
     support::RunTicks(rig, settle);
     s.hpEnd = mobs.TotalHp(s.id);
     s.voxEnd = mobs.LimbVoxelCount(s.id, s.torso);
     s.fireEnd = mobs.LimbMaterialCount(s.id, s.torso, matId("fire"));
+    if (coatMat)
+      s.bodyCoatEnd = bodySum(s.id, [&](uint64_t m, int li) {
+        return mobs.LimbCoatMatCount(m, li, coatMat, 1);
+      });
+    s.bodyBurntEnd = bodyBurnt(s.id);
+    s.bodyVoxEnd = bodyCells(s.id);
+    s.bodySkinEnd = bodySkin(s.id);
     if (const Mob* m = mobs.FindMobById(s.id)) s.burnHp = m->HpLostBy(DamageCause::Burn);
     spells.Clear();
     return s;
@@ -11990,7 +12107,17 @@ Status GateSpellPierce(Ctx& c, std::string& detail) {
         r.through ? Format(", OUT at %.1f m/s", r.exitSpeedMps).c_str() : "",
         r.depthVox * kVoxelMeters * 100.0f, r.cells, mats.empty() ? "none" : mats.c_str(),
         r.spentJ, r.hp, r.killed ? ", KILLED" : "", s.coatHit, settle, s.vox0, s.voxHit,
-        s.voxEnd, s.hp0, s.hpHit, s.hpEnd, s.burnHp, s.fireEnd);
+        s.voxEnd, s.hp0, s.hpHit, s.hpEnd, s.burnHp, s.fireEnd) +
+           (k == SpellMatterKind::Splash
+                ? Format("[splash coat %u r %.2f vox (%.1f cm): body coat %u cells on %u limbs "
+                         "at the hit, %u after %d ticks; burnt %u, body cells %u -> %u, "
+                         "skin %u -> %u]",
+                         s.log.shot.coatAmount, s.log.shot.splashRadius,
+                         s.log.shot.splashRadius * kVoxelMeters * 100.0f,
+                         s.bodyCoatHit, s.limbsCoatHit,
+                         s.bodyCoatEnd, settle, s.bodyBurntEnd, s.bodyVox0, s.bodyVoxEnd,
+                         s.bodySkin0, s.bodySkinEnd)
+                : std::string());
   };
 
   const uint32_t mWater = matId("water"), mAcid = matId("acid"), mLava = matId("lava");
@@ -11999,6 +12126,10 @@ Status GateSpellPierce(Ctx& c, std::string& detail) {
   const Shot water = shoot("water projectile", mWater);
   const Shot acid = shoot("acid projectile", mAcid);
   const Shot lava = shoot("lava projectile", mLava);
+  // ...and the same lava at the least and the most a page can scale one noun
+  // (x0.25, x4): the splash's growth with magnitude, end to end.
+  const Shot lavaDrop = shoot("lava@0.25 projectile", mLava);
+  const Shot lavaBig = shoot("lava@4 projectile", mLava);
   const Shot sand = shoot("sand bolt", 0);
   const Shot again = shoot("stone bolt", 0);
   lines += "STONE PROJECTILE " + describe(stoneP) + " | ";
@@ -12006,6 +12137,8 @@ Status GateSpellPierce(Ctx& c, std::string& detail) {
   lines += "WATER " + describe(water) + " | ";
   lines += "ACID " + describe(acid) + " | ";
   lines += "LAVA " + describe(lava) + " | ";
+  lines += "LAVA x0.25 " + describe(lavaDrop) + " | ";
+  lines += "LAVA x4 " + describe(lavaBig) + " | ";
   lines += "SAND BOLT " + describe(sand) + " | ";
 
   auto hitTorso = [&](const Shot& s, SpellMatterKind k, const char* nm) {
@@ -12050,19 +12183,49 @@ Status GateSpellPierce(Ctx& c, std::string& detail) {
     if (acid.log.r.coated == 0) fail("acid: no coat on the skin");
     if (acid.log.r.cells != 0 || acid.voxHit != acid.vox0)
       fail("acid PENETRATED (a liquid never makes a channel)");
+    // Eaten at EITHER resolution: a drop-sized coat (x1, ~2 cm) eats the fine
+    // skin it sits on and may not take one coarse collider cell in 2 s.
     const uint32_t eaten = acid.vox0 > acid.voxEnd ? acid.vox0 - acid.voxEnd : 0;
+    const uint32_t skinEaten =
+        acid.bodySkin0 > acid.bodySkinEnd ? acid.bodySkin0 - acid.bodySkinEnd : 0;
     if ((float)eaten < (float)BaselineNumber("spellPierceAcidMinEaten", 1) &&
+        (float)skinEaten < (float)BaselineNumber("spellPierceAcidMinEaten", 1) &&
         acid.burnHp <= 0.0f)
       fail(Format("acid: the coat ate nothing in %d ticks", settle));
     RecordObserved("spellPierceAcidEaten", (double)eaten);
+    RecordObserved("spellPierceAcidSkinEaten", (double)skinEaten);
   }
   if (hitTorso(lava, SpellMatterKind::Splash, "lava projectile")) {
     if (lava.log.r.coated == 0) fail("lava: no coat on the skin");
+    // ...and the same for the burn: seared (the flesh chain, fire) or lost
+    // skin under a drop counts as a burn at the wound.
     const uint32_t lost = lava.vox0 > lava.voxEnd ? lava.vox0 - lava.voxEnd : 0;
+    const uint32_t skinLost =
+        lava.bodySkin0 > lava.bodySkinEnd ? lava.bodySkin0 - lava.bodySkinEnd : 0;
     if (lava.burnHp < (float)BaselineNumber("spellPierceLavaMinBurnHp", 0.01) &&
-        lava.fireEnd == 0 && lost == 0)
+        lava.fireEnd == 0 && lost == 0 && skinLost == 0 && lava.bodyBurntEnd == 0)
       fail(Format("lava: no burn at the wound in %d ticks", settle));
     RecordObserved("spellPierceLavaBurnHp", (double)lava.burnHp);
+    // A ONE-VOXEL SPLASH IS A DROP, NOT A DRENCH (owner 2026-10-13): the coat
+    // a x1 lava projectile lays on the whole body at the hit is bounded, and
+    // the cast scaled to x4 lays strictly more -- the width grows with the
+    // magnitude (glyphs.json splashRadiusMille, SplashRadiusMille).
+    RecordObserved("spellPierceSplashX1Cells", (double)lava.bodyCoatHit);
+    const double x1Max = BaselineNumber("spellPierceSplashX1MaxCells", 40);
+    if ((double)lava.bodyCoatHit > x1Max)
+      fail(Format("lava x1: the splash coated %u cells (ceiling %.0f) -- too wide for one "
+                  "voxel of matter",
+                  lava.bodyCoatHit, x1Max));
+  }
+  if (hitTorso(lavaDrop, SpellMatterKind::Splash, "lava x0.25") && lavaDrop.log.r.coated == 0)
+    fail("lava x0.25: no coat at all (the smallest splash must still land)");
+  if (hitTorso(lavaBig, SpellMatterKind::Splash, "lava x4")) {
+    RecordObserved("spellPierceSplashX4Cells", (double)lavaBig.bodyCoatHit);
+    const double grow = BaselineNumber("spellPierceSplashX4MinRatio", 4.0);
+    if ((double)lavaBig.bodyCoatHit < grow * (double)std::max(1u, lava.bodyCoatHit))
+      fail(Format("lava x4: coated %u cells, under %.1fx the x1 splash's %u -- the width does "
+                  "not grow with the magnitude",
+                  lavaBig.bodyCoatHit, grow, lava.bodyCoatHit));
   }
   // ---- powder: a scour, never a channel through ------------------------------
   if (hitTorso(sand, SpellMatterKind::Scour, "sand bolt") && sand.log.r.through)

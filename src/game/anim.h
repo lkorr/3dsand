@@ -89,7 +89,8 @@ struct AnimClip {
   // weight: a held pose (spell_ready) must not take the walk's arm swing on
   // top of itself, since additives land after the override blend (anim.cpp
   // stage 3). `pitchFollow` is the share of the eased look pitch the part
-  // turns through about its own X (pose.cpp, after the head look).
+  // turns through about its PARENT's X (pose.cpp, after the head look; the
+  // head hands back what its ancestors carried).
   std::vector<float> quietAdditive;
   std::vector<float> pitchFollow;
   // OVERRIDE clips only: on every part this clip keys, the REST POSE fills

@@ -2259,44 +2259,93 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
         const ItemDef* ammo = bowDef ? items.Named(bowDef->bow.ammo) : nullptr;
         int have = ammo ? KitAmmoCount(kit, ammo->name) : 0;
         // The pose is authored for a bow in the RIGHT fist; the left plays
-        // its mirror (Mob::HandClip). Stopped on the hand it was STARTED in.
+        // its mirror (Mob::HandClip). Stopped as it was STARTED (s.bowClip):
+        // the hand, and the stance, it was drawn in.
+        auto stopDrawClip = [&] {
+          if (!s.bowClip.empty() && avatar.Spawned()) avatar.StopClip(s.bowClip);
+          s.bowClip.clear();
+        };
         if (bh != s.bowHand) {
-          const std::string was =
-              avatar.HandClip("bow_draw", HandAt(s.bowHand >= 0 ? s.bowHand : 0));
-          if (s.bowDrawTicks > 0 && avatar.Spawned() && !was.empty())
-            avatar.StopClip(was);
+          if (s.bowDrawTicks > 0) stopDrawClip();
           s.bowDrawTicks = 0;
           s.bowHand = bh;
         }
         const Hand bowHand = HandAt(bh >= 0 ? bh : 0);
-        const std::string drawClip = avatar.HandClip("bow_draw", bowHand);
+        // CROUCHED, the bow is laid flat (bow_draw_crouch): a low draw from
+        // cover. Prone has its own pose and takes no draw clip change here.
+        const bool crouchDraw = player.crouching && !player.prone;
+        const std::string drawClip = avatar.HandClip(
+            crouchDraw ? "bow_draw_crouch" : "bow_draw", bowHand);
         const uint32_t bowBtn = bowHand == Hand::Left ? TB_ALT : TB_ATTACK;
         if (bowDef != nullptr && ti.Held(bowBtn) &&
             (s.bowDrawTicks > 0 || have > 0)) {
-          if (s.bowDrawTicks == 0) {
-            if (avatar.Spawned() && !drawClip.empty()) avatar.PlayClip(drawClip);
-            s.lastHand = bowHand;
+          if (s.bowDrawTicks == 0) s.lastHand = bowHand;
+          // Started, or the stance changed under the draw: the other clip
+          // takes over through its own blend-in, the draw count runs on.
+          if (s.bowClip != drawClip) {
+            stopDrawClip();
+            if (avatar.Spawned() && !drawClip.empty()) {
+              avatar.PlayClip(drawClip);
+              s.bowClip = drawClip;
+            }
           }
           s.bowDrawTicks = std::min(s.bowDrawTicks + 1, 1 << 20);
         } else if (bowDef != nullptr && s.bowDrawTicks > 0) {
           // THE LOOSE. Under the bow's minDraw it is a fumble: the arrow
           // stays on the string (in the kit) and nothing flies.
           const float speed = BowArrowSpeed(*bowDef, s.bowDrawTicks);
-          if (avatar.Spawned() && !drawClip.empty()) avatar.StopClip(drawClip);
+          stopDrawClip();
           s.bowDrawTicks = 0;
           if (speed > 0.0f && ammo != nullptr && have > 0) {
-            // FROM THE EYE, ALONG THE LOOK -- the spell aim's camera, so the
-            // arrow goes where the crosshair is. It starts inside the
-            // shooter's own capsule and among its limbs; those are the
-            // flight's ignore list. The shooter's own velocity rides along.
+            // FROM THE BOW, AT THE CROSSHAIR. The flight leaves the arrow
+            // rest -- where the drawn bow holds it, at arm's length a hand
+            // right of the eye line and a little under it (bow_draw*; the
+            // crouched draw holds the flat bow lower and nearer the middle;
+            // the mirror for a bow in the left fist) -- aimed at the point
+            // the look reaches kZero ahead, so it crosses the crosshair there
+            // (gravity aside: the player holds over, as before). Launched
+            // from the eye it flew straight away from the camera, end-on, a
+            // centimetre of nock nobody could see -- the shot looked
+            // instantaneous. Placed in the CAMERA's frame, not off the posed
+            // hand, so the muzzle is the same however the third-person body
+            // has turned. POINT-BLANK (a wall or a body between the eye and
+            // the rest) it leaves from the eye, so nothing inside arm's
+            // length is flown past. It starts among the shooter's own limbs;
+            // those are the flight's ignore list, and the shooter's own
+            // velocity rides along.
+            constexpr float kAhead = 6.5f;     // world voxels
+            constexpr float kZero = 300.0f;    // 30 m
+            const Vec3 eye = player.EyePos();
             const Vec3 fwd = cam.Forward();
-            const Vec3 from = player.EyePos() + fwd * 0.5f;
+            const float side = bowHand == Hand::Left ? -1.0f : 1.0f;
+            const Vec3 rest = eye + fwd * kAhead +
+                              cam.Right() * (side * (crouchDraw ? 0.4f : 1.0f)) -
+                              cam.Up() * (crouchDraw ? 1.7f : 1.4f);
             std::vector<uint64_t> ignore;
             avatar.AppendLiveLimbBodies(ignore);
             if (playerBody) ignore.push_back(playerBody);
+            Vec3 from = rest, dir = (eye + fwd * kZero) - rest;
+            {
+              const Vec3 seg = rest - eye;
+              const float len = seg.len();
+              bool blocked = false;
+              for (float t = 0.0f; kindAt && t <= len && !blocked; t += 0.5f) {
+                const Vec3 q = eye + seg * (t / len);
+                blocked = kindAt(IVec3{ifloor(q.x), ifloor(q.y), ifloor(q.z)}) ==
+                          CellKind::Solid;
+              }
+              float frac = 1.0f;
+              if (!blocked && phys.CastRayBody(eye, seg * (1.0f / len), len, frac,
+                                               ignore) != 0)
+                blocked = true;
+              if (blocked) {
+                from = eye + fwd * 0.5f;
+                dir = fwd;
+              }
+            }
             const uint32_t aseed =
                 rng::Hash3(0xA770B0u, tick, (uint32_t)s.index);
-            if (w.arrows.Launch(*ammo, from, fwd, speed, player.vel, aseed,
+            if (w.arrows.Launch(*ammo, from, dir, speed, player.vel, aseed,
                                 std::move(ignore))) {
               KitTakeAmmo(kit, ammo->name);
               have--;

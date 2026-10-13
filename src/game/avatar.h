@@ -405,6 +405,12 @@ class PlayerAvatar : public Mob {
   // introspection (overlay / selftest)
   // Jolt body of a part, or 0 when it is severed or never spawned.
   uint64_t PartBody(int part) const;
+  // The debris body a severed part became (MobLimb::severedBody), or 0. May
+  // be a handle a carve has since replaced: resolve through Physics::Successor.
+  uint64_t PartSeveredBody(int part) const {
+    return part >= 0 && part < (int)limbs_.size() && !limbs_[part].body
+               ? limbs_[part].severedBody : 0;
+  }
   int PartIndex(const std::string& name) const;
   int LivePartCount() const;
   // ---- per-part condition, for the HUD body readout -----------------------

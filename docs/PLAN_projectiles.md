@@ -98,6 +98,26 @@ as `MeleeHitKind::Pierce`, gate `arrow`, `--shot-mob human:>N`. Open: embedded
 arrows are not saved and do not cross a handoff; the shooter does not see an
 arrow stuck in a peer's creature.
 
+**Revised 2026-10-13 (owner: "arrows shouldn't go through someone unless
+they're an extremely thin layer of voxels"; "they seem to move
+instantaneously"; "a little shorter/smaller"):**
+- EMBED, NOT THROUGH. The arrow's own numbers, not `gore.pierceCellJ` (which
+  the spell projectiles share): `sharpness` 1.0 -> 0.8 at the bow's new 50 m/s
+  (37.5 J). Full draw, `pierce` gate: torso 8-9 cm and stays, upper arm
+  through the bone and stops in the far muscle, head breaches the skull and
+  stays in the brain; the half draw stops before the brain. Gate `pierce`
+  asserts all three STAY; gate `arrow`'s (b) asserts a full draw into the
+  torso embeds, and keeps the through-and-on hand-off as a MECHANISM test at
+  3x the draw speed.
+- SLOWER: `drawSpeedMps` 65 -> 50 (a real longbow; 65 was a compound bow's).
+- SEEN IN FLIGHT: nothing drew an `ArrowFlight` -- the shot appeared, already
+  stuck, a third of a second after the loose. Now a render-only body
+  (`game/renderonly.h`, `ArrowFlights::AppendRenderBodies`) walked by
+  `BodyRegistry` after every real body, tick-interpolated like the camera.
+  `--shot-mob human:>3~` photographs arrows in the air.
+- SMALLER: 0.725 m -> 0.60 m (`gen_bow_items.py` ARROW_LEN 58 -> 48), the
+  vanes and the head's socket slimmer.
+
 - Items: `bow` (weaponClass "bow": drawSpeedMps, drawTimeMs) and `arrow`
   (massKg, tipRadius, head material, stack count; carried in the pack).
   Art as `.vox` + sidecar like every other item.
@@ -155,6 +175,27 @@ is the projectile"). How it came out:
   bolt scours 2.5 cm; water coats 596 skin cells, carves nothing; acid coats
   and eats 75 cells / 20 hp in 2 s; lava coats and burns 129 cells / 70 hp in
   2 s; the stone bolt replays identically. World hash unmoved (ef7d9a06).
+- **Splash width (2026-10-13, owner: "the lava splashed on the character is
+  too wide; low strength projectiles (1 voxel) should be super super small
+  and concentrated unless the magnitude is really high").** Measured on the
+  old law (1.2 voxels at x1, growing as the cube root): x1 lava coated 596
+  skin cells (a 24 cm disc), x0.25 256, x4 1,449 cells on 6 limbs. The width
+  was the DISC, not the burn spreading: 60 ticks later the x1 coat had cooled
+  to 179 cells and 232 cells had burnt (fire + the flesh/undercloth chain),
+  all under the disc. New law (`spell.cpp SplashRadiusMille`):
+  `splashRadiusMille` 200 x the matter scale, LINEAR, floored at 0.1 voxel
+  (the skin column the ray met) and capped at `splashRadiusMaxMille` 3000:
+  x0.25 = the floor, x1 = 2 cm, x4 = 8 cm, x15 = 30 cm. The `spell-pierce`
+  gate prints the whole-body footprint per splash and asserts x1 <=
+  `spellPierceSplashX1MaxCells` and x4 >= `spellPierceSplashX4MinRatio` x x1.
+  Measured after: x0.25 6 cells, x1 25 (water, acid, lava alike), x4 302.
+  The trade-off is DAMAGE: a x1 lava drop sears 18 skin cells and takes 90
+  in 2 s for 3.5 hp (was 129 collider cells / 70 hp), a x1 acid drop eats 26
+  skin cells and no collider cell (was 75 / 20 hp), so the acid/lava "it
+  ate / it burnt" assertions now count fine skin cells too; and a x4 lava
+  cast puts all 302 cells on the torso, whose burn KILLED the fixture in 2 s
+  (was 1,449 cells over 6 limbs, 200 hp, alive) -- concentrated on one vital
+  limb rather than spread over six. Hash unmoved (ef7d9a06).
 - **Owner decisions open:** (1) whether an embedded lump should LODGE (needs
   package C's embedded slot) instead of dropping out of the wound; (2) the
   calibration -- lumpMl 250, the delivery points, rates.kinetic 100/kJ -- is a

@@ -249,7 +249,7 @@ Status GateArcher(Ctx& c, std::string& detail) {
     bool facedThrough = true;    // FaceTarget every drawn tick
     float looseSpeed = 0.0f;
     std::string hitOutcome = "none";
-    int kitBefore = 0, kitAfter = 0, loosed = 0, embedded = 0;
+    int kitBefore = 0, kitAfter = 0, loosed = 0, embedded = 0, exited = 0;
     std::string sheath, hand;
     std::vector<std::string> facts;
     std::string err;
@@ -295,15 +295,33 @@ Status GateArcher(Ctx& c, std::string& detail) {
         if (e.kind == ArrowEvent::Kind::Hit && e.mobId == s.target && e.r.hit &&
             !e.r.missed && e.r.outcome != PierceOutcome::Glanced && r.hitTick < 0) {
           r.hitTick = now;
-          r.hitOutcome = PierceOutcomeName(e.r.outcome);
+          // WHERE it went in and how far, not just how it ended: an arrow
+          // through a forearm and one through a chest are both "exited".
+          const auto& L = c.mobs.Defs()[(size_t)c.mobs.FindDef("human")].limbs;
+          std::string mats;
+          for (const PierceMatCells& m : e.r.byMat)
+            mats += Format("%s%s %u", mats.empty() ? "" : ", ",
+                           m.mat < c.mats.size() ? c.mats[m.mat].name.c_str() : "?",
+                           m.cells);
+          r.hitOutcome = Format("%s, %s %.1f cm, %.1f J in, cells: %s",
+                                PierceOutcomeName(e.r.outcome),
+                                e.limb >= 0 && e.limb < (int)L.size()
+                                    ? L[(size_t)e.limb].name.c_str()
+                                    : "?",
+                                e.r.depth * kVoxelMeters * 100.0f, e.r.energyIn,
+                                mats.empty() ? "none" : mats.c_str());
         }
     }
     // A few ticks more so the last flight finishes its story.
     support::RunTicks(*s.rig, 8);
     for (const ArcheryEvent& e : s.rig->Authority().archers.events)
       if (e.kind == ArcheryEvent::Kind::Loose) r.loosed++;
-    for (const ArrowEvent& e : s.rig->Authority().arrows.Events())
+    for (const ArrowEvent& e : s.rig->Authority().arrows.Events()) {
       if (e.kind == ArrowEvent::Kind::Embedded && e.mobId == s.target) r.embedded++;
+      if (e.kind == ArrowEvent::Kind::Hit && e.mobId == s.target &&
+          e.r.outcome == PierceOutcome::Exited && !e.r.missed)
+        r.exited++;
+    }
     if (Mob* m = c.mobs.FindMobById(s.archer)) r.kitAfter = KitAmmoCount(m->GetKit(), bow->bow.ammo);
     r.facts = Facts(c, s);
     return r;
@@ -334,10 +352,10 @@ Status GateArcher(Ctx& c, std::string& detail) {
   }
   lines += Format("A: gap %.0f: drew +%d, loosed +%d at %.0f vox/s after %d ticks drawn "
                   "(clip %.2f), into the dummy +%d (%s); %d loosed in %d ticks, %d embedded, "
-                  "kit %d -> %d | ",
+                  "%d out the far side of a limb, kit %d -> %d | ",
                   gap, a1.drawTick, a1.looseTick, a1.looseSpeed, a1.drawnTicks, a1.clipMax,
                   a1.hitTick, a1.hitOutcome.c_str(), a1.loosed, hitTicks, a1.embedded,
-                  a1.kitBefore, a1.kitAfter);
+                  a1.exited, a1.kitBefore, a1.kitAfter);
   RecordObserved("archer.hitTick", (double)a1.hitTick);
 
   // ======== B. BACK OFF ===============================================================

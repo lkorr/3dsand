@@ -1,0 +1,49 @@
+{
+  "//": "SNEAKING (pose.cpp, the held crouch): an ADDITIVE layer weighted by how far the Ctrl crouch has sunk, so a crouch reads as creeping and not as a squat. The chest pitched over the hips, the head turned most of the way back up (the look rides on top), the arms brought forward by the lean and a little out from the sides with soft elbows. Additive about rest: an override that owns the arms (bow_draw*, spell_ready) quiets it there, and the walk's arm swing still lands on top. Written by scripts/gen_archery_clips.py (SNEAK_* constants).",
+  "name": "sneak",
+  "sidecarVoxelsPerMetre": 10,
+  "durationMs": 1200,
+  "loop": true,
+  "mode": "additive",
+  "blendInMs": 0,
+  "blendOutMs": 0,
+  "mask": ["torso", "head", "armU.L", "armL.L", "armU.R", "armL.R"],
+  "tracks": {
+    "torso": {
+      "rot": [
+        { "t": 0, "q": [0.2164, 0.0, 0.0, 0.9763] },
+        { "t": 1200, "q": [0.2164, 0.0, 0.0, 0.9763] }
+      ]
+    },
+    "head": {
+      "rot": [
+        { "t": 0, "q": [-0.1564, -0.0, -0.0, 0.9877] },
+        { "t": 1200, "q": [-0.1564, -0.0, -0.0, 0.9877] }
+      ]
+    },
+    "armU.L": {
+      "rot": [
+        { "t": 0, "q": [-0.1789, -0.0348, 0.1876, 0.9652] },
+        { "t": 1200, "q": [-0.1789, -0.0348, 0.1876, 0.9652] }
+      ]
+    },
+    "armL.L": {
+      "rot": [
+        { "t": 0, "q": [-0.2419, 0.0, 0.0, 0.9703] },
+        { "t": 1200, "q": [-0.2419, 0.0, 0.0, 0.9703] }
+      ]
+    },
+    "armU.R": {
+      "rot": [
+        { "t": 0, "q": [-0.1789, 0.0348, -0.1876, 0.9652] },
+        { "t": 1200, "q": [-0.1789, 0.0348, -0.1876, 0.9652] }
+      ]
+    },
+    "armL.R": {
+      "rot": [
+        { "t": 0, "q": [-0.2419, 0.0, 0.0, 0.9703] },
+        { "t": 1200, "q": [-0.2419, 0.0, 0.0, 0.9703] }
+      ]
+    }
+  }
+}

@@ -216,6 +216,7 @@ bool ArrowFlights::Launch(const ItemDef& arrow, Vec3 fromWorld, Vec3 dirWorld,
   const Vec3 v = dirWorld * (speedVox / dl) + carryVox;   // voxels/s
   ArrowFlight f;
   f.pos = FxOf(fromWorld);
+  f.prev = f.pos;
   f.vel = FxOf(v * (1.0f / (float)kArrowTicksPerSecond));
   f.item = arrow.name;
   f.seed = seed;
@@ -224,6 +225,28 @@ bool ArrowFlights::Launch(const ItemDef& arrow, Vec3 fromWorld, Vec3 dirWorld,
   live_.push_back(std::move(f));
   stats.launched++;
   return true;
+}
+
+void ArrowFlights::AppendRenderBodies(const ItemLibrary& items, float tickAlpha,
+                                      std::vector<RenderOnlyBody>& out) const {
+  const float a = std::clamp(tickAlpha, 0.0f, 1.0f);
+  for (const ArrowFlight& f : live_) {
+    const ItemDef* def = items.Named(f.item);
+    if (def == nullptr || def->microModel < 0) continue;
+    const Vec3 p0 = FloatOf(f.prev), p1 = FloatOf(f.pos);
+    // Along the segment it is flying (gravity tips it over the arc), else
+    // along its velocity (the tick it was loosed, before it has moved).
+    Vec3 dir = p1 - p0;
+    if (dir.len() < 1e-4f) dir = FloatOf(f.vel);
+    const float dl = dir.len();
+    dir = dl > 1e-6f ? dir * (1.0f / dl) : Vec3{1, 0, 0};
+    const BodyTransform xf = ArrowXf(*def, p0 + (p1 - p0) * a, dir);
+    RenderOnlyBody b;
+    b.pos = xf.pos;
+    for (int k = 0; k < 4; k++) b.quat[k] = xf.quat[k];
+    b.model = (uint32_t)def->microModel;
+    out.push_back(b);
+  }
 }
 
 void ArrowFlights::Log(const ArrowEvent& e) {
@@ -292,6 +315,7 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
       f.vel.y -= kArrowGravityFx;
       prefetch(f.pos, f.vel);
       const SpellFxVec start = f.pos;
+      f.prev = start;   // render-only: the lerp's far end
       // ---- THE GRID: half-voxel sub-steps, as the spell VM sweeps ----------
       const int32_t kHalf = kSpellFxOne / 2;
       const int64_t maxComp =

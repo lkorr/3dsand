@@ -6219,6 +6219,12 @@ bool DebrisSystem::IsItemBody(uint64_t handle) const {
   return i >= 0 && bodies_[i].item;
 }
 
+int DebrisSystem::MicroModelOf(uint64_t handle) const {
+  const int i = IndexOfHandle(handle);
+  if (i < 0 || !bodies_[i].micro.Valid()) return -1;
+  return (int)bodies_[i].micro.model;
+}
+
 bool DebrisSystem::CoatLatticeOf(uint64_t handle, FleshLattice& out) {
   const int i = IndexOfHandle(handle);
   if (i < 0 || !OwnedLocally(bodies_[i]) || bodies_[i].voxels.empty())

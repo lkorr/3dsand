@@ -20,8 +20,12 @@
 //   CPU, integer (24.8 fixed voxels, the spell VM's units), gravity, swept in
 //   half-voxel sub-steps against the grid (game/flightprobe.h, the probe the
 //   spells use), and once a tick ONE PierceAlongRay over the tick's segment
-//   for the bodies on it (game/pierce.h): through an arm and into the torso
-//   behind it, through one man and into the next, at the speed each leaves.
+//   for the bodies on it (game/pierce.h): into whatever it meets, and on
+//   through only what is thin enough to leave it speed (a hand, a scrap), at
+//   the speed it leaves with. SEEN as a render-only body (AppendRenderBodies,
+//   game/renderonly.h) the frame loop hands to BodyRegistry: until
+//   2026-10-13 nothing drew a flight at all, and an arrow appeared, already
+//   stuck, a third of a second after the loose -- "instantaneous".
 //
 // WHERE AN ARROW ENDS.
 //   - EMBEDDED in a creature this machine owns: it stays in the limb
@@ -54,6 +58,7 @@
 #include "game/hand.h"
 #include "game/item.h"
 #include "game/pierce.h"
+#include "game/renderonly.h"
 #include "game/spell.h"  // SpellFxVec / kSpellFxOne: the flight's fixed point
 #include "math3d.h"
 
@@ -113,6 +118,10 @@ bool PullArrowToKit(MobSystem& mobs, uint64_t body, Kit& kit,
 // ---- THE ARROWS IN FLIGHT ------------------------------------------------------
 struct ArrowFlight {
   SpellFxVec pos{}, vel{};  // 24.8 fixed world voxels; vel per TICK
+  // Where the point was at the START of the last step: RENDER-ONLY, the other
+  // end of the frame's tick interpolation (AppendRenderBodies). Nothing the
+  // flight decides reads it.
+  SpellFxVec prev{};
   std::string item;         // what it is ("arrow"): what embeds or sticks
   uint32_t seed = 0;        // the soak's draw key, per hit
   int ticksLeft = 0;
@@ -174,6 +183,15 @@ class ArrowFlights {
 
   size_t Live() const { return live_.size(); }
   const std::vector<ArrowFlight>& Flights() const { return live_; }
+  // THE ARROWS AS THEY ARE SEEN (game/renderonly.h): one body per live flight,
+  // its art placed point-first exactly as the embed and the stuck item place
+  // it, at the point INTERPOLATED between the last two ticks by `tickAlpha`
+  // (the frame's leftover accumulator over a tick -- the camera's own lerp,
+  // so a shot leaves the string at the frame rate rather than hopping a
+  // metre and a half per tick), along the segment it is flying. Appends;
+  // flights whose item has no micro model draw nothing. Render-only.
+  void AppendRenderBodies(const ItemLibrary& items, float tickAlpha,
+                          std::vector<RenderOnlyBody>& out) const;
   const std::vector<ArrowEvent>& Events() const { return events_; }
   void ClearEvents() { events_.clear(); }
   // Everything forgotten (a world reset). Stuck arrows stay where they are:
