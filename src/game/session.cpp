@@ -2297,18 +2297,55 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
           stopDrawClip();
           s.bowDrawTicks = 0;
           if (speed > 0.0f && ammo != nullptr && have > 0) {
-            // FROM THE EYE, ALONG THE LOOK -- the spell aim's camera, so the
-            // arrow goes where the crosshair is. It starts inside the
-            // shooter's own capsule and among its limbs; those are the
-            // flight's ignore list. The shooter's own velocity rides along.
+            // FROM THE BOW, AT THE CROSSHAIR. The flight leaves the arrow
+            // rest -- where the drawn bow holds it, at arm's length a hand
+            // right of the eye line and a little under it (bow_draw*; the
+            // crouched draw holds the flat bow lower and nearer the middle;
+            // the mirror for a bow in the left fist) -- aimed at the point
+            // the look reaches kZero ahead, so it crosses the crosshair there
+            // (gravity aside: the player holds over, as before). Launched
+            // from the eye it flew straight away from the camera, end-on, a
+            // centimetre of nock nobody could see -- the shot looked
+            // instantaneous. Placed in the CAMERA's frame, not off the posed
+            // hand, so the muzzle is the same however the third-person body
+            // has turned. POINT-BLANK (a wall or a body between the eye and
+            // the rest) it leaves from the eye, so nothing inside arm's
+            // length is flown past. It starts among the shooter's own limbs;
+            // those are the flight's ignore list, and the shooter's own
+            // velocity rides along.
+            constexpr float kAhead = 6.5f;     // world voxels
+            constexpr float kZero = 300.0f;    // 30 m
+            const Vec3 eye = player.EyePos();
             const Vec3 fwd = cam.Forward();
-            const Vec3 from = player.EyePos() + fwd * 0.5f;
+            const float side = bowHand == Hand::Left ? -1.0f : 1.0f;
+            const Vec3 rest = eye + fwd * kAhead +
+                              cam.Right() * (side * (crouchDraw ? 0.4f : 1.0f)) -
+                              cam.Up() * (crouchDraw ? 1.7f : 1.4f);
             std::vector<uint64_t> ignore;
             avatar.AppendLiveLimbBodies(ignore);
             if (playerBody) ignore.push_back(playerBody);
+            Vec3 from = rest, dir = (eye + fwd * kZero) - rest;
+            {
+              const Vec3 seg = rest - eye;
+              const float len = seg.len();
+              bool blocked = false;
+              for (float t = 0.0f; kindAt && t <= len && !blocked; t += 0.5f) {
+                const Vec3 q = eye + seg * (t / len);
+                blocked = kindAt(IVec3{ifloor(q.x), ifloor(q.y), ifloor(q.z)}) ==
+                          CellKind::Solid;
+              }
+              float frac = 1.0f;
+              if (!blocked && phys.CastRayBody(eye, seg * (1.0f / len), len, frac,
+                                               ignore) != 0)
+                blocked = true;
+              if (blocked) {
+                from = eye + fwd * 0.5f;
+                dir = fwd;
+              }
+            }
             const uint32_t aseed =
                 rng::Hash3(0xA770B0u, tick, (uint32_t)s.index);
-            if (w.arrows.Launch(*ammo, from, fwd, speed, player.vel, aseed,
+            if (w.arrows.Launch(*ammo, from, dir, speed, player.vel, aseed,
                                 std::move(ignore))) {
               KitTakeAmmo(kit, ammo->name);
               have--;
