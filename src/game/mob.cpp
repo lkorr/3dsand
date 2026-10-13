@@ -27528,6 +27528,7 @@ void Mob::DetachLimb(int limbIndex, bool adopt, bool keepJoint) {
     // and AppendMicroInsts both skip a limb with no body.
     limb.microModel = -1;
     limb.holdBody = limb.body;
+    limb.severedBody = limb.body;
     limb.holdSeconds = kSeverHoldSeconds;
     // ...AND IT KEEPS ITS GEAR ON. The shells noted above were adopted by the
     // recursion a moment ago and are lying in this limb's exact space; strapped,

@@ -14779,8 +14779,25 @@ The photograph is taken JOINT-CONSISTENT (`PlayerAvatar::JointConsistentPose`,
 blast flings a head still on its neck metres away for the tick the solver has
 not yet pulled it back - so every part that still has a joint is moved (rotation
 kept) until its anchor sits on its parent where the posed skeleton puts it,
-parents first, if it is more than a voxel off. A part that really came off has
-no body and is not in the photograph at all; gear rides its parent's correction.
+parents first, if it is more than a voxel off. Gear rides its parent's
+correction. A part that really came off is in the photograph TOO (2026-10-13),
+where it lay at the instant of death: `MobLimb::severedBody` remembers the
+debris body every severed part became (`PlayerAvatar::PartSeveredBody`,
+resolved through `Physics::Successor`), and before that a limb blown off one
+tick before the killing blow was drawn live as world debris - still staining,
+still rolling, and gone from the picture once it left the window.
+
+The SKIN is photographed a quarter second after death (the killing blow's own
+carve lands after `Die()`): every part's brick, corpse limb or severed debris
+alike (`DebrisSystem::MicroModelOf`), is cloned once, and from then on the
+portrait draws the clones, so nothing that stains, burns or eats the remains
+reaches the picture. A photographed part the world has since lost - despawned
+out of the window, burnt away - keeps a slot of its own past the live ones,
+and that holds even when the world has no bodies left at all.
+`SANDVOX_SHOT_DEATH_SEVER=<part>` + `SANDVOX_SHOT_DEATH_VANISH=1` on
+`--shot-inventory` is the repro: a part off first, then every body of the death
+removed before the turned picture (its `portrait` line prints `photo parts /
+frozen / lost`).
 
 The live rig and the death snapshot reach the camera through **one type**
 (`LimbBoxes`: one oriented box per limb, tagged with its figure slot), so

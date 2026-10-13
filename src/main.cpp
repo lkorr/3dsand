@@ -8899,7 +8899,37 @@ int main(int argc, char** argv) {
       std::snprintf(fl.name, sizeof fl.name, "%s", avatar.PartName(i));
       deathBody.limbs.push_back(fl);
     }
-    deathBody.have = !deathBody.boxes.Empty() && !deathBody.limbs.empty();
+    // ...AND EVERY PART THAT CAME OFF BEFORE THE END (owner, 2026-10-13: a
+    // fall down a mountain or a blast severs limbs, and they "eventually
+    // disappear out of sight"). A part severed even one tick before Die() has
+    // no PartBody, so the loop above never saw it, and the portrait drew it
+    // LIVE as world debris: still staining, still rolling downhill, and gone
+    // from the picture the moment it left the window. It is the body that
+    // died, so it is photographed like the rest: pose where it lay at the
+    // instant of death, brick cloned with the others below. No joint to pin
+    // by (haveAnchor false): it is not on one.
+    for (int i = 0; i < parts; i++) {
+      uint64_t h = avatar.PartSeveredBody(i);
+      BodyTransform cur;
+      // A carve since the sever rebuilt it under a new handle.
+      for (int hop = 0; hop < 16 && h && !phys.GetTransform(h, cur); hop++)
+        h = phys.Successor(h);
+      if (!h || !phys.GetTransform(h, cur)) continue;
+      bool dup = false;
+      for (const DeathBody::Limb& o : deathBody.limbs) dup |= o.body == h;
+      if (dup) continue;
+      DeathBody::Limb fl;
+      fl.body = h;
+      fl.xf.pos[0] = cur.pos.x; fl.xf.pos[1] = cur.pos.y; fl.xf.pos[2] = cur.pos.z;
+      std::memcpy(fl.xf.quat, cur.quat, sizeof fl.xf.quat);
+      fl.lastLive = cur;
+      fl.haveLive = true;
+      fl.isLimb = avatar.Def() && i < (int)avatar.Def()->limbs.size();
+      fl.figSlot = fl.isLimb ? BodySlotFor(avatar.PartName(i), avatar.PartTag(i)) : -1;
+      std::snprintf(fl.name, sizeof fl.name, "%s", avatar.PartName(i));
+      deathBody.limbs.push_back(fl);
+    }
+    deathBody.have =!deathBody.boxes.Empty() && !deathBody.limbs.empty();
     deathFrozen = true;
   });
   // The blade's position last tick, so the sweep has something to sweep FROM.
@@ -13215,6 +13245,14 @@ int main(int argc, char** argv) {
           }
           std::printf("--shot-inventory: blasting beside the player's head\n");
         } else {
+          // SANDVOX_SHOT_DEATH_SEVER=<part>: that part comes off FIRST, a
+          // beat before the head (bug report 2026-10-13: limbs lost before
+          // the end were drawn live, kept staining, and vanished from the
+          // photograph once they left the window). See _VANISH below.
+          if (const char* pre = std::getenv("SANDVOX_SHOT_DEATH_SEVER")) {
+            avatar.SeverByName(pre);
+            std::printf("--shot-inventory: severed %s before the killing blow\n", pre);
+          }
           avatar.SeverByName("head");
         }
         std::printf("--shot-inventory: took the player's head off "
@@ -13236,6 +13274,18 @@ int main(int argc, char** argv) {
       // ...and PEELED two layers (the autopsy, game/autopsy.h): the picture
       // shows the flesh and muscle under the skin, the gear gone.
       if (frameCounter == kShotInvDeathTurnAt) {
+        // SANDVOX_SHOT_DEATH_VANISH=1: every body of the death leaves the
+        // world (debris reset, the corpse removed) - what a corpse rolling
+        // out of the window does to it. The turned picture must still show
+        // the whole photographed body, severed parts included.
+        if (std::getenv("SANDVOX_SHOT_DEATH_VANISH")) {
+          debris.Reset();
+          for (uint32_t i = mobs.MobCount(); i-- > 0;) {
+            const uint64_t mid = mobs.MobIdAt(i);
+            if (mid && !mobs.IsAlive(mid)) mobs.RemoveMob(mid);
+          }
+          std::printf("--shot-inventory: every body of the death removed from the world\n");
+        }
         ui.portraitYaw = 1.4f;
         ui.autopsy.peel = 2;
         // ...from nearly straight above (the pitch reaches the poles now).
@@ -17477,8 +17527,14 @@ int main(int argc, char** argv) {
           for (DeathBody::Limb& fl : deathBody.limbs) {
             Vec3 aLimb;
             int model = -1;
-            if (!mobs.LimbAnchorByBody(fl.body, aLimb, &model)) continue;
-            if (fl.haveAnchor) {
+            // A part still on the corpse is a mob limb; one severed before
+            // (or by) the killing blow is debris, and its brick is that
+            // body's. Before 2026-10-13 a part that was not a mob limb was
+            // skipped here, so it was never photographed: drawn live, it
+            // went on staining and vanished when it left the window.
+            const bool onCorpse = mobs.LimbAnchorByBody(fl.body, aLimb, &model);
+            if (!onCorpse) model = debris.MicroModelOf(fl.body);
+            if (onCorpse && fl.haveAnchor) {
               const Quat q{fl.xf.quat[0], fl.xf.quat[1], fl.xf.quat[2], fl.xf.quat[3]};
               const Vec3 corner = fl.anchorWorld - QuatRotate(q, aLimb);
               fl.xf.pos[0] = corner.x; fl.xf.pos[1] = corner.y; fl.xf.pos[2] = corner.z;
@@ -21026,7 +21082,10 @@ int main(int argc, char** argv) {
         std::vector<int> slotLimb;
         std::vector<std::pair<uint32_t, int>> extraSlots;  // slot, limb index
         const size_t bodyXfLive = bodyXf.size();
-        if (deathFrozen && deathBody.have && !bodyXf.empty()) {
+        // NOT gated on the world having any bodies left: a corpse that rolled
+        // out of the window with every piece of it leaves bodyXf empty, and
+        // the photograph is then nothing BUT the appended slots below.
+        if (deathFrozen && deathBody.have) {
           // EVERY slot, not the debris range: the corpse is a dead Mob in
           // mobs_ now (MobSystem::AdoptDeadAvatar) and draws through mob
           // slots, while a limb severed before death is still debris.
@@ -21342,11 +21401,17 @@ int main(int argc, char** argv) {
                                 frameCounter == kShotInvDeathShot ||
                                 frameCounter == kShotInvDeathTurnShot))
           std::printf("--shot-inventory: portrait cube=%zu micro=%u "
-                      "eye=(%.1f %.1f %.1f) target=(%.1f %.1f %.1f)%s\n",
+                      "eye=(%.1f %.1f %.1f) target=(%.1f %.1f %.1f)%s"
+                      " photo parts=%zu frozen=%d lost=%zu\n",
                       (size_t)pDrawn, pMicro, portraitCam.eye.x, portraitCam.eye.y,
                       portraitCam.eye.z, portraitCam.target.x,
                       portraitCam.target.y, portraitCam.target.z,
-                      posedDead ? "  [death pose]" : "");
+                      posedDead ? "  [death pose]" : "",
+                      deathFrozen ? deathBody.limbs.size() : (size_t)0,
+                      deathFrozen ? (int)std::count_if(deathBody.limbs.begin(), deathBody.limbs.end(),
+                                                       [](const DeathBody::Limb& l) { return l.frozenModel >= 0; })
+                                  : 0,
+                      extraSlots.size());
         ctx.queue.Submit(pEnc.Finish());
 
         // Put the world back: the real hide mask, its instances, the corpse's
