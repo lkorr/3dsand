@@ -12606,8 +12606,83 @@ int main(int argc, char** argv) {
       player.vel = Vec3{0, 0, 0};
       cam.yaw = g_atYawDeg * 0.0174532925f;
       cam.pitch = g_atPitchDeg * 0.0174532925f;
+      // ---- SANDVOX_AT_LIST=<file>: many cameras and hours in ONE boot -------
+      // The lighting tickets want the same chamber seen from several cameras at
+      // several hours, and a boot per picture is ~45 s of device, worldgen and
+      // cascade refill for a frame the previous boot had already warmed. Each
+      // line of the file is one shot:
+      //   name x y z yawDeg pitchDeg minute hold [vx vy vz [speed]]
+      // held for `hold` frames (the lighting caches settle in ~120; a new
+      // window or cascade far away needs ~900), photographed on the entry's
+      // last frame as screenshot_at_<name>.bmp. `minute` sets the sky and the
+      // clock is FROZEN there (speed 0, the default) so two shots at one hour
+      // compare exactly; speed 1 lets it run at the game's rate. vx vy vz (m/s)
+      // fly the camera from the entry's first frame, as SANDVOX_AT_FLY does.
+      // '#' starts a comment. The run ends after the last shot.
+      struct AtListShot {
+        std::string name;
+        float eye[3], yaw, pitch, fly[3];
+        int minute, hold;
+        float speed;
+      };
+      static std::vector<AtListShot> atList;
+      static std::vector<uint64_t> atListStart;
+      static size_t atListCur = (size_t)-1;
+      if (frameCounter == 1) {
+        if (const char* lp = std::getenv("SANDVOX_AT_LIST")) {
+          if (FILE* f = std::fopen(lp, "rb")) {
+            char line[512];
+            while (std::fgets(line, sizeof line, f)) {
+              if (char* h = std::strchr(line, '#')) *h = 0;
+              AtListShot e{};
+              char nm[128] = {0};
+              const int n = std::sscanf(line, "%127s %f %f %f %f %f %d %d %f %f %f %f", nm,
+                                        &e.eye[0], &e.eye[1], &e.eye[2], &e.yaw, &e.pitch,
+                                        &e.minute, &e.hold, &e.fly[0], &e.fly[1], &e.fly[2],
+                                        &e.speed);
+              if (n < 8) continue;
+              if (n < 11) e.fly[0] = e.fly[1] = e.fly[2] = 0.0f;
+              if (n < 12) e.speed = 0.0f;
+              e.name = nm;
+              e.hold = std::max(e.hold, 2);
+              atList.push_back(e);
+            }
+            std::fclose(f);
+          }
+          uint64_t at = 1;
+          for (const AtListShot& e : atList) { atListStart.push_back(at); at += (uint64_t)e.hold; }
+          if (!atList.empty()) g_harnessFrames = at + 4;
+          std::printf("SANDVOX_AT_LIST: %zu shots over %llu frames\n", atList.size(),
+                      (unsigned long long)at);
+        }
+      }
       static std::string atShotName;
-      if (frameCounter == g_harnessFrames - 8) g_shotJumpPath = "screenshot_at.bmp";
+      if (!atList.empty()) {
+        size_t k = 0;
+        while (k + 1 < atList.size() && frameCounter >= atListStart[k + 1]) k++;
+        const AtListShot& e = atList[k];
+        if (k != atListCur) {
+          atListCur = k;
+          CelestialClock& cc = Celestial();
+          cc.engaged = true;
+          cc.scaleDen = 1024;
+          cc.scaleNum = (int64_t)std::lround(e.speed * 1024.0f);
+          cc.ticks = (int64_t)((double)(((e.minute % 1440) + 1440) % 1440) / 1440.0 *
+                               (double)TicksPerDay(CurrentTuning()));
+          cc.prevTicks = cc.ticks;
+          cc.rem = 0;
+        }
+        const float t = (float)(frameCounter - atListStart[k]) * (1.0f / 60.0f) / kVoxelMeters;
+        player.pos = Vec3{e.eye[0] + e.fly[0] * t, e.eye[1] + e.fly[1] * t,
+                          e.eye[2] + e.fly[2] * t} -
+                     Vec3{0, player.EyeOffsetNow(), 0};
+        cam.yaw = e.yaw * 0.0174532925f;
+        cam.pitch = e.pitch * 0.0174532925f;
+        if (frameCounter == atListStart[k] + (uint64_t)e.hold - 1) {
+          atShotName = "screenshot_at_" + e.name + ".bmp";
+          g_shotJumpPath = atShotName.c_str();
+        }
+      } else if (frameCounter == g_harnessFrames - 8) g_shotJumpPath = "screenshot_at.bmp";
       else if (atShotEvery > 0 && frameCounter >= atShotFrom &&
                frameCounter % (uint64_t)atShotEvery == 0) {
         atShotName = "screenshot_at_" + std::to_string(frameCounter) + ".bmp";

@@ -551,6 +551,150 @@ const FAR_SC_FLAG : u32 = 0x80000000u;
 const FAR_SC_REFINED : u32 = 0x08000000u;
 const FAR_SC_LEVEL_SHIFT : u32 = 28u;
 const FAR_SC_AXIS_BITS : u32 = countTrailingZeros(FAR_N);
+
+// ======================= THE FAR PATCH'S INDIRECT LIGHT (2026-10-13) ========
+// WHAT THIS FIXES (ticket 2026-10-12_20-13-42, teeth_caves). The near field's
+// indirect light is MEASURED: gi_gather.wgsl casts nine rays from every visible
+// block-face and reads what each one lands on (an emitter's glow, a sunlit
+// floor through a cave mouth, multi-bounce). The cascade's was a CLOSED FORM
+// for open terrain (raymarch.wgsl farGiBounce: a lit tread in front of the
+// face), which under the ground is daylight that is not there -- so the far
+// field scales it out by burial, and a buried cascade hit then had NO
+// indirect light at all. In a cave lit by glowcaps and crystals that drew a
+// sphere at the 20.5 m handoff inside which the walls round each emitter glow
+// and outside which they are black, and it moved with the camera.
+//
+// So a BURIED far patch measures it, in this pass, the way the near gather
+// does: the same nine directions and weights (the normal 0.25, eight ring rays
+// 0.09375) from the patch centre, each marched through the patch's own level
+// to the first MATERIAL cell within FAR_GI_REACH_M, which sends its emission
+// (irrSample's emissive term, the law every near deposit uses) and -- if it is
+// NOT buried itself, i.e. ground under the open sky seen through a mouth or a
+// shaft -- the sun's hard-Lambert light on the face the ray entered, unshadowed
+// (the closed forms' own assumption for open ground). COVERAGE as the near
+// gather credits it (giFacePlane): the hit cell's share of the cone falls off
+// as 1/t^2, the rest of the cone takes what the cells beside it in the face's
+// plane send -- their mean here, a cascade cell being 20-80 cm already. No
+// multi-bounce (the near field's write-back has no far twin).
+//
+// STORED in shadowHist[bucket]: a far patch has no penumbra window (that is
+// the near patches' word), so its bucket's word is free. RGB9E5 with the low
+// bit forced on (0 = not buried / nothing measured: the reader keeps the
+// closed form). Re-measured every FAR_GI_PERIOD resolves of the patch (the
+// sun's share moves with the day) and on its first; written on EVERY resolve
+// so a word left by the bucket's previous owner never reaches a reader (the
+// reader only reads a slot this pass has published, and this pass publishes
+// after it writes).
+const FAR_GI_REACH_M : f32 = 12.0;
+const FAR_GI_STEPS : i32 = 72;
+const FAR_GI_PERIOD : u32 = 4u;
+const FAR_GI_W_NORMAL : f32 = 0.25;
+const FAR_GI_W_RING : f32 = 0.09375;
+const FAR_GI_OMEGA_NORMAL : f32 = 0.8418;
+const FAR_GI_OMEGA_RING : f32 = 0.6802;
+// The burial weight of a point (raymarch.wgsl farHitBuried, verbatim: the
+// column one sub-column out along `n`, FAR_BURIED_LO..HI fine voxels under its
+// terrain top). -1 = no column.
+fn farBuriedW(level : u32, p : vec3f, n : vec3f) -> f32 {
+  let w = f32(1u << (farCellShift(level) - 1u));
+  let top = farColumnTop(level, p + n * w);
+  if (top < -1e8) { return -1.0; }
+  return smoothstep(24.0 + 2.0 * w, 48.0 + 2.0 * w, top - p.y);
+}
+// The material a level cell holds (0 = air or blocker-only).
+fn farGiMat(level : u32, c : vec3<i32>, b : FarBox) -> u32 {
+  if (!farInValid(c, b)) { return 0u; }
+  let bi = farVoxByteIndex(level, c);
+  let slot = farCellSlot((farVox[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu);
+  return select(farPalMat(&materials, slot), 0u, slot == 0u);
+}
+// What a level cell of material `m` sends back along -d through its face on
+// `axis` (sign from d): emission always; the sun only when the cell is not
+// buried (`litW` = 1 - its burial).
+fn farGiRadiance(m : u32, axis : i32, d : vec3f, litW : f32) -> vec3f {
+  let mt = materials[m];
+  let albedo = (unpackColor(mt.color0) + unpackColor(mt.color1) + unpackColor(mt.color2)) *
+               (1.0 / 3.0);
+  let nH = axisVec(axis, -sign(axisPick(d, axis)));
+  return irrSample(albedo, nH, keyLightDirP(R), keyLightColorP(R), litW,
+                   f32(mt.emission) / 255.0);
+}
+// One gather ray through `level` from `ro` (fine voxels): its radiance
+// toward the patch, coverage-weighted (see above).
+fn farGiRay(level : u32, ro : vec3f, rdIn : vec3f, omega : f32, b : FarBox) -> vec3f {
+  var rd = rdIn;
+  if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
+  if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
+  if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
+  let s = f32(1u << farCellShift(level));
+  let roL = ro / s;
+  let inv = 1.0 / rd;
+  let stepv = vec3<i32>(sign(rd));
+  let tDelta = abs(inv);
+  var c = vec3<i32>(floor(roL));
+  var tMax : vec3f;
+  for (var a = 0; a < 3; a++) {
+    tMax[a] = (f32(c[a]) + select(0.0, 1.0, rd[a] > 0.0) - roL[a]) * inv[a];
+  }
+  let tEnd = FAR_GI_REACH_M / VOXEL_METERS / s;
+  var t = 0.0;
+  var axis = 1;
+  for (var i = 0; i < FAR_GI_STEPS; i++) {
+    if (tMax.x < tMax.y && tMax.x < tMax.z) {
+      c.x += stepv.x; t = tMax.x; tMax.x += tDelta.x; axis = 0;
+    } else if (tMax.y < tMax.z) {
+      c.y += stepv.y; t = tMax.y; tMax.y += tDelta.y; axis = 1;
+    } else {
+      c.z += stepv.z; t = tMax.z; tMax.z += tDelta.z; axis = 2;
+    }
+    if (t > tEnd || !farInValid(c, b)) { return vec3f(0.0); }
+    let m = farGiMat(level, c, b);
+    if (m == 0u) { continue; }
+    // The hit: its own radiance over its share of the cone, the plane's mean
+    // over the rest. The sun term only for a cell under the open sky.
+    let nIn = axisVec(axis, -sign(axisPick(rd, axis)));
+    let hc = (vec3f(c) + 0.5) * s;
+    let litW = 1.0 - max(farBuriedW(level, hc, nIn), 0.0);
+    let own = farGiRadiance(m, axis, rd, litW);
+    let tF = max(t * s, 1.0);
+    let cov = min(s * s * (abs(rd.x) + abs(rd.y) + abs(rd.z)) / (tF * tF * omega), 1.0);
+    var fill = vec3f(0.0);
+    if (cov < 1.0) {
+      let u = axisVecI((axis + 1) % 3, 1);
+      let v = axisVecI((axis + 2) % 3, 1);
+      var nb = vec3f(0.0);
+      for (var k = 0; k < 4; k++) {
+        let o = select(select(select(-v, v, k == 2), -u, k == 1), u, k == 0);
+        let mn = farGiMat(level, c + o, b);
+        if (mn != 0u) { nb += farGiRadiance(mn, axis, rd, litW); }
+      }
+      fill = nb * 0.25;
+    }
+    return own * cov + fill * (1.0 - cov);
+  }
+  return vec3f(0.0);
+}
+// The nine-ray gather from a far patch centre `hp` (already half a cell off
+// the face along `n`), gi_gather.wgsl's directions and weights.
+fn farGather(level : u32, hp : vec3f, n : vec3f, face : u32) -> vec3f {
+  let b = farBox(level);
+  let tg = shadowFaceTangents(face);
+  let t0 = axisVec(i32(tg.x), 1.0);
+  let t1 = axisVec(i32(tg.y), 1.0);
+  var e = vec3f(0.0);
+  for (var r = 0u; r < 9u; r++) {
+    let su = select(select(0.0, 1.0, r == 1u || r == 5u || r == 6u), -1.0,
+                    r == 2u || r == 7u || r == 8u);
+    let sv = select(select(0.0, 1.0, r == 3u || r == 5u || r == 7u), -1.0,
+                    r == 4u || r == 6u || r == 8u);
+    let d = normalize(n + t0 * su + t1 * sv);
+    let w = select(FAR_GI_W_RING, FAR_GI_W_NORMAL, r == 0u);
+    let om = select(FAR_GI_OMEGA_RING, FAR_GI_OMEGA_NORMAL, r == 0u);
+    e += farGiRay(level, hp, d, om, b) * w;
+  }
+  return e;
+}
+
 fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
   let level = ((packedSub >> FAR_SC_LEVEL_SHIFT) & 7u) + 1u;
   let ab = FAR_SC_AXIS_BITS;
@@ -581,6 +725,18 @@ fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
     }
     valid = !(r.x >= 0.0 && r.x < 0.01);
     valU = u32(clamp(sh, 0.0, 1.0) * 255.0 + 0.5);
+    // THE FAR PATCH'S INDIRECT LIGHT (above): buried patches only.
+    let ver0 = shadowPatchVerifier(packedCell, packedSub);
+    let old0 = atomicLoad(&shadowCache[bucket * 2u + 1u]);
+    let mine = shadowStateValid(old0) && shadowStateVerifier(old0) == ver0;
+    let bw = farBuriedW(level, hp, n3);
+    var giW = 0u;
+    if (bw > 0.001) {
+      let due = !mine || shadowHist[bucket] == 0u ||
+                ((R.frameIdx / SHADOW_REFRESH_PERIOD + (key >> 8u)) % FAR_GI_PERIOD) == 0u;
+      giW = select(shadowHist[bucket], packRgb9e5(farGather(level, hp, n3, face)) | 1u, due);
+    }
+    shadowHist[bucket] = giW;
   }
   let ver = shadowPatchVerifier(packedCell, packedSub);
   if (atomicLoad(&shadowCache[bucket * 2u]) != key) { return; }

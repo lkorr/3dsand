@@ -813,6 +813,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // the sun's horizon + sky visibility per pyramid sample, written by
         // the hz rows on the per-frame table (BeginRendering's flush).
         entry(46, T::ReadOnlyStorage, S::Fragment),               // hzLight
+        // The shadow cache's per-bucket side word (world.h kShadowHistBytes),
+        // read-only: a FAR patch's measured indirect light (shadow_resolve.wgsl
+        // THE FAR PATCH'S INDIRECT LIGHT). The resolve pass writes it on the
+        // ShadowCache table; FlushForRenderDomain orders the read.
+        entry(47, T::ReadOnlyStorage, S::Fragment),               // shadowHistRO
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -4339,6 +4344,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(44, boltBuf_),              // the bolt table (boltfx.h)
         b(45, horizonBuf_),           // the far horizon (horizon.h)
         b(46, hzLightBuf_),           // the terrain light map (horizon.h kL*)
+        b(47, world_->shadowHist),    // far patches' indirect light (shadow_resolve.wgsl)
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");

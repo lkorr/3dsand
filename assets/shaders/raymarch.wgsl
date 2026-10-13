@@ -414,6 +414,12 @@ fn pixelAngle() -> f32 { return 2.0 * R.tanHalfFov / max(R.viewPx, 1.0); }
 // The map's height plane as a 2D max pyramid, written at load / environment
 // reload only. Header word 0 = 0: no pyramid, every horizon ray misses.
 @group(0) @binding(45) var<storage, read> horizon : array<u32>;
+// The shadow cache's per-bucket side word (world.h kShadowHistBytes). For a
+// NEAR patch it is the resolve pass's penumbra window and nothing here reads
+// it; for a FAR patch it is the patch's measured indirect light
+// (shadow_resolve.wgsl THE FAR PATCH'S INDIRECT LIGHT), read by the cascade
+// shade through the bucket farSlotRead found (gFarSlot).
+@group(0) @binding(47) var<storage, read> shadowHistRO : array<u32>;
 // ---- THE TERRAIN-SCALE LIGHT MAP (map v2 S1; horizon.h kL*, HZ_L_* below) ---
 // Per pyramid sample: the sun's horizon (blocker top | distance) and the sky
 // visibility, written by horizon_light.wgsl on the frames that rebuild it.
@@ -7920,7 +7926,12 @@ const GI_TRANSPORT_GAIN_MAX : f32 = 0.8;
 
 fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>, albedo : vec3f) -> vec3f {
   let slot = chunkIndexW(cell);
-  if (opennessGen[slot] != opennessStamp(worldChunkOf(cell))) { return farGiIrradiance(albedo, n); }
+  if (opennessGen[slot] != opennessStamp(worldChunkOf(cell))) {
+    // The closed form is OPEN terrain's bounce (a lit tread in front): under
+    // the ground it is daylight that is not there (NO MEASUREMENT YET IS NOT
+    // OPEN SKY UNDERGROUND, in fs). Scaled out by the same burial test.
+    return farGiIrradiance(albedo, n) * (1.0 - max(farHitBuried(1u, p, n), 0.0));
+  }
   let face = openFaceOfNormal(n);
   let lo = vec3<u32>(cell & vec3<i32>(i32(CHUNK) - 1));
   let pidx = irrIndex(slot, subOccBitLocal(lo), face);
@@ -8471,6 +8482,7 @@ fn shadowSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
 // re-registration. Far patches are re-cast only every SHADOW_REFRESH_PERIOD
 // frames on their key's phase (or while unresolved), so only then does a
 // pixel stamp the slot and append; every other frame is the plain find alone.
+var<private> gFarSlot : u32 = 0xFFFFFFFFu;
 fn farSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
   let key = shadowPatchKey(packedCell, packedSub);
   let ver = shadowPatchVerifier(packedCell, packedSub);
@@ -8478,6 +8490,9 @@ fn farSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
   let slot = f.x;
   let state = f.y;
   if (slot == 0xFFFFFFFFu) { return shadowSlotRead(packedCell, packedSub, curFrame); }
+  // The bucket, for the patch's side word -- only once the resolve pass has
+  // published this patch, which is also when it has written that word.
+  if (shadowStateValid(state)) { gFarSlot = slot; }
   if ((!shadowStateValid(state) || shadowRefreshDue(key)) &&
       shadowStateRequested(state) != curFrame) {
     let r = atomicCompareExchangeWeak(
@@ -15530,8 +15545,10 @@ fn fs(in : VSOut) -> FSOut {
       // (eyeSkyK: 1 under any open sky). Features (crowns, trunks) stand on
       // the heightfield and are never buried. Also feeds the fog target
       // (gHitSky).
+      var buriedF = 0.0;
       if (!fFeat && m.klass != CLASS_LIQUID) {
         let bw = farHitBuried(flv, hitP, n);
+        buriedF = max(bw, 0.0);
         if (SEAM_DBG == 12u) { gDbg = vec4f(select(0.4, 0.6 + 0.4 * bw, bw >= 0.0), 0.0, eyeSkyK(), 1.0); }
         if (bw >= 0.0) {
           openF *= 1.0 - bw;
@@ -15554,6 +15571,18 @@ fn fs(in : VSOut) -> FSOut {
       if (lamSm >= 0.0 && !farWater) { lambert = mix(lambert, lamSm, wN); }
       let dbgLamPreF = lambert;
       var dbgShF = 1.0;
+      // THE FAR PATCH, READ ONCE: its shadow for the sun term below and, for a
+      // buried hit, its measured indirect light (shadow_resolve.wgsl THE FAR
+      // PATCH'S INDIRECT LIGHT) -- asked for even where the sun term is not
+      // wanted (a face turned from the sun, a night), or a cave wall would
+      // never register the patch that carries its light.
+      let wantFarGi = SHADOW_CACHE && FAR_SHADOW_CACHE && TUNE_GI_STRENGTH > 0.0 &&
+                      buriedF > 0.0;
+      var shPatch = 1.0;
+      if (SHADOW_CACHE && FAR_SHADOW_CACHE &&
+          ((lambert > 0.0 && (R.flags & 1u) != 0u) || wantFarGi)) {
+        shPatch = farShadowCached(flv, far.cell, far.axis, far.sgn, fRefined || fFeat, hitP);
+      }
       if (lambert > 0.0 && (R.flags & 1u) != 0u) {
         // start the shadow march just off the hit face, in fine-voxel coords
         var hp = R.camPos + rd * (far.t - 1e-3) + n * (0.55 * sL);
@@ -15589,7 +15618,7 @@ fn fs(in : VSOut) -> FSOut {
           // The far patch cache (FAR_SHADOW_CACHE, ON since 2026-10-06): the march
           // is compiled out of fs. A card reads its cell's top patch, lifted
           // as a refined hit's is.
-          sh = farShadowCached(flv, far.cell, far.axis, far.sgn, fRefined || fFeat, hitP);
+          sh = shPatch;
         } else {
           let fsh = farShadowMarch(flv, hp, keyLightDir(), 0.0);
           if (fsh.t >= 0.0) {
@@ -15699,6 +15728,16 @@ fn fs(in : VSOut) -> FSOut {
       var dbgGiF = vec3f(0.0);
       if (TUNE_GI_STRENGTH > 0.0) {
         dbgGiF = ao * featBounce * farGiBounce(albedo, select(nSh, vec3f(0.0, 1.0, 0.0), fCard));
+        // A BURIED hit's own measured light (THE FAR PATCH, READ ONCE): what
+        // the burial took out of the open-terrain closed form above, put back
+        // as the patch's nine-ray gather -- the cascade's twin of giBounceAt,
+        // emitters and daylight through a mouth included.
+        if (wantFarGi && gFarSlot != 0xFFFFFFFFu) {
+          let gw = shadowHistRO[gFarSlot];
+          if (gw != 0u) {
+            dbgGiF += ao * buriedF * albedo * unpackRgb9e5(gw) * TUNE_GI_STRENGTH;
+          }
+        }
         color += dbgGiF;
       }
       if (SEAM_DBG != 0u) {
@@ -15937,6 +15976,19 @@ fn fs(in : VSOut) -> FSOut {
     // ~50 m scale what the grid measured. No measurement stays no measurement.
     var openRaw = opennessAt(openCell, hp, openN, &openness, &opennessGen);
     if (openRaw >= 0.0) { openRaw *= hzSkyVis(hp); }
+    // NO MEASUREMENT YET IS NOT OPEN SKY UNDERGROUND (2026-10-13). A slot the
+    // walk has not reached since it streamed in (up to ~2 s of the rolling
+    // refresh: moving at speed, the cells that come inside the handoff sphere
+    // first) read -1, which every consumer takes as the pre-P0 look -- the full
+    // sky hemisphere and an uncapped shadow lift. Outdoors that is the open
+    // field's own value and the right fallback; in a cave it lit freshly
+    // streamed walls with daylight until the walk caught up, a flash that moved
+    // with the camera. So the fallback is the cascade's own estimate, the
+    // burial test the far hits take (1 under the open sky: unchanged outdoors).
+    if (openRaw < 0.0) {
+      let bw = farHitBuried(1u, hp, openN);
+      if (bw > 0.0) { openRaw = (1.0 - bw) * hzSkyVis(hp); }
+    }
     // The fog target's say from this hit (gHitSky): the far map's burial
     // test at level 1 (farHitBuried), NOT the openness byte. The byte's fan
     // stops at render.opennessReach (12 m), so a face far down a 34 m hall
