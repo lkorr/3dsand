@@ -395,6 +395,15 @@ Status GateElecStun(Ctx& c, std::string& detail) {
     Tuning tt = saved;
     tt.gore.shockStunMinTicks = stunTicks;
     tt.gore.shockStunMaxTicks = std::max(tt.gore.shockStunMaxTicks, stunTicks);
+    // THE DOSE, scaled for this gate only (elecStun.hpScale). The zombie's
+    // TARGET stands on the plate too (the zombie fights it there), and an
+    // arc-fed plate is a near-lethal dose for a body bloodied by that fight:
+    // measured 2026-10-12, the dummy took 318-336 Electric hp and lived or
+    // died on the size of its blood coat (a conducting coat: the wet rule)
+    // -- and with it whether the zombie had anyone to attack after its stun.
+    // This gate measures the STUN and the recovery; the hp a shock deals is
+    // elec-water-mob's and elec-body-matter's, at the game's own dose.
+    tt.gore.shockHpPerKiloP *= (float)BaselineNumber("elecStun.hpScale", 0.5);
     SetCurrentTuning(tt);
   }
   Regenerate(c);
@@ -416,7 +425,7 @@ Status GateElecStun(Ctx& c, std::string& detail) {
   uint64_t zombie = 0, dummy = 0, dropped = 0;
   Mob::ShockRecord zrec, drec;
   bool dummyAlive = false;
-  std::string dummyCoat, zombieCoat;
+  std::string dummyCoat, zombieCoat, posNote;
   float dummyHpPre = -1.0f;
   {
     support::TickRig rig(c, t, f.chunk);
@@ -454,6 +463,11 @@ Status GateElecStun(Ctx& c, std::string& detail) {
     dummyCoat = coatNote(dummy);
     zombieCoat = coatNote(zombie);
     if (const Mob* dm = c.mobs.FindMobById(dummy)) dummyHpPre = dm->TotalHp();
+    for (uint64_t id : {zombie, dummy})
+      if (const Mob* m = c.mobs.FindMobById(id))
+        posNote += Format(" %s x%+.1f..%+.1f z%+.1f", id == zombie ? "zombie" : "dummy",
+                          m->Origin().x - f.x, m->Origin().x + c.mobs.Defs()[hd].worldSize.x - f.x,
+                          m->Origin().z - f.z);
     const uint64_t dropped0 = c.mobs.ShockAttacksDropped();
     Vec3 anchor{};
     bool haveAnchor = false;
@@ -547,12 +561,12 @@ Status GateElecStun(Ctx& c, std::string& detail) {
       "A zombie on an arc-fed plate: %d attacks in %d ticks before; stunned %d ticks (floor %d) "
       "with %d attacks, %llu refused by the stun, %d stroke ticks, moved %.2f vox, %u twitches, "
       "%s; attacked again %d ticks after (%d after in all) [%s]; its target the dummy %s [%s] "
-      "(hp %.1f and coat {%s} at the pulse; the zombie's coat {%s}) "
+      "(hp %.1f and coat {%s} at the pulse; the zombie's coat {%s}; at the pulse%s) "
       "| B lightning-fed plate: [%s]%s%s",
       preAttacks, preTicks, stunned, stunTicks, stunAttacks, (unsigned long long)dropped,
       strokeWhileStunned, moved, zrec.twitches, ragdolledA ? "KNOCKED DOWN" : "never down",
       recoverAt, postAttacks, RecNote(zrec).c_str(), dummyAlive ? "alive" : "DEAD",
-      RecNote(drec).c_str(), dummyHpPre, dummyCoat.c_str(), zombieCoat.c_str(),
+      RecNote(drec).c_str(), dummyHpPre, dummyCoat.c_str(), zombieCoat.c_str(), posNote.c_str(),
       RecNote(brec).c_str(),
       fails.empty() ? "" : " | FAILED: ", fails.c_str());
   std::printf("elec-stun: %s (%s)\n", fails.empty() ? "PASS" : "FAIL", detail.c_str());
