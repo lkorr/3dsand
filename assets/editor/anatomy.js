@@ -174,11 +174,20 @@ export const DEFAULT_ANATOMY = {
     // Inside the cage (depth 4+, so never in place of a rib, the sternum or the
     // muscle wall at depth 3), behind the sternum, a third right and two thirds
     // LEFT of the midline (+x is the creature's left: the L arm is the +x
-    // one), at the middle of the cage's height, from the front of the hollow
-    // back to the spine -- and down the spine's left side, because the rule
-    // runs BEFORE the spine's and the spine's (last match wins) takes back
-    // every cell of its own. On the stock human: 6 x 7 cells in front of the
-    // spine two deep, plus a 2-wide lobe four deep beside it, 112 cells.
+    // one), at the middle of the cage's height, in the FRONT HALF of the
+    // hollow only (z >= 0.5) and at most three cells thick (depth 4..6).
+    //
+    // SIZED TO A REAL HEART'S SHARE OF THE BODY (owner, 2026-10-13: "far too
+    // large"). A heart is ~300 g of a ~70 kg body, ~0.45% of the volume below
+    // the neck (the art's heads are oversized, so the head is left out of the
+    // ratio). The first cut ran from the front of the hollow back to the spine
+    // with a lobe down its left side, so its thickness was the CHEST'S: 0.53%
+    // on the stock human but 0.8-0.9% on the deep-chested characters
+    // (newcomer, fleepo: 205-210 cells) and the fiend. Front-half-and-depth-6
+    // stops the thickness scaling with chest depth: stock human 6 x 7 x 2 =
+    // 84 cells (0.39%), the z=16 chests ~135-140 (0.5-0.6%), fiend 243
+    // (0.41%). It no longer touches the spine, which a real heart does not
+    // either (the oesophagus and aorta are between them).
     //
     // Painted as the STAND-IN `mushroom_large`, because `heart` is past what a
     // .vox can paint (ids 0..127); `becomes` below rewrites every stand-in
@@ -194,8 +203,8 @@ export const DEFAULT_ANATOMY = {
           box: { y: [0.42, 0.94] }, stripe: { axis: 'y', period: 4, width: 2 } },
         { material: 'bone', where: 'bone', depth: [3, 3],
           box: { x: [0.45, 0.55], y: [0.42, 0.94], z: [0.5, 1] } },
-        { material: 'mushroom_large', where: 'bone', depth: [4, 254],
-          box: { x: [0.4, 0.7], y: [0.57, 0.77], z: [0.33, 1] } },
+        { material: 'mushroom_large', where: 'bone', depth: [4, 6],
+          box: { x: [0.4, 0.7], y: [0.57, 0.77], z: [0.5, 1] } },
         { material: 'bone', where: 'bone',
           box: { x: [0.4, 0.6], z: [0, 0.5] } },
       ],

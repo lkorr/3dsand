@@ -60,7 +60,7 @@
     ],
     "limbs": {
       "//head": "A bone skull two deep around a BRAIN. The core layer is open-ended, so `brain` is by definition everything the shell encloses -- there is no geometric brain test anywhere in the engine, and this recipe is the only thing that decides what is one. Losing a voxel of it costs its materials.json `organHp` flat on top of the ordinary volume damage (materials.json `brain`), which is why the skull in front of it matters: the rot chews bone at half rate (bone.rotRate), so breaching takes time and what is behind goes fast.",
-      "//torso": "A ribcage, not a bone brick: the depth schedule would fill the chest with solid bone, so `carve` hollows it to flesh (the organs), walls it in muscle at depth 3, and puts bone back as ribs, a sternum and a spine. The HEART sits in the hollow behind the sternum, two thirds left of the midline and down the spine's left side, painted as the stand-in `mushroom_large` (a .vox paints ids 0..127 only) that `becomes` turns to `heart` at load. Like the brain it costs its materials.json `organHp` flat per voxel lost.",
+      "//torso": "A ribcage, not a bone brick: the depth schedule would fill the chest with solid bone, so `carve` hollows it to flesh (the organs), walls it in muscle at depth 3, and puts bone back as ribs, a sternum and a spine. The HEART sits in the front half of the hollow behind the sternum, two thirds left of the midline, at most three cells thick (depth 4..6) and never back to the spine -- sized to a real heart's share of the body (~0.4% of it below the neck), painted as the stand-in `mushroom_large` (a .vox paints ids 0..127 only) that `becomes` turns to `heart` at load. Like the brain it costs its materials.json `organHp` flat per voxel lost.",
       "//hips": "A pelvis, not a bone brick: hollowed to flesh (the pelvic organs) and walled in muscle like the chest, with bone put back as solid acetabula over the femoral heads, a brim ring, iliac wings round the sides and back to the crest (open at the belly), a pubic symphysis and the sacrum carrying the spine. Above the crest the hips are waist: lumbar spine only.",
       "head": {
         "layers": [
@@ -198,7 +198,7 @@
             "where": "bone",
             "depth": [
               4,
-              254
+              6
             ],
             "box": {
               "x": [
@@ -210,7 +210,7 @@
                 0.77
               ],
               "z": [
-                0.33,
+                0.5,
                 1
               ]
             }

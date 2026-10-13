@@ -6687,7 +6687,7 @@ Status GateLaserHead(Ctx& c, std::string& detail) {
 // standing.
 //
 // FIXTURE. The stock `human` (the body heart.organHp is calibrated against:
-// 15% of its 112 heart cells takes its 180-hp torso to 0), else the authored
+// 15% of its 84 heart cells takes its 180-hp torso to 0), else the authored
 // def with the most heart in a vital limb. The SHIPPED dagger and sword,
 // through the real MeleeSweepDamage (blade-wounds' sweep, point first along
 // the blade -- a stab), from in front of the chest straight back along the
