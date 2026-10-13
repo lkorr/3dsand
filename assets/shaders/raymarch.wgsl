@@ -5873,6 +5873,12 @@ fn farFeatCell(fq : vec4<u32>, level : u32, vc : vec3<i32>, ro : vec3f, rd : vec
       let occ = f32(((e >> 14u) & 3u) + 1u) / W * keep;
       t = bladeCardHit(bladeCardOf(org, W), org, W, f32(topF), occ, pxVoxAt(tA), ro, rd,
                        sA, sB);
+      // A card has no bottom of its own (on the ground the ray meets the ground
+      // at its foot); a ray that passes UNDER the plant's ground -- down a hall
+      // or a cave beneath the moor -- would otherwise draw the card from the
+      // hall floor to its ceiling as a thin vertical line (ticket
+      // 2026-10-12_16-52-07). The plant stands on its column's ground.
+      if (t >= 0.0 && ro.y + rd.y * t < f32(topF - hg) - 0.5) { t = -1.0; }
     }
     if (t >= 0.0 && t < best) {
       best = t;
