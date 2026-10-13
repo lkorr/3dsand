@@ -13,7 +13,7 @@
  * `synth_shell` (hardness 45, `shell`); under them `circuitry` (soft, and it
  * ARCS -- every blow that reaches it throws a spark, some along arcs), an
  * `alloy` endoskeleton (hardness 180: a limb does not come off to a sword),
- * a `power_cell` in the chest and a `neural_core` (brainHp) in the head. The
+ * a `power_cell` in the chest and a `neural_core` (organHp) in the head. The
  * lights are `gem_arcane` (emission; the art colour is the light's colour),
  * the visor `glass`, the joints `steel`. A breached power cell, or a dead
  * android, DISCHARGES: a spray of sparks along jagged arcs that lights what
@@ -115,7 +115,7 @@ export const ANATOMY = {
 export const ANATOMY_NOTES = {
   '//': 'AN ANDROID: synthetic shell panels over a layer of circuitry over an ' +
         'alloy endoskeleton, a power cell in the chest behind the core window ' +
-        'and a neural core (brainHp) in the head. The surface is synth_shell, ' +
+        'and a neural core (organHp) in the head. The surface is synth_shell, ' +
         'gem_arcane lights, steel joints and a glass visor -- all KEPT; none ' +
         'of them appears below. synth_shell, circuitry, alloy, power_cell and ' +
         'neural_core are material ids above 127, which a .vox cannot paint, so ' +

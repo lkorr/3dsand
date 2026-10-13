@@ -990,20 +990,26 @@ struct MaterialDef {
   // 1.0 for anything that does not author it, so a material nobody has thought
   // about behaves exactly as it did before this field existed.
   float woundHp = 1.0f;
-  // ---- ...AND WHETHER IT IS BRAIN ------------------------------------------
+  // ---- ...AND WHETHER IT IS AN ORGAN (materials.json `organHp`) -------------
   //
-  // The one exception to "relative weight" above. A voxel of a material with
-  // this set ALSO subtracts gore.brainHpPerVoxel flat when it is destroyed, by
-  // any cause, on top of its ordinary share of the volume damage. Set on
-  // `brain` alone, and the reason it is a material flag rather than a test for
-  // "inside the head" is that there is no geometric brain anywhere: the head's
-  // anatomy recipe bakes brain as its open-ended core, and after that the
-  // substance is the only thing that knows.
+  // The one exception to "relative weight" above, and an ABSOLUTE hp figure:
+  // every voxel of a material with this above 0 ALSO subtracts this many hp
+  // flat from its limb when it is destroyed, by any cause, on top of its
+  // ordinary share of the volume damage. `brain` (3.5), `heart` (10.75) and
+  // the machines' minds carry it. It is a property of the SUBSTANCE rather
+  // than a test for "inside the head" or "behind the sternum" because there is
+  // no geometric organ anywhere: the anatomy recipe bakes the organ into the
+  // body, and after that the material is the only thing that knows.
   //
-  // Death is NOT special-cased off this. The flat charge drives head hp to 0
-  // and the existing rule takes it from there (HpZeroSevers -> Sever -> vital
-  // -> Die), which is the same path a mace to the skull already used.
-  bool brainHp = false;
+  // Death is NOT special-cased off this. The flat charge drives the limb's hp
+  // to 0 and the existing rule takes it from there (a vital limb at zero ->
+  // Die), which is the same path a mace to the skull already used. Until
+  // 2026-10-12 this was `bool brainHp` times one global knob
+  // (gore.brainHpPerVoxel, 3.5): a second organ needed its own figure, so the
+  // figure moved onto the material and the brain kept its 3.5.
+  //
+  // 0 for anything that does not author it. Negative and NaN load as 0.
+  float organHp = 0.0f;
   // ---- HOW READILY THE ROT CONVERTS IT -------------------------------------
   //
   // Read ONLY by Mob::InfectStep's spread. 1.0 = as fast as flesh, 0.5 = half

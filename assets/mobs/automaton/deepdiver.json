@@ -100,7 +100,8 @@
       "cactus_rib": "brass",
       "cactus_flesh": "clockwork",
       "cap_tan": "cogitator",
-      "cap_red": "boiler"
+      "cap_red": "boiler",
+      "mushroom_large": null
     },
     "garmentsBecome": null,
     "paintBecomes": null,

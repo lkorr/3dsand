@@ -148,6 +148,66 @@ console.log('human.vox');
   ok(painted > 0 && paintedDeep === 0, `paint lives on the surface only (${painted} painted, ${paintedDeep} buried)`);
 }
 
+/* ---- 4b. the HEART (2026-10-12, docs/PLAN_projectiles.md package A) -------
+ *
+ * The chest's organ, baked as a stand-in and rewritten to `heart` at load
+ * (DEFAULT_ANATOMY limbs.torso + `becomes`). Pinned here because the C++
+ * charge (materials.json heart.organHp) is calibrated against this exact
+ * count: 15% of 112 cells takes the human's 180-hp torso to 0. A recipe edit
+ * that moves the count has to move that figure with it. */
+console.log('human heart');
+{
+  const materials = JSON.parse(readFileSync(join(ROOT, 'assets/materials/materials.json'), 'utf8')).materials;
+  const matId = ANA.materialIds(materials);
+  const side = JSON.parse(readFileSync(join(ROOT, 'assets/mobs/human.json'), 'utf8'));
+  const recipe = side.anatomy;
+  const STAND = 'mushroom_large';
+  ok(recipe.becomes && recipe.becomes[STAND] === 'heart' &&
+     ANA.DEFAULT_ANATOMY.becomes && ANA.DEFAULT_ANATOMY.becomes[STAND] === 'heart',
+     'the stand-in becomes the heart at load (human.json and DEFAULT_ANATOMY)');
+  ok(matId[STAND] > 0 && matId[STAND] <= 127, `${STAND} is paintable in a .vox (id ${matId[STAND]})`);
+  ok(matId.heart > 127 && matId.heart <= 255,
+     `heart (id ${matId.heart}) is past the .vox palette but inside a micro brick's 8-bit material`);
+  const heartDef = materials[matId.heart - 1];
+  ok(heartDef && heartDef.organHp > 0, `heart carries an organHp (${heartDef && heartDef.organHp})`);
+  const brainDef = materials[matId.brain - 1];
+  ok(brainDef && brainDef.organHp === 3.5, `brain keeps the 3.5 it had as gore.brainHpPerVoxel (${brainDef && brainDef.organHp})`);
+
+  const read = () => {
+    const b = readFileSync(join(ROOT, 'assets/mobs/human.vox'));
+    return VOX.readVox(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength)).prefab;
+  };
+  const baked = read();
+  // The same body baked WITHOUT the heart rule: what the heart cells would be.
+  const noHeart = JSON.parse(JSON.stringify(recipe));
+  noHeart.limbs.torso.carve = noHeart.limbs.torso.carve.filter(c => c.material !== STAND);
+  const bare = read();
+  ANA.applyPlan(bare, ANA.planAnatomy(bare, noHeart, matId));
+  const stand = matId[STAND];
+  let heart = 0, elsewhere = 0, notFlesh = 0, left = 0, sumZ = 0;
+  let torsoDim = null;
+  baked.models.forEach((m, mi) => {
+    const d = m.dim;
+    for (let i = 0; i < m.grid.data.length; i++) {
+      if (m.grid.data[i] !== stand) continue;
+      if (m.name !== 'torso') { elsewhere++; continue; }
+      torsoDim = d;
+      heart++;
+      if (bare.models[mi].grid.data[i] !== matId.flesh) notFlesh++;
+      const x = i % d.x, z = (i / (d.x * d.y)) | 0;
+      if (x + 0.5 > d.x / 2) left++;
+      sumZ += z + 0.5;
+    }
+  });
+  ok(heart === 112, `the stock human's heart is 112 cells (${heart}) -- heart.organHp is calibrated to it`);
+  ok(elsewhere === 0, `the heart is in the torso only (${elsewhere} elsewhere)`);
+  ok(notFlesh === 0, `every heart cell was organ fill: no rib, sternum, spine or muscle wall lost to it (${notFlesh})`);
+  ok(heart > 0 && left / heart >= 0.6 && left < heart,
+     `left of the midline, not all of it (${left}/${heart} on the +x, left, side)`);
+  ok(torsoDim && heart > 0 && sumZ / heart > torsoDim.z * 0.4,
+     `toward the front of the chest (mean z ${(sumZ / Math.max(1, heart)).toFixed(2)} of ${torsoDim && torsoDim.z})`);
+}
+
 /* ---- 5. AND EVERY OTHER BAKED BODY ---------------------------------------
  *
  * Section 4 pins the human, which is the body the recipe was written for and

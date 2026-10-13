@@ -478,7 +478,7 @@ Status GateHairRooted(Ctx& c, std::string& detail) {
 // Owner report 2026-09-29: "when killing a mob via a laser their head gets
 // offset and displaced on the corpse ... the head becomes decoupled from their
 // hair". The laser is the one weapon that keeps carving the SAME limb every
-// tick, alive and dead, and that kills from the head (gore.brainHpPerVoxel), so
+// tick, alive and dead, and that kills from the head (the brain's materials.json organHp), so
 // the head is rebased and rebuilt dozens of times across the moment the rig
 // is handed to the solver.
 //
@@ -502,7 +502,7 @@ Status GateCorpseHeadLaser(Ctx& c, std::string& detail) {
   // live creature shares an id; the scope restores the suite's counter.
   mobs.SetNextIdCounter(1);
   PrepareWorld(c);
-  // A HEAD WITH A BRAIN IN IT. The laser kills through gore.brainHpPerVoxel,
+  // A HEAD WITH A BRAIN IN IT. The laser kills through the brain's organHp (materials.json),
   // and the claim (the head stays on its neck, the hair on the head, through
   // that kill and the corpse after it) was measured at adbc47d (2026-09-29
   // 11:29) on a human: head-neck 0.33 vox transient against the 0.6 cap.
@@ -6514,7 +6514,7 @@ Status GateWoundHeal(Ctx& c, std::string& detail) {
 // dismembers or explodes the head instead of shooting a clean hole through it
 // like it used to". Two causes, one per half of this gate:
 //
-//   * THE DEATH. gore.brainHpPerVoxel charges every brain cell the bore
+//   * THE DEATH. the brain's organHp (materials.json) charges every brain cell the bore
 //     crosses, so the head reached hp 0 within a few ticks, and a vital
 //     severable limb at zero went through Sever() — which DETACHES it before
 //     it calls Die(). hp now kills in place (Mob::Damage, Mob::CarveLimb);
@@ -6541,7 +6541,7 @@ Status GateLaserHead(Ctx& c, std::string& detail) {
   // property rather than by name. Largest for ChooseTarget's reason: a tiny
   // head is mostly neck, and a bore through it is a bore through the joint.
   // ...AND THAT HOLDS A BRAIN. The death half of the claim is the brain's
-  // (gore.brainHpPerVoxel); a head with none is bored straight through
+  // (the brain's materials.json organHp); a head with none is bored straight through
   // without dying. a411808 (2026-09-29) added the sylvan `deku`, whose wooden
   // head is the largest vital severable limb that bleeds (syrup) and has no
   // brain, so the property pick moved onto it and the gate measured a head
@@ -6669,6 +6669,220 @@ Status GateLaserHead(Ctx& c, std::string& detail) {
                    movedAtThrough).c_str()
           : "no",
       cause.empty() ? "" : Format(" cause: %s", cause.c_str()).c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- heart -----------------------------------------------------------------
+// A STAB INTO THE HEART KILLS; THE SAME STABS BESIDE IT DO NOT (owner,
+// 2026-10-12; docs/PLAN_projectiles.md package A).
+//
+// The heart is a material (materials.json `heart`, baked into the chest by the
+// torso's anatomy recipe) whose every lost cell costs its `organHp` flat --
+// the brain's rule, and nothing more. So the claim is about volume: enough of
+// the heart gone takes the torso's hp to 0 through the ordinary rule (vital
+// limb at zero -> Die), and the same blows that miss it leave the creature
+// standing.
+//
+// FIXTURE. The stock `human` (the body heart.organHp is calibrated against:
+// 15% of its 112 heart cells takes its 180-hp torso to 0), else the authored
+// def with the most heart in a vital limb. The SHIPPED dagger and sword,
+// through the real MeleeSweepDamage (blade-wounds' sweep, point first along
+// the blade -- a stab), from in front of the chest straight back along the
+// torso's own model axis, at heartStabSpeed of melee.fullSpeed. Each stab is a
+// new stroke; stab k lands at aim + a fixed pattern of small offsets across
+// the heart's face (kPattern), so repeated stabs open fresh heart rather than
+// re-boring one channel. The HEART arm aims at the heart's centroid; the
+// BESIDE arm makes the SAME stabs (same pattern, same count the heart arm
+// needed) shifted to the creature's right by the heart's own half-width plus
+// the blade's slit plus a margin, clear of the heart.
+//
+// Asserted per blade: the heart arm dies within heartStabMax stabs and the
+// death names the heart (Mob::OrganDeathCause: the organ charge took at least
+// half the torso's hp, whichever blow then finished it); the beside arm, after
+// as many stabs, is alive with its heart untouched. PRINTED: heart cells, cells lost per stab, the hp the
+// organ charge took, the torso's hp, and what a stab costs beside the heart.
+Status GateHeart(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const uint32_t heartMat = mobs.MaterialIdNamed("heart");
+  if (!heartMat || heartMat >= c.mats.size()) {
+    detail = "materials.json has no `heart`";
+    return Status::Fail;
+  }
+  const float organHp = c.mats[heartMat].organHp;
+  // ---- the fixture: the human, else the most heart in a vital limb --------
+  Target t;
+  const IVec3 probeSite = FixtureSite(c.world, 410);
+  auto consider = [&](int d) {
+    const MobDef& def = mobs.Defs()[(size_t)d];
+    mobs.Reset();
+    const uint64_t sid = mobs.Spawn(d, probeSite);
+    if (!sid) return;
+    for (size_t li = 0; li < def.limbs.size(); li++) {
+      if (!def.limbs[li].vital || !mobs.LimbBody(sid, (int)li)) continue;
+      const uint32_t n = mobs.LimbMaterialCount(sid, (int)li, heartMat);
+      if (n <= t.atSpawn) continue;
+      t.defIndex = d;
+      t.limb = (int)li;
+      t.atSpawn = n;
+      t.defName = def.name;
+      t.limbName = def.limbs[li].name;
+    }
+  };
+  if (const int h = mobs.FindDef("human"); h >= 0 && (size_t)h < mobs.LoadedDefCount())
+    consider(h);
+  for (size_t d = 0; !t.valid() && d < mobs.LoadedDefCount(); d++)
+    consider((int)d);
+  mobs.Reset();
+  if (!t.valid()) {
+    detail = "no authored mob def has heart in a vital limb (anatomy recipe?)";
+    return Status::Fail;
+  }
+  const ItemDef* blades[2] = {c.items.At(c.items.Find("dagger")),
+                              c.items.At(c.items.Find("sword"))};
+  const char* names[2] = {"dagger", "sword"};
+  if (!blades[0] && !blades[1]) {
+    detail = "the item library has no dagger and no sword";
+    return Status::Skip;
+  }
+  const auto& g = CurrentTuning().gore;
+  MeleeTuning mt;
+  ApplyMeleeTuning(mt);
+  const float speed = (float)BaselineNumber("heartStabSpeed", 0.8);
+  const float step = mt.fullSpeed * kTickDt * speed;
+  const int maxStabs = std::clamp((int)BaselineNumber("heartStabMax", 9), 1, 9);
+  // Offsets across the heart's face, in quarters of its width (x) / height (y).
+  static const float kPattern[9][2] = {{0, 0},   {0, 1},   {0, -1},
+                                       {1, 0},   {-1, 0},  {1, 1},
+                                       {-1, -1}, {1, -1},  {-1, 1}};
+
+  struct Arm {
+    bool ran = false, died = false;
+    int stabs = 0, landed = 0;
+    uint32_t heart0 = 0, heartLeft = 0;
+    float hp0 = 0, hpEnd = 0;
+    std::string cause, perStab;
+  };
+  // `shift` > 0 = the beside arm: every aim moved that far to the right.
+  auto runArm = [&](const ItemDef& it, float shift, int stabs) -> Arm {
+    Arm a;
+    IVec3 pchunk{};
+    const uint64_t id = SpawnTarget(c, t, 170, pchunk);
+    const uint64_t wid = id ? mobs.Spawn(t.defIndex, FixtureSite(c.world, 225)) : 0;
+    Mob* wielder = wid ? mobs.FindMobById(wid) : nullptr;
+    MobSystem::MaterialSpot spot;
+    if (!id || !wielder || !mobs.LimbMaterialSpot(id, t.limb, heartMat, spot)) {
+      mobs.Reset();
+      c.debris.Reset();
+      return a;
+    }
+    a.ran = true;
+    a.heart0 = spot.cells;
+    a.hp0 = mobs.LimbHp(id, t.limb);
+    const Vec3 right = spot.axis[0] * -1.0f, up = spot.axis[1];
+    const Vec3 in = spot.axis[2] * -1.0f;   // from the front, toward the back
+    const float w4 = (spot.hi[0] - spot.lo[0]) * 0.25f;
+    const float h4 = (spot.hi[1] - spot.lo[1]) * 0.25f;
+    const float L = 3.0f;   // world voxels of blade behind the point
+    std::vector<ParticleSpawn> spawns;
+    uint32_t before = a.heart0;
+    for (int k = 0; k < stabs && mobs.IsAlive(id); k++) {
+      const Vec3 tip1 = spot.centroid + right * shift +
+                        spot.axis[0] * (kPattern[k][0] * w4) +
+                        up * (kPattern[k][1] * h4);
+      const Vec3 tip0 = tip1 - in * step;
+      EdgeSweep sw;
+      sw.aPrev = tip0 - in * L; sw.bPrev = tip0;
+      sw.aNow = tip1 - in * L;  sw.bNow = tip1;
+      // The flat faces up, so the slit runs ACROSS the chest (melee.cpp
+      // BuildStrikeParts: across = travel x flat).
+      sw.flatNow = up;
+      sw.dt = kTickDt;
+      sw.halfWidth = it.edgeHalfWidth;
+      sw.carveBonus = it.carveBonus;
+      sw.strike = it.strike;
+      sw.heft = it.HeftFactor(g.woundHeftRef, g.woundHeftMax);
+      sw.tick = 8100u + (uint32_t)k;
+      std::vector<uint64_t> struck;   // a new stroke per stab
+      sw.struck = &struck;
+      sw.valid = true;
+      spawns.clear();
+      const EdgeSweepResult r = MeleeSweepDamage(sw, mt, *wielder, c.phys, mobs,
+                                                 c.debris, c.world, spawns);
+      if (r.bodiesHit > 0) a.landed++;
+      a.stabs = k + 1;
+      const uint32_t now = mobs.LimbBody(id, t.limb)
+                               ? mobs.LimbMaterialCount(id, t.limb, heartMat)
+                               : 0u;
+      a.perStab += Format("%s-%u", k ? "," : "", before > now ? before - now : 0u);
+      before = now;
+    }
+    a.heartLeft = mobs.LimbBody(id, t.limb)
+                      ? mobs.LimbMaterialCount(id, t.limb, heartMat)
+                      : 0u;
+    a.hpEnd = mobs.LimbHp(id, t.limb);
+    a.died = !mobs.IsAlive(id);
+    if (a.died) a.cause = mobs.DeathCause(id);
+    mobs.Reset();
+    c.debris.Reset();
+    return a;
+  };
+
+  bool ok = true;
+  std::string why, line;
+  for (int b = 0; b < 2; b++) {
+    if (!blades[b]) continue;
+    const ItemDef& it = *blades[b];
+    const std::string nm = names[b];
+    const Arm heart = runArm(it, 0.0f, maxStabs);
+    // Clear of the heart: its extent to the right of the centroid, the
+    // pattern's widest x offset, the slit's half-length across the blade
+    // (BuildStrikeParts: radius x stabWidth), and a margin of a fine cell.
+    MobSystem::MaterialSpot s0;
+    float shift = 0.0f;
+    {
+      IVec3 pc{};
+      const uint64_t id = SpawnTarget(c, t, 170, pc);
+      if (id && mobs.LimbMaterialSpot(id, t.limb, heartMat, s0))
+        shift = -s0.lo[0] + (s0.hi[0] - s0.lo[0]) * 0.25f +
+                (it.edgeHalfWidth + it.carveBonus) * g.stabWidth + 0.25f;
+      mobs.Reset();
+      c.debris.Reset();
+    }
+    const int n = std::max(1, heart.stabs);
+    const Arm beside = runArm(it, shift, n);
+    const uint32_t lostH = heart.heart0 > heart.heartLeft ? heart.heart0 - heart.heartLeft : 0u;
+    const uint32_t lostB = beside.heart0 > beside.heartLeft ? beside.heart0 - beside.heartLeft : 0u;
+    RecordObserved(("heartStabsToKill_" + nm).c_str(), heart.died ? (double)heart.stabs : -1.0);
+    RecordObserved(("heartCellsLost_" + nm).c_str(), (double)lostH);
+    RecordObserved(("heartBesideHpLost_" + nm).c_str(), (double)(beside.hp0 - beside.hpEnd));
+    auto fail = [&](const std::string& s) { ok = false; why += " | " + nm + ": " + s; };
+    if (!heart.ran || !beside.ran) fail("spawn or heart probe refused");
+    if (heart.landed == 0) fail("no stab landed on the chest");
+    if (!heart.died) fail(Format("heart arm alive after %d stabs", heart.stabs));
+    if (heart.died && heart.cause.find(c.mats[heartMat].name) == std::string::npos)
+      fail("death does not name the heart (\"" + heart.cause + "\")");
+    if (lostH == 0) fail("no heart cell lost");
+    if (beside.landed == 0) fail("no beside stab landed");
+    if (beside.died) fail("beside arm died (\"" + beside.cause + "\")");
+    if (lostB != 0) fail(Format("beside stabs took %u heart cells", lostB));
+    line += Format(
+        "%s: heart %u cells, %s on stab %d of %d (heart lost %s = %u cells, "
+        "%.0f%%, organ %.1f hp; torso %.1f -> %.1f%s); beside (%.2f vox right) "
+        "%d stabs: heart lost %u, torso %.1f -> %.1f, %s. ",
+        nm.c_str(), heart.heart0, heart.died ? "DIED" : "alive", heart.stabs,
+        maxStabs, heart.perStab.c_str(), lostH,
+        heart.heart0 ? 100.0 * lostH / heart.heart0 : 0.0, lostH * organHp,
+        heart.hp0, heart.hpEnd,
+        heart.cause.empty() ? "" : (", \"" + heart.cause + "\"").c_str(), shift,
+        beside.stabs, lostB, beside.hp0, beside.hpEnd,
+        beside.died ? "DIED" : "alive");
+  }
+  detail = Format("%s/%s, heart.organHp %.2f, %.2f speed: %s%s",
+                  t.defName.c_str(), t.limbName.c_str(), organHp, speed,
+                  line.c_str(), why.c_str());
+  std::printf("heart: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -10693,6 +10907,8 @@ const std::vector<Gate>& WoundGates() {
       {"wound-heal", "mob", {}, false, GateWoundHeal, false},
       {"corpse-burn", "mob", {}, false, GateCorpseBurn, false},
       {"laser-head", "mob", {}, false, GateLaserHead, false},
+      // A stab into the heart kills; the same stabs beside it do not.
+      {"heart", "mob", {}, false, GateHeart, false},
       {"joint-twins", "mob", {}, false, GateJointTwins, false},
       {"acid-coat", "mob", {}, false, GateAcidCoat, false},
       {"corpse-acid", "mob", {}, false, GateCorpseAcid, false},

@@ -403,7 +403,6 @@
     "infectBoneStain": 11,
     "infectBoneStainVary": 5,
     "infectBoneIchor": 0.449999988,
-    "brainHpPerVoxel": 3.5,
     "carveHpPerVolume": 1.5,
     "blastPowerRef": 200,
     "blastShedSpeed": 45,

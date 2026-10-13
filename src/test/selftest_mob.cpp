@@ -391,7 +391,7 @@ Status GateDamageCause(Ctx& c, std::string& detail) {
                            : JointRule::IfInfected;
         check(p.joint == (hair ? JointRule::Never : oldJoint), "joint", cz, eaten, t);
         // Mob::CarveLimb
-        check(p.chargesBrain == !inSpawnRot, "chargesBrain", cz, eaten, t);
+        check(p.chargesOrgan == !inSpawnRot, "chargesOrgan", cz, eaten, t);
         const bool oldBleeds = !inBurnFlush && !inSpawnRot && !bloodless && !shock;
         check(p.carveBleeds == oldBleeds, "carveBleeds", cz, eaten, t);
         check(!oldBleeds || p.carveBleed == oldRate, "carveBleed", cz, eaten, t);
