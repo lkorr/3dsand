@@ -13020,6 +13020,46 @@ fn fluidSeamShell(c : vec3<i32>) -> bool {
   return false;
 }
 
+// ---- A DRY RING SAMPLE IS ZERO WITHOUT ITS TAPS (2026-10-13) ---------------
+// A seam-ring chunk (class 2) has no node mass by definition (its block, if it
+// has one, lit no Y-mask bit), so the only thing fluidFieldAt can find there is
+// SETTLED voxel liquid. When the field's whole tap box -- x [bi.x, bi.x+1],
+// z [bi.y, bi.y+1], y [cy-1, cy+1], the rows fluidFieldAt can read -- lies in
+// that one chunk and every 4^3 sub-occupancy block it touches is clear in the
+// TOTAL class (no non-air cell at all; common.wgsl SUBOCC, conservative: an
+// unknown block reads set), every tap's fill is 0 and the field is exactly 0.
+// The march then does what it would have done with d = 0 (< iso / 4): stride
+// 1.25 without a crossing. So the caller skips the twelve-tap sample and the
+// t sequence, the iteration count and the hit are the ones the sample gave.
+// That is the exact half of PLAN_fluid_overhaul's "source mask" lever, for the
+// ~45% of coarse samples that land in ring shells, most of them over the
+// water in the air the ring chunk holds.
+var<private> gFluidViol : u32 = 0u;   // the verify arm's count (variant 4)
+fn fluidTapsDry(p : vec3f) -> bool {
+  let bi = vec2<i32>(floor(p.xz - vec2f(0.5)));
+  let cy = i32(floor(p.y));
+  let lo = vec3<i32>(bi.x, cy - 1, bi.y);
+  let hi = vec3<i32>(bi.x + 1, cy + 1, bi.y + 1);
+  let wc = worldChunkOf(lo);
+  if (any(worldChunkOf(hi) != wc)) { return false; }
+  let slot = chunkSlotOf(wc, R.origin);
+  if (slot == SLOT_NONE) { return false; }
+  let bl = vec3<u32>(lo & vec3<i32>(CHUNK_MASK)) >> vec3<u32>(SUBOCC_SHIFT);
+  let bh = vec3<u32>(hi & vec3<i32>(CHUNK_MASK)) >> vec3<u32>(SUBOCC_SHIFT);
+  let m0 = occupancy[subOccIndex(slot, 0u, 0u)];
+  let m1 = occupancy[subOccIndex(slot, 0u, 1u)];
+  for (var bz = bl.z; bz <= bh.z; bz++) {
+    for (var by = bl.y; by <= bh.y; by++) {
+      for (var bx = bl.x; bx <= bh.x; bx++) {
+        let bit = (bz * SUBOCC_DIM + by) * SUBOCC_DIM + bx;
+        let w = select(m0, m1, bit >= 32u);
+        if (((w >> (bit & 31u)) & 1u) != 0u) { return false; }
+      }
+    }
+  }
+  return true;
+}
+
 // NOTE: `fluidCellMarched` lived here — "is cell c inside the region the march
 // actually samples", used by fs() to decide whether the MPM surface owned a CA
 // liquid cell. It is GONE, deliberately: it answered a question about the
@@ -13296,6 +13336,16 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
         tPrev = t;
         t = max(fluidChunkExit(ro, inv, c, t) - f32(FLUID_SEAM_SHELL),
                 t + 0.5);
+        continue;
+      }
+      // A DRY RING SAMPLE (fluidTapsDry): field exactly 0, so exactly the
+      // d < iso / 4 stride below, without the taps.
+      if (heldClass == 2u && (fluidVariant() & 5u) != 0u && fluidTapsDry(p)) {
+        if ((fluidVariant() & 4u) != 0u && fluidFieldAt(p) >= iso * 0.25) {
+          gFluidViol += 1u;
+        }
+        tPrev = t;
+        t += 1.25;
         continue;
       }
       let d = fluidFieldAt(p);
@@ -13580,6 +13630,15 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
         tPrev = t;
         t = max(fluidChunkExit(ro, inv, c, t) - f32(FLUID_SEAM_SHELL),
                 t + 0.5);
+        continue;
+      }
+      // A DRY RING SAMPLE (fluidTapsDry): see the smooth march.
+      if (heldClass == 2u && (fluidVariant() & 5u) != 0u && fluidTapsDry(p)) {
+        if ((fluidVariant() & 4u) != 0u && fluidFieldAt(p) >= iso * 0.25) {
+          gFluidViol += 1u;
+        }
+        tPrev = t;
+        t += 1.25;
         continue;
       }
       let d = fluidFieldAt(p);
@@ -15564,6 +15623,13 @@ fn fs(in : VSOut) -> FSOut {
       let lakeShare = fluidSampleAt(lp).settled;
       mfLake = lakeShare >= MPM_LAKE_SETTLED;
       if (SEAM_DBG >= 9u) { gDbgM0.z = lakeShare; }
+    }
+    if ((fluidVariant() & 4u) != 0u && gFluidViol > 0u) {
+      // The dry-ring VERIFY arm: a skipped sample whose field was not < iso/4.
+      var dbg : FSOut;
+      dbg.color = vec4f(1.0, 0.0, 1.0, 1.0);
+      dbg.depth = 0.0;
+      return dbg;
     }
     if (fluidStage() == 4u) {   // the bench's STEP HEATMAP (fluidStage note)
       var dbg : FSOut;
