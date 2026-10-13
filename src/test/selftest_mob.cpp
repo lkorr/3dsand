@@ -16528,6 +16528,30 @@ Status GateDamageSources(Ctx& c, std::string& detail) {
     for (uint32_t k = 0; k < 16; k++)
       sum += mobs.LimbVoxelPos(id, torso, k * 7919u);
     const Vec3 tc = sum * (1.0f / 16.0f);
+    // WHAT STANDS IN THE STONE'S PATH (rule 6: a "did not take the stone"
+    // with no cause attached cost a triage pass). Every limb whose sampled
+    // centre lies in FRONT of the torso centre (+z, the side the block comes
+    // from) inside the block's lane, plus the swim state.
+    if (Mob* m = mobs.FindMobById(id)) {
+      std::string lane;
+      for (int li = 0; li < m->AppendedBase(); li++) {
+        if (li == torso || !mobs.LimbBody(id, li)) continue;
+        Vec3 ls{};
+        for (uint32_t k = 0; k < 16; k++)
+          ls += mobs.LimbVoxelPos(id, li, k * 7919u);
+        ls = ls * (1.0f / 16.0f);
+        const Vec3 d = ls - tc;
+        if (d.z > 0.5f && std::fabs(d.x) < 4.0f && std::fabs(d.y) < 4.0f)
+          lane += Format(" %s(%.1f,%.1f,+%.1f)", m->LimbDefAt(li).name.c_str(),
+                         d.x, d.y, d.z);
+      }
+      std::printf("  thrown stone fixture (%s, %.1f m/s): id %llu heading "
+                  "%.3f rad, swimming %d, limbs in front of the torso in the "
+                  "block's lane:%s\n",
+                  armoured ? "plated" : "bare", mps,
+                  (unsigned long long)id, m->Heading(), (int)m->Swimming(),
+                  lane.empty() ? " none" : lane.c_str());
+    }
     std::vector<DebrisVoxel> vox;
     for (int8_t z = 0; z < 3; z++)
       for (int8_t y = 0; y < 3; y++)
@@ -16614,6 +16638,11 @@ Status GateDamageSources(Ctx& c, std::string& detail) {
     fail("a stone at half gore.contactMinSpeed hurt somebody");
   else if (plated.billed == 0 || !(plated.shellHp > 0.0f) ||
            !(plated.torsoHp < fast.torsoHp))
+    // RED SINCE first-parent 9848dbd..1dd67ac (tests/BASELINE.md, 2026-10-12
+    // "combat package E"): the left forearm and hand stand in the block's
+    // lane (the "thrown stone fixture" lines), so the bare stone bills
+    // hand.L and the plated one bills the sleeve, and the torso is never
+    // struck.
     fail("the cuirass did not take the stone");
 
   // ---- G. the same stone at a PLAYER (W2-K) ---------------------------------
@@ -16785,7 +16814,8 @@ Status GateDamageSources(Ctx& c, std::string& detail) {
       hp0 - hp1, (int)npcAlive, charges, laserFlesh, laserShell, fast.billed,
       fast.torsoHp, slow.billed, plated.billed, plated.torsoHp, atPlayer.billed,
       atPlayer.torsoHp, why.empty() ? "" : "; FAIL: ", why.c_str());
-  std::printf("damage-sources: %s\n", ok ? "PASS" : "FAIL");
+  std::printf("damage-sources: %s%s%s\n", ok ? "PASS" : "FAIL",
+              why.empty() ? "" : " -- ", why.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 

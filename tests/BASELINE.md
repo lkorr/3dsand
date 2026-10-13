@@ -1388,3 +1388,83 @@ Left red, attributed, owner decisions:
   live level y197 (split 0); the pit's water reached 1,113 top columns against
   1,089 dug, so it found a side pocket. Next step: which component the body
   owns vs where its water is (wbOwns / wbComp).
+
+## 2026-10-12 — combat package E (baseline repair wave): `npc-styles` fixed, `swing-plane` and `damage-sources` attributed, still red
+
+No hash change and nothing rebaselined. All three gates are recorded `pass` and
+were red on main 8a46ed0 and on 1dd67ac.
+
+**`npc-styles`: FIXED. It was the gate.** Two defects, both in
+`src/test/selftest_combat.cpp`:
+1. `aimed` was read AFTER the stroke loop. The stroke's effector is an override
+   that `Mob::ClearStrikeEffector` drops when the stroke ends, and the fixture
+   holds a sword, so `ResolveEffector` fell through to `Held`. Every set of jaws
+   therefore read as "not aimed": the JAWS-turned and POSED-head-followed claims
+   never ran for any bite, and a jaws thrust was judged as a fist. `aimed` is
+   now latched during the Cut phase.
+2. `shark_bite` / `piranha_nip` (swimmers, 2cc68c4, 10-10) are reach-dominant
+   by a hair (cut reach 0.25 against 0.10 el), so the thrust branch asked for
+   1 vox of COMMANDED radial travel. An Aim effector has no radial channel:
+   `Mob::ApplyStrikeAim` reads only StrokeAz/StrokeEl, and its only forward
+   carry is the cut-progress lean (`aimLeanBodies`). The styles' own notes say
+   the CHARGE carries the jaws and the stroke only gapes and snaps them. For
+   an aimed effector the thrust claim is now "the rig carried the head forward"
+   (`AimDiag::lean > 0`). The data was not changed. With (1) fixed, the
+   absolute "commanded > 0.1 rad pitch" floor failed on shark_bite's
+   deliberate 0.10 rad. It is restated as half the authored elevation
+   (`naturalTravelFrac`), which is stricter for every land bite.
+   Result: `npc-styles: PASS (307 checks)` at --verify scope. That run also
+   had the demons agent's 4befcbd applied, uncommitted.
+
+**`damage-sources`: STILL RED, cause attributed, introducing commit NOT
+found.** The gate now prints why it failed (`damage-sources: FAIL --
+<reason>`), and the thrown-stone arm prints what is in the block's lane.
+Reason: "the cuirass did not take the stone". The fixture faces +z
+(heading 0.000), is not swimming, and has its LEFT forearm and hand in front
+of the torso inside the block's 3-voxel lane:
+`armL.L(1.9,1.9,+1.4) hand.L(2.0,0.1,+2.2)` relative to the 16-sample torso
+centroid. So the bare stone bills `hand.L -60` (body -27) and the plated
+stone bills the cuirass sleeve plus `armL.L -33`. The torso is never struck,
+so plated (33) > bare (27) for reasons that have nothing to do with armour.
+This is the same failure as the 09-29 `adbc47d` red, which fc8e451 fixed by
+throwing along z. The gate PASSED at 9848dbd, acd0d51, 5a23e96 and e959c65
+(thrown stone "7 billed -333 hp"), so the change is in first-parent
+9848dbd..1dd67ac. Between those commits the gate's own fixture code did not
+change. Something moved the left arm, or the sampled torso centroid, about a
+voxel into the lane. Untested suspects: 63e9dd8 (stump walk, "arms at the
+sides"), 088bd1b (freefall / seated limp hand-over), and the anatomy re-bake
+fc4783b, which changes torso voxel order and so the 16-sample centroid. Owner
+decision: if the pose is right, the fix is the fixture's lane (throw at the
+back, or pick a lane clear of other limbs). If it is wrong, it is a pose
+regression.
+
+**`swing-plane` E: STILL RED, mechanism found, bisect stopped one range
+short.** The new E lines (`swing-plane E (tick N)` / `(sweep)`) show the swing
+LANDS. It hits armU.R, head and armU.L on 6 ticks. Hp falls 1107 -> 1092.6.
+Every tick runs one kerf, but at depth 0.09..0.12 world voxels (power
+0.15..0.36 x edge align 0.38..0.86; tip speed 37..81 vox/s against a 200 vox/s
+full-power speed). The authoritative skin lattice loses about 3 voxels a tick
+(art 26428 -> 26412). The collider count the gate reads, `LimbVoxelCount`,
+stays at 3320, because a 0.1-voxel kerf never empties a collider cell. F's
+direct edge-on sweep still removes 638. So "0 of 0 wounded limbs" means
+"wounded below the gate's resolution", not "not wounded".
+Bisect (first-parent, `--verify swing-plane,damage-sources`):
+- good: acd0d51, 5a23e96. Both show "1 of 1 wounded", which is marginal: one
+  collider voxel.
+- bad: d34fb41, e959c65, 9848dbd, 1dd67ac.
+- The introducing commit is in first-parent `5a23e96..e959c65`: 55abf81
+  (demons D5), c2aec27 / c597987 (D5 merges of main: fight64 M work pool, Q,
+  R, D4 casting), 55cb72b, a7ca582, c96443f, b21d23a, 7194388, 25002dd
+  (fight64 round 3 S: Reset clears tick-drained queues), a6176ca (round 3 F:
+  CPU tick budget), e959c65 (round 3 C: CCD scoped to terrain for dead/limp
+  bodies, plain collision for kinematic pairs). Package X (3bb2f4b,
+  DownsampleSkin/CarveBounds) is AFTER e959c65 and is cleared.
+The tip box is identical on both sides of the range, (248.3,187.2,258.9) to
+(263.2,189.8,266.1), so the swing's geometry did not move. What changed is
+whether that marginal kerf took a whole collider cell. Next step for whoever
+picks it up: test e959c65's parent a6176ca, then 25002dd. Separately, there
+is an owner/fixture question. The gate measures wounds on the COLLIDER
+lattice while the wound model works on the skin lattice
+(`LimbArtVoxelCount`), and a 4-8 m/s cut is shallow by tuning (`gore.cutDepth`
+0.08 + 0.15 x power, unchanged since 09-14). Counting art voxels would make E
+pass at its current depth. That is a change to the claim, so it was not made.

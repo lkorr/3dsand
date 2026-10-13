@@ -1676,6 +1676,12 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
     // one that caught the neck-lever bug.
     float aimCmdPitchLo = 1e9f, aimCmdPitchHi = -1e9f;
     float aimGotPitchLo = 1e9f, aimGotPitchHi = -1e9f;
+    // ...and how far the rig carried the aimed part FORWARD (AimDiag::lean),
+    // which is the only radial travel an Aim effector has: see the thrust
+    // branch below.
+    float aimLeanMax = 0;
+    // WHICH EFFECTOR THE CUT RAN ON, read WHILE IT RAN (see `aimed` below).
+    bool aimedInCut = false;
     for (int i = 0; i < 90; i++) {
       tick();
       const NpcStroke* s = c.mobs.MobStroke(id);
@@ -1683,6 +1689,8 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
       if (s->phase == NpcStroke::Phase::Cut) {
         cutTicks++;
         if (const Mob* m = c.mobs.FindMobById(id)) {
+          if (m->StrikeEffectorKind() == StrikeEffectorMode::Aim)
+            aimedInCut = true;
           Vec3 eb, et, ef;
           float ehw = 0;
           if (m->WeaponEdge(eb, et, ehw, &ef)) {
@@ -1702,6 +1710,7 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
             aimCmdPitchHi = std::max(aimCmdPitchHi, ad.cmdPitch);
             aimGotPitchLo = std::min(aimGotPitchLo, ad.gotPitch);
             aimGotPitchHi = std::max(aimGotPitchHi, ad.gotPitch);
+            aimLeanMax = std::max(aimLeanMax, ad.lean);
           }
         }
         const TipRead t = ReadTip(c.mobs, id);
@@ -1804,12 +1813,14 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
     // the authority on which those are -- not a name in this file. Asked of
     // the live creature, so a def that later grows a neck chain makes its bite
     // a Chain effector and this gate follows it with no edit.
-    bool aimed = false;
-    if (natural) {
-      const Mob* m = c.mobs.FindMobById(id);
-      aimed = m != nullptr &&
-              m->StrikeEffectorKind() == StrikeEffectorMode::Aim;
-    }
+    //
+    // ASKED DURING THE CUT, NOT AFTER IT (2026-10-12). The stroke's effector
+    // is an OVERRIDE that ends with the stroke (Mob::ClearStrikeEffector), and
+    // this fixture holds a sword, so by the time the loop above has finished
+    // ResolveEffector falls through to the HELD item and every set of jaws
+    // read as `Held`: the JAWS-turned and POSED-head-followed claims below
+    // never ran for any bite, and a jaws thrust was judged as a fist.
+    const bool aimed = natural && aimedInCut;
     // ---- "THE WEAPON MOVED, NOT JUST THE STROKE" -------------------------
     //
     // Three weapons, three units, and the words name which one -- "the SWORD
@@ -1843,8 +1854,17 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
                                 : 0.0f;
       const float followFrac =
           (float)BaselineNumber("npcStyles.aimFollowFrac", 0.6);
-      check(cmdSpan > 0.1f,
-            "style " + n + ": the driver commanded real pitch");
+      // A SHARE OF THE PITCH THE STYLE AUTHORED, like the turn above, rather
+      // than an absolute 0.1 rad: that floor was written for the land bites
+      // (0.55..1.6 rad of authored elevation) and never ran until `aimed`
+      // was read during the cut. A shark's bite authors 0.10 rad on purpose
+      // -- the charge aims it, the stroke gapes and snaps (attack_styles.json)
+      // -- and its driver commands exactly that; the land bites are held to
+      // half of theirs, which is stricter than the old floor.
+      check(cmdSpan > wantEl * travelFrac,
+            "style " + n + ": the driver commanded the authored pitch (" +
+                Format("%.2f", cmdSpan) + " rad of " +
+                Format("%.2f", wantEl) + " authored)");
       check(gotSpan > cmdSpan * followFrac,
             "style " + n + ": the POSED head followed it (" +
                 Format("%.2f", gotSpan) + " rad of " +
@@ -1917,8 +1937,31 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
       // channel", which is what a thrust IS, and the claim that the fist
       // itself moved is carried by the posed-arc check above — the same split,
       // for the same reason, as the swing check two lines down.
-      check((natural ? cmdDr : dr) > minReach,
-            "style " + n + " (thrust) extended its reach");
+      //
+      // ---- AND AN AIM EFFECTOR HAS NO RADIAL CHANNEL (2026-10-12) ---------
+      //
+      // A set of jaws on a head no chain owns is POINTED, not extended:
+      // Mob::ApplyStrikeAim reads the stroke's StrokeAz/StrokeEl and nothing
+      // else, and the only forward carry it has is the cut-progress LEAN
+      // (sidecar `aimLeanBodies` x body depth), which the stroke's authored
+      // reach does not touch. So "the command drove the radial channel" is a
+      // claim about a number no part of the rig reads. It failed on the
+      // swimmers' bites from the day they landed (2cc68c4): shark_bite and
+      // piranha_nip author only a quarter of reach because the CHARGE carries
+      // the jaws to the target and the stroke only gapes and snaps them
+      // (attack_styles.json's own notes; the fish sidecars set their lean to
+      // 0.03 / 0.05 bodies for the same reason). What a reach-dominant aimed
+      // stroke CAN be asked is that the rig carried the head forward at all,
+      // read off the rig's own diagnostic (AimDiag::lean); the turn and the
+      // posed-follows-commanded pitch are asserted above.
+      if (aimed) {
+        check(aimLeanMax > 0.0f,
+              "style " + n + " (aimed thrust) carried the head forward (" +
+                  Format("%.2f", aimLeanMax) + " vox of lean)");
+      } else {
+        check((natural ? cmdDr : dr) > minReach,
+              "style " + n + " (thrust) extended its reach");
+      }
       // ON THE COMMANDED ARCS, like every other dominance claim here — the
       // restatement _npcStyles_about prescribed (2026-09-01, done when the
       // torso lean moved the posed number past the old absolute cap). A
