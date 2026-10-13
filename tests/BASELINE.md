@@ -1333,3 +1333,58 @@ it. Recorded with `--verify ... --rebaseline`.
   `surfaceMinY` and the `envTruthTreesPerHa_*` observations, last written by
   the P-G rebaseline (0b63a10) -- they are observations, not thresholds, and
   were stale from before map v2.
+
+## 2026-10-12 — baseline repair C: heat / weather / water (worktree branch, no key flipped)
+
+Eight gates recorded `pass` were red on main 8a46ed0 and on 1dd67ac. Each FAIL
+line was first made to say WHY (CLAUDE.md rule 6: `src/test/census.h`
+`MatCensus` names what a fixture holds instead of its subject; heat-melt /
+freeze traces; drafts meta + back-to-back rebuilds; rain-fire burn shape and
+front trace; waterbody pass N arm 2 extremes + relevel ledger), then fixed:
+
+- `drafts` (engine): the shelter solve is a pipeline advanced one stage per
+  tick its `args` row is recorded, and `Cond::Draft` needed `caActive`. A
+  world that proved itself settled mid-solve froze it: solve #358 started at
+  tick 61020 and published at 61035, three ticks after the smoke puff woke the
+  CA; the gate's first read was a geometry behind (purity: 275,443 of 393,216
+  words differed from a rebuild, while two back-to-back rebuilds agreed).
+  `RecordCtx::draftTail` keeps `C_DRAFT` for 2 x kDraftStages + 1 ticks after
+  the last CA / rebuild tick -> 0 words differ. Visible since the harness world
+  started proving itself settled quickly (idle-wake fixes, 10-05). Also
+  `drafts.sealedKeepMin` 0.3 -> 0.1: the sealed hut's smoke is a control and
+  thin smoke fades x3 since fd72df9 (owner decision; walls intact, census).
+- `wind` (fixture): the chamber at a literal y112 sat under the harness ground,
+  where the wind's height-above-ground ramp is 0 since 4d18d09 (09-30): every
+  arm hashed identical. Now terrain-relative (FixtureYOver +6): drift +21 / -24.
+- `evaporation`, `rain-stain` (fixture + engine): both fixtures stand at about
+  y228, above the harness column snowline (treeline 228 - 1). The pond skinned
+  over (surface ice 240, snow 30, water 10); frozen ground took no oil stain
+  (heatGroundFrozen). Both now pin a mild climate (base 12) over their
+  footprint, and `Simulation::PrepareHeat` gives a PINNED column no snowline
+  (the per-column snowline of map v2 A1 had made pins leaky).
+- `heat-melt`, `heat-freeze` (deadlines): measured geometric tails that
+  complete -- melt left t150 51 / t300 22 / t450 12 / t600 3 / t750 1 (1 at
+  900), freeze open tops t300 57 ... t1500 1, whose column then held its chunk
+  awake. heat.meltRunTicks / meltTicksMax 900 -> 1800, heat.freezePhase2Ticks
+  1500 -> 3000 (`_heatMeltFreezeTail_about`). Now melt done by 1245, 192/192.
+
+Left red, attributed, owner decisions:
+
+- `rain-fire`: a one-voxel leaf sheet burns near its percolation threshold.
+  Clear arm 43% at 400 ticks (front still alive: 269 gone, 18 burning);
+  `SANDVOX_RAINFIRE_DIAG=1` ran the same clear arm at four other harness sites:
+  56 / 71 / 30 / 65% (at (120,120) the front died at t300). 60% sits inside the
+  site-to-site spread, so the gate is a dice roll; no combustion knob or leaf
+  rule changed since it last passed (d83306e, 09-30). The ordering claims hold
+  by an order of magnitude (drizzle 2%, storm 1%). Wind pinned calm (36 ->
+  43%). Options: rainFireTicks 800 (the front at the gate's site is alive),
+  rainFireClearPctMin ~25 (a "lit and spread" floor), or a fuel that is not
+  near-critical.
+- `waterbody` pass N arm 2 (red since <= 13adc66, unowned): the CREATED body
+  never relevels -- adopted, footprint listed (44 chunks) and armed after the
+  crater, but `wbSurface` measures 0 columns (relevel count 0, given/taken
+  0/0) and the surface stays the CA's 1-eighth-per-2-cells cone (16 eighths
+  from the pit corner to the crater). Its sweep map holds 2 components at the
+  live level y197 (split 0); the pit's water reached 1,113 top columns against
+  1,089 dug, so it found a side pocket. Next step: which component the body
+  owns vs where its water is (wbOwns / wbComp).

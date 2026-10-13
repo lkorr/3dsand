@@ -427,7 +427,9 @@ PASS(rainExpo, "rainExpo", PT_TICK, PIPE_RAIN_EXPO, K_COMPUTE, D_RAINEXPO,1,1, G
 // thread's args, so they dispatch ZERO groups on a tick whose blockers did not
 // change. The field they write is a pure function of the masks (no history),
 // read by the CA, the particle and MPM wind sites, and the frame's streaks and
-// arrows. Nothing at all is recorded on a settled tick or at sim.draftMode 0.
+// arrows. Nothing at all is recorded at sim.draftMode 0, nor on a settled tick
+// once C_DRAFT's tail (RecordCtx::draftTail: 2 x 6 + 1 ticks after the last CA
+// or rebuild tick, so a solve in flight always publishes) has run out.
 // D_DRAFTCHUNKS is a literal (pass_table.cpp does not see world.h):
 // kDraftChunks = 2048, static_assert-ed in simulation.cpp.
 PASS(draftMaskAll, "draft", PT_TICK, PIPE_DRAFT_MASK_ALL, K_COMPUTE, 2048,1,1, GRP_SIM, DYN_ZERO, C_DRAFTALL, 1,

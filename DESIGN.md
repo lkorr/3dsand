@@ -20547,7 +20547,12 @@ Q8, and the sweeps are red-black.
 **It is a pipeline, one stage a tick:** pocket and faces, coarse solve, then
 the four fine passes. A solve starts when a mask has moved and none is in
 flight, so a burning house costs one stage a tick, and the field it publishes
-lags its geometry by at most 6 ticks. **A BURST** (TickParams.draftMode bit 1)
+lags its geometry by at most 6 ticks. **A stage is a tick on which `args` is
+recorded**, so `C_DRAFT` stays true for 2 x 6 + 1 ticks after the last tick the
+CA ran or the box rebuilt (`RecordCtx::draftTail`): without that tail a world
+that proved itself settled mid-solve froze the solve, and the published field
+stayed a geometry behind until something woke the CA (2026-10-12, the `drafts`
+gate's purity arm). **A BURST** (TickParams.draftMode bit 1)
 runs every stage in one tick. It fires when the box moved or when the gate, the
 materials or the buffer is new, because the field must match the box's new
 origin before anything reads it.
@@ -20556,7 +20561,7 @@ origin before anything reads it.
 
 | Scene | Cost |
 |---|---|
-| Settled world | ~0 (C_DRAFT is false, nothing recorded) |
+| Settled world | ~0 (C_DRAFT is false after the 13-tick tail, nothing recorded) |
 | `explosion` (debris re-solving the box continuously) | 166 µs |
 | `forestfire` (a 22 ms frame) | 538 µs |
 | `flythrough` (bursts as the box follows) | 53 µs |

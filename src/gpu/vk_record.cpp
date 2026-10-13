@@ -178,7 +178,7 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     // rows whenever either masks.
     case pass::Cond::DraftAll:      return cx.draftOn && cx.draftRebuild;
     case pass::Cond::DraftDirty:    return cx.draftOn && !cx.draftRebuild && cx.caActive;
-    case pass::Cond::Draft:         return cx.draftOn && (cx.draftRebuild || cx.caActive);
+    case pass::Cond::Draft:         return cx.draftOn && (cx.draftRebuild || cx.caActive || cx.draftTail);
     // The charge field's round k (k >= 1): only while k < this tick's rounds.
     // Wave 2's fast path: none of it while the field cannot hold charge.
     case pass::Cond::Elec:          return cx.caActive && cx.elecLive;
