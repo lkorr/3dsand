@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -351,5 +352,433 @@ inline KerfKeep KerfKeepAt(const KerfSlot& s, float scale) {
   // plus a hair is the thinnest slab no 6-connected path can step across.
   k.through = s.through;
   if (s.through) k.hw = std::max(k.hw, 0.51f);
+  return k;
+}
+
+// ============================================================================
+// A POINT DRIVEN THROUGH (2026-10-12; docs/PLAN_projectiles.md package B)
+// ============================================================================
+//
+// The kerf above is an EDGE: a slot that travels across the thing it cuts and
+// is priced by the PLANE it parts. A penetrator is the other blow a blade-shaped
+// thing can deliver: a POINT that travels along its own axis and is priced by
+// the LENGTH of matter it pushes through. An arrow, a thrown spear, a bolt of
+// iron out of a spell -- one model for all of them, and it is the same pricing
+// KerfBite already uses (materials.json `hardness` over gear.cutHardnessRef),
+// so a body is as hard to shoot through as it is to cut through, by what it is
+// made of, with no per-race rule anywhere: an automaton's brass and a sylvan's
+// bark stop an arrow that goes through a man because brass and bark are harder
+// than skin, and for no other reason.
+//
+// THE CHANNEL IS A THIN CYLINDER ON THE STRUCK THING'S FINE LATTICE (the
+// owner's decision 2): an arrow is a centimetre across, so it takes a tube of
+// skin cells out of a man, not a world voxel. It walks the axis cell by cell
+// in order of depth, paying for each one:
+//
+//   cost(cell) = gore.pierceCellJ * (cell.hardness / gear.cutHardnessRef)
+//              * soft(cell.hardness / tip.hardness) / max(sharpness, floor)
+//              * (cell volume / fine cell volume)
+//
+//   soft(r) = r^gore.pierceSoftExp when r > 1 (the point is SOFTER than what
+//   it meets: a wooden point on iron), 1 otherwise.
+//
+// Energy left when the axis runs out of matter -> EXITED, and the flight goes
+// on with the residual speed (through an arm into the torso, through one man
+// into the next). Energy gone inside -> EMBEDDED at that depth. Not enough to
+// pay for the first fine cell of matter at all -> GLANCED: nothing is carved
+// and the caller falls back to trauma (pebbles bruise, arrows skip off plate).
+//
+// Everything that FOLLOWS -- the hp the lost tissue costs, the brain charge,
+// the bleed, the gore particles, the wound soak -- is the ordinary carve path
+// (Mob::CarveLimb, DebrisSystem::DamageBody). This header only says which
+// cells, and what the flight has left.
+
+// The FINE lattice a tip is measured on: the human art's 80 cells per metre
+// (1.25 cm). A tip radius is stated in these whatever lattice the struck thing
+// is on, and a cell's price is scaled by its volume against one of these, so
+// the energy per unit length of channel is a property of the matter and the
+// point, never of the struck art's resolution.
+inline constexpr float kPierceRefCellsPerMetre = 80.0f;
+// The thinnest channel a lattice can carve without the axis slipping between
+// cell centres: half a cell's space diagonal. A tip thinner than this on a
+// coarse lattice is WIDENED to it and its per-cell price scaled down by the
+// area ratio, so it still pays the physical energy per unit length.
+inline constexpr float kPierceMinRadiusCells = 0.8661f;
+
+// ---- ONE PROJECTILE, AS PHYSICS ---------------------------------------------
+// What the struck thing needs to know about what hit it. Everything a flight
+// knows about speed and aim stays with the flight.
+struct Penetrator {
+  float massKg = 0.03f;     // a war arrow is 25..60 g
+  float speedMps = 0.0f;    // at the moment of contact
+  float tipRadius = 1.0f;   // in FINE cells (1/kPierceRefCellsPerMetre m)
+  // How hard the point is (materials.json `hardness` scale). 0 = take it
+  // from `material`; 0 there too = harder than anything (no soft penalty).
+  float hardness = 0.0f;
+  float sharpness = 1.0f;   // 0..1: a bodkin 1, a broadhead ~0.8, a stone ~0.05
+  uint32_t material = 0;    // the projectile's matter, 0 = not named
+  // A flat hp charge on top of the tissue the channel destroys -- a weapon
+  // stat, the way StrikeProfile::cut is melee's. 0 = the wound alone, which
+  // is what the `pierce` gate measures.
+  float hp = 0.0f;
+  // Draw key for the wound soak. NOT a tick: the same shot replayed against
+  // the same body must bleed the same way (KerfCut::seed).
+  uint32_t seed = 0;
+  float EnergyJ() const {
+    return 0.5f * std::max(massKg, 0.0f) * speedMps * speedMps;
+  }
+  float SpeedFor(float energyJ) const {
+    return massKg > 1e-6f ? std::sqrt(2.0f * std::max(energyJ, 0.0f) / massKg)
+                          : 0.0f;
+  }
+};
+
+enum class PierceOutcome : uint8_t { Glanced = 0, Embedded, Exited };
+
+inline const char* PierceOutcomeName(PierceOutcome o) {
+  switch (o) {
+    case PierceOutcome::Glanced: return "glanced";
+    case PierceOutcome::Embedded: return "embedded";
+    case PierceOutcome::Exited: return "exited";
+  }
+  return "?";
+}
+
+// Cells the channel took, and what they cost, per material.
+struct PierceMatCells {
+  uint32_t mat = 0;
+  uint32_t cells = 0;
+  float joules = 0.0f;
+};
+
+// ---- WHAT ONE BODY DID TO ONE PROJECTILE ------------------------------------
+struct PierceResult {
+  bool hit = false;            // the handle was a body this caller owns
+  // ...but no matter of it lay on the axis: the ray met its collider (a box
+  // merge's convex radius, or a body rebuilt under a new handle by a carve
+  // the same flight just made) and passed it by. Outcome Exited, nothing paid.
+  bool missed = false;
+  PierceOutcome outcome = PierceOutcome::Glanced;
+  float energyIn = 0.0f;       // J at the entry face
+  float energyLeft = 0.0f;     // J past the exit (Exited only)
+  float exitSpeedMps = 0.0f;   // ...as a speed, for the flight to continue at
+  float firstLayerJ = 0.0f;    // what the first fine cell of matter would cost
+  float depth = 0.0f;          // world voxels of channel, entry face -> stop/exit
+  Vec3 entryWorld{}, stopWorld{};      // where it went in, where it stopped/left
+  Vec3 entryLocal{}, stopLocal{}, dirLocal{};  // the same, in the body's frame
+  uint32_t cells = 0;          // lattice cells the channel took
+  uint32_t carved = 0;         // ...of which the carve really removed
+  uint32_t stopMat = 0;        // what it could not pay for (Embedded/Glanced)
+  std::vector<PierceMatCells> byMat;
+  float hpCharged = 0.0f;      // creature path: hp the wound cost (all causes)
+  bool killed = false;         // creature path: alive before, dead after
+  bool severed = false;        // the struck slot left the creature
+  bool loose = false;          // the struck thing was a loose body, not a limb
+};
+
+// ---- THE PRICE OF ONE CELL ---------------------------------------------------
+// The four numbers, so this header stays free of the tuning struct (and of its
+// rebuild fan-out); PierceCostOf reads them out of any Tuning.
+struct PierceCost {
+  float cellJ = 1.0f;       // gore.pierceCellJ
+  float hardRef = 8.0f;     // gear.cutHardnessRef
+  float softExp = 2.0f;     // gore.pierceSoftExp
+  float sharpFloor = 0.05f; // gore.pierceSharpFloor
+};
+template <class TuningT>
+inline PierceCost PierceCostOf(const TuningT& t) {
+  PierceCost c;
+  c.cellJ = t.gore.pierceCellJ;
+  c.hardRef = t.gear.cutHardnessRef;
+  c.softExp = t.gore.pierceSoftExp;
+  c.sharpFloor = t.gore.pierceSharpFloor;
+  return c;
+}
+// ---- A GLANCE IS A THROWN THING'S BLOW ---------------------------------------
+// What a point that could not get in delivers instead: trauma, by the CONTACT
+// rows (gore.contactImpulseMin / contactHpPerImpulse / contactMaxHp) -- the rule
+// MobSystem::ApplyContactDamage bills a thrown rock with, impulse in kg m/s.
+// Nothing new decides how much a stone hurts. `power` is hp over the cap, the
+// contact path's bruise scale.
+struct PierceGlance {
+  float hp = 0.0f;
+  float power = 0.0f;
+};
+template <class TuningT>
+inline PierceGlance PierceGlanceOf(const TuningT& t, const Penetrator& pen) {
+  const auto& g = t.gore;
+  const float impulse =
+      std::max(pen.massKg, 0.0f) * std::max(pen.speedMps, 0.0f);
+  PierceGlance r;
+  const float hp = (impulse - g.contactImpulseMin) * g.contactHpPerImpulse;
+  r.hp = hp > 0.0f ? std::min(hp, std::max(g.contactMaxHp, 0.0f)) : 0.0f;
+  r.power = g.contactMaxHp > 0.0f ? std::clamp(r.hp / g.contactMaxHp, 0.0f, 1.0f)
+                                  : 1.0f;
+  return r;
+}
+// J to drive a point of `tipHard` through one cell of `cellHard` matter.
+// `volScale` is the cell's volume against a fine cell, times the area
+// correction PierceLatticeFor computed. Unknown matter (hardness 0) is
+// charged as skin, the convention KerfBite's resistance table keeps.
+inline float PierceCellJ(const PierceCost& c, float cellHard, float tipHard,
+                         float sharpness, float volScale) {
+  const float rel = (cellHard > 0.0f && c.hardRef > 0.0f) ? cellHard / c.hardRef
+                                                          : 1.0f;
+  float soft = 1.0f;
+  if (tipHard > 0.0f && cellHard > tipHard && c.softExp > 0.0f)
+    soft = std::pow(cellHard / tipHard, c.softExp);
+  const float sharp = std::max(std::clamp(sharpness, 0.0f, 1.0f),
+                               std::max(c.sharpFloor, 1e-3f));
+  return std::max(c.cellJ, 0.0f) * rel * soft / sharp *
+         std::max(volScale, 0.0f);
+}
+
+// ---- THE TIP, ON ONE LATTICE -------------------------------------------------
+// `latScale` = the struck lattice's cells per world voxel; `voxelMeters` =
+// the world voxel (sim/world.h kVoxelMeters). `rCells` is the channel radius
+// in that lattice's cells; `volScale` the per-cell price factor.
+struct PierceLattice {
+  float rCells = 1.0f;
+  float volScale = 1.0f;
+};
+inline PierceLattice PierceLatticeFor(float tipRadiusFine, float latScale,
+                                      float voxelMeters) {
+  PierceLattice L;
+  const float ref = kPierceRefCellsPerMetre * voxelMeters;  // fine per voxel
+  const float s = std::max(latScale, 1e-3f);
+  // A tip thinner than a quarter of a fine cell is a needle the lattice
+  // cannot price: held at that, so a zero radius is not free passage.
+  const float rPhys = std::max(tipRadiusFine, 0.25f) * s / ref;
+  L.rCells = std::max(rPhys, kPierceMinRadiusCells);
+  const float cell = ref / s;  // this lattice's cell edge, in fine cells
+  L.volScale = cell * cell * cell * (rPhys * rPhys) / (L.rCells * L.rCells);
+  return L;
+}
+
+// ---- THE AXIS TEST, SHARED BY THE CHANNEL AND ITS CARVE ----------------------
+// ONE expression, so the cells the channel PAID for and the cells the carve
+// REMOVES are the same set to the last ulp on the authoritative lattice.
+// `o` is the origin in lattice units, `d` the unit axis.
+inline bool PierceInAxis(float x, float y, float z, const Vec3& o, const Vec3& d,
+                         float r2, float& t) {
+  const Vec3 p{x + 0.5f - o.x, y + 0.5f - o.y, z + 0.5f - o.z};
+  t = p.dot(d);
+  if (t < 0.0f) return false;
+  return p.dot(p) - t * t <= r2;
+}
+
+struct PierceChannelResult {
+  bool any = false;      // there was matter on the axis at all
+  bool glanced = false;  // ...and the point could not pay for its first cell
+  bool exited = false;   // paid for everything on the axis
+  float tEntry = 0.0f;   // world voxels along the axis from the origin
+  float tStop = 0.0f;    // the channel ends here (world voxels)
+  float tExit = 0.0f;    // far side of the last cell paid (exited)
+  // THE CARVE'S BOUND, EXACT: the channel is every cell on the axis whose
+  // DEPTH BIN, floor(t - t0Lat) in lattice units, is below binStop (INT_MAX
+  // when it exited). PierceKeepAt must be handed these, not a world-voxel
+  // round trip of them: t/s*s is not t.
+  float t0Lat = 0.0f;
+  int binStop = 0;
+  float firstLayerJ = 0.0f;
+  float spentJ = 0.0f, leftJ = 0.0f;
+  uint32_t cells = 0;
+  uint32_t stopMat = 0;  // commonest matter of the depth it could not pay for
+  std::vector<PierceMatCells> byMat;
+};
+
+// Walk the axis through ONE lattice. `oLocal`/`dLocal` are the axis in the
+// body's frame (world-voxel units, `dLocal` unit); `rCells` the channel radius
+// in this lattice's cells. `forEach` calls back probe(x, y, z, material) for
+// every non-empty cell of the lattice; `costOf(material)` is ONE FULL CELL of
+// that matter's price in J (PierceCellJ).
+//
+// PAID BY THE DEPTH, NOT BY THE CELL COUNT. The cells whose centres fall within
+// `rCells` of an axis are 2 to 5 per cell of depth for a radius of one cell,
+// depending only on where the axis crosses the lattice: priced per cell, the
+// same arrow shifted half a centimetre paid more than twice as much (measured
+// in the first `pierce` run: 2-cell slices through one head, 5-cell slices
+// through the next). So the axis is cut into DEPTH BINS one lattice cell long
+// from the first matter, and each bin is charged its occupied cells' prices
+// scaled by (pi r^2 / the bin's GEOMETRIC cell count) -- the cells a full bin
+// of the cylinder holds, matter or not. A full bin of one matter then costs
+// pi r^2 cells' worth whatever the alignment; a bin half in air (the curve of
+// a limb's surface) costs half. A bin is paid whole or not at all, so the
+// channel is exactly the bins paid and the carve (PierceKeepAt) takes exactly
+// that.
+//
+// GLANCE: the first bin -- the first lattice cell of depth of matter -- is
+// what the point must be able to pay for to get in at all.
+template <class ForEach, class CostOf>
+inline PierceChannelResult PierceChannel(Vec3 oLocal, Vec3 dLocal,
+                                         float latScale, float rCells,
+                                         float energyJ, ForEach forEach,
+                                         CostOf costOf) {
+  PierceChannelResult r;
+  const float s = std::max(latScale, 1e-3f);
+  const Vec3 o = oLocal * s;
+  const float dl = dLocal.len();
+  const Vec3 d = dl > 1e-6f ? dLocal * (1.0f / dl) : Vec3{0, 0, 1};
+  const float r2 = rCells * rCells;
+  struct Cell {
+    float t;
+    int16_t x, y, z;
+    uint32_t mat;
+  };
+  std::vector<Cell> cells;
+  cells.reserve(256);
+  forEach([&](float x, float y, float z, uint32_t mat) {
+    float t = 0.0f;
+    if (!PierceInAxis(x, y, z, o, d, r2, t)) return;
+    cells.push_back({t, (int16_t)x, (int16_t)y, (int16_t)z, mat});
+  });
+  r.leftJ = std::max(energyJ, 0.0f);
+  r.binStop = INT_MAX;
+  if (cells.empty()) {
+    r.exited = true;  // nothing of this lattice on the axis: passed it by
+    return r;
+  }
+  // A total order, so equal depths cannot reorder by however the lattice
+  // happened to be listed.
+  std::sort(cells.begin(), cells.end(), [](const Cell& a, const Cell& b) {
+    if (a.t != b.t) return a.t < b.t;
+    if (a.x != b.x) return a.x < b.x;
+    if (a.y != b.y) return a.y < b.y;
+    return a.z < b.z;
+  });
+  r.any = true;
+  const float t0 = cells.front().t;
+  r.t0Lat = t0;
+  r.tEntry = t0 / s;
+  auto binOf = [t0](float t) { return (int)std::floor(t - t0); };
+  // A body folded far down its own axis is not a channel anyone can fly:
+  // the bins are bounded (rule 2), and matter past the bound is not reached.
+  constexpr int kMaxBins = 4096;
+  const int nBins = std::min(binOf(cells.back().t) + 1, kMaxBins);
+  // The cylinder's GEOMETRIC cell count in bin k: every lattice point inside
+  // it, matter or not. One small box per bin paid.
+  auto geomCount = [&](int k) {
+    const Vec3 a = o + d * (t0 + (float)k);
+    const Vec3 b = o + d * (t0 + (float)k + 1.0f);
+    const int lo[3] = {(int)std::floor(std::min(a.x, b.x) - rCells) - 1,
+                       (int)std::floor(std::min(a.y, b.y) - rCells) - 1,
+                       (int)std::floor(std::min(a.z, b.z) - rCells) - 1};
+    const int hi[3] = {(int)std::ceil(std::max(a.x, b.x) + rCells) + 1,
+                       (int)std::ceil(std::max(a.y, b.y) + rCells) + 1,
+                       (int)std::ceil(std::max(a.z, b.z) + rCells) + 1};
+    int n = 0;
+    for (int z = lo[2]; z <= hi[2]; z++)
+      for (int y = lo[1]; y <= hi[1]; y++)
+        for (int x = lo[0]; x <= hi[0]; x++) {
+          float t = 0.0f;
+          if (PierceInAxis((float)x, (float)y, (float)z, o, d, r2, t) &&
+              binOf(t) == k)
+            n++;
+        }
+    return n;
+  };
+  constexpr float kPi = 3.14159265f;
+  const float area = kPi * r2;
+  auto tally = [&](uint32_t mat, float j) {
+    for (PierceMatCells& m : r.byMat)
+      if (m.mat == mat) {
+        m.cells++;
+        m.joules += j;
+        return;
+      }
+    r.byMat.push_back({mat, 1u, j});
+  };
+  size_t i = 0;
+  for (int k = 0; k < nBins && i < cells.size(); k++) {
+    size_t j = i;
+    float price = 0.0f;
+    while (j < cells.size() && binOf(cells[j].t) <= k) {
+      price += costOf(cells[j].mat);
+      j++;
+    }
+    if (j == i) continue;  // a gap in the matter: nothing to pay
+    const float norm = area / (float)std::max(geomCount(k), 1);
+    price *= norm;
+    if (k == 0) r.firstLayerJ = price;
+    if (price > r.leftJ) {
+      r.glanced = k == 0;
+      r.binStop = k;
+      r.tStop = (t0 + (float)k) / s;
+      // What stopped it: the commonest matter of the bin it could not pay.
+      uint32_t best = cells[i].mat, bestN = 0;
+      for (size_t a = i; a < j; a++) {
+        uint32_t n = 0;
+        for (size_t b = i; b < j; b++) n += cells[b].mat == cells[a].mat;
+        if (n > bestN) {
+          bestN = n;
+          best = cells[a].mat;
+        }
+      }
+      r.stopMat = best;
+      return r;
+    }
+    r.leftJ -= price;
+    r.spentJ += price;
+    for (size_t a = i; a < j; a++) {
+      tally(cells[a].mat, costOf(cells[a].mat) * norm);
+      r.cells++;
+    }
+    i = j;
+  }
+  if (i < cells.size()) {
+    // Past the bin bound: it stops there, as if at a wall.
+    r.binStop = nBins;
+    r.tStop = (t0 + (float)nBins) / s;
+    r.stopMat = cells[i].mat;
+    return r;
+  }
+  r.exited = true;
+  r.tExit = (cells.back().t + 0.5f) / s;
+  r.tStop = r.tExit;
+  r.binStop = INT_MAX;
+  return r;
+}
+
+// The carve that follows a channel, at `scale` cells per world voxel: true =
+// KEEP. On the channel's own lattice (`scale == latScale`) the test is the
+// channel's own -- PierceInAxis, then the depth bin -- with the channel's own
+// numbers, so it removes exactly the cells that were paid; on another lattice
+// (a fine limb's collider, re-derived from the skin anyway) it is the same
+// cylinder, converted.
+struct PierceKeep {
+  Vec3 o, d;
+  float r2 = 0.0f, t0 = 0.0f, binLen = 1.0f;
+  int binStop = 0;
+  bool operator()(float x, float y, float z) const {
+    float t = 0.0f;
+    if (!PierceInAxis(x, y, z, o, d, r2, t)) return true;
+    if (binStop == INT_MAX) return false;
+    const int bin = binLen == 1.0f ? (int)std::floor(t - t0)
+                                   : (int)std::floor((t - t0) / binLen);
+    return bin >= binStop;
+  }
+};
+// `t0Lat` / `binStop` are PierceChannelResult's (the channel lattice's units).
+inline PierceKeep PierceKeepAt(Vec3 oLocal, Vec3 dLocal, float latScale,
+                               float rCells, float t0Lat, int binStop,
+                               float scale) {
+  PierceKeep k;
+  const float dl = dLocal.len();
+  k.d = dl > 1e-6f ? dLocal * (1.0f / dl) : Vec3{0, 0, 1};
+  k.binStop = binStop;
+  const float s = std::max(latScale, 1e-3f);
+  if (scale == s) {
+    // The channel's own expressions, verbatim.
+    k.o = oLocal * s;
+    k.r2 = rCells * rCells;
+    k.t0 = t0Lat;
+    k.binLen = 1.0f;
+    return k;
+  }
+  const float kk = scale / s;
+  k.o = oLocal * scale;
+  k.r2 = (rCells * kk) * (rCells * kk);
+  k.t0 = t0Lat * kk;
+  k.binLen = kk;
   return k;
 }

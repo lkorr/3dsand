@@ -130,6 +130,13 @@ inline constexpr CauseRow kCauseRows[] = {
   // budget and nothing it charges carves.
   {DamageCause::Asphyxia, false, true,  BleedRate::None,    false, true,  true,  true,  false, JointRule::Always,     false, true,  true,  true,  false, false, false},
   {DamageCause::Asphyxia, true,  true,  BleedRate::None,    false, true,  true,  true,  false, JointRule::IfInfected, true,  false, false, false, true,  false, false},
+  // PIERCE (docs/PLAN_projectiles.md B, Mob::PierceLimb): Beam's rows. A
+  // channel is a BORE like the laser's, so it bleeds like a cut and charges
+  // the brain, and it parts nothing by the blade's cut-through rule: a limb an
+  // arrow takes off comes off by collapse or connectivity, the geometry's own
+  // rules, never because a point "came out the other side".
+  {DamageCause::Pierce,   false, true,  BleedRate::Full,    true,  true,  true,  true,  false, JointRule::Always,     false, true,  true,  true,  false, false, false},
+  {DamageCause::Pierce,   true,  true,  BleedRate::Full,    false, true,  true,  true,  false, JointRule::IfInfected, true,  false, false, false, true,  false, false},
 };
 // clang-format on
 

@@ -164,6 +164,10 @@ inline ShellRow ShellRowOf(DamageCause cause, const Tuning::Gear& g) {
     case DamageCause::Infection:
     case DamageCause::Electric:
     case DamageCause::Asphyxia:
+    // PIERCE prices a shell itself, cell by cell, by the same hardness ratio
+    // (phys/kerf.h PierceChannel): the plate is in the channel, not a scale
+    // on it, so the row is the identity.
+    case DamageCause::Pierce:
     case DamageCause::Count:
       r.carve = {ShellCurve::One};
       r.passed = {ShellCurve::Zero};
