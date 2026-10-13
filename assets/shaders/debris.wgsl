@@ -431,7 +431,7 @@ fn fsBody(in : BodyVSOut) -> @location(0) vec4f {
   if (veil.on) {
     col = waterVeilApply(veil, lit + add, dist);
   } else {
-    col = bodyAirFog(lit, in.world, R) + add;
+    col = bodyAirFog(lit, in.world, R, in.misc.z) + add;
   }
   // Same tonemap as fs() and as the terrain: a cube must match the ground it
   // lands on at any time of day.

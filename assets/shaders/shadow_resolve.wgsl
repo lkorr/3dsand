@@ -616,8 +616,10 @@ fn farGiRadiance(m : u32, axis : i32, d : vec3f, litW : f32) -> vec3f {
   let albedo = (unpackColor(mt.color0) + unpackColor(mt.color1) + unpackColor(mt.color2)) *
                (1.0 / 3.0);
   let nH = axisVec(axis, -sign(axisPick(d, axis)));
-  return irrSample(albedo, nH, keyLightDirP(R), keyLightColorP(R), litW,
-                   f32(mt.emission) / 255.0);
+  // The MEAN of a burning cell's breath, as every irradiance deposit takes it
+  // (the near walk's and this pass's own near-patch deposit).
+  let bt = burnTint(mt, albedo, f32(mt.emission) / 255.0, burnTintMean());
+  return irrSample(bt.albedo, nH, keyLightDirP(R), keyLightColorP(R), litW, bt.emis);
 }
 // One gather ray through `level` from `ro` (fine voxels): its radiance
 // toward the patch, coverage-weighted (see above).

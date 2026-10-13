@@ -932,6 +932,17 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   rp.hfogFalloff = 1.0f / std::max(tun.render.fogScaleHeight, 1.0f);
   rp.hfogBaseY = (float)worldmap::CurrentWorldMap().seaLevelY;
   rp.fogHaze = tun.render.fogHaze;
+  // THE EYE'S SKY (world.h eyeSky): depth of the eye under the terrain's
+  // ground, eased over the band raymarch.wgsl's burial test uses at level 1
+  // (FAR_BURIED_LO..HI + 2 voxels of pad).
+  rp.eyeSky = 1.0f;
+  if (!auxView && worldmap::CurrentWorldMap().Loaded()) {
+    const uint32_t seed = world.WorldSeed() != 0u ? world.WorldSeed() : kDefaultSeed;
+    const float top =
+        (float)(World::TerrainHeight((int)std::floor(eye.x), (int)std::floor(eye.z), seed) + 1);
+    const float x = std::clamp((top - eye.y - 26.0f) / 24.0f, 0.0f, 1.0f);
+    rp.eyeSky = 1.0f - x * x * (3.0f - 2.0f * x);
+  }
   rp.viewPx = viewPx;          // water ripple LOD footprint (see world.h)
   // Micro-detail animation clock + per-cell variation key (see world.h). Both
   // are render-only inputs; the tick is passed rather than `time` so a flipbook

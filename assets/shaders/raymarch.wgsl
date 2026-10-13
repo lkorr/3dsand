@@ -418,7 +418,7 @@ fn pixelAngle() -> f32 { return 2.0 * R.tanHalfFov / max(R.viewPx, 1.0); }
 // NEAR patch it is the resolve pass's penumbra window and nothing here reads
 // it; for a FAR patch it is the patch's measured indirect light
 // (shadow_resolve.wgsl THE FAR PATCH'S INDIRECT LIGHT), read by the cascade
-// shade through the bucket farSlotRead found (gFarSlot).
+// shade through the bucket its own find lands on (farGiCached).
 @group(0) @binding(47) var<storage, read> shadowHistRO : array<u32>;
 // ---- THE TERRAIN-SCALE LIGHT MAP (map v2 S1; horizon.h kL*, HZ_L_* below) ---
 // Per pyramid sample: the sun's horizon (blocker top | distance) and the sky
@@ -994,33 +994,26 @@ var<private> gFragXY : vec2f = vec2f(0.0);
 // cascade was lit like a hillside.
 //
 // THE EYE'S MEASUREMENT IS THE TERRAIN OVER IT (2026-10-13, ticket
-// 2026-10-12_20-13-42), the same burial test the cascade hits take
-// (farHitBuried at level 1, the surface map's column top): 1 under the open
-// sky, eased to 0 as the eye goes FAR_BURIED_LO..HI under the ground.
+// 2026-10-12_20-13-42): R.eyeSky, the eye's depth under the ground
+// (World::TerrainHeight on the CPU, genColumn's h exactly), eased to 0 over
+// 2.6..5.0 m -- the burial test the cascade hits take (farHitBuried) at level
+// 1, as one number per frame (support.cpp WriteRenderParams).
 // It was the openness grid's +Y byte of the first floor block under the eye,
 // one number for the whole frame, and in a cave that byte flips with a voxel
 // of eye height (the block found moves, a riser and a tread read differently)
 // -- the owner walked over a 1-2 voxel step and "the shading for this whole
 // chamber" changed, because the fog target and every buried-or-not cascade
 // hit followed it. Depth under terrain is continuous in the eye's position and
-// does not care which block it stands over.
+// does not care which block it stands over. A uniform rather than a per-pixel
+// map read: computed per pixel it cost this fragment shader registers (it is
+// read by the fog, the water's media terms and the smoke) for a value that is
+// the same for every pixel.
 // Readers: applyAerial's fog TARGET (mix toward render.enclosedAmbient, the
-// light an enclosed face keeps -- fog in a dark room is darkness) and the
-// far-hit shade's sky terms where the map has no column (outside the level's
-// valid box). The fog FRACTION is untouched: what the air hides is still
-// hidden, it just is not sky-coloured.
-// Uniform per frame (same addresses for every pixel), computed once per pixel
-// on first use. Render-only, never hashed.
-var<private> gEyeSkyK : f32 = -1.0;
-fn eyeSkyKCompute() -> f32 {
-  if (TUNE_OPENNESS_STRENGTH <= 0.0) { return 1.0; }
-  let bw = farHitBuried(1u, R.camPos, vec3f(0.0, 1.0, 0.0));
-  return select(1.0 - bw, 1.0, bw < 0.0);
-}
-fn eyeSkyK() -> f32 {
-  if (gEyeSkyK < 0.0) { gEyeSkyK = eyeSkyKCompute(); }
-  return gEyeSkyK;
-}
+// light an enclosed face keeps -- fog in a dark room is darkness), the media
+// terms (THE MEDIUM'S SKY) and the far-hit shade's sky terms where the map has
+// no column. The fog FRACTION is untouched: what the air hides is still
+// hidden, it just is not sky-coloured. Render-only, never hashed.
+fn eyeSkyK() -> f32 { return R.eyeSky; }
 // THE HIT'S OWN SKY, for the fog target: an enclosed eye looking out of a
 // doorway at a sunlit hillside must still fog that hillside toward the sky.
 // Set by the primary shade before it fogs -- near and cascade hits alike from
@@ -5839,12 +5832,25 @@ fn farFeatCell(fq : vec4<u32>, level : u32, vc : vec3<i32>, ro : vec3f, rd : vec
   let yLo = min(ro.y + rd.y * tA, ro.y + rd.y * tB);
   let keep = farFeatKeep(tA);
   var best = tB;
+  // THE GROUND THE PLANT STANDS ON, from the surface map (2026-10-13, ticket
+  // 2026-10-12_16-52-07). The word keeps the plant's top MOD 256 (eight bits)
+  // and this used to place it at the y nearest the CELL being walked -- right
+  // for a cell on the ground, wrong for any material cell that is not: the
+  // pillars and the floor of heather_cairn's hall, 15 m under the moor whose
+  // heather the words describe, unwrapped the moor's plants into the hall, and
+  // their cards stood there as thin vertical green and purple lines. The
+  // entry's top is the column's ground (procgen's, whatever VALID says), so the
+  // plant's top is that plus its height; a word whose low byte disagrees is
+  // not this ground's (an edited or raised column) and draws nothing.
+  let gq = farMap[farMapCell(level, vc.xz)];
   for (var q = 0u; q < 4u; q++) {
     // Component by SELECT, never fq[i] (farRefineCell says why).
     let e = select(select(fq.x, fq.y, q == 1u), select(fq.z, fq.w, q == 3u), q >= 2u);
     let hg = i32((e >> 8u) & 15u);
     if (hg == 0) { continue; }
-    let topF = y0 + (((i32(e & 255u) - y0 + 128) & 255) - 128);
+    let ge = select(select(gq.x, gq.y, q == 1u), select(gq.z, gq.w, q == 3u), q >= 2u);
+    let topF = farMapTop(ge) + hg;
+    if ((u32(topF) & 255u) != (e & 255u)) { continue; }
     // A SOLID word is a stalk, drawn by the surface map's refine (it is
     // part of the heightfield): the word is there for fardown's cut check.
     if ((e & FAR_FEAT_SOLID) != 0u) { continue; }
@@ -6959,6 +6965,49 @@ fn farShadowCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
   return select(1.0, r.x, r.y > 0.0);
 }
 
+// The far patch's measured indirect light (shadow_resolve.wgsl THE FAR PATCH'S
+// INDIRECT LIGHT), irradiance per unit albedo, or 0 while the patch has no
+// published answer. The same key as farShadowCached, so a pixel the sun term
+// already registered finds its slot in the plain read; a buried face turned
+// from the sun registers it here (farSlotRead's request path), which is what
+// keeps a cave wall's light coming at night.
+fn farGiCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
+               refined : bool, hitP : vec3f) -> vec3f {
+  let s = f32(1u << farCellShift(level));
+  let face = shadowFaceOf(axis, sgn < 0.0);
+  let tg = shadowFaceTangents(face);
+  let m = f32(FAR_SC_SUBDIV);
+  let f = clamp(hitP / s - vec3f(cell), vec3f(0.0), vec3f(1.0));
+  let ix = u32(min(floor(axisPick(f, i32(tg.x)) * m), m - 1.0));
+  let iy = u32(min(floor(axisPick(f, i32(tg.y)) * m), m - 1.0));
+  let sub = shadowPackSub(ix, iy) | select(0u, FAR_SC_REFINED, refined) | FAR_SC_FLAG |
+            ((level - 1u) << FAR_SC_LEVEL_SHIFT);
+  let packedCell = farScPackCell(cell, face);
+  let key = shadowPatchKey(packedCell, sub);
+  let ver = shadowPatchVerifier(packedCell, sub);
+  let curFrame = R.frameIdx & 15u;
+  let fp = shadowFindPlain(key, ver, shadowSetOf(key));
+  if (fp.x == 0xFFFFFFFFu) {
+    // Not found: claim and request it (shadowSlotRead's path), none this frame.
+    _ = shadowSlotRead(packedCell, sub, curFrame);
+    return vec3f(0.0);
+  }
+  // farSlotRead's registration, verbatim: re-requested on its refresh phase
+  // (the sun's share of its light moves) or while unresolved, and kept LIVE.
+  let state = fp.y;
+  if ((!shadowStateValid(state) || shadowRefreshDue(key)) &&
+      shadowStateRequested(state) != curFrame) {
+    let r = atomicCompareExchangeWeak(
+        &shadowCache[fp.x * 2u + 1u], state,
+        shadowPackState(state & 0xFFu, shadowStateResolved(state), curFrame,
+                        shadowStateValid(state), ver));
+    if (r.exchanged) { shadowAppendRequest(key, fp.x, packedCell, sub); }
+  }
+  if (!shadowStateValid(state)) { return vec3f(0.0); }
+  let gw = shadowHistRO[fp.x];
+  return select(vec3f(0.0), unpackRgb9e5(gw), gw != 0u);
+}
+
 // ---- far-field ambient occlusion: voxelAO's rule over cascade cells ----------
 // Mirrors voxelAO (below) tap for tap so a terrace riser darkens the same way
 // on both sides of the window edge: two tangent neighbours in the plane in
@@ -7930,7 +7979,8 @@ fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>, albedo : vec3f) -> vec3f {
     // The closed form is OPEN terrain's bounce (a lit tread in front): under
     // the ground it is daylight that is not there (NO MEASUREMENT YET IS NOT
     // OPEN SKY UNDERGROUND, in fs). Scaled out by the same burial test.
-    return farGiIrradiance(albedo, n) * (1.0 - max(farHitBuried(1u, p, n), 0.0));
+    // gHitSky: this hit's 1 - burial, set by the near shade before the gather.
+    return farGiIrradiance(albedo, n) * gHitSky;
   }
   let face = openFaceOfNormal(n);
   let lo = vec3<u32>(cell & vec3<i32>(i32(CHUNK) - 1));
@@ -8482,7 +8532,6 @@ fn shadowSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
 // re-registration. Far patches are re-cast only every SHADOW_REFRESH_PERIOD
 // frames on their key's phase (or while unresolved), so only then does a
 // pixel stamp the slot and append; every other frame is the plain find alone.
-var<private> gFarSlot : u32 = 0xFFFFFFFFu;
 fn farSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
   let key = shadowPatchKey(packedCell, packedSub);
   let ver = shadowPatchVerifier(packedCell, packedSub);
@@ -8490,9 +8539,6 @@ fn farSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
   let slot = f.x;
   let state = f.y;
   if (slot == 0xFFFFFFFFu) { return shadowSlotRead(packedCell, packedSub, curFrame); }
-  // The bucket, for the patch's side word -- only once the resolve pass has
-  // published this patch, which is also when it has written that word.
-  if (shadowStateValid(state)) { gFarSlot = slot; }
   if ((!shadowStateValid(state) || shadowRefreshDue(key)) &&
       shadowStateRequested(state) != curFrame) {
     let r = atomicCompareExchangeWeak(
@@ -9524,7 +9570,44 @@ fn reflectionSky(rd : vec3f) -> vec3f {
 //
 // `blur` is the reflected-lobe width in RADIANS (waterReflBlur); 0 = a perfect
 // mirror and reproduces the old lookup exactly.
+// ---- THE MEDIUM'S SKY (2026-10-13, the dungeons' water and smoke) --------
+// Everything a surface shade draws is lit by the terms that know where the
+// surface is (openness, the shadow cache, the gather). Several things the
+// renderer draws are NOT surfaces and were authored as COLOURS instead: water's
+// in-scatter (WATER_SCATTER / liquidOptics), the sky a reflection falls back to
+// when its ray finds nothing, a smoke plume's tint, the sun glint. Under the
+// open noon sky those colours are right, and that is where they were tuned. In
+// the flooded hall of heather_cairn (15 m under a moor, midnight) the pool
+// still glowed turquoise and mirrored a daylight sky; in a sealed cave a plume
+// is the pale grey of a noon cloud.
+// The sky weight is the FOG's (fogSkyK: 1 wherever the eye or the hit the
+// pixel resolved is under the open sky, the burial test's 1 - depth-under-
+// terrain otherwise), so the media and the air in front of them agree -- and
+// it is a value this fragment shader already holds for the fog, which matters:
+// a sky weight computed at each water interface and carried into the shade
+// took the raymarch fs from 128 to 168 registers (--shader-stats), past the
+// occupancy cliff every budget camera pays for.
+// The light a MEDIUM is bathed in, as a fraction of the daylight its authored
+// colour was tuned under: the sky dome and the key light on an up face (the
+// downwelling light of the open sky), weighted by `skyK`, plus the enclosed
+// ambient where the sky cannot reach. The reference is the open sky with the
+// sun half-way up -- every daytime hour from there to noon saturates at 1, so
+// the tuned day look is exactly what it was, and dusk, night and a cave take
+// the share of the light that is really there.
+fn mediaLightK(skyK : f32) -> f32 {
+  let lw = vec3f(0.2126, 0.7152, 0.0722);
+  let up = vec3f(0.0, 1.0, 0.0);
+  let lit = dot(ambientAt(up), lw) + dot(keyLightColor(), lw) * max(keyLightDir().y, 0.0);
+  let refL = dot(TUNE_AMB_SKY, lw) + dot(TUNE_SUN_COLOR, lw) * TUNE_SUN_INTENSITY * 0.5;
+  let encl = dot(TUNE_ENCLOSED_AMBIENT, lw);
+  return clamp((lit * skyK + encl * (1.0 - skyK)) / refL, 0.0, 1.0);
+}
 fn reflectionSkyBlur(rd : vec3f, blur : f32) -> vec3f {
+  // A sky the reflecting point cannot see is the enclosure's own dark
+  // (THE MEDIUM'S SKY, above): the ceiling of a flooded hall, not daylight.
+  return mix(TUNE_ENCLOSED_AMBIENT * 0.5, reflectionSkyOpen(rd, blur), fogSkyK());
+}
+fn reflectionSkyOpen(rd : vec3f, blur : f32) -> vec3f {
   var d = rd;
   if (d.y < 0.02) { d.y = 0.02; }
   // Body-free: the sun and moon discs are handled by the dedicated glint lobe
@@ -9622,7 +9705,22 @@ fn shadeSecondaryHit(h : OpaqueHit) -> vec3f {
                     burnTintWeight(h.cell, R.time));
   albedo = bt.albedo;
   let lam = wrapDiffuse(dot(rn, keyLightDir()), 0.55);
-  var c = albedo * face * (ambientAt(rn) + keyLightColor() * lam * 0.52);
+  // THE PRIMARY SHADE'S SKY TERMS, at the reflected hit (2026-10-13). It had
+  // the bare hemisphere ambient and half the sun, so the ceiling of a sealed
+  // hall reflected in its own flooded floor was lit like a noon meadow. The
+  // hit's openness (bilinear in its face plane, as the primary reads it; the
+  // burial test where the walk has not measured it) scales the sky term and
+  // adds the enclosed one (ambientOpen), and caps the key light the way
+  // shadowLiftCap caps an unshadowed reading -- no shadow ray at this budget,
+  // but no sun through rock either.
+  let rp = vec3f(h.cell) + vec3f(0.5) + rn * 0.5;
+  var ro = opennessAt(h.cell, rp, rn, &openness, &opennessGen);
+  if (ro < 0.0) {
+    let bw = farHitBuried(1u, rp, rn);
+    ro = select(-1.0, 1.0 - bw, bw >= 0.0);
+  }
+  var c = albedo * face * (ambientOpen(ambientAt(rn), opennessScale(ro), ro) +
+                           keyLightColor() * lam * 0.52 * shadowLiftCap(1.0, ro));
   let emis = bt.emis;
   if (emis > 0.0) { c += albedo * emis * 1.7; }
   return c;
@@ -10399,8 +10497,11 @@ fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
   // makes the water itself as bright as a sunlit surface, which flattens the
   // entire view into one luminance and is what "washed out" looks like.
   let sunUp = clamp(keyLightDir().y * 1.5, 0.05, 1.0);
+  // ... and only where the sky reaches the water (THE MEDIUM'S SKY): a flooded
+  // cave is black water, whatever the hour outside.
   let ambientWater =
-      scatterCol * keyLightColor() * sunUp * TUNE_SUB_SCATTER_GAIN * 0.45;
+      scatterCol * (keyLightColor() * sunUp * TUNE_SUB_SCATTER_GAIN * 0.45 * fogSkyK() +
+                    TUNE_ENCLOSED_AMBIENT * (1.0 - fogSkyK()));
 
   // ---- the surface, seen from underneath (Snell's window) ----
   // A ray that reached the sky left through the underside of the surface, and
@@ -11032,7 +11133,10 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   }
 
   var absorbK = optics.absorbK;
-  var scatter = optics.scatter;
+  // The column's in-scatter is LIGHT, not a paint (THE MEDIUM'S SKY): what the
+  // sky and the key light put into the water, so a pool in a sealed hall or a
+  // lake at midnight is dark water, not the noon turquoise at full strength.
+  var scatter = optics.scatter * mediaLightK(fogSkyK());
   // Dissolved matter (solLookAt): the body absorbs the tint's complement and
   // scatters toward the tint, by concentration, and a glowing species adds
   // its own light to what comes up through the surface. Resolved here, where
@@ -11118,7 +11222,8 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // underneath it.
     // Tinted by the key light so the track is amber at sunset and cold blue
     // under the moon, matching whatever is actually casting it.
-    let gl = waterGlint(n, v, hitP, fres);
+    // No sun or moon to glint where the sky cannot reach (THE MEDIUM'S SKY).
+    let gl = waterGlint(n, v, hitP, fres) * fogSkyK();
     color += gl;
   }
 
@@ -13490,8 +13595,10 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   // Squaring the albedo into the scatter tint is what keeps deep water
   // SATURATED: single-scatter with a flat albedo washes toward the light's
   // own (near-white) colour, and the pool read as grey milk.
+  // Lit by the sky and the key light only where they reach (THE MEDIUM'S SKY).
   var body = gcol * mix(gcol, vec3f(1.0), 0.25) *
-             (ambientAt(vec3f(0.0, 1.0, 0.0)) * 0.85 + keyLightColor() * 0.35);
+             ((ambientAt(vec3f(0.0, 1.0, 0.0)) * 0.85 + keyLightColor() * 0.35) * fogSkyK() +
+              TUNE_ENCLOSED_AMBIENT * (1.0 - fogSkyK()));
   // The particles' own liquid through the one optics model: the authored MPM
   // look above is its clear-water end, so water is untouched and a murky
   // liquid shades with the same derived coefficients its pool would have.
@@ -13505,7 +13612,7 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
     let co = liquidClearBlend(liquidOptics(materials[caMat]),
                               WATER_ABSORB, WATER_SCATTER);
     absorb = mix(absorb, co.absorbK, caFrac);
-    body = mix(body, co.scatter, caFrac);
+    body = mix(body, co.scatter * mediaLightK(fogSkyK()), caFrac);
   }
   // Dissolved matter along the column (solPathLook), as shadeWater and
   // shadeSubmerged apply it: a blood cloud under a swimmer whose wake excited
@@ -13900,7 +14007,8 @@ fn shadeFarWater(hitP : vec3f, rd : vec3f, m : Material, nFace : vec3f,
     lit *= veilCaustic(waterCausticCurv(hitP, rd, bed.path, depthM), depthM);
   }
   let trans = exp(-optics.absorbK * depthM);
-  let refracted = lit * trans + optics.scatter * (vec3f(1.0) - trans);
+  // shadeWater's in-scatter law (THE MEDIUM'S SKY): light, not paint.
+  let refracted = lit * trans + optics.scatter * mediaLightK(fogSkyK()) * (vec3f(1.0) - trans);
   // Same rough-mirror lobe as shadeWater's open water (waterReflBlur): the
   // cascade is always far, so this is where the stars average out.
   var reflBlur = 0.0;
@@ -13909,7 +14017,7 @@ fn shadeFarWater(hitP : vec3f, rd : vec3f, m : Material, nFace : vec3f,
   var color = mix(refracted, reflection, fres);
   dbgWater(fres, refracted, reflection, lit, depthM);
   if (up) {
-    let gl = waterGlint(n, v, hitP, fres);
+    let gl = waterGlint(n, v, hitP, fres) * fogSkyK();
     color += gl;
     let foamA = waterFoam(hitP, depthM, 0.0);
     if (foamA > 0.0) {
@@ -15546,6 +15654,13 @@ fn fs(in : VSOut) -> FSOut {
       // the heightfield and are never buried. Also feeds the fog target
       // (gHitSky).
       var buriedF = 0.0;
+      if (!fFeat && m.klass == CLASS_LIQUID) {
+        // A far LIQUID's own sky (gHitSky), which the fog target and the
+        // water's media terms read (THE MEDIUM'S SKY): a pool down a dungeon
+        // hall is not under the open sky either.
+        let bwL = farHitBuried(flv, hitP, vec3f(0.0, 1.0, 0.0));
+        gHitSky = select(1.0, 1.0 - bwL, bwL >= 0.0);
+      }
       if (!fFeat && m.klass != CLASS_LIQUID) {
         let bw = farHitBuried(flv, hitP, n);
         buriedF = max(bw, 0.0);
@@ -15561,7 +15676,7 @@ fn fs(in : VSOut) -> FSOut {
             featBounce *= eyeK;
           }
         }
-      } else {
+      } else if (fFeat) {
         gHitSky = 1.0;
       }
       // Same wrapped diffuse as the near field — a different falloff here is a
@@ -15571,18 +15686,6 @@ fn fs(in : VSOut) -> FSOut {
       if (lamSm >= 0.0 && !farWater) { lambert = mix(lambert, lamSm, wN); }
       let dbgLamPreF = lambert;
       var dbgShF = 1.0;
-      // THE FAR PATCH, READ ONCE: its shadow for the sun term below and, for a
-      // buried hit, its measured indirect light (shadow_resolve.wgsl THE FAR
-      // PATCH'S INDIRECT LIGHT) -- asked for even where the sun term is not
-      // wanted (a face turned from the sun, a night), or a cave wall would
-      // never register the patch that carries its light.
-      let wantFarGi = SHADOW_CACHE && FAR_SHADOW_CACHE && TUNE_GI_STRENGTH > 0.0 &&
-                      buriedF > 0.0;
-      var shPatch = 1.0;
-      if (SHADOW_CACHE && FAR_SHADOW_CACHE &&
-          ((lambert > 0.0 && (R.flags & 1u) != 0u) || wantFarGi)) {
-        shPatch = farShadowCached(flv, far.cell, far.axis, far.sgn, fRefined || fFeat, hitP);
-      }
       if (lambert > 0.0 && (R.flags & 1u) != 0u) {
         // start the shadow march just off the hit face, in fine-voxel coords
         var hp = R.camPos + rd * (far.t - 1e-3) + n * (0.55 * sL);
@@ -15618,7 +15721,7 @@ fn fs(in : VSOut) -> FSOut {
           // The far patch cache (FAR_SHADOW_CACHE, ON since 2026-10-06): the march
           // is compiled out of fs. A card reads its cell's top patch, lifted
           // as a refined hit's is.
-          sh = shPatch;
+          sh = farShadowCached(flv, far.cell, far.axis, far.sgn, fRefined || fFeat, hitP);
         } else {
           let fsh = farShadowMarch(flv, hp, keyLightDir(), 0.0);
           if (fsh.t >= 0.0) {
@@ -15732,11 +15835,13 @@ fn fs(in : VSOut) -> FSOut {
         // the burial took out of the open-terrain closed form above, put back
         // as the patch's nine-ray gather -- the cascade's twin of giBounceAt,
         // emitters and daylight through a mouth included.
-        if (wantFarGi && gFarSlot != 0xFFFFFFFFu) {
-          let gw = shadowHistRO[gFarSlot];
-          if (gw != 0u) {
-            dbgGiF += ao * buriedF * albedo * unpackRgb9e5(gw) * TUNE_GI_STRENGTH;
-          }
+        // Its own read of the patch (farGiCached), not one carried from the sun
+        // term above: a value live across the shade cost this fragment shader
+        // 16 B of spill and ~0.1-0.25 ms on every budget camera, and a buried
+        // face turned from the sun never reaches the sun term at all.
+        if (SHADOW_CACHE && FAR_SHADOW_CACHE && buriedF > 0.0) {
+          dbgGiF += ao * buriedF * albedo * TUNE_GI_STRENGTH *
+                    farGiCached(flv, far.cell, far.axis, far.sgn, fRefined || fFeat, hitP);
         }
         color += dbgGiF;
       }
@@ -15984,20 +16089,20 @@ fn fs(in : VSOut) -> FSOut {
     // field's own value and the right fallback; in a cave it lit freshly
     // streamed walls with daylight until the walk caught up, a flash that moved
     // with the camera. So the fallback is the cascade's own estimate, the
-    // burial test the far hits take (1 under the open sky: unchanged outdoors).
-    if (openRaw < 0.0) {
-      let bw = farHitBuried(1u, hp, openN);
-      if (bw > 0.0) { openRaw = (1.0 - bw) * hzSkyVis(hp); }
-    }
+    // burial test the far hits take (1 under the open sky: unchanged
+    // outdoors), applied just below where that test runs.
     // The fog target's say from this hit (gHitSky): the far map's burial
     // test at level 1 (farHitBuried), NOT the openness byte. The byte's fan
     // stops at render.opennessReach (12 m), so a face far down a 34 m hall
     // whose diagonals run the length of it reads partly "open", and taking
     // that for sky fogged the vault at the end of the Tarn Cairn's hall blue.
     // No map answer is 0 -- "the eye decides". (Under an open sky the eye
-    // says 1, so outdoors this changes nothing.)
+    // says 1, so outdoors this changes nothing.) ONE burial test per near hit:
+    // the no-measurement fallback, the fog and the gather (giBounceAt's
+    // unstamped arm) all read it.
     let nb = farHitBuried(1u, hp, openN);
     gHitSky = select(0.0, 1.0 - nb, nb >= 0.0);
+    if (openRaw < 0.0 && nb > 0.0) { openRaw = (1.0 - nb) * hzSkyVis(hp); }
     var lambert = wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP);
     let dbgLamPreN = lambert;
     var dbgShN = 1.0;
@@ -16481,6 +16586,15 @@ fn fs(in : VSOut) -> FSOut {
     let mm = materials[mediaMat];
     var mc = (unpackColor(mm.color0) + unpackColor(mm.color1)) * 0.5;
     if (mediaTau > 1e-5) { mc = mediaTint / mediaTau; }
+    // A PLUME IS LIT (THE MEDIUM'S SKY): its tint is what it looks like under
+    // the open daytime sky, and at night or under the ground it gets the share
+    // of that light which is there (the fog's sky weight, as for the air in
+    // front of it). Flame is its own light:
+    // the fire's share of the column (the glow below, as it will be weighted)
+    // keeps the authored tint.
+    let gSky = fogSkyK();
+    let fireW = select(0.0, 1.0 - exp(-h.fireGlow * TUNE_FIRE_GLOW_RATE), h.fireMat != 0u);
+    mc *= mix(mediaLightK(gSky), 1.0, fireW);
     let tau = mediaTau * VOXEL_METERS * MEDIA_ABSORB;
     let a = 1.0 - exp(-tau);
     color = mix(color, mc, a);

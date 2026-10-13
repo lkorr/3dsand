@@ -3828,7 +3828,15 @@ struct RenderParams {
   // surface's airlight (raymarch.wgsl applyAerial). Fills the row fluidLo opens.
   float fogHaze = 0.0f;
   int32_t fluidHi[3] = {-1, -1, -1};
-  int32_t pad_fb1 = 0;
+  // Spent from pad_fb1 (2026-10-13): THE EYE'S SKY, 1 under the open sky,
+  // eased to 0 as the eye goes 2.6..5.0 m under the terrain's ground
+  // (World::TerrainHeight, which is genColumn's h exactly). raymarch.wgsl
+  // eyeSkyK reads it for the fog target and the media terms; it was a per-pixel
+  // probe of the openness byte under the eye, which flipped with a voxel of eye
+  // height (ticket 2026-10-12_20-13-42), then a per-pixel read of the far
+  // surface map, which cost the fragment shader registers for a value that is
+  // one number per frame. 1 for an aux view.
+  float eyeSky = 1.0f;
 
   // ---- wind (docs/RESEARCH_wind.md §4.2 — must match RenderParams in
   // common.wgsl) ----

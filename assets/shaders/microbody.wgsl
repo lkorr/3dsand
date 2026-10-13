@@ -837,7 +837,7 @@ fn fs(in : VSOut) -> FSOut {
   if (veil.on) {
     col = waterVeilApply(veil, lit + add, dist);
   } else {
-    col = bodyAirFog(lit, worldPos, R) + add;
+    col = bodyAirFog(lit, worldPos, R, open.y) + add;
   }
 
   // ---- reversed-Z depth, EXACTLY raymarch.wgsl's convention ----

@@ -1690,7 +1690,7 @@ struct RenderParams {
   fluidLo    : vec3<i32>,
   fogHaze    : f32,    // render.fogHaze (H1): the blue share of part-fogged airlight
   fluidHi    : vec3<i32>,
-  _pfb1      : i32,
+  eyeSky     : f32,    // the eye's sky weight (world.h; raymarch.wgsl eyeSkyK)
   // ---- wind (docs/RESEARCH_wind.md §4.2 — must match RenderParams in
   // world.h) ----
   // The evolving half of the wind field: everything else about it is a TUNE_*
@@ -2406,7 +2406,7 @@ fn litColorS(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
              R : RenderParams, openScale : f32, openRaw : f32,
              sh : f32) -> vec3f {
   return bodyAirFog(litColorSNoFog(albedo, n, worldPos, emission, R, openScale,
-                                   openRaw, sh), worldPos, R);
+                                   openRaw, sh), worldPos, R, openRaw);
 }
 
 // litColorS without the air fog. A body seen THROUGH a water surface takes its
@@ -2474,7 +2474,14 @@ fn airFogFrac(R : RenderParams, distM : f32, dirY : f32) -> f32 {
 }
 
 // The raster bodies' air fog, the tail litColorS always had.
-fn bodyAirFog(c : vec3f, worldPos : vec3f, R : RenderParams) -> vec3f {
+// `openRaw` is the body's openness probe (opennessAtBody .y; -1 = none): the
+// terrain fogs toward the light the AIR holds, which under the ground is the
+// enclosed ambient and not the sky (raymarch.wgsl applyAerial, fogSkyK), and a
+// mob in a cave fogged toward daylight blue against the black wall behind it
+// (the dungeons' "creature fog still sky-coloured", 2026-10-12). A body whose
+// ground sees (almost) no sky takes the enclosed target too; anything with
+// more than a sliver of sky over it keeps the old one.
+fn bodyAirFog(c : vec3f, worldPos : vec3f, R : RenderParams, openRaw : f32) -> vec3f {
   let dv = worldPos - R.camPos;
   let dist = length(dv);
   // The one air law (airFogFrac). A portrait (an aux view) uploads no air and
@@ -2483,8 +2490,11 @@ fn bodyAirFog(c : vec3f, worldPos : vec3f, R : RenderParams) -> vec3f {
   // cheap sky tint for fog, dimmed through the night like the real sky (a
   // fixed day-blue tint here was a second source of midnight glow). Both moons
   // count, and an eclipse dims it with everything else.
-  let fogTint = vec3f(0.55, 0.65, 0.85) *
+  var fogTint = vec3f(0.55, 0.65, 0.85) *
                 mix(0.015 + 0.05 * R.moonLit, 1.0, R.dayWeight);
+  if (openRaw >= 0.0) {
+    fogTint = mix(TUNE_ENCLOSED_AMBIENT, fogTint, smoothstep(0.0, 0.12, openRaw));
+  }
   return mix(c, fogTint, fog);
 }
 
