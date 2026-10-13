@@ -129,7 +129,8 @@
             "keep": true
           }
         ]
-      }
+      },
+      "hips": null
     },
     "becomes": {
       "mushroom_stem": "synth_shell",
@@ -138,7 +139,9 @@
       "petal_red": "neural_core",
       "petal_pink": "power_cell"
     },
-    "garmentsBecome": null
+    "garmentsBecome": null,
+    "paintBecomes": null,
+    "carve": null
   },
   "gait": {
     "rideHeight": 1.174
@@ -369,7 +372,7 @@
     {
       "name": "held_right",
       "offset": [
-        6,
+        9,
         66,
         10
       ]
@@ -440,181 +443,7 @@
   ],
   "clips": {
     "walk": {
-      "durationMs": 666,
-      "mask": [
-        "armU.L",
-        "armL.L",
-        "armU.R",
-        "armL.R",
-        "torso"
-      ],
-      "tracks": {
-        "armU.L": {
-          "rot": [
-            {
-              "t": 0,
-              "q": [
-                0.1149,
-                0,
-                0,
-                0.9934
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 333,
-              "q": [
-                -0.1149,
-                0,
-                0,
-                0.9934
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 666,
-              "q": [
-                0.1149,
-                0,
-                0,
-                0.9934
-              ]
-            }
-          ]
-        },
-        "armU.R": {
-          "rot": [
-            {
-              "t": 0,
-              "q": [
-                -0.1149,
-                0,
-                0,
-                0.9934
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 333,
-              "q": [
-                0.1149,
-                0,
-                0,
-                0.9934
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 666,
-              "q": [
-                -0.1149,
-                0,
-                0,
-                0.9934
-              ]
-            }
-          ]
-        },
-        "armL.L": {
-          "rot": [
-            {
-              "t": 0,
-              "q": [
-                -0.1149,
-                0,
-                0,
-                0.9934
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 333,
-              "q": [
-                -0.1977,
-                0,
-                0,
-                0.9803
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 666,
-              "q": [
-                -0.1149,
-                0,
-                0,
-                0.9934
-              ]
-            }
-          ]
-        },
-        "armL.R": {
-          "rot": [
-            {
-              "t": 0,
-              "q": [
-                -0.1977,
-                0,
-                0,
-                0.9803
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 333,
-              "q": [
-                -0.1149,
-                0,
-                0,
-                0.9934
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 666,
-              "q": [
-                -0.1977,
-                0,
-                0,
-                0.9803
-              ]
-            }
-          ]
-        },
-        "torso": {
-          "rot": [
-            {
-              "t": 0,
-              "q": [
-                0,
-                -0.0184,
-                0,
-                0.9998
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 333,
-              "q": [
-                0,
-                0.0184,
-                0,
-                0.9998
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 666,
-              "q": [
-                0,
-                -0.0184,
-                0,
-                0.9998
-              ]
-            }
-          ]
-        }
-      }
+      "durationMs": 666
     },
     "run": {
       "durationMs": 338
@@ -629,6 +458,32 @@
       "race": "android",
       "sex": "male",
       "bust": 0,
+      "bra": {
+        "style": "classic",
+        "cover": 1,
+        "cupSize": 1,
+        "cupLift": 0,
+        "bridge": 0,
+        "bridgePos": 0.5,
+        "taper": 0,
+        "plunge": 0,
+        "bandPos": 0,
+        "band": 1,
+        "wrap": 0,
+        "straps": "classic",
+        "strapWidth": 0.75,
+        "strapSet": 0.45,
+        "tone": "cloth"
+      },
+      "briefs": {
+        "style": "shorts",
+        "rise": 0,
+        "band": 1,
+        "leg": 0,
+        "cut": 0,
+        "back": "full",
+        "tone": "cloth"
+      },
       "heightM": 1.87,
       "hipWidth": 10,
       "shoulderWidth": 14,
@@ -695,6 +550,8 @@
       "mouthOpen": 0,
       "mouthTone": "shade",
       "lips": 0,
+      "lipTone": "lit",
+      "lipLine": false,
       "nose": 0,
       "noseWidth": 1,
       "earSize": 1,
@@ -760,6 +617,7 @@
       "cloth": "#b8303a",
       "clothShade": "#7a1e26",
       "nail": "#3a4048",
+      "lip": "#231b26",
       "root": "#4a3a2b",
       "moss": "#7f9a3e",
       "branch": "#6b5540",
@@ -781,7 +639,11 @@
       "frame": "#6a727c",
       "core": "#ff3a3a",
       "visor": "#141a22",
-      "trace": "#a82a2a"
+      "trace": "#a82a2a",
+      "horn": "#d8ccb0",
+      "hornTip": "#8a7e66",
+      "claw": "#1a1412",
+      "mark": "#4a0e0c"
     },
     "sylvan": {
       "face": "hollow",
@@ -871,6 +733,24 @@
       "fins": 0.5,
       "packs": 0.6,
       "halo": 0
+    },
+    "demon": {
+      "hornStyle": "goat",
+      "horns": 0.5,
+      "hornCurl": 0.5,
+      "hornSpread": 0.4,
+      "tail": 0.5,
+      "tailThick": 0.5,
+      "tailCurl": 0.5,
+      "tailTrail": 0.3,
+      "tailTip": "point",
+      "tailSway": 0.5,
+      "tailSpeed": 0.4,
+      "tailLag": 0.5,
+      "claws": 0.6,
+      "mottle": 0.35,
+      "glow": true,
+      "posture": "upright"
     }
   }
 }

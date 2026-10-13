@@ -31,6 +31,7 @@ import { fileURLToPath } from 'url';
 import { readVox } from '../assets/editor/vox.js';
 import * as mg from '../assets/editor/mobgen.js';
 import * as sc from '../assets/editor/sidecar.js';
+import * as SY from '../assets/editor/sylvan.js';
 import { listMobFiles, mobFile } from './mobfiles.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -1189,6 +1190,13 @@ section('L. the rig contract matches assets/mobs/human.json, the standard');
   const mine = mg.generateMob(mg.defaultGenome(), 0,
     { materials, player: tuning.player, avatar: avatarConstants(),
       name: 'human' }).sidecar;
+  // CLIPS ARE COMPARED AS A GENERATED CHARACTER RESOLVES THEM: the generator
+  // authors walk and run only, and every other clip on the human (bite
+  // 63a9e19, lunge / punch_r / punch_l b9c5de0) is inherited by design
+  // (mobgen.inheritUnmodelled, the same fill section M uses). walk and run
+  // are still compared key for key: those the generator DOES author. Only
+  // the clips, so a top-level key the generator stopped emitting still fails.
+  mine.clips = mg.inheritUnmodelled(mine, shipped).clips;
 
   for (const [k, what] of [
     ['limbs', 'the limb table — hp, sever speeds, joints, pose limits, anchors'],
@@ -1329,9 +1337,28 @@ section('M. every character on disk RESOLVES to the body its genome describes');
     // (mobgen.inheritUnmodelled: the base's other clips), which is exactly
     // what thinSidecar diffed.
     const whole = mg.inheritUnmodelled(fresh, base);
+    // THE ONE SLACK THE EMITTER GRANTS, granted here too: a clip key time
+    // under `tracks` may differ by 1 ms (sidecar.js diffAgainst: the retime
+    // rounds old*new/old, the generator lays keys at floor(period/2), so a
+    // duration-only patch lands 1 ms off for about half of all periods).
+    // Snapped to the generator's value when within it; every other number,
+    // and every key time off by more, is still exact.
+    const snapKeyTimes = (a, b, inTracks = false) => {
+      if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return a;
+      if (Array.isArray(a)) return Array.isArray(b) && a.length === b.length
+        ? a.map((x, i) => snapKeyTimes(x, b[i], inTracks)) : a;
+      const o = {};
+      for (const [kk, v] of Object.entries(a))
+        o[kk] = inTracks && kk === 't' && typeof v === 'number' &&
+                typeof b[kk] === 'number' && Math.abs(v - b[kk]) <= 1
+          ? b[kk] : snapKeyTimes(v, b[kk], inTracks || kk === 'tracks');
+      return o;
+    };
     for (const k of Object.keys(fresh)) {
       if (k === 'genome') continue;
-      const dr = diff(noNotes(resolved[k]), noNotes(whole[k]), `${name}.${k}`);
+      const got = k === 'clips' ? snapKeyTimes(noNotes(resolved[k]), noNotes(whole[k]))
+                                : noNotes(resolved[k]);
+      const dr = diff(got, noNotes(whole[k]), `${name}.${k}`);
       ok(!dr, `${name}: resolved \`${k}\` is what this genome derives`, dr);
     }
     // ...and the things the base contributes and the generator no longer
@@ -1527,12 +1554,18 @@ section('O. the sylvan race: another surface on the SAME rig');
   // 3. A HUMAN NEVER SEES THE RACE: its palette writes no sylvan slot, and a
   //    human litter rolls exactly as it did (section E pins the sequences).
   {
+    // BY COLOUR, NOT BY ZERO, as section Q does for the demon: paletteBytes
+    // writes every material's colour at its own id first, and the material
+    // list has grown past these slots (hair is id 222). The engine reads art
+    // colour only from the .col models, so that fill is ignored.
     const b = mg.generateMob(mg.defaultGenome(), 0, opts);
     const { palette } = readVox(b.vox);
-    const slots = Object.values(mg.COLOR_SLOTS).filter(v => v <= 243 && v >= 239);
-    ok(slots.every(sl => palette[(sl - 1) * 4] === 0 && palette[(sl - 1) * 4 + 1] === 0 &&
-                         palette[(sl - 1) * 4 + 2] === 0),
-       'a human writes none of the sylvan colours into its palette');
+    const hex = sl => '#' + [0, 1, 2].map(i => palette[(sl - 1) * 4 + i]
+      .toString(16).padStart(2, '0')).join('');
+    const slots = Object.entries(mg.COLOR_SLOTS).filter(([, v]) => v <= 243 && v >= 239);
+    ok(slots.every(([k, sl]) => hex(sl) !== SY.DEFAULT_COLORS[k]),
+       'a human writes none of the sylvan colours into its palette',
+       slots.map(([k, sl]) => `${k}@${sl} ${hex(sl)}`).join(', '));
   }
   // 4. THE INSIDE IS WOOD, and the eyes glow. Baked, as the Characters page
   //    and gen_mobs.mjs bake it.
@@ -1662,13 +1695,16 @@ section('P. the machine races: automaton and android on the SAME rig');
     // 4. A HUMAN NEVER SEES THE RACE: none of its colour slots in a human's
     //    palette.
     {
+      // By colour, not by zero: the material fill reaches these slots now
+      // (see the sylvan check in section O).
       const b = mg.generateMob(mg.defaultGenome(), 0, opts);
       const { palette } = readVox(b.vox);
-      const slots = Object.values(M.COLOR_SLOTS);
-      ok(slots.every(sl => palette[(sl - 1) * 4] === 0 &&
-                           palette[(sl - 1) * 4 + 1] === 0 &&
-                           palette[(sl - 1) * 4 + 2] === 0),
-         `a human writes none of the ${race} colours into its palette`);
+      const hex = sl => '#' + [0, 1, 2].map(i => palette[(sl - 1) * 4 + i]
+        .toString(16).padStart(2, '0')).join('');
+      const slots = Object.entries(M.COLOR_SLOTS);
+      ok(slots.every(([k, sl]) => hex(sl) !== M.DEFAULT_COLORS[k]),
+         `a human writes none of the ${race} colours into its palette`,
+         slots.map(([k, sl]) => `${k}@${sl} ${hex(sl)}`).join(', '));
     }
     // 5. RANDOM AND MUTANT machines are sound.
     for (const s of [1, 2, 3, 5, 8, 21]) {
