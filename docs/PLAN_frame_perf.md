@@ -315,8 +315,11 @@ are the OTHER half of this frame; they are not additive with `nomicro`.
    fixed (DESIGN.md "The far passes launch only the workgroups that work"):
    frames over 33 ms 16.5-17.1% -> 9.9-11.3%, n=3. Left on that flight:
    the 32 map columns of a plane's first slice (`farMapFill` p99 12-13 ms)
-   and window shifts at ~5 ms CPU each, ~3.3 of it eviction (not yet split
-   between the voxel and the solute layer's batches).
+   and window shifts at ~5 ms CPU each, ~3.1-3.3 of it eviction, of which
+   the solute layer's batches are only 0.21 ms (the `--frames` shift line
+   splits them out since 2026-10-13): the rest is `EvictSlots` itself on a
+   plane whose chunks the CA has touched (modified_, so stored), not yet
+   attributed further (`SANDVOX_PT_DEBUG=1` prints its `evict issue` counts).
 6. **Unbilled CPU frame-path work** — player collision runs a
    `std::function` per cell (~600 cells x dozens of calls per frame, fluid
    mirror evaluated before the kind lookup); avatar `FindClip` is a linear

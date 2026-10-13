@@ -451,6 +451,7 @@ class Stream {
   // reported by `--frames`, so re-checking it is one non-interactive command.
   struct Timing {
     double evictMs = 0;    // EvictSlots: RLE encode, store insert, copy encode
+    double evictSolMs = 0; // ...of which EvictSolutes (the solute layer's batches)
     double fillStoreMs = 0;// FillSlots' store-hit branch: decode + per-slot uploads
     double fillGenMs = 0;  // genList upload + EncodeGenList + submit
     double demoteMs = 0;   // the T+K completion: act set, sky demote, copy issue
