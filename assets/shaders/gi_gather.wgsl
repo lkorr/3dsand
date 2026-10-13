@@ -89,6 +89,97 @@ const GI_REQ_BITS : u32 = GI_REQ_HEADER + GI_REQ_CAP;   // raymarch.wgsl agrees
 // one gather and nothing can make two copies disagree.
 const GI_W_NORMAL : f32 = 0.25;
 const GI_W_RING : f32 = 0.09375;
+// The SOLID ANGLE each ray stands for, in steradians: the normal's cone out to
+// 30 degrees, 2 pi (1 - cos 30), and an eighth of the ring outside it,
+// 2 pi cos 30 / 8. The cosine-weighted shares above say how much each cone
+// counts; these say how big it is, which is what COVERAGE below needs.
+const GI_OMEGA_NORMAL : f32 = 0.8418;
+const GI_OMEGA_RING : f32 = 0.6802;
+
+// One block-face's word: face `a` of the block holding `cell`, the side a ray
+// travelling along `da` (its component on that axis) enters through. Zero for
+// a block whose slot the stamp does not vouch for: an emitter's light is only
+// meaningful under a matching stamp, and a neighbour across a chunk edge may
+// sit in a slot the window has handed to another chunk.
+fn giFaceWord(cell : vec3<i32>, a : u32, da : f32) -> vec3f {
+  let slot = chunkIndexW(cell);
+  if (opennessGen[slot] != opennessStamp(worldChunkOf(cell))) { return vec3f(0.0); }
+  let lo = vec3<u32>(cell & vec3<i32>(i32(CHUNK) - 1));
+  return unpackRgb9e5(irradiance[irrIndex(slot, subOccBitLocal(lo), 0u) + a * 2u +
+                                 select(0u, 1u, da < 0.0)]);
+}
+
+// ---- COVERAGE: A HIT IS ONE BLOCK, NOT THE WHOLE CONE (2026-10-12) ---------
+// The quadrature says "the cone this ray stands for is filled with what the
+// ray hit". For a wall or a floor that is true at any distance. For a SMALL
+// source it is false by orders of magnitude: a 40 cm candle block eight metres
+// off subtends ~0.003 sr of a ring cone's 0.68, and the ray that happened to
+// hit it lit the whole cone with it, while the face beside it -- whose nine
+// rays all missed -- got nothing. On a dungeon wall that was a soft 40 cm
+// square of candle colour every few blocks, metres from any candle (ticket
+// 2026-10-12_16-50-41), and the same holds for anything small and bright a
+// gather ray can land on: a crystal in a cave wall, an ember, a sunlit pebble
+// seen through a gap.
+//
+// So the hit block is credited with the share of the cone it actually covers,
+// cov = projected area / (t^2 x cone solid angle) (a cube of side
+// SUBOCC_BLOCK projects to SUBOCC_BLOCK^2 (|dx| + |dy| + |dz|) along `d`), and
+// the REST of the cone takes what the surface AROUND the hit looks like: the
+// MEDIAN of the eight block-faces beside it in the face's own plane. Per face
+// plane, because a floor seen at 45 degrees continues across x and z, not
+// across the plane perpendicular to the ray. A neighbour with no surface at
+// the hit's depth is looked for one block nearer and one further along that
+// face's axis, so a rough wall whose surface wanders between block slabs
+// still reads as the wall. The MEDIAN and not the mean, which is the point:
+// the background stands for an extended surface, and a mean lets a row of
+// candles on a shelf (three of the eight neighbours) paint 3/8 of the cone in
+// candle; the median ignores anything that fills less than half the ring, and
+// a lava pool, a lit floor or a sunlit wall -- things that do fill it -- come
+// through whole.
+//
+// What that keeps exactly as it was: every hit closer than about one block per
+// cone-width (cov = 1, the neighbours are not read at all), and any extended
+// surface at any distance. What it changes: a lone bright block's light falls
+// off as 1/t^2, like light, instead of filling a cone at any range.
+//
+// One face plane's radiance for a ray along `d`: the hit's word scaled by
+// `cov`, the plane's median filling the rest.
+fn giFacePlane(hit : vec3<i32>, a : u32, d : vec3f, cov : f32) -> vec3f {
+  let da = select(select(d.z, d.y, a == 1u), d.x, a == 0u);
+  let c = giFaceWord(hit, a, da);
+  if (cov >= 1.0) { return c; }
+  let ib = i32(SUBOCC_BLOCK);
+  let en = vec3<i32>(select(0, 1, a == 0u), select(0, 1, a == 1u), select(0, 1, a == 2u)) * ib;
+  let eu = vec3<i32>(select(0, 1, a == 2u), select(0, 1, a == 0u), select(0, 1, a == 1u)) * ib;
+  let ev = vec3<i32>(select(0, 1, a == 1u), select(0, 1, a == 2u), select(0, 1, a == 0u)) * ib;
+  // Toward the receiver along the face axis: against the ray.
+  let back = en * select(1, -1, da > 0.0);
+  var v : array<vec3f, 8>;
+  var l : array<f32, 8>;
+  var n = 0;
+  for (var j = 0; j < 9; j++) {
+    if (j == 4) { continue; }
+    let nc = hit + eu * (j % 3 - 1) + ev * (j / 3 - 1);
+    var x = giFaceWord(nc, a, da);
+    if (all(x == vec3f(0.0))) { x = giFaceWord(nc + back, a, da); }
+    if (all(x == vec3f(0.0))) { x = giFaceWord(nc - back, a, da); }
+    v[n] = x;
+    l[n] = dot(x, vec3f(0.2126, 0.7152, 0.0722));
+    n++;
+  }
+  // The median of eight: the mean of the two middle ranks by luminance (ties
+  // broken by index, so every element has a distinct rank).
+  var med = vec3f(0.0);
+  for (var i = 0; i < 8; i++) {
+    var rank = 0;
+    for (var k = 0; k < 8; k++) {
+      if (l[k] < l[i] || (l[k] == l[i] && k < i)) { rank++; }
+    }
+    if (rank == 3 || rank == 4) { med += v[i] * 0.5; }
+  }
+  return c * cov + med * (1.0 - cov);
+}
+
 // Ray `r` of the nine (r = 0 the normal; 1..4 the tangent diagonals; 5..8 the
 // corners): its weighted contribution, zero on a miss.
 fn giGatherRay(ro : vec3f, n : vec3f, face : u32, r : u32) -> vec3f {
@@ -108,21 +199,21 @@ fn giGatherRay(ro : vec3f, n : vec3f, face : u32, r : u32) -> vec3f {
   // never see through a wall the shadow ray cannot.
   let s = traceOpaque(ro, d, TUNE_GI_GATHER_BLOCKS + 1, 0.0, &occupancy, &materials);
   if (!s.hit) { return vec3f(0.0); }
-  let slot = chunkIndexW(s.cell);
-  // An emitter's light is only meaningful under a matching stamp.
-  if (opennessGen[slot] != opennessStamp(worldChunkOf(s.cell))) { return vec3f(0.0); }
-  let lo = vec3<u32>(s.cell & vec3<i32>(i32(CHUNK) - 1));
-  let base = irrIndex(slot, subOccBitLocal(lo), 0u);
-  // EVERY FACE THE RAY LEANS ON, weighted by the direction's share on that
-  // axis (raymarch.wgsl's notes say why the entry face alone gathers nothing
-  // from a floor).
   let ax = abs(d.x);
   let ay = abs(d.y);
   let az = abs(d.z);
+  let blk = f32(SUBOCC_BLOCK);
+  let tt = max(s.t, 1.0);
+  let omega = select(GI_OMEGA_RING, GI_OMEGA_NORMAL, r == 0u);
+  let cov = min(blk * blk * (ax + ay + az) / (tt * tt * omega), 1.0);
+  // EVERY FACE THE RAY LEANS ON, weighted by the direction's share on that
+  // axis (raymarch.wgsl's notes say why the entry face alone gathers nothing
+  // from a floor) -- which is also each face's share of the cube's projected
+  // area.
   var e = vec3f(0.0);
-  if (ax > 0.1) { e += unpackRgb9e5(irradiance[base + 0u + select(0u, 1u, d.x < 0.0)]) * ax; }
-  if (ay > 0.1) { e += unpackRgb9e5(irradiance[base + 2u + select(0u, 1u, d.y < 0.0)]) * ay; }
-  if (az > 0.1) { e += unpackRgb9e5(irradiance[base + 4u + select(0u, 1u, d.z < 0.0)]) * az; }
+  if (ax > 0.1) { e += giFacePlane(s.cell, 0u, d, cov) * ax; }
+  if (ay > 0.1) { e += giFacePlane(s.cell, 1u, d, cov) * ay; }
+  if (az > 0.1) { e += giFacePlane(s.cell, 2u, d, cov) * az; }
   return e * (w / (ax + ay + az));
 }
 

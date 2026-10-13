@@ -7840,6 +7840,10 @@ fn ambientAt(n : vec3f) -> vec3f {
 // registers to spare: a pyramid read there costs that pass, not every pixel.
 // It has not been rebuilt — the leak it addressed is closed — but if a long
 // gather ray's point sample ever shows, that is where it goes.
+// It DID show (2026-10-12, ticket 16-50-41: candle-coloured 40 cm squares on
+// dungeon walls metres from any candle), and the one-level answer is in
+// gi_gather.wgsl's giFacePlane: the hit block gets the share of the cone it
+// covers, the face plane's median neighbour fills the rest.
 //
 // ---- THE STEP BUDGET IS A COMPILE-TIME CONSTANT ------------------------------
 // TUNE_GI_GATHER_BLOCKS is a module const, so the nine inlined traceOpaque
