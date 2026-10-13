@@ -2690,6 +2690,173 @@ Status GateCaveTime(Ctx& c, std::string& detail) {
 }
 
 // ---------------------------------------------------------------------------
+// cave-window: a ray that leaves the residency window under the ground has not
+// seen the sky.
+//
+// THE BUG THIS PINS (2026-10-13, ticket 2026-10-12_20-13-42, DESIGN.md §9.e).
+// The openness walk marches through the window only, and a reach ray that left
+// it without meeting a blocker was written down as SKY. In the teeth_caves
+// chamber -- a vault 54 m under a hill, with the window's top 5 m over its
+// ceiling -- that made the walls read 24% open, lit like an overhang, and
+// because the answer depended on where the WINDOW sat it changed as the camera
+// walked: the "boundaries that expand as I move" of the ticket. The fix asks
+// the far surface map at the exit point (sim_openness.wgsl
+// openExitUnderTerrain): under the column's ground = blocked.
+//
+// THE FIXTURE: a stone-shelled room deep under the ground whose +X side IS the
+// window's +X face, so every ray that crosses the room toward +X leaves the
+// window clear -- exactly the case the walk used to call open. Probed: the
+// floor in the middle and by the face, the back wall looking straight at the
+// face, the ceiling. All must read sealed.
+//
+// AND A POSITIVE CONTROL, because "everything that leaves the window is
+// blocked" would pass the sealed arm too: a stone pad standing in the open air
+// over the ground beside the same face. Its rays leave the window ABOVE the
+// terrain and must still read open. A far map read wrong (a level not filled,
+// a top off by a cascade) breaks this arm, not the first.
+//
+// No render: like `openness`, it reads the compute-written grid back.
+Status GateCaveWindow(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  const uint32_t mStone = [&]() -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == "stone") return (uint32_t)i;
+    return 0;
+  }();
+  if (!mStone) {
+    detail = "stone missing from materials.json";
+    return Status::Fail;
+  }
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  const IVec3 org = world.WindowOrigin();
+  const IVec3 wlo{org.x * (int)kChunk, org.y * (int)kChunk, org.z * (int)kChunk};
+  const int x1 = wlo.x + (int)kWorldN;      // the window's +X face (exclusive)
+  // The far map the walk asks is level 1 around the window's centre, which
+  // covers the window and 25.6 m past each face.
+  DrainFullRefill(ctx, world, sim,
+                  IVec3{org.x + (int)kNChunk / 2, org.y + (int)kNChunk / 2,
+                        org.z + (int)kNChunk / 2});
+
+  const int kBlk = 1 << (int)kSubOccShift;
+  const int kIn = 32;                        // interior edge, voxels (3.2 m)
+  const int kWall = 2;
+  const int x0 = x1 - kIn;
+  const int z0 = (wlo.z + (int)kWorldN / 2) & ~(kBlk - 1);
+  // The lowest ground over the room AND over the exit columns past the face,
+  // so the room is under the ground wherever its rays leave the window.
+  int lowGround = 1 << 30;
+  for (int x = x0 - 8; x <= x1 + 16; x += 4)
+    for (int z = z0 - 8; z <= z0 + kIn + 8; z += 4)
+      lowGround = std::min(lowGround, World::TerrainHeight(x, z, kDefaultSeed));
+  const int kCover = 40;                     // rock over the ceiling, voxels
+  const int y0 = (lowGround - kCover - kIn) & ~(kBlk - 1);
+  // The control pad: 2 voxels of stone 3 m over the ground by the same face.
+  const int highGround = [&]() {
+    int h = -(1 << 30);
+    for (int x = x1 - 24; x <= x1 + 16; x += 4)
+      for (int z = z0 - 16; z <= z0 + 16; z += 4)
+        h = std::max(h, World::TerrainHeight(x, z, kDefaultSeed));
+    return h;
+  }();
+  const int padY = highGround + 30;
+  const IVec3 pchunk{(x1 - kIn / 2) >> 4, y0 >> 4, (z0 + kIn / 2) >> 4};
+
+  std::vector<CellOp> ops;
+  bool sited = true;
+  // The room: shelled on five sides, open on +X (the window face itself).
+  for (int x = -kWall; x < kIn; x++)
+    for (int y = -kWall; y < kIn + kWall; y++)
+      for (int z = -kWall; z < kIn + kWall; z++) {
+        const bool inside = x >= 0 && y >= 0 && y < kIn && z >= 0 && z < kIn;
+        const IVec3 cc{x0 + x, y0 + y, z0 + z};
+        if (!world.CellInWindow(cc)) { sited = false; continue; }
+        ops.push_back({World::SlotCellIndex(cc), PackVoxNew(inside ? 0u : mStone, 0u)});
+      }
+  for (int x = x1 - 16; x < x1; x++)
+    for (int y = padY; y < padY + 2; y++)
+      for (int z = z0 - 8; z < z0 + 8; z++) {
+        const IVec3 cc{x, y, z};
+        if (!world.CellInWindow(cc)) { sited = false; continue; }
+        ops.push_back({World::SlotCellIndex(cc), PackVoxNew(mStone, 0u)});
+      }
+  if (!sited) {
+    detail = Format("fixture outside the window (room floor y=%d, pad y=%d, "
+                    "window y %d..%d)", y0, padY, wlo.y, wlo.y + (int)kWorldN);
+    return Status::Fail;
+  }
+
+  // One poke per chunk the fixture touches, for a few ticks: the dirty walk
+  // marches what is on the dirty list, and the room spans a dozen chunks.
+  std::vector<CellOp> poke;
+  {
+    std::set<uint64_t> seen;
+    for (const CellOp& op : ops) {
+      const uint64_t key = op.cellIdx / kChunkVol;   // slot chunk of the cell
+      if (seen.insert(key).second) poke.push_back(op);
+    }
+  }
+  uint32_t tick = 95000;
+  SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, ops, false, pchunk,
+             false, false);
+  for (int i = 0; i < 4; i++)
+    SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, poke, false,
+               pchunk, false, false);
+  ctx.WaitIdle();
+
+  struct Probe { const char* name; IVec3 cell; uint32_t face; bool open; };
+  const int zc = z0 + kIn / 2;
+  const Probe probes[5] = {
+      {"floor middle +Y", IVec3{x0 + kIn / 2, y0 - 1, zc}, 3u, false},
+      {"floor by face +Y", IVec3{x1 - 2, y0 - 1, zc}, 3u, false},
+      {"back wall +X", IVec3{x0 - 1, y0 + kIn / 2, zc}, 1u, false},
+      {"ceiling -Y", IVec3{x0 + kIn / 2, y0 + kIn, zc}, 2u, false},
+      {"open pad top +Y", IVec3{x1 - 4, padY + 1, z0}, 3u, true},
+  };
+  const double maxSealed = BaselineNumber("caveWindow.maxSealed", 0.05);
+  const double minOpen = BaselineNumber("caveWindow.minOpen", 0.75);
+  bool ok = true;
+  double worstSealed = 0.0, pad = 1.0;
+  std::string bad;
+  for (const Probe& p : probes) {
+    bool stamp = false;
+    const uint32_t b = OpennessByteAt(ctx, world, p.cell, p.face, &stamp);
+    const double v = b / 255.0;
+    const bool good = stamp && (p.open ? v > minOpen : v <= maxSealed);
+    if (p.open) pad = v; else worstSealed = std::max(worstSealed, v);
+    if (!good) {
+      ok = false;
+      bad += Format("%s%s %.2f%s", bad.empty() ? "" : ", ", p.name, v,
+                    stamp ? "" : " (never walked)");
+    }
+    std::printf("  cave-window probe %-16s (%d,%d,%d) face %u: byte %3u = %.2f "
+                "%s%s\n",
+                p.name, p.cell.x, p.cell.y, p.cell.z, p.face, b, v,
+                p.open ? "(must be open)" : "(must be sealed)",
+                stamp ? "" : " STAMP MISMATCH - never walked");
+  }
+  std::printf(
+      "cave-window: %s (a %d-voxel room %d voxels under the lowest ground, its "
+      "+X side the window's +X face at x=%d: worst sealed face %.2f, must be <= "
+      "%.2f -- a ray that leaves the window under the ground has not seen the "
+      "sky; a pad %d voxels over the highest ground by the same face reads "
+      "%.2f, must be > %.2f. room floor y=%d, ground %d..%d, window origin "
+      "chunk (%d,%d,%d))\n",
+      ok ? "PASS" : "FAIL", kIn, lowGround - (y0 + kIn), x1, worstSealed,
+      maxSealed, padY - highGround, pad, minOpen, y0, lowGround, highGround,
+      org.x, org.y, org.z);
+  detail = ok ? Format("sealed <= %.2f (worst %.2f), open pad %.2f (> %.2f)",
+                       maxSealed, worstSealed, pad, minOpen)
+              : Format("failed: %s", bad.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
 // glow: the glow field carries an emitter's light into the space around it,
 // and takes it back when the emitter goes.
 //
@@ -5510,6 +5677,9 @@ const std::vector<Gate>& RenderGates() {
       // at (300, ground+20, 300), which is why it sits with the other fixture
       // gates rather than before anything that reads that region.
       {"cave-time", "render", {}, false, GateCaveTime, /*needsRender=*/true},
+      // No render pass: reads the openness grid back. Leaves a shelled room
+      // against the window's +X face, 4 m under the ground, and a pad over it.
+      {"cave-window", "render", {}, false, GateCaveWindow},
       {"glow", "render", {}, false, GateGlow},
       // The only gate in the suite that DRAWS A RIGIDBODY. Three arms of one
       // fixture frame, and it spawns a body through the real destruction path.
