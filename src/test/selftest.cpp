@@ -974,6 +974,11 @@ const char* const kOrder[] = {
     // pristine ground, CPU only.
     "head-cleave",
     "blade-wounds",
+    // ...and a POINT driven through (docs/PLAN_projectiles.md B): an arrow
+    // at three energies into a head, through an arm into the torso behind it,
+    // and into a harder skin; the numbers per material are the output. Fresh
+    // spawns on pristine ground; its last arm ticks the bleed.
+    "pierce",
     // ...and a coat on the blade goes INTO the wound it cuts, from the voxels
     // that touched only, and comes back carrying the wound's fluid; a mace
     // coats the surface, a fist coats what it hits, and the blade keeps its

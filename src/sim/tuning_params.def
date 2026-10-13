@@ -1853,6 +1853,14 @@ TP_F(gore, stabDepth, NO_WGSL, 0.35f, 0.0f, 8.0f)
 TP_F(gore, stabDepthPower, NO_WGSL, 0.6f, 0.0f, 8.0f)
 TP_F(gore, stabWidth, NO_WGSL, 0.4f, 0.05f, 4.0f)
 TP_F(gore, stabThick, NO_WGSL, 0.1f, 0.0f, 2.0f)
+// THE PENETRATOR (Tuning::Gore::pierceCellJ, phys/kerf.h PierceChannel). The
+// joules one fine cell of skin-hard matter costs a sharp point; zero is a
+// point that passes through everything. softExp 0 turns the soft-point
+// penalty off. sharpFloor divides, so zero would make a blunt thing's price
+// infinite rather than large.
+TP_F(gore, pierceCellJ, NO_WGSL, 1.0f, 0.0f, 100.0f)
+TP_F(gore, pierceSoftExp, NO_WGSL, 2.0f, 0.0f, 8.0f)
+TP_F(gore, pierceSharpFloor, NO_WGSL, 0.05f, 0.001f, 1.0f)
 TP_F(gore, woundHeftRef, NO_WGSL, 5.3f, 0.01f, 60.0f)
 TP_F(gore, woundHeftMax, NO_WGSL, 4.0f, 1.0f, 32.0f)
 TP_F(gore, woundStainRadius, NO_WGSL, 0.90f, 0.0f, 16.0f)

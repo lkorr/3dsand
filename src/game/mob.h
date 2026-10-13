@@ -2707,6 +2707,20 @@ class Mob {
   // this creature's live limbs.
   bool BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
                std::vector<ParticleSpawn>& spawns);
+  // ---- THE POINT PATH (phys/kerf.h PierceChannel, game/pierce.cpp) --------
+  // Drive `pen` into this creature's slot `bodyHandle` along the WORLD ray
+  // (`fromWorld`, unit `dirWorld`): a thin channel on the slot's fine lattice,
+  // paid cell by cell, carved through the ordinary CarveLimb (hp, woundHp
+  // weighting, the brain charge, the bleed, the gore, all as for a blade) with
+  // DamageCause::Pierce, and soaked like a crater. A GLANCE (it could not pay
+  // the first fine cell) carves nothing and lands as a BluntHit at the contact
+  // rows' impulse -> hp rule. `fromWorld` should be a little in front of the
+  // matter (the flight's last position, or the collider hit backed off): only
+  // matter at or past it is in the channel. False when the handle is not one of
+  // this creature's slots; `out` says what happened otherwise.
+  bool PierceLimb(uint64_t bodyHandle, Vec3 fromWorld, Vec3 dirWorld,
+                  const Penetrator& pen, World& world,
+                  std::vector<ParticleSpawn>& spawns, PierceResult& out);
 
   // ---- WHAT DID IT: THE CAUSE IS AN ARGUMENT (W2-G, 2026-09-24) -------------
   //
@@ -6551,6 +6565,12 @@ class MobSystem {
                 std::vector<ParticleSpawn>& spawns);
   bool BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
                std::vector<ParticleSpawn>& spawns);
+  // ...and the point (Mob::PierceLimb), over every creature. A flight that
+  // wants "this ray, through whatever it meets" calls game/pierce.h
+  // PierceAlongRay, which uses this.
+  bool PierceLimb(uint64_t bodyHandle, Vec3 fromWorld, Vec3 dirWorld,
+                  const Penetrator& pen, World& world,
+                  std::vector<ParticleSpawn>& spawns, PierceResult& out);
   // ---- A MATERIAL, BY NAME, AT RUNTIME ------------------------------------
   //
   // Tuning cannot hold a material id: tuning.json is hot-reloaded on F5 and

@@ -1346,6 +1346,38 @@ struct Tuning {
     float stabWidth = TPD(gore, stabWidth);
     float stabThick = TPD(gore, stabThick);
 
+    // ---- E1d. the penetrator (2026-10-12, docs/PLAN_projectiles.md B) ------
+    // A POINT driven along its own axis: an arrow, a thrown spear, a solid
+    // spell projectile (phys/kerf.h PierceChannel, Mob::PierceLimb). It walks
+    // a thin channel through the struck body's FINE lattice and pays for every
+    // cell it crosses, in joules:
+    //
+    //   pierceCellJ * (hardness / gear.cutHardnessRef)
+    //               * (hardness / tip hardness)^pierceSoftExp  [tip softer only]
+    //               / max(sharpness, pierceSharpFloor)
+    //
+    // per FINE cell (1.25 cm, the human art's lattice; a coarser lattice's
+    // cell is charged by its volume). The energy is the projectile's own,
+    // 1/2 m v^2. Left over past the far side: it EXITS and flies on. Spent
+    // inside: it EMBEDS. Unable to pay the first fine cell of skin at all: it
+    // GLANCES, carves nothing, and lands as trauma (BluntHit, at the contact
+    // rows' impulse -> hp rule).
+    //
+    // CALIBRATED against the human (PLAN_projectiles B; the `pierce` gate
+    // prints the numbers): a 30 g arrow at 65 m/s (~63 J, a full longbow
+    // draw) goes through a torso's flesh and breaches a skull into the brain;
+    // at half draw (half the speed, a quarter of the energy) it stops in the
+    // skull or in muscle; a thrown pebble glances. The channel's hp is the
+    // ordinary carve charge -- volume share by woundHp plus the flat brain
+    // charge -- and nothing else: there is no "an arrow kills" rule.
+    float pierceCellJ = TPD(gore, pierceCellJ);
+    // A point SOFTER than what it meets pays (cell / tip)^this on top: a wooden
+    // point on iron, ice on stone. 0 = hardness ratio ignored.
+    float pierceSoftExp = TPD(gore, pierceSoftExp);
+    // The least sharpness the price divides by: a sphere of stone is sharpness
+    // ~0.05 and pays twenty times a bodkin's price per cell.
+    float pierceSharpFloor = TPD(gore, pierceSharpFloor);
+
     // ---- E2. heft: how much weapon is behind the edge -----------------------
     // The item's own voxel volume in WORLD voxels that reads as heft 1.0.
     // DERIVED, not authored: an item's .vox is right there, so a weapon's mass

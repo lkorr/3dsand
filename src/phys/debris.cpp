@@ -5647,6 +5647,123 @@ bool DebrisSystem::CutBody(uint64_t handle, const KerfCut& cut, World& world,
   return true;
 }
 
+bool DebrisSystem::PierceBody(uint64_t handle, Vec3 fromWorld, Vec3 dirWorld,
+                              const Penetrator& pen, World& world,
+                              std::vector<ParticleSpawn>& spawns,
+                              PierceResult& out) {
+  out = PierceResult{};
+  if (!phys_) return false;
+  size_t bi = 0;
+  for (; bi < bodies_.size(); bi++)
+    if (bodies_[bi].handle == handle) break;
+  if (bi == bodies_.size()) return false;
+  out.hit = true;
+  out.loose = true;
+  const Tuning& tune = CurrentTuning();
+  Body& b = bodies_[bi];
+  phys_->GetTransform(b.handle, b.xf);
+  const float dl = dirWorld.len();
+  if (dl < 1e-6f) return true;
+  const Vec3 dW = dirWorld * (1.0f / dl);
+  // Into the body's own frame: the conjugate sandwich CutBody uses.
+  const float qi[4] = {-b.xf.quat[0], -b.xf.quat[1], -b.xf.quat[2],
+                       b.xf.quat[3]};
+  const Vec3 oL = QuatRot(qi, fromWorld - b.xf.pos);
+  const Vec3 dL = QuatRot(qi, dW);
+  out.dirLocal = dL;
+  const bool fine = b.HasFineSkin();
+  const float s = (float)std::max(1u, fine ? b.micro.skinScale : b.physScale);
+  const PierceLattice lat = PierceLatticeFor(pen.tipRadius, s, kVoxelMeters);
+  const PierceCost pc = PierceCostOf(tune);
+  auto hardOf = [&](uint32_t m) {
+    return m != 0 && m < matGpu_.size() ? (float)matGpu_[m].hardness : 0.0f;
+  };
+  const float tipHard = pen.hardness > 0.0f ? pen.hardness : hardOf(pen.material);
+  const size_t nMat = matGpu_.size();
+  thread_local std::vector<float> price;  // one table per shot
+  price.assign(nMat, 0.0f);
+  for (uint32_t m = 0; m < (uint32_t)nMat; m++)
+    price[m] = PierceCellJ(pc, hardOf(m), tipHard, pen.sharpness, lat.volScale);
+  const float unknown =
+      PierceCellJ(pc, 0.0f, tipHard, pen.sharpness, lat.volScale);
+  auto costOf = [&](uint32_t m) { return m < nMat ? price[m] : unknown; };
+  const float energy = pen.EnergyJ();
+  out.energyIn = energy;
+  const PierceChannelResult ch = PierceChannel(
+      oL, dL, s, lat.rCells, energy,
+      [&](auto&& probe) {
+        if (fine)
+          for (const PrefabVoxel& pv : b.skinVoxels) {
+            const uint32_t m = pv.material & 0xFFFu;
+            if (m) probe((float)pv.x, (float)pv.y, (float)pv.z, m);
+          }
+        else
+          for (const DebrisVoxel& dv : b.voxels) {
+            const uint32_t m = dv.payload & 0xFFFu;
+            if (m) probe((float)dv.x, (float)dv.y, (float)dv.z, m);
+          }
+      },
+      costOf);
+  out.firstLayerJ = ch.firstLayerJ;
+  out.stopMat = ch.stopMat;
+  out.byMat = ch.byMat;
+  out.cells = ch.cells;
+  out.entryLocal = oL + dL * ch.tEntry;
+  out.entryWorld = fromWorld + dW * ch.tEntry;
+  if (!ch.any) {
+    // The collider was met and the matter was not (a box merge's convex
+    // radius, a hollow): the point passed it by, untouched.
+    out.missed = true;
+    out.outcome = PierceOutcome::Exited;
+    out.energyLeft = energy;
+    out.exitSpeedMps = pen.speedMps;
+    out.stopLocal = oL;
+    out.stopWorld = fromWorld;
+    return true;
+  }
+  if (ch.glanced) {
+    out.outcome = PierceOutcome::Glanced;
+    out.stopLocal = out.entryLocal;
+    out.stopWorld = out.entryWorld;
+    // Trauma, as a corpse takes it (ResolveOnLooseMatter's bruise rung).
+    const PierceGlance g = PierceGlanceOf(tune, pen);
+    if (g.hp > 0.0f)
+      BruiseBody(handle, out.entryWorld,
+                 tune.gore.bruiseRadius * (0.5f + 0.5f * g.power),
+                 pen.seed ^ 0x6A1A9Eu, g.power, g.hp, false);
+    return true;
+  }
+  const float stopT = ch.exited ? ch.tExit : ch.tStop;
+  out.depth = std::max(0.0f, stopT - ch.tEntry);
+  out.stopLocal = oL + dL * stopT;
+  out.stopWorld = fromWorld + dW * stopT;
+  if (ch.exited) {
+    out.outcome = PierceOutcome::Exited;
+    out.energyLeft = ch.leftJ;
+    out.exitSpeedMps = pen.SpeedFor(ch.leftJ);
+  } else {
+    out.outcome = PierceOutcome::Embedded;
+  }
+  if (ch.cells == 0) return true;
+  // THE CARVE IS THE CHANNEL: PierceKeepAt on the authoritative lattice is
+  // the channel's own axis test, so DamageBody removes exactly the cells that
+  // were paid for (and re-derives the collider from them).
+  out.carved = ch.cells;
+  std::vector<Body> fragments;
+  uint32_t budget = MaxNewBodiesPerTick();
+  const bool ghost = !OwnedLocally(b);
+  const float rC = lat.rCells, t0Lat = ch.t0Lat;
+  const int binStop = ch.binStop;
+  DamageBody(bi, world, spawns, fragments, budget, /*eject=*/true,
+             [oL, dL, s, rC, t0Lat, binStop](float scale) -> CarveKeep {
+               const PierceKeep k = PierceKeepAt(oL, dL, s, rC, t0Lat, binStop, scale);
+               return [k](float x, float y, float z) { return k(x, y, z); };
+             },
+             DamageCause::Pierce, 1.0f, nullptr);
+  KeepFragments(fragments, ghost);
+  return true;
+}
+
 float DebrisSystem::BruiseBody(uint64_t handle, Vec3 atVoxel,
                                float radiusVoxels, uint32_t seed, float power,
                                float hp, bool unarmed) {
