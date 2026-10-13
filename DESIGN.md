@@ -6383,9 +6383,9 @@ to blood-meat either (it gets the blood smear only).
 **Robots are matter** (2026-10-02, materials.h `shell` / `struck` / `burst`).
 The machine races' behaviour is ten materials.json rows and three new fields,
 no race code: brass plating, oily `clockwork`, an iron frame, a glowing
-`boiler` and a `cogitator` (brainHp) for the automaton; `synth_shell` panels,
+`boiler` and a `cogitator` (organHp) for the automaton; `synth_shell` panels,
 arcing `circuitry`, an `alloy` endoskeleton (hardness 180), a glowing
-`power_cell` and a `neural_core` (brainHp) for the android; `oil` is what an
+`power_cell` and a `neural_core` (organHp) for the android; `oil` is what an
 automaton bleeds -- flammable, so a holed automaton near a spark burns.
 **An android bleeds NOTHING** (owner, 2026-10-03: "sparks only, no fluid"):
 its rows say `bleedFluid: false`, its wiring/cell/core crumble to `gravel`, and
@@ -8514,7 +8514,7 @@ fire's account of how a limb comes apart.
 
 **What each cause may do is ONE table** (`kCauseRows`, keyed `(cause, eaten)`,
 resolved against the limb's TISSUE by `SeverPolicyOf`). Columns: the
-extreme-impact sever, the bleed rate, whether a carve drips, brain charge, the
+extreme-impact sever, the bleed rate, whether a carve drips, organ charge, the
 collapse sever, children carried by a split, the cut-through rule, the joint
 rule, hp-0-severs-any-limb, the worn-shell exemption, gore, whether a severed
 garment drops, the death's name, a rotten vital limb detaching at hp 0, and
@@ -10545,6 +10545,29 @@ gets two orbits and a nasal hole filled with flesh, its chest is hollowed to
 flesh with a muscle wall and bone put back as ribs, a sternum and a spine.
 `anatomy.js carveFor/carveMatches` and `anatomy_resolve.cpp CarveFor/
 CarveMatches` are the same rule; `--gate anatomy-parity` keeps them one.
+
+**Organs cost hp by the cell (brain 2026-09-18, heart 2026-10-12).** An organ
+is a MATERIAL with `organHp` in materials.json: every cell of it lost, by any
+cause, subtracts that flat figure from its limb on top of the ordinary
+volume share (`Mob::CarveLimb`, `MobLimb::organCharged` — a delta of
+recomputed per-material sums, like the volume weights). No organ has a rule
+of its own: enough of it gone takes the limb's hp to 0 and the existing
+vital-limb rule kills, the death named for the organ ("heart destroyed",
+`Mob::OrganDeathCause`). `brain` 3.5 (it was the global
+`gore.brainHpPerVoxel` until the heart needed a figure of its own; same
+number, same charge bit for bit); `heart` 10.75, calibrated so 15% of the
+stock human's 112 heart cells takes its 180-hp torso to 0. The heart is a
+torso `carve` rule inside the cage (depth 4+, so it never displaces a rib,
+the sternum or the muscle wall; before the spine's rule, which takes its own
+cells back): behind the sternum, two thirds left of the midline, down the
+spine's left side. `heart` is id 223 — past what a `.vox` can paint (≤ 127)
+but inside a micro brick's 8-bit material (≤ 255), which is why it was
+INSERTED after `hair` rather than appended (saves remap by name) — so the
+bake paints the stand-in `mushroom_large` and the recipe's `becomes`
+rewrites it at load. A chest too thin to have an organ hollow (the imp, a
+few pool bodies) has no heart; race bodies with a chest of their own delete
+the inherited `becomes` key. Gate `heart` (a stab into it kills, the same
+stabs beside it do not); `scripts/test_anatomy.mjs` pins the count.
 
 **This is authoring, not engine.** Every runtime consumer was already per
 voxel: `voxload` keeps enclosed cells, the micro brick is dense and its march

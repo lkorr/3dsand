@@ -4671,8 +4671,9 @@ const qz = deg => { const h = radians(deg) * 0.5;
  *
  *  THE ABSOLUTE SCALE IS THE SHIPPED HUMAN'S, and it is not this file's to
  *  pick. Commit 6b8623f made wound damage depth-weighted (materials.json
- *  `woundHp`) and gave the head a `brain` core that costs gore.brainHpPerVoxel
- *  FLAT per voxel destroyed, on top of the volume damage; the limb bars were
+ *  `woundHp`) and gave the head a `brain` core that costs a FLAT hp per voxel
+ *  destroyed (materials.json `organHp`, 3.5 since the 2026-10-12 retune; the
+ *  chest's `heart` carries its own), on top of the volume damage; the limb bars were
  *  tripled in the same commit to pay for it. At head 135 that reads "about
  *  five voxels of brain is fatal", which is the intended lethality. A
  *  generated character carrying the pre-6b8623f third of these numbers is not
@@ -4785,12 +4786,16 @@ export function anatomyRecipe(race = 'human') {
           'human inherit it.',
     paintBecomes: [{ material: 'skin', art: [ART.HAIR_SHADE, ART.HAIR],
                      becomes: 'hair' }],
+    '//becomes': 'Stand-ins for what a .vox cannot paint, rewritten at load ' +
+          '(mob.cpp, after the recipe): the chest\'s `heart` is baked as ' +
+          '`mushroom_large`, which no .vox paints for itself. A race with ' +
+          'no heart deletes the key in its own file.',
     limbs: {
       '//head': 'A bone skull two deep around a BRAIN. The core layer is ' +
                 'open-ended, so `brain` is by definition everything the shell ' +
                 'encloses -- there is no geometric brain test anywhere in the ' +
                 'engine, and this recipe is the only thing that decides what ' +
-                'is one. Losing a voxel of it costs gore.brainHpPerVoxel flat ' +
+                'is one. Losing a voxel of it costs its materials.json `organHp` flat ' +
                 'on top of the ordinary volume damage (materials.json ' +
                 '`brain`), which is why the skull in front of it matters: the ' +
                 'rot chews bone at half rate (bone.rotRate), so breaching ' +
@@ -4798,7 +4803,12 @@ export function anatomyRecipe(race = 'human') {
       '//torso': 'A ribcage, not a bone brick: the depth schedule would fill ' +
                  'the chest with solid bone, so `carve` hollows it to flesh ' +
                  '(the organs), walls it in muscle at depth 3, and puts bone ' +
-                 'back as ribs, a sternum and a spine.',
+                 'back as ribs, a sternum and a spine. The HEART sits in the ' +
+                 'hollow behind the sternum, two thirds left of the midline ' +
+                 'and down the spine\'s left side, painted as the stand-in ' +
+                 '`mushroom_large` (a .vox paints ids 0..127 only) that ' +
+                 '`becomes` turns to `heart` at load. Like the brain it costs ' +
+                 'its materials.json `organHp` flat per voxel lost.',
       ...r.limbs,
     },
   };

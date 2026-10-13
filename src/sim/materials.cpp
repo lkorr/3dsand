@@ -1010,13 +1010,21 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
 
     d.rubble = m.value("rubble", "");
     d.molten = m.value("molten", "");
-    // ---- gore weights (materials.h woundHp / brainHp / rotRate) -------------
+    // ---- gore weights (materials.h woundHp / organHp / rotRate) -------------
     // All three are CPU-only body rules: nothing here reaches a shader, the
     // sim, or the world hash. Clamped rather than rejected because a silly
     // number in a data file should misbehave visibly, not refuse to load.
     d.woundHp = m.value("woundHp", 1.0f);
     if (!(d.woundHp >= 0.0f)) d.woundHp = 0.0f;   // also catches NaN
-    d.brainHp = m.value("brainHp", false);
+    d.organHp = m.value("organHp", 0.0f);
+    if (!(d.organHp >= 0.0f)) d.organHp = 0.0f;   // also catches NaN
+    // The flag this replaced (2026-10-12). A table still saying `brainHp`
+    // would load a brain that charges nothing, which is the kind of silent
+    // change a data file should be told about.
+    if (m.contains("brainHp"))
+      errors += path + ": material \"" + d.name +
+                "\": `brainHp` is retired -- write `\"organHp\": <hp per voxel "
+                "lost>` (the brain's is 3.5)\n";
     // -1 = unauthored, which MobDef resolves per creature against `tissue`.
     // Only clamp the TOP: the negative sentinel has to survive.
     d.rotRate = m.value("rotRate", -1.0f);

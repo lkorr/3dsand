@@ -55,7 +55,7 @@ struct CauseRow {
   bool impactSevers;       // Mob::Damage: the extreme-impact-speed sever
   BleedRate bleed;         // Mob::Damage's budget and a carve's drip rate
   bool carveBleeds;        // CarveLimb: does a carve open a drip at all
-  bool chargesBrain;       // CarveLimb: brain voxels lost charge hp
+  bool chargesOrgan;       // CarveLimb: organ voxels lost (organHp) charge hp
   bool collapseSevers;     // CarveLimb: the collapse fraction + straggler floor
   bool carriesChildren;    // CarveLimb: a child seated in a split-off piece leaves with it
   bool cutThrough;         // CarveLimb: the edge came out the other side
@@ -75,7 +75,7 @@ struct CauseRow {
 //   impact  the extreme-speed sever        cut    the cut-through rule
 //   bleed   drip rate                       joint  the joint rule
 //   cBleed  a carve drips                   hp0    hp 0 severs any limb
-//   brain   brain loss charges hp          sHeld  worn shell exempt from severs
+//   organ   organ loss charges hp          sHeld  worn shell exempt from severs
 //   coll    collapse severs                 gore   a stump spurts
 //   kids    split carries seated children   shed   a severed shell drops as a body
 //   burnt   "burnt/dissolved away"          rotV   rotten vital detaches at hp 0
@@ -85,7 +85,7 @@ struct CauseRow {
 // collapse, no carry, no joint) and a rotten body is the one exception, at a
 // vital limb; an EATEN carve cauterises (no drip, no gore), consumes a
 // garment (no shell exemption, nothing shed) and keeps fire's account (hp 0
-// severs, joint only on infection); SPAWN ROT refuses blood, brain charge,
+// severs, joint only on infection); SPAWN ROT refuses blood, organ charge,
 // the joint rule and carried children because those holes are old; only a
 // BLADE cuts through and only a blade is heard as one. Bite, Beam, Blast,
 // Fall and Burn are Other's rows: they differ in what callers do, not here.
@@ -94,7 +94,7 @@ struct CauseRow {
 // (PLAN_weapon_coats B1) is Burn's rows under its own ledger name: an
 // infection other than the rot is only ever eaten, through FlushBurn.
 inline constexpr CauseRow kCauseRows[] = {
-  // cause                eaten  impact bleed               cBleed brain  coll   kids   cut    joint                  hp0    sHeld  gore   shed   burnt  rotV   blade
+  // cause                eaten  impact bleed               cBleed organ  coll   kids   cut    joint                  hp0    sHeld  gore   shed   burnt  rotV   blade
   {DamageCause::Other,    false, true,  BleedRate::Full,    true,  true,  true,  true,  false, JointRule::Always,     false, true,  true,  true,  false, false, false},
   {DamageCause::Other,    true,  true,  BleedRate::Full,    false, true,  true,  true,  false, JointRule::IfInfected, true,  false, false, false, true,  false, false},
   {DamageCause::Blade,    false, true,  BleedRate::Full,    true,  true,  true,  true,  true,  JointRule::Always,     false, true,  true,  true,  false, false, true},
@@ -159,7 +159,7 @@ struct SeverPolicy {
   BleedRate hitBleed = BleedRate::None;  // Mob::Damage's bleed budget
   bool carveBleeds = false;              // a carve opens a drip (at row.bleed)
   BleedRate carveBleed = BleedRate::None;
-  bool chargesBrain = false;
+  bool chargesOrgan = false;
   bool collapseSevers = false;
   bool carriesChildren = false;
   bool cutThrough = false;
@@ -187,7 +187,7 @@ constexpr SeverPolicy SeverPolicyOf(const DamageCtx& ctx, Tissue t) {
   p.hitBleed = blood ? r.bleed : BleedRate::None;
   p.carveBleeds = r.carveBleeds && blood;
   p.carveBleed = p.carveBleeds ? r.bleed : BleedRate::None;
-  p.chargesBrain = r.chargesBrain;
+  p.chargesOrgan = r.chargesOrgan;
   p.collapseSevers = r.collapseSevers;
   p.carriesChildren = r.carriesChildren;
   p.cutThrough = r.cutThrough;

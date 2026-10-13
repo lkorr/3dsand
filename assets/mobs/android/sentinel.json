@@ -137,7 +137,8 @@
       "petal_blue": "circuitry",
       "mushroom_gill": "alloy",
       "petal_red": "neural_core",
-      "petal_pink": "power_cell"
+      "petal_pink": "power_cell",
+      "mushroom_large": null
     },
     "garmentsBecome": null,
     "paintBecomes": null,

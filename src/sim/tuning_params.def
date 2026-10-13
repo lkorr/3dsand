@@ -1949,7 +1949,6 @@ TP_F(gore, infectMobMult, NO_WGSL, 1.0f, 0.0f, 50.0f)
 TP_F(gore, infectBoneStain, NO_WGSL, 11.0f, 0.0f, 15.0f)
 TP_F(gore, infectBoneStainVary, NO_WGSL, 5.0f, 0.0f, 15.0f)
 TP_F(gore, infectBoneIchor, NO_WGSL, 0.45f, 0.0f, 1.0f)
-TP_F(gore, brainHpPerVoxel, NO_WGSL, 10.0f, 0.0f, 200.0f)
 // What losing matter costs (was mob.h kCarveDamagePerVolume).
 TP_F(gore, carveHpPerVolume, NO_WGSL, 1.5f, 0.0f, 20.0f)
 // Blast power for a full-radius body crater. Floor 1: it is a divisor.

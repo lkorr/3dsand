@@ -1826,21 +1826,9 @@ struct Tuning {
     // whole exposure. Falls back to whichever of the two exists when the other
     // does not (a creature with no blood, a biter with no ichor).
     float infectBoneIchor = TPD(gore, infectBoneIchor);
-    // ---- WHAT A VOXEL OF BRAIN IS WORTH -------------------------------------
-    //
-    // Flat hp per BRAIN voxel destroyed, by any cause, charged in
-    // Mob::CarveLimb on top of the ordinary volume damage. The only absolute
-    // per-voxel hp figure in the gore model -- everything else is a fraction of
-    // a limb, which is what makes a wound read the same on any rig; this one
-    // cannot be, because the point of it is that a hole in the brain is not a
-    // proportion of a head, it is a hole in the brain.
-    //
-    // At the shipped 10 and a human head's 45 hp, roughly five voxels of brain
-    // is fatal -- so breaching the skull (two voxels of bone, which the rot
-    // chews at half rate) is what takes the time, and what is behind it goes
-    // fast. 0 disables the mechanic entirely and restores the pre-2026-09-18
-    // behaviour, where brain was ordinary flesh with a different colour.
-    float brainHpPerVoxel = TPD(gore, brainHpPerVoxel);
+    // (What a voxel of BRAIN is worth was gore.brainHpPerVoxel until
+    // 2026-10-12. It is materials.json `organHp` now -- per material, because
+    // the heart is a second organ with its own figure; MaterialDef::organHp.)
     // ---- WHAT LOSING MATTER COSTS (was mob.h kCarveDamagePerVolume) ------
     //
     // Mob::CarveLimb charges a limb this multiple of its max hp for the whole

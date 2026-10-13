@@ -780,7 +780,6 @@ const TUNING_PARAMS = {
   'gore.infectBoneStain':{t:'f',def:11,min:0,max:15},
   'gore.infectBoneStainVary':{t:'f',def:5,min:0,max:15},
   'gore.infectBoneIchor':{t:'f',def:0.45,min:0,max:1},
-  'gore.brainHpPerVoxel':{t:'f',def:10,min:0,max:200},
   'gore.carveHpPerVolume':{t:'f',def:1.5,min:0,max:20},
   'gore.blastPowerRef':{t:'f',def:200,min:1,max:2000},
   'gore.blastShedSpeed':{t:'f',def:45,min:0,max:300},

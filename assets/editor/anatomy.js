@@ -118,6 +118,10 @@ export const DEFAULT_ANATOMY = {
     { material: 'muscle', where: 'bone' },
     { material: 'bone', where: 'bone', core: 0 },
   ],
+  // STAND-INS FOR WHAT A .VOX CANNOT PAINT, rewritten at load (mob.cpp
+  // anatomy.becomes): the chest's heart, painted as `mushroom_large` (see
+  // limbs.torso). Not read by planAnatomy -- the bake holds the stand-in.
+  becomes: { mushroom_large: 'heart' },
   limbs: {
     // THE SKULL IS A SHELL AND WHAT IT PROTECTS IS NOT BONE. The flesh ring
     // over it is the SCALP and is not decoration: without it bone sits one
@@ -165,6 +169,23 @@ export const DEFAULT_ANATOMY = {
     // from depth 3 inward. Instead: the organs (flesh) inside, a muscle wall at
     // depth 3, then bone put back as ribs (2 rows on, 2 off, over the chest), a
     // sternum down the front of the cage and a spine down the whole back.
+    //
+    // ...AND A HEART IN IT (2026-10-12, docs/PLAN_projectiles.md package A).
+    // Inside the cage (depth 4+, so never in place of a rib, the sternum or the
+    // muscle wall at depth 3), behind the sternum, a third right and two thirds
+    // LEFT of the midline (+x is the creature's left: the L arm is the +x
+    // one), at the middle of the cage's height, from the front of the hollow
+    // back to the spine -- and down the spine's left side, because the rule
+    // runs BEFORE the spine's and the spine's (last match wins) takes back
+    // every cell of its own. On the stock human: 6 x 7 cells in front of the
+    // spine two deep, plus a 2-wide lobe four deep beside it, 112 cells.
+    //
+    // Painted as the STAND-IN `mushroom_large`, because `heart` is past what a
+    // .vox can paint (ids 0..127); `becomes` below rewrites every stand-in
+    // cell to the heart at load (mob.cpp, after the recipe resolves -- the
+    // snake's venom gland does the same). `mushroom_large` because no .vox
+    // anywhere paints it, so the rewrite can touch nothing else on any body
+    // that inherits it.
     torso: {
       carve: [
         { material: 'flesh', where: 'bone' },
@@ -173,6 +194,8 @@ export const DEFAULT_ANATOMY = {
           box: { y: [0.42, 0.94] }, stripe: { axis: 'y', period: 4, width: 2 } },
         { material: 'bone', where: 'bone', depth: [3, 3],
           box: { x: [0.45, 0.55], y: [0.42, 0.94], z: [0.5, 1] } },
+        { material: 'mushroom_large', where: 'bone', depth: [4, 254],
+          box: { x: [0.4, 0.7], y: [0.57, 0.77], z: [0.33, 1] } },
         { material: 'bone', where: 'bone',
           box: { x: [0.4, 0.6], z: [0, 0.5] } },
       ],

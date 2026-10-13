@@ -1158,6 +1158,10 @@ const char* const kOrder[] = {
     // does not decapitate, and dead flesh takes the flesh bore, not the rock
     // melt (owner report 2026-09-22). Pristine ground, CPU only.
     "laser-head",
+    // ...and a stab into the HEART kills by the brain's rule (a flat organHp
+    // per lost cell), where the same stabs beside it do not (owner,
+    // 2026-10-12). Pristine ground, CPU only (pose ticks, real melee sweep).
+    "heart",
     // ...and the overlap where a limb meets its parent is ONE cell of flesh in
     // two lattices: rot, a coat or a hole in either copy is in both (owner
     // report 2026-09-23). Pristine ground, CPU only.
