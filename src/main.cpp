@@ -423,6 +423,17 @@ constexpr uint64_t kShotCrawlShotsAt = 330;  // third-person stroke window
 constexpr uint64_t kShotCrawlShotsEnd = 400;
 constexpr uint64_t kShotCrawlFirst = 420;    // first person from here
 constexpr uint64_t kShotCrawlLast = 520;
+// `--shot-archery`: the BOW and the SNEAK's look-iteration harness (the
+// bow_draw / bow_draw_crouch clips, the held crouch's `sneak` overlay). A bow
+// in the right fist; strafe to turn the body side-on, draw standing (third
+// person, then first person level / up / down), loose and photograph the
+// arrow's first frames, tap Ctrl into the crouch, sneak side-on and
+// three-quarter-front, then draw crouched (third and first person) and loose.
+// Every picture is screenshot_archery_<what>.bmp. `g_shotArcheryDraw` is the
+// scripted LMB (the frame's mouse sample is replaced by it).
+bool g_shotArchery = false;
+bool g_shotArcheryDraw = false;
+constexpr uint64_t kShotArcheryLast = 560;
 constexpr uint64_t kShotSwimTreadEnd = 280;   // Space held at the surface
 constexpr uint64_t kShotSwimCrawlEnd = 420;   // forward at the surface
 constexpr uint64_t kShotSwimDownEnd = 500;    // Ctrl alone
@@ -6309,6 +6320,12 @@ int main(int argc, char** argv) {
       g_shotCrawl = true;
       g_harnessFrames = kShotCrawlLast;
     }
+    // `--shot-archery`: the bow draw, standing and crouched, and the sneak.
+    // See the note at g_shotArchery.
+    else if (a == "--shot-archery") {
+      g_shotArchery = true;
+      g_harnessFrames = kShotArcheryLast;
+    }
     // `--duel-dummy` is the melee FEEL harness: a sword-armed human standing
     // three metres in front of the spawn, with nothing driving it. Mobs have no
     // AI yet, so "stands still" is simply the default and this flag is only a
@@ -7048,7 +7065,7 @@ int main(int argc, char** argv) {
     // body. Forced here rather than in tuning.json because it feeds the shader
     // constant prelude and therefore worldgen — it has to be true before the
     // first chunk is generated, not toggled later.
-    if (g_shotJump || g_shotSwim || g_shotCrawl) {
+    if (g_shotJump || g_shotSwim || g_shotCrawl || g_shotArchery) {
       tune.debug.vegetation = 0;
       tune.debug.groundCover = 0;
     }
@@ -8676,6 +8693,16 @@ int main(int argc, char** argv) {
     }
     // --shot-swim photographs the STROKE: a sword in the fist puts that arm
     // in its guard and hides half of it, so the harness swims empty-handed.
+    // --shot-archery: the BOW in the right fist (whatever the stub kit put
+    // there goes to the hotbar); the arrows are already in the pack.
+    if (g_shotArchery) {
+      const int bi = items.Find("bow");
+      ItemStack& rh = kit.equip.slots[EquipSlotOfHand(Hand::Right)];
+      if (bi >= 0) {
+        if (!rh.Empty()) hotbar.Add(rh);
+        rh = StackOf(items, bi);
+      }
+    }
     if (g_shotSwim && !std::getenv("SANDVOX_SHOT_SWIM_ARMED")) {
       ItemStack& rh = kit.equip.slots[EquipSlotOfHand(Hand::Right)];
       if (!rh.Empty()) {
@@ -11784,7 +11811,7 @@ int main(int argc, char** argv) {
           g_shotDemon ||     // ...or the demon it summoned
           g_shotEditor ||    // ...or the house it placed
           g_shotSpawn ||     // (a picture, not a reload test: the compile would own the run)
-          g_shotCrawl;
+          g_shotCrawl || g_shotArchery;
       if (frameCounter == g_harnessFrames / 2 && !noReload) {
         std::printf("--frames harness: triggering shader reload (F5 path)\n");
         ui.reloadShaders = true;
@@ -14467,6 +14494,114 @@ int main(int argc, char** argv) {
       cam.pitch = -0.12f;
       pin.SetPressed(TB_JUMP, frameCounter == kShotJumpAtFrame);
     }
+    // --shot-archery: the script (g_shotArchery). Frame windows, each picture
+    // near the end of its window so the blend into that pose has finished.
+    if (g_shotArchery) {
+      const uint64_t f = frameCounter;
+      if (f == 1) {
+        ui.visible = false;
+        CelestialClock& sky = Celestial();
+        sky.SetScale(2.0f, tick);
+        sky.SetScale(1.0f, tick);
+        const int64_t tpd = (int64_t)TicksPerDay(CurrentTuning());
+        sky.ticks = tpd * 42 / 100;
+        sky.prevTicks = sky.ticks;
+        sky.rem = 0;
+      }
+      player.fly = false;
+      ui.fly = false;
+      ui.tool = UIState::kToolMelee;   // the hands own LMB
+      ui.magicMode = false;
+      // The windows. Strafing turns the third-person body to its travel, so
+      // a strafe right then a stop leaves it side-on to the camera.
+      const bool fpStand = f >= 215 && f < 262;
+      const bool fpCrouch = f >= 452 && f < 500;
+      camMode = (fpStand || fpCrouch) ? CameraMode::First : CameraMode::Third;
+      pin.forward = 0.f;
+      pin.strafe = 0.f;
+      if (f >= 60 && f < 110) pin.strafe = 1.f;              // turn side-on
+      if (f >= 300 && f < 345) pin.strafe = 1.f;             // sneak, side-on
+      if (f >= 345 && f < 380) { pin.strafe = 1.f; pin.forward = -0.6f; }  // 3/4 front
+      if (f >= 380 && f < 392) pin.strafe = 1.f;             // square up again
+      pin.SetHeld(TB_SPRINT, false);
+      pin.SetHeld(TB_JUMP, false);
+      pin.SetPressed(TB_JUMP, false);
+      // A TAP of Ctrl toggles the crouch (a hold would go prone).
+      pin.SetHeld(TB_CROUCH, f == 280);
+      pin.SetPressed(TB_CROUCH, f == 280);
+      g_shotArcheryDraw = (f >= 150 && f < 250) || (f >= 400 && f < 492);
+      // The sneak EMPTY-HANDED (its arms are the sneak's own, not a held
+      // weapon's), the bow back in the fist for the crouched draw.
+      {
+        static ItemStack stowed;
+        ItemStack& rh = kit.equip.slots[EquipSlotOfHand(Hand::Right)];
+        if (f == 286 && !rh.Empty()) {
+          stowed = rh;
+          rh = ItemStack{};
+        }
+        if (f == 386 && rh.Empty() && !stowed.Empty()) {
+          rh = stowed;
+          stowed = ItemStack{};
+        }
+      }
+      cam.yaw = 0.6f;
+      cam.pitch = -0.12f;
+      // The draws from in front as well: the body holds the heading the
+      // strafe gave it (third person faces its travel), so turning the
+      // camera round three-quarters shows it from its front-left.
+      if ((f >= 206 && f < 215) || (f >= 441 && f < 452)) cam.yaw = 0.6f + 2.3f;
+      if (fpStand || fpCrouch) cam.pitch = 0.0f;
+      if (f >= 227 && f < 238) cam.pitch = 0.40f;   // aiming up
+      if (f >= 238 && f < 250) cam.pitch = -0.40f;  // aiming down
+      static char path[96];
+      auto shot = [&](const char* what) {
+        std::snprintf(path, sizeof(path), "screenshot_archery_%s.bmp", what);
+        g_shotJumpPath = path;
+      };
+      auto shotF = [&](const char* what) {
+        std::snprintf(path, sizeof(path), "screenshot_archery_%s_f%llu.bmp", what,
+                      (unsigned long long)f);
+        g_shotJumpPath = path;
+      };
+      if (f == 140) shot("tp_stand");
+      if (f == 204) shot("tp_draw");
+      if (f == 214) shot("tp_draw_front");
+      if (f == 226) shot("fp_draw");
+      if (f == 237) shot("fp_draw_up");
+      if (f == 249) shot("fp_draw_down");
+      if (f >= 250 && f < 258) shotF("fp_loose");
+      if (f == 296) shot("tp_crouch");
+      if (f >= 320 && f < 345 && (f - 320) % 8 == 0) shotF("tp_sneak_side");
+      if (f >= 358 && f < 380 && (f - 358) % 8 == 0) shotF("tp_sneak_front");
+      if (f == 398) shot("tp_crouch_still");
+      if (f == 439) shot("tp_crouch_draw");
+      if (f == 451) shot("tp_crouch_draw_front");
+      if (f == 480) shot("fp_crouch_draw");
+      if (f >= 492 && f < 500) shotF("fp_crouch_loose");
+      if (f == 540) shot("tp_end");
+      if (g_shotJumpPath) {
+        std::printf("--shot-archery: %s crouch=%d prone=%d draw=%d\n", g_shotJumpPath,
+                    (int)player.crouching, (int)player.prone, (int)g_shotArcheryDraw);
+        // Where the arms are against the eye, in ART cells in the body's own
+        // frame (x = its left, z = ahead): the numbers the clip generator
+        // (scripts/gen_archery_clips.py) predicts, to compare with.
+        Vec3 headEye{};
+        if (avatar.Spawned() && avatar.HeadEyeWorld(headEye)) {
+          const float h = avatar.Heading();
+          const float art = 80.0f * kVoxelMeters;   // art cells per world voxel
+          for (const char* nm : {"armU.L", "armL.L", "hand.L", "armU.R", "armL.R", "hand.R"}) {
+            Vec3 a{};
+            const int pi = avatar.PartIndex(nm);
+            if (pi < 0 || !avatar.PartAnchorWorld(pi, a)) continue;
+            const Vec3 d = a - headEye;
+            const float fwd = d.x * std::sin(h) + d.z * std::cos(h);
+            const float left = d.x * std::cos(h) - d.z * std::sin(h);
+            std::printf("    %-7s rel eye: left %6.1f up %6.1f ahead %6.1f\n", nm,
+                        left * art, d.y * art, fwd * art);
+          }
+        }
+      }
+    }
     // --shot-crawl: the crawl script (g_shotCrawl). Walk, a Ctrl press held
     // into prone, then crawl nearly side-on; first person from
     // kShotCrawlFirst. Morning sun, no dev panel.
@@ -15498,6 +15633,7 @@ int main(int argc, char** argv) {
       accumulator = (double)fixedTicksPerFrame * kTickDt;
     int ticksThisFrame = 0;
     bool mouseL = captured && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+    if (g_shotArchery) mouseL = g_shotArcheryDraw;   // the harness's scripted draw
     bool mouseR = captured && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
     // LMB routes to the active tool: continuous for brush/laser, click-edge
     // for one-shot tools (prefab stamp, mob spawn)
@@ -16472,6 +16608,21 @@ int main(int argc, char** argv) {
             // (the base rig is ParentsFirst, an appended slot's host is an
             // earlier slot), so one forward pass reaches every descendant.
             if (p.head >= 0 && p.head < (int)hide.size()) hide[p.head] = 1;
+            // THE STRING HAND OF A DRAWN BOW (bow_draw*): it is hooked under
+            // the jaw, a hand's breadth from the eye. The pose keeps it out of
+            // the view at any held aim, but the draw follows the look on an
+            // eased pitch and a fast flick down outruns it -- the forearm
+            // swept up across the bottom of the view for a tenth of a second.
+            // Hidden while the draw lasts, with whatever it wears; the bow arm
+            // stays (it is the view).
+            if (session.bowDrawTicks > 0 && session.bowHand >= 0) {
+              const bool bowLeft = HandAt(session.bowHand) == Hand::Left;
+              for (const char* nm : {bowLeft ? "armL.R" : "armL.L",
+                                     bowLeft ? "hand.R" : "hand.L"}) {
+                const int pi = avatar.PartIndex(nm);
+                if (pi >= 0 && pi < (int)hide.size()) hide[pi] = 1;
+              }
+            }
             for (int i = 0; i < (int)hide.size(); i++) {
               const int par = avatar.PartParent(i);
               if (par >= 0 && par < (int)hide.size() && hide[par] == 1)
@@ -19735,7 +19886,10 @@ int main(int argc, char** argv) {
       // numbers spelled out, so drawing the corner chrome underneath it is two
       // readouts of the same thing fighting for the same corner.
       // ...and while talking: the conversation panel sits where the hotbar is.
-      if (!ui.inventoryOpen && !ui.talk.open && !ui.worldMap.open && !editorMode.Active()) overlay.DrawHUD(ui);
+      // (--shot-archery photographs a pose: the bow meter sits on the figure.)
+      if (!ui.inventoryOpen && !ui.talk.open && !ui.worldMap.open && !editorMode.Active() &&
+          !g_shotArchery)
+        overlay.DrawHUD(ui);
       overlay.Draw(ui);
       DrawBugReport(ui);  // F12 (ui/bugreport.h): over everything, or nothing in the shot frame
       // ---- THE EDITOR (F8): its panels, overlays and input, then its world

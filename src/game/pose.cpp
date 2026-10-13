@@ -561,6 +561,7 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
     pose_.gaitClipsCount = sk.clips.size();
     pose_.walkClip = sk.FindClip("walk");
     pose_.runClip = sk.FindClip("run");
+    pose_.sneakClip = sk.FindClip("sneak");
   }
   const int walkClip = pose_.walkClip, runClip = pose_.runClip;
   // THE NPC'S PICK (PoseInputs::gaitClips). The avatar's thresholds, for the
@@ -658,6 +659,40 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
         for (ClipInstance& inst : st.clips)
           if (inst.clip == ci) inst.stopping = true;
       }
+    }
+  }
+
+  // ---- THE SNEAK: the held crouch's lean (assets/anims/sneak.json) ---------
+  // A Ctrl crouch used to be the pelvis sinking into bent knees and nothing
+  // else -- a squat. The sneak is an ADDITIVE layer on the spine and arms (the
+  // chest over the hips, the head turned back up to the look, the arms a
+  // little forward and out with soft elbows), weighted by how far the held
+  // crouch has sunk, so it rides that ease in and out exactly and goes with it
+  // wherever the crouch is off (a clip-owned state, the air's own pose keeps
+  // it, as the crouch does). Additive, so an override that owns the arms (the
+  // bow draws, a spell held ready) quiets it there by its own quietAdditive,
+  // and the walk's arm swing still lands on top of it. The weight is one tick
+  // behind the crouch it follows (crouchHold eases after the sample, below):
+  // a 33 ms lag inside an 80 ms ease. Only a driver that crouches (the avatar)
+  // ever gives it weight; every other body skips the block at weight 0.
+  if (pose_.sneakClip >= 0) {
+    float legLen = 0.0f;
+    for (const FootState& f : st.feet) legLen = std::max(legLen, f.legLength);
+    float full = MetresToCells(CurrentTuning().player.crouchKneeDrop);
+    if (legLen > 0.0f) full = std::min(full, kMaxHeldCrouchLegLengths * legLen);
+    const float w =
+        full > 1e-3f ? std::clamp(pose_.crouchHold / full, 0.0f, 1.0f) : 0.0f;
+    const int ci = pose_.sneakClip;
+    if (w > 0.0f) {
+      // Revive before requesting (the chase pose's reason, above).
+      for (ClipInstance& inst : st.clips)
+        if (inst.clip == ci) inst.stopping = false;
+      PlayClipIndex(ci);
+      for (ClipInstance& inst : st.clips)
+        if (inst.clip == ci) inst.weight = Smooth01(w);
+    } else {
+      for (ClipInstance& inst : st.clips)
+        if (inst.clip == ci) inst.stopping = true;
     }
   }
 
@@ -1028,15 +1063,39 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
       ApplyAimPart(sk, st, head, pose_.lookYaw, pose_.lookPitch, 1.0f,
                    in.lookSpineShare);
     // A held pose that follows the look up and down (AnimClip::pitchFollow,
-    // e.g. spell_ready's arms): a share of the same eased pitch, about the
-    // part's own X, sign as ApplyAimPart's (pitch positive UP).
-    if (std::fabs(pose_.lookPitch) > 1e-4f)
+    // e.g. spell_ready's arms, the bow draws' torso): a share of the same
+    // eased pitch, sign as ApplyAimPart's (pitch positive UP), about the
+    // PARENT's X -- the body's own left-right axis -- not the part's. The two
+    // agree for a part the clip only pitches; they part company the moment it
+    // is turned (the bow draw twists the torso 60 degrees side-on), where the
+    // part's own X points half way down the arrow and "pitch" became a roll
+    // that swung the bow sideways instead of lifting it.
+    if (std::fabs(pose_.lookPitch) > 1e-4f) {
       for (size_t i = 0; i < st.pitchFollow.size() && i < st.local.size(); i++) {
         const float f = st.pitchFollow[i];
         if (f == 0.0f || (i < st.partAlive.size() && !st.partAlive[i])) continue;
         st.local[i].rot = QuatNormalize(
-            Mul(st.local[i].rot, AxisAngle({1, 0, 0}, -pose_.lookPitch * f)));
+            Mul(AxisAngle({1, 0, 0}, -pose_.lookPitch * f), st.local[i].rot));
       }
+      // ...AND THE HEAD HANDS BACK WHAT ITS ANCESTORS TOOK. It was turned by
+      // the WHOLE look above, and a torso following a share of it carries the
+      // head through that share again: 1.6x the look under the bow draw,
+      // which swung the first-person eye (it rides the head) forward over the
+      // hands whenever the draw aimed down. Pure X turns commute, so taking
+      // the carried share off the head's own pitch leaves the face at the look.
+      if (haveHead) {
+        float carried = 0.0f;
+        for (int p = sk.parts[(size_t)head].parent; p >= 0;
+             p = sk.parts[(size_t)p].parent)
+          if (p < (int)st.pitchFollow.size() &&
+              (p >= (int)st.partAlive.size() || st.partAlive[(size_t)p]))
+            carried += st.pitchFollow[(size_t)p];
+        if (carried != 0.0f)
+          st.local[(size_t)head].rot = QuatNormalize(Mul(
+              st.local[(size_t)head].rot,
+              AxisAngle({1, 0, 0}, pose_.lookPitch * carried)));
+      }
+    }
   }
 
   // ---- stage 3.5: the torso serves a live swing (anim.h) ----

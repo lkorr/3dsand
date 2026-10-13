@@ -2259,30 +2259,42 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
         const ItemDef* ammo = bowDef ? items.Named(bowDef->bow.ammo) : nullptr;
         int have = ammo ? KitAmmoCount(kit, ammo->name) : 0;
         // The pose is authored for a bow in the RIGHT fist; the left plays
-        // its mirror (Mob::HandClip). Stopped on the hand it was STARTED in.
+        // its mirror (Mob::HandClip). Stopped as it was STARTED (s.bowClip):
+        // the hand, and the stance, it was drawn in.
+        auto stopDrawClip = [&] {
+          if (!s.bowClip.empty() && avatar.Spawned()) avatar.StopClip(s.bowClip);
+          s.bowClip.clear();
+        };
         if (bh != s.bowHand) {
-          const std::string was =
-              avatar.HandClip("bow_draw", HandAt(s.bowHand >= 0 ? s.bowHand : 0));
-          if (s.bowDrawTicks > 0 && avatar.Spawned() && !was.empty())
-            avatar.StopClip(was);
+          if (s.bowDrawTicks > 0) stopDrawClip();
           s.bowDrawTicks = 0;
           s.bowHand = bh;
         }
         const Hand bowHand = HandAt(bh >= 0 ? bh : 0);
-        const std::string drawClip = avatar.HandClip("bow_draw", bowHand);
+        // CROUCHED, the bow is laid flat (bow_draw_crouch): a low draw from
+        // cover. Prone has its own pose and takes no draw clip change here.
+        const bool crouchDraw = player.crouching && !player.prone;
+        const std::string drawClip = avatar.HandClip(
+            crouchDraw ? "bow_draw_crouch" : "bow_draw", bowHand);
         const uint32_t bowBtn = bowHand == Hand::Left ? TB_ALT : TB_ATTACK;
         if (bowDef != nullptr && ti.Held(bowBtn) &&
             (s.bowDrawTicks > 0 || have > 0)) {
-          if (s.bowDrawTicks == 0) {
-            if (avatar.Spawned() && !drawClip.empty()) avatar.PlayClip(drawClip);
-            s.lastHand = bowHand;
+          if (s.bowDrawTicks == 0) s.lastHand = bowHand;
+          // Started, or the stance changed under the draw: the other clip
+          // takes over through its own blend-in, the draw count runs on.
+          if (s.bowClip != drawClip) {
+            stopDrawClip();
+            if (avatar.Spawned() && !drawClip.empty()) {
+              avatar.PlayClip(drawClip);
+              s.bowClip = drawClip;
+            }
           }
           s.bowDrawTicks = std::min(s.bowDrawTicks + 1, 1 << 20);
         } else if (bowDef != nullptr && s.bowDrawTicks > 0) {
           // THE LOOSE. Under the bow's minDraw it is a fumble: the arrow
           // stays on the string (in the kit) and nothing flies.
           const float speed = BowArrowSpeed(*bowDef, s.bowDrawTicks);
-          if (avatar.Spawned() && !drawClip.empty()) avatar.StopClip(drawClip);
+          stopDrawClip();
           s.bowDrawTicks = 0;
           if (speed > 0.0f && ammo != nullptr && have > 0) {
             // FROM THE EYE, ALONG THE LOOK -- the spell aim's camera, so the

@@ -13,7 +13,14 @@ One keyframed clip per `<name>.json`, in the same schema as a mob sidecar's
   at full weight. Additives land after the override blend, so without it a
   held pose takes the walk's arm swing on top of itself.
 - `pitchFollow` — override clips only, `{ "<part>": -1..1 }`: the share of the
-  eased look pitch the part turns through about its own X (pose.cpp).
+  eased look pitch the part turns through about its PARENT's X -- the body's
+  left-right axis, so a turned part (the bow draw's side-on torso) still lifts
+  (pose.cpp). The head hands back whatever its ancestors carried.
+
+`bow_draw`, `bow_draw_crouch` and `sneak` are SOLVED, not posed:
+`python scripts/gen_archery_clips.py` writes them from target points (and
+prints what first person sees of the arms at each aim). Edit the targets
+there, never the quaternions.
 
 Both mirror with the clip (`<name>.mirror` swaps the part names). The tuner's
 clip lane does not edit them; hand-edit the file.

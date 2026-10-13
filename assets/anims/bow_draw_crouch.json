@@ -1,0 +1,74 @@
+{
+  "//": "DRAWING A BOW FROM A CROUCH (session.cpp's bow block plays this instead of bow_draw while the player is crouched). The bow laid flat, canted a quarter turn by the bow hand so its top limb points across to the draw side, held a little lower and closer than the standing draw; the same string-hand line (elbow behind the shoulder). The torso and head are this clip's: the sneak lean (sneak.json, an additive) is quieted there so the arrow is not aimed into the ground. Solved by scripts/gen_archery_clips.py from target points -- edit the targets there and re-run, never these quaternions. ",
+  "name": "bow_draw_crouch",
+  "sidecarVoxelsPerMetre": 10,
+  "durationMs": 1200,
+  "loop": true,
+  "mode": "override",
+  "blendInMs": 220,
+  "blendOutMs": 140,
+  "mask": ["armU.R", "armL.R", "hand.R", "armU.L", "armL.L", "hand.L", "torso", "head"],
+  "quietAdditive": {
+    "armU.R": 1.0,
+    "armL.R": 1.0,
+    "hand.R": 1.0,
+    "armU.L": 1.0,
+    "armL.L": 1.0,
+    "hand.L": 1.0,
+    "torso": 1.0,
+    "head": 1.0
+  },
+  "pitchFollow": {
+    "torso": 0.85
+  },
+  "tracks": {
+    "armU.R": {
+      "rot": [
+        { "t": 0, "q": [0.0334, 0.3608, -0.7573, 0.5434] },
+        { "t": 1200, "q": [0.0334, 0.3608, -0.7573, 0.5434] }
+      ]
+    },
+    "armL.R": {
+      "rot": [
+        { "t": 0, "q": [-0.1786, 0.0, 0.0, 0.9839] },
+        { "t": 1200, "q": [-0.1786, 0.0, 0.0, 0.9839] }
+      ]
+    },
+    "hand.R": {
+      "rot": [
+        { "t": 0, "q": [0.0526, -0.3791, 0.0561, 0.9222] },
+        { "t": 1200, "q": [0.0526, -0.3791, 0.0561, 0.9222] }
+      ]
+    },
+    "armU.L": {
+      "rot": [
+        { "t": 0, "q": [-0.3774, -0.3513, 0.598, 0.6137] },
+        { "t": 1200, "q": [-0.3774, -0.3513, 0.598, 0.6137] }
+      ]
+    },
+    "armL.L": {
+      "rot": [
+        { "t": 0, "q": [-0.9063, 0.0, 0.0, 0.4226] },
+        { "t": 1200, "q": [-0.9063, 0.0, 0.0, 0.4226] }
+      ]
+    },
+    "hand.L": {
+      "rot": [
+        { "t": 0, "q": [-0.4628, 0.1581, -0.0627, 0.87] },
+        { "t": 1200, "q": [-0.4628, 0.1581, -0.0627, 0.87] }
+      ]
+    },
+    "torso": {
+      "rot": [
+        { "t": 0, "q": [0.0, 0.4727, 0.0, 0.8812] },
+        { "t": 1200, "q": [0.0, 0.4727, 0.0, 0.8812] }
+      ]
+    },
+    "head": {
+      "rot": [
+        { "t": 0, "q": [-0.0, -0.4727, -0.0, 0.8812] },
+        { "t": 1200, "q": [-0.0, -0.4727, -0.0, 0.8812] }
+      ]
+    }
+  }
+}

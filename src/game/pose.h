@@ -237,6 +237,8 @@ struct PoseDrive {
   // clip table they were looked up in (re-resolved when that table moves).
   bool gaitRunning = false;
   int walkClip = -1, runClip = -1;
+  // The held crouch's lean (assets/anims/sneak.json), resolved with the pair.
+  int sneakClip = -1;
   const void* gaitClipsKey = nullptr;
   size_t gaitClipsCount = 0;
   // ---- the swim family (PoseInputs::swim) ---------------------------------
