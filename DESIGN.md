@@ -19374,6 +19374,51 @@ one WGSL const and no rebuild — it is **99.2%**, largest step exactly 16/255,
 and the number of slot-frames that move at all falls from 43,928 to 7,146.
 Moving a little every frame rather than a lot occasionally IS the fix.
 
+**A hit on the patch's own voxel is self-shadow, not burial** (2026-10-13,
+ticket `2026-10-13_09-55-24`, "at this specific time of day, shadows have a
+bunch of noise on them"). The near shade asks the cache for every face the
+WRAPPED diffuse lights (`render.diffuseWrap` 1: every face but the exact
+anti-sun one), so the dark side of every wall, roof and terrain riser is a
+patch whose sun is BEHIND it. Its ray turns into the face and meets the
+patch's own voxel at t = `shadowBias` / -dot(n, dir): from 0.05 voxels while
+dot(n, L) is above -0.4 (a valid contact shadow), under it inside the
+resolve's "buried" test, which made the slot INVALID, and a pixel with no
+valid tap shades as FULL SUN. So past a certain hour every face turned from
+the sun was sunlit, and AT that hour the cone's sixteen samples (+-1 deg)
+fell either side of -0.4, flipping each patch between its shadow and full sun
+on the window's 64-frame cycle: speckle that grew for ~45 frames and cleared
+for ~18. Measured at the ticket camera with the clock frozen (SEAM_DBG 14,
+below): 18-20k of the house front's 61k pixels without an opinion on most
+frames, all 61k on others; 0 after. Burial is now the cell IN FRONT of the
+patch (`selfHit`: the hit cell is the patch's own), which is also what the
+cache-off reference `sunShadowAt` answers for the same ray.
+
+**A fresh window is a whole window** (2026-10-13, ticket
+`2026-10-13_09-57-09`, "very thin 1-pixel circles and lines ... only while
+I'm moving forward"). A patch whose slot is fresh used to publish its centre
+ray alone (0 or 1) and gain one cone sample per resolve, i.e. one per
+`SHADOW_REFRESH_PERIOD` frames: a second before its penumbra was its
+penumbra. Standing still nothing is fresh. Walking forward, whole rows are:
+the reader's LODs (bilinear above 4 px, nearest below, pooled by powers of
+two below 1.5 px) are curves of constant projected patch size round the
+camera, and ground crossing one toward the eye needs patches nobody had read.
+Each boundary dragged an arc of binary patches through every soft shadow --
+dark dashes in the tree's penumbra beside the house at 5 m, seen in every
+frame of a 1.6 m/s walk and in none of a converged still. The first resolve
+now casts the centre ray and two rim samples (sunflower 15 and 11, ~190
+degrees apart); if all three agree the patch is outside every penumbra and
+the window takes their verdict (each bit is re-cast for real on its own
+turn), otherwise all sixteen are cast. `shadow_resolve` at the ticket camera
+walking (1324x1128, `--frames`, not exclusive): mean 0.25 -> 0.31 ms a frame
+(all sixteen on every fresh patch measured 0.55), p99 1.0 -> 2.9, max 1.9 ->
+3.8 (the first frame, where every patch is fresh). The arcs are gone from the
+same frames.
+
+`SEAM_DBG 14` (raymarch.wgsl) is the instrument both were found with: per
+pixel, whether the cache gave NO opinion (the pixel shades as sun), the raw
+cached value, and why a tap had none (found but invalid / no slot); far
+pixels write their patch's (no opinion, value).
+
 **What is NOT here.** Soft shadows on the raster body paths. `bodySunShadow`
 casts one ray per FRAGMENT with nowhere to accumulate, so a limb still takes a
 hard edge; the terrain under it does not. Per-fragment cone jitter would dither

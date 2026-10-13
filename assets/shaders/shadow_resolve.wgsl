@@ -777,6 +777,17 @@ fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
                               valid, ver));
 }
 
+// The order a FRESH window casts its samples in (resolve, A FRESH PATCH CASTS
+// ITS WHOLE WINDOW): the undeflected centre, then two rim samples of the
+// sunflower ~190 degrees apart (15 and 11: golden angle x 4), then the rest.
+fn shadowFreshOrder(k : u32) -> u32 {
+  if (k == 0u) { return 0u; }
+  if (k == 1u) { return 15u; }
+  if (k == 2u) { return 11u; }
+  let j = k - 2u;   // 1..13 -> the samples 1..10, 12, 13, 14
+  return select(j, j + 1u, j >= 11u);
+}
+
 // resolve: one media-blind shadow ray per requested patch.
 @compute @workgroup_size(64)
 fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -844,9 +855,37 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   // is what keeps a static scene's published value bit-stable frame to frame.
   let centre = fresh || slotIdx == 0u;
   let rot = f32(shadowPatchKey(packedCell, packedSub) & 0xFFFFu) * (1.0 / 65536.0);
-  let dir = select(shadowConeDir(keyLightDirP(R), slotIdx, rot),
-                   keyLightDirP(R), centre);
+  let L = keyLightDirP(R);
 
+  // ---- A FRESH PATCH CASTS ITS WHOLE WINDOW (2026-10-13) ------------------
+  // (ticket 2026-10-13_09-57-09: "very thin 1-pixel circles and lines ... they
+  // only appear while I'm moving forward".) A patch whose window starts empty
+  // used to publish its centre ray alone -- 0 or 1 -- and gain one cone sample
+  // per resolve, i.e. one per SHADOW_REFRESH_PERIOD frames: 64 frames, a
+  // second, before its penumbra was its penumbra. Standing still nothing is
+  // fresh. Walking, whole ROWS of patches are: the reader pools sub-pixel
+  // patches by powers of two (raymarch.wgsl SUB-PIXEL PATCHES ARE POOLED), so
+  // where the ground crosses a pool step as it comes toward the eye it needs
+  // the finer patches nobody had read, and each such boundary -- a curve of
+  // constant projected patch size round the camera -- dragged a band of
+  // half-estimated, high-contrast patches across every soft shadow. That was
+  // the moving circle under the house. So the FIRST resolve of a window
+  // publishes a FULL window; every later resolve refreshes one sample as
+  // before, the same direction into the same bit, so a static scene still
+  // settles bit-exactly. It is cheap where it can be: the centre ray and two
+  // rim samples ~190 degrees apart round the disc (sunflower 15 and 11) go
+  // first, and when all three agree the patch is outside every penumbra --
+  // the common case: open ground, a wall in full shadow -- and the other
+  // thirteen bits take their verdict (each is re-cast for real on its own
+  // turn, so a thin blocker the three missed costs a sample's worth of error
+  // for under a second). Only a patch the three disagree on, i.e. one IN a
+  // penumbra, casts all sixteen. Measured at the ticket camera walking
+  // (1324x1128): shadow_resolve mean 0.25 ms a frame before, 0.55 with all
+  // sixteen on every fresh patch, see DESIGN.md 9.s for the shipped number.
+  // One loop, one call site: the single-ray resolve is the same loop with a
+  // count of one.
+  let nCast = select(1u, SHADOW_SAMPLES, fresh && SHADOW_CONE_TAN > 0.0);
+  var probeSeen = 0u;   // fresh windows: how many of the first three saw the sun
   // shadowCoarseFromT() is `coarseFromT` (W2-B): past that distance the march
   // terminates on the 4^3 blockers mask instead of the voxel. It MUST be the
   // same expression sunShadowAt passes — the gate casts this ray and that one
@@ -855,85 +894,125 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   // how a function in common.wgsl reaches bindings declared after it (see
   // traceOpaque).
   let ro = hp + n3 * TUNE_SHADOW_BIAS;
-  let s = traceOpaque(ro, dir, TUNE_SHADOW_STEPS, shadowCoarseFromT(),
-                      &occupancy, &materials);
-  // A BURIED PATCH HAS NO OPINION. The ray starts TUNE_SHADOW_BIAS off the
-  // face; a hit within a twentieth of a voxel of that means the cell in front
-  // of the patch is itself solid — the patch is not a surface anyone can see,
-  // it is the top face of the block UNDER a terrace step, or the side face
-  // of one INSIDE the hill. No pixel is ever on such a patch, but the reader's
-  // bilinear taps roll into the neighbour cell's same face past a face edge
-  // (raymarch.wgsl shadowCached), and at every step of a terraced hillside
-  // that neighbour is buried. Resolving it to a contact-black value painted a
-  // one-pixel dark line along every voxel edge of the terrain, sun or no sun
-  // — --gate shadow-cache's walk arm counted them as ~15-21k "phantom" pixels
-  // a frame, every one on a step edge. Marking the slot INVALID instead makes
-  // the tap drop out of the blend (weight 0) and the pixel shade from its own
-  // face's patches, which is the ordinary patch-quantised edge and nothing
-  // more. The slot stays claimed and live, so it is re-requested each frame
-  // (one ray that terminates in its first cell) and never reclaimed by a
-  // foreign patch mid-frame.
-  let buried = s.hit && s.t < 0.05;
-
-  // ---- fold this frame's verdict into the window ----
-  // `lit` is the sample's bit. RAN OUT OF STEPS counts as OCCLUDED, not as
-  // daylight: leaving the window is sky, but exhausting the budget underground
-  // is a blocker somewhere past it, and "no hit = lit" put full sun on the
-  // floor of any cave deeper than the budget reaches along the sun (2026-09-02,
-  // with block termination off: 384 fine steps = 38 m). It takes the FAR
-  // blocker's lift below, which the openness cap at the reader turns into
-  // nothing inside a cave and into the usual soft lift outdoors. Same rule in
-  // sunShadowAt (raymarch.wgsl); the gate compares them.
-  let ranOut = !s.hit && s.steps > u32(TUNE_SHADOW_STEPS);
-  // ---- past the window face (CASTERS OUTSIDE THE WINDOW, above) ----
-  // The near ray left the window clear; the cascade decides the rest. `bHit`
-  // and `bT` are the verdict and blocker distance everything below reads —
-  // the buried test above stays on the near ray alone, since a far blocker is
-  // by construction never within a twentieth of a voxel of the patch.
-  var bHit = s.hit;
-  var bT = s.t;
-  if (!s.hit && !ranOut) {
-    let tw = shadowWindowExitT(ro, dir);
-    let reachF = TUNE_FAR_SHADOW_REACH / VOXEL_METERS;
-    if (tw < reachF) {
-      let ft = farShadowT(1u, ro, dir, tw);
-      if (ft >= 0.0) { bHit = true; bT = ft; }
-    }
-    // A CLEAR RAY UNDER THE TERRAIN IS NOT SUNLIT (above): asked where the
-    // ray stopped being marched -- the reach, or the window's face for a ray
-    // that left it past the reach.
-    if (!bHit && farUnderTerrain(ro, dir, max(tw, reachF))) {
-      bHit = true;
-      bT = max(tw, reachF);
-    }
-  }
-  let sunSeen = !bHit && !ranOut;
-  let bit = 1u << slotIdx;
-  hist = select(hist & ~bit, hist | bit, sunSeen);
-  if (fill < SHADOW_SAMPLES) { fill = fill + 1u; }
-
-  // The lift this ray saw, if it is the one that owns the byte. The law is
-  // sunShadowAt's, verbatim, and must stay that way: the depth of a shadow is
-  // taken from how far the ray travelled before being blocked, so a contact
-  // shadow stays dark and a distant blocker's shadow lifts.
+  var buried = false;
   var liftB = (hist >> SHADOW_LIFT_SHIFT) & 0xFFu;
-  if (centre) {
-    var lv = 0.0;
-    if (bHit) {
-      let dM = bT * VOXEL_METERS;
-      lv = clamp(smoothstep(TUNE_SHADOW_SOFT_NEAR, TUNE_SHADOW_SOFT_FAR, dM) *
-                 TUNE_SHADOW_LIFT, 0.0, 1.0);
-    } else if (ranOut) {
-      lv = TUNE_SHADOW_LIFT;
-    } else {
-      // The centre ray is clear, so nothing is blocking the middle of the disc
-      // and only its rim can be clipped. Such a blocker is by construction a
-      // grazing one; lifting its sliver of shadow all the way to the far value
-      // would brighten the outer half of every penumbra. Contact-dark is the
-      // conservative end and the one that keeps an edge reading as an edge.
-      lv = 0.0;
+  for (var k = 0u; k < nCast; k++) {
+    // The sample this ray is: this frame's on the ordinary resolve, every one
+    // in turn on a fresh window's (sample 0 is the undeflected centre ray).
+    let idx = select(slotIdx, shadowFreshOrder(k), nCast > 1u);
+    let isCentre = select(centre, k == 0u, nCast > 1u);
+    let dir = select(shadowConeDir(L, idx, rot), L, isCentre);
+    let s = traceOpaque(ro, dir, TUNE_SHADOW_STEPS, shadowCoarseFromT(),
+                        &occupancy, &materials);
+    // A BURIED PATCH HAS NO OPINION. The ray starts TUNE_SHADOW_BIAS off the
+    // face; a hit within a twentieth of a voxel of that means the cell in front
+    // of the patch is itself solid — the patch is not a surface anyone can see,
+    // it is the top face of the block UNDER a terrace step, or the side face
+    // of one INSIDE the hill. No pixel is ever on such a patch, but the reader's
+    // bilinear taps roll into the neighbour cell's same face past a face edge
+    // (raymarch.wgsl shadowCached), and at every step of a terraced hillside
+    // that neighbour is buried. Resolving it to a contact-black value painted a
+    // one-pixel dark line along every voxel edge of the terrain, sun or no sun
+    // — --gate shadow-cache's walk arm counted them as ~15-21k "phantom" pixels
+    // a frame, every one on a step edge. Marking the slot INVALID instead makes
+    // the tap drop out of the blend (weight 0) and the pixel shade from its own
+    // face's patches, which is the ordinary patch-quantised edge and nothing
+    // more. The slot stays claimed and live, so it is re-requested each frame
+    // (one ray that terminates in its first cell) and never reclaimed by a
+    // foreign patch mid-frame.
+    //
+    // A HIT ON THE PATCH'S OWN VOXEL IS NOT BURIAL, IT IS SELF-SHADOW (2026-10-13,
+    // ticket 2026-10-13_09-55-24: "at this specific time of day, shadows have a
+    // bunch of noise on them"). The near shade asks the cache for every face the
+    // WRAPPED diffuse lights (render.diffuseWrap 1: every face but the exact
+    // anti-sun one), so most patches on the dark side of a house are faces the
+    // sun is BEHIND. Their ray turns into the face and meets the patch's own
+    // voxel at t = shadowBias / -dot(n, dir): 0.05 or more while dot(n, L) is
+    // above -0.4, a valid contact shadow; under it, this test called the patch
+    // buried, and a pixel whose taps are all buried shades as FULL SUN. At the
+    // hour a wall's dot(n, L) sat at -0.4 the cone's sixteen samples (+-1 deg)
+    // fell either side of the line, so the wall flickered between its shadow
+    // and full sun patch by patch on a 64-frame cycle (the window), and further
+    // into the evening the whole wall was sunlit from behind. The cell in front
+    // of the patch is what burial means; the patch's own cell is a blocker at
+    // contact distance, which is exactly what sunShadowAt (the cache-off
+    // reference) answers for the same ray.
+    let selfHit = s.hit && all(s.cell == cell);
+    if (isCentre || nCast == 1u) { buried = s.hit && s.t < 0.05 && !selfHit; }
+
+    // ---- fold this frame's verdict into the window ----
+    // `lit` is the sample's bit. RAN OUT OF STEPS counts as OCCLUDED, not as
+    // daylight: leaving the window is sky, but exhausting the budget underground
+    // is a blocker somewhere past it, and "no hit = lit" put full sun on the
+    // floor of any cave deeper than the budget reaches along the sun (2026-09-02,
+    // with block termination off: 384 fine steps = 38 m). It takes the FAR
+    // blocker's lift below, which the openness cap at the reader turns into
+    // nothing inside a cave and into the usual soft lift outdoors. Same rule in
+    // sunShadowAt (raymarch.wgsl); the gate compares them.
+    let ranOut = !s.hit && s.steps > u32(TUNE_SHADOW_STEPS);
+    // ---- past the window face (CASTERS OUTSIDE THE WINDOW, above) ----
+    // The near ray left the window clear; the cascade decides the rest. `bHit`
+    // and `bT` are the verdict and blocker distance everything below reads --
+    // the buried test above stays on the near ray alone, since a far blocker is
+    // by construction never within a twentieth of a voxel of the patch.
+    var bHit = s.hit;
+    var bT = s.t;
+    if (!s.hit && !ranOut) {
+      let tw = shadowWindowExitT(ro, dir);
+      let reachF = TUNE_FAR_SHADOW_REACH / VOXEL_METERS;
+      if (tw < reachF) {
+        let ft = farShadowT(1u, ro, dir, tw);
+        if (ft >= 0.0) { bHit = true; bT = ft; }
+      }
+      // A CLEAR RAY UNDER THE TERRAIN IS NOT SUNLIT (above): asked where the
+      // ray stopped being marched -- the reach, or the window's face for a ray
+      // that left it past the reach.
+      if (!bHit && farUnderTerrain(ro, dir, max(tw, reachF))) {
+        bHit = true;
+        bT = max(tw, reachF);
+      }
     }
-    liftB = u32(lv * 255.0 + 0.5);
+    let sunSeen = !bHit && !ranOut;
+    let bit = 1u << idx;
+    hist = select(hist & ~bit, hist | bit, sunSeen);
+    if (fill < SHADOW_SAMPLES) { fill = fill + 1u; }
+    // A fresh window's first three agree: outside every penumbra, the rest of
+    // the window takes their verdict (A FRESH PATCH CASTS ITS WHOLE WINDOW).
+    // `continue` and not `break`: the lift block below is the centre ray's
+    // and has already run on k == 0.
+    if (nCast > 1u && k < 3u) {
+      probeSeen += select(0u, 1u, sunSeen);
+      if (k == 2u && (probeSeen == 0u || probeSeen == 3u)) {
+        hist = select(hist & ~SHADOW_HIST_MASK, hist | SHADOW_HIST_MASK, probeSeen == 3u);
+        fill = SHADOW_SAMPLES;
+        k = nCast;
+        continue;
+      }
+    }
+
+    // The lift this ray saw, if it is the one that owns the byte. The law is
+    // sunShadowAt's, verbatim, and must stay that way: the depth of a shadow is
+    // taken from how far the ray travelled before being blocked, so a contact
+    // shadow stays dark and a distant blocker's shadow lifts.
+    if (isCentre) {
+      var lv = 0.0;
+      if (bHit) {
+        let dM = bT * VOXEL_METERS;
+        lv = clamp(smoothstep(TUNE_SHADOW_SOFT_NEAR, TUNE_SHADOW_SOFT_FAR, dM) *
+                   TUNE_SHADOW_LIFT, 0.0, 1.0);
+      } else if (ranOut) {
+        lv = TUNE_SHADOW_LIFT;
+      } else {
+        // The centre ray is clear, so nothing is blocking the middle of the
+        // disc and only its rim can be clipped. Such a blocker is by
+        // construction a grazing one; lifting its sliver of shadow all the way
+        // to the far value would brighten the outer half of every penumbra.
+        // Contact-dark is the conservative end and the one that keeps an edge
+        // reading as an edge.
+        lv = 0.0;
+      }
+      liftB = u32(lv * 255.0 + 0.5);
+    }
   }
   hist = (hist & SHADOW_HIST_MASK) | (fill << SHADOW_FILL_SHIFT) |
          (liftB << SHADOW_LIFT_SHIFT);

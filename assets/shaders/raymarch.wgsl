@@ -1051,9 +1051,16 @@ fn fogSkyK() -> f32 { return max(eyeSkyK(), gHitSky); }
 // LOD-SEAM GATE (2026-10-12, `--gate lod-seam` prints the per-class medians
 // and means of whichever frame this is): 12 = the sun shadow's stages
 // (gDbgSh): raw, after the LOD lift, after the lift cap; 13 = a far pixel's
-// shadow-cache patch: no opinion (1), its value, 0.5. 0 = off and
-// const-folded away.
+// shadow-cache patch: no opinion (1), its value, 0.5. NEAR SHADOW CACHE
+// (2026-10-13, ticket 2026-10-13_09-55-24): 14 = a near cache pixel's taps --
+// no opinion at all (1: the pixel shades as full sun), the raw cached value,
+// and why a tap had none (1 = a slot found but not valid, 0.5 = no slot:
+// claimed this frame, set full or stolen); a FAR pixel's patch writes (no
+// opinion, value, 0.25). 0 = off and const-folded away.
 const SEAM_DBG : u32 = 0u;
+// SEAM_DBG 14: per-pixel tap verdicts of shadowSlotRead (valid, found but
+// invalid, not found / claimed, stolen at registration).
+var<private> gDbgSc : vec4f = vec4f(0.0);
 // The MPM terms (SEAM_DBG 9-10): caFrac, foam, settled share (fs), churn; colVox.
 var<private> gDbgM0 : vec4f = vec4f(0.0);
 var<private> gDbgM1 : f32 = 0.0;
@@ -7026,6 +7033,7 @@ fn farShadowCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
             ((level - 1u) << FAR_SC_LEVEL_SHIFT);
   let r = farSlotRead(farScPackCell(cell, face), sub, R.frameIdx & 15u);
   if (SEAM_DBG == 13u) { gDbgSh = vec3f(select(1.0, 0.0, r.y > 0.0), r.x, 0.5); }
+  if (SEAM_DBG == 14u) { gDbg = vec4f(select(1.0, 0.0, r.y > 0.0), r.x, 0.25, 1.0); }
   return select(1.0, r.x, r.y > 0.0);
 }
 
@@ -8531,7 +8539,10 @@ fn shadowSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
       // that is the only word this test lets through as free without also
       // being stale.
       if (s != 0u && shadowSlotLive(s, curFrame)) {
-        if (shadowStateVerifier(s) == ver) { return vec2f(0.0); }
+        if (shadowStateVerifier(s) == ver) {
+          if (SEAM_DBG == 14u) { gDbgSc.z += 1.0; }
+          return vec2f(0.0);
+        }
         continue;
       }
       let r = atomicCompareExchangeWeak(
@@ -8548,15 +8559,20 @@ fn shadowSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
         // 5,620 moved pixels between warmed frames 3 and 4 (starved patches
         // claiming once the duplicates went stale), 0 at 12 frames.
         if (shadowStateVerifier(r.old_value) == ver &&
-            shadowSlotLive(r.old_value, curFrame)) { return vec2f(0.0); }
+            shadowSlotLive(r.old_value, curFrame)) {
+          if (SEAM_DBG == 14u) { gDbgSc.z += 1.0; }
+          return vec2f(0.0);
+        }
         continue;
       }
       atomicStore(&shadowCache[b * 2u], key);
       shadowAppendRequest(key, b, packedCell, packedSub);
+      if (SEAM_DBG == 14u) { gDbgSc.z += 1.0; }
       return vec2f(0.0);
     }
     // Set full of live patches. A miss, counted nowhere: at a 20% load the
     // Poisson tail past 8 is ~1e-5 of patches, and the blend covers it.
+    if (SEAM_DBG == 14u) { gDbgSc.z += 1.0; }
     return vec2f(0.0);
   }
 
@@ -8590,8 +8606,12 @@ fn shadowSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
         shadowAppendRequest(key, slot, packedCell, packedSub);
       }
     } else if (shadowStateVerifier(r.old_value) != ver) {
+      if (SEAM_DBG == 14u) { gDbgSc.w += 1.0; }
       return vec2f(0.0);
     }
+  }
+  if (SEAM_DBG == 14u) {
+    if (shadowStateValid(state)) { gDbgSc.x += 1.0; } else { gDbgSc.y += 1.0; }
   }
   // A slot that has never been resolved (claimed this frame, or last frame
   // with the resolve still to come) has no opinion. One that has is trusted
@@ -16406,8 +16426,14 @@ fn fs(in : VSOut) -> FSOut {
           // so that is the patch that answers for all its grains.
           let grains = !isMicro && m.klass == CLASS_POWDER &&
                        powderIsPartial(h.word);
+          if (SEAM_DBG == 14u) { gDbgSc = vec4f(0.0); }
           sh = shadowCached(hitP, h.cell, select(h.axis, 1, grains),
                             select(h.sgn, -1.0, grains), h.t);
+          if (SEAM_DBG == 14u) {
+            gDbg = vec4f(select(0.0, 1.0, gDbgSc.x == 0.0), sh,
+                         select(select(0.0, 0.5, gDbgSc.z + gDbgSc.w > 0.0), 1.0,
+                                gDbgSc.y > 0.0), 1.0);
+          }
         } else {
           sh = sunShadowFar(hitP, n, h.t);
         }
