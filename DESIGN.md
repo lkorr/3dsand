@@ -6383,9 +6383,9 @@ to blood-meat either (it gets the blood smear only).
 **Robots are matter** (2026-10-02, materials.h `shell` / `struck` / `burst`).
 The machine races' behaviour is ten materials.json rows and three new fields,
 no race code: brass plating, oily `clockwork`, an iron frame, a glowing
-`boiler` and a `cogitator` (brainHp) for the automaton; `synth_shell` panels,
+`boiler` and a `cogitator` (organHp) for the automaton; `synth_shell` panels,
 arcing `circuitry`, an `alloy` endoskeleton (hardness 180), a glowing
-`power_cell` and a `neural_core` (brainHp) for the android; `oil` is what an
+`power_cell` and a `neural_core` (organHp) for the android; `oil` is what an
 automaton bleeds -- flammable, so a holed automaton near a spark burns.
 **An android bleeds NOTHING** (owner, 2026-10-03: "sparks only, no fluid"):
 its rows say `bleedFluid: false`, its wiring/cell/core crumble to `gravel`, and
@@ -8514,7 +8514,7 @@ fire's account of how a limb comes apart.
 
 **What each cause may do is ONE table** (`kCauseRows`, keyed `(cause, eaten)`,
 resolved against the limb's TISSUE by `SeverPolicyOf`). Columns: the
-extreme-impact sever, the bleed rate, whether a carve drips, brain charge, the
+extreme-impact sever, the bleed rate, whether a carve drips, organ charge, the
 collapse sever, children carried by a split, the cut-through rule, the joint
 rule, hp-0-severs-any-limb, the worn-shell exemption, gore, whether a severed
 garment drops, the death's name, a rotten vital limb detaching at hp 0, and
@@ -8939,6 +8939,66 @@ some, per hit under the wound gates' own figure for one sword cut, which is what
 makes "caving a face in SLOWLY" mean something) and `bite-rot` (rotflesh > 0
 through skin, exactly 0 through iron). Every numeric row above is in the
 `combat-tuning` round-trip table, with a string probe for `bruiseMat`.
+
+### A point driven through: the penetrator (2026-10-12; `docs/PLAN_projectiles.md` B; `phys/kerf.h` `PierceChannel`, `Mob::PierceLimb`, `DebrisSystem::PierceBody`, `game/pierce.h` `PierceAlongRay`, gate `pierce`)
+
+The kerf is an EDGE: a slot travelling across what it cuts, priced by the
+plane it parts. The penetrator is the other blow a pointed thing delivers: a
+POINT travelling along its own axis, priced by the LENGTH of matter it pushes
+through. One model for arrows, thrown points and solid spell projectiles
+(packages C and D build on it).
+
+- **What hits.** `Penetrator` (phys/kerf.h): mass, speed at contact, tip
+  radius in FINE cells (1/80 m, the human art's lattice), the point's
+  hardness (or its material's), sharpness 0..1, an optional flat `hp` (a weapon
+  stat, as `StrikeProfile::cut` is melee's; 0 = the wound alone) and a soak
+  seed. Its energy is 1/2 m v^2.
+- **The channel.** A thin cylinder on the struck body's AUTHORITATIVE lattice
+  (the fine skin when there is one), walked in depth order a SLICE at a time,
+  each cell paying
+  `gore.pierceCellJ x (hardness / gear.cutHardnessRef) x soft x (1/max(sharpness, gore.pierceSharpFloor)) x volume`,
+  `soft = (cell / tip hardness)^gore.pierceSoftExp` when the point is the softer
+  one. The ratio is KerfBite's, so a body is exactly as hard to shoot through as
+  to cut through, by what it is made of: brass, bark and plate stop what goes
+  through a man with no per-race rule anywhere. A coarse lattice's cell is
+  charged by its volume against a fine cell, and a tip thinner than the
+  lattice's thinnest channel (half a cell diagonal) is widened to it at a
+  proportionally lower price, so the joules per centimetre are physical on any
+  art.
+- **Three outcomes.** Energy left past the far side -> EXITED, with the
+  residual speed; spent inside -> EMBEDDED at that depth; unable to pay the
+  first fine cell of matter -> GLANCED: nothing carved, and the blow lands as
+  trauma through `Mob::BluntHit` (`BruiseBody` on loose matter) at the CONTACT
+  rows' impulse -> hp rule (`gore.contactImpulseMin` / `contactHpPerImpulse` /
+  `contactMaxHp`), the rule a thrown rock is already billed by.
+- **The carve IS the channel.** `PierceKeepAt` on the authoritative lattice is
+  the channel's own axis test with its own numbers (`tStopLat` in lattice
+  units, not a world-voxel round trip), so `CarveLimb` / `DamageBody` remove
+  exactly the cells paid for; the gate asserts it on every living hit. The
+  carve is the ordinary one with `DamageCause::Pierce` (Beam's rows in
+  `severpolicy.h`: bleeds like a cut, charges the brain, no cut-through rule),
+  so the hp (woundHp-weighted volume share plus the flat brain charge), the
+  bleed, the gore particles and the crater-style soak are what every carve
+  gets. The drip comes out of the ENTRY hole. There is no kill rule (decision
+  1): whether an arrow through a brain kills is the brain charge's answer.
+- **Along a ray.** `PierceAlongRay` casts `Physics::CastRayBody` body by body,
+  resolves each hit in place, and hands the residual speed on: through an arm
+  into the torso, through one man into the next. Bodies met are skipped
+  thereafter (a carve rebuilds a limb under a new handle, and a cast from inside
+  a collider reports it at fraction 0); a hit on a collider with no matter on
+  the axis is a MISS, not a hit; a player's capsule is skipped for the limbs
+  inside it; a body nobody can carve (a door, a bomb) stops the point. Bounded
+  at `kPierceMaxBodies`. Terrain is the caller's flight's business.
+
+Calibration, `gore.pierceCellJ` 1.0 J per fine cell of skin-hard matter (a full bin of a one-cell-radius tip is pi of those), measured by the `pierce` gate on the human with a 30 g steel-tipped arrow, tip radius 1 fine cell:
+
+- **Thrown stone** (50 g, 10 m/s, 2.5 J, sharpness 0.05): GLANCES -- its first bin (scalp hair and the curve of the skin under it) costs 33.5 J. Its impulse (0.5 kg m/s) is under `gore.contactImpulseMin`, so the trauma it lands is 0 hp.
+- **Half draw** (32.5 m/s, 15.8 J): through the head's hair and flesh, STOPPED by the skull (one bone bin costs 9.4 J), 2.5 cm, no brain cell. Into the upper arm: skin, flesh, muscle, stopped by the humerus at 3.8 cm.
+- **Full draw** (65 m/s, 63.4 J): through the WHOLE head, temple to temple (19.4 cm, 62.8 J spent, out at 6 m/s); through the upper arm (9.4 cm, out at 42.9 m/s) and 8.8 cm on into the torso, stopped by a rib; through the torso front to back 6 cm off the midline (14.4 cm, out at 39.4 m/s).
+- **Harder skin, same full-draw shot**: the automaton (`tinker`) loses 1.9 cm of the brass piece on its chest and the arrow then GLANCES off its brass torso (27.5 J for the first bin, 26.7 J left); the sylvan (`dryad`) takes 7.5 cm of bark and wood and stops it.
+- **Does an arrow through the brain kill?** Not by itself. The brain charge is per CELL destroyed (`gore.brainHpPerVoxel` 3.5), and a one-cell-radius channel holds 2 to 5 cells per cell of depth by its alignment with the lattice alone: across five sub-cell offsets of the same full-draw shot, 16..31 brain cells, 57..111 hp of the head's 135, none killed outright; the 16-cell wound bled the head from 77.7 to 75.9 hp in 10 s. The PRICE is alignment-free (bins); the HP is not, because the carve and the brain charge count cells. That spread, and whether a brain shot should kill, are the owner's (decision 1).
+
+Known limits: no angle-of-incidence glance (a grazing shot pays the same first bin as a square one); materials.json hardness ranks ice (35) ABOVE bone (24), so the soft-point rule does not shatter ice on bone; a ghost (remote) creature is carved like a local one (package C must route shots on peers' bodies the way melee hits are routed).
 
 ### Infection is a material (2026-10-01; `docs/PLAN_weapon_coats.md` B; `Mob::InfectStep`, `Mob::CoatInfectTick`, `MaterialDef::infect`)
 
@@ -10545,6 +10605,29 @@ gets two orbits and a nasal hole filled with flesh, its chest is hollowed to
 flesh with a muscle wall and bone put back as ribs, a sternum and a spine.
 `anatomy.js carveFor/carveMatches` and `anatomy_resolve.cpp CarveFor/
 CarveMatches` are the same rule; `--gate anatomy-parity` keeps them one.
+
+**Organs cost hp by the cell (brain 2026-09-18, heart 2026-10-12).** An organ
+is a MATERIAL with `organHp` in materials.json: every cell of it lost, by any
+cause, subtracts that flat figure from its limb on top of the ordinary
+volume share (`Mob::CarveLimb`, `MobLimb::organCharged` — a delta of
+recomputed per-material sums, like the volume weights). No organ has a rule
+of its own: enough of it gone takes the limb's hp to 0 and the existing
+vital-limb rule kills, the death named for the organ ("heart destroyed",
+`Mob::OrganDeathCause`). `brain` 3.5 (it was the global
+`gore.brainHpPerVoxel` until the heart needed a figure of its own; same
+number, same charge bit for bit); `heart` 10.75, calibrated so 15% of the
+stock human's 112 heart cells takes its 180-hp torso to 0. The heart is a
+torso `carve` rule inside the cage (depth 4+, so it never displaces a rib,
+the sternum or the muscle wall; before the spine's rule, which takes its own
+cells back): behind the sternum, two thirds left of the midline, down the
+spine's left side. `heart` is id 223 — past what a `.vox` can paint (≤ 127)
+but inside a micro brick's 8-bit material (≤ 255), which is why it was
+INSERTED after `hair` rather than appended (saves remap by name) — so the
+bake paints the stand-in `mushroom_large` and the recipe's `becomes`
+rewrites it at load. A chest too thin to have an organ hollow (the imp, a
+few pool bodies) has no heart; race bodies with a chest of their own delete
+the inherited `becomes` key. Gate `heart` (a stab into it kills, the same
+stabs beside it do not); `scripts/test_anatomy.mjs` pins the count.
 
 **This is authoring, not engine.** Every runtime consumer was already per
 voxel: `voxload` keeps enclosed cells, the micro brick is dense and its march

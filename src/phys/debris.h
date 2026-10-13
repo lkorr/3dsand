@@ -364,6 +364,17 @@ class DebrisSystem {
   // handle is not an adopted body.
   bool CutBody(uint64_t handle, const KerfCut& cut, World& world,
                std::vector<ParticleSpawn>& spawns);
+  // ---- ...AND A POINT DRIVEN THROUGH ONE (2026-10-12, PLAN_projectiles B) ---
+  //
+  // The debris twin of Mob::PierceLimb: the same channel out of phys/kerf.h
+  // (PierceChannel), priced by the same hardness ratio, carved through the
+  // ordinary DamageBody tail with DamageCause::Pierce -- so an arrow through a
+  // severed arm or a crate takes the same tube a living arm would lose. A
+  // GLANCE carves nothing and bruises (BruiseBody), the trauma a corpse takes.
+  // False when the handle is not an adopted body; `out` says what happened.
+  bool PierceBody(uint64_t handle, Vec3 fromWorld, Vec3 dirWorld,
+                  const Penetrator& pen, World& world,
+                  std::vector<ParticleSpawn>& spawns, PierceResult& out);
   // WHAT DID THIS. Carried through the carve so the noise at the far end can
   // tell a sword from a fire: only a blade makes the wet dismemberment sound
   // (an explosion that takes the same arm off did not saw through anything),

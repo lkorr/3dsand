@@ -40,6 +40,9 @@ enum class DamageCause : uint8_t {
   Asphyxia,   // a body that cannot breathe where it is: a fish stranded out of
               // water (Mob::TickBreath, MobDef::SwimDef::breathSeconds). Hp
               // only -- no wound, no bleed, Electric's rows
+  Pierce,     // a point driven through: an arrow, a thrown point, a solid spell
+              // projectile (Mob::PierceLimb, phys/kerf.h PierceChannel).
+              // Beam's rows -- a bore, not a parting: no cut-through rule
   Count
 };
 
@@ -61,6 +64,7 @@ constexpr const char* DamageCauseName(DamageCause c) {
     case DamageCause::Infection: return "infection";
     case DamageCause::Electric: return "electric";
     case DamageCause::Asphyxia: return "asphyxia";
+    case DamageCause::Pierce: return "pierce";
     case DamageCause::Count: break;
   }
   return "?";

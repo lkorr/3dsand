@@ -103,10 +103,17 @@ inline Vec3 RotateInv(const Quat& q, Vec3 v) { return QuatRotateInv(q, v); }
 // it inherits fire's `deathBurnt` row -- and a snake bite that poisoned the
 // torso to death read "vital limb burnt/dissolved away" over a torso still 94%
 // there (bug report 2026-10-07 21:00). Named by the cause instead.
-static const char* VitalDeathCause(const SeverPolicy& pol, const DamageCtx& ctx) {
+//
+// ...AND BY THE ORGAN, when an organ's flat charge took at least half the
+// limb's hp (2026-10-12: "heart destroyed", "brain destroyed" --
+// Mob::OrganDeathCause, which says why half). Only in place
+// of the generic words: an infection that ate the heart is still a poisoning,
+// and fire that reached it is still a burning.
+static const char* VitalDeathCause(const SeverPolicy& pol, const DamageCtx& ctx,
+                                   const char* organ = nullptr) {
   if (ctx.cause == DamageCause::Infection) return "vital limb poisoned (infection)";
-  return pol.deathBurnt ? "vital limb burnt/dissolved away"
-                        : "vital limb destroyed";
+  if (pol.deathBurnt) return "vital limb burnt/dissolved away";
+  return organ != nullptr && organ[0] ? organ : "vital limb destroyed";
 }
 
 // ---- THE RIG-COHERENCE A/B ARM, IN ONE BINARY -------------------------------
@@ -1198,15 +1205,21 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
     // so bone, which crumbles to dust and is therefore not tissue, is
     // invisible to the rot until materials.json gives it a rate.
     def.woundHp.assign(mats.size(), 1.0f);
-    def.brainMat.assign(mats.size(), 0);
+    def.organHp.assign(mats.size(), 0.0f);
     def.rotRate.assign(mats.size(), 0.0f);
     for (size_t mi = 0; mi < mats.size(); mi++) {
       def.woundHp[mi] = mats[mi].woundHp;
-      def.brainMat[mi] = mats[mi].brainHp ? 1 : 0;
+      def.organHp[mi] = mats[mi].organHp;
       const bool isTissue =
           def.tissue.empty() || (mi < def.tissue.size() && def.tissue[mi]);
       def.rotRate[mi] = mats[mi].rotRate >= 0.0f ? mats[mi].rotRate
                                                  : (isTissue ? 1.0f : 0.0f);
+    }
+    // The character screen's `brain` (MobDef::uiBrainMat), by the name its
+    // own census uses. UI only; the charge is organHp's above.
+    {
+      const int b = FindMaterialId(mats, "brain");
+      def.uiBrainMat = b > 0 ? (uint32_t)b : 0u;
     }
     // NOT rescaled: this is a COUNT of voxels a wound may still owe, i.e.
     // a volume budget, and volume goes as the cube of the voxel scale. It
@@ -4728,9 +4741,12 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
                                                        : limb.voxels.size());
     limb.voxelsCharged = limb.voxelsAtSpawn;  // nothing lost, nothing charged
     // ...and the same totals weighted by substance (mob.h MobLimb::weightAtSpawn).
-    LimbWoundTotals(limb, limb.weightAtSpawn, limb.brainAtSpawn);
+    LimbSpawnCensus census;
+    LimbWoundTotals(limb, limb.weightAtSpawn, limb.organAtSpawn, &census);
     limb.weightCharged = limb.weightAtSpawn;
-    limb.brainCharged = limb.brainAtSpawn;
+    limb.organCharged = limb.organAtSpawn;
+    limb.brainAtSpawn = census.uiBrain;
+    limb.organMat = (uint16_t)census.organMat;
     // The body origin is the limb's min corner in WORLD voxels; the collider
     // is built at pitch 1/physScale so its collider-unit local coordinates land
     // in the right physical place. Not an integer cell any more at scale>1,
@@ -13290,11 +13306,14 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
       // dies in place with its head on. Sever() detaches a severable vital
       // limb before it calls Die(), which is right for geometry (the neck was
       // cut through, CarveLimb's collapse/split/neck rules) and wrong here:
-      // the laser plus gore.brainHpPerVoxel took a head to zero in a few ticks
+      // the laser plus the brain's organHp took a head to zero in a few ticks
       // and popped it off, where the owner wants a clean hole you can see
       // through. Only the impact-speed exception still detaches outright.
       if (ld.vital && !impactSevers && !pol.vitalHpZeroDetaches) {
-        deathCause_ = "vital limb destroyed";
+        // Named for the organ when the organ charge emptied this limb and a
+        // blow's hp only finished it (a stab's strike lands before its carve).
+        const char* organ = OrganDeathCause((int)i);
+        deathCause_ = organ ? organ : "vital limb destroyed";
         Die();
       } else {
         Sever((int)i, ctx);
@@ -15843,7 +15862,7 @@ int Mob::RestoreVoxels(int limbIndex, uint32_t material, int count) {
   // whatever substance the donor was made of, so `placed` alone does not say
   // what was added. Taking the total from the lattice is the same rule the
   // carve uses and cannot disagree with it.
-  LimbWoundTotals(limb, limb.weightCharged, limb.brainCharged);
+  LimbWoundTotals(limb, limb.weightCharged, limb.organCharged);
   // Art, then collider, the order the carve uses; and the burn index points
   // at the old lattice now.
   if (limb.microModel >= 0) ReskinLimbMicro(limb, skinScale, physScale);
@@ -16420,7 +16439,7 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
         burnFracDirty_ = true;
       }
     }
-    LimbWoundTotals(limb, limb.weightCharged, limb.brainCharged);
+    LimbWoundTotals(limb, limb.weightCharged, limb.organCharged);
     // Art, then collider, the order the carve uses; the burn index points at
     // the old lattice now.
     if (limb.microModel >= 0) ReskinLimbMicro(limb, skinScale, physScale);
@@ -16935,30 +16954,40 @@ uint64_t Mob::EmitCarvedFragment(const MobLimb& src, int srcLimb,
 // show up.
 //
 // A def with no weight table (built before materials were available) reports
-// weight == the plain voxel count and no brain, which is the pre-feature
+// weight == the plain voxel count and no organ, which is the pre-feature
 // behaviour exactly: every voxel weighs 1 and the fraction is the old fraction.
-void Mob::LimbWoundTotals(const MobLimb& limb, float& weight,
-                          uint32_t& brain) const {
+void Mob::LimbWoundTotals(const MobLimb& limb, float& weight, float& organ,
+                          LimbSpawnCensus* census) const {
   weight = 0.0f;
-  brain = 0;
+  organ = 0.0f;
+  if (census) *census = LimbSpawnCensus{};
   const bool fine = limb.HasFineSkin();
   if (!def_) {
     weight = (float)(fine ? limb.skinVoxels.size() : limb.voxels.size());
     return;
   }
+  // One cell's share of all three totals. The organ figure is summed in
+  // lattice order like the weight, so the total is a pure function of the
+  // lattice (and exact for any one organ: see MobLimb::organCharged).
+  auto take = [&](uint32_t m) {
+    weight += def_->WoundHpOf(m);
+    const float o = def_->OrganHpOf(m);
+    if (o > 0.0f) {
+      organ += o;
+      if (census && census->organMat == 0) census->organMat = m;
+    }
+    if (census && def_->uiBrainMat != 0 && m == def_->uiBrainMat)
+      census->uiBrain++;
+  };
   if (fine) {
     for (const PrefabVoxel& v : limb.skinVoxels) {
       const uint32_t m = (uint32_t)(v.material & 0xFFFu);
-      if (m == 0) continue;
-      weight += def_->WoundHpOf(m);
-      if (def_->IsBrain(m)) brain++;
+      if (m != 0) take(m);
     }
   } else {
     for (const DebrisVoxel& v : limb.voxels) {
       const uint32_t m = (uint32_t)(v.payload & 0xFFFu);
-      if (m == 0) continue;
-      weight += def_->WoundHpOf(m);
-      if (def_->IsBrain(m)) brain++;
+      if (m != 0) take(m);
     }
   }
 }
@@ -17281,8 +17310,8 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   // spall rounds, the connectivity split, the collider re-derive) and only a
   // total taken from the live lattice sees all of them.
   float nowWeight = 0.0f;
-  uint32_t nowBrain = 0;
-  LimbWoundTotals(limb, nowWeight, nowBrain);
+  float nowOrgan = 0.0f;
+  LimbWoundTotals(limb, nowWeight, nowOrgan);
   // Whether the lattice is still the one these totals were taken from. Only
   // the death/sever branch and the connectivity split below can change it;
   // when neither ran, the re-sync at the end of this function would recount
@@ -17302,30 +17331,33 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
     limb.hp -= charge;
     hpLostBy_[(int)ctx.cause] += charge;
   }
-  // ---- ...AND THE BRAIN IS NOT A FRACTION OF ANYTHING ----------------------
+  // ---- ...AND AN ORGAN IS NOT A FRACTION OF ANYTHING -----------------------
   //
-  // The one absolute charge in this function. Every brain voxel destroyed --
-  // by rot, a blade, a blast, a spell, it does not matter which, because they
-  // all arrive here -- subtracts a flat gore.brainHpPerVoxel on top of its
-  // ordinary share of the volume above.
+  // The one absolute charge in this function. Every organ voxel destroyed --
+  // brain, heart (materials.json `organHp`) -- by rot, a blade, a blast, a
+  // spell, it does not matter which, because they all arrive here, subtracts
+  // its material's flat figure on top of its ordinary share of the volume
+  // above. `organCharged - nowOrgan` IS that sum for the cells just lost: the
+  // totals are sums of the same per-material figures (MobLimb::organCharged).
   //
-  // There is deliberately NO death rule here. This drives head hp to 0 and the
-  // existing machinery does the rest (HpZeroSevers is true for a vital limb,
-  // Sever sees `vital` and calls Die), which is the same path a mace to the
-  // skull has always taken. Compare the note above InfectTick: "There is no
-  // infection-specific death rule and there must not be."
-  const uint32_t lostBrain =
-      limb.brainCharged > nowBrain ? limb.brainCharged - nowBrain : 0u;
-  limb.brainCharged = nowBrain;
+  // There is deliberately NO death rule here. This drives the limb's hp to 0
+  // and the existing machinery does the rest (HpZeroSevers is true for a vital
+  // limb, Sever sees `vital` and calls Die), which is the same path a mace to
+  // the skull has always taken. Compare the note above InfectTick: "There is
+  // no infection-specific death rule and there must not be." The heart is the
+  // brain's rule in the chest and nothing more.
+  const float lostOrgan =
+      limb.organCharged > nowOrgan ? limb.organCharged - nowOrgan : 0.0f;
+  limb.organCharged = nowOrgan;
   // A CREATURE BORN BITTEN ARRIVED WITH THOSE HOLES. RotAtSpawn's bites are
   // the damage a zombie SPAWNED with, not damage it is taking now, so the
-  // brain charge must not fire for them — a zombie whose spawn roll ate five
+  // organ charge must not fire for them — a zombie whose spawn roll ate five
   // brain voxels would die before its first tick. Only NEW damage (rot
   // advancing, a blade, a blast) charges the flat penalty.
-  if (lostBrain && pol.chargesBrain && alive_) {
-    limb.hp -= (float)lostBrain * CurrentTuning().gore.brainHpPerVoxel;
-    hpLostBy_[(int)ctx.cause] +=
-        (float)lostBrain * CurrentTuning().gore.brainHpPerVoxel;
+  if (lostOrgan > 0.0f && pol.chargesOrgan && alive_) {
+    limb.hp -= lostOrgan;
+    hpLostBy_[(int)ctx.cause] += lostOrgan;
+    limb.organHpTaken += lostOrgan;   // naming only (Mob::OrganDeathCause)
   }
   // ---- WHAT MAY BLEED, AND WHAT MAY NOT ------------------------------------
   //
@@ -17507,13 +17539,13 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
     // and the corpse collapses as a whole.
     //
     // ...AND SO IS ANY OTHER CARVE THAT KILLED BY HP ALONE (2026-09-22). A
-    // laser bore through the brain charges gore.brainHpPerVoxel per cell and
+    // laser bore through the brain charges the brain's organHp per cell and
     // reaches zero long before the neck is touched; detaching the head then
     // turned a clean hole into a decapitation. Geometry (`collapsed`, and the
     // split/neck rules below) is still what takes a head off.
     if (!collapsed && limbIndex < (int)limbDefs_.size() &&
         limbDefs_[limbIndex].vital && limbDefs_[limbIndex].severable) {
-      deathCause_ = VitalDeathCause(pol, ctx);
+      deathCause_ = VitalDeathCause(pol, ctx, OrganDeathCause(limbIndex));
       Die();
       // THE CORPSE KEEPS ITS HEAD AND ITS CARVE. The rig is still here (Die
       // no longer hands it away), so the lattice this carve just changed must
@@ -17921,7 +17953,7 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   // The weighted totals ride the same re-sync, for the same reason: the split
   // took real substance away and it must not be billed to the next carve.
   if (!totalsCurrent)
-    LimbWoundTotals(limb, limb.weightCharged, limb.brainCharged);
+    LimbWoundTotals(limb, limb.weightCharged, limb.organCharged);
 
   // Art, then collider. ReskinLimbMicro may shift the limb origin, and the
   // collider must be built from the voxels in their FINAL frame.
@@ -21117,6 +21149,22 @@ const InfectSpec& RotSpec() {
 // the save code below); an infection's authored `death` text goes through it
 // so the pointer outlives a materials reload.
 static const char* InternDeathCause(const std::string& name);
+
+// The organ's name off the material table ("heart destroyed"), interned like
+// an infection's authored words so the pointer outlives a materials reload.
+// Half the limb's max hp taken by the organ charge is what "the organ did
+// it" means here (mob.h): the threshold keeps an incidental nick of the
+// heart in a blast that tore the chest open from being named for it.
+const char* Mob::OrganDeathCause(int limbIndex) const {
+  if (sys_ == nullptr || limbIndex < 0 || limbIndex >= (int)limbs_.size() ||
+      limbIndex >= (int)limbDefs_.size())
+    return nullptr;
+  const MobLimb& l = limbs_[(size_t)limbIndex];
+  if (l.organMat == 0 || l.organMat >= sys_->matNames_.size() ||
+      !(l.organHpTaken >= 0.5f * limbDefs_[(size_t)limbIndex].hp))
+    return nullptr;
+  return InternDeathCause(sys_->matNames_[l.organMat] + " destroyed");
+}
 
 const InfectSpec& Mob::InfectSpecFor(uint32_t mat) const {
   const InfectSpec* s = sys_ ? sys_->InfectSpecOf(mat) : nullptr;
@@ -27007,7 +27055,7 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
     // HOW IT DIED IS WRITTEN ONCE. A corpse is a dead Mob now and still loses
     // limbs (a fire, a later blast); that is not a second death.
     if (alive_)
-      deathCause_ = VitalDeathCause(pol, ctx);
+      deathCause_ = VitalDeathCause(pol, ctx, OrganDeathCause(limbIndex));
     Die();
   } else {
     // A VITAL LIMB THAT IS SEVERABLE COMES OFF, AND THEN THE CREATURE DIES OF
@@ -27054,7 +27102,7 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
         pol.byBlade && ld.vital && limbIndex < baseLimbs_ &&
         TrimNeckForSever(limbIndex);
     if (fatal && alive_)   // written once: see the root branch above
-      deathCause_ = VitalDeathCause(pol, ctx);
+      deathCause_ = VitalDeathCause(pol, ctx, OrganDeathCause(limbIndex));
       // The cut point in WORLD space, captured BEFORE DetachLimb: the joint
       // anchor expressed through the severed limb's own live transform.
       //
@@ -29637,6 +29685,64 @@ bool MobSystem::LimbStainWorldYRange(uint64_t mobId, int limbIndex,
   if (best < -1e29f) return false;
   lo = least;
   hi = best;
+  return true;
+}
+
+bool MobSystem::LimbMaterialSpot(uint64_t mobId, int limbIndex, uint32_t mat,
+                                 MaterialSpot& out) const {
+  out = MaterialSpot{};
+  const Mob* mob = FindCreature(mobId);
+  if (!mob || limbIndex < 0 || limbIndex >= (int)mob->limbs_.size() || mat == 0)
+    return false;
+  const MobLimb& l = mob->limbs_[limbIndex];
+  const Quat q{l.xf.quat[0], l.xf.quat[1], l.xf.quat[2], l.xf.quat[3]};
+  for (int a = 0; a < 3; a++) {
+    Vec3 u{0, 0, 0};
+    (a == 0 ? u.x : a == 1 ? u.y : u.z) = 1.0f;
+    out.axis[a] = Rotate(q, u);
+  }
+  // The same lattice -> world map LimbStainWorldYRange uses (cell centres
+  // through the art pose), on whichever lattice is authoritative.
+  std::vector<Vec3> pts, all;
+  auto consider = [&](int x, int y, int z, uint32_t m, float inv) {
+    const Vec3 w = l.xf.pos + Rotate(q, Vec3{((float)x + 0.5f) * inv,
+                                             ((float)y + 0.5f) * inv,
+                                             ((float)z + 0.5f) * inv});
+    all.push_back(w);
+    if (m == mat) pts.push_back(w);
+  };
+  if (l.HasFineSkin()) {
+    const float inv = 1.0f / (float)std::max(1u, mob->SkinScaleOf(l));
+    for (const PrefabVoxel& v : l.skinVoxels)
+      if ((v.material & 0xFFFu) != 0)
+        consider(v.x, v.y, v.z, v.material & 0xFFFu, inv);
+  } else {
+    const float inv = 1.0f / (float)std::max(1u, mob->PhysScaleOf(l));
+    for (const DebrisVoxel& v : l.voxels)
+      if ((v.payload & 0xFFFu) != 0)
+        consider(v.x, v.y, v.z, v.payload & 0xFFFu, inv);
+  }
+  if (pts.empty()) return false;
+  Vec3 sum{};
+  for (const Vec3& p : pts) sum += p;
+  out.cells = (uint32_t)pts.size();
+  out.centroid = sum * (1.0f / (float)pts.size());
+  for (int a = 0; a < 3; a++) {
+    out.lo[a] = out.allLo[a] = 1e30f;
+    out.hi[a] = out.allHi[a] = -1e30f;
+  }
+  for (const Vec3& p : pts)
+    for (int a = 0; a < 3; a++) {
+      const float d = (p - out.centroid).dot(out.axis[a]);
+      out.lo[a] = std::min(out.lo[a], d);
+      out.hi[a] = std::max(out.hi[a], d);
+    }
+  for (const Vec3& p : all)
+    for (int a = 0; a < 3; a++) {
+      const float d = (p - out.centroid).dot(out.axis[a]);
+      out.allLo[a] = std::min(out.allLo[a], d);
+      out.allHi[a] = std::max(out.allHi[a], d);
+    }
   return true;
 }
 
@@ -32441,9 +32547,14 @@ int Mob::AppendWornShell(const ItemDef& item, const ItemCover& cover,
   p.voxelsAtSpawn =
       (uint32_t)(p.HasFineSkin() ? p.skinVoxels.size() : p.voxels.size());
   p.voxelsCharged = p.voxelsAtSpawn;
-  LimbWoundTotals(p, p.weightAtSpawn, p.brainAtSpawn);
-  p.weightCharged = p.weightAtSpawn;
-  p.brainCharged = p.brainAtSpawn;
+  {
+    LimbSpawnCensus census;
+    LimbWoundTotals(p, p.weightAtSpawn, p.organAtSpawn, &census);
+    p.weightCharged = p.weightAtSpawn;
+    p.organCharged = p.organAtSpawn;
+    p.brainAtSpawn = census.uiBrain;
+    p.organMat = (uint16_t)census.organMat;
+  }
 
   // Placed by the SAME two steps the drive loop takes, in the same order, so
   // the wear frame and every frame after it agree and the shell does not pop
@@ -32670,7 +32781,7 @@ void Mob::RestoreShellLattice(int slot, const WornShellDamage& d) {
       (uint32_t)(L.HasFineSkin() ? L.skinVoxels.size() : L.voxels.size());
   // Same for the weighted totals; `weightAtSpawn` is left alone for the same
   // reason `voxelsAtSpawn` is -- it is the authored denominator.
-  LimbWoundTotals(L, L.weightCharged, L.brainCharged);
+  LimbWoundTotals(L, L.weightCharged, L.organCharged);
 
   // Art, then collider, in that order: ReskinLimbMicro may shift the limb
   // origin and the body must be built from the voxels in their FINAL frame.

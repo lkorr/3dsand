@@ -426,7 +426,7 @@ struct MobDef {
   std::vector<uint8_t> tissue;
   // ---- THE GORE WEIGHTS, FLATTENED PER MATERIAL ID -------------------------
   //
-  // Straight copies of MaterialDef::woundHp / brainHp / rotRate, resolved once
+  // Straight copies of MaterialDef::woundHp / organHp / rotRate, resolved once
   // at load into vectors indexed by material id, exactly as `tissue` above is.
   // The point of flattening is that the damage and infection passes run per
   // VOXEL on a hot path and must not hold a material table or do a lookup by
@@ -436,18 +436,25 @@ struct MobDef {
   //
   // All three are empty on a def built before materials were available, and
   // every reader treats empty / past-the-end as the pre-feature default (weight
-  // 1, not brain, rot per `tissue`).
+  // 1, no organ, rot per `tissue`).
   std::vector<float> woundHp;
-  std::vector<uint8_t> brainMat;
+  std::vector<float> organHp;
   std::vector<float> rotRate;
   // Per-material weight, defaulting to 1 past the end of the table so a mob
   // whose def predates the weights behaves exactly as it used to.
   float WoundHpOf(uint32_t mat) const {
     return mat < woundHp.size() ? woundHp[mat] : 1.0f;
   }
-  bool IsBrain(uint32_t mat) const {
-    return mat < brainMat.size() && brainMat[mat] != 0;
+  // Flat hp a lost voxel of this costs on top of the volume charge
+  // (MaterialDef::organHp: brain, heart, a machine's mind); 0 = not an organ.
+  float OrganHpOf(uint32_t mat) const {
+    return mat < organHp.size() ? organHp[mat] : 0.0f;
   }
+  // The material the CHARACTER SCREEN calls brain (by name, as main.cpp's
+  // ResolveTissueMats does), so MobLimb::brainAtSpawn can count the same cells
+  // its "x / y brain missing" line counts now. A UI census and nothing else:
+  // the charge is OrganHpOf's. 0 = none.
+  uint32_t uiBrainMat = 0;
   // 0 = the rot cannot touch it. Past the end falls back to `tissue`, which is
   // the behaviour every caller had before rotRate existed.
   float RotRateOf(uint32_t mat) const {
@@ -1805,20 +1812,34 @@ struct MobLimb {
   // of. Keeping both is what let the depth weights land without touching
   // dismemberment at all.
   //
-  // `brainCharged` is the count of BRAIN voxels already charged, and it is a
-  // separate running total rather than a weight because brain is the one
-  // material that costs an ABSOLUTE hp amount per voxel
-  // (gore.brainHpPerVoxel) on top of its share of the volume.
+  // `organAtSpawn` / `organCharged` sum MobDef::OrganHpOf the same way: the
+  // ABSOLUTE hp the limb's organ cells (brain, heart -- materials.json
+  // `organHp`) are worth, which a carve charges flat on top of the volume
+  // share. A sum of per-material figures rather than a count because two
+  // organs may carry two figures; for one organ it is count x figure, and
+  // every figure in the table is exact in a float (3.5, 10.75), so the brain's
+  // charge is bit-for-bit the count-times-knob it was until 2026-10-12.
   //
-  // All three are deltas against the previous carve, for the same reason
+  // All four are deltas against the previous carve, for the same reason
   // `voxelsCharged` is: removals arrive from the carve predicate, the spall
   // rounds, the connectivity split and the collider re-derive, and a delta on
   // a total recomputed from the live lattice catches every one of them
   // without any of those paths knowing this accounting exists.
   float weightAtSpawn = 0;
   float weightCharged = 0;
+  float organAtSpawn = 0;
+  float organCharged = 0;
+  // Cells of MobDef::uiBrainMat at spawn: the character screen's "x / y brain
+  // missing" denominator (Avatar::PartBrainAtSpawn). Charges nothing.
   uint32_t brainAtSpawn = 0;
-  uint32_t brainCharged = 0;
+  // WHICH organ this limb carries (the first organ material in lattice order
+  // at spawn; a limb carries one), so a death the organ charge caused can be
+  // named for it ("heart destroyed"). 0 = no organ. Presentation only.
+  uint16_t organMat = 0;
+  // Hp the organ charge has actually TAKEN from this limb over its life (the
+  // living, chargesOrgan causes only -- not the spawn-rot holes it arrived
+  // with). Read only to name a death (Mob::OrganDeathCause).
+  float organHpTaken = 0;
   // How many non-tissue voxels (bone) this limb's infection has COATED over
   // its life. Cumulative and never decremented, because the rot eats bone now
   // and so a census of coated bone falls while the coat is working perfectly
@@ -2707,6 +2728,20 @@ class Mob {
   // this creature's live limbs.
   bool BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
                std::vector<ParticleSpawn>& spawns);
+  // ---- THE POINT PATH (phys/kerf.h PierceChannel, game/pierce.cpp) --------
+  // Drive `pen` into this creature's slot `bodyHandle` along the WORLD ray
+  // (`fromWorld`, unit `dirWorld`): a thin channel on the slot's fine lattice,
+  // paid cell by cell, carved through the ordinary CarveLimb (hp, woundHp
+  // weighting, the brain charge, the bleed, the gore, all as for a blade) with
+  // DamageCause::Pierce, and soaked like a crater. A GLANCE (it could not pay
+  // the first fine cell) carves nothing and lands as a BluntHit at the contact
+  // rows' impulse -> hp rule. `fromWorld` should be a little in front of the
+  // matter (the flight's last position, or the collider hit backed off): only
+  // matter at or past it is in the channel. False when the handle is not one of
+  // this creature's slots; `out` says what happened otherwise.
+  bool PierceLimb(uint64_t bodyHandle, Vec3 fromWorld, Vec3 dirWorld,
+                  const Penetrator& pen, World& world,
+                  std::vector<ParticleSpawn>& spawns, PierceResult& out);
 
   // ---- WHAT DID IT: THE CAUSE IS AN ARGUMENT (W2-G, 2026-09-24) -------------
   //
@@ -4588,12 +4623,25 @@ class Mob {
                  const CarveSpall* spall = nullptr,
                  CarveReport* report = nullptr,
                  const CarveBounds* bounds = nullptr);
-  // Sum MobDef::WoundHpOf over a limb's CURRENT authoritative lattice, and
-  // count its brain voxels, in one pass. This is what MobLimb::weightCharged /
-  // brainCharged are deltas of; see the note on those fields for why the
+  // Sum MobDef::WoundHpOf and MobDef::OrganHpOf over a limb's CURRENT
+  // authoritative lattice, in one pass. This is what MobLimb::weightCharged /
+  // organCharged are deltas of; see the note on those fields for why the
   // accounting is a recomputed total rather than a running subtraction.
-  void LimbWoundTotals(const MobLimb& limb, float& weight,
-                       uint32_t& brain) const;
+  // `census` (optional) also takes the spawn census on the same pass:
+  // MobLimb::brainAtSpawn (MobDef::uiBrainMat cells) and MobLimb::organMat.
+  struct LimbSpawnCensus {
+    uint32_t uiBrain = 0;
+    uint32_t organMat = 0;
+  };
+  void LimbWoundTotals(const MobLimb& limb, float& weight, float& organ,
+                       LimbSpawnCensus* census = nullptr) const;
+  // THE ORGAN, named on the death screen ("heart destroyed"), when a vital
+  // limb dies having lost at least HALF its max hp to its organ's flat charge
+  // (MobLimb::organHpTaken): the heart, not the wound around it, emptied the
+  // bar -- whichever blow then finished it (a stab's strike damage lands
+  // before its carve, so the last hp often go to that). Interned; nullptr
+  // when the limb has no organ or the organ did less than that.
+  const char* OrganDeathCause(int limbIndex) const;
   // ---- ONE BLOB TORN OUT OF A LIMB ----------------------------------------
   //
   // The correlated-noise bite Mob::RotAtSpawn draws the undead's holes with,
@@ -6551,6 +6599,12 @@ class MobSystem {
                 std::vector<ParticleSpawn>& spawns);
   bool BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
                std::vector<ParticleSpawn>& spawns);
+  // ...and the point (Mob::PierceLimb), over every creature. A flight that
+  // wants "this ray, through whatever it meets" calls game/pierce.h
+  // PierceAlongRay, which uses this.
+  bool PierceLimb(uint64_t bodyHandle, Vec3 fromWorld, Vec3 dirWorld,
+                  const Penetrator& pen, World& world,
+                  std::vector<ParticleSpawn>& spawns, PierceResult& out);
   // ---- A MATERIAL, BY NAME, AT RUNTIME ------------------------------------
   //
   // Tuning cannot hold a material id: tuning.json is hot-reloaded on F5 and
@@ -7891,6 +7945,23 @@ class MobSystem {
   // `minAmt` (0 = every voxel). False when there are none.
   bool LimbStainWorldYRange(uint64_t mobId, int limbIndex, uint32_t minAmt,
                             float& lo, float& hi) const;
+  // WHERE ONE MATERIAL SITS IN A LIMB, in world voxels, for a gate that has to
+  // aim at an organ (`heart`): how many authoritative-lattice cells of it,
+  // their centroid, the limb's MODEL axes through its live pose (axis[0] = the
+  // model's +x, the creature's left; [1] = up; [2] = the front), and the
+  // extent of the cells along each axis measured from the centroid. Also the
+  // limb's whole-lattice extent along the same axes (allLo / allHi), so an aim
+  // can be placed outside the material but inside the body. False when the
+  // limb has none of it.
+  struct MaterialSpot {
+    uint32_t cells = 0;
+    Vec3 centroid{};
+    Vec3 axis[3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    float lo[3] = {0, 0, 0}, hi[3] = {0, 0, 0};
+    float allLo[3] = {0, 0, 0}, allHi[3] = {0, 0, 0};
+  };
+  bool LimbMaterialSpot(uint64_t mobId, int limbIndex, uint32_t mat,
+                        MaterialSpot& out) const;
   // The stain palette slot a material leaves (materials.json `stain.type`),
   // 0 when it does not stain. Read off the material table this system already
   // mirrors for the burn pass.

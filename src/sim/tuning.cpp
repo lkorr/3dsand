@@ -1039,7 +1039,6 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("infectBoneStain", g.infectBoneStain);
     put("infectBoneStainVary", g.infectBoneStainVary);
     put("infectBoneIchor", g.infectBoneIchor);
-    put("brainHpPerVoxel", g.brainHpPerVoxel);
     put("carveHpPerVolume", g.carveHpPerVolume);
     put("blastPowerRef", g.blastPowerRef);
     put("contactImpulseMin", g.contactImpulseMin);

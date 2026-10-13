@@ -66,6 +66,7 @@
 #include "game/player.h"
 #include "game/mob.h"
 #include "game/melee.h"  // hit-drive swings the real sweep
+#include "game/pierce.h"  // pierce: PierceAlongRay, the projectile entry point
 #include "game/anim.h"   // QuatRotate: a joint anchor is body-local
 #include "game/bodyreg.h"  // heal-restore's optional picture sequence
 #include "gpu/resources.h"  // CreateBuffer, ditto
@@ -478,7 +479,7 @@ Status GateHairRooted(Ctx& c, std::string& detail) {
 // Owner report 2026-09-29: "when killing a mob via a laser their head gets
 // offset and displaced on the corpse ... the head becomes decoupled from their
 // hair". The laser is the one weapon that keeps carving the SAME limb every
-// tick, alive and dead, and that kills from the head (gore.brainHpPerVoxel), so
+// tick, alive and dead, and that kills from the head (the brain's materials.json organHp), so
 // the head is rebased and rebuilt dozens of times across the moment the rig
 // is handed to the solver.
 //
@@ -502,7 +503,7 @@ Status GateCorpseHeadLaser(Ctx& c, std::string& detail) {
   // live creature shares an id; the scope restores the suite's counter.
   mobs.SetNextIdCounter(1);
   PrepareWorld(c);
-  // A HEAD WITH A BRAIN IN IT. The laser kills through gore.brainHpPerVoxel,
+  // A HEAD WITH A BRAIN IN IT. The laser kills through the brain's organHp (materials.json),
   // and the claim (the head stays on its neck, the hair on the head, through
   // that kill and the corpse after it) was measured at adbc47d (2026-09-29
   // 11:29) on a human: head-neck 0.33 vox transient against the 0.6 cap.
@@ -6514,7 +6515,7 @@ Status GateWoundHeal(Ctx& c, std::string& detail) {
 // dismembers or explodes the head instead of shooting a clean hole through it
 // like it used to". Two causes, one per half of this gate:
 //
-//   * THE DEATH. gore.brainHpPerVoxel charges every brain cell the bore
+//   * THE DEATH. the brain's organHp (materials.json) charges every brain cell the bore
 //     crosses, so the head reached hp 0 within a few ticks, and a vital
 //     severable limb at zero went through Sever() — which DETACHES it before
 //     it calls Die(). hp now kills in place (Mob::Damage, Mob::CarveLimb);
@@ -6541,7 +6542,7 @@ Status GateLaserHead(Ctx& c, std::string& detail) {
   // property rather than by name. Largest for ChooseTarget's reason: a tiny
   // head is mostly neck, and a bore through it is a bore through the joint.
   // ...AND THAT HOLDS A BRAIN. The death half of the claim is the brain's
-  // (gore.brainHpPerVoxel); a head with none is bored straight through
+  // (the brain's materials.json organHp); a head with none is bored straight through
   // without dying. a411808 (2026-09-29) added the sylvan `deku`, whose wooden
   // head is the largest vital severable limb that bleeds (syrup) and has no
   // brain, so the property pick moved onto it and the gate measured a head
@@ -6669,6 +6670,220 @@ Status GateLaserHead(Ctx& c, std::string& detail) {
                    movedAtThrough).c_str()
           : "no",
       cause.empty() ? "" : Format(" cause: %s", cause.c_str()).c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- heart -----------------------------------------------------------------
+// A STAB INTO THE HEART KILLS; THE SAME STABS BESIDE IT DO NOT (owner,
+// 2026-10-12; docs/PLAN_projectiles.md package A).
+//
+// The heart is a material (materials.json `heart`, baked into the chest by the
+// torso's anatomy recipe) whose every lost cell costs its `organHp` flat --
+// the brain's rule, and nothing more. So the claim is about volume: enough of
+// the heart gone takes the torso's hp to 0 through the ordinary rule (vital
+// limb at zero -> Die), and the same blows that miss it leave the creature
+// standing.
+//
+// FIXTURE. The stock `human` (the body heart.organHp is calibrated against:
+// 15% of its 112 heart cells takes its 180-hp torso to 0), else the authored
+// def with the most heart in a vital limb. The SHIPPED dagger and sword,
+// through the real MeleeSweepDamage (blade-wounds' sweep, point first along
+// the blade -- a stab), from in front of the chest straight back along the
+// torso's own model axis, at heartStabSpeed of melee.fullSpeed. Each stab is a
+// new stroke; stab k lands at aim + a fixed pattern of small offsets across
+// the heart's face (kPattern), so repeated stabs open fresh heart rather than
+// re-boring one channel. The HEART arm aims at the heart's centroid; the
+// BESIDE arm makes the SAME stabs (same pattern, same count the heart arm
+// needed) shifted to the creature's right by the heart's own half-width plus
+// the blade's slit plus a margin, clear of the heart.
+//
+// Asserted per blade: the heart arm dies within heartStabMax stabs and the
+// death names the heart (Mob::OrganDeathCause: the organ charge took at least
+// half the torso's hp, whichever blow then finished it); the beside arm, after
+// as many stabs, is alive with its heart untouched. PRINTED: heart cells, cells lost per stab, the hp the
+// organ charge took, the torso's hp, and what a stab costs beside the heart.
+Status GateHeart(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const uint32_t heartMat = mobs.MaterialIdNamed("heart");
+  if (!heartMat || heartMat >= c.mats.size()) {
+    detail = "materials.json has no `heart`";
+    return Status::Fail;
+  }
+  const float organHp = c.mats[heartMat].organHp;
+  // ---- the fixture: the human, else the most heart in a vital limb --------
+  Target t;
+  const IVec3 probeSite = FixtureSite(c.world, 410);
+  auto consider = [&](int d) {
+    const MobDef& def = mobs.Defs()[(size_t)d];
+    mobs.Reset();
+    const uint64_t sid = mobs.Spawn(d, probeSite);
+    if (!sid) return;
+    for (size_t li = 0; li < def.limbs.size(); li++) {
+      if (!def.limbs[li].vital || !mobs.LimbBody(sid, (int)li)) continue;
+      const uint32_t n = mobs.LimbMaterialCount(sid, (int)li, heartMat);
+      if (n <= t.atSpawn) continue;
+      t.defIndex = d;
+      t.limb = (int)li;
+      t.atSpawn = n;
+      t.defName = def.name;
+      t.limbName = def.limbs[li].name;
+    }
+  };
+  if (const int h = mobs.FindDef("human"); h >= 0 && (size_t)h < mobs.LoadedDefCount())
+    consider(h);
+  for (size_t d = 0; !t.valid() && d < mobs.LoadedDefCount(); d++)
+    consider((int)d);
+  mobs.Reset();
+  if (!t.valid()) {
+    detail = "no authored mob def has heart in a vital limb (anatomy recipe?)";
+    return Status::Fail;
+  }
+  const ItemDef* blades[2] = {c.items.At(c.items.Find("dagger")),
+                              c.items.At(c.items.Find("sword"))};
+  const char* names[2] = {"dagger", "sword"};
+  if (!blades[0] && !blades[1]) {
+    detail = "the item library has no dagger and no sword";
+    return Status::Skip;
+  }
+  const auto& g = CurrentTuning().gore;
+  MeleeTuning mt;
+  ApplyMeleeTuning(mt);
+  const float speed = (float)BaselineNumber("heartStabSpeed", 0.8);
+  const float step = mt.fullSpeed * kTickDt * speed;
+  const int maxStabs = std::clamp((int)BaselineNumber("heartStabMax", 9), 1, 9);
+  // Offsets across the heart's face, in quarters of its width (x) / height (y).
+  static const float kPattern[9][2] = {{0, 0},   {0, 1},   {0, -1},
+                                       {1, 0},   {-1, 0},  {1, 1},
+                                       {-1, -1}, {1, -1},  {-1, 1}};
+
+  struct Arm {
+    bool ran = false, died = false;
+    int stabs = 0, landed = 0;
+    uint32_t heart0 = 0, heartLeft = 0;
+    float hp0 = 0, hpEnd = 0;
+    std::string cause, perStab;
+  };
+  // `shift` > 0 = the beside arm: every aim moved that far to the right.
+  auto runArm = [&](const ItemDef& it, float shift, int stabs) -> Arm {
+    Arm a;
+    IVec3 pchunk{};
+    const uint64_t id = SpawnTarget(c, t, 170, pchunk);
+    const uint64_t wid = id ? mobs.Spawn(t.defIndex, FixtureSite(c.world, 225)) : 0;
+    Mob* wielder = wid ? mobs.FindMobById(wid) : nullptr;
+    MobSystem::MaterialSpot spot;
+    if (!id || !wielder || !mobs.LimbMaterialSpot(id, t.limb, heartMat, spot)) {
+      mobs.Reset();
+      c.debris.Reset();
+      return a;
+    }
+    a.ran = true;
+    a.heart0 = spot.cells;
+    a.hp0 = mobs.LimbHp(id, t.limb);
+    const Vec3 right = spot.axis[0] * -1.0f, up = spot.axis[1];
+    const Vec3 in = spot.axis[2] * -1.0f;   // from the front, toward the back
+    const float w4 = (spot.hi[0] - spot.lo[0]) * 0.25f;
+    const float h4 = (spot.hi[1] - spot.lo[1]) * 0.25f;
+    const float L = 3.0f;   // world voxels of blade behind the point
+    std::vector<ParticleSpawn> spawns;
+    uint32_t before = a.heart0;
+    for (int k = 0; k < stabs && mobs.IsAlive(id); k++) {
+      const Vec3 tip1 = spot.centroid + right * shift +
+                        spot.axis[0] * (kPattern[k][0] * w4) +
+                        up * (kPattern[k][1] * h4);
+      const Vec3 tip0 = tip1 - in * step;
+      EdgeSweep sw;
+      sw.aPrev = tip0 - in * L; sw.bPrev = tip0;
+      sw.aNow = tip1 - in * L;  sw.bNow = tip1;
+      // The flat faces up, so the slit runs ACROSS the chest (melee.cpp
+      // BuildStrikeParts: across = travel x flat).
+      sw.flatNow = up;
+      sw.dt = kTickDt;
+      sw.halfWidth = it.edgeHalfWidth;
+      sw.carveBonus = it.carveBonus;
+      sw.strike = it.strike;
+      sw.heft = it.HeftFactor(g.woundHeftRef, g.woundHeftMax);
+      sw.tick = 8100u + (uint32_t)k;
+      std::vector<uint64_t> struck;   // a new stroke per stab
+      sw.struck = &struck;
+      sw.valid = true;
+      spawns.clear();
+      const EdgeSweepResult r = MeleeSweepDamage(sw, mt, *wielder, c.phys, mobs,
+                                                 c.debris, c.world, spawns);
+      if (r.bodiesHit > 0) a.landed++;
+      a.stabs = k + 1;
+      const uint32_t now = mobs.LimbBody(id, t.limb)
+                               ? mobs.LimbMaterialCount(id, t.limb, heartMat)
+                               : 0u;
+      a.perStab += Format("%s-%u", k ? "," : "", before > now ? before - now : 0u);
+      before = now;
+    }
+    a.heartLeft = mobs.LimbBody(id, t.limb)
+                      ? mobs.LimbMaterialCount(id, t.limb, heartMat)
+                      : 0u;
+    a.hpEnd = mobs.LimbHp(id, t.limb);
+    a.died = !mobs.IsAlive(id);
+    if (a.died) a.cause = mobs.DeathCause(id);
+    mobs.Reset();
+    c.debris.Reset();
+    return a;
+  };
+
+  bool ok = true;
+  std::string why, line;
+  for (int b = 0; b < 2; b++) {
+    if (!blades[b]) continue;
+    const ItemDef& it = *blades[b];
+    const std::string nm = names[b];
+    const Arm heart = runArm(it, 0.0f, maxStabs);
+    // Clear of the heart: its extent to the right of the centroid, the
+    // pattern's widest x offset, the slit's half-length across the blade
+    // (BuildStrikeParts: radius x stabWidth), and a margin of a fine cell.
+    MobSystem::MaterialSpot s0;
+    float shift = 0.0f;
+    {
+      IVec3 pc{};
+      const uint64_t id = SpawnTarget(c, t, 170, pc);
+      if (id && mobs.LimbMaterialSpot(id, t.limb, heartMat, s0))
+        shift = -s0.lo[0] + (s0.hi[0] - s0.lo[0]) * 0.25f +
+                (it.edgeHalfWidth + it.carveBonus) * g.stabWidth + 0.25f;
+      mobs.Reset();
+      c.debris.Reset();
+    }
+    const int n = std::max(1, heart.stabs);
+    const Arm beside = runArm(it, shift, n);
+    const uint32_t lostH = heart.heart0 > heart.heartLeft ? heart.heart0 - heart.heartLeft : 0u;
+    const uint32_t lostB = beside.heart0 > beside.heartLeft ? beside.heart0 - beside.heartLeft : 0u;
+    RecordObserved(("heartStabsToKill_" + nm).c_str(), heart.died ? (double)heart.stabs : -1.0);
+    RecordObserved(("heartCellsLost_" + nm).c_str(), (double)lostH);
+    RecordObserved(("heartBesideHpLost_" + nm).c_str(), (double)(beside.hp0 - beside.hpEnd));
+    auto fail = [&](const std::string& s) { ok = false; why += " | " + nm + ": " + s; };
+    if (!heart.ran || !beside.ran) fail("spawn or heart probe refused");
+    if (heart.landed == 0) fail("no stab landed on the chest");
+    if (!heart.died) fail(Format("heart arm alive after %d stabs", heart.stabs));
+    if (heart.died && heart.cause.find(c.mats[heartMat].name) == std::string::npos)
+      fail("death does not name the heart (\"" + heart.cause + "\")");
+    if (lostH == 0) fail("no heart cell lost");
+    if (beside.landed == 0) fail("no beside stab landed");
+    if (beside.died) fail("beside arm died (\"" + beside.cause + "\")");
+    if (lostB != 0) fail(Format("beside stabs took %u heart cells", lostB));
+    line += Format(
+        "%s: heart %u cells, %s on stab %d of %d (heart lost %s = %u cells, "
+        "%.0f%%, organ %.1f hp; torso %.1f -> %.1f%s); beside (%.2f vox right) "
+        "%d stabs: heart lost %u, torso %.1f -> %.1f, %s. ",
+        nm.c_str(), heart.heart0, heart.died ? "DIED" : "alive", heart.stabs,
+        maxStabs, heart.perStab.c_str(), lostH,
+        heart.heart0 ? 100.0 * lostH / heart.heart0 : 0.0, lostH * organHp,
+        heart.hp0, heart.hpEnd,
+        heart.cause.empty() ? "" : (", \"" + heart.cause + "\"").c_str(), shift,
+        beside.stabs, lostB, beside.hp0, beside.hpEnd,
+        beside.died ? "DIED" : "alive");
+  }
+  detail = Format("%s/%s, heart.organHp %.2f, %.2f speed: %s%s",
+                  t.defName.c_str(), t.limbName.c_str(), organHp, speed,
+                  line.c_str(), why.c_str());
+  std::printf("heart: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -10654,6 +10869,400 @@ Status GateLiquidCoats(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// pierce: a point driven through a body, priced by what the body is made of
+// ---------------------------------------------------------------------------
+// docs/PLAN_projectiles.md package B (phys/kerf.h PierceChannel, Mob::
+// PierceLimb, game/pierce.h PierceAlongRay). Every shot goes through the one
+// entry point a flight will call, on a FRESH spawn posed like every wound
+// fixture, along a ray aimed from the body's own measured geometry:
+//
+//   HEAD   sideways through the head's centroid at three energies: a thrown
+//          stone (GLANCES), a half-draw arrow (stops in the skull -- no brain
+//          cell taken), a full-draw arrow (breaches into the brain).
+//   ARM    sideways through the upper arm's centroid toward the torso's: at
+//          full draw it goes THROUGH the arm (Exited) and on into the torso;
+//          at half draw it embeds in the arm.
+//   TORSO  front to back, a little off the midline, at full draw: reported.
+//   HARD   the same torso shot into a body whose skin is harder than skin
+//          (the automaton's brass, the sylvan's bark): it must NOT exit, and
+//          must stop shallower than the human's channel.
+//
+// Plus: the full-draw head shot repeated on a fresh spawn is bit-identical
+// (cells, materials, depth, hp); every living-limb channel carved EXACTLY the
+// cells it paid for (the carve is the channel); and after the full-draw head
+// shot the real tick runs until the creature dies or `pierceBleedTicks` pass.
+//
+// THE NUMBERS ARE THE POINT (decision 1): every shot prints the cells it
+// crossed per material, the joules it spent and the hp the wound cost. There
+// is no kill rule for the gate to assert, and it asserts none -- whether a
+// thin arrow through a brain kills is the brain charge's answer, printed.
+Status GatePierce(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  mobs.SetNextIdCounter(1);
+  PrepareWorld(c);
+  const int human = mobs.FindDef("human");
+  if (human < 0) {
+    detail = "no `human` mob def loaded";
+    return Status::Fail;
+  }
+  // THE PROJECTILES (baseline.json, so a recalibration costs no rebuild).
+  Penetrator arrow;
+  arrow.massKg = (float)BaselineNumber("pierceArrowKg", 0.03);
+  arrow.tipRadius = (float)BaselineNumber("pierceArrowTip", 1.0);
+  arrow.hardness = (float)BaselineNumber("pierceArrowHard", 200.0);  // steel
+  arrow.sharpness = (float)BaselineNumber("pierceArrowSharp", 1.0);
+  arrow.seed = 0x7A11u;
+  const float fullMps = (float)BaselineNumber("pierceFullMps", 65.0);
+  // HALF DRAW = half the speed (a draw fraction scales speed; package C).
+  const float halfMps = fullMps * 0.5f;
+  Penetrator stone;
+  stone.massKg = (float)BaselineNumber("pierceStoneKg", 0.05);
+  stone.speedMps = (float)BaselineNumber("pierceStoneMps", 10.0);
+  stone.tipRadius = (float)BaselineNumber("pierceStoneTip", 2.0);
+  stone.hardness = (float)BaselineNumber("pierceStoneHard", 90.0);
+  stone.sharpness = (float)BaselineNumber("pierceStoneSharp", 0.05);
+  stone.seed = 0x5707Eu;
+  const int bleedTicks = (int)BaselineNumber("pierceBleedTicks", 300);
+
+  auto limbNamed = [&](int d, const char* nm) {
+    const auto& L = mobs.Defs()[d].limbs;
+    for (size_t i = 0; i < L.size(); i++)
+      if (L[i].name == nm) return (int)i;
+    return -1;
+  };
+  auto centroid = [&](uint64_t id, int li) {
+    Vec3 sum{};
+    const uint32_t n = 512;
+    for (uint32_t k = 0; k < n; k++)
+      sum += mobs.LimbVoxelPos(id, li, k * 7919u);
+    return sum * (1.0f / (float)n);
+  };
+  auto matName = [&](uint32_t m) {
+    return m < c.mats.size() ? c.mats[m].name : std::string("?");
+  };
+  // One shot's line: per hit, limb, outcome, depth (cm), cells by material,
+  // J spent, hp charged, and what stopped it.
+  auto describe = [&](int d, const PierceFlight& f) {
+    std::string s;
+    for (const PierceHit& h : f.hits) {
+      const PierceResult& r = h.r;
+      const std::string ln =
+          h.limb >= 0 && h.limb < (int)mobs.Defs()[d].limbs.size()
+              ? mobs.Defs()[d].limbs[h.limb].name
+              : std::string(r.loose ? "loose" : "?");
+      std::string mats;
+      float spent = 0.0f;
+      for (const PierceMatCells& m : r.byMat) {
+        mats += Format("%s%s %u", mats.empty() ? "" : ", ",
+                       matName(m.mat).c_str(), m.cells);
+        spent += m.joules;
+      }
+      s += Format(
+          "[%s %s %.1f cm, %u cells (%s) of %u carved, %.1f of %.1f J, "
+          "entry %.2f J, hp %.2f%s%s%s]",
+          ln.c_str(), PierceOutcomeName(r.outcome),
+          r.depth * kVoxelMeters * 100.0f, r.cells,
+          mats.empty() ? "none" : mats.c_str(), r.carved, spent, r.energyIn,
+          r.firstLayerJ, r.hpCharged,
+          r.outcome != PierceOutcome::Exited
+              ? (", stopped by " + matName(r.stopMat)).c_str()
+              : Format(", out at %.1f m/s", r.exitSpeedMps).c_str(),
+          r.killed ? ", KILLED" : "", r.severed ? ", SEVERED" : "");
+    }
+    return s.empty() ? std::string("[no body met]") : s;
+  };
+  auto cellsOf = [&](const PierceResult& r, const char* name) {
+    uint32_t n = 0;
+    for (const PierceMatCells& m : r.byMat)
+      if (matName(m.mat) == name) n += m.cells;
+    return n;
+  };
+
+  // ---- ONE SHOT ON A FRESH SPAWN ---------------------------------------------
+  // `aim`: 0 head (sideways), 1 arm -> torso, 2 torso (front, off the midline).
+  struct Shot {
+    PierceFlight f;
+    uint64_t id = 0;
+    int def = -1, aimLimb = -1, torso = -1;
+    IVec3 chunk{};
+    bool ran = false;
+  };
+  std::vector<ParticleSpawn> spawns;
+  auto shoot = [&](int d, int aim, const Penetrator& pen,
+                   float offsetFine = 0.0f) -> Shot {
+    Shot sh;
+    sh.def = d;
+    Target t;
+    t.defIndex = d;
+    t.limb = 0;
+    sh.id = SpawnTarget(c, t, 170, sh.chunk);
+    if (!sh.id) return sh;
+    const int head = limbNamed(d, "head"), torso = limbNamed(d, "torso");
+    const int arm = limbNamed(d, "armU.L") >= 0 ? limbNamed(d, "armU.L")
+                                                : limbNamed(d, "armU.R");
+    sh.torso = torso;
+    if (head < 0 || torso < 0 || arm < 0 || !mobs.LimbBody(sh.id, head) ||
+        !mobs.LimbBody(sh.id, torso) || !mobs.LimbBody(sh.id, arm))
+      return sh;
+    const Vec3 headC = centroid(sh.id, head), torsoC = centroid(sh.id, torso),
+               armC = centroid(sh.id, arm);
+    // Sideways = from the arm toward the torso, level; front = across that.
+    Vec3 side = torsoC - armC;
+    side.y = 0.0f;
+    side = side.len() > 1e-3f ? side.normalized() : Vec3{1, 0, 0};
+    const Vec3 front = Vec3{0, 1, 0}.cross(side).normalized();
+    constexpr float kStandOff = 12.0f;  // start well outside the body
+    Vec3 from{}, dir{};
+    if (aim == 0) {
+      sh.aimLimb = head;
+      dir = side;
+      // `offsetFine` moves the axis across the lattice (up and forward, in
+      // fine cells): the sweep below reads how much of what the brain charge
+      // costs is the channel's alignment with the cells.
+      const float off = offsetFine / (kPierceRefCellsPerMetre * kVoxelMeters);
+      from = headC - side * kStandOff + (Vec3{0, 1, 0} + front) * off;
+    } else if (aim == 1) {
+      sh.aimLimb = arm;
+      dir = side;  // level, through the arm's centroid, on into the torso
+      from = armC - side * kStandOff;
+    } else {
+      sh.aimLimb = torso;
+      dir = front;
+      // Off the midline by 6 cm, clear of the sternum and spine.
+      from = torsoC - side * 0.6f - front * kStandOff;
+    }
+    sh.f = PierceAlongRay(c.phys, mobs, c.debris, c.world, spawns, from, dir,
+                          2.0f * kStandOff, pen);
+    spawns.clear();
+    sh.ran = true;
+    return sh;
+  };
+  auto penAt = [](Penetrator p, float mps) {
+    p.speedMps = mps;
+    return p;
+  };
+
+  bool ok = true;
+  std::string why, lines;
+  auto fail = [&](const std::string& s) {
+    ok = false;
+    why += " | " + s;
+  };
+  // Every living-limb hit carved exactly what it paid for.
+  uint32_t carveMismatch = 0;
+  auto audit = [&](const Shot& sh) {
+    for (const PierceHit& h : sh.f.hits)
+      if (!h.r.loose && !h.r.severed && h.r.cells != h.r.carved)
+        carveMismatch++;
+  };
+  auto first = [](const Shot& sh) -> const PierceHit* {
+    return sh.f.hits.empty() ? nullptr : &sh.f.hits.front();
+  };
+
+  // ---- HEAD ------------------------------------------------------------------
+  const Shot hStone = shoot(human, 0, stone);
+  const Shot hHalf = shoot(human, 0, penAt(arrow, halfMps));
+  const Shot hFull = shoot(human, 0, penAt(arrow, fullMps));
+  for (const Shot* s : {&hStone, &hHalf, &hFull}) audit(*s);
+  lines += Format("HEAD stone %.1f J: %s | ", stone.EnergyJ(),
+                  describe(human, hStone.f).c_str());
+  lines += Format("HEAD half %.1f J: %s | ", penAt(arrow, halfMps).EnergyJ(),
+                  describe(human, hHalf.f).c_str());
+  lines += Format("HEAD full %.1f J: %s | ", penAt(arrow, fullMps).EnergyJ(),
+                  describe(human, hFull.f).c_str());
+  {
+    const PierceHit* a = first(hStone);
+    if (!hStone.ran || !a || a->limb != hStone.aimLimb)
+      fail("stone: did not meet the head");
+    else if (a->r.outcome != PierceOutcome::Glanced)
+      fail("stone did not glance");
+    const PierceHit* b = first(hHalf);
+    if (!hHalf.ran || !b || b->limb != hHalf.aimLimb)
+      fail("half draw: did not meet the head");
+    else if (b->r.outcome != PierceOutcome::Embedded ||
+             cellsOf(b->r, "brain") > 0)
+      fail("half draw was not stopped by the skull");
+    const PierceHit* f = first(hFull);
+    if (!hFull.ran || !f || f->limb != hFull.aimLimb)
+      fail("full draw: did not meet the head");
+    else if (cellsOf(f->r, "brain") <
+             (uint32_t)BaselineNumber("pierceBrainMinCells", 1))
+      fail("full draw did not reach the brain");
+  }
+  // ---- ...AND HOW MUCH OF THAT IS WHERE THE AXIS CROSSED THE LATTICE --------
+  // The PRICE of a channel is per depth (PierceChannel), but the brain charge
+  // is per CELL destroyed, and a one-cell-radius channel holds 2 to 5 cells
+  // per cell of depth by alignment alone. Reported, never asserted: the same
+  // full-draw shot moved across the lattice in fifths of a fine cell, brain
+  // cells and hp each time (decision 1's range, not one sample of it).
+  {
+    uint32_t bMin = UINT32_MAX, bMax = 0;
+    float hMin = 1e30f, hMax = 0.0f;
+    int kills = 0;
+    std::string sweep;
+    for (int k = 1; k <= 4; k++) {
+      const Shot sh = shoot(human, 0, penAt(arrow, fullMps), 0.2f * (float)k);
+      audit(sh);
+      const PierceHit* h = first(sh);
+      if (!h || h->limb != sh.aimLimb) continue;
+      const uint32_t b = cellsOf(h->r, "brain");
+      bMin = std::min(bMin, b);
+      bMax = std::max(bMax, b);
+      hMin = std::min(hMin, h->r.hpCharged);
+      hMax = std::max(hMax, h->r.hpCharged);
+      kills += h->r.killed ? 1 : 0;
+      sweep += Format("%s+%.1f: %u brain, hp %.1f %s%s", sweep.empty() ? "" : "; ",
+                      0.2f * (float)k, b, h->r.hpCharged,
+                      PierceOutcomeName(h->r.outcome),
+                      h->r.killed ? " KILLED" : "");
+    }
+    if (const PierceHit* h = first(hFull)) {
+      bMin = std::min(bMin, cellsOf(h->r, "brain"));
+      bMax = std::max(bMax, cellsOf(h->r, "brain"));
+      hMin = std::min(hMin, h->r.hpCharged);
+      hMax = std::max(hMax, h->r.hpCharged);
+      kills += h->r.killed ? 1 : 0;
+    }
+    RecordObserved("pierceHeadBrainCellsMin", (double)bMin);
+    RecordObserved("pierceHeadBrainCellsMax", (double)bMax);
+    RecordObserved("pierceHeadHpMax", (double)hMax);
+    lines += Format("HEAD full across the lattice (fine-cell offsets): %s -> "
+                    "brain %u..%u cells, hp %.1f..%.1f, %d of 5 killed outright | ",
+                    sweep.c_str(), bMin, bMax, hMin, hMax, kills);
+  }
+  // ---- ARM, THEN THE TORSO BEHIND IT ------------------------------------------
+  const Shot aHalf = shoot(human, 1, penAt(arrow, halfMps));
+  const Shot aFull = shoot(human, 1, penAt(arrow, fullMps));
+  audit(aHalf);
+  audit(aFull);
+  lines += Format("ARM half: %s | ", describe(human, aHalf.f).c_str());
+  lines += Format("ARM full: %s | ", describe(human, aFull.f).c_str());
+  {
+    const PierceHit* a = first(aHalf);
+    if (!aHalf.ran || !a || a->limb != aHalf.aimLimb)
+      fail("arm half: did not meet the arm");
+    else if (a->r.outcome != PierceOutcome::Embedded)
+      fail("half draw did not embed in the arm");
+    const PierceHit* b = first(aFull);
+    if (!aFull.ran || !b || b->limb != aFull.aimLimb)
+      fail("arm full: did not meet the arm");
+    else if (b->r.outcome != PierceOutcome::Exited)
+      fail("full draw did not go through the arm");
+    else if (aFull.f.hits.size() < 2 || aFull.f.hits[1].mobId != b->mobId ||
+             aFull.f.hits[1].limb != aFull.torso ||
+             aFull.f.hits[1].r.cells == 0)
+      fail("through the arm, it did not go on into the torso");
+  }
+
+  // ---- TORSO, HUMAN AND HARD ------------------------------------------------
+  const Shot tHuman = shoot(human, 2, penAt(arrow, fullMps));
+  audit(tHuman);
+  lines += Format("TORSO full: %s | ", describe(human, tHuman.f).c_str());
+  const PierceHit* th = first(tHuman);
+  if (!tHuman.ran || !th || th->limb != tHuman.aimLimb)
+    fail("torso: did not meet the torso");
+  int hardRan = 0;
+  for (const char* nm : {"tinker", "dryad"}) {
+    const int d = mobs.FindDef(nm);
+    if (d < 0) {
+      lines += Format("HARD %s: not loaded | ", nm);
+      continue;
+    }
+    const Shot sh = shoot(d, 2, penAt(arrow, fullMps));
+    audit(sh);
+    lines += Format("HARD %s torso full: %s | ", nm, describe(d, sh.f).c_str());
+    // About the BODY, not the first slot met: a creature can wear something
+    // on its chest (the tinker's brass `bough`) that the arrow meets first and
+    // pays for. Asserted: the flight met this creature, it STOPPED in it, and
+    // whatever it did to the torso is shallower than the human's channel.
+    const PierceHit* h = first(sh);
+    if (!sh.ran || !h || h->mobId != sh.id) {
+      fail(std::string(nm) + ": did not meet the creature");
+      continue;
+    }
+    hardRan++;
+    float torsoDepth = 0.0f;
+    bool through = false;
+    for (const PierceHit& x : sh.f.hits)
+      if (x.mobId == sh.id && x.limb == sh.aimLimb) {
+        torsoDepth = x.r.depth;
+        through = x.r.outcome == PierceOutcome::Exited;
+      }
+    if (through || !sh.f.stopped)
+      fail(std::string(nm) + ": the arrow went through");
+    if (th && torsoDepth >= th->r.depth)
+      fail(std::string(nm) + ": not shallower than the human's channel");
+  }
+  if (hardRan == 0) fail("no hard-skinned def (tinker, dryad) to shoot");
+  // ---- ...THE SAME SHOT AGAIN, AND THEN THE CLOCK ----------------------------
+  // Replayed on a fresh spawn of the same creature at the same place: every
+  // number the channel produced must come back identical.
+  const Shot hAgain = shoot(human, 0, penAt(arrow, fullMps));
+  {
+    const PierceHit* a = first(hFull);
+    const PierceHit* b = first(hAgain);
+    bool same = a && b && a->r.outcome == b->r.outcome &&
+                a->r.cells == b->r.cells && a->r.depth == b->r.depth &&
+                a->r.hpCharged == b->r.hpCharged &&
+                a->r.byMat.size() == b->r.byMat.size();
+    for (size_t k = 0; same && k < a->r.byMat.size(); k++)
+      same = a->r.byMat[k].mat == b->r.byMat[k].mat &&
+             a->r.byMat[k].cells == b->r.byMat[k].cells;
+    if (!same) fail("the full-draw head shot did not replay identically");
+  }
+  // How long the full-draw head shot takes to kill, by the bleed it opened.
+  // Ticked on the replay's spawn (still standing, the wound fresh).
+  int diedAt = -1;
+  float hpEnd = 0.0f;
+  if (hAgain.ran && mobs.IsAlive(hAgain.id)) {
+    uint32_t tick = 66999;
+    IVec3 chunk = hAgain.chunk;
+    support::TickCursor ticker{c, tick, chunk};
+    for (int k = 0; k < bleedTicks; k++) {
+      ticker();
+      if (!mobs.IsAlive(hAgain.id)) {
+        diedAt = k + 1;
+        break;
+      }
+    }
+    hpEnd = mobs.IsAlive(hAgain.id)
+                ? mobs.LimbHp(hAgain.id, limbNamed(human, "head"))
+                : 0.0f;
+  } else if (hAgain.ran) {
+    diedAt = 0;  // the channel itself killed
+  }
+  RecordObserved("pierceHeadDiedTicks", (double)diedAt);
+  if (const PierceHit* a = first(hFull)) {
+    RecordObserved("pierceHeadBrainCells", (double)cellsOf(a->r, "brain"));
+    RecordObserved("pierceHeadHp", (double)a->r.hpCharged);
+  }
+  lines += diedAt == 0
+               ? std::string("the full-draw head shot KILLED outright | ")
+           : diedAt > 0
+               ? Format("after the full-draw head shot: died %d ticks (%.1f s) "
+                        "later | ",
+                        diedAt, (float)diedAt * kTickDt)
+               : Format("after the full-draw head shot: ALIVE after %d ticks "
+                        "(%.1f s), head hp %.1f | ",
+                        bleedTicks, (float)bleedTicks * kTickDt, hpEnd);
+
+  if (carveMismatch)
+    fail(Format("%u channels carved other than what they paid for",
+                carveMismatch));
+  mobs.Reset();
+  c.debris.Reset();
+  // The clock bled onto the ground: pristine terrain for whoever is next.
+  PrepareWorld(c);
+
+  detail = Format("arrow %.0f g, tip %.1f fine cells, hardness %.0f; %s%s",
+                  arrow.massKg * 1000.0f, arrow.tipRadius, arrow.hardness,
+                  lines.c_str(), why.c_str());
+  std::printf("pierce: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 const std::vector<Gate>& WoundGates() {
   static const std::vector<Gate> g = {
       {"wound-chip", "mob", {}, false, GateWoundChip, /*needsRender=*/false},
@@ -10672,6 +11281,9 @@ const std::vector<Gate>& WoundGates() {
       {"corpse-dismember", "mob", {}, false, GateCorpseDismember, false},
       {"head-cleave", "mob", {}, false, GateHeadCleave, false},
       {"blade-wounds", "mob", {}, false, GateBladeWounds, false},
+      // A point driven through: arrows at three energies, through an arm into
+      // the torso, and a harder skin that stops what goes through a man.
+      {"pierce", "mob", {}, false, GatePierce, false},
       {"wound-rebleed", "mob", {}, false, GateWoundRebleed, false},
       {"corpse-blunt", "mob", {}, false, GateCorpseBlunt, false},
       {"bruise-is-skin", "mob", {}, false, GateBruiseIsSkin, false},
@@ -10693,6 +11305,8 @@ const std::vector<Gate>& WoundGates() {
       {"wound-heal", "mob", {}, false, GateWoundHeal, false},
       {"corpse-burn", "mob", {}, false, GateCorpseBurn, false},
       {"laser-head", "mob", {}, false, GateLaserHead, false},
+      // A stab into the heart kills; the same stabs beside it do not.
+      {"heart", "mob", {}, false, GateHeart, false},
       {"joint-twins", "mob", {}, false, GateJointTwins, false},
       {"acid-coat", "mob", {}, false, GateAcidCoat, false},
       {"corpse-acid", "mob", {}, false, GateCorpseAcid, false},

@@ -12,7 +12,7 @@
  * WHAT IT IS MADE OF (materials.json, the robot rows). Plating is `brass`
  * (hardness 70, `shell`: a sword takes a ninth of the kerf it takes from
  * skin); under it `clockwork` (the works, swimming in oil), an `iron` frame
- * for a skeleton, a `boiler` in the chest, a `cogitator` (brainHp) at the
+ * for a skeleton, a `boiler` in the chest, a `cogitator` (organHp) at the
  * core of the head. Eye lamps and the furnace glow are `gem_arcane` (its
  * emission is the light, the art colour its colour), lenses and gauge faces
  * `glass`, joints `leather`. IT BLEEDS OIL: oil is flammable, so a holed
@@ -122,7 +122,7 @@ export const ANATOMY = {
 export const ANATOMY_NOTES = {
   '//': 'AN AUTOMATON: brass plating over the clockwork (wheels and springs in ' +
         'oil) over an iron frame, a boiler in the chest behind the furnace ' +
-        'grate and a cogitator (brainHp) at the core of the head. The surface ' +
+        'grate and a cogitator (organHp) at the core of the head. The surface ' +
         'is brass, glass lenses, gem_arcane lamps and furnace glow, leather ' +
         'joints -- all KEPT; none of them appears below. brass, clockwork, ' +
         'boiler and cogitator are material ids above 127, which a .vox cannot ' +
