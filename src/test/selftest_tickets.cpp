@@ -163,6 +163,7 @@ struct SettleRun {
   uint32_t colNonAir[kTicketBoxN] = {};
   int colTop = -1 << 30, ground = 0;
   uint32_t colTopMat = 0;
+  std::string awake;            // attribution when the box never fell asleep
 };
 
 // ---- MEASUREMENT ONLY: SANDVOX_TICKET_COST=1 ---------------------------------
@@ -356,6 +357,95 @@ bool RunSettle(Ctx& c, SettleRun& R, std::string& why) {
       }
     }
   }
+  // ATTRIBUTION (CLAUDE.md rule 6): the box never fell asleep. Name the
+  // interior chunks still dirty, the raw DIRTY_R_* word of the first, and
+  // what changed in it over one tick, by material and field.
+  if (R.asleepAt < 0 && c.stream.TicketSet().StateOf(R.ticket) == Tickets::State::Live) {
+    const std::vector<uint32_t> dirty = c.stream.TicketSet().DirtyInteriorSlots(R.ticket);
+    R.awake = Format("%zu interior chunks dirty (idle snaps %u):", dirty.size(),
+                     c.stream.TicketSet().IdleSnaps(R.ticket));
+    for (size_t k = 0; k < dirty.size() && k < 8; k++) {
+      const IVec3 wc = c.world.TicketSlotWorldChunk(dirty[k]);
+      R.awake += Format(" (%d,%d,%d)", wc.x, wc.y, wc.z);
+    }
+    if (!dirty.empty()) {
+      const uint32_t ws = dirty[0];
+      c.world.SetDirtyWatch(ws);
+      std::vector<uint32_t> a(kChunkVol), b(kChunkVol);
+      c.ctx.WaitIdle();
+      ReadVoxelsSync(c.ctx, c.world, ws, 1, a.data(), "ticketAwake0");
+      tick();
+      c.ctx.WaitIdle();
+      ReadVoxelsSync(c.ctx, c.world, ws, 1, b.data(), "ticketAwake1");
+      // T+2 and T+16: a period-2 shuffle reads back identical at T+2; a
+      // creep keeps drifting.
+      std::vector<uint32_t> c2(kChunkVol), c16(kChunkVol);
+      tick();
+      c.ctx.WaitIdle();
+      ReadVoxelsSync(c.ctx, c.world, ws, 1, c2.data(), "ticketAwake2");
+      for (uint32_t k = 0; k < 14; k++) tick();
+      c.ctx.WaitIdle();
+      ReadVoxelsSync(c.ctx, c.world, ws, 1, c16.data(), "ticketAwake16");
+      {
+        const IVec3 wc = c.world.TicketSlotWorldChunk(ws);
+        uint32_t d2 = 0, d16 = 0, sandA = 0, sandB = 0;
+        std::string cells;
+        uint32_t listed = 0;
+        for (uint32_t k = 0; k < kChunkVol; k++) {
+          const uint32_t m = ~0x00FF0000u;
+          if ((a[k] & m) != (c2[k] & m)) d2++;
+          if ((a[k] & m) != (c16[k] & m)) d16++;
+          if ((a[k] & 0xFFFu) == (uint32_t)MatId(c, "sand")) sandA += PowderMassOfState((a[k] >> 12) & 0xFu);
+          if ((c16[k] & 0xFFFu) == (uint32_t)MatId(c, "sand")) sandB += PowderMassOfState((c16[k] >> 12) & 0xFu);
+          if ((a[k] & m) != (b[k] & m) && listed < 8) {
+            listed++;
+            const int lx = (int)(k % kChunk), ly = (int)((k / kChunk) % kChunk),
+                      lz = (int)(k / (kChunk * kChunk));
+            cells += Format(" (%d,%d,%d) %x/%x->%x/%x->%x/%x", wc.x * 16 + lx, wc.y * 16 + ly,
+                            wc.z * 16 + lz, a[k] & 0xFFFu, (a[k] >> 12) & 0xFu, b[k] & 0xFFFu,
+                            (b[k] >> 12) & 0xFu, c2[k] & 0xFFFu, (c2[k] >> 12) & 0xFu);
+          }
+        }
+        R.awake += Format("; cells differing T vs T+2 %u, T vs T+16 %u; sand mass in the chunk "
+                          "%u -> %u over 16 ticks; changed cells (mat/state T->T+1->T+2):%s",
+                          d2, d16, sandA, sandB, cells.c_str());
+      }
+      for (uint32_t k = 0; k < World::kSnapshotLatency + 1; k++) tick();
+      c.ctx.WaitIdle();
+      const uint32_t reason = c.world.Snap().watchReason;
+      c.world.SetDirtyWatch(0xFFFFFFFFu);
+      uint32_t nMat = 0, nState = 0, nStain = 0, nStamp = 0;
+      std::vector<std::pair<uint32_t, uint32_t>> pairs;  // (from<<12|to, count)
+      int ylo = 99, yhi = -1;
+      for (uint32_t k = 0; k < kChunkVol; k++) {
+        const uint32_t x = a[k], y = b[k];
+        if (x == y) continue;
+        if ((x & 0xFFFu) != (y & 0xFFFu)) nMat++;
+        else if (((x >> 12) & 0xFu) != ((y >> 12) & 0xFu)) nState++;
+        else if ((x & 0xFF000000u) != (y & 0xFF000000u)) nStain++;
+        else { nStamp++; continue; }
+        const int ly = (int)((k / kChunk) % kChunk);
+        ylo = std::min(ylo, ly), yhi = std::max(yhi, ly);
+        const uint32_t key = ((x & 0xFFFu) << 12) | (y & 0xFFFu);
+        auto it = std::find_if(pairs.begin(), pairs.end(),
+                               [&](const auto& p) { return p.first == key; });
+        if (it == pairs.end()) pairs.push_back({key, 1u});
+        else it->second++;
+      }
+      R.awake += Format("; first watch reason 0x%x; one tick: %u material, %u state, "
+                        "%u stain, %u stamp-only changes, local y %d..%d;",
+                        reason, nMat, nState, nStain, nStamp, ylo, yhi);
+      std::sort(pairs.begin(), pairs.end(),
+                [](const auto& p, const auto& q) { return p.second > q.second; });
+      for (size_t k = 0; k < pairs.size() && k < 5; k++) {
+        const uint32_t f = pairs[k].first >> 12, to = pairs[k].first & 0xFFFu;
+        R.awake += Format(" %s->%s x%u", f < c.mats.size() ? c.mats[f].name.c_str() : "?",
+                          to < c.mats.size() ? c.mats[to].name.c_str() : "?",
+                          pairs[k].second);
+      }
+    }
+  }
+  if (R.releasedAt < 0) R.recentred = R.recentredSeen;  // never released: count so far
   // Let the release's keep decision land (kSnapshotLatency ticks) and the
   // eviction harvest: a dozen more ticks of nothing.
   for (int i = 0; i < 12; i++) tick();
@@ -394,6 +484,11 @@ Status GateTicketSettle(Ctx& c, std::string& detail) {
       (int)BaselineNumber("ticketSettle.releaseAfterAsleepMax",
                           (double)(kTicketIdleTicks + 2 * World::kSnapshotLatency + 4));
   const bool poured = A.poured >= 2000;  // IfAir: a grass tuft can refuse a cell
+  // The settled read is taken the tick the box falls asleep and the store
+  // read after the release: a box that never did either has no mass to
+  // compare, and calling that "moved" sent the 2026-10-12 triage after a
+  // conservation bug that was not there.
+  const bool measured = A.asleepAt >= 0 && A.releasedAt >= 0;
   const bool conserved = A.massSettled == A.mass0 && A.massStore == A.mass0 &&
                          A.massBack == A.mass0;
   const bool asleep = A.asleepAt >= 0 && A.asleepAt <= asleepMax;
@@ -421,11 +516,14 @@ Status GateTicketSettle(Ctx& c, std::string& detail) {
       A.ticket, A.lo.x, A.lo.y, A.lo.z, A.centre.x, A.centre.y, A.centre.z, A.poured,
       (unsigned long long)A.base, (unsigned long long)A.mass0,
       (unsigned long long)A.massSettled, (unsigned long long)A.massStore, A.storedChunks,
-      (unsigned long long)A.massBack, conserved ? " - CONSERVED" : " - MASS MOVED",
+      (unsigned long long)A.massBack,
+      !measured ? " - mass NOT MEASURED (the box never slept and released within the cap, "
+                  "so there is no settled read and nothing in the store yet)"
+      : conserved ? " - CONSERVED" : " - MASS MOVED",
       A.asleepAt, asleepMax, A.lastRecentreAt, A.releasedAt, releaseLagMax, A.faults, B.faults,
       same ? "IDENTICAL" : "DIVERGED", A.hashSettled, B.hashSettled,
       c.stream.TicketSet().LiveCount());
-  if (!poured || !conserved)
+  if (!poured || (measured && !conserved))
     detail += Format(
         " | POUR PROBE: %u ops, first cell slot %u word %08x -> %08x, page entry "
         "cpu %08x gpu %08x, GPU ticket table head [%u %u %u %u | %d %d %d %u]; "
@@ -444,6 +542,7 @@ Status GateTicketSettle(Ctx& c, std::string& detail) {
                      A.pourTick, A.asleepSnapTick, (unsigned long long)A.recentred,
                      (unsigned long long)A.relIdle, (unsigned long long)A.relTimeout,
                      c.stream.TicketSet().LastRecentreNote().c_str());
+  if (!A.awake.empty()) detail += " | NEVER ASLEEP: " + A.awake;
   if (Cost().on) {
     const TicketCost& tc = Cost();
     const char* name[3] = {"no ticket, window settled", "1 live ticket, interior asleep",
