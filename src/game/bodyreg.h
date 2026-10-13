@@ -7,6 +7,7 @@
 
 #include "game/avatar.h"
 #include "game/mob.h"
+#include "game/renderonly.h"
 #include "phys/debris.h"
 #include "sim/microbody.h"
 
@@ -93,7 +94,9 @@ void CullBodyRanges(const std::vector<BodyDrawRange>& ranges,
 // Debris bodies take slots [0, D), the player avatar's parts stack after, and
 // mob limbs (the dead included) stack after those — the avatar ahead of the
 // mobs so a crowd of corpses can never be what starves the player's own body
-// at kMaxBodySlots (bodyreg.cpp). Three parallel arrays are indexed by that
+// at kMaxBodySlots (bodyreg.cpp); render-only bodies (SetRenderOnly: the
+// arrows in flight) take the slots after everything real. Three parallel
+// arrays are indexed by that
 // slot: the transforms (bodyXforms), the cube instances (bodyInstances) and
 // the compacted micro-body draw list. All three MUST agree on the walk order
 // and the base offsets, and that agreement used to be spelled out by hand at
@@ -119,6 +122,18 @@ class BodyRegistry {
                PlayerAvatar* avatar /*nullable*/,
                const MicroBodySet* microSet = nullptr)
       : debris_(debris), mobs_(mobs), avatar_(avatar), microSet_(microSet) {}
+
+  // RENDER-ONLY BODIES (game/renderonly.h), walked LAST, after the mob limbs:
+  // the arrows in flight. Each takes a transform slot and a micro draw of its
+  // (shared) model, and nothing else -- handle 0 in BuildHandles, no cube
+  // instances (so no other system's instance base shifts and
+  // AnyInstancesDirty is not their business), never a holder in the audit.
+  // Last, so a crowded frame at kMaxBodySlots starves the arrows and never
+  // anybody's body. The list must outlive every Build* call made with it;
+  // null (the default) is no extras, which is every harness's walk.
+  void SetRenderOnly(const std::vector<RenderOnlyBody>* extras) {
+    extras_ = extras;
+  }
 
   // Per-slot transforms, refreshed every frame (cheap).
   void BuildXforms(std::vector<BodyXformGpu>& out) const;
@@ -176,6 +191,10 @@ class BodyRegistry {
   MobSystem& mobs_;
   PlayerAvatar* avatar_;
   const MicroBodySet* microSet_ = nullptr;
+  const std::vector<RenderOnlyBody>* extras_ = nullptr;
+  // Slots the real bodies take before the extras: what the three walks emit,
+  // capped where they stop (kMaxBodySlots).
+  uint32_t ExtrasBase() const;
   // Audit scratch. A BodyRegistry is constructed per frame at every call site,
   // so these buy nothing across frames — they exist so the audit's cheap phase
   // allocates nothing on the frames where it finds nothing, which is all of

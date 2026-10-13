@@ -30,10 +30,31 @@
 // `SlotCount()` is the emitted count and is the only thing a base may be built
 // from. See the audit below, which fails loudly if the two ever part again.
 
+// THE RENDER-ONLY BODIES go after all of it (SetRenderOnly), and their base is
+// the same capped count every walk reaches: the real walks each stop at
+// kMaxBodySlots, so the extras start where the real slots END, never where
+// their counts say they would.
+uint32_t BodyRegistry::ExtrasBase() const {
+  const uint32_t real = debris_.SlotCount() + mobs_.LimbBodyCount() +
+                        (avatar_ ? avatar_->LimbBodyCount() : 0u);
+  return std::min(real, kMaxBodySlots);
+}
+
 void BodyRegistry::BuildXforms(std::vector<BodyXformGpu>& out) const {
   debris_.BuildXforms(out);  // clears + fills [0, SlotCount)
   if (avatar_) avatar_->AppendXforms(out);
   mobs_.AppendXforms(out);
+  if (extras_) {
+    for (const RenderOnlyBody& e : *extras_) {
+      if (out.size() >= kMaxBodySlots) break;
+      BodyXformGpu x{};
+      x.pos[0] = e.pos.x;
+      x.pos[1] = e.pos.y;
+      x.pos[2] = e.pos.z;
+      std::memcpy(x.quat, e.quat, sizeof(x.quat));
+      out.push_back(x);
+    }
+  }
 }
 
 void BodyRegistry::BuildHandles(std::vector<uint64_t>& out) const {
@@ -42,6 +63,10 @@ void BodyRegistry::BuildHandles(std::vector<uint64_t>& out) const {
   for (uint32_t s = 0; s < d; s++) out.push_back(debris_.BodyHandle(s));
   if (avatar_) avatar_->AppendBodyHandles(out);
   mobs_.AppendBodyHandles(out);
+  // No physics body: handle 0, which every handle consumer already skips.
+  if (extras_)
+    for (size_t k = 0; k < extras_->size() && out.size() < kMaxBodySlots; k++)
+      out.push_back(0);
 }
 
 void BodyRegistry::BuildInstances(std::vector<BodyVoxInst>& out) {
@@ -64,7 +89,18 @@ void BodyRegistry::BuildMicroInsts(std::vector<MicroBodyInstGpu>& out) const {
   const uint32_t mobBase =
       avatar_ ? avatar_->AppendMicroInsts(out, avatarBase) : avatarBase;
   const uint32_t avatarEnd = (uint32_t)out.size();
-  mobs_.AppendMicroInsts(out, mobBase);
+  const uint32_t mobEnd = mobs_.AppendMicroInsts(out, mobBase);
+  // The render-only bodies, at the slots BuildXforms gave them. Their models
+  // are SHARED item records (never owned), so the alias check below skips
+  // them by construction: two arrows in the air draw one brick, correctly.
+  if (extras_) {
+    uint32_t slot = std::min(mobEnd, kMaxBodySlots);
+    for (const RenderOnlyBody& e : *extras_) {
+      if (slot >= kMaxBodySlots) break;
+      out.push_back({slot, e.model, 0u, 0u});
+      slot++;
+    }
+  }
 
   // ---- ALIASING DIAGNOSTIC --------------------------------------------------
   // Two micro instances sharing the same OWNED model draw from one brick:
@@ -489,8 +525,11 @@ void CullBodyRanges(const std::vector<BodyDrawRange>& ranges,
 }
 
 uint32_t BodyRegistry::TotalSlots() const {
-  return debris_.SlotCount() + mobs_.LimbBodyCount() +
-         (avatar_ ? avatar_->LimbBodyCount() : 0u);
+  const uint32_t real = debris_.SlotCount() + mobs_.LimbBodyCount() +
+                        (avatar_ ? avatar_->LimbBodyCount() : 0u);
+  if (!extras_ || extras_->empty()) return real;
+  const uint32_t base = ExtrasBase();
+  return real + std::min((uint32_t)extras_->size(), kMaxBodySlots - base);
 }
 
 bool BodyRegistry::AnyInstancesDirty() const {

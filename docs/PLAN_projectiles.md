@@ -98,6 +98,26 @@ as `MeleeHitKind::Pierce`, gate `arrow`, `--shot-mob human:>N`. Open: embedded
 arrows are not saved and do not cross a handoff; the shooter does not see an
 arrow stuck in a peer's creature.
 
+**Revised 2026-10-13 (owner: "arrows shouldn't go through someone unless
+they're an extremely thin layer of voxels"; "they seem to move
+instantaneously"; "a little shorter/smaller"):**
+- EMBED, NOT THROUGH. The arrow's own numbers, not `gore.pierceCellJ` (which
+  the spell projectiles share): `sharpness` 1.0 -> 0.8 at the bow's new 50 m/s
+  (37.5 J). Full draw, `pierce` gate: torso 8-9 cm and stays, upper arm
+  through the bone and stops in the far muscle, head breaches the skull and
+  stays in the brain; the half draw stops before the brain. Gate `pierce`
+  asserts all three STAY; gate `arrow`'s (b) asserts a full draw into the
+  torso embeds, and keeps the through-and-on hand-off as a MECHANISM test at
+  3x the draw speed.
+- SLOWER: `drawSpeedMps` 65 -> 50 (a real longbow; 65 was a compound bow's).
+- SEEN IN FLIGHT: nothing drew an `ArrowFlight` -- the shot appeared, already
+  stuck, a third of a second after the loose. Now a render-only body
+  (`game/renderonly.h`, `ArrowFlights::AppendRenderBodies`) walked by
+  `BodyRegistry` after every real body, tick-interpolated like the camera.
+  `--shot-mob human:>3~` photographs arrows in the air.
+- SMALLER: 0.725 m -> 0.60 m (`gen_bow_items.py` ARROW_LEN 58 -> 48), the
+  vanes and the head's socket slimmer.
+
 - Items: `bow` (weaponClass "bow": drawSpeedMps, drawTimeMs) and `arrow`
   (massKg, tipRadius, head material, stack count; carried in the pack).
   Art as `.vox` + sidecar like every other item.

@@ -10880,12 +10880,16 @@ Status GateLiquidCoats(Ctx& c, std::string& detail) {
 // fixture, along a ray aimed from the body's own measured geometry:
 //
 //   HEAD   sideways through the head's centroid at three energies: a thrown
-//          stone (GLANCES), a half-draw arrow (stops in the skull -- no brain
-//          cell taken), a full-draw arrow (breaches into the brain).
+//          stone (GLANCES), a half-draw arrow (stops short of the brain), a
+//          full-draw arrow (breaches into the brain and STAYS there --
+//          Embedded, not out the far side).
 //   ARM    sideways through the upper arm's centroid toward the torso's: at
-//          full draw it goes THROUGH the arm (Exited) and on into the torso;
-//          at half draw it embeds in the arm.
-//   TORSO  front to back, a little off the midline, at full draw: reported.
+//          full draw it EMBEDS in the arm (owner, 2026-10-13: an arrow stays
+//          in what it hits; until then it went through and on into the
+//          torso); at half draw it embeds shallower.
+//   TORSO  front to back, a little off the midline, at full draw: EMBEDS.
+//   HAND   sideways through the hanging hand: printed, not asserted -- the
+//          thin matter a full draw is ALLOWED to pass through.
 //   HARD   the same torso shot into a body whose skin is harder than skin
 //          (the automaton's brass, the sylvan's bark): it must NOT exit, and
 //          must stop shallower than the human's channel.
@@ -10983,7 +10987,8 @@ Status GatePierce(Ctx& c, std::string& detail) {
   };
 
   // ---- ONE SHOT ON A FRESH SPAWN ---------------------------------------------
-  // `aim`: 0 head (sideways), 1 arm -> torso, 2 torso (front, off the midline).
+  // `aim`: 0 head (sideways), 1 arm -> torso, 2 torso (front, off the midline),
+  // 3 hand (sideways through the hanging hand).
   struct Shot {
     PierceFlight f;
     uint64_t id = 0;
@@ -11029,6 +11034,13 @@ Status GatePierce(Ctx& c, std::string& detail) {
       sh.aimLimb = arm;
       dir = side;  // level, through the arm's centroid, on into the torso
       from = armC - side * kStandOff;
+    } else if (aim == 3) {
+      const int hand = limbNamed(d, "hand.L") >= 0 ? limbNamed(d, "hand.L")
+                                                   : limbNamed(d, "hand.R");
+      if (hand < 0 || !mobs.LimbBody(sh.id, hand)) return sh;
+      sh.aimLimb = hand;
+      dir = side;  // level, through the hand's centroid, toward the hip
+      from = centroid(sh.id, hand) - side * kStandOff;
     } else {
       sh.aimLimb = torso;
       dir = front;
@@ -11085,13 +11097,15 @@ Status GatePierce(Ctx& c, std::string& detail) {
       fail("half draw: did not meet the head");
     else if (b->r.outcome != PierceOutcome::Embedded ||
              cellsOf(b->r, "brain") > 0)
-      fail("half draw was not stopped by the skull");
+      fail("half draw was not stopped short of the brain");
     const PierceHit* f = first(hFull);
     if (!hFull.ran || !f || f->limb != hFull.aimLimb)
       fail("full draw: did not meet the head");
     else if (cellsOf(f->r, "brain") <
              (uint32_t)BaselineNumber("pierceBrainMinCells", 1))
       fail("full draw did not reach the brain");
+    else if (f->r.outcome != PierceOutcome::Embedded)
+      fail("full draw did not stay in the head (it went out the far side)");
   }
   // ---- ...AND HOW MUCH OF THAT IS WHERE THE AXIS CROSSED THE LATTICE --------
   // The PRICE of a channel is per depth (PierceChannel), but the brain charge
@@ -11150,12 +11164,14 @@ Status GatePierce(Ctx& c, std::string& detail) {
     const PierceHit* b = first(aFull);
     if (!aFull.ran || !b || b->limb != aFull.aimLimb)
       fail("arm full: did not meet the arm");
-    else if (b->r.outcome != PierceOutcome::Exited)
-      fail("full draw did not go through the arm");
-    else if (aFull.f.hits.size() < 2 || aFull.f.hits[1].mobId != b->mobId ||
-             aFull.f.hits[1].limb != aFull.torso ||
-             aFull.f.hits[1].r.cells == 0)
-      fail("through the arm, it did not go on into the torso");
+    else if (b->r.outcome != PierceOutcome::Embedded || !aFull.f.stopped)
+      fail("full draw did not stay in the arm (it went through)");
+  }
+  // ---- THE HAND: thin matter, printed -----------------------------------------
+  {
+    const Shot hd = shoot(human, 3, penAt(arrow, fullMps));
+    audit(hd);
+    lines += Format("HAND full: %s | ", describe(human, hd.f).c_str());
   }
 
   // ---- TORSO, HUMAN AND HARD ------------------------------------------------
@@ -11165,6 +11181,8 @@ Status GatePierce(Ctx& c, std::string& detail) {
   const PierceHit* th = first(tHuman);
   if (!tHuman.ran || !th || th->limb != tHuman.aimLimb)
     fail("torso: did not meet the torso");
+  else if (th->r.outcome != PierceOutcome::Embedded || !tHuman.f.stopped)
+    fail("full draw did not stay in the torso (it went through)");
   int hardRan = 0;
   for (const char* nm : {"tinker", "dryad"}) {
     const int d = mobs.FindDef(nm);
@@ -11279,8 +11297,13 @@ Status GatePierce(Ctx& c, std::string& detail) {
 //       limb moved, the arrow went with it), and after the arm is severed the
 //       arrow is a debris body strapped to the severed piece and registered
 //       as the item.
-//   (b) THROUGH: full draw at the torso goes through it (Exited) and the
-//       flight carries on past the body.
+//   (b) A FULL DRAW STAYS IN: full draw at the torso EMBEDS (owner,
+//       2026-10-13: an arrow buries itself in a chest; until then it went
+//       through). ...and THROUGH, as a MECHANISM: the same torso shot at
+//       arrowThroughSpeedX x the full-draw speed -- a speed no bow gives, so
+//       this is the residual-speed hand-off itself being tested (the thing a
+//       hand, a scrap or a heavier launcher will lean on), not a calibration --
+//       exits (Exited) and the flight carries on past the body.
 //   (c) TERRAIN: an arrow into the ground sticks there as a registered,
 //       motionless ground item, and the ground pickup takes it.
 //   (d) PULL-OUT: G's take (PullArrowToKit) on an embedded arrow puts it in
@@ -11314,6 +11337,7 @@ Status GateArrow(Ctx& c, std::string& detail) {
   const float rideTol = (float)BaselineNumber("arrowRideTolVox", 0.05);
   const float fallMin = (float)BaselineNumber("arrowFallMinVox", 1.0);
   const int volleyTicks = (int)BaselineNumber("arrowVolleyTicks", 40);
+  const float throughX = (float)BaselineNumber("arrowThroughSpeedX", 3.0);
 
   // THE GROUND REGISTRY the game binds (main.cpp): shed gear and stuck arrows
   // land in it, a released body leaves it.
@@ -11555,7 +11579,7 @@ Status GateArrow(Ctx& c, std::string& detail) {
       if (!pulled || inKit != 1 || m->EmbeddedArrowCount() != 0)
         fail("(d) the pull-out did not move the arrow into the kit");
     }
-    // (b) + the count: full draw through the torso until it dies (bounded).
+    // (b) + the count: full draw into the torso until it dies (bounded).
     // The aim is re-measured before every shot: the creature is alive and
     // the real tick runs between them.
     std::string seq;
@@ -11572,26 +11596,26 @@ Status GateArrow(Ctx& c, std::string& detail) {
       const std::vector<ArrowEvent> ev = eventsOf(f, sk);
       auditHits(ev);
       const ArrowEvent* first = nullptr;
-      bool after = false;
-      for (const ArrowEvent& e : ev) {
+      for (const ArrowEvent& e : ev)
         if (first == nullptr && e.kind == ArrowEvent::Kind::Hit && e.mobId == f.id)
           first = &e;
-        else if (first != nullptr)
-          after = true;
-      }
-      // ...still in the air past the body counts as flying on.
-      for (const ArrowFlight& fl : f.rig->Authority().arrows.Flights())
-        if (fl.seed == sk && first != nullptr) after = true;
       seq += first ? Format("%s%.0f", k ? "," : "", first->r.hpCharged)
                    : std::string(k ? ",miss" : "miss");
       if (k == 0) {
-        const bool through =
-            first != nullptr && first->r.outcome == PierceOutcome::Exited;
-        lines += Format("(b) full draw at the torso: %s, then %s | ",
+        const bool stayed =
+            first != nullptr && first->r.outcome == PierceOutcome::Embedded;
+        bool embedded = false, flying = false;
+        for (const ArrowEvent& e : ev)
+          embedded |= e.kind == ArrowEvent::Kind::Embedded && e.mobId == f.id;
+        for (const ArrowFlight& fl : f.rig->Authority().arrows.Flights())
+          flying |= fl.seed == sk;
+        lines += Format("(b) full draw at the torso: %s %.1f cm%s%s | ",
                         first ? PierceOutcomeName(first->r.outcome) : "no hit",
-                        after ? "it flew on" : "NOTHING after it");
-        if (!through || !after)
-          fail("(b) a full-draw arrow did not go through the torso and on");
+                        first ? first->r.depth * kVoxelMeters * 100.0f : 0.0f,
+                        embedded ? ", an arrow slot in it" : "",
+                        flying ? ", STILL FLYING" : "");
+        if (!stayed || !embedded || flying)
+          fail("(b) a full-draw arrow did not stay in the torso");
       }
       if (!mobs.IsAlive(f.id)) torsoKill = k + 1;
     }
@@ -11601,6 +11625,37 @@ Status GateArrow(Ctx& c, std::string& detail) {
     if (torsoKill < torsoKillMin || torsoKill > torsoKillMax)
       fail(Format("torso arrows to kill %d outside %d..%d", torsoKill,
                   torsoKillMin, torsoKillMax));
+  }
+  // (b) THROUGH, the mechanism: far faster than any draw, the same torso
+  // line -- out the back, and still flying past the body.
+  {
+    Fixture f = fixture(71500);
+    if (!f.id) {
+      detail = "the fixture human did not spawn (through)";
+      return Status::Fail;
+    }
+    const uint32_t sk = 0xB0200u;
+    shoot(f, f.torsoC - f.side * 0.6f, f.front, throughX * fullVox, sk);
+    support::RunTicks(*f.rig, 2);
+    const std::vector<ArrowEvent> ev = eventsOf(f, sk);
+    auditHits(ev);
+    const ArrowEvent* first = nullptr;
+    bool after = false;
+    for (const ArrowEvent& e : ev) {
+      if (first == nullptr && e.kind == ArrowEvent::Kind::Hit && e.mobId == f.id)
+        first = &e;
+      else if (first != nullptr)
+        after = true;
+    }
+    for (const ArrowFlight& fl : f.rig->Authority().arrows.Flights())
+      if (fl.seed == sk && first != nullptr) after = true;
+    const bool through =
+        first != nullptr && first->r.outcome == PierceOutcome::Exited;
+    lines += Format("(b) at %.1fx the full draw: %s, then %s | ", throughX,
+                    first ? PierceOutcomeName(first->r.outcome) : "no hit",
+                    after ? "it flew on" : "NOTHING after it");
+    if (!through || !after)
+      fail("(b) a far-faster arrow did not go through the torso and on");
   }
 
   // ======== the head: printed for the owner, not asserted ======================
