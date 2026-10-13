@@ -580,14 +580,19 @@ const FAR_SC_AXIS_BITS : u32 = countTrailingZeros(FAR_N);
 // STORED in shadowHist[bucket]: a far patch has no penumbra window (that is
 // the near patches' word), so its bucket's word is free. RGB9E5 with the low
 // bit forced on (0 = not buried / nothing measured: the reader keeps the
-// closed form). Re-measured every FAR_GI_PERIOD resolves of the patch (the
-// sun's share moves with the day) and on its first; written on EVERY resolve
-// so a word left by the bucket's previous owner never reaches a reader (the
-// reader only reads a slot this pass has published, and this pass publishes
-// after it writes).
+// closed form). Every buried patch that is REQUESTED gathers, and the reader
+// decides how many are: raymarch.wgsl farGiCached reads one patch per cell
+// face (sub-patch (0, 0)) for a fully buried hit and its own sub-patch only in
+// the burial band, so a cave's walls cost one gather per cell face.
+// Re-measured every FAR_GI_PERIOD resolves of the
+// patch (every 64 frames, ~1 s: the sun's share moves with the day, a degree
+// a second, and nothing else it sees moves at all) and on its first; written on EVERY resolve so a
+// word left by the bucket's previous owner never reaches a reader (the reader
+// only reads a slot this pass has published, and this pass publishes after
+// it writes).
 const FAR_GI_REACH_M : f32 = 12.0;
 const FAR_GI_STEPS : i32 = 72;
-const FAR_GI_PERIOD : u32 = 4u;
+const FAR_GI_PERIOD : u32 = 16u;
 const FAR_GI_W_NORMAL : f32 = 0.25;
 const FAR_GI_W_RING : f32 = 0.09375;
 const FAR_GI_OMEGA_NORMAL : f32 = 0.8418;
@@ -718,25 +723,37 @@ fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
       hp.y = max(hp.y, f32(cell.y + 1) * s + 0.05 * s);
     }
     let L = keyLightDirP(R);
-    let r = farShadowTC(level, hp, L, 0.0, true);
-    var sh = 1.0;
-    if (r.x >= 0.0) { sh = mix(1.0, shadowFromOpaqueHit(true, r.x, 0u), r.y); }
-    else if (farUnderTerrain(hp, L, TUNE_FAR_SHADOW_REACH / VOXEL_METERS)) {
-      // A CLEAR RAY UNDER THE TERRAIN IS NOT SUNLIT (above).
-      sh = shadowFromOpaqueHit(true, TUNE_FAR_SHADOW_REACH / VOXEL_METERS, 0u);
+    // A FULLY BURIED patch has no sun to measure: every reader caps the sun
+    // by the face's openness (shadowLiftCap), which burial takes to exactly 0,
+    // and raymarch.wgsl does not even ask for a pixel there. Such a patch is
+    // here for its indirect light (below), so it skips the march.
+    let bw = farBuriedW(level, hp, n3);
+    var sh = 0.0;
+    valid = true;
+    if (bw < 1.0) {
+      let r = farShadowTC(level, hp, L, 0.0, true);
+      sh = 1.0;
+      if (r.x >= 0.0) { sh = mix(1.0, shadowFromOpaqueHit(true, r.x, 0u), r.y); }
+      else if (farUnderTerrain(hp, L, TUNE_FAR_SHADOW_REACH / VOXEL_METERS)) {
+        // A CLEAR RAY UNDER THE TERRAIN IS NOT SUNLIT (above).
+        sh = shadowFromOpaqueHit(true, TUNE_FAR_SHADOW_REACH / VOXEL_METERS, 0u);
+      }
+      valid = !(r.x >= 0.0 && r.x < 0.01);
     }
-    valid = !(r.x >= 0.0 && r.x < 0.01);
     valU = u32(clamp(sh, 0.0, 1.0) * 255.0 + 0.5);
     // THE FAR PATCH'S INDIRECT LIGHT (above): buried patches only.
-    let ver0 = shadowPatchVerifier(packedCell, packedSub);
-    let old0 = atomicLoad(&shadowCache[bucket * 2u + 1u]);
-    let mine = shadowStateValid(old0) && shadowStateVerifier(old0) == ver0;
-    let bw = farBuriedW(level, hp, n3);
     var giW = 0u;
     if (bw > 0.001) {
+      let ver0 = shadowPatchVerifier(packedCell, packedSub);
+      let old0 = atomicLoad(&shadowCache[bucket * 2u + 1u]);
+      let mine = shadowStateValid(old0) && shadowStateVerifier(old0) == ver0;
       let due = !mine || shadowHist[bucket] == 0u ||
                 ((R.frameIdx / SHADOW_REFRESH_PERIOD + (key >> 8u)) % FAR_GI_PERIOD) == 0u;
-      giW = select(shadowHist[bucket], packRgb9e5(farGather(level, hp, n3, face)) | 1u, due);
+      if (due) {
+        giW = packRgb9e5(farGather(level, hp, n3, face)) | 1u;
+      } else {
+        giW = shadowHist[bucket];
+      }
     }
     shadowHist[bucket] = giW;
   }

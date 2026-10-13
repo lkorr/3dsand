@@ -6974,12 +6974,18 @@ fn farShadowCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
 
 // The far patch's measured indirect light (shadow_resolve.wgsl THE FAR PATCH'S
 // INDIRECT LIGHT), irradiance per unit albedo, or 0 while the patch has no
-// published answer. The same key as farShadowCached, so a pixel the sun term
-// already registered finds its slot in the plain read; a buried face turned
-// from the sun registers it here (farSlotRead's request path), which is what
-// keeps a cave wall's light coming at night.
+// published answer. Which patch: in the burial band (the sun term ran, with
+// `perFace` false) the pixel's own sub-patch -- the key farShadowCached just
+// read, so the find is a line already in cache; a FULLY buried hit (no sun
+// term) reads its face's sub-patch (0, 0) whichever sub-patch it is in, ONE
+// patch per cell face at the near grid's own 20-40 cm grain. In the Maw the
+// per-sub-patch version cost 1.3 ms of resolve (4x the gathers); per face
+// everywhere cost the outdoor cameras 0.12-0.17 ms (a second find, on a cold
+// line, for every hit on a slope steep enough to be partly buried). A buried
+// face turned from the sun registers it here (farSlotRead's request path),
+// which is what keeps a cave wall's light coming at night.
 fn farGiCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
-               refined : bool, hitP : vec3f) -> vec3f {
+               refined : bool, hitP : vec3f, perFace : bool) -> vec3f {
   let s = f32(1u << farCellShift(level));
   let face = shadowFaceOf(axis, sgn < 0.0);
   let tg = shadowFaceTangents(face);
@@ -6987,7 +6993,8 @@ fn farGiCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
   let f = clamp(hitP / s - vec3f(cell), vec3f(0.0), vec3f(1.0));
   let ix = u32(min(floor(axisPick(f, i32(tg.x)) * m), m - 1.0));
   let iy = u32(min(floor(axisPick(f, i32(tg.y)) * m), m - 1.0));
-  let sub = shadowPackSub(ix, iy) | select(0u, FAR_SC_REFINED, refined) | FAR_SC_FLAG |
+  let sub = shadowPackSub(select(ix, 0u, perFace), select(iy, 0u, perFace)) |
+            select(0u, FAR_SC_REFINED, refined) | FAR_SC_FLAG |
             ((level - 1u) << FAR_SC_LEVEL_SHIFT);
   let packedCell = farScPackCell(cell, face);
   let key = shadowPatchKey(packedCell, sub);
@@ -7985,9 +7992,11 @@ fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>, albedo : vec3f) -> vec3f {
   if (opennessGen[slot] != opennessStamp(worldChunkOf(cell))) {
     // The closed form is OPEN terrain's bounce (a lit tread in front): under
     // the ground it is daylight that is not there (NO MEASUREMENT YET IS NOT
-    // OPEN SKY UNDERGROUND, in fs). Scaled out by the same burial test.
-    // A rare arm (a slot the walk has not stamped): the burial test here.
-    return farGiIrradiance(albedo, n) * (1.0 - max(farHitBuried(1u, p, n), 0.0));
+    // OPEN SKY UNDERGROUND, in fs). Scaled out by the same burial test: fs
+    // ran it for this hit (gHitSky), because an unstamped slot has no
+    // openness byte either. Not a second call here -- inlining farHitBuried
+    // at this depth of the near shade cost the fragment shader 16 B of spill.
+    return farGiIrradiance(albedo, n) * gHitSky;
   }
   let face = openFaceOfNormal(n);
   let lo = vec3<u32>(cell & vec3<i32>(i32(CHUNK) - 1));
@@ -15693,6 +15702,11 @@ fn fs(in : VSOut) -> FSOut {
       if (lamSm >= 0.0 && !farWater) { lambert = mix(lambert, lamSm, wN); }
       let dbgLamPreF = lambert;
       var dbgShF = 1.0;
+      // A FACE THAT SEES NO SKY GETS NO SUN: shadowLiftCap(v, 0) is exactly 0
+      // (below), so a deep-buried hit -- every cascade pixel of a cave --
+      // skips the patch read, its registration and the patch's march in the
+      // resolve. Bit-identical to running it.
+      if (openF == 0.0) { lambert = 0.0; }
       if (lambert > 0.0 && (R.flags & 1u) != 0u) {
         // start the shadow march just off the hit face, in fine-voxel coords
         var hp = R.camPos + rd * (far.t - 1e-3) + n * (0.55 * sL);
@@ -15848,7 +15862,8 @@ fn fs(in : VSOut) -> FSOut {
         // face turned from the sun never reaches the sun term at all.
         if (SHADOW_CACHE && FAR_SHADOW_CACHE && buriedF > 0.0) {
           dbgGiF += ao * buriedF * albedo * TUNE_GI_STRENGTH *
-                    farGiCached(flv, far.cell, far.axis, far.sgn, fRefined || fFeat, hitP);
+                    farGiCached(flv, far.cell, far.axis, far.sgn, fRefined || fFeat, hitP,
+                                openF == 0.0);
         }
         color += dbgGiF;
       }
@@ -16110,7 +16125,10 @@ fn fs(in : VSOut) -> FSOut {
     // says (fogSkyK = max(eye, hit)), so an outdoor eye skips the map read for
     // every near pixel with a measurement -- the burial work this shade did on
     // every pixel before 2026-10-13, paid now only by a buried eye or an
-    // unmeasured face.
+    // unmeasured face. Skipped, the hit counts as open (what the fog does with
+    // it there anyway), and giBounceAt's unstamped arm -- whose slot has no
+    // openness stamp either, so openRaw < 0 ran the test -- reads it.
+    gHitSky = 1.0;
     if (R.eyeSky < 1.0 || openRaw < 0.0) {
       let nb = farHitBuried(1u, hp, openN);
       gHitSky = select(0.0, 1.0 - nb, nb >= 0.0);

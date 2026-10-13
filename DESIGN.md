@@ -18723,7 +18723,8 @@ changed the cost, not the answer.
 ambient by `opennessScale(opennessAt(...))`, alongside `ao` and never the sun
 (the sun has its own shadow ray). Far-cascade hits keep the plain lerp — the
 grid is keyed on residency slots and a cascade hit is outside the window by
-definition; open ground reads 1.0 so the two agree there, and the far GI
+definition; open ground reads 1.0 so the two agree there, and a buried cascade
+hit takes its sky from the column top instead (§9.k), and the far GI
 stand-in is `farGiBounce` (§9 far field, "near-only shading terms"). Micro hits sample the cell BELOW with the +Y face, because a grass
 tuft is not a ray blocker and its own block has no entry. `microbody.wgsl` uses
 `opennessScaleAtBody`, which walks down at most six blocks to the ground the
@@ -18842,6 +18843,16 @@ in `renderBGL_` — a burning ember in a cave no longer glows at full sky ambien
 Particles, sprites and fluid still take that walk per VERTEX; the BODY path
 takes it once per cube (at the centre) and shades per FRAGMENT — see §9.z.
 
+**A ray that leaves the window clear is asked where it left** (2026-10-13,
+§9.k). `traceOpaque` stops at the residency window, and a reach ray or an
+up-ray that left it without a blocker used to count as sky. A cave whose
+ceiling cracks reach above a window top 5 m over it read 24% open, and the
+answer moved with the window, i.e. with the camera. The exit point is now
+tested against the far surface map's column top (`openExitUnderTerrain`):
+under the ground = blocked. A column level 1 has not filled answers open and
+marks the walk uncertain, so it is walked again on its next refresh visit.
+Gate `cave-window`.
+
 ### 9.s The penumbra window — the sun is not a point (added 2026-09-11; `shadow_resolve.wgsl`, `src/sim/world.h` `kShadowHistBytes`)
 
 **The defect.** One ray per patch answers a yes/no question, so the shadow cache
@@ -18934,6 +18945,15 @@ the shadow share (`baseline − noshadow`) of the eye-height `seam` camera went
 0.47 — continuation and the far cone trace together; at noon all four moved by
 less than the noise. `--shader-stats`: `raymarch` fs unchanged at 128 registers
 + 144 B local; `shadowResolve` 63 → 64 registers.
+
+**...and a ray that runs out of reach under the ground is blocked**
+(2026-10-13, §9.k). A ray that ran `farShadowReach` (24 m) without meeting a
+cell used to be SUN. That covered a 30 m cave vault and any ray that left a
+level's valid box. Its endpoint is now tested against the far surface map's
+column top (`farUnderTerrain`). Under the ground, the ray is blocked at the
+reach. The near patch, the far patch, the cache-off reference
+(`sunShadowAt`) and the cache-off far march all apply the same test, so
+`shadow-cache` still compares like with like.
 
 **A window belongs to a PATCH, not to a slot.** The slot's `valid` bit is the
 only signal that distinguishes "my samples" from "the samples of whatever patch
@@ -19257,7 +19277,9 @@ it on the spot; a slot the walk has not stamped (a chunk that just streamed
 in waits up to ~4 s for the rolling refresh, and can come inside the handoff
 ring before then) has no cache and shades with `farGiIrradiance`, the closed
 form the far field draws just past the ring, where the inline version gathered
-per pixel. **The pass runs BEFORE `shadow_resolve`, on purpose**: with
+per pixel. Since 2026-10-13 (§9.k) that fallback is scaled by the point's
+burial, so an unwalked cave slot is not lit by open-ground bounce. A buried
+FAR patch measures its own bounce in the resolve pass instead. **The pass runs BEFORE `shadow_resolve`, on purpose**: with
 `giFeedback` on, plane 0 holds the multi-bounce fixed point only after the
 fragment write-back, and the resolve's deposits pull it back toward direct
 light every frame; gathered after the resolve the near field read ~2/255
@@ -19311,6 +19333,258 @@ and `render.heatSpillStrength` are gone.
 
 - Later: volumetrics for gases; a bilinear over the emitter faces if the
   block-scale edge of a bounce patch ever matters.
+
+### 9.k Under the ground — one answer to "does the sky reach here", near and far (added 2026-10-13; tickets `2026-10-12_20-13-42`, `2026-10-12_16-52-07`; gate `cave-window`)
+
+**The ticket.** The owner, in the teeth_caves chamber (a 20 m vault 54 m under
+a hill). They reported four problems:
+
+- A black, "unnatural" shadow past the first LOD seam, with lit voxels
+  sparkling inside it.
+- The whole chamber's shading changed when they stepped up 1-2 voxels.
+- Boundaries swept outward with them as they walked, the sphere radius of a
+  different lighting model.
+- The huge Maw chamber was a black ceiling full of white speckle.
+
+The `--at` reproductions put numbers on it (noon, fly camera):
+
+- **Near walls** read **0.24 open sky** on average.
+- **Far ceiling.** 190,000 of its 321,000 pixels had no answer from the burial
+  test. They fell back to a per-frame probe of the eye's floor, which said
+  "open", so the ceiling was lit like an outdoor overhang.
+- **Maw walls.** The far walls of the Maw took full direct sun at openness 0.
+  The same session's shardwell captures swung from full daylight at noon to
+  near black at midnight in a cave 16 m down.
+
+Seven separate mechanisms, all of one family: **"did not see a blocker" was
+read as "saw the sky".**
+
+1. **The eye's floor probe** (`eyeSkyK`, D9). This was the openness byte of the
+   first block under the camera, one number for the whole frame. It steered
+   two things: the fog target, and every cascade hit the burial test could not
+   answer. A riser and a tread under the eye read differently, so a 1-voxel
+   step flipped the chamber.
+2. **Burial behind VALID.** `farHitBuried` read the surface map through
+   `farSurfAt`, which refuses an entry whose VALID bit is clear. VALID means
+   "a clean heightfield the refine may draw", and every column through a cave
+   fails it, because `fardown`'s live check sees air under the top.
+3. **The openness walk clipped to the window.** `traceOpaque` stops at the
+   residency window, and a ray that left it clear (sideways, or up out of the
+   window top) was written down as sky. The chamber's ceiling cracks reached
+   above a window top 5 m over the vault, so its walls read 24% open. The
+   answer also depended on where the WINDOW sat, i.e. on the camera.
+4. **Shadow rays out of reach.** A sun ray that ran `farShadowReach` (24 m)
+   without a cell was SUN. That covered the Maw's 30 m vault, and any ray that
+   left a level's valid box.
+5. **The far arm capped only `sh < 1`.** The near shade refuses a full-sun
+   reading on a face with no sky (the 2026-09-11 cave-daylight fix). The far
+   arm did not, so (4)'s clear rays put full sun on buried cells.
+6. **No far indirect light.** The near field measures its bounce
+   (`gi_gather`, nine rays). The cascade had a closed form for open terrain,
+   which burial scales to 0. In an emitter-lit cave that is a sphere at
+   20.5 m: inside it the walls glow around each glowcap and crystal, outside
+   it they are black.
+7. **Media drawn as colours.** These were authored for the open noon sky and
+   drawn the same at midnight and under a moor: water's in-scatter, the sky a
+   reflection falls back to, the glint, a smoke plume's tint, the MPM body,
+   and the reflected hit's shading (bare hemisphere + half sun).
+   heather_cairn's flooded hall glowed turquoise at midnight.
+
+**THE RULE: one test, "is this point under the terrain", from one source.**
+The far surface map's entry top is procgen's ground under that column (plus a
+stalk), and nothing an edit does lowers it. So a column's top is an answer to
+"is there ground over this point" whatever VALID says.
+
+| Reader | Function |
+|---|---|
+| Cascade hits | `farColumnTop` / `farHitBuried`, raymarch.wgsl |
+| Shadow rays | `farColumnTop` / `farUnderTerrain`, shadow_resolve.wgsl (shadowBGL 34: `farMap`; the `shadow_resolve` pass-table row reads `FarMap`) |
+| The openness walk | `openTerrainTop` / `openExitUnderTerrain`, sim_openness.wgsl (simBGL 59/60: `farMap` + the far UBO; both openness pass-table rows read them) |
+| The eye | `RenderParams.eyeSky`, World::TerrainHeight on the CPU (genColumn's h exactly), spent from `pad_fb1` |
+
+Every one eases over the same band: FAR_BURIED_LO..HI, 2.4-4.8 m under the
+ground, plus two sub-columns of pad. All are continuous in position. The
+eye's value no longer cares which block it stands over.
+
+**What each consumer does with it:**
+
+- **The openness walk.** A reach ray or an up-ray that leaves the window clear
+  is asked at the point it left. That is the window top for an up-ray, or the
+  endpoint for a ray out the side or the floor. Under the ground it is
+  blocked. A column level 1 has not filled answers "open" (the old answer) and
+  marks the chunk's walk UNCERTAIN: its walked tick goes a quarter of the
+  clock into the past, so the refresh marches it again on its next visit,
+  instead of keeping a sky the map could not yet rule out. The walk's own sun
+  sample takes the same completion.
+- **Shadow rays.** A near patch's ray that left the window clear, and a far
+  patch's ray, end at the reach (or at the window face past it). If that point
+  is under the ground, the ray is blocked at the far blocker's distance. The
+  lift that gives is then capped by the face's openness. The cache-off
+  reference (`sunShadowAt`) and the cache-off far march do the same, so the
+  `shadow-cache` gate compares like with like.
+- **Cascade hits.** Burial from the column top; the eye's uniform only outside
+  a level's valid box. The far sun is capped by `shadowLiftCap` whatever its
+  value, as near. A far LIQUID hit's own sky feeds the fog target too.
+- **Near hits with no measurement yet** fall back to burial instead of the full
+  sky. These are slots the walk has not reached, up to ~2 s after streaming
+  in, i.e. what comes inside the handoff first while moving. The unstamped GI
+  fallback (`farGiIrradiance`) is scaled the same way. Outdoors both are
+  unchanged. The near burial read runs only where it can matter: an eye
+  under the ground (`R.eyeSky < 1`) or a face with no measurement. An outdoor
+  eye looking at measured faces pays nothing for it.
+- **The far patch measures its indirect light when buried**
+  (shadow_resolve.wgsl THE FAR PATCH'S INDIRECT LIGHT).
+  - The gather: the near gather's nine directions and weights, marched through
+    the patch's own level to the first material cell within 12 m.
+  - What a hit sends: its emission (irrSample's emissive term, burnTint's mean
+    for a burning cell). If the cell is not itself buried (ground seen through
+    a mouth or a shaft), also the sun's hard Lambert, unshadowed: the closed
+    forms' own open-ground assumption.
+  - Coverage as `giFacePlane` credits it. The hit cell's share of the cone
+    falls as 1/t²; the plane's neighbours fill the rest (their mean, a cell
+    being 20-80 cm already).
+  - HOW MANY PATCHES. Every buried patch that is requested gathers; the
+    reader decides how many that is.
+    - A fully buried hit (no sun term) reads its cell face's sub-patch
+      (0, 0), whichever sub-patch it is in: one gather per cell face, the
+      near grid's own 20-40 cm grain.
+    - A hit in the burial band reads its own sub-patch. That is the key
+      the sun term just found, so the find is a line already in cache.
+    - Measured: per sub-patch everywhere cost 1.3 ms of resolve in the Maw
+      (four times the gathers). Per face everywhere cost the outdoor cameras
+      0.12-0.17 ms: a second find on a cold line for every hit on a slope
+      steep enough to be partly buried.
+  - Storage: the bucket's `shadowHist` word, which a far patch never uses for
+    a penumbra window. RGB9E5, low bit forced on, 0 = "not buried / none".
+    Re-measured on the patch's first resolve and then every 16th, i.e. every
+    64 frames (~1 s). The sun's share moves a degree a second and nothing
+    else the gather sees moves at all. It is written on every resolve, so a
+    word the bucket's last owner left never reaches a reader.
+  - The read: the cascade shade reads it through its own find (`farGiCached`,
+    render binding 47). It does NOT carry the slot from the sun term: a value
+    live across the shade cost the fragment shader 16 B of spill, and a face
+    turned from the sun never reaches the sun term. That find also registers
+    the patch, so a cave wall at night still asks for its light.
+- **A face that sees no sky gets no sun, and pays nothing for it.**
+  `shadowLiftCap(v, 0)` is exactly 0. So a cascade hit whose openness burial
+  took to 0 (every far pixel of a deep cave) skips the sun term outright:
+  the patch read, its registration, and the patch's march in the resolve.
+  The result is bit-identical. A fully buried patch that is resolved for its
+  light alone skips the march too.
+- **The media take the light that is there** (raymarch.wgsl THE MEDIUM'S SKY).
+  `mediaLightK(sky)` is the sky dome and key light on an up face, as a fraction
+  of the open sky with the sun half-way up. Every daytime hour from there to
+  noon saturates at 1, so the tuned day look is exactly what it was. The
+  enclosed ambient is the floor where the sky cannot reach. It scales:
+  - water's in-scatter, near and far (`shadeWater` / `shadeFarWater`, so they
+    still agree);
+  - the MPM body;
+  - a plume's tint (not its flame: the fire's share keeps its colour);
+  - and, by sky alone, the glint, the submerged in-scatter and the fallback
+    sky of every reflection (`reflectionSkyBlur` → the enclosed dark).
+
+  The sky weight is the FOG's own, `fogSkyK` = max(eye, hit). The media and
+  the air in front of them agree, and it is a value the fragment shader
+  already holds. A sky weight computed per water interface and carried into
+  the shade took the raymarch fs from 128 to 168 registers.
+- **Reflected and refracted hits** (`shadeSecondaryHit`) read the hit's
+  openness (the burial fallback where there is none) into `ambientOpen`, and
+  cap the key light by it. There is no shadow ray at this budget, but no sun
+  through rock either.
+- **Bodies** fog toward the enclosed ambient where their ground sees (almost)
+  no sky (`bodyAirFog(…, openRaw)`). The dungeons' "creature fog still
+  sky-coloured" is closed.
+
+**And the plants.** Ticket `2026-10-12_16-52-07`, "weird lines": the far
+feature words keep a plant's top mod 256. `farFeatCell` placed it nearest the
+cell walked, and a card has no bottom. So the moor's heather, 15 m over
+heather_cairn's hall, stood in the hall as thin green and purple lines from
+floor to ceiling. Two fixes:
+
+- `farFeatMarch` walks only a ray whose walk starts at or above its column's
+  ground (one map read per ray).
+- A card under its own ground is refused.
+
+**Measured** (teeth_caves, the ticket's four cameras):
+
+- Near-field openness mean 0.043 → 0.000.
+- Unvouched far pixels 190,000 → 0.
+- The white speckle is gone from the Maw.
+- Each camera's mean luminance is identical to 0.1/255 at minute 0, 330, 720
+  and 1080: the caves no longer know the time of day.
+- In motion (walk 4 m/s, sprint 13 m/s, a 0.15 m/s climb through the vault),
+  frame-to-frame differences are parallax only.
+- Outdoor cameras (Harrowby, a forest path, a meadow, a mountain; four hours):
+  mean luminance within 0.2/255 of `ef48288`, 0.05-3% of pixels > 16/255 at
+  the run-to-run floor of grass wind and cloud.
+- **Cost.** Same exe, `ef48288`'s shaders against these, alternating boots,
+  exclusive lock, `--render-budget --budget-arms baseline`, 1080p, RTX
+  3060 Ti, `SANDVOX_MAP=default`. The two cave rows are the ticket's own
+  cameras via `SANDVOX_BUDGET_AT`. Columns are ms, base → now:
+
+  | camera | raymarch | shadow resolve | sum |
+  |---|---|---|---|
+  | noon | 9.59 → 9.66 | 0.176 → 0.203 | +0.09 |
+  | dusk | 12.09 → 12.07 | 0.411 → 0.435 | +0.01 |
+  | cascade | 5.62 → 5.65 | 0.066 → 0.095 | +0.06 |
+  | seamveg | 10.63 → 10.73 | 0.115 → 0.127 | +0.12 |
+  | meadow | 10.52 → 10.62 | 0.134 → 0.145 | +0.11 |
+  | canopy | 4.94 → 4.93 | 0.072 → 0.087 | +0.01 |
+  | village | 6.74 → 6.68 | 0.117 → 0.120 | −0.06 |
+  | teeth_caves Maw | 7.75 → 7.41 | 0.214 → 0.413 | −0.15 |
+  | teeth_caves vault | 4.35 → 4.23 | 0.212 → 0.354 | +0.03 |
+
+  **The stock cameras did not see the first version's cost.** Against the
+  seven stock cameras it measured +0.00-0.12 ms. At the ticket's Maw it cost
+  **+2.4 ms**: raymarch +1.03, resolve 0.22 → 1.55, with shadow-cache
+  requests 61k → 82k. Three changes brought it back:
+  - deep-buried hits skip the sun term (`shadowLiftCap(v, 0)` = 0);
+  - fully buried faces gather once per cell face, at period 16;
+  - giBounceAt's second burial call was removed (16 B of spill).
+
+  The Maw now asks for 34k patches, not 61k. **Price conditional work where
+  the condition holds.**
+- `raymarch` fs back at 128 registers / 96 B local, as on `ef48288`.
+  `giBounceAt`'s unstamped arm reads fs's burial value (`gHitSky`) rather than
+  calling the test again. A second inlined `farHitBuried` there cost 16 B of
+  spill and 0.1-0.25 ms on outdoor cameras. `shadowResolve` went 64 → 72
+  registers (the far gather).
+
+**Verified by** `--selftest --gate cave-window` (`selftest_render.cpp
+GateCaveWindow`). The fixture is a stone-shelled room 4 m under the ground
+whose open side IS the window's +X face, so every ray across it toward +X
+leaves the window clear. Its floor, back wall and ceiling must read <= 0.05
+open (`caveWindow.maxSealed`). Without the completion they read 0.16, 0.33
+and 0.16 (the back wall's 0.33 is the fan's double-weighted normal ray: 2 of
+6). A pad 3 m over the ground by the same face must still read > 0.75
+(`caveWindow.minOpen`, reads 1.00), so "everything that leaves the window is
+blocked" fails too. The rest of the lighting set passes unchanged, with the
+world hash unmoved, since nothing here is hashed: `openness`, `shadow-cache`,
+`gi-bounce`, `gi-nightfall`, `cave-time`, `glow`, `far-fog`, `far-surface`,
+`far-cover`, `body-shade`, `underwater-body`, `denoise`.
+
+**Instruments this left:**
+
+- `SANDVOX_AT_LIST=<file>` (main.cpp, the `--at` harness). Many cameras and
+  hours in one boot, one `screenshot_at_<name>.bmp` each, the clock frozen at
+  each entry's minute (`speed 1` runs it).
+- `SEAM_DBG 12`: per pixel, which path shaded it (near / near unmeasured / far
+  unvouched / far by its burial weight), the openness it used and the eye's
+  sky weight.
+
+**Not done:**
+
+- The caves are DARK. `render.enclosedAmbient` (0.012-0.016, "a moonless
+  night") is the floor, and only emitters and openings light a cave. That is
+  the design as tuned. The knob is the lever if the owner wants dungeons more
+  readable without carried light.
+- The far gather has no multi-bounce (the near write-back has no far twin).
+- A cave room that sees the sky only SIDEWAYS through a cliff opening is lit
+  near (the walk measures it) and buried far (the 1D test). Far openness
+  would need the same measured treatment the far GI got.
+- Body fog has no eye term (bodies have no far-map binding): a mob in a barn
+  seen from outside fogs toward the barn's dark, not the sky. Invisible at
+  the short range body fog acts over.
 
 ### 9.g The glow field — emitter light for the paths a ray cannot reach (added 2026-09-08; `assets/shaders/sim_glow.wgsl`, `src/sim/world.h` `kGlowBytes`)
 
