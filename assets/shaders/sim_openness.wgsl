@@ -64,6 +64,82 @@
 // where there is no surface, decayed where it cannot look, one coarse sun
 // sample where it can.
 @group(0) @binding(29) var<storage, read_write> irradiance  : array<u32>;
+// ---- THE TERRAIN OVER A POINT PAST THE WINDOW (2026-10-13) ----------------
+// traceOpaque clips to the residency window, so a ray that leaves it clear --
+// sideways out of a face near the window's edge, or straight UP out of the
+// window's top -- came back "not blocked", and the walk wrote that ray down as
+// SKY. A cave whose roof or whose ceiling cracks reach past the window's top
+// (the teeth_caves chamber of ticket 2026-10-12_20-13-42: a 20 m vault 54 m
+// under a hill, the window top 5 m over its ceiling) read 0.24 open on its
+// walls, so the near field lit a sealed cave with daylight ambient and the
+// cascade beyond the LOD seam, which knew it was buried, drew it black. And it
+// depended on where the WINDOW was, i.e. on where the camera was.
+// The completion: a ray that leaves the window clear is asked one more
+// question at the point it left -- is that point under the terrain's top? --
+// from the far SURFACE MAP's level 1 (fine columns, the level box is twice the
+// window's), the same answer raymarch.wgsl's burial test takes. Under the
+// ground = blocked; over it, or a column the level has not filled = the old
+// answer (open), which is right for every outdoor ray and costs one load.
+@group(0) @binding(59) var<storage, read> farMap : array<vec4<u32>>;
+@group(0) @binding(60) var<uniform> F : FarParams;
+// raymarch.wgsl farBox, verbatim (check_invariants.py pins the literals).
+const FAR_FACE_BITS : u32 = 5u;             // world.h kFarFaceBits
+const FAR_FACE_MASK : u32 = 31u;            // world.h kFarFaceMax
+const FAR_FACE_ALL  : u32 = 1u << 30u;      // world.h kFarFaceAllPending
+struct FarBox { lo : vec3<i32>, hi : vec3<i32> };
+fn farBox(level : u32) -> FarBox {
+  let o = F.origins[level - 1u];
+  let w = u32(o.w);
+  var b : FarBox;
+  b.lo = o.xyz * i32(CHUNK);
+  if ((w & FAR_FACE_ALL) != 0u) { b.hi = b.lo; return b; }
+  let lo = vec3<i32>(i32((w >> (0u * FAR_FACE_BITS)) & FAR_FACE_MASK),
+                     i32((w >> (2u * FAR_FACE_BITS)) & FAR_FACE_MASK),
+                     i32((w >> (4u * FAR_FACE_BITS)) & FAR_FACE_MASK));
+  let hi = vec3<i32>(i32((w >> (1u * FAR_FACE_BITS)) & FAR_FACE_MASK),
+                     i32((w >> (3u * FAR_FACE_BITS)) & FAR_FACE_MASK),
+                     i32((w >> (5u * FAR_FACE_BITS)) & FAR_FACE_MASK));
+  b.lo = (o.xyz + lo) * i32(CHUNK);
+  b.hi = (o.xyz + vec3<i32>(i32(FAR_NCHUNK)) - hi) * i32(CHUNK);
+  return b;
+}
+// raymarch.wgsl farColumnTop at level 1: the terrain's top over `p` (fine
+// voxels, the y of the air over the topmost far-solid voxel), whatever the
+// entry's VALID bit says -- VALID is "a clean heightfield", and every column
+// through a cave fails that while its top stays the ground's. -1e9 outside the
+// level's valid box.
+fn openTerrainTop(p : vec3f) -> f32 {
+  let w = f32(1u << (farCellShift(1u) - 1u));
+  let m = vec2<i32>(floor(vec2f(p.x, p.z) / w));
+  let b = farBox(1u);
+  let c = m >> vec2<u32>(1u);
+  if (any(c < b.lo.xz) || any(c >= b.hi.xz)) { return -1e9; }
+  let q = farMap[farMapCell(1u, c)];
+  let hx = (m.x & 1) != 0;
+  let e = select(select(q.x, q.y, hx), select(q.z, q.w, hx), (m.y & 1) != 0);
+  return f32(farMapTop(e) + 1);
+}
+// A clear ray from `ro` along `d` left the window at its exit: is that point
+// under the terrain? `d` straight up asks it at the window's top.
+// A column level 1 has not filled (a refill in flight, a face still pending)
+// answers "open", as before, and marks this thread's walk UNCERTAIN: the
+// chunk's walked tick is then written into the past (openChunk), so the
+// refresh walks it again on its next visit instead of keeping a sky the map
+// could not yet rule out -- the window generates in the same few ticks a
+// teleport or a load resets the cascade, and a walk is otherwise kept until
+// something near it changes.
+var<private> gOpenUncertain : bool = false;
+fn openExitUnderTerrain(ro : vec3f, d : vec3f) -> bool {
+  let lo = vec3f(T.origin * i32(CHUNK));
+  let inv = 1.0 / select(d, vec3f(1e-6), abs(d) < vec3f(1e-6));
+  let t0 = (lo - ro) * inv;
+  let t1 = (lo + vec3f(f32(WORLD_N)) - ro) * inv;
+  let tmax = max(t0, t1);
+  let p = ro + d * max(min(tmax.x, min(tmax.y, tmax.z)), 0.0);
+  let top = openTerrainTop(p);
+  if (top < -1e8) { gOpenUncertain = true; }
+  return p.y < top;
+}
 
 // ------------------------------------------------------------------ rays ----
 // FIVE directions in the face's hemisphere: the normal, and four at 45 degrees
@@ -240,6 +316,11 @@ fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
       let e = ro + d * reachVox;
       let u = traceOpaque(e, up, upSteps, 0.0, &occupancy, &materials);
       blocked = u.hit;
+      // Clear to the window's edge is not clear to the sky (THE TERRAIN OVER
+      // A POINT PAST THE WINDOW, above). An endpoint past the window's side
+      // or floor is asked where it is; one inside asks at the window's top,
+      // where its up-ray left.
+      if (!blocked) { blocked = openExitUnderTerrain(e, up); }
     }
     let w = select(1.0, 2.0, r == 0u);
     if (!blocked) { openW += w; }
@@ -332,6 +413,12 @@ fn openSunSample(blockMin : vec3<i32>, face : u32, open : f32) -> vec4f {
       let dM = s.t * VOXEL_METERS;
       lit = clamp(smoothstep(TUNE_SHADOW_SOFT_NEAR, TUNE_SHADOW_SOFT_FAR, dM) *
                   TUNE_SHADOW_LIFT, 0.0, 1.0);
+    } else if (s.steps > u32(TUNE_SHADOW_STEPS) || openExitUnderTerrain(ro, L)) {
+      // Out of steps (the resolve pass's ranOut) or out of the window under
+      // the terrain: a blocker past the march, at the far blocker's lift --
+      // the same verdict shadow_resolve.wgsl reaches for the same ray, so the
+      // two injection paths agree about a cave under a hill.
+      lit = TUNE_SHADOW_LIFT;
     }
     // The lift cannot enter an enclosed space (shadowLiftCap, common.wgsl);
     // `open` is the openness this same visit just measured for the face.
@@ -388,6 +475,7 @@ fn openChunk(slot : u32, li : u32, origin : vec3<i32>, fullIn : bool) {
   // barrier for the same reason as the stamp (nothing else writes it, but the
   // habit is the point).
   let prev = openness[slot * OPEN_WORDS_PER_CHUNK + li];
+  if (li == 0u) { atomicStore(&wgOpenUnc, 0u); }
   workgroupBarrier();
   // The stamp, from thread 0. Written unconditionally, including for a chunk
   // with no matter in it at all: "computed, and the answer is open" is a
@@ -513,7 +601,17 @@ fn openChunk(slot : u32, li : u32, origin : vec3<i32>, fullIn : bool) {
     packed |= v << (k * 8u);
   }
   openness[slot * OPEN_WORDS_PER_CHUNK + li] = packed;
+  // An UNCERTAIN walk (openExitUnderTerrain) is not a walk the refresh may
+  // skip: its walked tick goes a quarter of the clock into the past, so the
+  // next visit's "touched more recently than walked" holds and it marches
+  // again, by when the cascade has usually landed.
+  if (gOpenUncertain) { atomicStore(&wgOpenUnc, 1u); }
+  workgroupBarrier();
+  if (li == 0u && full && atomicLoad(&wgOpenUnc) != 0u) {
+    opennessGen[OPEN_WALKED_BASE + slot] = T.tick - 0x40000000u;
+  }
 }
+var<workgroup> wgOpenUnc : atomic<u32>;
 
 // ---------------------------------------------------------------- passes ----
 

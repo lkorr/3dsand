@@ -2032,9 +2032,13 @@ def check_far_face_word():
 
     # shadow_resolve.wgsl carries a verbatim copy of farBox since LOD-seam
     # package C (its patch rays continue into the cascade past the window).
+    # sim_openness.wgsl carries one too since 2026-10-13 (its walk asks the
+    # far surface map whether a ray that left the window is under the terrain).
     for fname, src in (("raymarch.wgsl", rm),
                        ("shadow_resolve.wgsl",
-                        read("assets/shaders/shadow_resolve.wgsl"))):
+                        read("assets/shaders/shadow_resolve.wgsl")),
+                       ("sim_openness.wgsl",
+                        read("assets/shaders/sim_openness.wgsl"))):
         if not src:
             continue
         got = {}

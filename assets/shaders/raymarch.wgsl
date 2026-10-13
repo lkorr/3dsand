@@ -987,44 +987,29 @@ var<private> gFragXY : vec2f = vec2f(0.0);
 // (farOpenness) assumes an open sky, which is why the hall's far end in the
 // cascade was lit like a hillside.
 //
-// The eye's own measurement is the openness grid's (sim_openness.wgsl): walk
-// DOWN from the camera to the first block holding matter (16 blocks, 6.4 m, so
-// a flying camera in a tall hall still finds its floor) and read that block's
-// +Y face -- exactly opennessAtBody's probe, with a longer reach. The result
-// is a 0..1 SKY WEIGHT k:
-//   * 1 EXACTLY where the floor's sky share is >= EYE_SKY_OPEN_HI, where there
-//     is no measurement (-1: off the grid, airborne, openness off) and where
-//     render.opennessStrength is 0 -- so every outdoor frame is bit-identical
-//     to before; only a camera whose floor sees (almost) no sky moves;
-//   * eased to 0 by EYE_SKY_OPEN_LO.
+// THE EYE'S MEASUREMENT IS THE TERRAIN OVER IT (2026-10-13, ticket
+// 2026-10-12_20-13-42), the same burial test the cascade hits take
+// (farHitBuried at level 1, the surface map's column top): 1 under the open
+// sky, eased to 0 as the eye goes FAR_BURIED_LO..HI under the ground.
+// It was the openness grid's +Y byte of the first floor block under the eye,
+// one number for the whole frame, and in a cave that byte flips with a voxel
+// of eye height (the block found moves, a riser and a tread read differently)
+// -- the owner walked over a 1-2 voxel step and "the shading for this whole
+// chamber" changed, because the fog target and every buried-or-not cascade
+// hit followed it. Depth under terrain is continuous in the eye's position and
+// does not care which block it stands over.
 // Readers: applyAerial's fog TARGET (mix toward render.enclosedAmbient, the
 // light an enclosed face keeps -- fog in a dark room is darkness) and the
-// far-hit shade's sky terms (openF, the bounce). The fog FRACTION is
-// untouched: what the air hides is still hidden, it just is not sky-coloured.
-// Uniform per frame in effect (same addresses for every pixel), computed once
-// per pixel on first use.
-// Render-only, never hashed.
-const EYE_SKY_OPEN_LO : f32 = 0.02;
-const EYE_SKY_OPEN_HI : f32 = 0.12;
-const EYE_SKY_WALK : u32 = 16u;
+// far-hit shade's sky terms where the map has no column (outside the level's
+// valid box). The fog FRACTION is untouched: what the air hides is still
+// hidden, it just is not sky-coloured.
+// Uniform per frame (same addresses for every pixel), computed once per pixel
+// on first use. Render-only, never hashed.
 var<private> gEyeSkyK : f32 = -1.0;
 fn eyeSkyKCompute() -> f32 {
   if (TUNE_OPENNESS_STRENGTH <= 0.0) { return 1.0; }
-  var c = vec3<i32>(floor(R.camPos));
-  for (var i = 0u; i < EYE_SKY_WALK; i++) {
-    let idx = chunkIndexW(c);
-    let lo = vec3<u32>(c & vec3<i32>(i32(CHUNK) - 1));
-    let sbit = subOccBitLocal(lo);
-    if ((occupancy[subOccIndex(idx, 1u, sbit >> 5u)] & (1u << (sbit & 31u))) != 0u) {
-      let b = opennessByteAt(c, 3u, &openness, &opennessGen);   // face 3 = +Y
-      if (b < 0) { return 1.0; }
-      let raw = f32(b) * (1.0 / OPEN_MAX);
-      if (raw >= EYE_SKY_OPEN_HI) { return 1.0; }
-      return smoothstep(EYE_SKY_OPEN_LO, EYE_SKY_OPEN_HI, raw);
-    }
-    c.y -= i32(SUBOCC_BLOCK);
-  }
-  return 1.0;
+  let bw = farHitBuried(1u, R.camPos, vec3f(0.0, 1.0, 0.0));
+  return select(1.0 - bw, 1.0, bw < 0.0);
 }
 fn eyeSkyK() -> f32 {
   if (gEyeSkyK < 0.0) { gEyeSkyK = eyeSkyKCompute(); }
@@ -8246,9 +8231,13 @@ fn sunShadowAt(hp : vec3f, n : vec3f, px : vec2f, camDistFine : f32,
                       &occupancy, &materials);
   rsAdd(RS_SHADOW, s.steps);
   if (beyondWindow && !s.hit && s.steps <= u32(TUNE_SHADOW_STEPS)) {
-    let f = farShadowMarch(1u, ro, keyLightDir(),
-                           shadowWindowExitT(ro, keyLightDir()));
+    let tw = shadowWindowExitT(ro, keyLightDir());
+    let f = farShadowMarch(1u, ro, keyLightDir(), tw);
     if (f.t >= 0.0) { return shadowFromOpaqueHit(true, f.t, 0u); }
+    // shadow_resolve.wgsl, A CLEAR RAY UNDER THE TERRAIN IS NOT SUNLIT: the
+    // reference casts what the resolve casts.
+    let tEnd = max(tw, TUNE_FAR_SHADOW_REACH / VOXEL_METERS);
+    if (farUnderTerrain(ro, keyLightDir(), tEnd)) { return shadowFromOpaqueHit(true, tEnd, 0u); }
   }
   // The softening law itself lives in common.wgsl (shadowFromOpaqueHit) since
   // 2026-09-04, because the raster body path casts the same ray and must land
@@ -14234,13 +14223,52 @@ fn farSurfAt(level : u32, hitP : vec3f, grad : bool) -> FarSurf {
 // column (an edit, a ruin, outside the level): no answer.
 const FAR_BURIED_LO : f32 = 24.0;
 const FAR_BURIED_HI : f32 = 48.0;
+// THE TERRAIN'S TOP OVER A POINT, whatever VALID says (2026-10-13, ticket
+// 2026-10-12_20-13-42). The surface map's VALID bit means "this column is a
+// clean heightfield the refine may draw" -- solid at and under the top, air
+// over it -- and EVERY column through a cave fails that (fardown's live check
+// sees air under the top and clears it), as does every column of a level chunk
+// an edit patched. Burial asked the map through farSurfAt, which refuses an
+// invalid entry, so a cave or a dungeon hall was "no answer" almost
+// everywhere (teeth_caves: 190k of the 321k far pixels at the ticket camera)
+// and fell back to the EYE's floor probe -- one value for the whole frame,
+// which flipped with a voxel of eye height and lit a sealed cave ceiling 54 m
+// under a hill like an outdoor overhang. The question burial asks is not
+// "is this a heightfield" but "is there terrain over this point", and the
+// entry's top answers it whatever the column holds under it: the fill writes
+// procgen's ground (+ a stalk), and nothing an edit does lowers it. What it
+// cannot see is the player's own excavation from above (a dug pit's air still
+// reads as under the old ground) -- the near field, which measures, covers the
+// window; past it that is a crater too small to matter at cascade scale.
+// Returns the top in fine voxels, or -1e9 outside the level's valid box.
+fn farColumnTop(level : u32, p : vec3f) -> f32 {
+  let w = f32(1u << (farCellShift(level) - 1u));
+  let m = vec2<i32>(floor(vec2f(p.x, p.z) / w));
+  let b = farBox(level);
+  let c = m >> vec2<u32>(1u);
+  if (any(c < b.lo.xz) || any(c >= b.hi.xz)) { return -1e9; }
+  let q = farMap[farMapCell(level, c)];
+  let hx = (m.x & 1) != 0;
+  let e = select(select(q.x, q.y, hx), select(q.z, q.w, hx), (m.y & 1) != 0);
+  return f32(farMapTop(e) + 1);
+}
+// shadow_resolve.wgsl farUnderTerrain, verbatim (A CLEAR RAY UNDER THE
+// TERRAIN IS NOT SUNLIT there): is the end of a clear ray of `t` fine voxels
+// under the terrain's top, at the finest level that holds the point?
+fn farUnderTerrain(ro : vec3f, rd : vec3f, t : f32) -> bool {
+  let p = ro + rd * t;
+  for (var level = 1u; level <= FAR_LEVELS; level++) {
+    let top = farColumnTop(level, p);
+    if (top > -1e8) { return p.y < top; }
+  }
+  return false;
+}
 fn farHitBuried(level : u32, hitP : vec3f, n : vec3f) -> f32 {
   let w = f32(1u << (farCellShift(level) - 1u));
-  let fs = farSurfAt(level, hitP + n * w, false);
-  if (!fs.ok) { return -1.0; }
-  let depth = f32(farMapTop(fs.e) + 1) - hitP.y;
+  let top = farColumnTop(level, hitP + n * w);
+  if (top < -1e8) { return -1.0; }
   let pad = 2.0 * w;
-  return smoothstep(FAR_BURIED_LO + pad, FAR_BURIED_HI + pad, depth);
+  return smoothstep(FAR_BURIED_LO + pad, FAR_BURIED_HI + pad, top - hitP.y);
 }
 fn farRiserShare(g : vec2f, rd : vec3f) -> f32 {
   let wT = max(-rd.y, 0.0);
@@ -15504,6 +15532,7 @@ fn fs(in : VSOut) -> FSOut {
       // (gHitSky).
       if (!fFeat && m.klass != CLASS_LIQUID) {
         let bw = farHitBuried(flv, hitP, n);
+        if (SEAM_DBG == 12u) { gDbg = vec4f(select(0.4, 0.6 + 0.4 * bw, bw >= 0.0), 0.0, eyeSkyK(), 1.0); }
         if (bw >= 0.0) {
           openF *= 1.0 - bw;
           featBounce *= 1.0 - bw;
@@ -15565,6 +15594,9 @@ fn fs(in : VSOut) -> FSOut {
           let fsh = farShadowMarch(flv, hp, keyLightDir(), 0.0);
           if (fsh.t >= 0.0) {
             sh = mix(1.0, shadowFromOpaqueHit(true, fsh.t, 0u), fsh.cov);
+          } else if (farUnderTerrain(hp, keyLightDir(), TUNE_FAR_SHADOW_REACH / VOXEL_METERS)) {
+            // shadow_resolve.wgsl resolveFarPatch: the same completion.
+            sh = shadowFromOpaqueHit(true, TUNE_FAR_SHADOW_REACH / VOXEL_METERS, 0u);
           }
         }
         // THE CONTACT SHADOW THE CELL MARCH GAVE UP (package F): a refined
@@ -15591,14 +15623,19 @@ fn fs(in : VSOut) -> FSOut {
         // march reaches. After the LOD lift, which is for contact shadows:
         // a mountain's is a cast shadow at the near law's depth.
         sh = min(sh, hzSunShade(hitP));
-        if (sh < 1.0) {
-          // The near field's cap (shadowLiftCap): the lift cannot reach a
-          // face that sees little sky. The near shade applies it to every
-          // shadowed face, on the openness the far arm now carries too, so a
-          // shadowed riser takes the same depth on either side of the seam.
-          sh = shadowLiftCap(sh, openF);
-          lambert *= sh;
-        }
+        // The near field's cap (shadowLiftCap): the lift cannot reach a face
+        // that sees little sky, and neither can a FULL-SUN reading -- the near
+        // shade caps every face, lit ones included (the cave-daylight fix of
+        // 2026-09-11), on the openness the far arm now carries too. This arm
+        // used to cap only `sh < 1`, so a cascade cell whose shadow march came
+        // back clear -- a patch with no opinion yet, a ray that ran out of
+        // farShadowReach inside a chamber taller than the reach -- kept the
+        // full sun at openness 0: the lit speckle across the black ceiling of
+        // a buried cave and the sunlit walls of the Maw (ticket
+        // 2026-10-12_20-13-42). Outdoors openF >= 0.25 and a lit reading is
+        // unchanged.
+        sh = shadowLiftCap(sh, openF);
+        lambert *= sh;
         dbgShF = sh;
       }
       // Cloud shadow (common.wgsl cloudSunAt): the deck's shadow crossing the
@@ -15666,6 +15703,7 @@ fn fs(in : VSOut) -> FSOut {
       }
       if (SEAM_DBG != 0u) {
         dbgRec(true, far.mat, far.t, albedo, dbgShF, ao, openF, dbgLamPreF, lambert, color, dbgGiF, face);
+        if (SEAM_DBG == 12u) { gDbg.y = openF; }
       }
       // The near field's wet sheen (its `wet > 0` block), same lobe.
       if (wet > 0.0) {
@@ -16126,6 +16164,7 @@ fn fs(in : VSOut) -> FSOut {
 
     if (SEAM_DBG != 0u) {
       dbgRec(false, mat, h.t, albedo, dbgShN, ao, openRaw, dbgLamPreN, lambert, color, dbgGiN, face);
+      if (SEAM_DBG == 12u) { gDbg = vec4f(select(0.1, 0.2, openRaw >= 0.0), max(openRaw, 0.0), eyeSkyK(), 1.0); }
     }
     // ---- caustics on a submerged surface ----
     // The rippling web of focused sunlight on anything under water. This is

@@ -431,6 +431,15 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // reads it. simBGL_ only. 58 is the first free slot of this dense
         // 0..57 layout.
         entry(58, T::Storage),         // stillWater (per window column)
+        // The far SURFACE MAP and the far UBO (its levels' origins and valid
+        // boxes), read by sim_openness.wgsl's walk: a ray that leaves the
+        // residency window clear asks the map whether the point it left at is
+        // under the terrain's top (openUnderTerrain), so a cave whose roof is
+        // above the window top no longer reads its ceiling cracks as sky
+        // (ticket 2026-10-12_20-13-42). simBGL_ only. 59..60, the first free
+        // slots of this dense 0..58 layout.
+        entry(59, T::ReadOnlyStorage), // farMap
+        entry(60, T::Uniform),         // farUBO
     };
     simBGL_ =device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1200,6 +1209,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // which write 33 (horizon.h kL*; the raymarch reads it at 46).
         entry(32, T::ReadOnlyStorage), // horizon
         entry(33, T::Storage),         // hzLight
+        // The far SURFACE MAP (world.h kFarMap*), read by the resolve's
+        // completion test: a shadow ray that runs out of farShadowReach still
+        // UNDER the terrain's top is blocked, not sunlit (shadow_resolve.wgsl
+        // farUnderTerrain; ticket 2026-10-12_20-13-42).
+        entry(34, T::ReadOnlyStorage), // farMap
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1447,6 +1461,8 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(56, world_->elecMeta),
         b(57, elecParamsBuf_),
         b(58, stillWaterBuf_),
+        b(59, world_->farMap),
+        b(60, world_->farUBO),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -4423,6 +4439,7 @@ void Simulation::BuildShadowBindGroup() {
       b(28, giReqBuf_),
       b(32, horizonBuf_),
       b(33, hzLightBuf_),
+      b(34, world_->farMap),
   };
   shadowBG_ = device_.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
 }

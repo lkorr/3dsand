@@ -179,6 +179,43 @@ fn farBox(level : u32) -> FarBox {
 fn farInValid(c : vec3<i32>, b : FarBox) -> bool {
   return all(c >= b.lo) && all(c < b.hi);
 }
+// ---- A CLEAR RAY UNDER THE TERRAIN IS NOT SUNLIT (2026-10-13) --------------
+// A shadow ray that ran farShadowReach without meeting a cell used to be SUN.
+// Outdoors that is the reach doing its job (a blocker past 24 m is a ridge the
+// horizon's hzSunShade answers). Underground it is a hole in the rock: in a
+// chamber taller than the reach along the sun -- the Maw of teeth_caves, 30 m
+// of vault -- or one whose ray leaves the cascade's valid box, every patch the
+// ray could not close read full sun, and the cap downstream (shadowLiftCap)
+// only knows a face's own sky view, which a far patch does not carry. So the
+// point the ray stopped at is asked whether it is under the terrain's top
+// (the far SURFACE MAP, binding 34; raymarch.wgsl farColumnTop, the burial
+// test's reader): under = blocked at the far blocker's distance, i.e. the
+// reach. Above the ground, or a column no level vouches for, keeps the old
+// answer -- every outdoor ray is unchanged.
+@group(0) @binding(34) var<storage, read> farMap : array<vec4<u32>>;
+fn farColumnTop(level : u32, p : vec3f) -> f32 {
+  let w = f32(1u << (farCellShift(level) - 1u));
+  let m = vec2<i32>(floor(vec2f(p.x, p.z) / w));
+  let b = farBox(level);
+  let c = m >> vec2<u32>(1u);
+  if (any(c < b.lo.xz) || any(c >= b.hi.xz)) { return -1e9; }
+  let q = farMap[farMapCell(level, c)];
+  let hx = (m.x & 1) != 0;
+  let e = select(select(q.x, q.y, hx), select(q.z, q.w, hx), (m.y & 1) != 0);
+  return f32(farMapTop(e) + 1);
+}
+// Is the end of a clear ray of length `t` (fine voxels) under the terrain? The
+// level that holds that point, finest first: level 1 covers +-51 m round the
+// eye, each next level twice that.
+fn farUnderTerrain(ro : vec3f, rd : vec3f, t : f32) -> bool {
+  let p = ro + rd * t;
+  for (var level = 1u; level <= FAR_LEVELS; level++) {
+    let top = farColumnTop(level, p);
+    if (top > -1e8) { return p.y < top; }
+  }
+  return false;
+}
+
 // raymarch.wgsl farShadowBlocked: MATERIAL cells only, never the blocker flag.
 fn farShadowBlocked(level : u32, c : vec3<i32>) -> bool {
   let bi = farVoxByteIndex(level, c);
@@ -534,9 +571,14 @@ fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
     if ((packedSub & FAR_SC_REFINED) != 0u) {
       hp.y = max(hp.y, f32(cell.y + 1) * s + 0.05 * s);
     }
-    let r = farShadowTC(level, hp, keyLightDirP(R), 0.0, true);
+    let L = keyLightDirP(R);
+    let r = farShadowTC(level, hp, L, 0.0, true);
     var sh = 1.0;
     if (r.x >= 0.0) { sh = mix(1.0, shadowFromOpaqueHit(true, r.x, 0u), r.y); }
+    else if (farUnderTerrain(hp, L, TUNE_FAR_SHADOW_REACH / VOXEL_METERS)) {
+      // A CLEAR RAY UNDER THE TERRAIN IS NOT SUNLIT (above).
+      sh = shadowFromOpaqueHit(true, TUNE_FAR_SHADOW_REACH / VOXEL_METERS, 0u);
+    }
     valid = !(r.x >= 0.0 && r.x < 0.01);
     valU = u32(clamp(sh, 0.0, 1.0) * 255.0 + 0.5);
   }
@@ -666,9 +708,17 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   var bT = s.t;
   if (!s.hit && !ranOut) {
     let tw = shadowWindowExitT(ro, dir);
-    if (tw < TUNE_FAR_SHADOW_REACH / VOXEL_METERS) {
+    let reachF = TUNE_FAR_SHADOW_REACH / VOXEL_METERS;
+    if (tw < reachF) {
       let ft = farShadowT(1u, ro, dir, tw);
       if (ft >= 0.0) { bHit = true; bT = ft; }
+    }
+    // A CLEAR RAY UNDER THE TERRAIN IS NOT SUNLIT (above): asked where the
+    // ray stopped being marched -- the reach, or the window's face for a ray
+    // that left it past the reach.
+    if (!bHit && farUnderTerrain(ro, dir, max(tw, reachF))) {
+      bHit = true;
+      bT = max(tw, reachF);
     }
   }
   let sunSeen = !bHit && !ranOut;

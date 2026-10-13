@@ -513,6 +513,10 @@ _SIM_GROUP0 = {
     # The tick's RenderParams copy for the derived rows, binding 53
     # (sim_openness.wgsl `RT`; docs/PLAN_async_compute.md).
     "RT",
+    # The far surface map + the far UBO, bindings 59/60: sim_openness's
+    # beyond-the-window completion (a clear ray leaving the window under the
+    # terrain's top is blocked). simBGL_ only.
+    "farMap", "F",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers

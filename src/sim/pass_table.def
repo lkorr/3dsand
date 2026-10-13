@@ -1317,7 +1317,8 @@ PASS(copy_renderUBOTick, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,0, GRP_NONE, D
 PASS(opennessDirty, "openness", PT_DERIVED, PIPE_OPENNESS_DIRTY, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SIM, DYN_ZERO, C_OPENNESS, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) U(RenderUBOTick) R(Occupancy) R(DirtyList)
-          I(DispatchArgs) R(PageTable) W(Openness) W(OpennessGen) W(Irradiance)))
+          I(DispatchArgs) R(PageTable) W(Openness) W(OpennessGen) W(Irradiance)
+          R(FarMap) U(FarUBO)))
 // The rolling refresh: render.opennessChunksPerFrame slots per tick, round
 // robin from a cursor derived from T.tick, so the whole window revisits in
 // kNumChunks / budget ticks. The dirty walk above covers every EDIT; this
@@ -1330,7 +1331,7 @@ PASS(opennessDirty, "openness", PT_DERIVED, PIPE_OPENNESS_DIRTY, K_INDIRECT, IND
 PASS(opennessRefresh, "openness", PT_DERIVED, PIPE_OPENNESS_REFRESH, K_COMPUTE, D_OPENCHUNKS,1,1,
      GRP_SIM, DYN_ZERO, C_OPENNESS, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) U(RenderUBOTick) R(Occupancy) R(PageTable)
-          W(Openness) W(OpennessGen) W(Irradiance)))
+          W(Openness) W(OpennessGen) W(Irradiance) R(FarMap) U(FarUBO)))
 
 // ---- phase 5d: the glow field --------------------------------------------
 // src/sim/world.h kGlowBytes; assets/shaders/sim_glow.wgsl states the design.
@@ -1862,7 +1863,7 @@ PASS(shadow_resolve, "shadowResolve", PT_SHADOWCACHE, PIPE_SHADOW_RESOLVE, K_IND
 // what orders this per-frame dispatch after them.
      USES(R(Voxels) R(Occupancy) R(Materials) U(RenderUBO) R(PageTable)
           A(ShadowCache) A(ShadowReq) I(ShadowArgs) W(Irradiance) R(OpennessGen)
-          R(Openness) W(ShadowHist) R(FarVox) R(FarOcc) U(FarUBO)))
+          R(Openness) W(ShadowHist) R(FarVox) R(FarOcc) U(FarUBO) R(FarMap)))
 
 // ---- THE CLOUDS (assets/shaders/cloud.wgsl, DESIGN.md §9.w) ---------------
 // Same table, same reason: per-FRAME render-path compute whose writes the
