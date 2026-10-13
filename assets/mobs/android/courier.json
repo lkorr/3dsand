@@ -89,7 +89,8 @@
             "keep": true
           }
         ]
-      }
+      },
+      "hips": null
     },
     "becomes": {
       "mushroom_stem": "synth_shell",
@@ -98,7 +99,9 @@
       "petal_red": "neural_core",
       "petal_pink": "power_cell"
     },
-    "garmentsBecome": null
+    "garmentsBecome": null,
+    "paintBecomes": null,
+    "carve": null
   },
   "limbs": [
     {
@@ -148,16 +151,6 @@
       ]
     }
   ],
-  "sockets": [
-    {
-      "name": "held_right",
-      "offset": [
-        4,
-        61,
-        10
-      ]
-    }
-  ],
   "natural": [
     {
       "name": "jaws",
@@ -189,17 +182,6 @@
       "bodyYOffset": null
     }
   ],
-  "clips": {
-    "walk": {
-      "mask": [
-        "armU.L",
-        "armL.L",
-        "armU.R",
-        "armL.R",
-        "torso"
-      ]
-    }
-  },
   "bleed": null,
   "genome": {
     "archetype": "humanoid",
@@ -209,6 +191,32 @@
       "race": "android",
       "sex": "male",
       "bust": 0,
+      "bra": {
+        "style": "classic",
+        "cover": 1,
+        "cupSize": 1,
+        "cupLift": 0,
+        "bridge": 0,
+        "bridgePos": 0.5,
+        "taper": 0,
+        "plunge": 0,
+        "bandPos": 0,
+        "band": 1,
+        "wrap": 0,
+        "straps": "classic",
+        "strapWidth": 0.75,
+        "strapSet": 0.45,
+        "tone": "cloth"
+      },
+      "briefs": {
+        "style": "shorts",
+        "rise": 0,
+        "band": 1,
+        "leg": 0,
+        "cut": 0,
+        "back": "full",
+        "tone": "cloth"
+      },
       "heightM": 1.74,
       "hipWidth": 10,
       "shoulderWidth": 12,
@@ -275,6 +283,8 @@
       "mouthOpen": 0,
       "mouthTone": "shade",
       "lips": 0,
+      "lipTone": "lit",
+      "lipLine": false,
       "nose": 0,
       "noseWidth": 1,
       "earSize": 1,
@@ -340,6 +350,7 @@
       "cloth": "#e07a2a",
       "clothShade": "#a8561a",
       "nail": "#3a4048",
+      "lip": "#c291b5",
       "root": "#4a3a2b",
       "moss": "#7f9a3e",
       "branch": "#6b5540",
@@ -361,7 +372,11 @@
       "frame": "#6a727c",
       "core": "#6ae8ff",
       "visor": "#141a22",
-      "trace": "#2a8aa8"
+      "trace": "#2a8aa8",
+      "horn": "#d8ccb0",
+      "hornTip": "#8a7e66",
+      "claw": "#1a1412",
+      "mark": "#4a0e0c"
     },
     "sylvan": {
       "face": "hollow",
@@ -451,6 +466,24 @@
       "fins": 0,
       "packs": 0,
       "halo": 0
+    },
+    "demon": {
+      "hornStyle": "goat",
+      "horns": 0.5,
+      "hornCurl": 0.5,
+      "hornSpread": 0.4,
+      "tail": 0.5,
+      "tailThick": 0.5,
+      "tailCurl": 0.5,
+      "tailTrail": 0.3,
+      "tailTip": "point",
+      "tailSway": 0.5,
+      "tailSpeed": 0.4,
+      "tailLag": 0.5,
+      "claws": 0.6,
+      "mottle": 0.35,
+      "glow": true,
+      "posture": "upright"
     }
   }
 }

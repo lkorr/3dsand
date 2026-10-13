@@ -4761,6 +4761,30 @@ export function anatomyRecipe(race = 'human') {
           'skeleton: eye sockets and a nasal hole in the skull, ribs, ' +
           'sternum and spine in the chest.',
     ...r,
+    // LOAD-TIME REWRITES, after the recipe resolves (mob.cpp), so neither
+    // touches the bake. human.json grew both on af87f5f (10-08) and they are
+    // the human's, not anatomy.js's: the editor applies DEFAULT_ANATOMY to
+    // bodies that have no hair slots and no linen shorts. Inert on a race
+    // recipe (no linen garments, no skin), which is why only this branch
+    // states them; a race body's thin file writes the RFC null instead.
+    '//garmentsBecome': 'The shorts are painted as `linen` (a .vox can only ' +
+          'paint ids 0..127) and are FLESH in every respect but look, so ' +
+          'every garment voxel on this body becomes `undercloth` at load -- ' +
+          'after the recipe, so `garments` above still finds them. ' +
+          'materials.json `undercloth` / reactions.json UNDERCLOTH. ' +
+          'Characters that extend human inherit it.',
+    garmentsBecome: 'undercloth',
+    '//paintBecomes': 'Paint that is a substance. The scalp hair, brows and ' +
+          'beard are painted over the skin in the generator\'s hair slots ' +
+          `(mobgen.js ART.HAIR ${ART.HAIR}, ART.HAIR_SHADE ${ART.HAIR_SHADE}) ` +
+          'and baked as skin, because `hair` is past what a .vox can paint; ' +
+          'at load every skin voxel painted one of those slots becomes ' +
+          '`hair` (materials.json HAIR ON THE SCALP), after the recipe like ' +
+          'garmentsBecome. Slots are the body file\'s own palette indices, ' +
+          'which every generated character shares. Characters that extend ' +
+          'human inherit it.',
+    paintBecomes: [{ material: 'skin', art: [ART.HAIR_SHADE, ART.HAIR],
+                     becomes: 'hair' }],
     limbs: {
       '//head': 'A bone skull two deep around a BRAIN. The core layer is ' +
                 'open-ended, so `brain` is by definition everything the shell ' +
@@ -4882,13 +4906,22 @@ function buildClips(gait) {
   // The forearm holds a fixed CARRY ANGLE with a swing about it. Only the
   // swing is trimmed: scaling the whole track would also straighten the elbow.
   const foreMid = -18.0, foreAmp = 8.0 * ARM_SWING;
-  for (const [nm, deg, period] of [['walk', 22 * ARM_SWING, walkMs],
-                                   ['run', 30 * ARM_SWING, runMs]]) {
+  // THE MASKS ARE THE SHIPPED HUMAN'S. 0bb9bfc (09-28) widened the human's
+  // WALK mask to the whole body in the tuner; run kept the arms and spine.
+  // Additive, and the tracks are still arms + torso only, so the wider mask
+  // changes nothing the legs' IK does -- it is what the human says.
+  const ARMS_SPINE = ['armU.L', 'armL.L', 'armU.R', 'armL.R', 'torso'];
+  const WHOLE_BODY = [...ARMS_SPINE, 'head', 'hips', 'hand.L', 'hand.R',
+                      'legU.L', 'legL.L', 'foot.L', 'legU.R', 'legL.R',
+                      'foot.R'];
+  for (const [nm, deg, period, mask] of [
+         ['walk', 22 * ARM_SWING, walkMs, WHOLE_BODY],
+         ['run', 30 * ARM_SWING, runMs, ARMS_SPINE]]) {
     const half = Math.floor(period / 2);
     clips[nm] = {
       durationMs: period, loop: true, mode: 'additive',
       blendInMs: 180, blendOutMs: 180,
-      mask: ['armU.L', 'armL.L', 'armU.R', 'armL.R', 'torso'],
+      mask: [...mask],
       tracks: {
         'armU.L': swing(deg, period, 0),
         'armU.R': swing(deg, period, 1),
@@ -5496,9 +5529,14 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
   // left-handed creature moves one line and every item still hangs correctly.
   // No rotation: the socket frame IS the hand's frame, and an item's own
   // orientation is its business (its `grip` block).
+  //
+  // ACROSS THE HAND IT IS NOT THE CENTRE: the shipped human's grip sits three
+  // quarters of the way toward +x, toward the body for a right hand (b9c5de0,
+  // 09-27, moved human.json's offset 4 -> 6 on an 8-wide hand). A FRACTION, so
+  // it follows a hand of another width.
   const sockets = [{
     name: 'held_right', part: 'hand.R',
-    offset: anchor([S['hand.R'].mn[0] + S['hand.R'].size[0] * 0.5,
+    offset: anchor([S['hand.R'].mn[0] + S['hand.R'].size[0] * 0.75,
                     S['hand.R'].mn[1] + S['hand.R'].size[1] * 0.5,
                     S['hand.R'].mn[2] + S['hand.R'].size[2] * 0.5]),
     rotation: [0, 0, 0],
