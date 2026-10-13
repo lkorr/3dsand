@@ -5832,25 +5832,15 @@ fn farFeatCell(fq : vec4<u32>, level : u32, vc : vec3<i32>, ro : vec3f, rd : vec
   let yLo = min(ro.y + rd.y * tA, ro.y + rd.y * tB);
   let keep = farFeatKeep(tA);
   var best = tB;
-  // THE GROUND THE PLANT STANDS ON, from the surface map (2026-10-13, ticket
-  // 2026-10-12_16-52-07). The word keeps the plant's top MOD 256 (eight bits)
-  // and this used to place it at the y nearest the CELL being walked -- right
-  // for a cell on the ground, wrong for any material cell that is not: the
-  // pillars and the floor of heather_cairn's hall, 15 m under the moor whose
-  // heather the words describe, unwrapped the moor's plants into the hall, and
-  // their cards stood there as thin vertical green and purple lines. The
-  // entry's top is the column's ground (procgen's, whatever VALID says), so the
-  // plant's top is that plus its height; a word whose low byte disagrees is
-  // not this ground's (an edited or raised column) and draws nothing.
-  let gq = farMap[farMapCell(level, vc.xz)];
   for (var q = 0u; q < 4u; q++) {
     // Component by SELECT, never fq[i] (farRefineCell says why).
     let e = select(select(fq.x, fq.y, q == 1u), select(fq.z, fq.w, q == 3u), q >= 2u);
     let hg = i32((e >> 8u) & 15u);
     if (hg == 0) { continue; }
-    let ge = select(select(gq.x, gq.y, q == 1u), select(gq.z, gq.w, q == 3u), q >= 2u);
-    let topF = farMapTop(ge) + hg;
-    if ((u32(topF) & 255u) != (e & 255u)) { continue; }
+    // The top is kept MOD 256 and placed nearest this cell: right for a cell
+    // on the ground, which is the only kind farFeatMarch walks any more (THE
+    // PLANTS STAND ON THE GROUND, there).
+    let topF = y0 + (((i32(e & 255u) - y0 + 128) & 255) - 128);
     // A SOLID word is a stalk, drawn by the surface map's refine (it is
     // part of the heightfield): the word is there for fardown's cut check.
     if ((e & FAR_FEAT_SOLID) != 0u) { continue; }
@@ -5942,6 +5932,17 @@ fn farFeatMarch(ro : vec3f, rdIn : vec3f, far : FarHit, tStart : f32) -> FarHit 
   let level = select(2u, 1u, far.t < tHand1);
   if (level > FAR_FEAT_LEVELS || tCur >= far.t) { return out; }
   let s = f32(1u << farCellShift(level));
+  // THE PLANTS STAND ON THE GROUND (2026-10-13, ticket 2026-10-12_16-52-07).
+  // The words describe the plants on each column's GROUND, and a walk that
+  // starts under that ground -- down a hall or a cave beneath the moor -- read
+  // the moor's heather as standing in the hall: the word keeps the plant's top
+  // mod 256 and farFeatCell places it nearest the cell walked, and a card has
+  // no bottom, so every one stood floor to ceiling as a thin green or purple
+  // line. One test per ray, where the walk starts (the open air in front of a
+  // cliff's foot is not under the cliff top; a hall is under the moor): under
+  // the column's ground by two cells = nothing to meet.
+  let pW = ro + rd * tCur;
+  if (pW.y < farColumnTop(level, pW) - 2.0 * s) { return out; }
   let b = farBox(level);
   let roL = ro / s;
   var vc = vec3<i32>(floor(roL + rd * (tCur / s + 1e-4)));
@@ -7985,8 +7986,8 @@ fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>, albedo : vec3f) -> vec3f {
     // The closed form is OPEN terrain's bounce (a lit tread in front): under
     // the ground it is daylight that is not there (NO MEASUREMENT YET IS NOT
     // OPEN SKY UNDERGROUND, in fs). Scaled out by the same burial test.
-    // gHitSky: this hit's 1 - burial, set by the near shade before the gather.
-    return farGiIrradiance(albedo, n) * gHitSky;
+    // A rare arm (a slot the walk has not stamped): the burial test here.
+    return farGiIrradiance(albedo, n) * (1.0 - max(farHitBuried(1u, p, n), 0.0));
   }
   let face = openFaceOfNormal(n);
   let lo = vec3<u32>(cell & vec3<i32>(i32(CHUNK) - 1));
@@ -16104,11 +16105,17 @@ fn fs(in : VSOut) -> FSOut {
     // that for sky fogged the vault at the end of the Tarn Cairn's hall blue.
     // No map answer is 0 -- "the eye decides". (Under an open sky the eye
     // says 1, so outdoors this changes nothing.) ONE burial test per near hit:
-    // the no-measurement fallback, the fog and the gather (giBounceAt's
-    // unstamped arm) all read it.
-    let nb = farHitBuried(1u, hp, openN);
-    gHitSky = select(0.0, 1.0 - nb, nb >= 0.0);
-    if (openRaw < 0.0 && nb > 0.0) { openRaw = (1.0 - nb) * hzSkyVis(hp); }
+    // the no-measurement fallback and the fog read it. ONLY WHEN SOMETHING
+    // READS IT: under an open sky the fog target is the sky whatever the hit
+    // says (fogSkyK = max(eye, hit)), so an outdoor eye skips the map read for
+    // every near pixel with a measurement -- the burial work this shade did on
+    // every pixel before 2026-10-13, paid now only by a buried eye or an
+    // unmeasured face.
+    if (R.eyeSky < 1.0 || openRaw < 0.0) {
+      let nb = farHitBuried(1u, hp, openN);
+      gHitSky = select(0.0, 1.0 - nb, nb >= 0.0);
+      if (openRaw < 0.0 && nb > 0.0) { openRaw = (1.0 - nb) * hzSkyVis(hp); }
+    }
     var lambert = wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP);
     let dbgLamPreN = lambert;
     var dbgShN = 1.0;
