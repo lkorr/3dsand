@@ -1781,6 +1781,15 @@ struct MobLimb {
   // animated pose KINEMATICALLY for a beat before flipping dynamic.
   uint64_t holdBody = 0;
   float holdSeconds = 0;
+  // ...and the body it went to, KEPT after the hold ends (`holdBody` is
+  // cleared then). Read-only bookkeeping for the death screen's photograph
+  // (main.cpp's dying observer, PlayerAvatar::PartSeveredBody): a limb blown
+  // off a tick before the killing blow is part of the body that died, and
+  // without this the photo had no way to name it -- it was drawn live from
+  // the world, so it went on staining, rolling and finally despawning out of
+  // the picture. Possibly stale (a carve rebuilds a body under a new handle,
+  // Physics::Successor follows it); never written to anything hashed.
+  uint64_t severedBody = 0;
   // Flipbook: >=0 selects an alternate .vox model's voxels for RENDERING only.
   int flipbookModel = -1;
   std::vector<std::vector<DebrisVoxel>> frameVoxels;

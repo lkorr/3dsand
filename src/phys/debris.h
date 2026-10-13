@@ -326,6 +326,10 @@ class DebrisSystem {
   // AdoptBody.
   void MarkItemBody(uint64_t handle);
   bool IsItemBody(uint64_t handle) const;
+  // The brick a body draws, by handle (Body::micro.model); -1 for an unknown
+  // handle or a body on the cube path. Render-side read: the death screen
+  // photographs a severed limb's brick by it.
+  int MicroModelOf(uint64_t handle) const;
   // ANY owned body's lattice view, by handle (the coat exchange's loose side:
   // MobSystem::CoatOnContact). False for an unknown or ghost handle.
   bool CoatLatticeOf(uint64_t handle, FleshLattice& out);
