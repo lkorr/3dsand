@@ -116,7 +116,7 @@ void RunTicks(TickRig& rig, int n,
     rig.w_->harness.blasts = rig.pending_.exps;
     // The gate's command for the body, empty unless it set one.
     const TickInput ti = rig.pending_.input;
-    const FrameIntent intent{};
+    const FrameIntent intent = rig.pending_.intent;
     TickAuthority(*rig.w_, *rig.session_, intent, ti, t, rig.batch_);
     rig.tick = t;
     rig.w_->harness.blasts.clear();

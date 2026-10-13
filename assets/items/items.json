@@ -207,6 +207,35 @@
       "id": "old_key",
       "kind": "key",
       "desc": "A heavy black key, its bit worn smooth by a century of turning."
+    },
+    {
+      "//": "THE BOW AND ARROWS (docs/PLAN_projectiles.md C, game/arrows.h). A bow is kind melee so it rides a hand slot like any weapon, but weaponClass `bow` takes it out of the stroke system: with it in hand the hand's button DRAWS (held) and SHOOTS (released). `bow.drawSpeedMps` is the arrow's speed at full draw, `drawTimeMs` how long a full draw takes, `minDraw` the least draw that looses an arrow at all (a tap is a fumble, not a shot), `ammo` the item id it shoots (consumed one per shot from the pack or hotbar; none = no shot). Speed = eased draw fraction x drawSpeedMps. Art: scripts/gen_bow_items.py.",
+      "id": "bow",
+      "kind": "melee",
+      "weaponClass": "bow",
+      "damage": 0.0,
+      "blunt": 2.0,
+      "reach": 9.0,
+      "bow": {
+        "drawSpeedMps": 65.0,
+        "drawTimeMs": 800,
+        "minDraw": 0.15,
+        "ammo": "arrow"
+      },
+      "desc": "A self longbow of yew as tall as a man's chin, braced with a waxed linen string. Hold to draw, let go to loose; the longer the draw, the harder it flies."
+    },
+    {
+      "//": "AMMUNITION (kind ammo): carried, never held or worn; a bow shoots it. `startCount` is how many the stub starting kit hands out (one stack, in the pack). The `arrow` block is the PENETRATOR it flies as (phys/kerf.h Penetrator): `massKg`, `tipRadius` in FINE cells (1/80 m), `sharpness` 0..1, and `damage` -- a FLAT hp charge on whatever it gets INTO (embedded or through; a glance pays only its trauma), on top of the tissue the channel destroys, the way a sword's `damage` is its cut. The head's HARDNESS is the material of the art's foremost cell (steel), unless `hardness` overrides it. Calibrated so 3-5 body arrows kill a man and the brain charge, not a rule, decides a head shot (the `arrow` gate prints both).",
+      "id": "arrow",
+      "kind": "ammo",
+      "startCount": 30,
+      "arrow": {
+        "massKg": 0.03,
+        "tipRadius": 1.0,
+        "sharpness": 1.0,
+        "damage": 35.0
+      },
+      "desc": "A clothyard shaft of spruce with a steel bodkin and goose fletching. It goes through a man's arm and on into whatever is behind it."
     }
   ]
 }

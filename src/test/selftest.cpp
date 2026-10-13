@@ -979,6 +979,16 @@ const char* const kOrder[] = {
     // and into a harder skin; the numbers per material are the output. Fresh
     // spawns on pristine ground; its last arm ticks the bleed.
     "pierce",
+    // ...and the BOW AND ITS ARROWS on the real tick (docs/PLAN_projectiles.md
+    // C): embed + ride + death + sever, through-and-through, the ground, the
+    // pull-out, the flat damage, a volley twice, the draw/release input path.
+    // Fresh spawns on pristine ground; regenerates it on the way out.
+    "arrow",
+    // ...and NPC ARCHERS (docs/PLAN_projectiles.md E): an `archer` draws,
+    // looses and gets into a dummy, backs off from one too close, stops at 0
+    // arrows and draws its sidearm, and replays bit for bit. Every scene
+    // regenerates the world and rewinds the ids; so does the way out.
+    "archer",
     // ...and a coat on the blade goes INTO the wound it cuts, from the voxels
     // that touched only, and comes back carrying the wound's fluid; a mace
     // coats the surface, a fist coats what it hits, and the blade keeps its
@@ -1167,6 +1177,12 @@ const char* const kOrder[] = {
     // per lost cell), where the same stabs beside it do not (owner,
     // 2026-10-12). Pristine ground, CPU only (pose ticks, real melee sweep).
     "heart",
+    // ...and a SPELL flight's matter as the point (docs/PLAN_projectiles.md
+    // D): real casts through a TickRig at fresh human spawns, ~500 ticks of
+    // THE tick (bleeds, acid and lava coats burning), so it sits here, late,
+    // by the rule the wound block states rather than beside `pierce`. Restores
+    // the id counter and regenerates the ground on the way out.
+    "spell-pierce",
     // ...and the overlap where a limb meets its parent is ONE cell of flesh in
     // two lattices: rot, a coat or a hole in either copy is in both (owner
     // report 2026-09-23). Pristine ground, CPU only.

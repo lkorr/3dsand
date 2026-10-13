@@ -85,6 +85,19 @@ charged, so decision 1 has its numbers.
 
 ## Arrows and bows (package C, after A+B)
 
+**STATUS (2026-10-12): DONE on branch worktree-agent-a817365c4a9b142d0**
+(DESIGN.md "The bow and its arrows"). Bow + arrow items (kind `ammo`, art
+from `scripts/gen_bow_items.py`), flat `damage` 35 via `Penetrator::hp`,
+starting kit (bow on the hotbar, 30 arrows in the pack), draw/release through
+TickInput's held mask in PhaseG, `bow_draw` clip, pixel HUD bow, CPU integer
+flights in `TickAuthorityCtx::arrows` (`game/arrows.*`) sharing the spell
+VM's grid probe (`game/flightprobe.h`), embedded arrows as follower slots at
+an angle (`Mob::EmbedArrow`, `MobLimb::wornRotated`), terrain shots as
+kinematic ground items, G pull-out (`PullArrowToKit`), peers' bodies routed
+as `MeleeHitKind::Pierce`, gate `arrow`, `--shot-mob human:>N`. Open: embedded
+arrows are not saved and do not cross a handoff; the shooter does not see an
+arrow stuck in a peer's creature.
+
 - Items: `bow` (weaponClass "bow": drawSpeedMps, drawTimeMs) and `arrow`
   (massKg, tipRadius, head material, stack count; carried in the pack).
   Art as `.vox` + sidecar like every other item.
@@ -110,9 +123,84 @@ payload -> `PierceChannel`; liquid/gas -> splash coat; leftover matter
 deposited at the stop point; kinetic term in the price; `pierce` mod body
 budget. Hash moves -> rebaseline once at the end. Gate `spell-pierce`.
 
+**Status (2026-10-12): built, on its worktree branch** (DESIGN.md "The matter
+is the projectile"). How it came out:
+
+- **Matter -> penetrator.** Mass = materials.json density x
+  `budgets.matterProjectile.lumpMl` (250 mL) x matter scale, summed over the
+  matter items; the heaviest is the core. Stone 0.65 kg, steel 1.95 kg, gold
+  4.8 kg, water 0.25 kg, fire 0.75 g. Speed = the record's launch speed
+  (projectile 14.4 m/s, bolt 28.8, lob 7.2). Point = the delivery's new
+  `penetrator` block (projectile tip 1.5 fine cells / sharpness 0.4, bolt
+  1.0 / 0.7, lob 2.5 / 0.15, orb 2.0 / 0.2); hardness = the matter's.
+- **Class decides the strike:** solid PIERCES (PierceAlongRay; through =
+  flies on at the residual speed), powder SCOURS (sharpness x0.4, tip x2,
+  capped at 2 skin bins, always stops), liquid SPLASHES a coat (PourOnBody;
+  acid eats, lava sears/lights, water wets -- the coats' own rules), gas
+  TOUCHES (resolve at the hit, as before: the NPC firebolt is unchanged).
+- **Deposit:** effects resolve at the stop point; the matter the body did not
+  take is dropped there with no velocity. Embedded inert solids (stone,
+  steel) are dropped, not lodged -- a lodged lump wants package C's embedded
+  slot (owner decision).
+- **Price:** kinetic term = 1/2 m v^2 x pierce bonus x `rates.kinetic` (100
+  mana/kJ), in carry after the box's multiplier. Stone: lob 17 -> 19,
+  projectile 25 -> 32, bolt 33 -> 60. NPC kits carry no solid matter
+  (fire weighs 0.75 g): firebolt / hellfire / lava_floor / lift prices are
+  unchanged.
+- **`pierce`** adds x1.0 of the matter's energy per word against bodies
+  (priced), and keeps its one-wall terrain role.
+- **Gate `spell-pierce`** (torso, front, real casts through the tick): stone
+  projectile 67.5 J embeds 3.8 cm (18 cells, 0.6 hp + bleed); stone bolt 270 J
+  goes through 14.6 cm (41 cells incl. 6 bone) and flies on at 24.7 m/s; sand
+  bolt scours 2.5 cm; water coats 596 skin cells, carves nothing; acid coats
+  and eats 75 cells / 20 hp in 2 s; lava coats and burns 129 cells / 70 hp in
+  2 s; the stone bolt replays identically. World hash unmoved (ef7d9a06).
+- **Owner decisions open:** (1) whether an embedded lump should LODGE (needs
+  package C's embedded slot) instead of dropping out of the wound; (2) the
+  calibration -- lumpMl 250, the delivery points, rates.kinetic 100/kJ -- is a
+  first cut: the stone projectile's wound is 0.6 hp, i.e. the damage is the
+  bleed and what the channel hits, by design (decision 1's no-kill-rule);
+  (3) `speed@4` now costs 149 for a stone projectile (was 41), so fast heavy
+  matter is out of reach of a 100-mana player.
+
 ## NPC archers (package E, after C)
 
 `behaviors.json` `ranged` block shaped like `cast`: preferred range, draw,
 lead aim (reuse the caster aim/lead code), ammo, back off when crowded. An
 `archer` profile; NPCs armed with a bow through the existing weapon paths
 (`props.weapon`, spawn panel). Gate `archer`.
+
+**Status (2026-10-13): built, on its worktree branch** (DESIGN.md "Creatures
+that shoot"). How it came out:
+
+- **AI** (`ai_behavior.*`): `ai::RangedTuning` (the `ranged` block: band
+  `rangeMin..rangeMax`, shot window `minRange..maxRange`, cadence + jitter,
+  first-sight delay, aimTolerance, `draw` share, hold + jitter, `spread`,
+  `lead` / `leadCap`, `aimRaise`, `quiver`, `bow`), a new `shoot` intent
+  emitting `ai::ShootRequest` (the cast seam's twin), facts `ammo` and
+  `cornered`. While the creature can shoot (bow in hand + arrows in its kit)
+  the band is the ranged one and is not slid onto swing reach; a drawn bow
+  forces FaceTarget.
+- **Owner** (`game/mob_archery.*`, `MobArcheryTick` right after
+  `MobCastTick`): the draw (the player's `bow_draw` clip, the bow's
+  drawTimeMs x `draw`, a hashed hold; `Mob::BowDrawn` refuses swing and
+  guard and tips the torso with the aim pitch), the aim (`MobTargetNow` +
+  `ai::LeadPoint` -- the casters' lead, factored out of `AimFor` bit for bit
+  -- + `ArrowHoldover`, the flight's own drop, + a hashed spread scaled by
+  `Tune::Aim`), the loose through `ArrowFlights::Launch` from the bow fist.
+  Out of arrows: bow to the bag, sheathed sidearm to the hand.
+- **Arming**: `ArmArcher` at spawn -- the F1 AI panel's new `archer` preset
+  (bow + the picked weapon as sidearm + 12 arrows), `npc` refs and dungeon
+  spawners whose behaviour has a `ranged` block. No placed NPC or village
+  changed.
+- **Gate `archer`**: draws (clip on, BowDrawn >= the bow's draw,
+  FaceTarget), looses at 650 vox/s and gets into a dummy 60 voxels off within
+  `archer.hitTicks` (+51); backs off 24.6 voxels from one 9 off without
+  drawing or swinging; with 2 arrows looses exactly 2, then nothing, bow in
+  the bag, sword drawn, closes 60 -> 8.5; replays bit for bit. World hash
+  unmoved (ef7d9a06).
+- **Open**: a draw in progress is not saved; the archer stands still while
+  drawn; no neutral (village watch) archer profile and no placed archer yet
+  (content); arrows hitting the PLAYER are package C's path (the avatar's
+  limbs through `PierceLimb`) and are not in the gate (the harness body has
+  no avatar).

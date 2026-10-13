@@ -565,6 +565,47 @@ bool LoadItems(const std::string& dir, size_t materialCount,
     d.weaponClass = it.value("weaponClass", "");
     // A KEY (dungeons D3): which lock it opens. Default: its own id.
     if (d.kind == ItemKind::Key) d.keyId = it.value("unlocks", d.name);
+    // How many the stub starting kit hands out, as one stack (main.cpp).
+    d.startCount = std::clamp(it.value("startCount", 1), 1, 999);
+    // ---- THE BOW (docs/PLAN_projectiles.md C, game/arrows.h) -----------------
+    // weaponClass "bow" is what takes a held item out of the stroke system,
+    // and it is meaningless without the numbers that make it shoot: a bow row
+    // with no usable `bow` block is skipped loudly rather than loaded as a
+    // stick that swings.
+    if (d.weaponClass == "bow") {
+      const json b = it.value("bow", json::object());
+      const float mps = b.is_object() ? b.value("drawSpeedMps", 0.0f) : 0.0f;
+      const int ms = b.is_object() ? b.value("drawTimeMs", 0) : 0;
+      d.bow.ammo = b.is_object() ? b.value("ammo", std::string()) : std::string();
+      if (d.kind != ItemKind::Melee || !(mps > 0.0f) || ms <= 0 ||
+          d.bow.ammo.empty()) {
+        errors += "items: \"" + d.name +
+                  "\" is a bow with no usable `bow` block (kind melee, "
+                  "drawSpeedMps > 0, drawTimeMs > 0, ammo) -- skipped\n";
+        continue;
+      }
+      d.bow.has = true;
+      d.bow.drawSpeed = MetresPerSecToCells(mps);
+      // At the fixed 30 Hz tick (test/support.h kTickDt).
+      d.bow.drawTicks = std::max(1, (int)std::lround((double)ms * 30.0 / 1000.0));
+      d.bow.minDraw = std::clamp(b.value("minDraw", 0.15f), 0.0f, 1.0f);
+    }
+    // ---- AMMUNITION: the penetrator it flies as (phys/kerf.h) ----------------
+    if (d.kind == ItemKind::Ammo) {
+      const json a = it.value("arrow", json::object());
+      d.arrow.massKg = a.is_object() ? a.value("massKg", 0.0f) : 0.0f;
+      d.arrow.tipRadius = a.is_object() ? a.value("tipRadius", 0.0f) : 0.0f;
+      if (!(d.arrow.massKg > 0.0f) || !(d.arrow.tipRadius > 0.0f)) {
+        errors += "items: \"" + d.name +
+                  "\" is ammo with no usable `arrow` block (massKg > 0, "
+                  "tipRadius > 0) -- skipped\n";
+        continue;
+      }
+      d.arrow.has = true;
+      d.arrow.sharpness = std::clamp(a.value("sharpness", 1.0f), 0.0f, 1.0f);
+      d.arrow.hardness = std::max(0.0f, a.value("hardness", 0.0f));
+      d.arrow.damage = std::max(0.0f, a.value("damage", 0.0f));
+    }
     // ---- VESSELS (game/container.h) ----------------------------------------
     // `holds` by CLASS NAME, so what a vessel takes up is authored, not a
     // material list: a flask holds every liquid there is or will be.
@@ -608,6 +649,36 @@ bool LoadItems(const std::string& dir, size_t materialCount,
     // A broken item is skipped, never fatal: one bad asset must not cost the
     // player their whole hotbar (DESIGN.md §6, the same rule mob defs follow).
     if (!LoadItemAsset(dir, materialCount, micro, d, errors)) continue;
+    // AN ARROW'S POINT IS ITS ART'S: the foremost cell along +x (the frame's
+    // axis, nock to head), its front face's centre in the lattice frame a body
+    // built from `voxels` has, and that cell's matter as the head's. So
+    // re-authoring the head re-derives where an arrow stops and how hard it
+    // is, with nothing in a JSON to keep true.
+    if (d.kind == ItemKind::Ammo) {
+      int maxX = -(1 << 20), minX = 1 << 20;
+      for (const PrefabVoxel& v : d.voxels) {
+        maxX = std::max(maxX, (int)v.x);
+        minX = std::min(minX, (int)v.x);
+      }
+      double sy = 0.0, sz = 0.0;
+      int n = 0;
+      uint32_t head = 0;
+      for (const PrefabVoxel& v : d.voxels)
+        if ((int)v.x == maxX) {
+          sy += v.y + 0.5;
+          sz += v.z + 0.5;
+          if (n == 0) head = v.material & 0xFFFu;
+          n++;
+        }
+      if (n == 0) {
+        errors += "items: \"" + d.name + "\" is ammo with no art -- skipped\n";
+        continue;
+      }
+      const float inv = 1.0f / (float)(d.scale ? d.scale : 1u);
+      d.arrow.headMaterial = head;
+      d.arrow.tip = Vec3{(float)(maxX + 1), (float)(sy / n), (float)(sz / n)} * inv;
+      d.arrow.length = (float)(maxX - minX + 1) * inv;
+    }
     // The see-through cells a vessel's contents are drawn in
     // (phys/fillview.h), off the model it is drawn with.
     if (d.kind == ItemKind::Container && d.container.fillSlices > 0) {
@@ -621,6 +692,19 @@ bool LoadItems(const std::string& dir, size_t materialCount,
     }
     out.items.push_back(std::move(d));
   }
+  // A BOW MUST NAME AMMUNITION THAT EXISTS. Checked once the whole library is
+  // in, since items.json may list the arrow after the bow. A bow that names
+  // nothing usable stays loaded (it is still a thing to carry) but cannot
+  // shoot, and says so here rather than by silently never firing.
+  for (ItemDef& d : out.items)
+    if (d.bow.has) {
+      const ItemDef* a = out.Named(d.bow.ammo);
+      if (a == nullptr || !a->IsAmmo()) {
+        errors += "items: bow \"" + d.name + "\" shoots \"" + d.bow.ammo +
+                  "\", which is not an ammo item -- it cannot shoot\n";
+        d.bow.has = false;
+      }
+    }
   if (out.items.empty()) errors += "items: no usable items in " + path + "\n";
   return !out.items.empty();
 }
@@ -1546,7 +1630,11 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       Mob* owner = mobs.FindOwner(hb, &li);
       // EITHER fist's item (dual wielding): the off hand's blade is no more
       // flesh than the striking one's.
-      if (owner != nullptr && li >= 0 && owner->IsHeldSlot(li)) continue;
+      // ...nor is an ARROW stuck in the body (Mob::EmbedArrow): a blade that
+      // meets the shaft passes the flesh it is in to the next probe.
+      if (owner != nullptr && li >= 0 &&
+          (owner->IsHeldSlot(li) || owner->IsArrowSlot(li)))
+        continue;
 
       // ---- WHAT WAS STRUCK, ASKED ONCE (game/impact.h StruckKind) ----------
       //
@@ -2077,10 +2165,57 @@ RemoteHitOutcome ApplyRemoteLooseHit(const MeleeHit& h, Physics& phys,
   return RemoteHitOutcome::Applied;
 }
 
+// A POINT A PEER'S FLIGHT DROVE INTO A BODY THIS MACHINE OWNS (MeleeHitKind::
+// Pierce, game/pierce.h). The shooter priced it on its ghost and flew on with
+// what that left; here the channel is run for real on the owner's slot, from
+// the record's origin along its axis in the slot's own frame, and an arrow
+// that embeds stays in the limb (Mob::EmbedArrow) -- on the machine that owns
+// the creature, which is the one whose state the limb's other readers trust.
+RemoteHitOutcome ApplyRemotePierceHit(const MeleeHit& h, Physics& phys,
+                                      MobSystem& mobs, DebrisSystem& debris,
+                                      World& world,
+                                      std::vector<ParticleSpawn>& spawns) {
+  uint64_t hb = 0;
+  Mob* t = nullptr;
+  int sl = -1;
+  if (h.c.target.kind == CombatantRef::kBody) {
+    hb = debris.HandleOfGlobalId(h.c.target.id);
+    if (hb == 0) return RemoteHitOutcome::Gone;
+    if (debris.IsGhost(hb)) return RemoteHitOutcome::Route;
+  } else {
+    t = mobs.ResolveCombatant(h.c.target);
+    if (t == nullptr) return RemoteHitOutcome::Gone;
+    if (!MobSystem::OwnedHere(*t)) return RemoteHitOutcome::Route;
+    if (t->AwaitingHandoff()) return RemoteHitOutcome::Wait;
+    sl = t->SlotIndexNamed(h.slot);
+    hb = sl >= 0 ? mobs.LimbBody(t->Id(), sl) : 0ull;
+    if (hb == 0) return RemoteHitOutcome::Gone;
+  }
+  BodyTransform xf{};
+  phys.GetTransform(hb, xf);
+  const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+  const Vec3 from = xf.pos + QuatRotate(q, h.c.at);
+  const Vec3 dir = QuatRotate(q, h.c.sweepDir);
+  PierceResult r;
+  if (t == nullptr) {
+    debris.PierceBody(hb, from, dir, h.c.pierce, world, spawns, r);
+    return RemoteHitOutcome::Applied;
+  }
+  mobs.PierceLimb(hb, from, dir, h.c.pierce, world, spawns, r);
+  if (r.hit && !r.missed && !r.severed &&
+      r.outcome == PierceOutcome::Embedded && !h.embedItem.empty() &&
+      mobs.Items() != nullptr)
+    if (const ItemDef* d = mobs.Items()->Named(h.embedItem))
+      t->EmbedArrow(*d, sl, r.stopWorld, dir);
+  return RemoteHitOutcome::Applied;
+}
+
 RemoteHitOutcome ApplyOneRemoteHit(const MeleeHit& h, Physics& phys,
                                    MobSystem& mobs, DebrisSystem& debris,
                                    World& world,
                                    std::vector<ParticleSpawn>& spawns) {
+  if ((MeleeHitKind)h.c.kind == MeleeHitKind::Pierce)
+    return ApplyRemotePierceHit(h, phys, mobs, debris, world, spawns);
   if (h.c.target.kind == CombatantRef::kBody)
     return ApplyRemoteLooseHit(h, phys, mobs, debris, world, spawns);
   Mob* t = mobs.ResolveCombatant(h.c.target);

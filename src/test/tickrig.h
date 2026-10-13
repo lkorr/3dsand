@@ -61,6 +61,9 @@ struct TickOps {
   // is a camera nobody is playing. A gate that asserts an INPUT path (a
   // button's press edge reaching the tick) sets the bits it means.
   TickInput input{};
+  // ...and what the frame layer would have settled for it (the hands up, so
+  // the mouse buttons are the hands'). Default: nothing, as before.
+  FrameIntent intent{};
 };
 
 // The engine a rig ticks: what TickAuthorityCtx takes by reference and a

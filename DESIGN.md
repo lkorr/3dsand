@@ -8998,7 +8998,112 @@ Calibration, `gore.pierceCellJ` 1.0 J per fine cell of skin-hard matter (a full 
 - **Harder skin, same full-draw shot**: the automaton (`tinker`) loses 1.9 cm of the brass piece on its chest and the arrow then GLANCES off its brass torso (27.5 J for the first bin, 26.7 J left); the sylvan (`dryad`) takes 7.5 cm of bark and wood and stops it.
 - **Does an arrow through the brain kill?** Not by itself. The brain charge is per CELL destroyed (`gore.brainHpPerVoxel` 3.5), and a one-cell-radius channel holds 2 to 5 cells per cell of depth by its alignment with the lattice alone: across five sub-cell offsets of the same full-draw shot, 16..31 brain cells, 57..111 hp of the head's 135, none killed outright; the 16-cell wound bled the head from 77.7 to 75.9 hp in 10 s. The PRICE is alignment-free (bins); the HP is not, because the carve and the brain charge count cells. That spread, and whether a brain shot should kill, are the owner's (decision 1).
 
-Known limits: no angle-of-incidence glance (a grazing shot pays the same first bin as a square one); materials.json hardness ranks ice (35) ABOVE bone (24), so the soft-point rule does not shatter ice on bone; a ghost (remote) creature is carved like a local one (package C must route shots on peers' bodies the way melee hits are routed).
+Known limits: no angle-of-incidence glance (a grazing shot pays the same first bin as a square one); materials.json hardness ranks ice (35) ABOVE bone (24), so the soft-point rule does not shatter ice on bone. A body another machine owns is no longer carved for real by the shooter (package C, below): `PierceAlongRay` routes it.
+
+### The bow and its arrows (2026-10-12; `docs/PLAN_projectiles.md` C; `game/arrows.h`, `Mob::EmbedArrow`, gate `arrow`)
+
+The first weapon that is not swung. Three items of data and two halves of code.
+
+- **Items.** `bow` is kind `melee` (it rides a hand slot, a sheath, the hotbar like any weapon) with `weaponClass: "bow"` and a `bow` block: `drawSpeedMps` (65), `drawTimeMs` (800), `minDraw` (0.15), `ammo` (`arrow`). The weapon class takes it OUT of the stroke system: `ResolveHands` marks the hand `HandNow::bow`, never `weapon`, so the button is never a swing. `arrow` is the new kind `ammo` (carried, never held or worn) with an `arrow` block: `massKg` 0.03, `tipRadius` 1 fine cell, `sharpness` 1, and a FLAT `damage` 35 hp (`Penetrator::hp`), charged by `Mob::PierceLimb` only when the channel got IN (embedded or through), never on a glance -- a weapon stat, as a sword's `damage` is its cut. The head's hardness is the art's: the loader takes the arrow's POINT from the foremost cell of its `.vox` along +x and that cell's material as `Penetrator::material` (steel, hardness 200), so re-authoring the head re-derives both. `startCount` (30) is how many the stub starting kit hands out as one stack (in the pack). Art: `scripts/gen_bow_items.py` (a braced yew longbow with a leather grip; a spruce arrow with goose fletching and a bodkin). The loader refuses a bow with no usable block and a bow whose `ammo` is not an ammo item.
+- **The bow is the player's** (session.cpp PhaseG's bow block, beside the throw it copies): with a bow in a hand and an arrow in the kit, that hand's button HELD draws (the `bow_draw` clip, a looping override on both arms with `pitchFollow`), LET GO looses. Speed = `BowArrowSpeed` = eased draw fraction (`1 - (1 - t)^2`, t = ticks / draw ticks) x `drawSpeed`; under `minDraw` the release is a fumble and nothing leaves the kit. One arrow leaves the kit per shot (`KitTakeAmmo`, hotbar then pack). Everything is read off the tick's command -- TickInput's held mask, the camera the tick turned from the look delta (the spell aim's `cam.Forward()`), from the eye -- so a replay or a peer draws the same bow the same way; there is no new TickInput field. The HUD draws a pixel bow under the crosshair whose string comes back with the draw, a draw bar with the `minDraw` notch, and the arrows left (`UIState::bowDraw / bowMinDraw / arrowsLeft`).
+- **The arrows in flight are the world's** (`TickAuthorityCtx::arrows`, `ArrowFlights`, stepped once a tick in phase K's slot, after the peers' blows and every session's swings, gore into this tick's batch). The `SpellProjectile` way, never a Jolt body (thin fast bodies tunnel; CCD is the 3 fps trap): 24.8 fixed voxels, gravity, half-voxel sub-steps against the grid through `FlightSolidAt` (`game/flightprobe.h` -- the spell VM's three-tier probe, factored out so the two share it), then ONE `PierceAlongRay` over the tick's segment (up to the wall if there is one). Through every body -> on at `PierceFlight::speedMps`. Bounded: 64 live, 10 s of life, out of the window = gone.
+- **Where an arrow ends.** EMBEDDED in a creature this machine owns: it STAYS IN THE LIMB. `Mob::EmbedArrow` appends a slot (tag `arrow`, `arrow:<item>`) that is a FOLLOWER of the struck limb exactly as a worn shell is (`MobLimb::wornHost`, posed by `DriveWornShells`, no joint -- `debris.h` StrapBody's note) but AT ITS ANGLE (`MobLimb::wornRotated / wornRot`: world rotation = host x wornRot; a garment's arithmetic is untouched), placed so the art's point is at `PierceResult::stopWorld` along the flight. Kinematic, on the PROP layer (`LimbRole` HeldProp in every phase: touches nothing, every ray sees it), bloodless, not a figure slot, its host always a BASE limb (a hit on a garment embeds in the limb under it; on a held item nowhere). Melee probes and `PierceAlongRay` pass an arrow slot by. It rides the living limb and the corpse (corpses are Mobs; DriveWornShells keeps posing followers); on a SEVER `ShedGearBeforeDetach` names it as the item, DetachLimb straps it to the piece and registers it, so it rides the severed arm and G takes it; a decayed corpse (`ReleaseRigToDebris`) registers its arrows the same way. Capped at `Mob::kMaxEmbeddedArrows` (8): past it the new arrow breaks. EMBEDDED in loose matter: a stuck item strapped to that body (`DebrisSystem::StrapBody`). GLANCED, or stopped by a body nobody carves: it drops as an ordinary falling item. THE GROUND: it sticks point first, 0.3..2.5 voxels deep by speed, as a KINEMATIC ground item (`DropItemToWorldXf(..., stuck)`), registered, G picks it up; the oldest goes past 48 stuck arrows (tracked by global id).
+- **G on an arrow in a body** (alive or dead, `PullArrowToKit`, main.cpp's take, ahead of the corpse loot panel): room in the kit first, then the slot goes. Nothing else changes -- no plug, no bleed coupling (owner). Like the ground pickup and the loot panel it is a frame-layer take, not a TickInput command.
+- **A peer's body is routed, not carved.** `PierceAlongRay`, meeting a creature (or loose body) this machine does not own, queues a `MeleeHitKind::Pierce` record (`game/meleehit.h` v3: `MeleeHitCore::pierce`, the projectile; `MeleeHit::embedItem`) in the struck slot's frame, taken BEFORE the carve, and runs the channel on the ghost as presentation with its gore discarded -- melee's rule 4, so the shooter flies on with what the ghost left. The owner (`ApplyRemotePierceHit`) runs the channel for real and, when it embeds, embeds the named item in its own creature. Arrows hitting the player are the avatar's limbs through the same `PierceLimb`, the way melee damages the player.
+
+Calibration (gate `arrow`, flat 35): the full-draw numbers per arrow and arrows-to-kill through the torso and head are printed by the gate and recorded as `arrowTorsoKill` / `arrowHeadKill`; the torso count is asserted in 3..5 (`tests/baseline.json`). The head is the brain charge's answer, as decision 1 says: printed, never asserted.
+
+Known limits: embedded arrows are not saved (a save drops the slot: `AlignRecordToRig` keeps only slots the rig answers to) and do not cross a creature handoff; the SHOOTER does not see the arrow stuck in a peer's creature (only its owner embeds it); an arrow strapped into a peer's loose body is not embedded on the owner (the routed record carves it there, nothing stays). NPCs shoot the same bow and the same arrows: "Creatures that shoot", next.
+
+### Creatures that shoot: NPC archers (2026-10-13; `docs/PLAN_projectiles.md` E; `game/mob_archery.h`, `ai::RangedTuning` / `Intent::Shoot`, gate `archer`)
+
+The casters' split, for a bow. The behaviour layer decides WHEN; `game/mob_archery.*` owns the bow.
+
+- **The `ranged` block** (`behaviors.json`, `ai::RangedTuning`): a footwork band (`rangeMin`..`rangeMax`), a shot window (`minRange`..`maxRange`), a cadence + jitter, a first-sight delay, `aimTolerance`, `draw` (share of the bow's own `drawTimeMs`), a hold (`holdTicks` + `holdJitter`), `spread` (radians, each axis), `lead` / `leadCap`, `aimRaise` (share of the target's height above its centre), and what `ArmArcher` hands a spawn (`quiver`, `bow`). `maxRange` 0 = never shoots: every older profile is unchanged.
+- **It shoots only while it CAN** -- a bow in a hand (`HeldBow`) and arrows for it in its own kit (`MobShotsLeft`; `ai::SelfView::ammo`, asked only of a profile with the block). While it can, the band is the ranged block's and the weapon slide (the melee band dropped onto strike reach) does not touch it; the new verb `Shoot` (appended last in `ai::Intent`) scores like `Cast` -- target held and visible, the cadence due, inside the shot window, the nose within `aimTolerance` x `Tune::Aim` -- and emits an `ai::ShootRequest` (`MobSystem::ShootRequests()`, beside the cast seam). No commit window: the draw holds the body through `SelfView::drawing` (the arbiter forces `FaceTarget`, feet still) for as long as the bow says. Two new rule facts, `ammo` and `cornered` (the ground fan's rear probe refused), let a profile decide whether it brawls with arrows left; the shipped `archer` does not unless its back is to a wall.
+- **The draw** (`MobArcheryTick`, right after `MobCastTick` in phase H's slot): a request starts one on a creature with a bow, two working hands, an arrow, no live swing (a held guard is let go) and no spell in its hand. Its arms play the PLAYER'S `bow_draw` clip (`Mob::HandClip`: the mirror for a bow in the left fist); `Mob::BowDrawn` refuses the swing and the guard (`CastBusy`'s two checks) and feeds the pose a LOOK whose pitch is the aim's, so the clip's `pitchFollow` tips the torso and arms with it exactly as the player's look does (the strike-aim head turn is off for the draw). The string comes back `drawTicks x draw`, then holds; a body that dies, ragdolls, is stunned, loses the bow or a hand, runs out of arrows -- or whose target dies -- lets the string down and keeps the arrow.
+- **The aim**, refreshed every tick from the LIVE target (`MobTargetNow`: a player's figure box or a creature's body box, the casters' own target rule, now public in `demon_cast.h`): its centre raised by `aimRaise` of its height, led where it WILL be by `ai::LeadPoint` (the casters' lead, factored out of `AimFor` bit for bit: planar velocity x flight time, capped) at the speed the arrow will leave at, and held high by `ArrowHoldover` -- the drop the flight's own integrator takes over the straight-line flight (g(1+..+n) for n ticks). At the loose an error of up to `spread` each axis, `rng::Hash3` on (mob id, tick), scaled by the rules' `Tune::Aim` (the shipped archer's "hurt" rule makes it 1.6x sloppier and stand 10 voxels further out).
+- **The loose** is the player's: `ArrowFlights::Launch` from the bow fist (`SpellHandWorld`) at `BowArrowSpeed` of the draw, the archer's own live limb bodies as the ignore list, one arrow out of its kit (`KitTakeAmmo`). Everything after is package C's -- the flight, `PierceAlongRay`, an embed in a creature or the player's avatar (the avatar's limbs through the same `PierceLimb`, the way melee damages the player), a peer's body routed as `MeleeHitKind::Pierce`, the ground. A loose the flight cap refuses keeps its arrow.
+- **Out of arrows** the bow goes into the bag and a SHEATHED sidearm comes into that hand as it was (the casters' stow / draw-back rule); with none the bow stays in the fist. The profile is then the melee creature its `movement` / `attack` blocks describe. `DrawSheathed` (the casters' once-a-second re-draw) skips a creature holding a bow: the off hand is the string hand.
+- **Arming** (`ArmArcher`, at SPAWN only -- a loaded creature's kit is the save's truth): for a profile with the block, a creature holding no bow gets the profile's `bow` in its right fist (what that fist held goes to the sheath as the sidearm, else the bag; the left fist is emptied into the bag) and arrows up to `quiver` in its pack. Called by the F1 AI panel after `SetMobBehavior` (its new `archer` preset: the bow, the picked weapon as the sidearm, 12 arrows), by an `npc` ref (`props.behavior: "archer"`, with or without `props.weapon: "bow"`) and by a dungeon spawner. No placed NPC or village uses it yet.
+- **Deterministic and authority-side**: requests served in issue order, draws stepped in the order they began, every draw by counter-based hash, the loosed arrows ordinary flights stepped in phase K. Bounded: `kMaxDrawing` 64 bows, `kServedPerTick` 16 requests, the flights' own cap. Not saved: a draw in progress (a loaded archer's string is slack).
+
+Gate `archer` (`src/test/selftest_archer.cpp`, the real tick, a stone strip, an `archer` armed by `ArmArcher` with a sword as its sidearm, a `training_dummy` to shoot at): A draws (the clip on, `BowDrawn` the whole draw, `FaceTarget` held), looses one arrow at the bow's full draw speed and gets into the dummy within `archer.hitTicks`; B backs off from a dummy inside `minRange` without drawing or swinging; C looses exactly its two arrows, draws nothing after, puts the bow in its bag, draws the sword and closes; D replays a scene bit for bit. Thresholds in `tests/baseline.json` (`archer.*`). First measurement: at 60 voxels it draws 16 ticks after first sight (`firstDelayTicks` 15), holds the string 33 ticks (the bow's 24 + a hold of 9), looses at 650 vox/s (65 m/s, the full draw) and goes THROUGH the dummy's torso 2 ticks later -- 3 arrows in 150 ticks; from 9 voxels it gives 24.6 voxels of ground in 2 s without drawing or swinging; with 2 arrows it looses both, then draws its sword and walks from 60 voxels to 8.5 in 5 s.
+
+### The matter is the projectile: spell flights strike bodies (2026-10-12; `docs/PLAN_projectiles.md` decision 3, package D; `game/spell.h` `FlightMatter` / `KineticMana`, `game/pierce.h` `SpellMatterStrike`, `SpellBodyProbe::matterHit`, gate `spell-pierce`)
+
+Until this a flight that met a body resolved its payload at the collider hit
+and did nothing of its own: a stone projectile sprayed three stone voxels
+through the man it hit and the readout claimed it "knocked" him. Now a FLIGHT
+carrying free matter (a matter word in its pile = a Spray item on hit) FLIES
+AS THAT MATTER, and what it does to a body is decided by what it is made of.
+
+- **What flies.** Mass = density x `budgets.matterProjectile.lumpMl` (250 mL)
+  x the matter scale (n x magnitude), summed over every matter item; the
+  heaviest item is the CORE and decides the rest. The lump is not the spray: a
+  stone projectile is a 0.65 kg fist of stone in flight and still lands three
+  stone voxels where it stops. Speed is the record's (`projectile` 4.8 vox/tick
+  = 14.4 m/s, `bolt` 28.8, `lob` 7.2; weight and `speed` scale it). The point
+  is the DELIVERY's shape (`glyphs.json` `penetrator`: `projectile` tip 1.5
+  fine cells / sharpness 0.4, a fist-sized lump; `bolt` 1.0 / 0.7, a dart;
+  `lob` 2.5 / 0.15, a blunt ball; `orb` 2.0 / 0.2) and its hardness the
+  MATTER's (materials.json): stone 90, steel 200, wood 40.
+- **Solid PIERCES** through `PierceAlongRay` -- the arrow's model, so a body
+  is as hard to shoot through as to cut through by what it is made of. Through
+  everything on the segment: the flight goes ON at the residual speed from the
+  far side (through one man and into the next). Stopped (embedded or glanced):
+  it resolves there.
+- **Powder SCOURS**: the same penetrator, sharpness x `powderSharpMille` (0.4),
+  tip x `powderTipMille` (2.0), its energy capped at `scourBins` (2) bins of
+  skin-hard matter at that tip, and always stopped -- grit takes a shallow
+  wound, never a channel.
+- **Liquid SPLASHES, never penetrates**: the first creature's skin under the
+  ray takes a coat disc (`splashRadiusMille` 1.2 voxels, cube-root of the
+  scale) at the material's own authored stain amount x the scale, through the
+  pour brush's writers (`MobSystem::PickBody` + `PourOnBody`), and the coat's
+  own rules do the rest -- acid eats (its reactions on the voxel it sits on),
+  lava sears and lights (`lava + tag:organic -> fire`, the hot-coat rule),
+  water wets and rinses. No new body rule anywhere.
+- **Gas (or a liquid no body can wear) TOUCHES**: resolves at the hit exactly
+  as every flight used to. `fire fire bolt` -- the NPC firebolt -- is unchanged.
+- **Where it stops.** Effects resolve there as they always did. The matter does
+  not fly on: what the body now holds (a coat) is gone from the payload, and
+  the rest -- a lump that stopped in the wound, a scour's grit, a second matter
+  word -- is DROPPED at the stop point with no velocity (it was flung on
+  through the body before). Inside a creature, a leftover matter a body can
+  wear coats the channel's floor, and a `tag:hot` one lights the limb
+  (`IgniteLimb`); no shipped solid glyph is either, so stone, steel and gold
+  drop out of the wound. Terrain is unchanged.
+- **`pierce`** keeps its wall and adds `pierceBodyMille` (x1.0) of the matter's
+  energy per word against bodies, as mass, so the residual speed is the
+  flight's own.
+- **The price includes the energy** (`KineticMana`, `rates.kinetic` = 100 mana
+  per kJ): 1/2 m v² x the pierce bonus, integer millijoules, added to the
+  carrier's carry AFTER its multiplier (an outer carrier's carry still
+  composes on it), per bolt, per lane at that lane's own speed. Stone: lob +2,
+  projectile +7, bolt +27, `speed@4` projectile +108; fire weighs nothing.
+- **Seam.** The VM still knows nothing about bodies (thesis 4): it fills a
+  `SpellBodyShot` and asks `SpellBodyProbe::matterHit`; the player's probe
+  (session.cpp phase I) and every creature caster's (`demon_cast.cpp`) answer
+  through `SpellMatterStrike`, the caster's own limbs as the ignore list. Gore
+  leaves through the tick's particle stream; nothing writes the world (rule 3).
+  The last 16 strikes are kept in `SpellSystem::StrikeLog` (diagnostics only).
+
+Measured by `spell-pierce` (the human's torso, from the front 6 cm off the
+midline, real casts through the tick): `stone projectile` 67.5 J EMBEDS 3.8 cm
+(skin 10, flesh 5, muscle 3 cells; 0.6 hp, then the bleed); `stone bolt` 270 J
+goes THROUGH, 14.6 cm (skin 9, flesh 12, muscle 13, blood 1, bone 6; 71.6 J
+spent) and flies on at 24.7 m/s; `sand bolt` scours 2.5 cm (capped 165 ->
+89.8 J; skin 17, flesh 8); `water projectile` coats 596 skin cells and carves
+nothing; `acid projectile` coats them and eats 75 torso cells / 20.3 hp in 2 s;
+`lava projectile` coats them and burns 129 cells / 70.4 hp in 2 s.
+
+Known limits: a solid that embeds is DROPPED, not lodged (package C's embedded
+arrow slot is the natural home for a lodged stone); a scour that clears a thin
+limb inside its cap may still nick the body behind it (PierceAlongRay's walk)
+though the flight stops; a peer's ghost is struck like a local creature (the
+penetrator's limit); materials have no freeze path on a body, so an `ice`
+glyph would pierce and drop.
 
 ### Infection is a material (2026-10-01; `docs/PLAN_weapon_coats.md` B; `Mob::InfectStep`, `Mob::CoatInfectTick`, `MaterialDef::infect`)
 
@@ -11664,7 +11769,9 @@ field is charged and named in the readout rather than editing something nobody
 reads, which is what makes rule 3's "every other mod on the hand is a no-op"
 honest. The runtime reads the record and nothing else: a bounce reflects the
 axis that entered the solid (each axis probed alone) and loses a fifth of the
-speed; a pierce passes through one wall and resolves on the next; a fused bolt
+speed; a pierce passes through one wall and resolves on the next (and, against
+a BODY, adds the matter's own energy again per word: "The matter is the
+projectile" below); a fused bolt
 rests where it landed and counts down; a seeking bolt turns toward the nearest
 target the owner names (`SpellBodyProbe::nearestTarget`, integer steering
 after one float→fixed conversion at the query boundary). A gravity Mod on an
@@ -11718,7 +11825,11 @@ declares `carry`, a per-mille premium on the payload tariff (`hand`/`self`/
 `bomb` 1.0, `projectile` 3.0, `bolt` 4.0), and instances multiply everything,
 so `shotgun³` pays 27 bolts' worth and reads as a lethal number before you
 commit. Sustained effects (`aura`, a held `beam`) price at zero up front and
-pay the same tariff per tick as they emit.
+pay the same tariff per tick as they emit. **Speed is not free (2026-10-12):** a
+flight carrying matter also pays the KINETIC TERM, 1/2 m v² of its matter at the
+record's launch speed (x the `pierce` body bonus) x `rates.kinetic` mana per kJ,
+inside the HUD's `carry` and after that box's own multiplier (`KineticMana`;
+"The matter is the projectile" below).
 
 **`anything` is priced when it lands.** The wildcard's tariff is unknowable
 before the cast (the HUD shows `+ ?`): on resolve, the material actually at

@@ -14,6 +14,7 @@
 #include "game/demon_seals.h"
 #include "game/demon_talk.h"
 #include "game/mob.h"
+#include "game/pierce.h"  // SpellMatterStrike: a creature's spell matter meets a body
 #include "game/session.h"
 #include "phys/debris.h"
 #include "phys/physics.h"
@@ -208,6 +209,9 @@ struct ProbeCtx {
   std::span<SessionTick> players;
   uint64_t caster = 0;
   std::vector<uint64_t> ownBodies;   // the caster's limbs: a ray from its chest
+  // The tick's particle stream: the gore a spell's matter tears out of a body
+  // (docs/PLAN_projectiles.md D) leaves with the batch, as a wound's does.
+  std::vector<ParticleSpawn>* gore = nullptr;
 };
 
 PlayerSession* SessionFor(std::span<SessionTick> players, uint64_t id) {
@@ -232,6 +236,15 @@ SpellBodyProbe MakeProbe(ProbeCtx& pc) {
     out = from + dir * (frac * len);
     return true;
   };
+  // THE MATTER IS THE PROJECTILE (docs/PLAN_projectiles.md D): the creature's
+  // matter strikes a body the way the player's does, its own limbs ignored.
+  if (pc.gore != nullptr)
+    bp.matterHit = [](void* c, const SpellBodyShot& shot, SpellBodyStrike& r) {
+      ProbeCtx& p = *(ProbeCtx*)c;
+      SpellMatterStrike(p.w->phys, p.w->mobs, p.w->debris, p.w->world, *p.gore, shot,
+                        p.ownBodies, r);
+      return r.hit;
+    };
   bp.bodyIdAt = [](void* c, Vec3 from, float radius, uint64_t& id, Vec3& out) {
     ProbeCtx& p = *(ProbeCtx*)c;
     MobSystem& mobs = p.w->mobs;
@@ -456,14 +469,12 @@ Aim AimFor(TickAuthorityCtx& w, const KitSpell& ks, uint64_t mobId, const ai::Ca
   }
   // WHERE IT WILL BE (flight only): the target's velocity over the flight
   // time, bounded so a sprint does not throw the aim into the next field.
+  // ai::LeadPoint, the one lead every creature's projectile takes (the NPC
+  // archers' too, game/mob_archery.cpp).
   if (ks.lead && !list.casts.empty() && list.casts[0].delivery.mech == DeliveryMech::Flight &&
       list.casts[0].delivery.speedFx > 0) {
     const float vTick = (float)list.casts[0].delivery.speedFx / (float)kSpellFxOne;
-    const float t = (to - chest).len() / std::max(0.5f, vTick) / 30.0f;   // seconds
-    Vec3 lead{req.targetVel.x * t, 0.0f, req.targetVel.z * t};
-    const float m = lead.len();
-    if (m > 8.0f) lead = lead * (8.0f / m);
-    to = to + lead;
+    to = ai::LeadPoint(chest, to, req.targetVel, vTick, 1.0f, 8.0f);
   }
   Vec3 d = to - chest;
   const float len = d.len();
@@ -695,6 +706,7 @@ MobCastOutcome ServeImpl(TickAuthorityCtx& w, std::span<SessionTick> players,
   pc.w = &w;
   pc.players = players;
   pc.caster = req.mobId;
+  pc.gore = &out.spawns;
   if (const Mob* mob = w.mobs.FindMobById(req.mobId); mob && mob->Def())
     for (int i = 0; i < (int)mob->Def()->limbs.size(); i++)
       if (const uint64_t h = w.mobs.LimbBody(req.mobId, i)) pc.ownBodies.push_back(h);
@@ -943,6 +955,15 @@ void DrawSheathed(TickAuthorityCtx& w, const ItemLibrary& items) {
       continue;
     const ItemStack& st = mob->GetKit().equip.slots[sheath];
     if (st.Empty()) continue;
+    // A BOW TAKES BOTH HANDS (the NPC archers, game/mob_archery.h): the off
+    // hand is the string hand, and a sidearm drawn into it would be drawn
+    // into the bow_draw pose. The archer's sidearm comes out when its arrows
+    // run out (mob_archery.cpp, with the bow put away first).
+    bool bowInHand = false;
+    for (Hand h : {Hand::Right, Hand::Left})
+      if (const ItemDef* hd = items.Named(mob->HeldItem(h)); hd != nullptr && hd->IsBow())
+        bowInHand = true;
+    if (bowInHand) continue;
     for (Hand h : {Hand::Right, Hand::Left}) {
       if (!HandCanCast(*mob, h) || !mob->HeldItem(h).empty()) continue;
       const ItemDef* def = items.Named(st.name);
@@ -1097,6 +1118,7 @@ void MobCastTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t t
     pc.w = &w;
     pc.players = players;
     pc.caster = c.mobId;
+    pc.gore = &out.spawns;
     if (!c.gone)
       if (const Mob* mob = w.mobs.FindMobById(c.mobId); mob && mob->Def())
         for (int i = 0; i < (int)mob->Def()->limbs.size(); i++)
@@ -1190,4 +1212,24 @@ void MobCastAppendLive(const TickAuthorityCtx& w, std::vector<const SpellProject
   if (!w.mobCast) return;
   for (const MobCaster& c : w.mobCast->casters)
     for (const SpellProjectile& p : c.spells.Live()) out.push_back(&p);
+}
+
+// ---- THE AIM, SHARED (game/mob_archery.cpp's archers) -------------------------------
+Vec3 MobAimCentre(const MobSystem& mobs, uint64_t id, Vec3* size) {
+  return BoxCentre(mobs, id, size);
+}
+
+bool MobTargetNow(TickAuthorityCtx& w, std::span<SessionTick> players, uint64_t id,
+                  Vec3& out, float* heightOut) {
+  if (!TargetNow(w, players, id, out)) return false;
+  if (heightOut != nullptr) {
+    if (ai::IsPlayerActorId(id)) {
+      *heightOut = 2.0f * Player::kHalfY;
+    } else {
+      Vec3 size{};
+      BoxCentre(w.mobs, id, &size);
+      *heightOut = size.y;
+    }
+  }
+  return true;
 }

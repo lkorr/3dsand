@@ -94,6 +94,7 @@
 struct TickAuthorityCtx;
 struct SessionTick;
 struct OpBatch;
+class MobSystem;
 
 // ---- the kit (content) ----------------------------------------------------------
 
@@ -296,3 +297,15 @@ bool MobCanCast(TickAuthorityCtx& w, uint64_t mobId, const std::string& spell, f
 // Every creature's flight carriers, for the renderer (they are drawn like the
 // player's; main.cpp's projectile loop).
 void MobCastAppendLive(const TickAuthorityCtx& w, std::vector<const SpellProjectile*>& out);
+
+// ---- THE AIM, SHARED with the NPC archers (game/mob_archery.h, 2026-10-13) ----
+// What a creature's projectile is aimed FROM and AT, the casters' own rules
+// (with ai::LeadPoint for where a moving target will be):
+//   MobAimCentre  the centre of a creature's body box (its origin when it has
+//                 none); `size` = the box's extent.
+//   MobTargetNow  where target `id` is NOW: a session's player (the centre of
+//                 its figure box) or a live creature's box centre. False for a
+//                 target that is gone. `heightOut` = how tall it stands.
+Vec3 MobAimCentre(const MobSystem& mobs, uint64_t id, Vec3* size = nullptr);
+bool MobTargetNow(TickAuthorityCtx& w, std::span<SessionTick> players, uint64_t id,
+                  Vec3& out, float* heightOut = nullptr);

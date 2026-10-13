@@ -418,6 +418,37 @@
       ]
     },
     {
+      "comment": "THE ARCHER (2026-10-13, docs/PLAN_projectiles.md E; game/mob_archery.h). A human with a bow: while it has arrows it keeps 35..80 voxels off (the `ranged` band, not slid onto any swing reach) and on its own cadence DRAWS (the player's bow_draw clip, the bow's own drawTimeMs), aims where you will be and high by the drop, and LOOSES through the same arrow flights the player's bow uses -- from 12 to 170 voxels off. Inside its band it gives ground facing you; with arrows left it does not brawl unless its back is to a wall (`ammo` / `cornered` rules). Out of arrows the bow goes into its pack, the sheathed sidearm comes out and it is a plain swordsman: the movement / attack blocks below. The AI panel's `archer` preset arms it (ArmArcher: the bow, the picked weapon as the sidearm, a quiver of 12); a ref arms it the same way.",
+      "name": "archer",
+      "label": "Archer",
+      "color": 3224425344,
+      "faction": "monster",
+      "hysteresis": 0.28,
+      "perception": { "sightRange": 160, "fovDegrees": 300, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 200, "keepRangeScale": 1.25, "stickiness": 8, "preferWeak": 4 },
+      "movement": { "mobile": true, "rangeMin": 7, "rangeMax": 11, "bandSlack": 2.0, "approachSpeed": 1.0, "strafeSpeed": 0.45, "retreatSpeed": 0.9, "fleeSpeed": 1.1, "circleTendency": 0.35, "circleHoldTicks": 40, "repathTicks": 10, "navRadius": 30, "dodgeSpeed": 1.3, "flank": 0.5, "keepOut": -1 },
+      "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "thrust"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 36, "jitterTicks": 20, "commitTicks": 10, "disengageTicks": 22, "pursueSpeed": 0.6, "leadTicks": 15 },
+      "defense": { "skill": 0.35, "reactTicks": 8, "reactJitter": 6, "margin": 2.5, "guardStance": 0, "guardReach": 0.85, "holdTicks": 4 },
+      "ranged": { "rangeMin": 35, "rangeMax": 80, "minRange": 12, "maxRange": 170, "cadenceTicks": 45, "jitterTicks": 20, "firstDelayTicks": 15, "aimTolerance": 0.3, "draw": 1.0, "holdTicks": 4, "holdJitter": 8, "spread": 0.015, "lead": 1.0, "leadCap": 12, "aimRaise": 0.15, "quiver": 12, "bow": "bow" },
+      "intents": {
+        "goto": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "sleep": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
+        "approach": { "weight": 1.15, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "holdRange": { "weight": 1.3, "cooldownTicks": 0, "minDwellTicks": 6 },
+        "circle": { "weight": 0.6, "cooldownTicks": 30, "minDwellTicks": 24 },
+        "attack": { "weight": 3.0, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "flee": { "weight": 0, "cooldownTicks": 0, "minDwellTicks": 30 },
+        "dodge": { "weight": 1.0, "cooldownTicks": 10, "minDwellTicks": 8 },
+        "shoot": { "weight": 3.2, "cooldownTicks": 0, "minDwellTicks": 0 }
+      },
+      "rules": [
+        { "note": "arrows left and room to give ground: shoot, do not brawl", "when": { "ammo": ">0", "cornered": 0 }, "scale": { "attack": 0 } },
+        { "note": "hurt: shoot from further out, and sloppier", "when": { "hp": "<0.5" }, "tune": { "band": 10, "aim": 1.6 } },
+        { "note": "badly hurt and losing: break off after every wound", "when": { "hp": "<0.25", "hpAdv": "<-0.25", "sinceHurt": "<120" }, "weight": { "flee": 3.5 } }
+      ]
+    },
+    {
       "comment": "THE IMP (docs/PLAN_demons.md D1; assets/mobs/demon/imp_skerrick.json, assets/demons/skerrick.json). A summoned thing that wants its summoner dead: faction `demon`, aggro hostile, the full 360 (it was looking for you before it arrived). AGILE AND LIGHT: a short fast cadence of claw rakes and bites (the human's natural weapons; demon.js makes the fists cut), a close band it darts in and out of, a lot of circling and a quick dodge. Ranges are centre-to-centre in world voxels and an imp is under a metre tall, so every number is about half a man's. CONTAINMENT IS NOT HERE: a demon summoned into an intact salt circle keeps this profile and keeps wanting you; the circle (game/demon_circle.h) clamps its walk and refuses a blow across the ring.",
       "//goto": "D6 item 10: a CONTAINED demon waits where it arrived, facing you -- game/demon_malice.h writes that routine (the `goto` intent); anything it can still do outscores it, and what the salt would refuse scores nothing (ai_behavior.h SelfView::targetFenced).",
       "name": "imp",

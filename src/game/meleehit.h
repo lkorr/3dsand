@@ -76,6 +76,7 @@
 
 #include "game/impact.h"
 #include "math3d.h"
+#include "phys/kerf.h"  // Penetrator: a MeleeHitKind::Pierce record's projectile
 #include "sim/bytestream.h"
 
 // A STRUCK THING, ACROSS TWO MACHINES. A mob is its mob id on both (the id
@@ -96,6 +97,13 @@ enum class MeleeHitKind : uint8_t {
   Shell,       // a worn garment took it (the cover retarget, or the probe)
   Parry,       // the held blade stopped the stroke (rule 2 above)
   Loose,       // loose matter (CombatantRef::kBody): DebrisSystem resolves it
+  // A POINT DRIVEN ALONG A RAY (game/pierce.h, docs/PLAN_projectiles.md C):
+  // an arrow the shooter's flight met a peer's creature with. The owner runs
+  // the channel on its own slot (Mob::PierceLimb) from `at` along `sweepDir`
+  // with `pierce`, and when it EMBEDS, the arrow `MeleeHit::embedItem` stays
+  // in that limb on the owner (Mob::EmbedArrow). The shooter's ghost was
+  // carved as presentation, rule 4's way.
+  Pierce,
 };
 
 // Everything fixed-size, so the record is one Pod and three strings.
@@ -127,6 +135,9 @@ struct MeleeHitCore {
   // LOOSE only: the body that is SHOVED, by global id, when the blow went to
   // a garment strapped to it (the corpse-armour retarget). 0 = the target.
   uint64_t reactBodyGid = 0;
+  // PIERCE only: the projectile as it met this body (its speed at the entry,
+  // its point, its flat hp, its soak seed). Plain floats and words: a POD.
+  Penetrator pierce{};
 
   static constexpr uint32_t kSelfMounted = 1u << 0;   // a fist / jaws
   static constexpr uint32_t kFirstContact = 1u << 1;  // impulses may land
@@ -141,13 +152,18 @@ struct MeleeHit {
   std::string slot;       // the rig slot that takes the blow, BY NAME
   std::string reactSlot;  // the flesh that flinches ("" = `slot`)
   std::string clothSlot;  // cloth the edge passed through ("" = none)
+  // PIERCE only: the item that stays in the limb when the point EMBEDS on
+  // the owner (an arrow, Mob::EmbedArrow); "" = nothing stays.
+  std::string embedItem;
 };
 
 // Bumped whenever MeleeHitCore or the string list changes. A record of
 // another version fails to decode (the reader is poisoned).
 // v2 (2026-10-08): loose matter (CombatantRef::kBody, MeleeHitKind::Loose,
 // reactBodyGid); CombatantRef's first word is a kind.
-inline constexpr uint32_t kMeleeHitVersion = 2;
+// v3 (2026-10-12): MeleeHitKind::Pierce -- MeleeHitCore::pierce and the
+// `embedItem` string (docs/PLAN_projectiles.md C).
+inline constexpr uint32_t kMeleeHitVersion = 3;
 
 inline void EncodeMeleeHit(ByteWriter& w, const MeleeHit& h) {
   w.U32(kMeleeHitVersion);
@@ -155,6 +171,7 @@ inline void EncodeMeleeHit(ByteWriter& w, const MeleeHit& h) {
   w.Str(h.slot);
   w.Str(h.reactSlot);
   w.Str(h.clothSlot);
+  w.Str(h.embedItem);
 }
 
 inline bool DecodeMeleeHit(ByteReader& r, MeleeHit& h) {
@@ -167,6 +184,7 @@ inline bool DecodeMeleeHit(ByteReader& r, MeleeHit& h) {
   r.Str(h.slot);
   r.Str(h.reactSlot);
   r.Str(h.clothSlot);
+  r.Str(h.embedItem);
   h.c.waitTick = 0;
   return r.ok;
 }

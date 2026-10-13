@@ -1,0 +1,74 @@
+{
+  "//": "DRAWING A BOW (session.cpp PhaseG's bow block, game/arrows.h): played while the bow hand's button is held, stopped on the loose. Authored for the bow in the RIGHT fist (the hotbar's E hand); a bow in the left plays the library's derived bow_draw.mirror. The bow arm straight out ahead at shoulder height; the draw arm's upper arm forward and across at shoulder height, rolled so the elbow hinges in the horizontal plane, and the forearm folded back 130 degrees so the string hand comes in to the chin. Solved from the target points (shoulder, elbow, chin) rather than posed by eye: rest is arms hanging along -Y, the character facing +Z with its left at +X; X negative = forward/up (pour.json's convention). pitchFollow tips the torso, and both arms with it, with the look, so the arrow points where the crosshair does.",
+  "name": "bow_draw",
+  "sidecarVoxelsPerMetre": 10,
+  "durationMs": 1200,
+  "loop": true,
+  "mode": "override",
+  "blendInMs": 220,
+  "blendOutMs": 140,
+  "mask": [
+    "armU.R",
+    "armL.R",
+    "hand.R",
+    "armU.L",
+    "armL.L",
+    "hand.L",
+    "torso"
+  ],
+  "quietAdditive": {
+    "armU.R": 1.0,
+    "armL.R": 1.0,
+    "hand.R": 1.0,
+    "armU.L": 1.0,
+    "armL.L": 1.0,
+    "hand.L": 1.0
+  },
+  "pitchFollow": {
+    "torso": 0.6
+  },
+  "tracks": {
+    "armU.R": {
+      "rot": [
+        { "t": 0, "q": [-0.7171, 0.0286, 0.0278, 0.6959] },
+        { "t": 1200, "q": [-0.7171, 0.0286, 0.0278, 0.6959] }
+      ]
+    },
+    "armL.R": {
+      "rot": [
+        { "t": 0, "q": [-0.0436, 0.0, 0.0, 0.9990] },
+        { "t": 1200, "q": [-0.0436, 0.0, 0.0, 0.9990] }
+      ]
+    },
+    "hand.R": {
+      "rot": [
+        { "t": 0, "q": [0.0, 0.0, 0.0, 1.0] },
+        { "t": 1200, "q": [0.0, 0.0, 0.0, 1.0] }
+      ]
+    },
+    "armU.L": {
+      "rot": [
+        { "t": 0, "q": [-0.6755, -0.4438, 0.2316, 0.5413] },
+        { "t": 1200, "q": [-0.6755, -0.4438, 0.2316, 0.5413] }
+      ]
+    },
+    "armL.L": {
+      "rot": [
+        { "t": 0, "q": [-0.9085, 0.0, 0.0, 0.4178] },
+        { "t": 1200, "q": [-0.9085, 0.0, 0.0, 0.4178] }
+      ]
+    },
+    "hand.L": {
+      "rot": [
+        { "t": 0, "q": [0.0, 0.0, 0.0, 1.0] },
+        { "t": 1200, "q": [0.0, 0.0, 0.0, 1.0] }
+      ]
+    },
+    "torso": {
+      "rot": [
+        { "t": 0, "q": [0.0, 0.0, 0.0, 1.0] },
+        { "t": 1200, "q": [0.0, 0.0, 0.0, 1.0] }
+      ]
+    }
+  }
+}

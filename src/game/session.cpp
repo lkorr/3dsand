@@ -22,6 +22,7 @@
 #include "game/demon_talk.h"
 #include "game/dye.h"
 #include "game/itemcoat.h"
+#include "game/pierce.h"   // SpellMatterStrike: a spell flight's matter meets a body
 #include "game/persist.h"
 #include "game/strokes.h"
 #include "game/worlditems.h"
@@ -1541,7 +1542,18 @@ static void PhaseD(TickAuthorityCtx& w, WorldScratch& ws,
                 : *profile != '\0' ? std::string(profile)
                 : d.behavior.empty() ? std::string("duelist")
                                      : d.behavior;
-            if (!mobs.SetMobBehavior(nid, prof)) {
+            const bool behaved = mobs.SetMobBehavior(nid, prof);
+            // AN ARCHER IS ARMED BY ITS PROFILE (game/mob_archery.h ArmArcher):
+            // a `ranged` block hands it the profile's bow (the weapon picked
+            // above becomes its sidearm, in the sheath) and a quiver. Any
+            // other profile: untouched.
+            if (behaved) {
+              std::string anote;
+              if (ArmArcher(mobs, nid, items, &anote) >= 0)
+                std::printf("AI panel: %s armed as an archer: %s\n",
+                            d.name.c_str(), anote.c_str());
+            }
+            if (!behaved) {
               // A NAMED PROFILE THAT IS NOT LOADED leaves the creature on the
               // legacy wander, where it walks off and never fights — and it
               // did it silently. The panel is a dev tool; say so.
@@ -2228,6 +2240,78 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
         ui.throwCharge = s.throwTicks > 0 && tdef
                              ? ContainerThrowCharge(*tdef, s.throwTicks)
                              : -1.0f;
+      }
+      // ---- THE BOW (game/arrows.h): the bow hand's button HELD draws, LET GO
+      // looses. WHICH HAND: the right's bow, else the left's. A draw needs an
+      // arrow to nock and is dropped -- loosing nothing -- the moment that hand
+      // stops holding the bow (or a throw takes the hands). All of it is read
+      // off this tick's command (the held mask; the camera the tick turned
+      // from the look delta), so a replay or a peer draws the same bow the
+      // same way, and the shot is an ordinary arrow in w.arrows from here.
+      {
+        int bh = -1;
+        const bool canShoot = !avatar.Spawned() || avatar.Alive();
+        if (st.intent.handsUp && canShoot && s.throwTicks == 0 &&
+            s.throwLaunchIn == 0)
+          for (int hk = 0; hk < kHands && bh < 0; hk++)
+            if (hands.hand[hk].bow) bh = hk;
+        const ItemDef* bowDef = bh >= 0 ? hands.hand[bh].item : nullptr;
+        const ItemDef* ammo = bowDef ? items.Named(bowDef->bow.ammo) : nullptr;
+        int have = ammo ? KitAmmoCount(kit, ammo->name) : 0;
+        // The pose is authored for a bow in the RIGHT fist; the left plays
+        // its mirror (Mob::HandClip). Stopped on the hand it was STARTED in.
+        if (bh != s.bowHand) {
+          const std::string was =
+              avatar.HandClip("bow_draw", HandAt(s.bowHand >= 0 ? s.bowHand : 0));
+          if (s.bowDrawTicks > 0 && avatar.Spawned() && !was.empty())
+            avatar.StopClip(was);
+          s.bowDrawTicks = 0;
+          s.bowHand = bh;
+        }
+        const Hand bowHand = HandAt(bh >= 0 ? bh : 0);
+        const std::string drawClip = avatar.HandClip("bow_draw", bowHand);
+        const uint32_t bowBtn = bowHand == Hand::Left ? TB_ALT : TB_ATTACK;
+        if (bowDef != nullptr && ti.Held(bowBtn) &&
+            (s.bowDrawTicks > 0 || have > 0)) {
+          if (s.bowDrawTicks == 0) {
+            if (avatar.Spawned() && !drawClip.empty()) avatar.PlayClip(drawClip);
+            s.lastHand = bowHand;
+          }
+          s.bowDrawTicks = std::min(s.bowDrawTicks + 1, 1 << 20);
+        } else if (bowDef != nullptr && s.bowDrawTicks > 0) {
+          // THE LOOSE. Under the bow's minDraw it is a fumble: the arrow
+          // stays on the string (in the kit) and nothing flies.
+          const float speed = BowArrowSpeed(*bowDef, s.bowDrawTicks);
+          if (avatar.Spawned() && !drawClip.empty()) avatar.StopClip(drawClip);
+          s.bowDrawTicks = 0;
+          if (speed > 0.0f && ammo != nullptr && have > 0) {
+            // FROM THE EYE, ALONG THE LOOK -- the spell aim's camera, so the
+            // arrow goes where the crosshair is. It starts inside the
+            // shooter's own capsule and among its limbs; those are the
+            // flight's ignore list. The shooter's own velocity rides along.
+            const Vec3 fwd = cam.Forward();
+            const Vec3 from = player.EyePos() + fwd * 0.5f;
+            std::vector<uint64_t> ignore;
+            avatar.AppendLiveLimbBodies(ignore);
+            if (playerBody) ignore.push_back(playerBody);
+            const uint32_t aseed =
+                rng::Hash3(0xA770B0u, tick, (uint32_t)s.index);
+            if (w.arrows.Launch(*ammo, from, fwd, speed, player.vel, aseed,
+                                std::move(ignore))) {
+              KitTakeAmmo(kit, ammo->name);
+              have--;
+            } else {
+              ui.kitMessage = "too many arrows in the air";
+              ui.kitMessageAge = 0.0f;
+            }
+          }
+        }
+        ui.bowDraw = bowDef == nullptr ? -1.0f
+                     : s.bowDrawTicks > 0
+                         ? BowDrawFraction(*bowDef, s.bowDrawTicks)
+                         : 0.0f;
+        ui.bowMinDraw = bowDef ? bowDef->bow.minDraw : 0.0f;
+        ui.arrowsLeft = bowDef ? std::max(0, have) : -1;
       }
       // WHICH VESSEL ACTS THIS TICK: the one whose hand's button is down
       // (the right's first), else the last-used hand's, else the only one.
@@ -3895,9 +3979,26 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           const Player* player;
           uint64_t playerId;
           const PlayerAvatar* avatar;
-        } bodyCtx{&phys, &mobs, &player, kPlayerCasterId, &avatar};
+          DebrisSystem* debris;
+          World* world;
+          std::vector<ParticleSpawn>* spawns;   // the tick's: a wound's gore
+        } bodyCtx{&phys, &mobs, &player, kPlayerCasterId, &avatar, &debris, &world, &spawns};
         SpellBodyProbe bodyProbe;
         bodyProbe.ctx = &bodyCtx;
+        // THE MATTER IS THE PROJECTILE (docs/PLAN_projectiles.md D): a flight
+        // carrying matter strikes the body itself -- pierces, scours, splashes
+        // or touches -- through game/pierce.h SpellMatterStrike. The caster's
+        // own parts are never in the way (bodyHit's ownership rule, as an
+        // ignore list: a body BEHIND the caster's arm is still met).
+        bodyProbe.matterHit = [](void* c, const SpellBodyShot& shot, SpellBodyStrike& r) {
+          SpellBodyCtx& bc = *(SpellBodyCtx*)c;
+          std::vector<uint64_t> own;
+          if (shot.casterId == bc.playerId && bc.avatar->Spawned())
+            for (int i = 0; i < bc.avatar->LimbCount(); i++)
+              if (const uint64_t h = bc.mobs->LimbBody(bc.avatar->Id(), i)) own.push_back(h);
+          SpellMatterStrike(*bc.phys, *bc.mobs, *bc.debris, *bc.world, *bc.spawns, shot, own, r);
+          return r.hit;
+        };
         // WHAT A FLIGHT RUNS INTO: the first MOVING-layer body on the tick's
         // segment (a mob limb, debris, a bomb), through the same ray the laser
         // and the melee sweep use. The caster's own parts are rejected by
@@ -5861,7 +5962,9 @@ static void ResolveHands(TickAuthorityCtx& w, SessionTick& st) {
     // again because a save or a script can put anything in a slot).
     if (d != nullptr && EquipSlotAccepts(EquipSlotOfHand(h), d->kind)) {
       hn.item = d;
-      hn.weapon = d->kind == ItemKind::Melee;
+      // A BOW is held like a weapon and shot, not swung (PhaseG's bow block).
+      hn.bow = d->IsBow();
+      hn.weapon = d->kind == ItemKind::Melee && !hn.bow;
       hn.vessel = d->IsContainer();
     }
     // No body (fly mode, dead) swings nothing; an arm that is gone or
@@ -6034,6 +6137,10 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
   // into this tick's streams; its blinks. Nothing to do (and no world) until a
   // creature first asks.
   MobCastTick(w, players, tick, out);
+  // ...and SHOOT (game/mob_archery.h, the NPC archers): the shoot requests the
+  // same PreTick issued start draws, every drawn bow steps, and a loose goes
+  // into w.arrows -- stepped in phase K's slot with the players' arrows.
+  MobArcheryTick(w, players, tick);
   tprof.Mark("H");
   for (size_t i = 0; i < players.size(); i++)
     PhaseI(w, ws, players[i], scratch[i], tick, out);
@@ -6061,6 +6168,16 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
     ApplyRemoteMeleeHits(w.phys, w.mobs, w.debris, w.world, out.spawns, tick);
   for (size_t i = 0; i < players.size(); i++)
     PhaseK(w, ws, players[i], scratch[i], tick, out);
+  // ---- THE ARROWS IN FLIGHT (game/arrows.h) ----------------------------------
+  // Once, for every session's bow: after the peers' blows and the local
+  // swings (the bodies are this tick's, debris.PreTick has run), with the
+  // tick's batch open so a channel's gore enters this tick's spawns. Nothing
+  // in the air, nothing runs.
+  if (w.arrows.Live() > 0) {
+    ArrowWorld aw{w.world, w.classOf, w.phys, w.mobs, w.debris, w.items,
+                  w.ground, &w.mbSet};
+    w.arrows.Tick(tick, aw, out.spawns);
+  }
   tprof.Mark("K");
   PhaseL(w, ws, players, scratch, tick, out);
   tprof.Mark("L");

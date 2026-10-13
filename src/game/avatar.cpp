@@ -1523,9 +1523,12 @@ void PlayerAvatar::JointConsistentPose(std::vector<Vec3>& pos, std::vector<Quat>
         !have[(size_t)i] || !have[(size_t)h])
       continue;
     const Quat q = rot[(size_t)h];
-    rot[(size_t)i] = q;
+    // An arrow stuck in the limb keeps its angle to it (MobLimb::wornRot).
+    const MobLimb& fl = limbs_[(size_t)i];
+    const Quat qi = fl.wornRotated ? QuatMul(q, fl.wornRot) : q;
+    rot[(size_t)i] = qi;
     pos[(size_t)i] = pos[(size_t)h] + Rotate(q, limbs_[(size_t)h].anchorLimb) -
-                     Rotate(q, limbs_[(size_t)i].anchorLimb);
+                     Rotate(qi, fl.anchorLimb);
   }
 }
 

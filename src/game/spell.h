@@ -349,6 +349,13 @@ struct GlyphDef {
   int32_t reach = 3;             // instant: voxels in front of the caster
   bool body = false;             // flight as a rigid body (bomb)
   bool resolveOnExpiry = false;  // orb: life running out is a resolve, not a fizzle
+  // THE SHAPE A FLIGHT'S MATTER STRIKES WITH (glyphs.json "penetrator",
+  // docs/PLAN_projectiles.md D): the point's radius in FINE cells (1.25 cm,
+  // phys/kerf.h Penetrator::tipRadius) and its sharpness 0..1, both x1000.
+  // The matter decides how hard and how heavy; the delivery how pointed: a
+  // `projectile` is a lump, a `bolt` a dart, a `lob` a blunt ball.
+  int32_t tipMille = 1500;
+  int32_t sharpMille = 300;
   GlyphLook look;                // how it is drawn (render-only)
   // What the describe line calls one of these ("a bolt", "a bomb"). Content,
   // so a modder's new carrier reads as itself; defaults to the glyph id.
@@ -490,7 +497,36 @@ struct SpellBudgets {
   int32_t rateGraft = 2;        // per voxel × arcane(M)
   int32_t rateExplode = 1;      // × power × r³ / 1000
   int32_t rateWind = 1;         // × footprint × ticks / 1000
+  // THE KINETIC TERM (docs/PLAN_projectiles.md decision 3, package D): mana
+  // per KILOJOULE of the energy a flight's matter carries, 1/2 m v^2 at the
+  // record's launch speed (and the `pierce` mod's body bonus). Billed as part
+  // of the delivery's CARRY, after its multiplier, so a carrier that launches
+  // a stone bolt pays its own carry on moving it too. 0 = speed is free again.
+  int32_t rateKinetic = 100;
   int32_t anythingSurchargeMille = 500;   // the wildcard, on top of the conversion
+  // ---- THE MATTER IS THE PROJECTILE (docs/PLAN_projectiles.md D) -----------
+  // How much matter one matter word puts in flight, mL per unit of matter
+  // scale (n x magnitude): its MASS is this x the material's density. NOT the
+  // spray volume (three world voxels = 3 L, a 7.8 kg stone at x1): what the
+  // body is hit by is the lump; what lands in the world where it stops is
+  // still the spray.
+  int32_t matterLumpMl = 250;
+  // Each `pierce` adds this per-mille of the matter's energy AGAINST BODIES
+  // (it keeps its terrain role, one wall per word). Priced: the kinetic term
+  // counts it.
+  int32_t pierceBodyMille = 1000;
+  // A POWDER lump is a spray of grains: its point is blunter (sharpness x
+  // powderSharpMille) and wider (tip x powderTipMille), and what it can spend
+  // on a body is capped at `scourBins` bins of skin-hard matter at that tip --
+  // a shallow scour, never a deep channel, and it never flies on through.
+  int32_t powderSharpMille = 400;
+  int32_t powderTipMille = 2000;
+  int32_t scourBins = 2;
+  // A LIQUID (or a gas that can coat) never penetrates: it SPLASHES a disc of
+  // this radius (world voxels x 1000 at x1, growing as the cube root of the
+  // matter scale) onto the skin it hits, at the material's own authored
+  // stain amount x the matter scale (capped at a full coat).
+  int32_t splashRadiusMille = 1200;
   // ---- sustained (plan §7), P3 ----------------------------------------------
   int32_t maxStatusTicks = 900;
   int32_t maxStatusPerCaster = 4;
@@ -498,6 +534,17 @@ struct SpellBudgets {
   int32_t maxGrimoirePages = 32;
   int32_t maxMacroWords = 32;
   int32_t maxMacroDepth = 4;
+};
+
+// One material, as a projectile's matter (GlyphLibrary::matterPhys).
+struct SpellMatterPhys {
+  int32_t density = 0;    // kg/m^3 (materials.json density)
+  int32_t hardness = 0;   // materials.json hardness (the penetrator's point)
+  uint8_t klass = 0;      // CLASS_SOLID / POWDER / LIQUID / GAS
+  // The stain amount a body coat of it is laid at (materials.json stain
+  // `amount`), 0 = a body cannot wear it (no stain slot: fire, stone).
+  uint8_t coatAmount = 0;
+  bool hot = false;       // tag:hot -- an embedded lump of it lights the wound
 };
 
 struct GlyphLibrary {
@@ -516,6 +563,14 @@ struct GlyphLibrary {
   std::vector<uint8_t> crumbles;
   bool Crumbles(uint32_t mat) const {
     return mat < crumbles.size() && crumbles[mat] != 0;
+  }
+  // WHAT A FLIGHT MADE OF THIS MATERIAL WEIGHS AND IS (docs/PLAN_projectiles.md
+  // D): materials.json density, hardness, class, and whether a body can wear
+  // it as a coat (its stain slot) at what authored amount. Copied at load
+  // beside `arcane`, so the price and the flight need only the library.
+  std::vector<SpellMatterPhys> matterPhys;
+  SpellMatterPhys MatterPhys(uint32_t mat) const {
+    return mat < matterPhys.size() ? matterPhys[mat] : SpellMatterPhys{};
   }
   // The implicit delivery (R5). Not in `glyphs`, so it cannot be spoken; its
   // record fields come from the "hand" block.
@@ -1024,6 +1079,107 @@ SpellCast InstanceCast(const SpellCast& cast, int32_t i);
 // mark), for drawing the bolt; 0 when it carries none.
 uint32_t CastTintMaterial(const SpellCast& cast);
 
+// ---- THE MATTER IS THE PROJECTILE (docs/PLAN_projectiles.md decision 3, D) --
+//
+// A FLIGHT carrying free matter (a matter word in its pile: a Spray item that
+// fires on hit) flies AS that matter. Its mass is the matter's density x
+// budgets.matterLumpMl x the matter scale, summed over every matter item; its
+// CORE -- what decides how it meets a body -- is the heaviest of them:
+//   solid   PIERCES: a phys/kerf.h Penetrator (the delivery's tip and
+//           sharpness, the matter's hardness) driven through the bodies on
+//           the segment by game/pierce.h PierceAlongRay. Through everything:
+//           it flies on at the residual speed. Stopped: it resolves THERE.
+//   powder  SCOURS: the same penetrator, blunter and wider, its energy capped
+//           at budgets.scourBins bins -- a shallow wound, never through.
+//   liquid  SPLASHES: never penetrates; a coat of it on the skin it hits
+//           (MobSystem::PourOnBody), whose own rules do the rest -- acid eats,
+//           lava sears and lights, water wets and rinses.
+//   gas, or a liquid no body can wear: TOUCHES -- takes the old bodyHit rule
+//           unchanged, bit for bit (a firebolt sprays its flame at the hit).
+// Effects in the payload resolve where it stopped, as they always did; the
+// matter left over after the body took its share (a coat takes the core
+// matter; a lump that stopped inside is DROPPED there, not flung on) is
+// sprayed at that point with no velocity. Terrain is unchanged.
+enum class SpellMatterKind : uint8_t { None = 0, Pierce, Scour, Splash, Touch };
+const char* SpellMatterKindName(SpellMatterKind k);   // "pierce" | ...
+struct SpellMatter {
+  SpellMatterKind kind = SpellMatterKind::None;
+  uint32_t material = 0;    // the core
+  int32_t scaleMille = 0;   // the core item's n x magnitude
+  int64_t massMg = 0;       // all the matter in flight, milligrams
+};
+// The matter a flight record carries, from its payload (the Hit items) and
+// lanes excluded -- call it with the INSTANCE's payload (InstanceCast).
+SpellMatter FlightMatter(const GlyphLibrary& lib, const DeliveryRec& d,
+                         const std::vector<EffectInst>& payload);
+// A record's launch speed in m/s (24.8 fixed voxels per 30 Hz tick).
+float SpellSpeedMps(int32_t speedFx);
+// THE KINETIC TERM of one flight instance, in mana: 1/2 m v^2 at the record's
+// speed, x (1 + pierce x budgets.pierceBodyMille), x budgets.rateKinetic per
+// kJ, rounded. 0 for anything that is not a non-body flight with matter.
+// Integer arithmetic only (a price is authoritative, thesis 3).
+int32_t KineticMana(const GlyphLibrary& lib, const DeliveryRec& d,
+                    const std::vector<EffectInst>& payload);
+// ...and the energy it is priced on, joules (the readout's number).
+float KineticJoules(const GlyphLibrary& lib, const DeliveryRec& d,
+                    const std::vector<EffectInst>& payload);
+
+// What the VM asks its owner to do when a flight's matter meets a body on
+// this tick's segment (SpellBodyProbe::matterHit). The VM fills it; the owner
+// (game/pierce.h SpellMatterStrike) answers through the body systems.
+struct SpellBodyShot {
+  Vec3 from{}, to{};        // this tick's segment, world voxels
+  uint64_t casterId = 0;
+  SpellMatterKind kind = SpellMatterKind::None;
+  uint32_t material = 0;    // the core matter
+  float massKg = 0.0f;      // with the pierce mod's body bonus folded in
+  float speedMps = 0.0f;    // at contact
+  float tipRadius = 1.5f;   // fine cells
+  float sharpness = 0.3f;   // 0..1
+  float hardness = 0.0f;    // the matter's (materials.json)
+  // Scour: what it may spend, in bins of skin-hard matter at its tip (the
+  // owner prices a bin with its own gore.pierceCellJ).
+  int32_t scourBins = 0;
+  uint32_t coatAmount = 0;  // Splash: the coat level laid (1..15)
+  float splashRadius = 1.0f;  // Splash: world voxels
+  bool hot = false;         // an embedded lump lights the wound
+  uint32_t seed = 0;        // the wound soak's draw key
+  uint32_t tick = 0;
+};
+// The owner's answer, which is also the log row (SpellSystem::StrikeLog).
+struct SpellBodyStrike {
+  bool hit = false;         // the segment met a body
+  // PIERCE: it left the far side of everything it met and flies on at
+  // `exitSpeedMps` from `at`. Everything else stops it at `at`.
+  bool through = false;
+  // The body now holds the core matter (a coat): nothing of it sprays.
+  bool tookMatter = false;
+  Vec3 at{};
+  float exitSpeedMps = 0.0f;
+  // ---- the report (the gate, a HUD line) ----
+  uint8_t outcome = 0;      // phys/kerf.h PierceOutcome (Pierce / Scour)
+  uint64_t mobId = 0;       // the first creature met (0 = loose / nobody)
+  int limb = -1;
+  uint32_t bodies = 0;      // bodies the ray resolved on
+  uint32_t cells = 0;       // lattice cells the channel(s) took
+  uint32_t coated = 0;      // body cells the splash coated
+  float energyJ = 0.0f, spentJ = 0.0f;
+  float depthVox = 0.0f;    // the first body's channel
+  float hp = 0.0f;          // charged across every body met
+  bool killed = false;
+  // The channel cells by material, across every body met (first-met order).
+  struct MatCells {
+    uint32_t mat = 0, cells = 0;
+  };
+  std::vector<MatCells> byMat;
+};
+struct SpellStrikeLog {
+  SpellBodyShot shot;
+  SpellBodyStrike r;
+  int deliveryGlyph = -1;
+  uint64_t casterId = 0;
+};
+
 // What the VM thinks the spoken sequence is, for the HUD.
 struct SpellReadout {
   std::string text;         // the bracket readout (HUD style)
@@ -1119,6 +1275,14 @@ struct SpellBodyProbe {
   // segment is clear. Bodies are not in the voxel grid, so without this a
   // bolt flies straight through a creature and resolves on the wall behind.
   bool (*bodyHit)(void* ctx, Vec3 from, Vec3 to, uint64_t casterId, Vec3& outHit) = nullptr;
+  // THE MATTER MEETS A BODY (docs/PLAN_projectiles.md D): a flight that
+  // carries matter a body can take (a solid, a powder, a liquid it can wear;
+  // not a gas) asks this INSTEAD of bodyHit, and the owner resolves the
+  // whole strike -- the channel, the splash, the trauma -- through the body
+  // systems (game/pierce.h SpellMatterStrike) and answers where the flight
+  // stopped or how fast it left. Null: the old bodyHit rule (resolve at the
+  // hit) for every flight.
+  bool (*matterHit)(void* ctx, const SpellBodyShot& shot, SpellBodyStrike& out) = nullptr;
   void* ctx = nullptr;
 };
 
@@ -1479,7 +1643,13 @@ class SpellSystem {
     beams_.clear();
     echoes_.clear();
     filters_.clear();
+    strikeLog_.clear();
   }
+  // The last kStrikeLogMax times a flight's matter met a body (oldest
+  // first): what it was, what it did. Diagnostics -- the spell-pierce gate's
+  // read-out and a HUD line -- never part of any identity, never saved.
+  static constexpr size_t kStrikeLogMax = 16;
+  const std::vector<SpellStrikeLog>& StrikeLog() const { return strikeLog_; }
   const std::vector<SpellProjectile>& Live() const { return live_; }
   int LiveCount() const { return (int)live_.size(); }
   const std::vector<SpellBomb>& Bombs() const { return bombs_; }
@@ -1513,6 +1683,7 @@ class SpellSystem {
   std::vector<SpellBeam> beams_;
   std::vector<SpellEcho> echoes_;
   std::vector<SpellFilter> filters_;
+  std::vector<SpellStrikeLog> strikeLog_;
   // Where a nested `self` resolves during a Cast() that named a body part
   // (the character screen). Valid only for the duration of that call.
   SpellFxVec selfAt_{};
