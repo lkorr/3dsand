@@ -79,6 +79,13 @@ TickRig::TickRig(const TickEngine& c, uint32_t lastTick, IVec3 fixtureChunk)
   w_->harness.pinWindow = true;
   w_->harness.farInert = true;
   w_->harness.ownsActors = true;
+  // ...and so the list STARTS EMPTY. MobSystem::Reset does not clear the
+  // player actors (the game re-lists them every tick), so a rig that owns them
+  // inherited whatever the previous gate set: `npc-hand-cast` after
+  // `demon-malice` had its battlemage chase demon-malice's phantom "you" 10
+  // voxels off and refuse the cast as busy mid-swing (2026-10-12). A gate
+  // that wants a player sets one after constructing its rig.
+  c.mobs.ClearPlayerActors();
   SetFixtureChunk(fixtureChunk);
   // The gate's own ops for the tick about to run, handed over at its top.
   w_->harness.inject = [this](uint32_t, OpBatch& out) {

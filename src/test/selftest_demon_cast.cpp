@@ -660,6 +660,22 @@ Status GateDemonCast(Ctx& c, std::string& detail) {
     const uint64_t hum = SpawnAt(c, "human", f.x - 0.5f, f.y, f.z - 14.5f);
     for (uint64_t id : {impFlat, imp, humFlat, hum}) c.mobs.SetMobBehavior(id, "dummy");
     support::RunTicks(rig, 60);
+    // WHAT THE BODIES STAND ON, as the CPU fetch cache holds it (the ground
+    // probe's source): the pad's top cell under the flat imp. A "feet 20 off"
+    // with this reading air is a stale cache, not a stance bug (2026-10-12:
+    // World::SeedCacheFromMirror froze the pre-pad copy).
+    {
+      const int wx = f.x - 12, wy = f.y - 1;
+      const CachedChunk* cc = c.world.Cached({wx >> 4, wy >> 4, f.z >> 4});
+      int cm = -1;
+      if (cc != nullptr && cc->voxels.size() == kChunkVol)
+        cm = (int)(cc->voxels[((f.z & 15) * kChunk + (wy & 15)) * kChunk + (wx & 15)] & 0xFFFu);
+      const char* under = cm < 0 ? "not cached"
+                          : cm < (int)c.mats.size() ? c.mats[(size_t)cm].name.c_str()
+                                                     : "?";
+      std::printf("demon-cast: H cache under the flat imp (%d,%d,%d): %s (version %u)\n", wx, wy,
+                  f.z, under, cc != nullptr ? cc->version : 0u);
+    }
     auto step = [&](int x) { return x >= f.stepX ? f.y + 1 : f.y; };
     FootClear(c, impFlat, step, flatWorst, flatLowest);
     FootClear(c, humFlat, step, humWorst, humLowest);
@@ -816,6 +832,20 @@ Status GateNpcHandCast(Ctx& c, std::string& detail) {
     const uint32_t reqTick = rig.tick + 1;
     OpBatch ob;
     req.tick = reqTick;
+    // WHO IS BUSY, if the request is refused (attribution, not a re-run): the
+    // hand-cast phase, the live stroke and what the brain is doing.
+    if (const Mob* m0 = c.mobs.FindMobById(id)) {
+      const MobHandCast* h0 = MobHandCastOf(rig.Authority(), id);
+      const ai::Brain* br = c.mobs.MobBrain(id);
+      std::printf("npc-hand-cast: mob %llu before the request: hand phase %d, stroke phase %d "
+                  "style %d, castBusy %d, target %llu (has %d, dist %.1f), intent %d, held L '%s' "
+                  "R '%s'\n",
+                  (unsigned long long)id, h0 ? (int)h0->phase : -1, (int)m0->Stroke().phase,
+                  m0->Stroke().style, (int)m0->CastBusy(),
+                  br ? (unsigned long long)br->targetId : 0ull, br ? (int)br->hasTarget : -1,
+                  br ? br->targetDist : -1.0f, br ? (int)br->intent : -1,
+                  m0->HeldItem(Hand::Left).c_str(), m0->HeldItem(Hand::Right).c_str());
+    }
     r.begun = MobCastBegin(rig.Authority(), std::span<SessionTick>(&st, 1), req, reqTick,
                            "firebolt", ob);
     {
