@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <unordered_map>
 #include <vector>
@@ -117,6 +118,11 @@ class FarEdits {
   // id: kContainNone (open), kContainLiquid or kContainWall. Until it is set,
   // centres are recorded raw, as they always were.
   static constexpr int kContainMaxShift = 2;   // == FAR_CONTAIN_MAX_SHIFT
+  // A candidate that FLOATS on the liquid is refused (worldgen.wgsl
+  // farFloatsOn; ticket 2026-10-11_22-09-52): the first non-wall voxel
+  // straight below it, within this reach, is liquid. So is a lone SPECK
+  // (Despeck below). A wall holds liquid beside or above it, never under it.
+  static constexpr int kFloatReach = 4;        // == FAR_FLOAT_REACH
   static constexpr uint8_t kContainNone = 0, kContainLiquid = 1, kContainWall = 2;
   // ContainedBy's matAt answers besides a material id.
   static constexpr int kMatAtUnseen = -1;   // counts as OPEN, never a candidate
@@ -159,6 +165,52 @@ class FarEdits {
   // (x, y, z), or -1 when the caller cannot see it.
   using AboveFn = std::function<int(int, int, int)>;
   uint32_t CoverOf(uint32_t mat) const { return mat < coverOf_.size() ? coverOf_[mat] : 0u; }
+
+  // ---- A LONE VOXEL IS DRAWN AS ITS SURROUNDINGS (worldgen.wgsl farDespeck;
+  // ticket 2026-10-11_22-09-52) ------------------------------------------------
+  // A SPECK is a far-solid voxel whose far slot is not cover and which no
+  // voxel of its 3x3x3 neighbourhood shares that slot with: a cloth scrap on a
+  // lake, a blood drop, a flake of ash. Centre-sampled it was a whole 2^k
+  // cube; instead the cell is drawn as the slot most of its six face
+  // neighbours hold (not-far-solid is a slot of its own; ties to the first in
+  // +x,-x,+y,-y,+z,-z order), as that neighbour's material, or air. Anything
+  // `matAt` cannot see (kMatAtUnseen) or names only as ground (kMatAtGround)
+  // counts as support: never despeck on a guess. Needs SetGroundSource (the
+  // far slots) and SetCoverSource; until both are set, `mat` is returned.
+  // Public for the far-contain gate's oracle.
+  template <class F>
+  uint32_t Despeck(uint32_t mat, int x, int y, int z, F&& matAt) const {
+    if (groundSlot_.empty() || coverOf_.empty()) return mat;
+    const uint32_t s = GroundSlotOf(mat);
+    if (s == kGroundNotSolid || s == 0 || CoverOf(mat) != 0) return mat;
+    auto slotOf = [&](int m) -> uint32_t {
+      const uint32_t g = GroundSlotOf((uint32_t)m);
+      return g == kGroundNotSolid ? 0u : g;
+    };
+    static constexpr int kDir[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+                                       {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+    int fm[6];
+    uint32_t fs[6];
+    for (int j = 0; j < 6; j++) {
+      fm[j] = matAt(x + kDir[j][0], y + kDir[j][1], z + kDir[j][2]);
+      if (fm[j] < 0) return mat;
+      fs[j] = slotOf(fm[j]);
+      if (fs[j] == s) return mat;
+    }
+    for (int i = 0; i < 27; i++) {
+      const int ox = i % 3 - 1, oy = (i / 3) % 3 - 1, oz = i / 9 - 1;
+      if (std::abs(ox) + std::abs(oy) + std::abs(oz) < 2) continue;
+      const int m = matAt(x + ox, y + oy, z + oz);
+      if (m < 0 || slotOf(m) == s) return mat;
+    }
+    int bestJ = 0, bestN = 0;
+    for (int j = 0; j < 6; j++) {
+      int n = 0;
+      for (int k = 0; k < 6; k++) n += fs[k] == fs[j] ? 1 : 0;
+      if (n > bestN) { bestN = n; bestJ = j; }
+    }
+    return fs[bestJ] == 0 ? (uint32_t)kMatAir : (uint32_t)fm[bestJ];
+  }
   // The cover rule for one cell (see SetCoverSource): `centre` its centre
   // material (already known not far-solid), `half` its half-width, `c0` its
   // min corner in whatever coordinates `matAt` takes. Returns the cell's

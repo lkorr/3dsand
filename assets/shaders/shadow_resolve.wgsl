@@ -253,6 +253,9 @@ fn farShadowCover(level : u32, vc : vec3<i32>, eAx : i32, tIn : f32,
   return smoothstep(0.0, max(w, 1e-3), margin);
 }
 // raymarch.wgsl farSkyCeil (sky_top.wgsl's words at farOcc's tail).
+// raymarch.wgsl PARTIAL COVERS ACCUMULATE: MUST AGREE.
+const FAR_SHADOW_COVER_HITS : i32 = 4;
+const FAR_SHADOW_OPEN_MIN : f32 = 0.05;
 const SKY_TOP_BASE : u32 = FAR_LEVELS * FAR_NUM_CHUNKS;   // raymarch.wgsl agrees
 const SKY_TOP_BIAS : i32 = 1 << 24;                       // raymarch.wgsl agrees
 fn farSkyCeil(level : u32) -> f32 {
@@ -279,6 +282,9 @@ fn farShadowTC(level0 : u32, roFine : vec3f, rdIn : vec3f, tStartFine : f32,
   let reachF = TUNE_FAR_SHADOW_REACH / VOXEL_METERS;
   var tF = tStartFine;
   var budget = FAR_SHADOW_STEP_CAP;
+  var open = 1.0;
+  var hits = 0;
+  var tFirst = -1.0;
   for (var level = level0; level <= FAR_LEVELS; level++) {
     if (tF >= reachF || budget <= 0) { break; }
     let s = f32(1u << farCellShift(level));
@@ -346,11 +352,15 @@ fn farShadowTC(level0 : u32, roFine : vec3f, rdIn : vec3f, tStartFine : f32,
             if (budget <= 0) { break; }
             budget -= 1;
             if (farShadowBlocked(level, vc)) {
-              var cov = 1.0;
-              if (withCov) {
-                cov = farShadowCover(level, vc, eAx, vCur, vMax, rd, stepv, s);
+              if (!withCov) { return vec2f(vCur * s, 1.0); }
+              // raymarch.wgsl farShadowMarch, PARTIAL COVERS ACCUMULATE.
+              let cv = farShadowCover(level, vc, eAx, vCur, vMax, rd, stepv, s);
+              if (hits == 0) { tFirst = vCur * s; }
+              open *= 1.0 - cv;
+              hits += 1;
+              if (open < FAR_SHADOW_OPEN_MIN || hits >= FAR_SHADOW_COVER_HITS) {
+                return vec2f(tFirst, 1.0 - open);
               }
-              return vec2f(vCur * s, cov);
             }
             if (vMax.x < vMax.y && vMax.x < vMax.z) {
               vc.x += stepv.x; vCur = vMax.x; vMax.x += tDelta.x; eAx = 0;
@@ -359,7 +369,8 @@ fn farShadowTC(level0 : u32, roFine : vec3f, rdIn : vec3f, tStartFine : f32,
             } else {
               vc.z += stepv.z; vCur = vMax.z; vMax.z += tDelta.z; eAx = 2;
             }
-            if (vCur >= tOut || vCur >= tExit) { break; }
+            // raymarch.wgsl traceFar, THE CELL CURSOR STAYS IN THE VALID BOX.
+            if (vCur >= tOut || vCur >= tExit || !farInValid(vc, box)) { break; }
             if (stepv.y > 0 && vc.y >= yTopRow) { break; }
           }
         }
@@ -377,7 +388,7 @@ fn farShadowTC(level0 : u32, roFine : vec3f, rdIn : vec3f, tStartFine : f32,
     }
     tF = max(tF, min(tCur, tExit) * s);
   }
-  return vec2f(-1.0, 0.0);
+  return select(vec2f(-1.0, 0.0), vec2f(tFirst, 1.0 - open), hits > 0);
 }
 
 // ======================= THE SUN IS NOT A POINT ============================

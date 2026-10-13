@@ -24,6 +24,13 @@ bool PlumeDebug() {
   static const bool on = std::getenv("SANDVOX_PLUME_DEBUG") != nullptr;
   return on;
 }
+// SANDVOX_PLUME_TOP=1: the pre-2026-10-11 anchor (the TOPMOST hot voxel, in
+// NoteChunk and in the wide clusters) -- the control arm of ticket
+// 2026-10-11_22-25-46's before/after, from one exe. Read once.
+bool PlumeTopAnchor() {
+  static const bool on = std::getenv("SANDVOX_PLUME_TOP") != nullptr;
+  return on;
+}
 const char* const kBandName[] = {"none", "IN-WINDOW", "fine", "wide",
                                  "out-of-range", "outside-box", "fine+wide"};
 
@@ -145,8 +152,16 @@ void FarPlumes::NoteChunk(IVec3 wc, const uint32_t* words) {
   constexpr uint32_t kCell = 1u << kGasOuterShift;   // 8
   constexpr uint32_t kSub = kChunk / kCell;          // 2 per axis in x/z
   uint32_t count[kSub * kSub] = {};
-  int topY[kSub * kSub];
-  for (uint32_t i = 0; i < kSub * kSub; i++) topY[i] = -1;
+  // THE BASE OF THE FIRE, not its top (2026-10-11, ticket 22-25-46: "the
+  // smoke LOD should start from the base of the fire"). The plume kernels
+  // stand the column ON this y, so the topmost hot voxel put a burning
+  // tree's far smoke at the crown's top -- above everything the cascade still
+  // shows of the fire -- and left a gap of sky between the fire and its
+  // smoke. The column rises through the burning matter from its lowest
+  // voxel instead; the part inside the crown is hidden by the crown, which
+  // is what the near smoke looks like too.
+  int baseY[kSub * kSub];
+  for (uint32_t i = 0; i < kSub * kSub; i++) baseY[i] = -1;
 
   for (uint32_t z = 0; z < kChunk; z++)
     for (uint32_t y = 0; y < kChunk; y++)
@@ -155,7 +170,7 @@ void FarPlumes::NoteChunk(IVec3 wc, const uint32_t* words) {
         if (!SmokeSource(mat)) continue;
         const uint32_t s = (z / kCell) * kSub + (x / kCell);
         count[s]++;
-        topY[s] = (int)y;   // ascending y, so the last write is the topmost
+        if (baseY[s] < 0 || PlumeTopAnchor()) baseY[s] = (int)y;   // ascending y
       }
 
   Emitter e[kSub * kSub];
@@ -165,7 +180,7 @@ void FarPlumes::NoteChunk(IVec3 wc, const uint32_t* words) {
       const uint32_t s = sz * kSub + sx;
       if (count[s] == 0) continue;
       e[n].x = wc.x * (int)kChunk + (int)(sx * kCell + kCell / 2);
-      e[n].y = wc.y * (int)kChunk + topY[s];
+      e[n].y = wc.y * (int)kChunk + baseY[s];
       e[n].z = wc.z * (int)kChunk + (int)(sz * kCell + kCell / 2);
       e[n].strength = std::min(count[s], kGasFarEmitStrengthMax);
       n++;
@@ -175,8 +190,8 @@ void FarPlumes::NoteChunk(IVec3 wc, const uint32_t* words) {
 
 void FarPlumes::NoteUniformChunk(IVec3 wc, uint32_t mat) {
   if (!SmokeSource(mat & 0xFFFu)) { Replace(wc, nullptr, 0); return; }
-  // A whole chunk of ember: every column is saturated and the top hot voxel is
-  // the chunk's top. Rare (a sentinel chunk of burning matter takes a
+  // A whole chunk of ember: every column is saturated and the lowest hot voxel
+  // is the chunk's floor. Rare (a sentinel chunk of burning matter takes a
   // deliberate fill) but it is the other door into the index and leaving it
   // shut would make the feature depend on which door a fire came through.
   constexpr uint32_t kCell = 1u << kGasOuterShift;
@@ -186,7 +201,7 @@ void FarPlumes::NoteUniformChunk(IVec3 wc, uint32_t mat) {
   for (uint32_t sz = 0; sz < kSub; sz++)
     for (uint32_t sx = 0; sx < kSub; sx++) {
       e[n].x = wc.x * (int)kChunk + (int)(sx * kCell + kCell / 2);
-      e[n].y = wc.y * (int)kChunk + (int)kChunk - 1;
+      e[n].y = wc.y * (int)kChunk + (PlumeTopAnchor() ? (int)kChunk - 1 : 0);
       e[n].z = wc.z * (int)kChunk + (int)(sz * kCell + kCell / 2);
       e[n].strength = kGasFarEmitStrengthMax;
       n++;
@@ -520,7 +535,7 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
 
   // ---- THE WIDE AGGREGATION, and what OVERFLOWING *it* now means ----------
   // Bucket by the COARSE cell the emitter stands in. Strengths add and the
-  // topmost hot voxel wins, so a whole burning hillside becomes ONE emitter
+  // LOWEST member's base wins (the base of the fire, see NoteChunk), so a whole burning hillside becomes ONE emitter
   // whose strength says how much of it is alight -- which is what the shader
   // turns into a taller, denser column. Per cell: the aggregate emitter, plus
   // the WEIGHTED strength sum, so the record's crossfade weight can be the
@@ -556,7 +571,11 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
     // does not reshuffle clusters and make plumes hop.
     //
     // The record stands at the strength-weighted CENTROID in x/z and the
-    // topmost member's y (smoke leaves the top of the fire). The radius
+    // LOWEST member's y: the column stands on the base of the fire. It was
+    // the topmost member's, which for a cluster spanning a crown, a trunk and
+    // the burning ground below it (a 128-voxel span at the base radius) put
+    // the coarse plume's base up to 12.8 m above the fire -- ticket
+    // 2026-10-11_22-25-46's gap between the burning tree and its far smoke. The radius
     // doubles with extraShift, the same overflow ladder the grid had.
     constexpr int32_t kClusterVox = 64;   // 6.4 m: a house, a stand of trees
     const int32_t rad = kClusterVox << extraShift;
@@ -593,7 +612,7 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
       const Key sc = cellOf(seed);
       uint64_t str = 0, sw = 0, rawStr = 0;
       int64_t sx = 0, sz = 0;
-      int32_t topY = seed.y;
+      int32_t baseY = seed.y;
       for (int dz = -1; dz <= 1; dz++)
         for (int dy = -1; dy <= 1; dy++)
           for (int dx = -1; dx <= 1; dx++) {
@@ -616,7 +635,8 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
               sw += (uint64_t)c.e.strength * w;
               sx += (int64_t)c.e.x * c.e.strength;
               sz += (int64_t)c.e.z * c.e.strength;
-              topY = std::max(topY, c.e.y);
+              baseY = PlumeTopAnchor() ? std::max(baseY, c.e.y)
+                                       : std::min(baseY, c.e.y);
             }
           }
       // A cluster with no weight at all draws nothing and takes no record.
@@ -624,7 +644,7 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
       Emitter e;
       e.x = rawStr ? (int32_t)(sx / (int64_t)rawStr) : seed.x;
       e.z = rawStr ? (int32_t)(sz / (int64_t)rawStr) : seed.z;
-      e.y = topY;
+      e.y = baseY;
       // Saturating at the 24 bits the record's strength field has.
       e.strength = (uint32_t)std::min<uint64_t>(str, (uint64_t)kGasFarEmitStrengthMask);
       const int ddx = e.x - cx, ddy = e.y - cy, ddz = e.z - cz;
@@ -636,7 +656,7 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
     }
     // TWO DOUBLINGS AND NO MORE, which is a correctness bound and not a
     // budget. Merging buckets CONCENTRATES MASS AT ONE POSITION: an aggregate
-    // stands at its topmost member's coordinate and carries the SUM of its
+    // stands at its lowest member's y and carries the SUM of its
     // members' strengths, and the shader reads that sum as "how big is this
     // fire" (hMul = sqrt(cols)). Coarsen without limit and a scatter of small
     // fires over a wide area collapses into one record that draws a four-times

@@ -673,6 +673,7 @@ const TUNING_PARAMS = {
   'ragdoll.getUpPitchDeg':{t:'f',def:60,min:0,max:90},
   'ragdoll.getUpDropFrac':{t:'f',def:0.45,min:0,max:1},
   'ragdoll.devSeconds':{t:'f',def:3,min:0.5,max:30},
+  'ragdoll.spinDamping':{t:'f',def:0.8,min:0,max:5},
   'ragdoll.corpseAirFraction':{t:'f',def:0.07,min:0,max:0.5},
   'ragdoll.limpWaterLift':{t:'f',def:0.8,min:0,max:5},
   'ragdoll.waterEntryLength':{t:'f',def:2,min:0.1,max:10},

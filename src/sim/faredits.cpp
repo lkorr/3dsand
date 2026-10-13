@@ -63,17 +63,25 @@ void FarEdits::Sweep(IVec3 wc,
         for (int iy = 0; iy < n[1]; iy++) {
           const int fine[3] = {first[0] + ix * step, first[1] + iy * step,
                                first[2] + iz * step};
-          uint32_t mat = sample(fine[0] - base[0], fine[1] - base[1], fine[2] - base[2]);
+          // The chunk-local reader the rules below share; across a face is
+          // unseen (the GPU, which sees the window, may answer differently
+          // there: a downsample-only answer, like the container rule's).
+          auto inChunk = [&](int x, int y, int z) -> int {
+            const int k = (int)kChunk;
+            if (x < 0 || y < 0 || z < 0 || x >= k || y >= k || z >= k) return kMatAtUnseen;
+            return (int)(sample(x, y, z) & 0xFFFu);
+          };
+          // A LONE SPECK at the centre is drawn as its surroundings (Despeck,
+          // worldgen.wgsl farDespeck): every rule below sees the substitute.
+          const int lfx = fine[0] - base[0], lfy = fine[1] - base[1], lfz = fine[2] - base[2];
+          uint32_t mat = Despeck(sample(lfx, lfy, lfz) & 0xFFFu, lfx, lfy, lfz, inChunk);
+          const int centreMat = (int)mat;
           // THE CONTAINER RULE (faredits.h kContainMaxShift): the cell lies
           // inside this chunk at these shifts; its face neighbours may not.
           if (shift <= kContainMaxShift && !containKind_.empty()) {
             const int c0[3] = {fine[0] - half - base[0], fine[1] - half - base[1],
                                fine[2] - half - base[2]};
-            mat = ContainedBy(mat & 0xFFFu, step, c0, [&](int x, int y, int z) {
-              const int k = (int)kChunk;
-              if (x < 0 || y < 0 || z < 0 || x >= k || y >= k || z >= k) return kMatAtUnseen;
-              return (int)(sample(x, y, z) & 0xFFFu);
-            });
+            mat = ContainedBy(mat & 0xFFFu, step, c0, inChunk);
           }
           // THE COVER RULE (SetCoverSource): the cell lies inside this chunk
           // at these shifts, and so do its eight sub-samples. After the
@@ -88,12 +96,11 @@ void FarEdits::Sweep(IVec3 wc,
           }
           // THE LOOSE TOP (SetLooseSource): worldgen.wgsl farRunTop, over what
           // this side can see. Not a cell the container rule claimed (`mat`
-          // still the raw centre); the cover rule only fills non-solid ones.
+          // still the (despecked) centre); the cover rule only fills non-solid ones.
           uint32_t gsTop = kGroundUnknown;
           if (!looseOf_.empty() && groundWorld_ && !containKind_.empty()) {
-            const int lx = fine[0] - base[0], ly = fine[1] - base[1], lz = fine[2] - base[2];
-            const int raw = (int)(sample(lx, ly, lz) & 0xFFFu);
-            if ((int)(mat & 0xFFFu) == raw && farSolid(raw)) {
+            const int lx = lfx, ly = lfy, lz = lfz;
+            if ((int)(mat & 0xFFFu) == centreMat && farSolid(centreMat)) {
               int t = -1;
               for (int d = 1; d <= step; d++) {
                 const int m = colAt(lx, ly + d, lz);
@@ -105,7 +112,9 @@ void FarEdits::Sweep(IVec3 wc,
               }
               if (t >= 0) {
                 const int tm = colAt(lx, t, lz);
-                if (tm > 0 && LooseOf((uint32_t)tm) && base[1] + t > GroundHeight(fine[0], fine[2])) {
+                // A lone speck is no top (farDespeck): one blood drop paints nothing.
+                if (tm > 0 && LooseOf((uint32_t)tm) && base[1] + t > GroundHeight(fine[0], fine[2]) &&
+                    Despeck((uint32_t)tm, lx, t, lz, inChunk) == (uint32_t)tm) {
                   mat = (uint32_t)tm;
                   gsTop = GroundSlotOf((uint32_t)tm);
                 }
@@ -222,7 +231,19 @@ uint32_t FarEdits::ContainedBy(uint32_t centre, int step, const int c0[3],
       liquid = liquid || k == kContainLiquid;
       open = open || k == kContainNone;
     }
-    if (liquid && open) return (uint32_t)m;
+    if (!liquid || !open) continue;
+    // ...and not FLOATING on the liquid (worldgen.wgsl farFloatsOn): the first
+    // non-wall voxel straight below, within kFloatReach, is liquid. Procgen
+    // ground is a wall; an unseen voxel ends the walk as open.
+    bool floats = false;
+    for (int d = 1; d <= kFloatReach; d++) {
+      const uint8_t k = kindAt(x, y - d, z);
+      if (k != kContainWall) { floats = k == kContainLiquid; break; }
+    }
+    if (floats) continue;
+    // ...nor a lone speck (Despeck): it is drawn as its surroundings.
+    if (Despeck((uint32_t)m, x, y, z, matAt) != (uint32_t)m) continue;
+    return (uint32_t)m;
   }
   return centre;
 }

@@ -440,6 +440,42 @@ Status GateRivers(Ctx& c, std::string& detail) {
                 iOk ? "PASS" : "FAIL", n, speed, speed > 0.0f ? along / speed : 0.0f, floorCells, skySpeed);
     if (!iOk) problems.push_back(Format("I: current %d prims, %.1f cells/s, along %.1f", n, speed, along));
     CurrentPrims().Clear();
+
+    // ---- J. a window move does not touch the river under the player ----
+    // (ticket 2026-10-11_18-39-38: "strobing in the water while moving in it
+    // every second or so".) The stream arm is rewritten whole on every window
+    // move, which a swimmer makes about once a second, and each rewrite used
+    // to restart every stream's attack ramp: the current under the player
+    // read ZERO on the move's tick and climbed back over six. The surface's
+    // wave phase is advected by this field, so every move strobed the water.
+    // Through SeedStreams itself (the path SubmitTick takes), read on the very
+    // tick of each move, for three moves along both axes.
+    const IVec3 org0{(bx >> 4), 0, (bz >> 4)};
+    const Vec3 at{L[mid][0] + 0.5f, L[mid][2] - 1.5f, L[mid][1] + 0.5f};
+    const IVec3 moves[4] = {{0, 0, 0}, {1, 0, 0}, {1, 0, 1}, {0, 0, 1}};
+    Vec3 v0{};
+    float worst = 0.0f, firstSpeed = 0.0f;
+    std::string jTrace;
+    for (int k = 0; k < 4; k++) {
+      const uint32_t tk = 200u + (uint32_t)k;
+      CurrentPrims().SeedStreamsAt(IVec3{org0.x + moves[k].x, 0, org0.z + moves[k].z}, kDefaultSeed, tk);
+      CurrentPrims().Tick(tk);
+      const Vec3 vk = sandvox::CurrentAtCpu(at);
+      const float sk = std::sqrt(vk.x * vk.x + vk.y * vk.y + vk.z * vk.z);
+      if (k == 0) {
+        v0 = vk;
+        firstSpeed = sk;
+      }
+      const float dx = vk.x - v0.x, dy = vk.y - v0.y, dz = vk.z - v0.z;
+      worst = std::max(worst, std::sqrt(dx * dx + dy * dy + dz * dz));
+      jTrace += Format(" %.2f", sk);
+    }
+    const bool jOk = firstSpeed >= floorCells * 0.9f && worst <= 1e-3f * firstSpeed;
+    std::printf("rivers: J window move: %s (speed at main's middle on each move's own tick:%s cells/s; "
+                "largest change %.4f)\n",
+                jOk ? "PASS" : "FAIL", jTrace.c_str(), worst);
+    if (!jOk) problems.push_back(Format("J: window move changed the current by %.3f (speeds%s)", worst, jTrace.c_str()));
+    CurrentPrims().Clear();
   }
 
   // ---- the world on the GPU ----

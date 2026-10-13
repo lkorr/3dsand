@@ -1230,6 +1230,46 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
   const uint64_t capRefused = plumes.RefusedChunks();
   SetCurrentTuning(saved);
 
+  // ---- arm G: the plume STANDS ON THE BASE OF THE FIRE (CPU only) --------
+  // Ticket 2026-10-11_22-25-46: a burning tree's far smoke started above the
+  // crown with sky between it and the fire, because every record stood at
+  // the TOPMOST hot voxel. A fresh index (no eye, no GPU) is fed a fire that
+  // is NOT flush with its chunk -- one 8x8 column footprint burning from
+  // y+4 to y+12 -- and the same footprint burning through the whole chunk
+  // above it: a tree alight from low on the trunk to the crown. Both lists
+  // must put the base at y+4 of the lower chunk: the fine record of that
+  // chunk (its lowest hot voxel, not y+12) and the WIDE cluster of the two
+  // (its lowest member, not the upper chunk's).
+  int32_t baseFine = INT32_MAX, baseWide = INT32_MIN;
+  uint32_t baseFineN = 0, baseWideN = 0;
+  const int32_t baseWant = wcOut.y * (int)kChunk + 4;
+  {
+    FarPlumes probe;
+    std::vector<uint32_t> lo(kChunkVol, 0u), hi(kChunkVol, 0u);
+    for (uint32_t z = 0; z < 8; z++)
+      for (uint32_t x = 0; x < 8; x++)
+        for (uint32_t y = 0; y < kChunk; y++) {
+          const uint32_t i = (z * kChunk + y) * kChunk + x;
+          if (y >= 4 && y <= 12) lo[i] = hotId;
+          hi[i] = hotId;
+        }
+    probe.NoteChunk(wcOut, lo.data());
+    probe.NoteChunk({wcOut.x, wcOut.y + 1, wcOut.z}, hi.data());
+    probe.Build(wo, (int32_t)(saved.render.farPlumeRange / kVoxelMeters));
+    const uint32_t* pw = nullptr;
+    uint32_t pn = 0;
+    if (probe.TakeUpload(&pw, &pn) && pw && pn >= kGasFarEmitWideBase) {
+      baseFineN = std::min(pw[0], kGasFarEmitMax);
+      for (uint32_t r = 0; r < baseFineN; r++)
+        baseFine = std::min(
+            baseFine, (int32_t)pw[kGasFarEmitHdr + r * kGasFarEmitStride + 1]);
+      baseWideN = std::min(pw[2], kGasFarEmitMaxWide);
+      if (baseWideN == 1) baseWide = (int32_t)pw[kGasFarEmitWideBase + 1];
+    }
+  }
+  const bool based = baseFineN == 2 && baseFine == baseWant &&
+                     baseWideN == 1 && baseWide == baseWant;
+
   // ---- the assertions -----------------------------------------------------
   // NOT `== kChunkVol`, and the difference is the CA: mutateCells lands the
   // paint and the colour loop runs behind it in the SAME tick, so a handful of
@@ -1376,8 +1416,17 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
                     "fire in the world"
                   : " -- the farthest chunk is in the FINE box, so the cap did "
                     "not reject it and the promotion is untested";
+  detail += Format(" | BASE arm: fine %u records, lowest y %d; wide %u "
+                   "records, y %d; want %d",
+                   baseFineN, baseFine == INT32_MAX ? -1 : baseFine, baseWideN,
+                   baseWide == INT32_MIN ? -1 : baseWide, baseWant);
+  if (!based)
+    detail += " -- the far plume does NOT stand on the base of the fire: a "
+              "record is anchored above the lowest burning voxel, so the "
+              "smoke floats off the fire with a gap under it (ticket "
+              "2026-10-11_22-25-46)";
   const bool ok = noted && drawn && placed && flagged && quiet && inert &&
-                  drifted && offExact && faded && capBound && capDrawn;
+                  drifted && offExact && faded && capBound && capDrawn && based;
   std::printf("gas-farplume: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
 
   // Leave the world as it was found (rule 7), index included: an emitter left
