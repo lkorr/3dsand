@@ -3667,11 +3667,20 @@ bool Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], u
     }
     return false;
   };
+  // A PINNED column's climate is the pin's, all of it: no snowline either.
+  // The snowline became per column (the map's treeline, map v2 A1) and a pin
+  // that kept it was a pin with a hole -- a gate fixture standing above the
+  // harness treeline (ground ~y220, snowline ~y227) froze under a "warm" pin.
+  // 0x7FFFFF is the largest Y the word's signed 24 bits hold: never reached.
+  // (The lapse rate still applies to a pinned column; it is 0 below ~1.7 km
+  // over the sea at the shipped 6 / km.)
+  constexpr int32_t kNoSnowline = 0x7FFFFF;
   auto colWord = [&](int x, int z) -> uint32_t {
     uint32_t b = 0;
-    if (!pinned(x, z, b)) b = World::MapBiomeAt(x, z, seed);
+    const bool pin = pinned(x, z, b);
+    if (!pin) b = World::MapBiomeAt(x, z, seed);
     b = std::min<uint32_t>(b, kHeatBiomesMax - 1);
-    const int32_t snowY = HeatSnowlineYAt(x, z, seed);
+    const int32_t snowY = pin ? kNoSnowline : HeatSnowlineYAt(x, z, seed);
     return b | ((uint32_t)snowY << 8);
   };
   // The world chunk column window tile k holds on each axis: chunk c in
@@ -4025,6 +4034,30 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
     }();
     if (caForced_ || kForceCaEnv) cx.caActive = true;
   }
+  // ---- THE DRAFT SOLVE FINISHES (Cond::Draft) -----------------------------
+  // The shelter solve is a PIPELINE, one stage per tick on which its `args`
+  // row is recorded (sim_draft.wgsl), and that row used to be recorded only
+  // on CA-active ticks. A world that proved itself settled mid-solve (a hut
+  // just built of inert stone: the CA proves idle within a few ticks) froze
+  // the solve at its stage, so the PUBLISHED field stayed one geometry behind
+  // until something woke the CA again -- and the stage it resumed from
+  // depended on when the settled proof arrived, which is a readback's timing.
+  // Measured 2026-10-12 (`drafts` purity): solve #358 started at tick 61020
+  // and published at 61035, three ticks after a smoke puff woke the world;
+  // 275,443 of 393,216 field words differed from a rebuild of the same
+  // geometry. A solve starts only on a tick `args` runs and DM_CHANGED is set
+  // (a mask moved: a CA or rebuild tick), runs DRAFT_STAGES ticks, and at
+  // most one more queues behind it -- so 2 x kDraftStages ticks of `args`
+  // after the last such tick publish everything started. On an idle tick
+  // `args` is a no-op (stage 0, nothing changed), so the tail costs one
+  // 1-thread dispatch, a 32-byte copy and six zero-group indirect rows, and
+  // stops by itself: a settled world still records nothing after it.
+  if (draftOn_ && (cx.caActive || draftRebuild_)) {
+    draftTail_ = 2 * kDraftStages + 1;
+  } else if (draftTail_ > 0) {
+    draftTail_--;
+  }
+  cx.draftTail = draftOn_ && draftTail_ > 0;
   caSkipped_ = !cx.caActive;
   if (caSkipped_) caSkipCount_++;
 

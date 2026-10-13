@@ -68,6 +68,7 @@
 #include "test/selftest.h"
 #include "test/support.h"
 #include "test/tickrig.h"
+#include "test/census.h"
 
 using namespace sandvox;
 
@@ -305,6 +306,8 @@ struct MeltResult {
   uint32_t interiorFirst = 0, firstMelted = 0;
   uint32_t pagesAfter = 0, awakeAfter = 0, melts = 0, refused = 0, pagesPeak = 0;
   std::string leak;
+  std::string leftWhy;  // the near zone at the end + its climate, when something is left
+  std::string leftTrace;  // near snow + ice left, every 150 ticks
   std::vector<uint32_t> finalCells;
   uint64_t heatHash = 0;
 };
@@ -388,6 +391,7 @@ MeltResult RunMelt(Ctx& c, int kTicks, int kCool) {
               }
       }
       if (left == 0 && r.meltTick == 0) r.meltTick = (uint32_t)i;
+      if (i % 150 == 0) r.leftTrace += Format(" t%d:%u", i, left);
     }
   }
   v.Read(ctx, world, room);
@@ -400,6 +404,33 @@ MeltResult RunMelt(Ctx& c, int kTicks, int kCool) {
   r.refused = hv.meta[kHmRefused];
   r.pagesPeak = hv.meta[kHmPagesPeak];
   r.heatHash = hv.Hash();
+  if (r.nearLeft) {
+    // WHAT is left and WHY it is cold (rule 6): the zone's census, the first
+    // frozen cell with its heat, and the climate the CPU table gives the
+    // fixture's columns -- the snowline (which a pin does not move) and the
+    // lapse at the room's height.
+    std::string first;
+    for (int z = nearZone.z0; z <= nearZone.z1 && first.empty(); z++)
+      for (int y = nearZone.y0; y <= nearZone.y1 && first.empty(); y++)
+        for (int x = nearZone.x0; x <= nearZone.x1 && first.empty(); x++) {
+          const uint32_t m = v.At(x, y, z) & 0xFFFu;
+          if (m == snow || m == ice)
+            first = Format("first at (%d,%d,%d) word %08x X %u X* %u", x, y, z, v.At(x, y, z),
+                           hv.X(x, y, z), hv.Xs(x, y, z));
+        }
+    int snowMin = 1 << 30;
+    for (int z = room.z0; z <= room.z1; z++)
+      for (int x = room.x0; x <= room.x1; x++)
+        snowMin = std::min(snowMin, (int)HeatSnowlineYAt(x, z, kDefaultSeed));
+    const IVec3 wo = world.WindowOrigin();
+    r.leftWhy = Format("near zone now: %s; %s; window origin (%d,%d,%d), column snowline min "
+                       "y%d (room y%d..%d), lapse at the room %d",
+                       MatCensus(c.mats, [&](int x, int y, int z) { return v.At(x, y, z); },
+                                 nearZone.x0, nearZone.y0, nearZone.z0, nearZone.x1,
+                                 nearZone.y1, nearZone.z1).c_str(),
+                       first.c_str(), wo.x, wo.y, wo.z, snowMin, room.y0, room.y1,
+                       (int)HeatLapseAt(room.y1));
+  }
   for (int z = room.z0; z <= room.z1; z++)
     for (int y = room.y0; y <= room.y1; y++)
       for (int x = room.x0; x <= room.x1; x++) r.finalCells.push_back(v.At(x, y, z) & 0xFFFFu);
@@ -450,6 +481,7 @@ Status GateHeatMelt(Ctx& c, std::string& detail) {
       a.finalCells == b.finalCells ? "same" : "DIFFER", (unsigned long long)a.heatHash,
       (unsigned long long)b.heatHash, twice ? "OK" : "NONDETERMINISTIC", a.refused);
   if (!a.leak.empty()) detail += "; LEFT OUT: " + a.leak;
+  if (!a.leftWhy.empty()) detail += "; LEFT: " + a.leftWhy + "; left over time" + a.leftTrace;
   std::printf("heat-melt: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
@@ -692,6 +724,7 @@ Status GateHeatIgnite(Ctx& c, std::string& detail) {
 struct FreezeResult {
   uint32_t cols = 0, frozenTop = 0, doubleFrozen = 0, earlyFrozen = 0, h2o0 = 0, h2oEnd = 0;
   uint32_t holeOpen = 0, holeAfter = 0, awake = 0, pages = 0, freezes = 0;
+  std::string why;  // the awake chunks and the open top cells, by name (rule 6)
   std::vector<uint32_t> finalCells;
   uint64_t heatHash = 0;
 };
@@ -758,7 +791,19 @@ FreezeResult RunFreeze(Ctx& c, int kPhase1, int kPhase2, int kEarly) {
   std::vector<CellOp> quench;
   Fill(quench, lavaB, kMatStone);
   Tick(c, t, quench);
-  for (int i = 0; i < kPhase2; i++) Tick(c, t);
+  for (int i = 0; i < kPhase2; i++) {
+    Tick(c, t);
+    if ((i + 1) % 300 == 0) {
+      // Open top cells over phase 2 (rule 6): a tail that is still closing
+      // reads differently from a column that never will.
+      v.Read(ctx, world, room);
+      uint32_t open = 0;
+      for (int z = poolB.z0; z <= poolB.z1; z++)
+        for (int x = poolB.x0; x <= poolB.x1; x++) open += !frozen(v.At(x, poolB.y1, z));
+      r.why += Format(" t%d:%u", i + 1, open);
+    }
+  }
+  if (!r.why.empty()) r.why = " open tops over phase 2" + r.why;
   v.Read(ctx, world, room);
   for (int z = poolB.z0; z <= poolB.z1; z++)
     for (int x = poolB.x0; x <= poolB.x1; x++) {
@@ -770,6 +815,32 @@ FreezeResult RunFreeze(Ctx& c, int kPhase1, int kPhase2, int kEarly) {
     for (int x = poolB.x0; x <= poolB.x0 + 1; x++) r.holeAfter += !frozen(v.At(x, poolB.y1, z));
   r.h2oEnd = h2o();
   r.awake = AwakeIn(ctx, sim, ChunksOf(room));
+  {
+    // ATTRIBUTION (rule 6): which chunk is awake and what it holds, and every
+    // top cell that is still open, with its word.
+    std::vector<uint32_t> flags(kNumSlots, 0);
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0, flags.data(),
+                          kNumSlots * 4, "heatFreezeAwake");
+    for (uint32_t ci : ChunksOf(room)) {
+      if (!flags[ci]) continue;
+      const IVec3 wc = world.SlotToWorldChunk(ci);
+      std::vector<uint32_t> cv(kChunkVol, 0);
+      ReadVoxelsSync(ctx, world, ci, 1, cv.data(), "heatFreezeAwakeVox");
+      r.why += Format(" [awake chunk (%d,%d,%d) flags %08x: %s]", wc.x, wc.y, wc.z, flags[ci],
+                      MatCensus(c.mats,
+                                [&](int x, int y, int z) {
+                                  return cv[((z & 15) * 16 + (y & 15)) * 16 + (x & 15)];
+                                },
+                                0, 0, 0, 15, 15, 15, 8)
+                          .c_str());
+    }
+    uint32_t listed = 0;
+    for (int z = poolB.z0; z <= poolB.z1; z++)
+      for (int x = poolB.x0; x <= poolB.x1; x++)
+        if (!frozen(v.At(x, poolB.y1, z)) && listed++ < 4)
+          r.why += Format(" [open top (%d,%d,%d) word %08x, above %08x]", x, poolB.y1, z,
+                          v.At(x, poolB.y1, z), v.At(x, poolB.y1 + 1, z));
+  }
   HeatView hv;
   hv.Read(ctx, world, true);
   r.pages = hv.PagesInUse();
@@ -814,6 +885,7 @@ Status GateHeatFreeze(Ctx& c, std::string& detail) {
       a.awake, a.pages, asleep ? "asleep" : "AWAKE", a.freezes,
       a.finalCells == b.finalCells ? "same" : "DIFFER", (unsigned long long)a.heatHash,
       (unsigned long long)b.heatHash, twice ? "OK" : "NONDETERMINISTIC");
+  if (!ok && !a.why.empty()) detail += ";" + a.why;
   std::printf("heat-freeze: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }

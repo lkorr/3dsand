@@ -1068,6 +1068,11 @@ struct RecordCtx {
   // this tick" (it moved, the gate or the materials changed, or it is new).
   bool draftOn = false;
   bool draftRebuild = false;
+  // ...and "a solve may still be in flight": the CA ran (or the box rebuilt)
+  // within the last 2 x kDraftStages ticks (Simulation::EncodeTick). Keeps
+  // Cond::Draft's args + solve rows recorded on SETTLED ticks long enough
+  // for any solve already started to publish.
+  bool draftTail = false;
   // The charge field's rounds this tick (Simulation::PrepareElec: sim.elecRounds,
   // or 1 with the layer off). Gates Cond::ElecR1..ElecR7.
   uint32_t elecRounds = 1;

@@ -1002,6 +1002,10 @@ class Simulation {
   rhi::Buffer renderUBOTickBuf_;
   bool draftOn_ = false, draftRebuild_ = false, draftForce_ = true, draftValid_ = false;
   bool draftLastOn_ = false;
+  // Ticks left in which Cond::Draft records even on a settled tick
+  // (EncodeTick, THE DRAFT SOLVE FINISHES): reset to 2 x kDraftStages + 1 on
+  // every tick the CA runs or the box rebuilds.
+  uint32_t draftTail_ = 0;
   int32_t draftOrigin_[3] = {0, 0, 0};
   int32_t draftLastOrigin_[3] = {-2147483647 - 1, 0, 0};
   int32_t draftHeatKnobs_[3] = {0, 0, 0};

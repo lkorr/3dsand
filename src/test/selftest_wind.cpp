@@ -58,6 +58,7 @@
 #include "sim/wind.h"
 #include "sim/windfield.h"
 #include "sim/windprim.h"
+#include "test/census.h"
 #include "test/selftest.h"
 #include "test/support.h"
 #include "test/tickrig.h"
@@ -82,6 +83,7 @@ struct WindResult {
   double sandX = 0.0;
   int sandMaxX = 0;         // furthest-downwind grain
   std::vector<uint32_t> sandCells;   // slot cell indices, chunk-major order
+  std::string census;       // the chamber's interior at the end, by material
 };
 
 Status GateWind(Ctx& c, std::string& detail) {
@@ -118,9 +120,15 @@ Status GateWind(Ctx& c, std::string& detail) {
   // `streaming` would otherwise build into space.
   const IVec3 wo = world.WindowOrigin();
   const int bx = wo.x * (int)kChunk + 64;
-  const int by = wo.y * (int)kChunk + 112;
   const int bz = wo.z * (int)kChunk + 64;
   const int kW = 48, kD = 6, kH = 10;
+  // ABOVE THE GROUND, terrain-relative. The wind's ramp is a function of
+  // height above the WORLDGEN ground (common.wgsl windRampF: profile(hAGL)),
+  // so a chamber below it stands in no wind at all, correctly -- and a literal
+  // y112 is under the harness ground since map v2 gave it an authored height
+  // plane (ground y155..255 in the window). Measured: every arm hashed
+  // identical (wind on == off), which is the field being zero, not broken.
+  const int by = FixtureYOver(bx - 1, bz - 1, bx + kW, bz + kD, kDefaultSeed, 6);
   const int x0 = bx, x1 = bx + kW - 1;
   const int z0 = bz, z1 = bz + kD - 1;
   const int yF = by, yT = by + kH + 1;     // stone floor and ceiling
@@ -218,6 +226,23 @@ Status GateWind(Ctx& c, std::string& detail) {
     if (r.smokeCount) r.smokeX = mxSum / r.smokeCount;
     if (r.sandCount) r.sandX = sxSum / r.sandCount;
     if (r.smokeCount) r.smokeX = mxSum / r.smokeCount;
+    {
+      // WHAT the chamber holds at the end (rule 6), read cell by cell.
+      std::map<uint32_t, std::vector<uint32_t>> cache;
+      auto at = [&](int x, int y, int z) -> uint32_t {
+        const uint32_t slot = World::SlotChunkIndex({x >> 4, y >> 4, z >> 4});
+        auto it = cache.find(slot);
+        if (it == cache.end()) {
+          std::vector<uint32_t> v((size_t)kChunkVol);
+          ReadVoxelsSync(ctx, world, slot, 1, v.data(), "windCensus");
+          it = cache.emplace(slot, std::move(v)).first;
+        }
+        return it->second[World::SlotCellIndex({x, y, z}) % kChunkVol];
+      };
+      r.census = MatCensus(c.mats, at, x0, yF + 1, z0, x1, yT - 1, z1) +
+                 Format("; shell at (%d,%d,%d) %s", x0 - 1, yF + 3, z0,
+                        MatCensus(c.mats, at, x0 - 1, yF, z0 - 1, x0 - 1, yT, z1 + 1).c_str());
+    }
     SetCurrentTuning(saved);
     return r;
   };
@@ -297,6 +322,10 @@ Status GateWind(Ctx& c, std::string& detail) {
           : "SKIPPED (windMode 2 trips the page-fault counter — see the file "
             "header; SANDVOX_WIND_ENTRAIN=1 to run it)");
 
+  if (!live || !drifts)
+    detail += Format(" -- smoke cells off/+x/-x/8x %u/%u/%u/%u; chamber (off) %s; chamber (+x) %s",
+                     off.smokeCount, east.smokeCount, west.smokeCount, hard.smokeCount,
+                     off.census.c_str(), east.census.c_str());
   if (!live) detail += " -- windMode 1 changed nothing";
   if (!drifts) detail += " -- smoke did not follow the direction knob";
   if (!bedHeld) detail += " -- drift bias moved SETTLED powder (invariant 4)";
@@ -1409,6 +1438,7 @@ Status GateDrafts(Ctx& c, std::string& detail) {
   uint32_t meta0[kDraftMetaWords] = {};
   readMeta(meta0);
   const int32_t* o = sim.DraftOrigin();
+  const int32_t oBefore[3] = {o[0], o[1], o[2]};
   struct R6 { float rx[3], rz[3]; bool in; };
   auto at = [&](const std::vector<uint32_t>& f, int x, int y, int z) -> R6 {
     R6 r{};
@@ -1620,6 +1650,19 @@ Status GateDrafts(Ctx& c, std::string& detail) {
                   "smoke-cell samples outside the draft hut, lee %u vs windward %u %s",
                   kSmokeTicks, placed, inside[0], inside[1], lee, windward, p ? "ok" : "FAIL");
     note(buf); ok = ok && p;
+    if (!p) {
+      // WHAT the sealed hut holds instead (rule 6), and its shell.
+      auto word = [&](int x, int y, int z) { return matAt(x, y, z); };
+      note(Format("sealed hut interior now: %s | its walls+roof+floor: %s",
+                  MatCensus(c.mats, word, cx - kHx + 1, y0 + 1, czs[0] - kHz + 1, cx + kHx - 1,
+                            y0 + kH, czs[0] + kHz - 1).c_str(),
+                  (MatCensus(c.mats, word, cx - kHx, y0, czs[0] - kHz, cx - kHx, y0 + kH + 1,
+                             czs[0] + kHz) + " / " +
+                   MatCensus(c.mats, word, cx - kHx, y0 + kH + 1, czs[0] - kHz, cx + kHx,
+                             y0 + kH + 1, czs[0] + kHz) + " / " +
+                   MatCensus(c.mats, word, cx - kHx, y0, czs[0] - kHz, cx + kHx, y0,
+                             czs[0] + kHz)).c_str()).c_str());
+    }
   }
   {
     // Smoke moving is not a geometry change: no solve in all those ticks.
@@ -1644,6 +1687,59 @@ Status GateDrafts(Ctx& c, std::string& detail) {
     std::snprintf(buf, sizeof buf, "purity: forced rebuild solved %u time(s), %zu of %zu field words differ %s",
                   meta2[kDraftMetaSolves] - meta1[kDraftMetaSolves], diff, field.size(), p ? "ok" : "FAIL");
     note(buf); ok = ok && p;
+    if (!p) {
+      // WHERE they differ (rule 6): the box origin either side, and the
+      // first differing cells with both words, in box cells.
+      std::string where = Format("box origin then (%d,%d,%d), now (%d,%d,%d); "
+                                 "meta (solves/last/cells, heat clock/box hot/heat start) "
+                                 "first read %u/%u/%u, %u/%u/%u; after smoke %u/%u/%u, %u/%u/%u; "
+                                 "rebuild %u/%u/%u, %u/%u/%u; first diffs:",
+                                 oBefore[0], oBefore[1], oBefore[2], sim.DraftOrigin()[0],
+                                 sim.DraftOrigin()[1], sim.DraftOrigin()[2],
+                                 meta0[kDraftMetaSolves], meta0[kDraftMetaLastTick],
+                                 meta0[kDraftMetaCells], meta0[kDraftMetaHeatClock],
+                                 meta0[kDraftMetaBoxHot], meta0[kDraftMetaHeatStart],
+                                 meta1[kDraftMetaSolves], meta1[kDraftMetaLastTick],
+                                 meta1[kDraftMetaCells], meta1[kDraftMetaHeatClock],
+                                 meta1[kDraftMetaBoxHot], meta1[kDraftMetaHeatStart],
+                                 meta2[kDraftMetaSolves], meta2[kDraftMetaLastTick],
+                                 meta2[kDraftMetaCells], meta2[kDraftMetaHeatClock],
+                                 meta2[kDraftMetaBoxHot], meta2[kDraftMetaHeatStart]);
+      // HISTORY OR INPUT? Rebuild once more, back to back: if two forced
+      // solves of the same state differ, the solver carries history; if they
+      // agree, the first field was solved from a different input.
+      // And is one tick enough? The solve is a kDraftStages-tick pipeline.
+      for (int i = 0; i < 2 * (int)kDraftStages + 2; i++) ticker();
+      ctx.WaitIdle();
+      std::vector<uint32_t> settled;
+      readField(settled);
+      sim.ForceDraftRebuild();
+      for (int i = 0; i < 2 * (int)kDraftStages + 3; i++) ticker();
+      ctx.WaitIdle();
+      std::vector<uint32_t> third;
+      readField(third);
+      size_t dSet = 0, dThird = 0, dFirst = 0;
+      for (size_t i = 0; i < third.size(); i++) {
+        dSet += settled[i] != again[i];
+        dThird += third[i] != settled[i];
+        dFirst += third[i] != field[i];
+      }
+      where += Format(" after the full pipeline the rebuild moved %zu more words; a second "
+                      "rebuild (full pipeline) differs from that in %zu, from the first field in %zu;",
+                      dSet, dThird, dFirst);
+      uint32_t listed = 0;
+      for (size_t i = 0; i < field.size() && listed < 4; i++)
+        if (field[i] != again[i]) {
+          const size_t cell = i / 3;
+          const uint32_t bx = (uint32_t)(cell % kDraftNX), by = (uint32_t)((cell / kDraftNX) % kDraftNY),
+                         bz = (uint32_t)(cell / ((size_t)kDraftNX * kDraftNY));
+          where += Format(" [cell (%u,%u,%u) word %zu: %08x -> %08x]", bx, by, bz, i % 3, field[i],
+                          again[i]);
+          listed++;
+          i += 3 * 97;  // spread the samples out
+        }
+      note(where.c_str());
+    }
   }
 
   SetCurrentTuning(saved);

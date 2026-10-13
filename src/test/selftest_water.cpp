@@ -127,6 +127,11 @@ struct VoxelTruth {
   uint32_t topCells = 0;
   int topMinE = 0;
   int topMaxE = 0;
+  // WHERE the extremes are (rule 6): the first column at the lowest and at
+  // the highest top, and how many columns sit at each eighth below the top.
+  int topMinAt[3] = {0, 0, 0};
+  int topMaxAt[3] = {0, 0, 0};
+  std::vector<uint32_t> topBelowMax;  // [k] = columns whose top is k eighths under topMaxE
   uint32_t chunks = 0;       // chunks actually read
 };
 
@@ -234,6 +239,8 @@ VoxelTruth SweepBasin(Ctx& c, const WaterBasin& b, const WaterBodyDesc& d,
         if (at(x, y + 1, z) != 0) break;   // our own liquid above: not a surface
         t.topCells++;
         const int e8 = y * 8 + (int)e;
+        if (e8 < t.topMinE) { t.topMinAt[0] = x; t.topMinAt[1] = y; t.topMinAt[2] = z; }
+        if (e8 > t.topMaxE) { t.topMaxAt[0] = x; t.topMaxAt[1] = y; t.topMaxAt[2] = z; }
         t.topMinE = std::min(t.topMinE, e8);
         t.topMaxE = std::max(t.topMaxE, e8);
         break;
@@ -245,6 +252,19 @@ VoxelTruth SweepBasin(Ctx& c, const WaterBasin& b, const WaterBodyDesc& d,
     t.surfaceMinE = 0; t.surfaceMaxE = 0;
   }
   if (t.topCells == 0) { t.topMinE = 0; t.topMaxE = 0; }
+  if (t.topCells > 0) {
+    t.topBelowMax.assign((size_t)std::min(t.topMaxE - t.topMinE, 63) + 1, 0u);
+    for (int z = d.lo.z; z <= d.hi.z; z++)
+      for (int x = d.lo.x; x <= d.hi.x; x++)
+        for (int y = y1; y >= yTopLo; y--) {
+          const uint8_t e = at(x, y, z);
+          if (e == 0) continue;
+          if (at(x, y + 1, z) != 0) break;
+          const int k = std::min(t.topMaxE - (y * 8 + (int)e), 63);
+          t.topBelowMax[(size_t)k]++;
+          break;
+        }
+  }
   t.read = true;
   return t;
 }
@@ -2298,11 +2318,39 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
           for (int z = nz - nCraterHalf; z <= nz + nCraterHalf; z++)
             for (int x = nx - nCraterHalf; x <= nx + nCraterHalf; x++)
               crater.push_back({World::SlotCellIndex({x, y, z}), 0u});
+        // ATTRIBUTION (rule 6): does the crater land in a chunk LAST tick's
+        // labelling gives a body (support.cpp's mutation latch arms only
+        // those), and did the relevel run on this body afterwards.
+        uint32_t craterLabelled = 0;
+        {
+          const std::vector<uint32_t>& lbl = WaterBodies().ChunkBody();
+          for (const CellOp& o : crater) {
+            const uint32_t s = o.cellIdx / kChunkVol;
+            craterLabelled += lbl.size() == kNumSlots && s < kNumSlots && lbl[s] != 0;
+          }
+        }
+        const LedgerView rv0 = ReadLedger(c);
         SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, {}, {}, crater,
                    false, c.world.WindowOrigin(), true, false);
         c.ctx.ProcessEvents();
         tick++;
+        const bool armedAfterCrater = WaterBodies().Gpu().writesThisTick;
         tick = RunQuietTicks(c, tick, nRelevelTicks);
+        const LedgerView rv1 = ReadLedger(c);
+        uint32_t ownChunks = 0;
+        for (uint32_t e : WaterBodies().Gpu().chunks) ownChunks += (e >> 16) == nSlot;
+        const std::string rvWhy = Format(
+            "GPU chunk list %zu entries (cap %u), %u of them slot %u's, %u bodies; "
+            "relevel count %d; ",
+            WaterBodies().Gpu().chunks.size(), kWaterChunkCap, ownChunks, nSlot,
+            WaterBodies().Gpu().bodyCount, rv1.At(nSlot, WBS_RVCOUNT_W)) + Format(
+            "crater cells in labelled chunks %u/%zu, footprint armed after the crater %s, "
+            "at the end %s; slot %u relevel given/taken %d/%d -> %d/%d, credit %d, capped %d",
+            craterLabelled, crater.size(), armedAfterCrater ? "yes" : "NO",
+            WaterBodies().Gpu().writesThisTick ? "yes" : "no", nSlot,
+            rv0.At(nSlot, WBS_RVGIVENT_W), rv0.At(nSlot, WBS_RVTAKENT_W),
+            rv1.At(nSlot, WBS_RVGIVENT_W), rv1.At(nSlot, WBS_RVTAKENT_W),
+            rv1.At(nSlot, WBS_RVCREDIT_W), rv1.At(nSlot, WBS_RVCAPPED_W));
         const VoxelTruth nv = SweepBasin(c, pbCopy, pdCopy, matId,
                                          nWaterBot - nCraterDepth, gyMax);
         uint32_t pf1[4] = {0, 0, 0, 0};
@@ -2321,6 +2369,23 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
                 "the owner's actual ask",
                 (long long)nSpread, nRelevelTicks, nCraterHalf * 2 + 1,
                 nCraterHalf * 2 + 1, nCraterDepth, nSpreadMax));
+          if ((double)nSpread > nSpreadMax) {
+            // WHERE (rule 6): the two extreme columns against the pit and
+            // the crater, and how many columns sit at each eighth under the
+            // top -- one stray column is not a sloped surface.
+            std::string hist;
+            for (size_t k = 0; k < nv.topBelowMax.size(); k++)
+              if (nv.topBelowMax[k]) hist += Format(" -%zu:%u", k, nv.topBelowMax[k]);
+            fail(Format("pass N arm 2 WHERE: top max %d at (%d,%d,%d), min %d at (%d,%d,%d); "
+                        "pit x%d..%d z%d..%d (crater x%d..%d z%d..%d y%d..%d); %u top "
+                        "columns by eighths under the top:%s; %s",
+                        nv.topMaxE, nv.topMaxAt[0], nv.topMaxAt[1], nv.topMaxAt[2],
+                        nv.topMinE, nv.topMinAt[0], nv.topMinAt[1], nv.topMinAt[2],
+                        nx - nHalf, nx + nHalf, nz - nHalf, nz + nHalf, nx - nCraterHalf,
+                        nx + nCraterHalf, nz - nCraterHalf, nz + nCraterHalf,
+                        nWaterBot - nCraterDepth, nWaterBot - 1, nv.topCells, hist.c_str(),
+                        rvWhy.c_str()));
+          }
         }
         if (nPf != 0)
           fail(Format("pass N arm 2: %u page faults (lost word 0x%08x) — a "

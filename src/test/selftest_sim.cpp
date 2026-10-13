@@ -17,6 +17,7 @@
 
 #include "game/prefab.h"
 #include "gpu/resources.h"
+#include "test/census.h"
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -1076,6 +1077,14 @@ bool evapOk = false;
   // because `needsSky` is false 200 voxels down, not as a buried fixture.
   const int py = FixtureYOver(px - R - 1, pz - R - 1,
                               dx + kDrops * 3, pz + R + 1, kDefaultSeed, 8);
+  // THE CLIMATE IS PINNED MILD (base 12, the heat gates' Simulation::
+  // SetHeatColumnPins). Since the temperature layer (2026-10-02) the ambient
+  // at y >= the column's snowline (its treeline - 1, ~y227 here) is the
+  // snowline's -20: this fixture stands at y228 over harness ground ~y220, so
+  // its pond SKINNED OVER (measured: surface layer ice 240, snow 30, water 10)
+  // and "10/289 water" read as evaporation eating a pond. Freezing is the
+  // heat gates' subject; this one is the sun's.
+  c.sim.SetHeatColumnPins({{px - R - 2, pz - R - 2, dx + kDrops * 3 + 1, pz + R + 2, 12, 0}});
   std::vector<CellOp> scene;
   auto put = [&](int x, int y, int z, int m) {
     uint32_t state = (m == wi) ? 7u : 0u;  // liquids are born full
@@ -1131,9 +1140,23 @@ bool evapOk = false;
     if (readCell(dx + i * 3, py, pz) == (uint32_t)wi) dropsLeft++;
 
   evapOk = surfWater == surfN && dropsLeft == 0;
+  std::string why;
+  if (!evapOk) {
+    // WHERE the pond went (rule 6): each layer of the pond box by name, and
+    // the ground the fixture was placed over.
+    auto at = [&](int x, int y, int z) { return vox[World::SlotCellIndex({x, y, z})]; };
+    for (int y = py - 1; y <= py + kDepth + 1; y++)
+      why += Format(" | y%d: %s", y,
+                    MatCensus(mats, at, px - R, y, pz - R, px + R, y, pz + R).c_str());
+    why += Format(" | fixture y %d over TerrainHeight %d, biome %u, snowline y%d",
+                  py, World::TerrainHeight(px, pz, kDefaultSeed),
+                  World::MapBiomeAt(px, pz, kDefaultSeed),
+                  (int)HeatSnowlineYAt(px, pz, kDefaultSeed));
+  }
   std::printf("evaporation: %s (pond surface %u/%u water after 2500 noon "
-              "ticks, %u/%d isolated droplets left)\n",
-              evapOk ? "PASS" : "FAIL", surfWater, surfN, dropsLeft, kDrops);
+              "ticks, %u/%d isolated droplets left)%s\n",
+              evapOk ? "PASS" : "FAIL", surfWater, surfN, dropsLeft, kDrops, why.c_str());
+  c.sim.SetHeatColumnPins({});
   SetCurrentTuning(saved);
 }
 
@@ -4329,14 +4352,29 @@ Status GateRainFire(Ctx& c, std::string& detail) {
     return Status::Fail;
   }
   const std::string prevPin = weather::Override();
+  // THE WIND IS PINNED CALM, as rain-stain's is. Since the weather drives the
+  // wind and its ramp reads height above the ground (2026-09-30), the sheet
+  // -- 24 over the footprint's highest ground -- stands in a real breeze
+  // under every sky, and a fire leans downwind: measured 2026-10-12, the
+  // clear arm burnt the -x half of the sheet (blocks 18-25 of 25) and left
+  // the +x half at 0-1, 36% overall. Which way the air carries a fire is the
+  // wind gates' claim; this one's is what the rain does to it.
+  const Tuning savedTune = CurrentTuning();
+  {
+    Tuning t = savedTune;
+    t.wind.weatherAuto = false;
+    t.wind.windSpeed = 0.0f;
+    SetCurrentTuning(t);
+  }
   const Tuning& tun = CurrentTuning();
 
-  const int W = 25, R = W / 2, cx = 200, cz = 200;
+  const int W = 25, R = W / 2;
+  int cx = 200, cz = 200;
   const uint32_t kTicks = (uint32_t)BaselineNumber("rainFireTicks", 400.0);
 
-  struct Arm { const char* sky; uint32_t word; uint32_t burnt; };
-  Arm arms[3] = {{"clear", 0, 0}, {"drizzle", 0, 0}, {"storm", 0, 0}};
-  for (Arm& a : arms) {
+  struct Arm { const char* sky; uint32_t word; uint32_t burnt; std::string why; };
+  Arm arms[3] = {{"clear", 0, 0, {}}, {"drizzle", 0, 0, {}}, {"storm", 0, 0, {}}};
+  auto runArm = [&](Arm& a) {
     weather::SetOverride(a.sky);
     a.word = weather::SimRainWord(tun, kDefaultSeed, 1);
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
@@ -4353,9 +4391,31 @@ Status GateRainFire(Ctx& c, std::string& detail) {
     uint32_t t = 1;
     SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, scene, false,
                {12, 12, 12}, false, false);
-    for (uint32_t i = 2; i <= kTicks; i++)
+    std::string trace;
+    for (uint32_t i = 2; i <= kTicks; i++) {
       SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
                  {12, 12, 12}, false, false);
+      if (i % 50 == 0) {
+        // The front over time (rule 6): leaves gone and cells burning now.
+        ctx.WaitIdle();
+        std::map<uint32_t, std::vector<uint32_t>> cache;
+        uint32_t gone = 0, lit = 0;
+        for (int z = -R; z <= R; z++)
+          for (int x = -R; x <= R; x++) {
+            const uint32_t ci = World::SlotCellIndex({cx + x, y, cz + z});
+            auto it = cache.find(ci / kChunkVol);
+            if (it == cache.end()) {
+              std::vector<uint32_t> v((size_t)kChunkVol);
+              ReadVoxelsSync(ctx, world, ci / kChunkVol, 1, v.data(), "rainFireTrace");
+              it = cache.emplace(ci / kChunkVol, std::move(v)).first;
+            }
+            const uint32_t m = it->second[ci % kChunkVol] & 0xFFFu;
+            gone += m != mLeaf;
+            lit += m != mLeaf && m != 0;
+          }
+        trace += Format(" t%u:%u/%u", i, gone, lit);
+      }
+    }
     ctx.WaitIdle();
     std::vector<uint32_t> vox(kNumSlots * (size_t)kChunkVol);
     ReadVoxelsSync(ctx, world, 0, kNumSlots, vox.data(), "rainFireRead");
@@ -4363,9 +4423,51 @@ Status GateRainFire(Ctx& c, std::string& detail) {
       for (int x = -R; x <= R; x++)
         if ((vox[World::SlotCellIndex({cx + x, y, cz + z})] & 0xFFFu) != mLeaf)
           a.burnt++;
+    // WHAT the sheet and the air over it hold (rule 6), and where it stands.
+    auto at = [&](int x, int yy, int z) { return vox[World::SlotCellIndex({x, yy, z})]; };
+    a.why = Format("sheet y%d (ground %d, biome %u, snowline y%d): %s | above: %s | below: %s",
+                   y, World::TerrainHeight(cx, cz, kDefaultSeed),
+                   World::MapBiomeAt(cx, cz, kDefaultSeed),
+                   (int)HeatSnowlineYAt(cx, cz, kDefaultSeed),
+                   MatCensus(c.mats, at, cx - R, y, cz - R, cx + R, y, cz + R).c_str(),
+                   MatCensus(c.mats, at, cx - R, y + 1, cz - R, cx + R, y + 1, cz + R).c_str(),
+                   MatCensus(c.mats, at, cx - R, y - 1, cz - R, cx + R, y - 1, cz + R).c_str());
+    // The burn's SHAPE: burnt cells per 5x5 block, rows -z to +z, columns -x
+    // to +x. A ring says the front stalled evenly, a lopsided map says the
+    // air moved it.
+    a.why += " | gone/burning over time" + trace;
+    a.why += " | burnt per 5x5 block (rows -z..+z):";
+    for (int bz = 0; bz < 5; bz++) {
+      a.why += " [";
+      for (int bx = 0; bx < 5; bx++) {
+        int n = 0;
+        for (int z = 0; z < 5; z++)
+          for (int x = 0; x < 5; x++)
+            n += (at(cx - R + bx * 5 + x, y, cz - R + bz * 5 + z) & 0xFFFu) != mLeaf;
+        a.why += Format(bx ? " %2d" : "%2d", n);
+      }
+      a.why += "]";
+    }
+  };
+  for (Arm& a : arms) runArm(a);
+  // SANDVOX_RAINFIRE_DIAG=1: the clear arm again at other sites, printed --
+  // is a lopsided burn a property of the site or of the rule?
+  if (std::getenv("SANDVOX_RAINFIRE_DIAG")) {
+    const int sites[][2] = {{300, 200}, {200, 300}, {120, 120}, {320, 320}};
+    for (const auto& s : sites) {
+      cx = s[0];
+      cz = s[1];
+      Arm d{"clear", 0, 0, {}};
+      runArm(d);
+      std::printf("rain-fire DIAG clear at (%d,%d): %.0f%% | %s\n", cx, cz,
+                  100.0 * d.burnt / (double)(W * W), d.why.c_str());
+    }
+    cx = 200;
+    cz = 200;
   }
   weather::SetOverride(prevPin);
   weather::Snap();
+  SetCurrentTuning(savedTune);
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
 
@@ -4395,7 +4497,8 @@ Status GateRainFire(Ctx& c, std::string& detail) {
                 wet(clr.word), rain(drz.word), wet(drz.word), rain(stm.word),
                 wet(stm.word), wordOk ? "" : " (WORD WRONG)");
   detail = buf;
-  std::printf("rain-fire: %s\n", buf);
+  if (!lit) detail += " | clear arm " + clr.why;
+  std::printf("rain-fire: %s\n", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -6604,6 +6707,14 @@ Status GateRainStain(Ctx& c, std::string& detail) {
   const int y = FixtureYOver(x0 - 4, z0 - 4, x0 + L + 4, z0 + zSpan + 4,
                              kDefaultSeed, 24);
   auto stripZ = [&](int a) { return z0 + a * kPitch + 1; };
+  // THE CLIMATE IS PINNED MILD, as evaporation's: the slab stands 24 over the
+  // harness ground, at or above the column's snowline (treeline - 1), and
+  // frozen ground takes no stain (sim_step.wgsl heatGroundFrozen in
+  // doStaining) -- the oil sat on the blood for the whole arm and wrote
+  // nothing. Frozen ground refusing a stain is the heat layer's rule; this
+  // gate is about which stain wins.
+  const int snowAtSlab = HeatSnowlineYAt(x0 + L / 2, z0 + zSpan / 2, kDefaultSeed);
+  c.sim.SetHeatColumnPins({{x0 - 5, z0 - 5, x0 + L + 5, z0 + zSpan + 5, 12, 0}});
   // One word per cell, decided once (the lower op index wins a cell).
   std::map<std::tuple<int, int, int>, uint32_t> cells;
   for (int x = x0 - 4; x <= x0 + L + 3; x++)
@@ -6684,6 +6795,14 @@ Status GateRainStain(Ctx& c, std::string& detail) {
   run(kOilTicks, scene);
   readFixture("rainStainOil");
   const Strip oiled = strip(kOilOver);
+  // WHERE the oil is (rule 6): the strip's ground, the two cells over it,
+  // and its first ground word.
+  const std::string oilWhy = Format(
+      "slab y%d, column snowline y%d (pinned mild) | oil strip ground: %s | y+1: %s | y+2: %s | first ground word %08x, over it %08x",
+      y, snowAtSlab, MatCensus(c.mats, at, x0, y, stripZ(kOilOver), x0 + L - 1, y, stripZ(kOilOver)).c_str(),
+      MatCensus(c.mats, at, x0, y + 1, stripZ(kOilOver), x0 + L - 1, y + 1, stripZ(kOilOver)).c_str(),
+      MatCensus(c.mats, at, x0, y + 2, stripZ(kOilOver), x0 + L - 1, y + 2, stripZ(kOilOver)).c_str(),
+      at(x0, y, stripZ(kOilOver)), at(x0, y + 1, stripZ(kOilOver)));
   // 2. Lift what is left of the oil off, then a storm.
   std::vector<CellOp> lift;
   for (int x = x0; x < x0 + L; x++)
@@ -6713,6 +6832,7 @@ Status GateRainStain(Ctx& c, std::string& detail) {
   weather::SetOverride(prevPin);
   weather::Snap();
   SetCurrentTuning(savedTune);
+  c.sim.SetHeatColumnPins({});
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
 
@@ -6747,7 +6867,8 @@ Status GateRainStain(Ctx& c, std::string& detail) {
       fmt(dry[kRoofed]).c_str(), dries ? "ok" : "FAIL", peak, left, kDryTicks,
       dryMaxFrac, sleeps ? "ok" : "FAIL", awake, chunkBuf.size());
   detail = buf;
-  std::printf("rain-stain: %s\n", buf);
+  if (!oilOk) detail += " | " + oilWhy;
+  std::printf("rain-stain: %s\n", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
