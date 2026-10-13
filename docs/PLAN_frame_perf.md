@@ -305,6 +305,18 @@ are the OTHER half of this frame; they are not additive with `nomicro`.
    118, snapshot stall max 81). Deferred wake + one shift per frame landed;
    the next lever is the mirror's N26 dilation (dirty 43% + ring 15% of the
    pool at flight peak), then the 16 KiB upload per revisited slot.
+   **Re-attributed 2026-10-13 — those numbers are stale and the tail is not
+   streaming CPU any more.** `--perf --scenario surface-sprint` n=3 (main
+   5805949, exclusive): frame p50 13.0-13.3 / p95 19.6-20.8 ms, 0 frames
+   over 33 ms, stream CPU p95 1.8-2.4 / max 5.7-6.4 ms, 0 wake-wait misses
+   in 1,394 shifts. The flight that still hitched was the 12-10-09 ticket's
+   (far field driven): its slow frames were far-sieve ticks, and the far
+   passes' biggest cost was launching workgroups that returned at once --
+   fixed (DESIGN.md "The far passes launch only the workgroups that work"):
+   frames over 33 ms 16.5-17.1% -> 9.9-11.3%, n=3. Left on that flight:
+   the 32 map columns of a plane's first slice (`farMapFill` p99 12-13 ms)
+   and window shifts at ~5 ms CPU each, ~3.3 of it eviction (not yet split
+   between the voxel and the solute layer's batches).
 6. **Unbilled CPU frame-path work** — player collision runs a
    `std::function` per cell (~600 cells x dozens of calls per frame, fluid
    mirror evaluated before the kind lookup); avatar `FindClip` is a linear

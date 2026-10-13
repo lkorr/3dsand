@@ -7274,6 +7274,11 @@ var<workgroup> wgFarWords : array<atomic<u32>, FAR_SWEEP_OWNERS * CHUNK>;
 // corner-max `btop` is taken only by the entry holding that row. So every
 // genCellIn call sees the arguments it saw before and every byte is the one
 // the per-entry sweep wrote (the far-* gates and `far-downsample` hold it).
+// The farList TAIL HEADER (FarField::PrepareTick): word 0 = the tick's
+// surface-map entry count, which sits between the list and the run heads.
+// 3 x world.h kFarListCap (4096): list, map entries, run heads; the C++ side
+// static_asserts the cap it was written for.
+const FAR_LIST_TAIL_HDR : u32 = 3u * 4096u;
 fn farSameColumn(a : u32, b : u32) -> bool {
   let la = (a & ~FAR_LIST_MAP_BIT) >> FAR_SLOT_SHIFT;
   let lb = (b & ~FAR_LIST_MAP_BIT) >> FAR_SLOT_SHIFT;
@@ -7285,12 +7290,19 @@ fn farSameColumn(a : u32, b : u32) -> bool {
 @compute @workgroup_size(256)
 fn far(@builtin(workgroup_id) wg : vec3<u32>,
        @builtin(local_invocation_index) li : u32) {
-  if (wg.x >= T.farCount) { return; }
   // ---- the run this workgroup fills (THE COLUMN STACK above) ----
-  let head = farList[wg.x];
-  if (wg.x > 0u && farSameColumn(farList[wg.x - 1u], head)) { return; }
+  // ONE WORKGROUP PER RUN (2026-10-13): FarField::PrepareTick lists each
+  // run's first index after the map entries (farList[farCount + mapCount +
+  // i], mapCount in the tail header) and the extent is their count, so the
+  // other 31 entries of a column no longer launch a 256-thread workgroup of
+  // this kernel only to return. The head test stays as the guard: an index
+  // that is not a run's first returns exactly as before.
+  let hi = farList[T.farCount + farList[FAR_LIST_TAIL_HDR] + wg.x];
+  if (hi >= T.farCount) { return; }
+  let head = farList[hi];
+  if (hi > 0u && farSameColumn(farList[hi - 1u], head)) { return; }
   var nRun = 1u;
-  while (wg.x + nRun < T.farCount && farSameColumn(farList[wg.x + nRun], head)) { nRun += 1u; }
+  while (hi + nRun < T.farCount && farSameColumn(farList[hi + nRun], head)) { nRun += 1u; }
 
   // Bit 31 is the surface-map fill flag (`farmap`), not part of the level.
   let level = ((head & ~FAR_LIST_MAP_BIT) >> FAR_SLOT_SHIFT) + 1u;   // 1-based
@@ -7305,7 +7317,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   var hx = 0;
   var hz = 0;
   for (var e = 0u; e < nRun; e++) {
-    let s = farList[wg.x + e] & FAR_SLOT_MASK;
+    let s = farList[hi + e] & FAR_SLOT_MASK;
     let sc = vec3<i32>(vec3<u32>(s % FAR_NCHUNK, (s / FAR_NCHUNK) % FAR_NCHUNK,
                                  s / (FAR_NCHUNK * FAR_NCHUNK)));
     let bc = farSlotToChunk(sc, origin) * i32(CHUNK);
@@ -7437,7 +7449,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
       atomicStore(&wgFarWords[i], 0u);
     }
     workgroupBarrier();
-    let slot = farList[wg.x + e] & FAR_SLOT_MASK;
+    let slot = farList[hi + e] & FAR_SLOT_MASK;
     let sc = vec3<i32>(vec3<u32>(slot % FAR_NCHUNK, (slot / FAR_NCHUNK) % FAR_NCHUNK,
                                  slot / (FAR_NCHUNK * FAR_NCHUNK)));
     // base LEVEL-cell coord of this level chunk (origins are level-chunk units)
@@ -8139,8 +8151,11 @@ fn farFeatFill(col : ptr<function, Col>, ponds : ptr<function, PondSet>, cover :
 fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
           @builtin(num_workgroups) nwg : vec3<u32>,
           @builtin(local_invocation_index) li : u32) {
-  if (wg.x >= T.farCount) { return; }
-  let packed = farList[wg.x];
+  // The tick's MAP ENTRIES, which FarField::PrepareTick copies after the list
+  // (farList[farCount + i]); the dispatch extent is their count
+  // (pass_table.def farMapFill), so every workgroup here has a column to
+  // fill. The bit test stays as the guard it always was.
+  let packed = farList[T.farCount + wg.x];
   if ((packed & FAR_LIST_MAP_BIT) == 0u) { return; }
   let level = ((packed & ~FAR_LIST_MAP_BIT) >> FAR_SLOT_SHIFT) + 1u;   // 1-based
   let slot = packed & FAR_SLOT_MASK;

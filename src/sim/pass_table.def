@@ -1649,8 +1649,9 @@ PASS(ho_solHash, "occupancyFull(hashOnly)", PT_HASHONLY, PIPE_SOL_HASH, K_COMPUT
 // TWO ROWS, ONE DISPATCH SHAPE (docs/PLAN_shader_compile.md package C item 1).
 // worldgen.wgsl's `far` was split into the pristine SWEEP and the edit-PATCH
 // loop, because the driver's compile cost is superlinear in entry-point size
-// and the two halves compile in parallel. They are recorded back to back over
-// the same D_FARCOUNT extent, so `wg.x` still indexes farPatch's header pairs.
+// and the two halves compile in parallel. They are recorded back to back; the
+// patch keeps the D_FARCOUNT extent, so its `wg.x` still indexes farPatch's
+// header pairs (the sweep's extent is the column runs since 2026-10-13).
 //
 // THE EDGE BETWEEN THEM IS LOAD-BEARING and is the whole reason the split is
 // safe: the sweep's whole-word atomicStores into farVox must land before the
@@ -1658,7 +1659,12 @@ PASS(ho_solHash, "occupancyFull(hashOnly)", PT_HASHONLY, PIPE_SOL_HASH, K_COMPUT
 // farOcc update reads the word the sweep just wrote. Inside the merged entry
 // that was a hand-written storageBarrier; here both rows declare A(FarVox)
 // A(FarOcc) and the recorder generates it (barrier_graph §3.8).
-PASS(farFill, "farFill", PT_FARFILL, PIPE_FAR_FILL, K_COMPUTE, D_FARCOUNT,1,1,
+// ONE WORKGROUP PER COLUMN RUN (2026-10-13): the sweep fills a whole run of a
+// level-chunk column's entries from the run's first workgroup (THE COLUMN
+// STACK), so its extent is the runs' first indices (FarField::PrepareTick's
+// tail, D_FARHEADCOUNT), not every entry. farPatchFill keeps D_FARCOUNT and
+// its wg.x indexing of the header pairs.
+PASS(farFill, "farFill", PT_FARFILL, PIPE_FAR_FILL, K_COMPUTE, D_FARHEADCOUNT,1,1,
      GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
      USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO)
           A(FarVox) A(FarOcc) R(TreeAtlas) R(WorldMap)))
@@ -1688,10 +1694,16 @@ PASS(farCoverFill, "farCoverFill", PT_FARFILL, PIPE_FAR_COVER_FILL, K_COMPUTE, D
 // sub-columns of genColumn work and an X/Z plane has only 32 of them, so one
 // workgroup each left the GPU nearly idle for 27-33 ms a plane while 64
 // threads ground through sixteen columns apiece (worldgen.wgsl `farmap` has
-// the measurement). wg.y splits the column; entries without the map bit
-// return on their first load, all sixteen of them.
-PASS(farMapFill, "farMapFill", PT_FARFILL, PIPE_FAR_MAP_FILL, K_COMPUTE, D_FARCOUNT,16,1,
-     GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
+// the measurement). wg.y splits the column.
+// ONLY THE MAP ENTRIES (2026-10-13): the extent used to be the whole list
+// (D_FARCOUNT x 16) with every non-map entry returning on its first load --
+// 16,384 workgroups of a 128-register, spilling kernel on a 1,024-entry tick,
+// which cost ~3.1 ms of GPU on a far tick with NO map entry at all
+// (SANDVOX_GPU_TIMER_SERIAL=1 --perf --scenario peaks-route, 969 frames).
+// FarField::PrepareTick appends the tick's map entries after the list
+// (farList[farCount + i]) and the extent is their count.
+PASS(farMapFill, "farMapFill", PT_FARFILL, PIPE_FAR_MAP_FILL, K_COMPUTE, D_FARMAPCOUNT,16,1,
+     GRP_SLIM_FAR, DYN_NONE, C_FARMAPCOUNT, 1,
      USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO) A(FarMap)
           A(FarVox) A(FarOcc) R(TreeAtlas) R(WorldMap)))
 // R(FarPatch) lives on THIS row now, not on the sweep: the sweep no longer

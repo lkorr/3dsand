@@ -241,10 +241,13 @@ bool fogOk = false;
       }
       return h;
     };
-    // farVox only: farOcc is not created CopySrc (world.cpp).
-    std::printf("far digest: farVox %016llx\n",
+    // farVox and the surface map + feature plane (farMap, the `farmap`
+    // entry's output); farOcc is not created CopySrc (world.cpp).
+    std::printf("far digest: farVox %016llx farMap %016llx\n",
                 (unsigned long long)digest(world.farVox,
-                                           (uint64_t)kFarLevels * kFarVox));
+                                           (uint64_t)kFarLevels * kFarVox),
+                (unsigned long long)digest(world.farMap,
+                                           (kFarMapWords + kFarFeatWords) * 4ull));
   }
   // cold start: level 1 still pending -> only the residency window is trusted.
   // Both bounds come from world.h's cascade helpers rather than restating the

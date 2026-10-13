@@ -624,6 +624,7 @@ enum class Cond : uint8_t {
   DirtyTick,  // !hashEnable
   GenCount,   // EncodeGenList count > 0
   FarCount,   // EncodeFarFill count > 0
+  FarMapCount,  // EncodeFarFill's surface-map entries > 0 (the `farmap` row)
   // Whole-world worldgen: the D_CHUNKS dispatch that writes all 32,768 slots.
   // Suppressed under --residency paged, where worldgen runs BATCHED through
   // worldgenList instead (PLAN_page_table.md §3.5c): a kernel cannot allocate,
@@ -823,6 +824,8 @@ enum class DispatchSel : uint32_t {
   GenCount,   // EncodeGenList count
   GenColCount,  // chunk-columns of the gen list (Simulation::WriteGenList)
   FarCount,   // EncodeFarFill count
+  FarMapCount,  // the surface-map entries appended after the list (FarField::ListMapCount)
+  FarHeadCount, // the column runs' first entries after those (FarField::ListHeadCount)
   IndDispatchArgs,   // indirect: world.dispatchArgs @ 0
   IndPDispatchArgs,  // indirect: world.pDispatchArgs @ 0
   // ---- MLS-MPM fluid ----
@@ -974,6 +977,8 @@ struct RecordCtx {
   uint32_t genCount = 0;
   uint32_t genColCount = 0;     // chunk-columns of the list: the `cols` pre-pass extent
   uint32_t farCount = 0;
+  uint32_t farMapCount = 0;     // farList tail: the map entries `farmap` walks
+  uint32_t farHeadCount = 0;    // farList tail: the run heads `far` fills from
   uint32_t fluidCount = 0;       // MLS-MPM particles alive AFTER this tick's spawns
   uint32_t fluidSpawnCount = 0;  // MLS-MPM spawn ops this tick
   // Chunk slots this tick's wind primitives want dirty-marked

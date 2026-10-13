@@ -67,6 +67,15 @@ class FarField {
   // which is what "the horizon has not been built yet" is supposed to look
   // like.
   uint32_t PrepareTick(const rhi::Queue& queue, bool drain = true);
+  // The surface-map entries the LAST PrepareTick (of any FarField: there is
+  // one farList buffer) wrote after its list, at farList[count + i]: the
+  // `farmap` row's dispatch extent (Simulation::EncodeFarFill). A property of
+  // the buffer's contents, which is why it is not per instance.
+  static uint32_t ListMapCount() { return listMapCount_; }
+  // ...and the run heads after them: the sweep's (`far`) dispatch extent.
+  static uint32_t ListHeadCount() { return listHeadCount_; }
+  // The tail header's word index in farList (worldgen.wgsl FAR_LIST_TAIL_HDR).
+  static constexpr uint32_t kFarListTailHdr = 3 * kFarListCap;
 
   // Entries a RESET may pop per tick (see bulkCap_). Defaults to kFarListCap,
   // which is what the headless drain loops want; the game lowers it.
@@ -151,6 +160,10 @@ class FarField {
   // Surface-map COLUMNS dispatched (entries carrying kFarListMapBit): the
   // `farmap` pass's whole workload, which is per column and not per entry.
   uint64_t MapColsIssued() const { return mapCols_; }
+  // ...per level (0-based): what lets a harness bill farMapFill per level.
+  uint64_t MapColsIssuedAt(uint32_t k) const {
+    return k < kFarLevels ? mapColsLevel_[k] : 0u;
+  }
   // The largest origin gap Update has had to close, in level chunks, and the
   // level it happened on. kFarNChunk is where a step becomes a reset.
   uint32_t WorstGap() const { return worstGap_; }
@@ -414,6 +427,10 @@ class FarField {
   uint64_t resets_ = 0, gapResets_ = 0, planes_ = 0, refills_ = 0;
   uint64_t coalesced_ = 0;
   uint64_t mapCols_ = 0;
+  static inline uint32_t listMapCount_ = 0;
+  static inline uint32_t listHeadCount_ = 0;
+  std::vector<uint32_t> listOut_;   // list_ then its map entries, one upload
+  uint64_t mapColsLevel_[kFarLevels] = {};
   uint64_t reversalDrops_ = 0, edgeDedupes_ = 0;
   uint32_t worstGap_ = 0, worstGapLevel_ = 0;
   uint32_t planeCap_ = kPlayFillCap;

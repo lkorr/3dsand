@@ -463,7 +463,13 @@ void World::Init(const rhi::Device& device) {
   farOcc = CreateBuffer(device,
                         ((uint64_t)kFarLevels * kFarNumChunks + kFarSkyTopWords) * 4,
                         U::Storage, "farOcc");
-  farList = CreateBuffer(device, kFarListCap * 4, U::Storage | U::CopyDst, "farList");
+  // THREE kFarListCap and a header: the tick's list, its surface-map entries
+  // copied again after it (what `farmap` dispatches over), then the index of
+  // each column run's first entry (what `far` dispatches over) -- each at
+  // most one per listed entry -- and the tail header at 3 x kFarListCap
+  // (FarField::PrepareTick, kFarListTailHdr).
+  farList = CreateBuffer(device, (3ull * kFarListCap + 4) * 4, U::Storage | U::CopyDst,
+                         "farList");
   farUBO = CreateBuffer(device, sizeof(FarParams), U::Uniform | U::CopyDst, "farUBO");
   // Edit patches for the cascade fill. The header half is rewritten by every
   // PrepareTick that dispatches fills (2 u32 per entry, <= 32 KiB), so the

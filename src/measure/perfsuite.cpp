@@ -4,6 +4,7 @@
 #include "measure/perfsuite.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cinttypes>
 #include <climits>
@@ -1523,6 +1524,12 @@ struct Run {
   bool skipped = false;
   std::string skipWhy;
   std::vector<PerfSample> samples;
+  // FARMAPFILL BY LEVEL (2026-10-13, rule 6): parallel to `samples`, the
+  // surface-map columns each frame dispatched per far level and the GPU time
+  // of its farMapFill / farFill passes, so a scenario that drives the far
+  // field can bill the pass per level instead of as one bare number.
+  std::vector<std::array<uint32_t, kFarLevels>> mapColsLvl;
+  std::vector<double> farMapMs, farFillMs;
   // Per-pass totals, kept beside the node rollup so the page can drill from
   // "fluidSys cost 3 ms" to "of which seam_settle_scan was 2.1".
   std::vector<PassTimer::Stat> passStats;
@@ -1805,6 +1812,7 @@ Run PerfRunner::Record(const Scenario& scIn) {
     // game's own arithmetic, so a frame that ran 90 ms owes three ticks and the
     // GPU work of three ticks lands inside the next one.
     uint32_t ticksThisFrame = 1;
+    std::array<uint32_t, kFarLevels> frameMapLvl{};
     if (sc.paced) {
       const double nowT = NowSeconds();
       // FIFO QUANTISES, it does not merely floor — and the difference is the
@@ -1890,7 +1898,13 @@ Run PerfRunner::Record(const Scenario& scIn) {
         s.far->SetPlaneCap((uint32_t)CurrentTuning().render.farPlaneFillRate);
         s.far->Update(playerChunk);
         s.farPendingMax = std::max(s.farPendingMax, s.far->PendingFills());
-        farCount = s.far->PrepareTick(ctx_.queue);
+        {
+          uint64_t c0[kFarLevels];
+          for (uint32_t k = 0; k < kFarLevels; k++) c0[k] = s.far->MapColsIssuedAt(k);
+          farCount = s.far->PrepareTick(ctx_.queue);
+          for (uint32_t k = 0; k < kFarLevels; k++)
+            frameMapLvl[k] += (uint32_t)(s.far->MapColsIssuedAt(k) - c0[k]);
+        }
         if (farCount) {
           s.farEntries += farCount;
           s.farTicks++;
@@ -2050,6 +2064,9 @@ Run PerfRunner::Record(const Scenario& scIn) {
       smp.wallMs = (NowSeconds() - frameT0) * 1000.0;
       frameToSample_[i] = (int)r.samples.size();
       r.samples.push_back(smp);
+      r.mapColsLvl.push_back(frameMapLvl);
+      r.farMapMs.push_back(0.0);
+      r.farFillMs.push_back(0.0);
     }
 
     // Harvest whatever GPU timings have landed and post them to their own rows.
@@ -2075,6 +2092,10 @@ Run PerfRunner::Record(const Scenario& scIn) {
         }
         dst.gpuMs[node] += (double)ps.ns / 1e6;
         dst.gpuValid = true;
+        if ((size_t)si < r.farMapMs.size()) {
+          if (ps.name && std::strcmp(ps.name, "farMapFill") == 0) r.farMapMs[(size_t)si] += (double)ps.ns / 1e6;
+          else if (ps.name && std::strcmp(ps.name, "farFill") == 0) r.farFillMs[(size_t)si] += (double)ps.ns / 1e6;
+        }
       }
     };
     // THE COLLECTOR FORM, not LastFrame(). A paced frame submits up to four
@@ -2161,6 +2182,39 @@ Run PerfRunner::Record(const Scenario& scIn) {
                   *std::max_element(v.begin(), v.end()));
     }
     std::printf("  (ms p50/p95/max)\n");
+    // FARMAPFILL BY LEVEL: frames whose surface-map columns all belong to ONE
+    // level bill that frame's farMapFill pass to it (a frame mixing levels is
+    // counted apart, never split by a guess). Frames with far entries but no
+    // map column give the pass's floor.
+    double lvMs[kFarLevels] = {}, lvMax[kFarLevels] = {};
+    uint64_t lvCols[kFarLevels] = {}, lvN[kFarLevels] = {};
+    uint64_t mixed = 0, none = 0;
+    double noneMs = 0.0;
+    for (size_t i = 0; i < r.samples.size() && i < r.mapColsLvl.size(); i++) {
+      if (!r.samples[i].gpuValid) continue;
+      int only = -1, levels = 0;
+      for (uint32_t k = 0; k < kFarLevels; k++)
+        if (r.mapColsLvl[i][k]) { levels++; only = (int)k; }
+      if (levels == 0) {
+        if (r.farFillMs[i] > 0.0) { none++; noneMs += r.farMapMs[i]; }
+        continue;
+      }
+      if (levels > 1) { mixed++; continue; }
+      lvN[only]++;
+      lvCols[only] += r.mapColsLvl[i][only];
+      lvMs[only] += r.farMapMs[i];
+      lvMax[only] = std::max(lvMax[only], r.farMapMs[i]);
+    }
+    std::printf("  %-12s farMapFill by level (frames of one level's map columns):", "");
+    for (uint32_t k = 0; k < kFarLevels; k++)
+      if (lvN[k])
+        std::printf("  L%u %llu fr %.1f cols %.2f ms (max %.2f, %.0f us/col)", k + 1,
+                    (unsigned long long)lvN[k], (double)lvCols[k] / (double)lvN[k],
+                    lvMs[k] / (double)lvN[k], lvMax[k],
+                    lvCols[k] ? 1000.0 * lvMs[k] / (double)lvCols[k] : 0.0);
+    std::printf("  | mixed %llu fr | far, no map: %llu fr %.2f ms\n",
+                (unsigned long long)mixed, (unsigned long long)none,
+                none ? noneMs / (double)none : 0.0);
   }
   if (sc.paced) {
     // A paced run's tick count is machine-dependent (that is the whole point),

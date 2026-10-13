@@ -25,14 +25,22 @@ light sections), `CLAUDE.md` layout rows, `assets/tuner.html` ARCH_NODES.
 - **A1:** the tundra snow-skin edge slide (heat-ambient D): owner decision.
 - **R1:** junctions are not profile-matched (two roads meeting at a vertex
   each bake their own Y; the ground blends them in table order).
-- **S1:** the sun-horizon rebuild is a ~3 ms spike about once a second while
-  the sun's azimuth turns; raster bodies (debris / microbodies, mobs) ignore
+- **S1:** ~~the sun-horizon rebuild is a ~3 ms spike about once a second~~
+  measured 2026-10-13 at the 12-10-09 camera: 65-67 rebuilds per 1,200
+  frames (one every ~0.3 s), median 0.77 ms, worst frame 1.35-3.13 ms; now
+  SLICED over 8 frames (median 0.22 ms, worst 1.32-1.48 ms, same total;
+  main 7ed7b20). Open: raster bodies (debris / microbodies, mobs) ignore
   the terrain shadow; the sea's LOD-handoff seam (`shadeWater` vs
   `shadeFarWater`).
-- **P1:** a far column cache (the far list sits at its cap on `peaks-route`);
-  the page pool reaches 88.5 % on `peaks-route` (demote refusals are not
-  retried); liquid sentinels (16,384 sea chunks resident and a ~200 ms first
-  tick on the sea window).
+- **P1:** a far column cache (the far list sits at its cap on `peaks-route`;
+  the far sweep's column stack, 330e762, shares the prologue); the page pool
+  ~~reaches 88.5 %~~ peaks at 81 % on `peaks-route` since the full-chunk
+  revisit retries refused demotes above 75 % residency (main b8da14e;
+  84.5 % before it on the same tree); liquid sentinels (16,384 sea chunks
+  resident and a ~200 ms first tick on the sea window) are still open: they
+  need a UNIFORM sentinel that carries the state nibble (world.h SynthWord,
+  common.wgsl synthWord, the worldgen verdict, Classify) and a birth wake
+  that skips an interior liquid chunk.
 - **Pre-existing, not map v2:** `check_pass_table.py` fails on `sim_fluid`'s
   `fluidAlloc` binding (already failing at BASE).
 - Out of scope, unchanged: rivers, generated towns, overhangs, extents past
