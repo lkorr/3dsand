@@ -1923,6 +1923,15 @@ void Overlay::DrawDevSpawn(UIState& s) {
         "The blade decides the wound: reach, cut depth and heft all come off\n"
         "its own art. \"fists\" is a weapon: a bare hand bruises and never\n"
         "severs, and a mace beats plate in where a sword skates off it.");
+    if (!s.aiOffhandNames.empty()) {
+      ImGui::SetNextItemWidth(-90);
+      NameCombo("off hand##ai", s.aiOffhandNames, s.aiOffhandPick);
+      ImGui::SetItemTooltip(
+          "A shield in the left fist. Its guard verb raises it instead of the\n"
+          "blade (a guardian keeps it up), it stops what its own voxels are in\n"
+          "the way of, and it chips, burns and breaks. A raised shield bars the\n"
+          "other arm's swing and slows the walk and the turn.");
+    }
     {
       static const char* kOutfits[] = {"nothing", "random clothes", "full plate",
                                        "custom pieces"};

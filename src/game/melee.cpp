@@ -590,6 +590,28 @@ bool LoadItems(const std::string& dir, size_t materialCount,
       d.bow.drawTicks = std::max(1, (int)std::lround((double)ms * 30.0 / 1000.0));
       d.bow.minDraw = std::clamp(b.value("minDraw", 0.15f), 0.0f, 1.0f);
     }
+    // ---- A SHIELD: what holding it up costs (item.h ShieldSpec) -------------
+    // Every field has a working default, so a shield row with no block is a
+    // legal (average) shield rather than a skip: what it STOPS is its art,
+    // and the art is in the sidecar.
+    if (d.kind == ItemKind::Shield) {
+      const json sh = it.value("shield", json::object());
+      auto ticks = [](int ms) {
+        return std::max(1, (int)std::lround((double)ms * 30.0 / 1000.0));
+      };
+      d.shield.has = true;
+      d.shield.raiseTicks = ticks(std::clamp(sh.value("raiseMs", 200), 33, 2000));
+      d.shield.lowerTicks = ticks(std::clamp(sh.value("lowerMs", 170), 33, 2000));
+      d.shield.moveScale = std::clamp(sh.value("moveScale", 0.6f), 0.05f, 1.0f);
+      d.shield.turnRate =
+          std::clamp(sh.value("turnDegPerSec", 170.0f), 10.0f, 1440.0f) *
+          (3.14159265f / 180.0f);
+      d.shield.wear = std::clamp(sh.value("wear", 1.0f), 0.0f, 10.0f);
+      d.shield.stability = std::max(0.0f, sh.value("stability", 12.0f));
+      d.shield.staggerTicks = ticks(std::clamp(sh.value("staggerMs", 600), 0, 5000));
+      d.shield.bluntThrough = std::clamp(sh.value("bluntThrough", 0.3f), 0.0f, 1.0f);
+      d.shield.clip = sh.value("clip", std::string("shield_raise"));
+    }
     // ---- AMMUNITION: the penetrator it flies as (phys/kerf.h) ----------------
     if (d.kind == ItemKind::Ammo) {
       const json a = it.value("arrow", json::object());
@@ -1312,6 +1334,94 @@ MeleeHit MakeWireHit(const Mob& wielder, Mob& target, uint64_t hb,
   return h;
 }
 
+// ---- A SHIELD STOPPED IT (MobSystem::FindShieldBlock, 2026-10-13) -----------
+//
+// Everything a block does to the holder, in one place for both callers: the
+// sweep on a holder this machine owns, and the OWNER applying a peer's blow
+// (ApplyRemoteMeleeHits' Parry branch). Here, because the first two parts are
+// built from the blow's strike parts and only this file builds those:
+//
+//   1. THE CHIP. The shield's own matter takes the blow AS MATTER. The cut
+//      part is a kerf in it (Mob::CutLimb's shell rule holds for a held
+//      shield: a sword's chip is scaled by the struck voxel's hardness against
+//      skin's, floored at one lattice cell -- so wood notches and iron only
+//      scores), and an armour-breaking blunt part dents it the way it dents
+//      plate (gear.bluntDentRadius x armorBreak, by the same hardness
+//      response). Nothing is cleaved: a shield is worn away, not parted. This
+//      is what makes the wear PROCEDURAL -- a hole is where the blows landed,
+//      and a hole as wide as a blade lets the next one through.
+//   2. THE TRAUMA BEHIND IT. `bluntThrough` of the blow's blunt part reaches
+//      the arm the shield is strapped to (Mob::ShieldArmPart) as a bruise: a
+//      mace on a shield still hurts the man behind it.
+//   3. THE REST (MobSystem::ApplyShieldBlock): item hp, the flinch, the guard
+//      beaten open, the break.
+BlockEvent ResolveShieldBlock(Mob& holder, int slot, const EdgeSweep& s,
+                              const Vec3& at, const Vec3& seg,
+                              const Vec3& sweepDir, float radius, float power,
+                              float tipSpeed, uint32_t hitSeed, MobSystem& mobs,
+                              World& world, std::vector<ParticleSpawn>& spawns) {
+  BlockEvent ev;
+  ev.shield = true;
+  Hand hand = Hand::Left;
+  if (!holder.IsHeldSlot(slot, &hand)) return ev;
+  const ItemDef::ShieldSpec* specP = holder.HeldShieldSpec();
+  const float through = specP != nullptr ? specP->bluntThrough : 0.0f;
+  const StrikeParts parts =
+      BuildStrikeParts(s, at, seg, sweepDir, radius, power, tipSpeed, hitSeed);
+  const uint64_t holderId = holder.Id();
+  // ---- 1. THE CHIP --------------------------------------------------------
+  if (s.strike.cut > 0.0f) {
+    const uint64_t b = mobs.LimbBody(holderId, slot);
+    KerfCut cut = parts.cut;
+    cut.cleave = 0.0f;
+    if (b != 0) mobs.CutLimb(b, cut, world, spawns, power, nullptr);
+  }
+  if (s.strike.blunt > 0.0f && s.strike.armorBreak > 0.0f) {
+    // A carve rebuilds the slot under a NEW handle (Mob::RebuildLimbBody), so
+    // the body is asked for again after the kerf above.
+    const uint64_t b = mobs.LimbBody(holderId, slot);
+    const Tuning& tune = CurrentTuning();
+    const float hard = holder.MaterialHardness(holder.ShellMaterialAt(slot, at));
+    const float k =
+        ShellResponseOf(hard, DamageCause::Blunt, tune.gear).carve;
+    // x melee.shieldDentScale: a shield is built to be hit, and the plate
+    // dent at full scale takes a mace through the whole of a board.
+    const float r = std::max(0.0f, tune.gear.bluntDentRadius) *
+                    std::max(0.0f, tune.melee.shieldDentScale) *
+                    s.strike.armorBreak * power * std::clamp(k, 0.0f, 1.0f);
+    // Under a quarter of a voxel the dent is two lattice cells: a tap.
+    if (b != 0 && r >= 0.25f)
+      mobs.CarveLimbRadial(b, at, r, /*ragged=*/true, /*eject=*/true, world,
+                           spawns, DamageCtx(DamageCause::Blunt, power));
+  }
+  // ---- 2. THE TRAUMA BEHIND IT --------------------------------------------
+  if (s.strike.blunt > 0.0f && through > 0.0f) {
+    const int arm = holder.ShieldArmPart(hand);
+    const uint64_t ab = arm >= 0 ? mobs.LimbBody(holderId, arm) : 0ull;
+    Vec3 ac{};
+    if (ab != 0 && holder.LimbCentreWorld(arm, ac)) {
+      ::BluntHit bh = parts.blunt;
+      bh.at = ac;
+      bh.hp *= through;
+      // ...and the bruise's SIZE with it: the radius reads `power`, and a
+      // full-power sword's token blunt part carried through a board marked
+      // 459 forearm cells at full size (--shot-strike), a mace's 16 the same.
+      bh.power *= through;
+      bh.carve = 0.0f;        // carried through a shield, it bruises
+      bh.armorBreak = 0.0f;
+      bh.impactSpeed = 0.0f;  // and knocks nothing loose
+      mobs.BluntHit(ab, bh, world, spawns);
+    }
+  }
+  // ---- 3. THE REST --------------------------------------------------------
+  const MobSystem::ShieldBlockOut o = mobs.ApplyShieldBlock(
+      holder, slot, at, sweepDir, s.strike, power, tipSpeed, s.heft);
+  ev.ring = o.ring;
+  ev.staggered = o.staggered;
+  ev.broke = o.broke;
+  return ev;
+}
+
 }  // namespace
 
 // =============================================================================
@@ -1388,6 +1498,50 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
   // number a blow is made of now comes from.)
   const Vec3 sweepDir =
       ((s.aNow + s.bNow) - (s.aPrev + s.bPrev)).normalized();
+
+  // ---- A SHIELD IN THE WAY, ASKED FIRST OF ALL (2026-10-13) --------------
+  //
+  // Before the blade-on-blade test and before any probe, for the parry's
+  // reason: a block ENDS the sweep, and a blow a shield stopped must not open
+  // the arm behind it on the same tick. Against the shield's OWN LATTICE
+  // (MobSystem::FindShieldBlock), raised or not: coverage is geometry, and a
+  // hole hacked or burnt through it is a hole.
+  {
+    MobSystem::ShieldHit sh;
+    if (mobs.FindShieldBlock(wielder, s.aPrev, s.bPrev, s.aNow, s.bNow,
+                             s.halfWidth, sh)) {
+      out.arrested = true;
+      out.block.attackerId = wielder.Id();
+      out.block.blockerId = sh.holder->Id();
+      out.block.blockerBody = sh.body;
+      out.block.at = sh.at;
+      out.block.power = power;
+      out.block.shield = true;
+      // The edge as it stood when it met the shield (the kerf runs along it).
+      const Vec3 ca = s.aPrev + (s.aNow - s.aPrev) * sh.t;
+      const Vec3 cb = s.bPrev + (s.bNow - s.bPrev) * sh.t;
+      const uint32_t hitSeed = (s.tick * 2654435761u) ^ 0x5B1E1Du;
+      if (!MobSystem::OwnedHere(*sh.holder)) {
+        // A PEER'S SHIELD (game/meleehit.h rule 2): judged here -- the stroke
+        // below is arrested this tick -- and what it does to the holder is
+        // its owner's, sent as a Parry record on the shield's slot.
+        mobs.QueueMeleeHit(MakeWireHit(
+            wielder, *sh.holder, sh.body, 0, 0, MeleeHitKind::Parry, sh.at,
+            Vec3{}, sweepDir, cb - ca, s.flatNow, s, radius, power,
+            out.tipSpeed, 1.0f, hitSeed, out.power * out.edgeAlign, 0.0f, 0u,
+            phys, mobs));
+      } else {
+        const BlockEvent ev = ResolveShieldBlock(
+            *sh.holder, sh.slot, s, sh.at, cb - ca, sweepDir, radius, power,
+            out.tipSpeed, hitSeed, mobs, world, spawns);
+        out.block.ring = ev.ring;
+        out.block.staggered = ev.staggered;
+        out.block.broke = ev.broke;
+      }
+      mobs.PushBlockEvent(out.block, t);
+      return out;
+    }
+  }
 
   // ---- BLADE ON BLADE, ASKED FIRST AND ASKED GEOMETRICALLY ----------------
   //
@@ -2247,6 +2401,26 @@ RemoteHitOutcome ApplyOneRemoteHit(const MeleeHit& h, Physics& phys,
     // it owns, with the same numbers (the tuning is the handshake's).
     MeleeTuning mt;
     ApplyMeleeTuning(mt, CurrentTuning());
+    // ...OR A SHIELD's (the record names the shield's slot): the block the
+    // sweep resolves on a shield it owns, rebuilt from the same inputs.
+    if (t->IsShieldSlot(sl)) {
+      EdgeSweep es;
+      es.strike = h.c.strike;
+      es.flatNow = D(h.c.flat);
+      es.heft = h.c.heft;
+      es.selfMounted = h.c.Has(MeleeHitCore::kSelfMounted);
+      BlockEvent ev = ResolveShieldBlock(*t, sl, es, at, D(h.c.seg), sweepDir,
+                                         h.c.radius, h.c.power, h.c.tipSpeed,
+                                         h.c.hitSeed, mobs, world, spawns);
+      ev.attackerId = attackerId;
+      ev.blockerId = t->Id();
+      ev.blockerBody = hb;
+      ev.at = at;
+      ev.power = h.c.power;
+      mobs.PushBlockEvent(ev, mt);
+      mobs.MeleeWire().parries++;
+      return RemoteHitOutcome::Applied;
+    }
     mobs.Damage(hb, total * h.c.power * mt.blockItemDamage, at, h.c.tipSpeed);
     mobs.HitReact(hb, sweepDir, total, h.c.power);
     BlockEvent ev;

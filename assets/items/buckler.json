@@ -1,0 +1,49 @@
+{
+  "comment": "A steel buckler, 0.32 m across, gripped in the fist behind a deep boss. It covers a hand's width and no more: it is a thing you put where the blade is going, not a wall to stand behind. Regenerate with scripts/gen_shield_items.py; the hilt box is emitted from the same constants that build the mesh, so the fist cannot drift off the grip.",
+  "name": "buckler",
+  "model": "buckler",
+  "artVoxelsPerMetre": 80,
+  "hp": 45,
+  "severable": true,
+  "severImpactSpeed": 0,
+  "grip": {
+    "held_left": {
+      "translation": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        90,
+        0,
+        0
+      ],
+      "scale": 1.0
+    },
+    "held_right": {
+      "translation": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        90,
+        0,
+        180
+      ],
+      "scale": 1.0
+    }
+  },
+  "hilt": {
+    "min": [
+      1,
+      12,
+      9
+    ],
+    "size": [
+      2,
+      2,
+      8
+    ]
+  }
+}

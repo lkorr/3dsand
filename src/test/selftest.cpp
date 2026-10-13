@@ -945,6 +945,11 @@ const char* const kOrder[] = {
     // went (game/selfclip.h). Directly after npc-styles because it builds the
     // identical fixture and restores the world the same way.
     "rig-clip", "duel",
+    // A SHIELD IN THE PATH (2026-10-13; game/mob_shield.cpp). Appended after
+    // the combat gates it extends, by the rule above: it spawns armed
+    // creatures, carves and breaks a shield, and runs a short fight, restoring
+    // the id counter and regenerating worldgen on the way out.
+    "shield",
     // ---- BLOOD IS HEALTH; BURNS CAP IT (Gore §F/§G, 2026-09-02) -----------
     // Appended after the combat gates by the same rule again. Each spawns one
     // creature inside the window and restores the id counter. bleed-out is

@@ -3463,6 +3463,9 @@ class Mob {
     Hand hand = Hand::Right;  // held only: which fist lost it
     WornDamage damage;      // empty for the held item
     uint32_t dye = 0;       // the colour it was (game/dye.h), 0 for undyed
+    // It did not fall out of the hand, it came apart (Mob::BreakHeld): what
+    // is on the ground is junk, not the item.
+    bool broken = false;
   };
   const std::vector<LostGear>& LostGearEvents() const { return lostGear_; }
   void ClearLostGear() { lostGear_.clear(); }
@@ -3568,6 +3571,68 @@ class Mob {
   }
   bool BowDrawn() const { return bowDraw_; }
   float BowAimPitch() const { return bowAimPitch_; }
+  // ---- A SHIELD IN HAND (ItemKind::Shield, game/mob_shield.cpp) ------------
+  //
+  // One shield per body (two shields is two slabs on two arms and nothing to
+  // swing; the left is asked first, the right only when the left has none).
+  // What it STOPS is MobSystem::FindShieldBlock's -- the lattice, wherever
+  // the arm has it. What is HERE is the raise: a fraction 0..1 stepped on the
+  // tick toward what the owner asks (SetShieldWant: the player's button, the
+  // AI's guard verb), at the shield's own raiseTicks/lowerTicks, and the four
+  // things it costs while up (item.h ShieldSpec): the other hand's strokes
+  // (ShieldBlocksStrike), the walk (ShieldMoveScale), the body's turn
+  // (ShieldTurnRate), and a guard that a heavy blow beats open
+  // (StaggerShield). The pose follows the raise exactly: the spec's clip at a
+  // weight of the raise (Mob::PosePipeline), so the arm is never further up
+  // than the mechanics say. Presentation + scheduling state on the CPU
+  // float tick, like the bow and the cast: never saved, never hashed.
+  bool ShieldHand(Hand& out) const;
+  bool HoldsShield() const {
+    Hand h;
+    return ShieldHand(h);
+  }
+  // Is rig slot `slot` a held shield (either hand)?
+  bool IsShieldSlot(int slot) const;
+  // The held shield's spec (a copy made at EquipItem), or null.
+  const ItemDef::ShieldSpec* HeldShieldSpec() const;
+  void SetShieldWant(bool want) { shieldWant_ = want; }
+  bool ShieldWant() const { return shieldWant_; }
+  float ShieldRaise() const { return shieldRaise_; }
+  // The raise at or above which the OTHER hand may not begin a stroke
+  // (melee.shieldStrikeBelow). A press made while it holds is the caller's
+  // to keep (the player banks it; an NPC defers its request) -- this only
+  // says whether it may begin now.
+  bool ShieldBlocksStrike() const;
+  // The walk multiplier at the current raise: 1 lowered, the spec's
+  // moveScale fully up, linear between.
+  float ShieldMoveScale() const;
+  // The most the BODY may turn per second given `freeRate` (what it turns
+  // at with the shield down): eased from freeRate to the spec's turnRate as
+  // the shield comes up, never above freeRate.
+  float ShieldTurnRate(float freeRate) const;
+  // A blow above the spec's stability: the shield is driven down and cannot
+  // come back up for `ticks` (the larger of a live stagger and this one).
+  void StaggerShield(int ticks);
+  int ShieldStaggerTicks() const { return shieldStagger_; }
+  // THE PITCH THE RAISED POSE FOLLOWS for a body with no camera (an NPC):
+  // radians, + up, from the shoulder to the blow it is reading. The player's
+  // is their look (PoseInputs::lookPitch), and this is ignored for it.
+  void SetShieldAimPitch(float p) { shieldAimPitch_ = p; }
+  float ShieldAimPitch() const { return shieldAimPitch_; }
+  // One tick of the raise. Called by every driver on the tick, before the
+  // pose (MobSystem::PreTick for NPCs, the session's shield block for a
+  // player). A hand that cannot grip (HandUsable) holds nothing up.
+  void StepShield();
+  // THE SHIELD BREAKS APART (hp 0 off a block, MobSystem::ApplyShieldBlock):
+  // what is left of it falls from the hand as plain debris -- NOT as the item,
+  // a broken shield is not a shield you can pick back up -- and the kit's
+  // hand slot gives it up at once, so the dress seam does not put a fresh one
+  // in the fist. Reported as a LostGear with `broken` set. False when the
+  // hand holds nothing.
+  bool BreakHeld(Hand h);
+  // The limb a blow on the shield in hand `h` is carried THROUGH to (the
+  // forearm the grip rides on, else the hand), -1 when neither is alive.
+  int ShieldArmPart(Hand h) const;
   void SetCastArm(const CastArm& a) { castArm_ = a; }
   const CastArm& GetCastArm() const { return castArm_; }
   // THE LIGHT IN THE FIST: the colour (0xAABBGGRR) of the spell this hand
@@ -5957,12 +6022,35 @@ class Mob {
     Vec3 aimAxis{0, 1, 0};
     bool borrowed = false;   // SetHeldBorrowed: a prop, not the item
     bool kitStale = false;   // HeldKitStale: the kit's stack was replaced
+    // A SHIELD (ItemDef::IsShield): its spec copied at EquipItem, so the
+    // tick's raise and the block's costs never look the item up by name.
+    bool shield = false;
+    ItemDef::ShieldSpec shieldSpec;
     void Clear() { *this = HeldHand{}; }
   };
   HeldHand held_[kHands];
   bool castBusy_ = false;   // SetCastBusy
   bool bowDraw_ = false;    // SetBowDraw
   float bowAimPitch_ = 0.0f;
+  // The shield's raise (Mob::StepShield, game/mob_shield.cpp).
+  float shieldRaise_ = 0.0f;
+  bool shieldWant_ = false;
+  // The AI raised it (ApplyAiArm), so the AI may lower it. A gate or a script
+  // that raises a shield on an AI creature is not overruled next tick -- the
+  // Brain::guardRaised rule, for the shield.
+  bool shieldByAi_ = false;
+  int shieldStagger_ = 0;       // ticks left of a beaten guard
+  float shieldAimPitch_ = 0.0f;
+  // The clip the pose drives, as resolved for the hand (Mob::HandClip) the
+  // last tick it was on, so a hand change retires the old side's instance.
+  std::string shieldClip_;
+  // AN ATTACK DECIDED WITH THE SHIELD UP (MobSystem::PreTick): the AI's
+  // request is held -- one, the latest -- while the shield comes down past
+  // melee.shieldStrikeBelow, then begun. The player's press is banked the
+  // same way (session.cpp). Dropped if it waits longer than a second.
+  ai::AttackRequest shieldPendingAttack_;
+  bool shieldPendingLive_ = false;
+  uint32_t shieldPendingTick_ = 0;
   uint32_t spellLight_[kHands] = {0, 0};   // SetSpellLight
   CastArm castArm_;         // SetCastArm
   // Which hand the stroke driver serves (SetStrikeHand / ArmForStyle).
@@ -6119,8 +6207,12 @@ class Mob {
   // The TISSUE column of the sever table (game/severpolicy.h) for one slot:
   // a garment is Shell, hair is Bloodless, anatomy is whatever the body's def
   // says (MobDef::bodyTissue). Same order of questions IsBloodless asks.
+  // A HELD SHIELD is Shell too (2026-10-13): it is kit a blade wears holes
+  // in, never "flesh" a kerf parts or severs at a joint -- the held slot of
+  // anything else stays the def's tissue, so a sword is still knocked from a
+  // hand by a fast parry (Shell refuses the impact sever).
   Tissue TissueOf(int limbIndex) const {
-    if (IsWornSlot(limbIndex)) return Tissue::Shell;
+    if (IsWornSlot(limbIndex) || IsShieldSlot(limbIndex)) return Tissue::Shell;
     if (IsBloodless(limbIndex)) return Tissue::Bloodless;
     return def_ ? def_->bodyTissue : Tissue::Flesh;
   }
@@ -6609,6 +6701,64 @@ class MobSystem {
   bool FindParry(const Mob& wielder, const Vec3& aPrev, const Vec3& bPrev,
                  const Vec3& aNow, const Vec3& bNow, float gap, Mob*& outBlocker,
                  uint64_t& outBody, Vec3& outAt);
+  // ---- ...AND IS A SHIELD? (game/mob_shield.cpp, 2026-10-13) ---------------
+  //
+  // A shield is not a segment, so FindParry's question cannot be asked of it.
+  // It is asked of the shield's OWN LATTICE in its live pose: each of a fixed
+  // row of points along the swinging edge is followed from where it was last
+  // tick to where it is now, clipped to the shield's box (a cheap reject),
+  // and where the path crosses the box the lattice is asked whether a live
+  // voxel lies within the blade's half-width (+ melee.shieldContactM) of it.
+  // The EARLIEST such contact along the travel, over every shield of every
+  // other creature, is the block. So coverage is the shield's size and where
+  // the arm holds it, raised or not; and a hole hacked or burnt through it is
+  // a hole, once it is as wide as the blade.
+  struct ShieldHit {
+    Mob* holder = nullptr;
+    Hand hand = Hand::Left;
+    int slot = -1;
+    uint64_t body = 0;
+    Vec3 at{};          // world voxels, the contact on the shield's matter
+    float t = 1.0f;     // how far into this tick's travel it met it
+  };
+  bool FindShieldBlock(const Mob& wielder, const Vec3& aPrev, const Vec3& bPrev,
+                       const Vec3& aNow, const Vec3& bNow, float halfWidth,
+                       ShieldHit& out);
+  // WHAT A BLOCK DOES TO THE HOLDER, applied by the holder's OWNER (the sweep
+  // for a local holder, ApplyRemoteMeleeHits for a peer's): the item hp the
+  // shield pays (`wear` x melee.blockItemDamage of the blow), the flinch
+  // behind it, the guard beaten open by a blow above the spec's stability
+  // (BlockImpact), and the break at hp 0. The CHIP and the blunt carried
+  // through to the arm are melee.cpp's (they are built from the strike's
+  // parts, which only the sweep can build). `ring` is filled from the struck
+  // voxel's material.
+  struct ShieldBlockOut {
+    bool staggered = false;
+    bool broke = false;
+    bool ring = true;
+  };
+  ShieldBlockOut ApplyShieldBlock(Mob& holder, int slot, const Vec3& at,
+                                  const Vec3& sweepDir,
+                                  const StrikeProfile& strike, float power,
+                                  float tipSpeed, float heft);
+  // HOW HARD A BLOW IS AGAINST A SHIELD: the cut half-weighted by the
+  // weapon's heft, the blunt part counted whole and again by how much it
+  // breaks armour, all times the blow's power. A full sword cut is ~9, a full
+  // mace blow ~29 -- the stability numbers in items.json are on this scale.
+  static float BlockImpact(const StrikeProfile& strike, float power, float heft) {
+    return (strike.cut * 0.5f * heft + strike.blunt * (1.0f + strike.armorBreak)) *
+           power;
+  }
+  // Process diagnostics, never hashed (the `shield` gate reads them).
+  struct ShieldStats {
+    uint32_t tests = 0;      // shields considered by a sweep
+    uint32_t boxHits = 0;    // ...whose box an edge path crossed
+    uint32_t blocks = 0;     // ...and met matter: blocked
+    uint32_t holes = 0;      // crossed the box and met no matter (a hole, an edge)
+    uint32_t staggers = 0;
+    uint32_t breaks = 0;
+  };
+  const ShieldStats& ShieldCounters() const { return shieldStats_; }
   void PushBlockEvent(const BlockEvent& ev, const MeleeTuning& t);
   const std::vector<BlockEvent>& BlockEvents() const { return blocks_; }
   void ClearBlockEvents() { blocks_.clear(); }
@@ -9209,6 +9359,7 @@ class MobSystem {
   const ItemLibrary* items_ = nullptr;
   std::function<void(uint64_t, const ItemInstance&)> onItemShed_;
   std::vector<BlockEvent> blocks_;
+  ShieldStats shieldStats_;
   std::vector<StrikeEvent> strikes_;
   // Melee across the wire (QueueMeleeHit / NoteRemoteMeleeHit).
   std::deque<MeleeHit> meleeOut_;

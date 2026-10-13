@@ -2196,6 +2196,24 @@ TP_F(melee, blockGapM, NO_WGSL, 0.22f, 0.0f, 0.5f)
 TP_F(melee, blockItemDamage, NO_WGSL, 0.35f, 0.0f, 1.0f)
 TP_F(melee, blockNudgeAz, NO_WGSL, 0.30f, 0.0f, 1.0f)
 TP_F(melee, blockNudgeEl, NO_WGSL, 0.18f, 0.0f, 1.0f)
+// ---- SHIELDS (ItemKind::Shield, game/mob_shield.cpp) ---------------------
+//   * shieldStrikeBelow: the raise (0..1) a shield must be AT OR BELOW
+//     before the other hand may begin a stroke. 1 = never barred (holding a
+//     shield up costs the other arm nothing: the turtle setting); 0 = barred
+//     while it is a hair up.
+//   * shieldContactM: slack, metres, added to the blade's half-width for how
+//     near a live shield voxel the edge must pass to be stopped. The ceiling
+//     is the same failure blockGapM's is: past it a shield stops blows that
+//     went round it.
+//   * shieldStaggerReact: how much harder the holder rocks when a blow beats
+//     the guard open, x the ordinary block flinch.
+//   * shieldDentScale: the plate dent (gear.bluntDentRadius x armorBreak)
+//     scaled for a shield, which is built to be hit; 1 takes a full mace blow
+//     through the whole of a wooden board.
+TP_F(melee, shieldStrikeBelow, NO_WGSL, 0.35f, 0.0f, 1.0f)
+TP_F(melee, shieldContactM, NO_WGSL, 0.02f, 0.0f, 0.15f)
+TP_F(melee, shieldStaggerReact, NO_WGSL, 2.5f, 1.0f, 8.0f)
+TP_F(melee, shieldDentScale, NO_WGSL, 0.4f, 0.0f, 1.0f)
 TP_F(melee, pickMinSpeed, NO_WGSL, 250.0f, 1.0f, 1500.0f)
 // Each further strike one stroke lands on the same creature does this
 // fraction of the previous one: 0.5 = 100%, 50%, 25%, ... 1 = no falloff,

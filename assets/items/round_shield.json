@@ -1,0 +1,49 @@
+{
+  "comment": "A round centre-grip shield, 0.6 m across: vertical boards of wood under a hollow steel boss, bound at the rim in rawhide. What it stops is its own voxels (MobSystem::FindShieldBlock): a blade notches the boards, fire takes them, and a shield hacked through has a hole. Regenerate with scripts/gen_shield_items.py; the hilt box is emitted from the same constants that build the mesh, so the fist cannot drift off the grip.",
+  "name": "round_shield",
+  "model": "round_shield",
+  "artVoxelsPerMetre": 80,
+  "hp": 60,
+  "severable": true,
+  "severImpactSpeed": 0,
+  "grip": {
+    "held_left": {
+      "translation": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        90,
+        0,
+        0
+      ],
+      "scale": 1.0
+    },
+    "held_right": {
+      "translation": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        90,
+        0,
+        180
+      ],
+      "scale": 1.0
+    }
+  },
+  "hilt": {
+    "min": [
+      1,
+      23,
+      18
+    ],
+    "size": [
+      2,
+      2,
+      12
+    ]
+  }
+}

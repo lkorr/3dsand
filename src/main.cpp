@@ -5242,7 +5242,11 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
         else
           std::printf("--shot-strike: %s wears %s (slot %d)\n", who, nm.c_str(),
                       slot);
-      } else if (!mobs.EquipItem(id, it)) {
+      } else if (!mobs.EquipItem(id, it,
+                                 // A shield goes in the LEFT fist, beside
+                                 // the weapon (item.h ItemKind::Shield).
+                                 it->kind == ItemKind::Shield ? "held_left"
+                                                              : "held_right")) {
         std::fprintf(stderr, "--shot-strike: %s could not hold %s\n", who,
                      nm.c_str());
       } else {
@@ -5267,6 +5271,11 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   };
   dress(idA, A, "attacker");
   dress(idB, B, "target");
+  // SANDVOX_SHOT_SHIELD_UP=1: the target holds its shield up (Mob::
+  // SetShieldWant; a training dummy's AI never lowers a shield it did not
+  // raise), so the blow is photographed meeting a raised guard.
+  if (std::getenv("SANDVOX_SHOT_SHIELD_UP"))
+    if (Mob* mb = mobs.FindMobById(idB)) mb->SetShieldWant(true);
   for (int i = 0; i < 20; i++) mobTick();   // settle, and let the gait pose
   maim(idA, dA, A, "attacker");
   maim(idB, dB, B, "target");
@@ -8223,6 +8232,19 @@ int main(int argc, char** argv) {
     ui.aiWeaponPick = 0;
     for (int i = 0; i < (int)ui.aiWeaponNames.size(); i++)
       if (ui.aiWeaponNames[i] == want) ui.aiWeaponPick = i;
+    // THE OFF HAND: "nothing" (a name no item has, the "fists" trick) and
+    // every shield, re-found by name the same way.
+    const std::string wasOff =
+        (ui.aiOffhandPick >= 0 && ui.aiOffhandPick < (int)ui.aiOffhandNames.size())
+            ? ui.aiOffhandNames[ui.aiOffhandPick]
+            : std::string();
+    ui.aiOffhandNames.clear();
+    ui.aiOffhandNames.push_back("nothing");
+    for (const ItemDef& it : items.items)
+      if (it.kind == ItemKind::Shield) ui.aiOffhandNames.push_back(it.name);
+    ui.aiOffhandPick = 0;
+    for (int i = 0; i < (int)ui.aiOffhandNames.size(); i++)
+      if (ui.aiOffhandNames[i] == wasOff) ui.aiOffhandPick = i;
   };
   rebuildAiWeapons();
   // ---- THE F1 "GIVE ME A FILLED VESSEL" PICKERS (UIState::giveVesselNames) --
@@ -8708,13 +8730,19 @@ int main(int argc, char** argv) {
       if (home < 0 && it.kind == ItemKind::Melee &&
           kit.equip.InHand(Hand::Right).Empty())
         home = EquipSlotOfHand(Hand::Right);
+      // ...AND THE FIRST SHIELD IN THE LEFT (2026-10-13): sword and board, so
+      // RMB raises it from the first tick. The rest go to the pack.
+      if (home < 0 && it.kind == ItemKind::Shield &&
+          kit.equip.InHand(Hand::Left).Empty())
+        home = EquipSlotOfHand(Hand::Left);
       // ...and as many as the row's `startCount` says, as ONE stack: thirty
       // arrows are a quiver, not thirty slots.
       const ItemStack st = StackOf(items, i, it.startCount);
       if (home >= 0)
         kit.equip.slots[home] = StackOf(items, i);
-      else if (ItemKindIsWorn(it.kind) || it.kind == ItemKind::Ammo)
-        kit.bag.Add(st);        // armour, and the arrows: into the pack
+      else if (ItemKindIsWorn(it.kind) || it.kind == ItemKind::Ammo ||
+               it.kind == ItemKind::Shield)
+        kit.bag.Add(st);        // armour, the arrows, spare shields: the pack
       else
         hotbar.Add(st);
     }
@@ -8722,6 +8750,14 @@ int main(int argc, char** argv) {
     // in its guard and hides half of it, so the harness swims empty-handed.
     // --shot-archery: the BOW in the right fist (whatever the stub kit put
     // there goes to the hotbar); the arrows are already in the pack.
+    // Neither scene wants the stub kit's shield on the other arm.
+    if (g_shotArchery || g_shotSwim) {
+      ItemStack& lh = kit.equip.slots[EquipSlotOfHand(Hand::Left)];
+      if (!lh.Empty()) {
+        kit.bag.Add(lh);
+        lh = ItemStack{};
+      }
+    }
     if (g_shotArchery) {
       const int bi = items.Find("bow");
       ItemStack& rh = kit.equip.slots[EquipSlotOfHand(Hand::Right)];
@@ -9069,19 +9105,24 @@ int main(int argc, char** argv) {
   // a second copy of any of those is a second thing to keep in step.
   // Deliberately takes the two things a block has and nothing else; it must
   // not need a Mob, because a parry between two NPCs has no player in it.
-  auto CombatBlockCue = [&](const Vec3& at, float power) {
+  // `ring` false (a blade into a wooden shield, MobSystem::ApplyShieldBlock's
+  // struck material): the strike's blunt layer and no clang -- a thud, not a
+  // ring, so the ear can tell a board from a blade or a boss.
+  auto CombatBlockCue = [&](const Vec3& at, float power, bool ring = true) {
     const float pw = std::clamp(power, 0.0f, 1.0f);
     if (!combatStrikeCue.pending || pw > combatStrikeCue.power) {
       combatStrikeCue.power = pw;
       combatStrikeCue.at = at;
-      combatStrikeEdged = true;
+      combatStrikeEdged = ring;
     }
     combatStrikeCue.pending = true;
-    if (!combatClangCue.pending || pw > combatClangCue.power) {
-      combatClangCue.power = pw;
-      combatClangCue.at = at;
+    if (ring) {
+      if (!combatClangCue.pending || pw > combatClangCue.power) {
+        combatClangCue.power = pw;
+        combatClangCue.at = at;
+      }
+      combatClangCue.pending = true;
     }
-    combatClangCue.pending = true;
     // A block is a hit that did not land, and it should still stop time —
     // being parried is information, and information the player does not feel
     // is information they miss. The chip tier: something happened, but nothing
@@ -15921,7 +15962,11 @@ int main(int argc, char** argv) {
     // is the one thing the body cannot fix, because it does not know which
     // hotbar slot filled it.
     for (const Mob::LostGear& lg : avatar.LostGearEvents()) {
-      if (lg.held) {
+      if (lg.broken) {
+        // A SHIELD BEATEN TO NOTHING (Mob::BreakHeld): gone from the kit,
+        // and what fell is junk, not the item.
+        ui.kitMessage = "your " + lg.item + " broke apart";
+      } else if (lg.held) {
         // THE KIT ALREADY KNOWS (dual wielding): the hand is a kit slot, and
         // Mob::ShedGearBeforeDetach emptied it at the instant the item left
         // the fist — the rig owns the kit it is dressed from. All that is
@@ -17421,13 +17466,14 @@ int main(int argc, char** argv) {
         // it and whoever caught it — a fight between two NPCs across the yard
         // is as audible as one in your face, at the volume the distance gives
         // it (audio::Cues::Combat spatializes on `ev.at`).
-        CombatBlockCue(ev.at, ev.power);
+        CombatBlockCue(ev.at, ev.power, !ev.shield || ev.ring);
         // THE PLAYER'S OWN GUARD IS BEATEN OPEN HERE and not in MobSystem,
         // because this MeleeState is main.cpp's: MobSystem::PushBlockEvent
         // nudges its own mobs and deliberately leaves the avatar to its owner.
         // Same counter-based draw, so both sides of an exchange shove the same
         // way (CLAUDE.md rule 1).
-        if (avatar.Spawned() && ev.blockerId == avatar.Id()) {
+        // (A SHIELD has no guard angle to beat open: its stagger is applied.)
+        if (avatar.Spawned() && ev.blockerId == avatar.Id() && !ev.shield) {
           const uint32_t h = rng::Hash3((uint32_t)ev.blockerId ^ 0xB10Cu,
                                         (uint32_t)ev.attackerId, 0);
           melee.Nudge((h & 1u ? 1.0f : -1.0f) * melee.tuning.blockNudgeAz *
@@ -18692,6 +18738,7 @@ int main(int argc, char** argv) {
             case ItemKind::ArmorHands: T.kindText = "worn on the hands"; break;
             case ItemKind::ArmorBelt: T.kindText = "worn at the waist"; break;
             case ItemKind::Trinket: T.kindText = "a trinket"; break;
+            case ItemKind::Shield: T.kindText = "a shield, held"; break;
             default: T.kindText = ItemKindName(sdef->kind); break;
           }
           {
@@ -19406,6 +19453,17 @@ int main(int argc, char** argv) {
                           "%.0f damage at full speed\n%.1f voxel reach%s",
                           d->strike.cut, d->reach,
                           d->hasEdge ? "\ncuts along its own edge" : "");
+            u.tip = tip;
+          } else if (d->IsShield()) {
+            // What holding it up costs (item.h ShieldSpec) and the button --
+            // what it STOPS is how big it is, and the art says that.
+            std::snprintf(tip, sizeof tip,
+                          "up in %.2f s; %.0f%% walk, %.0f deg/s turn while up\n"
+                          "holds against a blow of %.0f\n"
+                          "Q / E puts it in your left / right hand;\n"
+                          "hold that hand's button (RMB / LMB) to raise it",
+                          d->shield.raiseTicks / 30.0f, d->shield.moveScale * 100.0f,
+                          d->shield.turnRate * 57.2958f, d->shield.stability);
             u.tip = tip;
           } else if (d->IsContainer()) {
             // What is in it, and the two buttons -- the vessel has no other

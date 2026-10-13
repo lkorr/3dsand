@@ -1468,6 +1468,370 @@ Status GateNpcBlock(Ctx& c, std::string& detail) {
 }
 
 // =============================================================================
+// shield — a shield stops what its own voxels are in the way of, and holding
+// it up costs the rest (item.h ShieldSpec, game/mob_shield.cpp, 2026-10-13)
+// =============================================================================
+//
+// SEVEN CLAIMS, each the one a wrong implementation would get wrong:
+//   A. the content: three shields, kind shield, both grips, a hand takes one
+//      and a sheath does not, and the raise times order buckler < round <
+//      heater (the trade the three exist to make);
+//   B. a shield never takes the stroke driver, and the raise reaches 1 in its
+//      authored time and then costs exactly what the spec says (the other
+//      arm barred, the walk at moveScale, the turn at turnRate);
+//   C. a thrust into the RAISED shield is arrested by it: a shield
+//      BlockEvent, no flesh lost behind it, and the shield pays in hp AND in
+//      voxels carved where it was struck -- the chip is real geometry;
+//   D. THE CONTROL: the same thrust with the shield LOWERED reaches the
+//      chest. Without this arm, C passes on a fixture where the thrust simply
+//      falls short;
+//   E. coverage IS the lattice (FindShieldBlock on fabricated sweeps, in the
+//      shield's own frame): through the boards is blocked, through the empty
+//      corner of a round shield's box is not, and through a hole carved as
+//      wide as the blade is not;
+//   F. a heavy blow (a mace) beats the guard open -- the shield is knocked
+//      down while still wanted -- and enough ordinary blows break it, after
+//      at least shield.breakBlowsMin of them;
+//   G. A LIVE FIGHT: a guardian with sword and shield against a duelist
+//      raises its shield, still swings, and NEVER has a stroke in windup or
+//      cut while its shield is above melee.shieldStrikeBelow -- the rule that
+//      makes a shield cost something, asserted on the real AI.
+Status GateShield(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  // The shipped item library, for npc-strike's reason (weapon forms, and here
+  // the shields themselves), put back on the way out.
+  struct ItemsScope {
+    MobSystem& m;
+    const ItemLibrary* prev;
+    ItemsScope(MobSystem& mm, const ItemLibrary* now) : m(mm), prev(mm.Items()) {
+      m.SetItems(now);
+    }
+    ~ItemsScope() { m.SetItems(prev); }
+  } itemsScope(c.mobs, &c.items);
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const char* what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("shield: FAILED %s\n", what);
+    }
+  };
+
+  // ---- A. THE CONTENT ------------------------------------------------------
+  const ItemDef* round = c.items.Named("round_shield");
+  const ItemDef* buck = c.items.Named("buckler");
+  const ItemDef* heater = c.items.Named("heater_shield");
+  check(round != nullptr && buck != nullptr && heater != nullptr,
+        "A: round_shield, buckler and heater_shield load");
+  if (round == nullptr || buck == nullptr || heater == nullptr) {
+    detail = "the shields did not load";
+    return Status::Fail;
+  }
+  for (const ItemDef* d : {round, buck, heater}) {
+    check(d->kind == ItemKind::Shield && d->IsShield(), "A: kind shield with a spec");
+    check(d->grip.count("held_left") && d->grip.count("held_right"),
+          "A: both grips authored (a shield is not mirror-symmetric front to back)");
+    check(d->hilt.has && d->microModel >= 0, "A: a hilt box and a brick");
+  }
+  check(EquipSlotAccepts((int)EquipSlotId::HandL, ItemKind::Shield) &&
+            EquipSlotAccepts((int)EquipSlotId::HandR, ItemKind::Shield),
+        "A: either hand takes a shield");
+  check(!EquipSlotAccepts((int)EquipSlotId::Sheath, ItemKind::Shield),
+        "A: a sheath does not");
+  check(buck->shield.raiseTicks < round->shield.raiseTicks &&
+            round->shield.raiseTicks < heater->shield.raiseTicks,
+        "A: raise time buckler < round < heater");
+  check(buck->shield.moveScale > round->shield.moveScale &&
+            round->shield.moveScale > heater->shield.moveScale,
+        "A: walk while raised buckler > round > heater");
+
+  Stage st = OpenStage(c);
+  c.mobs.SetNextIdCounter(1);
+  if (!st.ok) {
+    detail = st.why;
+    std::printf("shield: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+  const float gap = (float)BaselineNumber("shield.gapVox", 7.0);
+  std::string why;
+  const uint64_t attacker =
+      SpawnFighter(c, st.defIndex, {st.spot.x, st.spot.y + 1, st.spot.z},
+                   "training_dummy", true, why);
+  const uint64_t defender = SpawnFighter(
+      c, st.defIndex,
+      {st.spot.x, st.spot.y + 1, st.spot.z + (int)std::lround(gap)},
+      "training_dummy", true, why);
+  if (attacker == 0 || defender == 0 ||
+      !c.mobs.EquipItem(defender, round, "held_left")) {
+    detail = why.empty() ? "fixture spawn / shield equip failed" : why;
+    std::printf("shield: SKIP (%s)\n", detail.c_str());
+    CloseStage(c);
+    return Status::Skip;
+  }
+  Mob* dm = c.mobs.FindMobById(defender);
+  Mob* am = c.mobs.FindMobById(attacker);
+  const int slot = dm != nullptr ? dm->HeldSlot(Hand::Left) : -1;
+
+  // ---- B. THE DRIVER, THE RAISE, AND WHAT IT COSTS ---------------------------
+  check(dm != nullptr && dm->HoldsShield() && dm->IsShieldSlot(slot),
+        "B: the round shield rides the left fist as a shield");
+  check(dm != nullptr && dm->StrikeHand() == Hand::Right,
+        "B: the sword keeps the stroke driver (a shield never takes it)");
+  {
+    const int hi = c.mobs.AttackStyles().Find("horizontal_r");
+    const AttackStyle* hr = c.mobs.AttackStyles().At(hi);
+    check(hr != nullptr && dm != nullptr && !dm->ArmForStyle(*hr, Hand::Left),
+          "B: a held style refuses the shield hand");
+    if (dm != nullptr) dm->SetStrikeHand(Hand::Right);
+  }
+  Ticker tick{c, 27500, {st.spot.x >> 4, st.spot.y >> 4, st.spot.z >> 4}};
+  FaceAt(c.mobs, attacker, Chest(c.mobs, defender, *st.def));
+  FaceAt(c.mobs, defender, Chest(c.mobs, attacker, *st.def));
+  for (int i = 0; i < 24; i++) tick();
+  int toFull = -1;
+  if (dm != nullptr) {
+    dm->SetShieldWant(true);
+    for (int i = 0; i < 90 && toFull < 0; i++) {
+      tick();
+      if (dm->ShieldRaise() >= 1.0f) toFull = i + 1;
+    }
+  }
+  check(toFull > 0 && toFull <= round->shield.raiseTicks + 1,
+        "B: up in its authored raise time");
+  check(dm != nullptr && dm->ShieldBlocksStrike(), "B: up, it bars the other arm");
+  check(dm != nullptr && Near(dm->ShieldMoveScale(), round->shield.moveScale, 1e-3f),
+        "B: up, the walk is moveScale");
+  check(dm != nullptr && Near(dm->ShieldTurnRate(100.0f), round->shield.turnRate, 1e-3f),
+        "B: up, the turn is turnRate");
+  // THE POSE PUTS IT IN FRONT: the shield's box centre ahead of the body.
+  float ahead = -1e9f;
+  if (dm != nullptr && slot >= 0) {
+    BodyTransform xf{};
+    if (c.phys.GetTransform(c.mobs.LimbBody(defender, slot), xf)) {
+      const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+      const float sc = (float)std::max(1u, round->scale);
+      const Vec3 half{round->size.x * 0.5f / sc, round->size.y * 0.5f / sc,
+                      round->size.z * 0.5f / sc};
+      const Vec3 centre = xf.pos + QuatRotate(q, half);
+      const Vec3 body = c.mobs.MobOrigin(defender) + st.def->worldSize * 0.5f;
+      ahead = (centre - body).dot(dm->Facing());
+    }
+  }
+  check(ahead > 1.0f, "B: raised, the shield is in front of the body");
+
+  // ---- C. A THRUST INTO THE RAISED SHIELD IS STOPPED BY IT --------------------
+  const float hp0 = dm != nullptr && slot >= 0 ? dm->LimbHpAt(slot) : 0.0f;
+  const uint32_t vox0 = slot >= 0 ? c.mobs.LimbArtVoxelCount(defender, slot) : 0;
+  const uint32_t flesh0 = FleshArtVoxels(c.mobs, defender);
+  c.mobs.ClearBlockEvents();
+  check(c.mobs.ForceAttack(attacker, "thrust", Chest(c.mobs, defender, *st.def),
+                           tick.tick),
+        "C: the attacker started a thrust");
+  int shieldBlocks = 0;
+  bool arrested = false;
+  for (int i = 0; i < 60; i++) {
+    if (dm != nullptr) dm->SetShieldWant(true);
+    tick();
+    for (const BlockEvent& ev : c.mobs.BlockEvents())
+      if (ev.shield && ev.blockerId == defender && ev.attackerId == attacker)
+        shieldBlocks++;
+    c.mobs.ClearBlockEvents();
+    const NpcStroke* s = c.mobs.MobStroke(attacker);
+    if (s != nullptr) arrested = arrested || s->arrested;
+    if (s == nullptr || (!s->Active() && i > 4)) break;
+  }
+  const float hp1 = dm != nullptr && slot >= 0 ? dm->LimbHpAt(slot) : 0.0f;
+  const uint32_t vox1 = slot >= 0 ? c.mobs.LimbArtVoxelCount(defender, slot) : 0;
+  const uint32_t flesh1 = FleshArtVoxels(c.mobs, defender);
+  check(shieldBlocks > 0, "C: the thrust met the shield (a shield BlockEvent)");
+  check(arrested, "C: and the stroke was arrested");
+  check(flesh1 + (uint32_t)BaselineNumber("shield.fleshLossMax", 0.0) >= flesh0,
+        "C: the body behind the shield lost no flesh");
+  check(hp1 < hp0, "C: the shield paid item hp");
+  check(vox1 < vox0, "C: and lost voxels where it was struck (the chip)");
+
+  // ---- D. THE CONTROL: LOWERED, THE SAME THRUST LANDS --------------------------
+  if (dm != nullptr) {
+    dm->SetShieldWant(false);
+    for (int i = 0; i < 30; i++) tick();
+  }
+  check(dm != nullptr && dm->ShieldRaise() <= 0.0f, "D: lowered");
+  const uint32_t flesh2 = FleshArtVoxels(c.mobs, defender);
+  c.mobs.ClearBlockEvents();
+  check(c.mobs.ForceAttack(attacker, "thrust", Chest(c.mobs, defender, *st.def),
+                           tick.tick),
+        "D: the attacker started the same thrust");
+  int lowBlocks = 0;
+  for (int i = 0; i < 60; i++) {
+    tick();
+    for (const BlockEvent& ev : c.mobs.BlockEvents())
+      if (ev.shield && ev.blockerId == defender) lowBlocks++;
+    c.mobs.ClearBlockEvents();
+    const NpcStroke* s = c.mobs.MobStroke(attacker);
+    if (s == nullptr || (!s->Active() && i > 4)) break;
+  }
+  const uint32_t flesh3 = FleshArtVoxels(c.mobs, defender);
+  // The lowered shield hangs at the side and may still catch the long blade
+  // on its way past (lowBlocks is reported, not asserted): the claim is that
+  // it no longer covers the chest, so the thrust LANDS.
+  check(flesh3 < flesh2,
+        "D: lowered, the shield does not cover the chest and the thrust lands");
+
+  // ---- E. COVERAGE IS THE LATTICE --------------------------------------------
+  // Fabricated sweeps in the shield's own frame (world voxels from its min
+  // corner; the face normal is local +X, the disc in YZ): a short edge driven
+  // through the boards' thickness.
+  bool eSolid = false, eCorner = true, eHole = true;
+  if (dm != nullptr && am != nullptr && slot >= 0) {
+    for (int i = 0; i < 4; i++) tick();   // the pose settles where it hangs
+    auto sweepAt = [&](float y, float z0, float z1) {
+      BodyTransform xf{};
+      if (!c.phys.GetTransform(c.mobs.LimbBody(defender, slot), xf)) return false;
+      const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+      auto W = [&](float x, float yy, float z) {
+        return xf.pos + QuatRotate(q, Vec3{x, yy, z});
+      };
+      MobSystem::ShieldHit sh;
+      return c.mobs.FindShieldBlock(*am, W(-2.0f, y, z0), W(-2.0f, y, z1),
+                                    W(4.0f, y, z0), W(4.0f, y, z1), 0.3f, sh) &&
+             sh.holder == dm;
+    };
+    // In WORLD voxels from the min corner: the round shield's box is its
+    // micro size over its scale, the disc centred in Y/Z.
+    const float sc = (float)std::max(1u, round->scale);
+    const float cy = round->size.y * 0.5f / sc, cz = round->size.z * 0.5f / sc;
+    // Through the boards, 1.5 voxels off the boss (r 0.8).
+    eSolid = sweepAt(cy + 1.5f, cz - 0.4f, cz + 0.4f);
+    // The empty corner of the round shield's square box.
+    eCorner = sweepAt(0.3f, 0.1f, 0.5f);
+    // A hole as wide as the blade, where the first sweep went through.
+    BodyTransform xf{};
+    if (c.phys.GetTransform(c.mobs.LimbBody(defender, slot), xf)) {
+      const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+      std::vector<ParticleSpawn> sink;
+      c.mobs.CarveLimbRadial(c.mobs.LimbBody(defender, slot),
+                             xf.pos + QuatRotate(q, Vec3{0.7f, cy + 1.5f, cz}),
+                             1.8f, false, false, c.world, sink);
+      eHole = sweepAt(cy + 1.5f, cz - 0.4f, cz + 0.4f);
+    }
+  }
+  check(eSolid, "E: an edge through the boards is blocked");
+  check(!eCorner, "E: an edge through the empty corner of the box is not");
+  check(!eHole, "E: an edge through a hole as wide as the blade is not");
+
+  // ---- F. A MACE BEATS THE GUARD OPEN; ENOUGH BLOWS BREAK IT ------------------
+  bool staggered = false, knockedDown = false, broke = false;
+  int blowsToBreak = 0;
+  // A FRESH SHIELD: E's hole cost the last one a third of its volume, and
+  // with it (CarveLimb's volume charge) a third of its hp.
+  int fslot = -1;
+  if (dm != nullptr && c.mobs.EquipItem(defender, round, "held_left"))
+    fslot = dm->HeldSlot(Hand::Left);
+  if (dm != nullptr && fslot >= 0) {
+    const int slot = fslot;
+    dm->SetShieldWant(true);
+    for (int i = 0; i < 30; i++) tick();
+    const float up0 = dm->ShieldRaise();
+    StrikeProfile mace;
+    mace.blunt = 16.0f;
+    mace.armorBreak = 0.8f;
+    BodyTransform xf{};
+    c.phys.GetTransform(c.mobs.LimbBody(defender, slot), xf);
+    const MobSystem::ShieldBlockOut o = c.mobs.ApplyShieldBlock(
+        *dm, slot, xf.pos, Vec3{0, 0, 1}, mace, 1.0f, 200.0f, 1.0f);
+    staggered = o.staggered && dm->ShieldStaggerTicks() > 0;
+    for (int i = 0; i < 4; i++) {
+      dm->SetShieldWant(true);
+      tick();
+    }
+    knockedDown = up0 >= 1.0f && dm->ShieldRaise() < 0.5f;
+    StrikeProfile sword;
+    sword.cut = 14.0f;
+    sword.blunt = 2.0f;
+    dm->ClearLostGear();
+    for (int i = 0; i < 200 && !broke; i++) {
+      const int s = dm->HeldSlot(Hand::Left);
+      if (s < 0) break;
+      c.phys.GetTransform(c.mobs.LimbBody(defender, s), xf);
+      blowsToBreak++;
+      broke = c.mobs.ApplyShieldBlock(*dm, s, xf.pos, Vec3{0, 0, 1}, sword,
+                                      1.0f, 200.0f, 1.0f).broke;
+    }
+  }
+  check(staggered, "F: a full mace blow beats the round shield's guard open");
+  check(knockedDown, "F: ...and knocks it down while it is still wanted up");
+  check(broke, "F: enough sword blows break it");
+  check(blowsToBreak >= (int)BaselineNumber("shield.breakBlowsMin", 6.0),
+        "F: ...but not quickly (shield.breakBlowsMin)");
+  bool brokenReported = false;
+  if (dm != nullptr)
+    for (const Mob::LostGear& lg : dm->LostGearEvents())
+      brokenReported = brokenReported || (lg.broken && lg.item == "round_shield");
+  check(dm != nullptr && !dm->HoldsShield() && dm->HeldSlot(Hand::Left) < 0 &&
+            brokenReported,
+        "F: broken, the fist is empty and the loss reads `broken`");
+
+  // ---- G. A LIVE FIGHT -----------------------------------------------------------
+  c.mobs.Reset();
+  c.debris.Reset();
+  c.mobs.SetNextIdCounter(100);
+  const float duelGap = (float)BaselineNumber("shield.duelGapVox", 12.0);
+  const uint64_t guard =
+      SpawnFighter(c, st.defIndex, {st.spot.x, st.spot.y + 1, st.spot.z},
+                   "guardian", true, why);
+  const uint64_t foe = SpawnFighter(
+      c, st.defIndex,
+      {st.spot.x, st.spot.y + 1, st.spot.z + (int)std::lround(duelGap)},
+      "duelist_blue", true, why);
+  int upTicks = 0, guardCuts = 0, duelBlocks = 0, behindShield = 0;
+  if (guard != 0 && foe != 0 && c.mobs.EquipItem(guard, round, "held_left")) {
+    FaceAt(c.mobs, guard, Chest(c.mobs, foe, *st.def));
+    FaceAt(c.mobs, foe, Chest(c.mobs, guard, *st.def));
+    const float below = CurrentTuning().melee.shieldStrikeBelow;
+    const int duelTicks = (int)BaselineNumber("shield.duelTicks", 360.0);
+    c.mobs.ClearBlockEvents();
+    for (int i = 0; i < duelTicks; i++) {
+      tick();
+      Mob* g = c.mobs.FindMobById(guard);
+      if (g == nullptr || !g->Alive()) break;
+      if (g->ShieldRaise() >= 0.5f) upTicks++;
+      const NpcStroke* s = c.mobs.MobStroke(guard);
+      const bool swinging = s != nullptr &&
+                            (s->phase == NpcStroke::Phase::Windup ||
+                             s->phase == NpcStroke::Phase::Cut);
+      if (s != nullptr && s->Cutting()) guardCuts++;
+      if (swinging && g->ShieldRaise() > below + 1e-4f) behindShield++;
+      for (const BlockEvent& ev : c.mobs.BlockEvents())
+        if (ev.shield && ev.blockerId == guard) duelBlocks++;
+      c.mobs.ClearBlockEvents();
+    }
+  }
+  check(guard != 0 && foe != 0, "G: the guardian and the duelist stood up");
+  check(upTicks > 0, "G: the guardian raised its shield");
+  check(guardCuts > 0, "G: ...and still swung (its attack waits for the shield, not forever)");
+  check(behindShield == 0, "G: and never swung with the shield above shieldStrikeBelow");
+  RecordObserved("shield.duelBlocks", (double)duelBlocks);
+  RecordObserved("shield.breakBlows", (double)blowsToBreak);
+
+  std::printf(
+      "shield: raise %d ticks; block C %d event(s), arrested %d, flesh %u->%u, "
+      "shield hp %.1f->%.1f vox %u->%u; control D flesh %u->%u (%d shield "
+      "blocks); E solid %d corner %d hole %d; F stagger %d knocked %d broke "
+      "after %d blows; G up %d ticks, %d cut ticks, %d shield blocks, %d "
+      "behind-shield swings\n",
+      toFull, shieldBlocks, (int)arrested, flesh0, flesh1, (double)hp0,
+      (double)hp1, vox0, vox1, flesh2, flesh3, lowBlocks, (int)eSolid,
+      (int)eCorner, (int)eHole, (int)staggered, (int)knockedDown, blowsToBreak,
+      upTicks, guardCuts, duelBlocks, behindShield);
+
+  CloseStage(c);
+  detail = Format("%d checks", checks);
+  std::printf("shield: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// =============================================================================
 // npc-styles — every authored style sweeps the plane it claims to
 // =============================================================================
 //
@@ -5720,6 +6084,10 @@ const std::vector<Gate>& CombatGates() {
       // at the END of the mob group. Same list, opposite end of the run.
       {"npc-strike", "mob", {}, false, GateNpcStrike},
       {"npc-block", "mob", {}, false, GateNpcBlock},
+      // A shield in the path (item.h ItemKind::Shield). Same fixture shape and
+      // exit contract as npc-block (id scope in, worldgen regenerated out),
+      // plus a live guardian-vs-duelist fight at the end.
+      {"shield", "mob", {}, false, GateShield},
       {"npc-styles", "mob", {}, false, GateNpcStyles},
       // ...and the same replay measured for a different defect: does the pose
       // pass through itself (game/selfclip.h). Same fixture shape as

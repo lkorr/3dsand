@@ -6568,6 +6568,9 @@ bool Mob::ArmForStyle(const AttackStyle& sty, Hand hand) {
     // THIS hand's item, and only if this hand can hold it: an arm whose
     // chain is broken does not begin a stroke.
     if (HeldSlot(hand) >= 0) {
+      // A SHIELD IS RAISED, NOT SWUNG (item.h ItemKind::Shield): it has no
+      // edge to cut with, and the fist that would punch is closed on it.
+      if (held_[HandIndex(hand)].shield) return false;
       if (!HandUsable(hand)) return false;
       strikeHand_ = hand;
       return true;
@@ -6662,12 +6665,18 @@ Hand Mob::StrokeHandFor(const AttackStyle& sty, uint32_t tick) const {
     return side == StyleSide::Left ? Hand::Left
            : side == StyleSide::Right ? Hand::Right
                                       : strikeHand_;
-  const bool r = HeldSlot(Hand::Right) >= 0 && HandUsable(Hand::Right);
-  const bool l = HeldSlot(Hand::Left) >= 0 && HandUsable(Hand::Left);
+  // A SHIELD HAND IS NOT A WEAPON HAND (it is raised, not swung): the stroke
+  // goes to the other fist, armed or empty, and a creature holding only a
+  // shield punches with the hand that is free.
+  const bool r = HeldSlot(Hand::Right) >= 0 && !held_[0].shield &&
+                 HandUsable(Hand::Right);
+  const bool l = HeldSlot(Hand::Left) >= 0 && !held_[1].shield &&
+                 HandUsable(Hand::Left);
   if (r && l)
     return (rng::Hash3((uint32_t)id_, tick, 0x4A4Du) & 1u) ? Hand::Left
                                                           : Hand::Right;
   if (l) return Hand::Left;
+  if (!r && held_[0].shield && HeldSlot(Hand::Left) < 0) return Hand::Left;
   return Hand::Right;
 }
 
@@ -7833,7 +7842,56 @@ void MobSystem::ApplyAiArm(Mob& mob, const MobDef& def,
   NpcStroke& st = mob.stroke_;
   // A spell in the hand (Mob::CastBusy): the arm is the cast's; no guard.
   // A drawn bow (Mob::BowDrawn): the arms are the draw's.
-  if (mob.castBusy_ || mob.bowDraw_) return;
+  if (mob.castBusy_ || mob.bowDraw_) {
+    mob.SetShieldWant(false);
+    return;
+  }
+  // ---- A SHIELD IS THE GUARD (item.h ItemKind::Shield) ---------------------
+  // A creature with a shield in a fist guards with THE SHIELD: the guard verb
+  // raises it, anything else lowers it, and the blade stays in its ready pose
+  // to answer -- not a second guard on the other arm, because a raised shield
+  // already bars that arm from swinging (Mob::ShieldBlocksStrike), and a
+  // shield and a blade both across the line is a wall no one designed. It
+  // comes up only between this creature's own strokes (or in a stroke's
+  // recover): an arm mid-swing is not holding anything up.
+  //
+  // The pose tips with the blow it read (Mob::SetShieldAimPitch): the line
+  // from the shoulder to the guard point -- the attacker's weapon -- so an
+  // overhead is met high and a low cut low. Coverage is still geometry: a
+  // shield lifted to an overhead leaves the legs.
+  if (mob.HoldsShield()) {
+    const bool armFree = !st.Active() || st.phase == NpcStroke::Phase::Guard ||
+                         st.phase == NpcStroke::Phase::Recover;
+    const bool raise = out.guard && !out.attack && armFree &&
+                       !mob.shieldPendingLive_;
+    // Only a shield THIS layer raised is lowered by it (shieldByAi_).
+    if (raise) {
+      mob.SetShieldWant(true);
+      mob.shieldByAi_ = true;
+    } else if (mob.shieldByAi_) {
+      mob.SetShieldWant(false);
+      mob.shieldByAi_ = false;
+    }
+    if (raise) {
+      const Vec3 pivot{mob.origin_.x + def.worldSize.x * 0.5f,
+                       mob.origin_.y + def.worldSize.y * 0.75f,
+                       mob.origin_.z + def.worldSize.z * 0.5f};
+      const Vec3 dv = out.guardPoint - pivot;
+      const float flat = std::sqrt(dv.x * dv.x + dv.z * dv.z);
+      mob.SetShieldAimPitch(
+          std::clamp(std::atan2(dv.y, std::max(flat, 0.5f)), -0.6f, 0.9f));
+    }
+    // A blade guard this creature raised before it held a shield goes down.
+    if (mob.ai_.guardRaised) {
+      mob.ai_.guardRaised = false;
+      if (!out.attack && st.phase == NpcStroke::Phase::Guard) ClearGuard(mob.id_);
+    }
+    if (out.cancelSwing && st.phase == NpcStroke::Phase::Windup) {
+      st.StartRelease(8);
+      st.settleTicks = 0;
+    }
+    return;
+  }
   if (out.cancelSwing && st.phase == NpcStroke::Phase::Windup) {
     // The bluff ends where a dropped guard does: released, faded, no return
     // pose (a feint has no follow-through to settle out of).
@@ -7884,6 +7942,9 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     mob.driveStrafe_ = 0.0f;
     mob.desiredHeading_ = mob.heading_;
     if (mob.stroke_.Active()) mob.stroke_.Reset();
+    // ...and a stunned arm holds no shield up.
+    mob.SetShieldWant(false);
+    mob.shieldPendingLive_ = false;
   };
 
   // ---- THE BEHAVIOUR LAYER ------------------------------------------------
@@ -7955,7 +8016,9 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     // What is in its hand: a held item arms it AND lets it guard (the parry
     // test is blade on blade — MobSystem::FindParry skips anything unarmed).
     self.armed = !mob.HeldItem().empty();
-    self.canGuard = self.armed && mob.HeldSlot() >= 0;
+    // ...or a SHIELD in either fist: its guard is the shield coming up
+    // (ApplyAiArm), and what it stops is its own lattice (FindShieldBlock).
+    self.canGuard = (self.armed && mob.HeldSlot() >= 0) || mob.HoldsShield();
     // A BOW (the NPC archers, game/mob_archery.h): the shots it can loose now
     // (arrows in its kit for the bow in its hand), whether the string is
     // back, and whether the step straight back is refused -- the fan's rear
@@ -8120,8 +8183,11 @@ float MobSystem::Steer(Mob& mob, const MobDef& def, float dt) {
   // Turn tighter when slow, wider when fast — a physical body's trade.
   const float speedFrac =
       std::clamp(mob.speedNow_ / std::max(def.speed, 0.01f), 0.0f, 1.0f);
-  const float rateCap =
-      lo.turnRate * (1.0f + (lo.turnRateMoving - 1.0f) * speedFrac);
+  // A RAISED SHIELD SLOWS THE TURN (item.h ShieldSpec::turnRate): the
+  // shield faces where the body faces, so a fighter who circles a guard
+  // outpaces it -- the counter to standing behind one.
+  const float rateCap = mob.ShieldTurnRate(
+      lo.turnRate * (1.0f + (lo.turnRateMoving - 1.0f) * speedFrac));
 
   if (rateCap <= 0.0f) {
     mob.turnVel_ = 0;
@@ -8689,7 +8755,8 @@ void MobSystem::DriveLocomotion(Mob& mob, const MobDef& def,
   // wrong question for a strafe or a back-pedal: a duelist circling a target it
   // is squarely facing has an alignment of 1 and a sidestep to make, and one
   // giving ground is deliberately walking the way it is NOT looking.
-  const float base = def.speed * speedScale;
+  // ...and a raised shield the walk (item.h ShieldSpec::moveScale).
+  const float base = def.speed * speedScale * mob.ShieldMoveScale();
   const float fwdDrive = base * mob.driveScale_ * align;
   const float sideDrive = base * mob.driveStrafe_;
 
@@ -8971,6 +9038,17 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
     in.lookYaw = 0.0f;
     in.lookPitch = mob.bowAimPitch_;
     in.strikeAim = false;
+  } else if (mob.shieldRaise_ > 0.0f) {
+    // ---- A SHIELD UP (Mob::SetShieldAimPitch) ----------------------------
+    // The same seam: the LOOK carries the pitch to the blow it read, and the
+    // raise clip's pitchFollow lifts and tilts the shield with it -- an
+    // overhead is met high. The body already faces the threat (the guard
+    // verb), so the yaw is nothing, and the strike aim is off for the same
+    // reason the bow's is.
+    in.haveLook = true;
+    in.lookYaw = 0.0f;
+    in.lookPitch = mob.shieldAimPitch_ * std::clamp(mob.shieldRaise_, 0.0f, 1.0f);
+    in.strikeAim = false;
   }
   mob.PosePipeline(in, dt, world, tick);
 }
@@ -9110,6 +9188,10 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       case NpcStroke::Phase::Recover: a.action = ai::Action::Recover; break;
       default: a.action = ai::Action::None; break;
     }
+    // A SHIELD UP is a guard to anyone watching (Fact::TargetGuarding), so a
+    // profile can answer it -- feint, circle, wait it out -- with data.
+    if (a.action == ai::Action::None && m.ShieldRaise() >= 0.5f)
+      a.action = ai::Action::Guard;
     actors_.push_back(std::move(a));
   }
   // THE PLAYERS, AS A WATCHER SEES THEM. The session published position and
@@ -9580,10 +9662,36 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       // is held across a line swings FROM the guard (the same take-over
       // ForceAttack has always allowed).
       burnprof::Scope bpStroke(burnprof::kStroke);
-      if (attacks_.size() > attacksBefore &&
-          (!mob.stroke_.Active() ||
-           mob.stroke_.phase == NpcStroke::Phase::Guard))
+      // ---- THE SHIELD'S RAISE, THEN WHETHER THE OTHER ARM MAY SWING --------
+      // (game/mob_shield.cpp). Stepped here, after the intent asked for it up
+      // or down and before a stroke may begin, so "may this arm swing" is
+      // asked of the raise as it stands this tick. An attack decided with the
+      // shield up is HELD (one, the latest) while the shield comes down past
+      // melee.shieldStrikeBelow -- the lowering is the first beat of the
+      // telegraph -- and begun then; one held past a second is dropped.
+      if (attacks_.size() > attacksBefore && mob.HoldsShield()) {
+        mob.shieldPendingAttack_ = attacks_.back();
+        mob.shieldPendingLive_ = true;
+        mob.shieldPendingTick_ = tick;
+        mob.SetShieldWant(false);
+      }
+      mob.StepShield();
+      const bool strokeFree = !mob.stroke_.Active() ||
+                              mob.stroke_.phase == NpcStroke::Phase::Guard;
+      if (mob.shieldPendingLive_) {
+        if (!mob.HoldsShield() || tick - mob.shieldPendingTick_ > 30u) {
+          // The shield is gone (broken, dropped): the request goes as normal
+          // this tick if it is this tick's, otherwise it has gone stale.
+          if (strokeFree && mob.shieldPendingTick_ == tick)
+            BeginStroke(mob, mob.shieldPendingAttack_, tick);
+          mob.shieldPendingLive_ = false;
+        } else if (!mob.ShieldBlocksStrike()) {
+          if (strokeFree) BeginStroke(mob, mob.shieldPendingAttack_, tick);
+          mob.shieldPendingLive_ = false;
+        }
+      } else if (attacks_.size() > attacksBefore && strokeFree) {
         BeginStroke(mob, attacks_.back(), tick);
+      }
       StepStroke(mob, tick, world, spawns);
       mob.swinging_ = mob.stroke_.Cutting();
       // THE CAST'S ARM (Mob::SetCastArm, game/demon_cast.cpp): last word on
@@ -12891,6 +12999,9 @@ void MobSystem::PushBlockEvent(const BlockEvent& ev, const MeleeTuning& t) {
   // attacker per tick, so this can hold at most kMaxMobs entries between
   // drains. The cap is the belt to that brace for a frame that never drains.
   if (blocks_.size() < kMaxMobs * 2) blocks_.push_back(ev);
+  // A SHIELD has no guard angle to beat open: what a hard blow does to a
+  // shield is the stagger (MobSystem::ApplyShieldBlock), already applied.
+  if (ev.shield) return;
   // ...AND THE DEFENDER'S GUARD IS BEATEN OPEN. Counter-based on (blocker,
   // attacker, power) so the shove is a pure function of the exchange: two runs
   // of the same fight beat the same guard the same way. Only the SIGN comes
@@ -13292,6 +13403,9 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
       }
     }
     if (alive_) {
+      if (IsShieldSlot((int)i) && std::getenv("SANDVOX_SHIELD_TRACE"))
+        std::printf("shield trace: Damage on shield slot %d: %.1f (cause %d)\n",
+                    (int)i, (double)amount, (int)ctx.cause);
       limb.hp -= amount;
       hpLostBy_[(int)ctx.cause] += amount;
     }
@@ -14746,7 +14860,12 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
     // the slot below, and an unscaled copy is what the plane is priced over
     // when the caller gave no edge (KerfBite's `edgeHalf`).
     const float halfL0 = halfL;
-    if (sys_ != nullptr && (IsWornSlot((int)i) || bodyShell)) {
+    // ...AND SO DOES A SHIELD (2026-10-13): a blade a shield stops is
+    // resolved on the shield as matter (melee.cpp ResolveShieldBlock), and
+    // what it leaves is the plate's chip, by the same hardness -- a sword
+    // notches a wooden board and scores an iron face.
+    if (sys_ != nullptr &&
+        (IsWornSlot((int)i) || bodyShell || IsShieldSlot((int)i))) {
       const auto& gear = CurrentTuning().gear;
       const float hard = MaterialHardness(cutStruck);
       if (hard > 0.0f && gear.cutHardnessRef > 0.0f) {
@@ -17376,6 +17495,11 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   if (alive_) {
     const float charge = (lostWeight / w0) * limbDefs_[limbIndex].hp *
                          CurrentTuning().gore.carveHpPerVolume;
+    if (IsShieldSlot(limbIndex) && std::getenv("SANDVOX_SHIELD_TRACE"))
+      std::printf("shield trace: carve charge on shield slot %d: %.1f "
+                  "(lostWeight %.1f of w0 %.1f, prev %.1f now %.1f)\n",
+                  limbIndex, (double)charge, (double)lostWeight, (double)w0,
+                  (double)prevWeight, (double)nowWeight);
     limb.hp -= charge;
     hpLostBy_[(int)ctx.cause] += charge;
   }
@@ -27072,6 +27196,12 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
   if (IsGhost()) return;
   const MobDef& def = *def_;
   if (limbIndex < 0 || limbIndex >= (int)limbs_.size()) return;
+  // SANDVOX_SHIELD_TRACE: a shield leaving by Sever() is a fault to attribute
+  // (a block should wear it or break it, never sever it).
+  if (IsShieldSlot(limbIndex) && std::getenv("SANDVOX_SHIELD_TRACE"))
+    std::printf("shield trace: mob %llu Sever(slot %d) cause %d hp %.1f\n",
+                (unsigned long long)id_, limbIndex, (int)ctx.cause,
+                (double)limbs_[limbIndex].hp);
   // limbDefs_, not def.limbs: a borrowed item slot severs like any limb (the
   // sword is cut out of the hand), and its def row only exists on the copy.
   const MobLimbDef& ld = limbDefs_[limbIndex];
@@ -27407,6 +27537,10 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
 void Mob::DetachLimb(int limbIndex, bool adopt, bool keepJoint) {
   MobLimb& limb = limbs_[limbIndex];
   if (!limb.body) return;
+  if (IsShieldSlot(limbIndex) && std::getenv("SANDVOX_SHIELD_TRACE"))
+    std::printf("shield trace: mob %llu DetachLimb(slot %d) hp %.1f vox %zu\n",
+                (unsigned long long)id_, limbIndex, (double)limb.hp,
+                limb.voxels.size());
   // A BORROWED hold (SetHeldBorrowed) is never adopted: the item it shows is
   // still wherever it lives (the bag), so a body registered as that item
   // would be a second one. The prop's body is removed; held_ keeps the slot
@@ -31975,8 +32109,10 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
     hh.kitStale = false;   // an empty fist is exactly what the kit says
     // The strike hand follows what is left: emptying the fist the driver
     // served while the other still holds something hands the driver over.
+    // (Never to a shield: a shield never takes the driver.)
     if (whichHand == strikeHand_ &&
-        held_[HandIndex(OtherHand(whichHand))].slot >= 0)
+        held_[HandIndex(OtherHand(whichHand))].slot >= 0 &&
+        !held_[HandIndex(OtherHand(whichHand))].shield)
       strikeHand_ = OtherHand(whichHand);
     return true;
   }
@@ -32159,6 +32295,19 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
     p.voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, v.color,
                         (uint16_t)(v.material | (variant << 12))});
   }
+  // THE SPAWN CENSUS a body limb and a worn shell take (CarveLimb charges hp
+  // as a FRACTION of it). A held item never took one, because nothing but a
+  // blast ever carved one -- and with a zero census every voxel a carve took
+  // charged the item's WHOLE hp x gore.carveHpPerVolume (measured on a shield
+  // after the first chip of a block: 180 hp for two voxels). A shield is
+  // carved by every blow it stops (melee.cpp ResolveShieldBlock), so it needs
+  // the denominator. EquipItemAsWas re-syncs the charged half to a restored
+  // lattice (RestoreShellLattice), leaving this as the authored denominator.
+  p.voxelsAtSpawn = (uint32_t)p.voxels.size();
+  p.voxelsCharged = p.voxelsAtSpawn;
+  LimbWoundTotals(p, p.weightAtSpawn, p.organAtSpawn);
+  p.weightCharged = p.weightAtSpawn;
+  p.organCharged = p.organAtSpawn;
 
   // Body at the composed pose. The body sits at the item's MIN CORNER, not at
   // its anchor — the same place BuildRig puts a limb's body.
@@ -32241,9 +32390,20 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
   // The weapon-arm IK derives the arm from the held part's parent, so the
   // slot is the whole of it; the NAME is kept for a def reload's re-resolve.
   hh.part = ld.name;
+  // A SHIELD (item.h ItemKind::Shield): its costs ride the hand, so the tick
+  // never looks the item up by name to know how fast it comes up.
+  hh.shield = item->IsShield();
+  hh.shieldSpec = item->shield;
   // A fist that was empty hands the driver to the one that now holds
   // something, so a creature armed in one hand swings with that hand.
-  if (held_[HandIndex(strikeHand_)].slot < 0) strikeHand_ = whichHand;
+  // A SHIELD NEVER TAKES THE DRIVER -- the stroke would swing a slab with no
+  // edge -- and a weapon arriving beside a shield takes it from the shield.
+  if (hh.shield) {
+    if (strikeHand_ == whichHand) strikeHand_ = OtherHand(whichHand);
+  } else if (held_[HandIndex(strikeHand_)].slot < 0 ||
+             held_[HandIndex(strikeHand_)].shield) {
+    strikeHand_ = whichHand;
+  }
   // A weapon lattice is the ITEM's, at the ITEM's scale — not the wearer's
   // skin. Recorded so every scale-taking operation on this slot (burn, carve,
   // re-skin, drop) converts by the right divisor; before shells existed this
@@ -34481,10 +34641,17 @@ bool StyleUsable(const Mob& who, const AttackStyle& sty) {
   // button); the style vocabulary only asks whether it can be swung at all.
   // ...or an EMPTY fist to throw it with (Mob::ArmForStyle: the directional
   // strikes are the unarmed strikes too).
-  if (sty.weapon.empty() || sty.weapon == "held")
-    return who.HeldSlot(Hand::Right) >= 0 || who.HeldSlot(Hand::Left) >= 0 ||
+  // A SHIELD is in a fist without being a weapon (it is raised, not swung):
+  // it neither swings the style nor leaves that fist free to punch it.
+  if (sty.weapon.empty() || sty.weapon == "held") {
+    auto weapon = [&](Hand h) {
+      const int s = who.HeldSlot(h);
+      return s >= 0 && !who.IsShieldSlot(s);
+    };
+    return weapon(Hand::Right) || weapon(Hand::Left) ||
            (who.HeldSlot(Hand::Right) < 0 && who.HandFist(Hand::Right)) ||
            (who.HeldSlot(Hand::Left) < 0 && who.HandFist(Hand::Left));
+  }
   const MobNaturalWeaponDef* nw = who.NaturalWeaponNamed(sty.weapon);
   return nw != nullptr && who.NaturalWeaponUsable(*nw);
 }

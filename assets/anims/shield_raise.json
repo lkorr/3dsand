@@ -1,0 +1,40 @@
+{
+  "//": "A SHIELD RAISED (Mob::StepShield, item.h ShieldSpec::clip): the shield arm brought up with the forearm across the chest, the shield upright and facing forward in front of the sternum. Authored for a shield in the RIGHT fist; the left plays the derived .mirror. The engine sets this clip's WEIGHT to the raise fraction every tick (restFill: weight w is w of the way from rest to the key), so the arm is exactly as far up as the mechanics say at whatever speed the shield comes up; no blend-in for that reason. pitchFollow lifts and tilts the shield with the look. Solved by scripts/gen_shield_clips.py from targets -- edit them there and re-run, never these quaternions. ",
+  "name": "shield_raise",
+  "sidecarVoxelsPerMetre": 10,
+  "durationMs": 1200,
+  "loop": true,
+  "mode": "override",
+  "blendInMs": 0,
+  "blendOutMs": 0,
+  "mask": ["armU.R", "armL.R", "hand.R"],
+  "quietAdditive": {
+    "armU.R": 1.0,
+    "armL.R": 1.0,
+    "hand.R": 1.0
+  },
+  "pitchFollow": {
+    "armU.R": 0.85
+  },
+  "tracks": {
+    "armU.R": {
+      "rot": [
+        { "t": 0, "q": [-0.0548, 0.4691, -0.5457, 0.6922] },
+        { "t": 1200, "q": [-0.0548, 0.4691, -0.5457, 0.6922] }
+      ]
+    },
+    "armL.R": {
+      "rot": [
+        { "t": 0, "q": [-0.7664, 0.0, 0.0, 0.6423] },
+        { "t": 1200, "q": [-0.7664, 0.0, 0.0, 0.6423] }
+      ]
+    },
+    "hand.R": {
+      "rot": [
+        { "t": 0, "q": [-0.1813, -0.4248, 0.1284, 0.8776] },
+        { "t": 1200, "q": [-0.1813, -0.4248, 0.1284, 0.8776] }
+      ]
+    }
+  },
+  "restFill": true
+}

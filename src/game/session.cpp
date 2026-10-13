@@ -801,6 +801,9 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
         // Fly mode is exempt for the same reason the injuries are: the debug
         // camera should not be encumbered.
         if (!player.fly) player.speedScale *= grab.SpeedScale(CurrentTuning().player);
+        // ...and so does a RAISED SHIELD (item.h ShieldSpec::moveScale), by
+        // how far up it is: you walk behind a shield, you do not run.
+        if (couple) player.speedScale *= avatar.ShieldMoveScale();
       }
       // ---- component 9: impact ripples -------------------------------------
       // The event source, and it is a RISING EDGE rather than a per-tick test:
@@ -1449,6 +1452,25 @@ static void PhaseD(TickAuthorityCtx& w, WorldScratch& ws,
                                            : 0];
             const ItemDef* weapon = items.At(items.Find(pick));
             if (weapon != nullptr) mobs.EquipItem(nid, weapon);
+            // ...AND THE OFF HAND (UIState::aiOffhandNames): a shield in the
+            // left fist. A random human with a one-handed blade takes one a
+            // third of the time (a cleaver is two-handed in all but code, and
+            // a bow wants the other hand for the string).
+            {
+              std::string off;
+              if (rnd) {
+                const bool oneHanded = weapon != nullptr && !weapon->IsBow() &&
+                                       weapon->name != "cleaver";
+                if (oneHanded && ui.aiOffhandNames.size() > 1 &&
+                    rpick(21, 3) == 0)
+                  off = ui.aiOffhandNames[1 + rpick(22, (uint32_t)ui.aiOffhandNames.size() - 1)];
+              } else if (ui.aiOffhandPick > 0 &&
+                         ui.aiOffhandPick < (int)ui.aiOffhandNames.size()) {
+                off = ui.aiOffhandNames[ui.aiOffhandPick];
+              }
+              const ItemDef* sh = off.empty() ? nullptr : items.At(items.Find(off));
+              if (sh != nullptr) mobs.EquipItem(nid, sh, "held_left");
+            }
             // WHAT IT WEARS (UIState::aiOutfit). Through MobSystem::WearItem,
             // the path the player's own equip slots take, so a spawn dressed
             // here is a creature in armour and not a dev-only object: its
@@ -2843,6 +2865,9 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
           case StrokeCursor::Phase::Recover: act = ai::Action::Recover; break;
           default:
             if (pl.melee.Phase() == SwingPhase::Guard) act = ai::Action::Guard;
+            // ...or a SHIELD up (the NPC side publishes the same, mob.cpp).
+            else if (pl.avatar.Spawned() && pl.avatar.ShieldRaise() >= 0.5f)
+              act = ai::Action::Guard;
             break;
         }
         ws.actors.push_back({pl.player.pos, Player::kHalfXZ,
@@ -3241,6 +3266,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         // off-view — were invisible to every gate, for the simple reason that
         // the policy only ever ran inside this render loop. It is pure, so the
         // selftest can drive it directly.
+        const float headingBefore = avatarHeading;
         avatarHeading = ResolveAvatarHeading(
             camMode, camHeading, avatarHeading,
             Vec3{player.vel.x - player.slideVel.x, 0,
@@ -3262,6 +3288,46 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           float d = want - avatarHeading;
           d -= 6.2831853f * std::floor((d + 3.14159265f) / 6.2831853f);
           avatarHeading += d * (1.0f - std::pow(0.5f, kTickDt / 0.08f));
+        }
+
+        // ---- THE SHIELD (item.h ItemKind::Shield, game/mob_shield.cpp) -------
+        // The shield hand's button HELD raises it, the rig steps the raise at
+        // the shield's own rate, and everything it costs reads that raise. It
+        // comes up only BETWEEN strokes of the other arm (or in a stroke's
+        // recover): an arm mid-windup or mid-cut is committed, and a shield
+        // that could snap up over a cut already thrown is the turtle with a
+        // sword. A strike pressed while it is up lowers it (`shieldYield`, the
+        // bank in the strike block below) until that strike has begun; from
+        // there the committed arm holds it down through the windup and the
+        // cut, and a button still held brings it back up in the recover --
+        // "hold to block" stays held, and every swing still costs an
+        // unguarded windup and cut and a guard that has to come back up.
+        if (avatar.Spawned()) {
+          int shk = -1;
+          for (int hk = 0; hk < kHands && shk < 0; hk++)
+            if (hands.hand[hk].shield) shk = hk;
+          const uint32_t shBtn =
+              shk >= 0 && HandAt(shk) == Hand::Left ? TB_ALT : TB_ATTACK;
+          const bool armBusy =
+              playerStrike.phase == StrokeCursor::Phase::Windup ||
+              playerStrike.phase == StrokeCursor::Phase::Cut;
+          if (s.shieldYield && strikeQueued < 0) s.shieldYield = false;
+          const bool want = shk >= 0 && st.intent.handsUp && avatar.Alive() &&
+                            ti.Held(shBtn) && !armBusy && !s.shieldYield &&
+                            s.bowDrawTicks == 0 && s.throwTicks == 0;
+          avatar.SetShieldWant(want);
+          avatar.StepShield();
+          // THE BODY TURNS NO FASTER THAN THE SHIELD LETS IT, and toward the
+          // CAMERA in either mode: the shield guards where you look, so a
+          // third-person body stops facing its run while it is up. The free
+          // rate above is replaced, not added to -- a raised shield is the
+          // slowest thing about turning.
+          if (avatar.ShieldRaise() > 0.0f) {
+            float d = camHeading - headingBefore;
+            d -= 6.2831853f * std::floor((d + 3.14159265f) / 6.2831853f);
+            const float maxStep = avatar.ShieldTurnRate(1.0e3f) * kTickDt;
+            avatarHeading = headingBefore + std::clamp(d, -maxStep, maxStep);
+          }
         }
 
         // FLY MODE HAS NO BODY. Two things go wrong otherwise, and the second
@@ -3528,7 +3594,24 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
               strikeBuffered = -1;
             }
             const Hand qHand = s.strikeQueuedHand;
-            if (strikeQueued >= 0 && hands[qHand].ready && avatar.Spawned()) {
+            // ---- BEHIND A RAISED SHIELD THE OTHER ARM WAITS ------------------
+            // (Mob::ShieldBlocksStrike, melee.shieldStrikeBelow.) The press is
+            // BANKED, not dropped, and it lowers the shield (`shieldYield`,
+            // read by the shield block next tick): one click is "drop the
+            // guard and hit", and the strike begins the tick the shield is
+            // low enough -- the lowering is the first beat of its telegraph.
+            // A bank older than a second is let go.
+            bool shieldHolds = false;
+            if (strikeQueued >= 0 && hands[qHand].ready && avatar.Spawned() &&
+                avatar.ShieldBlocksStrike()) {
+              s.shieldYield = true;
+              shieldHolds = ++s.shieldStrikeWait <= 30;
+              if (!shieldHolds) strikeQueued = -1;
+            }
+            if (!shieldHolds) s.shieldStrikeWait = 0;
+            if (shieldHolds) {
+              // Banked behind the shield: nothing begins this tick.
+            } else if (strikeQueued >= 0 && hands[qHand].ready && avatar.Spawned()) {
               const bool chained =
                   playerStrike.Active() && chainsNow(strikeQueued, qHand);
               const bool otherHand = chained && qHand != playerStrike.hand;
@@ -6014,6 +6097,8 @@ static void ResolveHands(TickAuthorityCtx& w, SessionTick& st) {
       // A BOW is held like a weapon and shot, not swung (PhaseG's bow block).
       hn.bow = d->IsBow();
       hn.weapon = d->kind == ItemKind::Melee && !hn.bow;
+      // A SHIELD is raised, not swung (the shield block): never `ready`.
+      hn.shield = d->IsShield();
       hn.vessel = d->IsContainer();
     }
     // No body (fly mode, dead) swings nothing; an arm that is gone or

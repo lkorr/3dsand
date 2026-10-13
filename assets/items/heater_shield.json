@@ -1,0 +1,49 @@
+{
+  "comment": "A heater shield, 0.48 m by 0.62 m: wooden boards faced with a sheet of iron and bound at the edge in steel, carried on a grip and a forearm strap. The face does not burn and a blade only scores it; the boards behind it will still catch. Regenerate with scripts/gen_shield_items.py; the hilt box is emitted from the same constants that build the mesh, so the fist cannot drift off the grip.",
+  "name": "heater_shield",
+  "model": "heater_shield",
+  "artVoxelsPerMetre": 80,
+  "hp": 110,
+  "severable": true,
+  "severImpactSpeed": 0,
+  "grip": {
+    "held_left": {
+      "translation": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        90,
+        0,
+        0
+      ],
+      "scale": 1.0
+    },
+    "held_right": {
+      "translation": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        90,
+        0,
+        180
+      ],
+      "scale": 1.0
+    }
+  },
+  "hilt": {
+    "min": [
+      0,
+      18,
+      21
+    ],
+    "size": [
+      2,
+      2,
+      12
+    ]
+  }
+}

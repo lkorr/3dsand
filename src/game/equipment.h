@@ -155,12 +155,15 @@ inline const EquipSlotDef* EquipSlots() {
        "requires: a carryable item"},
       {EquipSlotId::Quick3, "Quick IV", "slot_quick", {ItemKind::Melee},
        "requires: a carryable item"},
-      // What a hand can hold is what the rig can grip: a weapon or a vessel.
-      // Armour is worn, not held, and a trinket is worn round the neck.
+      // What a hand can hold is what the rig can grip: a weapon, a vessel or
+      // a shield. Armour is worn, not held, and a trinket is worn round the
+      // neck.
       {EquipSlotId::HandR, "Right hand", "slot_hands",
-       {ItemKind::Melee, ItemKind::Container}, "requires: something to hold"},
+       {ItemKind::Melee, ItemKind::Container, ItemKind::Shield},
+       "requires: something to hold"},
       {EquipSlotId::HandL, "Left hand", "slot_hands",
-       {ItemKind::Melee, ItemKind::Container}, "requires: something to hold"},
+       {ItemKind::Melee, ItemKind::Container, ItemKind::Shield},
+       "requires: something to hold"},
   };
   return k;
 }
