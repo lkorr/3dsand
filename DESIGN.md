@@ -22032,6 +22032,40 @@ merges almost nothing here, because worldgen's palette jitter gives every
 adjacent stone cell a different variant: a 64³ region of plain rock becomes ~25k
 unmergeable quads. Merging on exposure alone makes a flat plain a handful of
 quads whatever it is made of — measured 2.6k quads per region against ~25k — and
+What a request does NOT pay for (the Dungeons-tab speed pass, 2026-10-12;
+numbers are Shardwell isolated, one machine):
+
+* **Sky and rock are never read back.** genChunk publishes each chunk's
+  page-table class (`genAct`, world.h kGenVerdict*). EMPTY chunks are air; a
+  UNIFORM or JITTER chunk's samples are synthesised on the CPU by `SynthWordAt`
+  (majority = the one material, first-cell = the block's min corner) — exact,
+  the `voxregion` gate holds both lods byte-identical to the readback path. An
+  isolated dungeon's box is ~96% buried stone: lod 8 1.6 s → 0.44 s, lod 4
+  0.38 → 0.06 s, lod 1 48 → 10 ms. What is left at lod 8 is genChunk itself
+  over 512³ cells.
+* **Outside the viewer's ROI is not generated.** `REGION … CLIP` /
+  `/api/voxregion?clip=` (worldview.js sends `view.roi`): chunks wholly outside
+  are air, which is what the viewer draws there anyway. A 512³ root over a
+  dungeon ROI is ~3× the dungeon's volume.
+* **A dungeon edit does not reload the map.** `PreviewDungeon` re-places a
+  program of the same shape on the loaded map (`worldmap::ReplaceScratchDungeon`
+  — LoadWorldMap's anchor rule and content-hash fold; `dungeon-format` holds
+  its packed words identical to a full load) and re-packs: ~2.5 s → ~0.1 s per
+  slider move. Valid while the files are the ones the last full reload read:
+  RELOAD/SWATCH/CLEAR drop it and the tuner RELOADs on any signature change.
+* **No game boot.** The voxel tools dispatch straight after sim init (no Jolt,
+  mobs, items, streamer, far field: −2.2 s) and build no far horizon
+  (`horizon::SetBuildEnabled(false)`: −0.5 s at boot and per reload).
+* **No boot for the palette.** `/api/voxpalette` is cached on disk by the
+  material files + the exe, and a hit starts the server's boot in the
+  background, so a 3D view's first draw does not wait out a boot it does not
+  need yet.
+
+Where the time goes, without guessing: `SANDVOX_VOXPROF=1` makes the server
+print one `voxprof` line per region (chunks generated / read back /
+synthesised / sky, and ms for gen, verdict wait, readback, downsample) and
+`envprof` laps through `ReloadEnvironment`, on stderr.
+
 the material stays exact per voxel, jitter included. The same texture pays for
 per-fragment ambient occlusion (which therefore survives the merging, unlike
 baked vertex AO) and for the voxel edge lines that fade in when cells are big

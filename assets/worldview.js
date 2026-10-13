@@ -1122,6 +1122,14 @@
             '&lod=' + lod + '&seed=' + this.seed +
             '&layer=' + encodeURIComponent(this.layerSel || '@map') +
             (this.mapName ? '&map=' + encodeURIComponent(this.mapName) : '');
+    // THE ROI IS A CLIP, NOT ONLY A TREE FILTER: what lies outside it is drawn
+    // as air (_buildTree's `outside` nodes), so the server need not generate
+    // it. A 512-voxel root over a dungeon ROI used to evaluate ~3x the
+    // dungeon's volume in genChunk; the server normalises the box to chunks
+    // and drops it when it keeps the whole region (tuner_server.py).
+    var roi = this.view.roi;
+    if (roi) q += '&clip=' + [Math.floor(roi.min[0]), Math.floor(roi.min[1]), Math.floor(roi.min[2]),
+                              Math.ceil(roi.max[0]), Math.ceil(roi.max[1]), Math.ceil(roi.max[2])].join(',');
     var gen = this.gen, seq = this.refreshSeq;
     this.inflight++;
     this.pending.set(key, gen);
@@ -1485,9 +1493,14 @@
     return seq;
   };
   // How many resident regions are still waiting on a soft refresh.
+  // LIVE regions only (in the last update's tree). A refreshBox also marks the
+  // CACHE -- regions the camera has left -- and update() refetches a stale
+  // region only when it is back in the tree, so counting those held a host's
+  // "refreshing" (and the Dungeons tab's readiness) open forever after any
+  // edit made away from where the camera had been.
   WorldView.prototype.staleCount = function () {
-    var n = 0;
-    this.regions.forEach(function (r) { if (r.staleSeq > (r.fetchedSeq || 0)) n++; });
+    var n = 0, f = this._frame;
+    this.regions.forEach(function (r) { if (r.lastLive === f && r.staleSeq > (r.fetchedSeq || 0)) n++; });
     return n;
   };
 

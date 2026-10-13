@@ -115,6 +115,7 @@
 #include "telemetry.h"
 #include "test/selftest.h"
 #include "sim/faredits.h"
+#include "sim/horizon.h"   // SetBuildEnabled: the voxel tools draw nothing
 #include "tools/voxregion.h"  // --voxdump / --voxserve, the tuner's voxel view
 #include "measure/measure.h"
 #include "measure/perfsuite.h"
@@ -7271,6 +7272,10 @@ int main(int argc, char** argv) {
     const bool eager = (!checkedOutput && !voxelTool) || rendersHorizon;
     sim.SetFarBuild(eager ? Simulation::FarBuild::Eager
                           : Simulation::FarBuild::Lazy);
+    // ...nor the far HORIZON (sim/horizon.h): render-only, never read by
+    // genChunk, and a ~0.5 s bake on Tirnhallow at Init and again on every
+    // environment reload a voxel tool makes (each dungeon preview install).
+    if (voxelTool) horizon::SetBuildEnabled(false);
     if (!eager)
       std::printf("far-cascade pipelines: lazy (compiled only if this run asks "
                   "for cascade content)\n");
@@ -7279,6 +7284,33 @@ int main(int argc, char** argv) {
                 assetDir + "/shaders"))
     return 1;
   StartupMark("sim init: every compute shader through Tint + the driver");
+
+  // THE VOXEL TOOLS ANSWER HERE (--voxdump / --voxserve / --export-edits):
+  // the device, the compute pipelines and the material table exist, which is
+  // all genChunk needs. Everything below -- Jolt, debris, mob defs and their
+  // micro-body bricks, items, the streamer, the far field -- is the game's,
+  // and was ~2.2 s of every voxel-server boot (the tuner's 3D views wait on
+  // that boot). The far cascades and the raymarch variant stay deferred, as
+  // the block further down would set them for these modes.
+  if (voxserve || !voxdumpArgs.empty() || !exportEdits.empty()) {
+    sim.AllowDeferredFar(true);
+    sim.AllowDeferredRaymarchVariant(true);
+    // The seeding Stream::Init would have done (the requests re-seed the page
+    // table per region; this keeps the state what it was before the move).
+    if (world.pages) world.pages->SetWorldSeed(kDefaultSeed);
+    world.SetMirrorSeed(kDefaultSeed);
+    // Flush the boot's uploads (the world map, the tree atlas) out of the
+    // staging ring before the first request queues its own: see "SUBMIT WHAT
+    // IS QUEUED FIRST" below for the abort that rule exists for.
+    {
+      rhi::CommandEncoder flushEnc = ctx.device.CreateCommandEncoder();
+      ctx.queue.Submit(flushEnc.Finish());
+    }
+    if (!voxdumpArgs.empty())
+      return RunVoxDump(ctx, world, sim, mats, voxdumpArgs, voxdumpOut);
+    if (voxserve) return RunVoxServe(ctx, world, sim, mats);
+    return RunExportEdits(ctx, world, sim, mats, exportEdits);
+  }
 
   // --shader-stats answers HERE, before a player, a physics world or a single
   // tick exists: every pipeline in the engine has now been created, which is
@@ -7516,14 +7548,7 @@ int main(int argc, char** argv) {
   if (renderBudget)
     return sandvox::RunRenderBudget(ctx, world, sim, mats, perfOpt);
   if (perf) return sandvox::RunPerf(ctx, world, sim, mats, perfOpt);
-  // The voxel-region modes answer here: after the device, shaders and material
-  // table exist (genCellIn is WGSL and the palette is the COMPILED table), and
-  // before anything spawns a player, a mob or a physics world — none of which a
-  // terrain dump has any use for.
-  if (!voxdumpArgs.empty())
-    return RunVoxDump(ctx, world, sim, mats, voxdumpArgs, voxdumpOut);
-  if (voxserve) return RunVoxServe(ctx, world, sim, mats);
-  if (!exportEdits.empty()) return RunExportEdits(ctx, world, sim, mats, exportEdits);
+  // (The voxel-region modes answered above, straight after sim init.)
   if (shot) return RunShots(ctx, world, sim, mats);
   if (shotWaterfall) return RunWaterfallShot(ctx, world, sim);
   if (shotDebrisPond) return RunDebrisPondShot(ctx, world, sim, mats);

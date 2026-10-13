@@ -50,9 +50,16 @@ uint64_t LightWords(const std::vector<uint32_t>& w) {
   return kLightHeaderWords + 2ull * (uint64_t)w[kHNX] * (uint64_t)w[kHNZ];
 }
 
+namespace {
+bool g_buildEnabled = true;
+}  // namespace
+void SetBuildEnabled(bool on) { g_buildEnabled = on; }
+bool BuildEnabled() { return g_buildEnabled; }
+
 void Build(const worldmap::WorldMapData& m, const std::vector<uint32_t>& wm, uint32_t seed,
            std::vector<uint32_t>& out, const TreeAtlas* trees) {
   out.assign(kHeaderWords, 0u);
+  if (!g_buildEnabled) return;                    // a process that never draws
   if (!m.Loaded() || m.height.empty()) return;   // kHValid stays 0
 
   const int S = 1 << kSampleLog2;

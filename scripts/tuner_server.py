@@ -1088,6 +1088,51 @@ class VoxServe:
 _voxserve = VoxServe()
 
 
+def _palette_key():
+    """What /api/voxpalette's bytes are a function of: the material and
+    reaction files (LoadAssets) and the exe that compiles them (VoxPaletteJson
+    is C++). None when one of them cannot be read: no cache, ask the server."""
+    try:
+        st = os.stat(EXE)
+    except OSError:
+        return None
+    h = hashlib.sha1(("%d,%d" % (st.st_mtime_ns, st.st_size)).encode())
+    for path in (WRITABLE["materials"], os.path.join(os.path.dirname(WRITABLE["materials"]), "reactions.json")):
+        d = _file_digest(path)
+        if d == b"?":
+            return None
+        h.update(d)
+    return h.hexdigest()[:16]
+
+
+_warm_lock = threading.Lock()
+_warm_busy = False
+
+
+def _voxserve_warm(map_name=None):
+    """Boot --voxserve in the background if it is not alive, so the first
+    region does not pay the boot. Fire and forget: a failure here is the first
+    region's to report, and a busy GPU lock just means the region waits as it
+    always did."""
+    global _warm_busy
+    if _voxserve.proc is not None and _voxserve.proc.poll() is None:
+        return
+    with _warm_lock:
+        if _warm_busy:
+            return
+        _warm_busy = True
+
+    def run():
+        global _warm_busy
+        try:
+            _voxserve.command("PING", hold_lock=False, map_name=map_name)
+        except Exception:
+            pass
+        finally:
+            _warm_busy = False
+    threading.Thread(target=run, daemon=True).start()
+
+
 _SIG_CACHE = {}
 
 
@@ -1110,7 +1155,29 @@ def _file_digest(path):
     return hit
 
 
+# _world_signature memo: name -> (time, sig). Every region request asks for the
+# signature, and computing it is a listdir + stat of every plane tile, biome,
+# water and tree file (~10 ms on Tirnhallow) -- a cold octree of a few hundred
+# regions spent seconds re-proving nothing had changed. A second of staleness
+# is safe because every save this server makes is a POST, and do_POST drops
+# the memo before it handles one; only an edit from OUTSIDE the tuner (an
+# editor, another agent) is seen up to a second late.
+_SIG_MEMO = {}
+_SIG_MEMO_SEC = 1.0
+
+
 def _world_signature(name=None):
+    name = name or _tuning_map()
+    hit = _SIG_MEMO.get(name)
+    now = time.time()
+    if hit and now - hit[0] < _SIG_MEMO_SEC:
+        return hit[1]
+    sig = _world_signature_uncached(name)
+    _SIG_MEMO[name] = (now, sig)
+    return sig
+
+
+def _world_signature_uncached(name=None):
     """What the generated world depends on, as a short hex string.
 
     The cache key has to move when the world does, and the voxel server's
@@ -1494,8 +1561,19 @@ def _layer_path_region_digest(path, ox, oy, oz, ext_x, ext_y, ext_z):
     return h.hexdigest()[:12] if any_rec else ""
 
 
+_voxcache_writes = [0]
+
+
 def _voxcache_sweep():
-    """Trim the cache to VOXCACHE_MAX files, oldest-accessed first."""
+    """Trim the cache to 90% of VOXCACHE_MAX files, oldest-accessed first.
+
+    HYSTERESIS, and a listdir only every 64th write: at the cap the old sweep
+    stat-ed every file to delete ONE, on every region written -- tens of ms
+    per region once a dungeon session (whose every edit is a new program and
+    so new keys) had filled it."""
+    _voxcache_writes[0] += 1
+    if _voxcache_writes[0] % 64 != 1:
+        return
     try:
         names = os.listdir(VOXCACHE)
     except OSError:
@@ -1510,7 +1588,7 @@ def _voxcache_sweep():
         except OSError:
             pass
     entries.sort()
-    for _, p in entries[:len(entries) - VOXCACHE_MAX]:
+    for _, p in entries[:len(entries) - (VOXCACHE_MAX * 9) // 10]:
         try:
             os.remove(p)
         except OSError:
@@ -2103,6 +2181,26 @@ class Handler(BaseHTTPRequestHandler):
             if v % 16:
                 return self._json(400, {"ok": False,
                                         "error": "box origin must be a multiple of 16"})
+        # `clip=x0,y0,z0,x1,y1,z1` (world voxels, inclusive): the viewer's ROI.
+        # Chunks wholly outside it are not generated and come back as air
+        # (VoxRegionReq::clip). Normalised to the CHUNK grid and to the box, so
+        # every request that would produce the same bytes shares one cache
+        # key -- and a clip that keeps the whole box is no clip at all.
+        clip = None
+        if q.get("clip"):
+            try:
+                c = [int(float(v)) for v in q["clip"][0].split(",")]
+                if len(c) != 6:
+                    raise ValueError
+            except ValueError:
+                return self._json(400, {"ok": False, "error": "clip wants x0,y0,z0,x1,y1,z1"})
+            o, ext = (ox, oy, oz), (nx * lod, ny * lod, nz * lod)
+            lo = [max(o[i], (c[i] // 16) * 16) for i in range(3)]
+            hi = [min(o[i] + ext[i] - 1, (c[i + 3] // 16) * 16 + 15) for i in range(3)]
+            if any(lo[i] > hi[i] for i in range(3)):
+                lo, hi = list(o), [o[i] - 1 for i in range(3)]      # nothing kept: all air
+            if lo != list(o) or hi != [o[i] + ext[i] - 1 for i in range(3)]:
+                clip = lo + hi
 
         # WHICH MAP (map v2 E4): `map=` names one (the locale editor's 3D view
         # asks for the map it edits); absent = tuning's world.mapLayer, what the
@@ -2125,9 +2223,10 @@ class Handler(BaseHTTPRequestHandler):
         else:
             ldig = _layer_region_digest(layer, ox, oy, oz, nx * lod, ny * lod, nz * lod)
         scratch = _voxserve.scratch_key if _voxserve.scratch_map == mname else ""
-        key = hashlib.sha1(("%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%s%s" % (
+        key = hashlib.sha1(("%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%s%s%s" % (
             ox, oy, oz, nx, ny, nz, lod, seed, sig, layer, ldig,
-            ("," + scratch) if scratch else "")
+            ("," + scratch) if scratch else "",
+            (",clip" + ",".join(map(str, clip))) if clip else "")
         ).encode()).hexdigest()
         cached = os.path.join(VOXCACHE, key + ".gz")
         want_gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
@@ -2145,8 +2244,10 @@ class Handler(BaseHTTPRequestHandler):
         os.makedirs(VOXTMP, exist_ok=True)
         os.makedirs(VOXCACHE, exist_ok=True)
         raw = os.path.join(VOXTMP, key + ".bin")
-        cmd = "REGION %d %d %d %d %d %d %d %d %s" % (
-            ox, oy, oz, nx, ny, nz, lod, seed, raw.replace("\\", "/"))
+        cmd = "REGION %d %d %d %d %d %d %d %d %s%s" % (
+            ox, oy, oz, nx, ny, nz, lod, seed,
+            ("CLIP %d %d %d %d %d %d " % tuple(clip)) if clip else "",
+            raw.replace("\\", "/"))
         try:
             ok, msg = _voxserve.sync(sig, mname, REGION_LOCK_SEC)
             if not ok:
@@ -2179,7 +2280,10 @@ class Handler(BaseHTTPRequestHandler):
         # makes the run-length coding in the file itself nearly useless on
         # solid rock. Cached in the compressed form, since that is what almost
         # every response sends.
-        packed = gzip.compress(blob, 6)
+        # Level 1, not 6: on a 1.4 MB region 6 is ~45 ms and 1 is ~9 ms for a
+        # reply ~1.7x the size -- over a loopback hop the bytes are free and
+        # the 35 ms is not (a cold dungeon view is hundreds of regions).
+        packed = gzip.compress(blob, 1)
         try:
             with open(cached, "wb") as f:
                 f.write(packed)
@@ -2248,7 +2352,12 @@ class Handler(BaseHTTPRequestHandler):
         else:
             return self._json(400, {"ok": False, "error": "mode must be isolate, place, map or clear"})
         try:
-            ok, msg = _voxserve.command(line, map_name=mname, lock_timeout=REGION_LOCK_SEC)
+            # RELOAD first if the world's files moved since the server read them:
+            # the voxel server re-places a program on the map it LOADED (its
+            # dungeon fast path, voxregion.cpp), so it must be the current one.
+            ok, msg = _voxserve.sync(_world_signature(mname), mname, REGION_LOCK_SEC)
+            if ok:
+                ok, msg = _voxserve.command(line, map_name=mname, lock_timeout=REGION_LOCK_SEC)
         except LockBusy as e:
             return self._json(503, {"ok": False, "busy": True, "error": "busy: " + str(e)})
         except Exception as e:
@@ -2388,12 +2497,28 @@ class Handler(BaseHTTPRequestHandler):
     def _voxpalette(self):
         out = os.path.join(VOXTMP, "palette.json")
         os.makedirs(VOXTMP, exist_ok=True)
-        # PALETTE touches no GPU, so it does not queue behind a build.
-        # Any live map will do; `map=` (E4) names the one the caller is about
-        # to ask regions of, so a cold server boots on it once, not twice.
         mname = (self._query().get("map") or [""])[0]
         if mname and not _worldmap_dir(mname):
             return self._json(400, {"ok": False, "error": "bad map name"})
+        # THE PALETTE IS A FUNCTION OF THE MATERIAL FILES AND THE EXE, NOT OF
+        # A LIVE SERVER. It used to need one: a cold tab asked for it first,
+        # and every 3D view waited out a whole --voxserve boot (6-8 s, longer
+        # behind somebody's GPU run) before it drew a voxel. Cached on disk by
+        # content, so a tab opens at once; the miss path below is the old one.
+        key = _palette_key()
+        cached = os.path.join(VOXCACHE, "palette_" + key + ".json") if key else None
+        if cached and os.path.isfile(cached):
+            # The regions come next and they DO need the process: start its
+            # boot now, behind the reply, instead of on the first region.
+            _voxserve_warm(mname or None)
+            try:
+                with open(cached, "rb") as f:
+                    return self._send(200, f.read(), "application/json")
+            except OSError:
+                pass
+        # PALETTE touches no GPU, so it does not queue behind a build.
+        # Any live map will do; `map=` (E4) names the one the caller is about
+        # to ask regions of, so a cold server boots on it once, not twice.
         live = _voxserve.proc is not None and _voxserve.proc.poll() is None
         ok, msg = _voxserve.command("PALETTE " + out.replace("\\", "/"),
                                     hold_lock=False, map_name=mname if (mname and not live) else "*")
@@ -2401,9 +2526,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(503, {"ok": False, "error": msg})
         try:
             with open(out, "rb") as f:
-                return self._send(200, f.read(), "application/json")
+                body = f.read()
         except OSError as e:
             return self._json(500, {"ok": False, "error": str(e)})
+        if cached:
+            try:
+                os.makedirs(VOXCACHE, exist_ok=True)
+                with open(cached + ".tmp", "wb") as f:
+                    f.write(body)
+                os.replace(cached + ".tmp", cached)
+            except OSError:
+                pass
+        return self._send(200, body, "application/json")
 
     def do_GET(self):
         p = self.path.split("?")[0]
@@ -2853,6 +2987,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         p = self.path.split("?")[0]
+        # Any POST may be a save: the next region asks the disk again.
+        _SIG_MEMO.clear()
         if p == "/api/testresult":
             # perfview_test.html reports its verdict HERE rather than through
             # Chrome's --dump-dom, because the live arm cannot use

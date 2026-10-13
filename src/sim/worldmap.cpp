@@ -903,6 +903,109 @@ uint32_t HashEditLayerFiles(const std::vector<std::pair<std::string, std::string
   return h;
 }
 
+// THE DUNGEONS' ANCHORS (PLAN_dungeons §2.1): the bare ground at `at`, the
+// same resolution a locale anchor takes, so the whole dungeon rides the
+// ground AT THE ANCHOR, rigidly. The scratch ISOLATE dungeon names its y.
+// LoadWorldMap's, and ReplaceScratchDungeon's: one placement rule. Reads the
+// CURRENT map's bare ground (LoadWorldMap installs the map it is building
+// for the duration).
+bool AnchorDungeon(DungeonDef& g, uint32_t seed, const std::string& mapName, std::string& warning) {
+  const ScratchDungeon* scratch = ScratchDungeonSlot();
+  const bool absY = scratch && scratch->absoluteY && !scratch->replaceMapEntry && g.id == scratch->def.id;
+  g.groundY = absY ? scratch->anchorY : BareGroundHeight(g.ax, g.az, seed);
+  // PLAN §2.1 / §3.7 (D3's world/dungeon_refs.*): the anchor cell lands at
+  // (at.x, bare ground + yOffset, at.z) -- the GROUND cell itself at
+  // yOffset 0 -- and the rest at base + R(yaw) (local - anchor).
+  const std::array<int, 3> base{g.ax, absY ? scratch->anchorY : g.groundY + g.yOffset, g.az};
+  dungeon::Placed pl;
+  pl.shell = g.shell;
+  pl.res = g.res;
+  pl.yawQ = g.yawQ;
+  pl.origin = dungeon::OriginFor(*g.shell, g.yawQ, base);
+  dungeon::PlacedBounds(pl);
+  {
+    // A trial pack of this dungeon alone: a program the index cannot hold
+    // (a cell over the list limits) is a warning, not a refused map.
+    std::vector<uint32_t> trial(kHeaderWords, 0u);
+    std::string perr;
+    if (!dungeon::PackDungeons({pl}, trial, perr)) {
+      warning = "dungeon \"" + g.id + "\": " + perr + " -- not placed";
+      g.shell.reset();
+      g.res.reset();
+      g.resolved = false;
+      return false;
+    }
+  }
+  g.origin = pl.origin;
+  g.boxMin = pl.boxMin;
+  g.boxMax = pl.boxMax;
+  g.keepMin = pl.keepMin;
+  g.keepMax = pl.keepMax;
+  // THE SURFACE RECTS (D9): where the program reaches the ground, on the
+  // same bare ground the anchor reads. Trees and cover keep off them.
+  dungeon::SurfaceRects(pl, [&](int x, int z) { return BareGroundHeight(x, z, seed); });
+  g.surf = pl.surf;
+  g.resolved = true;
+  std::printf("world map: '%s' dungeon '%s' anchor (%d,%d): ground y%d, origin (%d,%d,%d) yaw %d, box "
+              "(%d,%d,%d)..(%d,%d,%d), %zu prims, %zu props, %zu surface rects\n",
+              mapName.c_str(), g.id.c_str(), g.ax, g.az, g.groundY, g.origin[0], g.origin[1], g.origin[2],
+              g.yawQ * 90, g.boxMin[0], g.boxMin[1], g.boxMin[2], g.boxMax[0], g.boxMax[1], g.boxMax[2],
+              g.shell->prims.size(), g.shell->instances.size(), g.surf.size());
+  return true;
+}
+
+namespace {
+// The dungeons' share of the content hash: each placed program's file bytes
+// (the placement is in map.json already), only when there is one.
+uint32_t FoldDungeonHashes(uint32_t hsh, const std::vector<DungeonDef>& dungeons) {
+  for (const DungeonDef& g : dungeons)
+    if (g.Placed()) {
+      const uint32_t dh = g.shellHash ^ (static_cast<uint32_t>(g.origin[1]) * 0x9E3779B1u);
+      hsh = FnvBytes(hsh, reinterpret_cast<const uint8_t*>(&dh), sizeof dh);
+    }
+  return hsh;
+}
+}  // namespace
+
+bool ReplaceScratchDungeon(WorldMapData& m, uint32_t seed, std::string& log) {
+  const ScratchDungeon* sd = ScratchDungeonSlot();
+  if (!sd || !sd->def.shell || !sd->def.res) {
+    log = "no scratch program installed";
+    return false;
+  }
+  DungeonDef* g = nullptr;
+  for (DungeonDef& d : m.dungeons)
+    if (d.id == sd->def.id) g = &d;
+  if (!g) {
+    log = "the map holds no dungeon '" + sd->def.id + "' to replace";
+    return false;
+  }
+  // LoadWorldMap's merge, on the one entry: a map entry keeps its own anchor
+  // and takes the program; the scratch's own entry is the scratch.
+  if (sd->replaceMapEntry) {
+    g->shell = sd->def.shell;
+    g->res = sd->def.res;
+    g->shellPath = sd->def.shellPath;
+    g->shellHash = sd->def.shellHash;
+  } else {
+    *g = sd->def;
+  }
+  g->resolved = false;
+  g->surf.clear();
+  // The previous program's warnings are not this one's.
+  const std::string tag = "dungeon \"" + g->id + "\":";
+  m.warnings.erase(std::remove_if(m.warnings.begin(), m.warnings.end(),
+                                  [&](const std::string& w) { return w.compare(0, tag.size(), tag) == 0; }),
+                   m.warnings.end());
+  std::string w;
+  if (!AnchorDungeon(*g, seed, m.name, w)) {
+    std::fprintf(stderr, "world map WARNING: %s\n", w.c_str());
+    m.warnings.push_back(w);
+  }
+  m.contentHash = FoldDungeonHashes(m.contentHashSansDungeons, m.dungeons);
+  return true;
+}
+
 bool LoadWorldMap(const std::string& assetDir, const std::string& name,
                   const biomes::BiomeSet& set, size_t materialCount, uint32_t seed,
                   WorldMapData& out, std::string& log, const std::string* mapJson) {
@@ -2299,51 +2402,11 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       st.padY += off;
       st.refY += off;
     }
-    // THE DUNGEONS' ANCHORS (PLAN_dungeons §2.1): the bare ground at `at`, the
-    // same resolution a locale anchor takes, so the whole dungeon rides the
-    // ground AT THE ANCHOR, rigidly. The scratch ISOLATE dungeon names its y.
-    const ScratchDungeon* scratch = ScratchDungeonSlot();
+    // THE DUNGEONS' ANCHORS (PLAN_dungeons §2.1; AnchorDungeon).
     for (DungeonDef& g : out.dungeons) {
       if (!g.shell || !g.res) continue;
-      const bool absY = scratch && scratch->absoluteY && !scratch->replaceMapEntry && g.id == scratch->def.id;
-      g.groundY = absY ? scratch->anchorY : BareGroundHeight(g.ax, g.az, seed);
-      // PLAN §2.1 / §3.7 (D3's world/dungeon_refs.*): the anchor cell lands at
-      // (at.x, bare ground + yOffset, at.z) -- the GROUND cell itself at
-      // yOffset 0 -- and the rest at base + R(yaw) (local - anchor).
-      const std::array<int, 3> base{g.ax, absY ? scratch->anchorY : g.groundY + g.yOffset, g.az};
-      dungeon::Placed pl;
-      pl.shell = g.shell;
-      pl.res = g.res;
-      pl.yawQ = g.yawQ;
-      pl.origin = dungeon::OriginFor(*g.shell, g.yawQ, base);
-      dungeon::PlacedBounds(pl);
-      {
-        // A trial pack of this dungeon alone: a program the index cannot hold
-        // (a cell over the list limits) is a warning, not a refused map.
-        std::vector<uint32_t> trial(kHeaderWords, 0u);
-        std::string perr;
-        if (!dungeon::PackDungeons({pl}, trial, perr)) {
-          warn("dungeon \"" + g.id + "\": " + perr + " -- not placed");
-          g.shell.reset();
-          g.res.reset();
-          continue;
-        }
-      }
-      g.origin = pl.origin;
-      g.boxMin = pl.boxMin;
-      g.boxMax = pl.boxMax;
-      g.keepMin = pl.keepMin;
-      g.keepMax = pl.keepMax;
-      // THE SURFACE RECTS (D9): where the program reaches the ground, on the
-      // same bare ground the anchor reads. Trees and cover keep off them.
-      dungeon::SurfaceRects(pl, [&](int x, int z) { return BareGroundHeight(x, z, seed); });
-      g.surf = pl.surf;
-      g.resolved = true;
-      std::printf("world map: '%s' dungeon '%s' anchor (%d,%d): ground y%d, origin (%d,%d,%d) yaw %d, box "
-                  "(%d,%d,%d)..(%d,%d,%d), %zu prims, %zu props, %zu surface rects\n",
-                  name.c_str(), g.id.c_str(), g.ax, g.az, g.groundY, g.origin[0], g.origin[1], g.origin[2],
-                  g.yawQ * 90, g.boxMin[0], g.boxMin[1], g.boxMin[2], g.boxMax[0], g.boxMax[1], g.boxMax[2],
-                  g.shell->prims.size(), g.shell->instances.size(), g.surf.size());
+      std::string w;
+      if (!AnchorDungeon(g, seed, name, w)) warn(w);
     }
     // ---- THE ROAD PROFILES (map v2 R1, worldmap.h kSiteRoad) ------------------
     // Per road, deterministic integer arithmetic on the BARE ground (no road
@@ -2628,14 +2691,11 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     const uint32_t sh = out.structureHash;
     hsh = FnvBytes(hsh, reinterpret_cast<const uint8_t*>(&sh), sizeof sh);
   }
-  // ...and each placed dungeon's program (its file bytes; the placement is in
-  // map.json already), only when there is one.
-  for (const DungeonDef& g : out.dungeons)
-    if (g.Placed()) {
-      const uint32_t dh = g.shellHash ^ (static_cast<uint32_t>(g.origin[1]) * 0x9E3779B1u);
-      hsh = FnvBytes(hsh, reinterpret_cast<const uint8_t*>(&dh), sizeof dh);
-    }
-  out.contentHash = hsh;
+  // ...and each placed dungeon's program (FoldDungeonHashes). The hash
+  // without them is kept, so a re-placed scratch program re-folds exactly
+  // what a full load would (ReplaceScratchDungeon).
+  out.contentHashSansDungeons = hsh;
+  out.contentHash = FoldDungeonHashes(hsh, out.dungeons);
   return true;
 }
 
