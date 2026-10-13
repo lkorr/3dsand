@@ -16516,7 +16516,29 @@ where you hear from either (§12b, "The ears are on the character").
   held them dirty (168 k), and of those the harvest demoted 60 k, skipped
   298 k as cpuDirty AT HARVEST (never retried) and classified 0 as mixed --
   so the leak is clean buried bulk that the copy path refuses once and never
-  revisits, held until the window scrolls past it. **And the open sea**
+  revisits, held until the window scrolls past it. **The second door
+  (2026-10-13, `Stream::RevisitFullChunks`):** from the occupancy the CPU
+  already receives (`LatestDelivered`, mapped through the toroidal origin so
+  a snapshot taken before the last shifts still names the chunk each slot
+  holds now), a resident, stainless, FULL chunk that is out of cpuDirty and
+  not a live ticket's goes back through the demote copy; HarvestDemotes'
+  Classify and guards decide, so a stale snapshot costs a copy, never a
+  voxel. A chunk Classify keeps (a full mix) is remembered against its key
+  and write-reach clock; a refused one waits `kRevisitCooldown` (32) ticks.
+  It runs ONLY while the pool is at least `kRevisitPressurePct` (75%) full,
+  at most `kRevisitPerTick` (128) copies a tick (`SANDVOX_PT_REVISIT=0` /
+  `SANDVOX_PT_REVISIT_PCT=<n>` are the arms): always on (the 50% and 0%
+  arms) it copied ~90 chunks a tick and cost ~0.9 ms of stream CPU a tick
+  on peaks-route for 7% fewer resident pages on average, while at 75% it
+  copies ~5.4 k over the whole flight. Measured on peaks-route, n=3 each:
+  pool peak 31,139 (84.5%) -> 29,813-29,871 (80.8-81.0%), stream CPU mean
+  1.50-1.58 ms against 1.58 for the same exe with `SANDVOX_PT_REVISIT=0`
+  (n=1, taken beside them). What is
+  left at the peak is still ~19.5 k full not-cpuDirty pages: the plane's
+  fresh bulk the revisit has not reached yet, at 128 a tick, while the
+  window descends a plane a tick. A GPU verdict (classify the slot's words
+  in a kernel, read back 4 bytes instead of 16 KiB and a CPU Classify) is
+  the lever if this ever has to go further. **And the open sea**
   (`altitude` gate pass H, the `peaksea` window 3 m over the ocean): worldgen
   wakes every chunk holding a liquid cell (genChunk's birth wake is
   `matCanAct`, and a liquid always can), 16,384 chunks; ALL of them are

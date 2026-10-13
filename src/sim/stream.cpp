@@ -301,6 +301,9 @@ void Stream::Update(const InterestSet& interest, uint32_t tick) {
     CompleteOldest(/*discard=*/false);
   // harvest completed shift-demote batches (non-blocking; see HarvestDemotes)
   HarvestDemotes(tick);
+  // ...and send the full chunks those batches refused back through it
+  // (stream.h, THE FULL-CHUNK REVISIT).
+  RevisitFullChunks(tick);
   // ...and completed solute evictions (non-blocking; see EvictSolutes)
   HarvestSoluteEvicts(/*wait=*/false);
   const double uT1 = PtNowMs();
@@ -1671,6 +1674,95 @@ void Stream::ApplyGenVerdict(const std::vector<uint32_t>& genSlots,
   }
 }
 
+void Stream::RevisitFullChunks(uint32_t tick) {
+  if (world_->residency != World::Residency::Paged || !world_->pages) return;
+  if (revisitMax_ < 0) {
+    const char* e = std::getenv("SANDVOX_PT_REVISIT");
+    revisitMax_ = e ? std::max(0, std::atoi(e)) : (int)kRevisitPerTick;
+  }
+  if (revisitMax_ == 0) return;
+  // ONLY UNDER PRESSURE. Each revisit is a 16 KiB copy plus a CPU Classify
+  // (~10 us), and always on it cost ~0.9 ms of stream CPU a tick on
+  // peaks-route for 7% fewer resident pages. The pool's failure mode is a
+  // fatal abort at exhaustion, not a slow frame, so the reclamation is paid
+  // for only when residency is high enough for it to matter.
+  // SANDVOX_PT_REVISIT_PCT=<0..100> moves the threshold (0 = always).
+  if (revisitPct_ < 0) {
+    const char* e = std::getenv("SANDVOX_PT_REVISIT_PCT");
+    revisitPct_ = e ? std::clamp(std::atoi(e), 0, 100) : (int)kRevisitPressurePct;
+  }
+  if ((uint64_t)world_->pages->PagesInUse() * 100u <
+      (uint64_t)kPoolPages * (uint64_t)revisitPct_)
+    return;
+  // The occupancy the free path already consumes (support.cpp: page-table
+  // bookkeeping reads LatestDelivered). Its age only decides WHICH chunks
+  // are copied: the demote itself is HarvestDemotes' Classify on words copied
+  // after this call, behind its freshness / write-reach / cpuDirty guards.
+  const WorldSnapshot& snap = world_->LatestDelivered();
+  if (!snap.valid || snap.occupancy.size() != kNumSlots) return;
+  // The snapshot is a few ticks old and in flight the window shifts about
+  // once a tick, so its origin is almost never the current one. A slot's
+  // word still describes the chunk the slot holds NOW whenever that chunk
+  // was resident in the same slot at capture, which is every slot outside
+  // the planes that shifted since: the toroidal map below names the chunk a
+  // slot held under each origin. (Requiring equal origins instead starved
+  // this pass on peaks-route: 8.8 k copies over 2,730 ticks.)
+  const IVec3 so = snap.windowOrigin;
+  const IVec3 co = world_->WindowOrigin();
+  const bool sameOrigin = so.x == co.x && so.y == co.y && so.z == co.z;
+  constexpr int kM = (int)kNChunk - 1;
+  auto sameChunk = [&](uint32_t slot) {
+    if (sameOrigin) return true;
+    const int sx = (int)(slot % kNChunk), sy = (int)((slot / kNChunk) % kNChunk),
+              sz = (int)(slot / (kNChunk * kNChunk));
+    return ((sx - so.x) & kM) + so.x == ((sx - co.x) & kM) + co.x &&
+           ((sy - so.y) & kM) + so.y == ((sy - co.y) & kM) + co.y &&
+           ((sz - so.z) & kM) + so.z == ((sz - co.z) & kM) + co.z;
+  };
+  if (revisitTick_.size() != kNumSlots) revisitTick_.assign(kNumSlots, 0);
+  if (keptKey_.size() != kNumSlots) {
+    keptKey_.assign(kNumSlots, 0);
+    keptReach_.assign(kNumSlots, 0);
+  }
+  const PageTable& pt = *world_->pages;
+  const SlotSet& dirty = pt.CpuDirty();
+  const bool haveStain = snap.occStain.size() == kNumSlots;
+  const bool haveFlags = snap.dirtyFlags.size() == kNumSlots;
+  std::vector<uint32_t> slots;
+  std::vector<uint64_t> keys;
+  // The scan is bounded too: a settled window has nothing to find, and a
+  // full walk per tick for nothing is rule 2's floor spent on bookkeeping.
+  // kNumSlots / 8 a tick sweeps the window every 8 ticks.
+  constexpr uint32_t kScanPerTick = kNumSlots / 8;
+  uint32_t s = revisitScan_;
+  for (uint32_t n = 0; n < kScanPerTick && slots.size() < (size_t)revisitMax_;
+       n++, s = (s + 1 == kNumSlots) ? 0u : s + 1) {
+    if (s >= kNumChunks) continue;   // ticket slots: never the window's
+    if ((snap.occupancy[s] & 0xFFFFu) != kChunkVol) continue;
+    if (haveStain && snap.occStain[s] != 0) continue;   // stain: no sentinel form
+    if (haveFlags && snap.dirtyFlags[s] != 0) continue;  // awake as of the snapshot
+    if (!sameChunk(s)) continue;                         // a plane shifted in since
+    if (world_->PageOffsetOfSlot(s) == World::kNoPage) continue;  // a sentinel already
+    if (dirty.Has(s)) continue;
+    if (world_->TicketSlotLive(s)) continue;
+    const uint32_t last = revisitTick_[s];
+    if (last != 0 && tick + 1 - last < kRevisitCooldown) continue;
+    const uint64_t key = World::PackChunkKey(world_->SlotToWorldChunk(s));
+    if (keptKey_[s] == key + 1 && keptReach_[s] == pt.ReachTick(s)) continue;
+    revisitTick_[s] = tick + 1;
+    slots.push_back(s);
+    keys.push_back(key);
+  }
+  revisitScan_ = s;
+  if (slots.empty()) return;
+  revisitIssued_ += slots.size();
+  IssueDemoteCopies(slots, keys, tick, 0, /*revisit=*/true);
+  if (PtDbg())
+    std::printf("[pt-time] full revisit: issued %zu (total %llu, demoted %llu)\n",
+                slots.size(), (unsigned long long)revisitIssued_,
+                (unsigned long long)revisitDemoted_);
+}
+
 void Stream::DiscardDemotes() {
   for (PendingDemote& d : demotes_) {
     d.map.Wait();
@@ -1682,7 +1774,7 @@ void Stream::DiscardDemotes() {
 
 void Stream::IssueDemoteCopies(const std::vector<uint32_t>& slots,
                                const std::vector<uint64_t>& keys,
-                               uint32_t tick, uint32_t generation) {
+                               uint32_t tick, uint32_t generation, bool revisit) {
   // Backstop, not a throughput knob: 32 in-flight batches is 128 MiB of
   // staging and far beyond the ~4-8 a saturated flight keeps queued. Hitting
   // it means the GPU is pathologically behind; forcing the oldest batch
@@ -1702,6 +1794,7 @@ void Stream::IssueDemoteCopies(const std::vector<uint32_t>& slots,
     d.staging = AcquireStaging();
     d.copyTick = tick;
     d.generation = generation;
+    d.revisit = revisit;
     d.slots.reserve(n);
     d.keys.reserve(n);
     d.copied.reserve(n);
@@ -1823,13 +1916,26 @@ void Stream::HarvestDemotes(uint32_t tick) {
         const uint32_t e =
             world_->pages->Classify(s, demoteScratch_.data() + i * kChunkVol);
         if (dbg) clsMs += PtNowMs() - k0;
-        if (e == PageTable::kNeedsPage) { hKept++; continue; }
+        if (e == PageTable::kNeedsPage) {
+          // A full mix (or a stained chunk): no sentinel describes it, and
+          // copying it again tells nothing new until something writes it.
+          // RevisitFullChunks reads this memo; any harvest may set it.
+          hKept++;
+          if (keptKey_.size() != kNumSlots) {
+            keptKey_.assign(kNumSlots, 0);
+            keptReach_.assign(kNumSlots, 0);
+          }
+          keptKey_[s] = d.keys[i] + 1;
+          keptReach_[s] = world_->pages->ReachTick(s);
+          continue;
+        }
         world_->pages->SetSentinel(s, e);
         demoted++;
+        if (d.revisit) revisitDemoted_++;
       }
       if (!retry.empty()) {
         retried += (uint32_t)retry.size();
-        IssueDemoteCopies(retry, retryKeys, tick, d.generation + 1);
+        IssueDemoteCopies(retry, retryKeys, tick, d.generation + 1, d.revisit);
       }
     } else {
       d.map.Unmap();

@@ -1406,6 +1406,11 @@ void VerifyPeaksRoute(Scene& s) {
     std::printf("  peaks-route page pool %s\n", s.pagesPeakWhy.c_str());
     s.note += "  |  page pool " + s.pagesPeakWhy;
   }
+  // The second demote door (stream.h, THE FULL-CHUNK REVISIT): how many full
+  // chunks it sent back through the word copy, and how many of those it freed.
+  std::printf("  peaks-route full revisit: %llu copied, %llu demoted\n",
+              (unsigned long long)s.stream.RevisitIssued(),
+              (unsigned long long)s.stream.RevisitDemoted());
   s.far = nullptr;
   if (!s.prevMap.empty()) {
     std::string why;

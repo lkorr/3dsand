@@ -524,6 +524,7 @@ class Stream {
     std::vector<uint8_t> copied;   // a real copy landed for this index
     uint32_t copyTick = 0;         // sim tick the copy was issued on
     uint32_t generation = 0;       // re-copies so far (HarvestDemotes' cap)
+    bool revisit = false;          // issued by RevisitFullChunks (counted apart)
   };
 
   void ShiftAxis(int axis, int dir);
@@ -661,11 +662,49 @@ class Stream {
   // `generation` is how many times these slots have already been re-copied.
   void IssueDemoteCopies(const std::vector<uint32_t>& slots,
                          const std::vector<uint64_t>& keys, uint32_t tick,
-                         uint32_t generation = 0);
+                         uint32_t generation = 0, bool revisit = false);
   // Classify+demote every COMPLETED batch; never blocks. A slot that may have
   // been written since its copy is re-copied rather than trusted, a bounded
   // number of times (see the staleness note at the definition).
   void HarvestDemotes(uint32_t tick);
+  // ---- THE FULL-CHUNK REVISIT (map v2 P1 follow-up, 2026-10-13) ----------
+  //
+  // The demote copy above is a ONE-SHOT door: a FULL chunk the harvest found
+  // in cpuDirty (written since the copy, or merely inside an active chunk's
+  // N26 ring) was skipped and never asked again, so it held its page until
+  // the window scrolled past it. On `peaks-route` that was 298 k refusals and
+  // a page pool at 88.5%, almost all of it clean buried stone (PLAN_map_v2
+  // P1). This is the second door: from the occupancy the CPU already
+  // receives, a resident, non-sentinel, stainless FULL chunk that is out of
+  // cpuDirty and not a live ticket's goes back through IssueDemoteCopies, at
+  // most kRevisitPerTick a tick (SANDVOX_PT_REVISIT=<n>, 0 = off: the A/B
+  // arm), and only while the pool is at least kRevisitPressurePct full
+  // (SANDVOX_PT_REVISIT_PCT): every revisit is a 16 KiB copy and a CPU
+  // Classify, measured at ~0.9 ms of stream CPU a tick when always on. The occupancy only CHOOSES which chunks are copied; the demote is
+  // still HarvestDemotes' word-exact Classify with its freshness and
+  // cpuDirty guards, so a stale snapshot costs a wasted copy, never a voxel.
+  // A chunk Classify keeps (a full mix: grass over dirt over stone) is
+  // remembered against its key and write-reach clock and not copied again
+  // until something reaches it; one that was refused is retried no sooner
+  // than kRevisitCooldown ticks later. Page-table bookkeeping only: nothing
+  // hashed moves.
+  void RevisitFullChunks(uint32_t tick);
+  static constexpr uint32_t kRevisitPerTick = 128;
+  static constexpr uint32_t kRevisitCooldown = 32;
+  // Runs only while the pool is at least this full (see the definition).
+  static constexpr uint32_t kRevisitPressurePct = 75;
+  int revisitMax_ = -1;                     // resolved from the env on first use
+  int revisitPct_ = -1;
+  uint32_t revisitScan_ = 0;                // rotating scan start (slot index)
+  std::vector<uint32_t> revisitTick_;       // tick + 1 the slot was last issued
+  std::vector<uint64_t> keptKey_;           // PackChunkKey + 1 Classify kept it under
+  std::vector<uint32_t> keptReach_;         // ...and its ReachTick then
+  uint64_t revisitIssued_ = 0;              // totals, for the PtDbg line and --perf
+  uint64_t revisitDemoted_ = 0;
+ public:
+  uint64_t RevisitIssued() const { return revisitIssued_; }
+  uint64_t RevisitDemoted() const { return revisitDemoted_; }
+ private:
   // Throw away every queued demote batch, bytes and all. MANDATORY on regen /
   // LoadWorld: the bytes belong to the REPLACED world, and while the identity
   // key skips most of them, an EMPTY/UNIFORM classification is seed-blind — a

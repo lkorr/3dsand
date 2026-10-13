@@ -8843,7 +8843,7 @@ const ARCH_NODES={
     tst:['far-surface','far-downsample','terrain'],
     doc:['DESIGN.md','docs/PLAN_map_v2.md'],
     rule:2,
-    wip:'farMapFill is now the largest far pass (~100 us per surface-map column); page pool 88.5% on peaks-route (clean buried bulk the demote copy refuses once is not retried); liquid sentinels (16,384 sea chunks resident and a ~200 ms first tick on the sea window).'},
+    wip:'farMapFill is now the largest far pass (~100 us per surface-map column); page pool peak 81% on peaks-route (was 84.5-88.5%: Stream::RevisitFullChunks now retries the full chunks the demote copy refused, above 75% residency; ~19.5 k freshly generated full pages still hold one at the peak, and a GPU verdict instead of a 16 KiB copy + CPU Classify is the lever past that); liquid sentinels (16,384 sea chunks resident and a ~200 ms first tick on the sea window).'},
 
   voxView:{label:'Voxel View + Edit Layer',tag:'cpu',
     desc:'The World map page’s PREVIEW pane (was the Worldgen tab, deleted in P-I): a voxel-accurate terrain viewer and its WorldEdit-style editor. Streams real cells out of a headless `--voxserve` process (which applies the saved edit layer itself, map-overhaul P7), draws them in WebGL2, and writes hand edits into an authored .svedit layer the MAP names (map.json editLayer) or, from the locale page, a LOCALE&rsquo;s own layer (locales/&lt;id&gt;/ground.svedit, map v2 E4; every layer of a map merged map-first, later wins), stored ground-relative and applied AS WORLDGEN: through the mutation queue after genChunk, never marked modified or baked into a save, seeded into the far field. Selections save as prefab .vox; a save exports back into a layer.',
