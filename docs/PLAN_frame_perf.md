@@ -320,7 +320,8 @@ state that lives across the DDA loop (168 -> 231 register cliff), the micro
 column-probe hoist. Numbers are in PLAN_surface_flight_perf.md,
 ROADMAP_scale.md §3 and RESEARCH_streaming_hitch.md.
 
-Stale docs to be aware of: PLAN_surface_flight_perf.md lists B2 as not done
-(the deferred wake shipped it); raymarch.wgsl's header says `Hit` has 26 fields
+Stale docs to be aware of: (PLAN_surface_flight_perf.md's B2 entry now says
+DONE, 2026-10-13, with a re-measure: 0 wake-wait misses in 1,394 + 282
+shifts); raymarch.wgsl's header says `Hit` has 26 fields
 (it has 30); `build/shader_stats_before.json` is byte-identical to the current
 stats and is not a baseline.

@@ -600,6 +600,25 @@ Worst exactly when RLE doesn't compress — mixed surface chunks. Cheapest fix:
 
 ### Phase 2 — streaming (owns part of the low-altitude 5 fps)
 8. **B2:** ~~async-ify the shift-demote occupancy prefilter (one-shift-latent is fine).~~
+   > **DONE 2026-09-03 by R1, the deferred wake (`012bcb3`,
+   > `RESEARCH_streaming_hitch.md` §R1) — this entry was stale until
+   > 2026-10-13.** The lever named below is what shipped: `genChunk` computes
+   > the act set and the page-table class ON THE GPU and publishes them to
+   > `genAct` (`world.h` `kGenVerdict*`), the shift queues ONE copy
+   > (occupancy + verdicts) with NO wait, and `Stream::CompleteDueShifts`
+   > polls it `kWakeLatency` (4) ticks later and only then wakes the act
+   > set. The shift path holds no fence; the only remaining synchronous
+   > `omap.Wait()` in `stream.cpp` is `ReloadWindow`'s whole-window path
+   > (load / regen, no frame to protect). Its residual on the frame path is
+   > the T+K poll when the GPU is still 4 ticks behind, counted as
+   > `wake-wait`. Re-measured 2026-10-13 on main `5805949`, exclusive:
+   > `--perf --scenario surface-sprint` n=3 = 464/465/465 shifts, **0
+   > wake-wait misses**, frame p95 19.6/19.7/20.8 ms, stream CPU p95
+   > 2.1/1.8/2.4 ms; the ticket-camera flight (`--frames 1200 --at
+   > 10585,687,-10815` + `SANDVOX_AT_FLY=13.75,0,0`) n=3 = 94 shifts each,
+   > 4.76-4.96 ms CPU per shift (eviction 3.1-3.3 of it), **0 wake-waits in
+   > 282**. The text below is the 2026-08-23 analysis, kept for its reasoning.
+
    **ATTRIBUTED AND DOCUMENTED, NOT DONE — "one-shift-latent is fine" is false.**
    This IS the remaining surface-band cost, and it is not close. Measured under
    `--autofly-surface` with `SANDVOX_PT_DEBUG=1`:
