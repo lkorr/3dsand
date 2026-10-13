@@ -1,73 +1,9 @@
 {
-  "//": "A CHARACTER, not a creature: deku inherits human's rig — limb names and tags, chains, loco states, natural weapons, sockets, the anatomy recipe and the shared clip library — and states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs deku --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
-  "extends": "human",
+  "//": "A CHARACTER, not a creature: deku extends sylvan, its race base, which extends human: the rig, loco states and clip library come from human, the race-wide traits (anatomy recipe, bleed, ...) from sylvan, and this file states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs deku --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
+  "extends": "sylvan",
   "model": "deku",
-  "race": "sylvan",
-  "sidecarVoxelsPerMetre": 10,
-  "bleed": {
-    "material": "syrup",
-    "perDamage": 1.5
-  },
   "anatomy": {
-    "layers": [
-      {
-        "material": "bark_light",
-        "depth": 1,
-        "keep": true
-      },
-      {
-        "material": "birch_wood",
-        "depth": 2
-      },
-      {
-        "material": "wood"
-      }
-    ],
-    "garments": [],
     "limbs": {
-      "head": {
-        "layers": [
-          {
-            "material": "bark_light",
-            "depth": 1,
-            "keep": true
-          },
-          {
-            "material": "birch_wood",
-            "depth": 1
-          },
-          {
-            "material": "wood",
-            "depth": 1
-          },
-          {
-            "material": "crystal"
-          }
-        ],
-        "carve": null
-      },
-      "torso": {
-        "carve": [
-          {
-            "material": "crystal",
-            "where": "wood",
-            "box": {
-              "x": [
-                0.36,
-                0.64
-              ],
-              "y": [
-                0.5,
-                0.74
-              ],
-              "z": [
-                0.35,
-                0.78
-              ]
-            }
-          }
-        ]
-      },
       "hair": {
         "layers": [
           {
@@ -83,13 +19,8 @@
             "keep": true
           }
         ]
-      },
-      "hips": null
-    },
-    "becomes": null,
-    "garmentsBecome": null,
-    "paintBecomes": null,
-    "carve": null
+      }
+    }
   },
   "gait": {
     "rideHeight": 1.23
@@ -293,20 +224,6 @@
           34
         ]
       }
-    }
-  ],
-  "states": [
-    {
-      "name": "squirm",
-      "bodyYOffset": null
-    },
-    {
-      "name": "crawl",
-      "bodyYOffset": null
-    },
-    {
-      "name": "crawl.shins",
-      "bodyYOffset": null
     }
   ],
   "clips": {

@@ -1,0 +1,524 @@
+{
+  "//": "A CHARACTER, not a creature: mailman extends android, its race base, which extends human: the rig, loco states and clip library come from human, the race-wide traits (anatomy recipe, bleed, ...) from android, and this file states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs mailman --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
+  "extends": "android",
+  "model": "mailman",
+  "anatomy": {
+    "limbs": {
+      "snout": {
+        "layers": [
+          {
+            "material": "hair_white",
+            "keep": true
+          }
+        ]
+      },
+      "snout.2": {
+        "layers": [
+          {
+            "material": "hair_white",
+            "keep": true
+          }
+        ]
+      }
+    }
+  },
+  "gait": {
+    "rideHeight": 1.211
+  },
+  "limbs": [
+    {
+      "name": "hips",
+      "hp": 108
+    },
+    {
+      "name": "torso",
+      "hp": 112,
+      "anchor": [
+        16,
+        62,
+        10
+      ]
+    },
+    {
+      "name": "head",
+      "hp": 118,
+      "anchor": [
+        16,
+        94,
+        10
+      ]
+    },
+    {
+      "name": "armU.L",
+      "hp": 44,
+      "anchor": [
+        28,
+        96,
+        10
+      ]
+    },
+    {
+      "name": "armL.L",
+      "hp": 35,
+      "anchor": [
+        28,
+        78,
+        10
+      ]
+    },
+    {
+      "name": "hand.L",
+      "anchor": [
+        28,
+        60,
+        10
+      ]
+    },
+    {
+      "name": "armU.R",
+      "hp": 44,
+      "anchor": [
+        4,
+        96,
+        10
+      ]
+    },
+    {
+      "name": "armL.R",
+      "hp": 35,
+      "anchor": [
+        4,
+        78,
+        10
+      ]
+    },
+    {
+      "name": "hand.R",
+      "anchor": [
+        4,
+        60,
+        10
+      ]
+    },
+    {
+      "name": "legU.L",
+      "anchor": [
+        22,
+        54,
+        10
+      ]
+    },
+    {
+      "name": "legL.L",
+      "hp": 46,
+      "anchor": [
+        22,
+        28,
+        10
+      ]
+    },
+    {
+      "name": "foot.L",
+      "hp": 54,
+      "anchor": [
+        22,
+        6,
+        14
+      ]
+    },
+    {
+      "name": "legU.R",
+      "anchor": [
+        10,
+        54,
+        10
+      ]
+    },
+    {
+      "name": "legL.R",
+      "hp": 46,
+      "anchor": [
+        10,
+        28,
+        10
+      ]
+    },
+    {
+      "name": "foot.R",
+      "hp": 54,
+      "anchor": [
+        10,
+        6,
+        14
+      ]
+    },
+    {
+      "name": "snout",
+      "parent": "head",
+      "joint": "fixed",
+      "hp": 7,
+      "severable": true,
+      "vital": false,
+      "bloodless": true,
+      "tag": "hair",
+      "anchor": [
+        5.5,
+        109,
+        9.5
+      ]
+    },
+    {
+      "name": "snout.2",
+      "parent": "head",
+      "joint": "fixed",
+      "hp": 7,
+      "severable": true,
+      "vital": false,
+      "bloodless": true,
+      "tag": "hair",
+      "anchor": [
+        26.5,
+        109,
+        9.5
+      ]
+    }
+  ],
+  "sockets": [
+    {
+      "name": "held_right",
+      "offset": [
+        6,
+        55,
+        10
+      ]
+    }
+  ],
+  "natural": [
+    {
+      "name": "jaws",
+      "edge": {
+        "from": [
+          10,
+          10.6,
+          8
+        ],
+        "to": [
+          10,
+          7.8,
+          34
+        ]
+      }
+    }
+  ],
+  "clips": {
+    "walk": {
+      "durationMs": 619
+    },
+    "run": {
+      "durationMs": 314
+    }
+  },
+  "genome": {
+    "archetype": "humanoid",
+    "name": "mailman",
+    "displayName": "Sentinel",
+    "body": {
+      "race": "android",
+      "sex": "female",
+      "bust": 0.55,
+      "bra": {
+        "style": "classic",
+        "cover": 1,
+        "cupSize": 1,
+        "cupLift": 0,
+        "bridge": 0,
+        "bridgePos": 0.5,
+        "taper": 0,
+        "plunge": 0,
+        "bandPos": -0.2,
+        "band": 3.9,
+        "wrap": 0,
+        "straps": "none",
+        "strapWidth": 0.75,
+        "strapSet": 0.45,
+        "tone": "cloth"
+      },
+      "briefs": {
+        "style": "shorts",
+        "rise": 0,
+        "band": 1,
+        "leg": 0,
+        "cut": 0,
+        "back": "full",
+        "tone": "cloth"
+      },
+      "heightM": 1.53,
+      "hipWidth": 10,
+      "shoulderWidth": 10,
+      "bodyDepth": 6,
+      "headWidth": 10,
+      "headDepth": 10,
+      "limbWidth": 4,
+      "footDepth": 7,
+      "stack": {
+        "foot": 3,
+        "shin": 10.5,
+        "thigh": 13.5,
+        "hips": 7.920433472841978,
+        "torso": 18.543603432364762,
+        "head": 13.631228939630091
+      },
+      "armStack": {
+        "upper": 11,
+        "fore": 11,
+        "hand": 5
+      },
+      "armLengths": 1
+    },
+    "shape": {
+      "waist": 0.84,
+      "chest": 1.08,
+      "shoulder": 1.07,
+      "chestDepth": 0.92,
+      "seat": 1.06,
+      "armGirth": 0.9500000000000001,
+      "legGirth": 0.97,
+      "upperArm": 1,
+      "bicep": 0,
+      "deltoid": 0,
+      "foreArm": 1,
+      "forearmMuscle": 0
+    },
+    "head": {
+      "jaw": 0.85,
+      "cheek": 1.03,
+      "crown": 1.03,
+      "skullBack": 0.6
+    },
+    "face": {
+      "eyeDx": 2.5,
+      "eyeRow": 0,
+      "eyeCols": 1,
+      "mouthWidth": 2,
+      "mouthDrop": 3,
+      "brow": false,
+      "beard": 0,
+      "browHeight": 0,
+      "browInner": 1,
+      "browOuter": 0,
+      "browThick": 1,
+      "browTilt": 0,
+      "browArch": 0,
+      "browSparse": 0,
+      "browTone": "shade",
+      "browProud": false,
+      "mouthCurve": 0,
+      "mouthSkew": 0,
+      "mouthShift": 0,
+      "mouthOpen": 0,
+      "mouthTone": "shade",
+      "lips": 0,
+      "lipTone": "lit",
+      "lipLine": false,
+      "nose": 0,
+      "noseWidth": 1,
+      "earSize": 1,
+      "earPoint": false,
+      "eyeWhites": false,
+      "eyeBags": 0,
+      "cheeks": 0,
+      "freckles": 0,
+      "wrinkles": 0,
+      "scar": 0,
+      "beardStyle": "clean",
+      "beardLip": 0,
+      "beardChin": 0,
+      "beardJaw": 0,
+      "beardCheek": 0,
+      "beardSide": 0,
+      "beardWidth": 0,
+      "beardDensity": 1,
+      "beardRagged": 0.45,
+      "beardTone": "shade",
+      "beardLen": 0,
+      "beardPoint": 0,
+      "beardFork": false
+    },
+    "hair": {
+      "style": "bald",
+      "back": 99,
+      "front": 99,
+      "length": 0,
+      "knot": false,
+      "side": 0,
+      "band": 1,
+      "volume": 0,
+      "crest": 0,
+      "spikes": 0,
+      "buns": false,
+      "drop": 0,
+      "tail": 0,
+      "braid": false,
+      "twin": false,
+      "wisp": 0.35,
+      "ragged": 0.3,
+      "bangs": 0,
+      "faceThin": 0,
+      "hairlineSoft": 0,
+      "sideThin": 0,
+      "topThin": 0,
+      "fluff": 0,
+      "fuzz": 0,
+      "fuzzTop": 1,
+      "fuzzSide": 1,
+      "fuzzBack": 1,
+      "fuzzLow": 0.5,
+      "fuzzFray": 0.5
+    },
+    "colors": {
+      "skin": "#2c3e60",
+      "skinShade": "#1c2a44",
+      "skinLight": "#4e6a96",
+      "hair": "#1c2a44",
+      "hairShade": "#121c30",
+      "eye": "#ff3a3a",
+      "cloth": "#b8303a",
+      "clothShade": "#7a1e26",
+      "nail": "#3a4048",
+      "lip": "#242548",
+      "root": "#4a3a2b",
+      "moss": "#7f9a3e",
+      "branch": "#6b5540",
+      "flower": "#f2eee2",
+      "flowerEye": "#e8c34a",
+      "leaf2": "#a6c94a",
+      "leaf3": "#2f5a24",
+      "leaf4": "#7a5a2e",
+      "rivet": "#e8c060",
+      "pipe": "#b8673a",
+      "gear": "#7a5418",
+      "gearDark": "#2e2010",
+      "patina": "#5fa58a",
+      "glass": "#cfe6e0",
+      "fire": "#ff8a2a",
+      "joint": "#3a2a1e",
+      "light": "#ff3a3a",
+      "seam": "#0e1626",
+      "frame": "#6a727c",
+      "core": "#ff3a3a",
+      "visor": "#141a22",
+      "trace": "#a82a2a",
+      "horn": "#d8ccb0",
+      "hornTip": "#8a7e66",
+      "claw": "#1a1412",
+      "mark": "#4a0e0c"
+    },
+    "sylvan": {
+      "face": "hollow",
+      "crown": "leafy",
+      "glow": true,
+      "sockets": 0.65,
+      "eyeSize": 1,
+      "brow": 0.5,
+      "mouthHole": 0.3,
+      "snout": 0,
+      "warp": 0.35,
+      "grain": 0.6,
+      "knots": 0.3,
+      "roots": 0.55,
+      "rootTwist": 0.5,
+      "relief": 0.7,
+      "moss": 0.2,
+      "wrap": 0.45,
+      "wreath": 0.3,
+      "leaves": 0.55,
+      "leafSize": 0.5,
+      "branches": 0.2,
+      "branchLen": 0.4,
+      "branchFork": 0.5,
+      "branchStyle": "sprigs",
+      "shoulderBranches": 0,
+      "backBranches": 0,
+      "boughLen": 0.5,
+      "tufts": 0.6,
+      "flowers": 0.15,
+      "flowerSize": 0,
+      "leafMix": 0.35,
+      "leafPatch": 0.5,
+      "veil": 0
+    },
+    "automaton": {
+      "face": "lamp",
+      "glow": true,
+      "lens": 1,
+      "bezel": 0.5,
+      "eyeDepth": 0.4,
+      "grille": 0.5,
+      "jaw": 0.4,
+      "brow": 0.3,
+      "monocle": 0,
+      "porthole": 0,
+      "furnace": 0,
+      "cyclops": false,
+      "plates": 0.5,
+      "rivets": 0.6,
+      "gears": 0.4,
+      "pipes": 0.35,
+      "joints": 0.6,
+      "boiler": 0.6,
+      "gauge": 0.5,
+      "patina": 0.15,
+      "wear": 0.2,
+      "polish": 0.4,
+      "stack": "none",
+      "stackHead": 0,
+      "hat": 0,
+      "crest": 0,
+      "stackBack": 0,
+      "key": 0.6
+    },
+    "android": {
+      "face": "synth",
+      "glow": true,
+      "eyeSize": 0.639680527879037,
+      "visor": 0,
+      "faceplate": 0.03796564167637378,
+      "mono": false,
+      "grille": 0,
+      "mouthLight": 0.018058902360722422,
+      "seams": 0.6470051495342329,
+      "human": 1,
+      "ears": 0.2546091715871543,
+      "panels": 0.5478083097536117,
+      "lights": 0.6402792973805964,
+      "traces": 0.2889247267802432,
+      "core": 0.4535207091388106,
+      "joints": 0.7089010985590517,
+      "twoTone": 0.3138750972266123,
+      "sheen": 0.4340534416636824,
+      "gear": "fins",
+      "antenna": 0,
+      "fins": 0.7,
+      "packs": 0,
+      "halo": 0
+    },
+    "demon": {
+      "hornStyle": "goat",
+      "horns": 0.5,
+      "hornCurl": 0.5,
+      "hornSpread": 0.4,
+      "tail": 0.5,
+      "tailThick": 0.5,
+      "tailCurl": 0.5,
+      "tailTrail": 0.3,
+      "tailTip": "point",
+      "tailSway": 0.5,
+      "tailSpeed": 0.4,
+      "tailLag": 0.5,
+      "claws": 0.6,
+      "mottle": 0.35,
+      "glow": true,
+      "posture": "upright"
+    }
+  }
+}

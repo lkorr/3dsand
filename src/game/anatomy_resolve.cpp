@@ -57,6 +57,9 @@ struct Carve {
   int stripeAxis = -1, stripePeriod = 0, stripeWidth = 0;
   int core = -1;           // -1 = no `core` test
   bool round = false;      // `round`: the ellipsoid inscribed in the box
+  // `mid`: |cell centre - limb centre| in [lo, hi), in CELLS (not fractions).
+  bool hasMid[3] = {false, false, false};
+  double mid[3][2] = {{0, 0}, {0, 0}, {0, 0}};
 };
 
 std::vector<Carve> CarveFor(const nlohmann::json& recipe,
@@ -98,6 +101,14 @@ std::vector<Carve> CarveFor(const nlohmann::json& recipe,
         e.hasBox[a] = true;
         e.box[a][0] = (*it)[0].get<double>();
         e.box[a][1] = (*it)[1].get<double>();
+      }
+    if (c.contains("mid") && c["mid"].is_object())
+      for (int a = 0; a < 3; a++) {
+        const auto it = c["mid"].find(kAxes[a]);
+        if (it == c["mid"].end() || !it->is_array() || it->size() != 2) continue;
+        e.hasMid[a] = true;
+        e.mid[a][0] = (*it)[0].get<double>();
+        e.mid[a][1] = (*it)[1].get<double>();
       }
     if (c.contains("depth") && c["depth"].is_array()) {
       const nlohmann::json& d = c["depth"];
@@ -147,6 +158,12 @@ bool CarveMatches(const Carve& c, int whereId, int layerId, const int l[3],
     }
   }
   if (c.round && e2 > 1) return false;
+  // anatomy.js `mid`: exact in doubles (half-integers and integers).
+  for (int a = 0; a < 3; a++) {
+    if (!c.hasMid[a]) continue;
+    const double off = std::fabs(l[a] + 0.5 - n[a] * 0.5);
+    if (off < c.mid[a][0] || off >= c.mid[a][1]) return false;
+  }
   if (c.stripeAxis >= 0 && l[c.stripeAxis] % c.stripePeriod >= c.stripeWidth)
     return false;
   return true;

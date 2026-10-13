@@ -115,6 +115,12 @@ struct MobPose {
   // FindParry reads it on a ghost, which runs no stroke of its own).
   uint32_t flags = 0;
   static constexpr uint32_t kBladeLive = 1u << 0;
+  // kShieldUp: the owner's shield is at least half raised (Mob::ShieldRaise).
+  // Its POSE already arrives as `limbs` (the held slot has a body), and a
+  // block is judged against that pose; this is the one fact about a raise a
+  // pose cannot say -- that it is a GUARD -- for the watchers' Fact::
+  // TargetGuarding on the far side (Mob::ShieldUpForWatchers).
+  static constexpr uint32_t kShieldUp = 1u << 1;
   // THE LIGHT IN EACH FIST (Mob::SpellLight; index HandIndex): the colour,
   // 0xAABBGGRR, of the spell a hand holds, 0 = none. The arm's casting pose
   // already arrives as `limbs`; this is the one thing about a cast that is

@@ -192,8 +192,14 @@ void RemotePlayersAppendActors(const RemotePlayers& remotes,
     // turn and walk toward. It is still APPENDED, as a dead actor, because the
     // band is positional and skipping it would renumber the ghosts after it.
     const bool alive = r->haveState && r->last.Has(PlayerState::kAlive);
+    // A peer's SHIELD UP is a guard to an NPC watching it (the owner's
+    // MobPose::kShieldUp, latched on the ghost avatar), the same answer the
+    // local player's session publishes. Nothing else about a peer's weapon
+    // is sent yet, so this is its only action.
+    const ai::Action act = r->avatar.ShieldUpForWatchers() ? ai::Action::Guard
+                                                           : ai::Action::None;
     out.push_back({r->ghost.pos, Player::kHalfXZ, Player::kHalfY * 2.0f,
-                   alive});
+                   alive, (uint8_t)act});
   }
 }
 

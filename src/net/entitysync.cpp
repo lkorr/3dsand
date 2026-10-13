@@ -151,6 +151,7 @@ void EntitySync::Connect(uint32_t me, uint32_t peer) {
   announcedBodies_.clear();
   mobPoseSent_.clear();
   mobStateSent_.clear();
+  mobGearSent_.clear();
   ghostMobSeen_.clear();
   ghostBodySeen_.clear();
   pendingMobHandoffs_.clear();
@@ -353,6 +354,7 @@ void EntitySync::ScanHandoffs(MobSystem& mobs, DebrisSystem& debris,
     // us and we are no longer the thing that announces it.
     announcedMobs_.erase(id);
     mobPoseSent_.erase(id);
+    mobGearSent_.erase(id);
     c_.handoffsOut++;
   }
 
@@ -502,9 +504,29 @@ void EntitySync::Build(MobSystem& mobs, DebrisSystem& debris, uint32_t label,
       if (mobs.BuildAnnounce(id, a)) {
         out.mobAnnounces.push_back(std::move(a));
         c_.announcesOut++;
+        mobGearSent_[id] = mobs.GearKeyOf(id);
       } else {
         announcedMobs_.erase(id);   // could not describe it; try again later
         continue;
+      }
+    } else if (m->Alive()) {
+      // RULE 1b: A LIVING CREATURE'S GEAR CHANGED (MobSystem::GearKeyOf) --
+      // a shield broken, a blade knocked from the hand, a cuirass cut loose,
+      // a piece put on. The announce is the one record that carries the
+      // gear, so it goes again; the peer's ApplyAnnounce re-dresses a ghost
+      // whose list differs. A CORPSE's gear rides its MobState (below).
+      // Before the pose, for the corpse's reason: the pose is indexed by the
+      // rig slots the re-dress lays out.
+      const uint64_t gk = mobs.GearKeyOf(id);
+      auto sent = mobGearSent_.find(id);
+      if (sent == mobGearSent_.end() || sent->second != gk) {
+        MobAnnounce a;
+        if (mobs.BuildAnnounce(id, a)) {
+          out.mobAnnounces.push_back(std::move(a));
+          c_.announcesOut++;
+          c_.gearReannounces++;
+          mobGearSent_[id] = gk;
+        }
       }
     }
     // THE CORPSE'S SHAPE (P2c), before its pose: a MobState re-dresses the
@@ -563,6 +585,7 @@ void EntitySync::Build(MobSystem& mobs, DebrisSystem& debris, uint32_t label,
     c_.gonesOut++;
     mobPoseSent_.erase(*it);
     mobStateSent_.erase(*it);
+    mobGearSent_.erase(*it);
     it = announcedMobs_.erase(it);
   }
 

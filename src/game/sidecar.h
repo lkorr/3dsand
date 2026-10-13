@@ -110,6 +110,10 @@ bool ReadJsonDoc(const std::string& path, json& out, std::string& log);
 // still name stems, and a stem must be unique across the root and every
 // variant folder (the loader says so when it is not). What the folder buys is
 // the authoring picker: open the prototype, then pick a variant of it.
+// (A race's characters live in the folder of its RACE BASE, sylvan.json etc.,
+// and also `extends` it -- DESIGN.md "Every race but the human has a RACE
+// BASE"; that is an authoring convention of the generator, nothing here
+// depends on it.)
 //
 // Two subfolders are not variant folders: `effects/` (modifiers, not bodies)
 // and `pool/` (the random-human pool, built at runtime by `pool:` name).

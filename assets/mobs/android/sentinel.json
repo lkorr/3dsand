@@ -1,87 +1,9 @@
 {
-  "//": "A CHARACTER, not a creature: sentinel inherits human's rig — limb names and tags, chains, loco states, natural weapons, sockets, the anatomy recipe and the shared clip library — and states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs sentinel --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
-  "extends": "human",
+  "//": "A CHARACTER, not a creature: sentinel extends android, its race base, which extends human: the rig, loco states and clip library come from human, the race-wide traits (anatomy recipe, bleed, ...) from android, and this file states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs sentinel --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
+  "extends": "android",
   "model": "sentinel",
-  "race": "android",
-  "sidecarVoxelsPerMetre": 10,
   "anatomy": {
-    "layers": [
-      {
-        "material": "mushroom_stem",
-        "depth": 1,
-        "keep": true
-      },
-      {
-        "material": "petal_blue",
-        "depth": 1
-      },
-      {
-        "material": "mushroom_gill"
-      }
-    ],
-    "garments": [],
     "limbs": {
-      "head": {
-        "layers": [
-          {
-            "material": "mushroom_stem",
-            "depth": 1,
-            "keep": true
-          },
-          {
-            "material": "mushroom_gill",
-            "depth": 1
-          },
-          {
-            "material": "petal_blue",
-            "depth": 1
-          },
-          {
-            "material": "petal_red"
-          }
-        ],
-        "carve": null
-      },
-      "torso": {
-        "carve": [
-          {
-            "material": "petal_pink",
-            "where": "petal_blue",
-            "box": {
-              "x": [
-                0.32,
-                0.68
-              ],
-              "y": [
-                0.48,
-                0.8
-              ],
-              "z": [
-                0.45,
-                1
-              ]
-            }
-          },
-          {
-            "material": "petal_pink",
-            "where": "mushroom_gill",
-            "box": {
-              "x": [
-                0.32,
-                0.68
-              ],
-              "y": [
-                0.48,
-                0.8
-              ],
-              "z": [
-                0.45,
-                1
-              ]
-            }
-          }
-        ]
-      },
       "snout": {
         "layers": [
           {
@@ -129,20 +51,8 @@
             "keep": true
           }
         ]
-      },
-      "hips": null
-    },
-    "becomes": {
-      "mushroom_stem": "synth_shell",
-      "petal_blue": "circuitry",
-      "mushroom_gill": "alloy",
-      "petal_red": "neural_core",
-      "petal_pink": "power_cell",
-      "mushroom_large": null
-    },
-    "garmentsBecome": null,
-    "paintBecomes": null,
-    "carve": null
+      }
+    }
   },
   "gait": {
     "rideHeight": 1.174
@@ -428,20 +338,6 @@
       }
     }
   ],
-  "states": [
-    {
-      "name": "squirm",
-      "bodyYOffset": null
-    },
-    {
-      "name": "crawl",
-      "bodyYOffset": null
-    },
-    {
-      "name": "crawl.shins",
-      "bodyYOffset": null
-    }
-  ],
   "clips": {
     "walk": {
       "durationMs": 666
@@ -450,7 +346,6 @@
       "durationMs": 338
     }
   },
-  "bleed": null,
   "genome": {
     "archetype": "humanoid",
     "name": "sentinel",

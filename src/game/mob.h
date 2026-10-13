@@ -2350,6 +2350,12 @@ class Mob {
   bool AwaitingHandoff() const;
   // A ghost's owner says its blade is live (MobPose::kBladeLive).
   bool GhostBladeLive() const { return ghostBladeLive_; }
+  // IS ITS SHIELD UP, as a WATCHER would say (ai::Action::Guard): the raise
+  // for a body stepped here, the owner's word (MobPose::kShieldUp) for a
+  // ghost, which steps no raise of its own.
+  bool ShieldUpForWatchers() const {
+    return IsGhost() ? ghostShieldUp_ : shieldRaise_ >= 0.5f;
+  }
   // ---- POSED BY ITS OWNER (2026-10-08) --------------------------------------
   // Latch `p` and place every limb where the owner had it (TickGhost), after
   // dropping any base limb the owner no longer has (DropLimbsOwnerLacks).
@@ -5696,6 +5702,8 @@ class Mob {
   // cutting or held in guard (MobPose::kBladeLive). FindParry reads it in
   // place of `swinging_` / the stroke phase, which a ghost does not run.
   bool ghostBladeLive_ = false;
+  // ...and its shield is up (MobPose::kShieldUp; ShieldUpForWatchers).
+  bool ghostShieldUp_ = false;
   // ONE tick of a creature somebody else owns: place the limbs where the
   // owner says they are and stop. The fourth branch of PreTick's loop, beside
   // Limp / GetUp / live.
@@ -7715,6 +7723,15 @@ class MobSystem {
   // and the pack. A coat does not move it — a ghost's coat is stale, the
   // known M9 limit — and neither does a pose. 0 for an unknown id.
   uint64_t StateKey(uint64_t mobId) const;
+  // WHAT A LIVING CREATURE HAS ON (2026-10-13): a digest of the gear list a
+  // MobAnnounce carries, by NAME, slot, hand and dye -- CaptureGear's walk
+  // without its damage lattices, so it is a few integer mixes per piece and
+  // can be asked every tick. A LIVE creature's announce went out once, so a
+  // shield that broke or a sword knocked from the hand on its owner never
+  // reached the peer's ghost, which went on holding it; net::EntitySync re-
+  // sends the announce when this changes (MobSystem::ApplyAnnounce re-dresses
+  // a ghost whose gear differs). 0 for an unknown id.
+  uint64_t GearKeyOf(uint64_t mobId) const;
   bool BuildState(uint64_t mobId, ::net::MobState& out) const;
   // False for an unknown id, a mob I own, or a record this build cannot read.
   bool ApplyState(const ::net::MobState& s);

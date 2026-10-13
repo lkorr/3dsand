@@ -4803,7 +4803,9 @@ export function anatomyRecipe(race = 'human') {
       '//torso': 'A ribcage, not a bone brick: the depth schedule would fill ' +
                  'the chest with solid bone, so `carve` hollows it to flesh ' +
                  '(the organs), walls it in muscle at depth 3, and puts bone ' +
-                 'back as ribs, a sternum and a spine. The HEART sits in the ' +
+                 'back as ribs, a sternum and a spine, its back face notched ' +
+                 'every other row through its depth into vertebrae, with ' +
+                 'spinous tips. The HEART sits in the ' +
                  'front of the hollow, wholly left of the midline (the ' +
                  'viewer\'s right) and high in the cage, a rounded lump ' +
                  '(`round`: the ellipsoid in its box) at most three cells ' +
@@ -5194,7 +5196,15 @@ export function generateMob(genome, seed = 0, opts = {}) {
     throw new Error(`"${HAIR_MAT_ID}" is material ${hairId}; mob voxel ` +
                     `material ids must stay <= 127`);
   const hairParts = [];
-  for (const hp of hairMass(g, parts, { face: sylFace })) {
+  // A RACE BASE IS BARE (raceBase): no hair, crown, horns, tail or pack. Every
+  // one of those is its own limb, appended after the body, and a character
+  // inherits its base's limbs by a named-array merge that can neither remove
+  // nor reorder one (sidecar.js diffNamedArray) -- so a base with a tail would
+  // give a tail to every character of its race, and a base whose parts came in
+  // another order than a character's could not be a base for it at all. The
+  // base is what EVERY member of the race has; each character grows its own.
+  const bare = opts.bare ?? isRaceBase(name);
+  for (const hp of bare ? [] : hairMass(g, parts, { face: sylFace })) {
     const mn = [0, 1, 2].map(i => Math.min(...hp.cells.map(c => c[i])));
     const mx = [0, 1, 2].map(i => Math.max(...hp.cells.map(c => c[i])));
     const size = [0, 1, 2].map(i => mx[i] - mn[i] + 1);
@@ -5874,12 +5884,53 @@ export const SYLVAN_PRESET_ORDER = Object.keys(SYLVAN_PRESETS);
 export const BASE_MOB = 'human';
 
 /** The FOLDER a character is filed in (src/game/sidecar.h "PROTOTYPES AND
- *  VARIANTS": filing, not semantics). Every generated character still
- *  `extends` BASE_MOB -- a sylvan is the human's rig with another surface --
- *  but a sylvan is filed beside its kin in assets/mobs/sylvan/. */
+ *  VARIANTS"): assets/mobs/<folder>/, a sylvan beside its kin in
+ *  assets/mobs/sylvan/. The folder is also the stem of the RACE BASE the
+ *  character extends (raceBase). */
 export const raceFolder = genome =>
   (genome && genome.body && genome.body.race === 'sylvan') ? 'sylvan'
   : raceMod(genome) ? raceMod(genome).FOLDER : BASE_MOB;
+
+/**
+ * THE HIERARCHY IS THREE DEEP (owner, 2026-10-13): the HUMAN owns the rig --
+ * limbs, chains, loco states, the clip library, natural weapons -- and every
+ * other race has ONE BASE BODY, assets/mobs/<race>.{vox,json}, which extends the
+ * human and is what that race's characters extend:
+ *
+ *     human  ->  sylvan  ->  dryad, deku, ...
+ *            ->  automaton -> tinker, ...
+ *
+ * So a clip or a loco state edited on the human reaches every creature, and a
+ * race-wide change made on its base -- the sylvan's anatomy recipe (heartwood,
+ * crystals), its sap, an android's absent bleed -- reaches that race's
+ * characters and no one else's. A human character extends the human directly
+ * (the human IS its race base). What a race base's own .vox looks like does NOT
+ * reach its characters: each wears its own art, exactly as a human character
+ * does not wear human.vox. Only sidecar data inherits.
+ *
+ * raceBase(genome) is the stem a character with that genome extends;
+ * raceBaseGenome(race) is the genome the base body itself is generated from
+ * (the default body, made that race -- `gen_mobs.mjs <race> --race-base`).
+ */
+export const raceBase = genome => raceFolder(genome);
+
+/** Is `name` a race base's stem (sylvan, automaton, android, demon)? A body
+ *  of that name is generated bare (generateMob). */
+export const isRaceBase = name => name !== BASE_MOB && RACES.includes(name);
+
+export function raceBaseGenome(race) {
+  if (race === BASE_MOB || !RACES.includes(race))
+    throw new Error(`no race base for '${race}' (races: ${RACES.join(', ')}; ` +
+                    `${BASE_MOB} is the root, not a race base)`);
+  return applyRace(defaultGenome(), race);
+}
+
+/** The stem a body named `name` with `genome` extends: its race base, or the
+ *  human when it IS the race base (or a human). */
+export const extendsFor = (genome, name) => {
+  const b = raceBase(genome);
+  return b === name ? BASE_MOB : b;
+};
 
 /**
  * A GENERATED CHARACTER IS A DIFF, NOT A BODY.
@@ -5905,9 +5956,11 @@ export const raceFolder = genome =>
  * it does not reproduce this body exactly, so a file that would load as a
  * different creature is never written.
  *
- * @param {object} full   a `generateMob(...).sidecar`
- * @param {object} base   the RESOLVED base sidecar (assets/mobs/human.json)
- * @param {string} name   the asset stem this will be saved under
+ * @param {object} full     a `generateMob(...).sidecar`
+ * @param {object} base     the RESOLVED sidecar of `baseName`
+ * @param {string} name     the asset stem this will be saved under
+ * @param {string} baseName the stem it extends: `extendsFor(genome, name)` --
+ *                          its race base, or the human (default: the human)
  */
 /**
  * WHAT THE GENERATOR DOES NOT MODEL IS INHERITED -- one level down as well as
@@ -5940,7 +5993,7 @@ export function inheritUnmodelled(full, base) {
   return body;
 }
 
-export function thinSidecar(full, base, name) {
+export function thinSidecar(full, base, name, baseName = BASE_MOB) {
   const body = inheritUnmodelled(full, base);
   delete body.genome;                       // the input, never inherited
   // WHAT THE GENERATOR DOES NOT MODEL IS INHERITED, NOT DELETED.
@@ -5956,13 +6009,29 @@ export function thinSidecar(full, base, name) {
   // which also does it for the clips the generator does not author).
   const patch = SC.diffAgainst(base, body) || {};
   return {
-    '//': `A CHARACTER, not a creature: ${name} inherits ${BASE_MOB}'s rig — ` +
-          'limb names and tags, chains, loco states, natural weapons, sockets, ' +
-          'the anatomy recipe and the shared clip library — and states only ' +
-          'what its own body makes different. Written by the Characters page ' +
-          `or by \`node scripts/gen_mobs.mjs ${name} --rebake\`, from the ` +
-          '`genome` block at the bottom. Do not hand-edit: re-roll it.',
-    extends: BASE_MOB,
+    '//': (isRaceBase(name)
+      ? `A RACE BASE: the body every ${name} character extends, itself a ` +
+        `difference against ${BASE_MOB} (whose rig, loco states and clip ` +
+        'library it inherits). Generated bare -- no hair, crown, horns, tail ' +
+        'or pack, since a character cannot remove a limb it inherits -- from ' +
+        `the default body made ${name} (\`node scripts/gen_mobs.mjs ${name} ` +
+        '--race-base`). Race-wide sidecar traits go HERE and reach every ' +
+        `${name}: the anatomy recipe, the bleed. Its .vox does not: each ` +
+        'character wears its own art.'
+      : baseName === BASE_MOB
+      ? `A CHARACTER, not a creature: ${name} inherits ${BASE_MOB}'s rig — ` +
+        'limb names and tags, chains, loco states, natural weapons, sockets, ' +
+        'the anatomy recipe and the shared clip library — and states only ' +
+        'what its own body makes different.'
+      : `A CHARACTER, not a creature: ${name} extends ${baseName}, its race ` +
+        `base, which extends ${BASE_MOB}: the rig, loco states and clip ` +
+        `library come from ${BASE_MOB}, the race-wide traits (anatomy recipe, ` +
+        `bleed, ...) from ${baseName}, and this file states only what its own ` +
+        'body makes different.') +
+      ' Written by the Characters page ' +
+      `or by \`node scripts/gen_mobs.mjs ${name} --rebake\`, from the ` +
+      '`genome` block at the bottom. Do not hand-edit: re-roll it.',
+    extends: baseName,
     // IGNORED BY THE LOADER, and said anyway: a file's own .vox wins over any
     // `model` (mob.cpp, CollectMobSources), so this is documentation that the
     // body is this character's own art and not the base's, which is the one

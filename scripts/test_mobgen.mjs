@@ -1280,7 +1280,14 @@ section('M. every character on disk RESOLVES to the body its genome describes');
     const p = path.join(mobsDir, 'effects', name + '.json');
     return fs.existsSync(p) ? readJson(p) : null;
   };
-  const base = sc.resolveSidecar(readStem, mg.BASE_MOB, readEffect);
+  // Each character is a difference against ITS base: the human for a human,
+  // the race base for anybody else (mobgen.raceBase / extendsFor), which is
+  // itself a difference against the human.
+  const bases = new Map();
+  const baseOf = stem => {
+    if (!bases.has(stem)) bases.set(stem, sc.resolveSidecar(readStem, stem, readEffect));
+    return bases.get(stem);
+  };
 
   const pool = listMobFiles('.json')
     .map(f => [f.stem, readJson(f.path)])
@@ -1301,12 +1308,18 @@ section('M. every character on disk RESOLVES to the body its genome describes');
     }
     // 1. THE FILE IS THE DIFFERENCE THIS GENOME PRODUCES TODAY. The `genome`
     //    block is the input and is not compared; everything else is.
-    let thin;
+    const baseName = mg.extendsFor(mg.normalizeGenome(onDisk.genome), name);
+    ok(onDisk.extends === baseName,
+       `${name} extends ${baseName} (${baseName === mg.BASE_MOB ? 'the root' : 'its race base'})`,
+       `it extends ${onDisk.extends}; re-parent it: node scripts/gen_mobs.mjs ` +
+       `${name} --rebake --sidecar-only`);
+    let base, thin;
     try {
-      thin = mg.thinSidecar(fresh, base, name);
+      base = baseOf(baseName);
+      thin = mg.thinSidecar(fresh, base, name, baseName);
     } catch (e) {
       ok(false, `${name}: its body is expressible as a difference from ` +
-         `${mg.BASE_MOB}`, e.message);
+         `${baseName}`, e.message);
       continue;
     }
     const strip = o => {
