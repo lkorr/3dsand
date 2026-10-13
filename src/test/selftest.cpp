@@ -1167,6 +1167,12 @@ const char* const kOrder[] = {
     // per lost cell), where the same stabs beside it do not (owner,
     // 2026-10-12). Pristine ground, CPU only (pose ticks, real melee sweep).
     "heart",
+    // ...and a SPELL flight's matter as the point (docs/PLAN_projectiles.md
+    // D): real casts through a TickRig at fresh human spawns, ~500 ticks of
+    // THE tick (bleeds, acid and lava coats burning), so it sits here, late,
+    // by the rule the wound block states rather than beside `pierce`. Restores
+    // the id counter and regenerates the ground on the way out.
+    "spell-pierce",
     // ...and the overlap where a limb meets its parent is ONE cell of flesh in
     // two lattices: rot, a coat or a hole in either copy is in both (owner
     // report 2026-09-23). Pristine ground, CPU only.

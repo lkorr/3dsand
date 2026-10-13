@@ -22,6 +22,7 @@
 #include "game/demon_talk.h"
 #include "game/dye.h"
 #include "game/itemcoat.h"
+#include "game/pierce.h"   // SpellMatterStrike: a spell flight's matter meets a body
 #include "game/persist.h"
 #include "game/strokes.h"
 #include "game/worlditems.h"
@@ -3895,9 +3896,26 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           const Player* player;
           uint64_t playerId;
           const PlayerAvatar* avatar;
-        } bodyCtx{&phys, &mobs, &player, kPlayerCasterId, &avatar};
+          DebrisSystem* debris;
+          World* world;
+          std::vector<ParticleSpawn>* spawns;   // the tick's: a wound's gore
+        } bodyCtx{&phys, &mobs, &player, kPlayerCasterId, &avatar, &debris, &world, &spawns};
         SpellBodyProbe bodyProbe;
         bodyProbe.ctx = &bodyCtx;
+        // THE MATTER IS THE PROJECTILE (docs/PLAN_projectiles.md D): a flight
+        // carrying matter strikes the body itself -- pierces, scours, splashes
+        // or touches -- through game/pierce.h SpellMatterStrike. The caster's
+        // own parts are never in the way (bodyHit's ownership rule, as an
+        // ignore list: a body BEHIND the caster's arm is still met).
+        bodyProbe.matterHit = [](void* c, const SpellBodyShot& shot, SpellBodyStrike& r) {
+          SpellBodyCtx& bc = *(SpellBodyCtx*)c;
+          std::vector<uint64_t> own;
+          if (shot.casterId == bc.playerId && bc.avatar->Spawned())
+            for (int i = 0; i < bc.avatar->LimbCount(); i++)
+              if (const uint64_t h = bc.mobs->LimbBody(bc.avatar->Id(), i)) own.push_back(h);
+          SpellMatterStrike(*bc.phys, *bc.mobs, *bc.debris, *bc.world, *bc.spawns, shot, own, r);
+          return r.hit;
+        };
         // WHAT A FLIGHT RUNS INTO: the first MOVING-layer body on the tick's
         // segment (a mob limb, debris, a bomb), through the same ray the laser
         // and the melee sweep use. The caster's own parts are rejected by

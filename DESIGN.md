@@ -9000,6 +9000,81 @@ Calibration, `gore.pierceCellJ` 1.0 J per fine cell of skin-hard matter (a full 
 
 Known limits: no angle-of-incidence glance (a grazing shot pays the same first bin as a square one); materials.json hardness ranks ice (35) ABOVE bone (24), so the soft-point rule does not shatter ice on bone; a ghost (remote) creature is carved like a local one (package C must route shots on peers' bodies the way melee hits are routed).
 
+### The matter is the projectile: spell flights strike bodies (2026-10-12; `docs/PLAN_projectiles.md` decision 3, package D; `game/spell.h` `FlightMatter` / `KineticMana`, `game/pierce.h` `SpellMatterStrike`, `SpellBodyProbe::matterHit`, gate `spell-pierce`)
+
+Until this a flight that met a body resolved its payload at the collider hit
+and did nothing of its own: a stone projectile sprayed three stone voxels
+through the man it hit and the readout claimed it "knocked" him. Now a FLIGHT
+carrying free matter (a matter word in its pile = a Spray item on hit) FLIES
+AS THAT MATTER, and what it does to a body is decided by what it is made of.
+
+- **What flies.** Mass = density x `budgets.matterProjectile.lumpMl` (250 mL)
+  x the matter scale (n x magnitude), summed over every matter item; the
+  heaviest item is the CORE and decides the rest. The lump is not the spray: a
+  stone projectile is a 0.65 kg fist of stone in flight and still lands three
+  stone voxels where it stops. Speed is the record's (`projectile` 4.8 vox/tick
+  = 14.4 m/s, `bolt` 28.8, `lob` 7.2; weight and `speed` scale it). The point
+  is the DELIVERY's shape (`glyphs.json` `penetrator`: `projectile` tip 1.5
+  fine cells / sharpness 0.4, a fist-sized lump; `bolt` 1.0 / 0.7, a dart;
+  `lob` 2.5 / 0.15, a blunt ball; `orb` 2.0 / 0.2) and its hardness the
+  MATTER's (materials.json): stone 90, steel 200, wood 40.
+- **Solid PIERCES** through `PierceAlongRay` -- the arrow's model, so a body
+  is as hard to shoot through as to cut through by what it is made of. Through
+  everything on the segment: the flight goes ON at the residual speed from the
+  far side (through one man and into the next). Stopped (embedded or glanced):
+  it resolves there.
+- **Powder SCOURS**: the same penetrator, sharpness x `powderSharpMille` (0.4),
+  tip x `powderTipMille` (2.0), its energy capped at `scourBins` (2) bins of
+  skin-hard matter at that tip, and always stopped -- grit takes a shallow
+  wound, never a channel.
+- **Liquid SPLASHES, never penetrates**: the first creature's skin under the
+  ray takes a coat disc (`splashRadiusMille` 1.2 voxels, cube-root of the
+  scale) at the material's own authored stain amount x the scale, through the
+  pour brush's writers (`MobSystem::PickBody` + `PourOnBody`), and the coat's
+  own rules do the rest -- acid eats (its reactions on the voxel it sits on),
+  lava sears and lights (`lava + tag:organic -> fire`, the hot-coat rule),
+  water wets and rinses. No new body rule anywhere.
+- **Gas (or a liquid no body can wear) TOUCHES**: resolves at the hit exactly
+  as every flight used to. `fire fire bolt` -- the NPC firebolt -- is unchanged.
+- **Where it stops.** Effects resolve there as they always did. The matter does
+  not fly on: what the body now holds (a coat) is gone from the payload, and
+  the rest -- a lump that stopped in the wound, a scour's grit, a second matter
+  word -- is DROPPED at the stop point with no velocity (it was flung on
+  through the body before). Inside a creature, a leftover matter a body can
+  wear coats the channel's floor, and a `tag:hot` one lights the limb
+  (`IgniteLimb`); no shipped solid glyph is either, so stone, steel and gold
+  drop out of the wound. Terrain is unchanged.
+- **`pierce`** keeps its wall and adds `pierceBodyMille` (x1.0) of the matter's
+  energy per word against bodies, as mass, so the residual speed is the
+  flight's own.
+- **The price includes the energy** (`KineticMana`, `rates.kinetic` = 100 mana
+  per kJ): 1/2 m v² x the pierce bonus, integer millijoules, added to the
+  carrier's carry AFTER its multiplier (an outer carrier's carry still
+  composes on it), per bolt, per lane at that lane's own speed. Stone: lob +2,
+  projectile +7, bolt +27, `speed@4` projectile +108; fire weighs nothing.
+- **Seam.** The VM still knows nothing about bodies (thesis 4): it fills a
+  `SpellBodyShot` and asks `SpellBodyProbe::matterHit`; the player's probe
+  (session.cpp phase I) and every creature caster's (`demon_cast.cpp`) answer
+  through `SpellMatterStrike`, the caster's own limbs as the ignore list. Gore
+  leaves through the tick's particle stream; nothing writes the world (rule 3).
+  The last 16 strikes are kept in `SpellSystem::StrikeLog` (diagnostics only).
+
+Measured by `spell-pierce` (the human's torso, from the front 6 cm off the
+midline, real casts through the tick): `stone projectile` 67.5 J EMBEDS 3.8 cm
+(skin 10, flesh 5, muscle 3 cells; 0.6 hp, then the bleed); `stone bolt` 270 J
+goes THROUGH, 14.6 cm (skin 9, flesh 12, muscle 13, blood 1, bone 6; 71.6 J
+spent) and flies on at 24.7 m/s; `sand bolt` scours 2.5 cm (capped 165 ->
+89.8 J; skin 17, flesh 8); `water projectile` coats 596 skin cells and carves
+nothing; `acid projectile` coats them and eats 75 torso cells / 20.3 hp in 2 s;
+`lava projectile` coats them and burns 129 cells / 70.4 hp in 2 s.
+
+Known limits: a solid that embeds is DROPPED, not lodged (package C's embedded
+arrow slot is the natural home for a lodged stone); a scour that clears a thin
+limb inside its cap may still nick the body behind it (PierceAlongRay's walk)
+though the flight stops; a peer's ghost is struck like a local creature (the
+penetrator's limit); materials have no freeze path on a body, so an `ice`
+glyph would pierce and drop.
+
 ### Infection is a material (2026-10-01; `docs/PLAN_weapon_coats.md` B; `Mob::InfectStep`, `Mob::CoatInfectTick`, `MaterialDef::infect`)
 
 Until this the rot was the only infection and it was wired in: `MobLimb::infectMat`
@@ -11664,7 +11739,9 @@ field is charged and named in the readout rather than editing something nobody
 reads, which is what makes rule 3's "every other mod on the hand is a no-op"
 honest. The runtime reads the record and nothing else: a bounce reflects the
 axis that entered the solid (each axis probed alone) and loses a fifth of the
-speed; a pierce passes through one wall and resolves on the next; a fused bolt
+speed; a pierce passes through one wall and resolves on the next (and, against
+a BODY, adds the matter's own energy again per word: "The matter is the
+projectile" below); a fused bolt
 rests where it landed and counts down; a seeking bolt turns toward the nearest
 target the owner names (`SpellBodyProbe::nearestTarget`, integer steering
 after one float→fixed conversion at the query boundary). A gravity Mod on an
@@ -11718,7 +11795,11 @@ declares `carry`, a per-mille premium on the payload tariff (`hand`/`self`/
 `bomb` 1.0, `projectile` 3.0, `bolt` 4.0), and instances multiply everything,
 so `shotgun³` pays 27 bolts' worth and reads as a lethal number before you
 commit. Sustained effects (`aura`, a held `beam`) price at zero up front and
-pay the same tariff per tick as they emit.
+pay the same tariff per tick as they emit. **Speed is not free (2026-10-12):** a
+flight carrying matter also pays the KINETIC TERM, 1/2 m v² of its matter at the
+record's launch speed (x the `pierce` body bonus) x `rates.kinetic` mana per kJ,
+inside the HUD's `carry` and after that box's own multiplier (`KineticMana`;
+"The matter is the projectile" below).
 
 **`anything` is priced when it lands.** The wildcard's tariff is unknowable
 before the cast (the HUD shows `+ ?`): on resolve, the material actually at

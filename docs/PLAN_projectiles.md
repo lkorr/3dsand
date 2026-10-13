@@ -110,6 +110,46 @@ payload -> `PierceChannel`; liquid/gas -> splash coat; leftover matter
 deposited at the stop point; kinetic term in the price; `pierce` mod body
 budget. Hash moves -> rebaseline once at the end. Gate `spell-pierce`.
 
+**Status (2026-10-12): built, on its worktree branch** (DESIGN.md "The matter
+is the projectile"). How it came out:
+
+- **Matter -> penetrator.** Mass = materials.json density x
+  `budgets.matterProjectile.lumpMl` (250 mL) x matter scale, summed over the
+  matter items; the heaviest is the core. Stone 0.65 kg, steel 1.95 kg, gold
+  4.8 kg, water 0.25 kg, fire 0.75 g. Speed = the record's launch speed
+  (projectile 14.4 m/s, bolt 28.8, lob 7.2). Point = the delivery's new
+  `penetrator` block (projectile tip 1.5 fine cells / sharpness 0.4, bolt
+  1.0 / 0.7, lob 2.5 / 0.15, orb 2.0 / 0.2); hardness = the matter's.
+- **Class decides the strike:** solid PIERCES (PierceAlongRay; through =
+  flies on at the residual speed), powder SCOURS (sharpness x0.4, tip x2,
+  capped at 2 skin bins, always stops), liquid SPLASHES a coat (PourOnBody;
+  acid eats, lava sears/lights, water wets -- the coats' own rules), gas
+  TOUCHES (resolve at the hit, as before: the NPC firebolt is unchanged).
+- **Deposit:** effects resolve at the stop point; the matter the body did not
+  take is dropped there with no velocity. Embedded inert solids (stone,
+  steel) are dropped, not lodged -- a lodged lump wants package C's embedded
+  slot (owner decision).
+- **Price:** kinetic term = 1/2 m v^2 x pierce bonus x `rates.kinetic` (100
+  mana/kJ), in carry after the box's multiplier. Stone: lob 17 -> 19,
+  projectile 25 -> 32, bolt 33 -> 60. NPC kits carry no solid matter
+  (fire weighs 0.75 g): firebolt / hellfire / lava_floor / lift prices are
+  unchanged.
+- **`pierce`** adds x1.0 of the matter's energy per word against bodies
+  (priced), and keeps its one-wall terrain role.
+- **Gate `spell-pierce`** (torso, front, real casts through the tick): stone
+  projectile 67.5 J embeds 3.8 cm (18 cells, 0.6 hp + bleed); stone bolt 270 J
+  goes through 14.6 cm (41 cells incl. 6 bone) and flies on at 24.7 m/s; sand
+  bolt scours 2.5 cm; water coats 596 skin cells, carves nothing; acid coats
+  and eats 75 cells / 20 hp in 2 s; lava coats and burns 129 cells / 70 hp in
+  2 s; the stone bolt replays identically. World hash unmoved (ef7d9a06).
+- **Owner decisions open:** (1) whether an embedded lump should LODGE (needs
+  package C's embedded slot) instead of dropping out of the wound; (2) the
+  calibration -- lumpMl 250, the delivery points, rates.kinetic 100/kJ -- is a
+  first cut: the stone projectile's wound is 0.6 hp, i.e. the damage is the
+  bleed and what the channel hits, by design (decision 1's no-kill-rule);
+  (3) `speed@4` now costs 149 for a stone projectile (was 41), so fast heavy
+  matter is out of reach of a 100-mana player.
+
 ## NPC archers (package E, after C)
 
 `behaviors.json` `ranged` block shaped like `cast`: preferred range, draw,

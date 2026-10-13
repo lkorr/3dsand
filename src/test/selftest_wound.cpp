@@ -11263,6 +11263,322 @@ Status GatePierce(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// spell-pierce: the matter IS the projectile
+// ---------------------------------------------------------------------------
+// docs/PLAN_projectiles.md decision 3, package D (game/spell.h FlightMatter,
+// game/pierce.h SpellMatterStrike). Every shot is a REAL CAST into the rig
+// session's own SpellSystem, flown by THE tick (TickAuthority phase I, the
+// player's spell probe and its matterHit), at a FRESH human posed like every
+// wound fixture, aimed at its torso from the front 6 cm off the midline (the
+// `pierce` gate's torso ray). Per shot it prints what the VM logged (kind,
+// outcome, depth, cells by material, joules, hp) and what the body shows
+// `spellPierceSettleTicks` later (coat cells, cells eaten, burn hp).
+//
+//   stone projectile  a solid lump: it must get IN (cells taken) and not out.
+//   stone bolt        the same matter twice as fast: deeper, or through.
+//   water projectile  a liquid: a coat on the skin, NOTHING carved, then or
+//                     after.
+//   acid projectile   a coat, and the acid then eats what it sits on.
+//   lava projectile   a coat, and the wound burns (burn hp / fire / cells).
+//   sand bolt         a powder: a scour that stops in the first body.
+//   price             stone bolt > stone projectile > stone lob, by the kinetic
+//                     term; the NPC kits' words priced with it and without.
+//   replay            the stone bolt again on a fresh spawn: identical numbers.
+Status GateSpellPierce(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  mobs.SetNextIdCounter(1);
+  PrepareWorld(c);
+  const int human = mobs.FindDef("human");
+  if (human < 0) {
+    detail = "no `human` mob def loaded";
+    return Status::Fail;
+  }
+  const int settle = (int)BaselineNumber("spellPierceSettleTicks", 60);
+  bool ok = true;
+  std::string why, lines;
+  auto fail = [&](const std::string& s) {
+    ok = false;
+    why += " | " + s;
+  };
+  auto matName = [&](uint32_t m) {
+    return m < c.mats.size() ? c.mats[m].name : std::string("?");
+  };
+  auto matId = [&](const char* nm) -> uint32_t {
+    for (uint32_t i = 0; i < (uint32_t)c.mats.size(); i++)
+      if (c.mats[i].name == nm) return i;
+    return 0;
+  };
+
+  // ---- THE RIG, and the glyphs the tick casts with ----------------------------
+  Target tgt;
+  tgt.defIndex = human;
+  tgt.limb = 0;
+  IVec3 chunk{};
+  if (!SpawnTarget(c, tgt, 170, chunk)) {
+    detail = "the fixture human did not spawn";
+    return Status::Fail;
+  }
+  support::TickRig rig(c, 71000, chunk);
+  GlyphLibrary& lib = rig.Glyphs();
+  {
+    std::string gerr;
+    if (!LoadGlyphs(AssetDir() + "/spells/glyphs.json", c.mats, lib, gerr)) {
+      detail = "glyph load failed: " + gerr;
+      std::printf("spell-pierce: FAIL (%s)\n", detail.c_str());
+      return Status::Fail;
+    }
+  }
+  SpellSystem& spells = rig.Session().spells;
+  spells.SetLibrary(&lib);
+  auto speak = [&](const GlyphLibrary& L, const std::string& words) {
+    SpellStack st;
+    size_t pos = 0;
+    while (pos <= words.size()) {
+      size_t sp = words.find(' ', pos);
+      if (sp == std::string::npos) sp = words.size();
+      const std::string w = words.substr(pos, sp - pos);
+      if (!w.empty()) {
+        int32_t mag = kMagUnset;
+        SpellTiming tm;
+        const int gi = ParseWord(L, w, mag, tm);
+        if (gi >= 0) st.Push(gi, mag, tm);
+      }
+      pos = sp + 1;
+    }
+    return CompileSpell(L, st);
+  };
+
+  // ---- ONE SHOT ------------------------------------------------------------------
+  struct Shot {
+    std::string words;
+    bool ran = false, logged = false;
+    SpellStrikeLog log;
+    uint64_t id = 0;
+    int torso = -1;
+    float hp0 = 0, hpHit = 0, hpEnd = 0, burnHp = 0;
+    uint32_t vox0 = 0, voxHit = 0, voxEnd = 0;
+    uint32_t coatHit = 0, fireEnd = 0;
+    int ticksToHit = -1;
+  };
+  auto shoot = [&](const std::string& words, uint32_t coatMat) -> Shot {
+    Shot s;
+    s.words = words;
+    spells.Clear();
+    s.id = SpawnTarget(c, tgt, 170, chunk);
+    rig.SetFixtureChunk(chunk);
+    if (!s.id) return s;
+    const auto& L = mobs.Defs()[human].limbs;
+    int arm = -1;
+    for (size_t i = 0; i < L.size(); i++) {
+      if (L[i].name == "torso") s.torso = (int)i;
+      if (L[i].name == "armU.L" || (arm < 0 && L[i].name == "armU.R")) arm = (int)i;
+    }
+    if (s.torso < 0 || arm < 0) return s;
+    auto centroid = [&](int li) {
+      Vec3 sum{};
+      const uint32_t n = 512;
+      for (uint32_t k = 0; k < n; k++) sum += mobs.LimbVoxelPos(s.id, li, k * 7919u);
+      return sum * (1.0f / (float)n);
+    };
+    const Vec3 torsoC = centroid(s.torso), armC = centroid(arm);
+    Vec3 side = torsoC - armC;
+    side.y = 0.0f;
+    side = side.len() > 1e-3f ? side.normalized() : Vec3{1, 0, 0};
+    const Vec3 front = Vec3{0, 1, 0}.cross(side).normalized();
+    // The hand resolves its payload at reach (glyphs.json hand.reach) and the
+    // flight leaves from there: 10 voxels back puts the muzzle ~5 voxels off
+    // the chest, close enough that a lob's drop stays on the torso.
+    const Vec3 from = torsoC - side * 0.6f - front * 10.0f;
+    s.hp0 = mobs.TotalHp(s.id);
+    s.vox0 = mobs.LimbVoxelCount(s.id, s.torso);
+    const CastList cl = speak(lib, words);
+    CasterState cs;
+    cs.mana = cs.manaMax = 1 << 20;
+    CasterHealth hp;
+    hp.get = [](void*) { return (int32_t)(1 << 20); };
+    SpellEmission e0;
+    const SpellProbe probe = WorldSpellProbe(c.world);
+    spells.Cast(cl, cs, hp, kPlayerCasterId,
+                {SpellFxFromFloat(from.x), SpellFxFromFloat(from.y), SpellFxFromFloat(from.z)},
+                {SpellFxFromFloat(front.x), SpellFxFromFloat(front.y), SpellFxFromFloat(front.z)},
+                rig.tick + 1, e0, &probe);
+    s.ran = spells.LiveCount() > 0;
+    for (int k = 0; k < 40 && spells.LiveCount() > 0 && spells.StrikeLog().empty(); k++) {
+      support::RunTicks(rig, 1);
+      if (!spells.StrikeLog().empty()) s.ticksToHit = k + 1;
+    }
+    if (!spells.StrikeLog().empty()) {
+      s.logged = true;
+      s.log = spells.StrikeLog().front();
+    }
+    s.hpHit = mobs.TotalHp(s.id);
+    s.voxHit = mobs.LimbVoxelCount(s.id, s.torso);
+    s.coatHit = coatMat ? mobs.LimbCoatMatCount(s.id, s.torso, coatMat, 1) : 0;
+    support::RunTicks(rig, settle);
+    s.hpEnd = mobs.TotalHp(s.id);
+    s.voxEnd = mobs.LimbVoxelCount(s.id, s.torso);
+    s.fireEnd = mobs.LimbMaterialCount(s.id, s.torso, matId("fire"));
+    if (const Mob* m = mobs.FindMobById(s.id)) s.burnHp = m->HpLostBy(DamageCause::Burn);
+    spells.Clear();
+    return s;
+  };
+  auto describe = [&](const Shot& s) {
+    if (!s.ran) return std::string("[not cast]");
+    if (!s.logged) return std::string("[no body met]");
+    const SpellBodyStrike& r = s.log.r;
+    std::string mats;
+    for (const SpellBodyStrike::MatCells& m : r.byMat)
+      mats += Format("%s%s %u", mats.empty() ? "" : ", ", matName(m.mat).c_str(), m.cells);
+    const SpellMatterKind k = s.log.shot.kind;
+    const bool point = k == SpellMatterKind::Pierce || k == SpellMatterKind::Scour;
+    return Format(
+        "[%s %s %.2f kg @ %.1f m/s = %.1f J (tip %.2f, sharp %.2f): %s%s, %.1f cm, %u cells "
+        "(%s), spent %.1f J, hp %.1f%s; coat %u then; after %d ticks: torso cells %u -> %u "
+        "-> %u, hp %.1f -> %.1f -> %.1f, burn hp %.1f, fire %u]",
+        SpellMatterKindName(k), matName(s.log.shot.material).c_str(), s.log.shot.massKg,
+        s.log.shot.speedMps, r.energyJ, s.log.shot.tipRadius, s.log.shot.sharpness,
+        point ? PierceOutcomeName((PierceOutcome)r.outcome) : (r.tookMatter ? "coated" : "touched"),
+        r.through ? Format(", OUT at %.1f m/s", r.exitSpeedMps).c_str() : "",
+        r.depthVox * kVoxelMeters * 100.0f, r.cells, mats.empty() ? "none" : mats.c_str(),
+        r.spentJ, r.hp, r.killed ? ", KILLED" : "", s.coatHit, settle, s.vox0, s.voxHit,
+        s.voxEnd, s.hp0, s.hpHit, s.hpEnd, s.burnHp, s.fireEnd);
+  };
+
+  const uint32_t mWater = matId("water"), mAcid = matId("acid"), mLava = matId("lava");
+  const Shot stoneP = shoot("stone projectile", 0);
+  const Shot stoneB = shoot("stone bolt", 0);
+  const Shot water = shoot("water projectile", mWater);
+  const Shot acid = shoot("acid projectile", mAcid);
+  const Shot lava = shoot("lava projectile", mLava);
+  const Shot sand = shoot("sand bolt", 0);
+  const Shot again = shoot("stone bolt", 0);
+  lines += "STONE PROJECTILE " + describe(stoneP) + " | ";
+  lines += "STONE BOLT " + describe(stoneB) + " | ";
+  lines += "WATER " + describe(water) + " | ";
+  lines += "ACID " + describe(acid) + " | ";
+  lines += "LAVA " + describe(lava) + " | ";
+  lines += "SAND BOLT " + describe(sand) + " | ";
+
+  auto hitTorso = [&](const Shot& s, SpellMatterKind k, const char* nm) {
+    if (!s.ran) {
+      fail(std::string(nm) + ": not cast");
+      return false;
+    }
+    if (!s.logged || s.log.r.mobId != s.id) {
+      fail(std::string(nm) + ": its matter met no body (or not the fixture)");
+      return false;
+    }
+    if (s.log.shot.kind != k) {
+      fail(Format("%s: flew as %s, not %s", nm, SpellMatterKindName(s.log.shot.kind),
+                  SpellMatterKindName(k)));
+      return false;
+    }
+    return true;
+  };
+  // ---- solids: in, and deeper at speed ----------------------------------------
+  if (hitTorso(stoneP, SpellMatterKind::Pierce, "stone projectile")) {
+    const SpellBodyStrike& r = stoneP.log.r;
+    if (r.cells < (uint32_t)BaselineNumber("spellPierceStoneMinCells", 1))
+      fail("stone projectile took no cells (it did not get in)");
+    if (r.through) fail("stone projectile went through (it should embed)");
+  }
+  if (hitTorso(stoneB, SpellMatterKind::Pierce, "stone bolt") && stoneP.logged) {
+    const SpellBodyStrike& p = stoneP.log.r;
+    const SpellBodyStrike& b = stoneB.log.r;
+    if (!(b.through || b.depthVox > p.depthVox))
+      fail(Format("stone bolt was no deeper than the projectile (%.2f vs %.2f vox)", b.depthVox,
+                  p.depthVox));
+    if (b.energyJ <= p.energyJ) fail("stone bolt carried no more energy than the projectile");
+  }
+  // ---- liquids: a coat, never a channel ---------------------------------------
+  if (hitTorso(water, SpellMatterKind::Splash, "water projectile")) {
+    if (water.log.r.coated == 0 || water.coatHit == 0) fail("water: no coat on the skin");
+    if (water.log.r.cells != 0 || water.voxHit != water.vox0 || water.voxEnd != water.vox0)
+      fail(Format("water carved the torso (%u -> %u -> %u cells)", water.vox0, water.voxHit,
+                  water.voxEnd));
+  }
+  if (hitTorso(acid, SpellMatterKind::Splash, "acid projectile")) {
+    if (acid.log.r.coated == 0) fail("acid: no coat on the skin");
+    if (acid.log.r.cells != 0 || acid.voxHit != acid.vox0)
+      fail("acid PENETRATED (a liquid never makes a channel)");
+    const uint32_t eaten = acid.vox0 > acid.voxEnd ? acid.vox0 - acid.voxEnd : 0;
+    if ((float)eaten < (float)BaselineNumber("spellPierceAcidMinEaten", 1) &&
+        acid.burnHp <= 0.0f)
+      fail(Format("acid: the coat ate nothing in %d ticks", settle));
+    RecordObserved("spellPierceAcidEaten", (double)eaten);
+  }
+  if (hitTorso(lava, SpellMatterKind::Splash, "lava projectile")) {
+    if (lava.log.r.coated == 0) fail("lava: no coat on the skin");
+    const uint32_t lost = lava.vox0 > lava.voxEnd ? lava.vox0 - lava.voxEnd : 0;
+    if (lava.burnHp < (float)BaselineNumber("spellPierceLavaMinBurnHp", 0.01) &&
+        lava.fireEnd == 0 && lost == 0)
+      fail(Format("lava: no burn at the wound in %d ticks", settle));
+    RecordObserved("spellPierceLavaBurnHp", (double)lava.burnHp);
+  }
+  // ---- powder: a scour, never a channel through ------------------------------
+  if (hitTorso(sand, SpellMatterKind::Scour, "sand bolt") && sand.log.r.through)
+    fail("sand went through (a scour always stops)");
+  // ---- the same bolt again: identical -----------------------------------------
+  if (stoneB.logged && again.logged) {
+    const SpellBodyStrike& a = stoneB.log.r;
+    const SpellBodyStrike& b = again.log.r;
+    bool same = a.cells == b.cells && a.depthVox == b.depthVox && a.hp == b.hp &&
+                a.through == b.through && a.exitSpeedMps == b.exitSpeedMps &&
+                a.byMat.size() == b.byMat.size();
+    for (size_t k = 0; same && k < a.byMat.size(); k++)
+      same = a.byMat[k].mat == b.byMat[k].mat && a.byMat[k].cells == b.byMat[k].cells;
+    if (!same) fail("the stone bolt did not replay identically on a fresh spawn");
+  } else {
+    fail("the stone bolt replay met nothing");
+  }
+  if (stoneP.logged) {
+    RecordObserved("spellPierceStoneCells", (double)stoneP.log.r.cells);
+    RecordObserved("spellPierceStoneDepthCm", (double)(stoneP.log.r.depthVox * kVoxelMeters * 100.0f));
+  }
+  if (stoneB.logged) {
+    RecordObserved("spellPierceBoltCells", (double)stoneB.log.r.cells);
+    RecordObserved("spellPierceBoltHp", (double)stoneB.log.r.hp);
+  }
+
+  // ---- THE PRICE: speed is not free -------------------------------------------
+  // Each sentence priced as shipped and with the kinetic term off (the price
+  // it had before package D), so the readout is the before/after table.
+  GlyphLibrary noKin = lib;
+  noKin.budgets.rateKinetic = 0;
+  std::string prices;
+  int32_t pProj = 0, pBolt = 0, pLob = 0;
+  for (const char* w :
+       {"stone projectile", "stone bolt", "stone lob", "steel bolt", "gold projectile",
+        "sand projectile", "water projectile", "acid projectile", "lava projectile",
+        "stone pierce projectile", "stone speed@4 projectile", "fire fire bolt",
+        "fire fire explosive@1.5 bolt", "anything transmute lava bolt", "lift@0.5 aura bolt"}) {
+    const CastList now = speak(lib, w), was = speak(noKin, w);
+    prices += Format("%s%s %d (was %d; word %d tariff %d carry %d)", prices.empty() ? "" : "; ",
+                     w, now.manaCost, was.manaCost, now.wordCost, now.tariff, now.carryCost);
+    if (std::string(w) == "stone projectile") pProj = now.manaCost;
+    if (std::string(w) == "stone bolt") pBolt = now.manaCost;
+    if (std::string(w) == "stone lob") pLob = now.manaCost;
+  }
+  lines += "PRICE " + prices + " | ";
+  if (!(pBolt > pProj && pProj > pLob))
+    fail(Format("price order: stone bolt %d, projectile %d, lob %d", pBolt, pProj, pLob));
+  RecordObserved("spellPiercePriceStoneProjectile", (double)pProj);
+  RecordObserved("spellPiercePriceStoneBolt", (double)pBolt);
+  {
+    const SpellReadout rd = DescribeSpell(lib, speak(lib, "stone projectile"));
+    lines += "READOUT stone projectile: " + rd.verdict + " | ";
+  }
+
+  mobs.Reset();
+  c.debris.Reset();
+  PrepareWorld(c);
+  detail = lines + why;
+  std::printf("spell-pierce: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 const std::vector<Gate>& WoundGates() {
   static const std::vector<Gate> g = {
       {"wound-chip", "mob", {}, false, GateWoundChip, /*needsRender=*/false},
@@ -11284,6 +11600,9 @@ const std::vector<Gate>& WoundGates() {
       // A point driven through: arrows at three energies, through an arm into
       // the torso, and a harder skin that stops what goes through a man.
       {"pierce", "mob", {}, false, GatePierce, false},
+      // ...and a SPELL's matter as the point: a stone projectile embeds, a
+      // stone bolt goes deeper, water/acid/lava splash a coat that acts.
+      {"spell-pierce", "mob", {}, false, GateSpellPierce, false},
       {"wound-rebleed", "mob", {}, false, GateWoundRebleed, false},
       {"corpse-blunt", "mob", {}, false, GateCorpseBlunt, false},
       {"bruise-is-skin", "mob", {}, false, GateBruiseIsSkin, false},

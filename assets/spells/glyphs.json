@@ -2,7 +2,7 @@
   "comment": "Glyphs are CONTENT, like materials.json and reactions.json. A glyph is a word of the ancient language; docs/PLAN_magic_grammar.md is the grammar and scripts/magic_grammar.py the executable reference the C++ parser is checked against (`--gate spells-oracle`). Five sorts: matter (a material BY NAME, resolved to a 12-bit id at load; `air` is the void, `anything` the wildcard), effect (something that happens at a point: verb + params), delivery (how an effect reaches a point: mech instant | flight | continuous, plus the record fields), mod (a field edit on the delivery record: field/op/amount, applied again per repetition), operator (verb + valence: `left`/`right` list the sorts each slot accepts or `any`, `result` is the sort produced). Every unary operator takes the word BEFORE it; only an infix operator has both slots. Costs are integer: `word` is the small fixed cost of saying it; the real price is the tariff on what the cast does to the world (budgets.rates x the per-material `arcane` value in materials.json). Hot-reloads on R alongside materials.json. A delivery's `speed` is voxels per tick at 30 Hz and may be fractional (4.8 = 14.4 m/s); a flight collides with the CPU mirror, then the chunk cache it prefetches ahead of itself, then the ground contract, and with bodies by ray. A delivery's `look` block is RENDER-ONLY: shape bolt | ball | orb | spark, size (core half-size, voxels), tail (trailing sprites; the orb's ring count), tailStep (voxels between them), glow (emission), color (#RRGGBB, used when the cast carries no matter). A delivery's `gesture` (and the hand block's) names how the ARM casts it, from gestures.json beside this file: the cast leaves the hand at that gesture's release, not on the press.",
   "language": "FOUR rules. R1 a noun goes into the PILE and order inside a scope of the pile does not matter: runs merge within a scope (fire fire = fire x2; matter and effects ADD, mods COMPOSE: shotgun x2 = 9) and the lowering rebuilds each scope in a canonical order. R2 a DELIVERY BOXES the innermost OPEN scope of the pile into one Effect value and speaking CONTINUES, so deliveries NEST and word order decides what is inside what; with no delivery the box is `hand`, at reach in front of the caster. R3 a MOD is pending and sticks to the box that closes the pile; on the hand only `shotgun`/`twin` (fanned resolve points) and `float`/`heavy` (the hop) mean anything and every other mod there is a charged no-op the readout names. R4 `lane` OPENS A LANE SCOPE and `end` CLOSES the innermost open one. A delivery inside an open lane boxes only that lane and the lane stays open; outside any lane it boxes the shared items plus every closed lane, which is the multi-socket box. Lanes are ordered as spoken, lane i belongs to instance i, the box fires max(count, lanes) instances, and an instance past the last lane carries the shared items alone. An unclosed lane is closed at the end of the sentence. Operators bind within the current scope only and a `lane`/`end` mark is a wall; a mod inside a lane edits that instance's record. A `count` mod SPLITS THE SCOPE it was spoken in - shared, it is the box's fan; inside a lane, it is that one branch's split - and at most ONE count word per scope is effective: the strongest wins, the rest are charged no-ops. Nine bolts is a split on each of three branches, not one word said twice. An operator with an empty required slot is INCOMPLETE: charged, does nothing, drawn with `_`; there are no defaults, `anything` and `air` are words. Every sequence lowers to a definite cast list; there is no misfire state.",
   "budgets": {
-    "comment": "Rule 2 applied to magic: every sustained effect declares a FINITE budget up front. Hard engine ceilings; a glyph's own budget is clamped to them at load. rates.* and anythingSurchargeMille are the tariff (plan section 4): place = per voxel x arcane(M); convert = per voxel + max(0, arcane(B)-arcane(A)); graft = per voxel x arcane(M); explode = power x r^3 / 1000; wind = footprint x ticks / 1000. The wildcard bills value(actual) x surcharge on top, when it resolves.",
+    "comment": "Rule 2 applied to magic: every sustained effect declares a FINITE budget up front. Hard engine ceilings; a glyph's own budget is clamped to them at load. rates.* and anythingSurchargeMille are the tariff (plan section 4): place = per voxel x arcane(M); convert = per voxel + max(0, arcane(B)-arcane(A)); graft = per voxel x arcane(M); explode = power x r^3 / 1000; wind = footprint x ticks / 1000. The wildcard bills value(actual) x surcharge on top, when it resolves. rates.kinetic: mana per KILOJOULE of the energy a flight's matter carries (1/2 m v^2 at the record's launch speed, x the pierce mod's body bonus), billed in the carrier's CARRY after its multiplier (docs/PLAN_projectiles.md D: speed is not free). 100 = 10 J a mana: a plain stone projectile (0.65 kg at 14.4 m/s, 67 J) +7, a stone bolt (28.8 m/s, 270 J) +27, a stone lob (7.2 m/s, 17 J) +2; fire (density 3) weighs nothing and pays nothing.",
     "maxLiveProjectiles": 32,
     "maxGeneration": 3,
     "maxTrailVoxels": 256,
@@ -18,7 +18,17 @@
       "convert": 1,
       "graft": 2,
       "explode": 1,
-      "wind": 1
+      "wind": 1,
+      "kinetic": 100
+    },
+    "matterProjectile": {
+      "comment": "THE MATTER IS THE PROJECTILE (docs/PLAN_projectiles.md decision 3, package D; game/spell.h FlightMatter). lumpMl: mL of matter a flight carries per unit of matter scale, so its mass is this x materials.json density (stone 0.65 kg, steel 1.95 kg, water 0.25 kg); the spray it leaves where it stops is still sprayVoxels. pierceBodyMille: what each `pierce` word adds to that energy against BODIES, per mille (it keeps its one-wall terrain role). powderSharpMille / powderTipMille: a powder lump is blunter and wider than the delivery's point, and scourBins caps what it can spend at that many bins of skin-hard matter -- a scour, never a channel. splashRadiusMille: the coat disc a liquid lays on the skin it hits, world voxels x 1000 at x1 (grows as the cube root of the matter scale).",
+      "lumpMl": 250,
+      "pierceBodyMille": 1000,
+      "powderSharpMille": 400,
+      "powderTipMille": 2000,
+      "scourBins": 2,
+      "splashRadiusMille": 1200
     },
     "anythingSurchargeMille": 500,
     "maxStatusTicks": 900,
@@ -412,6 +422,7 @@
         "glow": 1.2,
         "color": "#FFB040"
       },
+      "penetrator": { "tip": 1.5, "sharpness": 0.4, "comment": "a lump: a stone the size of a fist, pointed enough to break skin at speed (tip radius in fine 1.25 cm cells, sharpness 0..1; phys/kerf.h Penetrator)" },
       "lifetimeTicks": 150,
       "impactRadius": 3,
       "gravity": 1000,
@@ -436,13 +447,14 @@
         "glow": 1.6,
         "color": "#80D0FF"
       },
+      "penetrator": { "tip": 1.0, "sharpness": 0.7, "comment": "a dart: narrow and keen (tip radius in fine 1.25 cm cells, sharpness 0..1; phys/kerf.h Penetrator)" },
       "lifetimeTicks": 150,
       "impactRadius": 1,
       "gravity": 250,
       "carry": 4000,
       "example": "spark trail bolt",
       "axis": "weight (speed, life, kinetic impact)",
-      "desc": "Fast and light: twice the speed, half the kinetic impact."
+      "desc": "Fast and narrow: twice the speed of a projectile, a sharper point. A bolt of matter carries four times the energy of the same matter thrown as a projectile -- and costs it (the kinetic term)."
     },
     {
       "id": "lob",
@@ -460,6 +472,7 @@
         "glow": 0.9,
         "color": "#C0A060"
       },
+      "penetrator": { "tip": 2.5, "sharpness": 0.15, "comment": "a blunt ball (tip radius in fine 1.25 cm cells, sharpness 0..1; phys/kerf.h Penetrator)" },
       "lifetimeTicks": 200,
       "impactRadius": 4,
       "gravity": 1000,
@@ -483,6 +496,7 @@
         "glow": 1.4,
         "color": "#C080FF"
       },
+      "penetrator": { "tip": 2.0, "sharpness": 0.2, "comment": "a slow round mass (tip radius in fine 1.25 cm cells, sharpness 0..1; phys/kerf.h Penetrator)" },
       "lifetimeTicks": 300,
       "impactRadius": 3,
       "gravity": 0,
@@ -647,7 +661,7 @@
       "amount": 1,
       "example": "pierce spark projectile",
       "axis": "pierce +1",
-      "desc": "Passes through one body or thin wall before resolving."
+      "desc": "Passes through one thin wall before resolving. Against a body, a bolt of solid matter hits harder: each pierce adds the matter's own energy again (budgets.matterProjectile.pierceBodyMille), which is priced. Whether it then comes out the far side is the body's answer."
     },
     {
       "id": "seek",
