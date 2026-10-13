@@ -648,8 +648,8 @@ constexpr uint32_t kGasFarEmitMax = 256;
 // buffer and the same record shape without either side guessing which scale
 // the other meant.
 constexpr uint32_t kGasFarEmitHdr = 4;
-// Per record: world voxel x, y, z (i32; y is the TOPMOST hot voxel in the
-// column) then the strength word: bits 0..23 the hot-voxel count (a column's,
+// Per record: world voxel x, y, z (i32; y is the LOWEST hot voxel in the
+// column, so the plume rises from the fire, ticket 22-25-46) then the strength word: bits 0..23 the hot-voxel count (a column's,
 // or the wide list's SUM of columns), bits 24..31 the CROSSFADE WEIGHT 0..255
 // (see kGasFarBlendVox). WORLD VOXELS, never cell coords — which is what lets
 // one record shape serve two boxes of different cell sizes.

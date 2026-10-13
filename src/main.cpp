@@ -9644,9 +9644,17 @@ int main(int argc, char** argv) {
       if (tick < t0) return;
       if (!built) {
         built = true;
-        uint32_t fire = 0;
+        // SANDVOX_FOREST_FIRE_MAT=<material>: seed that instead of `fire`, and
+        // OVER whatever is there rather than IfAir. A puff of `fire` in the air
+        // gaps of a crown no longer reliably lights it (2026-10-11: the default
+        // map's oak at 12444,26503 never caught, 2,667 seeds burned out in
+        // ~3 s); `leaf_burning` set into the crown is a tree that IS alight,
+        // which is what the far-plume ticket 2026-10-11_22-25-46 needed.
+        const char* seedMat = std::getenv("SANDVOX_FOREST_FIRE_MAT");
+        uint32_t fire = 0, ifAir = kCellOpIfAir;
         for (size_t i = 0; i < mats.size(); i++)
-          if (mats[i].name == "fire") { fire = (uint32_t)i; break; }
+          if (mats[i].name == (seedMat ? seedMat : "fire")) { fire = (uint32_t)i; break; }
+        if (seedMat) ifAir = 0;
         const int px = ifloor(player.pos.x), pz = ifloor(player.pos.z);
         // A jittered 9-voxel grid of columns, 12..100 voxels out. Jitter is a
         // fixed hash of the column so the seed set is the same every run.
@@ -9661,7 +9669,7 @@ int main(int argc, char** argv) {
             for (int y : {g + 1, g + 2, g + 10, g + 18, g + 26, g + 34, g + 42}) {
               const IVec3 c{x, y, z};
               if (!world.CellInWindow(c)) continue;
-              seed.push_back({World::SlotCellIndex(c), fire | kCellOpIfAir});
+              seed.push_back({World::SlotCellIndex(c), fire | ifAir});
             }
           }
         // SANDVOX_FOREST_FIRE_CONTROL=1: the same run, camera and schedule
@@ -22352,6 +22360,21 @@ int main(int argc, char** argv) {
             }
             std::fprintf(f, "\n");
           }
+          std::fclose(f);
+        }
+      }
+      // SANDVOX_FRAMES_PASSES=<file>: EVERY pass of every recorded frame, one
+      // row each (live,pass,ms) -- the per-class attribution ("what does a
+      // tick frame with a far slice cost that a tick frame without one does
+      // not") that the six named CSV columns cannot give. Pair it with
+      // SANDVOX_GPU_TIMER_SERIAL=1 (vk_record.cpp) for spans that do not
+      // overlap their predecessor.
+      if (const char* pp = std::getenv("SANDVOX_FRAMES_PASSES")) {
+        if (FILE* f = std::fopen(pp, "w")) {
+          std::fprintf(f, "live,pass,ms\n");
+          for (const HarnessFrameRec& r : g_frameRecs)
+            for (const auto& t : r.top)
+              std::fprintf(f, "%u,%s,%.4f\n", r.live, t.second.c_str(), t.first);
           std::fclose(f);
         }
       }

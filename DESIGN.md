@@ -3350,7 +3350,11 @@ synthesizes their plumes. Both halves are deliberately small:
   the CPU ever sees an evicted chunk's voxels. It aggregates per gasOuter COLUMN
   FOOTPRINT: a cell is 8 voxels and a chunk is 16, so a burning chunk
   contributes at most FOUR emitters however much of it is alight, each carrying
-  the column's hot-voxel count and its topmost hot voxel. What counts as fire is
+  the column's hot-voxel count and its LOWEST hot voxel -- the plume stands on
+  the base of the fire and rises through it (it was the topmost until
+  2026-10-11: ticket 22-25-46, a burning tree's far smoke began above its crown
+  with sky between the fire and the smoke; the wide clusters likewise take their
+  lowest member's y, not their topmost's). What counts as fire is
   READ OFF THE REACTION TABLE (`SmokeSourceTable`, `materials.h`; since
   rule-unification W1-B1, 2026-09-24): a material whose own bucket DECAYS to
   or EMITS `fire` or `smoke` — exactly the materials that put smoke into the
@@ -3766,8 +3770,8 @@ moves, which is the point: what shrank is the column, not the opacity.
 
 And a second route to the same picture was closed on the CPU side: the wide
 bucket **coarsening added in round five is now capped at two doublings**. Merging
-buckets CONCENTRATES MASS AT ONE POSITION — an aggregate stands at its topmost
-member's coordinate and carries the SUM of its members' strengths, which the
+buckets CONCENTRATES MASS AT ONE POSITION — an aggregate stands at its members'
+centroid (lowest y since 2026-10-11) and carries the SUM of its members' strengths, which the
 shader reads as "how big is this fire" — so unbounded coarsening could collapse
 a scatter of small fires into one record drawing a 4x-height column somewhere
 none of them was. At x4 the bucket is 25.6 m, a genuinely local cluster.
@@ -16427,8 +16431,39 @@ where you hear from either (§12b, "The ears are on the character").
   4.05 -> 2.64 s (the arms are on `Tuning::Render::farPlaneBatch`).
   `SANDVOX_FAR_NO_PACING=1` is the unpaced A/B arm. What is left is the MEAN:
   ~33 us of GPU per entry across the passes, most of it the 32 entries of a
-  level-chunk column each recomputing the same 256 column prologues — the
-  far column cache below is still the lever.
+  level-chunk column each recomputing the same 256 column prologues.
+  **The column stack (2026-10-12, same ticket).** That is now shared, and
+  without a cache buffer or a pre-pass: `FarField::PrepareTick` sorts each
+  tick's list (stable) by (level, slot x, slot z), so a level-chunk column's
+  entries are one contiguous RUN, and `far`'s workgroup for the run's first
+  entry fills the whole run (worldgen.wgsl THE COLUMN STACK; every other
+  workgroup of the run returns on its first load). Its threads build genColumn
+  and the prologue ONCE over the union of the run's rows, then walk the
+  entries, each re-applying ITS OWN gates to the shared answer (cave bands
+  zeroed, tree set emptied, canopy memo 0, canopy volume none, corner-max
+  `btop` only for the entry holding that row) -- so every genCellIn call sees
+  the arguments it saw per entry, and the bytes are the per-entry sweep's.
+  Z planes now enqueue y innermost like X planes, so a 256-entry slice is
+  eight whole columns. Proof of exactness: `SANDVOX_FAR_DIGEST=1 --gate
+  far-fog` digests the whole cascade after a full refill (runs of 32):
+  c3757b404adc2604 before and after, and the same with unsorted runs of one;
+  `far-*` gates PASS, world hash unchanged. Measured `--perf --scenario
+  peaks-route` (1,024 entries every tick, one exe, two asset trees,
+  `SANDVOX_GPU_TIMER_SERIAL=1`): farFill 3.93 -> 2.59 ms/tick, farField node
+  p50 6.02 -> 5.22, p95 13.85 -> 10.07, max 21.2 -> 16.4 ms; frame p95 31.9
+  -> 27.9, p99 35.2 -> 30.7. The same sharing in `farcover` (the tree tile
+  scan once per run) was tried and REVERTED: farCoverFill 128 -> 299 us/tick,
+  because its per-entry early-outs already leave most entries trivial and the
+  run serialises the rest. What is left: `farMapFill` (~100 us per surface-map
+  column, ~2.9 ms/tick on peaks-route, ~20% of it the voxel-over-the-top
+  lookup's one-shot tree scan) is now the largest far pass, then the sim tick
+  itself (~9 ms GPU on a tick frame) and window shifts. Two instruments came
+  with it: `SANDVOX_GPU_TIMER_SERIAL=1` (vk_record.cpp; pass spans begin at
+  ALL_COMMANDS, so a pass is not charged its predecessor's tail -- an empty
+  farMapFill read 3 ms a tick at TOP_OF_PIPE) and `SANDVOX_FRAMES_PASSES=<file>`
+  (every pass of every `--frames` frame). NOTE the per-frame pass rows are
+  matched on the frame the TIMESTAMPS came back for, which is not always the
+  frame whose far entries the CSV row counts: attribute with run totals.
   **The sieve skips the sky (2026-09-12).** `far` ran a full `genCellCol` for
   all 4,096 cells of a level chunk whatever its altitude, and a level box is
   `kFarN` cells tall — 13 km at level 8 against a few hundred metres of
@@ -16471,8 +16506,8 @@ where you hear from either (§12b, "The ears are on the character").
   end, 14 coalesced level resets) -- demand is ~2x the cap once the eye moves
   on three axes, and the lever is the per-entry cost: an X/Z plane is 32
   entries stacked on each level-chunk column, every one recomputing the same
-  256 `genColumn`s (a far column cache, as `cols` is for genChunk, would cut
-  that up to 32x; `far`'s compile cliff is why it is its own package). And
+  256 `genColumn`s (fixed 2026-10-12 by the column stack, see "Plane fills
+  are paced" above: one prologue per run of a column's entries). And
   the page pool peaks at 88.5% (32,616 of 36,864): 29,438 FULL chunks hold a
   page, 25,510 of them not cpuDirty. `SANDVOX_PT_DEBUG=1` attributes it
   (Stream::ApplyGenVerdict / HarvestDemotes): of 2.73 M generated slots,
@@ -17192,6 +17227,92 @@ where you hear from either (§12b, "The ears are on the character").
     `lodShadowLift` raises to ~0.33, which happens to match. The sea's
     shadeWater / shadeFarWater seam is untouched by this (closed separately,
     next).
+  **The handoff, measured per class and sky: `--gate lod-seam` (2026-10-12,
+  ticket 2026-10-09_14-23-01).** The same-pixel experiment above, made a
+  gate so a seam that comes back for a new material, biome or light is a red
+  line rather than an owner ticket. On far-cover's forest fixture (a
+  synthetic all-forest map at the window origin, four headings from a
+  clearing), each sky is drawn twice: the shipped handoff (near) and the
+  handoff pulled in to `lodSeam.farHandoffM` 8 m (far: only the shaders that
+  read `render.lodHandoffDist` recompile), and far - near luma of the pixels
+  at 10-19 m is binned by the NEAR hit's voxel (read back): leaf (`farCover`
+  materials), bark (bark/wood), ground in the open, ground under a canopy
+  (leaf or bark anywhere above it in the column), plants (micro; folded into
+  their ground class, reported alone). Leaf and bark are judged by the
+  MEDIAN, ground by the MEAN (the far field draws grass as cover
+  statistics, so only an area mean is like for like), against
+  `tests/baseline.json` `lodSeam.*`. Skies: noon, afternoon (sun ~20
+  degrees), dusk (just under the horizon), overcast noon. A per-class R/G/B
+  table follows; with `SEAM_DBG` 3 / 12 / 13 set it is the attribution
+  (openness / lit / raw lambert; the sun shadow's raw / lifted / capped
+  stages; a far shadow patch's validity and value). Frames and the class
+  mask are written to `build/lodseam_*.bmp`.
+  - **What it found** (before, the shipped code): leaf noon +4.1, bark +8.8;
+    ground +28 (open) / +41 (under a canopy) at noon and afternoon, +11 / +13
+    at dusk, +37 / +41 overcast. Three causes, attributed with the table:
+  - **The far ground's openness** was the closed form (an up face sees all
+    the sky) everywhere: under crowns and in a clearing ringed by them, where
+    the near grid's fan lands on leaves. The heightfield and its cards now
+    take farOpenness x the cascade's UP fan (`farGroundOver` + `farSkyFan`),
+    behind a chunk-word prefilter over the fan's footprint (open ground pays
+    up to ten shared `farOcc` words). The up ray counts only cells a cell over
+    the column's heightfield top.
+  - **The far fan** (features and ground, `farFanRay`) reached 6.4 m and
+    sampled every 12 fine voxels past 16, stepping through crown lobes and
+    between trunks; it now marches EVERY cell -- the hit's level to 1.6 m,
+    then the level two coarser -- to `render.opennessReach` (the near walk's
+    12 m), with the near walk's weights (1/3, 1/6) and the level's sky
+    ceiling as the early-out. Tried and taken out (no change in the gate):
+    the near walk's endpoint up-march and its re-aimed down-diagonal.
+  - **The far shadow under a crown's edge was lit.** `farShadowCover`
+    estimates how much of the sun disc ONE blocker covers from where the ray
+    crossed it, and the march stopped there: a ray clipping the corner of the
+    first leaf cell came back ~lit however much crown stood behind it, and
+    the shadow cache's far patches (patch centres, one ray) hit that case
+    systematically -- `SEAM_DBG` 13: patches VALID at 0.96 where the per-pixel
+    march and the near cache read ~0.4. Partial covers now accumulate as
+    independent occluders, 1 - prod(1 - c), to 4 blockers or 5 % of the disc
+    (`farShadowTC` in shadow_resolve.wgsl; the fragment shader's
+    `farShadowMarch` carries it only with `FAR_SHADOW_CACHE` off, because
+    there it would serve only the near continuation past 999 m and cost fs
+    40 registers, 128 -> 168, the occupancy cliff).
+  - **Measured** after (same fixture, same boot type): leaf noon -2.2,
+    afternoon -2.2, dusk -1.6, overcast -1.6; bark -1.6 / -1.9 / -1.1 /
+    -1.0; ground open +16.2 / +10.1 / +3.0 / +24.8; ground under a canopy
+    +14.8 / +6.2 / -0.5 / +17.0 (noon / afternoon / dusk / overcast). Dusk is
+    closed (the ticket's "grass under canopy +12..16 at dusk"). fs back at
+    128 registers. `--render-budget` (exclusive, `--verify` boots, single
+    samples, before -> after): noon 5.62 -> 6.88 ms, seamveg 9.28 -> 9.53,
+    cascade 2.93 -> 2.93; the noon number swung 5.6-9.9 between boots of the
+    same tree, so read it as "up to ~1 ms on the overlook, nothing on the
+    cascade camera".
+  - **Order-free (2026-10-12, found at integration).** The gate passed
+    standalone and failed after the far-* gates + shadow-cache: near leaves
+    +28 luma, so leaf/bark read -33/-23. Its state line (printed every run:
+    inherited shadow-cache / irradiance / openness-stamp counts, every
+    render.* row off tuning.json, weather pin, mode flags) showed no tuning
+    or weather leak; the cause was the OPENNESS GRID. Its bytes and per-slot
+    stamps survive a worldgen at the same window origin (far-contain and
+    far-cover also regenerate at (0,0,0), other worlds), and the rolling
+    refresh re-marches a slot only if its column was touched since it was
+    walked, compared on T.tick -- while the gate's ticks restart at 1 under
+    stamps written at larger ticks. The near arm shaded the forest with
+    another world's sky. The gate now cold-starts (zeroes) openness +
+    stamps + irradiance before its ticks and the shadow cache before every
+    arm. Zeroing the shadow cache and irradiance alone did NOT fix it
+    (measured). After the prefix and standalone now agree within ~1 luma on
+    leaf/bark and ~4 on ground. Note for the engine: the game itself never
+    rewinds T.tick, but a regenerate at an unchanged window origin (a map
+    reload) would inherit the same stale openness until touched.
+  - **Still open, pinned as known residuals** (`lodSeam.max.<sky>.<class>`,
+    measured + ~2): sunlit and overcast ground stays +10..+25 brighter far.
+    The table says the far OPENNESS of open ground is still ~1.3x the near
+    grid's (and it loosens `shadowLiftCap` with it); the near walk's 40 cm
+    block DDA is more conservative than the far point samples on rough
+    ground. The overcast arm also shows a direct-light (cloud) factor that
+    differs between the two arms (near ~0.09, far ~0.24 of the clear value)
+    that is not attributed yet -- a gate-instrument suspect (the gate draws
+    no cloud passes of its own) as much as a shading one.
   **The far water IS shadeWater (2026-10-10).** The near and far water
   shades had been written twice and agreed by calibration. They now share
   the surface law term for term: `waterWaveNormal` (macro slope + Gerstner
@@ -17441,6 +17562,39 @@ where you hear from either (§12b, "The ears are on the character").
   window generation; a basin's outer CORNER column touches walls, not liquid,
   so a cell holding only it and outside air stays empty (a one-cell notch);
   liquid in a vessel or a body is not in the voxel grid and not in scope.
+  **Refined 2026-10-11 (ticket 2026-10-11_22-09-52): a wall that FLOATS holds
+  nothing.** A cloth scrap, a plank or a corpse's debris floating on a lake
+  is a wall voxel with liquid under or beside it and air over it -- the
+  container shape -- so the rule painted the WHOLE level-1/2 cell with every
+  scrap on the water: scattered robe voxels read 2x / 4x their size just past
+  the handoff. A wall holds liquid beside or above it, never under it, so a
+  candidate whose first non-wall voxel straight below (within
+  `FAR_FLOAT_REACH` = 4, `FarEdits::kFloatReach`) is LIQUID is refused, and so
+  is a lone SPECK (next paragraph). Troughs, wells and lake banks stand on
+  walls or ground and are untouched.
+  **A LONE VOXEL IS DRAWN AS ITS SURROUNDINGS (2026-10-11; worldgen.wgsl
+  `farDespeck`, faredits.h `Despeck`; gate `far-contain`'s speck half).** The
+  general half of the same ticket: centre sampling made any lone voxel that
+  sat on a cell centre a whole 2^k cube (8x its volume at level 1, 64x at
+  level 2) -- a scrap on a lake, a blood drop, a flake of ash, an item's last
+  voxel, anywhere. A SPECK is a far-solid voxel whose far slot is not cover
+  (leaf keeps the cover rule's density) and which no voxel of its 3x3x3
+  neighbourhood shares that slot with; any two voxels touching by a face, an
+  edge or a corner are an object, never specks. A speck's cell is drawn as
+  the far slot most of its six face neighbours hold (not-far-solid counts as
+  a slot of its own; ties to the first in +x,-x,+y,-y,+z,-z order): a scrap IN
+  a water surface is water, one ON water or ground is air, an ore fleck is
+  its rock. Anything the producer cannot see counts as support. Applied at
+  EVERY level by every live producer -- `fardown`'s centre, the loose top
+  (centre and top: one drop paints no cell), the container pass, the surface
+  map's claim check -- and by `FarEdits::Sweep` / `ContainedBy` for an
+  evicted chunk's patch (one chunk visible: a speck supported only across a
+  chunk face is a downsample-only answer). The SIEVE does not apply it (26
+  genCellIn per centre); pristine procgen has no lone non-leaf voxels but a
+  stamp's ornament, and a dirty stamp chunk may then lose such an ornament
+  at distance -- the intended direction. `fardown`'s skip signature covers its
+  own voxels only, so a speck whose support changes only across a chunk face
+  keeps its old cell until that chunk next changes.
   `--at x,y,z,yaw,pitch --frames N` reproduces a report's camera into
   `screenshot_at.bmp`; `SANDVOX_AT_FARPROBE=x,y,z[,level]` prints the cascade
   bytes and patch words around a voxel on that frame.
@@ -17718,8 +17872,14 @@ where you hear from either (§12b, "The ears are on the character").
   the tint fixes any of those. Liquids now carry BOTH halves: the volume terms
   (`mediaTau`/`mediaTint`) still accumulate, and `trace()` additionally records
   where the ray first crossed into liquid (`liqT`/`liqCell`/`liqAxis`) plus the
-  total distance travelled inside it (`liqPath`). `shadeWater()` then builds a
-  real air/water interface there:
+  total distance travelled inside it (`liqPath`). The volume terms are no
+  longer a COLOUR for liquids: `fs()`'s gas composite subtracts the liquid's
+  share (`liqPath` x its opacity, in its palette average) before shading the
+  gas, because `mediaMat` latches the first medium met and a ray that crossed
+  any gas before water otherwise painted the water's deep palette as fog
+  (ticket 2026-10-11_21-54-18: saturated blue cubes in the hydrogen over a
+  sodium blast). `fireGlow`'s dimming still reads the full sum. `shadeWater()`
+  then builds a real air/water interface there:
   - **Normal from the fullness field, not the voxel face.** The liquid state
     nibble is fill level in eighths (§4), so the liquid column height varies
     cell to cell and its gradient is the true macro slope of the surface —
@@ -22324,7 +22484,23 @@ list.
 ### 9d.4 The consumers, and the third transcription
 
 * **Render surface advection** -- component 9 evaluates wave phase at
-  `position - current*t`. This is what makes flow read as flow.
+  `position - current*age`. This is what makes flow read as flow. `age` is NOT
+  the session clock: it is the two-phase flow-map age (`raymarch.wgsl`
+  `WAVE_FLOW_CYCLE_S`, 4 s), two copies of the field half a cycle apart, each
+  faded to zero at its own restart and blended variance-preserving. With
+  `current * R.time` (until 2026-10-11) any change in the current moved the
+  waves by `change * seconds-since-launch` -- the stream arm is rewritten on
+  every window move, so a swimmer saw the river strobe about once a second
+  (ticket 2026-10-11_18-39-38) -- and any spatial change sheared them without
+  bound until a long session's river was per-pixel sparkle. Still water takes
+  the single-copy path and is unchanged. The oil film's drift uses the same
+  two-phase age.
+* **Streams have no attack ramp** (`CurrentPrimEnvelope`). The attack is for
+  events (a drain spinning up); a stream is terrain and is re-emitted on every
+  window move, so a ramp there zeroed the current under the player once a
+  chunk. The lattice probes are WORLD-aligned (`x, z == 32 mod 64`), so a
+  probe that survives a window move is the same primitive; the `rivers` gate's
+  pass J reads the field under main's middle on the tick of four moves.
 * **Foam on convergence lines** -- `currentConvergeAt`, a central difference of
   the field. Four evaluations of a function that early-outs to one compare
   outside the AABB, so a still lake pays nothing. Deliberately NOT a symbolic
@@ -24171,7 +24347,14 @@ grantkot.com/ll -- not MLS-MPM, which is heavier and buys nothing at this scale.
 **Powders**: a falling-sand CA, one grain per pixel.
 - A grain reads the smoothed liquid field (the same splat the renderer
   draws) to decide whether it sinks, how fast (mass gap, viscosity), or
-  floats.
+  floats. Every such rule asks ONE predicate, `GrainFloats` (flasksim.cpp),
+  and a TIE FLOATS, as in the world (`canDisplace`: a powder enters only a
+  strictly lighter liquid). Until 2026-10-11 the sink rules asked `ml < mg`
+  and the rise rules `ml > mg`, so tephra (density 1000, water's) did
+  neither: it hung mid-column as resting grains -- walls -- and an upturned
+  flask held its water in that lattice in mid-air, asleep. Gate
+  `alchemy-neutral` (a tie, a floater and a sinker poured into water: each
+  ends at its end, and the flask turned over empties).
 - Moving into liquid shoves that pixel's particles into the pixel the grain
   left.
 - RESTING grains are walls to the liquid. A particle that ends a step in a

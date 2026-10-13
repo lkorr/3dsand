@@ -1001,6 +1001,11 @@ struct Tuning {
     float getUpDropFrac = TPD(ragdoll, getUpDropFrac);
     // How long the dev panel's "ragdoll me" keeps the player down.
     float devSeconds = TPD(ragdoll, devSeconds);
+    // Angular damping (/s) on a LIMP or DEAD rig's limbs (debris keeps
+    // physics.debrisAngularDamping). Set in Physics::SetBodyRole when the role
+    // changes; a living limb is posed, so it does not care. Higher calms the
+    // flung-hand spin a hard graze can leave behind (ticket 15-16-57).
+    float spinDamping = TPD(ragdoll, spinDamping);
     // A CORPSE IN WATER (Mob::FloatLimpLimbs): the fraction of a dead body's
     // volume that is gas (lungs, gut), taken off the mean density of the
     // matter each limb is made of. Human tissue averages a little over water
