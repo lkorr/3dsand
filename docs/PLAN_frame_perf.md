@@ -280,6 +280,18 @@ are the OTHER half of this frame; they are not additive with `nomicro`.
    `cachesub2` measured inside the noise and stays at 4. What is left of the
    shadow ray is the per-frame resolve of every visible patch
    (`shadowCache` node 0.6–1.5 ms), not its granularity.
+   **Handoff 2026-10-13 (agent a1384c, item 6) — closed by measurement.**
+   The same noon overlook,
+   `--render-budget --budget-cams noon --budget-arms baseline,nocache`, main
+   9a573ad, SANDVOX_RUN_EXCLUSIVE=1, three boots: frame 12.04 / 12.19 / 12.11
+   ms, of which `shadow_resolve` 0.22 / 0.22 / 0.22 ms (the per-frame table:
+   ray_start_trace 1.46-1.88, gi_gather 0.26-0.27, cloud_march 0.19,
+   cloud_resolve 0.12); the `nocache` arm (the old inline per-pixel ray) 13.70
+   / 13.85 / 13.87 ms, so the cache still saves ~1.7 ms. The 0.6-1.5 ms was
+   the `--perf` node in motion before STAGGERED REFRESH and the nearest-patch
+   read (shadow_resolve.wgsl's 2026-10-03 note); in flight today it is 0.17
+   (peaks-route) to 0.26 ms (ticket flight) mean, p99 1.34. Nothing left to
+   take here; the largest row of the per-frame table is now `ray_start_trace`.
 2. **Async compute queue for the sim** (ROADMAP_scale.md §3.6, never started — still true 2026-10-02: `src/gpu/` has one queue).
    Hides most of the ~13 ms tick side under the raymarch in flight; zero win
    standing still. Large: the barrier generator in `vk_record.cpp` is
@@ -301,6 +313,17 @@ are the OTHER half of this frame; they are not additive with `nomicro`.
    of the chunk plane that streams in every tick; the only lever left there is
    the per-face cost of a NEW surface chunk's walk (the up-rays to the window
    top are the long ones), or walking a streamed plane over more than one tick.
+   **Handoff 2026-10-13 (agent a1384c, item 5) — closed by measurement;
+   the 1.2-1.3 ms sprint figure is
+   stale.** On main 5805949 / 17059f3, SANDVOX_RUN_EXCLUSIVE=1: `--perf
+   --scenario surface-sprint` (n=3) opennessRefresh 0.32 ms a frame (0.53 a
+   tick at 0.68 ticks a frame) and opennessDirty 0.035; `peaks-route` (n=6,
+   one tick a frame) opennessRefresh 0.35-0.37 ms, opennessDirty 0.02; the
+   12-10-09 ticket flight (595 frames at 13.75 m/s) the openness node 0.33
+   mean / 1.56 p99 ms. The refresh is a fixed 256-slot round robin whose
+   per-slot work is real (no idle launches, unlike the far passes), and the
+   dirty walk of streamed planes is now ~0.03 ms. Nothing left here worth a
+   package; re-open only if a harness shows the node above ~1 ms mean.
 5. **Streaming hitch tail** (stream CPU p95 35 ms / max 171, wake-wait max
    118, snapshot stall max 81). Deferred wake + one shift per frame landed;
    the next lever is the mirror's N26 dilation (dirty 43% + ring 15% of the
