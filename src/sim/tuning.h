@@ -1365,12 +1365,15 @@ struct Tuning {
     // rows' impulse -> hp rule).
     //
     // CALIBRATED against the human (PLAN_projectiles B; the `pierce` gate
-    // prints the numbers): a 30 g arrow at 65 m/s (~63 J, a full longbow
-    // draw) goes through a torso's flesh and breaches a skull into the brain;
-    // at half draw (half the speed, a quarter of the energy) it stops in the
-    // skull or in muscle; a thrown pebble glances. The channel's hp is the
-    // ordinary carve charge -- volume share by woundHp plus the flat brain
-    // charge -- and nothing else: there is no "an arrow kills" rule.
+    // prints the numbers): a perfectly sharp 30 g point at 65 m/s (~63 J)
+    // goes through a torso's flesh and breaches a skull into the brain; a
+    // pebble glances. THE BOW'S ARROW is not that point since 2026-10-13
+    // (owner: arrows stay in what they hit): 50 m/s and sharpness 0.8 in
+    // items.json stop a full draw inside a torso, an arm or a head -- the
+    // arrow's own numbers move, not this price, which the spell projectiles
+    // share. The channel's hp is the ordinary carve charge -- volume share by
+    // woundHp plus the flat brain charge -- and nothing else: there is no "an
+    // arrow kills" rule.
     float pierceCellJ = TPD(gore, pierceCellJ);
     // A point SOFTER than what it meets pays (cell / tip)^this on top: a wooden
     // point on iron, ice on stone. 0 = hardness ratio ignored.

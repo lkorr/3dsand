@@ -55,9 +55,14 @@ bs.COLOURS.update({
 
 
 # ---- THE ARROW ---------------------------------------------------------------
-ARROW_LEN = 58          # 0.725 m
+# 2026-10-13 (owner: "a little shorter/smaller"): 58 -> 48 cells, 0.725 m ->
+# 0.60 m, the head's socket a cell shorter and the vanes two out only at their
+# middle -- it read as a javelin stuck in a man. The point is still the
+# foremost cell, so every placement that reads ItemDef::ArrowSpec::tip (the
+# flight, the embed, the stuck item) follows the new length by itself.
+ARROW_LEN = 48          # 0.60 m
 ARROW_X = 5             # cross-section, odd: the axis through the middle cell
-HEAD_FROM = 51          # socket + point from here on
+HEAD_FROM = ARROW_LEN - 7   # socket + point from here on (7 cells, 8.75 cm)
 
 
 def arrow_cells():
@@ -65,24 +70,24 @@ def arrow_cells():
 
     def fn(x, dy, dz):
         on_axis = dy == 0 and dz == 0
-        # The head: a socket (a 3-cell cross round the shaft's end), a
-        # shoulder, then a three-cell bodkin point. The foremost cell is the
-        # arrow's POINT (ItemDef::ArrowSpec::tip).
+        # The head: a socket (a 3-cell cross round the shaft's end), then a
+        # four-cell bodkin point. The foremost cell is the arrow's POINT
+        # (ItemDef::ArrowSpec::tip).
         if x >= HEAD_FROM:
             k = x - HEAD_FROM
-            if k <= 3:
+            if k <= 2:
                 if (abs(dy) + abs(dz)) <= 1:
-                    return (STEEL, "head_hi" if (on_axis and k == 3) else "head")
+                    return (STEEL, "head")
                 return None
             return (STEEL, "head_hi") if on_axis else None
         # The nock.
         if x <= 1:
             return (STAFF_WOOD, "nock") if on_axis else None
-        # Fletching: four vanes, 10 cells long, 2 out from the shaft where full,
-        # 1 at the ends (a trailing taper read at a glance).
-        if 2 <= x <= 11 and (dy == 0) != (dz == 0):
+        # Fletching: four vanes, 9 cells long, 2 out from the shaft at their
+        # middle, 1 at the ends (a trailing taper read at a glance).
+        if 2 <= x <= 10 and (dy == 0) != (dz == 0):
             r = max(abs(dy), abs(dz))
-            full = 4 <= x <= 9
+            full = 5 <= x <= 8
             if r == 1 or (r == 2 and full):
                 cock = dz > 0   # the up vane is the cock feather
                 return (LINEN, "fletch_a" if cock else "fletch_b")
@@ -168,7 +173,7 @@ def main():
         "severImpactSpeed": 3.0,
         "grip": {"held_right": {"translation": [0, 0, 0],
                                 "rotation": [90, -90, 0], "scale": 1}},
-        "hilt": {"min": [24, 0, 0], "size": [10, ay, az]},
+        "hilt": {"min": [(ax - 10) // 2, 0, 0], "size": [10, ay, az]},
     }
     bs.emit(out, "arrow", arrow, arrow_side)
 

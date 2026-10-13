@@ -4123,6 +4123,32 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   };
 
   for (int i = 0; i < 20; i++) mobTick();  // healthy walk first: live gait pose
+  // ">N" / ">N~": N arrows at the creature's torso, arms, thighs and head from
+  // around its front quarter, `standOff` voxels out along each line, at
+  // `draw` x the bow's full-draw speed (game/arrows.h, the real flight).
+  int inAirVolley = 0;
+  auto loose = [&](int n, float standOff, float draw) {
+    const ItemDef* ad = items.Named("arrow");
+    const ItemDef* bd = items.Named("bow");
+    if (ad == nullptr || !ad->IsAmmo()) return;
+    const float spd = draw * (bd && bd->IsBow() ? bd->bow.drawSpeed
+                                                : MetresPerSecToCells(50.0f));
+    static const char* const kAim[8] = {"torso", "armU.L", "legU.R", "armU.R",
+                                        "torso", "legU.L", "hips", "head"};
+    for (int k = 0; k < n && k < 8; k++) {
+      int li = -1;
+      for (size_t i = 0; i < def.limbs.size(); i++)
+        if (def.limbs[i].name == kAim[k]) li = (int)i;
+      if (li < 0 || !mobs.LimbBody(id, li)) continue;
+      Vec3 cc{};
+      for (uint32_t s = 0; s < 256; s++) cc += mobs.LimbVoxelPos(id, li, s * 7919u);
+      cc = cc * (1.0f / 256.0f);
+      const float a = 0.9f + 0.55f * (float)k;   // around the front quarter
+      const Vec3 dir = Vec3{std::cos(a), -0.08f, std::sin(a)}.normalized();
+      rig.Authority().arrows.Launch(*ad, cc - dir * standOff, dir, spd, Vec3{},
+                                    0x5A0700u + (uint32_t)k, {});
+    }
+  };
   std::vector<uint64_t> droppedBodies;       // "_item" drops, logged at the shot
   std::vector<std::string> pendingDrops;     // "_item=mat:frac", dropped later
   for (size_t start = 0; start < limbCsv.size();) {
@@ -4178,31 +4204,22 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     // torso, arms, thighs and head from around it, through the real flight
     // and the real embed (Mob::EmbedArrow), so what arrows sticking out of a
     // body look like is a screenshot rather than a live session.
+    // ">N~" keeps them IN THE AIR instead: N full-draw arrows loosed from
+    // three metres out AFTER the settle ticks below, and the pictures taken
+    // one tick later, so what a flight looks like (game/arrows.h
+    // AppendRenderBodies) is a screenshot too.
+    if (!nm.empty() && nm[0] == '>' && nm.find('~') != std::string::npos) {
+      inAirVolley = std::clamp(std::atoi(nm.c_str() + 1), 1, 8);
+      continue;
+    }
     if (!nm.empty() && nm[0] == '>') {
       const ItemDef* ad = items.Named("arrow");
-      const ItemDef* bd = items.Named("bow");
       if (ad == nullptr || !ad->IsAmmo()) {
         std::fprintf(stderr, "--shot-mob: no arrow item to shoot\n");
         continue;
       }
       const int n = std::clamp(std::atoi(nm.c_str() + 1), 1, 8);
-      const float spd = 0.5f * (bd && bd->IsBow() ? bd->bow.drawSpeed
-                                                  : MetresPerSecToCells(65.0f));
-      static const char* const kAim[8] = {"torso", "armU.L", "legU.R", "armU.R",
-                                          "torso", "legU.L", "hips", "head"};
-      for (int k = 0; k < n; k++) {
-        int li = -1;
-        for (size_t i = 0; i < def.limbs.size(); i++)
-          if (def.limbs[i].name == kAim[k]) li = (int)i;
-        if (li < 0 || !mobs.LimbBody(id, li)) continue;
-        Vec3 cc{};
-        for (uint32_t s = 0; s < 256; s++) cc += mobs.LimbVoxelPos(id, li, s * 7919u);
-        cc = cc * (1.0f / 256.0f);
-        const float a = 0.9f + 0.55f * (float)k;   // around the front quarter
-        const Vec3 dir = Vec3{std::cos(a), -0.08f, std::sin(a)}.normalized();
-        rig.Authority().arrows.Launch(*ad, cc - dir * 10.0f, dir, spd, Vec3{},
-                                      0x5A0700u + (uint32_t)k, {});
-      }
+      loose(n, 10.0f, 0.5f);
       mobTick();
       mobTick();
       Mob* sm = mobs.FindCreature(id);
@@ -4285,6 +4302,12 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   // enough for the loco crossfade to finish and the sever spray to land, but
   // short enough that a crawler hasn't dragged itself in among the trees
   for (int i = 0; i < 90; i++) mobTick();
+  if (inAirVolley > 0) {
+    loose(inAirVolley, 30.0f, 1.0f);
+    mobTick();
+    std::printf("--shot-mob: %d arrows loosed, %zu in the air at the shot\n",
+                inAirVolley, rig.Authority().arrows.Live());
+  }
   std::printf("--shot-mob: %s locoState=%d clips=%d\n", spec.c_str(),
               mobs.LocoState(id), mobs.ActiveClips(id));
   {
@@ -4445,6 +4468,10 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     sim.UploadMicroBodies(ctx.queue, *mbs);
 
   BodyRegistry bodyReg(debris, mobs, nullptr);
+  // The arrows still in the air (">N~"), where the last tick left them.
+  std::vector<RenderOnlyBody> flightBodies;
+  rig.Authority().arrows.AppendRenderBodies(items, 1.0f, flightBodies);
+  bodyReg.SetRenderOnly(&flightBodies);
   std::vector<BodyXformGpu> xf;
   bodyReg.BuildXforms(xf);
   if (!xf.empty())
@@ -20736,6 +20763,13 @@ int main(int argc, char** argv) {
         g_bodyStats.microUploadMaxUs = std::max(g_bodyStats.microUploadMaxUs, us);
       }
       BodyRegistry bodyReg(debris, mobs, &avatar, &mbSet);
+      // THE ARROWS IN FLIGHT (game/arrows.h AppendRenderBodies): drawn as
+      // render-only bodies after every real one, at the camera's own tick
+      // interpolation. Without this a shot was invisible until it stuck.
+      static std::vector<RenderOnlyBody> flightBodies;
+      flightBodies.clear();
+      tickCtx.arrows.AppendRenderBodies(items, tickAlpha, flightBodies);
+      bodyReg.SetRenderOnly(&flightBodies);
       const auto bodyT0 = std::chrono::steady_clock::now();
       // WHO ELSE IS HOLDING MY ARM. One index sweep while everything is
       // healthy, a named report the moment two entities point at one brick
