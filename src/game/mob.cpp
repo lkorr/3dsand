@@ -2241,6 +2241,13 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
       rule.surge = std::clamp(s.value("surge", 0.0f), 0.0f, 0.95f);
       rule.surgePeak = std::clamp(s.value("surgePeak", 0.75f), 0.05f, 0.95f);
       rule.surgeSteps = std::clamp(s.value("surgeSteps", 2), 1, 8);
+      // AnimStateRule::surgeDwell / strokeClock (the army crawl). Surge may
+      // reach 1 here: a dwell's pulse IS the only motion, and a full stop
+      // between strokes is the point.
+      rule.surgeDwell = std::clamp(s.value("surgeDwell", 0.0f), 0.0f, 0.8f);
+      if (rule.surgeDwell > 0.0f)
+        rule.surge = std::clamp(s.value("surge", 0.0f), 0.0f, 1.0f);
+      rule.strokeClock = s.value("strokeClock", false);
       rule.crouchClip = s.value("crouchClip", "");
       rule.jumpScale = s.value("jumpScale", -1.0f);
       rule.jumpClip = s.value("jumpClip", "");
@@ -6038,8 +6045,24 @@ float Mob::LocoSurge() const {
     s -= std::floor(s);
     const float pk = rule.surgePeak;
     auto smooth = [](float x) { return x * x * (3.0f - 2.0f * x); };
-    const float shape = s < pk ? -1.0f + 2.0f * smooth(s / pk)
-                               : 1.0f - 2.0f * smooth((s - pk) / (1.0f - pk));
+    float shape;
+    if (rule.surgeDwell > 0.0f) {
+      // AnimStateRule::surgeDwell: still for the dwell, then one smoothstep
+      // bump (mean 1/2 over what is left, peak 1) scaled by 2/(1-dwell), so
+      // the multiplier 1+shape is 0 in the pause and the step's mean is 1.
+      const float d = rule.surgeDwell;
+      if (s < d) {
+        shape = -1.0f;
+      } else {
+        const float u = (s - d) / (1.0f - d);
+        const float bump = u < pk ? smooth(u / pk)
+                                  : 1.0f - smooth((u - pk) / (1.0f - pk));
+        shape = bump * 2.0f / (1.0f - d) - 1.0f;
+      }
+    } else {
+      shape = s < pk ? -1.0f + 2.0f * smooth(s / pk)
+                     : 1.0f - 2.0f * smooth((s - pk) / (1.0f - pk));
+    }
     const float on = std::clamp(inst.weight * inst.fade, 0.0f, 1.0f);
     return 1.0f + rule.surge * shape * on;
   }

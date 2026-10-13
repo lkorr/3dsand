@@ -409,6 +409,18 @@ const char* g_shotJumpPath = nullptr;  // set for exactly one frame, then taken
 // up: fully under and rising -- "swimming up" at the surface is, by design,
 // treading). The still phases are shot square to the body's side.
 bool g_shotSwim = false;
+// `--shot-crawl`: the PRONE ARMY CRAWL's look-iteration harness (Player::prone,
+// the `prone` loco state, assets/anims/crawl.json). Walk, hold Ctrl from
+// kShotCrawlDown (a hold, so prone), crawl side-on in third person, a picture
+// every SANDVOX_SHOT_CRAWL_EVERY frames (default 4) through one stroke window,
+// then first person for the lurch the eye rides. Prints a per-tick trace of
+// the body speed and the eye height so the pause and the pull are numbers.
+bool g_shotCrawl = false;
+constexpr uint64_t kShotCrawlDown = 120;     // Ctrl pressed, then held
+constexpr uint64_t kShotCrawlShotsAt = 330;  // third-person stroke window
+constexpr uint64_t kShotCrawlShotsEnd = 400;
+constexpr uint64_t kShotCrawlFirst = 420;    // first person from here
+constexpr uint64_t kShotCrawlLast = 520;
 constexpr uint64_t kShotSwimTreadEnd = 280;   // Space held at the surface
 constexpr uint64_t kShotSwimCrawlEnd = 420;   // forward at the surface
 constexpr uint64_t kShotSwimDownEnd = 500;    // Ctrl alone
@@ -6253,6 +6265,12 @@ int main(int argc, char** argv) {
       g_shotSwim = true;
       g_harnessFrames = kShotSwimLast;
     }
+    // `--shot-crawl`: the prone army crawl, stroke by stroke. See the note at
+    // g_shotCrawl.
+    else if (a == "--shot-crawl") {
+      g_shotCrawl = true;
+      g_harnessFrames = kShotCrawlLast;
+    }
     // `--duel-dummy` is the melee FEEL harness: a sword-armed human standing
     // three metres in front of the spawn, with nothing driving it. Mobs have no
     // AI yet, so "stands still" is simply the default and this flag is only a
@@ -6992,7 +7010,7 @@ int main(int argc, char** argv) {
     // body. Forced here rather than in tuning.json because it feeds the shader
     // constant prelude and therefore worldgen — it has to be true before the
     // first chunk is generated, not toggled later.
-    if (g_shotJump || g_shotSwim) {
+    if (g_shotJump || g_shotSwim || g_shotCrawl) {
       tune.debug.vegetation = 0;
       tune.debug.groundCover = 0;
     }
@@ -8363,7 +8381,7 @@ int main(int argc, char** argv) {
   double mx0 = 0, my0 = 0;
   glfwGetCursorPos(window, &mx0, &my0);
 
-  KeyEdge eP, eN, eV, eF1, eF2, eF3, eF4, eF5, eF6, eF7, eF8, eF9, eF10, eF11, eF12, eR, eEsc, eLBracket, eRBracket, eJump,
+  KeyEdge eP, eN, eV, eF1, eF2, eF3, eF4, eF5, eF6, eF7, eF8, eF9, eF10, eF11, eF12, eR, eEsc, eLBracket, eRBracket, eJump, eCrouch,
       eJ, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eU, eL, eI;
   // M opens the world map (ui/map_ui.h); its own edge, because the dev
   // panel's spawn-a-mob moved to Shift+M and reads eM only while captured.
@@ -11692,7 +11710,8 @@ int main(int argc, char** argv) {
           g_shotDialogue ||  // the reload would wipe the listener it spawned
           g_shotDemon ||     // ...or the demon it summoned
           g_shotEditor ||    // ...or the house it placed
-          g_shotSpawn;       // (a picture, not a reload test: the compile would own the run)
+          g_shotSpawn ||     // (a picture, not a reload test: the compile would own the run)
+          g_shotCrawl;
       if (frameCounter == g_harnessFrames / 2 && !noReload) {
         std::printf("--frames harness: triggering shader reload (F5 path)\n");
         ui.reloadShaders = true;
@@ -11720,6 +11739,22 @@ int main(int argc, char** argv) {
     // four are compared with, and it costs one frame.
     if (g_shotJump && frameCounter == kShotJumpAtFrame - 20)
       g_shotJumpPath = "screenshot_jump_walk.bmp";
+    // --shot-crawl: the stroke window side-on, then first person.
+    if (g_shotCrawl && avatar.Spawned()) {
+      static const int every = std::getenv("SANDVOX_SHOT_CRAWL_EVERY")
+                                   ? std::max(1, std::atoi(std::getenv("SANDVOX_SHOT_CRAWL_EVERY")))
+                                   : 4;
+      static char crawlPath[64];
+      const uint64_t f = frameCounter;
+      const bool third = f >= kShotCrawlShotsAt && f < kShotCrawlShotsEnd;
+      const bool first = f >= kShotCrawlFirst + 20 && f < kShotCrawlLast - 10;
+      if ((third || first) && (f - kShotCrawlShotsAt) % (uint64_t)every == 0) {
+        std::snprintf(crawlPath, sizeof(crawlPath), "screenshot_crawl_%s_f%llu.bmp",
+                      third ? "tp" : "fp", (unsigned long long)f);
+        g_shotJumpPath = crawlPath;
+      }
+      if (f == kShotCrawlDown - 10) g_shotJumpPath = "screenshot_crawl_stand.bmp";
+    }
     // --shot-swim: one picture per phase (see g_shotSwim). The fixed frames
     // sit near each window's end, so the blend into that phase has finished.
     if (g_shotSwim && avatar.Spawned()) {
@@ -14204,10 +14239,15 @@ int main(int argc, char** argv) {
       pin.SetHeld(TB_CROUCH, key(GLFW_KEY_LEFT_CONTROL));
       pin.SetHeld(TB_SPRINT, key(GLFW_KEY_LEFT_SHIFT));
       pin.SetPressed(TB_JUMP, eJump.Pressed(key(GLFW_KEY_SPACE)));
+      // Ctrl's EDGE as well as its level: a tap toggles the crouch and a hold
+      // goes prone (Player::UpdateStance), and a tap shorter than a tick is
+      // only visible as an edge.
+      pin.SetPressed(TB_CROUCH, eCrouch.Pressed(key(GLFW_KEY_LEFT_CONTROL)));
     } else {
       // Keep the jump edge fed with `false` so a space held THROUGH a menu
       // does not read as a fresh press the instant it closes.
       eJump.Pressed(false);
+      eCrouch.Pressed(false);
     }
     // --shot-jump: walk forward and jump once, with nobody at the keyboard.
     //
@@ -14258,6 +14298,57 @@ int main(int argc, char** argv) {
       cam.yaw = 0.6f;
       cam.pitch = -0.12f;
       pin.SetPressed(TB_JUMP, frameCounter == kShotJumpAtFrame);
+    }
+    // --shot-crawl: the crawl script (g_shotCrawl). Walk, a Ctrl press held
+    // into prone, then crawl nearly side-on; first person from
+    // kShotCrawlFirst. Morning sun, no dev panel.
+    if (g_shotCrawl) {
+      if (frameCounter == 1) {
+        ui.visible = false;
+        CelestialClock& sky = Celestial();
+        sky.SetScale(2.0f, tick);
+        sky.SetScale(1.0f, tick);
+        const int64_t tpd = (int64_t)TicksPerDay(CurrentTuning());
+        sky.ticks = tpd * 42 / 100;
+        sky.prevTicks = sky.ticks;
+        sky.rem = 0;
+      }
+      player.fly = false;
+      ui.fly = false;
+      const uint64_t f = frameCounter;
+      camMode = f >= kShotCrawlFirst ? CameraMode::First : CameraMode::Third;
+      const bool down = f >= kShotCrawlDown;
+      pin.SetHeld(TB_CROUCH, down);
+      pin.SetPressed(TB_CROUCH, f == kShotCrawlDown);
+      pin.SetHeld(TB_SPRINT, false);
+      pin.SetPressed(TB_JUMP, false);
+      pin.SetHeld(TB_JUMP, false);
+      if (f >= kShotCrawlFirst) {
+        // Straight ahead and a little down: the lurch is in the eye.
+        pin.forward = 1.f;
+        pin.strafe = 0.f;
+        cam.pitch = -0.25f;
+      } else {
+        // Side-on (strafe), so the stroke reads in profile.
+        pin.forward = down ? 0.0f : 0.4f;
+        pin.strafe = f > 60 ? 1.f : 0.f;
+        cam.yaw = 0.6f;
+        // The second half of the stroke window from high up: the elbows
+        // out to the sides and the frog knee read from above.
+        cam.pitch = f >= (kShotCrawlShotsAt + kShotCrawlShotsEnd) / 2 ? -0.75f : -0.18f;
+      }
+      if (avatar.Spawned() && f >= kShotCrawlDown && (f & 1u) == 0) {
+        const AvatarLocomotion lo = avatar.Locomotion();
+        Vec3 headEye{};
+        const bool he = avatar.HeadEyeWorld(headEye);
+        std::printf("--shot-crawl: f%llu prone=%d crouch=%d state=%s speed=%.2f m/s "
+                    "scale=%.2f wish=%.2f eyeY=%.2f\n",
+                    (unsigned long long)f, (int)player.prone, (int)player.crouching,
+                    lo.stateName ? lo.stateName : "-",
+                    Vec3{player.vel.x, 0, player.vel.z}.len() * kVoxelMeters,
+                    lo.speedScale, player.moveWish,
+                    he ? (headEye.y - (player.pos.y - Player::kHalfY)) * kVoxelMeters : -1.0f);
+      }
     }
     // --shot-swim: the phase script (g_shotSwim). The same three-quarter view
     // as --shot-jump: the body faces its travel in third person, and a stroke
@@ -14439,6 +14530,7 @@ int main(int argc, char** argv) {
     feeder.SetAxes(pin.forward, pin.strafe);
     feeder.SetHeldMask(pin.held);
     if (pin.Pressed(TB_JUMP)) feeder.Press(TB_JUMP);
+    if (pin.Pressed(TB_CROUCH)) feeder.Press(TB_CROUCH);
     // While talking to a demon (demons D5): L held, or the strip's toggle,
     // looks away from it -- HELD state, so it is re-sampled every frame.
     feeder.Hold(TB_DEMON_LOOKAWAY,

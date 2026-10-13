@@ -11025,11 +11025,25 @@ a detached speckle becomes a floating scrap of flesh in the world.
   box as a parameter (`Player::BoxFor` is the one place its shape is
   decided). The first-person eye is the LOWER of the figure's face row and
   just under the box top, because only the box is guaranteed clear.
-  **Crouch (Ctrl):** the box shrinks to `player.crouchHeight` (1.15 m), speed
-  scales by `player.crouchSpeedScale` and sprint is off; releasing Ctrl only
-  stands up once the standing box is clear where the body is, so a
-  crawl-space cannot wedge you. The eye change is banked into `viewYOffset`
-  like a step-up. The avatar mirrors `Player::crouching` into a held pelvis
+  **Crouch and prone (Ctrl, 2026-10-12):** a Ctrl TAP toggles the crouch
+  (sneak); a HOLD of `player.proneHoldTime` goes PRONE; a tap from prone rises
+  to the crouch and Space stands a prone body up (no jump). `Player::
+  UpdateStance` keeps the ASKED-FOR stance apart from the one the body has:
+  down always fits, up happens only once the taller box is clear where the
+  body is, so a crawl-space cannot wedge you and a stand asked for under a
+  ceiling finishes when you walk out. Crouched, the box is
+  `player.crouchHeight` (1.15 m), speed scales by `player.crouchSpeedScale`
+  and sprint is off. Prone, the box is `player.proneHeight` (0.5 m; its 0.4 m
+  floor keeps it taller than the terminal-velocity sweep substep), sprint and
+  jump are off, and the pace is the avatar's `prone` loco state (an ACTIVITY
+  state in human.json, set by avatar.cpp unless the damage already has the
+  body on the ground): the army crawl (`assets/anims/crawl.json`, shared with
+  the legless crawl) whose speed LURCHES -- `surgeDwell` holds the body still
+  while an elbow reaches and `surge` 1 drags it forward on the pull, and
+  `strokeClock` runs the playhead on the input (`Player::moveWish`, negative
+  backing up) so the stroke's own pause cannot stall it. The first-person eye
+  rides the posed head, so the lurch is felt in the camera. The eye change
+  is banked into `viewYOffset` like a step-up. The avatar mirrors `Player::crouching` into a held pelvis
   drop (`player.crouchKneeDrop`, `PlayerAvatar::crouchHold_`, capped in leg
   lengths) kept separate from the gait's per-step `stanceCrouch_`; the leg IK
   turns the drop into a knee bend with the feet where the gait put them.

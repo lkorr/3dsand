@@ -51,7 +51,9 @@
 // consumer asks one of exactly those two questions about the same button.
 enum TickButton : uint32_t {
   TB_JUMP = 1u << 0,    // space (rise, in fly/swim)
-  TB_CROUCH = 1u << 1,  // ctrl (descend, in fly/swim)
+  // ctrl (descend, in fly/swim). On foot its PRESSED edge toggles the crouch
+  // and the HELD level, kept up, goes prone (Player::UpdateStance).
+  TB_CROUCH = 1u << 1,
   TB_SPRINT = 1u << 2,
   // THE TWO HANDS (dual wielding, 2026-09-27): with the hands up, LMB is the
   // RIGHT hand's button and RMB the LEFT's — a strike, or its vessel's use.
@@ -106,7 +108,8 @@ enum TickButton : uint32_t {
 // 7: TB_DEMON_RELEASE (demons D3).
 // 8: TB_DEMON_TALK / PRESENT / DISMISS / LOOKAWAY + `contractHash`,
 //    `demonRef` (demons D5; 76 -> 84 bytes).
-constexpr uint32_t kTickInputVersion = 8;   // 2: TB_THROW, 3: TB_APPLY
+// 9: TB_CROUCH's PRESSED edge means something (the crouch toggle / prone).
+constexpr uint32_t kTickInputVersion = 9;   // 2: TB_THROW, 3: TB_APPLY
 
 // THE CONVERSATION COMMAND (TickInput::talk, game/dialogue.h). A choice made
 // in the conversation panel is a player INPUT like a strike or a use, so it

@@ -485,7 +485,13 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   if (loco != nullptr && loco->disableGait && !loco->clip.empty()) {
     const int ci = sk.FindClip(loco->clip);
     float rate;
-    if (loco->cycleDistance > 0.0f && ci >= 0 && sk.clips[ci].durationMs > 0) {
+    if (loco->strokeClock && in.haveMoveWish) {
+      // AnimStateRule::strokeClock: the INPUT runs the stroke, and the
+      // stroke runs the body (Mob::LocoSurge). Signed: backing up plays it
+      // backwards, which is the stroke pushing instead of pulling.
+      rate = std::clamp(in.moveWish, -1.0f, 1.0f);
+    } else if (loco->cycleDistance > 0.0f && ci >= 0 &&
+               sk.clips[ci].durationMs > 0) {
       const float cycleS = (float)sk.clips[ci].durationMs * 0.001f;
       rate = std::clamp(speedNow_ * cycleS / loco->cycleDistance, 0.0f, 3.0f);
     } else {
@@ -493,7 +499,7 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
           std::max(def.speed * std::max(loco->speedScale, 0.05f), 0.5f);
       rate = std::clamp(speedNow_ / ref, 0.0f, 1.5f);
     }
-    if (rate < 0.05f) rate = 0.0f;
+    if (std::fabs(rate) < 0.05f) rate = 0.0f;
     const int kc =
         loco->crouchClip.empty() ? -1 : sk.FindClip(loco->crouchClip);
     const float kneelStep = dt / 0.22f;   // seconds to drop onto the knees

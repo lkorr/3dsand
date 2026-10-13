@@ -336,6 +336,24 @@ struct AnimStateRule {
   float surge = 0.0f;
   float surgePeak = 0.75f;
   int surgeSteps = 2;
+  // ---- A STROKE THAT PAUSES (2026-10-12, the army crawl) ------------------
+  //
+  // `surgeDwell` (0..0.8 of a step): the first part of every step is a PAUSE
+  // -- the multiplier is 0 while the limbs reach -- and the rest is one pulse
+  // (rising to its top at `surgePeak` of what is left, back to 0 by the next
+  // plant) scaled so the step's mean is still 1. With `surge` 1 the body
+  // stops dead between strokes and is dragged forward on each pull; below 1
+  // it keeps that share of a steady glide. 0 keeps the smoothstep surge above.
+  //
+  // `strokeClock`: the loco clip's playhead runs on the INPUT, not on the
+  // body's speed (PoseInputs::moveWish; negative plays it backwards). A
+  // stroke whose own pause brings the body to a stop would otherwise stop
+  // its own playhead there and never pull again -- the speed-ratio and
+  // `cycleDistance` playheads both read the body's travel, and that travel
+  // is now what the playhead decides. A driver with no input to give (an
+  // NPC, moveWish unset) keeps the speed-ratio playhead.
+  float surgeDwell = 0.0f;
+  bool strokeClock = false;
   // `crouchClip`: what this state does with a held crouch. A clip-owned state
   // keys the pelvis the stance crouch moves, so the gait's knee-bend crouch is
   // off under it (pose.cpp, the held crouch); with this set the crouch is

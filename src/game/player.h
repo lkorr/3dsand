@@ -118,8 +118,9 @@ class Player {
     // box is what every sweep and probe in player.cpp already receives.
     const TopFn* top = nullptr;
   };
-  Box BoxFor(bool crouched) const;
-  Box CurrentBox() const { return BoxFor(crouching); }
+  // `lying` = the PRONE box (player.proneHeight), which wins over `crouched`.
+  Box BoxFor(bool crouched, bool lying = false) const;
+  Box CurrentBox() const { return BoxFor(crouching, prone); }
   // Height of the live collision box above the sole, voxels.
   float BoxHeight() const {
     const Box b = CurrentBox();
@@ -288,13 +289,39 @@ class Player {
   Vec3 vel{0, 0, 0};
   bool fly = true;          // start in fly mode until the first mirror arrives
   bool grounded = false;
-  // Ctrl held on the ground (or in the air; not while swimming, hanging or
-  // mantling). The collision box is crouchHeight tall while this holds and
-  // ground speed is scaled by crouchSpeedScale. STICKY under a low ceiling:
-  // releasing Ctrl only stands the body up once the standing box fits, so
-  // a crawl-space cannot wedge you by letting go at the wrong moment. The
-  // avatar reads it for the knee bend. Fly mode clears it (Ctrl is descend).
+  // ---- THE STANCE: stand, crouch (sneak), prone (crawl) — 2026-10-12 ----
+  //
+  // Ctrl is a TOGGLE on a tap and a crawl on a HOLD (owner request):
+  //   * tap while standing  -> crouch, and it STAYS crouched (sneak mode);
+  //   * tap while crouched  -> stand;
+  //   * hold (player.proneHoldTime) from standing or crouched -> PRONE;
+  //   * tap while prone     -> back up to the crouch; Space -> straight up.
+  // The press crouches at once, so a hold passes through the crouch on its
+  // way down rather than waiting the hold out on its feet.
+  //
+  // `crouching` and `prone` are what the body IS; the stance it was ASKED for
+  // is kept separately (stanceWant_), and the body rises to it only when the
+  // taller box fits where it is. That is the old "sticky under a low ceiling"
+  // rule kept whole: a tap to stand in a crawl-space stands you up the moment
+  // you walk out, and nothing can wedge the box into a ceiling. Going down
+  // always fits (a smaller box fits wherever a bigger one did).
+  //
+  // Only on foot: Ctrl is descend in fly and swim-down at swim depth, and a
+  // hang or mantle is a scripted shape. Fly and swimming reset the stance to
+  // standing. The avatar reads `crouching` for the knee bend and `prone` for
+  // the crawl state (AnimStateRule::activity "prone", human.json).
   bool crouching = false;
+  // Lying flat: the collision box is player.proneHeight tall, sprint and the
+  // jump are off (Space stands up instead), and the walk is the avatar's
+  // `prone` state's speedScale pulsed by its stroke (AnimStateRule::surge) —
+  // the lurching army crawl.
+  bool prone = false;
+  // The walk the input ASKED for this tick, -1..1: the movement keys'
+  // magnitude, negative when backing up. Not the velocity: a crawl that
+  // pauses between strokes is still being asked to move, and the stroke's
+  // playhead runs on this (AnimStateRule::strokeClock) so it does not stall
+  // in its own pause. Zero in fly and while hanging/mantling.
+  float moveWish = 0.0f;
   bool inLiquid = false;
   // Any part of the body wet is `inLiquid`; SWIMMING is the state where the
   // water has actually taken over — the body three-quarters under
@@ -432,6 +459,15 @@ class Player {
   float viewDecayPerTick = 1.0f;
 
   float modelEyeOffset_ = 0;
+
+  // ---- the stance machine (see `crouching`/`prone`) ----
+  enum Stance : uint8_t { kStand = 0, kCrouch = 1, kProne = 2 };
+  uint8_t stanceWant_ = kStand;  // what Ctrl last asked for
+  uint8_t pressFrom_ = kStand;   // stanceWant_ when the live press began
+  bool holdFired_ = false;       // this press already went prone
+  float crouchHold_ = -1.0f;     // seconds the live press has been held; <0 none
+  void UpdateStance(float dt, const TickInput& in, bool onFoot,
+                    const KindFn& kindAt);
 
   // ---- avatar damage coupling ----
   // Multipliers the PlayerAvatar's dismemberment state feeds in (see

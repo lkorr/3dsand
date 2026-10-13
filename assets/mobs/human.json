@@ -906,7 +906,11 @@
       "speedScale": 0.3,
       "disableGait": true,
       "bodyYOffset": 0,
-      "groundAlign": 1
+      "groundAlign": 1,
+      "surge": 1,
+      "surgeDwell": 0.4,
+      "surgePeak": 0.45,
+      "strokeClock": true
     },
     {
       "name": "crawl.shins",
@@ -918,7 +922,11 @@
       "speedScale": 0.3,
       "disableGait": true,
       "bodyYOffset": 0,
-      "groundAlign": 1
+      "groundAlign": 1,
+      "surge": 1,
+      "surgeDwell": 0.4,
+      "surgePeak": 0.45,
+      "strokeClock": true
     },
     {
       "name": "stumps",
@@ -980,6 +988,19 @@
       "disableGait": true,
       "bodyYOffset": 0,
       "groundAlign": 1
+    },
+    {
+      "name": "prone",
+      "activity": "prone",
+      "clip": "crawl",
+      "speedScale": 0.25,
+      "disableGait": true,
+      "bodyYOffset": 0,
+      "groundAlign": 1,
+      "surge": 1,
+      "surgeDwell": 0.4,
+      "surgePeak": 0.45,
+      "strokeClock": true
     }
   ],
   "clips": {

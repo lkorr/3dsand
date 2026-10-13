@@ -71,8 +71,9 @@ struct PlayerSession;  // session.h includes THIS file; MakePlayerState is in .c
 // reading a peer's struct with our layout — the failure mode of getting that
 // wrong is a player standing in the wrong place with no error anywhere.
 // 2: kThrowDraw/kThrowSwing; 3: severed; 4: severed gone again (the body's
-// own pose stream, net::PlayerBody, says which limbs it has).
-constexpr uint32_t kPlayerStateVersion = 4;
+// own pose stream, net::PlayerBody, says which limbs it has); 5: kProne +
+// kWishFwd/kWishBack (the crawl).
+constexpr uint32_t kPlayerStateVersion = 5;
 
 // ONE TICK OF SOMEBODY ELSE'S CONTROLLER, AS A RESULT. POD, fixed layout, no
 // pointers and no std:: anything: this struct is memcpy'd into a frame by
@@ -148,6 +149,13 @@ struct PlayerState {
     // The mantle in progress is a LEDGE CLIMB out of a hang (not a water
     // climb-out): the ghost's avatar poses the muscle-up from it.
     kMantleFromHang = 1u << 11,
+    // Lying flat (Player::prone): the ghost's avatar crawls.
+    kProne = 1u << 12,
+    // The sign of Player::moveWish, which runs a crawl's stroke clock
+    // (AnimStateRule::strokeClock). Not derivable from `vel`: the stroke's
+    // own pause stops the body while the keys are still down.
+    kWishFwd = 1u << 13,
+    kWishBack = 1u << 14,
   };
   bool Has(Flag f) const { return (flags & (uint32_t)f) != 0; }
   void Set(Flag f, bool on) {

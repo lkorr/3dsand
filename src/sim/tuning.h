@@ -285,6 +285,12 @@ struct Tuning {
     float crouchHeight = TPD(player, crouchHeight);
     float crouchSpeedScale = TPD(player, crouchSpeedScale);
     float crouchKneeDrop = TPD(player, crouchKneeDrop);
+    // PRONE (Player::prone): Ctrl HELD this long goes prone (a shorter press
+    // is a tap, which toggles the crouch). The box shrinks to proneHeight;
+    // the crawl's pace and its lurch are the avatar's `prone` state
+    // (human.json), not a knob here.
+    float proneHeight = TPD(player, proneHeight);
+    float proneHoldTime = TPD(player, proneHoldTime);
     // The FIGURE contract, not collision: scripts/test_mobgen.mjs reads these
     // out of tuning.json and asserts the generated human is halfHeight*2 tall
     // with the face at halfHeight+eyeOffset. The controller does not read

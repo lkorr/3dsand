@@ -127,6 +127,12 @@ struct PoseInputs {
   // ---- DRIVER EXTRAS ------------------------------------------------------
   // The held crouch (Ctrl): eased toward player.crouchKneeDrop.
   bool crouch = false;
+  // The walk the driver's INPUT asks for, -1..1 (Player::moveWish), for a
+  // state whose playhead runs on it (AnimStateRule::strokeClock). Only a
+  // driver that has an input sets `haveMoveWish`; without it such a state
+  // falls back to the speed-ratio playhead.
+  bool haveMoveWish = false;
+  float moveWish = 0.0f;
   // Ledge-hang palms: pin the arm chains' item sockets to a held lip.
   bool hangActive = false;
   IVec3 hangLip{};       // the held lip voxel, world

@@ -9686,7 +9686,12 @@ Status GateStumpWalk(Ctx& c, std::string& detail) {
       pl.canJump = loco.canJump;
       TickInput in{};
       in.forward = forward;
-      in.SetHeld(TB_CROUCH, crouch);
+      // Ctrl TOGGLES the crouch since 2026-10-12 (a held Ctrl goes prone):
+      // one tap on the phase's first tick when the stance must change.
+      if (i == 0 && crouch != pl.crouching) {
+        in.SetHeld(TB_CROUCH, true);
+        in.SetPressed(TB_CROUCH, true);
+      }
       pl.Update(kTickDt, in, Vec3{0, 0, 1}, Vec3{1, 0, 0}, Vec3{0, 0, 1},
                 kindAt);
       avTick();

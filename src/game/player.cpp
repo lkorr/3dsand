@@ -718,11 +718,91 @@ float Player::LedgeClimbRise() const {
   return std::clamp(1.0f - (lipTop - feet) / d0, 0.0f, 1.0f);
 }
 
-Player::Box Player::BoxFor(bool crouched) const {
-  const float h =
-      (crouched ? T().crouchHeight : T().collisionHeight) / kVoxelMeters;
+Player::Box Player::BoxFor(bool crouched, bool lying) const {
+  // The prone box is a short COLUMN, not a body-length slab: the box is where
+  // the feet go (see Box), and a lying figure's limbs overhang it exactly as
+  // a standing one's arms do. Its floor (player.proneHeight >= 0.4 m) is the
+  // SweepAxis stride argument: 4 voxels still out-measures the 3.4-voxel
+  // terminal-velocity substep, so a body that crawls off a cliff cannot
+  // tunnel a one-voxel slab on the way down.
+  const float h = (lying      ? T().proneHeight
+                   : crouched ? T().crouchHeight
+                              : T().collisionHeight) /
+                  kVoxelMeters;
   return Box{0.5f * T().collisionWidth / kVoxelMeters, -kHalfY,
              -kHalfY + std::max(h, 1.0f), cellTop ? &cellTop : nullptr};
+}
+
+// The stance machine (player.h, "THE STANCE"). Decides `crouching`/`prone`
+// BEFORE anything sweeps with the box.
+void Player::UpdateStance(float dt, const TickInput& in, bool onFoot,
+                          const KindFn& kindAt) {
+  const bool held = in.Held(TB_CROUCH);
+  if (!onFoot) {
+    // Ctrl means something else here (descend, swim down, let go of a lip),
+    // so no press is live. Fly and swimming end the stance outright; a hang
+    // or a mantle only suspends it, and the scripted climb below stands the
+    // body up anyway (crouching/prone are cleared while it runs).
+    crouchHold_ = -1.0f;
+    if (fly || (inLiquid && submersion >= kSwimSubmersion))
+      stanceWant_ = kStand;
+  } else {
+    // THE PRESS, as an edge: a tap shorter than a tick arrives as pressed
+    // with held already false, and is still a whole tap.
+    if (in.Pressed(TB_CROUCH)) {
+      pressFrom_ = stanceWant_;
+      holdFired_ = false;
+      crouchHold_ = 0.0f;
+      // Down at once: a hold passes through the crouch on its way to prone.
+      if (stanceWant_ == kStand) stanceWant_ = kCrouch;
+    } else if (crouchHold_ >= 0.0f && held) {
+      crouchHold_ += dt;
+    }
+    // THE HOLD: prone once it has been held long enough, from standing or
+    // crouched, on the ground. Airborne, the hold keeps counting and fires on
+    // landing — lying down in mid-air is not a stance.
+    if (crouchHold_ >= 0.0f && held && !holdFired_ && pressFrom_ != kProne &&
+        grounded && crouchHold_ >= T().proneHoldTime) {
+      stanceWant_ = kProne;
+      holdFired_ = true;
+    }
+    // THE RELEASE. A press that never became a hold was a TAP: it toggles
+    // the crouch, and from prone it rises one stage.
+    if (crouchHold_ >= 0.0f && !held) {
+      if (!holdFired_) {
+        if (pressFrom_ == kCrouch) stanceWant_ = kStand;
+        else if (pressFrom_ == kProne) stanceWant_ = kCrouch;
+      }
+      crouchHold_ = -1.0f;
+    }
+  }
+
+  // Resolve the body toward the wanted stance. Down always fits; up only when
+  // the taller box is clear here, else as far up as fits (prone -> crouch
+  // under a crouch-height ceiling), and the want stays so the body finishes
+  // rising once it moves clear.
+  const bool wasProne = prone, wasCrouch = crouching;
+  bool p = wasProne, c = wasCrouch;
+  if (!onFoot && (fly || hanging || mantleTimer > 0.0f)) {
+    p = c = false;  // a scripted shape / the debug camera: no stance
+  } else if (stanceWant_ == kProne) {
+    p = true;
+    c = false;
+  } else if (stanceWant_ == kCrouch) {
+    if (!p || !Collides(pos, BoxFor(true), kindAt)) {
+      p = false;
+      c = true;
+    }
+  } else if (p || c) {
+    if (!Collides(pos, BoxFor(false), kindAt)) {
+      p = c = false;
+    } else if (p && !Collides(pos, BoxFor(true), kindAt)) {
+      p = false;
+      c = true;
+    }
+  }
+  prone = p;
+  crouching = c;
 }
 
 void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
@@ -743,18 +823,21 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
                       // are never swimming, and a stale true would take the
                       // jump away after stepping out of a pool in fly mode
   swimAim = Vec3{};
+  moveWish = 0.0f;    // set again by the walk path, the only one that walks
   ledgeGrabbed = false;  // one-frame flag; set again below if a grab latches
   ledgeInReach = false;  // recomputed below (hang block or the walk probe)
 
-  // ---- crouch: decide the box BEFORE anything sweeps with it ----
+  // ---- stance: decide the box BEFORE anything sweeps with it ----
   //
   // Ctrl is descend in fly and swim-down in liquid, and while hanging or
-  // mantling the body is a scripted shape, so the crouch only means anything
-  // on foot. Going DOWN is always allowed (a smaller box fits wherever the
-  // bigger one did). Coming back UP is gated on the standing box being clear
-  // where the body is right now: a body that let go of Ctrl in a crawl-space
-  // stays crouched until it walks out, instead of standing into the ceiling
-  // and being welded there for UnstickRise to dig out.
+  // mantling the body is a scripted shape, so the stance only means anything
+  // on foot. A tap toggles the crouch, a hold goes prone (UpdateStance, and
+  // player.h "THE STANCE" for the whole rule). Going DOWN is always allowed
+  // (a smaller box fits wherever the bigger one did). Coming back UP is gated
+  // on the taller box being clear where the body is right now: a body asked
+  // to stand in a crawl-space stays down until it walks out, instead of
+  // standing into the ceiling and being welded there for UnstickRise to dig
+  // out.
   //
   // The eye rides the box top, so a change of box is a change of eye height.
   // Banked into viewYOffset exactly like a step-up, so the camera glides
@@ -769,16 +852,9 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
   // tick's submersion, as inLiquid already was here (both are measured below).
   {
     const bool swimDepth = inLiquid && submersion >= kSwimSubmersion;
-    const bool wantCrouch =
-        in.Held(TB_CROUCH) && !fly && !swimDepth && !hanging && mantleTimer <= 0.0f;
+    const bool onFoot = !fly && !swimDepth && !hanging && mantleTimer <= 0.0f;
     const float eyeBefore = EyeOffsetNow();
-    if (fly) {
-      crouching = false;
-    } else if (wantCrouch) {
-      crouching = true;
-    } else if (crouching && !Collides(pos, BoxFor(false), kindAt)) {
-      crouching = false;
-    }
+    UpdateStance(dt, in, onFoot, kindAt);
     BankEyeShift(EyeOffsetNow() - eyeBefore);
   }
   const Box b = CurrentBox();
@@ -899,6 +975,13 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
   if (in.Pressed(TB_JUMP) && jumpLockout <= 0.0f) {
     jumpBuffer = T().jumpBufferTime;
     jumpLockout = T().jumpRepressTime;
+  }
+  // SPACE GETS A PRONE BODY UP; it does not throw it into the air. The press
+  // is spent on the stance (stood up next tick, or as far up as the ceiling
+  // allows), never left in the buffer to fire as a jump once the body is up.
+  if (prone && jumpBuffer > 0.0f) {
+    stanceWant_ = kStand;
+    jumpBuffer = 0.0f;
   }
 
   // ---- water-edge mantle: drive the body onto the ledge it committed to ----
@@ -1237,12 +1320,18 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     // Crouched: no sprint, and the walk scaled down. A crouch is a deliberate
     // slow-and-low, and letting Shift sprint through it would make the box
     // shrink for free.
-    const bool sprint = in.Held(TB_SPRINT) && !crouching;
+    const bool sprint = in.Held(TB_SPRINT) && !crouching && !prone;
     float speed = ((sprint ? T().sprintSpeed : T().walkSpeed) / kVoxelMeters) *
                   wade * (speedScale > 0.0f ? speedScale : 0.0f) *
                   (crouching ? T().crouchSpeedScale : 1.0f);
     Vec3 wish = flatFwd * in.forward + right * in.strafe;
     wish.y = 0;
+    // The ASKED-FOR pace (player.h moveWish): backing up reads negative, so
+    // a stroke-clocked crawl plays its stroke in reverse and pushes.
+    moveWish = std::min(1.0f, std::sqrt(in.forward * in.forward +
+                                        in.strafe * in.strafe));
+    if (in.forward < 0.0f && -in.forward >= std::fabs(in.strafe))
+      moveWish = -moveWish;
     // UNDER WATER THE STROKE GOES WHERE YOU LOOK (2026-10-10). A swimmer
     // (three-quarters under, see `swimming`) steers in 3D: W while looking
     // down dives, looking up climbs, looking level holds depth. Only while
@@ -1552,10 +1641,10 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     // Cap the view offset at one step height. Anything bigger than a step is
     // not a step — a long fall resolved by the ground snap, a spawn, a shove —
     // and smearing the camera across it reads as lag, not smoothness.
-    // The crouch's eye drop goes through here too, so the cap must admit it
+    // The crouch and prone eye drops go through here too, so the cap must admit them
     // as well as a step: whichever of the two is larger.
     const float maxOff = std::max((float)kMaxStepUpVoxels,
-                                  BoxFor(false).yHi - BoxFor(true).yHi);
+                                  BoxFor(false).yHi - BoxFor(false, true).yHi);
     ClampViewSmooth(maxOff);
   }
 

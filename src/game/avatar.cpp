@@ -455,6 +455,8 @@ PoseInputs PlayerAvatar::AvatarPoseInputs(bool grounded,
   in.lookPitch = lookPitchGoal_;
   in.lookSpineShare = CurrentTuning().avatar.headLookSpine;
   in.crouch = crouchWant_;
+  in.haveMoveWish = true;
+  in.moveWish = moveWish_;
   in.hangActive = hangActive_;
   in.hangLip = hangLipW_;
   in.hangDir = hangDirW_;
@@ -576,6 +578,20 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     playerVel_ = player.vel;
     hangActive_ = player.hanging;
     crouchWant_ = player.crouching;
+    moveWish_ = player.moveWish;
+    // PRONE IS AN ACTIVITY (AnimStateRule::activity "prone", human.json): the
+    // rig's prone state, the army crawl, chosen whatever the limbs say --
+    // EXCEPT when the damage already has the body on the ground. A legless
+    // body is already crawling, and an armless legless one squirms; lying
+    // down on purpose must not swap either for a crawl with limbs it lacks.
+    // A rig with no "prone" state keeps its own posture (AnimSelectState
+    // finds no activity match and falls through to the damage rules).
+    anim_.activity.clear();
+    if (player.prone) {
+      const int dmg = AnimSelectState(skel_, anim_);
+      if (dmg < 0 || skel_.states[dmg].groundAlign <= 0.0f)
+        anim_.activity = "prone";
+    }
     // ...and the states that are airborne to the GAIT but must not play a
     // jump/fall pose. A hang and a mantle carry the weight on the hands, a
     // swimmer is carried by the water (the same argument the air CLOCK makes

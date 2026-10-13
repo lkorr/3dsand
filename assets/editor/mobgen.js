@@ -4922,10 +4922,17 @@ function buildStates() {
     { name: 'squirm', missing: ['legU.L', 'legU.R'],
       missingAny: ['armU.L', 'armU.R'],
       clip: 'squirm', speedScale: 0.12, disableGait: true, groundAlign: 1.0 },
+    // The crawl is an ARMY CRAWL that LURCHES (2026-10-12): every stroke is
+    // a pause while the elbow reaches, then one pull that drags the body
+    // (surge 1 = a full stop between strokes; surgeDwell = the pause's share
+    // of the stroke), and the playhead runs on the INPUT so the pause cannot
+    // stall its own stroke (anim.h AnimStateRule::surgeDwell / strokeClock).
     { name: 'crawl', missing: ['legU.L', 'legU.R'],
-      clip: 'crawl', speedScale: 0.3, disableGait: true, groundAlign: 1.0 },
+      clip: 'crawl', speedScale: 0.3, disableGait: true, groundAlign: 1.0,
+      surge: 1, surgeDwell: 0.4, surgePeak: 0.45, strokeClock: true },
     { name: 'crawl.shins', missing: ['legL.L', 'legL.R'],
-      clip: 'crawl', speedScale: 0.3, disableGait: true, groundAlign: 1.0 },
+      clip: 'crawl', speedScale: 0.3, disableGait: true, groundAlign: 1.0,
+      surge: 1, surgeDwell: 0.4, surgePeak: 0.45, strokeClock: true },
     // BOTH FEET GONE IS A STUMP WALK (2026-10-06). It was a crawl from
     // 96c86d5 until today: the hop before that was an upright bunny-bounce, so
     // the body went prone instead. Prone is right physically and wrong as
@@ -4972,6 +4979,12 @@ function buildStates() {
     // named array cannot say "remove this element").
     { name: 'sleep', activity: 'sleep', clip: 'sleep', speedScale: 0,
       disableGait: true, bodyYOffset: 0, groundAlign: 1.0 },
+    // PRONE ON PURPOSE (2026-10-12): the player holding Ctrl (Player::prone,
+    // avatar.cpp sets the activity) lies down and army-crawls -- the same
+    // clip and lurch as the legless crawl, at its own pace.
+    { name: 'prone', activity: 'prone', clip: 'crawl', speedScale: 0.25,
+      disableGait: true, bodyYOffset: 0, groundAlign: 1.0,
+      surge: 1, surgeDwell: 0.4, surgePeak: 0.45, strokeClock: true },
   ];
 }
 

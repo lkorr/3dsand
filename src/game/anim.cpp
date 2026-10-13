@@ -341,12 +341,15 @@ void AnimSampleAndBlend(const AnimSkeleton& sk, AnimState& st, float dt) {
     const AnimClip& c = sk.clips[inst.clip];
 
     // The playhead carries the instance's rate; the AGE does not — see the
-    // note on ClipInstance::rate. Clamped positive so a bad rate can stall a
-    // clip but never run it backwards through its own blend.
-    inst.timeMs += dt * 1000.0f * std::max(inst.rate, 0.0f);
+    // note on ClipInstance::rate. Clamped positive for a ONE-SHOT so a bad
+    // rate can stall it but never run it backwards through its own blend; a
+    // LOOP may run backwards (a stroke-clocked crawl backing up,
+    // AnimStateRule::strokeClock), and wraps at both ends.
+    inst.timeMs += dt * 1000.0f * (c.loop ? inst.rate : std::max(inst.rate, 0.0f));
     inst.ageMs += dt * 1000.0f;
     if (c.loop && c.durationMs > 0) {
       while (inst.timeMs >= (float)c.durationMs) inst.timeMs -= (float)c.durationMs;
+      while (inst.timeMs < 0.0f) inst.timeMs += (float)c.durationMs;
     } else if (c.durationMs > 0 && inst.timeMs >= (float)c.durationMs) {
       inst.timeMs = (float)c.durationMs;
       inst.stopping = true;

@@ -643,6 +643,8 @@ class PlayerAvatar : public Mob {
   // Mob::SyncStrideClock. `crouchWant_` below is the player's REQUEST, mirrored
   // from Player::crouching into PoseInputs::crouch.)
   bool crouchWant_ = false;
+  // Player::moveWish, mirrored into PoseInputs::moveWish (the stroke clock).
+  float moveWish_ = 0.0f;
 
   // Head look: the GOAL set by SetLook (the avatar's release-band policy).
   // The smoothed angles the rig is actually posed at are Mob::pose_'s, eased

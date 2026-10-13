@@ -43,6 +43,9 @@ PlayerState MakePlayerState(const PlayerSession& s, uint32_t tick,
 
   st.Set(PlayerState::kGrounded, p.grounded);
   st.Set(PlayerState::kCrouching, p.crouching);
+  st.Set(PlayerState::kProne, p.prone);
+  st.Set(PlayerState::kWishFwd, p.moveWish > 0.05f);
+  st.Set(PlayerState::kWishBack, p.moveWish < -0.05f);
   st.Set(PlayerState::kJumped, p.jumped);
   st.Set(PlayerState::kInLiquid, p.inLiquid);
   st.Set(PlayerState::kSwimming, p.swimming);
@@ -101,6 +104,10 @@ void RemotePlayer::Apply(const PlayerState& st) {
   ghost.vel = st.vel;
   ghost.grounded = st.Has(PlayerState::kGrounded);
   ghost.crouching = st.Has(PlayerState::kCrouching);
+  ghost.prone = st.Has(PlayerState::kProne);
+  ghost.moveWish = st.Has(PlayerState::kWishFwd)    ? 1.0f
+                   : st.Has(PlayerState::kWishBack) ? -1.0f
+                                                    : 0.0f;
   ghost.inLiquid = st.Has(PlayerState::kInLiquid);
   ghost.swimming = st.Has(PlayerState::kSwimming);
   ghost.fly = st.Has(PlayerState::kFly);

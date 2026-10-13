@@ -1039,17 +1039,22 @@ Status GatePlayerPlants(Ctx& c, std::string& detail) {
 // corridor with an exact number of free rows under a solid ceiling. Every
 // height here is read off the live tuning so the gate follows the knobs.
 //
-// Four claims, and the first one is the reason the box exists: a corridor
+// Five claims, and the first one is the reason the box exists: a corridor
 // exactly as tall as the STANDING box admits the body even though the
 // 17-row figure would not fit. Then: a corridor as tall as the CROUCH box
-// refuses the standing body, admits it crouched, keeps it crouched when
-// Ctrl is released under the ceiling, and stands it up once it walks out.
-// Then the crouch walk is slower by crouchSpeedScale, and the eye drops with
-// the box and never rises above it.
+// refuses the standing body, admits it crouched (a Ctrl TAP latches the
+// crouch), keeps it crouched when a second tap asks to stand under the
+// ceiling, and stands it up once it walks out. Then the crouch walk is slower
+// by crouchSpeedScale, and the eye drops with the box and never rises above
+// it. Last, THE STANCE MACHINE (Player::UpdateStance, 2026-10-12): a HOLD of
+// proneHoldTime goes prone, the prone box fits a corridor the crouch box does
+// not, a tap rises one stage (to the crouch) only where it fits, and Space
+// stands a prone body up instead of jumping it.
 Status GatePlayerCrouch(Ctx&, std::string& detail) {
   const Tuning::Player& tp = CurrentTuning().player;
   const int standRows = (int)std::ceil(tp.collisionHeight / kVoxelMeters - 1e-3f);
   const int crouchRows = (int)std::ceil(tp.crouchHeight / kVoxelMeters - 1e-3f);
+  const int proneRows = (int)std::ceil(tp.proneHeight / kVoxelMeters - 1e-3f);
   const int figureRows = (int)std::lround(2.0f * Player::kHalfY);
   auto corridor = [](int headroom) -> Player::KindFn {
     return [headroom](IVec3 c) {
@@ -1070,10 +1075,26 @@ Status GatePlayerCrouch(Ctx&, std::string& detail) {
                     int n) {
     for (int i = 0; i < n; i++) p.Update(dt, in, fwd, right, fwd, k);
   };
+  // A Ctrl TAP: one frame down (the press edge), released the next.
+  auto tap = [&](Player& p, const Player::KindFn& k, TickInput in) {
+    TickInput down = in;
+    down.SetHeld(TB_CROUCH, true);
+    down.SetPressed(TB_CROUCH, true);
+    frames(p, k, down, 1);
+    frames(p, k, in, 1);
+  };
+  // A Ctrl HOLD of `n` frames, then released.
+  auto hold = [&](Player& p, const Player::KindFn& k, TickInput in, int n) {
+    TickInput down = in;
+    down.SetHeld(TB_CROUCH, true);
+    down.SetPressed(TB_CROUCH, true);
+    frames(p, k, down, 1);
+    down.SetPressed(TB_CROUCH, false);
+    frames(p, k, down, n - 1);
+    frames(p, k, in, 1);
+  };
   TickInput walk;
   walk.forward = 1.0f;
-  TickInput crawl = walk;
-  crawl.SetHeld(TB_CROUCH, true);
   TickInput back;
   back.forward = -1.0f;
   TickInput rest;
@@ -1092,11 +1113,13 @@ Status GatePlayerCrouch(Ctx&, std::string& detail) {
   frames(b, low, walk, 180);
   const float bBlockedX = b.pos.x;
   const bool bRefused = bBlockedX < 150.0f;
-  frames(b, low, crawl, 300);
+  tap(b, low, walk);
+  frames(b, low, walk, 300);
   const float bInX = b.pos.x;
-  const bool bAdmitted = b.crouching && bInX > 156.0f;
+  const bool bAdmitted = b.crouching && !b.prone && bInX > 156.0f;
+  tap(b, low, rest);  // ask to stand: the ceiling is still there
   frames(b, low, rest, 30);
-  const bool bStuck = b.crouching;  // Ctrl released, ceiling still there
+  const bool bStuck = b.crouching;
   frames(b, low, back, 420);
   const bool bStood = !b.crouching && b.pos.x < 148.0f;
 
@@ -1107,9 +1130,11 @@ Status GatePlayerCrouch(Ctx&, std::string& detail) {
   const float x1 = c1.pos.x;
   frames(c1, open, walk, 60);
   const float standDist = c1.pos.x - x1;
-  frames(c2, open, crawl, 90);
+  frames(c2, open, rest, 2);
+  tap(c2, open, walk);
+  frames(c2, open, walk, 86);
   const float x2 = c2.pos.x;
-  frames(c2, open, crawl, 60);
+  frames(c2, open, walk, 60);
   const float crouchDist = c2.pos.x - x2;
   const float ratio = standDist > 1e-3f ? crouchDist / standDist : -1.0f;
   const bool cOk = std::abs(ratio - tp.crouchSpeedScale) < 0.1f;
@@ -1120,17 +1145,66 @@ Status GatePlayerCrouch(Ctx&, std::string& detail) {
   const bool dOk = c2.crouching && eyeStand - eyeCrouch > 1.0f &&
                    eyeCrouch < c2.BoxHeight() && eyeStand < c1.BoxHeight();
 
+  // (e) the stance machine. A hold released before proneHoldTime leaves the
+  // crouch the press took (it was not a tap from the crouch, so nothing
+  // toggles back); the next tap stands.
+  const int holdFrames = (int)std::ceil(tp.proneHoldTime / dt);
+  Player e = make();
+  frames(e, open, rest, 30);
+  hold(e, open, rest, std::max(2, holdFrames / 2));
+  const bool eShortCrouch = e.crouching && !e.prone;
+  tap(e, open, rest);
+  const bool eTapStood = !e.crouching && !e.prone;
+  // ...a full hold goes prone, with the prone box...
+  hold(e, open, rest, holdFrames + 6);
+  const bool eProne = e.prone && !e.crouching &&
+                      std::fabs(e.BoxHeight() - (float)proneRows) < 1.01f;
+  // ...a prone body gets under a ceiling the crouch box will not fit...
+  const Player::KindFn flat = corridor(std::max(proneRows, crouchRows - 3));
+  Player f = make();
+  frames(f, flat, rest, 30);
+  hold(f, flat, rest, holdFrames + 6);
+  frames(f, flat, walk, 900);
+  const bool fUnder = f.prone && f.pos.x > 156.0f;
+  // ...a tap under it does not rise (the crouch box is refused there)...
+  tap(f, flat, rest);
+  frames(f, flat, rest, 10);
+  const bool fStaysDown = f.prone;
+  // ...and once back out on open floor it finishes rising to the crouch it
+  // was asked for. Space from prone stands up and does NOT jump.
+  frames(f, flat, back, 900);
+  const bool fRoseToCrouch = f.crouching && !f.prone && f.pos.x < 148.0f;
+  Player g = make();
+  frames(g, open, rest, 30);
+  hold(g, open, rest, holdFrames + 6);
+  const bool gWasProne = g.prone;
+  TickInput jump = rest;
+  jump.SetHeld(TB_JUMP, true);
+  jump.SetPressed(TB_JUMP, true);
+  const float gY = g.pos.y;
+  frames(g, open, jump, 1);
+  frames(g, open, rest, 20);
+  const bool gStood = gWasProne && !g.prone && !g.crouching &&
+                      std::fabs(g.pos.y - gY) < 0.5f;
+  const bool eOk = eShortCrouch && eTapStood && eProne && fUnder &&
+                   fStaysDown && fRoseToCrouch && gStood;
+
   const bool ok = aIn && aTighterThanFigure && bRefused && bAdmitted &&
-                  bStuck && bStood && cOk && dOk;
-  char buf[360];
+                  bStuck && bStood && cOk && dOk && eOk;
+  char buf[640];
   std::snprintf(buf, sizeof(buf),
-                "rows stand=%d crouch=%d figure=%d; tall corridor x=%.1f "
-                "(want>156); low: standing x=%.1f (want<150) crouched x=%.1f "
-                "(want>156) stuck=%d stood=%d x=%.1f (want<148); speed ratio "
-                "%.2f (want %.2f); eye stand=%.1f crouch=%.1f",
-                standRows, crouchRows, figureRows, a.pos.x, bBlockedX, bInX,
-                bStuck ? 1 : 0, bStood ? 1 : 0, b.pos.x, ratio,
-                tp.crouchSpeedScale, eyeStand, eyeCrouch);
+                "rows stand=%d crouch=%d prone=%d figure=%d; tall corridor "
+                "x=%.1f (want>156); low: standing x=%.1f (want<150) crouched "
+                "x=%.1f (want>156) stuck=%d stood=%d x=%.1f (want<148); speed "
+                "ratio %.2f (want %.2f); eye stand=%.1f crouch=%.1f; stance: "
+                "short-hold crouch=%d tap-stand=%d prone=%d (box %.1f) "
+                "under=%d x=%.1f stays-down=%d rose-to-crouch=%d space-stood=%d",
+                standRows, crouchRows, proneRows, figureRows, a.pos.x,
+                bBlockedX, bInX, bStuck ? 1 : 0, bStood ? 1 : 0, b.pos.x, ratio,
+                tp.crouchSpeedScale, eyeStand, eyeCrouch, eShortCrouch ? 1 : 0,
+                eTapStood ? 1 : 0, eProne ? 1 : 0, e.BoxHeight(),
+                fUnder ? 1 : 0, f.pos.x, fStaysDown ? 1 : 0,
+                fRoseToCrouch ? 1 : 0, gStood ? 1 : 0);
   detail = buf;
   std::printf("player crouch: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
   return ok ? Status::Pass : Status::Fail;
@@ -1300,7 +1374,10 @@ TickInput TickInputScriptBlock(int block, uint32_t& edges, float& lookDx) {
   // SPRINT: held across a stretch, so the speed law changes mid-trajectory.
   in.SetHeld(TB_SPRINT, firstTick >= 40 && firstTick < 120);
   // CROUCH: held near the end, which also moves the collision box and the eye.
+  // Since 2026-10-12 the press EDGE is what crouches and the hold, kept up
+  // past player.proneHoldTime, goes prone — so this exercises both.
   in.SetHeld(TB_CROUCH, firstTick >= 240 && firstTick < 280);
+  if (firstTick == 240) edges |= TB_CROUCH;
   // JUMP: three presses, plus space HELD around each one (the ledge and swim
   // paths read the held bit, the buffer reads the edge).
   const bool jumpBlock = firstTick == 48 || firstTick == 96 || firstTick == 144;
