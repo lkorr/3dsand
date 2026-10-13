@@ -1268,6 +1268,61 @@ even against itself: A vs A2 59,513 px > 2). World hash unchanged
    7,950 particles live and the basin never fully settles, so the live box never
    empties and the march never sleeps while the camera is near.
 
+#### Handoff 2026-10-13 (agent a1384c, perf-debt item 7) — exact levers only
+
+**Re-measured.** `--fluid-bench hill`, main 9a573ad exe (`build/Release/
+sandvox.exe` copied to `sandvox_head.exe`), `SANDVOX_RUN_EXCLUSIVE=1`,
+frozen asset copy (`SANDVOX_ASSET_DIR=<copy of assets/>`, see the trap
+below), `SANDVOX_FLUID_VARIANTS=9 SANDVOX_FLUID_ARM_SHOTS=200,400`, n=1:
+`paired fluid arms (147 ticks, net of no-fluid 3.39 ms): full 2.734 coarse
+2.074 refine 2.248 thick 2.270 v9 2.694`. So the fluid draw is 2.73 ms today
+(not 3.17), against the 2.5 ms target, and the coarse march is 2.07 of it.
+`v9` is a variant no shader code reads: its distance from `full` (0.04 ms
+here, 0.13 in the next boot) is the in-process noise floor.
+
+**Pixel exactness cannot mean bit-identical images on this bench.** The same
+frame rendered twice in one tick (`v0` vs `v9`, no shader difference) differs
+in 1,361-5,879 pixels by at most 2 (shadow-cache / GI state advances between
+the arm renders). So exactness is proven at the MARCH instead: a VERIFY
+variant (bit 4 below) runs the lever and ALSO computes the skipped sample,
+and paints the pixel magenta (`fs()`, before the stage-4 heatmap) if any
+skipped sample's field was not < iso/4. Zero magenta pixels + an image diff
+no larger than the v0/v9 floor = exact on those frames.
+
+**Lever 1 tried: the dry-ring sample skip (exact, NO WIN, not landed).**
+A seam-ring chunk (class 2) has no node mass, so a sample whose whole tap box
+(x [bi.x, bi.x+1], z [bi.y, bi.y+1], y [cy-1, cy+1]) lies inside that chunk
+and touches only 4^3 blocks clear in the occupancy buffer's TOTAL sub-mask
+(`subOccIndex(slot, 0, w)`, already built by sim_occupancy/worldgen for
+ray_start) has field exactly 0 and can stride 1.25 without the twelve taps.
+No new buffer, WGSL-only (`raymarch.wgsl fluidTapsDry`, hooked after the
+class-2 shell test in both `fluidMarch` and `fluidMarchBlocky`, gated on
+`fluidVariant() & 5`). Result, same process, 147 tick pairs: `full 2.946
+coarse 2.171 refine 2.240 thick 2.338 v1 2.857 v5 3.163 v9 2.821` — the
+lever (v1) is inside the noise of the do-nothing arm (v9). Exactness: 0
+magenta pixels at ticks 200 and 400 (v5), v1 vs v0 differ by <= 1 like
+v0 vs v9. Code on branch `wip/perf-fluid` (one commit; the variant gates are
+still in, strip them if it is ever landed). The second boot of that pair was
+cancelled at wrap-up, so it is n=1.
+
+**Not tried: lever 2, the 2^3 super-cell near bit.** Trap for whoever does:
+JUMPING to a super-cell exit is not exact — the per-chunk walk's
+`fluidChunkExit` takes `max(..., t + 0.05)` nudges in fp corner cases, so
+the t sequence (and the 320-step budget's consumption) diverges; that is
+how the rejected multi-level Y jump changed 73 pixels. The exact form is an
+inner loop that repeats the SAME per-chunk `fluidChunkExit` stride while the
+near bit is clear, and charges each stride to the outer loop's `i` so the
+budget is identical; its gain is only the outer loop's per-iteration
+overhead on class-0 chunks (7.4 M of 19 M iterations at tick 200 in the
+2026-10-07 heatmap). Measure with `SANDVOX_FLUID_VARIANTS=<lever>,9` and a
+verify arm as above before trusting any number under ~0.15 ms.
+
+**Harness:** `scripts/perf/fluid_ab.sh <tag> <variants> [n]` (copies
+assets/tests to `build/perf/snap_<tag>` and runs the bench against the copy),
+`scripts/perf/bmpdiff.py a.bmp b.bmp`. **Trap:** the bench reads
+`assets/shaders/*.wgsl` at launch, so editing raymarch.wgsl while a run is
+queued silently tests the new shader; always run against a frozen copy.
+
 
 ## 10. Handoff rules for implementing agents
 

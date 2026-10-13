@@ -708,3 +708,45 @@ Open owner decisions:
 - The B, C, F and L trade-offs, as named in DESIGN.md.
 - Parallel carves across creatures. That changes the fight, because later
   probes in the same tick meet an earlier carve's rebuilt body.
+
+## Handoff 2026-10-13 (agent a1384c, perf-debt item 8): the "regression" is the machine, not the code
+
+**Question:** the mob side read 12.4-13.3 ms on main against round 4's 9.92
+(n=3, 2026-10-05). Is that a code regression since 28c8209?
+
+**Measured, same day, same harness, both exclusive** (`SANDVOX_RUN_EXCLUSIVE=1
+SANDVOX_MOBCAP_FIGHTS=3 --selftest --gate mob-cap64`, no sampling profiler):
+
+| ms per tick (mean of 3 fights) | 28c8209 (round 4), rebuilt today | main 9a573ad |
+|---|---|---|
+| mob side mean | 13.13 [11.80 .. 14.71] | 12.92 [12.56 .. 13.10] |
+| tick wall mean | 27.53 | 26.25 |
+| tick wall p95 | 36.45 | 33.31 |
+| Jolt Update | 2.36 | 2.05 |
+| stroke / stain / burnLimbs / shocks / woundStain | 4.00 / 2.06 / 1.58 / 1.24 / 0.55 | 3.55 / 2.13 / 1.96 / 1.17 / 0.53 |
+
+The round-4 commit itself, built and run today, reads 13.1 ms, not 9.9: every
+stage is ~25-30% slower than the 10-05 table (stroke 3.10 -> 4.00 on the SAME
+code), so the difference is the machine's state (other processes, clocks,
+thermals), not a commit. main is not slower than round 4 (-0.2 ms mob side,
+-1.3 ms tick). Stage moves between the two commits larger than the
+fight-to-fight spread: burnHeads +0.45 and burnLimbs +0.38 on main, stroke
+-0.44, sweep -0.42, carve -0.30; net mob side -0.21. No bisect was needed.
+(An earlier main run WITH `SANDVOX_SAMPLE_PROF=1` read 12.4-13.3 too, so the
+profiler is not the cause either.)
+
+**How it was run:** `git worktree add --detach _old28 28c8209` inside a
+worktree, `SANDVOX_DEPS=C:/sv-deps bash scripts/build.sh` there (compile
+436 s with sccache), run from `_old28` with its own compiled-in assets
+(`scripts/perf/mobcap_commit.sh <tree> <tag>` wraps it);
+`python scripts/perf/fightcmp.py old.log new.log` diffs the two
+`fights x3` tables. A second interleaved r4/main pair was cancelled at
+wrap-up, so this is one boot (three fights) per commit.
+
+**Next step:** the 10-05 number is not a code target. Before quoting any
+fight-64 number against 9.9, measure the round-4 exe and the candidate in the
+same session (owner's tuner/Chrome closed if possible). The targets (mob side
++ Jolt under 10, worst under 16) are still open; the `SANDVOX_SAMPLE_PROF=1`
+profile on main is flat (no self-time row above ~3%, 30% waits), so no
+behaviour-identical single fix stood out. Parallel carves across creatures
+stay an owner decision.
