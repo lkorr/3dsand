@@ -11883,6 +11883,10 @@ Status GateArrow(Ctx& c, std::string& detail) {
 //                     after.
 //   acid projectile   a coat, and the acid then eats what it sits on.
 //   lava projectile   a coat, and the wound burns (burn hp / fire / cells).
+//                     ...a DROP at x1: at most spellPierceSplashX1MaxCells
+//                     coated skin cells on the whole body; x0.25 still
+//                     lands; x4 coats spellPierceSplashX4MinRatio times more
+//                     (the splash's width grows linearly with the matter).
 //   sand bolt         a powder: a scour that stops in the first body.
 //   price             stone bolt > stone projectile > stone lob, by the kinetic
 //                     term; the NPC kits' words priced with it and without.
@@ -11962,7 +11966,48 @@ Status GateSpellPierce(Ctx& c, std::string& detail) {
     float hp0 = 0, hpHit = 0, hpEnd = 0, burnHp = 0;
     uint32_t vox0 = 0, voxHit = 0, voxEnd = 0;
     uint32_t coatHit = 0, fireEnd = 0;
+    // THE SPLASH'S FOOTPRINT, WHOLE BODY (owner 2026-10-13: "the lava splashed
+    // on the character is too wide"): coated cells on every limb and how many
+    // limbs wear any at the hit, then after the settle the coat left, what
+    // burnt (fire + the flesh/undercloth/hair/cloth burn chain) and what is
+    // gone -- so "the splash was wide" and "the fire spread" are two numbers.
+    uint32_t bodyCoatHit = 0, limbsCoatHit = 0, bodyCoatEnd = 0, bodyBurntEnd = 0;
+    uint32_t bodyVox0 = 0, bodyVoxEnd = 0;
+    // ...and at the SKIN's resolution: a drop-sized coat works on the fine
+    // lattice (1.25 cm) and can eat or sear there without taking a single
+    // cell of the coarse collider the `vox` counts above are made of.
+    uint32_t bodySkin0 = 0, bodySkinEnd = 0;
     int ticksToHit = -1;
+  };
+  // Every base limb of the fixture, summed: the splash is not the torso's.
+  auto bodySum = [&](uint64_t id, auto&& per) {
+    uint32_t n = 0;
+    const size_t nl = mobs.Defs()[human].limbs.size();
+    for (size_t li = 0; li < nl; li++) n += per(id, (int)li);
+    return n;
+  };
+  auto bodyCells = [&](uint64_t id) {
+    return bodySum(id, [&](uint64_t m, int li) { return mobs.LimbVoxelCount(m, li); });
+  };
+  // Live skin cells (a burn's material-0 tombstones are not skin).
+  auto bodySkin = [&](uint64_t id) {
+    return bodySum(id, [&](uint64_t m, int li) {
+      const uint32_t n = mobs.LimbSkinVoxelCount(m, li), dead = mobs.LimbMaterialCount(m, li, 0);
+      return n > dead ? n - dead : 0u;
+    });
+  };
+  std::vector<uint32_t> burntMats;
+  for (const char* nm : {"fire", "flesh_cooked", "flesh_burning", "flesh_charred",
+                         "undercloth_seared", "undercloth_burning", "undercloth_charred",
+                         "hair_burning", "cloth_burning", "cloth_charred"})
+    for (uint32_t i = 0; i < (uint32_t)c.mats.size(); i++)
+      if (c.mats[i].name == nm) burntMats.push_back(i);
+  auto bodyBurnt = [&](uint64_t id) {
+    return bodySum(id, [&](uint64_t m, int li) {
+      uint32_t k = 0;
+      for (uint32_t bm : burntMats) k += mobs.LimbMaterialCount(m, li, bm);
+      return k;
+    });
   };
   auto shoot = [&](const std::string& words, uint32_t coatMat) -> Shot {
     Shot s;
@@ -11995,6 +12040,8 @@ Status GateSpellPierce(Ctx& c, std::string& detail) {
     const Vec3 from = torsoC - side * 0.6f - front * 10.0f;
     s.hp0 = mobs.TotalHp(s.id);
     s.vox0 = mobs.LimbVoxelCount(s.id, s.torso);
+    s.bodyVox0 = bodyCells(s.id);
+    s.bodySkin0 = bodySkin(s.id);
     const CastList cl = speak(lib, words);
     CasterState cs;
     cs.mana = cs.manaMax = 1 << 20;
@@ -12018,10 +12065,25 @@ Status GateSpellPierce(Ctx& c, std::string& detail) {
     s.hpHit = mobs.TotalHp(s.id);
     s.voxHit = mobs.LimbVoxelCount(s.id, s.torso);
     s.coatHit = coatMat ? mobs.LimbCoatMatCount(s.id, s.torso, coatMat, 1) : 0;
+    if (coatMat) {
+      s.bodyCoatHit = bodySum(s.id, [&](uint64_t m, int li) {
+        return mobs.LimbCoatMatCount(m, li, coatMat, 1);
+      });
+      s.limbsCoatHit = bodySum(s.id, [&](uint64_t m, int li) {
+        return mobs.LimbCoatMatCount(m, li, coatMat, 1) > 0 ? 1u : 0u;
+      });
+    }
     support::RunTicks(rig, settle);
     s.hpEnd = mobs.TotalHp(s.id);
     s.voxEnd = mobs.LimbVoxelCount(s.id, s.torso);
     s.fireEnd = mobs.LimbMaterialCount(s.id, s.torso, matId("fire"));
+    if (coatMat)
+      s.bodyCoatEnd = bodySum(s.id, [&](uint64_t m, int li) {
+        return mobs.LimbCoatMatCount(m, li, coatMat, 1);
+      });
+    s.bodyBurntEnd = bodyBurnt(s.id);
+    s.bodyVoxEnd = bodyCells(s.id);
+    s.bodySkinEnd = bodySkin(s.id);
     if (const Mob* m = mobs.FindMobById(s.id)) s.burnHp = m->HpLostBy(DamageCause::Burn);
     spells.Clear();
     return s;
@@ -12045,7 +12107,17 @@ Status GateSpellPierce(Ctx& c, std::string& detail) {
         r.through ? Format(", OUT at %.1f m/s", r.exitSpeedMps).c_str() : "",
         r.depthVox * kVoxelMeters * 100.0f, r.cells, mats.empty() ? "none" : mats.c_str(),
         r.spentJ, r.hp, r.killed ? ", KILLED" : "", s.coatHit, settle, s.vox0, s.voxHit,
-        s.voxEnd, s.hp0, s.hpHit, s.hpEnd, s.burnHp, s.fireEnd);
+        s.voxEnd, s.hp0, s.hpHit, s.hpEnd, s.burnHp, s.fireEnd) +
+           (k == SpellMatterKind::Splash
+                ? Format("[splash coat %u r %.2f vox (%.1f cm): body coat %u cells on %u limbs "
+                         "at the hit, %u after %d ticks; burnt %u, body cells %u -> %u, "
+                         "skin %u -> %u]",
+                         s.log.shot.coatAmount, s.log.shot.splashRadius,
+                         s.log.shot.splashRadius * kVoxelMeters * 100.0f,
+                         s.bodyCoatHit, s.limbsCoatHit,
+                         s.bodyCoatEnd, settle, s.bodyBurntEnd, s.bodyVox0, s.bodyVoxEnd,
+                         s.bodySkin0, s.bodySkinEnd)
+                : std::string());
   };
 
   const uint32_t mWater = matId("water"), mAcid = matId("acid"), mLava = matId("lava");
@@ -12054,6 +12126,10 @@ Status GateSpellPierce(Ctx& c, std::string& detail) {
   const Shot water = shoot("water projectile", mWater);
   const Shot acid = shoot("acid projectile", mAcid);
   const Shot lava = shoot("lava projectile", mLava);
+  // ...and the same lava at the least and the most a page can scale one noun
+  // (x0.25, x4): the splash's growth with magnitude, end to end.
+  const Shot lavaDrop = shoot("lava@0.25 projectile", mLava);
+  const Shot lavaBig = shoot("lava@4 projectile", mLava);
   const Shot sand = shoot("sand bolt", 0);
   const Shot again = shoot("stone bolt", 0);
   lines += "STONE PROJECTILE " + describe(stoneP) + " | ";
@@ -12061,6 +12137,8 @@ Status GateSpellPierce(Ctx& c, std::string& detail) {
   lines += "WATER " + describe(water) + " | ";
   lines += "ACID " + describe(acid) + " | ";
   lines += "LAVA " + describe(lava) + " | ";
+  lines += "LAVA x0.25 " + describe(lavaDrop) + " | ";
+  lines += "LAVA x4 " + describe(lavaBig) + " | ";
   lines += "SAND BOLT " + describe(sand) + " | ";
 
   auto hitTorso = [&](const Shot& s, SpellMatterKind k, const char* nm) {
@@ -12105,19 +12183,49 @@ Status GateSpellPierce(Ctx& c, std::string& detail) {
     if (acid.log.r.coated == 0) fail("acid: no coat on the skin");
     if (acid.log.r.cells != 0 || acid.voxHit != acid.vox0)
       fail("acid PENETRATED (a liquid never makes a channel)");
+    // Eaten at EITHER resolution: a drop-sized coat (x1, ~2 cm) eats the fine
+    // skin it sits on and may not take one coarse collider cell in 2 s.
     const uint32_t eaten = acid.vox0 > acid.voxEnd ? acid.vox0 - acid.voxEnd : 0;
+    const uint32_t skinEaten =
+        acid.bodySkin0 > acid.bodySkinEnd ? acid.bodySkin0 - acid.bodySkinEnd : 0;
     if ((float)eaten < (float)BaselineNumber("spellPierceAcidMinEaten", 1) &&
+        (float)skinEaten < (float)BaselineNumber("spellPierceAcidMinEaten", 1) &&
         acid.burnHp <= 0.0f)
       fail(Format("acid: the coat ate nothing in %d ticks", settle));
     RecordObserved("spellPierceAcidEaten", (double)eaten);
+    RecordObserved("spellPierceAcidSkinEaten", (double)skinEaten);
   }
   if (hitTorso(lava, SpellMatterKind::Splash, "lava projectile")) {
     if (lava.log.r.coated == 0) fail("lava: no coat on the skin");
+    // ...and the same for the burn: seared (the flesh chain, fire) or lost
+    // skin under a drop counts as a burn at the wound.
     const uint32_t lost = lava.vox0 > lava.voxEnd ? lava.vox0 - lava.voxEnd : 0;
+    const uint32_t skinLost =
+        lava.bodySkin0 > lava.bodySkinEnd ? lava.bodySkin0 - lava.bodySkinEnd : 0;
     if (lava.burnHp < (float)BaselineNumber("spellPierceLavaMinBurnHp", 0.01) &&
-        lava.fireEnd == 0 && lost == 0)
+        lava.fireEnd == 0 && lost == 0 && skinLost == 0 && lava.bodyBurntEnd == 0)
       fail(Format("lava: no burn at the wound in %d ticks", settle));
     RecordObserved("spellPierceLavaBurnHp", (double)lava.burnHp);
+    // A ONE-VOXEL SPLASH IS A DROP, NOT A DRENCH (owner 2026-10-13): the coat
+    // a x1 lava projectile lays on the whole body at the hit is bounded, and
+    // the cast scaled to x4 lays strictly more -- the width grows with the
+    // magnitude (glyphs.json splashRadiusMille, SplashRadiusMille).
+    RecordObserved("spellPierceSplashX1Cells", (double)lava.bodyCoatHit);
+    const double x1Max = BaselineNumber("spellPierceSplashX1MaxCells", 40);
+    if ((double)lava.bodyCoatHit > x1Max)
+      fail(Format("lava x1: the splash coated %u cells (ceiling %.0f) -- too wide for one "
+                  "voxel of matter",
+                  lava.bodyCoatHit, x1Max));
+  }
+  if (hitTorso(lavaDrop, SpellMatterKind::Splash, "lava x0.25") && lavaDrop.log.r.coated == 0)
+    fail("lava x0.25: no coat at all (the smallest splash must still land)");
+  if (hitTorso(lavaBig, SpellMatterKind::Splash, "lava x4")) {
+    RecordObserved("spellPierceSplashX4Cells", (double)lavaBig.bodyCoatHit);
+    const double grow = BaselineNumber("spellPierceSplashX4MinRatio", 4.0);
+    if ((double)lavaBig.bodyCoatHit < grow * (double)std::max(1u, lava.bodyCoatHit))
+      fail(Format("lava x4: coated %u cells, under %.1fx the x1 splash's %u -- the width does "
+                  "not grow with the magnitude",
+                  lavaBig.bodyCoatHit, grow, lava.bodyCoatHit));
   }
   // ---- powder: a scour, never a channel through ------------------------------
   if (hitTorso(sand, SpellMatterKind::Scour, "sand bolt") && sand.log.r.through)

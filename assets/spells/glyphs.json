@@ -22,13 +22,14 @@
       "kinetic": 100
     },
     "matterProjectile": {
-      "comment": "THE MATTER IS THE PROJECTILE (docs/PLAN_projectiles.md decision 3, package D; game/spell.h FlightMatter). lumpMl: mL of matter a flight carries per unit of matter scale, so its mass is this x materials.json density (stone 0.65 kg, steel 1.95 kg, water 0.25 kg); the spray it leaves where it stops is still sprayVoxels. pierceBodyMille: what each `pierce` word adds to that energy against BODIES, per mille (it keeps its one-wall terrain role). powderSharpMille / powderTipMille: a powder lump is blunter and wider than the delivery's point, and scourBins caps what it can spend at that many bins of skin-hard matter -- a scour, never a channel. splashRadiusMille: the coat disc a liquid lays on the skin it hits, world voxels x 1000 at x1 (grows as the cube root of the matter scale).",
+      "comment": "THE MATTER IS THE PROJECTILE (docs/PLAN_projectiles.md decision 3, package D; game/spell.h FlightMatter). lumpMl: mL of matter a flight carries per unit of matter scale, so its mass is this x materials.json density (stone 0.65 kg, steel 1.95 kg, water 0.25 kg); the spray it leaves where it stops is still sprayVoxels. pierceBodyMille: what each `pierce` word adds to that energy against BODIES, per mille (it keeps its one-wall terrain role). powderSharpMille / powderTipMille: a powder lump is blunter and wider than the delivery's point, and scourBins caps what it can spend at that many bins of skin-hard matter -- a scour, never a channel. splashRadiusMille: the coat disc a liquid lays on the skin it hits, world voxels x 1000 at x1, growing LINEARLY with the matter scale (game/spell.cpp SplashRadiusMille; floor 100 = the skin column the ray met, a cell or two) up to splashRadiusMaxMille. 200 = a 2 cm drop for one voxel of lava, 8 cm at x4, the 30 cm ceiling at x15 (owner 2026-10-13: a one-voxel splash is a drop, only a big cast drenches; it was 1200 growing as the cube root, 596 skin cells at x1).",
       "lumpMl": 250,
       "pierceBodyMille": 1000,
       "powderSharpMille": 400,
       "powderTipMille": 2000,
       "scourBins": 2,
-      "splashRadiusMille": 1200
+      "splashRadiusMille": 200,
+      "splashRadiusMaxMille": 3000
     },
     "anythingSurchargeMille": 500,
     "maxStatusTicks": 900,

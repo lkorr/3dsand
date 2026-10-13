@@ -523,10 +523,14 @@ struct SpellBudgets {
   int32_t powderTipMille = 2000;
   int32_t scourBins = 2;
   // A LIQUID (or a gas that can coat) never penetrates: it SPLASHES a disc of
-  // this radius (world voxels x 1000 at x1, growing as the cube root of the
-  // matter scale) onto the skin it hits, at the material's own authored
-  // stain amount x the matter scale (capped at a full coat).
-  int32_t splashRadiusMille = 1200;
+  // this radius (world voxels x 1000 at x1) onto the skin it hits, at the
+  // material's own authored stain amount x the matter scale (capped at a full
+  // coat). The radius grows LINEARLY with the matter scale (SplashRadiusMille)
+  // up to `splashRadiusMaxMille`: one voxel of lava is a drop a few skin cells
+  // across, only a big cast drenches (owner, 2026-10-13 -- it was 12 cm at x1,
+  // growing as the cube root, and 596 skin cells for one voxel of matter).
+  int32_t splashRadiusMille = 200;
+  int32_t splashRadiusMaxMille = 3000;
   // ---- sustained (plan §7), P3 ----------------------------------------------
   int32_t maxStatusTicks = 900;
   int32_t maxStatusPerCaster = 4;
@@ -1112,6 +1116,12 @@ struct SpellMatter {
 // lanes excluded -- call it with the INSTANCE's payload (InstanceCast).
 SpellMatter FlightMatter(const GlyphLibrary& lib, const DeliveryRec& d,
                          const std::vector<EffectInst>& payload);
+// The coat disc a Splash lays on a body, world voxels x 1000, for a core of
+// matter scale `sMille` (n x magnitude, per-mille): budgets.splashRadiusMille
+// x the scale, LINEAR, floored at kSplashRadiusFloorMille and capped at
+// budgets.splashRadiusMaxMille. Integer only (thesis 3).
+inline constexpr int32_t kSplashRadiusFloorMille = 100;
+int32_t SplashRadiusMille(const SpellBudgets& b, int32_t sMille);
 // A record's launch speed in m/s (24.8 fixed voxels per 30 Hz tick).
 float SpellSpeedMps(int32_t speedFx);
 // THE KINETIC TERM of one flight instance, in mana: 1/2 m v^2 at the record's

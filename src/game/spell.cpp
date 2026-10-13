@@ -741,6 +741,7 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
       rm("powderTipMille", b.powderTipMille);
       rm("scourBins", b.scourBins);
       rm("splashRadiusMille", b.splashRadiusMille);
+      rm("splashRadiusMaxMille", b.splashRadiusMaxMille);
     }
   }
   // Rule 2: these are hard engine ceilings, so a content edit cannot author an
@@ -770,7 +771,8 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
   b.powderSharpMille = ClampI(b.powderSharpMille, 1, 1000);
   b.powderTipMille = ClampI(b.powderTipMille, 250, 8000);
   b.scourBins = ClampI(b.scourBins, 1, 16);
-  b.splashRadiusMille = ClampI(b.splashRadiusMille, 100, 8000);
+  b.splashRadiusMille = ClampI(b.splashRadiusMille, 25, 8000);
+  b.splashRadiusMaxMille = ClampI(b.splashRadiusMaxMille, kSplashRadiusFloorMille, 16000);
   b.anythingSurchargeMille = ClampI(b.anythingSurchargeMille, 0, 10000);
   b.maxStatusTicks = ClampI(b.maxStatusTicks, 1, 18000);
   b.maxStatusPerCaster = ClampI(b.maxStatusPerCaster, 1, 32);
@@ -2324,6 +2326,26 @@ SpellMatter FlightMatter(const GlyphLibrary& lib, const DeliveryRec& d,
   else if (mp.klass == CLASS_POWDER) m.kind = SpellMatterKind::Scour;
   else m.kind = mp.coatAmount ? SpellMatterKind::Splash : SpellMatterKind::Touch;
   return m;
+}
+
+// THE SPLASH'S WIDTH GROWS LINEARLY WITH THE MATTER (owner, 2026-10-13: "low
+// strength projectiles (1 voxel) should be super super small and concentrated
+// unless the magnitude is really high"). It grew as the CUBE ROOT from 1.2
+// voxels, the law the terrain radii use (a ball of n voxels spans cbrt(n)) --
+// which made one voxel of lava a 24 cm disc of 596 skin cells, and x4 only
+// 1.6 times wider. A splash is not a ball. The coat it lays is at the
+// matter's authored depth, saturating at a full coat by about x1.5, so past
+// that every extra unit of matter can only be AREA: volume conservation alone
+// says r ~ sqrt(scale). Linear is faster than that on purpose -- a heavier
+// lump also arrives harder and spatters -- so a drop stays a drop and a
+// big cast reads as a drench: x0.25 the floor (a cell or two), x1 2 cm,
+// x4 8 cm, x15 the ceiling. The floor keeps the disc wide enough to reach the
+// skin column the ray met (the farthest a point is from a fine-cell column
+// centre is half its diagonal, 0.09 voxel at the human's 8 cells per voxel).
+int32_t SplashRadiusMille(const SpellBudgets& b, int32_t sMille) {
+  const int64_t r = ((int64_t)b.splashRadiusMille * std::max(sMille, 0) + 500) / 1000;
+  const int64_t hi = std::max(b.splashRadiusMaxMille, kSplashRadiusFloorMille);
+  return (int32_t)std::clamp<int64_t>(r, kSplashRadiusFloorMille, hi);
 }
 
 float SpellSpeedMps(int32_t speedFx) {
@@ -4957,8 +4979,7 @@ void SpellSystem::Tick(uint32_t tick, World& world,
                   ? 0u
                   : (uint32_t)ClampI(
                         (int32_t)(((int64_t)mp.coatAmount * mt.scaleMille + 500) / 1000), 1, 15);
-          shot.splashRadius =
-              (float)ScaleRadiusCbrtMille(bud.splashRadiusMille, mt.scaleMille) / 1000.0f;
+          shot.splashRadius = (float)SplashRadiusMille(bud, mt.scaleMille) / 1000.0f;
           shot.seed = Hash3(p.seq, tick, (uint32_t)p.casterId);
           shot.tick = tick;
           SpellBodyStrike r;
