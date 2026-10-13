@@ -1451,27 +1451,53 @@ void World::SeedCacheFromMirror(const WorldSnapshot& s) {
   // matter-bearing (so not SkyKnown) and each held by UntunnelRig for the
   // fetch's ~5 ticks -- the body froze in mid-air beside the face.
   //
-  // ABSENT ENTRIES ONLY. A chunk already cached keeps the version its
-  // consumers asked for and are tracking (ManageTerrain rebuilds on a version
-  // change; refreshing all 27 every tick would re-gather 27 patches a tick for
-  // nothing). The cost is 27 lookups per publish and a 16 KiB copy per chunk
-  // the mirror newly covers.
+  // A CHUNK ALREADY CACHED IS REFRESHED ONLY WHEN ITS MATTER CHANGED. Its
+  // consumers track the version (ManageTerrain rebuilds on a version change),
+  // so bumping all 27 every tick would re-gather 27 patches a tick for
+  // nothing; the compare ignores the tick stamp + excite scratch (bits 16-23),
+  // which move every tick in an active chunk without the matter moving.
+  //
+  // It USED to be absent entries only, and that froze the first copy for
+  // good: nothing else refreshes a settled chunk (ManageTerrain's refresh is
+  // dirty-gated and only around bodies, a ground probe fetches only on a
+  // miss). So matter laid into the mirror AFTER its first publish -- a
+  // fixture pad, a wall the player builds, a pit dug -- never reached the
+  // cache, and every creature standing there read the dead copy: the demon
+  // gates' imps and humans fell 20 voxels through a stone pad to the chunk
+  // below it (2026-10-12; demon-cast/-circle/-contract/-malice). A refresh is
+  // exactly a fetch landing (same post-tick words, same version rule), at
+  // most once per kMirrorRefreshTicks per chunk so a burning chunk does not
+  // re-version every tick.
   if (!s.valid || s.mirror.size() < (size_t)27 * kChunkVol) return;
   static const bool kOff = [] {
     const char* e = std::getenv("SANDVOX_NO_MIRROR_SEED");
     return e != nullptr && e[0] != '0';
   }();
   if (kOff) return;
+  constexpr uint32_t kMirrorRefreshTicks = 4;
+  constexpr uint32_t kMatterMask = 0xFF00FFFFu;   // all but stamp + excite scratch
   for (int dz = 0; dz < 3; dz++)
     for (int dy = 0; dy < 3; dy++)
       for (int dx = 0; dx < 3; dx++) {
         const IVec3 wc{s.mirrorBase.x + dx, s.mirrorBase.y + dy, s.mirrorBase.z + dz};
         const uint64_t key = PackChunkKey(wc);
+        const uint32_t* src = s.mirror.data() + (size_t)((dz * 3 + dy) * 3 + dx) * kChunkVol;
         auto it = cache_.find(key);
-        if (it != cache_.end() && it->second.voxels.size() == kChunkVol) continue;
+        if (it != cache_.end() && it->second.voxels.size() == kChunkVol) {
+          CachedChunk& cc = it->second;
+          if (cc.version >= s.tick || s.tick - cc.version < kMirrorRefreshTicks) continue;
+          const uint32_t* have = cc.voxels.data();
+          if (std::memcmp(have, src, (size_t)kChunkVol * 4) == 0) continue;
+          bool moved = false;
+          for (uint32_t i = 0; i < kChunkVol && !moved; i++)
+            moved = ((have[i] ^ src[i]) & kMatterMask) != 0u;
+          if (!moved) continue;
+          cc.version = s.tick;
+          cc.voxels.assign(src, src + kChunkVol);
+          continue;
+        }
         CachedChunk& cc = cache_[key];
         cc.version = s.tick;
-        const uint32_t* src = s.mirror.data() + (size_t)((dz * 3 + dy) * 3 + dx) * kChunkVol;
         cc.voxels.assign(src, src + kChunkVol);
       }
 }

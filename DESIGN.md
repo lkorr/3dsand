@@ -7958,8 +7958,13 @@ neighbors, so this needs an explicit connectivity pass:
        every published snapshot's 27 mirror chunks go into the cache where it
        holds no copy yet. The mirror leads a moving body (`MirrorLeadChunk`),
        so the chunks a falling rig enters arrive with no fetch round trip.
-       Absent entries only, so no consumer sees a version churn.
-       `SANDVOX_NO_MIRROR_SEED=1` is the A/B arm.
+       A chunk already cached is re-copied only when its MATTER differs from
+       the mirror's (stamp + excite bits ignored), at most once per 4 ticks,
+       so no consumer sees a version churn from a merely active chunk. (Until
+       2026-10-12 it was absent entries only, which froze the first copy: a
+       pad, wall or pit made in the mirror after its first publish never
+       reached the cache, and the demon gates' bodies fell through a stone
+       pad to the chunk below.) `SANDVOX_NO_MIRROR_SEED=1` is the A/B arm.
      - **One known-sky verdict per tick**: a chunk the sweep skipped as
        `SkyKnown` stays vouched for the step it clamps, even if the snapshot
        published in between shows matter there (a rig's own blood spray).
