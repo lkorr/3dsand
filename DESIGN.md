@@ -7395,7 +7395,11 @@ neighbors, so this needs an explicit connectivity pass:
      gas voxel with at most `sim.gasThinNeighbors` (2) gas face-neighbours --
      counted from camask's gas plane, a face in another chunk counts as gas --
      rolls its own fade-to-air rules at that multiple. Plume cores are
-     untouched; the haze they shed goes sooner. At 3: village (perf) gas cells
+     untouched; the haze they shed goes sooner. Exempt: heavy gases, heat
+     emitters, and electric SOURCES (spark / arc / lightning) -- a discharge
+     is laid thin, and x3 on its 450-700 per-mille decay is a certainty, so
+     from 2026-10-06 to 10-12 every discharge vanished before the charge
+     field could read it (every elec gate dark). At 3: village (perf) gas cells
      run -32%, awake chunks 3,802 -> 3,497, CA 12.38 -> 11.52, raymarch 11.92
      -> 10.60, frame p50 30.3 -> 27.5 ms; forest CA 5.37 -> 5.09, p50 20.2 ->
      19.8 (its smoke was never the cost). On the `--render-budget` village and
