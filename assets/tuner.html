@@ -8829,12 +8829,12 @@ const ARCH_NODES={
     details:'Measured 2026-10-08 at 2560x1440, RTX 3060 Ti: the <code>peaksea</code> camera (the massif 10 km off) costs ~0.14 ms for the pyramid walk; <code>summit</code> within noise. Look frames <code>screenshot_peaks_valley</code> / <code>_summit</code> / <code>_sea10k</code>.'},
 
   terrainLight:{label:'Terrain Light + Clouds vs Terrain (map v2 S1)',tag:'render',
-    desc:'Terrain light map (2026-10-08; horizon_light.wgsl): per horizon-pyramid sample the SUN&rsquo;S HORIZON in the key light&rsquo;s azimuth (blocker top + distance, so a receiver at any height is tested) and the SKY VISIBILITY over eight azimuths; rebuilt only when the sun&rsquo;s azimuth turns (~0.25&deg;), the sky once per upload. Ridges shade valleys at map scale (horizon, cascade and near field), gorges lose sky light; clouds stop at the terrain (deckSpan against the AVG ground) so summits stand veiled in the deck; snow above the lapse-rate freezing level.',
+    desc:'Terrain light map (2026-10-08; horizon_light.wgsl): per horizon-pyramid sample the SUN&rsquo;S HORIZON in the key light&rsquo;s azimuth (blocker top + distance, so a receiver at any height is tested) and the SKY VISIBILITY over eight azimuths; rebuilt only when the sun&rsquo;s azimuth turns (~0.25&deg;), spread over 8 frames (one slice of the samples each, 2026-10-13: worst frame 1.3-3.1 &rarr; 1.3-1.5 ms), the sky once per upload. Ridges shade valleys at map scale (horizon, cascade and near field), gorges lose sky light; clouds stop at the terrain (deckSpan against the AVG ground) so summits stand veiled in the deck; snow above the lapse-rate freezing level.',
     files:['assets/shaders/horizon_light.wgsl','assets/shaders/cloud.wgsl','assets/shaders/raymarch.wgsl','src/sim/horizon.h'],
     sym:['hzSunVis','hzSunShade','hzSkyVis','terrainHitM','deckSpan','cloudSunAtM'],
     tst:['clouds'],
     doc:['DESIGN.md','docs/PLAN_map_v2.md'],
-    wip:'Sun rebuild spike ~3 ms ~1/s while the azimuth turns; raster bodies (debris / microbodies) ignore the terrain shadow; sea LOD-handoff seam (shadeWater vs shadeFarWater).'},
+    wip:'Raster bodies (debris / microbodies) ignore the terrain shadow; sea LOD-handoff seam (shadeWater vs shadeFarWater).'},
 
   tallTerrainPerf:{label:'Tall-Terrain Perf (map v2 P1)',tag:'gen',
     desc:'Tall terrain perf (2026-10-08): a per-column cactus bound (cactusColTop) so a high treeline does not hold every desert column&rsquo;s sky open; buried far rows skip genCellIn (provably identical, hash unmoved); sky tiles in ray_start (a coarse grid of sky ceilings per level, so one peak does not raise every ray&rsquo;s); the peaks-route perf scenario (--perf --scenario peaks-route: summit &rarr; gorge &rarr; high valley).',

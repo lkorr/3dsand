@@ -120,13 +120,19 @@ enum : uint32_t {
 //       angles in kSkyDirs azimuths (mean of cos^2 of each horizon angle).
 // Both march the pyramid from kLightMinDistSamples samples out: the near
 // field's own shadow cache and openness grid own the first ~50 m.
-// Header (kLightHeaderWords): words written by the KERNELS, never the CPU
-// (a CPU write lands at the head of the NEXT command buffer):
+// Header (kLightHeaderWords): words written by the KERNELS, never by a
+// Queue::WriteBuffer (that lands at the head of the NEXT command buffer):
 enum : uint32_t {
   kLSkyValid = 0,    // 1 = w1 holds this map's sky visibility
   kLSunValid = 1,    // 1 = w0 holds a sun horizon
   kLSunDirX = 2,     // f32: the key light azimuth (unit xz) w0 was built for
   kLSunDirZ = 3,
+  // u32: which SLICE of the samples this frame's hz_sun dispatch fills (the
+  // rebuild is spread over Simulation::kHzSunSlices frames). The one header
+  // word the CPU sets, and it sets it IN the recording command buffer
+  // (FillTracked, just before the ShadowCache table), never by a deferred
+  // write, so the dispatch that reads it is the one it was meant for.
+  kLSunSlice = 4,
   kLightHeaderWords = 8,
   kLightDistUnit = 8,        // voxels per w0 distance unit (65534 x 8 = 52 km)
   kLightMinDistSamples = 2,  // the first sample out the march looks at

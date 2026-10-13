@@ -18386,7 +18386,20 @@ once per pyramid upload (a function of the map alone) and `hz_sun` when the
 key light's AZIMUTH has turned more than 0.0044 rad (~0.25 deg: a ridge's
 edge 5 km off moves under one sample) since the last build -- the sun RISING
 needs no rebuild, the per-pixel compare takes the elevation from the uniform.
-A frame that rebuilds nothing records neither row. **Readers** (raymarch.wgsl
+A frame that rebuilds nothing records neither row. **The sun rebuild is
+SLICED (2026-10-13):** a turn past the threshold starts a cycle of
+`Simulation::kHzSunSlices` (8) frames, each dispatching one eighth of the
+samples (the slice index is `horizon.h` `kLSunSlice`, written by a
+`FillTracked` in the same command buffer as the dispatch, never a deferred
+`WriteBuffer`); the first build after an upload stays whole, and a sky
+rebuild frame (which owns the shared extent) defers the slice a frame.
+`SANDVOX_HZ_SUN_SLICES=1` is the one-frame arm. Measured standing at the
+2026-10-11_12-10-09 camera, 1,200 frames, n=3 per arm, one exe: whole =
+65-67 rebuilds, median 0.77 ms, worst frame 2.42 / 3.13 / 1.35 ms; sliced =
+269-306 slices, median 0.22 ms, worst frame 1.35 / 1.32 / 1.48 ms; total
+hz_sun GPU 0.049-0.052 ms a frame in both (one sliced run 0.094). A slice
+is a dispatch of ~1,350 workgroups, which is about one wave of the GPU, so
+its time is the march's latency rather than an eighth of the whole. **Readers** (raymarch.wgsl
 `hzSunVis` / `hzSunShade` / `hzSkyVis`, bilinear over four samples, each
 evaluated for the receiver's own height; 1 = no opinion outside the grid,
 before the first build or with `render.horizon` off): the horizon hit (its

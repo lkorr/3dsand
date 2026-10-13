@@ -62,6 +62,9 @@ const HZ_L_SKY_VALID : u32 = 0u;
 const HZ_L_SUN_VALID : u32 = 1u;
 const HZ_L_SUN_DIR_X : u32 = 2u;
 const HZ_L_SUN_DIR_Z : u32 = 3u;
+// horizon.h kLSunSlice: the slice of the samples this hz_sun dispatch fills
+// (CPU-filled in this command buffer; 0 for a whole build).
+const HZ_L_SUN_SLICE : u32 = 4u;
 const HZ_L_HDR : u32 = 8u;
 const HZ_L_DIST_UNIT : f32 = 8.0;
 const HZ_L_MIN_DIST : f32 = 2.0;
@@ -163,11 +166,19 @@ fn hzSky(@builtin(global_invocation_id) gid : vec3<u32>) {
   hzLight[HZ_L_HDR + 2u * idx + 1u] = bitcast<u32>(vis / f32(HZ_L_SKY_DIRS));
 }
 
+// SLICED (2026-10-13). A whole rebuild is one thread per sample, ~3 ms on the
+// shipped map, and it landed on ONE frame about once a second while the sun's
+// azimuth turned. The CPU now dispatches a slice of the samples per frame
+// (Simulation::EncodeShadowResolve, kHzSunSlices): slice s covers samples
+// [s * span, (s + 1) * span), span = this dispatch's thread count. A sample is
+// at most kHzSunSlices frames older than its neighbour across a slice edge,
+// against an azimuth threshold whose edge already moves ~22 m per rebuild.
 @compute @workgroup_size(64)
-fn hzSun(@builtin(global_invocation_id) gid : vec3<u32>) {
+fn hzSun(@builtin(global_invocation_id) gid : vec3<u32>,
+         @builtin(num_workgroups) nwg : vec3<u32>) {
   if (horizon[HZ_H_VALID] == 0u) { return; }
   let n = hzN();
-  let idx = gid.x;
+  let idx = gid.x + hzLight[HZ_L_SUN_SLICE] * nwg.x * 64u;
   if (idx >= u32(n.x * n.y)) { return; }
   let L = keyLightDirP(R);
   var dir = vec2f(1.0, 0.0);

@@ -1267,6 +1267,15 @@ class Simulation {
   bool hzSkyDue_ = false;
   bool hzSunBuilt_ = false;
   float hzSunAz_[2] = {0.0f, 0.0f};
+  // The sun rebuild in SLICES (horizon_light.wgsl hzSun): a turn past the
+  // threshold starts a cycle of hzSunSlices_ frames, each filling one slice of
+  // the samples; hzSunSliceNext_ is the slice the next frame fills (0 when
+  // idle). The first build after an upload stays whole: until it runs there is
+  // no sun horizon at all. SANDVOX_HZ_SUN_SLICES=1 is the one-frame arm.
+  static constexpr uint32_t kHzSunSlices = 8;
+  uint32_t hzSunSlices_ = 0;       // resolved from the env on first use
+  uint32_t hzSunSliceNext_ = 0;
+  bool hzSunCycle_ = false;
   bool renderBGBuilt_ = false;
   // The GI gather request list (gi_gather.wgsl; pass_table.h kGiReq*): fixed
   // size, zeroed at Init (the dedup bitmap must start empty). 28 in

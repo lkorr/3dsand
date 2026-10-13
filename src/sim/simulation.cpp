@@ -1532,6 +1532,8 @@ void Simulation::UploadHorizon(const rhi::Device& device, const rhi::Queue& queu
   hzSamples_ = words[horizon::kHValid] != 0u ? words[horizon::kHNX] * words[horizon::kHNZ] : 0u;
   hzSkyDue_ = hzSamples_ > 0;
   hzSunBuilt_ = false;
+  hzSunCycle_ = false;
+  hzSunSliceNext_ = 0;
   bool rebind = false;
   if (lightWords > hzLightWords_) {
     hzLightWords_ = lightWords;
@@ -3428,10 +3430,17 @@ void Simulation::EncodeShadowResolve(const rhi::CommandEncoder& enc) {
     // ~0.25 deg: a ridge's shadow edge 5 km off moves ~22 m (under one
     // 25.6 m sample) between builds.
     constexpr float kHzSunTurnRad = 0.0044f;
-    cx.hzGx = std::min<uint32_t>((hzSamples_ + 63) / 64, 65535u);
+    const uint32_t fullGx = std::min<uint32_t>((hzSamples_ + 63) / 64, 65535u);
+    cx.hzGx = fullGx;
+    bool skyNow = false;
     if (hzSkyDue_) {
       cx.cloudFlags |= 16u;
       hzSkyDue_ = false;
+      skyNow = true;
+    }
+    if (hzSunSlices_ == 0) {
+      const char* e = std::getenv("SANDVOX_HZ_SUN_SLICES");
+      hzSunSlices_ = e ? (uint32_t)std::clamp(std::atoi(e), 1, 64) : kHzSunSlices;
     }
     const float* L = sandvox::LastKeyLightDir();
     const float lh = std::sqrt(L[0] * L[0] + L[2] * L[2]);
@@ -3439,11 +3448,41 @@ void Simulation::EncodeShadowResolve(const rhi::CommandEncoder& enc) {
       const float ax = L[0] / lh, az = L[2] / lh;
       const float turn = std::fabs(std::atan2(ax * hzSunAz_[1] - az * hzSunAz_[0],
                                               ax * hzSunAz_[0] + az * hzSunAz_[1]));
-      if (!hzSunBuilt_ || turn > kHzSunTurnRad) {
-        cx.cloudFlags |= 32u;
-        hzSunBuilt_ = true;
-        hzSunAz_[0] = ax;
-        hzSunAz_[1] = az;
+      // ---- THE SUN REBUILD, SPREAD OVER FRAMES (2026-10-13) ---------------
+      // The whole map in one dispatch was a ~3 ms spike about once a second
+      // while the azimuth turned (PLAN_map_v2 S1). A turn now starts a CYCLE
+      // of hzSunSlices_ frames, one slice of the samples each; the first build
+      // after an upload stays whole (there is no sun horizon to keep showing
+      // until it lands). A sky rebuild frame owns the shared dispatch extent
+      // (D_HZGX), so a slice due then waits a frame.
+      if (!hzSunBuilt_ || hzSunSlices_ <= 1) {
+        if (!hzSunBuilt_ || turn > kHzSunTurnRad) {
+          enc.FillTracked(pass::Buf::HzLight, hzLightBuf_, horizon::kLSunSlice * 4u,
+                          4u, 0u);
+          cx.cloudFlags |= 32u;
+          hzSunBuilt_ = true;
+          hzSunCycle_ = false;
+          hzSunSliceNext_ = 0;
+          hzSunAz_[0] = ax;
+          hzSunAz_[1] = az;
+        }
+      } else {
+        if (!hzSunCycle_ && turn > kHzSunTurnRad) {
+          hzSunCycle_ = true;
+          hzSunSliceNext_ = 0;
+          hzSunAz_[0] = ax;
+          hzSunAz_[1] = az;
+        }
+        if (hzSunCycle_ && !skyNow) {
+          cx.hzGx = (fullGx + hzSunSlices_ - 1) / hzSunSlices_;
+          enc.FillTracked(pass::Buf::HzLight, hzLightBuf_, horizon::kLSunSlice * 4u,
+                          4u, hzSunSliceNext_);
+          cx.cloudFlags |= 32u;
+          if (++hzSunSliceNext_ >= hzSunSlices_) {
+            hzSunCycle_ = false;
+            hzSunSliceNext_ = 0;
+          }
+        }
       }
     }
   }
