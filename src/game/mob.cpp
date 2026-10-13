@@ -11023,7 +11023,8 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // is charged separately and bleeds for itself. Same refusal CarveLimb
     // and StainWound make for a worn slot, made here for the drip. Hair (a
     // `bloodless` base limb) is refused for the same reason: see IsBloodless.
-    if (IsBloodless((int)li)) {
+    // So is a prop (a held item, an embedded arrow): see LeaksNothing.
+    if (LeaksNothing((int)li)) {
       limb.bleedBudget = 0.0f;
       tr.why = "bloodless";
       continue;
@@ -13332,7 +13333,9 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     // A creature with NO BLEED BLOCK (bleedMat 0: an android, "sparks only")
     // opens no budget at all: BleedTick would never drain it, and a budget
     // left standing reads as an open wound to every "is it bleeding" query.
-    if (pol.hitBleed != BleedRate::None && def_->bleedMat != 0) {
+    // A PROP (a held bow, an arrow shaft) opens nothing: Mob::LeaksNothing.
+    if (pol.hitBleed != BleedRate::None && def_->bleedMat != 0 &&
+        !LeaksNothing((int)i)) {
       const float add = amount * def_->bleedPerDamage *
                         BleedRateScale(pol.hitBleed) * BleedWeightOf(struckMat());
       NoteWoundFluid(limb, FluidAt((int)i, struckMat()), add);
@@ -16975,7 +16978,7 @@ uint64_t Mob::EmitCarvedFragment(const MobLimb& src, int srcLimb,
   uint32_t fragBleed = 0;
   // ...and a creature with no bleed block hands it nothing, whatever the
   // matter's own opinion (the same last rung Mob::FluidAt keeps).
-  if (!IsBloodless(srcLimb) && def_ && def_->bleedMat != 0) {
+  if (!LeaksNothing(srcLimb) && def_ && def_->bleedMat != 0) {
     FluidTally t;
     for (const DebrisVoxel& v : part)
       t.Add(OwnFluidOf(v.payload & 0xFFFu), BleedWeightOf(v.payload & 0xFFFu));
@@ -33249,7 +33252,7 @@ uint32_t Mob::OwnFluidOf(uint32_t mat) const {
 uint32_t Mob::LimbFluid(int limbIndex) const {
   if (!def_ || def_->bleedMat == 0) return 0;
   if (limbIndex < 0 || limbIndex >= (int)limbs_.size()) return def_->bleedMat;
-  if (IsBloodless(limbIndex)) return 0;
+  if (LeaksNothing(limbIndex)) return 0;
   const MobLimb& limb = limbs_[limbIndex];
   FluidTally t;
   if (limb.HasFineSkin()) {
@@ -33268,7 +33271,7 @@ uint32_t Mob::LimbFluid(int limbIndex) const {
 
 uint32_t Mob::FluidAt(int limbIndex, uint32_t mat) const {
   if (!def_ || def_->bleedMat == 0) return 0;
-  if (limbIndex >= 0 && limbIndex < (int)limbs_.size() && IsBloodless(limbIndex))
+  if (limbIndex >= 0 && limbIndex < (int)limbs_.size() && LeaksNothing(limbIndex))
     return 0;
   const uint32_t own = OwnFluidOf(mat);
   return own ? own : LimbFluid(limbIndex);
@@ -33277,7 +33280,7 @@ uint32_t Mob::FluidAt(int limbIndex, uint32_t mat) const {
 uint32_t Mob::WoundFluid(int limbIndex) const {
   if (!def_ || def_->bleedMat == 0) return 0;
   if (limbIndex < 0 || limbIndex >= (int)limbs_.size()) return def_->bleedMat;
-  if (IsBloodless(limbIndex)) return 0;
+  if (LeaksNothing(limbIndex)) return 0;
   const uint32_t f = limbs_[limbIndex].woundFluid;
   return f ? f : LimbFluid(limbIndex);
 }

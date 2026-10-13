@@ -6116,6 +6116,23 @@ class Mob {
            (limbIndex >= 0 && limbIndex < (int)limbDefs_.size() &&
             limbDefs_[limbIndex].bloodless);
   }
+  // ---- A PROP LEAKS NOTHING (2026-10-13) ------------------------------------
+  //
+  // A held item (tag "item", EquipItem) or an embedded arrow (tag "arrow") is
+  // matter riding the rig, not part of the creature. Without this a stab that
+  // caught a bow, a mace haft or an arrow shaft leaked SYRUP (wood's
+  // bleedFluid), the blade of a wooden-gripped sword leaked syrup by the
+  // limb's majority vote, and an all-steel dagger fell through to the
+  // wearer's blood. Narrower than IsBloodless on purpose: that one also
+  // decides TissueOf (hair's rooted sever rules), which a sword knocked out
+  // of a hand must not inherit. Asked by every "what does this leak" site
+  // (LimbFluid / FluidAt / WoundFluid, BleedTick's refusal, the hit budget).
+  bool LeaksNothing(int limbIndex) const {
+    if (IsBloodless(limbIndex)) return true;
+    if (limbIndex < baseLimbs_ || limbIndex >= (int)limbDefs_.size()) return false;
+    const std::string& tag = limbDefs_[limbIndex].tag;
+    return tag == "item" || tag == "arrow";
+  }
   // The TISSUE column of the sever table (game/severpolicy.h) for one slot:
   // a garment is Shell, hair is Bloodless, anatomy is whatever the body's def
   // says (MobDef::bodyTissue). Same order of questions IsBloodless asks.
