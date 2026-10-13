@@ -1474,14 +1474,16 @@ pass at its current depth. That is a change to the claim, so it was not made.
 Merged on `baseline-repair` (7 worktree packages): 26 of the 30 inherited reds are green, determinism ef7d9a06 unmoved. Four are marked `fail` in baseline.json pending OWNER decisions, each attributed above:
 - rain-fire — clear-sky arm is a coin flip on a one-voxel leaf sheet (30..71% across 5 sites); options: run 800 ticks / floor ~25% / thicker fuel bed. See "Baseline repair C".
 - waterbody (pass N arm 2) — a player-dug pool splits into two components and the relevel counts 0 surface columns; water-relevel design work. See "Baseline repair C".
-- swing-plane E — the swing wounds (hp 1107 -> 1092.6) but cuts ~0.1 vox deep, never emptying a collider cell the gate counts; introduced in 5a23e96..e959c65 (demons D5 / fight64 round 3 S, F, C). See "combat package E". (Corrected below: introduced by 64993fd, D4's standing reach cap; the depth never changed.)
+- swing-plane E — the swing wounds (hp 1107 -> 1092.6) but cuts ~0.1 vox deep, never emptying a collider cell the gate counts; introduced in 5a23e96..e959c65 (demons D5 / fight64 round 3 S, F, C). See "combat package E". (Corrected below: introduced by 64993fd, D4's standing reach cap, and the depth never changed. Fixed below: E now swings the real click stroke, and the key is `pass`.)
 - damage-sources — the fixture's left forearm stands in the stone's path, so the cuirass is never struck; introduced in 9848dbd..1dd67ac, pose vs fixture is the owner's call. See "combat package E".
 
-## 2026-10-12 — `swing-plane` E attributed to demons D4's standing reach cap (64993fd); the cut did NOT get shallower; still red, owner decision
+## 2026-10-12 — `swing-plane` E: attributed to demons D4's standing reach cap (64993fd), the cut did NOT get shallower; FIXED by driving E with the real click stroke, key flipped to `pass`
 
-No hash change, nothing rebaselined, `swing-plane` stays `fail`. No engine or
-gate behaviour changed in this entry. It corrects the attribution above
-("combat package E" and the orchestrator's list).
+No hash change (determinism ef7d9a06, matches baseline) and nothing
+rebaselined. `swing-plane` is `pass` in baseline.json. No engine code changed.
+The fix is to the fixture; see "Resolution" at the end of this entry. The
+attribution below corrects "combat package E" and the orchestrator's list
+above.
 
 **Introducing commit: 64993fd** (demons D4, 10-04: "the standing-body reach
 cap (pose.cpp: the imp float)"). It reached first-parent main through c597987
@@ -1522,8 +1524,7 @@ measures the sword's at ~220 vox/s (full power), and each strike removes 1-8
 collider voxels and 26-68 art voxels. E's drag runs at about a third of that
 speed.
 
-Nothing was changed, per the package's brief (no claim change, no tuning
-change, no new mechanics). The options, for the owner:
+The options as first reported (option 1 was chosen; see Resolution):
 1. Drive E with the player's real sword stroke, the stroke program a click
    fires, so "a real swing" really is one. This changes the fixture, not the
    claim.
@@ -1534,3 +1535,34 @@ change, no new mechanics). The options, for the owner:
    it is not a fix by itself.
 4. If 0.1-0.23 world voxels per tick is too shallow for a sword, that is
    `gore.cutDepth` / `cutDepthPower` (unchanged since 09-14), not a regression.
+
+**Resolution (option 1).** Arm E now fires what a plain click fires, through
+the strike tick's own calls (src/test/selftest_swing.cpp, "THE CUT IS A
+CLICK"). The armed compass's neutral stroke is `horizontal_r`, resolved to the
+sword's form `horizontal_r@long:player`, on the right arm. It runs on live
+melee tuning, with the driver seeded from the rig, the head and chest
+keep-outs set, `StepStrokeProgram`, and `StrokePoseNow` pushed. The aim is the
+tick's own: the crosshair goes on the DRAWN torso (its voxels averaged), and
+the strike point is the first body down the eye line, capped at the arm's
+reach. The sweep runs on the program's Cut phase with the sword's profile and
+heft, and with one-impulse-per-stroke sets. The claim did not change:
+collider-lattice wounds on the limbs under the edge, and the out-of-arc body
+untouched.
+
+`--verify swing-plane,damage-sources,determinism,npc-strike`, one boot:
+- swing-plane: PASS (56 checks). 38 program ticks, 9 cutting, 9 swept.
+  The first contact is at 218.8 vox/s, power 1.00, kerf depth 0.50 (was 0.10
+  at 41.8 vox/s). Collider 3320 -> 3315, art 26428 -> 26383, hp 1107 ->
+  1085.4, `1 of 1 wounded limbs were under the edge`, the far body lost 0 of
+  3320. The later cut ticks slow to 79 / 73 / 24 / 26 vox/s at kerf 0.13 /
+  0.13 / 0.09 / 0.09.
+- determinism: PASS, ef7d9a06 matches baseline.
+- npc-strike: PASS (19 checks). Its sword strikes top out at 219-221 vox/s,
+  the same speed as the player's stroke.
+- damage-sources: FAIL "the cuirass did not take the stone". Unchanged and
+  still recorded `fail` (its own entry above).
+
+Still thin: only ONE limb loses collider voxels (5 of them, the first
+full-power contact). The torso and armU.L ticks after it run at 0.08-0.37
+power and cut 0.09-0.13 deep, so the rest of the stroke still wounds below
+collider resolution. That is the shipped cut depth, not a fixture fault.

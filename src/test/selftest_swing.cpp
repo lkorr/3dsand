@@ -1707,7 +1707,9 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
   // The same shape as the `mob` gate's melee subtest — near limb loses voxels,
   // far limb does not — but driven by a REAL swing rather than by a direct
   // carve call, so it is the sweep's own geometry under test and not just
-  // CarveLimbRadial's.
+  // CarveLimbRadial's. The swing is the stroke a plain click fires (since
+  // 2026-10-12; it was the retired mouse drag before), and it is the one
+  // pass here that runs LIVE melee tuning (see "THE CUT IS A CLICK").
   bool hitOk = true;
   if (dummyDef < 0) {
     std::printf("swing-plane E: SKIP (no \"human\" mob def to cut)\n");
@@ -1775,98 +1777,227 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
                             : 0;
       }
 
-      // The cut: load right, then flick left through the dummy's front. THE
-      // SWEEP IS DRIVEN TOO — main.cpp calls MeleeSweepDamage once per tick off
-      // the blade's own previous and current edge, and a gate that only posed
-      // the arm would be asserting that a swing looks right while never
-      // touching anything.
-      melee.Reset();
-      drive(0, 0, true);
-      // The ready ALSO brings the point up to chest height: the walk cycle
-      // leaves the arm hanging at about -30 degrees of elevation, and a
-      // purely horizontal ready keeps it there — six voxels under a target
-      // whose chest is what a cut is aimed at. Closed-loop, for the reason
-      // `readyTo` exists: an open-loop version of this line parked the blade
-      // on the azimuth stop.
-      // THE ELEVATION IS MEASURED, NOT ASSUMED. A fixed ready of 0.15 rad puts
-      // the blade at chest height only when the avatar and its target settled
-      // on the same floor, and on a slope they do not: in the full suite the
-      // dummy came to rest 2.8 voxels lower than it does standalone and the
-      // whole sweep passed over its head (tip box y 233..241 against a body
-      // spanning 217..234), which the gate reported as "0 of 0 wounded limbs"
-      // about a fixture that was alive and fifteen-limbed the whole time.
+      // ---- THE CUT IS A CLICK (2026-10-12) -----------------------------------
       //
-      // Taken about the LIVE shoulder and against the LIVE chest, so it is
-      // right on any ground and needs no flat-spot search (see the anchor note).
-      // CAVEAT (2026-10-12): the "chest" is the live BOX's 60% height, not the
-      // drawn body. Since 64993fd a standing body is drawn lower in its box,
-      // so this aims nearer the head than the chest.
-      const Vec3 tgtChest{(float)dx + dd.worldSize.x * 0.5f,
-                          mobs.MobOrigin(tid).y + dd.worldSize.y * 0.60f,
-                          (float)dz + dd.worldSize.z * 0.5f};
-      const Vec3 sh = shoulderWorld();
-      const Vec3 toTgt = tgtChest - sh;
-      const float aimEl = std::asin(std::clamp(
-          toTgt.y / std::max(toTgt.len(), 1e-3f), -1.0f, 1.0f));
-      const bool eReady = readyTo(1.15f, aimEl);
-      check(eReady, "the cut's ready reached its start pose");
+      // Until this date E "swung" by feeding the driver 34 px of mouse a tick
+      // (MeleeState::Feed). That was the freeform mouse melee, and it left
+      // the game on 2026-09-25: a player's only cut now is the STROKE PROGRAM
+      // a click fires (session.cpp's strike tick). The drag moved the tip at
+      // ~6 m/s, about a third of what the program does, and so measured a
+      // 0.1-voxel kerf that no player can make. tests/BASELINE.md 2026-10-12
+      // has the attribution.
+      //
+      // So this is the click, through session.cpp's own calls in its own
+      // order. A plain press with the sword drawn and no flick names the
+      // compass's neutral horizontal (StrikePicker starts altRight, so the
+      // first is horizontal_r: from the right, through the target, as the
+      // drag was). The sword's FORM of that stroke arms the right hand. Each
+      // tick: seed the driver from the rig, set the keep-outs, aim, step the
+      // program, push StrokePoseNow. Then the blade sweeps on the program's
+      // own Cut phase, with the held sword's strike profile and heft, off the
+      // previous and current WeaponEdge. That is exactly what the game's
+      // sweep reads.
+      //
+      // THE AIM IS THE DRAWN BODY, NOT THE BOX. The crosshair is put on the
+      // torso's own surviving voxels, and the strike point is resolved the
+      // way the tick resolves it: the first body down the eye's line, but
+      // never past where the arm's outer reach meets that line. 60% of the
+      // box's height reads the head since 64993fd (a standing body is drawn
+      // lower in its box). The voxel march along the line is left out: the
+      // fixture is open air between the eye and the chest.
+      //
+      // `melee` keeps its pinned feel knobs for the other passes. The strike
+      // gets its own driver with LIVE tuning, the way session.cpp applies
+      // fresh sliders to every swing.
+      melee.Reset();
+      const StyleLibrary& lib = mobs.AttackStyles();
+      const PlayerStrikeMap& compass = PlayerCompass(lib, /*armed=*/true);
+      StrikePicker picker;  // a fresh session's first plain click
+      const int baseStyle = NeutralStrike(compass, picker.altRight);
+      const int formed =
+          baseStyle >= 0 ? lib.ResolveForm(baseStyle, FormForItem(sword)) : -1;
+      const AttackStyle* sty = formed >= 0 ? lib.At(formed) : nullptr;
+      check(sty != nullptr, "a plain click with the sword drawn names a stroke");
+      const bool armed = sty != nullptr && avatar.ArmForStyle(*sty, Hand::Right);
+      check(armed, "...and the avatar's right arm can swing it");
+      const bool mirror = armed && StrokeMirrored(*sty, Hand::Right);
+      const Vec3 rightNow = mirror ? kR * -1.0f : kR;
+      MeleeState strike;
+      ApplyMeleeTuning(strike.tuning);
+      strike.SetHandSign(mirror ? 1.0f : avatar.HandSign());
+
+      // The drawn chest: the torso limb's own voxels, averaged.
+      int torsoLimb = -1;
+      for (size_t li = 0; li < dd.limbs.size(); li++)
+        if (dd.limbs[li].name == "torso") torsoLimb = (int)li;
+      Vec3 chest{(float)dx + dd.worldSize.x * 0.5f,
+                 mobs.MobOrigin(tid).y + dd.worldSize.y * 0.60f,
+                 (float)dz + dd.worldSize.z * 0.5f};
+      bool chestDrawn = false;
+      if (torsoLimb >= 0 && mobs.LimbBody(tid, torsoLimb)) {
+        Vec3 sum{0, 0, 0};
+        for (uint32_t k = 0; k < 16; k++)
+          sum = sum + mobs.LimbVoxelPos(tid, torsoLimb, k * 7919u);
+        chest = sum * (1.0f / 16.0f);
+        chestDrawn = true;
+      }
+      check(chestDrawn, "the target has a torso to aim at");
+      const Vec3 eye = pl.EyePos();
+      const Vec3 look = (chest - eye).normalized();
+      float lastAimDist = 0;
+      auto aimNow = [&](float& az, float& el, float& dist) {
+        az = el = dist = 0;
+        Vec3 pivot;
+        if (!avatar.StrokePivotWorld(pivot)) return;
+        constexpr float kAimRange = 40.0f;
+        float hitDist = kAimRange;
+        std::vector<uint64_t> ignore;
+        avatar.AppendLiveLimbBodies(ignore);
+        float frac = 1.0f;
+        if (phys.CastRayBody(eye, look, kAimRange, frac, ignore))
+          hitDist = std::min(hitDist, frac * kAimRange);
+        float reachLo = 0, reachHi = 0;
+        strike.ReachBand(reachLo, reachHi);
+        const Vec3 e = eye - pivot;
+        const float b = e.dot(look);
+        const float disc = b * b - (e.dot(e) - reachHi * reachHi);
+        if (reachHi > 0.0f && disc >= 0.0f) {
+          const float dConv = -b + std::sqrt(disc);
+          if (dConv > 0.0f) hitDist = std::min(hitDist, dConv);
+        }
+        StrokeAimAt(pivot, eye + look * hitDist, rightNow, kU, kF, az, el, dist);
+        lastAimDist = dist;
+      };
+      // Seed the driver from the live rig, plus the head and chest keep-outs,
+      // as the strike tick does before it steps.
+      auto seedStrike = [&]() {
+        Vec3 hand, tip, flat;
+        float reach = 0;
+        if (avatar.WeaponStrokePose(hand, tip, flat, reach))
+          strike.SetStroke(hand, tip, mirror ? flat * -1.0f : flat, reach);
+        else
+          strike.ClearArm();
+        Vec3 kc;
+        float kr = 0;
+        if (avatar.HeadKeepOut(kc, kr))
+          strike.SetKeepOut(kc, kr);
+        else
+          strike.ClearKeepOut();
+        Vec3 ba, bb;
+        float bw = 0, bdp = 0;
+        if (avatar.BodyKeepOut(ba, bb, bw, bdp))
+          strike.SetBodyKeepOut(ba, bb, bw, bdp);
+        else
+          strike.ClearBodyKeepOut();
+      };
+      auto pushPose = [&](const StrokeCursor& cur) {
+        const AttackStyle* s = cur.style >= 0 ? lib.At(cur.style) : nullptr;
+        WeaponPose wp = StrokePoseNow(cur, s, strike);
+        if (mirror) MirrorWeaponPose(wp);
+        avatar.SetWeaponPose(wp);
+      };
+
       std::printf(
-          "swing-plane E: shoulder y %.1f, target chest y %.1f, ready el "
-          "%.2f rad\n",
-          sh.y, tgtChest.y, aimEl);
+          "swing-plane E: a plain click fires \"%s\" (base %d, sword form %d, "
+          "%s); crosshair on the drawn chest (%.1f,%.1f,%.1f)%s, box chest y "
+          "%.1f, shoulder y %.1f\n",
+          sty ? sty->name.c_str() : "-", baseStyle, formed,
+          mirror ? "mirrored" : "authored arm", chest.x, chest.y, chest.z,
+          chestDrawn ? "" : " (NO TORSO: box fallback)",
+          mobs.MobOrigin(tid).y + dd.worldSize.y * 0.60f, shoulderWorld().y);
+
       std::vector<Vec3> tipPath, basePath;
-      BladeRead prev = readBlade();
-      int sweptTicks = 0;
+      int sweptTicks = 0, cutTicks = 0, programTicks = 0;
       // WHAT THE SWEEP ITSELF SAID (rule 6): a "0 of 0" with the edge 0.05
       // voxels from the head is either probes that found nothing or a sweep
       // that never ran its probes, and EdgeSweepResult tells those apart.
       EdgeSweepResult sumRes;
       float tipSpeedMax = 0, powerMax = 0, alignMin = 1;
       int gatedTicks = 0, arrestedTicks = 0;
-      for (int i = 0; i < 18; i++) {
-        drive(-34.0f, 0, true);
-        const BladeRead b = readBlade();
-        if (!b.valid) continue;
-        tipPath.push_back(b.tip);
-        basePath.push_back(b.base);
-        // Every tick of the drive IS the cut: the driver has no Slash of its
-        // own to gate on any more (melee.h SwingPhase), and a stroke program
-        // sweeps on its own Cut phase, which this drive stands in for.
-        if (prev.valid) {
+      StrokeCursor cur;
+      Vec3 lastBase, lastTip;
+      bool lastEdgeValid = false;
+      if (armed) {
+        seedStrike();
+        BeginStrokeProgram(cur, *sty, formed, 0x504E5u);
+        cur.hand = Hand::Right;
+        cur.mirrored = mirror;
+        if (const std::string clip = avatar.StrokeClip(*sty, mirror); !clip.empty())
+          avatar.PlayClip(clip);
+      }
+      for (int i = 0; i < 120 && cur.Active(); i++) {
+        if (i > 0) seedStrike();
+        // A click, not a hold: the button is up by the end of the windup.
+        cur.holdWindup = false;
+        float aimAz = 0, aimEl = 0, aimDist = 0;
+        aimNow(aimAz, aimEl, aimDist);
+        const StrokeStepResult r = StepStrokeProgram(
+            cur, lib.At(cur.style), strike, aimAz, aimEl, aimDist, kTickDt,
+            rightNow, kU, kF);
+        programTicks++;
+        if (r == StrokeStepResult::Finished) {
+          cur.Reset();
+          avatar.ClearStrikeEffector();
+        }
+        pushPose(cur);
+        avatar.SetSwinging(cur.Cutting());
+        avTick();
+
+        Vec3 eb, et, ef;
+        float ehw = 0;
+        if (!avatar.WeaponEdge(eb, et, ehw, &ef)) {
+          lastEdgeValid = false;
+          continue;
+        }
+        // ONE STROKE, ONE IMPULSE PER BODY: cleared off the cut, as the
+        // tick clears playerStruck.
+        if (!cur.Cutting()) {
+          cur.struck.clear();
+          cur.bitten = false;
+          cur.victimHits.clear();
+        } else {
+          cutTicks++;
+        }
+        if (lastEdgeValid && cur.Cutting()) {
+          tipPath.push_back(lastTip);
+          basePath.push_back(lastBase);
+          tipPath.push_back(et);
+          basePath.push_back(eb);
           EdgeSweep sw;
-          sw.aPrev = prev.base;
-          sw.bPrev = prev.tip;
-          sw.aNow = b.base;
-          sw.bNow = b.tip;
-          sw.flatNow = b.flat;
+          sw.aPrev = lastBase;
+          sw.bPrev = lastTip;
+          sw.aNow = eb;
+          sw.bNow = et;
+          sw.flatNow = ef;
           sw.dt = kTickDt;
-          sw.halfWidth = sword->edgeHalfWidth;
+          sw.halfWidth = ehw;
           sw.strike = sword->strike;
           sw.carveBonus = sword->carveBonus;
-          // The SHIPPED sword's heft, not the neutral default: the kerf's
-          // depth scales with it, so a gate that left it at 1 would be
-          // measuring a wound no weapon in the game makes.
           sw.heft = sword->HeftFactor(CurrentTuning().gore.woundHeftRef,
                                       CurrentTuning().gore.woundHeftMax);
-          sw.tick = (uint32_t)i;
+          sw.tick = t;
+          sw.struck = &cur.struck;
+          sw.bitten = &cur.bitten;
+          sw.victimHits = &cur.victimHits;
+          sw.selfMounted = false;
           sw.valid = true;
           std::vector<ParticleSpawn> spawns;
           mobs.ClearCutBites();
-          const EdgeSweepResult r = MeleeSweepDamage(
-              sw, melee.tuning, avatar, phys, mobs, debris, world, spawns);
+          const EdgeSweepResult r2 = MeleeSweepDamage(
+              sw, strike.tuning, avatar, phys, mobs, debris, world, spawns);
           sweptTicks++;
-          sumRes.bodiesHit += r.bodiesHit;
-          sumRes.probesCast += r.probesCast;
-          sumRes.probesAir += r.probesAir;
-          sumRes.probesSelf += r.probesSelf;
-          sumRes.probesBody += r.probesBody;
-          sumRes.probesCovered += r.probesCovered;
-          tipSpeedMax = std::max(tipSpeedMax, r.tipSpeed);
-          powerMax = std::max(powerMax, r.power);
-          if (r.probesCast > 0) alignMin = std::min(alignMin, r.edgeAlign);
-          if (r.probesCast == 0 && !r.arrested) gatedTicks++;
-          if (r.arrested) arrestedTicks++;
-          if (r.probesBody > 0 || r.bodiesHit > 0) {
+          sumRes.bodiesHit += r2.bodiesHit;
+          sumRes.probesCast += r2.probesCast;
+          sumRes.probesAir += r2.probesAir;
+          sumRes.probesSelf += r2.probesSelf;
+          sumRes.probesBody += r2.probesBody;
+          sumRes.probesCovered += r2.probesCovered;
+          tipSpeedMax = std::max(tipSpeedMax, r2.tipSpeed);
+          powerMax = std::max(powerMax, r2.power);
+          if (r2.probesCast > 0) alignMin = std::min(alignMin, r2.edgeAlign);
+          if (r2.probesCast == 0 && !r2.arrested) gatedTicks++;
+          if (r2.arrested) arrestedTicks++;
+          if (r2.probesBody > 0 || r2.bodiesHit > 0) {
             uint32_t nearNow = 0, nearArt = 0;
             for (size_t li = 0; li < dd.limbs.size(); li++)
               if (mobs.LimbBody(tid, (int)li)) {
@@ -1877,13 +2008,13 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
             // The first contact, against the near body's limbs: which one
             // it was, and how far its nearest sampled voxel is.
             std::string nearest = "-";
-            if (r.hasHitAt) {
+            if (r2.hasHitAt) {
               float bd = 1e9f;
               for (size_t li = 0; li < dd.limbs.size(); li++) {
                 if (!mobs.LimbBody(tid, (int)li)) continue;
                 for (uint32_t k = 0; k < 32; k++) {
                   const float d =
-                      (mobs.LimbVoxelPos(tid, (int)li, k * 7919u) - r.hitAt)
+                      (mobs.LimbVoxelPos(tid, (int)li, k * 7919u) - r2.hitAt)
                           .len();
                   if (d < bd) {
                     bd = d;
@@ -1899,17 +2030,36 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
                 "%u vox (art %u) %.1f hp, far %.1f hp, dead-flesh %d; "
                 "kerf: %u cuts, depth %.2f, budget %.2f, carve kept %u of "
                 "%u\n",
-                i, r.tipSpeed, r.power, r.edgeAlign, r.bodiesHit,
-                r.probesBody, r.hitAt.x, r.hitAt.y, r.hitAt.z, nearest.c_str(),
-                nearNow, nearArt, mobs.TotalHp(tid),
-                farId ? mobs.TotalHp(farId) : 0.0f, (int)r.hitDeadFlesh,
+                i, r2.tipSpeed, r2.power, r2.edgeAlign, r2.bodiesHit,
+                r2.probesBody, r2.hitAt.x, r2.hitAt.y, r2.hitAt.z,
+                nearest.c_str(), nearNow, nearArt, mobs.TotalHp(tid),
+                farId ? mobs.TotalHp(farId) : 0.0f, (int)r2.hitDeadFlesh,
                 cb.cuts, cb.depth, cb.budget, cb.kept, cb.before);
           }
         }
-        prev = b;
+        lastBase = eb;
+        lastTip = et;
+        lastEdgeValid = true;
       }
-      for (int i = 0; i < 20; i++) drive(0, 0, false);
-      check(sweptTicks > 0, "the flick committed a cut the sweep could run");
+      // The program is done; the arm unwinds the way the tick lets it when
+      // no program stepped the driver.
+      cur.Reset();
+      avatar.ClearStrikeEffector();
+      avatar.SetSwinging(false);
+      for (int i = 0; i < 20; i++) {
+        seedStrike();
+        strike.Update(kTickDt, false, true, rightNow, kU, kF);
+        WeaponPose wp = strike.Pose();
+        if (mirror) MirrorWeaponPose(wp);
+        avatar.SetWeaponPose(wp);
+        avTick();
+      }
+      std::printf(
+          "swing-plane E (stroke): %d program ticks, %d cutting, %d swept; "
+          "strike point %.1f vox from the pivot\n",
+          programTicks, cutTicks, sweptTicks, lastAimDist);
+      check(cutTicks > 0, "the click's stroke reached its cut");
+      check(sweptTicks > 0, "...and the sweep ran on it");
 
       // WHERE THE WOUNDS ARE, against WHERE THE BLADE WAS.
       //
@@ -1961,15 +2111,12 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
       const bool struck = hitNear > 0;
       const bool spared = farId != 0 && farTotal > 0 && farLost == 0;
       hitOk = struck && spared;
-      // RED SINCE 64993fd, demons D4's standing reach cap (tests/BASELINE.md,
-      // 2026-10-12 "swing-plane E attributed"). The cut lands on the skin
-      // lattice, about 3 art voxels a tick at a 0.1-voxel kerf, but empties
-      // no COLLIDER cell, and the collider is what LimbVoxelCount reads. The
-      // cap drew the standing dummy lower inside its box, so this box-aimed
-      // edge moved from the torso to the head. Before that, the pass was one
-      // collider voxel. The depth and the drag's ~6 m/s did not change; the
-      // drag is the freeform mode retired on 09-25, not a real stroke. See
-      // the "E (tick N)" lines above.
+      // RED from 64993fd until the stroke above replaced the mouse drag
+      // (tests/BASELINE.md, 2026-10-12 "swing-plane E"). The drag cut 0.1
+      // voxel a tick at ~6 m/s and emptied a collider cell only by
+      // coincidence. When D4's standing reach cap moved the box-aimed edge
+      // from the torso to the head, the coincidence was gone. The real
+      // stroke's first contact runs at full power (~220 vox/s, kerf ~0.5).
       check(struck, "a real swing wounds the limbs the edge passed through");
       check(spared,
             "...and leaves a body outside the arc completely alone");
