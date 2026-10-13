@@ -502,12 +502,24 @@ struct FedPool {
   Box in;
   int ex, ey, ez;  // the electrode
 };
+// `padR` > 0 widens the electrode into a (2 padR + 1)^2 copper pad in the
+// floor (the spark still feeds its middle cell only). MOLTEN pools need it:
+// molten salt COOLS where it touches anything not hot (reactions.json, ~7
+// per-mille a tick for the cell over a cold electrode), and a one-cell
+// electrode has exactly one pool cell over it -- freeze that one to salt (an
+// insulator) before the charge arrives and the pool can never be fed. It
+// happened at y 120 on 2026-10-12 (the cell over the electrode was salt by
+// the first fed tick: a reaction-RNG reroll, not the parity this gate is
+// about); nine contacts cannot all freeze in the build ticks.
 FedPool BuildFedPool(std::vector<CellOp>& rooms, std::vector<CellOp>& build, const Box& in,
-                     int depth, uint32_t liquidWord, uint32_t copper) {
+                     int depth, uint32_t liquidWord, uint32_t copper, int padR = 0) {
   Room(rooms, in);
   Fill(build, {in.x0, in.y0, in.z0, in.x1, in.y0 + depth - 1, in.z1}, liquidWord);
   FedPool p{in, (in.x0 + in.x1) / 2, in.y0 - 1, (in.z0 + in.z1) / 2};
-  Put(build, p.ex, p.ey, p.ez, copper);
+  // Before the pocket: two ops on one cell in a tick, the first wins, so the
+  // pad's copper keeps the floor cells the pocket's stone would take.
+  for (int dz = -padR; dz <= padR; dz++)
+    for (int dx = -padR; dx <= padR; dx++) Put(build, p.ex + dx, p.ey, p.ez + dz, copper);
   Pocket(build, p.ex, p.ey - 1, p.ez, 0, 1, 0);
   return p;
 }
@@ -536,7 +548,7 @@ Status GateElecElectrolysis(Ctx& c, std::string& detail) {
   for (int k = 0; k < 3; k++) {
     const int x0 = 40 + k * 12;
     mp[k] = BuildFedPool(rooms, build, {x0, kYb + k, kZm, x0 + 6, kYb + k + 4, kZm + 6}, 1,
-                         molten | kFull, copper);
+                         molten | kFull, copper, 1);
     Put(feedMolten, mp[k].ex, mp[k].ey - 1, mp[k].ez, spark);
   }
   // Water pools, two layers: brine (salt grains dropped in, dissolved for
@@ -562,6 +574,7 @@ Status GateElecElectrolysis(Ctx& c, std::string& detail) {
   ticker({}, grains);
   auto grow = [](const Box& b) { return Box{b.x0, b.y0, b.z0, b.x1, b.y1, b.z1}; };
   uint32_t naM[3] = {}, clM[3] = {}, moltenLeft[3] = {};
+  std::string poolNote[3], poolTrace[3];
   uint32_t lyeB = 0, clB = 0, h2B = 0, lyeF = 0, clF = 0, h2F = 0;
   const int total = std::max(moltenHold + 10, dissolve + brineHold + 10);
   for (int i = 0; i < total; i++) {
@@ -570,6 +583,43 @@ Status GateElecElectrolysis(Ctx& c, std::string& detail) {
     if (i >= dissolve && i < dissolve + brineHold)
       feed.insert(feed.end(), feedWater.begin(), feedWater.end());
     ticker({}, feed);
+    // ATTRIBUTION (once, mid-hold): per molten pool, the P the field holds at
+    // the feed cell, the electrode, and the pool's best cell, and how many
+    // pool cells hold any -- so a pool that never splits says whether the
+    // charge never arrived or arrived and the rule never fired.
+    // ...and for the first ticks, the cell over each electrode: what it is
+    // and the P the field gave it (the pool's only way in).
+    if (i < 6) {
+      std::vector<uint32_t> vox(kChunkVol);
+      for (int k = 0; k < 3; k++) {
+        const FedPool& p = mp[k];
+        const int x = p.ex, y = p.ey + 1, z = p.ez;
+        ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex({x >> 4, y >> 4, z >> 4}), 1,
+                       vox.data(), "elecLysisVox");
+        const uint32_t w =
+            vox[(((uint32_t)z & 15) * 16 + ((uint32_t)y & 15)) * 16 + ((uint32_t)x & 15)];
+        const uint32_t m = w & 0xFFFu;
+        poolTrace[k] += Format(" t%d:%s/s%u e%u p%u", i, m < c.mats.size() ? c.mats[m].name.c_str() : "?",
+                               (w >> 12) & 15u, ProbeP(c.ctx, c.world, x, y - 1, z),
+                               ProbeP(c.ctx, c.world, x, y, z));
+      }
+    }
+    if (i == moltenHold / 2) {
+      ElecView v;
+      v.Read(c.ctx, c.world);
+      for (int k = 0; k < 3; k++) {
+        const FedPool& p = mp[k];
+        uint32_t best = 0, n = 0;
+        for (int z = p.in.z0; z <= p.in.z1; z++)
+          for (int x = p.in.x0; x <= p.in.x1; x++) {
+            const uint32_t q = v.P(x, p.in.y0, z);
+            best = std::max(best, q);
+            n += q > 0;
+          }
+        poolNote[k] = Format(" [mid-hold P: feed %u, electrode %u, pool best %u, %u cells]",
+                             v.P(p.ex, p.ey - 1, p.ez), v.P(p.ex, p.ey, p.ez), best, n);
+      }
+    }
     if (i < moltenHold + 10 && (i % 2) == 1)
       for (int k = 0; k < 3; k++) {
         const std::vector<uint32_t> h = Census(c, grow(mp[k].in));
@@ -598,6 +648,7 @@ Status GateElecElectrolysis(Ctx& c, std::string& detail) {
     pools += Format("%s y %d (y%%3 %d): sodium %u, chlorine %u, molten left %u %s", k ? " |" : "",
                     mp[k].in.y0, ((mp[k].in.y0 % 3) + 3) % 3, naM[k], clM[k], moltenLeft[k],
                     split ? "split" : "NO ELECTROLYSIS");
+    if (!split) pools += poolNote[k] + " over the electrode:" + poolTrace[k];
   }
   const bool brineOk = clB > 0 && (lyeB > 0 || h2B > 0);
   const bool freshOk = lyeF == 0 && clF == 0 && h2F == 0;

@@ -989,6 +989,14 @@ fn caMaskGasAt(ci : u32, l : vec3<i32>) -> bool {
 }
 fn gasThinMul(ci : u32, local : vec3<i32>, m : Material) -> u32 {
   if ((m.flags & MATF_HEAVY_GAS) != 0u) { return 1u; }
+  // NOR A DISCHARGE (an electric SOURCE: spark, arc, lightning; `_r2` bit 25).
+  // It is not haze: it is laid one cell at a time (a pocket, a bolt), so it is
+  // ALWAYS thin, and its fade-to-air rule (spark 450, lightning 550, arc 700
+  // per mille) times 3 is a certainty -- every source decayed in the very
+  // substep it was laid, before the charge field (after the CA) could read it,
+  // and the field went dark everywhere (fd72df9 turned x3 on 2026-10-06;
+  // every elec gate read P 0 from then until 2026-10-12).
+  if ((m._r2 & ELEC_R2_SOURCE) != 0u) { return 1u; }
   if (((m._r2 >> HEAT_R2_EMIT_SHIFT) & 0xFFu) != 0u) { return 1u; }
   var n = 0u;
   for (var f = 0u; f < 6u; f++) {
