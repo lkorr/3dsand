@@ -747,16 +747,18 @@ const NAME_OK = /^[a-z0-9_]{1,40}$/;
 function mobDirFor(name, base) {
   const have = S.pool.find(p => p.name === name);
   if (have) return have.folder ? 'mobs/' + have.folder : 'mobs';
+  if (name === base) return 'mobs';   // a race base is a prototype, at the root
   const b = S.pool.find(p => p.name === base);
   const proto = b ? (b.folder || b.name) : base;
   return 'mobs/' + proto;
 }
 
-/** The base every character extends, resolved off the server. Fetched fresh on
- *  each save rather than cached for the session: the Models tab may have edited
- *  the human in another window, and a diff against a stale base writes
- *  overrides for numbers that are no longer different. */
-async function resolvedBase() {
+/** The base a character extends (its race base, or the human: mobgen.raceBase),
+ *  resolved off the server. Fetched fresh on each save rather than cached for
+ *  the session: the Models tab may have edited the human in another window,
+ *  and a diff against a stale base writes overrides for numbers that are no
+ *  longer different. */
+async function resolvedBase(stem = mg.BASE_MOB) {
   const fetched = new Map();
   const get = async (dir, stem) => {
     const key = dir + '/' + stem;
@@ -777,8 +779,8 @@ async function resolvedBase() {
     if (typeof j.extends === 'string' && j.extends)
       await walk(j.extends, depth + 1);
   };
-  await walk(mg.BASE_MOB, 0);
-  return SC.resolveSidecar(stem => fetched.get('mobs/' + stem), mg.BASE_MOB,
+  await walk(stem, 0);
+  return SC.resolveSidecar(s => fetched.get('mobs/' + s), stem,
                            nm => fetched.get('mobs/effects/' + nm) ?? null);
 }
 
@@ -802,9 +804,11 @@ async function saveCharacter() {
   if (b.complaints.length)
     return toast('refused: ' + b.complaints[0], true);
   const existing = S.pool.find(p => p.name === name);
-  // FILED by race: a sylvan lands in assets/mobs/sylvan/, beside its kin. The
-  // folder is filing only (src/game/sidecar.h); it still extends the human.
-  const dir = mobDirFor(name, mg.raceFolder(S.genome));
+  // FILED by race: a sylvan lands in assets/mobs/sylvan/, beside its kin, and
+  // extends the race base assets/mobs/sylvan.json (mobgen.raceBase), which
+  // extends the human.
+  const dir = mobDirFor(name, mg.raceBase(S.genome));
+  const baseName = mg.extendsFor(S.genome, name);
   if (existing && !confirm(`assets/${dir}/${name}.{vox,json} already exists. ` +
                            'Overwrite?')) return;
   // THE ANATOMY IS BAKED HERE, not left to a command line. A body straight out
@@ -830,7 +834,7 @@ async function saveCharacter() {
   // is on disk right now.
   let doc;
   try {
-    doc = mg.thinSidecar(b.sidecar, await resolvedBase(), name);
+    doc = mg.thinSidecar(b.sidecar, await resolvedBase(baseName), name, baseName);
   } catch (e) {
     return toast('refused: ' + e.message, true);
   }

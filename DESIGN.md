@@ -10327,6 +10327,27 @@ and the Models tab, which lists prototypes in its main picker and the open
 prototype's variants in a second one. The Characters page and `gen_mobs.mjs`
 write new characters into the folder of the prototype they extend.
 
+**Every race but the human has a RACE BASE, and the hierarchy is three deep
+(2026-10-13).** `assets/mobs/{sylvan,automaton,android,demon}.{vox,json}` are
+prototypes that `extends: "human"`, and each race's characters (filed in the
+folder of that name) `extends` their race base, not the human:
+`human -> sylvan -> dryad`. The human still owns the rig, the loco states and
+the clip library, so those reach every creature; a race-wide SIDECAR trait set
+on the base -- its anatomy recipe, its bleed -- reaches that race's characters
+and nobody else's. The base's `.vox` does not: every character wears its own
+art, exactly as a human character does not wear `human.vox`. A race base is
+generated BARE (`node scripts/gen_mobs.mjs <race> --race-base`: the default
+body made that race, with no hair, crown, horns, tail or pack), because each of
+those is its own limb and the named-array merge (rule 2 below) can neither
+remove nor reorder an inherited element -- a base with a tail would put one on
+every character of its race, and a base whose parts came in another order than
+a character's could not be its base at all. `mobgen.raceBase`/`extendsFor` say
+which base a genome extends; `test_mobgen.mjs` asserts every character extends
+the right one and is the diff against it, and `gen_mobs.mjs <name> --rebake
+--sidecar-only` re-diffs a character against its base without touching its
+art. The re-parenting changed what no def resolves to (34/34 identical before
+and after, `--gate sidecar-resolve` agreeing).
+
 **The merge is three rules, and they live in `src/game/sidecar.cpp` with a
 line-for-line mirror in `assets/editor/sidecar.js`** (the Models tab, the
 Characters page, `gen_mobs.mjs` and `test_mobgen.mjs` all resolve through the

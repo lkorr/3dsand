@@ -11,6 +11,13 @@
  *                                        --tint '#b9c3ae' --tint-amount 0.2
  *   node scripts/gen_mobs.mjs peasant --preset waif --dry   # report, write nothing
  *   node scripts/gen_mobs.mjs --list                        # what is in the pool
+ *   node scripts/gen_mobs.mjs sylvan --race-base            # a RACE BASE body:
+ *                       # assets/mobs/sylvan.{vox,json}, the default body made
+ *                       # that race; it extends human and the race's
+ *                       # characters extend it (mobgen.raceBase)
+ *   node scripts/gen_mobs.mjs dryad --rebake --sidecar-only # re-diff the sidecar
+ *                       # against its base, art untouched (after a base moved
+ *                       # or a character was re-parented)
  *
  * THIS IS THE HEADLESS HALF of the Characters page, and it calls the SAME
  * `generateMob` the browser does (assets/editor/mobgen.js) — the arrangement
@@ -61,7 +68,9 @@ const readJson = p => JSON.parse(readFileSync(p, 'utf8'));
 // Declared up here rather than beside resolvedBase(): the writes below run at
 // module top level, before the helper section, and a `let` down there is in
 // its temporal dead zone by the time the first character is written.
-let baseCache = null;
+// stem -> resolved sidecar: a human character diffs against the human, a race
+// character against its race base (mobgen.raceBase).
+const baseCache = new Map();
 
 // ---- arguments --------------------------------------------------------------
 const argv = process.argv.slice(2);
@@ -203,6 +212,7 @@ if (opt('litter')) {
   if (flag('rebake')) genome = loadGenomeByName(name);
   else if (opt('genome')) genome = mg.normalizeGenome(readJson(opt('genome')));
   else if (opt('preset')) genome = mg.presetGenome(opt('preset'));
+  else if (flag('race-base')) genome = mg.raceBaseGenome(name);
   else if (flag('random')) genome = mg.rollColors(mg.randomGenome(mg.makeRng(seed), null,
                                                                  { race: opt('race', 'human') }),
                                                   mg.makeRng(seed ^ 0x5bf03635));
@@ -227,6 +237,9 @@ function fileDirFor(name, base) {
   if (outDir !== MOBS) return outDir;
   const have = mobFile(name, '.json');
   if (existsSync(have)) return dirname(have);
+  // A RACE BASE is a prototype: it sits at the root, and its folder is where
+  // its characters go.
+  if (name === base) return MOBS;
   return join(MOBS, protoOf(base));
 }
 
@@ -245,21 +258,30 @@ function loadGenomeByName(name) {
  *  the character is written to, so a `--out` sandbox diffs against the base
  *  that will actually sit beside it. Cached: a litter of thirty asks thirty
  *  times and the answer cannot change mid-run. */
-function resolvedBase() {
-  if (baseCache) return baseCache;
-  if (!existsSync(join(outDir, mg.BASE_MOB + '.json')))
-    die(`no ${mg.BASE_MOB}.json in ${rel(outDir)} — a character is a diff ` +
-        'against its base, so the base has to be there to diff against');
-  const read = stem => readJson(join(outDir, stem + '.json'));
+function resolvedBase(stem = mg.BASE_MOB) {
+  if (baseCache.has(stem)) return baseCache.get(stem);
+  // A sandbox (--out) is flat; the assets tree files variants in folders.
+  const at = s => outDir === MOBS ? mobFile(s, '.json') : join(outDir, s + '.json');
+  if (!existsSync(at(stem)))
+    die(`no ${stem}.json in ${rel(outDir)} — a character is a diff ` +
+        'against its base, so the base has to be there to diff against' +
+        (stem === mg.BASE_MOB ? '' : ` (a race base: \`node scripts/gen_mobs.mjs ` +
+                                     `${stem} --race-base\`)`));
+  const read = s => readJson(at(s));
   const readEffect = name => {
     const p = join(outDir, 'effects', name + '.json');
     return existsSync(p) ? readJson(p) : null;
   };
-  baseCache = sc.resolveSidecar(read, mg.BASE_MOB, readEffect);
-  return baseCache;
+  baseCache.set(stem, sc.resolveSidecar(read, stem, readEffect));
+  return baseCache.get(stem);
 }
 
 function write(name, genome) {
+  if (name === mg.BASE_MOB)
+    die(`${mg.BASE_MOB} is the root every body extends and is authored by hand, ` +
+        'not generated');
+  const baseName = mg.extendsFor(genome, name);
+  const sidecarOnly = flag('sidecar-only');
   const built = mg.generateMob(genome, seed, { ...GEN_OPTS, name });
   const complaints = mg.validateMob(built);
   const s = built.stats;
@@ -278,7 +300,7 @@ function write(name, genome) {
   // Before the write, not after: a half-finished asset should never exist on
   // disk, and the bake can REFUSE (a recipe naming a material that does not
   // exist, a tight rebase that would drift the anchors).
-  if (!flag('no-anatomy')) {
+  if (!flag('no-anatomy') && !sidecarOnly) {
     let baked;
     try {
       baked = mg.bakeAnatomy(built, materials);
@@ -290,27 +312,33 @@ function write(name, genome) {
       .sort((a, b) => b[1] - a[1]).map(([m, n]) => `${m} ${n}`).join(', '));
   }
   if (dry) { console.log('  (--dry: wrote nothing)'); return; }
-  // Filed by race (a sylvan beside its kin in assets/mobs/sylvan/); every
-  // character still extends mg.BASE_MOB.
-  const fd = fileDirFor(name, mg.raceFolder(genome));
+  // Filed by race (a sylvan beside its kin in assets/mobs/sylvan/), and
+  // extending that race's base (mobgen.raceBase); a race base itself sits at
+  // the root and extends the human.
+  const fd = fileDirFor(name, mg.raceBase(genome));
   mkdirSync(fd, { recursive: true });
   const vp = join(fd, name + '.vox'), jp = join(fd, name + '.json');
   // THE FILE IS THE DIFF. `built.sidecar` is the whole creature; what is
   // written is only what this body makes different from the base it extends,
   // so the rig keeps tracking the human instead of freezing a copy of it (see
   // mobgen.thinSidecar). The .vox is still the whole body: art is art.
-  const doc = mg.thinSidecar(built.sidecar, resolvedBase(), name);
+  const doc = mg.thinSidecar(built.sidecar, resolvedBase(baseName), name, baseName);
   // THE AI PROFILE IS NOT THE BODY'S, so the generator never derives it: a
   // `--behavior` names one (behaviors.json), and a re-bake keeps whatever
   // the file on disk already named (an imp stays an imp).
   const prevBehavior = existsSync(jp) ? readJson(jp).behavior : undefined;
   if (opt('behavior')) doc.behavior = opt('behavior');
   else if (prevBehavior) doc.behavior = prevBehavior;
-  writeFileSync(vp, built.vox);
+  // --sidecar-only: the art is left exactly as it is on disk -- what moved is
+  // the base this file is a difference against, not the body.
+  if (sidecarOnly && !existsSync(vp))
+    die(`--sidecar-only: ${rel(vp)} does not exist; there is no art to keep`);
+  if (!sidecarOnly) writeFileSync(vp, built.vox);
   writeFileSync(jp, JSON.stringify(doc, null, 2) + '\n');
-  console.log(`  wrote ${rel(vp)} (${built.vox.length} bytes) and ${rel(jp)} ` +
-              `(${JSON.stringify(doc).length} B of difference against ` +
-              `${JSON.stringify(built.sidecar).length} B of resolved rig)`);
+  console.log(`  wrote ${sidecarOnly ? '' : `${rel(vp)} (${built.vox.length} bytes) and `}` +
+              `${rel(jp)} (${JSON.stringify(doc).length} B of difference against ` +
+              `${JSON.stringify(built.sidecar).length} B of resolved rig, ` +
+              `extends ${baseName})${sidecarOnly ? '; art untouched' : ''}`);
   if (flag('no-anatomy'))
     console.log('  --no-anatomy: the body is solid skin at every depth. Run ' +
                 `\`node scripts/anatomize_mob.mjs ${name}\` before shipping it.`);

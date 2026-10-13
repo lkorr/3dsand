@@ -1,91 +1,9 @@
 {
-  "//": "A CHARACTER, not a creature: deepdiver inherits human's rig — limb names and tags, chains, loco states, natural weapons, sockets, the anatomy recipe and the shared clip library — and states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs deepdiver --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
-  "extends": "human",
+  "//": "A CHARACTER, not a creature: deepdiver extends automaton, its race base, which extends human: the rig, loco states and clip library come from human, the race-wide traits (anatomy recipe, bleed, ...) from automaton, and this file states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs deepdiver --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
+  "extends": "automaton",
   "model": "deepdiver",
-  "race": "automaton",
-  "sidecarVoxelsPerMetre": 10,
-  "bleed": {
-    "material": "oil",
-    "perDamage": 1.4
-  },
   "anatomy": {
-    "layers": [
-      {
-        "material": "cactus_rib",
-        "depth": 1,
-        "keep": true
-      },
-      {
-        "material": "cactus_flesh",
-        "depth": 2
-      },
-      {
-        "material": "iron"
-      }
-    ],
-    "garments": [],
     "limbs": {
-      "head": {
-        "layers": [
-          {
-            "material": "cactus_rib",
-            "depth": 1,
-            "keep": true
-          },
-          {
-            "material": "iron",
-            "depth": 1
-          },
-          {
-            "material": "cactus_flesh",
-            "depth": 1
-          },
-          {
-            "material": "cap_tan"
-          }
-        ],
-        "carve": null
-      },
-      "torso": {
-        "carve": [
-          {
-            "material": "cap_red",
-            "where": "cactus_flesh",
-            "box": {
-              "x": [
-                0.26,
-                0.74
-              ],
-              "y": [
-                0.4,
-                0.76
-              ],
-              "z": [
-                0.4,
-                1
-              ]
-            }
-          },
-          {
-            "material": "cap_red",
-            "where": "iron",
-            "box": {
-              "x": [
-                0.26,
-                0.74
-              ],
-              "y": [
-                0.4,
-                0.76
-              ],
-              "z": [
-                0.4,
-                1
-              ]
-            }
-          }
-        ]
-      },
       "bough": {
         "layers": [
           {
@@ -93,19 +11,8 @@
             "keep": true
           }
         ]
-      },
-      "hips": null
-    },
-    "becomes": {
-      "cactus_rib": "brass",
-      "cactus_flesh": "clockwork",
-      "cap_tan": "cogitator",
-      "cap_red": "boiler",
-      "mushroom_large": null
-    },
-    "garmentsBecome": null,
-    "paintBecomes": null,
-    "carve": null
+      }
+    }
   },
   "gait": {
     "rideHeight": 1.174
@@ -253,20 +160,6 @@
           34
         ]
       }
-    }
-  ],
-  "states": [
-    {
-      "name": "squirm",
-      "bodyYOffset": null
-    },
-    {
-      "name": "crawl",
-      "bodyYOffset": null
-    },
-    {
-      "name": "crawl.shins",
-      "bodyYOffset": null
     }
   ],
   "clips": {

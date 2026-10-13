@@ -1,9 +1,7 @@
 {
-  "//": "A CHARACTER, not a creature: fiend inherits human's rig — limb names and tags, chains, loco states, natural weapons, sockets, the anatomy recipe and the shared clip library — and states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs fiend --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
-  "extends": "human",
+  "//": "A CHARACTER, not a creature: fiend extends demon, its race base, which extends human: the rig, loco states and clip library come from human, the race-wide traits (anatomy recipe, bleed, ...) from demon, and this file states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs fiend --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
+  "extends": "demon",
   "model": "fiend",
-  "race": "demon",
-  "sidecarVoxelsPerMetre": 10,
   "anatomy": {
     "limbs": {
       "snout": {
@@ -247,7 +245,6 @@
         "halfWidth": 6
       },
       "strike": {
-        "blunt": 2.4,
         "cut": 3.5
       }
     },
@@ -267,7 +264,6 @@
         "halfWidth": 6
       },
       "strike": {
-        "blunt": 2.4,
         "cut": 3.5
       }
     },
@@ -289,18 +285,6 @@
     }
   ],
   "states": [
-    {
-      "name": "squirm",
-      "bodyYOffset": null
-    },
-    {
-      "name": "crawl",
-      "bodyYOffset": null
-    },
-    {
-      "name": "crawl.shins",
-      "bodyYOffset": null
-    },
     {
       "name": "tailsway",
       "overlay": true,

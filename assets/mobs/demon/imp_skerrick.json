@@ -1,9 +1,7 @@
 {
-  "//": "A CHARACTER, not a creature: imp_skerrick inherits human's rig — limb names and tags, chains, loco states, natural weapons, sockets, the anatomy recipe and the shared clip library — and states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs imp_skerrick --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
-  "extends": "human",
+  "//": "A CHARACTER, not a creature: imp_skerrick extends demon, its race base, which extends human: the rig, loco states and clip library come from human, the race-wide traits (anatomy recipe, bleed, ...) from demon, and this file states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs imp_skerrick --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
+  "extends": "demon",
   "model": "imp_skerrick",
-  "race": "demon",
-  "sidecarVoxelsPerMetre": 10,
   "anatomy": {
     "limbs": {
       "snout": {
@@ -247,7 +245,6 @@
         ]
       },
       "strike": {
-        "blunt": 2.4,
         "cut": 4
       }
     },
@@ -266,7 +263,6 @@
         ]
       },
       "strike": {
-        "blunt": 2.4,
         "cut": 4
       }
     },
@@ -287,18 +283,6 @@
     }
   ],
   "states": [
-    {
-      "name": "squirm",
-      "bodyYOffset": null
-    },
-    {
-      "name": "crawl",
-      "bodyYOffset": null
-    },
-    {
-      "name": "crawl.shins",
-      "bodyYOffset": null
-    },
     {
       "name": "tailsway",
       "overlay": true,
