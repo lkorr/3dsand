@@ -1474,5 +1474,63 @@ pass at its current depth. That is a change to the claim, so it was not made.
 Merged on `baseline-repair` (7 worktree packages): 26 of the 30 inherited reds are green, determinism ef7d9a06 unmoved. Four are marked `fail` in baseline.json pending OWNER decisions, each attributed above:
 - rain-fire — clear-sky arm is a coin flip on a one-voxel leaf sheet (30..71% across 5 sites); options: run 800 ticks / floor ~25% / thicker fuel bed. See "Baseline repair C".
 - waterbody (pass N arm 2) — a player-dug pool splits into two components and the relevel counts 0 surface columns; water-relevel design work. See "Baseline repair C".
-- swing-plane E — the swing wounds (hp 1107 -> 1092.6) but cuts ~0.1 vox deep, never emptying a collider cell the gate counts; introduced in 5a23e96..e959c65 (demons D5 / fight64 round 3 S, F, C). See "combat package E".
+- swing-plane E — the swing wounds (hp 1107 -> 1092.6) but cuts ~0.1 vox deep, never emptying a collider cell the gate counts; introduced in 5a23e96..e959c65 (demons D5 / fight64 round 3 S, F, C). See "combat package E". (Corrected below: introduced by 64993fd, D4's standing reach cap; the depth never changed.)
 - damage-sources — the fixture's left forearm stands in the stone's path, so the cuirass is never struck; introduced in 9848dbd..1dd67ac, pose vs fixture is the owner's call. See "combat package E".
+
+## 2026-10-12 — `swing-plane` E attributed to demons D4's standing reach cap (64993fd); the cut did NOT get shallower; still red, owner decision
+
+No hash change, nothing rebaselined, `swing-plane` stays `fail`. No engine or
+gate behaviour changed in this entry. It corrects the attribution above
+("combat package E" and the orchestrator's list).
+
+**Introducing commit: 64993fd** (demons D4, 10-04: "the standing-body reach
+cap (pose.cpp: the imp float)"). It reached first-parent main through c597987
+(the D5 merge of main), inside the bisected range 5a23e96..e959c65.
+`Mob::StepGait` now draws a STANDING body no higher than every planted foot can
+reach. That lowers the dummy's drawn limbs inside an unchanged box. The gate
+aims at `MobOrigin + 0.60 x worldSize.y`, which is the BOX and not the drawn
+body, and the blade's path did not change (the avatar's shoulder is 194.1 in
+both arms below). So the edge now crosses the dummy higher up: armU.R, head,
+armU.L. Before, it took armU.R, torso, armU.L.
+
+Proved with one A/B in one binary. A temporary env switch around the cap,
+since removed, ran `--gate swing-plane` in both arms:
+- cap ON (shipped): 6 body hits, art 26428 -> 26412, collider 3320 -> 3320,
+  `0 of 0 wounded`, FAIL.
+- cap OFF: 9 body hits (torso on ticks 7-9), art 26428 -> 26401, collider
+  3320 -> 3319 on tick 10 (armU.L), `1 of 1 wounded`, PASS. That is exactly the
+  "1 of 1, one collider voxel" the bisect saw at acd0d51 and 5a23e96.
+- Per-tick tip speed, power, align and kerf depth are IDENTICAL in both arms:
+  speed 41.8 / 73.7 / 56.7 / 77.9 / 48.4 / 36.9 vox/s, depth 0.10 / 0.10 /
+  0.11 / 0.12 / 0.10 / 0.09.
+
+**The kerf depth did not regress.** Nothing that computes it changed in the
+range: melee.cpp, avatar.*, player.*, kerf.h, items.json and tuning.json are
+all untouched in 5a23e96..e959c65. The depth is
+`(gore.cutDepth 0.08 + gore.cutDepthPower 0.15 x power) x heft 1.0`. The pass
+before the range was a one-collider-cell coincidence. A 0.1-voxel kerf is 0.8
+art voxels at 8 art voxels per cell. It only empties a 512-art collider cell
+that already sat within a few voxels of the 256 majority line.
+
+**The swing speed did not regress either, and it is not a real swing.** E's
+`drive(-34, 0, true)` is the freeform mouse drag that was removed from the game
+on 2026-09-25 (see the melee.h header; nothing outside this gate calls
+`MeleeState::Feed` any more). The arithmetic is 34 px/tick x aimGainX 0.005
+rad/px x 30 Hz = 5.1 rad/s. At ~12 vox of tip radius that is ~61 vox/s, which
+matches the 37-81 measured. A real cut is a stroke program. `npc-strike`
+measures the sword's at ~220 vox/s (full power), and each strike removes 1-8
+collider voxels and 26-68 art voxels. E's drag runs at about a third of that
+speed.
+
+Nothing was changed, per the package's brief (no claim change, no tuning
+change, no new mechanics). The options, for the owner:
+1. Drive E with the player's real sword stroke, the stroke program a click
+   fires, so "a real swing" really is one. This changes the fixture, not the
+   claim.
+2. Count E's wound on the authoritative lattice (`LimbArtVoxelCount`), which
+   the cut visibly reduces every tick. This changes the claim.
+3. Aim E at the drawn chest (a torso limb voxel) instead of the box. This
+   restores the pre-range geometry, but only to the same one-voxel margin, so
+   it is not a fix by itself.
+4. If 0.1-0.23 world voxels per tick is too shallow for a sword, that is
+   `gore.cutDepth` / `cutDepthPower` (unchanged since 09-14), not a regression.

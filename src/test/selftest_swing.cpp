@@ -1798,6 +1798,9 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
       //
       // Taken about the LIVE shoulder and against the LIVE chest, so it is
       // right on any ground and needs no flat-spot search (see the anchor note).
+      // CAVEAT (2026-10-12): the "chest" is the live BOX's 60% height, not the
+      // drawn body. Since 64993fd a standing body is drawn lower in its box,
+      // so this aims nearer the head than the chest.
       const Vec3 tgtChest{(float)dx + dd.worldSize.x * 0.5f,
                           mobs.MobOrigin(tid).y + dd.worldSize.y * 0.60f,
                           (float)dz + dd.worldSize.z * 0.5f};
@@ -1958,11 +1961,15 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
       const bool struck = hitNear > 0;
       const bool spared = farId != 0 && farTotal > 0 && farLost == 0;
       hitOk = struck && spared;
-      // RED SINCE first-parent 5a23e96..e959c65 (tests/BASELINE.md,
-      // 2026-10-12 "combat package E"): the cut lands on the skin lattice,
-      // about 3 art voxels a tick at a 0.1-voxel kerf, but empties no
-      // COLLIDER cell, and the collider is what LimbVoxelCount reads. See the
-      // "E (tick N)" lines above.
+      // RED SINCE 64993fd, demons D4's standing reach cap (tests/BASELINE.md,
+      // 2026-10-12 "swing-plane E attributed"). The cut lands on the skin
+      // lattice, about 3 art voxels a tick at a 0.1-voxel kerf, but empties
+      // no COLLIDER cell, and the collider is what LimbVoxelCount reads. The
+      // cap drew the standing dummy lower inside its box, so this box-aimed
+      // edge moved from the torso to the head. Before that, the pass was one
+      // collider voxel. The depth and the drag's ~6 m/s did not change; the
+      // drag is the freeform mode retired on 09-25, not a real stroke. See
+      // the "E (tick N)" lines above.
       check(struck, "a real swing wounds the limbs the edge passed through");
       check(spared,
             "...and leaves a body outside the arc completely alone");
