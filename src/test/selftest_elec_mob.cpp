@@ -50,6 +50,7 @@
 // Y), walls one tick and contents the next (the first op on a cell wins), and
 // the world is regenerated on the way out.
 
+#include <map>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -63,7 +64,7 @@
 #include "sim/oprecord.h"
 #include "sim/tuning.h"
 #include "sim/voxload.h"   // kBodyStainAmtMax: a full coat
-#include "sim/weather.h"   // the dry sky elec-body-matter pins
+#include "sim/weather.h"   // the dry sky elec-body-matter / elec-stun pin
 #include "sim/worldgen_run.h"
 #include "test/selftest.h"
 #include "test/support.h"
@@ -375,6 +376,19 @@ Status GateElecStun(Ctx& c, std::string& detail) {
     if (!ok) fails += (fails.empty() ? "" : "; ") + what;
   };
 
+  // A DRY day (as elec-body-matter): the scheduled sky can rain on the
+  // harness, and rain is a conducting coat. Measured 2026-10-12: at tick 85000
+  // both bodies stood in rain (water 5,999 / 3,767 coat units at the pulse),
+  // the wet rule lifted the dummy's arc dose to eff P 2,862, it died of the
+  // shock, and the zombie -- its only target -- had nobody left to attack,
+  // so "attacks again after the stun" measured the weather. Restored on the
+  // way out.
+  struct ClearSky {
+    std::string was = weather::Override();
+    ClearSky() { weather::SetOverride("clear"); }
+    ~ClearSky() { weather::SetOverride(was); }
+  } clearSky;
+
   // ---- A. the zombie ------------------------------------------------------
   const Tuning saved = CurrentTuning();
   {
@@ -400,7 +414,10 @@ Status GateElecStun(Ctx& c, std::string& detail) {
   float moved = 0.0f;
   bool ragdolledA = false;
   uint64_t zombie = 0, dummy = 0, dropped = 0;
-  Mob::ShockRecord zrec;
+  Mob::ShockRecord zrec, drec;
+  bool dummyAlive = false;
+  std::string dummyCoat, zombieCoat;
+  float dummyHpPre = -1.0f;
   {
     support::TickRig rig(c, t, f.chunk);
     BuildFix(rig, f);
@@ -411,11 +428,32 @@ Status GateElecStun(Ctx& c, std::string& detail) {
       for (const ai::AttackRequest& a : c.mobs.AttackRequests()) n += a.mobId == id;
       return n;
     };
+    // ATTRIBUTION: the dummy's coat (what makes a body "wet" to the current:
+    // any conducting material in it) when the pulse starts -- summed over its
+    // limbs, the heaviest materials.
+    auto coatNote = [&](uint64_t id) {
+      std::map<uint32_t, uint32_t> amt;
+      uint32_t vox = 0;
+      for (int li = 0;; li++) {
+        const LimbCoat* lc = c.mobs.LimbCoatOf(id, li);
+        if (!lc) break;
+        vox += lc->voxels;
+        for (const CoatEntry& e : lc->top)
+          if (e.mat != 0) amt[e.mat] += e.sumAmt;
+      }
+      std::string s = Format("%u vox:", vox);
+      for (const auto& [m, a] : amt)
+        s += Format(" %s %u", m < c.mats.size() ? c.mats[m].name.c_str() : "?", a);
+      return s;
+    };
     for (int i = 0; i < preTicks; i++) {
       c.mobs.ClearAttackRequests();
       Tick(rig);
       preAttacks += attacksBy(zombie);
     }
+    dummyCoat = coatNote(dummy);
+    zombieCoat = coatNote(zombie);
+    if (const Mob* dm = c.mobs.FindMobById(dummy)) dummyHpPre = dm->TotalHp();
     const uint64_t dropped0 = c.mobs.ShockAttacksDropped();
     Vec3 anchor{};
     bool haveAnchor = false;
@@ -454,6 +492,10 @@ Status GateElecStun(Ctx& c, std::string& detail) {
     }
     dropped = c.mobs.ShockAttacksDropped() - dropped0;
     zrec = ShockOf(c, zombie);
+    // ATTRIBUTION: the zombie's only target. A dead dummy leaves the zombie
+    // nothing to attack, so "never attacked again" is then about the dummy.
+    drec = ShockOf(c, dummy);
+    dummyAlive = c.mobs.FindMobById(dummy) != nullptr && c.mobs.IsAlive(dummy);
   }
   SetCurrentTuning(saved);
   check(preAttacks > 0, Format("A: the zombie never attacked before the shock (%d ticks): the "
@@ -504,10 +546,14 @@ Status GateElecStun(Ctx& c, std::string& detail) {
   detail = Format(
       "A zombie on an arc-fed plate: %d attacks in %d ticks before; stunned %d ticks (floor %d) "
       "with %d attacks, %llu refused by the stun, %d stroke ticks, moved %.2f vox, %u twitches, "
-      "%s; attacked again %d ticks after (%d after in all) [%s] | B lightning-fed plate: [%s]%s%s",
+      "%s; attacked again %d ticks after (%d after in all) [%s]; its target the dummy %s [%s] "
+      "(hp %.1f and coat {%s} at the pulse; the zombie's coat {%s}) "
+      "| B lightning-fed plate: [%s]%s%s",
       preAttacks, preTicks, stunned, stunTicks, stunAttacks, (unsigned long long)dropped,
       strokeWhileStunned, moved, zrec.twitches, ragdolledA ? "KNOCKED DOWN" : "never down",
-      recoverAt, postAttacks, RecNote(zrec).c_str(), RecNote(brec).c_str(),
+      recoverAt, postAttacks, RecNote(zrec).c_str(), dummyAlive ? "alive" : "DEAD",
+      RecNote(drec).c_str(), dummyHpPre, dummyCoat.c_str(), zombieCoat.c_str(),
+      RecNote(brec).c_str(),
       fails.empty() ? "" : " | FAILED: ", fails.c_str());
   std::printf("elec-stun: %s (%s)\n", fails.empty() ? "PASS" : "FAIL", detail.c_str());
   return fails.empty() ? Status::Pass : Status::Fail;
