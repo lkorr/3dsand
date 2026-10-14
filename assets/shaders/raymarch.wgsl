@@ -12627,13 +12627,16 @@ const MOLTEN_CRACK_MEAN : f32 = 0.486;
 const MOLTEN_FP_FADE_LO : f32 = 0.25;
 // ...and is fully its mean at this many.
 const MOLTEN_FP_FADE_HI : f32 = 0.6;
-// The macro crust (shadeMolten): the crack law this many times coarser, and
-// how far its rifts/rafts shift the averaged crack distribution (the field's
-// spread is ~0.17, so 0.7 moves a raft's mean below the knee and a rift's
-// into it; 0.9 pushed the rifts to the ramp's yellow top and the lake read
-// creamy).
+// The macro crust (shadeMolten): the crack law this many times coarser; its
+// RIFTS are the crack value's upper tail (RIFT_LO..HI, ~the top 9% of the
+// field), which shift the averaged crack distribution up by up to GAIN, and
+// everything else (the rafts) shifts down by GAIN x RAFT -- chosen so the
+// mean shift is ~0 and a distant lake keeps the near crust's mean emission.
 const MOLTEN_MACRO_SCALE : f32 = 6.0;
-const MOLTEN_MACRO_GAIN : f32 = 0.7;
+const MOLTEN_MACRO_GAIN : f32 = 0.5;
+const MOLTEN_MACRO_RIFT_LO : f32 = 0.68;
+const MOLTEN_MACRO_RIFT_HI : f32 = 0.82;
+const MOLTEN_MACRO_RAFT : f32 = 0.093;
 
 // What the octaves are (they were crustCracks' body, now crustCracksFp's):
 // Advection: each octave drifts at its own rate and direction, so the crust
@@ -12783,6 +12786,9 @@ fn shadeMolten(m : Material, cell : vec3<i32>, hitP : vec3f,
   // (the pattern is foreshortened along the view, and the longer axis is the
   // one that aliases -- the trilinear-mip rule). Floored at a 0.2 cosine so a
   // grazing pool keeps some structure rather than going flat at the horizon.
+  // NOT the geometric mean of the axes: tried, and a grazing pool kept
+  // half-resolved hot cracks that the TAA accumulates in linear HDR -- an
+  // orange speckle far brighter than the crust's tonemapped mean.
   let cosV = max(abs(dot(n, rd)), 0.2);
   let fpM = max(tVox, 1.0) * VOXEL_METERS * R.tanHalfFov / (R.viewPx * 0.5) / cosV;
 
@@ -12898,7 +12904,12 @@ fn shadeMolten(m : Material, cell : vec3<i32>, hitP : vec3f,
     // Only once MOST of the crust is averaged: while the plates still
     // resolve, the small averaged share (the finest octave, from ~10 m out)
     // must not paint the coarse rifts over them as a soft glowing haze.
-    let shift = (mk.x - MOLTEN_CRACK_MEAN) * MOLTEN_MACRO_GAIN * pool *
+    // RIFTS ARE THIN: only the crack field's upper tail (its ridges) warms,
+    // and everything else -- most of the lake -- cools a little, so the
+    // shift's mean stays ~0. A symmetric shift (the first cut) made half the
+    // lake "rift" and drew a distant pool as pale tan blobs at night.
+    let rift = smoothstep(MOLTEN_MACRO_RIFT_LO, MOLTEN_MACRO_RIFT_HI, mk.x);
+    let shift = (rift - MOLTEN_MACRO_RAFT) * MOLTEN_MACRO_GAIN * pool *
                 smoothstep(0.35, 0.85, ck.y);
     var q = array<f32, 16>(0.1616, 0.2317, 0.2800, 0.3197, 0.3563, 0.3920, 0.4279, 0.4639,
                            0.5003, 0.5377, 0.5751, 0.6134, 0.6524, 0.6947, 0.7458, 0.8225);
@@ -15281,7 +15292,7 @@ const FAR_FP_STAIR_START : f32 = 2.5;   // px per element: untouched
 // the irradiance grid's reach at the seam and grows with the cells, as the
 // pool's light on a distant hillside should. Strength is per unit albedo,
 // tuned against the near rim at the seam at night.
-const FAR_MOLTEN_SPILL : f32 = 0.8;
+const FAR_MOLTEN_SPILL : f32 = 0.35;
 fn farMoltenSpill(level : u32, a : vec3<i32>) -> vec3f {
   let b = farBox(level);
   var acc = vec3f(0.0);
@@ -16627,6 +16638,7 @@ fn fs(in : VSOut) -> FSOut {
           groundY = f32(farMapTop(fs2.e) + 1);
           let skinM = farPalMat(&materials, (fs2.e >> 16u) & 0x7Fu);
           let subM = farPalMat(&materials, fs2.sub);
+          var skinA = paletteMean(materials[skinM]);
           if (far.mat == skinM || far.mat == subM) {
             fSurf = true;
             // The cover: this sub-column's bit, or the cell's fraction once a
@@ -16635,7 +16647,6 @@ fn fs(in : VSOut) -> FSOut {
             // The cover (coverWeight): the cell's covered fraction and the
             // first covered entry's plant, in the near side's column order.
             let cb = (fs2.q & vec4<u32>(FAR_MAP_COVER_BIT)) != vec4<u32>(0u);
-            var skinA = paletteMean(materials[skinM]);
             if (any(cb)) {
               let frac = dot(select(vec4f(0.0), vec4f(0.25), cb), vec4f(1.0));
               let ce = select(select(select(fs2.q.w, fs2.q.z, cb.z), fs2.q.y, cb.y),
@@ -16648,15 +16659,29 @@ fn fs(in : VSOut) -> FSOut {
               skinA = mix(skinA, cc, cw);
               if (n.y > 0.5) { albedo = mix(albedo, cc, cw); }
             }
-            if (wLit > 0.0 && fs2.gok) {
-              let nS = normalize(vec3f(-fs2.g.x, 1.0, -fs2.g.y));
-              lamSm = wrapDiffuse(dot(nS, keyLightDir()), TUNE_DIFFUSE_WRAP);
-              faceSm = nS.y * nS.y + nS.x * nS.x * TUNE_FACE_X + nS.z * nS.z * TUNE_FACE_Z;
-              nSh = normalize(mix(n, nS, wLit));
-              let riserA = mix(skinA, paletteMean(materials[subM]),
-                               1.0 - 1.0 / max(1.0, max(abs(fs2.g.x), abs(fs2.g.y))));
-              smoothAlb = mix(skinA, riserA, farRiserShare(fs2.g, rd));
-            }
+          }
+          // THE STAIRCASE'S OWN RISERS (farTerraceLightW). A level-L step is
+          // 2^L fine voxels tall, so its riser shows the column's DEEPER
+          // layers (under the skin and sub-skin: cinder, stone, ...), which
+          // the skin/sub-skin test above does not call the surface -- and in
+          // the ticket's ashlands those risers were the whole stripe. A hit at
+          // or under the top of the column it faces into is that column's
+          // side, not something standing on the ground (a trunk, a boulder
+          // stands ABOVE the top), so it takes the staircase average too.
+          // Only once wL engages; fSurf itself (which the indirect terms read)
+          // keeps its meaning.
+          var hfHit = fSurf;
+          if (!hfHit && wL > 0.0) {
+            hfHit = hitP.y <= farColumnTop(flv, hitP - n * 0.25) + 0.25;
+          }
+          if (hfHit && wLit > 0.0 && fs2.gok) {
+            let nS = normalize(vec3f(-fs2.g.x, 1.0, -fs2.g.y));
+            lamSm = wrapDiffuse(dot(nS, keyLightDir()), TUNE_DIFFUSE_WRAP);
+            faceSm = nS.y * nS.y + nS.x * nS.x * TUNE_FACE_X + nS.z * nS.z * TUNE_FACE_Z;
+            nSh = normalize(mix(n, nS, wLit));
+            let riserA = mix(skinA, paletteMean(materials[subM]),
+                             1.0 - 1.0 / max(1.0, max(abs(fs2.g.x), abs(fs2.g.y))));
+            smoothAlb = mix(skinA, riserA, farRiserShare(fs2.g, rd));
           }
         }
       }
@@ -16925,7 +16950,7 @@ fn fs(in : VSOut) -> FSOut {
       }
       // A heightfield hit lit as the smooth hill (wL) has no tread/riser
       // crease to darken either: the crease AO eases out on the same ramp.
-      if (fSurf) { ao = mix(ao, 1.0, wL); }
+      if (lamSm >= 0.0) { ao = mix(ao, 1.0, wL); }
       // The occupied-cell-above term stays on top: it is what darkens the
       // ground under a flattened canopy at levels >= 5, where the crown is
       // painted onto the surface cell and nothing sits above it to occlude.

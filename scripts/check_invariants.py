@@ -2351,6 +2351,8 @@ def check_burn_tint_sites():
             "litColorO takes an already-tinted emission from its caller",
         ("raymarch.wgsl", "let emis = f32(m.emission) / 255.0;"):
             "moltenEmit (shadeMolten): lava, an OPAQUE liquid, which can never be foliage",
+        ("raymarch.wgsl", "acc += moltenRamp(mm, 0.62) * (f32(mm.emission) / 255.0)"):
+            "farMoltenSpill: isMoltenMat taps only, an OPAQUE liquid, never foliage",
         ("raymarch.wgsl", "(f32(materials[mat].emission) / 255.0) * fl"):
             "the media march: gases only, and no gas carries the flag",
     }
