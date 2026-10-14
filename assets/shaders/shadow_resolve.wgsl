@@ -609,11 +609,22 @@ const FAR_GI_W_RING : f32 = 0.09375;
 const FAR_GI_OMEGA_NORMAL : f32 = 0.8418;
 const FAR_GI_OMEGA_RING : f32 = 0.6802;
 // The burial weight of a point (raymarch.wgsl farHitBuried, verbatim: the
-// column one sub-column out along `n`, FAR_BURIED_LO..HI fine voxels under its
-// terrain top). -1 = no column.
+// ground in front of the face -- farFrontTop, the LOWEST of the four
+// sub-column tops of the level cell half a sub-column out along `n` --
+// FAR_BURIED_LO..HI fine voxels over the point; raymarch.wgsl farFrontTop says
+// why it is not one column). -1 = no column.
+fn farFrontTop(level : u32, p : vec3f, n : vec3f) -> f32 {
+  let w = f32(1u << (farCellShift(level) - 1u));
+  let q = p + n * (0.5 * w);
+  let c = vec2<i32>(floor(vec2f(q.x, q.z) / w)) >> vec2<u32>(1u);
+  let b = farBox(level);
+  if (any(c < b.lo.xz) || any(c >= b.hi.xz)) { return -1e9; }
+  let e = farMap[farMapCell(level, c)];
+  return f32(min(min(farMapTop(e.x), farMapTop(e.y)), min(farMapTop(e.z), farMapTop(e.w))) + 1);
+}
 fn farBuriedW(level : u32, p : vec3f, n : vec3f) -> f32 {
   let w = f32(1u << (farCellShift(level) - 1u));
-  let top = farColumnTop(level, p + n * w);
+  let top = farFrontTop(level, p, n);
   if (top < -1e8) { return -1.0; }
   return smoothstep(24.0 + 2.0 * w, 48.0 + 2.0 * w, top - p.y);
 }
