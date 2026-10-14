@@ -387,6 +387,40 @@ are the OTHER half of this frame; they are not additive with `nomicro`.
    with `SANDVOX_FRAMES_PASSES` + `SANDVOX_GPU_TIMER_SERIAL=1`). Daylight
    capture (`SANDVOX_AT_MINUTE=660`, `SANDVOX_AT_SHOT_EVERY=15`): no seam
    lines in any of the 40 flight frames.
+   **Attribution of the wave-1014 render growth (2026-10-14, b9f3c2d).** One
+   exe (b9f3c2d), asset trees only (SANDVOX_ASSET_DIR): `base` = main
+   ab6b5c6's raymarch/shadow_resolve/cloud.wgsl + tuning.json; `full` =
+   wave-1014's; each suspect arm = `full` with that commit's shader diff
+   reverse-applied (`refine2` = `full` with render.farRefineLevel 2).
+   `SANDVOX_GPU_TIMER_SERIAL=1`, `SANDVOX_FRAMES_PASSES`, `SANDVOX_AT_MINUTE=720`,
+   no F5, exclusive, arms interleaved, n=1 each (differences under ~0.15
+   ms are noise). Scenarios: the ticket flight (595 frames) and the ticket
+   camera held still at noon (600 frames). **The pass that grew is
+   `rm_world` (the primary raymarch) and nothing else**: base -> full
+   +1.83 / +1.56 ms (flight, tick / non-tick frames) and +1.33 / +2.11
+   (static). Every other pass is within noise; tick-frame GPU totals are
+   equal in base and full (26.3 / 26.2 ms flight, 18.2 / 18.0 static), so
+   the earlier "tick frame 19 -> 25.8 ms" was a cross-session comparison
+   (different exe, different C++), not a shader cost -- the C++ side of the
+   merge was not varied here. `rm_world` ms per frame SAVED by reverting
+   each commit (full minus arm):
+
+   | commit (owner) | flight tick | flight non-tick | static tick | static non-tick |
+   |---|---|---|---|---|
+   | base -> full, total | +1.83 | +1.56 | +1.33 | +2.11 |
+   | 9058556 lod-seam far-ground openness (CURRENT cost; being reworked into the shadow-patch cache) | 1.38 | 1.17 | 1.12 | 1.77 |
+   | 3f768dc shadow-cache fallback probes | 0.34 | 0.39 | ~0 | ~0 |
+   | 22063f5+30e559d+baded23 molten/cloud + terrace/spill | 0.13 | 0.29 | 0.07 | 0.16 |
+   | 93fe630 render.farRefineLevel 2 -> 8 (tuning) | 0.12 | 0.25 | 0.21 | 0.18 |
+   | 93fe630 desert burial (shader) | ~0 | ~0 | ~0 | ~0 |
+   | a15a37e lye liquid surface | ~0 | 0.10 | ~0 | ~0 |
+   | c8120c7 seam bed shadow | not split (its diff no longer reverse-applies; inside the openness rework's lines) | | | |
+
+   The openness change is 60-85% of the growth everywhere; shadow-cache
+   probes matter only in flight (cache misses when the view moves);
+   the rest are each under 0.3 ms. Arms: `build/mkarms.sh`, runs
+   `build/attr.sh`, table `build/attrsum.py` in the worktree that wrote
+   this (not committed; the recipe above is enough to redo it).
 6. **Unbilled CPU frame-path work** — player collision runs a
    `std::function` per cell (~600 cells x dozens of calls per frame, fluid
    mirror evaluated before the kind lookup); avatar `FindClip` is a linear
