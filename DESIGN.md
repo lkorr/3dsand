@@ -17351,6 +17351,32 @@ where you hear from either (§12b, "The ears are on the character").
     terraces are real relief, and that flattened every distant hill: luminance
     std of `screenshot_cascade` rows 380-760 went 27.6 -> 23.4 (Rec.709 luma,
     before/after); keyed on the element it is 27.2.
+  - **...and past the handoff the terraces are lit and painted as the hill**
+    (`farTerraceLightW`, 2026-10-14, ticket `2026-10-13_21-00-54` follow-up).
+    Keyed on the element, the average almost never engages (the kFarN law
+    keeps cells 3-8 px), so a level-L staircase -- 2^L fine voxels per step,
+    the same riser AREA as the near field's one-voxel steps in 2^L-times
+    fewer, taller bands -- read as contour stripes on every distant slope,
+    worst where skin and riser differ (pale tephra over black basalt in the
+    ashlands; under an overcast nothing else shades a hill). Now a distance
+    ramp from the handoff (exactly the cube shade there, so no seam) to 3x
+    the handoff eases a HEIGHTFIELD hit (fSurf) to the staircase average --
+    the smooth map normal for Lambert, face weight and the shading normal,
+    the tread/riser-share albedo, and no crease AO. This is the cut ef553c5
+    was reverted for, minus its fault: the smooth normal carries the slope,
+    so sun and shade sides stay. A level-L riser shows the column's DEEPER
+    layers (cinder, stone under the skin and sub-skin), which the fSurf
+    material test does not call the surface -- and at the ticket camera those
+    risers were most of the stripe -- so a hit at or under the top of the
+    column it faces into (`farColumnTop`) takes the average too; things that
+    stand on the ground sit above that top. fSurf itself, which the indirect
+    terms read, keeps its meaning. It only engages where the surface map
+    vouches for the column, which since 93fe630 (the ground takes the far
+    slots under 128) includes the late biomes; before it, every ashlands /
+    mesa / karst / moor / ... column was refused for a seven-bit slot and no
+    far staircase there had a map to average. Constants
+    `FAR_TERRACE_LIGHT_FROM/TO` (raymarch.wgsl); TO = 1e9 restores the
+    element-only rule.
   - **The cover tint** (`coverWeight`, raymarch.wgsl; the COVER bit of the
     far surface map, worldgen.wgsl `farmap`). The far field has no plants
     (`farCellIsSolid` drops MATF_MICRO) and B's fade thins the near plants to
@@ -18674,7 +18700,7 @@ where you hear from either (§12b, "The ears are on the character").
   this section was written to remove, cut off by a hard circle at the handoff
   sphere. Now both fields call `shadeMolten(m, fineCell, hitP, n, rd, pool,
   tVox)` (predicate `isMoltenMat`, `pool` = 1 for a cascade cell) with the
-  footprint in METRES per pixel (stretched by the view slant), so the law is a
+  footprint in METRES per pixel (stretched by the view slant, long axis; the geometric mean of the axes was tried and left half-resolved hot cracks the TAA accumulates into an orange speckle), so the law is a
   function of distance alone and cannot step at the seam:
   - `crustCracksFp` eases each octave to its mean (0.486, measured) once it
     passes ~0.25-0.6 cycles per pixel, and reports the averaged share;
@@ -18685,13 +18711,24 @@ where you hear from either (§12b, "The ears are on the character").
     plain mean let the hottest quantiles wash the lake to creamy tan). The
     ramp of the average crack value would have been an unlit plate;
   - a MACRO crust (the same law 6x coarser and slower, footprint-filtered
-    itself) shifts that distribution warm along rafts' rifts and cool over
-    them, so a lake seen from a hillside keeps structure at a scale the
+    itself) shifts that distribution warm along its RIFTS (the crack value's
+    upper tail, ~9% of the area; GAIN 0.5 -- at 0.8 the rifts went cream-white) and slightly cool over the rafts between,
+    zero-mean, so a lake seen from a hillside keeps structure at a scale the
     pixels can carry. It enters only once most of the fine crust is averaged,
-    so the near crust is untouched;
+    so the near crust is untouched. (A symmetric shift, the first cut, made
+    half the lake "rift" and drew far pools as pale tan blobs at night.);
   - the 0.4 m per-patch temperature jitter and its pulse fade with the same
     rule (a sub-pixel patch's pulse is temporal sparkle).
   Any emissive opaque liquid (molten glass, molten iron) gets all of it.
+
+  **The pool lights its rim past the seam too** (`farMoltenSpill`). In the
+  window the rim glow is the irradiance grid's (emitters deposit, the gather
+  reads); the cascade has no grid, so the rim went dark at the handoff while
+  the pool glowed. A cascade ground hit now looks at the five cells under and
+  beside the air cell in front of its face, at its own level, and adds a
+  molten tap's ramp-mid colour x emission (centre tap double) x albedo x AO,
+  `FAR_MOLTEN_SPILL` = 0.35 (0.8 drew a bright orange ring round every pool seen low). One far cell of reach, which grows with the
+  level as a distant pool's light on its hillside should.
 
   **Embers are render-only, and that is an architectural choice.** The sim has
   a particle system and a data-driven `emit` reaction — lava emitting fire is
