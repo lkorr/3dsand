@@ -272,6 +272,12 @@ enum class Buf : uint8_t {
   // READ by raymarch.wgsl's fragment stage (renderBGL 46) -- BeginRendering's
   // flush, as for RayStart. Render-private: never hashed, never saved.
   HzLight,
+  // THE TERRAIN FLOW FIELD's window grid (src/sim/flowfield.h): which way
+  // the map's water runs, solved on the CPU from the water's shape. CPU-written
+  // (queue.WriteBuffer) on window moves only; read by the raymarch (renderBGL
+  // 48, waves / foam / film), the arrow overlay, and the `wind_streak` row's
+  // current tracers (shadow group 35). Render-only: never hashed, never saved.
+  FlowGrid,
   // The GI gather request list (assets/shaders/gi_gather.wgsl): block-faces
   // whose one-bounce gather cache is due, appended by raymarch.wgsl's fragment
   // stage (with a dedup bitmap) and consumed by the next frame's gi_prepare /

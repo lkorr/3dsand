@@ -23929,33 +23929,29 @@ funnel stands open in still water, which is instantly and obviously wrong; the
 gate asserts the envelope reaches exactly zero and that the primitive is then
 dropped.
 
-### 9d.3 The stream arm, and the slope trap it walks past
+### 9d.3 The stream arm (REMOVED 2026-10-14 -- see §9d.10)
 
-`CurrentPrimSystem::SeedStreams`. Manning/Chezy: `v = C * sqrt(slope * depth)`,
-direction from the bed gradient. Genuinely independent of components 1-7 -- no
-descriptor needed, and it would work in a world where the ledger did not exist.
-
-`World::Column::slope` IS `Land.slope`, which `worldgen.wgsl:550` states is `g2`:
-accumulated through the HILL octave and deliberately not through detail and
-grain, because `d(slope)/dcolumn` through the grain octave is 96 Q8 -- the whole
-of a gate's range in ONE column. A current built on the fine gradient is
-per-voxel noise. So the MAGNITUDE reads that field directly.
-
-The DIRECTION needs a signed gradient, which `slope` (an absolute sum) does not
-carry and which is not exposed -- the signed `g2` pair lives inside the block
-`check_invariants.py` token-compares against the shader, and widening it would be
-a change to the mirror rather than to this system. So the direction is a central
-difference of the ground height over a +-32 voxel baseline, which is the same
-low-pass by another route: over that span the grain octave (cell 8 voxels,
-amplitude 4) can contribute at most 0.06 voxel/voxel, where a +-1 difference --
-the actual trap -- would give it 2.0.
-
-The probe is scheduled by the WINDOW, not by the tick: the answer is a pure
-function of (seed, window, tuning) and cannot change between window moves, so
-re-probing every tick would be ~1,600 terrain hashes for a result already on the
-list.
+`CurrentPrimSystem::SeedStreams` used to put rivers on the primitive list: a
+slab `CPRIM_STREAM` every 6.4 m of a map river's centreline, one speed per reach
+(Chezy on the surface fall, floored at 0.4 m/s), plus a bed-gradient lattice
+over standing water. The owner's verdict on what that produced -- "the current
+should be less uniform in one direction and depend on the shape of the
+river/lake/ponds" -- is exactly right, and it is structural, not a tuning
+problem: a primitive is an analytic shape about a point, so the slab flowed as
+fast over the shallow margin as over the channel, as fast in a pool as in a
+narrows, stopped dead at every lake, and the lattice gave any pond on a slope a
+uniform downhill current a closed basin cannot have. (The lattice placed nothing
+in the shipped world -- the slope gate refused every authored pool -- and
+`sim.currentStreamMinSlope` went with it.) Terrain flow is now a field SOLVED
+FROM THE WATER'S SHAPE, §9d.10. The primitive list carries events only.
 
 ### 9d.4 The consumers, and the third transcription
+
+`currentAt` (render) is the primitive list PLUS the terrain flow field's window
+grid (`flowGridAt`, §9d.10); `CurrentAtCpu` / `CurrentAtCpuSim` add the same
+grid through `WaterFlowField::Sample`. `currentAtQ` (the GPU sim kernels) sums
+the primitives only -- the grid is not bound to any sim kernel, and
+`sim.currentMode` is off.
 
 * **Render surface advection** -- component 9 evaluates wave phase at
   `position - current*age`. This is what makes flow read as flow. `age` is NOT
@@ -24111,7 +24107,7 @@ a `TUNE_CURRENT_*` constant would be a second, never-read copy of a number.
 
 `sim.currentMode`, `sim.currentVortexGamma` (m^2/s), `sim.currentVortexDecay`
 (s), `sim.currentVortexRadius` (cells), `sim.currentSinkSpeed` (m/s),
-`sim.currentStreamScale`, `sim.currentStreamMinSlope` (Q8), `sim.currentDrag`
+`sim.currentStreamScale` (the rivers' Chezy coefficient, §9d.10), `sim.currentDrag`
 (/s).
 
 The wave knobs are RENDER-side and are `.def` rows, because `raymarch.wgsl`
@@ -24146,10 +24142,12 @@ pair into the cycle's starting position (current wins a file asking for both).
 
 The current arm draws **regardless of `sim.currentMode`**, because
 `currentRenderOn` is its own always-on gate (§9c) -- so the overlay shows the
-resolved primitives whether or not the sim is being pushed by them. What it
-cannot show is a field with no primitives in it: `SeedStreams` and `SeedDrains`
-run every tick, so a world with rivers or draining bodies has arrows and a world
-with still water is honestly empty.
+resolved primitives and the terrain flow grid whether or not the sim is being
+pushed by them. A world with rivers or draining bodies has arrows and a world
+with still water is honestly empty. For the grid alone there is a cheaper view:
+`SANDVOX_FLOW_DUMP=<prefix>` writes every composed window grid to
+`<prefix>_<x>_<z>.bin`, and `python scripts/flow_view.py <bin> <png>` draws it
+(speed colour, a stroke per node).
 
 ### 9d.9 What is NOT here
 
@@ -24160,12 +24158,120 @@ with still water is honestly empty.
   yet. The natural author is M3's jet where it lands, which needs the impact
   point, which is a GPU fact.
 * **No refraction**, per §9d.5.
-* **The stream arm places nothing in the shipped world**, because the authored
-  pools and `pondAt`'s tarns are flat-floored basins and the slope gate refuses
-  them. The arm is correct and will fire on standing water over a real hillside;
-  there is not yet any worldgen that makes such water.
+* **No eddies.** The terrain field is potential flow: irrotational, so no
+  recirculation behind a point bar or in the lee of a bend, and the fastest
+  water in a bend is on the INSIDE (real rivers put it outside, by secondary
+  flow). The look carries the turbulence (§9d.11); the field carries where the
+  water goes.
+* **Player-made water is not routed.** The flow grid is built from the map's
+  water (`worldmap::WaterColumnAt`). A channel the player digs from a river
+  fills, but the field does not flow down it; a basin the player floods is still.
 * **`sim.currentMode` ships at 0.** Flipping it is an owner decision and a
   rebaseline commit, exactly as `sim.windMode` was.
+
+### 9d.10 The terrain flow field: water goes where its shape sends it (added 2026-10-14)
+
+`src/sim/flowfield.{h,cpp}`, `WaterFlow()`. Which way the map's rivers, lakes
+and sea run, as a 2D field over the residency window, SOLVED FROM THE WATER'S
+SHAPE instead of placed along it.
+
+**The model.** Depth-averaged steady flow with Manning friction, linearised:
+discharge per unit width `q = -T grad(phi)` with transmissivity `T = h^(5/3)`,
+continuity `div(q) = 0`, velocity `v = q / h = -h^(2/3) grad(phi)`. On a node
+grid (8 cells = 0.8 m) over the map's water that is one sparse Laplacian with
+harmonic-mean edge conductances, relaxed by SOR. Everything the slab lacked
+falls out of it with no rule written for any of it: a narrows or a shoal
+speeds the water up, a pool slows it, the deep thalweg runs and the shallow
+margin barely moves (`v ~ h^(2/3)`), the bank is zero (a dry node passes
+nothing: a no-flux wall), a river mouth fans into its lake, an outlet draws the
+lake toward it, and water with no driven boundary -- a pond, a basin the map
+does not route -- is exactly still. `kFlowMinDepth` (3 cells) floors the depth
+the solve sees: a one-cell lip at a weir or a lake's sill is real, but at one
+cell it throttled the reach through a single node row.
+
+**The boundary conditions come from the map network, never from the window.**
+Per river (its baked `line`): a reference speed from Chezy on its own fall and
+depth (`sim.currentStreamScale`, clamped to `kRiverMinFlowMs` 0.6 ..
+`kRiverMaxFlowMs` 3 m/s), discharge `Q = v * width * depth`, and a potential
+`phi = C_r - G_r * s` along its arc. Per lake and for the sea: the analytic
+potential of its inlets (2D sources) and outlets (sinks), `phi = phi_0 +/- Q/(pi
+T) ln(r / r0)`. The constants are chained DOWNSTREAM-FIRST (the sea is 0; a
+lake's `phi_0` is set by its outlet; a river's `C` by what it drains into -- its
+lake, the sea, or its parent at the junction), so a river's potential meets its
+lake's at the mouth. Those values are the solver's starting guess, which is why
+260 sweeps converge.
+
+**Discharge, not potential, drives a river.** In every connected piece of water
+(a fall's lip bakes a dry row across a channel; a river leaves the domain and
+comes back), each river's most-upstream 24 cells of arc take its `Q` as an
+INFLOW, shared by transmissivity, and its most-downstream 24 are PINNED to its
+own potential -- except where the piece holds what it is fed by (its source
+lake: no inflow) or drains into (its lake, the sea, its parent: no pin, the
+water carries on). The first version pinned potential at both ends, and a weir's
+shallow lip throttled the whole reach to a third of its speed; a river's flow is
+set by its catchment, not by how hard its channel is to push through. Lake and
+sea nodes are pinned on the block's rim and wherever they are farther than
+`kFlowAnchor` (32 m) from every inlet and outlet, so a big lake's far field is
+the analytic one and the solve spends itself near the mouths.
+
+**World-anchored blocks, so a window move cannot touch it.** The solve runs on
+fixed world blocks -- cores `kFlowBlock` (512 cells) wide on a world-aligned
+lattice, each solved over its core plus a half-core apron (129^2 nodes) -- and a
+node's value is the tent blend of the (up to) four blocks whose centres surround
+it, which gives the apron's least-trusted edge zero weight. Every block is a
+pure function of (map, seed, scale, block coordinate), so the window chooses
+WHICH nodes are uploaded, never their values: the `rivers` gate's pass J asserts
+the current under a swimmer is bit-identical across four window moves (ticket
+2026-10-11_18-39-38 was the strobe the old stream arm made on every move).
+
+**Cost scales with travel.** A block is 15-35 ms (the column probe dominates).
+Holding still costs nothing; a window move re-composes 67^2 nodes from cached
+blocks and uploads 36 KB (`flowGrid`, renderBGL 48 / shadowBGL 35). New blocks
+are solved on `std::async` threads as soon as the window comes within half a
+block of needing them (at most two in flight) and joined only when a composition
+needs one -- deterministic whatever the timing, because the result is a pure
+function of the block's position. The first window after a load solves its nine
+blocks synchronously (~150 ms, once). A background solve reads the current world
+map, so `SetCurrentWorldMap` and `LoadWorldMap`'s temporary swap call
+`WaterFlowQuiesce()` first.
+
+**Authority.** A pure function of (map, seed, tuning, position), so it carries
+the sim licence the stream arm did: `CurrentAtCpuSim` (the player's swim stroke,
+NPCs afloat) reads it. It is not hashed (the player is not part of the world
+hash) and no GPU sim kernel reads it.
+
+**Gates.** `rivers` passes I (main's middle runs downstream at no less than the
+floor, nothing in the air over it), K (the cross-section: 0.8 of the half-width
+out is under 0.8 of the thalweg's speed) and J (window moves).
+
+### 9d.11 What moving water looks like (added 2026-10-14)
+
+`raymarch.wgsl`, "WHAT MAKES MOVING WATER LOOK MOVING". Drifting the wind chop
+downstream says "this surface is going somewhere" but still reads as a lake on
+a conveyor. A current writes its own marks, and three carry the read:
+
+* **Streaks** (`flowStreakSlope`): three octaves of noise in the flow's frame,
+  stretched up to 5:1 along it, in the same two-phase advected frame as the chop.
+* **Boils** (`flowBoils`): one possible dome per 3.2 m lattice cell, rising,
+  spreading and fading over 5 s; the dome wipes the chop under it (the slick).
+* **Foam lines** (`flowFoamLines`, through `waterFoam`): noise stretched 25:1
+  along the flow, thresholded to sparse lines and broken into dashes stretched
+  the same way, riding the water. Density rises with speed squared and with the
+  SHEAR across the flow (two more taps of the grid), which is where real foam
+  lines collect: a bank, the edge of the thalweg.
+
+All scale with `flowMarkStrength` (0.04 .. 0.55 m/s), so a river's slow margins
+and a lake's middle stay glassy and still water pays one compare. The chop
+keeps 70% of its amplitude on fully flowing water.
+
+**The frame trap.** "Noise in the flow's frame" first meant `(p . dir, p .
+perp)` with the local `dir` -- a rotation about the WORLD ORIGIN by an angle
+that varies across a bend. At 1.3 km from the origin one degree of bend per
+metre shears the pattern by 23 m per metre, and the streaks came out diagonal to
+the river and the foam as marbling. The frame is therefore one of 16 FIXED
+directions, the pattern the variance-preserving blend of the two that bracket
+the local flow (`flowFrame`): each a rigid rotation of the world, a bend a
+crossfade between them.
 
 ## 9c. The terrain viewer and the edit layer (added 2026-08-27)
 

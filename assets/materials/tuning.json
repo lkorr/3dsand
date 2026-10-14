@@ -680,7 +680,6 @@
     "currentVortexRadius": 40,
     "currentSinkSpeed": 3,
     "currentStreamScale": 1.2,
-    "currentStreamMinSlope": 24,
     "currentDrag": 6,
     "windMode": 1,
     "gasMode": 1,

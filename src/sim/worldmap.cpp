@@ -32,6 +32,10 @@
 
 using nlohmann::json;
 
+// sim/flowfield.h: finish the terrain-flow solves that read the map before it
+// is replaced (declared here so this file need not include world.h).
+namespace sandvox { void WaterFlowQuiesce(); }
+
 namespace worldmap {
 namespace {
 
@@ -2376,6 +2380,7 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   // sites does not matter. Exact because the twin is the height mirror the
   // `terrain` gate holds to the shader per voxel.
   {
+    sandvox::WaterFlowQuiesce();   // see SetCurrentWorldMap
     WorldMapData prev = std::move(Slot());
     Slot() = out;
     for (WorldMapData::StampSite& st : out.sites) {
@@ -3021,7 +3026,12 @@ const std::vector<StructurePlacement>* StructureOverrideSlot() {
 }
 
 const WorldMapData& CurrentWorldMap() { return Slot(); }
-void SetCurrentWorldMap(WorldMapData map) { Slot() = std::move(map); }
+// A terrain-flow solve (sim/flowfield.h) may be reading the map on a
+// background thread; it is finished before the map is replaced.
+void SetCurrentWorldMap(WorldMapData map) {
+  sandvox::WaterFlowQuiesce();
+  Slot() = std::move(map);
+}
 
 const WorldMapData::Region* WorldMapData::RegionAt(int x, int z) const {
   // Even-odd crossing test at the column CENTRE (x + 1/2, z + 1/2), in

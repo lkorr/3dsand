@@ -4368,15 +4368,82 @@ fn currentPrimAt(p : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
   return acc;
 }
 
+// ==================== THE TERRAIN FLOW FIELD (render side) ==================
+// src/sim/flowfield.h: which way the map's rivers, lakes and sea run, solved on
+// the CPU from the water's SHAPE (depth-weighted potential flow) and uploaded
+// as a window grid of world-aligned nodes on window moves only. The words:
+//   [0] origin x  [1] origin z (world cells, i32)  [2] nodes per axis, 0 = none
+//   per node (row-major in z), two words:
+//     w0 = vx | vz << 16       i16, 1/FLOW_VEL_Q cells/s
+//     w1 = surf | bed << 16    i16 world cells; surf == FLOW_DRY is land
+// `flowGrid` is declared only by the shaders that draw the current (raymarch,
+// wind_streak, debug_current); LoadShader (resources.cpp kFlowBound*) keeps the
+// BOUND block for a body that declares `> flowGrid` and the stub for every
+// other, exactly as it does the draft reader; check_shaders.sh does the same.
+// >>>FLOW_BOUND_BEGIN<<<
+const FLOW_BOUND : bool = true;
+fn flowWord(i : u32) -> u32 { return flowGrid[i]; }
+// >>>FLOW_BOUND_END<<<
+// >>>FLOW_UNBOUND_BEGIN<<<
+const FLOW_BOUND : bool = false;
+fn flowWord(i : u32) -> u32 { return 0u; }
+// >>>FLOW_UNBOUND_END<<<
+// Must match flowfield.h kFlowStep / kFlowVelQ / kFlowDry / kFlowHeaderWords.
+const FLOW_STEP : f32 = 8.0;
+const FLOW_VEL_Q : f32 = 128.0;
+const FLOW_DRY : i32 = -32768;
+const FLOW_HEADER : u32 = 4u;
+fn flowI16Lo(w : u32) -> i32 { return bitcast<i32>(w << 16u) >> 16u; }
+fn flowI16Hi(w : u32) -> i32 { return bitcast<i32>(w) >> 16u; }
+
+// World cells/s at `p`, horizontal (y = 0). TRANSCRIBED from — and by —
+// WaterFlowField::Sample (flowfield.cpp): the same bilinear weights over the
+// same quantised words, the same vertical gate and the same profile, so the
+// player is pushed by the current the surface draws. Change both together.
+fn flowGridAt(p : vec3f) -> vec3f {
+  if (!FLOW_BOUND) { return vec3f(0.0); }
+  let n = i32(flowWord(2u));
+  if (n == 0) { return vec3f(0.0); }
+  let fx = (p.x - f32(bitcast<i32>(flowWord(0u)))) / FLOW_STEP;
+  let fz = (p.z - f32(bitcast<i32>(flowWord(1u)))) / FLOW_STEP;
+  let ix = i32(floor(fx));
+  let iz = i32(floor(fz));
+  if (ix < 0 || iz < 0 || ix >= n - 1 || iz >= n - 1) { return vec3f(0.0); }
+  let tx = fx - f32(ix);
+  let tz = fz - f32(iz);
+  var v = vec2f(0.0);
+  var surf = -1e9;
+  var bed = 1e9;
+  for (var c = 0; c < 4; c++) {
+    let dx = c & 1;
+    let dz = c >> 1u;
+    let k = FLOW_HEADER + 2u * u32((iz + dz) * n + (ix + dx));
+    let w1 = flowWord(k + 1u);
+    let s = flowI16Lo(w1);
+    if (s == FLOW_DRY) { continue; }
+    let w0 = flowWord(k);
+    let w = select(1.0 - tx, tx, dx == 1) * select(1.0 - tz, tz, dz == 1);
+    v += w * vec2f(f32(flowI16Lo(w0)), f32(flowI16Hi(w0)));
+    surf = max(surf, f32(s));
+    bed = min(bed, f32(flowI16Hi(w1)));
+  }
+  if (surf < -1e8 || p.y > surf + 1.5 || p.y < bed - 0.5) { return vec3f(0.0); }
+  // Faster at the surface than at the bed: a log-law profile, flattened.
+  let hz = clamp((p.y - bed) / max(surf - bed, 1.0), 0.0, 1.0);
+  let prof = (0.75 + 0.25 * sqrt(hz)) / FLOW_VEL_Q;
+  return vec3f(v.x * prof, 0.0, v.y * prof);
+}
+
 // THE FIELD, render side. World cells/s at world position `p`.
 //
 // There is no ambient term to add — unlike wind, which has weather everywhere,
-// still water is still. The stream arm is a PRIMITIVE (CPRIM_STREAM, seeded
-// from the landform bed gradient on the CPU), not a global, because a river is
-// somewhere and a wind is everywhere.
+// still water is still. Two parts: the TERRAIN flow field above (the map's
+// rivers and lakes, solved from their shape), and the primitive list (events:
+// a drain's sink and whirlpool), because a river is somewhere and a wind is
+// everywhere.
 fn currentAt(p : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
   if ((*R).currentRenderOn == 0u) { return vec3f(0.0); }
-  return currentPrimAt(p, R);
+  return currentPrimAt(p, R) + flowGridAt(p);
 }
 
 // CONVERGENCE of the field at a point, per second — negative divergence, so
@@ -4388,12 +4455,13 @@ fn currentAt(p : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
 // nothing checking it, for four evaluations of a function that early-outs to
 // one compare outside the AABB. `e` is in world cells.
 fn currentConvergeAt(p : vec3f, R : ptr<uniform, RenderParams>) -> f32 {
-  if ((*R).currentRenderOn == 0u || (*R).currentPrimCount == 0u) { return 0.0; }
+  if ((*R).currentRenderOn == 0u) { return 0.0; }
+  if ((*R).currentPrimCount == 0u && (!FLOW_BOUND || flowWord(2u) == 0u)) { return 0.0; }
   let e = 1.5;
-  let vx1 = currentPrimAt(p + vec3f(e, 0.0, 0.0), R).x;
-  let vx0 = currentPrimAt(p - vec3f(e, 0.0, 0.0), R).x;
-  let vz1 = currentPrimAt(p + vec3f(0.0, 0.0, e), R).z;
-  let vz0 = currentPrimAt(p - vec3f(0.0, 0.0, e), R).z;
+  let vx1 = currentAt(p + vec3f(e, 0.0, 0.0), R).x;
+  let vx0 = currentAt(p - vec3f(e, 0.0, 0.0), R).x;
+  let vz1 = currentAt(p + vec3f(0.0, 0.0, e), R).z;
+  let vz0 = currentAt(p - vec3f(0.0, 0.0, e), R).z;
   return -((vx1 - vx0) + (vz1 - vz0)) / (2.0 * e);
 }
 

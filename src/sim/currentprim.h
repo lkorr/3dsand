@@ -52,7 +52,8 @@
 // So every primitive carries kCurrentPrimSim, and it is set ONLY when the
 // primitive's parameters are a pure function of (seed, window, tuning, tick):
 //
-//   * the STREAM arm  — a function of the landform, so yes.
+//   * the terrain flow (rivers, lakes) is no longer on this list: it is
+//     sim/flowfield.h, a pure function of (map, seed, tuning, position).
 //   * a DRAIN's sink and vortex — seeded from the MUTATION that cut the hole,
 //     which rides the mutation queue and is therefore on the tick stream. Yes.
 //   * anything read back from `waterBodyState` — NO, and there is deliberately
@@ -76,42 +77,20 @@ constexpr uint32_t kCurrentPrimForever = 0xFFFFFFFFu;
 // Ticks a primitive fades IN over. Short, because a drain's swirl genuinely
 // spins up fast once the water starts moving; the fade exists so a seeded
 // vortex does not switch a 5 m/s tangential field on between two frames.
-// STREAMS SKIP IT (CurrentPrimEnvelope): they are terrain, re-written on every
-// window move, and a ramp there zeroed the river under the player once a chunk.
+// STREAMS SKIP IT (CurrentPrimEnvelope): a stream is terrain-like, and a ramp
+// on one re-asserted every window move zeroed the river under the player once
+// a chunk (ticket 2026-10-11_18-39-38).
 constexpr uint32_t kCurrentPrimAttack = 6;
 
-// ---- the stream arm's probe schedule --------------------------------------
-// Voxels between lattice probes over the residency window, and also each stream
-// primitive's own radius — so the probes tile the window without the primitives
-// overlapping into a wall of flow. 64 voxels = 6.4 m.
-constexpr int kStreamProbeStride = 64;
-// Central-difference baseline for the bed direction, voxels. Wide ON PURPOSE:
-// see the slope-trap note over SeedStreams. 32 voxels = four grain-octave cells.
-constexpr int kStreamGradBaseline = 32;
-// Stream primitives one window may carry. Half the cap, so a drain seeded in
-// the same tick can always still find a slot — rule 2 charged before emission.
-constexpr int kStreamMaxPrims = 16;
 // A slab stream's fade past its half-height, cells. Mirrors CPRIM_SLAB_FADE
 // in common.wgsl.
 constexpr int kCurrentSlabFade = 3;
-// ---- the map-river half of the stream arm ---------------------------------
-// Voxels of centreline arc between river primitives, and each one's axial
-// reach (so the axial tents partition unity along the channel). 6.4 m.
-constexpr int kRiverPrimStride = 64;
-// Half-span of arc the surface fall is measured over: a reach is flat between
-// weirs, so a short baseline would read 0 on most of the river and a step's
-// whole drop at the rest.
-constexpr float kRiverSlopeBaseline = 160.0f;
-// Half-span of arc the flow DIRECTION is taken over: short, so a bend turns the
-// current where the channel turns.
-constexpr float kRiverTangentHalf = 24.0f;
+// ---- the river speed envelope (read by the terrain flow field) ------------
 // m/s. The floor is what an authored river flows at down a reach the bake laid
 // flat (most of them); the cap keeps a waterfall's reach from becoming a jet.
-constexpr float kRiverMinFlowMs = 0.4f;
+constexpr float kRiverMinFlowMs = 0.6f;
 constexpr float kRiverMaxFlowMs = 3.0f;
-// Owner handles. The stream arm is one owner (it is retired and rebuilt whole
-// when the window moves); each body's drain owns two consecutive handles.
-constexpr uint64_t kStreamOwnerId = 0x57524541u;      // 'STREA'
+// Owner handles: each body's drain owns two consecutive handles.
 constexpr uint64_t kDrainOwnerBase = 0x44524149u;     // 'DRAI'
 
 // ---- the authored primitive -----------------------------------------------
@@ -221,30 +200,9 @@ class CurrentPrimSystem {
 
   // ---- the seeders (split from evaluation, plan component 8) --------------
   //
-  // "Build the evaluator first with the stream arm and a debug/authored
-  // primitive list; add seeders as components land." Both of these are
-  // idempotent per tick and both only ever assert primitives whose parameters
-  // are a pure function of the tick input stream — see the authority note at
-  // the top of this file.
-
-  // THE STREAM ARM. Manning/Chezy: v proportional to sqrt(slope * depth), with
-  // the direction taken from the BED gradient. Independent of every other
-  // component in this plan — no descriptor needed, and it would work in a world
-  // where components 1-7 did not exist.
-  //
-  // Rebuilt only when the residency window moves, because it is a pure function
-  // of (seed, window, tuning) and re-probing it every tick would be ~1,600
-  // terrain hashes a tick for an answer that cannot have changed.
-  void SeedStreams(const World& world, uint32_t seed, uint32_t tick);
-  // The same, for a window at `origin` (chunks) -- all SeedStreams reads off
-  // the World. Lets a gate move the window without a World to move.
-  void SeedStreamsAt(IVec3 origin, uint32_t seed, uint32_t tick);
-  // The stream arm's MAP-RIVER half: map.json rivers[] along their baked
-  // centrelines, downstream, nearest the window centre first. Called by
-  // SeedStreams before its lattice; returns how many it emitted, which the
-  // lattice's share of kStreamMaxPrims is charged against.
-  int SeedMapRivers(int baseX, int baseZ, uint32_t seed, uint32_t tick,
-                    float scale);
+  // The drain arm is idempotent per tick and only ever asserts primitives
+  // whose parameters are a pure function of the tick input stream — see the
+  // authority note at the top of this file.
 
   // THE DRAIN ARM (components 6 + 8). While a governed body's drain window is
   // live, a SINK at the hole plus a VORTEX about the vertical through it. The
@@ -270,13 +228,6 @@ class CurrentPrimSystem {
   IVec3 lo_{1, 1, 1}, hi_{0, 0, 0};
   uint32_t tick_ = 0;
   uint32_t dropped_ = 0;
-  // The window origin the stream arm was last probed for. A sentinel far
-  // outside any legal origin so the first call always builds.
-  IVec3 streamOrigin_{1 << 30, 1 << 30, 1 << 30};
-  uint32_t streamSeed_ = 0;
-  // How many stream primitives the last build put on the list, so a list that
-  // has since lost some (see SeedStreams) is rebuilt rather than trusted.
-  size_t streamBuilt_ = 0;
 };
 
 // THE live list. A global for exactly the reason WindPrims() and WaterBodies()

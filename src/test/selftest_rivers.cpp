@@ -64,6 +64,7 @@
 
 #include "sim/biomes.h"
 #include "sim/currentprim.h"
+#include "sim/flowfield.h"
 #include "sim/horizon.h"
 #include "sim/treeatlas.h"
 #include "sim/weather.h"
@@ -404,14 +405,13 @@ Status GateRivers(Ctx& c, std::string& detail) {
     if (!cOk) problems.push_back(Format("C: lake inside %d wrong %d outside %d%s", inWet, inWrong, outWet, why.c_str()));
   }
 
-  // ---- I. the current field runs downstream (currentprim.cpp SeedMapRivers) ----
-  // A window centred on main's middle sample: the map-river arm must put more
-  // than one stream primitive there (the lattice arm's shared owner handle
-  // once collapsed every stream to ONE), and the CPU field just under the
-  // surface at that sample must point along the centreline, downstream, at no
-  // less than the authored floor.
+  // ---- I. the current runs downstream (sim/flowfield.h) ----
+  // A window centred on main's middle sample: the terrain flow field, solved
+  // from the channel's shape, must run along the centreline, downstream, at
+  // no less than the authored floor just under the surface there -- and be
+  // zero in the air over the river.
   {
-    using sandvox::CurrentPrims;
+    using sandvox::WaterFlow;
     const auto& L = rMain->line;
     const size_t mid = L.size() / 2;
     const size_t ta = mid >= 4 ? mid - 4 : 0, tb = std::min(L.size() - 1, mid + 4);
@@ -419,48 +419,52 @@ Status GateRivers(Ctx& c, std::string& detail) {
     const float tl = std::max(std::sqrt(tx * tx + tz * tz), 1e-3f);
     tx /= tl;
     tz /= tl;
-    CurrentPrims().Clear();
-    const int bx = L[mid][0] - static_cast<int>(kWorldN) / 2;
-    const int bz = L[mid][1] - static_cast<int>(kWorldN) / 2;
-    const int n = CurrentPrims().SeedMapRivers(bx, bz, kDefaultSeed, 100, 1.2f);
-    CurrentPrims().Tick(100 + sandvox::kCurrentPrimAttack);
-    const Vec3 v = sandvox::CurrentAtCpu(
-        Vec3{L[mid][0] + 0.5f, L[mid][2] - 1.5f, L[mid][1] + 0.5f});
+    WaterFlow().Clear();
+    const int bx = (L[mid][0] - static_cast<int>(kWorldN) / 2) & ~15;
+    const int bz = (L[mid][1] - static_cast<int>(kWorldN) / 2) & ~15;
+    WaterFlow().UpdateAt(bx, bz, kDefaultSeed);
+    const Vec3 at{L[mid][0] + 0.5f, L[mid][2] - 1.5f, L[mid][1] + 0.5f};
+    const Vec3 v = WaterFlow().Sample(at);
     const float speed = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
     const float along = v.x * tx + v.z * tz;
     const float floorCells = sandvox::kRiverMinFlowMs / kVoxelMeters;
-    // The slab: nothing in the air over the river (it once reached 18 m up).
-    // 24 cells, not 4: the reach upstream stands a weir or two higher, and its
-    // slab is flat over its own 64 voxels of channel.
-    const Vec3 sky = sandvox::CurrentAtCpu(Vec3{L[mid][0] + 0.5f, L[mid][2] + 24.5f, L[mid][1] + 0.5f});
+    const Vec3 sky = WaterFlow().Sample(Vec3{L[mid][0] + 0.5f, L[mid][2] + 24.5f, L[mid][1] + 0.5f});
     const float skySpeed = std::sqrt(sky.x * sky.x + sky.y * sky.y + sky.z * sky.z);
-    const bool iOk = n >= 2 && speed >= floorCells * 0.9f && along >= 0.9f * speed && skySpeed == 0.0f;
-    std::printf("rivers: I current: %s (%d river primitive(s) in the window; at main's middle %.1f cells/s, %.2f of it "
+    const bool iOk = WaterFlow().BlocksSolved() >= 1 && speed >= floorCells * 0.9f &&
+                     along >= 0.9f * speed && skySpeed == 0.0f;
+    std::printf("rivers: I current: %s (%u flow block(s) solved; at main's middle %.1f cells/s, %.2f of it "
                 "downstream, floor %.1f; 24 cells over the surface %.2f)\n",
-                iOk ? "PASS" : "FAIL", n, speed, speed > 0.0f ? along / speed : 0.0f, floorCells, skySpeed);
-    if (!iOk) problems.push_back(Format("I: current %d prims, %.1f cells/s, along %.1f", n, speed, along));
-    CurrentPrims().Clear();
+                iOk ? "PASS" : "FAIL", WaterFlow().BlocksSolved(), speed, speed > 0.0f ? along / speed : 0.0f,
+                floorCells, skySpeed);
+    if (!iOk) problems.push_back(Format("I: current %.1f cells/s, along %.1f", speed, along));
+
+    // ---- K. the SHAPE decides the speed ----
+    // Across the channel: v ~ h^(2/3), so most of the way to the bank (the U
+    // profile's shallows) the water runs well under the thalweg's speed.
+    {
+      const float hw = static_cast<float>(L[mid][3]);
+      const Vec3 bank{at.x - tz * 0.8f * hw, at.y, at.z + tx * 0.8f * hw};
+      const Vec3 vb = WaterFlow().Sample(bank);
+      const float sb = std::sqrt(vb.x * vb.x + vb.z * vb.z);
+      const bool kOk = speed > 0.0f && sb < 0.8f * speed;
+      std::printf("rivers: K cross-section: %s (thalweg %.1f cells/s, 0.8 of the half-width out %.1f)\n",
+                  kOk ? "PASS" : "FAIL", speed, sb);
+      if (!kOk) problems.push_back(Format("K: bank %.1f vs thalweg %.1f", sb, speed));
+    }
 
     // ---- J. a window move does not touch the river under the player ----
     // (ticket 2026-10-11_18-39-38: "strobing in the water while moving in it
-    // every second or so".) The stream arm is rewritten whole on every window
-    // move, which a swimmer makes about once a second, and each rewrite used
-    // to restart every stream's attack ramp: the current under the player
-    // read ZERO on the move's tick and climbed back over six. The surface's
-    // wave phase is advected by this field, so every move strobed the water.
-    // Through SeedStreams itself (the path SubmitTick takes), read on the very
-    // tick of each move, for three moves along both axes.
-    const IVec3 org0{(bx >> 4), 0, (bz >> 4)};
-    const Vec3 at{L[mid][0] + 0.5f, L[mid][2] - 1.5f, L[mid][1] + 0.5f};
-    const IVec3 moves[4] = {{0, 0, 0}, {1, 0, 0}, {1, 0, 1}, {0, 0, 1}};
+    // every second or so".) The field is solved on WORLD-anchored blocks and
+    // blended by world position, so a window move only changes which nodes
+    // are uploaded, never their values: the sample must be bit-identical on
+    // the tick of each of three moves along both axes.
+    const int moves[4][2] = {{0, 0}, {16, 0}, {16, 16}, {0, 16}};
     Vec3 v0{};
     float worst = 0.0f, firstSpeed = 0.0f;
     std::string jTrace;
     for (int k = 0; k < 4; k++) {
-      const uint32_t tk = 200u + (uint32_t)k;
-      CurrentPrims().SeedStreamsAt(IVec3{org0.x + moves[k].x, 0, org0.z + moves[k].z}, kDefaultSeed, tk);
-      CurrentPrims().Tick(tk);
-      const Vec3 vk = sandvox::CurrentAtCpu(at);
+      WaterFlow().UpdateAt(bx + moves[k][0], bz + moves[k][1], kDefaultSeed);
+      const Vec3 vk = WaterFlow().Sample(at);
       const float sk = std::sqrt(vk.x * vk.x + vk.y * vk.y + vk.z * vk.z);
       if (k == 0) {
         v0 = vk;
@@ -470,12 +474,12 @@ Status GateRivers(Ctx& c, std::string& detail) {
       worst = std::max(worst, std::sqrt(dx * dx + dy * dy + dz * dz));
       jTrace += Format(" %.2f", sk);
     }
-    const bool jOk = firstSpeed >= floorCells * 0.9f && worst <= 1e-3f * firstSpeed;
+    const bool jOk = firstSpeed >= floorCells * 0.9f && worst == 0.0f;
     std::printf("rivers: J window move: %s (speed at main's middle on each move's own tick:%s cells/s; "
                 "largest change %.4f)\n",
                 jOk ? "PASS" : "FAIL", jTrace.c_str(), worst);
     if (!jOk) problems.push_back(Format("J: window move changed the current by %.3f (speeds%s)", worst, jTrace.c_str()));
-    CurrentPrims().Clear();
+    WaterFlow().Clear();
   }
 
   // ---- the world on the GPU ----

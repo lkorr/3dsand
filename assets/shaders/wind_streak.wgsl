@@ -74,6 +74,10 @@
 // after the tick's heat passes. The draw never reads them.
 @group(0) @binding(25) var<storage, read> heatPool : array<u32>;
 @group(0) @binding(26) var<storage, read> heatMeta : array<u32>;
+// The terrain flow field (shadowBGL_ 35, the UPDATE's layout; sim/flowfield.h):
+// a current tracer is advected by currentAt, which adds it. The wind_streak
+// row's R(FlowGrid) declares the read; the draw never reads it.
+@group(0) @binding(35) var<storage, read> flowGrid : array<u32>;
 // The update's view (shadowBGL_ binding 22, compute).
 @group(0) @binding(22) var<storage, read_write> streaks : array<vec4f>;
 // The draw's view of the same buffer (renderBGL_ binding 33, vertex).

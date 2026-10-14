@@ -503,6 +503,9 @@ add_library(sandvox_core OBJECT
   # The current field: sinks, vortices, sources and streams summed
   # analytically, the wind field applied to water (plan component 8).
   src/sim/currentprim.cpp
+  # The terrain flow field: which way the map's water runs, solved from its
+  # shape (DESIGN.md 9d.6).
+  src/sim/flowfield.cpp
   src/sim/trample.cpp
   src/sim/voxload.cpp
   # The baked tree atlas: assets/trees/*.svtree -> one storage buffer that

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "sim/flowfield.h"
 #include "sim/rng.h"
 #include "sim/tuning.h"
 #include "sim/waterbody.h"
@@ -180,8 +181,6 @@ void CurrentPrimSystem::Clear() {
   lo_ = {1, 1, 1};
   hi_ = {0, 0, 0};
   dropped_ = 0;
-  streamOrigin_ = {1 << 30, 1 << 30, 1 << 30};
-  streamBuilt_ = 0;
 }
 
 void CurrentPrimSystem::Tick(uint32_t tick) {
@@ -229,267 +228,12 @@ void CurrentPrimSystem::Tick(uint32_t tick) {
 }
 
 // ---------------------------------------------------------------------------
-// THE STREAM ARM (plan component 8)
-//
-// Manning/Chezy: v proportional to sqrt(slope * depth), direction from the BED
-// gradient. Genuinely independent of components 1-7 — no descriptor is needed
-// and this would work in a world where the ledger did not exist.
-//
-// THE SLOPE TRAP, and it is a repeat of one this repo has already paid for.
-// `World::Column::slope` is `Land.slope`, which worldgen.wgsl:550 states is
-// `g2` — accumulated through the HILL octave and deliberately not through
-// detail or grain, because d(slope)/dcolumn through the grain octave is 96 Q8,
-// the whole of a gate's range in ONE column. A current built on the fine
-// gradient is per-voxel noise. So the MAGNITUDE comes from that field directly.
-//
-// The DIRECTION needs a signed gradient, which `slope` (an absolute sum) does
-// not carry and which is not exposed — the signed g2 pair lives inside the
-// block check_invariants.py token-compares against the shader, and widening it
-// would be a change to the mirror rather than to this system. So the direction
-// is a CENTRAL DIFFERENCE OF THE GROUND HEIGHT OVER A WIDE BASELINE, which is
-// the same low-pass by another route: over +-32 voxels the grain octave (cell 8
-// voxels, amplitude 4) can contribute at most 4/64 = 0.06 voxel/voxel to the
-// answer, against a hill octave whose gradient is the thing being measured.
-// A +-1 difference — the actual trap — would give it 2.0.
-void CurrentPrimSystem::SeedStreams(const World& world, uint32_t seed,
-                                    uint32_t tick) {
-  SeedStreamsAt(world.WindowOrigin(), seed, tick);
-}
-
-void CurrentPrimSystem::SeedStreamsAt(IVec3 origin, uint32_t seed, uint32_t tick) {
-  // Scheduled by the WINDOW, not by convenience: the answer is a pure function
-  // of (seed, window, tuning) and cannot change between window moves, so
-  // re-probing it every tick would be ~1,600 terrain hashes a tick for a
-  // result that is already on the list.
-  // ...unless the list lost them. Tick() drops any primitive whose envelope
-  // reads zero, and a tick counter that steps BACK past their spawnTick (the
-  // game's first SubmitTick runs at tick 1, then the session restarts its
-  // count) reads zero for every one of them — after which this early-out kept
-  // a window with no stream at all, forever. Count, and rebuild on a shortfall.
-  size_t streamLive = 0;
-  for (const CurrentPrim& p : live_)
-    if (p.kind == kCurrentPrimStream && p.ownerId == kStreamOwnerId) streamLive++;
-  if (origin.x == streamOrigin_.x && origin.y == streamOrigin_.y &&
-      origin.z == streamOrigin_.z && seed == streamSeed_ &&
-      streamLive == streamBuilt_) {
-    // Keep the existing stream primitives alive: they are terrain, not events,
-    // so their release ramp must never start while the window still holds them.
-    for (CurrentPrim& p : live_) {
-      if (p.kind != kCurrentPrimStream) continue;
-      p.seenTick = tick;
-      // A counter that stepped back past the spawn would read the attack as
-      // "not born yet" (envelope 0) for as long as the window holds still.
-      if (p.spawnTick > tick) p.spawnTick = tick;
-    }
-    if (std::getenv("SANDVOX_CURRENT_TRACE") && tick % 120 == 0)
-      std::fprintf(stderr, "current: tick %u live %zu resolved %zu dropped %u first (%d,%d,%d) r %d\n",
-                   tick, live_.size(), resolved_.size(), dropped_,
-                   live_.empty() ? 0 : live_[0].x, live_.empty() ? 0 : live_[0].y,
-                   live_.empty() ? 0 : live_[0].z, live_.empty() ? 0 : live_[0].radius);
-    return;
-  }
-  streamOrigin_ = origin;
-  streamSeed_ = seed;
-  streamBuilt_ = 0;
-  RetireOwner(kStreamOwnerId);
-
-  const Tuning& tun = CurrentTuning();
-  const float scale = tun.sim.currentStreamScale;
-  if (!(scale > 0.0f)) return;
-
-  // A coarse lattice over the residency window. `kStreamProbeStride` is 64
-  // voxels — a stream primitive's own radius, so the probes tile the window
-  // without the primitives overlapping into a wall of flow.
-  const int base = origin.x * (int)kChunk;
-  const int baseZ = origin.z * (int)kChunk;
-  const int span = (int)kWorldN;
-  int emitted = SeedMapRivers(base, baseZ, seed, tick, scale);
-  if (std::getenv("SANDVOX_CURRENT_TRACE"))
-    std::fprintf(stderr, "current: tick %u window base (%d,%d) rivers in map %zu -> %d river prims\n",
-                 tick, base, baseZ, worldmap::CurrentWorldMap().rivers.size(), emitted);
-  // THE LATTICE IS WORLD-ALIGNED: probes sit on x, z == stride/2 (mod stride)
-  // in WORLD cells. It used to start at the window's own corner, which moves a
-  // chunk at a time, so every window move put every probe 16 cells somewhere
-  // else and the field under the player changed with it. World-aligned, a
-  // probe that is still in the window after the move is the same primitive.
-  auto firstProbe = [](int b) {
-    const int s = kStreamProbeStride;
-    return (((s / 2 - b) % s) + s) % s;
-  };
-  for (int oz = firstProbe(baseZ); oz < span; oz += kStreamProbeStride) {
-    for (int ox = firstProbe(base); ox < span; ox += kStreamProbeStride) {
-      if (emitted >= kStreamMaxPrims) return;
-      const int x = base + ox, z = baseZ + oz;
-      const World::Column c = World::TerrainColumn(x, z, seed);
-      if (c.water == INT32_MIN) continue;          // no standing water here
-      const int depth = c.water - c.h;             // voxels
-      if (depth <= 0) continue;
-      // The landform slope, Q8. Below the threshold the water is a pond, not a
-      // stream, and a pond has no bed-driven current at all.
-      if (c.slope < tun.sim.currentStreamMinSlope) continue;
-
-      // Direction: downhill, from a WIDE central difference (see the note
-      // above). Y is dropped — a bed current runs along the bed.
-      const int S = kStreamGradBaseline;
-      const int hxp = World::TerrainHeight(x + S, z, seed);
-      const int hxm = World::TerrainHeight(x - S, z, seed);
-      const int hzp = World::TerrainHeight(x, z + S, seed);
-      const int hzm = World::TerrainHeight(x, z - S, seed);
-      float dx = (float)(hxm - hxp);   // +x is downhill when h falls with x
-      float dz = (float)(hzm - hzp);
-      const float dl = std::sqrt(dx * dx + dz * dz);
-      if (!(dl > 1e-3f)) continue;
-      dx /= dl;
-      dz /= dl;
-
-      // Chezy: v = C * sqrt(R * S). R ~ depth in metres, S = slope (Q8 -> 1).
-      const float slope01 = (float)c.slope / 256.0f;
-      const float depthM = (float)depth * kVoxelMeters;
-      const float vms = scale * std::sqrt(slope01 * depthM);
-      if (!(vms > 0.02f)) continue;
-
-      CurrentPrim p;
-      p.kind = kCurrentPrimStream;
-      // THE SIM LICENCE: a stream's parameters are a pure function of (seed,
-      // window, tuning), so this one is entitled to it.
-      p.flags = kCurrentPrimSim;
-      p.x = x;
-      p.y = c.water;
-      p.z = z;
-      p.radius = kStreamProbeStride;
-      p.reach = kStreamProbeStride;
-      p.decayTicks = kCurrentPrimForever;
-      p.spawnTick = tick;
-      p.seenTick = tick;
-      p.ownerId = kStreamOwnerId;
-      CurrentPrimAim(p, Vec3{dx, 0.0f, dz}, vms);
-      if (!SpawnUnowned(p)) return;
-      emitted++;
-      streamBuilt_++;
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// THE MAP-RIVER ARM (map.json rivers[], docs/PLAN_worldbuilder.md W1)
-//
-// The lattice above cannot see an authored river: TerrainColumn reports rolled
-// ponds and the sea, not the W1 water bake, and a river's reaches are FLAT
-// surfaces stepped down at weirs, so a bed gradient would point anywhere. But
-// the bake already knows the one thing that matters — which way is downstream —
-// because `River::line` runs source to mouth (the `rivers` gate asserts its
-// surface never rises along it). So the direction is the centreline's own
-// tangent and the slope is the surface's fall over a wide baseline of it.
-//
-// One stream primitive every kRiverPrimStride voxels of arc, with that stride
-// as its axial reach: the stream profile's axial tent then partitions unity
-// along the channel, so a straight reach flows at one speed instead of pulsing.
-// A pure function of (map, seed, window, tuning), so it carries the sim licence.
-//
-// Charged first and nearest-the-window-centre first, so when a window holds
-// more river than the budget the water the player is in is what flows.
-int CurrentPrimSystem::SeedMapRivers(int baseX, int baseZ, uint32_t seed,
-                                     uint32_t tick, float scale) {
-  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
-  if (m.rivers.empty()) return 0;
-  const int span = (int)kWorldN;
-  const int cx = baseX + span / 2, cz = baseZ + span / 2;
-
-  struct Cand {
-    int64_t d2;
-    int x, z, surf, hw;
-    float dx, dz, slope;
-  };
-  std::vector<Cand> cands;
-  for (const worldmap::WorldMapData::River& rv : m.rivers) {
-    const auto& L = rv.line;
-    if (L.size() < 2) continue;
-    // Cumulative arc length, voxels, so the stride and the slope baseline are
-    // measured along the water rather than in sample counts.
-    std::vector<float> arc(L.size(), 0.0f);
-    for (size_t i = 1; i < L.size(); i++) {
-      const float ex = (float)(L[i][0] - L[i - 1][0]);
-      const float ez = (float)(L[i][1] - L[i - 1][1]);
-      arc[i] = arc[i - 1] + std::sqrt(ex * ex + ez * ez);
-    }
-    float next = (float)kRiverPrimStride * 0.5f;
-    size_t lo = 0, hi = 0;
-    for (size_t i = 0; i < L.size(); i++) {
-      if (arc[i] < next) continue;
-      next = arc[i] + (float)kRiverPrimStride;
-      const int x = L[i][0], z = L[i][1], hw = std::max(1, L[i][3]);
-      // Outside the window (plus the primitive's own reach) it cannot be
-      // sampled by anything resident.
-      const int pad = kRiverPrimStride + hw;
-      if (x < baseX - pad || x >= baseX + span + pad || z < baseZ - pad ||
-          z >= baseZ + span + pad)
-        continue;
-      // The baseline: the samples kRiverSlopeBaseline voxels of arc up- and
-      // downstream (clamped to the ends). Monotone pointers, since `i` only
-      // grows.
-      while (lo + 1 < i && arc[lo + 1] <= arc[i] - kRiverSlopeBaseline) lo++;
-      if (hi < i) hi = i;
-      while (hi + 1 < L.size() && arc[hi] < arc[i] + kRiverSlopeBaseline) hi++;
-      // Tangent from a shorter span than the slope's, so a bend turns the
-      // flow where the channel turns rather than a whole baseline early.
-      size_t ta = i, tb = i;
-      while (ta > 0 && arc[i] - arc[ta] < kRiverTangentHalf) ta--;
-      while (tb + 1 < L.size() && arc[tb] - arc[i] < kRiverTangentHalf) tb++;
-      float dx = (float)(L[tb][0] - L[ta][0]);
-      float dz = (float)(L[tb][1] - L[ta][1]);
-      const float dl = std::sqrt(dx * dx + dz * dz);
-      if (!(dl > 1e-3f)) continue;
-      dx /= dl;
-      dz /= dl;
-      const float run = arc[hi] - arc[lo];
-      const float fall = (float)(L[lo][2] - L[hi][2]);
-      const float slope = run > 1.0f ? std::max(0.0f, fall / run) : 0.0f;
-      const int64_t ox = x - cx, oz = z - cz;
-      cands.push_back({ox * ox + oz * oz, x, z, L[i][2], hw, dx, dz, slope});
-    }
-  }
-  // Nearest first; ties by position so the order never depends on anything
-  // but the map.
-  std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
-    if (a.d2 != b.d2) return a.d2 < b.d2;
-    if (a.x != b.x) return a.x < b.x;
-    return a.z < b.z;
-  });
-
-  int emitted = 0;
-  for (const Cand& c : cands) {
-    if (emitted >= kStreamMaxPrims) break;
-    const worldmap::WaterColumn wc = worldmap::WaterColumnAt(c.x, c.z, seed);
-    const int depth = std::clamp(c.surf - wc.h, 1, (int)worldmap::kRiverDepthMax);
-    // Chezy on the surface fall, floored: a river the map authored flows
-    // even down a reach the bake laid flat, which is most of them.
-    const float depthM = (float)depth * kVoxelMeters;
-    const float vms = std::clamp(scale * std::sqrt(c.slope * depthM),
-                                 kRiverMinFlowMs, kRiverMaxFlowMs);
-    CurrentPrim p;
-    p.kind = kCurrentPrimStream;
-    p.flags = kCurrentPrimSim;
-    p.x = c.x;
-    // A SLAB centred in the water column: the channel's width across, the
-    // water's depth top to bottom (+ the fade, so the surface cell itself is full
-    // strength, which is where the waves sample it), and nothing above.
-    p.y = c.surf - depth / 2;
-    p.z = c.z;
-    p.radius = std::clamp(c.hw + 2, 4, (int)kCurrentPrimMaxExtent);
-    p.slab = std::clamp(depth - depth / 2 + kCurrentSlabFade, 1,
-                        (int)kCurrentPrimMaxExtent);
-    p.reach = kRiverPrimStride;
-    p.decayTicks = kCurrentPrimForever;
-    p.spawnTick = tick;
-    p.seenTick = tick;
-    p.ownerId = kStreamOwnerId;
-    CurrentPrimAim(p, Vec3{c.dx, 0.0f, c.dz}, vms);
-    if (!SpawnUnowned(p)) break;
-    emitted++;
-    streamBuilt_++;
-  }
-  return emitted;
-}
+// THE STREAM ARM IS GONE (2026-10-14). Rivers, lakes and the sea are the
+// terrain flow field (sim/flowfield.h), solved from the water's shape; the
+// slab-per-6.4-m map-river arm and the bed-gradient lattice that used to live
+// here gave a river one speed for its whole width and reach, a lake no flow at
+// all, and a pond on a slope a uniform downhill current a closed basin cannot
+// have. This list now carries EVENTS only (the drain arm below).
 
 // ---------------------------------------------------------------------------
 // THE DRAIN ARM (plan components 6 + 8)
@@ -618,18 +362,21 @@ Vec3 CurrentAtCpu(Vec3 posVox) { return CurrentAtCpuImpl(posVox, false); }
 Vec3 CurrentAtCpuSim(Vec3 posVox) { return CurrentAtCpuImpl(posVox, true); }
 
 static Vec3 CurrentAtCpuImpl(Vec3 posVox, bool simOnly) {
+  // The terrain flow field first: rivers and lakes (flowfield.h). A pure
+  // function of (map, seed, tuning, world position), so it is sim-licensed
+  // and both arms read it -- the same words the renderer's flowGridAt reads.
+  Vec3 acc = WaterFlow().Sample(posVox);
   const CurrentPrimSystem& cp = CurrentPrims();
   const uint32_t n = std::min(cp.Count(), kCurrentPrimCap);
-  if (n == 0) return Vec3{0.0f, 0.0f, 0.0f};
+  if (n == 0) return acc;
   // The union AABB, the same whole-loop reject the shaders take.
   const IVec3 lo = cp.BoundsLo(), hi = cp.BoundsHi();
   const int px = (int)std::floor(posVox.x), py = (int)std::floor(posVox.y),
             pz = (int)std::floor(posVox.z);
   if (px < lo.x || py < lo.y || pz < lo.z || px > hi.x || py > hi.y ||
       pz > hi.z)
-    return Vec3{0.0f, 0.0f, 0.0f};
+    return acc;
 
-  Vec3 acc{0.0f, 0.0f, 0.0f};
   for (uint32_t i = 0; i < n; i++) {
     const int32_t* w = cp.Resolved()[i].w;
     const uint32_t kind = (uint32_t)w[3] & 0xFu;

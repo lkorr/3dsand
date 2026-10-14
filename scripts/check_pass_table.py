@@ -270,6 +270,9 @@ BUF_TO_WGSL = {
     # raymarch DRAW's views (renderBGL 45 / 46) are not rows.
     "Horizon": {"horizon"},
     "HzLight": {"hzLight"},
+    # The terrain flow field (src/sim/flowfield.h); the raymarch DRAW's view
+    # (renderBGL 48) is not a row.
+    "FlowGrid": {"flowGrid"},
     "GodVis": {"godVis"},
     "GasMask": {"gasMask"},
     # The GI gather request list; GiArgs is indirect-only and never bound.
@@ -908,6 +911,11 @@ def module_for(fname):
     # the draft volume would look as if it never touched draftField, and a row
     # that omitted R(Draft) would pass.
     drop = "DRAFT_UNBOUND" if "> draftField" in body else "DRAFT_BOUND"
+    common = re.sub(">>>" + drop + "_BEGIN<<<.*?>>>" + drop + "_END<<<", "",
+                    common, flags=re.S)
+    # The TERRAIN FLOW FIELD reader's two blocks (resources.cpp BodyReadsFlow),
+    # for the same reason: both define flowWord.
+    drop = "FLOW_UNBOUND" if "> flowGrid" in body else "FLOW_BOUND"
     common = re.sub(">>>" + drop + "_BEGIN<<<.*?>>>" + drop + "_END<<<", "",
                     common, flags=re.S)
     # The HEAT UPDRAFTS reader's two blocks (resources.cpp BodyReadsHeat), for

@@ -493,6 +493,10 @@ for f in "${FILES[@]}"; do
   # BodyReadsDrafts) -- so the strip below always runs.
   stripDraftB=1; stripDraftU=0
   if grep -q '> draftField' "$f"; then stripDraftB=0; stripDraftU=1; fi
+  # The TERRAIN FLOW FIELD reader (LoadShader's BodyReadsFlow): BOUND for a
+  # body that declares `> flowGrid`, UNBOUND otherwise.
+  stripFlowB=1; stripFlowU=0
+  if grep -q '> flowGrid' "$f"; then stripFlowB=0; stripFlowU=1; fi
   # The HEAT UPDRAFTS reader, three blocks (LoadShader's BodyReadsHeat):
   # BOUND for a sim body that declares `> heatPool`, BOUND_RO for a render
   # body (`uniform> R :`) that does, the stubs otherwise.
@@ -508,7 +512,7 @@ for f in "${FILES[@]}"; do
     stripTicketB=0; stripTicketU=1
   fi
   commonSrc="$TMP/common_${name}"
-  awk -v sr="$stripRead" -v sw="$stripWrite" -v ss="$stripSupport"       -v db="$stripDraftB" -v du="$stripDraftU" -v tb="$stripTicketB" -v tu="$stripTicketU" -v hb="$stripHeatB" -v hr="$stripHeatR" -v hu="$stripHeatU" '
+  awk -v sr="$stripRead" -v sw="$stripWrite" -v ss="$stripSupport"       -v db="$stripDraftB" -v du="$stripDraftU" -v tb="$stripTicketB" -v tu="$stripTicketU" -v hb="$stripHeatB" -v hr="$stripHeatR" -v hu="$stripHeatU" -v fb="$stripFlowB" -v fu="$stripFlowU" '
     /HEAT_WIND_BOUND_RO_BEGIN/ { print; s = hr; next }
     /HEAT_WIND_BOUND_RO_END/   { print; s = 0;  next }
     /HEAT_WIND_UNBOUND_BEGIN/ { print; s = hu; next }
@@ -525,6 +529,10 @@ for f in "${FILES[@]}"; do
     /DRAFT_UNBOUND_END/      { print; s = 0;  next }
     /DRAFT_BOUND_BEGIN/      { print; s = db; next }
     /DRAFT_BOUND_END/        { print; s = 0;  next }
+    /FLOW_UNBOUND_BEGIN/     { print; s = fu; next }
+    /FLOW_UNBOUND_END/       { print; s = 0;  next }
+    /FLOW_BOUND_BEGIN/       { print; s = fb; next }
+    /FLOW_BOUND_END/         { print; s = 0;  next }
     /TICKET_UNBOUND_BEGIN/   { print; s = tu; next }
     /TICKET_UNBOUND_END/     { print; s = 0;  next }
     /TICKET_BOUND_BEGIN/     { print; s = tb; next }

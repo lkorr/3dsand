@@ -32,6 +32,7 @@
 #include "sim/windprim.h"
 #include "sim/windfield.h"
 #include "sim/currentprim.h"
+#include "sim/flowfield.h"   // the terrain flow field: updated in SubmitTick, uploaded with RenderParams
 #include "sim/trample.h"
 #include "sim/solutes.h"
 #include "sim/heat.h"     // kHmPendCount / kHmDueLeft: Simulation::NoteHeatPending
@@ -869,6 +870,7 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   // this frame's render clock. Here for the shadow cache's reason: every path
   // that draws writes render params first. Writes nothing while no bolt burns.
   boltfx::Upload(queue, time);
+  flowfield::Upload(queue);
   rp.shadowSubdiv = (uint32_t)CurrentTuning().render.shadowCacheSubdiv;
   // ~41 deg elevation: low enough that terrain and canopy cast readable
   // shadows (near field AND the far-field cascade shadow march), high enough
@@ -1825,7 +1827,10 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // Seeds first, resolve second. Both seeders only ever assert primitives
     // whose parameters are a pure function of the tick input stream — see the
     // authority note at the top of sim/currentprim.h.
-    cp.SeedStreams(world, seed, tick);
+    // The map's rivers and lakes are NOT primitives: they are the terrain
+    // flow field (sim/flowfield.h), solved from the water's shape and
+    // re-composed only when the window moves. Primitives are events.
+    WaterFlow().Update(world.WindowOrigin(), seed);
     cp.SeedDrains(WaterBodies(), seed, tick);
     cp.Tick(tick);
     const uint32_t n = std::min(cp.Count(), kCurrentPrimCap);

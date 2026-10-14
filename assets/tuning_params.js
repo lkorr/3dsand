@@ -967,7 +967,6 @@ const TUNING_PARAMS = {
   'sim.currentVortexRadius':{t:'i',def:40,min:4,max:512},
   'sim.currentSinkSpeed':{t:'f',def:3,min:0,max:20},
   'sim.currentStreamScale':{t:'f',def:1.2,min:0,max:20},
-  'sim.currentStreamMinSlope':{t:'i',def:24,min:0,max:4096},
   'dayNight.cycleMinutes':{t:'i',def:20,min:1,max:240},
   'dayNight.freeze':{t:'i',def:0,min:0,max:1},
   'dayNight.freezePhase':{t:'i',def:32768,min:0,max:65535},

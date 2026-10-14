@@ -2391,7 +2391,6 @@ TP_F(sim, currentVortexDecay, NO_WGSL, 3.0f, 0.05f, 120.0f)
 TP_I(sim, currentVortexRadius, NO_WGSL, 40, 4, kCurrentPrimMaxExtent)
 TP_F(sim, currentSinkSpeed, NO_WGSL, 3.0f, 0.0f, 20.0f)
 TP_F(sim, currentStreamScale, NO_WGSL, 1.2f, 0.0f, 20.0f)
-TP_I(sim, currentStreamMinSlope, NO_WGSL, 24, 0, 4096)
 
 
 // ==== dayNight ====

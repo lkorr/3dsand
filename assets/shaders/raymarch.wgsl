@@ -424,6 +424,11 @@ fn pixelAngle() -> f32 { return 2.0 * R.tanHalfFov / max(R.viewPx, 1.0); }
 // Per pyramid sample: the sun's horizon (blocker top | distance) and the sky
 // visibility, written by horizon_light.wgsl on the frames that rebuild it.
 @group(0) @binding(46) var<storage, read> hzLight : array<u32>;
+// ---- THE TERRAIN FLOW FIELD (src/sim/flowfield.h; common.wgsl flowGridAt) ---
+// Which way the map's water runs, as a window grid of world-aligned nodes,
+// CPU-written on window moves. currentAt adds it: the waves drift with it, the
+// foam gathers on its convergence and in its shear, the oil film rides it.
+@group(0) @binding(48) var<storage, read> flowGrid : array<u32>;
 const BOLT_ROW_GROUPS : u32 = 1u;
 const BOLT_ROW_LIGHTS : u32 = 129u;
 const BOLT_ROW_SEGS : u32 = 145u;
@@ -9514,6 +9519,167 @@ const WAVE_FLOW_CYCLE_S : f32 = 4.0;
 // wavelength, so the two copies are different patterns and the crossfade does
 // not just fade one pattern into itself shifted.
 const WAVE_FLOW_LAYER_SHIFT : vec2f = vec2f(3.71, -2.29);
+
+// ---- WHAT MAKES MOVING WATER LOOK MOVING (2026-10-14) ----------------------
+// Drifting the wind chop downstream (above) says "this surface is going
+// somewhere", but it still reads as a lake on a conveyor: the same isotropic
+// ripples, just translated. A real current writes its own marks on the
+// surface, and three of them carry nearly all of the read:
+//   * STREAKS. Turbulence is torn out along the flow: the surface texture of a
+//     river is elongated downstream, a few times longer than it is wide.
+//   * BOILS. Eddies shed off the bed rise and spread as smooth domes -- a slick
+//     where the chop is wiped flat, ringed by a lip -- and drift with the water.
+//   * FOAM LINES (waterFoam). Bubbles and scum are gathered into ragged lines
+//     along the flow, and drift with it.
+// All three are evaluated in the ADVECTED frame of the two-phase flow map, so
+// they move at the water's speed and restart in the same crossfade as the
+// chop. All three scale with the local speed from the terrain flow field
+// (common.wgsl flowGridAt), so the slow margins of a river and the middle of a
+// lake stay glassy while the thalweg tears up -- and still water pays one
+// compare for all of it (the flowing branch below never runs).
+//
+// m/s: the speed the marks start at, and the speed they are full at.
+const FLOW_MARK_LO : f32 = 0.04;
+const FLOW_MARK_HI : f32 = 0.55;
+// The streak octaves: length along the flow, width across it (m), height (m).
+// The first two are the torn-out streaks; the third is shorter and nearly
+// round, and it is the one a viewer looking DOWNSTREAM sees -- a streak's
+// slope is almost all across the flow, which tilts the normal sideways and
+// barely moves a reflection seen along it.
+const FLOW_STREAK_L0 : vec3f = vec3f(2.6, 0.5, 0.02);
+const FLOW_STREAK_L1 : vec3f = vec3f(1.0, 0.2, 0.008);
+const FLOW_STREAK_L2 : vec3f = vec3f(0.55, 0.3, 0.006);
+// Boils: lattice cell (m), lifetime (s), dome height (m).
+const FLOW_BOIL_CELL : f32 = 3.2;
+const FLOW_BOIL_LIFE : f32 = 5.0;
+const FLOW_BOIL_AMP : f32 = 0.022;
+// How much of the wind chop a fully-flowing surface keeps: the current's own
+// marks take over from it.
+const FLOW_CHOP_KEEP : f32 = 0.7;
+
+fn flowHash2(c : vec2<i32>) -> f32 {
+  var h = (bitcast<u32>(c.x) * 0x8da6b343u) ^ (bitcast<u32>(c.y) * 0xd8163841u);
+  h = (h ^ (h >> 15u)) * 0x2c1b3c6du;
+  h = h ^ (h >> 12u);
+  return f32(h & 0xFFFFFFu) * (1.0 / 16777215.0);
+}
+
+// Value noise with its analytic gradient: (value, d/dx, d/dy). Quintic fade,
+// so the gradient is continuous and a normal built on it has no creases.
+fn flowNoised(p : vec2f) -> vec3f {
+  let i = vec2<i32>(floor(p));
+  let f = fract(p);
+  let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  let du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+  let a = flowHash2(i);
+  let b = flowHash2(i + vec2<i32>(1, 0));
+  let c = flowHash2(i + vec2<i32>(0, 1));
+  let d = flowHash2(i + vec2<i32>(1, 1));
+  let k = a - b - c + d;
+  return vec3f(a + (b - a) * u.x + (c - a) * u.y + k * u.x * u.y,
+               du * vec2f(b - a + k * u.y, c - a + k * u.x));
+}
+
+// 0..1, how hard the water at this speed is marking its surface.
+fn flowMarkStrength(speedMS : f32) -> f32 {
+  return smoothstep(FLOW_MARK_LO, FLOW_MARK_HI, speedMS);
+}
+
+// THE FLOW'S FRAME, and the trap in it. A pattern stretched along the flow is
+// noise evaluated at (p . dir, p . perp). With `dir` varying in space -- any
+// bend -- that is a rotation about the WORLD ORIGIN by an angle that changes
+// from pixel to pixel, and at 1.3 km from the origin one degree of bend per
+// metre shears the pattern by 23 m per metre: the streaks came out diagonal
+// and the foam as marbling (2026-10-14). So the frame is never the local
+// direction. It is one of FLOW_FRAMES fixed directions, and the pattern is
+// the blend of the two that bracket the local one: each is a RIGID rotation
+// of the world (no shear at any distance), and a bend crossfades between
+// them. Returns (index of the lower frame, weight of the upper one).
+const FLOW_FRAMES : f32 = 16.0;
+fn flowFrame(dir : vec2f) -> vec2f {
+  let a = atan2(dir.y, dir.x) * (FLOW_FRAMES / 6.2831853);
+  let i = floor(a);
+  return vec2f(i, a - i);
+}
+fn flowFrameDir(i : f32) -> vec2f {
+  let t = i * (6.2831853 / FLOW_FRAMES);
+  return vec2f(cos(t), sin(t));
+}
+
+// The streak slope at an advected point: noise in the flow's frame (above),
+// stretched along it.
+fn flowStreakSlope(pAdv : vec2f, dir : vec2f, strength : f32, footM : f32) -> vec2f {
+  let fr = flowFrame(dir);
+  var acc = vec2f(0.0);
+  for (var f = 0; f < 2; f++) {
+    let w = select(1.0 - fr.y, fr.y, f == 1);
+    if (w <= 0.0) { continue; }
+    let d = flowFrameDir(fr.x + f32(f));
+    let perp = vec2f(-d.y, d.x);
+    let q = vec2f(dot(pAdv, d), dot(pAdv, perp));
+    var g = vec2f(0.0);
+    for (var o = 0; o < 3; o++) {
+      let L = select(select(FLOW_STREAK_L0, FLOW_STREAK_L1, o == 1), FLOW_STREAK_L2, o == 2);
+      // Unresolvable once a pixel covers the streak's width (normal-map mip).
+      let band = 1.0 - smoothstep(L.y * 0.3, L.y * 0.9, footM);
+      if (band <= 0.0) { continue; }
+      let n = flowNoised(q / L.xy + vec2f(19.7, 7.3) * f32(o));
+      g += vec2f(n.y / L.x, n.z / L.y) * (L.z * band);
+    }
+    acc += (d * g.x + perp * g.y) * w;
+  }
+  // Variance-preserving, as the two-phase blend is: the crossfade must not
+  // flatten a bend.
+  let wl = length(vec2f(1.0 - fr.y, fr.y));
+  return acc * (strength / wl);
+}
+
+// A scalar noise stretched along the flow by `L` (m along, m across), in the
+// flow's frame (above), blended variance-preserving about its 0.5 mean.
+fn flowNoiseAlong(p : vec2f, dir : vec2f, L : vec2f, seed : vec2f) -> f32 {
+  let fr = flowFrame(dir);
+  var acc = 0.0;
+  for (var f = 0; f < 2; f++) {
+    let w = select(1.0 - fr.y, fr.y, f == 1);
+    if (w <= 0.0) { continue; }
+    let d = flowFrameDir(fr.x + f32(f));
+    let q = vec2f(dot(p, d), dot(p, vec2f(-d.y, d.x)));
+    acc += (flowNoised(q / L + seed).x - 0.5) * w;
+  }
+  return 0.5 + acc / length(vec2f(1.0 - fr.y, fr.y));
+}
+
+// The boils at an advected point: (slope.xy, slick). One per lattice cell,
+// born at a hashed moment, growing from a third of its radius to all of it
+// and fading as it spreads, as a real boil does. `slick` (0..1) is how much
+// of the chop its smooth dome has wiped.
+fn flowBoils(pAdv : vec2f, t : f32, strength : f32) -> vec3f {
+  if (strength <= 0.05) { return vec3f(0.0); }
+  let cp = pAdv / FLOW_BOIL_CELL;
+  let base = vec2<i32>(floor(cp - 0.5));
+  var acc = vec3f(0.0);
+  for (var c = 0; c < 4; c++) {
+    let cell = base + vec2<i32>(c & 1, c >> 1u);
+    let h0 = flowHash2(cell);
+    // Not every cell boils: fast water boils more.
+    if (h0 > 0.35 + 0.45 * strength) { continue; }
+    let h1 = flowHash2(cell + vec2<i32>(101, 37));
+    let h2 = flowHash2(cell + vec2<i32>(-53, 211));
+    let age = fract(t / FLOW_BOIL_LIFE + h1);
+    let ctr = (vec2f(cell) + 0.5 + (vec2f(h1, h2) - 0.5) * 0.5) * FLOW_BOIL_CELL;
+    let rb = FLOW_BOIL_CELL * (0.18 + 0.32 * age) * (0.7 + 0.6 * h2);
+    let d = pAdv - ctr;
+    let r2 = dot(d, d);
+    if (r2 >= rb * rb) { continue; }
+    let x = 1.0 - r2 / (rb * rb);
+    // Rises fast, spreads and settles slowly.
+    let env = smoothstep(0.0, 0.12, age) * (1.0 - age) * strength;
+    // Dome h = A x^2: slope = dh/dr * d/r = -4 A x d / rb^2.
+    acc += vec3f(d * (-4.0 * FLOW_BOIL_AMP * env * x / (rb * rb)), env * smoothstep(0.0, 0.5, x));
+  }
+  return vec3f(acc.xy, min(acc.z, 1.0));
+}
+
 fn waveSlope(pWorldM : vec2f, t : f32, footM : f32, depthM : f32,
              flowMS : vec2f) -> vec2f {
   // Shore fade. A sum of sinusoids cannot reflect off a bank, and shallow
@@ -9532,9 +9698,20 @@ fn waveSlope(pWorldM : vec2f, t : f32, footM : f32, depthM : f32,
     let f1 = fract(tau + 0.5);
     let w0 = 1.0 - abs(2.0 * f0 - 1.0);   // 0 at copy 0's restart
     let w1 = 1.0 - w0;                    // 0 at copy 1's (half a cycle on)
-    let s0 = waveBands(pWorldM - v * (f0 * WAVE_FLOW_CYCLE_S), t, footM, depthM, shore);
-    let s1 = waveBands(pWorldM + WAVE_FLOW_LAYER_SHIFT - v * (f1 * WAVE_FLOW_CYCLE_S),
-                       t, footM, depthM, shore);
+    let p0 = pWorldM - v * (f0 * WAVE_FLOW_CYCLE_S);
+    let p1 = pWorldM + WAVE_FLOW_LAYER_SHIFT - v * (f1 * WAVE_FLOW_CYCLE_S);
+    // The current's own marks (see WHAT MAKES MOVING WATER LOOK MOVING),
+    // per copy, in the same advected frame as its chop.
+    let speed = length(flowMS);
+    let st = flowMarkStrength(speed) * shore;
+    let dir = flowMS / max(speed, 1e-6);
+    let chop = mix(1.0, FLOW_CHOP_KEEP, st);
+    let b0 = flowBoils(p0, t, st);
+    let b1 = flowBoils(p1, t, st);
+    let s0 = waveBands(p0, t, footM, depthM, shore) * (chop * (1.0 - 0.75 * b0.z)) +
+             flowStreakSlope(p0, dir, st, footM) + b0.xy;
+    let s1 = waveBands(p1, t, footM, depthM, shore) * (chop * (1.0 - 0.75 * b1.z)) +
+             flowStreakSlope(p1, dir, st, footM) + b1.xy;
     slope = (s0 * w0 + s1 * w1) * inverseSqrt(w0 * w0 + w1 * w1);
   }
   // ---- impact ripples ----
@@ -10116,11 +10293,68 @@ fn waterFoam(hitP : vec3f, pathM : f32, simFoam : f32) -> f32 {
   let conv = currentConvergeAt(hitP, &R) * VOXEL_METERS;   // per second
   let flowFoam = clamp((conv - TUNE_WAVE_FOAM_THRESHOLD) * TUNE_WAVE_FOAM_GAIN, 0.0, 1.0);
   let amount = max(max(shallow, flowFoam), simFoam);
-  if (amount <= 0.0) { return 0.0; }
   let pm = vec2f(hitP.x, hitP.z) * VOXEL_METERS;
-  let rs = rippleSlope(pm, R.time, 0.0);
-  let mask = smoothstep(0.010, 0.055, length(rs));
-  return amount * mask * TUNE_FOAM_STRENGTH;
+  var foam = 0.0;
+  if (amount > 0.0) {
+    let rs = rippleSlope(pm, R.time, 0.0);
+    let mask = smoothstep(0.010, 0.055, length(rs));
+    foam = amount * mask * TUNE_FOAM_STRENGTH;
+  }
+  return max(foam, flowFoamLines(hitP, pm));
+}
+
+// FOAM LINES on moving water (WHAT MAKES MOVING WATER LOOK MOVING). Bubbles
+// and scum are drawn out into ragged lines along the flow and ride it: noise
+// stretched 14:1 along the current, thresholded to sparse lines, in the same
+// two-phase advected frame as the chop so the lines travel at the water's
+// speed. More of it where the water is fast, and where it SHEARS -- the speed
+// changing across the flow, at a bank or the edge of the thalweg -- which is
+// where real foam lines collect.
+const FLOW_FOAM_LEN : f32 = 4.0;    // m along the flow
+const FLOW_FOAM_WIDTH : f32 = 0.16; // m across it
+// The break-up of a line into flecks, also stretched along the flow: foam is
+// drawn out into dashes, never round blobs.
+const FLOW_FLECK : vec2f = vec2f(0.45, 0.06);
+fn flowFoamLines(hitP : vec3f, pm : vec2f) -> f32 {
+  let flowMS = currentAt(hitP, &R).xz * VOXEL_METERS;
+  let speed = length(flowMS);
+  let st = flowMarkStrength(speed);
+  if (st <= 0.0) { return 0.0; }
+  let dir = flowMS / speed;
+  let perp = vec2f(-dir.y, dir.x);
+  // The shear across the flow, per second: the along-flow speed 0.6 m to
+  // either side. Two more taps of a bilinear grid.
+  let e = 0.6;
+  let aL = dot(currentAt(hitP + vec3f(perp.x, 0.0, perp.y) * (e / VOXEL_METERS), &R).xz, dir);
+  let aR = dot(currentAt(hitP - vec3f(perp.x, 0.0, perp.y) * (e / VOXEL_METERS), &R).xz, dir);
+  let shear = abs(aL - aR) * VOXEL_METERS / (2.0 * e);
+  let density = clamp(0.45 * st * st + shear * 2.0, 0.0, 1.0);
+  if (density <= 0.02) { return 0.0; }
+  let v = flowMS * TUNE_WAVE_FLOW_SCALE;
+  let tau = R.time / WAVE_FLOW_CYCLE_S;
+  let f0 = fract(tau);
+  let f1 = fract(tau + 0.5);
+  let w0 = 1.0 - abs(2.0 * f0 - 1.0);
+  let w1 = 1.0 - w0;
+  let p0 = pm - v * (f0 * WAVE_FLOW_CYCLE_S);
+  let p1 = pm + WAVE_FLOW_LAYER_SHIFT - v * (f1 * WAVE_FLOW_CYCLE_S);
+  let L = vec2f(FLOW_FOAM_LEN, FLOW_FOAM_WIDTH);
+  let n0 = flowNoiseAlong(p0, dir, L, vec2f(0.0));
+  let n1 = flowNoiseAlong(p1, dir, L, vec2f(31.1, 5.7));
+  // The break-up so a line is dashes, not a painted stroke. Advected in the
+  // same two-phase frame, so it travels with the line it breaks up.
+  let fine0 = flowNoiseAlong(p0, dir, FLOW_FLECK, vec2f(0.0));
+  let fine1 = flowNoiseAlong(p1, dir, FLOW_FLECK, vec2f(3.3, 9.1));
+  // Both crossfades variance-preserving about the 0.5 mean, so the lines do
+  // not thin out half way through every cycle.
+  let wl = length(vec2f(w0, w1));
+  let fine = 0.5 + ((fine0 - 0.5) * w0 + (fine1 - 0.5) * w1) / wl;
+  let n = 0.5 + ((n0 - 0.5) * w0 + (n1 - 0.5) * w1) / wl;
+  let thr = mix(0.88, 0.68, density);
+  let line = smoothstep(thr, thr + 0.07, n) * smoothstep(0.35, 0.75, fine);
+  // Faded out with distance: a fleck is a few centimetres wide.
+  let foot = waterRippleFootprint(hitP);
+  return line * (0.22 + 0.38 * density) * (1.0 - smoothstep(0.06, 0.25, foot));
 }
 const WATER_FOAM_COLOR : vec3f = vec3f(0.92, 0.95, 0.97);
 

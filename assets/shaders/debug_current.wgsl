@@ -18,6 +18,9 @@
 
 @group(0) @binding(2) var<storage, read> materials : array<Material>;
 @group(0) @binding(3) var<uniform> R : RenderParams;
+// The terrain flow field (renderBGL_ 48, Vertex | Fragment; sim/flowfield.h):
+// currentAt adds it, so the arrows show the river the surface draws.
+@group(0) @binding(48) var<storage, read> flowGrid : array<u32>;
 
 struct VSOut {
   @builtin(position) pos : vec4f,

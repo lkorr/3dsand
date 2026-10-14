@@ -483,6 +483,15 @@ constexpr const char* kDraftBoundEnd = ">>>DRAFT_BOUND_END<<<";
 constexpr const char* kDraftUnboundBegin = ">>>DRAFT_UNBOUND_BEGIN<<<";
 constexpr const char* kDraftUnboundEnd = ">>>DRAFT_UNBOUND_END<<<";
 
+// THE TERRAIN FLOW FIELD reader (common.wgsl's FLOW_BOUND / FLOW_UNBOUND
+// blocks, sim/flowfield.h) reads `flowGrid`, which only the shaders that draw
+// the current declare (raymarch, wind_streak, debug_current). Same two-block,
+// body-derived shape as the draft reader above.
+constexpr const char* kFlowBoundBegin = ">>>FLOW_BOUND_BEGIN<<<";
+constexpr const char* kFlowBoundEnd = ">>>FLOW_BOUND_END<<<";
+constexpr const char* kFlowUnboundBegin = ">>>FLOW_UNBOUND_BEGIN<<<";
+constexpr const char* kFlowUnboundEnd = ">>>FLOW_UNBOUND_END<<<";
+
 // The HEAT UPDRAFTS reader (common.wgsl's block of that name, wind phase 5)
 // reads `heatPool` / `heatMeta`, which only the temperature layer's consumers
 // declare (sim_step, sim_heat, sim_particle, sim_draft, sim_gas, and the two
@@ -566,6 +575,10 @@ bool BodyResolvesTickets(const std::string& body) {
 
 bool BodyReadsDrafts(const std::string& body) {
   return body.find("> draftField") != std::string::npos;
+}
+
+bool BodyReadsFlow(const std::string& body) {
+  return body.find("> flowGrid") != std::string::npos;
 }
 
 bool BodyReadsHeat(const std::string& body) {
@@ -762,6 +775,11 @@ bool AssembleShaderSource(const std::string& shaderDir, const std::string& name,
     common = StripBlock(common, kDraftUnboundBegin, kDraftUnboundEnd);
   } else {
     common = StripBlock(common, kDraftBoundBegin, kDraftBoundEnd);
+  }
+  if (BodyReadsFlow(body)) {
+    common = StripBlock(common, kFlowUnboundBegin, kFlowUnboundEnd);
+  } else {
+    common = StripBlock(common, kFlowBoundBegin, kFlowBoundEnd);
   }
   {
     const bool heat = BodyReadsHeat(body);

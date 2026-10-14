@@ -1247,6 +1247,7 @@ class Simulation {
   // points. 44 in renderBGL_ (fragment, read); CPU-written per frame by
   // boltfx::Upload while a bolt burns.
   rhi::Buffer boltBuf_;
+  rhi::Buffer flowGridBuf_;   // the terrain flow field's window grid (flowfield.h)
   // The far horizon's height pyramid (sim/horizon.h): 45 in renderBGL_
   // (fragment, read). Built from the map at Init and every UploadEnvironment;
   // grow-only. renderBGBuilt_ says the render bind groups exist yet (Init

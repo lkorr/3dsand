@@ -3555,14 +3555,10 @@ struct Tuning {
     // against the vortex is why real whirlpools look enormous while the actual
     // suction is a small hole.
     float currentSinkSpeed = TPD(sim, currentSinkSpeed);
-    // Chezy coefficient for the stream arm: v = scale * sqrt(slope * depth),
-    // depth in metres. 0 disables the stream arm entirely.
+    // Chezy coefficient for the map's rivers (sim/flowfield.h): a river's
+    // reference speed is scale * sqrt(fall/run * depth), depth in metres,
+    // clamped to [kRiverMinFlowMs, kRiverMaxFlowMs]. 0 = no terrain flow.
     float currentStreamScale = TPD(sim, currentStreamScale);
-    // Landform slope below which standing water is a POND, not a stream, Q8
-    // (256 = one voxel per voxel = the angle of repose). Read against
-    // World::Column::slope, which is `Land.slope` — the HILL-octave gradient,
-    // deliberately not the fine one. See the trap note over SeedStreams.
-    int currentStreamMinSlope = TPD(sim, currentStreamMinSlope);
     // How fast an MPM node closes the gap to the local current, per second.
     // The ONE current knob a shader reads (sim_fluid.wgsl const-evals it), and
     // it is a DRAG rather than a push for windDrag's reason: a drag law is

@@ -28,6 +28,7 @@
 #include "sim/heat.h"        // the temperature layer's layout (heatParams, PackHeatMaterial)
 #include "sim/elec.h"        // the charge field's layout (elecParams, PackElecMaterial)
 #include "sim/boltfx.h"      // the bolt table at renderBGL 44 (render-only)
+#include "sim/flowfield.h"   // the terrain flow field at renderBGL 48 (render-only)
 #include "sim/worlddefaults.h"  // kDefaultSeed: the horizon treeline before streaming sets the seed
 #include "sim/horizon.h"     // the far horizon's pyramid at renderBGL 45 (render-only)
 #include "test/support.h"    // AssetDir(): the one asset-path chokepoint (solutes.json)
@@ -819,6 +820,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // THE FAR PATCH'S INDIRECT LIGHT). The resolve pass writes it on the
         // ShadowCache table; FlushForRenderDomain orders the read.
         entry(47, T::ReadOnlyStorage, S::Fragment),               // shadowHistRO
+        // THE TERRAIN FLOW FIELD (sim/flowfield.h; common.wgsl flowGridAt):
+        // the window grid of which way the map's water runs, CPU-written on
+        // window moves. Fragment for the waves, foam and film; Vertex for the
+        // current arrow overlay (debug_current.wgsl). Render-only.
+        entry(48, T::ReadOnlyStorage, S::Fragment | S::Vertex),   // flowGrid
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1102,6 +1108,15 @@ bool Simulation::Init(const rhi::Device& device, World& world,
       device.GetQueue().WriteBuffer(boltBuf_, 0, zero.data(), zero.size());
       boltfx::SetBuffer(&boltBuf_);
     }
+    // The terrain flow field's window grid (sim/flowfield.h): zeroed = no
+    // field (header word 2 is the node count); flowfield::Upload rewrites it
+    // from WriteRenderParams when the window grid changes. Render-only.
+    {
+      flowGridBuf_ = CreateBuffer(device, (uint64_t)sandvox::kFlowWords * 4, U::Storage, "flowGrid");
+      const std::vector<uint32_t> zero((size_t)sandvox::kFlowWords, 0u);
+      device.GetQueue().WriteBuffer(flowGridBuf_, 0, zero.data(), zero.size() * 4);
+      sandvox::flowfield::SetBuffer(&flowGridBuf_);
+    }
     // The GI gather request list (gi_gather.wgsl; pass_table.h kGiReq*):
     // header + list + one bit per irradiance-plane word. The zero-initialized
     // allocation is the cold state (empty list, no face pending), as for
@@ -1220,6 +1235,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // UNDER the terrain's top is blocked, not sunlit (shadow_resolve.wgsl
         // farUnderTerrain; ticket 2026-10-12_20-13-42).
         entry(34, T::ReadOnlyStorage), // farMap
+        // THE TERRAIN FLOW FIELD (flowfield.h): the current tracers in
+        // wind_streak's `update` are advected by currentAt, which adds it.
+        entry(35, T::ReadOnlyStorage), // flowGrid
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -2922,6 +2940,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::RainMap:             return rainMapBuf_;
     case B::Horizon:             return horizonBuf_;
     case B::HzLight:             return hzLightBuf_;
+    case B::FlowGrid:            return flowGridBuf_;
     case B::GodVis:              return godVisBuf_;
     case B::GasMask:             return gasMaskBuf_;
     case B::GiReq:               return giReqBuf_;
@@ -4390,6 +4409,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(45, horizonBuf_),           // the far horizon (horizon.h)
         b(46, hzLightBuf_),           // the terrain light map (horizon.h kL*)
         b(47, world_->shadowHist),    // far patches' indirect light (shadow_resolve.wgsl)
+        b(48, flowGridBuf_),          // the terrain flow field (flowfield.h)
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");
@@ -4491,6 +4511,7 @@ void Simulation::BuildShadowBindGroup() {
       b(32, horizonBuf_),
       b(33, hzLightBuf_),
       b(34, world_->farMap),
+      b(35, flowGridBuf_),
   };
   shadowBG_ = device_.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
 }

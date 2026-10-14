@@ -1780,10 +1780,13 @@ PASS(ray_start_trace, "rayStart", PT_SHADOWCACHE, PIPE_RAY_START_TRACE, K_COMPUT
 // under each particle -- a gust streak dies in liquid, a current tracer lives
 // only in it -- through voxWordAt. Written on the tick command buffer, covered
 // by the global barrier every command buffer opens with, like the draft.
+// R(FlowGrid) (2026-10-14): a current tracer is advected by currentAt, which
+// adds the terrain flow field (src/sim/flowfield.h), CPU-written on window
+// moves.
 PASS(wind_streak, "windStreaks", PT_SHADOWCACHE, PIPE_WIND_STREAK, K_COMPUTE, D_STREAKGX,1,1,
      GRP_SHADOW, DYN_NONE, C_STREAKS, 1,
      USES(R(Voxels) R(Materials) U(RenderUBO) R(PageTable) RW(WindStreaks) R(Draft)
-          R(HeatPool) R(HeatMeta)))
+          R(HeatPool) R(HeatMeta) R(FlowGrid)))
 PASS(ray_start_min, "rayStart", PT_SHADOWCACHE, PIPE_RAY_START_MIN, K_COMPUTE, D_RSGX,D_RSGY,1,
      GRP_SHADOW, DYN_NONE, C_RAYSTART, 1,
      USES(U(RenderUBO) RW(RayStart)))
