@@ -148,6 +148,24 @@ Status GateBugReportMd(Ctx&, std::string& detail) {
     check(!WriteBugReport(root.string(), none, "", d2, e2) && !e2.empty(),
           "a new report with no picture is refused");
 
+    // A SUGGESTION: its own folder under the root (never in the open-bug
+    // list), its own title, and words alone are enough -- but not nothing.
+    UIState::BugReportUI sug;
+    sug.suggestion = true;
+    sug.text = "an idea";
+    sug.tags = {"ui"};
+    std::string ds, es;
+    check(WriteBugReport(root.string(), sug, "- map: harness\n", ds, es) &&
+              fs::path(ds).parent_path().filename() == "suggestions",
+          "a suggestion with no picture writes, under <root>/suggestions/");
+    const std::string sugMd = ReadAll(fs::path(ds) / "report.md");
+    check(sugMd.rfind("# Suggestion ", 0) == 0 && ParseBugReportMd(sugMd).text == "an idea",
+          "a suggestion is titled as one and keeps its text");
+    UIState::BugReportUI sugEmpty;
+    sugEmpty.suggestion = true;
+    check(!WriteBugReport(root.string(), sugEmpty, "", d2, e2) && !e2.empty(),
+          "a suggestion with no picture and no text is refused");
+
     UIState::BugReportUI add;
     add.target = dir;
     add.text = "the new ticket\n\nand an addition";
@@ -171,7 +189,7 @@ Status GateBugReportMd(Ctx&, std::string& detail) {
     check(!fs::exists(fs::path(dir) / "report.md.tmp"), "no temp file left behind");
     int dirs = 0;
     for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec))
-      dirs += it->is_directory() ? 1 : 0;
+      dirs += it->is_directory() && it->path().filename() != "suggestions" ? 1 : 0;
     check(dirs == 1, "an append makes no new folder");
 
     uint32_t w = 0, h = 0, tw = 0, th = 0;

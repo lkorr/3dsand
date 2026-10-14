@@ -30,6 +30,13 @@
 // text, leaving every existing shot section and the `## Context` block as
 // they were. Nothing ever deletes a ticket or one of its pictures.
 //
+// SUGGESTIONS. The list column's "bugs | suggestions" switch files into
+// bug_reports/suggestions/<stamp>/ instead (`# Suggestion <time>`, same
+// layout) and lists those: ideas and tickets that are not bugs, kept out of
+// the open-bug list and out of every `bug_reports/*/` glob. A new suggestion
+// needs a picture OR text, not necessarily a picture. Every clear (submit,
+// discard) puts the panel back on bugs.
+//
 // TAGS. A report carries any number of category tags ("lod", "physics",
 // ...) as ONE line right under the title, `tags: lod, graphics`, so an agent
 // finds every LOD ticket with

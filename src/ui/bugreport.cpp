@@ -278,6 +278,7 @@ struct Parked {  // the unsaved edit of a ticket not on the panel
 };
 struct Library {
   bool scanned = false;
+  bool suggest = false;  // which list this is: bug_reports/ or its suggestions/
   std::vector<LibEntry> entries;
   std::map<std::string, Parked> edits;
   std::vector<std::string> known;  // every tag the panel offers, starter set first
@@ -345,10 +346,23 @@ std::filesystem::path TicketRoot() {
   return std::filesystem::path(sandvox::AssetDir() + "/../bug_reports").lexically_normal();
 }
 
-void ScanLibrary() {
+// Where a report of this kind is filed under the bug root: suggestions get
+// their own folder, so the open-bug list (and every `bug_reports/*/` glob an
+// agent runs) never sees them. Tags stay shared (the root's tags.txt).
+constexpr const char* kSuggestDir = "suggestions";
+std::filesystem::path KindRoot(const std::filesystem::path& root, bool suggest) {
+  return suggest ? root / kSuggestDir : root;
+}
+
+// `suggest` picks the list. Unsaved edits parked on tickets survive the
+// rescan a mode switch does (they are keyed by folder, which is unique).
+void ScanLibrary(bool suggest) {
   namespace fs = std::filesystem;
+  std::map<std::string, Parked> edits = std::move(g_lib.edits);
   g_lib = Library{};
+  g_lib.edits = std::move(edits);
   g_lib.scanned = true;
+  g_lib.suggest = suggest;
   std::error_code ec;
   const fs::path root = TicketRoot();
   for (const auto& t : BugReportStarterTags()) AddKnown(t);
@@ -356,11 +370,13 @@ void ScanLibrary() {
     std::ifstream f(root / "tags.txt");
     for (std::string l; std::getline(f, l);) AddKnown(NormalizeBugTag(l));
   }
-  for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+  const fs::path list = KindRoot(root, suggest);
+  for (fs::directory_iterator it(list, ec), end; !ec && it != end; it.increment(ec)) {
     std::error_code e2;
     if (!it->is_directory(e2)) continue;
     const std::string name = it->path().filename().string();
-    if (name == "fixed" || !fs::exists(it->path() / "report.md", e2)) continue;
+    if (name == "fixed" || name == kSuggestDir || !fs::exists(it->path() / "report.md", e2))
+      continue;
     LibEntry e;
     e.dir = it->path().string();
     e.stamp = name;
@@ -715,7 +731,10 @@ bool AppendBugReport(const std::string& dirS, const UIState::BugReportUI& r, std
     err = "replace report.md: " + ec.message();
     return false;
   }
-  RememberTags(dir.parent_path(), tags);
+  // A suggestion's parent is <root>/suggestions; the tag list is the root's.
+  fs::path tagRoot = dir.parent_path();
+  if (tagRoot.filename() == kSuggestDir) tagRoot = tagRoot.parent_path();
+  RememberTags(tagRoot, tags);
   return true;
 }
 
@@ -726,16 +745,22 @@ bool WriteBugReport(const std::string& root, const UIState::BugReportUI& r,
     outDir = r.target;
     return AppendBugReport(r.target, r, err);
   }
-  if (r.shots.empty()) {
+  // A bug is a thing SEEN, so it needs a picture; a suggestion may be words.
+  if (r.shots.empty() && !r.suggestion) {
     err = "a new report needs a picture (F12 takes one)";
+    return false;
+  }
+  if (r.suggestion && r.shots.empty() && TrimRight(r.text).empty()) {
+    err = "a suggestion needs a picture or some text";
     return false;
   }
   const std::string stamp = LocalTime("%Y-%m-%d_%H-%M-%S");
   const std::string human = LocalTime("%Y-%m-%d %H:%M:%S");
-  fs::path dir = fs::path(root).lexically_normal() / stamp;
+  const fs::path kindRoot = KindRoot(fs::path(root).lexically_normal(), r.suggestion);
+  fs::path dir = kindRoot / stamp;
   // Two submits inside one second get their own folders.
   for (int k = 2; fs::exists(dir); k++)
-    dir = fs::path(root).lexically_normal() / (stamp + "_" + std::to_string(k));
+    dir = kindRoot / (stamp + "_" + std::to_string(k));
   outDir = dir.string();
   std::error_code ec;
   fs::create_directories(dir, ec);
@@ -755,7 +780,7 @@ bool WriteBugReport(const std::string& root, const UIState::BugReportUI& r,
     return false;
   }
   const std::vector<std::string> tags = CleanTags(r.tags);
-  md << "# Bug report " << human << "\n\n";
+  md << (r.suggestion ? "# Suggestion " : "# Bug report ") << human << "\n\n";
   if (!tags.empty()) md << "tags: " << JoinTags(tags) << "\n\n";
   md << (text.empty() ? std::string("(no description)") : text) << "\n\n";
   md << "## Screenshots\n\n";
@@ -774,7 +799,7 @@ bool WriteBugReport(const std::string& root, const UIState::BugReportUI& r,
 }
 
 bool BugReportSelectTicket(UIState& s, int index) {
-  if (!g_lib.scanned) ScanLibrary();
+  if (!g_lib.scanned || g_lib.suggest != s.bug.suggestion) ScanLibrary(s.bug.suggestion);
   if (index < 0 || index >= (int)g_lib.entries.size()) return false;
   SelectTicket(s.bug, g_lib.entries[(size_t)index].dir);
   return true;
@@ -800,13 +825,15 @@ void DrawBugReport(UIState& s) {
     char line[320];
     if (r.collecting && !r.target.empty())
       std::snprintf(line, sizeof line,
-                    "BUG REPORT  adding to %s  %zu new shot%s   F12 capture next   shift+F12 back to report",
+                    "%s  adding to %s  %zu new shot%s   F12 capture next   shift+F12 back to report",
+                    r.suggestion ? "SUGGESTION" : "BUG REPORT",
                     std::filesystem::path(r.target).filename().string().c_str(), r.shots.size(),
                     r.shots.size() == 1 ? "" : "s");
     else if (r.collecting)
       std::snprintf(line, sizeof line,
-                    "BUG REPORT  %zu shot%s   F12 capture next   shift+F12 back to report",
-                    r.shots.size(), r.shots.size() == 1 ? "" : "s");
+                    "%s  %zu shot%s   F12 capture next   shift+F12 back to report",
+                    r.suggestion ? "SUGGESTION" : "BUG REPORT", r.shots.size(),
+                    r.shots.size() == 1 ? "" : "s");
     else
       std::snprintf(line, sizeof line, "%s", r.toast.c_str());
     ImDrawList* dl = ImGui::GetForegroundDrawList();
@@ -818,8 +845,9 @@ void DrawBugReport(UIState& s) {
     ImGui::PopFont();
     return;
   }
-  if (!g_lib.scanned) ScanLibrary();
+  if (!g_lib.scanned || g_lib.suggest != r.suggestion) ScanLibrary(r.suggestion);
   const bool existing = !r.target.empty();
+  const bool sug = r.suggestion;
   const LibEntry* cur = existing ? FindEntry(r.target) : nullptr;
 
   // ---- the panel ------------------------------------------------------------
@@ -897,7 +925,7 @@ void DrawBugReport(UIState& s) {
   ui::PanelBody(dl, wp, wb, st);
   ui::Draw9(dl, "panel", wp, wb);
   const float hb = ui::HeaderBar(dl, ImVec2(wp.x + kFrame, wp.y + kFrame), panelW - 2 * kFrame,
-                                 "BUG REPORT", nullptr);
+                                 sug ? "SUGGESTION" : "BUG REPORT", nullptr);
   {
     ImGui::PushFont(ui::FontSmall());
     const char* hint = existing ? "ctrl+enter  save    esc  leave the text box"
@@ -926,19 +954,45 @@ void DrawBugReport(UIState& s) {
     std::sort(used.begin(), used.end());
     if (!g_filter.empty() && !HasTag(used, g_filter)) g_filter.clear();
     float listTop = top;
+    // BUGS | SUGGESTIONS: which kind this panel files, and which list it
+    // shows. Switching keeps the draft and the pictures; it points the panel
+    // back at the new report (a ticket of one kind is not edited as the other).
+    {
+      ImGui::PushFont(ui::FontSmall());
+      float bottom = 0.0f;
+      const std::vector<std::string> kinds = {"bugs", "suggestions"};
+      const auto at = LayoutChips(kinds, ImVec2(lx, top), kListW, 0.0f, bottom);
+      for (int i = 0; i < 2; i++) {
+        const bool on = (i == 1) == sug;
+        ImGui::PushID(i);
+        if (ui::Button("##kind", at[(size_t)i], kinds[(size_t)i].c_str(), on) && !on) {
+          SelectTicket(r, "");
+          r.suggestion = i == 1;
+          g_filter.clear();
+        }
+        if (ImGui::IsItemHovered())
+          ui::Tip(i == 0 ? "file a bug: something wrong you saw (bug_reports/)"
+                         : "file a suggestion: an idea or a ticket that is not a bug "
+                           "(bug_reports/suggestions/); no picture needed");
+        ImGui::PopID();
+      }
+      ImGui::PopFont();
+      listTop = Snap(bottom + 10);
+    }
     if (!used.empty()) {
       ImGui::PushFont(ui::FontSmall());
       std::vector<std::string> labels = {"all"};
       labels.insert(labels.end(), used.begin(), used.end());
       float bottom = 0.0f;
-      const auto at = LayoutChips(labels, ImVec2(lx, top), kListW, 0.0f, bottom);
+      const auto at = LayoutChips(labels, ImVec2(lx, listTop), kListW, 0.0f, bottom);
       for (size_t i = 0; i < labels.size(); i++) {
         const bool on = i == 0 ? g_filter.empty() : g_filter == labels[i];
         ImGui::PushID((int)i);
         if (ui::Button("##filter", at[i], labels[i].c_str(), on))
           g_filter = i == 0 || on ? std::string() : labels[i];
         if (ImGui::IsItemHovered())
-          ui::Tip(i == 0 ? "every open ticket" : "only tickets tagged with this");
+          ui::Tip(i == 0 ? (sug ? "every suggestion" : "every open ticket")
+                         : "only tickets tagged with this");
         ImGui::PopID();
       }
       ImGui::PopFont();
@@ -994,11 +1048,13 @@ void DrawBugReport(UIState& s) {
       // The new report: the pictures taken now stand for it while it is the target.
       const bool sel = !existing;
       const auto* first = sel && !r.shots.empty() ? &r.shots[0] : nullptr;
-      if (row("##newticket", "NEW REPORT", ui::ColGoldPale(), sel ? r.text : r.newText,
+      if (row("##newticket", sug ? "NEW SUGGESTION" : "NEW REPORT", ui::ColGoldPale(),
+              sel ? r.text : r.newText,
               sel ? r.tags : r.newTags, kThumbCells, first ? first->th : 32,
               first ? first->thumb.data() : nullptr, sel))
         SelectTicket(r, "");
-      if (ImGui::IsItemHovered()) ui::Tip("file these pictures as a new ticket");
+      if (ImGui::IsItemHovered())
+        ui::Tip(sug ? "file this as a new suggestion" : "file these pictures as a new ticket");
     }
     for (size_t i = 0; i < g_lib.entries.size(); i++) {
       const LibEntry& e = g_lib.entries[i];
@@ -1029,7 +1085,7 @@ void DrawBugReport(UIState& s) {
     }
     if (g_lib.entries.empty()) {
       ui::ShadowText(cd, ImVec2(base.x + kRowPad, py), ui::ColParchDim(),
-                     Fit("no open tickets", textW).c_str());
+                     Fit(sug ? "no suggestions yet" : "no open tickets", textW).c_str());
       py += sl;
     }
     ImGui::SetCursorScreenPos(ImVec2(base.x, py));
@@ -1041,8 +1097,9 @@ void DrawBugReport(UIState& s) {
   float y = top;
   {
     const std::string head =
-        existing ? "TICKET " + std::filesystem::path(r.target).filename().string()
-                 : std::string("NEW REPORT");
+        existing ? (sug ? "SUGGESTION " : "TICKET ") +
+                       std::filesystem::path(r.target).filename().string()
+                 : std::string(sug ? "NEW SUGGESTION" : "NEW REPORT");
     y = ui::Subheading(dl, ImVec2(cx, y), inner, head.c_str()) + 6;
   }
 
@@ -1050,7 +1107,9 @@ void DrawBugReport(UIState& s) {
   ImGui::PushFont(ui::FontSmall());
   if (pics.empty())
     ui::ShadowText(dl, ImVec2(cx, y + 6), ui::ColParchDim(),
-                   Fit("no pictures yet: 'add another', then F12", inner).c_str());
+                   Fit(sug ? "no pictures (optional for a suggestion): 'add another', then F12"
+                           : "no pictures yet: 'add another', then F12",
+                       inner).c_str());
   for (size_t i = 0; i < pics.size(); i++) {
     const Pic& p = pics[i];
     const int col = (int)i % perRow, rw = (int)i / perRow;
@@ -1129,7 +1188,7 @@ void DrawBugReport(UIState& s) {
   }
 
   // ---- the text ---------------------------------------------------------------
-  y = ui::Subheading(dl, ImVec2(cx, y), inner, "WHAT WENT WRONG") + 6;
+  y = ui::Subheading(dl, ImVec2(cx, y), inner, sug ? "WHAT YOU WANT" : "WHAT WENT WRONG") + 6;
   ImGui::SetCursorScreenPos(ImVec2(cx, y));
   if (r.focusText) {
     ImGui::SetKeyboardFocusHere();
@@ -1155,8 +1214,10 @@ void DrawBugReport(UIState& s) {
   if (r.text.empty() && !ImGui::IsItemActive()) {
     ImGui::PushFont(ui::FontSmall());
     ui::ShadowText(dl, ImVec2(cx + 10, y + 8), ui::Fade(ui::ColParchDim(), 0.7f),
-                   Fit("what you did, what you saw, what you expected. 'add another' to pair more "
-                       "pictures.",
+                   Fit(sug ? "the idea: what it should do, and why. 'add another' to pair "
+                             "pictures."
+                           : "what you did, what you saw, what you expected. 'add another' to "
+                             "pair more pictures.",
                        inner - 20)
                        .c_str());
     ImGui::PopFont();
@@ -1199,7 +1260,8 @@ void DrawBugReport(UIState& s) {
   if (!r.toast.empty() && r.toastLeft > 0.0f) {
     ImGui::PushFont(ui::FontSmall());
     // (the last save's "saved" line is still up when the panel reopens soon after)
-    const bool good = r.toast.rfind("bug report saved", 0) == 0;
+    const bool good = r.toast.rfind("bug report saved", 0) == 0 ||
+                      r.toast.rfind("suggestion saved", 0) == 0;
     ui::ShadowText(dl, ImVec2(cx, Snap(y + lineH + 14)), good ? ui::ColGold() : ui::ColBloodHi(),
                    Fit(r.toast, inner).c_str());
     ImGui::PopFont();

@@ -188,19 +188,35 @@ bool PullArrowToKit(MobSystem& mobs, uint64_t body, Kit& kit,
   if (!IsEmbeddedArrowBody(mobs, body)) return false;
   int li = -1;
   Mob* m = mobs.FindOwner(body, &li);
-  const std::string name = m->ArrowItemOf(li);
+  return PullArrowSlotToKit(*m, li, kit, items, itemOut, noRoom);
+}
+
+bool PullArrowSlotToKit(Mob& m, int li, Kit& kit, const ItemLibrary& items,
+                        std::string* itemOut, bool* noRoom) {
+  if (noRoom) *noRoom = false;
+  if (!m.IsArrowSlot(li)) return false;
+  const std::string name = m.ArrowItemOf(li);
   const int di = items.Find(name);
   if (di < 0) return false;
   // ROOM FIRST: a full pack refuses and the arrow stays where it is, the
   // ground pickup's rule (nothing a take does can lose an item).
   const ItemStack one = StackOf(items, di, 1);
+  ItemStack* into = nullptr;
   int where = kit.bag.Add(one);
-  if (where < 0) where = kit.hotbar.Add(one);
-  if (where < 0) {
+  if (where >= 0) {
+    into = &kit.bag.slots[where];
+  } else if ((where = kit.hotbar.Add(one)) >= 0) {
+    into = &kit.hotbar.slots[where];
+  } else {
     if (noRoom) *noRoom = true;
     return false;
   }
-  m->PullArrow(li);
+  // A slot that will not come out (mid-sever hold) gives the pocketed one
+  // back: nothing a take does can make an item either.
+  if (!m.PullArrow(li)) {
+    if (--into->count <= 0) *into = ItemStack{};
+    return false;
+  }
   if (itemOut) *itemOut = name;
   return true;
 }

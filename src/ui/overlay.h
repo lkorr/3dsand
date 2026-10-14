@@ -838,6 +838,18 @@ struct UIState {
     static constexpr int kInfectRows = 3;
     InfectRow infect[kInfectRows];
     int infectCount = 0;
+    // ...AND WHAT IS STUCK IN IT (game/arrows.h): every arrow embedded in a
+    // limb drawn as this segment, by the avatar's rig slot (the part index
+    // PlayerAvatar::PartBody takes) and its item name. The inspector lists
+    // them with a "pull out" button; main.cpp takes the slot back off the
+    // rig into the kit (UIState::pullArrow). Capped at the rig's own cap.
+    struct ArrowRow {
+      int part = -1;
+      char item[24] = {};
+    };
+    static constexpr int kArrowRows = 8;   // Mob::kMaxEmbeddedArrows
+    ArrowRow arrows[kArrowRows];
+    int arrowCount = 0;
     // WHERE THE LIMB IS ON THE PORTRAIT, so the inspector can outline it.
     // Normalized to the portrait frame: (0,0) top-left, (1,1) bottom-right,
     // as the screen-space bounds of the limb's projected oriented box.
@@ -1494,6 +1506,11 @@ struct UIState {
     // the new report's while an existing ticket is on the panel.
     std::vector<std::string> tags;
     std::vector<std::string> newTags;
+    // SUGGESTION MODE: the same panel filing into bug_reports/suggestions/
+    // instead -- ideas and non-bug tickets, kept out of the open-bug list
+    // (and out of `bug_reports/*/report.md`). Its list shows the suggestions;
+    // a new one needs no picture. Reset to a bug report by every clear.
+    bool suggestion = false;
     bool wantSubmit = false, wantAddAnother = false, wantDiscard = false;
     int wantRemove = -1;
     std::string toast;          // "saved to ..." after a submit
@@ -1584,6 +1601,14 @@ struct UIState {
     bool pending = false;
     int slot = -1;             // UIState::BodySlot
   } castAtPart;
+  // "pull out" on an arrow row in the health inspector (BodyPartUI::arrows):
+  // the avatar's rig slot to take it from. main.cpp consumes it the way G
+  // consumes an arrow in somebody else (PullArrowToKit): room first, then
+  // the slot goes.
+  struct PullArrowIntent {
+    bool pending = false;
+    int part = -1;
+  } pullArrow;
   // ...and with a filled VESSEL chosen on the FLASKS row instead (game/
   // container.h; `activeVessel` below): the portrait becomes a BRUSH. Left button held over the
   // body pours where the cursor is (MobSystem::PourOnBody); right-drag

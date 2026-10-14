@@ -119,6 +119,11 @@ bool IsEmbeddedArrowBody(MobSystem& mobs, uint64_t body);
 bool PullArrowToKit(MobSystem& mobs, uint64_t body, Kit& kit,
                     const ItemLibrary& items, std::string* itemOut = nullptr,
                     bool* noRoom = nullptr);
+// ...the same take by rig SLOT on a creature already in hand: the player
+// pulling an arrow out of their own body from the health inspector, where
+// there is no look ray to name a body.
+bool PullArrowSlotToKit(Mob& m, int slot, Kit& kit, const ItemLibrary& items,
+                        std::string* itemOut = nullptr, bool* noRoom = nullptr);
 
 // ---- THE ARROWS IN FLIGHT ------------------------------------------------------
 struct ArrowFlight {

@@ -3479,6 +3479,34 @@ void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size, bool deathBanner = true) {
     y += 6;
   }
 
+  // ---- STUCK IN IT: arrows embedded in this limb (game/arrows.h) ----------
+  //
+  // Only when there are any, like the rot row: the section appearing is the
+  // news. Each one is a row with its own "pull out" button; main.cpp takes it
+  // into the pack (UIState::pullArrow), room first.
+  if (b.arrowCount > 0) {
+    y = ui::Subheading(dl, ImVec2(base.x, y), w, "STUCK IN IT") + 4;
+    for (int k = 0; k < b.arrowCount; k++) {
+      const UIState::BodyPartUI::ArrowRow& ar = b.arrows[k];
+      ImGui::PushFont(ui::FontSmall());
+      const float lineH = ImGui::GetTextLineHeight();
+      ui::ShadowText(dl, ImVec2(base.x + 4, y + 4), ui::ColParch(),
+                     ar.item[0] ? ar.item : "arrow");
+      ImGui::PopFont();
+      char id[24];
+      std::snprintf(id, sizeof id, "##pullarrow%d", k);
+      const float bw = 88.0f;
+      if (ui::Button(id, ImVec2(base.x + w - bw - 4, y), "pull out", false, bw)) {
+        s.pullArrow.pending = true;
+        s.pullArrow.part = ar.part;
+      }
+      if (ImGui::IsItemHovered())
+        Tip("Pull it out and put it in your pack. The wound stays.");
+      y = std::max(y + lineH + 8, ImGui::GetItemRectMax().y) + 2;
+    }
+    y += 6;
+  }
+
   // ---- COVER: the piece of gear standing between this limb and the world ---
   //
   // The reason the two views are one screen now. The slot itself is lit in the

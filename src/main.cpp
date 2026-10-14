@@ -1705,6 +1705,22 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
     }
   }
 
+  // WHAT IS STUCK IN EACH SEGMENT: the rig's arrow slots (Mob::EmbedArrow),
+  // filed under the figure slot of the limb they ride (WornHostOf is always a
+  // base limb: an arrow that stopped in armour is strapped to what is under
+  // it). The arrow slots themselves have no figure slot (tag "arrow").
+  for (int i = 0; i < avatar.PartCount(); i++) {
+    if (!avatar.IsArrowSlot(i) || !avatar.PartBody(i)) continue;
+    const int host = avatar.WornHostOf(i);
+    const int slot = host >= 0 ? BodySlotFor(avatar.PartName(host), avatar.PartTag(host)) : -1;
+    if (slot < 0) continue;
+    UIState::BodyPartUI& b = ui.body[slot];
+    if (b.arrowCount >= UIState::BodyPartUI::kArrowRows) continue;
+    UIState::BodyPartUI::ArrowRow& row = b.arrows[b.arrowCount++];
+    row.part = i;
+    std::snprintf(row.item, sizeof row.item, "%s", avatar.ArrowItemOf(i).c_str());
+  }
+
   // Fold each slot's accumulated columns into the 0..255 shares the overlay
   // mixes colours from.
   for (int i = 0; i < UIState::kSlotCount; i++) {
@@ -13813,6 +13829,7 @@ int main(int argc, char** argv) {
         br.newText.clear();
         br.tags.clear();
         br.newTags.clear();
+        br.suggestion = false;
         bugContext.clear();
       };
       if (br.wantRemove >= 0) {
@@ -13835,7 +13852,7 @@ int main(int argc, char** argv) {
         if (WriteBugReport(AssetDir() + "/../bug_reports", br, bugContext, dir, err)) {
           std::printf("bug report: wrote %s (%zu picture%s)\n", dir.c_str(), br.shots.size(),
                       br.shots.size() == 1 ? "" : "s");
-          br.toast = "bug report saved: " + dir;
+          br.toast = (br.suggestion ? "suggestion saved: " : "bug report saved: ") + dir;
           clearReport();
         } else {
           std::fprintf(stderr, "bug report: FAILED in %s: %s\n", dir.c_str(), err.c_str());
@@ -19097,6 +19114,21 @@ int main(int argc, char** argv) {
       if (ui.castAtPart.pending) {
         ui.castAtPart.pending = false;
         castAtPartQueued = ui.castAtPart.slot;
+      }
+      // AN ARROW IN YOU, pulled from the health inspector: G's take on your
+      // own body (arrows.h PullArrowSlotToKit) -- room first, a full pack refuses
+      // and the arrow stays in.
+      if (ui.pullArrow.pending) {
+        ui.pullArrow.pending = false;
+        std::string got;
+        bool noRoom = false;
+        if (PullArrowSlotToKit(avatar, ui.pullArrow.part, kit, items, &got, &noRoom))
+          ui.kitMessage = "pulled out the " + got;
+        else if (noRoom)
+          ui.kitMessage = "you have no room for that";
+        else
+          ui.kitMessage = "it will not come out";
+        ui.kitMessageAge = 0.0f;
       }
       // THE POUR BRUSH: the cursor on the portrait becomes a world ray through
       // the SAME camera that rendered it -- the inverse of ProjectToPortrait,
