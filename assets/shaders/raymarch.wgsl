@@ -14612,8 +14612,8 @@ fn farSurfAt(level : u32, hitP : vec3f, grad : bool) -> FarSurf {
 // ALBEDO of the averaged staircase is skin and sub-skin in these shares; its
 // LIGHTING is the smooth heightfield normal's, so the relief survives.
 // How BURIED a cascade hit is (D9): 0 = the air in front of its face is
-// under the open sky, 1 = under rock (the column one sub-column out along `n`
-// has its heightfield top FAR_BURIED_LO..HI fine voxels or more above the
+// under the open sky, 1 = under rock (the ground in front of the face,
+// farFrontTop below, has its heightfield top FAR_BURIED_LO..HI fine voxels or more above the
 // hit, plus two sub-columns of slack), -1 = the map does not vouch for that
 // column (an edit, a ruin, outside the level): no answer.
 const FAR_BURIED_LO : f32 = 24.0;
@@ -14658,9 +14658,36 @@ fn farUnderTerrain(ro : vec3f, rd : vec3f, t : f32) -> bool {
   }
   return false;
 }
+// THE GROUND IN FRONT OF A FACE (2026-10-14; tickets 2026-10-13_23-57-48,
+// _23-58-42, _23-59-16): the LOWEST of the four sub-column tops of the level
+// cell the face looks into (the cell holding the point half a sub-column out
+// along `n`: the neighbour across a side face, the cell's own column over a
+// top face) -- one 16-byte farMap load. Burial read ONE sub-column, exactly
+// `w` out, and that is wrong on any steep slope whichever sub-column it is:
+// a cascade cell is its CENTRE sample, so its faces stand up to half a cell
+// away from the true surface, and the sub-columns beside the one the cell
+// was sampled at differ from it by the slope times the offset. On a wall
+// steeper than ~2.4 m per sub-column -- every mesa, butte, canyon wall and
+// talus foot -- the sub-column read was the cliff itself, its top metres over
+// the hit, and the face read as rock overhead: no sky, no sun, near black.
+// Those were the "holes" chevroned along the bands of every steep face, at
+// every level (plus a floor() on the boundary between two sub-columns that
+// read the far one on a +axis face and the near one on a -axis face). The air
+// in front of a face is under rock only if ALL the ground it looks out over
+// is higher: over a cave, a dungeon hall or a real overhang the rock spans
+// the whole cell, so burial there is unchanged. -1e9 = outside the box.
+fn farFrontTop(level : u32, p : vec3f, n : vec3f) -> f32 {
+  let w = f32(1u << (farCellShift(level) - 1u));
+  let q = p + n * (0.5 * w);
+  let c = vec2<i32>(floor(vec2f(q.x, q.z) / w)) >> vec2<u32>(1u);
+  let b = farBox(level);
+  if (any(c < b.lo.xz) || any(c >= b.hi.xz)) { return -1e9; }
+  let e = farMap[farMapCell(level, c)];
+  return f32(min(min(farMapTop(e.x), farMapTop(e.y)), min(farMapTop(e.z), farMapTop(e.w))) + 1);
+}
 fn farHitBuried(level : u32, hitP : vec3f, n : vec3f) -> f32 {
   let w = f32(1u << (farCellShift(level) - 1u));
-  let top = farColumnTop(level, hitP + n * w);
+  let top = farFrontTop(level, hitP, n);
   if (top < -1e8) { return -1.0; }
   let pad = 2.0 * w;
   return smoothstep(FAR_BURIED_LO + pad, FAR_BURIED_HI + pad, top - hitP.y);

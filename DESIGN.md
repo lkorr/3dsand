@@ -17820,6 +17820,32 @@ where you hear from either (§12b, "The ears are on the character").
   slot fields: a skin whose slot is past 127 (a stamp's flagstone floor)
   invalidates its entry instead of truncating, and the renderer draws the
   cells.
+  **The ground takes the low slots (2026-10-14; tickets
+  `2026-10-13_23-58-42`, `2026-10-14_00-03-23`; materials.cpp
+  `WorldgenMaterialNames`).** Identity-first made that seven-bit limit hit
+  far more than stamp floors. By then 44 of the materials worldgen lays
+  had ids past 127: red_sand, red_sandstone, limestone, chalk_rock, basalt,
+  moor_turf, peat, the savanna, steppe and heath plants, and the maple and
+  gold crowns. Wherever one of them was the ground, the surface-map entry
+  was INVALID. So the desert mesas, the badlands, the moors and every later
+  biome got none of the map's work: no refine, no smooth-normal staircase
+  average, no cover tint. They were plain centre-sampled cells at every
+  level, a different shape at each level seam, beside older biomes that
+  refined. The owner, approaching a mesa: "it transforms radically between
+  lod layers. same with the sand beneath me".
+  The loader now reads every material name a worldgen asset mentions
+  (assets/biomes, water, trees and every map.json, as plain JSON strings, so
+  a new biome material needs no registration).
+  - Under 128, slot == id is kept for that ground, for every id world.h
+    compiles in, and for every plant (MICRO or tagged foliage).
+  - The ground past 127 takes the free slots under 128 from the TOP down.
+    Those ids are bodies, gear and their burning or charred states (brain,
+    iron, flesh_charred, linen, ...), which worldgen never lays.
+  - The displaced materials fill whatever is left.
+  - Past 127 ground materials the loader warns, and `check_invariants.py`
+    (farbits) fails.
+  Today it is 90 distinct owners. Far bytes are render-only and never saved,
+  so a material that moves only moves within the palette.
   **The ground is the ground, not procgen's skin (2026-10-02).**
   `farSurfaceMat` used to colour every cell straddling `h` with procgen's
   skin, so anything laid FLUSH on the ground — the edit layer's gravel tracks,
@@ -18191,7 +18217,7 @@ where you hear from either (§12b, "The ears are on the character").
     `fardown` / `farpatch` keep correct as before. What it gives up: an edited
     column shows the plain cascade cell until a pristine refill of it.
   - **Render** (raymarch.wgsl `farRefineCell`, in traceFar's cell loop, up to
-    `render.farRefineLevel`, ships at 2 — see the measurement below). A cell is a CANDIDATE when it is a
+    `render.farRefineLevel`, shipped at 2, at 8 (every level) since 2026-10-14 — see below). A cell is a CANDIDATE when it is a
     material cell or the flagged air directly over one (one byte read) — so the
     map is loaded for at most a couple of cells per ray, never for the cover-
     height rows of blocker flags the ray crossed on the way down. If its four
@@ -18241,6 +18267,18 @@ where you hear from either (§12b, "The ears are on the character").
     levels 3+ were 0.61 ms of the 4.44 ms cascade camera and nothing on the
     eye-height cameras. The surface MAP is still filled at every level: the
     shading reads it (heightfield normal, cover) wherever the refine does not.
+    **Since 2026-10-14 it refines EVERY level (`render.farRefineLevel` 8;
+    ticket `2026-10-14_00-03-23`).** The cap was right for the eye-height
+    cameras and wrong from the air. From 150 m over a dune field, levels 3-6
+    are the whole picture. Each level's centre samples quantise the ground to
+    its cell height (0.8 / 1.6 / 3.2 / 6.4 m), so any relief shallower than
+    a cell vanished at the level seam where the cell outgrew it. The owner
+    saw "the lod seam between detailed desert and flattened terrain": fine
+    ripples out to the level 4/5 sphere, flat 3.2 m slabs past it.
+    Refined, every level draws its sub-columns at their true fine-voxel
+    heights, so the ripples run on to the horizon at the map's 2x
+    resolution, and the footprint fade averages them once a sub-column is
+    under ~2 px. The cost, measured 2026-10-14 (`--budget-cams cascade`, RTX 3060 Ti 1080p, not exclusive): raymarch 5.20 -> 6.43 ms (+1.23, 19%) against the level-2 cap; `refine2` is the arm that restores the cap.
   - **Gate** `far-surface`: after a full refill every sampled valid level-1
     entry equals `TerrainHeight` (or a fluid surface over it) and the sieve's
     cell holding that top wears the same far slot as the entry's skin; levels
@@ -20116,7 +20154,8 @@ stalk), and nothing an edit does lowers it. So a column's top is an answer to
 
 | Reader | Function |
 |---|---|
-| Cascade hits | `farColumnTop` / `farHitBuried`, raymarch.wgsl |
+| Cascade hits | `farFrontTop` / `farHitBuried`, raymarch.wgsl |
+| Far patches (sun skip, gather) | `farFrontTop` / `farBuriedW`, shadow_resolve.wgsl |
 | Shadow rays | `farColumnTop` / `farUnderTerrain`, shadow_resolve.wgsl (shadowBGL 34: `farMap`; the `shadow_resolve` pass-table row reads `FarMap`) |
 | The openness walk | `openTerrainTop` / `openExitUnderTerrain`, sim_openness.wgsl (simBGL 59/60: `farMap` + the far UBO; both openness pass-table rows read them) |
 | The eye | `RenderParams.eyeSky`, World::TerrainHeight on the CPU (genColumn's h exactly), spent from `pad_fb1` |
@@ -20124,6 +20163,28 @@ stalk), and nothing an edit does lowers it. So a column's top is an answer to
 Every one eases over the same band: FAR_BURIED_LO..HI, 2.4-4.8 m under the
 ground, plus two sub-columns of pad. All are continuous in position. The
 eye's value no longer cares which block it stands over.
+
+**A FACE asks about the LOWEST ground it looks out over (2026-10-14; tickets
+`2026-10-13_23-57-48`, `_23-58-42`, `_23-59-16`).** A point (a shadow ray's
+end, the eye) asks its own column. A cascade FACE first asked one
+sub-column, exactly a sub-column out along its normal, and that made every
+steep face in the far field black: grey-and-orange desert mesas showed black
+chevrons along their bands at every distance, which the owner read as holes
+in the rock. The cascade cell is its CENTRE sample, so its face stands up to
+half a cell away from the true surface. The sub-columns beside the sampled
+one differ from it by the slope times the offset. On a wall steeper than
+~2.4 m per sub-column (mesas, buttes, canyon walls, the talus at their feet),
+the sub-column read was the cliff itself. Its top was metres over the hit,
+so burial was 1: no sky, no sun, only the enclosed ambient. (`w` out also sat
+on the boundary between two sub-columns, so floor() read the far one on a
++axis face and the near one on a -axis face.) `farFrontTop` now reads the
+level cell half a sub-column out along `n` (the neighbour across a side
+face; the face's own column for a top face) as one 16-byte `farMap` load
+and takes the MIN of its four tops. A cave, a dungeon hall or a real
+overhang has rock over the whole cell, so its burial is unchanged; a face on
+a slope is under rock only if all the ground in front of it is higher.
+Measured at the 23-59-16 camera, noon: pixels under luma 40 went 14,303 -> 0;
+at 23-57-48 the mesa's blue-grey speckle is gone.
 
 **What each consumer does with it:**
 
