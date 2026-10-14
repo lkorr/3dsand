@@ -126,6 +126,45 @@ constexpr float kDragSinkLegLengths = 0.15f;
 constexpr float kMaxHeldCrouchLegLengths = 0.55f;
 constexpr float kHeldCrouchHalflife = 0.08f;
 
+// THE SNEAK'S LEGS (2026-10-14). The held crouch used to sink the pelvis
+// straight down between feet left exactly where standing put them: knees
+// together, feet side by side -- a squat. What every reference sneak shares
+// is a WIDE BASE, the LEAD FOOT half a step ahead of the rear one, KNEES
+// OVER THE TOES (splayed out, not pinched in), a LEVEL pelvis, and a
+// deliberate high lift on each step. All weighted by SneakWeight (how far the
+// held crouch has sunk), so a body that never crouches is untouched.
+//
+// Foot targets, in leg lengths off the rest stance: each foot out to its own
+// side, the lead (leg ordinal 0, the left -- the stride clock's leg 0) ahead
+// and the other behind. The stagger is a STANDING stance: a walk that kept it
+// would land the left foot ahead of the right every stride, a fencer's
+// advance, so it fades out as the body gets moving (kSneakStaggerSpeed, as a
+// fraction of top speed) and the width alone carries the walk.
+constexpr float kSneakFootOut = 0.10f;
+constexpr float kSneakLeadFwd = 0.20f;
+constexpr float kSneakTrailBack = 0.16f;
+constexpr float kSneakStaggerSpeed = 0.20f;
+// A standing body never steps off a sub-threshold drift (StepGait), so
+// sinking into the crouch would leave the feet where they stood. Crouched and
+// still, a foot further than this from its sneak stance steps into it: the
+// set-your-feet shuffle into the stance, and the shuffle of a crouched turn.
+constexpr float kSneakSettleStep = 0.10f;
+// The knee pole's outward lean at a full sneak (added to the chain's own
+// forward pole before normalising): ~24 degrees of knee splay.
+constexpr float kSneakKneeOut = 0.45f;
+// Extra step arc at a full sneak, as a multiple of the gait's stepHeight.
+constexpr float kSneakStepLift = 0.8f;
+
+// How far the held crouch has sunk, 0..1 of its full drop -- the weight the
+// sneak clip and the sneak legs ride, so the two arrive together.
+float SneakWeight(float crouchHold, const AnimState& st) {
+  float legLen = 0.0f;
+  for (const FootState& f : st.feet) legLen = std::max(legLen, f.legLength);
+  float full = MetresToCells(CurrentTuning().player.crouchKneeDrop);
+  if (legLen > 0.0f) full = std::min(full, kMaxHeldCrouchLegLengths * legLen);
+  return full > 1e-3f ? std::clamp(crouchHold / full, 0.0f, 1.0f) : 0.0f;
+}
+
 // Stride-clock lock. `kStrideSyncGain` is how much of the phase error is taken
 // out at each touchdown: 1 snaps (and pops the bob), 0 never locks. Half
 // converges inside two steps while keeping every correction sub-visible once
@@ -681,12 +720,7 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   // a 33 ms lag inside an 80 ms ease. Only a driver that crouches (the avatar)
   // ever gives it weight; every other body skips the block at weight 0.
   if (pose_.sneakClip >= 0) {
-    float legLen = 0.0f;
-    for (const FootState& f : st.feet) legLen = std::max(legLen, f.legLength);
-    float full = MetresToCells(CurrentTuning().player.crouchKneeDrop);
-    if (legLen > 0.0f) full = std::min(full, kMaxHeldCrouchLegLengths * legLen);
-    const float w =
-        full > 1e-3f ? std::clamp(pose_.crouchHold / full, 0.0f, 1.0f) : 0.0f;
+    const float w = SneakWeight(pose_.crouchHold, st);
     const int ci = pose_.sneakClip;
     if (w > 0.0f) {
       // Revive before requesting (the chase pose's reason, above).
@@ -1314,6 +1348,8 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
     // chain index: a rig whose arms are interleaved with its legs must still
     // split its legs fore and aft, the same argument SyncStrideClock makes.
     int legOrdinal = 0;
+    // Knees out over the toes while sneaking (kSneakKneeOut).
+    const float kneeOut = kSneakKneeOut * Smooth01(SneakWeight(pose_.crouchHold, st));
     for (size_t c = 0; c < sk.chains.size() && c < st.feet.size(); c++) {
       if (!IsLegChain(sk, c)) continue;
       const FootState& f = st.feet[c];
@@ -1358,7 +1394,17 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
           !haveGait ? airPt
                     : (haveAir ? prefabPt + (airPt - prefabPt) * pose_.airFrac
                                : prefabPt);
-      AnimSolveTwoBone(sk, st, sk.chains[c], target, weight);
+      if (kneeOut > 0.0f && hip >= 0) {
+        // A copy with the pole leaned out to this leg's side; only a
+        // crouching body pays for it.
+        IkChain splayed = sk.chains[c];
+        const float side = sk.parts[hip].anchorLocal.x >= pivot.x ? 1.0f : -1.0f;
+        splayed.pole = (splayed.pole.normalized() + Vec3{side * kneeOut, 0, 0})
+                           .normalized();
+        AnimSolveTwoBone(sk, st, splayed, target, weight);
+      } else {
+        AnimSolveTwoBone(sk, st, sk.chains[c], target, weight);
+      }
     }
   }
 
@@ -1912,6 +1958,13 @@ void Mob::StepGait(const PoseInputs& in, float dt, World& world, uint32_t tick) 
   // pose have to agree about where the foot is.
   const float ankleRise = restSoleY_ + CurrentTuning().avatar.footTrim;
 
+  // The sneak's stance (kSneakFootOut and friends): its weight, and how much
+  // of the fore/aft stagger survives the current speed.
+  const float sneakW = Smooth01(SneakWeight(pose_.crouchHold, st));
+  const float sneakStagger =
+      sneakW * (1.0f - SmoothSpan(0.05f, kSneakStaggerSpeed, speedFactor));
+  int legOrdinal = 0;
+
   for (size_t c = 0; c < sk.chains.size() && c < st.feet.size(); c++) {
     const IkChain& ch = sk.chains[c];
     FootState& f = st.feet[c];
@@ -1923,6 +1976,9 @@ void Mob::StepGait(const PoseInputs& in, float dt, World& world, uint32_t tick) 
       f.swinging = false;
       continue;
     }
+    // Leg ordinal, SyncStrideClock's (dead legs count, so the survivor keeps
+    // its side of the stagger).
+    const bool leadLeg = (legOrdinal++ & 1) == 0;
     // limb loss: stop scheduling this leg's steps entirely.
     bool alive = true;
     for (int p : ch.parts)
@@ -1946,6 +2002,15 @@ void Mob::StepGait(const PoseInputs& in, float dt, World& world, uint32_t tick) 
     for (int par = sk.parts[ch.effector].parent; par >= 0;
          par = sk.parts[par].parent)
       restLocal = restLocal + sk.parts[par].rest.pos;
+    // The sneak's stance: out to this foot's side, the lead foot ahead and
+    // the other behind (prefab +z is forward).
+    if (sneakW > 0.0f) {
+      const float side =
+          sk.parts[ch.parts[0]].anchorLocal.x >= pivot.x ? 1.0f : -1.0f;
+      restLocal.x += side * kSneakFootOut * sneakW * f.legLength;
+      restLocal.z += (leadLeg ? kSneakLeadFwd : -kSneakTrailBack) *
+                     sneakStagger * f.legLength;
+    }
     const Vec3 stance =
         Vec3{origin_.x, bodyY_, origin_.z} + pivot + Rotate(yaw, restLocal - pivot);
     // This chain's HIP, in world XZ (anchorLocal is prefab-absolute). Only the
@@ -2038,7 +2103,8 @@ void Mob::StepGait(const PoseInputs& in, float dt, World& world, uint32_t tick) 
         // whatever t the tick lands on.
         const float t = f.swingT;
         Vec3 flat = f.swingFrom * (1.0f - t) + f.swingTo * t;
-        float lift = std::sin(t * 3.14159265f) * g.stepHeight * f.legLength;
+        float lift = std::sin(t * 3.14159265f) * g.stepHeight * f.legLength *
+                     (1.0f + kSneakStepLift * sneakW);
         const float kLandEase = 0.75f;   // lift is fully shed by t = 1
         if (t > kLandEase)
           lift *= std::max(0.0f, (1.0f - t) / (1.0f - kLandEase));
@@ -2048,9 +2114,13 @@ void Mob::StepGait(const PoseInputs& in, float dt, World& world, uint32_t tick) 
     } else {
       // This foot WANTS to step. Whether it gets to is decided after the loop,
       // once every leg has said how badly it needs the slot. A body at a
-      // standstill does not step off a sub-threshold creep (`speedFactor`).
+      // standstill does not step off a sub-threshold creep (`speedFactor`)
+      // -- unless it is sneaking, when it sets its feet (kSneakSettleStep).
       const float drift = Vec3{goal.x - f.planted.x, 0, goal.z - f.planted.z}.len();
-      if (drift > g.stepThreshold * f.legLength && speedFactor > 0.05f &&
+      const bool moving = speedFactor > 0.05f;
+      const bool settle =
+          !moving && sneakW > 0.5f && drift > kSneakSettleStep * f.legLength;
+      if (((moving && drift > g.stepThreshold * f.legLength) || settle) &&
           nBids < 8) {
         int myGroup = -1;
         for (size_t gi = 0; gi < g.groups.size(); gi++)
@@ -2124,6 +2194,11 @@ void Mob::StepGait(const PoseInputs& in, float dt, World& world, uint32_t tick) 
   // (the stride's own crouch already oscillates up to the same clamp).
   if (dragW_ > 0.0f && crouchLegLength > 0.0f)
     crouchNeed = std::max(crouchNeed, dragW_ * crouchLegLength * kDragSinkLegLengths);
+  // The held crouch has already brought the hip down by crouchHold; only
+  // what the stride needs beyond that is the stance crouch's. Charging both
+  // dropped a sneaking walk twice at every double support -- a bob where a
+  // sneak glides level.
+  crouchNeed = std::max(0.0f, crouchNeed - pose_.crouchHold);
   crouchNeed = std::clamp(crouchNeed, 0.0f, kMaxCrouchLegLengths * crouchLegLength);
   // Eased on a SHORT half-life, which the per-foot form above makes safe (it is
   // continuous by construction) and which must stay short: the demand
