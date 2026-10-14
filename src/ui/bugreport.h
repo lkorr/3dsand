@@ -13,8 +13,9 @@
 //              is kept too, as a 4x4 contact sheet (ui/framering.h); each
 //              picture's "1 s" toggle files the sheet instead of the still.
 //   add another  fold the panel away and give the game back; the next F12
-//              appends a picture to the SAME report. Shift+F12 opens the panel
-//              without taking one.
+//              appends a picture to the SAME report. Shift+F12 while
+//              collecting goes back to the panel without taking one; outside
+//              collecting it is plain F12 (a new report always has a picture).
 //   submit     writes bug_reports/<YYYY-MM-DD_HH-MM-SS>/report.md + shot_N.png
 //              beside assets/ (gitignored). Every picture carries its own
 //              camera and a `--at x,y,z,yaw,pitch` line that boots the game

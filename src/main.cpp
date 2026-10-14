@@ -13498,13 +13498,14 @@ int main(int argc, char** argv) {
     const bool gameKeys = !ui.inventoryOpen && !ui.talk.open && !uiTyping && !edActive &&
                           !ui.bug.open && !ui.worldMap.open;
     // F12: photograph this frame for a bug report (the panel opens once the
-    // picture is in). Shift+F12 while collecting goes back to the panel
-    // without a new picture. Read every frame so the edge stays honest.
+    // picture is in). Shift+F12 while collecting ("add another") goes back to
+    // the panel without a new picture; outside collecting it is plain F12 --
+    // a report never starts empty. Read every frame so the edge stays honest.
     {
       const bool f12 = eF12.Pressed(key(GLFW_KEY_F12));
       if (f12 && !uiTyping && !ui.bug.open) {
         const bool shift = key(GLFW_KEY_LEFT_SHIFT) || key(GLFW_KEY_RIGHT_SHIFT);
-        if (shift) {  // the panel (and its ticket list) without a picture
+        if (shift && ui.bug.collecting) {  // back to the panel, no new picture
           ui.bug.open = true;
           ui.bug.focusText = true;
         } else {
