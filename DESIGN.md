@@ -17425,6 +17425,79 @@ where you hear from either (§12b, "The ears are on the character").
     differs between the two arms (near ~0.09, far ~0.24 of the clear value)
     that is not attributed yet -- a gate-instrument suspect (the gate draws
     no cloud passes of its own) as much as a shading one.
+  - **The far riser's foreground sun (2026-10-13).** Attributed with the
+    gate's own arms (counterfactual asset copies, one change each): the far
+    ground's BOUNCE was the dominant term -- removing it took open ground
+    +15.3 -> +4.9 and ground under a canopy +16.1 -> 0.0 at noon. A far
+    riser's bounce is a closed form (`farGiBounce`: the ring rays that lean
+    down land on the tread in front, taken to be in FULL SUN always); the
+    near gather reads what the shadow resolve deposited there. An open riser
+    patch now also carries its foreground's sun: `farForegroundLit`
+    (shadow_resolve.wgsl) marches from just over the heightfield top half a
+    cell in front of the patch, by the patch sun's own law, and stores it in
+    the patch's `shadowHist` word tagged `FAR_GI_FG_TAG` (2; a buried
+    gather word has bit 0 set), refreshed on the gather's period.
+    raymarch.wgsl multiplies the riser's closed-form bounce by it, from the
+    same `farGiCached` call site (no second find). Measured, standalone
+    `--gate lod-seam`, ground open / under a canopy: noon +15.5/+14.3 ->
+    +9.5/+4.6, afternoon +13.7/+7.3 -> +10.1/+3.8, dusk +3.2/-0.3 ->
+    +3.0/0.0, overcast +16.3/+14.8 -> +9.6/+4.5; leaf and bark within 0.5.
+    `lodSeam.max.*` re-pinned at those + ~2.5. Not run: `--render-budget`
+    (the extra cost is one patch word read on far riser pixels, and a short
+    march per open riser patch every `FAR_GI_PERIOD` resolves).
+  - **HANDOFF 2026-10-13 (where 14-23-01 stands; resume here).**
+    - Open ground is still ~+10 far (noon/afternoon/overcast). ~6 of it is
+      the far OPENNESS: an arm that substituted the near grid's openness
+      into the far shade (cfB) took -5.8 off; the rest (~4) is bounce excess.
+      Tried and REJECTED: counting blocker-flag bytes as solid in the sky
+      fan (`farSkySolid` -> `farByteAt != 0`): open ground -55, bark -10.
+      The near walk is a 40 cm block DDA over the blockers mask with an
+      endpoint up-march; the far fan point-samples cells. That difference is
+      where to look next, not another constant.
+    - THE SEA SEAM, measured 2026-10-13 (same-pixel arms on the default
+      map's shelf (2016, 142, -84950) yaw -90 pitch -14, the Twinmere lake
+      (12000, 213, 24500) and deep sea (4000, 172, -105000); SEAM_DBG 15 now
+      bands water pixels too): deep sea 0.0, lake 0.0, shelf water +0.7
+      noon / +3.2 at minute 960 (median), but the SHALLOW shelf (path < 6 m)
+      +4.5 noon / +9.3 low sun. Attributed (SEAM_DBG 6 re-mapped to
+      refracted / bed lit / path, and 2/3 with the far bed instrumented):
+      the far BED's light is 3-4x the near bed's. `farWaterBed` lights the
+      bed with NO SHADOW (near median shadow 0.23 at noon -- 0.07 on the
+      risers turned from the sun -- and 0.48 at minute 960), with the
+      closed-form openness (1.0 tread / 0.6 riser vs near 0.80 / 0.28), and
+      the dry palette mean (near albedo ~12 % darker: the water's stain on
+      the bed voxels). An UNVERIFIED fix is on branch
+      `wip/seam-14-23-01` (never run): the bed reads its face's far shadow
+      patch (`farShadowCached`, then lodShadowLift / hzSunShade /
+      shadowLiftCap as the dry far shade does) within 12 m of water path;
+      the far shadow march made MEDIA-BLIND like `traceOpaque`
+      (`farShadowBlocked` = a ray-blocking material, both copies -- until
+      now every far water cell was opaque to the sun, which no face asked
+      through); a wet bed face not counted as buried by the water over it
+      (`resolveFarPatch`); the bed's entry face taken as the DDA's last
+      crossing (53 % treads far vs 44 % near before, 37 % after). Verify
+      it with the shelf arms below, then `--verify lod-seam,shadow-cache,
+      cave-window,determinism` and a `--render-budget peaksea` pair.
+    - HOW TO MEASURE (one boot per arm): copy `assets/` per arm, set
+      `SEAM_DBG` in the copy's raymarch.wgsl and, for the far arm,
+      `render.lodHandoffDist` 8 in its tuning.json; run
+      `SANDVOX_ASSET_DIR=<copy> SANDVOX_AT_LIST=<file>
+      SANDVOX_UI_SIZE=1324x1128 SANDVOX_WEATHER=clear bash scripts/run.sh
+      sandvox.exe --frames N --at <first camera>` (list lines: `name x y z
+      yaw pitch minute hold`; shots land in the CWD as
+      `screenshot_at_<name>.bmp`); diff the two arms pixel for pixel inside
+      the SEAM_DBG 15 band. SEAM_DBG: 2 albedo / shadow / AO, 3 openness /
+      lit lambert / raw lambert, 4 colour / GI / face, 5-7 the water terms,
+      12 the sun shadow's raw / lifted / capped stages, 13 a far patch's
+      validity / value, 14 the near cache taps' verdicts (valid / invalid /
+      not found / stolen), 15 the shaded colour inside 10-19 m only.
+    - TRAPS: the UI width must be a multiple of 4 (BMP stride: 1325 wide
+      writes skewed images); `--gate lod-seam` alone and after the far-*
+      prefix differ by up to ~4 luma on ground (pin both); the far water and
+      the near water only share `dbgRec` through gDbgW0, so a debug mode
+      that reads gDbgT alone shows no water; a SEAM_DBG frame is the
+      encoded output, so compare arms, never absolute values against
+      linear constants.
   **The far water IS shadeWater (2026-10-10).** The near and far water
   shades had been written twice and agreed by calibration. They now share
   the surface law term for term: `waterWaveNormal` (macro slope + Gerstner
@@ -26649,7 +26722,21 @@ map's dungeons to the voxel genChunk generates there, so a generator branch
 the sieve does not run is a red gate, for any material. What this does NOT
 change: a cascade cell is still its centre sample, so a feature one voxel
 thin is drawn at level 1 only where a centre lands in it (see "What is
-representable, honestly" in §9). `caveBands` turns off a natural
+representable, honestly" in §9). **OPEN OWNER DECISION (2026-10-13, the
+ticket stays open on it): a sub-cell rule.** A one-voxel moss band, crust,
+trim line or plank shows at level 1 only where a centre sample lands in it
+(~50 % of a sheet, 25-50 % of a line). The general rule -- fill a cell from
+2+ of its 8 voxels, ties to the thinner material, specks still excluded --
+must go into ALL FOUR far producers (sieve `far`, `fardown`, the CPU twin
+`farpatch`, `farcover`'s path) or a cell changes when its chunk turns dirty.
+In the procgen sieve it needs all 4 fine columns per level-1 cell: the
+column half alone measured +0.35 ms mean / +2.3 ms p99 `farFill` on a
+13.75 m/s flight (598k entries, back-to-back runs), before the per-row work
+and one more large worldgen entry to compile. It also draws thin things two
+voxels wide and closes one-voxel slits. Cheaper variant to try first:
+LEVEL 1 ONLY (the first seam is the only place a one-voxel feature is
+bigger than a pixel), so levels 2+ keep the centre sample and their cost.
+`far-parity` is the gate that must stay at 0 after either. `caveBands` turns off a natural
 cave band that reaches into a dungeon's keep box (bounds + `keepOut`, default
 24; `naturalCaves: true` opts out), and the magma table goes with it (it only
 floods carved band cells). **Cost**: a map with no dungeon pays one header

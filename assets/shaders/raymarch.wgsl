@@ -7057,8 +7057,11 @@ fn farShadowCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
 // line, for every hit on a slope steep enough to be partly buried). A buried
 // face turned from the sun registers it here (farSlotRead's request path),
 // which is what keeps a cave wall's light coming at night.
+// The patch's shadowHist WORD: a buried patch's gather (bit 0 set, RGB9E5),
+// an open riser's foreground sun (low bits FAR_GI_FG_TAG), or 0 (nothing yet).
+const FAR_GI_FG_TAG : u32 = 2u;   // shadow_resolve.wgsl agrees
 fn farGiCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
-               refined : bool, hitP : vec3f, perFace : bool) -> vec3f {
+               refined : bool, hitP : vec3f, perFace : bool) -> u32 {
   let s = f32(1u << farCellShift(level));
   let face = shadowFaceOf(axis, sgn < 0.0);
   let tg = shadowFaceTangents(face);
@@ -7077,7 +7080,7 @@ fn farGiCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
   if (fp.x == 0xFFFFFFFFu) {
     // Not found: claim and request it (shadowSlotRead's path), none this frame.
     _ = shadowSlotRead(packedCell, sub, curFrame);
-    return vec3f(0.0);
+    return 0u;
   }
   // farSlotRead's registration, verbatim: re-requested on its refresh phase
   // (the sun's share of its light moves) or while unresolved, and kept LIVE.
@@ -7090,9 +7093,8 @@ fn farGiCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
                         shadowStateValid(state), ver));
     if (r.exchanged) { shadowAppendRequest(key, fp.x, packedCell, sub); }
   }
-  if (!shadowStateValid(state)) { return vec3f(0.0); }
-  let gw = shadowHistRO[fp.x];
-  return select(vec3f(0.0), unpackRgb9e5(gw), gw != 0u);
+  if (!shadowStateValid(state)) { return 0u; }
+  return shadowHistRO[fp.x];
 }
 
 // ---- far-field ambient occlusion: voxelAO's rule over cascade cells ----------
@@ -16129,10 +16131,22 @@ fn fs(in : VSOut) -> FSOut {
         // term above: a value live across the shade cost this fragment shader
         // 16 B of spill and ~0.1-0.25 ms on every budget camera, and a buried
         // face turned from the sun never reaches the sun term at all.
-        if (SHADOW_CACHE && FAR_SHADOW_CACHE && buriedF > 0.0) {
-          dbgGiF += ao * buriedF * albedo * TUNE_GI_STRENGTH *
-                    farGiCached(flv, far.cell, far.axis, far.sgn, fRefined || fFeat, hitP,
-                                openF == 0.0);
+        //
+        // AN OPEN RISER OF THE HEIGHTFIELD reads the same patch for its
+        // FOREGROUND's sun (shadow_resolve.wgsl farForegroundLit, tagged
+        // FAR_GI_FG_TAG): the closed form's ground in front was in full sun
+        // always, the near gather's is lit as it is lit -- under a crown, in a
+        // trunk's shadow, it is dark. Same call site, so no second find in
+        // the compiled shader; the patch is the one the sun term just read.
+        let fgRiser = fSurf && !fCard && far.axis != 1 && buriedF == 0.0;
+        if (SHADOW_CACHE && FAR_SHADOW_CACHE && (buriedF > 0.0 || fgRiser)) {
+          let gw = farGiCached(flv, far.cell, far.axis, far.sgn, fRefined || fFeat, hitP,
+                               openF == 0.0);
+          if ((gw & 1u) != 0u) {
+            dbgGiF += ao * buriedF * albedo * TUNE_GI_STRENGTH * unpackRgb9e5(gw);
+          } else if ((gw & 3u) == FAR_GI_FG_TAG && fgRiser) {
+            dbgGiF *= f32((gw >> 8u) & 0xFFu) * (1.0 / 255.0);
+          }
         }
         color += dbgGiF;
       }
@@ -17327,7 +17341,10 @@ fn fs(in : VSOut) -> FSOut {
     gDbg = vec4f(gDbgM0.z, gDbgM0.w, min(gDbgM1 / 40.0, 1.0), 1.0);
   }
   if (SEAM_DBG == 15u) {
-    let bandM = gDbgT * VOXEL_METERS;
+    // A water surface (either water shade) records its distance in gDbgW0.y,
+    // not through dbgRec: the band then covers the sea seam too.
+    let wet = gDbgW0.x == 1.0 || gDbgW0.x == 0.5;
+    let bandM = select(gDbgT, gDbgW0.y, wet) * VOXEL_METERS;
     gDbg = select(vec4f(0.0, 0.0, 0.0, 1.0), vec4f(color, 1.0), bandM >= 10.0 && bandM <= 19.0);
   }
   if (SEAM_DBG != 0u) { out.color = vec4f(gDbg.xyz, 1.0); }

@@ -713,6 +713,41 @@ fn farGather(level : u32, hp : vec3f, n : vec3f, face : u32) -> vec3f {
   return e;
 }
 
+// ---- THE GROUND IN FRONT OF A FAR RISER IS LIT AS THE CASCADE LIGHTS IT ----
+// (2026-10-13, ticket 2026-10-09_14-23-01: sunlit and overcast ground +9..+16
+// luma brighter past the 20.5 m handoff.) A far riser's bounce is a closed
+// form (raymarch.wgsl farGiBounce): the ring rays that lean down land on the
+// tread in front, and that tread was taken to be in FULL SUN, always. The near
+// field's gather reads what the shadow resolve deposited there, which is the
+// tread's real light: under a crown, in a tree's afternoon shadow, nothing.
+// Attributed with `--gate lod-seam` (the same pixels shaded near and far):
+// with the far ground's bounce removed altogether the ground under a canopy
+// went +16.1 -> 0.0 and open ground +15.3 -> +4.9 at noon (overcast +16.3 ->
+// -1.1 / +15.5 -> +2.5); the cascade's openness (the far fan read where the
+// near grid is) was the other ~6 on open ground and ~1 under a canopy.
+//
+// So an OPEN riser patch also carries the sun its foreground gets: the same
+// march and law the patch's own sun takes, from a point just over the
+// heightfield top in front of it (the column the patch centre stands over,
+// half a cell out). Stored in the patch's shadowHist word, tagged
+// FAR_GI_FG_TAG (low bits 10: a buried gather word always has bit 0 set),
+// and refreshed on the gather's period; raymarch.wgsl's far shade multiplies
+// the riser's closed form by it. An underside keeps the closed form: the
+// ground under an overhang is not the heightfield top over it.
+const FAR_GI_FG_TAG : u32 = 2u;   // raymarch.wgsl FAR_GI_FG_TAG agrees
+fn farForegroundLit(level : u32, hp : vec3f, L : vec3f) -> f32 {
+  let top = farColumnTop(level, hp);
+  if (top < -1e8) { return 1.0; }   // no surface-map column: the closed form as it was
+  let s = f32(1u << farCellShift(level));
+  let p = vec3f(hp.x, top + 0.05 * s, hp.z);
+  let r = farShadowTC(level, p, L, 0.0, true);
+  if (r.x >= 0.0) { return mix(1.0, shadowFromOpaqueHit(true, r.x, 0u), r.y); }
+  if (farUnderTerrain(p, L, TUNE_FAR_SHADOW_REACH / VOXEL_METERS)) {
+    return shadowFromOpaqueHit(true, TUNE_FAR_SHADOW_REACH / VOXEL_METERS, 0u);
+  }
+  return 1.0;
+}
+
 fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
   let level = ((packedSub >> FAR_SC_LEVEL_SHIFT) & 7u) + 1u;
   let ab = FAR_SC_AXIS_BITS;
@@ -752,16 +787,23 @@ fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
       valid = !(r.x >= 0.0 && r.x < 0.01);
     }
     valU = u32(clamp(sh, 0.0, 1.0) * 255.0 + 0.5);
-    // THE FAR PATCH'S INDIRECT LIGHT (above): buried patches only.
+    // THE FAR PATCH'S INDIRECT LIGHT (above): buried patches' gather, and an
+    // open RISER's foreground (FAR_GI_FG_TAG, below).
     var giW = 0u;
-    if (bw > 0.001) {
+    let riser = abs(n3.y) < 0.5;
+    if (bw > 0.001 || riser) {
       let ver0 = shadowPatchVerifier(packedCell, packedSub);
       let old0 = atomicLoad(&shadowCache[bucket * 2u + 1u]);
       let mine = shadowStateValid(old0) && shadowStateVerifier(old0) == ver0;
       let due = !mine || shadowHist[bucket] == 0u ||
                 ((R.frameIdx / SHADOW_REFRESH_PERIOD + (key >> 8u)) % FAR_GI_PERIOD) == 0u;
       if (due) {
-        giW = packRgb9e5(farGather(level, hp, n3, face)) | 1u;
+        if (bw > 0.001) {
+          giW = packRgb9e5(farGather(level, hp, n3, face)) | 1u;
+        } else {
+          giW = (u32(clamp(farForegroundLit(level, hp, L), 0.0, 1.0) * 255.0 + 0.5) << 8u) |
+                FAR_GI_FG_TAG;
+        }
       } else {
         giW = shadowHist[bucket];
       }
