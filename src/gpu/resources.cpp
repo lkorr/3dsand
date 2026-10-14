@@ -744,6 +744,14 @@ bool AssembleShaderSource(const std::string& shaderDir, const std::string& name,
     std::string dg;
     if (ReadFileText(shaderDir + "/worldgen_dungeon.wgsli", dg)) body += "\n" + dg;
   }
+  // THE ONE GATHER (gi_gather_rays.wgsli's header): the near cache's refresh
+  // and the far patch inside the window both call it. Absent = an older asset
+  // tree, whose gi_gather.wgsl still holds it and whose shadow_resolve never
+  // called it.
+  if (name == "gi_gather.wgsl" || name == "shadow_resolve.wgsl") {
+    std::string gi;
+    if (ReadFileText(shaderDir + "/gi_gather_rays.wgsli", gi)) body += "\n" + gi;
+  }
   // The seed accessor the page block's JITTER synthesis calls. Empty unless
   // this shader addresses voxels, which is exactly when the block survives.
   std::string ptSeed;

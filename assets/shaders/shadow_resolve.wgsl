@@ -713,6 +713,23 @@ fn farGather(level : u32, hp : vec3f, n : vec3f, face : u32) -> vec3f {
   let t0 = axisVec(i32(tg.x), 1.0);
   let t1 = axisVec(i32(tg.y), 1.0);
   var e = vec3f(0.0);
+  // INSIDE THE RESIDENCY WINDOW THE FAR PATCH TAKES THE NEAR GATHER (2026-10-14,
+  // ticket 2026-10-12_16-36-34: a crystal cave's walls 4-6x brighter past the
+  // 20.5 m seam). The cascade march below sends every hit cell's radiance from
+  // its MATERIAL (irrSample, emission whole); the near field's gather reads
+  // what the grid holds for the faces it hits -- the deposits, multi-bounce,
+  // the median background (gi_gather_rays.wgsli). Two radiance sources for
+  // one wall can only agree by accident, and the seam is always inside the
+  // window (render.lodHandoffDist < its half extent), so here the far patch
+  // runs THE gather, from its own centre, over the real voxels: the far wall
+  // takes exactly the light the near wall beside it takes. Measured at the
+  // ticket camera (SEAM_DBG 4, the 10-19 m band, same pixels near and far):
+  // far bounce mean 26.2 -> 8.5 against the near's 11.0 (encoded x4). Outside
+  // the window no near grid exists, and the cascade march stays.
+  if (inWindow(vec3<i32>(floor(hp)), R.origin)) {
+    for (var r = 0u; r < 9u; r++) { e += giGatherRay(hp, n, face, r); }
+    return e;
+  }
   for (var r = 0u; r < 9u; r++) {
     let su = select(select(0.0, 1.0, r == 1u || r == 5u || r == 6u), -1.0,
                     r == 2u || r == 7u || r == 8u);

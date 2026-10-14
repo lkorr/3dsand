@@ -572,6 +572,11 @@ fn ptTick() -> u32 { return ${u}.tick; }"
     # loop never compiles it alone).
     if [ "$name" = "worldgen.wgsl" ] && [ -f "$SHADER_DIR/worldgen_dungeon.wgsli" ]; then
       printf '\n'; cat "$SHADER_DIR/worldgen_dungeon.wgsli"
+    fi
+    # the one gather (gi_gather_rays.wgsli): the near refresh and the far patch
+    if { [ "$name" = "gi_gather.wgsl" ] || [ "$name" = "shadow_resolve.wgsl" ]; } &&
+       [ -f "$SHADER_DIR/gi_gather_rays.wgsli" ]; then
+      printf '\n'; cat "$SHADER_DIR/gi_gather_rays.wgsli"
     fi; } > "$combined"
 
   # `-f wgsl` parses, resolves, and validates, then re-emits WGSL we discard.

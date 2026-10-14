@@ -162,7 +162,7 @@ def check_tuning_consts():
                 "`python scripts/gen_tuning_params.py`")
 
     used = set()
-    for w in (ROOT / "assets/shaders").glob("*.wgsl"):
+    for w in (ROOT / "assets/shaders").glob("*.wgsl*"):
         used |= set(re.findall(r"TUNE_[A-Z_0-9]+",
                                w.read_text(encoding="utf-8", errors="replace")))
     for k in sorted(used - emitted):
@@ -464,7 +464,7 @@ def check_tuning_consumers():
                          re.escape(ty) + r")\b")
         group_files[g] = {rel for rel, t in files.items() if pat.search(t)}
     wgsl = set()
-    for p in (ROOT / "assets" / "shaders").glob("*.wgsl"):
+    for p in (ROOT / "assets" / "shaders").glob("*.wgsl*"):
         txt = re.sub(r"//[^\n]*", "", p.read_text(encoding="utf-8",
                                                   errors="replace"))
         wgsl |= set(re.findall(r"\bTUNE_\w+", txt))
