@@ -11836,8 +11836,8 @@ Status GateArrow(Ctx& c, std::string& detail) {
     hold(1, false);
     const uint64_t afterTap = fl.stats.launched - launched0;
     const int ammoAfterTap = KitAmmoCount(kit, "arrow");
-    // A full draw, held a little past it, then let go.
-    hold(bowDef->bow.drawTicks + 3, true);
+    // A full draw (the windup and the pull), held a little past it, then let go.
+    hold(BowFullDrawTicks(*bowDef) + 3, true);
     // The HUD's draw (UIState::bowDraw, written by the tick) at full; the
     // speed a full draw looses at is BowArrowSpeed of it, the bow's
     // drawSpeed exactly (the eased fraction is 1 there).

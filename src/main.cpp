@@ -14722,6 +14722,9 @@ int main(int argc, char** argv) {
         g_shotJumpPath = path;
       };
       if (f == 140) shot("tp_stand");
+      // The windup and the pull, frame by frame (bow_draw is a one-shot on
+      // the bow's windup + pull timeline, then held).
+      if (f >= 150 && f < 204 && (f - 150) % 6 == 0) shotF("tp_draw_seq");
       if (f == 204) shot("tp_draw");
       if (f == 214) shot("tp_draw_front");
       if (f == 226) shot("fp_draw");
@@ -16770,14 +16773,23 @@ int main(int argc, char** argv) {
             // (the base rig is ParentsFirst, an appended slot's host is an
             // earlier slot), so one forward pass reaches every descendant.
             if (p.head >= 0 && p.head < (int)hide.size()) hide[p.head] = 1;
-            // THE STRING HAND OF A DRAWN BOW (bow_draw*): it is hooked under
-            // the jaw, a hand's breadth from the eye. The pose keeps it out of
-            // the view at any held aim, but the draw follows the look on an
-            // eased pitch and a fast flick down outruns it -- the forearm
-            // swept up across the bottom of the view for a tenth of a second.
-            // Hidden while the draw lasts, with whatever it wears; the bow arm
-            // stays (it is the view).
-            if (session.bowDrawTicks > 0 && session.bowHand >= 0) {
+            // THE STRING HAND OF A DRAWN BOW (bow_draw*): at full draw it is
+            // hooked under the jaw, a hand's breadth from the eye. The pose
+            // keeps it out of the view at any held aim, but the draw follows
+            // the look on an eased pitch and a fast flick down outruns it --
+            // the forearm swept up across the bottom of the view for a tenth
+            // of a second. Hidden from three quarters of the draw on, with
+            // whatever it wears; before that it is out at the string in front
+            // of the face and the windup and the pull are the thing to see
+            // (scripts/gen_archery_clips.py prints where it leaves the view).
+            // The bow arm stays (it is the view).
+            const ItemDef* fpBow =
+                session.bowHand >= 0
+                    ? items.Named(avatar.HeldItem(HandAt(session.bowHand)))
+                    : nullptr;
+            if (session.bowDrawTicks > 0 && session.bowHand >= 0 &&
+                (fpBow == nullptr ||
+                 BowDrawFraction(*fpBow, session.bowDrawTicks) >= 0.75f)) {
               const bool bowLeft = HandAt(session.bowHand) == Hand::Left;
               for (const char* nm : {bowLeft ? "armL.R" : "armL.L",
                                      bowLeft ? "hand.R" : "hand.L"}) {

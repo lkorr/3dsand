@@ -565,7 +565,12 @@ struct ItemDef {
   struct BowSpec {
     bool has = false;
     float drawSpeed = 0.0f;   // world voxels/s at full draw (`drawSpeedMps`)
-    int drawTicks = 24;       // ticks to a full draw (`drawTimeMs`, at 30 Hz)
+    // The WINDUP comes first (`windupMs`): the bow comes up and the arrow is
+    // nocked, and nothing can be loosed yet -- let go in it and the arrow
+    // stays on the string. Then the PULL (`drawTimeMs`): tension builds from
+    // brace to anchor. A full draw is windupTicks + drawTicks held.
+    int windupTicks = 0;      // ticks before the pull starts (`windupMs`, 30 Hz)
+    int drawTicks = 24;       // ticks of pull to a full draw (`drawTimeMs`, 30 Hz)
     float minDraw = 0.15f;    // least draw fraction that looses at all
     std::string ammo;         // the item id it shoots
   } bow;

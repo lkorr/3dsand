@@ -588,6 +588,8 @@ bool LoadItems(const std::string& dir, size_t materialCount,
       d.bow.drawSpeed = MetresPerSecToCells(mps);
       // At the fixed 30 Hz tick (test/support.h kTickDt).
       d.bow.drawTicks = std::max(1, (int)std::lround((double)ms * 30.0 / 1000.0));
+      d.bow.windupTicks = std::max(
+          0, (int)std::lround((double)b.value("windupMs", 0) * 30.0 / 1000.0));
       d.bow.minDraw = std::clamp(b.value("minDraw", 0.15f), 0.0f, 1.0f);
     }
     // ---- A SHIELD: what holding it up costs (item.h ShieldSpec) -------------

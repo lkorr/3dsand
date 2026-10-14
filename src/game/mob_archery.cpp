@@ -198,7 +198,9 @@ void BeginDraw(TickAuthorityCtx& w, std::span<SessionTick> players, MobArcheryWo
   d.targetId = r.targetId;
   d.hand = HandIndex(h);
   d.startTick = tick;
-  d.drawTo = std::max(1, (int)std::lround((double)bow->bow.drawTicks * (double)rt->draw));
+  // The windup first (nothing loosed in it), then rt->draw of the pull.
+  d.drawTo = bow->bow.windupTicks +
+             std::max(1, (int)std::lround((double)bow->bow.drawTicks * (double)rt->draw));
   const int hold =
       (int)rt->holdTicks +
       (rt->holdJitter > 0

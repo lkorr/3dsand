@@ -240,7 +240,7 @@ float ClipFade(const AnimClip& c, float tMs, float ageMs, bool stopping,
                float stopFade) {
   float f = 1.0f;
   if (c.blendInMs > 0) f = std::min(f, ageMs / (float)c.blendInMs);
-  if (!c.loop && c.blendOutMs > 0 && c.durationMs > 0)
+  if (!c.loop && !c.holdEnd && c.blendOutMs > 0 && c.durationMs > 0)
     f = std::min(f, ((float)c.durationMs - tMs) / (float)c.blendOutMs);
   if (stopping) f = std::min(f, stopFade);
   return std::clamp(f, 0.0f, 1.0f);
@@ -352,7 +352,7 @@ void AnimSampleAndBlend(const AnimSkeleton& sk, AnimState& st, float dt) {
       while (inst.timeMs < 0.0f) inst.timeMs += (float)c.durationMs;
     } else if (c.durationMs > 0 && inst.timeMs >= (float)c.durationMs) {
       inst.timeMs = (float)c.durationMs;
-      inst.stopping = true;
+      if (!c.holdEnd) inst.stopping = true;   // AnimClip::holdEnd keeps it
     }
     if (inst.stopping) inst.fade = std::max(0.0f, inst.fade - dt * 6.0f);
     else inst.fade = 1.0f;

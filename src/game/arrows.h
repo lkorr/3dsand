@@ -73,10 +73,15 @@ struct ParticleSpawn;
 struct Kit;
 
 // ---- THE BOW, AS NUMBERS ------------------------------------------------------
-// The draw after `ticks` held: linear in time to a full draw at drawTicks,
-// then EASED OUT (1 - (1 - t)^2) -- the first half of a draw is most of its
-// speed, the last few inches buy the rest, the way a draw-force curve feels.
+// The draw after `ticks` held: 0 through the WINDUP (windupTicks: the bow
+// coming up, the arrow nocked -- nothing to loose yet), then linear in time
+// over the pull to a full draw drawTicks later, EASED OUT (1 - (1 - t)^2) --
+// the first half of a pull is most of its speed, the last few inches buy the
+// rest, the way a draw-force curve feels. The bow_draw clips are authored on
+// the same timeline (scripts/gen_archery_clips.py reads items.json).
 float BowDrawFraction(const ItemDef& bow, int ticks);
+// Ticks held to a full draw: the windup and the whole pull.
+int BowFullDrawTicks(const ItemDef& bow);
 // World voxels/s the arrow leaves at for that draw (0 below minDraw).
 float BowArrowSpeed(const ItemDef& bow, int ticks);
 // The penetrator an arrow flies as, at `speedMps`.

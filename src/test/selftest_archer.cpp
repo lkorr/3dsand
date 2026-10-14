@@ -335,9 +335,9 @@ Status GateArcher(Ctx& c, std::string& detail) {
                  a1.hand.c_str(), a1.sheath.c_str()));
     check(a1.drawTick >= 0, "A: the archer drew (a Draw event)");
     check(a1.looseTick >= 0, "A: the archer loosed (a Loose event)");
-    check(a1.drawnTicks >= bow->bow.drawTicks,
-          Format("A: the string was back at least the bow's draw, %d ticks (%d)",
-                 bow->bow.drawTicks, a1.drawnTicks));
+    check(a1.drawnTicks >= BowFullDrawTicks(*bow),
+          Format("A: the string was back at least the bow's windup + draw, %d ticks (%d)",
+                 BowFullDrawTicks(*bow), a1.drawnTicks));
     check(a1.clipMax >= 0.5f, Format("A: the bow_draw clip played (weight %.2f)", a1.clipMax));
     check(a1.facedThrough, "A: the archer held FaceTarget through the draw");
     check(std::fabs(a1.looseSpeed - bow->bow.drawSpeed) <= 0.01f * bow->bow.drawSpeed,

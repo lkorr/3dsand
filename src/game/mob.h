@@ -3098,6 +3098,11 @@ class Mob {
   void RegisterTerrainAnchor();
   void PlayClip(const std::string& name);
   void PlayClipIndex(int ci);
+  // PlayClip with the playhead put at `timeMs` (the blend-in still runs from
+  // the start): a clip that takes over a performance part-way through -- the
+  // crouched bow draw replacing the standing one mid-pull -- picks it up
+  // where it was instead of starting the windup again.
+  void PlayClipAt(const std::string& name, float timeMs);
   // Blend out every running instance of `name` (a looping hold, e.g. the
   // throw wind-up, that only its owner knows when to end). No-op if absent.
   void StopClip(const std::string& name);

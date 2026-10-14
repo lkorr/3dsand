@@ -386,6 +386,7 @@ static void ParseClipJson(const AnimSkeleton& sk, const std::string& where,
   clip.blendInMs = c.value("blendInMs", 0);
   clip.blendOutMs = c.value("blendOutMs", 0);
   clip.restFill = c.value("restFill", false);   // AnimClip::restFill
+  clip.holdEnd = !clip.loop && c.value("holdEnd", false);   // AnimClip::holdEnd
   if (c.contains("mask") && c["mask"].is_array()) {
     clip.mask.assign(sk.parts.size(), 0);
     for (const auto& nm : c["mask"]) {
@@ -6181,6 +6182,14 @@ void Mob::DrapeTail(World& world, float dt) {
 
 void Mob::PlayClip(const std::string& name) {
   PlayClipIndex(skel_.FindClip(name));
+}
+
+void Mob::PlayClipAt(const std::string& name, float timeMs) {
+  const int ci = skel_.FindClip(name);
+  PlayClipIndex(ci);
+  if (ci < 0) return;
+  for (ClipInstance& inst : anim_.clips)
+    if (inst.clip == ci && !inst.stopping) inst.timeMs = std::max(0.0f, timeMs);
 }
 
 void Mob::StopClip(const std::string& name) {

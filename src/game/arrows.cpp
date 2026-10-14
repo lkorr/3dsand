@@ -85,10 +85,15 @@ BodyTransform ArrowXf(const ItemDef& def, Vec3 tip, Vec3 dir) {
 // ---- THE BOW, AS NUMBERS -------------------------------------------------------
 
 float BowDrawFraction(const ItemDef& bow, int ticks) {
-  if (!bow.bow.has || ticks <= 0) return 0.0f;
+  const int pulled = ticks - bow.bow.windupTicks;
+  if (!bow.bow.has || pulled <= 0) return 0.0f;
   const float t = std::clamp(
-      (float)ticks / (float)std::max(1, bow.bow.drawTicks), 0.0f, 1.0f);
+      (float)pulled / (float)std::max(1, bow.bow.drawTicks), 0.0f, 1.0f);
   return 1.0f - (1.0f - t) * (1.0f - t);
+}
+
+int BowFullDrawTicks(const ItemDef& bow) {
+  return bow.bow.windupTicks + std::max(1, bow.bow.drawTicks);
 }
 
 float BowArrowSpeed(const ItemDef& bow, int ticks) {

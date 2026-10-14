@@ -1,9 +1,10 @@
 {
-  "//": "DRAWING A BOW FROM A CROUCH (session.cpp's bow block plays this instead of bow_draw while the player is crouched). The bow laid flat, canted a quarter turn by the bow hand so its top limb points across to the draw side, held a little lower and closer than the standing draw; the same string-hand line (elbow behind the shoulder). The torso and head are this clip's: the sneak lean (sneak.json, an additive) is quieted there so the arrow is not aimed into the ground. Solved by scripts/gen_archery_clips.py from target points -- edit the targets there and re-run, never these quaternions. ",
+  "//": "DRAWING A BOW FROM A CROUCH (session.cpp's bow block plays this instead of bow_draw while the player is crouched). A ONE-SHOT THAT HOLDS (holdEnd) on the bow's own timeline (items.json bow windupMs + drawTimeMs, game/arrows.h BowDrawFraction): t=0 LIFT, the bow low and canted, the string hand at the nock; end of the windup SET, the bow on the aim, the string already most of the way back -- nothing can be loosed before here; then the slow PULL of the last inches to the anchor, keyed at the eased draw fraction so the string is where the loosed speed says it is; then held. At full draw the bow laid flat, canted a quarter turn by the bow hand so its top limb points across to the draw side, held a little lower and closer than the standing draw; the same string-hand line (elbow behind the shoulder). The torso and head are this clip's: the sneak lean (sneak.json, an additive) is quieted there so the arrow is not aimed into the ground. Solved by scripts/gen_archery_clips.py from target points -- edit the targets there and re-run, never these quaternions. ",
   "name": "bow_draw_crouch",
   "sidecarVoxelsPerMetre": 10,
-  "durationMs": 1200,
-  "loop": true,
+  "durationMs": 1250,
+  "loop": false,
+  "holdEnd": true,
   "mode": "override",
   "blendInMs": 220,
   "blendOutMs": 140,
@@ -24,50 +25,82 @@
   "tracks": {
     "armU.R": {
       "rot": [
-        { "t": 0, "q": [0.0334, 0.3608, -0.7573, 0.5434] },
-        { "t": 1200, "q": [0.0334, 0.3608, -0.7573, 0.5434] }
+        { "t": 0, "q": [-0.4846, 0.5323, -0.1533, 0.677] },
+        { "t": 450, "q": [-0.1284, 0.4159, -0.7204, 0.5399] },
+        { "t": 650, "q": [0.0077, 0.3808, -0.7522, 0.5378] },
+        { "t": 850, "q": [0.0206, 0.3711, -0.7549, 0.5404] },
+        { "t": 1050, "q": [0.0276, 0.3656, -0.7564, 0.5417] },
+        { "t": 1250, "q": [0.0334, 0.3608, -0.7573, 0.5434] }
       ]
     },
     "armL.R": {
       "rot": [
-        { "t": 0, "q": [-0.1786, 0.0, 0.0, 0.9839] },
-        { "t": 1200, "q": [-0.1786, 0.0, 0.0, 0.9839] }
+        { "t": 0, "q": [-0.2668, 0.0, 0.0, 0.9637] },
+        { "t": 450, "q": [-0.0979, 0.0, 0.0, 0.9952] },
+        { "t": 650, "q": [-0.1557, 0.0, 0.0, 0.9878] },
+        { "t": 850, "q": [-0.1675, 0.0, 0.0, 0.9859] },
+        { "t": 1050, "q": [-0.1742, 0.0, 0.0, 0.9847] },
+        { "t": 1250, "q": [-0.1786, 0.0, 0.0, 0.9839] }
       ]
     },
     "hand.R": {
       "rot": [
-        { "t": 0, "q": [0.0526, -0.3791, 0.0561, 0.9222] },
-        { "t": 1200, "q": [0.0526, -0.3791, 0.0561, 0.9222] }
+        { "t": 0, "q": [0.1296, -0.0716, 0.0344, 0.9884] },
+        { "t": 450, "q": [0.0636, -0.3155, 0.0033, 0.9468] },
+        { "t": 650, "q": [0.0538, -0.3745, 0.0488, 0.9244] },
+        { "t": 850, "q": [0.0533, -0.3771, 0.0524, 0.9231] },
+        { "t": 1050, "q": [0.0531, -0.3785, 0.0542, 0.9225] },
+        { "t": 1250, "q": [0.0526, -0.3791, 0.0561, 0.9222] }
       ]
     },
     "armU.L": {
       "rot": [
-        { "t": 0, "q": [-0.3774, -0.3513, 0.598, 0.6137] },
-        { "t": 1200, "q": [-0.3774, -0.3513, 0.598, 0.6137] }
+        { "t": 0, "q": [0.0247, -0.332, 0.4688, 0.8182] },
+        { "t": 450, "q": [-0.4331, -0.4307, 0.5586, 0.5612] },
+        { "t": 650, "q": [-0.3948, -0.3823, 0.5863, 0.5952] },
+        { "t": 850, "q": [-0.3759, -0.3542, 0.5988, 0.6121] },
+        { "t": 1050, "q": [-0.3752, -0.3496, 0.5993, 0.6146] },
+        { "t": 1250, "q": [-0.3774, -0.3513, 0.598, 0.6137] }
       ]
     },
     "armL.L": {
       "rot": [
         { "t": 0, "q": [-0.9063, 0.0, 0.0, 0.4226] },
-        { "t": 1200, "q": [-0.9063, 0.0, 0.0, 0.4226] }
+        { "t": 450, "q": [-0.9063, 0.0, 0.0, 0.4226] },
+        { "t": 650, "q": [-0.9063, 0.0, 0.0, 0.4226] },
+        { "t": 850, "q": [-0.9063, 0.0, 0.0, 0.4226] },
+        { "t": 1050, "q": [-0.9063, 0.0, 0.0, 0.4226] },
+        { "t": 1250, "q": [-0.9063, 0.0, 0.0, 0.4226] }
       ]
     },
     "hand.L": {
       "rot": [
-        { "t": 0, "q": [-0.4628, 0.1581, -0.0627, 0.87] },
-        { "t": 1200, "q": [-0.4628, 0.1581, -0.0627, 0.87] }
+        { "t": 0, "q": [0.4692, 0.0318, 0.0607, 0.8805] },
+        { "t": 450, "q": [0.2951, 0.0741, 0.0595, 0.9507] },
+        { "t": 650, "q": [-0.0798, 0.1185, 0.0115, 0.9897] },
+        { "t": 850, "q": [-0.3122, 0.1394, -0.0299, 0.9393] },
+        { "t": 1050, "q": [-0.4329, 0.1505, -0.054, 0.8872] },
+        { "t": 1250, "q": [-0.4628, 0.1581, -0.0627, 0.87] }
       ]
     },
     "torso": {
       "rot": [
-        { "t": 0, "q": [0.0, 0.4727, 0.0, 0.8812] },
-        { "t": 1200, "q": [0.0, 0.4727, 0.0, 0.8812] }
+        { "t": 0, "q": [0.0, -0.1885, 0.0, 0.9821] },
+        { "t": 450, "q": [0.0, 0.3873, 0.0, 0.9219] },
+        { "t": 650, "q": [0.0, 0.4571, 0.0, 0.8894] },
+        { "t": 850, "q": [0.0, 0.4647, 0.0, 0.8855] },
+        { "t": 1050, "q": [0.0, 0.4687, 0.0, 0.8833] },
+        { "t": 1250, "q": [0.0, 0.4727, 0.0, 0.8812] }
       ]
     },
     "head": {
       "rot": [
-        { "t": 0, "q": [-0.0, -0.4727, -0.0, 0.8812] },
-        { "t": 1200, "q": [-0.0, -0.4727, -0.0, 0.8812] }
+        { "t": 0, "q": [0.0, 0.1885, 0.0, 0.9821] },
+        { "t": 450, "q": [-0.0, -0.3873, -0.0, 0.9219] },
+        { "t": 650, "q": [-0.0, -0.4571, -0.0, 0.8894] },
+        { "t": 850, "q": [-0.0, -0.4647, -0.0, 0.8855] },
+        { "t": 1050, "q": [-0.0, -0.4687, -0.0, 0.8833] },
+        { "t": 1250, "q": [-0.0, -0.4727, -0.0, 0.8812] }
       ]
     }
   }

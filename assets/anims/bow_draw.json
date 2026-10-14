@@ -1,9 +1,10 @@
 {
-  "//": "DRAWING A BOW (session.cpp PhaseG's bow block, game/arrows.h): played while the bow hand's button is held, stopped on the loose. Authored for the bow in the RIGHT fist; a bow in the left plays the library's derived bow_draw.mirror. The bow arm straight out ahead of the face, a hand right of the eye line, the bow upright; the string hand hooked under the left of the jaw with its ELBOW OUT BEHIND THE SHOULDER at shoulder height -- the line a real draw makes, and one first person (the eye rides the head) never looks through. pitchFollow tips the torso, and both arms with it, with the look. Solved by scripts/gen_archery_clips.py from target points -- edit the targets there and re-run, never these quaternions. ",
+  "//": "DRAWING A BOW (session.cpp PhaseG's bow block, game/arrows.h): played while the bow hand's button is held, stopped on the loose. Authored for the bow in the RIGHT fist; a bow in the left plays the library's derived bow_draw.mirror. A ONE-SHOT THAT HOLDS (holdEnd) on the bow's own timeline (items.json bow windupMs + drawTimeMs, game/arrows.h BowDrawFraction): t=0 LIFT, the bow low and canted, the string hand at the nock; end of the windup SET, the bow on the aim, the string already most of the way back -- nothing can be loosed before here; then the slow PULL of the last inches to the anchor, keyed at the eased draw fraction so the string is where the loosed speed says it is; then held. At full draw the bow arm is straight out ahead of the face, a hand right of the eye line, the bow upright; the string hand hooked under the left of the jaw with its ELBOW OUT BEHIND THE SHOULDER at shoulder height -- the line a real draw makes, and one first person (the eye rides the head) never looks through. pitchFollow tips the torso, and both arms with it, with the look. Solved by scripts/gen_archery_clips.py from target points -- edit the targets there and re-run, never these quaternions. ",
   "name": "bow_draw",
   "sidecarVoxelsPerMetre": 10,
-  "durationMs": 1200,
-  "loop": true,
+  "durationMs": 1250,
+  "loop": false,
+  "holdEnd": true,
   "mode": "override",
   "blendInMs": 220,
   "blendOutMs": 140,
@@ -22,50 +23,82 @@
   "tracks": {
     "armU.R": {
       "rot": [
-        { "t": 0, "q": [-0.5879, -0.3349, -0.3918, 0.6235] },
-        { "t": 1200, "q": [-0.5879, -0.3349, -0.3918, 0.6235] }
+        { "t": 0, "q": [-0.516, 0.3182, 0.1268, 0.7852] },
+        { "t": 450, "q": [-0.647, -0.239, -0.3133, 0.6527] },
+        { "t": 650, "q": [-0.5878, -0.3351, -0.3919, 0.6234] },
+        { "t": 850, "q": [-0.5877, -0.3354, -0.3922, 0.6231] },
+        { "t": 1050, "q": [-0.5891, -0.3331, -0.3905, 0.624] },
+        { "t": 1250, "q": [-0.5879, -0.3349, -0.3918, 0.6235] }
       ]
     },
     "armL.R": {
       "rot": [
-        { "t": 0, "q": [-0.0701, 0.0, 0.0, 0.9975] },
-        { "t": 1200, "q": [-0.0701, 0.0, 0.0, 0.9975] }
+        { "t": 0, "q": [-0.0629, 0.0, 0.0, 0.998] },
+        { "t": 450, "q": [-0.0335, 0.0, 0.0, 0.9994] },
+        { "t": 650, "q": [-0.0701, 0.0, 0.0, 0.9975] },
+        { "t": 850, "q": [-0.0698, 0.0, 0.0, 0.9976] },
+        { "t": 1050, "q": [-0.0691, 0.0, 0.0, 0.9976] },
+        { "t": 1250, "q": [-0.0701, 0.0, 0.0, 0.9975] }
       ]
     },
     "hand.R": {
       "rot": [
-        { "t": 0, "q": [0.0404, -0.0499, 0.0217, 0.9977] },
-        { "t": 1200, "q": [0.0404, -0.0499, 0.0217, 0.9977] }
+        { "t": 0, "q": [0.011, 0.0292, -0.0296, 0.9991] },
+        { "t": 450, "q": [0.0314, -0.049, -0.0302, 0.9979] },
+        { "t": 650, "q": [0.0403, -0.0498, 0.0219, 0.9977] },
+        { "t": 850, "q": [0.0403, -0.0498, 0.0218, 0.9977] },
+        { "t": 1050, "q": [0.0402, -0.0498, 0.0209, 0.9977] },
+        { "t": 1250, "q": [0.0404, -0.0499, 0.0217, 0.9977] }
       ]
     },
     "armU.L": {
       "rot": [
-        { "t": 0, "q": [-0.4408, -0.2802, 0.598, 0.6079] },
-        { "t": 1200, "q": [-0.4408, -0.2802, 0.598, 0.6079] }
+        { "t": 0, "q": [0.0564, -0.3217, 0.51, 0.7957] },
+        { "t": 450, "q": [-0.4949, -0.4089, 0.5522, 0.532] },
+        { "t": 650, "q": [-0.4687, -0.3488, 0.5829, 0.5647] },
+        { "t": 850, "q": [-0.444, -0.2998, 0.5984, 0.5958] },
+        { "t": 1050, "q": [-0.4398, -0.2824, 0.5994, 0.6062] },
+        { "t": 1250, "q": [-0.4408, -0.2802, 0.598, 0.6079] }
       ]
     },
     "armL.L": {
       "rot": [
         { "t": 0, "q": [-0.9063, 0.0, 0.0, 0.4226] },
-        { "t": 1200, "q": [-0.9063, 0.0, 0.0, 0.4226] }
+        { "t": 450, "q": [-0.9063, 0.0, 0.0, 0.4226] },
+        { "t": 650, "q": [-0.9063, 0.0, 0.0, 0.4226] },
+        { "t": 850, "q": [-0.9063, 0.0, 0.0, 0.4226] },
+        { "t": 1050, "q": [-0.9063, 0.0, 0.0, 0.4226] },
+        { "t": 1250, "q": [-0.9063, 0.0, 0.0, 0.4226] }
       ]
     },
     "hand.L": {
       "rot": [
-        { "t": 0, "q": [-0.463, 0.136, -0.052, 0.8743] },
-        { "t": 1200, "q": [-0.463, 0.136, -0.052, 0.8743] }
+        { "t": 0, "q": [0.4813, -0.0042, 0.0386, 0.8757] },
+        { "t": 450, "q": [0.3444, 0.0462, 0.0494, 0.9364] },
+        { "t": 650, "q": [-0.0381, 0.0919, 0.0157, 0.9949] },
+        { "t": 850, "q": [-0.2945, 0.1161, -0.0234, 0.9483] },
+        { "t": 1050, "q": [-0.4279, 0.1287, -0.0447, 0.8935] },
+        { "t": 1250, "q": [-0.463, 0.136, -0.052, 0.8743] }
       ]
     },
     "torso": {
       "rot": [
-        { "t": 0, "q": [0.0, 0.4687, 0.0, 0.8833] },
-        { "t": 1200, "q": [0.0, 0.4687, 0.0, 0.8833] }
+        { "t": 0, "q": [0.0, -0.2723, 0.0, 0.9622] },
+        { "t": 450, "q": [0.0, 0.3721, 0.0, 0.9282] },
+        { "t": 650, "q": [0.0, 0.4689, 0.0, 0.8832] },
+        { "t": 850, "q": [0.0, 0.4693, 0.0, 0.883] },
+        { "t": 1050, "q": [0.0, 0.4671, 0.0, 0.8842] },
+        { "t": 1250, "q": [0.0, 0.4687, 0.0, 0.8833] }
       ]
     },
     "head": {
       "rot": [
-        { "t": 0, "q": [-0.0, -0.4687, -0.0, 0.8833] },
-        { "t": 1200, "q": [-0.0, -0.4687, -0.0, 0.8833] }
+        { "t": 0, "q": [0.0, 0.2723, 0.0, 0.9622] },
+        { "t": 450, "q": [-0.0, -0.3721, -0.0, 0.9282] },
+        { "t": 650, "q": [-0.0, -0.4689, -0.0, 0.8832] },
+        { "t": 850, "q": [-0.0, -0.4693, -0.0, 0.883] },
+        { "t": 1050, "q": [-0.0, -0.4671, -0.0, 0.8842] },
+        { "t": 1250, "q": [-0.0, -0.4687, -0.0, 0.8833] }
       ]
     }
   }

@@ -209,7 +209,7 @@
       "desc": "A heavy black key, its bit worn smooth by a century of turning."
     },
     {
-      "//": "THE BOW AND ARROWS (docs/PLAN_projectiles.md C, game/arrows.h). A bow is kind melee so it rides a hand slot like any weapon, but weaponClass `bow` takes it out of the stroke system: with it in hand the hand's button DRAWS (held) and SHOOTS (released). `bow.drawSpeedMps` is the arrow's speed at full draw, `drawTimeMs` how long a full draw takes, `minDraw` the least draw that looses an arrow at all (a tap is a fumble, not a shot), `ammo` the item id it shoots (consumed one per shot from the pack or hotbar; none = no shot). Speed = eased draw fraction x drawSpeedMps. 50 m/s is a real longbow's (was 65, a modern compound bow's, until 2026-10-13: owner, 'they move too fast'); the drop is real too, ~1 m over 20 m, which the NPC archers' holdover (ArrowHoldover) pays and the player aims over by eye. Art: scripts/gen_bow_items.py.",
+      "//": "THE BOW AND ARROWS (docs/PLAN_projectiles.md C, game/arrows.h). A bow is kind melee so it rides a hand slot like any weapon, but weaponClass `bow` takes it out of the stroke system: with it in hand the hand's button DRAWS (held) and SHOOTS (released). `bow.drawSpeedMps` is the arrow's speed at full draw, `windupMs` how long raising the bow and nocking takes before the string can be pulled at all (let go inside it and nothing flies -- owner, 2026-10-14), `drawTimeMs` how long the pull from brace to a full draw then takes, `minDraw` the least draw that looses an arrow at all (a tap is a fumble, not a shot), `ammo` the item id it shoots (consumed one per shot from the pack or hotbar; none = no shot). Speed = eased draw fraction x drawSpeedMps. 50 m/s is a real longbow's (was 65, a modern compound bow's, until 2026-10-13: owner, 'they move too fast'); the drop is real too, ~1 m over 20 m, which the NPC archers' holdover (ArrowHoldover) pays and the player aims over by eye. Art: scripts/gen_bow_items.py.",
       "id": "bow",
       "kind": "melee",
       "weaponClass": "bow",
@@ -218,6 +218,7 @@
       "reach": 9.0,
       "bow": {
         "drawSpeedMps": 50.0,
+        "windupMs": 450,
         "drawTimeMs": 800,
         "minDraw": 0.15,
         "ammo": "arrow"

@@ -9,7 +9,7 @@
   "grip": {
     "held_left": {
       "translation": [
-        0,
+        1,
         0,
         0
       ],
@@ -22,7 +22,7 @@
     },
     "held_right": {
       "translation": [
-        0,
+        1,
         0,
         0
       ],

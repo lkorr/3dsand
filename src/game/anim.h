@@ -101,6 +101,13 @@ struct AnimClip {
   // one ramped in by weight (MobDef::chaseClip: a snake rearing up over half
   // a second has to pass through the poses in between).
   bool restFill = false;
+  // ONE-SHOT THAT HOLDS (sidecar `holdEnd`, non-looping clips only): at the
+  // end of its timeline the clip stays on its last key at full weight until
+  // it is stopped, instead of fading out over blendOutMs and retiring. For a
+  // pose that is PERFORMED and then KEPT -- bow_draw raises the bow, nocks
+  // and pulls over its timeline, then holds the anchor for as long as the
+  // button is down.
+  bool holdEnd = false;
 };
 
 // Holden's closed-form spring (unconditionally stable at any dt). One per

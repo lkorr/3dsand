@@ -39,7 +39,8 @@ from gen_archery_clips import (  # noqa: E402  (the rig and its solver kit)
     hinge_of, swing_twist, qangle, clip_json, write)
 
 SOCKET_R = (6, 61, 10)      # human.json sockets.held_right (hand.R)
-SHIELD_FACE = 4.0           # hilt centre -> the boards, cells along the normal
+SHIELD_FACE = 5.0           # the fist -> the boards, cells along the normal (4 from the
+                            # hilt centre + the grip translation's 1, gen_shield_items.py)
 FWD = np.array([0.0, 0.0, 1.0])
 UP = np.array([0.0, 1.0, 0.0])
 ARM = ["armU.R", "armL.R", "hand.R"]

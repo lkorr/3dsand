@@ -278,8 +278,14 @@ GRIPS = {
     # face +X stays +X (outward for a left fist), up (item +Y) onto the
     # fist's grip axis (hand +Z). held_right = Rz(180) Rx(90): face -X,
     # outward for the right, up onto the same grip axis.
-    "held_left": {"translation": [0, 0, 0], "rotation": [90, 0, 0], "scale": 1.0},
-    "held_right": {"translation": [0, 0, 0], "rotation": [90, 0, 180], "scale": 1.0},
+    #
+    # TRANSLATION [1, 0, 0] (item frame, art cells): the fist closes one cell
+    # BEHIND the hilt centre, so the whole shield stands one cell further out
+    # along its face normal, away from the arm. With the hilt centred the
+    # forearm lying across the back poked through the boards (owner report,
+    # 2026-10-14). Item frame, so the same +X is outward for either hand.
+    "held_left": {"translation": [1, 0, 0], "rotation": [90, 0, 0], "scale": 1.0},
+    "held_right": {"translation": [1, 0, 0], "rotation": [90, 0, 180], "scale": 1.0},
 }
 
 

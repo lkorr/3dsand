@@ -2303,11 +2303,14 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             (s.bowDrawTicks > 0 || have > 0)) {
           if (s.bowDrawTicks == 0) s.lastHand = bowHand;
           // Started, or the stance changed under the draw: the other clip
-          // takes over through its own blend-in, the draw count runs on.
+          // takes over through its own blend-in, the draw count runs on --
+          // and so does the other clip's playhead, which is on the same
+          // timeline (bow_draw* are one-shots keyed on the bow's windup +
+          // pull), so a crouch mid-pull does not replay the windup.
           if (s.bowClip != drawClip) {
             stopDrawClip();
             if (avatar.Spawned() && !drawClip.empty()) {
-              avatar.PlayClip(drawClip);
+              avatar.PlayClipAt(drawClip, (float)s.bowDrawTicks * 1000.0f / 30.0f);
               s.bowClip = drawClip;
             }
           }

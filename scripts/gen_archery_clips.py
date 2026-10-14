@@ -187,7 +187,11 @@ def unpack(x, fixed):
     return local
 
 
-def solve(fixed, cost, yaw0=0.8):
+def solve(fixed, cost, yaw0=0.8, warm=None):
+    """Returns (pose, residual, x). `warm` = the x of the previous key of the
+    same clip: the solve starts there and only there, so consecutive keys stay
+    on one branch of the arm's solutions and the engine's slerp between them
+    is a short, continuous move instead of a flip through the body."""
     n = 1 + 3 * len(FREE3) + len(FREE1)
     x0 = np.zeros(n)
     x0[0] = yaw0
@@ -201,13 +205,14 @@ def solve(fixed, cost, yaw0=0.8):
         local = unpack(x, fixed)
         return cost(local) + 2000.0 * limit_penalty(local)
 
+    starts = [np.array(warm, float)] if warm is not None else [
+        x0 + (np.random.RandomState(seed).randn(n) * 0.5 if seed else 0) for seed in range(10)]
     best = None
-    for seed in range(10):
-        start = x0 + (np.random.RandomState(seed).randn(n) * 0.5 if seed else 0)
+    for start in starts:
         r = minimize(f, start, method="BFGS", options={"maxiter": 6000, "gtol": 1e-9})
         if best is None or r.fun < best.fun:
             best = r
-    return unpack(best.x, fixed), best.fun
+    return unpack(best.x, fixed), best.fun, best.x
 
 
 # ---- targets -----------------------------------------------------------------
@@ -224,11 +229,13 @@ def swing_twist(q, axis):
     return qangle(swing), qangle(tw)
 
 
-def draw_cost(grip, anchor, elbow_y, bow_up, yaw_pref):
+def draw_cost(grip, anchor, elbow_y, bow_up, yaw_pref, behind=1.0, bow_bend=10.0):
     """The bow arm reaches the grip nearly straight with the bow along bow_up;
     the string hand's fingers sit at the anchor under the jaw and the draw
     elbow rides at elbow_y BEHIND the shoulder line (so first person, at the
-    eye, never looks through the forearm)."""
+    eye, never looks through the forearm). `behind` scales that last rule:
+    1 at full draw, 0 at brace, where the string hand is out at the bow and
+    the elbow is in front of the shoulder because the forearm is."""
     def cost(local):
         rot, pos = fk(local)
         c = 0.0
@@ -243,7 +250,7 @@ def draw_cost(grip, anchor, elbow_y, bow_up, yaw_pref):
         # worth of clearance, out past the shoulder.
         e = pos["armL.L"]
         c += 0.5 * (e[1] - elbow_y) ** 2
-        c += 1.0 * max(0.0, e[2] - (ANCHOR["head"][2] - 10.0)) ** 2
+        c += behind * max(0.0, e[2] - (ANCHOR["head"][2] - 10.0)) ** 2
         # The string hand may cock its wrist in toward the jaw, no more than a
         # real hooked draw does; the bow hand stays straight on its forearm
         # but may ROLL (the forearm's own pronation -- how the crouch lays the
@@ -253,7 +260,7 @@ def draw_cost(grip, anchor, elbow_y, bow_up, yaw_pref):
         swr, twr = swing_twist(local["hand.R"], (0, -1, 0))
         c += 60.0 * swr ** 2 + 2.0 * twr ** 2 + 400.0 * max(0.0, twr - math.radians(100)) ** 2
         bend = qangle(local["armL.R"])
-        c += 20.0 * (bend - math.radians(10)) ** 2
+        c += 20.0 * (bend - math.radians(bow_bend)) ** 2
         # As little twist at the waist as the draw needs.
         yaw = 2 * math.atan2(local["torso"][1], local["torso"][3])
         c += 10.0 * (yaw - yaw_pref) ** 2
@@ -369,6 +376,118 @@ def clip_json(name, comment, local, parts, mode="override", extra=None, dur=1200
     return d
 
 
+def keyed_clip_json(name, comment, keys, parts, extra):
+    """A ONE-SHOT that HOLDS its last key (AnimClip::holdEnd): `keys` is
+    [(t ms, pose)], the last one the held pose."""
+    tracks = {}
+    for p in parts:
+        tracks[p] = {"rot": [{"t": int(round(t)), "q": fmt_q(local.get(p, (0, 0, 0, 1)))}
+                             for t, local in keys]}
+    d = {"//": comment, "name": name, "sidecarVoxelsPerMetre": 10,
+         "durationMs": int(round(keys[-1][0])), "loop": False, "holdEnd": True,
+         "mode": "override"}
+    for k in ("blendInMs", "blendOutMs"):
+        if k in extra:
+            d[k] = extra[k]
+    d["mask"] = list(parts)
+    for k in ("quietAdditive", "pitchFollow"):
+        if k in extra:
+            d[k] = extra[k]
+    d["tracks"] = tracks
+    return d
+
+
+def bow_timing():
+    """(windupMs, drawTimeMs) of items.json's `bow`: the clips are authored on
+    the bow's own timeline (game/arrows.h BowDrawFraction), so the string is
+    where the loosed speed says it is."""
+    with open(os.path.join(ROOT, "assets", "items", "items.json"), encoding="utf-8") as fh:
+        items = json.load(fh)
+    rows = items["items"] if isinstance(items, dict) else items
+    for r in rows:
+        if r.get("id") == "bow":
+            b = r["bow"]
+            return float(b.get("windupMs", 0)), float(b["drawTimeMs"])
+    raise SystemExit("items.json has no `bow` row")
+
+
+# The pull is sampled at these fractions of its TIME; the string sits at the
+# eased draw fraction of each (1 - (1 - t)^2, BowDrawFraction), so the hand
+# moves fast off the brace and creeps the last inches into the anchor.
+PULL_SAMPLES = (0.25, 0.5, 0.75, 1.0)
+BRACE = 16.0        # cells from the grip to the string at brace (~20 cm)
+# Where the WINDUP leaves the string: this share of the way from brace to the
+# anchor. Not brace itself -- the rig cannot put the string hand there: with
+# the torso turned side-on for the anchor, the far arm reaches no more than
+# ~17 cells ahead of the eye with the bow arm out (brace is 40), and a SET
+# key solved at brace drags the BOW hand back to meet it. So the windup raises
+# the bow and draws most of the way in one motion, and the PULL is the last
+# ~19 cm -- the slight, slow pull that builds the tension (owner's words) and
+# that the loosed speed is priced on.
+SET_DRAW = 0.62
+# Cost per rad^2 of a key's joints turning away from the next key's (see
+# solve_draw's `near`): enough to pin the free roll, small next to the targets.
+CONTINUITY = 30.0
+
+
+def solve_draw(label, grip, anchor, lift_grip, lift_up, bow_up, elbow_y, yaw):
+    """The whole draw as keys: LIFT (t=0: the bow coming up low and canted,
+    the string hand at the nock), SET (end of the windup: the bow on the aim,
+    fingers on the string at brace), then the PULL from brace to the anchor.
+    Returns ([(fraction of the timeline, pose)], residuals)."""
+    windup, draw = bow_timing()
+    total = windup + draw
+    line = anchor - grip
+    brace = grip + line * (BRACE / float(np.linalg.norm(line)))
+    brace = brace + (anchor - brace) * SET_DRAW      # the SET string point
+    keys, errs = [], []
+
+    def near(cost, prev, w=CONTINUITY):
+        """The arm has a redundant ROLL about its own axis (the hand takes the
+        roll back, so the grip and string do not care): left free, every key
+        picks its own and the slerp between them rolls the arm back and
+        forth. Charged here against the neighbouring key, so the clip only
+        moves what the targets move."""
+        if prev is None:
+            return cost
+
+        def c(local):
+            return cost(local) + w * sum(
+                qangle(qmul(qconj(prev[p]), local[p])) ** 2
+                for p in FREE3 + FREE1 + ["torso"])
+        return c
+
+    prev = None
+    # Solved BACKWARDS from the full draw (from scratch, the canonical pose)
+    # with each earlier key warm-started from the one after it, so the whole
+    # clip is one continuous branch that ends on the pose the archery was
+    # tuned on.
+    x = None
+    for k in reversed(PULL_SAMPLES):
+        f = 1.0 - (1.0 - k) ** 2
+        pose, e, x = solve({}, near(draw_cost(grip, brace + (anchor - brace) * f, elbow_y,
+                                              bow_up, yaw, behind=f), prev), warm=x)
+        keys.append((windup + draw * k, pose)); errs.append(e)
+        prev = pose
+    # SET (end of the windup): the bow up on the aim, the string most of the way back.
+    pose, e, x = solve({}, near(draw_cost(grip, brace, elbow_y, bow_up, yaw,
+                                          behind=0.0), prev), warm=x)
+    keys.append((windup, pose)); errs.append(e)
+    prev = pose
+    # LIFT (t=0, under the blend-in): the bow coming up low and canted, the
+    # arrow laid on the rest, the string hand at the nock a little behind the
+    # grip on the arrow's line, the elbow low.
+    nock = lift_grip + unit(line) * 9.0
+    pose, e, x = solve({}, near(draw_cost(lift_grip, nock, elbow_y - 14, lift_up,
+                                          yaw * 0.6, behind=0.0, bow_bend=25.0), prev),
+                       warm=x)
+    keys.append((0.0, pose)); errs.append(e)
+    keys.reverse(); errs.reverse()
+    print(f"== {label}: windup {windup:.0f} ms + pull {draw:.0f} ms, residuals "
+          + " ".join(f"{v:.2f}" for v in errs))
+    return keys
+
+
 def write(path, d):
     text = json.dumps(d, indent=2)
     # One key per line, as the library's hand-written files have them.
@@ -412,11 +531,20 @@ def main():
     # line and a little under it, the bow upright; the string hand's fingers
     # under the left of the jaw, its elbow out behind the shoulder at shoulder
     # height -- the line a real draw makes, and one first person cannot see.
+    #
+    # THE WINDUP before it (owner, 2026-10-14: "windup before being able to
+    # fire, then pulling the string back slightly to build tension"): the bow
+    # comes up from low and canted at the chest (LIFT) to the aim with the
+    # fingers on the string at brace (SET) over items.json windupMs, and the
+    # string is PULLED from brace to the anchor over drawTimeMs.
     grip = np.array([eye[0] - 10.0, eye[1] - 11.0, eye[2] + 56.0])
     anchor = np.array([eye[0] + 4.5, eye[1] - 12.0, eye[2] + 2.0])
-    stand, err = solve({}, draw_cost(grip, anchor, ANCHOR["armU.L"][1] + 2,
-                                     unit((0, 1, 0)), math.radians(55)))
-    report(f"bow_draw (residual {err:.3f})", stand)
+    liftGrip = np.array([eye[0] - 6.0, eye[1] - 32.0, eye[2] + 36.0])
+    standKeys = solve_draw("bow_draw", grip, anchor, liftGrip, unit((0.3, 1, 0.35)),
+                           unit((0, 1, 0)), ANCHOR["armU.L"][1] + 2, math.radians(55))
+    report("bow_draw at FULL DRAW", standKeys[-1][1])
+    for t, k in standKeys[:-1]:
+        print(f"   key t={t:.0f}: first person at look 0: {fp_visible(k, 0.0, FOLLOW)}")
 
     # ---- CROUCHED DRAW: the bow laid flat --------------------------------------
     # The same draw from a crouch, the bow canted a quarter turn so it lies
@@ -424,9 +552,11 @@ def main():
     # closer: a low, short draw under cover.
     gripC = np.array([eye[0] - 3.0, eye[1] - 15.0, eye[2] + 55.0])
     anchorC = np.array([eye[0] + 4.5, eye[1] - 14.0, eye[2] + 2.0])
-    crouch, errC = solve({}, draw_cost(gripC, anchorC, ANCHOR["armU.L"][1],
-                                       unit((1, 0.12, 0)), math.radians(55)))
-    report(f"bow_draw_crouch (residual {errC:.3f})", crouch)
+    liftGripC = np.array([eye[0] - 2.0, eye[1] - 30.0, eye[2] + 34.0])
+    crouchKeys = solve_draw("bow_draw_crouch", gripC, anchorC, liftGripC,
+                            unit((1, 0.5, 0.3)), unit((1, 0.12, 0)),
+                            ANCHOR["armU.L"][1], math.radians(55))
+    report("bow_draw_crouch at FULL DRAW", crouchKeys[-1][1])
 
     # ---- THE SNEAK: an additive on the held crouch ----------------------------
     # Deltas about REST (anim.cpp stage 3), weighted by how far the crouch has
@@ -466,28 +596,35 @@ def main():
         mode="additive", extra={"blendInMs": 0, "blendOutMs": 0}))
     base = ("Solved by scripts/gen_archery_clips.py from target points -- edit the "
             "targets there and re-run, never these quaternions. ")
-    write(os.path.join(ANIMS, "bow_draw.json"), clip_json(
+    timeline = ("A ONE-SHOT THAT HOLDS (holdEnd) on the bow's own timeline (items.json bow "
+                "windupMs + drawTimeMs, game/arrows.h BowDrawFraction): t=0 LIFT, the bow low "
+                "and canted, the string hand at the nock; end of the windup SET, the bow on "
+                "the aim, the string already most of the way back -- nothing can be loosed before here; "
+                "then the slow PULL of the last inches to the anchor, keyed at the eased draw fraction so the string "
+                "is where the loosed speed says it is; then held. ")
+    write(os.path.join(ANIMS, "bow_draw.json"), keyed_clip_json(
         "bow_draw",
         "DRAWING A BOW (session.cpp PhaseG's bow block, game/arrows.h): played while the bow "
         "hand's button is held, stopped on the loose. Authored for the bow in the RIGHT fist; a "
-        "bow in the left plays the library's derived bow_draw.mirror. The bow arm straight out "
+        "bow in the left plays the library's derived bow_draw.mirror. " + timeline +
+        "At full draw the bow arm is straight out "
         "ahead of the face, a hand right of the eye line, the bow upright; the string hand "
         "hooked under the left of the jaw with its ELBOW OUT BEHIND THE SHOULDER at shoulder "
         "height -- the line a real draw makes, and one first person (the eye rides the head) "
         "never looks through. pitchFollow tips the torso, and both arms with it, with the look. "
-        + base, stand, ARMS + ["torso", "head"],
+        + base, standKeys, ARMS + ["torso", "head"],
         extra={"blendInMs": 220, "blendOutMs": 140,
                "quietAdditive": {p: 1.0 for p in ARMS},
                "pitchFollow": {"torso": FOLLOW}}))
-    write(os.path.join(ANIMS, "bow_draw_crouch.json"), clip_json(
+    write(os.path.join(ANIMS, "bow_draw_crouch.json"), keyed_clip_json(
         "bow_draw_crouch",
         "DRAWING A BOW FROM A CROUCH (session.cpp's bow block plays this instead of bow_draw "
-        "while the player is crouched). The bow laid flat, canted a quarter turn by the bow "
+        "while the player is crouched). " + timeline + "At full draw the bow laid flat, canted a quarter turn by the bow "
         "hand so its top limb points across to the draw side, held a little lower and closer "
         "than the standing draw; the same string-hand line (elbow behind the shoulder). The "
         "torso and head are this clip's: the sneak lean (sneak.json, an additive) is quieted "
         "there so the arrow is not aimed into the ground. "
-        + base, crouch, ARMS + ["torso", "head"],
+        + base, crouchKeys, ARMS + ["torso", "head"],
         extra={"blendInMs": 220, "blendOutMs": 140,
                "quietAdditive": dict({p: 1.0 for p in ARMS}, torso=1.0, head=1.0),
                "pitchFollow": {"torso": FOLLOW}}))
