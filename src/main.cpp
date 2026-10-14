@@ -4645,7 +4645,10 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
 // close-up of the victim (aquatic_victim.bmp), and two close-ups of each of the
 // first four bites (aquatic_biteN_a/b.bmp: the gape, the snap). What the victim
 // lost is printed per limb at the end, and what each bite stroke did when it
-// ends. `+none` = no victim (idle swimming, wander). SANDVOX_AQUATIC_R = the
+// ends. `+none` = no victim (idle swimming, wander); `+<victim>:dead` = the
+// victim killed where it stands and left 240 ticks to float up before the
+// swimmers go in (a corpse at the waterline: the strike from below,
+// OrbitTuning::climb). SANDVOX_AQUATIC_R = the
 // pool's half-width (default 40); SANDVOX_AQUATIC_STROKES=1 prints the jaws'
 // gap to the victim every tick of a stroke; SANDVOX_PASS_TRACE=1 (any run)
 // prints every tick of every charge's geometry.
@@ -4658,6 +4661,11 @@ int RunAquaticShot(GpuContext& ctx, World& world, Simulation& sim,
   if (size_t p = swimmers.find('+'); p != std::string::npos) {
     victimName = swimmers.substr(p + 1);
     swimmers = swimmers.substr(0, p);
+  }
+  bool victimDead = false;
+  if (size_t p = victimName.find(":dead"); p != std::string::npos) {
+    victimDead = true;
+    victimName = victimName.substr(0, p);
   }
   struct Want { int def; int n; };
   std::vector<Want> wants;
@@ -4728,6 +4736,11 @@ int RunAquaticShot(GpuContext& ctx, World& world, Simulation& sim,
       victim = mobs.Spawn(vd, {sx - (int)(vs.x * 0.5f), floorY + 1,
                                sz - (int)(vs.z * 0.5f)});
       if (victim) mobs.SetMobBehavior(victim, "dummy");
+      // A CORPSE: dead where it stood, then left to come up and float.
+      if (victim && victimDead) {
+        if (Mob* vm = mobs.FindMobById(victim)) vm->Die();
+        support::RunTicks(rig, 240);
+      }
     }
   }
   std::vector<uint64_t> ids;
@@ -6516,7 +6529,7 @@ int main(int argc, char** argv) {
     }
     else if (a == "--shot-aquatic") {
       if (i + 1 >= argc) {
-        std::fprintf(stderr, "--shot-aquatic wants <def>[*N][,<def>[*N]][+victim|+none]\n");
+        std::fprintf(stderr, "--shot-aquatic wants <def>[*N][,<def>[*N]][+victim[:dead]|+none]\n");
         return 1;
       }
       shotAquatic = argv[++i];

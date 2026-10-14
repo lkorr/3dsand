@@ -15617,6 +15617,31 @@ verb set so every older profile is untouched:
   the next lap begins the way the body is going. One bite per pass.
   `SANDVOX_PASS_TRACE=1` prints every tick of every pass's geometry.
 
+**The strike from below** (`OrbitTuning::climb`, 2026-10-13; the piranha's
+0.7 rad). A body floating at the waterline -- a corpse, a swimmer -- is
+mostly ABOVE the water; its underside is all a fish can reach, and only from
+beneath. Two things kept the darts level with it, so they slid under it or
+grazed its flank: the lap circled at the aim point's own height (pinned just
+under the surface by the soft ceiling), and the swim drive turns a wanted
+HEIGHT into a pitch over a run of `max(body, 0.6 x speed)` -- right for a
+body drifting to a depth, and at a dart's 50 vox/s it climbed 3 voxels in 5
+at five degrees. With `climb` set: the lap runs at least `orbitR x
+tan(climb)` UNDER the aim point; turning in, a body still above the cone
+under the aim point sinks onto it, and from there the behaviour layer names
+the PITCH outright (`ai::IntentOut::pitch` -> `Mob::pitchWant_`, which
+replaces the altitude law in `DriveSwim` for that tick; the waterline and bed
+still bend it, `pitchRate` and `maxPitch` still bound it): the nose on the
+true 3D line to the aim point, frozen with the heading at the lock, held
+through the snap, then pitched DOWN at half the climb by the peel. The whole
+pass may breach -- the feel treated the air past a line that ends below the
+waterline as a wall and bent every upward line flat. Against a body standing
+on the bed the cone is under the bed, the bed wins, and the line flattens to
+what it was. Gate `aquatic` part E reports every nip on its floating corpse:
+reached him or not, the pitch at the throw, how far above the fish the voxel
+nearest its jaws was, and how near a miss's jaws came
+(`aquaticCarrionHitShare`). `--shot-aquatic piranha*6+human:dead` photographs
+it: the victim killed where it stands and left 240 ticks to float up.
+
 **Contact for a bite** (`MobSystem::SwimStrikeTarget`). Through a swimmer's
 windup and cut its stroke's target is not a wall to it, and it is not
 spaced off by the crowd push, either way round: two capsules otherwise held

@@ -16,7 +16,8 @@
 //
 // WHAT THE WATER DOES (DriveSwim), in the order it is applied:
 //   1. THE HEIGHT IT WANTS becomes a pitch: atan(dy / run), bounded by the
-//      waterline and the bed as soft walls a voxel early.
+//      waterline and the bed as soft walls a voxel early. (Or the layer names
+//      the pitch outright -- IntentOut::pitch, a strike up a 3D line.)
 //   2. IT FEELS AHEAD for rock -- and for AIR above the waterline, which to a
 //      fish is a wall -- down its wanted line, and if that is blocked tries a
 //      fan of nearby lines and takes the first clear one (a projection onto
@@ -311,6 +312,10 @@ void MobSystem::DriveSwim(Mob& mob, const MobDef& def, World& world, float dt) {
     const float dy = mob.altitudeWant_ - c.y;
     wantPitch = std::atan2(dy, std::max(ws.z, speed * 0.6f));
   }
+  // ...unless the behaviour layer named the angle itself (a strike up a 3D
+  // line, ai::OrbitTuning::climb): that law's long run is right for a body
+  // drifting to a depth and flattens a strike to a few degrees at speed.
+  if (mob.pitchSet_) wantPitch = mob.pitchWant_;
   // The waterline and the bed are SOFT walls a voxel early: the pitch is
   // bent away before the hard limits in step 5 have to act.
   const float allowUp = mob.breachOk_ ? sw.breach : -sw.surfaceGap;

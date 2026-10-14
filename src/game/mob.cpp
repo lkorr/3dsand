@@ -8121,6 +8121,7 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
   mob.driveScale_ = 1.0f;
   mob.driveStrafe_ = 0.0f;
   mob.altitudeSet_ = false;   // a swimmer holds its depth unless asked
+  mob.pitchSet_ = false;
   mob.breachOk_ = false;
   // ---- SHOCKED (docs/PLAN_electricity.md E4) --------------------------------
   // A stunned body neither moves nor attacks: the drive is zeroed, the heading
@@ -8275,6 +8276,8 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
       mob.driveStrafe_ = out.driveStrafe;
       mob.altitudeSet_ = out.altitudeSet;
       mob.altitudeWant_ = out.altitude;
+      mob.pitchSet_ = out.pitchSet;
+      mob.pitchWant_ = out.pitch;
       mob.breachOk_ = out.breach;
       // A CONTAINED DEMON'S BLOW ACROSS ITS RING IS REFUSED (mobfence.h).
       if (out.attack &&

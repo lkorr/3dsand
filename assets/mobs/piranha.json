@@ -55,9 +55,9 @@
     "driveAlignFull": 0.7,
     "driveAlignZero": 2.6
   },
-  "//swim": "Quick everything: it turns at 3.6 rad/s moving, reaches its cruise in a fifth of a second and stops nearly as fast; a strong grip on its line. Out of the water it flops hard and often, and suffocates in six seconds at 2 hp a second (it has about 35).",
+  "//swim": "Quick everything: it turns at 3.6 rad/s moving, reaches its cruise in a fifth of a second and stops nearly as fast; a strong grip on its line. It pitches at 6 rad/s, so a dart can put its nose up the 40-degree line it strikes along from below (behaviors.json `climb`) inside the few ticks the dart lasts. Out of the water it flops hard and often, and suffocates in six seconds at 2 hp a second (it has about 35).",
   "swim": {
-    "pitchRate": 3,
+    "pitchRate": 6,
     "maxPitch": 1.1,
     "accel": 60,
     "brake": 30,

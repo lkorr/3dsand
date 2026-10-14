@@ -299,6 +299,7 @@ TuneMode TuneModeOf(Tune t) {
 //                "lead": 0.8, "lockDist": 5, "overrun": 14, "peel": 0.55,
 //                "biteCone": 0.6, "biteLead": 7, ... },   // OrbitTuning
 //     // with intents "orbit" and "charge" weighted (ai_behavior.h Intent).
+//     // orbit "climb" (2026-10-13): strike from below, up a 3D line.
 //     // ---- the archers (2026-10-13); RangedTuning, intent "shoot" -----------
 //     "ranged": { "rangeMin": 40, "rangeMax": 80, "minRange": 14,
 //                 "maxRange": 160, "cadenceTicks": 45, "jitterTicks": 20,
@@ -591,6 +592,7 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
       o.passMax = std::max(10u, q.value("passMax", 150u));
       o.biteLead = q.value("biteLead", 6u);
       o.hitHeight = q.value("hitHeight", 0.0f);
+      o.climb = std::clamp(q.value("climb", 0.0f), 0.0f, 1.4f);
     }
     // D4: magic (CastTuning). Absent = never casts.
     if (p.contains("cast") && p["cast"].is_object()) {
@@ -841,7 +843,8 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
         << ", \"biteCone\": " << num(t.biteCone)
         << ", \"passMax\": " << t.passMax
         << ", \"biteLead\": " << t.biteLead
-        << ", \"hitHeight\": " << num(t.hitHeight) << " },\n";
+        << ", \"hitHeight\": " << num(t.hitHeight)
+        << ", \"climb\": " << num(t.climb) << " },\n";
     }
     // D4: the cast block, only for a creature that casts (CastTuning).
     if (!p.cast.spells.empty()) {
@@ -1629,6 +1632,7 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   out.cast = false;
   out.shoot = false;
   out.altitudeSet = false;
+  out.pitchSet = false;
   out.breach = false;
 
   NoteHurt(brain, self, tick);
@@ -2811,6 +2815,12 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       if (self.volumetric) {
         out.altitudeSet = true;
         out.altitude = tc.y + brain.orbitH;
+        // A STRIKE FROM BELOW (OrbitTuning::climb) starts below the line: the
+        // lap runs at least a radius x tan(climb) under the aim point, the
+        // depth the pass then climbs back up at the authored angle.
+        if (ob.climb > 0.0f)
+          out.altitude = std::min(out.altitude,
+                                  tc.y - brain.orbitR * std::tan(ob.climb));
       }
       break;
     }
@@ -2861,6 +2871,12 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       const Vec3 muzzle = centre + fw3 * snoutFwd;
       const float tR = tgtActor != nullptr ? std::max(0.5f, tgtActor->radius * 0.8f) : 1.5f;
       const float dm = std::max(0.0f, BodyDist(self, muzzle, brain.targetPos) - tR);
+      // THE 3D LINE (OrbitTuning::climb): the nose's angle from the centre up
+      // (or down) to the aim point, which the swim drive is handed as a pitch
+      // rather than as a height it would approach at a few degrees.
+      const bool climbing = self.volumetric && ob.climb > 0.0f;
+      const float horiz = PlanarDist(centre, P);
+      const float linePitch = std::atan2(P.y - centre.y, std::max(horiz, 0.5f));
       if (brain.passPhase == 1 && err <= ob.lineUp) brain.passPhase = 2;
       // A TURN-IN THAT CANNOT LINE UP IS ABANDONED: the target was inside the
       // body's turning circle the whole way round (the slow-down below should
@@ -2876,6 +2892,7 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
         brain.passLocked = true;
         brain.passHeading = want;
         brain.passAlt = P.y;
+        brain.passPitch = linePitch;
       }
       brain.passClosest = std::min(brain.passClosest, dm);
       if (brain.passPhase == 2 && brain.passLocked &&
@@ -2901,6 +2918,30 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
         out.altitudeSet = true;
         out.altitude = brain.passLocked ? brain.passAlt : P.y;
         out.breach = brain.passPhase >= 2;
+        // ---- ...UP THE LINE, FROM BELOW (OrbitTuning::climb) ---------------
+        // Turning in, a body still ABOVE the cone under the aim point (the
+        // depth from which the line climbs at `climb`) sinks onto it; one
+        // under it already points its nose at the aim point. The run holds
+        // the 3D line, frozen with the heading at the lock; the overrun keeps
+        // it through the snap until the peel turns it down (below). The whole
+        // pass may breach: the air past a line that ends below the waterline
+        // is not in the way, and asking the feel to dodge it bent every
+        // upward line flat.
+        if (climbing) {
+          out.breach = true;
+          if (brain.passPhase == 1) {
+            const float cone = P.y - horiz * std::tan(ob.climb);
+            if (centre.y > cone) {
+              out.altitude = cone;
+            } else {
+              out.pitchSet = true;
+              out.pitch = linePitch;
+            }
+          } else {
+            out.pitchSet = true;
+            out.pitch = brain.passLocked ? brain.passPitch : linePitch;
+          }
+        }
       }
       // ---- the bite, from the run ----
       // THE JAWS' OWN CONE: how far off the nose the target is as seen from
@@ -2970,12 +3011,13 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
         if (kPassTrace)
           std::printf("pass #%llu t%u ph %d d %.1f dm %.1f err %+.2f want %+.2f "
                       "hd %+.2f lock %d bit %d drive %.2f v %.1f P(%.1f %.1f %.1f) "
-                      "c(%.1f %.1f %.1f)\n",
+                      "c(%.1f %.1f %.1f) pitch %+.2f wants %s%+.2f\n",
                       (unsigned long long)self.id, tick, brain.passPhase, d, dm,
                       WrapPi(want - self.heading), want, self.heading,
                       (int)brain.passLocked, (int)brain.passBit, out.driveScale,
                       self.velocity.len(), P.x, P.y, P.z, centre.x, centre.y,
-                      centre.z);
+                      centre.z, self.pitch, out.pitchSet ? "pitch " : "alt ",
+                      out.pitchSet ? out.pitch : out.altitude - centre.y);
       }
       // ...AND PEELS OFF ONCE THE JAWS HAVE CLOSED. The line holds through the
       // gape and the snap (biteLead ticks of travel plus the cut); then the
@@ -2987,6 +3029,9 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
         brain.passLocked = true;
         brain.passHeading = self.heading + (float)brain.orbitSign * ob.peel;
         brain.passAlt = P.y;
+        // A strike from below dives back down under what it bit, at half
+        // the climb, instead of running on up into the waterline.
+        if (climbing) brain.passPitch = -0.5f * ob.climb;
       }
       // ---- ...and the pass ends ----
       const bool past = brain.passPhase == 3 && d >= ob.overrun;

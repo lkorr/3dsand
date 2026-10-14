@@ -437,6 +437,51 @@ Status GateAquatic(Ctx& c, std::string& detail) {
   // WHERE THE NIPS WENT (rule 6): fish-ticks in a cut at the corpse, bodies
   // those cuts touched, how near the fish was, where the corpse floats.
   uint32_t cutTicksE = 0, bodiesE = 0;
+  // ...AND WHAT EACH NIP DID (rule 6; 2026-10-13, the strike from below):
+  // whether the jaws reached him, how close their tip came while they closed
+  // (a miss's "how far off"), the fish's pitch when it threw, and how far
+  // ABOVE its centre the voxel nearest its jaws then was -- a floating corpse
+  // is bitten from beneath or not at all.
+  struct NipE {
+    bool live = false;
+    int prevPhase = -1, hits0 = 0, hits = 0;
+    float gap = 1e9f, pitch = 0.0f, rise = 0.0f;
+  };
+  std::vector<NipE> nipE(shoal.size());
+  uint32_t nipHit = 0, nipMiss = 0;
+  float pitchHit = 0.0f, pitchMiss = 0.0f, riseHit = 0.0f, riseMiss = 0.0f,
+        gapMiss = 0.0f;
+  auto jawGap = [&](const Mob& f, Vec3* nearest) {
+    Vec3 eb{}, et{};
+    float hw = 0.0f;
+    const Mob* m = mobs.FindMobById(corpse);
+    if (m == nullptr || !f.WeaponEdge(eb, et, hw)) return -1.0f;
+    float best = 1e9f;
+    for (int li = 0; li < m->LimbCount(); li++) {
+      if (mobs.LimbVoxelCount(corpse, li) == 0) continue;
+      const Vec3 v = mobs.LimbNearestVoxelWorld(corpse, li, et);
+      // (a limb with no body answers the point itself: not a voxel)
+      if (v.x == et.x && v.y == et.y && v.z == et.z) continue;
+      if ((v - et).len() < best) {
+        best = (v - et).len();
+        if (nearest != nullptr) *nearest = v;
+      }
+    }
+    return best;
+  };
+  auto closeNip = [&](NipE& ne) {
+    if (ne.hits > ne.hits0) {
+      nipHit++;
+      pitchHit += ne.pitch;
+      riseHit += ne.rise;
+    } else {
+      nipMiss++;
+      pitchMiss += ne.pitch;
+      riseMiss += ne.rise;
+      gapMiss += ne.gap < 1e8f ? ne.gap : 0.0f;
+    }
+    ne.live = false;
+  };
   float nearSum = 0.0f, corpseY = 0.0f;
   // HOW FAR THE FEEDING SHOVES HIM: the pelvis's path and its fastest tick.
   float corpsePath = 0.0f, corpseTop = 0.0f;
@@ -467,6 +512,25 @@ Status GateAquatic(Ctx& c, std::string& detail) {
         if (st->bodiesHit > lastHit[k]) bodiesE += (uint32_t)(st->bodiesHit - lastHit[k]);
       }
       lastHit[k] = st->bodiesHit;
+      NipE& ne = nipE[k];
+      const bool onIt = st->Active() && st->targetId == corpse;
+      const bool begins = onIt && st->phase == NpcStroke::Phase::Windup &&
+                          ne.prevPhase != (int)NpcStroke::Phase::Windup;
+      if (ne.live && (!onIt || begins)) closeNip(ne);
+      if (begins) {
+        ne = NipE{};
+        ne.live = true;
+        ne.hits0 = ne.hits = st->bodiesHit;
+        ne.pitch = f->SwimPitch();
+        Vec3 nv{};
+        if (jawGap(*f, &nv) >= 0.0f) ne.rise = nv.y - CentreOf(*f).y;
+      }
+      if (ne.live) {
+        ne.hits = std::max(ne.hits, st->bodiesHit);
+        if (st->phase == NpcStroke::Phase::Cut)
+          if (const float g = jawGap(*f, nullptr); g >= 0.0f) ne.gap = std::min(ne.gap, g);
+      }
+      ne.prevPhase = onIt ? (int)st->phase : -1;
     }
     int holding = 0;
     for (uint64_t id : shoal)
@@ -497,6 +561,12 @@ Status GateAquatic(Ctx& c, std::string& detail) {
                    lostE >= (uint32_t)BaselineNumber("aquaticCarrionVoxelsMin", 60) &&
                    ratio0 > 0.0f && ratioEnd < ratio0;
   RecordObserved("aquaticCarrionVoxels", (double)lostE);
+  for (NipE& ne : nipE)
+    if (ne.live) closeNip(ne);
+  const float nipHitShare =
+      nipHit + nipMiss > 0 ? (float)nipHit / (float)(nipHit + nipMiss) : 0.0f;
+  RecordObserved("aquaticCarrionHitShare", (double)nipHitShare);
+  auto mean = [](float s, uint32_t n) { return n > 0 ? s / (float)n : 0.0f; };
 
   mobs.Reset();
   c.debris.Reset();
@@ -514,7 +584,9 @@ Status GateAquatic(Ctx& c, std::string& detail) {
       "(%.1f hp to asphyxia) | E carrion %s: %u nips on a corpse, %u fish-ticks on it, "
       "lost %u voxels over %d limbs, meat/bone %.2f -> %.3f (eats to %.3f: stripped at "
       "tick %d, let go at %d) [%u cut fish-ticks at it, %u bodies touched, %.1f from its "
-      "pelvis on average; pelvis y %+.1f over the water's top; meat cells %u -> %u, bone and the rest %.0f -> %.0f; pelvis swam %.0f voxels, fastest %.2f a tick; alone, %.1f voxels in 300 ticks]",
+      "pelvis on average; pelvis y %+.1f over the water's top; meat cells %u -> %u, bone and the rest %.0f -> %.0f; pelvis swam %.0f voxels, fastest %.2f a tick; alone, %.1f voxels in 300 ticks] "
+      "[nips: %u reached him, %u missed (%.0f%% hit); pitch at the throw %+.2f hit / %+.2f "
+      "missed; the nearest voxel %+.1f / %+.1f above the fish; a miss's jaws came within %.1f]",
       siteWhy.c_str(), aOk ? "PASS" : "FAIL", swimShare * 100.0f, outOfWater, worstLow,
       worstHigh, sweptAtFirstPass, passes, peakV, cruise > 0 ? peakV / cruise : 0.0f,
       bites, wentPast, lostA, limbsA, hpLostA, victimEnd.c_str(), bOk ? "PASS" : "FAIL",
@@ -526,7 +598,9 @@ Status GateAquatic(Ctx& c, std::string& detail) {
       cutTicksE, bodiesE, cutTicksE ? nearSum / (float)cutTicksE : 0.0f,
       corpseY - (float)(waterTop + 1), meat0, meatEnd,
       ratio0 > 0.0f ? (float)meat0 / ratio0 : 0.0f,
-      ratioEnd > 0.0f ? (float)meatEnd / ratioEnd : 0.0f, corpsePath, corpseTop, alonePath);
+      ratioEnd > 0.0f ? (float)meatEnd / ratioEnd : 0.0f, corpsePath, corpseTop, alonePath,
+      nipHit, nipMiss, nipHitShare * 100.0f, mean(pitchHit, nipHit), mean(pitchMiss, nipMiss),
+      mean(riseHit, nipHit), mean(riseMiss, nipMiss), mean(gapMiss, nipMiss));
   return aOk && bOk && cOk && dOk && eOk ? Status::Pass : Status::Fail;
 }
 

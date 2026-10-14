@@ -5894,6 +5894,10 @@ class Mob {
   // (ai::IntentOut::altitude): the CENTRE's world y, or unset (hold depth).
   bool altitudeSet_ = false;
   float altitudeWant_ = 0.0f;
+  // ...or the nose's angle itself (ai::IntentOut::pitch): set, it replaces
+  // the altitude's pitch law (a strike up a 3D line, OrbitTuning::climb).
+  bool pitchSet_ = false;
+  float pitchWant_ = 0.0f;
   // A charge may lift the back over the waterline by SwimDef::breach.
   bool breachOk_ = false;
   // Out of the water.

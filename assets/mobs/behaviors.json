@@ -688,6 +688,7 @@
       "comment": "THE PIRANHA (assets/mobs/piranha.json). The SAME two verbs as the shark with a piranha's numbers: it circles a body-width out on short, jittery laps that reverse two times in five, and darts in every half second or so for a NIP -- a hole a couple of art voxels across (strike.biteRadius 0.55) -- overrunning by a body length and coming straight back. One is a nuisance. A shoal is a death by a thousand cuts, and the crowd spacing (MobSystem::ApplyCrowdSpacing, the swim drive's sidestep) spreads them round the victim instead of stacking them on one spot.",
       "//frenzy": "FRENZY: once the target bleeds (Fact::TargetBleeding) every piranha in range smells it (scentRange 60, no line of sight needed), laps shrink through the cadence (x0.45) and it swims harder. That is the whole feeding frenzy -- one rule, no code.",
       "//carrion": "IT EATS THE DEAD (Perception::carrion, 2026-10-11). A corpse in the water is a target while its meat (organic cells) is still more than 0.03 of its bone and the rest (a fresh man is about 0.42, so: until about a fourteenth of the meat is left -- the scraps between the bones) -- and the bites go to whichever limbs still have meat on them. A living swimmer within 8 voxels (carrionPull) of the corpse's distance is preferred. A SEVERED PIECE (a limb, or a corpse's rig gone to debris) is food by the same test, its own meat over its own bone, and the bite strips it to the bone (2026-10-11).",
+      "//climb": "IT STRIKES FROM BELOW (OrbitTuning::climb 0.7 rad, about 40 degrees; 2026-10-13). A body floating at the waterline -- a corpse, a swimmer -- is mostly above the water, and its underside is all a fish can reach. So the lap circles at least radius x tan(climb) UNDER the point it means to bite (2.5..4.3 voxels on its 2.9..6.1 laps), and the dart comes back up the true 3D line to it, nose pitched up the whole way (the swim drive is handed the pitch, not a height it would creep toward at a few degrees), then dives back down at half the angle once the jaws have shut. Against a body standing on the bed it can get no lower than the bed, so the line flattens to what it was.",
       "name": "piranha",
       "label": "Piranha",
       "color": 3224399999,
@@ -698,7 +699,7 @@
                     "wander": { "radius": 8, "speed": 0.5, "pauseMin": 0, "pauseMax": 15, "arrive": 1.5, "depth": 2 } },
       "orbit": { "radius": 4.5, "radiusJitter": 0.35, "speed": 0.8, "height": 0, "heightJitter": 3, "lookahead": 0.75, "engage": 4,
                  "lapMin": 4, "lapMax": 16, "reverseChance": 0.4,
-                 "chargeSpeed": 2.4, "turnInSpeed": 1.3, "lineUp": 0.6, "lead": 0.5, "lockDist": 1.5, "overrun": 2.5, "peel": 0.6, "biteCone": 0.9, "passMax": 50, "biteLead": 3, "hitHeight": 0 },
+                 "chargeSpeed": 2.4, "turnInSpeed": 1.3, "lineUp": 0.6, "lead": 0.5, "lockDist": 1.5, "overrun": 2.5, "peel": 0.6, "biteCone": 0.9, "passMax": 50, "biteLead": 3, "hitHeight": 0, "climb": 0.7 },
       "attack": { "styles": ["piranha_nip"], "reach": 10, "aimTolerance": 3.2, "cadenceTicks": 6, "jitterTicks": 5, "commitTicks": 4, "disengageTicks": 0, "pursueSpeed": 0, "leadTicks": 0 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },

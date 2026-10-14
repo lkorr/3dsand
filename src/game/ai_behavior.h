@@ -678,6 +678,19 @@ struct OrbitTuning {
   uint32_t biteLead = 6;        // ticks of travel the bite is thrown ahead of
                                 // contact (the gape has to open in time)
   float hitHeight = 0.0f;       // vox above the target's centre the run aims at
+  // THE STRIKE FROM BELOW (2026-10-13; a SelfView::volumetric body only). The
+  // least angle (rad) the run CLIMBS into the target at; 0 = off, the pass as
+  // above. On: the lap circles at least `orbitR x tan(climb)` UNDER the aim
+  // point (so a pass starts below the line, not level with it), and from the
+  // turn-in on the nose is held on the TRUE 3D line to the aim point
+  // (IntentOut::pitch) instead of an altitude the swim drive would flatten
+  // -- its law runs a rise over max(body, 0.6 x speed), so a dart at 50
+  // vox/s climbed 3 voxels in 5 at 5 degrees and slid under a floating
+  // corpse. The turn-in may breach (air past the aim point is not a wall to
+  // a line that ends below it), and the overrun dives back down at half the
+  // angle. A body floating at the waterline is mostly above the water; its
+  // underside is all a fish can reach, and only from below.
+  float climb = 0.0f;
 };
 
 // ---- TUNE: what a holding RULE may do to the fighter, besides weights -------
@@ -1326,6 +1339,7 @@ struct Brain {
   uint32_t passSince = 0;
   float passHeading = 0.0f;       // the line, once locked (phase 2 close / 3)
   float passAlt = 0.0f;
+  float passPitch = 0.0f;         // ...and its climb (OrbitTuning::climb)
   bool passLocked = false;
   bool passBit = false;           // this pass has thrown its bite
   uint32_t passBiteTick = 0;      // ...on this tick
@@ -1411,6 +1425,13 @@ struct IntentOut {
   // body's own pitch rate and kept inside the water whatever is asked.
   bool altitudeSet = false;
   float altitude = 0;
+  // ...OR THE NOSE'S ANGLE ITSELF (rad above level; 2026-10-13): set, it
+  // replaces the altitude's pitch law for this tick (the waterline and bed
+  // still bend it, and the body's pitch rate and maxPitch still bound it).
+  // A strike along a 3D line (OrbitTuning::climb) says where the nose points,
+  // not a height to drift toward.
+  bool pitchSet = false;
+  float pitch = 0;
   // A charge's run may break the surface (MobDef::SwimDef::breach).
   bool breach = false;
   bool attack = false;
