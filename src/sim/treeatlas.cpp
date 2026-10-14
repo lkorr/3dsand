@@ -26,6 +26,83 @@ void SetCurrentTreeLattice(const TreeLattice& l) { LatticeSlot() = l; }
 
 namespace {
 
+/** THE FAR SILHOUETTE: a species' trunk material and its leaf radius per
+ *  height band, measured from its baked variants (already rebased and
+ *  remapped in W), into the species entry `s` (kSBarkMat, kSProfile).
+ *  worldgen.wgsl farCanopyAt draws this outline at cascade levels 5-6, where
+ *  a whole tree is two to four cells: a spruce reads as a cone, a redwood as
+ *  a crown on a bare stem, an oak as a dome -- instead of every species being
+ *  one leaf column standing on the ground.
+ *
+ *  Foliage is the species' leaf ramp and its canopy material; the bark is the
+ *  anchor column's ground-row run when that is not foliage (a bush's skirt
+ *  is, so a bush has no trunk). A band's radius is the 90th percentile of its
+ *  leaf voxels' distance from the trunk axis, per variant, averaged over the
+ *  variants (a variant with nothing in the band counts 0); a band holding
+ *  under 2 % of a variant's leaves is empty for it, so a stray low twig does
+ *  not hang a crown cell under the tree. Render-only: no near-field cell and
+ *  no hash reads these words. */
+void BakeFarProfile(const uint32_t* W, uint32_t* s) {
+  constexpr int kB = kProfileBands;
+  constexpr int kMaxR = 256;
+  const int above = std::max(1, static_cast<int>(s[kSAbove]));
+  const int nvar = static_cast<int>(s[kSVariantCount]);
+  const uint32_t foliage[4] = {s[kSLeaf0], s[kSLeaf0 + 1], s[kSLeaf0 + 2], s[kSCanopyMat]};
+  auto isLeaf = [&](uint32_t m) {
+    return m != 0u && (m == foliage[0] || m == foliage[1] || m == foliage[2] || m == foliage[3]);
+  };
+  uint32_t bark = 0;
+  double radSum[kB] = {};
+  std::vector<uint32_t> hist(static_cast<size_t>(kB) * kMaxR);
+  for (int v = 0; v < nvar; v++) {
+    const uint32_t* d = W + s[kSVariantDir] + v * kVariantWords;
+    const int nx = static_cast<int>(d[kVNx]), nz = static_cast<int>(d[kVNz]);
+    const int ax = static_cast<int>(d[kVAnchorX]), az = static_cast<int>(d[kVAnchorZ]);
+    std::fill(hist.begin(), hist.end(), 0u);
+    uint32_t bandN[kB] = {};
+    uint32_t total = 0;
+    for (int lz = 0; lz < nz; lz++) {
+      for (int lx = 0; lx < nx; lx++) {
+        const uint32_t* col = W + d[kVColumns] + (static_cast<size_t>(lz) * nx + lx) * 2;
+        const int r = std::min(kMaxR - 1, static_cast<int>(std::lround(
+                          std::sqrt(double((lx - ax) * (lx - ax) + (lz - az) * (lz - az))))));
+        for (uint32_t k = 0; k < col[1]; k++) {
+          const uint32_t run = W[col[0] + k];
+          const uint32_t m = run & 0xFFFu;
+          const int y0 = static_cast<int>((run >> 16) & kRunMaxY0);
+          const int len = static_cast<int>((run >> (16 + kRunY0Bits)) & kRunMaxLen);
+          if (lx == ax && lz == az && k == 0 && y0 == 0 && bark == 0u && !isLeaf(m)) bark = m;
+          if (!isLeaf(m)) continue;
+          for (int y = y0; y < y0 + len; y++) {
+            const int b = std::min(kB - 1, y * kB / above);
+            hist[static_cast<size_t>(b) * kMaxR + r]++;
+            bandN[b]++;
+            total++;
+          }
+        }
+      }
+    }
+    for (int b = 0; b < kB; b++) {
+      if (bandN[b] == 0u || bandN[b] * 50u < total) continue;
+      const uint32_t want = (bandN[b] * 9u + 9u) / 10u;
+      uint32_t acc = 0;
+      int r = 0;
+      for (; r < kMaxR; r++) {
+        acc += hist[static_cast<size_t>(b) * kMaxR + r];
+        if (acc >= want) break;
+      }
+      radSum[b] += r;
+    }
+  }
+  s[kSBarkMat] = bark;
+  for (int w = 0; w < kB / 4; w++) s[kSProfile + w] = 0u;
+  for (int b = 0; b < kB && nvar > 0; b++) {
+    const uint32_t r = static_cast<uint32_t>(
+        std::min(255.0, std::floor(radSum[b] / nvar + 0.5)));
+    s[kSProfile + b / 4] |= r << ((b % 4) * 8);
+  }
+}
+
 /** The .svtree files of `dir` in SPECIES ORDER. Sorted by name: the species
  *  INDEX reaches the world through a hash roll (and, since P6, through an
  *  authored tree site's record), so directory order would make the forest
@@ -338,6 +415,7 @@ bool LoadTreeAtlas(const std::string& dir, const std::vector<MaterialDef>& mats,
       if (!s[kSLeaf0 + k] || !s[kSAutumn0 + k]) autumnOk = false;
     }
     s[kSAutumnChance] = autumnOk ? static_cast<uint32_t>(f.autumnChance) : 0u;
+    BakeFarProfile(W, s);
 
     out.maxReachXZ = std::max(out.maxReachXZ, f.reach);
     out.maxAbove = std::max(out.maxAbove, f.above);

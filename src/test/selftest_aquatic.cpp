@@ -42,6 +42,7 @@
 
 #include "game/mob.h"
 #include "gpu/rhi.h"
+#include "sim/currentprim.h"
 #include "sim/tuning.h"
 #include "sim/worldgen_run.h"
 #include "test/selftest.h"
@@ -1045,6 +1046,35 @@ Status GateNpcSwim(Ctx& c, std::string& detail) {
   const bool aOk = a != 0 && aSwim && std::fabs(aY - floatY) <= floatTol && aPose &&
                    aTread >= 0.5f;
 
+  // ======== D. THE RIVER CARRIES IT (2026-10-14) ============================
+  // The same floating dummy, a +x stream switched on through the pool. It has
+  // nowhere to go, so it must drift with the water -- and still TREAD, because
+  // the pose reads the stroke relative to the water, not the drift.
+  CurrentPrims().Clear();
+  {
+    CurrentPrim st;
+    st.kind = kCurrentPrimStream;
+    st.flags = kCurrentPrimSim;
+    st.x = site.x; st.y = ifloor(floatY + 0.5f * H); st.z = site.z;
+    st.radius = 64;
+    st.reach = 64;
+    st.decayTicks = kCurrentPrimForever;
+    st.ownerId = 0x7E59u;
+    CurrentPrimAim(st, Vec3{1.0f, 0.0f, 0.0f}, 0.5f);
+    CurrentPrims().Spawn(st);
+  }
+  float dX0 = 0.0f, dDrift = 0.0f, dTread = 0.0f;
+  bool dSwim = false;
+  if (const Mob* m = mobs.FindMobById(a)) dX0 = m->Origin().x;
+  support::RunTicks(rig, 60);
+  if (const Mob* m = mobs.FindMobById(a)) {
+    dDrift = m->Origin().x - dX0;
+    dSwim = m->Swimming();
+    dTread = m->Pose().swimW[0];
+  }
+  CurrentPrims().Clear();
+  const bool dOk = aOk && dSwim && dDrift >= 2.0f && dTread >= 0.5f;
+
   // ======== B. IT SWIMS OUT ==================================================
   mobs.Reset();
   c.debris.Reset();
@@ -1109,12 +1139,13 @@ Status GateNpcSwim(Ctx& c, std::string& detail) {
       "vs float %.2f (tol %.1f), swim pose %d, tread %.2f | B swims out %s: %d ticks "
       "swimming (%d with a target), crawl peak %.2f, out on the bank at tick %d of %d "
       "(got to x %+.1f of the bank) | C dives %s: %d ticks swimming, %d with the head under (lowest %+.1f "
-      "vs the waterline), stroke pitch peak %.2f rad (min %.2f)",
+      "vs the waterline), stroke pitch peak %.2f rad (min %.2f) | D carried %s: drift %+.1f "
+      "in 60 ticks, swimming %d, tread %.2f",
       siteWhy.c_str(), H, bedY, surfY, aOk ? "PASS" : "FAIL", (int)aSwim, aY, floatY,
       floatTol, (int)aPose, aTread, bOk ? "PASS" : "FAIL", swamB, targetedB, crawlPeak, outAt, kOut,
       bestX - (float)(site.x + R - 1), cOk ? "PASS" : "FAIL", swamC, underC, headLow,
-      pitchPeak, pitchMin);
-  return aOk && bOk && cOk ? Status::Pass : Status::Fail;
+      pitchPeak, pitchMin, dOk ? "PASS" : "FAIL", dDrift, (int)dSwim, dTread);
+  return aOk && bOk && cOk && dOk ? Status::Pass : Status::Fail;
 }
 
 // ---------------------------------------------------------------------------

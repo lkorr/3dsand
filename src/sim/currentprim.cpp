@@ -613,7 +613,11 @@ WaveImpactRing& WaveImpacts() {
 // Transcribed from currentPrimEvalF in assets/shaders/common.wgsl, line for
 // line, in the same order and with the same clamps. Read the two side by side
 // when changing either.
-Vec3 CurrentAtCpu(Vec3 posVox) {
+static Vec3 CurrentAtCpuImpl(Vec3 posVox, bool simOnly);
+Vec3 CurrentAtCpu(Vec3 posVox) { return CurrentAtCpuImpl(posVox, false); }
+Vec3 CurrentAtCpuSim(Vec3 posVox) { return CurrentAtCpuImpl(posVox, true); }
+
+static Vec3 CurrentAtCpuImpl(Vec3 posVox, bool simOnly) {
   const CurrentPrimSystem& cp = CurrentPrims();
   const uint32_t n = std::min(cp.Count(), kCurrentPrimCap);
   if (n == 0) return Vec3{0.0f, 0.0f, 0.0f};
@@ -629,6 +633,7 @@ Vec3 CurrentAtCpu(Vec3 posVox) {
   for (uint32_t i = 0; i < n; i++) {
     const int32_t* w = cp.Resolved()[i].w;
     const uint32_t kind = (uint32_t)w[3] & 0xFu;
+    if (simOnly && ((((uint32_t)w[3] >> 4) & kCurrentPrimSim) == 0)) continue;
     const Vec3 pos{(float)w[0], (float)w[1], (float)w[2]};
     Vec3 dir{(float)w[4] / 65536.0f, (float)w[5] / 65536.0f,
              (float)w[6] / 65536.0f};

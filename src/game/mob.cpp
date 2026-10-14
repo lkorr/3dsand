@@ -2656,6 +2656,16 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   for (uint32_t& m : matOfStainType_) m = 0;
   ignitedForm_.clear();
   reactions_ = reactions;
+  // What the passive heal grows tissue back as (Mob::ScarTick), by name.
+  scarMat_ = 0;
+  {
+    const std::string& scarName = CurrentTuning().gore.scarMat;
+    for (size_t i = 1; i < mats.size() && !scarName.empty(); i++)
+      if (mats[i].name == scarName) {
+        scarMat_ = (uint32_t)i;
+        break;
+      }
+  }
   // How burnt each material reads, for the body's burnt fraction (Gore §G).
   burnStage_.assign(mats.size(), 0u);
   burnable_.assign(mats.size(), 0u);
@@ -9144,6 +9154,11 @@ void MobSystem::EaseBodyY(Mob& mob, float targetY, float dt) {
 // a second copy of the whole pipeline plus a second ~390-line gait
 // (MobSystem::UpdateGait), and the two had drifted — pose.cpp says which way
 // each difference was resolved.
+// mob_afloat.cpp: the horizontal current at a floating walker's middle.
+// Declared here rather than in mob.h so the one consumer does not recompile
+// every file that includes the mob header.
+Vec3 AfloatCurrent(const Mob& mob, const MobDef& def);
+
 void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
                                 float dt, uint32_t tick) {
   (void)def;
@@ -9222,7 +9237,10 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
       mob.ragdoll_ == Mob::RagdollPhase::None) {
     const float H = std::max(def.worldSize.y, 1.0f);
     in.swim = true;
-    in.velocity = mob.swimVel_;
+    // The stroke is what the body does RELATIVE TO THE WATER: the river's
+    // share of the velocity (AfloatCurrent, the drift DriveAfloat added) is
+    // taken out, so a swimmer drifting with nowhere to go treads.
+    in.velocity = mob.swimVel_ - AfloatCurrent(mob, def);
     in.grounded = false;
     in.airPoseEligible = false;
     in.height = PoseInputs::Height::FromDriver;
@@ -9232,9 +9250,9 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
     in.guardPump = false;
     const bool under =
         !mob.surfaceKnown_ || mob.origin_.y + 0.9f * H < mob.surfaceY_;
-    const float sp = mob.swimVel_.len();
+    const float sp = in.velocity.len();
     if (under && sp > 0.15f * std::max(def.speed, 0.01f))
-      in.swimAim = mob.swimVel_ * (1.0f / sp);
+      in.swimAim = in.velocity * (1.0f / sp);
   }
   // ---- A DRAWN BOW (game/mob_archery.h) -------------------------------------
   // The bow_draw clip (the player's own, on the same rig) owns the arms; the
@@ -15135,6 +15153,38 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
     };
     slot.c = slot.c + w * KerfEntry(slot, latScale, walk);
     const Vec3 slotAt = slot.c;
+    // ---- HOW FAR THE POINT GOES IN (phys/kerf.h KerfStabDepth) --------------
+    // A stab into tissue spends its budget down the bore by what it meets, so
+    // bone stops it and scar gives. A shell (worn plate, a plate body, a
+    // shield) has already had its hardness taken by the chip rule above and is
+    // not charged twice; it only keeps to the blade's reach.
+    if (cut.stab) {
+      const float reach = cut.reach > 0.0f ? cut.reach : slot.depth;
+      if (sys_ != nullptr && !IsWornSlot((int)i) && !bodyShell &&
+          !IsShieldSlot((int)i)) {
+        const float ref = CurrentTuning().gear.cutHardnessRef;
+        auto costOf = [&](uint32_t m) {
+          const float h = MaterialHardness(m);
+          return (h > 0.0f && ref > 0.0f) ? h / ref : 1.0f;
+        };
+        slot.depth = KerfStabDepth(slot, latScale, slot.depth, reach,
+                                   [&](auto&& probe) {
+          if (fineSkin)
+            for (const PrefabVoxel& pv : limb.skinVoxels) {
+              const uint32_t m = pv.material & 0xFFFu;
+              if (m) probe((float)pv.x, (float)pv.y, (float)pv.z, costOf(m));
+            }
+          else
+            for (const DebrisVoxel& dv : limb.voxels) {
+              const uint32_t m = dv.payload & 0xFFFu;
+              if (m) probe((float)dv.x, (float)dv.y, (float)dv.z, costOf(m));
+            }
+        });
+      } else {
+        slot.depth = std::min(slot.depth, reach);
+      }
+      depth = slot.depth;
+    }
 
     // ---- DID THE EDGE COME OUT THE OTHER SIDE? (phys/kerf.h KerfBite) ------
     //
@@ -16375,6 +16425,7 @@ struct HealGrow {
   uint8_t color;
   int32_t tomb;  // lattice index of a tombstone to revive, or -1 (a new voxel)
   bool twin;     // a joint-twin copy whose other copy is present: grown free
+  bool surface = false;  // ScarPass: a recipe SURFACE cell (the skin layer)
 };
 struct HealMend {
   uint32_t idx;
@@ -16407,9 +16458,26 @@ bool Mob::IsHealExempt(uint32_t mat) const {
 }
 
 void Mob::HealTick(uint32_t tick) {
-  if (!alive_ || !def_ || !sys_ || sys_->coatRestore_.empty()) return;
+  if (!alive_ || !def_ || !sys_) return;
+  // THE PASSIVE HEAL (ScarTick) runs on every limb that is not wearing a
+  // healing coat this tick -- the coat, when there is one, does it better.
+  const bool scar = CurrentTuning().gore.scarHeals && sys_->scarMat_ != 0 &&
+                    WoundsHeal();
+  if (sys_->coatRestore_.empty() && !scar) return;
   const int n = std::min(baseLimbs_, (int)limbs_.size());
   bool any = false;
+  // A creature LOSING BLOOD anywhere (a dripping cut, an open stump) regains
+  // no hp on any limb: blood is health (Mob::DrainBlood), and a regen on the
+  // whole limbs would quietly refund what the wound is draining -- the
+  // bleed-out identity (hp lost == blood x rate) and the death it ends in.
+  scarBleeding_ = false;
+  for (int li = 0; scar && li < n; li++) {
+    const MobLimb& l = limbs_[li];
+    if (l.bleedBudget >= 1.0f || l.stumpOpen || l.gushTicks > 0) {
+      scarBleeding_ = true;
+      break;
+    }
+  }
   for (int li = 0; li < n; li++) {
     MobLimb& l = limbs_[li];
     if (!l.body) continue;
@@ -16421,10 +16489,13 @@ void Mob::HealTick(uint32_t tick) {
       if (en.mat != 0 && en.mat < sys_->coatRestore_.size() &&
           sys_->coatRestore_[en.mat] > 0.0f)
         wears = true;
-    if (!wears) continue;
     // Staggered per creature and limb, so a party healing at once does not
     // re-pack every brick on one tick.
     const uint32_t key = (uint32_t)id_ * 0x9E3779B9u + (uint32_t)li * 2654435761u;
+    if (!wears) {
+      if (scar && !IsWornSlot(li) && ScarTick(li, tick, key)) any = true;
+      continue;
+    }
     if ((tick + key) % kHealPeriod != 0) continue;
     if (HealLimbStep(li, tick) > 0) any = true;
   }
@@ -16433,7 +16504,98 @@ void Mob::HealTick(uint32_t tick) {
   if (any && burnFracDirty_) RecountBurn(tick, /*force=*/true);
 }
 
-uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
+// ============================================================================
+// THE BODY HEALS ITSELF, SLOWLY (gore.scarHeals; owner, 2026-10-14)
+//
+// "Over the course of many minutes, missing flesh voxels should repair and
+// become scar tissue, same with skin, though skin voxels shouldn't repair
+// until the surface beneath them repairs."
+//
+// One limb, every kHealPeriod ticks (staggered by `key`):
+//   1. WAIT while the wound is still active: the limb owes blood (a cut still
+//      dripping, an open stump on it, a gout), carries burning matter, rots
+//      (an infection) or is dissolving pulp. Each of those is a process that
+//      is still taking tissue away; scarring over it would grow cells for the
+//      process to eat again. The settled signature is dropped too, so the
+//      first step after it stops re-walks the recipe.
+//   2. hp back at gore.scarHpPerMin of the limb's authored hp a minute, up to
+//      the burn cap. Independent of the shape: hp is the creature's state of
+//      health, the scar is the wound's.
+//   3. SETTLED? A limb whose damage signature has not moved since a step found
+//      nothing to scar is skipped here, at the price of four integer compares
+//      -- the cost of an undamaged creature (rule 2). The recipe walk below is
+//      O(limb) and never runs for it.
+//   4. THE PACE: gore.scarRate cubic centimetres a minute, converted to this
+//      limb's lattice cells and integrated over the tick (the coat's pacing,
+//      HealLimbStep's note), offset by the limb's key so a crowd's steps do
+//      not all land on one tick. At the default a human limb earns a cell
+//      every ~4 s, so the recipe walk is rare even on a wounded body.
+//   5. HealLimbStep with a ScarPass: the same pick, twin rule, re-skin and
+//      collider rebuild as the coat; see the ScarPass branches in it for what
+//      differs (tissue only, scar material, the surface rule, no purse).
+//
+// BOUNDED (rule 2): a scar step only ever moves the limb toward its recipe's
+// shape and a scarred cell is never revisited, so the work ends when the
+// wound is closed. DETERMINISTIC: tick, id and limb keyed, integer counts,
+// the pace's doubles in one fixed order; CPU body state, not hashed.
+// ============================================================================
+uint64_t Mob::ScarSigOf(const MobLimb& l) const {
+  const uint64_t n = l.HasFineSkin() ? l.skinVoxels.size() : l.voxels.size();
+  uint32_t fb;
+  std::memcpy(&fb, &burnFrac_, sizeof fb);
+  uint64_t h = 0x5CA2u;
+  h = h * 0x9E3779B97F4A7C15ull ^ n;
+  h = h * 0x9E3779B97F4A7C15ull ^ l.burn.removed;
+  h = h * 0x9E3779B97F4A7C15ull ^ l.burn.burntAway;
+  h = h * 0x9E3779B97F4A7C15ull ^ fb;
+  return h ? h : 1u;  // 0 is "not settled"
+}
+
+bool Mob::ScarTick(int li, uint32_t tick, uint32_t key) {
+  MobLimb& l = limbs_[(size_t)li];
+  if (li >= (int)def_->limbs.size()) return false;
+  // ---- 1. a wound still at work waits ------------------------------------
+  // (bleedBudget >= 1 is MobSystem::LimbWoundOpen's "still bleeding": a
+  // sub-voxel remainder is not a drip, and would otherwise hold forever.)
+  if (l.bleedBudget >= 1.0f || l.stumpOpen || l.gushTicks > 0 || l.burn.alight ||
+      l.Infected() || l.bluntPulp) {
+    l.scarSig = 0;
+    return false;
+  }
+  if ((tick + key) % kHealPeriod != 0) return false;
+  const Tuning::Gore& g = CurrentTuning().gore;
+  // ---- 2. hp ---------------------------------------------------------------
+  const float hpMax = def_->limbs[(size_t)li].hp;
+  const float cap = hpMax * std::clamp(burnCap_, 0.0f, 1.0f);
+  if (!scarBleeding_ && l.hp < cap && g.scarHpPerMin > 0.0f) {
+    const float before = l.hp;
+    l.hp = std::min(cap, l.hp + hpMax * g.scarHpPerMin * (float)kHealPeriod /
+                                    (60.0f * 30.0f));
+    healStats_.scarHp += l.hp - before;
+  }
+  // ---- 3. settled ----------------------------------------------------------
+  if (l.scarSig != 0 && l.scarSig == ScarSigOf(l)) return false;
+  // ---- 4. the pace ---------------------------------------------------------
+  if (g.scarRate <= 0.0f) return false;
+  const uint32_t scale =
+      std::max(1u, l.HasFineSkin() ? SkinScaleOf(l) : PhysScaleOf(l));
+  const double cellsPerWv = (double)scale * scale * scale;
+  const double cm3PerWv = (double)kVoxelMeters * kVoxelMeters * kVoxelMeters * 1e6;
+  const double perTick = (double)g.scarRate / cm3PerWv * cellsPerWv / (60.0 * 30.0);
+  const double t = (double)tick + (double)(key & 0xFFFFu);
+  const double paced =
+      std::floor(perTick * t) - std::floor(perTick * (t - (double)kHealPeriod));
+  if (paced < 1.0) return false;
+  // ---- 5. the step ---------------------------------------------------------
+  ScarPass sp;
+  sp.budget = (uint32_t)std::min(paced, 1.0e6);
+  sp.mat = sys_->scarMat_;
+  const uint32_t did = HealLimbStep(li, tick, &sp);
+  if (!sp.found) l.scarSig = ScarSigOf(l);
+  return did > 0;
+}
+
+uint32_t Mob::HealLimbStep(int li, uint32_t tick, ScarPass* scar) {
   if (!def_ || li < 0 || li >= (int)limbs_.size() || li >= (int)def_->limbs.size())
     return 0;
   MobLimb& limb = limbs_[li];
@@ -16457,7 +16619,9 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
   double purse = limb.healCredit;
   float rate = 0.0f, strongestR = 0.0f;
   uint32_t strongest = 0;
-  for (size_t i = 0; i < nv; i++) {
+  // THE PASSIVE HEAL has no purse: its pace is ScarTick's, already spent into
+  // scar->budget, and nothing pays for it (bounded by the wound's own size).
+  for (size_t i = 0; i < nv && !scar; i++) {
     if (v.Mat(i) == 0) continue;  // tombstone
     const uint16_t s = v.Stain(i);
     const uint32_t amt = BodyStainAmt(s);
@@ -16473,7 +16637,7 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
       strongest = m;
     }
   }
-  if (payers.empty()) {
+  if (payers.empty() && !scar) {
     limb.healCredit = 0.0f;  // the coat is gone; its change goes with it
     return 0;
   }
@@ -16482,7 +16646,8 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
   const double perTick = (double)rate * cellsPerWv / 30.0;
   const double paced = std::floor(perTick * (double)tick) -
                        std::floor(perTick * ((double)tick - (double)kHealPeriod));
-  const uint32_t budget = (uint32_t)std::floor(std::min(paced, purse));
+  const uint32_t budget =
+      scar ? scar->budget : (uint32_t)std::floor(std::min(paced, purse));
   if (budget == 0) return 0;
   // Diagnostic cost of the step from here (HealStats::stepUs; never read by
   // anything the tick decides).
@@ -16568,6 +16733,64 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
   }
   static const int kD6[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
                                 {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
+  // ---- THE PASSIVE HEAL's view of the recipe (ScarPass only) ---------------
+  // The recipe's own SHAPE, on this lattice: which cells it has and what each
+  // is made of. A recipe cell with a face open in that shape is a SURFACE
+  // cell (the skin layer: anatomy.js makes a limb's own faces depth 0), and a
+  // surface cell is rebuilt only over a whole cell beneath it.
+  std::vector<std::pair<uint64_t, uint32_t>> rshape;
+  if (scar) {
+    rshape.reserve(model.voxels.size());
+    for (const PrefabVoxel& rv : model.voxels) {
+      int x = rv.x, y = rv.y, z = rv.z;
+      if (folded) {
+        x /= fold;
+        y /= fold;
+        z /= fold;
+      }
+      rshape.push_back({CellKey(x - rebase.x, y - rebase.y, z - rebase.z),
+                        rv.material & 0xFFFu});
+    }
+    std::sort(rshape.begin(), rshape.end());
+  }
+  auto recipeAt = [&](int x, int y, int z) -> int {
+    const uint64_t k = CellKey(x, y, z);
+    const auto it = std::lower_bound(rshape.begin(), rshape.end(),
+                                     std::make_pair(k, (uint32_t)0));
+    return it != rshape.end() && it->first == k ? (int)it->second : -1;
+  };
+  auto isSurface = [&](int x, int y, int z) {
+    for (const auto& d : kD6)
+      if (recipeAt(x + d[0], y + d[1], z + d[2]) < 0) return true;
+    return false;
+  };
+  // What the scar regrows: the creature's TISSUE (MobDef::tissue: skin,
+  // flesh, muscle -- whatever bleeds), never bone. An empty mask is "no
+  // anatomy", where every cell is tissue (the soak's own fallback).
+  auto isTissue = [&](uint32_t m) {
+    return def.tissue.empty() || (m < def.tissue.size() && def.tissue[m] != 0);
+  };
+  // "Skin voxels shouldn't repair until the surface beneath them repairs": a
+  // surface cell may be rebuilt once one of its DEEPER neighbours (a recipe
+  // cell that is not itself surface; a neighbour along the skin does not
+  // count) is present and not burnt. When nothing beneath it is tissue that
+  // could come back (skin over a bone notch, a finger's one-cell edge), it
+  // closes from the side, or it would never close at all.
+  auto underWhole = [&](int x, int y, int z) {
+    bool couldRegrow = false;
+    for (const auto& d : kD6) {
+      const int nx = x + d[0], ny = y + d[1], nz = z + d[2];
+      const int rm = recipeAt(nx, ny, nz);
+      if (rm < 0 || isSurface(nx, ny, nz)) continue;
+      const int at = find(nx, ny, nz);
+      if (at >= 0) {
+        const uint32_t m = v.Mat((size_t)at);
+        if (m != 0 && sys_->BurnStageOf(m) == 0) return true;
+      }
+      if (isTissue((uint32_t)rm) && !IsHealExempt((uint32_t)rm)) couldRegrow = true;
+    }
+    return !couldRegrow;
+  };
   for (const PrefabVoxel& rv : model.voxels) {
     int x = rv.x, y = rv.y, z = rv.z;
     if (folded) {
@@ -16582,6 +16805,7 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
       continue;
     if (folded && !foldSeen.insert(CellKey(x, y, z)).second) continue;
     const uint32_t rmat = rv.material & 0xFFFu;
+    if (scar && !isTissue(rmat)) continue;  // bone does not regrow
     // A recipe cell of a SELF-ACTIVE material (one with an ungated decay:
     // the anatomy's blood speckles in muscle) is not tissue the coat rebuilds.
     // It decays on its own whenever the burn pass is awake on the limb (the
@@ -16593,7 +16817,10 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
     // BuildAuthoredLattice's variant, from the AUTHORED coordinate, so a grown
     // cell is byte-for-byte the cell the creature spawned with.
     const uint32_t variant = ((uint32_t)(rv.x * 7 + rv.y * 13 + rv.z * 29)) % 3u;
-    const uint16_t word = (uint16_t)(rmat | (variant << 12));
+    // A scar is its own material with no paint (art 0 draws the material's
+    // colour), so it shows on any complexion.
+    const uint16_t word = (uint16_t)((scar ? scar->mat : rmat) | (variant << 12));
+    const uint8_t color = scar ? (uint8_t)0 : rv.color;
     const int at = find(x, y, z);
     // A TOMBSTONE (material 0: removed by a body pass, its compaction batched
     // until FlushBurn's threshold) is missing matter that still holds a slot:
@@ -16605,6 +16832,9 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
     if (at >= 0 && !tomb) {
       const uint32_t cur = v.Mat((size_t)at);
       if (cur == rmat) continue;  // whole
+      // The passive heal mends only BURNT tissue (a soak reverts on its own,
+      // a rot or venom waits for its cure) and leaves a scar as it is.
+      if (scar && (cur == scar->mat || sys_->BurnStageOf(cur) == 0)) continue;
       // A JOINT TWIN's CHILD copy is the parent's to mend: the sync copies a
       // changed material across, and the two copies are authored differently
       // (the torso's rim is skin where the hip's copy is muscle), so each side
@@ -16614,14 +16844,16 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
                                        TwinRestKey(x + twinO.x, y + twinO.y,
                                                    z + twinO.z)))
         continue;
+      if (scar && isSurface(x, y, z) && !underWhole(x, y, z)) continue;
       if (folded) {
         // Material only on a folded lattice: the cell's variant and art are
         // the collider's own, and the recipe's first voxel is not "the" cell.
         mend.push_back({(uint32_t)at,
-                        (uint16_t)(rmat | (v.Word((size_t)at) & 0x3000u)),
-                        (uint8_t)v.Art((size_t)at)});
+                        (uint16_t)((scar ? scar->mat : rmat) |
+                                   (v.Word((size_t)at) & 0x3000u)),
+                        scar ? (uint8_t)0 : (uint8_t)v.Art((size_t)at)});
       } else {
-        mend.push_back({(uint32_t)at, word, rv.color});
+        mend.push_back({(uint32_t)at, word, color});
       }
       continue;
     }
@@ -16634,6 +16866,8 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
       }
     }
     if (!touches) continue;
+    const bool surf = scar && isSurface(x, y, z);
+    if (surf && !underWhole(x, y, z)) continue;
     // d2 is carried for the gate's order log only; it decides nothing.
     const float dx = (float)x + 0.5f - root.x, dy = (float)y + 0.5f - root.y,
                 dz = (float)z + 0.5f - root.z;
@@ -16642,8 +16876,11 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
         std::binary_search(partnerRest.begin(), partnerRest.end(),
                            TwinRestKey(x + selfO.x, y + selfO.y, z + selfO.z));
     grow.push_back({dx * dx + dy * dy + dz * dz, x, y, z, word,
-                    folded ? (uint8_t)0 : rv.color, tomb ? at : -1, twin});
+                    folded ? (uint8_t)0 : color, tomb ? at : -1, twin, surf});
   }
+  // Nothing left to scar (or nothing yet reachable, which the next change to
+  // the limb will move): ScarTick settles the limb on this.
+  if (scar) scar->found = !grow.empty() || !mend.empty();
 
   // ---- 3b. THE PICK: the lowest hashes of the whole frontier ----------------
   // Keyed by creature and limb, the tick, and the cell's own lattice
@@ -16716,6 +16953,7 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
     if (healStats_.logOrder && healStats_.orderD2.size() < 65536)
       healStats_.orderD2.push_back(g.d2 / (float)(scale * scale));
     if (g.twin) twinFree++;
+    if (g.surface) healStats_.scarSurface++;
     grown++;
   }
   uint32_t used = grown + mended;
@@ -16749,13 +16987,14 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
   // (RecountBurn) and healing never lifts hp above it -- it lifts the CAP only
   // by mending the burnt tissue, and HealTick recounts as soon as it has.
   const float cap = hpMax * std::clamp(burnCap_, 0.0f, 1.0f);
-  if (grown > revived && limb.voxelsAtSpawn > 0 && limb.hp < cap) {
+  // The passive heal's hp is ScarTick's own clock, not a refund per cell.
+  if (!scar && grown > revived && limb.voxelsAtSpawn > 0 && limb.hp < cap) {
     // What a carve charged per voxel, a graft refunds per voxel (RestoreVoxels).
     const float before = limb.hp;
     limb.hp = std::min(cap, limb.hp + hpMax * (float)(grown - revived) / (float)limb.voxelsAtSpawn);
     hpGain += limb.hp - before;
   }
-  if (used == 0 && limb.voxelsAtSpawn > 0) {
+  if (!scar && used == 0 && limb.voxelsAtSpawn > 0) {
     // THE SHAPE IS WHOLE: what is left buys hp, up to the cap.
     if (limb.hp < cap) {
       const float perCell = hpMax / (float)limb.voxelsAtSpawn;
@@ -16774,7 +17013,9 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
   double owe = (double)(used - twinFree) - (double)limb.healCredit;
   uint32_t levels = 0;
   std::vector<uint32_t> paid;
-  if (owe <= 0.0) {
+  if (scar) {
+    // Nothing pays for a scar: the purse is time (ScarTick's pace).
+  } else if (owe <= 0.0) {
     limb.healCredit -= (float)(used - twinFree);
   } else {
     bool any = true;
@@ -16795,7 +17036,8 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
     }
     limb.healCredit = owe < 0.0 ? (float)-owe : 0.0f;
   }
-  coatDirty_ = twinDirty_ = true;
+  if (!scar) coatDirty_ = true;
+  twinDirty_ = true;
 
   // ---- 6. THE LATTICE, THE BRICK, THE BODY ---------------------------------
   if (grown > 0 || mended > 0) {
@@ -16870,6 +17112,12 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
   // healed joint is one cell to the fire and the rot again, and the free copy
   // cannot be burnt off alone and regrown free.
   if (twinFree > 0) twinRelink_ = true;
+  if (scar) {
+    healStats_.scarGrown += grown;
+    healStats_.scarMended += mended;
+    healStats_.scarSteps++;
+    return grown + mended;
+  }
   healStats_.twinFree += twinFree;
   healStats_.grown += grown;
   healStats_.mended += mended;

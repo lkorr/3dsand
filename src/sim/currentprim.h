@@ -340,6 +340,11 @@ WaveImpactRing& WaveImpacts();
 // The player is not part of the world hash, so this is float and needs no
 // integer twin.
 Vec3 CurrentAtCpu(Vec3 posVox);
+// The same field over the SIM-LICENSED primitives only (kCurrentPrimSim, the
+// authority line above) -- what currentAtQ sums. For anything that moves a
+// body the tick owns (an NPC swimmer, mob_afloat.cpp): a primitive seeded off
+// a readback would make where the NPC ends up depend on when the CPU noticed.
+Vec3 CurrentAtCpuSim(Vec3 posVox);
 
 // ---- the arrow overlay's lattice -------------------------------------------
 // THIS FORMULA IS MIRRORED in debug_current.wgsl's vertex shader, which derives

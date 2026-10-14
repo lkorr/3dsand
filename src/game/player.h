@@ -491,6 +491,13 @@ class Player {
   // feet along by slideVel, so a slide is a glide, not a walk. Render/anim
   // only: nothing in the sim reads it.
   Vec3 slideVel{0, 0, 0};
+  // OUTPUT: the water's velocity (vox/s) at the body while the current is
+  // CARRYING it -- afloat, no footing (see THE CURRENT in Player::Update).
+  // Zero on the ground, wading, and out of the water. The avatar's swim pose
+  // reads `vel - currentVel`, the stroke relative to the water, so a body
+  // drifting downstream with no input treads instead of crawling the way the
+  // river takes it. Render/anim only, like slideVel.
+  Vec3 currentVel{0, 0, 0};
   bool canJump = true;
 
   // Largest single-frame velocity LOSS to a collision sweep since the avatar

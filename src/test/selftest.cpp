@@ -470,7 +470,7 @@ const char* const kOrder[] = {
     // leaves a filled basin 45 cells from body-shade's site, clear of that
     // gate's roof; nothing after it reads that region before regenerating.
     "underwater-body",
-    "player-walk", "player-waterjump", "player-swim-floor", "player-ledgegrab", "player-climb-fuzz",
+    "player-walk", "player-waterjump", "player-swim-floor", "player-current", "player-ledgegrab", "player-climb-fuzz",
     "player-crouch",
     "player-fastfall",
     "freefall",
@@ -1232,7 +1232,7 @@ const char* const kOrder[] = {
     // ...and a HEALING coat (enchanted blood / water, alchemy package D)
     // rebuilds a carved, cut and cooked limb toward its recipe, paid for out
     // of the coat and no further. Pose ticks; resets mobs on the way out.
-    "heal-restore", "heal-wound", "heal-joint",
+    "heal-restore", "heal-wound", "heal-joint", "scar-heal",
     // ...and a part that comes off keeps its hand: a split forearm drops the
     // hand with the wrist end, a severed arm stays jointed. Pose ticks only.
     "severed-hand",

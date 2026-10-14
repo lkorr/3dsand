@@ -685,7 +685,14 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
       }
     }
     {
-      PoseInputs pin = AvatarPoseInputs(gaitGrounded, player.vel - player.slideVel);
+      // A SWIMMER'S STROKE IS RELATIVE TO THE WATER. The current carries the
+      // body at Player::currentVel; that part of the velocity is the river's,
+      // not the arms', so it is taken out of what the swim pose reads -- held
+      // still in a current the body treads while it drifts, instead of
+      // crawling in whatever direction the river happens to take it.
+      const Vec3 carriedBy = swimming_ ? player.currentVel : Vec3{};
+      PoseInputs pin = AvatarPoseInputs(
+          gaitGrounded, player.vel - player.slideVel - carriedBy);
       // The stroke's direction (Player::swimAim): what the body lies along
       // under water. Zero whenever the controller is not swimming.
       pin.swimAim = swimming_ ? player.swimAim : Vec3{};

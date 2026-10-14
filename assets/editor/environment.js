@@ -40,6 +40,7 @@ import * as Water from './water.js';
 import * as Structures from './structures.js';
 import * as Schedules from './schedules.js';
 import * as Biome from './biome.js';
+import * as BG from './biomegen.js';
 import * as WorldMap from './map.js';
 import * as Link from './envlink.js';
 
@@ -145,10 +146,15 @@ async function paintNav() {
   nav.append(el('h4', {}, 'Biomes'));
   const cur = Biome.currentName();
   for (const n of names) {
-    const eng = ['forest', 'meadow', 'pine', 'desert'].includes(n);
+    // The pill is the biome's packed id (its place in ENGINE_BIOMES). Every
+    // file is an engine biome; one missing from the list saves as index -1
+    // and the loader refuses to start, so that case is flagged, not hidden.
+    const id = BG.ENGINE_BIOMES.indexOf(n);
     const b = el('button', {'data-page': 'biome', 'data-name': n, class: (current === 'biome' && cur === n) ? 'on' : ''},
                  el('span', {}, n),
-                 el('span', {class: 'pill' + (eng ? ' eng' : '')}, eng ? 'engine' : 'authored'));
+                 el('span', {class: 'pill' + (id < 0 ? ' dirty' : ''),
+                             title: id < 0 ? 'not in ENGINE_BIOMES (biomegen.js): the engine will refuse this file' : 'packed biome id'},
+                    id < 0 ? 'no id' : '#' + id));
     b.addEventListener('click', () => openPage('biome', n));
     nav.append(b);
   }

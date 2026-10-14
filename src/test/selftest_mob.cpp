@@ -15750,6 +15750,16 @@ Status GateNetShield(Ctx& c, std::string& detail) {
     }
     c.mobs.ClearBlockEvents();
     for (int i = 0; i < 2; i++) step();
+    // C beat the guard open, and a lowered shield is no guard (2026-10-13):
+    // back up on A, and its kShieldUp on B's ghost, before B's blow.
+    for (int i = 0; i < 60; i++) {
+      sm->SetShieldWant(true);
+      step();
+      ghost = far.FindMobById(subject);
+      if (sm->ShieldRaise() >= 1.0f && ghost != nullptr &&
+          ghost->ShieldUpForWatchers())
+        break;
+    }
     const uint64_t re0 = entA.Stats().gearReannounces;
     sm->ClearLostGear();
     std::vector<ParticleSpawn> sp;

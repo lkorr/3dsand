@@ -5617,6 +5617,33 @@ bool DebrisSystem::CutBody(uint64_t handle, const KerfCut& cut, World& world,
   // shell is on the living.
   const bool garment = WornHostOf(handle) != 0ull;
   slot.c = slot.c + slot.w * KerfEntry(slot, latScale, walk);
+  // A stab's bore is priced by what it meets (phys/kerf.h KerfStabDepth), as
+  // on the living (Mob::CutLimb); a strapped garment only keeps to the reach.
+  if (cut.stab) {
+    const float reach = cut.reach > 0.0f ? cut.reach : slot.depth;
+    if (!garment) {
+      const float ref = CurrentTuning().gear.cutHardnessRef;
+      auto costOf = [&](uint32_t m) {
+        const float h = m < matGpu_.size() ? (float)matGpu_[m].hardness : 0.0f;
+        return (h > 0.0f && ref > 0.0f) ? h / ref : 1.0f;
+      };
+      slot.depth = KerfStabDepth(slot, latScale, slot.depth, reach,
+                                 [&](auto&& probe) {
+        if (fine)
+          for (const PrefabVoxel& pv : b.skinVoxels) {
+            const uint32_t m = pv.material & 0xFFFu;
+            if (m) probe((float)pv.x, (float)pv.y, (float)pv.z, costOf(m));
+          }
+        else
+          for (const DebrisVoxel& dv : b.voxels) {
+            const uint32_t m = dv.payload & 0xFFFu;
+            if (m) probe((float)dv.x, (float)dv.y, (float)dv.z, costOf(m));
+          }
+      });
+    } else {
+      slot.depth = std::min(slot.depth, reach);
+    }
+  }
   // A stab is a hole, never a parting (phys/kerf.h KerfCut::stab).
   if (!garment && !cut.stab) {
     const float edgeHalf = cut.edgeHalf > 0.0f ? cut.edgeHalf : slot.halfL;
@@ -5664,10 +5691,12 @@ bool DebrisSystem::CutBody(uint64_t handle, const KerfCut& cut, World& world,
   // pass is a sphere test, and one sized to the depth is the volume the edge
   // actually disturbed.
   SpallParams spall;
+  // A stab's depth is what its bore paid for, not its budget.
+  const float spallDepth = cut.stab ? slot.depth : cut.depth;
   if (!slot.through && gt.cutSpallRounds > 0 && gt.cutSpallStrength > 0.0f &&
-      cut.depth > 0.0f) {
-    spall.centre = slot.c + slot.w * (cut.depth * 0.5f);   // scaled below
-    spall.radius = std::max(cut.depth, slot.halfW * 2.0f);
+      spallDepth > 0.0f) {
+    spall.centre = slot.c + slot.w * (spallDepth * 0.5f);   // scaled below
+    spall.radius = std::max(spallDepth, slot.halfW * 2.0f);
     spall.strength = std::clamp(gt.cutSpallStrength, 0.0f, 1.0f);
     spall.rounds = gt.cutSpallRounds;
     spall.seed = seed;

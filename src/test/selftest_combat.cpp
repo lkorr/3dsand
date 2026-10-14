@@ -1672,19 +1672,22 @@ Status GateShield(Ctx& c, std::string& detail) {
     if (s == nullptr || (!s->Active() && i > 4)) break;
   }
   const uint32_t flesh3 = FleshArtVoxels(c.mobs, defender);
-  // The lowered shield hangs at the side and may still catch the long blade
-  // on its way past (lowBlocks is reported, not asserted): the claim is that
-  // it no longer covers the chest, so the thrust LANDS.
+  // The lowered shield hangs at the side, where it used to catch the long
+  // blade on its way past and arrest the thrust (owner report 2026-10-13: a
+  // shield that is down is no guard). Down, it blocks nothing.
   check(flesh3 < flesh2,
         "D: lowered, the shield does not cover the chest and the thrust lands");
+  check(lowBlocks == 0, "D: ...and a lowered shield blocks nothing");
 
   // ---- E. COVERAGE IS THE LATTICE --------------------------------------------
   // Fabricated sweeps in the shield's own frame (world voxels from its min
   // corner; the face normal is local +X, the disc in YZ): a short edge driven
   // through the boards' thickness.
-  bool eSolid = false, eCorner = true, eHole = true;
+  bool eSolid = false, eCorner = true, eHole = true, eDown = true;
   if (dm != nullptr && am != nullptr && slot >= 0) {
     for (int i = 0; i < 4; i++) tick();   // the pose settles where it hangs
+    // Coverage is asked of a RAISED shield (a lowered one is no guard, which
+    // eDown below pins on the same sweep): up, then settled.
     auto sweepAt = [&](float y, float z0, float z1) {
       BodyTransform xf{};
       if (!c.phys.GetTransform(c.mobs.LimbBody(defender, slot), xf)) return false;
@@ -1701,6 +1704,16 @@ Status GateShield(Ctx& c, std::string& detail) {
     // micro size over its scale, the disc centred in Y/Z.
     const float sc = (float)std::max(1u, round->scale);
     const float cy = round->size.y * 0.5f / sc, cz = round->size.z * 0.5f / sc;
+    // Lowered, the same sweep through the boards is not a block.
+    eDown = sweepAt(cy + 1.5f, cz - 0.4f, cz + 0.4f);
+    for (int i = 0; i < 30 && dm->ShieldRaise() < 1.0f; i++) {
+      dm->SetShieldWant(true);
+      tick();
+    }
+    for (int i = 0; i < 4; i++) {   // the raised pose settles
+      dm->SetShieldWant(true);
+      tick();
+    }
     // Through the boards, 1.5 voxels off the boss (r 0.8).
     eSolid = sweepAt(cy + 1.5f, cz - 0.4f, cz + 0.4f);
     // The empty corner of the round shield's square box.
@@ -1716,6 +1729,7 @@ Status GateShield(Ctx& c, std::string& detail) {
       eHole = sweepAt(cy + 1.5f, cz - 0.4f, cz + 0.4f);
     }
   }
+  check(!eDown, "E: lowered, an edge through the boards is not blocked");
   check(eSolid, "E: an edge through the boards is blocked");
   check(!eCorner, "E: an edge through the empty corner of the box is not");
   check(!eHole, "E: an edge through a hole as wide as the blade is not");

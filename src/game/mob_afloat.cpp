@@ -49,6 +49,7 @@
 #include "game/ai_behavior.h"
 #include "game/mob.h"
 #include "game/mob_cellcache.h"
+#include "sim/currentprim.h"
 #include "sim/scale.h"
 #include "sim/tuning.h"
 #include "sim/world.h"
@@ -91,6 +92,17 @@ bool Engaged(ai::Intent it) {
 }
 
 }  // namespace
+
+// The horizontal water velocity at a floating walker's middle (vox/s), from
+// the sim-licensed current field. Read by DriveAfloat (the drift) and by the
+// pose (mob.cpp, which takes it back out so a drifting body treads).
+Vec3 AfloatCurrent(const Mob& mob, const MobDef& def) {
+  const Vec3 c = sandvox::CurrentAtCpuSim(
+      Vec3{mob.Origin().x + def.worldSize.x * 0.5f,
+           mob.Origin().y + def.worldSize.y * 0.5f,
+           mob.Origin().z + def.worldSize.z * 0.5f});
+  return Vec3{c.x, 0.0f, c.z};
+}
 
 bool MobSystem::CanSwimAfloat(const Mob& mob, const MobDef& def) const {
   // The tread is the family's anchor (pose.cpp gates the whole family on it).
@@ -215,6 +227,14 @@ void MobSystem::DriveAfloat(Mob& mob, const MobDef& def, World& world,
   if (mob.bedKnown_) wantY = std::max(wantY, mob.bedY_);
   wish.y = std::clamp((wantY - mob.origin_.y) * kDepthGain, -swimSpeed,
                       swimSpeed);
+  // THE RIVER CARRIES IT (2026-10-14), as it carries the player
+  // (Player::Update, THE CURRENT): the stroke is relative to the water, so
+  // the horizontal wish rides on the current at the body's middle and a
+  // swimmer with nowhere to go drifts at the river's speed. Only here, in the
+  // afloat drive: a walker with its feet on the bed holds against the flow.
+  // Horizontal only -- the float / dive height above owns the vertical. The
+  // SIM-licensed field, because this moves a body the tick owns.
+  wish = wish + AfloatCurrent(mob, def);
   const float blend = 1.0f - std::exp(-pt.liquidAccel * dt);
   mob.swimVel_ = mob.swimVel_ + (wish - mob.swimVel_) * blend;
 

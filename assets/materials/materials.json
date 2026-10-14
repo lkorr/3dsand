@@ -5346,6 +5346,31 @@
       "molten": "fire"
     },
     {
+      "//": "SCAR TISSUE (owner, 2026-10-14: slow passive healing). What a living body grows its missing flesh and skin back as, and what its burnt tissue mends into, when no restorative coat is doing the healing (Mob::ScarTick; gore.scarMat names it). Pale, slightly glossy pink-white so an old wound reads on any skin. SOFTER than what it replaced -- hardness 4 against skin's 8, flesh's 6, muscle's 10 -- and that one field is the whole of 'a scar is a weak spot': a blade's kerf, a stab and an arrow's pierce cost all scale by the struck cell's hardness (phys/kerf.h, gear.cutHardnessRef), so they go deeper through it. Burns, rots and is eaten by venom like flesh (reactions.json, soft_tissue tag). `rubble: blood` keeps it in MobDef::tissue, so a cut through a scar is a wound and it scars again. A restorative coat mends it back to the recipe's own tissue (Mob::HealLimbStep): magic erases scars, time does not.",
+      "//id": "INSERTED after `necrotic` (224), for heart's reason: a body material must be <= 255 (a micro brick packs 8 bits of material) and the table's end is past that. Everything after this row moved up one; nothing stores those ids (saves remap by NAME; harrowby's id-baked ground.svedit tops out at 221). Never painted into a .vox: only the passive heal writes it.",
+      "id": "scar",
+      "electric": {"resist": 12, "ignite": {"into": "flesh_cooked", "chance": 120}, "char": "flesh_charred", "shock": 1000},
+      "class": "solid",
+      "density": 1000,
+      "hardness": 4,
+      "rubble": "blood",
+      "bleed": 0.6,
+      "woundHp": 1,
+      "colors": [
+        "#e8bfae",
+        "#dfb2a2",
+        "#f0cbbb"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "soft_tissue"
+      ],
+      "far": "flesh",
+      "molten": "fire"
+    },
+    {
       "//": "MAP V2 R1. PACKED EARTH: a road's or a lane's beaten surface -- dirt trodden and rolled until it holds its shape. A SOLID on purpose: a road is graded, and a graded road is a slope, so a powder surface (dirt, gravel: repose 40) would slide off the first cut it is laid on and the chunk would never sleep (CLAUDE.md rule 2). Dirt's colours, a shade darker and flatter. Laid by worldgen only, from map.json roads[] (worldgen.wgsl roadColAt); a dug or blasted cell crumbles back to dirt.",
       "id": "packed_earth",
       "arcane": 1,
