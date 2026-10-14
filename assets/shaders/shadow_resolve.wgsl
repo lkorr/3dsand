@@ -216,10 +216,12 @@ fn farUnderTerrain(ro : vec3f, rd : vec3f, t : f32) -> bool {
   return false;
 }
 
-// raymarch.wgsl farShadowBlocked: MATERIAL cells only, never the blocker flag.
+// raymarch.wgsl farShadowBlocked: MATERIAL cells only, never the blocker flag,
+// and only a ray-blocking material (media-blind: clear water is no caster).
 fn farShadowBlocked(level : u32, c : vec3<i32>) -> bool {
   let bi = farVoxByteIndex(level, c);
-  return farCellSlot((farVox[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu) != 0u;
+  let slot = farCellSlot((farVox[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu);
+  return slot != 0u && isRayBlocker(materials[farPalMat(&materials, slot)]);
 }
 // raymarch.wgsl shadowWindowExitT.
 fn shadowWindowExitT(ro : vec3f, rd : vec3f) -> f32 {
@@ -609,11 +611,22 @@ const FAR_GI_W_RING : f32 = 0.09375;
 const FAR_GI_OMEGA_NORMAL : f32 = 0.8418;
 const FAR_GI_OMEGA_RING : f32 = 0.6802;
 // The burial weight of a point (raymarch.wgsl farHitBuried, verbatim: the
-// column one sub-column out along `n`, FAR_BURIED_LO..HI fine voxels under its
-// terrain top). -1 = no column.
+// ground in front of the face -- farFrontTop, the LOWEST of the four
+// sub-column tops of the level cell half a sub-column out along `n` --
+// FAR_BURIED_LO..HI fine voxels over the point; raymarch.wgsl farFrontTop says
+// why it is not one column). -1 = no column.
+fn farFrontTop(level : u32, p : vec3f, n : vec3f) -> f32 {
+  let w = f32(1u << (farCellShift(level) - 1u));
+  let q = p + n * (0.5 * w);
+  let c = vec2<i32>(floor(vec2f(q.x, q.z) / w)) >> vec2<u32>(1u);
+  let b = farBox(level);
+  if (any(c < b.lo.xz) || any(c >= b.hi.xz)) { return -1e9; }
+  let e = farMap[farMapCell(level, c)];
+  return f32(min(min(farMapTop(e.x), farMapTop(e.y)), min(farMapTop(e.z), farMapTop(e.w))) + 1);
+}
 fn farBuriedW(level : u32, p : vec3f, n : vec3f) -> f32 {
   let w = f32(1u << (farCellShift(level) - 1u));
-  let top = farColumnTop(level, p + n * w);
+  let top = farFrontTop(level, p, n);
   if (top < -1e8) { return -1.0; }
   return smoothstep(24.0 + 2.0 * w, 48.0 + 2.0 * w, top - p.y);
 }
@@ -773,7 +786,17 @@ fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
     // by the face's openness (shadowLiftCap), which burial takes to exactly 0,
     // and raymarch.wgsl does not even ask for a pixel there. Such a patch is
     // here for its indirect light (below), so it skips the march.
-    let bw = farBuriedW(level, hp, n3);
+    var bw = farBuriedW(level, hp, n3);
+    // A WET FACE IS NOT BURIED BY ITS WATER (raymarch.wgsl farWaterBed: the
+    // bed under far water reads its face's patch). The surface map's top over
+    // a lake or the sea is the water's, so burial took a bed 3 m down for a
+    // face 3 m under rock and skipped its sun; the near field's shadow and
+    // openness rays pass clear water (media-blind), and so does the march.
+    let front = farGiMat(level, cell + vec3<i32>(n3), box);
+    if (front != 0u && materials[front].klass == CLASS_LIQUID &&
+        !isRayBlocker(materials[front])) {
+      bw = 0.0;
+    }
     var sh = 0.0;
     valid = true;
     if (bw < 1.0) {
@@ -784,7 +807,16 @@ fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
         // A CLEAR RAY UNDER THE TERRAIN IS NOT SUNLIT (above).
         sh = shadowFromOpaqueHit(true, TUNE_FAR_SHADOW_REACH / VOXEL_METERS, 0u);
       }
-      valid = !(r.x >= 0.0 && r.x < 0.01);
+      // A BLOCKER AT CONTACT IS A SHADOW, NOT "NO OPINION" (2026-10-14,
+      // ticket 2026-10-14_00-52-22). This used to publish the slot INVALID
+      // when the ray met a cell within 0.01 voxels of its start, after the
+      // near patch's burial rule. But a far pixel reads ONE patch, with
+      // nothing to renormalise onto, and a patch with no opinion shades as
+      // full sun: every far face whose start point sat in a neighbouring
+      // cell -- the inside faces of a distant canopy, mostly -- was lit,
+      // permanently: ~900 px of a still frame at the ticket camera, lit
+      // specks over every far tree. The cache-off reference (raymarch.wgsl's farShadowMarch
+      // branch) has no such rule and answers a contact shadow; so does this.
     }
     valU = u32(clamp(sh, 0.0, 1.0) * 255.0 + 0.5);
     // THE FAR PATCH'S INDIRECT LIGHT (above): buried patches' gather, and an

@@ -1052,15 +1052,19 @@ fn fogSkyK() -> f32 { return max(eyeSkyK(), gHitSky); }
 // and means of whichever frame this is): 12 = the sun shadow's stages
 // (gDbgSh): raw, after the LOD lift, after the lift cap; 13 = a far pixel's
 // shadow-cache patch: no opinion (1), its value, 0.5. NEAR SHADOW CACHE
-// (2026-10-13, ticket 2026-10-13_09-55-24): 14 = a near cache pixel's taps --
-// no opinion at all (1: the pixel shades as full sun), the raw cached value,
-// and why a tap had none (1 = a slot found but not valid, 0.5 = no slot:
-// claimed this frame, set full or stolen); a FAR pixel's patch writes (no
-// opinion, value, 0.25). LOD BAND (2026-10-13, ticket 2026-10-12_16-36-34):
+// (2026-10-13, ticket 2026-10-13_09-55-24): 14 = a near cache pixel --
+// nothing answered (1: the pixel shades as full sun), the shadow value, and
+// how it was answered (0.5 its own taps, 0.75 a fallback probe, 1 nothing;
+// 2026-10-14, A MISS IS NOT SUN); a FAR pixel's patch writes (nothing
+// answered, value, 0.25). LOD BAND (2026-10-13, ticket 2026-10-12_16-36-34):
 // 15 = the final colour of the pixels whose surface (near or far) is 10-19 m
 // from the eye and black elsewhere, so two arms with the handoff at 20.5 and
 // at 8 m compare the SAME band as near and as far, colour for colour (a
 // material's pixel count per arm is how much of it the far field kept).
+// 16 = OPENNESS DEFINITION (2026-10-14, ticket 2026-10-09_14-23-01): the
+// shade's openness (near: the grid's byte; far: the cascade's), the near
+// walk's definition re-measured at the pixel on the window's voxels
+// (dbgNearOpenDef), 1 on an up face.
 // 0 = off and const-folded away.
 const SEAM_DBG : u32 = 0u;
 // SEAM_DBG 14: per-pixel tap verdicts of shadowSlotRead (valid, found but
@@ -6703,8 +6707,19 @@ fn farLevelForDist(distFine : f32) -> u32 {
 // a half-cell crest that the near field would not shadow either. The flag keeps
 // its other reader (traceFar's primary-hit path, behind
 // render.farBlockerHitLevel).
+//
+// AND MEDIA-BLIND, AS THE NEAR SHADOW RAY IS (2026-10-13, ticket
+// 2026-10-09_14-23-01, the sea seam): a material cell blocks the sun only if
+// its material is a ray blocker (common.wgsl isRayBlocker -- traceOpaque's own
+// class), so clear water is not a caster. Until then every far cell of water
+// was opaque to the sun, which nothing saw only because no far face UNDER water
+// asked: the bed under far water was lit by a closed form with no shadow at
+// all (farWaterBed). It asks now, and a bed patch's ray starts in the water.
+// Air (slot 0) costs no table read; a solid one dependent pair, once, on the
+// cell that ends the march.
 fn farShadowBlocked(level : u32, vc : vec3<i32>) -> bool {
-  return farPalAt(level, vc) != 0u;
+  let slot = farPalAt(level, vc);
+  return slot != 0u && isRayBlocker(materials[farPalMat(&materials, slot)]);
 }
 
 // Where a ray from `ro` (fine voxels) leaves the residency window, in fine
@@ -7025,8 +7040,9 @@ fn farScPackCell(c : vec3<i32>, face : u32) -> u32 {
          (face << (FAR_SC_AXIS_BITS * 3u));
 }
 // The cached far shadow for the pixel at `hitP` (fine voxels) on face
-// (axis, sgn) of cell `cell` of `level`: its nearest patch's value, or 1 (lit)
-// while the patch has no opinion (its first frame on screen).
+// (axis, sgn) of cell `cell` of `level`: its nearest patch's value; while that
+// patch has no opinion (its first frame on screen), what farShadowFallback
+// finds for the same ground, and 1 (lit) only if that is nothing too.
 fn farShadowCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
                    refined : bool, hitP : vec3f) -> f32 {
   rsAdd(RS_SC_TAPS, 1u);
@@ -7039,10 +7055,58 @@ fn farShadowCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
   let iy = u32(min(floor(axisPick(f, i32(tg.y)) * m), m - 1.0));
   let sub = shadowPackSub(ix, iy) | select(0u, FAR_SC_REFINED, refined) | FAR_SC_FLAG |
             ((level - 1u) << FAR_SC_LEVEL_SHIFT);
-  let r = farSlotRead(farScPackCell(cell, face), sub, R.frameIdx & 15u);
+  let pcell = farScPackCell(cell, face);
+  var r = farSlotRead(pcell, sub, R.frameIdx & 15u);
   if (SEAM_DBG == 13u) { gDbgSh = vec3f(select(1.0, 0.0, r.y > 0.0), r.x, 0.5); }
+  // A MISS IS NOT SUN here either (shadowCached, 2026-10-14): a far patch with
+  // no opinion -- its first frame on screen, which every level boundary and
+  // the near/far handoff hand to a moving camera on a ring round it -- asks
+  // the answers the cache already holds for the same ground instead.
+  if (r.y <= 0.0) { r = farShadowFallback(level, cell, face, refined, hitP, pcell, sub); }
   if (SEAM_DBG == 14u) { gDbg = vec4f(select(1.0, 0.0, r.y > 0.0), r.x, 0.25, 1.0); }
   return select(1.0, r.x, r.y > 0.0);
+}
+
+// farShadowCached's miss, in order: the same patch under the other refinement
+// (a cell's refinement can flip between frames); the same face of the four
+// in-plane neighbour cells (a face sliding out from behind a nearer one -- a
+// distant canopy's leaves under parallax -- has a visible neighbour); the
+// level ABOVE at this point (ground coming toward the eye crosses from a
+// coarse level into a finer one, and the coarse patch is the one it was read
+// through last frame); the level BELOW (going away, the reverse); and at
+// level 1 the near cache's patch at the fine cell (ground crossing the
+// handoff outward was a near pixel last frame), at the coarsest pool patch
+// every near read of that face keeps warm. Read-only probes, (value, 1) or
+// (0, 0).
+fn farShadowFallback(level : u32, cell : vec3<i32>, face : u32, refined : bool,
+                     hitP : vec3f, pcell : u32, sub : u32) -> vec2f {
+  var r = shadowPeek(pcell, sub ^ FAR_SC_REFINED);
+  if (r.y > 0.0) { return r; }
+  let tg = shadowFaceTangents(face);
+  let ta = axisVecI(i32(tg.x), 1);
+  let tb = axisVecI(i32(tg.y), 1);
+  for (var k = 0u; k < 4u; k++) {
+    let c = cell + select(tb, ta, k < 2u) * select(1, -1, (k & 1u) != 0u);
+    r = shadowPeek(farScPackCell(c, face), sub);
+    if (r.y > 0.0) { return r; }
+  }
+  if (level < FAR_LEVELS) {
+    r = farScPeekEither(farScPatchAt(level + 1u, hitP, face), refined);
+    if (r.y > 0.0) { return r; }
+  }
+  if (level > 1u) {
+    r = farScPeekEither(farScPatchAt(level - 1u, hitP, face), refined);
+    if (r.y > 0.0) { return r; }
+  } else {
+    let c = vec3<i32>(floor(hitP - shadowFaceNormal(face) * 0.25));
+    let rel = c - R.origin * i32(CHUNK);
+    if (all(rel >= vec3<i32>(0)) && all(rel < vec3<i32>(i32(WORLD_N)))) {
+      let subdiv = clamp(R.shadowSubdiv, 1u, SHADOW_SUBDIV_MAX);
+      let pc = shadowPoolPick(0u, shadowPoolMax(subdiv), subdiv);
+      r = shadowPeek(shadowPackCell(c, face), shadowPackSub(pc, pc));
+    }
+  }
+  return r;
 }
 
 // The far patch's measured indirect light (shadow_resolve.wgsl THE FAR PATCH'S
@@ -7078,9 +7142,10 @@ fn farGiCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
   let curFrame = R.frameIdx & 15u;
   let fp = shadowFindPlain(key, ver, shadowSetOf(key));
   if (fp.x == 0xFFFFFFFFu) {
-    // Not found: claim and request it (shadowSlotRead's path), none this frame.
+    // Not found: claim and request it (shadowSlotRead's path); this frame
+    // borrows what the cache holds for the same ground (farGiFallback).
     _ = shadowSlotRead(packedCell, sub, curFrame);
-    return 0u;
+    return farGiFallback(level, face, refined, hitP, perFace, packedCell, sub);
   }
   // farSlotRead's registration, verbatim: re-requested on its refresh phase
   // (the sun's share of its light moves) or while unresolved, and kept LIVE.
@@ -7093,8 +7158,36 @@ fn farGiCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
                         shadowStateValid(state), ver));
     if (r.exchanged) { shadowAppendRequest(key, fp.x, packedCell, sub); }
   }
-  if (!shadowStateValid(state)) { return 0u; }
+  if (!shadowStateValid(state)) {
+    return farGiFallback(level, face, refined, hitP, perFace, packedCell, sub);
+  }
   return shadowHistRO[fp.x];
+}
+
+// farGiCached's miss: the patch's first frame on screen, which a level ring
+// or a refinement flip hands a moving camera every frame. Nothing published
+// used to mean "no indirect light" (a buried face one frame darker, an open
+// riser one frame without its foreground term): a speckle of the same kind
+// as the sun's (A MISS IS NOT SUN, shadowCached). So it borrows the word the
+// cache holds for the same ground -- the other refinement, then the level
+// above and below -- by read-only probes, and only a patch with none of them
+// is still 0 for its one frame.
+fn farGiFallback(level : u32, face : u32, refined : bool, hitP : vec3f,
+                 perFace : bool, packedCell : u32, sub : u32) -> u32 {
+  var slot = shadowPeekSlot(packedCell, sub ^ FAR_SC_REFINED);
+  for (var k = 0u; k < 2u && slot == 0xFFFFFFFFu; k++) {
+    let lv = select(level - 1u, level + 1u, k == 0u);
+    if (lv < 1u || lv > FAR_LEVELS) { continue; }
+    let pk = farScPatchAt(lv, hitP, face);
+    // perFace reads sub-patch (0, 0): the six sub-index bits cleared.
+    let ps = select(pk.y, pk.y & ~0x3Fu, perFace);
+    slot = shadowPeekSlot(pk.x, ps | select(0u, FAR_SC_REFINED, refined));
+    if (slot == 0xFFFFFFFFu) {
+      slot = shadowPeekSlot(pk.x, ps | select(FAR_SC_REFINED, 0u, refined));
+    }
+  }
+  if (slot == 0xFFFFFFFFu) { return 0u; }
+  return shadowHistRO[slot];
 }
 
 // ---- far-field ambient occlusion: voxelAO's rule over cascade cells ----------
@@ -8776,7 +8869,7 @@ fn shadowAppendRequest(key : u32, slot : u32, packedCell : u32, packedSub : u32)
 // what keeps the ramp continuous across voxel boundaries; a neighbour that is
 // buried resolves to a contact-dark patch, which is the right answer for the
 // floor-meets-wall seam. Taps with no opinion drop out and the rest
-// renormalise; only a pixel with NO resolved neighbour shades fully lit.
+// renormalise; a pixel with NO resolved tap asks shadowCachedFallback.
 //
 // BUT ONLY WHERE A PATCH IS AT LEAST A PIXEL WIDE. Over most of an overlook
 // frame a 2.5 cm patch is SUB-pixel, and there the four taps of adjacent pixels
@@ -8787,11 +8880,24 @@ fn shadowAppendRequest(key : u32, slot : u32, packedCell : u32, packedSub : u32)
 // single nearest tap — same request count as before filtering existed — and
 // the blend switches on exactly where its cost buys something visible.
 // `camDistFine` is the receiver's camera distance in fine voxels (h.t).
-// A MISS RETURNS 1.0 (lit), which is the cache's documented one-frame cost: a
-// patch nobody has requested yet renders unshadowed until the resolve pass
-// fills it in next frame, and a one-frame bright edge on a newly visible
-// surface is invisible in motion outdoors. It was NOT invisible where patches
-// are sub-pixel — see SUB-PIXEL PATCHES ARE POOLED below.
+// A MISS IS NOT SUN (2026-10-14, ticket 2026-10-14_00-52-22: "tons of
+// bisecting circles of lines of light that run through shadows everywhere as I
+// run around"). A pixel whose taps have no opinion -- a patch nobody had read
+// before this frame, which the resolve pass only answers NEXT frame -- used to
+// shade as full sun. The defence was that a one-frame bright edge on a newly
+// visible surface is invisible in motion. It is not when the new patches lie
+// on a CURVE: every LOD boundary of this reader (nearest/bilinear, each pool
+// step) is a curve of constant projected patch size round the camera, and
+// translation drags each one across the ground, so a moving camera painted a
+// fresh 1 px arc of full sun through every shadow on every frame. Two parts:
+// the pool steps are nested (SUB-PIXEL PATCHES ARE POOLED, below) so most
+// boundary crossings are no longer misses at all, and what does miss asks
+// shadowCachedFallback -- the same face's coarser pool patches, then the
+// neighbour cells', then the far cascade's patch -- with plain read-only
+// probes of answers the cache already holds. Only a surface with none of
+// those (true disocclusion, or the first frame) still shades lit for a frame.
+// The --at harness could not see any of this until the same day: its picture
+// re-ran the resolve before re-rendering (main.cpp g_shotAsPresented).
 //
 // INDOORS IT WAS NOT INVISIBLE, and the fix is NOT here. `shadowLiftCap` used
 // to pass v = 1 through untouched, so a miss inside a sealed cave shaded with
@@ -8819,6 +8925,117 @@ const SHADOW_NEAREST_PX : f32 = 4.0;
 // Below this patch width the nearest read pools patches (SUB-PIXEL PATCHES ARE
 // POOLED, in the function). 1.5 so a pooled patch lands at 1.5-3 px.
 const SHADOW_POOL_PX : f32 = 1.5;
+
+// ---- NESTED POOL STEPS (THE POOLED PATCHES ARE NESTED, in shadowCached) ----
+// A step-s block (s a power of two) reads sub-patch
+// `(n & ~(s - 1)) | (SHADOW_POOL_PICK & (s - 1))`: the same low-bit pattern at
+// every step, so the patch a step reads is in the set every finer step reads.
+// 0b0101... alternates the side of the block centre a step lands on, keeping
+// each pick within s/4 of the centre (steps 2/4/8 read 1/1/5; the centred
+// picks they replace were 1/2/4).
+const SHADOW_POOL_PICK : u32 = 0x55u;
+// The coarsest step: the largest power of two in the face's subdivision, so
+// a non-power-of-two `shadowCacheSubdiv` still pools by nested powers of two
+// (its last partial block clamps to the face's last patch).
+fn shadowPoolMax(subdiv : u32) -> u32 { return 1u << firstLeadingBit(max(subdiv, 1u)); }
+// The step that makes a patch `px` pixels wide on screen at least
+// SHADOW_POOL_PX wide.
+fn shadowPoolStep(px : f32, subdiv : u32) -> u32 {
+  let s = exp2(ceil(log2(max(SHADOW_POOL_PX / max(px, 1e-6), 1.0))));
+  return min(u32(min(s, 256.0)), shadowPoolMax(subdiv));
+}
+fn shadowPoolPick(n : u32, s : u32, subdiv : u32) -> u32 {
+  return min((n & ~(s - 1u)) | (SHADOW_POOL_PICK & (s - 1u)), subdiv - 1u);
+}
+
+// A READ-ONLY PROBE: the published answer of a patch the cache already holds,
+// (value, 1), or (0, 0). No claim, no registration, no request -- the plain
+// view alone (THE FIND IS A PLAIN LOAD, above), so a fallback can ask several
+// patches without making any of them live or costing the resolve a ray.
+fn shadowPeek(packedCell : u32, packedSub : u32) -> vec2f {
+  let key = shadowPatchKey(packedCell, packedSub);
+  let f = shadowFindPlain(key, shadowPatchVerifier(packedCell, packedSub), shadowSetOf(key));
+  if (f.x == 0xFFFFFFFFu || !shadowStateValid(f.y)) { return vec2f(0.0); }
+  return vec2f(shadowStateValue(f.y), 1.0);
+}
+// The same probe's slot, for a reader of the slot's shadowHist word
+// (farGiFallback); 0xFFFFFFFF if the patch has no published answer.
+fn shadowPeekSlot(packedCell : u32, packedSub : u32) -> u32 {
+  let key = shadowPatchKey(packedCell, packedSub);
+  let f = shadowFindPlain(key, shadowPatchVerifier(packedCell, packedSub), shadowSetOf(key));
+  return select(0xFFFFFFFFu, f.x, f.x != 0xFFFFFFFFu && shadowStateValid(f.y));
+}
+
+// The far cache's level-`level` patch under fine-voxel point `p` on `face`:
+// (packedCell, packedSub without the refined bit). farShadowCached keys its
+// own reads through this, so a probe from anywhere names the same patch.
+fn farScPatchAt(level : u32, p : vec3f, face : u32) -> vec2<u32> {
+  let s = f32(1u << farCellShift(level));
+  // A quarter voxel INTO the surface: a hit on a cell's face lies exactly on
+  // the boundary with the empty cell beyond it, and floor() alone would name
+  // that one.
+  let q = (p - shadowFaceNormal(face) * 0.25) / s;
+  let c = vec3<i32>(floor(q));
+  let tg = shadowFaceTangents(face);
+  let f = clamp(q - vec3f(c), vec3f(0.0), vec3f(1.0));
+  let m = f32(FAR_SC_SUBDIV);
+  let ix = u32(min(floor(axisPick(f, i32(tg.x)) * m), m - 1.0));
+  let iy = u32(min(floor(axisPick(f, i32(tg.y)) * m), m - 1.0));
+  return vec2<u32>(farScPackCell(c, face),
+                   shadowPackSub(ix, iy) | FAR_SC_FLAG | ((level - 1u) << FAR_SC_LEVEL_SHIFT));
+}
+// Either refinement of a far patch: the refined bit is part of the key, and
+// a cell's refinement can change from one frame to the next.
+fn farScPeekEither(pk : vec2<u32>, refinedFirst : bool) -> vec2f {
+  let a = shadowPeek(pk.x, pk.y | select(0u, FAR_SC_REFINED, refinedFirst));
+  if (a.y > 0.0) { return a; }
+  return shadowPeek(pk.x, pk.y | select(FAR_SC_REFINED, 0u, refinedFirst));
+}
+
+// SEAM_DBG 14: how the pixel's shadow was answered -- 0 its own taps, 0.5 a
+// fallback probe, 1 nothing (the pixel shades as full sun).
+var<private> gDbgFb : f32 = 0.0;
+
+// What a near pixel with no opinion asks instead of shading as full sun, in
+// order of how likely each is to hold this pixel's answer:
+//  1. its own face's coarser pool patches. A pixel that stepped FINER this
+//     frame (the ground coming toward the eye across a pool boundary) needs a
+//     patch nobody read; the coarser one it read last frame is, by the nesting,
+//     one of these.
+//  2. the same face of the four in-plane neighbour cells, at their coarsest
+//     patch (which every pool step of theirs keeps warm): a surface sliding
+//     into view from behind an edge has a visible neighbour.
+//  3. the far cascade's level-1 patch at this point: ground crossing the
+//     near/far handoff toward the eye was a FAR pixel last frame.
+// Read-only probes all of them; the pixel's own patch was already claimed by
+// shadowSlotRead and answers for itself next frame.
+fn shadowCachedFallback(hp : vec3f, cell : vec3<i32>, face : u32, ta : vec3<i32>,
+                        tb : vec3<i32>, nU : u32, nV : u32, subdiv : u32,
+                        winLo : vec3<i32>) -> f32 {
+  let smax = shadowPoolMax(subdiv);
+  let own = shadowPackCell(cell, face);
+  for (var s = 2u; s <= smax; s = s * 2u) {
+    let r = shadowPeek(own, shadowPackSub(shadowPoolPick(nU, s, subdiv),
+                                          shadowPoolPick(nV, s, subdiv)));
+    if (r.y > 0.0) { if (SEAM_DBG == 14u) { gDbgFb = 0.5; } return r.x; }
+  }
+  let pc = shadowPoolPick(0u, smax, subdiv);
+  let coarse = shadowPackSub(pc, pc);
+  for (var k = 0u; k < 4u; k++) {
+    let c = cell + select(tb, ta, k < 2u) * select(1, -1, (k & 1u) != 0u);
+    let rel = c - winLo;
+    if (any(rel < vec3<i32>(0)) || any(rel >= vec3<i32>(i32(WORLD_N)))) { continue; }
+    let r = shadowPeek(shadowPackCell(c, face), coarse);
+    if (r.y > 0.0) { if (SEAM_DBG == 14u) { gDbgFb = 0.5; } return r.x; }
+  }
+  if (FAR_SHADOW_CACHE) {
+    let r = farScPeekEither(farScPatchAt(1u, hp, face), false);
+    if (r.y > 0.0) { if (SEAM_DBG == 14u) { gDbgFb = 0.5; } return r.x; }
+  }
+  if (SEAM_DBG == 14u) { gDbgFb = 1.0; }
+  return 1.0;
+}
+
 fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
                 camDistFine : f32) -> f32 {
   rsAdd(RS_SC_TAPS, 1u);
@@ -8850,11 +9067,15 @@ fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
   // it, which only makes the staircase less visible, so face-on is the
   // conservative side.
   let patchPx = R.viewPx / (2.0 * R.tanHalfFov * m * max(camDistFine, 1.0));
+  // The patch the pixel is inside: the nearest read's tap, and where
+  // shadowCachedFallback starts climbing.
+  let nU = u32(min(floor(fu * m), m - 1.0));
+  let nV = u32(min(floor(fv * m), m - 1.0));
   if (patchPx < SHADOW_NEAREST_PX) {
     // Nearest: an integer coordinate makes the +1 taps' weights exactly zero,
     // and the loop below skips them.
-    u = min(floor(fu * m), m - 1.0);
-    v = min(floor(fv * m), m - 1.0);
+    u = f32(nU);
+    v = f32(nV);
     // ---- SUB-PIXEL PATCHES ARE POOLED (owner report 2026-10-08) ----
     // Where a patch is narrower than SHADOW_POOL_PX, adjacent pixels land on
     // DIFFERENT patches and most of a face's patches are sampled by nobody in
@@ -8864,13 +9085,15 @@ fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
     // SPARKLED while the camera moved (bug_reports/2026-10-08_19-45-11).
     // So the patch grid is coarsened in powers of two until a patch is about
     // a pixel wide, and every pixel of the coarse block reads ONE fine patch
-    // inside it (index `step * k + step / 2`, a real sub-patch, so the key,
+    // inside it (shadowPoolPick: a real sub-patch, so the key,
     // the request and the resolve are unchanged). A newly sampled patch is
     // then as rare as a newly visible pixel-sized piece of surface. What it
     // costs: a shadow edge here is quantised to 1.5-3 px instead of < 1 px,
     // and it REMOVES requests rather than adding any. A few ALU ops on
     // purpose: an 8-neighbour slot-peek on a miss was tried first and the
-    // next run sat in this file's driver compile for 40+ minutes.
+    // next run sat in this file's driver compile for 40+ minutes. (The miss
+    // fallback that exists now, shadowCachedFallback, probes through the
+    // plain-load find only -- no atomics, no claim loop.)
     //
     // PER AXIS AND FORESHORTENED, which is the opposite of `patchPx`'s
     // "face-on is conservative": for pooling it is the anti-conservative
@@ -8883,10 +9106,22 @@ fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
     let dv = dot(vec3f(tb), vd);
     let pxU = patchPx * sqrt(max(1.0 - du * du, 0.0));
     let pxV = patchPx * sqrt(max(1.0 - dv * dv, 0.0));
-    let stepU = min(exp2(ceil(log2(max(SHADOW_POOL_PX / max(pxU, 1e-6), 1.0)))), m);
-    let stepV = min(exp2(ceil(log2(max(SHADOW_POOL_PX / max(pxV, 1e-6), 1.0)))), m);
-    u = min(floor(u / stepU) * stepU + floor(stepU * 0.5), m - 1.0);
-    v = min(floor(v / stepV) * stepV + floor(stepV * 0.5), m - 1.0);
+    //
+    // THE POOLED PATCHES ARE NESTED (2026-10-14, ticket 2026-10-14_00-52-22):
+    // the patch a step-s block reads is also a patch every finer step reads.
+    // It used to be the block's centre, `s*k + s/2`, and those sets are
+    // DISJOINT from one step to the next ({1,3} at step 2, {2} at step 4), so
+    // wherever ground crossed a step boundary -- a curve round the camera that
+    // translation drags across the ground -- every pixel on it needed a patch
+    // nobody had read: a one-frame miss in BOTH directions of travel, a 1 px
+    // dotted arc of full sun through every shadow. shadowPoolPick keeps one
+    // fixed low-bit pattern at every step, so stepping coarser always lands on
+    // a patch the finer step was already keeping warm, and stepping finer has
+    // the coarser patch to fall back on (shadowCachedFallback).
+    let stepU = shadowPoolStep(pxU, subdiv);
+    let stepV = shadowPoolStep(pxV, subdiv);
+    u = f32(shadowPoolPick(u32(u), stepU, subdiv));
+    v = f32(shadowPoolPick(u32(v), stepV, subdiv));
   }
   let i0 = i32(floor(u));
   let j0 = i32(floor(v));
@@ -8917,7 +9152,8 @@ fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
     acc += r.x * r.y * w;
     wsum += r.y * w;
   }
-  return select(1.0, acc / wsum, wsum > 1e-4);
+  if (wsum > 1e-4) { return acc / wsum; }
+  return shadowCachedFallback(hp, cell, face, ta, tb, nU, nV, subdiv, winLo);
 }
 
 // ============================================================================
@@ -9291,23 +9527,39 @@ fn rippleCurvature(cp : vec2f, t : f32, e : f32, footM : f32) -> f32 {
 //
 // This is what makes a settling / flowing / wavy body of water read as a
 // surface with shape rather than as a staircase, and it costs 4 taps.
-fn liquidFullnessAt(c : vec3<i32>, mat : u32) -> f32 {
+//
+// ANY LIQUID IS THE SAME SURFACE (ticket 2026-10-13 20:56:51, "lye in a pool
+// has an outline like ice"). The SHAPE of a liquid's top is the interface
+// between liquid and whatever is not liquid; which liquid sits in the next
+// column over does not move that interface. This used to read "is this cell
+// MY material", so where lye met water each side saw the other as a cliff of
+// air at its own level: the column gradient across the seam was a whole
+// cell-height, the normal tilted ~55 degrees over it, the far rim of the patch
+// went grazing and its Fresnel to ~1, and a one-cell staircase of white sky
+// traced every boundary between two liquids -- lye in water, blood in water,
+// brine against fresh, a potion poured into a pond. Every surface-SHAPE probe
+// (this column, waterDepthM, waterOpenness, the viscous density field) now
+// reads any liquid; what each liquid LOOKS like is still its own material's
+// (optics, palette, the slick's sheen), so an immiscible pair such as oil on
+// water stays legible by colour, not by a fake crease at its edge.
+fn liquidFullnessAt(c : vec3<i32>) -> f32 {
   if (!inBounds(c)) { return 0.0; }
   let w = voxWordAt(c);
-  if (voxMat(w) != mat) { return 0.0; }
+  let m = voxMat(w);
+  if (m == MAT_AIR || materials[m].klass != CLASS_LIQUID) { return 0.0; }
   return f32(voxState(w) + 1u) / 8.0;
 }
 
 // Surface height (in voxels, relative to the cell floor) of the liquid column
 // at XZ: full cells below stack, and the topmost partial cell adds its
 // fullness. Sampling the column rather than one cell is what lets the gradient
-// see a slope of more than one cell.
-fn liquidColumn(c : vec3<i32>, mat : u32) -> f32 {
+// see a slope of more than one cell. Any liquid (liquidFullnessAt).
+fn liquidColumn(c : vec3<i32>) -> f32 {
   // Walk up from the sample cell while cells stay full; the first non-full
   // cell contributes its fraction and ends the column.
   var h = 0.0;
   for (var i = 0; i < 3; i++) {
-    let f = liquidFullnessAt(c + vec3<i32>(0, i, 0), mat);
+    let f = liquidFullnessAt(c + vec3<i32>(0, i, 0));
     h += f;
     if (f < 0.999) { break; }
   }
@@ -9327,11 +9579,11 @@ fn liquidColumn(c : vec3<i32>, mat : u32) -> f32 {
 // Resolution near the surface is what the shore fade and the shoaling gain are
 // sensitive to; resolution at 2 m is not, because tanh has already saturated.
 // A linear 26-tap probe would spend 18 extra taps buying nothing.
-fn waterDepthM(cell : vec3<i32>, mat : u32) -> f32 {
+fn waterDepthM(cell : vec3<i32>) -> f32 {
   var d = 0;
   var step = 1;
   for (var i = 0; i < 8; i++) {
-    if (liquidFullnessAt(cell - vec3<i32>(0, d + step, 0), mat) <= 0.0) {
+    if (liquidFullnessAt(cell - vec3<i32>(0, d + step, 0)) <= 0.0) {
       break;
     }
     d += step;
@@ -9360,7 +9612,7 @@ fn waterDepthM(cell : vec3<i32>, mat : u32) -> f32 {
 // otherwise go glassy and dead.
 //
 // 12 taps on a 2-voxel spacing, primary up-facing water hits only.
-fn waterOpenness(cell : vec3<i32>, mat : u32) -> f32 {
+fn waterOpenness(cell : vec3<i32>) -> f32 {
   var n = 0.0;
   for (var i = 0; i < 12; i++) {
     // Two rings at 2 and 4 voxels: the inner one separates a droplet from a
@@ -9369,7 +9621,7 @@ fn waterOpenness(cell : vec3<i32>, mat : u32) -> f32 {
     let a = f32(i % 6) * 1.0472;   // 60 degrees apart
     let o = vec3<i32>(i32(round(cos(a) * f32(ring))), 0,
                       i32(round(sin(a) * f32(ring))));
-    if (liquidColumn(cell + o, mat) > 0.05) { n += 1.0; }
+    if (liquidColumn(cell + o) > 0.05) { n += 1.0; }
   }
   return smoothstep(TUNE_WATER_FETCH_LOW, TUNE_WATER_FETCH_HIGH, n / 12.0);
 }
@@ -9605,10 +9857,10 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
 
   // Central differences of the column height across X and Z. dh/dx in voxels
   // per voxel is already a slope, so the normal is (-dh/dx, 1, -dh/dz).
-  let hx0 = liquidColumn(cell + vec3<i32>(-1, 0, 0), mat);
-  let hx1 = liquidColumn(cell + vec3<i32>( 1, 0, 0), mat);
-  let hz0 = liquidColumn(cell + vec3<i32>(0, 0, -1), mat);
-  let hz1 = liquidColumn(cell + vec3<i32>(0, 0,  1), mat);
+  let hx0 = liquidColumn(cell + vec3<i32>(-1, 0, 0));
+  let hx1 = liquidColumn(cell + vec3<i32>( 1, 0, 0));
+  let hz0 = liquidColumn(cell + vec3<i32>(0, 0, -1));
+  let hz1 = liquidColumn(cell + vec3<i32>(0, 0,  1));
   let slope = vec2f((hx0 - hx1) * 0.5, (hz0 - hz1) * 0.5);
 
   // Ripples on top of the macro slope, in world metres (waterWaveNormal).
@@ -9644,7 +9896,7 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
     waveBase += rainRipples(vec2f(hitP.x, hitP.z) * VOXEL_METERS, R.time, rainA,
                          waterRippleFootprint(hitP));
   }
-  return waterWaveNormal(hitP, waveBase, waterDepthM(cell, mat), waterOpenness(cell, mat),
+  return waterWaveNormal(hitP, waveBase, waterDepthM(cell), waterOpenness(cell),
                          waveFluxAt(cell));
 }
 
@@ -11105,8 +11357,15 @@ fn solLookAt(cell : vec3<i32>, mat : u32) -> SolLook {
   // A value on a cell that is not a solvent of its species is mass a
   // destroyed solvent left behind (solCompact clears it at the end of the
   // tick): it is not in this liquid.
+  // The SOLVENT is the cell's own liquid, not the surface's: a ray entering a
+  // water surface and crossing into lye (or brine under fresh water) reads the
+  // lye cell's solute as lye's. `mat` stands in only where the cell holds no
+  // CA liquid (the MPM fluid path's column).
+  let cw = voxWordAt(cell);
+  let cm = voxMat(cw);
+  let sm = select(mat, cm, cm != MAT_AIR && materials[cm].klass == CLASS_LIQUID);
   if (s == 0u || mass == 0u || s > 24u ||
-      (solSpec[SOLS_MAT_BASE + (mat & 0xFFFu)] & (1u << (7u + s))) == 0u) { return o; }
+      (solSpec[SOLS_MAT_BASE + (sm & 0xFFFu)] & (1u << (7u + s))) == 0u) { return o; }
   let rb = SOLS_BASE + s * SOLS_STRIDE;
   var refc = max(solSpec[rb + 1u], 1u);
   // lookFull (solutes.json, bits 16..23 of the tintStrength word): the
@@ -11117,10 +11376,10 @@ fn solLookAt(cell : vec3<i32>, mat : u32) -> SolLook {
   let nc = min(solSpec[rb + 10u], 4u);
   for (var k = 0u; k < nc; k = k + 1u) {
     let row = solSpec[rb + 11u + k];
-    if ((row & 0xFFFu) == mat) { refc = max(min(refc, row >> 24u), 1u); }
+    if ((row & 0xFFFu) == sm) { refc = max(min(refc, row >> 24u), 1u); }
   }
   // Concentration = mass per full cell (mass x 8 / fullness), as the CA reads it.
-  let full = voxState(voxWordAt(cell)) + 1u;
+  let full = voxState(cw) + 1u;
   let c = min(f32(mass * 8u) / f32(full * refc), 1.0);
   let t = solSpec[rb + 6u];   // 0x00RRGGBB
   o.tint = vec3f(f32((t >> 16u) & 0xFFu), f32((t >> 8u) & 0xFFu), f32(t & 0xFFu)) / 255.0;
@@ -11436,7 +11695,7 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // The reflected lobe's width (waterReflBlur): the sub-pixel wave slopes
     // turn this mirror rough with distance, so the stars in the reflected
     // sky average out instead of landing one crisp pixel each on the lake.
-    let reflBlur = waterReflBlur(hitP, waterOpenness(cell, mat));
+    let reflBlur = waterReflBlur(hitP, waterOpenness(cell));
     if (fres > TUNE_REFLECTION_CUTOFF) {
       reflection = traceReflection(hitP, n, rd, reflBlur);
     } else {
@@ -11749,8 +12008,10 @@ fn filmBands(q : vec2f, cosI : f32) -> vec3f {
 // should crust, but a one-voxel-wide RUN of blood down a wall is precisely the
 // "moving" case this needs to catch. Vertical extent is the signal that tells a
 // wall trail (tall, thin, moving) from a floor pool (wide, flat, still), so it
-// has to be part of the measurement.
-fn bloodPooling(cell : vec3<i32>, mat : u32) -> f32 {
+// has to be part of the measurement. Any liquid counts toward the body (a
+// patch of blood on a lake is part of a still body, not a droplet), for the
+// same reason as liquidFullnessAt: only the liquid/air interface has a rim.
+fn bloodPooling(cell : vec3<i32>) -> f32 {
   var n = 0.0;
   var total = 0.0;
   // 2-voxel spacing over a 5^3-ish neighbourhood: wide enough that a pool
@@ -11762,7 +12023,7 @@ fn bloodPooling(cell : vec3<i32>, mat : u32) -> f32 {
         let c = cell + vec3<i32>(dx, dy, dz);
         if (!inBounds(c)) { continue; }
         if (occTotal(chunkOcc(c)) == 0u) { continue; }
-        if (voxMat(voxWordAt(c)) == mat) { n += 1.0; }
+        if (liquidFullnessAt(c) > 0.0) { n += 1.0; }
       }
     }
   }
@@ -11802,17 +12063,22 @@ fn bloodPooling(cell : vec3<i32>, mat : u32) -> f32 {
 // that is. So a droplet is a small blob of density in an empty field and comes
 // out spherical; a pool is a slab and comes out flat on top. Both fall out of
 // the same code with no special cases.
-fn liquidDensityAt(c : vec3<i32>, mat : u32) -> f32 {
-  if (!inBounds(c)) { return 0.0; }
-  let w = voxWordAt(c);
-  if (voxMat(w) != mat) { return 0.0; }
-  return f32(voxState(w) + 1u) / 8.0;
+//
+// ANY liquid counts (liquidFullnessAt; ticket 2026-10-13 20:56:51): the field
+// is the shape of the liquid/air interface, so blood or oil lying against
+// water is one continuous surface there, not a blob whose side bulges out
+// over the neighbouring liquid (which tilted its normal exactly as the
+// lye-on-water rim did). The SILHOUETTE feather in shadeViscous is the one
+// reader that keeps the per-material field (liquidMatFieldAt): it softens
+// where THIS liquid ends, which beside water is still an edge of colour.
+fn liquidDensityAt(c : vec3<i32>) -> f32 {
+  return liquidFullnessAt(c);
 }
 
 // Trilinearly-interpolated density at an arbitrary world point. Samples on the
 // lattice of cell CENTRES (hence the -0.5), so the field is smooth everywhere
 // rather than piecewise-constant per cell.
-fn liquidFieldAt(p : vec3f, mat : u32) -> f32 {
+fn liquidFieldAt(p : vec3f) -> f32 {
   let g = p - vec3f(0.5);
   let b = floor(g);
   let f = g - b;
@@ -11822,7 +12088,28 @@ fn liquidFieldAt(p : vec3f, mat : u32) -> f32 {
   for (var i = 0; i < 8; i++) {
     let o = vec3<i32>(i & 1, (i >> 1) & 1, (i >> 2) & 1);
     let wgt = mix(1.0 - f, f, vec3f(o));
-    acc += liquidDensityAt(c0 + o, mat) * wgt.x * wgt.y * wgt.z;
+    acc += liquidDensityAt(c0 + o) * wgt.x * wgt.y * wgt.z;
+  }
+  return acc;
+}
+
+// The same trilinear field over THIS material only: where the blob of `mat`
+// ends, whatever lies beyond it. For shadeViscous's silhouette feather only --
+// never for a normal (see liquidDensityAt).
+fn liquidMatFieldAt(p : vec3f, mat : u32) -> f32 {
+  let g = p - vec3f(0.5);
+  let b = floor(g);
+  let f = g - b;
+  let c0 = vec3<i32>(b);
+  var acc = 0.0;
+  for (var i = 0; i < 8; i++) {
+    let o = vec3<i32>(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+    let c = c0 + o;
+    if (!inBounds(c)) { continue; }
+    let w = voxWordAt(c);
+    if (voxMat(w) != mat) { continue; }
+    let wgt = mix(1.0 - f, f, vec3f(o));
+    acc += (f32(voxState(w) + 1u) / 8.0) * wgt.x * wgt.y * wgt.z;
   }
   return acc;
 }
@@ -11835,19 +12122,19 @@ fn liquidFieldAt(p : vec3f, mat : u32) -> f32 {
 // 6 field samples x 8 taps = 48 voxel reads. That is the real cost of this
 // function, and it is why it runs ONLY on the primary blood surface hit — not
 // in reflections, not in shadow rays, and not on any other material.
-fn liquidFieldNormal(p : vec3f, mat : u32, fallback : vec3f) -> vec3f {
+fn liquidFieldNormal(p : vec3f, fallback : vec3f) -> vec3f {
   // Sampling baseline in voxels. This is the smoothing control: at 1.0 the
   // gradient spans one cell either side, which removes the per-voxel faceting
   // while keeping a droplet's shape. Raising it smooths harder (a blobbier,
   // more merged surface) at the cost of small-detail shape; below ~0.5 the
   // samples fall inside a single cell and the cubes come back.
   let e = TUNE_BLOOD_SMOOTH;
-  let gx = liquidFieldAt(p + vec3f(e, 0.0, 0.0), mat) -
-           liquidFieldAt(p - vec3f(e, 0.0, 0.0), mat);
-  let gy = liquidFieldAt(p + vec3f(0.0, e, 0.0), mat) -
-           liquidFieldAt(p - vec3f(0.0, e, 0.0), mat);
-  let gz = liquidFieldAt(p + vec3f(0.0, 0.0, e), mat) -
-           liquidFieldAt(p - vec3f(0.0, 0.0, e), mat);
+  let gx = liquidFieldAt(p + vec3f(e, 0.0, 0.0)) -
+           liquidFieldAt(p - vec3f(e, 0.0, 0.0));
+  let gy = liquidFieldAt(p + vec3f(0.0, e, 0.0)) -
+           liquidFieldAt(p - vec3f(0.0, e, 0.0));
+  let gz = liquidFieldAt(p + vec3f(0.0, 0.0, e)) -
+           liquidFieldAt(p - vec3f(0.0, 0.0, e));
   // The gradient points INTO the liquid (density increases inward), so the
   // outward surface normal is its negation.
   let g = vec3f(-gx, -gy, -gz);
@@ -11872,7 +12159,7 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
                 sceneBehind : vec3f, tSurf : f32, underwater : bool) -> vec3f {
   let m = materials[mat];
   let upFacing = (axis == 1 && sgn < 0.0);
-  let pool = bloodPooling(cell, mat);
+  let pool = bloodPooling(cell);
   // 0 = blood-like, 1 = petroleum-like. Every oil-specific term below rides
   // this, so a liquid authored between the two blends rather than switching.
   let oily = oiliness(m);
@@ -11884,7 +12171,7 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // of the blood AROUND them, so neighbouring voxels agree on their normal and
   // the surface reads as continuous.
   let flat = axisVec(axis, -sgn);
-  var n = liquidFieldNormal(hitP, mat, flat);
+  var n = liquidFieldNormal(hitP, flat);
   // Blend back toward the face normal on big flat pools. A pool's interior has
   // a weak, noisy gradient (the field is saturated in every direction), and
   // letting that noise drive the normal makes a still puddle shimmer; its true
@@ -11916,9 +12203,8 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     let floatW = floatingOnLiquid(cell, mat);
     if (floatW > 0.01) {
       let wc = floatBedCell(cell, mat);
-      let wm = voxMat(voxWordAt(wc));
-      let wn = waterWaveNormal(hitP, vec2f(0.0), waterDepthM(wc, wm),
-                               waterOpenness(wc, wm), vec2f(0.0));
+      let wn = waterWaveNormal(hitP, vec2f(0.0), waterDepthM(wc),
+                               waterOpenness(wc), vec2f(0.0));
       filmSlope = -wn.xz / max(wn.y, 0.2) * (OIL_SLOSH_SLOPE * floatW * oily);
       n = normalize(n + vec3f(-filmSlope.x, 0.0, -filmSlope.y));
     }
@@ -12205,10 +12491,10 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // Narrowing the band to the true outer fringe keeps the anti-aliasing (the
   // silhouette is still soft, which is the point of the term) while leaving
   // the body of the blob opaque.
-  let edgeField = liquidFieldAt(hitP - rd * 0.35, mat);
+  let edgeField = liquidMatFieldAt(hitP - rd * 0.35, mat);
   // Peak the field can reach for this blob, floored so a full pool still uses
   // the authored feather rather than a vanishing one.
-  let peak = max(liquidFieldAt(hitP - rd * 1.1, mat), 0.35);
+  let peak = max(liquidMatFieldAt(hitP - rd * 1.1, mat), 0.35);
   let lo = TUNE_BLOOD_EDGE_FEATHER * peak;
   let band = mix(0.28, TUNE_OIL_EDGE_BAND, oily);
   let solid = smoothstep(lo, lo + band * peak, edgeField);
@@ -14306,7 +14592,41 @@ fn farWaterLiquidAt(level : u32, box : FarBox, p : vec3f, s : f32) -> u32 {
   if (materials[mat].klass == CLASS_LIQUID) { return 1u; }
   return 2u | (mat << 2u);
 }
-fn farWaterBed(level : u32, p : vec3f, rd : vec3f) -> FarBed {
+// The bed's sun is looked up only this far along the ray (THE BED'S SUN, below).
+const FAR_BED_SUN_MAX_M : f32 = 12.0;
+// THE BED IS SOAKED (2026-10-14, ticket 2026-10-09_14-23-01, the sea seam):
+// worldgen lays every solid / powder face that touches a staining liquid down
+// at the stain stainStep converges to (worldgen.wgsl WET BANKS, wetBankWord),
+// so the near bed under the sea is wet sand, ~12 % darker than the dry
+// palette mean the far bed took (measured at the shelf camera). The same
+// fixed point here, on the bed material's bare word, and applyStain's law at
+// its expected mottle (0.5: a far bed pixel spans many voxels' mottle).
+// `liq` = the water's material id (0: none known, the albedo unchanged).
+fn farSoakedAlbedo(albedo : vec3f, bedMat : u32, liq : u32) -> vec3f {
+  if (liq == 0u) { return albedo; }
+  let lm = materials[liq];
+  let bm = materials[bedMat];
+  if (lm.klass != CLASS_LIQUID || matStainType(lm) == 0u || matStainAmount(lm) == 0u) {
+    return albedo;
+  }
+  var w = bedMat;
+  for (var i = 0u; i < 16u; i++) {
+    let d = stainStep(matStainType(lm), matStainAmount(lm), matWashes(lm), w, bm);
+    if ((d.y & STAIN_WORK) == 0u) { break; }
+    w = d.x;
+  }
+  if (!voxStained(w)) { return albedo; }
+  let amt = f32(voxStainAmt(w)) / f32(STAIN_AMT_MAX);
+  let pal = materials[STAIN_PALETTE_BASE + voxStainType(w)];
+  let stainCol = unpackColor(pal.stainColor);
+  let opacity = f32((pal._r3 >> 22u) & 0xFFu) / 255.0;
+  let cover = clamp((amt * (1.0 + TUNE_STAIN_MOTTLE) - 0.5 * TUNE_STAIN_MOTTLE) *
+                    TUNE_STAIN_COVERAGE, 0.0, 1.0);
+  let shown = cover * opacity;
+  let soaked = albedo * mix(vec3f(1.0), stainCol * TUNE_STAIN_DARKEN, shown);
+  return mix(soaked, stainCol, shown * TUNE_STAIN_OPACITY);
+}
+fn farWaterBed(level : u32, p : vec3f, rd : vec3f, tEye : f32, liq : u32) -> FarBed {
   var r = farBedDeep();
   let s = f32(1u << farCellShift(level));
   let box = farBox(level);
@@ -14360,22 +14680,55 @@ fn farWaterBed(level : u32, p : vec3f, rd : vec3f) -> FarBed {
   // grazing ray through shallow water sees mostly the RISERS of the bed's
   // staircase (measured at the shelf camera: median raw Lambert 0.23, a side
   // face at noon), and an up-facing sunlit closed form drew them 4x brighter
-  // than the near bed. Not reproduced: the bed's cast and contact shadows
-  // (the near bed's median shadow there was 0.36) and its AO.
+  // than the near bed. Not reproduced: the bed's AO.
+  //
+  // The entry face is the LAST cell boundary the ray crossed into the bed
+  // cell (a DDA's entry face). It was "y if the bracket crossed a y boundary
+  // at all", which called a riser a tread whenever the bracket also clipped a
+  // row: 53 % of the shelf's shallow bed pixels read as treads far against
+  // 44 % near (now 37 %; the bracket is three bisections wide).
   let bm = materials[hitK >> 2u];
-  let d = vec3<i32>(floor((p + rd * t) / s)) - vec3<i32>(floor((p + rd * t0) / s));
-  var axis = 2;
-  if (d.y != 0) { axis = 1; } else if (d.x != 0) { axis = 0; }
-  let nb = axisVec(axis, -sign(axisPick(rd, axis)));
+  let ca = vec3<i32>(floor((p + rd * t0) / s));
+  let cb = vec3<i32>(floor((p + rd * t) / s));
+  // Per axis, where the ray crossed into cb's slab (-inf where it did not
+  // move on that axis); no dynamic vector index (the by-value register
+  // gotcha), so the three are spelled out.
+  let pl = select(vec3f(cb + vec3<i32>(1)) * s, vec3f(cb) * s, rd > vec3f(0.0));
+  let tc = select(vec3f(-1e30), (pl - p) / rd, ca != cb);
+  var axis = 1;
+  if (tc.x > tc.y && tc.x >= tc.z) { axis = 0; }
+  else if (tc.z > tc.y && tc.z > tc.x) { axis = 2; }
+  let rs = sign(axisPick(rd, axis));
+  let nb = axisVec(axis, -rs);
   var face = 1.0;
   if (axis == 0) { face = TUNE_FACE_X; } else if (axis == 2) { face = TUNE_FACE_Z; }
   let ob = farOpenness(nb);
-  let albedo = paletteMean(bm);
-  r.lit = albedo * face *
-          (ambientOpen(ambientAt(nb), opennessScale(ob), ob) +
-           keyLightColor() * wrapDiffuse(dot(nb, keyLightDir()), TUNE_DIFFUSE_WRAP));
-  if (TUNE_GI_STRENGTH > 0.0) { r.lit += farGiBounce(albedo, nb); }
+  let albedo = farSoakedAlbedo(paletteMean(bm), hitK >> 2u, liq);
   r.path = min(0.5 * (t0 + t), maxV);
+  var lam = wrapDiffuse(dot(nb, keyLightDir()), TUNE_DIFFUSE_WRAP);
+  // THE BED'S SUN IS THE FAR TERRAIN'S (2026-10-13, ticket 2026-10-09_14-23-01,
+  // the sea seam): its face's far shadow patch (farShadowCached, the resolve's
+  // media-blind march -- see farShadowBlocked), then the dry far shade's
+  // lodShadowLift, hzSunShade and shadowLiftCap, in that order. The bed had no
+  // shadow at all, so a riser turned from the sun took the wrapped key light
+  // a sunlit one gets; measured on the shelf (same pixels near and far,
+  // SEAM_DBG 15 + 6 + 2/3), the shallow bed's light was 3-4x the near bed's
+  // (near median shadow 0.23 at noon -- 0.07 on the risers -- and 0.48 at
+  // minute 960) and the shallow water +4.5 / +9.3 luma brighter far.
+  // Only where the bed can show: past FAR_BED_SUN_MAX_M of water the column
+  // passes under a tenth of the bed's blue, and a patch per sea-floor cell
+  // to the horizon would buy nothing. tEye < 0 = the caller wants the path only.
+  if (lam > 0.0 && tEye >= 0.0 && (R.flags & 1u) != 0u && SHADOW_CACHE && FAR_SHADOW_CACHE &&
+      r.path * VOXEL_METERS < FAR_BED_SUN_MAX_M) {
+    let eP = p + rd * r.path;
+    var sh = farShadowCached(level, cb, axis, rs, false, eP);
+    if (sh < 1.0) { sh = lodShadowLift(sh, tEye + r.path); }
+    sh = min(sh, hzSunShade(eP));
+    lam *= shadowLiftCap(sh, ob);
+  }
+  r.lit = albedo * face *
+          (ambientOpen(ambientAt(nb), opennessScale(ob), ob) + keyLightColor() * lam);
+  if (TUNE_GI_STRENGTH > 0.0) { r.lit += farGiBounce(albedo, nb); }
   return r;
 }
 
@@ -14544,13 +14897,14 @@ fn farBandNearWeight(tFine : f32) -> f32 {
 //
 // So a feature's face takes its sky from the cascade: the fan sim_openness
 // measures with (the normal and four 45-degree diagonals of the face's own
-// hemisphere), each ray walked by farFanRay (the hit's own level to 1.6 m,
+// hemisphere), each ray walked by farSkyFan (the hit's own level to 1.6 m,
 // then every cell of the level two coarser out to the near walk's reach,
 // render.opennessReach), a ray closed by the first MATERIAL cell (never the
 // blocker flag, as for AO and shadows). Weights are the near quadrature's:
 // the normal 1/3, each diagonal 1/6. The result scales the openness and the
 // bounce together, the two indirect terms the near grid carries. The
-// heightfield takes the UP fan instead (farGroundOver + farSkyFan, below).
+// heightfield takes the near walk's whole definition instead (farGroundOver +
+// farSkyFan's `def`, below).
 // Past FAR_SKY_FADE_END_M the cascade's trees are cells wider than a lobe (and flattened into the skin at
 // level 5), so the term eases out with distance, never on a level boundary.
 const FAR_SKY_FADE_START_M : f32 = 60.0;
@@ -14558,84 +14912,185 @@ const FAR_SKY_FADE_END_M : f32 = 110.0;
 // A sample is solid when its level chunk holds anything at or above its row
 // (farOcc's count and top row: an open-sky sample above the ground costs the
 // chunk's word, which every neighbouring sample shares) and its byte is a
-// material.
+// RAY-BLOCKING material (isRayBlocker, the near walk's own class: the fan is
+// MEDIA-BLIND as sim_openness is, so clear water is no roof -- the bed under
+// far water asks this fan, 2026-10-14; one material read, on the cell that
+// ends a ray).
 fn farSkySolid(level : u32, c : vec3<i32>, b : FarBox) -> bool {
   if (!farInValid(c, b)) { return false; }
   let occ = farOcc[farOccIndex(level, c)];
   if (occ == 0u) { return false; }
   let top = farOccTop(occ);
   if (top != 0u && (c.y & (i32(CHUNK) - 1)) >= i32(top)) { return false; }
-  return farPalAt(level, c) != 0u;
+  let slot = farPalAt(level, c);
+  return slot != 0u && isRayBlocker(materials[farPalMat(&materials, slot)]);
 }
-// ONE RAY OF A FAR SKY FAN: 1 open, 0 closed by a material cell. Shared by
-// the feature fan and the ground fan (farSkyFan), so the two read the cascade
-// one way.
+// THE FAR SKY FAN: the fraction of a face's hemisphere the cascade leaves
+// open, by the near walk's quadrature (sim_openness OPEN_WEIGHT_TOTAL: the
+// normal weighted double, 2/6, each 45-degree diagonal 1/6), each ray closed
+// by the first MATERIAL cell (never the blocker flag, as for AO and shadows).
+// Shared by a feature's face and the heightfield (and its cards), so the two
+// read the cascade one way; ONE call site in fs (registers: fs sits at the
+// 128-register occupancy cliff, --shader-stats, and a nested three-stretch
+// version of the old ray took it to 168 on its own).
 //
 // THE REACH IS THE NEAR WALK'S (render.opennessReach, 12 m) and THE OUTER
-// PART IS MARCHED, NOT SKIPPED (2026-10-12, `--gate lod-seam`). The fan used to
-// stop at 6.4 m and sample every 12 fine voxels past 16: it stepped through
-// 1-2 m crown lobes and between trunks, where the near grid -- which walks
-// EVERY 40 cm block (sim_openness, traceOpaque's coarse mode) -- found leaves.
-// Now two stretches, each in cells of its own size so a ray tests every cell
-// it crosses at that size: the hit's own level every cell to 16 fine voxels
-// (a lobe's shell is a cell or two thick), then the level TWO coarser (80 cm
-// from a level-1 hit) every cell to the reach -- the cover rule keeps a
-// crown's density at levels 1-4. ~21 samples a ray at level 1, fewer where a
-// ray that does not descend climbs over its level's SKY CEILING (farSkyCeil:
-// open).
+// PART IS MARCHED, NOT SKIPPED (2026-10-12, `--gate lod-seam`): two stretches,
+// each in cells of its own size so a ray tests every cell it crosses at that
+// size -- the hit's own level to 16 fine voxels (a lobe's shell is a cell or
+// two thick), then the level TWO coarser (80 cm from a level-1 hit) to the
+// reach -- the cover rule keeps a crown's density at levels 1-4. A ray that
+// does not descend and climbs over its level's SKY CEILING (farSkyCeil) is
+// open.
 //
-// TRIED AND TAKEN OUT (no measurable change in the gate, +cost): the near
-// walk's two other rules -- an unblocked ray marching straight up from its
-// endpoint ("an unblocked ray is not sky"), and a side face's down-diagonal
-// re-aimed 63 degrees up.
+// TWO RULE SETS, `def`:
 //
-// `minFine`: only cells whose bottom is at or over this fine-voxel height
-// count (the up ray over a heightfield skips the column's own terrain; -1e9 =
-// every cell).
+// A FEATURE'S FACE (def = false): the rays step from the hit CELL's centre
+// along integer cell diagonals (k cells along the normal and k along the
+// tangent), the reach counted per axis. What the crowns were calibrated
+// against (THE SKY OVER A FAR FEATURE, above; leaf and bark within ~2 luma of
+// the near field in `--gate lod-seam`).
+//
+// THE GROUND (def = true): THE NEAR WALK'S DEFINITION, marched over the
+// cascade (2026-10-14, ticket 2026-10-09_14-23-01). The heightfield used to
+// take a closed form (farOpenness: 1 for a tread, 0.6 for a riser) times the
+// UP fan, and both halves were wrong near trees. Measured with SEAM_DBG 16
+// (the near definition re-measured per pixel, dbgNearOpenDef, agrees with the
+// grid's byte to 3 %): of the pixels the gate classes "ground", 93 % are
+// RISERS (a staircase seen at grazing angles), and the riser/up-face ratio
+// the near walk measures is 0.62 on open ground but 1.68 under a crown -- a
+// riser's level rays see out UNDER the canopy -- so no up-fan multiple can
+// stand for it. And the up fan itself read the clearing 1.2x more open than
+// the near walk (0.60 against 0.50), the canopy over a crown's foot 2x (0.32
+// against 0.15). So the ground takes the definition itself, from just off the
+// face, by the near walk's rules (sim_openness openValueAt):
+//   - the face's OWN fan (a riser's normal is level), a side face's
+//     down-diagonal re-aimed 63 degrees up ("a vertical face does not ask the
+//     ground");
+//   - real rays in fine-voxel space, the reach measured ALONG the ray (the
+//     cell-diagonal step reached 17 m on a diagonal, over the crowns the near
+//     walk ends under);
+//   - an unblocked ray is not sky: it marches straight up from its endpoint
+//     ("AN UNBLOCKED RAY IS NOT SKY");
+//   - the outer stretch is a BLOCK MASK: a cell counts if any of its eight
+//     children one level finer is material. The near walk's coarse mode is
+//     "any blocker in a 40 cm block"; the cascade's 80 cm cell is one
+//     cover-rule sample, which is porous to a ray through a crown's edge.
+//     This rule alone was 0.60 -> 0.49 on the clearing's up fan.
+// Measured, mean openness of the same pixels (near grid / far before / far
+// now): open ground 0.30 / 0.38 / 0.35, under a crown 0.25 / 0.22 / 0.25,
+// grass blades (the ground's up face) 0.23 / 0.34 / 0.27. A map-terrain test
+// (a sample under the level-1 heightfield top is solid) was measured and
+// changed nothing: the cascade's own cells carry the relief at this reach.
+// Still behind the prefilter (farGroundOver): on ground nothing stands over,
+// the closed form is what the near grid measures (where it was calibrated).
 const FAR_SKY_REACH_V : i32 = i32(TUNE_OPENNESS_REACH / VOXEL_METERS);
-// THE NEAR WALK'S QUADRATURE (sim_openness OPEN_WEIGHT_TOTAL): the normal
-// weighted double, 2/6, each diagonal 1/6. Was 0.36 / 0.16.
 const FAR_SKY_W_UP : f32 = 1.0 / 3.0;
 const FAR_SKY_W_DIAG : f32 = 1.0 / 6.0;
-fn farFanRay(level : u32, cell : vec3<i32>, d : vec3<i32>, minFine : f32) -> f32 {
-  // ONE flat loop over both stretches, and nothing per stretch held across
-  // it: fs sits at the 128-register occupancy cliff (--shader-stats), and a
-  // nested three-stretch version of this took it to 168 on its own.
-  let l2 = min(level + 2u, FAR_LEVELS);
-  let s0 = farCellShift(level);
-  let s2 = farCellShift(l2);
-  let nIn = max(1, 16 >> s0);
-  let k2a = (16 >> s2) + 1;
-  let nAll = nIn + max(k2a, FAR_SKY_REACH_V >> s2) - k2a + 1;
-  let o2 = ((cell << vec3<u32>(s0)) + vec3<i32>(i32(1u << s0) >> 1u)) >> vec3<u32>(s2);
-  for (var j = 1; j <= nAll; j++) {
-    let inner = j <= nIn;
-    let lv = select(l2, level, inner);
-    let c = select(o2 + d * (j - nIn + k2a - 1), cell + d * j, inner);
-    if (d.y >= 0 && f32(c.y) >= farSkyCeil(lv)) { return 1.0; }
-    if (f32(c.y << select(s2, s0, inner)) < minFine) { continue; }
-    if (farSkySolid(lv, c, farBox(lv))) { return 0.0; }
-  }
-  return 1.0;
+// Is anything at or above row c.y of cell c's level chunk? (farOcc's count
+// and top row; false = every cell from this row up to the chunk's top is
+// air.) Outside the valid box: no.
+fn farOccAbove(level : u32, c : vec3<i32>) -> bool {
+  if (!farInValid(c, farBox(level))) { return false; }
+  let occ = farOcc[farOccIndex(level, c)];
+  if (occ == 0u) { return false; }
+  let top = farOccTop(occ);
+  return top == 0u || (c.y & (i32(CHUNK) - 1)) < i32(top);
 }
-// THE FAN: the face's normal (FAR_SKY_W_UP) and its four 45-degree diagonals
-// (FAR_SKY_W_DIAG each), one call site for both users -- a feature's face
-// (a feature's fan) and the heightfield's up fan (farGroundOver) --
-// for the register reason above. `upMin` applies to the normal ray only.
-fn farSkyFan(level : u32, cell : vec3<i32>, ni : vec3<i32>, upMin : f32) -> f32 {
+// THE BLOCK MASK's other half: any of the eight children (level lv - 1) of
+// level-lv cell c a ray blocker? The eight share one level chunk (2c is even,
+// so 2c and 2c + 1 never straddle a 16-cell boundary), so ONE farOcc word
+// answers "nothing here" for all of them -- the common case, sky over the
+// ground -- before any byte is read.
+fn farChildrenSolid(lv : u32, c : vec3<i32>) -> bool {
+  let lc = lv - 1u;
+  let c0 = c * 2;
+  if (!farOccAbove(lc, c0)) { return false; }
+  for (var k = 0; k < 8; k++) {
+    let slot = farPalAt(lc, c0 + vec3<i32>(k & 1, (k >> 1) & 1, (k >> 2) & 1));
+    if (slot != 0u && isRayBlocker(materials[farPalMat(&materials, slot)])) { return true; }
+  }
+  return false;
+}
+// One sample of the fan: the cell of level `lv` holding fine point `p`, and
+// (`mask`) any of its eight children one level finer.
+fn farSkySample(lv : u32, p : vec3f, mask : bool) -> bool {
+  let c = vec3<i32>(floor(p / f32(1u << farCellShift(lv))));
+  if (farSkySolid(lv, c, farBox(lv))) { return true; }
+  return mask && lv > 1u && farChildrenSolid(lv, c);
+}
+// `ro`: the fine-voxel point the rays leave from (def: just off the face; a
+// feature: its cell's centre). `ni`: the face normal, an axis.
+fn farSkyFan(level : u32, ro : vec3f, ni : vec3<i32>, def : bool) -> f32 {
+  let n = vec3f(ni);
   // Two tangents of the face, integer: t1 is x unless the normal is x.
   let t1 = select(vec3<i32>(1, 0, 0), vec3<i32>(0, 0, 1), ni.x != 0);
   let t2 = vec3<i32>(ni.y * t1.z - ni.z * t1.y, ni.z * t1.x - ni.x * t1.z,
                      ni.x * t1.y - ni.y * t1.x);
+  let l2 = min(level + 2u, FAR_LEVELS);
+  let s0 = f32(1u << farCellShift(level));
+  let s2 = f32(1u << farCellShift(l2));
+  let reach = f32(FAR_SKY_REACH_V);
   var vis = 0.0;
   for (var r = 0; r < 5; r++) {
-    // From the hit cell's centre: k cells along the normal and k along the
-    // tangent (the 45-degree ray from the face centre lands in that cell).
-    var d = ni;
-    if (r == 1) { d = ni + t1; } else if (r == 2) { d = ni - t1; }
-    else if (r == 3) { d = ni + t2; } else if (r == 4) { d = ni - t2; }
-    vis += select(FAR_SKY_W_DIAG, FAR_SKY_W_UP, r == 0) *
-           farFanRay(level, cell, d, select(-1e9, upMin, r == 0));
+    var di = ni;
+    if (r == 1) { di = ni + t1; } else if (r == 2) { di = ni - t1; }
+    else if (r == 3) { di = ni + t2; } else if (r == 4) { di = ni - t2; }
+    if (def && ni.y == 0 && di.y < 0) { di = ni + vec3<i32>(0, 2, 0); }
+    let dv = vec3f(di);
+    let len = length(dv);
+    let d = dv / len;
+    // A feature steps whole cell diagonals (`len` per cell) and counts the
+    // reach per axis; the definition steps one cell along the real ray.
+    let lf = select(len, 1.0, def);
+    var t = 0.0;
+    var open = true;
+    var sky = false;
+    // ~8 inner + 13 outer samples at level 1; the bound is a safety net.
+    for (var k = 0; k < 48; k++) {
+      let outer = t >= 16.0 * lf - 1e-3;
+      // The first outer sample is the first l2 cell past the inner stretch
+      // (the old index k2a = 16 / s2 + 1), so a feature's cells are exactly
+      // the integer diagonal's.
+      if (outer && t < 16.0 * lf + 1e-3) { t = (floor(16.0 / s2) + 1.0) * s2 * lf; }
+      else { t += select(s0, s2, outer) * lf; }
+      if (t > reach * lf + 1e-3) { break; }
+      let lv = select(level, l2, outer);
+      let p = ro + d * t;
+      if (d.y >= 0.0 && floor(p.y / f32(1u << farCellShift(lv))) >= farSkyCeil(lv)) {
+        sky = true;
+        break;
+      }
+      if (farSkySample(lv, p, def && outer)) { open = false; break; }
+    }
+    // AN UNBLOCKED RAY IS NOT SKY (the definition only): straight up from
+    // the endpoint, at the outer level WITH its block mask, to the level's
+    // sky ceiling. The ceiling is the level's ONE top (the highest thing in
+    // the whole level box), so the climb skips, exactly: a stretch of rows
+    // where neither the cell's level chunk nor its children's has anything
+    // at or above the row is air to the top of the children's chunk (8
+    // cells of l2), and the climb jumps there. Without the skip this was
+    // up to 48 masked steps per open ray: the far ground's cost went 2.8 ->
+    // 20.8 ms on the --render-budget `cascade` camera.
+    // MEASURED, NOT TO BE CUT BLIND (2026-10-14): dropping the mask here
+    // (and on level rays) saved 0.8 ms on the noon overlook and put ground
+    // under a crown back to +7.7..+8.4 luma in `--gate lod-seam` -- an
+    // endpoint under a crown climbs through its porous 80 cm cells.
+    if (def && open && !sky) {
+      let e = vec3<i32>(floor((ro + d * reach) / s2));
+      var cy = e.y + 1;
+      for (var k = 0; k < 24; k++) {
+        if (f32(cy) >= farSkyCeil(l2)) { break; }
+        let c = vec3<i32>(e.x, cy, e.z);
+        if (!farOccAbove(l2, c) && !farOccAbove(l2 - 1u, c * 2)) {
+          cy = ((cy >> 3u) + 1) << 3u;
+          continue;
+        }
+        if (farSkySolid(l2, c, farBox(l2)) || farChildrenSolid(l2, c)) { open = false; break; }
+        cy += 1;
+      }
+    }
+    if (open) { vis += select(FAR_SKY_W_DIAG, FAR_SKY_W_UP, r == 0); }
   }
   return vis;
 }
@@ -14676,14 +15131,14 @@ fn farFeatureBounce(hAbove : f32, tFine : f32) -> f32 {
 // grid's ~0.6, and through shadowLiftCap (which caps a shadow's lift by the
 // openness) the noon tree shadows on it lifted with it.
 //
-// So a heightfield face and a card take farOpenness x the fraction of the UP
-// hemisphere the cascade leaves open, by the feature fan's quadrature and
-// marches (farSkyFan / farFanRay: the near walk's weights and reach). The
-// fan is the UP one whatever the face (a riser keeps its closed form for the
-// ground in front of it, which the up fan cannot see), and the up ray counts
-// only cells a cell over the column's heightfield top (`groundTop`, fine
-// voxels): a refined hit sits inside its level cell, whose neighbour above
-// may still hold the slope's own terrain.
+// So a heightfield face and a card take the near walk's DEFINITION marched
+// over the cascade (farSkyFan with `def`, 2026-10-14: the face's own fan, the
+// reach along the ray, the endpoint up-march, the outer stretch as a block
+// mask -- why each, and what it measured, is at farSkyFan). Until then it was
+// farOpenness x the UP fan, whose two halves were wrong near trees in
+// opposite directions (open ground 1.3x the near grid, ground under a crown
+// 0.9x): a riser's own level rays see out under a canopy, which no up fan
+// can, and the 80 cm cover-rule cells let the up fan through crown edges.
 //
 // THE COST BOUND: a chunk-word prefilter over the fan's whole footprint (the
 // prefilter below; a column-only one was tried first and was wrong -- the
@@ -14720,6 +15175,53 @@ fn farGroundOver(level : u32, cell : vec3<i32>) -> bool {
     if (top == 0u || (pr.y >> 4u) * ch + i32(top) - 1 > o2.y + 1) { return true; }
   }
   return false;
+}
+
+// SEAM_DBG 16 ONLY (const-folded away otherwise): the NEAR grid's openness
+// DEFINITION (sim_openness.wgsl openValueAt: the normal x2 and four
+// 45-degree diagonals, traceOpaque fine for two blocks then the 40 cm block
+// mask, an unblocked ray blocked if anything stands over its endpoint),
+// re-measured at this pixel on the window's voxels. `mode` bit 0: skip the
+// endpoint up-march; bit 1: fine voxels the whole way (no block mask). The
+// origin is the first non-blocker voxel along the normal from the hit (the
+// walk's "exposed air cell, found by looking"). The instrument that splits a
+// far/near openness gap into its causes in one gate run.
+fn dbgNearOpenDef(p : vec3f, nIn : vec3f, mode : u32) -> f32 {
+  let ni = vec3<i32>(round(nIn));
+  let n = vec3f(ni);
+  var c = vec3<i32>(floor(p + n * 0.5));
+  for (var k = 0; k < 8; k++) {
+    if (!isRayBlocker(materials[voxMat(voxWordAt(c))])) { break; }
+    c += ni;
+  }
+  let ro = vec3f(c) + vec3f(0.5);
+  let ay = abs(ni.y) == 1;
+  let t0 = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), ay);
+  let t1 = select(select(vec3f(0.0, 0.0, 1.0), vec3f(1.0, 0.0, 0.0), abs(ni.z) == 1),
+                  vec3f(0.0, 0.0, 1.0), ay);
+  let reachVox = TUNE_OPENNESS_REACH / VOXEL_METERS;
+  let fineT = select(f32(SUBOCC_BLOCK) * 2.0, 1e30, (mode & 2u) != 0u);
+  let maxSteps = select(i32(f32(SUBOCC_BLOCK) * 4.0 + reachVox / f32(SUBOCC_BLOCK)) + 8,
+                        i32(reachVox * 3.0) + 8, (mode & 2u) != 0u);
+  let up = vec3f(0.0, 1.0, 0.0);
+  var openW = 0.0;
+  for (var r = 0u; r < 5u; r++) {
+    var d = n;
+    if (r == 1u) { d = normalize(n + t0); }
+    else if (r == 2u) { d = normalize(n - t0); }
+    else if (r == 3u) { d = normalize(n + t1); }
+    else if (r == 4u) { d = normalize(n - t1); }
+    if (!ay && d.y < -0.3) { d = normalize(n + up * 2.0); }
+    let s = traceOpaque(ro, d, maxSteps, fineT, &occupancy, &materials);
+    var blocked = s.hit && (s.t * VOXEL_METERS) <= TUNE_OPENNESS_REACH;
+    if (!blocked && (mode & 1u) == 0u) {
+      let u = traceOpaque(ro + d * reachVox, up, i32(WORLD_N / SUBOCC_BLOCK) + 4, 0.0,
+                          &occupancy, &materials);
+      blocked = u.hit;
+    }
+    if (!blocked) { openW += select(1.0, 2.0, r == 0u); }
+  }
+  return openW / 6.0;
 }
 
 // ---- THE FOOTPRINT FADE: detail below a pixel (package E) ----
@@ -14902,8 +15404,8 @@ fn farSurfAt(level : u32, hitP : vec3f, grad : bool) -> FarSurf {
 // ALBEDO of the averaged staircase is skin and sub-skin in these shares; its
 // LIGHTING is the smooth heightfield normal's, so the relief survives.
 // How BURIED a cascade hit is (D9): 0 = the air in front of its face is
-// under the open sky, 1 = under rock (the column one sub-column out along `n`
-// has its heightfield top FAR_BURIED_LO..HI fine voxels or more above the
+// under the open sky, 1 = under rock (the ground in front of the face,
+// farFrontTop below, has its heightfield top FAR_BURIED_LO..HI fine voxels or more above the
 // hit, plus two sub-columns of slack), -1 = the map does not vouch for that
 // column (an edit, a ruin, outside the level): no answer.
 const FAR_BURIED_LO : f32 = 24.0;
@@ -14948,9 +15450,36 @@ fn farUnderTerrain(ro : vec3f, rd : vec3f, t : f32) -> bool {
   }
   return false;
 }
+// THE GROUND IN FRONT OF A FACE (2026-10-14; tickets 2026-10-13_23-57-48,
+// _23-58-42, _23-59-16): the LOWEST of the four sub-column tops of the level
+// cell the face looks into (the cell holding the point half a sub-column out
+// along `n`: the neighbour across a side face, the cell's own column over a
+// top face) -- one 16-byte farMap load. Burial read ONE sub-column, exactly
+// `w` out, and that is wrong on any steep slope whichever sub-column it is:
+// a cascade cell is its CENTRE sample, so its faces stand up to half a cell
+// away from the true surface, and the sub-columns beside the one the cell
+// was sampled at differ from it by the slope times the offset. On a wall
+// steeper than ~2.4 m per sub-column -- every mesa, butte, canyon wall and
+// talus foot -- the sub-column read was the cliff itself, its top metres over
+// the hit, and the face read as rock overhead: no sky, no sun, near black.
+// Those were the "holes" chevroned along the bands of every steep face, at
+// every level (plus a floor() on the boundary between two sub-columns that
+// read the far one on a +axis face and the near one on a -axis face). The air
+// in front of a face is under rock only if ALL the ground it looks out over
+// is higher: over a cave, a dungeon hall or a real overhang the rock spans
+// the whole cell, so burial there is unchanged. -1e9 = outside the box.
+fn farFrontTop(level : u32, p : vec3f, n : vec3f) -> f32 {
+  let w = f32(1u << (farCellShift(level) - 1u));
+  let q = p + n * (0.5 * w);
+  let c = vec2<i32>(floor(vec2f(q.x, q.z) / w)) >> vec2<u32>(1u);
+  let b = farBox(level);
+  if (any(c < b.lo.xz) || any(c >= b.hi.xz)) { return -1e9; }
+  let e = farMap[farMapCell(level, c)];
+  return f32(min(min(farMapTop(e.x), farMapTop(e.y)), min(farMapTop(e.z), farMapTop(e.w))) + 1);
+}
 fn farHitBuried(level : u32, hitP : vec3f, n : vec3f) -> f32 {
   let w = f32(1u << (farCellShift(level) - 1u));
-  let top = farColumnTop(level, hitP + n * w);
+  let top = farFrontTop(level, hitP, n);
   if (top < -1e8) { return -1.0; }
   let pad = 2.0 * w;
   return smoothstep(FAR_BURIED_LO + pad, FAR_BURIED_HI + pad, top - hitP.y);
@@ -16191,24 +16720,29 @@ fn fs(in : VSOut) -> FSOut {
       // openness here and the far bounce below (`featSky`), so a face inside a
       // crown is lit like one: the near field's measured grid says the same
       // one voxel inside the handoff.
-      // The heightfield and its cards take the UP fan (farGroundOver), behind
-      // its prefilter; ONE farSkyFan call site for both (registers).
+      // The heightfield and its cards take THE NEAR WALK'S DEFINITION over
+      // the cascade instead of the closed form (farSkyFan's `def`), behind the
+      // prefilter (farGroundOver); a card asks for the ground's up face, as a
+      // near micro hit does. ONE farSkyFan call site for both (registers).
       var featSky = 1.0;
       var featBounce = 1.0;
       let skyFade = farSkyFade(far.t);
       let fanFeat = !fSurf && !fFeat && m.klass != CLASS_LIQUID;
       let fanGround = (fSurf || fCard) && m.klass != CLASS_LIQUID;
       if (skyFade > 0.0 && (fanFeat || (fanGround && farGroundOver(flv, far.cell)))) {
-        // The ground's up ray counts from one cell over its column's
-        // heightfield top (a refined hit's neighbour above may be its slope).
-        let upMin = select(select(groundY + sL, f32(far.cell.y + 1) * sL, groundY < -1e8),
-                           -1e9, fanFeat);
-        let fanN = select(vec3<i32>(0, 1, 0), vec3<i32>(round(n)), fanFeat);
-        featSky = mix(1.0, farSkyFan(flv, far.cell, fanN, upMin), skyFade);
-        openF *= featSky;
+        let an = abs(n);
+        let nAx = select(select(vec3<i32>(0, 0, select(-1, 1, n.z > 0.0)),
+                                vec3<i32>(select(-1, 1, n.x > 0.0), 0, 0), an.x >= an.z),
+                         vec3<i32>(0, 1, 0), (an.y >= an.x && an.y >= an.z) || fCard);
+        let ro = select((vec3f(far.cell) + vec3f(0.5)) * sL, hitP + vec3f(nAx) * 0.5, fanGround);
+        let v = farSkyFan(flv, ro, nAx, fanGround);
         if (fanFeat) {
+          featSky = mix(1.0, v, skyFade);
+          openF *= featSky;
           featBounce = featSky * farFeatureBounce(select(hitP.y - groundY, 0.0, groundY < -1e8),
                                                   far.t);
+        } else {
+          openF = mix(openF, v, skyFade);
         }
       }
       let bandW = select(farBandNearWeight(far.t), 0.0, fCard);
@@ -16455,6 +16989,16 @@ fn fs(in : VSOut) -> FSOut {
       if (SEAM_DBG != 0u) {
         dbgRec(true, far.mat, far.t, albedo, dbgShF, ao, openF, dbgLamPreF, lambert, color, dbgGiF, face);
         if (SEAM_DBG == 12u) { gDbg.y = openF; }
+        if (SEAM_DBG == 16u) {
+          // THE OPENNESS DEFINITION, far arm: the shade's openness, the near
+          // walk's definition re-measured at this hit on the window's voxels
+          // (dbgNearOpenDef), 1 on an up face.
+          let an = abs(n);
+          let upF = (an.y >= an.x && an.y >= an.z) || fCard;
+          let nD = select(select(vec3f(0.0, 0.0, sign(n.z)), vec3f(sign(n.x), 0.0, 0.0),
+                                 an.x >= an.z), vec3f(0.0, 1.0, 0.0), upF);
+          gDbg = vec4f(openF, dbgNearOpenDef(hitP, nD, 0u), select(0.0, 1.0, upF), 1.0);
+        }
       }
       // The near field's wet sheen (its `wet > 0` block), same lobe.
       if (wet > 0.0) {
@@ -16485,7 +17029,7 @@ fn fs(in : VSOut) -> FSOut {
             nW = vec3f(0.0, 1.0, 0.0);
           }
         }
-        color = shadeFarWater(hitP, rd, m, nW, farWaterBed(flv, hitP + rd * 0.01, rd));
+        color = shadeFarWater(hitP, rd, m, nW, farWaterBed(flv, hitP + rd * 0.01, rd, far.t, far.mat));
         if (SEAM_DBG >= 5u) { gDbgW0.x = 1.0; gDbgW0.y = far.t; }
       }
       if (SEAM_DBG == 8u) {
@@ -16532,7 +17076,7 @@ fn fs(in : VSOut) -> FSOut {
       // and the column the near shade attenuates by goes on to that bed.
       if (nearCut && m.klass == CLASS_LIQUID && !isViscousLiquid(m) &&
           (m.flags & MATF_OPAQUE) == 0u) {
-        let bed = farWaterBed(flv, hitP + rd * 0.01, rd);
+        let bed = farWaterBed(flv, hitP + rd * 0.01, rd, far.t, far.mat);
         color = bed.lit;
         liqExtra += bed.path;
       }
@@ -16765,13 +17309,11 @@ fn fs(in : VSOut) -> FSOut {
           // so that is the patch that answers for all its grains.
           let grains = !isMicro && m.klass == CLASS_POWDER &&
                        powderIsPartial(h.word);
-          if (SEAM_DBG == 14u) { gDbgSc = vec4f(0.0); }
+          if (SEAM_DBG == 14u) { gDbgSc = vec4f(0.0); gDbgFb = 0.0; }
           sh = shadowCached(hitP, h.cell, select(h.axis, 1, grains),
                             select(h.sgn, -1.0, grains), h.t);
           if (SEAM_DBG == 14u) {
-            gDbg = vec4f(select(0.0, 1.0, gDbgSc.x == 0.0), sh,
-                         select(select(0.0, 0.5, gDbgSc.z + gDbgSc.w > 0.0), 1.0,
-                                gDbgSc.y > 0.0), 1.0);
+            gDbg = vec4f(select(0.0, 1.0, gDbgFb == 1.0), sh, 0.5 + 0.5 * gDbgFb, 1.0);
           }
         } else {
           sh = sunShadowFar(hitP, n, h.t);
@@ -16925,7 +17467,7 @@ fn fs(in : VSOut) -> FSOut {
       // THIS IS THE ONLY INJECTION PATH WITH NO MEASUREMENT BEHIND IT: the
       // openness walk and the resolve pass each cast a ray, while this one
       // records whatever the PIXEL happened to shade with -- including a
-      // shadow-cache MISS, which shades as full sun. What stops that becoming
+      // shadow-cache miss nothing answered (full sun). What stops that becoming
       // permanent daylight in a cave is shadowLiftCap refusing a full-sun
       // reading on a face that can see no sky (common.wgsl); `sun` below is
       // already zero there, so `outgoing` is the bounce alone. See the
@@ -16962,6 +17504,15 @@ fn fs(in : VSOut) -> FSOut {
     if (SEAM_DBG != 0u) {
       dbgRec(false, mat, h.t, albedo, dbgShN, ao, openRaw, dbgLamPreN, lambert, color, dbgGiN, face);
       if (SEAM_DBG == 12u) { gDbg = vec4f(select(0.1, 0.2, openRaw >= 0.0), max(openRaw, 0.0), eyeSkyK(), 1.0); }
+      if (SEAM_DBG == 16u) {
+        // near arm: the grid's byte, the definition re-measured at this pixel
+        // (dbgNearOpenDef: agrees with the byte to ~3 % in the mean), 1 on an
+        // up face.
+        let oc = select(h.cell, h.cell - vec3<i32>(0, 1, 0), isMicro);
+        let on = select(vec3f(axisVec(h.axis, -h.sgn)), vec3f(0.0, 1.0, 0.0), isMicro);
+        let pc = vec3f(oc) + vec3f(0.5) + on * 0.5;
+        gDbg = vec4f(max(openRaw, 0.0), dbgNearOpenDef(pc, on, 0u), select(0.0, 1.0, on.y > 0.5), 1.0);
+      }
     }
     // ---- caustics on a submerged surface ----
     // The rippling web of focused sunlight on anything under water. This is
@@ -17481,7 +18032,7 @@ fn fs(in : VSOut) -> FSOut {
         // (past the handoff). Its column is the gap down to that water plus
         // the cascade's own path to the bed under it.
         caMat = far.mat;
-        let fb = farWaterBed(far.level & 0xFFu, R.camPos + rd * (far.t + 0.01), rd);
+        let fb = farWaterBed(far.level & 0xFFu, R.camPos + rd * (far.t + 0.01), rd, -1.0, 0u);
         caPath = max(far.t - mf.t, 0.0) + fb.path;
       }
       let behindMpm = color;

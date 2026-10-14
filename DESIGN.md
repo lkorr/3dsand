@@ -9010,7 +9010,7 @@ Known limits: no angle-of-incidence glance (a grazing shot pays the same first b
 The first weapon that is not swung. Three items of data and two halves of code.
 
 - **Items.** `bow` is kind `melee` (it rides a hand slot, a sheath, the hotbar like any weapon) with `weaponClass: "bow"` and a `bow` block: `drawSpeedMps` (50, a real longbow's; 65 until 2026-10-13), `drawTimeMs` (800), `minDraw` (0.15), `ammo` (`arrow`). The weapon class takes it OUT of the stroke system: `ResolveHands` marks the hand `HandNow::bow`, never `weapon`, so the button is never a swing. `arrow` is the new kind `ammo` (carried, never held or worn) with an `arrow` block: `massKg` 0.03, `tipRadius` 1 fine cell, `sharpness` 0.8 (1 until 2026-10-13: see "It stays in what it hits" below), and a FLAT `damage` 35 hp (`Penetrator::hp`), charged by `Mob::PierceLimb` only when the channel got IN (embedded or through), never on a glance -- a weapon stat, as a sword's `damage` is its cut. The head's hardness is the art's: the loader takes the arrow's POINT from the foremost cell of its `.vox` along +x and that cell's material as `Penetrator::material` (steel, hardness 200), so re-authoring the head re-derives both. `startCount` (30) is how many the stub starting kit hands out as one stack (in the pack). Art: `scripts/gen_bow_items.py` (a braced yew longbow with a leather grip; a spruce arrow with goose fletching and a bodkin). The loader refuses a bow with no usable block and a bow whose `ammo` is not an ammo item.
-- **The bow is the player's** (session.cpp PhaseG's bow block, beside the throw it copies): with a bow in a hand and an arrow in the kit, that hand's button HELD draws (the `bow_draw` clip, an override on both arms with `pitchFollow`; crouched, `bow_draw_crouch`, the bow laid flat -- swapped mid-draw if the stance changes, `PlayerSession::bowClip`, the new clip's playhead put where the old one's was, `Mob::PlayClipAt`), LET GO looses. THE DRAW HAS A WINDUP (owner, 2026-10-14): for the bow's `windupMs` (450) the bow comes up from low and canted at the chest and the string is drawn most of the way back, and nothing can be loosed -- let go in it and the arrow stays on the string; then over `drawTimeMs` (800) the last ~15 cm are PULLED slowly to the anchor, which is the charge. The clips are ONE-SHOTS THAT HOLD (`AnimClip::holdEnd`: a non-looping clip that stays on its last key at full weight until stopped) keyed on that same timeline -- LIFT at 0, SET at the end of the windup, the pull keyed at the eased draw fraction -- so the string is where the loosed speed says it is; the generator reads the timing out of items.json. Both draws are SOLVED from target points by `scripts/gen_archery_clips.py` (never hand-edit their quaternions): the upper body turned ~60 degrees side-on at the waist (the head turned back, so the eye does not move), the bow arm straight out a hand right of the eye line, the string hand under the jaw with its ELBOW BEHIND THE SHOULDER -- the first draw folded the string arm in front of the face, and first person (the eye rides the head) looked through its forearm. `pitchFollow` turns a part about its PARENT's X (the body's left-right axis, so a twisted torso still lifts the bow rather than rolling it), and the head hands back what its ancestors' follow carried (it was getting 1.6x the look). In first person the string forearm and hand are hidden from 0.75 of the draw on (out at the string in front of the face before that, the windup and pull are the thing to see): a fast flick down outruns the eased pitch the draw follows. Speed = `BowArrowSpeed` = eased draw fraction (`1 - (1 - t)^2`, t = (ticks - windup ticks) / draw ticks, 0 through the windup) x `drawSpeed`; under `minDraw` the release is a fumble and nothing leaves the kit. One arrow leaves the kit per shot (`KitTakeAmmo`, hotbar then pack). Everything is read off the tick's command -- TickInput's held mask, the camera the tick turned from the look delta (the spell aim's `cam.Forward()`) --; the flight leaves the ARROW REST (in the camera's frame, at arm's length a hand right of and under the eye line, where the drawn bow holds it; the crouched draw's flat bow lower and nearer the middle) aimed at the point the look reaches 30 m out, and from the eye only point-blank (a wall or a body inside that arm's length). Launched from the eye, it flew end-on away from the camera and nobody saw it fly (2026-10-13) -- so a replay or a peer draws the same bow the same way; there is no new TickInput field. The HUD draws a pixel bow under the crosshair whose string comes back with the draw, a draw bar with the `minDraw` notch, and the arrows left (`UIState::bowDraw / bowMinDraw / arrowsLeft`).
+- **The bow is the player's** (session.cpp PhaseG's bow block, beside the throw it copies): with a bow in a hand and an arrow in the kit, that hand's button HELD draws (the `bow_draw` clip, an override on both arms with `pitchFollow`; crouched, `bow_draw_crouch`, the bow laid flat -- swapped mid-draw if the stance changes, `PlayerSession::bowClip`, the new clip's playhead put where the old one's was, `Mob::PlayClipAt`), LET GO looses. THE DRAW HAS A WINDUP (owner, 2026-10-14): for the bow's `windupMs` (450) the bow comes up from low and canted at the chest and the string is drawn most of the way back, and nothing can be loosed -- let go in it and the arrow stays on the string; then over `drawTimeMs` (800) the last ~15 cm are PULLED slowly to the anchor, which is the charge. The clips are ONE-SHOTS THAT HOLD (`AnimClip::holdEnd`: a non-looping clip that stays on its last key at full weight until stopped) keyed on that same timeline -- LIFT at 0, SET at the end of the windup, the pull keyed at the eased draw fraction -- so the string is where the loosed speed says it is; the generator reads the timing out of items.json. THE DRAWN BOW IS SEEN (2026-10-14): `PresentDrawnBow` (game/arrows.h), once a frame per creature before the body registry builds its list, shows a bow whose draw clip is in as its string-less art (`ItemDef::BowStringArt::unstrungModel`, swapped in through `Mob::SetHeldRenderModel`, never over a carved brick), the string as two one-cell rods from the tips to the string hand's socket (pre-packed lengths, `rods`), and the ARROW NOCKED on it: nock at the fingers, laid through the arrow rest two cells off the grip on the head's side of the bow -- all render-only bodies, never hashed; the bow's body and lattice keep their string. The sidecar's `string` block (two scene cells) is the only authored fact; the string's cells are FOUND on that segment at load, so a wrong frame is an error, not a silent miss. In first person the string is cut 2.5 voxels short of the lens. The draw is AIMED: the clips are solved so the shaft from the nock through the rest crosses the look at 30 m within a cell (`aimed_grip`, the bow arm angled in, the anchor under the chin -- under the right of the jaw crouched, where the flat bow's arm otherwise covers the reticle), and the flight leaves from where the nocked arrow's point was (`kAhead` 6.75 under the eye), so the arrow the player watched is the one that flies. The arrow art is 0.65 m (was 0.60): the 46-cell draw had its point inside the bow hand. Both draws are SOLVED from target points by `scripts/gen_archery_clips.py` (never hand-edit their quaternions): the upper body turned ~60 degrees side-on at the waist (the head turned back, so the eye does not move), the bow arm straight out a hand right of the eye line, the string hand under the jaw with its ELBOW BEHIND THE SHOULDER -- the first draw folded the string arm in front of the face, and first person (the eye rides the head) looked through its forearm. `pitchFollow` turns a part about its PARENT's X (the body's left-right axis, so a twisted torso still lifts the bow rather than rolling it), and the head hands back what its ancestors' follow carried (it was getting 1.6x the look). In first person the string forearm and hand are hidden from 0.75 of the draw on (out at the string in front of the face before that, the windup and pull are the thing to see): a fast flick down outruns the eased pitch the draw follows. Speed = `BowArrowSpeed` = eased draw fraction (`1 - (1 - t)^2`, t = (ticks - windup ticks) / draw ticks, 0 through the windup) x `drawSpeed`; under `minDraw` the release is a fumble and nothing leaves the kit. One arrow leaves the kit per shot (`KitTakeAmmo`, hotbar then pack). Everything is read off the tick's command -- TickInput's held mask, the camera the tick turned from the look delta (the spell aim's `cam.Forward()`) --; the flight leaves the ARROW REST (in the camera's frame, at arm's length a hand right of and under the eye line, where the drawn bow holds it; the crouched draw's flat bow lower and nearer the middle) aimed at the point the look reaches 30 m out, and from the eye only point-blank (a wall or a body inside that arm's length). Launched from the eye, it flew end-on away from the camera and nobody saw it fly (2026-10-13) -- so a replay or a peer draws the same bow the same way; there is no new TickInput field. The HUD draws a pixel bow under the crosshair whose string comes back with the draw, a draw bar with the `minDraw` notch, and the arrows left (`UIState::bowDraw / bowMinDraw / arrowsLeft`).
 - **The arrows in flight are the world's** (`TickAuthorityCtx::arrows`, `ArrowFlights`, stepped once a tick in phase K's slot, after the peers' blows and every session's swings, gore into this tick's batch). The `SpellProjectile` way, never a Jolt body (thin fast bodies tunnel; CCD is the 3 fps trap): 24.8 fixed voxels, gravity, half-voxel sub-steps against the grid through `FlightSolidAt` (`game/flightprobe.h` -- the spell VM's three-tier probe, factored out so the two share it), then ONE `PierceAlongRay` over the tick's segment (up to the wall if there is one). Through every body -> on at `PierceFlight::speedMps`. Bounded: 64 live, 10 s of life, out of the window = gone. **Seen in flight** (2026-10-13): until then nothing drew a flight, and a shot appeared already stuck a third of a second after the loose. A flight is not a body in any system, so it is a RENDER-ONLY body (`game/renderonly.h`): `ArrowFlights::AppendRenderBodies` places the arrow's art point-first exactly as the embed and the stuck item do (`ArrowXf`, the art's foremost cell on the point), at the point interpolated between the last two ticks by the frame's `tickAlpha` (the camera's own lerp; `ArrowFlight::prev` is render-only), along the segment it flew; the frame loop hands the list to `BodyRegistry::SetRenderOnly`, which walks it AFTER every real body -- a transform slot and a micro draw of the SHARED item model, handle 0, no cube instances (no other instance base shifts), never a holder in the brick audit. Last, so a frame at `kMaxBodySlots` starves the arrows and nobody's body. `--shot-mob human:>3~` photographs three in the air.
 - **Where an arrow ends.** EMBEDDED in a creature this machine owns: it STAYS IN THE LIMB. `Mob::EmbedArrow` appends a slot (tag `arrow`, `arrow:<item>`) that is a FOLLOWER of the struck limb exactly as a worn shell is (`MobLimb::wornHost`, posed by `DriveWornShells`, no joint -- `debris.h` StrapBody's note) but AT ITS ANGLE (`MobLimb::wornRotated / wornRot`: world rotation = host x wornRot; a garment's arithmetic is untouched), placed so the art's point is at `PierceResult::stopWorld` along the flight. Kinematic, on the PROP layer (`LimbRole` HeldProp in every phase: touches nothing, every ray sees it), bloodless, not a figure slot, its host always a BASE limb (a hit on a garment embeds in the limb under it; on a held item nowhere). Melee probes and `PierceAlongRay` pass an arrow slot by. It rides the living limb and the corpse (corpses are Mobs; DriveWornShells keeps posing followers); on a SEVER `ShedGearBeforeDetach` names it as the item, DetachLimb straps it to the piece and registers it, so it rides the severed arm and G takes it; a decayed corpse (`ReleaseRigToDebris`) registers its arrows the same way. Capped at `Mob::kMaxEmbeddedArrows` (8): past it the new arrow breaks. EMBEDDED in loose matter: a stuck item strapped to that body (`DebrisSystem::StrapBody`). GLANCED, or stopped by a body nobody carves: it drops as an ordinary falling item. THE GROUND: it sticks point first, 0.3..2.5 voxels deep by speed, as a KINEMATIC ground item (`DropItemToWorldXf(..., stuck)`), registered, G picks it up; the oldest goes past 48 stuck arrows (tracked by global id).
 - **G on an arrow in a body** (alive or dead, `PullArrowToKit`, main.cpp's take, ahead of the corpse loot panel): room in the kit first, then the slot goes. Nothing else changes -- no plug, no bleed coupling (owner). Like the ground pickup and the loot panel it is a frame-layer take, not a TickInput command.
@@ -17574,7 +17574,7 @@ where you hear from either (§12b, "The ears are on the character").
     behind a chunk-word prefilter over the fan's footprint (open ground pays
     up to ten shared `farOcc` words). The up ray counts only cells a cell over
     the column's heightfield top.
-  - **The far fan** (features and ground, `farFanRay`) reached 6.4 m and
+  - **The far fan** (features and ground, then `farFanRay`, now `farSkyFan`) reached 6.4 m and
     sampled every 12 fine voxels past 16, stepping through crown lobes and
     between trunks; it now marches EVERY cell -- the hit's level to 1.6 m,
     then the level two coarser -- to `render.opennessReach` (the near walk's
@@ -17650,7 +17650,8 @@ where you hear from either (§12b, "The ears are on the character").
     `lodSeam.max.*` re-pinned at those + ~2.5. Not run: `--render-budget`
     (the extra cost is one patch word read on far riser pixels, and a short
     march per open riser patch every `FAR_GI_PERIOD` resolves).
-  - **HANDOFF 2026-10-13 (where 14-23-01 stands; resume here).**
+  - **HANDOFF 2026-10-13** (superseded by the 2026-10-14 entries below; kept
+    for its measuring recipe and traps).
     - Open ground is still ~+10 far (noon/afternoon/overcast). ~6 of it is
       the far OPENNESS: an arm that substituted the near grid's openness
       into the far shade (cfB) took -5.8 off; the rest (~4) is bounce excess.
@@ -17703,6 +17704,109 @@ where you hear from either (§12b, "The ears are on the character").
       that reads gDbgT alone shows no water; a SEAM_DBG frame is the
       encoded output, so compare arms, never absolute values against
       linear constants.
+  - **The far ground takes the near walk's DEFINITION (2026-10-14, ticket
+    2026-10-09_14-23-01).** The residual open-ground seam (+9.6 / +10.1 /
+    +3.0 / +9.6 luma, noon / afternoon / dusk / overcast) was attributed in
+    one gate run each, not by elimination: a new `SEAM_DBG` 16 frame writes
+    the shade's openness (near: the grid's byte; far: the cascade's), the
+    near walk's definition RE-MEASURED at the pixel on the window's voxels
+    (`dbgNearOpenDef`, a copy of `openValueAt` on `traceOpaque`; it agrees
+    with the grid's byte to ~3 % in the class mean, so it is a valid stand-in
+    for "what the grid would say here"), and the face orientation. What it
+    found, mean openness of the same pixels:
+    - 93 % of the "ground" pixels at 10-19 m are RISERS (a voxel staircase
+      seen at grazing angles), and the near walk's riser / up-face ratio is
+      0.62 on open ground but 1.68 under a crown -- a riser's level rays see
+      out UNDER the canopy. The far law was `farOpenness` (1 tread / 0.6
+      riser) x the UP fan, which can be right in one of those places only.
+    - The up fan itself read the clearing 1.2x the near definition (0.60 vs
+      0.50) and the ground under a crown 2x (0.32 vs 0.15). Its rays stepped
+      integer cell diagonals with the reach counted per axis (a diagonal
+      reached 17 m and ended OVER the crowns the near walk ends under, so
+      the endpoint up-march the 10-12 pass tried could not matter), and its
+      80 cm outer cells are one cover-rule sample each, porous to a ray
+      through a crown's edge where the near walk's 40 cm block mask ("any
+      blocker in the block") is not. Measured on the up fan: the any-of rule
+      alone 0.60 -> 0.49.
+    So `farSkyFan` (raymarch.wgsl) has two rule sets behind ONE call site
+    (fs is at the 128-register cliff): a FEATURE keeps the calibrated cell-
+    diagonal fan; the HEIGHTFIELD and its cards (`def`) march the near
+    walk's definition over the cascade -- the face's own fan from just off
+    the face (a card asks for the ground's up face), a side face's
+    down-diagonal re-aimed 63 degrees up, real rays with the reach along the
+    ray, the endpoint up-march, and the outer stretch as a block mask (a
+    cell counts if any of its eight children one level finer is a ray
+    blocker) -- and it REPLACES the closed form wherever the prefilter
+    (`farGroundOver`) says anything stands near; open flat ground keeps the
+    closed form, which is what the grid measures there. A map-terrain test
+    (a sample under the level-1 heightfield top is solid) was measured and
+    changed nothing (the cascade's own cells carry the relief at 12 m), so
+    it is not in. The fan is MEDIA-BLIND like the near walk: `farSkySolid`
+    counts a material only if `isRayBlocker`.
+    - Openness, same pixels (near grid / far before / far now): open ground
+      0.30 / 0.38 / 0.35, ground under a crown 0.25 / 0.22 / 0.25, grass
+      blades 0.23 / 0.34 / 0.27. Leaf and bark are untouched (feature fan).
+    - **lod-seam, standalone, before -> after**: ground open noon +9.6 ->
+      +1.2, afternoon +10.1 -> +2.4, dusk +3.0 -> +1.0, overcast +9.6 ->
+      +3.6; ground under a crown +4.6 -> +1.5, +3.8 -> 0.0, 0.0 -> -0.2,
+      +4.5 -> +2.6; plant +6.5 -> -0.6 (noon); leaf and bark within 0.3. The
+      "~4 of bounce excess" the 10-13 handoff assigned was the openness too
+      (an arm that substitutes one term moves the others through
+      shadowLiftCap); no bounce term was changed.
+    - **Same root cause elsewhere, recorded**: the FEATURE fan reads the
+      crowns 0.7x the near definition (leaf 0.14 vs 0.19, bark 0.18 vs 0.21)
+      and leaf / bark luma match only because the feature bounce
+      (`farFeatureBounce`) was calibrated on top of it -- moving features to
+      the definition (measured: leaf 0.21, bark 0.23) is right but needs that
+      calibration redone against the gate; not done here. Any far closed
+      form that assumes "a riser faces the eye on ground rising away" is the
+      same mistake on terrain falling away from the eye (looking down a
+      slope or out over a shore: the risers seen face uphill and their level
+      rays hit the slope); those now take the definition wherever the
+      prefilter fires, which on a slope it does (the uphill neighbour chunk
+      stands over the hit's row).
+    - **Cost** (`--render-budget`, 1080p, exclusive lock, main's exe,
+      budget-only boots, main's shaders -> these; the per-pixel work
+      counters were identical across the boots, and two after-boots agreed
+      within 0.07 ms): noon overlook 10.76 -> 13.33 ms, canopy 7.15 -> 8.34,
+      seamveg 10.51 -> 11.67, cascade 2.77 -> 3.99, meadow 8.58 -> 8.83;
+      summit 3.92 -> 3.89 and peaksea 9.72 -> 9.75 (their far ground is past
+      the 110 m fade). In already: the endpoint climb skips empty chunk rows
+      exactly (without it, 48 masked rows per open ray: cascade 2.8 -> 20.8
+      ms), and the children test reads one farOcc word before any byte.
+      TRIED AND TAKEN OUT: the block mask on climbing rays only and none on
+      the endpoint climb -- noon 13.3 -> 12.5 ms, but ground under a crown
+      went back to +7.7..+8.4 luma (an endpoint under a crown climbs
+      through its porous 80 cm cells). The levers left if the overlook's
+      +2.6 ms is too much (OWNER CALL): end the ground's definition fan
+      nearer than FAR_SKY_FADE_END_M (the seam it closes is at 20.5 m),
+      or move the far ground's openness into the far shadow patch (the
+      resolve pass already marches per patch and caches across frames, so
+      the fan would be paid per patch per refresh, not per pixel per frame).
+      Not measured: `--shader-stats` (fs registers).
+  - **The sea seam closed (2026-10-14, same ticket).** The 10-13 WIP fix
+    (branch `wip/seam-14-23-01` 1da36ec: the bed reads its face's far shadow
+    patch through lodShadowLift / hzSunShade / shadowLiftCap; the far shadow
+    march media-blind in both copies; a wet bed face not buried by its
+    water; the bed's entry face the DDA's last crossing) verified, plus two
+    terms of the same kind: the far bed is SOAKED as worldgen soaks it
+    (`farSoakedAlbedo`: the WET BANKS fixed point of `stainStep` on the bed
+    material's bare word, then applyStain's law at its expected mottle --
+    the near bed under the sea is wet sand, ~12 % darker than the dry
+    palette mean), and the sky fan is media-blind (above). Same-pixel arms
+    on the default map's shelf (2016, 142, -84950) yaw -90 pitch -14,
+    1324x1128, SEAM_DBG 15 colour inside 10-19 m, the path split from a
+    SEAM_DBG 7 near frame, far - near luma MEAN (main -> WIP -> now):
+    shallow water (path < 6 m) noon +2.6 -> +0.9 -> 0.0, minute 960 +8.8 ->
+    +3.3 -> +1.1; water 6-30 m noon 0.0 -> -0.1 -> +0.2, minute 960 -0.3
+    -> -0.1 -> -1.4; the dry beach in the band noon +4.1 -> +2.0, minute 960
+    +10.9 -> +3.0. NOT reproduced (the rest of the shallow +1): the bed's
+    AO, and its openness is still the closed form (a bed seen from the
+    shore is a staircase falling away from the eye, so its visible risers
+    face uphill: near 0.28 against 0.6 far) -- the fix is the same
+    definition fan from the bed face, but that is a second inlined copy of
+    the fan in fs (farWaterBed has two shading call sites) and was not
+    taken without a register measurement.
   **The far water IS shadeWater (2026-10-10).** The near and far water
   shades had been written twice and agreed by calibration. They now share
   the surface law term for term: `waterWaveNormal` (macro slope + Gerstner
@@ -17820,6 +17924,32 @@ where you hear from either (§12b, "The ears are on the character").
   slot fields: a skin whose slot is past 127 (a stamp's flagstone floor)
   invalidates its entry instead of truncating, and the renderer draws the
   cells.
+  **The ground takes the low slots (2026-10-14; tickets
+  `2026-10-13_23-58-42`, `2026-10-14_00-03-23`; materials.cpp
+  `WorldgenMaterialNames`).** Identity-first made that seven-bit limit hit
+  far more than stamp floors. By then 44 of the materials worldgen lays
+  had ids past 127: red_sand, red_sandstone, limestone, chalk_rock, basalt,
+  moor_turf, peat, the savanna, steppe and heath plants, and the maple and
+  gold crowns. Wherever one of them was the ground, the surface-map entry
+  was INVALID. So the desert mesas, the badlands, the moors and every later
+  biome got none of the map's work: no refine, no smooth-normal staircase
+  average, no cover tint. They were plain centre-sampled cells at every
+  level, a different shape at each level seam, beside older biomes that
+  refined. The owner, approaching a mesa: "it transforms radically between
+  lod layers. same with the sand beneath me".
+  The loader now reads every material name a worldgen asset mentions
+  (assets/biomes, water, trees and every map.json, as plain JSON strings, so
+  a new biome material needs no registration).
+  - Under 128, slot == id is kept for that ground, for every id world.h
+    compiles in, and for every plant (MICRO or tagged foliage).
+  - The ground past 127 takes the free slots under 128 from the TOP down.
+    Those ids are bodies, gear and their burning or charred states (brain,
+    iron, flesh_charred, linen, ...), which worldgen never lays.
+  - The displaced materials fill whatever is left.
+  - Past 127 ground materials the loader warns, and `check_invariants.py`
+    (farbits) fails.
+  Today it is 90 distinct owners. Far bytes are render-only and never saved,
+  so a material that moves only moves within the palette.
   **The ground is the ground, not procgen's skin (2026-10-02).**
   `farSurfaceMat` used to colour every cell straddling `h` with procgen's
   skin, so anything laid FLUSH on the ground — the edit layer's gravel tracks,
@@ -18191,7 +18321,7 @@ where you hear from either (§12b, "The ears are on the character").
     `fardown` / `farpatch` keep correct as before. What it gives up: an edited
     column shows the plain cascade cell until a pristine refill of it.
   - **Render** (raymarch.wgsl `farRefineCell`, in traceFar's cell loop, up to
-    `render.farRefineLevel`, ships at 2 — see the measurement below). A cell is a CANDIDATE when it is a
+    `render.farRefineLevel`, shipped at 2, at 8 (every level) since 2026-10-14 — see below). A cell is a CANDIDATE when it is a
     material cell or the flagged air directly over one (one byte read) — so the
     map is loaded for at most a couple of cells per ray, never for the cover-
     height rows of blocker flags the ray crossed on the way down. If its four
@@ -18241,6 +18371,18 @@ where you hear from either (§12b, "The ears are on the character").
     levels 3+ were 0.61 ms of the 4.44 ms cascade camera and nothing on the
     eye-height cameras. The surface MAP is still filled at every level: the
     shading reads it (heightfield normal, cover) wherever the refine does not.
+    **Since 2026-10-14 it refines EVERY level (`render.farRefineLevel` 8;
+    ticket `2026-10-14_00-03-23`).** The cap was right for the eye-height
+    cameras and wrong from the air. From 150 m over a dune field, levels 3-6
+    are the whole picture. Each level's centre samples quantise the ground to
+    its cell height (0.8 / 1.6 / 3.2 / 6.4 m), so any relief shallower than
+    a cell vanished at the level seam where the cell outgrew it. The owner
+    saw "the lod seam between detailed desert and flattened terrain": fine
+    ripples out to the level 4/5 sphere, flat 3.2 m slabs past it.
+    Refined, every level draws its sub-columns at their true fine-voxel
+    heights, so the ripples run on to the horizon at the map's 2x
+    resolution, and the footprint fade averages them once a sub-column is
+    under ~2 px. The cost, measured 2026-10-14 (`--budget-cams cascade`, RTX 3060 Ti 1080p, not exclusive): raymarch 5.20 -> 6.43 ms (+1.23, 19%) against the level-2 cap; `refine2` is the arm that restores the cap.
   - **Gate** `far-surface`: after a full refill every sampled valid level-1
     entry equals `TerrainHeight` (or a fluid surface over it) and the sieve's
     cell holding that top wears the same far slot as the entry's skin; levels
@@ -18277,6 +18419,24 @@ where you hear from either (§12b, "The ears are on the character").
     maintains for free. Four taps, and it is what stops a lake looking like
     tiled glass. Side/bottom faces keep their flat voxel normal (the gradient
     describes the top surface only).
+  - **Any liquid is the same surface (2026-10-14, ticket 2026-10-13_20-56-51).**
+    Every surface-SHAPE probe — the column height (`liquidColumn`), the depth
+    (`waterDepthM`) and fetch (`waterOpenness`) probes, the viscous density
+    field (`liquidDensityAt`; only its silhouette feather keeps the per-material
+    `liquidMatFieldAt`) and `bloodPooling` — reads the fullness of ANY
+    `CLASS_LIQUID` cell (`liquidFullnessAt`), not "my material". They used to
+    ask "is this cell my liquid", so where two liquids met (lye in a pond,
+    blood or oil on water, brine against fresh) each side saw the other as air
+    at its own level, the normal tilted ~55° over the seam, and the far rim
+    went grazing with Fresnel ~1: a one-cell white staircase like an ice rim
+    traced every liquid/liquid boundary. The shape of a liquid is its
+    liquid/air interface; which liquid fills the next column does not move it.
+    What a liquid LOOKS like (optics, palette, oil's sheen) stays per material,
+    so an immiscible pair stays legible by colour, not by a fake crease. The
+    solute look likewise reads each cell's OWN liquid as the solvent
+    (`solLookAt`), not the surface's. Gate: `liquid-seam` (lye / oil / blood
+    patches in a water basin vs the all-water frame: no bright rim, patch
+    still seen).
   - **Ripples** as a sum of 5 directional wave bands (analytic slope, no
     texture), each faded out once the per-pixel footprint approaches its
     wavelength — per-band mip selection done analytically. The footprint must
@@ -19743,10 +19903,61 @@ walking (1324x1128, `--frames`, not exclusive): mean 0.25 -> 0.31 ms a frame
 3.8 (the first frame, where every patch is fresh). The arcs are gone from the
 same frames.
 
-`SEAM_DBG 14` (raymarch.wgsl) is the instrument both were found with: per
-pixel, whether the cache gave NO opinion (the pixel shades as sun), the raw
-cached value, and why a tap had none (found but invalid / no slot); far
-pixels write their patch's (no opinion, value).
+**A miss is not sun** (2026-10-14, ticket `2026-10-14_00-52-22`, "tons of
+bisecting circles of lines of light that run through shadows everywhere as I
+run around"). The fresh-window fix above made a new patch's FIRST answer
+right; the frame before that answer exists was still full sun. A pixel whose
+taps have no opinion shaded lit, on the argument that a one-frame bright edge
+on a newly visible surface is invisible in motion. It is not when the new
+patches lie on a curve. Every LOD boundary of the near reader -- the
+nearest/bilinear switch and each power-of-two pool step -- is a curve of
+constant projected patch size round the camera, and translation drags it
+across the ground, so a moving camera put a fresh 1 px dotted arc of full sun
+through every shadow on every frame. The pool picks made it worse: a step-s
+block read its centre, `s*k + s/2`, and those sets are DISJOINT from one step
+to the next ({1,3} at step 2, {2} at step 4), so crossing a step boundary in
+EITHER direction was a miss. Three parts, all render-only:
+
+1. **Nested pool picks** (`shadowPoolPick`): a step-s block reads
+   `(n & ~(s-1)) | (0x55 & (s-1))`, one low-bit pattern at every step, so the
+   patch a step reads is one every finer step already keeps warm (steps
+   2/4/8 read 1/1/5, within s/4 of the block centre). Stepping coarser is no
+   longer a miss at all.
+2. **A fallback that asks what the cache already knows**
+   (`shadowCachedFallback`, `farShadowFallback`, `farGiFallback`). A pixel
+   with no opinion probes, read-only through the plain-load find (no claim,
+   no request, no atomics): its face's coarser pool patches (stepping finer:
+   the patch it read last frame); the same face of the four in-plane
+   neighbour cells (a surface sliding out from behind an edge); the far
+   cascade's level-1 patch (ground crossing the near/far handoff toward the
+   eye). A far patch with no opinion probes the other refinement, its four
+   in-plane neighbours, the level above and below, and at level 1 the near
+   patch. The far GI word (`farGiCached`) borrows the same way rather than
+   reading 0. Only a surface with none of those -- true disocclusion, the
+   first frame -- still shades lit, for one frame.
+3. **A far blocker at contact is a shadow.** The far resolve published a
+   patch INVALID when its ray met a cell within 0.01 voxels of its start,
+   after the near burial rule; but a far pixel reads one patch with nothing
+   to renormalise onto, so those patches (inside faces of distant canopies,
+   mostly) shaded full sun permanently. The cache-off reference
+   (`farShadowMarch`) answers a contact shadow, and so does the cache now.
+
+**Why no harness had seen it.** The `--at` picture re-renders the world into
+its own texture, and it ran the per-frame prepass first -- which RESOLVES
+every patch the frame had just claimed. Every one-frame cache miss was
+invisible to every `--at` repro, still or in flight; the 2026-10-13 fix was
+verified through that blind spot. An `--at` shot now skips the prepass
+(`main.cpp` `g_shotAsPresented`) and captures the frame as presented.
+Measured through it (ticket camera, 09:30, clear, flying 3.2 m/s across the
+house's shadow, SEAM_DBG 14, mean of 13 frames in flight): near pixels shaded
+full sun by a miss **2,819 -> 146** a frame, far **2,889 -> 356** (still:
+near 239 -> 100, far 902 -> 9). The dotted arcs are gone from the same frames;
+a still frame is unchanged apart from grass-sway noise.
+
+`SEAM_DBG 14` (raymarch.wgsl) is the instrument all three were found with:
+per pixel, whether NOTHING answered (the pixel shades as sun), the shadow
+value, and how a near pixel was answered (0.5 its own taps, 0.75 a fallback
+probe, 1 nothing); far pixels write (nothing answered, value, 0.25).
 
 **What is NOT here.** Soft shadows on the raster body paths. `bodySunShadow`
 casts one ray per FRAGMENT with nowhere to accumulate, so a limb still takes a
@@ -20145,7 +20356,8 @@ stalk), and nothing an edit does lowers it. So a column's top is an answer to
 
 | Reader | Function |
 |---|---|
-| Cascade hits | `farColumnTop` / `farHitBuried`, raymarch.wgsl |
+| Cascade hits | `farFrontTop` / `farHitBuried`, raymarch.wgsl |
+| Far patches (sun skip, gather) | `farFrontTop` / `farBuriedW`, shadow_resolve.wgsl |
 | Shadow rays | `farColumnTop` / `farUnderTerrain`, shadow_resolve.wgsl (shadowBGL 34: `farMap`; the `shadow_resolve` pass-table row reads `FarMap`) |
 | The openness walk | `openTerrainTop` / `openExitUnderTerrain`, sim_openness.wgsl (simBGL 59/60: `farMap` + the far UBO; both openness pass-table rows read them) |
 | The eye | `RenderParams.eyeSky`, World::TerrainHeight on the CPU (genColumn's h exactly), spent from `pad_fb1` |
@@ -20153,6 +20365,28 @@ stalk), and nothing an edit does lowers it. So a column's top is an answer to
 Every one eases over the same band: FAR_BURIED_LO..HI, 2.4-4.8 m under the
 ground, plus two sub-columns of pad. All are continuous in position. The
 eye's value no longer cares which block it stands over.
+
+**A FACE asks about the LOWEST ground it looks out over (2026-10-14; tickets
+`2026-10-13_23-57-48`, `_23-58-42`, `_23-59-16`).** A point (a shadow ray's
+end, the eye) asks its own column. A cascade FACE first asked one
+sub-column, exactly a sub-column out along its normal, and that made every
+steep face in the far field black: grey-and-orange desert mesas showed black
+chevrons along their bands at every distance, which the owner read as holes
+in the rock. The cascade cell is its CENTRE sample, so its face stands up to
+half a cell away from the true surface. The sub-columns beside the sampled
+one differ from it by the slope times the offset. On a wall steeper than
+~2.4 m per sub-column (mesas, buttes, canyon walls, the talus at their feet),
+the sub-column read was the cliff itself. Its top was metres over the hit,
+so burial was 1: no sky, no sun, only the enclosed ambient. (`w` out also sat
+on the boundary between two sub-columns, so floor() read the far one on a
++axis face and the near one on a -axis face.) `farFrontTop` now reads the
+level cell half a sub-column out along `n` (the neighbour across a side
+face; the face's own column for a top face) as one 16-byte `farMap` load
+and takes the MIN of its four tops. A cave, a dungeon hall or a real
+overhang has rock over the whole cell, so its burial is unchanged; a face on
+a slope is under rock only if all the ground in front of it is higher.
+Measured at the 23-59-16 camera, noon: pixels under luma 40 went 14,303 -> 0;
+at 23-57-48 the mesa's blue-grey speckle is gone.
 
 **What each consumer does with it:**
 

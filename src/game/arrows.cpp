@@ -270,6 +270,120 @@ void ArrowFlights::AppendRenderBodies(const ItemLibrary& items, float tickAlpha,
   }
 }
 
+// ---- THE DRAWN BOW AS SEEN ----------------------------------------------------
+
+namespace {
+
+// A one-cell-thick straight length of string from `a` to `b`, out of the
+// bow's rods (its art's own string cell, BowStringArt::rods).
+void PushStringRod(const ItemDef::BowStringArt& bs, Vec3 a, Vec3 b,
+                   std::vector<RenderOnlyBody>& out) {
+  const Vec3 ab = b - a;
+  const float len = ab.len();
+  if (!(len > 1e-4f) || bs.rods.empty()) return;
+  const int n = std::clamp((int)std::lround(len / bs.cell), bs.rodMin,
+                           bs.rodMin + (int)bs.rods.size() - 1);
+  const Vec3 dir = ab * (1.0f / len);
+  const Quat q = QuatNormalize(QuatFromTo(Vec3{1, 0, 0}, dir));
+  RenderOnlyBody r;
+  // The rod's cells sit at y, z in [0, 1) cell: its centre line half a cell
+  // in from the corner the body transform is at.
+  r.pos = a - QuatRotate(q, Vec3{0.0f, 0.5f * bs.cell, 0.5f * bs.cell});
+  r.quat[0] = q.x;
+  r.quat[1] = q.y;
+  r.quat[2] = q.z;
+  r.quat[3] = q.w;
+  r.model = (uint32_t)bs.rods[(size_t)(n - bs.rodMin)];
+  out.push_back(r);
+}
+
+}  // namespace
+
+void PresentDrawnBow(Mob& m, const ItemLibrary& items, std::vector<RenderOnlyBody>& out,
+                     const Vec3* nearEye, float nearClip) {
+  // The half string from its tip `a` toward the fingers `b`, cut where it
+  // first comes within nearClip of the eye (nothing at all if the tip is).
+  auto clipNear = [&](Vec3 a, Vec3& b) {
+    if (nearEye == nullptr || !(nearClip > 0.0f)) return true;
+    const Vec3 ab = b - a, ae = a - *nearEye;
+    const float r2 = nearClip * nearClip;
+    if (ae.dot(ae) <= r2) return false;
+    const float A = ab.dot(ab), B = 2.0f * ae.dot(ab), C = ae.dot(ae) - r2;
+    const float disc = B * B - 4.0f * A * C;
+    if (!(A > 1e-8f) || disc < 0.0f) return true;
+    const float t = (-B - std::sqrt(disc)) / (2.0f * A);
+    if (t >= 0.0f && t < 1.0f) b = a + ab * t;
+    return true;
+  };
+  for (Hand h : {Hand::Right, Hand::Left}) {
+    m.SetHeldRenderModel(h, -1);
+    const std::string& held = m.HeldItem(h);
+    if (held.empty()) continue;
+    const ItemDef* bow = items.Named(held);
+    if (bow == nullptr || !bow->IsBow()) continue;
+    // DRAWN = the draw clip is on and not being let go, and has come most of
+    // the way in: under its blend-in the string hand is still coming up from
+    // the hip, and a string stretched down to it reads as a fault.
+    float w = 0.0f;
+    for (const char* c : {"bow_draw", "bow_draw_crouch"}) {
+      const std::string clip = m.HandClip(c, h);
+      if (!clip.empty() && m.ClipPlaying(clip)) w = std::max(w, m.ClipWeight(clip));
+    }
+    if (w < 0.8f) continue;
+    Vec3 nock{}, grip{};
+    BodyTransform bx{};
+    if (!m.HandSocketWorld(OtherHand(h), nock) || !m.HandSocketWorld(h, grip) ||
+        !m.HeldBodyXf(h, bx))
+      continue;
+    const Quat bq{bx.quat[0], bx.quat[1], bx.quat[2], bx.quat[3]};
+    const ItemDef::BowStringArt& bs = bow->bowString;
+    const float cell = 1.0f / (float)std::max(1u, bow->scale);
+    // THE STRING: the bow's own art with its string taken out, and the
+    // string from each tip to the fingers. A carved bow keeps its own brick
+    // (the damage is only in that one) and its straight string.
+    if (bs.has && !m.HeldCarved(h)) {
+      m.SetHeldRenderModel(h, bs.unstrungModel);
+      for (const Vec3& tip : {bs.from, bs.to}) {
+        const Vec3 a = bx.pos + QuatRotate(bq, tip);
+        Vec3 b = nock;
+        if (clipNear(a, b)) PushStringRod(bs, a, b, out);
+      }
+    }
+    // THE ARROW ON THE STRING: nock at the fingers, laid along the line to
+    // the ARROW REST -- beside the grip, two cells out of the stave on the
+    // side the archer's head is (the bow's flat normal, signed toward it),
+    // where the shaft lies against the bow and where the flight leaves from.
+    const ItemDef* ammo = items.Named(bow->bow.ammo);
+    if (ammo == nullptr || !ammo->IsAmmo() || ammo->microModel < 0) continue;
+    Vec3 rest = grip;
+    if (bs.has) {
+      // The flat normal: across the plane the string and the stave's bend lie
+      // in -- the string's axis crossed with the line from the string's
+      // middle to the grip.
+      const Vec3 axis = QuatRotate(bq, bs.to - bs.from);
+      const Vec3 bend = grip - (bx.pos + QuatRotate(bq, (bs.from + bs.to) * 0.5f));
+      Vec3 n = axis.cross(bend);
+      const float nl = n.len();
+      Vec3 head{};
+      if (nl > 1e-5f && m.PartCornerWorld("head", head)) {
+        n = n * (1.0f / nl);
+        if ((head - grip).dot(n) < 0.0f) n = n * -1.0f;
+        rest = grip + n * (2.0f * cell);
+      }
+    }
+    Vec3 dir = rest - nock;
+    const float dl = dir.len();
+    if (!(dl > 1e-4f)) continue;
+    dir = dir * (1.0f / dl);
+    const BodyTransform axf = ArrowXf(*ammo, nock + dir * ammo->arrow.length, dir);
+    RenderOnlyBody a;
+    a.pos = axf.pos;
+    for (int k = 0; k < 4; k++) a.quat[k] = axf.quat[k];
+    a.model = (uint32_t)ammo->microModel;
+    out.push_back(a);
+  }
+}
+
 void ArrowFlights::Log(const ArrowEvent& e) {
   // Bounded (rule 2): the gate's window, not a history.
   if (events_.size() >= kMaxEvents)

@@ -2338,14 +2338,21 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             // length is flown past. It starts among the shooter's own limbs;
             // those are the flight's ignore list, and the shooter's own
             // velocity rides along.
-            constexpr float kAhead = 6.5f;     // world voxels
+            //
+            // WHERE THE NOCKED ARROW'S POINT WAS (2026-10-14): the drawn
+            // pose holds the arrow parallel to the look under the eye, its
+            // point 6.75 voxels out (bow_draw*, solved by
+            // gen_archery_clips.py so the shaft is on the reticle; drawn by
+            // arrows.cpp PresentDrawnBow), so the flight starts there and
+            // the arrow the player was looking at is the one that flies.
+            constexpr float kAhead = 6.75f;    // world voxels
             constexpr float kZero = 300.0f;    // 30 m
             const Vec3 eye = player.EyePos();
             const Vec3 fwd = cam.Forward();
             const float side = bowHand == Hand::Left ? -1.0f : 1.0f;
             const Vec3 rest = eye + fwd * kAhead +
-                              cam.Right() * (side * (crouchDraw ? 0.4f : 1.0f)) -
-                              cam.Up() * (crouchDraw ? 1.7f : 1.4f);
+                              cam.Right() * (side * (crouchDraw ? 0.44f : 0.0f)) -
+                              cam.Up() * (crouchDraw ? 1.1f : 1.35f);
             std::vector<uint64_t> ignore;
             avatar.AppendLiveLimbBodies(ignore);
             if (playerBody) ignore.push_back(playerBody);

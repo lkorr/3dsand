@@ -575,6 +575,24 @@ struct ItemDef {
     std::string ammo;         // the item id it shoots
   } bow;
   bool IsBow() const { return bow.has && kind == ItemKind::Melee; }
+  // THE STRING AS ART (the sidecar's `string` block, melee.cpp): what a DRAWN
+  // bow looks like. While a creature draws, its held bow is drawn from
+  // `unstrungModel` -- the same art with the string's cells taken out -- and
+  // the string is drawn as two straight lengths of `rods` from the tips
+  // (`from`, `to`) to the string hand, with the nocked arrow along it
+  // (game/arrows.h PresentDrawnBow). Render-only, never hashed: the bow's
+  // body and lattice keep their string. Points are in the body frame (world
+  // voxels from the lattice origin, as ArrowSpec::tip); `rods[k]` is a
+  // one-cell-thick length of string `rodMin + k` art cells long along +x,
+  // `cell` world voxels per art cell.
+  struct BowStringArt {
+    bool has = false;
+    Vec3 from{}, to{};
+    int unstrungModel = -1;
+    int rodMin = 0;
+    std::vector<int> rods;
+    float cell = 1.0f;
+  } bowString;
 
   // AMMUNITION (ItemKind::Ammo): the penetrator it flies as (phys/kerf.h).
   // Everything but the speed, which is the bow's; the POINT is the art's.

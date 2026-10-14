@@ -3,8 +3,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <nlohmann/json.hpp>
 
 // For the voxel-word stain limits (kStainTypeMax / kStainAmtMax): the stain a
@@ -18,6 +20,88 @@ static_assert(kMatFarPalSlots == kFarPalBlocker && kFarPalBlocker < kFarPaletteS
               "far slots are 0..254 of one byte; 255 is the blocker-only cell");
 
 using nlohmann::json;
+
+// The largest far slot the far SURFACE MAP's seven-bit skin / sub-skin fields
+// (and the feature words') can name: worldgen.wgsl FAR_MAP_SLOT_MAX, world.h
+// "THE FAR SURFACE MAP" layout. A ground material past it makes its entry
+// invalid, so the slot assignment below keeps the ground under it.
+static constexpr uint32_t kFarMapSlotLimit = 0x7Fu;
+
+// The material ids world.h compiles in (kMat*), by name: CheckPinnedMaterialIds
+// below holds materials.json to them, and the far slot assignment keeps them in
+// their identity slots (worldgen and the shaders name several of them).
+struct MatPin {
+  uint32_t id;
+  const char* name;
+};
+static const MatPin kPins[] = {
+    {kMatAir, "air"}, {kMatStone, "stone"}, {kMatWood, "wood"},
+    {kMatSand, "sand"}, {kMatGravel, "gravel"}, {kMatWater, "water"},
+    {kMatOil, "oil"}, {kMatSmoke, "smoke"}, {kMatSteam, "steam"},
+    {kMatFire, "fire"}, {kMatEmber, "ember"}, {kMatAsh, "ash"},
+    {kMatLava, "lava"}, {kMatAcid, "acid"}, {kMatIce, "ice"},
+    {kMatSnow, "snow"}, {kMatDirt, "dirt"}, {kMatPlant, "plant"},
+    {kMatSeed, "seed"}, {kMatSprout, "sprout"}, {kMatStem, "stem"},
+    {kMatFlower, "flower"}, {kMatVine, "vine"}, {kMatFungus, "fungus"},
+    {kMatDust, "dust"}, {kMatMoltenGlass, "molten_glass"},
+    {kMatGlass, "glass"}, {kMatSourceWater, "source_water"},
+    {kMatSourceSand, "source_sand"}, {kMatSourceLava, "source_lava"},
+    {kMatVoid, "void"}, {kMatMite, "mite"}, {kMatBlood, "blood"},
+    {kMatGrass, "grass"}, {kMatLeaves, "leaves"},
+    {kMatPineNeedles, "pine_needles"}, {kMatAutumnLeaves, "autumn_leaves"},
+    {kMatBirchWood, "birch_wood"}, {kMatPetal, "petal"},
+    {kMatGrassTuft, "grass_tuft"}, {kMatFoliageBush, "foliage_bush"},
+    {kMatFlowerPoppy, "flower_poppy"}, {kMatFlowerDaisy, "flower_daisy"},
+    {kMatPetalRed, "petal_red"}, {kMatPetalWhite, "petal_white"},
+    {kMatPetalYellow, "petal_yellow"}, {kMatLeafGreen, "leaf_green"},
+    {kMatStemGreen, "stem_green"}, {kMatFlowerBluebell, "flower_bluebell"},
+    {kMatFlowerFoxglove, "flower_foxglove"},
+    {kMatFlowerButtercup, "flower_buttercup"}, {kMatFern, "fern"},
+    {kMatMushroomCluster, "mushroom_cluster"},
+    {kMatToadstoolPale, "toadstool_pale"}, {kMatTallGrass, "tall_grass"},
+    {kMatTallGrassHead, "tall_grass_head"},
+    {kMatMushroomLarge, "mushroom_large"},
+};
+
+// Every material NAME a worldgen asset mentions: the biomes (skins, relief,
+// cover, trees, caves), the water presets (beds, shores, flora), the tree
+// species (wood, crowns) and every map.json (palette, sites). Read as plain
+// strings out of the JSON, values only -- over-inclusion only costs a low far
+// slot -- relative to the materials file (assets/materials/materials.json),
+// so SANDVOX_ASSET_DIR trees resolve their own. Missing dirs are skipped.
+static std::set<std::string> WorldgenMaterialNames(const std::string& materialsPath) {
+  namespace fs = std::filesystem;
+  std::set<std::string> out;
+  std::error_code ec;
+  const fs::path root = fs::path(materialsPath).parent_path().parent_path();
+  std::vector<fs::path> files;
+  for (const char* sub : {"biomes", "water", "trees"}) {
+    for (fs::directory_iterator it(root / sub, ec), end; !ec && it != end; it.increment(ec))
+      if (it->path().extension() == ".json") files.push_back(it->path());
+    ec.clear();
+  }
+  for (fs::directory_iterator it(root / "worldmap", ec), end; !ec && it != end; it.increment(ec)) {
+    const fs::path m = it->path() / "map.json";
+    if (fs::exists(m, ec)) files.push_back(m);
+  }
+  std::sort(files.begin(), files.end());
+  std::vector<const json*> stack;
+  for (const fs::path& p : files) {
+    std::ifstream f(p);
+    if (!f) continue;
+    json j;
+    try { j = json::parse(f); } catch (const std::exception&) { continue; }
+    stack.assign(1, &j);
+    while (!stack.empty()) {
+      const json* n = stack.back();
+      stack.pop_back();
+      if (n->is_string()) out.insert(n->get<std::string>());
+      else if (n->is_array() || n->is_object())
+        for (const auto& c : *n) stack.push_back(&c);
+    }
+  }
+  return out;
+}
 
 std::string FormatMille(double mille) {
   char buf[32];
@@ -1184,8 +1268,9 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
   // for two materials that should be indistinguishable at distance (sandstone
   // is sand's colour, so a firmed sand skin does not change the far field).
   //
-  // IDENTITY FIRST: while every material's id fits, slot == id. Aliases FREE
-  // slots, and pass 2 hands the freed ones to the ids that no longer fit.
+  // IDENTITY WHERE IT CAN BE, THE GROUND UNDER 128 (below): slot == id for
+  // most materials; aliases FREE slots; the worldgen ground past id 127 takes
+  // a slot under 128, and whatever it displaced fills the freed ones.
   {
     std::vector<int> aliasOf(mats.size(), -1);
     for (size_t i = 0; i < mats.size(); i++) {
@@ -1237,13 +1322,88 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
                 " in materials.json so they share a slot, or widen the far cell"
                 " (farVox is already 1 GiB).\n";
 
+    // THE GROUND TAKES THE LOW SLOTS (2026-10-14; tickets 2026-10-13_23-58-42,
+    // 2026-10-14_00-03-23). The far SURFACE MAP's entry and the feature words
+    // carry a slot in SEVEN bits (world.h kFarMap*, worldgen.wgsl
+    // FAR_MAP_SLOT_MAX), and an entry whose skin or sub-skin slot is over 127
+    // is written INVALID -- so under pure identity every material added after
+    // the first 127 lost the whole surface-map path wherever it is the ground:
+    // the refine, the smooth-normal staircase average, the cover tint. That
+    // was 44 of the 106 materials worldgen lays (red_sand, red_sandstone,
+    // limestone, chalk_rock, basalt, moor_turf, peat, the savanna / steppe /
+    // heath plants, the maple and gold crowns ...): the desert mesas, the
+    // badlands, the moors and every later biome drew plain centre-sampled
+    // cells at every level -- a different shape at each level seam -- next to
+    // older biomes that refined. So the slots under 128 go to the GROUND first.
+    // GROUND = every material a worldgen asset names (assets/biomes, water,
+    // trees, and every map.json; read here by name, so a new biome material
+    // needs no registration). Under 128 slot == id is KEPT for the ground, for
+    // every id world.h compiles in (kPins: worldgen and the shaders name some
+    // of them), and for every plant (MICRO or tagged foliage: a cover plant or
+    // a crown can reach the map's fields by a path no JSON names). The ground
+    // past 127 then takes the free slots under 128 from the TOP down -- the
+    // ids nearest 127 are bodies, gear and their burning / charred states
+    // (brain, iron, flesh_charred, linen, ...), which worldgen never lays --
+    // and those displaced materials, like every other id, keep slot == id if
+    // it is still free and otherwise fill whatever is left. Far bytes are
+    // render-only and never saved, so a material that moves only moves within
+    // the far palette; the CPU (FarEdits, stream.cpp) reads farPalSlot like the
+    // GPU does.
+    std::vector<bool> ground(mats.size(), false);
+    std::vector<bool> keep(mats.size(), false);
+    {
+      const std::set<std::string> named = WorldgenMaterialNames(path);
+      for (size_t i = 1; i < mats.size(); i++) {
+        const MaterialDef& d = mats[i];
+        const int own = aliasOf[i] >= 0 ? aliasOf[i] : (int)i;   // the slot is the owner's
+        bool pinned = false;
+        for (const MatPin& p : kPins) pinned = pinned || d.name == p.name;
+        const bool plant =
+            (d.gpu.flags & kMatFlagMicro) != 0 ||
+            std::find(d.tags.begin(), d.tags.end(), std::string("foliage")) != d.tags.end();
+        if (named.count(d.name)) ground[own] = true;
+        if (named.count(d.name) || pinned || plant) keep[own] = true;
+      }
+    }
     std::vector<int> ownerOf(kMatFarPalSlots, -1);   // slot -> material
     std::vector<int> slotOf(mats.size(), -1);
-    for (size_t i = 0; i < mats.size() && i < kMatFarPalSlots; i++) {
-      if (aliasOf[i] >= 0) continue;
+    const size_t kSurfSlots = (size_t)kFarMapSlotLimit + 1;   // slots 0..127
+    // 1. air, and every kept material under 128, in its identity slot
+    for (size_t i = 0; i < mats.size() && i < kSurfSlots; i++) {
+      if (aliasOf[i] >= 0 || (i != 0 && !keep[i])) continue;
       ownerOf[i] = (int)i;
       slotOf[i] = (int)i;
     }
+    // 2. ground past 127: the highest slot under 128 still free
+    size_t groundOver = 0;
+    std::string groundOverNames;
+    {
+      int hi = (int)kFarMapSlotLimit;
+      for (size_t i = kSurfSlots; i < mats.size(); i++) {
+        if (aliasOf[i] >= 0 || !ground[i]) continue;
+        while (hi > 0 && ownerOf[hi] >= 0) hi--;
+        if (hi <= 0) {
+          groundOver++;
+          groundOverNames += (groundOverNames.empty() ? "" : ", ") + mats[i].name;
+          continue;
+        }
+        ownerOf[hi] = (int)i;
+        slotOf[i] = hi;
+      }
+    }
+    if (groundOver > 0)
+      std::fprintf(stderr,
+                   "materials: %zu worldgen material(s) past the far surface map's "
+                   "%u slots (%s): their ground draws as plain far cells, without "
+                   "the refine or the cover tint (widen the farMap slot fields)\n",
+                   groundOver, kFarMapSlotLimit, groundOverNames.c_str());
+    // 3. everything else in its identity slot where that is still free
+    for (size_t i = 1; i < mats.size() && i < kMatFarPalSlots; i++) {
+      if (aliasOf[i] >= 0 || slotOf[i] >= 0 || ownerOf[i] >= 0) continue;
+      ownerOf[i] = (int)i;
+      slotOf[i] = (int)i;
+    }
+    // 4. the rest fill the free slots in id order
     uint32_t probe = 0;
     for (size_t i = 0; i < mats.size(); i++) {
       if (aliasOf[i] >= 0 || slotOf[i] >= 0) continue;
@@ -2217,39 +2377,7 @@ bool LoadAssets(const std::string& materialsPath, const std::string& reactionsPa
 // the same list, so a new kMat* without a row here fails the static check.
 void CheckPinnedMaterialIds(const std::vector<MaterialDef>& mats,
                             const std::string& path, std::string& errors) {
-  struct Pin {
-    uint32_t id;
-    const char* name;
-  };
-  static const Pin kPins[] = {
-      {kMatAir, "air"}, {kMatStone, "stone"}, {kMatWood, "wood"},
-      {kMatSand, "sand"}, {kMatGravel, "gravel"}, {kMatWater, "water"},
-      {kMatOil, "oil"}, {kMatSmoke, "smoke"}, {kMatSteam, "steam"},
-      {kMatFire, "fire"}, {kMatEmber, "ember"}, {kMatAsh, "ash"},
-      {kMatLava, "lava"}, {kMatAcid, "acid"}, {kMatIce, "ice"},
-      {kMatSnow, "snow"}, {kMatDirt, "dirt"}, {kMatPlant, "plant"},
-      {kMatSeed, "seed"}, {kMatSprout, "sprout"}, {kMatStem, "stem"},
-      {kMatFlower, "flower"}, {kMatVine, "vine"}, {kMatFungus, "fungus"},
-      {kMatDust, "dust"}, {kMatMoltenGlass, "molten_glass"},
-      {kMatGlass, "glass"}, {kMatSourceWater, "source_water"},
-      {kMatSourceSand, "source_sand"}, {kMatSourceLava, "source_lava"},
-      {kMatVoid, "void"}, {kMatMite, "mite"}, {kMatBlood, "blood"},
-      {kMatGrass, "grass"}, {kMatLeaves, "leaves"},
-      {kMatPineNeedles, "pine_needles"}, {kMatAutumnLeaves, "autumn_leaves"},
-      {kMatBirchWood, "birch_wood"}, {kMatPetal, "petal"},
-      {kMatGrassTuft, "grass_tuft"}, {kMatFoliageBush, "foliage_bush"},
-      {kMatFlowerPoppy, "flower_poppy"}, {kMatFlowerDaisy, "flower_daisy"},
-      {kMatPetalRed, "petal_red"}, {kMatPetalWhite, "petal_white"},
-      {kMatPetalYellow, "petal_yellow"}, {kMatLeafGreen, "leaf_green"},
-      {kMatStemGreen, "stem_green"}, {kMatFlowerBluebell, "flower_bluebell"},
-      {kMatFlowerFoxglove, "flower_foxglove"},
-      {kMatFlowerButtercup, "flower_buttercup"}, {kMatFern, "fern"},
-      {kMatMushroomCluster, "mushroom_cluster"},
-      {kMatToadstoolPale, "toadstool_pale"}, {kMatTallGrass, "tall_grass"},
-      {kMatTallGrassHead, "tall_grass_head"},
-      {kMatMushroomLarge, "mushroom_large"},
-  };
-  for (const Pin& p : kPins) {
+  for (const MatPin& p : kPins) {
     if (p.id < mats.size() && mats[p.id].name == p.name) continue;
     const int at = FindMaterial(mats, p.name);
     errors += path + ": world.h pins material id " + std::to_string(p.id) +

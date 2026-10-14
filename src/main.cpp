@@ -402,6 +402,17 @@ constexpr uint64_t kShotJumpLastFrame = 420;
 enum class JumpShot { Rise, Apex, Fall, Land, Done };
 JumpShot g_shotJumpWant = JumpShot::Rise;
 const char* g_shotJumpPath = nullptr;  // set for exactly one frame, then taken
+// THE --at PICTURE IS THE FRAME AS PRESENTED (ticket 2026-10-14_00-52-22).
+// The capture block re-renders the world into its own texture, and it used to
+// run the per-frame prepass (EncodeShadowResolve) first -- which resolves every
+// shadow-cache patch the frame just claimed. So a pixel that shaded as full sun
+// on screen because its patch was new this frame was RESOLVED in the picture:
+// every one-frame cache miss (the bright arcs a moving camera drags through
+// shadows) was invisible to every --at repro, still or in flight. An --at shot
+// sets this for its one frame and the capture skips the prepass: the frame's
+// claims, registrations, clouds and ray-start map are all still this frame's,
+// so the re-render reads the cache in the state the presented frame read it.
+bool g_shotAsPresented = false;
 // `--shot-swim`: the SWIM POSE's look-iteration harness (pose.cpp, "the swim
 // family"). The player is dropped into the harness map's fixture lake in third
 // person and scripted through tread -> crawl -> down -> dive -> up, one BMP per
@@ -12907,6 +12918,7 @@ int main(int argc, char** argv) {
         atShotName = "screenshot_at_" + std::to_string(frameCounter) + ".bmp";
         g_shotJumpPath = atShotName.c_str();
       }
+      g_shotAsPresented = g_shotJumpPath != nullptr;
       // SANDVOX_AT_FARPROBE=x,y,z[,level]: the cascade cells the picture drew
       // around one fine voxel -- a 5x5 slab in XZ at the voxel's level cell
       // row, as the GPU holds them (byte = far slot | blocker bit) beside the
@@ -16804,9 +16816,17 @@ int main(int argc, char** argv) {
                 session.bowHand >= 0
                     ? items.Named(avatar.HeldItem(HandAt(session.bowHand)))
                     : nullptr;
-            if (session.bowDrawTicks > 0 && session.bowHand >= 0 &&
-                (fpBow == nullptr ||
-                 BowDrawFraction(*fpBow, session.bowDrawTicks) >= 0.75f)) {
+            // ...AND WHILE THE CLIP LETS GO after the loose: the hand falls
+            // from the jaw through the lens on the blend-out.
+            float fpLetGo = 0.0f;
+            if (session.bowDrawTicks == 0 && session.bowHand >= 0)
+              for (const char* c : {"bow_draw", "bow_draw_crouch"})
+                fpLetGo += avatar.ClipWeight(avatar.HandClip(c, HandAt(session.bowHand)).c_str());
+            if (session.bowHand >= 0 &&
+                ((session.bowDrawTicks > 0 &&
+                  (fpBow == nullptr ||
+                   BowDrawFraction(*fpBow, session.bowDrawTicks) >= 0.75f)) ||
+                 fpLetGo > 0.02f)) {
               const bool bowLeft = HandAt(session.bowHand) == Hand::Left;
               for (const char* nm : {bowLeft ? "armL.R" : "armL.L",
                                      bowLeft ? "hand.R" : "hand.L"}) {
@@ -20967,6 +20987,21 @@ int main(int argc, char** argv) {
       static std::vector<RenderOnlyBody> flightBodies;
       flightBodies.clear();
       tickCtx.arrows.AppendRenderBodies(items, tickAlpha, flightBodies);
+      // THE DRAWN BOWS (game/arrows.h PresentDrawnBow): the string pulled
+      // back to the hand and the arrow nocked on it, every creature drawing
+      // one (the player, an NPC archer), off the pose this frame draws.
+      {
+        bool avatarSeen = false;
+        mobs.ForEachCreature([&](Mob& m) {
+          if (&m == static_cast<Mob*>(&avatar)) avatarSeen = true;
+          // First person: the player's own string is cut short of the lens.
+          const bool fp = &m == static_cast<Mob*>(&avatar) && camMode == CameraMode::First;
+          PresentDrawnBow(m, items, flightBodies, fp ? &eye : nullptr, 2.5f);
+        });
+        if (!avatarSeen)
+          PresentDrawnBow(avatar, items, flightBodies,
+                          camMode == CameraMode::First ? &eye : nullptr, 2.5f);
+      }
       bodyReg.SetRenderOnly(&flightBodies);
       const auto bodyT0 = std::chrono::steady_clock::now();
       // WHO ELSE IS HOLDING MY ARM. One index sweep while everything is
@@ -21904,7 +21939,9 @@ int main(int argc, char** argv) {
             rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
             "inventoryShot");
         rhi::CommandEncoder senc = ctx.device.CreateCommandEncoder();
-        sim.EncodeShadowResolve(senc);
+        // Not for an --at picture: see g_shotAsPresented.
+        if (!g_shotAsPresented) sim.EncodeShadowResolve(senc);
+        g_shotAsPresented = false;
         rhi::RenderPass srp = sim.BeginRenderPass(
             senc, shotTex.CreateView(), ctx.surfaceFormat, W, H);
         sim.DrawWorld(srp);

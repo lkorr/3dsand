@@ -87,6 +87,27 @@ float BowArrowSpeed(const ItemDef& bow, int ticks);
 // The penetrator an arrow flies as, at `speedMps`.
 Penetrator ArrowPenetrator(const ItemDef& arrow, float speedMps, uint32_t seed);
 
+// THE DRAWN BOW AS SEEN (2026-10-14, owner: "drawing a bow should actually
+// draw the string, and there should be a visibly notched arrow that flies
+// out"). For a creature whose bow_draw* clip is playing and has come in: the
+// held bow is drawn from its string-less art (ItemDef::BowStringArt,
+// Mob::SetHeldRenderModel), the string as two straight lengths from the tips
+// to the string hand, and the arrow on it -- nock at the string hand, along
+// the line to the arrow rest beside the grip, so its point stands past the
+// bow. Pushed onto `out` as render-only bodies (game/renderonly.h). Run once
+// per creature per frame, before the body registry builds its draw list (it
+// also resets the held render model, so a bow put down shows its own art).
+// Nothing here is read by the tick: on the loose the clip stops, this draws
+// nothing, and the flight -- launched from the same arrow rest (session.cpp)
+// -- is what flies out.
+//
+// `nearEye` (first person, the camera): the string is cut off `nearClip`
+// world voxels short of it. The fingers are a hand's breadth under the eye,
+// so the last of each half string passes the lens, and a one-cell string
+// there fills a third of the view.
+void PresentDrawnBow(Mob& m, const ItemLibrary& items, std::vector<RenderOnlyBody>& out,
+                     const Vec3* nearEye = nullptr, float nearClip = 0.0f);
+
 // THE DROP, PAID IN ADVANCE: the point to aim at so an arrow loosed from
 // `from` at `speedVox` world voxels/s comes down onto `to` -- `to` raised by
 // what this flight's own gravity takes off it on the way (the integrator's

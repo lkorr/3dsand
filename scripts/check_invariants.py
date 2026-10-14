@@ -2187,6 +2187,47 @@ def check_far_material_bits():
             f"holds {want}. Give the look-alikes a \"far\": \"<material>\" so "
             "they share a slot, or widen the far cell.")
 
+    # THE GROUND TAKES THE LOW SLOTS (materials.cpp WorldgenMaterialNames,
+    # 2026-10-14): the far surface map's skin / sub-skin fields are seven
+    # bits, so every material a worldgen asset names must fit in slots 1..127
+    # or its ground loses the refine. The loader assigns them first and only
+    # warns past the limit; this fails the moment a data edit crosses it.
+    import glob as _glob
+    import os as _os
+    names = set()
+    def _walk(n):
+        if isinstance(n, str):
+            names.add(n)
+        elif isinstance(n, dict):
+            for v in n.values():
+                _walk(v)
+        elif isinstance(n, list):
+            for v in n:
+                _walk(v)
+    base = _os.path.join(ROOT, "assets")
+    files = []
+    for sub in ("biomes", "water", "trees"):
+        files += _glob.glob(_os.path.join(base, sub, "*.json"))
+    files += _glob.glob(_os.path.join(base, "worldmap", "*", "map.json"))
+    for fpath in files:
+        try:
+            with open(fpath, encoding="utf-8") as fh:
+                _walk(_json.load(fh))
+        except Exception:                                     # noqa: BLE001
+            continue
+    ground = set()
+    for nm in names:
+        r = byname.get(nm)
+        if r is None:
+            continue
+        ground.add(r.get("far") or nm)
+    if len(ground) > 127:
+        problems.append(
+            f"far cell palette slot bits: worldgen names {len(ground)} distinct "
+            "far-slot owners (assets/biomes, water, trees, map.json) but the far "
+            "surface map's seven-bit skin fields hold 127 -- the overflow's ground "
+            "draws as plain far cells; widen the farMap slot fields")
+
 # ------------------------------------------------------- readback ring depth
 def check_readback_ring():
     """World::kFramesInFlight must equal rhi_vulkan.h's kAcquireSlots.

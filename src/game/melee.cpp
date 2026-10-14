@@ -502,6 +502,83 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
       errors += "items: \"" + d.name +
                 "\" has no micro brick and will not render\n";
   }
+
+  // ---- A BOW'S STRING (item.h BowStringArt) --------------------------------
+  // Two scene CELLS, the string's tip cells, converted exactly as the hilt
+  // box's centre is (the (x, z, -y) map, the model-origin rebase) into the
+  // frame the loader's own hilt check measures voxel centres in. The cells ON
+  // that segment are the string: found, not listed, so the check that the
+  // conversion is right is that they are there (most of the segment's length,
+  // one material) -- a wrong frame finds nothing and says so.
+  if (held && d.scale > 1 && s.contains("string") && s["string"].is_object()) {
+    const json& st = s["string"];
+    auto cellAt = [&](const json& c, Vec3& out) {
+      if (!c.is_array() || c.size() != 3) return false;
+      const float x = c[0].get<float>(), y = c[1].get<float>(), z = c[2].get<float>();
+      out = Vec3{x + 0.5f, z + 0.5f, -(y + 0.5f)} * inv - modelOrigin;
+      return true;
+    };
+    Vec3 a{}, b{};
+    if (cellAt(st.value("from", json()), a) && cellAt(st.value("to", json()), b) &&
+        (b - a).len() > inv) {
+      const Vec3 ab = b - a;
+      const float L2 = ab.dot(ab);
+      std::vector<PrefabVoxel> unstrung;
+      unstrung.reserve(d.voxels.size());
+      int onString = 0;
+      const PrefabVoxel* sample = nullptr;
+      for (const PrefabVoxel& v : d.voxels) {
+        const Vec3 c = Vec3{v.x + 0.5f, v.y + 0.5f, v.z + 0.5f} * inv;
+        const float t = std::clamp((c - a).dot(ab) / L2, 0.0f, 1.0f);
+        if ((c - (a + ab * t)).len() <= 0.6f * inv &&
+            (sample == nullptr || v.material == sample->material)) {
+          if (sample == nullptr) sample = &v;
+          onString++;
+          continue;
+        }
+        unstrung.push_back(v);
+      }
+      const int span = (int)std::lround(std::sqrt(L2) / inv) + 1;
+      if (sample == nullptr || onString < span * 3 / 4) {
+        errors += "items: \"" + d.name + "\" string block found " +
+                  std::to_string(onString) + " of ~" + std::to_string(span) +
+                  " string cells on its segment -- the cells are in the wrong "
+                  "frame; the bow will draw with a static string\n";
+      } else {
+        ItemDef::BowStringArt& bs = d.bowString;
+        bs.from = a;
+        bs.to = b;
+        bs.cell = inv;
+        bs.unstrungModel = MicroBodyPack(micro, unstrung, d.size, d.scale,
+                                         "item/" + d.name + "/unstrung", errors);
+        // Every length a half string can take: from a few cells (a tip
+        // pressed to the hand) to a part's 120-cell limit, which is past the
+        // longest tip-to-hand reach of any draw.
+        const PrefabVoxel sv = *sample;
+        bs.rodMin = 4;
+        for (int n = bs.rodMin; n <= 118; n++) {
+          std::vector<PrefabVoxel> rod;
+          rod.reserve((size_t)n);
+          for (int x = 0; x < n; x++) {
+            PrefabVoxel r = sv;
+            r.x = (int16_t)x;
+            r.y = 0;
+            r.z = 0;
+            rod.push_back(r);
+          }
+          const int m = MicroBodyPack(micro, rod, IVec3{n, 1, 1}, d.scale,
+                                      "item/" + d.name + "/string" + std::to_string(n),
+                                      errors);
+          if (m < 0) break;
+          bs.rods.push_back(m);
+        }
+        bs.has = bs.unstrungModel >= 0 && !bs.rods.empty();
+      }
+    } else {
+      errors += "items: \"" + d.name + "\" string block needs `from` and `to` "
+                "cells apart -- ignored\n";
+    }
+  }
   return true;
 }
 

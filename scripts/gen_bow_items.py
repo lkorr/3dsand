@@ -60,7 +60,11 @@ bs.COLOURS.update({
 # middle -- it read as a javelin stuck in a man. The point is still the
 # foremost cell, so every placement that reads ItemDef::ArrowSpec::tip (the
 # flight, the embed, the stuck item) follows the new length by itself.
-ARROW_LEN = 48          # 0.60 m
+# 2026-10-14: 48 -> 52 (0.65 m). The arrow is now SEEN NOCKED on the drawn
+# string (game/arrows.h PresentDrawnBow), and at 0.60 m it was shorter than the
+# draw: its point sat inside the bow hand at full draw. The draw is 46 cells
+# (scripts/gen_archery_clips.py), so 52 puts the point ~6 cm past the grip.
+ARROW_LEN = 52          # 0.65 m
 ARROW_X = 5             # cross-section, odd: the axis through the middle cell
 HEAD_FROM = ARROW_LEN - 7   # socket + point from here on (7 cells, 8.75 cm)
 
@@ -104,6 +108,7 @@ def arrow_cells():
 BOW_LEN = 97            # 1.21 m tip to tip
 BOW_Y = 15              # the bend + brace height (string to belly)
 BOW_Z = 3               # the stave's width
+BOW_STRING_Y = (BOW_Y - 1) // 2 + (BOW_Y - 1) // 2   # string_dy (+7) + the forge's centre row
 GRIP_HALF = 6           # the wrapped grip: 13 cells (16 cm) at the middle
 
 
@@ -198,6 +203,11 @@ def main():
                                 "rotation": [90, -90, 0], "scale": 1}},
         "hilt": {"min": [mid - GRIP_HALF, 3, 0],
                  "size": [2 * GRIP_HALF + 1, 3, bz]},
+        # THE STRING, tip cell to tip cell (scene cells, like the hilt box):
+        # what the drawn bow takes OUT of its art and redraws as two lengths
+        # from the tips to the string hand (game/arrows.h PresentDrawnBow).
+        "string": {"from": [1, BOW_STRING_Y, (bz - 1) // 2],
+                   "to": [bx - 2, BOW_STRING_Y, (bz - 1) // 2]},
     }
     bs.emit(out, "bow", bow, bow_side)
 
