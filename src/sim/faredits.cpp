@@ -1,6 +1,8 @@
 #include "sim/faredits.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 
 #include "sim/chunkstore.h"
 #include "sim/stream.h"  // RleDecodeChunk
@@ -94,6 +96,17 @@ void FarEdits::Sweep(IVec3 wc,
               return sample(x, y, z) & 0xFFFu;
             });
           }
+          // THE THIN RULE (ThinPick): a cell still holding no matter takes a
+          // coherent one-voxel feature of its block. The block is in this
+          // chunk; a face neighbour across the chunk's face is unseen, which
+          // counts as solid (the GPU, seeing the window, may call it thin: a
+          // downsample-only answer, like the container rule's).
+          if (shift <= kThinMaxShift && ThinReady() && !containKind_.empty() &&
+              ContainKindOf(mat & 0xFFFu) == kContainNone) {
+            const int c0[3] = {fine[0] - half - base[0], fine[1] - half - base[1],
+                               fine[2] - half - base[2]};
+            mat = ThinPick(mat & 0xFFFu, half, c0, inChunk);
+          }
           // THE LOOSE TOP (SetLooseSource): worldgen.wgsl farRunTop, over what
           // this side can see. Not a cell the container rule claimed (`mat`
           // still the (despecked) centre); the cover rule only fills non-solid ones.
@@ -168,6 +181,17 @@ void FarEdits::Sweep(IVec3 wc,
 
 int FarEdits::GroundHeight(int x, int z) {
   const uint32_t seed = groundWorld_->WorldSeed();
+  // THE CACHE BELONGS TO ONE MAP. The ground contract is the map's (its height
+  // plane, its sites' pads), so a reload, a structure re-apply or a gate's
+  // fixture map (far-cover's synthetic forest) changes every answer while the
+  // seed stays put. Keyed on the seed alone, the far-thin gate found the
+  // stamps' base words computed on the PREVIOUS gate's flat forest ground
+  // (403 of 427 field cells, against 427 run alone).
+  const uint32_t mapHash = worldmap::CurrentWorldMap().contentHash;
+  if (mapHash != groundMapHash_) {
+    groundH_.clear();
+    groundMapHash_ = mapHash;
+  }
   const uint64_t key = ((uint64_t)seed << 40) ^ ((uint64_t)(uint32_t)x << 20) ^
                        (uint64_t)(uint32_t)z ^ ((uint64_t)(uint32_t)z << 52);
   auto it = groundH_.find(key);
@@ -424,11 +448,148 @@ void FarEdits::StampContainers(std::unordered_map<LKey, std::vector<uint32_t>, L
   }
 }
 
+void FarEdits::StampThin(std::unordered_map<LKey, std::vector<uint32_t>, LKeyHash>& out) {
+  if (!ThinReady() || containKind_.empty() || World::LabWorld()) return;
+  using worldmap::WorldMapData;
+  const WorldMapData& map = worldmap::CurrentWorldMap();
+  std::vector<const WorldMapData::StampSite*> stamps;
+  for (const auto& s : map.sites)
+    if (s.kind == worldmap::kSiteStamp && !s.words.empty() && s.nx > 0 && s.ny > 0 && s.nz > 0)
+      stamps.push_back(&s);
+  if (stamps.empty()) return;
+  // THE CACHE. The answer is a pure function of the stamps' blocks, their
+  // placement and the ground contract's seed; SetBase runs on every
+  // whole-window generation (a teleport, a load), so a map's stamps are
+  // evaluated once and the words reused while that signature holds.
+  uint64_t sig = 1469598103934665603ull;
+  auto mix = [&](uint64_t v) { sig = (sig ^ v) * 1099511628211ull; };
+  mix(groundWorld_ ? groundWorld_->WorldSeed() : 0u);
+  // ...the map (its ground contract decides the cells off every footprint)...
+  mix(map.contentHash);
+  // ...and the material classes the rule reads (a reload may change them).
+  for (uint8_t v : groundSlot_) mix(v);
+  for (uint8_t v : containKind_) mix(v);
+  for (uint8_t v : looseOf_) mix(v);
+  for (uint32_t v : coverOf_) mix(v);
+  for (const auto* s : stamps) {
+    mix((uint32_t)s->x); mix((uint32_t)s->z); mix((uint32_t)s->padY); mix((uint32_t)s->sink);
+    mix((uint32_t)s->bx0); mix((uint32_t)s->bz0); mix((uint32_t)s->x1); mix((uint32_t)s->z1);
+    mix((uint32_t)s->nx); mix((uint32_t)s->ny); mix((uint32_t)s->nz);
+    for (uint32_t w : s->words) mix(w);
+  }
+  if (sig == stampThinSig_ && stampThinValid_) {
+    for (const auto& kv : stampThinWords_)
+      out[kv.first].insert(out[kv.first].end(), kv.second.begin(), kv.second.end());
+    return;
+  }
+  stampThinWords_.clear();
+  const auto t0 = std::chrono::steady_clock::now();
+  // Each stamp's template as a dense block (run word: material 0..11, y0
+  // 16..26, length 27..31, treeatlas.h), in the world frame StampContainers'
+  // stampAt reads it in.
+  struct Dense {
+    const WorldMapData::StampSite* s;
+    int ox, oy, oz;   // world voxel of local (0, 0, 0)
+    std::vector<uint16_t> m;
+  };
+  std::vector<Dense> dense;
+  dense.reserve(stamps.size());
+  for (const auto* sp : stamps) {
+    const WorldMapData::StampSite& s = *sp;
+    Dense d;
+    d.s = sp;
+    d.ox = s.x - s.nx / 2;
+    d.oy = s.padY + 1 - s.sink;
+    d.oz = s.z - s.nz / 2;
+    d.m.assign((size_t)s.nx * s.ny * s.nz, 0);
+    for (int lz = 0; lz < s.nz; lz++)
+      for (int lx = 0; lx < s.nx; lx++) {
+        const size_t ci = worldmap::kStampHdrWords + ((size_t)lz * s.nx + lx) * 2;
+        const uint32_t runOff = s.words[ci], cnt = s.words[ci + 1];
+        for (uint32_t k = 0; k < cnt; k++) {
+          const uint32_t r = s.words[runOff + k];
+          const int y0 = (int)((r >> 16) & treeatlas::kRunMaxY0);
+          const int len = (int)(r >> 27);
+          for (int ly = y0; ly < y0 + len && ly < s.ny; ly++)
+            d.m[((size_t)ly * s.nz + lz) * s.nx + lx] = (uint16_t)(r & 0xFFFu);
+        }
+      }
+    dense.push_back(std::move(d));
+  }
+  auto denseAt = [](const Dense& d, int x, int y, int z) -> uint32_t {
+    const int lx = x - d.ox, ly = y - d.oy, lz = z - d.oz;
+    if (lx < 0 || ly < 0 || lz < 0 || lx >= d.s->nx || ly >= d.s->ny || lz >= d.s->nz) return 0;
+    return d.m[((size_t)ly * d.s->nz + lz) * d.s->nx + lx];
+  };
+  size_t words = 0;
+  for (size_t si = 0; si < dense.size(); si++) {
+    const Dense& D = dense[si];
+    const WorldMapData::StampSite& s = *D.s;
+    // The stamps whose block or pad this one's grown box meets: genCellIn's
+    // first stamp wins a voxel (wmStampsCell), and a pad levels the ground.
+    const int lo[3] = {D.ox - 1, D.oy - 1, D.oz - 1};
+    const int hi[3] = {D.ox + s.nx, D.oy + s.ny, D.oz + s.nz};
+    std::vector<const Dense*> near;
+    for (const Dense& o : dense) {
+      const int olo[2] = {std::min(o.ox, o.s->bx0), std::min(o.oz, o.s->bz0)};
+      const int ohi[2] = {std::max(o.ox + o.s->nx - 1, o.s->x1), std::max(o.oz + o.s->nz - 1, o.s->z1)};
+      if (olo[0] > hi[0] || ohi[0] < lo[0] || olo[1] > hi[2] || ohi[1] < lo[2]) continue;
+      near.push_back(&o);
+    }
+    // What genCellIn puts at a voxel as far as this side can say (StampContainers'
+    // matAt): the first stamp's template voxel; under template air a footprint's
+    // pad ground, or off every footprint the ground contract.
+    auto matAt = [&](int x, int y, int z) -> int {
+      for (const Dense* o : near)
+        if (const uint32_t m = denseAt(*o, x, y, z)) return (int)m;
+      for (const Dense* o : near)
+        if (x >= o->s->bx0 && x <= o->s->x1 && z >= o->s->bz0 && z <= o->s->z1)
+          return y <= o->s->padY ? kMatAtGround : (int)kMatAir;
+      if (!groundWorld_) return kMatAtUnseen;
+      return y <= GroundHeight(x, z) ? kMatAtGround : (int)kMatAir;
+    };
+    for (uint32_t level = 1; level <= kFarLevels; level++) {
+      const int shift = (int)(level + kFarShiftBase);
+      if (shift > kThinMaxShift) break;
+      const int step = 1 << shift, half = 1 << (shift - 1);
+      // The cells the block meets: a thin cell holds a block voxel.
+      for (int cz = FDiv(D.oz, step); cz <= FDiv(D.oz + s.nz - 1, step); cz++)
+        for (int cy = FDiv(D.oy, step); cy <= FDiv(D.oy + s.ny - 1, step); cy++)
+          for (int cx = FDiv(D.ox, step); cx <= FDiv(D.ox + s.nx - 1, step); cx++) {
+            const int c0[3] = {cx * step, cy * step, cz * step};
+            const int centre = matAt(c0[0] + half, c0[1] + half, c0[2] + half);
+            // Matter at the centre (template matter, or the ground) keeps it.
+            if (centre < 0 || ContainKindOf((uint32_t)centre) != kContainNone) continue;
+            // Only this stamp's own voxels decide here: a cell a neighbour
+            // stamp's block also meets is that stamp's to file as well, and
+            // both file the same word (the same matAt), so the order is moot.
+            const uint32_t mat = ThinPick((uint32_t)centre, half, c0, matAt);
+            if (mat == (uint32_t)centre) continue;
+            const uint32_t ci =
+                (uint32_t)(((cz & 15) * (int)kChunk + (cy & 15)) * (int)kChunk + (cx & 15));
+            stampThinWords_[LKey{cx >> 4, cy >> 4, cz >> 4, level}].push_back((mat << kCellBits) | ci);
+            words++;
+          }
+    }
+  }
+  stampThinSig_ = sig;
+  stampThinValid_ = true;
+  stampThinCount_ = words;
+  std::printf("far: thin rule over %zu stamps: %zu cells in %.1f ms\n", stamps.size(), words,
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+  for (const auto& kv : stampThinWords_)
+    out[kv.first].insert(out[kv.first].end(), kv.second.begin(), kv.second.end());
+}
+
 void FarEdits::SetBase(const std::vector<BaseCell>& cells) {
   base_.clear();
   merged_.clear();
-  // The stamps' container cells first, so the layer's own words (appended
-  // below, and the compaction keeps the last of a cell) win where both speak.
+  // The stamps' THIN cells (the thin rule over every stamp's block), then
+  // their container cells, so a container wall wins a cell both claim (the
+  // compaction keeps the last word of a cell, and the GPU's container pass
+  // runs after its thin pass), and the layer's own words (appended below) win
+  // where the layer speaks.
+  StampThin(base_);
   StampContainers(base_);
   // The container rule needs a liquid centre's cell-mates. The layer is
   // sparse, so they come from a position index of the layer's own cells; a
@@ -460,6 +621,43 @@ void FarEdits::SetBase(const std::vector<BaseCell>& cells) {
       const uint32_t ci = (cz * kChunk + cy) * kChunk + cx;
       const LKey key{c.x >> (shift + 4), c.y >> (shift + 4), c.z >> (shift + 4), level};
       base_[key].push_back(((c.mat & 0xFFFu) << kCellBits) | ci);
+    }
+  }
+  // THE THIN RULE over the layer (faredits.h ThinPick): the candidate cells
+  // are the ones holding a layer voxel that could be thin, decided once each,
+  // after the centre words above (so the newer word at compaction) and before
+  // the container words below (which win a cell both claim, as on the GPU).
+  // A voxel the layer does not hold is procgen, guessed from the ground
+  // contract as the container rule guesses it.
+  if (!containKind_.empty() && ThinReady()) {
+    auto matAt = [&](int x, int y, int z) {
+      auto it = at.find(posKey(x, y, z));
+      if (it != at.end()) return (int)it->second;
+      if (!groundWorld_) return kMatAtUnseen;
+      return y <= GroundHeight(x, z) ? kMatAtGround : (int)kMatAir;
+    };
+    for (uint32_t level = 1; level <= kFarLevels; level++) {
+      const int shift = (int)(level + kFarShiftBase);
+      if (shift > kThinMaxShift) break;
+      const int step = 1 << shift;
+      const int half = 1 << (shift - 1);
+      std::unordered_map<uint64_t, bool> seen;
+      for (const BaseCell& c : cells) {
+        const uint32_t m = c.mat & 0xFFFu;
+        if (m == kMatAir || ContainKindOf(m) == kContainNone || LooseOf(m) || CoverOf(m) != 0) continue;
+        const int cell[3] = {c.x >> shift, c.y >> shift, c.z >> shift};
+        if (!seen.emplace(posKey(cell[0], cell[1], cell[2]), true).second) continue;
+        const int c0[3] = {cell[0] * step, cell[1] * step, cell[2] * step};
+        const int centre = matAt(c0[0] + half, c0[1] + half, c0[2] + half);
+        if (centre < 0 || ContainKindOf((uint32_t)centre) != kContainNone) continue;
+        const uint32_t mat = ThinPick((uint32_t)centre, half, c0, matAt);
+        if (mat == (uint32_t)centre) continue;
+        const uint32_t ci = (uint32_t)(((cell[2] & 15) * (int)kChunk + (cell[1] & 15)) *
+                                           (int)kChunk +
+                                       (cell[0] & 15));
+        base_[LKey{cell[0] >> 4, cell[1] >> 4, cell[2] >> 4, level}].push_back(
+            (mat << kCellBits) | ci);
+      }
     }
   }
   // THE CONTAINER RULE over the layer (faredits.h kContainMaxShift). The

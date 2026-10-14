@@ -239,6 +239,74 @@ class FarEdits {
     return (minN != 0 && n >= minN) ? mat[bestO] : centre;
   }
 
+  // ---- THE THIN RULE (2026-10-14; worldgen.wgsl farThinPick, DESIGN.md "A
+  // thin feature keeps its cell") -------------------------------------------
+  // At the levels whose cells are at most kThinMaxShift (levels 1-2), a cell
+  // that holds no matter after the centre and the cover rule takes the
+  // dominant far slot among its eight sub-samples (CoverPick's positions)
+  // that are THIN -- far-solid, not loose, not cover, and with BOTH face
+  // neighbours not far-solid along at least one axis -- when at least
+  // kThinMin of them are. Ties go to the first sub-sample in scan order; the
+  // material returned is that sub-sample's. `matAt` answers a material id,
+  // kMatAtUnseen or kMatAtGround; both of those count as solid and are never
+  // a candidate (no claim on a guess). Needs SetGroundSource (far slots),
+  // SetCoverSource and SetLooseSource; until they are set, `centre` is
+  // returned. Public for the gates' oracles.
+  static constexpr int kThinMaxShift = 2;   // == FAR_THIN_MAX_SHIFT
+  static constexpr int kThinMin = 2;        // == FAR_THIN_MIN
+  bool ThinReady() const { return !groundSlot_.empty() && !coverOf_.empty() && !looseOf_.empty(); }
+  template <class F>
+  uint32_t ThinPick(uint32_t centre, int half, const int c0[3], F&& matAt) const {
+    if (!ThinReady()) return centre;
+    auto solid = [&](int m) {
+      if (m < 0) return true;   // unseen / procgen ground: solid, no claim
+      return m != (int)kMatAir && GroundSlotOf((uint32_t)m) != kGroundNotSolid;
+    };
+    uint32_t slot[8], mat[8];
+    int pos[8][3];
+    const int q = half >> 1;
+    for (int o = 0; o < 8; o++) {
+      pos[o][0] = c0[0] + (o & 1) * half + q;
+      pos[o][1] = c0[1] + ((o >> 1) & 1) * half + q;
+      pos[o][2] = c0[2] + ((o >> 2) & 1) * half + q;
+      const int m = matAt(pos[o][0], pos[o][1], pos[o][2]);
+      mat[o] = m < 0 ? 0u : (uint32_t)m;
+      slot[o] = 0;
+      if (m <= 0 || !solid(m) || LooseOf((uint32_t)m) || CoverOf((uint32_t)m) != 0) continue;
+      slot[o] = GroundSlotOf((uint32_t)m);
+    }
+    // Only a slot two candidates share can win: ask the others' neighbours
+    // nothing (worldgen.wgsl farThinNeedMask), then keep the thin ones.
+    uint32_t thinSlot[8];
+    for (int o = 0; o < 8; o++) {
+      thinSlot[o] = 0;
+      if (slot[o] == 0) continue;
+      int c = 0;
+      for (int j = 0; j < 8; j++) c += slot[j] == slot[o] ? 1 : 0;
+      if (c < kThinMin) continue;
+      bool thin = false;
+      for (int a = 0; a < 3 && !thin; a++) {
+        int p[3] = {pos[o][0], pos[o][1], pos[o][2]};
+        p[a] += 1;
+        const bool up = !solid(matAt(p[0], p[1], p[2]));
+        p[a] -= 2;
+        const bool dn = !solid(matAt(p[0], p[1], p[2]));
+        thin = up && dn;
+      }
+      if (thin) thinSlot[o] = slot[o];
+    }
+    // A candidate the neighbour test dropped no longer counts for its slot:
+    // the count is among the thin ones (farThinPick).
+    int best = 0, bestO = -1;
+    for (int i = 0; i < 8; i++) {
+      if (thinSlot[i] == 0) continue;
+      int c = 0;
+      for (int j = 0; j < 8; j++) c += thinSlot[j] == thinSlot[i] ? 1 : 0;
+      if (c > best) { best = c; bestO = i; }
+    }
+    return (bestO >= 0 && best >= kThinMin) ? mat[bestO] : centre;
+  }
+
   // Forgets every NOTED edit. The BASE (SetBase) survives: it is the authored
   // edit layer, which belongs to the map, not to the store being replaced.
   void Clear() {
@@ -275,6 +343,8 @@ class FarEdits {
   };
   void SetBase(const std::vector<BaseCell>& cells);
   size_t BaseLevelChunks() const { return base_.size(); }
+  // The stamps' thin-rule words of the last SetBase (StampThin).
+  size_t StampThinWords() const { return stampThinCount_; }
   // ---- THE INDEX IS CAPPED (2026-09-24) ------------------------------------
   // It was an unbounded unordered_map, and what feeds it is every chunk the
   // stream's sticky `modified_` calls written — which includes a chunk that
@@ -414,8 +484,18 @@ class FarEdits {
   // of every map stamp holding liquid where the rule changes the centre
   // sample, filed into `out` as patch words. See SetBase.
   void StampContainers(std::unordered_map<LKey, std::vector<uint32_t>, LKeyHash>& out);
+  // THE THIN RULE FOR STAMPS (SetBase's other stamp contribution; ThinPick
+  // over every map stamp's block, its pad and the ground contract), filed
+  // into `out`. Cached across SetBase calls on a signature of the stamps'
+  // blocks and placement: a map's stamps are evaluated once per content.
+  void StampThin(std::unordered_map<LKey, std::vector<uint32_t>, LKeyHash>& out);
+  std::unordered_map<LKey, std::vector<uint32_t>, LKeyHash> stampThinWords_;
+  uint64_t stampThinSig_ = 0;
+  bool stampThinValid_ = false;
+  size_t stampThinCount_ = 0;
   const World* groundWorld_ = nullptr;
   std::unordered_map<uint64_t, int> groundH_;
+  uint32_t groundMapHash_ = 0;   // the map groundH_ was filled under (GroundHeight)
   int GroundHeight(int x, int z);
   uint32_t GroundSlotOf(uint32_t mat) const {
     return mat < groundSlot_.size() ? groundSlot_[mat] : kGroundNotSolid;

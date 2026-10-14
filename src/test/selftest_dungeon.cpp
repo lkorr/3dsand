@@ -953,6 +953,10 @@ Status GateDungeonGen(Ctx& c, std::string& detail) {
 // (GenerateChunks), and the two are compared by far slot. Mismatches are
 // counted by the voxel's material: a generator branch the sieve does not run
 // is a red line naming the material it drops. farParity.maxMismatch.
+// The THIN rule adds to empty level-1/2 cells (DESIGN.md "A thin feature
+// keeps its cell"): such a cell is held to the rule over genChunk's voxels of
+// the sample's chunk instead, and the share of the dungeon cells it fills
+// that the sieve fills is farParity.thinCoverMin (by material in the detail).
 //
 // Exit contract as dungeon-gen: the window regenerated at the origin it found
 // (GenerateChunks clobbers it) and the cascade refilled round it.
@@ -1044,6 +1048,9 @@ Status GateFarParity(Ctx& c, std::string& detail) {
 
   // ---- per region: refill, read, generate, compare -------------------------
   long long compared = 0, mism = 0, dressing = 0;
+  long long thinWant = 0, thinHit = 0, thinExtra = 0;   // the thin rule (see the compare loop)
+  std::map<uint32_t, long long> thinWantByMat, thinMissByMat;
+  std::string firstThinMiss;
   std::map<uint32_t, long long> mismByMat, cellsByMat;
   std::string first, regionLine;
   std::map<std::pair<int, int>, int> hMemo;
@@ -1129,6 +1136,54 @@ Status GateFarParity(Ctx& c, std::string& detail) {
       // (the cover rule's leaf, a stalk's mark): those rules ADD to empty
       // cells by design, so they are not a disagreement about the sample.
       if (wantSlot == 0u && got != 0u && got < slotCover.size() && slotCover[got]) continue;
+      // THE THIN RULE (faredits.h ThinPick; DESIGN.md "A thin feature keeps
+      // its cell") adds to empty cells too, at levels 1-2. Its oracle is the
+      // rule over genChunk's voxels of the sample's chunk (a level-1/2 cell
+      // lies in one chunk; a face neighbour across the chunk's face is unseen
+      // and counts solid, as the CPU patch counts it). A fill the oracle also
+      // makes is AGREED; one it does not make is accepted only when the cell
+      // really holds two voxels of that slot (the sieve's terrain word is an
+      // approximation at the ground, and the oracle cannot see across the
+      // chunk's faces) and is a MISMATCH otherwise; an oracle fill the sieve
+      // left empty is MISSED (the coverage below).
+      if (wantSlot == 0u && (int)(e.level + kFarShiftBase) <= FarEdits::kThinMaxShift &&
+          edits.ThinReady()) {
+        const int shift = (int)(e.level + kFarShiftBase), step = 1 << shift, half = step >> 1;
+        const std::vector<uint32_t>& gw = git->second;
+        const int c0[3] = {(e.cc.x << shift) & 15, (e.cc.y << shift) & 15, (e.cc.z << shift) & 15};
+        auto inChunk = [&](int x, int y, int z) -> int {
+          if (x < 0 || y < 0 || z < 0 || x > 15 || y > 15 || z > 15) return FarEdits::kMatAtUnseen;
+          return (int)(gw[(size_t)x + (size_t)y * 16 + (size_t)z * 256] & 0xFFFu);
+        };
+        const uint32_t om = edits.ThinPick(m, half, c0, inChunk);
+        const uint32_t oSlot = om != m && farSolid(om) ? c.mats[om].farPalSlot : 0u;
+        const bool dungeonRegion = r.name != "caves";
+        if (oSlot != 0u && dungeonRegion) {
+          thinWant++;
+          thinWantByMat[om]++;
+          if (got != oSlot) {
+            thinMissByMat[om]++;
+            if (firstThinMiss.empty())
+              firstThinMiss = Format("%s L%u cell (%d,%d,%d) wants %s, sieve slot %u", r.name.c_str(), e.level,
+                                     e.cc.x, e.cc.y, e.cc.z, om < c.mats.size() ? c.mats[om].name.c_str() : "?", got);
+          }
+        }
+        if (got != 0u) {
+          if (got == oSlot) {
+            if (dungeonRegion) thinHit++;
+            continue;
+          }
+          int held = 0;
+          for (int k = 0; k < step * step * step; k++) {
+            const int vm = inChunk(c0[0] + k % step, c0[1] + (k / step) % step, c0[2] + k / (step * step));
+            if (vm > 0 && farSolid((uint32_t)vm) && c.mats[(uint32_t)vm].farPalSlot == got) held++;
+          }
+          if (held >= FarEdits::kThinMin) {
+            thinExtra++;
+            continue;
+          }
+        }
+      }
       compared++;
       rCmp++;
       cellsByMat[m]++;
@@ -1155,6 +1210,16 @@ Status GateFarParity(Ctx& c, std::string& detail) {
   check(dressing > 0, "no sample landed in dungeon dressing (crystal, old_moss, gravel, water): the gate is vacuous");
   check(mism <= maxMism, Format("%lld of %lld cascade samples are not genChunk's voxel (max %lld); first: %s", mism,
                                 compared, maxMism, first.c_str()));
+  // The thin rule over the dungeons (worldgen.wgsl farcover's dungeon pass):
+  // of the level-1/2 cells the oracle fills, the share the sieve filled with
+  // the same slot. Not 1: the sieve's terrain word is approximate and the
+  // oracle is blind across the chunk's faces.
+  const double thinCover = thinWant > 0 ? (double)thinHit / (double)thinWant : 0.0;
+  const double thinCoverMin = BaselineNumber("farParity.thinCoverMin", 0.8);
+  check(thinWant > 0, "no dungeon cell the thin rule fills: its half of the gate is vacuous");
+  check(thinCover >= thinCoverMin, Format("the sieve fills %lld of the %lld dungeon cells the thin rule fills "
+                                          "(%.3f < %.3f)", thinHit, thinWant, thinCover, thinCoverMin));
+  RecordObserved("farParity.thinCover", thinCover);
   std::string byMat;
   {
     std::vector<std::pair<long long, uint32_t>> v;
@@ -1171,9 +1236,15 @@ Status GateFarParity(Ctx& c, std::string& detail) {
   DrainFullRefill(c.ctx, c.world, c.sim,
                   IVec3{savedOrigin.x + (int)kNChunk / 2, savedOrigin.y + (int)kNChunk / 2,
                         savedOrigin.z + (int)kNChunk / 2});
-  detail = Format("%lld samples (levels 1-3, off the ground band), %lld mismatches [%s]%s%s; %lld on dressing materials",
+  std::string thinByMat;
+  for (const auto& [m, n] : thinWantByMat)
+    thinByMat += Format("%s%s %lld/%lld", thinByMat.empty() ? "" : ", ",
+                        m < c.mats.size() ? c.mats[m].name.c_str() : "?", n - thinMissByMat[m], n);
+  detail = Format("%lld samples (levels 1-3, off the ground band), %lld mismatches [%s]%s%s; %lld on dressing materials"
+                  " | thin rule: sieve fills %lld of %lld dungeon cells (%.3f) [%s], %lld more held; first miss %s",
                   compared, mism, regionLine.c_str(), byMat.empty() ? "" : " by material: ", byMat.c_str(),
-                  dressing);
+                  dressing, thinHit, thinWant, thinCover, thinByMat.c_str(), thinExtra,
+                  firstThinMiss.empty() ? "none" : firstThinMiss.c_str());
   if (!why.empty()) {
     for (const std::string& w : why) detail += " | FAIL: " + w;
     std::printf("far-parity: FAIL (%s)\n", detail.c_str());

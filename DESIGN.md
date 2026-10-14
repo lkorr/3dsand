@@ -17027,6 +17027,11 @@ where you hear from either (§12b, "The ears are on the character").
   | 5 | 32 vox (3.2 m) | 666 m (819 m) | ~3 m — a tower, a quarry |
   | 6–8 | 64–256 vox | 1.3–2.7 km, level 8 its box (6.6 km) | 6–26 m — terrain-scale work only |
 
+  Nor is a one-voxel FEATURE at levels 1-2 (a rail, a post, a board, a twig,
+  a crystal's tip): an empty cell takes a coherent thin feature of its block
+  (THE THIN RULE, below), so the "smallest visible edit" column is a 0.1 m
+  line there, drawn one cell thick. A one-voxel COAT on a surface (a moss
+  band, a flush trim) is a colour, not a shape, and is still bound by it.
   The SURFACE of pristine terrain is no longer bound by this table: the far
   surface map below draws each surface cell as its 2x2 true-height
   sub-columns, so the ground itself resolves at half a cell (level 1: the fine
@@ -18143,6 +18148,144 @@ where you hear from either (§12b, "The ears are on the character").
   `SANDVOX_AT_SLICK=x,y,z,r[,material]` (+ `SANDVOX_AT_SLICK_AFTER=<ticks>`)
   lays a one-voxel liquid disc in an `--at` run; with `SANDVOX_AT_FLY` it
   reproduces the ticket's walk-away.
+  **A THIN FEATURE KEEPS ITS CELL: THE THIN RULE (2026-10-14; worldgen.wgsl
+  `farThinPick` + the thin pass in `fardownFeat` + the tree and dungeon
+  passes in `farcover`, faredits.h `ThinPick` / `StampThin`; gate
+  `far-thin`; tickets 2026-10-14_00-51-22 "fence invisible at first lod
+  seam" and 2026-10-12_16-36-34's sub-cell half).** The fourth exception to
+  "a cell is its centre sample", and the one for SHAPE. A feature one voxel
+  thick held a level-1 cell only where its voxels sat on the centre's parity
+  (the centre is the block's (1,1,1) voxel): a rail along x 25 % of the time
+  (y and z both odd), a post 25 %, a board 50 % -- so past the 20.5 m handoff
+  most of a fence, a ladder, a window frame, a beam, a hand rail, a crystal's
+  tip, a twig or a stalactite was gone, and grew back in as the owner walked
+  toward it. Measured on Harrowby's field fence (the ticket's), handoff pulled
+  in to 2 m: the south fence entirely gone, a rail or two left of the north.
+  THE RULE, at the levels whose cells are at most `FAR_THIN_MAX_SHIFT` = 2
+  (levels 1-2, 0.2 / 0.4 m: where a one-voxel feature is still bigger than a
+  pixel past the handoff): a cell that holds NO matter after the centre
+  sample and the cover rule takes the dominant far slot among its eight
+  sub-samples (the cover rule's positions -- at level 1 the 2x2x2 block
+  itself) that are THIN, when at least `FAR_THIN_MIN` = 2 of them are; a
+  sub-sample is thin when it is far-solid, neither LOOSE (the loose top's
+  business) nor COVER (leaves have the denser 3-of-8 rule), and along at
+  least one axis BOTH its face neighbours are not far-solid. Ties go to the
+  first sub-sample in scan order. It is material-agnostic -- shape decides,
+  never a tag -- which is what makes it safe: bulk (terrain, a wall, a floor,
+  a trunk) has solid behind each face on at least one side of every axis, so
+  it is never thin and every surface keeps the centre rule exactly (the
+  surface map, the skin rule and the far-surface / far-parity contracts are
+  built on it); a lone voxel is one sub-sample, never two, so a speck does
+  not grow (the despeck rule's direction); a coherent line or sheet puts at
+  least two voxels in every level-1 block it crosses, so an axis-aligned one
+  is drawn WHOLE at level 1, one cell (two voxels) thick. At level 2 the
+  sub-samples are octant centres, so a one-voxel line lands in a quarter of
+  the cell rows it crosses, as before plus the cells it does reach. A solid
+  column plant (the feature plane's stalk) is already marked into its cells
+  by `farmap`; the live rule marks the same cells from the voxels.
+  - **Producers, one order everywhere (centre, cover, thin, container: a cell
+    the container rule claims is the container's).** LIVE: the thin pass in
+    `fardownFeat` -- no prefilter scan (a sentinel chunk is one material and
+    never thin), eight page reads per empty cell (the chunk once at level 1),
+    the face neighbours only where two candidates of one slot meet in a cell,
+    across a chunk face through `voxWordAt` (outside the window: solid).
+    PROCGEN TREES: `farcover` (the cover rule's entry) applies it to the
+    tree atlas's matter where the cover rule added nothing -- the column's
+    tree mask is grown by a voxel so a sub-sample's neighbours see the tree
+    that reaches them; ground and everything the trees do not hold count
+    open. PROCGEN DUNGEONS: `farcover`'s second pass, for a level chunk whose
+    one 64^3 dungeon index cell has a list (a level-1/2 chunk is 32 / 64
+    voxels, aligned, so it lies in exactly one), `farDgCellSub` -- `dgCell`'s
+    carve, firm shell, ordered fill / keep / skin pass and props, in its
+    order, WITHOUT ITS SCATTER -- at the sub-samples and their neighbours, on
+    an APPROXIMATE terrain word (stone at or under the cell's centre column's
+    ground, air over it; inside a keep box the natural caves are off, so
+    under the ground the terrain is solid and only its material differs).
+    The approximation never speaks for itself: a voxel the dungeon left as
+    the terrain word (bit 31 rides the word through `dgCell`, which returns
+    it unchanged where nothing touched it) is no candidate, and terrain air
+    within a voxel of the ground is not trusted to be open -- so a dungeon
+    cell is filled only with matter the dungeon decided (a fill, a keep, a
+    skin, a prop), and a terrain sliver between two carves is missed rather
+    than painted stone (the first cut painted 6 such cells, `far-parity`'s
+    zero-mismatch line caught them). THE COST, and what bounds it: the first
+    cut (full `dgCell`, every empty cell of every listed level chunk) cost
+    23-55 ms of `farCoverFill` on a 1,024-entry refill slice in the
+    Shardwell; four cuts, each measured on the same in-flight run:
+    (1) a buried level chunk is "full" to farOcc (blocker cells count), so
+    the full test now gates only the trees' tile scan; (2) the sky over a
+    dungeon is skipped (matter over the ground only inside its surface
+    rects, never over its box top); (3) the index cell's list is CULLED per
+    workgroup to the prims that can reach the level chunk (`farDgCull`: every
+    shape distance is 1-Lipschitz in Q2 and the noise moves it at most 2 x
+    NAMP, so a prim whose centre distance clears the chunk's half-diagonal +
+    4 NAMP + 40 voxels changes no threshold in it -- exact, `far-parity`'s
+    fills identical), and a cell no surviving fill / keep / skin / prop can
+    reach is skipped with one distance per prim instead of eight evaluations
+    (`farDgCellNear`); (4) the SCATTER is not evaluated (its probes walk the
+    whole list per probe cell: it was the bulk of what remained, for 2-3 of
+    the 218 cells the oracle fills). Measured: see below. One evaluator call
+    site, in one rolled loop; at level 1 the three in-block neighbours reuse
+    the sub-samples.
+    STAMPS AND THE EDIT LAYER: the CPU base (`FarEdits::StampThin` over every
+    map stamp's block -- template, then pad, then the ground contract, as
+    `StampContainers` reads them -- and the layer's cells in `SetBase`),
+    cached across whole-window generations on a signature of the stamps'
+    blocks, placement and the material classes. A stamped structure is
+    pristine procgen whose chunks are never dirty, so the base is where
+    Harrowby's fence gets its cells. EVICTED EDITS: `FarEdits::Sweep`, over
+    the noted chunk (a neighbour across its face is unseen and counts solid).
+  - **What no procgen producer evaluates** -- natural-cave flora, pond life,
+    a biome's far-solid stalks at level 2, a dungeon's scatter and its
+    level-2 cells -- gets the rule only when its chunk is downsampled; the
+    cell changes then, as a dug one does.
+  - **`FarEdits::GroundHeight`'s cache is now per MAP** (keyed on the seed
+    and invalidated when `CurrentWorldMap().contentHash` changes). It was
+    keyed on the seed alone, so a reload, a structure re-apply or a gate's
+    fixture map left heights from the previous map in it, and everything the
+    CPU side reads from the ground contract -- the stamps' container and thin
+    cells, the loose top's `h`, the layer's ground guesses -- used them:
+    `far-thin` run after `far-cover` found the field's base words computed on
+    far-cover's flat forest ground (403 of 427 cells; 427 alone and now).
+  - **Gates.** `far-thin`: a fence built on the harness ground (two
+    rail-and-post runs on every parity, a board, a free post, a lone cloth
+    speck), downsample == the rule over the live grid and CPU patch == the
+    rule over the chunk on every cell, coverage of the cells holding two or
+    more fence voxels, the speck's cell; and Harrowby's field installed as a
+    structure, the sieve + base patch against the rule over the generated
+    voxels (`farThin.stampAgreeMin` / `stampCoverMin`). `far-cover` and
+    `far-parity` evaluate the thin rule in their oracles (`farParity.thinCoverMin`:
+    the share of the dungeon cells the rule fills that the sieve fills).
+  - **Measured** (2026-10-14). `far-thin`: of the 51 level-1 cells holding
+    two or more voxels of the built fence the centre rule drew 0.22 and the
+    rule 1.00, downsample and CPU patch equal to their oracles on all 576
+    cells, the cloth speck's cell empty; Harrowby's field: 427 of its 755
+    timber cells take the rule, the sieve + base fill all 427 (agree 1.000).
+    `far-parity`: 0 sample mismatches, the dungeon pass fills 187 of the 218
+    dungeon cells the oracle fills (iron, plank, timber, cloth, cobble 100 %
+    at level 1; the misses are terrain slivers, scatter and level 2). The
+    ticket's camera with the handoff pulled in to 2 m (every pixel far): the
+    field's south fence and the west posts were gone, the north fence a rail
+    or two; with the rule the whole fence stands. GPU (`--frames`, exclusive
+    lock, same exe, base vs new assets): flying Harrowby at 13.5 m/s
+    `farCoverFill` 0.67 -> 0.79 ms/frame mean (p99 3.9 -> 4.6) and
+    `farDownFeat` 0.23 -> 0.32 (p99 0.53 -> 0.67); flying the Shardwell
+    `farCoverFill` under the 0.05 floor -> 0.06 mean, p99 0.19, max 9.3 ms
+    on one 1,024-entry refill slice; `--forest-fire` `farDown` 0.46 -> 0.49,
+    `farCoverFill` 0.30 -> 0.32, `farDownFeat` under the floor in both.
+    CPU: `StampThin` 27-48 ms for the default map's 5 structures, once per
+    map content (cached). `farcover`'s driver compile 6.9 s. Render-only:
+    nothing here is hashed.
+  - **Left open** (owner calls): (a) a one-voxel COAT on a surface -- a moss
+    band, a crust on a ceiling, a flush trim -- is a colour, not a shape,
+    and still shows where a centre lands; a "paint" rule that takes an
+    exposed sub-sample's colour would change pristine terrain cells (cliff
+    strata against `farSurfaceMat`'s skin) unless the sieve evaluated it
+    over all terrain, so it is not done. (b) The procgen dungeon pass is
+    level 1 only and has no scatter (cost, measured above). (c) A thin cell
+    patched by the base clears the surface map's VALID bit over its four
+    sub-columns, as every patch does (`farpatch`), so the ground right
+    beside a stamp's fence post is drawn as plain cells.
   **The far SURFACE MAP (LOD-seam package A, 2026-09-28).** Centre sampling
   is the cascade's resolution limit and the window edge is where it shows: a
   level-1 cell is a 20 cm cube standing where the near field draws four 10 cm
@@ -26925,23 +27068,17 @@ the cell size moving a patch's edge by a voxel, and the far crystal area went
 instructions. `far-parity` holds every level-1..3 sample over the harness
 map's dungeons to the voxel genChunk generates there, so a generator branch
 the sieve does not run is a red gate, for any material. What this does NOT
-change: a cascade cell is still its centre sample, so a feature one voxel
-thin is drawn at level 1 only where a centre lands in it (see "What is
-representable, honestly" in §9). **OPEN OWNER DECISION (2026-10-13, the
-ticket stays open on it): a sub-cell rule.** A one-voxel moss band, crust,
-trim line or plank shows at level 1 only where a centre sample lands in it
-(~50 % of a sheet, 25-50 % of a line). The general rule -- fill a cell from
-2+ of its 8 voxels, ties to the thinner material, specks still excluded --
-must go into ALL FOUR far producers (sieve `far`, `fardown`, the CPU twin
-`farpatch`, `farcover`'s path) or a cell changes when its chunk turns dirty.
-In the procgen sieve it needs all 4 fine columns per level-1 cell: the
-column half alone measured +0.35 ms mean / +2.3 ms p99 `farFill` on a
-13.75 m/s flight (598k entries, back-to-back runs), before the per-row work
-and one more large worldgen entry to compile. It also draws thin things two
-voxels wide and closes one-voxel slits. Cheaper variant to try first:
-LEVEL 1 ONLY (the first seam is the only place a one-voxel feature is
-bigger than a pixel), so levels 2+ keep the centre sample and their cost.
-`far-parity` is the gate that must stay at 0 after either. `caveBands` turns off a natural
+change: a cascade cell is still its centre sample. **THE SUB-CELL RULE (2026-10-14, the owner's call on the decision this paragraph left open)** is
+the THIN RULE (§9 "A thin feature keeps its cell"): an empty level-1/2 cell
+takes a coherent one-voxel feature of its block -- two or more sub-samples
+of one slot with open space on both sides along an axis -- so a crystal's
+tip, a stalactite, a timber support or a rail is drawn whole, one cell thick;
+material-agnostic, so bulk and every surface keep the centre sample. The
+procgen half for dungeons is a pass of `farcover` running this file's
+`dgCell` over an approximate terrain word, only in level chunks whose index
+cell has a list (not the 4-columns-per-cell sieve the paragraph priced). A
+one-voxel moss band or crust ON a wall is not thin (rock behind it) and
+still shows only where a centre lands in it: a colour, not a shape. `far-parity` is the gate that must stay at 0 after either. `caveBands` turns off a natural
 cave band that reaches into a dungeon's keep box (bounds + `keepOut`, default
 24; `naturalCaves: true` opts out), and the magma table goes with it (it only
 floods carved band cells). **Cost**: a map with no dungeon pays one header

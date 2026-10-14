@@ -7680,6 +7680,327 @@ fn farCoverPick(a : FarCoverAcc, level : u32) -> u32 {
   return select(0u, bestS, minN != 0u && n >= minN);
 }
 
+// ---- THE THIN RULE: a coherent thin feature survives the cell (2026-10-14) --
+// (tickets 2026-10-14_00-51-22 "fence invisible at first lod seam" and
+// 2026-10-12_16-36-34's open half; DESIGN.md "A thin feature keeps its cell")
+//
+// A cell is its centre sample, and a feature ONE voxel thick -- a fence rail
+// or post, a ladder, a window frame, a beam, a crystal's tip, a stalactite, a
+// twig, a hand rail -- holds that centre at level 1 only when its voxels sit
+// on the centre's parity: a rail along x at (y, z) is in the cell when y and z
+// are both odd (25 %), a post when x and z are (25 %), a board when its one
+// coordinate is (50 %). Past the 20.5 m handoff the rest of it was gone, and
+// the owner walked toward fences and crystals that grew in as he came.
+//
+// THE RULE, one law for every producer, at the levels whose cells are at most
+// FAR_THIN_MAX_SHIFT (levels 1-2, 0.2 / 0.4 m cells -- where a one-voxel
+// feature is still bigger than a pixel): a cell that holds NO matter after the
+// centre sample and the cover rule takes the dominant far slot among its
+// eight sub-samples (farCoverSub's, at level 1 exactly the 2x2x2 block) that
+// are THIN, when at least FAR_THIN_MIN of them are:
+//   a sub-sample is THIN when it is far-solid matter that is neither loose
+//   (the loose top's business: a layer lies ON something) nor cover (leaves
+//   have their own, denser rule) and, along at least one axis, BOTH of its
+//   face neighbours are not far-solid.
+// Material-agnostic: what decides is the shape, never the material. Bulk --
+// terrain, a wall, a floor, a trunk -- has solid behind every face on at
+// least one side of each axis, so it is never thin and keeps the centre rule
+// exactly (the surface map and the skin rules are built on that rule). A
+// lone voxel (a speck) is one sub-sample, never two, so it does not grow; a
+// coherent line or sheet has at least two in every cell it passes through.
+// The price, accepted with the rule: a one-voxel feature is drawn one cell
+// (two voxels at level 1) thick past the handoff. A filled cell blocks by
+// holding a material, as a cover-filled one does.
+//
+// THE PRODUCERS (each with the same order: centre, cover, thin, container):
+//   * `fardownFeat` over the LIVE grid (its thin pass);
+//   * `farcover` over PROCGEN: the trees (the atlas, as the cover rule reads
+//     it) and, at level 1, the dungeons (dgCell's carve / fill / keep / skin
+//     / props without its scatter, over an approximate terrain word: matter
+//     the dungeon decided, never the terrain; see farDgCull);
+//   * FarEdits::ThinPick (faredits.h) over an evicted chunk's voxels, and
+//     over the map's STAMPS and the edit layer for the base patch -- a
+//     stamped structure is pristine procgen whose chunks are never dirty, so
+//     the base is where a fence in a stamp gets its cells.
+// A solid column PLANT (a cactus, a crystal spire: the feature plane's STALK)
+// is already marked into its cells by `farmap` with its body slot, the same
+// conservative fill; the live rule marks the same cells from the voxels.
+// What NO procgen producer evaluates -- natural-cave flora, pond life, a
+// biome's stalks at level 2, a dungeon's scatter and its level-2 cells --
+// gets the rule when its chunk is downsampled.
+const FAR_THIN_MAX_SHIFT : u32 = 2u;   // faredits.h kThinMaxShift
+const FAR_THIN_MIN : u32 = 2u;         // faredits.h kThinMin
+// The far slot material `m` contributes as a thin CANDIDATE (0 = none): far-
+// solid, not loose, not cover. Whether it IS thin is its neighbours' answer.
+fn farThinSlotOf(m : u32) -> u32 {
+  if (!farCellIsSolid(m) || farIsLoose(m)) { return 0u; }
+  let s = matFarPal(&materials, m);
+  return select(s, 0u, farCoverWord(s) != 0u);
+}
+// Sub-sample o's face neighbour j: axis j / 2, +1 for even j, -1 for odd.
+fn farThinNbr(v : vec3<i32>, j : u32) -> vec3<i32> {
+  let d = select(1, -1, (j & 1u) != 0u);
+  let a = j >> 1u;
+  return v + vec3<i32>(select(0, d, a == 0u), select(0, d, a == 1u), select(0, d, a == 2u));
+}
+// The rule's answer from the eight candidate slots `a` (0 = not a candidate)
+// and the OPEN bits of their face neighbours (bit o * 6 + j: neighbour j of
+// sub-sample o is not far-solid; o < 4 in `lo`, else `hi` at (o - 4) * 6 + j):
+// the dominant slot among the thin ones, ties to the first in scan order, 0
+// when fewer than FAR_THIN_MIN agree. FarEdits::ThinPick is the CPU twin.
+fn farThinIsThin(lo : u32, hi : u32, o : u32) -> bool {
+  let w = select(lo >> (o * 6u), hi >> ((o - 4u) * 6u), o >= 4u) & 63u;
+  return (w & 3u) == 3u || (w & 12u) == 12u || (w & 48u) == 48u;
+}
+fn farThinPick(a : FarCoverAcc, lo : u32, hi : u32) -> u32 {
+  var t : FarCoverAcc;
+  t.lo = 0u;
+  t.hi = 0u;
+  for (var o = 0u; o < 8u; o++) {
+    let s = farCoverAt(a, o);
+    if (s != 0u && farThinIsThin(lo, hi, o)) { farCoverPut(&t, o, s); }
+  }
+  var best = 0u;
+  var bestS = 0u;
+  for (var i = 0u; i < 8u; i++) {
+    let si = farCoverAt(t, i);
+    if (si == 0u) { continue; }
+    var c = 0u;
+    for (var j = 0u; j < 8u; j++) { c += select(0u, 1u, farCoverAt(t, j) == si); }
+    if (c > best) { best = c; bestS = si; }
+  }
+  return select(0u, bestS, best >= FAR_THIN_MIN);
+}
+// Which candidate sub-samples still need their neighbours asked: those whose
+// slot at least FAR_THIN_MIN candidates share (no pick is possible otherwise).
+fn farThinNeedMask(a : FarCoverAcc) -> u32 {
+  var m = 0u;
+  for (var o = 0u; o < 8u; o++) {
+    let s = farCoverAt(a, o);
+    if (s == 0u) { continue; }
+    var c = 0u;
+    for (var j = 0u; j < 8u; j++) { c += select(0u, 1u, farCoverAt(a, j) == s); }
+    if (c >= FAR_THIN_MIN) { m |= 1u << o; }
+  }
+  return m;
+}
+fn farThinOpenSet(lo : ptr<function, u32>, hi : ptr<function, u32>, o : u32, j : u32) {
+  if (o < 4u) { *lo |= 1u << (o * 6u + j); } else { *hi |= 1u << ((o - 4u) * 6u + j); }
+}
+// The material the dungeons put at fine voxel p, over the APPROXIMATE terrain
+// word `farcover`'s dungeon pass uses (solid at or under ground `gh`, air over
+// it; see there): dgCell where an index cell lists prims, the terrain word
+// itself where none does. A voxel the dungeon left as the terrain word comes
+// back with FAR_DG_TERRAIN set -- the approximation, not an answer: it is
+// never a candidate, and it is open only well clear of the ground (`farcover`).
+// The flag rides bit 31 of the terrain word handed to dgCell, which returns
+// that exact word for a cell nothing of the dungeon touched (and a word of its
+// own, without the bit, for every cell it decided).
+const FAR_DG_TERRAIN : u32 = 0x1000u;
+
+// ---- THE LEVEL CHUNK'S OWN PRIM LIST (the dungeon pass's cost) --------------
+// dgCell walks every prim of a voxel's 64^3 index cell -- up to DG_LIST_MAX,
+// each a shape distance plus its noise -- and the dungeon pass asks it eight
+// times per empty cell: the first cut cost 25-55 ms of farCoverFill on a
+// 1,024-entry refill slice inside the Shardwell. Most of an index cell's prims
+// are nowhere near a given 32^3 level chunk, so `farcover` CULLS the list once
+// per workgroup into wgDgSub (list order kept: later wins) and evaluates the
+// level chunk's own voxels over the survivors (farDgCellSub, dgCell's text over
+// the sub-list); a voxel outside the level chunk (the thin test's apron) still
+// asks the full dgCell.
+// THE CULL IS EXACT, from two facts of the evaluator: every shape distance is
+// 1-Lipschitz in Q2 (box, rounded box, ramp, tube: true or L-inf distances;
+// the elliptic ones scale a normalised radius by the SHORTEST semi-axis,
+// dungeon.cpp dgEll), and the noise displacement is at most 2 x NAMP either
+// way. So over a box of half-diagonal hd (Q2) round the centre c,
+// d(x) >= d(c) - hd - 4 NAMP. A prim with d(c) - hd - 4 NAMP > FAR_DG_CULL_T
+// is that far outside the box everywhere in it, and FAR_DG_CULL_T clears
+// every threshold a prim's distance (or the carve field it joins) is
+// compared with outside its shape: the blend radius, the firm shell
+// (DG_FIRM_Q2), the skin widths, the band scatter's reach (size <= 16).
+// A prop instance is culled when its template box misses the level chunk.
+// WHAT CAN BE THIN: only matter the dungeon DECIDED -- a fill, a keep, a
+// skin, a scatter feature, a prop (a carve makes air or liquid; liquid is
+// loose). A level chunk whose survivors are carves without scatter and no
+// prop holds no candidate of the dungeon's (wgDgContent = 0): skipped whole.
+const FAR_DG_CULL_T : i32 = 160;   // Q2: 40 voxels
+var<workgroup> wgDgSub : array<u32, 64>;    // DG_LIST_MAX prim offsets
+var<workgroup> wgDgSubN : u32;
+var<workgroup> wgDgInst : array<u32, 64>;   // prop instance records
+var<workgroup> wgDgInstN : u32;
+var<workgroup> wgDgContent : u32;
+var<workgroup> wgDgFull : u32;
+var<workgroup> wgDgReach : i32;
+// CAN THE DUNGEON HAVE DECIDED ANYTHING IN THIS CELL (min corner c0, `step`
+// wide, plus the thin test's one-voxel apron)? The same Lipschitz bound as the
+// cull, per cell: one distance per surviving prim at the cell's centre voxel,
+// instead of eight evaluations. Matter the dungeon decides (farDgCellSub)
+// stands in a fill, keep or skin (d < 0 there) or in a prop's box. (Were the
+// scatter evaluated, wgDgReach would be its size and a cell within that reach
+// of ANY prim's surface would count -- a band kind just outside its own prim,
+// a feature growing from the first solid within its height; it is not, and
+// wgDgReach stays -1.) A cell no surviving fill, keep, skin or prop can reach
+// is carved air or terrain: the eight evaluations are skipped.
+fn farDgCellNear(c0 : vec3<i32>, step : i32) -> bool {
+  let lo = c0 - vec3<i32>(1);
+  let hi = c0 + vec3<i32>(step);
+  for (var k = 0u; k < wgDgInstN; k++) {
+    let ir = wgDgInst[k];
+    let blk = worldMap[ir + DG_I_BLK];
+    let b0 = vec3<i32>(dgI(ir + DG_I_X), dgI(ir + DG_I_Y), dgI(ir + DG_I_Z));
+    let b1 = b0 + vec3<i32>(i32(worldMap[blk]), i32(worldMap[blk + 1u]), i32(worldMap[blk + 2u])) - vec3<i32>(1);
+    if (all(b1 >= lo) && all(b0 <= hi)) { return true; }
+  }
+  let cc = c0 + vec3<i32>(step >> 1);
+  // the farthest voxel of the cell + apron from cc is (step + 1) per axis away
+  let hd = (step + 1) * 7 + 4;   // Q2: 4 * sqrt(3) * (step + 1), rounded up, + slack
+  let reach = wgDgReach;
+  for (var k = 0u; k < wgDgSubN; k++) {
+    let p = wgDgSub[k];
+    let d = dgPrimD(p, cc.x, cc.y, cc.z);
+    let m = hd + 4 * abs(dgI(p + DG_P_NAMP));
+    let op = worldMap[p + DG_P_FLAGS] & 3u;
+    if (op != DG_OP_CARVE && d <= m + max(reach, 0) * 4 + DG_FIRM_Q2) { return true; }
+    if (reach >= 0 && abs(d) <= m + reach * 4 + DG_FIRM_Q2 + i32(worldMap[p + DG_P_BLEND] & 0xFFFFu)) {
+      return true;
+    }
+  }
+  return false;
+}
+fn farDgCull(lst : u32, lo : vec3<i32>, hi : vec3<i32>) {
+  let c = (lo + hi) / 2;
+  let e = vec3<f32>(hi - lo + vec3<i32>(1)) * 0.5;
+  // half-diagonal in Q2, rounded up (one more voxel of slack)
+  let hd = i32(ceil(length(e))) * 4 + 4;
+  let nAll = worldMap[lst];
+  let n = min(nAll, DG_LIST_MAX);
+  var k2 = 0u;
+  var content = 0u;
+  var reach = 0;
+  for (var k = 0u; k < n; k++) {
+    let p = worldMap[lst + 1u + k];
+    let fl = worldMap[p + DG_P_FLAGS];
+    let ns = (fl >> 12u) & 15u;
+    var own = 0;   // this prim's scatter reach (the band kinds act that far OUTSIDE it)
+    for (var j = 0u; j < ns; j++) {
+      own = max(own, i32(worldMap[worldMap[p + DG_P_SCAT] + j * DG_S_WORDS + DG_S_SIZE] >> 16u));
+    }
+    let d = dgPrimD(p, c.x, c.y, c.z);
+    if (d - hd - 4 * abs(dgI(p + DG_P_NAMP)) > max(FAR_DG_CULL_T, own * 4 + 16)) { continue; }
+    wgDgSub[k2] = p;
+    k2 += 1u;
+    if ((fl & 3u) != DG_OP_CARVE) { content = 1u; }
+    reach = max(reach, own);
+  }
+  wgDgSubN = k2;
+  // The scatter is not evaluated here (farDgCellSub), so it decides nothing
+  // and reaches nothing: farDgCellNear's carve-surface clause stays off. (The
+  // cull above still keeps a scattering prim to its reach: the threshold is
+  // what dgCell needs, and costs nothing once the cull is done.)
+  wgDgReach = -1;
+  // More instances than the table holds (never packed so far): no cull at
+  // all -- every voxel asks the full dgCell (farDgVox's `inChunk` is false).
+  let niAll = worldMap[lst + 1u + nAll];
+  wgDgFull = select(0u, 1u, niAll > 64u);
+  let ni = min(niAll, 64u);
+  var i2 = 0u;
+  for (var k = 0u; k < ni; k++) {
+    let ir = worldMap[lst + 2u + nAll + k];
+    let blk = worldMap[ir + DG_I_BLK];
+    let b0 = vec3<i32>(dgI(ir + DG_I_X), dgI(ir + DG_I_Y), dgI(ir + DG_I_Z));
+    let b1 = b0 + vec3<i32>(i32(worldMap[blk]), i32(worldMap[blk + 1u]), i32(worldMap[blk + 2u])) - vec3<i32>(1);
+    if (any(b1 < lo) || any(b0 > hi)) { continue; }
+    wgDgInst[i2] = ir;
+    i2 += 1u;
+    content = 1u;
+  }
+  wgDgInstN = i2;
+  wgDgContent = select(content, 1u, wgDgFull != 0u);
+}
+// dgCell (worldgen_dungeon.wgsli) WITHOUT ITS SCATTER STEP, over the culled
+// list (`lst` 0) or a voxel's own index-cell list: the carve, the firm shell,
+// the ordered fill / keep / skin / re-carve pass and the props, in dgCell's
+// order. THE SCATTER (rubble, stalagmites, stalactites, crystals, bones, moss,
+// ore, puddles) is left to the near field and the live producer: its probes
+// walk the whole list once per probe cell, and with them the pass measured
+// 23-49 ms of farCoverFill on a 1,024-entry refill slice in the Shardwell
+// (`--frames` worst-frame table, the in-flight harness), for 3 of the 218
+// cells the `far-parity` oracle fills there. A scatter voxel this evaluation
+// calls air can only make a feature beside it look thinner than it is: the
+// fill it then gets is still the feature's own material (`far-parity` counts
+// every such cell as held).
+fn farDgPrimOf(lst : u32, k : u32) -> u32 {
+  if (lst == 0u) { return wgDgSub[k]; }
+  return worldMap[lst + 1u + k];
+}
+fn farDgCellSub(x : i32, y : i32, z : i32, tw : u32, gh : i32, lst : u32) -> u32 {
+  var n = wgDgSubN;
+  var ni = wgDgInstN;
+  if (lst != 0u) {
+    n = min(worldMap[lst], DG_LIST_MAX);
+    ni = worldMap[lst + 1u + worldMap[lst]];
+  }
+  var dd : array<i32, DG_LIST_MAX>;
+  var c = DG_BIG;
+  var own = DG_BIG;
+  var ownP = 0u;
+  for (var k = 0u; k < n; k++) {
+    let p = farDgPrimOf(lst, k);
+    let d = dgPrimD(p, x, y, z);
+    dd[k] = d;
+    if ((worldMap[p + DG_P_FLAGS] & 3u) == DG_OP_CARVE) {
+      c = dgSmin(c, d, i32(worldMap[p + DG_P_BLEND] & 0xFFFFu));
+      if (d < own) { own = d; ownP = p; }
+    }
+  }
+  let tm = tw & 0xFFFu;
+  var w = tw;
+  if (c < 0) {
+    w = dgCarveWord(ownP, x, y, z);
+  } else if (c < DG_FIRM_Q2 && ownP != 0u && dgFlowy(tm)) {
+    w = dgWord(worldMap[ownP + DG_P_MATS] >> 16u, x, y, z);
+  }
+  var kept = false;
+  for (var k = 0u; k < n; k++) {
+    if (dd[k] >= 0) { continue; }
+    let p = farDgPrimOf(lst, k);
+    let op = worldMap[p + DG_P_FLAGS] & 3u;
+    if (op == DG_OP_FILL) {
+      if ((worldMap[p + DG_P_FLAGS] & DG_PF_OPEN_ONLY) == 0u || (w & 0xFFFu) == 0u) {
+        w = dgWord(dgFillMat(p, x, z), x, y, z);
+      }
+    } else if (op == DG_OP_KEEP) {
+      w = tw;
+      kept = true;
+    } else if (op == DG_OP_SKIN) {
+      if (c >= 0 && c <= i32(worldMap[p + DG_P_BLEND] >> 16u) && tm != 0u) {
+        w = dgWord(dgFillMat(p, x, z), x, y, z);
+      }
+    } else if (!kept) {
+      w = dgCarveWord(p, x, y, z);
+    }
+  }
+  for (var k = 0u; k < ni; k++) {
+    var ir = 0u;
+    if (lst == 0u) { ir = wgDgInst[k]; } else { ir = worldMap[lst + 2u + worldMap[lst] + k]; }
+    let m = dgPropCell(ir, x, y, z);
+    if (m == DG_CARVE_MAT) { w = 0u; }
+    else if (m != DG_PROP_NONE) { w = dgWord(m, x, y, z); }
+  }
+  return w;
+}
+// `inChunk`: p lies in the level chunk the cull was made for (else its own
+// index cell's list). One evaluator call site.
+fn farDgVox(p : vec3<i32>, gh : i32, inChunk : bool) -> u32 {
+  let tw = select(MAT_AIR, M_STONE, p.y <= gh) | 0x80000000u;
+  var w = tw;
+  let useSub = inChunk && wgDgFull == 0u;
+  var lst = 0u;
+  if (!useSub) { lst = dgListAt(p.x, p.y, p.z); }
+  if (useSub || lst != 0u) { w = farDgCellSub(p.x, p.y, p.z, tw, gh, lst); }
+  return (w & 0xFFFu) | select(0u, FAR_DG_TERRAIN, w == tw);
+}
+
 // ---- `farcover`: the rule over PROCGEN trees -------------------------------
 // Its own entry over the sweep's dispatch extent, recorded right after it
 // (pass_table.def farCoverFill), for the compile reason `farpatch` and
@@ -7816,23 +8137,57 @@ fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
   let level = ((packed & ~FAR_LIST_MAP_BIT) >> FAR_SLOT_SHIFT) + 1u;   // 1-based
   let slot = packed & FAR_SLOT_MASK;
   let shift = farCellShift(level);
-  if (shift > FAR_COVER_MAX_SHIFT || !VEGETATION || taSpeciesCount() <= 0) { return; }
+  if (shift > FAR_COVER_MAX_SHIFT) { return; }
   let sc = vec3<i32>(vec3<u32>(slot % FAR_NCHUNK, (slot / FAR_NCHUNK) % FAR_NCHUNK,
                                slot / (FAR_NCHUNK * FAR_NCHUNK)));
   let base = farSlotToChunk(sc, F.origins[level - 1u].xyz) * i32(CHUNK);
   let half = 1 << (shift - 1u);
   let span = i32(CHUNK) << shift;            // the level chunk, in fine voxels
   let f0 = base << vec3<u32>(shift);         // its min corner, fine
-  // Above every tree in the world: nothing to add (most of a level's sky).
-  if (f0.y > treeMaxTop()) { return; }
+  // THE TWO PROCGEN SOURCES this entry adds from: the trees (the cover rule,
+  // and the thin rule at its levels) -- nothing above every tree in the world,
+  // most of a level's sky -- and the DUNGEONS (the thin rule; DESIGN.md "A
+  // thin feature keeps its cell"). A level-1 chunk is 32 fine voxels on a
+  // side and aligned to its size, so it lies in ONE 64^3 dungeon index cell:
+  // its list, looked up once, says whether any dungeon prim can reach it.
+  // LEVEL 1 ONLY for the dungeons: level 2 (a level chunk = the whole index
+  // cell, so the cull keeps nearly every prim) measured +5 ms p99 / +1.5 ms
+  // max of farCoverFill flying the Shardwell for 5 of the 218 cells the
+  // `far-parity` oracle fills there (a one-voxel prop at 40-80 m, under
+  // ground). A dungeon's level-2 cells keep the centre rule unless their
+  // chunk is downsampled.
+  let doTrees = VEGETATION && taSpeciesCount() > 0 && f0.y <= treeMaxTop();
+  let doDungeon = shift == 1u && dgListAt(f0.x, f0.y, f0.z) != 0u;
+  if (!doTrees && !doDungeon) { return; }
   let oi = (level - 1u) * FAR_NUM_CHUNKS + slot;
-  // A level chunk the sweep filled solid has no empty cell to fill.
+  // A level chunk the sweep filled solid has no empty cell to fill. NOT a
+  // test the dungeon pass may use: farOcc counts BLOCKER-only cells as
+  // non-empty (the far readers' skip must never under-count), and a level
+  // chunk under the ground is blocker in every cell its rock does not fill --
+  // a dungeon's carved halls read "full" (the first cut of the dungeon pass
+  // ran in 2 of 4 harness dungeons, and only where a hall reached the sky).
+  // So the full test gates the TREES (bit 0: the tile scan is most of this
+  // entry's cost, and a buried level chunk has no crown to fill), and the
+  // dungeon pass runs where the cull left the dungeon something to decide
+  // (bit 1, farDgCull's wgDgContent).
   if (li == 0u) {
-    atomicStore(&wgCoverN, select(0u, 1u, (atomicLoad(&farOcc[oi]) & 0xFFFFu) < CHUNK_VOL));
     atomicStore(&wgCoverAdd, 0u);
     atomicStore(&wgCoverTop, 0u);
+    wgDgContent = 0u;
+    wgDgFull = 0u;
+    wgDgSubN = 0u;
+    wgDgInstN = 0u;
+    wgDgReach = -1;
+    if (doDungeon) {
+      farDgCull(dgListAt(f0.x, f0.y, f0.z), f0, f0 + vec3<i32>(span - 1));
+    }
+    atomicStore(&wgCoverN, select(0u, 1u, (atomicLoad(&farOcc[oi]) & 0xFFFFu) < CHUNK_VOL) |
+                           select(0u, 2u, wgDgContent != 0u));
   }
-  if (workgroupUniformLoad(&wgCoverN) == 0u) { return; }
+  let gate = workgroupUniformLoad(&wgCoverN);
+  let treesOn = doTrees && (gate & 1u) != 0u;
+  let dgContent = doDungeon && (gate & 2u) != 0u;
+  if (!treesOn && !dgContent) { return; }
 
   // ---- the trees that can reach this level chunk, one tile per thread ----
   let lo = f0.xz;
@@ -7844,7 +8199,7 @@ fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
   let nAx = min(fdiv(hi.x, TREE_TILE) + TREE_SCAN - tx0 + 1, WG_COVER_AXIS);
   let nAz = min(fdiv(hi.y, TREE_TILE) + TREE_SCAN - tz0 + 1, WG_COVER_AXIS);
   let maxReach = treeMaxReach();
-  for (var i = i32(li); i < nAx * nAz; i += 256) {
+  for (var i = i32(li); i < nAx * nAz && treesOn; i += 256) {
     var e = coverTreeNone();
     let s = treeSite(tx0 + i % nAx, tz0 + i / nAx, T.seed);
     if (s.wx + maxReach >= lo.x && s.wx - maxReach <= hi.x &&
@@ -7863,7 +8218,7 @@ fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
   }
   // The authored trees of the footprint's site cells (at most four: a level
   // chunk here is <= 25.6 m, a site cell 102.4 m), after the lattice's.
-  if (li == 0u) {
+  if (li == 0u && treesOn) {
     var k = 0;
     for (var q = 0u; q < 4u; q++) {
       let cx = select(lo.x, hi.x, (q & 1u) != 0u);
@@ -7904,17 +8259,17 @@ fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
   // The compact list, in offer order, by one thread (<= ~110 entries).
   if (li == 0u) {
     var n = 0u;
-    for (var i = 0; i < nAx * nAz && n < FAR_COVER_TREES; i++) {
+    for (var i = 0; i < nAx * nAz && n < FAR_COVER_TREES && treesOn; i++) {
       if (wgCover[i].vtop != FAR_COVER_NONE) { wgCoverIdx[n] = u32(i); n += 1u; }
     }
-    for (var d = 0; d < FAR_COVER_SITES && n < FAR_COVER_TREES; d++) {
+    for (var d = 0; d < FAR_COVER_SITES && n < FAR_COVER_TREES && treesOn; d++) {
       let i = WG_COVER_AXIS * WG_COVER_AXIS + d;
       if (wgCover[i].vtop != FAR_COVER_NONE) { wgCoverIdx[n] = u32(i); n += 1u; }
     }
     atomicStore(&wgCoverN, n);
   }
   let nTrees = workgroupUniformLoad(&wgCoverN);
-  if (nTrees == 0u) { return; }
+  if (nTrees == 0u && !(doDungeon && dgContent)) { return; }
 
   // ---- the cells: the sweep's own ownership (one z row, four x per OWNER,
   // the sixteen words those four columns pack into), one column per LANE:
@@ -7936,22 +8291,26 @@ fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
     let cx0 = f0.x + i32(x0 + b) * step;
     let cz0 = f0.z + i32(zi) * step;
     // The trees that reach this cell column, as a mask over the compact list,
-    // and their vertical extent.
+    // and their vertical extent -- the column's box grown by one voxel, so the
+    // thin rule's face neighbours of a sub-sample on its edge see the tree
+    // that reaches them (for the cover rule's own lookups, inside the box, a
+    // tree that meets only the margin answers air either way).
     var m0 = 0u;
     var m1 = 0u;
     var yb = 2147483647;
     var yt = FAR_COVER_NONE;
-    let clo = vec2<i32>(cx0, cz0);
-    let chi = clo + vec2<i32>(step - 1);
+    let clo = vec2<i32>(cx0, cz0) - vec2<i32>(1);
+    let chi = vec2<i32>(cx0, cz0) + vec2<i32>(step);
     for (var i = 0u; i < nTrees; i++) {
       let e = wgCover[wgCoverIdx[i]];
-      if (!coverTreeMeets(e, clo, chi, ylo, yhi)) { continue; }
+      if (!coverTreeMeets(e, clo, chi, ylo - 1, yhi + 1)) { continue; }
       if (i < 32u) { m0 |= 1u << i; } else { m1 |= 1u << (i - 32u); }
       yb = min(yb, e.base + 1);
       yt = max(yt, e.vtop);
     }
     // (No trees reach this column: the loop below runs zero times.)
     let anyTree = (m0 | m1) != 0u;
+    let thinLevel = shift <= FAR_THIN_MAX_SHIFT;
     for (var yi = 0u; yi < CHUNK && anyTree; yi++) {
       let byteV = bytes[yi];
       if (farCellSlot(byteV) != 0u) { continue; }       // the centre found matter
@@ -7960,18 +8319,136 @@ fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
       var acc : FarCoverAcc;
       acc.lo = 0u;
       acc.hi = 0u;
+      var thin : FarCoverAcc;
+      thin.lo = 0u;
+      thin.hi = 0u;
       for (var o = 0u; o < 8u; o++) {
-        farCoverPut(&acc, o, farCoverSlotOf(coverTreesAt(m0, m1, farCoverSub(c0, half, o))));
+        let m = coverTreesAt(m0, m1, farCoverSub(c0, half, o));
+        farCoverPut(&acc, o, farCoverSlotOf(m));
+        if (thinLevel) { farCoverPut(&thin, o, farThinSlotOf(m)); }
       }
-      let pick = farCoverPick(acc, level);
+      var pick = farCoverPick(acc, level);
+      // THE THIN RULE over the trees (a one-voxel twig, a sapling's trunk):
+      // only where the cover rule added nothing, its face neighbours from the
+      // same atlas (ground and everything else the trees do not hold: open).
+      if (pick == 0u && thinLevel) {
+        let need = farThinNeedMask(thin);
+        if (need != 0u) {
+          var oLo = 0u;
+          var oHi = 0u;
+          for (var k = 0u; k < 48u; k++) {
+            let o = k / 6u;
+            let j = k % 6u;
+            if ((need & (1u << o)) == 0u) { continue; }
+            let q = farThinNbr(farCoverSub(c0, half, o), j);
+            if (!farCellIsSolid(coverTreesAt(m0, m1, q))) { farThinOpenSet(&oLo, &oHi, o, j); }
+          }
+          pick = farThinPick(thin, oLo, oHi);
+        }
+      }
       if (pick == 0u) { continue; }
       // This lane's byte only: the other three lanes of the word may be
       // rewriting theirs in the same instant.
       let w = wordBase + yi * (CHUNK / 4u);
       atomicAnd(&farVox[w], ~(0xFFu << (b * 8u)));
       atomicOr(&farVox[w], pick << (b * 8u));
+      bytes[yi] = pick;
       if (byteV == 0u) { added += 1u; }   // a blocker cell was already counted
       top = max(top, yi + 1u);
+    }
+
+    // ---- THE THIN RULE over the DUNGEONS --------------------------------
+    // dgCell -- genChunk's own evaluator, dressing and props included -- at
+    // the cell's sub-samples and their face neighbours, on an APPROXIMATE
+    // terrain word: solid (stone) at or under the cell's centre column's
+    // ground, air over it. Inside a dungeon's keep box the natural cave bands
+    // are off (caveBands), so under the ground the terrain IS solid rock and
+    // only its material differs, which decides no shape; the approximation
+    // shows only where a dungeon reaches the surface, a voxel's ground away
+    // from its neighbour's. The one dgCell call site is the loop's (compile:
+    // the carve field at ONE call site per kernel path). At level 1 the three
+    // face neighbours inside the 2x2x2 block are sub-samples already asked.
+    // THE SKY OVER A DUNGEON IS NOT EVALUATED: an index cell reaches far over
+    // the ground where its box does, and every one of those empty cells cost
+    // eight dgCell calls to learn it was air (the first cut measured 22 ms
+    // p99 / 55 ms max of farCoverFill flying over the Shardwell). A dungeon
+    // puts matter over the ground only inside its SURFACE RECTS (dgSurfNear,
+    // the rects carry the prims' inflation; the tree and cover keep-outs rest
+    // on the same fact) and never over its box's top, so a cell whose floor
+    // is more than a voxel over the column's ground is skipped unless the
+    // column is near a rect and under the box top.
+    if (doDungeon && dgContent) {
+      var L : LandCol;
+      var haveL = false;
+      var skyFloor = 0;   // the lowest cell floor that is sky to the dungeons
+      for (var yi = 0u; yi < CHUNK; yi++) {
+        let byteV = bytes[yi];
+        if (farCellSlot(byteV) != 0u) { continue; }
+        let c0 = vec3<i32>(cx0, f0.y + i32(yi) * step, cz0);
+        if (!haveL) {
+          landColumn(cx0 + half, cz0 + half, T.seed, &L);
+          haveL = true;
+          skyFloor = L.h + 2;
+          if (dgSurfNear(cx0 + half, cz0 + half, step + 2)) {
+            skyFloor = max(skyFloor, dgColTop(cx0 + half, cz0 + half) + 2);
+          }
+        }
+        if (c0.y >= skyFloor) { break; }
+        if (wgDgFull == 0u && !farDgCellNear(c0, step)) { continue; }
+        var acc : FarCoverAcc;
+        acc.lo = 0u;
+        acc.hi = 0u;
+        var solid = 0u;
+        var need = 0u;
+        var oLo = 0u;
+        var oHi = 0u;
+        for (var k = 0u; k < 56u; k++) {
+          var q : vec3<i32>;
+          var o = k;
+          var j = 0u;
+          if (k < 8u) {
+            q = farCoverSub(c0, half, k);
+          } else {
+            if (k == 8u) {
+              need = farThinNeedMask(acc);
+              if (need == 0u) { break; }
+            }
+            o = (k - 8u) / 6u;
+            j = (k - 8u) % 6u;
+            if ((need & (1u << o)) == 0u) { continue; }
+            q = farThinNbr(farCoverSub(c0, half, o), j);
+            let lq = q - c0;
+            if (half == 1 && all(lq >= vec3<i32>(0)) && all(lq <= vec3<i32>(1))) {
+              let oq = u32(lq.x + lq.y * 2 + lq.z * 4);
+              if ((solid & (1u << oq)) == 0u) { farThinOpenSet(&oLo, &oHi, o, j); }
+              continue;
+            }
+          }
+          // The approximation never speaks for itself: terrain is no
+          // candidate, and terrain air within a voxel of the ground (whose
+          // real height differs column to column) is not trusted to be open.
+          let lq0 = q - f0;
+          let dv = farDgVox(q, L.h, all(lq0 >= vec3<i32>(0)) && all(lq0 < vec3<i32>(span)));
+          let m = dv & 0xFFFu;
+          let approx = (dv & FAR_DG_TERRAIN) != 0u;
+          let blocked = farCellIsSolid(m) || (approx && q.y <= L.h + 1);
+          if (k < 8u) {
+            if (!approx) { farCoverPut(&acc, k, farThinSlotOf(m)); }
+            if (blocked) { solid |= 1u << k; }
+          } else if (!blocked) {
+            farThinOpenSet(&oLo, &oHi, o, j);
+          }
+        }
+        if (need == 0u) { continue; }
+        let pick = farThinPick(acc, oLo, oHi);
+        if (pick == 0u) { continue; }
+        let w = wordBase + yi * (CHUNK / 4u);
+        atomicAnd(&farVox[w], ~(0xFFu << (b * 8u)));
+        atomicOr(&farVox[w], pick << (b * 8u));
+        bytes[yi] = pick;
+        if (byteV == 0u) { added += 1u; }
+        top = max(top, yi + 1u);
+      }
     }
   }
   atomicAdd(&wgCoverAdd, added);
@@ -8722,6 +9199,22 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
 // bit 0 of the slot's signature.
 fn farDownRan(slot : u32) -> bool { return (farSig[slot] & FAR_SIG_RAN) != 0u; }
 
+// ---- the thin rule's two live questions (fardownFeat's thin pass) ----------
+// The material at fine voxel q, for a chunk at `base` whose page is at
+// `pageBase` (not a sentinel): its own page inside it, the window across a
+// face, FAR_THIN_UNSEEN outside the window -- which the rule counts as solid
+// (no claim on a guess, FarEdits' kMatAtUnseen).
+const FAR_THIN_UNSEEN : u32 = 0xFFFFu;
+fn farThinLive(q : vec3<i32>, base : vec3<i32>, pageBase : u32) -> u32 {
+  let l = q - base;
+  if (all(l >= vec3<i32>(0)) && all(l < vec3<i32>(i32(CHUNK)))) {
+    let u = vec3<u32>(l);
+    return voxels[pageBase + (u.z * CHUNK + u.y) * CHUNK + u.x] & 0xFFFu;
+  }
+  if (!inWindow(q, T.origin)) { return FAR_THIN_UNSEEN; }
+  return voxWordAt(q) & 0xFFFu;
+}
+
 @compute @workgroup_size(64)
 fn fardownClaim(@builtin(workgroup_id) wg : vec3<u32>,
                 @builtin(local_invocation_index) li : u32) {
@@ -9041,6 +9534,66 @@ fn fardownFeat(@builtin(workgroup_id) wg : vec3<u32>,
                       farCoverSlotOf(voxels[pageBase + (lf.z * CHUNK + lf.y) * CHUNK + lf.x] & 0xFFFu));
         }
         let pick = farCoverPick(acc, level);
+        if (pick == 0u) { continue; }
+        atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
+        atomicOr(&farVox[bi >> 2u], pick << bsh);
+        atomicMax(&farOcc[farOccIndex(level, cc)],
+                  farOccPack(1u, u32(cc.y & (i32(CHUNK) - 1)) + 1u));
+      }
+    }
+  }
+
+  // ---- THE THIN RULE, LIVE (farThinPick; DESIGN.md "A thin feature keeps its
+  // cell") --------------------------------------------------------------------
+  // After the cover pass (a cell it filled holds matter now and is left alone)
+  // and before the loose top and container passes (the loose top touches only
+  // cells whose centre is far-solid; the container rule may claim a cell this
+  // filled, and wins, as it does in FarEdits::Sweep). No prefilter scan: a
+  // SENTINEL chunk is one material, so none of its voxels is thin (each has
+  // its own material behind it on every axis); every other chunk pays one
+  // read per sub-sample of each EMPTY cell -- the chunk once at level 1 -- and
+  // the neighbour reads only where two candidates of one slot meet in a cell.
+  if ((pe & PT_SENTINEL_BIT) == 0u) {
+    for (var level = 1u; level <= FAR_LEVELS; level++) {
+      let shift = farCellShift(level);
+      if (shift > FAR_THIN_MAX_SHIFT) { break; }
+      let step = 1 << shift;
+      let half = 1 << (shift - 1u);
+      let first = vec3<i32>(farFirstCenter(base.x, step, half), farFirstCenter(base.y, step, half),
+                            farFirstCenter(base.z, step, half));
+      let n = vec3<i32>(farCenterCount(base.x, first.x, step), farCenterCount(base.y, first.y, step),
+                        farCenterCount(base.z, first.z, step));
+      let origin = F.origins[level - 1u].xyz;
+      let cells = u32(n.x * n.y * n.z);
+      for (var ci = li; ci < cells; ci += 64u) {
+        let fine = first + vec3<i32>(i32(ci) % n.x, (i32(ci) / n.x) % n.y, i32(ci) / (n.x * n.y)) * step;
+        let cc = fine >> vec3<u32>(shift);
+        if (!farInBox(cc, origin)) { continue; }
+        let bi = farVoxByteIndex(level, cc);
+        let bsh = (bi & 3u) * 8u;
+        if (farCellSlot((atomicLoad(&farVox[bi >> 2u]) >> bsh) & 0xFFu) != 0u) { continue; }
+        // The cell's min corner, chunk-local: the whole cell is in this page.
+        let c0 = fine - vec3<i32>(half) - base;
+        var acc : FarCoverAcc;
+        acc.lo = 0u;
+        acc.hi = 0u;
+        for (var o = 0u; o < 8u; o++) {
+          let lf = vec3<u32>(farCoverSub(c0, half, o));
+          farCoverPut(&acc, o, farThinSlotOf(voxels[pageBase + (lf.z * CHUNK + lf.y) * CHUNK + lf.x] & 0xFFFu));
+        }
+        let need = farThinNeedMask(acc);
+        if (need == 0u) { continue; }
+        var oLo = 0u;
+        var oHi = 0u;
+        for (var k = 0u; k < 48u; k++) {
+          let o = k / 6u;
+          let j = k % 6u;
+          if ((need & (1u << o)) == 0u) { continue; }
+          let q = farThinNbr(base + farCoverSub(c0, half, o), j);
+          let m = farThinLive(q, base, pageBase);
+          if (m != FAR_THIN_UNSEEN && !farCellIsSolid(m)) { farThinOpenSet(&oLo, &oHi, o, j); }
+        }
+        let pick = farThinPick(acc, oLo, oHi);
         if (pick == 0u) { continue; }
         atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
         atomicOr(&farVox[bi >> 2u], pick << bsh);
