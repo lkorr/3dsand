@@ -3019,6 +3019,8 @@ DebrisSystem::FleshLattice DebrisSystem::FleshOf(Body& b) {
   f.microModel = &b.micro.model;
   f.selfActive = b.activeCount > 0;
   f.bleedMat = b.bleedMat;
+  f.bleeding = b.bleedMat != 0 && b.wound.open &&
+               (b.wound.gushTicks > 0 || b.wound.budget >= 1.0f);
   f.geomGen = b.geomGen;
   return f;
 }
@@ -4955,6 +4957,49 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
   // Wholly destroyed, or blown under the body-worthiness floor: the remainder
   // rejoins the world as loose voxels, exactly like the burn dissolve path.
   if (b.voxels.size() < MinBodyVoxels()) {
+    // ---- A PIECE BLOWN APART STILL BLEEDS (2026-10-14) ---------------------
+    // The wound below is armed on the SURVIVOR and drained by BleedBodies
+    // over the next seconds; a piece that does not survive has nowhere to
+    // drain it from, so it used to bleed nothing at all -- a grenade on a
+    // severed head left bone chips and no blood (owner report 2026-10-14).
+    // It pays the whole of it NOW, as an amputation: the gout's droplets in
+    // one burst, the drip budget and the sever's thrown voxels as whole
+    // blood voxels, every one out from where the piece was.
+    if (b.bleedMat != 0 && lostN > 0) {
+      const auto& gore = CurrentTuning().gore;
+      const int ms = std::max(2, gore.microScale);
+      const uint32_t fluid = cutFluid != 0 ? cutFluid : b.bleedMat;
+      const size_t restN = fine ? b.skinVoxels.size() : b.voxels.size();
+      const float wholeVox =
+          carvedWorldVox + (float)restN / (lostScale * lostScale * lostScale);
+      const Vec3 at = woundW;
+      const float scale = std::max(0.0f, b.wound.scale);
+      const int nVox = (int)std::lround(
+          ((wholeVox * gore.corpseBleedPerVoxel + gore.severStumpBudget) *
+               std::max(0.0f, gore.bleedVoxelGain) +
+           (float)std::max(0, gore.severVoxels) * std::max(0.0f, gore.bleedGain)) *
+          scale);
+      const int nDrop = (int)std::lround((float)gore.severSpray *
+                                         std::max(0.0f, gore.bleedGain) * scale);
+      const float sprd = gore.severGobbetSpread;
+      for (int k = 0; k < nVox + nDrop; k++) {
+        if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+        const bool drop = k >= nVox;
+        const uint32_t h = rng::Hash3(b.serial * 2246822519u, (uint32_t)k, 0xB1A57u);
+        Vec3 dir{rng::SignedUnit(h),
+                 0.3f + 0.7f * std::fabs(rng::SignedUnit(rng::Pcg(h ^ 0x31u))),
+                 rng::SignedUnit(rng::Pcg(h ^ 0x9Fu))};
+        const float dl = dir.len();
+        dir = dl > 1e-3f ? dir * (1.0f / dl) : Vec3{0, 1, 0};
+        const float sp = (drop ? gore.severSpraySpeed : gore.severVoxelSpeed) *
+                         (0.6f + 0.8f * rng::Unit01(rng::Pcg(h ^ 0x77u)));
+        const Vec3 p{at.x + rng::SignedUnit(rng::Pcg(h ^ 0x2A5u)) * sprd,
+                     at.y + rng::SignedUnit(rng::Pcg(h ^ 0xB77u)) * sprd,
+                     at.z + rng::SignedUnit(rng::Pcg(h ^ 0xC3Du)) * sprd};
+        spawns.push_back(BloodSpawn(p, dir * sp, fluid, drop,
+                                    drop ? gore.microLifeTicks : 0, drop ? ms : 0));
+      }
+    }
     VoxelsToParticles(b, b.voxels, lin, ang, world, spawns);
     ReleaseBody(b);
     bodies_[bi] = std::move(bodies_.back());
@@ -5987,7 +6032,33 @@ bool DebrisSystem::BluntBody(uint64_t handle, Vec3 atVoxel, float radiusVoxels,
   phys_->GetTransform(b.handle, b.xf);
   const float qi[4] = {-b.xf.quat[0], -b.xf.quat[1], -b.xf.quat[2],
                        b.xf.quat[3]};
-  const Vec3 cBody = QuatRot(qi, atVoxel - b.xf.pos);
+  Vec3 cBody = QuatRot(qi, atVoxel - b.xf.pos);
+  // ---- TEETH CLOSE AROUND, THEY DO NOT SCRAPE (2026-10-14) -----------------
+  // A bite's hole sits UNDER the contact, as on a creature (Mob::BiteHit, "the
+  // same hole dead or alive"): pushed in along the line to the piece's own
+  // middle by its radius, never more than halfway there. Without it a nip on
+  // a severed head was a ball centred ON the skin -- half of it air, and the
+  // meat-only filter keeping the skin's bone side -- and a shoal took ~7 skin
+  // voxels a bite off a loose head (owner report 2026-10-14: piranhas "not
+  // removing any voxels" from a severed naga head).
+  if (cause == DamageCause::Bite && !b.voxels.empty()) {
+    int lo[3] = {INT_MAX, INT_MAX, INT_MAX}, hi[3] = {INT_MIN, INT_MIN, INT_MIN};
+    for (const DebrisVoxel& v : b.voxels) {
+      if ((v.payload & 0xFFFu) == 0) continue;
+      lo[0] = std::min(lo[0], (int)v.x); hi[0] = std::max(hi[0], (int)v.x);
+      lo[1] = std::min(lo[1], (int)v.y); hi[1] = std::max(hi[1], (int)v.y);
+      lo[2] = std::min(lo[2], (int)v.z); hi[2] = std::max(hi[2], (int)v.z);
+    }
+    if (lo[0] <= hi[0]) {
+      const float inv = 1.0f / (float)std::max(1u, b.physScale);
+      const Vec3 mid{((float)lo[0] + (float)hi[0] + 1.0f) * 0.5f * inv,
+                     ((float)lo[1] + (float)hi[1] + 1.0f) * 0.5f * inv,
+                     ((float)lo[2] + (float)hi[2] + 1.0f) * 0.5f * inv};
+      const Vec3 inward = mid - cBody;
+      const float d = inward.len();
+      if (d > 1e-3f) cBody += inward * (std::min(radiusVoxels, d * 0.5f) / d);
+    }
+  }
   const float r2 = radiusVoxels * radiusVoxels;
   const uint32_t jScale = std::max(1u, b.micro.skinScale);
   const uint32_t key = b.serial * 40503u + seed;

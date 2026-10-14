@@ -1217,6 +1217,9 @@ const char* const kOrder[] = {
     // ...and a lava-coated SEVERED HEAD in water is quenched (the coat goes)
     // and steams. Ticks the world; regenerated on the way out.
     "lava-quench",
+    // ...and a SEVERED PIECE is food that bleeds (a shoal at a cut-off head).
+    // Ticks the world; regenerated on the way out.
+    "loose-carrion",
     // ...and EVERY liquid coats a body, syrup by hand and walked through
     // (DefaultLiquidStain). Ticks the world; regenerated on the way out.
     "liquid-coats",

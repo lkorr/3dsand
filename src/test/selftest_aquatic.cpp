@@ -113,6 +113,210 @@ bool PickDrySite(Ctx& c, int R, int kDepth, IVec3& site, int& hMin, int& hMax,
   return sited;
 }
 
+// ---------------------------------------------------------------------------
+// loose-carrion: a SEVERED PIECE is food, and it bleeds when it is blown apart
+// ---------------------------------------------------------------------------
+// Owner report 2026-10-14: piranhas at a severed (naga) head "not making it
+// bleed or removing any voxels", "aren't able to eat dismembered limbs besides
+// the torso", and a blast on the head made no blood. Three causes, one claim
+// each, on a man in a pool whose head is cut off and a fresh shoal:
+//   A. THE SHOAL TURNS TO THE PIECES: fish-ticks with a loose piece as the
+//      target >= looseCarrionTargetMin. A loose actor never reported its open
+//      wound (ai::Actor::bleeding), so the gouting head was never smelled and
+//      the corpse won every ranking (measured 17 fish-ticks of 5,400).
+//   B. ...AND EATS THEM: the head loses >= looseCarrionVoxelsMin voxels. The
+//      loose bite was a ball centred ON the contact at radius x power; it is
+//      now the corpse's hole (Mob::BiteHit: under the contact, 0.4 + 0.6 power).
+//   C. A PIECE BLOWN APART BLEEDS: a blast that destroys the head throws
+//      >= looseCarrionBlastBloodMin blood particles. DamageBody released a
+//      destroyed body before arming the wound that bleeds it (it threw 0).
+// Thresholds in tests/baseline.json.
+Status GateLooseCarrion(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  MobSystem& mobs = c.mobs;
+  const uint32_t mStone = MatIdOf(c, "stone"), mWater = MatIdOf(c, "water");
+  const int dPiranha = mobs.FindDef("piranha"), dHuman = mobs.FindDef("human");
+  if (!mStone || !mWater || dPiranha < 0 || dHuman < 0) {
+    detail = "missing stone / water / piranha / human";
+    return Status::Fail;
+  }
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  mobs.Reset();
+  c.debris.Reset();
+
+  // ---- THE SITE: dry ground, chosen off the GPU's own voxels (PickDrySite).
+  constexpr int R = 34, kDepth = 16;
+  IVec3 site{};
+  int hMin = 0, hMax = 0;
+  std::string siteWhy;
+  if (!PickDrySite(c, R, kDepth, site, hMin, hMax, siteWhy)) {
+    detail = "no dry, flat site: " + siteWhy;
+    return Status::Fail;
+  }
+  // Dug below the lowest ground; walls to above the highest; air over it.
+  const int bedY = hMin - kDepth - 1;      // the floor's top stone layer
+  const int waterTop = bedY + kDepth;      // the topmost water layer
+  const int wallTop = hMax + 2;
+  // THE LEDGE (part D): a stone shelf inside the pool, its top one voxel over
+  // the waterline, against the +x wall.
+  const int ledgeX0 = site.x + R - 9, ledgeX1 = site.x + R - 2;
+  auto inLedge = [&](int x, int z) {
+    return x >= ledgeX0 && x <= ledgeX1 && std::abs(z - site.z) <= 4;
+  };
+  std::vector<CellOp> pool;
+  for (int x = site.x - R; x <= site.x + R; x++)
+    for (int z = site.z - R; z <= site.z + R; z++)
+      for (int y = bedY - 1; y <= wallTop + 14; y++) {
+        const IVec3 cc{x, y, z};
+        if (!c.world.CellInWindow(cc)) continue;
+        const bool wall = std::abs(x - site.x) >= R - 1 || std::abs(z - site.z) >= R - 1;
+        uint32_t w = PackVoxNew(0u, 0u);
+        if (y <= bedY || (wall && y <= wallTop)) w = PackVoxNew(mStone, 0u);
+        else if (inLedge(x, z) && y <= waterTop + 1) w = PackVoxNew(mStone, 0u);
+        else if (y <= waterTop && !wall) w = (mWater & 0xFFFu) | (7u << 12);
+        pool.push_back({World::SlotCellIndex(cc), w});
+      }
+  // ...and a dry pad on the bank for part C's man and part D's dry fish:
+  // level stone, air over it, outside the -x wall.
+  const int padX = site.x - R - 10, padZ = site.z;
+  for (int x = padX - 5; x <= padX + 5; x++)
+    for (int z = padZ - 5; z <= padZ + 5; z++)
+      for (int y = hMin - 2; y <= hMax + 24; y++) {
+        const IVec3 cc{x, y, z};
+        if (!c.world.CellInWindow(cc)) continue;
+        pool.push_back({World::SlotCellIndex(cc),
+                        PackVoxNew(y <= hMax ? mStone : 0u, 0u)});
+      }
+  support::TickRig rig(c, 74000u, IVec3{site.x >> 4, waterTop >> 4, site.z >> 4});
+  for (size_t off = 0; off < pool.size(); off += 60000) {
+    const size_t n = std::min<size_t>(60000, pool.size() - off);
+    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) {
+      o.cells.assign(pool.begin() + (ptrdiff_t)off, pool.begin() + (ptrdiff_t)(off + n));
+    });
+  }
+  support::RunTicks(rig, 30);
+
+  const Vec3 poolC{(float)site.x + 0.5f, (float)bedY + 1.0f, (float)site.z + 0.5f};
+  auto spawnVictim = [&](Vec3 at) -> uint64_t {
+    const Vec3 vs = mobs.Defs()[dHuman].worldSize;
+    const uint64_t id = mobs.Spawn(dHuman, {ifloor(at.x - vs.x * 0.5f), ifloor(at.y),
+                                            ifloor(at.z - vs.z * 0.5f)});
+    if (id) mobs.SetMobBehavior(id, "dummy");
+    return id;
+  };
+  auto spawnAt = [&](int def, Vec3 centre) -> uint64_t {
+    const Vec3 ws = mobs.Defs()[def].worldSize;
+    return mobs.Spawn(def, {ifloor(centre.x - ws.x * 0.5f), ifloor(centre.y - ws.y * 0.5f),
+                            ifloor(centre.z - ws.z * 0.5f)});
+  };
+
+  const uint64_t corpse = spawnVictim(poolC);
+  support::RunTicks(rig, 10);
+  int head = -1;
+  if (const Mob* cm = mobs.FindMobById(corpse))
+    for (size_t li = 0; li < cm->Def()->limbs.size(); li++)
+      if (cm->Def()->limbs[li].name == "head") head = (int)li;
+  if (head < 0) {
+    detail = "the human has no head limb";
+    return Status::Fail;
+  }
+  mobs.Sever(corpse, head);
+  support::RunTicks(rig, 30);
+  // Every loose piece of the man: its voxels, and the biggest one's centre.
+  // `only` (nonzero) counts that one piece -- the head -- by global id: the
+  // shoal tears more pieces off the corpse as it feeds, and their voxels
+  // would hide what was eaten off the head.
+  auto pieces = [&](uint32_t& n, Vec3* centre, uint64_t only = 0, uint64_t* bigId = nullptr) {
+    n = 0;
+    uint32_t pc = 0;
+    size_t best = 0;
+    for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++) {
+      DebrisSystem::FleshLattice f;
+      if (!c.debris.CoatLatticeOf(c.debris.BodyHandle(bi), f) || f.creature != corpse) continue;
+      if (only != 0 && f.id != only) continue;
+      size_t k = 0;
+      if (f.skin) { for (const PrefabVoxel& v : *f.skin) if (v.material & 0xFFFu) k++; }
+      else if (f.coll) { for (const DebrisVoxel& v : *f.coll) if (v.payload & 0xFFFu) k++; }
+      n += (uint32_t)k;
+      pc++;
+      if (k > best && bigId) *bigId = f.id;
+      if (centre && f.xf && k > best) {
+        const float ps = 1.0f / (float)std::max(1u, f.physScale);
+        const Vec3 mid{(float)(f.lo.x + f.hi.x) * 0.5f * ps, (float)(f.lo.y + f.hi.y) * 0.5f * ps,
+                       (float)(f.lo.z + f.hi.z) * 0.5f * ps};
+        const Quat q{f.xf->quat[0], f.xf->quat[1], f.xf->quat[2], f.xf->quat[3]};
+        *centre = f.xf->pos + QuatRotate(q, mid);
+      }
+      best = std::max(best, k);
+    }
+    return pc;
+  };
+  uint32_t n0 = 0;
+  uint64_t headId = 0;
+  if (pieces(n0, nullptr, 0, &headId) == 0 || headId == 0) {
+    detail = "the severed head is not a loose body";
+    return Status::Fail;
+  }
+  std::vector<uint64_t> shoal;
+  for (int k = 0; k < 6; k++) {
+    const float a = 0.3f + (float)k * 1.047f;
+    shoal.push_back(spawnAt(dPiranha, poolC + Vec3{std::cos(a) * 11.0f, 5.0f + (float)(k % 3),
+                                                   std::sin(a) * 11.0f}));
+  }
+  const int kTicks = (int)BaselineNumber("looseCarrionTicks", 900);
+  uint32_t onLoose = 0, onCorpse = 0, cutLoose = 0;
+  std::string trace;
+  for (int i = 0; i < kTicks; i++) {
+    support::RunTicks(rig, 1);
+    for (uint64_t id : shoal) {
+      const ai::Brain* b = mobs.MobBrain(id);
+      const NpcStroke* st = mobs.MobStroke(id);
+      if (b && b->hasTarget) {
+        if (ai::IsLooseActorId(b->targetId)) onLoose++;
+        else if (b->targetId == corpse) onCorpse++;
+      }
+      if (st && st->phase == NpcStroke::Phase::Cut && ai::IsLooseActorId(st->targetId)) cutLoose++;
+    }
+    if (i % 150 == 0) {
+      uint32_t n = 0, nh = 0;
+      const uint32_t pc = pieces(n, nullptr);
+      pieces(nh, nullptr, headId);
+      trace += Format(" t%d %u/%u/%u", i, nh, n, pc);
+    }
+  }
+  uint32_t n1 = 0, all1 = 0;
+  Vec3 at{};
+  pieces(n1, &at, headId);
+  pieces(all1, nullptr);
+  // C: the blast, on the head's middle, through DebrisSystem directly
+  // (the claim is the debris carve's, not the explosion pipeline's).
+  std::vector<ParticleSpawn> sp;
+  c.debris.DamageBodiesRadial(at, 4.0f, c.world, sp);
+  const uint32_t mBlood = mobs.Defs()[dHuman].bleedMat;
+  uint32_t blood = 0;
+  for (const ParticleSpawn& q : sp)
+    if ((q.payload & 0xFFFu) == mBlood) blood++;
+  uint32_t n2 = 0;
+  pieces(n2, nullptr, headId);
+  mobs.Reset();
+  c.debris.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  const uint32_t lost = n0 > n1 ? n0 - n1 : 0;
+  const bool aOk = onLoose >= (uint32_t)BaselineNumber("looseCarrionTargetMin", 500);
+  const bool bOk = lost >= (uint32_t)BaselineNumber("looseCarrionVoxelsMin", 150);
+  const bool cOk = n2 < n1 && blood >= (uint32_t)BaselineNumber("looseCarrionBlastBloodMin", 100);
+  RecordObserved("looseCarrionVoxels", (double)lost);
+  RecordObserved("looseCarrionBlastBlood", (double)blood);
+  detail = Format("A target %s: %u fish-ticks on a loose piece, %u on the corpse, %u cut ticks at a piece "
+                  "| B eaten %s: head %u -> %u voxels (%u lost; every piece %u at the end) [head/all/pieces:%s] | C blast %s: "
+                  "head %u -> %u voxels, %zu spawns, %u blood",
+                  aOk ? "PASS" : "FAIL", onLoose, onCorpse, cutLoose, bOk ? "PASS" : "FAIL", n0, n1,
+                  lost, all1, trace.c_str(), cOk ? "PASS" : "FAIL", n1, n2, sp.size(), blood);
+  return aOk && bOk && cOk ? Status::Pass : Status::Fail;
+}
+
 Status GateAquatic(Ctx& c, std::string& detail) {
   IdCounterScope idScope(c.mobs);
   MobSystem& mobs = c.mobs;
@@ -1299,6 +1503,7 @@ const std::vector<Gate>& AquaticGates() {
   static const std::vector<Gate> g = {
       // The swimmers: a shark's hunt, a piranha shoal, the medium, stranding.
       {"aquatic", "mob", {}, false, GateAquatic, false},
+      {"loose-carrion", "mob", {}, false, GateLooseCarrion, false},
       // A walker swims: floats and treads, swims out over a low bank, dives.
       {"npc-swim", "mob", {}, false, GateNpcSwim, false},
       // An amputation under water bleeds on, at underwaterBleedRate x dry.

@@ -15642,6 +15642,17 @@ it never asks the ground navigator (there is no floor to route over; the
 drive feels its own way), and its idle wander draws each leg's height too
 (`wander.depth`).
 
+**Carrion, and the pieces of it** (`Perception::carrion`): a corpse with meat
+left is food, and so is every SEVERED PIECE -- a loose-flesh actor in the
+`ai::kLooseActorBase` band, its meat counted by the corpse's rule, and
+`bleeding` while its debris wound still pays out (`FleshLattice::bleeding`),
+so a gouting head is smelled in the water like a body. A bite on one is the
+corpse's hole (`Mob::BiteHit`): `biteRadius x (0.4 + 0.6 power)`, pushed
+under the contact toward the piece's middle (`DebrisSystem::BluntBody`,
+cause Bite), meat only. A piece a blast DESTROYS pays its whole wound at
+once (`DamageBody`: drip budget + sever voxels as whole blood, the gout as
+one burst) -- the survivor-only wound left it bloodless. Gate `loose-carrion`.
+
 **The bite: a mouthful, and jaws that close by their own force.** Two strike
 profile fields on the natural weapon. `strike.biteForce` (0..1): a floor on
 the blow's power, and the sweep runs however slowly the head is moving --

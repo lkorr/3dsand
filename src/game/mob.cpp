@@ -9526,6 +9526,11 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
         a.immersion =
             eaterMob != nullptr ? PointImmersion(*eaterMob, c) : 1.0f;
         a.fleshRatio = lm.ratio;
+        // ...and a piece that still BLEEDS is smelled in the water like the
+        // corpse it came off (Perception::scentRange / scentPull). Without it
+        // a gouting severed head ranked as a dry one, and a shoal at the
+        // corpse never once turned to it (2026-10-14: 17 fish-ticks of 5,400).
+        a.bleeding = f.bleeding;
         actors_.push_back(std::move(a));
       });
       looseMeat_.swap(keep);

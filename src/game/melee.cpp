@@ -1018,8 +1018,12 @@ void ResolveOnLooseMatter(uint64_t body, const StrikeParts& p,
   // would leave in living tissue has nothing to progress through.
   if (profile.bite > 0.0f && firstContact && biteAllowed &&
       !(bitten != nullptr && *bitten)) {
+    // The corpse's hole (Mob::BiteHit's biteR): a weak nip is a smaller tear,
+    // not a vanishing one. BluntBody pushes it under the contact.
     debris.BluntBody(body, p.bite.at,
-                     goreT.biteRadius * profile.biteRadius * power, p.bite.seed,
+                     goreT.biteRadius * profile.biteRadius *
+                         (0.4f + 0.6f * std::clamp(power, 0.0f, 1.0f)),
+                     p.bite.seed,
                      world, spawns, DebrisSystem::DamageCause::Bite,
                      // A scavenger's teeth take the meat and leave the bone,
                      // on a severed piece as on a corpse (Mob::BiteHit).
