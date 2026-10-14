@@ -26649,7 +26649,36 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   rock:** a column whose landform slope reaches `terrain.rockSlope` (Q8,
   640 = 2.5:1; 0 = off) skins four cells of `coverFirmMat` and wears no snow
   cap and no cover row (`colSteep`): powder on a cliff never sleeps, grass on
-  one does not read as a cliff. `homeArea.y` is retired (a warning if
+  one does not read as a cliff.
+  **A FEATURE STANDS ON ITS OWN COLUMN'S GROUND (2026-10-14; worldgen.wgsl
+  `featureSteepAt`; tickets `2026-10-13_23-57-48`, `_23-59-16`).** Saguaros
+  hung 20-40 voxels in the air down the default map's mesa faces. A voxdump
+  at (78225, -11613) shows ground 1262-1279 across the bole and cactus from
+  1300. A metre-scale feature (tree, cactus, tile plant) is rooted at ONE
+  column's ground and is rigid across its footprint, so on a slope of s
+  voxels per voxel its downhill edge floats s times its offset from the
+  axis. Two rules, every biome:
+  1. No tree, cactus or tile plant roots on a column at or past `rockSlope`
+     (`treeInfoBare`, `cactusInfoBare`, `plantSiteAt`). That is the same
+     line where the cover rows already grow nothing. The horizon's forest
+     estimate (horizon.cpp) takes the same gate. Authored site trees keep
+     their place.
+  2. What still stands over lower ground reaches it.
+     - A tree's ground-row atlas columns (lowest run at local y 0: trunk,
+       root flare, a bush's skirt) fill down to the asking column's own
+       ground (`treeCellFrom`).
+     - A cactus's bole does the same, as its cross-section at the base
+       (`cactusAt`).
+     - A tile plant's cell over ground more than a voxel below its base is
+       not placed (`genColumn`).
+     Crowns, branches and cactus arms still overhang: that is their shape.
+  Measured on seven lod-1 voxdumps of the default map's desert, mesa foot
+  and lake shore (feature voxels whose cell below is air and whose ground is
+  2+ voxels down): 117 before, 84 after. All 84 are cactus-arm undersides
+  13-43 voxels up, the arm's own overhang. The mesa-face cacti are gone (gap
+  37 -> no cactus), and the 2-voxel base gaps on the dune flats are filled.
+  The world hash moves (worldgen); far-parity holds by construction (the
+  sieve calls the same functions). `homeArea.y` is retired (a warning if
   present). Gate `altitude` (on `peaks`): the window, the per-biome jittered
   treeline, the lapse rate, the lava clearance under the gorge, CPU + GPU
   sediment on the valley floor, rock + <= 32 active chunks on the cliff band.

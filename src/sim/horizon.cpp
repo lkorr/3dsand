@@ -239,6 +239,9 @@ void Build(const worldmap::WorldMapData& m, const std::vector<uint32_t>& wm, uin
         // Land.slope's units: |dh/dx| + |dh/dz| in Q8.
         const int slope = (int)std::lround(256.0 * (std::abs(avgAt(i + 1, j) - avgAt(i - 1, j)) +
                                                      std::abs(avgAt(i, j + 1) - avgAt(i, j - 1))) / (2.0 * S));
+        // No trunk on a cliff (worldgen.wgsl featureSteepAt: terrain.rockSlope).
+        const int rockSl = (int)(int32_t)wm[worldmap::kHTerrainRockSlope];
+        if (rockSl > 0 && slope >= rockSl) continue;
         mats.clear();
         double lam = 0.0;
         double lamH = 0.0;   // sum of lambda x the species' dome mean height

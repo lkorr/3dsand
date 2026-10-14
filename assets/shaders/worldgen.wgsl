@@ -937,6 +937,30 @@ fn treelineAt(x : i32, z : i32, seed : u32) -> i32 {
 }
 // MIRROR-END height
 
+// ---- A FEATURE STANDS ON ITS OWN COLUMN'S GROUND (2026-10-14) ---------------
+// Tickets 2026-10-13_23-57-48 / _23-59-16: saguaros hung 20-40 voxels in the
+// air down the default map's mesa faces (a voxdump at (78225, -11613): ground
+// 1262-1279 across the bole, cactus from 1300). A metre-scale feature -- a
+// tree, a cactus, a tile plant -- is rooted at ONE column's ground (its axis /
+// centre) and is a rigid shape across its footprint, so on a slope of s
+// voxels per voxel its downhill edge floats s x (offset from the axis). Two
+// rules, for every such feature in every biome:
+//   1. NO FEATURE ROOTS ON A CLIFF. A site whose LANDFORM slope is at or past
+//      map.json terrain.rockSlope -- the line past which a column skins as bare
+//      rock and the cover rows already grow nothing (colSteep) -- grows no
+//      tree, cactus or tile plant (treeInfoBare, cactusInfoBare, plantSiteAt).
+//      Authored site trees keep their place: the author put them there.
+//   2. WHAT STILL STANDS OVER LOWER GROUND REACHES IT. Below its base, a
+//      tree's ground-row columns (treeCellFrom) and a cactus's bole
+//      (cactusAt) fill down to the asking column's own ground; a tile plant's
+//      cells over ground more than one voxel below its base are not placed
+//      (genColumn), as cells inside higher ground never were. Crowns, arms and
+//      branches still overhang: that is their shape, not a missing support.
+fn featureSteepAt(slope : i32) -> bool {
+  let r = wmTerrain(WM_H_TERRAIN_ROCK_SLOPE);
+  return r > 0 && slope >= r;
+}
+
 // ---- biome field ----
 // The biome is READ FROM THE PAINTED MAP with a seeded edge warp (mapBiomeAt,
 // with the other map readers below). The height curve blends on the map's own
@@ -2924,6 +2948,8 @@ fn treeInfoBare(s : TreeSite, land : Land, seed : u32) -> Tree {
   // No trees on snowfields, in ponds (treePondOk), or over the selftest
   // fixture sites. The treeline is the TRUNK column's own (map v2 A1).
   if (h >= treelineAt(s.wx, s.wz, seed)) { return t; }
+  // No trunk on a cliff (featureSteepAt).
+  if (featureSteepAt(land.slope)) { return t; }
   // (The spawn clearing is checked AFTER the species draw, where the crown's
   // real width is known — see the note at that test.)
 
@@ -3377,8 +3403,24 @@ const TREE_RUN_LEN_MASK : u32 = 31u;
 // runs — typically one to three of them. Runs are sorted ascending and do not
 // overlap, so the first run that starts above `ly` ends the search.
 fn treeCellFrom(c : TreeCand, y : i32) -> u32 {
-  let ly = y - c.base - 1;
-  if (ly < 0 || ly >= c.ny) { return MAT_AIR; }
+  var ly = y - c.base - 1;
+  // A FEATURE STANDS ON ITS OWN COLUMN'S GROUND (2026-10-14; see
+  // featureSteepAt): a tree is rooted at its TRUNK column's ground, and on a
+  // slope a trunk column of the same tree stands over lower ground -- the
+  // baked trunk's first voxel then floated over a gap as tall as the slope
+  // times the trunk's offset from the axis. Below the base, a column whose
+  // lowest run starts AT the ground row (ly 0: a trunk, a root flare, a
+  // bush's skirt) is that run's material all the way down to whatever ground
+  // the asking column has (genCellIn asks only y > h, so the fill stops on
+  // it). A column whose runs start higher (a branch, a crown) still hangs in
+  // the air, as a crown should.
+  if (ly < 0) {
+    if (c.colCnt == 0u) { return MAT_AIR; }
+    let r0 = treeAtlas[c.colOff];
+    if (((r0 >> 16u) & TREE_RUN_Y0_MASK) != 0u) { return MAT_AIR; }
+    ly = 0;
+  }
+  if (ly >= c.ny) { return MAT_AIR; }
   for (var k = 0u; k < c.colCnt; k++) {
     let r = treeAtlas[c.colOff + k];
     let y0 = i32((r >> 16u) & TREE_RUN_Y0_MASK);
@@ -3415,7 +3457,9 @@ fn treeFromCands(c : ptr<function, TreeCands>, y : i32) -> u32 {
   if (y > (*c).top) { return MAT_AIR; }
   for (var i = 0; i < (*c).n; i++) {
     let e = (*c).t[i];
-    if (y < e.base || y > e.vtop) { continue; }
+    // No lower bound: below the base a ground-row column fills down to the
+    // asking column's ground (treeCellFrom), and genCellIn asks only y > h.
+    if (y > e.vtop) { continue; }
     let m = treeCellFrom(e, y);
     if (m != MAT_AIR) { return m; }
   }
@@ -3520,9 +3564,12 @@ fn cactusInfoBare(tx : i32, tz : i32, seed : u32) -> Cactus {
   if (!VEGETATION) { return c; }
   let cb = biomeAt(c.wx, c.wz, seed);
   if (!wmFlag(cb, WM_BF_CACTI)) { return c; }
-  let h = baseHeight(c.wx, c.wz, seed);
+  let land = landAt(c.wx, c.wz, seed);   // baseHeight's own call, slope included
+  let h = land.h;
   c.base = h;
   if (h >= treelineAt(c.wx, c.wz, seed)) { return c; }
+  // No cactus on a cliff (featureSteepAt).
+  if (featureSteepAt(land.slope)) { return c; }
   if (siteKeepOut(c.wx, c.wz) || sitePadNear(c.wx, c.wz, 0) || dgSurfNear(c.wx, c.wz, 2)) { return c; }
 
   // Density and mix are the biome's (cover.cactusChance / saguaroFraction,
@@ -3728,8 +3775,13 @@ fn cactusAt(x : i32, y : i32, z : i32, seed : u32, ponds : ptr<function, PondSet
       // its base. Clipping this is how canopies get flat tops (treeAt's vtop
       // comment); here it would behead the saguaro and its crown of flowers.
       let vtop = cactusVTop(c);
-      if (y < c.base || y > vtop) { continue; }
-      let m = cactusCell(c, x, y, z, seed);
+      if (y > vtop) { continue; }
+      // A FEATURE STANDS ON ITS OWN COLUMN'S GROUND (featureSteepAt): below the
+      // base -- a column of the bole over ground lower than the root's -- the
+      // cell is the bole's own cross-section at the base (dy 0 holds no arm:
+      // arms leave at 40-65 % of the height), so the column runs down to
+      // whatever ground it has (genCellIn asks only y > h).
+      let m = cactusCell(c, x, max(y, c.base), z, seed);
       if (m != MAT_AIR) { return m; }
     }
   }
@@ -4125,6 +4177,7 @@ fn plantSiteAt(cx : i32, cz : i32, seed : u32, needCover : bool) -> PlantSite {
   landColumn(cx, cz, seed, &L);
   ps.h = L.h;
   if (L.h >= treelineAt(cx, cz, seed) || L.pond >= 0 || L.inRim || L.inPoolFloor) { return ps; }
+  if (featureSteepAt(L.slope)) { return ps; }   // no tile plant on a cliff
   if (L.near.onShore && L.near.past < wmWaterI(L.near.wp, WM_W_SHORE_BAND)) { return ps; }
   let ug = undergrowthSite(cx, cz, seed, &L.ponds);
   if (ug.trunkD2 <= 4) { return ps; }
@@ -4550,6 +4603,12 @@ fn genColumn(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> Co
   col.wp = L.wp;
   col.bedSolid = L.bedSolid;
   col.plant = plantColumnAt(x, z, seed, biome);
+  // A tile plant's cell over ground more than a voxel below its base is not
+  // placed (featureSteepAt, rule 2): the rigid rosette / cap would float there.
+  if (col.plant.mat != MAT_AIR && h < col.plant.base - 1) {
+    col.plant.mat = MAT_AIR;
+    col.plant.top = -1;
+  }
   col.looseTop = h;
   col.sedTop = h;
   col.tl = tl;
@@ -4840,8 +4899,7 @@ fn snowCapCol(col : ptr<function, Col>) -> bool {
 // (looseCoverDepth); this is the gate for the SOLID skins those two never
 // look at. 0 = off.
 fn colSteep(col : ptr<function, Col>) -> bool {
-  let r = wmTerrain(WM_H_TERRAIN_ROCK_SLOPE);
-  return r > 0 && (*col).slope >= r && !(*col).inRim;
+  return featureSteepAt((*col).slope) && !(*col).inRim;
 }
 
 // Can any cell of this column be a TREE cell? The column half of genCellIn's

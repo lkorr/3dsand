@@ -1614,3 +1614,7 @@ Still thin: only ONE limb loses collider voxels (5 of them, the first
 full-power contact). The torso and armU.L ticks after it run at 0.08-0.37
 power and cut 0.09-0.13 deep, so the rest of the stroke still wounds below
 collider resolution. That is the shipped cut depth, not a fixture fault.
+
+## 2026-10-14 -- determinismHash ef7d9a06 -> 437b0cec (features stand on their own ground)
+
+Intentional worldgen change (worldgen.wgsl `featureSteepAt`, tickets 2026-10-13_23-57-48 / _23-59-16): no tree, cactus or tile plant roots on a column at or past `terrain.rockSlope`; tree ground-row columns and cactus boles fill down to the asking column's ground; tile-plant cells over ground 2+ below their base are not placed. Sim reproduces itself (twice-run equal); rebaselined with `--selftest --gate determinism --rebaseline`. far-parity / terrain / biomes / altitude / clearing pass unchanged in the same --verify boot.
