@@ -367,6 +367,26 @@ are the OTHER half of this frame; they are not additive with `nomicro`.
    rejected -- any barrier between them (FarVox WAW vs `farDown`) waits on
    all prior compute in Vulkan's stage scope, so it needs pass grouping in
    the recorder first.
+   **Follow-up 2026-10-14, on wave-1014 (38fa573: + desert farRefineLevel 8,
+   far burial, far-ground openness, shadow-cache fallback probes,
+   molten/cloud).** `scripts/perf/fly_ticket.sh` now sets
+   `SANDVOX_FRAMES_NO_RELOAD=1` by default (`=0` restores the F5). Ticket
+   flight, one exe, arms interleaved, exclusive, n=3 each: shipped 2.7 /
+   3.2 / 2.7% frames > 33 ms, p95 29.7-29.8, p99 36.7-37.7 ms; control
+   (`SANDVOX_FARMAP_FIRST=1 SANDVOX_FAR_NO_STAGGER=1
+   SANDVOX_EVICT_NO_PRISTINE=1`) 5.2-5.7%, p95 33.1-33.7, p99 40.3-41.7;
+   0 box-face handoffs in every arm. `render.farPlaneBatch` 128 (asset-dir
+   copy, same exe): 2.5 / 2.7 / 2.9%, p99 36.3-36.8 -- NOT kept: the floor
+   never binds on this flight (far frames 192-198 vs 193-201, far GPU
+   1.94-1.98 vs 1.93-2.02 s), so the difference is run noise. The merged
+   tree's frames got heavier: p50 11.3 -> 13.1 ms, and a tick frame with no
+   far work now averages 25.8 ms of GPU (19 before the merge) against 23.8
+   with a far slice -- the remaining > 33 ms frames are tick frames, and the
+   far field is no longer what separates them. Next lever: the sim tick
+   (item 2) and whatever the merged render work added per frame (attribute
+   with `SANDVOX_FRAMES_PASSES` + `SANDVOX_GPU_TIMER_SERIAL=1`). Daylight
+   capture (`SANDVOX_AT_MINUTE=660`, `SANDVOX_AT_SHOT_EVERY=15`): no seam
+   lines in any of the 40 flight frames.
 6. **Unbilled CPU frame-path work** — player collision runs a
    `std::function` per cell (~600 cells x dozens of calls per frame, fluid
    mirror evaluated before the kind lookup); avatar `FindClip` is a linear
