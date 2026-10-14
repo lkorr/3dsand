@@ -16804,9 +16804,17 @@ int main(int argc, char** argv) {
                 session.bowHand >= 0
                     ? items.Named(avatar.HeldItem(HandAt(session.bowHand)))
                     : nullptr;
-            if (session.bowDrawTicks > 0 && session.bowHand >= 0 &&
-                (fpBow == nullptr ||
-                 BowDrawFraction(*fpBow, session.bowDrawTicks) >= 0.75f)) {
+            // ...AND WHILE THE CLIP LETS GO after the loose: the hand falls
+            // from the jaw through the lens on the blend-out.
+            float fpLetGo = 0.0f;
+            if (session.bowDrawTicks == 0 && session.bowHand >= 0)
+              for (const char* c : {"bow_draw", "bow_draw_crouch"})
+                fpLetGo += avatar.ClipWeight(avatar.HandClip(c, HandAt(session.bowHand)).c_str());
+            if (session.bowHand >= 0 &&
+                ((session.bowDrawTicks > 0 &&
+                  (fpBow == nullptr ||
+                   BowDrawFraction(*fpBow, session.bowDrawTicks) >= 0.75f)) ||
+                 fpLetGo > 0.02f)) {
               const bool bowLeft = HandAt(session.bowHand) == Hand::Left;
               for (const char* nm : {bowLeft ? "armL.R" : "armL.L",
                                      bowLeft ? "hand.R" : "hand.L"}) {
@@ -20967,6 +20975,21 @@ int main(int argc, char** argv) {
       static std::vector<RenderOnlyBody> flightBodies;
       flightBodies.clear();
       tickCtx.arrows.AppendRenderBodies(items, tickAlpha, flightBodies);
+      // THE DRAWN BOWS (game/arrows.h PresentDrawnBow): the string pulled
+      // back to the hand and the arrow nocked on it, every creature drawing
+      // one (the player, an NPC archer), off the pose this frame draws.
+      {
+        bool avatarSeen = false;
+        mobs.ForEachCreature([&](Mob& m) {
+          if (&m == static_cast<Mob*>(&avatar)) avatarSeen = true;
+          // First person: the player's own string is cut short of the lens.
+          const bool fp = &m == static_cast<Mob*>(&avatar) && camMode == CameraMode::First;
+          PresentDrawnBow(m, items, flightBodies, fp ? &eye : nullptr, 2.5f);
+        });
+        if (!avatarSeen)
+          PresentDrawnBow(avatar, items, flightBodies,
+                          camMode == CameraMode::First ? &eye : nullptr, 2.5f);
+      }
       bodyReg.SetRenderOnly(&flightBodies);
       const auto bodyT0 = std::chrono::steady_clock::now();
       // WHO ELSE IS HOLDING MY ARM. One index sweep while everything is

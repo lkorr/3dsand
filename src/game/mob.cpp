@@ -29065,9 +29065,14 @@ uint32_t Mob::AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
       // so nothing is displaced.
       uint32_t word = limb.dye;
       Hand fillHand = Hand::Right;
-      if (IsHeldSlot((int)i, &fillHand) && held_[HandIndex(fillHand)].fill.Drawn())
-        word = BodyFillWord(held_[HandIndex(fillHand)].fill, limb.xf.quat);
-      out.push_back({slot, (uint32_t)limb.microModel, bits, word});
+      uint32_t model = (uint32_t)limb.microModel;
+      if (IsHeldSlot((int)i, &fillHand)) {
+        const HeldHand& hh = held_[HandIndex(fillHand)];
+        if (hh.fill.Drawn()) word = BodyFillWord(hh.fill, limb.xf.quat);
+        // SetHeldRenderModel: a shared stand-in, never over a carved brick.
+        if (hh.renderModel >= 0 && !limb.carved) model = (uint32_t)hh.renderModel;
+      }
+      out.push_back({slot, model, bits, word});
     }
     slot++;
   }

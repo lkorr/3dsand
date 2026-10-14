@@ -396,3 +396,53 @@ int ArmArcher(MobSystem& mobs, uint64_t mobId, const ItemLibrary& items, std::st
   }
   return added;
 }
+
+// ---- THE DRAWN BOW AS SEEN: the Mob's half (game/arrows.h PresentDrawnBow) ----
+// Everything here reads limb.xf -- the transform AppendXforms hands the
+// renderer -- plus renderOffset_, so what is placed off it lands on the drawn
+// body, not on the collider a tick behind or ahead of it.
+
+bool Mob::HeldBodyXf(Hand h, BodyTransform& out) const {
+  const int slot = held_[HandIndex(h)].slot;
+  if (slot < 0 || slot >= (int)limbs_.size() || !limbs_[slot].body) return false;
+  out = limbs_[slot].xf;
+  out.pos = out.pos + renderOffset_;
+  return true;
+}
+
+bool Mob::HeldCarved(Hand h) const {
+  const int slot = held_[HandIndex(h)].slot;
+  return slot >= 0 && slot < (int)limbs_.size() && limbs_[slot].carved;
+}
+
+bool Mob::HandSocketWorld(Hand h, Vec3& out) const {
+  if (def_ == nullptr) return false;
+  const int si = def_->FindSocket(HandContext(h));
+  if (si < 0) return false;
+  const MobSocketDef& sock = def_->sockets[si];
+  if (sock.partIndex < 0 || sock.partIndex >= (int)limbs_.size()) return false;
+  if (!LimbAlive(sock.partIndex)) return false;
+  const MobLimb& hand = limbs_[sock.partIndex];
+  if (!hand.body) return false;
+  // EquipItem's own placement: the socket is `offset - restOffset` from the
+  // hand part's frame, through the hand's live rotation.
+  const Quat q{hand.xf.quat[0], hand.xf.quat[1], hand.xf.quat[2], hand.xf.quat[3]};
+  out = hand.xf.pos + QuatRotate(q, sock.offset - hand.restOffset) + renderOffset_;
+  return true;
+}
+
+bool Mob::ClipPlaying(const std::string& name) const {
+  const int ci = skel_.FindClip(name);
+  if (ci < 0) return false;
+  for (const ClipInstance& inst : anim_.clips)
+    if (inst.clip == ci && !inst.stopping) return true;
+  return false;
+}
+
+bool Mob::PartCornerWorld(const std::string& part, Vec3& out) const {
+  const int pi = skel_.FindPart(part);
+  if (pi < 0 || pi >= (int)limbs_.size() || !limbs_[pi].body || !LimbAlive(pi))
+    return false;
+  out = limbs_[pi].xf.pos + renderOffset_;
+  return true;
+}

@@ -46,7 +46,11 @@ PARENT = {
 ORDER = ["torso", "head", "armU.L", "armL.L", "hand.L", "armU.R", "armL.R", "hand.R"]
 EYE_LOCAL = (0, 16, 0)          # human.json eyeLocal, from the head anchor
 SOCKET_R = (6, 61, 10)          # human.json sockets.held_right (hand.R)
-STRING_L = (31, 57, 10)         # the draw hand's hooked fingers (hand.L)
+# The draw hand's NOCK point: the hand.L socket (human.json held_right on
+# hand.R, mirrored the way MobSystem derives held_left). The drawn string and
+# the nocked arrow are placed there at runtime (game/arrows.cpp
+# PresentDrawnBow, Mob::HandSocketWorld), so it is what the solve aims.
+STRING_L = (30, 61, 10)
 # Shoulder limits (human.json poseLimit), in the part's rest frame.
 REACH = {
     "armU.L": [((0, 0, -1), 50), ((-1, 0, 0), 30)],
@@ -169,7 +173,7 @@ FREE1 = ["armL.L", "armL.R"]
 def hinge_of(u):
     """The elbow's bend from an unbounded variable: 0..HINGE_MAX exactly, so
     the solver cannot hand the engine a bend its hinge clamp would move."""
-    return HINGE_MAX / (1.0 + math.exp(-u))
+    return HINGE_MAX / (1.0 + math.exp(-max(-60.0, min(60.0, u))))
 
 
 def unpack(x, fixed):
@@ -251,6 +255,11 @@ def draw_cost(grip, anchor, elbow_y, bow_up, yaw_pref, behind=1.0, bow_bend=10.0
         e = pos["armL.L"]
         c += 0.5 * (e[1] - elbow_y) ** 2
         c += behind * max(0.0, e[2] - (ANCHOR["head"][2] - 10.0)) ** 2
+        # ...and OUT to the draw side, past the head: with the anchor under
+        # the middle of the chin (aimed at the reticle) the cheapest elbow is
+        # straight behind the head, and the forearm then runs through the
+        # neck. A real draw brings the forearm in along the jaw from the side.
+        c += behind * 2.0 * max(0.0, (ANCHOR["head"][0] + ELBOW_OUT) - e[0]) ** 2
         # The string hand may cock its wrist in toward the jaw, no more than a
         # real hooked draw does; the bow hand stays straight on its forearm
         # but may ROLL (the forearm's own pronation -- how the crouch lays the
@@ -327,6 +336,30 @@ def fp_visible(local, pitch, follow=0.6, posePitch=None):
     return seen
 
 
+def reticle_clearance(local, pitch=0.0, follow=FOLLOW):
+    """Degrees from the view's centre to the nearest edge of each arm part in
+    first person (negative = the part covers the reticle)."""
+    lp = look_pose(local, pitch, follow)
+    rot, pos = fk(lp)
+    e = point(rot, pos, "head", np.add(ANCHOR["head"], EYE_LOCAL))
+    fwd = np.array([0.0, math.sin(pitch), math.cos(pitch)])
+    right = np.array([-1.0, 0.0, 0.0])
+    up = np.cross(right, fwd) * -1.0
+    out = {}
+    for p, (a, b, r) in BONES.items():
+        best = 99.0
+        for t in np.linspace(0, 1, 15):
+            c = point(rot, pos, p, np.add(a, np.multiply(np.subtract(b, a), t)))
+            v = c - e
+            z = float(np.dot(v, fwd))
+            if z < 1.0:
+                continue
+            off = math.hypot(float(np.dot(v, right)), float(np.dot(v, up)))
+            best = min(best, math.degrees(math.atan(off / z)) - math.degrees(math.atan(r / z)))
+        out[p] = round(best, 1)
+    return out
+
+
 def report(name, local):
     rot, pos = fk(local)
     eye = point(rot, pos, "head", np.add(ANCHOR["head"], EYE_LOCAL))
@@ -352,6 +385,8 @@ def report(name, local):
     for deg in (-40, 40):
         print(f"   first person flick to {deg:+d}, pose at half: "
               f"{fp_visible(local, math.radians(deg), FOLLOW, math.radians(deg / 2))}")
+    print(f"   reticle clearance at look 0 (deg from the crosshair to each arm part's edge; "
+          f"< 0 = over it): {reticle_clearance(local)}")
     t = local.get("torso", np.array([0.0, 0, 0, 1]))
     print(f"   torso yaw {math.degrees(2 * math.atan2(t[1], t[3])):.0f} deg")
     print(f"   limit penalty {limit_penalty(local):.5f}")
@@ -488,6 +523,26 @@ def solve_draw(label, grip, anchor, lift_grip, lift_up, bow_up, elbow_y, yaw):
     return keys
 
 
+def aim_draw(label, eye, anchor, rest_off, lift_grip, lift_up, bow_up, elbow_y, yaw):
+    """solve_draw with the grip AIMED (aimed_grip) from where the nock really
+    lands: the rig cannot always put the fingers exactly on the anchor, and a
+    grip aimed from the anchor then points the arrow off the reticle by the
+    miss. Two passes: solve, re-aim the grip from the solved nock, solve."""
+    nock = anchor
+    for _ in range(2):
+        keys = solve_draw(label, aimed_grip(eye, nock, rest_off), anchor, lift_grip,
+                          lift_up, bow_up, elbow_y, yaw)
+        rot, pos = fk(keys[-1][1])
+        nock = point(rot, pos, "hand.L", STRING_L)
+    rot, pos = fk(keys[-1][1])
+    g = point(rot, pos, "hand.R", SOCKET_R) + rest_off
+    d = unit(g - nock)
+    miss = nock + d * ((ZERO - (nock[2] - eye[2])) / d[2]) - np.array([eye[0], eye[1], eye[2] + ZERO])
+    print(f"   {label}: the nocked arrow crosses the look {ZERO:.0f} cells out "
+          f"{np.round(miss[:2], 1)} cells off the reticle (x, y)")
+    return keys
+
+
 def write(path, d):
     text = json.dumps(d, indent=2)
     # One key per line, as the library's hand-written files have them.
@@ -503,6 +558,19 @@ def write(path, d):
 
 
 ARMS = ["armU.R", "armL.R", "hand.R", "armU.L", "armL.L", "hand.L"]
+
+ZERO = 2400.0      # session.cpp kZero, 30 m, in art cells: where the shot crosses the look
+DRAW = 46.0        # nock -> arrow rest at full draw, cells (the arrow is 52: 6 stand past)
+REST_OUT = 2.0     # arrows.cpp PresentDrawnBow: the rest, cells off the grip along the flat
+ELBOW_OUT = 20.0   # the draw elbow's least distance out from the head's middle, cells
+
+
+def aimed_grip(eye, nock, rest_off):
+    """The grip that puts the arrow from `nock` through its rest onto the
+    crosshair's point ZERO cells straight ahead of the eye."""
+    aim = np.array([eye[0], eye[1], eye[2] + ZERO])
+    rest = nock + unit(aim - nock) * DRAW
+    return rest - rest_off
 
 # The sneak, in degrees (see main()).
 SNEAK_LEAN = 25.0        # chest forward over the hips
@@ -537,11 +605,22 @@ def main():
     # comes up from low and canted at the chest (LIFT) to the aim with the
     # fingers on the string at brace (SET) over items.json windupMs, and the
     # string is PULLED from brace to the anchor over drawTimeMs.
-    grip = np.array([eye[0] - 10.0, eye[1] - 11.0, eye[2] + 56.0])
-    anchor = np.array([eye[0] + 4.5, eye[1] - 12.0, eye[2] + 2.0])
+    #
+    # THE ARROW AT THE RETICLE (owner, 2026-10-14: "the arm should be ever so
+    # slightly pointed inwards so that it looks like the arrow is actually
+    # pointing towards the reticle"). The nocked arrow is drawn from the nock
+    # through the ARROW REST -- REST_OUT cells off the grip along the bow's
+    # flat, toward the head (arrows.cpp) -- so the grip is SOLVED FROM the
+    # anchor: on the line from the nock to the crosshair's point ZERO ahead,
+    # DRAW cells out, less the rest offset. The anchor is under the middle of
+    # the chin, the bow arm angled in to a grip a few cells right of the eye
+    # line, and the shaft runs parallel to the look, a cell right of it.
+    anchor = np.array([eye[0] - 1.0, eye[1] - 12.0, eye[2] + 2.0])
+    grip = aimed_grip(eye, anchor, np.array([REST_OUT, 0.0, 0.0]))
     liftGrip = np.array([eye[0] - 6.0, eye[1] - 32.0, eye[2] + 36.0])
-    standKeys = solve_draw("bow_draw", grip, anchor, liftGrip, unit((0.3, 1, 0.35)),
-                           unit((0, 1, 0)), ANCHOR["armU.L"][1] + 2, math.radians(55))
+    standKeys = aim_draw("bow_draw", eye, anchor, np.array([REST_OUT, 0.0, 0.0]),
+                         liftGrip, unit((0.3, 1, 0.35)), unit((0, 1, 0)),
+                         ANCHOR["armU.L"][1] + 2, math.radians(55))
     report("bow_draw at FULL DRAW", standKeys[-1][1])
     for t, k in standKeys[:-1]:
         print(f"   key t={t:.0f}: first person at look 0: {fp_visible(k, 0.0, FOLLOW)}")
@@ -550,12 +629,18 @@ def main():
     # The same draw from a crouch, the bow canted a quarter turn so it lies
     # across the body (top limb toward the draw side), held a little lower and
     # closer: a low, short draw under cover.
-    gripC = np.array([eye[0] - 3.0, eye[1] - 15.0, eye[2] + 55.0])
-    anchorC = np.array([eye[0] + 4.5, eye[1] - 14.0, eye[2] + 2.0])
+    # The flat bow's rest is ON TOP of the grip (its flat normal is up).
+    # Under the RIGHT of the jaw, not the middle: with the flat bow's grip
+    # straight under the eye the bow arm is seen end-on from behind, across
+    # the reticle (measured: upper arm and forearm 4 degrees INTO the
+    # crosshair; at 9 cells right the bow hand is the nearest, 2 degrees off). The
+    # shaft still runs parallel to the look, ~11 cm right of it.
+    anchorC = np.array([eye[0] - 9.0, eye[1] - 14.0, eye[2] + 2.0])
+    gripC = aimed_grip(eye, anchorC, np.array([0.0, REST_OUT, 0.0]))
     liftGripC = np.array([eye[0] - 2.0, eye[1] - 30.0, eye[2] + 34.0])
-    crouchKeys = solve_draw("bow_draw_crouch", gripC, anchorC, liftGripC,
-                            unit((1, 0.5, 0.3)), unit((1, 0.12, 0)),
-                            ANCHOR["armU.L"][1], math.radians(55))
+    crouchKeys = aim_draw("bow_draw_crouch", eye, anchorC, np.array([0.0, REST_OUT, 0.0]),
+                          liftGripC, unit((1, 0.5, 0.3)), unit((1, 0.12, 0)),
+                          ANCHOR["armU.L"][1], math.radians(55))
     report("bow_draw_crouch at FULL DRAW", crouchKeys[-1][1])
 
     # ---- THE SNEAK: an additive on the held crouch ----------------------------

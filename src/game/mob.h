@@ -3240,6 +3240,26 @@ class Mob {
   // turns the held part into an item can mistake it for the item's colour.
   // The session sets the player's; MobSystem::RefreshHeldFills every NPC's.
   void SetHeldFill(const ContainerHeldFill& f, Hand h) { held_[HandIndex(h)].fill = f; }
+  // WHICH SHARED MODEL A HELD ITEM IS DRAWN FROM this frame, in place of its
+  // slot's own (-1 = its own). Render-only, set every frame, kept OFF the limb
+  // like the fill: a drawn bow is shown string-less while its string is drawn
+  // as rods to the hand (game/arrows.h PresentDrawnBow). Ignored on a carved
+  // slot, whose own brick is the only one that shows the damage.
+  void SetHeldRenderModel(Hand h, int model) { held_[HandIndex(h)].renderModel = model; }
+  // The held item's body transform as drawn (limb xf + the render offset);
+  // false with no live held slot. Its frame is the item's body frame (ItemDef
+  // ArrowSpec::tip's, BowStringArt's).
+  bool HeldBodyXf(Hand h, BodyTransform& out) const;
+  // True when the held slot's brick has been carved (owned): its art differs
+  // from the item's shared model.
+  bool HeldCarved(Hand h) const;
+  // Where an item in this hand is held, world, as drawn: the hand's socket
+  // point (the hilt centre's anchor), off the hand part's live transform.
+  bool HandSocketWorld(Hand h, Vec3& out) const;
+  // A running instance of `name` that is not blending out.
+  bool ClipPlaying(const std::string& name) const;
+  // A rig part's body corner as drawn (xf + the render offset), by name.
+  bool PartCornerWorld(const std::string& part, Vec3& out) const;
   // HOW A HELD VESSEL IS TILTED (the alchemy bench, session.cpp BenchHold):
   // the hand is turned about the wrist, after every solver and the clamp, so
   // the held item's own long axis (its lattice +X: base -> mouth, the way
@@ -6079,6 +6099,7 @@ class Mob {
     Vec3 gripBody{};         // grip point in the item's BODY frame
     alchemy::Composition contents;   // SetHeldContents
     ContainerHeldFill fill;  // SetHeldFill; render-only
+    int renderModel = -1;    // SetHeldRenderModel; render-only
     float aimWeight = 0;     // SetHeldAim
     Vec3 aimAxis{0, 1, 0};
     bool borrowed = false;   // SetHeldBorrowed: a prop, not the item
