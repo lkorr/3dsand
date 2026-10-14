@@ -17440,6 +17440,11 @@ where you hear from either (§12b, "The ears are on the character").
     now 111/148/95 RGB. The COLOUR moves toward the near field; the far meadow
     still reads as lawn, not blades — the blades' texture and their tan heads
     are not something a colour on the ground can carry.
+    **SUPERSEDED 2026-10-14 by the COVER PLANE** (below, after the strata
+    plane): the bit sampled ONE column per sub-column, so past level 1 a
+    speck became a block. Bit 30 of an entry is now always 0 and the
+    sub-skin field is always the sub-skin; the near side's half of this
+    rule is unchanged.
   - **Each level hands off on a sphere, not on its box** (`tLvlOut` in
     `traceFar`). The concentric-ring MOIRE (seam_veg's far ridge, the cascade
     camera's pond bowls and dune bands) was not shading: a per-pixel debug of
@@ -18898,6 +18903,89 @@ where you hear from either (§12b, "The ears are on the character").
     (a sand cap split by its step line, a sediment wedge firmed above its
     step line) keeps the first three; the horizon past level 8 still paints
     steep faces by its own slope rule (`HZ_H_MAT_STONE`).
+  - **The COVER plane: a minority TINTS, it does not occupy (2026-10-14,
+    ticket `2026-10-14_11-20-12`, the crystal barrens at x 70-82k,
+    z -23..-29k).** "From far away it shouldn't look blocky at all, mostly
+    just one color with some noise of the other color." The ground there is
+    pale quartzite with, per column (`--voxdump` of a 12.8 m box, 16,384
+    columns): 1.9 % alpine cushions, 1.1 % dry tussocks (both MICRO) and
+    0.27 % violet crystal spires (SOLID, 1 m, emissive 70), the spires dense
+    in 3.2 m patches. Two far representations SAMPLED those specks, and a
+    sample makes a minority the same frequency at 2^L times the size:
+    - the cover tint read the entry's COVER BIT, set when that sub-column's
+      ONE sample column grew a plant, and averaged four of them over a cell:
+      0 or 25-100 % where the truth is 3 %, at full plant colour -- the dark
+      blocks over the whole mountain (`--selftest --gate far-surface` arm (g)
+      measures the retired rule's per-cell error at 0.048 share rms on the
+      desert site, the new one 0.014);
+    - a solid cover STALK past the stalk levels (L3+, where farmap no longer
+      raises it into the heightfield) survived only where a cell's centre
+      sample landed in one: a 0.8-25 m cube of violet per stalk the lattice
+      happened to hit. `SEAM_DBG 18` (representation, emissive, level) showed
+      it: refined sticks to the L2 sphere (~83 m), then sparse plain-cell
+      spire cubes and no patches at all -- "the glowing sticks are clearly
+      not rendered right between nearby lod seams".
+    THE PLANE (sim/farfeat.h `kFarCover*`, worldgen.wgsl `farCoverCell`;
+    +8 MiB): a fourth farMap plane, one u32 per LEVEL CELL, every level,
+    written by `farmap` from the cell's (even, even) sub-column. It holds the
+    cell's EXPECTED cover share, which is analytic: rows roll in order, the
+    first that passes wins, row i passes with 1/chance once its conditions
+    and its patch mask do, so its share is q_i prod_{j<i} (1 - q_j) with
+    q_i = patch share / chance -- no hash, no sampling noise. Conditions are
+    the sample column's (`coverRowPick`'s, same order); the patch mask is
+    SOFT-sampled at the four sub-column centres (a sample passes by how far
+    the noise is over the threshold against how far it moves across the
+    sub-column, so the share is continuous from cell to cell rather than
+    quantised to quarters); genCellIn's keep-outs (`siteKeepOut`,
+    `dgSurfNear`) scale it by the open share of the same four points. It
+    stores the two largest materials (far slot + sqrt-coded share) scaled so
+    they carry the whole cover's share, and the tallest solid row's stalk
+    height. `farCoverTint` (raymarch.wgsl) gives each an optical depth
+    tau = share (1 + K H sin(view) / cos(view to the GROUND's normal)) --
+    the heightfield's smooth normal, not +y: a hillside facing the eye shows
+    its ground (with |rd.y| the facing slopes saturated to the plant colour)
+    -- with K = 0.15 for MICRO blades (where the feature plane's cards have
+    faded: x (1 - farFeatKeep)) and K = 1 for one-voxel solid stalks past
+    FAR_FEAT_LEVELS; the weights combine as 1 - prod(1 - w), the look as
+    their weighted mean, lit as upright faces (`coverBladeLight`), and an
+    emissive stalk adds its share x emission (a spire field glows by the
+    part of the view its sticks fill). The tint goes on the tread and,
+    through the skin albedo, the staircase average.
+    THE STALK DROP (`farCoverStalkDrop`, in farSurfaceMat, so the sieve, the
+    downsample and the edit patch agree): past the stalk levels a solid
+    non-MICRO voxel over its column's ground, no higher than its row's stalk
+    can reach, whose material is a cover row of the column's biome, gives
+    its cell up (the blocker flag stays, as every air cell of the cover band
+    has it). A cacti biome's cactus flesh / rib / bloom is exempt: the
+    saguaros and barrels are the same material and metres wide.
+    The near side is unchanged (its four voxels over the level-1 cell's four
+    columns), and so is level 1-2's geometry (refined stalks, blade cards).
+    **Measured** (minute 660, clear, 2400 frames; `cap`-style boxes: block
+    noise = std of luma minus its 9x9 box mean; dark specks = pixels 20+
+    under it). Ticket far camera, mountain face (480,300)-(1150,440): block
+    noise 9.81 -> 5.08, dark specks 5.24 % -> 0.46 %, mean RGB 170/172/180
+    -> 172/174/182. Close camera, past the L2/L3 seam (300,390)-(1100,480):
+    11.14 -> 4.04, 7.77 % -> 0.90 %; the band below it (L1-2, real sticks
+    and cards) 12.14 -> 10.41 with its mean colour 174/169/176 against the
+    tinted band's 170/166/171 above the seam. The meadow (`screenshot_seam_veg`,
+    far meadow band (1080,535)-(1250,600)): 108/139/94 -> 119/159/106 against
+    the near meadow's 126/167/109, block noise 22.1 -> 6.8. Gate
+    `far-surface` arm (g): over 512 level-3/4 cells (81,920 columns) at the
+    desert site the plane's share is 0.0124 against the live census's 0.0131
+    (x0.94; `farSurface.coverTol` 0.35 in baseline.json).
+    Cost: one more 16-byte farMap load and the tint's two-material loop per
+    mapped far pixel; fs +132 SPIR-V instructions; farmap 23,175 -> 23,945
+    (ceiling 25,000), fardown 24,918 (the drop's row loop). `--render-budget`
+    noon, exclusive lock, main's exe vs this: 11.34 vs 11.42 ms (a second
+    main run read 15-25 % slower on EVERY camera, the ones with no far
+    ground included, i.e. machine state, not a delta).
+    What it does not do: a level-2 stalk is still the tallest of its
+    sub-column's four drawn 20 cm wide (4x the area of the level-1 stick, so
+    a spire field reads denser from 41 to 83 m); the tint's patch mottling
+    steps at cell edges (soft, but per cell); a third and later material
+    lend their share to the two kept; the arm (g) stalk-drop check found no
+    candidate at the harness desert site (cactus is exempt), so the drop is
+    held there only by the far-downsample / far-parity agreement.
   What it does not do: trees, rocks, overhangs and edits keep the centre-
   sampled cells (see the level table); columns whose top is off the far
   field's 16-bit window (|y| > 3.2 km) are simply invalid; far shadows are

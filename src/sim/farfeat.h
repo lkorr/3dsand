@@ -62,3 +62,31 @@ inline uint32_t FarStrataSlotAt(uint32_t w, int d) {
   return d <= FarStrataD1(w) ? FarStrataSub(w)
                              : (d <= FarStrataD2(w) ? FarStrataMid(w) : FarStrataDeep(w));
 }
+
+// ---- THE FAR COVER PLANE (2026-10-14; DESIGN.md "The far cover plane") -----
+// A fourth plane, after the strata plane, ALL levels: one u32 per LEVEL CELL
+// (not per sub-column: index = the cell's vec4 index, kFarMapWord / 4) giving
+// the EXPECTED coverage of the biome's cover rows over the cell -- analytic
+// over the rows' chances and conditions, the patch mask sampled at the four
+// sub-column centres -- so a minority plant or stalk TINTS the far ground by
+// its share instead of being sampled into whole cells (ticket
+// 2026-10-14_11-20-12). Written by worldgen.wgsl `farmap`; trusted only where
+// the cell's map entries are VALID. Bit layout (worldgen.wgsl FAR_COVER_*;
+// raymarch.wgsl farCoverTint reads the same bits):
+//   bits  0..6   slot A (largest share)    bits  7..12  A's share, (v/63)^2
+//   bits 13..19  slot B (second)           bits 20..25  B's share, (v/63)^2
+//   bits 26..29  the tallest SOLID row's stalk height, voxels
+//   bit  31      PRESENT
+// A + B carry the whole cover's share (the rows past the second scale them).
+constexpr uint64_t kFarCoverWords = (uint64_t)kFarLevels * kFarN * kFarN;
+constexpr uint64_t kFarCoverBase = kFarStrataBase + kFarStrataWords;
+constexpr uint32_t kFarCoverPresent = 0x80000000u;
+inline uint64_t FarCoverWord(uint32_t level, int cx, int cz) {
+  return kFarCoverBase + kFarMapWord(level, cx * 2, cz * 2) / 4;
+}
+inline uint32_t FarCoverSlotA(uint32_t w) { return w & 0x7Fu; }
+inline uint32_t FarCoverSlotB(uint32_t w) { return (w >> 13) & 0x7Fu; }
+inline double FarCoverShareOf(uint32_t q6) { const double v = q6 / 63.0; return v * v; }
+inline double FarCoverShareA(uint32_t w) { return FarCoverShareOf((w >> 7) & 63u); }
+inline double FarCoverShareB(uint32_t w) { return FarCoverShareOf((w >> 20) & 63u); }
+inline int FarCoverStalkH(uint32_t w) { return (int)((w >> 26) & 15u); }

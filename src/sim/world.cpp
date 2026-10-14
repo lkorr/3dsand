@@ -485,7 +485,9 @@ void World::Init(const rhi::Device& device) {
   // levels 1..kFarFeatLevels thin-feature words, zero = no feature.
   // + the STRATA plane after that (sim/farfeat.h): every level, zero = no
   // strata (the sub-skin paints the whole riser, the rule before it).
-  farMap = CreateBuffer(device, (kFarMapWords + kFarFeatWords + kFarStrataWords) * 4,
+  // + the COVER plane after that (sim/farfeat.h): one word per level cell,
+  // every level, zero = no cover (+8 MiB).
+  farMap = CreateBuffer(device, (kFarMapWords + kFarFeatWords + kFarStrataWords + kFarCoverWords) * 4,
                         U::Storage | U::CopySrc, "farMap");
 
   for (auto& s : slots_) {

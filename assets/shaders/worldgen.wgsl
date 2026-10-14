@@ -5851,6 +5851,7 @@ fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
   let k = materials[mat].klass;
   if (k != CLASS_SOLID && k != CLASS_POWDER) { return mat; }  // fluids keep their ID
   var h = (*col).h;
+  if (farCoverStalkDrop(col, mat, fine.y, shift)) { return MAT_AIR; }
   // "Topmost solid cell of this column": solid means center <= h, and the cell
   // above (center + 2^shift) samples past h. NOT "cell span contains h" — when
   // h lands in a cell's lower half that cell's center samples air (the cell is
@@ -5925,6 +5926,41 @@ fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
   if (wetTop) { return top; }
   if (!skinOk) { return mat; }
   return roadTint(col, skin, shift);
+}
+// A COVER STALK PAST THE STALK LEVELS IS COVERAGE, NOT A CELL (2026-10-14,
+// ticket 2026-10-14_11-20-12). A biome's solid cover row -- a crystal spire,
+// a cactus, a cattail, a chalk rock, brimstone -- is one voxel wide. Levels
+// 1..FAR_FEAT_LEVELS draw it as geometry (farmap raises the entry to it and
+// marks its cells); past them only a cell whose CENTRE sample landed in one
+// held it, as a whole 0.8-25 m cube of it: one stalk in 4^L, 2^L times too
+// wide -- the violet blocks over the crystal barrens. There the cover plane
+// (farCoverCell) carries the stalks as a tint on the ground, so the sample
+// itself is dropped: a solid non-MICRO voxel over the column's ground whose
+// material is one of the column's biome's cover rows (body or head), no
+// higher than that row's stalk can reach (its height + 1, coverRowPick's
+// jitter). The cell keeps its blocker flag, as every air cell of that band
+// does (farColTopFrom counts the cover rows). In farSurfaceMat, so the sieve,
+// the downsample and the edit patch -- the three producers -- drop it alike
+// (the far-downsample agreement); a player's block of the same material on
+// the ground goes the same way, which at 0.8 m+ cells is the thin rule's own
+// verdict on a one-voxel thing. THE ONE EXCEPTION is a LANDMARK of the same
+// material: a cacti biome's saguaros and barrels are cactus flesh / rib /
+// bloom like its cover row's stalk and metres wide, and dropping their lower
+// metre would float the rest; there the stalk rule keeps the centre rule.
+fn farCoverStalkDrop(col : ptr<function, Col>, mat : u32, y : i32, shift : u32) -> bool {
+  let h = (*col).h;
+  if (shift <= farCellShift(FAR_FEAT_LEVELS) || y <= h ||
+      y > h + i32(worldMap[WM_H_MAX_COVER_H]) + 1) { return false; }
+  if ((materials[mat].flags & MATF_MICRO) != 0u) { return false; }
+  let biome = (*col).biome;
+  if (wmFlag(biome, WM_BF_CACTI) &&
+      (mat == M_CACTUS || mat == M_CACTUS_RIB || mat == M_CACTUS_BLOOM)) { return false; }
+  let nRows = wmBiome(biome, WM_B_COVER_COUNT);
+  for (var i = unrollFenceU(); i < nRows; i++) {
+    if ((wmCover(biome, i, WM_C_MAT) == mat || wmCover(biome, i, WM_C_HEAD) == mat) &&
+        y <= h + i32(wmCover(biome, i, WM_C_HEIGHT)) + 1) { return true; }
+  }
+  return false;
 }
 // A ROAD NARROWER THAN THE CELL still colours it (map v2 R1). The centre
 // column decides the skin, so a 1.2 m path through a 1.6 m cell is drawn only
@@ -8616,16 +8652,13 @@ fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
 // sub-columns, so each thread does ONE: same work, sixteen times the
 // parallelism. The stride is read from num_workgroups, so a dispatch of any
 // height still covers the whole column.
-// THE COVER BIT (LOD-seam package E, 2026-09-28). A column plant (grass, a
-// flower, moss: any MATF_MICRO material) standing on the sub-column's top is
-// dropped by every far writer (farCellIsSolid), so past the handoff a meadow
-// was its bare skin. The map records it: bit 30 set = a plant stands on this
-// sample column, and bits 23..29 then hold the PLANT's far palette slot in
-// place of the sub-skin (the renderer takes the sub-skin from a sibling
-// sub-column of the same cell — raymarch.wgsl farMapSubOf). raymarch.wgsl's
-// FAR_MAP_COVER_BIT is the same bit; declared in both rather than in
-// common.wgsl because a common.wgsl edit recompiles every shader.
-const FAR_MAP_COVER_BIT : u32 = 0x40000000u;
+// THE COVER BIT (LOD-seam package E, 2026-09-28 -- RETIRED 2026-10-14). A
+// column plant (grass, a flower, moss: any MATF_MICRO material) is dropped by
+// every far writer (farCellIsSolid), so past the handoff a meadow was its bare
+// skin. Bit 30 of the entry used to say "a plant stands on this SAMPLE
+// column" (its slot in the sub-skin field); one column standing for a whole
+// sub-column made a speck a block, and the COVER PLANE (farCoverCell, below)
+// replaced it with the cell's coverage. Bit 30 of an entry is now always 0.
 
 // ---- THE FEATURE PLANE (LOD-seam package F, 2026-09-28) ---------------------
 // The cells centre-sample, so a plant one voxel wide is in the far field with
@@ -8706,16 +8739,16 @@ fn farStrataWord(level : u32, m : vec2<i32>) -> u32 {
 // stack against the sample column's ground (their own ground is within a
 // voxel or two: a far feature, 45-90 m out) and do not see those overrides.
 struct FarFeatPick { card : u32, stalk : u32 };
+// `canopy`: the sample column's undergrowthSite cover, or -1 (the caller's,
+// shared with farCoverCell: one inlined scan per entry, not two).
 fn farFeatFill(col : ptr<function, Col>, ponds : ptr<function, PondSet>, cover : u32,
-               m : vec2<i32>, wsh : u32, fx : i32, fz : i32, seed : u32) -> FarFeatPick {
+               m : vec2<i32>, wsh : u32, fx : i32, fz : i32, seed : u32,
+               canopy : i32) -> FarFeatPick {
   var r : FarFeatPick;
   r.card = 0u;
   r.stalk = 0u;
   let h = (*col).h;
   if (!GROUND_COVER || (*col).inRim || (*col).pond >= 0) { return r; }
-  let biome = (*col).biome;
-  var canopy = -1;
-  if (wmFlag(biome, WM_BF_CANOPY_ROWS)) { canopy = undergrowthSite(fx, fz, seed, ponds).cover; }
   let n = 1 << wsh;
   // The tallest MICRO plant (a card) and the tallest SOLID one (a stalk),
   // separately: a stalk goes into the heightfield, a card into the word.
@@ -8768,6 +8801,144 @@ fn farFeatFill(col : ptr<function, Col>, ponds : ptr<function, PondSet>, cover :
               (farFeatSlot(sHead) << 23u) | FAR_FEAT_SOLID;
   }
   return r;
+}
+
+// ---- THE COVER PLANE (2026-10-14, ticket 2026-10-14_11-20-12) ---------------
+// "From far away it shouldn't look blocky at all, mostly just one color with
+// some noise of the other." The crystal barrens are pale quartzite with ~2 %
+// alpine cushions, ~1 % tussocks and, in patches, ~2 % violet crystal spires
+// per column -- one-voxel things the near field shows as specks and sticks.
+// Past the handoff each far representation SAMPLED them: the cover tint read
+// the map entry's COVER BIT, set when the entry's ONE sample column grew a
+// plant, so a 3 % speck became 3-11 % of whole sub-columns (0.4-12.8 m) at
+// FULL plant colour; and a solid stalk (a spire, a cactus, a chalk rock)
+// past the stalk levels survived only where a cell's centre sample hit one,
+// as a whole 0.8-25 m cube. Same frequency, 2^L times the size: block noise.
+//
+// A far cell must show the COVERAGE-WEIGHTED AVERAGE of what it stands for.
+// The coverage of a column's cover stack is analytic: rows are rolled in
+// order and the first that passes wins (coverRowPick), each with 1/chance
+// once its conditions and its patch mask pass, so over a cell the expected
+// share of row i is  q_i * prod_{j<i} (1 - q_j),  q_i = patchFrac_i / chance_i
+// -- no hash, no sampling noise. Conditions (altitude, treeline, slope,
+// canopy, water) are the writer's sample column's; the patch mask, the one
+// term that varies inside a cell (3.2 m patches), is sampled at the cell's
+// four sub-column centres. One u32 per LEVEL CELL, every level, after the
+// strata plane (sim/farfeat.h kFarCover*; raymarch.wgsl reads the same bits):
+//   bits  0..6   slot A: the cover material with the largest share (far slot)
+//   bits  7..12  A's share, sqrt-coded: share = (v / 63)^2 (1/63 -> 0.03 %)
+//   bits 13..19  slot B: the second         bits 20..25  B's share, same code
+//   bits 26..29  the tallest SOLID row's stalk height, voxels (0 = none)
+//   bit  31      PRESENT
+// The rows past the second keep their share: A and B are scaled so A + B is
+// the whole cover (a meadow's twelve flowers tint as its two commonest
+// plants, at the full strength of all twelve). A row whose material has no
+// 7-bit far slot is not cover here (farFeatSlot), as everywhere else.
+// The renderer tints the ground by it (coverWeight): MICRO plants where the
+// feature plane's cards have gone, SOLID stalks past the levels that draw
+// them as geometry (FAR_FEAT_LEVELS) -- where the centre-sampled stalk cell
+// is dropped (farCoverStalkDrop) so no cube remains. Written by `farmap`,
+// trusted only under a VALID entry of the cell (an edit invalidates it).
+const FAR_COVER_BASE : u32 = FAR_STRATA_BASE + FAR_LEVELS * FAR_N * FAR_N * 4u;
+const FAR_COVER_PRESENT : u32 = 0x80000000u;
+fn farCoverWordAt(level : u32, c : vec2<i32>) -> u32 {
+  return FAR_COVER_BASE + farMapCell(level, c);
+}
+fn farCoverShareQ(f : f32) -> u32 {
+  return u32(round(sqrt(clamp(f, 0.0, 1.0)) * 63.0));
+}
+// The cell whose min fine corner is c0 (2^shift wide), for the column `col`
+// standing in it; `canopy` its undergrowthSite cover or -1. 0 = no cover.
+fn farCoverCell(col : ptr<function, Col>, ponds : ptr<function, PondSet>, canopy : i32,
+                c0 : vec2<i32>, shift : u32, seed : u32) -> u32 {
+  if (!GROUND_COVER || (*col).inRim || (*col).pond >= 0 || colSteep(col)) { return 0u; }
+  let h = (*col).h;
+  let biome = (*col).biome;
+  let nRows = wmBiome(biome, WM_B_COVER_COUNT);
+  let bThresh = i32(wmBiome(biome, WM_B_PATCH_THRESH));
+  let pLog2 = wmBiome(biome, WM_B_PATCH_LOG2);
+  let hw = 1 << (shift - 1u);     // a sub-column's width
+  let qo = hw >> 1;               // its centre (0 at level 1: the column itself)
+  // genCellIn's per-column keep-outs (an authored site's pad, a dungeon's
+  // surface opening): the share of the four sub-column centres they leave
+  // open scales every row. Without it the plane counted cover over a whole
+  // village green.
+  var open = 0.0;
+  for (var o = unrollFence(); o < 4; o++) {
+    let x = c0.x + (o & 1) * hw + qo;
+    let z = c0.y + (o >> 1) * hw + qo;
+    if (!siteKeepOut(x, z) && !dgSurfNear(x, z, 0)) { open += 0.25; }
+  }
+  if (open <= 0.0) { return 0u; }
+  var free = 1.0;                 // the chance no earlier row took the column
+  var tot = 0.0;
+  var sA = 0u;  var fA = 0.0;
+  var sB = 0u;  var fB = 0.0;
+  var hS = 0;
+  for (var i = unrollFenceU(); i < nRows; i++) {
+    let chance = wmCover(biome, i, WM_C_CHANCE);
+    if (chance == 0u) { continue; }
+    // coverRowPick's conditions, on the sample column (same order, same law).
+    let cMin = i32(wmCover(biome, i, WM_C_CANOPY_MIN));
+    let cMax = i32(wmCover(biome, i, WM_C_CANOPY_MAX));
+    if (max(canopy, 0) < cMin || max(canopy, 0) > cMax) { continue; }
+    let minY = bitcast<i32>(wmCover(biome, i, WM_C_MIN_Y));
+    let maxY = bitcast<i32>(wmCover(biome, i, WM_C_MAX_Y));
+    if (minY >= 0 && h < minY) { continue; }
+    if (maxY >= 0 && h > maxY) { continue; }
+    let tlc = wmCover(biome, i, WM_C_TREELINE);
+    if (tlc == 1u && h >= (*col).tl) { continue; }
+    if (tlc == 2u && h < (*col).tl) { continue; }
+    let rSlope = i32(wmCover(biome, i, WM_C_MAX_SLOPE));
+    if (rSlope > 0 && rSlope < 1024 && (*col).slope > rSlope) { continue; }
+    let nwMax = bitcast<i32>(wmCover(biome, i, WM_C_NEAR_WATER_MAX));
+    let nwMin = i32(wmCover(biome, i, WM_C_NEAR_WATER_MIN));
+    if (nwMax >= 0 || nwMin > 0) {
+      let d = waterDistAt(ponds, c0.x + hw, c0.y + hw, max(nwMax, nwMin));
+      if (!nearWaterOk(d, nwMax, nwMin)) { continue; }
+    }
+    // The patch mask's share of the cell, at its four sub-column centres --
+    // SOFT: each sample passes by how far the noise is over the threshold,
+    // against how much the noise moves across the sub-column it stands for
+    // (value noise climbs its 0..255 range over about one 2^pLog2 cell). A
+    // hard pass/fail quantised the share to quarters, a cell-sized step at
+    // every patch edge; this is continuous from one cell to the next.
+    var pf = 1.0;
+    let thresh = max(bThresh, i32(wmCover(biome, i, WM_C_PATCH_THRESH)));
+    if (thresh > 0) {
+      let off = i32(i) * 613;
+      let wSoft = max(255.0 * f32(hw) / f32(1 << pLog2), 1.0);
+      var ps = 0.0;
+      for (var o = 0; o < 4; o++) {
+        let x = c0.x + (o & 1) * hw + qo;
+        let z = c0.y + (o >> 1) * hw + qo;
+        let pm = vnoise2d(x - 617 + off, z + 431 - off, pLog2, seed ^ (0xD5E7u + i)).n >> 6;
+        ps += clamp((f32(pm - thresh) - 0.5) / wSoft + 0.5, 0.0, 1.0);
+      }
+      pf = ps * 0.25;
+    }
+    let q = pf / f32(chance);
+    let cov = q * free * open;
+    free *= 1.0 - q;
+    let mat = wmCover(biome, i, WM_C_MAT);
+    let s = farFeatSlot(mat);
+    if (cov <= 0.0 || s == 0u) { continue; }
+    tot += cov;
+    if ((materials[mat].flags & MATF_MICRO) == 0u) {
+      hS = max(hS, i32(wmCover(biome, i, WM_C_HEIGHT)));
+    }
+    if (s == sA) { fA += cov; }
+    else if (s == sB) { fB += cov; }
+    else if (cov > fB) { sB = s; fB = cov; }
+    if (fB > fA) {
+      let ts = sA; sA = sB; sB = ts;
+      let tf = fA; fA = fB; fB = tf;
+    }
+  }
+  if (sA == 0u) { return 0u; }
+  let k = tot / max(fA + fB, 1e-9);
+  return sA | (farCoverShareQ(fA * k) << 7u) | (sB << 13u) | (farCoverShareQ(fB * k) << 20u) |
+         (u32(clamp(hS, 0, 15)) << 26u) | FAR_COVER_PRESENT;
 }
 
 @compute @workgroup_size(64)
@@ -8914,19 +9085,29 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
     var e = u32(clamp(top + FAR_MAP_H_BIAS, 0, 0xFFFF)) |
             ((sSkin & FAR_MAP_SLOT_MAX) << 16u) |
             ((sUnder & FAR_MAP_SLOT_MAX) << 23u);
-    // A plant on the ground (not on a fluid surface: a lily pad keeps the
-    // fluid look) with a far slot of its own: the cover bit + its slot.
-    if (cover != MAT_AIR && top == col.h && (materials[cover].flags & MATF_MICRO) != 0u) {
-      let cs = matFarPal(&materials, cover);
-      if (cs != 0u && cs <= FAR_MAP_SLOT_MAX) {
-        e = (e & ~(0x7Fu << 23u)) | (cs << 23u) | FAR_MAP_COVER_BIT;
+    // THE COVER BIT IS RETIRED (2026-10-14): the plant on this ONE sample
+    // column used to be the entry's cover (bit 30, the plant's slot in the
+    // sub-skin field) -- one column standing for 4^(L-1), a speck drawn as a
+    // block. The cover plane below carries the cell's coverage instead, and
+    // the sub-skin field is the sub-skin again.
+    var canopy = -1;
+    if (wmFlag(col.biome, WM_BF_CANOPY_ROWS) && top == col.h) {
+      canopy = undergrowthSite(fx, fz, T.seed, &ponds).cover;
+    }
+    // THE COVER PLANE (farCoverCell): one word per level cell, written by its
+    // (even, even) sub-column's thread, from that column.
+    if ((m.x & 1) == 0 && (m.y & 1) == 0) {
+      var cw = 0u;
+      if (ok && top == col.h) {
+        cw = farCoverCell(&col, &ponds, canopy, m << vec2<u32>(wsh), shift, T.seed);
       }
+      atomicStore(&farMap[farCoverWordAt(level, m >> vec2<u32>(1u))], cw);
     }
     // THE FEATURES (see FAR_FEAT_*): what stands on a valid ground top.
     var feat = 0u;
     var stalked = false;
     if (level <= FAR_FEAT_LEVELS && ok && top == col.h) {
-      let fp = farFeatFill(&col, &ponds, cover, m, wsh, fx, fz, T.seed);
+      let fp = farFeatFill(&col, &ponds, cover, m, wsh, fx, fz, T.seed, canopy);
       feat = fp.card;
       if (fp.stalk != 0u) {
         // A STALK IS PART OF THE HEIGHTFIELD. A cactus stalk is far-solid,

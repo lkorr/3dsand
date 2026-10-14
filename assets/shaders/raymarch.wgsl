@@ -1071,6 +1071,10 @@ fn fogSkyK() -> f32 { return max(eyeSkyK(), gHitSky); }
 // that is not the heightfield's); the map under the hit (0 not VALID or
 // outside the level, 0.5 VALID without strata, 1 VALID with strata).
 // Near pixels black. Count a band's grey/orange by the green channel.
+// 18 = EMISSIVE STALKS ACROSS THE SEAMS (2026-10-14, ticket 2026-10-14_11-20-12):
+// which representation drew the pixel (0 near; far: 1 a plain cell, 0.75 a
+// feature card, 0.5 a refined sub-column), 1 if its material emits (a crystal
+// spire), and a far pixel's level / 8.
 // 0 = off and const-folded away.
 const SEAM_DBG : u32 = 0u;
 var<private> gDbgLayer : f32 = 0.0;
@@ -1108,6 +1112,7 @@ fn dbgRec(isFar : bool, mat : u32, t : f32, alb : vec3f, sh : f32, ao : f32, ope
   else if (SEAM_DBG == 2u) { gDbg = vec4f(dbgLum(alb), sh, ao, 1.0); }
   else if (SEAM_DBG == 3u) { gDbg = vec4f(open, lam, lamPre, 1.0); }
   else if (SEAM_DBG == 4u) { gDbg = vec4f(dbgLum(col) * 0.5, dbgLum(gi) * 4.0, face, 1.0); }
+  else if (SEAM_DBG == 18u) { gDbg = vec4f(select(0.0, 1.0, isFar), select(0.0, 1.0, materials[mat].emission > 0u), 0.0, 1.0); }
 }
 // trace()'s own step count. A call site zeroes it, calls, and bills the delta
 // to its slot — cheaper than a parameter through a function that is inlined
@@ -15353,20 +15358,13 @@ fn surfaceGrainFp(cell : vec3<i32>, amp : f32, voxPx : f32) -> f32 {
 // asked for. The map is filled at EVERY level, whatever farRefineLevel caps
 // the refine at. ok = false when an entry is outside the valid box or not
 // vouched for (an edit, a ruin): the caller keeps the plain cell shade there.
-const FAR_MAP_COVER_BIT : u32 = 0x40000000u;   // worldgen.wgsl, same name
 struct FarSurf { ok : bool, e : u32, q : vec4<u32>, sub : u32, g : vec2f, gok : bool,
                  c : vec2<i32>, qi : u32 };
-// The sub-skin of entry `ez` of cell `q`: its own field, or — when the cover
-// bit took that field for the plant's slot — the first uncovered sibling's,
-// else the skin.
+// The sub-skin of entry `ez` of cell `q`.
+// (The cover bit that once borrowed this field for a plant's slot is retired:
+// the cover plane carries the cover, farCoverTint.)
 fn farMapSubOf(ez : u32, q : vec4<u32>) -> u32 {
-  if ((ez & FAR_MAP_COVER_BIT) == 0u) { return (ez >> 23u) & 0x7Fu; }
-  var r = (ez >> 16u) & 0x7Fu;
-  if ((q.w & FAR_MAP_COVER_BIT) == 0u) { r = (q.w >> 23u) & 0x7Fu; }
-  if ((q.z & FAR_MAP_COVER_BIT) == 0u) { r = (q.z >> 23u) & 0x7Fu; }
-  if ((q.y & FAR_MAP_COVER_BIT) == 0u) { r = (q.y >> 23u) & 0x7Fu; }
-  if ((q.x & FAR_MAP_COVER_BIT) == 0u) { r = (q.x >> 23u) & 0x7Fu; }
-  return r;
+  return (ez >> 23u) & 0x7Fu;
 }
 fn farSurfAt(level : u32, hitP : vec3f, grad : bool) -> FarSurf {
   var r : FarSurf;
@@ -15501,9 +15499,9 @@ fn farRiserShare(g : vec2f, rd : vec3f) -> f32 {
 // width) — and the tint is 1 - exp(-tau) of the plant's look (body and tip
 // palette means). At the eye-height seam that is ~all of a meadow and a
 // fraction of a desert's tussocks; from above, about the footprint.
-// SAME FUNCTION BOTH SIDES: the far side reads the four map entries of the
-// cell (cover bit + the plant's slot, worldgen farmap), the near side the four
-// voxels over the same four columns, and the near weight ramps in across B's
+// SAME FUNCTION BOTH SIDES: the far side reads the cell's cover-plane word
+// (its expected coverage: farCoverTint, below), the near side the four
+// voxels over the four columns of a level-1 cell, and the near weight ramps in across B's
 // fade band as the plants themselves go, so it is 1 from DETAIL_FADE_END_M on
 // — before the handoff. The plant's identity is its far palette slot's owner
 // on both sides, so an aliased plant looks the same across the seam.
@@ -15537,6 +15535,83 @@ fn coverBladeLight(rd : vec3f) -> f32 {
 }
 fn coverWeight(f : f32, hVox : f32, rd : vec3f) -> f32 {
   return 1.0 - exp(-f * (1.0 + FAR_COVER_K * hVox / max(-rd.y, 0.02)));
+}
+
+// ---- THE COVER PLANE's tint (worldgen.wgsl farCoverCell; 2026-10-14, ticket
+// 2026-10-14_11-20-12) ----
+// The far side's cover used to be the map entry's COVER BIT: did the ONE
+// sample column of a sub-column grow a plant. Averaged over a cell's four
+// entries that is an unbiased estimate of the coverage and a terrible one --
+// 0 or 25-100 % where the truth is 3 % -- so a speckled hillside (2 % alpine
+// cushions on pale quartzite) drew 3-11 % of its cells at full plant colour:
+// blocks at the frequency of the specks, 2^L times their size. The cover
+// plane holds the cell's EXPECTED coverage (analytic over the biome's cover
+// rows), its two commonest materials and the tallest solid stalk; the tint
+// is coverWeight's optical depth per material, MICRO plants with the blade
+// law (FAR_COVER_K, where the feature plane's cards have gone: 1 - keep) and
+// SOLID stalks -- one voxel wide, opaque -- with K = 1 past the levels that
+// draw them as geometry (FAR_FEAT_LEVELS). A stalk's emission rides along:
+// a field of crystal spires glows by the share of the view its sticks fill.
+// Returns the look (rgb), its weight w and the emitted light (premultiplied
+// by w, x emission / 255).
+const FAR_COVER_VEC : u32 = FAR_STRATA_VEC + FAR_LEVELS * FAR_N * FAR_N;
+const FAR_COVER_PRESENT : u32 = 0x80000000u;
+const FAR_STALK_K : f32 = 1.0;
+fn farCoverWordOf(level : u32, c : vec2<i32>) -> u32 {
+  let ci = farMapCell(level, c);
+  let v = farMap[FAR_COVER_VEC + (ci >> 2u)];
+  let k = ci & 3u;
+  return select(select(v.x, v.y, k == 1u), select(v.z, v.w, k == 3u), k >= 2u);
+}
+struct FarCoverTint { rgb : vec3f, w : f32, emis : vec3f };
+fn farCoverTint(cw : u32, level : u32, keep : f32, rd : vec3f, nG : vec3f) -> FarCoverTint {
+  var r : FarCoverTint;
+  r.rgb = vec3f(0.0);
+  r.w = 0.0;
+  r.emis = vec3f(0.0);
+  if ((cw & FAR_COVER_PRESENT) == 0u) { return r; }
+  var clear = 1.0;          // the share of the ground nothing hides
+  var acc = vec3f(0.0);     // sum of weight x look
+  var accW = 0.0;
+  let bl = coverBladeLight(rd);   // view-only: once, not per material
+  // The optical depth's view term, against the GROUND's normal, not +y: a
+  // hillside facing the eye shows its ground and the stalks' sides in the
+  // ratio a flat field seen from overhead does. coverWeight's |rd.y| is the
+  // flat case (and stays the near side's law at the handoff, where the far
+  // MICRO tint is still faded out). Upright things show their sides by the
+  // view's horizontal share.
+  let side = sqrt(max(1.0 - rd.y * rd.y, 0.0)) / max(-dot(rd, nG), 0.02);
+  for (var k = 0u; k < 2u; k++) {
+    let sh = k * 13u;
+    let slot = (cw >> sh) & 0x7Fu;
+    let q = f32((cw >> (sh + 7u)) & 63u) * (1.0 / 63.0);
+    if (slot == 0u || q <= 0.0) { continue; }
+    let mat = farPalMat(&materials, slot);
+    let mm = materials[mat];
+    var wk = 0.0;
+    var look = vec3f(0.0);
+    if ((mm.flags & MATF_MICRO) != 0u) {
+      let cl = coverLook(mat);
+      wk = (1.0 - exp(-q * q * (1.0 + FAR_COVER_K * cl.w * side))) * (1.0 - keep);
+      look = cl.rgb * bl;
+    } else if (level > FAR_FEAT_LEVELS) {
+      let hv = f32((cw >> 26u) & 15u);
+      wk = 1.0 - exp(-q * q * (1.0 + FAR_STALK_K * hv * side));
+      look = paletteMean(mm);
+      r.emis += look * wk * (f32(mm.emission) * (1.0 / 255.0));
+      // Its SIDES are what a grazing view sees, lit as a blade's are.
+      look *= bl;
+    }
+    clear *= 1.0 - wk;
+    acc += look * wk;
+    accW += wk;
+  }
+  r.w = 1.0 - clear;
+  if (accW > 0.0) { r.rgb = acc / accW; }
+  // The emitted light is what the hidden share shows: scale the per-material
+  // sum to the combined weight as the look is.
+  if (accW > 0.0) { r.emis *= r.w / accW; }
+  return r;
 }
 
 // ---- far WET GROUND: the near rain term, with openness replaced ----
@@ -16622,6 +16697,7 @@ fn fs(in : VSOut) -> FSOut {
       // far field's closed-form indirect terms are calibrated for the first;
       // the second takes its sky from the cascade (farSkyFan, below).
       var fSurf = false;
+      var coverEmis = vec3f(0.0);   // the cover plane's glow on this pixel (farCoverTint)
       var groundY = -1e9;   // the column's heightfield top (fine voxels), if mapped
       if (m.klass != CLASS_LIQUID && !fFeat) {
         let fs2 = farSurfAt(flv, hitP, wLit > 0.0);
@@ -16654,23 +16730,20 @@ fn fs(in : VSOut) -> FSOut {
           if (far.mat == skinM || far.mat == subM ||
               (fRefined && (far.mat == midM || far.mat == deepM))) {
             fSurf = true;
-            // The cover: this sub-column's bit, or the cell's fraction once a
-            // sub-column is under ~2 px; the plant is this sub-column's, or
-            // the first covered sibling's.
-            // The cover (coverWeight): the cell's covered fraction and the
-            // first covered entry's plant, in the near side's column order.
-            let cb = (fs2.q & vec4<u32>(FAR_MAP_COVER_BIT)) != vec4<u32>(0u);
-            if (any(cb)) {
-              let frac = dot(select(vec4f(0.0), vec4f(0.25), cb), vec4f(1.0));
-              let ce = select(select(select(fs2.q.w, fs2.q.z, cb.z), fs2.q.y, cb.y),
-                              fs2.q.x, cb.x);
-              let cl = coverLook(farPalMat(&materials, (ce >> 23u) & 0x7Fu));
-              // Only where the features have gone (farFeatKeep): nearer, the
-              // blades themselves are drawn (package F).
-              let cw = coverWeight(frac, cl.w, rd) * (1.0 - farFeatKeep(far.t));
-              let cc = cl.rgb * coverBladeLight(rd);
-              skinA = mix(skinA, cc, cw);
-              if (n.y > 0.5) { albedo = mix(albedo, cc, cw); }
+            // THE COVER (the cover plane, farCoverTint): the cell's coverage-
+            // weighted plants and stalks, tinting the tread -- and, through
+            // skinA, the staircase average -- by what they hide from this view.
+            // The ground's own normal (the heightfield's, when the map has
+            // it): a stand hides ground by the view's angle to the SLOPE.
+            let nG = select(vec3f(0.0, 1.0, 0.0), normalize(vec3f(-fs2.g.x, 1.0, -fs2.g.y)),
+                            fs2.gok);
+            let ct = farCoverTint(farCoverWordOf(flv, fs2.c), flv, farFeatKeep(far.t), rd, nG);
+            if (ct.w > 0.0) {
+              skinA = mix(skinA, ct.rgb, ct.w);
+              if (n.y > 0.5) { albedo = mix(albedo, ct.rgb, ct.w); }
+              // A glowing stalk's light: a tread wears all of it, a riser
+              // the tread share of the staircase average (below).
+              coverEmis = ct.emis;
             }
           }
           // THE STAIRCASE'S OWN RISERS (farTerraceLightW). A level-L step is
@@ -16711,7 +16784,12 @@ fn fs(in : VSOut) -> FSOut {
             let riserA = (skinA + paletteMean(materials[subM]) * nSub +
                           paletteMean(materials[midM]) * nMid +
                           paletteMean(materials[deepM]) * nDeep) / g;
-            smoothAlb = mix(skinA, riserA, farRiserShare(fs2.g, rd));
+            let rShare = farRiserShare(fs2.g, rd);
+            smoothAlb = mix(skinA, riserA, rShare);
+            if (n.y <= 0.5) { coverEmis *= wLit * (1.0 - rShare); }
+            else { coverEmis *= mix(1.0, 1.0 - rShare, wLit); }
+          } else if (n.y <= 0.5) {
+            coverEmis = vec3f(0.0);
           }
         }
       }
@@ -17133,6 +17211,7 @@ fn fs(in : VSOut) -> FSOut {
       if (SEAM_DBG == 17u) {
         gDbg = vec4f(f32(flv) / 8.0, gDbgLayer, gDbgMap, 1.0);
       }
+      if (SEAM_DBG == 18u) { gDbg.x = select(select(1.0, 0.75, fFeat), 0.5, fRefined); gDbg.z = f32(flv) / 8.0; }
       // ---- the frozen fire's breath (farEmberPlasma) ----
       // A cascade ember is a fire the window left behind: nothing about it
       // moves any more. The plasma field crawls and pulses over its emission,
@@ -17163,6 +17242,9 @@ fn fs(in : VSOut) -> FSOut {
         emis *= farEmberPlasma(hitP, amp);
         color += albedo * emis * TUNE_EMISSIVE_STRENGTH;
       }
+      // The cover's own light (a field of crystal spires): its share of the
+      // view times its emission, the near voxel's albedo x emission law.
+      color += coverEmis * TUNE_EMISSIVE_STRENGTH;
       // ---- A NEAR WATER COLUMN CUT OFF BY THE HANDOFF (farWaterBed) ----
       // The fine march ended inside the water it entered at liqT, and the
       // cascade's first hit is that same water. What lies behind the surface

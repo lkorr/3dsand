@@ -18,6 +18,7 @@
 #include "game/brush.h"
 #include "game/camera.h"
 #include "gpu/resources.h"
+#include "sim/biomes.h"
 #include "sim/celestial.h"
 #include "sim/faredits.h"
 #include "sim/farfeat.h"
@@ -247,7 +248,7 @@ bool fogOk = false;
                 (unsigned long long)digest(world.farVox,
                                            (uint64_t)kFarLevels * kFarVox),
                 (unsigned long long)digest(world.farMap,
-                                           (kFarMapWords + kFarFeatWords + kFarStrataWords) * 4ull));
+                                           (kFarMapWords + kFarFeatWords + kFarStrataWords + kFarCoverWords) * 4ull));
   }
   // cold start: level 1 still pending -> only the residency window is trusted.
   // Both bounds come from world.h's cascade helpers rather than restating the
@@ -533,6 +534,10 @@ Status GateFarPersist(Ctx& c, std::string& detail) {
 //   (f) THE STRATA PLANE. Each pristine level-1 strata word names the live
 //       grid's far slot at every depth it covers, and the slots it names
 //       round-trip through the far palette (below, after (a)).
+//   (g) THE COVER PLANE. Each level-3/4 cell's expected cover share agrees
+//       with the live grid's census of its footprint (in aggregate), beats
+//       the retired one-sample-column rule per cell, and no level-3+ cell
+//       keeps a cover stalk its centre sample caught (at the desert site).
 namespace {
 uint32_t FarMapEntry(GpuContext& ctx, World& world, uint32_t level, int mx, int mz) {
   rhi::Buffer staging =
@@ -926,6 +931,137 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
                         f.x, f.z, f.top, f.h, mb, mt, mo, FarFeatBody(f.w),
                         FarFeatHead(f.w));
   }
+  // ---- (g) THE COVER PLANE (sim/farfeat.h kFarCover*, 2026-10-14) ----------
+  // Ticket 2026-10-14_11-20-12: a speckled ground drew its specks as BLOCKS
+  // past the handoff, because the far cover was one SAMPLE column per
+  // sub-column. The plane holds each cell's EXPECTED cover share; here it is
+  // held to the live grid's census over the same footprint -- every fine
+  // column of each sampled level-3 / level-4 cell, covered when the voxel over
+  // its ground is one of its biome's cover-row materials (body or head):
+  //   * in aggregate, plane share / census share within farSurface.coverTol;
+  //   * per cell, the plane's squared error against the census must be below
+  //     what the retired rule (the four sub-columns' SAMPLE columns, n / 4)
+  //     gave -- the block noise this replaced, as a number;
+  //   * THE STALK DROP: a level-3+ cell whose centre sample is a solid cover
+  //     stalk (not a cacti biome's landmark flesh) must not wear its slot.
+  int gCells = 0, gCols = 0, gCovered = 0, gDropCand = 0, gDropKept = 0;
+  double gExp = 0.0, gSeNew = 0.0, gSeOld = 0.0;
+  bool gBiomes = false;
+  {
+    biomes::BiomeSet bset;
+    std::string blog;
+    gBiomes = biomes::LoadBiomeSet(AssetDir(), c.mats, bset, blog);
+    std::unordered_map<uint32_t, std::vector<uint32_t>> rowsOf;
+    auto rowsAt = [&](int x, int z) -> const std::vector<uint32_t>& {
+      const uint32_t bid = World::MapBiomeAt(x, z, seed);
+      auto it = rowsOf.find(bid);
+      if (it != rowsOf.end()) return it->second;
+      std::vector<uint32_t> v;
+      if (const biomes::BiomeDef* d = biomes::BiomeById(bset, (int)bid))
+        for (const biomes::CoverRow& r : d->cover) {
+          if (r.materialId) v.push_back(r.materialId);
+          if (r.headId) v.push_back(r.headId);
+        }
+      return rowsOf.emplace(bid, std::move(v)).first->second;
+    };
+    std::unordered_map<uint32_t, std::vector<uint32_t>> cache;
+    auto live = [&](int x, int y, int z) -> uint32_t {
+      const IVec3 wc{x >> 4, y >> 4, z >> 4};
+      if (!world.ChunkInWindow(wc)) return 0xFFFFu;
+      const uint32_t slot = World::SlotChunkIndex(wc);
+      auto it = cache.find(slot);
+      if (it == cache.end()) {
+        it = cache.emplace(slot, std::vector<uint32_t>(kChunkVol)).first;
+        ReadVoxelsSync(ctx, world, slot, 1, it->second.data(), "farCoverPlane");
+      }
+      return it->second[((z & 15) * kChunk + (y & 15)) * kChunk + (x & 15)] & 0xFFFu;
+    };
+    auto covered = [&](int x, int z) -> int {   // 1 / 0, -1 = not countable
+      const int h = World::TerrainHeight(x, z, seed);
+      const uint32_t g = live(x, h, z), m = live(x, h + 1, z);
+      if (g == 0xFFFFu || m == 0xFFFFu || g == kMatAir) return -1;
+      const std::vector<uint32_t>& r = rowsAt(x, z);
+      return std::find(r.begin(), r.end(), m) != r.end() ? 1 : 0;
+    };
+    for (uint32_t level = 3; level <= 4 && gBiomes; level++) {
+      const int sh = (int)(level + kFarShiftBase), step = 1 << sh;
+      const int wsh = sh - 1, hw = (1 << wsh) >> 1;
+      const uint64_t lvlMap = (uint64_t)(level - 1) * plane;
+      const uint64_t lvlCov = kFarCoverBase + (uint64_t)(level - 1) * kFarN * kFarN;
+      const std::vector<uint32_t> mapL = FarMapWords(ctx, world, lvlMap, plane);
+      const std::vector<uint32_t> covL = FarMapWords(ctx, world, lvlCov, kFarN * kFarN);
+      const int c0x = (wx0 + step - 1) >> sh, c1x = (wx0 + (int)kWorldN) >> sh;
+      const int c0z = (wz0 + step - 1) >> sh, c1z = (wz0 + (int)kWorldN) >> sh;
+      const int stride = level == 3 ? 4 : 2;
+      for (int cz = c0z; cz < c1z; cz += stride)
+        for (int cx = c0x; cx < c1x; cx += stride) {
+          const uint32_t e = mapL[kFarMapWord(level, cx * 2, cz * 2) - lvlMap];
+          if (!(e & kFarMapValid)) continue;
+          const int sx = cx * 2 * (1 << wsh) + hw, sz = cz * 2 * (1 << wsh) + hw;
+          if (FarMapTopOf(e) != World::TerrainHeight(sx, sz, seed)) continue;   // a fluid top
+          const uint32_t w = covL[FarCoverWord(level, cx, cz) - lvlCov];
+          const double ex = (w & kFarCoverPresent) ? FarCoverShareA(w) + FarCoverShareB(w) : 0.0;
+          int n = 0, k = 0;
+          for (int z = cz * step; z < (cz + 1) * step; z++)
+            for (int x = cx * step; x < (cx + 1) * step; x++) {
+              const int cv = covered(x, z);
+              if (cv < 0) continue;
+              n++;
+              k += cv;
+            }
+          if (n < step * step / 2) continue;
+          int ko = 0, no = 0;
+          for (int q = 0; q < 4; q++) {
+            const int cv = covered(((cx * 2 + (q & 1)) << wsh) + hw, ((cz * 2 + (q >> 1)) << wsh) + hw);
+            if (cv < 0) continue;
+            no++;
+            ko += cv;
+          }
+          const double meas = (double)k / n, old = no ? (double)ko / no : 0.0;
+          gCells++;
+          gCols += n;
+          gCovered += k;
+          gExp += ex * n;
+          gSeNew += (ex - meas) * (ex - meas);
+          gSeOld += (old - meas) * (old - meas);
+          // The stalk drop, at the cell's own centre column.
+          const int fx = cx * step + step / 2, fz = cz * step + step / 2;
+          const int h = World::TerrainHeight(fx, fz, seed);
+          const uint32_t bid = World::MapBiomeAt(fx, fz, seed);
+          const biomes::BiomeDef* bd = biomes::BiomeById(bset, (int)bid);
+          for (int cy = (h + 1) >> sh; cy <= (h + 22) >> sh; cy++) {
+            const int y = cy * step + step / 2;
+            if (y <= h) continue;
+            const uint32_t m = live(fx, y, fz);
+            if (m == 0xFFFFu || m == kMatAir || m >= c.mats.size()) continue;
+            if (c.mats[m].gpu.flags & kMatFlagMicro) continue;
+            const std::vector<uint32_t>& r = rowsAt(fx, fz);
+            if (std::find(r.begin(), r.end(), m) == r.end()) continue;
+            const std::string& nm = c.mats[m].name;
+            if (bd && bd->cacti && nm.rfind("cactus", 0) == 0) continue;
+            gDropCand++;
+            if (FarCellSlot(FarVoxByte(ctx, world, level, {cx, cy, cz})) == c.mats[m].farPalSlot)
+              gDropKept++;
+          }
+        }
+    }
+  }
+  const double gMeas = (double)gCovered;
+  const double gRatio = gMeas > 0.0 ? gExp / gMeas : 0.0;
+  const double gTol = BaselineNumber("farSurface.coverTol", 0.35);
+  const double gMinCov = BaselineNumber("farSurface.coverMinCols", 100);
+  const bool gOk = gBiomes && gMeas >= gMinCov && std::abs(gRatio - 1.0) <= gTol &&
+                   gSeNew < gSeOld && gDropKept == 0;
+  RecordObserved("farSurface.coverRatio", gRatio);
+  RecordObserved("farSurface.coverRmsNew", gCells ? std::sqrt(gSeNew / gCells) : 0.0);
+  RecordObserved("farSurface.coverRmsOld", gCells ? std::sqrt(gSeOld / gCells) : 0.0);
+  const std::string gDetail =
+      Format("cover plane %d cells %d cols: plane %.4f vs census %.4f share (x%.2f, tol %.2f), "
+             "per-cell rms %.4f vs %.4f sampled; stalk drop %d/%d kept",
+             gCells, gCols, gCols ? gExp / gCols : 0.0, gCols ? gMeas / gCols : 0.0, gRatio, gTol,
+             gCells ? std::sqrt(gSeNew / gCells) : 0.0, gCells ? std::sqrt(gSeOld / gCells) : 0.0,
+             gDropKept, gDropCand);
+
   // The cut: prefer a SOLID feature (a stalk), with a control >= 64 voxels off.
   // A stalk's entry claims the stalk, so the cut must also clear its VALID
   // (and the far cells the fill marked with the stalk's slot: no ghost); a
@@ -981,18 +1117,18 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
              nSolid, nMicro, nL2, agree, checked, cutSolid ? "stalk" : "card", cutCleared,
              cutMapValid, !noGhost, ctlKept);
 
-  const bool ok = aOk && bOk && cOk && dOk && eOk && fOk;
+  const bool ok = aOk && bOk && cOk && dOk && eOk && fOk && gOk;
   detail = Format("L1 %d/%d valid, %d exact + %d fluid, %d cell/skin agree, %d wrong; "
                   "L2-3 %d/%d; edit %d%d%d->%d%d%d L2 %d; refill healed %d kept %d%d; %s; "
                   "strata %d cols (%d layered), %d/%d depths agree, %d palette bad%s; "
                   "flush re-skin (pre %d): live %d/4 cells %d/4 maps off, indexed %d/4 "
-                  "cells %d/4 maps off%s",
+                  "cells %d/4 maps off%s; %s",
                   valid, sampled, exact, fluid, cellAgree, wrong, coarseExact, coarse,
                   preCrater, preBuild, preControl, postCrater, postBuild,
                   postControl, postCrater2, healed, keptCrater, keptBuild,
                   dDetail.c_str(), stCols, stLayered, stChecked - stWrong, stChecked,
                   palBad, stWhy.c_str(), preYard, yardCellsLive, yardMapsLive, yardCellsIdx,
-                  yardMapsIdx, yardWhy.c_str());
+                  yardMapsIdx, yardWhy.c_str(), gDetail.c_str());
   std::printf("far surface: %s (%s%s%s; %u chunks indexed)\n", ok ? "PASS" : "FAIL",
               detail.c_str(), firstWrong.c_str(), firstBad.c_str(), noted);
   // Leave the cascades as the next gate expects to find them: pristine + the
