@@ -25,6 +25,7 @@
 #include "game/session.h"   // PrefetchChunksAround -- the gate and the real
                             // tick must call ONE definition of it
 #include "sim/biomes.h"
+#include "sim/currentprim.h"
 #include "sim/materials.h"
 #include "sim/stream.h"
 #include "sim/treeatlas.h"
@@ -381,6 +382,85 @@ Status GatePlayerWaterJump(Ctx&, std::string& detail) {
                 wadeFeet0, wadePeak);
   detail = buf;
   std::printf("player waterjump: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// player-current — A RIVER CARRIES A SWIMMER, NOT A WADER (2026-10-14).
+//
+// One stream primitive running +X through a synthetic pool (the lambda
+// fixture, for the reason over GatePlayerWaterJump). Two bodies, no movement
+// input on either:
+//   WADE  waist-deep with feet on the bed. The legs hold against the flow,
+//         so the body must not move and Player::currentVel must stay zero.
+//   TREAD 30 deep, Space held at the surface. The water carries it
+//         downstream, and the velocity the avatar's swim pose reads
+//         (vel - currentVel, avatar.cpp) must be near zero -- the pose treads
+//         while it drifts instead of crawling the way the river goes.
+Status GatePlayerCurrent(Ctx&, std::string& detail) {
+  const int kFloor = 100, kWadeTop = 108, kDeepTop = 130;
+  CurrentPrims().Clear();
+  CurrentPrim st;
+  st.kind = kCurrentPrimStream;
+  st.flags = kCurrentPrimSim;
+  st.x = 128; st.y = 115; st.z = 140;
+  st.radius = 256;
+  st.reach = 256;
+  st.decayTicks = kCurrentPrimForever;
+  st.ownerId = 0x7E58u;
+  CurrentPrimAim(st, Vec3{1.0f, 0.0f, 0.0f}, 2.0f);
+  const bool spawned = CurrentPrims().Spawn(st);
+  CurrentPrims().Tick(64);
+  const Vec3 field = CurrentAtCpu(Vec3{128.5f, 115.5f, 140.5f});
+
+  const Vec3 fwd{1, 0, 0}, right{0, 0, 1};
+  const float dt = 1.0f / 60.0f;
+  auto pool = [&](int top) {
+    return Player::KindFn([=](IVec3 c) {
+      if (c.y < kFloor) return CellKind::Solid;
+      return c.y < top ? CellKind::Liquid : CellKind::Air;
+    });
+  };
+
+  Player::KindFn wadeFn = pool(kWadeTop);
+  Player wade;
+  wade.fly = false;
+  wade.pos = Vec3{128.5f, kFloor + Player::kHalfY, 140.5f};
+  for (int i = 0; i < 30; i++) wade.Update(dt, TickInput{}, fwd, right, fwd, wadeFn);
+  const float wadeX0 = wade.pos.x;
+  bool wadeHeld = true;
+  for (int i = 0; i < 120; i++) {
+    wade.Update(dt, TickInput{}, fwd, right, fwd, wadeFn);
+    wadeHeld &= wade.currentVel.x == 0.0f && wade.currentVel.z == 0.0f;
+  }
+  const bool wadeOk = wade.inLiquid && wade.grounded && !wade.swimming &&
+                      wadeHeld && std::fabs(wade.pos.x - wadeX0) < 0.5f;
+
+  Player::KindFn deepFn = pool(kDeepTop);
+  Player tread;
+  tread.fly = false;
+  tread.pos = Vec3{100.5f, (float)kDeepTop - 1.0f, 140.5f};
+  TickInput up;
+  up.SetHeld(TB_JUMP, true);
+  for (int i = 0; i < 30; i++) tread.Update(dt, up, fwd, right, fwd, deepFn);
+  const float treadX0 = tread.pos.x;
+  for (int i = 0; i < 120; i++) tread.Update(dt, up, fwd, right, fwd, deepFn);
+  const float drift = tread.pos.x - treadX0;
+  const float relH = std::hypot(tread.vel.x - tread.currentVel.x,
+                                tread.vel.z - tread.currentVel.z);
+  const float curH = std::hypot(tread.currentVel.x, tread.currentVel.z);
+  const bool treadOk = tread.inLiquid && !tread.grounded && drift > 5.0f &&
+                       curH > 1.0f && relH < 0.25f * curH;
+  CurrentPrims().Clear();
+
+  const bool ok = spawned && field.x > 1.0f && wadeOk && treadOk;
+  char buf[320];
+  std::snprintf(buf, sizeof(buf),
+                "field %.1f vox/s | wade wet=%d ground=%d swim=%d dx %.2f "
+                "held=%d | tread dx %.1f current %.1f rel %.2f",
+                field.x, wade.inLiquid ? 1 : 0, wade.grounded ? 1 : 0,
+                wade.swimming ? 1 : 0, wade.pos.x - wadeX0, wadeHeld ? 1 : 0,
+                drift, curH, relH);
+  detail = buf;
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -3838,6 +3918,7 @@ const std::vector<Gate>& PlayerGates() {
       {"player-walk", "player", {}, false, GatePlayerWalk},
       {"player-waterjump", "player", {}, false, GatePlayerWaterJump},
       {"player-swim-floor", "player", {}, false, GatePlayerSwimFloor},
+      {"player-current", "player", {}, false, GatePlayerCurrent},
       {"player-ledgegrab", "player", {}, false, GatePlayerLedgeGrab},
       {"player-climb-fuzz", "player", {}, false, GatePlayerClimbFuzz},
       {"player-crouch", "player", {}, false, GatePlayerCrouch},

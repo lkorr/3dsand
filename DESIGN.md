@@ -23856,10 +23856,18 @@ list.
   fraction and a grid voxel has no sub-voxel position to measure one from --
   the same structural fact that put buoyancy in the particle ring rather than
   in the CA (§5).
-* **The player** (`player.cpp`, in the `inLiquid` block) -- a drag toward the
-  local flow scaled by SUBMERSION, which that file already computes as a
-  fraction. Vertical included, deliberately: the downward limb of a drain's
-  vortex is the dangerous part.
+* **The player** (`player.cpp`) -- ONLY while the water carries the body
+  (swimming, or afloat with no footing; a wader's legs hold against the flow).
+  Horizontally the swim control blends toward wish + current, so the stroke is
+  relative to the water and a body with no input drifts at the river's speed;
+  vertically a drag toward the flow scaled by SUBMERSION, kept because the
+  downward limb of a drain's vortex is the dangerous part. The avatar's swim
+  pose and heading read `vel - Player::currentVel`, so a drifting body treads.
+* **NPC walkers afloat** (`mob_afloat.cpp`, `AfloatCurrent`) -- the same
+  water-relative stroke, horizontal only (the float/dive height owns the
+  vertical), and the pose subtracts it the same way. Fish (`mob_swim.cpp`)
+  ignore the current. Both bodies are tick-owned, so both read
+  `CurrentAtCpuSim`: the sim-licensed primitives only (`kCurrentPrimSim`).
 
 That last one needs `CurrentAtCpu`, and **it is a third transcription of the four
 profiles, named as one.** `common.wgsl` carries the float evaluator (the

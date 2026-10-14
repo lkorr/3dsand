@@ -3298,8 +3298,10 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         const float headingBefore = avatarHeading;
         avatarHeading = ResolveAvatarHeading(
             camMode, camHeading, avatarHeading,
-            Vec3{player.vel.x - player.slideVel.x, 0,
-                 player.vel.z - player.slideVel.z},
+            // Less the slide and the current: neither is the body's own
+            // travel, so a swimmer drifting downstream keeps its facing.
+            Vec3{player.vel.x - player.slideVel.x - player.currentVel.x, 0,
+                 player.vel.z - player.slideVel.z - player.currentVel.z},
             kTickDt, avatar.Spawned() ? avatar.LocoGroundAlign() : 0.0f,
             avatar.Spawned() && !player.fly
                 ? avatar.Locomotion().baseSpeedScale *

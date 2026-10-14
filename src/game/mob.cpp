@@ -9144,6 +9144,11 @@ void MobSystem::EaseBodyY(Mob& mob, float targetY, float dt) {
 // a second copy of the whole pipeline plus a second ~390-line gait
 // (MobSystem::UpdateGait), and the two had drifted — pose.cpp says which way
 // each difference was resolved.
+// mob_afloat.cpp: the horizontal current at a floating walker's middle.
+// Declared here rather than in mob.h so the one consumer does not recompile
+// every file that includes the mob header.
+Vec3 AfloatCurrent(const Mob& mob, const MobDef& def);
+
 void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
                                 float dt, uint32_t tick) {
   (void)def;
@@ -9222,7 +9227,10 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
       mob.ragdoll_ == Mob::RagdollPhase::None) {
     const float H = std::max(def.worldSize.y, 1.0f);
     in.swim = true;
-    in.velocity = mob.swimVel_;
+    // The stroke is what the body does RELATIVE TO THE WATER: the river's
+    // share of the velocity (AfloatCurrent, the drift DriveAfloat added) is
+    // taken out, so a swimmer drifting with nowhere to go treads.
+    in.velocity = mob.swimVel_ - AfloatCurrent(mob, def);
     in.grounded = false;
     in.airPoseEligible = false;
     in.height = PoseInputs::Height::FromDriver;
@@ -9232,9 +9240,9 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
     in.guardPump = false;
     const bool under =
         !mob.surfaceKnown_ || mob.origin_.y + 0.9f * H < mob.surfaceY_;
-    const float sp = mob.swimVel_.len();
+    const float sp = in.velocity.len();
     if (under && sp > 0.15f * std::max(def.speed, 0.01f))
-      in.swimAim = mob.swimVel_ * (1.0f / sp);
+      in.swimAim = in.velocity * (1.0f / sp);
   }
   // ---- A DRAWN BOW (game/mob_archery.h) -------------------------------------
   // The bow_draw clip (the player's own, on the same rig) owns the arms; the

@@ -818,6 +818,7 @@ void Player::UpdateStance(float dt, const TickInput& in, bool onFoot,
 
 void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
   slideVel = Vec3{0, 0, 0};  // re-derived below, and only on slippery ground
+  currentVel = Vec3{0, 0, 0};  // re-derived below, and only while afloat
   const Vec3& flatFwd = in.flatFwd;
   const Vec3& right = in.right;
   const Vec3& lookFwd = in.lookFwd;
@@ -1317,7 +1318,12 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     // the tread thrust below is applied as though Space were held, which
     // settles the box at exactly the float a held Space always gave.
     const bool afloat = inLiquid && !onGround;
-    if (afloat)
+    // SWIM FATIGUE IS OFF (owner, 2026-10-14: "disable the fatigue effect for
+    // now"). The meter never drains, so the water always holds the body up and
+    // the HUD bar never shows. Flip kSwimFatigue back on to restore it; the
+    // knobs (player.swimStaminaTime / RegenTime) are untouched.
+    constexpr bool kSwimFatigue = false;
+    if (afloat && kSwimFatigue)
       swimStamina = std::max(0.0f, swimStamina - dt / std::max(T().swimStaminaTime, 0.1f));
     else
       swimStamina = std::min(1.0f, swimStamina + dt / std::max(T().swimStaminaRegenTime, 0.1f));
@@ -1376,8 +1382,26 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     float rate = onGround ? T().groundAccel * groundGrip
                           : (inLiquid ? T().liquidAccel : T().airAccel);
     float blend = 1.0f - std::exp(-rate * dt);
-    vel.x += (wish.x - vel.x) * blend;
-    vel.z += (wish.z - vel.z) * blend;
+    // ---- THE CURRENT (docs/PLAN_water_master.md component 8) ------------
+    // ONLY A BODY THE WATER IS HOLDING. Feet on the bed -- wading, or
+    // standing chest-deep -- the legs hold against the flow, so a river does
+    // not shove a standing body downstream. Afloat (`swimming`, or wet with
+    // no footing) it does. `!rising` keeps a wader's jump out of the stream:
+    // the ground probe is suppressed while rising, so a hop in the shallows
+    // would otherwise read as afloat for its whole arc.
+    //
+    // A SWIMMER'S STROKE IS RELATIVE TO THE WATER: the horizontal control
+    // blends toward wish + current, so letting go of the keys drifts at the
+    // river's speed and swimming upstream is the stroke minus the flow. This
+    // used to be a separate drag toward the current scaled by submersion,
+    // fighting a control that pulled toward a still-water wish; at the
+    // surface float (~0.3 under) the control won by 9 to 1 and a treading
+    // body barely moved however fast the river ran.
+    const bool carried = inLiquid && (swimming || (afloat && !rising));
+    const Vec3 cur = carried ? sandvox::CurrentAtCpuSim(pos) : Vec3{0, 0, 0};
+    currentVel = cur;
+    vel.x += (wish.x + cur.x - vel.x) * blend;
+    vel.z += (wish.z + cur.z - vel.z) * blend;
     // The steered swimmer's vertical is driven like its horizontal. Gravity
     // (already scaled by buoyancy above) still pulls on it, so letting go of
     // the keys returns the body to its float or its sink.
@@ -1418,27 +1442,17 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
       // `submersion` above.
       vel.y *= std::exp(-T().liquidDrag * submersion * dt);
 
-      // ---- THE CURRENT (docs/PLAN_water_master.md component 8) ------------
-      // The water you are in is going somewhere, and a whirlpool that does not
-      // pull you into it is a painting of a whirlpool.
-      //
-      // A DRAG toward the local flow, not a push, for windDrag's reason: drag
-      // is self-limiting, so no current and no knob can throw a swimmer faster
-      // than the water is moving, and no budget of its own is needed. Scaled by
-      // SUBMERSION, which this file already computes as a fraction — ankle-deep
-      // in a stream nudges, fully under a drain drags hard — so partial
-      // buoyancy and partial current come out of the same number for free.
-      //
-      // Vertical included, deliberately: the downward limb of a drain's vortex
-      // is the part that is dangerous, and dropping it would leave a whirlpool
-      // that spins you and never takes you down.
-      const Vec3 cur = sandvox::CurrentAtCpu(pos);
-      if (cur.x != 0.0f || cur.y != 0.0f || cur.z != 0.0f) {
+      // THE CURRENT'S VERTICAL (horizontal is in the swim control above).
+      // A DRAG, not a push, for windDrag's reason: self-limiting, so no
+      // current can throw a body faster than the water moves. Scaled by
+      // SUBMERSION, and kept, deliberately: the downward limb of a drain's
+      // vortex is the part that is dangerous, and dropping it would leave a
+      // whirlpool that spins you and never takes you down. `cur` is zero
+      // unless the water is carrying the body.
+      if (cur.y != 0.0f) {
         const float k =
             1.0f - std::exp(-CurrentTuning().sim.currentDrag * submersion * dt);
-        vel.x += (cur.x - vel.x) * k;
         vel.y += (cur.y - vel.y) * k;
-        vel.z += (cur.z - vel.z) * k;
       }
 
       // Water-edge mantle. Gated on the same canJump/jumpScale the dry jump is
