@@ -6703,8 +6703,19 @@ fn farLevelForDist(distFine : f32) -> u32 {
 // a half-cell crest that the near field would not shadow either. The flag keeps
 // its other reader (traceFar's primary-hit path, behind
 // render.farBlockerHitLevel).
+//
+// AND MEDIA-BLIND, AS THE NEAR SHADOW RAY IS (2026-10-13, ticket
+// 2026-10-09_14-23-01, the sea seam): a material cell blocks the sun only if
+// its material is a ray blocker (common.wgsl isRayBlocker -- traceOpaque's own
+// class), so clear water is not a caster. Until then every far cell of water
+// was opaque to the sun, which nothing saw only because no far face UNDER water
+// asked: the bed under far water was lit by a closed form with no shadow at
+// all (farWaterBed). It asks now, and a bed patch's ray starts in the water.
+// Air (slot 0) costs no table read; a solid one dependent pair, once, on the
+// cell that ends the march.
 fn farShadowBlocked(level : u32, vc : vec3<i32>) -> bool {
-  return farPalAt(level, vc) != 0u;
+  let slot = farPalAt(level, vc);
+  return slot != 0u && isRayBlocker(materials[farPalMat(&materials, slot)]);
 }
 
 // Where a ray from `ro` (fine voxels) leaves the residency window, in fine
@@ -14084,7 +14095,9 @@ fn farWaterLiquidAt(level : u32, box : FarBox, p : vec3f, s : f32) -> u32 {
   if (materials[mat].klass == CLASS_LIQUID) { return 1u; }
   return 2u | (mat << 2u);
 }
-fn farWaterBed(level : u32, p : vec3f, rd : vec3f) -> FarBed {
+// The bed's sun is looked up only this far along the ray (THE BED'S SUN, below).
+const FAR_BED_SUN_MAX_M : f32 = 12.0;
+fn farWaterBed(level : u32, p : vec3f, rd : vec3f, tEye : f32) -> FarBed {
   var r = farBedDeep();
   let s = f32(1u << farCellShift(level));
   let box = farBox(level);
@@ -14138,22 +14151,55 @@ fn farWaterBed(level : u32, p : vec3f, rd : vec3f) -> FarBed {
   // grazing ray through shallow water sees mostly the RISERS of the bed's
   // staircase (measured at the shelf camera: median raw Lambert 0.23, a side
   // face at noon), and an up-facing sunlit closed form drew them 4x brighter
-  // than the near bed. Not reproduced: the bed's cast and contact shadows
-  // (the near bed's median shadow there was 0.36) and its AO.
+  // than the near bed. Not reproduced: the bed's AO.
+  //
+  // The entry face is the LAST cell boundary the ray crossed into the bed
+  // cell (a DDA's entry face). It was "y if the bracket crossed a y boundary
+  // at all", which called a riser a tread whenever the bracket also clipped a
+  // row: 53 % of the shelf's shallow bed pixels read as treads far against
+  // 44 % near (now 37 %; the bracket is three bisections wide).
   let bm = materials[hitK >> 2u];
-  let d = vec3<i32>(floor((p + rd * t) / s)) - vec3<i32>(floor((p + rd * t0) / s));
-  var axis = 2;
-  if (d.y != 0) { axis = 1; } else if (d.x != 0) { axis = 0; }
-  let nb = axisVec(axis, -sign(axisPick(rd, axis)));
+  let ca = vec3<i32>(floor((p + rd * t0) / s));
+  let cb = vec3<i32>(floor((p + rd * t) / s));
+  // Per axis, where the ray crossed into cb's slab (-inf where it did not
+  // move on that axis); no dynamic vector index (the by-value register
+  // gotcha), so the three are spelled out.
+  let pl = select(vec3f(cb + vec3<i32>(1)) * s, vec3f(cb) * s, rd > vec3f(0.0));
+  let tc = select(vec3f(-1e30), (pl - p) / rd, ca != cb);
+  var axis = 1;
+  if (tc.x > tc.y && tc.x >= tc.z) { axis = 0; }
+  else if (tc.z > tc.y && tc.z > tc.x) { axis = 2; }
+  let rs = sign(axisPick(rd, axis));
+  let nb = axisVec(axis, -rs);
   var face = 1.0;
   if (axis == 0) { face = TUNE_FACE_X; } else if (axis == 2) { face = TUNE_FACE_Z; }
   let ob = farOpenness(nb);
   let albedo = paletteMean(bm);
-  r.lit = albedo * face *
-          (ambientOpen(ambientAt(nb), opennessScale(ob), ob) +
-           keyLightColor() * wrapDiffuse(dot(nb, keyLightDir()), TUNE_DIFFUSE_WRAP));
-  if (TUNE_GI_STRENGTH > 0.0) { r.lit += farGiBounce(albedo, nb); }
   r.path = min(0.5 * (t0 + t), maxV);
+  var lam = wrapDiffuse(dot(nb, keyLightDir()), TUNE_DIFFUSE_WRAP);
+  // THE BED'S SUN IS THE FAR TERRAIN'S (2026-10-13, ticket 2026-10-09_14-23-01,
+  // the sea seam): its face's far shadow patch (farShadowCached, the resolve's
+  // media-blind march -- see farShadowBlocked), then the dry far shade's
+  // lodShadowLift, hzSunShade and shadowLiftCap, in that order. The bed had no
+  // shadow at all, so a riser turned from the sun took the wrapped key light
+  // a sunlit one gets; measured on the shelf (same pixels near and far,
+  // SEAM_DBG 15 + 6 + 2/3), the shallow bed's light was 3-4x the near bed's
+  // (near median shadow 0.23 at noon -- 0.07 on the risers -- and 0.48 at
+  // minute 960) and the shallow water +4.5 / +9.3 luma brighter far.
+  // Only where the bed can show: past FAR_BED_SUN_MAX_M of water the column
+  // passes under a tenth of the bed's blue, and a patch per sea-floor cell
+  // to the horizon would buy nothing. tEye < 0 = the caller wants the path only.
+  if (lam > 0.0 && tEye >= 0.0 && (R.flags & 1u) != 0u && SHADOW_CACHE && FAR_SHADOW_CACHE &&
+      r.path * VOXEL_METERS < FAR_BED_SUN_MAX_M) {
+    let eP = p + rd * r.path;
+    var sh = farShadowCached(level, cb, axis, rs, false, eP);
+    if (sh < 1.0) { sh = lodShadowLift(sh, tEye + r.path); }
+    sh = min(sh, hzSunShade(eP));
+    lam *= shadowLiftCap(sh, ob);
+  }
+  r.lit = albedo * face *
+          (ambientOpen(ambientAt(nb), opennessScale(ob), ob) + keyLightColor() * lam);
+  if (TUNE_GI_STRENGTH > 0.0) { r.lit += farGiBounce(albedo, nb); }
   return r;
 }
 
@@ -16183,7 +16229,7 @@ fn fs(in : VSOut) -> FSOut {
             nW = vec3f(0.0, 1.0, 0.0);
           }
         }
-        color = shadeFarWater(hitP, rd, m, nW, farWaterBed(flv, hitP + rd * 0.01, rd));
+        color = shadeFarWater(hitP, rd, m, nW, farWaterBed(flv, hitP + rd * 0.01, rd, far.t));
         if (SEAM_DBG >= 5u) { gDbgW0.x = 1.0; gDbgW0.y = far.t; }
       }
       if (SEAM_DBG == 8u) {
@@ -16215,7 +16261,7 @@ fn fs(in : VSOut) -> FSOut {
       // and the column the near shade attenuates by goes on to that bed.
       if (nearCut && m.klass == CLASS_LIQUID && !isViscousLiquid(m) &&
           (m.flags & MATF_OPAQUE) == 0u) {
-        let bed = farWaterBed(flv, hitP + rd * 0.01, rd);
+        let bed = farWaterBed(flv, hitP + rd * 0.01, rd, far.t);
         color = bed.lit;
         liqExtra += bed.path;
       }
@@ -17165,7 +17211,7 @@ fn fs(in : VSOut) -> FSOut {
         // (past the handoff). Its column is the gap down to that water plus
         // the cascade's own path to the bed under it.
         caMat = far.mat;
-        let fb = farWaterBed(far.level & 0xFFu, R.camPos + rd * (far.t + 0.01), rd);
+        let fb = farWaterBed(far.level & 0xFFu, R.camPos + rd * (far.t + 0.01), rd, -1.0);
         caPath = max(far.t - mf.t, 0.0) + fb.path;
       }
       let behindMpm = color;
