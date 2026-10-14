@@ -753,6 +753,10 @@ const char* const kOrder[] = {
     // The far cover rule on a procgen crown at the harness origin: regenerates
     // the window there and restores the origin it found, like far-contain.
     "far-cover",
+    // The far THIN rule: a fence built on the ground at the harness origin
+    // (downsample + CPU patch) and Harrowby's field installed as a stamp (the
+    // sieve's base patch); same exit contract as far-contain.
+    "far-thin",
     // The near/far handoff, the same pixels shaded both ways under four
     // skies on far-cover's forest fixture; same exit contract (environment
     // restored, window regenerated at the origin it found, tuning + shaders

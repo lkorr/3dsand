@@ -1312,18 +1312,33 @@ Status GateFarCover(Ctx& c, std::string& detail) {
   auto local = [](int x, int y, int z) {
     return ((uint32_t)z * kChunk + (uint32_t)y) * kChunk + (uint32_t)x;
   };
-  // The rule's answer for the level-`level` cell at chunk-local index lc of a
-  // chunk's words: -1 when the centre is far-solid (the rule may not touch
-  // it), else the slot it fills (0 = stays empty).
-  auto oracle = [&](const uint32_t* w, uint32_t level, IVec3 lc) -> int {
+  // The rules' answer for the level-`level` cell at chunk-local index lc of a
+  // chunk's words: -1 when the centre is far-solid (the rules may not touch
+  // it), else the slot they fill (0 = stays empty): the cover rule, then at
+  // its levels the THIN rule (faredits.h ThinPick; a crown's one-voxel twigs
+  // are thin), whose face neighbours `nb` answers at chunk-local coordinates
+  // that may leave the chunk (kMatAtUnseen where the arm cannot see).
+  auto oracleWith = [&](const uint32_t* w, uint32_t level, IVec3 lc, const auto& nb) -> int {
     const int shift = (int)(level + kFarShiftBase), step = 1 << shift, half = step >> 1;
     const int c0[3] = {lc.x * step, lc.y * step, lc.z * step};
     const uint32_t centre = w[local(c0[0] + half, c0[1] + half, c0[2] + half)] & 0xFFFu;
     if (farSolid(centre)) return -1;
-    const uint32_t pick = edits.CoverPick(centre, level, half, c0, [&](int x, int y, int z) {
+    uint32_t pick = edits.CoverPick(centre, level, half, c0, [&](int x, int y, int z) {
       return w[local(x, y, z)] & 0xFFFu;
     });
+    if (pick == centre && shift <= FarEdits::kThinMaxShift) pick = edits.ThinPick(centre, half, c0, nb);
     return pick == centre ? 0 : (int)slotOf(pick);
+  };
+  // What the CPU patch sees: this chunk only.
+  auto inChunkOf = [&](const uint32_t* w) {
+    return [w, &local](int x, int y, int z) -> int {
+      if (x < 0 || y < 0 || z < 0 || x >= (int)kChunk || y >= (int)kChunk || z >= (int)kChunk)
+        return FarEdits::kMatAtUnseen;
+      return (int)(w[local(x, y, z)] & 0xFFFu);
+    };
+  };
+  auto oracle = [&](const uint32_t* w, uint32_t level, IVec3 lc) -> int {
+    return oracleWith(w, level, lc, inChunkOf(w));
   };
   auto firedL1 = [&](const uint32_t* w) {
     int n = 0;
@@ -1440,6 +1455,23 @@ Status GateFarCover(Ctx& c, std::string& detail) {
   const auto D = readArm();
   std::vector<uint32_t> after(kChunkVol);
   ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex(wc), 1, after.data(), "far-cover");
+  // The downsample sees the window, so its oracle reads the thin rule's face
+  // neighbours across the chunk's faces too: the 26 chunks round it.
+  std::vector<uint32_t> ring((size_t)27 * kChunkVol, 0u);
+  for (int i = 0; i < 27; i++) {
+    const IVec3 nc{wc.x + i % 3 - 1, wc.y + (i / 3) % 3 - 1, wc.z + i / 9 - 1};
+    if (!c.world.ChunkInWindow(nc)) continue;
+    ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex(nc), 1, ring.data() + (size_t)i * kChunkVol,
+                   "far-cover");
+  }
+  auto fullNb = [&](int x, int y, int z) -> int {
+    const int ox = x >> 4, oy = y >> 4, oz = z >> 4;
+    if (ox < -1 || ox > 1 || oy < -1 || oy > 1 || oz < -1 || oz > 1) return FarEdits::kMatAtUnseen;
+    const IVec3 nc{wc.x + ox, wc.y + oy, wc.z + oz};
+    if (!c.world.ChunkInWindow(nc)) return FarEdits::kMatAtUnseen;
+    const int i = (ox + 1) + (oy + 1) * 3 + (oz + 1) * 9;
+    return (int)(ring[(size_t)i * kChunkVol + local(x & 15, y & 15, z & 15)] & 0xFFFu);
+  };
   // P: the CPU patch.
   edits.Clear();
   edits.NoteChunk(wc, after.data());
@@ -1469,12 +1501,13 @@ Status GateFarCover(Ctx& c, std::string& detail) {
           }
           const int oa = oracle(after.data(), level, lc);
           if (oa < 0) continue;
+          const int oaD = oracleWith(after.data(), level, lc, fullNb);
           liveCells++;
           const int d = (int)armSlot(D, level, lc), p = (int)armSlot(P, level, lc);
-          if (d != oa || p != oa) {
+          if (d != oaD || p != oa) {
             if (liveBad++ == 0)
-              firstLive = Format("L%u cell (%d,%d,%d): oracle %d downsample %d patch %d", level, x,
-                                 y, z, oa, d, p);
+              firstLive = Format("L%u cell (%d,%d,%d): oracle %d (window %d) downsample %d patch %d",
+                                 level, x, y, z, oa, oaD, d, p);
           }
         }
   }
@@ -1519,6 +1552,354 @@ Status GateFarCover(Ctx& c, std::string& detail) {
                   probeD, probeP);
   for (const std::string& w : why) detail += " | FAIL: " + w;
   std::printf("far-cover: %s (%s)\n", why.empty() ? "PASS" : "FAIL", detail.c_str());
+  return why.empty() ? Status::Pass : Status::Fail;
+}
+
+// ---- far-thin -----------------------------------------------------------------
+// THE THIN RULE (worldgen.wgsl farThinPick, faredits.h ThinPick; DESIGN.md "A
+// thin feature keeps its cell"; tickets 2026-10-14_00-51-22 "fence invisible
+// at first lod seam" and 2026-10-12_16-36-34's sub-cell half). A cascade cell
+// is its centre sample, so a feature one voxel thick held a level-1 cell only
+// where its voxels sat on the centre's parity -- a rail 25 % of the time, a
+// board 50 % -- and past the 20.5 m handoff the rest of the fence was gone.
+// Two fixtures, the producers each one reaches:
+//
+//   A. A FENCE BUILT ON THE GROUND in one fine chunk of the harness window
+//      (cell ops: two rail-and-post runs on both parities, a one-voxel board,
+//      a free post, and a lone speck), then
+//        D  the DOWNSAMPLE (the ops dirty the chunk: `fardown` + fardownFeat's
+//           thin pass from the live grid), and
+//        P  the CPU PATCH (the chunk noted into FarEdits, then a refill).
+//      Over every level-1/2 cell of the chunk whose (despecked) centre is not
+//      far-solid, against the rules evaluated on the voxels read back:
+//        (a) D == the oracle that sees the window, P == the one that sees the
+//            chunk (FarEdits' blind side);
+//        (b) every level-1 cell holding two or more fixture voxels holds
+//            matter in D (the coverage the ticket is about; the centre rule's
+//            share is printed beside it);
+//        (c) the speck's cell is the oracle's (a lone voxel does not grow);
+//        (d) not vacuous: the rule fired at level 1 at least farThin.firedL1Min
+//            times and at level 2 at least once.
+//   B. HARROWBY'S FIELD (the ticket's own fence: timber rails and posts round
+//      a stamped dirt field) placed as a structure ref, then
+//        S  the SIEVE and its base patch (a full refill: the stamp is pristine
+//           procgen, so its thin cells are FarEdits::StampThin's words),
+//      over every level-1/2 cell holding a template timber voxel:
+//        (e) S agrees with the window oracle on at least farThin.stampAgreeMin
+//            of the cells either fills (the base sees the template, the pad
+//            and the ground contract; the oracle the generated voxels), and
+//            fills at least farThin.stampCoverMin of the cells the oracle does.
+Status GateFarThin(Ctx& c, std::string& detail) {
+  refs::RegisterAllKinds();
+  structures::TakeReapply();
+  std::vector<std::string> why;
+  auto check = [&](bool ok, const std::string& what) {
+    if (!ok && why.size() < 8) why.push_back(what);
+    return ok;
+  };
+  const IVec3 savedOrigin = c.world.WindowOrigin();
+  FarEdits& edits = c.stream.Edits();
+  if (!edits.ThinReady()) {
+    detail = "FarEdits has no material sources (SetGroundSource / SetCoverSource / SetLooseSource)";
+    return Status::Fail;
+  }
+  auto farSolid = [&](uint32_t m) {
+    if (m == kMatAir || m >= c.mats.size()) return false;
+    const MaterialDef& d = c.mats[m];
+    return d.gpu.klass != CLASS_GAS && (d.gpu.flags & kMatFlagMicro) == 0;
+  };
+  auto slotOf = [&](uint32_t m) { return farSolid(m) ? c.mats[m].farPalSlot : 0u; };
+  // The cascade's slot at a level cell, one level chunk read per cache miss.
+  std::map<std::tuple<uint32_t, int, int, int>, std::vector<uint8_t>> lcache;
+  auto cellSlot = [&](uint32_t level, IVec3 cc) -> uint32_t {
+    const auto key = std::make_tuple(level, cc.x >> 4, cc.y >> 4, cc.z >> 4);
+    auto it = lcache.find(key);
+    if (it == lcache.end()) {
+      auto wrapv = [](int v) { return (uint32_t)(v & (int)(kFarN - 1)); };
+      const uint32_t ch = ((wrapv(cc.z) >> 4) * kFarNChunk + (wrapv(cc.y) >> 4)) * kFarNChunk +
+                          (wrapv(cc.x) >> 4);
+      const uint64_t off = (uint64_t)(level - 1) * kFarVox + (uint64_t)ch * kChunkVol;
+      rhi::Buffer staging = CreateBuffer(c.ctx.device, kChunkVol,
+                                         rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "farThin");
+      rhi::CommandEncoder enc = c.ctx.device.CreateCommandEncoder();
+      enc.CopyBufferToBuffer(c.world.farVox, off, staging, 0, kChunkVol);
+      c.ctx.queue.Submit(enc.Finish());
+      std::vector<uint8_t> bytes(kChunkVol);
+      rhi::ReadBufferBlocking(c.ctx.device, staging, 0, bytes.data(), kChunkVol);
+      it = lcache.emplace(key, std::move(bytes)).first;
+    }
+    return FarCellSlot(it->second[((cc.z & 15) * 16 + (cc.y & 15)) * 16 + (cc.x & 15)]);
+  };
+  // The rules' answer at a level cell from voxels: -1 when the (despecked)
+  // centre is far-solid, else the slot the cover and thin rules fill it with
+  // (0 = empty). `matAt` takes world coordinates.
+  auto expect = [&](uint32_t level, IVec3 cc, const auto& matAt) -> int {
+    const int shift = (int)(level + kFarShiftBase), step = 1 << shift, half = step >> 1;
+    const int c0[3] = {cc.x * step, cc.y * step, cc.z * step};
+    const int cm = matAt(c0[0] + half, c0[1] + half, c0[2] + half);
+    if (cm < 0) return -1;
+    const uint32_t centre = edits.Despeck((uint32_t)cm, c0[0] + half, c0[1] + half, c0[2] + half, matAt);
+    if (farSolid(centre)) return -1;
+    uint32_t pick = edits.CoverPick(centre, level, half, c0, [&](int x, int y, int z) {
+      const int m = matAt(x, y, z);
+      return m < 0 ? 0u : (uint32_t)m;
+    });
+    if (pick == centre && shift <= FarEdits::kThinMaxShift) pick = edits.ThinPick(centre, half, c0, matAt);
+    return pick == centre ? 0 : (int)slotOf(pick);
+  };
+
+  // ==== A. the fence on the ground ===============================================
+  c.world.SetWindowOrigin({0, 0, 0});
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  edits.Clear();
+  const uint32_t mTimber = MatId(c.mats, "timber"), mPlank = MatId(c.mats, "plank"),
+                 mIron = MatId(c.mats, "iron"), mCloth = MatId(c.mats, "cloth");
+  if (!mTimber || !mPlank || !mIron || !mCloth) {
+    Restore(c, savedOrigin);
+    detail = "a fixture material is missing (timber, plank, iron, cloth)";
+    return Status::Fail;
+  }
+  // A chunk whose every column's ground top lies at chunk-local y -1..5 (-1:
+  // the top voxel of the chunk below) with nothing far-solid over it in the
+  // chunk: open, nearly flat ground with room for a fence. The procgen ground
+  // contract picks the candidates; the live voxels decide.
+  IVec3 wc{-1, -1, -1};
+  int ground[16][16] = {};
+  {
+    BoxRead rd{{}, &c.ctx, &c.world};
+    int tried = 0;
+    for (int cz = 2; cz < (int)kNChunk - 2 && wc.x < 0 && tried < 24; cz++)
+      for (int cx = 2; cx < (int)kNChunk - 2 && wc.x < 0 && tried < 24; cx++) {
+        int hmin = INT32_MAX, hmax = INT32_MIN;
+        for (int z = 0; z < 16; z++)
+          for (int x = 0; x < 16; x++) {
+            const int h = World::TerrainHeight(cx * 16 + x, cz * 16 + z, kDefaultSeed);
+            hmin = std::min(hmin, h);
+            hmax = std::max(hmax, h);
+          }
+        const int cy = (hmin + 1) >> 4;
+        if (hmax - cy * 16 > 5 || hmin - cy * 16 < -1 || cy < 1 || cy >= (int)kNChunk - 1) continue;
+        tried++;
+        bool ok = true;
+        for (int z = 0; z < 16 && ok; z++)
+          for (int x = 0; x < 16 && ok; x++) {
+            int top = -2;
+            for (int y = 15; y >= -1; y--)
+              if (farSolid(rd.Mat({cx * 16 + x, cy * 16 + y, cz * 16 + z}))) {
+                top = y;
+                break;
+              }
+            if (top < -1 || top > 5) ok = false;
+            ground[x][z] = top;
+          }
+        if (ok) wc = {cx, cy, cz};
+      }
+  }
+  if (wc.x < 0) {
+    Restore(c, savedOrigin);
+    detail = "no open, flat chunk in the harness window to build the fence on";
+    return Status::Fail;
+  }
+  const IVec3 cb{wc.x * 16, wc.y * 16, wc.z * 16};
+  std::vector<CellOp> ops;
+  std::set<std::tuple<int, int, int>> fixture;   // the fence's voxels (not the speck)
+  auto put = [&](int x, int y, int z, uint32_t m, bool feature) {
+    ops.push_back(CellOp{World::SlotCellIndex({cb.x + x, cb.y + y, cb.z + z}), m});
+    if (feature) fixture.insert({cb.x + x, cb.y + y, cb.z + z});
+  };
+  // Two runs of fence along x (z = 3 odd, z = 8 even): posts at x = 1 and 14
+  // from the ground to y 13, rails between them at y 8 / 11 and 9 / 12 --
+  // every (y, z) parity of a level-1 cell.
+  const int runZ[2] = {3, 8};
+  const int railY[2][2] = {{8, 11}, {9, 12}};
+  for (int r = 0; r < 2; r++) {
+    const int z = runZ[r];
+    for (int px : {1, 14})
+      for (int y = ground[px][z] + 1; y <= 13; y++) put(px, y, z, mTimber, true);
+    for (int ry : railY[r])
+      for (int x = 2; x <= 13; x++) put(x, ry, z, mTimber, true);
+  }
+  // A board standing on the ground (one voxel thick in z, at z 12) and a free
+  // iron post (x 10, z 5; x even, z odd) to y 9.
+  for (int x = 4; x <= 11; x++)
+    for (int y = ground[x][12] + 1; y <= 7; y++) put(x, y, 12, mPlank, true);
+  for (int y = ground[10][5] + 1; y <= 9; y++) put(10, y, 5, mIron, true);
+  // A lone speck of cloth on the ground (x 6, z 5).
+  const IVec3 speck{cb.x + 6, cb.y + ground[6][5] + 1, cb.z + 5};
+  put(6, ground[6][5] + 1, 5, mCloth, false);
+  // DIRECT PHASE CALLS ON PURPOSE (W2-O): as far-contain / far-cover, this
+  // gate tests the far producers, not the tick; the ops through a bare
+  // SubmitTick dirty the chunk, which is exactly what runs `fardown` and its
+  // thin pass over it.
+  for (uint32_t t = 1; t <= 3; t++) {
+    std::vector<CellOp> tops;
+    if (t == 1) tops = ops;
+    SubmitTick(c.ctx, c.world, c.sim, t, kDefaultSeed, {}, {}, tops, false, wc, false, false);
+  }
+  c.ctx.WaitIdle();
+  lcache.clear();
+  BoxRead live{{}, &c.ctx, &c.world};
+  int stood = 0;
+  for (const auto& [x, y, z] : fixture) stood += live.Mat({x, y, z}) != kMatAir ? 1 : 0;
+  check(stood == (int)fixture.size(),
+        Format("the fence did not stand: %d of %zu voxels are there after the ticks", stood, fixture.size()));
+  auto windowAt = [&](int x, int y, int z) -> int {
+    const uint32_t w = live.Word({x, y, z});
+    return w == 0xFFFFFFFFu ? FarEdits::kMatAtUnseen : (int)(w & 0xFFFu);
+  };
+  auto chunkAt = [&](int x, int y, int z) -> int {
+    if ((x >> 4) != wc.x || (y >> 4) != wc.y || (z >> 4) != wc.z) return FarEdits::kMatAtUnseen;
+    return windowAt(x, y, z);
+  };
+  struct ACell {
+    uint32_t level;
+    IVec3 cc;
+    int wantD, wantP;
+    uint32_t d;
+  };
+  std::vector<ACell> acells;
+  for (uint32_t level = 1; level <= 2; level++) {
+    const int shift = (int)(level + kFarShiftBase), n = 16 >> shift;
+    for (int z = 0; z < n; z++)
+      for (int y = 0; y < n; y++)
+        for (int x = 0; x < n; x++) {
+          const IVec3 cc{(cb.x >> shift) + x, (cb.y >> shift) + y, (cb.z >> shift) + z};
+          acells.push_back({level, cc, expect(level, cc, windowAt), expect(level, cc, chunkAt),
+                            cellSlot(level, cc)});
+        }
+  }
+  // P: the CPU patch.
+  {
+    std::vector<uint32_t> words(kChunkVol);
+    ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex(wc), 1, words.data(), "farThin");
+    edits.NoteChunk(wc, words.data());
+  }
+  DrainFullRefill(c.ctx, c.world, c.sim, wc);
+  lcache.clear();
+  int badD = 0, badP = 0, firedA[3] = {0, 0, 0}, covered = 0, featureCells = 0, centreCovered = 0;
+  std::string firstD, firstP;
+  for (const ACell& a : acells) {
+    const uint32_t p = cellSlot(a.level, a.cc);
+    if (a.wantD >= 0 && (int)a.d != a.wantD && badD++ == 0)
+      firstD = Format("L%u cell (%d,%d,%d): oracle %d downsample %u", a.level, a.cc.x, a.cc.y, a.cc.z, a.wantD, a.d);
+    if (a.wantP >= 0 && (int)p != a.wantP && badP++ == 0)
+      firstP = Format("L%u cell (%d,%d,%d): oracle %d patch %u", a.level, a.cc.x, a.cc.y, a.cc.z, a.wantP, p);
+    if (a.wantD > 0) firedA[a.level]++;
+    if (a.level != 1) continue;
+    int held = 0;
+    for (int o = 0; o < 8; o++)
+      held += fixture.count({a.cc.x * 2 + (o & 1), a.cc.y * 2 + ((o >> 1) & 1), a.cc.z * 2 + ((o >> 2) & 1)}) ? 1 : 0;
+    if (held < 2) continue;
+    featureCells++;
+    covered += a.d != 0 ? 1 : 0;
+    centreCovered += a.wantD < 0 ? 1 : 0;
+  }
+  edits.Clear();
+  const int speckCell = [&]() {
+    for (const ACell& a : acells)
+      if (a.level == 1 && a.cc.x == (speck.x >> 1) && a.cc.y == (speck.y >> 1) && a.cc.z == (speck.z >> 1))
+        return (int)a.d;
+    return -1;
+  }();
+  const int speckWant = expect(1, {speck.x >> 1, speck.y >> 1, speck.z >> 1}, windowAt);
+  check(badD == 0, Format("%d cells: the downsample is not the rule over the live grid; first %s", badD, firstD.c_str()));
+  check(badP == 0, Format("%d cells: the CPU patch is not the rule over the chunk; first %s", badP, firstP.c_str()));
+  check(featureCells > 0 && covered == featureCells,
+        Format("coverage: %d of %d level-1 cells holding two or more fence voxels hold matter", covered, featureCells));
+  check(speckCell >= 0 && (speckWant < 0 || speckCell == speckWant) && speckCell != (int)slotOf(mCloth),
+        Format("the lone cloth speck's cell reads slot %d (oracle %d): a speck grew", speckCell, speckWant));
+  check(firedA[1] >= (int)BaselineNumber("farThin.firedL1Min", 16) && firedA[2] > 0,
+        Format("vacuous: the rule fired at L1 %d, L2 %d times", firedA[1], firedA[2]));
+  const std::string aLine =
+      Format("A fence in chunk (%d,%d,%d): %zu voxels, %d stood | fired L1 %d L2 %d | D/P vs oracle %d/%d bad of %zu | "
+             "L1 fence cells %d: centre rule %.2f, now %.2f | speck cell %d (oracle %d)",
+             wc.x, wc.y, wc.z, fixture.size(), stood, firedA[1], firedA[2], badD, badP, acells.size(), featureCells,
+             featureCells ? (double)centreCovered / featureCells : 0.0, featureCells ? (double)covered / featureCells : 0.0,
+             speckCell, speckWant);
+
+  // ==== B. Harrowby's field (the ticket's fence) as a stamp ========================
+  const char* kBase = "harrowby_field";
+  structures::Asset asset;
+  {
+    std::string err;
+    std::vector<std::string> w;
+    if (!structures::LoadAsset(AssetDir(), kBase, true, asset, err, w)) {
+      Restore(c, savedOrigin);
+      detail = aLine + " | cannot load " + std::string(kBase) + ": " + err;
+      return Status::Fail;
+    }
+  }
+  worldmap::StructurePlacement p;
+  p.id = "gate/thin_field";
+  p.base = kBase;
+  p.file = "refs/gate.json";
+  p.x = 256;
+  p.z = 256;
+  p.y = World::TerrainHeight(p.x, p.z, kDefaultSeed) + 1;
+  p.yaw = 0;
+  const structures::Frame frame = structures::MakeFrame(asset, {p.x, p.y, p.z}, 0);
+  std::set<std::tuple<uint32_t, int, int, int>> fieldCells;
+  for (const PrefabVoxel& v : asset.prefab.models[0].voxels) {
+    if (v.material != mTimber) continue;
+    const IVec3 w = frame.Cell({v.x, v.y, v.z});
+    for (uint32_t level = 1; level <= 2; level++) {
+      const int shift = (int)(level + kFarShiftBase);
+      fieldCells.insert({level, w.x >> shift, w.y >> shift, w.z >> shift});
+    }
+  }
+  std::vector<worldmap::StructurePlacement> list{p};
+  std::string log;
+  if (!Install(c, &list, log)) {
+    Restore(c, savedOrigin);
+    detail = aLine + " | ReloadEnvironment refused: " + log;
+    return Status::Fail;
+  }
+  edits.Clear();
+  DrainFullRefill(c.ctx, c.world, c.sim, IVec3{p.x >> 4, p.y >> 4, p.z >> 4});
+  lcache.clear();
+  BoxRead fieldRd{{}, &c.ctx, &c.world};
+  auto fieldAt = [&](int x, int y, int z) -> int {
+    const uint32_t w = fieldRd.Word({x, y, z});
+    return w == 0xFFFFFFFFu ? FarEdits::kMatAtUnseen : (int)(w & 0xFFFu);
+  };
+  int sBoth = 0, sAgree = 0, oFills = 0, sFills = 0, centreHeld = 0;
+  std::string firstS;
+  for (const auto& [level, x, y, z] : fieldCells) {
+    const IVec3 cc{x, y, z};
+    const int want = expect(level, cc, fieldAt);
+    if (want < 0) {
+      centreHeld++;
+      continue;
+    }
+    const int s = (int)cellSlot(level, cc);
+    if (want > 0) {
+      oFills++;
+      sFills += s == want ? 1 : 0;
+    }
+    if (want > 0 || s > 0) {
+      sBoth++;
+      if (s == want) sAgree++;
+      else if (firstS.empty())
+        firstS = Format("L%u cell (%d,%d,%d): oracle %d sieve %d", level, x, y, z, want, s);
+    }
+  }
+  const size_t stampWords = edits.StampThinWords();
+  const double agree = sBoth ? (double)sAgree / sBoth : 0.0, cover = oFills ? (double)sFills / oFills : 0.0;
+  check(stampWords > 0 && oFills > 0, Format("vacuous: %zu stamp thin words, %d oracle fills over the field's timber",
+                                             stampWords, oFills));
+  check(agree >= BaselineNumber("farThin.stampAgreeMin", 0.95),
+        Format("the sieve agrees with the oracle on %.3f of %d field cells; first %s", agree, sBoth, firstS.c_str()));
+  check(cover >= BaselineNumber("farThin.stampCoverMin", 0.95),
+        Format("the sieve fills %d of the %d field cells the rule fills (%.3f)", sFills, oFills, cover));
+  RecordObserved("farThin.stampAgree", agree);
+  RecordObserved("farThin.stampCover", cover);
+  Restore(c, savedOrigin);
+  detail = aLine + Format(" | B field: %zu timber cells, %d keep a timber centre; the rule fills %d, the sieve %d "
+                          "(cover %.3f), agree %.3f of %d; %zu stamp thin words",
+                          fieldCells.size(), centreHeld, oFills, sFills, cover, agree, sBoth, stampWords);
+  for (const std::string& w : why) detail += " | FAIL: " + w;
+  std::printf("far-thin: %s (%s)\n", why.empty() ? "PASS" : "FAIL", detail.c_str());
   return why.empty() ? Status::Pass : Status::Fail;
 }
 
@@ -2087,6 +2468,7 @@ const std::vector<Gate>& StructureGates() {
       {"structure-door", "world", {}, false, GateStructureDoor, /*needsRender=*/false},
       {"far-contain", "render", {}, false, GateFarContain, /*needsRender=*/false},
       {"far-cover", "render", {}, false, GateFarCover, /*needsRender=*/false},
+      {"far-thin", "render", {}, false, GateFarThin, /*needsRender=*/false},
       // Draws: the same pixels near and far, four skies (ticket 2026-10-09_14-23-01).
       {"lod-seam", "render", {}, false, GateLodSeam, /*needsRender=*/true},
   };
