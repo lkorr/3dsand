@@ -3246,6 +3246,10 @@ class Mob {
   // as rods to the hand (game/arrows.h PresentDrawnBow). Ignored on a carved
   // slot, whose own brick is the only one that shows the damage.
   void SetHeldRenderModel(Hand h, int model) { held_[HandIndex(h)].renderModel = model; }
+  // The gait's side-to-side pelvis SWAY and ROLL, scaled (1 = as authored;
+  // the bob is untouched). A drawn bow steadies the walk (ItemDef BowSpec
+  // drawSwayScale, set by the player's tick).
+  void SetGaitSwayScale(float k) { gaitSwayScale_ = k; }
   // The held item's body transform as drawn (limb xf + the render offset);
   // false with no live held slot. Its frame is the item's body frame (ItemDef
   // ArrowSpec::tip's, BowStringArt's).
@@ -6113,6 +6117,7 @@ class Mob {
   HeldHand held_[kHands];
   bool castBusy_ = false;   // SetCastBusy
   bool bowDraw_ = false;    // SetBowDraw
+  float gaitSwayScale_ = 1.0f;   // SetGaitSwayScale
   float bowAimPitch_ = 0.0f;
   // The shield's raise (Mob::StepShield, game/mob_shield.cpp).
   float shieldRaise_ = 0.0f;
