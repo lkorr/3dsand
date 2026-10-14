@@ -244,7 +244,16 @@ void Overlay::DrawHUD(const UIState& s) {
   // instead: above its hand captions, still at the left edge.
   const float stripHalf =
       0.5f * ((float)s.hotbarSlots.size() * 48.0f - 4.0f) + 18.0f + 44.0f + 6.0f;
-  const float barsRight = x + w + (s.strikeCompass ? 14.0f + 116.0f : 0.0f);
+  // The bow tab (below) sits right of the bars too, beside or atop the compass.
+  const float bowPx = 2.0f;                 // the bow's pixel
+  const float bowGlyphW = 13 * bowPx;       // string pulled 6 + stave bow 4 + head 3
+  char bowCount[16];
+  std::snprintf(bowCount, sizeof bowCount, "x%d", std::max(0, s.arrowsLeft));
+  const ImVec2 bowCs = ImGui::CalcTextSize(bowCount);
+  const float bowInner = bowGlyphW + 8.0f + bowCs.x;
+  const float barsRight =
+      x + w + std::max(s.strikeCompass ? 14.0f + 116.0f : 0.0f,
+                       s.bowDraw >= 0.0f ? 14.0f + 6.0f + bowInner + 6.0f : 0.0f);
   const bool overStrip =
       !s.hotbarSlots.empty() && barsRight + 12.0f > disp.x * 0.5f - stripHalf;
   // 14 + 44 = the strip's bottom margin and slot; 30 = its backing and the
@@ -719,7 +728,7 @@ void Overlay::DrawHUD(const UIState& s) {
     }
     py += ph + 14.0f;
   }
-  // ---- the bow: a pixel bow under the crosshair whose string comes back ----
+  // ---- the bow: a pixel bow right of the bars whose string comes back ------
   //
   // With a bow in either hand (UIState::bowDraw >= 0; game/arrows.h): a
   // braced bow drawn on the 2 px grid, 15 blocks tall, the stave bowing to
@@ -729,22 +738,26 @@ void Overlay::DrawHUD(const UIState& s) {
   // FULL draw it holds still and the arrow's head goes ember -- the one state
   // to catch without reading anything. No arrows: the count is cinnabar and
   // there is no arrow on the string.
+  //
+  // Bottom-left, NOT under the crosshair: the centre of the screen is where
+  // you aim. The tab stands beside the bars, bottom-aligned with the mp bar,
+  // or on top of the strike compass when a melee hand puts that there.
   if (s.bowDraw >= 0.0f) {
-    const float b = 2.0f;                   // the pixel
+    const float b = bowPx;
     const int rows = 15, mid = 7;
     const float draw = std::clamp(s.bowDraw, 0.0f, 1.0f);
     const bool full = draw >= 0.999f;
     const bool nocked = s.arrowsLeft > 0;
     const int pull = (int)std::lround(draw * 6.0f);   // blocks the string comes back
-    char count[16];
-    std::snprintf(count, sizeof count, "x%d", std::max(0, s.arrowsLeft));
-    const ImVec2 cs = ImGui::CalcTextSize(count);
-    const float glyphW = 13 * b;            // string pulled 6 + stave bow 4 + head 3
+    const char* count = bowCount;
+    const ImVec2 cs = bowCs;
+    const float glyphW = bowGlyphW;
     const float barW = 13 * b, barH = 4.0f;
-    const float inner = glyphW + 8.0f + cs.x;
-    const float x0 = std::floor((disp.x - inner) * 0.5f);
-    const float y0 = py;
+    const float inner = bowInner;
     const float tabH = rows * b + 4.0f + barH;
+    const float x0 = std::floor(x + w + 14.0f + 6.0f);
+    const float bottom = s.strikeCompass ? yMana + h - 116.0f - 2.0f - 8.0f : yMana + h;
+    const float y0 = std::floor(bottom - 4.0f - tabH);
     d->AddRectFilled(ImVec2(x0 - 6, y0 - 4), ImVec2(x0 + inner + 6, y0 + tabH + 4),
                      IM_COL32(0, 0, 0, 170));
     d->AddRect(ImVec2(x0 - 6, y0 - 4), ImVec2(x0 + inner + 6, y0 + tabH + 4),
@@ -785,7 +798,6 @@ void Overlay::DrawHUD(const UIState& s) {
     const float ty = y0 + std::floor((rows * b - cs.y) * 0.5f);
     d->AddText(ImVec2(tx + 1, ty + 1), IM_COL32(0, 0, 0, 190), count);
     d->AddText(ImVec2(tx, ty), nocked ? ui::ColGoldPale() : ui::ColBloodHi(), count);
-    py += tabH + 12.0f;
   }
   // APPLY MODE (TB_APPLY): say it is on, and whose skin LMB would brush.
   if (s.applyShown) {

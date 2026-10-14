@@ -8753,8 +8753,8 @@ int main(int argc, char** argv) {
       if (home >= 0)
         kit.equip.slots[home] = StackOf(items, i);
       else if (ItemKindIsWorn(it.kind) || it.kind == ItemKind::Ammo ||
-               it.kind == ItemKind::Shield)
-        kit.bag.Add(st);        // armour, the arrows, spare shields: the pack
+               it.kind == ItemKind::Shield || it.kind == ItemKind::Key)
+        kit.bag.Add(st);        // armour, the arrows, spare shields, keys: the pack
       else
         hotbar.Add(st);
     }

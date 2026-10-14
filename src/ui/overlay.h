@@ -1799,7 +1799,7 @@ struct UIState {
   // fraction that scales the arrow's speed; 0 = in hand, not drawn) and the
   // arrows left in the kit; -1 / -1 with no bow in either hand. `bowMinDraw`
   // is where a release starts to loose at all. Written by the tick; the HUD
-  // draws a pixel bow under the crosshair whose string comes back with it.
+  // draws a pixel bow bottom-left, right of the bars, whose string comes back.
   float bowDraw = -1.0f;
   float bowMinDraw = 0.0f;
   int arrowsLeft = -1;
