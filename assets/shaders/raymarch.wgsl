@@ -14764,6 +14764,74 @@ fn farFootprintFade(voxPx : f32, full : f32, start : f32) -> f32 {
 // flattened every distant hill. Only an element under ~2 px is averaged.
 const FAR_FP_STAIR_FULL : f32 = 1.0;    // px per element: fully averaged
 const FAR_FP_STAIR_START : f32 = 2.5;   // px per element: untouched
+// ---- THE MOLTEN SPILL ON CASCADE CELLS ----
+// In the window a lava pool lights its own rim through the irradiance grid
+// (irrSample: emitters deposit, the gather reads). The cascade has no grid,
+// so past the seam the rim rock went dark at the handoff while the pool
+// itself glowed (ticket 2026-10-13_21-00-23 follow-up). The cascade's
+// stand-in: the five cells under and beside the AIR cell in front of the hit
+// face (`a`, = far.cell + the face normal), at the hit's own level -- for a
+// riser facing a pool that is the pool surface in front of it, for a rim
+// tread the pool cells beside it. A molten one (isMoltenMat) adds its ramp's
+// mid colour x emission, the centre tap counting double. Five byte reads per
+// far ground pixel; the material row is read only for a non-air tap.
+// Reaches one far cell (0.4 m at level 1, 3.2 m at level 4), which is about
+// the irradiance grid's reach at the seam and grows with the cells, as the
+// pool's light on a distant hillside should. Strength is per unit albedo,
+// tuned against the near rim at the seam at night.
+const FAR_MOLTEN_SPILL : f32 = 0.8;
+fn farMoltenSpill(level : u32, a : vec3<i32>) -> vec3f {
+  let b = farBox(level);
+  var acc = vec3f(0.0);
+  for (var k = 0; k < 5; k++) {
+    let o = select(select(select(select(vec3<i32>(0, -1, 0), vec3<i32>(1, -1, 0), k == 1),
+                                 vec3<i32>(-1, -1, 0), k == 2),
+                          vec3<i32>(0, -1, 1), k == 3),
+                   vec3<i32>(0, -1, -1), k == 4);
+    let c = a + o;
+    if (!farInValid(c, b)) { continue; }
+    let slot = farPalAt(level, c);
+    if (slot == 0u) { continue; }
+    let mm = materials[farPalMat(&materials, slot)];
+    if (!isMoltenMat(mm)) { continue; }
+    acc += moltenRamp(mm, 0.62) * (f32(mm.emission) / 255.0) * select(1.0, 2.0, k == 0);
+  }
+  return acc * (FAR_MOLTEN_SPILL / 6.0);
+}
+
+// ---- THE TERRACES ARE LIT AS THE HILL, PAST THE HANDOFF ----
+// (ticket 2026-10-13_21-00-54, "weird outline shit ... around the hills".)
+// The element fade above leaves a cascade staircase lit face by face for as
+// long as its cells are ~2.5 px or more -- and by the kFarN law they stay
+// 3-8 px at EVERY level, so in practice always. But a level-L terrace is 2^L
+// fine voxels tall: the near field's one-voxel steps, at 8-32x the height.
+// Lit by its cube normal, every tread got the sky and every riser the face
+// weight and the horizon half of the ambient, and under an overcast (where
+// nothing else shades a hill) a distant slope read as stacked contour
+// stripes. So the LIGHTING -- Lambert, face weight and the shading normal
+// the ambient / openness / bounce / wetness read -- takes the heightfield's
+// smooth normal (farSurfAt's gradient) over a distance ramp from the handoff
+// (where it is exactly the cube shade, so the seam cannot step) to
+// FAR_TERRACE_LIGHT_TO x the handoff. The ALBEDO takes the staircase average
+// (smoothAlb: skin and sub-skin in the tread/riser shares this view sees) on
+// the same ramp -- measured at the ticket camera, lighting alone moved the
+// stripes by ~2/255: in the ashlands they are mostly ALBEDO (pale tephra
+// treads over black basalt risers), and a level-L staircase draws the same
+// riser area as the near field's in 2^L-times-fewer, 2^L-times-taller bands.
+// The geometry (AO taps, shadow start) keeps the face normal, and only
+// heightfield hits (fSurf) have a map to average -- a boulder or a trunk
+// keeps its cubes.
+// The 2026-10 note above ("averaging the LIGHTING by the fine voxel's size
+// flattened every distant hill") was a smooth normal without a slope; this
+// one carries the slope, so a hill keeps its sun side and its shade side and
+// loses only the tread/riser alternation.
+const FAR_TERRACE_LIGHT_FROM : f32 = 1.0;   // x handoff: cube shade at and inside
+const FAR_TERRACE_LIGHT_TO : f32 = 3.0;     // x handoff: fully the smooth normal
+fn farTerraceLightW(tFine : f32) -> f32 {
+  let h = min(SEAM_HANDOFF, WINDOW_HALF_EXTENT_METERS);
+  return smoothstep(h * FAR_TERRACE_LIGHT_FROM, h * FAR_TERRACE_LIGHT_TO,
+                    tFine * VOXEL_METERS);
+}
 const FAR_FP_JITTER_FULL : f32 = 1.0;
 const FAR_FP_JITTER_START : f32 = 2.0;
 fn paletteMean(m : Material) -> vec3f {
@@ -16009,6 +16077,11 @@ fn fs(in : VSOut) -> FSOut {
       //    band's near-grid lookup).
       let elemPx = voxPx * select(sL, 0.5 * sL, fRefined);
       let wN = farFootprintFade(elemPx, FAR_FP_STAIR_FULL, FAR_FP_STAIR_START);
+      // wL: the staircase's LIGHTING goes smooth past the handoff even where
+      // its cells are still several px wide (farTerraceLightW). wLit is the
+      // weight every lighting term below takes; wN still owns the albedo.
+      let wL = farTerraceLightW(far.t);
+      let wLit = max(wN, wL);
       var nSh = n;
       var lamSm = -1.0;
       var faceSm = 1.0;
@@ -16020,7 +16093,7 @@ fn fs(in : VSOut) -> FSOut {
       var fSurf = false;
       var groundY = -1e9;   // the column's heightfield top (fine voxels), if mapped
       if (m.klass != CLASS_LIQUID && !fFeat) {
-        let fs2 = farSurfAt(flv, hitP, wN > 0.0);
+        let fs2 = farSurfAt(flv, hitP, wLit > 0.0);
         if (fs2.ok) {
           groundY = f32(farMapTop(fs2.e) + 1);
           let skinM = farPalMat(&materials, (fs2.e >> 16u) & 0x7Fu);
@@ -16046,11 +16119,11 @@ fn fs(in : VSOut) -> FSOut {
               skinA = mix(skinA, cc, cw);
               if (n.y > 0.5) { albedo = mix(albedo, cc, cw); }
             }
-            if (wN > 0.0 && fs2.gok) {
+            if (wLit > 0.0 && fs2.gok) {
               let nS = normalize(vec3f(-fs2.g.x, 1.0, -fs2.g.y));
               lamSm = wrapDiffuse(dot(nS, keyLightDir()), TUNE_DIFFUSE_WRAP);
               faceSm = nS.y * nS.y + nS.x * nS.x * TUNE_FACE_X + nS.z * nS.z * TUNE_FACE_Z;
-              nSh = normalize(mix(n, nS, wN));
+              nSh = normalize(mix(n, nS, wLit));
               let riserA = mix(skinA, paletteMean(materials[subM]),
                                1.0 - 1.0 / max(1.0, max(abs(fs2.g.x), abs(fs2.g.y))));
               smoothAlb = mix(skinA, riserA, farRiserShare(fs2.g, rd));
@@ -16081,12 +16154,12 @@ fn fs(in : VSOut) -> FSOut {
         // The near micro rule: keyed on the world normal.
         face = select(select(1.0, TUNE_FACE_Z, abs(n.z) > 0.5), TUNE_FACE_X, abs(n.x) > 0.5);
       }
-      if (lamSm >= 0.0) { face = mix(face, faceSm, wN); }
+      if (lamSm >= 0.0) { face = mix(face, faceSm, wLit); }
       // Same lattice as the near field's surfaceGrain(h.cell, ...) — see the
       // fine-voxel note above. TUNE_GRAIN_AMP_FAR ships equal to TUNE_GRAIN_AMP
       // now that the pattern matches; it stays a knob so the far field can be
       // calmed independently if a coarser cascade ever needs it.
-      if (smoothAlb.x >= 0.0) { albedo = mix(albedo, smoothAlb, wN); }
+      if (smoothAlb.x >= 0.0) { albedo = mix(albedo, smoothAlb, wLit); }
       albedo *= surfaceGrainFp(fineV, TUNE_GRAIN_AMP_FAR, voxPx);
       // THE FAR CANOPY RULE's shade (CANOPY_SHADE): crown matter from level 5
       // out is a canopy mass full of its own shadow, as the horizon paints it.
@@ -16189,7 +16262,7 @@ fn fs(in : VSOut) -> FSOut {
       // visible brightness step at the window seam.
       var lambert = select(wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP),
                            0.0, farWater);
-      if (lamSm >= 0.0 && !farWater) { lambert = mix(lambert, lamSm, wN); }
+      if (lamSm >= 0.0 && !farWater) { lambert = mix(lambert, lamSm, wLit); }
       let dbgLamPreF = lambert;
       var dbgShF = 1.0;
       // A FACE THAT SEES NO SKY GETS NO SUN: shadowLiftCap(v, 0) is exactly 0
@@ -16316,6 +16389,9 @@ fn fs(in : VSOut) -> FSOut {
         let uvL = vec2f(fract(axisPick(hitP, a1) / sL), fract(axisPick(hitP, a2) / sL));
         ao = farVoxelAO(flv, far.cell, ni, a1, a2, uvL);
       }
+      // A heightfield hit lit as the smooth hill (wL) has no tread/riser
+      // crease to darken either: the crease AO eases out on the same ramp.
+      if (fSurf) { ao = mix(ao, 1.0, wL); }
       // The occupied-cell-above term stays on top: it is what darkens the
       // ground under a flattened canopy at levels >= 5, where the crown is
       // painted onto the surface cell and nothing sits above it to occlude.
@@ -16371,6 +16447,10 @@ fn fs(in : VSOut) -> FSOut {
           }
         }
         color += dbgGiF;
+      }
+      // ---- THE POOL LIGHTS ITS RIM PAST THE SEAM TOO (farMoltenSpill) ----
+      if (FAR_MOLTEN_SPILL > 0.0 && !fFeat && m.klass != CLASS_LIQUID) {
+        color += ao * albedo * farMoltenSpill(flv, far.cell + ni);
       }
       if (SEAM_DBG != 0u) {
         dbgRec(true, far.mat, far.t, albedo, dbgShF, ao, openF, dbgLamPreF, lambert, color, dbgGiF, face);
