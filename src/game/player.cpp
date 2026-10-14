@@ -1517,6 +1517,10 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     vel.y = std::clamp(vel.y, -vmax, vmax);
 
     const Vec3 velBeforeSweep = vel;
+    // Where the body was before this frame's fall: the ledge latch below
+    // sweeps the hands over [yBeforeMove, pos.y], so a fast fall cannot step
+    // over the one frame where they were level with the lip.
+    const float yBeforeMove = pos.y;
 
     // ---- vertical move ----
     // A held descent still moves as far as the mirror vouches for (see
@@ -1624,8 +1628,20 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
         if (LedgeGrabAhead(pos, dir, b, kindAt, &hit)) {
           ledgeInReach = true;
           ledgeLip = hit.lip;
+          // THE HANDS MUST MEET THE LIP. The probe window reaches up to the
+          // fingertips so the HUD can say "a lip is up there", but a catch
+          // only latches once the body is at (or has fallen past) the dead-hang
+          // height for it, give or take ledgeGrabSlack. Without this a lip
+          // caught at full reach hauled the body up to the anchor by the
+          // settle -- up to ~0.9 m of rise from nothing, which read as a
+          // teleport (owner 2026-10-14: "too far below it, it should just
+          // fail and you fall"). Above the anchor is fine: the hands caught
+          // it on the way down and the settle lowers the body into the hang.
+          const float slack = T().ledgeGrabSlack / kVoxelMeters;
+          const bool handsMet =
+              hit.anchor.y <= std::max(pos.y, yBeforeMove) + slack;
           if (!grounded && !inLiquid && in.Held(TB_JUMP) && !in.Held(TB_CROUCH) &&
-              vel.y <= nonJumpSpeed) {
+              vel.y <= nonJumpSpeed && handsMet) {
             hanging = true;
             ledgeGrabbed = true;
             hangTime = 0.0f;

@@ -236,6 +236,11 @@ struct Tuning {
     // deeper drop; raise this and the hands stay planted as far as the
     // shrug allows.
     float ledgeHangDrop = TPD(player, ledgeHangDrop);
+    // How far BELOW its dead-hang height the body may be and still catch a
+    // lip (meters). A catch latches only when the hands have actually met the
+    // lip: a body still lower than that (a jump that fell short) is refused
+    // and keeps falling instead of being hauled up into the hang. 0 = exact.
+    float ledgeGrabSlack = TPD(player, ledgeGrabSlack);
     // Upward velocity of the ARM BOOST — the pull-up used when there is no
     // room to stand on the lip (a rough wall's one-voxel ledge): ballistic,
     // so the next lip up can catch near the apex and the climb chains.

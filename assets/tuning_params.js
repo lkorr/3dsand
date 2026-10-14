@@ -487,6 +487,7 @@ const TUNING_PARAMS = {
   'player.waterMantleTime':{t:'f',def:0.9,min:0.1,max:3},
   'player.ledgeReach':{t:'f',def:0.75,min:0,max:1.5},
   'player.ledgeHangDrop':{t:'f',def:-0.15,min:-0.5,max:1},
+  'player.ledgeGrabSlack':{t:'f',def:0.15,min:0,max:1},
   'player.ledgeBoostSpeed':{t:'f',def:5.25,min:0,max:15},
   'player.ledgeMantleSpeed':{t:'f',def:1.5,min:0.1,max:20},
   'player.ledgeMantleTime':{t:'f',def:2.8,min:0.1,max:3},
