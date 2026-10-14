@@ -483,7 +483,9 @@ void World::Init(const rhi::Device& device) {
   // safe state: the renderer refines nothing it was not told about.
   // + the FEATURE plane after it (sim/farfeat.h, LOD-seam package F): the
   // levels 1..kFarFeatLevels thin-feature words, zero = no feature.
-  farMap = CreateBuffer(device, (kFarMapWords + kFarFeatWords) * 4,
+  // + the STRATA plane after that (sim/farfeat.h): every level, zero = no
+  // strata (the sub-skin paints the whole riser, the rule before it).
+  farMap = CreateBuffer(device, (kFarMapWords + kFarFeatWords + kFarStrataWords) * 4,
                         U::Storage | U::CopySrc, "farMap");
 
   for (auto& s : slots_) {

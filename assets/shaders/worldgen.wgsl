@@ -8674,6 +8674,29 @@ fn farFeatSlot(mat : u32) -> u32 {
 // fields are seven bits, the cell byte's eight. Only worldgen packs them.
 const FAR_MAP_SLOT_MAX : u32 = 0x7Fu;
 
+// ---- THE STRATA PLANE (2026-10-14) ------------------------------------------
+// What a sub-column holds UNDER its top voxel, for the risers the refine and
+// the staircase average draw (raymarch.wgsl farStrataSlot). The entry's
+// sub-skin used to paint a riser's whole height: a mesa wall -- each column
+// step four voxels of red_sandstone (steep rock) over stone -- was half grey
+// in the near field and all red past the handoff. One u32 per sub-column,
+// EVERY level, after the feature plane (sim/farfeat.h owns the layout):
+//   bits  0..4  d1: the sub slot holds depths 1..d1 under the top
+//   bits  5..9  d2: the mid slot holds d1+1..d2 (d2 == d1: no mid run)
+//   bits 10..16 sub slot, 17..23 mid slot, 24..30 deep slot (d2+1 and down)
+//   bit  31     PRESENT; 0 = no strata (a fluid top, a stalk): the sub-skin
+//               paints the whole side, the rule before the plane
+// Written by `farmap` with its entry and trusted only under a VALID entry.
+const FAR_STRATA_BASE : u32 = FAR_FEAT_BASE + FAR_FEAT_LEVELS * FAR_N * FAR_N * 4u;
+const FAR_STRATA_PRESENT : u32 = 0x80000000u;
+const FAR_STRATA_DMAX : i32 = 31;
+// Worst case: the far bound's slot, a 5-step search per run, and one wasted
+// probe at the phase change.
+const FAR_STRATA_PROBES : u32 = 14u;
+fn farStrataWord(level : u32, m : vec2<i32>) -> u32 {
+  return FAR_STRATA_BASE + farMapWord(level, m);
+}
+
 // The feature of one map entry (sub-column `m` of a level with 2^wsh fine
 // columns per sub-column), whose sample column (fx, fz) the caller holds as
 // `col` with `cover` = the voxel over its top. The SAMPLE column is exact:
@@ -8784,11 +8807,85 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
     var skin = MAT_AIR;
     var under = MAT_AIR;
     var cover = MAT_AIR;
+    // THE STRATA (FAR_STRATA_*): the runs under the sub-skin, found by two
+    // binary searches over depth in the same rolled loop. Dry ground only (a
+    // fluid top's riser is the fluid). `dDeep` is the depth from which the
+    // column is M_STONE wherever the caves leave rock (colDeepStoneTop, exact),
+    // so a search's far bound is that depth with a known slot -- or, past
+    // what the field holds, FAR_STRATA_DMAX with its slot probed first. Runs
+    // are assumed contiguous (genCellIn's `y <= h` chain is a ladder of depth
+    // thresholds); where one is not (a sand cap split by its step line) the
+    // search finds A boundary, and the far-surface gate's arm (f) counts
+    // every depth the plane gets wrong against the live grid.
+    let dry = top == col.h;
+    let dDeep = col.h - colDeepStoneTop(&col);
+    let dB = clamp(dDeep, 2, FAR_STRATA_DMAX);
+    let stoneS = matFarPal(&materials, M_STONE);
+    var sLo = 1;                  // deepest depth known to hold the run's slot
+    var sHi = dB;                 // shallowest depth known not to (once sHiS is)
+    var sHiS = select(0xFFFFu, stoneS, dDeep <= FAR_STRATA_DMAX);
+    var sRun = 0u;                // the run being searched: its slot
+    var sPhase = select(3u, 0u, dry);   // 0 = sub run, 1 = mid run, 3 = done
+    var sDone = false;            // the strata word is complete
+    var d1 = FAR_STRATA_DMAX;
+    var d2 = FAR_STRATA_DMAX;
+    var midS = 0u;
+    var deepS = 0u;
+    var noCave : CaveBands;
+    noCave.on1 = false;
+    noCave.on2 = false;
+    var trees : TreeCands;
     // q = 0 the voxel over the top (the cover plant, if any), 1 the skin, 2
-    // the sub-skin.
-    for (var q = unrollFenceU(); q < 3u; q++) {
-      let mq = genCellCol(&col, &ponds, vec3<i32>(fx, top + 1 - i32(q), fz), T.seed) & 0xFFFu;
-      if (q == 0u) { cover = mq; } else if (q == 1u) { skin = mq; } else { under = mq; }
+    // the sub-skin; 3.. the strata probes (one depth each, while the searches
+    // run). ONE genCellIn call site: each is a whole inlined copy (see
+    // unrollFence()). The probes skip the caves (`noCave`): the strata are
+    // what the rock is, and a riser the map vouches for is rock.
+    for (var q = unrollFenceU(); q < 3u + FAR_STRATA_PROBES; q++) {
+      var y = top + 1 - i32(q);
+      if (q >= 3u) {
+        if (sPhase == 3u) { break; }
+        // The far bound's slot when it is not known yet (dS past the field).
+        if (sHiS == 0xFFFFu) { y = top - sHi; }
+        else { y = top - (sLo + sHi) / 2; }
+      }
+      let mq = genCellIn(&col, &noCave, q >= 3u, &trees, false, &ponds, -1,
+                         fx, y, fz, T.seed) & 0xFFFu;
+      if (q == 0u) { cover = mq; } else if (q == 1u) { skin = mq; } else if (q == 2u) {
+        under = mq;
+        sRun = matFarPal(&materials, mq);
+        if (!farCellIsSolid(mq)) { sPhase = 3u; }
+      } else {
+        let s = matFarPal(&materials, mq);
+        if (sHiS == 0xFFFFu) { sHiS = s; }
+        else if (s == sRun) { sLo = (sLo + sHi) / 2; }
+        else { sHi = (sLo + sHi) / 2; sHiS = s; }
+      }
+      // A search is done when its bracket closes, or at once when the far
+      // bound holds the run's own slot (the run reaches the field's end).
+      if (q >= 2u && sPhase < 3u && sHiS != 0xFFFFu &&
+          (sHi - sLo <= 1 || sHiS == sRun)) {
+        let end = select(sLo, FAR_STRATA_DMAX, sHiS == sRun);
+        if (sPhase == 0u) {
+          d1 = end;
+          d2 = end;
+          midS = sHiS;
+          deepS = sHiS;
+          if (sHiS == sRun || sHi >= dB) { sPhase = 3u; sDone = true; }
+          else {
+            // The mid run: from sHi down to the same far bound.
+            sPhase = 1u;
+            sRun = sHiS;
+            sLo = sHi;
+            sHi = dB;
+            sHiS = select(0xFFFFu, stoneS, dDeep <= FAR_STRATA_DMAX);
+          }
+        } else {
+          deepS = select(sHiS, midS, sHiS == sRun);
+          d2 = end;
+          sPhase = 3u;
+          sDone = true;
+        }
+      }
     }
     if (!farCellIsSolid(skin)) {
       // Something non-far-solid ON the surface voxel (a lily pad over a pond):
@@ -8827,6 +8924,7 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
     }
     // THE FEATURES (see FAR_FEAT_*): what stands on a valid ground top.
     var feat = 0u;
+    var stalked = false;
     if (level <= FAR_FEAT_LEVELS && ok && top == col.h) {
       let fp = farFeatFill(&col, &ponds, cover, m, wsh, fx, fz, T.seed);
       feat = fp.card;
@@ -8843,6 +8941,7 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
         // the far march stops on them and the refine gets its candidate --
         // no extra walk, no extra load on any other cell.
         feat = fp.stalk;
+        stalked = true;
         let sTop = col.h + i32((fp.stalk >> 8u) & 15u);
         let body = (fp.stalk >> 16u) & 0x7Fu;
         let head = (fp.stalk >> 23u) & 0x7Fu;
@@ -8875,6 +8974,16 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
     if (level <= FAR_FEAT_LEVELS) {
       atomicStore(&farMap[farFeatWord(level, m)], feat);
     }
+    // THE STRATA WORD. Not for a stalk (its entry's sub-skin is the stalk's
+    // body, the whole of its side), nor a slot the 7-bit fields cannot hold.
+    var st = 0u;
+    let subS = matFarPal(&materials, under);
+    if (sDone && !stalked && max(subS, max(midS, deepS)) <= FAR_MAP_SLOT_MAX) {
+      let a = clamp(d1, 1, FAR_STRATA_DMAX);
+      st = u32(a) | (u32(clamp(d2, a, FAR_STRATA_DMAX)) << 5u) | (subS << 10u) |
+           (midS << 17u) | (deepS << 24u) | FAR_STRATA_PRESENT;
+    }
+    atomicStore(&farMap[farStrataWord(level, m)], st);
   }
 }
 

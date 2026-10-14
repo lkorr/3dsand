@@ -247,7 +247,7 @@ bool fogOk = false;
                 (unsigned long long)digest(world.farVox,
                                            (uint64_t)kFarLevels * kFarVox),
                 (unsigned long long)digest(world.farMap,
-                                           (kFarMapWords + kFarFeatWords) * 4ull));
+                                           (kFarMapWords + kFarFeatWords + kFarStrataWords) * 4ull));
   }
   // cold start: level 1 still pending -> only the residency window is trusted.
   // Both bounds come from world.h's cascade helpers rather than restating the
@@ -530,6 +530,9 @@ Status GateFarPersist(Ctx& c, std::string& detail) {
 //       cell over it must read the yard and the entry must have lost VALID,
 //       live and again after an indexed refill. Before 2026-10-02 neither
 //       held, and every village path was grass past the LOD handoff.
+//   (f) THE STRATA PLANE. Each pristine level-1 strata word names the live
+//       grid's far slot at every depth it covers, and the slots it names
+//       round-trip through the far palette (below, after (a)).
 namespace {
 uint32_t FarMapEntry(GpuContext& ctx, World& world, uint32_t level, int mx, int mz) {
   rhi::Buffer staging =
@@ -640,6 +643,84 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
   }
   const bool aOk = valid >= sampled * 3 / 4 && wrong == 0 &&
                    exact + fluid == valid && coarse >= 16 && coarseExact == coarse;
+
+  // ---- (f) THE STRATA PLANE (sim/farfeat.h, 2026-10-14) ---------------------
+  // Pristine: every PRESENT level-1 strata word (a level-1 sub-column IS its
+  // fine column) names, at every depth down to two past its last run, the far
+  // slot of the voxel the live grid holds there -- cave air and cave lava
+  // skipped, the plane is the rock. Plus the palette leg the renderer takes
+  // after it: each slot the probe met, and stone's, resolves (slot -> its
+  // owner, simulation.cpp's reverse table) to a material with the same colours
+  // as the one that took the slot -- "a slot round-trips" for the ground.
+  int stCols = 0, stLayered = 0, stChecked = 0, stWrong = 0, palBad = 0;
+  std::string stWhy;
+  {
+    std::unordered_map<uint32_t, std::vector<uint32_t>> chunkWords;
+    auto liveAt = [&](int x, int y, int z) -> uint32_t {
+      const IVec3 wc{x >> 4, y >> 4, z >> 4};
+      if (!world.ChunkInWindow(wc)) return 0xFFFFu;
+      const uint32_t slot = World::SlotChunkIndex(wc);
+      auto it = chunkWords.find(slot);
+      if (it == chunkWords.end()) {
+        it = chunkWords.emplace(slot, std::vector<uint32_t>(kChunkVol)).first;
+        ReadVoxelsSync(ctx, world, slot, 1, it->second.data(), "farStrata");
+      }
+      return it->second[((z & 15) * kChunk + (y & 15)) * kChunk + (x & 15)] & 0xFFFu;
+    };
+    std::set<uint32_t> slotsMet;
+    for (int i = 0; i < 96; i++) {
+      const int wx = (16 + (i * 37) % 480) | 1;
+      const int wz = (16 + (i * 53 + 29) % 480) | 1;
+      const uint32_t e = FarMapEntry(ctx, world, 1, wx, wz);
+      if (!(e & kFarMapValid)) continue;
+      const int top = FarMapTopOf(e);
+      if (top != World::TerrainHeight(wx, wz, seed)) continue;   // a fluid top
+      const uint32_t st = FarMapWords(ctx, world, FarStrataWord(1, wx, wz), 1)[0];
+      if (!(st & kFarStrataPresent)) continue;
+      stCols++;
+      if (FarStrataSub(st) != FarStrataDeep(st)) stLayered++;
+      const int dEnd = std::min(FarStrataD2(st) + 2, 31);
+      for (int d = 1; d <= dEnd; d++) {
+        const uint32_t m = liveAt(wx, top - d, wz);
+        if (m == 0xFFFFu) break;
+        if (m == kMatAir || m >= c.mats.size()) continue;
+        if (c.mats[m].gpu.klass == CLASS_LIQUID || c.mats[m].gpu.klass == CLASS_GAS) continue;
+        const uint32_t want = c.mats[m].farPalSlot;
+        const uint32_t got = FarStrataSlotAt(st, d);
+        slotsMet.insert(got);
+        stChecked++;
+        if (got != want) {
+          stWrong++;
+          if (stWhy.size() < 400)
+            stWhy += Format(" [(%d,%d) top %d d %d: live %s slot %u, plane slot %u "
+                            "(d1 %d d2 %d sub %u mid %u deep %u)]",
+                            wx, wz, top, d, c.mats[m].name.c_str(), want, got,
+                            FarStrataD1(st), FarStrataD2(st), FarStrataSub(st),
+                            FarStrataMid(st), FarStrataDeep(st));
+        }
+      }
+    }
+    slotsMet.insert(c.mats[kMatStone].farPalSlot);
+    for (uint32_t s : slotsMet) {
+      int owner = -1, taker = -1;
+      for (size_t i = 0; i < c.mats.size(); i++) {
+        if (c.mats[i].farPalSlot != s) continue;
+        if (c.mats[i].farPalOwner) owner = (int)i;
+        if (taker < 0) taker = (int)i;
+      }
+      const bool same = owner >= 0 && taker >= 0 &&
+                        c.mats[owner].gpu.color0 == c.mats[taker].gpu.color0 &&
+                        c.mats[owner].gpu.color1 == c.mats[taker].gpu.color1 &&
+                        c.mats[owner].gpu.color2 == c.mats[taker].gpu.color2;
+      if (!same) {
+        palBad++;
+        stWhy += Format(" [slot %u: owner %s, taken by %s]", s,
+                        owner >= 0 ? c.mats[owner].name.c_str() : "none",
+                        taker >= 0 ? c.mats[taker].name.c_str() : "none");
+      }
+    }
+  }
+  const bool fOk = stCols >= 24 && stChecked > 0 && stWrong == 0 && palBad == 0;
 
   // ---- (b) live edits invalidate -------------------------------------------
   auto validAt = [&](int x, int z) {
@@ -900,15 +981,17 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
              nSolid, nMicro, nL2, agree, checked, cutSolid ? "stalk" : "card", cutCleared,
              cutMapValid, !noGhost, ctlKept);
 
-  const bool ok = aOk && bOk && cOk && dOk && eOk;
+  const bool ok = aOk && bOk && cOk && dOk && eOk && fOk;
   detail = Format("L1 %d/%d valid, %d exact + %d fluid, %d cell/skin agree, %d wrong; "
                   "L2-3 %d/%d; edit %d%d%d->%d%d%d L2 %d; refill healed %d kept %d%d; %s; "
+                  "strata %d cols (%d layered), %d/%d depths agree, %d palette bad%s; "
                   "flush re-skin (pre %d): live %d/4 cells %d/4 maps off, indexed %d/4 "
                   "cells %d/4 maps off%s",
                   valid, sampled, exact, fluid, cellAgree, wrong, coarseExact, coarse,
                   preCrater, preBuild, preControl, postCrater, postBuild,
                   postControl, postCrater2, healed, keptCrater, keptBuild,
-                  dDetail.c_str(), preYard, yardCellsLive, yardMapsLive, yardCellsIdx,
+                  dDetail.c_str(), stCols, stLayered, stChecked - stWrong, stChecked,
+                  palBad, stWhy.c_str(), preYard, yardCellsLive, yardMapsLive, yardCellsIdx,
                   yardMapsIdx, yardWhy.c_str());
   std::printf("far surface: %s (%s%s%s; %u chunks indexed)\n", ok ? "PASS" : "FAIL",
               detail.c_str(), firstWrong.c_str(), firstBad.c_str(), noted);

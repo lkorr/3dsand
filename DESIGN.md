@@ -18827,6 +18827,77 @@ where you hear from either (§12b, "The ears are on the character").
     window clear their entries while a control column keeps its; refilled with
     an empty edit index the crater's entry is pristine again, refilled with the
     edited chunks indexed `farpatch` clears it again.
+  - **The STRATA plane (2026-10-14; the default map's striped mesas near
+    x 78-81k, z -11..-15k).** An entry carries two slots, the skin and the
+    sub-skin, and every riser the far field drew took the sub-skin for its
+    WHOLE height: the refine's side faces (`farRefineCell`) and the
+    staircase average (`smoothAlb`, whose riser albedo was skin over sub-skin
+    by 1/g). A mesa wall is per column step four voxels of `red_sandstone`
+    (genCellIn's steep-rock branch, `y > h - 4`) over stone, steps ~13
+    voxels tall, so the near field's riser faces are **28 % red** (counted
+    off a `--voxdump` of the wall: 18,281 riser voxels). Past the handoff
+    the wall read 49 % red at level 1, 59 % at levels 2-3 and 65 % at the
+    seam's far side (r-b unmix of the ticket camera, `shots/share.py`), and
+    the whole mesa 96 % red from 250 m. Before 93fe630 red_sandstone's far
+    slot was past 127, every entry on a mesa was INVALID, no map term ran,
+    and the plain cells' stone showed instead -- the bias just went the
+    other way.
+    Attribution (`SEAM_DBG 17`: level, which run of the strata the drawn
+    material is, whether the map vouches): the "50/50" the owner saw at the
+    seam was ITSELF an artifact. The refine owns only the SURFACE BAND of a
+    cell; below it, down to the lower ground in front, a steep riser is drawn
+    by PLAIN cells, deep rock. So a level-1 riser was half refined (all red)
+    and half plain cells (all grey). The whole wall in that frame is far
+    field: the near field starts 20 m in front of it.
+    The fix is a third plane in the farMap buffer, after the feature plane,
+    one u32 per sub-column at EVERY level (sim/farfeat.h `kFarStrata*`,
+    worldgen.wgsl `FAR_STRATA_*`; +32 MiB): the runs under the top --
+    sub slot to depth d1, mid slot to d2, deep slot below -- found by
+    `farmap` with two binary searches over depth (at most 14 more
+    genCellIn probes per entry, in the entry's one rolled call site; caves
+    skipped, the bound is `colDeepStoneTop`, where the column is stone).
+    Readers:
+    - `farRefineCell` returns a side hit's depth and sub-column;
+      `farRefineStrata` reads the plane (one 16-byte load, side hits only).
+    - `farSideStrata`: a PLAIN ground cell's side face that looks out over
+      the ground in front (a riser, not a cave wall or an overhang: the face
+      is above `farColumnTop` of the column it faces) wears the strata of
+      the sub-column it belongs to. Ground by class (solid / powder, not a
+      plant, not the canopy proxy), because a coarse cell's centre sample is
+      another column's and the top cell of a cliff column wears its skin
+      (`farSurfaceMat`): a 25 m band of red_sand down a level-8 face.
+    - `smoothAlb`: the riser is skin x 1 + sub x min(d1, g-1) + mid + deep
+      over g, g the slope in fine voxels per fine voxel. With no strata it
+      is the old mix exactly.
+    THE DEPTH WRAPS PAST LEVEL 1 (`farRiserDepth`). A level-k sub-column is
+    2^(k-1) fine columns, and its ONE riser stands for that many near-field
+    steps, each `per` voxels tall (the cell's own top difference across the
+    face, per fine column), each with its own skin and strata. So the depth
+    the strata are read at is taken mod `per`: a 6 m coarse riser shows the
+    near field's red/grey bands at their own scale, not 6 m of red (the
+    sub-skin rule) nor 6 m of grey (depth taken literally). Under 2 voxels
+    per column the slope is gentle and a riser is a real single step, read
+    at its depth. Level 1 never wraps: there the side IS the near field's.
+    Entries with no strata (a fluid top, a cactus stalk -- its side is its
+    body) keep the sub-skin rule. Edits need nothing: the plane is trusted
+    only under a VALID entry.
+    **Measured** (ticket camera `--at 78285.77,1214.63,-11857.50,120.4,20.7`,
+    minute 660, clear, 2400 frames; red share by r-b unmix): level 1
+    0.49 -> 0.33, levels 2-3 0.59 -> 0.35, past the seam 0.65 -> 0.30 --
+    flat across distance at the near field's 28 % (the remainder is the
+    treads, 54 % red). The whole-mesa camera (`--at
+    79167.36,931.89,-14704.79,112.1,0.1`): 0.96 -> 0.37, the level-6..8
+    cliffs behind it 0.41 -> 0.36. Cost on that camera, same harness:
+    raymarch mean 4.88 -> 4.93 ms, farMapFill p99 8.8 -> 8.4 ms (noise).
+    **Gate** `far-surface` arm (f): every PRESENT level-1 strata word names
+    the live grid's far slot at every depth it covers (91 columns, 2,761
+    depths, harness window), and each slot it met, and stone's, resolves
+    through the far palette to a material with the same colours as the one
+    that took it.
+    What it does not do: a column with more than three runs under its top
+    (a sand cap split by its step line, a sediment wedge firmed above its
+    step line) keeps the first three; the horizon past level 8 still paints
+    steep faces by its own slope rule (`HZ_H_MAT_STONE`).
   What it does not do: trees, rocks, overhangs and edits keep the centre-
   sampled cells (see the level table); columns whose top is off the far
   field's 16-bit window (|y| > 3.2 km) are simply invalid; far shadows are

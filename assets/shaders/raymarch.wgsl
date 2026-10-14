@@ -1065,8 +1065,16 @@ fn fogSkyK() -> f32 { return max(eyeSkyK(), gHitSky); }
 // shade's openness (near: the grid's byte; far: the cascade's), the near
 // walk's definition re-measured at the pixel on the window's voxels
 // (dbgNearOpenDef), 1 on an up face.
+// 17 = FAR STRATA (2026-10-14, the mesa wall's red far field): a far
+// pixel's level / 8; which run of its sub-column's strata its material is
+// (0.25 the skin, 0.5 the sub, 0.75 the mid, 1 the deep, 0 none: a cell
+// that is not the heightfield's); the map under the hit (0 not VALID or
+// outside the level, 0.5 VALID without strata, 1 VALID with strata).
+// Near pixels black. Count a band's grey/orange by the green channel.
 // 0 = off and const-folded away.
 const SEAM_DBG : u32 = 0u;
+var<private> gDbgLayer : f32 = 0.0;
+var<private> gDbgMap : f32 = 0.0;
 // SEAM_DBG 14: per-pixel tap verdicts of shadowSlotRead (valid, found but
 // invalid, not found / claimed, stolen at registration).
 var<private> gDbgSc : vec4f = vec4f(0.0);
@@ -5735,7 +5743,108 @@ fn farSkyClip(roY : f32, rdY : f32, invY : f32, ceil : f32, t : vec2f) -> vec2f 
 // in fs after the loop with a resumed march on a miss — the re-seeded passes
 // cost MORE than the divergence (seam +1.41 ms vs +0.61 in-loop).
 const FAR_HIT_REFINED : u32 = 0x100u;   // FarHit.level flag: hit came from the map
-struct FarRefine { hit : bool, t : f32, axis : i32, pal : u32 };
+// `dep` >= 0: a SIDE hit under the top of sub-column `q` (0..3 = e.x..e.w),
+// at that depth as the strata read it (farRiserDepth; 0 = a fine column's
+// own top voxel, `skin`). The caller resolves the slot through the strata
+// plane (farRefineStrata), since only it holds the level. -1: `pal` stands.
+struct FarRefine { hit : bool, t : f32, axis : i32, pal : u32, dep : i32, q : u32,
+                   skin : u32 };
+
+// ---- THE STRATA (worldgen.wgsl FAR_STRATA_*, sim/farfeat.h) ----------------
+// A sub-column's riser is not its sub-skin all the way down: the plane after
+// the feature words holds, per sub-column, the runs under the top -- sub slot
+// to depth d1, mid slot to d2, deep slot below. Same layout as worldgen's.
+const FAR_STRATA_VEC : u32 = FAR_FEAT_VEC + FAR_FEAT_LEVELS * FAR_N * FAR_N;
+const FAR_STRATA_PRESENT : u32 = 0x80000000u;
+// The far slot at depth `d` >= 1 under the top of a sub-column whose strata
+// word is `st`; `sub` (the entry's sub-skin) when it has none.
+fn farStrataSlot(st : u32, sub : u32, d : i32) -> u32 {
+  if ((st & FAR_STRATA_PRESENT) == 0u) { return sub; }
+  return select(select((st >> 24u) & 0x7Fu, (st >> 17u) & 0x7Fu, d <= i32((st >> 5u) & 31u)),
+                (st >> 10u) & 0x7Fu, d <= i32(st & 31u));
+}
+// THE RISER OF A COARSE SUB-COLUMN STANDS FOR A STAIRCASE OF FINE ONES. At
+// level 1 a sub-column is one fine column and its side IS the near field's,
+// voxel for voxel: depth is depth. Past it, one sub-column 2^(k-1) fine
+// columns wide draws ONE riser where the near field draws that many, each
+// `per` voxels tall (the slope) and each with its own skin at its top and its
+// own strata under it. So the near field's pattern on that face repeats every
+// `per` voxels, and the depth the strata are read at wraps by it -- a 6.4 m
+// riser on a mesa then shows the near field's 4-red/4-grey bands at their
+// scale, not 6.4 m of red (the sub-skin rule) nor 6 m of grey (depth taken
+// literally). `per` is the cell's own top difference across the face, per
+// fine column; under 2 the slope is gentle and the riser a real single step
+// (a terrace lip), read by its depth.
+fn farRiserDepth(d : i32, diff : i32, w : i32) -> i32 {
+  if (w <= 1 || d <= 0) { return d; }
+  let per = (abs(diff) + (w >> 1)) / w;
+  if (per < 2) { return d; }
+  return d % per;
+}
+// The slot of refined hit `rf` in level cell `c`: a side hit's strata (one
+// more 16-byte load, side hits only), anything else as farRefineCell said.
+fn farRefineStrata(level : u32, c : vec2<i32>, rf : FarRefine) -> u32 {
+  if (rf.dep < 0) { return rf.pal; }
+  let sv = farMap[FAR_STRATA_VEC + farMapCell(level, c)];
+  let st = select(select(sv.x, sv.y, rf.q == 1u), select(sv.z, sv.w, rf.q == 3u), rf.q >= 2u);
+  if ((st & FAR_STRATA_PRESENT) == 0u) { return rf.pal; }
+  if (rf.dep == 0) { return rf.skin; }
+  return farStrataSlot(st, rf.pal, rf.dep);
+}
+// THE SAME RISER, DRAWN BY PLAIN CELLS. The refine owns only the SURFACE BAND
+// of a cell (floor <= the tallest of its four tops, ceiling > the lowest);
+// on a wall steeper than a cell per cell the riser runs on BELOW the band, to
+// the lower ground in front, and those cells are drawn as their centre
+// samples -- deep rock, almost always. Measured on the ticket's mesa wall
+// (SEAM_DBG 17): a level-1 riser was half band, half plain cells, so the
+// sub-skin rule painted half of it red and the plain cells the other half
+// grey -- a "50/50" that was an accident of the band test -- and with the
+// strata in the band alone the wall went 80 % grey against the near field's
+// 4-red-over-stone steps. So a plain terrain cell's SIDE face that faces
+// open air over the ground in front (the face's own column top over the hit,
+// the next column's under it -- a riser, not a cave wall or an overhang)
+// wears the strata at its depth under its own sub-column's top, wrapped
+// like the refine's (farRiserDepth). Anything not of the column's strata --
+// a trunk, a boulder, a built wall -- keeps its cell. `mat` is returned
+// unchanged whenever the map does not vouch (not VALID, no strata, out of
+// the level's box).
+fn farSideStrata(level : u32, hitP : vec3f, n : vec3f, mat : u32) -> u32 {
+  let w = 1 << (farCellShift(level) - 1u);
+  let p = hitP - n * 0.25;
+  let m = vec2<i32>(floor(p.xz / f32(w)));
+  let c = m >> vec2<u32>(1u);
+  let b = farBox(level);
+  if (any(c < b.lo.xz) || any(c >= b.hi.xz)) { return mat; }
+  let q = farMap[farMapCell(level, c)];
+  let hx = (m.x & 1) != 0;
+  let hz = (m.y & 1) != 0;
+  let e = select(select(q.x, q.y, hx), select(q.z, q.w, hx), hz);
+  if ((e & FAR_MAP_VALID) == 0u) { return mat; }
+  let top = farMapTop(e);
+  let yv = i32(floor(p.y));
+  if (yv >= top) { return mat; }
+  // Open air over the ground in front: a riser, not a cave wall.
+  if (hitP.y < farColumnTop(level, hitP + n * 0.5)) { return mat; }
+  let sv = farMap[FAR_STRATA_VEC + farMapCell(level, c)];
+  let st = select(select(sv.x, sv.y, hx), select(sv.z, sv.w, hx), hz);
+  if ((st & FAR_STRATA_PRESENT) == 0u) { return mat; }
+  // GROUND, by class, not by matching this sub-column's own runs: a coarse
+  // cell's centre sample is another column's, up to half a cell away, and
+  // the top cell of a cliff column wears ITS skin (farSurfaceMat) -- on the
+  // level-6..8 mesas that was a 25 m band of red_sand down the face, no run
+  // of the sub-column the face belongs to. What must keep its cell is what
+  // is not ground: a crown (farIsCanopy: the canopy proxy, any level), a
+  // plant, a liquid. A built wall or a stamp has already cleared VALID.
+  let mm = materials[mat];
+  if ((mm.klass != CLASS_SOLID && mm.klass != CLASS_POWDER) ||
+      (mm.flags & MATF_MICRO) != 0u || farIsCanopy(mat)) { return mat; }
+  let skinS = (e >> 16u) & 0x7Fu;
+  let dX = farMapTop(select(q.x, q.z, hz)) - farMapTop(select(q.y, q.w, hz));
+  let dZ = farMapTop(select(q.x, q.y, hx)) - farMapTop(select(q.z, q.w, hx));
+  let d = farRiserDepth(top - yv, select(dZ, dX, abs(n.x) > 0.5), w);
+  if (d == 0) { return farPalMat(&materials, skinS); }
+  return farPalMat(&materials, farStrataSlot(st, 0u, d));
+}
 
 // The ray against the 2x2 sub-columns of level cell `vc` over [tIn, tOut], in
 // LEVEL-CELL t units (traceFar's). `e` = the cell's four entries, all VALID;
@@ -5751,6 +5860,9 @@ fn farRefineCell(e : vec4<u32>, vc : vec3<i32>, s : f32, roL : vec3f, rd : vec3f
                  maxTop : i32, flat : bool) -> FarRefine {
   var r : FarRefine;
   r.hit = false;
+  r.dep = -1;
+  r.q = 0u;
+  r.skin = 0u;
   // THE QUICK MISS: heights compare in FINE units (a multiply, never a divide
   // by s), and a ray whose lowest point over the cell is above the tallest
   // top — the common case for the flagged air a grazing ray skims — leaves
@@ -5767,8 +5879,11 @@ fn farRefineCell(e : vec4<u32>, vc : vec3<i32>, s : f32, roL : vec3f, rd : vec3f
   // proved the ray reaches under that top inside the cell, it always hits:
   // no miss into the next cell, no piece walk. Skin = the tallest entry's.
   if (flat) {
-    let ez = select(select(e.w, e.z, farMapTop(e.z) == maxTop),
-                    select(e.y, e.x, farMapTop(e.x) == maxTop), farMapTop(e.x) == maxTop || farMapTop(e.y) == maxTop);
+    let fx = farMapTop(e.x) == maxTop;
+    let fxy = fx || farMapTop(e.y) == maxTop;
+    let fz = farMapTop(e.z) == maxTop;
+    let ez = select(select(e.w, e.z, fz), select(e.y, e.x, fx), fxy);
+    r.q = select(select(3u, 2u, fz), select(1u, 0u, fx), fxy);
     let top = f32(maxTop + 1);
     r.hit = true;
     r.t = tIn;
@@ -5780,6 +5895,9 @@ fn farRefineCell(e : vec4<u32>, vc : vec3<i32>, s : f32, roL : vec3f, rd : vec3f
     let yv = i32(floor((roL.y + rd.y * r.t) * s));
     let skin = r.axis == 1 || yv >= maxTop;
     r.pal = select((ez >> 23u) & 0x7Fu, (ez >> 16u) & 0x7Fu, skin);
+    // Relief under the flat threshold: the side is read at its true depth.
+    r.dep = select(maxTop - yv, -1, skin);
+    r.skin = (ez >> 16u) & 0x7Fu;
     return r;
   }
   let midX = f32(vc.x) + 0.5;
@@ -5796,8 +5914,8 @@ fn farRefineCell(e : vec4<u32>, vc : vec3<i32>, s : f32, roL : vec3f, rd : vec3f
     let tm = 0.5 * (ta + tb);
     // Component by SELECT, never e[i] (see the note above).
     let hiX = roL.x + rd.x * tm >= midX;
-    let ez = select(select(e.x, e.y, hiX), select(e.z, e.w, hiX),
-                    roL.z + rd.z * tm >= midZ);
+    let hiZ = roL.z + rd.z * tm >= midZ;
+    let ez = select(select(e.x, e.y, hiX), select(e.z, e.w, hiX), hiZ);
     let hq = farMapTop(ez);
     let top = f32(hq + 1);                 // fine y of the sub-column's top face
     var th = ta;
@@ -5817,6 +5935,15 @@ fn farRefineCell(e : vec4<u32>, vc : vec3<i32>, s : f32, roL : vec3f, rd : vec3f
       let yv = i32(floor((roL.y + rd.y * th) * s));
       let skin = hax == 1 || yv >= hq;
       r.pal = select((ez >> 23u) & 0x7Fu, (ez >> 16u) & 0x7Fu, skin);
+      // The strata depth (farRiserDepth): the cell's top difference across
+      // this face, in this sub-column's row (an x face) or column (a z face).
+      r.q = select(0u, 1u, hiX) + select(0u, 2u, hiZ);
+      if (!skin) {
+        let dX = farMapTop(select(e.x, e.z, hiZ)) - farMapTop(select(e.y, e.w, hiZ));
+        let dZ = farMapTop(select(e.x, e.y, hiX)) - farMapTop(select(e.z, e.w, hiX));
+        r.dep = farRiserDepth(hq - yv, select(dZ, dX, hax == 0), i32(s) >> 1);
+        r.skin = (ez >> 16u) & 0x7Fu;
+      }
       return r;
     }
     ta = tb;
@@ -6525,7 +6652,7 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
                         out.axis = rf.axis;
                         out.sgn = sign(select(select(rd.x, rd.z, rf.axis == 2), rd.y,
                                               rf.axis == 1));
-                        out.mat = farPalMat(&materials, rf.pal);
+                        out.mat = farPalMat(&materials, farRefineStrata(level, vc.xz, rf));
                         out.cell = vc;
                         out.level = level | FAR_HIT_REFINED;
                         return out;
@@ -15227,7 +15354,8 @@ fn surfaceGrainFp(cell : vec3<i32>, amp : f32, voxPx : f32) -> f32 {
 // the refine at. ok = false when an entry is outside the valid box or not
 // vouched for (an edit, a ruin): the caller keeps the plain cell shade there.
 const FAR_MAP_COVER_BIT : u32 = 0x40000000u;   // worldgen.wgsl, same name
-struct FarSurf { ok : bool, e : u32, q : vec4<u32>, sub : u32, g : vec2f, gok : bool };
+struct FarSurf { ok : bool, e : u32, q : vec4<u32>, sub : u32, g : vec2f, gok : bool,
+                 c : vec2<i32>, qi : u32 };
 // The sub-skin of entry `ez` of cell `q`: its own field, or — when the cover
 // bit took that field for the plant's slot — the first uncovered sibling's,
 // else the skin.
@@ -15252,6 +15380,8 @@ fn farSurfAt(level : u32, hitP : vec3f, grad : bool) -> FarSurf {
   r.q = farMap[farMapCell(level, c)];
   let hx = (m.x & 1) != 0;
   r.e = select(select(r.q.x, r.q.y, hx), select(r.q.z, r.q.w, hx), (m.y & 1) != 0);
+  r.c = c;
+  r.qi = u32(m.x & 1) + u32(m.y & 1) * 2u;
   if ((r.e & FAR_MAP_VALID) == 0u) { return r; }
   r.ok = true;
   r.sub = farMapSubOf(r.e, r.q);
@@ -16412,6 +16542,11 @@ fn fs(in : VSOut) -> FSOut {
       // ambient floor as the near field, plus cascade-marched sun shadows and
       // a one-sample AO — lighting mismatch at the window seam is what makes
       // LOD terrain read as a different world.
+      // A plain cell's side on a riser wears the strata (farSideStrata).
+      if ((far.level & (FAR_HIT_REFINED | FAR_HIT_FEATURE)) == 0u && far.axis != 1) {
+        far.mat = farSideStrata(far.level & 0xFFu, R.camPos + rd * far.t,
+                                axisVec(far.axis, -far.sgn), far.mat);
+      }
       let m = materials[far.mat];
       var n = axisVec(far.axis, -far.sgn);
       // The level, and whether the hit came from the surface map's refine
@@ -16493,9 +16628,31 @@ fn fs(in : VSOut) -> FSOut {
         if (fs2.ok) {
           groundY = f32(farMapTop(fs2.e) + 1);
           let skinM = farPalMat(&materials, (fs2.e >> 16u) & 0x7Fu);
-          let subM = farPalMat(&materials, fs2.sub);
+          var subM = farPalMat(&materials, fs2.sub);
           var skinA = paletteMean(materials[skinM]);
-          if (far.mat == skinM || far.mat == subM) {
+          // THE STRATA under this sub-column (FAR_STRATA_*): its riser's
+          // runs. One more 16-byte load per mapped far pixel.
+          let sv = farMap[FAR_STRATA_VEC + farMapCell(flv, fs2.c)];
+          let st = select(select(sv.x, sv.y, fs2.qi == 1u), select(sv.z, sv.w, fs2.qi == 3u),
+                          fs2.qi >= 2u);
+          let stOk = (st & FAR_STRATA_PRESENT) != 0u;
+          var midM = subM;
+          var deepM = subM;
+          if (stOk) {
+            subM = farPalMat(&materials, (st >> 10u) & 0x7Fu);
+            midM = farPalMat(&materials, (st >> 17u) & 0x7Fu);
+            deepM = farPalMat(&materials, (st >> 24u) & 0x7Fu);
+          }
+          if (SEAM_DBG == 17u) {
+            gDbgMap = select(0.5, 1.0, stOk);
+            gDbgLayer = select(select(select(select(0.0, 1.0, far.mat == deepM), 0.75,
+                                             far.mat == midM), 0.5, far.mat == subM),
+                               0.25, far.mat == skinM);
+          }
+          // A refined side hit wears whichever run its depth fell in: all of
+          // them are the heightfield.
+          if (far.mat == skinM || far.mat == subM ||
+              (fRefined && (far.mat == midM || far.mat == deepM))) {
             fSurf = true;
             // The cover: this sub-column's bit, or the cell's fraction once a
             // sub-column is under ~2 px; the plant is this sub-column's, or
@@ -16535,8 +16692,25 @@ fn fs(in : VSOut) -> FSOut {
             lamSm = wrapDiffuse(dot(nS, keyLightDir()), TUNE_DIFFUSE_WRAP);
             faceSm = nS.y * nS.y + nS.x * nS.x * TUNE_FACE_X + nS.z * nS.z * TUNE_FACE_Z;
             nSh = normalize(mix(n, nS, wLit));
-            let riserA = mix(skinA, paletteMean(materials[subM]),
-                             1.0 - 1.0 / max(1.0, max(abs(fs2.g.x), abs(fs2.g.y))));
+            // The NEAR field's riser, averaged: per fine column a step of g
+            // voxels (the slope), its top voxel the skin and the g - 1 under
+            // it the strata's runs -- sub to d1, mid to d2, deep below. With
+            // no strata the sub-skin takes all g - 1, the rule before them;
+            // that rule drew a mesa wall's 4-red-over-stone steps all red.
+            let g = max(1.0, max(abs(fs2.g.x), abs(fs2.g.y)));
+            let L = g - 1.0;
+            var nSub = L;
+            var nMid = 0.0;
+            if (stOk) {
+              let d1 = f32(st & 31u);
+              let d2 = f32((st >> 5u) & 31u);
+              nSub = min(d1, L);
+              nMid = clamp(min(d2, L) - d1, 0.0, L);
+            }
+            let nDeep = max(L - nSub - nMid, 0.0);
+            let riserA = (skinA + paletteMean(materials[subM]) * nSub +
+                          paletteMean(materials[midM]) * nMid +
+                          paletteMean(materials[deepM]) * nDeep) / g;
             smoothAlb = mix(skinA, riserA, farRiserShare(fs2.g, rd));
           }
         }
@@ -16955,6 +17129,9 @@ fn fs(in : VSOut) -> FSOut {
       }
       if (SEAM_DBG == 11u) {
         gDbg = vec4f(f32(flv) / 8.0, select(0.0, 1.0, farIsCanopy(far.mat)), 0.0, 1.0);
+      }
+      if (SEAM_DBG == 17u) {
+        gDbg = vec4f(f32(flv) / 8.0, gDbgLayer, gDbgMap, 1.0);
       }
       // ---- the frozen fire's breath (farEmberPlasma) ----
       // A cascade ember is a fire the window left behind: nothing about it
