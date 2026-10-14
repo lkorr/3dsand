@@ -16813,31 +16813,17 @@ int main(int argc, char** argv) {
             // (the base rig is ParentsFirst, an appended slot's host is an
             // earlier slot), so one forward pass reaches every descendant.
             if (p.head >= 0 && p.head < (int)hide.size()) hide[p.head] = 1;
-            // THE STRING HAND OF A DRAWN BOW (bow_draw*): at full draw it is
-            // hooked under the jaw, a hand's breadth from the eye. The pose
-            // keeps it out of the view at any held aim, but the draw follows
-            // the look on an eased pitch and a fast flick down outruns it --
-            // the forearm swept up across the bottom of the view for a tenth
-            // of a second. Hidden from three quarters of the draw on, with
-            // whatever it wears; before that it is out at the string in front
-            // of the face and the windup and the pull are the thing to see
-            // (scripts/gen_archery_clips.py prints where it leaves the view).
-            // The bow arm stays (it is the view).
-            const ItemDef* fpBow =
-                session.bowHand >= 0
-                    ? items.Named(avatar.HeldItem(HandAt(session.bowHand)))
-                    : nullptr;
-            // ...AND WHILE THE CLIP LETS GO after the loose: the hand falls
-            // from the jaw through the lens on the blend-out.
+            // THE STRING HAND OF A DRAWN BOW (bow_draw*) is SEEN while it
+            // draws: since 2026-10-14 it anchors beside the left cheek (in
+            // front of the face crouched), at the edge of the view, holding
+            // the string the player watches come back. It is hidden only
+            // WHILE THE CLIP LETS GO after the loose, when the hand falls
+            // from the cheek through the lens on the blend-out.
             float fpLetGo = 0.0f;
             if (session.bowDrawTicks == 0 && session.bowHand >= 0)
               for (const char* c : {"bow_draw", "bow_draw_crouch"})
                 fpLetGo += avatar.ClipWeight(avatar.HandClip(c, HandAt(session.bowHand)).c_str());
-            if (session.bowHand >= 0 &&
-                ((session.bowDrawTicks > 0 &&
-                  (fpBow == nullptr ||
-                   BowDrawFraction(*fpBow, session.bowDrawTicks) >= 0.75f)) ||
-                 fpLetGo > 0.02f)) {
+            if (session.bowHand >= 0 && fpLetGo > 0.02f) {
               const bool bowLeft = HandAt(session.bowHand) == Hand::Left;
               for (const char* nm : {bowLeft ? "armL.R" : "armL.L",
                                      bowLeft ? "hand.R" : "hand.L"}) {
@@ -21007,11 +20993,11 @@ int main(int argc, char** argv) {
           if (&m == static_cast<Mob*>(&avatar)) avatarSeen = true;
           // First person: the player's own string is cut short of the lens.
           const bool fp = &m == static_cast<Mob*>(&avatar) && camMode == CameraMode::First;
-          PresentDrawnBow(m, items, flightBodies, fp ? &eye : nullptr, 2.5f);
+          PresentDrawnBow(m, items, flightBodies, fp ? &eye : nullptr, 1.0f);
         });
         if (!avatarSeen)
           PresentDrawnBow(avatar, items, flightBodies,
-                          camMode == CameraMode::First ? &eye : nullptr, 2.5f);
+                          camMode == CameraMode::First ? &eye : nullptr, 1.0f);
       }
       bodyReg.SetRenderOnly(&flightBodies);
       const auto bodyT0 = std::chrono::steady_clock::now();

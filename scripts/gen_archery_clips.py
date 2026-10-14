@@ -615,10 +615,20 @@ def main():
     # DRAW cells out, less the rest offset. The anchor is under the middle of
     # the chin, the bow arm angled in to a grip a few cells right of the eye
     # line, and the shaft runs parallel to the look, a cell right of it.
-    anchor = np.array([eye[0] - 1.0, eye[1] - 12.0, eye[2] + 2.0])
-    grip = aimed_grip(eye, anchor, np.array([REST_OUT, 0.0, 0.0]))
+    #
+    # 2026-10-14 (owner): the anchor under the chin put the fingers INSIDE
+    # the head (the eye is the middle of the head box) and the last of the
+    # string through the lens. It is BESIDE THE LEFT CHEEK now, outside the
+    # head and a little forward of the eye, where first person sees the whole
+    # string come back to the hand at the edge of the view. Aimed at the
+    # reticle from there, the shaft runs parallel to the look ~15 cm left, so
+    # the bow is left of centre too.
+    anchor = np.array([eye[0] + 12.0, eye[1] - 10.0, eye[2] + 9.0])
+    grip = aimed_grip(eye, anchor, np.array([-REST_OUT, 0.0, 0.0]))
     liftGrip = np.array([eye[0] - 6.0, eye[1] - 32.0, eye[2] + 36.0])
-    standKeys = aim_draw("bow_draw", eye, anchor, np.array([REST_OUT, 0.0, 0.0]),
+    # The rest is on the HEAD's side of the bow (arrows.cpp), which with the
+    # bow left of the eye is toward -x.
+    standKeys = aim_draw("bow_draw", eye, anchor, np.array([-REST_OUT, 0.0, 0.0]),
                          liftGrip, unit((0.3, 1, 0.35)), unit((0, 1, 0)),
                          ANCHOR["armU.L"][1] + 2, math.radians(55))
     report("bow_draw at FULL DRAW", standKeys[-1][1])
@@ -635,7 +645,12 @@ def main():
     # the reticle (measured: upper arm and forearm 4 degrees INTO the
     # crosshair; at 9 cells right the bow hand is the nearest, 2 degrees off). The
     # shaft still runs parallel to the look, ~11 cm right of it.
-    anchorC = np.array([eye[0] - 9.0, eye[1] - 14.0, eye[2] + 2.0])
+    #
+    # 2026-10-14 (owner): "the other arm is also inside the character's head,
+    # so extend the bow holding arm out a bit more so that the drawstring
+    # holding hand is in front of the head". Forward of the face (the head box
+    # reaches ~8 cells past the eye), the bow arm out by the same amount.
+    anchorC = np.array([eye[0] - 9.0, eye[1] - 14.0, eye[2] + 12.0])
     gripC = aimed_grip(eye, anchorC, np.array([0.0, REST_OUT, 0.0]))
     liftGripC = np.array([eye[0] - 2.0, eye[1] - 30.0, eye[2] + 34.0])
     crouchKeys = aim_draw("bow_draw_crouch", eye, anchorC, np.array([0.0, REST_OUT, 0.0]),
