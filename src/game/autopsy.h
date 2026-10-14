@@ -60,7 +60,7 @@ enum Kind : uint8_t {
   kOther = 0,      // neither tissue nor damage (metal on a robot, a shard)
   kTissue = 1,     // what the body is built from: skin, flesh, muscle, bone, blood
   kBurn = 2,       // cooked / burning / charred
-  kInfection = 3,  // a material with an `infect` block: rot, venom
+  kInfection = 3,  // a material with an `infect` block (rot, venom), or one's `leaves` (necrotic)
 };
 
 // Deepest layer reported. A human torso is ~16 skin voxels deep at its core;

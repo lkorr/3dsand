@@ -9130,7 +9130,8 @@ the envenomed spreading to flesh that makes it an infection"):
   one more candidate (`Mob::InfectAcrossJoint` seeds that limb at its own anchor,
   unless the infection is already there).
 - **EAT** — independently, with chance `pE`, the voxel is eaten: tombstoned and
-  flushed as a carve (`FlushBurn`).
+  flushed as a carve (`FlushBurn`) — or, if the block names `leaves`, turned
+  into that material where it stands (venom leaves `necrotic`, below).
 
 Counter-based (`Hash3` of creature, limb, lattice POSITION, tick and material);
 cells act in storage order on the lattice as it stands, so nothing acts twice in
@@ -9165,7 +9166,7 @@ ledger so a venom coat lying in a wound arms its seeding again.
 "infect": { "spread": 0.006, "eat": 0.009, "floor": 0,
             "targets": ["tag:soft_tissue"], "hp": 250, "cause": "infection",
             "death": "venom", "turns": false, "cured": "flesh",
-            "label": "venom" }
+            "leaves": "necrotic", "label": "venom" }
 ```
 
 - `spread` / `eat` — chances per voxel per SECOND, for a voxel one world voxel
@@ -9192,6 +9193,18 @@ ledger so a venom coat lying in a wound arms its seeding again.
   of a turning material" — dying of venom does not make a zombie). All three are
   read off the MATERIAL of the cells eaten or present, not off the limb.
 - `cured` — what a remedy turns a cell of it into (below).
+- `leaves` — what an EATEN cell becomes instead of being removed (2026-10-13,
+  owner: venom should leave dead tissue, not dissolve it). Absent = removed, a
+  carve (the rot). The loader refuses a `leaves` that is not a solid, that is
+  itself an infection (block or `infectious` tag — the dead do not spread, so
+  the arithmetic below is untouched: a left cell is no more food than a hole
+  was), or whose id is above 255 (a body cell holds 8 bits of material, so the
+  row is inserted, not appended). Being eaten still charges `hp`; only the
+  removal's volume charge is gone, because nothing is removed. Nothing is
+  uncovered either, so the bone-blood coat an eat lays on bared bone does not
+  happen, and there is no carve to flush: a charge that takes the limb to 0 is
+  resolved in `InfectStep` by the rule a blow uses (`Mob::Damage`), not an
+  eaten carve's — a vital or root limb dies in place, an arm stays on, dead.
 - `label` — what the HUD and the remedy messages call it ("rot", "venom"); absent = the material's name.
 
 **One number per infection, body and world.** The world-grid rot rules
@@ -9231,7 +9244,16 @@ sear it; its block targets `tag:soft_tissue` — `flesh`, `muscle`, `brain`,
 tissue whose wound leaks venom through `bleedFluid`). All three are appended
 (ids 204-206), so `venom_gland` (>127) cannot be painted into a `.vox`
 directly: a snake paints a stand-in and rewrites it at load, as `garmentsBecome`
-does. The third such rewrite is `anatomy.paintBecomes` (human.json, 2026-10-08):
+does. A fourth, `necrotic` (2026-10-13, id 224, inserted after `heart`), is
+what envenomed's `leaves` names: near-black dead tissue that the venom's eat
+leaves in place, so a burnt-out venom wound is a dead patch the shape of the
+infection rather than a hole. It has no `infect` block, no `soft_tissue` tag
+(the venom cannot re-take it) and no `infectious` tag (holy water and a
+`disinfect` leave it alone — the venom is gone from it); `rubble: blood` keeps
+it creature tissue (a cut through it is a wound, the rot eats it), `bleed` 0.2
+(no blood supply), and a healing coat mends it to the recipe like any wrong
+cell. The autopsy reads it as an infection finding (`AutopsyKinds`), not as
+healthy tissue. The third such rewrite is `anatomy.paintBecomes` (human.json, 2026-10-08):
 a voxel of one material painted one of a list of the file's own art slots
 becomes another — every skin cell the generator paints in its hair slots (251,
 252: scalp hair, brows, beard) is `hair` (id 222), which catches from one hot
@@ -9252,8 +9274,9 @@ whatever the rate. The mean time to die out is `H(D, R) / μ` with
 on a human (skinScale 8, `μ = 0.072` a second) that is 61 s for a dose of 5,
 89 s for 12 and 108 s for 20 — a little less in a wound that runs out of soft
 tissue to spread into, which also pulls the eaten ratio under 3 (measured 2.55).
-`hp` 250 a world voxel charges a 12-cell dose's ~36 eaten cells ≈ 18 hp. When
-the last cell goes the latch drops and the pending tombstones are flushed at
+`hp` 250 a world voxel charges a 12-cell dose's ~36 eaten cells ≈ 18 hp — and
+leaves ~36 necrotic cells where they were. When the last cell goes the latch
+drops and any pending tombstones (an infection without `leaves`) are flushed at
 once (a finished infection never reaches the rebuild threshold on its own).
 
 **The rot, retuned per voxel.** Per voxel the rot is SUPERCRITICAL: knobs
@@ -9319,8 +9342,9 @@ human seeds nothing; a CONTROL human with the same pits and no venom, ticked
 alongside, gives the bone census to subtract — A's venom-attributable bone loss
 must be ≤ `venomWoundBoneLossMax` (measured 0 and 0; `Mob::FlushTailBone`
 attributes any bone a flush's carve tail drops, by cause); and a fifth human with
-a zombie bite AND the venom soak on one arm, where both infections must run.
-The 364 → 291 bone fall reported from the per-limb version did not reproduce
+a zombie bite AND the venom soak on one arm, where both infections must run;
+and (since 2026-10-13) the eaten cells are still in A as `necrotic`, with none
+in the uncut human. The 364 → 291 bone fall reported from the per-limb version did not reproduce
 with the control alongside (both arms 364 → 364): it is not attributable to the
 venom on this fixture.
 
@@ -15691,6 +15715,17 @@ boldness another. A swimmer's distances are 3D (`ai::SelfView::volumetric`),
 it never asks the ground navigator (there is no floor to route over; the
 drive feels its own way), and its idle wander draws each leg's height too
 (`wander.depth`).
+
+**Carrion, and the pieces of it** (`Perception::carrion`): a corpse with meat
+left is food, and so is every SEVERED PIECE -- a loose-flesh actor in the
+`ai::kLooseActorBase` band, its meat counted by the corpse's rule, and
+`bleeding` while its debris wound still pays out (`FleshLattice::bleeding`),
+so a gouting head is smelled in the water like a body. A bite on one is the
+corpse's hole (`Mob::BiteHit`): `biteRadius x (0.4 + 0.6 power)`, pushed
+under the contact toward the piece's middle (`DebrisSystem::BluntBody`,
+cause Bite), meat only. A piece a blast DESTROYS pays its whole wound at
+once (`DamageBody`: drip budget + sever voxels as whole blood, the gout as
+one burst) -- the survivor-only wound left it bloodless. Gate `loose-carrion`.
 
 **The bite: a mouthful, and jaws that close by their own force.** Two strike
 profile fields on the natural weapon. `strike.biteForce` (0..1): a floor on

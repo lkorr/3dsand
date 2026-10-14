@@ -3143,11 +3143,14 @@ Status GateMobRace(Ctx& c, std::string& detail) {
 //      sits in baseline.json's band round 3 -- e = 1.5 s means 2 D spread and
 //      3 D eaten, whatever the rate. Summed over four limbs because a single
 //      small dose is a short random walk and its ratio is noisy.
-//   4. IT HURTS: A booked hp to DamageCause::Infection (the venom's own `hp`
-//      plus the volume charge), and its limbs' hp fell.
+//   4. IT HURTS: A booked hp to DamageCause::Infection (the venom's own `hp`;
+//      since 2026-10-13 nothing is carved, so there is no volume charge), and
+//      its limbs' hp fell.
 //   5. BONE STOPS IT: A's bone count on the four limbs did not move.
 //   6. SKIN STOPS IT: B -- the same coat on whole skin -- seeded nothing, grew
 //      nothing and booked nothing.
+//   7. DEAD, NOT GONE: what the venom ate is still in A as `envenomed`'s
+//      `infect.leaves` (necrotic), and B has none.
 //
 // SPEEDED UP AS DATA, the way bite-infect cranks its tuning rows: the venom's
 // rates live in materials.json, so the gate hands MobSystem a COPY of the
@@ -3463,6 +3466,12 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   const int boneLossA = (int)bone0 - (int)bone1;
   const int boneLossC = (int)boneC0 - (int)boneC1;
   const int boneLossVenom = boneLossA - boneLossC;
+  // WHAT THE VENOM LEFT (7): its eaten cells, as `leaves`, over every limb.
+  // Reported against `eaten`, not held equal to it: a joint twin copies a
+  // cell into the neighbour limb (the same caveat as `conserved` below).
+  const uint32_t leavesMat = envDef.infectLeaves;
+  const uint32_t deadA = leavesMat ? sumAll(a, leavesMat) : 0u;
+  const uint32_t deadB = leavesMat ? sumAll(b, leavesMat) : 0u;
   restore();
 
   // THE EXPECTED WINDOW, from the authored numbers at the scaled rate. Per
@@ -3504,6 +3513,7 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   RecordObserved("venomWoundBoneLossA", (double)boneLossA);
   RecordObserved("venomWoundBoneLossControl", (double)boneLossC);
   RecordObserved("venomWoundBoneLossVenom", (double)boneLossVenom);
+  RecordObserved("venomWoundLeftBehind", (double)deadA);
 
   const bool seeded = sa.seeded > 0 && firstSeen > 0;
   const bool spread = sa.spread > 0;
@@ -3530,6 +3540,9 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   const bool coexist = !rotMat || bothBitten == 0 ||
                        ((bothRot.spread + bothRot.eaten) > 0 &&
                         (bothVen.seeded > 0 && bothVen.spread + bothVen.eaten > 0));
+  // DEAD, NOT GONE (7): an infection that authors `leaves` left them where it
+  // ate, and the whole-skin human, which it never reached, has none.
+  const bool leftBehind = leavesMat == 0 || (deadA > 0 && deadB == 0);
 
   detail = Format(
       "%u holes, venom on %u / %u cells (A / B) | A: seeded %u, spread %u, "
@@ -3544,6 +3557,10 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
       aliveA ? "" : " (A DIED)", sb.seeded, sb.spread, bMax, hpInfB);
   detail += conserved ? " | books balance" : " | books off (twin overlap)";
   detail += " | took:" + took;
+  if (leavesMat)
+    detail += Format(" | LEFT BEHIND: %u %s in A for %u eaten, %u in B", deadA,
+                     leavesMat < c.mats.size() ? c.mats[leavesMat].name.c_str() : "?",
+                     sa.eaten, deadB);
   detail += Format(" | BONE: A %u -> %u (-%d), control (same pits, no venom, "
                    "%u pits) %u -> %u (-%d), venom-attributable %d; flush-tail "
                    "bone A %u [%s ], control %u [%s ]",
@@ -3558,7 +3575,7 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   RecordObserved("venomWoundBothVenomActs", (double)(bothVen.spread + bothVen.eaten));
   if (!left.empty()) detail += " | still envenomed:" + left;
   if (seeded && spread && burntOut && threeX && onTime && hurt && boneKept &&
-      skinStops && boneCensus && coexist)
+      skinStops && boneCensus && coexist && leftBehind)
     return Status::Pass;
   const char* why = !seeded      ? "the coat seeded nothing in the wounds"
                     : !spread    ? "the venom never spread"
@@ -3569,6 +3586,7 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
                     : !boneKept  ? "the venom converted bone or skin"
                     : !boneCensus ? "A lost more bone than the control"
                     : !coexist   ? "rot and venom did not both run on one limb"
+                    : !leftBehind ? "the eaten cells were not left behind as the infection's `leaves`"
                                  : "a venom coat on whole skin seeded or hurt";
   detail = std::string(why) + ": " + detail;
   return Status::Fail;

@@ -279,6 +279,9 @@ class DebrisSystem {
     // only fire is its own embers is not turned away by the cheap gate.
     bool selfActive = false;
     uint32_t bleedMat = 0;   // Body::bleedMat: the blood a bared bone may wear
+    // The wound still pays out (Body::wound: open, gout or drip budget left):
+    // what a scavenger smells in the water (ai::Actor::bleeding).
+    bool bleeding = false;
     // Body::geomGen. With the voxel count, the key every index derived from
     // lattice COORDINATES is cached on (MobSystem::FleshView).
     uint32_t geomGen = 0;

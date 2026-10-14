@@ -4886,7 +4886,7 @@
       "tags": []
     },
     {
-      "//": "ENVENOMED TISSUE (docs/PLAN_weapon_coats.md B3; DESIGN.md 'Infection is a material'). What venom turns soft tissue into, and the second infection after the zombie's rotflesh -- a DIFFERENT rot voxel, dark and bruise-purple where the rot is green. Tagged like rotflesh (flammable, organic, dissolvable, and `infectious`, so holy water and sunwater sear it out the way they sear the rot). Crumbles to blood, so it is still the creature's tissue to every wound rule. Its `infect` block is the venom: it spreads only into SOFT tissue (tag:soft_tissue: flesh, muscle, brain, glands -- never skin, never bone, so a wound to the bone stops there) and EATS 1.5x as fast as it spreads, so it always burns itself out (floor 0). THE ARITHMETIC, per voxel (the per-voxel rule every infection runs): each envenomed cell is eaten with chance e = 0.009 a second and converts a soft-tissue neighbour with chance s = 0.006 a second (per world-voxel cell; a human's skinScale-8 lattice runs its cells 8x as often, 0.072 and 0.048, so a front crosses an arm at the same physical speed and the RATIO is unchanged). So each cell has R = s / e = 2/3 offspring on average before it is eaten -- subcritical, it always burns out -- and a dose of D cells eats D / (1 - R) = 3 D in all, having spread 2 D more. How long that takes is a birth-death process: mean H(D, R) / mu with H = sum_{i=1..D} sum_{j>=0} R^j / (i + j) and mu = 0.072 a second on a human, i.e. 61 s for a dose of 5, 89 s for 12, 108 s for 20 (a little less where the wound runs out of soft tissue to spread into). `hp` 250 per world voxel eaten on top of the volume charge: a 12-cell dose eats 36 cells (0.07 world voxels) and costs the limb about 18 hp. Books to the Infection ledger and names the death `venom`; the dead do not rise from it.",
+      "//": "ENVENOMED TISSUE (docs/PLAN_weapon_coats.md B3; DESIGN.md 'Infection is a material'). What venom turns soft tissue into, and the second infection after the zombie's rotflesh -- a DIFFERENT rot voxel, dark and bruise-purple where the rot is green. Tagged like rotflesh (flammable, organic, dissolvable, and `infectious`, so holy water and sunwater sear it out the way they sear the rot). Crumbles to blood, so it is still the creature's tissue to every wound rule. Its `infect` block is the venom: it spreads only into SOFT tissue (tag:soft_tissue: flesh, muscle, brain, glands -- never skin, never bone, so a wound to the bone stops there) and EATS 1.5x as fast as it spreads, so it always burns itself out (floor 0). THE ARITHMETIC, per voxel (the per-voxel rule every infection runs): each envenomed cell is eaten with chance e = 0.009 a second and converts a soft-tissue neighbour with chance s = 0.006 a second (per world-voxel cell; a human's skinScale-8 lattice runs its cells 8x as often, 0.072 and 0.048, so a front crosses an arm at the same physical speed and the RATIO is unchanged). So each cell has R = s / e = 2/3 offspring on average before it is eaten -- subcritical, it always burns out -- and a dose of D cells eats D / (1 - R) = 3 D in all, having spread 2 D more. How long that takes is a birth-death process: mean H(D, R) / mu with H = sum_{i=1..D} sum_{j>=0} R^j / (i + j) and mu = 0.072 a second on a human, i.e. 61 s for a dose of 5, 89 s for 12, 108 s for 20 (a little less where the wound runs out of soft tissue to spread into). `hp` 250 per world voxel eaten on top of the volume charge: a 12-cell dose eats 36 cells (0.07 world voxels) and costs the limb about 18 hp. Books to the Infection ledger and names the death `venom`; the dead do not rise from it. EATEN IS NOT GONE (2026-10-13, `leaves`): an eaten cell becomes `necrotic` where it stands instead of being carved out, so a burnt-out venom wound is a dead black patch the shape of the infection, not a hole -- the arithmetic above is unchanged (necrotic is not soft tissue, so it is no more food than a hole was), only the volume charge of a removal is gone.",
       "id": "envenomed",
       "electric": {"resist": 8, "ignite": {"into": "flesh_cooked", "chance": 120}, "char": "flesh_charred", "shock": 1000},
       "class": "solid",
@@ -4917,6 +4917,7 @@
         "death": "venom",
         "turns": false,
         "cured": "flesh",
+        "leaves": "necrotic",
         "label": "venom"
       }
     },
@@ -5318,6 +5319,31 @@
       "//woundHp": "Muscle's depth weight (it IS muscle, and it is deeper than any other in the chest).",
       "woundHp": 2,
       "organHp": 48
+    },
+    {
+      "//": "NECROTIC TISSUE (owner, 2026-10-13: venom should not dissolve the cells it eats; it should leave dead tissue behind). What `envenomed`'s infect block LEAVES (`infect.leaves`): when an envenomed cell's eat roll lands, the cell becomes this instead of being removed, so a venom wound ends as a black, dead patch of the same size and shape rather than a hole. Nothing here is a rule -- it is the absence of one. It carries no `infect` block, so it neither spreads nor eats, and no `soft_tissue` tag, so envenomed (whose diet is tag:soft_tissue) cannot take it again: the front's wake is dead ground, exactly as a hole was. It is not `infectious` either, so holy water and sunwater do not sear it, and a remedy's `disinfect` leaves it alone -- the venom is gone from it. A healing coat mends it back to the recipe's tissue like any other wrong cell (Mob::HealLimbStep). `rubble: blood` keeps it in MobDef::tissue (a cut through it is a wound in the creature, and the rot eats it like any dead flesh); `bleed` 0.2: dead tissue has no blood supply, so a blade through it draws a fifth of what live flesh would (wood's figure). Flammable, organic and dissolvable like envenomed: it burns and acid takes it.",
+      "//id": "INSERTED here, after `heart` (223), not appended, for heart's reason: a body material must be <= 255 (a micro brick packs 8 bits of material) and the table's end is past that. Everything after this row moved up one; nothing stores those ids (saves remap by NAME; trees, biomes, roads and dungeons name their materials; the one id-baked edit layer, harrowby's ground.svedit, tops out at 221). Never painted into a .vox: only InfectStep writes it.",
+      "id": "necrotic",
+      "electric": {"resist": 8, "ignite": {"into": "flesh_cooked", "chance": 120}, "char": "flesh_charred", "shock": 1000},
+      "class": "solid",
+      "density": 980,
+      "hardness": 4,
+      "rubble": "blood",
+      "bleed": 0.2,
+      "//colors": "Near-black with a brown-grey cast: the dead centre of a necrotising bite. Darker and less purple than envenomed's bruise, so the live front reads against the dead ground it leaves.",
+      "colors": [
+        "#221c19",
+        "#191412",
+        "#2c2420"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "//far": "A wound's interior is never visible at cascade distance: it shares flesh_charred's near-black slot rather than spending one of the 254.",
+      "far": "flesh_charred",
+      "molten": "fire"
     },
     {
       "//": "MAP V2 R1. PACKED EARTH: a road's or a lane's beaten surface -- dirt trodden and rolled until it holds its shape. A SOLID on purpose: a road is graded, and a graded road is a slope, so a powder surface (dirt, gravel: repose 40) would slide off the first cut it is laid on and the chunk would never sleep (CLAUDE.md rule 2). Dirt's colours, a shade darker and flatter. Laid by worldgen only, from map.json roads[] (worldgen.wgsl roadColAt); a dug or blasted cell crumbles back to dirt.",
