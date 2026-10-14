@@ -3246,6 +3246,10 @@ class Mob {
   // as rods to the hand (game/arrows.h PresentDrawnBow). Ignored on a carved
   // slot, whose own brick is the only one that shows the damage.
   void SetHeldRenderModel(Hand h, int model) { held_[HandIndex(h)].renderModel = model; }
+  // The gait's side-to-side pelvis SWAY and ROLL, scaled (1 = as authored;
+  // the bob is untouched). A drawn bow steadies the walk (ItemDef BowSpec
+  // drawSwayScale, set by the player's tick).
+  void SetGaitSwayScale(float k) { gaitSwayScale_ = k; }
   // The held item's body transform as drawn (limb xf + the render offset);
   // false with no live held slot. Its frame is the item's body frame (ItemDef
   // ArrowSpec::tip's, BowStringArt's).
@@ -3629,9 +3633,12 @@ class Mob {
   // (ai::SelfView::drawing), and the pose tips the torso with `aimPitch`
   // (radians, + up: the clip's pitchFollow, the player's look in the same
   // convention). Presentation + scheduling: never saved, never hashed.
-  void SetBowDraw(bool on, float aimPitch = 0.0f) {
+  // `moveScale` multiplies the walk while drawn (BowSpec drawMoveScale,
+  // eased in over the windup by the caller; MobSystem's drive reads it).
+  void SetBowDraw(bool on, float aimPitch = 0.0f, float moveScale = 1.0f) {
     bowDraw_ = on;
     bowAimPitch_ = on ? aimPitch : 0.0f;
+    bowMoveScale_ = on ? moveScale : 1.0f;
   }
   bool BowDrawn() const { return bowDraw_; }
   float BowAimPitch() const { return bowAimPitch_; }
@@ -6113,6 +6120,8 @@ class Mob {
   HeldHand held_[kHands];
   bool castBusy_ = false;   // SetCastBusy
   bool bowDraw_ = false;    // SetBowDraw
+  float gaitSwayScale_ = 1.0f;   // SetGaitSwayScale
+  float bowMoveScale_ = 1.0f;    // SetBowDraw
   float bowAimPitch_ = 0.0f;
   // The shield's raise (Mob::StepShield, game/mob_shield.cpp).
   float shieldRaise_ = 0.0f;

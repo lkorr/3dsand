@@ -804,6 +804,21 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
         // ...and so does a RAISED SHIELD (item.h ShieldSpec::moveScale), by
         // how far up it is: you walk behind a shield, you do not run.
         if (couple) player.speedScale *= avatar.ShieldMoveScale();
+        // ...and so does a DRAWN BOW (BowSpec drawMoveScale / drawSwayScale):
+        // slower, and the walk's side-to-side sway steadied, eased in over
+        // the windup as the bow comes up. Last tick's draw count (PhaseG
+        // runs after this), so a loose frees the walk one tick later.
+        float bowSway = 1.0f;
+        if (couple && s.bowDrawTicks > 0 && s.bowHand >= 0) {
+          const ItemDef* bd = items.Named(avatar.HeldItem(HandAt(s.bowHand)));
+          if (bd != nullptr && bd->IsBow()) {
+            const float k = std::min(1.0f, (float)s.bowDrawTicks /
+                                               (float)std::max(1, bd->bow.windupTicks));
+            player.speedScale *= 1.0f + (bd->bow.drawMoveScale - 1.0f) * k;
+            bowSway = 1.0f + (bd->bow.drawSwayScale - 1.0f) * k;
+          }
+        }
+        avatar.SetGaitSwayScale(bowSway);
       }
       // ---- component 9: impact ripples -------------------------------------
       // The event source, and it is a RISING EDGE rather than a per-tick test:

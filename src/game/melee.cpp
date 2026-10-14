@@ -668,6 +668,8 @@ bool LoadItems(const std::string& dir, size_t materialCount,
       d.bow.windupTicks = std::max(
           0, (int)std::lround((double)b.value("windupMs", 0) * 30.0 / 1000.0));
       d.bow.minDraw = std::clamp(b.value("minDraw", 0.15f), 0.0f, 1.0f);
+      d.bow.drawMoveScale = std::clamp(b.value("drawMoveScale", 1.0f), 0.0f, 1.0f);
+      d.bow.drawSwayScale = std::clamp(b.value("drawSwayScale", 1.0f), 0.0f, 1.0f);
     }
     // ---- A SHIELD: what holding it up costs (item.h ShieldSpec) -------------
     // Every field has a working default, so a shield row with no block is a

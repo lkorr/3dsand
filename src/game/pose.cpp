@@ -1050,9 +1050,10 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
     root.pos.y += g.bobAmp *
                   std::sin(g.bobFreqMul * 6.2831853f * st.gaitPhase) *
                   speedFactor;
-    root.pos.x += g.swayAmp * std::sin(6.2831853f * st.gaitPhase) * speedFactor;
-    const float roll =
-        g.rollAmp * std::sin(6.2831853f * st.gaitPhase) * speedFactor;
+    root.pos.x += g.swayAmp * gaitSwayScale_ *
+                  std::sin(6.2831853f * st.gaitPhase) * speedFactor;
+    const float roll = g.rollAmp * gaitSwayScale_ *
+                       std::sin(6.2831853f * st.gaitPhase) * speedFactor;
     root.rot = QuatNormalize(Mul(root.rot, AxisAngle({0, 0, 1}, roll)));
     for (size_t i = 0; i < sk.parts.size(); i++) {
       if (sk.parts[i].tag != "spine") continue;

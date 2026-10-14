@@ -257,7 +257,10 @@ bool StepDraw(TickAuthorityCtx& w, std::span<SessionTick> players, MobArcheryWor
   d.ticks++;
   if (d.ticks < d.looseAt) {
     const ShotAim s = AimShot(w, *m, d, *rt, BowArrowSpeed(*bow, d.drawTo));
-    m->SetBowDraw(true, s.pitch);
+    // The player's walk rule (session.cpp PhaseA): BowSpec drawMoveScale,
+    // eased in over the windup as the bow comes up.
+    const float k = std::min(1.0f, (float)d.ticks / (float)std::max(1, bow->bow.windupTicks));
+    m->SetBowDraw(true, s.pitch, 1.0f + (bow->bow.drawMoveScale - 1.0f) * k);
     return true;
   }
 

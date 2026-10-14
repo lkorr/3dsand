@@ -572,6 +572,11 @@ struct ItemDef {
     int windupTicks = 0;      // ticks before the pull starts (`windupMs`, 30 Hz)
     int drawTicks = 24;       // ticks of pull to a full draw (`drawTimeMs`, 30 Hz)
     float minDraw = 0.15f;    // least draw fraction that looses at all
+    // WALKING WITH IT DRAWN (owner, 2026-10-14): the walk speed and the
+    // gait's side-to-side pelvis sway and roll are scaled by these while the
+    // string is back, eased in over the windup (session.cpp PhaseA).
+    float drawMoveScale = 1.0f;   // `drawMoveScale`
+    float drawSwayScale = 1.0f;   // `drawSwayScale`
     std::string ammo;         // the item id it shoots
   } bow;
   bool IsBow() const { return bow.has && kind == ItemKind::Melee; }
