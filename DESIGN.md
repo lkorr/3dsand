@@ -19714,10 +19714,61 @@ walking (1324x1128, `--frames`, not exclusive): mean 0.25 -> 0.31 ms a frame
 3.8 (the first frame, where every patch is fresh). The arcs are gone from the
 same frames.
 
-`SEAM_DBG 14` (raymarch.wgsl) is the instrument both were found with: per
-pixel, whether the cache gave NO opinion (the pixel shades as sun), the raw
-cached value, and why a tap had none (found but invalid / no slot); far
-pixels write their patch's (no opinion, value).
+**A miss is not sun** (2026-10-14, ticket `2026-10-14_00-52-22`, "tons of
+bisecting circles of lines of light that run through shadows everywhere as I
+run around"). The fresh-window fix above made a new patch's FIRST answer
+right; the frame before that answer exists was still full sun. A pixel whose
+taps have no opinion shaded lit, on the argument that a one-frame bright edge
+on a newly visible surface is invisible in motion. It is not when the new
+patches lie on a curve. Every LOD boundary of the near reader -- the
+nearest/bilinear switch and each power-of-two pool step -- is a curve of
+constant projected patch size round the camera, and translation drags it
+across the ground, so a moving camera put a fresh 1 px dotted arc of full sun
+through every shadow on every frame. The pool picks made it worse: a step-s
+block read its centre, `s*k + s/2`, and those sets are DISJOINT from one step
+to the next ({1,3} at step 2, {2} at step 4), so crossing a step boundary in
+EITHER direction was a miss. Three parts, all render-only:
+
+1. **Nested pool picks** (`shadowPoolPick`): a step-s block reads
+   `(n & ~(s-1)) | (0x55 & (s-1))`, one low-bit pattern at every step, so the
+   patch a step reads is one every finer step already keeps warm (steps
+   2/4/8 read 1/1/5, within s/4 of the block centre). Stepping coarser is no
+   longer a miss at all.
+2. **A fallback that asks what the cache already knows**
+   (`shadowCachedFallback`, `farShadowFallback`, `farGiFallback`). A pixel
+   with no opinion probes, read-only through the plain-load find (no claim,
+   no request, no atomics): its face's coarser pool patches (stepping finer:
+   the patch it read last frame); the same face of the four in-plane
+   neighbour cells (a surface sliding out from behind an edge); the far
+   cascade's level-1 patch (ground crossing the near/far handoff toward the
+   eye). A far patch with no opinion probes the other refinement, its four
+   in-plane neighbours, the level above and below, and at level 1 the near
+   patch. The far GI word (`farGiCached`) borrows the same way rather than
+   reading 0. Only a surface with none of those -- true disocclusion, the
+   first frame -- still shades lit, for one frame.
+3. **A far blocker at contact is a shadow.** The far resolve published a
+   patch INVALID when its ray met a cell within 0.01 voxels of its start,
+   after the near burial rule; but a far pixel reads one patch with nothing
+   to renormalise onto, so those patches (inside faces of distant canopies,
+   mostly) shaded full sun permanently. The cache-off reference
+   (`farShadowMarch`) answers a contact shadow, and so does the cache now.
+
+**Why no harness had seen it.** The `--at` picture re-renders the world into
+its own texture, and it ran the per-frame prepass first -- which RESOLVES
+every patch the frame had just claimed. Every one-frame cache miss was
+invisible to every `--at` repro, still or in flight; the 2026-10-13 fix was
+verified through that blind spot. An `--at` shot now skips the prepass
+(`main.cpp` `g_shotAsPresented`) and captures the frame as presented.
+Measured through it (ticket camera, 09:30, clear, flying 3.2 m/s across the
+house's shadow, SEAM_DBG 14, mean of 13 frames in flight): near pixels shaded
+full sun by a miss **2,819 -> 146** a frame, far **2,889 -> 356** (still:
+near 239 -> 100, far 902 -> 9). The dotted arcs are gone from the same frames;
+a still frame is unchanged apart from grass-sway noise.
+
+`SEAM_DBG 14` (raymarch.wgsl) is the instrument all three were found with:
+per pixel, whether NOTHING answered (the pixel shades as sun), the shadow
+value, and how a near pixel was answered (0.5 its own taps, 0.75 a fallback
+probe, 1 nothing); far pixels write (nothing answered, value, 0.25).
 
 **What is NOT here.** Soft shadows on the raster body paths. `bodySunShadow`
 casts one ray per FRAGMENT with nowhere to accumulate, so a limb still takes a
