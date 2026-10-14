@@ -17166,7 +17166,8 @@ where you hear from either (§12b, "The ears are on the character").
   coarse center sample almost never hits it. At levels ≥ 5 (cells 3.2 m+,
   wider than a tree) a column under a crown's XZ footprint is CROWN MATTER
   from the ground up to the crown's dome (`farCanopyAt`: its surface cell and
-  every air-sampled cell in (h, dome] take the leaf material) — trees too
+  every air-sampled cell in (h, dome] take the leaf material; at levels 5-6
+  the species' own silhouette and trunk instead, see "Shape" there) — trees too
   thin to survive center sampling become a canopy mass with a height, so the
   far forest keeps its colour AND its silhouette (2026-10-11, "The forest on
   the horizon" in §9 has the rule). **A submerged column's surface cell wears its FLUID (2026-10-10,
@@ -19320,7 +19321,7 @@ where it was:
   vertical reach over its trunk's ground at the trunk, its measured leaf
   centroid at the rim; atlas words `TA_S_ABOVE` / `TA_S_CROWN_Y`). From level
   5 the cascades hold the column as crown matter from the ground to the dome
-  (worldgen.wgsl `farCanopyAt` / `farCanopyCell`, in the sieve, `fardown` and
+  (worldgen.wgsl `farCanopyAt` / `farCanopyMat`, in the sieve, `fardown` and
   `farpatch` alike -- the `far-downsample` agreement; `farCanopyRows` gates
   the 5x5 tree scan to level chunks that can hold a surface or dome cell, a
   superset of the cells that read it, so two producers visiting different
@@ -19334,6 +19335,29 @@ where it was:
   The heights are NOT in the pyramid's MAX/AVG: the light map, the clouds'
   ground and the near field's terrain-scale sun horizon still see bare ground
   (a forest's own shadow is the cascade's at that range).
+- **Shape, levels 5-6 only (2026-10-14; owner: "trees in the far lod dont
+  look like trees at all ... just entire 5x3 chunks made of leaves").** The
+  dome from the ground made every species a leaf column at 410 m - 1.6 km,
+  where a tree is still two to four cells: a pine or redwood a green PILLAR,
+  an oak a crate. At those two levels (`FAR_CANOPY_SHAPED_MAX_SHIFT` = 6) the
+  proxy draws the species' SILHOUETTE instead: `treeatlas.cpp
+  BakeFarProfile` measures, at atlas load, the trunk material (`kSBarkMat`,
+  the anchor column's ground-row run unless it is foliage -- a bush has no
+  trunk) and a leaf radius per height band (`kSProfile`, 12 u8 bands over
+  [0, above): the 90th percentile of the band's leaf voxels' distance from
+  the trunk axis, averaged over variants; a band under 2 % of a variant's
+  leaves is empty). `canopyFor` gives a column the crown from the lowest to
+  the highest band whose radius reaches it (`lo`..`top`); the ONE cell column
+  holding the trunk axis reads the profile at d = 0 and is bark from the
+  ground to the crown's lowest band (`stem`); the surface cell under a crown
+  keeps the ground's own skin unless the crown comes down to within half a
+  cell of it (`farCanopyPaintsGround`, also the farMap skin's rule) -- a
+  spruce's skirt paints, an oak's crown does not. Same three producers, same
+  shared functions, so the far-downsample agreement holds. Levels 7-8 keep
+  the dome: a tree is a cell or less there, the shape is not resolvable, and
+  the painted ground is what keeps a forest a forest (the 10-10 ticket) and
+  the horizon's disc-mean seam. Render-only; the world hash does not move
+  (437b0cec), the atlas hash does (`treeAtlasHash`).
 - **Shade.** Crown matter at range is porous foliage full of its own shadow:
   a cascade hit whose far slot is a COVER slot (the far palette entry's
   `tagMask`, the cover rule's foliage) and the horizon's canopy colour are

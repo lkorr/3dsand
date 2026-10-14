@@ -1456,6 +1456,9 @@ const TA_S_SHADE       : u32 = 11u;
 const TA_S_AUTUMN      : u32 = 12u;
 const TA_S_LEAF0       : u32 = 13u;
 const TA_S_AUTUMN0     : u32 = 16u;
+const TA_S_BARK_MAT    : u32 = 20u;   // treeatlas.h kSBarkMat (the far silhouette)
+const TA_S_PROFILE     : u32 = 21u;   // treeatlas.h kSProfile: u8 leaf radius per band
+const TA_PROFILE_BANDS : i32 = 12;    // treeatlas.h kProfileBands
 
 const TA_VARIANT_WORDS : u32 = 12u;
 const TA_V_NX      : u32 = 0u;
@@ -5697,19 +5700,46 @@ fn genCellCol(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
 // level is that number too -- the level-8 cells and the horizon past them
 // agree in expectation, which is what keeps the seam quiet.
 // `farSurfaceMat` paints the surface cell with `mat`; the far producers'
-// air-sampled cells in (h, top] take it too (farCanopyCell). Callers compute
+// air-sampled cells in (h, top] take it too (farCanopyMat). Callers compute
 // it once per column (it is a 5x5 treeInfo scan) and only at shift >= 5.
-struct FarCanopy { mat : u32, top : i32 };
+//
+// THE SHAPED LEVELS (2026-10-14, owner: "trees in the far lod dont look like
+// trees at all ... just entire 5x3 chunks made of leaves"). At levels 5-6
+// (3.2 / 6.4 m cells, ~410 m - 1.6 km) a tree is still two to four cells, and
+// the dome above stood on the ground at every column it covered: a pine or a
+// redwood came out as a leaf PILLAR, an oak as a leaf crate. There the proxy
+// draws the species' own silhouette instead -- the per-band leaf radius
+// treeatlas.cpp BakeFarProfile measures from the baked variants: a column
+// holds crown matter from the lowest to the highest band whose radius reaches
+// it (`lo`..`top`), the ground under a crown that does not come down to it
+// keeps its own skin (farSurfaceMat), and the ONE cell column that holds the
+// trunk axis is bark from the ground up to the crown's base (`stem`), and
+// reads the profile as on the axis. Past level 6 a tree is a cell or less and
+// the dome above (and the horizon's expectation of it) is the right answer;
+// those levels are unchanged.
+struct FarCanopy { mat : u32, top : i32, lo : i32, bark : u32, stem : i32 };
 const FAR_CANOPY_MIN_SHIFT : u32 = 5u;
-fn farCanopyNone() -> FarCanopy { return FarCanopy(MAT_AIR, -2147483647); }
-fn farCanopyAt(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> FarCanopy {
+const FAR_CANOPY_SHAPED_MAX_SHIFT : u32 = 6u;
+fn farCanopyNone() -> FarCanopy {
+  return FarCanopy(MAT_AIR, -2147483647, -2147483647, MAT_AIR, -2147483647);
+}
+// `shift` is the asking cell's: it picks the dome or the silhouette, and sizes
+// the cell column the trunk test asks about ((x, z) is that column's centre).
+fn farCanopyAt(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>,
+               shift : u32) -> FarCanopy {
+  let shaped = shift <= FAR_CANOPY_SHAPED_MAX_SHIFT;
+  let half = 1 << (max(shift, 1u) - 1u);
+  // A trunk whose tree has no crown over this column waits for the scan to
+  // find no crown either (a neighbour's crown over a trunk's cell wins).
+  var stemOnly = farCanopyNone();
   let tx = fdiv(x, TREE_TILE);
   let tz = fdiv(z, TREE_TILE);
   for (var oz = -TREE_SCAN + unrollFence(); oz <= TREE_SCAN; oz++) {
     for (var ox = -TREE_SCAN + unrollFence(); ox <= TREE_SCAN; ox++) {
       var t = treeInfo(tx + ox, tz + oz, seed, ponds);
-      let cm = canopyOf(&t, x, z, seed);
-      if (cm != MAT_AIR) { return FarCanopy(cm, canopyTopOf(&t, x, z)); }
+      let c = canopyFor(&t, x, z, seed, shaped, half);
+      if (c.mat != MAT_AIR) { return c; }
+      if (c.bark != MAT_AIR && stemOnly.bark == MAT_AIR) { stemOnly = c; }
     }
   }
   // The authored trees (P6): the far field paints their crowns as it paints
@@ -5721,10 +5751,54 @@ fn farCanopyAt(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> 
     let sid = wmSiteK(lst, k);
     if (wmSiteKind(sid) != WM_SITE_TREE) { continue; }
     var t = siteTree(sid, seed);
-    let cm = canopyOf(&t, x, z, seed);
-    if (cm != MAT_AIR) { return FarCanopy(cm, canopyTopOf(&t, x, z)); }
+    let c = canopyFor(&t, x, z, seed, shaped, half);
+    if (c.mat != MAT_AIR) { return c; }
+    if (c.bark != MAT_AIR && stemOnly.bark == MAT_AIR) { stemOnly = c; }
   }
-  return farCanopyNone();
+  return stemOnly;
+}
+// One tree's proxy over column (x, z): the dome, or (shaped) the silhouette.
+fn canopyFor(t : ptr<function, Tree>, x : i32, z : i32, seed : u32, shaped : bool,
+             half : i32) -> FarCanopy {
+  var out = farCanopyNone();
+  if (!(*t).present) { return out; }
+  if (!shaped) {
+    let cm = canopyOf(t, x, z, seed);
+    if (cm != MAT_AIR) { out.mat = cm; out.top = canopyTopOf(t, x, z); }
+    return out;
+  }
+  let ox = (*t).wx - x;
+  let oz = (*t).wz - z;
+  let bark = taSpecies((*t).sp, TA_S_BARK_MAT);
+  let axis = ox >= -half && ox < half && oz >= -half && oz < half;
+  // The axis's cell stands for the axis: it reads the profile at d = 0 (the
+  // centre sample would otherwise cut a narrow crown's top off the one column
+  // that should carry it), punch and all, as the axis column would.
+  var cm = MAT_AIR;
+  if (axis) { cm = canopyOf(t, (*t).wx, (*t).wz, seed); }
+  else { cm = canopyOf(t, x, z, seed); }
+  let d2 = select(ox * ox + oz * oz, 0, axis);
+  let above = max((*t).above, 1);
+  var lo = TA_PROFILE_BANDS;
+  var hi = -1;
+  var base0 = TA_PROFILE_BANDS;   // the crown's lowest band anywhere: the stem's end
+  for (var b = unrollFence(); b < TA_PROFILE_BANDS; b++) {
+    let r = i32((taSpecies((*t).sp, TA_S_PROFILE + u32(b) / 4u) >> ((u32(b) % 4u) * 8u)) & 0xFFu);
+    if (r == 0) { continue; }
+    base0 = min(base0, b);
+    if (r * r >= d2) { lo = min(lo, b); hi = max(hi, b); }
+  }
+  if (cm != MAT_AIR && hi >= 0) {
+    out.mat = cm;
+    out.lo = (*t).base + 1 + (lo * above) / TA_PROFILE_BANDS;
+    out.top = (*t).base + ((hi + 1) * above) / TA_PROFILE_BANDS;
+  }
+  if (axis && bark != MAT_AIR && taSpecies((*t).sp, TA_S_CANOPY_MAT) != MAT_AIR) {
+    out.bark = bark;
+    out.stem = (*t).base + 1 + (base0 * above) / TA_PROFILE_BANDS;
+    out.top = max(out.top, out.stem - 1);
+  }
+  return out;
 }
 // The crown dome's top over column (x, z) of a tree whose disc covers it.
 fn canopyTopOf(t : ptr<function, Tree>, x : i32, z : i32) -> i32 {
@@ -5735,9 +5809,20 @@ fn canopyTopOf(t : ptr<function, Tree>, x : i32, z : i32) -> i32 {
   return (*t).base + above - ((above - cy) * min(dx * dx + dz * dz, r2)) / r2;
 }
 // The canopy byte rule for a cell whose CENTRE sample found no matter: crown
-// matter when the centre is over the column's ground and under its dome.
-fn farCanopyCell(can : FarCanopy, h : i32, y : i32) -> bool {
-  return can.mat != MAT_AIR && y > h && y <= can.top;
+// matter in the column's crown span (the dome: from the ground up), else the
+// trunk below the crown in the axis's column. MAT_AIR = neither.
+fn farCanopyMat(can : FarCanopy, h : i32, y : i32) -> u32 {
+  if (y <= h) { return MAT_AIR; }
+  if (can.mat != MAT_AIR && y >= can.lo && y <= can.top) { return can.mat; }
+  if (can.bark != MAT_AIR && y < can.stem) { return can.bark; }
+  return MAT_AIR;
+}
+// Whether the crown paints the column's SURFACE cell (farSurfaceMat, and the
+// farMap skin that refines it): the dome always does; a shaped crown only when
+// it comes down to within half a cell of the ground (a spruce's skirt) -- the
+// ground under an oak's crown is grass, and is seen between the trunks.
+fn farCanopyPaintsGround(can : FarCanopy, h : i32, shift : u32) -> bool {
+  return can.mat != MAT_AIR && can.lo <= h + (1 << (max(shift, 1u) - 1u));
 }
 // Whether a column's cell CENTRES in [yLo, yHi] can include one that reads
 // the canopy -- the surface cell (centre c <= h < c + step, farSurfaceMat's
@@ -5861,8 +5946,9 @@ fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
   // levels still resolve trees as shapes and double-painting would fatten them.
   // `can` is the caller's farCanopyAt for this column (farCanopyNone below
   // FAR_CANOPY_MIN_SHIFT): the surface cell of a crowned column wears the
-  // crown, and the cells over it up to the dome do too (farCanopyCell).
-  if (shift >= FAR_CANOPY_MIN_SHIFT && can.mat != MAT_AIR) { return can.mat; }
+  // crown (a shaped one only where it comes down to the ground), and the
+  // cells over it in its span do too (farCanopyMat).
+  if (shift >= FAR_CANOPY_MIN_SHIFT && farCanopyPaintsGround(can, h, shift)) { return can.mat; }
   // MEADOW COVER IS NOT FLATTENED INTO THE SKIN (tried and taken out): the
   // strand palette painted over a far meadow reads darker than the near
   // field, where the eye sees the skin between thin blades. A blade thinner
@@ -6226,7 +6312,7 @@ fn farDespeck(mat : u32, fine : vec3<i32>) -> u32 {
 // bound for a crown would be `treeMaxAbove()`, which is WIDER than a level-5
 // cell -- flagging that band would turn every forested column into a column
 // of solid cubes. The canopy is carried at distance by MATERIAL cells
-// instead: `farSurfaceMat` paints the surface cell and `farCanopyCell` the
+// instead: `farSurfaceMat` paints the surface cell and `farCanopyMat` the
 // cells under the crown's dome, at shift >= 5 (farCanopyAt).
 fn farColTopFrom(h : i32, fluidTop : i32, x : i32, z : i32) -> i32 {
   var top = max(h, fluidTop);
@@ -7532,7 +7618,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   // entry that wants it); the crown's dome is not sky either.
   var canU = farCanopyNone();
   if (shift >= FAR_CANOPY_MIN_SHIFT && farCanopyRows(col.h, yLoU, yHiU, step)) {
-    canU = farCanopyAt(fx, fz, T.seed, &ponds);
+    canU = farCanopyAt(fx, fz, T.seed, &ponds, shift);
   }
   // THE BURIED ROWS (map v2 P1): a sample at or under colDeepStoneTop that
   // the cave bands leave solid is M_STONE -- genCellIn's own answer there,
@@ -7650,9 +7736,9 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
       } else if (fine.y > col.h && fine.y <= peak) {
         // A summit between the sample columns (farPeakTop).
         byteV = farCellByte(matFarPal(&materials, farPeakMat(col.biome, peak, col.tl)), byteV);
-      } else if (farCanopyCell(can, col.h, fine.y)) {
-        // Under a crown's dome (farCanopyAt).
-        byteV = farCellByte(matFarPal(&materials, can.mat), byteV);
+      } else if (farCanopyMat(can, col.h, fine.y) != MAT_AIR) {
+        // Under a crown's dome, or its silhouette and stem (farCanopyAt).
+        byteV = farCellByte(matFarPal(&materials, farCanopyMat(can, col.h, fine.y)), byteV);
       }
       // farOcc counts NON-EMPTY cells, which now includes blocker-only ones —
       // it gates empty-space skipping for every far reader, and a reader that
@@ -8898,8 +8984,8 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
     // a refined sub-column there must wear the same paint as the cell it
     // replaces, or the far forest turns into bare grass the moment it refines.
     if (shift >= FAR_CANOPY_MIN_SHIFT && top == col.h && ok) {
-      let can = farCanopyAt(fx, fz, T.seed, &ponds);
-      if (can.mat != MAT_AIR) { skin = can.mat; }
+      let can = farCanopyAt(fx, fz, T.seed, &ponds, shift);
+      if (farCanopyPaintsGround(can, col.h, shift)) { skin = can.mat; }
     }
     if (!farCellIsSolid(under)) { under = skin; }
     // THE ENTRY'S SLOT FIELDS ARE SEVEN BITS (16..22, 23..29), the cell byte's
@@ -9089,7 +9175,7 @@ fn farpatch(@builtin(workgroup_id) wg : vec3<u32>,
       pTop = farColTopFrom(pcol.h, pcol.fluidTop, pfine.x, pfine.z);
       // The sweep's canopy volume, on the same column (farCanopyAt).
       pcan = farCanopyNone();
-      if (shift >= FAR_CANOPY_MIN_SHIFT) { pcan = farCanopyAt(pfine.x, pfine.z, T.seed, &pponds); }
+      if (shift >= FAR_CANOPY_MIN_SHIFT) { pcan = farCanopyAt(pfine.x, pfine.z, T.seed, &pponds, shift); }
       lastX = pfine.x;
       lastZ = pfine.z;
       haveCol = true;
@@ -9112,10 +9198,10 @@ fn farpatch(@builtin(workgroup_id) wg : vec3<u32>,
       byteV = farCellByte(matFarPal(&materials, farSurfaceMat(&pcol, &pponds, pmat, pfine, shift,
                                                               T.seed, ground, pcan)),
                           byteV);
-    } else if (farCanopyCell(pcan, pcol.h, pfine.y)) {
+    } else if (farCanopyMat(pcan, pcol.h, pfine.y) != MAT_AIR) {
       // An air centre under a procgen crown's dome: the crown, as the sweep
       // paints it (the canopy proxy is procgen's, like farSurfaceMat's).
-      byteV = farCellByte(matFarPal(&materials, pcan.mat), byteV);
+      byteV = farCellByte(matFarPal(&materials, farCanopyMat(pcan, pcol.h, pfine.y)), byteV);
     }
     if (byteV != 0u) { pnz += 1u; atomicMax(&wgFarTop, u32(pl.y) + 1u); }
     // THE SURFACE MAP STOPS VOUCHING FOR AN EDITED CELL'S COLUMN (package A).
@@ -9318,7 +9404,7 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
       var pcan = farCanopyNone();
       if (shift >= FAR_CANOPY_MIN_SHIFT && n.y > 0 &&
           farCanopyRows(pcol.h, first.y, first.y + (n.y - 1) * step, step)) {
-        pcan = farCanopyAt(fx, fz, T.seed, &pponds);
+        pcan = farCanopyAt(fx, fz, T.seed, &pponds, shift);
       }
       for (var iy = 0; iy < n.y; iy++) {
         // fine-voxel sample point, and the level cell it belongs to
@@ -9358,8 +9444,8 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
                               byteV);
         } else if (fine.y > pcol.h && fine.y <= peak) {
           byteV = farCellByte(matFarPal(&materials, farPeakMat(pcol.biome, peak, pcol.tl)), byteV);
-        } else if (farCanopyCell(pcan, pcol.h, fine.y)) {
-          byteV = farCellByte(matFarPal(&materials, pcan.mat), byteV);
+        } else if (farCanopyMat(pcan, pcol.h, fine.y) != MAT_AIR) {
+          byteV = farCellByte(matFarPal(&materials, farCanopyMat(pcan, pcol.h, fine.y)), byteV);
         }
         let bi = farVoxByteIndex(level, cc);
         let bsh = (bi & 3u) * 8u;

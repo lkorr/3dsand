@@ -95,8 +95,18 @@ enum : int {
   // 1-in-kSAutumnChance by the tree's own hash. A ramp rather than one colour
   // because substituting a flat autumn material for a shaded green one would
   // throw the shading bake away on exactly the trees the eye goes to.
-  kSAutumnChance = 12, kSLeaf0 = 13, kSAutumn0 = 16, kSFlags = 19
+  kSAutumnChance = 12, kSLeaf0 = 13, kSAutumn0 = 16, kSFlags = 19,
+  // THE FAR SILHOUETTE (2026-10-14): what the far field's crown proxy draws
+  // at cascade levels 5-6 (worldgen.wgsl farCanopyAt), measured from the
+  // baked variants at load (BakeFarProfile). kSBarkMat = the trunk's material
+  // (the anchor column's ground-row run, 0 = no trunk); kSProfile.. = one u8
+  // leaf radius per height band, kProfileBands bands over [0, above), four
+  // per word, band 0 in the low byte of the first word. 0 = no foliage there.
+  kSBarkMat = 20, kSProfile = 21
 };
+inline constexpr int kProfileBands = 12;
+static_assert(kSProfile + kProfileBands / 4 <= kSpeciesWords,
+              "the far profile must fit the species entry");
 
 // THE TREE LATTICE, and the candidate-set bound derived from it.
 //
