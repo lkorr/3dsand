@@ -2418,17 +2418,35 @@ const RenderArm kRenderArms[] = {
     // The far SURFACE MAP refine (LOD-seam package A). Off = every surface
     // cell is the plain centre-sampled cube again; baseline - norefine is what
     // the refine costs (map loads + the 2x2 sub-column test) on this camera.
-    {"norefine", "farRefineLevel 8 -> 0",
+    {"norefine", "farRefineLevel 6 -> 0",
      [](Tuning& t) { t.render.farRefineLevel = 0; }, true, 1,
      "the far surface-map refine: map loads + sub-column intersections"},
     // The handoff the refine exists to allow (package E): the cascade takes
     // over at 20 m, inside the window, instead of at the window box.
-    {"refine1", "farRefineLevel 8 -> 1",
+    {"refine1", "farRefineLevel 6 -> 1",
      [](Tuning& t) { t.render.farRefineLevel = 1; }, true, 1,
-     "the refine on levels 2..8 (baseline - refine1)"},
-    {"refine2", "farRefineLevel 8 -> 2",
+     "the refine on levels 2..6 (baseline - refine1)"},
+    {"refine2", "farRefineLevel 6 -> 2",
      [](Tuning& t) { t.render.farRefineLevel = 2; }, true, 1,
-     "the refine on levels 3..8 (baseline - refine2)"},
+     "the refine on levels 3..6 (baseline - refine2)"},
+    {"refine4", "farRefineLevel 6 -> 4",
+     [](Tuning& t) { t.render.farRefineLevel = 4; }, true, 1,
+     "the refine on levels 5..6 (baseline - refine4)"},
+    {"refine8", "farRefineLevel 6 -> 8",
+     [](Tuning& t) { t.render.farRefineLevel = 8; }, true, 1,
+     "the refine on levels 7..8 too (refine8 - baseline)"},
+    // THE FLAT REFINE (2026-10-14): a candidate whose relief is under
+    // farRefineFlatPx pixels is one box at its true top. baseline - noflat is
+    // what the threshold saves; flat1 / flat8 price a tighter / looser one.
+    {"noflat", "farRefineFlatPx 2 -> 0",
+     [](Tuning& t) { t.render.farRefineFlatPx = 0.0f; }, true, 1,
+     "the 2x2 piece walk on every refine candidate (baseline - noflat)"},
+    {"flat1", "farRefineFlatPx 2 -> 1",
+     [](Tuning& t) { t.render.farRefineFlatPx = 1.0f; }, true, 1,
+     "a tighter flat-refine threshold (flat1 - baseline)"},
+    {"flat8", "farRefineFlatPx 2 -> 8",
+     [](Tuning& t) { t.render.farRefineFlatPx = 8.0f; }, true, 1,
+     "nearly every candidate one box at its true top (baseline - flat8)"},
     {"lod20", "lodHandoffDist 26 -> 20 m",
      [](Tuning& t) { t.render.lodHandoffDist = 20.0f; }, true, 1,
      "fine marching between 20 m and the window edge that the cascade covers"},
@@ -3209,7 +3227,7 @@ const char* const kArmsReduced[] = {
 // are the ones that price it and the ones that bound what is left. `nofar` is
 // the ceiling on everything the cascade could ever cost.
 const char* const kArmsCascade[] = {
-    "baseline", "nofar", "noshadow", "halfres", "norefine", "refine1", "refine2", nullptr};
+    "baseline", "nofar", "noshadow", "halfres", "norefine", "refine1", "refine2", "refine4", "refine8", "noflat", "flat1", "flat8", nullptr};
 // The foliage cameras: the picture-dependent rows plus the ceilings that only
 // mean something with plants in the frame. `nomicro` is the ceiling on the
 // whole plant march; `micro1` / `plantlod4` price its two knobs; `lod8` and
@@ -3449,7 +3467,7 @@ const char* const kArmsSeam[] = {
     "baseline", "noshadow", "nofar", "nogi", "nomicro", "halfres",
     // LOD-seam package A: the surface-map refine's cost, and the 20 m handoff
     // it exists to allow (package E).
-    "norefine", "refine1", "refine2", "lod20", nullptr};
+    "norefine", "refine1", "refine2", "refine8", "noflat", "lod20", nullptr};
 
 const BudgetCam kBudgetCams[] = {
     {"noon",

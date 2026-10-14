@@ -5753,6 +5753,40 @@ const FAR_GROUND_PROCGEN : u32 = 0xFFFFFFFFu;
 // slot (faredits.h kMatUntouched / kGroundShift).
 const FAR_PATCH_UNTOUCHED : u32 = 0xFFFu;
 const FAR_GROUND_SAMPLE : u32 = 0xFFFFFFFEu;
+// ---- A CAVE UNDER A STEEP FACE IS SEALED AT CASCADE SCALE (2026-10-14) -----
+// Tickets 2026-10-13_23-57-48 / _23-58-42 / _23-59-16: rows of black dashes on
+// every banded mesa wall, from 50 m to the horizon, where the near field --
+// the same voxels -- shows unbroken rock. caveBands keeps both bands vlen(40)
+// under the column's OWN ground, so a cave can never breach, but on a slope
+// of s voxels per voxel that cover is only 40/s voxels of rock HORIZONTALLY:
+// on the default map's mesas (s ~ 14) a band-1 tube runs 3-6 voxels behind
+// the cliff face for hundreds of metres. A cascade cell 8-64 voxels wide is
+// its centre sample, and wherever that sample landed in the tube the cell was
+// AIR: a hole through the face, through which the ray met the tube's far wall
+// -- a cell the far surface map correctly calls 5 m under the terrain, so
+// burial took its sky and sun and it drew near black. Centre sampling cannot
+// represent a wall thinner than its cell, and an enclosed void is never
+// visible from outside, so the sieve fills an open-cave sample STONE when the
+// cell lies within TWO cells of the lowest ground around it -- of the four
+// axis-neighbouring cells' sample columns (`nbrMin`, from `far`'s column
+// prologue: the hole is seen THROUGH a neighbouring cell, so its ground is
+// the one that counts; a band-2 tube 25 m under a plateau whose LIP is the
+// next cell over is caught by this and by nothing local), and of this column
+// less the landform's drop over a cell and a half (Col.slope, |dh/dx| +
+// |dh/dz| in Q8: the diagonals the four neighbours do not see). Deep caves,
+// and every cave cell more than two cells under the ground round it, are
+// drawn as before, so a player inside a cave still sees its far end in the
+// cascade. The near field and genChunk are untouched (the world hash does not
+// move); `fardown` / FarEdits redraw a CHANGED chunk from its live voxels,
+// where an edit has opened the rock anyway.
+fn farCaveSealed(col : ptr<function, Col>, cave : ptr<function, CaveBands>, y : i32,
+                 shift : u32, nbrMin : i32) -> bool {
+  if (caveIn(*cave, y) != 1) { return false; }
+  let half = 1 << (shift - 1u);
+  let drop = (3 * half * max((*col).slope, 0) + 255) >> 8;
+  let ground = min((*col).h - drop, nbrMin);
+  return ground - (y + half) < (2 << shift);
+}
 fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
                  mat : u32, fine : vec3<i32>, shift : u32, seed : u32,
                  ground : u32, can : FarCanopy) -> u32 {
@@ -7372,6 +7406,18 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   var caveU : CaveBands;
   var trees : TreeCands;
   let needU = colPrologue(&col, fx, fz, yLoU, yHiU, &caveU);
+  // THE NEIGHBOUR CELLS' GROUND (farCaveSealed): the lowest ground of the four
+  // axis-neighbouring cells' sample columns, only for a column whose cave
+  // bands are on in this run's range. One call site, a fenced loop: each
+  // colHeightAt is a whole landColumn (see farCornerTop's note).
+  var caveNbrMin = 2147483647;
+  if ((caveU.on1 || caveU.on2) && !col.inRim && !col.wet && yLoU <= col.h) {
+    for (var ni = unrollFenceU(); ni < 4u; ni++) {
+      let sx = select(-step, step, (ni & 1u) != 0u);
+      let nxz = select(vec2<i32>(fx, fz + sx), vec2<i32>(fx + sx, fz), ni < 2u);
+      caveNbrMin = min(caveNbrMin, colHeightAt(nxz.x, nxz.y, T.seed));
+    }
+  }
   if (needU.trees) { treeCandsInto(&trees, fx, fz, T.seed, &ponds); } else { colNoTrees(&trees); }
   let treesN = trees.n;
   let treesTop = trees.top;
@@ -7496,6 +7542,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
       if (fine.y > deepTop || (!col.inRim && !col.wet && caveIn(cave, fine.y) != 0)) {
         mat = genCellIn(&col, &cave, true, &trees, true, &ponds, canopyArg,
                         fine.x, fine.y, fine.z, T.seed) & 0xFFFu;
+        if (!farCellIsSolid(mat) && farCaveSealed(&col, &cave, fine.y, shift, caveNbrMin)) { mat = M_STONE; }
       }
       // THE DUNGEON at the sample: genChunk's own dgCell, skin, scatter and
       // firm shell included, on the centre sample's material -- so a cascade

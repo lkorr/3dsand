@@ -5748,7 +5748,7 @@ struct FarRefine { hit : bool, t : f32, axis : i32, pal : u32 };
 // are tried in keeps the entry face's axis on a hit at tIn.
 fn farRefineCell(e : vec4<u32>, vc : vec3<i32>, s : f32, roL : vec3f, rd : vec3f,
                  inv : vec3f, tIn : f32, tOut : f32, entryAxis : i32,
-                 maxTop : i32) -> FarRefine {
+                 maxTop : i32, flat : bool) -> FarRefine {
   var r : FarRefine;
   r.hit = false;
   // THE QUICK MISS: heights compare in FINE units (a multiply, never a divide
@@ -5758,6 +5758,30 @@ fn farRefineCell(e : vec4<u32>, vc : vec3<i32>, s : f32, roL : vec3f, rd : vec3f
   let yIn = (roL.y + rd.y * tIn) * s;
   let yOut = (roL.y + rd.y * tOut) * s;
   if (min(yIn, yOut) > f32(maxTop + 1)) { return r; }
+  // THE FLAT REFINE (2026-10-14; render.farRefineFlatPx): the four tops differ
+  // by under the threshold in PIXELS here, so the 2x2 walk would draw relief
+  // nobody can see. One box up to the tallest top: the cell keeps its TRUE
+  // height (what the refine is for at levels 3+ -- a centre-sampled cell
+  // quantises the ground to its own height, 0.8-6.4 m, which is the flattened
+  // band past the old level-2 cap), and since the quick miss above already
+  // proved the ray reaches under that top inside the cell, it always hits:
+  // no miss into the next cell, no piece walk. Skin = the tallest entry's.
+  if (flat) {
+    let ez = select(select(e.w, e.z, farMapTop(e.z) == maxTop),
+                    select(e.y, e.x, farMapTop(e.x) == maxTop), farMapTop(e.x) == maxTop || farMapTop(e.y) == maxTop);
+    let top = f32(maxTop + 1);
+    r.hit = true;
+    r.t = tIn;
+    r.axis = entryAxis;
+    if (yIn > top) {
+      r.t = (top / s - roL.y) * inv.y;
+      r.axis = 1;
+    }
+    let yv = i32(floor((roL.y + rd.y * r.t) * s));
+    let skin = r.axis == 1 || yv >= maxTop;
+    r.pal = select((ez >> 23u) & 0x7Fu, (ez >> 16u) & 0x7Fu, skin);
+    return r;
+  }
   let midX = f32(vc.x) + 0.5;
   let midZ = f32(vc.z) + 0.5;
   let tx = clamp((midX - roL.x) * inv.x, tIn, tOut);
@@ -6488,9 +6512,13 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
                                         vec4<u32>(farCellSlot(cellByte)));
                     let hc = select(maxH, hq.w, level == 1u && !stalkCell);
                     if (mat == 0u || y0 + (si >> 1) <= hc) {
+                      // THE FLAT REFINE (render.farRefineFlatPx): relief under
+                      // that many pixels here is one box at the true top.
+                      let flat = f32(maxH - minH) * farVoxPx(vCur * s) <
+                                 TUNE_FAR_REFINE_FLAT_PX;
                       let rf = farRefineCell(e, vc, s, roL, rd, inv, vCur,
                                              min(vMax.x, min(vMax.y, vMax.z)), axis,
-                                             maxH);
+                                             maxH, flat);
                       if (rf.hit) {
                         out.hit = true;
                         out.t = rf.t * s;   // back to fine-voxel units
