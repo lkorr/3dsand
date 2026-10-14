@@ -18480,6 +18480,35 @@ where you hear from either (§12b, "The ears are on the character").
   and draws a bright orange ring around it — more objectionable than either
   look on its own.
 
+  **The crust is band-limited by the pixel footprint, and the far field runs
+  the same function** (2026-10-14, ticket `2026-10-13_21-00-23`, "lod for lava
+  look ass"). The crack octaves run 2.4 to ~21 cycles/m — the finest is half a
+  voxel — so point-sampled per pixel they aliased into sparkle from ~20 m, and
+  past the window seam the cascade did not run `shadeMolten` at all: far lava
+  took the liquid paint (palette + sky airglow), the sun and ambient terms and
+  the ember emission on top, i.e. exactly the saturated pale pink/white slab
+  this section was written to remove, cut off by a hard circle at the handoff
+  sphere. Now both fields call `shadeMolten(m, fineCell, hitP, n, rd, pool,
+  tVox)` (predicate `isMoltenMat`, `pool` = 1 for a cascade cell) with the
+  footprint in METRES per pixel (stretched by the view slant), so the law is a
+  function of distance alone and cannot step at the seam:
+  - `crustCracksFp` eases each octave to its mean (0.486, measured) once it
+    passes ~0.25-0.6 cycles per pixel, and reports the averaged share;
+  - that share is replaced by the MEAN EMISSION over the crack field's own
+    distribution — 16 measured quantiles run through the live knee / bias /
+    ramp / gain (`moltenEmit`), Karis-weighted (`1/(1+luma)`) so the far
+    colour matches the TONEMAPPED near look rather than the HDR mean (the
+    plain mean let the hottest quantiles wash the lake to creamy tan). The
+    ramp of the average crack value would have been an unlit plate;
+  - a MACRO crust (the same law 6x coarser and slower, footprint-filtered
+    itself) shifts that distribution warm along rafts' rifts and cool over
+    them, so a lake seen from a hillside keeps structure at a scale the
+    pixels can carry. It enters only once most of the fine crust is averaged,
+    so the near crust is untouched;
+  - the 0.4 m per-patch temperature jitter and its pulse fade with the same
+    rule (a sub-pixel patch's pulse is temporal sparkle).
+  Any emissive opaque liquid (molten glass, molten iron) gets all of it.
+
   **Embers are render-only, and that is an architectural choice.** The sim has
   a particle system and a data-driven `emit` reaction — lava emitting fire is
   one line of `reactions.json`. But lava is PERMANENT: unlike ember, which
@@ -20982,6 +21011,34 @@ tops inside the deck borrowed uncut texels and drew CLEAR over a clouded face
 ("bits of the mountain poking through"); near the eye the MAX overstates a slope
 by a whole sample sideways, a wide angle of sky pixels sent to the env map,
 while the cloud in front of near ground is thin either way.
+
+**Each pixel takes the texels of its own kind** (2026-10-14, ticket
+`2026-10-13_21-00-54`, "weird outline shit during cumulus weather around the
+hills"). The two rules above still blended ACROSS kinds and patched the wrong
+kind with a stand-in, and wherever the pyramid's ground and the drawn ground
+disagree that drew an outline: a sky pixel whose footprint held a cut texel
+mixed in the env map (a 64^2 directional march, a visibly different colour), so
+every ridge the pyramid knew behind the skyline showed as a dotted line of
+bluish specks at the texel pitch; a hit pixel on a crest the pyramid shaved
+had only sky texels and took their kilometres-long span, a band of different
+cloud along every crest; and a cascade still refilling drew the seam as a
+bilinear sawtooth. The upsample is now depth-CLASS-aware (`cloudScreenAt`,
+`cloudScreenAtHit`, `cloudClassSearch`): a pixel blends only the texels of its
+own kind in the 2x2, renormalised; with none there, the nearest of its kind
+within 3 texels (inverse-square weights); only then the old fallback (env map
+for sky, the sky span for a hit). The search runs only on those boundary
+pixels. Hit pixels keep the 8% whisper of sky texels beside cut ones.
+
+That alone made the specks WORSE, which named the real source: the temporal
+resolve (`cloud.wgsl resolve`). The cut bit was the current frame's while
+(c, T) were the running mean of every frame, and the per-frame jitter flips a
+ridge-line texel between cut (near-clear: no deck behind, no horizon fill, no
+cirrus) and sky every few frames — so ridge texels tagged SKY carried a blend
+of clear "ground" frames, and the neighbourhood clamp spanned both kinds too.
+The resolve is class-aware now: the clamp box and the reprojected history take
+only texels of the current frame's kind (renormalised bilinear; none = start
+over from this frame), and the span history likewise. Verified at the ticket's
+camera under `towering` at 11:00: the dotted ridge lines are gone.
 
 Cost of the march itself: within noise of before (cloud pass 1.3-1.8 ms mean in
 the 10-09 ticket views at 1600x900 under overcast, `--frames` pass attribution).

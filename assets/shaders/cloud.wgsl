@@ -1048,6 +1048,14 @@ fn loadRaw(p : vec2<i32>) -> Tex5 {
   let b = unpack2x16float(cloudRaw[i + 1u]);
   return Tex5(vec4f(a.x, a.y, b.x, b.y), unpackTd(cloudRaw[i + 2u]));
 }
+// The CUT bit (bit 9 of word 2) of a raw texel, clamped like loadRaw.
+fn rawCut(p : vec2<i32>) -> bool {
+  let q = clamp(p, vec2<i32>(0), vec2<i32>(i32(C.lowW) - 1, i32(C.lowH) - 1));
+  return (cloudRaw[(u32(q.y) * C.lowW + u32(q.x)) * RAW_WORDS + 2u] & 512u) != 0u;
+}
+fn histCut(base : u32, p : vec2<u32>) -> bool {
+  return (cloudHist[base + (p.y * C.lowW + p.x) * HIST_WORDS + 2u] & 512u) != 0u;
+}
 fn loadHistAt(base : u32, p : vec2<u32>) -> Tex5 {
   let i = base + (p.y * C.lowW + p.x) * HIST_WORDS;
   let a = unpack2x16float(cloudHist[i]);
@@ -1064,11 +1072,25 @@ fn loadHistAt(base : u32, p : vec2<u32>) -> Tex5 {
 // frames the jittered, dithered march has converged to a clean image — the
 // "low res plus temporal reconstruction" every cloud renderer in the corpus
 // describes (plan §1g). TAA then finishes the job at full resolution.
+//
+// THE HISTORY IS CLASS-AWARE (ticket 2026-10-13_21-00-54). A texel is a SKY
+// ray or a CUT ray (it stopped on the pyramid's ground: no deck behind, no
+// horizon fill, no cirrus -- near-clear), and the per-frame jitter flips a
+// texel on a ridge line between the two every few frames. The cut bit was
+// this frame's alone while (c, T) were the running mean of both, and the
+// neighbourhood clamp spanned both kinds too: every texel along a ridge the
+// pyramid knows carried a blend of clear "ground" frames tagged as sky. The
+// sky composite (raymarch.wgsl cloudScreenAt) showed them as a dotted line of
+// bare-sky specks tracing the ridges behind the skyline. So the clamp box and
+// the reprojected history both take only texels of THIS frame's kind
+// (renormalised bilinear); a texel whose history footprint holds none of its
+// kind starts over from this frame.
 @compute @workgroup_size(8, 8)
 fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= C.lowW || gid.y >= C.lowH) { return; }
   let p = vec2<i32>(gid.xy);
   let cur = loadRaw(p);
+  let curCut = rawCut(p);
   var mn = cur.v;
   var mx = cur.v;
   var mnd = cur.td;
@@ -1076,6 +1098,7 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   for (var k = 0u; k < 9u; k++) {
     if (k == 4u) { continue; }
     let o = vec2<i32>(i32(k % 3u) - 1, i32(k / 3u) - 1);
+    if (rawCut(p + o) != curCut) { continue; }
     let v = loadRaw(p + o);
     mn = min(mn, v.v);
     mx = max(mx, v.v);
@@ -1099,36 +1122,47 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
       if (q.x >= 0.0 && q.y >= 0.0 && q.x <= f32(C.lowW) - 1.001 && q.y <= f32(C.lowH) - 1.001) {
         let i0 = vec2<u32>(floor(q));
         let fr = q - floor(q);
-        let h00 = loadHistAt(C.histPrev, i0);
-        let h10 = loadHistAt(C.histPrev, i0 + vec2<u32>(1u, 0u));
-        let h01 = loadHistAt(C.histPrev, i0 + vec2<u32>(0u, 1u));
-        let h11 = loadHistAt(C.histPrev, i0 + vec2<u32>(1u, 1u));
-        var hist = mix(mix(h00.v, h10.v, fr.x), mix(h01.v, h11.v, fr.x), fr.y);
-        var histD = mix(mix(h00.td, h10.td, fr.x), mix(h01.td, h11.td, fr.x), fr.y);
-        // Neighbourhood clamp, slightly widened: the raw samples are dithered,
-        // so their min/max is noisier than the truth, and a tight clamp would
-        // throw the history away on every frame.
-        let pad = (mx - mn) * 0.25 + vec4f(0.002);
-        hist = clamp(hist, mn - pad, mx + pad);
-        histD = clamp(histD, mnd - (mxd - mnd) * 0.25 - 0.002, mxd + (mxd - mnd) * 0.25 + 0.002);
-        // A running mean for the first frames after a reset (C.spare.x is the
-        // history's age), the steady exponential after that.
-        let alpha = max(TUNE_CLOUD_TEMPORAL, 1.0 / (C.spare.x + 1.0));
-        outv = mix(hist, cur.v, alpha);
-        outd = mix(histD, cur.td, alpha);
-        // THE SPAN IS ACCUMULATED TOO, in its log2 code. It was this frame's
-        // alone while (c, T) were the running mean of many: the jittered
-        // march moved the span's ends by up to a step every frame against a
-        // steady opacity, and the composite over a slope inside the deck
-        // twitched with it (ticket 2026-10-09_22-19-35). Nearest history
-        // texel (a log distance does not bilinear across a silhouette), and
-        // only when both carry cloud: an empty span is not a distance.
-        let hs = cloudHist[C.histPrev + (u32(round(q.y)) * C.lowW + u32(round(q.x))) * HIST_WORDS + 2u];
-        let ha = vec2f(f32((hs >> 10u) & 2047u), f32(hs >> 21u));
-        let ca = vec2f(f32((spanW >> 10u) & 2047u), f32(spanW >> 21u));
-        if (ha.x <= ha.y && ca.x <= ca.y) {
-          let m = vec2<u32>(round(mix(ha, ca, alpha)));
-          spanW = (spanW & 1023u) | (m.x << 10u) | (m.y << 21u);
+        var hist = vec4f(0.0);
+        var histD = 0.0;
+        var hw = 0.0;
+        for (var k = 0u; k < 4u; k++) {
+          let hp = i0 + vec2<u32>(k & 1u, k >> 1u);
+          if (histCut(C.histPrev, hp) != curCut) { continue; }
+          let w = select(1.0 - fr.x, fr.x, (k & 1u) != 0u) *
+                  select(1.0 - fr.y, fr.y, k >= 2u);
+          let h = loadHistAt(C.histPrev, hp);
+          hist += h.v * w;
+          histD += h.td * w;
+          hw += w;
+        }
+        if (hw > 1e-4) {
+          hist /= hw;
+          histD /= hw;
+          // Neighbourhood clamp, slightly widened: the raw samples are dithered,
+          // so their min/max is noisier than the truth, and a tight clamp would
+          // throw the history away on every frame.
+          let pad = (mx - mn) * 0.25 + vec4f(0.002);
+          hist = clamp(hist, mn - pad, mx + pad);
+          histD = clamp(histD, mnd - (mxd - mnd) * 0.25 - 0.002, mxd + (mxd - mnd) * 0.25 + 0.002);
+          // A running mean for the first frames after a reset (C.spare.x is the
+          // history's age), the steady exponential after that.
+          let alpha = max(TUNE_CLOUD_TEMPORAL, 1.0 / (C.spare.x + 1.0));
+          outv = mix(hist, cur.v, alpha);
+          outd = mix(histD, cur.td, alpha);
+          // THE SPAN IS ACCUMULATED TOO, in its log2 code. It was this frame's
+          // alone while (c, T) were the running mean of many: the jittered
+          // march moved the span's ends by up to a step every frame against a
+          // steady opacity, and the composite over a slope inside the deck
+          // twitched with it (ticket 2026-10-09_22-19-35). Nearest history
+          // texel (a log distance does not bilinear across a silhouette), and
+          // only when both carry cloud: an empty span is not a distance.
+          let hs = cloudHist[C.histPrev + (u32(round(q.y)) * C.lowW + u32(round(q.x))) * HIST_WORDS + 2u];
+          let ha = vec2f(f32((hs >> 10u) & 2047u), f32(hs >> 21u));
+          let ca = vec2f(f32((spanW >> 10u) & 2047u), f32(spanW >> 21u));
+          if (ha.x <= ha.y && ca.x <= ca.y && ((hs & 512u) != 0u) == curCut) {
+            let m = vec2<u32>(round(mix(ha, ca, alpha)));
+            spanW = (spanW & 1023u) | (m.x << 10u) | (m.y << 21u);
+          }
         }
       }
     }

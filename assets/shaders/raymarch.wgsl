@@ -7190,44 +7190,141 @@ fn cloudySkyAirglow(rd : vec3f) -> vec3f {
 // A target whose size is not the one CloudParams was written for (a stale
 // uniform) reads as clear sky rather than as someone else's clouds.
 struct CloudPx { c : vec3f, t : f32, td : f32 };
-// For a SKY pixel along `rd`. A texel whose march stopped at the far
-// horizon's ground (the CUT bit, cloud.wgsl gCut) holds only the cloud in
-// front of a mountain the pyramid says is there; this pixel is sky, so the
-// frame drew no such ground (the pyramid's 25.6 m posts bridge a notch, or the
-// cascade is still refilling). Taking it painted a mountain-shaped HOLE in the
-// clouds, which jittered with the march's sub-pixel offset (ticket
-// 2026-10-09_22-19-35). A cut texel's bilinear weight goes to the env map
-// instead (the uncut column, cloud.wgsl env): weighted, not switched, so the
-// hand-over is as smooth as the bilinear itself. The env map has no detail
-// erosion, so a large region the frame draws no ground under (a cascade
-// refilling) reads softer, never as a hole.
-fn cloudScreenAt(fragXY : vec2f, rd : vec3f) -> CloudPx {
+// ---- EACH PIXEL TAKES THE TEXELS OF ITS OWN KIND (ticket 2026-10-13_21-00-54) ----
+// The cloud image is marched at 1/resDiv resolution, and every texel is one of
+// two kinds: a SKY texel (its ray went on to the deck's far side) or a CUT
+// texel (its ray stopped on the far horizon's pyramid ground, cloud.wgsl
+// gCut). A full-resolution pixel is also one of two kinds -- the frame drew
+// sky there, or a surface -- and the texels of the OTHER kind describe a
+// different column of air: a sky texel's extinction runs kilometres past a
+// hill, a cut texel's stops at a mountain the frame may not have drawn.
+//
+// Both composites used to blend across the kinds in the 2x2 bilinear
+// footprint and patch the wrong kind with a stand-in: a sky pixel swapped a
+// cut texel's weight for the ENV MAP (a 64^2 directional march, a different
+// colour from the screen march), a hit pixel kept a sky texel at 8% weight
+// and, when all four were sky texels, took their span as a guess. Where the
+// pyramid's ground and the drawn ground disagree -- its 25.6 m posts, its
+// AVG ground near the eye shaving a crest, its MAX ground far away standing
+// a ridge the cascade drew lower -- that drew the owner's "weird outline
+// around the hills" in a cumulus deck: a dotted line of env-coloured specks
+// at the texel pitch tracing every ridge the pyramid knows behind the
+// skyline, and a band along each crest that took sky texels' cloud instead
+// of the hill's. A cascade still refilling drew the same seam as a bilinear
+// sawtooth.
+//
+// So the upsample is depth-CLASS-aware, the classic nearest-depth upsample
+// in the one dimension these texels carry: a pixel blends only the texels of
+// its own kind in the 2x2, renormalised; when the 2x2 has none, the nearest
+// of its kind within CLOUD_CLASS_REACH texels beyond it (inverse-square
+// weights); only when THAT is empty does it fall back -- a sky pixel to the
+// env map (a cascade refilling under a large stretch of pyramid ground), a
+// hit pixel to the sky texels' span (no ground the cloud march knew within
+// reach). The search runs only on those boundary pixels.
+const CLOUD_CLASS_REACH : i32 = 3;
+struct CloudAcc { c : vec3f, t : f32, td : f32, w : f32 };
+fn cloudTexelIsCut(p : vec2<u32>) -> bool {
+  let idx = CL.histCur + (p.y * CL.lowW + p.x) * 3u;
+  if (idx + 2u >= arrayLength(&cloudHist)) { return false; }
+  return (cloudHist[idx + 2u] & 512u) != 0u;
+}
+// The low-res footprint of a full-resolution pixel: texel coords (centres at
+// integers) and the 2x2's corner.
+fn cloudLowF(fragXY : vec2f) -> vec2f {
   let div = f32(max(CL.resDiv, 1u));
-  let f = clamp(fragXY / div - 0.5, vec2f(0.0),
-                vec2f(f32(CL.lowW) - 1.001, f32(CL.lowH) - 1.001));
+  return clamp(fragXY / div - 0.5, vec2f(0.0),
+               vec2f(f32(CL.lowW) - 1.001, f32(CL.lowH) - 1.001));
+}
+// The texel's cloud IN FRONT OF a surface `tHitM` metres along the ray (see
+// cloudScreenAtHit for the rule): its recorded extinction span's share in
+// front of the hit scales its optical depth.
+fn cloudTexelAtHit(p : vec2<u32>, tHitM : f32) -> CloudPx {
+  let idx = CL.histCur + (p.y * CL.lowW + p.x) * 3u;
+  if (idx + 2u >= arrayLength(&cloudHist)) { return CloudPx(vec3f(0.0), 1.0, 1.0); }
+  let rg = unpack2x16float(cloudHist[idx]);
+  let bt = unpack2x16float(cloudHist[idx + 1u]);
+  let sw = cloudHist[idx + 2u];
+  let a = exp2(f32((sw >> 10u) & 2047u) / 2047.0 * 17.0);
+  let b = exp2(f32(sw >> 21u) / 2047.0 * 17.0);
+  let tex = clamp(bt.y, 0.0, 1.0);
+  // A degenerate span (one layer at one distance: the horizon fill, the
+  // cirrus) still ramps over 2% of its distance rather than stepping.
+  let share = clamp((tHitM - a) / max(b - a, a * 0.02 + 1.0), 0.0, 1.0);
+  let t = exp2(share * log2(max(tex, 1e-6)));
+  let k1 = select(share, (1.0 - t) / (1.0 - tex), tex < 0.999);
+  return CloudPx(max(vec3f(rg.x, rg.y, bt.x), vec3f(0.0)) * k1, t, t);
+}
+// The nearest texels of one kind OUTSIDE the 2x2 footprint, within
+// CLOUD_CLASS_REACH: summed with inverse-square weights, w = 0 for none.
+// `wantCut` picks the kind; `tHitM` < 0 reads sky texels whole (the sky
+// composite), >= 0 reads each texel's share in front of that hit.
+fn cloudClassSearch(f : vec2f, wantCut : bool, tHitM : f32) -> CloudAcc {
+  var o = CloudAcc(vec3f(0.0), 0.0, 0.0, 0.0);
+  let i0 = vec2<i32>(floor(f));
+  let hi = vec2<i32>(i32(CL.lowW) - 1, i32(CL.lowH) - 1);
+  for (var dy = -CLOUD_CLASS_REACH; dy <= CLOUD_CLASS_REACH + 1; dy++) {
+    for (var dx = -CLOUD_CLASS_REACH; dx <= CLOUD_CLASS_REACH + 1; dx++) {
+      if (dx >= 0 && dx <= 1 && dy >= 0 && dy <= 1) { continue; }   // the 2x2
+      let q = i0 + vec2<i32>(dx, dy);
+      if (any(q < vec2<i32>(0)) || any(q > hi)) { continue; }
+      let p = vec2<u32>(q);
+      if (cloudTexelIsCut(p) != wantCut) { continue; }
+      let d = vec2f(q) - f;
+      let w = 1.0 / (1.0 + dot(d, d));
+      var e : CloudPx;
+      if (tHitM >= 0.0) { e = cloudTexelAtHit(p, tHitM); } else { e = cloudHistTexel(p); }
+      o.c += e.c * w;
+      o.t += e.t * w;
+      o.td += e.td * w;
+      o.w += w;
+    }
+  }
+  return o;
+}
+
+// The accumulated cloud image at a full-resolution pixel: (in-scatter, T).
+// Bilinear over the low-res grid, whose texel centres sit at (i + 0.5) * div.
+// A target whose size is not the one CloudParams was written for (a stale
+// uniform) reads as clear sky rather than as someone else's clouds.
+// For a SKY pixel along `rd`: the sky texels of its footprint (above). A cut
+// texel holds only the cloud in front of a mountain the pyramid says is
+// there, and this pixel is sky, so the frame drew no such ground; taking it
+// painted a mountain-shaped HOLE in the clouds (ticket 2026-10-09_22-19-35),
+// and swapping it for the env map drew the specks above.
+fn cloudScreenAt(fragXY : vec2f, rd : vec3f) -> CloudPx {
+  let f = cloudLowF(fragXY);
   let i0 = vec2<u32>(floor(f));
   let fr = f - floor(f);
   let i1 = min(i0 + vec2<u32>(1u), vec2<u32>(CL.lowW - 1u, CL.lowH - 1u));
   var acc = CloudPx(vec3f(0.0), 0.0, 0.0);
-  var wCut = 0.0;
+  var wSky = 0.0;
   for (var k = 0u; k < 4u; k++) {
     let p = vec2<u32>(select(i0.x, i1.x, (k & 1u) != 0u), select(i0.y, i1.y, k >= 2u));
     let w = select(1.0 - fr.x, fr.x, (k & 1u) != 0u) * select(1.0 - fr.y, fr.y, k >= 2u);
     let idx = CL.histCur + (p.y * CL.lowW + p.x) * 3u;
     if (idx + 2u >= arrayLength(&cloudHist)) { return CloudPx(vec3f(0.0), 1.0, 1.0); }
-    if ((cloudHist[idx + 2u] & 512u) != 0u) { wCut += w; continue; }
+    if ((cloudHist[idx + 2u] & 512u) != 0u) { continue; }
     let e = cloudHistTexel(p);
     acc.c += e.c * w;
     acc.t += e.t * w;
     acc.td += e.td * w;
+    wSky += w;
   }
-  if (wCut > 0.0) {
-    let e = cloudEnvAt(normalize(rd), &CL, &cloudMaps);
-    acc.c += max(e.rgb, vec3f(0.0)) * wCut;
-    acc.t += e.a * wCut;
-    acc.td += e.a * wCut;
+  if (wSky <= 1e-4) {
+    // No sky texel in the footprint: the nearest ones, else the env map (the
+    // uncut column, cloud.wgsl env) -- a large region the frame draws no
+    // ground under (a cascade refilling) reads softer, never as a hole.
+    let s = cloudClassSearch(f, false, -1.0);
+    if (s.w > 0.0) {
+      acc = CloudPx(s.c, s.t, s.td);
+      wSky = s.w;
+    } else {
+      let e = cloudEnvAt(normalize(rd), &CL, &cloudMaps);
+      return CloudPx(max(e.rgb, vec3f(0.0)), clamp(e.a, 0.0, 1.0), clamp(e.a, 0.0, 1.0));
+    }
   }
-  return CloudPx(max(acc.c, vec3f(0.0)), clamp(acc.t, 0.0, 1.0), clamp(acc.td, 0.0, 1.0));
+  return CloudPx(max(acc.c / wSky, vec3f(0.0)), clamp(acc.t / wSky, 0.0, 1.0),
+                 clamp(acc.td / wSky, 0.0, 1.0));
 }
 fn cloudHistTexel(p : vec2<u32>) -> CloudPx {
   let i = CL.histCur + (p.y * CL.lowW + p.x) * 3u;
@@ -7247,44 +7344,40 @@ fn cloudHistTexel(p : vec2<u32>) -> CloudPx {
 // whole column), keeps the deck seen from above off a cliff standing in front
 // of it, and is a depth-aware upsample for free: a sky texel's far span does
 // not bleed onto a near silhouette.
+//
+// A hit pixel takes the CUT texels of its footprint (above): a cut texel's
+// ray stopped on the ground, in steps fitted to that short segment, the best
+// proxy a hit pixel has. A sky texel's span runs kilometres past this surface
+// in steps of hundreds of metres, so its share for a near hit is a guess --
+// it stays as a whisper (8%) beside cut texels, and is used whole only when
+// no cut texel lies within reach.
 fn cloudScreenAtHit(fragXY : vec2f, tHitM : f32) -> CloudPx {
-  let div = f32(max(CL.resDiv, 1u));
-  let f = clamp(fragXY / div - 0.5, vec2f(0.0),
-                vec2f(f32(CL.lowW) - 1.001, f32(CL.lowH) - 1.001));
+  let f = cloudLowF(fragXY);
   let i0 = vec2<u32>(floor(f));
   let fr = f - floor(f);
   let i1 = min(i0 + vec2<u32>(1u), vec2<u32>(CL.lowW - 1u, CL.lowH - 1u));
   var o = CloudPx(vec3f(0.0), 0.0, 0.0);
   var wSum = 0.0;
+  var wCut = 0.0;
   for (var k = 0u; k < 4u; k++) {
     let p = vec2<u32>(select(i0.x, i1.x, (k & 1u) != 0u), select(i0.y, i1.y, k >= 2u));
     var w = select(1.0 - fr.x, fr.x, (k & 1u) != 0u) * select(1.0 - fr.y, fr.y, k >= 2u);
-    let idx = CL.histCur + (p.y * CL.lowW + p.x) * 3u;
-    var c = vec3f(0.0);
-    var t = 1.0;
-    if (idx + 2u < arrayLength(&cloudHist)) {
-      // A CUT texel's ray stopped on the ground, in steps fitted to that
-      // short segment: the best proxy a hit pixel has. An uncut texel is a
-      // sky ray whose span runs kilometres past this surface in steps of
-      // hundreds of metres, so its share for a near hit is a guess; next to a
-      // cut texel it all but gives way (ticket 2026-10-09_22-19-35).
-      w *= select(0.08, 1.0, (cloudHist[idx + 2u] & 512u) != 0u);
-      let rg = unpack2x16float(cloudHist[idx]);
-      let bt = unpack2x16float(cloudHist[idx + 1u]);
-      let sw = cloudHist[idx + 2u];
-      let a = exp2(f32((sw >> 10u) & 2047u) / 2047.0 * 17.0);
-      let b = exp2(f32(sw >> 21u) / 2047.0 * 17.0);
-      let tex = clamp(bt.y, 0.0, 1.0);
-      // A degenerate span (one layer at one distance: the horizon fill, the
-      // cirrus) still ramps over 2% of its distance rather than stepping.
-      let share = clamp((tHitM - a) / max(b - a, a * 0.02 + 1.0), 0.0, 1.0);
-      t = exp2(share * log2(max(tex, 1e-6)));
-      let k1 = select(share, (1.0 - t) / (1.0 - tex), tex < 0.999);
-      c = max(vec3f(rg.x, rg.y, bt.x), vec3f(0.0)) * k1;
-    }
-    o.c += c * w;
-    o.t += t * w;
+    let cut = cloudTexelIsCut(p);
+    if (cut) { wCut += w; }
+    w *= select(0.08, 1.0, cut);
+    let e = cloudTexelAtHit(p, tHitM);
+    o.c += e.c * w;
+    o.t += e.t * w;
     wSum += w;
+  }
+  if (wCut <= 1e-4) {
+    // Every texel in the footprint is sky: a crest the pyramid shaved, or
+    // ground it put lower. The nearest cut texels are the hill under it.
+    let s = cloudClassSearch(f, true, tHitM);
+    if (s.w > 0.0) {
+      o = CloudPx(s.c, s.t, s.t);
+      wSum = s.w;
+    }
   }
   o.c /= max(wSum, 1e-6);
   o.t = select(1.0, o.t / wSum, wSum > 1e-6);
@@ -12270,46 +12363,98 @@ fn hashNoise2(p : vec2f) -> f32 {
   return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
-// Ridged multi-octave noise -> crack network. Returns 0..1, high in cracks.
-fn crustCracks(pm : vec2f, t : f32) -> f32 {
-  // Advection: each octave drifts at its own rate and direction, so the crust
-  // shears rather than sliding rigidly. Slow — lava is viscous, and anything
-  // fast enough to notice per-frame reads as boiling water, not rock.
+// ---- THE CRUST IS BAND-LIMITED BY THE PIXEL FOOTPRINT (ticket 2026-10-13_21-00-23) ----
+// The crack field is four octaves from 2.4 to ~21 cycles per metre — the
+// finest is HALF A VOXEL. Point-sampled once per pixel it is fine at arm's
+// length and aliases into sparkle from ~20 m out, and past the window seam
+// the far field did not run it at all: far lava was lit like rock (palette
+// albedo, sky airglow, sun) with the flat emission added on top, which is the
+// saturated pale pink/white slab this function was written to get rid of —
+// drawn as a disc with a hard circular edge at the handoff sphere.
+//
+// The fix is the texture-filtering answer, in both fields from one function:
+//  * each octave whose frequency passes ~0.5 cycles per pixel eases to its
+//    MEAN (every octave's mean ridge is 0.486, measured over 4e5 samples of
+//    this exact noise), so the detail fades out where it would alias instead
+//    of turning into noise;
+//  * what the faded octaves carried is not thrown away: shadeMolten blends
+//    toward MOLTEN_CRACK_Q's mean EMISSION — the ramp averaged over the crack
+//    field's own distribution, not the ramp of the average crack. The ramp
+//    is steeply nonlinear (dark plates, glowing seams), so the average of the
+//    look is a dim warm red with a hot tint, while "the look at the average
+//    crack value" is an unlit plate; using the latter would turn every
+//    distant pool black.
+// Footprint in METRES per pixel, so it is the same law for a near hit and a
+// cascade hit at the same distance: the seam cannot show.
+const MOLTEN_CRACK_MEAN : f32 = 0.486;
+// Ridge octave frequency must stay under this many cycles per pixel...
+const MOLTEN_FP_FADE_LO : f32 = 0.25;
+// ...and is fully its mean at this many.
+const MOLTEN_FP_FADE_HI : f32 = 0.6;
+// The macro crust (shadeMolten): the crack law this many times coarser, and
+// how far its rifts/rafts shift the averaged crack distribution (the field's
+// spread is ~0.17, so 0.7 moves a raft's mean below the knee and a rift's
+// into it; 0.9 pushed the rifts to the ramp's yellow top and the lake read
+// creamy).
+const MOLTEN_MACRO_SCALE : f32 = 6.0;
+const MOLTEN_MACRO_GAIN : f32 = 0.7;
+
+// What the octaves are (they were crustCracks' body, now crustCracksFp's):
+// Advection: each octave drifts at its own rate and direction, so the crust
+// shears rather than sliding rigidly. Slow — lava is viscous, and anything
+// fast enough to notice per-frame reads as boiling water, not rock.
+//
+// Base frequency in cycles per metre. Plates want to be roughly fist- to
+// head-sized; at 0.55 they came out metres across and the pool read as
+// polished marble rather than crust.
+//
+// ROTATE THE DOMAIN PER OCTAVE. hashNoise2 samples a square lattice, and the
+// ridge transform turns that lattice's axes into visible creases: without
+// rotation every octave creases along the SAME x/y directions, they
+// reinforce, and the crack network comes out full of right angles and long
+// straight runs — it reads as cracked tile, not as rock. An irrational-ish
+// angle per octave (~31.7 deg, chosen so no small multiple lands back on an
+// axis) decorrelates them and the network turns organic.
+//
+// Ridge transform: peaks become creases. `pow` below 2 WIDENS the crease —
+// squaring gives the thin, hard-edged filaments that read as fractured
+// tile; a gentler exponent keeps a crack network but lets it bloom into
+// the softer molten channels of classic lava.
+//
+// Amplitude falls off FASTER than 0.5 so the fine octaves contribute
+// texture without carving additional hard creases of their own — the
+// high-frequency detail is what makes the network look busy and angular.
+//
+// Ridged multi-octave noise -> crack network. x = 0..1, high in cracks;
+// y = the share of the field's weight that the footprint replaced by its mean
+// (0 = all four octaves resolved, 1 = the pixel sees only the average).
+fn crustCracksFp(pm : vec2f, t : f32, fpM : f32) -> vec2f {
   var v = 0.0;
   var amp = 1.0;
   var norm = 0.0;
-  // Base frequency in cycles per metre. Plates want to be roughly fist- to
-  // head-sized; at 0.55 they came out metres across and the pool read as
-  // polished marble rather than crust.
+  var lost = 0.0;
+  var freq = TUNE_LAVA_CRACK_FREQ;
   var p = pm * TUNE_LAVA_CRACK_FREQ;
   var drift = vec2f(0.031, -0.019);
-  // ROTATE THE DOMAIN PER OCTAVE. hashNoise2 samples a square lattice, and the
-  // ridge transform turns that lattice's axes into visible creases: without
-  // rotation every octave creases along the SAME x/y directions, they
-  // reinforce, and the crack network comes out full of right angles and long
-  // straight runs — it reads as cracked tile, not as rock. An irrational-ish
-  // angle per octave (~31.7 deg, chosen so no small multiple lands back on an
-  // axis) decorrelates them and the network turns organic.
   let ca = 0.851; let sa = 0.525;   // cos/sin of ~31.7 degrees
   for (var i = 0; i < 4; i++) {
-    let n = hashNoise2(p + drift * t);
-    // Ridge transform: peaks become creases. `pow` below 2 WIDENS the crease —
-    // squaring gives the thin, hard-edged filaments that read as fractured
-    // tile; a gentler exponent keeps a crack network but lets it bloom into
-    // the softer molten channels of classic lava.
-    let ridge = 1.0 - abs(n * 2.0 - 1.0);
-    v += pow(ridge, 1.72) * amp;
+    let w = smoothstep(MOLTEN_FP_FADE_LO, MOLTEN_FP_FADE_HI, fpM * freq);
+    var r = MOLTEN_CRACK_MEAN;
+    if (w < 1.0) {
+      let n = hashNoise2(p + drift * t);
+      r = mix(pow(1.0 - abs(n * 2.0 - 1.0), 1.72), MOLTEN_CRACK_MEAN, w);
+    }
+    v += r * amp;
+    lost += w * amp;
     norm += amp;
-    // Amplitude falls off FASTER than 0.5 so the fine octaves contribute
-    // texture without carving additional hard creases of their own — the
-    // high-frequency detail is what makes the network look busy and angular.
     amp *= 0.42;
-    p = vec2f(p.x * ca - p.y * sa, p.x * sa + p.y * ca) * 2.07 +
-        vec2f(11.3, 7.7);            // non-integer lacunarity: no re-tiling
+    freq *= 2.07;
+    p = vec2f(p.x * ca - p.y * sa, p.x * sa + p.y * ca) * 2.07 + vec2f(11.3, 7.7);
     drift = vec2f(-drift.y, drift.x) * 1.35;
   }
-  return v / max(norm, 1e-5);
+  return vec2f(v / max(norm, 1e-5), lost / max(norm, 1e-5));
 }
+
 
 // ---- the full molten shade ----
 // Returns the emitted colour of a molten surface cell, in linear HDR (values
@@ -12354,13 +12499,56 @@ fn moltenPooling(cell : vec3<i32>, mat : u32) -> f32 {
 }
 
 
-fn shadeMolten(m : Material, mat : u32, cell : vec3<i32>, hitP : vec3f,
-               n : vec3f, rd : vec3f) -> vec3f {
-  // How much surface is there for a crust to form on? 0 = isolated speck,
-  // 1 = the middle of a pool. Everything crust-related below is scaled by
-  // this, so scattered lava keeps the simple emissive look it had before the
-  // crust model existed (see moltenPooling).
-  let pool = moltenPooling(cell, mat);
+// Is this material MOLTEN -- an emissive OPAQUE liquid (lava, molten glass,
+// molten metal)? Detected by class + flags + emission, never by material ID:
+// any modder's emissive opaque liquid gets the crust shade for free, in the
+// near field AND the far one (one predicate, two call sites).
+fn isMoltenMat(m : Material) -> bool {
+  return m.klass == CLASS_LIQUID && (m.flags & MATF_OPAQUE) != 0u && m.emission > 0u;
+}
+
+// The emitted colour at one crust temperature: the blackbody ramp scaled by
+// its T^n power, plus the grazing rim (`grazing3` = (1 - |n.v|)^3). Split out
+// so the footprint average in shadeMolten can run it over the crack
+// distribution.
+fn moltenEmit(m : Material, temp : f32, grazing3 : f32) -> vec3f {
+  // Emission scales STEEPLY with temperature (Stefan-Boltzmann is T^4; the
+  // exponent here is tuned rather than physical, but the point is the same --
+  // the cracks must out-radiate the plates by a large factor, or the surface
+  // averages back out into the flat slab this replaces).
+  let emis = f32(m.emission) / 255.0;
+  // Peak intensity is bounded on purpose. The steep exponent is what makes
+  // cracks out-radiate plates, but run it to 3.4x and the crack cores land
+  // deep in the tonemap's shoulder, where per-channel compression bleaches
+  // them to white and the hue is lost exactly where the surface is most
+  // interesting. ~1.9x peak keeps the cores inside the range where the
+  // shoulder still discriminates colour.
+  let power = temp * temp * (0.35 + 2.2 * temp);
+  // The constant term is the crust's own dim self-illumination, NOT an ambient
+  // light -- it has to stay small or it lifts the dark plates back into brown.
+  var c = moltenRamp(m, temp) * (0.055 + power * emis * TUNE_LAVA_EMISSION_GAIN);
+  // Fresnel-ish rim: a glancing view of any surface catches more of its
+  // emission, and on a pool this draws a hot lip around the far edge that
+  // makes it read as a volume of liquid rather than a painted disc.
+  c += moltenRamp(m, min(temp + 0.25, 1.0)) * grazing3 * emis * 0.55;
+  return c;
+}
+
+// `pool`: how much surface is there for a crust to form on? 0 = isolated
+// speck, 1 = the middle of a pool (moltenPooling in the window; 1 for a
+// cascade cell, which is a whole far cell of lava). Everything crust-related
+// below is scaled by it, so scattered lava keeps the simple emissive look it
+// had before the crust model existed.
+// `tVox`: hit distance in fine voxels -- the pixel footprint the crust is
+// band-limited to (crustCracksFp), the same law on both sides of the seam.
+fn shadeMolten(m : Material, cell : vec3<i32>, hitP : vec3f,
+               n : vec3f, rd : vec3f, pool : f32, tVox : f32) -> vec3f {
+  // Pixel footprint in metres, stretched by the view's slant across the face
+  // (the pattern is foreshortened along the view, and the longer axis is the
+  // one that aliases -- the trilinear-mip rule). Floored at a 0.2 cosine so a
+  // grazing pool keeps some structure rather than going flat at the horizon.
+  let cosV = max(abs(dot(n, rd)), 0.2);
+  let fpM = max(tVox, 1.0) * VOXEL_METERS * R.tanHalfFov / (R.viewPx * 0.5) / cosV;
 
   // Plates live in the horizontal plane for a pool surface; for a wall of
   // lava, project onto whichever plane the face points out of, so a vertical
@@ -12371,7 +12559,8 @@ fn shadeMolten(m : Material, mat : u32, cell : vec3<i32>, hitP : vec3f,
   else { pm = vec2f(hitP.x, hitP.y); }
   pm *= VOXEL_METERS;
 
-  let cracks = crustCracks(pm, R.time);
+  let ck = crustCracksFp(pm, R.time, fpM);
+  let cracks = ck.x;
 
   // Map the crack field to temperature with a SHARP knee. The knee is what
   // separates plate from crack: a soft ramp gives a uniformly warm surface
@@ -12414,13 +12603,19 @@ fn shadeMolten(m : Material, mat : u32, cell : vec3<i32>, hitP : vec3f,
   // rectangles rather than reading as variation within a continuous crust.
   // Scaled by pooling for the same reason as the crack field: plate-to-plate
   // temperature variation is meaningless on something that is not a plate.
-  temp += (f32(ph & 0xFFu) / 255.0 - 0.68) * 0.10 * pool;
+  // The patch is 0.4 m, so it is band-limited like the cracks: past ~2
+  // patches per pixel it is its mean (-0.018), not a per-pixel coin flip.
+  let wPatch = smoothstep(MOLTEN_FP_FADE_LO, MOLTEN_FP_FADE_HI, fpM / (4.0 * VOXEL_METERS));
+  let jit = mix(f32(ph & 0xFFu) / 255.0 - 0.68, 0.5 - 0.68, wPatch) * 0.10 * pool;
+  temp += jit;
 
   // Slow per-cell pulse: convection turning fresh melt over. Distinct phase
   // per patch so the pool does not beat in unison (same reasoning as the fire
   // flicker, which this deliberately does NOT reuse — fire flickers fast and
   // randomly, lava breathes).
-  temp += TUNE_LAVA_PULSE_AMP * sin(R.time * TUNE_LAVA_PULSE_RATE + f32(ph & 0x3FFu) * 0.0061);
+  // Faded with the patch: a sub-pixel patch's pulse is temporal sparkle.
+  temp += (1.0 - wPatch) * TUNE_LAVA_PULSE_AMP *
+          sin(R.time * TUNE_LAVA_PULSE_RATE + f32(ph & 0x3FFu) * 0.0061);
 
   // Top faces are the coolest (they radiate to the sky and skin over first);
   // the sides of a flow are freshly exposed melt and run hotter.
@@ -12433,35 +12628,62 @@ fn shadeMolten(m : Material, mat : u32, cell : vec3<i32>, hitP : vec3f,
   // rectangles scattered over the surface — it reads as a shading bug, which
   // is exactly what it is. Keep the difference under the width of one ramp
   // band so a riser blends with its neighbours instead of banding away.
-  if (n.y > 0.5) { temp -= 0.015 * pool; }
-  else { temp += 0.030 * pool; }
+  let faceBias = select(0.030, -0.015, n.y > 0.5) * pool;
+  temp += faceBias;
 
   temp = clamp(temp, 0.0, 1.0);
-
-  var c = moltenRamp(m, temp);
-
-  // Emission scales STEEPLY with temperature (Stefan-Boltzmann is T^4; the
-  // exponent here is tuned rather than physical, but the point is the same —
-  // the cracks must out-radiate the plates by a large factor, or the surface
-  // averages back out into the flat slab this replaces).
-  let emis = f32(m.emission) / 255.0;
-  // Peak intensity is bounded on purpose. The steep exponent is what makes
-  // cracks out-radiate plates, but run it to 3.4x and the crack cores land
-  // deep in the tonemap's shoulder, where per-channel compression bleaches
-  // them to white and the hue is lost exactly where the surface is most
-  // interesting. ~1.9x peak keeps the cores inside the range where the
-  // shoulder still discriminates colour.
-  let power = temp * temp * (0.35 + 2.2 * temp);
-  // The constant term is the crust's own dim self-illumination, NOT an ambient
-  // light — it has to stay small or it lifts the dark plates back into brown.
-  c *= 0.055 + power * emis * TUNE_LAVA_EMISSION_GAIN;
-
-  // Fresnel-ish rim: a glancing view of any surface catches more of its
-  // emission, and on a pool this draws a hot lip around the far edge that
-  // makes it read as a volume of liquid rather than a painted disc.
   let grazing = 1.0 - abs(dot(n, -rd));
-  c += moltenRamp(m, min(temp + 0.25, 1.0)) * pow(grazing, 3.0) * emis * 0.55;
+  let g3 = grazing * grazing * grazing;
+  var c = moltenEmit(m, temp, g3);
 
+  // ---- what the footprint averaged away (crustCracksFp) ----
+  // The resolved octaves are shaded above; the share the pixel can no longer
+  // resolve is replaced by the MEAN EMISSION over the crack field's own
+  // distribution: 16 quantiles of the crack value, measured over 4e5 samples
+  // of this exact noise (they only need re-measuring if the octave law in
+  // crustCracksFp changes; the knee, bias, ramp and gain stay live knobs
+  // because they are applied here, per quantile). A far pool therefore reads
+  // as the dim warm red its plates and seams average to -- the near crust's
+  // hue and brightness with the detail squinted away -- not as a lit plate,
+  // and not as the saturated slab the far field used to draw.
+  //
+  // THE MACRO CRUST. A flat mean is right for the colour and wrong for the
+  // read: a lava lake seen from a hillside is not a uniform disc, it is
+  // rafts of skin with hot rifts between them, at a scale far above the
+  // fist-sized plates. So the same crack law runs again MOLTEN_MACRO_SCALE
+  // times coarser (and slower), band-limited by the same footprint rule,
+  // and shifts the averaged distribution warm along its rifts and cool over
+  // its rafts. It only enters through the averaged share (ck.y), so the near
+  // crust is untouched, and it is itself footprint-filtered, so at the
+  // horizon it too eases to the mean instead of aliasing.
+  if (ck.y > 0.0) {
+    let mk = crustCracksFp(pm * (1.0 / MOLTEN_MACRO_SCALE) + vec2f(37.1, -19.3),
+                           R.time * (1.0 / MOLTEN_MACRO_SCALE), fpM * (1.0 / MOLTEN_MACRO_SCALE));
+    // Only once MOST of the crust is averaged: while the plates still
+    // resolve, the small averaged share (the finest octave, from ~10 m out)
+    // must not paint the coarse rifts over them as a soft glowing haze.
+    let shift = (mk.x - MOLTEN_CRACK_MEAN) * MOLTEN_MACRO_GAIN * pool *
+                smoothstep(0.35, 0.85, ck.y);
+    var q = array<f32, 16>(0.1616, 0.2317, 0.2800, 0.3197, 0.3563, 0.3920, 0.4279, 0.4639,
+                           0.5003, 0.5377, 0.5751, 0.6134, 0.6524, 0.6947, 0.7458, 0.8225);
+    var avg = vec3f(0.0);
+    var wSum = 0.0;
+    for (var i = 0; i < 16; i++) {
+      var tq = smoothstep(TUNE_LAVA_CRACK_KNEE_LOW, TUNE_LAVA_CRACK_KNEE_HIGH, q[i] + shift) +
+               TUNE_LAVA_WARM_BIAS;
+      tq = mix(0.86, tq, pool) + jit + faceBias;
+      // KARIS-WEIGHTED (1 / (1 + luma)): the eye sees the near crust AFTER
+      // the tonemap has compressed the hot seams, so the honest far colour
+      // is the average of the tonemapped look, not the tonemap of the HDR
+      // average. A plain mean let the few hottest quantiles dominate and the
+      // far lake came out a pale creamy tan.
+      let e = moltenEmit(m, clamp(tq, 0.0, 1.0), g3);
+      let wq = 1.0 / (1.0 + dot(e, vec3f(0.2126, 0.7152, 0.0722)));
+      avg += e * wq;
+      wSum += wq;
+    }
+    c = mix(c, avg / wSum, ck.y);
+  }
   return c;
 }
 
@@ -16251,6 +16473,21 @@ fn fs(in : VSOut) -> FSOut {
       // pixels ONLY -- `emis > 0` is a handful of pixels in a frame that has a
       // distant fire in it and none at all in a frame that does not.
       var emis = bt.emis;
+      // ---- A FAR MOLTEN CELL IS THE NEAR CRUST, FOOTPRINT-FILTERED ----
+      // (ticket 2026-10-13_21-00-23.) Lava is its own light: the near field
+      // REPLACES the lit shade with shadeMolten, and so does this. Before,
+      // a cascade lava cell took the liquid paint above (palette + sky
+      // airglow), the sun and ambient terms, and the ember emission on top
+      // -- every channel saturated into a pale pink/white disc that ended
+      // on a hard circle at the handoff sphere. Same function, same fine
+      // cell for the patch hash, same footprint law as the near call, so
+      // the crust carries across the seam and fades to its mean emission
+      // where a pixel can no longer resolve it. pool = 1: a cascade cell of
+      // lava is a whole far cell of it.
+      if (isMoltenMat(m) && h.liqT <= 0.0) {
+        color = shadeMolten(m, fineV, hitP, n, rd, 1.0, far.t);
+        emis = 0.0;
+      }
       if (emis > 0.0) {
         let tFace = far.t - f32(WORLD_N) * 0.5;
         let amp = FAR_EMBER_PLASMA_AMP *
@@ -16799,10 +17036,9 @@ fn fs(in : VSOut) -> FSOut {
     // Detected by class + flags + emission, never by material ID: any modder's
     // emissive opaque liquid gets this for free (CLAUDE.md conventions).
     let emis = bt.emis;
-    let isMolten = m.klass == CLASS_LIQUID &&
-                   (m.flags & MATF_OPAQUE) != 0u && m.emission > 0u;
-    if (isMolten) {
-      color = shadeMolten(m, mat, h.cell, R.camPos + rd * h.t, n, rd);
+    if (isMoltenMat(m)) {
+      color = shadeMolten(m, h.cell, R.camPos + rd * h.t, n, rd,
+                          moltenPooling(h.cell, mat), h.t);
     } else if (emis > 0.0) {
       // everything else emissive (fire, embers) keeps the fast random flicker
       let ch = pcg(u32(h.cell.x * 7 + h.cell.y * 131 + h.cell.z * 2917));
