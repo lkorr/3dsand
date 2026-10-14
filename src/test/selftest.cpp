@@ -1361,6 +1361,9 @@ const char* const kOrder[] = {
     // The blood cloud drawn from below and above the surface (own worldgen,
     // own basin at (224, ., 224); nothing after it reads that region).
     "blood-cloud",
+    // Two liquids side by side drawn as one surface (own worldgen, own basin
+    // at (224, ., 224), as blood-cloud; nothing after it reads that region).
+    "liquid-seam",
     // A blast in a pond gives its water back (own worldgen, own basin).
     "blast-water",
     "snapshot-latency",

@@ -9198,23 +9198,39 @@ fn rippleCurvature(cp : vec2f, t : f32, e : f32, footM : f32) -> f32 {
 //
 // This is what makes a settling / flowing / wavy body of water read as a
 // surface with shape rather than as a staircase, and it costs 4 taps.
-fn liquidFullnessAt(c : vec3<i32>, mat : u32) -> f32 {
+//
+// ANY LIQUID IS THE SAME SURFACE (ticket 2026-10-13 20:56:51, "lye in a pool
+// has an outline like ice"). The SHAPE of a liquid's top is the interface
+// between liquid and whatever is not liquid; which liquid sits in the next
+// column over does not move that interface. This used to read "is this cell
+// MY material", so where lye met water each side saw the other as a cliff of
+// air at its own level: the column gradient across the seam was a whole
+// cell-height, the normal tilted ~55 degrees over it, the far rim of the patch
+// went grazing and its Fresnel to ~1, and a one-cell staircase of white sky
+// traced every boundary between two liquids -- lye in water, blood in water,
+// brine against fresh, a potion poured into a pond. Every surface-SHAPE probe
+// (this column, waterDepthM, waterOpenness, the viscous density field) now
+// reads any liquid; what each liquid LOOKS like is still its own material's
+// (optics, palette, the slick's sheen), so an immiscible pair such as oil on
+// water stays legible by colour, not by a fake crease at its edge.
+fn liquidFullnessAt(c : vec3<i32>) -> f32 {
   if (!inBounds(c)) { return 0.0; }
   let w = voxWordAt(c);
-  if (voxMat(w) != mat) { return 0.0; }
+  let m = voxMat(w);
+  if (m == MAT_AIR || materials[m].klass != CLASS_LIQUID) { return 0.0; }
   return f32(voxState(w) + 1u) / 8.0;
 }
 
 // Surface height (in voxels, relative to the cell floor) of the liquid column
 // at XZ: full cells below stack, and the topmost partial cell adds its
 // fullness. Sampling the column rather than one cell is what lets the gradient
-// see a slope of more than one cell.
-fn liquidColumn(c : vec3<i32>, mat : u32) -> f32 {
+// see a slope of more than one cell. Any liquid (liquidFullnessAt).
+fn liquidColumn(c : vec3<i32>) -> f32 {
   // Walk up from the sample cell while cells stay full; the first non-full
   // cell contributes its fraction and ends the column.
   var h = 0.0;
   for (var i = 0; i < 3; i++) {
-    let f = liquidFullnessAt(c + vec3<i32>(0, i, 0), mat);
+    let f = liquidFullnessAt(c + vec3<i32>(0, i, 0));
     h += f;
     if (f < 0.999) { break; }
   }
@@ -9234,11 +9250,11 @@ fn liquidColumn(c : vec3<i32>, mat : u32) -> f32 {
 // Resolution near the surface is what the shore fade and the shoaling gain are
 // sensitive to; resolution at 2 m is not, because tanh has already saturated.
 // A linear 26-tap probe would spend 18 extra taps buying nothing.
-fn waterDepthM(cell : vec3<i32>, mat : u32) -> f32 {
+fn waterDepthM(cell : vec3<i32>) -> f32 {
   var d = 0;
   var step = 1;
   for (var i = 0; i < 8; i++) {
-    if (liquidFullnessAt(cell - vec3<i32>(0, d + step, 0), mat) <= 0.0) {
+    if (liquidFullnessAt(cell - vec3<i32>(0, d + step, 0)) <= 0.0) {
       break;
     }
     d += step;
@@ -9267,7 +9283,7 @@ fn waterDepthM(cell : vec3<i32>, mat : u32) -> f32 {
 // otherwise go glassy and dead.
 //
 // 12 taps on a 2-voxel spacing, primary up-facing water hits only.
-fn waterOpenness(cell : vec3<i32>, mat : u32) -> f32 {
+fn waterOpenness(cell : vec3<i32>) -> f32 {
   var n = 0.0;
   for (var i = 0; i < 12; i++) {
     // Two rings at 2 and 4 voxels: the inner one separates a droplet from a
@@ -9276,7 +9292,7 @@ fn waterOpenness(cell : vec3<i32>, mat : u32) -> f32 {
     let a = f32(i % 6) * 1.0472;   // 60 degrees apart
     let o = vec3<i32>(i32(round(cos(a) * f32(ring))), 0,
                       i32(round(sin(a) * f32(ring))));
-    if (liquidColumn(cell + o, mat) > 0.05) { n += 1.0; }
+    if (liquidColumn(cell + o) > 0.05) { n += 1.0; }
   }
   return smoothstep(TUNE_WATER_FETCH_LOW, TUNE_WATER_FETCH_HIGH, n / 12.0);
 }
@@ -9512,10 +9528,10 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
 
   // Central differences of the column height across X and Z. dh/dx in voxels
   // per voxel is already a slope, so the normal is (-dh/dx, 1, -dh/dz).
-  let hx0 = liquidColumn(cell + vec3<i32>(-1, 0, 0), mat);
-  let hx1 = liquidColumn(cell + vec3<i32>( 1, 0, 0), mat);
-  let hz0 = liquidColumn(cell + vec3<i32>(0, 0, -1), mat);
-  let hz1 = liquidColumn(cell + vec3<i32>(0, 0,  1), mat);
+  let hx0 = liquidColumn(cell + vec3<i32>(-1, 0, 0));
+  let hx1 = liquidColumn(cell + vec3<i32>( 1, 0, 0));
+  let hz0 = liquidColumn(cell + vec3<i32>(0, 0, -1));
+  let hz1 = liquidColumn(cell + vec3<i32>(0, 0,  1));
   let slope = vec2f((hx0 - hx1) * 0.5, (hz0 - hz1) * 0.5);
 
   // Ripples on top of the macro slope, in world metres (waterWaveNormal).
@@ -9551,7 +9567,7 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
     waveBase += rainRipples(vec2f(hitP.x, hitP.z) * VOXEL_METERS, R.time, rainA,
                          waterRippleFootprint(hitP));
   }
-  return waterWaveNormal(hitP, waveBase, waterDepthM(cell, mat), waterOpenness(cell, mat),
+  return waterWaveNormal(hitP, waveBase, waterDepthM(cell), waterOpenness(cell),
                          waveFluxAt(cell));
 }
 
@@ -11012,8 +11028,15 @@ fn solLookAt(cell : vec3<i32>, mat : u32) -> SolLook {
   // A value on a cell that is not a solvent of its species is mass a
   // destroyed solvent left behind (solCompact clears it at the end of the
   // tick): it is not in this liquid.
+  // The SOLVENT is the cell's own liquid, not the surface's: a ray entering a
+  // water surface and crossing into lye (or brine under fresh water) reads the
+  // lye cell's solute as lye's. `mat` stands in only where the cell holds no
+  // CA liquid (the MPM fluid path's column).
+  let cw = voxWordAt(cell);
+  let cm = voxMat(cw);
+  let sm = select(mat, cm, cm != MAT_AIR && materials[cm].klass == CLASS_LIQUID);
   if (s == 0u || mass == 0u || s > 24u ||
-      (solSpec[SOLS_MAT_BASE + (mat & 0xFFFu)] & (1u << (7u + s))) == 0u) { return o; }
+      (solSpec[SOLS_MAT_BASE + (sm & 0xFFFu)] & (1u << (7u + s))) == 0u) { return o; }
   let rb = SOLS_BASE + s * SOLS_STRIDE;
   var refc = max(solSpec[rb + 1u], 1u);
   // lookFull (solutes.json, bits 16..23 of the tintStrength word): the
@@ -11024,10 +11047,10 @@ fn solLookAt(cell : vec3<i32>, mat : u32) -> SolLook {
   let nc = min(solSpec[rb + 10u], 4u);
   for (var k = 0u; k < nc; k = k + 1u) {
     let row = solSpec[rb + 11u + k];
-    if ((row & 0xFFFu) == mat) { refc = max(min(refc, row >> 24u), 1u); }
+    if ((row & 0xFFFu) == sm) { refc = max(min(refc, row >> 24u), 1u); }
   }
   // Concentration = mass per full cell (mass x 8 / fullness), as the CA reads it.
-  let full = voxState(voxWordAt(cell)) + 1u;
+  let full = voxState(cw) + 1u;
   let c = min(f32(mass * 8u) / f32(full * refc), 1.0);
   let t = solSpec[rb + 6u];   // 0x00RRGGBB
   o.tint = vec3f(f32((t >> 16u) & 0xFFu), f32((t >> 8u) & 0xFFu), f32(t & 0xFFu)) / 255.0;
@@ -11343,7 +11366,7 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // The reflected lobe's width (waterReflBlur): the sub-pixel wave slopes
     // turn this mirror rough with distance, so the stars in the reflected
     // sky average out instead of landing one crisp pixel each on the lake.
-    let reflBlur = waterReflBlur(hitP, waterOpenness(cell, mat));
+    let reflBlur = waterReflBlur(hitP, waterOpenness(cell));
     if (fres > TUNE_REFLECTION_CUTOFF) {
       reflection = traceReflection(hitP, n, rd, reflBlur);
     } else {
@@ -11656,8 +11679,10 @@ fn filmBands(q : vec2f, cosI : f32) -> vec3f {
 // should crust, but a one-voxel-wide RUN of blood down a wall is precisely the
 // "moving" case this needs to catch. Vertical extent is the signal that tells a
 // wall trail (tall, thin, moving) from a floor pool (wide, flat, still), so it
-// has to be part of the measurement.
-fn bloodPooling(cell : vec3<i32>, mat : u32) -> f32 {
+// has to be part of the measurement. Any liquid counts toward the body (a
+// patch of blood on a lake is part of a still body, not a droplet), for the
+// same reason as liquidFullnessAt: only the liquid/air interface has a rim.
+fn bloodPooling(cell : vec3<i32>) -> f32 {
   var n = 0.0;
   var total = 0.0;
   // 2-voxel spacing over a 5^3-ish neighbourhood: wide enough that a pool
@@ -11669,7 +11694,7 @@ fn bloodPooling(cell : vec3<i32>, mat : u32) -> f32 {
         let c = cell + vec3<i32>(dx, dy, dz);
         if (!inBounds(c)) { continue; }
         if (occTotal(chunkOcc(c)) == 0u) { continue; }
-        if (voxMat(voxWordAt(c)) == mat) { n += 1.0; }
+        if (liquidFullnessAt(c) > 0.0) { n += 1.0; }
       }
     }
   }
@@ -11709,17 +11734,22 @@ fn bloodPooling(cell : vec3<i32>, mat : u32) -> f32 {
 // that is. So a droplet is a small blob of density in an empty field and comes
 // out spherical; a pool is a slab and comes out flat on top. Both fall out of
 // the same code with no special cases.
-fn liquidDensityAt(c : vec3<i32>, mat : u32) -> f32 {
-  if (!inBounds(c)) { return 0.0; }
-  let w = voxWordAt(c);
-  if (voxMat(w) != mat) { return 0.0; }
-  return f32(voxState(w) + 1u) / 8.0;
+//
+// ANY liquid counts (liquidFullnessAt; ticket 2026-10-13 20:56:51): the field
+// is the shape of the liquid/air interface, so blood or oil lying against
+// water is one continuous surface there, not a blob whose side bulges out
+// over the neighbouring liquid (which tilted its normal exactly as the
+// lye-on-water rim did). The SILHOUETTE feather in shadeViscous is the one
+// reader that keeps the per-material field (liquidMatFieldAt): it softens
+// where THIS liquid ends, which beside water is still an edge of colour.
+fn liquidDensityAt(c : vec3<i32>) -> f32 {
+  return liquidFullnessAt(c);
 }
 
 // Trilinearly-interpolated density at an arbitrary world point. Samples on the
 // lattice of cell CENTRES (hence the -0.5), so the field is smooth everywhere
 // rather than piecewise-constant per cell.
-fn liquidFieldAt(p : vec3f, mat : u32) -> f32 {
+fn liquidFieldAt(p : vec3f) -> f32 {
   let g = p - vec3f(0.5);
   let b = floor(g);
   let f = g - b;
@@ -11729,7 +11759,28 @@ fn liquidFieldAt(p : vec3f, mat : u32) -> f32 {
   for (var i = 0; i < 8; i++) {
     let o = vec3<i32>(i & 1, (i >> 1) & 1, (i >> 2) & 1);
     let wgt = mix(1.0 - f, f, vec3f(o));
-    acc += liquidDensityAt(c0 + o, mat) * wgt.x * wgt.y * wgt.z;
+    acc += liquidDensityAt(c0 + o) * wgt.x * wgt.y * wgt.z;
+  }
+  return acc;
+}
+
+// The same trilinear field over THIS material only: where the blob of `mat`
+// ends, whatever lies beyond it. For shadeViscous's silhouette feather only --
+// never for a normal (see liquidDensityAt).
+fn liquidMatFieldAt(p : vec3f, mat : u32) -> f32 {
+  let g = p - vec3f(0.5);
+  let b = floor(g);
+  let f = g - b;
+  let c0 = vec3<i32>(b);
+  var acc = 0.0;
+  for (var i = 0; i < 8; i++) {
+    let o = vec3<i32>(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+    let c = c0 + o;
+    if (!inBounds(c)) { continue; }
+    let w = voxWordAt(c);
+    if (voxMat(w) != mat) { continue; }
+    let wgt = mix(1.0 - f, f, vec3f(o));
+    acc += (f32(voxState(w) + 1u) / 8.0) * wgt.x * wgt.y * wgt.z;
   }
   return acc;
 }
@@ -11742,19 +11793,19 @@ fn liquidFieldAt(p : vec3f, mat : u32) -> f32 {
 // 6 field samples x 8 taps = 48 voxel reads. That is the real cost of this
 // function, and it is why it runs ONLY on the primary blood surface hit — not
 // in reflections, not in shadow rays, and not on any other material.
-fn liquidFieldNormal(p : vec3f, mat : u32, fallback : vec3f) -> vec3f {
+fn liquidFieldNormal(p : vec3f, fallback : vec3f) -> vec3f {
   // Sampling baseline in voxels. This is the smoothing control: at 1.0 the
   // gradient spans one cell either side, which removes the per-voxel faceting
   // while keeping a droplet's shape. Raising it smooths harder (a blobbier,
   // more merged surface) at the cost of small-detail shape; below ~0.5 the
   // samples fall inside a single cell and the cubes come back.
   let e = TUNE_BLOOD_SMOOTH;
-  let gx = liquidFieldAt(p + vec3f(e, 0.0, 0.0), mat) -
-           liquidFieldAt(p - vec3f(e, 0.0, 0.0), mat);
-  let gy = liquidFieldAt(p + vec3f(0.0, e, 0.0), mat) -
-           liquidFieldAt(p - vec3f(0.0, e, 0.0), mat);
-  let gz = liquidFieldAt(p + vec3f(0.0, 0.0, e), mat) -
-           liquidFieldAt(p - vec3f(0.0, 0.0, e), mat);
+  let gx = liquidFieldAt(p + vec3f(e, 0.0, 0.0)) -
+           liquidFieldAt(p - vec3f(e, 0.0, 0.0));
+  let gy = liquidFieldAt(p + vec3f(0.0, e, 0.0)) -
+           liquidFieldAt(p - vec3f(0.0, e, 0.0));
+  let gz = liquidFieldAt(p + vec3f(0.0, 0.0, e)) -
+           liquidFieldAt(p - vec3f(0.0, 0.0, e));
   // The gradient points INTO the liquid (density increases inward), so the
   // outward surface normal is its negation.
   let g = vec3f(-gx, -gy, -gz);
@@ -11779,7 +11830,7 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
                 sceneBehind : vec3f, tSurf : f32, underwater : bool) -> vec3f {
   let m = materials[mat];
   let upFacing = (axis == 1 && sgn < 0.0);
-  let pool = bloodPooling(cell, mat);
+  let pool = bloodPooling(cell);
   // 0 = blood-like, 1 = petroleum-like. Every oil-specific term below rides
   // this, so a liquid authored between the two blends rather than switching.
   let oily = oiliness(m);
@@ -11791,7 +11842,7 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // of the blood AROUND them, so neighbouring voxels agree on their normal and
   // the surface reads as continuous.
   let flat = axisVec(axis, -sgn);
-  var n = liquidFieldNormal(hitP, mat, flat);
+  var n = liquidFieldNormal(hitP, flat);
   // Blend back toward the face normal on big flat pools. A pool's interior has
   // a weak, noisy gradient (the field is saturated in every direction), and
   // letting that noise drive the normal makes a still puddle shimmer; its true
@@ -11823,9 +11874,8 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     let floatW = floatingOnLiquid(cell, mat);
     if (floatW > 0.01) {
       let wc = floatBedCell(cell, mat);
-      let wm = voxMat(voxWordAt(wc));
-      let wn = waterWaveNormal(hitP, vec2f(0.0), waterDepthM(wc, wm),
-                               waterOpenness(wc, wm), vec2f(0.0));
+      let wn = waterWaveNormal(hitP, vec2f(0.0), waterDepthM(wc),
+                               waterOpenness(wc), vec2f(0.0));
       filmSlope = -wn.xz / max(wn.y, 0.2) * (OIL_SLOSH_SLOPE * floatW * oily);
       n = normalize(n + vec3f(-filmSlope.x, 0.0, -filmSlope.y));
     }
@@ -12112,10 +12162,10 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // Narrowing the band to the true outer fringe keeps the anti-aliasing (the
   // silhouette is still soft, which is the point of the term) while leaving
   // the body of the blob opaque.
-  let edgeField = liquidFieldAt(hitP - rd * 0.35, mat);
+  let edgeField = liquidMatFieldAt(hitP - rd * 0.35, mat);
   // Peak the field can reach for this blob, floored so a full pool still uses
   // the authored feather rather than a vanishing one.
-  let peak = max(liquidFieldAt(hitP - rd * 1.1, mat), 0.35);
+  let peak = max(liquidMatFieldAt(hitP - rd * 1.1, mat), 0.35);
   let lo = TUNE_BLOOD_EDGE_FEATHER * peak;
   let band = mix(0.28, TUNE_OIL_EDGE_BAND, oily);
   let solid = smoothstep(lo, lo + band * peak, edgeField);
