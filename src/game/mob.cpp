@@ -2761,6 +2761,7 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
                                                     : DamageCause::Infection;
         s.death = m.infectDeath;
         s.cured = m.infectCured;
+        s.leaves = m.infectLeaves;
       }
       infectSpec_.push_back(std::move(s));
     }
@@ -21613,7 +21614,9 @@ bool Mob::InfectTick(uint32_t tick, World& world,
 //           also counts that neighbour limb as one more candidate (the
 //           crossing; Mob::InfectAcrossJoint).
 //   EAT     independently, with chance pE, the voxel is eaten: tombstoned and
-//           flushed as a carve (FlushBurn), exactly as before.
+//           flushed as a carve (FlushBurn), exactly as before -- or, when the
+//           block names `leaves` (venom -> necrotic, 2026-10-13), turned into
+//           that material where it stands: dead tissue, not a hole.
 //
 // pS = spread * s / 30 and pE = eat * s / 30 for a lattice of s cells per
 // world voxel at 30 Hz: the authored rates are per voxel per SECOND for a
@@ -21978,16 +21981,30 @@ bool Mob::InfectStep(int li, uint32_t tick, World& world,
       uint32_t& left = countOf(cur);
       if (left <= spec.floor) continue;
       ownBrick();
-      v.Set(c.i, 0, 0);  // tombstone; FlushBurn compacts it away
-      const uint32_t ci = cellOf(p);
-      if (ci != kNoBurnCell) st.idx[ci] = 0;  // gone NOW: neighbours see through
-      st.removed++;
-      // NOT `burntAway`: an infection eating an arm is not a burn, and the
-      // burn cap (RecountBurn) must not count it as one.
-      if (poke)
-        MicroBodyPoke(*micro, (uint32_t)limb.microModel, p.x, p.y, p.z, 0, 0);
-      // AFTER the tombstone, so the bone this uncovers is uncovered.
-      coatExposedBone(p, cur, posKey);
+      if (spec.leaves != 0) {
+        // DEAD, NOT GONE (`infect.leaves`; owner, 2026-10-13: venom leaves
+        // necrotic tissue instead of dissolving the cell). The cell stays
+        // where it is as the named material, so nothing is uncovered and
+        // there is no carve to flush: the wound keeps its shape, and only the
+        // flat `hp` below is charged. The loader refuses a `leaves` that is
+        // itself an infection, so the cell drops out of the list at the next
+        // resolve and nothing this block admits can take it again.
+        v.Set(c.i, spec.leaves, (h2 >> 24) % 3u);
+        if (poke)
+          MicroBodyPoke(*micro, (uint32_t)limb.microModel, p.x, p.y, p.z,
+                        (uint8_t)spec.leaves, 0);
+      } else {
+        v.Set(c.i, 0, 0);  // tombstone; FlushBurn compacts it away
+        const uint32_t ci = cellOf(p);
+        if (ci != kNoBurnCell) st.idx[ci] = 0;  // gone NOW: neighbours see through
+        st.removed++;
+        // NOT `burntAway`: an infection eating an arm is not a burn, and the
+        // burn cap (RecountBurn) must not count it as one.
+        if (poke)
+          MicroBodyPoke(*micro, (uint32_t)limb.microModel, p.x, p.y, p.z, 0, 0);
+        // AFTER the tombstone, so the bone this uncovers is uncovered.
+        coatExposedBone(p, cur, posKey);
+      }
       left--;
       eaten++;
       InfectStatFor(cur).eaten++;
@@ -22046,13 +22063,32 @@ bool Mob::InfectStep(int li, uint32_t tick, World& world,
   // infection's name, and not at whatever flush comes next.
   sys_->infectRuleMs_ += msSince(tRule);
   const bool wasAlive = alive_;
+  const bool flushes = eaten && limbs_[li].burn.removed;
   const bool flushed =
-      !(eaten && limbs_[li].burn.removed) ||
+      !flushes ||
       FlushBurn(li, DamageCtx(first ? first->cause : DamageCause::Burn), world,
                 spawns, /*force=*/lethal || burntOut);
+  // A LETHAL CHARGE WITH NOTHING TO FLUSH (every cell eaten was left behind
+  // as its `leaves`): no carve will read this hp, so it is resolved here, by
+  // the rule a blow uses (Mob::Damage) rather than an eaten carve's, because
+  // nothing was eaten AWAY -- a vital or root limb at zero is a death in
+  // place, and an arm stays on, dead.
+  bool kept = flushed;
+  if (!flushes && lethal && alive_ && limbs_[li].hp <= 0.0f) {
+    const DamageCtx ctx(first ? first->cause : DamageCause::Infection);
+    if (HpZeroSevers(li, ctx)) {
+      if (li < (int)limbDefs_.size() && limbDefs_[li].vital) {
+        deathCause_ = VitalDeathCause(PolicyAt(li, ctx), ctx);
+        Die();
+      } else {
+        Sever(li, ctx);  // a root or unseverable limb: Sever routes to Die
+      }
+      kept = false;  // `limb`, `v` and `st` may be dangling now
+    }
+  }
   if (wasAlive && !alive_ && !deathName.empty())
     deathCause_ = InternDeathCause(deathName);
-  return flushed;
+  return kept;
 }
 
 uint32_t Mob::InfectAcrossJoint(int fromLimb, uint32_t mat, uint32_t tick,

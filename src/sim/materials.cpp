@@ -506,6 +506,8 @@ static void ParseInfect(const json& m, const std::string& path, MaterialDef& d,
   d.infectBooksBurn = cause == "burn";
   d.infectDeath = in.value("death", std::string());
   d.infectCuredName = in.value("cured", std::string());
+  // What an eaten cell becomes; absent = removed (LoadMaterials resolves it).
+  d.infectLeavesName = in.value("leaves", std::string());
   // What the UI calls it ("rot", "venom"): the HUD row and the remedy line
   // name the infection by this, never by a hardcoded word. Absent = the
   // material's own name.
@@ -2102,6 +2104,27 @@ bool LoadAssets(const std::string& materialsPath, const std::string& reactionsPa
                   "\": infect cured \"" + d.infectCuredName + "\" is not a material\n";
       else
         d.infectCured = (uint32_t)id;
+    }
+    // WHAT AN EATEN CELL LEAVES (materials.h `leaves`). A solid, because it
+    // stays in the body. Not an infection (block or legacy tag), or "eaten"
+    // would be "spread" by another name and R < 1 would stop meaning the
+    // infection burns out. And <= 255: a body cell holds 8 bits of material
+    // (sim/microbody.h), so the row is INSERTED below that, never appended.
+    d.infectLeaves = 0;
+    if (!d.infectLeavesName.empty()) {
+      const int id = FindMaterial(m, d.infectLeavesName);
+      const uint32_t infBit = tags.MaskOf("infectious", false);
+      const std::string at = materialsPath + ": material \"" + d.name +
+                             "\": infect leaves \"" + d.infectLeavesName + "\" ";
+      if (id <= 0 || m[id].gpu.klass != CLASS_SOLID)
+        errors += at + "is not a solid material\n";
+      else if (m[id].infect || (infBit && (m[id].gpu.tagMask & infBit)))
+        errors += at + "is itself an infection (what an infection leaves must not spread)\n";
+      else if (id > 255)
+        errors += at + "is material id " + std::to_string(id) +
+                  "; a body cell holds 8 bits of material, so it must be <= 255\n";
+      else
+        d.infectLeaves = (uint32_t)id;
     }
     d.infectTargetTags = 0;
     d.infectTargetIds.clear();

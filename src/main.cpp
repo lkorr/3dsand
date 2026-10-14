@@ -1467,6 +1467,12 @@ void AutopsyKinds(const BurnMats& burnMats, const TissueMats& tissueMats,
     if (m < 256) out[m] = autopsy::kBurn;
   for (uint32_t m : tissueMats.rot)
     if (m < 256) out[m] = autopsy::kInfection;
+  // ...and what an infection LEAVES (`infect.leaves`: venom's necrotic). It is
+  // organic, so the first loop called it tissue; it is the infection's damage,
+  // and a venom wound that has burnt out must still be a finding.
+  for (const MaterialDef& d : mats)
+    if (d.infect && d.infectLeaves != 0 && d.infectLeaves < 256)
+      out[d.infectLeaves] = autopsy::kInfection;
 }
 
 void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,

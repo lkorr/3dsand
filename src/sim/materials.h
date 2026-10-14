@@ -1034,7 +1034,8 @@ struct MaterialDef {
   //
   //   SPREAD  with chance `spread`, convert one face-neighbour that matches
   //           `targets` (drawn uniformly among them) to this material;
-  //   EAT     independently, with chance `eat`, be eaten (removed).
+  //   EAT     independently, with chance `eat`, be eaten: removed, or turned
+  //           into `leaves` when the block names one (venom -> necrotic).
   //
   // So any number of infections coexist on one limb with no bookkeeping, and
   // whether one grows or burns out is just spread against eat: each voxel
@@ -1045,7 +1046,7 @@ struct MaterialDef {
   //               second>, "floor": <int>, "targets": ["tag:x", "<name>"],
   //               "hp": <hp per world voxel eaten>, "turns": <bool>,
   //               "cause": "burn" | "infection", "death": "<text>",
-  //               "cured": "<material>" }
+  //               "cured": "<material>", "leaves": "<material>" }
   //
   //   spread / eat  chances per voxel per SECOND for a voxel one world voxel
   //                 across. A limb whose lattice is `s` cells per world voxel
@@ -1071,6 +1072,14 @@ struct MaterialDef {
   //   death         the death cause it writes when its damage kills.
   //   cured         what a FILTERED remedy (`disinfect:tag:x`) turns a cell of
   //                 it into; absent = that remedy leaves it alone.
+  //   leaves        what an EATEN cell becomes instead of being removed (venom
+  //                 leaves `necrotic`: dead tissue, the wound keeps its shape).
+  //                 Absent = removed, a carve (the rot). Must be a solid that
+  //                 is not itself an infection -- the dead do not spread, so
+  //                 the branching arithmetic above is untouched -- with an id
+  //                 <= 255, because a body cell holds 8 bits of material.
+  //                 Being eaten still charges `hp`; only the volume charge a
+  //                 removal makes is gone, since nothing is removed.
   //
   // CPU-only body state, never hashed (the infection pass is gore).
   bool infect = false;
@@ -1087,6 +1096,8 @@ struct MaterialDef {
   std::string infectCuredName;              // as authored
   std::string infectLabel;                  // UI name ("rot", "venom"); default = name
   uint32_t infectCured = 0;                 // resolved
+  std::string infectLeavesName;             // as authored
+  uint32_t infectLeaves = 0;                // resolved; 0 = an eaten cell is removed
   // ...AND A COAT THAT CARRIES ONE ("coat": {"infects": "<material>",
   // "infectCost": <levels>}, B2). Where a coat of this sits ON, or face-
   // adjacent to one the named infection targets that faces the same open space as the coat (a wound rim), that voxel

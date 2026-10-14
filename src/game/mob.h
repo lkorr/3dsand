@@ -2212,6 +2212,7 @@ struct InfectSpec {
   DamageCause cause = DamageCause::Infection;
   std::string death;                 // death cause when its damage kills
   uint32_t cured = 0;                // what a disinfect (bare or filtered) turns it into
+  uint32_t leaves = 0;               // what an eaten cell becomes (venom: necrotic); 0 = removed
 };
 
 // ============================================================================
