@@ -263,9 +263,10 @@ struct Perception {
   float carrionPull = 0.0f;
   // ---- THE NEAREST PART, NOT THE MIDDLE (2026-10-11, the piranha) ---------
   // true: once the target is seen and its motion tracked, `targetPos` is the
-  // centre of its body part nearest this creature (WorldView::aimPart), so a
-  // swimmer lines up on the hand or the head it is beside instead of every
-  // fish converging on the hips. Distances follow it.
+  // centre of its body part nearest this creature's JAWS (WorldView::aimPart
+  // from the muzzle, SelfView::muzzleFwd -- or half the body -- ahead along
+  // its 3D facing), so a swimmer lines up on the hand or the head in front of
+  // it instead of every fish converging on the hips. Distances follow it.
   bool nearestPart = false;
 };
 
@@ -691,6 +692,35 @@ struct OrbitTuning {
   // angle. A body floating at the waterline is mostly above the water; its
   // underside is all a fish can reach, and only from below.
   float climb = 0.0f;
+  // ---- THE DART (2026-10-13, the piranha) ---------------------------------
+  // A share of the passes are not passes. A DART is a nip from where the
+  // body already is: its lap is a HOVER `dartStandoff` voxels off the bite
+  // point (the jaws to it), nose on it -- under it, down the `climb` cone,
+  // for a creature that strikes from below; its strike is a LUNGE of a foot
+  // or two that brakes so the jaws STOP on the meat (the bite is thrown on
+  // the way, as the run throws it); then it BACKS OFF on its fins, still
+  // facing in, to the hover, and the next lap may be another dart. No
+  // overrun and no circle: a drive-by that overshoots by a body length is a
+  // second of a shoal's feeding spent coming back, a dart is not.
+  // `dartChance`: the share of laps that are darts (0 = never, every profile
+  // before this one). `dartStay`: after a dart, the chance the next lap is
+  // one too (< 0 = dartChance) -- a darter is already at the meat.
+  float dartChance = 0.0f;
+  float dartStay = -1.0f;
+  float dartStandoff = 5.0f;   // vox, the jaws to the bite point, hovering
+  float dartReach = 8.0f;      // vox: the jaws at most this far off may lunge
+  float dartAim = 0.3f;        // rad: the nose this close to the point = lunge
+  float dartSpeed = 1.6f;      // x walk speed, the lunge's ceiling
+  float dartBrake = 40.0f;     // vox/s^2 the lunge plans its stop on (the
+                               // jaws on the meat, not through it)
+  float dartBack = 0.3f;       // x walk speed backing off (DriveSwim caps a
+                               // back-pedal at 0.3)
+  float dartHold = 0.5f;       // x walk speed, the hover's ceiling
+  // x walk speed SIDEWAYS while hovering (the lap's direction): the darter
+  // circles the meat facing it, so its next nip lands on fresh meat and not
+  // in the pit the last one dug (one stroke takes one hole). 0 = parks.
+  float dartDrift = 0.0f;
+  uint32_t dartRecoil = 30;    // ticks: the back-off ends by then however far
 };
 
 // ---- TUNE: what a holding RULE may do to the fighter, besides weights -------
@@ -1334,8 +1364,13 @@ struct Brain {
   int orbitSign = 0;
   uint32_t orbitReadyAt = 0;
   uint32_t orbitLap = 0;          // laps drawn; the draws' hash key
+  bool orbitDart = false;         // this lap is a hover, its pass a DART
   // The pass: 0 = none, 1 = turning in, 2 = the run, 3 = the overrun.
+  // A DART (passDart): 1 = aiming from the hover, 2 = the lunge, 3 = the
+  // back-off (OrbitTuning::dart*).
   int passPhase = 0;
+  bool passDart = false;
+  uint32_t passPhaseAt = 0;       // the tick a dart's lunge / back-off began
   uint32_t passSince = 0;
   float passHeading = 0.0f;       // the line, once locked (phase 2 close / 3)
   float passAlt = 0.0f;
@@ -1347,6 +1382,8 @@ struct Brain {
   // Diagnostics the gates assert on (rule 6: every bare count with a cause).
   uint32_t passes = 0;            // passes begun
   uint32_t passBites = 0;         // ...that threw a bite
+  uint32_t darts = 0;             // of the passes, darts begun
+  uint32_t dartBites = 0;         // ...that threw a bite (in passBites too)
   uint32_t reversals = 0;         // laps that turned round
   float orbitSwept = 0.0f;        // radians swept round the target circling
   float lastOrbitBearing = 0.0f;  // the target->body bearing last circling tick
@@ -1434,6 +1471,10 @@ struct IntentOut {
   float pitch = 0;
   // A charge's run may break the surface (MobDef::SwimDef::breach).
   bool breach = false;
+  // ...AND WHERE THE LINE ENDS (vox from the snout; 0 = the body's own
+  // feel, 2026-10-13): a strike at a point need not be felt PAST it. A dart
+  // at a foot on the bed had its line refused by the bed beyond the foot.
+  float feelReach = 0;
   bool attack = false;
   AttackRequest request;
   // ---- the weapon arm, when not attacking (2026-09-27) ----

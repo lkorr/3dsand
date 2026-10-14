@@ -15642,6 +15642,31 @@ nearest its jaws was, and how near a miss's jaws came
 (`aquaticCarrionHitShare`). `--shot-aquatic piranha*6+human:dead` photographs
 it: the victim killed where it stands and left 240 ticks to float up.
 
+**The dart** (`OrbitTuning::dart*`, 2026-10-13; the piranha). A drive-by
+bites at a run and coasts on: measured in gate `aquatic` part E, inside a
+second of its bite a drive-by fish is ~10-13 voxels from the point it bit.
+So a share of laps (`dartChance`, then `dartStay` after a dart) are DARTS:
+the lap is a HOVER (`DartHover`) with the jaws `dartStandoff` voxels off the
+bite point, facing it, on the climb's cone under it, held forward or BACK on
+the fins on an arrive curve and drifting sideways round it (`dartDrift`: one
+stroke takes one hole, and a parked darter dug a pit); the pass is AIM (nose
+on the 3D line; or at once if the jaws are already within 2 voxels), LUNGE
+(homing, at the speed it can stop from with the jaws AT the part's centre,
+`dartBrake`; over it, back water), the bite thrown biteLead ticks of closing
+speed short of the skin, the jaws held through the snap, then BACK-OFF
+(reverse fins, facing in, `dartRecoil` ticks). A dart sets
+`IntentOut::feelReach` (the swim drive's feel stops where the strike's line
+does: the bed past a foot, or the air past a point at the waterline, refused
+the line otherwise) and `breach`. `Perception::nearestPart` now measures from
+the JAWS, not the middle (a fish pressed against a man aimed at the arm at
+its flank). Measured, same binary, darts off as the control: on the corpse
+185 vs 165 strokes, 10,966 vs 9,821 voxels eaten in 1200 ticks; a darter is
+~4.5 voxels from its bite point a second later. The gate drains the attack
+seam every tick as the frame loop does -- nothing in `TickAuthority` drains
+`MobSystem::attacks_`, and once it holds `kMaxMobs x 2` requests NO mob
+begins a stroke: every gate that ticks more than 128 swings between Resets
+without draining is silently starved (open; not fixed in MobSystem).
+
 **Contact for a bite** (`MobSystem::SwimStrikeTarget`). Through a swimmer's
 windup and cut its stroke's target is not a wall to it, and it is not
 spaced off by the crowd push, either way round: two capsules otherwise held

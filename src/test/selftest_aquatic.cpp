@@ -308,11 +308,21 @@ Status GateAquatic(Ctx& c, std::string& detail) {
   }
   const std::vector<uint32_t> v0B = limbCounts(victim);
   const float hp0B = mobs.TotalHp(victim);
-  support::RunTicks(rig, kShoal);
-  uint32_t nips = 0;
+  // THE ATTACK SEAM IS DRAINED EVERY TICK, as the frame loop drains it
+  // (main.cpp; parts B and E): nothing in the tick does, and once it holds
+  // kMaxMobs x 2 requests MobSystem begins no more strokes -- a shoal's
+  // 129th bite since the last Reset was thrown and never swung (2026-10-13).
+  for (int i = 0; i < kShoal; i++) {
+    support::RunTicks(rig, 1);
+    mobs.ClearAttackRequests();
+  }
+  uint32_t nips = 0, dartNipsB = 0;
   int swimmingB = 0;
   for (uint64_t id : shoal) {
-    if (const ai::Brain* b = mobs.MobBrain(id)) nips += b->passBites;
+    if (const ai::Brain* b = mobs.MobBrain(id)) {
+      nips += b->passBites;
+      dartNipsB += b->dartBites;
+    }
     if (const Mob* m = mobs.FindMobById(id); m && m->Swimming()) swimmingB++;
   }
   int limbsB = 0;
@@ -443,15 +453,48 @@ Status GateAquatic(Ctx& c, std::string& detail) {
   // ABOVE its centre the voxel nearest its jaws then was -- a floating corpse
   // is bitten from beneath or not at all.
   struct NipE {
-    bool live = false;
+    bool live = false, dart = false;
     int prevPhase = -1, hits0 = 0, hits = 0;
     float gap = 1e9f, pitch = 0.0f, rise = 0.0f;
+    // At the jaws' closest moment in the cut: how far the nearest voxel is
+    // ABOVE the jaw tip, and how deep the fish's centre is under the
+    // waterline (the waterline's soft wall is a voxel early).
+    float tipDy = 0.0f, depth = 0.0f;
   };
   std::vector<NipE> nipE(shoal.size());
-  uint32_t nipHit = 0, nipMiss = 0;
+  std::vector<int> anyPrev(shoal.size(), -1);
+  uint32_t strokesElse = 0;
+  uint32_t nipHit = 0, nipMiss = 0, dartHit = 0, dartMiss = 0;
+  float dartGapMiss = 0.0f, dartDyMiss = 0.0f, dartDepthMiss = 0.0f, dartDepthHit = 0.0f;
   float pitchHit = 0.0f, pitchMiss = 0.0f, riseHit = 0.0f, riseMiss = 0.0f,
         gapMiss = 0.0f;
-  auto jawGap = [&](const Mob& f, Vec3* nearest) {
+  // THE DART AGAINST THE DRIVE-BY (OrbitTuning::dart*; 2026-10-13): after
+  // each bite is thrown, the farthest the fish's centre gets from the point
+  // it bit at over the next kFarTicks -- a drive-by's overrun, a dart's
+  // back-off -- per kind; and the fish-ticks on the corpse spent darting.
+  constexpr int kFarTicks = 30;
+  struct AfterBite {
+    int left = 0;
+    bool dart = false;
+    Vec3 at{};
+    float far = 0.0f;
+  };
+  std::vector<AfterBite> after(shoal.size());
+  std::vector<uint32_t> bitesSeenE(shoal.size(), 0);
+  uint32_t bitesDropped = 0, dropPhase[5] = {};
+  float dartFarSum = 0.0f, runFarSum = 0.0f;
+  uint32_t dartFarN = 0, runFarN = 0, dartTicks = 0;
+  auto closeAfter = [&](AfterBite& ab) {
+    if (ab.dart) {
+      dartFarSum += ab.far;
+      dartFarN++;
+    } else {
+      runFarSum += ab.far;
+      runFarN++;
+    }
+    ab.left = 0;
+  };
+  auto jawGap = [&](const Mob& f, Vec3* nearest, Vec3* tip = nullptr) {
     Vec3 eb{}, et{};
     float hw = 0.0f;
     const Mob* m = mobs.FindMobById(corpse);
@@ -465,11 +508,21 @@ Status GateAquatic(Ctx& c, std::string& detail) {
       if ((v - et).len() < best) {
         best = (v - et).len();
         if (nearest != nullptr) *nearest = v;
+        if (tip != nullptr) *tip = et;
       }
     }
     return best;
   };
   auto closeNip = [&](NipE& ne) {
+    if (ne.dart && ne.hits > ne.hits0) {
+      dartHit++;
+      dartDepthHit += ne.depth;
+    } else if (ne.dart) {
+      dartMiss++;
+      dartGapMiss += ne.gap < 1e8f ? ne.gap : 0.0f;
+      dartDyMiss += ne.tipDy;
+      dartDepthMiss += ne.depth;
+    }
     if (ne.hits > ne.hits0) {
       nipHit++;
       pitchHit += ne.pitch;
@@ -490,6 +543,7 @@ Status GateAquatic(Ctx& c, std::string& detail) {
   std::vector<int> lastHit(shoal.size(), 0);
   for (int i = 0; i < kCarrion; i++) {
     support::RunTicks(rig, 1);
+    mobs.ClearAttackRequests();   // the seam, drained (see part B)
     Vec3 cc{};
     if (const Mob* m = mobs.FindMobById(corpse))
       if (m->LimbCentreWorld(m->Def()->rootLimb, cc)) {
@@ -513,6 +567,12 @@ Status GateAquatic(Ctx& c, std::string& detail) {
       }
       lastHit[k] = st->bodiesHit;
       NipE& ne = nipE[k];
+      // Every stroke the fish begins, whatever it is at (the corpse's
+      // severed pieces are food too, and the bite counters count those).
+      const bool anyBegins = st->Active() && st->phase == NpcStroke::Phase::Windup &&
+                             anyPrev[k] != (int)NpcStroke::Phase::Windup;
+      if (anyBegins && st->targetId != corpse) strokesElse++;
+      anyPrev[k] = st->Active() ? (int)st->phase : -1;
       const bool onIt = st->Active() && st->targetId == corpse;
       const bool begins = onIt && st->phase == NpcStroke::Phase::Windup &&
                           ne.prevPhase != (int)NpcStroke::Phase::Windup;
@@ -520,6 +580,7 @@ Status GateAquatic(Ctx& c, std::string& detail) {
       if (begins) {
         ne = NipE{};
         ne.live = true;
+        if (const ai::Brain* b = mobs.MobBrain(shoal[k])) ne.dart = b->passDart;
         ne.hits0 = ne.hits = st->bodiesHit;
         ne.pitch = f->SwimPitch();
         Vec3 nv{};
@@ -527,10 +588,42 @@ Status GateAquatic(Ctx& c, std::string& detail) {
       }
       if (ne.live) {
         ne.hits = std::max(ne.hits, st->bodiesHit);
-        if (st->phase == NpcStroke::Phase::Cut)
-          if (const float g = jawGap(*f, nullptr); g >= 0.0f) ne.gap = std::min(ne.gap, g);
+        if (st->phase == NpcStroke::Phase::Cut) {
+          Vec3 nv{}, tp{};
+          if (const float g = jawGap(*f, &nv, &tp); g >= 0.0f && g < ne.gap) {
+            ne.gap = g;
+            ne.tipDy = nv.y - tp.y;
+            ne.depth = (float)(waterTop + 1) - CentreOf(*f).y;
+          }
+        }
       }
       ne.prevPhase = onIt ? (int)st->phase : -1;
+    }
+    for (size_t k = 0; k < shoal.size(); k++) {
+      const ai::Brain* b = mobs.MobBrain(shoal[k]);
+      const Mob* f = mobs.FindMobById(shoal[k]);
+      if (b == nullptr || f == nullptr) continue;
+      AfterBite& ab = after[k];
+      if (ab.left > 0) {
+        ab.far = std::max(ab.far, (CentreOf(*f) - ab.at).len());
+        if (--ab.left == 0) closeAfter(ab);
+      }
+      if (b->passBites > bitesSeenE[k]) {
+        // DID IT SWING? A bite thrown while the last stroke is still live is
+        // dropped (MobSystem phase H: requests are not queued). A stroke that
+        // began on the bite's own tick is in its first windup tick.
+        if (const NpcStroke* st = mobs.MobStroke(shoal[k]);
+            st == nullptr || st->phase != NpcStroke::Phase::Windup || st->phaseTick > 1) {
+          bitesDropped++;
+          if (st != nullptr) dropPhase[std::min((int)st->phase, 4)]++;
+        }
+        if (ab.left > 0) closeAfter(ab);
+        ab = AfterBite{kFarTicks, b->passDart, b->targetPos, (CentreOf(*f) - b->targetPos).len()};
+      }
+      bitesSeenE[k] = b->passBites;
+      if (b->hasTarget && b->targetId == corpse &&
+          (b->intent == ai::Intent::Charge ? b->passDart : b->orbitDart))
+        dartTicks++;
     }
     int holding = 0;
     for (uint64_t id : shoal)
@@ -551,16 +644,33 @@ Status GateAquatic(Ctx& c, std::string& detail) {
       break;
     }
   }
-  uint32_t nipsE = 0;
+  uint32_t nipsE = 0, dartsE = 0, dartBitesE = 0;
   for (uint64_t id : shoal)
-    if (const ai::Brain* b = mobs.MobBrain(id)) nipsE += b->passBites;
+    if (const ai::Brain* b = mobs.MobBrain(id)) {
+      nipsE += b->passBites;
+      dartsE += b->darts;
+      dartBitesE += b->dartBites;
+    }
+  for (AfterBite& ab : after)
+    if (ab.left > 0) closeAfter(ab);
+  const float dartFar = dartFarN > 0 ? dartFarSum / (float)dartFarN : 0.0f;
+  const float runFar = runFarN > 0 ? runFarSum / (float)runFarN : 0.0f;
   int limbsE = 0;
   const uint32_t lostE = limbLoss(corpse, v0E, limbsE);
+  // THE DARTS (OrbitTuning::dart*): they happen, they bite, and after a bite
+  // a darter stays at the meat -- its farthest from the bite point inside a
+  // second is a back-off, not a drive-by's overrun.
+  const bool dartsOk =
+      dartBitesE >= (uint32_t)BaselineNumber("aquaticDartBitesMin", 8) &&
+      dartFarN > 0 && dartFar <= (float)BaselineNumber("aquaticDartFarMax", 9);
   const bool eOk = corpse != 0 && !mobs.IsAlive(corpse) &&
                    nipsE >= (uint32_t)BaselineNumber("aquaticCarrionNipsMin", 20) &&
                    lostE >= (uint32_t)BaselineNumber("aquaticCarrionVoxelsMin", 60) &&
-                   ratio0 > 0.0f && ratioEnd < ratio0;
+                   ratio0 > 0.0f && ratioEnd < ratio0 && dartsOk;
   RecordObserved("aquaticCarrionVoxels", (double)lostE);
+  RecordObserved("aquaticDartBites", (double)dartBitesE);
+  RecordObserved("aquaticDartFar", (double)dartFar);
+  RecordObserved("aquaticCarrionStrippedAt", (double)strippedAt);
   for (NipE& ne : nipE)
     if (ne.live) closeNip(ne);
   const float nipHitShare =
@@ -577,7 +687,7 @@ Status GateAquatic(Ctx& c, std::string& detail) {
       "site %s | A hunt %s: swam %.0f%% (out of the slab %d ticks, low %+.1f high %+.1f), "
       "swept %.2f rad before pass 1, %u passes (peak %.1f = %.2fx cruise), %u bites, "
       "%d went past, man lost %u voxels over %d limbs and %.0f hp (%s) | B shoal %s: %u "
-      "nips, %d/6 swimming, man lost %u voxels over %d limbs and %.0f hp, %.2f voxels a "
+      "nips (%u from darts), %d/6 swimming, man lost %u voxels over %d limbs and %.0f hp, %.2f voxels a "
       "nip against the shark's %.1f a bite | C medium %s: shark targeted the dry man "
       "%d/%d ticks, patrolled %.1f | D stranded %s: ledge fish rolled %.2f, %u flops, back "
       "in the water at tick %d; bank fish rolled %.2f, %u flops, dead at tick %d of %s "
@@ -585,12 +695,18 @@ Status GateAquatic(Ctx& c, std::string& detail) {
       "lost %u voxels over %d limbs, meat/bone %.2f -> %.3f (eats to %.3f: stripped at "
       "tick %d, let go at %d) [%u cut fish-ticks at it, %u bodies touched, %.1f from its "
       "pelvis on average; pelvis y %+.1f over the water's top; meat cells %u -> %u, bone and the rest %.0f -> %.0f; pelvis swam %.0f voxels, fastest %.2f a tick; alone, %.1f voxels in 300 ticks] "
-      "[nips: %u reached him, %u missed (%.0f%% hit); pitch at the throw %+.2f hit / %+.2f "
-      "missed; the nearest voxel %+.1f / %+.1f above the fish; a miss's jaws came within %.1f]",
+      "[nips: %u reached him, %u missed (%.0f%% hit; %u more strokes at other things -- his severed pieces); pitch at the throw %+.2f hit / %+.2f "
+      "missed; the nearest voxel %+.1f / %+.1f above the fish; a miss's jaws came within %.1f] "
+      "[darts %s: %u begun, %u bit (%u of the %u nips that ran their stroke: %u reached him); "
+      "%.0f%% of the fish-ticks on him darting; inside a second of its bite the fish got %.1f "
+      "from the bite point on a dart, %.1f on a drive-by (%u / %u bites); a dart's miss: jaws "
+      "within %.1f, the nearest voxel %+.1f above the jaw tip, the fish %.1f under the waterline "
+      "(a hit's %.1f)] [%u bites found the last stroke still live (idle %u guard %u windup %u cut %u "
+      "recover %u) and did not swing]",
       siteWhy.c_str(), aOk ? "PASS" : "FAIL", swimShare * 100.0f, outOfWater, worstLow,
       worstHigh, sweptAtFirstPass, passes, peakV, cruise > 0 ? peakV / cruise : 0.0f,
       bites, wentPast, lostA, limbsA, hpLostA, victimEnd.c_str(), bOk ? "PASS" : "FAIL",
-      nips, swimmingB,
+      nips, dartNipsB, swimmingB,
       lostB, limbsB, hpLostB, perBitePiranha, perBiteShark, cOk ? "PASS" : "FAIL",
       targeted, kMedium, patrol, dOk ? "PASS" : "FAIL", maxRollLedge, flopsLedge,
       backInAt, maxRollBank, flopsBank, deadAt, cause, asphyxia, eOk ? "PASS" : "FAIL",
@@ -599,8 +715,13 @@ Status GateAquatic(Ctx& c, std::string& detail) {
       corpseY - (float)(waterTop + 1), meat0, meatEnd,
       ratio0 > 0.0f ? (float)meat0 / ratio0 : 0.0f,
       ratioEnd > 0.0f ? (float)meatEnd / ratioEnd : 0.0f, corpsePath, corpseTop, alonePath,
-      nipHit, nipMiss, nipHitShare * 100.0f, mean(pitchHit, nipHit), mean(pitchMiss, nipMiss),
-      mean(riseHit, nipHit), mean(riseMiss, nipMiss), mean(gapMiss, nipMiss));
+      nipHit, nipMiss, nipHitShare * 100.0f, strokesElse, mean(pitchHit, nipHit), mean(pitchMiss, nipMiss),
+      mean(riseHit, nipHit), mean(riseMiss, nipMiss), mean(gapMiss, nipMiss),
+      dartsOk ? "PASS" : "FAIL", dartsE, dartBitesE, dartHit + dartMiss, nipHit + nipMiss,
+      dartHit, onCorpse > 0 ? 100.0f * (float)dartTicks / (float)onCorpse : 0.0f, dartFar,
+      runFar, dartFarN, runFarN, mean(dartGapMiss, dartMiss), mean(dartDyMiss, dartMiss),
+      mean(dartDepthMiss, dartMiss), mean(dartDepthHit, dartHit), bitesDropped, dropPhase[0],
+      dropPhase[1], dropPhase[2], dropPhase[3], dropPhase[4]);
   return aOk && bOk && cOk && dOk && eOk ? Status::Pass : Status::Fail;
 }
 

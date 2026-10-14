@@ -593,6 +593,18 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
       o.biteLead = q.value("biteLead", 6u);
       o.hitHeight = q.value("hitHeight", 0.0f);
       o.climb = std::clamp(q.value("climb", 0.0f), 0.0f, 1.4f);
+      // The dart (0 = never: the passes are all drive-bys, as before).
+      o.dartChance = std::clamp(q.value("dartChance", 0.0f), 0.0f, 1.0f);
+      o.dartStay = std::min(q.value("dartStay", -1.0f), 1.0f);
+      o.dartStandoff = std::max(0.5f, q.value("dartStandoff", 5.0f));
+      o.dartReach = std::max(o.dartStandoff, q.value("dartReach", 8.0f));
+      o.dartAim = std::clamp(q.value("dartAim", 0.3f), 0.02f, 1.5f);
+      o.dartSpeed = std::max(0.1f, q.value("dartSpeed", 1.6f));
+      o.dartBrake = std::max(1.0f, q.value("dartBrake", 40.0f));
+      o.dartBack = std::clamp(q.value("dartBack", 0.3f), 0.0f, 1.0f);
+      o.dartHold = std::max(0.05f, q.value("dartHold", 0.5f));
+      o.dartDrift = std::clamp(q.value("dartDrift", 0.0f), 0.0f, 1.0f);
+      o.dartRecoil = std::max(1u, q.value("dartRecoil", 30u));
     }
     // D4: magic (CastTuning). Absent = never casts.
     if (p.contains("cast") && p["cast"].is_object()) {
@@ -844,7 +856,18 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
         << ", \"passMax\": " << t.passMax
         << ", \"biteLead\": " << t.biteLead
         << ", \"hitHeight\": " << num(t.hitHeight)
-        << ", \"climb\": " << num(t.climb) << " },\n";
+        << ", \"climb\": " << num(t.climb)
+        << ", \"dartChance\": " << num(t.dartChance)
+        << ", \"dartStay\": " << num(t.dartStay)
+        << ", \"dartStandoff\": " << num(t.dartStandoff)
+        << ", \"dartReach\": " << num(t.dartReach)
+        << ", \"dartAim\": " << num(t.dartAim)
+        << ", \"dartSpeed\": " << num(t.dartSpeed)
+        << ", \"dartBrake\": " << num(t.dartBrake)
+        << ", \"dartBack\": " << num(t.dartBack)
+        << ", \"dartHold\": " << num(t.dartHold)
+        << ", \"dartDrift\": " << num(t.dartDrift)
+        << ", \"dartRecoil\": " << t.dartRecoil << " },\n";
     }
     // D4: the cast block, only for a creature that casts (CastTuning).
     if (!p.cast.spells.empty()) {
@@ -1587,6 +1610,13 @@ void DrawLap(Brain& b, const OrbitTuning& ob, const SelfView& self,
   const uint32_t span = ob.lapMax - ob.lapMin + 1u;
   b.orbitReadyAt = tick + ob.lapMin + (h2 >> 16) % std::max(1u, span);
   BookWhim(b, ob, self, tick);
+  // A DART OR A DRIVE-BY (OrbitTuning::dartChance), one draw a lap; after a
+  // dart the odds are `dartStay`'s -- the darter is already at the meat.
+  {
+    const float p = b.orbitDart && ob.dartStay >= 0.0f ? ob.dartStay : ob.dartChance;
+    const uint32_t h3 = rng::Hash3((uint32_t)self.id ^ kSaltOrbit, b.orbitLap, 14u);
+    b.orbitDart = p > 0.0f && (float)(h3 & 0xFFFFu) / 65535.0f < p;
+  }
   if (followBody || b.orbitSign == 0) {
     // Which way round is the body already going: the tangential share of its
     // facing. sin(heading - bearing-from-target) > 0 is the bearing growing.
@@ -1596,6 +1626,55 @@ void DrawLap(Brain& b, const OrbitTuning& ob, const SelfView& self,
   } else if (u3 < ob.reverseChance) {
     b.orbitSign = -b.orbitSign;
     b.reversals++;
+  }
+}
+
+// THE DARTER'S HOVER (OrbitTuning::dart*). The station: the jaws
+// `dartStandoff` voxels off the bite point P on the side the body is already
+// on -- and, for a creature that strikes from below, down the climb's cone
+// under it. The body faces P across the water the whole time and holds the
+// station on its fins, FORWARD OR BACK along its own axis (a fish backs
+// water rather than turning round to give up a voxel), on an arrive curve
+// either way, so it settles instead of overshooting. Off the station it
+// pitches for the station's depth; on it, the nose goes on P. And it
+// DRIFTS round P on its fins (`dartDrift` x walk speed sideways, `sign` the
+// lap's way round): one stroke takes one hole, and a darter parked on one
+// bearing dug a pit and closed its jaws on the hollow -- each landed nip took
+// a fifth less meat than a drive-by's, which meets fresh meat every pass.
+// Writes the heading, the drive, the drift and the height or pitch.
+void DartHover(const OrbitTuning& ob, const SelfView& self,
+               const GroundView& ground, Vec3 centre, Vec3 P, float snoutFwd,
+               float drv, int sign, IntentOut& out) {
+  const float el = self.volumetric ? ob.climb : 0.0f;
+  const float back = ob.dartStandoff + snoutFwd;   // the centre's gap to P
+  const float b = BearingTo(P, centre);
+  const Vec3 S{P.x + std::sin(b) * std::cos(el) * back, P.y - std::sin(el) * back,
+               P.z + std::cos(b) * std::cos(el) * back};
+  out.desiredHeading = Deflect(BearingTo(centre, P), self.heading, ground);
+  const float cp = std::cos(self.pitch);
+  const Vec3 fw3{std::sin(self.heading) * cp, std::sin(self.pitch),
+                 std::cos(self.heading) * cp};
+  const Vec3 toS = self.volumetric ? S - centre : Vec3{S.x - centre.x, 0.0f, S.z - centre.z};
+  const float along = toS.dot(fw3);
+  const float v = std::sqrt(2.0f * 0.5f * ob.dartBrake * std::abs(along));
+  const float drive = (along >= 0.0f ? v : -v) / std::max(1.0f, self.speed);
+  out.driveScale = drv * std::clamp(drive, -ob.dartBack, ob.dartHold);
+  out.driveStrafe = drv * ob.dartDrift * (float)(sign >= 0 ? 1 : -1);
+  if (self.volumetric) {
+    if (toS.len() > 2.0f) {
+      out.altitudeSet = true;
+      out.altitude = S.y;
+    } else {
+      out.pitchSet = true;
+      out.pitch = std::atan2(P.y - centre.y, std::max(PlanarDist(centre, P), 0.5f));
+      // The nose on the point must not be felt off it: the swim drive's
+      // feel took the air past a point at the waterline for a wall and
+      // levelled the line (the strike from below's lesson), and the bed
+      // past a foot standing on it. So the body may breach, and the feel
+      // stops where the line does.
+      out.breach = true;
+      out.feelReach = std::max(1.0f, (P - (centre + fw3 * snoutFwd)).len());
+    }
   }
 }
 
@@ -1640,11 +1719,18 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   TrackTargetMotion(brain, self, tick, dt);
   // THE NEAREST PART (Perception::nearestPart): after the motion is tracked
   // on the body's centre, so the velocity estimate does not jump between
-  // limbs as the nearest one changes.
+  // limbs as the nearest one changes. Nearest the JAWS (2026-10-13), not the
+  // middle: a fish pressed against a man took the arm at its flank for its
+  // mark and spun trying to face it, with his ribs in front of its teeth.
   if (pr.perception.nearestPart && brain.hasTarget && brain.visible &&
       view.aimPart != nullptr) {
+    const float cpN = std::cos(self.pitch);
+    const float jawFwd =
+        std::max(self.muzzleFwd, self.length > 0.0f ? self.length * 0.5f : 0.0f);
+    const Vec3 jaws = self.Centre() + Vec3{std::sin(self.heading) * cpN, std::sin(self.pitch),
+                                           std::cos(self.heading) * cpN} * jawFwd;
     Vec3 part{};
-    if (view.aimPart(view.aimCtx, brain.targetId, self.Centre(), part)) {
+    if (view.aimPart(view.aimCtx, brain.targetId, jaws, part)) {
       brain.targetPos = part;
       brain.targetDist = BodyDist(self, self.Centre(), part);
     }
@@ -2802,6 +2888,15 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       // nose leads the tangent -- so the radius corrects itself and the path
       // is a curve, never the polygon a tangent-plus-correction walks.
       const Vec3 tc = brain.targetPos;
+      // A DART'S LAP IS NOT A CIRCLE: it is the hover the dart lunges from
+      // (OrbitTuning::dart*), the lap's clock the wait between nips.
+      if (brain.orbitDart) {
+        const float snout =
+            std::max(self.muzzleFwd, self.length > 0.0f ? self.length * 0.5f : 0.0f);
+        DartHover(ob, self, ground, centre, tc, snout, sp * spd, brain.orbitSign, out);
+        brain.orbitBearingValid = false;
+        break;
+      }
       const float theta = BearingTo(tc, centre);
       if (brain.orbitBearingValid)
         brain.orbitSwept += std::abs(WrapPi(theta - brain.lastOrbitBearing));
@@ -2847,10 +2942,14 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
         brain.passBit = false;
         brain.passClosest = 1e9f;
         brain.passes++;
+        brain.passDart = brain.orbitDart;
+        brain.passPhaseAt = tick;
+        if (brain.passDart) brain.darts++;
       }
       const uint32_t age = tick - brain.passSince;
-      const float runV =
-          std::max(1.0f, self.speed * std::max(ob.chargeSpeed, 0.1f) * spd);
+      const float runV = std::max(
+          1.0f, self.speed *
+                    std::max(brain.passDart ? ob.dartSpeed : ob.chargeSpeed, 0.1f) * spd);
       Vec3 tvel = brain.haveTargetVel ? brain.targetVel : Vec3{};
       if (tgtActor != nullptr && tgtActor->velocity.len() > 1e-3f)
         tvel = tgtActor->velocity;
@@ -2877,69 +2976,138 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       const bool climbing = self.volumetric && ob.climb > 0.0f;
       const float horiz = PlanarDist(centre, P);
       const float linePitch = std::atan2(P.y - centre.y, std::max(horiz, 0.5f));
-      if (brain.passPhase == 1 && err <= ob.lineUp) brain.passPhase = 2;
-      // A TURN-IN THAT CANNOT LINE UP IS ABANDONED: the target was inside the
-      // body's turning circle the whole way round (the slow-down below should
-      // have prevented it), and another lap is a better plan than a spiral.
-      if (brain.passPhase == 1 && age > ob.passMax / 2) {
-        brain.passPhase = 0;
-        DrawLap(brain, ob, self, tick, true);
-        out.desiredHeading = self.heading;
-        out.driveScale = sp * ob.speed * spd;
-        break;
-      }
-      if (brain.passPhase >= 2 && !brain.passLocked && dm <= ob.lockDist) {
-        brain.passLocked = true;
-        brain.passHeading = want;
-        brain.passAlt = P.y;
-        brain.passPitch = linePitch;
-      }
-      brain.passClosest = std::min(brain.passClosest, dm);
-      if (brain.passPhase == 2 && brain.passLocked &&
-          dm > brain.passClosest + 1.0f)
-        brain.passPhase = 3;
-      const float heading = brain.passLocked ? brain.passHeading : want;
-      out.desiredHeading = Deflect(heading, self.heading, ground);
-      float drive = brain.passPhase == 1 ? ob.turnInSpeed : ob.chargeSpeed;
-      // THE TURN-IN SLOWS TO MAKE ITS TURN. A body at speed v turning at w
-      // draws a circle of radius v/w, and a target inside that circle is never
-      // lined up -- it orbits it instead, which is the one thing a charge must
-      // not do. The circle that leaves on the nose's line and passes through
-      // the target has radius d / (2 sin err); the speed that turns that
-      // tightly is w x that radius (with a margin, and a floor so the body
-      // still glides through the turn).
-      if (brain.passPhase == 1 && err > 0.05f && self.turnRate > 0.0f) {
-        const float rNeed = d / (2.0f * std::max(std::sin(std::min(err, 1.5707963f)), 0.05f));
-        const float vTurn = 0.65f * self.turnRate * rNeed;
-        drive = std::min(drive, std::max(0.3f, vTurn / std::max(1.0f, self.speed)));
-      }
-      out.driveScale = sp * drive * spd;
-      if (self.volumetric) {
-        out.altitudeSet = true;
-        out.altitude = brain.passLocked ? brain.passAlt : P.y;
-        out.breach = brain.passPhase >= 2;
-        // ---- ...UP THE LINE, FROM BELOW (OrbitTuning::climb) ---------------
-        // Turning in, a body still ABOVE the cone under the aim point (the
-        // depth from which the line climbs at `climb`) sinks onto it; one
-        // under it already points its nose at the aim point. The run holds
-        // the 3D line, frozen with the heading at the lock; the overrun keeps
-        // it through the snap until the peel turns it down (below). The whole
-        // pass may breach: the air past a line that ends below the waterline
-        // is not in the way, and asking the feel to dodge it bent every
-        // upward line flat.
-        if (climbing) {
+      // A DART'S JAWS TO THE BITE POINT along the nose (jaws that have gone
+      // PAST it read 0, not "far"), and to the skin, about a voxel nearer
+      // than a part's centre. The lunge stops the jaws AT the centre -- in
+      // the meat: stopped at the skin they closed a voxel and more short.
+      const float dartToP = std::max(0.0f, (P - muzzle).dot(fw3));
+      const float dartGap = std::max(0.0f, dartToP - 1.0f);
+      if (brain.passDart) {
+        // ---- THE DART (OrbitTuning::dart*) ----------------------------------
+        // 1 AIM: hold the hover, the nose onto the point (the 3D line, not
+        //   the station's depth); in reach and on it = the lunge.
+        // 2 THE LUNGE: home on the point at the speed it can still stop from
+        //   with the jaws on the meat -- sqrt(2 x dartBrake x gap), capped
+        //   at dartSpeed; over that it backs water (a back-pedal brakes at
+        //   the body's full acceleration, DriveSwim's rule). The bite is
+        //   thrown on the way (below) and the jaws HOLD on the meat through
+        //   the snap.
+        // 3 THE BACK-OFF: still facing in, back on the fins to the hover's
+        //   distance (or dartRecoil ticks), and the pass is over.
+        Vec3 toP = P - centre;
+        if (!self.volumetric) toP.y = 0.0f;
+        const float lp = toP.len();
+        const float noseErr =
+            lp > 1e-3f ? std::acos(std::clamp(fw3.dot(toP * (1.0f / lp)), -1.0f, 1.0f))
+                       : 0.0f;
+        const float gapP = BodyDist(self, muzzle, P);
+        if (brain.passPhase == 1) {
+          // On the line and in reach -- or the jaws already at the meat
+          // (pressed against the body, the nose cannot be "aimed" at a point
+          // a voxel off it, and need not be).
+          if ((gapP <= ob.dartReach && noseErr <= ob.dartAim) || gapP <= 2.0f) {
+            brain.passPhase = 2;
+            brain.passPhaseAt = tick;
+          } else if (age > ob.passMax / 2) {
+            brain.passPhase = 0;
+            DrawLap(brain, ob, self, tick, true);
+            DartHover(ob, self, ground, centre, brain.targetPos, snoutFwd, sp * spd,
+                      brain.orbitSign, out);
+            break;
+          }
+        }
+        if (brain.passPhase == 2 &&
+            (brain.passBit ? tick >= brain.passBiteTick + ob.biteLead + 4u
+                           : tick >= brain.passPhaseAt + 24u)) {
+          brain.passPhase = 3;
+          brain.passPhaseAt = tick;
+        }
+        out.desiredHeading = Deflect(want, self.heading, ground);
+        if (brain.passPhase == 1) {
+          DartHover(ob, self, ground, centre, P, snoutFwd, sp * spd, brain.orbitSign, out);
+        } else if (brain.passPhase == 2) {
+          const float vWant = std::sqrt(2.0f * ob.dartBrake * dartToP);
+          const float vNow = self.velocity.dot(fw3);
+          const float drive = vNow > vWant + 2.0f
+                                  ? -1.0f
+                                  : std::min(ob.dartSpeed, vWant / std::max(1.0f, self.speed));
+          out.driveScale = sp * drive * spd;
+        } else {
+          out.driveScale = -sp * ob.dartBack * spd;
+        }
+        if (self.volumetric) {
+          out.altitudeSet = false;
+          out.pitchSet = true;
+          out.pitch = linePitch;
+          // See DartHover: the line must not be felt flat.
           out.breach = true;
-          if (brain.passPhase == 1) {
-            const float cone = P.y - horiz * std::tan(ob.climb);
-            if (centre.y > cone) {
-              out.altitude = cone;
+          out.feelReach = std::max(1.0f, gapP);
+        }
+      } else {
+        if (brain.passPhase == 1 && err <= ob.lineUp) brain.passPhase = 2;
+        // A TURN-IN THAT CANNOT LINE UP IS ABANDONED: the target was inside the
+        // body's turning circle the whole way round (the slow-down below should
+        // have prevented it), and another lap is a better plan than a spiral.
+        if (brain.passPhase == 1 && age > ob.passMax / 2) {
+          brain.passPhase = 0;
+          DrawLap(brain, ob, self, tick, true);
+          out.desiredHeading = self.heading;
+          out.driveScale = sp * ob.speed * spd;
+          break;
+        }
+        if (brain.passPhase >= 2 && !brain.passLocked && dm <= ob.lockDist) {
+          brain.passLocked = true;
+          brain.passHeading = want;
+          brain.passAlt = P.y;
+          brain.passPitch = linePitch;
+        }
+        brain.passClosest = std::min(brain.passClosest, dm);
+        if (brain.passPhase == 2 && brain.passLocked &&
+            dm > brain.passClosest + 1.0f)
+          brain.passPhase = 3;
+        const float heading = brain.passLocked ? brain.passHeading : want;
+        out.desiredHeading = Deflect(heading, self.heading, ground);
+        float drive = brain.passPhase == 1 ? ob.turnInSpeed : ob.chargeSpeed;
+        // THE TURN-IN SLOWS TO MAKE ITS TURN. A body at speed v turning at w
+        // draws a circle of radius v/w, and a target inside that circle is never
+        // lined up -- it orbits it instead, which is the one thing a charge must
+        // not do. The circle that leaves on the nose's line and passes through
+        // the target has radius d / (2 sin err); the speed that turns that
+        // tightly is w x that radius (with a margin, and a floor so the body
+        // still glides through the turn).
+        if (brain.passPhase == 1 && err > 0.05f && self.turnRate > 0.0f) {
+          const float rNeed = d / (2.0f * std::max(std::sin(std::min(err, 1.5707963f)), 0.05f));
+          const float vTurn = 0.65f * self.turnRate * rNeed;
+          drive = std::min(drive, std::max(0.3f, vTurn / std::max(1.0f, self.speed)));
+        }
+        out.driveScale = sp * drive * spd;
+        if (self.volumetric) {
+          out.altitudeSet = true;
+          out.altitude = brain.passLocked ? brain.passAlt : P.y;
+          out.breach = brain.passPhase >= 2;
+          // ---- ...UP THE LINE, FROM BELOW (OrbitTuning::climb) ---------------
+          // Turning in, a body still ABOVE the cone under the aim point (the
+          // depth from which the line climbs at `climb`) sinks onto it; one
+          // under it already points its nose at the aim point. The run holds
+          // the 3D line, frozen with the heading at the lock; the overrun keeps
+          // it through the snap until the peel turns it down (below). The whole
+          // pass may breach: the air past a line that ends below the waterline
+          // is not in the way, and asking the feel to dodge it bent every
+          // upward line flat.
+          if (climbing) {
+            out.breach = true;
+            if (brain.passPhase == 1) {
+              const float cone = P.y - horiz * std::tan(ob.climb);
+              if (centre.y > cone) {
+                out.altitude = cone;
+              } else {
+                out.pitchSet = true;
+                out.pitch = linePitch;
+              }
             } else {
               out.pitchSet = true;
-              out.pitch = linePitch;
+              out.pitch = brain.passLocked ? brain.passPitch : linePitch;
             }
-          } else {
-            out.pitchSet = true;
-            out.pitch = brain.passLocked ? brain.passPitch : linePitch;
           }
         }
       }
@@ -2965,7 +3133,10 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
         onLine = ahead > -tR && lateral <= tR + 1.5f;
       }
       const bool jawsOn = onLine || snoutErr <= ob.biteCone;
-      if (!brain.passBit && brain.visible && (brain.passPhase >= 2 || jawsOn)) {
+      // A dart throws only from its lunge (the hover is not a strike).
+      const bool mayBite =
+          brain.passDart ? brain.passPhase == 2 : (brain.passPhase >= 2 || jawsOn);
+      if (!brain.passBit && brain.visible && mayBite) {
         // Timed against the speed the body HAS, along the line to the target
         // (a run still accelerating covers far less than its ceiling): the
         // jaws should be open when they arrive, not seven ticks of top speed
@@ -2975,13 +3146,20 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
             toT.len() > 1e-3f
                 ? std::max(0.0f, self.velocity.dot(toT * (1.0f / toT.len())))
                 : 0.0f;
+        // A DART'S LUNGE BRAKES INTO THE MEAT, so its closing speed is the
+        // truth and no floor is put under it: thrown biteLead ticks of that
+        // speed short of the skin (it is still doing about sqrt(2 x
+        // dartBrake x a voxel) there), and at once by jaws already in.
         const float trigger =
-            std::max(closing, 0.25f * runV) * (float)ob.biteLead *
-                std::max(dt, 1e-4f) +
-            1.0f;
-        if (dm <= trigger && jawsOn) {
+            brain.passDart
+                ? closing * (float)ob.biteLead * std::max(dt, 1e-4f) + 0.3f
+                : std::max(closing, 0.25f * runV) * (float)ob.biteLead *
+                          std::max(dt, 1e-4f) +
+                      1.0f;
+        if ((brain.passDart ? dartGap : dm) <= trigger && jawsOn) {
           brain.passBit = true;
           brain.passBites++;
+          if (brain.passDart) brain.dartBites++;
           const uint32_t jit =
               pr.attack.jitterTicks == 0
                   ? 0
@@ -3009,10 +3187,11 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       {
         static const bool kPassTrace = std::getenv("SANDVOX_PASS_TRACE") != nullptr;
         if (kPassTrace)
-          std::printf("pass #%llu t%u ph %d d %.1f dm %.1f err %+.2f want %+.2f "
+          std::printf("pass #%llu t%u %s ph %d d %.1f dm %.1f gap %.1f err %+.2f want %+.2f "
                       "hd %+.2f lock %d bit %d drive %.2f v %.1f P(%.1f %.1f %.1f) "
                       "c(%.1f %.1f %.1f) pitch %+.2f wants %s%+.2f\n",
-                      (unsigned long long)self.id, tick, brain.passPhase, d, dm,
+                      (unsigned long long)self.id, tick, brain.passDart ? "dart" : "run",
+                      brain.passPhase, d, dm, dartGap,
                       WrapPi(want - self.heading), want, self.heading,
                       (int)brain.passLocked, (int)brain.passBit, out.driveScale,
                       self.velocity.len(), P.x, P.y, P.z, centre.x, centre.y,
@@ -3023,7 +3202,7 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       // gape and the snap (biteLead ticks of travel plus the cut); then the
       // body goes PAST, on a line turned `peel` off its own the way the next
       // lap will run, so it brushes by instead of ramming the body it bit.
-      if (brain.passBit && brain.passPhase != 3 &&
+      if (!brain.passDart && brain.passBit && brain.passPhase != 3 &&
           tick >= brain.passBiteTick + ob.biteLead + 6u) {
         brain.passPhase = 3;
         brain.passLocked = true;
@@ -3034,7 +3213,13 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
         if (climbing) brain.passPitch = -0.5f * ob.climb;
       }
       // ---- ...and the pass ends ----
-      const bool past = brain.passPhase == 3 && d >= ob.overrun;
+      // A drive-by once it has overrun; a dart once it has backed off to the
+      // hover's distance (or run out of back-off).
+      const bool past =
+          brain.passPhase == 3 &&
+          (brain.passDart ? BodyDist(self, muzzle, P) >= ob.dartStandoff ||
+                                tick >= brain.passPhaseAt + ob.dartRecoil
+                          : d >= ob.overrun);
       if (past || age >= ob.passMax) {
         brain.passPhase = 0;
         DrawLap(brain, ob, self, tick, true);

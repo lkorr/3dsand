@@ -340,7 +340,10 @@ void MobSystem::DriveSwim(Mob& mob, const MobDef& def, World& world, float dt) {
   // equal escapes; none clear = turn round.
   {
     const Vec3 snout = c + mob.Forward3() * halfLen;
-    const float reach = sw.feel + speed * 0.33f;
+    // ...no further than a strike's line runs (ai::IntentOut::feelReach):
+    // what lies past the point it bites is not in its way.
+    float reach = sw.feel + speed * 0.33f;
+    if (mob.feelReach_ > 0.0f) reach = std::min(reach, mob.feelReach_);
     auto clear = [&](float h, float p) {
       const Vec3 d = DirOf(h, p);
       for (float s = 1.0f; s <= reach; s += 1.0f) {

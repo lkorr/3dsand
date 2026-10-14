@@ -5900,6 +5900,9 @@ class Mob {
   float pitchWant_ = 0.0f;
   // A charge may lift the back over the waterline by SwimDef::breach.
   bool breachOk_ = false;
+  // The feel's reach down the wanted line, capped (ai::IntentOut::feelReach):
+  // a strike's line ends at the point it strikes. 0 = the body's own.
+  float feelReach_ = 0.0f;
   // Out of the water.
   float drySeconds_ = 0.0f;
   float suffocateOwed_ = 0.0f;   // hp accrued, spent in whole points
