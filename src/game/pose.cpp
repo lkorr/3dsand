@@ -1553,7 +1553,10 @@ void Mob::ApplySlither(const MobDef::SlitherDef& sd, const PoseInputs& in,
   const float phase = k * pose_.slitherOdo;
   const float ramp = std::max(1e-3f, sd.ampRamp * sd.length);
   const float sPivot = sd.zTip - def_->worldSize.z * 0.5f;
-  const float kappa = pose_.slitherKappa;
+  // AN UPRIGHT BODY ON LAND LAYS ITS TAIL ALONG ITS PATH (below), so the
+  // turn is in the path and the bend term is not added a second time.
+  const bool follow = sd.upright && sd.beatHz <= 0.0f;
+  const float kappa = follow ? 0.0f : pose_.slitherKappa;
   auto lateral = [&](float s) {
     float t = std::clamp(s / ramp, 0.0f, 1.0f);
     t = t * t * (3.0f - 2.0f * t);
@@ -1585,6 +1588,137 @@ void Mob::ApplySlither(const MobDef::SlitherDef& sd, const PoseInputs& in,
         own[i] = std::max(0.0f, own[i] - w);
   }
 
+  // ---- FOLLOW THE PATH (SlitherDef::upright, on land; 2026-10-13) ---------
+  //
+  // The snake's wave stands still in the world because its phase is the
+  // odometer, and a turn is drawn as a bend of the turn's own curvature. For
+  // a tail BEHIND an upright body that is not enough: the body can turn on the
+  // spot, circle, double back, and a tail drawn as "a wave about the current
+  // heading" swings round behind it like a rudder. So the tail's root is
+  // recorded where it goes (PoseDrive::tailPath, world x-z, a point every half
+  // voxel), and the trail is laid joint by joint ALONG that path: each joint
+  // is the point of the path its segment's rest length further back from the
+  // one before. Turning in place swings the root round the hips and the tail
+  // curls after it; a U-turn leaves it in a U; backing up retracts the root
+  // down its own path. The wave above rides on top as yaw about each segment.
+  static thread_local std::vector<float> pathYaw;
+  pathYaw.clear();
+  if (!follow) {
+    pose_.tailPath.clear();
+  } else if (sd.parts.size() >= 2 && def_->rootLimb >= 0) {
+    const float ch = std::cos(heading_), shd = std::sin(heading_);
+    const Vec3 pivot{def_->worldSize.x * 0.5f, 0, def_->worldSize.z * 0.5f};
+    // Model x-z -> world x-z at this heading (a turn about +Y by heading_).
+    auto toWorld = [&](Vec3 m) {
+      const float x = m.x - pivot.x, z = m.z - pivot.z;
+      return Vec3{origin_.x + pivot.x + x * ch + z * shd, 0,
+                  origin_.z + pivot.z - x * shd + z * ch};
+    };
+    // The chain's rest joints (model frame) and each segment's rest run.
+    const size_t m = sd.parts.size();
+    static thread_local std::vector<float> segLen;
+    segLen.assign(m, 1.0f);
+    float total = 0.0f;
+    for (size_t c = 0; c < m; c++) {
+      const Vec3 a = sk.parts[(size_t)sd.parts[c]].anchorLocal;
+      const Vec3 b = c + 1 < m
+                         ? sk.parts[(size_t)sd.parts[c + 1]].anchorLocal
+                         : a + (a - sk.parts[(size_t)sd.parts[c - 1]].anchorLocal);
+      segLen[c] = std::max(0.5f, std::sqrt((b.x - a.x) * (b.x - a.x) +
+                                           (b.z - a.z) * (b.z - a.z)));
+      total += segLen[c];
+    }
+    const Vec3 root = toWorld(sk.parts[(size_t)sd.parts[0]].anchorLocal);
+    const Vec3 back{-shd, 0, -ch};
+    std::vector<Vec3>& path = pose_.tailPath;   // oldest first, newest last
+    constexpr float kSpacing = 0.5f;
+    // Fresh, or the body jumped (a spawn, a load, a teleport): straight back.
+    if (path.empty() ||
+        std::hypot(path.back().x - root.x, path.back().z - root.z) > 8.0f) {
+      path.clear();
+      path.push_back(root + back * (total + 4.0f));
+      path.push_back(root);
+    }
+    // Backing up: the root moved back down its own path, so the newest points
+    // are now IN FRONT of it. Retract them rather than fold the tail forward.
+    while (path.size() > 2) {
+      const Vec3 p0 = path[path.size() - 1];
+      const Vec3 p1 = path[path.size() - 2];
+      const float ax = p0.x - p1.x, az = p0.z - p1.z;
+      if ((root.x - p0.x) * ax + (root.z - p0.z) * az >= 0.0f) break;
+      if (std::hypot(root.x - p1.x, root.z - p1.z) > std::hypot(ax, az)) break;
+      path.pop_back();
+    }
+    if (std::hypot(path.back().x - root.x, path.back().z - root.z) >= kSpacing)
+      path.push_back(root);
+    // Keep about a tail and a half of history.
+    {
+      float run = 0.0f;
+      size_t keepFrom = 0;
+      for (size_t i = path.size() - 1; i > 0; i--) {
+        run += std::hypot(path[i].x - path[i - 1].x, path[i].z - path[i - 1].z);
+        if (run > total * 1.5f + 4.0f) { keepFrom = i - 1; break; }
+      }
+      if (keepFrom > 0)
+        path.erase(path.begin(), path.begin() + (ptrdiff_t)keepFrom);
+    }
+    // Walk the chain down the path, newest to oldest: from the current joint,
+    // the next one is where the path first lies a segment's length away.
+    // Past the oldest point the path carries on straight.
+    Vec3 at = root;
+    int seg = (int)path.size() - 1;        // walking path[seg] -> path[seg-1]
+    Vec3 segA = root;
+    float prevYaw = 0.0f;
+    for (size_t c = 0; c < m; c++) {
+      const float L = segLen[c];
+      Vec3 next = at + back * L;
+      for (int guard = 0; guard < 4096; guard++) {
+        Vec3 segB;
+        const bool beyond = seg <= 0;
+        if (!beyond) {
+          segB = path[(size_t)seg - 1];
+        } else {
+          Vec3 dir = path.size() >= 2 ? path[0] - path[1] : back;
+          const float dl = std::hypot(dir.x, dir.z);
+          dir = dl > 1e-4f ? dir * (1.0f / dl) : back;
+          segB = segA + dir * (L * 2.0f + 1.0f);
+        }
+        // The point of [segA, segB] at distance L from `at`, if it is on it.
+        const float dx = segB.x - segA.x, dz = segB.z - segA.z;
+        const float fx = segA.x - at.x, fz = segA.z - at.z;
+        const float qa = dx * dx + dz * dz;
+        const float qb = 2.0f * (fx * dx + fz * dz);
+        const float qc = fx * fx + fz * fz - L * L;
+        const float disc = qb * qb - 4.0f * qa * qc;
+        if (qa > 1e-8f && disc >= 0.0f) {
+          const float t = (-qb + std::sqrt(disc)) / (2.0f * qa);
+          if (t >= 0.0f && t <= 1.0f) {
+            next = Vec3{segA.x + dx * t, 0, segA.z + dz * t};
+            segA = next;
+            break;
+          }
+        }
+        if (beyond) break;   // the straight extension always reaches
+        segA = segB;
+        seg--;
+      }
+      // The segment points along -Z turned by (heading + yaw): solve for the
+      // yaw in the model frame, then bound the bend from its neighbour (a
+      // hard corner in the path is a curl, never a fold).
+      const float wx = next.x - at.x, wz = next.z - at.z;
+      float yaw = std::atan2(-wx, -wz) - heading_;
+      while (yaw > 3.14159265f) yaw -= 6.28318531f;
+      while (yaw <= -3.14159265f) yaw += 6.28318531f;
+      const float lim = (c == 0 ? 110.0f : 50.0f) * 0.0174532925f;
+      yaw = std::clamp(yaw, prevYaw - lim, prevYaw + lim);
+      pathYaw.push_back(yaw);
+      prevYaw = yaw;
+      // Re-seat on the bounded direction so the next joint starts there.
+      const float a = heading_ + yaw;
+      at = at + Vec3{-std::sin(a), 0, -std::cos(a)} * L;
+    }
+  }
+
   // ---- target yaw per chain part, then deltas down the hierarchy ----------
   static thread_local std::vector<float> yawAbs;
   static thread_local std::vector<uint8_t> inChain;
@@ -1594,7 +1728,9 @@ void Mob::ApplySlither(const MobDef::SlitherDef& sd, const PoseInputs& in,
     const int p = sd.parts[c];
     if (p < 0 || (size_t)p >= n) continue;
     inChain[(size_t)p] = 1;
-    yawAbs[(size_t)p] = own[(size_t)p] * yawAt(sd.sMid[c]);
+    yawAbs[(size_t)p] =
+        own[(size_t)p] * ((follow && c < pathYaw.size() ? pathYaw[c] : 0.0f) +
+                          yawAt(sd.sMid[c]));
   }
   // Parents are stored before children, so one ascending pass sees every
   // parent's absolute yaw before its child is laid relative to it.

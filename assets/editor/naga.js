@@ -390,10 +390,18 @@ export const PRESET_ORDER = Object.keys(PRESETS);
 // the generator hooks only a naga has (mobgen buildSidecar)
 // =============================================================================
 
-/** Sidecar keys a naga adds: its bite carries venom, the snake's way. */
+/** Sidecar keys a naga adds. CLOSE QUARTERS ARE A BITE (mob.h
+ *  MobDef::closeStyle): whatever its behaviour profile swings with, a target
+ *  within 0.7 m gets the jaws -- as a STRIKE (`bite_lunge`: the body darts in
+ *  and bites), because the standing `bite` reaches about 0.2 m past the face
+ *  and a fight is held at arm's length. And the bite carries venom, the
+ *  snake's way. */
+export const BITE_RANGE = 7;
 export function extraSidecar(g) {
-  return g.naga && g.naga.venom
-    ? { bite: { infect: 'envenomed', stain: 'venom' } } : {};
+  return {
+    closeStyle: { style: 'bite_lunge', range: BITE_RANGE },
+    ...(g.naga && g.naga.venom ? { bite: { infect: 'envenomed', stain: 'venom' } } : {}),
+  };
 }
 
 /** Long fangs bite harder. The edge stays the human's jaws'. */

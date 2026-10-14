@@ -15447,6 +15447,16 @@ the root's rest height. `IsLegChain`'s legacy fallback now applies only to
 UNTAGGED chains: a legless rig keeping its tagged arm chains had its arms
 handed the gait, the stride clock and the mantle's knee pose.
 
+**The tail follows the PATH, not the heading** (2026-10-13). On land the
+tail's root is recorded where it goes (`PoseDrive::tailPath`, world x-z, a
+point every half voxel) and the trail is laid joint by joint along it; the
+wave rides on top. Turning on the spot curls the tail round after the hips, a
+U-turn leaves it in a U, backing up retracts the root down its own path.
+**Close quarters are a bite**: sidecar `closeStyle` (`MobDef::closeStyle`)
+makes a target within `range` get that style whatever the behaviour profile
+would draw; the naga's is `bite_lunge` within 0.7 m (a standing `bite` reaches
+0.2 m past the face and fights are held at arm's length).
+
 **In water it swims like a walker** (`MobSystem::CanSwimAfloat` admits an
 upright tail; the snake, a body that IS its chain, still does not) with its
 own swim family -- `tread`, `swim`, `swim_back`, `swim_side` (+ `.mirror`),

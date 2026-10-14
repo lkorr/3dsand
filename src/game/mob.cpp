@@ -1291,6 +1291,11 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
       std::max(1.0f, j.value("chaseRampMs", def.chaseRampS * 1000.0f)) /
       1000.0f;
   def.chaseRange = std::max(0.0f, j.value("chaseRange", 0.0f)) * worldLen;
+  if (j.contains("closeStyle") && j["closeStyle"].is_object()) {   // MobDef::closeStyle
+    def.closeStyle = j["closeStyle"].value("style", std::string());
+    def.closeStyleRange =
+        std::max(0.0f, j["closeStyle"].value("range", 0.0f)) * worldLen;
+  }
 
   // Sound slots (assets/sound_schema.js). Presentation only, so a bad entry
   // is skipped rather than failing the def — a mob with a typo'd sound name
@@ -6922,8 +6927,23 @@ void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
   // styles in its list, every cadence, forever. See PickAttackStyle.
   const float slack =
       mob.Def() != nullptr ? mob.Def()->worldSize.z * 0.5f : 1.0f;
-  const int si = PickAttackStyle(styles_, pr->attack.styles, mob.id_, tick,
-                                 &mob, req.distance, slack);
+  // CLOSE QUARTERS FIRST (MobDef::closeStyle): inside its range the creature's
+  // own close style is the stroke, if it can make it (the jaws are still on).
+  int si = -1;
+  if (const MobDef* cd = mob.Def(); cd != nullptr && !cd->closeStyle.empty() &&
+                                    req.distance > 0.0f &&
+                                    req.distance <= cd->closeStyleRange) {
+    // ...and only where it ARRIVES: the reach check below would otherwise
+    // drop the stroke, and the creature would miss its turn at the edge.
+    const int ci = styles_.Find(cd->closeStyle);
+    if (ci >= 0 && StyleUsable(mob, *styles_.At(ci))) {
+      const float r = StyleReachOn(mob, *styles_.At(ci));
+      if (r <= 0.0f || req.distance <= r + slack) si = ci;
+    }
+  }
+  if (si < 0)
+    si = PickAttackStyle(styles_, pr->attack.styles, mob.id_, tick, &mob,
+                         req.distance, slack);
   if (si < 0) {
     // TWO DIFFERENT SILENCES, TOLD APART. "Nothing is usable" is a rig or a
     // content fault; "nothing reaches" is a POSITIONING fault, and until now

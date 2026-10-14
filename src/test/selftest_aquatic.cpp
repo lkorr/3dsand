@@ -1042,6 +1042,10 @@ Status GateNaga(Ctx& c, std::string& detail) {
   float gap0 = -1, gapLow = 1e9f, uprightLow = 1e9f, clearWorst = 0, sinkLow = 1e9f,
         waveMax = 0;
   int samples = 0, targeted = 0, sinceStrike = 1000;
+  // CLOSE QUARTERS ARE A BITE (MobDef::closeStyle): every stroke begun with
+  // the target inside the close range must be the def's close style.
+  int closeStrokes = 0, closeBites = 0, farStrokes = 0;
+  bool wasActive = false;
   float speedPeak = 0;
   std::string intents;
   for (int i = 0; i < kLand; i++) {
@@ -1065,7 +1069,20 @@ Status GateNaga(Ctx& c, std::string& detail) {
     // A blow, a leap and the ticks after one are not the slither: the claims
     // below are about the body travelling (GateSnake's rule).
     const NpcStroke* stroke = mobs.MobStroke(a);
-    const bool striking = (stroke != nullptr && stroke->Active()) || m->Airborne();
+    const bool active = stroke != nullptr && stroke->Active();
+    if (active && !wasActive) {
+      const ai::Brain* br = mobs.MobBrain(a);
+      const AttackStyle* sty = mobs.AttackStyles().At(stroke->style);
+      const bool bite = sty != nullptr && sty->name == nd.closeStyle;
+      if (br != nullptr && br->targetDist <= nd.closeStyleRange) {
+        closeStrokes++;
+        closeBites += bite ? 1 : 0;
+      } else {
+        farStrokes++;
+      }
+    }
+    wasActive = active;
+    const bool striking = active || m->Airborne();
     sinceStrike = striking ? 0 : sinceStrike + 1;
     if (i < kWarm || i % 3 || sinceStrike <= 6) continue;
     samples++;
@@ -1108,10 +1125,58 @@ Status GateNaga(Ctx& c, std::string& detail) {
   const float sinkMax = (float)BaselineNumber("nagaTailSinkMax", 2.0);
   const float waveMin = (float)BaselineNumber("nagaWaveMin", 0.5);
   const float moved = gap0 >= 0 ? gap0 - gapLow : 0.0f;
-  const bool aOk = a != 0 && samples > 0 && moved >= moveMin &&
+  const bool aOkMove = a != 0 && samples > 0 && moved >= moveMin &&
                    uprightLow >= upMin && clearWorst <= clearMax &&
                    sinkLow >= -sinkMax && waveMax >= waveMin;
+  const bool biteOk = !nd.closeStyle.empty() && closeStrokes > 0 &&
+                      closeBites == closeStrokes;
   RecordObserved("nagaLandMoved", (double)moved);
+
+  // ======== A2. THE TAIL FOLLOWS THE PATH ======================================
+  // The point jumps to BEHIND the naga: it turns round and sets off the other
+  // way. A tail drawn about the current heading would swing straight round
+  // behind it like a rudder; one laid along the path (ApplySlither, `follow`)
+  // still lies the way the body came, so for a while the trail runs off to
+  // the side of the body's new back. Measured as the largest angle, over the
+  // window, between the body's back direction and the line tail3 -> tip
+  // (world x-z); the turnaround must curl it past nagaCurlMinDeg.
+  // A FRESH body, so the fight above leaves nothing behind: it sets off toward
+  // a point far ahead (inside its sight, outside its reach), the point jumps
+  // as far BEHIND it, and the window ends before it could close to strike.
+  float curlMax = 0.0f;
+  mobs.Reset();
+  c.debris.Reset();
+  support::RunTicks(rig, 2);
+  const float zA2 = (float)site.z + 0.5f;
+  mobs.SetPlayerActor(Vec3{(float)site.x + 16.0f, (float)hMax + 2.0f, zA2}, 3.0f,
+                      17.0f, true);
+  const uint64_t u = mobs.Spawn(dNaga, {ifloor(site.x - 14 - ns.x * 0.5f), hMax + 1,
+                                        ifloor(site.z - ns.z * 0.5f)});
+  if (u) mobs.SetMobBehavior(u, "zombie");
+  support::RunTicks(rig, (int)BaselineNumber("nagaTurnLeadTicks", 20));
+  if (const Mob* m0 = mobs.FindMobById(u)) {
+    Vec3 hc{};
+    m0->LimbCentreWorld(iHips, hc);
+    mobs.SetPlayerActor(Vec3{hc.x - 30.0f, (float)hMax + 2.0f, zA2}, 3.0f, 17.0f,
+                        true);
+    for (int i = 0; i < (int)BaselineNumber("nagaTurnTicks", 25); i++) {
+      support::RunTicks(rig, 1);
+      const Mob* m = mobs.FindMobById(u);
+      if (m == nullptr) break;
+      Vec3 t3{}, tip{};
+      if (!m->LimbCentreWorld(iT3, t3) || !m->LimbCentreWorld(iT12, tip)) continue;
+      const float h = m->Heading();
+      const float bx = -std::sin(h), bz = -std::cos(h);
+      const float tx = tip.x - t3.x, tz = tip.z - t3.z;
+      const float tl = std::hypot(tx, tz);
+      if (tl < 1.0f) continue;
+      const float cosA = std::clamp((tx * bx + tz * bz) / tl, -1.0f, 1.0f);
+      curlMax = std::max(curlMax, std::acos(cosA) * 57.29578f);
+    }
+  }
+  const float curlMin = (float)BaselineNumber("nagaCurlMinDeg", 50);
+  const bool curlOk = curlMax >= curlMin;
+  RecordObserved("nagaCurlMaxDeg", (double)curlMax);
   RecordObserved("nagaTailClearWorst", (double)clearWorst);
   RecordObserved("nagaWaveMax", (double)waveMax);
 
@@ -1197,6 +1262,7 @@ Status GateNaga(Ctx& c, std::string& detail) {
   const Swim sb = swimAcross(dNaga);
   const Swim sm = swimAcross(dMerrow);
   const float ratio = (float)BaselineNumber("nagaPlaneRatio", 1.3);
+  const bool aOk = aOkMove && biteOk && curlOk;
   const bool bOk = sb.swam > 40 && sb.crawl >= 0.5f && sb.lat >= ratio * sb.sag &&
                    sm.swam > 40 && sm.crawl >= 0.5f && sm.sag >= ratio * sm.lat;
 
@@ -1211,13 +1277,17 @@ Status GateNaga(Ctx& c, std::string& detail) {
       "site %s | A slithers %s: moved %.1f (min %.1f) over %d samples [target %d/%d "
       "ticks, intents %s, drive speed peak %.2f], head over hips "
       ">= %.1f (min %.1f), trail clearance worst mean %.2f (max %.1f) deepest %.2f "
-      "(floor -%.1f), S off the chord %.2f (min %.2f) | B swims %s: base %d ticks "
+      "(floor -%.1f), S off the chord %.2f (min %.2f), close-range strokes %d of "
+      "them bites %d (%d further out) %s, U-turn curl %.0f deg (min %.0f) %s | B "
+      "swims %s: base %d ticks "
       "swimming, stroke %.2f, speed %.2f, tail bend across %.2f / in-plane %.2f "
       "(undulates); merrow %d ticks, stroke %.2f, speed %.2f, across %.2f / in-plane "
       "%.2f (kicks); ratio %.1f",
       siteWhy.c_str(), aOk ? "PASS" : "FAIL", moved, moveMin, samples, targeted, kLand,
       intents.c_str(), speedPeak, uprightLow,
-      upMin, clearWorst, clearMax, sinkLow, sinkMax, waveMax, waveMin,
+      upMin, clearWorst, clearMax, sinkLow, sinkMax, waveMax, waveMin, closeStrokes,
+      closeBites, farStrokes, biteOk ? "ok" : "FAIL", curlMax, curlMin,
+      curlOk ? "ok" : "FAIL",
       bOk ? "PASS" : "FAIL", sb.swam, sb.crawl, sb.speed, sb.lat, sb.sag, sm.swam,
       sm.crawl, sm.speed, sm.lat, sm.sag, ratio);
   return aOk && bOk ? Status::Pass : Status::Fail;

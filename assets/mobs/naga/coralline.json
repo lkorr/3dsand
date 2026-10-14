@@ -112,87 +112,89 @@
       "name": "tail3",
       "anchor": [
         16,
-        9.4,
-        3.4
+        9,
+        3
       ]
     },
     {
       "name": "tail4",
-      "hp": 62,
+      "hp": 63,
       "anchor": [
         16,
-        9.2,
-        -15.1
+        8.8,
+        -10.4
       ]
     },
     {
       "name": "tail5",
-      "hp": 57,
+      "hp": 63,
       "anchor": [
         16,
-        8.9,
-        -33.6
+        8.5,
+        -24.4
       ]
     },
     {
       "name": "tail6",
-      "hp": 56,
+      "hp": 60,
       "anchor": [
         16,
-        8.5,
-        -52.6
+        8.1,
+        -37.9
       ]
     },
     {
       "name": "tail7",
-      "hp": 53,
+      "hp": 60,
       "anchor": [
         16,
-        7.8,
-        -71.1
+        7.5,
+        -51.4
       ]
     },
     {
       "name": "tail8",
+      "hp": 47,
       "anchor": [
         16,
-        7.1,
-        -89.6
+        6.8,
+        -64.9
       ]
     },
     {
       "name": "tail9",
-      "hp": 41,
+      "hp": 46,
       "anchor": [
         16,
-        6.2,
-        -108.1
+        5.9,
+        -78.4
       ]
     },
     {
       "name": "tail10",
-      "hp": 34,
+      "hp": 37,
       "anchor": [
         16,
-        5.2,
-        -126.6
+        4.9,
+        -92.4
       ]
     },
     {
       "name": "tail11",
+      "hp": 27,
       "anchor": [
         16,
-        4,
-        -145.6
+        3.8,
+        -105.9
       ]
     },
     {
       "name": "tail12",
-      "hp": 21,
+      "hp": 22,
       "anchor": [
         16,
-        2.7,
-        -164.1
+        2.6,
+        -119.4
       ]
     },
     {
@@ -267,7 +269,7 @@
         ]
       },
       "strike": {
-        "bite": 9.5
+        "bite": 9.8
       }
     }
   ],
@@ -281,19 +283,19 @@
       "sex": "female",
       "bust": 0.55,
       "bra": {
-        "style": "classic",
-        "cover": 1,
-        "cupSize": 1,
-        "cupLift": 0,
+        "style": "triangle",
+        "cover": 0.9,
+        "cupSize": 1.45,
+        "cupLift": 0.1,
         "bridge": 0,
         "bridgePos": 0.5,
-        "taper": 0,
+        "taper": 0.85,
         "plunge": 0,
         "bandPos": 0,
-        "band": 1,
+        "band": 0.6,
         "wrap": 0,
-        "straps": "classic",
-        "strapWidth": 0.75,
+        "straps": "halter",
+        "strapWidth": 0.5,
         "strapSet": 0.45,
         "tone": "cloth"
       },
@@ -400,12 +402,12 @@
     },
     "hair": {
       "style": "bob",
-      "back": 4.5,
-      "front": 7,
+      "back": 3.5,
+      "front": 12,
       "length": 0,
       "knot": false,
       "side": 0,
-      "band": 1,
+      "band": 0.8,
       "volume": 1,
       "crest": 0,
       "spikes": 0,
@@ -416,13 +418,13 @@
       "twin": false,
       "wisp": 0.25,
       "ragged": 0.1,
-      "bangs": 0.85,
+      "bangs": 0.3,
       "faceThin": 0.45,
       "hairlineSoft": 0,
       "sideThin": 0,
       "topThin": 0,
       "fluff": 0,
-      "fuzz": 0,
+      "fuzz": 0.7,
       "fuzzTop": 1,
       "fuzzSide": 1,
       "fuzzBack": 1,
@@ -586,10 +588,10 @@
       "kind": "coral",
       "eyes": "black",
       "glow": false,
-      "markings": "mask",
+      "markings": "stripe",
       "scaleCreep": 0.4,
       "faceScales": 0.35,
-      "fangs": 0.7,
+      "fangs": 0.8,
       "venom": true,
       "hood": 0,
       "hoodWidth": 0.65,
@@ -599,8 +601,8 @@
       "regalia": "none"
     },
     "serpent": {
-      "length": 1.5,
-      "girth": 0.35,
+      "length": 1.1,
+      "girth": 0,
       "taper": 0.55,
       "flat": 0.3,
       "pattern": "ringed",

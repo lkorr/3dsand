@@ -685,6 +685,14 @@ struct MobDef {
   // (sidecar `chaseRange`; 0 = whenever engaged). A cobra rears at a threat
   // in front of it, not at one thirty voxels away it is still crossing to.
   float chaseRange = 0.0f;
+  // ---- A STYLE FOR CLOSE QUARTERS (sidecar `closeStyle`, 2026-10-13) ------
+  // `{"style": "bite", "range": 7}`: when the target is within `range` world
+  // voxels (centre to centre, the attack request's own distance) and the
+  // style is usable, the stroke IS that style -- whatever the behaviour
+  // profile's draw would have picked. The naga bites what it has in its arms'
+  // reach and swings at anything further. Empty = the profile's draw always.
+  std::string closeStyle;
+  float closeStyleRange = 0.0f;
 
   const std::string& Sound(const char* slot) const {
     static const std::string kNone;

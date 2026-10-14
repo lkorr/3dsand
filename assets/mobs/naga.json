@@ -5345,6 +5345,10 @@
       "ampRamp": 0.6
     }
   },
+  "closeStyle": {
+    "style": "bite_lunge",
+    "range": 7
+  },
   "bite": {
     "infect": "envenomed",
     "stain": "venom"

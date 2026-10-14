@@ -224,6 +224,13 @@ struct PoseDrive {
   float slitherHeading = 0.0f;
   float slitherKappa = 0.0f;
   bool slitherInit = false;
+  // THE PATH AN UPRIGHT BODY'S TAIL LIES ALONG (SlitherDef::upright, on
+  // land): where the tail's root has been, in world x-z, oldest first, a
+  // point every half voxel and about a tail and a half of them. The trail is
+  // laid joint by joint along it (Mob::ApplySlither), so a turn, a circle or
+  // a U-turn leaves the tail curled along the way the body actually went.
+  // Presentation state, rebuilt straight behind the body when empty.
+  std::vector<Vec3> tailPath;
   // ---- the prone leap (AnimStateRule::airLift) ----------------------------
   // The origin height the body last stood at; while airborne the drawn body
   // is lifted by how far the origin has risen above it.
