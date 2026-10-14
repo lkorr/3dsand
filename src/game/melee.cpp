@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 
 #include <nlohmann/json.hpp>
@@ -983,9 +985,12 @@ StrikeParts BuildStrikeParts(const EdgeSweep& s, const Vec3& at,
     p.cut.halfWidth = std::max(p.cut.halfWidth, goreT.stabThick);
     p.cut.length = std::max(radius * goreT.stabWidth, p.cut.halfWidth);
     // NO HEFT (Tuning::Gore::stabDepth says why), and never past the blade
-    // itself: a dagger cannot put its point in deeper than it is long.
-    p.cut.depth =
-        std::min(goreT.stabDepth + goreT.stabDepthPower * power, segL);
+    // itself: a dagger cannot put its point in deeper than it is long. The
+    // depth is the point's SKIN-EQUIVALENT budget, spent down the bore by
+    // what it meets (phys/kerf.h KerfStabDepth): bone stops it short, scar
+    // lets it in further -- never past `reach`.
+    p.cut.depth = goreT.stabDepth + goreT.stabDepthPower * power;
+    p.cut.reach = segL;
     p.cut.edgeHalf = p.cut.length;
     p.cut.cleave = 0.0f;
   } else {
@@ -1603,12 +1608,71 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
   // Before the blade-on-blade test and before any probe, for the parry's
   // reason: a block ENDS the sweep, and a blow a shield stopped must not open
   // the arm behind it on the same tick. Against the shield's OWN LATTICE
-  // (MobSystem::FindShieldBlock), raised or not: coverage is geometry, and a
-  // hole hacked or burnt through it is a hole.
+  // (MobSystem::FindShieldBlock), once it is half up: coverage is geometry,
+  // and a hole hacked or burnt through it is a hole. A lowered shield is no
+  // guard and is skipped.
   {
     MobSystem::ShieldHit sh;
-    if (mobs.FindShieldBlock(wielder, s.aPrev, s.bPrev, s.aNow, s.bNow,
-                             s.halfWidth, sh)) {
+    bool shielded = mobs.FindShieldBlock(wielder, s.aPrev, s.bPrev, s.aNow,
+                                         s.bNow, s.halfWidth, sh);
+    // ---- ...BUT ONLY IF THE SHIELD IS WHAT THE EDGE MET FIRST (2026-10-13) --
+    //
+    // Owner report: blows went to a shield that was not up and that the blade
+    // was not hitting. The test above covers the WHOLE tick's quad, and one
+    // tick of a full-speed swing is several voxels of travel: a slash that
+    // reached the torso a third of the way through the tick and clipped the
+    // lowered shield hanging at the far hip two thirds through was handed to
+    // the shield whole -- clang, arrest, no wound. Coverage is geometry, so
+    // the shield takes the blow only when nothing else was reached before it.
+    //
+    // Asked with the same blade-axis rays the probe loop below casts, over
+    // the sub-steps up to the contact (u = 0 included: an edge that starts
+    // the tick already in a body has no shield between it and that body).
+    // The rays reach the edge's own half-width past each tile and no further
+    // -- NOT the loop's cell overhang -- because the shield's contact slack
+    // (shieldContactM) is wider than half-width, so a thrust's tip ray stops
+    // short of the face and cannot find the arm behind the boards. Shields
+    // and blades in fists are skipped exactly as the loop skips them. Runs
+    // only on a found block, so it costs nothing on the common sweep.
+    if (shielded) {
+      std::vector<uint64_t> self;
+      wielder.AppendLiveLimbBodies(self);
+      const float sweepLen0 = (s.bNow - s.bPrev).len();
+      const int steps0 = std::clamp(
+          (int)std::ceil(sweepLen0 / std::max(t.sweepSpacing, 0.05f)), 1,
+          std::max(t.sweepMaxSteps, 1));
+      for (int step = 0; step <= steps0 && shielded; step++) {
+        const float u = (float)step / (float)steps0;
+        if (u >= sh.t) break;
+        const Vec3 a = s.aPrev + (s.aNow - s.aPrev) * u;
+        const Vec3 b = s.bPrev + (s.bNow - s.bPrev) * u;
+        const Vec3 seg = b - a;
+        const float segLen = seg.len();
+        if (segLen < 1e-4f) continue;
+        const int along0 = std::clamp(
+            (int)std::ceil(segLen / std::max(radius, 0.5f)), 1, 5);
+        const Vec3 dir = seg * (1.0f / segLen);
+        const float len = segLen / (float)along0 + std::max(s.halfWidth, 0.0f);
+        for (int k = 0; k < along0; k++) {
+          const Vec3 p = a + seg * ((float)k / (float)along0);
+          float frac = 1.0f;
+          const uint64_t hb = phys.CastRayBody(p, dir, len, frac, self);
+          if (!hb || wielder.OwnsBody(hb)) continue;
+          int li = -1;
+          Mob* owner = mobs.FindOwner(hb, &li);
+          if (owner == nullptr || li < 0) continue;   // loose matter: not a body
+          if (owner->IsHeldSlot(li) || owner->IsArrowSlot(li)) continue;
+          if (std::getenv("SANDVOX_SHIELD_TRACE"))
+            std::printf("shield trace: blade met mob %llu slot %d at u %.2f "
+                        "before mob %llu's shield at t %.2f: no block\n",
+                        (unsigned long long)owner->Id(), li, (double)u,
+                        (unsigned long long)sh.holder->Id(), (double)sh.t);
+          shielded = false;
+          break;
+        }
+      }
+    }
+    if (shielded) {
       out.arrested = true;
       out.block.attackerId = wielder.Id();
       out.block.blockerId = sh.holder->Id();

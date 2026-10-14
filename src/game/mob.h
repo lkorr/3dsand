@@ -2064,6 +2064,13 @@ struct MobLimb {
   // level's worth, so it can never outlive the coat that paid for it by more
   // than one level (rule 2). Not saved: a load forfeits a fraction of a level.
   float healCredit = 0.0f;
+  // SCARRED OVER (Mob::ScarTick): the limb's damage signature (Mob::ScarSigOf
+  // -- lattice size, pending removals, burnt-away tally, the creature's burnt
+  // fraction) as it stood when a passive heal step last found NOTHING left to
+  // scar. While it still matches, the limb is skipped without walking its
+  // recipe; any new damage moves it. 0 = never settled / something blocked
+  // the healing since. Derived, not saved.
+  uint64_t scarSig = 0;
   // What is ON this limb, recounted at a bounded cadence (see LimbCoat).
   // Index-parallel by construction because it rides the limb itself, which is
   // what RemoveAppendedSlots moves wholesale.
@@ -5369,8 +5376,37 @@ class Mob {
   // `coat.effects` (stanch, disinfect) run on a limb it healed. Never
   // reshapes limbs_ (no sever, no death). See the long note at the definition.
   void HealTick(uint32_t tick);
+  // ---- A BODY THAT HEALS ITSELF, SLOWLY (gore.scarHeals, 2026-10-14) -------
+  // With no coat at all, a LIVING creature whose wounds heal (WoundsHeal: not
+  // the undead) knits a damaged limb back over many minutes: missing tissue
+  // grows back and burnt tissue is mended -- both as gore.scarMat (`scar`),
+  // never as the recipe's own skin or flesh, and softer than either
+  // (materials.json hardness), so an old wound is a weak spot a blade or an
+  // arrow goes deeper into. A SURFACE cell of the recipe (one with a face open
+  // in the limb's own shape: the skin layer) grows back only once a deeper
+  // cell beside it is whole again -- the wound fills from the bottom and
+  // skins over last. Bone and other non-tissue recipe cells are not regrown.
+  // Paused while the limb bleeds, burns, rots or pulps. hp comes back at
+  // gore.scarHpPerMin of the limb's authored hp a minute, up to the burn cap.
+  // The same step as the coat's (HealLimbStep, given a ScarPass), so the pick,
+  // the twin rule, the re-skin and the collider rebuild are one code path.
+  struct ScarPass {
+    uint32_t budget = 0;  // recipe cells this step may scar
+    uint32_t mat = 0;     // gore.scarMat, resolved
+    bool found = false;   // OUT: the step saw a cell still to scar
+  };
+  // One limb's passive heal for this tick (staggered to kHealPeriod). True
+  // when it rebuilt something.
+  bool ScarTick(int limbIndex, uint32_t tick, uint32_t key);
+  // Set by HealTick each tick: some limb is losing blood, so no limb regains
+  // hp (ScarTick step 2).
+  bool scarBleeding_ = false;
+  uint64_t ScarSigOf(const MobLimb& limb) const;
   // One limb's step of it. Returns the recipe cells rebuilt (grown + mended).
-  uint32_t HealLimbStep(int limbIndex, uint32_t tick);
+  // `scar` non-null = the passive heal (ScarTick): no coat, no purse, the
+  // budget given, every rebuilt cell made of scar->mat.
+  uint32_t HealLimbStep(int limbIndex, uint32_t tick,
+                        ScarPass* scar = nullptr);
   // A recipe material the healing neither regrows nor counts as missing: a
   // SELF-ACTIVE one (MobSystem::matSelfActive_ -- the anatomy's blood
   // speckles), which decays by itself whenever the limb's burn pass is awake.
@@ -5389,6 +5425,13 @@ class Mob {
     uint32_t steps = 0;        // limb steps that did anything
     float hpHealed = 0.0f;     // hp credited (volume back + the hp-only path)
     uint32_t bodyRebuilds = 0; // steps that rebuilt the Jolt collider
+    // The passive heal (Mob::ScarTick), kept apart from the coat's counts
+    // above so a coat gate reads only what its coat did.
+    uint32_t scarGrown = 0;    // missing tissue grown back as scar
+    uint32_t scarSurface = 0;  // of scarGrown, recipe SURFACE (skin-layer) cells
+    uint32_t scarMended = 0;   // burnt tissue mended to scar
+    uint32_t scarSteps = 0;    // passive steps that rebuilt anything
+    float scarHp = 0.0f;       // hp the passive regen credited
     // Wall-clock cost of the steps that walked the recipe (diagnostic only:
     // read by the gates, never by anything the tick decides).
     uint32_t timedSteps = 0;
@@ -6868,7 +6911,9 @@ class MobSystem {
   // voxel lies within the blade's half-width (+ melee.shieldContactM) of it.
   // The EARLIEST such contact along the travel, over every shield of every
   // other creature, is the block. So coverage is the shield's size and where
-  // the arm holds it, raised or not; and a hole hacked or burnt through it is
+  // the arm holds it -- once it is half up (ShieldUpForWatchers: a lowered
+  // shield is no guard), and only if the edge met nothing else first
+  // (MeleeSweepDamage); and a hole hacked or burnt through it is
   // a hole, once it is as wide as the blade.
   struct ShieldHit {
     Mob* holder = nullptr;
@@ -9404,6 +9449,9 @@ class MobSystem {
   // MaterialDef::coatRestore / coatRestoreRate (world voxels per level, per
   // second); 0 = not restorative. Read by Mob::HealTick and SoakLimb.
   std::vector<float> coatRestore_, coatRestoreRate_;
+  // gore.scarMat resolved by name at the last OnMaterialsReloaded (0 = none:
+  // the passive heal is off). Read by Mob::HealTick.
+  uint32_t scarMat_ = 0;
   std::vector<float> matBareBlood_;   // MaterialDef::bareBlood
   std::vector<float> matBleed_;       // MaterialDef::bleed (wound bleed weight)
   // A KindOfWord class table in which only WASHER liquids (water) are class 2

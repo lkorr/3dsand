@@ -8424,8 +8424,16 @@ touch a creature with a sword, lose a limb, anywhere, every time.
 - **A thrust is a STAB, not a kerf (2026-09-26).** `BuildStrikeParts`
   (melee.cpp) calls a blow a stab when the blade travels along itself, hilt →
   point (cosine ≥ `gore.stabAlign`; above 1 = never). The slot is then a bore:
-  depth along the thrust (`stabDepth + stabDepthPower × power`, NO heft, capped
-  at the blade's length), length ACROSS the blade (`stabWidth` × its authored
+  depth along the thrust (`stabDepth + stabDepthPower × power`, NO heft) --
+  since 2026-10-14 a BUDGET in skin-equivalent voxels that `KerfStabDepth`
+  (phys/kerf.h) spends down the bore layer by layer at each layer's mean
+  hardness / `gear.cutHardnessRef` (bone ~3x stops it short, scar 0.5x lets
+  it twice as far, a cavity is free), never past the blade's length
+  (`KerfCut::reach`); a worn shell, plate body or shield is not charged twice
+  (its chip already took its hardness) and keeps only the reach. Both
+  populations (`Mob::CutLimb`, `DebrisSystem::CutBody`), so creatures resist
+  stabs by what they are made of, as they already resisted slashes --
+  length ACROSS the blade (`stabWidth` × its authored
   half-width), thickness the edge's (floor `stabThick`) — the kerf's wedge
   narrows it to the point. `KerfCut::stab` skips `KerfBite` on both populations
   (a stab never parts a limb) and the stab lands once per slot per stroke
@@ -10320,6 +10328,60 @@ closes, cooked cells return, the burn cap rises, hp rises and is never above
 the cap on any tick; enchanted water mends, does not stanch, and stays within
 its levels). The pace and scatter thresholds are `heal.*` in
 `tests/baseline.json`.
+
+### The body heals itself, slowly (2026-10-14; `Mob::ScarTick`, `HealLimbStep`'s `ScarPass`, material `scar`, `gore.scar*`, gate `scar-heal`)
+
+Owner: "over the course of many minutes, missing flesh voxels should repair
+and become scar tissue, same with skin, though skin voxels shouldn't repair
+until the surface beneath them repairs. Scar tissue should be softer and more
+penetrable." No coat is needed. Every tick a LIVING creature whose wounds heal
+(`WoundsHeal`: `gore.woundHeals` AND the sidecar's `bleed.woundHeals`, so the
+undead never heal) runs `ScarTick` on each body limb that is NOT wearing a
+healing coat (the coat, when there is one, does it better: "A coat that
+heals").
+
+- **Waits while the wound is still at work:** the limb owes blood
+  (`bleedBudget >= 1`, `LimbWoundOpen`'s test), carries an open stump, gouts,
+  is alight, is infected or is dissolving pulp. Each of those is still taking
+  tissue away. Stumps never close (`gore.stumpBleedsOpen`), so a limb with a
+  severed child never scars; that is a choice, not an accident.
+- **hp** returns at `gore.scarHpPerMin` of the limb's authored hp a minute
+  (0.1), up to authored x the burn cap. Independent of the shape, but NOT
+  while the creature is losing blood anywhere (any limb's drip, gout or open
+  stump): blood is health, and a regen on the whole limbs would refund what
+  the wound drains -- measured, it broke `bleed-out`'s identity (hp lost ==
+  blood x rate). So an amputee never regenerates; the stump kills.
+- **Tissue** comes back at `gore.scarRate` cubic centimetres a minute per limb
+  (25: a ~160-cell crater in a human thigh closes in ~13 game minutes),
+  converted to lattice cells and integrated over the tick like the coat's
+  pace, offset per limb so a crowd's steps spread out. The step is
+  `HealLimbStep` with a `ScarPass`: the same noisy lowest-hash pick, joint-twin
+  rule, re-skin and collider rebuild as the coat, but (1) only TISSUE recipe
+  cells (`MobDef::tissue`; bone never regrows, so a crater to the bone keeps
+  its notch); (2) every rebuilt cell is `gore.scarMat` with art 0, never the
+  recipe's skin or flesh; (3) present cells are mended only if BURNT (a burn
+  stage) -- a soak reverts on its own, rot and venom wait for their cure, a
+  scar is left as it is; (4) **the skin closes last**: a recipe SURFACE cell
+  (a face open in the limb's own recipe shape, which `anatomy.js` makes the
+  skin layer) is rebuilt only when a deeper recipe neighbour is present and
+  not burnt, unless nothing beneath it could ever regrow (skin over bone, a
+  finger edge), when it closes from the side; (5) no purse, no payment, no
+  per-cell hp refund. Measured on `human.legU.L`: 39% of the first half of the
+  regrowth is surface cells against 68% of the second.
+- **Idle cost is four compares.** When a step finds nothing left to scar the
+  limb stores `MobLimb::scarSig` (lattice size, pending removals, burnt-away
+  tally, the creature's burnt fraction); while it matches, the limb is never
+  walked again. Any block above clears it.
+- **A scar is a weak spot** through one field: `scar` hardness 4 (skin 8,
+  flesh 6, muscle 10). A slash's cleave (`KerfBite`), an arrow's pierce cost
+  and a stab's bore (`KerfStabDepth`, see "A thrust is a STAB") all charge by
+  hardness, so they go further through it. A restorative coat mends a scar
+  back to the recipe: magic erases scars, time does not. `scar` burns, rots
+  and is eaten by venom like flesh (reactions.json mirrors flesh's four
+  rules; `soft_tissue` tag). A scar has no paint, so on a non-human
+  complexion it shows in scar's own pale pink.
+- CPU body state, not hashed; saved only as the limb diff already saves any
+  non-pristine cell.
 
 ### A creature is a variant of another creature (2026-09-15, inheritance + becoming one at runtime 2026-09-20; `src/game/sidecar.*` + `assets/editor/sidecar.js`, sidecar `extends`/`model`/`effects`/`palette`/`turn`, `assets/mobs/effects/`, `BuildMobDef` + `MobDefFactory`, `MobSystem::DefWithEffects`/`TurnMob`, `MobDef::undead`, `MobRotDef`, `Mob::RotAtSpawn`, gates `sidecar-resolve` + `undead` + `zombify`)
 
@@ -24781,9 +24843,19 @@ live voxel lies within half the blade's carve width (+ `melee.shieldContactM`)
 of the path. The earliest such contact along the travel, over every shield of
 every other creature, is the block. So:
 
-- coverage is how big the shield is and where the arm holds it, raised or
-  NOT -- a shield hanging at your side stops the blade that happens to meet
-  it, and leaves the chest it is not in front of;
+- coverage is how big the shield is and where the arm holds it -- **while it
+  is up** (half raised or more, `Mob::ShieldUpForWatchers`, the same flag a
+  peer's ghost carries). Until 2026-10-13 a lowered shield counted too, and the
+  owner reported the result: a shield hanging at the hip caught blades on
+  their way to the body and arrested the whole stroke. Down, it is skipped as a
+  sword in a fist is;
+- **the shield must be what the edge met first.** The test covers the whole
+  tick's travel, several voxels for a full-speed swing, so a slash that reached
+  the torso early in the tick and crossed the shield later was handed to the
+  shield whole. `MeleeSweepDamage` now casts the probe loop's blade-axis rays
+  over the sub-steps before the contact (half-width past each tile, not the
+  cell overhang, so a thrust's tip ray stops short of the face and cannot find
+  the arm behind it); a creature body found there cancels the block;
 - a round shield's empty box corners are empty;
 - **a hole is a hole**: hacked or burnt through, once a gap is as wide as the
   blade the next edge goes through it. Nothing tracks "integrity".

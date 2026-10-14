@@ -186,11 +186,14 @@ bool CutOnce(MobSystem& mobs, World& world, uint64_t id, int limb,
 // the test cuts is the runtime lattice — a def's art voxel count says nothing
 // about physScale, skinScale, or whether the rig gave that limb a body at all.
 // Each candidate is despawned again, so this leaves the system as it found it.
-Target ChooseTarget(MobSystem& mobs, IVec3 at) {
+// `only` non-null = that def alone (a gate whose claim is about a human body
+// should not ride whichever creature the library's biggest limb belongs to).
+Target ChooseTarget(MobSystem& mobs, IVec3 at, const char* only = nullptr) {
   Target best;
   for (size_t d = 0; d < mobs.Defs().size(); d++) {
     const MobDef& def = mobs.Defs()[d];
     if (def.limbs.empty() || def.bleedMat == 0) continue;  // must be able to bleed
+    if (only && def.name != only) continue;
     mobs.Reset();
     const uint64_t id = mobs.Spawn((int)d, at);
     if (!id) continue;
@@ -10533,6 +10536,264 @@ Status GateHealWound(Ctx& c, std::string& detail) {
   return bloodOk && waterOk ? Status::Pass : Status::Fail;
 }
 
+// scar-heal: THE BODY HEALS ITSELF, SLOWLY (gore.scarHeals, 2026-10-14)
+// ---------------------------------------------------------------------------
+// Mob::ScarTick with no coat. The clock is sped up `scar.speedup` times (60:
+// a game minute a second) through gore.scarRate and gore.scarHpPerMin, so ten
+// minutes of healing is ten seconds of ticks; the gate prints what the run
+// took in UNSCALED game minutes. Claims:
+//   A. A CUT, left alone: nothing is rebuilt while it still bleeds; once it
+//      stops, missing tissue grows back as `scar` (never the recipe's skin or
+//      flesh: their counts do not rise), the TISSUE left missing is at most
+//      scar.maxLeftFrac of the hole (bone is not regrown, so a crater down to
+//      the bone keeps its notch), hp rises and is never above the
+//      burn cap, and the SKIN CLOSES LAST: the share of regrown cells that
+//      are recipe-surface cells is lower in the first half of the regrowth
+//      than in the second. Once closed it SETTLES (rule 2): no passive step
+//      rebuilds anything in a further scar.settleTicks.
+//   B. BURNT: surface skin rewritten to flesh_cooked mends to scar, the
+//      burnt fraction falls and the burn cap rises.
+//   C. OFF (gore.scarHeals false; the undead's woundHeals off is the same
+//      gate in Mob::HealTick): the same cut grows nothing.
+//   D. THE STAB IS PRICED (phys/kerf.h KerfStabDepth), on a synthetic bore
+//      of known matter: skin goes the budget, scar twice it (capped at the
+//      reach), a bone layer stops it short, and a cavity is free.
+Status GateScarHeal(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  constexpr int kInset = 300;
+  // THE HUMAN: the claim is about skin over flesh over bone, the anatomy
+  // recipe's layers (the library's biggest limb is a naga's tail).
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, kInset), "human");
+  uint32_t scarMat = 0, skin = 0, flesh = 0, cooked = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    const std::string& n = c.mats[i].name;
+    if (n == "scar") scarMat = (uint32_t)i;
+    if (n == "skin") skin = (uint32_t)i;
+    if (n == "flesh") flesh = (uint32_t)i;
+    if (n == "flesh_cooked") cooked = (uint32_t)i;
+  }
+  if (!t.valid() || !scarMat || !skin || !flesh || !cooked) {
+    detail = "no fixture limb, or scar/skin/flesh/flesh_cooked missing";
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  const float hpMax = def.limbs[t.limb].hp;
+  const IVec3 site = FixtureSite(c.world, kInset);
+  IVec3 pchunk{site.x >> 4, site.y >> 4, site.z >> 4};
+  uint32_t simTick = 37000;
+  support::TickCursor ticker{c, simTick, pchunk};
+  auto poseTick = [&]() {
+    ticker.chunk = pchunk;
+    ticker();
+  };
+  const Tuning saved = CurrentTuning();
+  const double speed = std::max(1.0, BaselineNumber("scar.speedup", 60));
+  auto setTune = [&](bool on) {
+    Tuning tt = saved;
+    tt.gore.scarHeals = on;
+    tt.gore.scarRate = (float)(saved.gore.scarRate * speed);
+    tt.gore.scarHpPerMin = (float)(saved.gore.scarHpPerMin * speed);
+    SetCurrentTuning(tt);
+  };
+  const uint32_t maxTicks = (uint32_t)BaselineNumber("scar.maxTicks", 2400);
+  const double maxLeft = BaselineNumber("scar.maxLeftFrac", 0.02);
+  const uint32_t settle = (uint32_t)BaselineNumber("scar.settleTicks", 300);
+
+  // ---- A. a cut, left alone ------------------------------------------------
+  struct CutRun {
+    bool spawned = false, cut = false;
+    uint32_t bledFor = 0, grownWhileOpen = 0;
+    uint32_t miss0 = 0, missEnd = 0, closedAt = 0, tissueLeft = 0;
+    uint32_t skin0 = 0, flesh0 = 0, skinEnd = 0, fleshEnd = 0, scarEnd = 0;
+    float hp0 = 0, hpEnd = 0;
+    uint32_t overCap = 0;
+    uint32_t halfGrown = 0, halfSurface = 0;
+    Mob::HealStats end, settled;
+    std::string why;
+  };
+  auto cutRun = [&](bool on, CutRun& r) {
+    setTune(on);
+    const uint64_t id = SpawnTarget(c, t, kInset, pchunk);
+    if (!id) return;
+    r.spawned = true;
+    mobs.SetMobBehavior(id, "dummy");
+    for (int i = 0; i < 10; i++) poseTick();
+    // A round crater in the side of the limb at mid-length (heal-restore's
+    // fixture): deep enough to reach under the skin, so there is a bottom to
+    // fill and a skin layer to close over it. Then one blade cut across it,
+    // so the wound bleeds.
+    const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
+    const Vec3 mid = ax.anchor + ax.along * (0.5f * ax.reach);
+    const Vec3 sides[4] = {ax.travel, ax.travel * -1.0f, ax.edge, ax.edge * -1.0f};
+    MobSystem::BodyRayHit hit;
+    for (const Vec3& sd : sides) {
+      hit = mobs.PickBody(id, mid + sd * 20.0f, sd * -1.0f, 40.0f);
+      if (hit.hit && hit.limb == t.limb) break;
+    }
+    std::vector<ParticleSpawn> spawns;
+    if (hit.hit && hit.limb == t.limb)
+      mobs.CarveLimbRadial(mobs.LimbBody(id, t.limb), hit.pos,
+                           (float)BaselineNumber("scar.craterRadius", 1.0), true,
+                           false, c.world, spawns);
+    r.cut = hit.hit && hit.limb == t.limb && mobs.LimbBody(id, t.limb) != 0 &&
+            CutOnce(mobs, c.world, id, t.limb, ax, 0.5f * ax.reach, 1.0f, 1.0f,
+                    0x5CA1u, spawns);
+    poseTick();
+    // Still bleeding: nothing may be rebuilt.
+    while (mobs.LimbWoundOpen(id, t.limb) && r.bledFor < 3000) {
+      poseTick();
+      r.bledFor++;
+    }
+    r.grownWhileOpen = mobs.HealStatsOf(id).scarGrown;
+    uint32_t d = 0;
+    mobs.LimbRecipeDiff(id, t.limb, r.miss0, d);
+    r.skin0 = mobs.LimbMaterialCount(id, t.limb, skin);
+    r.flesh0 = mobs.LimbMaterialCount(id, t.limb, flesh);
+    r.hp0 = mobs.LimbHp(id, t.limb);
+    // Cells grown before the half-way mark (half the starting hole).
+    const uint32_t halfway = r.miss0 / 2;
+    r.missEnd = r.miss0;
+    for (uint32_t i = 0; i < maxTicks && mobs.LimbBody(id, t.limb); i++) {
+      poseTick();
+      const float lim = hpMax * mobs.BurnHealthCap(id);
+      if (mobs.LimbHp(id, t.limb) > lim + 1e-3f) r.overCap++;
+      if (i % 30 != 29) continue;
+      uint32_t m = 0;
+      mobs.LimbRecipeDiff(id, t.limb, m, d);
+      const Mob::HealStats s = mobs.HealStatsOf(id);
+      if (r.halfGrown == 0 && r.miss0 > 0 && m <= r.miss0 - halfway) {
+        r.halfGrown = s.scarGrown;
+        r.halfSurface = s.scarSurface;
+      }
+      // The tick the hole last shrank: when the healing finished.
+      if (m < r.missEnd) r.closedAt = i + 1;
+      r.missEnd = m;
+    }
+    r.end = mobs.HealStatsOf(id);
+    for (uint32_t i = 0; i < settle; i++) poseTick();
+    r.settled = mobs.HealStatsOf(id);
+    uint32_t m = 0;
+    mobs.LimbRecipeDiff(id, t.limb, m, d, &r.why);
+    r.missEnd = m;
+    // What is still missing that the scar could have regrown: the diff's
+    // per-material tally ("mats id:n id:n") less what is not tissue (bone
+    // never regrows, by design).
+    r.tissueLeft = m;
+    if (const size_t at = r.why.find("mats "); at != std::string::npos) {
+      size_t p = at + 5;
+      while (p < r.why.size() && std::isdigit((unsigned char)r.why[p])) {
+        const uint32_t mat = (uint32_t)std::strtoul(r.why.c_str() + p, nullptr, 10);
+        const size_t colon = r.why.find(':', p);
+        if (colon == std::string::npos) break;
+        const uint32_t n = (uint32_t)std::strtoul(r.why.c_str() + colon + 1, nullptr, 10);
+        const bool tissue = def.tissue.empty() ||
+                            (mat < def.tissue.size() && def.tissue[mat] != 0);
+        if (!tissue) r.tissueLeft -= std::min(r.tissueLeft, n);
+        p = r.why.find_first_of(" ];", colon);
+        if (p == std::string::npos || r.why[p] != ' ') break;
+        p++;
+      }
+    }
+    r.skinEnd = mobs.LimbMaterialCount(id, t.limb, skin);
+    r.fleshEnd = mobs.LimbMaterialCount(id, t.limb, flesh);
+    r.scarEnd = mobs.LimbMaterialCount(id, t.limb, scarMat);
+    r.hpEnd = mobs.LimbHp(id, t.limb);
+    mobs.RemoveMob(id);
+  };
+  CutRun a;
+  cutRun(true, a);
+  const double shareFirst =
+      a.halfGrown ? (double)a.halfSurface / (double)a.halfGrown : 0.0;
+  const uint32_t lateGrown = a.end.scarGrown - a.halfGrown;
+  const double shareLate =
+      lateGrown ? (double)(a.end.scarSurface - a.halfSurface) / (double)lateGrown
+                : 0.0;
+  const bool aOk = a.cut && a.miss0 >= 20 && a.grownWhileOpen == 0 &&
+                   a.closedAt != 0 &&
+                   (double)a.tissueLeft <= maxLeft * (double)a.miss0 &&
+                   a.scarEnd > 0 && a.skinEnd <= a.skin0 &&
+                   a.fleshEnd <= a.flesh0 && a.hpEnd >= a.hp0 && a.overCap == 0 &&
+                   a.halfGrown > 0 && shareFirst < shareLate &&
+                   a.settled.scarSteps == a.end.scarSteps;
+
+  // ---- B. burnt ---------------------------------------------------------------
+  setTune(true);
+  bool bOk = false;
+  uint32_t burnt = 0, cookedEnd = 0, scarB = 0;
+  float cap0 = 0, cap1 = 0, frac0 = 0, frac1 = 0;
+  if (const uint64_t id = SpawnTarget(c, t, kInset, pchunk)) {
+    mobs.SetMobBehavior(id, "dummy");
+    for (int i = 0; i < 10; i++) poseTick();
+    burnt = mobs.RewriteLimbSurface(id, t.limb, skin, cooked, 600, simTick);
+    poseTick();
+    cap0 = mobs.BurnHealthCap(id);
+    frac0 = mobs.BurnFraction(id);
+    for (uint32_t i = 0; i < maxTicks; i++) poseTick();
+    cap1 = mobs.BurnHealthCap(id);
+    frac1 = mobs.BurnFraction(id);
+    cookedEnd = mobs.LimbMaterialCount(id, t.limb, cooked);
+    scarB = mobs.LimbMaterialCount(id, t.limb, scarMat);
+    bOk = burnt >= 100 && cookedEnd < burnt && scarB > 0 && frac1 < frac0 &&
+          cap1 >= cap0;
+    mobs.RemoveMob(id);
+  }
+
+  // ---- C. off --------------------------------------------------------------
+  CutRun off;
+  cutRun(false, off);
+  const bool cOk = off.cut && off.end.scarGrown == 0 && off.scarEnd == 0;
+  SetCurrentTuning(saved);
+
+  // ---- D. the priced bore -------------------------------------------------
+  // A one-column bore at lattice scale 1 down +x, cells 0..15; `cost(k)` is
+  // the resistance of the matter in layer k (0 = no cell).
+  auto bore = [&](float budget, float reach, auto cost) {
+    KerfSlot s;
+    s.c = Vec3{0.0f, 0.5f, 0.5f};
+    s.u = Vec3{0, 1, 0};
+    s.v = Vec3{0, 0, 1};
+    s.w = Vec3{1, 0, 0};
+    s.halfW = s.halfL = 0.5f;
+    return KerfStabDepth(s, 1.0f, budget, reach, [&](auto&& probe) {
+      for (int k = 0; k < 16; k++) {
+        const float cst = cost(k);
+        if (cst > 0.0f) probe((float)k - 0.5f, 0.0f, 0.0f, cst);
+      }
+    });
+  };
+  const float dSkin = bore(4.0f, 12.0f, [](int) { return 1.0f; });
+  const float dScar = bore(4.0f, 12.0f, [](int) { return 0.5f; });
+  const float dScarCap = bore(4.0f, 6.0f, [](int) { return 0.5f; });
+  const float dBone = bore(4.0f, 12.0f, [](int k) { return k >= 2 ? 3.0f : 1.0f; });
+  const float dHole = bore(4.0f, 12.0f, [](int k) { return k < 2 ? 0.0f : 1.0f; });
+  auto near = [](float a, float b) { return std::fabs(a - b) < 0.02f; };
+  const bool dOk = near(dSkin, 4.0f) && near(dScar, 8.0f) &&
+                   near(dScarCap, 6.0f) && near(dBone, 2.0f + 2.0f / 3.0f) &&
+                   near(dHole, 6.0f);
+  mobs.Reset();
+  c.debris.Reset();
+
+  detail = Format(
+      "%s.%s x%.0f | A cut: bled %u ticks (grown meanwhile %u), %u missing -> "
+      "%u (%u of it tissue), closed at tick %u = %.1f game min (unscaled), scar %u, skin %u->%u "
+      "flesh %u->%u, hp %.2f->%.2f (max %.1f, %u ticks over cap), surface "
+      "share %.2f first half vs %.2f second, steps %u then %u after %u settle "
+      "ticks | B burn: %u cooked -> %u, scar %u, frac %.3f->%.3f cap "
+      "%.3f->%.3f | C off: grown %u scar %u | D bore depths skin %.2f scar "
+      "%.2f scar@reach6 %.2f bone %.2f hole %.2f",
+      t.defName.c_str(), t.limbName.c_str(), speed, a.bledFor,
+      a.grownWhileOpen, a.miss0, a.missEnd, a.tissueLeft, a.closedAt,
+      a.closedAt * speed / (30.0 * 60.0), a.scarEnd, a.skin0, a.skinEnd,
+      a.flesh0, a.fleshEnd, a.hp0, a.hpEnd, hpMax, a.overCap, shareFirst,
+      shareLate, a.end.scarSteps, a.settled.scarSteps, settle, burnt, cookedEnd,
+      scarB, frac0, frac1, cap0, cap1, off.end.scarGrown, off.scarEnd, dSkin,
+      dScar, dScarCap, dBone, dHole);
+  detail += Format(" | A %d B %d C %d D %d | A left: ", aOk, bOk, cOk, dOk) + a.why;
+  return aOk && bOk && cOk && dOk ? Status::Pass : Status::Fail;
+}
+
 // heal-joint. The two healing findings of docs/AUDIT_alchemy_chemistry.md:
 //   * R3, HEALING UNDER A STARVED BURN POT. HealTick runs in the burn pass's
 //     finish (Mob::BurnHeadFinish). Until fight64 round 3 B (d7eefc7) the
@@ -12361,6 +12622,7 @@ const std::vector<Gate>& WoundGates() {
       {"heal-wound", "mob", {}, false, GateHealWound, false},
       // Audit R3 + R4: healing under an emptied burn pot; a joint cell paid once.
       {"heal-joint", "mob", {}, false, GateHealJoint, false},
+      {"scar-heal", "mob", {}, false, GateScarHeal, false},
       {"severed-hand", "mob", {}, false, GateSeveredHand, false},
       {"corpse-sleep", "mob", {}, false, GateCorpseSleep, false},
       {"corpse-cap", "mob", {}, false, GateCorpseCap, false},

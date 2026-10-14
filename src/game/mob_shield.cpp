@@ -207,6 +207,13 @@ bool MobSystem::FindShieldBlock(const Mob& wielder, const Vec3& aPrev,
   float bestT = 2.0f;
   auto test = [&](Mob& m) {
     if (&m == &wielder || !m.alive_) return;
+    // A SHIELD THAT IS DOWN IS NOT A GUARD (owner report, 2026-10-13): one
+    // hanging at the hip caught blades on their way to the body and arrested
+    // the whole stroke. It guards once it is half up -- ShieldUpForWatchers,
+    // the raise for a body stepped here and the owner's kShieldUp for a
+    // ghost, so the attacker judging a peer's shield asks the same question
+    // the owner would. Down, it is skipped like a sword in a fist is.
+    if (!m.ShieldUpForWatchers()) return;
     for (int k = 0; k < kHands; k++) {
       const Mob::HeldHand& hh = m.held_[k];
       if (!hh.shield || hh.slot < 0 || hh.slot >= (int)m.limbs_.size()) continue;

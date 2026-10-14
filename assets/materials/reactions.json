@@ -1431,6 +1431,12 @@
       "selfBecomes": "flesh_cooked"
     },
     {
+      "self": "scar",
+      "neighbor": "tag:hot",
+      "chance": 63,
+      "selfBecomes": "flesh_cooked"
+    },
+    {
       "self": "muscle",
       "neighbor": "tag:hot",
       "chance": 63,
@@ -1449,6 +1455,13 @@
     {
       "self": "rotflesh",
       "neighbor": "flesh",
+      "chance": 1,
+      "infectSpread": true,
+      "neighborBecomes": "rotflesh"
+    },
+    {
+      "self": "rotflesh",
+      "neighbor": "scar",
       "chance": 1,
       "infectSpread": true,
       "neighborBecomes": "rotflesh"
@@ -1698,6 +1711,12 @@
     },
     {
       "self": "chlorine",
+      "neighbor": "scar",
+      "chance": 30,
+      "neighborBecomes": "flesh_cooked"
+    },
+    {
+      "self": "chlorine",
       "neighbor": "muscle",
       "chance": 30,
       "neighborBecomes": "flesh_cooked"
@@ -1733,6 +1752,12 @@
     {
       "self": "noxious_gas",
       "neighbor": "flesh",
+      "chance": 5,
+      "neighborBecomes": "flesh_cooked"
+    },
+    {
+      "self": "noxious_gas",
+      "neighbor": "scar",
       "chance": 5,
       "neighborBecomes": "flesh_cooked"
     },

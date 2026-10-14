@@ -73,7 +73,11 @@ struct KerfCut {
   // thrust, `edgeAxis` runs ACROSS the blade, so the slot's length is the
   // blade's width and its depth is how far the point went in -- and it is
   // never priced by KerfBite: a stab makes a hole, it does not part a limb.
+  // ...but the BORE is priced (KerfStabDepth, 2026-10-14): `depth` is then
+  // the point's budget in skin-equivalent world voxels, and `reach` the
+  // farthest it can physically go (the blade's length; 0 = `depth`).
   bool stab = false;
+  float reach = 0.0f;
 };
 
 // ---- THE SAME BLOW, IN THE STRUCK THING'S FRAME -----------------------------
@@ -277,6 +281,73 @@ inline KerfBiteResult KerfBite(const KerfSlot& s, float latScale,
   // Out of matter with budget to spare: the depth is the far side.
   r.depth = std::max(startDepth, (at - back) / sc);
   return r;
+}
+
+// ---- HOW FAR THE POINT GOES IN (2026-10-14) ----------------------------------
+//
+// A STAB IS PAID FOR IN MATERIAL, ALONG ITS BORE. Owner: "stabs should respect
+// tissue too", so different creatures resist stabs and slashes differently.
+// Until this the bore was a fixed length whatever it met -- a thrust went as
+// deep through a shin bone as through a belly. Now the point carries a budget
+// of `budget` world voxels of SKIN-equivalent depth (cost 1 per voxel of
+// skin) and spends it layer by layer down the bore: each one-cell layer of
+// the bore's core costs the MEAN resistance of the matter in it (the cost
+// KerfBite charges: hardness over gear.cutHardnessRef -- bone ~3x, scar
+// 0.5x, muscle 1.25x). Empty layers (a cavity, an earlier wound) are free.
+// It stops where the budget runs out or at `reach`, the blade's length,
+// whichever comes first. A cheap tissue (scar) lets the point in deeper, up
+// to the blade; a hard one stops it short.
+//
+// The core is KerfEntry's (a third of the slot each way, never thinner than
+// one lattice column), so the price is what the POINT meets, not the wedge's
+// rim. `forEach` calls back probe(x, y, z, cost) per present voxel, the
+// KerfBite convention. Returns the depth in world voxels, 0..reach. Integer
+// layer walk in a fixed order: the same thrust into the same body always
+// stops at the same place.
+template <class ForEach>
+inline float KerfStabDepth(const KerfSlot& s, float latScale, float budget,
+                           float reach, ForEach forEach) {
+  const float sc = std::max(latScale, 1e-3f);
+  const Vec3 c = s.c * sc;
+  const float hw = std::max(s.halfW * sc * 0.35f, 0.5f);
+  const float hl = std::max(s.halfL * sc * 0.35f, 0.5f);
+  const float reachCells = std::max(reach, 0.0f) * sc;
+  std::vector<float> sum;
+  std::vector<uint32_t> n;
+  forEach([&](float x, float y, float z, float cost) {
+    const Vec3 d{x + 0.5f - c.x, y + 0.5f - c.y, z + 0.5f - c.z};
+    if (std::fabs(d.dot(s.u)) > hl || std::fabs(d.dot(s.v)) > hw) return;
+    const float dw = d.dot(s.w);
+    if (dw < 0.0f || dw > reachCells + 1.0f) return;
+    const size_t k = (size_t)std::floor(dw);
+    if (k >= 4096) return;
+    if (k >= sum.size()) {
+      sum.resize(k + 1, 0.0f);
+      n.resize(k + 1, 0u);
+    }
+    sum[k] += std::max(cost, 0.0f);
+    n[k]++;
+  });
+  float left = std::max(budget, 0.0f) * sc;  // skin-equivalent cells
+  float at = 0.0f;                            // cells along w from the entry
+  for (size_t k = 0; k < sum.size() && left > 0.0f && at < reachCells; k++) {
+    const float price = n[k] ? sum[k] / (float)n[k] : 0.0f;
+    if (price <= 0.0f) {
+      at = (float)(k + 1);
+      continue;
+    }
+    if (price > left) {
+      at += left / price;
+      left = 0.0f;
+      break;
+    }
+    left -= price;
+    at = (float)(k + 1);
+  }
+  // Out of matter with budget to spare: the point goes on to its reach (there
+  // is nothing more to carve, but the slot's wedge is sized from its depth).
+  if (left > 0.0f) at = std::max(at, std::min(reachCells, at + left));
+  return std::clamp(at / sc, 0.0f, std::max(reach, 0.0f));
 }
 
 // ---- THE SLOT ITSELF, AT ONE LATTICE'S RESOLUTION ---------------------------

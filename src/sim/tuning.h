@@ -1470,6 +1470,21 @@ struct Tuning {
     bool woundHeals = TPD(gore, woundHeals);
     float woundHealSlow = TPD(gore, woundHealSlow);
 
+    // ---- E3a. THE BODY HEALS ITSELF, SLOWLY (Mob::ScarTick, 2026-10-14) ----
+    // No coat needed: a living limb that is not bleeding, burning, rotting or
+    // pulping grows its missing tissue back and mends its burnt tissue, both
+    // as `scarMat` (softer than skin or flesh, so an old wound is a weak
+    // spot), at `scarRate` cubic centimetres a minute per limb (~25: a sword
+    // cut closes in about ten minutes). The skin layer grows back only over
+    // a whole cell beneath it. hp returns at `scarHpPerMin` of the limb's
+    // authored hp a minute, up to the burn cap, and not at all while any limb
+    // of the creature is losing blood (blood is health: Mob::DrainBlood). Gated by woundHeals and the
+    // creature's own bleed.woundHeals, so the undead never heal.
+    bool scarHeals = TPD(gore, scarHeals);
+    std::string scarMat = TPD(gore, scarMat);
+    float scarRate = TPD(gore, scarRate);
+    float scarHpPerMin = TPD(gore, scarHpPerMin);
+
     // ---- E3b. BLOOD ON A BODY: the stain lattice (2026-09-13) --------------
     // The soak above REWRITES flesh to blood. This is the other half, and it
     // is what the owner asked for in as many words: every voxel a cut

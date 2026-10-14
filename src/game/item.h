@@ -102,7 +102,7 @@ enum class ItemKind : uint8_t {
   // block is how fast it comes up and what holding it up costs
   // (ItemDef::ShieldSpec). What it STOPS is its own voxels: a blade whose
   // swept edge meets the shield's live lattice is arrested
-  // (MobSystem::FindShieldBlock), raised or not. Appended LAST so every kind
+  // (MobSystem::FindShieldBlock) while it is up. Appended LAST so every kind
   // number before it -- and every range test above -- is unchanged.
   Shield,
 };
