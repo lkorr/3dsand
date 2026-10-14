@@ -18277,6 +18277,24 @@ where you hear from either (§12b, "The ears are on the character").
     maintains for free. Four taps, and it is what stops a lake looking like
     tiled glass. Side/bottom faces keep their flat voxel normal (the gradient
     describes the top surface only).
+  - **Any liquid is the same surface (2026-10-14, ticket 2026-10-13_20-56-51).**
+    Every surface-SHAPE probe — the column height (`liquidColumn`), the depth
+    (`waterDepthM`) and fetch (`waterOpenness`) probes, the viscous density
+    field (`liquidDensityAt`; only its silhouette feather keeps the per-material
+    `liquidMatFieldAt`) and `bloodPooling` — reads the fullness of ANY
+    `CLASS_LIQUID` cell (`liquidFullnessAt`), not "my material". They used to
+    ask "is this cell my liquid", so where two liquids met (lye in a pond,
+    blood or oil on water, brine against fresh) each side saw the other as air
+    at its own level, the normal tilted ~55° over the seam, and the far rim
+    went grazing with Fresnel ~1: a one-cell white staircase like an ice rim
+    traced every liquid/liquid boundary. The shape of a liquid is its
+    liquid/air interface; which liquid fills the next column does not move it.
+    What a liquid LOOKS like (optics, palette, oil's sheen) stays per material,
+    so an immiscible pair stays legible by colour, not by a fake crease. The
+    solute look likewise reads each cell's OWN liquid as the solvent
+    (`solLookAt`), not the surface's. Gate: `liquid-seam` (lye / oil / blood
+    patches in a water basin vs the all-water frame: no bright rim, patch
+    still seen).
   - **Ripples** as a sum of 5 directional wave bands (analytic slope, no
     texture), each faded out once the per-pixel footprint approaches its
     wavelength — per-band mip selection done analytically. The footprint must

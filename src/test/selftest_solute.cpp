@@ -1866,6 +1866,183 @@ Status GateBloodCloud(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- liquid-seam ----------------------------------------------------------------
+// TWO LIQUIDS SIDE BY SIDE ARE ONE SURFACE (ticket 2026-10-13 20:56:51: "when
+// adding lye to a pool of water there's a weird outline that looks kinda like
+// ice"). A still open basin of water; a square patch of its columns is
+// replaced by another liquid (lye -- miscible, nearly as clear as water; blood
+// -- viscous, drawn by shadeViscous; oil -- the immiscible slick that MUST stay
+// legible), two ticks run, and the surface is photographed from the ticket's
+// angle (~10 cells up, ~-36 degrees) against the same basin all water.
+//
+// The bug: every surface-shape probe in raymarch.wgsl (the column-height
+// gradient that makes waterNormal, the depth and fetch probes, the viscous
+// density field) asked "is this cell MY liquid?", so where lye met water each
+// side saw the other as a cliff of air at its own level and tilted its normal
+// up to ~55 degrees over it. The rim cells on the far side of the patch turned
+// to grazing, Fresnel went to ~1, and a one-cell white staircase of sky
+// reflection traced the boundary -- the "ice" outline.
+//
+// Asserted per arm: rim = share of the frame brighter than the all-water frame
+// by more than `liquidSeam.rimLum` (luma, 0..255) is at most `maxRim`; and
+// moved = share changed by more than 12 is at least `minMoved` (the patch is
+// still SEEN -- the fix must not make the second liquid vanish into the first).
+// Frames: build/liquid_seam_{clean,<liquid>}.bmp. Render-only.
+Status GateLiquidSeam(Ctx& c, std::string& detail) {
+  const uint32_t water = MatNamed(c, "water");
+  if (!water) {
+    detail = "needs water";
+    return Status::Fail;
+  }
+  FixtureTuning tune;
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int cx = 224, cz = 224, kHalf = 16, kDeep = 6;
+  const int fy = FixtureYOver(cx - kHalf - 1, cz - kHalf - 1, cx + kHalf + 1, cz + kHalf + 1,
+                              kDefaultSeed, 1);
+  const Box box{cx - kHalf, cx + kHalf, cz - kHalf, cz + kHalf, fy, fy + kDeep + 3, false};
+  const int surfY = fy + kDeep;            // top water cell
+  const int kP = 5;                        // patch half-width
+  // The patch fills the WHOLE column by default: a two-layer lye patch (denser
+  // than water) sank under the top layer within the tick it landed and left no
+  // seam at the surface to photograph.
+  const int patchDepth =
+      std::clamp((int)BaselineNumber("liquidSeam.patchDepth", (double)kDeep), 1, kDeep);
+  auto patch = [&](uint32_t mat) {
+    std::vector<CellOp> v;
+    for (int y = surfY - patchDepth + 1; y <= surfY; y++)
+      for (int z = cz - kP; z <= cz + kP; z++)
+        for (int x = cx - kP; x <= cx + kP; x++)
+          v.push_back({World::SlotCellIndex({x, y, z}), (mat & 0xFFFu) | (7u << 12)});
+    return v;
+  };
+
+  uint32_t t = 64000;
+  support::TickCursor ticker{c, t, {cx >> 4, surfY >> 4, cz >> 4}};
+  const int kSettle = (int)BaselineNumber("liquidSeam.settleTicks", 200);
+  for (int i = 0; i < kSettle; i++)
+    ticker({}, i == 0 ? box.Build((uint32_t)kMatStone)
+                      : i == 2 ? box.Layers(water, fy + 1, kDeep, 7u) : std::vector<CellOp>{});
+
+  const Tuning base = CurrentTuning();
+  uint32_t noonTick = 0;
+  {
+    float bestUp = -2.0f;
+    for (uint32_t s = 0; s < 200000u; s += 64u) {
+      const float up = ComputeSky(base, (double)s).sunDir[1];
+      if (up > bestUp) { bestUp = up; noonTick = s; }
+    }
+  }
+  const uint32_t W = c.width, H = c.height;
+  // The ticket's view: ~10 cells over the surface, looking ~36 degrees down
+  // at the patch from the south.
+  const Vec3 eye{(float)cx + 0.5f, (float)surfY + 10.5f, (float)cz - 13.5f};
+  const Vec3 at{(float)cx + 0.5f, (float)surfY + 1.0f, (float)cz + 0.5f};
+  Camera cam;
+  {
+    const float dx = at.x - eye.x, dy = at.y - eye.y, dz = at.z - eye.z;
+    cam.yaw = std::atan2(dz, dx);
+    cam.pitch = std::atan2(dy, std::sqrt(dx * dx + dz * dz));
+  }
+  rhi::Buffer shot = CreateBuffer(c.ctx.device, (uint64_t)W * H * 4,
+                                  rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                                  "liquidSeamShot");
+  auto render = [&](std::vector<uint8_t>& out) -> bool {
+    const int kWarm = 8;
+    for (int f = 0; f <= kWarm; f++) {
+      // Sun shadows off (as blood-cloud): the staggered refresh is not the claim.
+      WriteRenderParams(c.ctx.queue, c.world, eye, cam, (float)W / H, false, 0.0f,
+                        kFarFogDensity, (float)H, noonTick);
+      rhi::CommandEncoder enc = c.ctx.device.CreateCommandEncoder();
+      c.sim.EncodeShadowResolve(enc);
+      rhi::RenderPass rp =
+          c.sim.BeginRenderPass(enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+      c.sim.DrawWorld(rp);
+      rp.End();
+      if (f == kWarm) {
+        rhi::TexelCopyTexture srcT{};
+        srcT.texture = c.offscreen;
+        rhi::TexelCopyBuffer dstB{};
+        dstB.buffer = shot;
+        dstB.bytesPerRow = W * 4;
+        dstB.rowsPerImage = H;
+        enc.CopyTextureToBuffer(srcT, dstB, rhi::Extent3D{W, H, 1});
+      }
+      c.ctx.queue.Submit(enc.Finish());
+    }
+    out.assign((size_t)W * H * 4, 0);
+    return rhi::ReadBufferBlocking(c.ctx.device, shot, 0, out.data(), out.size());
+  };
+
+  std::vector<uint8_t> clean;
+  if (!render(clean)) {
+    detail = "render/readback failed (clean)";
+    return Status::Fail;
+  }
+  WriteBmpFile("build/liquid_seam_clean.bmp", clean, W, H);
+
+  const double rimLum = BaselineNumber("liquidSeam.rimLum", 40.0);
+  const double maxRim = BaselineNumber("liquidSeam.maxRim", 0.002);
+  const double minMoved = BaselineNumber("liquidSeam.minMoved", 0.01);
+  auto luma = [](const std::vector<uint8_t>& a, size_t i) {
+    return 0.2126 * a[i] + 0.7152 * a[i + 1] + 0.0722 * a[i + 2];
+  };
+  bool ok = true;
+  int arms = 0;
+  // Oil and blood last: blood leaves solute mass behind it, which the water
+  // rebuild between arms does not clear.
+  for (const char* name : {"lye", "oil", "blood"}) {
+    const uint32_t m = MatNamed(c, name);
+    if (!m) {
+      detail += Format("%s: absent | ", name);
+      continue;
+    }
+    arms++;
+    ticker({}, patch(m));
+    ticker({}, {});
+    std::vector<uint8_t> img;
+    if (!render(img)) {
+      detail = Format("render/readback failed (%s)", name);
+      return Status::Fail;
+    }
+    WriteBmpFile(Format("build/liquid_seam_%s.bmp", name), img, W, H);
+    size_t rim = 0, moved = 0;
+    double maxUp = 0.0;
+    for (size_t p = 0; p < (size_t)W * H; p++) {
+      const size_t i = p * 4;
+      const double up = luma(img, i) - luma(clean, i);
+      maxUp = std::max(maxUp, up);
+      if (up > rimLum) rim++;
+      const int d = std::max({std::abs((int)img[i] - (int)clean[i]),
+                              std::abs((int)img[i + 1] - (int)clean[i + 1]),
+                              std::abs((int)img[i + 2] - (int)clean[i + 2])});
+      if (d > 12) moved++;
+    }
+    const double rimF = (double)rim / (double)((size_t)W * H);
+    const double movF = (double)moved / (double)((size_t)W * H);
+    // Per-liquid overrides (liquidSeam.maxRim.<name>, .minMoved.<name>): lye is
+    // authored nearly as clear and as blue as water, so "still seen" is not
+    // its claim; oil and blood must stay legible.
+    const double armMaxRim = BaselineNumber(Format("liquidSeam.maxRim.%s", name).c_str(), maxRim);
+    const double armMinMoved =
+        BaselineNumber(Format("liquidSeam.minMoved.%s", name).c_str(), minMoved);
+    const bool armOk = rimF <= armMaxRim && movF >= armMinMoved;
+    ok = ok && armOk;
+    RecordObserved(Format("liquidSeam.rim.%s", name).c_str(), rimF);
+    RecordObserved(Format("liquidSeam.moved.%s", name).c_str(), movF);
+    detail += Format("%s: rim %.4f (max %.4f) peak +%.0f, moved %.3f (min %.3f) %s | ", name,
+                     rimF, armMaxRim, maxUp, movF, armMinMoved, armOk ? "ok" : "FAIL");
+    // Back to an all-water basin for the next arm.
+    ticker({}, box.Layers(water, fy + 1, kDeep, 7u));
+    for (int i = 0; i < 20; i++) ticker({}, {});
+  }
+  if (arms == 0) ok = false;
+  detail += "frames build/liquid_seam_{clean,lye,oil,blood}.bmp";
+  std::printf("liquid-seam: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SoluteGates() {
@@ -1881,6 +2058,7 @@ const std::vector<Gate>& SoluteGates() {
       {"solute-payout", "sim", {}, false, GateSolutePayout, false},
       {"solute-blood", "sim", {}, false, GateSoluteBlood, false},
       {"blood-cloud", "render", {}, false, GateBloodCloud, true},
+      {"liquid-seam", "render", {}, false, GateLiquidSeam, true},
   };
   return g;
 }
