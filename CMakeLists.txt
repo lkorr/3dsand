@@ -706,6 +706,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_wound.cpp
   src/test/selftest_archer.cpp
   src/test/selftest_aquatic.cpp
+  src/test/selftest_stagger.cpp
   src/test/selftest_solute.cpp
   src/test/selftest_heat.cpp
   src/test/selftest_impact.cpp
