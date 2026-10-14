@@ -959,15 +959,27 @@ fn farGroundOpen(level : u32, ro : vec3f, ni : vec3<i32>) -> f32 {
 const FAR_FEAT_VEC : u32 = FAR_LEVELS * FAR_N * FAR_N;   // raymarch.wgsl agrees
 const FAR_OPEN_FADE_END_M : f32 = 110.0;                 // raymarch.wgsl FAR_SKY_FADE_END_M
 const FAR_FEAT_SOLID : u32 = 0x40000000u;                // raymarch.wgsl agrees
+// .z: a FEATURE face's openness (2026-10-14): a cell standing ON its
+// column's top (a crown, a trunk, a wall; the heightfield's own cells and a
+// card's air cell are under or at it) takes the definition from just off the
+// face, with none of the ground's start rules. Measured per pixel with
+// SEAM_DBG 16 against the near grid: the old cell-diagonal feature fan read
+// the crowns ~0.7x (leaf 0.14 vs 0.19, bark 0.18 vs 0.21). 255 = not a
+// feature cell (fs keeps its closed form).
 fn farGroundOpenByte(level : u32, cell : vec3<i32>, fp : vec3f, n3 : vec3f,
-                     refined : bool) -> vec2<u32> {
+                     refined : bool) -> vec3<u32> {
   let s = f32(1u << farCellShift(level));
   // Past the distance fs eases the term out by (raymarch.wgsl farSkyFade:
   // FAR_SKY_FADE_END_M) nothing reads it: no fan.
-  if (length(fp - R.camPos) * VOXEL_METERS > FAR_OPEN_FADE_END_M) { return vec2<u32>(255u); }
+  if (length(fp - R.camPos) * VOXEL_METERS > FAR_OPEN_FADE_END_M) { return vec3<u32>(255u); }
   let top = farColumnTop(level, fp - n3 * (0.25 * s));
-  if (top < -1e8 || f32(cell.y) * s > top + s) { return vec2<u32>(255u); }
-  if (!farGroundOver(level, cell)) { return vec2<u32>(255u); }
+  if (top < -1e8 || !farGroundOver(level, cell)) { return vec3<u32>(255u); }
+  let ni = vec3<i32>(round(n3));
+  var f = 255u;
+  if (f32(cell.y) * s >= top - 0.01) {
+    f = u32(clamp(farGroundOpen(level, fp + n3 * 0.5, ni), 0.0, 1.0) * 254.0 + 0.5);
+  }
+  if (f32(cell.y) * s > top + s) { return vec3<u32>(255u, 255u, f); }
   var ro = fp + n3 * 0.5;
   let cy = f32(cell.y) * s;
   // A refined tread starts from its sub-column's top, as the pixel on it does.
@@ -990,7 +1002,6 @@ fn farGroundOpenByte(level : u32, cell : vec3<i32>, fp : vec3f, n3 : vec3f,
       ro.y = mix(lo, hi, clamp((fp.y - cy) / s, 0.0, 1.0));
     }
   }
-  let ni = vec3<i32>(round(n3));
   let g = u32(clamp(farGroundOpen(level, ro, ni), 0.0, 1.0) * 254.0 + 0.5);
   var c = g;
   if (n3.y > 0.5) {
@@ -1010,7 +1021,7 @@ fn farGroundOpenByte(level : u32, cell : vec3<i32>, fp : vec3f, n3 : vec3f,
       c = u32(clamp(farGroundOpen(level, rc, ni), 0.0, 1.0) * 254.0 + 0.5);
     }
   }
-  return vec2<u32>(g, c);
+  return vec3<u32>(g, c, f);
 }
 
 fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
@@ -1095,8 +1106,8 @@ fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
         // fardown refresh of what is already 10+ m away; the near grid owns
         // the edited ground inside the handoff).
         let oldW = shadowHist[bucket];
-        var ob = vec2<u32>((oldW >> 16u) & 0xFFu, (oldW >> 8u) & 0xFFu);
-        if (!mine || (oldW & 3u) != FAR_GI_FG_TAG || ob.x == 255u) {
+        var ob = vec3<u32>((oldW >> 16u) & 0xFFu, (oldW >> 8u) & 0xFFu, oldW >> 24u);
+        if (!mine || (oldW & 3u) != FAR_GI_FG_TAG || (ob.x == 255u && ob.z == 255u)) {
           let fp = shadowPatchCentre(cell, face, packedSub & 7u, (packedSub >> 3u) & 7u,
                                      FAR_SC_SUBDIV) * s;
           ob = farGroundOpenByte(level, cell, fp, n3, (packedSub & FAR_SC_REFINED) != 0u);
@@ -1105,7 +1116,7 @@ fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
         let fg = select(ob.y,
                         u32(clamp(farForegroundLit(level, hp, L), 0.0, 1.0) * 255.0 + 0.5),
                         riser);
-        giW = (ob.x << 16u) | (fg << 8u) | FAR_GI_FG_TAG;
+        giW = (ob.z << 24u) | (ob.x << 16u) | (fg << 8u) | FAR_GI_FG_TAG;
       }
     } else {
       giW = shadowHist[bucket];

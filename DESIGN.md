@@ -17901,27 +17901,64 @@ where you hear from either (§12b, "The ears are on the character").
       patch pays its fan on its first resolve (the flight-hitch ticket's
       case; `--frames ... --autofly` with SANDVOX_SHOT_EVERY is the
       instrument); `--shader-stats`.
-    - **OPEN, found on the way (not fixed)**: the far SUN read keys a card
-      the same way (`farShadowCached(..., far.axis, far.sgn, ...)`): a card
-      hit by a climbing ray reads its ground cell's BOTTOM-face shadow patch,
-      whose march starts under the ground. Fixing it is the same one-line
-      `select(far.sgn, -1.0, fCard)`, but it moves card shading on rising
-      ground (and the per-pixel arm the gate was pinned against has the same
-      bug), so it wants its own lod-seam measurement.
-    - **HANDOFF: the CROWN FAN (not done).** The FEATURE fan (`farSkyFan`,
-      leaves and bark) reads the crowns 0.7x the near definition (leaf 0.14
-      vs 0.19, bark 0.18 vs 0.21, `SEAM_DBG` 16); leaf / bark luma match the
-      near field only because the feature bounce (`farFeatureBounce`,
-      FAR_BOUNCE_HIGH) was calibrated on top of it. The general fix is the
-      ground's: measure a feature face's openness by the definition
-      (`farGroundOpen` without the ground-only start rules) once per far
-      patch in the resolve -- feature faces already have patches (fs reads
-      them with refined = true) -- read it from the word, and then re-fit
-      `farFeatureBounce` against `--gate lod-seam` leaf/bark (pins
-      `lodSeam.maxAbsMedian_leaf` 4.0 and the default 3.0). Measured
-      definition values for the crowns: leaf 0.21, bark 0.23. The feature
-      patch's word slot is free (a crown face is never buried and is not a
-      riser of the heightfield).
+    - **The card's sun keys the same TOP patch (2026-10-14, closed).**
+      `farShadowCached` now takes `select(far.sgn, -1.0, fCard)` as the
+      openness read does. Measured, same exe and boot type, wave-1014 control
+      vs this one line: every lod-seam class within 0.1 luma (plant noon -0.4
+      -> -0.3, ground open afternoon +3.3 -> +3.4). The gate's reference is
+      the NEAR field, which never had the bug, so nothing was re-pinned.
+  - **The crowns' openness is the definition too, per patch (2026-10-14,
+    same ticket; closes the crown-fan handoff).** A FEATURE face (crown,
+    trunk, wall: a cell standing on its column's top) takes the near walk's
+    definition from just off the face (`farGroundOpenByte` .z: no ground start
+    rules), in the patch word's bits 24..31; fs replaces the closed form with
+    it as the ground does, and scales the closed-form bounce by it. The
+    per-pixel cell-diagonal feature fan (`farSkyFan`) is gone from fs.
+    - **Then the bounce, measured, not fitted to luma.** A SEAM_DBG copy
+      writing (openness, bounce luma, lit lambert) for the same pixels near
+      and far, noon: with the openness right, one high-face constant could
+      not serve both classes -- at the old 0.35 leaf bounce was 0.45x the
+      near gather (1.3 vs 2.9) and bark's 1.8x (3.6 vs 2.0); at 0.75 leaf
+      matched and bark went to 2.1x. Two causes, two terms: (a) the near-ground
+      part of `farFeatureBounce` is the closed form's lit tread in front of
+      the face, so it now takes the patch's FOREGROUND SUN (the riser term,
+      `farForegroundLit`, already in the word's bits 8..15 for every side
+      face) -- a trunk's foot under its own crown stands on shaded ground;
+      (b) the high part differs by what the face is: a crown LOBE
+      (`farIsCanopy`: its material a far cover slot -- data, the cover rule's
+      own tag) sees other, sunlit lobes, `FAR_BOUNCE_HIGH_LOBE` 0.75; anything
+      else standing (a trunk, a wall) sees shaded ground and the crown's dark
+      underside, `FAR_BOUNCE_HIGH` 0.35. Result, bounce luma near / far: leaf
+      2.9 / 2.7, bark 2.0 / 2.2.
+    - **lod-seam** (this tree's exe, wave-1014 merged; control = wave-1014
+      shaders, same exe): leaf noon -2.2 -> -0.9, afternoon -2.3 -> -0.9,
+      dusk -1.6 -> -0.8, overcast -1.7 -> -0.6; bark -1.6 -> -0.9, -1.9 ->
+      -0.7, -1.1 -> -0.4, -1.0 -> -0.6; ground and plants within 0.1. The
+      ~-0.9 left on leaves is not openness (far 52.8 vs near 49.6 encoded,
+      slightly higher) nor bounce nor sun (far's lit lambert is higher): the
+      next suspect is albedo / AO of the crown cells, unmeasured.
+    - **Cost** (`--render-budget`, budget-only boots, exclusive, this tree's
+      exe; control = wave-1014 shaders): noon 11.18 -> 11.16 ms (pre 1.70 ->
+      1.79), seamveg 10.72 -> 10.94, cascade 3.84 -> 3.85, canopy 7.09 ->
+      7.57, meadow 8.61 -> 9.19. A second pair with only meadow + canopy
+      (the card-sun line alone vs this tree, same boot order): meadow 10.32
+      -> 10.80, canopy 8.64 -> 8.73. The meadow camera draws NO far pixels
+      (rmPxFar 0.000, every work counter identical), fs stays at 128
+      registers and its binary is 3.6 KB smaller, so the meadow +0.5 ms is a
+      code-generation effect of the fs change, not work -- unattributed past
+      that. (Absolute meadow numbers move ~1.7 ms with the camera's place in
+      the boot's order: compare only within one order.)
+    - The ground classes on this exe (wave-1014's far refine to level 6) read
+      ~2-3 luma higher than on the previous one (open noon -1.2 -> +1.8 with
+      the same shaders); inside the pins, not this change.
+  - **NOT DONE: the far sea bed's openness and AO** (the shallow shelf's
+    last ~+1 luma at low sun). The bed's patch already resolves (its sun) and
+    would carry the definition, but fs would need the bed patch's WORD as well
+    as its value: a second find at farWaterBed's two inlined call sites, or
+    the hot `farShadowCached` read returning its slot. Neither is cheap
+    enough to do without a register measurement; and the ground start rules
+    use the surface map's top, which over the sea is the WATER's, so the
+    bed's riser start would need its own rule.
   - **The sea seam closed (2026-10-14, same ticket).** The 10-13 WIP fix
     (branch `wip/seam-14-23-01` 1da36ec: the bed reads its face's far shadow
     patch through lodShadowLift / hzSunShade / shadowLiftCap; the far shadow
