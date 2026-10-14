@@ -3633,9 +3633,12 @@ class Mob {
   // (ai::SelfView::drawing), and the pose tips the torso with `aimPitch`
   // (radians, + up: the clip's pitchFollow, the player's look in the same
   // convention). Presentation + scheduling: never saved, never hashed.
-  void SetBowDraw(bool on, float aimPitch = 0.0f) {
+  // `moveScale` multiplies the walk while drawn (BowSpec drawMoveScale,
+  // eased in over the windup by the caller; MobSystem's drive reads it).
+  void SetBowDraw(bool on, float aimPitch = 0.0f, float moveScale = 1.0f) {
     bowDraw_ = on;
     bowAimPitch_ = on ? aimPitch : 0.0f;
+    bowMoveScale_ = on ? moveScale : 1.0f;
   }
   bool BowDrawn() const { return bowDraw_; }
   float BowAimPitch() const { return bowAimPitch_; }
@@ -6118,6 +6121,7 @@ class Mob {
   bool castBusy_ = false;   // SetCastBusy
   bool bowDraw_ = false;    // SetBowDraw
   float gaitSwayScale_ = 1.0f;   // SetGaitSwayScale
+  float bowMoveScale_ = 1.0f;    // SetBowDraw
   float bowAimPitch_ = 0.0f;
   // The shield's raise (Mob::StepShield, game/mob_shield.cpp).
   float shieldRaise_ = 0.0f;

@@ -8961,8 +8961,10 @@ void MobSystem::DriveLocomotion(Mob& mob, const MobDef& def,
   // wrong question for a strafe or a back-pedal: a duelist circling a target it
   // is squarely facing has an alignment of 1 and a sidestep to make, and one
   // giving ground is deliberately walking the way it is NOT looking.
-  // ...and a raised shield the walk (item.h ShieldSpec::moveScale).
-  const float base = def.speed * speedScale * mob.ShieldMoveScale();
+  // ...and a raised shield the walk (item.h ShieldSpec::moveScale), and a
+  // drawn bow (BowSpec drawMoveScale, Mob::SetBowDraw) -- the player's rule.
+  const float base =
+      def.speed * speedScale * mob.ShieldMoveScale() * mob.bowMoveScale_;
   const float fwdDrive = base * mob.driveScale_ * align;
   const float sideDrive = base * mob.driveStrafe_;
 
