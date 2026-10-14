@@ -17574,7 +17574,7 @@ where you hear from either (§12b, "The ears are on the character").
     behind a chunk-word prefilter over the fan's footprint (open ground pays
     up to ten shared `farOcc` words). The up ray counts only cells a cell over
     the column's heightfield top.
-  - **The far fan** (features and ground, `farFanRay`) reached 6.4 m and
+  - **The far fan** (features and ground, then `farFanRay`, now `farSkyFan`) reached 6.4 m and
     sampled every 12 fine voxels past 16, stepping through crown lobes and
     between trunks; it now marches EVERY cell -- the hit's level to 1.6 m,
     then the level two coarser -- to `render.opennessReach` (the near walk's
@@ -17650,7 +17650,8 @@ where you hear from either (§12b, "The ears are on the character").
     `lodSeam.max.*` re-pinned at those + ~2.5. Not run: `--render-budget`
     (the extra cost is one patch word read on far riser pixels, and a short
     march per open riser patch every `FAR_GI_PERIOD` resolves).
-  - **HANDOFF 2026-10-13 (where 14-23-01 stands; resume here).**
+  - **HANDOFF 2026-10-13** (superseded by the 2026-10-14 entries below; kept
+    for its measuring recipe and traps).
     - Open ground is still ~+10 far (noon/afternoon/overcast). ~6 of it is
       the far OPENNESS: an arm that substituted the near grid's openness
       into the far shade (cfB) took -5.8 off; the rest (~4) is bounce excess.
@@ -17703,6 +17704,109 @@ where you hear from either (§12b, "The ears are on the character").
       that reads gDbgT alone shows no water; a SEAM_DBG frame is the
       encoded output, so compare arms, never absolute values against
       linear constants.
+  - **The far ground takes the near walk's DEFINITION (2026-10-14, ticket
+    2026-10-09_14-23-01).** The residual open-ground seam (+9.6 / +10.1 /
+    +3.0 / +9.6 luma, noon / afternoon / dusk / overcast) was attributed in
+    one gate run each, not by elimination: a new `SEAM_DBG` 16 frame writes
+    the shade's openness (near: the grid's byte; far: the cascade's), the
+    near walk's definition RE-MEASURED at the pixel on the window's voxels
+    (`dbgNearOpenDef`, a copy of `openValueAt` on `traceOpaque`; it agrees
+    with the grid's byte to ~3 % in the class mean, so it is a valid stand-in
+    for "what the grid would say here"), and the face orientation. What it
+    found, mean openness of the same pixels:
+    - 93 % of the "ground" pixels at 10-19 m are RISERS (a voxel staircase
+      seen at grazing angles), and the near walk's riser / up-face ratio is
+      0.62 on open ground but 1.68 under a crown -- a riser's level rays see
+      out UNDER the canopy. The far law was `farOpenness` (1 tread / 0.6
+      riser) x the UP fan, which can be right in one of those places only.
+    - The up fan itself read the clearing 1.2x the near definition (0.60 vs
+      0.50) and the ground under a crown 2x (0.32 vs 0.15). Its rays stepped
+      integer cell diagonals with the reach counted per axis (a diagonal
+      reached 17 m and ended OVER the crowns the near walk ends under, so
+      the endpoint up-march the 10-12 pass tried could not matter), and its
+      80 cm outer cells are one cover-rule sample each, porous to a ray
+      through a crown's edge where the near walk's 40 cm block mask ("any
+      blocker in the block") is not. Measured on the up fan: the any-of rule
+      alone 0.60 -> 0.49.
+    So `farSkyFan` (raymarch.wgsl) has two rule sets behind ONE call site
+    (fs is at the 128-register cliff): a FEATURE keeps the calibrated cell-
+    diagonal fan; the HEIGHTFIELD and its cards (`def`) march the near
+    walk's definition over the cascade -- the face's own fan from just off
+    the face (a card asks for the ground's up face), a side face's
+    down-diagonal re-aimed 63 degrees up, real rays with the reach along the
+    ray, the endpoint up-march, and the outer stretch as a block mask (a
+    cell counts if any of its eight children one level finer is a ray
+    blocker) -- and it REPLACES the closed form wherever the prefilter
+    (`farGroundOver`) says anything stands near; open flat ground keeps the
+    closed form, which is what the grid measures there. A map-terrain test
+    (a sample under the level-1 heightfield top is solid) was measured and
+    changed nothing (the cascade's own cells carry the relief at 12 m), so
+    it is not in. The fan is MEDIA-BLIND like the near walk: `farSkySolid`
+    counts a material only if `isRayBlocker`.
+    - Openness, same pixels (near grid / far before / far now): open ground
+      0.30 / 0.38 / 0.35, ground under a crown 0.25 / 0.22 / 0.25, grass
+      blades 0.23 / 0.34 / 0.27. Leaf and bark are untouched (feature fan).
+    - **lod-seam, standalone, before -> after**: ground open noon +9.6 ->
+      +1.2, afternoon +10.1 -> +2.4, dusk +3.0 -> +1.0, overcast +9.6 ->
+      +3.6; ground under a crown +4.6 -> +1.5, +3.8 -> 0.0, 0.0 -> -0.2,
+      +4.5 -> +2.6; plant +6.5 -> -0.6 (noon); leaf and bark within 0.3. The
+      "~4 of bounce excess" the 10-13 handoff assigned was the openness too
+      (an arm that substitutes one term moves the others through
+      shadowLiftCap); no bounce term was changed.
+    - **Same root cause elsewhere, recorded**: the FEATURE fan reads the
+      crowns 0.7x the near definition (leaf 0.14 vs 0.19, bark 0.18 vs 0.21)
+      and leaf / bark luma match only because the feature bounce
+      (`farFeatureBounce`) was calibrated on top of it -- moving features to
+      the definition (measured: leaf 0.21, bark 0.23) is right but needs that
+      calibration redone against the gate; not done here. Any far closed
+      form that assumes "a riser faces the eye on ground rising away" is the
+      same mistake on terrain falling away from the eye (looking down a
+      slope or out over a shore: the risers seen face uphill and their level
+      rays hit the slope); those now take the definition wherever the
+      prefilter fires, which on a slope it does (the uphill neighbour chunk
+      stands over the hit's row).
+    - **Cost** (`--render-budget`, 1080p, exclusive lock, main's exe,
+      budget-only boots, main's shaders -> these; the per-pixel work
+      counters were identical across the boots, and two after-boots agreed
+      within 0.07 ms): noon overlook 10.76 -> 13.33 ms, canopy 7.15 -> 8.34,
+      seamveg 10.51 -> 11.67, cascade 2.77 -> 3.99, meadow 8.58 -> 8.83;
+      summit 3.92 -> 3.89 and peaksea 9.72 -> 9.75 (their far ground is past
+      the 110 m fade). In already: the endpoint climb skips empty chunk rows
+      exactly (without it, 48 masked rows per open ray: cascade 2.8 -> 20.8
+      ms), and the children test reads one farOcc word before any byte.
+      TRIED AND TAKEN OUT: the block mask on climbing rays only and none on
+      the endpoint climb -- noon 13.3 -> 12.5 ms, but ground under a crown
+      went back to +7.7..+8.4 luma (an endpoint under a crown climbs
+      through its porous 80 cm cells). The levers left if the overlook's
+      +2.6 ms is too much (OWNER CALL): end the ground's definition fan
+      nearer than FAR_SKY_FADE_END_M (the seam it closes is at 20.5 m),
+      or move the far ground's openness into the far shadow patch (the
+      resolve pass already marches per patch and caches across frames, so
+      the fan would be paid per patch per refresh, not per pixel per frame).
+      Not measured: `--shader-stats` (fs registers).
+  - **The sea seam closed (2026-10-14, same ticket).** The 10-13 WIP fix
+    (branch `wip/seam-14-23-01` 1da36ec: the bed reads its face's far shadow
+    patch through lodShadowLift / hzSunShade / shadowLiftCap; the far shadow
+    march media-blind in both copies; a wet bed face not buried by its
+    water; the bed's entry face the DDA's last crossing) verified, plus two
+    terms of the same kind: the far bed is SOAKED as worldgen soaks it
+    (`farSoakedAlbedo`: the WET BANKS fixed point of `stainStep` on the bed
+    material's bare word, then applyStain's law at its expected mottle --
+    the near bed under the sea is wet sand, ~12 % darker than the dry
+    palette mean), and the sky fan is media-blind (above). Same-pixel arms
+    on the default map's shelf (2016, 142, -84950) yaw -90 pitch -14,
+    1324x1128, SEAM_DBG 15 colour inside 10-19 m, the path split from a
+    SEAM_DBG 7 near frame, far - near luma MEAN (main -> WIP -> now):
+    shallow water (path < 6 m) noon +2.6 -> +0.9 -> 0.0, minute 960 +8.8 ->
+    +3.3 -> +1.1; water 6-30 m noon 0.0 -> -0.1 -> +0.2, minute 960 -0.3
+    -> -0.1 -> -1.4; the dry beach in the band noon +4.1 -> +2.0, minute 960
+    +10.9 -> +3.0. NOT reproduced (the rest of the shallow +1): the bed's
+    AO, and its openness is still the closed form (a bed seen from the
+    shore is a staircase falling away from the eye, so its visible risers
+    face uphill: near 0.28 against 0.6 far) -- the fix is the same
+    definition fan from the bed face, but that is a second inlined copy of
+    the fan in fs (farWaterBed has two shading call sites) and was not
+    taken without a register measurement.
   **The far water IS shadeWater (2026-10-10).** The near and far water
   shades had been written twice and agreed by calibration. They now share
   the surface law term for term: `waterWaveNormal` (macro slope + Gerstner

@@ -216,10 +216,12 @@ fn farUnderTerrain(ro : vec3f, rd : vec3f, t : f32) -> bool {
   return false;
 }
 
-// raymarch.wgsl farShadowBlocked: MATERIAL cells only, never the blocker flag.
+// raymarch.wgsl farShadowBlocked: MATERIAL cells only, never the blocker flag,
+// and only a ray-blocking material (media-blind: clear water is no caster).
 fn farShadowBlocked(level : u32, c : vec3<i32>) -> bool {
   let bi = farVoxByteIndex(level, c);
-  return farCellSlot((farVox[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu) != 0u;
+  let slot = farCellSlot((farVox[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu);
+  return slot != 0u && isRayBlocker(materials[farPalMat(&materials, slot)]);
 }
 // raymarch.wgsl shadowWindowExitT.
 fn shadowWindowExitT(ro : vec3f, rd : vec3f) -> f32 {
@@ -784,7 +786,17 @@ fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
     // by the face's openness (shadowLiftCap), which burial takes to exactly 0,
     // and raymarch.wgsl does not even ask for a pixel there. Such a patch is
     // here for its indirect light (below), so it skips the march.
-    let bw = farBuriedW(level, hp, n3);
+    var bw = farBuriedW(level, hp, n3);
+    // A WET FACE IS NOT BURIED BY ITS WATER (raymarch.wgsl farWaterBed: the
+    // bed under far water reads its face's patch). The surface map's top over
+    // a lake or the sea is the water's, so burial took a bed 3 m down for a
+    // face 3 m under rock and skipped its sun; the near field's shadow and
+    // openness rays pass clear water (media-blind), and so does the march.
+    let front = farGiMat(level, cell + vec3<i32>(n3), box);
+    if (front != 0u && materials[front].klass == CLASS_LIQUID &&
+        !isRayBlocker(materials[front])) {
+      bw = 0.0;
+    }
     var sh = 0.0;
     valid = true;
     if (bw < 1.0) {
