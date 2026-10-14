@@ -17801,17 +17801,18 @@ where you hear from either (§12b, "The ears are on the character").
       through a crown's edge where the near walk's 40 cm block mask ("any
       blocker in the block") is not. Measured on the up fan: the any-of rule
       alone 0.60 -> 0.49.
-    So `farSkyFan` (raymarch.wgsl) has two rule sets behind ONE call site
-    (fs is at the 128-register cliff): a FEATURE keeps the calibrated cell-
-    diagonal fan; the HEIGHTFIELD and its cards (`def`) march the near
-    walk's definition over the cascade -- the face's own fan from just off
-    the face (a card asks for the ground's up face), a side face's
-    down-diagonal re-aimed 63 degrees up, real rays with the reach along the
-    ray, the endpoint up-march, and the outer stretch as a block mask (a
-    cell counts if any of its eight children one level finer is a ray
-    blocker) -- and it REPLACES the closed form wherever the prefilter
-    (`farGroundOver`) says anything stands near; open flat ground keeps the
-    closed form, which is what the grid measures there. A map-terrain test
+    So the HEIGHTFIELD and its cards take the near walk's definition
+    marched over the cascade (`farGroundOpen`, shadow_resolve.wgsl) -- the
+    face's own fan from just off the face (a card asks for the ground's up
+    face), a side face's down-diagonal re-aimed 63 degrees up, real rays with
+    the reach along the ray, the endpoint up-march, and the outer stretch as
+    a block mask (a cell counts if any of its eight children one level finer
+    is a ray blocker) -- and it REPLACES the closed form wherever the
+    prefilter (`farGroundOver`) says anything stands near; open flat ground
+    keeps the closed form, which is what the grid measures there. A FEATURE
+    keeps the calibrated cell-diagonal fan (`farSkyFan`, raymarch.wgsl).
+    First landed as a per-pixel fan in fs (9058556, +2.6 ms on the noon
+    overlook); now MEASURED ONCE PER FAR PATCH (below). A map-terrain test
     (a sample under the level-1 heightfield top is solid) was measured and
     changed nothing (the cascade's own cells carry the relief at 12 m), so
     it is not in. The fan is MEDIA-BLIND like the near walk: `farSkySolid`
@@ -17850,13 +17851,77 @@ where you hear from either (§12b, "The ears are on the character").
       TRIED AND TAKEN OUT: the block mask on climbing rays only and none on
       the endpoint climb -- noon 13.3 -> 12.5 ms, but ground under a crown
       went back to +7.7..+8.4 luma (an endpoint under a crown climbs
-      through its porous 80 cm cells). The levers left if the overlook's
-      +2.6 ms is too much (OWNER CALL): end the ground's definition fan
-      nearer than FAR_SKY_FADE_END_M (the seam it closes is at 20.5 m),
-      or move the far ground's openness into the far shadow patch (the
-      resolve pass already marches per patch and caches across frames, so
-      the fan would be paid per patch per refresh, not per pixel per frame).
-      Not measured: `--shader-stats` (fs registers).
+      through its porous 80 cm cells). SUPERSEDED the same day: the fan
+      moved into the far shadow patch (next entry), noon back to +0.1 ms.
+  - **The far ground's openness is the far patch's (2026-10-14, same ticket,
+    after 9058556).** The definition fan moved out of fs into the shadow
+    resolve: `resolveFarPatch` measures it once per far patch, on the
+    patch's first resolve, and KEEPS it across the patch's refreshes (the
+    refresh is for the sun, and openness is the geometry's; a patch with no
+    measurement -- past the 110 m fade, or nothing near when asked -- asks
+    again, which is a distance test and the prefilter's ten `farOcc`
+    words). It rides the patch's `shadowHist` word, which the far riser's
+    foreground sun already used: an open patch's word is now `[23..16]` the
+    ground's openness (0..254, 255 = keep the closed form) `[15..8]` a
+    riser's foreground sun, or on an up face its BLADE CARDS' openness
+    `[1..0]` FAR_GI_FG_TAG; a buried patch's word is still its RGB9E5 gather
+    (bit 0). fs reads the word ONCE (`farGiCached`, the one call site) before
+    the sun term -- the openness feeds the shadow's lift cap -- and spends the
+    gather and the foreground at the bounce from the same word; the burial
+    weight is read there too. The fan's code left fs (raymarch.wgsl's
+    `farSkyFan` is the feature fan alone again).
+    - **What it took to make the patch agree with the pixels** (instruments:
+      `SEAM_DBG` 18/19 debug copies, the cached value against the per-pixel
+      fan on the same pixels, then the resolve's start rule replayed in fs):
+      a riser patch sits at a fixed height on its cell's camera-side
+      boundary, so its start is mapped onto the EXPOSED span (front column's
+      top to the higher of the cell's two sub-columns along the normal); a
+      card's openness is measured from half the cell's tallest plant up and
+      kept in its own byte (cards are drawn in the ground cell, so they share
+      the tread's patch); and a CARD READS ITS CELL'S TOP PATCH whichever way
+      the ray went -- farFeatMarch records a card as axis 1 with the RAY's y
+      sign, so 43 % of the gate's card pixels (rays climbing toward rising
+      ground) keyed the cell's BOTTOM face, whose fan started under the
+      ground: open ground -8 luma at noon until that one line.
+    - **lod-seam** (in the `--verify far-parity,shadow-cache,lod-seam` boot,
+      wave-1014 merged; the same boot's control arm, wave-1014 with the
+      per-pixel fan, in brackets), ground open / under a crown: noon -1.2 /
+      +0.2 (-1.4 / 0.0), afternoon -0.1 / -0.9 (-0.3 / -1.0), dusk -2.8 / -1.1
+      (-2.9 / -1.2), overcast +1.6 / +1.6 (+1.3 / +1.4); plant -0.9 / -0.7 /
+      -0.3 / +0.4; leaf and bark unchanged. Inside the pins; none moved.
+      shadow-cache and far-parity identical to the control.
+    - **Cost** (`--render-budget`, 1080p, exclusive lock, budget-only boots,
+      main's exe): noon overlook raymarch 10.76 (before the definition fan) ->
+      13.72 (wave-1014 with the per-pixel fan) -> 10.86 ms now, `pre` 1.45 ->
+      1.40 -> 1.64 (shadow_resolve 0.24 -> 0.51); seamveg 10.51 -> 11.68 ->
+      10.74, canopy 7.15 -> 8.33 -> 7.10, meadow 8.58 -> 8.62 -> 8.70, cascade
+      2.77 -> 4.04 -> 3.93 (cascade's +1.2 is wave-1014's far refine change,
+      present in the control). Net against the pre-fan baseline: noon +0.10
+      raymarch +0.19 pre. NOT measured: a moving camera, where every NEW far
+      patch pays its fan on its first resolve (the flight-hitch ticket's
+      case; `--frames ... --autofly` with SANDVOX_SHOT_EVERY is the
+      instrument); `--shader-stats`.
+    - **OPEN, found on the way (not fixed)**: the far SUN read keys a card
+      the same way (`farShadowCached(..., far.axis, far.sgn, ...)`): a card
+      hit by a climbing ray reads its ground cell's BOTTOM-face shadow patch,
+      whose march starts under the ground. Fixing it is the same one-line
+      `select(far.sgn, -1.0, fCard)`, but it moves card shading on rising
+      ground (and the per-pixel arm the gate was pinned against has the same
+      bug), so it wants its own lod-seam measurement.
+    - **HANDOFF: the CROWN FAN (not done).** The FEATURE fan (`farSkyFan`,
+      leaves and bark) reads the crowns 0.7x the near definition (leaf 0.14
+      vs 0.19, bark 0.18 vs 0.21, `SEAM_DBG` 16); leaf / bark luma match the
+      near field only because the feature bounce (`farFeatureBounce`,
+      FAR_BOUNCE_HIGH) was calibrated on top of it. The general fix is the
+      ground's: measure a feature face's openness by the definition
+      (`farGroundOpen` without the ground-only start rules) once per far
+      patch in the resolve -- feature faces already have patches (fs reads
+      them with refined = true) -- read it from the word, and then re-fit
+      `farFeatureBounce` against `--gate lod-seam` leaf/bark (pins
+      `lodSeam.maxAbsMedian_leaf` 4.0 and the default 3.0). Measured
+      definition values for the crowns: leaf 0.21, bark 0.23. The feature
+      patch's word slot is free (a crown face is never buried and is not a
+      riser of the heightfield).
   - **The sea seam closed (2026-10-14, same ticket).** The 10-13 WIP fix
     (branch `wip/seam-14-23-01` 1da36ec: the bed reads its face's far shadow
     patch through lodShadowLift / hzSunShade / shadowLiftCap; the far shadow
