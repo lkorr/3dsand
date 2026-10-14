@@ -116,6 +116,8 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
     std::vector<uint32_t> verdict(kGenBatch, 0u);
     std::vector<uint32_t> vox;   // words: only for the check / a fallback
     batch.reserve(kGenBatch);
+    const bool layerOn = !WorldEditLayer().Empty();
+    world.pages->ClearAllGenClass();
     // THE WINDOW'S SLOTS ONLY. Ticket slots stay the PT_EMPTY ResetAllEmpty
     // just gave them: no ticket survives a regen (DropAll above), so they name
     // no chunk to generate.
@@ -163,6 +165,17 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
         if (needWords)
           e = world.pages->Classify(base + k, vox.data() + (size_t)k * kChunkVol);
         if (e != PageTable::kNeedsPage) world.pages->SetSentinel(base + k, e);
+        // THE GEN CLASS (PageTable::GenClass, stream.h THE PRISTINE
+        // SENTINEL): `e` describes the words genChunk just wrote, so a
+        // window shift may later evict this chunk without storing it if it
+        // is still that sentinel -- unless the edit layer (queued above)
+        // patches it, which re-entry would repeat.
+        if (layerOn && WorldEditLayer().HasChunk(world.SlotToWorldChunk(base + k)))
+          world.pages->BlockGenClass(base + k);
+        else if (e != PageTable::kNeedsPage)
+          world.pages->NoteGenClass(base + k, e);
+        else
+          world.pages->ClearGenClass(base + k);
       }
       world.pages->FlushTableWrites(ctx.queue);
     }

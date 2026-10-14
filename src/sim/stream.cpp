@@ -470,6 +470,8 @@ void Stream::ShiftAxis(int axis, int dir) {
   const double sT2 = PtNowMs();
   timing_.evictMs += sT2 - sT0;
   timing_.evictSolMs += sT2 - sT1;
+  timing_.evictMaxMs = std::max(timing_.evictMaxMs, sT2 - sT0);
+  if (sT2 - sT0 > 1.0) timing_.evictSlowShifts++;
 
   IVec3 no = o;
   if (axis == 0) no.x += dir;
@@ -486,6 +488,21 @@ void Stream::ShiftAxis(int axis, int dir) {
   timing_.shifts++;
 }
 
+// THE PRISTINE SENTINEL's record (stream.h): forwarded to the page table,
+// which the whole-window worldgen writes too (PageTable::GenClass).
+void Stream::NotePristine(uint32_t s, uint32_t entry) {
+  if (world_->pages) world_->pages->NoteGenClass(s, entry);
+}
+void Stream::BlockPristine(uint32_t s) {
+  if (world_->pages) world_->pages->BlockGenClass(s);
+}
+void Stream::ClearPristine(uint32_t s) {
+  if (world_->pages) world_->pages->ClearGenClass(s);
+}
+uint32_t Stream::Pristine(uint32_t s) const {
+  return world_->pages ? world_->pages->GenClass(s) : PageTable::kNoGenClass;
+}
+
 void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter,
                         const std::vector<uint8_t>* keep) {
   const WorldSnapshot& snap = world_->Snap();
@@ -495,6 +512,7 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter,
   toSave.reserve(slots.size());
   std::vector<uint32_t> sentRle;
   uint32_t unmodReal = 0;
+  const double eT0 = PtNowMs();
   for (uint32_t s : slots) {
     // The delta save's mask (FlushResident): a slot it does not name is
     // reproducible without the store, by exactly the argument below.
@@ -563,8 +581,39 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter,
     // keeps JITTER planes from bloating the store with per-cell RLE they never
     // needed; it now keeps mixed surface planes out of it as well.
     const uint64_t off0 = world_->PageOffsetOfSlot(s);
+    // SANDVOX_EVICT_NO_PRISTINE=1: the A/B arm (encode + store them anyway).
+    static const bool noPristine = std::getenv("SANDVOX_EVICT_NO_PRISTINE") != nullptr;
+    // No snapshot needed (unlike the unmodified test above): the argument is
+    // about the CPU table's entry, which is exact, not about dirty reports.
+    // The startup window's first shifts run before any snapshot is valid --
+    // `worth` is then true for every slot -- and that is where these chunks
+    // were: 8 shifts storing ~870 JITTER chunks each, 31-36 ms apiece.
+    if (off0 == World::kNoPage && !noPristine && filter &&
+        Pristine(s) == world_->PageEntryOfSlot(s)) {
+      // THE PRISTINE SENTINEL (stream.h THE PRISTINE SENTINEL): still exactly what
+      // genChunk wrote, so re-derivable like the unmodified slots above.
+      timing_.evictSkipPristine++;
+      continue;
+    }
     if (off0 == World::kNoPage) {
+      if (Pristine(s) >= PageTable::kGenClassBlocked) {
+        timing_.evictPristineNone++;
+      } else {
+        timing_.evictPristineDiff++;
+        // SANDVOX_PRISTINE_DEBUG=1: the first few (gen class, entry now) pairs.
+        static const bool pdbg = std::getenv("SANDVOX_PRISTINE_DEBUG") != nullptr;
+        static int printed = 0;
+        if (pdbg && printed < 12) {
+          printed++;
+          const IVec3 pwc = world_->SlotToWorldChunk(s);
+          std::printf("[pristine] slot %u chunk (%d,%d,%d): gen 0x%08x now 0x%08x\n", s,
+                      pwc.x, pwc.y, pwc.z, Pristine(s), world_->PageEntryOfSlot(s));
+        }
+      }
+      const double sT = PtNowMs();
       const IVec3 wc = world_->SlotToWorldChunk(s);
+      timing_.evictSentStored++;
+      if (world_->PageEntryOfSlot(s) & kPtJitterBit) timing_.evictSentJitter++;
       RleEncodeSentinelChunk(world_->PageEntryOfSlot(s), wc, seed_, sentRle);
       // A modified (or unfiltered-flush) sentinel is stored synchronously:
       // pure CPU, ~4 us a chunk, and the store is current before FillSlots
@@ -597,6 +646,7 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter,
         farPlumes_.NoteUniformChunk(wc, world_->PageEntryOfSlot(s) & kPtMatMask);
       }
       sentRle.reserve(kChunkVol * 2);  // see the re-reserve in CompleteOldest
+      timing_.evictSentMs += PtNowMs() - sT;
       continue;
     }
     toSave.push_back({s, {world_->SlotToWorldChunk(s), modified_[s] != 0}});
@@ -614,10 +664,24 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter,
                 snap.valid ? snap.tick : 0u, modCount);
   }
 
+  const double eT1 = PtNowMs();
+  timing_.evictLoopMs += eT1 - eT0;
+  timing_.evictCopied += toSave.size();
+  {
+    static const bool pdbg = std::getenv("SANDVOX_PRISTINE_DEBUG") != nullptr;
+    if (pdbg)
+      std::printf("[pristine] EvictSlots filter=%d slots=%zu copied=%zu loop %.2f ms "
+                  "(sent-stored so far %llu)\n", filter ? 1 : 0, slots.size(),
+                  toSave.size(), eT1 - eT0, (unsigned long long)timing_.evictSentStored);
+  }
   for (size_t off = 0; off < toSave.size(); off += kEvictBatch) {
     size_t n = std::min(kEvictBatch, toSave.size() - off);
     PendingEvict p;
+    const double aT0 = PtNowMs();
     p.staging = AcquireStaging();
+    const double aT1 = PtNowMs();
+    timing_.evictAcquireMs += aT1 - aT0;
+    timing_.evictBatches++;
     p.tick = lastTick_;  // see PendingEvict::tick (M9.5-A)
     p.items.reserve(n);
     rhi::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
@@ -667,6 +731,7 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter,
     ctx_->queue.Submit(enc.Finish());
     p.map = rhi::MapReadDeferred(ctx_->device, p.staging, 0, n * kChunkBytes);
     pending_.push_back(std::move(p));
+    timing_.evictSubmitMs += PtNowMs() - aT1;
   }
 }
 
@@ -995,6 +1060,7 @@ bool Stream::ReplaceChunk(IVec3 wc, const uint32_t* words) {
   // procgen regenerate the pre-sync contents; quiet streak reset because the
   // contents just changed and the streak describes the contents.
   modified_[s] = 1;
+  ClearPristine(s);
   world_->NoteChunkTouched(wc);
   replacesApplied_++;
   return true;
@@ -1109,6 +1175,7 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake,
       exchangeStats_.forgotten++;
     }
     modified_[s] = 0;
+    ClearPristine(s);
     // The slot is about to hold a DIFFERENT world chunk, so whatever quiet
     // streak it had belonged to the chunk that left (M9.3-A). Reset by SLOT
     // and not by world chunk: SlotToWorldChunk below still reports the new
@@ -1237,8 +1304,17 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake,
     // travel the MutationQueue and target chunks by WORLD coordinate, so they
     // are unaffected by whether the CA has been told about the plane yet.
     if (!sandvox::WorldEditLayer().Empty())
-      for (uint32_t gs : genSlots)
-        sandvox::WorldEditLayer().QueueChunk(world_->SlotToWorldChunk(gs), seed_);
+      for (uint32_t gs : genSlots) {
+        const IVec3 gwc = world_->SlotToWorldChunk(gs);
+        sandvox::WorldEditLayer().QueueChunk(gwc, seed_);
+        // Re-entry is gen + layer here, so the gen verdict is not what it
+        // reproduces (stream.h THE PRISTINE SENTINEL). HasChunk after QueueChunk: the
+        // layer is resolved by then.
+        if (sandvox::WorldEditLayer().HasChunk(gwc)) {
+          BlockPristine(gs);
+          timing_.pristineBlocked++;
+        }
+      }
     timing_.fillGenMs += PtNowMs() - fT1;
 
     // ---- THE READBACK, AND WHY IT NO LONGER WAITS ------------------------
@@ -1555,6 +1631,9 @@ void Stream::ApplyGenVerdict(const std::vector<uint32_t>& genSlots,
       if (world_->PageOffsetOfSlot(gs) == World::kNoPage) continue;
       const uint32_t nonAir = occ[gs] & 0xFFFFu;  // low 16 = non-air count
       if (occValid && nonAir == 0u) {
+        // nonAir == 0 on a fresh gen slot IS PT_EMPTY's content (the note
+        // above); untouched since gen, it is the pristine entry.
+        NotePristine(gs, kPtEmpty);
         // ---- R1 RACE 1: the count is kWakeLatency ticks old ------------
         //
         // Between generation and now, an acting neighbour may have pushed a
@@ -1598,6 +1677,12 @@ void Stream::ApplyGenVerdict(const std::vector<uint32_t>& genSlots,
       // any of them takes the word copy exactly as before; so does one whose
       // verdict was not published (a failed map fills act with 1s).
       const uint32_t v = i < act.size() ? act[i] : 0u;
+      // THE PRISTINE ENTRY (stream.h THE PRISTINE SENTINEL): the verdict describes the
+      // GEN words exactly, whatever has written the slot since.
+      if ((v & kGenVerdictValid) != 0u) {
+        const uint32_t pe = world_->pages->ClassifyGenVerdict(v, seed_);
+        if (pe != PageTable::kNeedsPage) { NotePristine(gs, pe); timing_.pristineNoted++; }
+      }
       // WHY a full chunk went to the word copy instead (PtDbg attribution,
       // map v2 P1): the first condition that refused it.
       if ((v & kGenVerdictValid) == 0u) fullNoVerdict++;
@@ -1630,7 +1715,11 @@ void Stream::ApplyGenVerdict(const std::vector<uint32_t>& genSlots,
     keys.reserve(cands.size());
     for (uint32_t gs : cands)
       keys.push_back(World::PackChunkKey(world_->SlotToWorldChunk(gs)));
-    IssueDemoteCopies(cands, keys, tick);
+    // !enactWake (no act set) is ReloadWindow's synchronous path, the one
+    // caller that runs this in the same breath as the gen submit: the copy
+    // is queued right behind genChunk, so its bytes are the gen words
+    // (PendingDemote::genWords, stream.h THE PRISTINE SENTINEL).
+    IssueDemoteCopies(cands, keys, tick, 0, false, /*genWords=*/!enactWake);
     if (PtDbg())
       std::printf("[pt-time] shift demote: gen=%zu cands=%zu sky=%u held=%u "
                   "full-by-verdict=%u full-kept=%u | cands because noverdict=%u "
@@ -1777,7 +1866,8 @@ void Stream::DiscardDemotes() {
 
 void Stream::IssueDemoteCopies(const std::vector<uint32_t>& slots,
                                const std::vector<uint64_t>& keys,
-                               uint32_t tick, uint32_t generation, bool revisit) {
+                               uint32_t tick, uint32_t generation, bool revisit,
+                               bool genWords) {
   // Backstop, not a throughput knob: 32 in-flight batches is 128 MiB of
   // staging and far beyond the ~4-8 a saturated flight keeps queued. Hitting
   // it means the GPU is pathologically behind; forcing the oldest batch
@@ -1798,6 +1888,7 @@ void Stream::IssueDemoteCopies(const std::vector<uint32_t>& slots,
     d.copyTick = tick;
     d.generation = generation;
     d.revisit = revisit;
+    d.genWords = genWords;
     d.slots.reserve(n);
     d.keys.reserve(n);
     d.copied.reserve(n);
@@ -1903,6 +1994,14 @@ void Stream::HarvestDemotes(uint32_t tick) {
         // corruption of the worst kind.
         if (World::PackChunkKey(world_->SlotToWorldChunk(s)) != d.keys[i])
           { hMoved++; continue; }
+        // THE PRISTINE ENTRY from gen words (stream.h THE PRISTINE SENTINEL): a statement
+        // about the bytes genChunk wrote, so it holds whatever the slot has
+        // done since -- recorded before any of the current-state guards.
+        if (d.genWords) {
+          const uint32_t pe =
+              world_->pages->Classify(s, demoteScratch_.data() + i * kChunkVol);
+          if (pe != PageTable::kNeedsPage) { NotePristine(s, pe); timing_.pristineNoted++; }
+        }
         if (world_->PageOffsetOfSlot(s) == World::kNoPage) continue;  // demoted already
         const bool untouched = world_->pages->ReachTick(s) < d.copyTick;
         if (!fresh && !untouched) {
@@ -2136,6 +2235,7 @@ void Stream::ReloadWindow(IVec3 origin) {
   world_->ResetSolutes(ctx_->queue);
   world_->SetWindowOrigin(origin);
   modified_.assign(kNumSlots, 0);
+  if (world_->pages) world_->pages->ClearAllGenClass();
   // Every slot is refilled below from the store or genChunk, so the delta
   // save's coverage proof restarts with the window (FlushResident).
   ResetSaveTracking();

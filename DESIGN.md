@@ -443,6 +443,23 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   chunks behind the player; only self-propelled fronts can be there).
   CPU-known writes (brush/explosions) mark chunks modified immediately to
   shrink that window.
+  **A pristine sentinel is not stored either (2026-10-14).** Every gen path
+  records, per slot, the sentinel entry that describes the words genChunk
+  wrote (`PageTable::GenClass`: the kernel's verdict in `SubmitWorldgen` and
+  on a shift's deferred wake, the same-tick word copy on ReloadWindow's
+  synchronous path); a chunk the authored edit layer patches is blocked.
+  A sentinel's content is a pure function of (entry, world chunk), so an
+  evicted slot that is a sentinel EQUAL to its gen class holds exactly what
+  re-entry regenerates, whatever `modified_` says -- the CA's wake reports
+  set that on chunks no cell of which changed, and before the first snapshot
+  is valid every slot counts. That was 8 startup shifts storing ~870 JITTER
+  chunks each (~37 us of RLE apiece, 31-50 ms a shift) after every load or
+  teleport, and it is what the "3.1-3.3 ms eviction per shift" of the
+  2026-10-11_12-10-09 flight was: a whole-run mean over 94 shifts, 86 of
+  which evicted in ~0.01 ms. Now slowest shift eviction 0.34 ms, none over
+  1 ms; `SANDVOX_EVICT_NO_PRISTINE=1` is the A/B arm. The `--frames` shift
+  breakdown is now printed for the stats window, with a whole-run line
+  carrying the slowest shift.
 - **Region files (post-v0.4):** the `ChunkStore` groups chunks into 16³-chunk
   regions. Unbound it is pure RAM (unchanged); bound to a world directory
   (`world.svd/` = `meta.svm` + `r_<x>_<y>_<z>.svr`) regions lazy-load on Get,
@@ -16759,6 +16776,31 @@ where you hear from either (§12b, "The ears are on the character").
   where its 32 columns land) and the sweep's runs. `--perf` scenarios that
   drive the far field print `farMapFill by level` (frames of one level's map
   columns: mean ms, us per column) for that next step.
+  **Map columns ride the slices; plane slices step off shift ticks
+  (2026-10-14, same ticket).** Two changes in `FarField`, both render-only.
+  (1) `EnqueuePlane` is one pass again, column by column, each level-chunk
+  column's map entry leading its own 32 entries (the order `farpatch` needs),
+  so a plane's 32 surface-map columns go out ~8 per 256-entry slice instead
+  of all 32 in the first: `farMapFill` is latency-bound (one sub-column per
+  thread), ~4.5 ms for 8 columns against ~6.7 for 32, and the 32-column
+  slice was the flight's p99. `SANDVOX_FARMAP_FIRST=1` is the old order.
+  (2) THE STAGGER: the session tells FarField when the tick carried a window
+  shift (`NoteShiftThisTick`); a frame-gated PrepareTick then skips its
+  plane slice if every queued plane still makes its due tick from the next
+  one (`CanDefer`), so the shift's genChunk and a far slice stop landing on
+  one frame (`SANDVOX_FAR_NO_STAGGER=1` is the A/B arm; never a reset, never
+  headless). Measured, the ticket flight with `SANDVOX_FRAMES_NO_RELOAD=1`
+  (see below), one exe, arms interleaved, `SANDVOX_RUN_EXCLUSIVE=1`: frames
+  over 33 ms 3.9-5.4% (n=5) -> 1.8-3.2% (n=10, mean 2.35%), p95 31.6-33.9 ->
+  29.1-30.2 ms, p99 39.0-40.6 -> 34.4-38.0 ms; 0 box-face handoffs at the
+  shipped margin and at most 2 planes a run landing 1-2 ticks past due.
+  **The ticket harness had been measuring an F5.** A default `--frames 1200`
+  reloads shaders at frame 600 -- the moment the flight starts -- and the
+  far pipelines' re-arrival queues a whole FullRefill; that refill, not
+  travel, was the "L1 5 / L2 4 / L3 4" box-face handoffs (planes queued 5
+  deep behind the resets) and part of every earlier p95. With
+  `SANDVOX_FRAMES_NO_RELOAD=1` the control arm shows 0/0/0. Quote flight
+  numbers with it set.
   **The sieve skips the sky (2026-09-12).** `far` ran a full `genCellCol` for
   all 4,096 cells of a level chunk whatever its altitude, and a level box is
   `kFarN` cells tall — 13 km at level 8 against a few hundred metres of

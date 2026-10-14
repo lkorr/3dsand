@@ -343,6 +343,30 @@ are the OTHER half of this frame; they are not additive with `nomicro`.
    splits them out since 2026-10-13): the rest is `EvictSlots` itself on a
    plane whose chunks the CA has touched (modified_, so stored), not yet
    attributed further (`SANDVOX_PT_DEBUG=1` prints its `evict issue` counts).
+   **Handoff 2026-10-14 (ticket 2026-10-11_12-10-09, all three levers).**
+   (0) The harness: `--frames` fires an F5 at frame N/2 = 600, the start of
+   the flight, and its far FullRefill was the source of the remaining
+   box-face handoffs; measure with `SANDVOX_FRAMES_NO_RELOAD=1`
+   (`build/arms.sh`-style loops: `scripts/perf/fly_ticket.sh` does not set
+   it). (b) "Eviction 3.1-3.3 ms per shift" was a per-shift MEAN: 8 startup
+   shifts (snapshot not yet valid, so every JITTER slot stored, ~870 x 37 us)
+   at 31-50 ms, 86 flight shifts at ~0.01. Fixed by the pristine-sentinel
+   skip (DESIGN.md, "A pristine sentinel is not stored either"): slowest
+   shift eviction 0.34 ms; flight shifts cost 1.5 ms CPU each, of which
+   eviction 0.23 (solutes). (a)+(c) map columns spread over a plane's slices
+   and plane slices staggered off shift ticks: frames > 33 ms 3.9-5.4% ->
+   1.8-3.2%, p99 39-41 -> 34-38 ms (DESIGN.md "Map columns ride the
+   slices"). LEFT: p99 is still ~35 ms, not 33. What the slow frames are
+   now: a tick frame costs ~19 ms of GPU with no far work at all (the sim
+   tick, ~13 ms over the 6 ms render) and 21-27 ms with a slice, so any
+   tick frame with a far slice is one vblank from 33 ms; the next lever is
+   the sim tick itself (item 2, async compute) or a smaller far slice floor
+   (`render.farPlaneBatch` 256 -> 128 is untested on this flight), not the
+   far passes' shapes. `farMapFill` is latency-bound (~4.5 ms for 8 columns,
+   one sub-column per thread); overlapping it with `far` was considered and
+   rejected -- any barrier between them (FarVox WAW vs `farDown`) waits on
+   all prior compute in Vulkan's stage scope, so it needs pass grouping in
+   the recorder first.
 6. **Unbilled CPU frame-path work** — player collision runs a
    `std::function` per cell (~600 cells x dozens of calls per frame, fluid
    mirror evaluated before the kind lookup); avatar `FindClip` is a linear

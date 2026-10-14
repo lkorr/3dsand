@@ -840,6 +840,17 @@ uint32_t g_lastFrameTicks = 0;   // ticksThisFrame, for the record above
 // (FarField::NearestValidFaceVox) — a seam drawn as the box face instead of
 // the dithered sphere. [margin 2 | the shipped margin][level 1..3].
 uint32_t g_faceBreach[2][3] = {};
+// ...and WHICH face, how many planes were queued on it, and how far inside the
+// sphere it sat (2026-10-14: "L1 5 L2 4 L3 4" was a bare count). Shipped margin.
+struct FaceBreachRec { uint32_t live, level; int axisSide; uint32_t queued; float dChunks; };
+std::vector<FaceBreachRec> g_faceBreachRecs;
+// Stream::Timings() at the first recorded frame: the window-shift breakdown
+// is printed for the stats window (FramesStatsFrom on), not the whole run --
+// the whole run's per-shift mean folded 8 startup shifts at 31-36 ms of
+// eviction into 86 flight shifts at ~0.01 and read "3 ms a shift"
+// (2026-10-14, ticket 2026-10-11_12-10-09).
+Stream::Timing g_streamAtStats{};
+bool g_streamAtStatsSet = false;
 // P2-D: WHICH cause and WHICH arm (support.h SnapshotStallStats). Accumulated
 // over the harness frames only, like the three counters above.
 sandvox::SnapshotStallStats g_frameStallStats{};
@@ -22098,6 +22109,10 @@ int main(int argc, char** argv) {
       // the first recorded frame's delta is its own and not the warm-up's.
       static uint64_t prevFar = 0, prevMap = 0, prevShifts = 0;
       const uint64_t nowMap = far.MapColsIssued(), nowShifts = stream.Timings().shifts;
+      // Until the stats window opens, keep the latest whole-run timings: the
+      // window's breakdown is the final total minus this.
+      if (frameCounter <= FramesStatsFrom()) g_streamAtStats = stream.Timings();
+      else g_streamAtStatsSet = true;
       if (frameCounter > FramesStatsFrom()) {
         HarnessFrameRec rec;
         rec.live = liveFrameNo;
@@ -22110,11 +22125,18 @@ int main(int argc, char** argv) {
         const Vec3 e = player.EyePos();
         const float eye[3] = {e.x, e.y, e.z};
         for (uint32_t k = 0; k < 3; k++) {
-          const float d = far.NearestValidFaceVox(k, eye);
+          int as = 0;
+          const float d = far.NearestValidFaceVox(k, eye, &as);
           if (d < 0) continue;
           if (d < FarField::HandoffSphereVox(k, 2)) g_faceBreach[0][k]++;
-          if (d < FarField::HandoffSphereVox(k, FarField::kSphereMarginChunks))
+          if (d < FarField::HandoffSphereVox(k, FarField::kSphereMarginChunks)) {
             g_faceBreach[1][k]++;
+            if (g_faceBreachRecs.size() < 32) {
+              const float span = (float)(kChunk << (k + 1 + kFarShiftBase));
+              g_faceBreachRecs.push_back({liveFrameNo, k + 1, as,
+                                          far.FaceQueued(k, as / 2, as & 1), d / span});
+            }
+          }
         }
       }
       prevFar = g_farEntries;
@@ -22771,6 +22793,21 @@ int main(int argc, char** argv) {
                   g_frameRecs.size(), g_faceBreach[0][0], g_faceBreach[0][1], g_faceBreach[0][2],
                   FarField::kSphereMarginChunks, g_faceBreach[1][0], g_faceBreach[1][1],
                   g_faceBreach[1][2]);
+      if (!g_faceBreachRecs.empty()) {
+        std::printf("      breaches (live level face queued-planes d-chunks):");
+        for (const FaceBreachRec& b : g_faceBreachRecs)
+          std::printf(" [%u L%u %c%c q%u %.2f]", b.live, b.level, b.axisSide & 1 ? '+' : '-',
+                      "xyz"[b.axisSide / 2], b.queued, b.dChunks);
+        std::printf("\n");
+      }
+      std::printf("      planes landed late (after their due tick) L1..L4: %llu/%llu "
+                  "%llu/%llu %llu/%llu %llu/%llu, worst %u ticks late; %llu plane "
+                  "slices staggered off shift ticks\n",
+                  (unsigned long long)far.LatePlanes(0), (unsigned long long)far.LandedPlanes(0),
+                  (unsigned long long)far.LatePlanes(1), (unsigned long long)far.LandedPlanes(1),
+                  (unsigned long long)far.LatePlanes(2), (unsigned long long)far.LandedPlanes(2),
+                  (unsigned long long)far.LatePlanes(3), (unsigned long long)far.LandedPlanes(3),
+                  far.WorstLateTicks(), (unsigned long long)far.StaggeredTicks());
       std::printf("    worst frames (from frame %llu): %zu frames, %zu dispatched sieve "
                   "entries (mean %.1f ms), %zu did not (mean %.1f ms), %zu filled "
                   "surface-map columns\n",
@@ -22822,7 +22859,16 @@ int main(int argc, char** argv) {
         // window shift. Denominated PER SHIFT, because a shift is the unit the
         // cost comes in — a per-frame mean of an all-or-nothing 40 ms stall
         // describes nothing that happens.
-        const Stream::Timing& st = stream.Timings();
+        // THE STATS WINDOW's shifts (g_streamAtStats), then one line for the
+        // whole run, startup included, with the slowest shift's eviction.
+        const Stream::Timing& stAll = stream.Timings();
+        const Stream::Timing st =
+            g_streamAtStatsSet ? stAll.Minus(g_streamAtStats) : stAll;
+        std::printf("    window shifts, whole run: %u (%u in the stats window); evict "
+                    "%.2f ms a shift, slowest %.2f ms, %u over 1 ms\n",
+                    stAll.shifts, st.shifts,
+                    stAll.shifts ? stAll.evictMs / (double)stAll.shifts : 0.0,
+                    stAll.evictMaxMs, stAll.evictSlowShifts);
         if (st.shifts > 0) {
           const double per = 1.0 / (double)st.shifts;
           // `wake-wait` is the R1 poll that was NOT ready at T+kWakeLatency
@@ -22839,6 +22885,19 @@ int main(int argc, char** argv) {
                       st.demoteMs * per, st.wakeWaitMs * per, st.wakeWaits,
                       st.harvestMs / (double)n,
                       st.dirtyFoldMs / (double)n);
+          // ...and the evict figure split (Stream::Timing, 2026-10-14).
+          std::printf("    evict split per shift: loop %.2f (sentinel RLE+put %.2f: %.1f "
+                      "stored, %.1f JITTER)  acquire %.2f  submit %.2f (%.2f batches, "
+                      "%.1f pages copied) | pristine sentinels skipped %.1f "
+                      "(stored: no record %.1f, other entry %.1f; noted %.1f, "
+                      "layer-blocked %.1f)\n",
+                      st.evictLoopMs * per, st.evictSentMs * per,
+                      (double)st.evictSentStored * per, (double)st.evictSentJitter * per,
+                      st.evictAcquireMs * per, st.evictSubmitMs * per,
+                      (double)st.evictBatches * per, (double)st.evictCopied * per,
+                      (double)st.evictSkipPristine * per,
+                      (double)st.evictPristineNone * per, (double)st.evictPristineDiff * per,
+                      (double)st.pristineNoted * per, (double)st.pristineBlocked * per);
         }
       }
     }
