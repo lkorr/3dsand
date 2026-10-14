@@ -761,6 +761,241 @@ fn farForegroundLit(level : u32, hp : vec3f, L : vec3f) -> f32 {
   return 1.0;
 }
 
+// ---- THE FAR GROUND'S OPENNESS, BY THE NEAR WALK'S DEFINITION ----------
+// (2026-10-14, ticket 2026-10-09_14-23-01.) The heightfield's openness is the
+// near walk's (sim_openness openValueAt) marched over the cascade, ONCE PER
+// PATCH here and read per pixel from the patch word (raymarch.wgsl
+// farGiCached, bits 16..23). It was a per-pixel fan in fs until the same day:
+// the seam numbers below, at +2.6 ms on the --render-budget overlook; the
+// patch is already resolved, cached and refreshed every FAR_GI_PERIOD
+// resolves, which is what a quantity of the static geometry wants.
+//
+// WHY THE DEFINITION. Measured with raymarch.wgsl SEAM_DBG 16 (the near
+// definition re-measured per pixel, dbgNearOpenDef, agrees with the grid's
+// byte to ~3 %): of the pixels `--gate lod-seam` classes "ground", 93 % are
+// RISERS, and the riser / up-face ratio the near walk measures is 0.62 on
+// open ground but 1.68 under a crown -- a riser's level rays see out UNDER
+// the canopy -- so no multiple of an up fan (the far law until then:
+// farOpenness, 1 tread / 0.6 riser, x the cascade's up fan) can stand for it.
+// The up fan itself read the clearing 1.2x more open than the near walk (0.60
+// against 0.50), the canopy over a crown's foot 2x (0.32 against 0.15). So:
+//   - the face's OWN fan (a riser's normal is level), a side face's
+//     down-diagonal re-aimed 63 degrees up ("a vertical face does not ask the
+//     ground");
+//   - real rays in fine-voxel space, the reach (render.opennessReach)
+//     measured ALONG the ray (the cell-diagonal step reached 17 m on a
+//     diagonal, over the crowns the near walk ends under);
+//   - an unblocked ray is not sky: it climbs straight up from its endpoint;
+//   - the outer stretch is a BLOCK MASK: a cell counts if any of its eight
+//     children one level finer is a ray blocker. The near walk's coarse mode
+//     is "any blocker in a 40 cm block"; the cascade's 80 cm cell is one
+//     cover-rule sample, porous to a ray through a crown's edge (this rule
+//     alone: 0.60 -> 0.49 on the clearing's up fan). Measured, NOT TO BE CUT
+//     BLIND: dropping it on level rays and on the climb put ground under a
+//     crown back to +7.7..+8.4 luma.
+// Mean openness of the same pixels (near grid / far before / far now): open
+// ground 0.30 / 0.38 / 0.35, under a crown 0.25 / 0.22 / 0.25, grass blades
+// 0.23 / 0.34 / 0.27. A map-terrain test (a sample under the level-1
+// heightfield top is solid) was measured and changed nothing.
+// MEDIA-BLIND, as the near walk is (isRayBlocker): clear water is no roof.
+// MUST AGREE: raymarch.wgsl farSkySolid (the feature fan's sample).
+const FAR_OPEN_REACH_V : f32 = TUNE_OPENNESS_REACH / VOXEL_METERS;
+const FAR_OPEN_W_UP : f32 = 1.0 / 3.0;
+const FAR_OPEN_W_DIAG : f32 = 1.0 / 6.0;
+fn farSlotAt(level : u32, c : vec3<i32>) -> u32 {
+  let bi = farVoxByteIndex(level, c);
+  return farCellSlot((farVox[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu);
+}
+fn farSkySolid(level : u32, c : vec3<i32>, b : FarBox) -> bool {
+  if (!farInValid(c, b)) { return false; }
+  let occ = farOcc[farOccIndex(level, c)];
+  if (occ == 0u) { return false; }
+  let top = farOccTop(occ);
+  if (top != 0u && (c.y & (i32(CHUNK) - 1)) >= i32(top)) { return false; }
+  let slot = farSlotAt(level, c);
+  return slot != 0u && isRayBlocker(materials[farPalMat(&materials, slot)]);
+}
+// Is anything at or above row c.y of cell c's level chunk? (farOcc's count
+// and top row; false = every cell from this row up to the chunk's top is
+// air.) Outside the valid box: no.
+fn farOccAbove(level : u32, c : vec3<i32>) -> bool {
+  if (!farInValid(c, farBox(level))) { return false; }
+  let occ = farOcc[farOccIndex(level, c)];
+  if (occ == 0u) { return false; }
+  let top = farOccTop(occ);
+  return top == 0u || (c.y & (i32(CHUNK) - 1)) < i32(top);
+}
+// THE BLOCK MASK's other half: any of the eight children (level lv - 1) of
+// level-lv cell c a ray blocker? The eight share one level chunk (2c is even),
+// so ONE farOcc word answers "nothing here" for all of them before any byte.
+fn farChildrenSolid(lv : u32, c : vec3<i32>) -> bool {
+  let lc = lv - 1u;
+  let c0 = c * 2;
+  if (!farOccAbove(lc, c0)) { return false; }
+  for (var k = 0; k < 8; k++) {
+    let slot = farSlotAt(lc, c0 + vec3<i32>(k & 1, (k >> 1) & 1, (k >> 2) & 1));
+    if (slot != 0u && isRayBlocker(materials[farPalMat(&materials, slot)])) { return true; }
+  }
+  return false;
+}
+// THE PREFILTER: does anything stand over the hit within the fan's reach?
+// (false = the closed form is what the near grid measures, as on flat open
+// ground, where it was calibrated). The two-levels-coarser chunk round the
+// cell and its four side neighbours, one chunk row up; open if none of them
+// holds anything over the cell's row (+1 row of terrain relief), or if the
+// cell is over its level's sky ceiling. A column-only test was tried first and
+// was wrong: the diagonals of a clearing's grass land in the crowns AROUND it.
+fn farGroundOver(level : u32, cell : vec3<i32>) -> bool {
+  if (f32(cell.y + 1) >= farSkyCeil(level)) { return false; }
+  let shift = farCellShift(level);
+  let l2 = min(level + 2u, FAR_LEVELS);
+  let b2 = farBox(l2);
+  let o2 = ((cell << vec3<u32>(shift)) + vec3<i32>(i32(1u << shift) >> 1u)) >>
+           vec3<u32>(farCellShift(l2));
+  let ch = i32(CHUNK);
+  for (var i = 0; i < 10; i++) {
+    let side = i >> 1;
+    var off = vec3<i32>(0, (i & 1) * ch, 0);
+    if (side == 1) { off.x = ch; } else if (side == 2) { off.x = -ch; }
+    else if (side == 3) { off.z = ch; } else if (side == 4) { off.z = -ch; }
+    let pr = o2 + off;
+    if (!farInValid(pr, b2)) { continue; }
+    let occ = farOcc[farOccIndex(l2, pr)];
+    if (occ == 0u) { continue; }
+    let top = farOccTop(occ);
+    if (top == 0u || (pr.y >> 4u) * ch + i32(top) - 1 > o2.y + 1) { return true; }
+  }
+  return false;
+}
+// The definition from `ro` (fine voxels, just off the face) on face normal
+// `ni` (an axis), 0..1.
+fn farGroundOpen(level : u32, ro : vec3f, ni : vec3<i32>) -> f32 {
+  let n = vec3f(ni);
+  let t1 = select(vec3<i32>(1, 0, 0), vec3<i32>(0, 0, 1), ni.x != 0);
+  let t2 = vec3<i32>(ni.y * t1.z - ni.z * t1.y, ni.z * t1.x - ni.x * t1.z,
+                     ni.x * t1.y - ni.y * t1.x);
+  let l2 = min(level + 2u, FAR_LEVELS);
+  let s0 = f32(1u << farCellShift(level));
+  let s2 = f32(1u << farCellShift(l2));
+  let b2 = farBox(l2);
+  var vis = 0.0;
+  for (var r = 0; r < 5; r++) {
+    var di = ni;
+    if (r == 1) { di = ni + t1; } else if (r == 2) { di = ni - t1; }
+    else if (r == 3) { di = ni + t2; } else if (r == 4) { di = ni - t2; }
+    if (ni.y == 0 && di.y < 0) { di = ni + vec3<i32>(0, 2, 0); }
+    let d = normalize(vec3f(di));
+    var t = 0.0;
+    var open = true;
+    var sky = false;
+    for (var k = 0; k < 48; k++) {
+      let outer = t >= 16.0 - 1e-3;
+      // The first outer sample is the first l2 cell past the inner stretch.
+      if (outer && t < 16.0 + 1e-3) { t = (floor(16.0 / s2) + 1.0) * s2; }
+      else { t += select(s0, s2, outer); }
+      if (t > FAR_OPEN_REACH_V + 1e-3) { break; }
+      let lv = select(level, l2, outer);
+      let p = ro + d * t;
+      let c = vec3<i32>(floor(p / select(s0, s2, outer)));
+      if (d.y >= 0.0 && f32(c.y) >= farSkyCeil(lv)) { sky = true; break; }
+      if (farSkySolid(lv, c, farBox(lv)) || (outer && lv > 1u && farChildrenSolid(lv, c))) {
+        open = false;
+        break;
+      }
+    }
+    // AN UNBLOCKED RAY IS NOT SKY: straight up from the endpoint, at the
+    // outer level with its block mask, to the level's sky ceiling. The
+    // ceiling is the level's ONE top, so the climb skips, exactly: a row
+    // where neither the cell's chunk nor its children's has anything at or
+    // above it is air to the top of the children's chunk (8 cells of l2).
+    if (open && !sky) {
+      let e = vec3<i32>(floor((ro + d * FAR_OPEN_REACH_V) / s2));
+      var cy = e.y + 1;
+      for (var k = 0; k < 24; k++) {
+        if (f32(cy) >= farSkyCeil(l2)) { break; }
+        let c = vec3<i32>(e.x, cy, e.z);
+        if (!farOccAbove(l2, c) && !(l2 > 1u && farOccAbove(l2 - 1u, c * 2))) {
+          cy = ((cy >> 3u) + 1) << 3u;
+          continue;
+        }
+        if (farSkySolid(l2, c, b2) || (l2 > 1u && farChildrenSolid(l2, c))) { open = false; break; }
+        cy += 1;
+      }
+    }
+    if (open) { vis += select(FAR_OPEN_W_DIAG, FAR_OPEN_W_UP, r == 0); }
+  }
+  return vis;
+}
+// The patch word's openness bytes: (the ground's, the blade cards'), each
+// 0..254, or 255 when the patch is not the GROUND (a crown or trunk cell
+// clear of the heightfield -- the feature fan in fs is theirs) or nothing
+// stands near it (the prefilter). `fp` is the patch centre ON the face.
+//
+// THE CARDS HAVE THEIR OWN. A far blade card is drawn in the GROUND cell
+// (raymarch.wgsl farFeatCell), so a card pixel reads the same patch as the
+// tread under it, but the pixels on a card are spread up the blade, and a
+// fan from half the blade's height up sees more sky than one from the
+// ground (measured with SEAM_DBG 18, the cached value against the per-pixel
+// fan on the same pixels: cards 0.76x from the ground's start). An up face's
+// riser-foreground byte is unused, so the cards' value rides there (bits
+// 8..15).
+const FAR_FEAT_VEC : u32 = FAR_LEVELS * FAR_N * FAR_N;   // raymarch.wgsl agrees
+const FAR_OPEN_FADE_END_M : f32 = 110.0;                 // raymarch.wgsl FAR_SKY_FADE_END_M
+const FAR_FEAT_SOLID : u32 = 0x40000000u;                // raymarch.wgsl agrees
+fn farGroundOpenByte(level : u32, cell : vec3<i32>, fp : vec3f, n3 : vec3f,
+                     refined : bool) -> vec2<u32> {
+  let s = f32(1u << farCellShift(level));
+  // Past the distance fs eases the term out by (raymarch.wgsl farSkyFade:
+  // FAR_SKY_FADE_END_M) nothing reads it: no fan.
+  if (length(fp - R.camPos) * VOXEL_METERS > FAR_OPEN_FADE_END_M) { return vec2<u32>(255u); }
+  let top = farColumnTop(level, fp - n3 * (0.25 * s));
+  if (top < -1e8 || f32(cell.y) * s > top + s) { return vec2<u32>(255u); }
+  if (!farGroundOver(level, cell)) { return vec2<u32>(255u); }
+  var ro = fp + n3 * 0.5;
+  let cy = f32(cell.y) * s;
+  // A refined tread starts from its sub-column's top, as the pixel on it does.
+  if (refined && n3.y > 0.5) { ro.y = top + 0.5; }
+  // A RISER's patch is at a fixed height in its cell (a quarter / three
+  // quarters up) on the cell's camera-side boundary, but the faces a pixel
+  // sees are only the EXPOSED span -- from the top of the column in front up
+  // to the higher of the cell's two sub-columns along the normal (a refined
+  // cell's step can be at its boundary or half a cell in). A start under the
+  // front column's top is inside the step below, and its level rays close on
+  // the first cell (measured: open ground -7 luma at noon). So the
+  // sub-patch's height in the cell is mapped onto that span, the way the
+  // pixels on it are spread.
+  if (abs(n3.y) < 0.5) {
+    let front = farColumnTop(level, fp + n3 * (0.25 * s));
+    if (front > -1e8) {
+      let inner = max(top, farColumnTop(level, fp - n3 * (0.75 * s)));
+      let lo = clamp(front, cy, cy + s);
+      let hi = max(clamp(inner, cy, cy + s), lo);
+      ro.y = mix(lo, hi, clamp((fp.y - cy) / s, 0.0, 1.0));
+    }
+  }
+  let ni = vec3<i32>(round(n3));
+  let g = u32(clamp(farGroundOpen(level, ro, ni), 0.0, 1.0) * 254.0 + 0.5);
+  var c = g;
+  if (n3.y > 0.5) {
+    // The tallest plant of the cell's four sub-columns (farFeatCell's words:
+    // height bits 8..11; a SOLID word is a stalk, not a card). Not the one
+    // under the patch centre: a card pixel reads its CELL's patch for the
+    // sub-patch it falls in, and measured (SEAM_DBG 19) a third of them sat
+    // over a sub-column with no plant of its own, so took the ground's start.
+    let q = farMap[FAR_FEAT_VEC + farMapCell(level, cell.xz)];
+    var hg = 0u;
+    for (var k = 0u; k < 4u; k++) {
+      let e = select(select(q.x, q.y, k == 1u), select(q.z, q.w, k == 3u), k >= 2u);
+      if ((e & FAR_FEAT_SOLID) == 0u) { hg = max(hg, (e >> 8u) & 15u); }
+    }
+    if (hg > 0u) {
+      let rc = vec3f(ro.x, top + 0.5 * f32(hg) + 0.5, ro.z);
+      c = u32(clamp(farGroundOpen(level, rc, ni), 0.0, 1.0) * 254.0 + 0.5);
+    }
+  }
+  return vec2<u32>(g, c);
+}
+
 fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
   let level = ((packedSub >> FAR_SC_LEVEL_SHIFT) & 7u) + 1u;
   let ab = FAR_SC_AXIS_BITS;
@@ -819,26 +1054,44 @@ fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
       // branch) has no such rule and answers a contact shadow; so does this.
     }
     valU = u32(clamp(sh, 0.0, 1.0) * 255.0 + 0.5);
-    // THE FAR PATCH'S INDIRECT LIGHT (above): buried patches' gather, and an
-    // open RISER's foreground (FAR_GI_FG_TAG, below).
+    // THE FAR PATCH'S WORD (above): a buried patch's gather; an open patch's
+    // riser foreground (FAR_GI_FG_TAG) and ground openness (farGroundOpen,
+    // bits 16..23). Every patch carries one now (a tread used to keep 0).
     var giW = 0u;
     let riser = abs(n3.y) < 0.5;
-    if (bw > 0.001 || riser) {
-      let ver0 = shadowPatchVerifier(packedCell, packedSub);
-      let old0 = atomicLoad(&shadowCache[bucket * 2u + 1u]);
-      let mine = shadowStateValid(old0) && shadowStateVerifier(old0) == ver0;
-      let due = !mine || shadowHist[bucket] == 0u ||
-                ((R.frameIdx / SHADOW_REFRESH_PERIOD + (key >> 8u)) % FAR_GI_PERIOD) == 0u;
-      if (due) {
-        if (bw > 0.001) {
-          giW = packRgb9e5(farGather(level, hp, n3, face)) | 1u;
-        } else {
-          giW = (u32(clamp(farForegroundLit(level, hp, L), 0.0, 1.0) * 255.0 + 0.5) << 8u) |
-                FAR_GI_FG_TAG;
-        }
+    let ver0 = shadowPatchVerifier(packedCell, packedSub);
+    let old0 = atomicLoad(&shadowCache[bucket * 2u + 1u]);
+    let mine = shadowStateValid(old0) && shadowStateVerifier(old0) == ver0;
+    let due = !mine || shadowHist[bucket] == 0u ||
+              ((R.frameIdx / SHADOW_REFRESH_PERIOD + (key >> 8u)) % FAR_GI_PERIOD) == 0u;
+    if (due) {
+      if (bw > 0.001) {
+        giW = packRgb9e5(farGather(level, hp, n3, face)) | 1u;
       } else {
-        giW = shadowHist[bucket];
+        // THE OPENNESS IS THE GEOMETRY'S, NOT THE SUN'S: measured on the
+        // patch's first resolve and KEPT across its refreshes (the refresh is
+        // for the riser's foreground sun, which moves with the day). Only a
+        // patch with no measurement (255: beyond the fade, or nothing near
+        // when it was asked) asks again, which is a distance test and the
+        // prefilter's ten farOcc words. An edit under a live patch keeps the
+        // old value until the slot is reclaimed (a far-field edit is a
+        // fardown refresh of what is already 10+ m away; the near grid owns
+        // the edited ground inside the handoff).
+        let oldW = shadowHist[bucket];
+        var ob = vec2<u32>((oldW >> 16u) & 0xFFu, (oldW >> 8u) & 0xFFu);
+        if (!mine || (oldW & 3u) != FAR_GI_FG_TAG || ob.x == 255u) {
+          let fp = shadowPatchCentre(cell, face, packedSub & 7u, (packedSub >> 3u) & 7u,
+                                     FAR_SC_SUBDIV) * s;
+          ob = farGroundOpenByte(level, cell, fp, n3, (packedSub & FAR_SC_REFINED) != 0u);
+        }
+        // bits 8..15: a riser's foreground sun; an up face's cards' openness.
+        let fg = select(ob.y,
+                        u32(clamp(farForegroundLit(level, hp, L), 0.0, 1.0) * 255.0 + 0.5),
+                        riser);
+        giW = (ob.x << 16u) | (fg << 8u) | FAR_GI_FG_TAG;
       }
+    } else {
+      giW = shadowHist[bucket];
     }
     shadowHist[bucket] = giW;
   }
