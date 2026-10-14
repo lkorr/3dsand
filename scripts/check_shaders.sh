@@ -758,7 +758,12 @@ if [ -f "$WORLDGEN_COMBINED" ]; then
   # thinner than a cascade cell (a crystal vein is a two-voxel skin, a crystal
   # a cone voxels across) and the far field drew the bare shell for every
   # dressing material: 26,359 -> 28,787 instructions.
-  for spec in "far:32000" "farpatch:25000" "fardown:25000" "farmap:25000"; do
+  # `fardown` 25000 -> 28000 (2026-10-14, ticket 2026-10-14_11-20-12): the far
+  # cover plane (8d3ce52, expected cover shares per cell + the stalk drop) and
+  # the far LOD trees (132b822, baked silhouette at levels 5-6) each fit alone
+  # (24,918) and together measure 25,425. fardown compiles in ~100 s cold, not
+  # far's ~750 s; the merged tree's cold pipeline time is in that commit.
+  for spec in "far:32000" "farpatch:25000" "fardown:28000" "farmap:25000"; do
     ep="${spec%%:*}"; ceil="${spec##*:}"
     spv="$TMP/worldgen_${ep}.spv"
     if ! "$TINT_BIN" -f spirv -ep "$ep" -o "$spv" "$WORLDGEN_COMBINED" >/dev/null 2>&1; then
