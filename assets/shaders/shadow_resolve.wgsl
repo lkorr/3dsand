@@ -795,7 +795,16 @@ fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
         // A CLEAR RAY UNDER THE TERRAIN IS NOT SUNLIT (above).
         sh = shadowFromOpaqueHit(true, TUNE_FAR_SHADOW_REACH / VOXEL_METERS, 0u);
       }
-      valid = !(r.x >= 0.0 && r.x < 0.01);
+      // A BLOCKER AT CONTACT IS A SHADOW, NOT "NO OPINION" (2026-10-14,
+      // ticket 2026-10-14_00-52-22). This used to publish the slot INVALID
+      // when the ray met a cell within 0.01 voxels of its start, after the
+      // near patch's burial rule. But a far pixel reads ONE patch, with
+      // nothing to renormalise onto, and a patch with no opinion shades as
+      // full sun: every far face whose start point sat in a neighbouring
+      // cell -- the inside faces of a distant canopy, mostly -- was lit,
+      // permanently: ~900 px of a still frame at the ticket camera, lit
+      // specks over every far tree. The cache-off reference (raymarch.wgsl's farShadowMarch
+      // branch) has no such rule and answers a contact shadow; so does this.
     }
     valU = u32(clamp(sh, 0.0, 1.0) * 255.0 + 0.5);
     // THE FAR PATCH'S INDIRECT LIGHT (above): buried patches' gather, and an

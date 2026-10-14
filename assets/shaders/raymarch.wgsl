@@ -1052,11 +1052,11 @@ fn fogSkyK() -> f32 { return max(eyeSkyK(), gHitSky); }
 // and means of whichever frame this is): 12 = the sun shadow's stages
 // (gDbgSh): raw, after the LOD lift, after the lift cap; 13 = a far pixel's
 // shadow-cache patch: no opinion (1), its value, 0.5. NEAR SHADOW CACHE
-// (2026-10-13, ticket 2026-10-13_09-55-24): 14 = a near cache pixel's taps --
-// no opinion at all (1: the pixel shades as full sun), the raw cached value,
-// and why a tap had none (1 = a slot found but not valid, 0.5 = no slot:
-// claimed this frame, set full or stolen); a FAR pixel's patch writes (no
-// opinion, value, 0.25). LOD BAND (2026-10-13, ticket 2026-10-12_16-36-34):
+// (2026-10-13, ticket 2026-10-13_09-55-24): 14 = a near cache pixel --
+// nothing answered (1: the pixel shades as full sun), the shadow value, and
+// how it was answered (0.5 its own taps, 0.75 a fallback probe, 1 nothing;
+// 2026-10-14, A MISS IS NOT SUN); a FAR pixel's patch writes (nothing
+// answered, value, 0.25). LOD BAND (2026-10-13, ticket 2026-10-12_16-36-34):
 // 15 = the final colour of the pixels whose surface (near or far) is 10-19 m
 // from the eye and black elsewhere, so two arms with the handoff at 20.5 and
 // at 8 m compare the SAME band as near and as far, colour for colour (a
@@ -7025,8 +7025,9 @@ fn farScPackCell(c : vec3<i32>, face : u32) -> u32 {
          (face << (FAR_SC_AXIS_BITS * 3u));
 }
 // The cached far shadow for the pixel at `hitP` (fine voxels) on face
-// (axis, sgn) of cell `cell` of `level`: its nearest patch's value, or 1 (lit)
-// while the patch has no opinion (its first frame on screen).
+// (axis, sgn) of cell `cell` of `level`: its nearest patch's value; while that
+// patch has no opinion (its first frame on screen), what farShadowFallback
+// finds for the same ground, and 1 (lit) only if that is nothing too.
 fn farShadowCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
                    refined : bool, hitP : vec3f) -> f32 {
   rsAdd(RS_SC_TAPS, 1u);
@@ -7039,10 +7040,58 @@ fn farShadowCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
   let iy = u32(min(floor(axisPick(f, i32(tg.y)) * m), m - 1.0));
   let sub = shadowPackSub(ix, iy) | select(0u, FAR_SC_REFINED, refined) | FAR_SC_FLAG |
             ((level - 1u) << FAR_SC_LEVEL_SHIFT);
-  let r = farSlotRead(farScPackCell(cell, face), sub, R.frameIdx & 15u);
+  let pcell = farScPackCell(cell, face);
+  var r = farSlotRead(pcell, sub, R.frameIdx & 15u);
   if (SEAM_DBG == 13u) { gDbgSh = vec3f(select(1.0, 0.0, r.y > 0.0), r.x, 0.5); }
+  // A MISS IS NOT SUN here either (shadowCached, 2026-10-14): a far patch with
+  // no opinion -- its first frame on screen, which every level boundary and
+  // the near/far handoff hand to a moving camera on a ring round it -- asks
+  // the answers the cache already holds for the same ground instead.
+  if (r.y <= 0.0) { r = farShadowFallback(level, cell, face, refined, hitP, pcell, sub); }
   if (SEAM_DBG == 14u) { gDbg = vec4f(select(1.0, 0.0, r.y > 0.0), r.x, 0.25, 1.0); }
   return select(1.0, r.x, r.y > 0.0);
+}
+
+// farShadowCached's miss, in order: the same patch under the other refinement
+// (a cell's refinement can flip between frames); the same face of the four
+// in-plane neighbour cells (a face sliding out from behind a nearer one -- a
+// distant canopy's leaves under parallax -- has a visible neighbour); the
+// level ABOVE at this point (ground coming toward the eye crosses from a
+// coarse level into a finer one, and the coarse patch is the one it was read
+// through last frame); the level BELOW (going away, the reverse); and at
+// level 1 the near cache's patch at the fine cell (ground crossing the
+// handoff outward was a near pixel last frame), at the coarsest pool patch
+// every near read of that face keeps warm. Read-only probes, (value, 1) or
+// (0, 0).
+fn farShadowFallback(level : u32, cell : vec3<i32>, face : u32, refined : bool,
+                     hitP : vec3f, pcell : u32, sub : u32) -> vec2f {
+  var r = shadowPeek(pcell, sub ^ FAR_SC_REFINED);
+  if (r.y > 0.0) { return r; }
+  let tg = shadowFaceTangents(face);
+  let ta = axisVecI(i32(tg.x), 1);
+  let tb = axisVecI(i32(tg.y), 1);
+  for (var k = 0u; k < 4u; k++) {
+    let c = cell + select(tb, ta, k < 2u) * select(1, -1, (k & 1u) != 0u);
+    r = shadowPeek(farScPackCell(c, face), sub);
+    if (r.y > 0.0) { return r; }
+  }
+  if (level < FAR_LEVELS) {
+    r = farScPeekEither(farScPatchAt(level + 1u, hitP, face), refined);
+    if (r.y > 0.0) { return r; }
+  }
+  if (level > 1u) {
+    r = farScPeekEither(farScPatchAt(level - 1u, hitP, face), refined);
+    if (r.y > 0.0) { return r; }
+  } else {
+    let c = vec3<i32>(floor(hitP - shadowFaceNormal(face) * 0.25));
+    let rel = c - R.origin * i32(CHUNK);
+    if (all(rel >= vec3<i32>(0)) && all(rel < vec3<i32>(i32(WORLD_N)))) {
+      let subdiv = clamp(R.shadowSubdiv, 1u, SHADOW_SUBDIV_MAX);
+      let pc = shadowPoolPick(0u, shadowPoolMax(subdiv), subdiv);
+      r = shadowPeek(shadowPackCell(c, face), shadowPackSub(pc, pc));
+    }
+  }
+  return r;
 }
 
 // The far patch's measured indirect light (shadow_resolve.wgsl THE FAR PATCH'S
@@ -7078,9 +7127,10 @@ fn farGiCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
   let curFrame = R.frameIdx & 15u;
   let fp = shadowFindPlain(key, ver, shadowSetOf(key));
   if (fp.x == 0xFFFFFFFFu) {
-    // Not found: claim and request it (shadowSlotRead's path), none this frame.
+    // Not found: claim and request it (shadowSlotRead's path); this frame
+    // borrows what the cache holds for the same ground (farGiFallback).
     _ = shadowSlotRead(packedCell, sub, curFrame);
-    return 0u;
+    return farGiFallback(level, face, refined, hitP, perFace, packedCell, sub);
   }
   // farSlotRead's registration, verbatim: re-requested on its refresh phase
   // (the sun's share of its light moves) or while unresolved, and kept LIVE.
@@ -7093,8 +7143,36 @@ fn farGiCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
                         shadowStateValid(state), ver));
     if (r.exchanged) { shadowAppendRequest(key, fp.x, packedCell, sub); }
   }
-  if (!shadowStateValid(state)) { return 0u; }
+  if (!shadowStateValid(state)) {
+    return farGiFallback(level, face, refined, hitP, perFace, packedCell, sub);
+  }
   return shadowHistRO[fp.x];
+}
+
+// farGiCached's miss: the patch's first frame on screen, which a level ring
+// or a refinement flip hands a moving camera every frame. Nothing published
+// used to mean "no indirect light" (a buried face one frame darker, an open
+// riser one frame without its foreground term): a speckle of the same kind
+// as the sun's (A MISS IS NOT SUN, shadowCached). So it borrows the word the
+// cache holds for the same ground -- the other refinement, then the level
+// above and below -- by read-only probes, and only a patch with none of them
+// is still 0 for its one frame.
+fn farGiFallback(level : u32, face : u32, refined : bool, hitP : vec3f,
+                 perFace : bool, packedCell : u32, sub : u32) -> u32 {
+  var slot = shadowPeekSlot(packedCell, sub ^ FAR_SC_REFINED);
+  for (var k = 0u; k < 2u && slot == 0xFFFFFFFFu; k++) {
+    let lv = select(level - 1u, level + 1u, k == 0u);
+    if (lv < 1u || lv > FAR_LEVELS) { continue; }
+    let pk = farScPatchAt(lv, hitP, face);
+    // perFace reads sub-patch (0, 0): the six sub-index bits cleared.
+    let ps = select(pk.y, pk.y & ~0x3Fu, perFace);
+    slot = shadowPeekSlot(pk.x, ps | select(0u, FAR_SC_REFINED, refined));
+    if (slot == 0xFFFFFFFFu) {
+      slot = shadowPeekSlot(pk.x, ps | select(FAR_SC_REFINED, 0u, refined));
+    }
+  }
+  if (slot == 0xFFFFFFFFu) { return 0u; }
+  return shadowHistRO[slot];
 }
 
 // ---- far-field ambient occlusion: voxelAO's rule over cascade cells ----------
@@ -8776,7 +8854,7 @@ fn shadowAppendRequest(key : u32, slot : u32, packedCell : u32, packedSub : u32)
 // what keeps the ramp continuous across voxel boundaries; a neighbour that is
 // buried resolves to a contact-dark patch, which is the right answer for the
 // floor-meets-wall seam. Taps with no opinion drop out and the rest
-// renormalise; only a pixel with NO resolved neighbour shades fully lit.
+// renormalise; a pixel with NO resolved tap asks shadowCachedFallback.
 //
 // BUT ONLY WHERE A PATCH IS AT LEAST A PIXEL WIDE. Over most of an overlook
 // frame a 2.5 cm patch is SUB-pixel, and there the four taps of adjacent pixels
@@ -8787,11 +8865,24 @@ fn shadowAppendRequest(key : u32, slot : u32, packedCell : u32, packedSub : u32)
 // single nearest tap — same request count as before filtering existed — and
 // the blend switches on exactly where its cost buys something visible.
 // `camDistFine` is the receiver's camera distance in fine voxels (h.t).
-// A MISS RETURNS 1.0 (lit), which is the cache's documented one-frame cost: a
-// patch nobody has requested yet renders unshadowed until the resolve pass
-// fills it in next frame, and a one-frame bright edge on a newly visible
-// surface is invisible in motion outdoors. It was NOT invisible where patches
-// are sub-pixel — see SUB-PIXEL PATCHES ARE POOLED below.
+// A MISS IS NOT SUN (2026-10-14, ticket 2026-10-14_00-52-22: "tons of
+// bisecting circles of lines of light that run through shadows everywhere as I
+// run around"). A pixel whose taps have no opinion -- a patch nobody had read
+// before this frame, which the resolve pass only answers NEXT frame -- used to
+// shade as full sun. The defence was that a one-frame bright edge on a newly
+// visible surface is invisible in motion. It is not when the new patches lie
+// on a CURVE: every LOD boundary of this reader (nearest/bilinear, each pool
+// step) is a curve of constant projected patch size round the camera, and
+// translation drags each one across the ground, so a moving camera painted a
+// fresh 1 px arc of full sun through every shadow on every frame. Two parts:
+// the pool steps are nested (SUB-PIXEL PATCHES ARE POOLED, below) so most
+// boundary crossings are no longer misses at all, and what does miss asks
+// shadowCachedFallback -- the same face's coarser pool patches, then the
+// neighbour cells', then the far cascade's patch -- with plain read-only
+// probes of answers the cache already holds. Only a surface with none of
+// those (true disocclusion, or the first frame) still shades lit for a frame.
+// The --at harness could not see any of this until the same day: its picture
+// re-ran the resolve before re-rendering (main.cpp g_shotAsPresented).
 //
 // INDOORS IT WAS NOT INVISIBLE, and the fix is NOT here. `shadowLiftCap` used
 // to pass v = 1 through untouched, so a miss inside a sealed cave shaded with
@@ -8819,6 +8910,117 @@ const SHADOW_NEAREST_PX : f32 = 4.0;
 // Below this patch width the nearest read pools patches (SUB-PIXEL PATCHES ARE
 // POOLED, in the function). 1.5 so a pooled patch lands at 1.5-3 px.
 const SHADOW_POOL_PX : f32 = 1.5;
+
+// ---- NESTED POOL STEPS (THE POOLED PATCHES ARE NESTED, in shadowCached) ----
+// A step-s block (s a power of two) reads sub-patch
+// `(n & ~(s - 1)) | (SHADOW_POOL_PICK & (s - 1))`: the same low-bit pattern at
+// every step, so the patch a step reads is in the set every finer step reads.
+// 0b0101... alternates the side of the block centre a step lands on, keeping
+// each pick within s/4 of the centre (steps 2/4/8 read 1/1/5; the centred
+// picks they replace were 1/2/4).
+const SHADOW_POOL_PICK : u32 = 0x55u;
+// The coarsest step: the largest power of two in the face's subdivision, so
+// a non-power-of-two `shadowCacheSubdiv` still pools by nested powers of two
+// (its last partial block clamps to the face's last patch).
+fn shadowPoolMax(subdiv : u32) -> u32 { return 1u << firstLeadingBit(max(subdiv, 1u)); }
+// The step that makes a patch `px` pixels wide on screen at least
+// SHADOW_POOL_PX wide.
+fn shadowPoolStep(px : f32, subdiv : u32) -> u32 {
+  let s = exp2(ceil(log2(max(SHADOW_POOL_PX / max(px, 1e-6), 1.0))));
+  return min(u32(min(s, 256.0)), shadowPoolMax(subdiv));
+}
+fn shadowPoolPick(n : u32, s : u32, subdiv : u32) -> u32 {
+  return min((n & ~(s - 1u)) | (SHADOW_POOL_PICK & (s - 1u)), subdiv - 1u);
+}
+
+// A READ-ONLY PROBE: the published answer of a patch the cache already holds,
+// (value, 1), or (0, 0). No claim, no registration, no request -- the plain
+// view alone (THE FIND IS A PLAIN LOAD, above), so a fallback can ask several
+// patches without making any of them live or costing the resolve a ray.
+fn shadowPeek(packedCell : u32, packedSub : u32) -> vec2f {
+  let key = shadowPatchKey(packedCell, packedSub);
+  let f = shadowFindPlain(key, shadowPatchVerifier(packedCell, packedSub), shadowSetOf(key));
+  if (f.x == 0xFFFFFFFFu || !shadowStateValid(f.y)) { return vec2f(0.0); }
+  return vec2f(shadowStateValue(f.y), 1.0);
+}
+// The same probe's slot, for a reader of the slot's shadowHist word
+// (farGiFallback); 0xFFFFFFFF if the patch has no published answer.
+fn shadowPeekSlot(packedCell : u32, packedSub : u32) -> u32 {
+  let key = shadowPatchKey(packedCell, packedSub);
+  let f = shadowFindPlain(key, shadowPatchVerifier(packedCell, packedSub), shadowSetOf(key));
+  return select(0xFFFFFFFFu, f.x, f.x != 0xFFFFFFFFu && shadowStateValid(f.y));
+}
+
+// The far cache's level-`level` patch under fine-voxel point `p` on `face`:
+// (packedCell, packedSub without the refined bit). farShadowCached keys its
+// own reads through this, so a probe from anywhere names the same patch.
+fn farScPatchAt(level : u32, p : vec3f, face : u32) -> vec2<u32> {
+  let s = f32(1u << farCellShift(level));
+  // A quarter voxel INTO the surface: a hit on a cell's face lies exactly on
+  // the boundary with the empty cell beyond it, and floor() alone would name
+  // that one.
+  let q = (p - shadowFaceNormal(face) * 0.25) / s;
+  let c = vec3<i32>(floor(q));
+  let tg = shadowFaceTangents(face);
+  let f = clamp(q - vec3f(c), vec3f(0.0), vec3f(1.0));
+  let m = f32(FAR_SC_SUBDIV);
+  let ix = u32(min(floor(axisPick(f, i32(tg.x)) * m), m - 1.0));
+  let iy = u32(min(floor(axisPick(f, i32(tg.y)) * m), m - 1.0));
+  return vec2<u32>(farScPackCell(c, face),
+                   shadowPackSub(ix, iy) | FAR_SC_FLAG | ((level - 1u) << FAR_SC_LEVEL_SHIFT));
+}
+// Either refinement of a far patch: the refined bit is part of the key, and
+// a cell's refinement can change from one frame to the next.
+fn farScPeekEither(pk : vec2<u32>, refinedFirst : bool) -> vec2f {
+  let a = shadowPeek(pk.x, pk.y | select(0u, FAR_SC_REFINED, refinedFirst));
+  if (a.y > 0.0) { return a; }
+  return shadowPeek(pk.x, pk.y | select(FAR_SC_REFINED, 0u, refinedFirst));
+}
+
+// SEAM_DBG 14: how the pixel's shadow was answered -- 0 its own taps, 0.5 a
+// fallback probe, 1 nothing (the pixel shades as full sun).
+var<private> gDbgFb : f32 = 0.0;
+
+// What a near pixel with no opinion asks instead of shading as full sun, in
+// order of how likely each is to hold this pixel's answer:
+//  1. its own face's coarser pool patches. A pixel that stepped FINER this
+//     frame (the ground coming toward the eye across a pool boundary) needs a
+//     patch nobody read; the coarser one it read last frame is, by the nesting,
+//     one of these.
+//  2. the same face of the four in-plane neighbour cells, at their coarsest
+//     patch (which every pool step of theirs keeps warm): a surface sliding
+//     into view from behind an edge has a visible neighbour.
+//  3. the far cascade's level-1 patch at this point: ground crossing the
+//     near/far handoff toward the eye was a FAR pixel last frame.
+// Read-only probes all of them; the pixel's own patch was already claimed by
+// shadowSlotRead and answers for itself next frame.
+fn shadowCachedFallback(hp : vec3f, cell : vec3<i32>, face : u32, ta : vec3<i32>,
+                        tb : vec3<i32>, nU : u32, nV : u32, subdiv : u32,
+                        winLo : vec3<i32>) -> f32 {
+  let smax = shadowPoolMax(subdiv);
+  let own = shadowPackCell(cell, face);
+  for (var s = 2u; s <= smax; s = s * 2u) {
+    let r = shadowPeek(own, shadowPackSub(shadowPoolPick(nU, s, subdiv),
+                                          shadowPoolPick(nV, s, subdiv)));
+    if (r.y > 0.0) { if (SEAM_DBG == 14u) { gDbgFb = 0.5; } return r.x; }
+  }
+  let pc = shadowPoolPick(0u, smax, subdiv);
+  let coarse = shadowPackSub(pc, pc);
+  for (var k = 0u; k < 4u; k++) {
+    let c = cell + select(tb, ta, k < 2u) * select(1, -1, (k & 1u) != 0u);
+    let rel = c - winLo;
+    if (any(rel < vec3<i32>(0)) || any(rel >= vec3<i32>(i32(WORLD_N)))) { continue; }
+    let r = shadowPeek(shadowPackCell(c, face), coarse);
+    if (r.y > 0.0) { if (SEAM_DBG == 14u) { gDbgFb = 0.5; } return r.x; }
+  }
+  if (FAR_SHADOW_CACHE) {
+    let r = farScPeekEither(farScPatchAt(1u, hp, face), false);
+    if (r.y > 0.0) { if (SEAM_DBG == 14u) { gDbgFb = 0.5; } return r.x; }
+  }
+  if (SEAM_DBG == 14u) { gDbgFb = 1.0; }
+  return 1.0;
+}
+
 fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
                 camDistFine : f32) -> f32 {
   rsAdd(RS_SC_TAPS, 1u);
@@ -8850,11 +9052,15 @@ fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
   // it, which only makes the staircase less visible, so face-on is the
   // conservative side.
   let patchPx = R.viewPx / (2.0 * R.tanHalfFov * m * max(camDistFine, 1.0));
+  // The patch the pixel is inside: the nearest read's tap, and where
+  // shadowCachedFallback starts climbing.
+  let nU = u32(min(floor(fu * m), m - 1.0));
+  let nV = u32(min(floor(fv * m), m - 1.0));
   if (patchPx < SHADOW_NEAREST_PX) {
     // Nearest: an integer coordinate makes the +1 taps' weights exactly zero,
     // and the loop below skips them.
-    u = min(floor(fu * m), m - 1.0);
-    v = min(floor(fv * m), m - 1.0);
+    u = f32(nU);
+    v = f32(nV);
     // ---- SUB-PIXEL PATCHES ARE POOLED (owner report 2026-10-08) ----
     // Where a patch is narrower than SHADOW_POOL_PX, adjacent pixels land on
     // DIFFERENT patches and most of a face's patches are sampled by nobody in
@@ -8864,13 +9070,15 @@ fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
     // SPARKLED while the camera moved (bug_reports/2026-10-08_19-45-11).
     // So the patch grid is coarsened in powers of two until a patch is about
     // a pixel wide, and every pixel of the coarse block reads ONE fine patch
-    // inside it (index `step * k + step / 2`, a real sub-patch, so the key,
+    // inside it (shadowPoolPick: a real sub-patch, so the key,
     // the request and the resolve are unchanged). A newly sampled patch is
     // then as rare as a newly visible pixel-sized piece of surface. What it
     // costs: a shadow edge here is quantised to 1.5-3 px instead of < 1 px,
     // and it REMOVES requests rather than adding any. A few ALU ops on
     // purpose: an 8-neighbour slot-peek on a miss was tried first and the
-    // next run sat in this file's driver compile for 40+ minutes.
+    // next run sat in this file's driver compile for 40+ minutes. (The miss
+    // fallback that exists now, shadowCachedFallback, probes through the
+    // plain-load find only -- no atomics, no claim loop.)
     //
     // PER AXIS AND FORESHORTENED, which is the opposite of `patchPx`'s
     // "face-on is conservative": for pooling it is the anti-conservative
@@ -8883,10 +9091,22 @@ fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
     let dv = dot(vec3f(tb), vd);
     let pxU = patchPx * sqrt(max(1.0 - du * du, 0.0));
     let pxV = patchPx * sqrt(max(1.0 - dv * dv, 0.0));
-    let stepU = min(exp2(ceil(log2(max(SHADOW_POOL_PX / max(pxU, 1e-6), 1.0)))), m);
-    let stepV = min(exp2(ceil(log2(max(SHADOW_POOL_PX / max(pxV, 1e-6), 1.0)))), m);
-    u = min(floor(u / stepU) * stepU + floor(stepU * 0.5), m - 1.0);
-    v = min(floor(v / stepV) * stepV + floor(stepV * 0.5), m - 1.0);
+    //
+    // THE POOLED PATCHES ARE NESTED (2026-10-14, ticket 2026-10-14_00-52-22):
+    // the patch a step-s block reads is also a patch every finer step reads.
+    // It used to be the block's centre, `s*k + s/2`, and those sets are
+    // DISJOINT from one step to the next ({1,3} at step 2, {2} at step 4), so
+    // wherever ground crossed a step boundary -- a curve round the camera that
+    // translation drags across the ground -- every pixel on it needed a patch
+    // nobody had read: a one-frame miss in BOTH directions of travel, a 1 px
+    // dotted arc of full sun through every shadow. shadowPoolPick keeps one
+    // fixed low-bit pattern at every step, so stepping coarser always lands on
+    // a patch the finer step was already keeping warm, and stepping finer has
+    // the coarser patch to fall back on (shadowCachedFallback).
+    let stepU = shadowPoolStep(pxU, subdiv);
+    let stepV = shadowPoolStep(pxV, subdiv);
+    u = f32(shadowPoolPick(u32(u), stepU, subdiv));
+    v = f32(shadowPoolPick(u32(v), stepV, subdiv));
   }
   let i0 = i32(floor(u));
   let j0 = i32(floor(v));
@@ -8917,7 +9137,8 @@ fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
     acc += r.x * r.y * w;
     wsum += r.y * w;
   }
-  return select(1.0, acc / wsum, wsum > 1e-4);
+  if (wsum > 1e-4) { return acc / wsum; }
+  return shadowCachedFallback(hp, cell, face, ta, tb, nU, nV, subdiv, winLo);
 }
 
 // ============================================================================
@@ -16762,13 +16983,11 @@ fn fs(in : VSOut) -> FSOut {
           // so that is the patch that answers for all its grains.
           let grains = !isMicro && m.klass == CLASS_POWDER &&
                        powderIsPartial(h.word);
-          if (SEAM_DBG == 14u) { gDbgSc = vec4f(0.0); }
+          if (SEAM_DBG == 14u) { gDbgSc = vec4f(0.0); gDbgFb = 0.0; }
           sh = shadowCached(hitP, h.cell, select(h.axis, 1, grains),
                             select(h.sgn, -1.0, grains), h.t);
           if (SEAM_DBG == 14u) {
-            gDbg = vec4f(select(0.0, 1.0, gDbgSc.x == 0.0), sh,
-                         select(select(0.0, 0.5, gDbgSc.z + gDbgSc.w > 0.0), 1.0,
-                                gDbgSc.y > 0.0), 1.0);
+            gDbg = vec4f(select(0.0, 1.0, gDbgFb == 1.0), sh, 0.5 + 0.5 * gDbgFb, 1.0);
           }
         } else {
           sh = sunShadowFar(hitP, n, h.t);
@@ -16922,7 +17141,7 @@ fn fs(in : VSOut) -> FSOut {
       // THIS IS THE ONLY INJECTION PATH WITH NO MEASUREMENT BEHIND IT: the
       // openness walk and the resolve pass each cast a ray, while this one
       // records whatever the PIXEL happened to shade with -- including a
-      // shadow-cache MISS, which shades as full sun. What stops that becoming
+      // shadow-cache miss nothing answered (full sun). What stops that becoming
       // permanent daylight in a cave is shadowLiftCap refusing a full-sun
       // reading on a face that can see no sky (common.wgsl); `sun` below is
       // already zero there, so `outgoing` is the bounce alone. See the
