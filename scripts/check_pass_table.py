@@ -895,6 +895,12 @@ def module_for(fname):
     if not body:
         _module_cache[fname] = None
         return None
+    # The bodies AssembleShaderSource (gpu/resources.cpp) appends: worldgen's
+    # dungeon layer, and the one gather for its two hosts.
+    if fname == "worldgen.wgsl":
+        body += "\n" + (read(SHADERS / "worldgen_dungeon.wgsli") or "")
+    if fname in ("gi_gather.wgsl", "shadow_resolve.wgsl"):
+        body += "\n" + (read(SHADERS / "gi_gather_rays.wgsli") or "")
     # LoadShader prepends common.wgsl; the call graph spans both. It also keeps
     # exactly ONE of the WIND DRAFTS reader's two blocks (resources.cpp
     # BodyReadsDrafts): both define draftWord, and parse_module keeps the LAST

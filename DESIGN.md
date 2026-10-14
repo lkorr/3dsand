@@ -18476,10 +18476,31 @@ where you hear from either (§12b, "The ears are on the character").
     nothing here is hashed.
   - **Left open** (owner calls): (a) a one-voxel COAT on a surface -- a moss
     band, a crust on a ceiling, a flush trim -- is a colour, not a shape,
-    and still shows where a centre lands; a "paint" rule that takes an
-    exposed sub-sample's colour would change pristine terrain cells (cliff
-    strata against `farSurfaceMat`'s skin) unless the sieve evaluated it
-    over all terrain, so it is not done. (b) The procgen dungeon pass is
+    and still shows where a centre lands. **HANDOFF (2026-10-14, the coat
+    rule, designed, not built).** The rule: at level 1, a cell whose
+    material is far-solid takes the dominant far slot among its eight voxels
+    that are COATS -- far-solid, not loose, not cover, a slot other than the
+    cell's, with an open face neighbour and, opposite it, a far-solid
+    neighbour of another slot -- when two or more are. Over natural terrain
+    it is either redundant (a top skin is `farSurfaceMat`'s) or wrong for
+    agreement (the sieve would need four fine columns per cell everywhere),
+    so it is confined to where worldgen dresses surfaces, a zone every
+    producer can test from the same data: a dungeon's world box (DG_D_BOX /
+    DungeonDef::boxMin..boxMax) more than 12 voxels under the cell's centre
+    column's ground (keep boxes have no natural caves, so only the dungeon
+    carves surfaces there), and a stamp's template block above its pad.
+    Producers: fardownFeat (a pass after the thin pass, before the loose
+    top, which wins), FarEdits::Sweep (the loose top's guard must become
+    "the container did not claim", not "the material is unchanged"), a
+    StampCoat beside StampThin for the base, and `farcover`'s dungeon pass.
+    The last is the cost: the dungeon's moss bands and ore are SCATTER band
+    kinds, which `farDgCellSub` leaves out, so the pass would need the band
+    kinds back (cheap if the moss noise is tested before its six probes, and
+    the probes walk the culled list inside the level chunk) and would visit
+    every wall cell of a hall, not just the empty ones -- measure it on the
+    Shardwell flight before keeping it; `far-parity` would hold the zone's
+    coats to the rule over genChunk's voxels. Not done in the 2026-10-14
+    package for time. (b) The procgen dungeon pass is
     level 1 only and has no scatter (cost, measured above). (c) A thin cell
     patched by the base clears the surface map's VALID bit over its four
     sub-columns, as every patch does (`farpatch`), so the ground right
@@ -20658,6 +20679,48 @@ at 23-57-48 the mesa's blue-grey speckle is gone.
       (four times the gathers). Per face everywhere cost the outdoor cameras
       0.12-0.17 ms: a second find on a cold line for every hit on a slope
       steep enough to be partly buried.
+  - **Inside the residency window the far patch takes the NEAR gather**
+    (2026-10-14, ticket `2026-10-12_16-36-34`, "clear shadow differences on
+    the first lod seam"). Attributed at the ticket camera (the Shardwell, the
+    same pixels 10-19 m away shaded near and far: `SEAM_DBG` 15 for the
+    band, 2/3/4 for the terms, 1 for the material): openness 0 and no sun on
+    either side, albedo equal on quartzite and crystal, the far BOUNCE 4-5x
+    the near's on every material (the far frame's mean +8 luma, its bright
+    tail +50). Two causes, both radiance SOURCES:
+    - the near grid was too dark at emitters. raymarch.wgsl's P2 write-back
+      blended each pixel's `albedo x sun + bounce` into its block face, so
+      every frame a crystal (a glowcap, a candle, an ember) was on screen
+      its own pixels pulled its word toward a non-emissive surface, against
+      the resolve pass's and the walk's deposits, which both write
+      irrSample's `albedo x (sun + emission x emissiveStrength)`. The
+      write-back now carries the emission too (burnTint's mean, as the
+      deposits take it). Near bounce at the ticket camera 6.2 -> 11.0
+      (encoded x4); crystal faces' 26 -> 49.
+    - the cascade gather sent each hit cell's radiance from its MATERIAL
+      (whole emission, no deposits, no multi-bounce, a mean background), the
+      near gather what the grid holds. So `farGather` runs THE gather
+      (`gi_gather_rays.wgsli`, now one file appended to gi_gather.wgsl and
+      shadow_resolve.wgsl by AssembleShaderSource and check_shaders.sh) from
+      the patch centre over the real voxels whenever the patch is inside the
+      residency window -- which the first seam always is
+      (`render.lodHandoffDist` < the window's half extent). Far bounce
+      26.2 -> 8.5 against the near's 11.0; the cascade march stays outside
+      the window, where no near grid exists.
+    Together, the 10-19 m band at the ticket camera (final image luma, the
+    same 486k pixels near and far): before near 40.5 / far 48.4 mean (far
+    +7.9, median +1.0), after near 42.2 / far 40.3 (far -1.9, median -0.8);
+    midnight the same (+10.5 -> -2.9 mean). The far side is now slightly the
+    darker: a face only the far field draws has no write-back of its own
+    (no multi-bounce). `lod-seam` on the forest fixture, merged tree before
+    this vs after (part of it is 9058556's far-ground openness, merged in
+    the same step): ground in the open +9.5 -> +0.6 mean at noon, under a
+    canopy +4.5 -> +1.7, plants +6.4 -> -0.6; leaf and bark within 0.7.
+    `cave-window`, `cave-time`, `gi-bounce`, `glow`, `shadow-cache` pass.
+    Left: far timber / iron / plank are lighter than near (albedo, not
+    light): a MATF_TINTED material's dye lives in the voxel's state nibble
+    and the far byte carries only the slot, so a dyed beam is its base
+    colour past the seam (an owner call: dyed far slots, or a far tint
+    plane).
   - Storage: the bucket's `shadowHist` word, which a far patch never uses for
     a penumbra window. RGB9E5, low bit forced on, 0 = "not buried / none".
     Re-measured on the patch's first resolve and then every 16th, i.e. every

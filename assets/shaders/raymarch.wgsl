@@ -17520,7 +17520,20 @@ fn fs(in : VSOut) -> FSOut {
         // was. The displayed `bounce` keeps the full artistic giStrength.
         let carried = min(albedo * TUNE_GI_STRENGTH, vec3f(GI_TRANSPORT_GAIN_MAX)) *
                       (ao * gathered);
-        let outgoing = albedo * sun + carried;
+        // THE FACE'S OWN EMISSION GOES IN TOO (2026-10-14, ticket
+        // 2026-10-12_16-36-34: a crystal cave 4-6x brighter past the 20.5 m
+        // seam). The grid's other two writers deposit irrSample's law --
+        // albedo x (sun + emission x emissiveStrength), the resolve pass for
+        // every patch on screen and the walk for every face it visits -- and
+        // this one wrote albedo x sun + bounce, so every frame an EMITTER was
+        // on screen its own pixels blended its block-face word toward a
+        // non-emissive surface: crystals, glowcaps, candles and embers lit
+        // the near walls a fraction of what their deposits say. The far
+        // patch's gather (shadow_resolve.wgsl farGiRadiance) takes irrSample
+        // whole, which is why the cascade was the bright side. The MEAN of a
+        // burning cell's breath, as both deposits take it (burnTintMean).
+        let emisW = burnTint(m, albedo, f32(m.emission) / 255.0, burnTintMean()).emis;
+        let outgoing = albedo * (sun + vec3f(emisW * TUNE_EMISSIVE_STRENGTH)) + carried;
         irradiance[wi] =
             packRgb9e5(mix(unpackRgb9e5(irradiance[wi]), outgoing, TUNE_GI_FEEDBACK));
       }
