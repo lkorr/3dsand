@@ -2146,7 +2146,8 @@ function statLines(b) {
     el('div', { class: 'note' },
       `${st.worldH ?? '?'} voxels tall in the world · `,
       `${st.painted ?? '?'} voxels of art · `,
-      `stands ${sc ? sc.gait.rideHeight : '?'} off the ground · `,
+      (sc && !sc.gait ? 'on a serpent tail · '
+                      : `stands ${sc ? sc.gait.rideHeight : '?'} off the ground · `),
       `one walking stride ${sc ? sc.clips.walk.durationMs : '?'} ms`),
     // THE SHOULDER ROUND, said out loud. It is a rule that fires inside the
     // generator, it is the whole difference between a generated body and the

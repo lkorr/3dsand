@@ -64,16 +64,23 @@ export function retimeClip(clip, oldMs, newMs) {
   return clip;
 }
 
+/** A TOMBSTONE, `{name: X, remove: true}`: the patch deletes the base's
+ *  element X (sidecar.cpp IsTombstone has the argument). Never appended. */
+export const isTombstone = e =>
+  !!e && typeof e === 'object' && e.remove === true;
+
 function mergeNamedArray(target, patch, path) {
   const out = [];
   for (const base of target) {
     const over = findNamed(patch, base.name);
+    if (isTombstone(over)) continue;
     out.push(over ? mergePatch(base, over, `${path}/${base.name}`) : base);
   }
   // Unmatched names APPEND, after the base's own order — never displacing a
   // limb the save file counts on finding where it was.
   for (const p of patch)
-    if (!findNamed(target, p.name)) out.push(JSON.parse(JSON.stringify(p)));
+    if (!isTombstone(p) && !findNamed(target, p.name))
+      out.push(JSON.parse(JSON.stringify(p)));
   return out;
 }
 
@@ -274,20 +281,20 @@ function sameUpToKeyTimes(a, b, key = '', inTracks = false) {
 function diffNamedArray(base, target, path) {
   const baseNames = base.map(e => e.name);
   const targetNames = target.map(e => e.name);
-  // The merge appends unmatched names after the base's own order and can
-  // neither reorder nor remove. A body that needs either is not a variant of
-  // this base, and saying so here is better than writing a file that resolves
-  // into a different rig.
-  for (const n of baseNames)
-    if (!targetNames.includes(n))
-      throw new Error(`${path}: "${n}" is in the base and not in this body; ` +
-                      'the named-array merge cannot remove an element');
-  const kept = targetNames.filter(n => baseNames.includes(n));
-  if (kept.join(',') !== baseNames.join(','))
-    throw new Error(`${path}: this body reorders the base's elements ` +
-                    `(${kept.join(',')} vs ${baseNames.join(',')}); the ` +
-                    'named-array merge preserves base order and cannot');
+  // The merge appends unmatched names after the base's own order and cannot
+  // reorder. A body that needs that is not a variant of this base, and saying
+  // so here is better than writing a file that resolves into a different rig.
+  // It CAN remove: an element the base has and this body does not is a
+  // tombstone (isTombstone), emitted first.
   const out = [];
+  for (const n of baseNames)
+    if (!targetNames.includes(n)) out.push({ name: n, remove: true });
+  const kept = targetNames.filter(n => baseNames.includes(n));
+  const survivors = baseNames.filter(n => targetNames.includes(n));
+  if (kept.join(',') !== survivors.join(','))
+    throw new Error(`${path}: this body reorders the base's elements ` +
+                    `(${kept.join(',')} vs ${survivors.join(',')}); the ` +
+                    'named-array merge preserves base order and cannot');
   for (const el of target) {
     const b = base.find(e => e.name === el.name);
     if (!b) { out.push(clone(el)); continue; }        // appended: emit whole

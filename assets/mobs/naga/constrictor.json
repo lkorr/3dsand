@@ -1,0 +1,596 @@
+{
+  "//": "A CHARACTER, not a creature: constrictor extends naga, its race base, which extends human: the rig, loco states and clip library come from human, the race-wide traits (anatomy recipe, bleed, ...) from naga, and this file states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs constrictor --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
+  "extends": "naga",
+  "model": "constrictor",
+  "speed": 23.625,
+  "limbs": [
+    {
+      "name": "hips",
+      "hp": 454
+    },
+    {
+      "name": "torso",
+      "hp": 518,
+      "anchor": [
+        32,
+        90,
+        26
+      ]
+    },
+    {
+      "name": "head",
+      "hp": 169,
+      "anchor": [
+        32,
+        132,
+        26
+      ]
+    },
+    {
+      "name": "armU.L",
+      "hp": 244,
+      "anchor": [
+        56,
+        134,
+        26
+      ]
+    },
+    {
+      "name": "armL.L",
+      "hp": 199,
+      "anchor": [
+        56,
+        108,
+        26
+      ]
+    },
+    {
+      "name": "hand.L",
+      "hp": 73,
+      "anchor": [
+        56,
+        82,
+        26
+      ]
+    },
+    {
+      "name": "armU.R",
+      "hp": 244,
+      "anchor": [
+        8,
+        134,
+        26
+      ]
+    },
+    {
+      "name": "armL.R",
+      "hp": 199,
+      "anchor": [
+        8,
+        108,
+        26
+      ]
+    },
+    {
+      "name": "hand.R",
+      "hp": 73,
+      "anchor": [
+        8,
+        82,
+        26
+      ]
+    },
+    {
+      "name": "tail1",
+      "anchor": [
+        32,
+        72,
+        26
+      ]
+    },
+    {
+      "name": "tail2",
+      "anchor": [
+        32,
+        36,
+        26
+      ]
+    },
+    {
+      "name": "tail3",
+      "anchor": [
+        32,
+        15.9,
+        5.8
+      ]
+    },
+    {
+      "name": "tail4",
+      "hp": 59,
+      "anchor": [
+        32,
+        15.7,
+        -30.2
+      ]
+    },
+    {
+      "name": "tail5",
+      "hp": 58,
+      "anchor": [
+        32,
+        15.2,
+        -66.7
+      ]
+    },
+    {
+      "name": "tail6",
+      "hp": 56,
+      "anchor": [
+        32,
+        14.4,
+        -102.7
+      ]
+    },
+    {
+      "name": "tail7",
+      "anchor": [
+        32,
+        13.3,
+        -138.7
+      ]
+    },
+    {
+      "name": "tail8",
+      "anchor": [
+        32,
+        12,
+        -175.2
+      ]
+    },
+    {
+      "name": "tail9",
+      "anchor": [
+        32,
+        10.5,
+        -211.2
+      ]
+    },
+    {
+      "name": "tail10",
+      "anchor": [
+        32,
+        8.7,
+        -247.7
+      ]
+    },
+    {
+      "name": "tail11",
+      "hp": 26,
+      "anchor": [
+        32,
+        6.8,
+        -283.7
+      ]
+    },
+    {
+      "name": "tail12",
+      "hp": 19,
+      "anchor": [
+        32,
+        4.6,
+        -319.7
+      ]
+    }
+  ],
+  "sockets": [
+    {
+      "name": "held_right",
+      "offset": [
+        11,
+        76,
+        26
+      ]
+    }
+  ],
+  "natural": [
+    {
+      "name": "fist.L",
+      "edge": {
+        "from": [
+          6,
+          11.4,
+          6
+        ],
+        "to": [
+          6,
+          0.6,
+          6
+        ],
+        "halfWidth": 6
+      }
+    },
+    {
+      "name": "fist.R",
+      "edge": {
+        "from": [
+          6,
+          11.4,
+          6
+        ],
+        "to": [
+          6,
+          0.6,
+          6
+        ],
+        "halfWidth": 6
+      }
+    },
+    {
+      "name": "jaws",
+      "edge": {
+        "from": [
+          10,
+          15.2,
+          8
+        ],
+        "to": [
+          10,
+          11.2,
+          34
+        ]
+      },
+      "strike": {
+        "bite": 7.7
+      }
+    }
+  ],
+  "genome": {
+    "archetype": "humanoid",
+    "name": "constrictor",
+    "displayName": "Constrictor",
+    "body": {
+      "race": "naga",
+      "lower": "serpent",
+      "sex": "male",
+      "bust": 0,
+      "bra": {
+        "style": "classic",
+        "cover": 1,
+        "cupSize": 1,
+        "cupLift": 0,
+        "bridge": 0,
+        "bridgePos": 0.5,
+        "taper": 0,
+        "plunge": 0,
+        "bandPos": 0,
+        "band": 1,
+        "wrap": 0,
+        "straps": "classic",
+        "strapWidth": 0.75,
+        "strapSet": 0.45,
+        "tone": "cloth"
+      },
+      "briefs": {
+        "style": "shorts",
+        "rise": 0,
+        "band": 1,
+        "leg": 0,
+        "cut": 0,
+        "back": "full",
+        "tone": "cloth"
+      },
+      "heightM": 2.15,
+      "hipWidth": 14,
+      "shoulderWidth": 18,
+      "bodyDepth": 12,
+      "headWidth": 10,
+      "headDepth": 10,
+      "limbWidth": 6,
+      "footDepth": 7,
+      "stack": {
+        "foot": 4,
+        "shin": 13,
+        "thigh": 14,
+        "hips": 10,
+        "torso": 18,
+        "head": 16
+      },
+      "armStack": {
+        "upper": 11,
+        "fore": 11,
+        "hand": 5
+      },
+      "armLengths": 1
+    },
+    "shape": {
+      "waist": 0.96,
+      "chest": 1.2,
+      "shoulder": 1.2,
+      "chestDepth": 1.15,
+      "seat": 1,
+      "armGirth": 1.25,
+      "legGirth": 1,
+      "upperArm": 1,
+      "bicep": 0,
+      "deltoid": 0,
+      "foreArm": 1,
+      "forearmMuscle": 0
+    },
+    "head": {
+      "jaw": 1,
+      "cheek": 1,
+      "crown": 1,
+      "skullBack": 0.6
+    },
+    "face": {
+      "eyeDx": 2.5,
+      "eyeRow": 0,
+      "eyeCols": 1,
+      "mouthWidth": 2,
+      "mouthDrop": 3,
+      "brow": false,
+      "beard": 0,
+      "browHeight": 0,
+      "browInner": 1,
+      "browOuter": 0,
+      "browThick": 1,
+      "browTilt": 0,
+      "browArch": 0,
+      "browSparse": 0,
+      "browTone": "shade",
+      "browProud": false,
+      "mouthCurve": 0,
+      "mouthSkew": 0,
+      "mouthShift": 0,
+      "mouthOpen": 0,
+      "mouthTone": "shade",
+      "lips": 0,
+      "lipTone": "lit",
+      "lipLine": false,
+      "nose": 0,
+      "noseWidth": 1,
+      "earSize": 1,
+      "earPoint": false,
+      "eyeWhites": false,
+      "eyeBags": 0,
+      "cheeks": 0,
+      "freckles": 0,
+      "wrinkles": 0,
+      "scar": 0,
+      "beardStyle": "clean",
+      "beardLip": 0,
+      "beardChin": 0,
+      "beardJaw": 0,
+      "beardCheek": 0,
+      "beardSide": 0,
+      "beardWidth": 0,
+      "beardDensity": 1,
+      "beardRagged": 0.45,
+      "beardTone": "shade",
+      "beardLen": 0,
+      "beardPoint": 0,
+      "beardFork": false
+    },
+    "hair": {
+      "style": "bald",
+      "back": 99,
+      "front": 99,
+      "length": 0,
+      "knot": false,
+      "side": 0,
+      "band": 1,
+      "volume": 0,
+      "crest": 0,
+      "spikes": 0,
+      "buns": false,
+      "drop": 0,
+      "tail": 0,
+      "braid": false,
+      "twin": false,
+      "wisp": 0.35,
+      "ragged": 0.3,
+      "bangs": 0,
+      "faceThin": 0,
+      "hairlineSoft": 0,
+      "sideThin": 0,
+      "topThin": 0,
+      "fluff": 0,
+      "fuzz": 0,
+      "fuzzTop": 1,
+      "fuzzSide": 1,
+      "fuzzBack": 1,
+      "fuzzLow": 0.5,
+      "fuzzFray": 0.5
+    },
+    "colors": {
+      "skin": "#6e4a32",
+      "skinShade": "#4e321e",
+      "skinLight": "#8e664a",
+      "hair": "#4a3728",
+      "hairShade": "#33251a",
+      "eye": "#3ac860",
+      "cloth": "#7a6a4e",
+      "clothShade": "#5c4f39",
+      "nail": "#6a4a38",
+      "lip": "#4a2418",
+      "root": "#4a3a2b",
+      "moss": "#7f9a3e",
+      "branch": "#6b5540",
+      "flower": "#f2eee2",
+      "flowerEye": "#e8c34a",
+      "leaf2": "#a6c94a",
+      "leaf3": "#2f5a24",
+      "leaf4": "#7a5a2e",
+      "rivet": "#e8c060",
+      "pipe": "#b8673a",
+      "gear": "#7a5418",
+      "gearDark": "#2e2010",
+      "patina": "#5fa58a",
+      "glass": "#cfe6e0",
+      "fire": "#ff8a2a",
+      "joint": "#3a2a1e",
+      "light": "#6ae8ff",
+      "seam": "#5a6270",
+      "frame": "#6a727c",
+      "core": "#6ae8ff",
+      "visor": "#141a22",
+      "trace": "#2a8aa8",
+      "horn": "#d8ccb0",
+      "hornTip": "#8a7e66",
+      "claw": "#1a1412",
+      "mark": "#4a0e0c",
+      "pupil": "#0a120a",
+      "fang": "#f0ead8",
+      "gold": "#d8a838",
+      "scale": "#7a6a3a",
+      "scaleShade": "#584a26",
+      "pattern": "#33261a",
+      "belly": "#e2d6b2",
+      "fin": "#6a5a30"
+    },
+    "sylvan": {
+      "face": "hollow",
+      "crown": "leafy",
+      "glow": true,
+      "sockets": 0.65,
+      "eyeSize": 1,
+      "brow": 0.5,
+      "mouthHole": 0.3,
+      "snout": 0,
+      "warp": 0.35,
+      "grain": 0.6,
+      "knots": 0.3,
+      "roots": 0.55,
+      "rootTwist": 0.5,
+      "relief": 0.7,
+      "moss": 0.2,
+      "wrap": 0.45,
+      "wreath": 0.3,
+      "leaves": 0.55,
+      "leafSize": 0.5,
+      "branches": 0.2,
+      "branchLen": 0.4,
+      "branchFork": 0.5,
+      "branchStyle": "sprigs",
+      "shoulderBranches": 0,
+      "backBranches": 0,
+      "boughLen": 0.5,
+      "tufts": 0.6,
+      "flowers": 0.15,
+      "flowerSize": 0,
+      "leafMix": 0.35,
+      "leafPatch": 0.5,
+      "veil": 0
+    },
+    "automaton": {
+      "face": "lamp",
+      "glow": true,
+      "lens": 1,
+      "bezel": 0.5,
+      "eyeDepth": 0.4,
+      "grille": 0.5,
+      "jaw": 0.4,
+      "brow": 0.3,
+      "monocle": 0,
+      "porthole": 0,
+      "furnace": 0,
+      "cyclops": false,
+      "plates": 0.5,
+      "rivets": 0.6,
+      "gears": 0.4,
+      "pipes": 0.35,
+      "joints": 0.6,
+      "boiler": 0.6,
+      "gauge": 0.5,
+      "patina": 0.15,
+      "wear": 0.2,
+      "polish": 0.4,
+      "stack": "none",
+      "stackHead": 0,
+      "hat": 0,
+      "crest": 0,
+      "stackBack": 0,
+      "key": 0.6
+    },
+    "android": {
+      "face": "visor",
+      "glow": true,
+      "eyeSize": 1,
+      "visor": 0.6,
+      "faceplate": 0,
+      "mono": false,
+      "grille": 0,
+      "mouthLight": 0,
+      "seams": 0.5,
+      "human": 0,
+      "ears": 0.4,
+      "panels": 0.5,
+      "lights": 0.5,
+      "traces": 0.25,
+      "core": 0.6,
+      "joints": 0.6,
+      "twoTone": 0.3,
+      "sheen": 0.5,
+      "gear": "none",
+      "antenna": 0,
+      "fins": 0,
+      "packs": 0,
+      "halo": 0
+    },
+    "demon": {
+      "hornStyle": "goat",
+      "horns": 0.5,
+      "hornCurl": 0.5,
+      "hornSpread": 0.4,
+      "tail": 0.5,
+      "tailThick": 0.5,
+      "tailCurl": 0.5,
+      "tailTrail": 0.3,
+      "tailTip": "point",
+      "tailSway": 0.5,
+      "tailSpeed": 0.4,
+      "tailLag": 0.5,
+      "claws": 0.6,
+      "mottle": 0.35,
+      "glow": true,
+      "posture": "upright"
+    },
+    "naga": {
+      "kind": "python",
+      "eyes": "slit",
+      "glow": false,
+      "markings": "none",
+      "scaleCreep": 0.8,
+      "faceScales": 0.5,
+      "fangs": 0.2,
+      "venom": false,
+      "hood": 0,
+      "hoodWidth": 0.65,
+      "hoodMark": "spectacle",
+      "ears": "human",
+      "crest": 0,
+      "regalia": "none"
+    },
+    "serpent": {
+      "length": 2.1,
+      "girth": 0.85,
+      "taper": 0.55,
+      "flat": 0.3,
+      "pattern": "blotched",
+      "patternScale": 0.7,
+      "belly": 0.5,
+      "crest": 0,
+      "crestRun": 0.6,
+      "frills": 0,
+      "tip": "point",
+      "tipSize": 0.5,
+      "speed": 0.75,
+      "wave": 0.5,
+      "waveLength": 0.5,
+      "swim": "undulate",
+      "kick": 0.5,
+      "sway": 0.4,
+      "tipFlick": 0.5
+    }
+  }
+}

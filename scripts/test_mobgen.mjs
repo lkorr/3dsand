@@ -32,6 +32,7 @@ import { readVox } from '../assets/editor/vox.js';
 import * as mg from '../assets/editor/mobgen.js';
 import * as sc from '../assets/editor/sidecar.js';
 import * as SY from '../assets/editor/sylvan.js';
+import * as SE from '../assets/editor/serpent.js';
 import { listMobFiles, mobFile } from './mobfiles.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -1379,8 +1380,13 @@ section('M. every character on disk RESOLVES to the body its genome describes');
     // file, so `states` naming `crawl` has to keep meaning something.
     // A PREFIX: a race may append its own base posture AFTER the human's
     // ladder (demon.js extraStates, the hunch; section Q checks it is last).
-    const ds = diff(noNotes(resolved.states).slice(0, shippedStates.length).map(fillState),
-                    noNotes(shippedStates).map(fillState), `${name}.states`);
+    // A SERPENT below the hips (serpent.js) has the same ladder with its leg
+    // predicates re-stated for the tail and the two leg-only rungs gone.
+    const ladder = SE.isSerpent(mg.normalizeGenome(onDisk.genome))
+      ? SE.states(noNotes(shippedStates))
+      : shippedStates;
+    const ds = diff(noNotes(resolved.states).slice(0, ladder.length).map(fillState),
+                    noNotes(ladder).map(fillState), `${name}.states`);
     ok(!ds, `${name} inherits the shipped human’s locomotion ladder`, ds);
     const reachable = { ...clipLibrary(), ...resolved.clips };
     for (const st of resolved.states)
@@ -1913,6 +1919,133 @@ section('Q. the demon race: flesh on the SAME rig, its own height band');
     };
     const k0 = key(base);
     for (const spec of mg.GENE_SPECS.filter(sp => sp.race === 'demon' && !sp.kind)) {
+      const g = mg.normalizeGenome(base);
+      const v = mg.getPath(g, spec.path);
+      mg.setPath(g, spec.path, v > (spec.min + spec.max) / 2 ? spec.min : spec.max);
+      ok(key(g) !== k0, `${spec.path} changes the body`);
+    }
+  }
+}
+
+section('R. the naga: the human above the hips, a serpent tail below');
+{
+  const opts = { materials, player: tuning.player, avatar: avatarConstants() };
+  const NG = mg.RACE_MODS.naga;
+  ok(!!NG && NG.MACHINE === false && NG.LOWER === 'serpent',
+     'naga is a flesh race module born on the serpent lower body');
+  const sound = (label, g) => {
+    let b;
+    try { b = mg.generateMob(g, 0, opts); } catch (e) {
+      ok(false, `${label}: builds`, e.message);
+      return null;
+    }
+    const v = mg.validateMob(b);
+    ok(!v.length, `${label}: structurally sound`, v.join('; '));
+    return b;
+  };
+  // 1. THE UPPER BODY IS THE HUMAN'S: the same boxes, anchors (minus the
+  //    frame shift the tail's depth brings), sockets, arm chains and weapon
+  //    edges. The legs are GONE and the twelve tail parts are there, the ten
+  //    behind TRAILING (measured out of the body box) and in the slither.
+  for (const [label, human] of [['default', mg.defaultGenome()],
+                                ['brute', mg.presetGenome('brute')],
+                                ['random 11', mg.randomGenome(mg.makeRng(11))]]) {
+    const nag = mg.applyRace(mg.normalizeGenome(human), 'naga');
+    ok(nag.body.lower === 'serpent', `naga ${label}: on the serpent lower body`);
+    const a = mg.generateMob(human, 0, opts), b = sound(`naga ${label}`, nag);
+    if (!b) continue;
+    const upper = mg.ARCHETYPE.order.filter(n => !SE.LEG_PARTS.includes(n));
+    const box = r => Object.fromEntries(upper.map(n => [n, r.table.limbs[n]]));
+    ok(!diff(box(a), box(b), 'limbs'), `naga ${label}: the human's upper limb boxes`,
+       diff(box(a), box(b), 'limbs'));
+    const names = b.sidecar.limbs.map(l => l.name);
+    ok(SE.LEG_PARTS.every(n => !names.includes(n)), `naga ${label}: no legs`);
+    ok(SE.PARTS.every(n => names.includes(n)), `naga ${label}: all twelve tail parts`);
+    const trailing = b.sidecar.limbs.filter(l => l.trailing).map(l => l.name);
+    ok(trailing.join() === SE.TRAIL.join(), `naga ${label}: the trail, and only it, trails`,
+       trailing.join());
+    ok(b.sidecar.slither && b.sidecar.slither.upright &&
+       b.sidecar.slither.parts.join() === SE.TRAIL.join() && b.sidecar.slither.water,
+       `naga ${label}: an upright slither over the trail, with a water wave`);
+    ok(b.sidecar.gait === null, `naga ${label}: no gait (null deletes the human's)`);
+    ok(b.sidecar.chains.every(c => c.tag === 'arm') && b.sidecar.chains.length === 2,
+       `naga ${label}: the arm chains only`);
+    const tail = b.parts.filter(p => SE.PARTS.includes(p.name));
+    ok(Math.min(...tail.map(p => p.mn[2])) === 0, `naga ${label}: the tail lies on z = 0`);
+    const edges = r => r.sidecar.natural.map(n => ({ name: n.name, part: n.part }));
+    ok(!diff(edges(a), edges(b), 'natural'), `naga ${label}: the human's natural weapons`);
+    // Every swim stroke holds the rise and the trail's root straight, so the
+    // body lies in one line, and masks the rest of the trail to the wave.
+    for (const k of ['tread', 'swim', 'swim_back', 'swim_side', 'swim_side.mirror',
+                     'swim_up', 'swim_down']) {
+      const c = b.sidecar.clips[k];
+      ok(c && c.durationMs === 1600 && c.tracks.tail2 && c.tracks.tail3 &&
+         !c.mask.includes('tail4'),
+         `naga ${label}: ${k} straightens the tail and leaves the trail to the wave`);
+    }
+  }
+  // 2. A SERPENT TAIL IS NOT THE NAGA'S: a human and a sylvan grow one too.
+  for (const race of ['human', 'sylvan']) {
+    const g = race === 'human' ? mg.defaultGenome() : mg.applyRace(mg.defaultGenome(), 'sylvan');
+    g.body.lower = 'serpent';
+    const b = sound(`a ${race} on a serpent tail`, mg.normalizeGenome(g));
+    if (b) ok(b.sidecar.slither && !b.sidecar.limbs.some(l => l.name === 'legU.L'),
+              `a ${race} on a serpent tail has the tail and no legs`);
+  }
+  // 3. LEAVING THE RACE PUTS THE LEGS BACK.
+  {
+    const g = mg.applyRace(mg.defaultGenome(), 'naga');
+    mg.applyRace(g, 'human');
+    ok(g.body.lower === 'legs', 'a naga turned human stands on legs again');
+  }
+  // 4. EVERY PRESET AND EVERY KIND builds sound, bakes the human's inside,
+  //    bleeds blood, and is filed in assets/mobs/naga/.
+  for (const k of NG.PRESET_ORDER) {
+    const g = mg.presetGenome(k);
+    ok(g.body.race === 'naga', `${k} is a naga`);
+    const b = sound(k, g);
+    if (!b) continue;
+    const c = mg.bakeAnatomy(b, materials).census;
+    ok(c.skin > 0 && c.flesh > 0 && c.muscle > 0 && c.bone > 0 && c.brain > 0,
+       `${k}: the human's inside`, JSON.stringify(c));
+    ok(b.sidecar.bleed && b.sidecar.bleed.material === 'blood', `${k}: bleeds blood`);
+    ok(mg.raceFolder(g) === 'naga', `${k}: filed in assets/mobs/naga/`);
+    ok(!g.naga.venom || (b.sidecar.bite && b.sidecar.bite.infect === 'envenomed'),
+       `${k}: a venomous bite envenoms`);
+  }
+  for (const kind of NG.KIND_ORDER) {
+    const g = mg.applyRace(mg.defaultGenome(), 'naga');
+    NG.applyKind(g, kind);
+    sound(`kind ${kind}`, mg.normalizeGenome(g));
+  }
+  for (const tip of SE.TIPS)
+    for (const len of [0.8, 3]) {
+      const g = mg.applyRace(mg.defaultGenome(), 'naga');
+      Object.assign(g.serpent, { tip, length: len, tipSize: 1, crest: 1, frills: 1 });
+      sound(`tip ${tip} at length ${len}`, mg.normalizeGenome(g));
+    }
+  // 5. RANDOM NAGAS build sound (the Characters page's litter).
+  for (let seed = 1; seed <= 12; seed++)
+    sound(`random naga ${seed}`, mg.randomGenome(mg.makeRng(seed * 977), null,
+                                                 { race: 'naga' }));
+  // 6. GOLD IS PAINTED AS ITS STAND-IN and the recipe turns it back.
+  {
+    const g = mg.presetGenome('nagaraja');
+    const b = mg.generateMob(g, 0, opts);
+    ok(b.sidecar.anatomy.becomes && b.sidecar.anatomy.becomes.iron === 'gold',
+       'nagaraja: iron becomes gold at load', JSON.stringify(b.sidecar.anatomy.becomes));
+  }
+  // 7. THE NAGA GENES MOVE THE BODY (each, at the far end of its range).
+  {
+    const base = mg.applyRace(mg.defaultGenome(), 'naga');
+    const key = g => {
+      const b = mg.generateMob(g, 0, opts);
+      return b.parts.map(p => p.name + ':' + p.cells.map(c => c.join(',')).join(';')).join('|') +
+             JSON.stringify(b.sidecar);
+    };
+    const k0 = key(base);
+    for (const spec of mg.GENE_SPECS.filter(sp => (sp.race === 'naga' ||
+                                                   sp.lower === 'serpent') && !sp.kind)) {
       const g = mg.normalizeGenome(base);
       const v = mg.getPath(g, spec.path);
       mg.setPath(g, spec.path, v > (spec.min + spec.max) / 2 ? spec.min : spec.max);

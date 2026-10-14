@@ -958,6 +958,271 @@ Status GateStumpUnderwater(Ctx& c, std::string& detail) {
   return never && reaches && faster ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// THE NAGA (2026-10-13): gate `naga`. A person on a serpent's tail
+// (assets/editor/serpent.js; mob.h SlitherDef::upright) on land and in water.
+//
+//   A. ON LAND it SLITHERS: the `naga` base, on the dry site before the pool
+//      is stamped, chases a point across it. It travels (nagaLandMoveMin
+//      voxels in the window); the body stays UPRIGHT (the head over the hips
+//      by nagaUprightMin voxels at every sample, no lean); the TRAIL LIES ON
+//      THE GROUND (Mob::DrapeTail: the mean of the trailing segments' lowest
+//      voxel over the terrain under it within nagaTailClearMax, and none
+//      deeper than nagaTailSinkMax); and the trail holds an S (Mob::
+//      ApplySlither: its middle off the chord from tail3 to tail12 by
+//      nagaWaveMin voxels, in the model frame).
+//   B. IN WATER it SWIMS (MobSystem::CanSwimAfloat admits an upright tail):
+//      the `naga` base and the `merrow` (a sea naga) each spawned on the bed
+//      of the stamped pool and sent across it. Each swims (the stroke
+//      `swim` weight past 0.5), and the tail BEATS IN ITS OWN PLANE
+//      (MobDef::slitherWater): the cobra base undulates (slither.water axis
+//      yaw: the tip's side-to-side spread in the model frame beats its
+//      up-and-down), the merrow KICKS (axis pitch: the other way round), each
+//      by nagaPlaneRatio. The spreads are RMS about the tip's mean offset from
+//      the hips, in the model frame, so neither the heading nor the stroke's
+//      pitch enters them.
+//
+// Every number is in the detail. Ticks the world and regenerates it on the
+// way out.
+// ---------------------------------------------------------------------------
+Status GateNaga(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  MobSystem& mobs = c.mobs;
+  const uint32_t mStone = MatIdOf(c, "stone"), mWater = MatIdOf(c, "water");
+  const int dNaga = mobs.FindDef("naga"), dMerrow = mobs.FindDef("merrow");
+  if (!mStone || !mWater || dNaga < 0 || dMerrow < 0) {
+    detail = "missing stone / water / naga / merrow";
+    return Status::Fail;
+  }
+  const MobDef& nd = mobs.Defs()[dNaga];
+  if (!nd.slither.present || !nd.slither.upright || !nd.slitherWater.present) {
+    detail = "naga has no upright slither or no water wave";
+    return Status::Fail;
+  }
+  auto limbOf = [&](int def, const char* nm) {
+    const MobDef& d = mobs.Defs()[def];
+    for (size_t i = 0; i < d.limbs.size(); i++)
+      if (d.limbs[i].name == nm) return (int)i;
+    return -1;
+  };
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  mobs.Reset();
+  c.debris.Reset();
+
+  constexpr int R = 22, kDepth = 28;
+  IVec3 site{};
+  int hMin = 0, hMax = 0;
+  std::string siteWhy;
+  if (!PickDrySite(c, R, kDepth, site, hMin, hMax, siteWhy)) {
+    detail = "no dry, flat site: " + siteWhy;
+    return Status::Fail;
+  }
+  const int bedY = hMin - kDepth - 1;
+  const int waterTop = bedY + kDepth;
+  const int surfY = waterTop + 1;
+  const int wallTop = hMax + 2;
+  support::TickRig rig(c, 77000u, IVec3{site.x >> 4, hMax >> 4, site.z >> 4});
+  support::RunTicks(rig, 10);
+
+  // ======== A. ON LAND ========================================================
+  const Vec3 ns = nd.worldSize;
+  const int iHips = limbOf(dNaga, "hips"), iHead = limbOf(dNaga, "head");
+  std::vector<int> trail;
+  for (int pi : nd.slither.parts) trail.push_back(pi);
+  const int iT3 = trail.front(), iT12 = trail.back();
+  // Within the zombie's 34-voxel sight (behaviors.json), so it gives chase.
+  const Vec3 goal{(float)site.x + 13.0f, (float)hMax + 2.0f, (float)site.z + 0.5f};
+  mobs.SetPlayerActor(goal, 3.0f, 17.0f, true);
+  const uint64_t a = mobs.Spawn(dNaga, {ifloor(site.x - 14 - ns.x * 0.5f), hMax + 1,
+                                        ifloor(site.z - ns.z * 0.5f)});
+  if (a) mobs.SetMobBehavior(a, "zombie");
+  const int kLand = (int)BaselineNumber("nagaLandTicks", 150);
+  const int kWarm = 10;
+  float gap0 = -1, gapLow = 1e9f, uprightLow = 1e9f, clearWorst = 0, sinkLow = 1e9f,
+        waveMax = 0;
+  int samples = 0, targeted = 0, sinceStrike = 1000;
+  float speedPeak = 0;
+  std::string intents;
+  for (int i = 0; i < kLand; i++) {
+    support::RunTicks(rig, 1);
+    const Mob* m = mobs.FindMobById(a);
+    if (m == nullptr) break;
+    // Attribution, so a naga that does not move says why (rule 6).
+    speedPeak = std::max(speedPeak, m->SpeedNow());
+    if (const ai::Brain* br = mobs.MobBrain(a)) {
+      targeted += br->hasTarget ? 1 : 0;
+      const std::string in = ai::IntentName(br->intent);
+      if (intents.find(in) == std::string::npos) intents += (intents.empty() ? "" : ",") + in;
+    }
+    // How far it CLOSED on the point (the hips' column), the snake gate's way.
+    Vec3 hc{};
+    if (m->LimbCentreWorld(iHips, hc)) {
+      const float gap = std::hypot(hc.x - goal.x, hc.z - goal.z);
+      if (gap0 < 0) gap0 = gap;
+      gapLow = std::min(gapLow, gap);
+    }
+    // A blow, a leap and the ticks after one are not the slither: the claims
+    // below are about the body travelling (GateSnake's rule).
+    const NpcStroke* stroke = mobs.MobStroke(a);
+    const bool striking = (stroke != nullptr && stroke->Active()) || m->Airborne();
+    sinceStrike = striking ? 0 : sinceStrike + 1;
+    if (i < kWarm || i % 3 || sinceStrike <= 6) continue;
+    samples++;
+    uprightLow = std::min(uprightLow,
+                          m->PartModelPos(iHead).y - m->PartModelPos(iHips).y);
+    // The trail's lowest voxels over the terrain under each.
+    float sum = 0;
+    int n = 0;
+    for (int pi : trail) {
+      const uint32_t nv = mobs.LimbVoxelCount(a, pi);
+      float lo = 0;
+      Vec3 at{};
+      bool have = false;
+      for (uint32_t v = 0; v < nv; v += 3) {
+        const Vec3 p = mobs.LimbVoxelPos(a, pi, v);
+        if (!have || p.y < lo) { lo = p.y; at = p; have = true; }
+      }
+      if (!have) continue;
+      const float cl = lo - (float)(World::TerrainHeight(ifloor(at.x), ifloor(at.z),
+                                                         kDefaultSeed) + 1);
+      sum += cl;
+      n++;
+      sinkLow = std::min(sinkLow, cl);
+    }
+    if (n) clearWorst = std::max(clearWorst, std::fabs(sum / (float)n));
+    // The S: the trail's joints off the chord tail3 -> tail12, in x-z.
+    const Vec3 pa = m->PartModelPos(iT3), pb = m->PartModelPos(iT12);
+    const float cx = pb.x - pa.x, cz = pb.z - pa.z;
+    const float cl = std::sqrt(cx * cx + cz * cz);
+    if (cl > 1.0f)
+      for (int pi : trail) {
+        const Vec3 p = m->PartModelPos(pi);
+        waveMax = std::max(waveMax, std::fabs(((p.x - pa.x) * cz -
+                                               (p.z - pa.z) * cx) / cl));
+      }
+  }
+  const float moveMin = (float)BaselineNumber("nagaLandMoveMin", 10);
+  const float upMin = (float)BaselineNumber("nagaUprightMin", 5);
+  const float clearMax = (float)BaselineNumber("nagaTailClearMax", 1.5);
+  const float sinkMax = (float)BaselineNumber("nagaTailSinkMax", 2.0);
+  const float waveMin = (float)BaselineNumber("nagaWaveMin", 0.5);
+  const float moved = gap0 >= 0 ? gap0 - gapLow : 0.0f;
+  const bool aOk = a != 0 && samples > 0 && moved >= moveMin &&
+                   uprightLow >= upMin && clearWorst <= clearMax &&
+                   sinkLow >= -sinkMax && waveMax >= waveMin;
+  RecordObserved("nagaLandMoved", (double)moved);
+  RecordObserved("nagaTailClearWorst", (double)clearWorst);
+  RecordObserved("nagaWaveMax", (double)waveMax);
+
+  // ======== B. IN WATER =======================================================
+  mobs.Reset();
+  c.debris.Reset();
+  std::vector<CellOp> pool;
+  for (int x = site.x - R; x <= site.x + R; x++)
+    for (int z = site.z - R; z <= site.z + R; z++)
+      for (int y = bedY - 1; y <= wallTop + 30; y++) {
+        const IVec3 cc{x, y, z};
+        if (!c.world.CellInWindow(cc)) continue;
+        const bool wall = std::abs(x - site.x) >= R - 1 || std::abs(z - site.z) >= R - 1;
+        uint32_t w = PackVoxNew(0u, 0u);
+        if (y <= bedY || (wall && y <= wallTop)) w = PackVoxNew(mStone, 0u);
+        else if (y <= waterTop && !wall) w = (mWater & 0xFFFu) | (7u << 12);
+        pool.push_back({World::SlotCellIndex(cc), w});
+      }
+  for (size_t off = 0; off < pool.size(); off += 60000) {
+    const size_t n = std::min<size_t>(60000, pool.size() - off);
+    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) {
+      o.cells.assign(pool.begin() + (ptrdiff_t)off, pool.begin() + (ptrdiff_t)(off + n));
+    });
+  }
+  support::RunTicks(rig, 30);
+
+  struct Swim {
+    int swam = 0;
+    float crawl = 0, lat = 0, sag = 0, speed = 0;
+  };
+  const int kSwim = (int)BaselineNumber("nagaSwimTicks", 260);
+  auto swimAcross = [&](int def) {
+    Swim out;
+    mobs.Reset();
+    c.debris.Reset();
+    support::RunTicks(rig, 2);
+    const Vec3 ws = mobs.Defs()[def].worldSize;
+    mobs.SetPlayerActor(Vec3{(float)site.x + 12.0f, (float)surfY - 4.0f,
+                             (float)site.z + 0.5f}, 3.0f, 17.0f, true);
+    const uint64_t id = mobs.Spawn(def, {ifloor(site.x - 12 - ws.x * 0.5f), bedY + 1,
+                                         ifloor(site.z - ws.z * 0.5f)});
+    if (!id) return out;
+    mobs.SetMobBehavior(id, "zombie");
+    const MobDef& d = mobs.Defs()[def];
+    const std::vector<int>& ch = d.slither.parts;
+    double sx = 0, ss = 0;
+    int n = 0;
+    for (int i = 0; i < kSwim; i++) {
+      support::RunTicks(rig, 1);
+      const Mob* m = mobs.FindMobById(id);
+      if (m == nullptr) break;
+      if (!m->Swimming()) continue;
+      out.swam++;
+      out.crawl = std::max(out.crawl, m->Pose().swimW[1]);
+      out.speed = std::max(out.speed, m->SpeedNow());
+      // THE WAVE'S PLANE, in the tail's own frame: each middle joint's offset
+      // from the chord tail3 -> tip, split into ACROSS the body (model x made
+      // square to the chord) and IN its sagittal plane (the third axis). The
+      // body's pitch turns the chord, never the split. Stroking only.
+      if (m->Pose().swimW[1] < 0.5f) continue;
+      const Vec3 pa = m->PartModelPos(ch.front()), pb = m->PartModelPos(ch.back());
+      Vec3 cd = pb - pa;
+      const float cl = cd.len();
+      if (cl < 2.0f) continue;
+      cd = cd * (1.0f / cl);
+      Vec3 ex = Vec3{1, 0, 0} - cd * cd.x;
+      if (ex.len() < 0.3f) continue;
+      ex = ex.normalized();
+      const Vec3 es = cd.cross(ex);
+      for (size_t k = 2; k + 2 < ch.size(); k++) {
+        const Vec3 dd = m->PartModelPos(ch[k]) - pa;
+        const Vec3 perp = dd - cd * dd.dot(cd);
+        sx += (double)perp.dot(ex) * perp.dot(ex);
+        ss += (double)perp.dot(es) * perp.dot(es);
+        n++;
+      }
+    }
+    if (n < 8) return out;
+    out.lat = (float)std::sqrt(sx / n);
+    out.sag = (float)std::sqrt(ss / n);
+    return out;
+  };
+  const Swim sb = swimAcross(dNaga);
+  const Swim sm = swimAcross(dMerrow);
+  const float ratio = (float)BaselineNumber("nagaPlaneRatio", 1.3);
+  const bool bOk = sb.swam > 40 && sb.crawl >= 0.5f && sb.lat >= ratio * sb.sag &&
+                   sm.swam > 40 && sm.crawl >= 0.5f && sm.sag >= ratio * sm.lat;
+
+  mobs.Reset();
+  c.debris.Reset();
+  mobs.SetPlayerActor(Vec3{(float)site.x - 400.0f, (float)hMax + 400.0f, (float)site.z},
+                      3.0f, 17.0f, false);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  detail = Format(
+      "site %s | A slithers %s: moved %.1f (min %.1f) over %d samples [target %d/%d "
+      "ticks, intents %s, drive speed peak %.2f], head over hips "
+      ">= %.1f (min %.1f), trail clearance worst mean %.2f (max %.1f) deepest %.2f "
+      "(floor -%.1f), S off the chord %.2f (min %.2f) | B swims %s: base %d ticks "
+      "swimming, stroke %.2f, speed %.2f, tail bend across %.2f / in-plane %.2f "
+      "(undulates); merrow %d ticks, stroke %.2f, speed %.2f, across %.2f / in-plane "
+      "%.2f (kicks); ratio %.1f",
+      siteWhy.c_str(), aOk ? "PASS" : "FAIL", moved, moveMin, samples, targeted, kLand,
+      intents.c_str(), speedPeak, uprightLow,
+      upMin, clearWorst, clearMax, sinkLow, sinkMax, waveMax, waveMin,
+      bOk ? "PASS" : "FAIL", sb.swam, sb.crawl, sb.speed, sb.lat, sb.sag, sm.swam,
+      sm.crawl, sm.speed, sm.lat, sm.sag, ratio);
+  return aOk && bOk ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& AquaticGates() {
@@ -968,6 +1233,9 @@ const std::vector<Gate>& AquaticGates() {
       {"npc-swim", "mob", {}, false, GateNpcSwim, false},
       // An amputation under water bleeds on, at underwaterBleedRate x dry.
       {"stump-underwater", "mob", {}, false, GateStumpUnderwater, false},
+      // A person on a serpent's tail: slithers upright with the trail on the
+      // ground, swims, and its tail beats in its own plane (yaw / pitch).
+      {"naga", "mob", {}, false, GateNaga, false},
   };
   return g;
 }

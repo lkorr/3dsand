@@ -40,12 +40,26 @@ bool IsClipSlot(const std::string& path) {
   return path.find('/', 7) == std::string::npos;
 }
 
+// A TOMBSTONE: `{"name": X, "remove": true}` in a patch deletes the base's
+// element X (2026-10-13, the naga). The one thing rule 2 could not say, and
+// the thing a different BODY PLAN on an inherited rig needs: a serpent's tail
+// in place of the legs keeps the human's head, arms, sockets, fists and clips
+// and drops six limbs and the states that read them. The survivors keep the
+// base's order, so only the derived def's own positional indices move, and
+// a save is per def. A tombstone that names nothing is ignored, never
+// appended: it is an instruction, not an element.
+bool IsTombstone(const json* e) {
+  return e && e->is_object() && e->contains("remove") &&
+         (*e)["remove"].is_boolean() && (*e)["remove"].get<bool>();
+}
+
 void MergeNamedArray(json& target, const json& patch,
                      const std::string& path) {
   json out = json::array();
   for (const json& base : target) {
     const std::string nm = base["name"].get<std::string>();
     const json* over = FindNamed(patch, nm);
+    if (IsTombstone(over)) continue;
     json merged = base;
     if (over) MergePatch(merged, *over, path + "/" + nm);
     out.push_back(std::move(merged));
@@ -54,7 +68,8 @@ void MergeNamedArray(json& target, const json& patch,
   // a tail gets it at the end; it never displaces a limb the save file counts
   // on finding where it was.
   for (const json& p : patch)
-    if (!FindNamed(target, p["name"].get<std::string>())) out.push_back(p);
+    if (!IsTombstone(&p) && !FindNamed(target, p["name"].get<std::string>()))
+      out.push_back(p);
   target = std::move(out);
 }
 

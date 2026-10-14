@@ -1462,6 +1462,7 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
     ld.severable = l.value("severable", true);
     ld.vital = l.value("vital", false);
     ld.bloodless = l.value("bloodless", false);
+    ld.trailing = l.value("trailing", false);   // MobLimbDef::trailing
     ld.swingAmp = l.value("swingAmp", 0.0f);
     ld.swingPhase = l.value("swingPhase", 0.0f);
     ld.tag = l.value("tag", "");
@@ -1667,8 +1668,10 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
   // has one -- is untouched by construction, not merely because its lo
   // happens to come out zero.
   {
+    // ...and a TRAILING part (MobLimbDef::trailing, the naga's tail) is
+    // measured out the same way, so the body corner is the upright figure's.
     auto isHair = [](const MobLimbDef& ld) {
-      return ld.tag == "hair" || ld.bloodless;
+      return ld.tag == "hair" || ld.bloodless || ld.trailing;
     };
     bool hasHair = false;
     for (const MobLimbDef& ld : def.limbs) hasHair |= isHair(ld);
@@ -1940,13 +1943,31 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
         num("slip", sd.slip, 0.1f, 1.0f);
         num("ampIdle", sd.ampIdle, 0.0f, 1.0f);
         num("ampSpeed", sd.ampSpeed, 0.05f, 4.0f);
+        sd.upright = sj.value("upright", false);   // SlitherDef::upright
+        const std::string ax = sj.value("axis", std::string("yaw"));
+        if (ax != "yaw" && ax != "pitch")
+          log += jp + ": " + what + " axis \"" + ax +
+                 "\" is not yaw or pitch (yaw)\n";
+        sd.axis = ax == "pitch" ? 1 : 0;
         out = std::move(sd);
       } else {
         log += jp + ": " + what + " needs at least three parts laid along +Z\n";
       }
     };
-    if (j.contains("slither") && j["slither"].is_object())
+    if (j.contains("slither") && j["slither"].is_object()) {
       parseWave(j["slither"], "slither", def.slither);
+      // THE SAME TAIL IN WATER (MobDef::slitherWater): the slither block with
+      // `water`'s keys over it, so the chain and everything unstated carry.
+      const json& sj = j["slither"];
+      if (def.slither.present && sj.contains("water") &&
+          sj["water"].is_object()) {
+        json wj = sj;
+        wj.erase("water");
+        for (auto it = sj["water"].begin(); it != sj["water"].end(); ++it)
+          wj[it.key()] = it.value();
+        parseWave(wj, "slither.water", def.slitherWater);
+      }
+    }
 
     // ---- A BODY THE WATER CARRIES (mob.h MobDef::SwimDef) ----------------
     // Every number clamped to a range a body can have; an unknown key is
@@ -2371,7 +2392,10 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
       // Hair (tag "hair", or any bloodless limb) is measured out for the
       // same reason: a mane down the back is not how big the creature is.
       // The prefab was already re-origined on this same body set, above.
-      if (ld.tag == "prop" || ld.tag == "hair" || ld.bloodless) continue;
+      // A TRAILING part likewise (MobLimbDef::trailing): a tail lying behind
+      // an upright body is not its size.
+      if (ld.tag == "prop" || ld.tag == "hair" || ld.bloodless || ld.trailing)
+        continue;
       int mi = FindModel(def.prefab, ld.name);
       if (mi < 0) continue;
       const PrefabModel& m = def.prefab.models[mi];
@@ -4891,6 +4915,14 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
     restSoleY_ = any ? lowest : 0.0f;
     restHipY_ = any ? hipOfLowest : 0.0f;
     restFootAhead_ = any ? aheadOfLowest : 0.0f;
+    // AN UPRIGHT BODY ON A SERPENT'S TAIL STANDS ON THE TAIL (SlitherDef::
+    // upright): no leg chain, but its hips are held as high as a man's by the
+    // rise of the tail, and that is the span it can gather to climb a step --
+    // without it the step-up below clamps to one cell and a naga cannot take
+    // a stair a man walks up.
+    if (!any && def.slither.upright && def.rootLimb >= 0 &&
+        def.rootLimb < (int)def.skel.parts.size())
+      restHipY_ = std::max(0.0f, def.skel.parts[def.rootLimb].anchorLocal.y);
   }
 
   // ---- the terrain budgets, resolved ONCE per body -----------------------
@@ -5145,7 +5177,7 @@ Mob::Footing Mob::FootprintFooting(World& world, const MobDef& def, float cx,
   // (the far columns are where the slope is, not where it stands), and the
   // headroom is asked over each column's own ground. A real wall is still a
   // wall: it rises faster than the grade within a few voxels of the nose.
-  const bool lies = longBody && def.slither.present;
+  const bool lies = longBody && def.slither.present && !def.slither.upright;
   int colY[7][7];
   bool colOk[7][7] = {};
 
@@ -5758,7 +5790,9 @@ void Mob::ConformProneSegments(World& world, float dt) {
   // takes the grade between the supports under its own two ends, about its
   // own middle. A segment an OVERRIDE clip owns (the strike's coil, the cobra
   // stance) is draped by what is left of it, as ApplySlither yields its wave.
-  if (def_->slither.present) {
+  // (An UPRIGHT body's tail is Mob::DrapeTail's, and a prone one -- a naga
+  // crawling on its arms with the tail cut away -- lies like a man.)
+  if (def_->slither.present && !def_->slither.upright) {
     constexpr float kDrapeMaxDeg = 55.0f;
     constexpr float kDrapeMaxRelDeg = 38.0f;
     constexpr float kDrapeHalfLife = 0.07f;
@@ -6002,6 +6036,143 @@ void Mob::ConformProneSegments(World& world, float dt) {
   }
 }
 
+// ---- THE UPRIGHT BODY'S TAIL ON THE GROUND (2026-10-13, the naga) ----------
+//
+// MobDef::SlitherDef::upright. The snake's drape above lays a body that IS its
+// chain: it pitches the root to the grade, learns one clearance off the root's
+// middle and moves the whole body onto it, and bends every part it finds --
+// arms included. A naga is an upright figure with a chain BEHIND it: the root
+// (the hips) is held by the driver exactly where a man's would be, so nothing
+// here may lean it, lower it, or touch an arm. Only the chain is laid, front
+// to back, and each segment's far end goes to the support under its own far
+// half at ITS OWN rest clearance -- the next segment's joint height in the
+// rest pose, which is the belly-on-the-ground height of a tail that thins.
+// The bend between neighbours is capped (a step is a soft S) and eased, and a
+// segment an OVERRIDE clip holds (the sleeping coil, a swim stroke) is laid by
+// what is left of it, as ApplySlither yields its wave.
+void Mob::DrapeTail(World& world, float dt) {
+  const size_t n = std::min(limbs_.size(), anim_.model.size());
+  if (def_ == nullptr || n == 0 || skel_.parts.size() < n) return;
+  const MobDef::SlitherDef& sd = def_->slither;
+  if (!sd.present || !sd.upright) return;
+  tailDrape_.resize(n, 0.0f);
+  constexpr float kDeg = 0.0174532925f;
+  constexpr float kMaxDeg = 55.0f;
+  constexpr float kMaxRelDeg = 38.0f;
+  constexpr float kHalfLife = 0.07f;
+  const float kd = std::clamp(
+      1.0f - std::pow(0.5f, std::max(dt, 0.0f) / kHalfLife), 0.0f, 1.0f);
+
+  // SubmitPose's body frame, exactly (ConformProneSegments' arithmetic).
+  const Quat bodyRot = Mul(QuatFromTo(Vec3{0, 1, 0}, bodyUp_),
+                           AxisAngle(Vec3{0, 1, 0}, heading_));
+  const Quat invRot = QuatConj(bodyRot);
+  const Vec3 pivot{def_->worldSize.x * 0.5f, 0, def_->worldSize.z * 0.5f};
+  const Vec3 bodyOrigin{origin_.x, bodyY_, origin_.z};
+  auto toWorld = [&](Vec3 m) {
+    return bodyOrigin + pivot + Rotate(bodyRot, m - pivot);
+  };
+  auto segDir = [&](size_t i) {
+    const MobLimb& limb = limbs_[i];
+    const float inv = 1.0f / (float)PhysScaleOf(limb);
+    const Vec3 c{(float)limb.size.x * inv * 0.5f,
+                 (float)limb.size.y * inv * 0.5f,
+                 (float)limb.size.z * inv * 0.5f};
+    return Rotate(anim_.model[i].rot, c - limb.anchorLimb) * 2.0f;
+  };
+  auto slopeAngle = [](Vec3 d) {
+    const float run = std::sqrt(d.x * d.x + d.z * d.z);
+    return std::atan2(d.y, std::max(run, 1e-4f));
+  };
+  auto support = [&](Vec3 p, float yTop, float& out) {
+    int gy = 0;
+    if (!GroundHeightAt(world, ifloor(p.x), ifloor(p.z),
+                        ifloor(yTop) + kMobProbeLiftCells, gy))
+      return false;
+    out = (float)gy;
+    return true;
+  };
+  auto pivotTree = [&](size_t root, const Quat& q, Vec3 at) {
+    for (size_t j = 0; j < n; j++) {
+      bool inTree = j == root;
+      for (int a = skel_.parts[j].parent; !inTree && a >= 0;
+           a = skel_.parts[a].parent)
+        if ((size_t)a == root) inTree = true;
+      if (!inTree) continue;
+      anim_.model[j].rot = QuatNormalize(Mul(q, anim_.model[j].rot));
+      anim_.model[j].pos = at + Rotate(q, anim_.model[j].pos - at);
+    }
+  };
+  // + bend = far end up, about the horizontal axis across `dW`.
+  auto pitchQuat = [&](Vec3 dW, float bend) {
+    const float run = std::sqrt(dW.x * dW.x + dW.z * dW.z);
+    const Vec3 h{dW.x / run, 0, dW.z / run};
+    const Vec3 axisW = Vec3{0, 1, 0}.cross(h);
+    return AxisAngle(Rotate(invRot, axisW).normalized(), -bend);
+  };
+  // Override ownership per part (ApplySlither's `own`).
+  std::vector<float> drapeW(n, 1.0f);
+  for (const ClipInstance& inst : anim_.clips) {
+    if (inst.clip < 0 || inst.clip >= (int)skel_.clips.size()) continue;
+    const AnimClip& clip = skel_.clips[inst.clip];
+    if (clip.mode != ClipMode::Override) continue;
+    const float w = std::clamp(inst.weight * inst.fade, 0.0f, 1.0f);
+    if (w <= 0.0f) continue;
+    for (size_t i = 0; i < n; i++)
+      if (clip.mask.empty() || (i < clip.mask.size() && clip.mask[i]))
+        drapeW[i] = std::max(0.0f, drapeW[i] - w);
+  }
+  std::vector<Vec3> dir0(n);
+  for (size_t i = 0; i < n; i++) dir0[i] = Rotate(bodyRot, segDir(i));
+  std::vector<float> slopeNow(n, 0.0f);
+  std::vector<uint8_t> laid(n, 0);
+  for (size_t c = 0; c < sd.parts.size(); c++) {
+    const int pi = sd.parts[c];
+    if (pi < 0 || (size_t)pi >= n) continue;
+    const size_t i = (size_t)pi;
+    const MobLimb& limb = limbs_[i];
+    const int parent = skel_.parts[i].parent;
+    if (parent < 0 || !limb.body || limb.holdSeconds > 0 ||
+        (i < anim_.partAlive.size() && !anim_.partAlive[i]) ||
+        limb.size.x <= 0 || limb.size.y <= 0 || limb.size.z <= 0)
+      continue;
+    const Vec3 jointM = anim_.model[i].pos;
+    const Vec3 joint = toWorld(jointM);
+    const Vec3 d = Rotate(bodyRot, segDir(i));
+    const float run = std::sqrt(d.x * d.x + d.z * d.z);
+    const float len = d.len();
+    if (run < 0.3f || len < 1e-3f) continue;
+    // The far end's rest clearance: the next segment's joint height in the
+    // rest pose (the model floor is the ground the body stands on), or most
+    // of this one's for the tip.
+    const float clrFar =
+        c + 1 < sd.parts.size() && sd.parts[c + 1] >= 0 &&
+                (size_t)sd.parts[c + 1] < skel_.parts.size()
+            ? skel_.parts[(size_t)sd.parts[c + 1]].anchorLocal.y
+            : 0.6f * skel_.parts[i].anchorLocal.y;
+    float target = tailDrape_[i];
+    float sM = 0, sF = 0;
+    const float yTop = std::max(joint.y, joint.y + d.y);
+    if (support(joint + d * 0.5f, yTop, sM) && support(joint + d, yTop, sF)) {
+      const float dy = std::max(sM, sF) + clrFar - joint.y;
+      float want = std::asin(std::clamp(dy / len, -1.0f, 1.0f));
+      want = std::clamp(want, -kMaxDeg * kDeg, kMaxDeg * kDeg);
+      if (laid[(size_t)parent]) {
+        const float ps = slopeNow[(size_t)parent];
+        want = std::clamp(want, ps - kMaxRelDeg * kDeg, ps + kMaxRelDeg * kDeg);
+      }
+      target = (want - slopeAngle(dir0[i])) * drapeW[i];
+    }
+    tailDrape_[i] += (target - tailDrape_[i]) * kd;
+    const float inherited = slopeAngle(d) - slopeAngle(dir0[i]);
+    const float bend = tailDrape_[i] - inherited;
+    slopeNow[i] = slopeAngle(dir0[i]) + tailDrape_[i];
+    laid[i] = 1;
+    if (std::fabs(bend) < 1e-4f) continue;
+    pivotTree(i, pitchQuat(d, bend), jointM);
+  }
+}
+
 void Mob::PlayClip(const std::string& name) {
   PlayClipIndex(skel_.FindClip(name));
 }
@@ -6174,7 +6345,7 @@ MobSystem::GroundSense MobSystem::SenseGround(const Mob& mob, const MobDef& def,
     // reaches nine voxels past its middle, and a one-in-two staircase is four
     // steps up there: every probe ahead read as a wall, the forward drive was
     // refused, and it lay at the foot of the stairs approaching for ever.
-    const bool lies = def.slither.present;
+    const bool lies = def.slither.present && !def.slither.upright;
     s.clear[i] = (float)rise <= (float)s.stepUpCells +
                                     (lies ? kLieGrade * std::fabs(along) : 0.0f);
   }
