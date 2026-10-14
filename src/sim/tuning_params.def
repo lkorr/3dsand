@@ -2285,6 +2285,21 @@ TP_F(combatfx, hitReactPushFrac, NO_WGSL, 0.050f, 0.0f, 0.2f)
 TP_F(combatfx, hitReactLimbDeg, NO_WGSL, 22.0f, 0.0f, 45.0f)
 TP_F(combatfx, hitReactHalflife, NO_WGSL, 0.110f, 0.01f, 0.6f)
 TP_F(combatfx, hitReactImpulse, NO_WGSL, 5.0f, 0.0f, 200.0f)
+// ---- THE STAGGER (Mob::NoteStaggerHp, MobSystem::TickStagger) ------------
+// The feature the hitReact note above says it is not: a keyed recoil with a
+// recovery state the AI honours. The fractions are of the STRUCK LIMB's max
+// hp landed inside a short window (halved every tick); 0 staggers on any
+// blow, 1 needs the limb's whole hp in one go. The durations are floored at
+// a tenth of a second (a stagger that ends the tick it starts is a pop).
+TP_B(combatfx, stagger, NO_WGSL, true)
+TP_F(combatfx, staggerHeadFrac, NO_WGSL, 0.07f, 0.0f, 1.0f)
+TP_F(combatfx, staggerChestFrac, NO_WGSL, 0.05f, 0.0f, 1.0f)
+TP_F(combatfx, staggerHeadMs, NO_WGSL, 1100.0f, 100.0f, 4000.0f)
+TP_F(combatfx, staggerChestMs, NO_WGSL, 1000.0f, 100.0f, 4000.0f)
+TP_F(combatfx, staggerChestMoveScale, NO_WGSL, 0.2f, 0.0f, 1.0f)
+TP_F(combatfx, staggerBackstepMs, NO_WGSL, 320.0f, 0.0f, 1000.0f)
+TP_F(combatfx, staggerBackstep, NO_WGSL, 0.6f, 0.0f, 1.5f)
+TP_F(combatfx, staggerImmuneMs, NO_WGSL, 400.0f, 0.0f, 5000.0f)
 TP_F(combatfx, whooshVolume, NO_WGSL, 0.55f, 0.0f, 4.0f)
 TP_F(combatfx, whooshMinSpeed, NO_WGSL, 300.0f, 0.0f, 2000.0f)
 TP_F(combatfx, whooshRateSlow, NO_WGSL, 0.82f, 0.25f, 4.0f)

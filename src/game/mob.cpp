@@ -8300,6 +8300,9 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
       // A SPELL IN THE HAND (Mob::CastBusy): no swing through a cast. A
       // DRAWN BOW (Mob::BowDrawn) neither.
       if (mob.castBusy_ || mob.bowDraw_) out.attack = false;
+      // A STAGGERED BODY (Mob::StaggerNow) neither swings, casts nor looses:
+      // it is busy holding its head, or its belly.
+      if (mob.StaggerBlocksAttack()) out.attack = out.cast = out.shoot = false;
       if (out.attack && attacks_.size() < kMaxMobs * 2)
         attacks_.push_back(std::move(out.request));
       // D4: a cast request (game/demon_cast.h drains it after this phase).
@@ -9823,7 +9826,9 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       aiSteps_++;
       const size_t attacksBefore = attacks_.size();
       burnprof::Scope bpIntent(burnprof::kIntent);
+      StartStagger(mob, tick, dt);
       DecideIntent(mob, def, sense, tick, dt);
+      StaggerDrive(mob, tick, dt);
       bpIntent.Stop();
       // PERSONAL SPACE, between the intent and the steer. The AI has had its
       // say about where to go; this is the body declining to walk through
@@ -13623,6 +13628,7 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
                     (int)i, (double)amount, (int)ctx.cause);
       limb.hp -= amount;
       hpLostBy_[(int)ctx.cause] += amount;
+      NoteStaggerHp((int)i, amount, ctx.cause);
     }
     limb.woundLocal = RotateInv(q, hitWorldVoxel - limb.xf.pos);
     // ---- THE HIT FLASH ------------------------------------------------------
@@ -13703,8 +13709,11 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
       // it was the one clip every rig had. It reads as the victim throwing an
       // overhead swing with the right arm every single time anything touches
       // them, which is exactly as wrong as it sounds. The reaction to a blow is
-      // Mob::HitReact (the body rocks away from the blade); a rig that wants a
-      // keyframed recoil on top of that should name it, and none do yet.
+      // Mob::HitReact (the body rocks away from the blade). The KEYED recoil
+      // is the stagger: NoteStaggerHp above booked this blow's share, and a
+      // big enough one plays stagger_head / stagger_chest from the NPC
+      // driver's next tick (MobSystem::StartStagger) -- never from here, so
+      // the clip and the drive change start together.
       //
       // ...but the creature says so. Intensity is the fraction of THIS
       // limb's max hp removed, which is what the hurt slot documents: a
@@ -17719,6 +17728,7 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
                   (double)prevWeight, (double)nowWeight);
     limb.hp -= charge;
     hpLostBy_[(int)ctx.cause] += charge;
+    NoteStaggerHp(limbIndex, charge, ctx.cause);
   }
   // ---- ...AND AN ORGAN IS NOT A FRACTION OF ANYTHING -----------------------
   //
@@ -17746,6 +17756,7 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   if (lostOrgan > 0.0f && pol.chargesOrgan && alive_) {
     limb.hp -= lostOrgan;
     hpLostBy_[(int)ctx.cause] += lostOrgan;
+    NoteStaggerHp(limbIndex, lostOrgan, ctx.cause);
     limb.organHpTaken += lostOrgan;   // naming only (Mob::OrganDeathCause)
   }
   // ---- WHAT MAY BLEED, AND WHAT MAY NOT ------------------------------------
@@ -28032,6 +28043,8 @@ void Mob::Die() {
   weapon_ = WeaponPose{};
   swinging_ = false;
   hitReact_.live = false;
+  stagger_.kind = StaggerKind::None;
+  stagger_.headAcc = stagger_.chestAcc = 0.0f;
   aimLookValid_ = false;
   // The rig is still whole and still posed HERE (see Mob::OnDying).
   OnDying();
@@ -28135,6 +28148,8 @@ void Mob::EnterGhostDeath() {
   weapon_ = WeaponPose{};
   swinging_ = false;
   hitReact_.live = false;
+  stagger_.kind = StaggerKind::None;
+  stagger_.headAcc = stagger_.chestAcc = 0.0f;
   aimLookValid_ = false;
   // The death cry is presentation, and this machine's player is standing
   // there too. After `alive_` went false, as in Die(), so PushVoice refuses
@@ -34349,6 +34364,141 @@ void HitReactPump(SpringState& s, Vec3 v) {
 }
 
 }  // namespace
+
+// ============================================================================
+// THE STAGGER -- a blow you reel back from (mob.h Mob::NoteStaggerHp)
+// ============================================================================
+
+void Mob::NoteStaggerHp(int limbIndex, float hp, DamageCause cause) {
+  if (!alive_ || !(hp > 0.0f)) return;
+  // ANATOMY ONLY: a sword hit on a held blade, a cut through a robe or a dent
+  // in a helmet is not the head being hit (the helmet's share reaches the
+  // head as its own Damage, which counts).
+  if (limbIndex < 0 || limbIndex >= baseLimbs_ ||
+      limbIndex >= (int)limbDefs_.size())
+    return;
+  // BLOWS ONLY. Fire, rot, an infection, a shock, a fall and drowning all
+  // take hp; none of them is something a body reels back from.
+  switch (cause) {
+    case DamageCause::Blade:
+    case DamageCause::Blunt:
+    case DamageCause::Unarmed:
+    case DamageCause::Bite:
+    case DamageCause::Pierce:
+    case DamageCause::Beam:
+    case DamageCause::Blast:
+      break;
+    default:
+      return;
+  }
+  const MobLimbDef& ld = limbDefs_[limbIndex];
+  if (!(ld.hp > 0.0f)) return;
+  // THE SHARE OF THAT LIMB, so "a good chunk" scales with the creature. The
+  // rig's own tags say which part is which: `head`, and `spine` for the trunk
+  // (the human's torso and hips).
+  const float share = hp / ld.hp;
+  if (ld.tag == "head")
+    stagger_.headAcc += share;
+  else if (ld.tag == "spine")
+    stagger_.chestAcc += share;
+}
+
+void MobSystem::StartStagger(Mob& mob, uint32_t tick, float dt) {
+  using SK = Mob::StaggerKind;
+  Mob::StaggerState& st = mob.stagger_;
+  const Tuning::CombatFx& fx = CurrentTuning().combatfx;
+  if (st.kind != SK::None && tick >= st.endTick) st.kind = SK::None;
+  SK want = SK::None;
+  if (fx.stagger) {
+    if (st.headAcc > 0.0f && st.headAcc >= fx.staggerHeadFrac)
+      want = SK::Head;
+    else if (st.chestAcc > 0.0f && st.chestAcc >= fx.staggerChestFrac)
+      want = SK::Chest;
+  }
+  // THE WINDOW: halved every tick, so a cut that lands over three or four
+  // ticks sums to one blow and two blows a second apart do not.
+  st.headAcc *= 0.5f;
+  st.chestAcc *= 0.5f;
+  if (want == SK::None) return;
+  // A HEAD BLOW UPGRADES a trunk stagger whenever it lands; anything else
+  // waits out the live stagger and its guard (staggerImmuneMs).
+  const bool upgrade = st.kind != SK::None && st.kind < want;
+  if (!upgrade && (st.kind != SK::None || tick < st.immuneUntil)) return;
+  // Not while the water or Jolt holds the body: a swimmer has no floor to
+  // step back on and a ragdoll is not posed by clips.
+  if (mob.ragdoll_ != Mob::RagdollPhase::None || mob.swimming_) return;
+  const char* clip = want == SK::Head ? "stagger_head" : "stagger_chest";
+  // A HUMANOID: the clip compiled onto this rig AND the rig has the two hands
+  // the clip puts on the wound. The library compiles a clip onto any rig
+  // sharing even ONE part name with it (a file with no usable track is the
+  // only one skipped), so the clip alone would let a snake -- whose first
+  // part is called `head` -- reel back with nothing but its head keyed.
+  if (mob.skel_.FindClip(clip) < 0 || mob.skel_.FindPart("hand.L") < 0 ||
+      mob.skel_.FindPart("hand.R") < 0)
+    return;
+  if (upgrade) mob.StopClip("stagger_chest");
+  mob.PlayClip(clip);
+  const float step = std::max(dt, 1e-4f);
+  const float ms = want == SK::Head ? fx.staggerHeadMs : fx.staggerChestMs;
+  const uint32_t len =
+      std::max(1u, (uint32_t)std::ceil(ms * 0.001f / step));
+  st.kind = want;
+  st.startTick = tick;
+  st.endTick = tick + len;
+  st.immuneUntil =
+      st.endTick + (uint32_t)std::ceil(std::max(0.0f, fx.staggerImmuneMs) *
+                                       0.001f / step);
+  if (want == SK::Head) {
+    // The blow to the head ENDS the swing it caught: the arm goes to the
+    // head, not on through the cut. The shield comes down with it.
+    if (mob.stroke_.Active()) mob.stroke_.Reset();
+    mob.SetShieldWant(false);
+    st.startedHead++;
+  } else {
+    st.startedChest++;
+  }
+}
+
+void MobSystem::StaggerDrive(Mob& mob, uint32_t tick, float dt) {
+  using SK = Mob::StaggerKind;
+  const Mob::StaggerState& st = mob.stagger_;
+  if (st.kind == SK::None) return;
+  const Tuning::CombatFx& fx = CurrentTuning().combatfx;
+  const bool head = st.kind == SK::Head;
+  const float el = (float)(tick - st.startTick) * dt;
+  // THE STEP BACK: whatever the AI wanted, the body gives ground first -- a
+  // full step for the head, half of one for the trunk. Negative drive is the
+  // back-pedal the walk already knows (IntentOut::driveScale).
+  const float stepS = std::max(0.0f, fx.staggerBackstepMs) * 0.001f *
+                      (head ? 1.0f : 0.5f);
+  const float stepV = std::max(0.0f, fx.staggerBackstep) * (head ? 1.0f : 0.5f);
+  if (el < stepS) {
+    mob.driveScale_ = -stepV;
+    mob.driveStrafe_ = 0.0f;
+    if (head) mob.desiredHeading_ = mob.heading_;
+    return;
+  }
+  if (head) {
+    // ...then it stands where it reeled to, holding its head. No walk and no
+    // turn: it is not tracking anybody.
+    mob.driveScale_ = 0.0f;
+    mob.driveStrafe_ = 0.0f;
+    mob.desiredHeading_ = mob.heading_;
+    return;
+  }
+  // THE TRUNK: the walk the AI asked for, slowed to staggerChestMoveScale
+  // and held there for the first 60% of what is left, then eased back to
+  // full -- someone charging you checks, and comes on again.
+  const float total = (float)(st.endTick - st.startTick) * dt;
+  const float u =
+      std::clamp((el - stepS) / std::max(total - stepS, 1e-3f), 0.0f, 1.0f);
+  const float r = std::clamp((u - 0.6f) / 0.4f, 0.0f, 1.0f);
+  const float ease = r * r * (3.0f - 2.0f * r);
+  const float lo = std::clamp(fx.staggerChestMoveScale, 0.0f, 1.0f);
+  const float k = lo + (1.0f - lo) * ease;
+  mob.driveScale_ *= k;
+  mob.driveStrafe_ *= k;
+}
 
 void Mob::HitReact(int limbIndex, Vec3 dirWorld, float hp, float power) {
   const Tuning::CombatFx& fx = CurrentTuning().combatfx;

@@ -4059,6 +4059,40 @@ class Mob {
   // Is a reaction running? For the gates and the dev readout; also the one
   // thing `--shot-mob` can assert without reaching into the springs.
   bool HitReactLive() const { return hitReact_.live; }
+  // ---- THE STAGGER: A BLOW YOU REEL BACK FROM ------------------------------
+  //
+  // The hit reaction above is deliberately a flinch that moves nothing. This
+  // is the feature its note sets aside: a KEYED recoil with a recovery state
+  // the drive and the AI honour (Tuning::CombatFx stagger*).
+  //
+  //   Head  -- a real share of the head's hp: the swing in flight is dropped,
+  //            the body steps back and stands clutching its head, writhing
+  //            (assets/anims/stagger_head.json), no attack, no turn.
+  //   Chest -- the same on the torso or hips: a hunch with a hand on the
+  //            belly (stagger_chest.json), a small step back, and the walk at
+  //            staggerChestMoveScale easing back to full; no new attack.
+  //
+  // THE TRIGGER IS EVERY HP CHARGE, not one call site. A sword's strike and a
+  // mace come in through Damage, but an arrow, a spell bolt and a blast's
+  // crater charge hp through CarveLimb's volume and organ charges; each of
+  // those three calls NoteStaggerHp beside its hpLostBy_ booking. What it
+  // adds is the share of THAT LIMB's max hp, so "a good chunk" means the same
+  // on a goblin as on an ogre. The window is a decaying sum (halved per tick)
+  // because a cut lands over several ticks and is still one blow.
+  //
+  // ONLY THE NPC DRIVER ACTS ON IT (MobSystem::TickStagger): the avatar
+  // accumulates and nothing reads it. And ONLY A RIG THE CLIP COMPILED ONTO
+  // WITH TWO HANDS staggers (StartStagger): the library compiles a clip onto
+  // any rig sharing one part name with it, so a snake, whose first part is
+  // `head`, gets a head-only stagger_head -- and must never reel.
+  enum class StaggerKind : uint8_t { None = 0, Chest = 1, Head = 2 };
+  void NoteStaggerHp(int limbIndex, float hp, DamageCause cause);
+  StaggerKind StaggerNow() const { return stagger_.kind; }
+  // Is a stagger holding this body's attacks back this tick?
+  bool StaggerBlocksAttack() const { return stagger_.kind != StaggerKind::None; }
+  // Stagger counters for the gates (never reset; not hashed, not saved).
+  uint32_t StaggersHead() const { return stagger_.startedHead; }
+  uint32_t StaggersChest() const { return stagger_.startedChest; }
   // WHAT TO LOOK AT while not swinging, in world voxels. Set by the AI seam
   // each tick it has a target and cleared when it does not, so a creature that
   // loses sight of you stops staring through the wall.
@@ -5988,6 +6022,21 @@ class Mob {
     // one bool test per tick and not one spring step.
     bool live = false;
   } hitReact_;
+  // ---- the stagger (Mob::NoteStaggerHp / MobSystem::TickStagger) ---------
+  // `headAcc` / `chestAcc`: shares of the struck limb's max hp in the window,
+  // halved each tick by TickStagger. `startTick..endTick` is the live
+  // stagger; `immuneUntil` the re-stagger guard (Tuning staggerImmuneMs).
+  // Transient presentation-plus-drive state: a reload starts unstaggered.
+  struct StaggerState {
+    float headAcc = 0.0f;
+    float chestAcc = 0.0f;
+    StaggerKind kind = StaggerKind::None;
+    uint32_t startTick = 0;
+    uint32_t endTick = 0;
+    uint32_t immuneUntil = 0;
+    uint32_t startedHead = 0;
+    uint32_t startedChest = 0;
+  } stagger_;
   // ---- this body's terrain budgets, in CELLS (anim.h LocomotionDef) -------
   // Authored in metres per rig and resolved once in BuildRig. THE ONE COPY:
   // the walk drive's footprint collider, the 8-way sense fan, the freefall
@@ -7188,8 +7237,10 @@ class MobSystem {
   // Damage a limb by physics body handle (laser, explosions). Returns true
   // if the handle belonged to a live mob limb. Severs / kills at 0 hp, and a
   // hit whose impact speed (voxels/sec) exceeds the limb's severImpactSpeed
-  // severs regardless of remaining hp. Starts NO clip — the visible answer to
-  // a blow is HitReact below, not a keyframed pose. `ctx`: Mob::Damage.
+  // severs regardless of remaining hp. Starts NO clip itself — the visible
+  // answer to a blow is HitReact below — but a real share of a head's or a
+  // trunk's hp staggers an NPC on its next tick (Mob::NoteStaggerHp).
+  // `ctx`: Mob::Damage.
   bool Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
               float impactSpeed = 0.0f, const DamageCtx& ctx = {});
   // ONE TICK OF THE LASER ON A CREATURE (W2-H). One Mob::Damage of
@@ -9057,6 +9108,13 @@ class MobSystem {
                     uint32_t tick, float dt);
   // The AI's guard / feint requests, applied to the stroke (mob.cpp says how).
   void ApplyAiArm(Mob& mob, const MobDef& def, const ai::IntentOut& out);
+  // THE STAGGER, both halves (Mob::NoteStaggerHp). StartStagger runs BEFORE
+  // DecideIntent: it reads the hp window, starts or ends a stagger, plays the
+  // clip, and halves the window. StaggerDrive runs AFTER it (and before the
+  // crowd spacing, which only ever brakes): it overrides the AI's drive with
+  // the backstep and the slowed walk. The attack gate is in DecideIntent.
+  void StartStagger(Mob& mob, uint32_t tick, float dt);
+  void StaggerDrive(Mob& mob, uint32_t tick, float dt);
 
   // Close the gap between heading and desiredHeading at a bounded rate, and
   // report how well aligned the body now is (1 = facing the target, 0 = past

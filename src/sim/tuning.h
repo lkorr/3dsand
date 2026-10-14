@@ -2481,6 +2481,34 @@ struct Tuning {
     // so a blow off the centre of mass turns a body over instead of sliding
     // it. A human limb is ~3-8 kg, so 12 is roughly a 2-4 m/s kick.
     float hitReactImpulse = TPD(combatfx, hitReactImpulse);
+    // ---- the stagger (Mob::NoteStaggerHp, MobSystem::TickStagger) ---------
+    // A blow that lands a real share of a limb's hp on the HEAD or the TRUNK
+    // of a living NPC whose rig has the clips (stagger_head / stagger_chest in
+    // assets/anims -- a humanoid) plays a keyed recoil AND changes what the
+    // body does, which the hitReact spring above never may:
+    //   head  -> the stroke in flight is dropped, a backstep, then it stands
+    //            clutching its head for staggerHeadMs; no attack, no turn.
+    //   chest -> a short backstep, then the walk at staggerChestMoveScale
+    //            easing back to full over staggerChestMs; no new attack.
+    // Counted causes are BLOWS (blade, blunt, unarmed, bite, pierce, beam,
+    // blast) -- a burn or a shock is not something you reel back from.
+    bool stagger = TPD(combatfx, stagger);
+    // Share of the struck limb's max hp inside the window that staggers.
+    float staggerHeadFrac = TPD(combatfx, staggerHeadFrac);
+    float staggerChestFrac = TPD(combatfx, staggerChestFrac);
+    // How long each lasts (the clip is authored to about these lengths).
+    float staggerHeadMs = TPD(combatfx, staggerHeadMs);
+    float staggerChestMs = TPD(combatfx, staggerChestMs);
+    // The walk under a chest stagger at its start (it eases back to 1).
+    float staggerChestMoveScale = TPD(combatfx, staggerChestMoveScale);
+    // The step back: how long, and how fast as a share of the walk speed
+    // (a chest stagger takes half of each -- a smaller step).
+    float staggerBackstepMs = TPD(combatfx, staggerBackstepMs);
+    float staggerBackstep = TPD(combatfx, staggerBackstep);
+    // After a stagger ends, how long before another of the SAME OR LOWER rank
+    // may start: a hail of arrows does not lock a body in a recoil loop. A
+    // head blow during a chest stagger always upgrades it.
+    float staggerImmuneMs = TPD(combatfx, staggerImmuneMs);
     // ---- combat cues --------------------------------------------------------
     // Volumes are the same 0..N trim every other cue group uses; radius is the
     // audible radius in METRES, matching Tuning::Audio.

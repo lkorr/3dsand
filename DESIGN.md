@@ -15940,6 +15940,45 @@ first and at 6 a victim of a sword through the chest did not perceptibly move.
 can prove the body goes the right way and comes back, and cannot tell you that
 the amount is invisible.
 
+**The stagger is the feature the flinch is not** (2026-10-14;
+`Mob::NoteStaggerHp`, `MobSystem::StartStagger` / `StaggerDrive`,
+`combatfx.stagger*`, gate `stagger`). A blow that lands a real share of the
+STRUCK limb's max hp on a living NPC's head (`staggerHeadFrac`) or trunk
+(`staggerChestFrac`, the `spine`-tagged torso and hips) plays a keyed recoil
+and changes what the body does:
+
+- *Head* — the stroke in flight is dropped and the shield lowered, the body
+  steps back (`staggerBackstep` of the walk for `staggerBackstepMs`, the
+  walk's own back-pedal so the feet plant), then stands clutching its head and
+  writhing (`stagger_head.json`): no walk, no turn, no attack, cast or shot for
+  `staggerHeadMs`.
+- *Trunk* — a hunch with a palm on the belly (`stagger_chest.json`), half the
+  backstep, then the AI's own drive at `staggerChestMoveScale` easing back to
+  full over `staggerChestMs`; no new attack. A charging enemy checks and comes
+  on again.
+
+*The trigger is every hp charge, not one call site.* A sword's strike and a
+mace reach hp through `Mob::Damage`, but an arrow's channel, a spell bolt and
+a blast's crater charge it through `CarveLimb`'s volume and organ charges — so
+all three bookings call `NoteStaggerHp` next to `hpLostBy_`. It adds the share
+of that limb's own max hp into a window halved every tick (a cut lands over
+several ticks and is still one blow). Blows only: blade, blunt, unarmed, bite,
+pierce, beam, blast — fire, rot, infection, shock, a fall and drowning take hp
+and are not something a body reels from. Worn and held slots never count; a
+helmet's transmitted share reaches the head as its own `Damage`.
+
+*Humanoids only, by data.* The clips must have compiled onto the rig AND the
+rig must have `hand.L` and `hand.R`: the library compiles a clip onto any rig
+sharing one part name with it, and the snake's first part is `head`. Only the
+NPC driver acts on it; the avatar accumulates and nothing reads it.
+
+*Escalation and the guard.* A head blow during a trunk stagger upgrades it;
+anything else waits out the live stagger plus `staggerImmuneMs`, so a hail of
+arrows does not pin a body in a recoil loop. The state is transient (not saved,
+reset on death) and the clips are SOLVED from palm targets on the human rig by
+`scripts/gen_stagger_clips.py` (the archery solver's FK and limits) — edit the
+keys there, never the quaternions.
+
 ### Animation pipeline (2026-08-20; `game/anim`, docs/PLAN_voxel_editor.md §B)
 
 The single-sine limb swing became a layered pose pipeline. **All of it is

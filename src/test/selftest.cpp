@@ -134,6 +134,8 @@ const std::vector<Gate>& ClearingGates();
 const std::vector<Gate>& BugReportGates();
 // The swimmers (selftest_aquatic.cpp): a shark's hunt, a shoal, stranding.
 const std::vector<Gate>& AquaticGates();
+// The hit stagger (selftest_stagger.cpp): head / trunk blows on a walker.
+const std::vector<Gate>& StaggerGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -1318,6 +1320,9 @@ const char* const kOrder[] = {
     // against the rig's own idle wobble — so it goes where nothing else can
     // leave a body standing in its fixture.
     "hit-react",
+    // ...and the stagger beside it, by the same append rule: it spawns a
+    // walker four times and regenerates worldgen on the way out.
+    "stagger",
     // ...and `levitate` after it, by that same rule: it spawns TWO creatures
     // and lays one of them down, so it is the most disturbing member of the
     // group rather than the most easily disturbed.
@@ -1432,7 +1437,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(), &ItemStageGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &DungeonEntityGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates()})
+                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &DungeonEntityGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates(), &StaggerGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;
