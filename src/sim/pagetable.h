@@ -474,6 +474,35 @@ class PageTable {
     return slot < reachTick_.size() ? reachTick_[slot] : 0u;
   }
 
+  // ---- THE GEN CLASS (2026-10-14, ticket 2026-10-11_12-10-09) ------------
+  // Per slot: the sentinel entry that describes, bit-exactly, the words
+  // genChunk wrote into the chunk the slot now holds -- or kNoGenClass.
+  // Recorded by every gen path from a statement about the GEN words (the
+  // kernel's verdict, or a copy made before anything else ran): the whole-
+  // window worldgen (worldgen_run.cpp) and Stream's plane fills. Stream
+  // reads it at eviction (stream.h, THE PRISTINE SENTINEL) and owns the
+  // argument; it lives here because the table is the one per-slot record
+  // both gen paths already write. Derived, not hashed, not saved.
+  static constexpr uint32_t kNoGenClass = 0xFFFFFFFFu;
+  static constexpr uint32_t kGenClassBlocked = 0xFFFFFFFEu;
+  uint32_t GenClass(uint32_t slot) const {
+    return slot < genClass_.size() ? genClass_[slot] : kNoGenClass;
+  }
+  void NoteGenClass(uint32_t slot, uint32_t entry) {
+    if (genClass_.size() != kNumSlots) genClass_.assign(kNumSlots, kNoGenClass);
+    if (genClass_[slot] != kGenClassBlocked) genClass_[slot] = entry;
+  }
+  // The authored edit layer lands on this chunk after genChunk: re-entry is
+  // gen + layer, so no gen class may be recorded until the slot is refilled.
+  void BlockGenClass(uint32_t slot) {
+    if (genClass_.size() != kNumSlots) genClass_.assign(kNumSlots, kNoGenClass);
+    genClass_[slot] = kGenClassBlocked;
+  }
+  void ClearGenClass(uint32_t slot) {
+    if (slot < genClass_.size()) genClass_[slot] = kNoGenClass;
+  }
+  void ClearAllGenClass() { genClass_.assign(kNumSlots, kNoGenClass); }
+
   // Install a sentinel for a slot, freeing any page it held. Used by
   // worldgen's post-pass compaction and by streaming/LoadWorld classification.
   void SetSentinel(uint32_t slot, uint32_t entry);
@@ -785,6 +814,7 @@ class PageTable {
   // (marks). The bulk resets (ResetIdentity / ResetAllEmpty, which hand out
   // pages without going through either) stamp the whole array themselves.
   std::vector<uint32_t> reachTick_;
+  std::vector<uint32_t> genClass_;   // see GenClass
   void MarkReach(uint32_t slot) {
     if (slot < reachTick_.size()) reachTick_[slot] = tick_;
   }

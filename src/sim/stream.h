@@ -452,6 +452,23 @@ class Stream {
   struct Timing {
     double evictMs = 0;    // EvictSlots: RLE encode, store insert, copy encode
     double evictSolMs = 0; // ...of which EvictSolutes (the solute layer's batches)
+    // ...and EvictSlots itself, split (2026-10-14, ticket 2026-10-11_12-10-09:
+    // "eviction 3.1-3.3 ms" was a bare number). loop = the per-slot classify
+    // pass; of it, sent = the modified-sentinel RLE + exchange + store Put;
+    // acquire = staging buffers (may complete -- map-WAIT on -- the oldest
+    // pending batch, or create a 4 MiB buffer); submit = copy encode + queue
+    // submit + deferred map. Counts say what the leaving planes held.
+    double evictLoopMs = 0, evictSentMs = 0, evictAcquireMs = 0, evictSubmitMs = 0;
+    uint64_t evictCopied = 0;      // real pages copied out (GPU readback)
+    uint64_t evictSentStored = 0;  // modified sentinels RLE'd straight to the store
+    uint64_t evictSentJitter = 0;  // ...of which JITTER (a per-cell RLE, ~4k runs)
+    uint64_t evictSkipPristine = 0;// modified sentinels equal to their gen verdict: skipped
+    // ...and why the rest were not (attribution, CLAUDE.md rule 6): no record
+    // for the slot, or a record naming another entry; at record time, full
+    // gen chunks with a valid verdict recorded / refused by the reach clock.
+    uint64_t evictPristineNone = 0, evictPristineDiff = 0;
+    uint64_t pristineNoted = 0, pristineBlocked = 0;
+    uint64_t evictBatches = 0;     // staging batches issued
     double fillStoreMs = 0;// FillSlots' store-hit branch: decode + per-slot uploads
     double fillGenMs = 0;  // genList upload + EncodeGenList + submit
     double demoteMs = 0;   // the T+K completion: act set, sky demote, copy issue
@@ -466,6 +483,30 @@ class Stream {
     double dirtyFoldMs = 0;// the per-tick kNumChunks fold of snapshot dirty flags
     double totalMs = 0;    // the whole of Update, so the parts can be checked
     uint32_t shifts = 0;
+    // The slowest single shift's eviction, and how many shifts paid > 1 ms of
+    // it: a per-shift MEAN of an all-or-nothing cost hid that the "3.1-3.3 ms
+    // per shift" of the ticket flight was 8 startup shifts at 31-36 ms and
+    // 86 at ~0.01 (2026-10-14). Whole run; Minus leaves them alone.
+    double evictMaxMs = 0;
+    uint32_t evictSlowShifts = 0;
+    // This minus an earlier copy of itself: the costs of the shifts between
+    // the two (the --frames harness prints its stats window this way).
+    Timing Minus(const Timing& o) const {
+      Timing r = *this;
+      r.evictMs -= o.evictMs; r.evictSolMs -= o.evictSolMs;
+      r.evictLoopMs -= o.evictLoopMs; r.evictSentMs -= o.evictSentMs;
+      r.evictAcquireMs -= o.evictAcquireMs; r.evictSubmitMs -= o.evictSubmitMs;
+      r.evictCopied -= o.evictCopied; r.evictSentStored -= o.evictSentStored;
+      r.evictSentJitter -= o.evictSentJitter; r.evictSkipPristine -= o.evictSkipPristine;
+      r.evictPristineNone -= o.evictPristineNone; r.evictPristineDiff -= o.evictPristineDiff;
+      r.pristineNoted -= o.pristineNoted; r.pristineBlocked -= o.pristineBlocked;
+      r.evictBatches -= o.evictBatches; r.fillStoreMs -= o.fillStoreMs;
+      r.fillGenMs -= o.fillGenMs; r.demoteMs -= o.demoteMs;
+      r.wakeWaitMs -= o.wakeWaitMs; r.wakeWaits -= o.wakeWaits;
+      r.harvestMs -= o.harvestMs; r.dirtyFoldMs -= o.dirtyFoldMs;
+      r.totalMs -= o.totalMs; r.shifts -= o.shifts;
+      return r;
+    }
   };
   const Timing& Timings() const { return timing_; }
 
@@ -526,6 +567,10 @@ class Stream {
     uint32_t copyTick = 0;         // sim tick the copy was issued on
     uint32_t generation = 0;       // re-copies so far (HarvestDemotes' cap)
     bool revisit = false;          // issued by RevisitFullChunks (counted apart)
+    // The bytes ARE genChunk's: issued in the same tick as the gen submit,
+    // nothing queued between (ReloadWindow's synchronous path). The harvest
+    // records their class as the slot's pristine entry (THE PRISTINE SENTINEL).
+    bool genWords = false;
   };
 
   void ShiftAxis(int axis, int dir);
@@ -612,6 +657,54 @@ class Stream {
   FarPlumes farPlumes_;
   std::vector<uint8_t> blockerOf_;  // per material: stops a ray (occ high 16)
   std::vector<uint8_t> modified_;   // per slot, sticky since last recycle
+  // ---- THE PRISTINE SENTINEL (2026-10-14, ticket 2026-10-11_12-10-09) -----
+  // Per slot: the sentinel entry that describes, bit-exactly, the words
+  // genChunk wrote into it -- or none. Recorded at the deferred wake
+  // from the kernel's own verdict over those words (or the sky share's
+  // in-kernel nonAir == 0), whatever has happened to the slot since: the
+  // verdict is a statement about the GEN words, not the current ones.
+  //
+  // WHY THAT IS ENOUGH. A sentinel's content is a pure function of (entry,
+  // world chunk) -- SynthWordAt / RleEncodeSentinelChunk -- so a slot that is
+  // a sentinel EQUAL to its pristine entry at eviction holds exactly the gen
+  // words, which is exactly what re-entry reproduces (genChunk is a pure
+  // function of chunk and seed, and a gen slot has no store copy to prefer).
+  // How it got there does not matter: `modified_` is set by every dirty
+  // report, and the CA's wakes report chunks no cell of which ever changed
+  // (or that changed and settled back into the identical sentinel).
+  //
+  // THE ONE THING RE-ENTRY ADDS: the authored edit layer, applied as ops
+  // after genChunk (FillSlots, WorldEditLayer().QueueChunk). A chunk the
+  // layer covers re-enters as gen + layer, so its slot is blocked at fill
+  // and never recorded.
+  //
+  // A WHOLE-WINDOW FILL (ReloadWindow: load, teleport, the startup window)
+  // publishes no verdicts -- genChunk wakes in-kernel and genAct holds one
+  // plane -- so there the record comes from the demote pass's word copy,
+  // which that path issues in the same tick as the gen submit with nothing
+  // queued between: those bytes ARE the gen words (PendingDemote::genWords).
+  // That case is most of the measured cost: the startup window's chunks are
+  // all woken, hence all `modified_`, and the first 32 shifts away from a
+  // spawn evict ~220 JITTER chunks each.
+  //
+  // EvictSlots skips the matching slots instead of RLE-encoding a JITTER
+  // chunk (~37 us: 4,096 position hashes and ~4k runs) into the store and
+  // the chunk exchange: 74 chunks and 2.7-3.1 ms of every window shift on the
+  // ticket's flight. (The first cut also required the write-reach clock to
+  // prove "untouched since gen", the demote pass's test; it recorded 67
+  // slots a shift and refused 257, because a wake's Materialize stamps the
+  // clock without writing a cell -- and none of the 74 was among the 67.)
+  // Reset on every refill; never recorded for a store hit.
+  //
+  // STORED ON THE PAGE TABLE (PageTable::GenClass): the whole-window worldgen
+  // (worldgen_run.cpp SubmitWorldgen) records it too, from the verdicts it
+  // already reads back per batch -- the startup window is where most of the
+  // cost was, because every chunk in it is woken at load and so `modified_`.
+  // Paged residency only (a dense window has no sentinels to skip).
+  void NotePristine(uint32_t s, uint32_t entry);
+  void BlockPristine(uint32_t s);
+  void ClearPristine(uint32_t s);
+  uint32_t Pristine(uint32_t s) const;   // PageTable::kNoGenClass when none
   uint64_t layerWakesIgnored_ = 0;  // see LayerWakesIgnored()
   // M9.3-C run counters. Not hashed, not saved: they exist so the --frames
   // net report can say "4 applied, 1 refused" instead of a chunk quietly not
@@ -663,7 +756,8 @@ class Stream {
   // `generation` is how many times these slots have already been re-copied.
   void IssueDemoteCopies(const std::vector<uint32_t>& slots,
                          const std::vector<uint64_t>& keys, uint32_t tick,
-                         uint32_t generation = 0, bool revisit = false);
+                         uint32_t generation = 0, bool revisit = false,
+                         bool genWords = false);
   // Classify+demote every COMPLETED batch; never blocks. A slot that may have
   // been written since its copy is re-copied rather than trusted, a bounded
   // number of times (see the staleness note at the definition).

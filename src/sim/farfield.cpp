@@ -122,6 +122,22 @@ uint32_t FarField::PlaneQuota() const {
   return (uint32_t)std::min<uint64_t>(need, planeCap_);
 }
 
+bool FarField::CanDefer() const {
+  // PlaneQuota's arithmetic one tick later: every record must still land by
+  // its due with one tick fewer, at no more than the cap a tick.
+  uint64_t ahead = 0;
+  for (uint32_t k = 0; k < kFarLevels; k++) {
+    for (const PlaneRec& r : recs_[k]) {
+      if (r.axis < 0 && r.due == 0) return false;   // a reset: never defer
+      ahead += r.remaining;
+      if (r.due <= tick_ + 1) return false;         // due now or next tick
+      const uint64_t left = r.due - tick_ - 1;
+      if ((ahead + left - 1) / left > planeCap_) return false;
+    }
+  }
+  return true;
+}
+
 void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord,
                             const int skipSa[3], uint64_t due) {
   int m = (int)kFarNChunk - 1;
@@ -142,19 +158,28 @@ void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord,
   const int side = wcoord == oa + (int)kFarNChunk - 1 ? 1 : 0;
   planes_++;
   uint32_t n = 0;
-  // TWO PASSES: the plane's surface-map columns first, then the rest. The
-  // fill of a column's map has to land no later than any `farpatch` of that
-  // column (below), which column-contiguous order also gave; FIRST gives it
-  // and puts all of a plane's farMapFill work in its first slice, so the
-  // slices after it skip that pass's fixed latency (farfield.h PLANE PACING).
-  // A Z plane already ran its map row first; an X plane interleaved it.
+  // ONE PASS, COLUMN BY COLUMN: each level-chunk column's map entry (its
+  // slot-layer-0 entry) leads its own 32 entries. The fill of a column's map
+  // has to land no later than any `farpatch` of that column (below), and
+  // column order gives exactly that. So a plane's 32 surface-map columns
+  // ride its slices, ~8 per 256-entry slice, instead of all 32 in the first.
+  // (2026-10-14, ticket 2026-10-11_12-10-09.) They went FIRST on 2026-10-11,
+  // when every far tick paid `farmap`'s fixed latency whether it had a column
+  // or not; since the far passes dispatch only the workgroups that work
+  // (2026-10-13) a slice without a column costs nothing in `farMapFill`, and
+  // the first slice's 32 columns were the p99 left on the ticket's flight
+  // (farMapFill p50 6.7 ms on those slices; ~4.5 ms with 8 columns: the pass
+  // is latency-bound, one sub-column per thread). Measured with the stagger
+  // below, n=2 each, 595 flight frames: frames over 33 ms 5.4 / 3.9% ->
+  // 2.5 / 2.2%. SANDVOX_FARMAP_FIRST=1 is the A/B arm (the two-pass order).
   // Y INNERMOST for the X and Z planes (2026-10-11): a plane drains in slices
   // (PLANE PACING), and `far` shares one column prologue between the entries
   // of a level-chunk column that land in the same slice (worldgen.wgsl THE
   // COLUMN STACK). An X plane's `a` is already y; a Z plane's was x, which
   // put eight rows of 32 columns in a 256-entry slice instead of eight whole
   // columns. Order within a plane changes no byte.
-  for (int pass = 0; pass < 2; pass++)
+  static const bool spread = std::getenv("SANDVOX_FARMAP_FIRST") == nullptr;
+  for (int pass = 0; pass < (spread ? 1 : 2); pass++)
   for (int u = 0; u < (int)kFarNChunk; u++) {
     for (int v = 0; v < (int)kFarNChunk; v++) {
       const int a = axis == 2 ? u : v;
@@ -172,7 +197,7 @@ void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord,
       // lands no later than any `farpatch` of the same column (which clears
       // map entries over edited cells and must not be overwritten after).
       const bool mapFill = axis != 1 && s[1] == 0;
-      if (mapFill != (pass == 0)) continue;
+      if (!spread && mapFill != (pass == 0)) continue;
       // ---- A DIAGONAL STEP QUEUES THE CROSSING LINE ONCE -----------------
       // Two planes of one Update cross in a line of kFarNChunk slots. The
       // earlier plane already holds it, earlier in this level's FIFO, so its
@@ -361,7 +386,8 @@ float FarField::SafeRadiusMeters() const {
   return best;
 }
 
-float FarField::NearestValidFaceVox(uint32_t k, const float eyeVox[3]) const {
+float FarField::NearestValidFaceVox(uint32_t k, const float eyeVox[3],
+                                    int* axisSide) const {
   if (bulkPending_[k] > 0) return -1.0f;
   const float span = (float)(kChunk << (k + 1 + kFarShiftBase));   // one level chunk
   const int o[3] = {origins_[k].x, origins_[k].y, origins_[k].z};
@@ -369,7 +395,9 @@ float FarField::NearestValidFaceVox(uint32_t k, const float eyeVox[3]) const {
   for (int a = 0; a < 3; a++) {
     const float lo = (float)(o[a] + (int)faces_[k][a][0]) * span;
     const float hi = (float)(o[a] + (int)kFarNChunk - (int)faces_[k][a][1]) * span;
-    best = std::min(best, std::min(eyeVox[a] - lo, hi - eyeVox[a]));
+    const float dl = eyeVox[a] - lo, dh = hi - eyeVox[a];
+    if (dl < best) { best = dl; if (axisSide) *axisSide = a * 2; }
+    if (dh < best) { best = dh; if (axisSide) *axisSide = a * 2 + 1; }
   }
   return best;
 }
@@ -507,6 +535,26 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
   // Planes drain on their deadlines (PlaneQuota), not at the cap: the cap is
   // the most a tick may take, and spending it on a plane that had six more
   // ticks to land is the 100 ms flying hitch (farfield.h PLANE PACING).
+  // ---- THE STAGGER (2026-10-14, ticket 2026-10-11_12-10-09) --------------
+  // A tick that already carries a window shift — its genChunk plane in the
+  // same submit, ~5 ms of CPU on the frame — skips its plane slice when
+  // every queued plane can still make its due tick from the next one
+  // (CanDefer; farfield.h NoteShiftThisTick). The work moves one tick, the
+  // deadlines hold (measured: 0 breaches, at most 1-2 planes a run landing
+  // 1-2 ticks past due, still outside the handoff sphere), and the two
+  // biggest per-tick costs of flight stop landing on one frame. A reset never
+  // defers. Measured n=2 (with the map spread above): frames over 33 ms
+  // 5.4 / 3.9% -> 2.5 / 2.2%; stagger alone 2.7% in its one round.
+  // SANDVOX_FAR_NO_STAGGER=1 is the A/B arm.
+  static const bool stagger = std::getenv("SANDVOX_FAR_NO_STAGGER") == nullptr;
+  const bool shiftTick = shiftHint_;
+  shiftHint_ = false;
+  // Frame-gated callers only (the game loop, BeginFrame): a headless drain
+  // has no frame to protect, and the far gates keep their tick-exact drains.
+  if (stagger && frameGated_ && shiftTick && !bulk && CanDefer()) {
+    staggered_++;
+    return 0;
+  }
   const uint32_t cap = (uint32_t)std::min(
       PendingFills(), (size_t)(bulk ? bulkCap_ : PlaneQuota()));
   list_.clear();
@@ -587,6 +635,11 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
             faces_[r.level][r.axis][r.side] > 0) {
           faces_[r.level][r.axis][r.side]--;
           uboDirty_ = true;
+          landedPlanes_[k]++;
+          if (tick_ > r.due) {
+            latePlanes_[k]++;
+            worstLate_ = std::max(worstLate_, (uint32_t)(tick_ - r.due));
+          }
         }
         recs_[k].pop_front();
       }

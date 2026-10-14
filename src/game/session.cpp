@@ -1061,7 +1061,9 @@ static void PhaseB(TickAuthorityCtx& w, WorldScratch& ws,
         // A HARNESS PINS THE WINDOW (session.h section J): an empty interest
         // set is Stream::Update's own "no shift", and it still pays the
         // harvests and deferred wakes it owes.
+        const uint32_t shiftsBefore = stream.Timings().shifts;
         stream.Update(w.harness.pinWindow ? InterestSet{} : interest, tick);
+        if (stream.Timings().shifts != shiftsBefore) far.NoteShiftThisTick();
         // THE HORIZON ARRIVING. `far`/`fardown` compile on a background thread
         // (docs/PLAN_shader_compile.md package A) and this is the one place
         // that notices they landed. Nothing was recorded for the cascades

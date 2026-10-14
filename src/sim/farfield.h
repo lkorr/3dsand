@@ -115,6 +115,13 @@ class FarField {
   // selftest gates and the smokes already did.
   void BeginFrame() { frameGated_ = true; bulkThisFrame_ = false; }
 
+  // ---- STAGGER (2026-10-14, ticket 2026-10-11_12-10-09) -------------------
+  // The tick's caller says "a window shift happened this tick" (its worldgen
+  // is in the same submit); the next PrepareTick may then skip its plane
+  // slice if no plane's deadline needs it (CanDefer).
+  void NoteShiftThisTick() { shiftHint_ = true; }
+  uint64_t StaggeredTicks() const { return staggered_; }
+
   // Patch words uploaded by the last PrepareTick (diagnostics / selftest).
   uint32_t LastPatchWords() const { return lastPatchWords_; }
 
@@ -240,7 +247,19 @@ class FarField {
   // voxels, from `eyeVox` to level k's (0-based) nearest valid face, so the
   // harness can count the frames a seam would show at a given margin; < 0
   // when the level has no valid box (a reset in flight).
-  float NearestValidFaceVox(uint32_t k, const float eyeVox[3]) const;
+  // `axisSide` (optional) receives axis * 2 + side of that nearest face.
+  float NearestValidFaceVox(uint32_t k, const float eyeVox[3],
+                            int* axisSide = nullptr) const;
+  // Planes queued on one face of level k (0-based): what a breach is made of.
+  uint32_t FaceQueued(uint32_t k, int axis, int side) const {
+    return k < kFarLevels ? faces_[k][axis][side] : 0u;
+  }
+  // Planes whose LAST entry was dispatched after their due tick, per level,
+  // and the worst lateness in ticks (2026-10-14: a late plane is what pulls
+  // a valid face inside the handoff sphere).
+  uint64_t LatePlanes(uint32_t k) const { return k < kFarLevels ? latePlanes_[k] : 0u; }
+  uint64_t LandedPlanes(uint32_t k) const { return k < kFarLevels ? landedPlanes_[k] : 0u; }
+  uint32_t WorstLateTicks() const { return worstLate_; }
   // The sphere radius at margin `m`, fine voxels, for level k (0-based).
   static float HandoffSphereVox(uint32_t k, int m) {
     return (float)(((int)kFarNChunk / 2 - m) * (int)kChunk) *
@@ -272,6 +291,8 @@ class FarField {
   // Entries the play path pops this tick: the least that still lands every
   // queued plane by its due tick, never more than planeCap_.
   uint32_t PlaneQuota() const;
+  // Would every queued plane still land by its due if this tick took nothing?
+  bool CanDefer() const;
   void Enqueue(uint32_t k, uint32_t slot);           // queue + per-level counter
   // A direction reversal on `axis` makes the newest pending plane with slot
   // layer `sa` redundant: drop its remaining entries and release its face.
@@ -404,8 +425,11 @@ class FarField {
   // before the first entry. So the quota is never less than planeBatch_
   // (or what is queued): a plane goes out in four slices of 256, not seven
   // of ~150, and lands sooner, which is the direction the seam wants anyway.
-  // And X planes queue their surface-map columns FIRST (EnqueuePlane), so
-  // only a plane's first slice pays farMapFill. (`farcover` then went to four
+  // And X planes queued their surface-map columns FIRST (EnqueuePlane), so
+  // only a plane's first slice paid farMapFill -- until 2026-10-14, when the
+  // far passes no longer launched idle workgroups and those 32 columns in one
+  // slice were the flight's p99: they ride the slices column by column again
+  // (EnqueuePlane, ONE PASS). (`farcover` then went to four
   // lanes as well and its fixed cost fell to ~1.2 ms; Tuning::Render::
   // farPlaneBatch has the measured arms.)
   uint32_t planeBatch_ = 256;
@@ -431,10 +455,14 @@ class FarField {
   static inline uint32_t listHeadCount_ = 0;
   std::vector<uint32_t> listOut_;   // list_ then its map entries, one upload
   uint64_t mapColsLevel_[kFarLevels] = {};
+  uint64_t latePlanes_[kFarLevels] = {}, landedPlanes_[kFarLevels] = {};
+  uint32_t worstLate_ = 0;
   uint64_t reversalDrops_ = 0, edgeDedupes_ = 0;
   uint32_t worstGap_ = 0, worstGapLevel_ = 0;
   uint32_t planeCap_ = kPlayFillCap;
   bool frameGated_ = false;   // BeginFrame has been called at least once
+  bool shiftHint_ = false;    // NoteShiftThisTick, consumed by PrepareTick
+  uint64_t staggered_ = 0;
   bool bulkThisFrame_ = false;
   bool uboDirty_ = true;
   // THE farSig CLEAR (world.h farSig; worldgen.wgsl `fardown`'s skip). A sieve
