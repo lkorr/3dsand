@@ -4963,6 +4963,10 @@ struct Tuning {
     // detail. Trees, rocks, ruins and edits keep the 3D cells. 0 turns it off
     // everywhere (the A/B), which is what `--budget-arms norefine` does.
     int farRefineLevel = TPD(render, farRefineLevel);
+    // A refine candidate whose sub-column relief projects under this many
+    // pixels is drawn as one box at its true top (no 2x2 piece walk, no
+    // miss into the next cell). 0 = the piece walk everywhere.
+    float farRefineFlatPx = TPD(render, farRefineFlatPx);
 
     // ---- in-window LOD handoff (PLAN_surface_flight_perf.md A1) ----
     // Distance in METERS past which the PRIMARY march stops resolving fine

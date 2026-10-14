@@ -645,7 +645,13 @@ TP_I(render, farBlockerHitLevel, TUNE_FAR_BLOCKER_HIT_LEVEL, 0, 0, kFarLevels)
 // highest cascade level whose surface cells traceFar refines against the
 // map's 2x-resolution sub-columns. A level cap like the one above, so 0
 // (off: the plain centre-sampled cells, the feature's A/B) .. kFarLevels.
-TP_I(render, farRefineLevel, TUNE_FAR_REFINE_LEVEL, 2, 0, kFarLevels)
+TP_I(render, farRefineLevel, TUNE_FAR_REFINE_LEVEL, 6, 0, kFarLevels)
+// THE FLAT REFINE (2026-10-14): a refine candidate whose four sub-column tops
+// differ by less than this many PIXELS at the cell's distance is drawn as ONE
+// box at its true (tallest) top instead of the 2x2 piece walk: the relief
+// inside it is sub-pixel, and a single box never misses into the next cell.
+// 0 = always the piece walk (the A/B arm `noflat`).
+TP_F(render, farRefineFlatPx, TUNE_FAR_REFINE_FLAT_PX, 2.0f, 0.0f, 8.0f)
 
 // ---- gas voxel -> parcel crossfade (PLAN_gas_particles.md stage 1b) ----
 // The LOD handoff must not land in front of the near clip: a zero here

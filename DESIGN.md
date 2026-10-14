@@ -18032,6 +18032,37 @@ where you hear from either (§12b, "The ears are on the character").
   capped at `h - 10`, so caves never breach the surface and coarse center
   samples never land in a void — verified by rendering levels 4–6 with fog at
   3% of nominal, which shows solid terrain with no swiss-cheese.
+  **That held only on gentle ground (2026-10-14, `farCaveSealed`, worldgen.wgsl;
+  tickets `2026-10-13_23-57-48`, `_23-58-42`, `_23-59-16`).** The bands are
+  kept vlen(40) under the column's OWN ground. On a slope of s voxels per
+  voxel that is only 40/s voxels of rock horizontally. On the default map's
+  mesas (s ~ 14), a band-1 tube runs 3-6 voxels behind the cliff face for
+  hundreds of metres; a voxdump of the 23-59-16 wall shows it with the face
+  intact. A centre sample that landed in the tube made the cell AIR: a hole
+  through the face. Through it the ray met the tube's far wall, a cell the
+  surface map rightly calls 5 m under the terrain, so burial drew it near
+  black. That gave rows of dashes along every banded wall, at every level,
+  where the near field shows unbroken rock. Attributed with a per-pixel debug
+  frame: of the dark pixels, 90 % were unrefined side faces of cells wholly
+  under their own sub-column tops, with burial 1.
+  The sieve now fills an open-cave sample STONE when its cell lies within
+  two cells of the lowest ground round it. Two measures are taken:
+  - the four axis-neighbouring cells' sample columns (`colHeightAt`, once
+    per column in `far`'s prologue, only where a cave band is on), because
+    the hole is seen THROUGH a neighbouring cell;
+  - this column less `Col.slope` times a cell and a half, for the diagonals.
+  The slope term alone was not enough. It is a local gradient, blind to a
+  plateau LIP a cell away, and it left one row of dashes at the 23-58-42
+  camera: a band-2 tube 25 m under a plateau whose cliff began at the next
+  cell. An enclosed void is never visible from outside, and centre sampling
+  cannot draw a wall thinner than its cell. Deep caves, and every cave cell
+  more than two cells under the ground round it, are drawn as before, so a
+  player in a cave still sees its far end in the cascade. Cost: `far`
+  28,878 -> 29,013 SPIR-V instructions. The near field and genChunk are untouched (no hash
+  move). `fardown` / FarEdits redraw a changed chunk from its live voxels,
+  where an edit has opened the rock anyway. `far-parity` skips the ground
+  band, and on the harness map's gentle ground the rule does not reach
+  past it.
   **THE CONTAINER RULE (2026-10-07; worldgen.wgsl `farContainedBy`,
   faredits.h `kContainMaxShift` / `StampContainers`; gate `far-contain`).**
   The one exception to "a cell is its centre sample". Harrowby's quench trough
@@ -18321,7 +18352,7 @@ where you hear from either (§12b, "The ears are on the character").
     `fardown` / `farpatch` keep correct as before. What it gives up: an edited
     column shows the plain cascade cell until a pristine refill of it.
   - **Render** (raymarch.wgsl `farRefineCell`, in traceFar's cell loop, up to
-    `render.farRefineLevel`, shipped at 2, at 8 (every level) since 2026-10-14 — see below). A cell is a CANDIDATE when it is a
+    `render.farRefineLevel`, shipped at 2, at 6 since 2026-10-14 — see below). A cell is a CANDIDATE when it is a
     material cell or the flagged air directly over one (one byte read) — so the
     map is loaded for at most a couple of cells per ray, never for the cover-
     height rows of blocker flags the ray crossed on the way down. If its four
@@ -18371,18 +18402,51 @@ where you hear from either (§12b, "The ears are on the character").
     levels 3+ were 0.61 ms of the 4.44 ms cascade camera and nothing on the
     eye-height cameras. The surface MAP is still filled at every level: the
     shading reads it (heightfield normal, cover) wherever the refine does not.
-    **Since 2026-10-14 it refines EVERY level (`render.farRefineLevel` 8;
+    **Since 2026-10-14 it refines levels 1-6 (`render.farRefineLevel` 6;
     ticket `2026-10-14_00-03-23`).** The cap was right for the eye-height
     cameras and wrong from the air. From 150 m over a dune field, levels 3-6
     are the whole picture. Each level's centre samples quantise the ground to
     its cell height (0.8 / 1.6 / 3.2 / 6.4 m), so any relief shallower than
     a cell vanished at the level seam where the cell outgrew it. The owner
     saw "the lod seam between detailed desert and flattened terrain": fine
-    ripples out to the level 4/5 sphere, flat 3.2 m slabs past it.
-    Refined, every level draws its sub-columns at their true fine-voxel
-    heights, so the ripples run on to the horizon at the map's 2x
-    resolution, and the footprint fade averages them once a sub-column is
-    under ~2 px. The cost, measured 2026-10-14 (`--budget-cams cascade`, RTX 3060 Ti 1080p, not exclusive): raymarch 5.20 -> 6.43 ms (+1.23, 19%) against the level-2 cap; `refine2` is the arm that restores the cap.
+    ripples out to the level 4/5 sphere, flat 3.2 m slabs past it. Refined,
+    those levels draw their sub-columns at their true fine-voxel heights,
+    and the footprint fade averages them once a sub-column is under ~2 px.
+    **THE FLAT REFINE (`render.farRefineFlatPx`, 2 px).** A candidate whose
+    four sub-column tops differ by less than that many pixels at its
+    distance is ONE box up to its tallest top (raymarch.wgsl
+    `farRefineCell`'s `flat` arm). It keeps the true height, which is what
+    the refine is for past level 2, and drops the sub-pixel relief. Since
+    the quick miss already proved the ray reaches under that top inside the
+    cell, it always hits: no 2x2 piece walk, no miss into the next cell.
+    **Measured** 2026-10-14, exclusive lock, one process per row, RTX 3060 Ti
+    1080p, `--budget-cams cascade` (300 voxels up, half the frame far
+    field):
+    | refine | raymarch | refine cost |
+    |---|---|---|
+    | levels 1-2 (the old cap) | 7.22-7.29 ms | — |
+    | every level, piece walk everywhere | 8.49 ms | +1.21 ms |
+    | every level, flat refine at 1 px | 8.22 ms | |
+    | every level, flat refine at 2 px | 8.12 ms | |
+    | every level, flat refine at 8 px | 7.98 ms | |
+    | per level, at flat 1 px | | levels 3-4 +0.52, 5-6 +0.13, 7-8 +0.25 |
+    The `seam` camera (eye height) prices the whole refine past level 2 at
+    0.01 ms. So the shipped cut is levels 1-6 at 2 px. Levels 7-8 lie past
+    ~3.3 km, under the aerial fog, with cells of 12.8 / 25.6 m. As shipped
+    (same lock and process, the final `--verify` boot): cascade 7.17 ms
+    against 6.65 with the old cap. The refine now costs +0.52 ms (7.8 %),
+    down from +1.21 (19 %). `refine8` adds 0.40, `noflat` 0.34. On the seam
+    camera it is +0.12 ms.
+    Two cheaper-looking ideas measured as NOTHING, and are not in the code:
+    - skipping the far crease-AO taps where the shading LOD has already
+      faded the AO to 1;
+    - a one-cell slope stencil in place of `farSurfAt`'s four neighbour
+      loads.
+    Both moved the frame by under 0.05 ms. The refine's remaining cost is
+    divergence and traversal, not loads. A pixel-footprint cap does not
+    help either: the kFarN law keeps every level's cells 3.7-7.4 px wide at
+    1080p, so "refine only while a cell spans more than 1-2 px" is always
+    true.
   - **Gate** `far-surface`: after a full refill every sampled valid level-1
     entry equals `TerrainHeight` (or a fluid surface over it) and the sieve's
     cell holding that top wears the same far slot as the entry's skin; levels
