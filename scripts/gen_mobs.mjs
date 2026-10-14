@@ -287,7 +287,9 @@ function write(name, genome) {
   const s = built.stats;
   console.log(`${name}: ${s.worldH} world voxels, ${s.parts} parts, ` +
               `${s.painted} painted micro voxels, ` +
-              `rideHeight ${built.sidecar.gait.rideHeight}, ` +
+              (built.sidecar.gait
+                ? `rideHeight ${built.sidecar.gait.rideHeight}, `
+                : `a ${built.sidecar.slither ? 'serpent tail' : 'legless body'}, `) +
               `walk ${built.sidecar.clips.walk.durationMs} ms`);
   if (complaints.length) {
     // A refusal, not a warning. These are the failures a preview cannot show

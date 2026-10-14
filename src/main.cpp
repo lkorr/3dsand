@@ -4572,8 +4572,13 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   // def's own SIZE while it is alive: the dummy and critter are ~8 voxels tall
   // but a humanoid rig is ~28, and a constant distance either crops the tall
   // one or leaves the short one a speck.
+  // SANDVOX_SHOT_DIST=<voxels> overrides it: a close-up of a face, a hood,
+  // the scales of a tail.
+  const char* shotDistEnv = std::getenv("SANDVOX_SHOT_DIST");
   const float shotDist =
-      corpseSpread > 0.5f
+      shotDistEnv != nullptr && std::atof(shotDistEnv) > 1.0
+          ? (float)std::atof(shotDistEnv)
+      : corpseSpread > 0.5f
           ? std::max(14.0f, 3.2f * corpseSpread)
           : std::max(18.0f, 2.4f * std::max(def.worldSize.y,
                                             std::max(def.worldSize.x,
@@ -8155,7 +8160,14 @@ int main(int argc, char** argv) {
   // at whichever def is named by tuning.json player.model, so swapping
   // the player character is data, not code.  F5 re-reads it.
   std::string& avatarDefName = session.avatarDefName;
-  avatarDefName = CurrentTuning().player.model;
+  // SANDVOX_PLAYER_MODEL=<def> overrides it for one run without touching
+  // tuning.json (a look harness -- `--shot-swim` as a naga -- or a quick
+  // try of a body). Read here and on F5 alike, so a reload keeps it.
+  auto playerModel = []() {
+    const char* e = std::getenv("SANDVOX_PLAYER_MODEL");
+    return (e != nullptr && *e) ? std::string(e) : CurrentTuning().player.model;
+  };
+  avatarDefName = playerModel();
   PlayerAvatar& avatar = session.avatar;
   avatar.Init(&phys, &world, &debris, mats, &mobs);
   avatar.SetDefs(&mobs.Defs(), avatarDefName);
@@ -15044,7 +15056,7 @@ int main(int argc, char** argv) {
           ui.fStretch      = fr.fluidStretch;
           ui.fDensityShade = fr.fluidDensityShade;
         }
-        avatarDefName = CurrentTuning().player.model;
+        avatarDefName = playerModel();
         // The field overlay is reachable two ways and F5 is where they meet:
         // the tuning bools are the authored state and F4 cycles from there, so
         // reloading re-seeds the cycle rather than leaving the key and the

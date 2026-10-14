@@ -305,6 +305,11 @@ inline float HalfLifeK(float dt, float hl) {
 bool Mob::IsLegChain(const AnimSkeleton& sk, size_t c) {
   if (c >= sk.chains.size()) return false;
   if (sk.chains[c].tag == "leg") return true;
+  // A chain that SAYS what it is and is not a leg is not one (2026-10-13). The
+  // fallback below is for a legacy rig whose chains are untagged; a legless
+  // rig that keeps its tagged ARM chains (the naga, on a serpent's tail) had
+  // its arms handed the gait, the stride clock and the mantle's knee pose.
+  if (!sk.chains[c].tag.empty()) return false;
   for (const IkChain& ch : sk.chains)
     if (ch.tag == "leg") return false;
   return true;
@@ -963,8 +968,12 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   // `slither` block: one test on every other rig.
   // A SWIMMER'S WAVE IS THE SAME WAVE ON A CLOCK (MobDef::SwimDef::wave):
   // the driver asks for it (PoseInputs::swimWave), a slither body keeps its own.
+  // ...and a WALKER that swims on a tail kicks it with the tail's own water
+  // wave (MobDef::slitherWater: the naga's mermaid kick).
   if (in.swimWave && def.swim.wave.present)
     ApplySlither(def.swim.wave, in, dt);
+  else if (in.swim && def.slitherWater.present)
+    ApplySlither(def.slitherWater, in, dt);
   else if (def.slither.present)
     ApplySlither(def.slither, in, dt);
 
@@ -1268,6 +1277,11 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
       ConformProneSegments(world, dt);
     else
       proneConform_.clear();
+    // An upright body's tail lies on the ground behind it (Mob::DrapeTail),
+    // in every upright state; never in the water, where the kick owns it.
+    if (def.slither.upright && !in.swim &&
+        (loco == nullptr || loco->groundAlign <= 0.0f))
+      DrapeTail(world, dt);
   }
   if (!clipOwnsPose) proneConform_.clear();
   pose_.bodyPlaced = true;
@@ -1590,9 +1604,21 @@ void Mob::ApplySlither(const MobDef::SlitherDef& sd, const PoseInputs& in,
     const float parentYaw =
         (par >= 0 && inChain[(size_t)par]) ? yawAbs[(size_t)par] : 0.0f;
     const float delta = yawAbs[i] - parentYaw;
-    if (std::fabs(delta) > 1e-5f)
-      st.local[i].rot = QuatNormalize(
-          QuatMul(AxisAngle({0, 1, 0}, delta), st.local[i].rot));
+    // AN UPRIGHT BODY'S TAIL (SlitherDef::upright) turns in the segment's
+    // OWN frame, about its own up (yaw) or its own across (pitch): a clip
+    // that holds the tail in line under a swimming body carries the wave's
+    // plane with it, so a kick is up and down IN THE BODY, whatever way the
+    // stroke has pitched it. The snake keeps the parent-frame yaw it was
+    // tuned on.
+    if (std::fabs(delta) > 1e-5f) {
+      if (sd.upright)
+        st.local[i].rot = QuatNormalize(QuatMul(
+            st.local[i].rot,
+            AxisAngle(sd.axis == 1 ? Vec3{1, 0, 0} : Vec3{0, 1, 0}, delta)));
+      else
+        st.local[i].rot = QuatNormalize(
+            QuatMul(AxisAngle({0, 1, 0}, delta), st.local[i].rot));
+    }
     if ((int)i == def_->rootLimb)
       st.local[i].pos.x += own[i] * lateral(sd.sRootJoint);
   }

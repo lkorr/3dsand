@@ -34,6 +34,10 @@
 //    An array with even one unnamed element replaces wholesale, so `mask`,
 //    `groups`, `parts` and every coordinate triple keep the RFC rule.
 //
+//    A TOMBSTONE, `{"name": X, "remove": true}`, deletes the base's element X
+//    and is never appended (2026-10-13): a serpent body plan keeps the
+//    human's upper rig and drops its legs. Survivors keep base order.
+//
 // 3. CLIP RETIME. A clip patch carrying `durationMs` and NO `tracks` scales
 //    every inherited key time by new/old. Without it, the two-line override a
 //    thin character wants — `{"clips": {"walk": {"durationMs": 638}}}` —

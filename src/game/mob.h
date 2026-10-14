@@ -62,6 +62,14 @@ struct MobLimbDef {
   // through Mob::IsBloodless, which folds worn slots in (a garment is
   // bloodless too, by tag rather than by field).
   bool bloodless = false;
+  // A TRAILING part (2026-10-13, the naga's tail): flesh like any other, but
+  // MEASURED OUT of the creature's box like hair and props -- the prefab is
+  // re-origined on the rest of the body and `worldSize` leaves it out. A
+  // serpent's tail lying three metres behind an upright torso is not how big
+  // the creature is: counted, it puts the box centre (the turn pivot, the
+  // footing grid, the spawn centring) halfway down the tail. Laid on the
+  // ground by Mob::DrapeTail. Sidecar `trailing: true`.
+  bool trailing = false;
   Vec3 axis{1, 0, 0};          // hinge axis
   float minAngle = -1.2f, maxAngle = 1.2f;
   // ---- ball-joint (swing-twist) limits; see Physics::JointDesc ------------
@@ -760,8 +768,24 @@ struct MobDef {
     float slip = 0.7f;
     float ampIdle = 0.35f;
     float ampSpeed = 0.6f;
+    // ---- AN UPRIGHT BODY ON A SERPENT'S TAIL (2026-10-13, the naga) -------
+    // `upright`: the chain is a TAIL behind a body that stands -- the root is
+    // not in it and is never laid down. The wave turns each segment in ITS
+    // OWN frame (so a clip that holds the tail straight under a swimming
+    // body carries the wave with it), the tail is draped on the ground segment
+    // by segment with no lean of the body (Mob::DrapeTail), and the body
+    // swims like any walker (MobSystem::CanSwimAfloat).
+    // `axis`: 0 the wave is a YAW (side to side, a snake), 1 a PITCH (up and
+    // down in the body's own plane: a mermaid's kick, a dolphin's).
+    bool upright = false;
+    int axis = 0;
   };
   SlitherDef slither;
+  // THE SAME TAIL IN WATER (sidecar `slither.water`, 2026-10-13): a second
+  // wave over the slither's own chain, used while a walker swims
+  // (PoseInputs::swim). Normally on a clock (`beatHz`) and often a PITCH --
+  // the naga's mermaid kick. Every key it does not state is the slither's.
+  SlitherDef slitherWater;
   // ---- A BODY THE WATER CARRIES (MobSystem::DriveSwim; 2026-10-10) ---------
   //
   // Sidecar `swim`. A creature with this block is AQUATIC: while enough of it
@@ -4450,6 +4474,13 @@ class Mob {
   // segment ends up following its own ground. Presentation only; reset when
   // the body is not prone.
   void ConformProneSegments(World& world, float dt);
+  // THE UPRIGHT BODY'S TAIL ON THE GROUND (MobDef::SlitherDef::upright). Each
+  // segment of the slither chain, front to back, has its far end laid on the
+  // support under it at its own rest clearance (the belly on the ground), with
+  // the bend between neighbours capped -- the snake's drape without the root
+  // pitch, without the shared clearance and without touching anything that is
+  // not the tail. The body above it stays exactly as the driver placed it.
+  void DrapeTail(World& world, float dt);
   // LATERAL UNDULATION (MobDef::SlitherDef; game/pose.cpp). Writes a yaw per
   // segment of the def's `slither` chain into the PRE-FLATTEN locals, plus the
   // root's lateral offset, so the posed chain lies on a sine path that is
@@ -5739,6 +5770,7 @@ class Mob {
   // Per part, the eased pitch (radians, + = far end up) ConformProneSegments
   // is holding that segment at relative to the body plane.
   std::vector<float> proneConform_;
+  std::vector<float> tailDrape_;   // Mob::DrapeTail's eased bend per part
   // A SLITHER BODY'S LYING CLEARANCE (ConformProneSegments' drape): how high
   // the root's middle is drawn over its support, LEARNED while the root lies
   // on level ground and held everywhere else -- on a staircase the one fitted

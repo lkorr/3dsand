@@ -94,7 +94,11 @@ bool Engaged(ai::Intent it) {
 
 bool MobSystem::CanSwimAfloat(const Mob& mob, const MobDef& def) const {
   // The tread is the family's anchor (pose.cpp gates the whole family on it).
-  return !def.swim.present && !def.slither.present &&
+  // A body on a serpent's tail (SlitherDef::upright, the naga) is a walker
+  // that swims: its tail kicks with the slither's water wave, under the swim
+  // family's strokes. Only a body that IS its chain (the snake) is not.
+  return !def.swim.present &&
+         (!def.slither.present || def.slither.upright) &&
          mob.Pose().swimClip[0] >= 0;
 }
 

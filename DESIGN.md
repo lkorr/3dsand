@@ -10367,6 +10367,12 @@ implementation).
    replaces. Order preservation is load-bearing rather than tidy:
    `TopoSortLimbs`' output indexes the save file's positional limb records, so
    a merge that reordered limbs would misplace every saved mob's damage.
+   **A TOMBSTONE** (2026-10-13), `{"name": X, "remove": true}`, deletes the
+   base's element X and is never appended: a different BODY PLAN on an
+   inherited rig (the naga keeps the human's upper body and drops its six leg
+   limbs and two leg-only states). Survivors keep base order, so only the
+   derived def's own positional indices move, and a save is per def.
+   `sidecar.js diffAgainst` writes them for an element the body lacks.
 3. **Clip retime.** A clip patch carrying `durationMs` and NO `tracks` scales
    every inherited key time by new/old. Without it the two-line override a thin
    character wants — `{"clips": {"walk": {"durationMs": 638}}}` — changes the
@@ -15376,6 +15382,110 @@ depending on where I stand; it goes up a ramp as one inclined plank").**
   and 22% of the segments on the steps lie flat (< 9 degrees), 53% steep;
   the plank (`SANDVOX_PRONE_RIGID=1`) is 0% and 95%. `SANDVOX_DRAPE_DEBUG=1`
   prints each segment's joint, supports, wanted and achieved slope per tick.
+
+### The naga: a person on a serpent's tail (2026-10-13; `assets/editor/serpent.js`, `assets/editor/naga.js`, `assets/mobs/naga.*` + `assets/mobs/naga/`, `Mob::DrapeTail`, gate `naga`)
+
+The human above the hips, a serpent below. Two pieces, deliberately apart:
+
+- **The SERPENT is a LOWER-BODY PLAN, not a race** (`genome.body.lower`:
+  `legs` | `serpent`, `serpent.js`). It owns the tail's genes (length in body
+  heights, girth, taper, flatness, pattern and its spacing, belly scutes,
+  dorsal crest, side frills, the tip -- point / rattle / spade / fluke / fan /
+  club --, land speed, the slither's width and wave length, how it swims, the
+  idle sway and tip flick) and its five colours (art slots 213..209, written
+  into a palette only by a body that has the tail). Any race can be given one
+  -- `test_mobgen` R builds a human and a sylvan on it -- and the sidecar side
+  of a swap is a declarative patch (below), which is the seam a later
+  transformation spell would use.
+- **The NAGA is a race module** (`naga.js`, a `RACE_MODS` row, `LOWER =
+  'serpent'`, so `applyRace` puts the tail on and leaving the race puts the
+  legs back). It owns the upper half's look: slit / round / black eyes that
+  may give light, scales creeping up from the tail over the hips, spine,
+  flanks and forearms, scaled cheekbones and temples, fangs (the jaws bite
+  harder) and a venomous bite (`bite: {infect: envenomed, stain: venom}`, the
+  snake's), tear / mask / stripe / chevron markings, a cobra's hood (its own
+  fixed hair-mass part off the back of the neck, marked with spectacles, one
+  eye or bands), fin ears and a head crest, and gold (`bands`, `collar`,
+  `circlet`, `royal`; painted as `iron` and turned back into `gold` by the
+  anatomy `becomes` row, since `gold` is material 128). A KIND (cobra, viper,
+  python, coral, sea, jungle, royal, abyssal) is a picker that sets the tail,
+  the hood and the scale colours together. Presets: `nagaraja`, `merrow` (a
+  sea naga: fluke, fins, frills, a mermaid's kick), `sidewinder`,
+  `constrictor`, `coralline`, `abyssal`.
+
+**The rig.** The human's head, torso, arms, hands, sockets, natural weapons,
+arm IK chains and every upper-body clip, INHERITED: `naga.json` extends
+`human` and tombstones (rule 2, above) the six leg limbs and the two leg-only
+states, writes `gait: null` and replaces `chains` with the arm pair. Below the
+hips hang twelve parts: `tail1` (the WAIST, straight down, tagged `spine` so
+it shares the look and aim twist -- a naga turns at the waist), `tail2` (the
+RISE, 45 degrees down and back to the ground) and `tail3`..`tail12` (the
+TRAIL, lying behind). The shape is ONE SWEPT TUBE cut by arc length, so the
+pattern runs unbroken across every joint and a seam row is in both
+neighbours (no gap when a joint bends). Every armour piece above the waist and
+every weapon fits; leg armour has no limb to go on.
+
+**The trail is TRAILING** (sidecar `trailing: true`, `MobLimbDef::trailing`):
+measured OUT of the body box and the prefab re-origin exactly as hair is, so
+the creature's footing grid, pivot, spawn box, standing height and step-up are
+the upright figure's and not a four-metre snake's. Measured in, the box centre
+-- the turn pivot -- sat halfway down the tail.
+
+**The slither is `upright`** (`SlitherDef::upright`). The trail is the
+`slither` chain and the wave is the snake's odometer wave (`Mob::ApplySlither`),
+with two differences: each segment turns in ITS OWN frame (so a clip that
+holds the tail in line under a swimming body carries the wave's plane with
+it), and the tail is laid on the ground by `Mob::DrapeTail` instead of the
+snake's drape -- which pitched the ROOT to the grade, shared one clearance
+learned off the root's middle and bent every part it found, arms included.
+`DrapeTail` touches only the chain, front to back, laying each segment's far
+end on the support under it at ITS OWN rest clearance, with the snake's bend
+caps; the body above stays exactly where the driver put it. It runs in every
+upright state and never in water. A naga with no leg chain would have had a
+one-cell step-up (the cap is the rig's leg span); an upright tail's span is
+the root's rest height. `IsLegChain`'s legacy fallback now applies only to
+UNTAGGED chains: a legless rig keeping its tagged arm chains had its arms
+handed the gait, the stride clock and the mantle's knee pose.
+
+**In water it swims like a walker** (`MobSystem::CanSwimAfloat` admits an
+upright tail; the snake, a body that IS its chain, still does not) with its
+own swim family -- `tread`, `swim`, `swim_back`, `swim_side` (+ `.mirror`),
+`swim_up`, `swim_down`, generated in `serpent.js clips` -- in which every
+stroke holds `tail2` and `tail3` at -45 degrees: the rise in line with the
+waist and the trail in line with the rise, so the whole body is ONE LINE that
+the hips' stroke pitch (the human strokes' own 70.9 / 115 degrees, which
+`kSwimCrawlPitch` and the waterline shares are stated about) lays out along
+the stroke. The trail's own joints stay out of the strokes' masks and kick
+with `slither.water` (`MobDef::slitherWater`: the slither block with the
+water keys over it), on a CLOCK (`beatHz`, the fish's phase source) and on
+the axis the gene picks: `pitch`, a mermaid's dorsoventral kick, or `yaw`, a
+sea snake's undulation.
+
+**States** are the human's ladder re-predicated for the tail (same names and
+order, so the base is still a patch of the human's): `squirm` / `crawl` when
+the trail is gone (an army crawl on the arms, prone, where the generic prone
+conform lays it like a man), `limp` (clip `taillimp`) when half of it is,
+`sleep` coils (clip `coil`: the trail curls into a spiral, upright, the torso
+slumped over it), and an overlay `serpentsway` (the waist's sway and the tip's
+flick, always). `walk` / `run` are a carriage, not a stride: there is no leg
+to lock to, the wave is the gait.
+
+**Cost.** The tail is solid flesh like any limb: a naga's art is 2-7x a
+human's (the micro pool rose from 0.93M to 2.08M words with the base and six
+characters loaded, of 8.4M). `--shot-mob` frames by the body box, so
+`SANDVOX_SHOT_DIST=<voxels>` is there for close-ups.
+
+**Not yet playable.** `SANDVOX_PLAYER_MODEL=merrow --shot-swim` puts the
+player in one for a look harness, and the box it stands in is the upright
+figure's, so it mostly works -- but the avatar's capsule, jump (it needs a
+leg and a foot alive) and first-person tuning are a human's.
+
+**Gate `naga`**: on dry ground the base slithers upright (head over hips),
+its trail on the ground (mean clearance, deepest voxel) in an S off its own
+chord; in a stamped pool the base's tail undulates and the merrow's kicks,
+the wave's plane measured in the tail's own frame. `test_mobgen` section R:
+the upper body is the human's box for box, the legs are gone, the trail and
+only the trail trails, every preset / kind / tip / random roll is sound.
 
 ### Swimmers: the shark and the piranha (2026-10-10; `src/game/mob_swim.cpp`, sidecar `swim`, `ai::Intent::Orbit` / `Charge`, `scripts/gen_fish.mjs`, gate `aquatic`)
 

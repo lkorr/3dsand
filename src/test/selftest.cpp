@@ -1250,6 +1250,11 @@ const char* const kOrder[] = {
     // and climbs onto it, one dives for a point on the bed. Ticks the world
     // and regenerates it on the way out.
     "npc-swim",
+    // A naga (assets/editor/serpent.js): the `naga` base slithers across dry
+    // ground upright with its trail lying on it in an S, then it and the sea
+    // naga `merrow` swim a stamped pool, the base's tail undulating and the
+    // merrow's kicking. Ticks the world and regenerates it on the way out.
+    "naga",
     // An amputation under water bleeds on, at gore.underwaterBleedRate times
     // the same stump on the dry bank. Ticks the world and regenerates it on
     // the way out.

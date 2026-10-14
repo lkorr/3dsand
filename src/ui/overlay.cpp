@@ -1856,15 +1856,16 @@ void Overlay::DrawDevSpawn(UIState& s) {
       // stays an index into the FULL list (the spawn reads it that way); the
       // filtered view maps its rows back.
       // The machine races (automaton, android: assets/editor/automaton.js /
-      // android.js) each have their own button; "other" is everything else.
-      static const char* kRaces[] = {"all", "human", "sylvan", "automaton",
-                                     "android", "other"};
-      constexpr int kNamed = 6;
+      // android.js), the demons and the nagas (demon.js, naga.js) each have
+      // their own button; "other" is everything else.
+      static const char* kRaces[] = {"all",     "human", "sylvan", "automaton",
+                                     "android", "demon", "naga",   "other"};
+      constexpr int kNamed = 8;
       Caption("race");
       {
         const float w = CellWidth(3);
         for (int r = 0; r < kNamed; r++) {
-          // Two rows of three: a fourth on one line would not fit the panel.
+          // Rows of three: a fourth on one line would not fit the panel.
           if (r % 3) ImGui::SameLine();
           if (ToggleButton((std::string(kRaces[r]) + "##airace").c_str(),
                            s.aiRaceFilter == r, w, 22))

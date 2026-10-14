@@ -85,6 +85,8 @@ import * as SY from './sylvan.js';
 import * as AU from './automaton.js';
 import * as AN from './android.js';
 import * as DM from './demon.js';
+import * as NG from './naga.js';
+import * as SE from './serpent.js';
 
 /** THE MACHINE RACES (automaton.js, android.js), by race key. Everything such
  *  a race contributes reaches the generator through this table and ONE
@@ -93,13 +95,14 @@ import * as DM from './demon.js';
  *  made of (with stand-ins for ids a .vox cannot paint), the inside, the
  *  bleed, presets and its folder. A new race of that shape is a module and a
  *  row here. The sylvan predates the interface and keeps its own hooks. */
-export const RACE_MODS = { automaton: AU, android: AN, demon: DM };
+export const RACE_MODS = { automaton: AU, android: AN, demon: DM, naga: NG };
 export const RACES = [...SY.RACES, ...Object.keys(RACE_MODS)];
 /** The machine race module a genome is, or null (human, sylvan). */
 export const raceMod = g =>
   RACE_MODS[(g && g.body && g.body.race) || 'human'] || null;
 /** Which race OWNS a colour key: null for the human's own nine. */
 const colorOwner = k => (k in SY.COLOR_SLOTS) ? 'sylvan'
+  : (k in SE.COLOR_SLOTS) ? 'serpent'
   : (Object.keys(RACE_MODS).find(r => k in RACE_MODS[r].COLOR_SLOTS) || null);
 
 // =============================================================================
@@ -292,6 +295,10 @@ export const ART = {
   ...AN.SLOTS,
   // THE DEMON's (demon.js), likewise.
   ...DM.SLOTS,
+  // THE NAGA's (naga.js, 216..214) and THE SERPENT TAIL's (serpent.js,
+  // 213..209: a lower-body plan's, painted on any body that has the tail).
+  ...NG.SLOTS,
+  ...SE.SLOTS,
   // THE LIPS (2026-10-08): below the demon's. Written into a palette only
   // when a face paints it (lipUsed), so a body without coloured lips spends
   // no slot of the engine's shared art palette on it.
@@ -332,7 +339,7 @@ export const HAIR_MAT_ID = 'hair_white';
  *  hair through the shoulders. Neither exists on a body whose style has no
  *  mass, so every pre-existing character builds exactly as it did. */
 export const HAIR_PARTS = { hair: 'head', mane: 'torso', snout: 'head',
-                            bough: 'torso', tail: 'torso' };
+                            bough: 'torso', tail: 'torso', hood: 'torso' };
 
 /** genome.colors key -> art slot. The genome names a colour by what it IS,
  *  the slot is where it lands; the UI pickers walk this map. */
@@ -353,6 +360,10 @@ export const COLOR_SLOTS = {
   // LAST, so the jitter loop in rollColors draws for it after every slot it
   // drew for before it existed (it is a skin tone, so it takes no draw anyway).
   lip: ART.LIP,
+  // AFTER the lip, for the same reason: every draw a roll made before these
+  // existed is still the draw it makes.
+  ...NG.COLOR_SLOTS,
+  ...SE.COLOR_SLOTS,
 };
 
 /**
@@ -487,6 +498,12 @@ export function defaultGenome() {
        *  limb box, so armour and weapons fit both. Switched with applyRace,
        *  which moves the build by SY.BUILD_DELTA the way applySex moves it. */
       race: 'human',
+      /** 'legs' | 'serpent' (serpent.js): the LOWER-BODY PLAN. Legs are the
+       *  human's six leg limbs and the gait; a serpent is a waist, a rise and
+       *  a tail lying behind, which slithers and swims (the naga's). The
+       *  upper body is the same either way. Never rolled (a litter keeps its
+       *  plan); a race may be born on one (naga.js LOWER). */
+      lower: 'legs',
       /** 'male' | 'female'. Not a switch in the generator so much as a
        *  PRESET OF OFFSETS over the build genes (applySex): the toggle moves
        *  the sliders, the sliders build the body. Two things read it directly:
@@ -719,6 +736,8 @@ export function defaultGenome() {
       // The machine races' own colours (automaton.js, android.js), likewise.
       ...Object.fromEntries(Object.values(RACE_MODS).flatMap(M =>
         Object.keys(M.COLOR_SLOTS).map(k => [k, M.DEFAULT_COLORS[k]]))),
+      // The serpent tail's (serpent.js), likewise.
+      ...SE.DEFAULT_COLORS,
     },
 
     /** The sylvan's genes: face, bark and crown (sylvan.js). Inert on a
@@ -731,6 +750,10 @@ export function defaultGenome() {
      *  mutation, roll and cross loops without a random draw. */
     ...Object.fromEntries(Object.entries(RACE_MODS)
       .map(([k, M]) => [k, M.defaultGenes()])),
+
+    /** The serpent tail's genes (serpent.js): inert on legs, and skipped by a
+     *  legged body's mutation, roll and cross loops without a random draw. */
+    serpent: SE.defaultGenes(),
   };
 }
 
@@ -1001,6 +1024,8 @@ export const GENE_GROUPS = [
   ...AU.GENE_GROUPS,
   ...AN.GENE_GROUPS,
   ...DM.GENE_GROUPS,
+  ...NG.GENE_GROUPS,
+  SE.GENE_GROUP,
   { key: 'colour', title: 'colours',
     note: 'Nine art slots. Each surface picks base, shadow or highlight by ' +
           'which way it faces, so the three skin tones want to be the same ' +
@@ -1068,6 +1093,13 @@ export const GENE_SPECS = [
           'and arcs when struck and bleeds nothing. The same limbs and proportions every time, ' +
           'so every armour piece and weapon fits all four.',
     kind: 'enum', choices: RACES, sigma: 0 },
+  { path: 'body.lower', label: 'lower body', group: 'body', fixed: true,
+    hint: 'legs: a man\'s, with the walk. serpent: a waist, a rise and a long ' +
+          'tail lying behind that slithers on land and swims like a ' +
+          'mermaid\'s -- the naga\'s body, on any race. The upper body is ' +
+          'the same either way, so armour above the waist and every weapon ' +
+          'still fit.',
+    kind: 'enum', choices: SE.LOWERS, sigma: 0 },
   { path: 'body.sex', label: 'sex', group: 'body',
     hint: 'Male or female. Switching moves the build sliders by the ' +
           'typical difference (shorter, narrower shoulders, narrower waist, ' +
@@ -1546,6 +1578,11 @@ export const GENE_SPECS = [
       path: 'colors.' + k, label, hint, group: 'colour', kind: 'color',
       sigma: 0.10, race,
     }))),
+  // ...and the serpent tail's, on any body that has one.
+  ...SE.COLOR_SPECS.map(([k, label, hint]) => ({
+    path: 'colors.' + k, label, hint, group: 'colour', kind: 'color',
+    sigma: 0.10, lower: 'serpent',
+  })),
 ];
 // The sylvan's face / bark / crown rows go in BEFORE the colours, so the page
 // stacks them under their own headings. Their place in the list moves no
@@ -1630,13 +1667,15 @@ const BRIEFS_SPECS = [
 ];
 GENE_SPECS.splice(GENE_SPECS.findIndex(sp => sp.group === 'colour'), 0,
                   ...BRA_SPECS, ...BRIEFS_SPECS, ...SY.GENE_SPECS, ...AU.GENE_SPECS, ...AN.GENE_SPECS,
-                  ...DM.GENE_SPECS);
+                  ...DM.GENE_SPECS, ...NG.GENE_SPECS, ...SE.GENE_SPECS);
 
 /** Does this row apply to this genome? (race-gated rows, see GENE_SPECS;
  *  `sex`-gated rows, the bra, show on that sex only) */
 export const specApplies = (spec, genome) =>
   (!spec.race ||
    spec.race === ((genome && genome.body && genome.body.race) || 'human')) &&
+  (!spec.lower ||
+   spec.lower === ((genome && genome.body && genome.body.lower) || 'legs')) &&
   (!spec.sex ||
    spec.sex === ((genome && genome.body && genome.body.sex) || 'male'));
 
@@ -1702,7 +1741,7 @@ export function normalizeGenome(src) {
     for (const k of ['name', 'displayName', 'archetype'])
       if (typeof src[k] === 'string' && src[k]) g[k] = src[k];
     for (const k of ['body', 'shape', 'head', 'face', 'hair', 'colors',
-                     'sylvan', ...Object.keys(RACE_MODS)]) {
+                     'sylvan', 'serpent', ...Object.keys(RACE_MODS)]) {
       if (!src[k] || typeof src[k] !== 'object') continue;
       for (const kk of Object.keys(g[k])) {
         if (!(kk in src[k])) continue;
@@ -1861,6 +1900,13 @@ export function applyRace(genome, race, locks) {
   };
   moveBuild(deltaOf(was), -1);
   moveBuild(deltaOf(race), 1);
+  // A race BORN ON a lower-body plan (naga.js LOWER) puts it on; leaving such
+  // a race puts the legs back. A race with no opinion leaves it alone.
+  const lowerOf = r => (RACE_MODS[r] && RACE_MODS[r].LOWER) || null;
+  if (lowerOf(race) && !isLocked(locks, 'body.lower'))
+    genome.body.lower = lowerOf(race);
+  else if (lowerOf(was) && !isLocked(locks, 'body.lower'))
+    genome.body.lower = 'legs';
   const setColors = set => {
     for (const [k, v] of Object.entries(set))
       if (!isLocked(locks, 'colors.' + k)) genome.colors[k] = v;
@@ -2735,8 +2781,21 @@ export function limbTable(genome) {
         r.mn[0] !== -a.mn[0] - a.size[0])
       throw new Error(`${n} and its .R twin are not mirrors about x=0`);
   }
-  return { limbs, rows, armRows, microH, worldH, eyeZ };
+  const out = { limbs, rows, armRows, microH, worldH, eyeZ };
+  // A SERPENT below the hips (serpent.js): the leg boxes go, the tail's come,
+  // with their cells already cut.
+  if (SE.isSerpent(g)) SE.extendTable(g, out);
+  return out;
 }
+
+/** What kind of surface a part is (ARCHETYPE.roles); a serpent tail part
+ *  is a limb to any race that dresses the surface. */
+const roleOf = nm => ARCHETYPE.roles[nm] || 'limb';
+
+/** The limb names this genome's body has, parent before child. */
+export const orderOf = g => SE.isSerpent(g)
+  ? [...ARCHETYPE.order.filter(n => !SE.LEG_PARTS.includes(n)), ...SE.PARTS]
+  : ARCHETYPE.order;
 
 /** The DEFAULT table, used as the denominator every time a shape parameter is
  *  scaled by "this box over the drawn box". Computed once. */
@@ -4291,7 +4350,9 @@ function hairMass(g, parts, extra = {}) {
   // gone), before the split. Leaves use the hair slots, so they are leaves.
   // A TAIL (demon.js) is its own group: one jointed limb off the small of the
   // back that sways and lags (sidecar `tail` limb), not a fixed bough.
-  let snoutCells = [], boughCells = [], limbTail = [];
+  // A HOOD (naga.js) is its own group: one fixed piece standing off the back
+  // of the neck, rooted on the torso like a bough.
+  let snoutCells = [], boughCells = [], limbTail = [], hoodCells = [];
   if (crownOn) {
     const got = SY.crownExtras(g, { ART, K, add, C, halfW, halfD, skullH,
                                     head, mass, body, face: extra.face,
@@ -4309,11 +4370,12 @@ function hairMass(g, parts, extra = {}) {
     snoutCells = snoutCells.concat(got.head);
     boughCells = boughCells.concat(got.torso);
     limbTail = limbTail.concat(got.tail || []);
+    hoodCells = hoodCells.concat(got.hood || []);
   }
 
   // ---- split by what it rides, then into connected pieces -------------------
   const groups = { hair: [], mane: [], snout: snoutCells, bough: boughCells,
-                   tail: limbTail };
+                   tail: limbTail, hood: hoodCells };
   // A TAIL RIDES THE HEAD all the way down: it is tied to the head, and a
   // ponytail swinging when the head turns is what one does.
   for (const [k, v] of mass)
@@ -4361,6 +4423,7 @@ function hairMass(g, parts, extra = {}) {
   for (const c of groups.snout || []) taken.add(K(c[0], c[1], c[2]));
   for (const c of groups.bough || []) taken.add(K(c[0], c[1], c[2]));
   for (const c of groups.tail || []) taken.add(K(c[0], c[1], c[2]));
+  for (const c of groups.hood || []) taken.add(K(c[0], c[1], c[2]));
   // THE BLOCKS ARE THE ENGINE'S: the loader maps scene (x, y, z) to engine
   // (x, z, -y) and rebases to the min corner, so a block runs up from the min
   // corner in x and z but DOWN from the max corner in scene y.
@@ -4459,13 +4522,14 @@ function hairMass(g, parts, extra = {}) {
     // dropped; everything else is a limb.
     // (The snout is small and deliberate: it keeps anything past a speck.)
     pieces.filter(p => p.length >= (base === 'snout' || base === 'bough' ||
-                                    base === 'tail' ? 8
+                                    base === 'tail' || base === 'hood' ? 8
                                                      : Math.max(32, total * 0.02)))
       .sort((a, b) => b.length - a.length)
       .map(p => p.map(i => cells[i]))
-      .filter(pc => (base !== 'bough' && base !== 'tail') || rooted(pc))
-      // ONE tail: a scrap the body cut off it is not a second tail.
-      .filter((pc, n) => base !== 'tail' || n === 0)
+      .filter(pc => (base !== 'bough' && base !== 'tail' && base !== 'hood') ||
+                    rooted(pc))
+      // ONE tail, ONE hood: a scrap the body cut off it is not a second one.
+      .filter((pc, n) => (base !== 'tail' && base !== 'hood') || n === 0)
       .map(pc => giveCollider(pc))
       .filter(Boolean)
       .forEach((pc, n) => out.push({
@@ -4746,6 +4810,15 @@ export function anatomyRecipe(race = 'human') {
     return { ...SY.ANATOMY_NOTES, ...r };
   }
   const M = RACE_MODS[race];
+  // A FLESH race with stand-ins of its own (naga.js: gold painted as iron)
+  // takes the human's recipe with its stand-ins added to the human's
+  // `becomes` (the heart's), so the load-time rewrite turns them back.
+  if (M && !M.ANATOMY && M.STAND_INS && Object.keys(M.STAND_INS).length) {
+    const r = anatomyRecipe('human');
+    r.becomes = { ...(r.becomes || {}) };
+    for (const [n, si] of Object.entries(M.STAND_INS)) r.becomes[si] = n;
+    return r;
+  }
   // A race with no recipe of its own (demon.js: it is flesh) takes the
   // human's, below.
   if (M && M.ANATOMY) return standInRecipe(M, { ...M.ANATOMY_NOTES,
@@ -5084,7 +5157,8 @@ export function generateMob(genome, seed = 0, opts = {}) {
   void seed;
 
   // ---- the height contract, asserted --------------------------------------
-  const bodyNames = ARCHETYPE.order.filter(n => !ARCHETYPE.props.includes(n));
+  const ORDER = orderOf(g);
+  const bodyNames = ORDER.filter(n => !ARCHETYPE.props.includes(n));
   const top = Math.max(...bodyNames.map(n => L[n].mn[2] + L[n].size[2]));
   const bottom = Math.min(...bodyNames.map(n => L[n].mn[2]));
   if (bottom !== 0)
@@ -5118,7 +5192,7 @@ export function generateMob(genome, seed = 0, opts = {}) {
   // What the sylvan face pass found (eyes, mouth, brow), head-local shipped:
   // the crown hangs its veil and its snout off it.
   let sylFace = null;
-  for (const nm of ARCHETYPE.order) {
+  for (const nm of ORDER) {
     const artSize = L[nm].size;
     const size = artSize.map(v => v * SKIN_UPSCALE);
     const mn = L[nm].mn.map(v => v * SKIN_UPSCALE);
@@ -5129,7 +5203,8 @@ export function generateMob(genome, seed = 0, opts = {}) {
     if (worldExtent > 120)
       throw new Error(`${nm} is ${worldExtent} world voxels; even a 1:1 ` +
                       `collider exceeds the DebrisVoxel int8 bound`);
-    let cells = SHAPES[nm](g, artSize, { ...table, limbs: L, name: nm });
+    let cells = SHAPES[nm] ? SHAPES[nm](g, artSize, { ...table, limbs: L, name: nm })
+                           : SE.shape(g, nm, table);
     if (!cells.length) throw new Error(`${nm} generated no voxels`);
     cells = upscaleCells(cells, SKIN_UPSCALE);
     // THE SHOULDER ROUND, after the upscale because that is the only lattice
@@ -5150,7 +5225,7 @@ export function generateMob(genome, seed = 0, opts = {}) {
     const Ms = raceMod(g);
     if (sylvan || Ms) {
       const info = { ART, mn };
-      if (ARCHETYPE.roles[nm] === 'head') {
+      if (roleOf(nm) === 'head') {
         const eyeA = table.eyeZ - L[nm].mn[2] + g.face.eyeRow;
         const neckA = Math.max(1, Math.round(2 * artSize[2] / DEF.head.size[2]));
         info.eyeRow = eyeA * SKIN_UPSCALE;
@@ -5160,8 +5235,8 @@ export function generateMob(genome, seed = 0, opts = {}) {
       }
       // THE MACHINE SURFACE (automaton.js / android.js surfacePass), the
       // same contract: inside the part's own box.
-      cells = sylvan ? SY.barkPass(g, ARCHETYPE.roles[nm], nm, cells, size, info)
-                     : Ms.surfacePass(g, ARCHETYPE.roles[nm], nm, cells, size, info);
+      cells = sylvan ? SY.barkPass(g, roleOf(nm), nm, cells, size, info)
+                     : Ms.surfacePass(g, roleOf(nm), nm, cells, size, info);
       if (info.face) sylFace = info.face;
     }
     const seen = new Set();
@@ -5181,7 +5256,10 @@ export function generateMob(genome, seed = 0, opts = {}) {
       uniq.push([x, y, z, c]);
     }
     painted += uniq.length;
-    parts.push({ name: nm, size, mn, cells: uniq });
+    // A TRAILING part (the serpent's trail) is measured out of the body box,
+    // as the engine measures it (mob.h MobLimbDef::trailing).
+    parts.push({ name: nm, size, mn, cells: uniq,
+                 ...(L[nm].trailing ? { trailing: true } : {}) });
   }
 
   // ---- the hair mass, as its own parts (see hairMass) ----------------------
@@ -5270,7 +5348,7 @@ export function generateMob(genome, seed = 0, opts = {}) {
     vox = writeVox(models, paletteBytes(opts.materials,
                                         lipUsed(g) ? g.colors
                                                    : { ...g.colors, lip: null },
-                                        g.body.race),
+                                        g.body.race, g.body.lower),
                    { scene: true });
   }
 
@@ -5361,7 +5439,8 @@ export function bakeAnatomy(built, materials) {
   return built.anatomyBaked;
 }
 
-export function paletteBytes(materials, colors, race = 'human') {
+export function paletteBytes(materials, colors, race = 'human',
+                             lower = 'legs') {
   const pal = new Uint8Array(1024);
   const put = (idx, hex) => {
     const h = String(hex).replace('#', '');
@@ -5381,9 +5460,12 @@ export function paletteBytes(materials, colors, race = 'human') {
   // human paints would cost it five slots per human.
   // Each machine race's likewise: a colour key a race owns is written only
   // by that race.
+  // ...and the serpent tail's (serpent.js) by a body that has the tail.
   for (const [k, slot] of Object.entries(COLOR_SLOTS)) {
     const owner = colorOwner(k);
-    if (colors[k] && (!owner || owner === race)) put(slot, colors[k]);
+    if (colors[k] && (!owner || owner === race ||
+                      (owner === 'serpent' && lower === 'serpent')))
+      put(slot, colors[k]);
   }
   for (const [slot, hex] of Object.entries(wispColors(colors)))
     put(Number(slot), hex);
@@ -5404,7 +5486,10 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
   // LOADER (mob.cpp skips tag == "prop" when it measures worldSize): anchors
   // are rebased against this origin, so measuring a box the engine does not
   // shifts every anchor and moves the gait pivot off the body.
-  const bodyNames = Object.keys(S).filter(n => !ARCHETYPE.props.includes(n));
+  // ...and so is a TRAILING part (the serpent's trail): mob.cpp measures it
+  // out of the box and re-origins the prefab on the rest of the body.
+  const bodyNames = Object.keys(S).filter(n => !ARCHETYPE.props.includes(n) &&
+                                               !L[n].trailing);
   const minX = Math.min(...bodyNames.map(n => S[n].mn[0]));
   const maxY = Math.max(...bodyNames.map(n => S[n].mn[1] + S[n].size[1]));
   /** Scene (Z-up) -> prefab-local engine coords (Y-up, min corner 0), matching
@@ -5509,7 +5594,8 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
       tag: 'hand', anchor: jointTop(`hand.${side}`),         // wrist
       severImpactSpeed: LIMB_BASE.hand.sever });
   }
-  for (const side of ARCHETYPE.sides) {
+  const serpent = SE.isSerpent(g);
+  for (const side of serpent ? [] : ARCHETYPE.sides) {
     limbs.push({
       name: `legU.${side}`, parent: 'hips', joint: 'ball',
       hp: hpOf(`legU.${side}`, LIMB_BASE.legU.hp), severable: true, tag: 'leg',
@@ -5545,6 +5631,10 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
       anchor: jointBottom(`foot.${side}`, { dy: -1.5, rise: 3.0 }),
       severImpactSpeed: LIMB_BASE.foot.sever });
   }
+  // A SERPENT below the hips (serpent.js): the tail's twelve limbs where the
+  // legs were. They APPEND after the arms, which is where a body extending
+  // the human finds them (its leg rows are tombstoned by the diff).
+  if (serpent) limbs.push(...SE.limbs(g, table, anchor, U));
 
   // ---- sockets ------------------------------------------------------------
   // A socket is named for the CONTEXT an item asks to be held in, not for the
@@ -5637,7 +5727,7 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
 
   // ---- IK chains ----------------------------------------------------------
   const chains = [];
-  for (const side of ARCHETYPE.sides)
+  for (const side of serpent ? [] : ARCHETYPE.sides)
     chains.push({ tag: 'leg',
                   parts: [`legU.${side}`, `legL.${side}`, `foot.${side}`],
                   effector: `foot.${side}`, pole: [0, 0, 1], solver: 'twobone' });
@@ -5683,7 +5773,8 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
       // A BOUGH is wood growing out of the torso: fixed, like the head's hair,
       // not the hanging mane's sprung ball.
       name: p.name, parent: p.parent,
-      joint: p.parent === 'head' || p.name.startsWith('bough') ? 'fixed' : 'ball',
+      joint: p.parent === 'head' || p.name.startsWith('bough') ||
+             p.name.startsWith('hood') ? 'fixed' : 'ball',
       hp, severable: true, vital: false, bloodless: true, tag: 'hair',
       anchor: anchor([best[0] + 0.5, best[1] + 0.5, best[2] + 1]),
     };
@@ -5694,7 +5785,8 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
       Object.assign(limb, { cone: 0.6, coneSide: 0.9, twist: 0.2,
                             spring: { halflife: 0.35, gain: 0.6, maxAngle: 0.6 },
                             ...((Mt && Mt.tailLimb) ? Mt.tailLimb(g) : {}) });
-    } else if (p.parent !== 'head' && !p.name.startsWith('bough')) {
+    } else if (p.parent !== 'head' && !p.name.startsWith('bough') &&
+               !p.name.startsWith('hood')) {
       Object.assign(limb, { cone: 0.3, coneSide: 0.2, twist: 0.15,
                             spring: { halflife: 0.3, gain: 0.3, maxAngle: 0.25 } });
     }
@@ -5711,8 +5803,11 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
     Object.assign(anatomy.limbs, hairAnatomy);
   }
 
-  const gait = gaitNumbers(table, opts, g.body.heightM);
-  const clips = scaleClipPositions(buildClips(gait), SKIN_UPSCALE);
+  // A SERPENT has no leg to derive a stride from: its speed is its own gene
+  // over the player's sprint, and its clips are the tail's (serpent.js).
+  const gait = serpent ? null : gaitNumbers(table, opts, g.body.heightM);
+  const clips = serpent ? SE.clips(g)
+    : scaleClipPositions(buildClips(gait), SKIN_UPSCALE);
   // A race's own clips (demon.js extraClips: the tail sway), rotation-only,
   // only for parts this body actually grew.
   const Mc = raceMod(g);
@@ -5741,8 +5836,12 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
          : raceMod(g) ? (raceMod(g).BLEED ? { ...raceMod(g).BLEED } : null)
          : { material: 'blood', perDamage: 2.5 },
     anatomy,
-    speed: pyRound(gait.refSpeed, 4),
-    gait: {
+    speed: serpent
+      ? SE.speed(g, { ...PLAYER_CONSTANTS, ...(opts.player || {}) }.sprintSpeed)
+      : pyRound(gait.refSpeed, 4),
+    // A serpent has no gait: `null` is the RFC delete of the human's, kept
+    // by thinSidecar (inheritUnmodelled) as a real difference.
+    gait: serpent ? null : {
       // Biped: two SINGLETON groups, so only one foot may swing at a time.
       // That single constraint is the whole gait state machine.
       groups: [['legU.L'], ['legU.R']],
@@ -5756,18 +5855,24 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
       // mid-swing knee on its limit through the whole swing. 0.08 leg lengths
       // is about 5 cm on a 1.7 m body, which is what a walking foot clears.
       stepHeight: 0.08,
-      rideHeight: gait.rideHeight,
+      rideHeight: gait && gait.rideHeight,
       bobAmp: 0.045, bobFreqMul: 2.0, swayAmp: 0.03,
       rollAmp: 0.06, spineCounter: 0.75, phaseLag: 0.05,
     },
     limbs, sockets, natural, chains,
     // ...plus a race's base posture (demon.js extraStates: the hunch),
     // appended AFTER every damage state so a crawl or a limp still wins.
-    states: [...buildStates(),
+    states: [...(serpent ? SE.states(buildStates()) : buildStates()),
+             ...(serpent ? SE.overlayStates(g) : []),
              ...((raceMod(g) && raceMod(g).extraStates)
                    ? raceMod(g).extraStates(g)
                        .filter(st => !st.overlay || clips[st.clip]) : [])],
     clips,
+    // The tail's wave, on land and in water (mob.h SlitherDef, `upright`).
+    ...(serpent ? { slither: SE.slither(g) } : {}),
+    // ...and whatever else a race says about the whole creature (naga.js
+    // extraSidecar: the venom its bite carries).
+    ...((raceMod(g) && raceMod(g).extraSidecar) ? raceMod(g).extraSidecar(g) : {}),
     flipbooks: {},
     // What rolled this body. Not read by the engine; it is what lets the
     // Characters page load a saved character back into its sliders and breed
@@ -5983,6 +6088,22 @@ export function inheritUnmodelled(full, base) {
       if (!k.startsWith('//') && !(k in body.clips))
         body.clips[k] = JSON.parse(JSON.stringify(v));
   }
+  // A BODY WITH NO LEGS has no use for a leg track in a clip it inherits
+  // (the human's lunge steps with them): left in, the loader logs a track for
+  // an unknown part on every load. Struck from the inherited copies, so the
+  // diff writes them as RFC deletes.
+  const g0 = full.genome;
+  if (g0 && g0.body && g0.body.lower === 'serpent' && body.clips)
+    for (const [k, c] of Object.entries(body.clips)) {
+      if (!c || typeof c !== 'object' || (full.clips && k in full.clips)) continue;
+      const legs = SE.LEG_PARTS.filter(n => c.tracks && n in c.tracks);
+      const inMask = Array.isArray(c.mask) && c.mask.some(n => SE.LEG_PARTS.includes(n));
+      if (!legs.length && !inMask) continue;
+      const c2 = JSON.parse(JSON.stringify(c));
+      for (const n of legs) delete c2.tracks[n];
+      if (inMask) c2.mask = c2.mask.filter(n => !SE.LEG_PARTS.includes(n));
+      body.clips[k] = c2;
+    }
   // AN EXPLICIT `null` IS AN OPINION: "none of the base's" (an android's
   // `bleed`, android.js BLEED). It was kept out of the fill above; here it
   // leaves the body, which is what the resolved creature looks like once the
@@ -6110,7 +6231,7 @@ export function validateMob(built) {
   for (const p of parts) S[p.name] = p;
   // The BODY's corner is the prefab origin (mob.cpp rebases to it, measuring
   // hair out exactly as it measures a held prop out); hair may lie past it.
-  const bodyParts = parts.filter(p => !p.hair);
+  const bodyParts = parts.filter(p => !p.hair && !p.trailing);
   const minX = Math.min(...bodyParts.map(p => p.mn[0]));
   const maxY = Math.max(...bodyParts.map(p => p.mn[1] + p.size[1]));
   for (const lm of sidecar.limbs) {
