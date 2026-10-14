@@ -324,6 +324,44 @@ function exposedFaces(b) {
 }
 
 /**
+ * What the orbit preview turns about and how far it must fit: a VERTICAL AXIS
+ * THROUGH THE HEAD (the torso if there is none), at the figure's mid-height,
+ * measured on the UNPOSED body.
+ *
+ * It used to be the centre of the bounding box of whatever was drawn, which
+ * is wrong twice for a naga: a 400-cell tail puts the box centre far behind
+ * the person, so turning swings the head across the screen; and the box was
+ * the POSED frame's, so every frame of the tail's sway moved and rescaled the
+ * whole figure. Anchored here the head stays put and only the tail moves.
+ *
+ * Cached on the shape; posedBody hands its frames the same anchor.
+ */
+function orbitAnchor(b) {
+  if (b._anchor !== undefined) return b._anchor;
+  const G = gridOf(b);
+  let A = null;
+  if (G) {
+    const p = b.parts.find(q => q.name === 'head') ||
+              b.parts.find(q => q.name === 'torso');
+    let cx = (G.mnx + G.mxx + 1) / 2, cy = (G.mny + G.mxy + 1) / 2;
+    if (p && p.cells.length) {
+      let sx = 0, sy = 0;
+      for (const c of p.cells) { sx += c[0]; sy += c[1]; }
+      cx = p.mn[0] + sx / p.cells.length + 0.5;
+      cy = p.mn[1] + sy / p.cells.length + 0.5;
+    }
+    // The farthest footprint corner from the axis: the half-width the figure
+    // can reach on screen from any yaw.
+    let r = 1;
+    for (const x of [G.mnx, G.mxx + 1]) for (const y of [G.mny, G.mxy + 1])
+      r = Math.max(r, Math.hypot(x - cx, y - cy));
+    A = { c: [cx, cy, (G.mnz + G.mxz + 1) / 2], r, ez: G.mxz - G.mnz + 1 };
+  }
+  Object.defineProperty(b, '_anchor', { value: A, configurable: true });
+  return A;
+}
+
+/**
  * Draw a built character from ANY angle: the tweak pane's orbit preview.
  *
  * Orthographic, with a z-buffer, into ImageData. The fixed painter below gets
@@ -359,15 +397,15 @@ export function drawOrbit(canvas, b, view = ORBIT_HOME) {
   const U = [-sy * sp, cy * sp, cp];
   const dot = (a, v) => a[0] * v[0] + a[1] * v[1] + a[2] * v[2];
 
-  // A zoom-1 scale that fits the figure from EVERY yaw, so turning it does not
-  // breathe in and out: the horizontal extent is the footprint's diagonal.
-  const ex = G.mxx - G.mnx + 1, ey = G.mxy - G.mny + 1, ez = G.mxz - G.mnz + 1;
-  const foot = Math.hypot(ex, ey), pad = 4;
+  // A zoom-1 scale that fits the figure from EVERY yaw about its anchor, so
+  // turning it does not breathe in and out (orbitAnchor: the head's axis, and
+  // the unposed body's extent, so the sway does not breathe it either).
+  const anc = orbitAnchor(b);
+  const foot = 2 * anc.r, ez = anc.ez, pad = 4;
   const s0 = Math.min((W - pad * 2) / foot,
                       (Hh - pad * 2) / (ez * cp + foot * Math.abs(sp)));
   const s = s0 * view.zoom;
-  const c = [(G.mnx + G.mxx + 1) / 2, (G.mny + G.mxy + 1) / 2,
-             (G.mnz + G.mxz + 1) / 2];
+  const c = anc.c;
   const ox = W / 2 + view.panX - dot(c, R) * s;
   const oy = Hh / 2 + view.panY + dot(c, U) * s;
 
@@ -615,7 +653,8 @@ function buildOf(genome, name, exact = false) {
   const g = mg.normalizeGenome(genome);
   const k = JSON.stringify(g);
   const hit = buildCache.get(k);
-  if (hit && (!exact || !hit.recolour)) return hit;
+  // A preview build carries no .vox (noVox below), so a save regenerates.
+  if (hit && (!exact || (!hit.recolour && hit.vox))) return hit;
   const sk = shapeKey(g);
   const shape = !exact && shapeCache.get(sk);
   if (shape) {
@@ -631,6 +670,7 @@ function buildOf(genome, name, exact = false) {
       materials: H.materials(),
       player: (H.tuning && H.tuning() && H.tuning().player) || undefined,
       name: name || g.name,
+      noVox: !exact,
     });
     out.complaints = mg.validateMob(out);
   } catch (e) {
@@ -1272,17 +1312,6 @@ function poolPane() {
  *  the angle stays. */
 const sceneQuat = q => [q[0], -q[2], q[1], q[3]];
 
-function qRotate(q, v) {
-  const [x, y, z, w] = q;
-  const ix = w * v[0] + y * v[2] - z * v[1];
-  const iy = w * v[1] + z * v[0] - x * v[2];
-  const iz = w * v[2] + x * v[1] - y * v[0];
-  const iw = -x * v[0] - y * v[1] - z * v[2];
-  return [ix * w + iw * -x + iy * -z - iz * -y,
-          iy * w + iw * -y + iz * -x - ix * -z,
-          iz * w + iw * -z + ix * -y - iy * -x];
-}
-
 function qSlerp(a, b, t) {
   let d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
   const s = d < 0 ? -1 : 1;
@@ -1363,23 +1392,44 @@ function jointPivot(p, parent) {
 /** One part turned by `q` (scene axes) about `pivot`: a fresh part with its
  *  own box, since a turned tail leaves the box it was cut for. */
 function turnedPart(p, q, pivot) {
+  // The rotation as a 3x3 matrix, applied inline: this runs for 8 samples of
+  // every cell of every swaying part (a naga's tail is ~60k cells) on each
+  // new animation frame, and the old per-sample arrays + string keys cost
+  // ~70 ms a frame -- more than the 33 ms the anim loop allows.
+  const [qx, qy, qz, qw] = q;
+  const m00 = 1 - 2 * (qy * qy + qz * qz), m01 = 2 * (qx * qy - qz * qw),
+        m02 = 2 * (qx * qz + qy * qw);
+  const m10 = 2 * (qx * qy + qz * qw), m11 = 1 - 2 * (qx * qx + qz * qz),
+        m12 = 2 * (qy * qz - qx * qw);
+  const m20 = 2 * (qx * qz - qy * qw), m21 = 2 * (qy * qz + qx * qw),
+        m22 = 1 - 2 * (qx * qx + qy * qy);
+  const ox = p.mn[0] - pivot[0], oy = p.mn[1] - pivot[1], oz = p.mn[2] - pivot[2];
+  const [px, py, pz] = pivot;
+  // Small-integer key (|offset| < 1024 a side). Map order is first-claim
+  // order, as it was with the string key.
   const seen = new Map();
-  for (const [x, y, z, c] of p.cells)
-    for (const sx of [0.25, 0.75]) for (const sy of [0.25, 0.75])
-      for (const sz of [0.25, 0.75]) {
-        const v = [p.mn[0] + x + sx - pivot[0], p.mn[1] + y + sy - pivot[1],
-                   p.mn[2] + z + sz - pivot[2]];
-        const r = qRotate(q, v);
-        const X = Math.floor(r[0] + pivot[0]), Y = Math.floor(r[1] + pivot[1]),
-              Z = Math.floor(r[2] + pivot[2]);
-        const k = X + ',' + Y + ',' + Z;
-        if (!seen.has(k)) seen.set(k, [X, Y, Z, c]);
-      }
-  const cells = [...seen.values()];
-  const mn = [0, 1, 2].map(i => Math.min(...cells.map(c => c[i])));
-  const mx = [0, 1, 2].map(i => Math.max(...cells.map(c => c[i])));
-  return { name: p.name, mn, size: mx.map((v, i) => v - mn[i] + 1),
-           cells: cells.map(c => [c[0] - mn[0], c[1] - mn[1], c[2] - mn[2], c[3]]) };
+  let mnx = 1e9, mny = 1e9, mnz = 1e9, mxx = -1e9, mxy = -1e9, mxz = -1e9;
+  for (const cell of p.cells) {
+    const c = cell[3];
+    for (let i = 0; i < 8; i++) {
+      const vx = ox + cell[0] + ((i & 4) ? 0.75 : 0.25);
+      const vy = oy + cell[1] + ((i & 2) ? 0.75 : 0.25);
+      const vz = oz + cell[2] + ((i & 1) ? 0.75 : 0.25);
+      const X = Math.floor(m00 * vx + m01 * vy + m02 * vz + px);
+      const Y = Math.floor(m10 * vx + m11 * vy + m12 * vz + py);
+      const Z = Math.floor(m20 * vx + m21 * vy + m22 * vz + pz);
+      const k = ((Z + 1024) * 2048 + (Y + 1024)) * 256 + (X + 128);
+      if (seen.has(k)) continue;
+      seen.set(k, [X, Y, Z, c]);
+      if (X < mnx) mnx = X; if (X > mxx) mxx = X;
+      if (Y < mny) mny = Y; if (Y > mxy) mxy = Y;
+      if (Z < mnz) mnz = Z; if (Z > mxz) mxz = Z;
+    }
+  }
+  const cells = [];
+  for (const c of seen.values()) cells.push([c[0] - mnx, c[1] - mny, c[2] - mnz, c[3]]);
+  return { name: p.name, mn: [mnx, mny, mnz],
+           size: [mxx - mnx + 1, mxy - mny + 1, mxz - mnz + 1], cells };
 }
 
 /** `b` as it stands at `tMs` into its idle motion, or `b` itself. Shares the
@@ -1402,6 +1452,9 @@ function posedBody(b, tMs) {
               complaints: b.complaints,
               parts: b.parts.map(p => turned.get(p.name) || p) };
     gridOf(frame); exposedFaces(frame);           // cache ON the frame
+    // ...but turn about the UNPOSED body's anchor, or the sway moves it.
+    Object.defineProperty(frame, '_anchor', { value: orbitAnchor(b),
+                                              configurable: true });
     if (A.frames.size > 120) A.frames.clear();
     A.frames.set(key, frame);
   }
@@ -2324,6 +2377,10 @@ function paintPreview() {
   if (cs[0]) {
     b = buildOf(S.genome, S.name);
     drawOrbit(cs[0], posedBody(b, performance.now()), S.view || ORBIT_HOME);
+    // Hold the sway off while a slider is moving: every drag frame is a new
+    // shape, so each sway frame would be a second fresh pose (~25 ms on a
+    // naga) competing with the next build for the same frame.
+    animLast = performance.now() + 200;
     ensureAnimLoop();
   }
   if (cs[1]) b = thumbFor(cs[1], S.genome, S.name, 'side');

@@ -3689,13 +3689,43 @@ function hairMass(g, parts, extra = {}) {
   const extrasOn = !!(Mx && Mx.extrasWant(g));
   if (!massOn && !fuzzOn && !beardOn && !crownOn && !extrasOn) return [];
   const U = SKIN_UPSCALE;
-  const K = (x, y, z) => ((z + 512) * 2048 + (y + 1024)) * 2048 + (x + 1024);
+  // 9 + 11 + 10 bits: under 2^30, so every key is a V8 small integer. The old
+  // 11 + 11 + 11 packing ran to 2^33, i.e. a heap double per key, and hashing
+  // the naga's 90k body cells into `body` was the hottest line in the build.
+  // Scene extents across every preset are x +-64, y -14..415, z 0..178.
+  const K = (x, y, z) => ((z + 256) * 2048 + (y + 512)) * 512 + (x + 256);
   const P = {};
   for (const p of parts) P[p.name] = p;
   const head = P.head;
-  const body = new Set();
-  for (const p of parts)
-    for (const [x, y, z] of p.cells) body.add(K(p.mn[0] + x, p.mn[1] + y, p.mn[2] + z));
+  // Every body cell, as a BITMAP over the parts' box answering `has(K(..))`
+  // -- the only question anyone (here, or a race's extras) asks of it. A Set
+  // of the naga's 90k cells was the single most expensive step of its build.
+  const body = (() => {
+    let x0 = 1e9, y0 = 1e9, z0 = 1e9, x1 = -1e9, y1 = -1e9, z1 = -1e9;
+    for (const p of parts) {
+      x0 = Math.min(x0, p.mn[0]); x1 = Math.max(x1, p.mn[0] + p.size[0]);
+      y0 = Math.min(y0, p.mn[1]); y1 = Math.max(y1, p.mn[1] + p.size[1]);
+      z0 = Math.min(z0, p.mn[2]); z1 = Math.max(z1, p.mn[2] + p.size[2]);
+    }
+    x0 = Math.floor(x0); y0 = Math.floor(y0); z0 = Math.floor(z0);
+    const dx = Math.max(0, Math.ceil(x1) - x0), dy = Math.max(0, Math.ceil(y1) - y0);
+    const dz = Math.max(0, Math.ceil(z1) - z0);
+    const bits = new Uint32Array(((dx * dy * dz) >>> 5) + 1);
+    for (const p of parts)
+      for (const [x, y, z] of p.cells) {
+        const i = (p.mn[0] + x - x0) + dx * ((p.mn[1] + y - y0) + dy * (p.mn[2] + z - z0));
+        bits[i >>> 5] |= 1 << (i & 31);
+      }
+    return {
+      has(k) {                          // K's inverse: x 9 bits, y 11, z the rest
+        const x = (k & 511) - 256 - x0, y = ((k >>> 9) & 2047) - 512 - y0;
+        const z = (k >>> 20) - 256 - z0;
+        if (x < 0 || x >= dx || y < 0 || y >= dy || z < 0 || z >= dz) return false;
+        const i = x + dx * (y + dy * z);
+        return (bits[i >>> 5] & (1 << (i & 31))) !== 0;
+      },
+    };
+  })();
 
   // The skull: its hair cells (the scalp the mass roots on), its skin cells
   // (which hair must never touch but at the hairline), and a centre taken
@@ -5146,8 +5176,12 @@ function scaleClipPositions(clips, factor) {
  *   avatar     the four gait constants from avatar.cpp. Defaults to
  *              AVATAR_CONSTANTS.
  *   name       asset stem; defaults to genome.name.
+ *   noVox      skip serializing the .vox (the Characters page's previews only
+ *              paint `parts`; writing the file was ~10% of a naga's build).
+ *              Materials are still resolved and checked exactly as for a save.
  * @returns {{name, genome, table, parts, prefab, sidecar, vox, stats}}
- *   `vox` is a Uint8Array only when `materials` was supplied.
+ *   `vox` is a Uint8Array only when `materials` was supplied and `noVox`
+ *   was not.
  */
 export function generateMob(genome, seed = 0, opts = {}) {
   const g = normalizeGenome(genome);
@@ -5246,7 +5280,9 @@ export function generateMob(genome, seed = 0, opts = {}) {
             z >= 0 && z < size[2]))
         throw new Error(`${nm} voxel (${x},${y},${z}) outside declared size ` +
                         `${size}`);
-      const k = x + ',' + y + ',' + z;
+      // An integer key inside the part's own box (checked just above): the
+      // string key this was cost a naga ~30 ms a build in allocations.
+      const k = x + size[0] * (y + size[1] * z);
       if (seen.has(k)) continue;                       // first write wins
       seen.add(k);
       if (!(c >= 128 && c <= 255))
@@ -5330,7 +5366,7 @@ export function generateMob(genome, seed = 0, opts = {}) {
     }
   }
   let vox = null;
-  if (opts.materials) {
+  if (opts.materials && !opts.noVox) {
     const models = [];
     for (const p of parts) {
       const size = { x: p.size[0], y: p.size[1], z: p.size[2] };

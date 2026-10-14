@@ -261,7 +261,11 @@ export function extendTable(g, table) {
   }
 
   // ---- the tube: each cell claimed by the sample it is deepest inside ----
-  const K = (x, y, z) => `${x},${y},${z}`;
+  // A small-integer key (x +-128, y -512..1535, z -64..447: under 2^28), not
+  // a string: the tube is ~60k cells claimed many times over, and a string
+  // key per claim was most of a naga's build time. Map order is insertion
+  // order either way, so the output is unchanged.
+  const K = (x, y, z) => ((z + 64) * 2048 + (y + 512)) * 256 + (x + 128);
   const cells = new Map();
   for (const p of samples) {
     const X = Math.ceil(p.rx) + 1, P = Math.ceil(p.rp) + 1;
