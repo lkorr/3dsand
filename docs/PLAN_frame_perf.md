@@ -616,3 +616,110 @@ blocker COUNT that stream.cpp writes from the CPU (every reader only tests it
 against zero, so a 1-bit blocker flag would free 13 bits) — i.e. a C++ change
 plus both WGSL producers. Measure it the way the jump was: the region must be
 per-CHUNK (coherent across a warp), never per-ray.
+
+## 7. Handoff 2026-10-15: water pouring through a breach (ticket 22-55-02)
+
+**The scene, permanent.** `SANDVOX_MAP=harness --render-budget --budget-cams
+pour,pourblood` and `SANDVOX_MAP=harness --perf --scenario pour`
+(perfsuite.cpp, commit c743bdf9). The harness lake (r 68, 24 deep) gets a pit
+cut beside it (24 x 25 cells, floor 20 under the bed) and, 5 ticks later, a
+16-deep notch from the lake into it. The lake falls through as MPM + CA water
+(9-12k MPM particles live). The eye is the ticket's: 3 m from the torrent at
+-48.5 deg, over the pit, looking back at the notch. `pourblood` paints twelve
+blood spheres into the lake on ticks 5 and 105, so the pour carries dissolved
+blood. The budget camera freezes at tick 180. Two budget extras:
+`SANDVOX_BUDGET_REPEAT=n` interleaves the arm list n times, and every arm row
+prints its p10 beside the p50.
+
+**What it costs (1920x1080, RTX 3060 Ti, in-process perfExp arms, quiet machine,
+pourblood baseline 16.0 ms, base2 drift <= 0.16):**
+
+| part of the raymarch | ms |
+|---|---|
+| everything MPM (march + every MPM shade; perfExp arm skips the fluid block) | **7.3** |
+| . march loop skeleton (iterations, no field samples) | 2.1 |
+| . field samples + bisection + lake-ownership sample | 2.55 |
+| . calm-raft `shadeWater` (the second, lake shade on MPM pixels) | 1.41 |
+| . shadeMpmFluid itself: thickness 0.6, normal 0.28, refraction 0.2, reflection 0.1, glint vis 0.1, foam 0.07 | ~1.24 |
+| `solPathLook` everywhere (dissolved blood; CA + MPM water) | 1.1 |
+| everything else (primary march through the lake/pit water, terrain) | 8.7 |
+
+Pour vs pourblood: 12.97 vs 13.63 ms in one boot, so a bloody pour adds ~0.7 ms.
+Per pixel (the step heatmap): 14.2 march iterations and 5.7 field samples.
+Iterations: 4.75 class-0 chunk strides, 1.88 empty-Y-level skips, and 4.59 steps
+through seam-ring chunks. 58% of samples return exactly 0. An oracle 4^3-brick
+source mask per block would prove 44% of those zero (1.5 samples/px). The rest
+sit in tap boxes that straddle a chunk face, in ring chunks, or beside water.
+MPM shading covers 9.2% of pixels. 8.2% are calm rafts that ALSO run
+shadeWater, and on half of those the raft weight is >= 0.998.
+
+Sim, `--perf pour` (one tick a frame, 300 frames over the pour): ca 3.08 +
+ca1 1.68, MLS-MPM 1.67 (g2p 0.55, p2g1 0.44, p2g2 0.27, gridUp 0.27, clear 0.21),
+openness 0.55, waterBodies 0.19, solute 0.19. That is ~7.5 ms of GPU a tick.
+The perf scenario's raymarch row is 8.5 ms p50 as the pour thins
+(9.6k -> 1k particles).
+
+**Does it reproduce the 47 ms? Not as one number, and the owner's inference is
+wrong in a way that matters.** "Looking at the floor goes back to 60, so it is
+rendering" does not follow. Ticks run at 30 Hz on the same queue as the render,
+so a frame costs render + (frame/33 ms) x tick, and the second tick per frame is
+throttled (main.cpp CPU budget / GPU-lag throttle). The same session's lake
+ticket (22-55-53) gives two equations: 34.7 ms staring at the lake, with a lake
+render the other agent measured at 17.5 ms at 1080p (~12.6 at the owner's 0.88
+scale), and 60+ fps on grass. Together they put the owner's tick at ~20 ms of
+GPU: the breached lake, a solute layer full of blood, swimmers. With that tick,
+the pour's 47 ms needs only ~19 ms of render at the owner's scale (~26 at
+1080p). The floor view then pays ~3 ms of render, the tick fits in its period,
+and the frame reads 60. Here the tick is 7.5 ms and the pour render 16 ms at
+1080p (~11.5 at 0.88), so the harness pour sits near the 60 fps edge rather
+than at 20. Getting to the owner's frame takes a bigger flood (more excited
+lake, more awake CA water, more solute), not a different render path.
+
+**LANDED: (A) resolve a chunk once** (`fluidChunkHeld` /
+`fluidSeamShellHeld`). On entry the march takes the class, the Y mask and the
+ring chunk's six water faces in one go, so a ring step no longer re-reads up to
+three neighbours' block-map and Y-mask words. It is exact: same loads, same
+answers, no t changes. Registers stay at 128 / 112 B local. Measured with
+`SANDVOX_BUDGET_REPEAT=3`, interleaved against perfExp-0 control on
+`pourblood`: p50 16.15 / 16.13 / 16.40 -> 15.86 / 15.81 / 15.94, and p10
+15.93 / 15.95 / 16.04 -> 15.41 / 15.56 / 15.57. That is **-0.3 ms p50,
+-0.45 ms p10**.
+
+**The other four, measured in the same run.** Alone, each was inside the noise:
+
+- (E) a calm raft whose lake weight is >= 1 - 1/256 skips shadeMpmFluid after
+  caFrac (the raft shade replaces it whole): -0.5 / +0.66 / -0.6.
+- (D) skip the thickness walk when the CA column is >= 48 voxels. The walk
+  cannot return more than 48, so max(thick, caPath) is caPath. Exact.
+- (F) a multi-level Y jump that lands on the bit-identical plane. Each skipped
+  level's step was absolute, and a level is >= 1 t-unit, so the 0.25 floor
+  never skips a plane. This is NOT the rejected 2026-10-07 jump, which moved
+  sample phase.
+- (S) a settled-share-only sample for the mfLake test: same taps, same sums,
+  no foam/velocity/composition reads. Alone it measured +1.1 / +1.1 / 0.
+
+All five together (A+D+E+F+S) gave **15.10 / 14.91 / 15.02 against the same
+16.15-16.40 control: -1.2 ms p50, -1.3 p10**, plus 14.73 in a separate boot.
+They were NOT landed: 258 pixels moved by more than 15 (max 65) against a
+control-vs-control floor of 0 above 15. (E) is the suspect. Its "< 1/256 of
+the pixel" ignores HDR: the MPM sun glint (pow 380, x3 Fresnel) is far brighter
+than 1.0, so 1/256 of it is still visible. The way back in: keep the glint in
+E's early exit, or gate E on the glint being dark. Then re-measure the four
+together with REPEAT. That code was not committed. Each change is ~10-35
+lines, and the description above is the whole recipe.
+
+REFUTED by register count: reusing the lake test's FluidSample in the shade,
+and moving the thickness walk into the shade block. Each took the fs from 128
+to 168 registers (`--shader-stats`), and the combined arm was +3 ms.
+
+**Left, ranked.** (1) The tick, not the render, is the multiplier on the owner's
+frame: the CA moving a flood (ca + ca1) and the solute layer under a bloody lake.
+Price both on a bigger breach (widen the notch, or run the default map's lake
+from a save). (2) A per-block FIELD CACHE: one 8 B word per block cell (fill,
+fill*vy, blocker bit), built per frame in the pre table from the exact
+fluidCellFromRef. Every field tap in a block chunk drops from grid + voxel +
+material reads to one load, which covers march samples, bisection, thickness and
+normal (~3.5 ms here). It needs a pass, a buffer (8 MB at kFluidBlocks 256) and
+a binding, which could go in a fluidGrid tail. (3) A 4^3 brick source mask beside
+it: <= 1.5 samples/px. (4) Calm rafts pay two water shades. Deciding the raft
+weight before the MPM shade (E) is the place, once it can be measured.
