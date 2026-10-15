@@ -314,7 +314,13 @@ are the OTHER half of this frame; they are not additive with `nomicro`.
    (`raymarch.wgsl shadowSlotHeld`; fresh far 5.8k -> 3.6k), one inlined copy of
    each march, and the resolve's rays as a per-warp task list. Result, n=2
    each interleaved: **2.19-2.20 -> 1.16-1.20 ms a frame**, wall mean 13.4-13.5
-   -> 12.3, p50 11.6-11.7 -> 9.7-9.8. REFUTED here: sorting a 256-lane
+   -> 12.3, p50 11.6-11.7 -> 9.7-9.8. `--perf` (n=1, same exe and asset A/B,
+   exclusive; the `shadowCache` node): forestfire 1.79 -> 1.23 ms, wall p50
+   20.2 -> 19.5; flythrough 1.84 -> 0.94 ms, wall p50 13.3 -> 12.5. Pictures:
+   the ticket camera still (SANDVOX_AT_LIST, clock frozen) differs from base
+   by mean |dL| 0.34-0.36 against 0.45 between two base runs; in-flight
+   frames differ run to run by more than the change can be seen through.
+   REFUTED here: sorting a 256-lane
    workgroup's requests by kind (+0.4 ms; the group holds the SM until its
    slowest warp ends), seeding a fresh window from its pool parent (-0.05,
    dropped). LEFT (~1.2 ms): ~14k one-ray window refreshes, ~5k fresh windows'
