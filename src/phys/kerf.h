@@ -291,9 +291,11 @@ inline KerfBiteResult KerfBite(const KerfSlot& s, float latScale,
 // deep through a shin bone as through a belly. Now the point carries a budget
 // of `budget` world voxels of SKIN-equivalent depth (cost 1 per voxel of
 // skin) and spends it layer by layer down the bore: each one-cell layer of
-// the bore's core costs the MEAN resistance of the matter in it (the cost
-// KerfBite charges: hardness over gear.cutHardnessRef -- bone ~3x, scar
-// 0.5x, muscle 1.25x). Empty layers (a cavity, an earlier wound) are free.
+// the bore's core costs the resistance of the matter in it per cell of depth
+// (the cost KerfBite charges: hardness over gear.cutHardnessRef -- bone ~3x,
+// scar 0.5x, muscle 1.25x), normalised by the layer's geometric cell count so
+// the angle to the lattice does not change it (see the walk below). Empty
+// layers (a cavity, an earlier wound) are free.
 // It stops where the budget runs out or at `reach`, the blade's length,
 // whichever comes first. A cheap tissue (scar) lets the point in deeper, up
 // to the blade; a hard one stops it short.
@@ -312,36 +314,79 @@ inline float KerfStabDepth(const KerfSlot& s, float latScale, float budget,
   const float hw = std::max(s.halfW * sc * 0.35f, 0.5f);
   const float hl = std::max(s.halfL * sc * 0.35f, 0.5f);
   const float reachCells = std::max(reach, 0.0f) * sc;
-  std::vector<float> sum;
-  std::vector<uint32_t> n;
-  forEach([&](float x, float y, float z, float cost) {
+  // Which one-cell layer of the core a lattice cell's centre falls in, -1 for
+  // none. ONE expression for the matter and for the geometric count below, so
+  // the two agree to the last ulp.
+  auto layerOf = [&](float x, float y, float z) -> int {
     const Vec3 d{x + 0.5f - c.x, y + 0.5f - c.y, z + 0.5f - c.z};
-    if (std::fabs(d.dot(s.u)) > hl || std::fabs(d.dot(s.v)) > hw) return;
+    if (std::fabs(d.dot(s.u)) > hl || std::fabs(d.dot(s.v)) > hw) return -1;
     const float dw = d.dot(s.w);
-    if (dw < 0.0f || dw > reachCells + 1.0f) return;
-    const size_t k = (size_t)std::floor(dw);
-    if (k >= 4096) return;
-    if (k >= sum.size()) {
-      sum.resize(k + 1, 0.0f);
-      n.resize(k + 1, 0u);
-    }
-    sum[k] += std::max(cost, 0.0f);
-    n[k]++;
+    if (dw < 0.0f || dw > reachCells + 1.0f) return -1;
+    const float k = std::floor(dw);
+    return k >= 4096.0f ? -1 : (int)k;
+  };
+  std::vector<float> sum;
+  forEach([&](float x, float y, float z, float cost) {
+    const int k = layerOf(x, y, z);
+    if (k < 0) return;
+    if ((size_t)k >= sum.size()) sum.resize((size_t)k + 1, 0.0f);
+    sum[(size_t)k] += std::max(cost, 0.0f);
   });
+  // PAID BY THE DEPTH, NOT BY THE CELLS SAMPLED (PierceChannel's rule). The
+  // core is about one cell across, so how many lattice centres a layer holds
+  // -- 0, 1, 2 -- depends only on the bore's angle to the lattice. Priced as
+  // the mean of the cells present, a layer holding NO centre read as a cavity
+  // and was crossed for free: an oblique thrust slipped through bone layers
+  // that stopped the same thrust along an axis. So each layer is charged its
+  // matter over its GEOMETRIC count (every lattice centre in that layer's
+  // core, matter or not): a full layer of one matter costs that matter's
+  // price at any angle, a layer half in air (a limb's curved surface, a
+  // wound's edge) half of it. A layer with no lattice centre at all says
+  // nothing about the matter there; it is priced as the next layer the core
+  // does sample, rather than as empty. Bounded: the count walks the box of
+  // the layers that hold matter, once per stab.
+  std::vector<uint32_t> geom(sum.size(), 0u);
+  if (!sum.empty()) {
+    const float len = (float)sum.size();
+    const Vec3 mid = c + s.w * (len * 0.5f);
+    auto ext = [&](float u, float v, float w) {
+      return std::fabs(u) * hl + std::fabs(v) * hw + std::fabs(w) * len * 0.5f;
+    };
+    const float ex = ext(s.u.x, s.v.x, s.w.x), ey = ext(s.u.y, s.v.y, s.w.y),
+                ez = ext(s.u.z, s.v.z, s.w.z);
+    // Lattice cell x has its centre at x + 0.5.
+    const int x0 = (int)std::floor(mid.x - ex - 0.5f) - 1,
+              x1 = (int)std::ceil(mid.x + ex - 0.5f) + 1;
+    const int y0 = (int)std::floor(mid.y - ey - 0.5f) - 1,
+              y1 = (int)std::ceil(mid.y + ey - 0.5f) + 1;
+    const int z0 = (int)std::floor(mid.z - ez - 0.5f) - 1,
+              z1 = (int)std::ceil(mid.z + ez - 0.5f) + 1;
+    for (int z = z0; z <= z1; z++)
+      for (int y = y0; y <= y1; y++)
+        for (int x = x0; x <= x1; x++) {
+          const int k = layerOf((float)x, (float)y, (float)z);
+          if (k >= 0 && (size_t)k < geom.size()) geom[(size_t)k]++;
+        }
+  }
   float left = std::max(budget, 0.0f) * sc;  // skin-equivalent cells
   float at = 0.0f;                            // cells along w from the entry
   for (size_t k = 0; k < sum.size() && left > 0.0f && at < reachCells; k++) {
-    const float price = n[k] ? sum[k] / (float)n[k] : 0.0f;
+    // Unsampled: paid with the next sampled layer. (A layer holding matter
+    // always counts that matter's centres; the max is a guard, not a case.)
+    if (geom[k] == 0u && sum[k] <= 0.0f) continue;
+    const float price = sum[k] / (float)std::max(geom[k], 1u);
     if (price <= 0.0f) {
       at = (float)(k + 1);
       continue;
     }
-    if (price > left) {
+    // This layer plus any unsampled ones before it, at this layer's price.
+    const float span = (float)(k + 1) - at;
+    if (price * span > left) {
       at += left / price;
       left = 0.0f;
       break;
     }
-    left -= price;
+    left -= price * span;
     at = (float)(k + 1);
   }
   // Out of matter with budget to spare: the point goes on to its reach (there
