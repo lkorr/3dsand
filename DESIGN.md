@@ -15774,6 +15774,55 @@ order, each tick:
    samples or the width of a man.
 6. **It banks**: the coordinated-turn lean `atan(v w / g)`, scaled by `bank`.
 
+**A body missing a fin** (2026-10-15; `MobDef::SwimDef::FinDef`, sidecar
+`swim.fins`; `MobSystem::SenseFins`; gate `shark-fins`). Optional: a swimmer
+whose sidecar names its pectoral pair and its tail (`left`/`right`/`tail`, by
+limb name, resolved at load) handles worse as it loses them. A fin's SHARE is
+its authoritative lattice's voxels over `MobLimb::voxelsAtSpawn` (0 once
+severed), so a ragged fin is part of a fin and a graft gives it back. The
+mechanics follow the biology (Wilga & Lauder 2000: a shark's pectorals do not
+hold it up in steady swimming -- the body's angle does -- they START pitch
+changes, take part in turns and flare to brake; the tail is the thrust), each
+an authored number:
+- **Pitch**: the pair's mean share `pa` scales `pitchRate` (down to 15%) and
+  `maxPitch` (down to 35%).
+- **Turning**: a turn pivots on the fin on its inside, so the turn rate toward
+  a side loses `turnLoss` x that fin's missing share. This is the one change
+  outside the swim drive: `Steer` takes ONE-SHOT left/right multipliers
+  (`Mob::turnCapL_/turnCapR_`, reset to 1 by Steer itself, so no walker can
+  inherit them).
+- **Braking**: one fin flared alone yaws the body toward it -- `brakeSpin` x
+  (left share - right share) x the brake's share of full, applied to the
+  heading AFTER Steer, with the steering loosened (up to 70%) while it lasts.
+  What velocity the yaw leaves off the new axis becomes sideslip: a missed
+  charge ends in a skid, flank first. The brake itself loses `brakeLoss`
+  with both fins.
+- **Trim**: it lists toward a missing fin (`listRoll`, half as much again
+  when slow) and a pitch change rolls it (`pitchRoll` per rad/s); with
+  neither fin it cannot hold its angle and SINKS (`sink`, a share of gravity,
+  halved at twice cruise) and wallows; its burst ceiling falls toward 1.6x
+  cruise below one fin's worth (a lunge, not a run).
+- **The tail**: thrust and acceleration lose `thrustLoss` x its missing share.
+- **The shock**: losing `thrashMin` of a fin, measured from the shares when
+  the last shock began (so bites add up as surely as one cut), starts up to
+  `thrash` seconds of flailing scaled by the loss -- a wobble on the wanted
+  heading and pitch, lurching drive, fast rolling, the tail whipped
+  (`PoseInputs::waveKick`) -- and the creature attacks nothing until it ends
+  (the stroke in flight is dropped; `DecideIntent` refuses new ones).
+- **Laps go the easy way round**: `ai::SelfView::turnBias` (left share - right
+  share) makes `DrawLap` / `Whim` put a lap that would circle the hard way onto
+  the easy way, certain from two-thirds of a fin's difference
+  (`Brain::easyWayFlips` counts them). Readable on purpose: a maimed shark
+  always circles toward its good side, and its charges come from there.
+
+With every fin whole every factor is exactly 1 and every term exactly 0
+(`Lerp1` returns 1.0 at k = 1, not lo + (1 - lo)), so an intact body swims to
+the bit as before. The stump bleeds through the ordinary amputation path. The
+shark's profile has no flee rule (owner call, 2026-10-15: a wounded shark
+fights to the end); fleeing is the `flee` intent's weight, set by a profile
+rule, so any future creature that should break off still can. Maimed
+(`limbsLost >= 1`) its passes come sooner (`cadence` x0.7).
+
 **The pose**: `PoseInputs::attitude` (pitch, roll) is composed on the root in
 the rig frame straight after the clip blend, so every segment rides it; the
 undulation is the snake's `ApplySlither` -- the same wave on the same chain

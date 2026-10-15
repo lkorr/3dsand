@@ -1568,6 +1568,22 @@ float LapRadius(const OrbitTuning& ob, const SelfView& self, float u) {
   return std::max(r, std::max(2.0f, self.length * 0.75f));
 }
 
+// THE EASY WAY ROUND (SelfView::turnBias): a body that turns one way better
+// than the other -- a shark missing a pectoral -- puts a lap that would go
+// its hard way onto its easy way instead, with a chance growing with the
+// bias (certain from two-thirds of a fin's difference). A lap is a turn held
+// for seconds; a hunter that can barely make it one way round goes the other.
+void PreferEasyWay(Brain& b, const SelfView& self, uint32_t h) {
+  if (self.turnBias == 0.0f || b.orbitSign == 0) return;
+  const int easy = self.turnBias > 0.0f ? 1 : -1;
+  if (b.orbitSign == easy) return;
+  const float p = std::min(1.0f, std::abs(self.turnBias) * 1.5f);
+  if ((float)(h & 0xFFFFu) / 65535.0f < p) {
+    b.orbitSign = easy;
+    b.easyWayFlips++;
+  }
+}
+
 // The next whim (OrbitTuning::whimMin..whimMax ticks out), or none.
 void BookWhim(Brain& b, const OrbitTuning& ob, const SelfView& self,
               uint32_t tick) {
@@ -1593,6 +1609,7 @@ void Whim(Brain& b, const OrbitTuning& ob, const SelfView& self,
     b.orbitSign = -b.orbitSign;
     b.reversals++;
   }
+  PreferEasyWay(b, self, rng::Hash3((uint32_t)self.id ^ kSaltOrbit, b.orbitWhim, 23u));
   BookWhim(b, ob, self, tick);
 }
 
@@ -1627,6 +1644,7 @@ void DrawLap(Brain& b, const OrbitTuning& ob, const SelfView& self,
     b.orbitSign = -b.orbitSign;
     b.reversals++;
   }
+  PreferEasyWay(b, self, rng::Hash3((uint32_t)self.id ^ kSaltOrbit, b.orbitLap, 15u));
 }
 
 // THE DARTER'S HOVER (OrbitTuning::dart*). The station: the jaws
