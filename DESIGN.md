@@ -11436,6 +11436,24 @@ were. Nothing about storage or rendering changes: the human already paid for
   The lash colour is `colors.lash`, a tone of the hair. The NOSTRILS are a
   derived tone of the skin (`NOSTRIL_TONE`, the owner's pick off shana's
   repainted mouth), lighter than the skin's shade they used.
+- **The art palette is banked (2026-10-15).** The shared run of 255 merged
+  art colours was full (486 wanted across the shipped models), so every model
+  loaded after it took the NEAREST colour already there -- which is how a
+  0.1-step lash opacity rendered as a switch in game while the Characters page,
+  which draws exact colours, showed a ramp. The run is now `kArtBanks` (8) x
+  `kArtBankSlots` (255) entries in the material table. A voxel's art byte is
+  unchanged (8 bits, 1-based) but means an index WITHIN ITS MODEL'S BANK:
+  `MicroBodyMergeArt` puts all of a prefab's colours in one bank (first fit,
+  deduplicated within it, `Prefab::artBank`), the bank rides
+  `MicroBodyModelGpu::cutFaces` bits 8..15 to `microbody.wgsl`
+  (`microBodyArtBaseOf`), and every CPU reader turns a byte into a colour
+  with `MicroBodyArtFlat` (debris ground tint, burn stand-ins per bank, the
+  item preview). Clones, carve gobbets and fitted shells copy their source's
+  bank; a body rising undead re-finds its living bytes in the undead def's
+  bank. The cast may use banks 0..6; bank 7 is the wardrobe's (its dyeable
+  weave must stay exact greys). The cube path (`debris.wgsl`, 4-bit art)
+  reads bank 0 only, as it only ever reached the first 15 entries.
+
 - **`humanSkinPass`** runs on every part of a human after the upscale and
   PAINTS ONLY — no cell added or removed, so armour boxes, the collider, the
   anchors and the left/right mirror are untouched (`test_mobgen.mjs` §T
@@ -26475,9 +26493,11 @@ and all four are the reason for it:
   cloned, nothing is re-packed, and the cost of a dye is one word per instance.
 * **The colour is CONTINUOUS.** The rejected alternative — allocating art
   palette slots per dye and baking it into the voxels — costs nothing at shade
-  time and has a hard ceiling: the merged art palette is 255 entries *total*
+  time and has a hard ceiling: the merged art palette was 255 entries *total*
   across every prefab in the game (`kArtPaletteSlotsGpu`), shared with every
   creature's skin, so a six-tone ramp buys about forty simultaneous colours.
+  (Since 2026-10-15 it is eight banks of 255 -- see "The art palette is
+  banked" -- but a model still addresses only its own bank's 255.)
 * **A severed sleeve keeps its colour.** The dye rides `MicroBodyRef`, which is
   a render description and is what `DebrisSystem::AdoptBody` already takes — so
   the hand-off path needed no new argument.

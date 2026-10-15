@@ -16563,7 +16563,7 @@ Status GatePoolHuman(Ctx& c, std::string& detail) {
   // ATTRIBUTION for claim G: how full the merged art palette already is
   // before this gate builds anything (the shipped cast + whatever earlier
   // gates composed), so a full palette names who filled it.
-  const size_t art0 = c.mobs.MicroSet() ? c.mobs.MicroSet()->artColors.size() : 0;
+  const size_t art0 = c.mobs.MicroSet() ? MicroBodyArtUsed(*c.mobs.MicroSet()) : 0;
   const std::vector<std::string> names = c.mobs.PoolNames();
   std::string fem, mal;
   for (const std::string& n : names) {
@@ -16634,7 +16634,7 @@ Status GatePoolHuman(Ctx& c, std::string& detail) {
                        c.mobs.RuntimeDefCount() == beforeBad;
 
   // ---- G ----------------------------------------------------------------------
-  const size_t art = c.mobs.MicroSet() ? c.mobs.MicroSet()->artColors.size() : 0;
+  const size_t art = c.mobs.MicroSet() ? MicroBodyArtUsed(*c.mobs.MicroSet()) : 0;
   const bool palette = art > 0 && art < (size_t)kArtPaletteSlotsGpu;
 
   const bool ok = built && cached && spawned && zombie && refused && palette;
