@@ -98,6 +98,12 @@ enum TickButton : uint32_t {
   TB_DEMON_PRESENT = 1u << 21,
   TB_DEMON_DISMISS = 1u << 22,
   TB_DEMON_LOOKAWAY = 1u << 23,
+  // HELD while the hands are taken away from the world by the FRAME, not by
+  // the player: the mouse is not captured (inventory, Esc, alt-tab). The tick
+  // cannot tell a button released from a button nobody can see any more, and
+  // the difference matters where a RELEASE is the verb: a drawn bow lets its
+  // string down instead of loosing (session.cpp THE BOW).
+  TB_HANDS_AWAY = 1u << 24,
 };
 
 // Bumped whenever a field is added, removed or changes meaning. Carried in the
@@ -109,7 +115,8 @@ enum TickButton : uint32_t {
 // 8: TB_DEMON_TALK / PRESENT / DISMISS / LOOKAWAY + `contractHash`,
 //    `demonRef` (demons D5; 76 -> 84 bytes).
 // 9: TB_CROUCH's PRESSED edge means something (the crouch toggle / prone).
-constexpr uint32_t kTickInputVersion = 9;   // 2: TB_THROW, 3: TB_APPLY
+// 10: TB_HANDS_AWAY (held: the frame has taken the hands; a draw is let down).
+constexpr uint32_t kTickInputVersion = 10;   // 2: TB_THROW, 3: TB_APPLY
 
 // THE CONVERSATION COMMAND (TickInput::talk, game/dialogue.h). A choice made
 // in the conversation panel is a player INPUT like a strike or a use, so it

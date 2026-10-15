@@ -2309,6 +2309,18 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
           s.bowDrawTicks = 0;
           s.bowHand = bh;
         }
+        // INTERRUPTED IS NOT RELEASED. The loose below is "the button is up",
+        // and a stun (its command zeroed in TickAuthority), a conversation, or
+        // the frame taking the hands (TB_HANDS_AWAY: inventory, Esc, alt-tab)
+        // all read as up without the player letting go. Each lets the string
+        // down instead -- the draw ends, the arrow stays in the kit -- as an
+        // NPC archer's stun does (mob_archery.cpp StepDraw).
+        const bool letDown = avatar.Stunned(tick) || s.talk.active ||
+                             ti.Held(TB_HANDS_AWAY);
+        if (letDown && s.bowDrawTicks > 0) {
+          stopDrawClip();
+          s.bowDrawTicks = 0;
+        }
         const Hand bowHand = HandAt(bh >= 0 ? bh : 0);
         // CROUCHED, the bow is laid flat (bow_draw_crouch): a low draw from
         // cover. Prone has its own pose and takes no draw clip change here.
@@ -2316,7 +2328,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
         const std::string drawClip = avatar.HandClip(
             crouchDraw ? "bow_draw_crouch" : "bow_draw", bowHand);
         const uint32_t bowBtn = bowHand == Hand::Left ? TB_ALT : TB_ATTACK;
-        if (bowDef != nullptr && ti.Held(bowBtn) &&
+        if (bowDef != nullptr && !letDown && ti.Held(bowBtn) &&
             (s.bowDrawTicks > 0 || have > 0)) {
           if (s.bowDrawTicks == 0) s.lastHand = bowHand;
           // Started, or the stance changed under the draw: the other clip

@@ -15890,6 +15890,10 @@ int main(int argc, char** argv) {
     // between two ticks reads as released on the second one.
     feeder.Hold(TB_ATTACK, mouseL);
     feeder.Hold(TB_ALT, mouseR);
+    // ...and whether the mouse can be read at all: uncaptured, a bow's button
+    // reads as up, and the tick must not take that for a loose (session.cpp
+    // THE BOW). The scripted archery shot drives mouseL uncaptured on purpose.
+    feeder.Hold(TB_HANDS_AWAY, !captured && !g_shotArchery);
     // G held winds up a throw of a held vessel; letting go throws it
     // (game/container.h). Only a throwable vessel in hand reads it; the hold
     // is decided with the take/drag above (`gThrowHold`).
