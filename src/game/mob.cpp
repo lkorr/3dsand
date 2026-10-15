@@ -9786,6 +9786,13 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // still runs — a body knocked flat goes on bleeding from where it lies.
     if (mob.alive_ && mob.ragdoll_ == Mob::RagdollPhase::Limp) {
       mob.TickRagdollLimp(world, dt);
+      // ---- THE SHIELD COMES DOWN (Mob::StepShield) -------------------------
+      // A ragdoll holds nothing up: StepShield lowers the raise whenever the
+      // body is not on its feet, but only if it is stepped. Unstepped, a guard
+      // knocked flat with its shield up kept the raise it fell with through
+      // the whole limp and get-up -- still a guard to FindShieldBlock, the
+      // actor list and every watcher. The avatar steps it every tick.
+      mob.StepShield();
       // ---- A LIMP BODY IN WATER FLOATS, AS A CORPSE DOES ------------------
       // Liquids are not in the collider: without this a creature knocked
       // into a lake fell through it to the bed. Same per-limb Archimedes as
@@ -9807,6 +9814,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       // pose (the crouch-then-rise curve). No intent and no drive, so it
       // cannot walk off before its feet are under it.
       mob.TickGetUp(dt);
+      mob.StepShield();  // still lowering: see the limp branch
       UpdateAnimation(mob, def, world, dt, tick);
       mob.SubmitPose(dt, /*writeXf=*/false);
     } else if (mob.alive_) {
@@ -9879,6 +9887,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       }
       bpDrive.Stop();
       if (mob.ragdoll_ == Mob::RagdollPhase::Limp) {
+        mob.StepShield();  // fell this tick: the shield starts down now
         mob.BleedTick(tick, world, ops, spawns, bleedOps);
         mi++;
         continue;
