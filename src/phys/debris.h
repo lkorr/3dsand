@@ -1515,7 +1515,13 @@ class DebrisSystem {
   // 5 (2026-09-26): THE BRUISE BYTE (voxload.h PrefabVoxel::bruise), in what
   // was the skin voxel's padding byte. Same stride, so a v4 section still
   // LOADS -- with that byte zeroed, because in v4 it was never written.
-  static constexpr uint32_t kSaveVersion = 5;
+  //
+  // 6 (2026-10-14): BODY::DEAD, as one u32 flags word after each record (bit
+  // 0), the word the strap-group format below always carried. Without it every
+  // reloaded body was never-alive: a severed limb lost corpseAirFraction and
+  // sank beside the corpse that still floated, stopped being carrion, and fell
+  // out of the coat and burn passes. v4/v5 still load, as never-alive.
+  static constexpr uint32_t kSaveVersion = 6;
   // `skipGroup` (2026-10-08): a STRAP GROUP (StrapGroupOf) any member of which
   // answers true is left out -- the ground-item section writes those groups as
   // its own records (game/persist.cpp 'ITMS' v9), so one body is never saved
@@ -1535,8 +1541,8 @@ class DebrisSystem {
   //
   // The bytes are the DBRS per-body record, exactly (pose, scales, dye, bleed,
   // strap offset, both lattices; WriteBodyRecord), with the strap index local
-  // to the group and one flags word per body ('DBRS' never carried `dead`, so
-  // a parked severed head came back as plain debris). Written by
+  // to the group and one flags word per body ('DBRS' did not carry `dead`
+  // before its v6, so a parked severed head came back as plain debris). Written by
   // game/persist.cpp's ground-item records -- which is what parks a dropped
   // helm WITH the head it is on, rather than unstrapping it and losing the
   // head (PLAN_save_system.md "Ground items do not park", decided 2026-10-08).

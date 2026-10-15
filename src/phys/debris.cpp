@@ -8034,6 +8034,10 @@ void DebrisSystem::SaveState(
       for (size_t j = 0; j < saved.size(); j++)
         if (saved[j]->handle == b.wornHost) { hostIdx = (uint32_t)j; break; }
     WriteBodyRecord(w, b, hostIdx);
+    // v6: the per-body flags word the group format already carried (bit 0 =
+    // Body::dead). It decides the floating density (corpseAirFraction), the
+    // carrion test and the coat/burn passes, none of which the lattice says.
+    w.U32(b.dead ? 1u : 0u);
   }
 }
 
@@ -8170,7 +8174,7 @@ uint64_t DebrisSystem::RestoreBody(SavedBody&& s, bool follower, bool dead) {
 }
 
 bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) {
-  if (version != kSaveVersion && version != 4u) {
+  if (version < 4u || version > kSaveVersion) {
     std::fprintf(stderr, "debris: unknown DBRS section version %u\n", version);
     return false;
   }
@@ -8191,14 +8195,21 @@ bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) 
   std::vector<PendingStrap> straps;
   for (uint32_t i = 0; i < count && r.ok; i++) {
     SavedBody s;
-    if (!ReadBodyRecord(r, version, s) || s.voxels.empty()) continue;
+    if (!ReadBodyRecord(r, version, s)) continue;
+    // The flags word is read before any skip, or the next record would start
+    // four bytes early. A v4/v5 section never wrote it: every body there
+    // loads as never-alive, which is what it always did.
+    uint32_t flags = 0;
+    if (version >= 6u && !r.U32(flags)) continue;
+    if (s.voxels.empty()) continue;
     if (bodies_.size() >= MaxBodies()) break;  // same ceiling spawning obeys
     PendingStrap ps;
     ps.self = i;
     ps.host = s.hostIdx;
     ps.relPos = s.relPos;
     for (int q = 0; q < 4; q++) ps.relQuat[q] = s.relQuat[q];
-    const uint64_t h = RestoreBody(std::move(s), ps.host < count, false);
+    const uint64_t h =
+        RestoreBody(std::move(s), ps.host < count, (flags & 1u) != 0);
     if (h == 0) continue;
     handleOfSaved[i] = h;
     if (ps.host < count) straps.push_back(ps);
@@ -8281,7 +8292,9 @@ bool DebrisSystem::LoadBodyGroup(ByteReader& r, std::vector<uint64_t>& handles) 
   if (!r.U32(gv) || !r.U32(bv) || !r.U32(n)) return false;
   // A strap group is a host and what it wears: a handful of bodies. A count
   // past this is a corrupt record, refused before anything is reserved.
-  if (gv != kBodyGroupVersion || (bv != kSaveVersion && bv != 4u) || n > 256u) {
+  // The per-body record is the DBRS one, read at its own version: 4, 5 and 6
+  // are the same bytes here (the group always wrote its own flags word).
+  if (gv != kBodyGroupVersion || bv < 4u || bv > kSaveVersion || n > 256u) {
     r.ok = false;
     return false;
   }
