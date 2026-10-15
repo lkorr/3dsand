@@ -704,6 +704,50 @@ fn rngCellId(c : vec3<i32>) -> u32 {
 // was the bug. `supportOut` is still declared above, which is the predicate
 // LoadShader strips the block on.
 
+// ---- THE CA'S SUPPORT-LOSS FLAG FOR A REWRITTEN NEIGHBOUR (common.wgsl
+// flagSupportLoss, made order-free for this dispatch; extends cross-vendor
+// audit #10 -- sim_mutate's flagSupportLossBrush, sim_explode's
+// flagSupportLossBlast -- to the CA, audit DET-1 2026-10-14) ---------------
+// When the acting cell c rewrites its face neighbour n = c + d (a PAIR rule's
+// product, a coat's partner, a stain eating its cell), flagSupportLoss(n)
+// would read n's six neighbours -- and one of them, n + d = c + 2d, is at
+// distance 2 from c: inside the write box of the same-colour actor c + 3d
+// ("THE READ REACH, AND WHY THERE IS A SNAPSHOT", below). Read before that
+// actor's store it is one material, after it another, so whether its chunk
+// got flagged was a function of GPU scheduling; and the flag queues an island
+// scan whose cooldowns and drain move WHEN islands drop, which is world state.
+//
+// So the far face is never read: it is treated as solid and its chunk flagged
+// unconditionally (a superset -- an island scan that finds nothing -- and a
+// pure function of the firing), exactly as the brush treats a covered
+// neighbour. The other five faces of n are within distance 1 of c (c itself,
+// or a cell diagonal to it), inside c's own write box, so only c can write
+// them and their reads stay. Everything else is common.wgsl's rule verbatim;
+// keep the copies in step. `c` must be the ACTOR and n one face away from it.
+fn flagSupportLossNbr(c : vec3<i32>, n : vec3<i32>, oldKlass : u32, newMat : u32) {
+  if (oldKlass != CLASS_SOLID && oldKlass != CLASS_POWDER) { return; }
+  let nm = newMat & 0xFFFu;
+  var keepsAbove = false;
+  if (nm != MAT_AIR) {
+    let nk = materials[nm].klass;
+    if (nk == CLASS_SOLID) { return; }  // still supports everything
+    if (nk == CLASS_POWDER) { keepsAbove = true; }
+  }
+  let away = n + (n - c);  // the face pointing away from the actor
+  for (var i = 0u; i < 6u; i++) {
+    if (oldKlass == CLASS_POWDER && i != 1u) { continue; }  // up only
+    if (keepsAbove && i == 1u) { continue; }
+    let nn = n + faceDir(i);
+    if (!inWindow(nn, ptOrigin())) { continue; }
+    var solid = all(nn == away);  // another actor's box: never read it
+    if (!solid) {
+      let nmat = voxMat(voxWordAt(nn));
+      solid = nmat != MAT_AIR && materials[nmat].klass == CLASS_SOLID;
+    }
+    if (solid) { atomicStore(&supportOut[chunkIndexW(nn)], 1u); }
+  }
+}
+
 
 // Mark the chunk containing world cell c dirty for next tick, plus every
 // neighbor chunk c borders (cross-chunk neighbors re-evaluate; sleeping is
@@ -3056,7 +3100,7 @@ fn coatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
       else { voxStore(pni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp)); }
       markVoxActive(pni);
       markDirtyR(n, DIRTY_R_REACTW);
-      if (!psyn) { flagSupportLoss(n, materials[pmat].klass, rule.prodNbr); }
+      if (!psyn) { flagSupportLossNbr(c, n, materials[pmat].klass, rule.prodNbr); }
     }
     // Clause 2c: the flame was made ON the cell, so a cell that can catch
     // CATCHES -- it takes its catch form (its own heat rules' burning product,
@@ -3364,7 +3408,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
             markVoxActive(ni);
             markDirtyR(n, DIRTY_R_REACTW);
             if (!synthFluid) {
-              flagSupportLoss(n, materials[nmat].klass, rule.prodNbr);
+              flagSupportLossNbr(c, n, materials[nmat].klass, rule.prodNbr);
             }
           }
           if (rule.prodSelf != PROD_KEEP) {
@@ -3808,7 +3852,7 @@ fn doStaining(c : vec3<i32>, idx : u32, selfWord : u32, m : Material,
       voxStore(ni, 0u);
       markVoxActive(ni);
       // The voxel that vanished may have been holding a solid up.
-      flagSupportLoss(n, materials[nmat].klass, MAT_AIR);
+      flagSupportLossNbr(c, n, materials[nmat].klass, MAT_AIR);
     }
     break;  // one neighbour per tick — bounds the rule's rate (rule 2)
   }
