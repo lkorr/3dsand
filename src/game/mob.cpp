@@ -16766,10 +16766,21 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick, ScarPass* scar) {
     return false;
   };
   // What the scar regrows: the creature's TISSUE (MobDef::tissue: skin,
-  // flesh, muscle -- whatever bleeds), never bone. An empty mask is "no
-  // anatomy", where every cell is tissue (the soak's own fallback).
+  // flesh, muscle -- whatever bleeds), never bone. Two things that are not
+  // living flesh never scar, however the mask reads:
+  //   - an EMPTY mask. The soak reads it as "no anatomy, every cell is
+  //     tissue", but here that would regrow a creature with no blood at all
+  //     (the android, `"bleed": null`) -- plating, circuitry, its core -- as
+  //     pink flesh that is softer than what was lost and bleeds blood. No
+  //     blood, no tissue, nothing grows back.
+  //   - a SHELL material (MaterialDef::shell: brass, clockwork, alloy,
+  //     circuitry...). The automaton's clockwork crumbles to its oil, so the
+  //     mask counts it as tissue for every wound rule; a gear train does not
+  //     knit, and a scar there would turn plate-priced works into flesh.
+  // The hp half of the heal (ScarTick step 2) is not gated by this.
   auto isTissue = [&](uint32_t m) {
-    return def.tissue.empty() || (m < def.tissue.size() && def.tissue[m] != 0);
+    return !def.tissue.empty() && m < def.tissue.size() && def.tissue[m] != 0 &&
+           !sys_->MatIsShell(m);
   };
   // "Skin voxels shouldn't repair until the surface beneath them repairs": a
   // surface cell may be rebuilt once one of its DEEPER neighbours (a recipe
