@@ -1383,5 +1383,22 @@
   "denoise.midHfMaxRatio": "0.6",
   "denoise.midMeanMaxDelta": "3.0",
   "denoise.nearMaxDiff": "0",
-  "denoise": "pass"
+  "denoise": "pass",
+  "_distantCalib_about": "distant-calib-matrix (src/test/selftest_distant_calib.cpp, docs/PLAN_distant_npcs.md D2a): the duel matrix that calibrates the distant tier's abstract hit model + the pure resolver's unit arm + a log-off/log-on bit-identity arm. DEFAULT (cheap): the bouts marked inDefault, `rounds` rounds of `ticks` melee and `rangedTicks` ranged ticks. SANDVOX_DISTANT_CALIB=<out.json>: every bout for `calibRounds` rounds of `calibTicks` / `calibRangedTicks` and the reduced table WRITTEN (assets/mobs/distant_combat.json is that file). minStrokes / minSamples: the matrix's floor and the per-weapon-row sample floor. minBoutsHurt: how many bouts must have drawn blood (a side below 99% of its starting hp) -- a bout nobody hurt is a fixture that never engaged; DECIDED bouts are asserted only in the calibration mode (a full-fidelity kill takes 600+ ticks). unit*: the resolver's 10k-roll arm and its tolerances (absolute on rates, relative on mean hp). bleedProbeHp / burnProbeVoxels: the two probes' single acts. neutralTicks: the log-neutral duel's length. *Observed-style keys (strokes, pooledHitRate, <matchup>.winA / ttkTicks) are measurements for --rebaseline, not thresholds.",
+  "distantCalib.rounds": "1",
+  "distantCalib.ticks": "300",
+  "distantCalib.rangedTicks": "300",
+  "distantCalib.calibRounds": "8",
+  "distantCalib.calibTicks": "1800",
+  "distantCalib.calibRangedTicks": "1200",
+  "distantCalib.minStrokes": "30",
+  "distantCalib.minBoutsHurt": "6",
+  "distantCalib.minSamples": "8",
+  "distantCalib.unitRolls": "10000",
+  "distantCalib.unitTol": "0.03",
+  "distantCalib.unitHpTol": "0.06",
+  "distantCalib.bleedProbeHp": "30",
+  "distantCalib.burnProbeVoxels": "60",
+  "distantCalib.neutralTicks": "150",
+  "distant-calib-matrix": "pass"
 }

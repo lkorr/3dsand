@@ -21,6 +21,7 @@
 #include "game/dye.h"
 #include "game/rigrender.h"
 #include "game/sidecar.h"
+#include "game/stroke_log.h"  // the distant tier's calibration log (observation only)
 #include "game/wornfit.h"  // a looted piece's damage moved onto this wearer's fit
 #include "phys/bodystain.h"
 #include "phys/floatrho.h"
@@ -7351,6 +7352,9 @@ void MobSystem::StartStroke(Mob& mob, int styleIndex, uint64_t targetId,
   // Mirrored, it is the clip's own mirror or nothing (MirroredClipName).
   if (const std::string clip = mob.StrokeClip(sty, st.mirrored); !clip.empty())
     mob.PlayClip(clip);
+  // THE CALIBRATION LOG (game/stroke_log.h): every stroke STARTED is a record,
+  // so a miss is a number and a hit rate is computable. Off = one branch.
+  if (strokelog::Sink* slog = strokelog::Active()) slog->OnStart(*this, mob, tick);
 }
 
 bool MobSystem::ForceAttack(uint64_t mobId, const std::string& style,
@@ -7847,6 +7851,8 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     // The fist was cut off, the sword left the hand, the creature died, or the
     // style library reloaded out from under a live swing. Drop the pose claim
     // rather than freezing the arm mid-cut.
+    if (strokelog::Sink* slog = strokelog::Active())
+      slog->OnEnd(mob, tick, strokelog::EndReason::Aborted);
     st.Reset();
     mob.ClearStrikeEffector();
     mob.SetWeaponPose(WeaponPose{});
@@ -7960,9 +7966,14 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     sw.selfMounted = nw != nullptr &&
                      mob.StrikeEffectorKind() == StrikeEffectorMode::Chain;
     sw.valid = true;
+    // The calibration log reads the target before and after this stroke's
+    // sweeps (game/stroke_log.h): what the blow did is the difference.
+    strokelog::Sink* const slog = strokelog::Active();
+    if (slog != nullptr) slog->BeforeSweep(*this, mob);
     const EdgeSweepResult res =
         MeleeSweepDamage(sw, st.melee.tuning, mob, *phys_, *this, *debris_,
                          world, spawns);
+    if (slog != nullptr) slog->OnSweep(mob, res);
     st.sweeps++;
     st.bodiesHit += res.bodiesHit;
     st.probesCast += res.probesCast;
@@ -8002,6 +8013,7 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
       const EdgeSweepResult hr =
           MeleeSweepDamage(hs, st.melee.tuning, mob, *phys_, *this, *debris_,
                            world, spawns);
+      if (slog != nullptr) slog->OnSweep(mob, hr);
       st.bodiesHit += hr.bodiesHit;
       if (hr.arrested) {
         st.arrested = true;
@@ -8010,6 +8022,7 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
         st.phaseTick = 0;
       }
     }
+    if (slog != nullptr) slog->AfterSweep(*this, mob, tick);
   }
   if (haveEdge) {
     st.edgeBase = base;
@@ -8184,6 +8197,8 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
   switch (StepStrokeProgram(st, sty, st.melee, liveAz, liveEl, lr,
                             1.0f / 30.0f, right, up, fwd)) {
     case StrokeStepResult::Finished:
+      if (strokelog::Sink* slog = strokelog::Active())
+        slog->OnEnd(mob, tick, strokelog::EndReason::Finished);
       st.Reset();
       // ...and hand the part back. A punch is over; a sword is still held, and
       // ClearStrikeEffector falls through to it rather than to nothing.
