@@ -292,6 +292,39 @@ are the OTHER half of this frame; they are not additive with `nomicro`.
    read (shadow_resolve.wgsl's 2026-10-03 note); in flight today it is 0.17
    (peaks-route) to 0.26 ms (ticket flight) mean, p99 1.34. Nothing left to
    take here; the largest row of the per-frame table is now `ray_start_trace`.
+   **Re-opened and handed off 2026-10-15 (worktree agent-a034c8b7, branch
+   `worktree-agent-a034c8b79d4282554`, on main e145446).** The wave-1014 work
+   (fresh windows cast whole, far-patch openness fans, far gathers) took the
+   ticket flight's resolve to **2.2 ms a frame**. READ THE TABLE RIGHT: the
+   `--frames` per-pass CSV showed it as 5.5 ms on "tick frames" and 0 on the
+   rest, because the sim PassTimer is kicked only on tick frames and the
+   per-frame rows recorded on the frames between are summed into the next
+   tick frame's row (tick-frame row / frames-since-last-tick = 2.07-2.33 ms
+   for gaps of 1-3 frames). The same holds for `ray_start_trace`,
+   `cloud_*`, `gi_gather`, `opennessRefresh`: divide by the gap, or read the
+   all-frames mean (`framepass.py`'s "ms/frame"). Attribution: a counter
+   build (resolve classes read back per frame, not committed) and stub arms
+   (`nearone`, `full3`, `noopen`, `nomarch`, `nogather`, `nofg` ...), one exe,
+   asset trees A/B, exclusive. Per frame: 19.5k near requests (5.4k fresh: 5.3k
+   settled by the three probes, ~190 casting all sixteen), 23k far (5.8k
+   fresh, 7.2k fans; marches 23k but only 0.11 ms of the pass). The sixteen-ray
+   windows cost 0.61 ms and the fans 0.44 ms through warp divergence (a warp
+   runs as long as its slowest lane; nearly every warp held one). Landed
+   (DESIGN.md 9.s "The rays are shared"): a far slot between refreshes is held
+   (`raymarch.wgsl shadowSlotHeld`; fresh far 5.8k -> 3.6k), one inlined copy of
+   each march, and the resolve's rays as a per-warp task list. Result, n=2
+   each interleaved: **2.19-2.20 -> 1.16-1.20 ms a frame**, wall mean 13.4-13.5
+   -> 12.3, p50 11.6-11.7 -> 9.7-9.8. REFUTED here: sorting a 256-lane
+   workgroup's requests by kind (+0.4 ms; the group holds the SM until its
+   slowest warp ends), seeding a fresh window from its pool parent (-0.05,
+   dropped). LEFT (~1.2 ms): ~14k one-ray window refreshes, ~5k fresh windows'
+   probes, ~23k far marches, ~4.5k fans -- now ray count, not divergence. The
+   next levers: fewer fresh far patches (3.6k a frame are genuinely new
+   ground at the screen edge, the handoff sphere and the level rings while
+   strafing -- a world-keyed openness memo would only help re-visits), and the
+   kernel's occupancy (80 registers, ~124 B a lane of driver shared memory,
+   both from the far path; splitting near and far into two dispatches is a
+   C++ pass-table change).
 2. **Async compute queue for the sim** (ROADMAP_scale.md §3.6, never started — still true 2026-10-02: `src/gpu/` has one queue).
    Hides most of the ~13 ms tick side under the raymarch in flight; zero win
    standing still. Large: the barrier generator in `vk_record.cpp` is

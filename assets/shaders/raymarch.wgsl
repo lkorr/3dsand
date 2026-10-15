@@ -8884,6 +8884,23 @@ fn shadowRefreshPhase(key : u32) -> u32 {
 fn shadowRefreshDue(key : u32) -> bool {
   return ((R.frameIdx + shadowRefreshPhase(key)) % SHADOW_REFRESH_PERIOD) == 0u;
 }
+// ---- A FAR PATCH BETWEEN ITS REFRESHES IS NOT FREE (2026-10-15, perf) -------
+// shadowSlotLive is "requested this frame or last", and a near patch on screen
+// re-stamps its slot every frame, so that is "on screen". A FAR patch stamps
+// only on its refresh frames (farSlotRead: one frame in SHADOW_REFRESH_PERIOD),
+// so for two frames of every four a far patch on screen read as free, and any
+// claim landing in its set took it -- the first non-live way, ahead of the
+// empty ones after it. The patch then came back FRESH: a new claim, a frame of
+// fallback, and its whole first resolve again (the march, the openness fans,
+// a buried patch's gather). Measured on the 12-10-09 ticket flight: 5.8k far
+// patches a frame resolved fresh out of ~70k on screen. So a claim also passes
+// over a VALID slot stamped within one refresh period: a patch that is being
+// read. Mod-16 like shadowSlotLive: a slot idle 16-20 frames (32-36, ...)
+// reads as held for those frames, which costs a probe, never a wrong value.
+fn shadowSlotHeld(s : u32, curFrame : u32) -> bool {
+  return shadowStateValid(s) &&
+         ((curFrame - shadowStateRequested(s)) & 15u) <= SHADOW_REFRESH_PERIOD;
+}
 
 // ---- THE FIND IS A PLAIN LOAD (2026-10-03, raymarch-far) -------------------
 // A set is 8 slots x 2 words = one 64-byte line. The find used to walk it with
@@ -8992,6 +9009,7 @@ fn shadowSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
         }
         continue;
       }
+      if (shadowSlotHeld(s, curFrame)) { continue; }
       let r = atomicCompareExchangeWeak(
           &shadowCache[b * 2u + 1u], s,
           shadowPackState(0u, 0u, curFrame, false, ver));
@@ -15518,7 +15536,7 @@ fn farSkySolid(level : u32, c : vec3<i32>, b : FarBox) -> bool {
 // THE FAR SKY FAN is not in fs any more: the ground's (2026-10-14) and the
 // features' (the same day) openness are both the near walk's DEFINITION,
 // measured once per far shadow patch in the resolve (shadow_resolve.wgsl
-// farGroundOpen / farGroundOpenByte) and read from the patch word
+// farOpenRay / farGroundOpenPlan) and read from the patch word
 // (farGiCached). farSkySolid stays for SEAM_DBG and as the resolve's twin.
 fn farSkyFade(tFine : f32) -> f32 {
   return 1.0 - smoothstep(FAR_SKY_FADE_START_M, FAR_SKY_FADE_END_M, tFine * VOXEL_METERS);
@@ -15579,7 +15597,7 @@ fn farFeatureBounce(hAbove : f32, tFine : f32, fg : f32, lobe : bool) -> f32 {
 // openness) the noon tree shadows on it lifted with it.
 //
 // So a heightfield face and a card take the near walk's DEFINITION, measured
-// over the cascade once per far patch (shadow_resolve.wgsl farGroundOpen,
+// over the cascade once per far patch (shadow_resolve.wgsl farOpenRay,
 // 2026-10-14: the face's own fan, the reach along the ray, the endpoint
 // up-march, the outer stretch as a block mask -- why each, and what it
 // measured, is there), behind a chunk-word prefilter over the fan's footprint
@@ -17297,7 +17315,7 @@ fn fs(in : VSOut) -> FSOut {
       // THE FAR GROUND'S OPENNESS IS THE PATCH'S (2026-10-14, ticket
       // 2026-10-09_14-23-01): the near walk's DEFINITION marched over the
       // cascade from the patch, once per patch per FAR_GI_PERIOD resolves
-      // (shadow_resolve.wgsl farGroundOpen). It replaces the closed form where
+      // (shadow_resolve.wgsl farOpenRay). It replaces the closed form where
       // the patch's prefilter found something standing near (byte != 255); a
       // card reads its cell's top patch, the ground's up face under it. Until
       // the patch publishes, the closed form (one frame, a borrowed word).
