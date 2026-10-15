@@ -333,6 +333,13 @@ struct DeathBody {
     // never cuts and "hide gear" takes away).
     int figSlot = -1;
     bool isLimb = false;
+    // AN ARROW STUCK IN THE BODY (Mob::EmbedArrow) is not gear: it is the
+    // wound's own record of where it went, so it survives every peel and the
+    // undressing (owner, 2026-10-14: peel back to see what it hit). Never
+    // peeled itself (isLimb stays false, so it is not measured either), and
+    // under "isolate" it goes with its host's figure slot, `hostFig`.
+    bool isArrow = false;
+    int hostFig = -1;
     char name[32] = {};  // the part's authored name, for the probe readout
     // WHERE ITS JOINT WAS, world voxels, at the instant of death (after the
     // joint-consistency snap). The frozen pose is pinned by THIS rather than

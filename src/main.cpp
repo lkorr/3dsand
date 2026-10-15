@@ -9057,6 +9057,11 @@ int main(int argc, char** argv) {
       fl.haveLive = phys.GetTransform(fl.body, fl.lastLive);
       fl.isLimb = avatar.Def() && i < (int)avatar.Def()->limbs.size();
       fl.figSlot = fl.isLimb ? BodySlotFor(avatar.PartName(i), avatar.PartTag(i)) : -1;
+      if (avatar.IsArrowSlot(i)) {
+        fl.isArrow = true;
+        const int host = avatar.WornHostOf(i);
+        fl.hostFig = host >= 0 ? BodySlotFor(avatar.PartName(host), avatar.PartTag(host)) : -1;
+      }
       std::snprintf(fl.name, sizeof fl.name, "%s", avatar.PartName(i));
       deathBody.limbs.push_back(fl);
     }
@@ -9087,6 +9092,11 @@ int main(int argc, char** argv) {
       fl.haveLive = true;
       fl.isLimb = avatar.Def() && i < (int)avatar.Def()->limbs.size();
       fl.figSlot = fl.isLimb ? BodySlotFor(avatar.PartName(i), avatar.PartTag(i)) : -1;
+      if (avatar.IsArrowSlot(i)) {
+        fl.isArrow = true;
+        const int host = avatar.WornHostOf(i);
+        fl.hostFig = host >= 0 ? BodySlotFor(avatar.PartName(host), avatar.PartTag(host)) : -1;
+      }
       std::snprintf(fl.name, sizeof fl.name, "%s", avatar.PartName(i));
       deathBody.limbs.push_back(fl);
     }
@@ -13422,6 +13432,20 @@ int main(int argc, char** argv) {
           if (const char* pre = std::getenv("SANDVOX_SHOT_DEATH_SEVER")) {
             avatar.SeverByName(pre);
             std::printf("--shot-inventory: severed %s before the killing blow\n", pre);
+          }
+          // SANDVOX_SHOT_DEATH_ARROWS=1: arrows stuck in the torso and the
+          // left thigh first, points at the part's centre (owner 2026-10-14:
+          // the peeled photograph must keep the arrow, to show what it hit).
+          if (std::getenv("SANDVOX_SHOT_DEATH_ARROWS")) {
+            const ItemDef* ad = items.Named("arrow");
+            int stuck = 0;
+            for (const char* pn : {"torso", "legU.L"}) {
+              const int pi = avatar.PartIndex(pn);
+              Vec3 c;
+              if (ad && pi >= 0 && avatar.PartCentreWorld(pi, c))
+                stuck += avatar.EmbedArrow(*ad, pi, c, Vec3{0.6f, -0.2f, 1.0f}) >= 0;
+            }
+            std::printf("--shot-inventory: %d arrows stuck in the player\n", stuck);
           }
           avatar.SeverByName("head");
         }
@@ -21423,11 +21447,16 @@ int main(int argc, char** argv) {
         if (deathFrozen && deathBody.have) {
           std::vector<autopsy::Part> parts;
           std::vector<int> instPart(microInsts.size(), -1);
+          // Per part: the host's figure slot if it is an embedded arrow,
+          // kNotArrow otherwise (DeathBody::Limb::isArrow).
+          constexpr int kNotArrow = -2;
+          std::vector<int> partArrowFig;
           for (size_t k = 0; k < microInsts.size() && k < instLimb.size(); k++) {
             if (instLimb[k] < 0) continue;
             const DeathBody::Limb& fl = deathBody.limbs[(size_t)instLimb[k]];
             instPart[k] = (int)parts.size();
             parts.push_back({microInsts[k].model, fl.figSlot, fl.isLimb});
+            partArrowFig.push_back(fl.isArrow ? fl.hostFig : kNotArrow);
           }
           uint8_t kinds[256];
           AutopsyKinds(burnMats, tissueMats, mats, kinds);
@@ -21438,17 +21467,28 @@ int main(int argc, char** argv) {
           const int iso = ui.autopsy.isolate ? ui.inspectSelected : -1;
           std::memcpy(probeKinds, kinds, sizeof kinds);
           // Anything worn or held makes the panel's first peel an undressing.
-          ui.autopsy.hasGear = std::any_of(parts.begin(), parts.end(),
-                                           [](const autopsy::Part& p) { return !p.isLimb; });
+          // An arrow is not gear (it stays through the undressing).
+          ui.autopsy.hasGear = false;
+          for (size_t p = 0; p < parts.size(); p++)
+            ui.autopsy.hasGear |= !parts[p].isLimb && partArrowFig[p] == kNotArrow;
           size_t keep = 0;
           for (size_t k = 0; k < microInsts.size(); k++) {
             MicroBodyInstGpu in = microInsts[k];
             if (instPart[k] >= 0) {
               const autopsy::Part& pp = parts[(size_t)instPart[k]];
-              // Gear goes with any peel: a robe over a peeled torso would hide
-              // exactly what the peel was for.
-              if (!pp.isLimb && (ui.autopsy.hideGear || peeling || iso >= 0)) continue;
-              if (iso >= 0 && pp.figSlot != iso) continue;
+              const int arrowFig = partArrowFig[(size_t)instPart[k]];
+              if (arrowFig != kNotArrow) {
+                // AN EMBEDDED ARROW stays through every peel, unpeeled: with
+                // the skin and flesh gone from round it, the shaft shows what
+                // it went through and where its point stopped. Isolated, it
+                // goes with the part it is stuck in.
+                if (iso >= 0 && arrowFig != iso) continue;
+              } else {
+                // Gear goes with any peel: a robe over a peeled torso would
+                // hide exactly what the peel was for.
+                if (!pp.isLimb && (ui.autopsy.hideGear || peeling || iso >= 0)) continue;
+                if (iso >= 0 && pp.figSlot != iso) continue;
+              }
               if (pp.isLimb) {
                 const uint32_t dm = autopsyPeeler.DrawModel(in.model);
                 if (dm == autopsy::Peeler::kHidden) continue;
