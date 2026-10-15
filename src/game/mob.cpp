@@ -16512,7 +16512,7 @@ void Mob::HealTick(uint32_t tick) {
 // become scar tissue, same with skin, though skin voxels shouldn't repair
 // until the surface beneath them repairs."
 //
-// One limb, every kHealPeriod ticks (staggered by `key`):
+// One limb, checked every kHealPeriod ticks (staggered by `key`):
 //   1. WAIT while the wound is still active: the limb owes blood (a cut still
 //      dripping, an open stump on it, a gout), carries burning matter, rots
 //      (an infection) or is dissolving pulp. Each of those is a process that
@@ -16526,19 +16526,26 @@ void Mob::HealTick(uint32_t tick) {
 //      nothing to scar is skipped here, at the price of four integer compares
 //      -- the cost of an undamaged creature (rule 2). The recipe walk below is
 //      O(limb) and never runs for it.
-//   4. THE PACE: gore.scarRate cubic centimetres a minute, converted to this
-//      limb's lattice cells and integrated over the tick (the coat's pacing,
-//      HealLimbStep's note), offset by the limb's key so a crowd's steps do
-//      not all land on one tick. At the default a human limb earns a cell
-//      every ~4 s, so the recipe walk is rare even on a wounded body.
-//   5. HealLimbStep with a ScarPass: the same pick, twin rule, re-skin and
-//      collider rebuild as the coat; see the ScarPass branches in it for what
-//      differs (tissue only, scar material, the surface rule, no purse).
-//
+//   4. THE CLOCK, per CELL (owner: "individual microvoxels should heal on
+//      average once per N minutes, but won't heal unless the area underneath
+//      them is healed"). A missing tissue cell (or a burnt one) has a running
+//      clock once a deeper cell beside it is whole (HealLimbStep's
+//      clockRuns); each running clock rings after a memoryless wait of mean
+//      gore.scarMinutes. Simulated exactly and cheaply as one event stream
+//      per limb (Gillespie): with E clocks running, the next ring is
+//      Exp(T / E) away, drawn from a hash; between events the limb costs
+//      three compares. A deep wound closes layer by layer, each layer's
+//      clocks starting only as the one beneath fills, so it takes longer
+//      than a shallow one with no rule that says so.
+//   5. THE EVENT: HealLimbStep with a ScarPass and a budget of one -- the
+//      lowest-hash running cell, so which cell rings is uniform. Then
+//   6. a budget-0 walk counts the clocks now running and draws the next.
+//      Two recipe walks per scarred cell; none while waiting.
+
 // BOUNDED (rule 2): a scar step only ever moves the limb toward its recipe's
 // shape and a scarred cell is never revisited, so the work ends when the
-// wound is closed. DETERMINISTIC: tick, id and limb keyed, integer counts,
-// the pace's doubles in one fixed order; CPU body state, not hashed.
+// wound is closed. DETERMINISTIC: tick, id and limb keyed hashes, integer
+// counts, the wait's doubles in one fixed order; CPU body state, not hashed.
 // ============================================================================
 uint64_t Mob::ScarSigOf(const MobLimb& l) const {
   const uint64_t n = l.HasFineSkin() ? l.skinVoxels.size() : l.voxels.size();
@@ -16561,6 +16568,7 @@ bool Mob::ScarTick(int li, uint32_t tick, uint32_t key) {
   if (l.bleedBudget >= 1.0f || l.stumpOpen || l.gushTicks > 0 || l.burn.alight ||
       l.Infected() || l.bluntPulp) {
     l.scarSig = 0;
+    l.scarNext = 0.0;  // no clock runs on an open wound
     return false;
   }
   if ((tick + key) % kHealPeriod != 0) return false;
@@ -16575,25 +16583,63 @@ bool Mob::ScarTick(int li, uint32_t tick, uint32_t key) {
     healStats_.scarHp += l.hp - before;
   }
   // ---- 3. settled ----------------------------------------------------------
-  if (l.scarSig != 0 && l.scarSig == ScarSigOf(l)) return false;
-  // ---- 4. the pace ---------------------------------------------------------
-  if (g.scarRate <= 0.0f) return false;
-  const uint32_t scale =
-      std::max(1u, l.HasFineSkin() ? SkinScaleOf(l) : PhysScaleOf(l));
-  const double cellsPerWv = (double)scale * scale * scale;
-  const double cm3PerWv = (double)kVoxelMeters * kVoxelMeters * kVoxelMeters * 1e6;
-  const double perTick = (double)g.scarRate / cm3PerWv * cellsPerWv / (60.0 * 30.0);
-  const double t = (double)tick + (double)(key & 0xFFFFu);
-  const double paced =
-      std::floor(perTick * t) - std::floor(perTick * (t - (double)kHealPeriod));
-  if (paced < 1.0) return false;
-  // ---- 5. the step ---------------------------------------------------------
-  ScarPass sp;
-  sp.budget = (uint32_t)std::min(paced, 1.0e6);
-  sp.mat = sys_->scarMat_;
-  const uint32_t did = HealLimbStep(li, tick, &sp);
-  if (!sp.found) l.scarSig = ScarSigOf(l);
-  return did > 0;
+  const uint64_t sig = ScarSigOf(l);
+  if (l.scarSig != 0 && l.scarSig == sig) return false;
+  if (g.scarMinutes <= 0.0f) return false;
+  // ---- 4. the clock --------------------------------------------------------
+  // A drawn event on an unchanged limb: wait for it (three compares).
+  const bool scheduled = l.scarNext != 0.0 && l.scarSchedSig == sig;
+  if (scheduled && (double)tick < l.scarNext) return false;
+  // A STALE draw (the limb changed under it): the running clocks waited until
+  // now, every one of them; redraw from now.
+  if (!scheduled && l.scarNext != 0.0 && (double)tick > l.scarSchedTick)
+    healStats_.scarExposure += (double)l.scarSchedE * ((double)tick - l.scarSchedTick);
+  // EVERY event due since the last check, each at its own time and the next
+  // drawn from it (exact whatever the check period; a gate's sped-up clock
+  // rings several times between checks). Bounded: 64 cells a check.
+  const double meanTicks = (double)g.scarMinutes * 60.0 * 30.0;
+  bool due = scheduled;
+  double now = (double)tick;
+  uint32_t didAll = 0;
+  for (int guard = 0; guard < 64; guard++) {
+    // ---- 5. the event: ONE cell, the lowest hash among the running clocks -
+    if (due) {
+      now = l.scarNext;
+      healStats_.scarExposure += (double)l.scarSchedE * (now - l.scarSchedTick);
+      ScarPass ev;
+      ev.mat = sys_->scarMat_;
+      ev.budget = 1;
+      didAll += HealLimbStep(li, tick, &ev);
+    }
+    l.scarNext = 0.0;
+    // ---- 6. the next one ---------------------------------------------------
+    // Count the clocks running NOW (the event may have started some: the cell
+    // above the one that just scarred) and draw the wait to the next event:
+    // the first of E memoryless clocks of mean T rings after Exp(T / E). A
+    // change to the limb (new damage, a burnt cell mended elsewhere moving
+    // the burnt fraction) redraws at step 4, which memorylessness makes exact.
+    ScarPass cnt;
+    cnt.mat = sys_->scarMat_;
+    cnt.budget = 0;
+    HealLimbStep(li, tick, &cnt);
+    if (!cnt.found || cnt.eligible == 0) {
+      l.scarSig = ScarSigOf(l);  // nothing left to scar (or nothing can be)
+      return didAll > 0;
+    }
+    const uint32_t h = rng::Hash3(
+        (uint32_t)id_ * 0x9E3779B9u ^ (uint32_t)li * 0x85EBCA6Bu, tick,
+        didAll * 0x9E3779B9u ^ 0x5CA7C10Cu);
+    const double u = ((double)(h >> 8) + 0.5) / 16777216.0;  // (0, 1)
+    const double wait =
+        std::min(-std::log(u) * meanTicks / (double)cnt.eligible, 1.0e8);
+    l.scarNext = std::max(now + wait, 1.0);  // 0 is "none"
+    l.scarSchedTick = now;
+    l.scarSchedE = cnt.eligible;
+    l.scarSchedSig = ScarSigOf(l);
+    if (l.scarNext > (double)tick) break;
+    due = true;
+  }
+  return didAll > 0;
 }
 
 uint32_t Mob::HealLimbStep(int li, uint32_t tick, ScarPass* scar) {
@@ -16649,7 +16695,8 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick, ScarPass* scar) {
                        std::floor(perTick * ((double)tick - (double)kHealPeriod));
   const uint32_t budget =
       scar ? scar->budget : (uint32_t)std::floor(std::min(paced, purse));
-  if (budget == 0) return 0;
+  // (A scar step with no budget is ScarTick counting running clocks: it walks.)
+  if (budget == 0 && !scar) return 0;
   // Diagnostic cost of the step from here (HealStats::stepUs; never read by
   // anything the tick decides).
   struct StepClock {
@@ -16735,11 +16782,18 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick, ScarPass* scar) {
   static const int kD6[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
                                 {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
   // ---- THE PASSIVE HEAL's view of the recipe (ScarPass only) ---------------
-  // The recipe's own SHAPE, on this lattice: which cells it has and what each
-  // is made of. A recipe cell with a face open in that shape is a SURFACE
-  // cell (the skin layer: anatomy.js makes a limb's own faces depth 0), and a
-  // surface cell is rebuilt only over a whole cell beneath it.
-  std::vector<std::pair<uint64_t, uint32_t>> rshape;
+  // The recipe's own SHAPE, on this lattice: which cells it has, what each is
+  // made of, and how DEEP each lies -- 6-connected steps in from the nearest
+  // cell with a face open in that shape (depth 0 = the skin layer:
+  // anatomy.js makes a limb's own faces its surface). Depth is what "the
+  // tissue beneath" means below.
+  struct RCell {
+    uint64_t key;
+    uint32_t mat;
+    int x, y, z;
+  };
+  std::vector<RCell> rshape;
+  std::vector<int> rdepth;
   if (scar) {
     rshape.reserve(model.voxels.size());
     for (const PrefabVoxel& rv : model.voxels) {
@@ -16749,21 +16803,54 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick, ScarPass* scar) {
         y /= fold;
         z /= fold;
       }
-      rshape.push_back({CellKey(x - rebase.x, y - rebase.y, z - rebase.z),
-                        rv.material & 0xFFFu});
+      x -= rebase.x;
+      y -= rebase.y;
+      z -= rebase.z;
+      rshape.push_back({CellKey(x, y, z), rv.material & 0xFFFu, x, y, z});
     }
-    std::sort(rshape.begin(), rshape.end());
+    // Stable, so a folded cell keeps the FIRST recipe voxel's material (the
+    // main loop's foldSeen rule).
+    std::stable_sort(rshape.begin(), rshape.end(),
+                     [](const RCell& p, const RCell& q) { return p.key < q.key; });
+    rshape.erase(std::unique(rshape.begin(), rshape.end(),
+                             [](const RCell& p, const RCell& q) { return p.key == q.key; }),
+                 rshape.end());
   }
-  auto recipeAt = [&](int x, int y, int z) -> int {
+  auto recipeIdx = [&](int x, int y, int z) -> int {
     const uint64_t k = CellKey(x, y, z);
-    const auto it = std::lower_bound(rshape.begin(), rshape.end(),
-                                     std::make_pair(k, (uint32_t)0));
-    return it != rshape.end() && it->first == k ? (int)it->second : -1;
+    const auto it = std::lower_bound(
+        rshape.begin(), rshape.end(), k,
+        [](const RCell& c, uint64_t key) { return c.key < key; });
+    return it != rshape.end() && it->key == k ? (int)(it - rshape.begin()) : -1;
   };
+  if (scar) {
+    // Multi-source BFS from the surface: integer, in rshape's (key) order.
+    rdepth.assign(rshape.size(), -1);
+    std::vector<uint32_t> q;
+    q.reserve(rshape.size());
+    for (uint32_t i = 0; i < (uint32_t)rshape.size(); i++) {
+      const RCell& c = rshape[i];
+      for (const auto& d : kD6)
+        if (recipeIdx(c.x + d[0], c.y + d[1], c.z + d[2]) < 0) {
+          rdepth[i] = 0;
+          q.push_back(i);
+          break;
+        }
+    }
+    for (size_t h = 0; h < q.size(); h++) {
+      const RCell& c = rshape[q[h]];
+      for (const auto& d : kD6) {
+        const int ni = recipeIdx(c.x + d[0], c.y + d[1], c.z + d[2]);
+        if (ni >= 0 && rdepth[(size_t)ni] < 0) {
+          rdepth[(size_t)ni] = rdepth[q[h]] + 1;
+          q.push_back((uint32_t)ni);
+        }
+      }
+    }
+  }
   auto isSurface = [&](int x, int y, int z) {
-    for (const auto& d : kD6)
-      if (recipeAt(x + d[0], y + d[1], z + d[2]) < 0) return true;
-    return false;
+    const int ri = recipeIdx(x, y, z);
+    return ri < 0 || rdepth[(size_t)ri] <= 0;
   };
   // What the scar regrows: the creature's TISSUE (MobDef::tissue: skin,
   // flesh, muscle -- whatever bleeds), never bone. An empty mask is "no
@@ -16771,26 +16858,29 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick, ScarPass* scar) {
   auto isTissue = [&](uint32_t m) {
     return def.tissue.empty() || (m < def.tissue.size() && def.tissue[m] != 0);
   };
-  // "Skin voxels shouldn't repair until the surface beneath them repairs": a
-  // surface cell may be rebuilt once one of its DEEPER neighbours (a recipe
-  // cell that is not itself surface; a neighbour along the skin does not
-  // count) is present and not burnt. When nothing beneath it is tissue that
-  // could come back (skin over a bone notch, a finger's one-cell edge), it
-  // closes from the side, or it would never close at all.
-  auto underWhole = [&](int x, int y, int z) {
-    bool couldRegrow = false;
+  // IS THIS CELL'S SCAR CLOCK RUNNING? (owner, 2026-10-14: "microvoxels won't
+  // be able to heal unless the area underneath them is healed".) Yes once a
+  // DEEPER recipe neighbour (greater depth; a neighbour at the same depth or
+  // shallower does not count) is present and not burnt. When nothing deeper
+  // is tissue that could come back (the core, a layer over bone, a finger's
+  // one-cell edge), it closes from the side: any present neighbour will do,
+  // or it would never close at all.
+  auto clockRuns = [&](int x, int y, int z) {
+    const int ri0 = recipeIdx(x, y, z);
+    const int d0 = ri0 >= 0 ? rdepth[(size_t)ri0] : 0;
+    bool couldRegrow = false, touches = false;
     for (const auto& d : kD6) {
       const int nx = x + d[0], ny = y + d[1], nz = z + d[2];
-      const int rm = recipeAt(nx, ny, nz);
-      if (rm < 0 || isSurface(nx, ny, nz)) continue;
       const int at = find(nx, ny, nz);
-      if (at >= 0) {
-        const uint32_t m = v.Mat((size_t)at);
-        if (m != 0 && sys_->BurnStageOf(m) == 0) return true;
-      }
-      if (isTissue((uint32_t)rm) && !IsHealExempt((uint32_t)rm)) couldRegrow = true;
+      const bool present = at >= 0 && v.Mat((size_t)at) != 0;
+      if (present) touches = true;
+      const int ri = recipeIdx(nx, ny, nz);
+      if (ri < 0 || rdepth[(size_t)ri] <= d0) continue;
+      if (present && sys_->BurnStageOf(v.Mat((size_t)at)) == 0) return true;
+      const uint32_t rm = rshape[(size_t)ri].mat;
+      if (isTissue(rm) && !IsHealExempt(rm)) couldRegrow = true;
     }
-    return !couldRegrow;
+    return touches && !couldRegrow;
   };
   for (const PrefabVoxel& rv : model.voxels) {
     int x = rv.x, y = rv.y, z = rv.z;
@@ -16845,7 +16935,10 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick, ScarPass* scar) {
                                        TwinRestKey(x + twinO.x, y + twinO.y,
                                                    z + twinO.z)))
         continue;
-      if (scar && isSurface(x, y, z) && !underWhole(x, y, z)) continue;
+      if (scar) {
+        if (!clockRuns(x, y, z)) continue;
+        scar->eligible++;
+      }
       if (folded) {
         // Material only on a folded lattice: the cell's variant and art are
         // the collider's own, and the recipe's first voxel is not "the" cell.
@@ -16867,8 +16960,11 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick, ScarPass* scar) {
       }
     }
     if (!touches) continue;
+    if (scar) {
+      if (!clockRuns(x, y, z)) continue;
+      scar->eligible++;
+    }
     const bool surf = scar && isSurface(x, y, z);
-    if (surf && !underWhole(x, y, z)) continue;
     // d2 is carried for the gate's order log only; it decides nothing.
     const float dx = (float)x + 0.5f - root.x, dy = (float)y + 0.5f - root.y,
                 dz = (float)z + 0.5f - root.z;
@@ -16882,6 +16978,7 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick, ScarPass* scar) {
   // Nothing left to scar (or nothing yet reachable, which the next change to
   // the limb will move): ScarTick settles the limb on this.
   if (scar) scar->found = !grow.empty() || !mend.empty();
+  if (scar && budget == 0) return 0;  // ScarTick's count: nothing grown
 
   // ---- 3b. THE PICK: the lowest hashes of the whole frontier ----------------
   // Keyed by creature and limb, the tick, and the cell's own lattice

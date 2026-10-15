@@ -10618,10 +10618,9 @@ Status GateHealWound(Ctx& c, std::string& detail) {
 
 // scar-heal: THE BODY HEALS ITSELF, SLOWLY (gore.scarHeals, 2026-10-14)
 // ---------------------------------------------------------------------------
-// Mob::ScarTick with no coat. The clock is sped up `scar.speedup` times (60:
-// a game minute a second) through gore.scarRate and gore.scarHpPerMin, so ten
-// minutes of healing is ten seconds of ticks; the gate prints what the run
-// took in UNSCALED game minutes. Claims:
+// Mob::ScarTick with no coat. The clock is sped up `scar.speedup` times (120:
+// two game minutes a second) through gore.scarMinutes and gore.scarHpPerMin;
+// the gate prints what the run took in UNSCALED game minutes. Claims:
 //   A. A CUT, left alone: nothing is rebuilt while it still bleeds; once it
 //      stops, missing tissue grows back as `scar` (never the recipe's skin or
 //      flesh: their counts do not rise), the TISSUE left missing is at most
@@ -10638,6 +10637,9 @@ Status GateHealWound(Ctx& c, std::string& detail) {
 //   D. THE STAB IS PRICED (phys/kerf.h KerfStabDepth), on a synthetic bore
 //      of known matter: skin goes the budget, scar twice it (capped at the
 //      reach), a bone layer stops it short, and a cavity is free.
+//   E. ONE CELL AT A TIME: a plain cut (no crater) closes, and sooner than
+//      A's deeper crater; the mean wait of a running cell clock over both is
+//      gore.scarMinutes within scar.waitTol (HealStats::scarExposure).
 Status GateScarHeal(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
   IdCounterScope idScope(mobs);
@@ -10669,15 +10671,15 @@ Status GateScarHeal(Ctx& c, std::string& detail) {
     ticker();
   };
   const Tuning saved = CurrentTuning();
-  const double speed = std::max(1.0, BaselineNumber("scar.speedup", 60));
+  const double speed = std::max(1.0, BaselineNumber("scar.speedup", 120));
   auto setTune = [&](bool on) {
     Tuning tt = saved;
     tt.gore.scarHeals = on;
-    tt.gore.scarRate = (float)(saved.gore.scarRate * speed);
     tt.gore.scarHpPerMin = (float)(saved.gore.scarHpPerMin * speed);
+    tt.gore.scarMinutes = (float)(saved.gore.scarMinutes / speed);
     SetCurrentTuning(tt);
   };
-  const uint32_t maxTicks = (uint32_t)BaselineNumber("scar.maxTicks", 2400);
+  const uint32_t maxTicks = (uint32_t)BaselineNumber("scar.maxTicks", 3600);
   const double maxLeft = BaselineNumber("scar.maxLeftFrac", 0.02);
   const uint32_t settle = (uint32_t)BaselineNumber("scar.settleTicks", 300);
 
@@ -10693,7 +10695,7 @@ Status GateScarHeal(Ctx& c, std::string& detail) {
     Mob::HealStats end, settled;
     std::string why;
   };
-  auto cutRun = [&](bool on, CutRun& r) {
+  auto cutRun = [&](bool on, CutRun& r, bool withCrater) {
     setTune(on);
     const uint64_t id = SpawnTarget(c, t, kInset, pchunk);
     if (!id) return;
@@ -10713,7 +10715,7 @@ Status GateScarHeal(Ctx& c, std::string& detail) {
       if (hit.hit && hit.limb == t.limb) break;
     }
     std::vector<ParticleSpawn> spawns;
-    if (hit.hit && hit.limb == t.limb)
+    if (withCrater && hit.hit && hit.limb == t.limb)
       mobs.CarveLimbRadial(mobs.LimbBody(id, t.limb), hit.pos,
                            (float)BaselineNumber("scar.craterRadius", 1.0), true,
                            false, c.world, spawns);
@@ -10783,7 +10785,7 @@ Status GateScarHeal(Ctx& c, std::string& detail) {
     mobs.RemoveMob(id);
   };
   CutRun a;
-  cutRun(true, a);
+  cutRun(true, a, true);
   const double shareFirst =
       a.halfGrown ? (double)a.halfSurface / (double)a.halfGrown : 0.0;
   const uint32_t lateGrown = a.end.scarGrown - a.halfGrown;
@@ -10822,7 +10824,30 @@ Status GateScarHeal(Ctx& c, std::string& detail) {
 
   // ---- C. off --------------------------------------------------------------
   CutRun off;
-  cutRun(false, off);
+  cutRun(false, off, true);
+
+  // ---- E. one CELL at a time, and deep takes longer ---------------------------
+  // The blade cut alone, no crater: a shallow sliver. It closes, and closes
+  // SOONER than A's crater, which has to fill layer by layer from the bottom
+  // (each layer's clocks start only as the one beneath fills). And the mean
+  // wait of a running cell clock, over both wounds (HealStats::scarExposure /
+  // cells scarred), is gore.scarMinutes within scar.waitTol: the per-cell rate
+  // the owner asked for, measured rather than assumed.
+  CutRun e;
+  cutRun(true, e, false);
+  const double eMin = e.closedAt * speed / (30.0 * 60.0);
+  const double aMin = a.closedAt * speed / (30.0 * 60.0);
+  const double wantMin = saved.gore.scarMinutes;
+  const double cells = (double)a.end.scarGrown + a.end.scarMended + e.end.scarGrown +
+                       e.end.scarMended;
+  const double waitMin =
+      cells > 0 ? (a.end.scarExposure + e.end.scarExposure) / cells * speed / (30.0 * 60.0)
+                : 0.0;
+  const double tol = BaselineNumber("scar.waitTol", 0.25);
+  const bool eOk = e.cut && e.miss0 > 0 && e.grownWhileOpen == 0 && e.closedAt != 0 &&
+                   (double)e.tissueLeft <= maxLeft * (double)e.miss0 &&
+                   e.closedAt < a.closedAt && waitMin >= (1.0 - tol) * wantMin &&
+                   waitMin <= (1.0 + tol) * wantMin;
   const bool cOk = off.cut && off.end.scarGrown == 0 && off.scarEnd == 0;
   SetCurrentTuning(saved);
 
@@ -10862,16 +10887,20 @@ Status GateScarHeal(Ctx& c, std::string& detail) {
       "share %.2f first half vs %.2f second, steps %u then %u after %u settle "
       "ticks | B burn: %u cooked -> %u, scar %u, frac %.3f->%.3f cap "
       "%.3f->%.3f | C off: grown %u scar %u | D bore depths skin %.2f scar "
-      "%.2f scar@reach6 %.2f bone %.2f hole %.2f",
+      "%.2f scar@reach6 %.2f bone %.2f hole %.2f | E plain cut: %u missing -> "
+      "%u tissue, closed %.1f game min vs crater %.1f; mean cell wait %.2f min "
+      "over %.0f cells (scarMinutes %.1f), recipe walks %u",
       t.defName.c_str(), t.limbName.c_str(), speed, a.bledFor,
       a.grownWhileOpen, a.miss0, a.missEnd, a.tissueLeft, a.closedAt,
       a.closedAt * speed / (30.0 * 60.0), a.scarEnd, a.skin0, a.skinEnd,
       a.flesh0, a.fleshEnd, a.hp0, a.hpEnd, hpMax, a.overCap, shareFirst,
       shareLate, a.end.scarSteps, a.settled.scarSteps, settle, burnt, cookedEnd,
       scarB, frac0, frac1, cap0, cap1, off.end.scarGrown, off.scarEnd, dSkin,
-      dScar, dScarCap, dBone, dHole);
-  detail += Format(" | A %d B %d C %d D %d | A left: ", aOk, bOk, cOk, dOk) + a.why;
-  return aOk && bOk && cOk && dOk ? Status::Pass : Status::Fail;
+      dScar, dScarCap, dBone, dHole, e.miss0, e.tissueLeft, eMin, aMin, waitMin, cells, wantMin,
+      a.end.timedSteps + e.end.timedSteps);
+  detail += Format(" | A %d B %d C %d D %d E %d | A left: ", aOk, bOk, cOk, dOk, eOk) +
+            a.why;
+  return aOk && bOk && cOk && dOk && eOk ? Status::Pass : Status::Fail;
 }
 
 // heal-joint. The two healing findings of docs/AUDIT_alchemy_chemistry.md:
