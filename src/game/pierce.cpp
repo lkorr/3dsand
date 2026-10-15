@@ -431,6 +431,21 @@ float SplashFloorOn(const MobSystem& mobs, uint64_t mobId) {
   return r;
 }
 
+// MAY THIS MACHINE PUT THE MATTER ON THAT BODY? Only a body it owns
+// (MobSystem::OwnedHere; always, in singleplayer). A peer's player or a
+// peer-owned NPC here is an inert ghost: a coat or a fire written onto it is
+// never heard of by the owner (ghosts run no StainTick), and claiming the
+// matter (`tookMatter`) would strip it from the drop too, so it existed on
+// neither machine. Refused, the strike reports no coat and the matter drops
+// where it stopped through the op stream, which both machines apply. The
+// channel itself IS routed to the owner (PierceAlongRay, MeleeHitKind::Pierce);
+// carrying the coat the same way needs a MeleeHit variant with the material,
+// amount and radius, applied owner-side -- not built yet.
+bool MatterLandsHere(const MobSystem& mobs, uint64_t mobId) {
+  const Mob* m = mobs.FindCreature(mobId);
+  return m == nullptr || MobSystem::OwnedHere(*m);
+}
+
 }  // namespace
 
 void SpellMatterStrike(Physics& phys, MobSystem& mobs, DebrisSystem& debris, World& world,
@@ -457,7 +472,8 @@ void SpellMatterStrike(Physics& phys, MobSystem& mobs, DebrisSystem& debris, Wor
     // writers (accumulate up to a full coat, a washer rinses first, the
     // material's coat.effects run on every limb it touched). Its own rules do
     // the rest on later ticks: acid eats, lava sears and lights, water wets.
-    if (shot.kind == SpellMatterKind::Splash && fb.mobId != 0 && shot.coatAmount > 0) {
+    if (shot.kind == SpellMatterKind::Splash && fb.mobId != 0 && shot.coatAmount > 0 &&
+        MatterLandsHere(mobs, fb.mobId)) {
       const float hp0 = mobs.TotalHp(fb.mobId);
       uint32_t marked = 0;
       mobs.PourOnBody(fb.mobId, fb.pick, d,
@@ -541,6 +557,9 @@ void SpellMatterStrike(Physics& phys, MobSystem& mobs, DebrisSystem& debris, Wor
   // with it. Only inside a creature that is still there to hold it.
   if (!f.stopped || last.mobId == 0 || !last.r.hit || last.r.severed) return;
   if (last.r.outcome == PierceOutcome::Glanced) return;  // nothing got in
+  // A peer's body: the wound was routed to its owner, the leftover matter
+  // drops (MatterLandsHere).
+  if (!MatterLandsHere(mobs, last.mobId)) return;
   if (shot.coatAmount > 0) {
     // A matter a body can wear coats the floor of the channel: the cells the
     // axis meets past where it stopped, and the wound's rim round them.
