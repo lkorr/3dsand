@@ -1052,6 +1052,9 @@ struct TickAuthorityCtx {
     // Body bursts (MobSystem::TakeBodyBursts: sparks off struck plating, a
     // breached boiler, a dead android's discharge) turned into flashes.
     uint64_t bodyBursts = 0;
+    // Connected only: grid firings in a chunk a PEER is the authority for,
+    // left to that peer to blast and flash (ReactFxToBlasts). 0 single-player.
+    uint64_t notOwned = 0;
     std::vector<ExplosionOp> recent;  // the last kRecent blasts issued
     static constexpr size_t kRecent = 16;
   } reactFx;

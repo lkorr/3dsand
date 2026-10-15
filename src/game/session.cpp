@@ -4988,6 +4988,25 @@ static void ReactFxToBlasts(TickAuthorityCtx& w, uint32_t tick,
                             std::vector<ExplosionOp>& exps) {
   auto& rf = w.reactFx;
   std::vector<ReactFxEvent> evs = w.world.TakeReactFx();
+  // ONE AUTHOR PER FIRING (M9). Both machines simulate a shared chunk and
+  // decode the same firings, so each would author the blast: both copies
+  // cross the wire, the crater is idempotent (lowest op wins) but every OWNED
+  // body near it is hit twice -- by the local copy in phase K and by the
+  // peer's in phase N (RemoteExplosionsHitOwnBodies). A reaction is
+  // world-authored, so it gets the single-producer rule (net/authority.h):
+  // only the chunk's authority blasts and flashes it -- the SAME question the
+  // crater's island scan asks of the same grid (DebrisSystem::ChunkOwned,
+  // net::EntitySync::ChunkOwned behind it), not a second copy of the rule.
+  // Unbound (single-player, every harness) it answers "mine" for every chunk,
+  // so nothing is filtered there. BODY firings below are not filtered: they
+  // come from bodies this machine owns.
+  {
+    const size_t before = evs.size();
+    std::erase_if(evs, [&](const ReactFxEvent& e) {
+      return !w.debris.ChunkOwned(net::ChunkOfVoxel(e.cell));
+    });
+    rf.notOwned += before - evs.size();
+  }
   std::vector<ReactFxEvent> body = w.mobs.TakeBodyReactFx();
   rf.bodyEvents += body.size();
   // BODY BURSTS (materials.h struck / burst): sparks and steam off a struck
