@@ -14850,6 +14850,12 @@ uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
       ws.drawMiss++;
       return;
     }
+    // Flesh becoming the infection, measured for the bite to bill (audit
+    // VN-1; WoundStats::convWeight). An ordinary wound rewrite is not.
+    if (rewriteInfect) {
+      ws.convWeight += def_->WoundHpOf(mat) - def_->WoundHpOf(stain & 0xFFFu);
+      ws.convOrgan += def_->OrganHpOf(mat) - def_->OrganHpOf(stain & 0xFFFu);
+    }
     apply();
     stained++;
     ws.rewritten++;
@@ -22207,6 +22213,29 @@ bool Mob::InfectStep(int li, uint32_t tick, World& world,
   // What was eaten, by material, for the hp, the ledger and the death cause;
   // in first-eaten order, which is storage order (deterministic).
   std::vector<std::pair<uint32_t, uint32_t>> ate;
+  // WHAT WAS CONVERTED IN PLACE, by infection material (audit VN-1): the
+  // summed (was - now) wound weight and organ figure of every cell this step
+  // rewrote without removing -- a spread, and an eat that `leaves` -- in
+  // first-converted (storage) order. Settled after the loop by
+  // SettleInfectConversion, under that material's cause. A REMOVED cell (the
+  // rot's eat) is not here: the flush's carve bills a removal, as ever.
+  struct Conv {
+    uint32_t mat;
+    float dWeight, dOrgan;
+  };
+  std::vector<Conv> conv;
+  auto noteConv = [&](uint32_t infectMat, uint32_t was, uint32_t now) {
+    const float dw = def_->WoundHpOf(was) - def_->WoundHpOf(now);
+    const float dor = def_->OrganHpOf(was) - def_->OrganHpOf(now);
+    if (dw == 0.0f && dor == 0.0f) return;
+    for (Conv& e : conv)
+      if (e.mat == infectMat) {
+        e.dWeight += dw;
+        e.dOrgan += dor;
+        return;
+      }
+    conv.push_back({infectMat, dw, dor});
+  };
   std::vector<uint32_t> cand;
   std::vector<float> candRate;
   std::vector<int> candJoint;
@@ -22275,6 +22304,7 @@ bool Mob::InfectStep(int li, uint32_t tick, World& world,
             // NOT recorded in `woundWas`: an infection that undoes itself is
             // the behaviour this pass replaced.
             v.Set(j, cur, (h3 >> 6) % 3u);
+            noteConv(cur, was, cur);  // a heart cell's organHp goes HERE
             const IVec3 q = v.At(j);
             if (poke)
               MicroBodyPoke(*micro, (uint32_t)limb.microModel, q.x, q.y, q.z,
@@ -22302,11 +22332,15 @@ bool Mob::InfectStep(int li, uint32_t tick, World& world,
         // DEAD, NOT GONE (`infect.leaves`; owner, 2026-10-13: venom leaves
         // necrotic tissue instead of dissolving the cell). The cell stays
         // where it is as the named material, so nothing is uncovered and
-        // there is no carve to flush: the wound keeps its shape, and only the
-        // flat `hp` below is charged. The loader refuses a `leaves` that is
+        // there is no carve to flush: the wound keeps its shape, and what is
+        // charged is the flat `hp` below plus the cell's CHANGE of weight and
+        // organ figure (noteConv; envenomed -> necrotic is 1 -> 1 and 0 -> 0
+        // today, so nothing) -- never a removal's whole weight, because
+        // nothing was removed. The loader refuses a `leaves` that is
         // itself an infection, so the cell drops out of the list at the next
         // resolve and nothing this block admits can take it again.
         v.Set(c.i, spec.leaves, (h2 >> 24) % 3u);
+        noteConv(cur, cur, spec.leaves);
         if (poke)
           MicroBodyPoke(*micro, (uint32_t)limb.microModel, p.x, p.y, p.z,
                         (uint8_t)spec.leaves, 0);
@@ -22344,9 +22378,26 @@ bool Mob::InfectStep(int li, uint32_t tick, World& world,
     burnFracDirty_ = true;
   }
 
+  // ---- WHAT THE CONVERSIONS COST (audit VN-1) -------------------------------
+  // Settled HERE, before the lethal check, so a heart the venom took is billed
+  // to the venom on the tick it took it -- not to whatever carves this limb
+  // next, and not forgiven by a heal re-baselining the ledger in between.
+  // NO HP IS BILLED TWICE: the ledgers move by exactly what was settled, so
+  // the next CarveLimb's delta starts from here, and the flat `infect.hp`
+  // below is a different thing -- the infection's own damage per cell EATEN,
+  // "on top of the volume charge" (DESIGN.md, Infection is a material); it
+  // never stood for the tissue's wound weight, which the rot's flush has
+  // always billed besides it.
+  uint32_t settledMat = 0;  // first material whose conversion charged hp
+  for (const Conv& cv : conv) {
+    const float h =
+        SettleInfectConversion(li, cv.dWeight, cv.dOrgan, specs[cv.mat].cause);
+    if (h > 0.0f && settledMat == 0) settledMat = cv.mat;
+  }
   // ---- THE INFECTION'S OWN DAMAGE (its material's `infect.hp`) -------------
   // A FLAT charge per WORLD voxel eaten, on top of the volume charge the flush
-  // makes, booked to the eaten material's own ledger. The living only.
+  // makes (the rot) or the conversion settlement above (a `leaves` eat),
+  // booked to the eaten material's own ledger. The living only.
   bool lethal = false;
   if (alive_)
     for (const auto& a : ate) {
@@ -22357,7 +22408,14 @@ bool Mob::InfectStep(int li, uint32_t tick, World& world,
       hpLostBy_[(int)spec.cause] += charge;
       InfectStatFor(a.first).hp += charge;
     }
-  if (eaten && alive_) lethal = limb.hp <= 0.0f;
+  // ANY CHARGE AN INFECTION MADE ON THIS LIMB IS RESOLVED ON ITS STEP: the
+  // eat's flat hp and the settlement above, and also a joint crossing's or a
+  // coat seeding's (both settle where they convert -- InfectAcrossJoint,
+  // CoatInfectTick -- and latch the limb, so this step runs the same tick or
+  // the next). So the test is the limb's hp, not "something was eaten": a
+  // living vital limb at zero is otherwise reachable only by a blow, which
+  // resolves itself.
+  if (alive_) lethal = limb.hp <= 0.0f;
   // BURNT OUT: no infectious cell is left on the limb. The flag goes now, and
   // what was eaten is flushed now rather than left as tombstones under the
   // rebuild threshold, which a finished infection would never reach.
@@ -22374,6 +22432,20 @@ bool Mob::InfectStep(int li, uint32_t tick, World& world,
       deathName = specs[a.first].death;
       break;
     }
+  // NOTHING EATEN, AND STILL A DEATH (audit VN-1): a conversion's settlement
+  // (venom reaching the heart), or a crossing's or a coat's charge resolved
+  // here. Blamed on the first material whose conversion charged this step,
+  // else the first infection on the limb (storage order) -- the infection
+  // that did it, never the organ and never the next blow.
+  const InfectSpec* blame = first;
+  if (!blame && settledMat) blame = &specs[settledMat];
+  if (!blame)
+    for (const auto& cnt : count)
+      if (specOf(cnt.first)) {
+        blame = &specs[cnt.first];
+        break;
+      }
+  if (deathName.empty() && blame) deathName = blame->death;
   // LAST, because it may sever the limb or kill the creature -- after which
   // `limb`, `v` and `st` are all dangling and the caller must touch nothing.
   // Forced when the charge was lethal, so the death happens HERE, under the
@@ -22392,7 +22464,7 @@ bool Mob::InfectStep(int li, uint32_t tick, World& world,
   // place, and an arm stays on, dead.
   bool kept = flushed;
   if (!flushes && lethal && alive_ && limbs_[li].hp <= 0.0f) {
-    const DamageCtx ctx(first ? first->cause : DamageCause::Infection);
+    const DamageCtx ctx(blame ? blame->cause : DamageCause::Infection);
     if (HpZeroSevers(li, ctx)) {
       if (li < (int)limbDefs_.size() && limbDefs_[li].vital) {
         deathCause_ = VitalDeathCause(PolicyAt(li, ctx), ctx);
@@ -22406,6 +22478,43 @@ bool Mob::InfectStep(int li, uint32_t tick, World& world,
   if (wasAlive && !alive_ && !deathName.empty())
     deathCause_ = InternDeathCause(deathName);
   return kept;
+}
+
+// The ledger half of an in-place conversion (mob.h; audit VN-1). CarveLimb's
+// charges at CarveLimb's rates, so a cell costs the same whether a carve or a
+// conversion took it, and the two never both bill it: whatever moves here the
+// next carve's `weightCharged - nowWeight` / `organCharged - nowOrgan` no
+// longer sees. Signed ledger moves, charges clamped at 0 -- CarveLimb's own
+// rule (a conversion that ADDS weight forgives nothing and charges nothing).
+// A corpse's ledger moves too; only the living are charged (Mob::Damage).
+float Mob::SettleInfectConversion(int li, float dWeight, float dOrgan,
+                                  DamageCause cause) {
+  if (li < 0 || li >= (int)limbs_.size() || li >= (int)limbDefs_.size())
+    return 0.0f;
+  MobLimb& limb = limbs_[(size_t)li];
+  limb.weightCharged -= dWeight;
+  limb.organCharged -= dOrgan;
+  if (!alive_) return 0.0f;
+  float charged = 0.0f;
+  if (dWeight > 0.0f) {
+    const float w0 = limb.weightAtSpawn > 0.0f
+                         ? limb.weightAtSpawn
+                         : (float)std::max(1u, limb.voxelsAtSpawn);
+    const float c = (dWeight / w0) * limbDefs_[(size_t)li].hp *
+                    CurrentTuning().gore.carveHpPerVolume;
+    limb.hp -= c;
+    hpLostBy_[(int)cause] += c;
+    charged += c;
+  }
+  // No NoteStaggerHp: an infection is not a blow (that function refuses
+  // every cause but a blow anyway).
+  if (dOrgan > 0.0f && PolicyAt(li, DamageCtx(cause)).chargesOrgan) {
+    limb.hp -= dOrgan;
+    hpLostBy_[(int)cause] += dOrgan;
+    limb.organHpTaken += dOrgan;  // naming only (Mob::OrganDeathCause)
+    charged += dOrgan;
+  }
+  return charged;
 }
 
 uint32_t Mob::InfectAcrossJoint(int fromLimb, uint32_t mat, uint32_t tick,
@@ -22498,8 +22607,15 @@ uint32_t Mob::InfectAcrossJoint(int fromLimb, uint32_t mat, uint32_t tick,
   {
     const uint32_t rr = Hash3(ci, tick, 0xB17Eu);
     const uint16_t w = (uint16_t)(infect | (((rr >> 6) % 3u) << 12));
-    InfectStatFor(infect).took[fine ? (dst.skinVoxels[ci].material & 0xFFFu)
-                                    : (dst.voxels[ci].payload & 0xFFFu)]++;
+    const uint32_t was = fine ? (dst.skinVoxels[ci].material & 0xFFFu)
+                              : (dst.voxels[ci].payload & 0xFFFu);
+    InfectStatFor(infect).took[was]++;
+    // THE DESTINATION'S LEDGER, settled here (audit VN-1): the seed is a
+    // conversion on THAT limb. A charge this takes to 0 is resolved by the
+    // destination's own InfectStep (latched just below), under this name.
+    SettleInfectConversion(toLimb, def_->WoundHpOf(was) - def_->WoundHpOf(infect),
+                           def_->OrganHpOf(was) - def_->OrganHpOf(infect),
+                           spec.cause);
     IVec3 p;
     if (fine) {
       dst.skinVoxels[ci].material = w;
@@ -22606,6 +22722,14 @@ void Mob::CoatInfectTick(uint32_t tick) {
       poke = true;
     };
     uint32_t seededHere = 0;
+    // WHAT THE SEEDING CONVERTED, per infection (audit VN-1): flesh becoming
+    // envenomed is billed as it becomes it -- settled after the sweep by
+    // SettleInfectConversion, exactly as InfectStep settles its spread.
+    struct Conv {
+      uint32_t mat;
+      float dWeight, dOrgan;
+    };
+    std::vector<Conv> conv;
     for (size_t i = 0; i < n; i++) {
       if ((v.Mat(i) & 0xFFFu) == 0) continue;  // tombstone
       const uint16_t s = v.Stain(i);
@@ -22632,6 +22756,21 @@ void Mob::CoatInfectTick(uint32_t tick) {
         const uint32_t rr = Hash3((uint32_t)j, tick, 0xC0A7u);
         InfectStatFor(inf).took[m]++;
         v.Set(j, inf, (rr >> 6) % 3u);
+        {
+          const float dw = def_->WoundHpOf(m) - def_->WoundHpOf(inf);
+          const float dor = def_->OrganHpOf(m) - def_->OrganHpOf(inf);
+          if (dw != 0.0f || dor != 0.0f) {
+            bool found = false;
+            for (Conv& e : conv)
+              if (e.mat == inf) {
+                e.dWeight += dw;
+                e.dOrgan += dor;
+                found = true;
+                break;
+              }
+            if (!found) conv.push_back({inf, dw, dor});
+          }
+        }
         if (poke)
           MicroBodyPoke(*micro, (uint32_t)limb.microModel, p.x, p.y, p.z,
                         (uint8_t)inf, 0);
@@ -22658,6 +22797,13 @@ void Mob::CoatInfectTick(uint32_t tick) {
       seededHere += (amt - left) / cost;
       limb.MarkInfected();
       InfectStatFor(inf).seeded += (amt - left) / cost;
+    }
+    // Charged here; a charge that takes the limb to 0 is resolved by its
+    // InfectStep, which runs right after this in the same tick (the limb is
+    // latched above) and names the death for the infection.
+    for (const Conv& e : conv) {
+      const InfectSpec* cs = sys_->InfectSpecOf(e.mat);
+      if (cs) SettleInfectConversion(li, e.dWeight, e.dOrgan, cs->cause);
     }
     if (seededHere) {
       coatDirty_ = twinDirty_ = true;
@@ -26994,10 +27140,15 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
         if (!kept || r2.count == 0 || r2.cells.empty() || rimX <= 0.0f) continue;
         const int lk = indexOf(pc.body);
         if (lk < 0) continue;
-        if (hit.infectMat != 0)
+        if (hit.infectMat != 0) {
           StainWoundAs(lk, r2.centreLocal, 0.0f, s2 ^ 0x120FEC7u, hit.infectMat,
                        hit.infectStain, &r2.cells, rimX);
-        else
+          // The venom's rewrite is billed as it lands (audit VN-1).
+          if (const InfectSpec* is = sys_ ? sys_->InfectSpecOf(hit.infectMat)
+                                          : nullptr)
+            SettleInfectConversion(lk, lastWoundStats_.convWeight,
+                                   lastWoundStats_.convOrgan, is->cause);
+        } else
           StainWound(lk, r2.centreLocal, 0.0f, s2 ^ 0x7EA12u, &r2.cells, rimX);
       }
     };
@@ -27055,6 +27206,15 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
     // than a substance decaying (MobLimb::infectMat).
     StainWoundAs(li, rep.centreLocal, 0.0f, seed ^ 0x120FEC7u, hit.infectMat,
                  hit.infectStain, &rep.cells, rim);
+    // FLESH BECOMING ENVENOMED IS BILLED AS IT BECOMES IT (audit VN-1): the
+    // rewrite's change of wound weight and organ (a fang into the heart) is
+    // settled now, under the infection's cause, not left for the next carve.
+    // A charge that takes the limb to 0 is resolved by its InfectStep (the
+    // limb is latched just below), under the infection's name.
+    if (const InfectSpec* is =
+            sys_ ? sys_->InfectSpecOf(hit.infectMat) : nullptr)
+      SettleInfectConversion(li, lastWoundStats_.convWeight,
+                             lastWoundStats_.convOrgan, is->cause);
     // The REWRITE count, not StainWoundAs's return: that also counts the
     // smear (one more for any coat laid), so a bite that infected nothing
     // used to latch the limb and print "1 cell rewritten".

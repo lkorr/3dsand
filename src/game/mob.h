@@ -5115,6 +5115,11 @@ class Mob {
   struct WoundStats {
     uint32_t inRange = 0, notTissue = 0, notTarget = 0, drawMiss = 0,
              rewritten = 0;
+    // When the rewrite material is an INFECTION (a bite's venom or rot): the
+    // summed (was - now) MobDef::WoundHpOf / OrganHpOf of the cells it
+    // rewrote, which the bite settles with Mob::SettleInfectConversion (audit
+    // VN-1). Zero for an ordinary wound rewrite.
+    float convWeight = 0.0f, convOrgan = 0.0f;
   };
   const WoundStats& LastWoundStats() const { return lastWoundStats_; }
   // ---- A WOUND THAT IS STILL BLEEDING KEEPS ITSELF BLOODY (2026-09-26) ------
@@ -5473,6 +5478,25 @@ class Mob {
   // anchor, unless `mat` is already there. Returns cells converted (0 or 1).
   uint32_t InfectAcrossJoint(int fromLimb, uint32_t mat, uint32_t tick,
                              int toLimb);
+  // AN INFECTION BILLS WHAT IT CONVERTS, WHEN IT CONVERTS IT (audit VN-1,
+  // owner 2026-10-14: "venom damage needs to be billed properly as flesh
+  // becomes envenomed"). A conversion in place -- tissue -> infection (a
+  // spread, a joint crossing, a coat seeding) or infection -> its `leaves`
+  // (venom -> necrotic) -- removes nothing, so no carve sees it, yet it moves
+  // the limb's wound-weight and organ totals that CarveLimb charges as a
+  // delta against MobLimb::weightCharged / organCharged. Left alone that is
+  // a debt the NEXT carve of any cause bills (an arrow graze charging a whole
+  // necrotized heart) or a heal re-baseline forgives. This settles it on the
+  // spot: `dWeight` / `dOrgan` are the summed (was - now) of
+  // MobDef::WoundHpOf / OrganHpOf over the cells converted; both ledgers move
+  // by exactly that (signed, so they keep describing the lattice), and the
+  // LIVING limb is charged CarveLimb's own rates for the positive part --
+  // the weight share x limb hp x gore.carveHpPerVolume, and the organ flat
+  // (organHpTaken, when the cause's policy charges organs) -- under `cause`.
+  // Returns the hp charged. Never resolves an hp-0 limb: the infection's own
+  // step does (Mob::InfectStep), under the infection's name.
+  float SettleInfectConversion(int limbIndex, float dWeight, float dOrgan,
+                               DamageCause cause);
   // What infection `mat` does: its InfectSpec, or the rot's rule for a
   // material the table has no block for (a legacy bite).
   const InfectSpec& InfectSpecFor(uint32_t mat) const;

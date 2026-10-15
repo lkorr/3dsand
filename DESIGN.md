@@ -9215,7 +9215,10 @@ ledger so a venom coat lying in a wound arms its seeding again.
   envenomed skin.
 - `hp` — FLAT hp the limb loses per world voxel of it eaten, on top of the volume
   charge the flush makes (a few tenths of an hp for a few dozen lattice cells of
-  a human arm — too little to be a poison).
+  a human arm — too little to be a poison). It is the infection's OWN damage and
+  never stood for the tissue's wound weight or organ figure: those are billed
+  besides it, by the flush for a removed cell and by the conversion settlement
+  (below) for a cell rewritten in place, so nothing is billed twice.
 - `cause` — `"burn"` keeps the rot on the `Burn` ledger it has always booked to;
   anything else books to `DamageCause::Infection` (Burn's sever rows under its
   own name). `death` names the death when its damage kills; `turns` makes a body
@@ -9235,7 +9238,34 @@ ledger so a venom coat lying in a wound arms its seeding again.
   happen, and there is no carve to flush: a charge that takes the limb to 0 is
   resolved in `InfectStep` by the rule a blow uses (`Mob::Damage`), not an
   eaten carve's — a vital or root limb dies in place, an arm stays on, dead.
+  The cell's CHANGE of wound weight and organ figure is still billed, by the
+  settlement below (`envenomed` -> `necrotic` is 1 -> 1 and 0 -> 0 today).
 - `label` — what the HUD and the remedy messages call it ("rot", "venom"); absent = the material's name.
+
+**An infection bills what it converts, when it converts it (audit VN-1, owner
+2026-10-14: "venom damage needs to be billed properly as flesh becomes
+envenomed").** `Mob::CarveLimb` charges wound weight and organ loss as a delta
+against `MobLimb::weightCharged` / `organCharged`, so a cell rewritten in place
+— which no carve sees — used to sit in that ledger as debt: once `leaves` made
+venom stop removing cells (and so stop flushing), a heart the venom took was
+billed whole by the NEXT carve of any cause (an arrow graze killing with ~190
+hp of "heart destroyed"), or forgiven by a heal re-baseline. Now every in-place
+conversion settles on the spot through `Mob::SettleInfectConversion`: the
+spread and a `leaves` eat (`InfectStep`), a joint crossing (on the destination
+limb), a coat seeding (`CoatInfectTick`) and a bite's infectious rewrite
+(`StainWoundAs` measures it, the bite bills it). Per conversion the summed
+(was − now) `woundHp` and `organHp` move both ledgers by exactly that (signed),
+and the LIVING limb is charged CarveLimb's own rates for the positive part —
+the weight share × limb hp × `gore.carveHpPerVolume`, and the organ figure flat
+(`organHpTaken`, when the cause's sever-policy row charges organs) — under the
+infection's `cause`. The rot's removal is unchanged (its flush bills the
+removed cell, now without the spread's delta it has already settled). A charge
+that takes a limb to 0 is resolved on that limb's own `InfectStep` (every
+writer above latches it), whose lethal test is now the limb's hp rather than
+"something was eaten", and the death is named for the infection that did it
+(first eaten, else first to charge, else first present) — never for the organ,
+never for the next blow. A conversion OUTSIDE an infection (a cut's wound
+rewrite, a joint-twin copy) is not settled here and still rides the ledger.
 
 **One number per infection, body and world.** The world-grid rot rules
 (`reactions.json`, `"infectSpread": true`) take their chance from the SAME
@@ -10860,7 +10890,10 @@ CarveMatches` are the same rule; `--gate anatomy-parity` keeps them one.
 is a MATERIAL with `organHp` in materials.json: every cell of it lost, by any
 cause, subtracts that flat figure from its limb on top of the ordinary
 volume share (`Mob::CarveLimb`, `MobLimb::organCharged` — a delta of
-recomputed per-material sums, like the volume weights). No organ has a rule
+recomputed per-material sums, like the volume weights). A cell CONVERTED in
+place counts too: an infection turning a heart cell into `envenomed` takes
+that cell's `organHp` at the conversion, under the infection's cause (see
+"An infection bills what it converts" under *Infection is a material*). No organ has a rule
 of its own: enough of it gone takes the limb's hp to 0 and the existing
 vital-limb rule kills, the death named for the organ ("heart destroyed",
 `Mob::OrganDeathCause`). `brain` 3.5 (it was the global
