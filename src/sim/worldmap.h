@@ -1030,8 +1030,12 @@ void SetScratchDungeon(const ScratchDungeon* s);
 const ScratchDungeon* ScratchDungeonSlot();
 // Place `g` (its shell + res set) for `seed` on the CURRENT map's bare ground:
 // origin, boxes, surface rects, `resolved`. False + `warning` when the
-// program cannot be packed (then it is left unplaced). LoadWorldMap's rule.
-bool AnchorDungeon(DungeonDef& g, uint32_t seed, const std::string& mapName, std::string& warning);
+// program cannot be packed (then it is left unplaced) -- alone, or together
+// with the placed entries of `table` (the map's dungeons[], which holds `g`)
+// that come before `g`, since PackWorldMap packs them all into one index.
+// LoadWorldMap's rule.
+bool AnchorDungeon(DungeonDef& g, uint32_t seed, const std::string& mapName, std::string& warning,
+                   const std::vector<DungeonDef>* table = nullptr);
 // The voxel server's dungeon preview without a map reload: `m` is a copy of a
 // map LoadWorldMap built with a scratch program of the SAME shape installed
 // (same id, same replaceMapEntry); its entry takes the scratch now installed,

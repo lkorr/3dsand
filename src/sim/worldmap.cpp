@@ -907,13 +907,33 @@ uint32_t HashEditLayerFiles(const std::vector<std::pair<std::string, std::string
   return h;
 }
 
+namespace {
+// One placed map entry as the packer takes it: PackWorldMap's dungeon block
+// and AnchorDungeon's trial pack read the same thing.
+dungeon::Placed PlacedOf(const DungeonDef& g) {
+  dungeon::Placed pl;
+  pl.id = g.id;
+  pl.shell = g.shell;
+  pl.res = g.res;
+  pl.yawQ = g.yawQ;
+  pl.origin = g.origin;
+  pl.boxMin = g.boxMin;
+  pl.boxMax = g.boxMax;
+  pl.keepMin = g.keepMin;
+  pl.keepMax = g.keepMax;
+  pl.surf = g.surf;
+  return pl;
+}
+}  // namespace
+
 // THE DUNGEONS' ANCHORS (PLAN_dungeons §2.1): the bare ground at `at`, the
 // same resolution a locale anchor takes, so the whole dungeon rides the
 // ground AT THE ANCHOR, rigidly. The scratch ISOLATE dungeon names its y.
 // LoadWorldMap's, and ReplaceScratchDungeon's: one placement rule. Reads the
 // CURRENT map's bare ground (LoadWorldMap installs the map it is building
 // for the duration).
-bool AnchorDungeon(DungeonDef& g, uint32_t seed, const std::string& mapName, std::string& warning) {
+bool AnchorDungeon(DungeonDef& g, uint32_t seed, const std::string& mapName, std::string& warning,
+                   const std::vector<DungeonDef>* table) {
   const ScratchDungeon* scratch = ScratchDungeonSlot();
   const bool absY = scratch && scratch->absoluteY && !scratch->replaceMapEntry && g.id == scratch->def.id;
   g.groundY = absY ? scratch->anchorY : BareGroundHeight(g.ax, g.az, seed);
@@ -928,11 +948,23 @@ bool AnchorDungeon(DungeonDef& g, uint32_t seed, const std::string& mapName, std
   pl.origin = dungeon::OriginFor(*g.shell, g.yawQ, base);
   dungeon::PlacedBounds(pl);
   {
-    // A trial pack of this dungeon alone: a program the index cannot hold
-    // (a cell over the list limits) is a warning, not a refused map.
+    // A trial pack: a program the index cannot hold (a cell over the list
+    // limits) is a warning, not a refused map. It packs this dungeon WITH
+    // every entry of `table` placed before it: PackWorldMap packs all placed
+    // dungeons into ONE shared index, so two that each fit alone can overflow
+    // a cell together -- and PackWorldMap failing is a refused boot. Anchored
+    // in table order, the first entry whose addition overflows is the one not
+    // placed, the same rule cumulatively.
+    std::vector<dungeon::Placed> set;
+    if (table != nullptr)
+      for (const DungeonDef& d : *table) {
+        if (&d == &g) break;
+        if (d.Placed()) set.push_back(PlacedOf(d));
+      }
+    set.push_back(pl);
     std::vector<uint32_t> trial(kHeaderWords, 0u);
     std::string perr;
-    if (!dungeon::PackDungeons({pl}, trial, perr)) {
+    if (!dungeon::PackDungeons(set, trial, perr)) {
       warning = "dungeon \"" + g.id + "\": " + perr + " -- not placed";
       g.shell.reset();
       g.res.reset();
@@ -1002,9 +1034,34 @@ bool ReplaceScratchDungeon(WorldMapData& m, uint32_t seed, std::string& log) {
                                   [&](const std::string& w) { return w.compare(0, tag.size(), tag) == 0; }),
                    m.warnings.end());
   std::string w;
-  if (!AnchorDungeon(*g, seed, m.name, w)) {
+  if (!AnchorDungeon(*g, seed, m.name, w, &m.dungeons)) {
     std::fprintf(stderr, "world map WARNING: %s\n", w.c_str());
     m.warnings.push_back(w);
+  }
+  // The entries AFTER it were checked against the previous program. Re-run
+  // LoadWorldMap's cumulative rule over them, so PackWorldMap never sees a set
+  // that overflows a shared index cell: the first one whose addition does is
+  // unplaced with a warning, as a full load would. (One unplaced earlier by
+  // the previous program stays unplaced until a reload: its program is gone.)
+  {
+    const size_t gi = static_cast<size_t>(g - m.dungeons.data());
+    std::vector<dungeon::Placed> set;
+    for (size_t i = 0; i < m.dungeons.size(); i++) {
+      DungeonDef& d = m.dungeons[i];
+      if (!d.Placed()) continue;
+      set.push_back(PlacedOf(d));
+      if (i <= gi) continue;
+      std::vector<uint32_t> trial(kHeaderWords, 0u);
+      std::string perr;
+      if (dungeon::PackDungeons(set, trial, perr)) continue;
+      set.pop_back();
+      const std::string why = "dungeon \"" + d.id + "\": " + perr + " -- not placed";
+      std::fprintf(stderr, "world map WARNING: %s\n", why.c_str());
+      m.warnings.push_back(why);
+      d.shell.reset();
+      d.res.reset();
+      d.resolved = false;
+    }
   }
   m.contentHash = FoldDungeonHashes(m.contentHashSansDungeons, m.dungeons);
   return true;
@@ -2411,7 +2468,7 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     for (DungeonDef& g : out.dungeons) {
       if (!g.shell || !g.res) continue;
       std::string w;
-      if (!AnchorDungeon(g, seed, name, w)) warn(w);
+      if (!AnchorDungeon(g, seed, name, w, &out.dungeons)) warn(w);
     }
     // ---- THE ROAD PROFILES (map v2 R1, worldmap.h kSiteRoad) ------------------
     // Per road, deterministic integer arithmetic on the BARE ground (no road
@@ -2972,21 +3029,8 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
   // worldgen's dungeon layer reads per chunk.
   {
     std::vector<dungeon::Placed> placed;
-    for (const DungeonDef& g : map.dungeons) {
-      if (!g.Placed()) continue;
-      dungeon::Placed pl;
-      pl.id = g.id;
-      pl.shell = g.shell;
-      pl.res = g.res;
-      pl.yawQ = g.yawQ;
-      pl.origin = g.origin;
-      pl.boxMin = g.boxMin;
-      pl.boxMax = g.boxMax;
-      pl.keepMin = g.keepMin;
-      pl.keepMax = g.keepMax;
-      pl.surf = g.surf;
-      placed.push_back(std::move(pl));
-    }
+    for (const DungeonDef& g : map.dungeons)
+      if (g.Placed()) placed.push_back(PlacedOf(g));
     dungeon::PackStats ds;
     if (!dungeon::PackDungeons(placed, W, log, &ds, !DungeonsEnabled(), !DungeonSurfaceKeep())) return false;
     if (!placed.empty())
