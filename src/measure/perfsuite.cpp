@@ -1159,6 +1159,148 @@ void DriveWater(Scene& s, uint32_t lt, TickOps& out) {
 }
 
 // ---------------------------------------------------------------------------
+// THE POUR (2026-10-15, ticket 2026-10-14_22-55-02: "a bunch of water pouring
+// in through a break tanks fps to ~20; looking at the floor it goes back to
+// 60"). Shared by the --perf scenario `pour` and the --render-budget cameras
+// `pour` / `pourblood`, so the timed frame and the attributed frame are one
+// scene.
+//
+// `water` above blows a crater in the bank and stands 2 r back; that never
+// makes a TORRENT (the crater fills and stops) and its camera sees the lake,
+// not the break. This one cuts a real breach: a pit beside the authored lake
+// (floor 20 voxels under the lake bed, open to the sky) and, a few ticks
+// later, a notch from the lake into it 16 voxels deep, so the lake falls
+// through the gap into the pit as excited MPM water (excite trigger (a),
+// "settled liquid with air below") and the CA's own falling cells. The eye is
+// the ticket's: ~3 m from the water along a -48.5 deg view, over the pit,
+// looking back (-x) at the notch with the lake beyond it.
+//
+// `blood` also paints blood spheres into the lake around the notch (a wound's
+// drip path, sim_mutate.wgsl paintTakes), so the poured water carries
+// dissolved blood the way the ticket's piranha-fed lake did. Every op goes
+// through SubmitTick's queue (rule 3).
+// ---------------------------------------------------------------------------
+struct PourGeom {
+  int cx = 0, cz = 0, r = 0, surf = 0, floorY = 0;
+  int dx = 1;          // the side of the lake the breach opens on: +1 / -1 x
+  int rimX = 0;        // the lake's edge on that side
+  int notchX1 = 0;     // the notch's outer lip (the pit starts one past it)
+};
+constexpr int kPourNotchHalfZ = 4, kPourNotchDepth = 16;
+constexpr int kPourPitLen = 24, kPourPitHalfZ = 12, kPourPitBelowBed = 20;
+constexpr int kPourOpenAbove = 30;   // cut to the sky this far over the waterline
+constexpr uint32_t kPourNotchTick = 5;   // after the pit (tick 0) has landed
+
+// The first authored lake with room for the pit on its +x side, else on its
+// -x side (the harness lake at (420,420) sits 24 voxels from the window's +x
+// face).
+bool PourFind(const Scene& s, PourGeom& g, std::string& why) {
+  for (int i = 0; i < World::WaterSiteCount(); i++) {
+    const World::PondDisc p = World::WaterSiteDisc(i, kDefaultSeed);
+    if (!p.present || p.fillId == 0u) continue;
+    if (!s.world.CellInWindow({p.cx, p.surf, p.cz})) continue;
+    for (int dx : {1, -1}) {
+      g.cx = p.cx;
+      g.cz = p.cz;
+      g.r = p.r;
+      g.surf = p.surf;
+      g.floorY = p.surf - p.depth;
+      g.dx = dx;
+      g.rimX = p.cx + dx * p.r;
+      g.notchX1 = g.rimX + dx * 8;
+      const int pitX1 = g.notchX1 + dx * (kPourPitLen + 4);
+      if (!s.world.CellInWindow({pitX1, g.floorY - kPourPitBelowBed, p.cz}) ||
+          !s.world.CellInWindow({pitX1, p.surf + kPourOpenAbove, p.cz}))
+        continue;
+      return true;
+    }
+  }
+  why = "no authored water pool with room for a pit beside it inside the "
+        "residency window (run with SANDVOX_MAP=harness: the fixture lake is "
+        "at (420,420))";
+  return false;
+}
+
+// Air cut into a box (x corners in either order), cells outside the window
+// skipped.
+void PourCut(const Scene& s, int xa, int xb, int y0, int y1, int z0, int z1,
+             std::vector<CellOp>& out) {
+  const int x0 = std::min(xa, xb), x1 = std::max(xa, xb);
+  for (int y = y0; y <= y1; y++)
+    for (int z = z0; z <= z1; z++)
+      for (int x = x0; x <= x1; x++) {
+        const IVec3 c{x, y, z};
+        if (!s.world.CellInWindow(c)) continue;
+        out.push_back({World::SlotCellIndex(c), (uint32_t)kMatAir});
+      }
+}
+void PourPitOps(const Scene& s, const PourGeom& g, std::vector<CellOp>& out) {
+  PourCut(s, g.notchX1 + g.dx, g.notchX1 + g.dx * kPourPitLen,
+          g.floorY - kPourPitBelowBed, g.surf + kPourOpenAbove,
+          g.cz - kPourPitHalfZ, g.cz + kPourPitHalfZ, out);
+}
+void PourNotchOps(const Scene& s, const PourGeom& g, std::vector<CellOp>& out) {
+  PourCut(s, g.rimX - g.dx * 6, g.notchX1, g.surf - kPourNotchDepth,
+          g.surf + kPourOpenAbove, g.cz - kPourNotchHalfZ, g.cz + kPourNotchHalfZ, out);
+}
+// Twelve radius-5 blood spheres a few voxels under the surface, in the lake's
+// half on the breach side -- the water that pours.
+void PourBloodOps(const Scene& s, const PourGeom& g, std::vector<BrushOp>& out) {
+  const uint32_t blood = MatId(s.mats, "blood");
+  if (blood == 0) return;
+  for (int k = 0; k < 12; k++) {
+    const int x = g.rimX - g.dx * (10 + (k % 4) * 12);
+    const int z = g.cz + ((k / 4) - 1) * 14;
+    out.push_back({x, g.surf - 6, z, 5, blood, 0u, 0u, 0u});
+  }
+}
+void PourEye(Scene& s, const PourGeom& g) {
+  // ~3 m along a -48.5 deg ray from the waterline: 22 voxels up, ~20 back.
+  s.eye = {(float)(g.notchX1 + g.dx * 20), (float)(g.surf + 22), (float)g.cz + 0.5f};
+  // Back at the notch, the lake beyond (Camera::Forward = cos yaw, ., sin yaw).
+  s.cam.yaw = g.dx > 0 ? 3.14159265f : 0.0f;
+  s.cam.pitch = -0.8465f;           // -48.5 deg, the ticket's
+}
+// One tick of the pour's script; `i` counts from the pit cut.
+void PourTickOps(const Scene& s, const PourGeom& g, uint32_t i, bool blood,
+                 TickOps& out) {
+  if (i == 0) PourPitOps(s, g, out.cells);
+  if (i == kPourNotchTick) PourNotchOps(s, g, out.cells);
+  // Twice: the first cloud has thinned by the time the frame is taken.
+  if (blood && (i == kPourNotchTick || i == kPourNotchTick + 100))
+    PourBloodOps(s, g, out.ops);
+  out.particlesActive = true;
+}
+
+bool SetupPour(Scene& s, std::string& why) {
+  PourGeom g;
+  if (!PourFind(s, g, why)) return false;
+  PourEye(s, g);
+  s.pond = {g.cx, g.surf, g.cz};
+  s.crownR = g.r;
+  char note[224];
+  std::snprintf(note, sizeof note,
+                "authored lake r=%d at (%d,%d), surface y=%d, bed y=%d: pit cut on "
+                "tick 0, a %d-deep notch into it on tick %u, blood painted on %u and "
+                "%u; eye over the pit at -48.5 deg",
+                g.r, g.cx, g.cz, g.surf, g.floorY, kPourNotchDepth, kPourNotchTick,
+                kPourNotchTick, kPourNotchTick + 100);
+  s.note = note;
+  return true;
+}
+void DrivePour(Scene& s, uint32_t, TickOps& out) {
+  PourGeom g;
+  std::string why;
+  if (!PourFind(s, g, why)) return;
+  PourTickOps(s, g, s.fireTick++, /*blood=*/true, out);
+}
+void VerifyPour(Scene& s) {
+  char buf[96];
+  std::snprintf(buf, sizeof buf, "; %u MPM particles live at the end", s.fluidLive);
+  s.note += buf;
+}
+
+// ---------------------------------------------------------------------------
 // SCENARIO: surface-sprint
 //
 // `--frames 600 --autofly-surface` as a recorded, attributed scenario.
@@ -1479,6 +1621,14 @@ const Scenario kScenarios[] = {
      "lights up the MPM solver and the CA/MPM seam, and it runs on terrain "
      "rather than the lab slab so the numbers describe the game.",
      "fluidSys;waterBodies;caLoop;renderPass", 60, 600, SetupWater, DriveWater},
+
+    {"pour", "Lake breach pour (ticket 22-55-02)",
+     "The harness lake breached into a pit beside it: a 16-deep notch, the "
+     "lake falling through it as MPM and CA water, blood dissolved in it, "
+     "the eye 3 m from the torrent looking down at -48.5 deg as the ticket's "
+     "was. The view-dependent water frame the owner measured at 47 ms.",
+     "fluidSys;waterBodies;caLoop;renderPass", 60, 300, SetupPour, DrivePour,
+     VerifyPour},
 
     {"surface-sprint", "Surface sprint (the tail)",
      "The game's own --autofly-surface: sprint flight over the terrain at 10.6 "
@@ -2869,6 +3019,51 @@ bool CamLake(Scene& s, uint32_t& tick, std::string& why) {
   return false;
 }
 
+// THE BREACH POUR (2026-10-15, ticket 2026-10-14_22-55-02): --perf pour's
+// scene (PourTickOps above) run for kPourBudgetTicks and frozen mid-torrent.
+// `pourblood` is the same with blood painted into the lake, so the pair
+// prices dissolved blood on a pour. Leaves the harness lake breached and the
+// pit full of water, so these come late in the default order.
+constexpr uint32_t kPourBudgetTicks = 180;
+bool CamPourImpl(Scene& s, uint32_t& tick, std::string& why, bool blood) {
+  PourGeom g;
+  if (!PourFind(s, g, why)) return false;
+  PourEye(s, g);
+  const IVec3 pc{(int)s.eye.x >> 4, (int)s.eye.y >> 4, (int)s.eye.z >> 4};
+  s.fluidLive = 0;
+  const uint32_t t0 = 6000;
+  for (uint32_t i = 0; i < kPourBudgetTicks; i++) {
+    TickOps ops;
+    PourTickOps(s, g, i, blood, ops);
+    SubmitTick(s.ctx, s.world, s.sim, t0 + i, kDefaultSeed, ops.ops, ops.exps,
+               ops.cells, (t0 + i) % 15 == 0, pc, /*wantReadback=*/true,
+               ops.particlesActive, {}, 0, {}, s.fluidLive);
+    s.ctx.ProcessEvents();
+    const WorldSnapshot& sn = s.world.Snap();
+    if (sn.valid) s.fluidLive = sn.fluidLive;
+    if ((i & 15u) == 0u) s.ctx.WaitIdle();   // keep the queue shallow
+  }
+  s.ctx.WaitIdle();
+  s.ctx.ProcessEvents();
+  if (s.world.Snap().valid) s.fluidLive = s.world.Snap().fluidLive;
+  char note[256];
+  std::snprintf(note, sizeof note,
+                "lake r=%d at (%d,%d) breached into a pit, %u ticks after the cut%s; "
+                "%u MPM particles live; eye over the pit 3 m from the torrent at "
+                "-48.5 deg, frame frozen",
+                g.r, g.cx, g.cz, kPourBudgetTicks, blood ? ", blood in the lake" : "",
+                s.fluidLive);
+  s.note = note;
+  tick = FindNoonTick(CurrentTuning());
+  return true;
+}
+bool CamPour(Scene& s, uint32_t& tick, std::string& why) {
+  return CamPourImpl(s, tick, why, false);
+}
+bool CamPourBlood(Scene& s, uint32_t& tick, std::string& why) {
+  return CamPourImpl(s, tick, why, true);
+}
+
 // ---------------------------------------------------------------------------
 // THE FOLIAGE CAMERAS (2026-09-05).
 //
@@ -3436,6 +3631,8 @@ bool CamAt(Scene& s, uint32_t& tick, std::string& why) {
 }
 const char* const kArmsAt[] = {"baseline", "noshadow", "noreflect", "reflgate",
                                "nogodray", "godshadow0", "halfres", nullptr};
+const char* const kArmsPour[] = {"baseline", "noshadow", "noreflect", "nomist",
+                                 "halfres", nullptr};
 // THE PEAKS SUMMIT (map v2 H1). On the `peaks` test map's 1,400 m summit
 // looking out over the range: the far cascade, the cascade-to-horizon seam,
 // the horizon past it and the height fog in one frame -- the camera the
@@ -3498,6 +3695,11 @@ const BudgetCam kBudgetCams[] = {
     {"village", "the Harrowby green with all three houses burning in oil, looking "
                 "at the longhouse",
      CamVillage, kArmsFire},
+    {"pour", "3 m over a breached lake's torrent, looking down at -48.5 deg "
+             "(ticket 22-55-02; harness map; leaves the lake breached)",
+     CamPour, kArmsPour},
+    {"pourblood", "the same pour with blood dissolved in the lake",
+     CamPourBlood, kArmsPour},
     {"seam", "eye height on the pad, window centred as in play, level at the "
              "window face (the LOD seam)",
      CamSeam, kArmsSeam},
@@ -3521,6 +3723,9 @@ constexpr int kBudgetCamCount =
 struct ArmResult {
   const RenderArm* arm = nullptr;
   double gpuP50 = 0, gpuP95 = 0;
+  // The fast tail: on a GPU other processes share, contention only ever ADDS
+  // time, so p10 tracks the uncontended cost when p50 drifts (printed only).
+  double gpuP10 = 0;
   // The per-frame compute table's share of gpuP50 (EncodeShadowResolve: the
   // shadow resolve, the sky bound, the clouds, the ray-start map), timed as its
   // own span so a lever that moves work between the fragment shader and that
@@ -3715,6 +3920,7 @@ class RenderBudgetRunner {
     }
     res.gpuP50 = Percentile(ms, 0.50);
     res.gpuP95 = Percentile(ms, 0.95);
+    res.gpuP10 = Percentile(ms, 0.10);
     res.preP50 = Percentile(pre, 0.50);
     for (auto& r : rows) res.preRows.push_back({r.first, Percentile(r.second, 0.50)});
     res.frames = (int)ms.size();
@@ -4219,6 +4425,16 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
       }
       arms.swap(kept);
     }
+    // SANDVOX_BUDGET_REPEAT=n: the arm list n times over, interleaved
+    // (a b c a b c ...), for A/B pairs on a machine whose GPU load drifts by
+    // more than the lever (2026-10-15: +2 ms baseline -> base2 in one run).
+    // Read each arm's spread from the repeated rows. Shader variants come out
+    // of the SPIR-V cache after the first pass, so a repeat costs frames only.
+    if (const char* e = std::getenv("SANDVOX_BUDGET_REPEAT")) {
+      const int n = std::max(1, std::min(16, std::atoi(e)));
+      const std::vector<const RenderArm*> once = arms;
+      for (int k = 1; k < n; k++) arms.insert(arms.end(), once.begin(), once.end());
+    }
 
     std::printf("\n=== camera %s — %s ===\n", id, cr.label.c_str());
     std::printf("        %s\n", scene.note.c_str());
@@ -4245,7 +4461,7 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
                                    /*frames=*/48);
       std::printf("  %-11s %-42s ", arm->id, arm->label);
       if (!r.ok) std::printf("SKIPPED — %s\n", r.why.c_str());
-      else std::printf("%7.2f ms  (pre %.2f)\n", r.gpuP50, r.preP50);
+      else std::printf("%7.2f ms  (pre %.2f, p10 %.2f)\n", r.gpuP50, r.preP50, r.gpuP10);
       // What `pre` is made of (rows >= 0.05 ms), baseline arm only: one line
       // per camera on the terminal, every arm's in the JSON.
       if (r.ok && std::strcmp(arm->id, "baseline") == 0 && !r.preRows.empty()) {
