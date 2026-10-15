@@ -694,15 +694,38 @@ const HZ_H_SEA_Y : u32 = 7u;
 const HZ_H_MAX_Y : u32 = 10u;
 const HZ_H_SAMPLES : u32 = 11u;
 // The ground search: geometric steps from 20 m out to `tMax` (the deck's
-// reach), then a bisection of the crossing. The growth factor is fitted to
-// tMax so the last step lands on it: the original fixed 1.12 over 40 steps
-// reached only 20 x 1.12^40 = 1.9 km, so every summit past that was marched
-// THROUGH -- the whole deck behind it painted over the slope, with a hard
-// edge where the hit crossed the deck base (tickets 2026-10-09_15-11-18 and
-// _15-14-31). A ridge narrower than a step at that distance (~1 km at 10 km)
-// can still be stepped over; the composite's span rescale (raymarch.wgsl
+// reach), then a bisection of the crossing. The original fixed 1.12 over 40
+// steps reached only 20 x 1.12^40 = 1.9 km, so every summit past that was
+// marched THROUGH -- the whole deck behind it painted over the slope, with a
+// hard edge where the hit crossed the deck base (tickets 2026-10-09_15-11-18
+// and _15-14-31). A ridge narrower than a step at that distance (~800 m at
+// 6 km) can still be stepped over; the composite's span rescale (raymarch.wgsl
 // cloudScreenAtHit) then trims what was marched behind the real surface.
-const GROUND_STEPS : i32 = 56;
+//
+// THE LADDER IS ONE FIXED SET OF DISTANCES, and the search runs along the
+// texel's UNJITTERED ray (ticket 2026-10-14_22-58-27, "mountain top strobing
+// in the cloud"). The ladder used to be fitted to each ray's own tMax -- the
+// deck's far side, which moves with rd.y -- and the search ran along the
+// jittered ray. So the R2 sub-texel jitter moved every step by up to ~75 m at
+// 6 km, a thin summit was caught by one frame's steps and stepped over by the
+// next, and the CUT bit of the texels round its top changed every frame. Both
+// halves of the composite key on that bit (the class-aware resolve starts a
+// texel's history over when it flips; cloudScreenAtHit takes cut texels, else
+// the nearest within reach, else the sky span), so the tip of a summit inside
+// the deck alternated between the cloud marched in front of the face and the
+// sky texels' span guess: on a thin cap cloud, clouded one frame and bare rock
+// the next. Now a texel's cut bit is a function of the texel and the camera
+// alone; the cloud march itself stays jittered (that is what the resolve
+// accumulates).
+const GROUND_STEPS : i32 = 64;
+// The ladder's reach: the longest ground search deckSpan can ask for.
+const GROUND_LADDER_M : f32 = TUNE_CLOUD_MAX_DIST_M + RAIN_MAX_M;
+// The clearance refinement (terrainHitM): a step is at most this many times
+// the ray's height over the ground (so only a slope steeper than ~1/K, plus
+// the ray's own climb, can rise into it unseen), and at least this fraction
+// of the plain geometric step.
+const GROUND_CLEARANCE_K : f32 = 0.75;
+const GROUND_FINE_FRAC : f32 = 0.0625;
 // Only the SCREEN march looks for the ground (deckSpan). The env map is the
 // fog target and the sky fallback for a texel the ground cut (raymarch.wgsl
 // cloudScreenAt), and in both roles it must be the column as if no mountain
@@ -747,13 +770,18 @@ fn terrainHitM(rd : vec3f, tMax : f32, steps : i32) -> f32 {
   if (rd.y >= 0.0 && C.camM.y >= topM) { return 1e9; }
   var tPrev = 0.0;
   var t = GROUND_FIRST_M;
-  let grow = max(GROUND_GROW_MIN, pow(max(tMax, GROUND_FIRST_M) / GROUND_FIRST_M,
-                                      1.0 / f32(steps - 1)));
-  for (var k = 0; k < steps; k++) {
+  // Fixed: never a function of this ray's tMax (see GROUND_LADDER_M). A
+  // shorter search (short-range mode, a ray that reaches the deck's far side
+  // early) just stops partway up it -- the last step is clamped onto tMax.
+  let grow = max(GROUND_GROW_MIN, pow(GROUND_LADDER_M / GROUND_FIRST_M, 1.0 / f32(steps - 1)));
+  let lnGrow = log(grow);
+  let budget = steps * 3;
+  for (var k = 0; k < budget; k++) {
     if (tPrev >= tMax) { break; }
     let tk = min(t, tMax);
     let p = C.camM + rd * tk;
-    if (p.y <= hzGroundM(p.xz, tk)) {
+    let g = hzGroundM(p.xz, tk);
+    if (p.y <= g) {
       var a = tPrev;
       var b = tk;
       for (var it = 0; it < 6; it++) {
@@ -766,10 +794,29 @@ fn terrainHitM(rd : vec3f, tMax : f32, steps : i32) -> f32 {
     // Climbing past everything the map holds: nothing further can be ground.
     if (rd.y > 0.0 && p.y > topM) { break; }
     tPrev = tk;
-    t *= grow;
+    // CLEARANCE-REFINED: the geometric step, shortened to GROUND_CLEARANCE_K
+    // x the ray's height over the ground here (never below GROUND_FINE_FRAC of
+    // it), so a ray grazing a summit samples it at a few hundred metres
+    // instead of ~800 m at 6 km. A plain ladder stepped over the top third of
+    // a 1.7 km peak at 6 km, and every hit pixel there fell back to the sky
+    // texels' span (cloudScreenAtHit): the summit showed through a closed
+    // overcast as a ghost with texel-stair edges. Refinement is spent only
+    // while the iterations left still cover the plain ladder's remaining
+    // steps to tMax, so the search always reaches tMax.
+    let geo = tk * (grow - 1.0);
+    var dt = geo;
+    let ladderLeft = i32(ceil(log(max(tMax / tk, 1.0)) / lnGrow));
+    if (budget - k - 1 > ladderLeft) {
+      dt = clamp((p.y - g) * GROUND_CLEARANCE_K, geo * GROUND_FINE_FRAC, geo);
+    }
+    t = tk + dt;
   }
   return 1e9;
 }
+
+// The screen texel's ray WITHOUT this frame's sub-texel jitter: what the
+// ground search walks (set by `march`; the env map never searches).
+var<private> gGroundRd : vec3f;
 
 // Where along `rd` the deck is: [t0, t1] in metres, empty if t0 >= t1. Also
 // reports the distance to the ground, so the rain march stops there.
@@ -819,7 +866,10 @@ fn deckSpan(rd : vec3f, groundT : ptr<function, f32>, quality : u32) -> vec2f {
   }
   if (groundLook > 0.0 && quality == 1u) {
     let steps = GROUND_STEPS;
-    *groundT = min(*groundT, terrainHitM(rd, groundLook, steps));
+    // Along the texel's UNJITTERED ray (gGroundRd; GROUND_LADDER_M says why):
+    // the distance it returns is used as-is on the jittered one, a sub-texel
+    // difference.
+    *groundT = min(*groundT, terrainHitM(gGroundRd, groundLook, steps));
   }
   if (t0 >= t1 || t0 >= *groundT) { return vec2f(0.0, -1.0); }
   return vec2f(t0, min(t1, *groundT));
@@ -1017,6 +1067,7 @@ fn march(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= C.lowW || gid.y >= C.lowH) { return; }
   let pix = vec2f(gid.xy) + 0.5 + C.jitter;
   let rd = rayOf(pix);
+  gGroundRd = rayOf(vec2f(gid.xy) + 0.5);
   let m = marchSky(rd, ign(vec2f(gid.xy), C.frame), 1u);
   let i = (gid.y * C.lowW + gid.x) * RAW_WORDS;
   cloudRaw[i] = pack2x16float(m.c.xy);
