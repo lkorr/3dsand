@@ -79,7 +79,9 @@
 //         ("never" | "ticks:N" | "onLeave", default never), schedule,
 //         behavior, trigger ("always" | "onEnter(<region>)"), outfit,
 //         weapon, and any ROLE a schedule row names. Its creatures carry
-//         derived ids (Mob::RefId "<spawner id>/s<slot>") and walk its
+//         derived ids (Mob::RefId "<spawner id>/s<slot>"; a corpse is
+//         renamed "<id>/s<slot>#dead<serial>" so it never shares the slot's
+//         id with the replacement) and walk its
 //         schedule (refs_npc.h StepScheduled). Every decision -- which
 //         base, where -- is rng::Hash3(RefHash(id), serial): the same
 //         spawner spawns the same creatures at the same places on every

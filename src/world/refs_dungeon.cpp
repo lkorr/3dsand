@@ -884,13 +884,31 @@ void TickSpawner(RefCtx& c, const Ref& r, SpawnerLive& L) {
     SpawnSlot& s = L.slots[i];
     const std::string sid = SlotId(r, i);
     Mob* m = c.mobs->FindMobByRef(sid);
-    if (s.state == 1) {
-      if (m != nullptr && !m->Alive()) {
+    // THE DEAD GIVE BACK THE SLOT'S NAME. The slot finds its creature by the
+    // derived ref id, and a corpse kept it: FindMobByRef answers the first
+    // match dead or alive, and LoadOne refuses a record whose ref already has
+    // a body, so a corpse and its replacement under one id would book the
+    // replacement dead on sight (or lose the corpse, loot and all, when it
+    // unparks behind it). A dead body under `sid` is renamed
+    // "<sid>#dead<serial>" here -- when the slot books it, and also when one
+    // turns up in an empty or dead slot (a save from before this rule) --
+    // before anything else reads the id. Each pass renames one body, so the
+    // loop ends.
+    while (m != nullptr && !m->Alive()) {
+      if (s.state == 1) {
         s.state = 2;
         s.deadTick = c.tick;
         dirty = true;
         ForgetResident(sid);
-      } else if (m == nullptr) {
+      }
+      const std::string stem = sid + "#dead" + std::to_string(s.serial);
+      std::string dead = stem;
+      for (uint32_t n = 1; c.mobs->FindMobByRef(dead) != nullptr; n++) dead = stem + "." + std::to_string(n);
+      m->SetRefId(dead);
+      m = c.mobs->FindMobByRef(sid);
+    }
+    if (s.state == 1) {
+      if (m == nullptr) {
         if (++s.missing > kSpawnMissingTicks) {
           s.state = 2;
           s.deadTick = c.tick;
