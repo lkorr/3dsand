@@ -31385,6 +31385,17 @@ void Mob::OverlayLimbLattice(size_t i, std::vector<DebrisVoxel>& voxels,
   L.restOffset = restOffset;
   L.anchorRoot = anchorRoot;
   L.anchorLimb = anchorLimb;
+  // THE CHARGED BASELINES FOLLOW THE LATTICE (RestoreShellLattice's rule).
+  // The rig under this was built pristine, so `voxelsCharged` and the weighted
+  // totals still read the spawn census, while the hp the record restored is
+  // already net of every carve that made this lattice. Left alone, CarveLimb's
+  // next `charged - now` difference would bill all of that old loss a second
+  // time -- limb hp and organ hp both (a parked NPC's chipped shield broken by
+  // its next block; a scratch after a load re-charging lost brain cells).
+  // `voxelsAtSpawn` / `weightAtSpawn` stay the AUTHORED denominators.
+  L.voxelsCharged =
+      (uint32_t)(L.HasFineSkin() ? L.skinVoxels.size() : L.voxels.size());
+  LimbWoundTotals(L, L.weightCharged, L.organCharged);
   if (sameShape)
     RepaintLimbMicro(L, MicroSet());
   else if (L.microModel >= 0)
@@ -31501,6 +31512,10 @@ void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
     L.restOffset = rec.limbs[i].restOffset;
     L.anchorRoot = rec.limbs[i].anchorRoot;
     L.anchorLimb = rec.limbs[i].anchorLimb;
+    // The charged baselines follow the lattice, as in OverlayLimbLattice.
+    L.voxelsCharged =
+        (uint32_t)(L.HasFineSkin() ? L.skinVoxels.size() : L.voxels.size());
+    m.LimbWoundTotals(L, L.weightCharged, L.organCharged);
     if (L.microModel >= 0)
       m.ReskinLimbMicro(L, m.SkinScaleOf(L), m.PhysScaleOf(L));
     m.RebuildLimbBody((int)i);
