@@ -5882,6 +5882,15 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
       // is behind one bool. Nothing is stored, nothing is copied, and the
       // submitted vectors are the ones the tick built, in the order it built
       // them — which is what the `--record-ops` oracle comparison proves.
+      //
+      // THE DRAFT BOX (audit DJ-1, 2026-10-14): this machine's player's
+      // shelter box, on the fixed lattice from the submit chunk. It rides the
+      // batch like an op, so connected, the merge below makes `out.drafts` the
+      // SESSION's list -- the host's box, then the client's, on both machines
+      // -- and the wind indoors is the same wind on both. Handed to the submit
+      // after the block, whichever list it is.
+      out.drafts.clear();
+      out.drafts.push_back(DraftBoxFor(pc));
       if (w.opsync && w.opsync->Connected()) {
         namespace opstream = sandvox::opstream;
         net::OpDelayQueue& q = w.opsync->Q();
@@ -5973,6 +5982,10 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
       // SANDVOX_NET_SMOKE_DRIFT=1 (session.h section I says why it exists at
       // all), so single-player and every harness are untouched.
       if (w.driftCells) w.driftCells(tick, cellOps);
+      // The session's draft boxes for THIS tick's submit (the merged list when
+      // connected, deduplicated and capped there; this machine's one box
+      // otherwise).
+      SetTickDraftBoxes(tick, out.drafts.data(), out.drafts.size());
       // ---- M9.4-D: CRATERS BY CHUNK AUTHORITY, FROM THE MERGED BATCH ----
       //
       // Every explosion that is about to be SUBMITTED this tick — mine and the

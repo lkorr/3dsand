@@ -54,6 +54,10 @@
 //   * (WIND PRIMITIVES cross since 2026-10-14, kOpsWireVersion 3: a spell's
 //     gust is staged on OpBatch::winds by SpawnWindPrim and phase N spawns
 //     the merged list at the label tick. The dev panel's fan does not cross.)
+//   * (THE DRAFT BOXES cross since 2026-10-14, kOpsWireVersion 4, audit DJ-1:
+//     each machine's phase N puts its own player's box on OpBatch::drafts,
+//     and the merge in author order is the session's box list, which phase N
+//     hands to SubmitTick at the label tick on both machines.)
 //   * THE CPU-SIDE CONSEQUENCES of a remote explosion (island rescan, limb
 //     damage, body impulses). The crater crosses, because it is an op; the
 //     debris scan and the ragdoll launch are raised by the AUTHORING machine
@@ -73,7 +77,8 @@ namespace net {
 // version bump).
 // 2: the sixth vector, OpBatch::gas (2026-10-07).
 // 3: the seventh, OpBatch::winds (2026-10-14).
-constexpr uint32_t kOpsWireVersion = 3;
+// 4: the eighth, OpBatch::drafts (2026-10-14, audit DJ-1).
+constexpr uint32_t kOpsWireVersion = 4;
 
 // HOW FAR AHEAD A TICK'S OPS ARE LABELLED, and it is D + 1, NOT D.
 //

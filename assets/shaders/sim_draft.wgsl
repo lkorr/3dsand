@@ -132,7 +132,12 @@ const DM_CHANGED : u32 = 0u;
 const DM_SOLVES : u32 = 1u;
 const DM_LAST : u32 = 2u;
 const DM_CELLS : u32 = 3u;
-const DM_ARGS : u32 = 8u;   // six stage records, 4 words apart
+// THE BOX LIST (audit DJ-1, world.h kDraftMaxBoxes): every DM_* word but the
+// two below is a SLOT word, at gMeta + DM_*; DM_ARGS and DM_LIST are the
+// tick's, after the slot blocks.
+const DM_SLOT_WORDS : u32 = 40u;
+const DM_ARGS : u32 = 80u;   // six stage records, 4 words apart
+const DM_LIST : u32 = 104u;  // per stage, the slots that run it (DRAFT_MAX_BOXES apart)
 const DRAFT_COARSE_BASE : u32 = 262144u;
 const DRAFT_COARSE_WORDS : u32 = 6u;
 const DRAFT_PHI_A : u32 = 667648u;
@@ -210,10 +215,34 @@ fn tileOf(t : u32) -> vec3<i32> {
 const DRAFT_HEAT_PERIOD : u32 = 16u;
 
 fn stackOn() -> bool { return T.draftStackQ > 0 && T.updraftGainQ > 0; }
+
+// ---- THE SLOT (audit DJ-1, 2026-10-14) ------------------------------------
+// The tick solves the SESSION's boxes, one per player (TickParams.draftBox,
+// the same list on every machine), each in its own slot of the volume and of
+// draftMeta. Every kernel works ONE slot per workgroup and names it once, at
+// entry (useSlot); everything below reads its slot through these three:
+// gBase = the slot's first word of `draftField`, gMeta = its first word of
+// `draftMeta`, gOrg = its box's min corner. A solve stage's slot comes from
+// that stage's list (`args` writes it; the indirect record's z counts it), so
+// a slot whose box and geometry did not move dispatches nothing at all.
+var<private> gSlot : u32;
+var<private> gBase : u32;
+var<private> gMeta : u32;
+var<private> gOrg : vec3<i32>;
+fn useSlot(s : u32) {
+  gSlot = s;
+  gBase = s * DRAFT_SLOT_WORDS;
+  gMeta = s * DM_SLOT_WORDS;
+  gOrg = T.draftBox[s].xyz;
+}
+// The slot this workgroup solves at pipeline stage `stage` (1..DRAFT_STAGES).
+fn stageSlot(stage : u32, z : u32) -> u32 {
+  return atomicLoad(&draftMeta[DM_LIST + (stage - 1u) * DRAFT_MAX_BOXES + z]);
+}
 // Did this solve's snapshot see heat? Set by coarseBuild, read by the later
 // stages, reset by `args` only when a new solve starts.
-fn stackLive() -> bool { return atomicLoad(&draftMeta[DM_BOX_HOT]) != 0u; }
-fn heatClock() -> u32 { return atomicLoad(&heatMeta[HM_DRAFT_HEAT_CLOCK]); }
+fn stackLive() -> bool { return atomicLoad(&draftMeta[gMeta + DM_BOX_HOT]) != 0u; }
+fn heatClock() -> u32 { return atomicLoad(&heatMeta[HM_DRAFT_HEAT_CLOCK + gSlot]); }
 
 // ---- the masks --------------------------------------------------------------
 
@@ -227,8 +256,14 @@ fn draftBlocks(w : u32) -> bool {
 // The three row masks of fine cell `cell`, packed as the buffer stores them.
 // A cell is 4-aligned inside a 16-voxel chunk, so all 64 voxels share one
 // page-table entry, and a sentinel chunk is one material throughout.
+// A CELL OUTSIDE THIS MACHINE'S WINDOW IS OPEN AIR (no blocker), the one
+// deterministic answer for matter this machine does not hold. The boxes are
+// the session's (audit DJ-1) and are no longer clamped into the window, so a
+// peer's box can reach past mine: there the two machines' masks can differ,
+// which is the window-edge limit the CA itself has and chunksync repairs. A
+// chunk that streams in is re-masked by maskDirty (a refill marks its chunk).
 fn cellMasks(cell : vec3<i32>) -> vec2<u32> {
-  let base = T.draftOrigin + cell * 4;
+  let base = gOrg + cell * 4;
   if (!inWindow(base, T.origin)) { return vec2<u32>(0u, 0u); }
   let e = pageTable[voxSlotOfCell(base)];
   if ((e & PT_SENTINEL_BIT) != 0u) {
@@ -273,10 +308,10 @@ fn maskCell(vc : vec3<i32>, li : u32) -> bool {
   let cell = vc * 4 + vec3<i32>(i32(li & 3u), i32((li >> 2u) & 3u), i32(li >> 4u));
   let m = cellMasks(cell);
   let i = 2u * fineIndex(cell);
-  let changed = draftField[i] != m.x || draftField[i + 1u] != m.y;
+  let changed = draftField[gBase + i] != m.x || draftField[gBase + i + 1u] != m.y;
   if (changed) {
-    draftField[i] = m.x;
-    draftField[i + 1u] = m.y;
+    draftField[gBase + i] = m.x;
+    draftField[gBase + i + 1u] = m.y;
   }
   return changed;
 }
@@ -285,29 +320,41 @@ fn maskCell(vc : vec3<i32>, li : u32) -> bool {
 // gate changed, or the buffer is new). Raises `changed` unconditionally: a
 // fresh buffer's zero masks equal an all-air box's, and the field still has to
 // be solved once.
+// One z layer of groups per slot (pass_table.def: 2048 x 1 x kDraftMaxBoxes);
+// only a BURSTING slot's layer works.
 @compute @workgroup_size(64)
 fn maskAll(@builtin(workgroup_id) wg : vec3<u32>,
            @builtin(local_invocation_index) li : u32) {
+  if ((T.draftBox[wg.z].w & 2) == 0) { return; }
+  useSlot(wg.z);
   let g = i32(wg.x);
   let vc = vec3<i32>(g % DRAFT_CX, (g / DRAFT_CX) % DRAFT_CY, g / (DRAFT_CX * DRAFT_CY));
   _ = maskCell(vc, li);
-  if (wg.x == 0u && li == 0u) { atomicOr(&draftMeta[DM_CHANGED], 1u); }
+  if (wg.x == 0u && li == 0u) { atomicOr(&draftMeta[gMeta + DM_CHANGED], 1u); }
 }
 
 // The tick's ACTIVE chunks (the CA's own dispatch list), skipping the ones
 // outside the box. Only an active chunk can hold a voxel that changed since
 // the last tick: settled matter writes nothing, and every writer -- the CA, an
 // op, a landing particle, a streamed refill -- marks the chunk it wrote.
+// Every live slot whose box holds the chunk (boxes may overlap: each keeps its
+// own masks), except a BURSTING slot, which maskAll re-masks whole this tick.
 @compute @workgroup_size(64)
 fn maskDirty(@builtin(workgroup_id) wg : vec3<u32>,
              @builtin(local_invocation_index) li : u32) {
   let wc = slotWorldChunk(dirtyList[wg.x], T.origin);
-  let vc = wc - (T.draftOrigin >> vec3<u32>(CHUNK_SHIFT));
-  if (vc.x < 0 || vc.y < 0 || vc.z < 0 ||
-      vc.x >= DRAFT_CX || vc.y >= DRAFT_CY || vc.z >= DRAFT_CZ) { return; }
-  if (maskCell(vc, li)) {
-    atomicOr(&draftMeta[DM_CHANGED], 1u);
-    atomicAdd(&draftMeta[DM_CELLS], 1u);
+  for (var s = 0u; s < DRAFT_MAX_BOXES; s++) {
+    let fl = T.draftBox[s].w;
+    if ((fl & 1) == 0) { break; }   // compacted: no live slot after a dead one
+    if ((fl & 2) != 0) { continue; }
+    useSlot(s);
+    let vc = wc - (gOrg >> vec3<u32>(CHUNK_SHIFT));
+    if (vc.x < 0 || vc.y < 0 || vc.z < 0 ||
+        vc.x >= DRAFT_CX || vc.y >= DRAFT_CY || vc.z >= DRAFT_CZ) { continue; }
+    if (maskCell(vc, li)) {
+      atomicOr(&draftMeta[gMeta + DM_CHANGED], 1u);
+      atomicAdd(&draftMeta[gMeta + DM_CELLS], 1u);
+    }
   }
 }
 
@@ -324,10 +371,17 @@ fn maskDirty(@builtin(workgroup_id) wg : vec3<u32>,
 // pockets, the coarse and packed fine faces, the scratch potentials), so a
 // mask changing mid-solve cannot tear it.
 //
-// A BURST (TickParams.draftMode bit 1: the box moved, or the gate, the
-// materials or the buffer is new) runs every stage on this one tick -- the
+// A BURST (TickParams.draftBox[slot].w bit 1: the box moved, or the gate,
+// the materials or the buffer is new) runs every stage on this one tick -- the
 // field must match the box's new origin before anything reads it -- and
 // abandons any solve in flight.
+//
+// PER SLOT (audit DJ-1): each live slot of the box list runs this on its own
+// words, so a box re-solves (or bursts) only when ITS masks, heat or origin
+// moved. A dead slot is left exactly as it is: it comes back with a burst
+// (Simulation::SetDraft), which re-masks and re-solves it from scratch. The
+// stage records are then the UNION: stage s dispatches its tiles in x and,
+// in z, one layer per slot that runs it, named in DM_LIST.
 //
 // Deterministic: the stage word is GPU state advanced once a tick by this one
 // thread from the tick's own inputs, so two runs of one input stream agree.
@@ -339,56 +393,75 @@ const DM_STAGE : u32 = 4u;
 
 @compute @workgroup_size(1)
 fn args() {
-  let burst = (T.draftMode & 2u) != 0u;
-  let prev = atomicLoad(&draftMeta[DM_STAGE]);
+  var cnt = array<u32, 6>(0u, 0u, 0u, 0u, 0u, 0u);
+  for (var s = 0u; s < DRAFT_MAX_BOXES; s++) {
+    let fl = T.draftBox[s].w;
+    if ((fl & 1) == 0) { break; }   // compacted: no live slot after a dead one
+    useSlot(s);
+    let next = argsSlot((fl & 2) != 0);
+    for (var st = 1u; st <= DRAFT_STAGES; st++) {
+      if ((fl & 2) != 0 || st == next) {
+        atomicStore(&draftMeta[DM_LIST + (st - 1u) * DRAFT_MAX_BOXES + cnt[st - 1u]], s);
+        cnt[st - 1u]++;
+      }
+    }
+  }
+  for (var st = 1u; st <= DRAFT_STAGES; st++) {
+    let o = DM_ARGS + 4u * (st - 1u);
+    let n = cnt[st - 1u];
+    atomicStore(&draftMeta[o], select(0u, DRAFT_TILES, n > 0u));
+    atomicStore(&draftMeta[o + 1u], 1u);
+    atomicStore(&draftMeta[o + 2u], max(n, 1u));
+  }
+}
+
+// One slot's pipeline step (the slot set by useSlot); returns the stage it
+// runs this tick (0 = none; a burst runs them all).
+fn argsSlot(burst : bool) -> u32 {
+  let prev = atomicLoad(&draftMeta[gMeta + DM_STAGE]);
   var next = 0u;
   var start = false;
   if (burst) {
-    atomicStore(&draftMeta[DM_CHANGED], 0u);
-    atomicAdd(&draftMeta[DM_SOLVES], 1u);
-    atomicStore(&draftMeta[DM_LAST], T.tick);
+    atomicStore(&draftMeta[gMeta + DM_CHANGED], 0u);
+    atomicAdd(&draftMeta[gMeta + DM_SOLVES], 1u);
+    atomicStore(&draftMeta[gMeta + DM_LAST], T.tick);
     start = true;
   } else if (prev != 0u && prev < DRAFT_STAGES) {
     next = prev + 1u;
   } else {
-    let masks = atomicExchange(&draftMeta[DM_CHANGED], 0u) != 0u;
+    let masks = atomicExchange(&draftMeta[gMeta + DM_CHANGED], 0u) != 0u;
     // THE STACK EFFECT'S TRIGGER (block above): the box's heat moved, due.
     var heat = false;
     if (stackOn()) {
-      let moved = heatClock() != atomicLoad(&draftMeta[DM_HEAT_CLOCK]);
-      let due = T.tick - atomicLoad(&draftMeta[DM_HEAT_START]) >= DRAFT_HEAT_PERIOD;
+      let moved = heatClock() != atomicLoad(&draftMeta[gMeta + DM_HEAT_CLOCK]);
+      let due = T.tick - atomicLoad(&draftMeta[gMeta + DM_HEAT_START]) >= DRAFT_HEAT_PERIOD;
       heat = moved && due;
     }
     if (masks || heat) {
       next = 1u;
-      atomicAdd(&draftMeta[DM_SOLVES], 1u);
+      atomicAdd(&draftMeta[gMeta + DM_SOLVES], 1u);
       start = true;
     }
   }
   // A solve begins: its snapshot (coarseBuild, this tick) re-decides whether
   // the box is hot, and the heat it sees is the heat as of now.
   if (start) {
-    atomicStore(&draftMeta[DM_BOX_HOT], 0u);
-    atomicStore(&draftMeta[DM_HEAT_CLOCK], heatClock());
-    atomicStore(&draftMeta[DM_HEAT_START], T.tick);
+    atomicStore(&draftMeta[gMeta + DM_BOX_HOT], 0u);
+    atomicStore(&draftMeta[gMeta + DM_HEAT_CLOCK], heatClock());
+    atomicStore(&draftMeta[gMeta + DM_HEAT_START], T.tick);
   }
-  if (next == DRAFT_STAGES) { atomicStore(&draftMeta[DM_LAST], T.tick); }
-  atomicStore(&draftMeta[DM_STAGE], next);
-  for (var s = 1u; s <= DRAFT_STAGES; s++) {
-    let o = DM_ARGS + 4u * (s - 1u);
-    atomicStore(&draftMeta[o], select(0u, DRAFT_TILES, burst || s == next));
-    atomicStore(&draftMeta[o + 1u], 1u);
-    atomicStore(&draftMeta[o + 2u], 1u);
-  }
+  if (next == DRAFT_STAGES) { atomicStore(&draftMeta[gMeta + DM_LAST], T.tick); }
+  atomicStore(&draftMeta[gMeta + DM_STAGE], next);
+  return next;
 }
 
 // ---- fine-grid faces ----------------------------------------------------------
 
 fn fineMask(c : vec3<i32>, a : u32) -> u32 {
   let i = 2u * fineIndex(c);
-  if (a == 0u) { return draftField[i] & 0xFFFFu; }
-  if (a == 1u) { return draftField[i] >> 16u; }
-  return draftField[i + 1u] & 0xFFFFu;
+  if (a == 0u) { return draftField[gBase + i] & 0xFFFFu; }
+  if (a == 1u) { return draftField[gBase + i] >> 16u; }
+  return draftField[gBase + i + 1u] & 0xFFFFu;
 }
 
 // The Q8 coefficient of the face between fine cell g and g + e_a. A face on
@@ -424,7 +497,7 @@ fn cCoord(i : u32) -> vec3<i32> {
 fn memberOf(p : vec3<i32>, g : vec3<i32>) -> bool {
   let l = g - p * 4;
   let bit = u32(l.x + 4 * l.y + 16 * l.z);
-  let w = draftField[cAddr(p, select(CW_MEM0, CW_MEM1, bit >= 32u))];
+  let w = draftField[gBase + cAddr(p, select(CW_MEM0, CW_MEM1, bit >= 32u))];
   return ((w >> (bit & 31u)) & 1u) != 0u;
 }
 
@@ -465,6 +538,7 @@ fn axisMask(m : vec2<u32>, a : u32) -> u32 {
 @compute @workgroup_size(256)
 fn coarseBuild(@builtin(workgroup_id) wg : vec3<u32>,
                @builtin(local_invocation_index) li : u32) {
+  useSlot(stageSlot(1u, wg.z));
   let tile = tileOf(wg.x);
   if (li == 0u) { atomicStore(&pbHot, 0u); }
   workgroupBarrier();
@@ -472,11 +546,11 @@ fn coarseBuild(@builtin(workgroup_id) wg : vec3<u32>,
     let t = li + 256u * k;
     let g = tile * 8 + tLocal(t);
     let i = 2u * fineIndex(g);
-    let m = vec2<u32>(draftField[i], draftField[i + 1u] & 0xFFFFu);
+    let m = vec2<u32>(draftField[gBase + i], draftField[gBase + i + 1u] & 0xFFFFu);
     pbMask[t] = m;
     pbLab[0][t] = select(t, NO_LABEL, rowsOpen(m) == 0u);
     // The fine faces' coefficients, once a solve, for the four fine passes.
-    draftField[DRAFT_KBASE + fineIndex(g)] =
+    draftField[gBase + DRAFT_KBASE + fineIndex(g)] =
         fineFaceK(g, 0u) | (fineFaceK(g, 1u) << 9u) | (fineFaceK(g, 2u) << 18u);
     atomicStore(&pbWgt[t], 0u);
     // THE STACK EFFECT'S SOURCE: the heat updraft at the cell's centre, Q12 of
@@ -485,10 +559,10 @@ fn coarseBuild(@builtin(workgroup_id) wg : vec3<u32>,
     // air and gets none.
     var bq = 0u;
     if (stackOn() && rowsOpen(m) != 0u) {
-      let up = windHeatUpQ(T.draftOrigin + g * 4 + vec3<i32>(2), &T);
+      let up = windHeatUpQ(gOrg + g * 4 + vec3<i32>(2), &T);
       bq = u32(clamp(up / max(T.updraftCapQ >> 12u, 1), 0, Q_ONE));
     }
-    draftField[DRAFT_SB + fineIndex(g)] = bq;
+    draftField[gBase + DRAFT_SB + fineIndex(g)] = bq;
     pbB[t] = bq;
     if (bq != 0u) { atomicOr(&pbHot, 1u); }
   }
@@ -559,12 +633,12 @@ fn coarseBuild(@builtin(workgroup_id) wg : vec3<u32>,
   workgroupBarrier();
   if (li < 8u) {
     let p = tile * 2 + vec3<i32>(i32(li & 1u), i32((li >> 1u) & 1u), i32(li >> 2u));
-    draftField[cAddr(p, CW_MEM0)] = atomicLoad(&pbMem[li * 2u]);
-    draftField[cAddr(p, CW_MEM1)] = atomicLoad(&pbMem[li * 2u + 1u]);
-    draftField[DRAFT_SC_BASE + 2u * cIndex(p)] =
+    draftField[gBase + cAddr(p, CW_MEM0)] = atomicLoad(&pbMem[li * 2u]);
+    draftField[gBase + cAddr(p, CW_MEM1)] = atomicLoad(&pbMem[li * 2u + 1u]);
+    draftField[gBase + DRAFT_SC_BASE + 2u * cIndex(p)] =
         atomicLoad(&pbBs[li]) / max(atomicLoad(&pbBn[li]), 1u);
   }
-  if (li == 0u && atomicLoad(&pbHot) != 0u) { atomicOr(&draftMeta[DM_BOX_HOT], 1u); }
+  if (li == 0u && atomicLoad(&pbHot) != 0u) { atomicOr(&draftMeta[gMeta + DM_BOX_HOT], 1u); }
 }
 
 // ---- coarseFaces: the coarse face coefficients, between pockets only ----------
@@ -578,6 +652,7 @@ var<workgroup> cfB : array<atomic<u32>, 24>;
 @compute @workgroup_size(256)
 fn coarseFaces(@builtin(workgroup_id) wg : vec3<u32>,
                @builtin(local_invocation_index) li : u32) {
+  useSlot(stageSlot(1u, wg.z));
   let tile = tileOf(wg.x);
   if (li < 24u) {
     atomicStore(&cfK[li], 0u);
@@ -615,8 +690,8 @@ fn coarseFaces(@builtin(workgroup_id) wg : vec3<u32>,
       kp |= ((atomicLoad(&cfK[li * 3u + a]) + 8u) >> 4u) << (9u * a);
       kb |= ((atomicLoad(&cfB[li * 3u + a]) + 8u) >> 4u) << (9u * a);
     }
-    draftField[cAddr(p, CW_KP)] = kp;
-    draftField[cAddr(p, CW_KB)] = kb;
+    draftField[gBase + cAddr(p, CW_KP)] = kp;
+    draftField[gBase + cAddr(p, CW_KB)] = kb;
   }
 }
 
@@ -639,7 +714,7 @@ var<workgroup> csKp : array<u32, 2048>;
 var<workgroup> csPb : array<i32, 2048>;
 var<workgroup> csSb : array<i32, 2048>;
 
-fn scB(c : vec3<i32>) -> i32 { return i32(draftField[DRAFT_SC_BASE + 2u * cIndex(c)]); }
+fn scB(c : vec3<i32>) -> i32 { return i32(draftField[gBase + DRAFT_SC_BASE + 2u * cIndex(c)]); }
 
 @compute @workgroup_size(1024)
 fn coarseSolve(@builtin(workgroup_id) wg : vec3<u32>,
@@ -647,10 +722,11 @@ fn coarseSolve(@builtin(workgroup_id) wg : vec3<u32>,
   // Dispatched with the tile count (one args record for every solve row);
   // only the first group works.
   if (wg.x != 0u) { return; }
+  useSlot(stageSlot(2u, wg.z));
   let live = stackLive();
   for (var i = li; i < DRAFT_CCELLS; i += 1024u) {
     let c = cCoord(i);
-    csKp[i] = draftField[cAddr(c, CW_KP)];
+    csKp[i] = draftField[gBase + cAddr(c, CW_KP)];
     csPx[i] = 0;
     csPz[i] = 0;
     csPb[i] = 0;
@@ -669,7 +745,7 @@ fn coarseSolve(@builtin(workgroup_id) wg : vec3<u32>,
       var kmy = 0;
       var bd = 0;
       if (c.y == 0) {
-        kmy = kGet(draftField[cAddr(c, CW_KB)], 1u);
+        kmy = kGet(draftField[gBase + cAddr(c, CW_KB)], 1u);
       } else {
         kmy = kGet(csKp[i - st.y], 1u);
         bd = scB(c - vec3<i32>(0, 1, 0));
@@ -700,7 +776,7 @@ fn coarseSolve(@builtin(workgroup_id) wg : vec3<u32>,
           var pmz = 0;
           var pmb = 0;
           if (dot(c, e) == 0) {
-            kma = kGet(draftField[cAddr(c, CW_KB)], a);
+            kma = kGet(draftField[gBase + cAddr(c, CW_KB)], a);
           } else {
             kma = kGet(csKp[i - st[a]], a);
             pmx = csPx[i - st[a]];
@@ -742,9 +818,9 @@ fn coarseSolve(@builtin(workgroup_id) wg : vec3<u32>,
   }
   for (var i = li; i < DRAFT_CCELLS; i += 1024u) {
     let c = cCoord(i);
-    draftField[cAddr(c, CW_PX)] = bitcast<u32>(csPx[i]);
-    draftField[cAddr(c, CW_PZ)] = bitcast<u32>(csPz[i]);
-    draftField[DRAFT_SC_BASE + 2u * cIndex(c) + 1u] = bitcast<u32>(csPb[i]);
+    draftField[gBase + cAddr(c, CW_PX)] = bitcast<u32>(csPx[i]);
+    draftField[gBase + cAddr(c, CW_PZ)] = bitcast<u32>(csPz[i]);
+    draftField[gBase + DRAFT_SC_BASE + 2u * cIndex(c) + 1u] = bitcast<u32>(csPb[i]);
   }
 }
 
@@ -769,12 +845,12 @@ var<workgroup> wbb : array<i32, 1728>;
 var<workgroup> wfz : array<i32, 1728>;
 var<workgroup> wkp : array<u32, 1728>;
 
-fn cPhi(c : vec3<i32>, f : u32) -> i32 { return bitcast<i32>(draftField[cAddr(c, f)]); }
+fn cPhi(c : vec3<i32>, f : u32) -> i32 { return bitcast<i32>(draftField[gBase + cAddr(c, f)]); }
 // The - face coefficient of coarse cell c on axis a.
 fn cKm(c : vec3<i32>, a : u32) -> i32 {
   let e = axisE(a);
-  if (dot(c, e) == 0) { return kGet(draftField[cAddr(c, CW_KB)], a); }
-  return kGet(draftField[cAddr(c - e, CW_KP)], a);
+  if (dot(c, e) == 0) { return kGet(draftField[gBase + cAddr(c, CW_KB)], a); }
+  return kGet(draftField[gBase + cAddr(c - e, CW_KP)], a);
 }
 
 // The coarse potential reconstructed at fine cell g (inside the box): its
@@ -796,7 +872,7 @@ fn reconstruct(g : vec3<i32>) -> vec2<i32> {
   }
   let px = cPhi(p, CW_PX);
   let pz = cPhi(p, CW_PZ);
-  let kpp = draftField[cAddr(p, CW_KP)];
+  let kpp = draftField[gBase + cAddr(p, CW_KP)];
   let off = (g - p * 4) * 2 - vec3<i32>(3);   // offset from p's centre, half fine cells
   var ox = px;
   var oz = pz;
@@ -837,7 +913,7 @@ fn reconstruct(g : vec3<i32>) -> vec2<i32> {
 // phi b, reconstructed at fine cell g by reconstruct()'s rule with b for the
 // stream: across a CLOSED y face the gradient is the cell's mean b (no flux
 // means b - dphi/dy = 0 there), across a closed x or z face it is 0.
-fn cPhiB(c : vec3<i32>) -> i32 { return bitcast<i32>(draftField[DRAFT_SC_BASE + 2u * cIndex(c) + 1u]); }
+fn cPhiB(c : vec3<i32>) -> i32 { return bitcast<i32>(draftField[gBase + DRAFT_SC_BASE + 2u * cIndex(c) + 1u]); }
 fn reconstructB(g : vec3<i32>) -> i32 {
   var p = g >> vec3<u32>(2u);
   if (!memberOf(p, g)) {
@@ -850,7 +926,7 @@ fn reconstructB(g : vec3<i32>) -> i32 {
   }
   let pb = cPhiB(p);
   let bc = scB(p);
-  let kpp = draftField[cAddr(p, CW_KP)];
+  let kpp = draftField[gBase + cAddr(p, CW_KP)];
   let off = (g - p * 4) * 2 - vec3<i32>(3);
   var ob = pb;
   for (var a = 0u; a < 3u; a++) {
@@ -957,7 +1033,7 @@ fn finePass(wgx : u32, li : u32, src : u32, dst : u32) {
     // the box's face): the boundary rule, computed here.
     var k = 0u;
     if (inD) {
-      k = draftField[DRAFT_KBASE + fineIndex(g)];
+      k = draftField[gBase + DRAFT_KBASE + fineIndex(g)];
     } else {
       k = fineFaceK(g, 0u) | (fineFaceK(g, 1u) << 9u) | (fineFaceK(g, 2u) << 18u);
     }
@@ -971,7 +1047,7 @@ fn finePass(wgx : u32, li : u32, src : u32, dst : u32) {
         ph = reconstruct(g);
       } else {
         let o = src + 2u * fineIndex(g);
-        ph = vec2<i32>(bitcast<i32>(draftField[o]), bitcast<i32>(draftField[o + 1u]));
+        ph = vec2<i32>(bitcast<i32>(draftField[gBase + o]), bitcast<i32>(draftField[gBase + o + 1u]));
       }
     }
     wfx[r] = ph.x;
@@ -979,11 +1055,11 @@ fn finePass(wgx : u32, li : u32, src : u32, dst : u32) {
     var pb = 0;
     var bb = 0;
     if (live && inD) {
-      bb = i32(draftField[DRAFT_SB + fineIndex(g)]);
+      bb = i32(draftField[gBase + DRAFT_SB + fineIndex(g)]);
       if (src == 0u) {
         pb = reconstructB(g);
       } else {
-        pb = bitcast<i32>(draftField[stackBase(src) + fineIndex(g)]);
+        pb = bitcast<i32>(draftField[gBase + stackBase(src) + fineIndex(g)]);
       }
     }
     wfb[r] = pb;
@@ -1043,9 +1119,9 @@ fn finePass(wgx : u32, li : u32, src : u32, dst : u32) {
     let g = ro + rc;
     if (dst != 0u) {
       let o = dst + 2u * fineIndex(g);
-      draftField[o] = bitcast<u32>(wfx[r]);
-      draftField[o + 1u] = bitcast<u32>(wfz[r]);
-      if (live) { draftField[stackBase(dst) + fineIndex(g)] = bitcast<u32>(wfb[r]); }
+      draftField[gBase + o] = bitcast<u32>(wfx[r]);
+      draftField[gBase + o + 1u] = bitcast<u32>(wfz[r]);
+      if (live) { draftField[gBase + stackBase(dst) + fineIndex(g)] = bitcast<u32>(wfb[r]); }
       continue;
     }
     var v = cellVel(r);
@@ -1088,9 +1164,9 @@ fn finePass(wgx : u32, li : u32, src : u32, dst : u32) {
       rz = ez + ((rz - ez) * dm) / 2;
     }
     let o = DRAFT_FIELD_BASE + 3u * fineIndex(g);
-    draftField[o] = pack16(rx.x, rx.y);
-    draftField[o + 1u] = pack16(rx.z, rz.x);
-    draftField[o + 2u] = pack16(rz.y, rz.z);
+    draftField[gBase + o] = pack16(rx.x, rx.y);
+    draftField[gBase + o + 1u] = pack16(rx.z, rz.x);
+    draftField[gBase + o + 2u] = pack16(rz.y, rz.z);
     // THE STACK FIELD, by the transfer's rules: a closed cell takes its open
     // neighbours' mean, and the outer two cells fade it to nothing (outside
     // the box the reader adds no correction at all). Not written for a cold
@@ -1114,8 +1190,8 @@ fn finePass(wgx : u32, li : u32, src : u32, dst : u32) {
       var sv = s.xyz;
       if (dm < 2) { sv = (sv * dm) / 2; }
       let so = DRAFT_STACK_FIELD + 2u * fineIndex(g);
-      draftField[so] = pack16(sv.x, sv.y);
-      draftField[so + 1u] = pack16(sv.z, 0);
+      draftField[gBase + so] = pack16(sv.x, sv.y);
+      draftField[gBase + so + 1u] = pack16(sv.z, 0);
     }
   }
 }
@@ -1123,25 +1199,29 @@ fn finePass(wgx : u32, li : u32, src : u32, dst : u32) {
 @compute @workgroup_size(256)
 fn fineFirst(@builtin(workgroup_id) wg : vec3<u32>,
              @builtin(local_invocation_index) li : u32) {
+  useSlot(stageSlot(3u, wg.z));
   finePass(wg.x, li, 0u, DRAFT_PHI_A);
 }
 @compute @workgroup_size(256)
 fn fineMid(@builtin(workgroup_id) wg : vec3<u32>,
            @builtin(local_invocation_index) li : u32) {
+  useSlot(stageSlot(4u, wg.z));
   finePass(wg.x, li, DRAFT_PHI_A, DRAFT_PHI_B);
 }
 @compute @workgroup_size(256)
 fn fineMid2(@builtin(workgroup_id) wg : vec3<u32>,
             @builtin(local_invocation_index) li : u32) {
+  useSlot(stageSlot(5u, wg.z));
   finePass(wg.x, li, DRAFT_PHI_B, DRAFT_PHI_A);
 }
 @compute @workgroup_size(256)
 fn fineLast(@builtin(workgroup_id) wg : vec3<u32>,
             @builtin(local_invocation_index) li : u32) {
+  useSlot(stageSlot(6u, wg.z));
   finePass(wg.x, li, DRAFT_PHI_A, 0u);
   // Publish whether the stack field is live, with the field it describes.
   if (wg.x == 0u && li == 0u) {
-    draftField[DRAFT_STACK_LIVE] = select(0u, 1u, stackLive());
+    draftField[gBase + DRAFT_STACK_LIVE] = select(0u, 1u, stackLive());
   }
 }
 
@@ -1243,7 +1323,7 @@ var<workgroup> jv : array<i32, 2048>;    // the carried jet, forward speed
 var<workgroup> jf : array<u32, 2048>;    // k back | ku+ << 9 | kv+ << 18
 
 fn jetK(g : vec3<i32>) -> u32 {
-  if (draftInside(g)) { return draftField[DRAFT_KBASE + fineIndex(g)]; }
+  if (draftInside(g)) { return draftField[gBase + DRAFT_KBASE + fineIndex(g)]; }
   return fineFaceK(g, 0u) | (fineFaceK(g, 1u) << 9u) | (fineFaceK(g, 2u) << 18u);
 }
 fn jetPick(s : i32, c : i32) -> i32 { return select(s, c, abs(c) > abs(s)); }
@@ -1271,6 +1351,7 @@ fn jetPrep(@builtin(workgroup_id) wg : vec3<u32>,
            @builtin(local_invocation_index) li : u32) {
   let col = wg.x * 256u + li;
   if (col >= JET_COLS) { return; }
+  useSlot(stageSlot(6u, wg.z));   // fineLast's records and list
   let x = i32(col % 64u);
   let z = i32(col / 64u);
   let on = TUNE_DRAFT_JET != 0;
@@ -1291,7 +1372,7 @@ fn jetPrep(@builtin(workgroup_id) wg : vec3<u32>,
     let fi = fineIndex(g);
     let kb = jetK(g);
     let ownRoof = on && kGet(kb, 1u) <= JET_ROOF_K;
-    let mk = vec2<u32>(draftField[2u * fi], draftField[2u * fi + 1u] & 0xFFFFu);
+    let mk = vec2<u32>(draftField[gBase + 2u * fi], draftField[gBase + 2u * fi + 1u] & 0xFFFFu);
     let air = rowsOpen(mk) != 0u;
     let dm = min(min(min(x, DRAFT_NX - 1 - x), min(y, DRAFT_NY - 1 - y)),
                  min(z, DRAFT_NZ - 1 - z));
@@ -1305,19 +1386,19 @@ fn jetPrep(@builtin(workgroup_id) wg : vec3<u32>,
     }
     if (ownRoof) { cov = true; }
     let rw = DRAFT_FIELD_BASE + 3u * fi;
-    let w0 = draftField[rw];
-    let w1 = draftField[rw + 1u];
-    let w2 = draftField[rw + 2u];
+    let w0 = draftField[gBase + rw];
+    let w1 = draftField[gBase + rw + 1u];
+    let w2 = draftField[gBase + rw + 2u];
     // X: R_x, u = z.
     let ox = DRAFT_JET_PREP + 3u * (u32(x) * JET_PLANE + u32(z + 64 * y));
-    draftField[ox] = w0;
-    draftField[ox + 1u] = (w1 & 0xFFFFu) | (u32(kGet(jetK(g - vec3<i32>(1, 0, 0)), 0u)) << 16u) | fl;
-    draftField[ox + 2u] = u32(kGet(kb, 0u)) | (u32(kGet(kb, 2u)) << 9u) | (u32(kGet(kb, 1u)) << 18u);
+    draftField[gBase + ox] = w0;
+    draftField[gBase + ox + 1u] = (w1 & 0xFFFFu) | (u32(kGet(jetK(g - vec3<i32>(1, 0, 0)), 0u)) << 16u) | fl;
+    draftField[gBase + ox + 2u] = u32(kGet(kb, 0u)) | (u32(kGet(kb, 2u)) << 9u) | (u32(kGet(kb, 1u)) << 18u);
     // Z: R_z, u = x.
     let oz = DRAFT_JET_PREP + 3u * nCells + 3u * (u32(z) * JET_PLANE + u32(x + 64 * y));
-    draftField[oz] = (w1 >> 16u) | (w2 << 16u);
-    draftField[oz + 1u] = (w2 >> 16u) | (u32(kGet(jetK(g - vec3<i32>(0, 0, 1)), 2u)) << 16u) | fl;
-    draftField[oz + 2u] = u32(kGet(kb, 2u)) | (u32(kGet(kb, 0u)) << 9u) | (u32(kGet(kb, 1u)) << 18u);
+    draftField[gBase + oz] = (w1 >> 16u) | (w2 << 16u);
+    draftField[gBase + oz + 1u] = (w2 >> 16u) | (u32(kGet(jetK(g - vec3<i32>(0, 0, 1)), 2u)) << 16u) | fl;
+    draftField[gBase + oz + 2u] = u32(kGet(kb, 2u)) | (u32(kGet(kb, 0u)) << 9u) | (u32(kGet(kb, 1u)) << 18u);
   }
 }
 
@@ -1326,6 +1407,7 @@ fn jets(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_index) li : u32) {
   // Dispatched with fineLast's args (the tile count); one group per direction.
   if (wg.x >= 4u) { return; }
+  useSlot(stageSlot(6u, wg.z));   // fineLast's records and list
   let dir = wg.x;
   let zAxis = dir >= 2u;              // march along Z (else X)
   let sgn = select(1, -1, (dir & 1u) != 0u);
@@ -1350,9 +1432,9 @@ fn jets(@builtin(workgroup_id) wg : vec3<u32>,
   let m0 = select(0, 63, sgn < 0);
   for (var k = 0u; k < 2u; k++) {
     let pw = prep + 3u * (u32(m0) * JET_PLANE + li + 1024u * k);
-    w0[k] = draftField[pw];
-    w1[k] = draftField[pw + 1u];
-    w2[k] = draftField[pw + 2u];
+    w0[k] = draftField[gBase + pw];
+    w1[k] = draftField[gBase + pw + 1u];
+    w2[k] = draftField[gBase + pw + 2u];
   }
   for (var s = 0; s <= 64; s++) {
     let mPrev = select(s - 1, 64 - s, sgn < 0);
@@ -1379,8 +1461,8 @@ fn jets(@builtin(workgroup_id) wg : vec3<u32>,
         }
         // Slice-major, as the readers index it (common.wgsl draftJetIndex).
         let o = outBase + 2u * (u32(mPrev) * JET_PLANE + pi);
-        draftField[o] = pack16(t.x, t.y);
-        draftField[o + 1u] = pack16(t.z, 0);
+        draftField[gBase + o] = pack16(t.x, t.y);
+        draftField[gBase + o + 1u] = pack16(t.z, 0);
       }
       if (s < 64) {
         let kback = select((w1[k] >> 16u) & K_MASK, w2[k] & K_MASK, sgn < 0);
@@ -1388,9 +1470,9 @@ fn jets(@builtin(workgroup_id) wg : vec3<u32>,
       }
       if (s < 63) {
         let pw = prep + 3u * (u32(mNext) * JET_PLANE + pi);
-        n0[k] = draftField[pw];
-        n1[k] = draftField[pw + 1u];
-        n2[k] = draftField[pw + 2u];
+        n0[k] = draftField[gBase + pw];
+        n1[k] = draftField[gBase + pw + 1u];
+        n2[k] = draftField[gBase + pw + 2u];
       }
     }
     if (s == 64) { break; }

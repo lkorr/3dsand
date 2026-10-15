@@ -12,7 +12,7 @@ namespace {
 using sandvox::opstream::OpMeta;
 using sandvox::opstream::Producer;
 
-// The seven vectors, in ONE order, written once. Encode and Decode both go
+// The eight vectors, in ONE order, written once. Encode and Decode both go
 // through it, so a vector added to OpBatch cannot be encoded and forgotten on
 // the read side (the compiler will not catch that; a single list will).
 template <typename W, typename B>
@@ -24,6 +24,7 @@ void WalkBatch(W&& w, B& b) {
   w(b.fluid);
   w(b.gas);   // kOpsWireVersion 2
   w(b.winds); // kOpsWireVersion 3
+  w(b.drafts); // kOpsWireVersion 4
 }
 
 }  // namespace
@@ -223,6 +224,8 @@ OpBatch OpDelayQueue::Merge(uint32_t label, const World& world, MergeStats& st,
         out.gas.insert(out.gas.end(), e->batch.gas.begin(), e->batch.gas.end());
         out.winds.insert(out.winds.end(), e->batch.winds.begin(),
                          e->batch.winds.end());
+        out.drafts.insert(out.drafts.end(), e->batch.drafts.begin(),
+                          e->batch.drafts.end());
         // Re-note as RUNS of equal (producer, author): one range per run
         // reproduces exactly what ResolveAuthors would have expanded, at a
         // fraction of the ranges.
@@ -322,6 +325,11 @@ OpBatch OpDelayQueue::Merge(uint32_t label, const World& world, MergeStats& st,
         out.winds.push_back(wp);
         st.remoteWinds++;
       }
+      // Draft boxes (audit DJ-1): absolute world voxels, already placed on
+      // the lattice by their author. In this canonical order the merge IS the
+      // session's box list (phase N dedupes and caps it).
+      out.drafts.insert(out.drafts.end(), e->batch.drafts.begin(),
+                        e->batch.drafts.end());
     }
   }
 

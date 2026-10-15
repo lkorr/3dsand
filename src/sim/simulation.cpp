@@ -974,22 +974,25 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   // The wind-draft volume (world.h kDraft*). ZEROED: the masks a solve
   // compares against start as an all-air box, and the field as "no wind"
   // until the first (forced) rebuild tick solves it -- the renderer does not
-  // read it before then (DraftValid).
+  // read it before then (DraftValid). kDraftMaxBoxes SLOTS of kDraftWords, one
+  // per box of the tick's box list (audit DJ-1).
   {
     using U = rhi::BufferUsage;
-    draftBuf_ = CreateBuffer(device, (uint64_t)kDraftWords * 4,
+    draftBuf_ = CreateBuffer(device, kDraftBufferWords * 4,
                              U::Storage | U::CopySrc | U::CopyDst, "draft");
     draftMetaBuf_ = CreateBuffer(device, (uint64_t)kDraftMetaWords * 4,
                                  U::Storage | U::CopySrc | U::CopyDst, "draftMeta");
     draftArgsBuf_ = CreateBuffer(device, 16 * kDraftStages, U::Indirect | U::CopyDst, "draftArgs");
     const std::vector<uint32_t> zero((size_t)kDraftWords, 0u);
-    device.GetQueue().WriteBuffer(draftBuf_, 0, zero.data(), zero.size() * 4);
+    for (uint32_t k = 0; k < kDraftMaxBoxes; k++)
+      device.GetQueue().WriteBuffer(draftBuf_, (uint64_t)k * kDraftWords * 4, zero.data(),
+                                    zero.size() * 4);
     device.GetQueue().WriteBuffer(draftMetaBuf_, 0, zero.data(), kDraftMetaWords * 4);
     uint32_t args0[4 * kDraftStages] = {};
     for (uint32_t s = 0; s < kDraftStages; s++) args0[4 * s + 1] = args0[4 * s + 2] = 1u;
     device.GetQueue().WriteBuffer(draftArgsBuf_, 0, args0, sizeof(args0));
     draftForce_ = true;
-    draftValid_ = false;
+    for (DraftSlotState& d : draftSlot_) d.valid = false;
   }
   BuildSimBindGroups(device);
   for (int page = 0; page < 2; page++) {
@@ -3387,35 +3390,52 @@ void Simulation::SetTickRain(uint32_t rainWord, int32_t slopeQx, int32_t slopeQz
   }
 }
 
-// The draft box's rebuild verdict for the next EncodeTick. A rebuild re-masks
-// every chunk of the box (maskAll) and always solves; otherwise only the
-// active chunks are re-masked and the solve runs if one of them changed. The
-// verdict must be a pure function of the tick input stream for the field to
-// be one: the box moved (its origin rides TickParams), the gate flipped, the
-// materials were re-uploaded, or the buffer is new -- each of which a replay
-// reproduces at the same tick.
-void Simulation::SetDraft(bool on, const int32_t origin[3]) {
-  static_assert(kDraftChunks == 2048, "pass_table.def draftMaskAll's literal extent");
+// The draft boxes' rebuild verdicts for the next EncodeTick, PER SLOT of the
+// box list (audit DJ-1). A rebuild re-masks every chunk of that slot's box
+// (maskAll's layer for it) and always solves it; otherwise only its active
+// chunks are re-masked and it solves if one of them changed. The verdict must
+// be a pure function of the tick input stream for the field to be one: the
+// box moved (its origin rides TickParams), the slot came live, the gate
+// flipped, the materials were re-uploaded, or the buffer is new -- each of
+// which a replay reproduces at the same tick. The list itself is the
+// session's (SubmitTick), so two machines running one session give every
+// slot the same verdicts too, except where one of them just loaded or
+// re-pulled its window (ForceDraftRebuild), which is a burst of the same
+// field.
+void Simulation::SetDraft(bool on, const DraftBox* boxes, uint32_t n) {
+  static_assert(kDraftChunks == 2048 && kDraftMaxBoxes == 2,
+                "pass_table.def draftMaskAll's literal extent (2048 x 1 x 2)");
   static_assert(kDraftTiles == 256, "sim_draft.wgsl DRAFT_TILES");
-  static_assert(kDraftStages == 6 && kDraftMetaArgs == 8,
-                "pass_table.def copy_draftArgs (32, 96) and the rows' stage offsets");
-  draftOn_ = on;
-  const bool moved = origin[0] != draftLastOrigin_[0] || origin[1] != draftLastOrigin_[1] ||
-                     origin[2] != draftLastOrigin_[2];
-  draftRebuild_ = on && (draftForce_ || moved || !draftLastOn_);
-  if (on) {
-    for (int i = 0; i < 3; i++) {
-      draftOrigin_[i] = origin[i];
-      draftLastOrigin_[i] = origin[i];
+  static_assert(kDraftStages == 6 && kDraftMetaArgs == 80,
+                "pass_table.def copy_draftArgs (320, 96) and the rows' stage offsets");
+  static_assert(kHmDraftHeatClock + kDraftMaxBoxes <= kHmFireLog,
+                "one heat clock per draft slot, before the firing log (heat.h)");
+  if (n > kDraftMaxBoxes) n = kDraftMaxBoxes;
+  draftOn_ = on && n > 0;
+  draftRebuild_ = false;
+  draftDirtySlots_ = false;
+  const bool force = draftForce_;
+  for (uint32_t k = 0; k < kDraftMaxBoxes; k++) {
+    DraftSlotState& d = draftSlot_[k];
+    d.live = draftOn_ && k < n;
+    d.rebuild = false;
+    if (d.live) {
+      const int32_t o[3] = {boxes[k].x, boxes[k].y, boxes[k].z};
+      const bool moved = o[0] != d.lastOrigin[0] || o[1] != d.lastOrigin[1] ||
+                         o[2] != d.lastOrigin[2];
+      d.rebuild = force || moved || !d.lastOn;
+      for (int i = 0; i < 3; i++) d.origin[i] = d.lastOrigin[i] = o[i];
+      if (d.rebuild) d.valid = true;   // this tick records a solve for this origin
+      draftRebuild_ = draftRebuild_ || d.rebuild;
+      draftDirtySlots_ = draftDirtySlots_ || !d.rebuild;
+    } else {
+      d.valid = false;
     }
-    if (draftRebuild_) {
-      draftForce_ = false;
-      draftValid_ = true;   // this tick records a solve for this origin
-    }
-  } else {
-    draftValid_ = false;
+    d.lastOn = d.live;
   }
-  draftLastOn_ = on;
+  // A force is spent by the tick that rebuilt something with it; with no live
+  // slot it waits (a slot coming live rebuilds anyway).
+  if (draftRebuild_) draftForce_ = false;
 }
 
 void Simulation::EncodeShadowResolve(const rhi::CommandEncoder& enc) {
@@ -4025,6 +4045,7 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // Wind drafts (SetDraft): the gate and this tick's rebuild verdict.
   cx.draftOn = draftOn_;
   cx.draftRebuild = draftRebuild_;
+  cx.draftDirtySlots = draftDirtySlots_;
   cx.opsCount = opsCount;
   cx.cellCount = cellCount;
   cx.expCount = expCount;

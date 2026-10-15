@@ -442,6 +442,11 @@ bool RecordedWeatherRain(uint32_t tick, uint32_t& word);
 // ...and the rain SLOPE beside it (TickParams rainSlopeQx / Qz), for the same
 // reason: it is derived from the same pinned preset.
 bool RecordedRainSlope(uint32_t tick, int32_t& sx, int32_t& sz);
+// ...and the DRAFT BOX LIST (TickParams draftBox, audit DJ-1): the session's
+// boxes are authored by every player's machine and merged over the wire, so a
+// replay -- which has no peer -- takes them from the record. Copies the whole
+// recorded array (w bit 0 = live, compacted); the burst bits are recomputed.
+bool RecordedDraftBoxes(uint32_t tick, int32_t (&box)[kDraftMaxBoxes][4]);
 
 // While replaying, re-apply this tick's recorded chunk replaces through
 // `stream`. A no-op (one pointer test) otherwise, so the drive loops call it

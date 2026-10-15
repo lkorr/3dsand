@@ -1056,10 +1056,11 @@ struct TickParams {
   wfProf : array<vec4<i32>, 4>,
   // kWindTerrWords cells, four to a row: 1024 = 4096 / 4.
   wfTerr : array<vec4<u32>, 1024>,
-  // WIND DRAFTS (world.h kDraft*): the shelter volume's min corner, world
-  // voxels, and its gate (0 = windAtQ is the ambient field exactly).
-  draftOrigin : vec3<i32>,
-  draftMode : u32,
+  // WIND DRAFTS (world.h kDraft*): THE BOX LIST (audit DJ-1), slot k's
+  // shelter volume: xyz its min corner, world voxels; w bit 0 live, bit 1
+  // burst. Compacted (live first); all w 0 = windAtQ is the ambient field
+  // exactly. Literal 2 = kDraftMaxBoxes (DRAFT_MAX_BOXES; compared on size).
+  draftBox : array<vec4<i32>, 2>,
   // HEAT UPDRAFTS + THE STACK EFFECT (world.h; windHeatQ below): lift per heat
   // unit and its cap (Q16.16 cells/s), the inflow per unit of lift gradient
   // (Q16), the stack field's share (Q8). updraftGainQ 0 = no heat term.
@@ -1824,8 +1825,9 @@ struct RenderParams {
   wfThermalK : i32,
   wfProf : array<vec4<i32>, 4>,
   wfTerr : array<vec4<u32>, 1024>,
-  draftOrigin : vec3<i32>,
-  draftMode : u32,
+  // Wind drafts, the render copy: per slot the last solved box's min corner,
+  // w = its field is valid. Literal 2 = kDraftMaxBoxes.
+  draftBox : array<vec4<i32>, 2>,
   // Chunk tickets, the render copy (world.h RenderParams; P4): the live boxes'
   // lo corners (world chunks) with the ticket index in .w, ticketCount valid.
   ticketCount : u32,
@@ -3209,6 +3211,11 @@ const DRAFT_FIELD_BASE : u32 = 274432u;
 // and the word that says the published solve saw any heat at all.
 const DRAFT_STACK_FIELD : u32 = 1720320u;
 const DRAFT_STACK_LIVE : u32 = 1982464u;
+// THE BOX LIST (audit DJ-1, world.h kDraftMaxBoxes): the buffer holds one
+// SLOT of all the words above per box, slot k at k * DRAFT_SLOT_WORDS
+// (= kDraftWords). Every offset above is within a slot.
+const DRAFT_MAX_BOXES : u32 = 2u;
+const DRAFT_SLOT_WORDS : u32 = 3817476u;
 
 fn draftSext(v : u32) -> i32 { return bitcast<i32>(v << 16u) >> 16u; }
 
@@ -3230,8 +3237,8 @@ fn draftJetIndex(d : vec3<i32>, dir : u32) -> u32 {
   let u = select(d.z, d.x, dir >= 2u);
   return dir * u32(DRAFT_NX * DRAFT_NY * DRAFT_NZ) + u32(sl * 2048 + u + 64 * d.y);
 }
-fn draftJetAt(d : vec3<i32>, dir : u32) -> vec3<i32> {
-  let i = DRAFT_JET_FIELD + 2u * draftJetIndex(d, dir);
+fn draftJetAt(base : u32, d : vec3<i32>, dir : u32) -> vec3<i32> {
+  let i = base + DRAFT_JET_FIELD + 2u * draftJetIndex(d, dir);
   let w0 = draftWord(i);
   let w1 = draftWord(i + 1u);
   return vec3<i32>(draftSext(w0), draftSext(w0 >> 16u), draftSext(w1));
@@ -3239,6 +3246,24 @@ fn draftJetAt(d : vec3<i32>, dir : u32) -> vec3<i32> {
 fn draftInside(d : vec3<i32>) -> bool {
   return d.x >= 0 && d.y >= 0 && d.z >= 0 &&
          d.x < DRAFT_NX && d.y < DRAFT_NY && d.z < DRAFT_NZ;
+}
+
+// WHICH BOX (audit DJ-1). The tick's boxes are the session's, one per player,
+// in the op exchange's canonical order and the same on every machine
+// (TickParams.draftBox, compacted). A sample takes the FIRST live box in list
+// order whose cells hold it: .xyz = its cell there, .w = the slot; .w = -1 =
+// no box holds it (the ambient field, unchanged). UNROLLED over the two slots
+// (world.h static_assert), with the boxes passed as values read at static
+// offsets: a dynamic index into a uniform array copied by value spills the
+// whole struct (memory: dynamic-index-on-byvalue-uniform).
+fn draftFind(p : vec3<i32>, b0 : vec4<i32>, b1 : vec4<i32>) -> vec4<i32> {
+  if ((b0.w & 1) == 0) { return vec4<i32>(0, 0, 0, -1); }
+  let d0 = (p - b0.xyz) >> vec3<u32>(DRAFT_CELL_SHIFT);
+  if (draftInside(d0)) { return vec4<i32>(d0, 0); }
+  if ((b1.w & 1) == 0) { return vec4<i32>(0, 0, 0, -1); }
+  let d1 = (p - b1.xyz) >> vec3<u32>(DRAFT_CELL_SHIFT);
+  if (draftInside(d1)) { return vec4<i32>(d1, 1); }
+  return vec4<i32>(0, 0, 0, -1);
 }
 
 // THE SIM'S READ: the ambient field `amb` (Q16.16 cells/s, primitives NOT
@@ -3250,13 +3275,15 @@ fn draftInside(d : vec3<i32>) -> bool {
 // negative component is -(amb >> 12), not (-amb) >> 12, so T-x = -R_x
 // reproduces R_x * (amb.x >> 12) to the bit.
 fn draftApplyQ(p : vec3<i32>, amb : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
-  if (!DRAFT_BOUND || (*T).draftMode == 0u) { return amb; }
-  let d = (p - (*T).draftOrigin) >> vec3<u32>(DRAFT_CELL_SHIFT);
-  if (!draftInside(d)) { return amb; }
+  if (!DRAFT_BOUND) { return amb; }
+  let f = draftFind(p, (*T).draftBox[0], (*T).draftBox[1]);
+  if (f.w < 0) { return amb; }
+  let base = u32(f.w) * DRAFT_SLOT_WORDS;
+  let d = f.xyz;
   let ax = amb.x >> 12u;
   let az = amb.z >> 12u;
-  let tx = draftJetAt(d, select(0u, 1u, ax < 0));
-  let tz = draftJetAt(d, select(2u, 3u, az < 0));
+  let tx = draftJetAt(base, d, select(0u, 1u, ax < 0));
+  let tz = draftJetAt(base, d, select(2u, 3u, az < 0));
   var o = tx * abs(ax) + tz * abs(az);
   let open = min(4096, (abs(tx.x) + abs(tz.z)) >> 1u);
   o.y += (amb.y >> 12u) * open;
@@ -3267,22 +3294,38 @@ fn draftApplyQ(p : vec3<i32>, amb : vec3<i32>, T : ptr<uniform, TickParams>) -> 
 // streak crossing a doorway turns smoothly instead of in 0.4 m steps. A tap
 // outside the volume is the identity (no shelter), which with the solver's
 // own edge blend makes the box's face invisible.
-fn draftTapF(d : vec3<i32>, dx : u32, dz : u32, tx : ptr<function, vec3f>,
+fn draftTapF(base : u32, d : vec3<i32>, dx : u32, dz : u32, tx : ptr<function, vec3f>,
              tz : ptr<function, vec3f>, w : f32) {
   if (draftInside(d)) {
-    *tx += vec3f(draftJetAt(d, dx)) * (w / 4096.0);
-    *tz += vec3f(draftJetAt(d, dz)) * (w / 4096.0);
+    *tx += vec3f(draftJetAt(base, d, dx)) * (w / 4096.0);
+    *tz += vec3f(draftJetAt(base, d, dz)) * (w / 4096.0);
   } else {
     *tx += vec3f(select(w, -w, dx == 1u), 0.0, 0.0);
     *tz += vec3f(0.0, 0.0, select(w, -w, dz == 3u));
   }
 }
+// The render's box test: the taps of a sample at p reach cells -1..N of box
+// `b` (the taps outside it are the identity), so the box holds p when its
+// lowest tap is in that range. The first live box in list order wins, as in
+// draftFind.
+fn draftQF(p : vec3f, b : vec4<i32>) -> vec3f { return (p - vec3f(b.xyz)) * 0.25 - vec3f(0.5); }
+fn draftHoldsF(q : vec3f, b : vec4<i32>) -> bool {
+  let c = vec3<i32>(floor(q));
+  return (b.w & 1) != 0 && c.x >= -1 && c.y >= -1 && c.z >= -1 &&
+         c.x < DRAFT_NX && c.y < DRAFT_NY && c.z < DRAFT_NZ;
+}
 fn draftApplyF(p : vec3f, amb : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
-  if (!DRAFT_BOUND || (*R).draftMode == 0u) { return amb; }
-  let q = (p - vec3f((*R).draftOrigin)) * 0.25 - vec3f(0.5);
+  if (!DRAFT_BOUND) { return amb; }
+  let b0 = (*R).draftBox[0];
+  let b1 = (*R).draftBox[1];
+  var q = draftQF(p, b0);
+  var base = 0u;
+  if (!draftHoldsF(q, b0)) {
+    q = draftQF(p, b1);
+    base = DRAFT_SLOT_WORDS;
+    if (!draftHoldsF(q, b1)) { return amb; }
+  }
   let b = vec3<i32>(floor(q));
-  if (b.x < -1 || b.y < -1 || b.z < -1 ||
-      b.x >= DRAFT_NX || b.y >= DRAFT_NY || b.z >= DRAFT_NZ) { return amb; }
   let f = q - floor(q);
   let dx = select(0u, 1u, amb.x < 0.0);
   let dz = select(2u, 3u, amb.z < 0.0);
@@ -3291,7 +3334,7 @@ fn draftApplyF(p : vec3f, amb : vec3f, R : ptr<uniform, RenderParams>) -> vec3f 
   for (var k = 0u; k < 8u; k++) {
     let o = vec3<i32>(i32(k & 1u), i32((k >> 1u) & 1u), i32(k >> 2u));
     let wv = select(vec3f(1.0) - f, f, o == vec3<i32>(1));
-    draftTapF(b + o, dx, dz, &tx, &tz, wv.x * wv.y * wv.z);
+    draftTapF(base, b + o, dx, dz, &tx, &tz, wv.x * wv.y * wv.z);
   }
   let open = clamp((abs(tx.x) + abs(tz.z)) * 0.5, 0.0, 1.0);
   return tx * abs(amb.x) + tz * abs(amb.z) + vec3f(0.0, amb.y * open, 0.0);
@@ -3406,26 +3449,26 @@ fn windHeatXNear(c : vec3<i32>, wc : vec3<i32>, e0 : u32, o : vec3<i32>) -> i32 
 // (TickParams) and the renderer (RenderParams, the same integers from the same
 // SubmitTick) run ONE body: windHeatK below. The window origin keys the slot
 // lookup; the four Q words are SubmitTick's conversions of the sim.wind*
-// heat rows; the draft gate and origin place the stack field.
+// heat rows; the draft box list (two slots, draftFind) places the stack field.
 struct HeatWindK {
   origin : vec3<i32>,
   gainQ : i32,
   capQ : i32,
   inflowQ : i32,
   stackQ : i32,
-  draftOn : u32,
-  draftOrigin : vec3<i32>,
+  draftBox0 : vec4<i32>,
+  draftBox1 : vec4<i32>,
 };
 fn heatWindKT(T : ptr<uniform, TickParams>) -> HeatWindK {
   return HeatWindK((*T).origin, (*T).updraftGainQ, (*T).updraftCapQ, (*T).updraftInflowQ,
-                   (*T).draftStackQ, (*T).draftMode, (*T).draftOrigin);
+                   (*T).draftStackQ, (*T).draftBox[0], (*T).draftBox[1]);
 }
 // The render copy: RenderParams carries the last tick's four Q words
-// (support.cpp WriteRenderParams), and draftMode there is "a solved volume
+// (support.cpp WriteRenderParams), and a box's w there is "a solved volume
 // exists", the render's own gate for draftApplyF.
 fn heatWindKR(R : ptr<uniform, RenderParams>) -> HeatWindK {
   return HeatWindK((*R).origin, (*R).updraftGainQ, (*R).updraftCapQ, (*R).updraftInflowQ,
-                   (*R).draftStackQ, (*R).draftMode, (*R).draftOrigin);
+                   (*R).draftStackQ, (*R).draftBox[0], (*R).draftBox[1]);
 }
 
 // THE LIFT at world cell p, Q16.16 cells/s in [0, cap]. Also what
@@ -3472,11 +3515,14 @@ fn draftStackAtQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
   return draftStackAtK(p, heatWindKT(T));
 }
 fn draftStackAtK(p : vec3<i32>, k : HeatWindK) -> vec3<i32> {
-  if (!DRAFT_BOUND || k.draftOn == 0u || k.stackQ <= 0) { return vec3<i32>(0); }
-  if (draftWord(DRAFT_STACK_LIVE) == 0u) { return vec3<i32>(0); }
-  let d = (p - k.draftOrigin) >> vec3<u32>(DRAFT_CELL_SHIFT);
-  if (!draftInside(d)) { return vec3<i32>(0); }
-  let i = DRAFT_STACK_FIELD + 2u * u32((d.z * DRAFT_NY + d.y) * DRAFT_NX + d.x);
+  if (!DRAFT_BOUND || k.stackQ <= 0) { return vec3<i32>(0); }
+  // The same box draftApplyQ picks for this sample (first in list order).
+  let f = draftFind(p, k.draftBox0, k.draftBox1);
+  if (f.w < 0) { return vec3<i32>(0); }
+  let base = u32(f.w) * DRAFT_SLOT_WORDS;
+  if (draftWord(base + DRAFT_STACK_LIVE) == 0u) { return vec3<i32>(0); }
+  let d = f.xyz;
+  let i = base + DRAFT_STACK_FIELD + 2u * u32((d.z * DRAFT_NY + d.y) * DRAFT_NX + d.x);
   let w0 = draftWord(i);
   let s = vec3<i32>(draftSext(w0), draftSext(w0 >> 16u), draftSext(draftWord(i + 1u)));
   // |s| < 2^15 and cap >> 12 <= 6,400 (40 m/s), then / 256 x a share <= 4x.

@@ -462,6 +462,14 @@ int BodySlotFor(const char* name, const char* tag);
 // single-player tick `winds` stays EMPTY (SpawnWindPrim spawns at once);
 // connected, the producers stage here, the batch crosses, and phase N spawns
 // the MERGED list at the label tick, the same list on both machines.
+//
+// AND AN EIGHTH, NOT AN OP: `drafts`, the wind-draft box of every player this
+// machine is the authority for (audit DJ-1, 2026-10-14, kOpsWireVersion 4).
+// Phase N fills it every tick with DraftBoxFor(the submit chunk); connected,
+// it crosses with the batch and the MERGE is the session's box list, in the
+// canonical author order (the host's box first) on both machines; phase N
+// hands that to SetTickDraftBoxes for the label tick's submit. Single-player it
+// is this machine's one box, handed over at once.
 struct OpBatch {
   std::vector<BrushOp> ops;
   std::vector<ExplosionOp> exps;
@@ -470,6 +478,7 @@ struct OpBatch {
   std::vector<FluidSpawnOp> fluid;
   std::vector<GasSpawnOp> gas;
   std::vector<WindPrim> winds;
+  std::vector<DraftBox> drafts;
   // Cleared, not reconstructed: the capacity is worth keeping across ticks and
   // the values are identical either way.
   void Clear() {
@@ -480,6 +489,7 @@ struct OpBatch {
     fluid.clear();
     gas.clear();
     winds.clear();
+    drafts.clear();
   }
 };
 

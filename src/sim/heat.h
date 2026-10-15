@@ -125,7 +125,10 @@ static_assert(kHmArgs + kHeatArgRecords * 4 <= kHmHdrWords, "the args fit the he
 // atomicAdd: the stack field re-solves when THIS moved, so a fire outside the box
 // does not re-solve a box whose own heat is settled. Past the args records and
 // outside the snapshot words (a worldgen / load reset zeroes it, and either
-// forces a draft burst that re-reads it).
+// forces a draft burst that re-reads it). ONE CLOCK PER SLOT of the draft box
+// list (audit DJ-1): slot k's at kHmDraftHeatClock + k, counted for chunks in
+// or under ITS box, so heat in one player's box does not re-solve the other's
+// (simulation.cpp static_asserts the kDraftMaxBoxes clocks end before 64).
 constexpr uint32_t kHmDraftHeatClock = 56;
 static_assert(kHmDraftHeatClock >= kHmArgs + kHeatArgRecords * 4 && kHmDraftHeatClock < 64,
               "the draft heat clock sits between the args and the firing log (kHmFireLog)");

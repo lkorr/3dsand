@@ -601,6 +601,17 @@ bool RecordedRainSlope(uint32_t tick, int32_t& sx, int32_t& sz) {
   return false;
 }
 
+bool RecordedDraftBoxes(uint32_t tick, int32_t (&box)[kDraftMaxBoxes][4]) {
+  if (!g_replay) return false;
+  for (const Frame& f : g_replay->frames) {
+    if (f.in.tick != tick) continue;
+    for (uint32_t k = 0; k < kDraftMaxBoxes; k++)
+      for (int i = 0; i < 4; i++) box[k][i] = f.tp.draftBox[k][i];
+    return true;
+  }
+  return false;
+}
+
 bool RecordedWeatherRain(uint32_t tick, uint32_t& word) {
   if (!g_replay) return false;
   for (const Frame& f : g_replay->frames) {

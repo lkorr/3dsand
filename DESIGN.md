@@ -22742,7 +22742,7 @@ thing you were testing.
 solver; common.wgsl's WIND DRAFTS block the reader; `world.h` kDraft* the
 layout; `--gate drafts` the proof.
 
-**What it does.** Inside a box round the player (64 x 32 x 64 cells of 4
+**What it does.** Inside a box round each player (64 x 32 x 64 cells of 4
 voxels = 25.6 x 12.8 x 25.6 m, chunk-aligned, snapped to even chunks so it
 moves every 3.2 m) the ambient field is redirected by geometry. A sealed room is
 still, a room with one opening barely stirs, a door to windward and a window to
@@ -22752,6 +22752,45 @@ bias and entrainment, ballistic particles, MPM surface nodes, through `windAtQ`)
 and so do the gust streaks and the F4 arrows (through `windAt`). Grass sway does
 not, because the raymarch fragment shader has no register headroom. Neither do
 the clouds, which have no use for it.
+
+**Whose box (audit DJ-1, 2026-10-14).** The boxes are the SESSION's, so two
+players see the same wind. Each machine used to place one box from its own
+player's chunk and clamp it into its own window, and nothing put it on the
+wire. Two peers in one longhouse therefore solved two different boxes and
+drifted the same smoke, ash and sand two different ways, and chunksync then
+re-sent the chunks. Now:
+
+- **Placement is a pure function of a player's chunk on a fixed world
+  lattice** (`support.h DraftBoxFor`): the even-chunk snap above, with NO
+  window clamp. The window is a per-machine input.
+- **The list is authored by the authority and crosses the wire.** Every tick,
+  phase N puts this machine's player's box on `OpBatch::drafts`
+  (`kOpsWireVersion` 4). Connected, the merge in the canonical author order
+  (the host's box first) is the session's list on both machines, handed to
+  that tick's `SubmitTick` (`SetTickDraftBoxes`). Single-player, it is the one
+  box, handed over at once, so nothing changes there. The list is deduplicated
+  keep-first and capped at `kDraftMaxBoxes` = 2, the session's player count.
+  Past the cap, the canonical first two win on every machine. It rides
+  `TickParams.draftBox` (compacted, live first), so the op record carries it,
+  and a replay takes it from the record (`RecordedDraftBoxes`).
+- **Box k is slot k** of the `draft` buffer (`kDraftWords` each, 30.5 MB for
+  two) and of `draftMeta`. Every consumer reads the same list. A sample takes
+  the FIRST live box in list order that holds it (common.wgsl `draftFind`: the
+  CA's `draftApplyQ`, the stack field, the render's `draftApplyF`); outside
+  every box it gets the ambient field unchanged.
+- **Each slot solves on its own.** Its masks, its pipeline stage, its heat
+  clock (heat.h `kHmDraftHeatClock + k`) and its bursts are per slot. `args`
+  advances every live slot and writes each stage's record as the union: x =
+  the tiles, z = the slots that run that stage, named in a per-stage list the
+  kernels read by `workgroup_id.z`. A slot whose box and geometry did not move
+  dispatches nothing, so two players cost two boxes only while both boxes are
+  changing (rule 2). A dead slot is left alone and bursts when it comes back.
+- **A box cell outside this machine's window is open air** (`cellMasks`).
+  That is the one deterministic answer for matter this machine does not hold.
+  A peer's box can reach past my window, and there the two machines' masks,
+  and so their fields, can still differ. This is the same window-edge limit
+  the CA itself has, and chunksync repairs it the same way. A chunk that
+  streams in is re-masked by the dirty path, because a refill marks its chunk.
 
 **What it stores is a TRANSFER, not a wind.** Per cell, R_x is what a unit
 horizontal wind along +X at infinity becomes there, and R_z the same for +Z.
@@ -22803,10 +22842,10 @@ recorded**, so `C_DRAFT` stays true for 2 x 6 + 1 ticks after the last tick the
 CA ran or the box rebuilt (`RecordCtx::draftTail`): without that tail a world
 that proved itself settled mid-solve froze the solve, and the published field
 stayed a geometry behind until something woke the CA (2026-10-12, the `drafts`
-gate's purity arm). **A BURST** (TickParams.draftMode bit 1)
-runs every stage in one tick. It fires when the box moved or when the gate, the
-materials or the buffer is new, because the field must match the box's new
-origin before anything reads it.
+gate's purity arm). **A BURST** (bit 1 of the slot's `TickParams.draftBox[k].w`)
+runs every stage of that slot in one tick. It fires when the box moved, when
+the slot came live, or when the gate, the materials or the buffer is new,
+because the field must match the box's new origin before anything reads it.
 
 **Cost** (RTX 3060 Ti, `--perf`, all draft rows summed, per frame):
 
@@ -28640,7 +28679,12 @@ oracle. Wind primitives are exchanged since 2026-10-14 (`OpBatch::winds`,
 `kOpsWireVersion` 3): connected, `SpawnWindPrim` stages a spell's or a
 creature's gust on the batch and phase N spawns the merged list with
 `spawnTick` = the label tick on both machines; single-player spawns at once and
-`winds` stays empty. The dev panel's fan is local (audit DET-8).
+`winds` stays empty. The dev panel's fan is local (audit DET-8). The wind-draft
+boxes are exchanged since 2026-10-14 (`OpBatch::drafts`, `kOpsWireVersion` 4):
+each machine's phase N puts its own player's lattice-placed box on the batch,
+and the merged list (host first) is the session's box list, which both
+machines solve from the label tick (audit DJ-1; "Drafts: the shelter volume",
+"Whose box").
 
 **M9.4 — entities are owned by the nearest resident player (2026-09-21;
 `src/net/authority.*`, `src/net/entitysync.*`, `mob.*`, `debris.*`).** Ownership is

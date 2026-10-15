@@ -706,22 +706,30 @@ class Simulation {
   const rhi::Buffer& RainExpoBuffer() const { return rainExpoBuf_; }
 
   // ---- WIND DRAFTS: the shelter volume (sim_draft.wgsl, world.h kDraft*) ----
-  // For the next EncodeTick: the gate (tuning sim.draftMode) and the box's
-  // origin (TickParams.draftOrigin, world voxels). A change of either, a
-  // material upload, or a fresh buffer makes that tick a REBUILD -- every
-  // chunk of the box re-masked -- and otherwise the box re-masks only its
-  // active chunks. SubmitTick calls it beside the TickParams upload.
-  void SetDraft(bool on, const int32_t origin[3]);
-  // What the renderer may read: the box's origin as last ENCODED, and whether
-  // a solve has been recorded for it (RenderParams.draftMode).
-  bool DraftValid() const { return draftValid_; }
-  // This tick re-masks the whole box and runs the whole solve (a BURST).
+  // For the next EncodeTick: the gate (tuning sim.draftMode) and the tick's
+  // BOX LIST (audit DJ-1: the session's boxes, the same on every machine,
+  // already deduplicated and capped; TickParams.draftBox). Box k is slot k.
+  // Per slot: a change of its origin, its slot coming live, a material
+  // upload, a knob change or a fresh buffer makes that tick a REBUILD of THAT
+  // slot -- every chunk of its box re-masked and the whole solve run -- and
+  // otherwise the slot re-masks only its active chunks. A slot past `n` is
+  // dead: left as it is, it rebuilds when it comes back. SubmitTick calls it
+  // beside the TickParams upload.
+  void SetDraft(bool on, const DraftBox* boxes, uint32_t n);
+  // What the renderer may read, per slot: the box's origin as last ENCODED,
+  // and whether a solve has been recorded for it (RenderParams.draftBox w).
+  // The unsuffixed forms are slot 0 (the gates' single-player box).
+  bool DraftValid(uint32_t k = 0) const { return k < kDraftMaxBoxes && draftSlot_[k].valid; }
+  // This tick re-masks slot k's whole box and runs its whole solve (a BURST).
+  bool DraftRebuild(uint32_t k) const { return k < kDraftMaxBoxes && draftSlot_[k].rebuild; }
+  // ...any slot does (the rows' gate).
   bool DraftRebuild() const { return draftRebuild_; }
-  const int32_t* DraftOrigin() const { return draftOrigin_; }
-  // The volume and its meta words, for a gate's readback (drafts) only.
+  const int32_t* DraftOrigin(uint32_t k = 0) const { return draftSlot_[k < kDraftMaxBoxes ? k : 0].origin; }
+  // The volume and its meta words, for a gate's readback (drafts) only. Slot
+  // 0 is at word 0 of both (world.h kDraftWords / kDraftMetaSlotWords apart).
   const rhi::Buffer& DraftBuffer() const { return draftBuf_; }
   const rhi::Buffer& DraftMetaBuffer() const { return draftMetaBuf_; }
-  // Force the next tick to re-mask the whole box (a gate's purity check).
+  // Force the next tick to re-mask every live box (a gate's purity check).
   void ForceDraftRebuild() { draftForce_ = true; }
   // The stack effect's knobs as the kernels see them (TickParams
   // updraftGainQ / updraftCapQ / draftStackQ): the stack field's b is solved
@@ -1011,14 +1019,22 @@ class Simulation {
   rhi::Buffer stillWaterBuf_;
   // pass::Buf::RenderUBOTick (docs/PLAN_async_compute.md).
   rhi::Buffer renderUBOTickBuf_;
-  bool draftOn_ = false, draftRebuild_ = false, draftForce_ = true, draftValid_ = false;
-  bool draftLastOn_ = false;
+  bool draftOn_ = false, draftRebuild_ = false, draftForce_ = true;
+  // Some live slot is NOT rebuilding this tick, so the dirty re-mask row
+  // records (Cond::DraftDirty; a rebuilding slot is re-masked whole).
+  bool draftDirtySlots_ = false;
+  // Per slot of the box list (SetDraft). lastOrigin starts impossible, so a
+  // slot's first live tick is a rebuild.
+  struct DraftSlotState {
+    bool live = false, lastOn = false, rebuild = false, valid = false;
+    int32_t origin[3] = {0, 0, 0};
+    int32_t lastOrigin[3] = {-2147483647 - 1, 0, 0};
+  };
+  DraftSlotState draftSlot_[kDraftMaxBoxes];
   // Ticks left in which Cond::Draft records even on a settled tick
   // (EncodeTick, THE DRAFT SOLVE FINISHES): reset to 2 x kDraftStages + 1 on
   // every tick the CA runs or the box rebuilds.
   uint32_t draftTail_ = 0;
-  int32_t draftOrigin_[3] = {0, 0, 0};
-  int32_t draftLastOrigin_[3] = {-2147483647 - 1, 0, 0};
   int32_t draftHeatKnobs_[3] = {0, 0, 0};
   bool draftHeatKnobsSet_ = false;
   int32_t draftSolverKnobs_[5] = {0, 0, 0, 0, 0};

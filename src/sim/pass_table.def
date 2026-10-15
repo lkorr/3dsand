@@ -432,16 +432,22 @@ PASS(rainExpo, "rainExpo", PT_TICK, PIPE_RAIN_EXPO, K_COMPUTE, D_RAINEXPO,1,1, G
 // or rebuild tick, so a solve in flight always publishes) has run out.
 // D_DRAFTCHUNKS is a literal (pass_table.cpp does not see world.h):
 // kDraftChunks = 2048, static_assert-ed in simulation.cpp.
-PASS(draftMaskAll, "draft", PT_TICK, PIPE_DRAFT_MASK_ALL, K_COMPUTE, 2048,1,1, GRP_SIM, DYN_ZERO, C_DRAFTALL, 1,
+// THE BOX LIST (audit DJ-1): every row works one SLOT per workgroup layer.
+// draftMaskAll's z is kDraftMaxBoxes (= 2, static_assert-ed with the 2048),
+// one layer per slot, of which only a bursting slot's works; draftMaskDirty
+// loops the live slots per active chunk; the solve rows take their slot from
+// their stage's list in draftMeta by workgroup_id.z (the record's z counts
+// the slots that run that stage).
+PASS(draftMaskAll, "draft", PT_TICK, PIPE_DRAFT_MASK_ALL, K_COMPUTE, 2048,1,2, GRP_SIM, DYN_ZERO, C_DRAFTALL, 1,
      USES(U(TickUBO) R(Voxels) R(Materials) R(PageTable) RW(Draft) A(DraftMeta)))
 PASS(draftMaskDirty, "draft", PT_TICK, PIPE_DRAFT_MASK_DIRTY, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_ZERO, C_DRAFTDIRTY, 1,
      USES(U(TickUBO) R(Voxels) R(Materials) R(PageTable) R(DirtyList) I(DispatchArgs) RW(Draft) A(DraftMeta)))
 PASS(draftArgs, "draft", PT_TICK, PIPE_DRAFT_ARGS, K_COMPUTE, 1,1,1, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
      USES(U(TickUBO) A(DraftMeta) A(HeatMeta)))
-// kDraftMetaArgs * 4 = 32 bytes into draftMeta: six stage records of 16
-// bytes. Each solve row reads ITS stage's record: the y field of an
-// IND_DRAFTARGS row is the byte offset (vk_record.cpp).
-PASS(copy_draftArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 32,0,96, GRP_NONE, DYN_NONE, C_DRAFT, 1,
+// kDraftMetaArgs * 4 = 320 bytes into draftMeta (past the slot blocks): six
+// stage records of 16 bytes. Each solve row reads ITS stage's record: the y
+// field of an IND_DRAFTARGS row is the byte offset (vk_record.cpp).
+PASS(copy_draftArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 320,0,96, GRP_NONE, DYN_NONE, C_DRAFT, 1,
      USES(TR(DraftMeta) TW(DraftArgs)))
 // The solve, a PIPELINE of six stages one tick apart (sim_draft.wgsl `args`):
 // each chunk's air pocket + the coarse faces between pockets; the coarse
@@ -452,26 +458,26 @@ PASS(copy_draftArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 32,0,96, GRP_NONE, DYN
 PASS(draftCoarseBuild, "draft", PT_TICK, PIPE_DRAFT_CBUILD, K_INDIRECT, IND_DRAFTARGS,0,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
      USES(I(DraftArgs) RW(Draft) U(TickUBO) R(HeatPool) A(HeatMeta) A(DraftMeta)))
 PASS(draftCoarseFaces, "draft", PT_TICK, PIPE_DRAFT_CFACES, K_INDIRECT, IND_DRAFTARGS,0,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
-     USES(I(DraftArgs) RW(Draft)))
+     USES(I(DraftArgs) U(TickUBO) RW(Draft) A(DraftMeta)))
 PASS(draftCoarseSolve, "draft", PT_TICK, PIPE_DRAFT_CSOLVE, K_INDIRECT, IND_DRAFTARGS,16,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
-     USES(I(DraftArgs) RW(Draft) A(DraftMeta)))
+     USES(I(DraftArgs) U(TickUBO) RW(Draft) A(DraftMeta)))
 PASS(draftFineFirst, "draft", PT_TICK, PIPE_DRAFT_FINE1, K_INDIRECT, IND_DRAFTARGS,32,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
-     USES(I(DraftArgs) RW(Draft) A(DraftMeta)))
+     USES(I(DraftArgs) U(TickUBO) RW(Draft) A(DraftMeta)))
 PASS(draftFineMid, "draft", PT_TICK, PIPE_DRAFT_FINE2, K_INDIRECT, IND_DRAFTARGS,48,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
-     USES(I(DraftArgs) RW(Draft) A(DraftMeta)))
+     USES(I(DraftArgs) U(TickUBO) RW(Draft) A(DraftMeta)))
 PASS(draftFineMid2, "draft", PT_TICK, PIPE_DRAFT_FINE2B, K_INDIRECT, IND_DRAFTARGS,64,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
-     USES(I(DraftArgs) RW(Draft) A(DraftMeta)))
+     USES(I(DraftArgs) U(TickUBO) RW(Draft) A(DraftMeta)))
 PASS(draftFineLast, "draft", PT_TICK, PIPE_DRAFT_FINE3, K_INDIRECT, IND_DRAFTARGS,80,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
-     USES(I(DraftArgs) RW(Draft) A(DraftMeta)))
+     USES(I(DraftArgs) U(TickUBO) RW(Draft) A(DraftMeta)))
 // THE JETS (2026-10-14): on the publishing stage's own args record, after the
 // field it reads -- the four directional transfers the readers apply (indoor
 // air keeps its momentum). jetPrep packs the march's input slice-major (16
 // groups of columns do the work); jets marches it, one group per direction.
 // The rest of the record's tile count returns at once in both.
 PASS(draftJetPrep, "draft", PT_TICK, PIPE_DRAFT_JET_PREP, K_INDIRECT, IND_DRAFTARGS,80,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
-     USES(I(DraftArgs) RW(Draft)))
+     USES(I(DraftArgs) U(TickUBO) RW(Draft) A(DraftMeta)))
 PASS(draftJets, "draft", PT_TICK, PIPE_DRAFT_JETS, K_INDIRECT, IND_DRAFTARGS,80,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
-     USES(I(DraftArgs) RW(Draft)))
+     USES(I(DraftArgs) U(TickUBO) RW(Draft) A(DraftMeta)))
 
 // ---- phase 3: the CA loop -------------------------------------------------
 // 27 colors x 2 gravity substeps, one workgroup per dirty chunk. A settled

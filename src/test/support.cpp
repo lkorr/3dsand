@@ -285,11 +285,16 @@ bool gGasRenderActive = false;
 // own variable rather than a second bit of the one above, because the two gate
 // different work and are true in different worlds.
 bool gGasFarRenderActive = false;
-// The wind-draft box the renderer may read (sim_draft.wgsl): its origin and
-// whether its field has been solved, published by SubmitTick from Simulation
-// right after SetDraft and read by WriteRenderParams.
-bool gDraftRenderValid = false;
-int32_t gDraftRenderOrigin[3] = {0, 0, 0};
+// The wind-draft boxes the renderer may read (sim_draft.wgsl), per slot of the
+// box list: origin, and in [3] whether its field has been solved. Published by
+// SubmitTick from Simulation right after SetDraft, read by WriteRenderParams.
+int32_t gDraftRenderBox[kDraftMaxBoxes][4] = {};
+// THE TICK'S BOX LIST as the authority handed it over (SetTickDraftBoxes),
+// for the SubmitTick of tick gTickDraftTick only, which consumes it.
+DraftBox gTickDraftBoxes[kDraftMaxBoxes] = {};
+uint32_t gTickDraftCount = 0;
+uint32_t gTickDraftTick = 0;
+bool gTickDraftSet = false;
 // The heat term's four TickParams words as the LAST tick used them
 // (updraftGainQ / CapQ / InflowQ / draftStackQ; gain 0 with the sim's wind
 // off), published by SubmitTick and copied into RenderParams by
@@ -1022,10 +1027,10 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
       const int32_t o3[3] = {wo.x, wo.y, wo.z};
       windfield::FillWindField(rp, tun, rp.seed, tick, frameFrac, DayPhaseNow(tick), o3);
     }
-    // The wind-draft box the last tick solved (SubmitTick), so the streaks and
-    // the F4 arrows read the sheltered field the sim does.
-    rp.draftMode = gDraftRenderValid ? 1u : 0u;
-    for (int i = 0; i < 3; i++) rp.draftOrigin[i] = gDraftRenderOrigin[i];
+    // The wind-draft boxes the last tick solved (SubmitTick), so the streaks
+    // and the F4 arrows read the sheltered field the sim does.
+    for (uint32_t k = 0; k < kDraftMaxBoxes; k++)
+      for (int i = 0; i < 4; i++) rp.draftBox[k][i] = gDraftRenderBox[k][i];
     // ...and the heat term the last tick added (HEAT UPDRAFTS, windHeatF).
     rp.updraftGainQ = gHeatRenderQ[0];
     rp.updraftCapQ = gHeatRenderQ[1];
@@ -1137,6 +1142,30 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   if (!auxView)
     for (int k = 0; k < 3; k++) gKeyLightDir[k] = rp.keyDir[k];
   queue.WriteBuffer(world.renderUBO, 0, &rp, sizeof(rp));
+}
+
+// (support.h.) The lattice is the old placement without the window clamp:
+// the box's min chunk is the player's chunk rounded down to even, less
+// (half - 1) chunks. FLOOR arithmetic throughout (>> on a negative chunk).
+DraftBox DraftBoxFor(IVec3 playerChunk) {
+  auto place = [](int pc, int half) { return (((pc >> 1) << 1) - (half - 1)) * (int)kChunk; };
+  return DraftBox{place(playerChunk.x, (int)kDraftChunksX / 2),
+                  place(playerChunk.y, (int)kDraftChunksY / 2),
+                  place(playerChunk.z, (int)kDraftChunksZ / 2)};
+}
+
+// (support.h.) Keep-first dedupe, then the cap, in the order given.
+void SetTickDraftBoxes(uint32_t tick, const DraftBox* boxes, size_t n) {
+  gTickDraftCount = 0;
+  for (size_t i = 0; i < n && gTickDraftCount < kDraftMaxBoxes; i++) {
+    bool dup = false;
+    for (uint32_t k = 0; k < gTickDraftCount; k++)
+      dup = dup || (gTickDraftBoxes[k].x == boxes[i].x && gTickDraftBoxes[k].y == boxes[i].y &&
+                    gTickDraftBoxes[k].z == boxes[i].z);
+    if (!dup) gTickDraftBoxes[gTickDraftCount++] = boxes[i];
+  }
+  gTickDraftTick = tick;
+  gTickDraftSet = true;
 }
 
 // Encode + submit one sim tick (uniform writes must precede the submit and
@@ -1877,30 +1906,41 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // voxel mirror describe one cube.
   IVec3 mb = world.MirrorBaseFor({mc.x - 1, mc.y - 1, mc.z - 1});
   tp.mirrorBase[0] = mb.x; tp.mirrorBase[1] = mb.y; tp.mirrorBase[2] = mb.z;
-  // ---- WIND DRAFTS: the shelter volume's box (world.h kDraft*) ----------
-  // A pure function of the player's chunk, snapped to EVEN chunks so the box
-  // moves (and re-solves) every 3.2 m of travel rather than every 1.6 m, and
-  // clamped inside the window. The player sits 7-8 chunks from its -X/-Z
-  // faces and 3-4 above its floor: more box overhead (a roof, an upper
-  // storey) than underfoot, where the ground is solid anyway.
+  // ---- WIND DRAFTS: the shelter volumes' boxes (world.h kDraft*) --------
+  // THE SESSION'S LIST (audit DJ-1, 2026-10-14): one box per player, placed
+  // on the fixed world lattice (DraftBoxFor) and handed over by the authority
+  // (SetTickDraftBoxes: the merged op batch's list when connected, the same
+  // on both machines). It used to be ONE box, from THIS machine's player and
+  // clamped into THIS machine's window, so two peers in one longhouse solved
+  // two different boxes and drifted the same smoke two ways. A replay takes
+  // the recorded list; a SubmitTick nobody handed a list to uses the one box
+  // round `playerChunk` -- which is the single-player list.
   {
-    const IVec3 w0 = world.WindowOrigin();
-    auto place = [](int pc, int half, int span, int wlo) {
-      int o = ((pc >> 1) << 1) - (half - 1);
-      const int hi = wlo + (int)kNChunk - span;
-      if (o < wlo) o = wlo;
-      if (o > hi) o = hi;
-      return o * (int)kChunk;
-    };
-    tp.draftOrigin[0] = place(playerChunk.x, (int)kDraftChunksX / 2, (int)kDraftChunksX, w0.x);
-    tp.draftOrigin[1] = place(playerChunk.y, (int)kDraftChunksY / 2, (int)kDraftChunksY, w0.y);
-    tp.draftOrigin[2] = place(playerChunk.z, (int)kDraftChunksZ / 2, (int)kDraftChunksZ, w0.z);
+    DraftBox boxes[kDraftMaxBoxes] = {};
+    uint32_t n = 0;
+    int32_t rec[kDraftMaxBoxes][4] = {};
+    if (opstream::RecordedDraftBoxes(tick, rec)) {
+      for (uint32_t k = 0; k < kDraftMaxBoxes && (rec[k][3] & 1) != 0; k++)
+        boxes[n++] = DraftBox{rec[k][0], rec[k][1], rec[k][2]};
+    } else if (gTickDraftSet && gTickDraftTick == tick) {
+      for (uint32_t k = 0; k < gTickDraftCount; k++) boxes[n++] = gTickDraftBoxes[k];
+    } else {
+      boxes[n++] = DraftBoxFor(playerChunk);
+    }
+    gTickDraftSet = false;   // consumed: one tick's list, one submit
     const bool on = CurrentTuning().sim.draftMode != 0;
-    sim.SetDraft(on, tp.draftOrigin);
-    // Bit 1: a BURST -- the whole solve this tick (sim_draft.wgsl `args`).
-    tp.draftMode = on ? (1u | (sim.DraftRebuild() ? 2u : 0u)) : 0u;
-    gDraftRenderValid = sim.DraftValid();
-    for (int i = 0; i < 3; i++) gDraftRenderOrigin[i] = sim.DraftOrigin()[i];
+    sim.SetDraft(on, boxes, n);
+    // Compacted, live slots first. Bit 0 live; bit 1 a BURST -- that slot's
+    // whole solve this tick (sim_draft.wgsl `args`).
+    for (uint32_t k = 0; k < kDraftMaxBoxes; k++) {
+      const bool live = on && k < n;
+      tp.draftBox[k][0] = live ? boxes[k].x : 0;
+      tp.draftBox[k][1] = live ? boxes[k].y : 0;
+      tp.draftBox[k][2] = live ? boxes[k].z : 0;
+      tp.draftBox[k][3] = live ? (int32_t)(1u | (sim.DraftRebuild(k) ? 2u : 0u)) : 0;
+      for (int i = 0; i < 3; i++) gDraftRenderBox[k][i] = sim.DraftOrigin(k)[i];
+      gDraftRenderBox[k][3] = sim.DraftValid(k) ? 1 : 0;
+    }
   }
   tp.vizActive = vizActive ? 1u : 0u;
   // ---- UPLOAD: the MutationQueue op stream reaching the GPU ---------------

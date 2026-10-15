@@ -2678,6 +2678,8 @@ static_assert(kWindStreakStride == 2 + kWindStreakTrail, "streak row layout");
 //                                   draftJetIndex). Outdoors (no roof above) and
 //                                   with the jets off, T = +-R exactly.
 //   [kDraftJetPrep, + 6 cells)       the march's packed input, scratch
+//   ...all of that is ONE SLOT. The buffer holds kDraftMaxBoxes slots, slot k
+//   at word k * kDraftWords (below), one per box of the tick's box list.
 // Buffer `draftMeta` (binding 47, atomics): kDraftMeta* words below.
 // MIRRORED as DRAFT_* in common.wgsl (check_invariants `drafts`).
 constexpr uint32_t kDraftCellShift = 2;   // a cell is 4 voxels (0.4 m)
@@ -2717,16 +2719,53 @@ constexpr uint32_t kDraftMetaSolves = 1;    // solves since the buffer was made
 constexpr uint32_t kDraftMetaLastTick = 2;  // tick of the last solve
 constexpr uint32_t kDraftMetaCells = 3;     // mask cells changed, summed
 constexpr uint32_t kDraftMetaStage = 4;     // the solve pipeline's stage (0 = idle)
-constexpr uint32_t kDraftMetaArgs = 8;      // 6 stages x 4 words: each stage's indirect args
 constexpr uint32_t kDraftStages = 6;
 // The stack effect's re-solve trigger (sim_draft.wgsl `args`): heat moving is
 // not a mask change, so these say when the box's own heat last moved (heat.h
-// kHmDraftHeatClock) and what the last snapshot saw. Past the args records,
-// which end at word 31; word 32 is unused.
+// kHmDraftHeatClock + slot) and what the last snapshot saw. Words 5..32 of a
+// slot's block are unused (they held the args records before the box list).
 constexpr uint32_t kDraftMetaHeatClock = 33;  // kHmDraftHeatClock at the last solve's start
 constexpr uint32_t kDraftMetaBoxHot = 34;     // the last snapshot saw b != 0 (OR)
 constexpr uint32_t kDraftMetaHeatStart = 35;  // tick the last solve started
-constexpr uint32_t kDraftMetaWords = 40;
+// THE BOX LIST (audit DJ-1, 2026-10-14; DESIGN.md "Drafts", "Whose box").
+// The draft boxes of a tick are the SESSION's, not this machine's: one box
+// per player, each placed on the fixed world lattice from that player's chunk
+// (support.h DraftBoxFor), authored by that player's own machine, crossing the
+// wire on OpBatch::drafts and merged in the op exchange's canonical order
+// (author ascending, so the host's box leads on both machines), deduplicated
+// keep-first and capped here. Two is the session's player count (a host and
+// one client); past the cap the canonical first kDraftMaxBoxes win, on every
+// machine alike. Slot k of the buffers is list entry k, so a sample takes the
+// FIRST box in list order that holds it (common.wgsl draftFind).
+constexpr uint32_t kDraftMaxBoxes = 2;
+static_assert(kDraftMaxBoxes == 2,
+              "common.wgsl draftFind / draftApplyF / heatWindK and sim_heat.wgsl "
+              "heatRelax test the boxes UNROLLED, two of them (uniform arrays are "
+              "read at static offsets: gotcha dynamic-index-on-byvalue-uniform)");
+// Per slot: kDraftMetaSlotWords words at slot * kDraftMetaSlotWords (the words
+// above). After the slots, the TICK's words: the six stage records of the
+// solve's indirect args (x = tiles, z = how many slots run that stage), then
+// per stage the slots that run it (sim_draft.wgsl `args` writes both; a
+// stage's kernels take their slot from the list by workgroup_id.z).
+constexpr uint32_t kDraftMetaSlotWords = 40;
+constexpr uint32_t kDraftMetaArgs = 80;     // 6 stages x 4 words
+constexpr uint32_t kDraftMetaList = 104;    // 6 stages x kDraftMaxBoxes slots
+constexpr uint32_t kDraftMetaWords = 116;
+static_assert(kDraftMetaArgs == kDraftMaxBoxes * kDraftMetaSlotWords &&
+                  kDraftMetaList == kDraftMetaArgs + 4 * kDraftStages &&
+                  kDraftMetaWords == kDraftMetaList + kDraftStages * kDraftMaxBoxes,
+              "draftMeta: the slot blocks, then the args records, then the stage lists "
+              "(literals so check_invariants `drafts` can read them)");
+static_assert(kDraftMetaHeatStart < kDraftMetaSlotWords, "a slot's words fit its block");
+// The whole `draft` buffer: kDraftMaxBoxes slots of kDraftWords (30.5 MB).
+constexpr uint64_t kDraftBufferWords = (uint64_t)kDraftMaxBoxes * kDraftWords;
+// One entry of the box list, as it crosses the wire (OpBatch::drafts) and as
+// SubmitTick takes it: the box's minimum corner, world voxels, ALREADY PLACED
+// on the lattice by the machine that authored it (support.h DraftBoxFor). POD:
+// it rides OpsWire's PodVec.
+struct DraftBox {
+  int32_t x = 0, y = 0, z = 0;
+};
 static_assert(kDraftNX == 64 && kDraftNY == 32 && kDraftNZ == 64,
               "sim_draft.wgsl jets / common.wgsl draftJetIndex: 64-cell slices of 64 x 32 "
               "planes (JET_PLANE 2048, u < 64) -- a new box size needs the march re-laid");
@@ -3596,13 +3635,14 @@ struct TickParams {
   uint32_t wfTerr[kWindTerrWords] = {}; // h i16 | exposure i8 | water u8
 
   // ---- WIND DRAFTS (kDraft* above; sim_draft.wgsl) ----
-  // The shelter volume's minimum corner, WORLD voxels, chunk-aligned and
-  // inside the window (support.cpp's box placement), and its gate. draftMode 0
-  // = no draft row is recorded and windAtQ is the ambient field exactly; bit 0
-  // = on; bit 1 = BURST (run the whole solve this tick: the box moved, or the
-  // gate / materials / buffer is new -- sim_draft.wgsl `args`).
-  int32_t draftOrigin[3] = {0, 0, 0};
-  uint32_t draftMode = 0;
+  // THE BOX LIST (audit DJ-1): slot k's shelter volume. xyz = its minimum
+  // corner, WORLD voxels, on the fixed lattice (support.h DraftBoxFor; NOT
+  // clamped to any machine's window), w = its flags: bit 0 = live; bit 1 =
+  // BURST (run the slot's whole solve this tick: its box moved, or the gate /
+  // materials / buffer is new -- sim_draft.wgsl `args`). COMPACTED: the live
+  // slots come first, so a reader stops at the first dead one. All w 0 = no
+  // draft row is recorded and windAtQ is the ambient field exactly.
+  int32_t draftBox[kDraftMaxBoxes][4] = {};
 
   // ---- HEAT UPDRAFTS + THE STACK EFFECT (wind phase 5; common.wgsl
   // windHeatQ, sim_draft.wgsl). Converted from the sim.windUpdraft* /
@@ -4046,11 +4086,10 @@ struct RenderParams {
   int32_t wfThermalK = 0;
   int32_t wfProf[kWindProfKnots] = {};
   uint32_t wfTerr[kWindTerrWords] = {};
-  // ---- WIND DRAFTS, the render copy: the origin of the LAST solved volume
-  // and whether its field is valid (Simulation::DraftValid). 0 = the render
-  // reads the ambient field, as the sim does at draftMode 0.
-  int32_t draftOrigin[3] = {0, 0, 0};
-  uint32_t draftMode = 0;
+  // ---- WIND DRAFTS, the render copy: per slot the origin of the LAST solved
+  // volume and in w whether its field is valid (Simulation::DraftValid). All w
+  // 0 = the render reads the ambient field, as the sim does with no live box.
+  int32_t draftBox[kDraftMaxBoxes][4] = {};
   // ---- CHUNK TICKETS, the render copy (docs/PLAN_chunk_tickets.md P4) -----
   // The LIVE ticket boxes (world chunks, lo corner; .w = the ticket index,
   // whose slot range the raymarch reads directly), compacted to the front;

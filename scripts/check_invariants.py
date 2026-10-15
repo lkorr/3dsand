@@ -1254,6 +1254,12 @@ def check_drafts():
         ("sim_draft", "DM_HEAT_CLOCK"): cpp("kDraftMetaHeatClock"),
         ("sim_draft", "DM_BOX_HOT"): cpp("kDraftMetaBoxHot"),
         ("sim_draft", "DM_HEAT_START"): cpp("kDraftMetaHeatStart"),
+        # THE BOX LIST (audit DJ-1): one slot of all the above per box, and
+        # the tick's words (args, stage lists) after the slots' meta blocks.
+        ("common", "DRAFT_MAX_BOXES"): cpp("kDraftMaxBoxes"),
+        ("common", "DRAFT_SLOT_WORDS"): phi_a + 24 * cells + 2 * coarse_cells + 4,
+        ("sim_draft", "DM_SLOT_WORDS"): cpp("kDraftMetaSlotWords"),
+        ("sim_draft", "DM_LIST"): cpp("kDraftMetaList"),
     }
     checked.append("wind drafts")
     for (where, name), v in want.items():

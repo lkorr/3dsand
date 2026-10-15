@@ -944,12 +944,12 @@ fn heatBlockAmbientRange(c : vec3<i32>) -> vec2<i32> {
   return vec2<i32>(lo, hi);
 }
 
-// World chunk wc is in the draft box (T.draftOrigin; DRAFT_N* cells of 4
-// voxels, so a chunk is 4 cells) or up to two chunks under it. False with the
-// volume off.
-fn heatInDraftReach(wc : vec3<i32>) -> bool {
-  if (T.draftMode == 0u) { return false; }
-  let v = wc - (T.draftOrigin >> vec3<u32>(CHUNK_SHIFT));
+// World chunk wc is in draft box `b` (one slot of T.draftBox; DRAFT_N* cells
+// of 4 voxels, so a chunk is 4 cells) or up to two chunks under it. False for
+// a dead slot.
+fn heatInDraftReach(wc : vec3<i32>, b : vec4<i32>) -> bool {
+  if ((b.w & 1) == 0) { return false; }
+  let v = wc - (b.xyz >> vec3<u32>(CHUNK_SHIFT));
   return v.x >= 0 && v.z >= 0 && v.y >= -2 &&
          v.x < DRAFT_NX / 4 && v.y < DRAFT_NY / 4 && v.z < DRAFT_NZ / 4;
 }
@@ -1027,11 +1027,14 @@ fn heatRelax(@builtin(workgroup_id) wg : vec3<u32>,
   }
   if (moved) { atomicAdd(&heatMeta[HM_RELAX_TICKS], 1u); }
   let freeing = !nonzero && (keep & 2u) == 0u;
-  // The draft volume's heat clock (heat.h kHmDraftHeatClock): this chunk's X
-  // moved or its page goes back, and it lies in the draft box or within the
-  // updraft's two-chunk look-down under it.
-  if ((moved || freeing) && heatInDraftReach(wc)) {
-    atomicAdd(&heatMeta[HM_DRAFT_HEAT_CLOCK], 1u);
+  // The draft volume's heat clocks (heat.h kHmDraftHeatClock + slot): this
+  // chunk's X moved or its page goes back, and it lies in that slot's box or
+  // within the updraft's two-chunk look-down under it. One clock per slot of
+  // the box list (audit DJ-1), so heat moving in one player's box re-solves
+  // that box and not the other. Unrolled over the two slots (world.h).
+  if (moved || freeing) {
+    if (heatInDraftReach(wc, T.draftBox[0])) { atomicAdd(&heatMeta[HM_DRAFT_HEAT_CLOCK], 1u); }
+    if (heatInDraftReach(wc, T.draftBox[1])) { atomicAdd(&heatMeta[HM_DRAFT_HEAT_CLOCK + 1u], 1u); }
   }
   if (freeing) {
     // Free: the page is all zero, so it goes back as it is.

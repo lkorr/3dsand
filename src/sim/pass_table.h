@@ -769,7 +769,9 @@ enum class Cond : uint8_t {
   // DraftAll: the volume moved, the gate or the materials changed, or the
   //   buffer is new -- re-mask every chunk of the box.
   // DraftDirty: otherwise, when the CA runs -- re-mask the active chunks
-  //   inside it (only an active chunk can have changed a voxel).
+  //   inside it (only an active chunk can have changed a voxel). Per slot of
+  //   the box list (audit DJ-1): records when some live slot is not
+  //   rebuilding, and skips the ones that are.
   // Draft: either of the above -- the args row, its copy and the two solve
   //   rows, which dispatch ZERO groups unless a mask moved. Nothing at all is
   //   recorded on a settled tick or at sim.draftMode 0.
@@ -1099,7 +1101,9 @@ struct RecordCtx {
   // Wind drafts (Simulation::SetDraft): the gate, and "re-mask the whole box
   // this tick" (it moved, the gate or the materials changed, or it is new).
   bool draftOn = false;
-  bool draftRebuild = false;
+  bool draftRebuild = false;   // ANY slot of the box list rebuilds (audit DJ-1)
+  // ...and some live slot does NOT, so the dirty re-mask row has work.
+  bool draftDirtySlots = false;
   // ...and "a solve may still be in flight": the CA ran (or the box rebuilt)
   // within the last 2 x kDraftStages ticks (Simulation::EncodeTick). Keeps
   // Cond::Draft's args + solve rows recorded on SETTLED ticks long enough

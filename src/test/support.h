@@ -175,6 +175,29 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 bool vizActive = false,
                 const IVec3* mirrorChunk = nullptr);
 
+// ---- THE DRAFT BOXES (audit DJ-1, 2026-10-14; DESIGN.md "Drafts") ----------
+// WHERE A PLAYER'S SHELTER BOX GOES: a pure function of the player's chunk on
+// a FIXED WORLD LATTICE -- snapped to EVEN chunks, so the box moves (and
+// re-solves) every 3.2 m of travel rather than every 1.6 m; the chunk sits 7-8
+// chunks from the box's -X/-Z faces and 3-4 above its floor (more box
+// overhead, a roof, an upper storey, than underfoot). NOT clamped to any
+// machine's window: the window is a per-machine input, and a box placed from
+// it was a box only that machine solved. A box cell outside the window is
+// masked as open air (sim_draft.wgsl cellMasks).
+DraftBox DraftBoxFor(IVec3 playerChunk);
+
+// THE TICK'S BOX LIST, as the authority hands it over: one box per player in
+// the session, in the op exchange's canonical order (TickAuthority's phase N:
+// the merged OpBatch::drafts when connected, this machine's own player alone
+// otherwise). Deduplicated KEEP-FIRST and capped at kDraftMaxBoxes here -- past
+// the cap the canonical first ones win, identically on every machine. Consumed
+// ONCE, by the SubmitTick of the same tick; a SubmitTick nobody handed a list
+// to (a harness ticking SubmitTick directly, worldgen) uses the one box
+// DraftBoxFor(playerChunk), which is what a single-player authority hands over
+// anyway. While replaying an op record, the recorded list wins (oprecord.h
+// RecordedDraftBoxes), so a replay reproduces a networked recording's boxes.
+void SetTickDraftBoxes(uint32_t tick, const DraftBox* boxes, size_t n);
+
 // Re-read the AUTHORED ENVIRONMENT from disk -- assets/biomes/*.json, the
 // world map named by world.mapLayer, assets/trees/* -- validate it the way
 // boot does, and push it to the GPU (Simulation::UploadEnvironment) and to
