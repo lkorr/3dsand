@@ -1083,6 +1083,11 @@ fn fogSkyK() -> f32 { return max(eyeSkyK(), gHitSky); }
 // which representation drew the pixel (0 near; far: 1 a plain cell, 0.75 a
 // feature card, 0.5 a refined sub-column), 1 if its material emits (a crystal
 // spire), and a far pixel's level / 8.
+// 19 = THE NEAR WATER SURFACE'S PER-COLUMN INPUTS (2026-10-15, ticket
+// 2026-10-14_18-13-07): waterDepthM / 3.4 m (the geometric probe's quantised
+// levels read as distinct greys), the fullness-gradient macro slope x 8 (a
+// one-eighth step reads 0.5), the sim flux's slope x 16. Anything that steps
+// from one column to the next on open water is one of these three.
 // 0 = off and const-folded away.
 const SEAM_DBG : u32 = 0u;
 var<private> gDbgLayer : f32 = 0.0;
@@ -4614,6 +4619,78 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
         }
       }
       var sat = false;
+      // ---- THE LIQUID RUN, TELESCOPED (2026-10-15, tickets 2026-10-14_22-55-53
+      // and 22-55-02: "looking out over the lake is 30 fps") ----
+      // Measured on the 22-55-53 lake (--render-budget at, 1080p): a water
+      // pixel here crosses ~146 cells before render.subVisibility's 10 m cap
+      // stops it, and the cells past the first 2 m alone were 5.7 of the
+      // frame's 17.5 ms (debug.perfExp arm capping the path at 2 m). Issuing
+      // the loads early (a lead DDA three cells ahead) made it 1.1 ms WORSE,
+      // so the loop is bound by its instruction count, not by load latency --
+      // and most of those instructions answered questions that do not change
+      // along a run of one liquid:
+      //   * the window test: the run never leaves its chunk, and a resident
+      //     chunk lies wholly inside the window;
+      //   * the chunk test and the address: the cell's position inside the
+      //     chunk (`loc`) and its word index (`li`) step with the DDA, one
+      //     add each, and leaving the chunk is one OR-and-mask of `loc`;
+      //   * the page-table sentinel test: a sentinel synthesises state 0..2
+      //     and a liquid run's key is state 7, so a sentinel chunk cannot
+      //     continue one (and is not entered);
+      //   * the media sums: every cell of the run adds its segment times the
+      //     SAME opacity and tint, so the run adds (tEnd - tStart) once at the
+      //     end -- the segments telescope -- and the 10 m cap is a t.
+      // The cells visited and the cell the run stops on are the old loop's;
+      // the sums differ from the per-cell ones by float rounding only.
+      // Measured (--render-budget at, 1080p, one process, exclusive): with
+      // the openness probe's one-load taps, 17.47 -> 15.05 ms.
+      // Gas runs keep the general loop below (their crossfade bound and the
+      // half-opacity latch are per cell).
+      if (!runGas) {
+        if ((cchPt & PT_SENTINEL_BIT) == 0u &&
+            all((cell >> vec3<u32>(CHUNK_SHIFT)) == cchC)) {
+          let base = cchPt * CHUNK_VOL;
+          var loc = cell & vec3<i32>(i32(CHUNK_MASK));
+          var li = (loc.z * i32(CHUNK) + loc.y) * i32(CHUNK) + loc.x;
+          let dli = vec3<i32>(stepv.x, stepv.y * i32(CHUNK), stepv.z * i32(CHUNK * CHUNK));
+          let tRun0 = tCur;
+          let path0 = out.liqPath;
+          let tCap = tRun0 + (LIQ_VIS_M / VOXEL_METERS - path0);
+          var n = 0u;
+          loop {
+            if (i + 1 >= maxSteps) { break; }
+            if ((voxels[base + u32(li)] & 0xFFFFu) != runKey) { break; }
+            i += 1;
+            n += 1u;
+            if (tMax.x < tMax.y && tMax.x < tMax.z) {
+              cell.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x; axis = 0;
+              loc.x += stepv.x; li += dli.x;
+            } else if (tMax.y < tMax.z) {
+              cell.y += stepv.y; tCur = tMax.y; tMax.y += tDelta.y; axis = 1;
+              loc.y += stepv.y; li += dli.y;
+            } else {
+              cell.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z; axis = 2;
+              loc.z += stepv.z; li += dli.z;
+            }
+            if (tCur > tCap) { sat = true; break; }
+            if (tCur >= tExit) { break; }
+            if (((loc.x | loc.y | loc.z) & ~i32(CHUNK_MASK)) != 0) { break; }
+          }
+          let seg = tCur - tRun0;
+          out.liqPath = path0 + seg;
+          let dT = seg * cellOp;
+          out.mediaTau += dT;
+          out.mediaTint += cellTint * dT;
+          if (RENDER_STATS && gRsOn) { gRsTraceSteps += n; }
+          rsAdd(RS_MEDIA, n);
+          if (sat) {
+            out.saturated = true;
+            out.t = tCur;
+          }
+        }
+        if (sat || tCur >= tExit) { break; }
+        continue;
+      }
       loop {
         if (i + 1 >= maxSteps) { break; }
         if (any(cell < wloI) || any(cell >= wloHi)) { break; }
@@ -9474,15 +9551,16 @@ fn rippleWaves() -> array<Ripple, RIPPLE_BANDS> {
 // THIS IS THE HIGHEST-LEVERAGE CONSTANT CHOICE IN THE RENDER TIER AND IT COSTS
 // NOTHING. If every octave scrolls at one speed the surface reads as a moving
 // texture. At `pondDepth` 26 (2.6 m) the spread across the bands worth
-// rendering is 4x — 0.88 m/s at 0.5 m against 3.48 m/s at 8 m. And because `h`
-// is the LOCAL depth the same term pays twice: approaching a bank at 0.3 m the
-// long swell slows to 1.70 m/s while the short chop barely changes, which is
-// shoaling. TUNE_WAVE_DISPERSION mixes between the two so the claim is an A/B
-// rather than an assertion.
+// rendering is 4x — 0.88 m/s at 0.5 m against 3.48 m/s at 8 m. The SPEED is
+// the deep-water one and the local `h` moves only the AMPLITUDE (Green's law):
+// a speed taken from the local depth is a phase seam on every depth contour
+// that grows with time (waveBands has the arithmetic, 2026-10-15).
+// TUNE_WAVE_DISPERSION mixes between the two so the claim is an A/B rather
+// than an assertion.
 //
 // WHAT THIS IS NOT. A sum of fixed-direction waves does not REFRACT: the
-// crests do not physically turn to run parallel to the shore, they only slow
-// and steepen there. Amplitude shoaling (Green's law) is included because it
+// crests do not physically turn to run parallel to the shore, they only
+// steepen there. Amplitude shoaling (Green's law) is included because it
 // falls out of the same term; directional refraction would need the wave
 // vectors to be functions of position, which is a different field.
 //
@@ -9758,10 +9836,24 @@ fn waveBands(pAdv : vec2f, t : f32, footM : f32, depthM : f32, shore : f32) -> v
     // TUNE_WAVE_DISPERSION = 0 reproduces the old look exactly and the knob is
     // a real before/after rather than a claim.
     let omegaFlat = w.speed * k;
-    // DISPERSED arm: the relation. tanh saturates, so a deep body costs the
-    // same as a shallow one and no branch is needed.
+    // DISPERSED arm: the relation at DEEP water, w^2 = g*k -- the spread of
+    // speeds ACROSS the bands, which is the read. NOT the local depth's
+    // tanh(k*h), and that is not an approximation to put back (ticket
+    // 2026-10-14_18-13-07, "a lighting separation line between water
+    // voxels"): the phase is k.p + w*t with t the seconds since launch, so a
+    // w that differs between two columns is a phase that differs by
+    // (delta w) x t -- unbounded, the trap the flow advection above names.
+    // waterDepthM is quantised (the geometric probe's 1, 2, 3, 5, 9, 17, 33
+    // cells), so every depth contour of the bed became a seam the swell
+    // jumped across: at 1.0 m against 1.8 m the 2.6 m band's w differs by
+    // 0.015 rad/s, 4.6 rad five minutes into a session. A stationary field
+    // cannot slow a wave over a shoal anyway -- at a fixed w the crests would
+    // have to crowd (k grows), which needs the integral of k along the ray,
+    // not a per-pixel value. What depth CAN change per pixel without a seam
+    // that grows with time is the AMPLITUDE (the shoaling gain below), so the
+    // local depth stays there.
     let th = tanh(clamp(k * depthM, 1e-3, 20.0));
-    let omegaDisp = sqrt(WAVE_G * k * th);
+    let omegaDisp = sqrt(WAVE_G * k);
     let omega = mix(omegaFlat, omegaDisp, TUNE_WAVE_DISPERSION) *
                 TUNE_RIPPLE_SPEED_SCALE;
     // SHOALING GAIN (Green's law, A ~ (c_deep/c)^(1/2)). Falls out of the same
@@ -9967,7 +10059,12 @@ fn waterOpenness(cell : vec3<i32>) -> f32 {
     let a = f32(i % 6) * 1.0472;   // 60 degrees apart
     let o = vec3<i32>(i32(round(cos(a) * f32(ring))), 0,
                       i32(round(sin(a) * f32(ring))));
-    if (liquidColumn(cell + o) > 0.05) { n += 1.0; }
+    // "Is there a liquid column here", which is exactly "is this cell
+    // liquid": liquidColumn adds the cells ABOVE only once this one is full,
+    // and a liquid cell holds at least an eighth -- so the walk up the column
+    // (two more voxel and material loads per tap on open water, 24 per pixel)
+    // could not change the answer.
+    if (liquidFullnessAt(cell + o) > 0.0) { n += 1.0; }
   }
   return smoothstep(TUNE_WATER_FETCH_LOW, TUNE_WATER_FETCH_HIGH, n / 12.0);
 }
@@ -10287,6 +10384,52 @@ fn waterGlint(n : vec3f, v : vec3f, hitP : vec3f, fres : f32) -> vec3f {
   let spec = pow(max(dot(n, hv), 0.0), power);
   let glintTint = normalize(keyLightColor() + vec3f(1e-4)) * 1.732;
   return glintTint * min(spec, 1.0) * TUNE_GLINT_INTENSITY * (0.25 + fres);
+}
+
+// ---- THE GLINT SEES ONLY A LIGHT THE SURFACE CAN SEE (ticket 2026-10-14_18-12-00)
+// The glint is the key light's MIRROR IMAGE, so it exists only where that light
+// reaches the water: a moon gone behind a ridge left its glitter path burning
+// on the lake below it, because the glint (alone of every key-lit term in the
+// renderer) had no occlusion at all. The water now asks the same chain a lit
+// face asks -- the shadow (near: the cache patch on the surface cell's top
+// face, far: the cascade's patch), the terrain-scale ridge (hzSunShade), the
+// cloud deck (cloudSunAt) -- for the sun by day and the moon by night alike
+// (keyLightDir is whichever is lighting the world).
+//
+// A shadow factor is not a visibility: the lit-face law LIFTS a cast shadow to
+// TUNE_SHADOW_LIFT (sky fill a diffuse face still gets) and a contact shadow
+// fades in from 0. A mirror image of the disc has no fill -- a blocked light
+// casts no glint at all -- so the factor is renormalised: the lift and below
+// is 0, full sun is 1, the penumbra and the LOD lift (lodShadowLift: a shadow
+// a few pixels wide) land between.
+//
+// GATED ON THE LOBE (WATER_GLINT_VIS_MIN): the lookups run only on the pixels
+// of the glitter path, so the cost is O(glint pixels), not O(water pixels),
+// and the patch reads register no shadow rays for the rest of the lake.
+const WATER_GLINT_VIS_MIN : f32 = 1.0 / 512.0;
+// `sh` = the receiver's shadow on the lit-face law, before the ridge: the
+// terrain-scale ridge (min, as the lit faces take it) and the cloud deck are
+// added here, so every water path asks the same three questions.
+fn glintVisOf(sh : f32, hitP : vec3f) -> f32 {
+  var v = smoothstep(TUNE_SHADOW_LIFT, 1.0, min(sh, hzSunShade(hitP)));
+  if (v > 0.0 && (R.weatherFlags & RWF_CLOUDS) != 0u) {
+    v *= cloudSunAt(hitP, keyLightDir(), &CL, &cloudMaps);
+  }
+  return v;
+}
+// A NEAR surface (a window cell): the cached shadow on the top face of `cell`,
+// the cell the surface lies in, exactly as a lit voxel top reads it.
+fn waterGlintVis(hitP : vec3f, cell : vec3<i32>, tSurf : f32) -> f32 {
+  if ((R.flags & 1u) == 0u) { return 1.0; }
+  var sh = 1.0;
+  if (tSurf * VOXEL_METERS > TUNE_SHADOW_MAX_DIST) {
+    sh = sunShadowFar(hitP, vec3f(0.0, 1.0, 0.0), tSurf);
+  } else if (SHADOW_CACHE) {
+    sh = shadowCached(hitP, cell, 1, -1.0, tSurf);
+  } else {
+    sh = sunShadowAt(hitP, vec3f(0.0, 1.0, 0.0), vec2f(0.0), tSurf, false);
+  }
+  return glintVisOf(lodShadowLift(sh, tSurf), hitP);
 }
 // The foam weight: shallow PATH (`pathM`, the ray's metres of water to the
 // bed), the analytic current's convergence and the sim's flux (`simFoam`,
@@ -11991,6 +12134,14 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   let upFacing = (axis == 1 && sgn < 0.0);
   var n = waterNormal(cell, mat, axis, sgn, hitP, upFacing);
   if (underwater) { n = -n; }   // seen from below, the interface faces down
+  if (SEAM_DBG == 19u && upFacing && !underwater) {
+    // The near surface's per-COLUMN inputs, the ones that can step from one
+    // column to the next (ticket 2026-10-14_18-13-07's staircase line).
+    let hx = liquidColumn(cell + vec3<i32>(-1, 0, 0)) - liquidColumn(cell + vec3<i32>(1, 0, 0));
+    let hz = liquidColumn(cell + vec3<i32>(0, 0, -1)) - liquidColumn(cell + vec3<i32>(0, 0, 1));
+    gDbg = vec4f(waterDepthM(cell) / 3.4, clamp(length(vec2f(hx, hz)) * 4.0, 0.0, 1.0),
+                 clamp(length(waveFluxAt(cell)) * TUNE_WAVE_SIM_SLOPE * 16.0, 0.0, 1.0), 1.0);
+  }
 
   let v = -rd;                                  // toward the eye
 
@@ -12133,8 +12284,13 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // underneath it.
     // Tinted by the key light so the track is amber at sunset and cold blue
     // under the moon, matching whatever is actually casting it.
-    // No sun or moon to glint where the sky cannot reach (THE MEDIUM'S SKY).
-    let gl = waterGlint(n, v, hitP, fres) * fogSkyK();
+    // No sun or moon to glint where the sky cannot reach (THE MEDIUM'S SKY),
+    // nor where the light itself is blocked (waterGlintVis: a moon behind
+    // the ridge, the sun behind the trees on the bank).
+    var gl = waterGlint(n, v, hitP, fres) * fogSkyK();
+    if (max(gl.r, max(gl.g, gl.b)) > WATER_GLINT_VIS_MIN) {
+      gl *= waterGlintVis(hitP, cell, tSurf);
+    }
     color += gl;
   }
 
@@ -14872,7 +15028,13 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   let kd = keyLightDir();
   let hv = normalize(kd + v);
   let spec = pow(max(dot(n, hv), 0.0), 380.0);
-  color += keyLightColor() * spec * TUNE_FLUID_SPECULAR * (3.0 * fres + 0.15);
+  var gl = keyLightColor() * spec * TUNE_FLUID_SPECULAR * (3.0 * fres + 0.15);
+  // Only where the light reaches the surface (waterGlintVis): a pour in the
+  // shade of the dam it broke through does not sparkle with sun.
+  if (max(gl.r, max(gl.g, gl.b)) > WATER_GLINT_VIS_MIN) {
+    gl *= waterGlintVis(hitP, vec3<i32>(floor(hitP)), fh.t);
+  }
+  color += gl;
 
   // ---- foam ----
   // TWO sources, and they answer different questions:
@@ -15147,8 +15309,11 @@ fn farWaterBed(level : u32, p : vec3f, rd : vec3f, tEye : f32, liq : u32) -> Far
 }
 
 // `bed` = farWaterBed's answer.
+// `level` / `cell`: the cascade cell the surface was hit in, for the glint's
+// shadow patch (waterGlintVis's far half); level 0 = no cascade cell (the
+// horizon), where the terrain-scale ridge and the cloud deck are the answer.
 fn shadeFarWater(hitP : vec3f, rd : vec3f, m : Material, nFace : vec3f,
-                 bed : FarBed) -> vec3f {
+                 bed : FarBed, level : u32, cell : vec3<i32>) -> vec3f {
   let up = nFace.y > 0.5;
   var n = nFace;
   if (up) {
@@ -15176,7 +15341,18 @@ fn shadeFarWater(hitP : vec3f, rd : vec3f, m : Material, nFace : vec3f,
   var color = mix(refracted, reflection, fres);
   dbgWater(fres, refracted, reflection, lit, depthM);
   if (up) {
-    let gl = waterGlint(n, v, hitP, fres) * fogSkyK();
+    // The glint's light must reach the surface (ticket 2026-10-14_18-12-00,
+    // waterGlintVis): the far patch on the cell's top face, as a far lit
+    // face reads it, then the ridge and the deck.
+    var gl = waterGlint(n, v, hitP, fres) * fogSkyK();
+    if (max(gl.r, max(gl.g, gl.b)) > WATER_GLINT_VIS_MIN && (R.flags & 1u) != 0u) {
+      var sh = 1.0;
+      if (level != 0u && SHADOW_CACHE && FAR_SHADOW_CACHE) {
+        sh = farShadowCached(level, cell, 1, -1.0, false, hitP);
+        if (sh < 1.0) { sh = lodShadowLift(sh, length(hitP - R.camPos)); }
+      }
+      gl *= glintVisOf(sh, hitP);
+    }
     color += gl;
     let foamA = waterFoam(hitP, depthM, 0.0);
     if (foamA > 0.0) {
@@ -16551,7 +16727,7 @@ fn shadeHorizon(hz : HzHit, rd : vec3f) -> vec3f {
   }
   if (wc > 0.0) {
     color = mix(color, shadeFarWater(hitP, rd, materials[horizon[HZ_H_MAT_WATER]], vec3f(0.0, 1.0, 0.0),
-                                         farBedDeep()), wc);
+                                         farBedDeep(), 0u, vec3<i32>(0)), wc);
   }
   return applyAerial(color, rd, hz.t);
 }
@@ -17435,7 +17611,8 @@ fn fs(in : VSOut) -> FSOut {
             nW = vec3f(0.0, 1.0, 0.0);
           }
         }
-        color = shadeFarWater(hitP, rd, m, nW, farWaterBed(flv, hitP + rd * 0.01, rd, far.t, far.mat));
+        color = shadeFarWater(hitP, rd, m, nW, farWaterBed(flv, hitP + rd * 0.01, rd, far.t, far.mat),
+                              flv, far.cell);
         if (SEAM_DBG >= 5u) { gDbgW0.x = 1.0; gDbgW0.y = far.t; }
       }
       if (SEAM_DBG == 8u) {

@@ -24461,15 +24461,25 @@ w^2 = g*k*tanh(k*h)      k = 2*pi/lambda, h = local depth
 
 If every octave scrolls at one speed the surface reads as a moving texture. At
 `pondDepth` 26 (2.6 m) the spread across the bands worth rendering is 4x -- 0.88
-m/s at 0.5 m against 3.48 m/s at 8 m. And because `h` is the LOCAL depth the same
-`tanh` pays a second time: approaching a bank at 0.3 m the long swell slows to
-1.70 m/s while the short chop barely changes, which is shoaling. Green's-law
-amplitude gain rides the same term. `render.waveDispersion` mixes between the two
-regimes, and at 0 it reproduces the per-band speeds this shader shipped with
+m/s at 0.5 m against 3.48 m/s at 8 m. `render.waveDispersion` mixes between the
+two regimes, and at 0 it reproduces the per-band speeds this shader shipped with
 exactly -- so the claim is an A/B rather than an assertion.
 
+**The PHASE speed is the deep-water one; the local depth moves only the
+AMPLITUDE** (2026-10-15, ticket 2026-10-14_18-13-07). The phase is `k.p + w*t`
+with `t` the seconds since launch, so a `w` taken from the local `tanh(k*h)`
+differs between two columns by a phase of `(delta w) * t` -- unbounded, and
+`waterDepthM` is quantised (1, 2, 3, 5, 9, 17, 33 cells), so every depth contour
+of a sea bed became a staircase seam the swell jumped across (1.0 m against 1.8
+m: 0.015 rad/s on the 2.6 m band, 4.6 rad five minutes in). A stationary field
+cannot slow a wave over a shoal: at a fixed `w` the crests would have to crowd,
+which needs the integral of `k` along the surface, not a per-pixel value. The
+Green's-law amplitude gain (`tanh` of the local depth) and the shore fade stay:
+a step in amplitude does not grow with time. `SEAM_DBG 19` in raymarch.wgsl shows
+the per-column inputs (depth level, fullness slope, sim flux) that can step.
+
 **What this is NOT.** A sum of fixed-direction waves does not REFRACT: the crests
-do not physically turn to run parallel to the shore, they only slow and steepen
+do not physically turn to run parallel to the shore, they only steepen
 there. Directional refraction would need the wave vectors to be functions of
 position, which is a different field.
 
