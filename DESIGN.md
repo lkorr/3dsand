@@ -18264,7 +18264,7 @@ where you hear from either (§12b, "The ears are on the character").
       blocker in the block") is not. Measured on the up fan: the any-of rule
       alone 0.60 -> 0.49.
     So the HEIGHTFIELD and its cards take the near walk's definition
-    marched over the cascade (`farGroundOpen`, shadow_resolve.wgsl) -- the
+    marched over the cascade (`farOpenRay` x5, shadow_resolve.wgsl; `farGroundOpen` until 2026-10-15) -- the
     face's own fan from just off the face (a card asks for the ground's up
     face), a side face's down-diagonal re-aimed 63 degrees up, real rays with
     the reach along the ray, the endpoint up-march, and the outer stretch as
@@ -18372,7 +18372,7 @@ where you hear from either (§12b, "The ears are on the character").
   - **The crowns' openness is the definition too, per patch (2026-10-14,
     same ticket; closes the crown-fan handoff).** A FEATURE face (crown,
     trunk, wall: a cell standing on its column's top) takes the near walk's
-    definition from just off the face (`farGroundOpenByte` .z: no ground start
+    definition from just off the face (`farGroundOpenPlan` fan 0, `farGroundOpenByte` .z until 2026-10-15: no ground start
     rules), in the patch word's bits 24..31; fs replaces the closed form with
     it as the ground does, and scales the closed-form bounce by it. The
     per-pixel cell-diagonal feature fan (`farSkyFan`) is gone from fs.
@@ -21022,6 +21022,48 @@ a still frame is unchanged apart from grass-sway noise.
 per pixel, whether NOTHING answered (the pixel shades as sun), the shadow
 value, and how a near pixel was answered (0.5 its own taps, 0.75 a fallback
 probe, 1 nothing); far pixels write (nothing answered, value, 0.25).
+
+**The rays are shared, and a far patch between refreshes is held**
+(2026-10-15, frame-perf flight package; `shadow_resolve.wgsl` THE HEAVY RAYS
+ARE SHARED, `raymarch.wgsl` `shadowSlotHeld`). On the 12-10-09 ticket flight
+(13.75 m/s) the resolve cost **2.2 ms a frame** (the `--frames` GPU table
+showed ~5.5 on "tick frames" only because the per-frame rows of the frames
+between ticks are summed into the next tick frame's row: the sim PassTimer is
+kicked on ticks), up from 0.26 on 2026-10-13. Attributed with a GPU counter
+build (per-class counts read back per frame) and stub arms: per frame ~41k
+requests -- 19.5k near (5.4k of them FRESH windows: 5.3k settled by the three
+probes, ~190 in a penumbra casting all sixteen) and 23k far (5.8k fresh, 7.2k
+openness fans). The sixteen-ray windows were 0.6 ms and the fans 0.44 ms, not
+because there were many but because a warp runs for its slowest lane and
+nearly every warp held one. Three changes, all render-only:
+
+1. **A far patch between its refreshes is not a free slot.** A far patch
+   stamps its slot only on its refresh frames (`farSlotRead`, one in four), so
+   `shadowSlotLive` ("asked this frame or last") called it free half the time
+   and any claim in its set took it -- ahead of the empty ways after it -- and
+   it came back fresh: the march, the fans, a gather, again. The claim now
+   also passes over a VALID slot stamped within one refresh period
+   (`shadowSlotHeld`). Fresh far patches 5.8k -> 3.6k a frame, fans 7.2k ->
+   4.5k.
+2. **The rays are the workgroup's.** The resolve workgroup is one warp; each
+   lane does its request's bookkeeping, but the rays go into a task list that
+   all 32 lanes cast from, in two rounds (centre + probes, then the thirteen a
+   penumbra needs), the answers back through workgroup memory. Every ray is
+   the ray the owner would have cast and every bit lands where it did; a fan's
+   five rays are counted in sixths, which gives the same byte as the float
+   sum for all 32 combinations.
+3. **One inlined copy of each march** (the riser foreground's march through
+   the patch march's call site, the fans' three calls through one task, the
+   gathers' constant loops as mask loops): the kernel binary was 197 KB.
+
+Measured (the ticket flight, `SANDVOX_GPU_TIMER_SERIAL=1`, one exe, asset
+trees A/B, exclusive, interleaved, n=2 each): `shadow_resolve` **2.19-2.20 ->
+1.16-1.20 ms a frame**; wall mean 13.4-13.5 -> 12.3 ms, p50 11.6-11.7 -> 9.7-9.8.
+By stage (n=1 each): the held slots 2.20 -> 2.05, the call sites and mask
+loops about -0.1, the shared rays about -0.7. Tried and dropped: sorting each 256-lane workgroup's requests by
+kind (+0.4 ms: a big workgroup holds its SM slot until its slowest warp
+ends); seeding a fresh window from its pool parent's (-0.05 ms, not worth an
+approximation).
 
 **What is NOT here.** Soft shadows on the raster body paths. `bodySunShadow`
 casts one ray per FRAGMENT with nowhere to accumulate, so a limb still takes a
