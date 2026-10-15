@@ -1192,8 +1192,10 @@ fn fineLast(@builtin(workgroup_id) wg : vec3<u32>,
 //
 // WHERE IT APPLIES: ONLY UNDER COVER. A cell is covered when a (nearly) closed
 // horizontal face lies anywhere above it in the box -- a roof, a floor above,
-// a cave ceiling. Momentum is carried only between covered cells, and an
-// uncovered cell keeps T = S exactly. That is the whole safety argument:
+// a cave ceiling -- and above its own content: a cell's own top face covers
+// it only if it holds no air (see jetPrep), so ground filling most of a
+// surface cell does not count as a roof over it. Momentum is carried only
+// between covered cells, and an uncovered cell keeps T = S exactly. That is the whole safety argument:
 //   * outdoors nothing changes (the stagnation in front of a wall, the lee
 //     behind it, the venturi in an alley are the projection's, as before);
 //   * a jet is SEEDED by the projection at the first covered cell it meets,
@@ -1273,18 +1275,35 @@ fn jetPrep(@builtin(workgroup_id) wg : vec3<u32>,
   let z = i32(col / 64u);
   let on = TUNE_DRAFT_JET != 0;
   let nCells = u32(DRAFT_NX * DRAFT_NY * DRAFT_NZ);
+  // `cov` = a roof face lies above THIS cell's own content. A cell's own +y
+  // face counts its own rows too (fineFaceK ORs both cells' masks), and the
+  // masks carry no height inside the cell, so ground filling 12-15 of a
+  // surface cell's 16 columns closes that cell's top face exactly as a roof
+  // in its upper rows would. Letting that face cover the cell itself made
+  // outdoor partly-filled ground cells ELIG under open sky -- the stagnation
+  // before a wall the cover rule exists to keep out. So a cell's own face
+  // covers the cells BELOW it, and covers the cell itself only when it holds
+  // no air (CLOSED: a full roof slab still rides the jet under it; a full
+  // ground slab outdoors has no carried neighbour and keeps S).
   var cov = false;
   for (var y = DRAFT_NY - 1; y >= 0; y--) {
     let g = vec3<i32>(x, y, z);
     let fi = fineIndex(g);
     let kb = jetK(g);
-    if (on && kGet(kb, 1u) <= JET_ROOF_K) { cov = true; }
+    let ownRoof = on && kGet(kb, 1u) <= JET_ROOF_K;
     let mk = vec2<u32>(draftField[2u * fi], draftField[2u * fi + 1u] & 0xFFFFu);
     let air = rowsOpen(mk) != 0u;
     let dm = min(min(min(x, DRAFT_NX - 1 - x), min(y, DRAFT_NY - 1 - y)),
                  min(z, DRAFT_NZ - 1 - z));
     var fl = 0u;
-    if (cov && dm >= 2) { fl = select(JET_CLOSED, JET_ELIG, air); }
+    if (dm >= 2) {
+      if (cov) {
+        fl = select(JET_CLOSED, JET_ELIG, air);
+      } else if (ownRoof && !air) {
+        fl = JET_CLOSED;
+      }
+    }
+    if (ownRoof) { cov = true; }
     let rw = DRAFT_FIELD_BASE + 3u * fi;
     let w0 = draftField[rw];
     let w1 = draftField[rw + 1u];
