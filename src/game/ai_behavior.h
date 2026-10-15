@@ -1131,6 +1131,12 @@ struct SelfView {
   // The body's length along its facing (world voxels): an orbit tighter than
   // this is a body chasing its own tail.
   float length = 0.0f;
+  // Which way this body turns more easily, -1..1 (+ = to its left, the way
+  // a + orbitSign lap circles): a swimmer short of a fin pivots on the one it
+  // still has (MobDef::SwimDef::FinDef; the left fin's share less the
+  // right's). 0 = either way alike, every body before 2026-10-15. A circling
+  // hunter's laps go its easy way round (DrawLap / Whim).
+  float turnBias = 0.0f;
   // ---- A BOW (2026-10-13, RangedTuning; game/mob_archery.h) ---------------
   // `ammo`: shots this body can loose now -- arrows in its kit for the bow in
   // its hand, 0 with no bow (Fact::Ammo). `drawing`: the string is back (the
@@ -1385,6 +1391,7 @@ struct Brain {
   uint32_t darts = 0;             // of the passes, darts begun
   uint32_t dartBites = 0;         // ...that threw a bite (in passBites too)
   uint32_t reversals = 0;         // laps that turned round
+  uint32_t easyWayFlips = 0;      // laps put onto the body's easy way round
   float orbitSwept = 0.0f;        // radians swept round the target circling
   float lastOrbitBearing = 0.0f;  // the target->body bearing last circling tick
   bool orbitBearingValid = false;

@@ -838,6 +838,41 @@ struct MobDef {
     // The undulation it swims with: a `slither` block in all but name, with
     // the clock phase (`beatHz` > 0). Optional; absent = a stiff body.
     SlitherDef wave;
+    // ---- THE FINS IT STEERS WITH (2026-10-15; DESIGN.md "Swimmers", "A body
+    // missing a fin"). Optional: absent = a body whose handling no wound can
+    // change, every swimmer before this. Sidecar `swim.fins`: the pectoral
+    // pair and the tail by LIMB NAME (resolved to indices at load), plus what
+    // losing each costs. A fin's share is its voxels left over its voxels at
+    // spawn (0 severed), so a ragged fin is part of a fin. What follows from
+    // the biology (Wilga & Lauder 2000: a shark's pectorals start pitch
+    // changes and take part in turns and braking; the tail is the thrust):
+    //   * PITCH: the pair's mean share scales the pitch rate and range.
+    //   * TURNING: a turn toward a side pivots on that side's fin; without it
+    //     the turn rate that way loses `turnLoss` (Steer's one-sided cap).
+    //   * BRAKING: one fin flared alone yaws the body toward it -- a hard stop
+    //     spins it out (`brakeSpin`) and loosens its steering while it lasts;
+    //     with neither the brake itself loses `brakeLoss`.
+    //   * TRIM: it lists toward a missing fin (`listRoll`, more when slow) and
+    //     a climb or dive rolls it (`pitchRoll`); with neither fin it cannot
+    //     hold its trim and sinks (`sink`, a share of gravity, less at speed).
+    //   * THE TAIL: thrust and acceleration lose `thrustLoss` with it.
+    //   * THE SHOCK: losing `thrashMin` of a fin (cumulative) throws it into
+    //     `thrash` seconds of flailing (scaled by the loss): it rolls, yaws
+    //     and lurches, and bites nothing until it is over.
+    struct FinDef {
+      bool present = false;
+      int left = -1, right = -1, tail = -1;   // limb indices; -1 = none
+      float turnLoss = 0.5f;
+      float brakeSpin = 2.5f;   // rad/s of yaw at full brake, one fin gone
+      float brakeLoss = 0.5f;
+      float listRoll = 0.3f;    // rad, one fin gone, at cruise
+      float pitchRoll = 0.15f;  // rad of roll per rad/s of pitch change
+      float sink = 0.25f;       // share of gravity, both fins gone, slow
+      float thrustLoss = 0.75f;
+      float thrash = 2.5f;      // seconds, a whole fin lost at once
+      float thrashMin = 0.15f;  // share of a fin
+    };
+    FinDef fins;
     // DERIVED at load: half the ROOT segment's width and height (world
     // voxels) -- the trunk's section without the fins, which is what a body
     // lying on its flank rests on (PoseInputs::bodyDrop).
@@ -3961,6 +3996,21 @@ class Mob {
   }
   uint32_t SwimBumps() const { return swimBumps_; }
   uint32_t SwimGlances() const { return swimGlances_; }
+  // THE FINS (MobDef::SwimDef::FinDef; MobSystem::SenseFins): each one's
+  // share left (0 = gone, 1 = whole; 1 on a body with no fins block), the
+  // flailing a fin's loss threw it into (seconds left, and 1..0 through it),
+  // how many times that happened, and the signed yaw braking on one fin has
+  // spun it through, summed (rad, + = left) -- the gate's readouts.
+  float FinLeft() const { return finL_; }
+  float FinRight() const { return finR_; }
+  float FinTail() const { return finTail_; }
+  float ThrashSeconds() const { return thrash_; }
+  float ThrashEnvelope() const {
+    return thrash_ > 0.0f && thrashLen_ > 0.0f ? std::min(1.0f, thrash_ / thrashLen_) : 0.0f;
+  }
+  uint32_t Thrashes() const { return thrashes_; }
+  float SpinYaw() const { return spinYaw_; }
+  float TurnVel() const { return turnVel_; }
   // The body's 3D forward: the heading tipped by the swim pitch. Equal to
   // Facing() for every body that does not swim.
   Vec3 Forward3() const {
@@ -6084,6 +6134,23 @@ class Mob {
   uint32_t nextFlopTick_ = 0;
   uint32_t flops_ = 0;
   float flopKick_ = 0.0f;        // 1 on a flop, decays: the pose's thrash
+  // THE FINS (MobSystem::SenseFins). `finRef*_` is what the shares were when
+  // the last flailing began (or grew back since): the loss that starts the
+  // next one is measured from there, so a fin nibbled away a little a tick
+  // still adds up to one. `brakeRatio_` is last tick's braking as a share of
+  // the body's full brake: how loose this tick's steering is. CPU-float
+  // gameplay state like the rest of the swimmer's; never saved, never hashed.
+  bool finsKnown_ = false;
+  float finL_ = 1.0f, finR_ = 1.0f, finTail_ = 1.0f;
+  float finRefL_ = 1.0f, finRefR_ = 1.0f, finRefTail_ = 1.0f;
+  float thrash_ = 0.0f, thrashLen_ = 0.0f, thrashPhase_ = 0.0f;
+  uint32_t thrashes_ = 0;
+  float brakeRatio_ = 0.0f;
+  float spinYaw_ = 0.0f;
+  // Steer's turn-rate multipliers toward the body's left (+ turnVel) and
+  // right: ONE-SHOT, set by the caller just before it calls Steer and put
+  // back to 1 by Steer, so no other caller can inherit them.
+  float turnCapL_ = 1.0f, turnCapR_ = 1.0f;
   // Diagnostics (rule 6): ticks the swim drive's feel found its line blocked
   // and steered off it; axis components the move resolve refused.
   uint32_t swimFelt_ = 0;
@@ -8301,6 +8368,10 @@ class MobSystem {
   // desired heading directly, leaving the turn-rate clamp fully in force. The
   // wander behaviour re-takes control as soon as it next wants to turn.
   void SetDesiredHeading(uint64_t mobId, float radians);
+  // ...and the drive (IntentOut::driveScale, x def.speed), for a body with no
+  // behaviour profile, which nothing else writes it on: a gate scripting a
+  // swimmer's runs and stops (shark-fins).
+  void SetMobDrive(uint64_t mobId, float driveScale);
   // ...AND THE ONE THAT ACTUALLY TURNS THE BODY, instantly. The scripted-
   // placement seam: "this creature is standing here facing that", which a
   // desired heading cannot express.
@@ -9147,6 +9218,9 @@ class MobSystem {
   void DriveSwim(Mob& mob, const MobDef& def, World& world, float dt);
   void TickStranded(Mob& mob, const MobDef& def, World& world,
                     const GroundSense& sense, uint32_t tick, float dt);
+  // SenseFins: each fin's share left (MobDef::SwimDef::FinDef), and the
+  // flailing a loss starts. A no-op on a def with no `swim.fins` block.
+  void SenseFins(Mob& mob, const MobDef& def);
   // Is this world cell rock to a swimming body (solid, or powder)? Unknown
   // (outside the mirror) is NOT rock -- a swimmer is never fenced in by the
   // edge of what the CPU can see, as a walker is not (ai_nav.h rule 1).

@@ -1723,6 +1723,338 @@ Status GateNaga(Ctx& c, std::string& detail) {
   return aOk && bOk ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// shark-fins: A SHARK SHORT OF A FIN SWIMS LIKE ONE (2026-10-15; MobDef::
+// SwimDef::FinDef, DESIGN.md "Swimmers", "A body missing a fin")
+// ---------------------------------------------------------------------------
+// One stamped pool. Two sharks, one after the other, each driven by the gate
+// (no behaviour profile, so nothing else writes its heading or drive) through
+// the same script: a hard turn each way, a run and a stop, a straight cruise,
+// and a slow circle. The first is whole: the CONTROL, and every one of its
+// numbers must say the fins block changed nothing. The second loses its left
+// pectoral (Sever) and must show:
+//   A. THE SHOCK: one flailing begun on the cut, rolling it hard, and no
+//      attack requested through it.
+//   B. THE ONE-SIDED TURN: its fastest turn toward the stump (left) at most
+//      sharkFinTurnRatioMax of its fastest the other way; the control's two
+//      within 5% of each other.
+//   C. THE SPIN-OUT: the stop after the run yaws it toward the fin it still
+//      has (right, - heading) by at least sharkFinSpinMin rad off the line it
+//      is steering for; the control's stop at most 0.05.
+//   D. THE LIST: cruising straight it rolls its stump side down by at least
+//      sharkFinListMin rad; the control within 0.02 of level.
+//   E. THE EASY WAY ROUND: given its profile back and a man to hunt, at least
+//      sharkFinOrbitShareMin of its circling ticks go round to the right.
+//   F. NO TRIM: with the right pectoral cut off too, the slow circle sinks it
+//      at least sharkFinSinkMin voxels; the control's held its depth within 1.
+// Thresholds in tests/baseline.json (sharkFin*). Ticks the world and
+// regenerates it on the way out.
+Status GateSharkFins(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  MobSystem& mobs = c.mobs;
+  const uint32_t mStone = MatIdOf(c, "stone"), mWater = MatIdOf(c, "water");
+  const int dShark = mobs.FindDef("shark"), dHuman = mobs.FindDef("human");
+  if (!mStone || !mWater || dShark < 0 || dHuman < 0) {
+    detail = "missing stone / water / shark / human";
+    return Status::Fail;
+  }
+  const MobDef& sd = mobs.Defs()[dShark];
+  int finL = -1, finR = -1;
+  for (size_t li = 0; li < sd.limbs.size(); li++) {
+    if ((int)li == sd.swim.fins.left) finL = (int)li;
+    if ((int)li == sd.swim.fins.right) finR = (int)li;
+  }
+  if (!sd.swim.fins.present || finL < 0 || finR < 0) {
+    detail = "the shark's sidecar has no swim.fins block naming both pectorals";
+    return Status::Fail;
+  }
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  mobs.Reset();
+  c.debris.Reset();
+
+  constexpr int R = 34, kDepth = 20;
+  IVec3 site{};
+  int hMin = 0, hMax = 0;
+  std::string siteWhy;
+  if (!PickDrySite(c, R, kDepth, site, hMin, hMax, siteWhy)) {
+    detail = "no dry, flat site: " + siteWhy;
+    return Status::Fail;
+  }
+  const int bedY = hMin - kDepth - 1;
+  const int waterTop = bedY + kDepth;
+  const int wallTop = hMax + 2;
+  std::vector<CellOp> pool;
+  for (int x = site.x - R; x <= site.x + R; x++)
+    for (int z = site.z - R; z <= site.z + R; z++)
+      for (int y = bedY - 1; y <= wallTop + 14; y++) {
+        const IVec3 cc{x, y, z};
+        if (!c.world.CellInWindow(cc)) continue;
+        const bool wall = std::abs(x - site.x) >= R - 1 || std::abs(z - site.z) >= R - 1;
+        uint32_t w = PackVoxNew(0u, 0u);
+        if (y <= bedY || (wall && y <= wallTop)) w = PackVoxNew(mStone, 0u);
+        else if (y <= waterTop && !wall) w = (mWater & 0xFFFu) | (7u << 12);
+        pool.push_back({World::SlotCellIndex(cc), w});
+      }
+  support::TickRig rig(c, 77000u, IVec3{site.x >> 4, waterTop >> 4, site.z >> 4});
+  for (size_t off = 0; off < pool.size(); off += 60000) {
+    const size_t n = std::min<size_t>(60000, pool.size() - off);
+    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) {
+      o.cells.assign(pool.begin() + (ptrdiff_t)off, pool.begin() + (ptrdiff_t)(off + n));
+    });
+  }
+  support::RunTicks(rig, 30);
+
+  const float midY = (float)(bedY + waterTop) * 0.5f + 1.0f;
+  const Vec3 poolC{(float)site.x + 0.5f, midY, (float)site.z + 0.5f};
+  auto spawnShark = [&](Vec3 centre, float heading) -> uint64_t {
+    const Vec3 ws = sd.worldSize;
+    const uint64_t id = mobs.Spawn(dShark, {ifloor(centre.x - ws.x * 0.5f),
+                                            ifloor(centre.y - ws.y * 0.5f),
+                                            ifloor(centre.z - ws.z * 0.5f)});
+    if (id) {
+      mobs.SetMobBehavior(id, "");
+      mobs.SetHeading(id, heading);
+      mobs.SetDesiredHeading(id, heading);
+      mobs.SetMobDrive(id, 0.0f);
+    }
+    return id;
+  };
+  // Moved (BlinkMob), turned, and let settle: ten ticks of no drive, so what
+  // it carried from the last step of the script has bled off.
+  auto place = [&](uint64_t id, Vec3 centre, float heading) {
+    if (const Mob* m = mobs.FindMobById(id))
+      mobs.BlinkMob(id, centre - m->Def()->worldSize * 0.5f);
+    mobs.SetHeading(id, heading);
+    mobs.SetDesiredHeading(id, heading);
+    mobs.SetMobDrive(id, 0.0f);
+    support::RunTicks(rig, 10);
+    mobs.SetHeading(id, heading);
+    mobs.SetDesiredHeading(id, heading);
+  };
+
+  // THE SCRIPT, the same for both sharks. Every reading is off the body.
+  struct Run {
+    float turnL = 0.0f, turnR = 0.0f;   // fastest yaw rate each way, rad/s
+    float spinDev = 0.0f;               // most-negative heading off the line
+    float spinDevAbs = 0.0f;            // largest |heading off the line|
+    float spinYaw = 0.0f;               // Mob::SpinYaw over the stop
+    float roll = 0.0f;                  // mean roll, straight cruise
+    float sink = 0.0f;                  // centre y lost over the slow circle
+    // Ticks the swim drive's feel turned it off the scripted line (Mob::
+    // SwimFelt) during the stop and the cruise: those two readings are only
+    // about the fins if the pool's walls never came into it (rule 6).
+    uint32_t feltStop = 0, feltCruise = 0;
+    bool ok = true;
+    std::string why;
+  };
+  auto script = [&](uint64_t id, bool doCircle) {
+    Run r;
+    auto mob = [&]() { return mobs.FindMobById(id); };
+    // 1. Hard turns: 45 ticks each way at a third of cruise, the wanted line
+    //    always 2 rad off the nose.
+    place(id, poolC, 0.0f);
+    mobs.SetMobDrive(id, 0.35f);
+    support::RunTicks(rig, 20);
+    for (int side = 0; side < 2; side++) {
+      for (int i = 0; i < 45; i++) {
+        const Mob* m = mob();
+        if (m == nullptr) break;
+        mobs.SetDesiredHeading(id, m->Heading() + (side == 0 ? 2.0f : -2.0f));
+        support::RunTicks(rig, 1);
+        if ((m = mob()) == nullptr) break;
+        if (side == 0) r.turnL = std::max(r.turnL, m->TurnVel());
+        else r.turnR = std::max(r.turnR, -m->TurnVel());
+      }
+    }
+    // 2. The run and the stop: from a corner down the diagonal, 14 ticks at
+    //    1.6x cruise, then 0.3x; the line held the whole time, and the heading
+    //    off it watched through the stop and 25 ticks after.
+    const float line = 0.78539816f;
+    place(id, poolC + Vec3{-22.0f, 0.0f, -22.0f}, line);
+    mobs.SetMobDrive(id, 0.0f);
+    support::RunTicks(rig, 15);
+    mobs.SetMobDrive(id, 1.6f);
+    for (int i = 0; i < 14; i++) {
+      mobs.SetDesiredHeading(id, line);
+      support::RunTicks(rig, 1);
+    }
+    const float yaw0 = mob() ? mob()->SpinYaw() : 0.0f;
+    const uint32_t felt0 = mob() ? mob()->SwimFelt() : 0u;
+    mobs.SetMobDrive(id, 0.3f);
+    for (int i = 0; i < 40; i++) {
+      mobs.SetDesiredHeading(id, line);
+      support::RunTicks(rig, 1);
+      if (const Mob* m = mob()) {
+        const float dev = std::remainder(m->Heading() - line, 6.2831853f);
+        r.spinDev = std::min(r.spinDev, dev);
+        r.spinDevAbs = std::max(r.spinDevAbs, std::fabs(dev));
+      }
+    }
+    r.spinYaw = (mob() ? mob()->SpinYaw() : 0.0f) - yaw0;
+    r.feltStop = (mob() ? mob()->SwimFelt() : 0u) - felt0;
+    // 3. Straight cruise up the pool at 0.6x cruise, the roll averaged over
+    //    its back half: 32 ticks carry it ~22 voxels, and its feel (7 + a
+    //    third of a second) never reaches the far wall from there.
+    place(id, poolC + Vec3{0.0f, 0.0f, -20.0f}, 0.0f);
+    const uint32_t felt1 = mob() ? mob()->SwimFelt() : 0u;
+    mobs.SetMobDrive(id, 0.6f);
+    float rollSum = 0.0f;
+    int rollN = 0;
+    for (int i = 0; i < 32; i++) {
+      mobs.SetDesiredHeading(id, 0.0f);
+      support::RunTicks(rig, 1);
+      if (i >= 16)
+        if (const Mob* m = mob()) {
+          rollSum += m->SwimRoll();
+          rollN++;
+        }
+    }
+    r.roll = rollN > 0 ? rollSum / (float)rollN : 0.0f;
+    r.feltCruise = (mob() ? mob()->SwimFelt() : 0u) - felt1;
+    // 4. The slow circle, level: four seconds at half cruise, a gentle
+    //    turn, depth asked of nobody (it holds what it has, or cannot).
+    if (doCircle) {
+      place(id, poolC + Vec3{0.0f, 4.0f, 0.0f}, 0.0f);
+      mobs.SetMobDrive(id, 0.5f);
+      support::RunTicks(rig, 5);
+      const float y0 = mob() ? CentreOf(*mob()).y : 0.0f;
+      for (int i = 0; i < 120; i++) {
+        if (const Mob* m = mob()) mobs.SetDesiredHeading(id, m->Heading() - 0.6f);
+        support::RunTicks(rig, 1);
+      }
+      r.sink = y0 - (mob() ? CentreOf(*mob()).y : y0);
+    }
+    if (mob() == nullptr || !mob()->Swimming()) {
+      r.ok = false;
+      r.why = "the shark is gone or out of the water";
+    }
+    return r;
+  };
+
+  // ======== THE CONTROL ======================================================
+  const uint64_t s0 = spawnShark(poolC, 0.0f);
+  support::RunTicks(rig, 20);
+  const Run ctl = script(s0, true);
+  const float ctlFins = mobs.FindMobById(s0) ? mobs.FindMobById(s0)->FinLeft() : 0.0f;
+  const uint32_t ctlThrash = mobs.FindMobById(s0) ? mobs.FindMobById(s0)->Thrashes() : 99u;
+  mobs.Reset();
+  c.debris.Reset();
+  support::RunTicks(rig, 2);
+
+  // ======== THE MAIMED SHARK =================================================
+  const uint64_t s1 = spawnShark(poolC, 0.0f);
+  mobs.SetMobDrive(s1, 0.6f);
+  support::RunTicks(rig, 20);
+  // A. THE SHOCK.
+  mobs.Sever(s1, finL);
+  float rollPeak = 0.0f, thrashSec = 0.0f;
+  uint32_t thrashes = 0;
+  int thrashTicks = 0;
+  for (int i = 0; i < 120; i++) {
+    support::RunTicks(rig, 1);
+    if (const Mob* m = mobs.FindMobById(s1)) {
+      if (i == 0) thrashSec = m->ThrashSeconds();
+      if (m->ThrashSeconds() > 0.0f) {
+        thrashTicks++;
+        rollPeak = std::max(rollPeak, std::fabs(m->SwimRoll()));
+      }
+      thrashes = m->Thrashes();
+    }
+  }
+  const float finLeft = mobs.FindMobById(s1) ? mobs.FindMobById(s1)->FinLeft() : 1.0f;
+  const bool aOk = thrashes == 1 && thrashSec >= 1.5f && rollPeak >= 0.5f && finLeft == 0.0f;
+  // B, C, D.
+  const Run mai = script(s1, false);
+  const float ratio = mai.turnR > 1e-3f ? mai.turnL / mai.turnR : 9.0f;
+  const float ctlRatio = ctl.turnR > 1e-3f ? ctl.turnL / ctl.turnR : 9.0f;
+  const bool bOk = ratio <= (float)BaselineNumber("sharkFinTurnRatioMax", 0.65) &&
+                   std::fabs(ctlRatio - 1.0f) <= 0.05f;
+  const bool cOk = -mai.spinDev >= (float)BaselineNumber("sharkFinSpinMin", 0.3) &&
+                   mai.spinYaw < 0.0f && ctl.spinDevAbs <= 0.05f && ctl.spinYaw == 0.0f &&
+                   mai.feltStop == 0 && ctl.feltStop == 0;
+  const bool dOk = -mai.roll >= (float)BaselineNumber("sharkFinListMin", 0.15) &&
+                   std::fabs(ctl.roll) <= 0.02f && mai.feltCruise == 0 && ctl.feltCruise == 0;
+  // E. THE EASY WAY ROUND: its profile back, a man standing in the middle.
+  const Vec3 vs = mobs.Defs()[dHuman].worldSize;
+  const uint64_t victim = mobs.Spawn(dHuman, {ifloor(poolC.x - vs.x * 0.5f), bedY + 1,
+                                              ifloor(poolC.z - vs.z * 0.5f)});
+  if (victim) mobs.SetMobBehavior(victim, "dummy");
+  place(s1, poolC + Vec3{22.0f, 0.0f, 0.0f}, 0.0f);
+  mobs.SetMobBehavior(s1, "shark");
+  const int kOrbit = (int)BaselineNumber("sharkFinOrbitTicks", 600);
+  uint32_t orbitR = 0, orbitL = 0, attacksInThrash = 0;
+  for (int i = 0; i < kOrbit; i++) {
+    support::RunTicks(rig, 1);
+    const ai::Brain* b = mobs.MobBrain(s1);
+    if (b == nullptr) break;
+    if (b->intent == ai::Intent::Orbit) (b->orbitSign < 0 ? orbitR : orbitL)++;
+  }
+  const ai::Brain* b1 = mobs.MobBrain(s1);
+  const uint32_t flips = b1 ? b1->easyWayFlips : 0u, passes = b1 ? b1->passes : 0u;
+  const float orbitShare =
+      orbitR + orbitL > 0 ? (float)orbitR / (float)(orbitR + orbitL) : 0.0f;
+  const bool eOk = orbitR + orbitL >= 60 &&
+                   orbitShare >= (float)BaselineNumber("sharkFinOrbitShareMin", 0.85);
+  // F. NO TRIM: the other pectoral too -- cut mid-hunt, so the second shock
+  //    is watched for a bite (A's last claim: none while it flails) -- then
+  //    its profile gone again and the man with it, and the slow circle.
+  mobs.Sever(s1, finR);
+  for (int i = 0; i < 100; i++) {
+    support::RunTicks(rig, 1);
+    if (const Mob* m = mobs.FindMobById(s1))
+      if (i > 0 && m->ThrashSeconds() > 0.0f && mobs.MobStroke(s1) &&
+          mobs.MobStroke(s1)->Active())
+        attacksInThrash++;
+  }
+  mobs.SetMobBehavior(s1, "");
+  if (victim) mobs.RemoveMob(victim);
+  Run fin2;
+  {
+    place(s1, poolC + Vec3{0.0f, 4.0f, 0.0f}, 0.0f);
+    mobs.SetMobDrive(s1, 0.5f);
+    support::RunTicks(rig, 5);
+    const float y0 = mobs.FindMobById(s1) ? CentreOf(*mobs.FindMobById(s1)).y : 0.0f;
+    for (int i = 0; i < 120; i++) {
+      if (const Mob* m = mobs.FindMobById(s1)) mobs.SetDesiredHeading(s1, m->Heading() - 0.6f);
+      support::RunTicks(rig, 1);
+    }
+    fin2.sink = y0 - (mobs.FindMobById(s1) ? CentreOf(*mobs.FindMobById(s1)).y : y0);
+  }
+  const bool fOk = fin2.sink >= (float)BaselineNumber("sharkFinSinkMin", 4.0) &&
+                   std::fabs(ctl.sink) <= 1.0f;
+  const bool ctlOk = ctl.ok && ctlFins == 1.0f && ctlThrash == 0;
+
+  mobs.Reset();
+  c.debris.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  RecordObserved("sharkFinTurnRatio", (double)ratio);
+  RecordObserved("sharkFinSpin", (double)-mai.spinDev);
+  RecordObserved("sharkFinList", (double)-mai.roll);
+  RecordObserved("sharkFinOrbitShare", (double)orbitShare);
+  RecordObserved("sharkFinSink", (double)fin2.sink);
+  detail = Format(
+      "control %s: fins %.2f, %u thrashes, turn L/R %.2f/%.2f rad/s, stop off-line %.3f "
+      "(spin %.3f, felt %u), roll %.3f (felt %u), slow circle sank %.2f%s | A shock %s: %u "
+      "thrash (%.2f s, %d ticks), roll peak %.2f, left fin %.2f | B turn %s: L/R %.2f/%.2f = "
+      "%.2f | C spin-out %s: off-line %.2f toward the good fin (spin %.2f, felt %u) | D list "
+      "%s: roll %.3f (felt %u) | "
+      "E easy way %s: %u ticks round right, %u left (%.2f), %u laps flipped, %u passes | "
+      "F no trim %s: sank %.2f; %u stroke ticks while flailing%s",
+      ctlOk ? "ok" : "FAIL", ctlFins, ctlThrash, ctl.turnL, ctl.turnR, ctl.spinDevAbs,
+      ctl.spinYaw, ctl.feltStop, ctl.roll, ctl.feltCruise, ctl.sink,
+      ctl.ok ? "" : (" -- " + ctl.why).c_str(), aOk ? "PASS" : "FAIL", thrashes, thrashSec,
+      thrashTicks, rollPeak, finLeft, bOk ? "PASS" : "FAIL", mai.turnL, mai.turnR, ratio,
+      cOk ? "PASS" : "FAIL", -mai.spinDev, mai.spinYaw, mai.feltStop, dOk ? "PASS" : "FAIL",
+      mai.roll, mai.feltCruise, eOk ? "PASS" : "FAIL",
+      orbitR, orbitL, orbitShare, flips, passes, fOk ? "PASS" : "FAIL", fin2.sink,
+      attacksInThrash, mai.ok ? "" : (" -- " + mai.why).c_str());
+  return ctlOk && aOk && bOk && cOk && dOk && eOk && fOk && mai.ok && attacksInThrash == 0
+             ? Status::Pass
+             : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& AquaticGates() {
@@ -1734,6 +2066,9 @@ const std::vector<Gate>& AquaticGates() {
       {"npc-swim", "mob", {}, false, GateNpcSwim, false},
       // An amputation under water bleeds on, at underwaterBleedRate x dry.
       {"stump-underwater", "mob", {}, false, GateStumpUnderwater, false},
+      // A shark short of a fin: the shock, the one-sided turn, the spin-out,
+      // the list, the easy way round, and no trim without either pectoral.
+      {"shark-fins", "mob", {}, false, GateSharkFins, false},
       // A person on a serpent's tail: slithers upright with the trail on the
       // ground, swims, and its tail beats in its own plane (yaw / pitch).
       {"naga", "mob", {}, false, GateNaga, false},

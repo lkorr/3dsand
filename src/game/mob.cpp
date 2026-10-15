@@ -2008,6 +2008,36 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
       num("flopReach", sw.flopReach, 0.0f, 24.0f);
       if (wj.contains("wave") && wj["wave"].is_object())
         parseWave(wj["wave"], "swim.wave", sw.wave);
+      // THE FINS (SwimDef::FinDef): limbs by name; a name that is not a limb
+      // of this rig is reported and left unset, never guessed.
+      if (wj.contains("fins") && wj["fins"].is_object()) {
+        const json& fj = wj["fins"];
+        MobDef::SwimDef::FinDef& fd = sw.fins;
+        fd.present = true;
+        auto limb = [&](const char* k, int& out) {
+          const std::string n = fj.value(k, std::string());
+          if (n.empty()) return;
+          for (size_t i = 0; i < def.limbs.size(); i++)
+            if (def.limbs[i].name == n) out = (int)i;
+          if (out < 0)
+            log += jp + ": swim.fins." + k + " names \"" + n + "\", which is not a limb\n";
+        };
+        limb("left", fd.left);
+        limb("right", fd.right);
+        limb("tail", fd.tail);
+        auto fnum = [&](const char* k, float& v, float lo, float hi) {
+          v = std::clamp(fj.value(k, v), lo, hi);
+        };
+        fnum("turnLoss", fd.turnLoss, 0.0f, 0.95f);
+        fnum("brakeSpin", fd.brakeSpin, 0.0f, 20.0f);
+        fnum("brakeLoss", fd.brakeLoss, 0.0f, 0.95f);
+        fnum("listRoll", fd.listRoll, 0.0f, 1.2f);
+        fnum("pitchRoll", fd.pitchRoll, 0.0f, 2.0f);
+        fnum("sink", fd.sink, 0.0f, 2.0f);
+        fnum("thrustLoss", fd.thrustLoss, 0.0f, 0.95f);
+        fnum("thrash", fd.thrash, 0.0f, 30.0f);
+        fnum("thrashMin", fd.thrashMin, 0.01f, 3.0f);
+      }
       // The trunk's own section, fins excluded (SwimDef::trunkHalfW): the
       // sidecar's when it states one (gen_fish.mjs writes the profile's
       // widest section), else the root segment's box -- which includes any
@@ -8227,6 +8257,9 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
                                   : Vec3{mob.anim_.velocity.x, 0.0f,
                                          mob.anim_.velocity.z};
     self.length = def.worldSize.z;
+    // ...and which way it turns more easily: a swimmer short of a fin
+    // (MobDef::SwimDef::FinDef) circles toward the one it still has.
+    if (self.volumetric && def.swim.fins.present) self.turnBias = mob.finL_ - mob.finR_;
     // What is in its hand: a held item arms it AND lets it guard (the parry
     // test is blade on blade — MobSystem::FindParry skips anything unarmed).
     self.armed = !mob.HeldItem().empty();
@@ -8314,6 +8347,8 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
       // A STAGGERED BODY (Mob::StaggerNow) neither swings, casts nor looses:
       // it is busy holding its head, or its belly.
       if (mob.StaggerBlocksAttack()) out.attack = out.cast = out.shoot = false;
+      // A SWIMMER FLAILING AT A LOST FIN (MobSystem::SenseFins) bites nothing.
+      if (mob.thrash_ > 0.0f) out.attack = false;
       if (out.attack && attacks_.size() < kMaxMobs * 2)
         attacks_.push_back(std::move(out.request));
       // D4: a cast request (game/demon_cast.h drains it after this phase).
@@ -8408,12 +8443,17 @@ float MobSystem::Steer(Mob& mob, const MobDef& def, float dt) {
   // outpaces it -- the counter to standing behind one.
   const float rateCap = mob.ShieldTurnRate(
       lo.turnRate * (1.0f + (lo.turnRateMoving - 1.0f) * speedFrac));
+  // ...AND MAY BE SLOWER ONE WAY THAN THE OTHER: a swimmer that has lost the
+  // fin a turn pivots on (MobDef::SwimDef::FinDef). One-shot multipliers the
+  // caller set for this call only; + turnVel is a turn to the left.
+  const float capL = rateCap * mob.turnCapL_, capR = rateCap * mob.turnCapR_;
+  mob.turnCapL_ = mob.turnCapR_ = 1.0f;
 
   if (rateCap <= 0.0f) {
     mob.turnVel_ = 0;
   } else if (lo.turnAccel <= 0.0f) {
     // No ramp: step straight to the capped rate.
-    mob.turnVel_ = std::clamp(err / std::max(dt, 1e-4f), -rateCap, rateCap);
+    mob.turnVel_ = std::clamp(err / std::max(dt, 1e-4f), -capR, capL);
   } else {
     // Ramp toward the rate that would arrive on target, but never past the cap.
     // The sqrt term is a critically-damped arrival: it is the fastest rate from
@@ -8422,7 +8462,7 @@ float MobSystem::Steer(Mob& mob, const MobDef& def, float dt) {
     // around it.
     const float arrive =
         std::sqrt(2.0f * lo.turnAccel * std::abs(err)) * (err < 0 ? -1.0f : 1.0f);
-    const float want = std::clamp(arrive, -rateCap, rateCap);
+    const float want = std::clamp(arrive, -capR, capL);
     const float dv = lo.turnAccel * dt;
     mob.turnVel_ += std::clamp(want - mob.turnVel_, -dv, dv);
   }
@@ -9224,7 +9264,9 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
                                 : (def.swim.trunkHalfH - def.swim.trunkHalfW) *
                                       std::fabs(std::sin(mob.roll_));
     in.swimWave = true;
-    in.waveKick = mob.flopKick_;
+    // ...whipped by a flop on the bank, or by the flailing a lost fin threw
+    // it into (Mob::ThrashEnvelope).
+    in.waveKick = std::max(mob.flopKick_, mob.ThrashEnvelope());
   }
   // ---- A WALKER SWIMMING (game/mob_afloat.cpp) -----------------------------
   // The player's swim family (Mob::PosePipeline): the driver says it swims
@@ -30034,6 +30076,14 @@ void MobSystem::SetHeading(uint64_t mobId, float radians) {
     if (mob.id_ == mobId) {
       mob.heading_ = radians;
       mob.desiredHeading_ = radians;
+      return;
+    }
+}
+
+void MobSystem::SetMobDrive(uint64_t mobId, float driveScale) {
+  for (Mob& mob : mobs_)
+    if (mob.id_ == mobId) {
+      mob.driveScale_ = driveScale;
       return;
     }
 }

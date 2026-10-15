@@ -1268,6 +1268,10 @@ const char* const kOrder[] = {
     // the same stump on the dry bank. Ticks the world and regenerates it on
     // the way out.
     "stump-underwater",
+    // A shark loses a pectoral, then the other (MobDef::SwimDef::FinDef):
+    // scripted turns, a stop, a cruise, a hunt and a slow circle against a
+    // whole control. Ticks the world and regenerates it on the way out.
+    "shark-fins",
     // The player's corpse is a dead Mob too (P2b): moved into mobs_ at the
     // PreTick after the death, whole respawn, sleeps, a cut reaches it. Ticks
     // the world and regenerates it on the way out, as corpse-sleep does.
