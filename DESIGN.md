@@ -11315,7 +11315,13 @@ a detached speckle becomes a floating scrap of flesh in the world.
 - **Player**: capsule controller (Jolt character), colliding against on-demand
   localized marching-cubes terrain patches. Voxel-type queries drive traversal:
   liquids slow movement and, **once the body is three-quarters under**
-  (`kSwimSubmersion`), swap jump→swim. Shallower than that is WADING, which is
+  (`kSwimSubmersion`) **in swimming water** (`Player::swimWater`: the column
+  at least neck deep for a standing figure, `kSwimNeckFrac` 0.85, held until it
+  is shallower than the chest, `kSwimWadeFrac` 0.70; 2026-10-14), swap
+  jump→swim. The implied tread that holds an afloat body at the surface, the
+  surface dive and the avatar's swim pose ask the same flag, so a body that
+  drops into water it could stand in sinks to the bed and wades (gate
+  `player-swim-entry`). Shallower than that is WADING, which is
   a walking state: footing, jump, step-up and the ground snap all survive, and
   only the submersion-scaled drag/buoyancy/wade-speed apply. `Player::swimming`
   is that distinction; `inLiquid` means only "some part of the body is wet" and
@@ -16322,7 +16328,7 @@ The inputs are the facts only a driver has:
 | look target | the camera's head-look goal (`SetLook`) | none (`ApplyStrikeAim` looks at `aimLook_`) |
 | aim target | `strikeAim` on (a no-op without an Aim effector) | `strikeAim` on |
 | extras | held crouch, ledge-hang lip | `chaseWant` |
-| `swim` | the water carries the body: `Player::swimming`, or wet with no footing (Space at the surface floats the box only 0.2..0.4 under); not fly / hanging / mantling | `swimming_` on a walker with the swim clips (`game/mob_afloat.cpp`, below); `velocity` = `swimVel_`, `height` `FromDriver`, no stride clips, no chase stance, and UNDER the surface `swimAim` = the travel's direction |
+| `swim` | the water carries the body: `Player::swimming`, or wet with no footing in swimming water (`Player::swimWater`; Space at the surface floats the box only 0.2..0.4 under); not fly / hanging / mantling | `swimming_` on a walker with the swim clips (`game/mob_afloat.cpp`, below); `velocity` = `swimVel_`, `height` `FromDriver`, no stride clips, no chase stance, and UNDER the surface `swimAim` = the travel's direction |
 
 **The swim family (2026-10-09).** While `swim` is set the pipeline plays seven
 library clips at once (`assets/anims`: `tread`, `swim`, `swim_back`,

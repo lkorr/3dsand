@@ -602,11 +602,18 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // So the pose lets go only after the condition has been false for
     // kSwimExitGrace while the body is still wet; leaving the water, flying,
     // grabbing a ledge or climbing out ends it at once.
+    //
+    // ONLY IN SWIMMING WATER (Player::swimWater: the column neck deep, owner
+    // 2026-10-14). "Wet with no floor" alone also held for a body DROPPING
+    // into waist-deep water off a bank -- it is off the ground and its feet
+    // are wet for the frames of the drop -- and the stroke flopped it face
+    // down in the shallows. A wader is never afloat in water it can stand in.
     const bool swimHard =
         player.inLiquid && !player.fly && !player.hanging && player.mantleTimer <= 0.0f;
     const bool swimCond =
         swimHard && (player.swimming ||
-                     (!player.grounded && player.submersion >= kSwimPoseSubmersion));
+                     (!player.grounded && player.swimWater &&
+                      player.submersion >= kSwimPoseSubmersion));
     if (swimCond)
       swimHold_ = kSwimExitGrace;
     else

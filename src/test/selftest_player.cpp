@@ -464,6 +464,112 @@ Status GatePlayerCurrent(Ctx&, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// player-swim-entry — THE WATER CARRIES A BODY ONLY WHERE IT IS NECK DEEP
+// (ticket 2026-10-14_18-18-29, owner: "entering shallow water from certain
+// elevations can look extremely goofy ... swimming animation should only start
+// if floating fully in water at the neck").
+//
+// The bug: a body that DROPPED into water it could stand in -- off a bank, a
+// jump -- was afloat (wet, no footing) for the frames of the drop, the implied
+// tread caught it at the surface float, and it never touched the bed again:
+// it swam, and the avatar played the stroke, in waist-deep water. Walking in
+// from the same bank at bed level never showed it, which is why it was "from
+// certain elevations".
+//
+// One synthetic pool (the lambda fixture, as player-waterjump), bed at y=100,
+// the body dropped from six voxels over the surface with no input:
+//   WAIST    9 deep  (0.53 of the 1.7 m figure): ends standing on the bed,
+//                     wading -- grounded, not swimming, not swimWater.
+//   SHOULDER 13 deep (0.76): the same -- shoulder deep is still a wade (the
+//                     old 0.75-sample swim line took the footing here).
+//   ...and WALKING OFF THE BANK into the waist-deep pool, W held: the same.
+//   NECK     16 deep (0.94): swimWater, afloat at the surface (the tread).
+//   HELD     ...then the bed under the floating body rises to 13 deep: still
+//                     swimWater (it lets go below the chest, not the neck);
+//                     and to 10 deep: let go, and the body sinks to the bed.
+// Also asserted per tick on the shallow arms: not afloat-and-held -- no tick
+// of the last two seconds (of five) in liquid without footing.
+Status GatePlayerSwimEntry(Ctx&, std::string& detail) {
+  const int kBed = 100;
+  const float dt = 1.0f / 30.0f;
+  const Vec3 fwd{1, 0, 0}, right{0, 0, 1};
+  struct Arm {
+    bool grounded = false, swimming = false, swimWater = false, inLiquid = false;
+    float sole = 0.0f, depth = 0.0f;
+    int afloatTicks = 0;   // wet with no footing, in the run's last 60 ticks
+  };
+  // bedAt: the bed's top (cells below it are solid); top: the waterline.
+  // x >= bankX is a bank whose top is `bankTop` (walk-off arm only).
+  auto run = [&](int bedAt, int top, Vec3 start, const TickInput& in, int ticks,
+                 Player* keep = nullptr, int bankX = 1 << 20, int bankTop = 0) {
+    Player::KindFn fn = [=](IVec3 c) {
+      if (c.x >= bankX) return c.y < bankTop ? CellKind::Solid : CellKind::Air;
+      if (c.y < bedAt) return CellKind::Solid;
+      return c.y < top ? CellKind::Liquid : CellKind::Air;
+    };
+    Player local;
+    Player& p = keep ? *keep : local;
+    if (!keep) {
+      p.fly = false;
+      p.pos = start;
+    }
+    Arm a;
+    for (int i = 0; i < ticks; i++) {
+      p.Update(dt, in, fwd, right, fwd, fn);
+      if (i >= ticks - 60 && p.inLiquid && !p.grounded) a.afloatTicks++;
+    }
+    a.grounded = p.grounded;
+    a.swimming = p.swimming;
+    a.swimWater = p.swimWater;
+    a.inLiquid = p.inLiquid;
+    a.sole = p.pos.y - Player::kHalfY;
+    a.depth = p.waterDepth;
+    return a;
+  };
+  auto dropAt = [&](int top) {
+    return Vec3{120.5f, (float)top + 6.0f + Player::kHalfY, 140.5f};
+  };
+  const TickInput idle{};
+  const Arm waist = run(kBed, kBed + 9, dropAt(kBed + 9), idle, 150);
+  const Arm shoulder = run(kBed, kBed + 13, dropAt(kBed + 13), idle, 150);
+  // Off a bank whose top is 4 over the water, walking toward -x into the pool.
+  TickInput walk;
+  walk.forward = -1.0f;
+  const Arm bank = run(kBed, kBed + 9,
+                       Vec3{141.5f, (float)(kBed + 13) + Player::kHalfY, 140.5f},
+                       walk, 150, nullptr, 140, kBed + 13);
+  auto wading = [&](const Arm& a) {
+    return a.inLiquid && a.grounded && !a.swimming && !a.swimWater &&
+           std::fabs(a.sole - (float)kBed) < 0.6f && a.afloatTicks == 0;
+  };
+  Player deep;
+  deep.fly = false;
+  deep.pos = dropAt(kBed + 16);
+  const Arm neck = run(kBed, kBed + 16, Vec3{}, idle, 150, &deep);
+  // The bed rises under the floater; the surface stays where it was.
+  const Arm held = run(kBed + 3, kBed + 16, Vec3{}, idle, 30, &deep);
+  const Arm gone = run(kBed + 6, kBed + 16, Vec3{}, idle, 150, &deep);
+  const bool neckOk = neck.inLiquid && neck.swimWater && !neck.grounded &&
+                      neck.sole > (float)kBed + 3.0f;
+  const bool heldOk = held.swimWater && !held.grounded;
+  const bool goneOk = !gone.swimWater && gone.grounded && !gone.swimming &&
+                      std::fabs(gone.sole - (float)(kBed + 6)) < 0.6f;
+  const bool ok = wading(waist) && wading(shoulder) && wading(bank) && neckOk &&
+                  heldOk && goneOk;
+  auto line = [](const char* n, const Arm& a) {
+    return Format("%s: ground %d swim %d swimWater %d depth %.0f sole %.2f "
+                  "afloat-ticks %d",
+                  n, a.grounded ? 1 : 0, a.swimming ? 1 : 0, a.swimWater ? 1 : 0,
+                  a.depth, a.sole, a.afloatTicks);
+  };
+  detail = line("waist", waist) + " | " + line("shoulder", shoulder) + " | " +
+           line("bank walk-off", bank) + " | " + line("neck", neck) + " | " +
+           line("bed to 13", held) + " | " + line("bed to 10", gone);
+  std::printf("player swim-entry: %s (%s)\n", ok ? "PASS" : "FAIL",
+              detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- player-swim-floor -------------------------------------------------
 //
 // A swimmer pressed into the lake bed keeps going and keeps its heading
@@ -3919,6 +4025,7 @@ const std::vector<Gate>& PlayerGates() {
       {"player-waterjump", "player", {}, false, GatePlayerWaterJump},
       {"player-swim-floor", "player", {}, false, GatePlayerSwimFloor},
       {"player-current", "player", {}, false, GatePlayerCurrent},
+      {"player-swim-entry", "player", {}, false, GatePlayerSwimEntry},
       {"player-ledgegrab", "player", {}, false, GatePlayerLedgeGrab},
       {"player-climb-fuzz", "player", {}, false, GatePlayerClimbFuzz},
       {"player-crouch", "player", {}, false, GatePlayerCrouch},

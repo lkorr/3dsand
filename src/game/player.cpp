@@ -290,6 +290,21 @@ inline const Tuning::Player& T() { return CurrentTuning().player; }
 // nobody controls, is never at the mercy of where this line sits.
 constexpr float kSwimSubmersion = 0.75f;
 
+// SWIMMING WATER (Player::swimWater): how deep the COLUMN must be, as a
+// fraction of the standing figure's height (2 kHalfY, 1.7 m), before the water
+// carries the body. In at the NECK (owner, 2026-10-14: "swimming should only
+// start if floating fully in water at the neck") -- 0.85 of 1.7 m is 1.45 m,
+// the eye row is 1.5 m -- and out again only below the CHEST, so a swimmer
+// over a bed that rises and falls by a voxel or two holds its stroke, and a
+// wader walking down a shelving bank keeps its feet until the bed drops away.
+// The scan below the waterline stops at kSwimDepthScan cells: anything deeper
+// is simply deep.
+constexpr float kSwimNeckFrac = 0.85f;
+constexpr float kSwimWadeFrac = 0.70f;
+constexpr int kSwimDepthScan = 24;
+static_assert(kSwimDepthScan > (int)(kSwimNeckFrac * 2.0f * Player::kHalfY) + 1,
+              "the depth scan must reach past the neck threshold");
+
 // Grace windows, seconds. Coyote time keeps a jump legal just after walking off
 // an edge; the buffer honours a jump pressed just before landing. Both exist
 // because on noisy ground the true airborne/grounded boundary is genuinely
@@ -755,7 +770,7 @@ void Player::UpdateStance(float dt, const TickInput& in, bool onFoot,
     // or a mantle only suspends it, and the scripted climb below stands the
     // body up anyway (crouching/prone are cleared while it runs).
     crouchHold_ = -1.0f;
-    if (fly || (inLiquid && submersion >= kSwimSubmersion))
+    if (fly || (inLiquid && swimWater && submersion >= kSwimSubmersion))
       stanceWant_ = kStand;
   } else {
     // THE PRESS, as an edge: a tap shorter than a tick arrives as pressed
@@ -863,7 +878,7 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
   // body the water is carrying; a wader crouches like anyone else. Last
   // tick's submersion, as inLiquid already was here (both are measured below).
   {
-    const bool swimDepth = inLiquid && submersion >= kSwimSubmersion;
+    const bool swimDepth = inLiquid && swimWater && submersion >= kSwimSubmersion;
     const bool onFoot = !fly && !swimDepth && !hanging && mantleTimer <= 0.0f;
     const float eyeBefore = EyeOffsetNow();
     UpdateStance(dt, in, onFoot, kindAt);
@@ -975,6 +990,30 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
         break;
       }
     }
+  }
+
+  // THE COLUMN'S DEPTH, and whether it is swimming water (Player::swimWater).
+  // Down from the waterline through the liquid to the first cell that is not
+  // liquid, at the body's own column. No surface within the scan above = the
+  // body is under a ceiling of water (a flooded passage, a deep dive): deep.
+  // Fly mode and dry land clear both. Last tick's swimWater is the latch.
+  if (inLiquid && !fly) {
+    int depth = kSwimDepthScan;
+    if (haveSurface) {
+      const int cx = ifloor(pos.x), cz = ifloor(pos.z);
+      const int top = (int)waterSurfaceY - 1;
+      depth = 0;
+      while (depth < kSwimDepthScan &&
+             kindAt({cx, top - depth, cz}) == CellKind::Liquid)
+        depth++;
+    }
+    waterDepth = (float)depth;
+    const float standH = 2.0f * kHalfY;
+    swimWater = swimWater ? waterDepth >= kSwimWadeFrac * standH
+                          : waterDepth >= kSwimNeckFrac * standH;
+  } else {
+    waterDepth = 0.0f;
+    swimWater = false;
   }
 
   // Timers run every frame regardless of mode so they never go stale in fly.
@@ -1286,7 +1325,10 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     // below is gated on being in liquid at all rather than on `swimming`.
     // That is what keeps the surface float safe — it does not matter which
     // side of the threshold a floating body's submersion happens to land on.
-    swimming = inLiquid && submersion >= kSwimSubmersion;
+    //
+    // The WATER must be swimming water too (swimWater, the column at least
+    // neck deep): shoulder-deep over a bed you can stand on is still a wade.
+    swimming = inLiquid && swimWater && submersion >= kSwimSubmersion;
     bool onGround = drop >= 0.0f && !swimming;
     if (onGround) coyoteTimer = T().coyoteTime;
 
@@ -1327,7 +1369,12 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
       swimStamina = std::max(0.0f, swimStamina - dt / std::max(T().swimStaminaTime, 0.1f));
     else
       swimStamina = std::min(1.0f, swimStamina + dt / std::max(T().swimStaminaRegenTime, 0.1f));
-    const bool buoyed = afloat && swimStamina > 0.0f && !in.Held(TB_CROUCH);
+    // ...and only in SWIMMING WATER (Player::swimWater). In water a body can
+    // stand in, an afloat body is one that has just dropped in (off a bank,
+    // a jump): it falls the rest of the way to the bed and wades. Caught by
+    // the tread here instead, it floated at the surface for good.
+    const bool buoyed =
+        afloat && swimWater && swimStamina > 0.0f && !in.Held(TB_CROUCH);
     if (!blindFall && !(buoyed && swimming)) vel.y -= gravity * accel * dt;
 
     // Wade speed also scales with submersion: ankle-deep water should barely
@@ -1368,7 +1415,8 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
       const Vec3 w3 = lookFwd * in.forward + right * in.strafe;
       if (w3.len() > 1e-3f) {
         const Vec3 a = w3.normalized();
-        if (swimming || (inLiquid && !onGround && a.y < kSurfaceDiveY)) {
+        if (swimming ||
+            (inLiquid && swimWater && !onGround && a.y < kSurfaceDiveY)) {
           swimAim = a;
           wish = swimAim;
         }
