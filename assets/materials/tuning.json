@@ -310,7 +310,7 @@
     "woundHealSlow": 1,
     "scarHeals": true,
     "scarMat": "scar",
-    "scarRate": 25,
+    "scarMinutes": 5,
     "scarHpPerMin": 0.1,
     "stainCutRadius": 0.4,
     "stainCutAmount": 15,

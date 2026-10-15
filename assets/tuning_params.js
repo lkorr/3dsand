@@ -740,7 +740,7 @@ const TUNING_PARAMS = {
   'gore.woundHealSlow':{t:'f',def:2,min:1,max:64},
   'gore.scarHeals':{t:'b',def:true},
   'gore.scarMat':{t:'s',def:"scar"},
-  'gore.scarRate':{t:'f',def:25,min:0,max:600000},
+  'gore.scarMinutes':{t:'f',def:5,min:0,max:600},
   'gore.scarHpPerMin':{t:'f',def:0.1,min:0,max:60},
   'gore.stainCutRadius':{t:'f',def:1.6,min:0,max:16},
   'gore.stainCutAmount':{t:'i',def:15,min:0,max:15},

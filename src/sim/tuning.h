@@ -1484,15 +1484,16 @@ struct Tuning {
     // No coat needed: a living limb that is not bleeding, burning, rotting or
     // pulping grows its missing tissue back and mends its burnt tissue, both
     // as `scarMat` (softer than skin or flesh, so an old wound is a weak
-    // spot), at `scarRate` cubic centimetres a minute per limb (~25: a sword
-    // cut closes in about ten minutes). The skin layer grows back only over
-    // a whole cell beneath it. hp returns at `scarHpPerMin` of the limb's
+    // spot), ONE CELL AT A TIME: every missing cell whose tissue beneath is
+    // whole scars over after a random wait averaging `scarMinutes` game
+    // minutes, so a deep wound, which has to close layer by layer from the
+    // bottom, takes longer than a shallow one (the skin last of all). hp returns at `scarHpPerMin` of the limb's
     // authored hp a minute, up to the burn cap, and not at all while any limb
     // of the creature is losing blood (blood is health: Mob::DrainBlood). Gated by woundHeals and the
     // creature's own bleed.woundHeals, so the undead never heal.
     bool scarHeals = TPD(gore, scarHeals);
     std::string scarMat = TPD(gore, scarMat);
-    float scarRate = TPD(gore, scarRate);
+    float scarMinutes = TPD(gore, scarMinutes);
     float scarHpPerMin = TPD(gore, scarHpPerMin);
 
     // ---- E3b. BLOOD ON A BODY: the stain lattice (2026-09-13) --------------

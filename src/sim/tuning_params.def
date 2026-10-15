@@ -1902,9 +1902,10 @@ TP_B(gore, scarHeals, NO_WGSL, true)
 // BY NAME, like bruiseMat; an unknown name resolves to 0 and turns the
 // passive heal off, so there is nothing to clamp.
 TP_S(gore, scarMat, NO_WGSL, "scar")
-// Cubic centimetres of tissue a limb knits back a minute. 0 = no regrowth
-// (hp still regenerates); the ceiling is a whole limb in about a second.
-TP_F(gore, scarRate, NO_WGSL, 25.0f, 0.0f, 600000.0f)
+// THE PACE: mean game minutes one missing cell waits to scar over once the
+// tissue beneath it is whole (a memoryless per-cell clock, Mob::ScarTick).
+// 0 = no regrowth (hp still regenerates).
+TP_F(gore, scarMinutes, NO_WGSL, 5.0f, 0.0f, 600.0f)
 // Fraction of a limb's authored hp regained a minute once healing runs.
 TP_F(gore, scarHpPerMin, NO_WGSL, 0.1f, 0.0f, 60.0f)
 TP_F(gore, stainCutRadius, NO_WGSL, 1.6f, 0.0f, 16.0f)
