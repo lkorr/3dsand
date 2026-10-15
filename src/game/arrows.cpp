@@ -458,13 +458,23 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
                     (int64_t)std::abs(f.vel.z)});
       int32_t steps = (int32_t)((maxComp + kHalf - 1) / kHalf);
       steps = std::clamp(steps, 1, 512);
-      bool wall = false;
+      bool wall = false, left = false;
       SpellFxVec p = f.pos, wallAt{};
       for (int32_t s = 0; s < steps; s++) {
         SpellFxVec next = p;
         next.x += f.vel.x / steps;
         next.y += f.vel.y / steps;
         next.z += f.vel.z / steps;
+        // LEAVING THE WINDOW IS NOT A WALL. FlightSolidAt answers "solid" out
+        // of window (a spell bolt detonates on the face, by design), but an
+        // arrow that reached the face would stick there in mid-air as a
+        // kinematic item. It flies on out of the world instead: the segment
+        // ends at the last in-window sample and the flight expires below.
+        if (!w.world.CellInWindow({SpellFxFloor(next.x), SpellFxFloor(next.y),
+                                   SpellFxFloor(next.z)})) {
+          left = true;
+          break;
+        }
         if (solidAt(next)) {
           wall = true;
           wallAt = next;
@@ -599,6 +609,14 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
         } else {
           stats.broke++;
         }
+        done = true;
+      }
+      // ---- OUT OF THE WINDOW: gone, as the tick-start check would say ------
+      if (!done && left) {
+        ArrowEvent e = event(ArrowEvent::Kind::Expired, f);
+        e.at = FloatOf(p);
+        Log(e);
+        stats.expired++;
         done = true;
       }
       if (!done) f.pos = segEnd;
