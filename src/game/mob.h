@@ -2499,6 +2499,16 @@ class Mob {
   void OverlayLimbLattice(size_t i, std::vector<DebrisVoxel>& voxels,
                           std::vector<PrefabVoxel>& skinVoxels, IVec3 size,
                           Vec3 restOffset, Vec3 anchorRoot, Vec3 anchorLimb);
+  // A STORED AMPUTATION IS STILL AN OPEN STUMP (sim/tuning.h Gore §F): limb
+  // `cut` is about to be re-severed by a record overlay (MOBS: OverlayMobRecord
+  // on a load, an unpark or a handoff; AVTR: PlayerAvatar::Spawn), so its
+  // parent's stump is reopened at the joint exactly where Sever() puts it --
+  // woundLocal, the matter-scaled woundScale and woundFluid, stumpOpen. The
+  // wound is not in either record and does not need to be: it is DERIVED from
+  // the severed part whose parent is still on the body. No sever budget or
+  // gout is re-armed (that burst happened before the save). Call BEFORE
+  // DetachLimb(cut): the anchor is read off the cut limb's live transform.
+  void ReopenStumpOf(int cut);
 
   // ---- LIVE RAGDOLL: limp, then back on its feet (sim/tuning.h Ragdoll) -----
   //

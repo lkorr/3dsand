@@ -300,23 +300,11 @@ bool PlayerAvatar::Spawn(const Player& player, float headingRad) {
     // rig was just built at rest (BuildRig writes every limb's xf), so the
     // anchor arithmetic is the same one Sever() runs on a live pose. A loss
     // that fire cauterised is indistinguishable here and reopens too; that
-    // is the conservative side of a bleed.
-    for (size_t i = 0; i < n; i++) {
-      if (restore_.parts[i].alive || !limbs_[i].body) continue;
-      const MobLimb& cut = limbs_[i];
-      const Quat cq{cut.xf.quat[0], cut.xf.quat[1], cut.xf.quat[2],
-                    cut.xf.quat[3]};
-      const Vec3 anchorW = cut.xf.pos + Rotate(cq, cut.anchorLimb);
-      for (size_t k = 0; k < limbDefs_.size() && k < limbs_.size(); k++) {
-        if (limbDefs_[k].name != limbDefs_[i].parent || !limbs_[k].body)
-          continue;
-        MobLimb& parent = limbs_[k];
-        const Quat pq{parent.xf.quat[0], parent.xf.quat[1], parent.xf.quat[2],
-                      parent.xf.quat[3]};
-        parent.woundLocal = RotateInv(pq, anchorW - parent.xf.pos);
-        parent.stumpOpen = true;
-      }
-    }
+    // is the conservative side of a bleed. One function with MOBS's overlay
+    // (Mob::ReopenStumpOf), so an NPC amputee keeps bleeding across a load,
+    // a park or a handoff by the same rule.
+    for (size_t i = 0; i < n; i++)
+      if (!restore_.parts[i].alive && limbs_[i].body) ReopenStumpOf((int)i);
     for (size_t i = 0; i < n; i++)
       if (!restore_.parts[i].alive && limbs_[i].body) DetachLimb((int)i, false);
   }

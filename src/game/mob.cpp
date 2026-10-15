@@ -31412,6 +31412,35 @@ void Mob::OverlayLimbLattice(size_t i, std::vector<DebrisVoxel>& voxels,
   if (sameShape) L.xf = spawnXf;
 }
 
+// ---- A STORED AMPUTATION REOPENS ITS PARENT'S STUMP --------------------------
+// MOBS's overlay and AVTR's Spawn share it (mob.h). Only a BODY limb of
+// blooded tissue opens one, the slots Sever() gives gore to: a worn shell, a
+// held item or hair coming off leaves no stump. A loss that fire cauterised
+// (or a coat stanched) is indistinguishable here and reopens too -- the
+// conservative side of a bleed; a charred wound face closes again on the next
+// BleedTick by the cauterise rule, which reads the restored lattice.
+void Mob::ReopenStumpOf(int cut) {
+  if (cut < 0 || cut >= baseLimbs_ || cut >= (int)limbs_.size() ||
+      cut >= (int)limbDefs_.size() || !limbs_[cut].body)
+    return;
+  if (!TissueHasBlood(TissueOf(cut))) return;
+  const MobLimb& c = limbs_[cut];
+  const Quat cq{c.xf.quat[0], c.xf.quat[1], c.xf.quat[2], c.xf.quat[3]};
+  const Vec3 anchorW = c.xf.pos + Rotate(cq, c.anchorLimb);
+  for (size_t k = 0; k < limbDefs_.size() && k < limbs_.size(); k++) {
+    if (limbDefs_[k].name != limbDefs_[cut].parent || !limbs_[k].body) continue;
+    MobLimb& parent = limbs_[k];
+    const Quat pq{parent.xf.quat[0], parent.xf.quat[1], parent.xf.quat[2],
+                  parent.xf.quat[3]};
+    // Sever()'s placement and its two matter reads at the cut, in its order.
+    parent.woundLocal = RotateInv(pq, anchorW - parent.xf.pos);
+    const uint32_t atCut = ShellMaterialAt((int)k, anchorW);
+    parent.woundFluid = FluidAt((int)k, atCut);
+    parent.woundScale = BleedWeightOf(atCut);
+    parent.stumpOpen = true;
+  }
+}
+
 void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
   if (rec.haveGear) AlignRecordToRig(m, rec);
   m.origin_ = rec.origin;
@@ -31524,6 +31553,16 @@ void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
   // the carve pass means it never operates on a limb the loop still needs.
   // adopt=false — the severed piece is not re-created here, it already
   // travels in the 'DBRS' section as the debris it became.
+  //
+  // The open stumps first, then the detaches (PlayerAvatar::Spawn's order):
+  // the record carries no wound state, so an amputee that was bleeding out
+  // would otherwise come back from a load, an unpark or a handoff with every
+  // stump closed -- and then regenerate and scar over (Mob::ReopenStumpOf).
+  // Reading every cut's anchor before any DetachLimb keeps the rig whole for
+  // all of them; a reopened parent that is itself severed below is cleared
+  // again by its own DetachLimb.
+  for (uint32_t i = 0; i < nApply; i++)
+    if (!rec.limbs[i].alive && m.limbs_[i].body) m.ReopenStumpOf((int)i);
   for (uint32_t i = 0; i < nApply; i++)
     if (!rec.limbs[i].alive && m.limbs_[i].body) {
       // v4 carries a severed limb's hp too (it writes hp for every kind), and
