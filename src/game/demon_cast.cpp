@@ -261,7 +261,17 @@ SpellBodyProbe MakeProbe(ProbeCtx& pc) {
       if (!mobs.IsAlive(mid)) continue;
       Vec3 lo, hi;
       if (!mobs.MobBodyBox(mid, lo, hi)) continue;
-      const float d = boxDist(from, lo, hi);
+      float d = boxDist(from, lo, hi);
+      // ...and to its TRAILING parts, which the box leaves out (the player's
+      // probe, session.cpp bodyIdAt, says why).
+      if (d > best)
+        if (const Mob* m = mobs.FindCreature(mid))
+          for (int li = 0; li < m->LimbCount(); li++) {
+            if (!m->LimbDefAt(li).trailing ||
+                mobs.LimbVoxelsNearWorld(mid, li, from, best) == 0)
+              continue;
+            d = std::min(d, (mobs.LimbNearestVoxelWorld(mid, li, from) - from).len());
+          }
       if (d <= best) {
         best = d;
         id = mid;

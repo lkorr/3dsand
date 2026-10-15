@@ -4225,7 +4225,22 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             if (!bc.mobs->IsAlive(mid)) continue;
             Vec3 lo, hi;
             if (!bc.mobs->MobBodyBox(mid, lo, hi)) continue;
-            const float d = boxDist(from, lo, hi);
+            float d = boxDist(from, lo, hi);
+            // ...AND TO ITS TRAILING PARTS (MobLimbDef::trailing: a naga's
+            // tail), which the box measures OUT of the creature's size, so a
+            // bolt resolved on a coil metres behind the upright figure found
+            // no body. Those limbs are measured by their own nearest voxel --
+            // only when the box missed, and only on the limbs so flagged, so
+            // an ordinary body costs nothing more here.
+            if (d > best)
+              if (const Mob* m = bc.mobs->FindCreature(mid))
+                for (int li = 0; li < m->LimbCount(); li++) {
+                  if (!m->LimbDefAt(li).trailing ||
+                      bc.mobs->LimbVoxelsNearWorld(mid, li, from, best) == 0)
+                    continue;
+                  d = std::min(d, (bc.mobs->LimbNearestVoxelWorld(mid, li, from) -
+                                   from).len());
+                }
             if (d <= best) {
               best = d;
               id = mid;
