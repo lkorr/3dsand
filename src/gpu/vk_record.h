@@ -116,6 +116,7 @@ struct RecordStats {
   uint32_t bufferBarriers = 0;  // VkBufferMemoryBarrier2 entries across them
   uint32_t globalBarriers = 0;  // VkMemoryBarrier2 entries (CA loop + head + host)
   uint32_t imageBarriers = 0;   // VkImageMemoryBarrier2 entries (layout transitions)
+  uint32_t besidePairs = 0;     // RunsBesideNext pairs recorded with no barrier between
 };
 
 // Phase 4b: one frame's attachments, resolved to backend images by the seam.
@@ -372,6 +373,9 @@ class Recorder {
   // Resolve a row's dispatch extent selector against this record's counts.
   static uint32_t Extent(uint32_t v, const RecordCtx& cx);
   static bool CondHolds(pass::Cond c, const RecordCtx& cx);
+  // pass::RunsBesideNext's pairing (vk_record.cpp RecordTable).
+  int BesideNextPartner(int i, pass::Table which, const RecordCtx& cx);
+  bool RowsDisjoint(const pass::Row& a, const pass::Row& b) const;
 
   // --measure: open/close the timestamp pair at group transitions.
   void TimerOpen(const char* group);

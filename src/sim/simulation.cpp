@@ -2608,6 +2608,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   farFill_ = {};
   farCoverFill_ = {};
   farMapFill_ = {};
+  farMapStalk_ = {};
   farPatchFill_ = {};
   farDown_ = {};
   farDownClaim_ = {};
@@ -2719,6 +2720,9 @@ void Simulation::StartFarBuild(unsigned threads) {
     // The cover rule (`farcover`): a tree scan and no genColumn, so it
     // compiles in a fraction of the sweep's time and shares its thread.
     r.cover = MakeComputePipeline(dev, layout, module, "farcover", "farCoverFill");
+    // The map fill's cell marking (`farmapstalk`): a few loads and a CAS loop,
+    // no procgen, so it shares this thread like the cover rule.
+    r.mapStalk = MakeComputePipeline(dev, layout, module, "farmapstalk", "farMapStalk");
     // fardown's follow-up phases: no procgen in them, so they compile in a
     // fraction of fardown's time and share the fill's thread.
     r.downClaim = MakeComputePipeline(dev, layout, module, "fardownClaim", "farDownClaim");
@@ -2765,6 +2769,7 @@ void Simulation::StartFarBuild(unsigned threads) {
     farFill_ = std::move(r.fill);
     farCoverFill_ = std::move(r.cover);
     farMapFill_ = std::move(r.map);
+    farMapStalk_ = std::move(r.mapStalk);
     farPatchFill_ = std::move(r.patch);
     farDown_ = std::move(r.down);
     farDownClaim_ = std::move(r.downClaim);
@@ -2782,6 +2787,7 @@ void Simulation::PublishFarPipelines() {
   farFill_ = std::move(r.fill);
   farCoverFill_ = std::move(r.cover);
   farMapFill_ = std::move(r.map);
+  farMapStalk_ = std::move(r.mapStalk);
   farPatchFill_ = std::move(r.patch);
   farDown_ = std::move(r.down);
   farDownClaim_ = std::move(r.downClaim);
@@ -2791,7 +2797,7 @@ void Simulation::PublishFarPipelines() {
   farReady_.store(true, std::memory_order_release);
   // Not fatal: a failed far compile costs the horizon, not the sim. Say so
   // once — silence here would read as "the cascades are just empty".
-  if (!farFill_ || !farCoverFill_ || !farMapFill_ || !farPatchFill_ || !farDown_ ||
+  if (!farFill_ || !farCoverFill_ || !farMapFill_ || !farMapStalk_ || !farPatchFill_ || !farDown_ ||
       !farDownClaim_ || !farDownStalk_ || !farDownFeat_)
     std::fprintf(stderr,
                  "far-cascade pipelines failed to compile; the horizon will "
@@ -3057,6 +3063,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::FarFill:        return farFill_;
     case P::FarPatchFill:   return farPatchFill_;
     case P::FarMapFill:     return farMapFill_;
+    case P::FarMapStalk:    return farMapStalk_;
     case P::FarCoverFill:   return farCoverFill_;
     case P::FarDown:        return farDown_;
     case P::FarDownClaim:   return farDownClaim_;
@@ -3329,7 +3336,7 @@ void Simulation::EncodeFarFill(const rhi::CommandEncoder& enc, uint32_t count) {
   // map holding the OUTGOING face's columns under the incoming one's cells.
   // The cover rule joins them: without it a refilled plane's crowns are
   // the porous centre-sample lattice beside dense downsampled ones.
-  if (!farFill_ || !farCoverFill_ || !farMapFill_ || !farPatchFill_) return;
+  if (!farFill_ || !farCoverFill_ || !farMapFill_ || !farMapStalk_ || !farPatchFill_) return;
   RecordCtx cx{};
   cx.farCount = count;
   // The map entries PrepareTick appended after the list (farfield.h

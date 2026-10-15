@@ -508,7 +508,9 @@ enum class Pipe : uint8_t {
   // row between the two: after the sweep, before the patch that invalidates it.
   // FarCoverFill is the far COVER RULE over procgen trees (worldgen.wgsl
   // `farcover`): after the sweep whose empty cells it fills, before the patch.
-  FarFill, FarCoverFill, FarMapFill, FarPatchFill, FarDown,
+  // FarMapStalk is the map fill's cell marking (worldgen.wgsl `farmapstalk`),
+  // split out so the map fill itself runs BESIDE the sweep (pass_table.def).
+  FarFill, FarCoverFill, FarMapFill, FarMapStalk, FarPatchFill, FarDown,
   // fardown's three follow-up dispatches (cross-vendor audit #9): the claim
   // check, the cut-stalk clear and the feature check, each its own entry so
   // no phase reads what another phase of the same dispatch is writing.
@@ -923,6 +925,25 @@ enum class DispatchSel : uint32_t {
 // A(HeatMeta) R(HeatParams) -> 29 uses.
 // Raised 32 -> 36 by the lake reservoir: `ca` gains R(StillWater) -> 33 uses.
 inline constexpr int kMaxUses = 36;
+
+
+// ---- A ROW THAT RUNS BESIDE THE NEXT ONE (2026-10-14, sprint flight) -------
+// The recorder emits each row's barriers immediately before it, per buffer,
+// and in Vulkan a barrier whose source scope is COMPUTE waits for EVERY
+// earlier compute dispatch, not just the one that wrote its buffer. So two
+// rows that do not touch each other's writes still never overlap if the second
+// needs any barrier at all against something older -- and the far passes, each
+// latency-bound on a few dozen workgroups, ran strictly one after another with
+// most of the GPU idle. A row named here is recorded TOGETHER with the next
+// row the table visits: both rows' barriers in one batch ahead of the pair,
+// then the two dispatches back to back with nothing between them, so the GPU
+// may run them concurrently. vk_record.cpp checks at record time that neither
+// row writes a buffer the other touches and records them one after the other,
+// as before, when they do -- an edit that makes the pair conflict loses the
+// overlap, never the ordering.
+// farFill (the sweep) beside farMapFill (the surface map): pass_table.def has
+// the measurement and why their uses are disjoint.
+inline bool RunsBesideNext(Pipe p) { return p == Pipe::FarFill; }
 
 struct Row {
   const char* name;

@@ -16895,6 +16895,24 @@ where you hear from either (§12b, "The ears are on the character").
   over 33 ms 3.9-5.4% (n=5) -> 1.8-3.2% (n=10, mean 2.35%), p95 31.6-33.9 ->
   29.1-30.2 ms, p99 39.0-40.6 -> 34.4-38.0 ms; 0 box-face handoffs at the
   shipped margin and at most 2 planes a run landing 1-2 ticks past due.
+  **The surface map fill runs BESIDE the sweep (2026-10-14, sprint
+  flight).** Both passes are latency-bound (a far tick's cost is mostly
+  fixed: 256 entries 8.4 ms, 1,024 13.5, 2,048 19.9 for sweep+map+cover at
+  32.5 m/s), and they ran one after the other. `farmap` now writes the map
+  only; its cactus-stalk cell marking is its own pass (`farmapstalk`, after
+  the cover rule -- the old position, so the cascade digests are identical
+  on the harness and default maps). `pass::RunsBesideNext` (pass_table.h)
+  lets the recorder apply the sweep's and the map's barriers as one batch
+  and record the two dispatches with nothing between them; it refuses the
+  pair if either writes what the other touches. `SANDVOX_FAR_SERIAL=1` is
+  the A/B arm. Sprint flight, n=3 interleaved: p50 21.4-22.4 -> 20.7-21.0,
+  p95 39.7-41.8 -> 37.9-38.7, p99 48.1-51.4 -> 43.7-46.6 ms. The overlap is
+  partial (sweep+map 11.1 -> 10.2 ms a far tick): `far` is a 2.1 MB binary
+  with ~2 KB of local memory a thread, `farmap` 1.5 MB / ~0.9 KB, so both
+  are instruction-cache and spill bound and share the SMs they land on --
+  shrinking those kernels is the next lever. Not kept: draining the far
+  slice on the non-tick frame (at sprint ~70% of frames tick; farMapFill
+  rose), and `render.farPlaneBatch` 2048 (p50 -4 ms but p95/p99 +10 ms).
   **The ticket harness had been measuring an F5.** A default `--frames 1200`
   reloads shaders at frame 600 -- the moment the flight starts -- and the
   far pipelines' re-arrival queues a whole FullRefill; that refill, not

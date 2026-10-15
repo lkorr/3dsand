@@ -256,7 +256,7 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "FAULTS are a bug, not a cost — the page shows them as a red counter."},
     {"farField", "Far-Field Cascades", "worldStorage", PerfSide::Gpu,
      PerfScope::Count, "farDown;farDownHash;farDownClaim;farDownHashClaim;farDownStalk;"
-     "farDownHashStalk;farDownFeat;farDownHashFeat;farFill;farCoverFill;farMapFill;farPatchFill",
+     "farDownHashStalk;farDownFeat;farDownHashFeat;farFill;farCoverFill;farMapFill;farMapStalk;farPatchFill",
      "Downsample into the cascade pyramid. Flat per tick; the render-side cost "
      "of reading it is in raymarch."},
 

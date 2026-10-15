@@ -605,8 +605,43 @@ void Recorder::TimerClose() {
   timerEndIdx_ = UINT32_MAX;
 }
 
+// The partner pass::RunsBesideNext pairs row `i` with: the next row of the
+// table the loop will VISIT (its condition holds), if that row is a plain
+// single-dispatch compute row with a pipeline -- else -1, and `i` records alone.
+int Recorder::BesideNextPartner(int i, pass::Table which, const RecordCtx& cx) {
+  for (int j = i + 1; j < pass::kRowCount; j++) {
+    const pass::Row& n = pass::kRows[j];
+    if (n.table != which || !CondHolds(n.cond, cx)) continue;
+    const bool compute =
+        n.kind == pass::Kind::Compute || n.kind == pass::Kind::ComputeIndirect;
+    if (!compute || n.repeat != 1 || bind_.pipelines[(int)n.pipe] == VK_NULL_HANDLE)
+      return -1;
+    return j;
+  }
+  return -1;
+}
+
+// Two rows may share one barrier batch only if neither WRITES a buffer the
+// other touches: a barrier between them is then not needed by either, which is
+// the only case in which leaving it out is not a race. Compared by the bound
+// buffer, not the table id, so two ids bound to one buffer still conflict.
+bool Recorder::RowsDisjoint(const pass::Row& a, const pass::Row& b) const {
+  for (int u = 0; u < a.useCount; u++) {
+    Buffer* ab = bind_.buffers[(int)a.uses[u].buf];
+    if (!ab || !ab->buf) continue;
+    const bool aw = Map(a.uses[u].acc).write;
+    for (int v = 0; v < b.useCount; v++) {
+      Buffer* bb = bind_.buffers[(int)b.uses[v].buf];
+      if (bb == ab && (aw || Map(b.uses[v].acc).write)) return false;
+    }
+  }
+  return true;
+}
+
 void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
   const vkl::DeviceFns& f = be_.Fns();
+  // The row whose uses a RunsBesideNext pair already applied (below).
+  int usesAppliedRow = -1;
 
   for (int i = 0; i < pass::kRowCount; i++) {
     const pass::Row& r = pass::kRows[i];
@@ -677,12 +712,37 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
       }
     }
 
+    // ---- A ROW THAT RUNS BESIDE THE NEXT ONE (pass_table.h RunsBesideNext) --
+    // Apply BOTH rows' uses now, flush their barriers as one batch, and let
+    // the partner skip its own ApplyUses: nothing is then recorded between the
+    // two dispatches, so the GPU may overlap them. Not under the sledgehammer
+    // oracle (it wants a full barrier before every row) or with async work in
+    // flight (its join is decided per row, above). The partner also stays in
+    // this row's timer span: a timestamp between them is a drain point.
+    // SANDVOX_FAR_SERIAL=1 is the A/B arm: every row records alone again.
+    static const bool besideOff = std::getenv("SANDVOX_FAR_SERIAL") != nullptr;
+    const bool partner = i == usesAppliedRow;
+    bool usesApplied = partner;
+    if (!partner && !besideOff && pass::RunsBesideNext(r.pipe) && r.repeat == 1 &&
+        mode_ != BarrierMode::Sledgehammer && !(asyncJoin_ && !asyncJoined_)) {
+      const int j = BesideNextPartner(i, which, cx);
+      if (j >= 0 && RowsDisjoint(r, pass::kRows[j])) {
+        for (int u = 0; u < r.useCount; u++) TouchBuffer(r.uses[u].buf, r.uses[u].acc);
+        const pass::Row& n = pass::kRows[j];
+        for (int u = 0; u < n.useCount; u++) TouchBuffer(n.uses[u].buf, n.uses[u].acc);
+        FlushPending(/*global=*/false);
+        usesApplied = true;
+        usesAppliedRow = j;
+        stats_.besidePairs++;
+      }
+    }
+
     // --measure: the timestamp pair spans each run of rows sharing a `group`
     // label, the granularity the phase-0 baseline was measured at.
     // --perf (timerPerRow_): key on the row instead, so a group covering
     // several architecture components reports one number each.
     const char* timerKey = timerPerRow_ ? r.name : r.group;
-    if (timerPool_ != VK_NULL_HANDLE && timerKey != timerGroup_) {
+    if (timerPool_ != VK_NULL_HANDLE && timerKey != timerGroup_ && !partner) {
       TimerClose();
       TimerOpen(timerKey);
     }
@@ -773,7 +833,7 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
       // edges against whatever wrote them in phase 1; iterations 1..53 emit the
       // inter-iteration barrier that IS the colour lattice (§3.6/§7.1). Those
       // 53 are not an optimisation target and must never be merged away.
-      ApplyUses(r.uses, r.useCount, /*global=*/caLoop);
+      if (!(usesApplied && k == 0)) ApplyUses(r.uses, r.useCount, /*global=*/caLoop);
 
       // Dynamic offsets. GRP_SIM's layout has exactly one dynamic uniform
       // (passUBO at binding 5); DYN_CA feeds iteration k the slice at

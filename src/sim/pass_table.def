@@ -1668,17 +1668,6 @@ PASS(farFill, "farFill", PT_FARFILL, PIPE_FAR_FILL, K_COMPUTE, D_FARHEADCOUNT,1,
      GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
      USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO)
           A(FarVox) A(FarOcc) R(TreeAtlas) R(WorldMap)))
-// THE COVER RULE OVER PROCGEN TREES (worldgen.wgsl `farcover`, DESIGN.md "Far
-// crowns keep their coverage"). Same dispatch extent; reads the bytes the
-// sweep just wrote (a cell whose centre sample found matter keeps it) and
-// fills an empty cell with leaf when enough of its eight sub-samples are
-// leaf. AFTER the sweep (A(FarVox) A(FarOcc) RAW) and BEFORE the patch, so an
-// edited chunk's patch words -- whose CPU twin applies the same rule from the
-// voxels that were really there -- still have the last word.
-PASS(farCoverFill, "farCoverFill", PT_FARFILL, PIPE_FAR_COVER_FILL, K_COMPUTE, D_FARCOUNT,1,1,
-     GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
-     USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO)
-          A(FarVox) A(FarOcc) R(TreeAtlas) R(WorldMap)))
 // THE SURFACE MAP FILL (worldgen.wgsl `farmap`, LOD-seam package A). Same
 // dispatch extent; only an entry carrying kFarListMapBit does any work — one
 // per level-chunk COLUMN of an X/Z plane or reset, which rewrites the 2D map
@@ -1687,9 +1676,8 @@ PASS(farCoverFill, "farCoverFill", PT_FARFILL, PIPE_FAR_COVER_FILL, K_COMPUTE, D
 // cell it patches (an edited level chunk), and that clear must land after the
 // fill it corrects, or a refill would vouch for pristine ground over a crater.
 // A(FarMap) on both rows is what generates that barrier.
-// A(FarVox) A(FarOcc) since LOD-seam package F: a cactus stalk the map
-// raises its column to is also MARKED into the level's cells (farmap), after
-// the sweep wrote them and before the patch rewrites an edited chunk's.
+// A cactus stalk the map raises its column to is also MARKED into the level's
+// cells (LOD-seam package F): that half is farMapStalk, after the cover rule.
 // SIXTEEN workgroups per entry in y (2026-10-11): a map entry is 1,024
 // sub-columns of genColumn work and an X/Z plane has only 32 of them, so one
 // workgroup each left the GPU nearly idle for 27-33 ms a plane while 64
@@ -1705,7 +1693,38 @@ PASS(farCoverFill, "farCoverFill", PT_FARFILL, PIPE_FAR_COVER_FILL, K_COMPUTE, D
 PASS(farMapFill, "farMapFill", PT_FARFILL, PIPE_FAR_MAP_FILL, K_COMPUTE, D_FARMAPCOUNT,16,1,
      GRP_SLIM_FAR, DYN_NONE, C_FARMAPCOUNT, 1,
      USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO) A(FarMap)
+          R(TreeAtlas) R(WorldMap)))
+// BESIDE THE SWEEP, NOT AFTER IT (2026-10-14, sprint flight). Both far passes
+// are LATENCY-bound -- a level-1 plane is 32 sweep workgroups and 32 map
+// columns, and measured per far tick at 32.5 m/s farFill cost 4.3 ms for 256
+// entries and 5.1 for 1,024, farMapFill 3.3 ms for 8 columns and 5.6 for 32 --
+// so run one after the other they left most of the GPU idle for ~10 ms. This
+// row now writes FarMap ALONE (the stalk marking that wrote FarVox/FarOcc is
+// farMapStalk below, in this row's old place), and the sweep touches no
+// FarMap, so the recorder puts no barrier between them and they overlap. Its
+// map words still land before farMapStalk and farPatchFill read/clear them
+// (A(FarMap) on both, the edge the farpatch note above needs).
+
+// THE COVER RULE OVER PROCGEN TREES (worldgen.wgsl `farcover`, DESIGN.md "Far
+// crowns keep their coverage"). Same dispatch extent; reads the bytes the
+// sweep just wrote (a cell whose centre sample found matter keeps it) and
+// fills an empty cell with leaf when enough of its eight sub-samples are
+// leaf. AFTER the sweep (A(FarVox) A(FarOcc) RAW) and BEFORE the patch, so an
+// edited chunk's patch words -- whose CPU twin applies the same rule from the
+// voxels that were really there -- still have the last word.
+PASS(farCoverFill, "farCoverFill", PT_FARFILL, PIPE_FAR_COVER_FILL, K_COMPUTE, D_FARCOUNT,1,1,
+     GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
+     USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO)
           A(FarVox) A(FarOcc) R(TreeAtlas) R(WorldMap)))
+// THE MAP FILL'S CELL MARKING (worldgen.wgsl `farmapstalk`): a cactus stalk
+// the map raised its sub-column to is MARKED into the level's cells it passes
+// through, after the sweep wrote them and the cover rule filled them, before
+// the patch rewrites an edited chunk's -- exactly where `farmap` used to do it
+// inline, so every byte is the one it wrote. It reads the stalk back from the
+// map entry and feature word farMapFill just wrote (A(FarMap): the barrier).
+PASS(farMapStalk, "farMapStalk", PT_FARFILL, PIPE_FAR_MAP_STALK, K_COMPUTE, D_FARMAPCOUNT,16,1,
+     GRP_SLIM_FAR, DYN_NONE, C_FARMAPCOUNT, 1,
+     USES(U(TickUBO) R(FarList) U(FarUBO) A(FarMap) A(FarVox) A(FarOcc)))
 // R(FarPatch) lives on THIS row now, not on the sweep: the sweep no longer
 // reads the patch buffer at all, and a read declared where it does not happen
 // is the spurious-barrier direction the checker warns about.

@@ -9214,26 +9214,9 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
         let head = (fp.stalk >> 23u) & 0x7Fu;
         e = (e & ~0x3FFFFFFFu) | u32(clamp(sTop + FAR_MAP_H_BIAS, 0, 0xFFFF)) |
             (select(body, head, head != 0u) << 16u) | (body << 23u);
-        let origin = F.origins[level - 1u].xyz;
-        let c = m >> vec2<u32>(1u);
-        for (var cy = (col.h + 1) >> shift; cy <= sTop >> shift; cy++) {
-          let cc = vec3<i32>(c.x, cy, c.y);
-          if (!farInBox(cc, origin)) { continue; }
-          let bi = farVoxByteIndex(level, cc);
-          let bsh = (bi & 3u) * 8u;
-          // Mark an air or blocker-only cell with the stalk's slot. A
-          // compare-exchange, not the and+or the other writers use: the four
-          // sub-columns of one level cell are four threads, and two stalks
-          // racing an and+or would OR their slots into a third material.
-          for (var tries = 0u; tries < 8u; tries++) {
-            let cur = atomicLoad(&farVox[bi >> 2u]);
-            if (farCellSlot((cur >> bsh) & 0xFFu) != 0u) { break; }
-            let nw = (cur & ~(0xFFu << bsh)) | (body << bsh);
-            if (atomicCompareExchangeWeak(&farVox[bi >> 2u], cur, nw).exchanged) { break; }
-          }
-          atomicMax(&farOcc[farOccIndex(level, cc)],
-                    farOccPack(1u, u32(cc.y & (i32(CHUNK) - 1)) + 1u));
-        }
+        // The cells it passes through are marked by `farmapstalk` (below),
+        // from this entry and its feature word: this pass writes the map only,
+        // so it runs beside the sweep (pass_table.def farMapFill).
       }
     }
     if (ok) { e |= FAR_MAP_VALID; }
@@ -9251,6 +9234,70 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
            (midS << 17u) | (deepS << 24u) | FAR_STRATA_PRESENT;
     }
     atomicStore(&farMap[farStrataWord(level, m)], st);
+  }
+}
+
+// ---- THE STALK MARKING (pass_table.def farMapStalk, 2026-10-14) -------------
+// `farmap`'s cell marking, moved out of it so the map fill writes nothing but
+// the map and can run BESIDE the sweep. A stalk the map raised its sub-column
+// to (a cactus, a spire: LOD-seam package F) is MARKED into the level's cells
+// it passes through -- an air or blocker-only cell takes its body slot, and
+// the chunk's farOcc counts it -- after the sweep wrote those cells and the
+// cover rule filled them, before the patch rewrites an edited chunk's: the
+// position the inline loop had, so every byte is the one it wrote.
+//
+// The stalk is read back from what `farmap` just wrote. Its feature word IS
+// the stalk (FAR_FEAT_SOLID, height bits 8..11, body slot 16..22), and the
+// entry's top was raised to the stalk's: h = top - height. Same dispatch
+// shape as `farmap`, one sub-column per thread; a sub-column with no stalk
+// costs one load.
+//
+// One edge the inline loop did not have: the entry's 16-bit top saturates at
+// a stalk top of 32,767 voxels (FAR_MAP_H_BIAS), 3.3 km, far over any map's
+// relief (the 1,400 m `peaks` massif is 14,000).
+@compute @workgroup_size(64)
+fn farmapstalk(@builtin(workgroup_id) wg : vec3<u32>,
+               @builtin(num_workgroups) nwg : vec3<u32>,
+               @builtin(local_invocation_index) li : u32) {
+  let packed = farList[T.farCount + wg.x];
+  if ((packed & FAR_LIST_MAP_BIT) == 0u) { return; }
+  let level = ((packed & ~FAR_LIST_MAP_BIT) >> FAR_SLOT_SHIFT) + 1u;   // 1-based
+  // Only the feature levels carry stalks (farmap's farFeatFill gate).
+  if (level > FAR_FEAT_LEVELS) { return; }
+  let slot = packed & FAR_SLOT_MASK;
+  let sc = vec3<i32>(vec3<u32>(slot % FAR_NCHUNK, (slot / FAR_NCHUNK) % FAR_NCHUNK,
+                               slot / (FAR_NCHUNK * FAR_NCHUNK)));
+  let origin = F.origins[level - 1u].xyz;
+  let base = farSlotToChunk(sc, origin) * i32(CHUNK);
+  let shift = farCellShift(level);
+  let n = 2u * CHUNK;                 // sub-columns per axis under the chunk
+  for (var i = wg.y * 64u + li; i < n * n; i += 64u * nwg.y) {
+    let m = vec2<i32>(base.x * 2 + i32(i % n), base.z * 2 + i32(i / n));
+    let fw = atomicLoad(&farMap[farFeatWord(level, m)]);
+    let hq = i32((fw >> 8u) & 15u);
+    if ((fw & FAR_FEAT_SOLID) == 0u || hq == 0) { continue; }
+    let sTop = i32(atomicLoad(&farMap[farMapWord(level, m)]) & 0xFFFFu) - FAR_MAP_H_BIAS;
+    let h = sTop - hq;
+    let body = (fw >> 16u) & 0x7Fu;
+    let c = m >> vec2<u32>(1u);
+    for (var cy = (h + 1) >> shift; cy <= sTop >> shift; cy++) {
+      let cc = vec3<i32>(c.x, cy, c.y);
+      if (!farInBox(cc, origin)) { continue; }
+      let bi = farVoxByteIndex(level, cc);
+      let bsh = (bi & 3u) * 8u;
+      // Mark an air or blocker-only cell with the stalk's slot. A
+      // compare-exchange, not the and+or the other writers use: the four
+      // sub-columns of one level cell are four threads, and two stalks
+      // racing an and+or would OR their slots into a third material.
+      for (var tries = 0u; tries < 8u; tries++) {
+        let cur = atomicLoad(&farVox[bi >> 2u]);
+        if (farCellSlot((cur >> bsh) & 0xFFu) != 0u) { break; }
+        let nw = (cur & ~(0xFFu << bsh)) | (body << bsh);
+        if (atomicCompareExchangeWeak(&farVox[bi >> 2u], cur, nw).exchanged) { break; }
+      }
+      atomicMax(&farOcc[farOccIndex(level, cc)],
+                farOccPack(1u, u32(cc.y & (i32(CHUNK) - 1)) + 1u));
+    }
   }
 }
 

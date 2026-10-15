@@ -124,6 +124,8 @@ PIPE_TO_MEMBER = {
     "PIPE_FAR_PATCH_FILL": "farPatchFill_",
     # The far SURFACE MAP fill (LOD-seam package A): worldgen.wgsl `farmap`.
     "PIPE_FAR_MAP_FILL": "farMapFill_",
+    # Its cell marking, split out so the map fill can run beside the sweep.
+    "PIPE_FAR_MAP_STALK": "farMapStalk_",
     # The cover rule over procgen trees: worldgen.wgsl `farcover`.
     "PIPE_FAR_COVER_FILL": "farCoverFill_",
     "PIPE_FAR_DOWN": "farDown_",

@@ -22285,9 +22285,16 @@ int main(int argc, char** argv) {
         post(liveRenderTimer, true);
 
       // Send anything that is complete or three frames old, oldest first.
+      // THE HARNESS WAITS LONGER (2026-10-14, sprint flight): a frame whose GPU
+      // work takes more than three frames to land is exactly a STALL frame,
+      // and dropping its timestamps left every --frames table blind to the
+      // worst GPU frames of a run -- the in-flight hitches showed as a 70 ms
+      // wall with "(no timestamps)" two frames before it. Twelve frames is
+      // longer than any stall measured; the live page keeps its three.
+      const uint64_t gpuWaitFrames = g_harnessFrames > 0 ? 12u : 3u;
       while (!livePending.empty() &&
              (livePending.front().s.gpuValid ||
-              liveFrameNo - livePending.front().frame >= 3)) {
+              liveFrameNo - livePending.front().frame >= gpuWaitFrames)) {
         if (telemetry.HasClient()) telemetry.BroadcastSample(livePending.front().s);
         // The harness keeps the GPU rows of every frame that got them; a
         // frame whose queries never resolved is left out rather than logged
