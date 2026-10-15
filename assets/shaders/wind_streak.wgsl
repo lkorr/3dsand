@@ -44,8 +44,10 @@
 // where currentAt() runs faster than CUR_SPAWN_LO, carried along the surface
 // by its horizontal part, dead when they leave the liquid. currentAt is the
 // function the surface waves advect with and the current arrows sample
-// (debug_current.wgsl), so these ARE that field. Still water, and a world with
-// no current primitives (currentRenderOn 0), spawns none.
+// (debug_current.wgsl), so these ARE that field: the terrain flow field
+// (flowGrid: rivers, lakes, sea) plus the live current primitives (drains).
+// Still water, currentRenderOn 0, or a window with neither a primitive nor a
+// flow grid spawns none.
 //
 // LAYOUT, array<vec4f>: row 0 = (camera cell is liquid ? 1 : 0, 0, 0, 0),
 // written by the update's thread 0 for the draw; then per slot STREAK_STRIDE rows —
@@ -284,7 +286,11 @@ fn currentUpdate(i : u32, base : u32, h0In : vec4f, h1In : vec4f, dt : f32,
   var h1 = h1In;
   if (!streakAlive(h0, h1)) {
     // ---- respawn attempt ----
-    if (R.currentRenderOn == 0u || R.currentPrimCount == 0u) { return; }
+    // Rivers, lakes and the sea live in flowGrid, not on the primitive list
+    // (which holds only live drains), so an empty list is not still water:
+    // the same gate as currentConvergeAt.
+    if (R.currentRenderOn == 0u) { return; }
+    if (R.currentPrimCount == 0u && (!FLOW_BOUND || flowWord(2u) == 0u)) { return; }
     if (streakU01(11u, i) >= min(dt * CUR_SPAWN_RATE, 1.0)) { return; }
     let ang = streakU01(12u, i) * 6.28318531;
     let rr = sqrt(streakU01(13u, i)) * radius;

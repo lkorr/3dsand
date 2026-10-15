@@ -4109,8 +4109,9 @@ struct Tuning {
     // currentAt() along the surface, born only where the current runs (the
     // spawn speeds and lifetime are consts in the shader: RenderParams has no
     // room left, and both knobs here ride RenderParams.streakN[3]'s spare
-    // bits) and dying when they leave the liquid. Still water and a world with
-    // no current primitives show none. currentStreakAlpha 0 = off.
+    // bits) and dying when they leave the liquid. Still water, and a window
+    // with neither a flow grid (rivers, lakes, sea) nor a live current
+    // primitive (drains), show none. currentStreakAlpha 0 = off.
     float currentStreakAlpha = TPD(wind, currentStreakAlpha);
     int currentStreakCount = TPD(wind, currentStreakCount);
 
