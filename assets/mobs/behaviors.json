@@ -657,7 +657,7 @@
       "comment": "THE SHARK (assets/mobs/shark.json, DESIGN.md \"Swimmers\"). A circling hunter: it never stops to bite. It comes in on its band (approach), then ORBITS the target nose-first -- FAST at 1.3x its cruise, a voxel below the target's middle, on a radius drawn anywhere from 31 to 104 voxels each lap -- and PACES: every few seconds (a whim, 2-8 s drawn) it swings onto a new radius (easing out or in at 18 vox/s, a widening or tightening spiral) and may turn round and go back the other way, and every lap end may turn it too. A lap lasts 1.5-9 s, and a spent lap only ends in a pass seven times in ten (else it is another lap), so the wait between passes has a long tail and cannot be counted. When the lap is spent and its attack clock is ready it CHARGES: curves off the circle onto where you will be, drives down the line at 5x its cruise, ~17.5 m/s (its burst ceiling, swim.burst, caps it), throws the bite seven ticks short of contact so the jaws are open when they arrive, and goes THROUGH -- the line keeps homing until 5 voxels out -- out to 24 past you, gliding on while it brakes, then curves round onto the next lap the way it was already going.",
       "//medium": "minImmersion 0.3: a man on the bank or wading to the ankles is not prey; one in to the waist is. Climb out and it loses you (the alert decays) and goes back to patrolling. sightRange 90 (it has to keep you in view across a 104-voxel lap). scentRange 150: a BLEEDING body in the water is felt from further than it is seen, without a line of sight, and is preferred over a dry one by 30 voxels -- blood in the water.",
       "//idle": "With nothing to hunt it roams 28 voxels round where it was born; half its legs are instead two laps of a figure eight round that spot (loops 25 voxels out, wide enough for its turning circle at a patrol pace).",
-      "//rules": "Blood in the water makes it bolder (laps a third shorter through the cadence, a little faster); badly hurt, it breaks off.",
+      "//rules": "Blood in the water makes it bolder (laps a third shorter through the cadence, a little faster). MAIMED it gets desperate, not careful: a part gone (a fin, the tail -- Fact::limbsLost) and it comes in again sooner (cadence x0.7); its runs get sloppier by themselves, because the body it makes them with steers worse (swim.fins). IT NEVER BREAKS OFF (2026-10-15, owner call): there is no flee rule, so a wounded shark fights to the end. Fleeing stays one rule away for any profile that wants it -- the `flee` intent's weight, set by a rule like { \"when\": { \"hp\": \"<0.25\" }, \"weight\": { \"flee\": 3.0 } }.",
       "name": "shark",
       "label": "Shark",
       "color": 3233844352,
@@ -681,7 +681,7 @@
       },
       "rules": [
         { "note": "blood in the water: bolder", "when": { "targetBleeding": ">0" }, "tune": { "cadence": 0.65, "speed": 1.1 } },
-        { "note": "badly hurt: break off", "when": { "hp": "<0.25" }, "weight": { "flee": 3.0, "charge": 0 } }
+        { "note": "maimed: desperate -- comes in again sooner", "when": { "limbsLost": ">=1" }, "tune": { "cadence": 0.7 } }
       ]
     },
     {

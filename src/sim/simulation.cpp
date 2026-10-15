@@ -983,11 +983,10 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     draftMetaBuf_ = CreateBuffer(device, (uint64_t)kDraftMetaWords * 4,
                                  U::Storage | U::CopySrc | U::CopyDst, "draftMeta");
     draftArgsBuf_ = CreateBuffer(device, 16 * kDraftStages, U::Indirect | U::CopyDst, "draftArgs");
-    const std::vector<uint32_t> zero((size_t)kDraftWords, 0u);
-    for (uint32_t k = 0; k < kDraftMaxBoxes; k++)
-      device.GetQueue().WriteBuffer(draftBuf_, (uint64_t)k * kDraftWords * 4, zero.data(),
-                                    zero.size() * 4);
-    device.GetQueue().WriteBuffer(draftMetaBuf_, 0, zero.data(), kDraftMetaWords * 4);
+    // NO ZERO UPLOAD: CreateBuffer already queues a GPU zero fill of every
+    // buffer (rhi_vulkan.cpp, "Zero-init, queued"). Uploading 30.5 MB of zeros
+    // on top of it -- kDraftMaxBoxes slots -- filled the 64 MiB staging ring
+    // with one unsubmitted batch and aborted every boot (2026-10-15).
     uint32_t args0[4 * kDraftStages] = {};
     for (uint32_t s = 0; s < kDraftStages; s++) args0[4 * s + 1] = args0[4 * s + 2] = 1u;
     device.GetQueue().WriteBuffer(draftArgsBuf_, 0, args0, sizeof(args0));

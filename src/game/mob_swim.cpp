@@ -33,6 +33,17 @@
 //   6. IT BANKS into the turn: roll = the coordinated-turn lean
 //      atan(v x omega / g), scaled by `bank`. Presentation (PoseInputs).
 //
+// A BODY SHORT OF A FIN (SenseFins; MobDef::SwimDef::FinDef) runs the same
+// six steps with the fins it has left: a slower, shallower pitch (1); a
+// thrash's wobble on the line it wants (1, 3); a turn rate that is lower
+// toward a missing pectoral (3: Steer's one-sided cap), and loose while it
+// brakes hard; less thrust without its tail, less brake without pectorals,
+// a hard brake on one fin spinning it toward that fin, and no trim without
+// either -- it sinks (4); a list toward the missing fin, a roll with every
+// climb and dive, and the thrash's rolling (6). With every fin whole each
+// of those factors is exactly 1 and each term exactly 0: an intact body
+// swims as it always did.
+//
 // OUT OF THE WATER (TickStranded): the walker's gravity and ground settle,
 // no walking at all, the body eased onto a flank, a flop every
 // flopMin..flopMax seconds that throws it toward the nearest water it can
@@ -291,6 +302,61 @@ void MobSystem::SenseWater(Mob& mob, const MobDef& def, World& world) {
 }
 
 // ---------------------------------------------------------------------------
+// SenseFins: what is left of each fin, and the shock of losing one.
+// ---------------------------------------------------------------------------
+// A fin's share is the authoritative lattice's voxels over the count it
+// spawned with (MobLimb::voxelsAtSpawn, the denominator every carve's hp
+// charge uses), 0 once it is severed. THE SHOCK is measured from the shares
+// when the last one began (Mob::finRef*_), so twenty bites that each take a
+// sliver add up to a flailing as surely as one cut that takes the lot; a
+// fin that grows back (a graft) moves the reference up with it.
+void MobSystem::SenseFins(Mob& mob, const MobDef& def) {
+  const MobDef::SwimDef::FinDef& fd = def.swim.fins;
+  if (!fd.present) return;
+  auto share = [&](int li) {
+    if (li < 0 || li >= (int)mob.limbs_.size()) return 1.0f;
+    const MobLimb& L = mob.limbs_[(size_t)li];
+    if (L.body == 0) return 0.0f;
+    if (L.voxelsAtSpawn == 0) return 1.0f;
+    const size_t n = L.HasFineSkin() ? L.skinVoxels.size() : L.voxels.size();
+    return std::min(1.0f, (float)n / (float)L.voxelsAtSpawn);
+  };
+  mob.finL_ = share(fd.left);
+  mob.finR_ = share(fd.right);
+  mob.finTail_ = share(fd.tail);
+  if (!mob.finsKnown_) {
+    // The first look is the reference: a body that spawned (or loaded)
+    // short of a fin has had its shock already.
+    mob.finsKnown_ = true;
+    mob.finRefL_ = mob.finL_;
+    mob.finRefR_ = mob.finR_;
+    mob.finRefTail_ = mob.finTail_;
+    mob.thrashPhase_ =
+        (float)(rng::Hash3((uint32_t)mob.id_ ^ 0x7A11u, 0u, 1u) & 0xFFFFu) / 65535.0f * 10.0f;
+    return;
+  }
+  mob.finRefL_ = std::max(mob.finRefL_, mob.finL_);
+  mob.finRefR_ = std::max(mob.finRefR_, mob.finR_);
+  mob.finRefTail_ = std::max(mob.finRefTail_, mob.finTail_);
+  const float lost = (mob.finRefL_ - mob.finL_) + (mob.finRefR_ - mob.finR_) +
+                     (mob.finRefTail_ - mob.finTail_);
+  if (lost < fd.thrashMin || fd.thrash <= 0.0f) return;
+  mob.finRefL_ = mob.finL_;
+  mob.finRefR_ = mob.finR_;
+  mob.finRefTail_ = mob.finTail_;
+  // A whole fin is the authored length; a sliver a share of it. A fresh
+  // shock on top of one still running restarts the longer of the two.
+  const float len = fd.thrash * std::min(1.0f, lost);
+  if (len > mob.thrash_) {
+    mob.thrash_ = len;
+    mob.thrashLen_ = len;
+  }
+  mob.thrashes_++;
+  // The bite it was throwing does not land: it is busy with its own body.
+  if (mob.stroke_.Active()) mob.stroke_.Reset();
+}
+
+// ---------------------------------------------------------------------------
 // DriveSwim: one tick of the water carrying the body. The header has the
 // order and why.
 // ---------------------------------------------------------------------------
@@ -303,6 +369,33 @@ void MobSystem::DriveSwim(Mob& mob, const MobDef& def, World& world, float dt) {
   const float g = MetresToCells(CurrentTuning().physics.gravity);
   CellCache cache{world, mob.ClassOf()};
   const float speed = mob.swimVel_.len();
+
+  // ---- 0. THE FINS IT HAS LEFT (SenseFins; MobDef::SwimDef::FinDef) ---------
+  // `pa`: the pectorals' pitch authority, their mean share. `asym`: + when the
+  // left is the stronger (a turn or a brake on one fin goes toward it).
+  // `Lerp1(lo, k)` is lo..1 over k, and EXACTLY 1 at k = 1, so a whole body's
+  // numbers are untouched to the bit.
+  SenseFins(mob, def);
+  const MobDef::SwimDef::FinDef& fd = sw.fins;
+  auto Lerp1 = [](float lo, float k) { return k >= 1.0f ? 1.0f : lo + (1.0f - lo) * k; };
+  const float pa = fd.present ? 0.5f * (mob.finL_ + mob.finR_) : 1.0f;
+  const float asym = fd.present ? mob.finL_ - mob.finR_ : 0.0f;
+  const float tailK = fd.present ? Lerp1(1.0f - fd.thrustLoss, mob.finTail_) : 1.0f;
+  const float pitchRate = sw.pitchRate * Lerp1(0.15f, pa);
+  const float maxPitch = sw.maxPitch * Lerp1(0.35f, pa);
+  // THE THRASH: `thr` 1..0 through it; three incommensurate clocks so the
+  // yaw, the pitch and the roll never line up into one tidy wiggle.
+  float thr = 0.0f, thrYaw = 0.0f, thrPitch = 0.0f, thrRoll = 0.0f, thrDrive = 0.0f;
+  if (mob.thrash_ > 0.0f) {
+    thr = mob.ThrashEnvelope();
+    mob.thrash_ = std::max(0.0f, mob.thrash_ - dt);
+    mob.thrashPhase_ += dt;
+    const float t = mob.thrashPhase_ * 6.2831853f;
+    thrYaw = thr * 0.9f * std::sin(t * 1.7f);
+    thrPitch = thr * 0.45f * std::sin(t * 1.1f + 1.3f);
+    thrRoll = thr * 1.1f * std::sin(t * 2.3f + 0.4f);
+    thrDrive = 0.45f + 0.75f * std::fabs(std::sin(t * 0.9f));
+  }
 
   // ---- 1. THE HEIGHT IT WANTS, as a pitch -----------------------------------
   // The run is at least a body length: a nose does not stand on end to rise
@@ -329,7 +422,7 @@ void MobSystem::DriveSwim(Mob& mob, const MobDef& def, World& world, float dt) {
     const float under = floor + 1.0f - c.y;
     if (under > 0.0f) wantPitch = std::max(wantPitch, std::atan2(under, ws.z));
   }
-  wantPitch = std::clamp(wantPitch, -sw.maxPitch, sw.maxPitch);
+  wantPitch = std::clamp(wantPitch + thrPitch, -maxPitch, maxPitch);
 
   // ---- 2. IT FEELS AHEAD ------------------------------------------------------
   // Down the WANTED line from the snout, `feel` voxels plus a third of a
@@ -366,7 +459,7 @@ void MobSystem::DriveSwim(Mob& mob, const MobDef& def, World& world, float dt) {
       bool found = false;
       for (const Try& t : kFan) {
         const float h = h0 + t.dh * side;
-        const float p = std::clamp(wantPitch + t.dp, -sw.maxPitch, sw.maxPitch);
+        const float p = std::clamp(wantPitch + t.dp, -maxPitch, maxPitch);
         if (!clear(h, p)) continue;
         mob.desiredHeading_ = h;
         wantPitch = p;
@@ -379,33 +472,78 @@ void MobSystem::DriveSwim(Mob& mob, const MobDef& def, World& world, float dt) {
   }
 
   // ---- 3. STEER: the yaw is the walker's own; the pitch is the body's -------
+  // Short of a pectoral, the turn that would pivot on it is slower; and a
+  // hard brake on one fin loosens the steering against the spin it makes
+  // (last tick's brake: the thrust step below has not run yet). The thrash
+  // swings the line it steers for and puts it back after: the heading the
+  // behaviour layer asked for stays its own.
+  if (fd.present) {
+    const float loose = 1.0f - 0.7f * std::fabs(asym) * mob.brakeRatio_;
+    mob.turnCapL_ = (1.0f - fd.turnLoss * (1.0f - mob.finL_)) * loose;
+    mob.turnCapR_ = (1.0f - fd.turnLoss * (1.0f - mob.finR_)) * loose;
+  }
+  mob.desiredHeading_ += thrYaw;
   const float align = Steer(mob, def, dt);
+  mob.desiredHeading_ -= thrYaw;
+  const float pitchWas = mob.pitch_;
   {
-    const float step = sw.pitchRate * dt;
+    const float step = pitchRate * dt;
     mob.pitch_ += std::clamp(wantPitch - mob.pitch_, -step, step);
-    mob.pitch_ = std::clamp(mob.pitch_, -sw.maxPitch, sw.maxPitch);
+    mob.pitch_ = std::clamp(mob.pitch_, -maxPitch, maxPitch);
   }
 
   // ---- 4. THRUST, FINS, BUOYANCY --------------------------------------------
   // A fish cannot turn on the spot: the drive keeps a share of itself while
   // the nose is off the heading it wants, so a turn is a curve.
+  // Short of fins: the burst ceiling keeps its full height on one pectoral
+  // and falls toward 1.6x cruise with neither (a lunge, not a run); the tail
+  // is the thrust; the brake is the pectorals flared.
   const Vec3 fwd = mob.Forward3();
-  const float drive = std::clamp(mob.driveScale_, -0.3f, sw.burst);
-  const float target = def.speed * drive * (0.35f + 0.65f * align);
+  const float burst =
+      fd.present && pa < 0.5f
+          ? 1.0f + (sw.burst - 1.0f) * std::max(0.15f, 2.0f * pa)
+          : sw.burst;
+  float drive = std::clamp(mob.driveScale_, -0.3f, burst);
+  if (thr > 0.0f) drive += (thrDrive - drive) * thr;   // the lurches
+  const float target = def.speed * drive * (0.35f + 0.65f * align) * tailK;
   float vAl = mob.swimVel_.dot(fwd);
   Vec3 lat = mob.swimVel_ - fwd * vAl;
   {
     const float dv = target - vAl;
     const bool speeding = target >= 0.0f ? dv > 0.0f : dv < 0.0f;
-    const float rate = (speeding ? sw.accel : sw.brake) * dt;
-    vAl += std::clamp(dv, -rate, rate);
+    const float brake = fd.present ? sw.brake * Lerp1(1.0f - fd.brakeLoss, pa) : sw.brake;
+    const float rate = (speeding ? sw.accel * tailK : brake) * dt;
+    const float step = std::clamp(dv, -rate, rate);
+    vAl += step;
+    // THE SPIN-OUT: slowing on one pectoral is a drag on one side -- the body
+    // yaws toward the fin it still has, in proportion to how hard it brakes
+    // and how lopsided it is. Turned here, after Steer: the steering only
+    // gets it back from next tick, at the loosened rate above, and what
+    // velocity the yaw leaves off the new axis becomes sideslip (a skid,
+    // flank first).
+    mob.brakeRatio_ = 0.0f;
+    if (fd.present && asym != 0.0f && !speeding && target >= 0.0f && step < 0.0f &&
+        sw.brake > 0.0f) {
+      mob.brakeRatio_ = std::min(1.0f, -step / (sw.brake * std::max(dt, 1e-4f)));
+      const float yaw = fd.brakeSpin * asym * mob.brakeRatio_ * dt;
+      mob.heading_ = std::remainder(mob.heading_ + yaw, 6.2831853f);
+      mob.spinYaw_ += yaw;
+    }
   }
-  lat = lat * std::exp(-sw.sideGrip * dt);
+  lat = lat * std::exp(-sw.sideGrip * Lerp1(0.5f, pa) * dt);
   // The crowd's push (ApplyCrowdSpacing's driveStrafe_): a sidestep of the fins.
   const Vec3 right{std::cos(mob.heading_), 0.0f, -std::sin(mob.heading_)};
   lat = lat + right * (def.speed * mob.driveStrafe_ * std::min(1.0f, sw.sideGrip * dt));
   Vec3 v = fwd * vAl + lat;
   v.y -= g * (1.0f - sw.buoyancy * mob.immersion_) * dt;
+  // NO TRIM WITHOUT PECTORALS: a shark is held level by its body's angle in
+  // the flow, and the pectorals are what set that angle. Without them the
+  // share it cannot hold sinks it -- less at speed, where the body's own
+  // lift does more of the work.
+  if (fd.present && pa < 1.0f && fd.sink > 0.0f) {
+    const float hold = 0.5f * std::min(1.0f, speed / std::max(2.0f * def.speed, 1e-3f));
+    v.y -= g * fd.sink * (1.0f - pa) * (1.0f - hold) * mob.immersion_ * dt;
+  }
 
   // ---- 5. THE MOVE ------------------------------------------------------------
   // Samples down the body's own axis (nose to tail) and a body-height above and
@@ -507,10 +645,25 @@ void MobSystem::DriveSwim(Mob& mob, const MobDef& def, World& world, float dt) {
   // The coordinated-turn lean, atan(v w / g): a positive turn rate is a turn
   // to the body's LEFT (heading grows toward +X, its left), and a lean left is
   // a NEGATIVE turn about model +Z (+Z rolls the left side up).
+  //
+  // Short of a fin, three more terms (roll + = the left side up): THE LIST
+  // toward the missing pectoral (the one left lifts its side), half as much
+  // again when slow; THE CLIMB'S ROLL -- a pitch change made on one fin
+  // pushes that side up or down with it; and, with neither fin, a slow
+  // wallow it cannot damp. Then the thrash rolls it, fast.
   {
     const float lean = std::atan(vAl * mob.turnVel_ / std::max(g, 1.0f));
-    const float want = std::clamp(-lean * sw.bank, -sw.maxRoll, sw.maxRoll);
-    mob.roll_ += (want - mob.roll_) * HalfLifeK(dt, 0.18f);
+    float want = std::clamp(-lean * sw.bank, -sw.maxRoll, sw.maxRoll);
+    if (fd.present && pa < 1.0f) {
+      const float slow = 1.0f - std::min(1.0f, speed / std::max(def.speed, 1e-3f));
+      want += fd.listRoll * asym * (1.0f + 0.5f * slow);
+      want += fd.pitchRoll * asym * (mob.pitch_ - pitchWas) / std::max(dt, 1e-4f);
+      if (pa < 0.3f)
+        want += 0.3f * (1.0f - pa / 0.3f) * std::sin(mob.phase_ * 0.35f);
+      want = std::clamp(want, -1.4f, 1.4f);
+    }
+    want += thrRoll;
+    mob.roll_ += (want - mob.roll_) * HalfLifeK(dt, thr > 0.0f ? 0.06f : 0.18f);
   }
   // The water gives the breath back, twice as fast as the bank took it.
   mob.drySeconds_ = std::max(0.0f, mob.drySeconds_ - 2.0f * dt);

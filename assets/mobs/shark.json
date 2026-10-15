@@ -140,6 +140,8 @@
     "feel": 7,
     "bank": 0.7,
     "maxRoll": 0.8,
+    "//fins": "A BODY MISSING A FIN (MobDef::SwimDef::FinDef, DESIGN.md \"Swimmers\"). The pectorals start its pitch changes, pivot its turns and flare to brake; the tail is its thrust (Wilga & Lauder 2000). Each fin's share is its voxels left over its voxels at spawn. One pectoral gone: turns toward the stump at half rate (turnLoss) so it circles toward its good side; a hard brake -- the end of a charge -- spins it toward the fin it has (brakeSpin 2.5 rad/s at full brake, steering loosened while it lasts), so a missed pass ends in a skid, flank first; it lists toward the stump (listRoll ~17 deg, more when slow) and rolls with every climb and dive. Both gone: no trim -- it sinks (sink, a quarter of gravity when slow, less at speed), wallows, and its burst falls to a lunge. The tail gone: three quarters of the thrust (thrustLoss). Losing 15% of a fin at once or bite by bite (thrashMin) throws it into up to 2.5 s of flailing (thrash) that bites nothing.",
+    "fins": { "left": "fin.L", "right": "fin.R", "tail": "tail", "turnLoss": 0.5, "brakeSpin": 2.5, "brakeLoss": 0.5, "listRoll": 0.3, "pitchRoll": 0.15, "sink": 0.25, "thrustLoss": 0.75, "thrash": 2.5, "thrashMin": 0.15 },
     "breathSeconds": 10,
     "suffocateHp": 25,
     "flopMin": 0.5,
