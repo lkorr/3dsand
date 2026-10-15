@@ -552,6 +552,12 @@ class DebrisSystem {
   // scan (the plan's M9.4-D note), so this is keyed on the region and not on
   // whoever caused it.
   void SetChunkOwnedFn(std::function<bool(IVec3 wc)> fn);
+  // IS THIS REGION OF GRID MINE TO SCAN? Null function = yes, always. Public
+  // because a reaction's blast and flash ask the same question of the same
+  // grid (TickAuthority's reactFx drain, audit DET-9).
+  bool ChunkOwned(IVec3 wc) const {
+    return !chunkOwnedFn_ || chunkOwnedFn_(wc);
+  }
 
   // The global id of a body by handle, or 0 if the handle is not one of ours.
   // `(ownerAtCreate << 48) | serial` -- see net::MakeGlobalBodyId.
@@ -2161,10 +2167,6 @@ class DebrisSystem {
   // asks. Inline and branch-free-cheap on purpose: it is in five per-body
   // loops and a single-player run must not pay for it.
   bool OwnedLocally(const Body& b) const { return b.owner == localPlayerId_; }
-  // IS THIS REGION OF GRID MINE TO SCAN? Null function = yes, always.
-  bool ChunkOwned(IVec3 wc) const {
-    return !chunkOwnedFn_ || chunkOwnedFn_(wc);
-  }
   // The world chunk an event's SEED box sits in -- the box that actually
   // changed, not the margin-grown region, because the margin can reach across
   // an authority seam while the change itself did not.
