@@ -48,6 +48,26 @@ constexpr size_t kEvictBatch = 256;   // staging bound: 4 MB per readback batch
 // budget, not a 64 MiB reservation.
 constexpr size_t kMaxPendingEvicts = 16;  // in-flight batches before we block
 
+// The occupancy word's LIQUID SPAN field (common.wgsl occSpanBits, which this
+// mirrors exactly, tie rule included): the longest run of consecutive chunk
+// layers in `good` (bit y = every cell of local layer y holds the one full-
+// liquid key) as lo << 17 | len << 21. RENDER-ONLY derived data; 0 = no span,
+// which only costs the raymarcher a per-cell march.
+static_assert(kChunk == 16, "occupancy span field packs a 4-bit lo and 5-bit len");
+inline uint32_t OccSpanBits(uint32_t good) {
+  uint32_t bestLo = 0, bestLen = 0, runLo = 0, runLen = 0;
+  for (uint32_t y = 0; y < kChunk; y++) {
+    if (((good >> y) & 1u) != 0u) {
+      if (runLen == 0) runLo = y;
+      runLen++;
+      if (runLen > bestLen) { bestLen = runLen; bestLo = runLo; }
+    } else {
+      runLen = 0;
+    }
+  }
+  return (bestLo << 17) | (bestLen << 21);
+}
+
 // SANDVOX_PT_DEBUG attribution clock, matching pagetable.cpp's. Only read
 // inside a getenv guard.
 inline double PtNowMs() {
@@ -230,6 +250,8 @@ void Stream::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
                          (m.gpu.klass == CLASS_SOLID || m.gpu.klass == CLASS_POWDER ||
                           (m.gpu.klass == CLASS_LIQUID &&
                            (m.gpu.flags & kMatFlagOpaque) != 0)));
+  liquidOf_.clear();
+  for (const auto& m : mats) liquidOf_.push_back(m.gpu.klass == CLASS_LIQUID ? 1 : 0);
   // The far index's GROUND SLOT source (faredits.h kGroundShift): each
   // material's far slot when a cascade cell keeps it -- worldgen's
   // farCellIsSolid: not a gas, not a micro plant -- else "not solid".
@@ -1022,6 +1044,7 @@ void Stream::InstallChunkWords(uint32_t s, IVec3 wc, const uint32_t* words) {
     // paying the neighbour test here without the occupancy buffer in hand.
     if (entry != kPtEmpty) world_->pages->RefilledSlot(s);
     uint32_t occ = 0, blockers = 0, anyStain = 0;
+    uint32_t spanKey = 0xFFFFFFFFu, spanBad = 0;
     // Sub-chunk occupancy bitmask, built in the SAME sweep (world.h
     // kSubOccShift; layout per common.wgsl subOccIndex): [0..1] TOTAL,
     // [2..3] BLOCKERS. This is the third producer of the mask and it must
@@ -1041,6 +1064,20 @@ void Stream::InstallChunkWords(uint32_t s, IVec3 wc, const uint32_t* words) {
       // first reload of a world that had ever bled or been soaked.
       if ((w & kStainBits) != 0u) anyStain = 1;
       uint32_t m = w & 0xFFFu;
+      // The liquid span (OccSpanBits above; sim_occupancy's per-thread form
+      // with one thread): the first FULL liquid cell names the key, every
+      // cell before it or unlike it marks its layer bad. Before the air
+      // `continue`, because an air cell is exactly what breaks a layer.
+      const uint32_t ly = (li / kChunk) % kChunk;
+      if (spanKey == 0xFFFFFFFFu) {
+        if (m != 0 && m < liquidOf_.size() && liquidOf_[m] && ((w >> 12) & 0xFu) == 7u) {
+          spanKey = w & 0xFFFFu;
+        } else {
+          spanBad |= 1u << ly;
+        }
+      } else if ((w & 0xFFFFu) != spanKey) {
+        spanBad |= 1u << ly;
+      }
       if (m == 0) continue;
       occ++;
       // Mirror of common.wgsl subOccBitLocal: (bz * DIM + by) * DIM + bx over
@@ -1056,8 +1093,10 @@ void Stream::InstallChunkWords(uint32_t s, IVec3 wc, const uint32_t* words) {
         sub[kSubOccWords + (sbit >> 5)] |= sm;
       }
     }
-    // packing per common.wgsl packOccStain
-    occ |= blockers << 16;
+    // packing per common.wgsl packOccStain: bit 16 is a blocker FLAG (every
+    // reader only tests it against zero), which frees 17..25 for the span.
+    occ |= (blockers != 0 ? 1u : 0u) << 16;
+    if (spanKey != 0xFFFFFFFFu) occ |= OccSpanBits(~spanBad & 0xFFFFu);
     occ |= anyStain << 31;
     ctx_->queue.WriteBuffer(world_->occupancy, (uint64_t)s * 4, &occ, 4);
     // ...and the sub-chunk mask in the tail of the same buffer (world.h).

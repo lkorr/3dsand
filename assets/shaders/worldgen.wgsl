@@ -6491,12 +6491,13 @@ fn farPeakMat(biome : u32, peak : i32, tl : i32) -> u32 {
 
 var<workgroup> wgCount : atomic<u32>;
 var<workgroup> wgBlock : atomic<u32>;
-// The chunk's lowest and highest generated cell KEY (word bits 0..15), for
-// the occupancy word's UNIFORM bit (common.wgsl OCC_UNIFORM_BIT) -- the same
-// reduction sim_occupancy makes, so a generated lake's interior chunks carry
-// the bit from the first frame instead of from the first hash tick.
+// The occupancy word's LIQUID SPAN (common.wgsl occSpanStep / occSpanBits) --
+// the same reduction sim_occupancy makes, so a generated lake's or sea's
+// chunks carry it from the first frame instead of from the first hash tick
+// (an untouched lake is never dirty, so mainDirty would never revisit it).
 var<workgroup> wgKeyLo : atomic<u32>;
 var<workgroup> wgKeyHi : atomic<u32>;
+var<workgroup> wgSpanBad : atomic<u32>;
 // Cells in this chunk that can ACT (matCanAct, common.wgsl). Third counter
 // rather than a reuse of wgCount because occupancy needs the total and the
 // wake needs this one, and they are different questions about the same sweep.
@@ -6538,6 +6539,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
     atomicStore(&wgBlock, 0u);
     atomicStore(&wgKeyLo, 0xFFFFFFFFu);
     atomicStore(&wgKeyHi, 0u);
+    atomicStore(&wgSpanBad, 0u);
     atomicStore(&wgAct, 0u);
     atomicStore(&wgNotEq, 0u);
     atomicStore(&wgNotJit, 0u);
@@ -6551,8 +6553,8 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
   let base = slotWorldChunk(slot, T.origin) * i32(CHUNK);
   var count = 0u;
   var block = 0u;
-  var kLo = 0xFFFFFFFFu;
-  var kHi = 0u;
+  var spK = OCC_SPAN_NONE;   // the liquid span's per-thread state
+  var spBad = 0u;
   var act = 0u;
   var sm0 = 0u; var sm1 = 0u;   // sub-chunk TOTAL class
   var sb0 = 0u; var sb1 = 0u;   // sub-chunk BLOCKER class
@@ -6625,6 +6627,8 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
         for (var ly = unrollFenceU(); ly < CHUNK; ly += 1u) {
           voxStore(voxWordInChunk(slot, lx + ly * CHUNK + lz * CHUNK * CHUNK), 0u);
         }
+        // Sixteen air cells: no layer of this column holds a liquid.
+        spBad = 0xFFFFu;
         continue;
       }
       // The column and its cave bands. The bands are handed to genCellIn as
@@ -6728,9 +6732,10 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
         // point. genChunk overwrites the WHOLE chunk, so the CPU materializes
         // every target slot before the dispatch (§3.5c) and this never faults.
         voxStore(voxWordInChunk(slot, i), w);
-        kLo = min(kLo, w & 0xFFFFu);
-        kHi = max(kHi, w & 0xFFFFu);
         let m = w & 0xFFFu;
+        occSpanStep(&spK, &spBad, w & 0xFFFFu,
+                    m != MAT_AIR && materials[m].klass == CLASS_LIQUID && voxState(w) == 7u,
+                    ly);
         if (m != MAT_AIR) {
           count += 1u;
           let md = materials[m];
@@ -6751,8 +6756,9 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
   }
   atomicAdd(&wgCount, count);
   atomicAdd(&wgBlock, block);
-  atomicMin(&wgKeyLo, kLo);
-  atomicMax(&wgKeyHi, kHi);
+  atomicMin(&wgKeyLo, spK);
+  atomicMax(&wgKeyHi, select(spK, 0u, spK == OCC_SPAN_NONE));
+  atomicOr(&wgSpanBad, spBad);
   atomicAdd(&wgAct, act);
   atomicOr(&wgSub[0], sm0);
   atomicOr(&wgSub[1], sm1);
@@ -6769,9 +6775,9 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
     // stainless by construction and bit 31 must read 0. The page-table free
     // path relies on exactly that — a generated sky chunk has to be demotable
     // on sight, without a readback.
-    let uni = n == CHUNK_VOL && atomicLoad(&wgKeyLo) == atomicLoad(&wgKeyHi);
     occupancy[slot] = packOcc(n, atomicLoad(&wgBlock)) |
-                      select(0u, OCC_UNIFORM_BIT, uni);
+                      occSpanBits(atomicLoad(&wgKeyLo), atomicLoad(&wgKeyHi),
+                                  atomicLoad(&wgSpanBad));
     storeSubOcc(slot, atomicLoad(&wgSub[0]), atomicLoad(&wgSub[1]),
                 atomicLoad(&wgSub[2]), atomicLoad(&wgSub[3]));
     // ---- THE STREAMING WAKE (CLAUDE.md rule 2) -------------------------

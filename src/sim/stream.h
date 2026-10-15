@@ -659,7 +659,8 @@ class Stream {
   // because the two answer different questions about the SAME observation and
   // the one thing that must not happen is for them to see different worlds.
   FarPlumes farPlumes_;
-  std::vector<uint8_t> blockerOf_;  // per material: stops a ray (occ high 16)
+  std::vector<uint8_t> blockerOf_;  // per material: stops a ray (occ bit 16)
+  std::vector<uint8_t> liquidOf_;   // per material: CLASS_LIQUID (occ span key)
   std::vector<uint8_t> modified_;   // per slot, sticky since last recycle
   // ---- THE PRISTINE SENTINEL (2026-10-14, ticket 2026-10-11_12-10-09) -----
   // Per slot: the sentinel entry that describes, bit-exactly, the words

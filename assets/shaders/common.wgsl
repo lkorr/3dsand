@@ -5597,11 +5597,11 @@ fn isRayBlockerW(m : Material, w : u32) -> bool {
   if (!isRayBlocker(m)) { return false; }
   return m.klass != CLASS_POWDER || powderMass(w) >= POWDER_BLOCK_MIN;
 }
-// OCCUPANCY WORD: [31] anyStain | [30] uniform | [28..16] rayBlockers |
-// [15..0] nonAir count.
+// OCCUPANCY WORD: [31] anyStain | [30..26] 0 | [25..21] liquid span LEN |
+// [20..17] liquid span LO | [16] anyRayBlocker | [15..0] nonAir count.
 //
-// Both counts are bounded by CHUNK_VOL = 4,096, so each needs 13 bits and bit
-// 31 was dead space. It now carries "some cell in this chunk has STAIN bits
+// The count is bounded by CHUNK_VOL = 4,096, so it needs 13 bits and bits
+// 13..15 always read 0. Bit 31 carries "some cell in this chunk has STAIN bits
 // set", which is what lets the page-table free path decide from the snapshot
 // the CPU ALREADY HAS instead of reading the chunk's 16 KiB of words back.
 //
@@ -5615,29 +5615,79 @@ fn isRayBlockerW(m : Material, w : u32) -> bool {
 // is why reclamation was capped at 128 chunks/tick against an allocation rate
 // measured at 1,270/tick. With the answer folded in here it is one bit test.
 //
-// occBlockers MASKS to 13 bits (a count of at most CHUNK_VOL = 4,096): it used
-// to be a bare `>> 16`, which would now read the stain flag as a blocker count
-// of 32,768 and make every stained chunk fully opaque to the raymarcher's
-// chunk-skip test -- and bit 30 below is the same hazard one bit down.
+// [16] is a blocker FLAG, not a count (2026-10-15, water-surface pass). It was
+// a 13-bit count of ray blockers until every reader turned out to test it
+// against zero -- the chunk skip of media-blind rays, here and in raymarch --
+// so its other twelve bits now carry the liquid span below. `occBlockers`
+// keeps its name and its "== 0 means none" contract; packOcc/packOccStain take
+// the count and store whether it is non-zero, so no producer changed shape.
+// The CPU's store-hit upload (stream.cpp) packs the same flag.
 //
-// [30] UNIFORM (2026-10-15, frame-perf pass): every one of the chunk's 4,096
-// cells holds the SAME material + state (word bits 0..15) and none is air.
-// RENDER-ONLY and CONSERVATIVE: worldgen's genChunk and sim_occupancy's
-// resident paths compute it (a min/max of the key over the chunk); every other
-// writer (the sentinel paths, the CPU store-hit upload) leaves it 0, which only
-// costs the raymarcher a per-cell march, never a picture. The CPU snapshot keeps the count only (world.cpp masks 0xFFFF), so
-// no C++ reader sees it. What it buys: trace()'s liquid run crosses a chunk
-// that is all one full liquid in one step instead of cell by cell -- the
-// interior of a deep lake, which a primary ray otherwise walks for the whole
-// render.subVisibility (10 m) cap.
-const OCC_UNIFORM_BIT : u32 = 0x40000000u;
+// [25..17] THE LIQUID SPAN (2026-10-15, frame-perf pass; replaces bit 30's
+// whole-chunk UNIFORM flag, which is the span [0, 16)). RENDER-ONLY, DERIVED,
+// CONSERVATIVE: chunk-local layers lo .. lo+len-1 hold, in every one of their
+// cells, ONE full-liquid key (word bits 0..15: a CLASS_LIQUID material at
+// state 7). len 0 = no span. Of several such runs the LONGEST (the lowest on a
+// tie). What it buys: trace()'s liquid run, standing inside the span, crosses
+// the whole box (the chunk's x/z extent x the span's y extent) in one exit
+// instead of cell by cell -- the interior of a deep lake (span [0,16)), and
+// the chunk LAYER holding a lake's or the sea's surface (water below the top
+// layer, air or a partial top above: span [0, h)), where grazing rays spent
+// most of their 10 m (docs/PLAN_frame_perf.md §8). Producers: genChunk and
+// both sim_occupancy entry points (the per-thread reduction occSpanStep below)
+// and the CPU store-hit upload (stream.cpp OccSpanBits, the same tie rule).
+// Every other writer (the sentinel paths: a sentinel synthesises state 0..2,
+// never a full liquid) leaves it 0, which only costs a per-cell march. The CPU
+// snapshot keeps the count only (world.cpp masks 0xFFFF): no C++ reader sees
+// the span, and no sim kernel reads the occupancy word at all.
+// The field widths assume CHUNK = 16 (stream.cpp static_asserts it).
+const OCC_BLOCK_BIT      : u32 = 0x10000u;
+const OCC_SPAN_LO_SHIFT  : u32 = 17u;
+const OCC_SPAN_LEN_SHIFT : u32 = 21u;
+const OCC_SPAN_NONE      : u32 = 0xFFFFFFFFu;   // occSpanStep: no key yet
 fn occTotal(occ : u32) -> u32 { return occ & 0xFFFFu; }
-fn occBlockers(occ : u32) -> u32 { return (occ >> 16u) & 0x1FFFu; }
-fn occUniform(occ : u32) -> bool { return (occ & OCC_UNIFORM_BIT) != 0u; }
+// 0 or 1: "any ray blocker". Every caller tests it against 0.
+fn occBlockers(occ : u32) -> u32 { return (occ >> 16u) & 1u; }
+fn occSpanLo(occ : u32) -> u32 { return (occ >> OCC_SPAN_LO_SHIFT) & 0xFu; }
+fn occSpanLen(occ : u32) -> u32 { return (occ >> OCC_SPAN_LEN_SHIFT) & 0x1Fu; }
 fn occAnyStain(occ : u32) -> bool { return (occ & 0x80000000u) != 0u; }
-fn packOcc(total : u32, blockers : u32) -> u32 { return total | (blockers << 16u); }
+fn packOcc(total : u32, blockers : u32) -> u32 {
+  return total | select(0u, OCC_BLOCK_BIT, blockers != 0u);
+}
 fn packOccStain(total : u32, blockers : u32, anyStain : bool) -> u32 {
-  return total | (blockers << 16u) | select(0u, 0x80000000u, anyStain);
+  return packOcc(total, blockers) | select(0u, 0x80000000u, anyStain);
+}
+// One cell into a producer's PER-THREAD span state. `k` is the thread's key
+// (OCC_SPAN_NONE until its first full-liquid cell), `bad` the layers in which
+// it has seen a cell unlike that key -- every cell before the key was chosen
+// included, since such a cell is not a full liquid and so cannot equal it.
+// The workgroup then takes min and max of the keys of the threads that HAVE
+// one (a thread with none has marked every layer it visited bad) and ORs the
+// `bad`s: a layer is good iff every thread that owns cells in it saw only its
+// key there and all those keys agree. Exact for any cell-to-thread mapping;
+// order-independent (min/max/or), like every other reduction here.
+fn occSpanStep(k : ptr<function, u32>, bad : ptr<function, u32>, key : u32,
+               fullLiq : bool, ly : u32) {
+  if (*k == OCC_SPAN_NONE && fullLiq) { *k = key; }
+  if (key != *k) { *bad |= 1u << ly; }
+}
+// The span field from the workgroup's reduction: the longest run of set bits
+// in `good` (bit y = layer y is all the one key), lowest on a tie. Mirrored
+// exactly by stream.cpp OccSpanBits.
+fn occSpanBits(kLo : u32, kHi : u32, bad : u32) -> u32 {
+  if (kLo != kHi) { return 0u; }   // no key (NONE vs 0), or two keys
+  let good = ~bad & 0xFFFFu;
+  var bestLo = 0u; var bestLen = 0u; var runLo = 0u; var runLen = 0u;
+  for (var y = 0u; y < CHUNK; y++) {
+    if (((good >> y) & 1u) != 0u) {
+      if (runLen == 0u) { runLo = y; }
+      runLen += 1u;
+      if (runLen > bestLen) { bestLen = runLen; bestLo = runLo; }
+    } else {
+      runLen = 0u;
+    }
+  }
+  return (bestLo << OCC_SPAN_LO_SHIFT) | (bestLen << OCC_SPAN_LEN_SHIFT);
 }
 
 // ---- SUB-CHUNK OCCUPANCY BITMASK (PLAN_surface_flight_perf.md A2) ----------

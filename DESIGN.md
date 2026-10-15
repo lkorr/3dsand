@@ -415,9 +415,10 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
 - Per-chunk metadata (CPU-mirrored, few bytes each):
   - `dirty` — contains moving/reacting voxels; the only chunks the CA dispatches
   - `nonEmpty` — any voxels at all (empty-space skipping for rendering & raycasts).
-    Implemented as a packed per-chunk word: low 16 bits = non-air count, high 16 =
-    ray-blocker count (solid/powder/opaque-liquid), so media-blind rays (shadows)
-    skip chunks that hold only gas/translucent liquid (see common.wgsl packOcc)
+    Implemented as a packed per-chunk word: low 16 bits = non-air count, bit 16 =
+    any ray blocker (solid/powder/opaque-liquid), so media-blind rays (shadows)
+    skip chunks that hold only gas/translucent liquid, bits 17..25 = the liquid
+    span the raymarch jumps, bit 31 = any stain (see common.wgsl packOcc)
   - `hasLiquid`, `hasLights` — cheap routing flags
   - `faceOccupancy[6]` — does any voxel touch each boundary face (island detection §7)
 - **Hierarchical dirty flags**: a mip-style tree over chunk flags so the dispatcher
@@ -1110,7 +1111,7 @@ SSBO lists of chunk indices.
   cell of <= 4 eighths whose ray segment stays above its mid-plane is passed
   as air in the march and costs no record or neighbour read, 2026-10-03 —
   on the harness desert that second pass is the frame's largest term); light
-  (shadow rays, AO, occupancy's blocker count) treats a partial under
+  (shadow rays, AO, occupancy's blocker flag) treats a partial under
   `POWDER_BLOCK_MIN` = 5 eighths as open (`isRayBlockerW`), and the CPU mirror
   walks through a film under `kPowderWalkMin` = 3 eighths (`KindOfWord`).
   Gate `powder-mass`: exact eighths through merge and sink, no buried partial,
@@ -4414,26 +4415,36 @@ does not keep an idle lake awake (its miss path marks only a cell
 `stillWant` says can still change). Next lever if water is ever hot again: a
 UNIFORM-water chunk crossed analytically instead of ~16 run-loop steps.
 
-THE UNIFORM-CHUNK JUMP (2026-10-15, frame-perf pass; the lever named above).
-The occupancy word carries a fourth field, bit 30 = UNIFORM: every one of the
-chunk's 4,096 cells holds the same material + state (word bits 0..15) and none
-is air (`OCC_UNIFORM_BIT`, common.wgsl; the layout is now [31] anyStain | [30]
-uniform | [28..16] blockers | [15..0] nonAir, and `occBlockers` masks 13 bits).
-`genChunk` (worldgen.wgsl) and both `sim_occupancy` entry points compute it as
-a min/max of the key over the chunk; every other writer (the sentinel paths,
-the CPU store-hit upload) leaves it 0, which costs only a per-cell march. It is
-render-only: the CPU snapshot keeps the counts (world.cpp masks 0xFFFF), the
-world hash never sees occupancy. `trace()`'s liquid run, entering a uniform
-chunk of its own liquid, crosses it with one box exit and one add (the
-segments telescope exactly as the run loop's do), taken only when the face is
-nearer than the 10 m depth cap and the march's exit, so the cell a ray stops
-on is still found cell by cell. `--render-budget at` on ticket 22-55-53's lake
-(deep, no bed in reach; one process): 15.77 -> 14.50 ms. What is left there
-is the chunk layer holding the SURFACE (not uniform: air above, often a
-partial top layer), where grazing rays spend most of their 10 m: crossing it
-needs a per-chunk uniform Y SPAN, i.e. more bits than the word has free
-without repacking the CPU-written blocker count (stream.cpp) -- see
-docs/PLAN_frame_perf.md. Two shapes were measured and are not to be retried:
+THE LIQUID-SPAN JUMP (2026-10-15, frame-perf pass; the lever named above).
+The occupancy word carries a LIQUID SPAN: chunk-local layers [lo, lo+len) hold,
+in every cell, one full-liquid key (word bits 0..15, a CLASS_LIQUID material at
+state 7); len 0 = none, the longest such run wins (lowest on a tie). Layout
+(common.wgsl, `occSpanLo`/`occSpanLen`): [31] anyStain | [25..21] span len |
+[20..17] span lo | [16] anyRayBlocker | [15..0] nonAir. Bit 16 became a FLAG
+when the 13-bit blocker count turned out to be read only against zero; that
+freed the span's nine bits. It replaced the first form of this lever, bit 30
+= UNIFORM (the whole chunk one key -- now just the span [0, 16)). Producers:
+`genChunk` (worldgen.wgsl), both `sim_occupancy` entry points (a per-thread
+key + bad-layer mask, reduced by min/max/or: `occSpanStep`/`occSpanBits`) and
+the CPU store-hit upload (stream.cpp `OccSpanBits`, same tie rule); the
+sentinel paths leave it 0 (a sentinel is never a full liquid), which costs
+only a per-cell march. Render-only: the CPU snapshot keeps the count
+(world.cpp masks 0xFFFF), no sim kernel reads occupancy, the world hash never
+sees it. `trace()`'s liquid run, when the cell it started from AND the next
+cell both lie in the span, crosses the box [chunk x/z] x [span y] with one
+exit and one add (the segments telescope exactly as the run loop's do), taken
+only when the face is nearer than the 10 m depth cap and the march's exit; the
+landing cell is the exit face's neighbour with the other two axes clamped into
+the box (without the clamp the 1e-4 nudge near a box edge could carry
+floor(p) into the bed below the span with the wrong face axis: one-pixel dark
+speckles along every chunk side a lake bed meets). That covers the deep
+interior (span [0,16)) and the chunk LAYER holding a lake's or the sea's
+surface (span [0, h)), where grazing rays spent most of their 10 m.
+`--render-budget`, 1080p, same exe, interleaved control/final boots:
+`at` (ticket 22-55-53's deep lake) 14.43 -> 12.70 ms, `submerged` ~8.5 ->
+7.25, `lake` ~13.1 -> 11.3..12.2 (a noisy camera), `peaksea` unchanged
+(~6.5; its sea costs little in the march). Docs/PLAN_frame_perf.md §8 has the
+attribution and the arms. Two shapes were measured and are not to be retried:
 issuing the next cell's load one step ahead (-0.1..-0.25 ms, nothing on top of
 the jump), and letting the run cross chunk faces itself (+2.6 ms: lanes reach
 a face on different steps, and the face work, serialised per lane, costs more

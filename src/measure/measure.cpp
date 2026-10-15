@@ -194,7 +194,10 @@ void MeasureOccupancy(GpuContext& ctx, World& world) {
 
   for (uint32_t i = 0; i < kNumSlots; i++) {
     uint32_t count = occ[i] & 0xFFFFu;
-    uint32_t block = occ[i] >> 16;
+    // Bit 16 is a FLAG since 2026-10-15 (common.wgsl occupancy word: the
+    // count's bits went to the liquid span), so this tallies CHUNKS with any
+    // ray blocker, not blocker voxels.
+    uint32_t block = (occ[i] >> 16) & 1u;
     nonAir.Add(count);
     blockers.Add(block);
     totalNonAir += count;
@@ -258,7 +261,7 @@ void MeasureOccupancy(GpuContext& ctx, World& world) {
   std::printf("\n");
   nonAir.Print("non-air");
   std::printf("\n");
-  blockers.Print("ray-blocker");
+  blockers.Print("has-ray-blocker (0/1)");
 
   std::printf("\n  per chunk-Y layer (each layer = %ux%u = %u chunks, "
               "world y %u..%u per layer):\n",
