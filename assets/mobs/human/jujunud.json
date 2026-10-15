@@ -144,6 +144,7 @@
     "displayName": "Untitled",
     "body": {
       "race": "human",
+      "lower": "legs",
       "sex": "male",
       "bust": 0,
       "bra": {
@@ -193,7 +194,13 @@
         "fore": 10.563147536470888,
         "hand": 5.077100559855824
       },
-      "armLengths": 1
+      "armLengths": 1,
+      "skin": {
+        "texture": 0.15,
+        "detail": 0.6,
+        "blush": 0,
+        "moles": 0.1
+      }
     },
     "shape": {
       "waist": 0.9061879266566658,
@@ -262,7 +269,13 @@
       "beardTone": "shade",
       "beardLen": 0,
       "beardPoint": 0,
-      "beardFork": false
+      "beardFork": false,
+      "eyeOpen": 0.4,
+      "eyeTilt": 0,
+      "lashes": 0.5,
+      "lidCrease": 0.25,
+      "noseBridge": 0.5,
+      "noseBulb": 0.3
     },
     "hair": {
       "style": "topknot",
@@ -331,7 +344,22 @@
       "horn": "#d8ccb0",
       "hornTip": "#8a7e66",
       "claw": "#1a1412",
-      "mark": "#4a0e0c"
+      "mark": "#4a0e0c",
+      "pupil": "#120c06",
+      "fang": "#f0ead8",
+      "gold": "#d8a838",
+      "wart": "#584a26",
+      "tusk": "#e2d6b2",
+      "warpaint": "#e6e6d9",
+      "ring": "#6a6a66",
+      "hat": "#a82a2a",
+      "hatTrim": "#e6d8b4",
+      "eyeDark": "#1a1210",
+      "scale": "#4a6a3a",
+      "scaleShade": "#33492a",
+      "pattern": "#2a3a1e",
+      "belly": "#d8cf9a",
+      "fin": "#8aa86a"
     },
     "sylvan": {
       "face": "hollow",
@@ -439,6 +467,80 @@
       "mottle": 0.35,
       "glow": true,
       "posture": "upright"
+    },
+    "naga": {
+      "kind": "cobra",
+      "eyes": "slit",
+      "glow": false,
+      "markings": "none",
+      "scaleCreep": 0.5,
+      "faceScales": 0.35,
+      "fangs": 0.5,
+      "venom": true,
+      "hood": 0.6,
+      "hoodWidth": 0.6,
+      "hoodMark": "spectacle",
+      "ears": "human",
+      "crest": 0,
+      "regalia": "none"
+    },
+    "goblin": {
+      "kind": "forest",
+      "ears": "leaf",
+      "earLength": 0.6,
+      "earWidth": 0.45,
+      "earRise": 0.25,
+      "earSweep": 0.35,
+      "earFlop": 0.05,
+      "earPoint": 0.75,
+      "earNotch": 0,
+      "earTuft": 0,
+      "earRings": 0,
+      "nose": "hook",
+      "noseLength": 0.5,
+      "noseHook": 0.6,
+      "noseBulb": 0.15,
+      "noseBend": 0,
+      "nosePierce": "none",
+      "teeth": "snaggle",
+      "tusks": 0,
+      "tuskSpread": 0.5,
+      "eyes": "big",
+      "glow": false,
+      "warts": 0.2,
+      "blotch": 0.2,
+      "warpaint": "none",
+      "bodyPaint": 0,
+      "claws": 0.4,
+      "posture": "upright",
+      "hat": "none",
+      "hatSize": 0.5,
+      "hatHeight": 0.5,
+      "hatTilt": 0,
+      "hatFlop": 0.5,
+      "hatDetail": 0.5,
+      "hatWear": 0
+    },
+    "serpent": {
+      "length": 1.7,
+      "girth": 0.5,
+      "taper": 0.55,
+      "flat": 0.3,
+      "pattern": "banded",
+      "patternScale": 0.5,
+      "belly": 0.5,
+      "crest": 0,
+      "crestRun": 0.6,
+      "frills": 0,
+      "tip": "point",
+      "tipSize": 0.5,
+      "speed": 0.9,
+      "wave": 0.5,
+      "waveLength": 0.5,
+      "swim": "kick",
+      "kick": 0.5,
+      "sway": 0.4,
+      "tipFlick": 0.5
     }
   }
 }

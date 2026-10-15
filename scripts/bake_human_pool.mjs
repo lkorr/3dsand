@@ -75,6 +75,40 @@ const base = sc.resolveSidecar(stem => readJson(join(MOBS, stem + '.json')),
     return existsSync(p) ? readJson(p) : null;
   });
 
+// --rebake: RE-BAKE THE POOL THAT IS ON DISK, each body from the genome in its
+// own sidecar -- the same people, re-drawn by today's generator (a new face, a
+// new anatomy recipe) -- instead of re-rolling the population from --seed.
+// gen_mobs.mjs --rebake is the same thing for a named character; it cannot
+// reach these, which live outside the folders it searches.
+if (argv.includes('--rebake')) {
+  let n = 0, bad = 0;
+  for (const f of readdirSync(POOL).filter(f => f.endsWith('.json')).sort()) {
+    const stem = f.slice(0, -5);
+    const doc = readJson(join(POOL, f));
+    if (!doc.genome) { console.error(`${stem}: no genome block, skipped`); continue; }
+    const name = 'pool_' + stem;
+    const g = mg.normalizeGenome({ ...doc.genome, name });
+    const built = mg.generateMob(g, 0, { ...GEN, name });
+    const complaints = mg.validateMob(built);
+    if (complaints.length) {
+      console.error(`${stem}: REFUSED (${complaints[0]}); left as it was`);
+      bad++;
+      continue;
+    }
+    mg.bakeAnatomy(built, materials);
+    const out = mg.thinSidecar(built.sidecar, base, name);
+    console.log(`${stem}: ${built.vox.length} B art${dry ? ' (--dry)' : ''}`);
+    if (!dry) {
+      writeFileSync(join(POOL, stem + '.vox'), built.vox);
+      writeFileSync(join(POOL, stem + '.json'), JSON.stringify(out, null, 2) + '\n');
+    }
+    n++;
+  }
+  console.log(`re-baked ${n} pool bodies from their own genomes` +
+              (bad ? `, ${bad} refused` : ''));
+  process.exit(bad ? 1 : 0);
+}
+
 if (!dry) mkdirSync(POOL, { recursive: true });
 const written = new Set();
 const colours = new Set();

@@ -104,6 +104,13 @@ const S = {
   redo: [],
   // Play the body's idle motion (the tail sway) in the preview.
   animate: true,
+  // THE OLD/FINE FACE TOGGLE (2026-10-15). On, every preview on the page --
+  // the tweak pane, the litter, the saved characters -- is built with the
+  // human face as it was before the fine face (mobgen headVoxFine), so the
+  // two can be flipped between to judge what improved and what regressed. A
+  // VIEW only: a save always writes the fine face. Not kept across reloads,
+  // so the page always opens on what the game will load.
+  oldFaces: false,
   // Which race the saved-characters column lists ('all' for every one).
   // Kept across reloads; empty until first shown, then the edited race.
   poolRace: (() => { try { return localStorage.getItem('breed.poolRace') || ''; }
@@ -266,6 +273,15 @@ function slotRGB(genome) {
     for (const d of deps)
       if (d !== 'lip')
         out[mg.COLOR_SLOTS[d] - 127] = out[mg.COLOR_SLOTS[base] - 127];
+  // THE FINE FACE'S DETAIL SLOTS (mobgen.js detailColors) are drawn as
+  // THEMSELVES, not flattened to their family's base like skinShade above:
+  // they are the lines, nostrils, lashes and eye whites, and flattened they
+  // would be invisible here while plain in the game.
+  for (const [slot, hex] of Object.entries(mg.detailColors(genome.colors))) {
+    if (!hex) continue;
+    const n = parseInt(hex.slice(1, 7), 16);
+    out[slot - 127] = [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
   // THE WISPS carry a fourth entry, their coverage 0..255 (mobgen.js
   // wispColors). Both painters draw them see-through, as the game does.
   for (const [slot, hex] of Object.entries(mg.wispColors(genome.colors))) {
@@ -651,11 +667,14 @@ const shapeKey = g => JSON.stringify({ ...g, colors: null });
  *  (prototype-linked, so the shape's grid and face caches are shared). */
 function buildOf(genome, name, exact = false) {
   const g = mg.normalizeGenome(genome);
-  const k = JSON.stringify(g);
+  // The old-face view (S.oldFaces) is a second body per genome, keyed apart
+  // so flipping back and forth regenerates nothing. A SAVE ignores it.
+  const legacy = S.oldFaces && !exact;
+  const k = (legacy ? 'old|' : '') + JSON.stringify(g);
   const hit = buildCache.get(k);
   // A preview build carries no .vox (noVox below), so a save regenerates.
   if (hit && (!exact || (!hit.recolour && hit.vox))) return hit;
-  const sk = shapeKey(g);
+  const sk = (legacy ? 'old|' : '') + shapeKey(g);
   const shape = !exact && shapeCache.get(sk);
   if (shape) {
     const v = Object.create(shape);
@@ -671,6 +690,7 @@ function buildOf(genome, name, exact = false) {
       player: (H.tuning && H.tuning() && H.tuning().player) || undefined,
       name: name || g.name,
       noVox: !exact,
+      face: legacy ? 'legacy' : undefined,
     });
     out.complaints = mg.validateMob(out);
   } catch (e) {
@@ -1087,6 +1107,10 @@ function css() {
 #view-characters .bhead{display:flex;align-items:center;gap:6px;margin:0 0 6px}
 #view-characters .bhead h3{margin:0;flex:1}
 #view-characters .bhead button{font-size:10px;padding:0 6px}
+#view-characters .bhead button.oldface.on{background:#b5651d;color:#fff;
+  border-color:#e08a3c}
+#view-characters .oldbanner{font-size:10px;background:#b5651d;color:#fff;
+  padding:2px 6px;margin:0 0 4px;border-radius:2px}
 /* A COLLAPSED COLUMN is a strip you click to get it back: its name runs down
    it, so a collapsed pane is never a missing one. */
 #view-characters .bcol.collapsed{display:flex;flex-direction:column;
@@ -1550,6 +1574,30 @@ function orbitControls(canvas) {
   });
 }
 
+/** Flip every preview between the fine human face and the old one (S.oldFaces).
+ *  Both bodies stay cached, so flipping back and forth is instant after the
+ *  first time each is seen. */
+function flipFaces() {
+  S.oldFaces = !S.oldFaces;
+  render();
+  toast(S.oldFaces ? 'showing the OLD faces (before 2026-10-15)'
+                   : 'showing the new fine faces');
+}
+
+/** The old/fine toggle's button, for the tweak pane's header. */
+function faceToggle() {
+  return el('button', {
+    class: 'oldface' + (S.oldFaces ? ' on' : ''),
+    'data-nohist': true,
+    title: 'Compare: flip EVERY preview on this page (this character, the ' +
+           'litter, the saved characters) between the new fine human face ' +
+           'and skin and the old face. Key: ` (backtick). A view only -- ' +
+           'saving always writes the new face. Other races are unchanged ' +
+           'either way.',
+    onclick: flipFaces,
+  }, S.oldFaces ? 'faces: OLD' : 'faces: new');
+}
+
 function tweakPane() {
   // WIDE when the litter is folded away: a preview big enough to judge a face
   // by, beside the sliders instead of on top of them.
@@ -1600,6 +1648,7 @@ function tweakPane() {
   return el('div', { class: 'bcol' },
     colHead(null, 'this character',
             'the one character the sliders hold, and the thing a save writes',
+            faceToggle(),
             el('button', {
               title: both ? 'bring back the saved characters and the litter'
                           : 'fold both side columns away: the whole page for ' +
@@ -1610,6 +1659,10 @@ function tweakPane() {
               },
             }, both ? 'unfocus' : 'focus')),
     el('div', { class: 'tbody' },
+      S.oldFaces ? el('div', { class: 'oldbanner' },
+        'OLD FACES — every preview on the page is the human face as it was ' +
+        'before 2026-10-15. Press ` or the button to flip back. Saving still ' +
+        'writes the new face.') : null,
       el('div', { class: 'prev' },
         el('div', { class: 'pcanv' }, big, side),
         el('div', {},
@@ -2303,7 +2356,8 @@ function geneRow(spec) {
     const hi = spec.uiMax ?? spec.max;
     input = el('input', {
       type: 'range', min: spec.min, max: hi,
-      step: spec.step ?? ((hi - spec.min) / 100),
+      // A human's face rows take half steps (mobgen specStep / fineStep).
+      step: mg.specStep(spec, S.genome) ?? ((hi - spec.min) / 100),
       value: Math.min(v, hi),
       oninput: e => {
         gset(spec.path, Number(e.target.value));
@@ -2586,6 +2640,19 @@ export function attach(hooks) {
   root.addEventListener('keydown', e => {
     if (!e.ctrlKey && !e.metaKey && hist(e)) pushUndo();
   }, true);
+  // ` flips the old/fine faces (flipFaces) -- unless the key is being typed
+  // into a field, the character's name say. On the DOCUMENT, because clicking
+  // a canvas focuses nothing inside this page, and only while it is the tab
+  // on show (a hidden tab's section has no offsetParent).
+  document.addEventListener('keydown', e => {
+    if (e.key !== '`' || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (!root || !root.isConnected || root.offsetParent === null) return;
+    const t = e.target, tag = t && t.tagName;
+    if (tag === 'INPUT' && t.type !== 'range' && t.type !== 'checkbox') return;
+    if (tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
+    e.preventDefault();
+    flipFaces();
+  });
 }
 
 /** Ctrl+Z / Ctrl+Y from the host. */
@@ -2610,7 +2677,7 @@ export function saveFromHost() { return saveCharacter(); }
  *  more than the UI is a second implementation. */
 export const __test = {
   state: S,
-  buildOf, drawBody, rollLitter, render, loadPool,
+  buildOf, drawBody, rollLitter, render, loadPool, flipFaces,
   set(path, v) { gset(path, v); render(); },
   /** Paint a repaint queued for the next frame NOW, so a check can read the
    *  canvas straight after a pick (renderPreviewOnly is one-per-frame). */
