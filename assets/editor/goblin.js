@@ -697,6 +697,8 @@ export function surfacePass(g, role, name, cells, size, info) {
   const seed = strHash(name) ^ 0x60b1;
   const HIDE = new Set([A.SKIN_BASE, A.SKIN_SHADE, A.SKIN_LIGHT]);
   const LIT = new Set([A.SKIN_BASE, A.SKIN_LIGHT]);
+  // What may lie over the hide on a body part: the clothing and war paint.
+  const COVER = new Set([A.CLOTH, A.CLOTH_SHADE, SLOTS.PAINT]);
   const frontOf = (() => {
     const m = new Map();
     for (const [x, y, z] of G.list()) {
@@ -737,17 +739,24 @@ export function surfacePass(g, role, name, cells, size, info) {
   }
 
   // ---- warts: dark bumps, raised where the box has room ----------------------
+  // THE BUMP IS THE BODY'S, whatever is painted over it: under the shorts, a
+  // top or war paint a wart is still there, in the colour of what covers it.
+  // Raised only on bare hide, the underwear and paint sliders moved geometry
+  // -- and the hair hanging over it (a long-haired goblin's bra re-draped
+  // her hair). Only the dark spot is skin-only.
   if (s.warts > 0.05 && role !== 'hand' && role !== 'foot') {
     const p = s.warts * (role === 'head' ? 0.05 : 0.02);
     for (const v of G.list()) {
-      if (!HIDE.has(v[3]) || !G.exposed(v[0], v[1], v[2])) continue;
+      const bare = HIDE.has(v[3]);
+      if ((!bare && (role === 'head' || !COVER.has(v[3]))) ||
+          !G.exposed(v[0], v[1], v[2])) continue;
       if (rnd(seed, v[0], v[1], v[2], 0x3a) >= p) continue;
-      v[3] = SLOTS.WART;
+      if (bare) v[3] = SLOTS.WART;
       if (s.warts > 0.4) {
         // Proud: one cell outward on the first open lateral side.
         const [ix, iy] = G.inward(v[0], v[1]);
         const ox = v[0] + (v[0] - ix), oy = v[1] + (v[1] - iy);
-        G.put(ox, oy, v[2], SLOTS.WART);
+        G.put(ox, oy, v[2], v[3]);
       }
     }
   }
@@ -761,7 +770,10 @@ export function surfacePass(g, role, name, cells, size, info) {
 
   // ---- the eyes -------------------------------------------------------------------
   const eyeRow = info.eyeRow ?? sz * 0.6;
+  // The eyes the head says it has (info.isEye, mobgen headMarks), not every
+  // cell in the EYE slot: a dark or open mouth is painted in it too.
   const eyeCells = G.list().filter(c => c[3] === A.EYE &&
+                                       (!info.isEye || info.isEye(c[0], c[1], c[2])) &&
                                        Math.abs(c[2] + 0.5 - eyeRow) < 5);
   const eyes = [eyeCells.filter(c => c[0] + 0.5 < cx),
                 eyeCells.filter(c => c[0] + 0.5 >= cx)].filter(e => e.length);
@@ -965,7 +977,11 @@ export function extras(g, ctx) {
   const hc = sceneCells(head);
   const EYEISH = new Set([ART.EYE, SLOTS.PUPIL]);
   const eyeCells = hc.filter(c => EYEISH.has(c[3]));
-  const eyeZ = eyeCells.length
+  // The eye line the head says it has (ctx.eyeLine, mobgen headMarks): the
+  // mean of every EYE-slot cell moved with a dark or an open mouth, and the
+  // ears and the nose hang off this.
+  const eyeZ = ctx.eyeLine ? (ctx.eyeLine[0] + ctx.eyeLine[1]) / 2 + 0.5
+    : eyeCells.length
     ? eyeCells.reduce((a, c) => a + c[2], 0) / eyeCells.length + 0.5
     : H.z0 + (H.z1 - H.z0) * 0.6;
   const xc = (H.x0 + H.x1 + 1) / 2;

@@ -722,6 +722,10 @@ export function defaultGenome() {
         nails: 1,
         toes: 0.6,
         softEdge: 1,    // the checker where a limb's shaded side begins
+        // WHICH moles, freckles and mottle (humanSkinPass, the fine face's
+        // freckles): the dice for the scatter, read by nothing else. The
+        // amounts are their own genes; this only says where they fall.
+        pattern: 0,
       },
     },
 
@@ -815,6 +819,11 @@ export function defaultGenome() {
       beardLen: 0,      // real hair hanging off the chin: 1 reaches the waist
       beardPoint: 0,    // the hanging beard tapers to a point
       beardFork: false, // ...to two points
+      // Real hair standing off the painted beard, in SHIPPED (fine) voxels,
+      // not the hair volume's steps of two (hairMass).
+      // Its own gene since 2026-10-15: until then the HAIR's volume grew off
+      // the beard paint as well, so the hair-volume slider puffed out beards.
+      beardVolume: 0,
       // ---- 2026-10-15: THE FINE FACE's own genes (headVoxFine; a human's
       // only). These defaults are the fine face as first drawn, and a genome
       // written before them takes them, which is how every saved human gets
@@ -872,6 +881,11 @@ export function defaultGenome() {
       tail: 0,          // ponytail length, on the same scale as drop
       braid: false,     // the tail is plaited
       twin: false,      // two tails behind the ears instead of one
+      // ---- the tail's shape (2026-10-15). 0 / 0 / 1 is the tail as first
+      // drawn, so every saved ponytail builds as it did.
+      tailCurve: 0,     // -1 hugs the back .. 0 falls onto it .. 1 sweeps out
+      tailHeight: 0,    // where it is tied: -1 the nape .. 0 as drawn .. 1 the crown
+      tailThick: 1,     // its girth, 0.5 .. 1.6
       wisp: 0.35,       // share of a hanging strand that thins to nothing
       ragged: 0.3,      // how uneven the ends are
       // ---- bangs and REGIONAL THINNING (2026-09-24). `wisp` thins only the
@@ -961,7 +975,8 @@ const HAIR_NONE = { back: 99, front: 99, length: 0, knot: false, side: 0,
                     band: 1, volume: 0, crest: 0, spikes: 0, buns: false,
                     drop: 0, tail: 0, braid: false, twin: false, wisp: 0.35,
                     ragged: 0.3, bangs: 0, faceThin: 0, hairlineSoft: 0,
-                    sideThin: 0, topThin: 0, fluff: 0 };
+                    sideThin: 0, topThin: 0, fluff: 0,
+                    tailCurve: 0, tailHeight: 0, tailThick: 1 };
 const hs = o => ({ ...HAIR_NONE, ...o });
 export const HAIR_STYLES = {
   // ---- short: paint on the skull, and at most a little mass
@@ -1010,7 +1025,8 @@ export const HAIR_STYLE_ORDER = Object.keys(HAIR_STYLES);
 const BEARD_NONE = { beard: 0, beardLip: 0, beardChin: 0, beardJaw: 0,
                      beardCheek: 0, beardSide: 0, beardWidth: 0,
                      beardDensity: 1, beardRagged: 0.45, beardTone: 'shade',
-                     beardLen: 0, beardPoint: 0, beardFork: false };
+                     beardLen: 0, beardPoint: 0, beardFork: false,
+                     beardVolume: 0 };
 const bs = o => ({ ...BEARD_NONE, ...o });
 // No moustache, no chin, no jaw: the building blocks the styles combine.
 const NO_JAW = { beardJaw: -4 };
@@ -1042,7 +1058,7 @@ export const BEARD_STYLES = {
   short:      bs({ beard: 0.7, beardJaw: -1, beardRagged: 0.1 }),
   full:       bs({ beard: 1 }),
   bushy:      bs({ beard: 1, beardWidth: 0.6, beardRagged: 0.8, beardCheek: 1,
-                   beardSide: 0.8, beardLen: 0.1 }),
+                   beardSide: 0.8, beardLen: 0.1, beardVolume: 2 }),
   muttonchops: bs({ beard: 0.9, beardLip: -1, beardChin: -1, beardCheek: 1,
                     beardSide: 1 }),
   friendly:   bs({ beard: 0.9, beardLip: 0.3, beardChin: -1, beardCheek: 1,
@@ -1778,35 +1794,35 @@ export const GENE_SPECS = [
   { path: 'hair.twin', label: 'twin tails', group: 'hair', kind: 'bool',
     hint: 'Two tails tied behind the ears instead of one at the back.',
     sigma: 0.2 },
-  { path: 'hair.wisp', label: 'thinning ends', group: 'hair',
+  { path: 'hair.wisp', label: 'thinning ends', group: 'hair', ui: 1001,
     hint: 'What share of each hanging strand fades toward see-through at ' +
           'its tip. 0 cuts off blunt.',
     min: 0, max: 0.8, step: 0.05, sigma: 0.1 },
-  { path: 'hair.ragged', label: 'ragged ends', group: 'hair',
+  { path: 'hair.ragged', label: 'ragged ends', group: 'hair', ui: 1001,
     hint: 'How uneven the strands are where they end. 0 is a clean cut.',
     min: 0, max: 1, step: 0.05, sigma: 0.15 },
-  { path: 'hair.bangs', label: 'bangs', group: 'hair',
+  { path: 'hair.bangs', label: 'bangs', group: 'hair', ui: 1001,
     hint: 'A fringe of real hair hanging from the hairline down over the ' +
           'forehead. 1 reaches the eyes; the parting tilts it to one side.',
     min: 0, max: 1, step: 0.05, sigma: 0.15 },
-  { path: 'hair.faceThin', label: 'thin at face', group: 'hair',
+  { path: 'hair.faceThin', label: 'thin at face', group: 'hair', ui: 1001,
     hint: 'Hair near the face turns see-through, most at the ends of the ' +
           'bangs where they meet the eyes. Needs bangs or hair standing ' +
           'off the head to have anything to thin.',
     min: 0, max: 1, step: 0.05, sigma: 0.15 },
-  { path: 'hair.hairlineSoft', label: 'soft hairline', group: 'hair',
+  { path: 'hair.hairlineSoft', label: 'soft hairline', group: 'hair', ui: 1001,
     hint: 'Breaks up the edge of the hair on the head into scalp, so the ' +
           'hairline fades out instead of ending on a ruled line.',
     min: 0, max: 1, step: 0.05, sigma: 0.15 },
-  { path: 'hair.sideThin', label: 'thin at sides', group: 'hair',
+  { path: 'hair.sideThin', label: 'thin at sides', group: 'hair', ui: 1001,
     hint: 'Thins the temples and the sides of the head, and the outer ' +
           'edges of hair hanging down.',
     min: 0, max: 1, step: 0.05, sigma: 0.15 },
-  { path: 'hair.topThin', label: 'thin on top', group: 'hair',
+  { path: 'hair.topThin', label: 'thin on top', group: 'hair', ui: 1001,
     hint: 'Thins the crown: scalp shows through on top and any hair ' +
           'standing there goes see-through. High is a thinning older head.',
     min: 0, max: 1, step: 0.05, sigma: 0.15 },
-  { path: 'hair.fluff', label: 'wispy surface', group: 'hair',
+  { path: 'hair.fluff', label: 'wispy surface', group: 'hair', ui: 1001,
     hint: 'Breaks the outer surface of any hair standing off the head or ' +
           'hanging into loose see-through wisps, all over.',
     min: 0, max: 1, step: 0.05, sigma: 0.15 },
@@ -2120,6 +2136,45 @@ GENE_SPECS.push(
     tone: 'hair', race: 'human', late: true, sigma: 0.1,
     hint: 'The lash line\u2019s colour. The eyes tab\u2019s lash opacity fades ' +
           'it toward the skin.' },
+  // ---- THE TAIL'S SHAPE (2026-10-15, owner ask: "the tail curves inwards
+  // toward the body and i want control to make it curve a bit outwards as
+  // well"). Every race's, so no `race`; `ui` 1000.5 sits them right after
+  // the twin-tails row (the rows after it carry 1001).
+  { path: 'hair.tailCurve', label: 'tail curve', group: 'hair', late: true,
+    ui: 1000.5,
+    hint: 'How the ponytail bends as it falls. Below 0 it tucks in under ' +
+          'the tie and lies flat down the back; 0 falls in onto the back; ' +
+          'above 0 it sweeps out away from the back in an arc, the end ' +
+          'furthest out.',
+    min: -1, max: 1, step: 0.05, sigma: 0.2 },
+  { path: 'hair.tailHeight', label: 'tied at', group: 'hair', late: true,
+    ui: 1000.5,
+    hint: 'Where the tail is gathered: low at the nape, the back of the ' +
+          'head, or high on the crown. Twin tails move up and down behind ' +
+          'the ears.',
+    min: -1, max: 1, step: 0.05, sigma: 0.2 },
+  { path: 'hair.tailThick', label: 'tail thickness', group: 'hair', late: true,
+    ui: 1000.5,
+    hint: 'How much hair is gathered into it, tie and all: a thin tail to ' +
+          'a heavy one.',
+    min: 0.5, max: 1.6, step: 0.05, sigma: 0.1 },
+  // THE BEARD'S VOLUME (2026-10-15): until it had a row, the hair's `volume`
+  // grew off beard paint too, so the hair slider puffed out the beard.
+  { path: 'face.beardVolume', label: 'volume', group: 'beard', late: true,
+    hint: 'Real hair standing off the painted beard, this many fine ' +
+          'voxels: a full, bushy beard rather than one drawn on. 0 is ' +
+          'paint on the skin, which is right for stubble and anything ' +
+          'trimmed.',
+    min: 0, max: 8, step: 1, int: true, roll: 0.3, sigma: 1 },
+  // THE SKIN'S DICE: which moles, freckles and mottle (humanSkinPass and the
+  // fine face's freckles hash it and nothing else does). A `dice` row is
+  // drawn whole, never nudged or blended: pattern 41 is no nearer 40 than 900.
+  { path: 'body.skin.pattern', label: 'pattern', group: 'skin', race: 'human',
+    late: true, dice: true, int: true, ui: 4,
+    hint: 'WHERE the moles, freckles and mottle fall: every number is a ' +
+          'different scatter of the same amounts. Nothing else on the ' +
+          'body reads it, and it reads nothing else.',
+    min: 0, max: 999, step: 1, sigma: 0.15 },
 );
 
 /** Does this row apply to this genome? (race-gated rows, see GENE_SPECS;
@@ -2495,6 +2550,10 @@ const isLocked = (locks, path) =>
   : Array.isArray(locks) ? locks.includes(path)
   : false;
 
+/** A `dice` row's throw: any whole value of its range, all equally likely. */
+const diceRoll = (spec, r) =>
+  spec.min + Math.min(spec.max - spec.min, Math.floor(r() * (spec.max - spec.min + 1)));
+
 const chanOf = hex => {
   const n = parseInt(hex.slice(1), 16);
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
@@ -2597,6 +2656,9 @@ export function mutate(genome, sigma, rng, locks) {
       if (r() < s) setPath(g, spec.path, !cur);
     } else if (spec.kind === 'enum') {
       if (r() < s) setPath(g, spec.path, r.pick(spec.choices));
+    } else if (spec.dice) {
+      // A dice row is kept or thrown again, never nudged (see the row).
+      if (r() < s) setPath(g, spec.path, diceRoll(spec, r));
     } else {
       setPath(g, spec.path, cur + r.norm() * s);
     }
@@ -2667,7 +2729,9 @@ export function cross(parents, rng, opts = {}) {
     if (isLocked(opts.locks, spec.path)) continue;
     if (spec.fixed || !specApplies(spec, g)) continue;   // no draw: see `race`
     if (spec.styled) continue;          // a style row: kept, see BRIEFS_SPECS
-    if (spec.kind === 'enum' || spec.kind === 'bool') {
+    // A dice row is inherited whole, like a pick: the mean of two patterns
+    // is a third pattern, not something between them.
+    if (spec.kind === 'enum' || spec.kind === 'bool' || spec.dice) {
       setPath(g, spec.path, getPath(r.pick(ps), spec.path));
     } else if (spec.kind === 'color') {
       // A colour blend between two parents is legitimate (skin tone really
@@ -2837,6 +2901,7 @@ export function randomGenome(rng, locks, opts = {}) {
     if (spec.roll !== undefined && r() >= spec.roll) continue;
     if (spec.kind === 'bool') { setPath(g, spec.path, r() < 0.4); continue; }
     if (spec.kind === 'enum') { setPath(g, spec.path, r.pick(spec.choices)); continue; }
+    if (spec.dice) { setPath(g, spec.path, diceRoll(spec, r)); continue; }
     const d = getPath(g, spec.path);
     const t = (r() + r()) * 0.5;
     setPath(g, spec.path, d + (t - 0.5) * 2 * Math.max(d - spec.min, spec.max - d));
@@ -3622,6 +3687,12 @@ function headVox(g, size, ctx) {
     return p > 0 && hashN(x, y, z, 71) / 4294967296 < p;
   };
 
+  // WHAT THE HAIR MASS IS TOLD (headMarks), as headVoxFine records it: the
+  // cap, the skull's extent, the beard, the eyes, the ears and nose -- here
+  // in authored cells, which generateMob scales to the shipped lattice.
+  const kA = (x, y, z) => x + sx * (y + sy * z);
+  const capK = new Set(), beardK = new Set(), featK = new Set();
+  const sk0 = [1e9, 1e9, 1e9], sk1 = [-1e9, -1e9, -1e9];
   const out = [];
   for (let z = 0; z < sz; z++) {
     let rx, ry;
@@ -3635,21 +3706,28 @@ function headVox(g, size, ctx) {
         if (!ellipseMask(x, y, cx, hcy, rx, ry)) continue;
         const back = y + 0.5 < hcy - 1.5;
         let col;
-        if (isHair(x, y, z))
+        if (isHair(x, y, z)) {
           col = thinCap && scalpShows(x, y, z) ? ART.SKIN_LIGHT
               : back ? ART.HAIR_SHADE : ART.HAIR;
-        else col = back ? ART.SKIN_SHADE : ART.SKIN_BASE;
+          capK.add(kA(x, y, z));
+        } else col = back ? ART.SKIN_SHADE : ART.SKIN_BASE;
         out.push([x, y, z, col]);
+        if (z >= sz * 0.25) {
+          sk0[0] = Math.min(sk0[0], x); sk1[0] = Math.max(sk1[0], x);
+          sk0[1] = Math.min(sk0[1], y); sk1[1] = Math.max(sk1[1], y);
+          sk0[2] = Math.min(sk0[2], z); sk1[2] = Math.max(sk1[2], z);
+        }
       }
   }
 
   const has = new Set(out.map(([x, y, z]) => x + ',' + y + ',' + z));
   const add = (x, y, z, c) => {
     const k = x + ',' + y + ',' + z;
-    if (x < 0 || y < 0 || z < 0 || x >= sx || y >= sy || z >= sz) return;
-    if (has.has(k)) return;
+    if (x < 0 || y < 0 || z < 0 || x >= sx || y >= sy || z >= sz) return false;
+    if (has.has(k)) return false;
     has.add(k);
     out.push([x, y, z, c]);
+    return true;
   };
 
   // A MANE: hair hanging behind the skull, down the nape. New cells below
@@ -3669,7 +3747,7 @@ function headVox(g, size, ctx) {
         for (let x = 0; x < sx; x++) {
           if (!ellipseMask(x, y, cx, hcy, rx, ry)) continue;
           if (y + 0.5 >= hcy - 1.0) continue;          // back half only
-          add(x, y, z, ART.HAIR_SHADE);
+          if (add(x, y, z, ART.HAIR_SHADE)) capK.add(kA(x, y, z));
         }
   }
   // A TOPKNOT: a bun on the back of the crown. GROWN FROM AN EXISTING CELL
@@ -3687,7 +3765,7 @@ function headVox(g, size, ctx) {
           if (has.has(x + ',' + y + ',' + z)) { backY = y; break; }
         if (backY <= 0) continue;
         for (let d = 1; d <= kd && backY - d >= 0; d++)
-          add(x, backY - d, z, ART.HAIR_SHADE);
+          if (add(x, backY - d, z, ART.HAIR_SHADE)) capK.add(kA(x, backY - d, z));
       }
   }
 
@@ -3831,7 +3909,11 @@ function headVox(g, size, ctx) {
       });
     }
     if (f.browProud)
-      for (const [x, z, low] of browCells) if (low) proud(x, z, ART.SKIN_BASE);
+      for (const [x, z, low] of browCells)
+        if (low) {
+          const i = proud(x, z, ART.SKIN_BASE);
+          if (i >= 0) featK.add(kA(out[i][0], out[i][1], out[i][2]));
+        }
   }
 
   // ---- skin marks: painted first, so beard, eyes, mouth and brows lie over
@@ -3930,8 +4012,10 @@ function headVox(g, size, ctx) {
       if (centre && !side && (lipRow ? f.beardLip : f.beardChin) !== 0 &&
           dx > cW - 1) edge = true;
       if (f.beardDensity < 1 && rnd01(x, y, z, 131) >= f.beardDensity) continue;
-      if (!edge || hashN(x, y, z, 97) / 4294967296 < keep)
+      if (!edge || hashN(x, y, z, 97) / 4294967296 < keep) {
         out[i] = [x, y, z, beardTone];
+        beardK.add(kA(x, y, z));
+      }
     }
   }
   // SIDEBURNS: the outermost two columns just in front of the ear, from the
@@ -3953,6 +4037,7 @@ function headVox(g, size, ctx) {
         if (Math.abs(x + 0.5 - cx) < maxDx - 1) continue;
         if (f.beardDensity < 1 && rnd01(x, y, z, 131) >= f.beardDensity) continue;
         out[i] = [x, y, z, beardTone];
+        beardK.add(kA(x, y, z));
       }
     }
   }
@@ -3968,6 +4053,12 @@ function headVox(g, size, ctx) {
     }
     for (const i of front.values()) out[i] = [out[i][0], out[i][1], out[i][2], col];
   };
+  // The eye cells, for headMarks: found before the paint, by the same rule.
+  const eyeK = new Set();
+  for (const x of eyeCols) {
+    const i = frontAt(x, eyeZ);
+    if (i >= 0) eyeK.add(kA(out[i][0], out[i][1], out[i][2]));
+  }
   paintFront(eyeCols, eyeZ, ART.EYE);
   if (f.eyeWhites)
     for (const s of eyeSides) light(s.outer + s.dir, eyeZ);
@@ -4022,6 +4113,26 @@ function headVox(g, size, ctx) {
       if (f.browSparse > 0 && rnd01(x, z, 163) < f.browSparse) continue;
       paintAt(x, z, tone);
     }
+  }
+  // headMarks, in AUTHORED cells and already flipped like the cells are;
+  // generateMob scales them to the shipped lattice with the cells.
+  if (ctx.marks) {
+    const flip = k => {
+      const x = k % sx, y = Math.floor(k / sx) % sy, z = Math.floor(k / (sx * sy));
+      return x + sx * ((sy - 1 - y) + sy * z);
+    };
+    for (const i of [...earSet, ...noseSet])
+      featK.add(kA(out[i][0], out[i][1], out[i][2]));
+    const keys = s => new Set([...s].map(flip));
+    ctx.marks.head = {
+      authored: true, size: [sx, sy, sz],
+      scalp: keys([...capK].filter(k => !eyeK.has(k))), beard: keys(beardK),
+      features: keys(featK), eyeCells: keys(eyeK),
+      eyes: [...eyeCols].map(x => [x, eyeZ]), eyeLo: eyeZ, eyeHi: eyeZ,
+      eyeBaseHi: eyeZ - g.face.eyeRow,
+      skull: { c0: [sk0[0], sy - 1 - sk1[1], sk0[2]],
+               c1: [sk1[0], sy - 1 - sk0[1], sk1[2]] },
+    };
   }
   return flipY(size, out);
 }
@@ -4129,6 +4240,16 @@ function headVoxFine(g, artSize, ctx) {
     const dx = (ac(X) - cx) / rx, dy = (ac(Y) - hcy) / ry;
     return dx * dx + dy * dy <= 1.0;
   };
+  // THE HEAD'S OWN FRAME for every hashed choice on it: across from the
+  // midline, front to back from the skull's centre, up from the box floor.
+  // Keyed on the box corner, a head two cells wider shifted every cell's key
+  // and re-rolled every speckle on it (see GENE INDEPENDENCE).
+  const HX = sx >> 1, HY = Math.round(hcy * S);
+  // WHAT THE HAIR MASS NEEDS TO KNOW, recorded as it is decided rather than
+  // read back out of the paint afterwards (headMarks; hairMass): the cap, the
+  // skull's own extent, the beard, the eyes, and the ears and nose.
+  const capK = new Set(), beardK = new Set();
+  const sk0 = [1e9, 1e9, 1e9], sk1 = [-1e9, -1e9, -1e9];
 
   // ---- the hair function, headVox's own, at shipped resolution ------------
   const hz = az / DEF.head.size[2], hy = ay / DEF.head.size[1];
@@ -4168,7 +4289,7 @@ function headVoxFine(g, artSize, ctx) {
       const w = clamp((axd - 0.55) / 0.4, 0, 1) * (Z / S < az * 0.8 ? 1 : 0.4);
       p = Math.max(p, hg.sideThin * 0.6 * w);
     }
-    return p > 0 && hashN(X, Y, Z, 71) / 4294967296 < p;
+    return p > 0 && hashN(X - HX, Y - HY, Z, 71) / 4294967296 < p;
   };
 
   // ---- the skull ------------------------------------------------------------
@@ -4186,11 +4307,19 @@ function headVoxFine(g, artSize, ctx) {
         if (!inEllipse(X, Y, rx, ry)) continue;
         const back = ac(Y) < hcy - 1.5;
         let c;
-        if (isHair(X, Y, Z))
+        if (isHair(X, Y, Z)) {
           c = thinCap && scalpShows(X, Y, Z) ? ART.SKIN_LIGHT
             : back ? ART.HAIR_SHADE : ART.HAIR;
-        else c = back ? ART.SKIN_SHADE : ART.SKIN_BASE;
+          capK.add(at(X, Y, Z));
+        } else c = back ? ART.SKIN_SHADE : ART.SKIN_BASE;
         col[at(X, Y, Z)] = c;
+        // The skull's extent over its upper three quarters, the frame the
+        // hair mass is grown in -- the skull alone, before any ear or nose.
+        if (Z >= sz * 0.25) {
+          sk0[0] = Math.min(sk0[0], X); sk1[0] = Math.max(sk1[0], X);
+          sk0[1] = Math.min(sk0[1], Y); sk1[1] = Math.max(sk1[1], Y);
+          sk0[2] = Math.min(sk0[2], Z); sk1[2] = Math.max(sk1[2], Z);
+        }
       }
   }
 
@@ -4206,7 +4335,7 @@ function headVoxFine(g, artSize, ctx) {
         for (let X = 0; X < sx; X++) {
           if (!inEllipse(X, Y, rx, ry)) continue;
           if (ac(Y) >= hcy - 1.0) continue;
-          add(X, Y, Z, ART.HAIR_SHADE);
+          if (add(X, Y, Z, ART.HAIR_SHADE)) capK.add(at(X, Y, Z));
         }
   }
   // A TOPKNOT, headVox's: grown back off the back-most cell of each column
@@ -4220,7 +4349,7 @@ function headVoxFine(g, artSize, ctx) {
         for (let Y = 0; Y < sy; Y++) if (get(X, Y, Z)) { backY = Y; break; }
         if (backY <= 0) continue;
         for (let d = 1; d <= kd && backY - d >= 0; d++)
-          add(X, backY - d, Z, ART.HAIR_SHADE);
+          if (add(X, backY - d, Z, ART.HAIR_SHADE)) capK.add(at(X, backY - d, Z));
       }
   }
 
@@ -4468,6 +4597,8 @@ function headVoxFine(g, artSize, ctx) {
   }
   // BLUSH (body.skin.blush): the lip colour, dithered over the same cheek
   // patch, thinning to its rim; strong enough, it reaches the tip of the nose.
+  // The dither is keyed to the patch (the outer eye corner, the eye row), so
+  // it rides with the eyes instead of re-rolling when they move.
   const blush = g.body.skin.blush;
   if (blush >= 0.1) {
     const rx = 2.4, rz = 1.7, pcx = eOut + 1.5, pcz = Ze - 2.5;
@@ -4475,17 +4606,21 @@ function headVoxFine(g, artSize, ctx) {
       for (let X = Math.floor(pcx - rx); X <= Math.ceil(pcx + rx); X++) {
         const ex = (X + 0.5 - pcx) / rx, ez = (Z + 0.5 - pcz) / rz;
         const d = Math.sqrt(ex * ex + ez * ez);
-        if (d > 1 || rnd01(X, Z, 0xb1) >= Math.min(1, blush * 1.6 * (1.15 - d)))
+        if (d > 1 || rnd01(X - eOut, Z - Ze, 0xb1) >=
+                     Math.min(1, blush * 1.6 * (1.15 - d)))
           continue;
         both(X, XX => paintAt(XX, Z, ART.LIP, true));
       }
   }
-  // FRECKLES: single cells now, across the nose and the cheeks.
+  // FRECKLES: single cells now, across the nose and the cheeks. WHICH cells is
+  // the skin's dice (body.skin.pattern, as on the body), keyed off the midline
+  // and the eye row: the band follows the eyes up and down and keeps its spots.
   if (f.freckles > 0)
     for (let Z = Ze - 5; Z <= Ze - 1; Z++)
       for (let X = 0; X < sx; X++)
         if (Math.abs(X + 0.5 - CX) < 7.5 &&
-            rnd01(X, Z, 151) < f.freckles * 0.3) shade(X, Z);
+            rnd01(g.body.skin.pattern | 0, X - HX, Z - Ze, 151) <
+              f.freckles * 0.3) shade(X, Z);
   // THE NOSE'S OWN SHADING: nostrils under the tip's outer cells, the crease
   // of each wing beside it, a highlight on the bulb. A face with no nose
   // still gets two nostrils, where a nose would end. All in the NOSTRIL tone,
@@ -4574,8 +4709,12 @@ function headVoxFine(g, artSize, ctx) {
           let edge = dx > reach - 0.5 || (!jawRow && dx > 1.2);
           if (centre && !side && (lipRow ? f.beardLip : f.beardChin) !== 0 &&
               dx > cW - 0.5) edge = true;
-          if (f.beardDensity < 1 && rnd01(X, Y, Z, 131) >= f.beardDensity) continue;
-          if (!edge || hashN(X, Y, Z, 97) / 4294967296 < keep) col[k] = beardTone;
+          if (f.beardDensity < 1 &&
+              rnd01(X - HX, Y - HY, Z, 131) >= f.beardDensity) continue;
+          if (!edge || hashN(X - HX, Y - HY, Z, 97) / 4294967296 < keep) {
+            col[k] = beardTone;
+            beardK.add(k);
+          }
         }
       }
     }
@@ -4600,8 +4739,10 @@ function headVoxFine(g, artSize, ctx) {
           const k = at(X, Y, Z);
           if (!FINE_SKIN.has(col[k]) || earSet.has(k)) continue;
           if (Math.abs(ac(X) - cx) < maxDx - 1) continue;
-          if (f.beardDensity < 1 && rnd01(X, Y, Z, 131) >= f.beardDensity) continue;
+          if (f.beardDensity < 1 &&
+              rnd01(X - HX, Y - HY, Z, 131) >= f.beardDensity) continue;
           col[k] = beardTone;
+          beardK.add(k);
         }
     }
   }
@@ -4610,8 +4751,17 @@ function headVoxFine(g, artSize, ctx) {
   // Repaints of the frontmost cell, so an eye can neither float nor sink.
   // The whites at opacity 0 are not painted at all: the skin is what shows.
   const whitesOn = toneQ(f.whites) > 0;
+  // The eyes' extent, for headMarks: where they are, painted or not, so the
+  // hair is told the same eyes whatever their whites, lashes or iris are set to.
+  const eyeXZ = [], eyeK = new Set();
+  const markEye = (X, Z) => {
+    const Y = frontY(X, Z);
+    if (Y >= 0) eyeK.add(at(X, Y, Z));
+  };
   for (let X = eOut; X <= eIn; X++) {
     const iris = isIris(X);
+    for (let r = 0; r < rowsOf(X); r++)
+      both(X, XX => { eyeXZ.push([XX, Ze + r + dzOf(X)]); markEye(XX, Ze + r + dzOf(X)); });
     if (!iris && !whitesOn) continue;
     for (let r = 0; r < rowsOf(X); r++)
       both(X, XX => paintAt(XX, Ze + r + dzOf(X), iris ? ART.EYE : ART.EYE_WHITE));
@@ -4620,7 +4770,9 @@ function headVoxFine(g, artSize, ctx) {
   if (f.glint && eyeRows === 2)
     both(i0, X => paintAt(X, Ze + 1 + dzOf(i0), ART.GLINT));
   // THE LASH LINE, over the eye; light lashes stop short of the inner corner.
-  // Heavy ones flick out past the outer corner and line its underside.
+  // Heavy ones flick out past the outer corner and line its underside. Its
+  // row is the eye's (headMarks) whether or not it is drawn.
+  for (let X = eOut; X <= eIn; X++) both(X, XX => markEye(XX, lashRow(X)));
   if (f.lashes >= 0.15 && toneQ(f.lashTone) > 0) {
     // LASH LENGTH: how much of the eye the line covers, from the outer corner.
     const xEnd = eOut + Math.max(1, Math.round((eIn - eOut + 1) * f.lashSpan)) - 1;
@@ -4700,7 +4852,12 @@ function headVoxFine(g, artSize, ctx) {
       f.browTone] ?? ART.HAIR_SHADE;
     for (const [X, Z] of browCells) {
       if (scarKeys.has(X * 4096 + Z)) continue;
-      if (f.browSparse > 0 && rnd01(X, Z, 163) < f.browSparse) continue;
+      // Which cells go bare is keyed to the brow's own eye (its outer corner,
+      // the eye row) and side, so the brow keeps its gaps as the eyes move.
+      const right = X >= CX ? 1 : 0;
+      if (f.browSparse > 0 &&
+          rnd01(right, (right ? mirror(X) : X) - eOut, Z - Ze, 163) < f.browSparse)
+        continue;
       paintAt(X, Z, tone);
     }
   }
@@ -4713,6 +4870,27 @@ function headVoxFine(g, artSize, ctx) {
         const c = col[at(X, Y, Z)];
         if (c) out.push([X, Y, Z, c]);
       }
+  // ...and the same flip for what the hair mass is told (headMarks).
+  if (ctx.marks) {
+    const flip = k => {
+      const X = k % sx, Y = Math.floor(k / sx) % sy, Z = Math.floor(k / (sx * sy));
+      return X + sx * ((sy - 1 - Y) + sy * Z);
+    };
+    const keys = s => new Set([...s].map(flip));
+    ctx.marks.head = {
+      size: [sx, sy, sz],
+      // The cap is scalp wherever an eye is not drawn over it (a low fringe
+      // reaches the eye row): hair never roots on an eye.
+      scalp: keys([...capK].filter(k => !eyeK.has(k))), beard: keys(beardK),
+      features: keys(new Set([...earSet, ...noseSet])),
+      eyeCells: keys(eyeK), eyes: eyeXZ, eyeLo: Ze, eyeHi: Ze,
+      // The eye line before the eye-height slider moves it (the eye metre
+      // contract's row): what the short hair layer's reach is measured from.
+      eyeBaseHi: Math.round(S * (eyeA - g.face.eyeRow)),
+      skull: { c0: [sk0[0], sy - 1 - sk1[1], sk0[2]],
+               c1: [sk1[0], sy - 1 - sk0[1], sk1[2]] },
+    };
+  }
   return flipY([sx, sy, sz], out);
 }
 
@@ -4736,9 +4914,10 @@ function headVoxFine(g, artSize, ctx) {
 //
 // Only SKIN_BASE cells are repainted (and SKIN_SHADE by the seam band), so
 // clothing, hair, the face's own paint and a goblin's anything are safe. Every
-// random choice is a hash of the genome's own numbers and the part's name: a
-// body is a pure function of its genome. `body.skin.detail` 0 turns the
-// anatomy off, and the old/fine toggle turns the whole pass off.
+// random choice is a hash of `body.skin.pattern`, the part's name and the
+// cell's place on the part -- never of another gene, so no slider but the
+// pattern re-rolls the scatter (see GENE INDEPENDENCE, above generateMob).
+// The old/fine toggle turns the whole pass off.
 // =============================================================================
 
 /**
@@ -4778,14 +4957,21 @@ function humanSkinPass(g, cells, size, info) {
     const y = frontY(x, z);
     return y >= 0 && paint(x, y, z, c, over);
   };
-  // The part's own seed: the genome's SHAPE numbers and the part's name. Never
-  // a colour -- a recolour is the palette moving, and must move no cell's slot
-  // (scripts/test_mobgen.mjs asserts it).
-  let seed = hashN(Math.round(g.face.eyeDx * 1000), Math.round(g.body.heightM * 1000),
-                   Math.round(g.face.freckles * 1000), Math.round(g.head.jaw * 1000),
-                   g.body.shoulderWidth | 0, Math.round(sk.texture * 1000));
+  // EVERY RANDOM CHOICE BELOW IS A HASH OF THREE THINGS: the skin PATTERN gene
+  // (body.skin.pattern, the dice for this scatter), the part's name, and the
+  // cell's place measured from the part's own MIDLINE and TOP JOINT. Nothing
+  // else. This seed used to mix in eyeDx, heightM, freckles, the jaw, the
+  // shoulder width and the texture amount, so the eye-spacing slider re-rolled
+  // every mole and freckle down to the feet (owner, 2026-10-15: "sliders like
+  // eye spacing will change freckles on skin"). Measured from the box corner
+  // instead, a limb one cell wider shifts every cell's key and re-rolls the
+  // whole limb; from the midline and the joint, what did not move keeps its
+  // roll. Never a colour either: a recolour moves no cell's slot.
+  let seed = hashN(0x5c1d, sk.pattern | 0);
   for (const ch of name) seed = hashN(seed, ch.charCodeAt(0));
-  const rnd = (...v) => hashN(seed, ...v) / 4294967296;
+  const ox = sx >> 1, oy = sy >> 1, oz = sz - 1;
+  const rnd = (x, y, z, salt) =>
+    hashN(seed, x - ox, y - oy, oz - z, salt) / 4294967296;
   const CXp = sx / 2;
   // EACH FEATURE IS ITS OWN GENE, an opacity: 0 skips it (nothing painted,
   // no palette cost), anything else paints its own toned slot, whose colour
@@ -4898,7 +5084,21 @@ function humanSkinPass(g, cells, size, info) {
     }
   }
 
-  // ---- FRECKLES ON THE SHOULDERS, past halfway --------------------------------
+  // ---- THE SCATTER: moles, freckles on the shoulders, the mottle -------------
+  // Each cell's mark is its own hash against its own gene, so a slider only
+  // adds or takes away ITS marks. The order is only who wins a cell two of
+  // them want -- a mole beats a freckle beats the mottle -- and every one of
+  // them claims bare skin (SKIN_BASE) only. The mottle used to go first, and
+  // then raising the texture took moles away: a mole could only land on a
+  // cell the mottle had not already taken.
+  if (sk.moles > 0) {
+    const rate = sk.moles * (role === 'head' ? 0.004 : 0.0012);
+    for (const v of cells)
+      if (v[3] === ART.SKIN_BASE && exposed(v[0], v[1], v[2]) &&
+          rnd(v[0], v[1], v[2], 0x30) < rate) v[3] = ART.MOLE;
+  }
+
+  // Freckles past halfway reach the shoulders.
   if (g.face.freckles > 0.5 && (name === 'torso' || name.startsWith('armU')))
     for (const v of cells) {
       if (v[3] !== ART.SKIN_BASE || v[2] < sz * 0.7) continue;
@@ -4907,23 +5107,15 @@ function humanSkinPass(g, cells, size, info) {
         v[3] = ART.FACE_SHADE;
     }
 
-  // ---- TEXTURE: a fine mottle, in patches ------------------------------------
+  // TEXTURE: a fine mottle, in patches.
   if (sk.texture > 0) {
     const rate = sk.texture * (role === 'head' ? 0.05 : 0.09);
     for (const v of cells) {
       if (v[3] !== ART.SKIN_BASE || !exposed(v[0], v[1], v[2])) continue;
-      const patch = vnoise(seed, v[0], v[1], v[2], 4);
+      const patch = vnoise(seed, v[0] - ox, v[1] - oy, oz - v[2], 4);
       if (rnd(v[0], v[1], v[2], 0x7e) < rate * (0.3 + 1.4 * patch))
         v[3] = rnd(v[0], v[1], v[2], 0x7f) < 0.65 ? ART.FACE_SHADE : ART.FACE_LIGHT;
     }
-  }
-
-  // ---- MOLES: a few, anywhere on bare skin ------------------------------------
-  if (sk.moles > 0) {
-    const rate = sk.moles * (role === 'head' ? 0.004 : 0.0012);
-    for (const v of cells)
-      if (v[3] === ART.SKIN_BASE && exposed(v[0], v[1], v[2]) &&
-          rnd(v[0], v[1], v[2], 0x30) < rate) v[3] = ART.MOLE;
   }
   return cells;
 }
@@ -5075,7 +5267,12 @@ function hairMass(g, parts, extra = {}) {
   const massOn = hairWants(h);
   const fuzzOn = h.fuzz > 0 &&
                  (h.fuzzTop > 0 || h.fuzzSide > 0 || h.fuzzBack > 0);
-  const beardOn = g.face.beardLen > 0 && g.face.beard > 0;
+  // The hanging beard, and the volume standing off the painted one (which
+  // sideburns alone can carry).
+  const beardHangOn = g.face.beardLen > 0 && g.face.beard > 0;
+  const beardVolOn = g.face.beardVolume > 0 &&
+                     (g.face.beard > 0 || g.face.beardSide > 0);
+  const beardOn = beardHangOn || beardVolOn;
   // A FOURTH: the sylvan crown (sylvan.js crownExtras), which roots on bare
   // bark as happily as on leaf hair.
   const crownOn = g.body.race === 'sylvan' && SY.crownWants(g);
@@ -5126,12 +5323,27 @@ function hairMass(g, parts, extra = {}) {
   // The skull: its hair cells (the scalp the mass roots on), its skin cells
   // (which hair must never touch but at the hairline), and a centre taken
   // over the skull rather than the neck stub.
+  //
+  // ALL THREE COME FROM THE HEAD'S OWN RECORD (headMarks, extra.head), not
+  // from reading its paint back. Read back, they were whatever the face had
+  // painted last: a dark mouth and an open one are painted in the EYE slot,
+  // so they moved the eye line every landmark below hangs off; the old nose
+  // tip and cheekbones are SKIN_LIGHT, which is scalp, so hair could root on
+  // a nose; and the skull's centre was the bounding box of every head cell,
+  // ears and nose included, so the ear sliders moved the whole mass. The
+  // record is written as the head is DECIDED (the cap by the hair function,
+  // the skull before any ear goes on), so only the hair genes and the skull's
+  // shape reach it. Positions only: a race's surface pass may carve a cell
+  // away, so membership is asked of the cells that are actually there.
   const hz0 = head.mn[2], hz1 = head.mn[2] + head.size[2];
+  const hm = extra.head && String(extra.head.size) === String(head.size)
+    ? extra.head : null;
+  const localK = (x, y, z) => x + head.size[0] * (y + head.size[1] * z);
   const scalp = [], skin = new Set();
   let c0 = [1e9, 1e9, 1e9], c1 = [-1e9, -1e9, -1e9];
   for (const [x, y, z, c] of head.cells) {
     const X = head.mn[0] + x, Y = head.mn[1] + y, Z = head.mn[2] + z;
-    if (Z >= hz0 + (hz1 - hz0) * 0.25) {
+    if (!hm && Z >= hz0 + (hz1 - hz0) * 0.25) {
       c0 = [Math.min(c0[0], X), Math.min(c0[1], Y), Math.min(c0[2], Z)];
       c1 = [Math.max(c1[0], X), Math.max(c1[1], Y), Math.max(c1[2], Z)];
     }
@@ -5139,10 +5351,15 @@ function hairMass(g, parts, extra = {}) {
     // scalpShows): still scalp, so the mass roots there and is not pushed off
     // it the way it is pushed off the face.
     // (On a sylvan the cap's leaves come in more colours than two: SY.SLOTS.)
-    if (c === ART.HAIR || c === ART.HAIR_SHADE || c === ART.SKIN_LIGHT ||
-        c === ART.LEAF2 || c === ART.LEAF3 || c === ART.LEAF4)
-      scalp.push([X, Y, Z]);
+    const isScalp = hm ? hm.scalp.has(localK(x, y, z))
+      : c === ART.HAIR || c === ART.HAIR_SHADE || c === ART.SKIN_LIGHT ||
+        c === ART.LEAF2 || c === ART.LEAF3 || c === ART.LEAF4;
+    if (isScalp) scalp.push([X, Y, Z]);
     else skin.add(K(X, Y, Z));
+  }
+  if (hm) {
+    c0 = hm.skull.c0.map((v, i) => head.mn[i] + v);
+    c1 = hm.skull.c1.map((v, i) => head.mn[i] + v);
   }
   if (!scalp.length && !fuzzOn && !beardOn && !crownOn && !extrasOn)
     return [];                                     // bald: no roots
@@ -5150,7 +5367,15 @@ function hairMass(g, parts, extra = {}) {
              (c0[2] + c1[2] + 1) / 2];
   const halfW = (c1[0] - c0[0] + 1) / 2, halfD = (c1[1] - c0[1] + 1) / 2;
   const skullH = c1[2] - c0[2] + 1;
-  const rnd = (...v) => hashN(...v) / 4294967296;
+  // EVERY HASHED CHOICE BELOW IS KEYED IN THE HEAD'S FRAME: x from the
+  // midline (scene x already is), y and z from the head's own box. They used
+  // to be keyed on scene coordinates, so any slider that moved the head --
+  // height, the leg and torso proportions, the hips -- re-rolled every fluffy
+  // end, ragged tip and streak on it: "a bunch of sliders make subtle changes
+  // to hair". A head carried up the body now carries its hair unchanged.
+  const HY = head.mn[1], HZ = head.mn[2];
+  const rnd = (X, Y, Z, s) => hashN(X, Y - HY, Z - HZ, s) / 4294967296;
+  const rcol = (X, Y, s) => hashN(X, Y - HY, s) / 4294967296;
   const top = p => p.mn[2] + p.size[2];
   const hipsTop = top(P.hips);
   const splitZ = top(P.torso) - U;              // the head's joint (buildSidecar)
@@ -5171,18 +5396,22 @@ function hairMass(g, parts, extra = {}) {
                                                        : null;
   const tailCells = new Set();                  // keys: always ride the head
 
-  const mass = new Map();                       // key -> [X, Y, Z, slot]
-  const add = (X, Y, Z, slot) => {
+  // key -> [X, Y, Z, slot, noise]. `noise` is the cell's own hash key for the
+  // thinning dither below: by default its place in the head's frame, but a
+  // DRAPED cell passes its strand's (the root it hangs from, its row), so a
+  // back that moves the curtain a cell keeps every wisp on the same strand.
+  const mass = new Map();
+  const add = (X, Y, Z, slot, noise) => {
     const k = K(X, Y, Z);
     if (body.has(k) || mass.has(k)) return false;
-    mass.set(k, [X, Y, Z, slot]);
+    mass.set(k, [X, Y, Z, slot, noise ?? hashN(X, Y - HY, Z - HZ)]);
     return true;
   };
   const free = (X, Y, Z) => !body.has(K(X, Y, Z));
-  const touchesSkin = (X, Y, Z) =>
-    skin.has(K(X + 1, Y, Z)) || skin.has(K(X - 1, Y, Z)) ||
-    skin.has(K(X, Y + 1, Z)) || skin.has(K(X, Y - 1, Z)) ||
-    skin.has(K(X, Y, Z + 1)) || skin.has(K(X, Y, Z - 1));
+  const touchesSkin = (X, Y, Z, S = skin) =>
+    S.has(K(X + 1, Y, Z)) || S.has(K(X - 1, Y, Z)) ||
+    S.has(K(X, Y + 1, Z)) || S.has(K(X, Y - 1, Z)) ||
+    S.has(K(X, Y, Z + 1)) || S.has(K(X, Y, Z - 1));
 
   // ---- the shell: volume off the scalp ------------------------------------
   // A BFS that carries each cell's SEED (the scalp cell it grew from), so the
@@ -5190,11 +5419,12 @@ function hairMass(g, parts, extra = {}) {
   // distance transform. Growth must point AWAY from the skull centre, never
   // touches skin (the face and ears stay clear) and never drops below a FRONT
   // seed, or the fringe grows a visor over the eyes.
-  const V = Math.max(1, h.volume * U);
-  const shell = [];
-  if (massOn) {
-    const seen = new Set(scalp.map(([X, Y, Z]) => K(X, Y, Z)));
-    const q = scalp.map(([X, Y, Z]) => [X, Y, Z, X, Y, Z]);
+  // `slotOf(x, y, z, d)` paints a grown cell, `d` its distance from its seed;
+  // `S` is the skin it keeps clear of (the seeds are never in it).
+  const growShell = (seeds, V, slotOf, onAdd, S = skin) => {
+    const grown = [];
+    const seen = new Set(seeds.map(([X, Y, Z]) => K(X, Y, Z)));
+    const q = seeds.map(([X, Y, Z]) => [X, Y, Z, X, Y, Z]);
     for (let qi = 0; qi < q.length; qi++) {
       const [X, Y, Z, sx, sy, sz] = q[qi];
       const ox = sx - C[0], oy = sy - C[1], oz = sz - C[2];
@@ -5210,20 +5440,48 @@ function hairMass(g, parts, extra = {}) {
             if (d2 > (V + 0.45) * (V + 0.45)) continue;
             if (ex * ox + ey * oy + ez * oz <= 0) continue;
             if (front && z < sz) continue;
-            if (touchesSkin(x, y, z)) continue;
+            if (touchesSkin(x, y, z, S)) continue;
             seen.add(k);
-            const d = Math.sqrt(d2);
-            // The outermost layer of a big volume is FLUFF: a broken edge of
-            // the lightest wisp rather than a hard shell.
-            const fluff = h.volume >= 3 && h.wisp > 0 && d > V - 1.2 &&
-                          rnd(x, y, z, 11) < 0.55;
-            add(x, y, z, fluff ? ART.HAIR_WISP1 : shadeOf(y));
-            shell.push([x, y, z]);
+            if (add(x, y, z, slotOf(x, y, z, Math.sqrt(d2))) && onAdd) onAdd(k);
+            grown.push([x, y, z]);
             q.push([x, y, z, sx, sy, sz]);
           }
     }
-  }
+    return grown;
+  };
+  const V = Math.max(1, h.volume * U);
+  // The outermost layer of a big volume is FLUFF: a broken edge of the
+  // lightest wisp rather than a hard shell.
+  const shell = massOn
+    ? growShell(scalp, V, (x, y, z, d) =>
+        h.volume >= 3 && h.wisp > 0 && d > V - 1.2 && rnd(x, y, z, 11) < 0.55
+          ? ART.HAIR_WISP1 : shadeOf(y))
+    : [];
   const outer = scalp.concat(shell);
+
+  // ---- the beard's volume: the same growth off the PAINTED BEARD ----------
+  // `face.beardVolume`, its own gene. The beard paint used to count as scalp,
+  // so the HAIR's volume (and the one-cell shell every hair mass has) grew off
+  // it as well: the hair-volume slider puffed out beards and stubble. The
+  // beard (headMarks) is in the beard's own tone, rides the head like the
+  // hanging beard and is thinned by nothing that thins the hair.
+  const beardCells = new Set();
+  if (beardVolOn && hm) {
+    const seeds = [];
+    for (const [x, y, z] of head.cells)
+      if (hm.beard.has(localK(x, y, z)))
+        seeds.push([head.mn[0] + x, head.mn[1] + y, head.mn[2] + z]);
+    const tone = g.face.beardTone === 'hair' ? ART.HAIR : ART.HAIR_SHADE;
+    const BV = g.face.beardVolume;               // shipped cells, see the gene
+    // The beard is this growth's scalp: it may sit on the beard, never on the
+    // bare skin round it.
+    const seedK = new Set(seeds.map(([X, Y, Z]) => K(X, Y, Z)));
+    const bareSkin = new Set([...skin].filter(k => !seedK.has(k)));
+    growShell(seeds, BV, (x, y, z, d) =>
+      g.face.beardVolume >= 6 && g.face.beardRagged > 0 && d > BV - 1.2 &&
+      rnd(x, y, z, 13) < 0.55 ? ART.HAIR_WISP1 : tone,
+      k => { beardCells.add(k); tailCells.add(k); }, bareSkin);
+  }
 
   // ---- a crest: the mohawk fin ---------------------------------------------
   // Rays out of the skull centre through every hair cell in a strip along the
@@ -5355,10 +5613,16 @@ function hairMass(g, parts, extra = {}) {
   const WISP = [0, ART.HAIR_WISP1, ART.HAIR_WISP2, ART.HAIR_WISP3];
 
   // ---- tails: gathered, tied, hanging ---------------------------------------
+  // THE TAIL'S SHAPE (2026-10-15): `tailHeight` slides the tie up the back of
+  // the head toward the crown or down to the nape, `tailThick` scales its
+  // girth, `tailCurve` bends it (see the drape below). At 0 / 1 / 0 each is
+  // an exact no-op, so a tail saved before them builds cell for cell.
   if (h.tail > 0) {
+    const th = h.tailHeight, tk = h.tailThick, tc = h.tailCurve;
     const roots = h.twin
-      ? [[-1, 0.55, -0.15], [1, 0.55, -0.15]]
-      : [[0, 1, 0.25]];
+      ? [[-1, 0.55, -0.15 + th * (th > 0 ? 0.9 : 0.45)],
+         [1, 0.55, -0.15 + th * (th > 0 ? 0.9 : 0.45)]]
+      : [[0, 1, 0.25 + th * (th > 0 ? 0.95 : 0.65)]];
     for (const dir of roots) {
       const { at, u } = surfaceAlong(dir);
       const cx = at[0] + 0.5 + u[0] * 1.5;
@@ -5367,12 +5631,16 @@ function hairMass(g, parts, extra = {}) {
       const zEnd = reach(z0, h.tail);
       const len = z0 - zEnd;
       if (len < 2) continue;
-      const r0 = 1.4, r1 = h.braid ? 2.0 : 2.6;
+      // The tie never shrinks below the drawn one: it is what seats the tail
+      // on the head, and a thin one sat a cell off it.
+      const r0 = tk <= 1 ? 1.4 : 1.4 * (0.6 + 0.4 * tk);
+      const r1 = (h.braid ? 2.0 : 2.6) * tk;
+      const rEnd = tk === 1 ? 1.0 : Math.max(0.8, Math.sqrt(tk));
       for (let z = z0; z >= zEnd; z--) {
         const t = (z0 - z) / len;
         let r = t < 0.06 ? r0 : t < 0.25
           ? r0 + (r1 - r0) * (t - 0.06) / 0.19
-          : r1 - (r1 - 1.0) * (t - 0.25) / 0.75;
+          : r1 - (r1 - rEnd) * (t - 0.25) / 0.75;
         const phase = z0 - z;
         if (h.braid) r *= 1 + 0.18 * Math.cos(phase * 2 * Math.PI / 4);
         // DRAPE. Below the skull a tail falls in toward the back a cell every
@@ -5380,11 +5648,29 @@ function hairMass(g, parts, extra = {}) {
         // straight down from the back of the skull left it floating a hand's
         // breadth behind the shoulder blades on every rig, because the
         // skull sits behind the torso's back plane.
+        //
+        // THE CURVE bends that fall. Below 0 it starts at the tie and comes
+        // in faster, so the tail tucks under the knot and lies flat; above 0
+        // an outward sweep is blended in, strongest under the tie and easing
+        // off toward the end -- an arc that carries the end away from the
+        // back. Either way it never passes into the body.
         const b = backAt(cx, z, r);
-        if (b > -1e9) {
-          const rest = b + 0.5 + r;
-          if (cy < rest) cy = rest;
-          else if (z < c0[2] && (z0 - z) % 2 === 0) cy = Math.max(rest, cy - 1);
+        const rest = b > -1e9 ? b + 0.5 + r : -1e9;
+        if (tc === 0) {
+          if (b > -1e9) {
+            if (cy < rest) cy = rest;
+            else if (z < c0[2] && (z0 - z) % 2 === 0) cy = Math.max(rest, cy - 1);
+          }
+        } else {
+          // Cells per row toward the back (`fall`) and away from it
+          // (`sweep`); both reach the tc = 0 rule's half a cell a row below
+          // the skull as tc goes to 0, so the slider has no jump at 0.
+          const a = Math.abs(tc), under = z < c0[2];
+          const fall = tc < 0
+            ? (under ? 0.5 * (1 + 1.5 * a) : z0 - z >= 2 ? a : 0)
+            : (under ? 0.5 * (1 - tc) : 0);
+          const sweep = tc > 0 && phase >= 2 ? tc * 0.9 * (1 - t) * (1 - t) : 0;
+          cy = Math.max(rest, cy + sweep - fall);
         }
         const tier = tierOf(z - zEnd, len);
         const rr = Math.ceil(r);
@@ -5402,8 +5688,13 @@ function hairMass(g, parts, extra = {}) {
               const a = (Math.atan2(ey, ex) / (2 * Math.PI) + 1) * 3;
               slot = Math.floor(a + phase / 1.34) % 3 === 0
                 ? ART.HAIR_SHADE : ART.HAIR;
-            } else slot = rnd(x, y, 53) < 0.22 ? ART.HAIR_SHADE : ART.HAIR;
-            if (add(x, y, z, slot)) tailCells.add(K(x, y, z));
+            } else slot = hashN(dx, dy, 53) / 4294967296 < 0.22
+              ? ART.HAIR_SHADE : ART.HAIR;
+            // Streaks and wisps are keyed ACROSS THE TAIL (dx, dy off its
+            // centre line) and down it, so they run along the tail however
+            // it drapes, bends or is tied.
+            if (add(x, y, z, slot, hashN(dx, dy, z - z0, 0x7a11)))
+              tailCells.add(K(x, y, z));
           }
       }
     }
@@ -5440,11 +5731,11 @@ function hairMass(g, parts, extra = {}) {
       // lifting each strand's end by its own amount.
       const edge = Math.min(1, Math.abs(X + 0.5 - C[0]) / Math.max(halfW, 1));
       const zEnd = Math.round(zBase + edge * edge * 0.18 * len0 +
-                              rnd(X, Y, 61) * h.ragged * 0.3 * len0);
+                              rcol(X, Y, 61) * h.ragged * 0.3 * len0);
       if (zEnd >= z0) continue;
       const len = z0 - zEnd;
       const back = Y >= C[1] - 1;
-      const streak = rnd(X, Y, 67) < 0.18;
+      const streak = rcol(X, Y, 67) < 0.18;
       let y = Y;
       for (let z = z0 - 1; z >= zEnd; z--) {
         // DRAPE: once below the skull, a back strand closes on the back by a
@@ -5460,11 +5751,16 @@ function hairMass(g, parts, extra = {}) {
           if (j >= 16) break;
           // Lay the strand over the top of what it met, so the column stays
           // one piece instead of jumping a gap.
-          for (let i = 1; i <= j; i++) add(X, y + i, z + 1, streak ? ART.HAIR_SHADE : ART.HAIR);
+          for (let i = 1; i <= j; i++)
+            add(X, y + i, z + 1, streak ? ART.HAIR_SHADE : ART.HAIR,
+                hashN(X, Y - HY, z + 1 - HZ, i));
           y += j;
         }
         const tier = tierOf(z - zEnd, len);
-        add(X, y, z, tier ? WISP[tier] : streak ? ART.HAIR_SHADE : ART.HAIR);
+        // Keyed by the strand (its root column) and the row, not by where
+        // the drape put it.
+        add(X, y, z, tier ? WISP[tier] : streak ? ART.HAIR_SHADE : ART.HAIR,
+            hashN(X, Y - HY, z - HZ));
       }
     }
     // Depth: a hanging cell with more hair behind it is in the shade of it.
@@ -5493,9 +5789,17 @@ function hairMass(g, parts, extra = {}) {
       const X = head.mn[0] + x, Y = head.mn[1] + y, Z = head.mn[2] + z;
       const k = X * 4096 + Z;
       if (!frontOf.has(k) || Y < frontOf.get(k)) frontOf.set(k, Y);
-      if (c === ART.EYE) {
+      if (!hm && c === ART.EYE) {
         if (Z < eyeLo) eyeLo = Z;
         if (!eyeFront.has(k) || Y < eyeFront.get(k)) eyeFront.set(k, Y);
+      }
+    }
+    // The eyes the head says it has (headMarks), at the face's front.
+    if (hm) {
+      eyeLo = head.mn[2] + hm.eyeLo;
+      for (const [x, z] of hm.eyes) {
+        const k = (head.mn[0] + x) * 4096 + (head.mn[2] + z);
+        if (frontOf.has(k)) eyeFront.set(k, frontOf.get(k));
       }
     }
     if (eyeLo === 1e9) eyeLo = Math.round(C[2] - skullH * 0.2);
@@ -5522,10 +5826,10 @@ function hairMass(g, parts, extra = {}) {
       if (Math.abs(ex) > 0.9 || z0 <= eyeLo) continue;
       const full = z0 - eyeLo + 1;
       const len = h.bangs * full * (1 - h.side * ex * 0.45) *
-                  (1 - 0.15 * ex * ex) * (1 - h.ragged * 0.3 * rnd(X, z0, 83));
+                  (1 - 0.15 * ex * ex) * (1 - h.ragged * 0.3 * hashN(X, z0 - HZ, 83) / 4294967296);
       const n = Math.max(1, Math.min(full, Math.round(len)));
       const wl = Math.round(h.faceThin * n);
-      const streak = rnd(X, 87) < 0.2;
+      const streak = hashN(X, 87) / 4294967296 < 0.2;
       // FORWARD ONLY. Hair hangs off the brow; it does not tuck back into the
       // eye socket. Following the face in there stacked three and four wisp
       // cells deep in front of each eye (the strand stepping in, the welder
@@ -5544,8 +5848,10 @@ function hairMass(g, parts, extra = {}) {
           tier = f < 1 / 3 ? 3 : f < 2 / 3 ? 2 : 1;
         }
         const k = K(X, y, z);
+        // Keyed by the strand and the row, not by how far the brow stands out.
         if (add(X, y, z, tier ? WISP[tier]
-                              : streak ? ART.HAIR_SHADE : ART.HAIR))
+                              : streak ? ART.HAIR_SHADE : ART.HAIR,
+                hashN(X, z - HZ, 0xba)))
           bangsCells.add(k);
       }
     }
@@ -5553,12 +5859,16 @@ function hairMass(g, parts, extra = {}) {
 
   // The eye rows in scene coords: the line the beard hangs below and the
   // forehead the short-hair layer stays above.
+  // The head's own eye rows (headMarks): the eye ROW, not where its paint
+  // went, so no eye shape, mouth or brow tone moves either line.
   let eyeZlo = 1e9, eyeZhi = -1e9;
-  for (const [, , z, c] of head.cells)
-    if (c === ART.EYE) {
-      eyeZlo = Math.min(eyeZlo, head.mn[2] + z);
-      eyeZhi = Math.max(eyeZhi, head.mn[2] + z);
-    }
+  if (hm) { eyeZlo = head.mn[2] + hm.eyeLo; eyeZhi = head.mn[2] + hm.eyeHi; }
+  else
+    for (const [, , z, c] of head.cells)
+      if (c === ART.EYE) {
+        eyeZlo = Math.min(eyeZlo, head.mn[2] + z);
+        eyeZhi = Math.max(eyeZhi, head.mn[2] + z);
+      }
   if (eyeZhi < -1e8) { eyeZlo = eyeZhi = Math.round(C[2] - skullH * 0.2); }
 
   // ---- a hanging beard ------------------------------------------------------
@@ -5569,8 +5879,7 @@ function hairMass(g, parts, extra = {}) {
   // hangs nothing, which is what a moustache should do. It falls straight;
   // where it meets the chest it slides FORWARD over it (front is -Y), the
   // curtain's rule mirrored. Every cell rides the head, like a tail.
-  const beardCells = new Set();
-  if (beardOn) {
+  if (beardHangOn) {
     const fc = g.face;
     const tone = fc.beardTone === 'hair' ? ART.HAIR : ART.HAIR_SHADE;
     const low = new Map(), root = new Map();
@@ -5578,8 +5887,11 @@ function hairMass(g, parts, extra = {}) {
       const X = head.mn[0] + x, Y = head.mn[1] + y, Z = head.mn[2] + z;
       const k = X * 4096 + Y;
       if (!low.has(k) || Z < low.get(k)) low.set(k, Z);
-      if ((c !== ART.HAIR && c !== ART.HAIR_SHADE) || Z >= eyeZlo - U ||
-          Y >= C[1]) continue;
+      // The beard the head painted (headMarks), whatever the mouth, the
+      // lips or a dark tone later painted over part of it.
+      const isBeard = hm ? hm.beard.has(localK(x, y, z))
+                         : c === ART.HAIR || c === ART.HAIR_SHADE;
+      if (!isBeard || Z >= eyeZlo - U || Y >= C[1]) continue;
       if (!root.has(k) || Z < root.get(k)[2]) root.set(k, [X, Y, Z]);
     }
     const roots = [...root.entries()]
@@ -5593,11 +5905,11 @@ function hairMass(g, parts, extra = {}) {
         // One point on the midline, or two either side of it.
         const a = fc.beardFork ? Math.abs(ax - 0.45) / 0.55 : ax;
         const len = Math.round(len0 * (1 - fc.beardPoint * Math.min(1, a) * 0.9) *
-                               (1 - fc.beardRagged * 0.3 * rnd(X, Y, 181)));
+                               (1 - fc.beardRagged * 0.3 * rcol(X, Y, 181)));
         const zEnd = z0 - len;
         if (zEnd >= rz) continue;
         const n = rz - zEnd, wl = Math.round(0.25 * n);
-        const streak = rnd(X, Y, 187) < 0.2;
+        const streak = rcol(X, Y, 187) < 0.2;
         let y = Y;
         for (let z = rz - 1; z >= zEnd; z--) {
           if (!free(X, y, z)) {
@@ -5645,7 +5957,12 @@ function hairMass(g, parts, extra = {}) {
   // of back and sides (by which way the cell faces), so dragging the side
   // length below the top one is a fade and the seams between them are soft.
   if (fuzzOn) {
-    const zLow = eyeZhi + 1 - h.fuzzLow * (eyeZhi + 1 - c0[2]);
+    // How low it reaches is measured from the head's STANDARD eye line, not
+    // the eye-height slider's: dragging the eyes moved the coat's lower edge
+    // round the back of the head. The forehead line (foreZ) does follow the
+    // eyes, since the brows sit on them.
+    const eyeLine = hm ? head.mn[2] + hm.eyeBaseHi : eyeZhi;
+    const zLow = eyeLine + 1 - h.fuzzLow * (eyeLine + 1 - c0[2]);
     const foreZ = eyeZhi + 3 * U;
     const beardZ = eyeZlo;                      // beard paint lives below this
     const D6 = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1],
@@ -5655,8 +5972,17 @@ function hairMass(g, parts, extra = {}) {
     };
     for (const [x, y, z, c] of head.cells) {
       const X = head.mn[0] + x, Y = head.mn[1] + y, Z = head.mn[2] + z;
-      if (Z < c0[2] || c === ART.EYE) continue;
-      if ((c === ART.HAIR || c === ART.HAIR_SHADE) && Z < beardZ) continue;
+      if (Z < c0[2]) continue;
+      // Not off an eye, the beard, an ear or the nose: the head says which
+      // cells those are (headMarks), so no paint decides where a coat grows.
+      if (hm) {
+        const lk = localK(x, y, z);
+        if (hm.eyeCells.has(lk) || hm.beard.has(lk) || hm.features.has(lk))
+          continue;
+      } else {
+        if (c === ART.EYE) continue;
+        if ((c === ART.HAIR || c === ART.HAIR_SHADE) && Z < beardZ) continue;
+      }
       const nx = (X + 0.5 - C[0]) / Math.max(halfW, 1);
       const ny = (Y + 0.5 - C[1]) / Math.max(halfD, 1);
       const face = ny < -0.35 && Math.abs(nx) < 0.75;
@@ -5765,7 +6091,8 @@ function hairMass(g, parts, extra = {}) {
            open(X, Y - 1, Z) || open(X, Y, Z + 1) || open(X, Y, Z - 1)))
         s = Math.max(s, h.fluff);
       if (s <= 0) continue;
-      const t = Math.min(3, Math.floor(s * 3 + rnd(X, Y, Z, 89)));
+      // The cell's own noise key (see `add`): a draped strand keeps its wisps.
+      const t = Math.min(3, Math.floor(s * 3 + hashN(v[4], 89) / 4294967296));
       if (t > cur) v[3] = WISP[t];
     }
   }
@@ -5792,9 +6119,13 @@ function hairMass(g, parts, extra = {}) {
   if (extrasOn) {
     // `mass` is the hair mass so far, keyed by K: a race may take cells
     // OUT of it (goblin.js: a hat flattens the hair under it).
+    // `eyeLine`: the head's eye rows, scene z (headMarks), for a race that
+    // hangs its ears or hood off the eyes.
     const got = Mx.extras(g, { ART, K, body, head, torso: P.torso,
                                face: extra.face, C, halfW, halfD, skullH,
-                               splitZ, mass });
+                               splitZ, mass,
+                               eyeLine: hm ? [head.mn[2] + hm.eyeLo,
+                                              head.mn[2] + hm.eyeHi] : null });
     snoutCells = snoutCells.concat(got.head);
     boughCells = boughCells.concat(got.torso);
     limbTail = limbTail.concat(got.tail || []);
@@ -5945,13 +6276,16 @@ function hairMass(g, parts, extra = {}) {
       cells = cells.concat(added);
     }
     const { pieces } = pieces6(cells);
-    const total = cells.length;
     // Specks too small to be a limb (a crest ray that clipped a corner) are
     // dropped; everything else is a limb.
     // (The snout is small and deliberate: it keeps anything past a speck.)
+    // A FIXED size, not a share of the whole mass: it was the larger of 32
+    // and 2% of the group, so any slider that added or took away a few cells
+    // ANYWHERE in the hair (an ear, a nose, a tuft) moved the bar and dropped
+    // or kept a speck on the far side of the head. Measured over the pool and
+    // 60 rolled bodies, the share decided one speck in 200 groups.
     pieces.filter(p => p.length >= (base === 'snout' || base === 'bough' ||
-                                    base === 'tail' || base === 'hood' ? 8
-                                                     : Math.max(32, total * 0.02)))
+                                    base === 'tail' || base === 'hood' ? 8 : 32))
       .sort((a, b) => b.length - a.length)
       .map(p => p.map(i => cells[i]))
       .filter(pc => (base !== 'bough' && base !== 'tail' && base !== 'hood') ||
@@ -6143,6 +6477,37 @@ function upscaleCells(cells, factor) {
           out.push([bx + dx, by + dy, bz + dz, c]);
   }
   return out;
+}
+
+/** headVox's marks (authored cells) on the shipped lattice, exactly as
+ *  upscaleCells scales the cells they describe. */
+function upscaleMarks(m, factor) {
+  if (!m.authored) return m;
+  const [ax, ay, az] = m.size;
+  const sx = ax * factor, sy = ay * factor, sz = az * factor;
+  const up = keys => {
+    const o = new Set();
+    for (const k of keys) {
+      const x = k % ax, y = Math.floor(k / ax) % ay, z = Math.floor(k / (ax * ay));
+      for (let dz = 0; dz < factor; dz++)
+        for (let dy = 0; dy < factor; dy++)
+          for (let dx = 0; dx < factor; dx++)
+            o.add((x * factor + dx) + sx * ((y * factor + dy) + sy * (z * factor + dz)));
+    }
+    return o;
+  };
+  const eyes = [];
+  for (const [x, z] of m.eyes)
+    for (let dz = 0; dz < factor; dz++)
+      for (let dx = 0; dx < factor; dx++) eyes.push([x * factor + dx, z * factor + dz]);
+  return {
+    size: [sx, sy, sz], scalp: up(m.scalp), beard: up(m.beard),
+    features: up(m.features), eyeCells: up(m.eyeCells), eyes,
+    eyeLo: m.eyeLo * factor, eyeHi: m.eyeHi * factor + factor - 1,
+    eyeBaseHi: m.eyeBaseHi * factor + factor - 1,
+    skull: { c0: m.skull.c0.map(v => v * factor),
+             c1: m.skull.c1.map(v => v * factor + factor - 1) },
+  };
 }
 
 // =============================================================================
@@ -6552,6 +6917,34 @@ function scaleClipPositions(clips, factor) {
 }
 
 // =============================================================================
+// GENE INDEPENDENCE (2026-10-15): every slider moves only what it is for
+//
+// The owner's ticket: eye spacing changed the freckles on the skin, a bunch of
+// sliders made subtle changes to the hair, the underwear changed the hair and
+// the freckles. Each was a random choice keyed on -- or a landmark read from
+// -- something the slider moved. The rules every builder here follows:
+//
+//  1. A HASH IS KEYED ON ITS OWN GENE AND ITS OWN FRAME. The skin's scatter on
+//     `body.skin.pattern` (a dice nothing else reads) and the cell's place from
+//     its part's midline and top joint; the hair on the head's frame, and a
+//     draped cell on its strand's (hairMass `add`'s noise key); the face's
+//     dithers on the feature they belong to (an eye's corner, the eye row).
+//     Never on scene coordinates, never on another gene's value, never on the
+//     n-th entry of a list something else can lengthen.
+//  2. A LANDMARK IS RECORDED, NOT READ BACK OUT OF PAINT. The head builders
+//     write `ctx.marks.head` (headMarks) as they decide the cap, the skull, the
+//     beard and the eyes; hairMass and the race passes read that. Paint is
+//     whatever was painted LAST -- a dark mouth is EYE paint.
+//  3. PAINT NEVER MOVES GEOMETRY. Clothing, war paint and the like are colour
+//     over the body; a bump, a groove or a strand's obstacle is decided as if
+//     they were not there.
+//
+// Physical contact stays: hair parts round an ear and rests on a shoulder,
+// and the bangs end at the eyes -- locally. scripts/test_mobgen.mjs §U steps
+// every slider and holds what moved to what the row is for.
+// =============================================================================
+
+// =============================================================================
 // generateMob
 // =============================================================================
 
@@ -6626,6 +7019,9 @@ export function generateMob(genome, seed = 0, opts = {}) {
   // What the sylvan face pass found (eyes, mouth, brow), head-local shipped:
   // the crown hangs its veil and its snout off it.
   let sylFace = null;
+  // What each builder knows about its own cells and hands on (headMarks: the
+  // head's cap, skull, beard and eyes, for hairMass). Filled as parts build.
+  const marks = {};
   for (const nm of ORDER) {
     const artSize = L[nm].size;
     const size = artSize.map(v => v * SKIN_UPSCALE);
@@ -6637,7 +7033,7 @@ export function generateMob(genome, seed = 0, opts = {}) {
     if (worldExtent > 120)
       throw new Error(`${nm} is ${worldExtent} world voxels; even a 1:1 ` +
                       `collider exceeds the DebrisVoxel int8 bound`);
-    const ctx = { ...table, limbs: L, name: nm };
+    const ctx = { ...table, limbs: L, name: nm, marks };
     let cells;
     if (fine && roleOf(nm) === 'head') {
       // Built at the shipped lattice already: no upscale.
@@ -6646,6 +7042,8 @@ export function generateMob(genome, seed = 0, opts = {}) {
       cells = SHAPES[nm] ? SHAPES[nm](g, artSize, ctx) : SE.shape(g, nm, table);
       if (!cells.length) throw new Error(`${nm} generated no voxels`);
       cells = upscaleCells(cells, SKIN_UPSCALE);
+      if (roleOf(nm) === 'head' && marks.head)
+        marks.head = upscaleMarks(marks.head, SKIN_UPSCALE);
     }
     // THE SHOULDER ROUND, after the upscale because that is the only lattice
     // fine enough to round on (see roundShoulders). `roundShoulders: false`
@@ -6664,7 +7062,15 @@ export function generateMob(genome, seed = 0, opts = {}) {
     // knots, moss, and on the head the wooden face. Inside the part's own box.
     const Ms = raceMod(g);
     if (sylvan || Ms) {
-      const info = { ART, mn };
+      // `bareSlot`: the skin slot this part's builder paints a bare cell at
+      // (x, y, z) with -- shadeBack, on the authored lattice before the flip,
+      // as every body builder calls it -- so a pass that takes the CLOTH off
+      // a cell (a sylvan's fraying leaf wrap) puts back exactly the skin a
+      // body without that garment has there.
+      const ay = artSize[1];
+      const info = { ART, mn, bareSlot: (x, y, z) =>
+        shadeBack(ay - 1 - Math.floor(y / SKIN_UPSCALE), ay * 0.5,
+                  ART.SKIN_BASE, ART.SKIN_SHADE) };
       if (roleOf(nm) === 'head') {
         const eyeA = table.eyeZ - L[nm].mn[2] + g.face.eyeRow;
         const neckA = Math.max(1, Math.round(2 * artSize[2] / DEF.head.size[2]));
@@ -6672,6 +7078,13 @@ export function generateMob(genome, seed = 0, opts = {}) {
         info.mouthRow = (eyeA - g.face.mouthDrop) * SKIN_UPSCALE + 0.5;
         info.mouthDx = g.face.mouthShift * SKIN_UPSCALE;
         info.neckTop = (neckA + 1) * SKIN_UPSCALE;
+        // WHICH CELLS ARE THE EYES (headMarks), for a face pass that finds
+        // them by their EYE paint: a dark or open mouth and a dark brow are
+        // painted in that slot too, and read as a third eye they moved a
+        // goblin's ears and nose with the mouth sliders.
+        const hmk = marks.head;
+        if (hmk) info.isEye = (x, y, z) =>
+          hmk.eyeCells.has(x + size[0] * (y + size[1] * z));
       }
       // THE MACHINE SURFACE (automaton.js / android.js surfacePass), the
       // same contract: inside the part's own box.
@@ -6685,7 +7098,9 @@ export function generateMob(genome, seed = 0, opts = {}) {
         name: nm, role: roleOf(nm), mnZ: L[nm].mn[2], microH: table.microH,
         sex: g.body.sex });
     }
-    const seen = new Set();
+    // A bitmap over the part's own box: the Set of integer keys this was is
+    // most of generateMob's own time on a full body.
+    const seen = new Uint8Array(size[0] * size[1] * size[2]);
     const uniq = [];
     for (const [x, y, z, c] of cells) {
       if (!(x >= 0 && x < size[0] && y >= 0 && y < size[1] &&
@@ -6695,8 +7110,8 @@ export function generateMob(genome, seed = 0, opts = {}) {
       // An integer key inside the part's own box (checked just above): the
       // string key this was cost a naga ~30 ms a build in allocations.
       const k = x + size[0] * (y + size[1] * z);
-      if (seen.has(k)) continue;                       // first write wins
-      seen.add(k);
+      if (seen[k]) continue;                           // first write wins
+      seen[k] = 1;
       if (!(c >= 128 && c <= 255))
         throw new Error(`${nm} cell (${x},${y},${z}) has colour ${c}, which ` +
                         `is not an art palette slot — a builder returned a ` +
@@ -6730,7 +7145,8 @@ export function generateMob(genome, seed = 0, opts = {}) {
   // another order than a character's could not be a base for it at all. The
   // base is what EVERY member of the race has; each character grows its own.
   const bare = opts.bare ?? isRaceBase(name);
-  for (const hp of bare ? [] : hairMass(g, parts, { face: sylFace })) {
+  for (const hp of bare ? [] : hairMass(g, parts, { face: sylFace,
+                                                    head: marks.head })) {
     const mn = [0, 1, 2].map(i => Math.min(...hp.cells.map(c => c[i])));
     const mx = [0, 1, 2].map(i => Math.max(...hp.cells.map(c => c[i])));
     const size = [0, 1, 2].map(i => mx[i] - mn[i] + 1);

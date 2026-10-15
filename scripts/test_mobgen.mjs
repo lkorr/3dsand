@@ -551,6 +551,18 @@ const sylvanMats = ['bark_light', 'bark_dark', 'leaves', 'staff_wood', 'gem_arca
       mg.applyFace(g, f); mg.applyCrown(g, c);
       rolls.push([`sylvan ${f} face, ${c} crown`, g]);
     }
+  // THE TAIL'S SHAPE at its ends, single, braided and twin: swept out, tucked
+  // in, tied at the crown and the nape, thin and thick. And the beard's own
+  // volume, on a bald head (nothing else to join) and under long hair.
+  for (const hs of ['ponytail', 'braid', 'pigtails'])
+    for (const [tc, th, tk] of [[1, 1, 1.6], [-1, -1, 0.5], [1, -1, 0.5], [-1, 1, 1.6]])
+      rolls.push([`${hs}, tail curve ${tc} height ${th} thickness ${tk}`,
+                  faceRig(hs, 'clean', { 'hair.tailCurve': tc, 'hair.tailHeight': th,
+                                         'hair.tailThick': tk, 'hair.tail': 1 })]);
+  for (const hs of ['bald', 'long'])
+    for (const bv of [1, 6])
+      rolls.push([`beard volume ${bv} on ${hs}`,
+                  faceRig(hs, 'bushy', { 'face.beardVolume': bv })]);
   rolls.push(['every face lever low', faceRig('bald', 'clean', {
     'face.brow': true, 'face.browHeight': -1, 'face.browInner': 0,
     'face.browTilt': -1, 'face.browSparse': 1, 'face.mouthWidth': 1,
@@ -2220,6 +2232,9 @@ section('S. the goblin: small, big-headed flesh on the SAME rig, its own height 
 }
 
 section('T. the fine face and the skin pass: a human drawn at the shipped lattice');
+// The late rows that are EVERY race's (the tail's shape, the beard's volume):
+// appended after the fine face's for the same reason, but not the human's.
+const EVERYONE_LATE = s => s.group === 'hair' || s.group === 'beard';
 {
   // A HUMAN's head is built on the 80 vox/m lattice (headVoxFine) and its body
   // painted there (humanSkinPass); `face: 'legacy'` builds the old head, which
@@ -2405,7 +2420,10 @@ section('T. the fine face and the skin pass: a human drawn at the shipped lattic
     const n = mg.normalizeGenome(g);
     ok(Number.isInteger(n.face.eyeRow), `${race}: a half-step eye row rounds to a whole one`);
     ok(mg.specStep(spec, n) === 1, `${race}: the eye-row slider steps whole rows`);
-    ok(!mg.GENE_SPECS.some(s => s.late && mg.specApplies(s, n)),
+    // (`late` also marks rows every race has that arrived after the roll
+    // order was fixed -- the tail's shape, the beard's volume -- and those
+    // live on the hair and beard tabs.)
+    ok(!mg.GENE_SPECS.some(s => s.late && !EVERYONE_LATE(s) && mg.specApplies(s, n)),
        `${race}: none of the fine face's rows show`);
     const b = mg.generateMob(n, 0, opts);
     ok(!b.parts.some(p => p.cells.some(c => DETAIL.has(c[3]))),
@@ -2433,8 +2451,281 @@ section('T. the fine face and the skin pass: a human drawn at the shipped lattic
   const late = mg.GENE_SPECS.filter(s => s.late).map(s => s.path);
   const r1bare = JSON.parse(JSON.stringify(r1));
   for (const p of late) mg.setPath(r1bare, p, mg.getPath(def, p));
-  ok(mg.GENE_SPECS.filter(s => s.late).every(s => s.race === 'human'),
-     'every late row is a human\u2019s', String(late.length));
+  ok(mg.GENE_SPECS.filter(s => s.late && !EVERYONE_LATE(s))
+       .every(s => s.race === 'human'),
+     'every late row off the hair and beard tabs is a human\u2019s',
+     String(late.length));
+}
+
+// =============================================================================
+// U. every slider moves only what it is for
+// =============================================================================
+
+section('U. every slider moves only what it is for (gene independence)');
+{
+  // THE OWNER'S TICKET (2026-10-15): "various sliders in the character creator
+  // affect other things for no reason; eye spacing will change freckles on
+  // skin, a bunch of sliders will end up making subtle changes to hair,
+  // changing underwear can change hair and freckles". Every one of those was
+  // a hash keyed on, or a landmark read from, something the slider moved:
+  //   - the skin pass seeded its whole scatter with eyeDx, heightM, freckles,
+  //     the jaw, the shoulder width and the texture amount;
+  //   - the hair mass hashed scene coordinates, read its eye line back out of
+  //     the face's paint (a dark or open mouth is EYE paint), rooted on any
+  //     hair-coloured paint (the beard, so the hair's volume puffed it out) and
+  //     took the skull's centre over the ears and the nose;
+  //   - a goblin hung its ears off the mean of every EYE-slot cell; a sylvan
+  //     carved its bark, and picked its knots, only where no cloth lay.
+  //
+  // So every slider is stepped once on bodies with everything on, and what
+  // moved is held to what the slider is for:
+  //   CONFINED  a face, skin or underwear row changes only its own parts;
+  //   NO HAIR   a skin or underwear row moves no hair at all;
+  //   PAINT     an underwear row, and the skin's dice, add or remove no cell
+  //             anywhere; an underwear row changes only cells that were or
+  //             became cloth;
+  //   ITS OWN   raising texture, moles or freckles only ADDS its own marks;
+  //   LOCAL     any other row that moves hair moves it near something the row
+  //             changed: within 12 cells, or under it in the same columns (a
+  //             strand hangs from whatever blocks it).
+  // The hair, short-hair and beard rows are not stepped -- moving the hair is
+  // what they are for -- and height and the proportions (`stack`) are not
+  // held to LOCAL: hanging hair is measured to the waist, so they move the end
+  // of every strand.
+  const R = 12;
+  const key = (x, y, z) => ((z + 512) * 2048 + (y + 1024)) * 2048 + (x + 1024);
+  const unkey = k => [k % 2048 - 1024, Math.floor(k / 2048) % 2048 - 1024,
+                      Math.floor(k / 4194304) - 512];
+  // Scene cells per part, the hair's own pieces (hair, hair.2, mane, ...)
+  // pooled as one; a race's extras (snout, bough, tail, hood) keep their name.
+  const HAIRP = /^(hair|mane)(\.\d+)?$/;
+  const partOf = p => (p.hair && HAIRP.test(p.name) ? 'HAIR'
+                       : p.hair ? 'X:' + p.name.replace(/\.\d+$/, '') : p.name);
+  const cellsOf = b => {
+    const parts = new Map();
+    for (const p of b.parts) {
+      const nm = partOf(p);
+      if (!parts.has(nm)) parts.set(nm, new Map());
+      const m = parts.get(nm);
+      for (const [x, y, z, c] of p.cells)
+        m.set(key(p.mn[0] + x, p.mn[1] + y, p.mn[2] + z), c);
+    }
+    return parts;
+  };
+  const diffOf = (A, B) => {
+    const out = new Map();
+    for (const nm of new Set([...A.keys(), ...B.keys()])) {
+      const ma = A.get(nm) || new Map(), mb = B.get(nm) || new Map();
+      const ch = [];
+      for (const [k, c] of ma) if (mb.get(k) !== c) ch.push(k);
+      for (const k of mb.keys()) if (!ma.has(k)) ch.push(k);
+      if (ch.length) out.set(nm, ch);
+    }
+    return out;
+  };
+  // Changed hair cells nothing the step changed explains (see LOCAL).
+  const farHair = d => {
+    const hair = d.get('HAIR');
+    if (!hair) return [];
+    const B = 4, buckets = new Map();
+    for (const [nm, ks] of d) {
+      if (nm === 'HAIR') continue;
+      for (const k of ks) {
+        const c = unkey(k);
+        const bk = Math.floor(c[0] / B) + ',' + Math.floor(c[1] / B) + ',' +
+                   Math.floor(c[2] / B);
+        if (!buckets.has(bk)) buckets.set(bk, []);
+        buckets.get(bk).push(c);
+      }
+    }
+    const nb = Math.ceil(R / B), far = [];
+    for (const k of hair) {
+      const [x, y, z] = unkey(k);
+      const bx = Math.floor(x / B), by = Math.floor(y / B), bz = Math.floor(z / B);
+      let near = false;
+      for (let dz = -nb; dz <= 64 && !near; dz++)
+        for (let dy = -nb; dy <= nb && !near; dy++)
+          for (let dx = -nb; dx <= nb && !near; dx++) {
+            const cs = buckets.get((bx + dx) + ',' + (by + dy) + ',' + (bz + dz));
+            if (!cs) continue;
+            for (const c of cs) {
+              const ax = Math.abs(c[0] - x), ay = Math.abs(c[1] - y), az = c[2] - z;
+              if (Math.max(ax, ay, Math.abs(az)) <= R ||
+                  (ax <= 3 && ay <= 3 && az >= -R)) { near = true; break; }
+            }
+          }
+      if (!near) far.push([x, y, z]);
+    }
+    return far;
+  };
+  const build = g => mg.generateMob(g, 0, { noVox: true });
+  const stepOf = (spec, g) => {
+    const v = mg.getPath(g, spec.path);
+    if (spec.kind === 'bool') return !v;
+    if (spec.kind === 'enum')
+      return spec.choices[(spec.choices.indexOf(v) + 1) % spec.choices.length];
+    const [, hi] = mg.specRange(spec, g);
+    const st = mg.specStep(spec, g) || 0.05;
+    return v + st <= hi + 1e-9 ? v + st : v - st;
+  };
+  const UNDERWEAR = p => p.startsWith('body.bra.') || p.startsWith('body.briefs.');
+  const partsFor = spec => {
+    if (spec.path === 'face.freckles') return ['head', 'torso', 'armU.L', 'armU.R'];
+    if (spec.path === 'body.skin.blush') return ['head'];
+    if (spec.path.startsWith('body.bra.')) return ['torso'];
+    if (spec.path.startsWith('body.briefs.')) return ['hips', 'legU.L', 'legU.R'];
+    if (['eyes', 'brows', 'mouth', 'details', 'ears', 'face'].includes(spec.group))
+      return ['head', 'HAIR'];
+    return null;                               // geometry, the skin: anywhere
+  };
+  const SCATTER = { 'body.skin.texture': [mg.ART.FACE_SHADE, mg.ART.FACE_LIGHT],
+                    'body.skin.moles': [mg.ART.MOLE],
+                    'face.freckles': [mg.ART.FACE_SHADE] };
+  const CLOTH = new Set([mg.ART.CLOTH, mg.ART.CLOTH_SHADE]);
+  const RACE_GROUPS = new Set(mg.GENE_GROUPS.slice(mg.GENE_GROUPS
+    .findIndex(gr => gr.key === 'underwear') + 1).map(gr => gr.key));
+
+  // THE BODIES. A man with everything a slider could reach across: hanging
+  // hair (tail, curtain, bangs, a hanging beard), the eye window, a shell, the
+  // short layer, scalp thinning, every scatter, a nose and brows. A woman for
+  // the rows only she has (the bra). And a goblin and a sylvan in underwear:
+  // the two races whose surface pass is geometry (warts, carved bark).
+  const man = mg.applySex(mg.presetGenome('human'), 'male');
+  mg.applyHairStyle(man, 'ponytail');
+  mg.applyBeardStyle(man, 'full');
+  Object.assign(man.face, { beardDensity: 0.7, beardLen: 0.5, beardRagged: 0.6,
+                            freckles: 0.8, brow: true, browSparse: 0.3, nose: 1 });
+  Object.assign(man.body.skin, { moles: 0.5, texture: 0.5, blush: 0.4 });
+  Object.assign(man.hair, { ragged: 0.6, wisp: 0.4, fuzz: 0.5, drop: 0.3,
+                            sideThin: 0.3, hairlineSoft: 0.3, bangs: 0.5,
+                            faceThin: 0.4, front: 8, volume: 1 });
+  const woman = mg.applySex(mg.presetGenome('human'), 'female');
+  mg.applyHairStyle(woman, 'long');
+  Object.assign(woman.face, { freckles: 0.8 });
+  Object.assign(woman.body.skin, { moles: 0.5, texture: 0.5 });
+  const dressed = race => {
+    const g = mg.applyRace(mg.applySex(mg.presetGenome('human'), 'female'), race);
+    mg.applyHairStyle(g, 'long');
+    mg.applyBraStyle(g, 'crop');
+    if (race === 'goblin') g.goblin.warts = 0.6;
+    return g;
+  };
+  const BODIES = [
+    ['man', man, s => !['hair', 'fuzz', 'beard'].includes(s.group)],
+    ['woman', woman, s => s.sex === 'female' || s.path === 'body.bust'],
+    ['goblin', dressed('goblin'), s => UNDERWEAR(s.path)],
+    ['sylvan', dressed('sylvan'), s => UNDERWEAR(s.path)],
+  ];
+  let stepped = 0;
+  for (const [who, raw, want] of BODIES) {
+    const g0 = mg.normalizeGenome(raw);
+    const A = cellsOf(build(g0));
+    for (const spec of mg.GENE_SPECS) {
+      if (!want(spec) || !mg.specApplies(spec, g0) || spec.fixed ||
+          spec.kind === 'color' || spec.styled || spec.path === 'body.sex')
+        continue;
+      const g1 = mg.normalizeGenome(mg.setPath(JSON.parse(JSON.stringify(g0)),
+                                               spec.path, stepOf(spec, g0)));
+      const v0 = mg.getPath(g0, spec.path), v1 = mg.getPath(g1, spec.path);
+      if (JSON.stringify(v0) === JSON.stringify(v1)) continue;
+      stepped++;
+      const B = cellsOf(build(g1));
+      const d = diffOf(A, B);
+      const why = [];
+      const allowed = partsFor(spec);
+      if (allowed) {
+        const extra = [...d.keys()].filter(p => !allowed.includes(p));
+        if (extra.length)
+          why.push('changed ' + extra.map(p => `${p} (${d.get(p).length})`).join(', '));
+      }
+      const paintOnly = UNDERWEAR(spec.path) || spec.path === 'body.skin.pattern';
+      if ((spec.group === 'skin' || paintOnly) && d.has('HAIR'))
+        why.push(`moved ${d.get('HAIR').length} hair cells`);
+      if (paintOnly) {
+        let geo = 0, notCloth = 0;
+        for (const [nm, ks] of d)
+          for (const k of ks) {
+            const a = A.get(nm)?.get(k), b = B.get(nm)?.get(k);
+            if (a === undefined || b === undefined) geo++;
+            else if (UNDERWEAR(spec.path) && !CLOTH.has(a) && !CLOTH.has(b)) notCloth++;
+          }
+        if (geo) why.push(`added or removed ${geo} cells`);
+        if (notCloth) why.push(`repainted ${notCloth} cells that were never cloth`);
+      }
+      if (SCATTER[spec.path] && v1 > v0) {
+        let wrong = 0;
+        for (const [nm, ks] of d)
+          for (const k of ks) if (!SCATTER[spec.path].includes(B.get(nm)?.get(k))) wrong++;
+        if (wrong) why.push(`${wrong} changed cells are not new marks of its own`);
+      }
+      if (spec.group !== 'skin' && !paintOnly && !RACE_GROUPS.has(spec.group) &&
+          spec.path !== 'body.heightM' && !spec.path.startsWith('body.stack.') &&
+          spec.path !== 'body.headWidth' && spec.path !== 'body.headDepth') {
+        const far = farHair(d);
+        if (far.length)
+          why.push(`moved ${far.length} of ${d.get('HAIR').length} hair cells ` +
+                   `nowhere near anything it changed (e.g. ${far[0]})`);
+      }
+      ok(!why.length, `${who}: ${spec.path} ${JSON.stringify(v0)} -> ` +
+                      `${JSON.stringify(v1)} moves only what it is for`,
+         why.join('; '));
+    }
+  }
+  ok(stepped > 120, 'every slider was stepped', `${stepped} steps`);
+
+  // THE SKIN'S DICE re-rolls the scatter (and, above, nothing else).
+  {
+    const g1 = JSON.parse(JSON.stringify(man));
+    g1.body.skin.pattern = 77;
+    const d = diffOf(cellsOf(build(mg.normalizeGenome(man))),
+                     cellsOf(build(mg.normalizeGenome(g1))));
+    ok([...d.values()].reduce((n, ks) => n + ks.length, 0) > 100,
+       'a different skin pattern is a different scatter');
+  }
+
+  // THE TAIL'S SHAPE does what its rows say: the curve carries the tail's end
+  // away from the back (or tucks it in), the tie climbs the head, and the
+  // girth is girth.
+  {
+    const tail = o => {
+      const g = mg.applyHairStyle(mg.defaultGenome(), 'ponytail');
+      Object.assign(g.hair, o);
+      const b = build(mg.normalizeGenome(g));
+      const cells = b.parts.filter(p => p.hair).flatMap(p =>
+        p.cells.map(([x, y, z]) => [p.mn[0] + x, p.mn[1] + y, p.mn[2] + z]));
+      const zLo = Math.min(...cells.map(c => c[2]));
+      const end = cells.filter(c => c[2] <= zLo + 3);
+      return { n: cells.length, top: Math.max(...cells.map(c => c[2])),
+               endY: end.reduce((s, c) => s + c[1], 0) / end.length };
+    };
+    const flat = tail({}), out = tail({ tailCurve: 1 }), tuck = tail({ tailCurve: -1 });
+    ok(out.endY > flat.endY + 3, 'tail curve 1 sweeps the end out from the back',
+       `end y ${flat.endY.toFixed(1)} -> ${out.endY.toFixed(1)}`);
+    ok(tuck.endY <= flat.endY, 'tail curve -1 keeps the end in on the back',
+       `end y ${flat.endY.toFixed(1)} -> ${tuck.endY.toFixed(1)}`);
+    const hi = tail({ tailHeight: 1, tail: 0.3 }), lo = tail({ tailHeight: -1, tail: 0.3 });
+    const mid = tail({ tail: 0.3 });
+    ok(hi.n !== mid.n && lo.n !== mid.n, 'the tie moves with the height row',
+       `${lo.n} / ${mid.n} / ${hi.n} cells`);
+    ok(tail({ tailThick: 1.6 }).n > flat.n && tail({ tailThick: 0.5 }).n < flat.n,
+       'thickness thickens the tail', `${flat.n} cells at 1`);
+  }
+
+  // THE BEARD'S VOLUME is its own: the hair's volume no longer reaches it, and
+  // its own row does.
+  {
+    const hairOf = (beard, bv) => {
+      const g = mg.applyBeardStyle(mg.applyHairStyle(mg.defaultGenome(), 'crew'), beard);
+      g.hair.volume = 3; g.face.beardVolume = bv;
+      return cellsOf(build(mg.normalizeGenome(g))).get('HAIR') || new Map();
+    };
+    const bare = hairOf('clean', 0), painted = hairOf('full', 0), grown = hairOf('full', 3);
+    ok(painted.size === bare.size && [...painted].every(([k, c]) => bare.get(k) === c),
+       'a painted beard grows no hair, whatever the hair\u2019s volume',
+       `${bare.size} hair cells shaven, ${painted.size} bearded`);
+    ok(grown.size > painted.size + 50, 'the beard\u2019s own volume does',
+       `${painted.size} -> ${grown.size}`);
+  }
 }
 
 // =============================================================================

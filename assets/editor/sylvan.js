@@ -635,6 +635,7 @@ export function barkPass(g, role, name, cells, size, info) {
     return true;
   };
   const BARK = BARKISH(A);
+  const WRAP = new Set([A.CLOTH, A.CLOTH_SHADE]);       // the leaf wrap's paint
   const lateral = (x, y, z) => !has(x - 1, y, z) || !has(x + 1, y, z) ||
                                !has(x, y - 1, z) || !has(x, y + 1, z);
   const cx = sx / 2, cy = sy / 2;
@@ -678,6 +679,28 @@ export function barkPass(g, role, name, cells, size, info) {
     }
   }
 
+  // ---- the leaf wrap: whole, ragged, or gone -----------------------------------
+  // The human's shorts (and a woman's top) are CLOTH paint; on a sylvan they
+  // are leaves. Below 1 they fray from the edges in: a ragged fringe that
+  // hangs longer in places, then patches, then bare bark.
+  //
+  // FIRST, before anything marks the bark, and back to the bark's own shade
+  // (info.bareSlot: what the body builder paints a bare cell there): where
+  // the wrap frays it is bark in every respect -- grain, roots, knots and moss
+  // included. Frayed after them, and shaded by a rule of its own, the bare
+  // patches showed where the wrap had been, so the underwear sliders
+  // repainted the bark around it.
+  if (s.wrap < 1) {
+    for (const v of list()) {
+      const [x, y, z, c] = v;
+      if (c !== A.CLOTH && c !== A.CLOTH_SHADE) continue;
+      const n = vnoise(seed ^ 0x9a9a, x * 2.2, y, z, 3);
+      if (n > s.wrap * 1.2 - 0.1)
+        v[3] = info.bareSlot ? info.bareSlot(x, y, z)
+             : y + 0.5 < cy - 1.8 ? A.SKIN_BASE : A.SKIN_SHADE;
+    }
+  }
+
   // ---- roots: helical strands, with the bark beside them carved away --------
   const nR = s.roots > 0.02
     ? Math.max(1, Math.round(s.roots * (role === 'trunk' ? 6 : role === 'head'
@@ -705,11 +728,16 @@ export function barkPass(g, role, name, cells, size, info) {
     const groove = [];
     const carve = role !== 'hand' && role !== 'foot' && s.relief > 0;
     for (const [x, y, z, c] of list()) {
-      if (!BARK.has(c) || !lateral(x, y, z)) continue;
+      // UNDER THE LEAF WRAP TOO. The relief is the trunk's shape and the wrap
+      // (the human's CLOTH paint) only lies over it: cut where the wrap is not,
+      // the underwear sliders carved the bark -- and moved the hair draped on
+      // it. The root's own colour stays off the wrap.
+      const bark = BARK.has(c);
+      if ((!bark && !WRAP.has(c)) || !lateral(x, y, z)) continue;
       if (role === 'head' && (y + 0.5 < cy + 1 || z <= (info.neckTop || 0)))
         continue;                                      // roots stay off the face
       const d = distTo(tOf(x, y), z);
-      if (d < w) paint(x, y, z, SLOTS.ROOT);
+      if (d < w) { if (bark) paint(x, y, z, SLOTS.ROOT); }
       else if (carve && d < w + 1.3 && rnd(seed, x, y, z, 5) < s.relief * 1.15)
         groove.push([x, y, z]);
     }
@@ -748,13 +776,17 @@ export function barkPass(g, role, name, cells, size, info) {
   }
 
   // ---- knots -----------------------------------------------------------------
+  // Each surface cell is a knot's centre or not by ITS OWN hash, one in 420 at
+  // knots 1 -- the count the old pick made. The old pick took the n-th cell of
+  // the bare-bark surface list, so anything that changed that list (the leaf
+  // wrap over the chest, a wider trunk) moved every knot on the part. The
+  // wrap is surface here too: a knot under it shows where it reaches out.
   if (s.knots > 0 && role !== 'hand') {
-    const surf = list().filter(([x, y, z, c]) => BARK.has(c) && lateral(x, y, z) &&
-                                                !nearFace(x, y, z));
-    const n = Math.floor(s.knots * surf.length / 420 + rnd(seed, 17));
-    for (let i = 0; i < n && surf.length; i++) {
-      const [kx, ky, kz] = surf[Math.floor(rnd(seed, i, 19) * surf.length)];
-      const r = 1.4 + rnd(seed, i, 23) * 1.4 * (0.5 + s.knots);
+    const centres = list().filter(([x, y, z, c]) =>
+      (BARK.has(c) || WRAP.has(c)) && lateral(x, y, z) && !nearFace(x, y, z) &&
+      rnd(seed, x, y, z, 19) < s.knots / 420);
+    for (const [kx, ky, kz] of centres) {
+      const r = 1.4 + rnd(seed, kx, ky, kz, 23) * 1.4 * (0.5 + s.knots);
       for (const v of list()) {
         const d = Math.hypot(v[0] - kx, v[1] - ky, v[2] - kz);
         if (d > r + 0.2 || !lateral(v[0], v[1], v[2])) continue;
@@ -777,20 +809,6 @@ export function barkPass(g, role, name, cells, size, info) {
       const blob = vnoise(seed ^ 0x3131, x, y, z, 3.5);
       if (blob < s.moss * 1.05 && rnd(seed, x, y, z, 29) < 0.35 + s.moss * 0.6)
         v[3] = SLOTS.MOSS;
-    }
-  }
-
-  // ---- the leaf wrap: whole, ragged, or gone -----------------------------------
-  // The human's shorts (and a woman's top) are CLOTH paint; on a sylvan they
-  // are leaves. Below 1 they fray from the edges in: a ragged fringe that
-  // hangs longer in places, then patches, then bare bark.
-  if (s.wrap < 1) {
-    for (const v of list()) {
-      const [x, y, z, c] = v;
-      if (c !== A.CLOTH && c !== A.CLOTH_SHADE) continue;
-      const n = vnoise(seed ^ 0x9a9a, x * 2.2, y, z, 3);
-      if (n > s.wrap * 1.2 - 0.1)
-        v[3] = y + 0.5 < cy - 1.8 ? A.SKIN_BASE : A.SKIN_SHADE;
     }
   }
 
@@ -845,7 +863,10 @@ function carveFace(g, A, cells, size, info, op) {
   const s = g.sylvan;
   const [sx, sy, sz] = size;
   const cx = sx / 2;
-  const eyeCells = cells.filter(c => c[3] === A.EYE);
+  // The eyes the head says it has (info.isEye, mobgen headMarks), not every
+  // cell in the EYE slot: a dark or open mouth is painted in it too.
+  const eyeCells = cells.filter(c => c[3] === A.EYE &&
+                                    (!info.isEye || info.isEye(c[0], c[1], c[2])));
   // The FRONT of every (x, z) column: the lowest y there. Measured before any
   // carving, so a socket and the mouth are cut from the same face.
   const front = new Map();

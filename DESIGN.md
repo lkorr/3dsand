@@ -11471,7 +11471,8 @@ were. Nothing about storage or rendering changes: the human already paid for
   asserts the body below the neck has exactly the old cells): fingers, nails,
   knuckles, toes, a kneecap, the elbow crease, collarbones, a navel, the line
   under a man's chest, a one-cell checker where `shadeBack`'s dark half
-  begins, `texture` mottle and `moles`.
+  begins, `texture` mottle and `moles` (where they fall is `body.skin.pattern`
+  alone: see "Every slider moves only what it is for" below).
 - **Detail art slots** (`ART.FACE_SHADE` 201, `FACE_LIGHT` 200,
   `EYE_WHITE` 199, `LASH` 198, then 197-180: `mg.DETAIL_SLOTS`). Three are an existing colour under a new number
   (skinShade, skinLight, hairShade), which costs the shared art palette nothing
@@ -11494,6 +11495,85 @@ were. Nothing about storage or rendering changes: the human already paid for
   `shana`'s torso had 34 cells of bra the current generator no longer paints;
   all now match. `assets/mobs/human.vox`, the hand-authored base (player model), has no
   genome and its own palette, and is NOT converted.
+
+#### Every slider moves only what it is for (2026-10-15)
+
+Owner ticket: "eye spacing will change freckles on skin, a bunch of sliders will
+end up making subtle changes to hair, changing underwear can change hair and
+freckles". Measured with a coupling matrix (every gene stepped, every part
+diffed), every case was a random choice keyed on, or a landmark read from,
+something the slider moved:
+
+- **The skin pass's seed** mixed in eyeDx, heightM, freckles, the jaw, the
+  shoulder width and the texture amount, so those six re-rolled every mole and
+  mottle down to the feet. It is now the part's name plus **`body.skin.pattern`**,
+  a `dice` row (thrown whole by a roll, never nudged or blended) that nothing
+  else reads; a cell is keyed from its part's MIDLINE and TOP JOINT, not the box
+  corner, so a wider limb keeps the marks that did not move. Moles, shoulder
+  freckles and mottle claim bare skin in that order of precedence, so raising
+  one only adds its own marks. The fine face's freckles use the same dice,
+  keyed off the midline and the eye row.
+- **`hairMass` read the head's paint.** A dark or open mouth and a dark brow are
+  painted in the EYE slot, so they moved the eye line the beard, bangs and short
+  layer hang off; the old nose tip and cheeks are `SKIN_LIGHT`, which is scalp;
+  any hair-coloured paint was scalp, so the hair's VOLUME grew off beards (a
+  "3D beard" on anyone with hair mass and a painted beard, a curtain hanging
+  off yorg's beard) and beard paint lowered the nape the curtain is measured
+  from; the skull's centre was the bounding box of every head cell, ears and
+  nose included. Now the head builders RECORD what the hair needs as they
+  decide it (**headMarks**, `ctx.marks.head`, scaled with the cells for
+  `headVox`): the cap (by the hair function, before any face paint), the
+  skull's extent (before any ear), the beard cells, the eye cells and rows,
+  the eye line before the eye-height slider (the short layer's reach), and the
+  ears/nose/brow ridge. A race's face pass and extras get the same eyes
+  (`info.isEye`, `ctx.eyeLine`): a goblin hung its ears and nose off the mean
+  of every EYE-slot cell, so its mouth sliders moved them.
+- **Hair hashed scene coordinates**, so anything that moved the head re-rolled
+  every fluffy end and streak. Every hashed choice is keyed in the head's frame
+  (x from the midline, y and z from the head box); a draped cell carries its
+  STRAND's key (root column and row, or the tail's own cross-section), so a back
+  that moves the curtain keeps every wisp on its strand. The speck filter is a
+  fixed 32 cells: it was 2% of the group, so a few cells anywhere flipped a
+  speck on the far side of the head (1 speck in 200 groups depended on it).
+- **Underwear on the races was geometry.** A goblin's warts and a sylvan's root
+  grooves were raised only on bare skin, and the sylvan's knots were picked by
+  index from the bare-bark list, so a bra re-carved the body and re-draped the
+  hair over it. Bumps, grooves and knot centres now ignore paint; the sylvan's
+  leaf wrap frays first, back to exactly the skin the builder paints there
+  (`info.bareSlot`).
+- **New rows (owner ask, same day):** the ponytail's **tail curve** (-1 tucks
+  in and lies flat, 0 as drawn, 1 sweeps out in an arc; continuous through 0),
+  **tied at** (nape to crown, twin tails too) and **tail thickness**; the
+  beard's own **volume** (fine cells off the painted beard, riding the head),
+  which replaces what the hair's volume used to do to beards by accident. All
+  are `late` rows; 0 / 0 / 1 / 0 are exact no-ops.
+- **The guard:** `test_mobgen.mjs` §U steps every slider once on a man with
+  everything on (hanging hair, bangs and the eye window, shell, short layer,
+  thinning, every scatter, a hanging beard), a woman (the bra rows) and a goblin
+  and sylvan in underwear, and holds what moved to what the row is for:
+  CONFINED (face/skin/underwear rows touch only their own parts), NO HAIR
+  (skin and underwear rows), PAINT (underwear and the dice add or remove no
+  cell; underwear repaints only cells that were or became cloth), ITS OWN
+  (raising texture, moles or freckles only adds its own marks) and LOCAL (any
+  other row moves hair only within 12 cells of something it changed, or under
+  it in the same columns -- a strand hangs from what blocks it). Hair, beard
+  and short-layer rows are not held to these (moving the hair is their job),
+  nor height and the stack (hanging hair is measured to the waist). Run against
+  the generator before this change, §U fails on exactly the ticket's cases.
+  It costs the gate ~20 s.
+- **Still coupled, on purpose:** the bangs, beard and short layer follow the
+  EYE ROW; ears, a nose and a brow ridge are solid, so hair parts round them
+  (locally); hanging hair rests on the shoulders and back, so the body's shape
+  changes the drape; a race's own features hang off the face (goblin ears,
+  demon horns). Every one is local, and §U says so.
+- **Assets:** every generated body was re-baked (`gen_mobs.mjs --rebake`, the
+  race bases, `bake_human_pool.mjs --rebake`). Each human got its own `pattern`
+  (from its stem) so the cast does not share one scatter, and the nine bodies
+  whose beard the hair's volume used to puff out got that volume as
+  `beardVolume` (brug, corwin, ferdruk, fleepo, sherp, yorg, zeus, pool m02,
+  m08). Not restorable by a row: yorg's "mane" was hair hanging off his beard
+  paint, and sherp's short nape curtain came from beard paint lowering his
+  nape; both are gone.
 
 ---
 

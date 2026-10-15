@@ -3,6 +3,18 @@
   "extends": "human",
   "model": "jujunud",
   "sidecarVoxelsPerMetre": 10,
+  "anatomy": {
+    "limbs": {
+      "hair": {
+        "layers": [
+          {
+            "material": "hair_white",
+            "keep": true
+          }
+        ]
+      }
+    }
+  },
   "gait": {
     "rideHeight": 1.195
   },
@@ -103,6 +115,21 @@
         12,
         32,
         10
+      ]
+    },
+    {
+      "name": "hair",
+      "parent": "head",
+      "joint": "fixed",
+      "hp": 18,
+      "severable": true,
+      "vital": false,
+      "bloodless": true,
+      "tag": "hair",
+      "anchor": [
+        18.5,
+        119,
+        -0.5
       ]
     }
   ],
@@ -208,7 +235,8 @@
         "knuckles": 0.5,
         "nails": 1,
         "toes": 0.6,
-        "softEdge": 1
+        "softEdge": 1,
+        "pattern": 196
       }
     },
     "shape": {
@@ -232,7 +260,7 @@
       "skullBack": 0.7106194502251256
     },
     "face": {
-      "eyeDx": 2.4039895415643913,
+      "eyeDx": 2.25,
       "eyeRow": 0,
       "eyeCols": 1,
       "mouthWidth": 1,
@@ -279,15 +307,16 @@
       "beardLen": 0,
       "beardPoint": 0,
       "beardFork": false,
-      "eyeOpen": 0.4,
+      "beardVolume": 0,
+      "eyeOpen": 1,
       "eyeTilt": 0,
-      "lashes": 0.5,
-      "lidCrease": 0.25,
+      "lashes": 0,
+      "lidCrease": 0,
       "noseBridge": 0.5,
       "noseBulb": 0.3,
-      "eyeStyle": "almond",
-      "irisSize": 0.3,
-      "whites": 1,
+      "eyeStyle": "old",
+      "irisSize": 1,
+      "whites": 0,
       "glint": false,
       "lashSpan": 0.7,
       "lashTone": 0.7,
@@ -315,9 +344,12 @@
       "spikes": 0,
       "buns": false,
       "drop": 0,
-      "tail": 0,
-      "braid": false,
+      "tail": 0.55,
+      "braid": true,
       "twin": false,
+      "tailCurve": 0,
+      "tailHeight": 0,
+      "tailThick": 1,
       "wisp": 0.35,
       "ragged": 0.3,
       "bangs": 0,

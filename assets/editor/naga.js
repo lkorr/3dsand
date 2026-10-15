@@ -491,7 +491,10 @@ export function surfacePass(g, role, name, cells, size, info) {
 
   // ---- the face ----------------------------------------------------------------
   const eyeRow = info.eyeRow ?? sz * 0.6;
+  // The eyes the head says it has (info.isEye, mobgen headMarks), not every
+  // cell in the EYE slot: a dark or open mouth is painted in it too.
   const eyeCells = G.list().filter(c => c[3] === A.EYE &&
+                                       (!info.isEye || info.isEye(c[0], c[1], c[2])) &&
                                        Math.abs(c[2] + 0.5 - eyeRow) < 5);
   const eyes = [eyeCells.filter(c => c[0] + 0.5 < cx),
                 eyeCells.filter(c => c[0] + 0.5 >= cx)].filter(e => e.length);
@@ -623,8 +626,11 @@ export function extras(g, ctx) {
   const H = extent(head);
   const hc = sceneCells(head);
   const eyeZs = hc.filter(c => c[3] === ART.EYE).map(c => c[2]);
-  const eyeZ = eyeZs.length ? eyeZs.reduce((a, b) => a + b, 0) / eyeZs.length
-                            : H.z0 + (H.z1 - H.z0) * 0.6;
+  // The head's own eye line (ctx.eyeLine, mobgen headMarks) when it has one:
+  // the mean of every EYE-slot cell moves with a dark or open mouth.
+  const eyeZ = ctx.eyeLine ? (ctx.eyeLine[0] + ctx.eyeLine[1]) / 2
+    : eyeZs.length ? eyeZs.reduce((a, b) => a + b, 0) / eyeZs.length
+                   : H.z0 + (H.z1 - H.z0) * 0.6;
   const headH = H.z1 - H.z0 + 1, halfW = (H.x1 - H.x0 + 1) / 2;
 
   // ---- the hood: a teardrop fan behind the neck, cupped forward at the edges
