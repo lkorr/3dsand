@@ -2395,8 +2395,19 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
     var idx = PT_NO_WORD;
     if (y < yTop) {
       let c = base + vec3<i32>(cx, y, cz);
-      idx = voxWordIndex(c);
-      if (idx != PT_NO_WORD) { w = voxels[idx]; }
+      // THE RESIDENCY RULE FIRST (seamSupport's, audit DET-6 2026-10-14): the
+      // spill rows of a block in the window's TOP chunk plane lie above the
+      // window, and voxWordIndex of a non-resident cell falls back to the
+      // masked window slot -- the BOTTOM plane's chunk 512 cells below, whose
+      // real page this walk then read and the commit wrote into. A cell
+      // outside residency is a blocker (the window edge is solid and inert).
+      // idx stays PT_NO_WORD, so the commit below cannot write it either.
+      if (cellResident(c, T.origin)) {
+        idx = voxWordIndex(c);
+        if (idx != PT_NO_WORD) { w = voxels[idx]; }
+      } else {
+        blocked = true;
+      }
       let mat = voxMat(w);
       if (mat != MAT_AIR && !seamLiquid(mat)) { blocked = true; }
       // An unmapped word can only mean the coverage guarantee failed (the
