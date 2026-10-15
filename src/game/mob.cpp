@@ -34535,13 +34535,23 @@ void Mob::ApplyAimPart(const AnimSkeleton& sk, AnimState& st, int part,
       // back twists the same TOTAL amount as a single torso rather than three
       // times as far.
       const float per = yaw * std::clamp(spineShare, 0.0f, 1.0f) / (float)nSpine;
+      // Only a spine joint ABOVE the part hands its share down to it: the
+      // naga's waist (`tail1`, spine-tagged, hanging from the hips beside the
+      // torso) turns too, but the head does not hang from it, and counting
+      // it left the look short by its share.
+      auto above = [&](size_t i) {
+        for (int p = sk.parts[(size_t)part].parent; p >= 0;
+             p = sk.parts[(size_t)p].parent)
+          if ((size_t)p == i) return true;
+        return false;
+      };
       for (size_t i = 0; i < sk.parts.size(); i++) {
         if (sk.parts[i].tag != "spine" || (int)i == root) continue;
         if (i < st.partAlive.size() && !st.partAlive[i]) continue;
         if (i >= st.local.size()) continue;
         st.local[i].rot = QuatNormalize(
             QuatMul(st.local[i].rot, AxisAngle({0, 1, 0}, per)));
-        spineTotal += per;
+        if (above(i)) spineTotal += per;
       }
     }
   }

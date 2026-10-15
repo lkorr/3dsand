@@ -1004,12 +1004,50 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   // the driver asks for it (PoseInputs::swimWave), a slither body keeps its own.
   // ...and a WALKER that swims on a tail kicks it with the tail's own water
   // wave (MobDef::slitherWater: the naga's mermaid kick).
+  const MobDef::SlitherDef* laid = nullptr;
   if (in.swimWave && def.swim.wave.present)
-    ApplySlither(def.swim.wave, in, dt);
+    laid = &def.swim.wave;
   else if (in.swim && def.slitherWater.present)
-    ApplySlither(def.slitherWater, in, dt);
+    laid = &def.slitherWater;
   else if (def.slither.present)
-    ApplySlither(def.slither, in, dt);
+    laid = &def.slither;
+  if (laid != nullptr) ApplySlither(*laid, in, dt);
+
+  // ---- THE TRAIL KEEPS THE PATH THE SLITHER LAID IT ON ---------------------
+  // ApplySlither solves each chain segment's yaw in the MODEL frame and
+  // assumes the parts between the root and the chain add none. A `spine`
+  // part above the chain breaks that: the naga's waist (`tail1`, tagged spine
+  // so a naga turns at the waist) takes its share of every later spine stage
+  // -- the stroke's torso twist, the head-look and aim, the air, climb and
+  // hit leans -- and the rise and the whole trail hanging from it swung about
+  // the hips with it, sweeping a 3-4 m tail sideways through a bite. So the
+  // spine ancestors' locals are noted here, and before the flatten the part
+  // below the deepest of them is handed back whatever they turned since: the
+  // waist still turns, the trail stays where it was laid. A body that IS its
+  // chain (the snake, a fish) has no such ancestor and pays one parent test.
+  static thread_local std::vector<int> trailAnc;   // root side first
+  static thread_local std::vector<Quat> trailWas;
+  trailAnc.clear();
+  trailWas.clear();
+  int trailKeep = -1;   // the part that is handed the turn back
+  if (laid != nullptr && !laid->parts.empty() && laid->parts[0] >= 0 &&
+      (size_t)laid->parts[0] < sk.parts.size()) {
+    const int head = laid->parts[0];
+    for (int p = sk.parts[(size_t)head].parent; p >= 0 && p != def.rootLimb;
+         p = sk.parts[(size_t)p].parent)
+      trailAnc.push_back(p);
+    std::reverse(trailAnc.begin(), trailAnc.end());
+    size_t keep = 0;   // through the deepest spine part on the path
+    for (size_t a = 0; a < trailAnc.size(); a++)
+      if (sk.parts[(size_t)trailAnc[a]].tag == "spine") keep = a + 1;
+    if (keep > 0) {
+      trailKeep = keep < trailAnc.size() ? trailAnc[keep] : head;
+      trailAnc.resize(keep);
+      for (int a : trailAnc) trailWas.push_back(st.local[(size_t)a].rot);
+    } else {
+      trailAnc.clear();
+    }
+  }
 
   // ---- procedural layer: the legacy phase swing ----------------------------
   // dummy.json has swingAmp/swingPhase and no chains; running it HERE rather
@@ -1222,6 +1260,25 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
 
   if (loco && loco->groundAlign > 0.0f)
     AnimDragDeadLegs(sk, st, speedNow_, st.gaitPhase);
+
+  // ---- the trail is handed back what the spine above it turned ------------
+  // (noted after ApplySlither, above). keep' = (now)^-1 * was * keep, so the
+  // product down to `trailKeep` is the one the slither laid the path in.
+  if (trailKeep >= 0 && (size_t)trailKeep < st.local.size() &&
+      !((size_t)trailKeep < st.partAlive.size() && !st.partAlive[(size_t)trailKeep])) {
+    Quat was{}, now{};
+    bool moved = false;
+    for (size_t a = 0; a < trailAnc.size(); a++) {
+      const Quat& w0 = trailWas[a];
+      const Quat& w1 = st.local[(size_t)trailAnc[a]].rot;
+      moved |= w0.x != w1.x || w0.y != w1.y || w0.z != w1.z || w0.w != w1.w;
+      was = QuatMul(was, w0);
+      now = QuatMul(now, w1);
+    }
+    if (moved)
+      st.local[(size_t)trailKeep].rot = QuatNormalize(QuatMul(
+          QuatMul(QuatConj(now), was), st.local[(size_t)trailKeep].rot));
+  }
 
   // ---- stage 4: flatten to model space ----
   AnimFlatten(sk, st);
