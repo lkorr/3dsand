@@ -3264,6 +3264,12 @@ reaction system.
   the owner took the trade on 2026-10-06 (with the two flags below; combined
   measurement under `sim.gasThinDecayMul`). Flip the const to re-run the
   comparison.
+  TELESCOPED since 2026-10-15 (frame-perf pass): the run's word index steps
+  with the DDA and its sums are added once, and the per-cell saturation and
+  half-opacity tests became two distances fixed at the run's start (the
+  crossfade bound `tFree` is still tested before each step). Same cells, same
+  stop. The general per-cell gas loop is gone; a run in a sentinel chunk is
+  left to the outer loop. `smoke` 9.03 -> 8.50 ms (one process).
 - **Own buffers, not a share of `kParticleCap`.** `gasParticles[2]` at
   `kGasParticleCap` = 262,144, plus `gasCounts` / `gasClaim` / `gasSpawn` (the
   CA's outbox, whose 8-word header is this tick's counters) / `gasSpawnOps` (the
@@ -4407,6 +4413,36 @@ pixel count, `rm_world` p50): submerged 14.48 -> 8.61 ms, surface 12.23 ->
 does not keep an idle lake awake (its miss path marks only a cell
 `stillWant` says can still change). Next lever if water is ever hot again: a
 UNIFORM-water chunk crossed analytically instead of ~16 run-loop steps.
+
+THE UNIFORM-CHUNK JUMP (2026-10-15, frame-perf pass; the lever named above).
+The occupancy word carries a fourth field, bit 30 = UNIFORM: every one of the
+chunk's 4,096 cells holds the same material + state (word bits 0..15) and none
+is air (`OCC_UNIFORM_BIT`, common.wgsl; the layout is now [31] anyStain | [30]
+uniform | [28..16] blockers | [15..0] nonAir, and `occBlockers` masks 13 bits).
+`genChunk` (worldgen.wgsl) and both `sim_occupancy` entry points compute it as
+a min/max of the key over the chunk; every other writer (the sentinel paths,
+the CPU store-hit upload) leaves it 0, which costs only a per-cell march. It is
+render-only: the CPU snapshot keeps the counts (world.cpp masks 0xFFFF), the
+world hash never sees occupancy. `trace()`'s liquid run, entering a uniform
+chunk of its own liquid, crosses it with one box exit and one add (the
+segments telescope exactly as the run loop's do), taken only when the face is
+nearer than the 10 m depth cap and the march's exit, so the cell a ray stops
+on is still found cell by cell. `--render-budget at` on ticket 22-55-53's lake
+(deep, no bed in reach; one process): 15.77 -> 14.50 ms. What is left there
+is the chunk layer holding the SURFACE (not uniform: air above, often a
+partial top layer), where grazing rays spend most of their 10 m: crossing it
+needs a per-chunk uniform Y SPAN, i.e. more bits than the word has free
+without repacking the CPU-written blocker count (stream.cpp) -- see
+docs/PLAN_frame_perf.md. Two shapes were measured and are not to be retried:
+issuing the next cell's load one step ahead (-0.1..-0.25 ms, nothing on top of
+the jump), and letting the run cross chunk faces itself (+2.6 ms: lanes reach
+a face on different steps, and the face work, serialised per lane, costs more
+than the outer loop's one shared pass); a jump bounded by a per-RAY region (the
+surface cell the ray entered) was +2.8 ms for the same reason.
+
+The bed shade's column walk (`waterColumnUp`, behind `waterAbove` and god
+rays' `waterTopAbove`) resolves the page once per chunk and the material once
+per distinct word; same cells, same sums. Submerged camera 8.63 -> 8.36 ms.
 
 THE RENDER SEAM: ONE LAKE, TWO REPRESENTATIONS (2026-08-25). The virtual-mass
 blend above lets the isosurface reach over SETTLED voxel water, which closes the

@@ -436,8 +436,111 @@ state that lives across the DDA loop (168 -> 231 register cliff), the micro
 column-probe hoist. Numbers are in PLAN_surface_flight_perf.md,
 ROADMAP_scale.md §3 and RESEARCH_streaming_hitch.md.
 
+The media march (2026-10-15, §5 below): a one-cell load lead in the liquid run
+(-0.1..-0.25 ms, nothing on top of the uniform-chunk jump); letting the liquid
+run cross chunk faces itself (+2.6 ms on the deep-lake camera: lanes reach a
+face on different steps and the per-lane face work serialises); a jump bounded
+by a per-RAY region (the surface cell the ray entered: +2.8 ms, same cause);
+one loop body serving both liquid and gas runs (+0.36 ms on the deep lake: the
+gas tests ride every water step).
+
 Stale docs to be aware of: (PLAN_surface_flight_perf.md's B2 entry now says
 DONE, 2026-10-13, with a re-measure: 0 wake-wait misses in 1,394 + 282
 shifts); raymarch.wgsl's header says `Hit` has 26 fields
 (it has 30); `build/shader_stats_before.json` is byte-identical to the current
 stats and is not a baseline.
+
+## 5. Handoff 2026-10-15: the media march (water, smoke) — agent ad3b7e
+
+Package: the primary raymarch's media march (water, smoke) and the owner's
+two water tickets (2026-10-14_22-55-53 "30 fps staring out on the lake",
+22-55-02 "water pouring through a break tanks to ~20"). Everything here is
+`--render-budget`, 1920x1080, RTX 3060 Ti, `SANDVOX_RUN_EXCLUSIVE=1`, main's
+e145446 exe with `SANDVOX_ASSET_DIR` trees; experiments were `debug.perfExp`
+arms in ONE process (base2 drift <= 0.19 ms). Cameras: `lake` / `submerged` /
+`smoke` on the harness map, `at` = ticket 22-55-53's
+`--at 2959.05,585.40,-8807.40,-80.5,-24.1` on the default map (a DEEP lake:
+no bed within the 10 m cap, 104 media cells/px).
+
+**Attribution first** (perfExp arms, ms saved off the camera's baseline):
+
+| arm | lake 13.0 | submerged 8.6 | at 15.7 | smoke 9.0 |
+|---|---|---|---|---|
+| liquid path capped at 2 m (everything that scales with water path past 2 m) | 2.76 | 2.69 | **4.29** | 0 |
+| ...of it, the BED's shade under > 2 m of water (bed hits dropped) | 1.79 | 0.70 | 0.02 | |
+| `waterAbove` + bed caustics off | 0.58 | 0.50 | ~0 | |
+| `solPathLook` off (clean water still walks the solute table per chunk) | 0.23 | 0.20 | | 0 |
+| reflection rays off (`noreflect`) | 0.76 | ~0 | | |
+
+So on the owner's lake the cost is the WATER MARCH ITSELF (2 -> 10 m of
+path, ~80 cells a pixel), not shading; on the harness lake (2.4 m deep, bed in
+view) it is mostly shading the bed under the water, which is general opaque
+shading and not this package's to cut.
+
+**Landed (exact up to float rounding; render-only; no hashed state):**
+
+1. **Uniform-chunk jump.** Occupancy word bit 30 = every cell of the chunk is
+   one material+state (genChunk + both sim_occupancy entry points; 0 from
+   every other writer = conservative). trace()'s liquid run crosses a uniform
+   chunk of its own liquid in one box exit. `at` 15.77 -> 14.50 ms (in-process
+   arm). The bit costs common.wgsl's `occBlockers` a 13-bit mask; the CPU never
+   sees it (world.cpp keeps the 16-bit count).
+2. **Gas run telescoped** (the liquid run's form: in-chunk word index, sums
+   once, saturation / half-opacity as distances). `smoke` 9.03 -> 8.50 ms; the
+   general per-cell gas loop is gone.
+3. **Column walk** (`waterColumnUp` behind `waterAbove` / `waterTopAbove`):
+   one page resolve per chunk, one material read per distinct word.
+   `submerged` 8.63 -> 8.36 ms.
+4. **Deferred MPM thickness**: fs() walks the MPM thickness only after the
+   lake-ownership test, so a surface handed to the lake's shade (`mfLake`)
+   no longer pays 14 field samples for a value it discards. `--fluid-bench
+   worldlake` paired arms (in-process variant): fluid net 2.560 -> 2.467 ms
+   (the bench camera sees few lake-owned MPM pixels; the gain grows with how
+   much settled lake the live blocks cover on screen).
+
+**Before / after** (control = e145446's assets, final = this tree, same
+exe, two interleaved passes ctl / fin / ctl / fin, `baseline` arm only):
+
+| camera | control | final | change |
+|---|---|---|---|
+| `at` (ticket 22-55-53's deep lake) | 15.82 / 15.79 | 14.45 / 14.44 | **-1.36 ms** |
+| `smoke` (inside ether vapour) | 9.10 / 9.10 | 8.48 / 8.50 | **-0.61 ms** |
+| `submerged` | 8.59 / 8.59 | 8.43 / 8.47 | -0.14 ms |
+| `lake` (harness, 2.4 m deep, bed in view) | 13.46 / 12.98 | 13.07 / 13.19 | ~0 (boot noise is +-0.4 on this camera) |
+
+Pictures (`scripts/perf/bmpdiff.py`, the budget's own baseline shots): every
+control-vs-final diff is inside the control-vs-control one -- `at` max 1/255,
+`submerged` max 2, `smoke` 7 px over 2 (control vs control 0, final vs final
+30; max 3), `lake` 696 / 3,096 px over 2, max 4 / 5, against 1,833 px max 4
+between two control boots (the shadow/GI caches are not warmed
+deterministically). `--shader-stats`: raymarch fs 128 registers and 112 B
+local memory before and after (binary 4,505,472 -> 4,520,064 B);
+`occupancyDirty` 22 -> 24 registers; worldgen's dense `main` 96 -> 128 (the
+min/max pair; only `--residency dense` dispatches it -- the paged `list` path
+is 128 either way).
+
+**The dam-breach ticket (22-55-02) — what was and was not established.**
+Suspect (1), "while MPM is live the WHOLE frame switches to the all-features
+raymarch variant", is refuted by the code, not by a run: `kRaymarchVariantOn`
+has been false since W2-A (simulation.cpp), so every frame always draws the
+universal pipeline and nothing switches. What MPM liveness does add is
+`fluidMarch` on every pixel whose ray crosses the live block box, and inside
+it the thickness walk on lake-owned hits (item 4 above). Suspect (2) dissolved
+blood: `solPathLook` costs 0.2 ms over clean water and walks up to 100 slabs
+only through chunks with solute, still unmeasured on a bloody lake. The 47 ms
+frame is still NOT reproduced: the bench's camera stands 1.5 r back from the
+lake, the ticket's 3 m over the breach looking down at -48 deg. Next step
+there: a `--render-budget` camera that pulls the worldlake plug and shoots
+from the ticket's pose (C++), with arms for fluid on/off and solute on/off.
+
+**What is left on the deep lake, and the lever.** After the jump, the `at`
+camera's water still costs ~3 ms past 2 m: grazing rays spend their 10 m
+inside the chunk LAYER that holds the surface, which is never uniform (air
+above it, often a partial top layer). The next lever is a per-chunk uniform
+Y SPAN (the cells from the chunk floor up to the first non-uniform layer, and
+from the bed up), so the run jumps the slab under the surface. It needs ~9
+bits and the occupancy word has 1 left (bit 29) without repacking the
+blocker COUNT that stream.cpp writes from the CPU (every reader only tests it
+against zero, so a 1-bit blocker flag would free 13 bits) — i.e. a C++ change
+plus both WGSL producers. Measure it the way the jump was: the region must be
+per-CHUNK (coherent across a warp), never per-ray.

@@ -4644,8 +4644,69 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
       // the sums differ from the per-cell ones by float rounding only.
       // Measured (--render-budget at, 1080p, one process, exclusive): with
       // the openness probe's one-load taps, 17.47 -> 15.05 ms.
-      // Gas runs keep the general loop below (their crossfade bound and the
-      // half-opacity latch are per cell).
+      // (2026-10-15: a ONE-cell lead -- the next cell's load issued before
+      // this one's word is tested, no extra DDA -- measured -0.1..-0.25 ms on
+      // the same camera and nothing on top of the uniform-chunk jump below,
+      // so neither direction of that argument is worth a register.)
+      // Gas runs take the same form, after this block (THE GAS RUN).
+      // ---- A UNIFORM CHUNK OF THE RUN'S LIQUID: crossed in ONE step (2026-10-15,
+      // frame-perf pass; ticket 2026-10-14_22-55-53's "30 fps over the lake") --
+      // The occupancy word's UNIFORM bit (common.wgsl OCC_UNIFORM_BIT, written by
+      // genChunk and sim_occupancy) says all 4,096 cells of this chunk hold ONE
+      // material+state. `marchCell`, the cell this run starts from, lies in this
+      // chunk (the per-chunk cache describes it) and holds `runKey`, so every
+      // cell of the chunk does: the per-cell loop below would walk to the chunk
+      // face adding the same opacity and tint per segment, and the segments
+      // telescope -- so the rest of the chunk is one box exit and one add, the
+      // chunk-skip jump with the run's sums. Exact up to float rounding (the
+      // jump rebuilds tMax from the face like every chunk skip; the cells and
+      // the material are the per-cell loop's). The jump is taken only when the
+      // face is nearer than both the 10 m depth cap and the march's exit, so
+      // the cell the ray stops on is still found by the per-cell loop.
+      // Coherent by construction: neighbouring pixels cross the same chunks, so
+      // a warp jumps together (a per-RAY region bound -- the surface cell's y --
+      // measured +2.8 ms on the same camera: lanes left the run at different
+      // cells). Measured (--render-budget `at` = the ticket camera, 1080p, one
+      // process): 15.77 -> 14.50 ms. The interior of a deep lake is uniform; the
+      // chunk holding the surface is not, which is what is left (PLAN_frame_perf).
+      if (!runGas && (cchPt & PT_SENTINEL_BIT) == 0u &&
+          all((cell >> vec3<u32>(CHUNK_SHIFT)) == cchC) && occUniform(cchOcc)) {
+        let blkLo = cell & vec3<i32>(~i32(CHUNK_MASK));
+        let bl = vec3f(blkLo);
+        let bh = bl + f32(CHUNK);
+        let ex = max((bl - ro) * inv, (bh - ro) * inv);
+        let tOut = max(min(ex.x, min(ex.y, ex.z)), tCur);
+        let tCapJ = tCur + (LIQ_VIS_M / VOXEL_METERS - out.liqPath);
+        if (tOut < tCapJ && tOut + 1e-4 < tExit) {
+          let seg = tOut - tCur;
+          out.liqPath += seg;
+          let dT = seg * cellOp;
+          out.mediaTau += dT;
+          out.mediaTint += cellTint * dT;
+          rsAdd(RS_CHUNK_SKIP, 1u);
+          t = tOut + 1e-4;
+          p = ro + rd * t;
+          var nc = vec3<i32>(floor(p));
+          if (ex.x <= ex.y && ex.x <= ex.z) {
+            nc.x = select(blkLo.x - 1, blkLo.x + i32(CHUNK), rd.x > 0.0);
+            axis = 0;
+          } else if (ex.y <= ex.z) {
+            nc.y = select(blkLo.y - 1, blkLo.y + i32(CHUNK), rd.y > 0.0);
+            axis = 1;
+          } else {
+            nc.z = select(blkLo.z - 1, blkLo.z + i32(CHUNK), rd.z > 0.0);
+            axis = 2;
+          }
+          if (!inBounds(nc)) { break; }
+          cell = nc;
+          for (var a = 0; a < 3; a++) {
+            let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
+            tMax[a] = (boundary - ro[a]) * inv[a];
+          }
+          tCur = t;
+          continue;
+        }
+      }
       if (!runGas) {
         if ((cchPt & PT_SENTINEL_BIT) == 0u &&
             all((cell >> vec3<u32>(CHUNK_SHIFT)) == cchC)) {
@@ -4691,55 +4752,68 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
         if (sat || tCur >= tExit) { break; }
         continue;
       }
-      loop {
-        if (i + 1 >= maxSteps) { break; }
-        if (any(cell < wloI) || any(cell >= wloHi)) { break; }
-        if (any((cell >> vec3<u32>(CHUNK_SHIFT)) != cchC)) { break; }
-        let w2 = voxWordAtEntry(cchPt, cell);
-        if ((w2 & keyMask) != runKey) { break; }
-        if (gasFlag) {
-          let tN = min(tMax.x, min(tMax.y, tMax.z));
-          if (tN >= tFree) { break; }
+      // ---- THE GAS RUN, TELESCOPED (2026-10-15, frame-perf pass) ----
+      // The liquid run's form for a run of one thin gas: the word index steps
+      // with the DDA, the media sums are added once (the segments telescope),
+      // and the three per-cell tests become three distances fixed at the run's
+      // start -- tCap where the gas optical depth crosses MEDIA_TAU_MAX
+      // (saturation), tHalfX where it crosses MEDIA_HALF_TAU (the gasHalfT
+      // latch, taken at the first cell boundary past it, as the per-cell test
+      // took it) and tFree (the crossfade bound, tested before the step exactly
+      // as before). Same cells, same stop; sums differ by float rounding only.
+      // Measured (--render-budget `smoke`, one process): 9.03 -> 8.50 ms. A
+      // sentinel chunk (no page to index) or a run starting across a chunk face
+      // is left to the outer loop, cell by cell, which is what the general loop
+      // this replaced did for the second case and costs one rare chunk the
+      // first.
+      if ((cchPt & PT_SENTINEL_BIT) == 0u &&
+          all((cell >> vec3<u32>(CHUNK_SHIFT)) == cchC)) {
+        let base = cchPt * CHUNK_VOL;
+        var loc = cell & vec3<i32>(i32(CHUNK_MASK));
+        var li = (loc.z * i32(CHUNK) + loc.y) * i32(CHUNK) + loc.x;
+        let dli = vec3<i32>(stepv.x, stepv.y * i32(CHUNK), stepv.z * i32(CHUNK * CHUNK));
+        let tRun0 = tCur;
+        let tauK = VOXEL_METERS * MEDIA_ABSORB;
+        let tCap = tRun0 + (MEDIA_TAU_MAX / tauK - gasTau) / cellOp;
+        var tHalfX = 1e30;
+        if (out.gasHalfT == 0.0) {
+          tHalfX = tRun0 + (MEDIA_HALF_TAU / tauK - gasTau) / cellOp;
         }
-        i += 1;
-        if (RENDER_STATS && gRsOn) { gRsTraceSteps += 1u; }
-        let tP = tCur;
-        if (tMax.x < tMax.y && tMax.x < tMax.z) {
-          cell.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x; axis = 0;
-        } else if (tMax.y < tMax.z) {
-          cell.y += stepv.y; tCur = tMax.y; tMax.y += tDelta.y; axis = 1;
-        } else {
-          cell.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z; axis = 2;
+        let tPre = select(1e30, tFree, gasFlag);
+        var n = 0u;
+        loop {
+          if (i + 1 >= maxSteps) { break; }
+          if ((voxels[base + u32(li)] & 0xFFFu) != runKey) { break; }
+          if (min(tMax.x, min(tMax.y, tMax.z)) >= tPre) { break; }
+          i += 1;
+          n += 1u;
+          if (tMax.x < tMax.y && tMax.x < tMax.z) {
+            cell.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x; axis = 0;
+            loc.x += stepv.x; li += dli.x;
+          } else if (tMax.y < tMax.z) {
+            cell.y += stepv.y; tCur = tMax.y; tMax.y += tDelta.y; axis = 1;
+            loc.y += stepv.y; li += dli.y;
+          } else {
+            cell.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z; axis = 2;
+            loc.z += stepv.z; li += dli.z;
+          }
+          if (tCur > tHalfX) { out.gasHalfT = tCur; tHalfX = 1e30; }
+          if (tCur > tCap) { sat = true; break; }
+          if (tCur >= tExit) { break; }
+          if (((loc.x | loc.y | loc.z) & ~i32(CHUNK_MASK)) != 0) { break; }
         }
-        let sg = tCur - tP;
-        let dT = sg * cellOp;
+        let dT = (tCur - tRun0) * cellOp;
         out.mediaTau += dT;
-        rsAdd(RS_MEDIA, 1u);
         out.mediaTint += cellTint * dT;
-        if (runGas) {
-          gasTau += dT;
-          if (out.gasHalfT == 0.0 &&
-              gasTau * VOXEL_METERS * MEDIA_ABSORB > MEDIA_HALF_TAU) {
-            out.gasHalfT = tCur;
-          }
-          if (gasTau * VOXEL_METERS * MEDIA_ABSORB > MEDIA_TAU_MAX) {
-            out.saturated = true;
-            out.t = tCur;
-            sat = true;
-            break;
-          }
-        } else {
-          out.liqPath += sg;
-          if (out.liqPath * VOXEL_METERS > LIQ_VIS_M) {
-            out.saturated = true;
-            out.t = tCur;
-            sat = true;
-            break;
-          }
+        gasTau += dT;
+        if (RENDER_STATS && gRsOn) { gRsTraceSteps += n; }
+        rsAdd(RS_MEDIA, n);
+        if (sat) {
+          out.saturated = true;
+          out.t = tCur;
         }
-        if (tCur >= tExit) { break; }
+        if (sat || tCur >= tExit) { break; }
       }
-      if (sat || tCur >= tExit) { break; }
     }
   }
 
@@ -10821,28 +10895,66 @@ const SUB_DEPTH_STEPS : i32 = 40;
 // voxel row — and it was the most obvious artifact in the first cut. Carrying
 // the fractional part of the start height removes the stair entirely for the
 // cost of one subtraction.
-fn waterAbove(p : vec3f) -> f32 {
+// THE COLUMN WALK both callers below share (2026-10-15, frame-perf pass):
+// up from p through translucent liquid, one page-table resolve per CHUNK (a
+// resident chunk's residency is one test, its page one load) and one material
+// read per DISTINCT word -- a column of lake repeats one word, so after its
+// first cell every step is a load and a compare. Same cells, same order, same
+// sums as the per-cell voxWordAt walk it replaced, so both results are
+// bit-identical. Returns (overhead fill in voxels, world y of the column top,
+// or -1e9 when p is not under liquid). Measured (--render-budget `submerged`,
+// one process): -0.29 ms; the bed shade's walk is ~flat on the `lake` camera.
+fn waterColumnUp(p : vec3f) -> vec2f {
   let cell = vec3<i32>(floor(p));
   var n = 0.0;
-  for (var i = 0; i <= SUB_DEPTH_STEPS; i++) {
-    let c = cell + vec3<i32>(0, i, 0);
-    // Out of the window reads as "no more water". Unloaded space is solid and
-    // inert (CLAUDE.md), so treating it as more water would paint caustics
-    // under every overhang at the window edge.
-    if (!inBounds(c)) { break; }
-    let w = voxWordAt(c);
-    let mt = voxMat(w);
-    if (mt == MAT_AIR) { break; }
-    let m = materials[mt];
-    // Only a TRANSLUCENT liquid counts as water overhead. An opaque one (lava)
-    // transmits nothing, and a solid lid ends the column.
-    if (m.klass != CLASS_LIQUID || (m.flags & MATF_OPAQUE) != 0u) { break; }
-    var f = f32(voxState(w) + 1u) / 8.0;
-    // The cell the point is IN contributes only the part above the point.
-    if (i == 0) { f = max(f - fract(p.y), 0.0); }
-    n += f;
+  var top = -1e9;
+  let yEnd = cell.y + SUB_DEPTH_STEPS;
+  var y = cell.y;
+  var key = 0xFFFFFFFFu;
+  var fKey = 0.0;
+  var stop = false;
+  loop {
+    if (stop || y > yEnd) { break; }
+    let c0 = vec3<i32>(cell.x, y, cell.z);
+    // Residency is per chunk, so one test covers every cell of this chunk.
+    if (!inBounds(c0)) { break; }
+    let e = pageTable[voxSlotOfCell(c0)];
+    let lo = c0 & vec3<i32>(CHUNK_MASK);
+    let yLast = min(y - lo.y + i32(CHUNK) - 1, yEnd);
+    let base = e * CHUNK_VOL;
+    var li = u32((lo.z * i32(CHUNK) + lo.y) * i32(CHUNK) + lo.x);
+    loop {
+      if (y > yLast) { break; }
+      var w : u32;
+      if ((e & PT_SENTINEL_BIT) != 0u) {
+        w = synthWordAt(e, vec3<i32>(cell.x, y, cell.z), ptSeed());
+      } else {
+        w = voxels[base + li];
+      }
+      if ((w & 0xFFFFu) != key) {
+        let mt = voxMat(w);
+        if (mt == MAT_AIR) { stop = true; break; }
+        let m = materials[mt];
+        if (m.klass != CLASS_LIQUID || (m.flags & MATF_OPAQUE) != 0u) {
+          stop = true;
+          break;
+        }
+        key = w & 0xFFFFu;
+        fKey = f32(voxState(w) + 1u) / 8.0;
+      }
+      var f = fKey;
+      if (y == cell.y) { f = max(f - fract(p.y), 0.0); }
+      n += f;
+      top = f32(y) + fKey;
+      y += 1;
+      li += CHUNK;
+    }
   }
-  return n * VOXEL_METERS;
+  return vec2f(n, top);
+}
+
+fn waterAbove(p : vec3f) -> f32 {
+  return waterColumnUp(p).x * VOXEL_METERS;
 }
 
 // ---- the same walk, but reporting WHERE the surface is ---------------------
@@ -10869,19 +10981,7 @@ fn waterAbove(p : vec3f) -> f32 {
 // the call site: it reuses the EYE's column for every sample on the ray, which
 // is exact for a flat surface and wrong under an overhang.
 fn waterTopAbove(p : vec3f) -> f32 {
-  let cell = vec3<i32>(floor(p));
-  var top = -1e9;
-  for (var i = 0; i <= SUB_DEPTH_STEPS; i++) {
-    let c = cell + vec3<i32>(0, i, 0);
-    if (!inBounds(c)) { break; }
-    let w = voxWordAt(c);
-    let mt = voxMat(w);
-    if (mt == MAT_AIR) { break; }
-    let m = materials[mt];
-    if (m.klass != CLASS_LIQUID || (m.flags & MATF_OPAQUE) != 0u) { break; }
-    top = f32(c.y) + f32(voxState(w) + 1u) / 8.0;
-  }
-  return top;
+  return waterColumnUp(p).y;
 }
 
 // ---- the caustic web itself ----
@@ -14426,9 +14526,12 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
     out.t = hi;
   }
   if (fluidStage() == 2u) { out.hit = false; return out; }
-
-  out.thick = fluidThickness(ro, rd, out.t, tMax, iso);
-  if (fluidStage() == 3u) { out.hit = false; }
+  // The thickness walk is fs()'s, after the lake-ownership test (DEFERRED
+  // THICKNESS, there). The bench's stage 3 still prices it here.
+  if (fluidStage() == 3u) {
+    out.thick = fluidThickness(ro, rd, out.t, tMax, iso);
+    out.hit = false;
+  }
   return out;
 }
 
@@ -14722,9 +14825,12 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
     out.t = hit.w;
   }
   if (fluidStage() == 2u) { out.hit = false; return out; }
-
-  out.thick = fluidThickness(ro, rd, out.t, tMax, iso);
-  if (fluidStage() == 3u) { out.hit = false; }
+  // The thickness walk is fs()'s, after the lake-ownership test (DEFERRED
+  // THICKNESS, there). The bench's stage 3 still prices it here.
+  if (fluidStage() == 3u) {
+    out.thick = fluidThickness(ro, rd, out.t, tMax, iso);
+    out.hit = false;
+  }
   return out;
 }
 
@@ -16898,6 +17004,22 @@ fn fs(in : VSOut) -> FSOut {
       let lakeShare = fluidSampleAt(lp).settled;
       mfLake = lakeShare >= MPM_LAKE_SETTLED;
       if (SEAM_DBG >= 9u) { gDbgM0.z = lakeShare; }
+    }
+    // ---- DEFERRED THICKNESS (2026-10-15, frame-perf pass) ----
+    // The thickness walk (up to 14 field samples of 8+ taps each) feeds only
+    // shadeMpmFluid, and a surface the test above hands to the lake's own
+    // shade (mfLake) is never MPM-shaded -- yet every one of them paid for
+    // the walk inside the march. Which is the common case wherever MPM water
+    // is live beside a lake: a pour into it, a breach out of it, a disturbed
+    // patch settling (ticket 2026-10-14_22-55-02). Same walk, same arguments
+    // (the march's axis-nudged direction included), so the value is the one
+    // the march computed; only the pixels that discard it stop paying.
+    if (mf.hit && !mfLake) {
+      var rdT = rd;
+      if (abs(rdT.x) < 1e-6) { rdT.x = select(-1e-6, 1e-6, rdT.x >= 0.0); }
+      if (abs(rdT.y) < 1e-6) { rdT.y = select(-1e-6, 1e-6, rdT.y >= 0.0); }
+      if (abs(rdT.z) < 1e-6) { rdT.z = select(-1e-6, 1e-6, rdT.z >= 0.0); }
+      mf.thick = fluidThickness(R.camPos, rdT, mf.t, sceneT, max(TUNE_FLUID_ISO, 0.05));
     }
     if (fluidStage() == 4u) {   // the bench's STEP HEATMAP (fluidStage note)
       var dbg : FSOut;
