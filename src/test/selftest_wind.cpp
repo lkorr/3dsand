@@ -1374,7 +1374,14 @@ Status GateDrafts(Ctx& c, std::string& detail) {
   // Window rows: up to one below the ceiling, so smoke that has risen to the
   // roof can still find it (6 wide, 7 high, its top row the ceiling's).
   const int kWin0 = 18, kWin1 = 24;
-  const int y0 = FixtureYOver(cx - 40, czs[0] - 40, cx + 40, czs[kHuts - 1] + 40,
+  // THE WINDOW HALL (the jets' case, 2026-10-14): a 4.8 m room downwind of the
+  // row, its only openings two 0.6 m windows facing each other across it on
+  // the wind's line -- the room the projection left still between a gale in
+  // and a gale out. Centred on the alley between huts 2 and 3 so its windward
+  // window sees the alley's wind, not a hut's lee.
+  const int wx = cx + 84, wz = 200, kWh = 24;   // walls at +-24, interior 1..24 high
+  const int kWy0 = 8, kWy1 = 13, kWz = 3;       // the windows: y 8..13, z -3..2
+  const int y0 = FixtureYOver(cx - 40, czs[0] - 40, wx + kWh + 16, czs[kHuts - 1] + 40,
                               kDefaultSeed, 24, 140);
   std::map<std::tuple<int, int, int>, uint32_t> fx;
   for (int x = cx - 40; x <= cx + 40; x++)
@@ -1400,6 +1407,21 @@ Status GateDrafts(Ctx& c, std::string& detail) {
       }
     }
   }
+  for (int x = cx + 41; x <= wx + kWh + 16; x++)
+    for (int z = wz - kWh - 16; z <= wz + kWh + 16; z++) {
+      fx[{x, y0, z}] = mStone;
+      for (int y = 1; y <= kH + 30; y++) fx[{x, y0 + y, z}] = 0u;
+    }
+  for (int x = -kWh; x <= kWh; x++)
+    for (int z = -kWh; z <= kWh; z++) fx[{wx + x, y0 + kH + 1, wz + z}] = mStone;
+  for (int y = 1; y <= kH; y++)
+    for (int t = -kWh; t <= kWh; t++) {
+      const bool win = t >= -kWz && t < kWz && y >= kWy0 && y <= kWy1;
+      if (!win) fx[{wx - kWh, y0 + y, wz + t}] = mStone;   // windward wall
+      if (!win) fx[{wx + kWh, y0 + y, wz + t}] = mStone;   // leeward wall
+      fx[{wx + t, y0 + y, wz - kWh}] = mStone;
+      fx[{wx + t, y0 + y, wz + kWh}] = mStone;
+    }
   std::vector<CellOp> build;
   build.reserve(fx.size());
   for (const auto& [k, w] : fx)
@@ -1429,12 +1451,21 @@ Status GateDrafts(Ctx& c, std::string& detail) {
     rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DraftBuffer(),
                           (uint64_t)kDraftFieldBase * 4, f.data(), f.size() * 4, "draftField");
   };
+  // THE JETS (sim_draft.wgsl `jets`): the four directional transfers the
+  // readers actually apply, +X / -X / +Z / -Z, 2 words a cell each.
+  auto readJets = [&](std::vector<uint32_t>& f) {
+    f.assign((size_t)8 * kDraftCells, 0u);
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DraftBuffer(),
+                          (uint64_t)kDraftJetField * 4, f.data(), f.size() * 4, "draftJets");
+  };
   auto readMeta = [&](uint32_t m[kDraftMetaWords]) {
     rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DraftMetaBuffer(), 0, m,
                           kDraftMetaWords * 4, "draftMeta");
   };
   std::vector<uint32_t> field;
   readField(field);
+  std::vector<uint32_t> jets;
+  readJets(jets);
   uint32_t meta0[kDraftMetaWords] = {};
   readMeta(meta0);
   const int32_t* o = sim.DraftOrigin();
@@ -1582,6 +1613,154 @@ Status GateDrafts(Ctx& c, std::string& detail) {
     note(buf); ok = ok && p;
   }
 
+  // ---- THE JETS: what the readers apply ----
+  // Potential flow spreads a door's inflow over the whole room at once, so the
+  // draft hut's air away from the straight line between its openings barely
+  // moved. The jet stage carries the inflow across the room under the roof.
+  // Claims: dead-end huts stay still (a jet is seeded only by flow the
+  // projection lets through), the draft hut's ROOM -- not just its centre --
+  // moves at a real fraction of the outside wind and faster than the
+  // projection alone, and uncovered air is the projection to the bit.
+  {
+    auto tAt = [&](int dir, int x, int y, int z, float v[3]) -> bool {
+      v[0] = v[1] = v[2] = 0.0f;
+      const int dx = (x - o[0]) >> 2, dy = (y - o[1]) >> 2, dz = (z - o[2]) >> 2;
+      if (dx < 0 || dy < 0 || dz < 0 || dx >= (int)kDraftNX || dy >= (int)kDraftNY ||
+          dz >= (int)kDraftNZ)
+        return false;
+      // March order (common.wgsl draftJetIndex): slice-major per direction.
+      const size_t cell = dir < 2 ? (size_t)dx * 2048 + (size_t)dz + 64 * (size_t)dy
+                                  : (size_t)dz * 2048 + (size_t)dx + 64 * (size_t)dy;
+      const size_t i = 2 * ((size_t)dir * kDraftCells + cell);
+      auto s16 = [](uint32_t w) { return (float)(int16_t)(uint16_t)(w & 0xFFFFu) / 4096.0f; };
+      v[0] = s16(jets[i]);
+      v[1] = s16(jets[i] >> 16);
+      v[2] = s16(jets[i + 1]);
+      return true;
+    };
+    auto tMean = [&](int x, int y, int z, float v[3]) {
+      v[0] = v[1] = v[2] = 0.0f;
+      int n = 0;
+      for (int dz = -4; dz <= 4; dz += 4)
+        for (int dy = -4; dy <= 4; dy += 4)
+          for (int dx = -4; dx <= 4; dx += 4) {
+            float t[3];
+            if (!tAt(0, x + dx, y + dy, z + dz, t)) continue;
+            for (int a = 0; a < 3; a++) v[a] += t[a];
+            n++;
+          }
+      if (n) for (int a = 0; a < 3; a++) v[a] /= (float)n;
+    };
+    float t0[3], t1[3];
+    tMean(cx, y0 + 12, czs[0], t0);
+    tMean(cx, y0 + 12, czs[1], t1);
+    const float ts = len3(t0), td = len3(t1);
+    {
+      const bool p = ts < sealedMax && td < doorMax;
+      std::snprintf(buf, sizeof buf,
+                    "jets: sealed hut |T| %.3f (< %.2f), door-only hut |T| %.3f (< %.2f) %s", ts,
+                    sealedMax, td, doorMax, p ? "ok" : "FAIL");
+      note(buf); ok = ok && p;
+    }
+    // The ROOM of the draft hut: every cell centre one cell in from the walls,
+    // floor and ceiling. Mean speed of the jets vs the projection alone.
+    double sumT = 0.0, sumR = 0.0;
+    int nRoom = 0, nMoving = 0;
+    for (int y = 4; y <= kH - 4; y += 4)
+      for (int z = -kHz + 4; z <= kHz - 4; z += 4)
+        for (int x = -kHx + 4; x <= kHx - 4; x += 4) {
+          float t[3];
+          const R6 r = at(field, cx + x, y0 + y, czs[2] + z);
+          if (!tAt(0, cx + x, y0 + y, czs[2] + z, t) || !r.in) continue;
+          const float lt = len3(t);
+          sumT += lt;
+          sumR += len3(r.rx);
+          nMoving += lt >= 0.25f;
+          nRoom++;
+        }
+    const float roomT = nRoom ? (float)(sumT / nRoom) : 0.0f;
+    const float roomR = nRoom ? (float)(sumR / nRoom) : 0.0f;
+    {
+      const float minT = (float)BaselineNumber("drafts.jetRoomMin", 0.3);
+      const float minGain = (float)BaselineNumber("drafts.jetRoomGainMin", 1.25);
+      const bool p = roomT >= minT && roomT >= minGain * roomR;
+      std::snprintf(buf, sizeof buf,
+                    "jets: draft hut room mean |T| %.3f vs projection |R| %.3f (>= %.2f and >= %.2fx), "
+                    "%d of %d cells at >= 0.25 of the outside wind %s",
+                    roomT, roomR, minT, minGain, nMoving, nRoom, p ? "ok" : "FAIL");
+      note(buf); ok = ok && p;
+    }
+    {
+      // THE WINDOW HALL: the room between the two windows, cell centres one in
+      // from every face. The projection's mean is the flux of two small
+      // windows spread over a 4.8 m room; the jet's is the claim.
+      double hT = 0.0, hR = 0.0;
+      int hn = 0, hMoving = 0, hMovingR = 0;
+      for (int y = 4; y <= kH - 4; y += 4)
+        for (int z = -kWh + 4; z <= kWh - 4; z += 4)
+          for (int x = -kWh + 4; x <= kWh - 4; x += 4) {
+            float t[3];
+            const R6 r = at(field, wx + x, y0 + y, wz + z);
+            if (!tAt(0, wx + x, y0 + y, wz + z, t) || !r.in) continue;
+            hT += len3(t);
+            hR += len3(r.rx);
+            hMoving += len3(t) >= 0.25f;
+            hMovingR += len3(r.rx) >= 0.25f;
+            hn++;
+          }
+      float mid[3];
+      tAt(0, wx, y0 + 10, wz, mid);
+      const R6 midR = at(field, wx, y0 + 10, wz);
+      const float mT = hn ? (float)(hT / hn) : 0.0f, mR = hn ? (float)(hR / hn) : 0.0f;
+      const float gainMin = (float)BaselineNumber("drafts.hallGainMin", 2.0);
+      const float midMin = (float)BaselineNumber("drafts.hallMidMin", 0.3);
+      const bool p = hn > 0 && mT >= gainMin * mR && mid[0] >= midMin;
+      std::snprintf(buf, sizeof buf,
+                    "jets: window hall (4.8 m, two 0.6 m windows) room mean |T| %.3f vs |R| %.3f "
+                    "(>= %.1fx), cells >= 0.25: %d vs %d of %d; on the window line mid-room "
+                    "T.x %.3f (>= %.2f) vs R.x %.3f %s",
+                    mT, mR, gainMin, hMoving, hMovingR, hn, mid[0], midMin, midR.rx[0],
+                    p ? "ok" : "FAIL");
+      note(buf); ok = ok && p;
+      if (std::getenv("SANDVOX_DRAFT_DUMP")) {
+        std::printf("drafts dump hall along x (y0+10, wz) T+x | R_x:");
+        for (int x = -kWh - 8; x <= kWh + 8; x += 4) {
+          float t[3];
+          tAt(0, wx + x, y0 + 10, wz, t);
+          const R6 r = at(field, wx + x, y0 + 10, wz);
+          std::printf(" [%d %.2f %.2f %.2f | %.2f]", x, t[0], t[1], t[2], r.rx[0]);
+        }
+        std::printf("\n");
+      }
+    }
+    {
+      // Uncovered air is the projection exactly, both signs.
+      float tp[3], tn[3];
+      const R6 top = at(field, cx, y0 + 52, 200);
+      const R6 alley = at(field, cx, y0 + 12, 200);
+      bool same = true;
+      for (const auto& [y, r] : {std::pair<int, R6>{y0 + 52, top}, {y0 + 12, alley}}) {
+        tAt(0, cx, y, 200, tp);
+        tAt(1, cx, y, 200, tn);
+        for (int a = 0; a < 3; a++) same = same && tp[a] == r.rx[a] && tn[a] == -r.rx[a];
+      }
+      std::snprintf(buf, sizeof buf, "jets: open air and the alley are the projection, both signs %s",
+                    same ? "ok" : "FAIL");
+      note(buf); ok = ok && same;
+    }
+    if (std::getenv("SANDVOX_DRAFT_DUMP")) {
+      for (int h = 0; h < kHuts; h++) {
+        std::printf("drafts dump hut %d T+x along x (y0+8, cz):", h);
+        for (int x = cx - 24; x <= cx + 24; x += 4) {
+          float t[3];
+          tAt(0, x, y0 + 8, czs[h], t);
+          std::printf(" [%d %.2f %.2f %.2f]", x - cx, t[0], t[1], t[2]);
+        }
+        std::printf("\n");
+      }
+    }
+  }
+
   // ---- the CA: smoke in the sealed hut and in the draft hut ----
   std::vector<CellOp> puff;
   for (int h : {0, 2})
@@ -1679,13 +1858,20 @@ Status GateDrafts(Ctx& c, std::string& detail) {
     ctx.WaitIdle();
     std::vector<uint32_t> again;
     readField(again);
+    std::vector<uint32_t> jetsAgain;
+    readJets(jetsAgain);
     uint32_t meta2[kDraftMetaWords] = {};
     readMeta(meta2);
     size_t diff = 0;
     for (size_t i = 0; i < field.size(); i++) diff += field[i] != again[i];
-    const bool p = meta2[kDraftMetaSolves] == meta1[kDraftMetaSolves] + 1 && diff == 0;
-    std::snprintf(buf, sizeof buf, "purity: forced rebuild solved %u time(s), %zu of %zu field words differ %s",
-                  meta2[kDraftMetaSolves] - meta1[kDraftMetaSolves], diff, field.size(), p ? "ok" : "FAIL");
+    size_t jdiff = 0;
+    for (size_t i = 0; i < jets.size(); i++) jdiff += jets[i] != jetsAgain[i];
+    const bool p = meta2[kDraftMetaSolves] == meta1[kDraftMetaSolves] + 1 && diff == 0 && jdiff == 0;
+    std::snprintf(buf, sizeof buf,
+                  "purity: forced rebuild solved %u time(s), %zu of %zu field words and %zu of %zu "
+                  "jet words differ %s",
+                  meta2[kDraftMetaSolves] - meta1[kDraftMetaSolves], diff, field.size(), jdiff,
+                  jets.size(), p ? "ok" : "FAIL");
     note(buf); ok = ok && p;
     if (!p) {
       // WHERE they differ (rule 6): the box origin either side, and the

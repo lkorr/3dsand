@@ -179,6 +179,8 @@ namespace {
 #define PIPE_DRAFT_FINE2      Pipe::DraftFineMid
 #define PIPE_DRAFT_FINE2B     Pipe::DraftFineMid2
 #define PIPE_DRAFT_FINE3      Pipe::DraftFineLast
+#define PIPE_DRAFT_JETS       Pipe::DraftJets
+#define PIPE_DRAFT_JET_PREP   Pipe::DraftJetPrep
 #define PIPE_HEAT_BEGIN       Pipe::HeatBegin
 #define PIPE_HEAT_SHIFT       Pipe::HeatShift
 #define PIPE_HEAT_PEND        Pipe::HeatPend

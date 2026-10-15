@@ -22716,6 +22716,68 @@ Knobs: `sim.draftMode` (the gate; 0 is an exact identity, nothing is recorded),
 `SANDVOX_DRAFT_DUMP=1 --gate drafts`, which prints per-hut profiles and writes
 `build/draft_coarse.bin` / `draft_masks.bin`.
 
+#### Jets: under cover the air keeps its momentum (2026-10-14)
+
+`sim_draft.wgsl` THE JETS is the code; `docs/RESEARCH_wind.md` §14.12 the
+record; `--gate drafts` (the jets lines and the window hall) the proof.
+
+**What was wrong.** The projection is potential flow, and potential flow has no
+momentum: air through a window spreads over the whole room the moment it is
+inside, so the room's speed is the window's flux over the room's cross-section.
+A gale went in at one window and out at the other with the room between them
+nearly still (the gate's window hall: 0.30 of the outside wind mid-room on the
+window line, against 3.1 at the window). Real cross-ventilation is a jet that
+keeps going across the room and splashes along the far wall.
+
+**What the readers apply is now a DIRECTIONAL transfer.** A jet is not odd in
+the wind (a +X wind's jet enters at the west window, a -X wind's at the east),
+so the box publishes four transfers, T+x / T-x / T+z / T-z, and
+`draftApplyQ` / `draftApplyF` pick one per horizontal component by its sign
+and scale it by the magnitude. Each is stored in its march's slice-major order
+(`draftJetIndex`). R is still solved and published; it is the jets' input.
+
+**The march.** On the publishing stage, after `fineLast`: `jetPrep` (one thread
+per column) finds the COVER -- a cell is covered when a horizontal face at most
+a quarter open lies anywhere above it in the box -- and packs the transfer,
+flags and face coefficients slice-major; `jets` is one 1,024-thread group per
+direction walking the 64 slices. The carried quantity is the jet's FORWARD
+momentum flux: C = (1 - decay) x sqrt(sum of w x k x J.fwd^2) over the cell
+behind and its four side neighbours, J.fwd = whichever of C and the
+projection's own forward component is larger, the sideways components the
+projection's. Spreading u^2 rather than u is what makes it a free jet (speed
+falls as 1/width as it entrains the room's air, not 1/area). A carried jet
+meeting a closed face turns its blocked share along the wall the way the
+projection's lateral flow points.
+
+**Only under cover, and that is the safety argument.** Momentum is carried only
+between covered cells and an uncovered cell keeps T = +-R to the bit, so
+outdoors -- stagnation before a wall, the lee, the alley venturi -- is exactly
+the projection, and the pinned determinism hash did not move. A jet is seeded
+only by what the projection lets through the first covered cell, and the
+projection sends air through an opening only when there is a way out, so a
+sealed room (0.038) and a one-door room (0.139, the partial inflow at the
+mouth) stay still.
+
+| Gate `drafts` | Projection R | Jets T |
+|---|---|---|
+| Window hall (4.8 m room, two 0.6 m windows), mid-room on the window line | 0.30 | 1.43 |
+| Window hall, room mean / cells at >= 0.25 of the wind | 0.25 / 240 of 605 | 0.48 / 346 |
+| Door + leeward window hut, room mean | 0.40 | 0.76 |
+| Sealed / door-only hut | 0.037 / 0.035 | 0.038 / 0.139 |
+
+**Cost** (`--perf --scenario explosion`, debris re-solving the box continuously):
+`draftJetPrep` 15 + `draftJets` 37 µs/frame against ~285 µs for all draft rows.
+The first layout read the field straight from the march, consecutive threads
+2,048 words apart in the X march: 142 µs/frame.
+
+Knobs: `sim.draftJet` (0 = T is +-R exactly), `sim.draftJetSpread` (6/64 of the
+momentum flux to each side per cell), `sim.draftJetDecay` (3/256 per cell). A
+change of any solver knob (these, or the sweep counts) now re-solves the box
+(`Simulation::NoteDraftSolverKnobs`). Not modelled: the return flow round a
+jet (a room's corners away from the jet stay calmer than a real room's eddy
+would leave them), and jets through roof openings (the march is horizontal).
+
+
 ### Heat updrafts and the stack effect (phase 5, landed 2026-10-02)
 
 `docs/RESEARCH_wind.md` §4.4 (the updraft) and §14.11 (the stack effect) are the

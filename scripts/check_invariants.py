@@ -1248,6 +1248,9 @@ def check_drafts():
         ("sim_draft", "DRAFT_SPHI_B"): phi_a + 7 * cells + 2 * coarse_cells,
         ("common", "DRAFT_STACK_FIELD"): phi_a + 8 * cells + 2 * coarse_cells,
         ("common", "DRAFT_STACK_LIVE"): phi_a + 10 * cells + 2 * coarse_cells,
+        # The jets' four directional transfers, after the live word's 4.
+        ("common", "DRAFT_JET_FIELD"): phi_a + 10 * cells + 2 * coarse_cells + 4,
+        ("sim_draft", "DRAFT_JET_PREP"): phi_a + 18 * cells + 2 * coarse_cells + 4,
         ("sim_draft", "DM_HEAT_CLOCK"): cpp("kDraftMetaHeatClock"),
         ("sim_draft", "DM_BOX_HOT"): cpp("kDraftMetaBoxHot"),
         ("sim_draft", "DM_HEAT_START"): cpp("kDraftMetaHeatStart"),

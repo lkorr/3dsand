@@ -212,7 +212,7 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
     {"wind", "Wind + Rain", "simTick", PerfSide::Gpu, PerfScope::Count,
      "windWake;rainFall;rainExpo;"
      "draftMaskAll;draftMaskDirty;draftArgs;draftCoarseBuild;draftCoarseFaces;"
-     "draftCoarseSolve;draftFineFirst;draftFineMid;draftFineMid2;draftFineLast",
+     "draftCoarseSolve;draftFineFirst;draftFineMid;draftFineMid2;draftFineLast;draftJetPrep;draftJets",
      "windAt() is a pure function evaluated in the kernels that need it; only "
      "the wake pass is separately timed. rainFall is the rain-on-the-ground "
      "fall-line sampler (wets while it rains, dries top surfaces while it does "

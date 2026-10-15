@@ -736,6 +736,17 @@ class Simulation {
     draftHeatKnobs_[2] = stackQ;
     draftHeatKnobsSet_ = true;
   }
+  // The solver's own knobs (sim.draftCoarseSweeps / draftFineSweeps /
+  // draftJet / draftJetSpread / draftJetDecay): the field is a function of
+  // them too, so a change re-solves the box rather than waiting for the next
+  // geometry change. SubmitTick calls it with the heat knobs.
+  void NoteDraftSolverKnobs(const int32_t k[5]) {
+    bool moved = false;
+    for (int i = 0; i < 5; i++) moved = moved || k[i] != draftSolverKnobs_[i];
+    if (draftSolverKnobsSet_ && moved) draftForce_ = true;
+    for (int i = 0; i < 5; i++) draftSolverKnobs_[i] = k[i];
+    draftSolverKnobsSet_ = true;
+  }
 
   // Publish a finished background compile and return true EXACTLY ONCE: on the
   // call that made the pipelines live. That is the caller's cue to
@@ -989,7 +1000,7 @@ class Simulation {
   // the first tick after the buffer is made is a rebuild.
   rhi::ComputePipeline draftMaskAll_, draftMaskDirty_, draftArgs_, draftCoarseBuild_,
       draftCoarseFaces_, draftCoarseSolve_, draftFineFirst_, draftFineMid_, draftFineMid2_,
-      draftFineLast_;
+      draftFineLast_, draftJetPrep_, draftJets_;
   rhi::Buffer draftBuf_, draftMetaBuf_, draftArgsBuf_;
   // The CA's air mask (pass_table.def caMask): 128 words per chunk slot.
   rhi::Buffer caMaskBuf_, caWindBuf_;
@@ -1010,6 +1021,8 @@ class Simulation {
   int32_t draftLastOrigin_[3] = {-2147483647 - 1, 0, 0};
   int32_t draftHeatKnobs_[3] = {0, 0, 0};
   bool draftHeatKnobsSet_ = false;
+  int32_t draftSolverKnobs_[5] = {0, 0, 0, 0, 0};
+  bool draftSolverKnobsSet_ = false;
   rhi::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pSpawn_, pIntegrate_,
       pArgs2_, pResolve_;
   // Gas particles (sim_gas.wgsl, docs/PLAN_gas_particles.md stage 1). Five

@@ -2460,6 +2460,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { draftFineMid_ = MakeComputePipeline(device, simPL_, mDraft, "fineMid", "draftFineMid"); });
   pool.Add([&] { draftFineMid2_ = MakeComputePipeline(device, simPL_, mDraft, "fineMid2", "draftFineMid2"); });
   pool.Add([&] { draftFineLast_ = MakeComputePipeline(device, simPL_, mDraft, "fineLast", "draftFineLast"); });
+  pool.Add([&] { draftJetPrep_ = MakeComputePipeline(device, simPL_, mDraft, "jetPrep", "draftJetPrep"); });
+  pool.Add([&] { draftJets_ = MakeComputePipeline(device, simPL_, mDraft, "jets", "draftJets"); });
   // The solute POUR (world.h CellOpSolute): in the mutate module because it
   // writes voxels (the powder a pour with no solvent leaves).
   pool.Add([&] { solPour_ = MakeComputePipeline(device, simPL_, mMutate, "solPour", "solPour"); });
@@ -2637,7 +2639,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !pageFill_ || !mutate_ ||
       !mutateCells_ || !windWake_ || !rainFall_ || !rainExpo_ ||
       !draftMaskAll_ || !draftMaskDirty_ || !draftArgs_ || !draftCoarseBuild_ || !draftCoarseFaces_ ||
-      !draftCoarseSolve_ || !draftFineFirst_ || !draftFineMid_ || !draftFineMid2_ || !draftFineLast_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
+      !draftCoarseSolve_ || !draftFineFirst_ || !draftFineMid_ || !draftFineMid2_ || !draftFineLast_ || !draftJetPrep_ || !draftJets_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
       !solWant_ || !solArgs_ || !solAlloc_ || !solDiffuse_ || !solCompact_ || !solScoop_ || !solPour_ || !solHash_ || !solEvict_ || !solRestore_ ||
       !heatBegin_ || !heatShift_ || !heatPend_ || !heatWant_ || !heatArgs_ || !heatAlloc_ || !heatSrc_ || !heatDue_ || !heatTent_ || !heatRelax_ ||
@@ -3030,6 +3032,8 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::DraftFineMid:     return draftFineMid_;
     case P::DraftFineMid2:    return draftFineMid2_;
     case P::DraftFineLast:    return draftFineLast_;
+    case P::DraftJetPrep:     return draftJetPrep_;
+    case P::DraftJets:        return draftJets_;
     case P::Compact:        return compact_;
     case P::CompactNext:    return compactNext_;
     case P::Step:           return step_;

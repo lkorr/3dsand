@@ -219,6 +219,8 @@ PIPE_TO_MEMBER = {
     "PIPE_DRAFT_FINE2": "draftFineMid_",
     "PIPE_DRAFT_FINE2B": "draftFineMid2_",
     "PIPE_DRAFT_FINE3": "draftFineLast_",
+    "PIPE_DRAFT_JETS": "draftJets_",
+    "PIPE_DRAFT_JET_PREP": "draftJetPrep_",
     # The temperature layer (sim_heat.wgsl, src/sim/heat.h).
     "PIPE_HEAT_BEGIN": "heatBegin_",
     "PIPE_HEAT_SHIFT": "heatShift_",

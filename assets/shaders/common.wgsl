@@ -3173,6 +3173,12 @@ fn windPrimAt(p : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
 // Because the transfer is geometry ONLY it is re-solved only on a tick whose
 // blockers changed, so a settled world pays nothing for it (rule 2).
 //
+// UNDER COVER THE AIR KEEPS ITS MOMENTUM (2026-10-14). What the readers below
+// apply is not R but one of four DIRECTIONAL transfers chosen by the sign of
+// each ambient component, T+x / T-x / T+z / T-z: the projection plus, under a
+// roof, the inflow carried across the room as a jet (sim_draft.wgsl THE
+// JETS). Outdoors T = +-R to the bit, so the formula above still holds there.
+//
 // THE PRIMITIVES ARE ADDED AFTER, unprojected (a fan indoors is not confined
 // by the room in v1; research doc §14.1).
 //
@@ -3206,16 +3212,29 @@ const DRAFT_STACK_LIVE : u32 = 1982464u;
 
 fn draftSext(v : u32) -> i32 { return bitcast<i32>(v << 16u) >> 16u; }
 
-// The transfer at volume cell d (in range), Q12: rx = response to unit +X,
-// rz = response to unit +Z.
-struct DraftR { rx : vec3<i32>, rz : vec3<i32> };
-fn draftAt(d : vec3<i32>) -> DraftR {
-  let i = DRAFT_FIELD_BASE + 3u * u32((d.z * DRAFT_NY + d.y) * DRAFT_NX + d.x);
+// THE JETS (sim_draft.wgsl `jets`, world.h kDraftJetField). What the readers
+// apply is not R itself but a DIRECTIONAL transfer per sign of the ambient's
+// horizontal components: T+x, T-x, T+z, T-z. Potential flow has no momentum
+// -- air through a window spread over the whole room at once, so a room with
+// a gale through it stood still away from its openings -- and a jet is not odd
+// in the wind (a +X wind's jet comes in at the west window, a -X wind's at the
+// east one), so one transfer per axis cannot hold it. Outdoors (no roof over
+// the cell) and with the jets off, T-x = -R_x exactly, and the wind below is
+// bit-identical to R_x * amb.x + R_z * amb.z.
+// Each direction is stored in its MARCH order, slice-major: (x, then z + 64 y)
+// for +-X, (z, then x + 64 y) for +-Z -- so the march's stores coalesce. A
+// reader takes one cell, for which the order costs nothing.
+const DRAFT_JET_FIELD : u32 = 1982468u;
+fn draftJetIndex(d : vec3<i32>, dir : u32) -> u32 {
+  let sl = select(d.x, d.z, dir >= 2u);
+  let u = select(d.z, d.x, dir >= 2u);
+  return dir * u32(DRAFT_NX * DRAFT_NY * DRAFT_NZ) + u32(sl * 2048 + u + 64 * d.y);
+}
+fn draftJetAt(d : vec3<i32>, dir : u32) -> vec3<i32> {
+  let i = DRAFT_JET_FIELD + 2u * draftJetIndex(d, dir);
   let w0 = draftWord(i);
   let w1 = draftWord(i + 1u);
-  let w2 = draftWord(i + 2u);
-  return DraftR(vec3<i32>(draftSext(w0), draftSext(w0 >> 16u), draftSext(w1)),
-                vec3<i32>(draftSext(w1 >> 16u), draftSext(w2), draftSext(w2 >> 16u)));
+  return vec3<i32>(draftSext(w0), draftSext(w0 >> 16u), draftSext(w1));
 }
 fn draftInside(d : vec3<i32>) -> bool {
   return d.x >= 0 && d.y >= 0 && d.z >= 0 &&
@@ -3226,17 +3245,20 @@ fn draftInside(d : vec3<i32>) -> bool {
 // included) at world cell p, sheltered. NEAREST cell: the CA's drift bias is a
 // probability and the particle tier's drag a rate, so a 0.4 m step in the
 // field is invisible to both. Integer end to end (rule 1): amb >> 12 times a
-// Q12 transfer is amb x R in amb's own units, and stays inside i32 for any
-// wind the field can make (|amb| < 2^26, |R| < 2^15).
+// Q12 transfer is amb x T in amb's own units, and stays inside i32 for any
+// wind the field can make (|amb| < 2^26, |T| < 2^15). The magnitude of a
+// negative component is -(amb >> 12), not (-amb) >> 12, so T-x = -R_x
+// reproduces R_x * (amb.x >> 12) to the bit.
 fn draftApplyQ(p : vec3<i32>, amb : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
   if (!DRAFT_BOUND || (*T).draftMode == 0u) { return amb; }
   let d = (p - (*T).draftOrigin) >> vec3<u32>(DRAFT_CELL_SHIFT);
   if (!draftInside(d)) { return amb; }
-  let r = draftAt(d);
   let ax = amb.x >> 12u;
   let az = amb.z >> 12u;
-  var o = r.rx * ax + r.rz * az;
-  let open = min(4096, (abs(r.rx.x) + abs(r.rz.z)) >> 1u);
+  let tx = draftJetAt(d, select(0u, 1u, ax < 0));
+  let tz = draftJetAt(d, select(2u, 3u, az < 0));
+  var o = tx * abs(ax) + tz * abs(az);
+  let open = min(4096, (abs(tx.x) + abs(tz.z)) >> 1u);
   o.y += (amb.y >> 12u) * open;
   return o;
 }
@@ -3245,14 +3267,14 @@ fn draftApplyQ(p : vec3<i32>, amb : vec3<i32>, T : ptr<uniform, TickParams>) -> 
 // streak crossing a doorway turns smoothly instead of in 0.4 m steps. A tap
 // outside the volume is the identity (no shelter), which with the solver's
 // own edge blend makes the box's face invisible.
-fn draftTapF(d : vec3<i32>, rx : ptr<function, vec3f>, rz : ptr<function, vec3f>, w : f32) {
+fn draftTapF(d : vec3<i32>, dx : u32, dz : u32, tx : ptr<function, vec3f>,
+             tz : ptr<function, vec3f>, w : f32) {
   if (draftInside(d)) {
-    let r = draftAt(d);
-    *rx += vec3f(r.rx) * (w / 4096.0);
-    *rz += vec3f(r.rz) * (w / 4096.0);
+    *tx += vec3f(draftJetAt(d, dx)) * (w / 4096.0);
+    *tz += vec3f(draftJetAt(d, dz)) * (w / 4096.0);
   } else {
-    *rx += vec3f(w, 0.0, 0.0);
-    *rz += vec3f(0.0, 0.0, w);
+    *tx += vec3f(select(w, -w, dx == 1u), 0.0, 0.0);
+    *tz += vec3f(0.0, 0.0, select(w, -w, dz == 3u));
   }
 }
 fn draftApplyF(p : vec3f, amb : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
@@ -3262,15 +3284,17 @@ fn draftApplyF(p : vec3f, amb : vec3f, R : ptr<uniform, RenderParams>) -> vec3f 
   if (b.x < -1 || b.y < -1 || b.z < -1 ||
       b.x >= DRAFT_NX || b.y >= DRAFT_NY || b.z >= DRAFT_NZ) { return amb; }
   let f = q - floor(q);
-  var rx = vec3f(0.0);
-  var rz = vec3f(0.0);
+  let dx = select(0u, 1u, amb.x < 0.0);
+  let dz = select(2u, 3u, amb.z < 0.0);
+  var tx = vec3f(0.0);
+  var tz = vec3f(0.0);
   for (var k = 0u; k < 8u; k++) {
     let o = vec3<i32>(i32(k & 1u), i32((k >> 1u) & 1u), i32(k >> 2u));
     let wv = select(vec3f(1.0) - f, f, o == vec3<i32>(1));
-    draftTapF(b + o, &rx, &rz, wv.x * wv.y * wv.z);
+    draftTapF(b + o, dx, dz, &tx, &tz, wv.x * wv.y * wv.z);
   }
-  let open = clamp((abs(rx.x) + abs(rz.z)) * 0.5, 0.0, 1.0);
-  return rx * amb.x + rz * amb.z + vec3f(0.0, amb.y * open, 0.0);
+  let open = clamp((abs(tx.x) + abs(tz.z)) * 0.5, 0.0, 1.0);
+  return tx * abs(amb.x) + tz * abs(amb.z) + vec3f(0.0, amb.y * open, 0.0);
 }
 
 // ============================ HEAT UPDRAFTS ==================================
