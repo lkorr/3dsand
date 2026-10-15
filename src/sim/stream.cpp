@@ -472,6 +472,9 @@ void Stream::ShiftAxis(int axis, int dir) {
   timing_.evictSolMs += sT2 - sT1;
   timing_.evictMaxMs = std::max(timing_.evictMaxMs, sT2 - sT0);
   if (sT2 - sT0 > 1.0) timing_.evictSlowShifts++;
+  // The plane's slots are about to hold the ENTERING chunks: its MPM block
+  // map entries and calm counters describe the chunks leaving.
+  ForgetFluidSlots(slots);
 
   IVec3 no = o;
   if (axis == 0) no.x += dir;
@@ -486,6 +489,46 @@ void Stream::ShiftAxis(int axis, int dir) {
   for (uint32_t s : slots) shiftEvicted_[s] = 0;
   shifts_++;
   timing_.shifts++;
+}
+
+// THE FLUID'S SLOT-KEYED STATE MUST NOT OUTLIVE THE CHUNK (audit DET-5,
+// 2026-10-14). fluidBlockMap's index word ([slot] = blockIdx+1) and fluidCalm
+// carry from one tick into the next keyed by SLOT, and the CA (fluidOccMat)
+// plus the seam's front half (exciteDetect, consumeApply) read them BEFORE the
+// next tick's alloc retires last tick's list. A recycled slot therefore showed
+// the evicted chunk's node mass, velocity and intent at the same local cell,
+// 512 cells away -- phantom excited water a PAIR rule could react with, a
+// phantom fast node that woke settled water. Deterministic for one window
+// trajectory but a function of window HISTORY, which two peers do not share.
+//
+// Zeroing the index word makes such a slot read "no block" (exactly what a
+// freshly generated chunk would see after worldgen's Fill); alloc's phase A
+// still walks last tick's list and masks the word, which is a no-op on zero.
+// fluidCalm restarts as worldgen leaves it. The Y-mask half is render-only and
+// phase A clears it for every listed slot, so it is left alone.
+//
+// Deferred queue writes (rhi: they drain at the head of the NEXT command
+// buffer), and every caller runs between ticks, so they land after the last
+// tick that wrote these words and before the first that reads them. Runs of
+// consecutive slots coalesce: a z-plane is one write per buffer, a y-plane 32,
+// an x-plane one word per slot (2,048 four-byte updates on that shift).
+void Stream::ForgetFluidSlots(const std::vector<uint32_t>& slots) {
+  if (slots.empty() || !ctx_ || !world_) return;
+  std::vector<uint32_t> s(slots);
+  std::sort(s.begin(), s.end());
+  s.erase(std::unique(s.begin(), s.end()), s.end());
+  static const std::vector<uint32_t> kZeros(kNumChunks, 0u);
+  size_t i = 0;
+  while (i < s.size()) {
+    if (s[i] >= kNumSlots) { i++; continue; }
+    size_t j = i + 1;
+    while (j < s.size() && s[j] == s[j - 1] + 1 && s[j] < kNumSlots && j - i < kZeros.size()) j++;
+    const uint64_t off = (uint64_t)s[i] * 4;
+    const uint64_t bytes = (uint64_t)(j - i) * 4;
+    ctx_->queue.WriteBuffer(world_->fluidBlockMap, off, kZeros.data(), bytes);
+    ctx_->queue.WriteBuffer(world_->fluidCalm, off, kZeros.data(), bytes);
+    i = j;
+  }
 }
 
 // THE PRISTINE SENTINEL's record (stream.h): forwarded to the page table,
@@ -2504,6 +2547,9 @@ void Stream::DropTickets() {
 
 void Stream::FillTicketSlots(const std::vector<uint32_t>& slots) {
   if (slots.empty()) return;
+  // A ticket slot that held another chunk before must not show that chunk's
+  // MPM block or calm count (ForgetFluidSlots, the window shift's rule).
+  ForgetFluidSlots(slots);
   // FillSlots' own store-hit and gen branches (one implementation of a
   // refill), with `ticket` set: no exchange hold, no sentinel, no verdict.
   FillSlots(slots, /*deferWake=*/false, /*ticket=*/true);

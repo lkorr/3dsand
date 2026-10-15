@@ -574,6 +574,10 @@ class Stream {
   };
 
   void ShiftAxis(int axis, int dir);
+  // Zero the MLS-MPM fluid's SLOT-keyed carried state -- the block map's index
+  // word and fluidCalm -- for slots about to hold a different world chunk (a
+  // shift's plane, a ticket's new chunks). See the definition for why.
+  void ForgetFluidSlots(const std::vector<uint32_t>& slots);
   // Encode readback copies for the slots and queue them as pending evictions.
   // filter=true applies the occupancy/modified save-worthiness test
   // (streaming); filter=false saves everything including air (whole-window
