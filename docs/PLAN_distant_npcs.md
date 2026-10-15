@@ -810,7 +810,161 @@ recommendations):
 
 ## 6. Deviations from this plan (filled in by the implementing packages)
 
-(empty)
+### D0
+
+Landed on `distant-npcs` 2026-10-15 (`71840cf1`). Code: `src/game/distant.{h,cpp}` (the
+tier, the classifier, MobSystem's border code), `src/game/steer.{h,cpp}` (the
+extracted steer), `MobSystem::PatchMobRecord` + `Mob::ApplyDistantOverlay` in
+`mob.cpp` (beside the record reader they are built on), the promotion pass in
+`EntityParking::Unpark` (`persist.cpp`), phase H in `session.cpp`. Gate
+`distant-roundtrip` (§4, plus a steer oracle arm, a patch arm, a retire arm, a
+switch-off arm and a full-tier arm; 3.7 s alone); `mob-park` gained arm G
+(switch on). Verified with `--verify distant-roundtrip,mob-park,
+mob-save-delta,npc-catchup,refs-npc-identity,mob-handoff,mob-cap64-twice`:
+all pass.
+
+**The API later packages build on** (`game/distant.h`, `game/mob.h`):
+`DistantMob` (id, defName/defIndex hint, refId, record, origin, vel, `SteerState
+steer`, `ai::Brain brain`, `DistantGround ground`, cached worldSize/speed/loco,
+`limbHp` + `limbRole` (flags + rig tag) per RECORD limb, D2b fields
+`bloodLossPerTick` / `burnTicksLeft` / `strokeImpactTick` / `strokeStyle`
+written by nobody yet, dead/cause/deathSeq/deathTick, asleep/wakeTick,
+`Overlay()`); `DistantMobs` (sorted by id; `Find`, `FindByRef`, `All`, `At`,
+`Insert`, `Erase`, `Take`, `PromotionCandidates`, `MarkMoved` + the two scan
+latches, `Stats`, `SetCapForTest`); `DistantRunTotals()`; `SteerStep`;
+`ClassifyDistantGround` / `InPlacedDungeonBox`; on `MobSystem`: `Distant()`,
+`DistantMut()`, `PromoteDistant`, `HasRoomForDistant`, `DistantRecord`,
+`PatchMobRecord`, `LocateCreature` / `LocateByRef` / `IdInUse`,
+`SetDistantRefId`, `BrainAnyTierMut`, `SetBehaviorAnyTier`; `LoadOne(...,
+keepId)`; `Mob::ApplyDistantOverlay`, `Mob::ShieldTurnCap`.
+
+**Deviations**
+
+1. **"Near the player" is the WINDOW CENTRE** (radius test, retire test,
+   promotion order). It is within ~3 chunks of the primary (2-chunk
+   hysteresis), immaterial at 128 m, and -- unlike a player position -- the
+   same answer in the game and in a gate whose window is pinned. D8's
+   "farthest from the player" may want the player itself.
+2. **`MobSystem::ParkFn` takes `(Vec3 origin, record)`**, not `(const Mob&,
+   record)`: a retiring distant creature has no Mob. The only installer is
+   `EntityParking::Bind`.
+3. **Unpark in the tick = `TickAuthorityCtx::parking`** (session.h H3b): phase
+   H calls it right before `mobs.PreTick`; main.cpp sets it and now Binds
+   BEFORE the tick (so tick 1 already has a park function). Null in every
+   harness, so the gates that own an `EntityParking` (mob-park, corpse-save,
+   npc-catchup, refs-*, worldio) keep their by-hand calls unchanged.
+   `distant-roundtrip` sets it on its rig.
+4. **Promotion passes `catchUp = true` in D0.** A frozen distant villager is
+   a parked one with an id, so it comes back where its schedule says, as an
+   unpark does. D5 (distant villagers walk their schedules) must turn it off
+   for creatures that walked. The steer state is restored only when the
+   creature came back where the overlay put it.
+5. **Promotion loads the PATCHED record** (dead block included), then runs
+   `ApplyDistantOverlay`. So a creature that dies at distance (D2b) comes back
+   through `LoadOne`'s dead path (`spawnDead_` + `EnterLoadedDead`: no cry,
+   ragdoll from the record pose) -- §2.8's second option. `ApplyDistantOverlay`
+   still has the `Die()` branch for an overlay that is dead on a body that
+   loaded alive, and the hp-zero rules (`HpZeroSevers` -> `Sever`, base limbs,
+   `DamageCtx{}`); with D0's frozen numbers neither ever fires. D2b picks the
+   cause it passes.
+6. **The brain moves back BEFORE `ApplyDistantOverlay`** (plan: after), so a
+   `Die()` inside the overlay acts on the creature's own brain.
+7. **The tier does not hold its def** against `EvictUnusedDefs`: 512 distant
+   pool humans must not pin the near crowd's runtime slots and pool words.
+   `DistantMob` caches worldSize / speed / LocomotionDef at demotion;
+   `defIndex` is only a hint (valid while that slot still has `defName`);
+   `LoadOne` re-resolves by name at promotion. D4a's look keys may want a
+   pinned def per baked look instead.
+8. **SURFACE probes the footprint's centre column at the feet** (plan: the
+   origin): `|feet - (TerrainHeight + 1)| <= surfaceSnapMaxVox` and that cell
+   outside every placed dungeon box of `CurrentWorldMap().dungeons`.
+9. **Demotion proves the overlay first**: the record patched with the
+   overlay read off the live Mob must give back the record's own bytes, or the
+   creature parks instead (counted `failed`, logged). Cheap (one copy + one
+   parse per leaver) and it pins `SaveOne`'s limb walk to the tier's.
+10. **Retire rescans** on a window move, the tier's latch (`MarkMoved`, D1's
+    drive) or a change of radius + hysteresis (an F5); the switch turned off
+    retires everyone at the next tick ("off = the old behaviour" holds at
+    runtime too). Without a park function nothing retires.
+11. **Nearest-first is the SERVICE order** (`PromotionCandidates`), not a
+    promise about completion order: a nearer creature waiting on its ground
+    does not block a farther one whose ground is known -- `Unpark`'s rule for
+    records. Distant creatures are served before parked records.
+12. **`Unpark`'s return / `lastCall` / `maxCall` count promotions too**;
+    `Stats::unparked` stays records only; the tier counts its own.
+13. **`SteerStep(state, loco, defSpeed, shieldRateCap, capMulL, capMulR, dt)`**:
+    the shield's ceiling is passed as a number (`Mob::ShieldTurnCap`, +inf
+    with none), because `ShieldTurnRate` is `min(freeRate, cap)`;
+    `MobSystem::Steer` is the wrapper. Guarded by the oracle arm (100k random
+    states, every bit) rather than a pinned `mob-cap64-twice` digest, which
+    does not exist (that gate compares two arms of one run).
+14. **Velocity** is stored (heading x speedNow, plus fall / lunge carry when
+    airborne) for D1's mid-air landing, not restored at promotion.
+15. **No save-format change** (`kSaveVersion` stays 11): the overlay fits the
+    record. `MobSystem::SaveState` (the legacy whole-section writer) still
+    writes the near crowd only, as it did for parked creatures.
+16. **Not added in D0** (left to their packages): `ai::SelfView selfCache`,
+    `DistantKit`, the distant `WorldView`/`NavProbe`, sleep/wake logic.
+17. `check_invariants.py`'s tuning-consumer allowlist names the three rows
+    batched ahead of their readers (`idleStride`, `promoteMaxDropVox`,
+    `overflowMinDistVox`); each leaves when its package reads it.
+18. `DESIGN.md`'s parking paragraph says Unpark runs inside the tick now,
+    plus three lines on the seam; the full section stays D3's.
+
+**§2.14, the audit** (every call site outside `src/test/` of `FindMobById`,
+`FindCombatantById`, `CreatureWithId`, `FindCreature`, `MobBrain(Mut)`,
+`FindMobByRef`, `IsAlive`, `RemoveMob`, `SetMobBehavior`, and every stored mob
+id / ref lookup). The near lookups are UNCHANGED (they mean "a Mob with a rig
+in `mobs_`"); class (a) sites now ask the either-tier queries.
+
+(a) MUST SEE DISTANT -- fixed:
+
+| Site | Was | Now |
+|---|---|---|
+| `LoadOne` duplicate-ref refusal | near only: a parked record for a ref whose body is distant unparked a second body | either tier, except the distant creature coming back under `keepId` |
+| `LoadOne` / `AdoptDeadAvatar` player-corpse id probe | near only | `IdInUse` (either tier) |
+| `refs_dungeon.cpp TickSpawner` slot occupancy | distant = missing -> dead after 600 ticks -> duplicate spawn | distant alive = occupied (`missing = 0`) |
+| `TickSpawner` dead-rename loop | a distant corpse kept the slot name | renamed in the tier (`SetDistantRefId`; the patched record carries it); uniqueness probed across both tiers |
+| spawner + npc `deactivate` (Edited/Deleted) | `RemoveMob` missed a distant body | removes the distant one too |
+| npc `activate` ("already standing") | near only | `LocateByRef` |
+| `MobSystem::RemoveMob` (demon `Depart`, the refs above) | near only | also erases from the tier |
+| `demon.cpp DemonTick` | `IsAlive` false -> LiveDemon erased (binding, circle, pact lost) | kept while alive in either tier; a DISTANT demon is not re-judged (its circle is not in the window) |
+| `DemonUnbind` / `AimAtSummoner`, `demon_seals Release`, `demon_talk Present` | one-time profile / brain writes missed a distant demon | `SetBehaviorAnyTier` / `BrainAnyTierMut` |
+| `demon_talk` DMNS save | a distant bound demon not saved | saved; def name + origin from the tier |
+| `demon_talk ContractTick` restores | near bodies only | also matches a distant body (strictly nearer) |
+| `demon_cast MobCastTick` | `IsAlive` false -> caster latched `gone` for good | gone only if gone in both tiers; distant = frozen (no regen) |
+| `ApplyAnnounce` / `ApplyHandoff` (net) | -- | a peer's creature replaces a distant copy of its id (unreachable in D0: the tier is host-only, host-band ids) |
+| `SetBehaviors` (R reload) | -- | distant brains re-pointed by their own profile's name |
+| `persist.cpp 'MOBS' saveRecords` | `mobs_` only (audit A2) | + every distant creature's patched record |
+| `MobSystem::Reset(rewindIds)` | -- | clears the tier before ids can be re-issued |
+
+(a) BY CONSTRUCTION, no code change: `ServiceRising` (`FindCreature` of a
+corpse to raise) -- a rising is booked only on the dead, and a corpse's
+booking is withdrawn at demotion and travels in its record (re-booked by
+`EnterLoadedDead` at promotion), so no booking ever names a distant id. D2b's
+distant deaths must keep it so (book into the overlay, never `rises_`).
+
+(b) MUST NOT SEE DISTANT (~140 sites): every rig / limb / body / damage /
+equip / carve / coat / shock / arrow-embed / pierce / render accessor
+(`CreatureWithId`, `FindCreature`, `FindMob` and their wrappers in
+`mob.cpp`), `LoadOne`'s and the handoff's re-lookups after a spawn, the
+archers' draws, the casters' bodies, `refs_dungeon Bodies` (plates and
+triggers), and main.cpp's shot harnesses. Unchanged.
+
+(c) INDIFFERENT (~66 sites): AI target resolution (`FindCombatantById`,
+`StepStroke`, swim / archery tracking -- the target is simply not there this
+tick), net melee in flight (ghosts only), demon malice / gaze / talk-range /
+per-tick brain reads (a distant demon is frozen, which is the intended
+behaviour), dialogue `TickSession` (a speaker past the window is out of talk
+range anyway), `refs_npc StepResident` (the resident's plan resets on return,
+exactly as an unpark resets it today; D5 replaces this), `usePoint` / `onUse`
+(the player is within 7 m), `refs.cpp LiveMobOfRef` (no callers), debug UI and
+harness printouts. Unchanged.
+
+Test-side note: `dungeon-entities`, `refs-npc-identity`, `npc-catchup` count
+bodies per ref over `MobAt` and `demon-contract` / `demon-malice` use
+`!IsAlive` as "gone"; all run with the switch off, so they still mean what
+they meant. D3's flip should revisit them.
 
 ## 7. Audit 2026-10-15: what changed and why
 

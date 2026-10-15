@@ -670,7 +670,9 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   creature and a saved one are the same bytes and the next save puts it on
   disk with no code of its own -- and then releases the rig as before. Only a
   creature this machine OWNS parks (a ghost is the peer's). `game/persist.h
-  MobParking::Unpark`, called once per sim tick after `TickAuthority`, brings
+  MobParking::Unpark`, called once per sim tick INSIDE `TickAuthority` (phase
+  H, right before `mobs.PreTick`, through `TickAuthorityCtx::parking`; it ran
+  after the tick until 2026-10-15, docs/PLAN_distant_npcs.md D0), brings
   back the `MOBS` records of the window's regions whose origin is at least one
   chunk inside every face (hysteresis against the 16-voxel park pad), through
   the load path (`MobSystem::LoadOne`), and a record WAITS -- stays parked,
@@ -701,6 +703,16 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   reaches it. **Not done:** parked creatures do not tick (no off-screen
   travel or schedules); authored NPCs still have no
   stable content id (`npc:<name>`) for quests to name. Gate `mob-park`.
+  **The distant tier's seam (2026-10-15, docs/PLAN_distant_npcs.md D0,
+  `game/distant.h`), behind `distant.enabled` (OFF until D3):** a leaver within
+  `distant.radius` of the window centre DEMOTES instead of parking -- id,
+  `ai::Brain` and steer state kept in `MobSystem::Distant()`, the `SaveOne`
+  record kept as the bridge, the dead too -- and `Unpark` PROMOTES those the
+  window reaches again first (nearest first, same three waits, same budget,
+  `LoadOne(..., keepId)` + `Mob::ApplyDistantOverlay`); past radius +
+  hysteresis one RETIRES as its patched record (`MobSystem::PatchMobRecord`);
+  a save writes each as its patched record. D0 creatures are frozen. Gate
+  `distant-roundtrip`; the full section lands with D3.
 - **The save stores the delta, and meta names its generator (2026-09-22,
   `docs/PLAN_save_system.md` S1).** A saved world is `genChunk(seed,
   generator)` plus the store. `Stream::FlushResident` used to write all 32,768
