@@ -15477,6 +15477,12 @@ int main(int argc, char** argv) {
       fluidPendingSpawns.clear();  // table zeroes the GPU count + calm state)
       debris.Reset();
       mobs.Reset();
+      // The arrows go with the world (game/arrows.h): flights in the air and
+      // the stuck-arrow cap's global ids, which debris.Reset's serials restart
+      // under -- left, the cap would evict whatever the new world's body of
+      // that id is. The NPC draws name mobs that no longer exist.
+      tickCtx.arrows.Clear();
+      tickCtx.archers.Clear();
       // A new world: the refs start as authored (no deltas, nothing active),
       // read again from the map F7 may just have switched to.
       if (refsMapName() != kHarnessMapName) {
@@ -15660,6 +15666,13 @@ int main(int argc, char** argv) {
         // transient state is cleared here.
         grenades.clear();
         everExploded = false;
+        // Arrows are not in the save either (stuck ones are ITMS items, which
+        // came back with the debris): the flights loosed before the load, the
+        // stuck-arrow cap's ids (a serial space the load restarted) and the
+        // NPC draws of mobs the load replaced all belong to the old world.
+        // Cleared, not ended: EndDraw would find a LOADED mob by a stale id.
+        tickCtx.arrows.Clear();
+        tickCtx.archers.Clear();
         fluidCount = 0;  // MPM fluid is not in the save format: saves
         fluidPendingSpawns.clear();  // force-settle (loadReset zeroes the
                                      // GPU count + calm state)
