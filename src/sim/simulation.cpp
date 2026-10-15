@@ -1140,11 +1140,8 @@ bool Simulation::Init(const rhi::Device& device, World& world,
       // CopySrc: the heat-updraft gate reads probe streaks back (test only).
       windStreakBuf_ = CreateBuffer(device, words * 4ull, U::Storage | U::CopyDst | U::CopySrc,
                                     "windStreaks");
-      // NO explicit zero upload: every buffer starts zeroed (rhi_vulkan.cpp, the
-      // zero-init registry). The 3.5 MB upload this was rode the same
-      // unsubmitted init batch as audit DJ-1's doubled draft zeroing and ran the
-      // 64 MiB staging ring out at startup ("Raise kStagingRingBytes" abort in
-      // Simulation::Init, main 2e34096).
+      std::vector<uint32_t> zero((size_t)words, 0u);
+      device.GetQueue().WriteBuffer(windStreakBuf_, 0, zero.data(), zero.size() * 4);
     }
     veilPixels_ = 0;
     BuildRenderBindGroup(renderBG_, veilBuf_);
