@@ -391,10 +391,11 @@ void Route(TickAuthorityCtx& w, std::span<SessionTick> players, MobCastWorld& m,
   if (!players.empty() && players[0].s)
     for (const ExplosionOp& e : em.explosions) players[0].s->pendingBlasts.push_back(e);
   for (const ParticleSpawn& p : em.spawns) out.spawns.push_back(p);
+  // Through the player's door (SpawnWindPrim), so a connected peer's CA gets
+  // the gust too.
   for (WindPrim wp : em.winds) {
-    wp.spawnTick = tick;
     wp.ownerId = c.mobId;
-    WindPrims().Spawn(wp);
+    SpawnWindPrim(w, out, wp, tick);
   }
   m.stats.unsupported += em.strikes.size() + em.summons.size();
   // Sustained lift on a body, whoever's.

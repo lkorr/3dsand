@@ -709,6 +709,18 @@ static inline uint32_t OpLandingTick(const TickAuthorityCtx& w, uint32_t tick) {
   return tick + (w.opsync ? w.opsync->Delay() : 0u);
 }
 
+// (session.h.) Connected, `spawnTick` is left for phase N to stamp: the
+// primitive's whole motion and lifetime are f(t - spawnTick), and only the
+// label tick is a fact both machines share.
+bool SpawnWindPrim(TickAuthorityCtx& w, OpBatch& out, WindPrim p, uint32_t tick) {
+  if (w.opsync && w.opsync->Connected()) {
+    out.winds.push_back(p);
+    return true;
+  }
+  p.spawnTick = tick;
+  return WindPrims().Spawn(p);
+}
+
 // THE FLICK -> A COMPASS STYLE FOR THIS HAND, -1 when the flick names none.
 // A MIRRORED STROKE TRAVELS THE MIRROR OF ITS SECTOR (strokes.h "THE LEFT HAND
 // IS THE RIGHT, MIRRORED"): the left hand swinging a right-authored style
@@ -4732,10 +4744,12 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         // someone's fan, and the refusal is COUNTED for the same reason the op
         // overflow above is: "my gust sometimes does nothing" is miserable to
         // diagnose from silence.
-        for (WindPrim w : emit.winds) {
-          w.spawnTick = tick;
-          w.ownerId = kPlayerCasterId;   // the same casterId the projectile carries
-          if (!WindPrims().Spawn(w)) ui.windPrimsDropped++;
+        //
+        // Through SpawnWindPrim, so a connected peer's CA gets the same gust
+        // (it crosses in OpBatch::winds and lands at the label tick).
+        for (WindPrim wp : emit.winds) {
+          wp.ownerId = kPlayerCasterId;   // the same casterId the projectile carries
+          if (!SpawnWindPrim(w, out, wp, tick)) ui.windPrimsDropped++;
         }
 
         // ---- the dev-panel producer (docs/RESEARCH_wind.md §4.3) ------------
@@ -5908,6 +5922,17 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
           world.QueueGasSpawns(out.gas.data(), (uint32_t)out.gas.size());
           out.gas.clear();
         }
+        // THE SEVENTH (2026-10-14): the merged wind primitives -- the same
+        // list, in the same order, on both machines -- spawned NOW, at the
+        // label tick, which is the spawnTick both machines can agree on
+        // (SpawnWindPrim staged them unstamped). SubmitTick below copies
+        // WindPrims() into this tick's TickParams, so both CAs see the gust
+        // from the same tick. A full list refuses identically on both.
+        for (WindPrim& wp : out.winds) {
+          wp.spawnTick = tick;
+          if (!WindPrims().Spawn(wp)) ui.windPrimsDropped++;
+        }
+        out.winds.clear();
         // ---- A PEER'S GRENADE HITS MY BODY, ON MY MACHINE ---------------
         // The owner-side half W1-F left open (DESIGN.md s10): at the landing
         // tick, the tick its crater reaches this GPU, each REMOTE explosion

@@ -51,6 +51,9 @@
 //     World's queue into OpBatch::gas before PushLocal and re-queues the
 //     merged batch's after the merge. Absolute 24.8 world coords, so no
 //     translation, like a ParticleSpawn.)
+//   * (WIND PRIMITIVES cross since 2026-10-14, kOpsWireVersion 3: a spell's
+//     gust is staged on OpBatch::winds by SpawnWindPrim and phase N spawns
+//     the merged list at the label tick. The dev panel's fan does not cross.)
 //   * THE CPU-SIDE CONSEQUENCES of a remote explosion (island rescan, limb
 //     damage, body impulses). The crater crosses, because it is an op; the
 //     debris scan and the ragdoll launch are raised by the AUTHORING machine
@@ -69,7 +72,8 @@ namespace net {
 // (three packages' schemas in one file would make every one of them a protocol
 // version bump).
 // 2: the sixth vector, OpBatch::gas (2026-10-07).
-constexpr uint32_t kOpsWireVersion = 2;
+// 3: the seventh, OpBatch::winds (2026-10-14).
+constexpr uint32_t kOpsWireVersion = 3;
 
 // HOW FAR AHEAD A TICK'S OPS ARE LABELLED, and it is D + 1, NOT D.
 //
@@ -144,7 +148,8 @@ struct MergeStats {
   uint32_t remoteSpawns = 0;
   uint32_t remoteFluid = 0;
   uint32_t remoteGas = 0;
-  uint32_t merged = 0;           // ops of all six kinds in the merged batch
+  uint32_t remoteWinds = 0;
+  uint32_t merged = 0;           // ops of all seven kinds in the merged batch
   int32_t firstDropChunk[3] = {0, 0, 0};
   bool haveFirstDrop = false;
 };

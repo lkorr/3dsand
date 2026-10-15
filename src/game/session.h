@@ -454,6 +454,14 @@ int BodySlotFor(const char* name, const char* tag);
 // peer's spawns cross like every other op, 2026-10-07) and hands the MERGED
 // batch's gas back to the queue after the merge, where SubmitTick drains (and
 // the op record records) it exactly as before.
+//
+// AND A SEVENTH, ALSO ONLY ON THE WIRE: `winds`, a spell's wind primitives
+// (2026-10-14, kOpsWireVersion 3). A primitive lives in the process-wide
+// WindPrims() list that SubmitTick copies into TickParams, so a gust spawned
+// only on the caster's machine bent the caster's CA and nobody else's. In a
+// single-player tick `winds` stays EMPTY (SpawnWindPrim spawns at once);
+// connected, the producers stage here, the batch crosses, and phase N spawns
+// the MERGED list at the label tick, the same list on both machines.
 struct OpBatch {
   std::vector<BrushOp> ops;
   std::vector<ExplosionOp> exps;
@@ -461,6 +469,7 @@ struct OpBatch {
   std::vector<ParticleSpawn> spawns;
   std::vector<FluidSpawnOp> fluid;
   std::vector<GasSpawnOp> gas;
+  std::vector<WindPrim> winds;
   // Cleared, not reconstructed: the capacity is worth keeping across ticks and
   // the values are identical either way.
   void Clear() {
@@ -470,6 +479,7 @@ struct OpBatch {
     spawns.clear();
     fluid.clear();
     gas.clear();
+    winds.clear();
   }
 };
 
@@ -1409,6 +1419,15 @@ struct SessionTick {
 
 void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
                    uint32_t tick, OpBatch& out);
+
+// THE ONE DOOR A GAMEPLAY WIND PRIMITIVE GOES THROUGH (a player's spell, a
+// creature's). Single-player: stamped `spawnTick = tick` and spawned into
+// WindPrims() now, exactly the old path; false = the list was full. Connected
+// (w.opsync): staged on `out.winds` instead, to cross with this tick's batch,
+// and spawned by phase N from the MERGED batch at the label tick on both
+// machines (true; a refusal there is counted then). The dev panel's fan is NOT
+// routed: it is a debug control, local to the machine that placed it.
+bool SpawnWindPrim(TickAuthorityCtx& w, OpBatch& out, WindPrim p, uint32_t tick);
 
 // ONE PLAYER IS A SPAN OF ONE. Kept because the frame loop and every harness
 // fixture read better this way, not because the authority is singular — the

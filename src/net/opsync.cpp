@@ -12,7 +12,7 @@ namespace {
 using sandvox::opstream::OpMeta;
 using sandvox::opstream::Producer;
 
-// The six vectors, in ONE order, written once. Encode and Decode both go
+// The seven vectors, in ONE order, written once. Encode and Decode both go
 // through it, so a vector added to OpBatch cannot be encoded and forgotten on
 // the read side (the compiler will not catch that; a single list will).
 template <typename W, typename B>
@@ -23,6 +23,7 @@ void WalkBatch(W&& w, B& b) {
   w(b.spawns);
   w(b.fluid);
   w(b.gas);   // kOpsWireVersion 2
+  w(b.winds); // kOpsWireVersion 3
 }
 
 }  // namespace
@@ -220,6 +221,8 @@ OpBatch OpDelayQueue::Merge(uint32_t label, const World& world, MergeStats& st,
         out.fluid.insert(out.fluid.end(), e->batch.fluid.begin(),
                          e->batch.fluid.end());
         out.gas.insert(out.gas.end(), e->batch.gas.begin(), e->batch.gas.end());
+        out.winds.insert(out.winds.end(), e->batch.winds.begin(),
+                         e->batch.winds.end());
         // Re-note as RUNS of equal (producer, author): one range per run
         // reproduces exactly what ResolveAuthors would have expanded, at a
         // fraction of the ranges.
@@ -313,11 +316,18 @@ OpBatch OpDelayQueue::Merge(uint32_t label, const World& world, MergeStats& st,
         out.gas.push_back(g);
         st.remoteGas++;
       }
+      // Wind primitives: absolute world cells, no translation; unstamped
+      // (phase N stamps spawnTick with the label tick on both machines).
+      for (const WindPrim& wp : e->batch.winds) {
+        out.winds.push_back(wp);
+        st.remoteWinds++;
+      }
     }
   }
 
   st.merged = (uint32_t)(out.ops.size() + out.exps.size() + out.cells.size() +
-                         out.spawns.size() + out.fluid.size() + out.gas.size());
+                         out.spawns.size() + out.fluid.size() + out.gas.size() +
+                         out.winds.size());
   mergedMax = std::max<uint64_t>(mergedMax, st.merged);
   mergedUpTo_ = label;
   everMerged_ = true;
