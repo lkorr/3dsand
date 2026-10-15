@@ -1020,6 +1020,12 @@ bool LoadWorld(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
     // consumable afterwards (see World::InvalidateSnapshot).
     world.InvalidateSnapshot();
     stream.ReloadWindow({origin[0], origin[1], origin[2]});
+    // The wind-draft field (shelter solve, jet transfers) is derived from the
+    // REPLACED world, and SetDraft only bursts on a box move: a load under a
+    // box that did not move kept the pre-load field until an incremental
+    // solve published, and what it published depended on what ran before the
+    // load. Same bug and fix as worldgen_run.cpp's ForceDraftRebuild.
+    sim.ForceDraftRebuild();
     rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
     sim.EncodeLoadReset(enc);
     rhi::CommandBuffer cmd = enc.Finish();

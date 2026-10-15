@@ -11853,6 +11853,9 @@ int main(int argc, char** argv) {
       // the host holds is HELD INERT and arrives over the wire instead of
       // being generated and then overwritten in front of the player.
       stream.ReloadWindow(world.WindowOrigin());
+      // The re-pulled window is not the world the draft field was solved
+      // from, and the box did not move: re-solve it (see LoadWorld).
+      sim.ForceDraftRebuild();
       std::fflush(stdout);
     }
   }
@@ -15547,6 +15550,9 @@ int main(int argc, char** argv) {
         const IVec3 origin{(tx >> 4) - half, GroundWindowY(tx, tz), (tz >> 4) - half};
         world.InvalidateSnapshot();
         stream.ReloadWindow(origin);
+        // The draft field describes the old window; a teleport inside the
+        // same box snap would not move the box (see LoadWorld).
+        sim.ForceDraftRebuild();
         {
           rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
           sim.EncodeLoadReset(enc);
