@@ -4513,14 +4513,104 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     // measures "miss world" on every limb -- the puddle still flowing, which
     // is the world waking the walk, not a limb that cannot sleep. The wait is
     // now explicit: mobBurnSleepSettleTicks (tests/baseline.json).
+    //
+    // WHAT MOVED IN THE WORLD (2026-10-15, CLAUDE.md rule 6). "miss world"
+    // says a cached chunk in a limb's box was re-versioned, not by what. A
+    // fetch trace (SANDVOX_FETCH_TRACE) showed the nine ground chunks round
+    // this body re-landing every 9 ticks (debris.cpp's dirty-chunk refresh,
+    // kTerrainRefreshTicks) with DIFFERENT matter on 71 of 72 landings, for
+    // 640 ticks after the douse -- so the walk was right to wake, and the
+    // question is what the matter is. Every chunk round the body is copied
+    // and diffed whenever its version moves: by FIELD (material / state
+    // nibble / stain), with the commonest material transitions by name.
+    struct KChunkSeen {
+      IVec3 wc{};
+      uint32_t version = 0;
+      std::vector<uint32_t> vox;
+      uint32_t bumps = 0, matCells = 0, stateCells = 0, stainCells = 0;
+    };
+    std::vector<KChunkSeen> kSeen;
+    std::vector<std::pair<uint32_t, uint32_t>> kTransKey;  // (from, to)
+    std::vector<uint32_t> kTransN;
+    std::vector<uint32_t> kStateBy(mats.size(), 0), kStainBy(mats.size(), 0);
+    {
+      const Vec3 at = mobs.LimbVoxelPos(id, rootLimb, 0);
+      const IVec3 rc{ifloor(at.x) >> 4, ifloor(at.y) >> 4, ifloor(at.z) >> 4};
+      for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+          for (int dx = -1; dx <= 1; dx++) {
+            KChunkSeen s;
+            s.wc = IVec3{rc.x + dx, rc.y + dy, rc.z + dz};
+            if (const CachedChunk* cc = world.Cached(s.wc);
+                cc != nullptr && cc->voxels.size() == kChunkVol) {
+              s.version = cc->version;
+              s.vox = cc->voxels;
+            }
+            kSeen.push_back(std::move(s));
+          }
+    }
+    // True when any chunk round the body was re-versioned since the last
+    // call (the thing that wakes the walk); `tally` counts what moved.
+    auto kDiff = [&](bool tally) {
+      bool any = false;
+      for (KChunkSeen& s : kSeen) {
+        const CachedChunk* cc = world.Cached(s.wc);
+        if (cc == nullptr || cc->voxels.size() != kChunkVol ||
+            cc->version == s.version)
+          continue;
+        any = true;
+        if (tally && s.vox.size() == kChunkVol) {
+          s.bumps++;
+          for (uint32_t i = 0; i < kChunkVol; i++) {
+            const uint32_t a = s.vox[i], b = cc->voxels[i], d = a ^ b;
+            if ((d & 0xFF00FFFFu) == 0u) continue;
+            const uint32_t ma = a & 0xFFFu, mb = b & 0xFFFu;
+            if (d & 0xFFFu) {
+              s.matCells++;
+              size_t k = 0;
+              while (k < kTransKey.size() && kTransKey[k] != std::make_pair(ma, mb)) k++;
+              if (k == kTransKey.size()) {
+                kTransKey.push_back({ma, mb});
+                kTransN.push_back(0);
+              }
+              kTransN[k]++;
+            } else if (d & 0xF000u) {
+              s.stateCells++;
+              if (mb < kStateBy.size()) kStateBy[mb]++;
+            } else {
+              s.stainCells++;
+              if (mb < kStainBy.size()) kStainBy[mb]++;
+            }
+          }
+        }
+        s.version = cc->version;
+        s.vox = cc->voxels;
+      }
+      return any;
+    };
+    // ...AND THE WORLD ROUND IT HAS TO HAVE STOPPED MOVING:
+    // mobBurnSleepWorldQuietTicks consecutive ticks with no chunk round the
+    // body re-versioned (0 = not asked), within mobBurnSleepSettleMaxTicks.
+    // Measured 2026-10-15: the diff named the douse itself -- water->air 338,
+    // air->water 152, 2400 fullness changes, wet stain creeping over the
+    // sandstone, all downhill of the body -- still running off this slope at
+    // t+600, where the fixed settle opened the window (48% / 57% asleep). The
+    // flood is quiet at ~t+2280 and then every limb sleeps (239/240 charred,
+    // 660/660 unburnt). A smaller douse box drained SLOWER (t+3133): the
+    // slope sets the time, not the volume.
     const int settleMin = (int)BaselineNumber("mobBurnSleepSettleTicks", 560.0);
-    int settled = -1;
-    for (int i = 0; i < 1500 && mobs.IsAlive(id); i++) {
+    const int quietNeed = (int)BaselineNumber("mobBurnSleepWorldQuietTicks", 0.0);
+    const int settleMax =
+        (int)BaselineNumber("mobBurnSleepSettleMaxTicks", 1500.0);
+    int settled = -1, quietRun = 0, settleTicks = 0;
+    for (int i = 0; i < settleMax && mobs.IsAlive(id); i++) {
       burnTick(id, 0, 0);
+      settleTicks = i + 1;
+      quietRun = kDiff(false) ? 0 : quietRun + 1;
       // Past the index's release grace (kBurnIndexGrace) before asking.
       if (i >= 40 && !anyAwake()) {
         if (settled < 0) settled = i;  // when the fronts emptied (reported)
-        if (i >= settleMin) break;
+        if (i >= settleMin && quietRun >= quietNeed) break;
       } else {
         settled = -1;
       }
@@ -4528,7 +4618,10 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     // Off the front, the idle exit still holds the index for kBurnIndexGrace
     // (30) quiet ticks before releasing it, and the sleep engages on the walk
     // AFTER the release.
-    for (int i = 0; i < 40 && mobs.IsAlive(id); i++) burnTick(id, 0, 0);
+    for (int i = 0; i < 40 && mobs.IsAlive(id); i++) {
+      burnTick(id, 0, 0);
+      kDiff(false);
+    }
     // THE SLEEP, MEASURED OVER A WINDOW rather than read off one tick, and for
     // EVERY limb: a limb-visit counts as asleep when the burn pass skipped its
     // world walk (the key matched). An absolute claim, not one relative to the
@@ -4555,6 +4648,7 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     std::string awakeTicks;
     for (int i = 0; i < kSleepWindow && mobs.IsAlive(id); i++) {
       burnTick(id, 0, 0);
+      kDiff(true);
       int awakeNow = 0;
       for (int li = 0; li < nLimbs; li++) {
         const MobSystem::LimbBurnProbe pr = mobs.LimbBurnStateOf(id, li);
@@ -4589,6 +4683,34 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       std::printf("    sleep window, awake visits: holdBy[%s ] miss[%s ] "
                   "limbs[%s ] ticks[%s ]\n",
                   hs.c_str(), ms.c_str(), ls.c_str(), awakeTicks.c_str());
+      // ...and what moved in the world under them (kDiff).
+      auto nameOf = [&](uint32_t m) {
+        return m < mats.size() ? mats[m].name.c_str() : "?";
+      };
+      std::string cs, ts, ss, ws;
+      for (const KChunkSeen& s : kSeen)
+        if (s.bumps)
+          cs += Format(" (%d,%d,%d) v+%u mat %u state %u stain %u",
+                       s.wc.x - kSeen[13].wc.x, s.wc.y - kSeen[13].wc.y,
+                       s.wc.z - kSeen[13].wc.z, s.bumps, s.matCells,
+                       s.stateCells, s.stainCells);
+      std::vector<size_t> order(kTransKey.size());
+      for (size_t k = 0; k < order.size(); k++) order[k] = k;
+      std::sort(order.begin(), order.end(),
+                [&](size_t a, size_t b) { return kTransN[a] > kTransN[b]; });
+      for (size_t k = 0; k < order.size() && k < 6; k++)
+        ts += Format(" %s->%s %u", nameOf(kTransKey[order[k]].first),
+                     nameOf(kTransKey[order[k]].second), kTransN[order[k]]);
+      for (size_t m = 0; m < mats.size(); m++) {
+        if (kStateBy[m]) ss += Format(" %s %u", nameOf((uint32_t)m), kStateBy[m]);
+        if (kStainBy[m]) ws += Format(" %s %u", nameOf((uint32_t)m), kStainBy[m]);
+      }
+      std::printf("    world under them (settle %d ticks, world quiet run %d of "
+                  "%d asked): chunks[%s ] transitions[%s ] state-only[%s ] "
+                  "stain-only[%s ]\n",
+                  settleTicks, quietRun, quietNeed,
+                  cs.empty() ? " none re-versioned" : cs.c_str(), ts.c_str(),
+                  ss.c_str(), ws.c_str());
     }
     const KCensus k = kCensus(true);
     const double sleepMin = BaselineNumber("mobBurnSleepFracMin", 0.9);
@@ -16660,9 +16782,9 @@ Status GatePoolHuman(Ctx& c, std::string& detail) {
 // table ran out, a limb packed no brick and the cube path drew it at collider
 // scale. Three things changed, and this gate holds each:
 //   A EVERY pool body builds and packs WHOLE while all of them are held at
-//     once -- the living cap's worth alive, the rest killed so they lie as
-//     corpses, the oldest corpses decayed to debris (every holder population
-//     EvictUnusedDefs counts);
+//     once -- kPoolHoldAlive alive, the rest killed so they lie as corpses,
+//     the corpses past kPoolHoldDead decayed to debris (every holder
+//     population EvictUnusedDefs counts, and each one must be non-empty);
 //   B nothing held is evicted: an eviction with no grace in the middle of A
 //     takes nothing;
 //   C once nothing holds them the PreTick sweep takes them after its grace
@@ -16705,15 +16827,24 @@ Status GatePoolEvict(Ctx& c, std::string& detail) {
   const IVec3 anchor = AiFixtureCentre(c.world);
   const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
 
+  // THE GATE'S OWN HOLD COUNTS, NOT THE SYSTEM'S CAPS. A leaned on the living
+  // cap (16) to kill the oldest -- and when kMaxMobs went 16 -> 64
+  // (2026-10-04) the whole 20-body wave fit, nothing died, and the corpse and
+  // debris holders B is about went unexercised for ten days behind a red that
+  // read "killed 0". So the gate keeps kPoolHoldAlive alive itself, and past
+  // kPoolHoldDead corpses the oldest decays to debris the way the dead cap
+  // does it at PreTick (Mob::ReleaseRigToDebris -- there are no ticks here).
+  // Both are below every system cap, so neither cap can empty a population.
+  constexpr size_t kPoolHoldAlive = 6, kPoolHoldDead = 6;
   struct Wave {
-    int built = 0, spawned = 0, partial = 0, killed = 0;
+    int built = 0, spawned = 0, partial = 0, killed = 0, decayed = 0;
     uint32_t heldEvicted = 0;  // B: must stay 0
     uint32_t debrisHolders = 0;
     uint32_t minFree = 0xFFFFFFFFu;
     std::string why;
   };
   auto wave = [&](Wave& w) {
-    std::vector<uint64_t> living;
+    std::vector<uint64_t> living, dead;
     for (size_t k = 0; k < names.size(); k++) {
       const int di = c.mobs.FindOrComposeDef(names[k]);
       if (di < 0) {
@@ -16730,14 +16861,23 @@ Status GatePoolEvict(Ctx& c, std::string& detail) {
           w.why = Format("%s has %d brickless limbs (human %d)",
                          names[k].c_str(), bare, humanBare);
       }
-      // The living cap is 16: the oldest living one dies to make room and
-      // stays a holder as a corpse (and, past the dead cap, as debris).
-      while (!c.mobs.HasRoomToSpawn() && !living.empty()) {
+      // The oldest living one dies to make room and stays a holder as a
+      // corpse; past kPoolHoldDead the oldest corpse is a holder as debris.
+      while ((living.size() >= kPoolHoldAlive || !c.mobs.HasRoomToSpawn()) &&
+             !living.empty()) {
         if (Mob* m = c.mobs.FindMobById(living.front())) {
           m->Die();
           w.killed++;
+          dead.push_back(living.front());
         }
         living.erase(living.begin());
+      }
+      while (dead.size() > kPoolHoldDead) {
+        if (Mob* m = c.mobs.FindMobById(dead.front())) {
+          m->ReleaseRigToDebris();
+          w.decayed++;
+        }
+        dead.erase(dead.begin());
       }
       const int x = spot.x + (int)(k % 5) * 12 - 24;
       const int z = spot.z + (int)(k / 5) * 12 - 24;
@@ -16783,8 +16923,11 @@ Status GatePoolEvict(Ctx& c, std::string& detail) {
   drain(d2);
 
   const int n = (int)names.size();
+  // B means something only while all three holder populations are present.
   auto waveOk = [&](const Wave& w) {
-    return w.built == n && w.spawned == n && w.partial == 0 && w.heldEvicted == 0;
+    return w.built == n && w.spawned == n && w.partial == 0 &&
+           w.heldEvicted == 0 && w.killed > 0 && w.decayed > 0 &&
+           w.debrisHolders > 0;
   };
   auto drainOk = [&](const Drain& d) {
     return d.firstSweep == 0 && d.secondSweep >= (uint32_t)n &&
@@ -16792,12 +16935,12 @@ Status GatePoolEvict(Ctx& c, std::string& detail) {
   };
   const bool reused = defsAfterW2 == defsAfterW1;
   const bool ok = waveOk(w1) && waveOk(w2) && drainOk(d1) && drainOk(d2) &&
-                  reused && w1.killed > 0;
+                  reused;
   auto waveStr = [&](const Wave& w) {
-    return Format("built %d/%d spawned %d partial %d killed %d debris-held %u "
-                  "held-evicted %u min free %u",
-                  w.built, n, w.spawned, w.partial, w.killed, w.debrisHolders,
-                  w.heldEvicted, w.minFree);
+    return Format("built %d/%d spawned %d partial %d killed %d decayed %d "
+                  "debris-held %u held-evicted %u min free %u",
+                  w.built, n, w.spawned, w.partial, w.killed, w.decayed,
+                  w.debrisHolders, w.heldEvicted, w.minFree);
   };
   auto drainStr = [&](const Drain& d) {
     return Format("sweeps %u then %u, runtime left %u/%u, free words %u/%u, "
