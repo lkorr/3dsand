@@ -2964,6 +2964,15 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
 
     const size_t opsStart = cellOps.size();
     bool inWindow = true;
+    // EVERY TARGET MUST BE AIR. The ops below are kCellOpIfAir and
+    // sim_mutate.wgsl drops one that lands on anything else -- and the body is
+    // released in this same tick, so a dropped op is a lost voxel. Support
+    // above is judged only from the cell UNDER each voxel; a body resting on a
+    // lake bed is "supported" by the bed while every cell it occupies is
+    // water. So read each target from the same mirror the support test reads
+    // and hold the settle (no wake, no counter reset: re-tested in 30 ticks
+    // like any other refusal) if one is not air or cannot be seen yet.
+    bool targetsClear = true;
     std::vector<std::pair<IVec3, uint32_t>> written;
     written.reserve(totalOps);
     for (Member& mem : members) {
@@ -2980,6 +2989,23 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
           inWindow = false;
           break;
         }
+        {
+          const IVec3 wc = ChunkOfCell(cell.x, cell.y, cell.z);
+          const CachedChunk* cc = world.Cached(wc);
+          if (!cc || cc->voxels.size() != kChunkVol) {
+            world.RequestChunkFetch(wc, World::FetchSource::Settle);
+            targetsClear = false;
+            break;
+          }
+          const uint32_t here =
+              cc->voxels[((uint32_t)(cell.z & 15) * kChunk +
+                          (uint32_t)(cell.y & 15)) * kChunk +
+                         (uint32_t)(cell.x & 15)] & 0xFFFu;
+          if (here != 0) {
+            targetsClear = false;
+            break;
+          }
+        }
         const uint32_t mat = (uint32_t)v.payload & 0xFFFu;
         // The garment's DYE and the grid-born rule ride with the body, not
         // the voxel (DepositState): a dyed sleeve lands in its dye's tint, a
@@ -2992,9 +3018,10 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
         cellOps.push_back({World::SlotCellIndex(cell), word});
         written.push_back({cell, word});
       }
-      if (!inWindow) break;
+      if (!inWindow || !targetsClear) break;
     }
-    if (!inWindow) {
+    if (!inWindow || !targetsClear) {
+      if (inWindow) floaters_.settleTargetBlocked++;
       cellOps.resize(opsStart);
       continue;
     }

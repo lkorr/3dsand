@@ -1412,6 +1412,11 @@ class DebrisSystem {
     uint32_t deferredOversize = 0;      // oversize component held for a re-scan
     uint32_t eventQueueFullSpilled = 0; // queue full -> pendingSupport_ instead
     uint32_t settleWithoutSupport = 0;  // a settle refused for want of ground
+    // A settle held back because a cell it would stamp is not air in the
+    // mirror (water under a body on a lake bed, smoke, an unfetched chunk):
+    // sim_mutate refuses an IF_AIR op onto anything but air, so emitting it
+    // would release the body and lose those voxels. The body stays a body.
+    uint32_t settleTargetBlocked = 0;
     // An event whose chunks never arrived, spilled back to pendingSupport_
     // instead of being thrown away. In the deferral column, not the leak
     // column: the region is still resident, so the scan is late, not lost.
