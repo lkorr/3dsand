@@ -598,8 +598,9 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   **ITMS v9 (2026-10-08): the item carries its own body.** One record per
   STRAP GROUP that holds an item (`DebrisSystem::StrapGroupOf`: a dropped
   sword alone, or a helm AND the severed head it is still on): the group's
-  bodies in the `DBRS` per-body form (`SaveBodyGroup`, plus a `dead` flag the
-  section never carried) followed by each item's identity entry and which
+  bodies in the `DBRS` per-body form (`SaveBodyGroup`, plus the per-body
+  `dead` flags word that `DBRS` itself only carries since its v6, 2026-10-14)
+  followed by each item's identity entry and which
   body of the group it is. `DBRS` leaves those groups out
   (`SaveState(skipGroup)`, the registry asked as the one predicate), so no
   body is written by two sections and no record indexes another -- the v8
@@ -9136,8 +9137,12 @@ nothing; `acid projectile` coats them and eats 75 torso cells / 20.3 hp in 2 s;
 Known limits: a solid that embeds is DROPPED, not lodged (package C's embedded
 arrow slot is the natural home for a lodged stone); a scour that clears a thin
 limb inside its cap may still nick the body behind it (PierceAlongRay's walk)
-though the flight stops; a peer's ghost is struck like a local creature (the
-penetrator's limit); materials have no freeze path on a body, so an `ice`
+though the flight stops; on a peer's body the channel is routed to its owner
+(`MeleeHitKind::Pierce`), but a splash's coat and a lodged lump's coat or fire
+are NOT applied: the matter drops where it stopped, through the op stream on
+both machines (`pierce.cpp` `MatterLandsHere`; applying the coat on the owner's
+machine needs a `MeleeHit` variant carrying material, amount and radius; audit
+PJ-1, 2026-10-14); materials have no freeze path on a body, so an `ice`
 glyph would pierce and drop.
 
 ### Infection is a material (2026-10-01; `docs/PLAN_weapon_coats.md` B; `Mob::InfectStep`, `Mob::CoatInfectTick`, `MaterialDef::infect`)
@@ -22833,7 +22838,11 @@ and scale it by the magnitude. Each is stored in its march's slice-major order
 
 **The march.** On the publishing stage, after `fineLast`: `jetPrep` (one thread
 per column) finds the COVER -- a cell is covered when a horizontal face at most
-a quarter open lies anywhere above it in the box -- and packs the transfer,
+a quarter open lies anywhere above it in the box and above its own content (a
+cell's own top face counts the cell's own rows, with no height inside the cell,
+so it covers only the cells below it, and the cell itself only when it holds no
+air: ground filling most of a surface cell is not a roof over that cell; audit
+DJ-2, 2026-10-14) -- and packs the transfer,
 flags and face coefficients slice-major; `jets` is one 1,024-thread group per
 direction walking the 64 slices. The carried quantity is the jet's FORWARD
 momentum flux: C = (1 - decay) x sqrt(sum of w x k x J.fwd^2) over the cell
@@ -28594,7 +28603,11 @@ connected, phase N moves World's gas queue into the batch before `PushLocal`
 and hands the merged batch's gas back to the queue after the merge, where
 `SubmitTick` drains and records it as before (gate `ops-exchange` H).
 Single-player is D = 0, `gas` stays empty, and it is byte-identical to the
-oracle.
+oracle. Wind primitives are exchanged since 2026-10-14 (`OpBatch::winds`,
+`kOpsWireVersion` 3): connected, `SpawnWindPrim` stages a spell's or a
+creature's gust on the batch and phase N spawns the merged list with
+`spawnTick` = the label tick on both machines; single-player spawns at once and
+`winds` stays empty. The dev panel's fan is local (audit DET-8).
 
 **M9.4 — entities are owned by the nearest resident player (2026-09-21;
 `src/net/authority.*`, `src/net/entitysync.*`, `mob.*`, `debris.*`).** Ownership is
