@@ -3278,11 +3278,11 @@ void ProbeCell(GpuContext& ctx, World& world,
   for (uint32_t w : chunk) nonAir += (w & 0xFFFu) != 0;
   const uint32_t here = chunk[World::SlotCellIndex(c) - slot * kChunkVol] & 0xFFFu;
   std::printf("    probe %-12s cell (%d,%d,%d) = %s | chunk (%d,%d,%d) slot %u: "
-              "page table %s, occupancy nonAir %u rayBlockers %u, readback "
+              "page table %s, occupancy nonAir %u anyRayBlocker %u, readback "
               "nonAir %u\n",
               label, c.x, c.y, c.z,
               here < mats.size() ? mats[here].name.c_str() : "?", wc.x, wc.y,
-              wc.z, slot, pt, occ[slot] & 0xFFFFu, occ[slot] >> 16, nonAir);
+              wc.z, slot, pt, occ[slot] & 0xFFFFu, (occ[slot] >> 16) & 1u, nonAir);
 }
 
 // Scoring radii, in voxels. Meadow 8 m: the frame is grass at 0-20 m, and 8 m

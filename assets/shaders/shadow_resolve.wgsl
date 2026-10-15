@@ -541,7 +541,7 @@ fn prepare() {
   atomicStore(&shadowReq[2], raw);
   atomicStore(&shadowReq[3], select(0u, raw - SHADOW_REQ_CAP, raw > SHADOW_REQ_CAP));
   atomicStore(&shadowReq[0], 0u);
-  shadowArgs[0] = (n + 63u) / 64u;
+  shadowArgs[0] = (n + RESOLVE_WG - 1u) / RESOLVE_WG;
   shadowArgs[1] = 1u;
   shadowArgs[2] = 1u;
 }
@@ -727,10 +727,21 @@ fn farGather(level : u32, hp : vec3f, n : vec3f, face : u32) -> vec3f {
   // far bounce mean 26.2 -> 8.5 against the near's 11.0 (encoded x4). Outside
   // the window no near grid exists, and the cascade march stays.
   if (inWindow(vec3<i32>(floor(hp)), R.origin)) {
-    for (var r = 0u; r < 9u; r++) { e += giGatherRay(hp, n, face, r); }
+    // Mask loops (2026-10-15, perf): a counted loop of constant trip is
+    // unrolled by the driver, nine copies of a DDA in a kernel whose binary
+    // was 205 KB. Same rays, same order.
+    var mi = 0x1FFu;
+    while (mi != 0u) {
+      let r = firstTrailingBit(mi);
+      mi &= mi - 1u;
+      e += giGatherRay(hp, n, face, r);
+    }
     return e;
   }
-  for (var r = 0u; r < 9u; r++) {
+  var m9 = 0x1FFu;
+  while (m9 != 0u) {
+    let r = firstTrailingBit(m9);
+    m9 &= m9 - 1u;
     let su = select(select(0.0, 1.0, r == 1u || r == 5u || r == 6u), -1.0,
                     r == 2u || r == 7u || r == 8u);
     let sv = select(select(0.0, 1.0, r == 3u || r == 5u || r == 7u), -1.0,
@@ -765,18 +776,11 @@ fn farGather(level : u32, hp : vec3f, n : vec3f, face : u32) -> vec3f {
 // the riser's closed form by it. An underside keeps the closed form: the
 // ground under an overhang is not the heightfield top over it.
 const FAR_GI_FG_TAG : u32 = 2u;   // raymarch.wgsl FAR_GI_FG_TAG agrees
-fn farForegroundLit(level : u32, hp : vec3f, L : vec3f) -> f32 {
-  let top = farColumnTop(level, hp);
-  if (top < -1e8) { return 1.0; }   // no surface-map column: the closed form as it was
-  let s = f32(1u << farCellShift(level));
-  let p = vec3f(hp.x, top + 0.05 * s, hp.z);
-  let r = farShadowTC(level, p, L, 0.0, true);
-  if (r.x >= 0.0) { return mix(1.0, shadowFromOpaqueHit(true, r.x, 0u), r.y); }
-  if (farUnderTerrain(p, L, TUNE_FAR_SHADOW_REACH / VOXEL_METERS)) {
-    return shadowFromOpaqueHit(true, TUNE_FAR_SHADOW_REACH / VOXEL_METERS, 0u);
-  }
-  return 1.0;
-}
+// farForegroundLit, the law: from (hp.x, the column top + 0.05 cell, hp.z),
+// the patch march's farShadowTC + farUnderTerrain law; 1 where the surface
+// map has no column (the closed form as it was). Since 2026-10-15 it is cast
+// through the patch march's own call site in resolveFarPatch (ONE MARCH CALL
+// SITE), which is the only place it lives.
 
 // ---- THE FAR GROUND'S OPENNESS, BY THE NEAR WALK'S DEFINITION ----------
 // (2026-10-14, ticket 2026-10-09_14-23-01.) The heightfield's openness is the
@@ -817,8 +821,8 @@ fn farForegroundLit(level : u32, hp : vec3f, L : vec3f) -> f32 {
 // MEDIA-BLIND, as the near walk is (isRayBlocker): clear water is no roof.
 // MUST AGREE: raymarch.wgsl farSkySolid (the feature fan's sample).
 const FAR_OPEN_REACH_V : f32 = TUNE_OPENNESS_REACH / VOXEL_METERS;
-const FAR_OPEN_W_UP : f32 = 1.0 / 3.0;
-const FAR_OPEN_W_DIAG : f32 = 1.0 / 6.0;
+// Weights: the up ray 1/3, each of the four diagonals 1/6 (farOpenByte counts
+// them in sixths).
 fn farSlotAt(level : u32, c : vec3<i32>) -> u32 {
   let bi = farVoxByteIndex(level, c);
   return farCellSlot((farVox[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu);
@@ -885,9 +889,19 @@ fn farGroundOver(level : u32, cell : vec3<i32>) -> bool {
   return false;
 }
 // The definition from `ro` (fine voxels, just off the face) on face normal
-// `ni` (an axis), 0..1.
-fn farGroundOpen(level : u32, ro : vec3f, ni : vec3<i32>) -> f32 {
-  let n = vec3f(ni);
+// `ni` (an axis), 0..1: the weighted sum of its five rays (farOpenRay), in
+// SIXTHS -- the up ray 2, each diagonal 1 -- which is what the float sum of
+// 1/3 and 1/6 was, byte for byte after the *254 + 0.5 (all 32 combinations
+// checked in float32; no sum lies within 1e-5 of a rounding edge).
+// Since 2026-10-15 the five rays are cast by whichever lanes of the
+// workgroup are free (THE HEAVY RAYS ARE SHARED, at resolve) and summed in
+// wgFanVis; farOpenByte below is that sum's byte.
+const FAR_OPEN_SIXTHS_UP : u32 = 2u;
+fn farOpenByte(sixths : u32) -> u32 {
+  return u32(clamp(f32(sixths) / 6.0, 0.0, 1.0) * 254.0 + 0.5);
+}
+// Ray `r` of the fan (0 the face normal, 1..4 the diagonals): does it see sky?
+fn farOpenRay(level : u32, ro : vec3f, ni : vec3<i32>, r : i32) -> bool {
   let t1 = select(vec3<i32>(1, 0, 0), vec3<i32>(0, 0, 1), ni.x != 0);
   let t2 = vec3<i32>(ni.y * t1.z - ni.z * t1.y, ni.z * t1.x - ni.x * t1.z,
                      ni.x * t1.y - ni.y * t1.x);
@@ -895,8 +909,7 @@ fn farGroundOpen(level : u32, ro : vec3f, ni : vec3<i32>) -> f32 {
   let s0 = f32(1u << farCellShift(level));
   let s2 = f32(1u << farCellShift(l2));
   let b2 = farBox(l2);
-  var vis = 0.0;
-  for (var r = 0; r < 5; r++) {
+  {
     var di = ni;
     if (r == 1) { di = ni + t1; } else if (r == 2) { di = ni - t1; }
     else if (r == 3) { di = ni + t2; } else if (r == 4) { di = ni - t2; }
@@ -939,9 +952,8 @@ fn farGroundOpen(level : u32, ro : vec3f, ni : vec3<i32>) -> f32 {
         cy += 1;
       }
     }
-    if (open) { vis += select(FAR_OPEN_W_DIAG, FAR_OPEN_W_UP, r == 0); }
+    return open;
   }
-  return vis;
 }
 // The patch word's openness bytes: (the ground's, the blade cards'), each
 // 0..254, or 255 when the patch is not the GROUND (a crown or trunk cell
@@ -966,20 +978,24 @@ const FAR_FEAT_SOLID : u32 = 0x40000000u;                // raymarch.wgsl agrees
 // SEAM_DBG 16 against the near grid: the old cell-diagonal feature fan read
 // the crowns ~0.7x (leaf 0.14 vs 0.19, bark 0.18 vs 0.21). 255 = not a
 // feature cell (fs keeps its closed form).
-fn farGroundOpenByte(level : u32, cell : vec3<i32>, fp : vec3f, n3 : vec3f,
-                     refined : bool) -> vec3<u32> {
+// THE PLAN (2026-10-15, perf): which of the three fans this patch needs and
+// where they start; mask 0 = none (beyond the fade, or the prefilter found
+// nothing near: every byte 255). The three fans used to be three inlined
+// calls of the fan here, cast by the patch's own lane.
+struct FarOpenPlan { mask : u32, featOnly : bool, y : vec2f };
+fn farGroundOpenPlan(level : u32, cell : vec3<i32>, fp : vec3f, n3 : vec3f,
+                     refined : bool) -> FarOpenPlan {
+  var none : FarOpenPlan;
+  none.mask = 0u;
+  none.featOnly = true;
   let s = f32(1u << farCellShift(level));
   // Past the distance fs eases the term out by (raymarch.wgsl farSkyFade:
   // FAR_SKY_FADE_END_M) nothing reads it: no fan.
-  if (length(fp - R.camPos) * VOXEL_METERS > FAR_OPEN_FADE_END_M) { return vec3<u32>(255u); }
+  if (length(fp - R.camPos) * VOXEL_METERS > FAR_OPEN_FADE_END_M) { return none; }
   let top = farColumnTop(level, fp - n3 * (0.25 * s));
-  if (top < -1e8 || !farGroundOver(level, cell)) { return vec3<u32>(255u); }
-  let ni = vec3<i32>(round(n3));
-  var f = 255u;
-  if (f32(cell.y) * s >= top - 0.01) {
-    f = u32(clamp(farGroundOpen(level, fp + n3 * 0.5, ni), 0.0, 1.0) * 254.0 + 0.5);
-  }
-  if (f32(cell.y) * s > top + s) { return vec3<u32>(255u, 255u, f); }
+  if (top < -1e8 || !farGroundOver(level, cell)) { return none; }
+  let wantF = f32(cell.y) * s >= top - 0.01;
+  let featOnly = f32(cell.y) * s > top + s;
   var ro = fp + n3 * 0.5;
   let cy = f32(cell.y) * s;
   // A refined tread starts from its sub-column's top, as the pixel on it does.
@@ -1002,29 +1018,46 @@ fn farGroundOpenByte(level : u32, cell : vec3<i32>, fp : vec3f, n3 : vec3f,
       ro.y = mix(lo, hi, clamp((fp.y - cy) / s, 0.0, 1.0));
     }
   }
-  let g = u32(clamp(farGroundOpen(level, ro, ni), 0.0, 1.0) * 254.0 + 0.5);
-  var c = g;
-  if (n3.y > 0.5) {
+  var hg = 0u;
+  if (!featOnly && n3.y > 0.5) {
     // The tallest plant of the cell's four sub-columns (farFeatCell's words:
     // height bits 8..11; a SOLID word is a stalk, not a card). Not the one
     // under the patch centre: a card pixel reads its CELL's patch for the
     // sub-patch it falls in, and measured (SEAM_DBG 19) a third of them sat
     // over a sub-column with no plant of its own, so took the ground's start.
     let q = farMap[FAR_FEAT_VEC + farMapCell(level, cell.xz)];
-    var hg = 0u;
     for (var k = 0u; k < 4u; k++) {
       let e = select(select(q.x, q.y, k == 1u), select(q.z, q.w, k == 3u), k >= 2u);
       if ((e & FAR_FEAT_SOLID) == 0u) { hg = max(hg, (e >> 8u) & 15u); }
     }
-    if (hg > 0u) {
-      let rc = vec3f(ro.x, top + 0.5 * f32(hg) + 0.5, ro.z);
-      c = u32(clamp(farGroundOpen(level, rc, ni), 0.0, 1.0) * 254.0 + 0.5);
-    }
   }
-  return vec3<u32>(g, c, f);
+  // Fan 0 = the feature face's (f, from fp + n3/2), 1 = the ground's (g, from
+  // `ro`), 2 = the cards' (c, from `ro` lifted to half the tallest plant).
+  // All three start at fp + n3/2 in x and z, so a plan is the mask and two
+  // heights; the fans are cast by the workgroup (farFanTask) and composed by
+  // farOpenCompose.
+  var p : FarOpenPlan;
+  p.mask = select(0u, 1u, wantF) | select(0u, 2u, !featOnly) | select(0u, 4u, hg > 0u);
+  p.featOnly = featOnly;
+  p.y = vec2f(ro.y, top + 0.5 * f32(hg) + 0.5);
+  return p;
+}
+// The patch word's three bytes from the plan's fan sums (sixths, by fan).
+fn farOpenCompose(plan : FarOpenPlan, six : vec3<u32>) -> vec3<u32> {
+  var b = vec3<u32>(255u);
+  if ((plan.mask & 1u) != 0u) { b.z = farOpenByte(six.x); }
+  if ((plan.mask & 2u) != 0u) { b.x = farOpenByte(six.y); }
+  if ((plan.mask & 4u) != 0u) { b.y = farOpenByte(six.z); }
+  if (plan.featOnly) { return vec3<u32>(255u, 255u, b.z); }
+  // No plant: the cards read the ground's own fan.
+  if ((plan.mask & 4u) == 0u) { b.y = b.x; }
+  return b;
 }
 
-fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
+// Returns true when the patch's word waits on its openness fans (farFinish).
+fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32,
+                   lane : u32) -> bool {
+  var pending = false;
   let level = ((packedSub >> FAR_SC_LEVEL_SHIFT) & 7u) + 1u;
   let ab = FAR_SC_AXIS_BITS;
   let tor = vec3<i32>(vec3<u32>(packedCell, packedCell >> ab, packedCell >> (2u * ab)) &
@@ -1060,16 +1093,42 @@ fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
         !isRayBlocker(materials[front])) {
       bw = 0.0;
     }
-    var sh = 0.0;
     valid = true;
-    if (bw < 1.0) {
-      let r = farShadowTC(level, hp, L, 0.0, true);
-      sh = 1.0;
-      if (r.x >= 0.0) { sh = mix(1.0, shadowFromOpaqueHit(true, r.x, 0u), r.y); }
-      else if (farUnderTerrain(hp, L, TUNE_FAR_SHADOW_REACH / VOXEL_METERS)) {
+    // Whether this resolve re-measures the patch's word (below), read up here
+    // because the riser's foreground march (farForegroundLit) shares the
+    // patch march's call site.
+    let riser = abs(n3.y) < 0.5;
+    let ver0 = shadowPatchVerifier(packedCell, packedSub);
+    let old0 = atomicLoad(&shadowCache[bucket * 2u + 1u]);
+    let mine = shadowStateValid(old0) && shadowStateVerifier(old0) == ver0;
+    let due = !mine || shadowHist[bucket] == 0u ||
+              ((R.frameIdx / SHADOW_REFRESH_PERIOD + (key >> 8u)) % FAR_GI_PERIOD) == 0u;
+    // ONE MARCH CALL SITE (2026-10-15, perf: one inlined farShadowTC where
+    // there were two, in a kernel whose binary was 205 KB): march 0 is the
+    // patch's own sun from `hp`, march 1 the riser's foreground's,
+    // farForegroundLit's start and law verbatim (a riser with no surface-map
+    // column keeps 1, as farForegroundLit returned).
+    let fgTop = farColumnTop(level, hp);
+    let pFg = vec3f(hp.x, fgTop + 0.05 * s, hp.z);
+    var shK = vec2f(1.0);
+    var mk = select(0u, 1u, bw < 1.0) |
+             select(0u, 2u, due && !(bw > 0.001) && riser && fgTop > -1e8);
+    while (mk != 0u) {
+      let k = firstTrailingBit(mk);
+      mk &= mk - 1u;
+      let p = select(hp, pFg, k == 1u);
+      let r = farShadowTC(level, p, L, 0.0, true);
+      var v = 1.0;
+      if (r.x >= 0.0) { v = mix(1.0, shadowFromOpaqueHit(true, r.x, 0u), r.y); }
+      else if (farUnderTerrain(p, L, TUNE_FAR_SHADOW_REACH / VOXEL_METERS)) {
         // A CLEAR RAY UNDER THE TERRAIN IS NOT SUNLIT (above).
-        sh = shadowFromOpaqueHit(true, TUNE_FAR_SHADOW_REACH / VOXEL_METERS, 0u);
+        v = shadowFromOpaqueHit(true, TUNE_FAR_SHADOW_REACH / VOXEL_METERS, 0u);
       }
+      if (k == 0u) { shK.x = v; } else { shK.y = v; }
+    }
+    var sh = 0.0;
+    if (bw < 1.0) {
+      sh = shK.x;
       // A BLOCKER AT CONTACT IS A SHADOW, NOT "NO OPINION" (2026-10-14,
       // ticket 2026-10-14_00-52-22). This used to publish the slot INVALID
       // when the ray met a cell within 0.01 voxels of its start, after the
@@ -1086,12 +1145,6 @@ fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
     // riser foreground (FAR_GI_FG_TAG) and ground openness (farGroundOpen,
     // bits 16..23). Every patch carries one now (a tread used to keep 0).
     var giW = 0u;
-    let riser = abs(n3.y) < 0.5;
-    let ver0 = shadowPatchVerifier(packedCell, packedSub);
-    let old0 = atomicLoad(&shadowCache[bucket * 2u + 1u]);
-    let mine = shadowStateValid(old0) && shadowStateVerifier(old0) == ver0;
-    let due = !mine || shadowHist[bucket] == 0u ||
-              ((R.frameIdx / SHADOW_REFRESH_PERIOD + (key >> 8u)) % FAR_GI_PERIOD) == 0u;
     if (due) {
       if (bw > 0.001) {
         giW = packRgb9e5(farGather(level, hp, n3, face)) | 1u;
@@ -1107,29 +1160,55 @@ fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
         // the edited ground inside the handoff).
         let oldW = shadowHist[bucket];
         var ob = vec3<u32>((oldW >> 16u) & 0xFFu, (oldW >> 8u) & 0xFFu, oldW >> 24u);
+        let fgB = u32(clamp(shK.y, 0.0, 1.0) * 255.0 + 0.5);
         if (!mine || (oldW & 3u) != FAR_GI_FG_TAG || (ob.x == 255u && ob.z == 255u)) {
           let fp = shadowPatchCentre(cell, face, packedSub & 7u, (packedSub >> 3u) & 7u,
                                      FAR_SC_SUBDIV) * s;
-          ob = farGroundOpenByte(level, cell, fp, n3, (packedSub & FAR_SC_REFINED) != 0u);
+          let plan = farGroundOpenPlan(level, cell, fp, n3, (packedSub & FAR_SC_REFINED) != 0u);
+          if (plan.mask != 0u) {
+            // The fans are the workgroup's (THE HEAVY RAYS ARE SHARED); the
+            // word is composed by farFinish once they are in. The publish
+            // below does not wait for it: nothing reads this pass's
+            // shadowHist words before the dispatch ends.
+            wgFarPlan[lane] = vec4<u32>(plan.mask | select(0u, 8u, plan.featOnly),
+                                        bitcast<u32>(plan.y.x), bitcast<u32>(plan.y.y),
+                                        fgB | select(0u, 256u, riser));
+            pending = true;
+          }
+          ob = farOpenCompose(plan, vec3<u32>(0u));
         }
         // bits 8..15: a riser's foreground sun; an up face's cards' openness.
-        let fg = select(ob.y,
-                        u32(clamp(farForegroundLit(level, hp, L), 0.0, 1.0) * 255.0 + 0.5),
-                        riser);
+        let fg = select(ob.y, fgB, riser);
         giW = (ob.z << 24u) | (ob.x << 16u) | (fg << 8u) | FAR_GI_FG_TAG;
       }
     } else {
       giW = shadowHist[bucket];
     }
-    shadowHist[bucket] = giW;
+    if (!pending) { shadowHist[bucket] = giW; }
   }
   let ver = shadowPatchVerifier(packedCell, packedSub);
-  if (atomicLoad(&shadowCache[bucket * 2u]) != key) { return; }
+  if (atomicLoad(&shadowCache[bucket * 2u]) != key) { return pending; }
   let old = atomicLoad(&shadowCache[bucket * 2u + 1u]);
-  if (shadowStateVerifier(old) != ver) { return; }
+  if (shadowStateVerifier(old) != ver) { return pending; }
   atomicStore(&shadowCache[bucket * 2u + 1u],
               shadowPackState(valU, R.frameIdx & 15u, shadowStateRequested(old),
                               valid, ver));
+  return pending;
+}
+
+// The far patch's word once its fans are in: the plan and the foreground byte
+// resolveFarPatch left in wgFarPlan, the fan sums in wgFanVis.
+fn farFinish(lane : u32, bucket : u32) {
+  let w = wgFarPlan[lane];
+  var plan : FarOpenPlan;
+  plan.mask = w.x & 7u;
+  plan.featOnly = (w.x & 8u) != 0u;
+  let six = vec3<u32>(atomicLoad(&wgFanVis[lane * 3u]), atomicLoad(&wgFanVis[lane * 3u + 1u]),
+                      atomicLoad(&wgFanVis[lane * 3u + 2u]));
+  let ob = farOpenCompose(plan, six);
+  let riser = (w.w & 256u) != 0u;
+  let fg = select(ob.y, w.w & 255u, riser);
+  shadowHist[bucket] = (ob.z << 24u) | (ob.x << 16u) | (fg << 8u) | FAR_GI_FG_TAG;
 }
 
 // The order a FRESH window casts its samples in (resolve, A FRESH PATCH CASTS
@@ -1143,22 +1222,230 @@ fn shadowFreshOrder(k : u32) -> u32 {
   return select(j, j + 1u, j >= 11u);
 }
 
-// resolve: one media-blind shadow ray per requested patch.
-@compute @workgroup_size(64)
-fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
-  let n = atomicLoad(&shadowReq[1]);
-  if (gid.x >= n) { return; }
+// ======================= THE HEAVY RAYS ARE SHARED (2026-10-15, perf) =======
+// WHAT THIS FIXES. A request used to be one lane's whole job, and a warp runs
+// for its slowest lane. Most requests are one ray (a valid near patch's
+// window sample) or one cheap march (a valid far patch), but two kinds are
+// long: a FRESH near window in a penumbra casts all sixteen samples (A FRESH
+// PATCH CASTS ITS WHOLE WINDOW), and a FRESH far patch casts up to three
+// openness fans of five rays each (THE FAR GROUND'S OPENNESS). They are rare
+// -- on the 12-10-09 ticket flight ~110 sixteen-ray windows and ~3,600 fresh
+// far patches a frame among ~41,000 requests -- but nearly every warp held
+// one, so nearly every warp ran as long as it. Measured on that flight
+// (attribution arms, one exe, exclusive): capping the sixteen at the three
+// probes took 0.61 ms off a 1.85 ms pass, skipping the fans 0.44 ms.
+//
+// So the RAYS are the unit of work, not the request. The workgroup is one
+// warp (32 lanes). Each lane reads its request and does the request's own
+// bookkeeping, but the rays it needs go into the group's task list
+// (stageTask), and every lane takes tasks from the list in turn -- a
+// sixteen-ray window becomes one ray on each of sixteen lanes. A window's
+// later steps depend on its first rays (the probes decide whether the other
+// thirteen are needed), so the group runs in ROUNDS: cast the round's tasks,
+// barrier, each owner reads its results and either finishes (nearFinish /
+// farFinish) or queues its next rays. Two rounds cover the longest chain
+// (centre + probes -> the thirteen). A task's results go back through workgroup
+// memory: the sample bits (wgSun), the centre ray's lift and burial
+// (wgRay0), a fan's ray count in sixths (wgFanVis).
+//
+// THE ANSWERS ARE THE SAME. Every ray is the ray the owner would have cast
+// (same origin, direction, march; the origin is recomputed from the request
+// by the same expressions), every bit lands where the owner's loop put it,
+// and a fan's byte is the same byte (farOpenByte). Only who casts it moved.
+// A task list overflowing COOP_CAP keeps the excess with its owner, which
+// casts it itself in the same loop.
+const RESOLVE_WG : u32 = 32u;
+const COOP_CAP : u32 = 128u;
+var<workgroup> wgTaskN : array<atomic<u32>, 2>;
+var<workgroup> wgTaskA : array<u32, COOP_CAP>;
+var<workgroup> wgTaskB : array<u32, COOP_CAP>;
+var<workgroup> wgSun : array<atomic<u32>, RESOLVE_WG>;
+var<workgroup> wgRay0 : array<u32, RESOLVE_WG>;
+var<workgroup> wgFanVis : array<atomic<u32>, 96>;          // RESOLVE_WG x 3 fans
+var<workgroup> wgFarPlan : array<vec4<u32>, RESOLVE_WG>;   // resolveFarPatch / farFinish
 
-  let base = SHADOW_REQ_HEADER + gid.x * SHADOW_REQ_WORDS;
-  let key = atomicLoad(&shadowReq[base]);
-  let bucket = atomicLoad(&shadowReq[base + 1u]);
-  let packedCell = atomicLoad(&shadowReq[base + 2u]);
-  let packedSub = atomicLoad(&shadowReq[base + 3u]);
-  if ((packedSub & FAR_SC_FLAG) != 0u) {
-    resolveFarPatch(key, bucket, packedCell, packedSub);
-    return;
+// A task word: the owner lane (bits 0..4), then for a near ray the sample
+// (5..8), TASK_CENTRE (the undeflected ray, which owns the lift) and
+// TASK_BURIEDRAY (the ray the burial test reads); for a fan ray TASK_FAR, the
+// fan (5..6) and the ray (7..9).
+const TASK_FAR : u32 = 0x80000000u;
+const TASK_CENTRE : u32 = 0x200u;
+const TASK_BURIEDRAY : u32 = 0x400u;
+// A lane's stage: what its queued rays are, i.e. what it reads next.
+const ST_DONE : u32 = 0u;
+const ST_SINGLE : u32 = 1u;     // a valid window: one sample (aux: sample | centre << 4)
+const ST_FRESH : u32 = 2u;      // a fresh window: the centre and the two rim probes
+const ST_FULL : u32 = 3u;       // a window in a penumbra: the other thirteen
+const ST_FAR : u32 = 4u;        // a far patch's openness fans (aux: the fan mask)
+const SC_PROBE_BITS : u32 = 0x8801u;   // samples 0, 11, 15 (shadowFreshOrder 0..2)
+
+fn stageTaskCount(stage : u32, aux : u32) -> u32 {
+  switch (stage) {
+    case ST_SINGLE: { return 1u; }
+    case ST_FRESH: { return 3u; }
+    case ST_FULL: { return 13u; }
+    case ST_FAR: { return 5u * countOneBits(aux & 7u); }
+    default: { return 0u; }
   }
+}
+// The j-th ray of a lane's stage.
+fn stageTask(stage : u32, lane : u32, aux : u32, j : u32) -> u32 {
+  switch (stage) {
+    case ST_SINGLE: {
+      return lane | ((aux & 15u) << 5u) | select(0u, TASK_CENTRE, (aux & 16u) != 0u) |
+             TASK_BURIEDRAY;
+    }
+    case ST_FRESH: {
+      return lane | (shadowFreshOrder(j) << 5u) |
+             select(0u, TASK_CENTRE | TASK_BURIEDRAY, j == 0u);
+    }
+    case ST_FULL: { return lane | (shadowFreshOrder(j + 3u) << 5u); }
+    default: {
+      // ST_FAR: fan = the (j / 5)-th set bit of the mask, ray = j % 5.
+      var m = aux & 7u;
+      for (var q = 0u; q < j / 5u; q++) { m &= m - 1u; }
+      return TASK_FAR | lane | (firstTrailingBit(m) << 5u) | ((j % 5u) << 7u);
+    }
+  }
+}
+// Queue a lane's stage on `list`; returns how many went in (the rest are the
+// owner's to cast itself, from that index on).
+fn pushTasks(list : u32, stage : u32, lane : u32, aux : u32) -> u32 {
+  let n = stageTaskCount(stage, aux);
+  let b = atomicAdd(&wgTaskN[list], n);
+  var j = 0u;
+  while (j < n && b + j < COOP_CAP) {
+    let t = stageTask(stage, lane, aux, j);
+    if (list == 0u) { wgTaskA[b + j] = t; } else { wgTaskB[b + j] = t; }
+    j += 1u;
+  }
+  return j;
+}
 
+// A lane's request state across the rounds.
+struct ReqSt {
+  stage : u32,
+  aux : u32,
+  hist : u32,    // the window: sample bits 0..15, the lift byte at SHADOW_LIFT_SHIFT
+  fill : u32,
+  flags : u32,   // ST_F_*
+  old0 : u32,    // the slot's state word before this resolve (the glide reads it)
+  bucket : u32,
+};
+const ST_F_FRESH : u32 = 1u;
+const ST_F_WASFULL : u32 = 2u;
+const ST_F_BURIED : u32 = 4u;
+
+fn reqWord(r : u32, w : u32) -> u32 {
+  return atomicLoad(&shadowReq[SHADOW_REQ_HEADER + r * SHADOW_REQ_WORDS + w]);
+}
+
+// resolve: the requested patches, one request per lane, their rays shared.
+@compute @workgroup_size(32)
+fn resolve(@builtin(local_invocation_index) li : u32,
+           @builtin(workgroup_id) wid3 : vec3<u32>) {
+  let wid = wid3.x;
+  let n = atomicLoad(&shadowReq[1]);
+  if (li < 2u) { atomicStore(&wgTaskN[li], 0u); }
+  atomicStore(&wgSun[li], 0u);
+  wgRay0[li] = 0u;
+  atomicStore(&wgFanVis[li * 3u], 0u);
+  atomicStore(&wgFanVis[li * 3u + 1u], 0u);
+  atomicStore(&wgFanVis[li * 3u + 2u], 0u);
+  workgroupBarrier();
+  let r0 = wid * RESOLVE_WG + li;
+  var st : ReqSt;
+  st.stage = ST_DONE;
+  if (r0 < n) {
+    let key = reqWord(r0, 0u);
+    let bucket = reqWord(r0, 1u);
+    let packedCell = reqWord(r0, 2u);
+    let packedSub = reqWord(r0, 3u);
+    if ((packedSub & FAR_SC_FLAG) != 0u) {
+      if (resolveFarPatch(key, bucket, packedCell, packedSub, li)) {
+        st.stage = ST_FAR;
+        st.aux = wgFarPlan[li].x & 7u;
+        st.bucket = bucket;
+      }
+    } else {
+      st = nearBegin(key, bucket, packedCell, packedSub);
+    }
+  }
+  var own0 = 0u;
+  var ownN = 0u;
+  if (st.stage != ST_DONE) {
+    own0 = pushTasks(0u, st.stage, li, st.aux);
+    ownN = stageTaskCount(st.stage, st.aux);
+  }
+  for (var round = 0u; round < 2u; round++) {
+    workgroupBarrier();
+    let list = round & 1u;
+    let cnt = min(atomicLoad(&wgTaskN[list]), COOP_CAP);
+    var i = li;
+    var j = own0;
+    loop {
+      var t = 0u;
+      if (i < cnt) {
+        t = select(wgTaskB[i], wgTaskA[i], list == 0u);
+        i += RESOLVE_WG;
+      } else if (j < ownN) {
+        t = stageTask(st.stage, li, st.aux, j);
+        j += 1u;
+      } else {
+        break;
+      }
+      runTask(t, wid);
+    }
+    workgroupBarrier();
+    // This list is refilled two rounds on; the next round's is the other one.
+    if (li == 0u) { atomicStore(&wgTaskN[list], 0u); }
+    own0 = 0u;
+    ownN = 0u;
+    if (st.stage != ST_DONE) {
+      st = resolveStep(st, li, r0);
+      if (st.stage != ST_DONE) {
+        own0 = pushTasks(1u - list, st.stage, li, st.aux);
+        ownN = stageTaskCount(st.stage, st.aux);
+      }
+    }
+  }
+}
+
+fn runTask(t : u32, wid : u32) {
+  let o = t & 31u;
+  let r = wid * RESOLVE_WG + o;
+  let packedCell = reqWord(r, 2u);
+  let packedSub = reqWord(r, 3u);
+  if ((t & TASK_FAR) != 0u) { farFanTask(t, o, packedCell, packedSub); }
+  else { nearRayTask(t, o, packedCell, packedSub); }
+}
+
+// One ray of a far patch's openness fan (farGroundOpenPlan's starts).
+fn farFanTask(t : u32, o : u32, packedCell : u32, packedSub : u32) {
+  let level = ((packedSub >> FAR_SC_LEVEL_SHIFT) & 7u) + 1u;
+  let ab = FAR_SC_AXIS_BITS;
+  let tor = vec3<i32>(vec3<u32>(packedCell, packedCell >> ab, packedCell >> (2u * ab)) &
+                      vec3<u32>(FAR_N - 1u));
+  let face = (packedCell >> (3u * ab)) & 7u;
+  let box = farBox(level);
+  let cell = box.lo + ((tor - box.lo) & vec3<i32>(i32(FAR_N) - 1));
+  let s = f32(1u << farCellShift(level));
+  let n3 = shadowFaceNormal(face);
+  let fp = shadowPatchCentre(cell, face, packedSub & 7u, (packedSub >> 3u) & 7u,
+                             FAR_SC_SUBDIV) * s;
+  let k = (t >> 5u) & 3u;
+  let r = i32((t >> 7u) & 7u);
+  var p = fp + n3 * 0.5;
+  let w = wgFarPlan[o];
+  if (k == 1u) { p.y = bitcast<f32>(w.y); } else if (k == 2u) { p.y = bitcast<f32>(w.z); }
+  if (farOpenRay(level, p, vec3<i32>(round(n3)), r)) {
+    atomicAdd(&wgFanVis[o * 3u + k], select(1u, FAR_OPEN_SIXTHS_UP, r == 0));
+  }
+}
+
+// A near patch's window state before its rays: what nearBegin reads from the
+// request and the slot, and which rays its first round needs.
+fn nearBegin(key : u32, bucket : u32, packedCell : u32, packedSub : u32) -> ReqSt {
   // Reconstruct the patch's world-space centre and normal. The request stores
   // the cell TOROIDAL (9 bits per axis at WORLD_N 512), so it means the same
   // patch whether or not the window moved between the frame that queued it
@@ -1182,7 +1469,7 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   let ver = shadowPatchVerifier(packedCell, packedSub);
   let old0 = atomicLoad(&shadowCache[bucket * 2u + 1u]);
   let fresh = !shadowStateValid(old0) || shadowStateVerifier(old0) != ver;
-  var hist = select(shadowHist[bucket], 0u, fresh);
+  let hist = select(shadowHist[bucket], 0u, fresh);
   var fill = (hist >> SHADOW_FILL_SHIFT) & SHADOW_FILL_MASK;
   // Read BEFORE the increment below: the glide may only run once the window is
   // a full window. While it is filling, the divisor itself is changing, so the
@@ -1209,8 +1496,6 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   // contact black). A single fixed ray means the byte settles and STAYS, which
   // is what keeps a static scene's published value bit-stable frame to frame.
   let centre = fresh || slotIdx == 0u;
-  let rot = f32(shadowPatchKey(packedCell, packedSub) & 0xFFFFu) * (1.0 / 65536.0);
-  let L = keyLightDirP(R);
 
   // ---- A FRESH PATCH CASTS ITS WHOLE WINDOW (2026-10-13) ------------------
   // (ticket 2026-10-13_09-57-09: "very thin 1-pixel circles and lines ... they
@@ -1237,10 +1522,33 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   // penumbra, casts all sixteen. Measured at the ticket camera walking
   // (1324x1128): shadow_resolve mean 0.25 ms a frame before, 0.55 with all
   // sixteen on every fresh patch, see DESIGN.md 9.s for the shipped number.
-  // One loop, one call site: the single-ray resolve is the same loop with a
-  // count of one.
-  let nCast = select(1u, SHADOW_SAMPLES, fresh && SHADOW_CONE_TAN > 0.0);
-  var probeSeen = 0u;   // fresh windows: how many of the first three saw the sun
+  // The rays are the workgroup's (THE HEAVY RAYS ARE SHARED): a valid window
+  // queues its one sample, a fresh one its centre and probes, and resolveStep
+  // takes it from there.
+  var st : ReqSt;
+  st.hist = hist;
+  st.fill = fill;
+  st.flags = select(0u, ST_F_FRESH, fresh) | select(0u, ST_F_WASFULL, wasFull);
+  st.old0 = old0;
+  st.bucket = bucket;
+  if (fresh && SHADOW_CONE_TAN > 0.0) {
+    st.stage = ST_FRESH;
+  } else {
+    st.stage = ST_SINGLE;
+    st.aux = slotIdx | select(0u, 16u, centre);
+  }
+  return st;
+}
+
+// One near window sample, cast by any lane for its owner `o`: the ray the
+// owner's loop cast (same origin, same direction), its bit into wgSun, and --
+// from the centre / burial ray -- the lift and the burial into wgRay0.
+fn nearRayTask(t : u32, o : u32, packedCell : u32, packedSub : u32) {
+  let cell = shadowUnwrapCell(packedCell, R.origin * i32(CHUNK));
+  let face = (packedCell >> (WORLD_SHIFT * 3u)) & 7u;
+  let hp = shadowPatchCentre(cell, face, packedSub & 7u, (packedSub >> 3u) & 7u,
+                             R.shadowSubdiv);
+  let n3 = shadowFaceNormal(face);
   // shadowCoarseFromT() is `coarseFromT` (W2-B): past that distance the march
   // terminates on the 4^3 blockers mask instead of the voxel. It MUST be the
   // same expression sunShadowAt passes — the gate casts this ray and that one
@@ -1249,126 +1557,189 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   // how a function in common.wgsl reaches bindings declared after it (see
   // traceOpaque).
   let ro = hp + n3 * TUNE_SHADOW_BIAS;
-  var buried = false;
-  var liftB = (hist >> SHADOW_LIFT_SHIFT) & 0xFFu;
-  for (var k = 0u; k < nCast; k++) {
-    // The sample this ray is: this frame's on the ordinary resolve, every one
-    // in turn on a fresh window's (sample 0 is the undeflected centre ray).
-    let idx = select(slotIdx, shadowFreshOrder(k), nCast > 1u);
-    let isCentre = select(centre, k == 0u, nCast > 1u);
-    let dir = select(shadowConeDir(L, idx, rot), L, isCentre);
-    let s = traceOpaque(ro, dir, TUNE_SHADOW_STEPS, shadowCoarseFromT(),
-                        &occupancy, &materials);
-    // A BURIED PATCH HAS NO OPINION. The ray starts TUNE_SHADOW_BIAS off the
-    // face; a hit within a twentieth of a voxel of that means the cell in front
-    // of the patch is itself solid — the patch is not a surface anyone can see,
-    // it is the top face of the block UNDER a terrace step, or the side face
-    // of one INSIDE the hill. No pixel is ever on such a patch, but the reader's
-    // bilinear taps roll into the neighbour cell's same face past a face edge
-    // (raymarch.wgsl shadowCached), and at every step of a terraced hillside
-    // that neighbour is buried. Resolving it to a contact-black value painted a
-    // one-pixel dark line along every voxel edge of the terrain, sun or no sun
-    // — --gate shadow-cache's walk arm counted them as ~15-21k "phantom" pixels
-    // a frame, every one on a step edge. Marking the slot INVALID instead makes
-    // the tap drop out of the blend (weight 0) and the pixel shade from its own
-    // face's patches, which is the ordinary patch-quantised edge and nothing
-    // more. The slot stays claimed and live, so it is re-requested each frame
-    // (one ray that terminates in its first cell) and never reclaimed by a
-    // foreign patch mid-frame.
-    //
-    // A HIT ON THE PATCH'S OWN VOXEL IS NOT BURIAL, IT IS SELF-SHADOW (2026-10-13,
-    // ticket 2026-10-13_09-55-24: "at this specific time of day, shadows have a
-    // bunch of noise on them"). The near shade asks the cache for every face the
-    // WRAPPED diffuse lights (render.diffuseWrap 1: every face but the exact
-    // anti-sun one), so most patches on the dark side of a house are faces the
-    // sun is BEHIND. Their ray turns into the face and meets the patch's own
-    // voxel at t = shadowBias / -dot(n, dir): 0.05 or more while dot(n, L) is
-    // above -0.4, a valid contact shadow; under it, this test called the patch
-    // buried, and a pixel whose taps are all buried shades as FULL SUN. At the
-    // hour a wall's dot(n, L) sat at -0.4 the cone's sixteen samples (+-1 deg)
-    // fell either side of the line, so the wall flickered between its shadow
-    // and full sun patch by patch on a 64-frame cycle (the window), and further
-    // into the evening the whole wall was sunlit from behind. The cell in front
-    // of the patch is what burial means; the patch's own cell is a blocker at
-    // contact distance, which is exactly what sunShadowAt (the cache-off
-    // reference) answers for the same ray.
-    let selfHit = s.hit && all(s.cell == cell);
-    if (isCentre || nCast == 1u) { buried = s.hit && s.t < 0.05 && !selfHit; }
+  let rot = f32(shadowPatchKey(packedCell, packedSub) & 0xFFFFu) * (1.0 / 65536.0);
+  let L = keyLightDirP(R);
+  // The sample this ray is (the task word: stageTask), and whether it is the
+  // undeflected centre ray.
+  let idx = (t >> 5u) & 15u;
+  let isCentre = (t & TASK_CENTRE) != 0u;
+  let dir = select(shadowConeDir(L, idx, rot), L, isCentre);
+  let s = traceOpaque(ro, dir, TUNE_SHADOW_STEPS, shadowCoarseFromT(),
+                      &occupancy, &materials);
+  // A BURIED PATCH HAS NO OPINION. The ray starts TUNE_SHADOW_BIAS off the
+  // face; a hit within a twentieth of a voxel of that means the cell in front
+  // of the patch is itself solid — the patch is not a surface anyone can see,
+  // it is the top face of the block UNDER a terrace step, or the side face
+  // of one INSIDE the hill. No pixel is ever on such a patch, but the reader's
+  // bilinear taps roll into the neighbour cell's same face past a face edge
+  // (raymarch.wgsl shadowCached), and at every step of a terraced hillside
+  // that neighbour is buried. Resolving it to a contact-black value painted a
+  // one-pixel dark line along every voxel edge of the terrain, sun or no sun
+  // — --gate shadow-cache's walk arm counted them as ~15-21k "phantom" pixels
+  // a frame, every one on a step edge. Marking the slot INVALID instead makes
+  // the tap drop out of the blend (weight 0) and the pixel shade from its own
+  // face's patches, which is the ordinary patch-quantised edge and nothing
+  // more. The slot stays claimed and live, so it is re-requested each frame
+  // (one ray that terminates in its first cell) and never reclaimed by a
+  // foreign patch mid-frame.
+  //
+  // A HIT ON THE PATCH'S OWN VOXEL IS NOT BURIAL, IT IS SELF-SHADOW (2026-10-13,
+  // ticket 2026-10-13_09-55-24: "at this specific time of day, shadows have a
+  // bunch of noise on them"). The near shade asks the cache for every face the
+  // WRAPPED diffuse lights (render.diffuseWrap 1: every face but the exact
+  // anti-sun one), so most patches on the dark side of a house are faces the
+  // sun is BEHIND. Their ray turns into the face and meets the patch's own
+  // voxel at t = shadowBias / -dot(n, dir): 0.05 or more while dot(n, L) is
+  // above -0.4, a valid contact shadow; under it, this test called the patch
+  // buried, and a pixel whose taps are all buried shades as FULL SUN. At the
+  // hour a wall's dot(n, L) sat at -0.4 the cone's sixteen samples (+-1 deg)
+  // fell either side of the line, so the wall flickered between its shadow
+  // and full sun patch by patch on a 64-frame cycle (the window), and further
+  // into the evening the whole wall was sunlit from behind. The cell in front
+  // of the patch is what burial means; the patch's own cell is a blocker at
+  // contact distance, which is exactly what sunShadowAt (the cache-off
+  // reference) answers for the same ray.
+  let selfHit = s.hit && all(s.cell == cell);
+  // The ray the burial test reads: a valid window's one sample, a fresh
+  // window's centre (TASK_BURIEDRAY).
+  let buried = (t & TASK_BURIEDRAY) != 0u && s.hit && s.t < 0.05 && !selfHit;
 
-    // ---- fold this frame's verdict into the window ----
-    // `lit` is the sample's bit. RAN OUT OF STEPS counts as OCCLUDED, not as
-    // daylight: leaving the window is sky, but exhausting the budget underground
-    // is a blocker somewhere past it, and "no hit = lit" put full sun on the
-    // floor of any cave deeper than the budget reaches along the sun (2026-09-02,
-    // with block termination off: 384 fine steps = 38 m). It takes the FAR
-    // blocker's lift below, which the openness cap at the reader turns into
-    // nothing inside a cave and into the usual soft lift outdoors. Same rule in
-    // sunShadowAt (raymarch.wgsl); the gate compares them.
-    let ranOut = !s.hit && s.steps > u32(TUNE_SHADOW_STEPS);
-    // ---- past the window face (CASTERS OUTSIDE THE WINDOW, above) ----
-    // The near ray left the window clear; the cascade decides the rest. `bHit`
-    // and `bT` are the verdict and blocker distance everything below reads --
-    // the buried test above stays on the near ray alone, since a far blocker is
-    // by construction never within a twentieth of a voxel of the patch.
-    var bHit = s.hit;
-    var bT = s.t;
-    if (!s.hit && !ranOut) {
-      let tw = shadowWindowExitT(ro, dir);
-      let reachF = TUNE_FAR_SHADOW_REACH / VOXEL_METERS;
-      if (tw < reachF) {
-        let ft = farShadowT(1u, ro, dir, tw);
-        if (ft >= 0.0) { bHit = true; bT = ft; }
-      }
-      // A CLEAR RAY UNDER THE TERRAIN IS NOT SUNLIT (above): asked where the
-      // ray stopped being marched -- the reach, or the window's face for a ray
-      // that left it past the reach.
-      if (!bHit && farUnderTerrain(ro, dir, max(tw, reachF))) {
-        bHit = true;
-        bT = max(tw, reachF);
-      }
+  // ---- fold this frame's verdict into the window ----
+  // `lit` is the sample's bit. RAN OUT OF STEPS counts as OCCLUDED, not as
+  // daylight: leaving the window is sky, but exhausting the budget underground
+  // is a blocker somewhere past it, and "no hit = lit" put full sun on the
+  // floor of any cave deeper than the budget reaches along the sun (2026-09-02,
+  // with block termination off: 384 fine steps = 38 m). It takes the FAR
+  // blocker's lift below, which the openness cap at the reader turns into
+  // nothing inside a cave and into the usual soft lift outdoors. Same rule in
+  // sunShadowAt (raymarch.wgsl); the gate compares them.
+  let ranOut = !s.hit && s.steps > u32(TUNE_SHADOW_STEPS);
+  // ---- past the window face (CASTERS OUTSIDE THE WINDOW, above) ----
+  // The near ray left the window clear; the cascade decides the rest. `bHit`
+  // and `bT` are the verdict and blocker distance everything below reads --
+  // the buried test above stays on the near ray alone, since a far blocker is
+  // by construction never within a twentieth of a voxel of the patch.
+  var bHit = s.hit;
+  var bT = s.t;
+  if (!s.hit && !ranOut) {
+    let tw = shadowWindowExitT(ro, dir);
+    let reachF = TUNE_FAR_SHADOW_REACH / VOXEL_METERS;
+    if (tw < reachF) {
+      let ft = farShadowT(1u, ro, dir, tw);
+      if (ft >= 0.0) { bHit = true; bT = ft; }
     }
-    let sunSeen = !bHit && !ranOut;
-    let bit = 1u << idx;
-    hist = select(hist & ~bit, hist | bit, sunSeen);
-    if (fill < SHADOW_SAMPLES) { fill = fill + 1u; }
-    // A fresh window's first three agree: outside every penumbra, the rest of
-    // the window takes their verdict (A FRESH PATCH CASTS ITS WHOLE WINDOW).
-    // `continue` and not `break`: the lift block below is the centre ray's
-    // and has already run on k == 0.
-    if (nCast > 1u && k < 3u) {
-      probeSeen += select(0u, 1u, sunSeen);
-      if (k == 2u && (probeSeen == 0u || probeSeen == 3u)) {
-        hist = select(hist & ~SHADOW_HIST_MASK, hist | SHADOW_HIST_MASK, probeSeen == 3u);
-        fill = SHADOW_SAMPLES;
-        k = nCast;
-        continue;
-      }
-    }
-
-    // The lift this ray saw, if it is the one that owns the byte. The law is
-    // sunShadowAt's, verbatim, and must stay that way: the depth of a shadow is
-    // taken from how far the ray travelled before being blocked, so a contact
-    // shadow stays dark and a distant blocker's shadow lifts.
-    if (isCentre) {
-      var lv = 0.0;
-      if (bHit) {
-        let dM = bT * VOXEL_METERS;
-        lv = clamp(smoothstep(TUNE_SHADOW_SOFT_NEAR, TUNE_SHADOW_SOFT_FAR, dM) *
-                   TUNE_SHADOW_LIFT, 0.0, 1.0);
-      } else if (ranOut) {
-        lv = TUNE_SHADOW_LIFT;
-      } else {
-        // The centre ray is clear, so nothing is blocking the middle of the
-        // disc and only its rim can be clipped. Such a blocker is by
-        // construction a grazing one; lifting its sliver of shadow all the way
-        // to the far value would brighten the outer half of every penumbra.
-        // Contact-dark is the conservative end and the one that keeps an edge
-        // reading as an edge.
-        lv = 0.0;
-      }
-      liftB = u32(lv * 255.0 + 0.5);
+    // A CLEAR RAY UNDER THE TERRAIN IS NOT SUNLIT (above): asked where the
+    // ray stopped being marched -- the reach, or the window's face for a ray
+    // that left it past the reach.
+    if (!bHit && farUnderTerrain(ro, dir, max(tw, reachF))) {
+      bHit = true;
+      bT = max(tw, reachF);
     }
   }
+  let sunSeen = !bHit && !ranOut;
+  // The sample's bit, for its owner (resolveStep folds it into the window).
+  if (sunSeen) { atomicOr(&wgSun[o], 1u << idx); }
+
+  // The lift this ray saw, if it is the one that owns the byte. The law is
+  // sunShadowAt's, verbatim, and must stay that way: the depth of a shadow is
+  // taken from how far the ray travelled before being blocked, so a contact
+  // shadow stays dark and a distant blocker's shadow lifts.
+  var w = select(0u, 1u, buried);
+  if (isCentre) {
+    var lv = 0.0;
+    if (bHit) {
+      let dM = bT * VOXEL_METERS;
+      lv = clamp(smoothstep(TUNE_SHADOW_SOFT_NEAR, TUNE_SHADOW_SOFT_FAR, dM) *
+                 TUNE_SHADOW_LIFT, 0.0, 1.0);
+    } else if (ranOut) {
+      lv = TUNE_SHADOW_LIFT;
+    } else {
+      // The centre ray is clear, so nothing is blocking the middle of the
+      // disc and only its rim can be clipped. Such a blocker is by
+      // construction a grazing one; lifting its sliver of shadow all the way
+      // to the far value would brighten the outer half of every penumbra.
+      // Contact-dark is the conservative end and the one that keeps an edge
+      // reading as an edge.
+      lv = 0.0;
+    }
+    w |= (u32(lv * 255.0 + 0.5) << 8u) | 0x10000u;
+  }
+  // Burial and the lift for the owner: only the ray that owns them writes.
+  if ((t & (TASK_BURIEDRAY | TASK_CENTRE)) != 0u) { wgRay0[o] = w; }
+}
+
+// An owner's turn after a round: fold the round's rays into its window and
+// either finish or queue the next ones. The order is the one the owner's own
+// loop had (A FRESH PATCH CASTS ITS WHOLE WINDOW): centre + probes; three that
+// agree fill the window with their verdict; otherwise the other thirteen.
+fn resolveStep(stIn : ReqSt, lane : u32, r : u32) -> ReqSt {
+  var st = stIn;
+  if (st.stage == ST_FAR) {
+    farFinish(lane, st.bucket);
+    st.stage = ST_DONE;
+    return st;
+  }
+  let sun = atomicLoad(&wgSun[lane]);
+  let ray0 = wgRay0[lane];
+  var done = false;
+  switch (st.stage) {
+    case ST_SINGLE: {
+      let bit = 1u << (st.aux & 15u);
+      st.hist = (st.hist & ~bit) | (sun & bit);
+      st.fill = min(st.fill + 1u, SHADOW_SAMPLES);
+      done = true;
+    }
+    case ST_FRESH: {
+      st.hist = (st.hist & ~SC_PROBE_BITS) | (sun & SC_PROBE_BITS);
+      st.fill = min(st.fill + 3u, SHADOW_SAMPLES);
+      let seen = countOneBits(sun & SC_PROBE_BITS);
+      if (seen == 0u || seen == 3u) {
+        st.hist = select(st.hist & ~SHADOW_HIST_MASK, st.hist | SHADOW_HIST_MASK, seen == 3u);
+        st.fill = SHADOW_SAMPLES;
+        done = true;
+      } else {
+        st.stage = ST_FULL;
+      }
+    }
+    default: {
+      // ST_FULL: the thirteen.
+      let m13 = SHADOW_HIST_MASK & ~SC_PROBE_BITS;
+      st.hist = (st.hist & ~m13) | (sun & m13);
+      st.fill = min(st.fill + 13u, SHADOW_SAMPLES);
+      done = true;
+    }
+  }
+  // The centre / burial ray of this request was in the first round, which every
+  // stage above has seen by now; ray0 holds its burial and, from a centre, the
+  // lift.
+  if (done) {
+    if ((ray0 & 0x10000u) != 0u) {
+      st.hist = (st.hist & ~(0xFFu << SHADOW_LIFT_SHIFT)) | (((ray0 >> 8u) & 0xFFu) << SHADOW_LIFT_SHIFT);
+    }
+    if ((ray0 & 1u) != 0u) { st.flags |= ST_F_BURIED; }
+    nearFinish(st, r);
+    st.stage = ST_DONE;
+  }
+  return st;
+}
+
+// The window's published value, its deposit and the publish (the owner's).
+fn nearFinish(st : ReqSt, r : u32) {
+  let key = reqWord(r, 0u);
+  let bucket = st.bucket;
+  let packedCell = reqWord(r, 2u);
+  let packedSub = reqWord(r, 3u);
+  let cell = shadowUnwrapCell(packedCell, R.origin * i32(CHUNK));
+  let face = (packedCell >> (WORLD_SHIFT * 3u)) & 7u;
+  let n3 = shadowFaceNormal(face);
+  let ver = shadowPatchVerifier(packedCell, packedSub);
+  let fresh = (st.flags & ST_F_FRESH) != 0u;
+  let wasFull = (st.flags & ST_F_WASFULL) != 0u;
+  let buried = (st.flags & ST_F_BURIED) != 0u;
+  let old0 = st.old0;
+  let fill = st.fill;
+  let liftB = (st.hist >> SHADOW_LIFT_SHIFT) & 0xFFu;
+  var hist = st.hist;
   hist = (hist & SHADOW_HIST_MASK) | (fill << SHADOW_FILL_SHIFT) |
          (liftB << SHADOW_LIFT_SHIFT);
 

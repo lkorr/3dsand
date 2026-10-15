@@ -4649,31 +4649,41 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
       // the same camera and nothing on top of the uniform-chunk jump below,
       // so neither direction of that argument is worth a register.)
       // Gas runs take the same form, after this block (THE GAS RUN).
-      // ---- A UNIFORM CHUNK OF THE RUN'S LIQUID: crossed in ONE step (2026-10-15,
-      // frame-perf pass; ticket 2026-10-14_22-55-53's "30 fps over the lake") --
-      // The occupancy word's UNIFORM bit (common.wgsl OCC_UNIFORM_BIT, written by
-      // genChunk and sim_occupancy) says all 4,096 cells of this chunk hold ONE
-      // material+state. `marchCell`, the cell this run starts from, lies in this
-      // chunk (the per-chunk cache describes it) and holds `runKey`, so every
-      // cell of the chunk does: the per-cell loop below would walk to the chunk
-      // face adding the same opacity and tint per segment, and the segments
-      // telescope -- so the rest of the chunk is one box exit and one add, the
-      // chunk-skip jump with the run's sums. Exact up to float rounding (the
-      // jump rebuilds tMax from the face like every chunk skip; the cells and
-      // the material are the per-cell loop's). The jump is taken only when the
-      // face is nearer than both the 10 m depth cap and the march's exit, so
-      // the cell the ray stops on is still found by the per-cell loop.
-      // Coherent by construction: neighbouring pixels cross the same chunks, so
-      // a warp jumps together (a per-RAY region bound -- the surface cell's y --
-      // measured +2.8 ms on the same camera: lanes left the run at different
-      // cells). Measured (--render-budget `at` = the ticket camera, 1080p, one
-      // process): 15.77 -> 14.50 ms. The interior of a deep lake is uniform; the
-      // chunk holding the surface is not, which is what is left (PLAN_frame_perf).
+      // ---- THE CHUNK'S LIQUID SPAN: crossed in ONE step (2026-10-15, frame-perf
+      // pass; ticket 2026-10-14_22-55-53's "30 fps over the lake") --
+      // The occupancy word's LIQUID SPAN (common.wgsl occSpanLo/occSpanLen,
+      // written by genChunk, sim_occupancy and the CPU store-hit upload) says
+      // chunk-local layers [lo, lo+len) hold, in every cell, ONE full-liquid
+      // key. `marchCell`, the cell this run starts from, holds `runKey` and lies
+      // in this chunk (the per-chunk cache describes it); when its y is in the
+      // span, the span's key IS runKey, and when `cell` (the next cell, where
+      // tCur stands) is in it too, the box [chunk x/z] x [span y] holds runKey
+      // from tCur to its exit. The per-cell loop below would walk that box
+      // adding the same opacity and tint per segment, and the segments
+      // telescope -- so the box is one exit and one add, the chunk-skip jump
+      // with the run's sums. Exact up to float rounding (the jump rebuilds
+      // tMax from the face like every chunk skip; the cells and the material
+      // are the per-cell loop's). Taken only when the face is nearer than both
+      // the 10 m depth cap and the march's exit, so the cell the ray stops on
+      // is still found cell by cell. marchCell's y is rebuilt from `cell` and
+      // the step axis rather than read, so nothing new lives across the
+      // media branch above (the register cliff, PLAN_frame_perf §4).
+      // A whole-chunk span [0, 16) is the deep interior (what bit 30's UNIFORM
+      // jump crossed, 15.77 -> 14.50 ms on the ticket camera); a span [0, h)
+      // is the layer holding the surface, where grazing rays spent most of
+      // their 10 m. Coherent by construction: neighbouring pixels cross the
+      // same chunks, so a warp jumps together (a per-RAY region bound -- the
+      // surface cell's y -- measured +2.8 ms: lanes left the run at different
+      // cells). Measured: docs/PLAN_frame_perf.md §8.
+      let spY0 = (cell.y & ~i32(CHUNK_MASK)) + i32(occSpanLo(cchOcc));
+      let spY1 = spY0 + i32(occSpanLen(cchOcc));
+      let spMy = cell.y - select(0, stepv.y, axis == 1);
       if (!runGas && (cchPt & PT_SENTINEL_BIT) == 0u &&
-          all((cell >> vec3<u32>(CHUNK_SHIFT)) == cchC) && occUniform(cchOcc)) {
+          all((cell >> vec3<u32>(CHUNK_SHIFT)) == cchC) &&
+          cell.y >= spY0 && cell.y < spY1 && spMy >= spY0 && spMy < spY1) {
         let blkLo = cell & vec3<i32>(~i32(CHUNK_MASK));
-        let bl = vec3f(blkLo);
-        let bh = bl + f32(CHUNK);
+        let bl = vec3f(f32(blkLo.x), f32(spY0), f32(blkLo.z));
+        let bh = vec3f(f32(blkLo.x + i32(CHUNK)), f32(spY1), f32(blkLo.z + i32(CHUNK)));
         let ex = max((bl - ro) * inv, (bh - ro) * inv);
         let tOut = max(min(ex.x, min(ex.y, ex.z)), tCur);
         let tCapJ = tCur + (LIQ_VIS_M / VOXEL_METERS - out.liqPath);
@@ -4686,12 +4696,21 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
           rsAdd(RS_CHUNK_SKIP, 1u);
           t = tOut + 1e-4;
           p = ro + rd * t;
-          var nc = vec3<i32>(floor(p));
+          // The landing cell is the exit face's neighbour: the other two axes
+          // are CLAMPED into the box, because the 1e-4 nudge past a face near
+          // an edge of the box can carry floor(p) across a second face too --
+          // and when that second face is the span's floor, the cell below is
+          // the bed, entered with the wrong face's axis (a dark one-pixel
+          // speckle along every chunk side where a lake bed meets it; the
+          // clamp leaves tMax to take that face on the next step, as the
+          // per-cell DDA would have).
+          var nc = clamp(vec3<i32>(floor(p)), vec3<i32>(blkLo.x, spY0, blkLo.z),
+                         vec3<i32>(blkLo.x + i32(CHUNK) - 1, spY1 - 1, blkLo.z + i32(CHUNK) - 1));
           if (ex.x <= ex.y && ex.x <= ex.z) {
             nc.x = select(blkLo.x - 1, blkLo.x + i32(CHUNK), rd.x > 0.0);
             axis = 0;
           } else if (ex.y <= ex.z) {
-            nc.y = select(blkLo.y - 1, blkLo.y + i32(CHUNK), rd.y > 0.0);
+            nc.y = select(spY0 - 1, spY1, rd.y > 0.0);
             axis = 1;
           } else {
             nc.z = select(blkLo.z - 1, blkLo.z + i32(CHUNK), rd.z > 0.0);
@@ -8958,6 +8977,23 @@ fn shadowRefreshPhase(key : u32) -> u32 {
 fn shadowRefreshDue(key : u32) -> bool {
   return ((R.frameIdx + shadowRefreshPhase(key)) % SHADOW_REFRESH_PERIOD) == 0u;
 }
+// ---- A FAR PATCH BETWEEN ITS REFRESHES IS NOT FREE (2026-10-15, perf) -------
+// shadowSlotLive is "requested this frame or last", and a near patch on screen
+// re-stamps its slot every frame, so that is "on screen". A FAR patch stamps
+// only on its refresh frames (farSlotRead: one frame in SHADOW_REFRESH_PERIOD),
+// so for two frames of every four a far patch on screen read as free, and any
+// claim landing in its set took it -- the first non-live way, ahead of the
+// empty ones after it. The patch then came back FRESH: a new claim, a frame of
+// fallback, and its whole first resolve again (the march, the openness fans,
+// a buried patch's gather). Measured on the 12-10-09 ticket flight: 5.8k far
+// patches a frame resolved fresh out of ~70k on screen. So a claim also passes
+// over a VALID slot stamped within one refresh period: a patch that is being
+// read. Mod-16 like shadowSlotLive: a slot idle 16-20 frames (32-36, ...)
+// reads as held for those frames, which costs a probe, never a wrong value.
+fn shadowSlotHeld(s : u32, curFrame : u32) -> bool {
+  return shadowStateValid(s) &&
+         ((curFrame - shadowStateRequested(s)) & 15u) <= SHADOW_REFRESH_PERIOD;
+}
 
 // ---- THE FIND IS A PLAIN LOAD (2026-10-03, raymarch-far) -------------------
 // A set is 8 slots x 2 words = one 64-byte line. The find used to walk it with
@@ -9066,6 +9102,7 @@ fn shadowSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
         }
         continue;
       }
+      if (shadowSlotHeld(s, curFrame)) { continue; }
       let r = atomicCompareExchangeWeak(
           &shadowCache[b * 2u + 1u], s,
           shadowPackState(0u, 0u, curFrame, false, ver));
@@ -15674,7 +15711,7 @@ fn farSkySolid(level : u32, c : vec3<i32>, b : FarBox) -> bool {
 // THE FAR SKY FAN is not in fs any more: the ground's (2026-10-14) and the
 // features' (the same day) openness are both the near walk's DEFINITION,
 // measured once per far shadow patch in the resolve (shadow_resolve.wgsl
-// farGroundOpen / farGroundOpenByte) and read from the patch word
+// farOpenRay / farGroundOpenPlan) and read from the patch word
 // (farGiCached). farSkySolid stays for SEAM_DBG and as the resolve's twin.
 fn farSkyFade(tFine : f32) -> f32 {
   return 1.0 - smoothstep(FAR_SKY_FADE_START_M, FAR_SKY_FADE_END_M, tFine * VOXEL_METERS);
@@ -15735,7 +15772,7 @@ fn farFeatureBounce(hAbove : f32, tFine : f32, fg : f32, lobe : bool) -> f32 {
 // openness) the noon tree shadows on it lifted with it.
 //
 // So a heightfield face and a card take the near walk's DEFINITION, measured
-// over the cascade once per far patch (shadow_resolve.wgsl farGroundOpen,
+// over the cascade once per far patch (shadow_resolve.wgsl farOpenRay,
 // 2026-10-14: the face's own fan, the reach along the ray, the endpoint
 // up-march, the outer stretch as a block mask -- why each, and what it
 // measured, is there), behind a chunk-word prefilter over the fan's footprint
@@ -17469,7 +17506,7 @@ fn fs(in : VSOut) -> FSOut {
       // THE FAR GROUND'S OPENNESS IS THE PATCH'S (2026-10-14, ticket
       // 2026-10-09_14-23-01): the near walk's DEFINITION marched over the
       // cascade from the patch, once per patch per FAR_GI_PERIOD resolves
-      // (shadow_resolve.wgsl farGroundOpen). It replaces the closed form where
+      // (shadow_resolve.wgsl farOpenRay). It replaces the closed form where
       // the patch's prefilter found something standing near (byte != 255); a
       // card reads its cell's top patch, the ground's up face under it. Until
       // the patch publishes, the closed form (one frame, a borrowed word).

@@ -108,8 +108,10 @@ bash scripts/check_worldview.sh                           # tuner voxel view in 
 view: they run the real GPU worldgen and read a box back, so the World map
 page's preview pane draws actual cells instead of a column map. `--voxserve` is a stdin request loop
 because device+SPIR-V boot is ~3 s and a region is ~8 ms; `tuner_server.py` keeps
-one alive and takes the run mutex **per request**, never for the process
-lifetime. Anything C++ can assert lives in `--selftest --gate voxregion`;
+one alive and takes the GPU lock **only while a `SANDVOX_RUN_EXCLUSIVE` measurement
+is running or queued** (then as a short lease, released after 1.5 s idle or 20 s),
+never behind ordinary gates and never for the process lifetime. It boots on the
+shared `C:/sv-deps` shader caches like `run.sh`. Anything C++ can assert lives in `--selftest --gate voxregion`;
 `check_worldview.sh` covers the browser half (WebGL2, the worker, meshing, a
 pixel readback, an edit, an undo) that C++ cannot see.
 

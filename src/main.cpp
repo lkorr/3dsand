@@ -19032,6 +19032,7 @@ int main(int argc, char** argv) {
             itemstage::Look look;
             look.mats = &mats;
             look.artColors = mobs.MicroSet() ? &mobs.MicroSet()->artColors : nullptr;
+            look.artBank = sdef->prefab.artBank;
             look.dye = sst->dye;
             look.scale = sdef->scale;
             itemstage::Render(grid, *lat, scam, look, stagePixels);

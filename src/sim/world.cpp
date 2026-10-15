@@ -993,8 +993,8 @@ void World::KickReadback() {
                                                                 : 1;
           active += dirtyW[i] != 0 ? 1u : 0u;
           reasonOr |= dirtyW[i];
-          // GPU word packs [31] anyStain | [30..16] blockers | [15..0]
-          // nonAir (packOccStain, common.wgsl). Existing CPU consumers
+          // GPU word packs [31] anyStain | [25..17] liquid span | [16]
+          // anyBlocker | [15..0] nonAir (packOccStain, common.wgsl). Existing CPU consumers
           // (streaming evict, voxelTotal) want the non-air COUNT, so that
           // stays the stored value — but the STAIN FLAG is carried across
           // in its own array rather than masked away, because the page

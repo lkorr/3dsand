@@ -982,7 +982,7 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
   if (!def.prefab.artColors.empty()) {
     const std::vector<uint8_t> remap =
         MicroBodyMergeArt(micro, def.prefab.artColors, def.name, log,
-                          &def.prefab);
+                          &def.prefab, &def.prefab.artBank);
     for (PrefabModel& pm : def.prefab.models)
       for (PrefabVoxel& v : pm.voxels)
         if (v.color) v.color = remap[v.color];
@@ -2490,6 +2490,8 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
       ld.microModel = MicroBodyPack(micro, m.voxels, m.size, def.skinScale,
                                     def.name + "/" + ld.name, log,
                                     MicroBodyCutFaces(def.prefab, mi));
+      if (ld.microModel >= 0)
+        MicroBodySetArtBank(micro, (uint32_t)ld.microModel, def.prefab.artBank);
       if (ld.microModel < 0) {
         log += def.name + ": limb \"" + ld.name +
                "\" has no micro brick; the whole def is refused (" +
@@ -2528,14 +2530,16 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
   // list, so carrying one across a reload would repaint every def with the
   // previous load's colours.
   micro.artColors.clear();
-  // THE WARDROBE'S SHARE OF THE ART PALETTE (MicroBodySet::artCeiling): the
-  // cast merges up to kWardrobeArtReserve short of the full run, so the items
-  // loaded after it keep exact colours. Restored on every way out.
+  for (uint16_t& f : micro.artBankFill) f = 0;
+  // THE WARDROBE'S SHARE OF THE ART PALETTE (MicroBodySet::artBanksUsable):
+  // the cast merges into every bank but the last, so the items loaded after
+  // it keep exact colours (their dyeable weave is exact greys). Restored on
+  // every way out.
   struct CeilingGuard {
     MicroBodySet& m;
-    ~CeilingGuard() { m.artCeiling = kArtPaletteSlotsGpu; }
+    ~CeilingGuard() { m.artBanksUsable = kArtBanks; }
   } ceilingGuard{micro};
-  micro.artCeiling = kArtPaletteSlotsGpu - kWardrobeArtReserve;
+  micro.artBanksUsable = kArtBanks - 1;
   // ...and which materials the brick's stain lattice can draw a coat in (a
   // coat is drawn by its material, microbody.h). Published HERE as well as from
   // MobSystem::OnMaterialsReloaded because a set is handed to the system after
@@ -3630,6 +3634,7 @@ bool MobSystem::ServiceRising(size_t ri) {
   // colour over 60 seconds.
   uint8_t humanToTint[256] = {};
   uint8_t zombieToTint[256] = {};
+  uint8_t humanRebank[256] = {};   // living-bank byte -> undead-bank byte
   if (restoring) {
     const int wasAt = FindDef(wasDef);
     const std::vector<int16_t> recolour =
@@ -3641,20 +3646,45 @@ bool MobSystem::ServiceRising(size_t ri) {
     // one. Initialised to the LIVING colour, so the creature rises looking
     // like it did when it died; PreTick lerps the RGB toward the zombie colour
     // over kTurnTintSeconds.
+    // THE TWO BANKS (world.h kArtBanks): the captured voxels' bytes index the
+    // LIVING def's bank, the new body's bricks the UNDEAD def's. Every byte
+    // that comes across is re-found in the undead bank (humanRebank), and the
+    // dedicated tint entries are taken there too -- the bricks they paint are
+    // the undead def's.
+    const uint32_t bankH = wasAt >= 0 ? defs_[wasAt].prefab.artBank : 0u;
+    const uint32_t bankZ = defs_[at].prefab.artBank;
+    if (microSet_) {
+      for (int h = 1; h < 256; h++) {
+        const uint32_t fl = ArtFlat(bankH, (uint32_t)h);
+        if (bankH == bankZ || fl - 1 >= microSet_->artColors.size() ||
+            h > (int)microSet_->artBankFill[bankH]) {
+          humanRebank[h] = (uint8_t)h;
+          continue;
+        }
+        humanRebank[h] = MicroBodyArtInBank(*microSet_, bankZ,
+                                            microSet_->artColors[fl - 1]);
+      }
+    }
     if (!recolour.empty() && microSet_) {
       for (size_t s = 1; s < recolour.size(); s++) {
         if (recolour[s] < 0 || recolour[s] == (int16_t)s) continue;
         uint8_t hIdx = (uint8_t)s, zIdx = (uint8_t)recolour[s];
         if (hIdx == 0 || zIdx == 0) continue;
-        if ((size_t)(hIdx - 1) >= microSet_->artColors.size() ||
-            (size_t)(zIdx - 1) >= microSet_->artColors.size()) continue;
-        uint32_t hRgb = microSet_->artColors[hIdx - 1];
-        uint32_t zRgb = microSet_->artColors[zIdx - 1];
+        const uint32_t hFl = ArtFlat(bankH, hIdx), zFl = ArtFlat(bankZ, zIdx);
+        if (hFl - 1 >= microSet_->artColors.size() ||
+            zFl - 1 >= microSet_->artColors.size()) continue;
+        uint32_t hRgb = microSet_->artColors[hFl - 1];
+        uint32_t zRgb = microSet_->artColors[zFl - 1];
         if (hRgb == zRgb) continue;
-        size_t slot = microSet_->artColors.size();
-        if (slot >= kArtPaletteSlotsGpu) break;
-        microSet_->artColors.push_back(hRgb);
-        uint8_t m = (uint8_t)(slot + 1);
+        // A DEDICATED entry, never shared: its RGB lerps under this body only.
+        if (microSet_->artBankFill[bankZ] >= kArtBankSlots) break;
+        const size_t need = ((size_t)bankZ + 1) * kArtBankSlots;
+        if (microSet_->artColors.size() < need)
+          microSet_->artColors.resize(need, 0u);
+        const uint32_t inBank = microSet_->artBankFill[bankZ]++;
+        const size_t slot = (size_t)bankZ * kArtBankSlots + inBank;
+        microSet_->artColors[slot] = hRgb;
+        uint8_t m = (uint8_t)(inBank + 1);
         humanToTint[hIdx] = m;
         zombieToTint[zIdx] = m;
         now.turnTintSlots_.push_back({slot, hRgb, zRgb});
@@ -3670,10 +3700,14 @@ bool MobSystem::ServiceRising(size_t ri) {
       if (rl.voxels.empty()) continue;   // nothing left to stand up
       // Captured limbs carry human merged indices — remap to the dedicated
       // tint entries so they start at the living colour.
+      // ...and a colour that does not change still crosses into the undead
+      // def's bank.
       for (DebrisVoxel& v : rl.voxels)
-        if (v.color && humanToTint[v.color]) v.color = humanToTint[v.color];
+        if (v.color) v.color = humanToTint[v.color] ? humanToTint[v.color]
+                                                    : humanRebank[v.color];
       for (PrefabVoxel& v : rl.skinVoxels)
-        if (v.color && humanToTint[v.color]) v.color = humanToTint[v.color];
+        if (v.color) v.color = humanToTint[v.color] ? humanToTint[v.color]
+                                                    : humanRebank[v.color];
       MobLimb& L = now.limbs_[slot];
       L.hp = rl.hp;
       L.voxels = std::move(rl.voxels);
@@ -15888,7 +15922,9 @@ void Mob::LimbVoxelsToParticles(const MobLimb& limb, uint32_t physScale,
     const uint32_t nib = ((uint32_t)v.payload >> 12) & 0xFu;
     const uint32_t pstate =
         debris_ ? debris_->DepositState(DebrisSystem::kTintLimbSpray, pmat,
-                                        v.color, nib, limb.dye, false)
+                                        MicroBodyArtFlat(MicroSet(), limb.microModel,
+                                                         v.color),
+                                        nib, limb.dye, false)
                 : nib;
     s.payload = (uint16_t)(pmat | (pstate << 12));
     s.flags = 1u;  // PFLAG_ALIVE
@@ -18045,6 +18081,10 @@ uint64_t Mob::EmitCarvedFragment(const MobLimb& src, int srcLimb,
     }
     std::string log;
     int m = MicroBodyPack(*MicroSet(), mv, dims, physScale, "carve", log);
+    // The gobbet's art bytes are its limb's: they index the limb's bank.
+    if (m >= 0)
+      MicroBodySetArtBank(*MicroSet(), (uint32_t)m,
+                          MicroBodyArtBank(*MicroSet(), src.microModel));
     if (m < 0) {
       LimbVoxelsToParticles(src, physScale, part, world, spawns);
       return 0;
@@ -19328,10 +19368,16 @@ void MobSystem::RefreshArtStandIns() {
   mix(pal ? pal->size() : 0);
   if (pal)
     for (uint32_t c : *pal) mix(c);
-  if (key == artStandInKey_ && artStandIn_.size() == matGpu_.size() * 3) return;
+  // ONE TABLE PER ART BANK (world.h kArtBanks): a stand-in is a byte in the
+  // burning body's own bank, so the nearest is sought there.
+  const size_t perBank = matGpu_.size() * 3;
+  if (key == artStandInKey_ && artStandIn_.size() == perBank * kArtBanks) return;
   artStandInKey_ = key;
-  artStandIn_.assign(matGpu_.size() * 3, 0u);
+  artStandIn_.assign(perBank * kArtBanks, 0u);
   if (!pal || pal->empty()) return;
+  for (uint32_t bank = 0; bank < kArtBanks; bank++) {
+  const size_t b0 = (size_t)bank * kArtBankSlots;
+  const size_t fill = microSet_->artBankFill[bank];
   for (size_t m = 0; m < matGpu_.size(); m++) {
     if (!BurnableOf((uint32_t)m) && !AlightOf((uint32_t)m)) continue;
     const uint32_t cols[3] = {matGpu_[m].color0, matGpu_[m].color1, matGpu_[m].color2};
@@ -19341,16 +19387,17 @@ void MobSystem::RefreshArtStandIns() {
                 b = (int)((cols[k] >> 16) & 255u);
       int64_t bestD = INT64_MAX;
       size_t best = SIZE_MAX;
-      for (size_t a = 0; a < pal->size() && a < kArtPaletteSlotsGpu; a++) {
-        const uint32_t c = (*pal)[a];
+      for (size_t a = 0; a < fill && b0 + a < pal->size(); a++) {
+        const uint32_t c = (*pal)[b0 + a];
         if ((c >> 24) != 0u) continue;
         const int dr = (int)((c >> 16) & 255u) - r, dg = (int)((c >> 8) & 255u) - g,
                   db = (int)(c & 255u) - b;
         const int64_t d = (int64_t)dr * dr + (int64_t)dg * dg + (int64_t)db * db;
         if (d < bestD) { bestD = d; best = a; }
       }
-      if (best != SIZE_MAX) artStandIn_[m * 3 + k] = (uint8_t)(best + 1);
+      if (best != SIZE_MAX) artStandIn_[bank * perBank + m * 3 + k] = (uint8_t)(best + 1);
     }
+  }
   }
 }
 
@@ -19360,7 +19407,12 @@ void MobSystem::SetBurnVoxel(const BurnLimbView& v, size_t i, uint32_t into,
   uint32_t art = 0;
   if (KeepsArtInto(was, into)) {
     art = v.Art(i);
-    if (art == 0 && AlightOf(into) && !AlightOf(was) && was * 3 + 2 < artStandIn_.size()) {
+    const size_t perBank = matGpu_.size() * 3;
+    const size_t b0 = (size_t)(microSet_ && v.microModel
+                                   ? MicroBodyArtBank(*microSet_, *v.microModel)
+                                   : 0u) * perBank;
+    if (art == 0 && AlightOf(into) && !AlightOf(was) && was * 3 + 2 < perBank &&
+        b0 + perBank <= artStandIn_.size()) {
       // The variant it was DRAWN in: the micro path picks it by brick cell
       // (microbody.wgsl paletteJitter(mat, c.x*7 + c.y*13 + c.z*29)), the
       // cube path by the stored one (debris.wgsl paletteColor).
@@ -19369,7 +19421,7 @@ void MobSystem::SetBurnVoxel(const BurnLimbView& v, size_t i, uint32_t into,
         const IVec3 p = v.At(i);
         shown = (uint32_t)(p.x * 7 + p.y * 13 + p.z * 29) % 3u;
       }
-      art = artStandIn_[was * 3 + std::min(shown, 2u)];
+      art = artStandIn_[b0 + was * 3 + std::min(shown, 2u)];
     }
   }
   v.SetWord(i, (into & 0xFFFu) | ((variant & 3u) << 12), art);
@@ -20428,7 +20480,11 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             // screen (KeepsArtInto): its ash, smoke and fire are the fire's,
             // as they were when ignition cleared the slot.
             : v.gridState ? v.gridState(v.gridStateCtx, pm,
-                                        AlightOf(was) ? 0u : v.Art(i), jitter)
+                                        AlightOf(was) ? 0u
+                                        : MicroBodyArtFlat(microSet_,
+                                              v.microModel ? *v.microModel : -1,
+                                              v.Art(i)),
+                                        jitter)
                           : jitter;
         // A POWDER product lands as the grains this sub-voxel is worth, not
         // as a whole cell (docs/PLAN_powder_mass.md §5): at skinScale 2 one
@@ -34127,6 +34183,10 @@ int Mob::AppendWornShell(const ItemDef& item, const ItemCover& cover,
     // cells without moving a plane.
     const int own = MicroBodyPack(*MicroSet(), shellVox, shellSize, itemScale,
                                   "fit/" + ld.name, log, cover.cutFaces);
+    // Resampled, not recoloured: the shell keeps the item's art bank.
+    if (own >= 0)
+      MicroBodySetArtBank(*MicroSet(), (uint32_t)own,
+                          MicroBodyArtBank(*MicroSet(), cover.microModel));
     if (own >= 0) {
       p.microModel = own;
       ld.microModel = own;

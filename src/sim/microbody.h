@@ -291,10 +291,14 @@ struct MicroBodySet {
   // material table — so the merge has to happen where the models are pooled,
   // which is here. Render-only, exactly like the pool itself.
   //
-  // Packed 0x00RRGGBB. Entry i is stored in a voxel's art byte as i + 1 and
-  // read back by the shaders as materials[ART_PALETTE_BASE + i]. Bounded by
-  // kArtPaletteSlotsGpu (world.h) = 255, the 1-based ceiling of that byte.
+  // Packed 0x00RRGGBB, FLAT across the BANKS (world.h kArtBanks): bank b's
+  // entry i is artColors[b * kArtBankSlots + i], stored in a voxel's art byte
+  // as i + 1 and read by the shaders at materials[ART_PALETTE_BASE + b *
+  // ART_BANK_SLOTS + i]. A byte means nothing without its model's bank
+  // (MicroBodyArtBank / MicroBodyArtFlat). Entries past a bank's fill are 0.
   std::vector<uint32_t> artColors;
+  // How many entries of each bank are taken.
+  uint16_t artBankFill[kArtBanks] = {};
   // HOW FAR A MERGE MAY GROW artColors before it takes the NEAREST merged
   // colour instead (MicroBodyMergeArt). The full run except while the CAST
   // loads: LoadMobDefs holds it kWardrobeArtReserve short, so the wardrobe
@@ -303,7 +307,9 @@ struct MicroBodySet {
   // nearest match would tint every garment. The cast grows every week (the
   // robot races filled the run on 2026-10-02); the wardrobe is shared by all
   // of it.
-  size_t artCeiling = kArtPaletteSlotsGpu;
+  // (Since the banks, 2026-10-15: a COUNT OF BANKS the merge may use. The
+  // cast is held one short so the wardrobe has a bank of its own.)
+  uint32_t artBanksUsable = kArtBanks;
 
   // ---- which materials a body coat can be drawn in -------------------------
   //
@@ -351,11 +357,47 @@ void MicroBodySetCoatLooks(MicroBodySet& set, std::vector<uint8_t> drawsCoat,
 // entries on 187 colours anybody could see (measured 2026-09-27), so a new
 // painted item overflowed the palette and fell back to its material colour.
 // An unused slot's remap entry stays 0, which no voxel reads.
+//
+// THE BANK (2026-10-15): every colour of the prefab goes into ONE bank -- the
+// first whose free entries hold the colours it does not already have (exact,
+// or within kArtMergeNear) -- and that bank is returned through `bankOut`.
+// Only when no bank has room does a colour take the nearest one in the bank
+// with the most room (reported, as before). The caller gives the bank to every
+// brick it packs from this prefab (MicroBodySetArtBank) and keeps it beside
+// the voxels (Prefab::artBank).
 std::vector<uint8_t> MicroBodyMergeArt(MicroBodySet& set,
                                        const std::vector<uint32_t>& artColors,
                                        const std::string& label,
                                        std::string& log,
-                                       const Prefab* paintedBy = nullptr);
+                                       const Prefab* paintedBy = nullptr,
+                                       uint32_t* bankOut = nullptr);
+
+// ---- the art bank of a model ------------------------------------------------
+// Stored in MicroBodyModelGpu::cutFaces bits 8..15 (the joint mask is bits
+// 0..5), so it travels with every copy of the record: an owned clone, a COW
+// edit, a severed limb. A byte read off a brick is an index into that bank.
+void MicroBodySetArtBank(MicroBodySet& set, uint32_t model, uint32_t bank);
+uint32_t MicroBodyArtBank(const MicroBodySet& set, int64_t model);
+// A voxel's art byte as a FLAT index into set.artColors, 1-based (0 stays 0,
+// unpainted): `bank * kArtBankSlots + art`. What every CPU reader that turns
+// a byte into a colour must use.
+inline uint32_t ArtFlat(uint32_t bank, uint32_t art) {
+  return art ? bank * kArtBankSlots + art : 0u;
+}
+// How many merged colours are taken, over every bank (artColors.size() is the
+// flat extent, a whole bank at a time).
+inline size_t MicroBodyArtUsed(const MicroBodySet& set) {
+  size_t n = 0;
+  for (uint16_t f : set.artBankFill) n += f;
+  return n;
+}
+inline uint32_t MicroBodyArtFlat(const MicroBodySet* set, int64_t model,
+                                 uint32_t art) {
+  return set ? ArtFlat(MicroBodyArtBank(*set, model), art) : art;
+}
+// Find (exact, or within kArtMergeNear) or add `rgb` in `bank`; when the bank
+// is full, the nearest colour in it. Returns the 1-based index within the bank.
+uint8_t MicroBodyArtInBank(MicroBodySet& set, uint32_t bank, uint32_t rgb);
 
 // Packs one limb's voxel model into `set` and returns its model index, or -1 on
 // failure (pool full, out-of-range material, empty model). `voxels` are in

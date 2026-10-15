@@ -247,6 +247,64 @@ var toasts = [], dirt = [];
     say(host.querySelectorAll('.lcell.bad').length === 0,
         'no litter cell failed the structural asserts');
 
+    mark('5b. the old/fine face toggle');
+    // ---- 5b. the old/fine face toggle (breed.js flipFaces) -----------------
+    // Every preview flips between the fine human face and the old one; the
+    // still preview (no idle sway) makes the before/after a pixel compare.
+    st.animate = false;
+    breed.__test.render();
+    var pv = function(){ return host.querySelector('.prev canvas').toDataURL(); };
+    var newShot = pv();
+    var fbtn = host.querySelector('button.oldface');
+    say(!!fbtn && /new/.test(fbtn.textContent),
+        'the faces toggle is on the page, showing the new faces',
+        fbtn ? fbtn.textContent : 'no button');
+    if (fbtn) fbtn.click();
+    say(st.oldFaces === true, 'clicking it shows the old faces');
+    say(pv() !== newShot, 'the old face draws differently from the new one');
+    say(!!host.querySelector('.oldbanner'), 'and the page says the old faces are showing');
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: '`', bubbles: true }));
+    say(st.oldFaces === false, 'the ` key flips back');
+    say(pv() === newShot, 'back to the identical new face');
+    // The new face's detail is drawn as itself: the eye whites' colour is on
+    // the canvas (flattened to the skin it would not be).
+    var wctx = host.querySelector('.prev canvas').getContext('2d');
+    var wd = wctx.getImageData(0, 0, wctx.canvas.width, wctx.canvas.height).data;
+    var whiteSeen = false;
+    for (var wi = 0; wi < wd.length; wi += 4)
+      if (wd[wi + 3] && Math.abs(wd[wi] - wd[wi + 1]) < 12 && wd[wi] > 150 &&
+          Math.abs(wd[wi + 1] - wd[wi + 2]) < 20) { whiteSeen = true; break; }
+    say(whiteSeen, 'the preview draws the eye whites in their own colour');
+    st.animate = true;
+    // The EYES tab: every eye row, then the eyebrows under a divider (no
+    // eyebrows tab of their own); the ears have a tab.
+    var tabNames = [].map.call(host.querySelectorAll('.gtab'),
+                               function(b){ return b.textContent; });
+    say(tabNames.indexOf('eyes') >= 0 && tabNames.indexOf('ears') >= 0 &&
+        tabNames.indexOf('eyebrows') < 0,
+        'there are eyes and ears tabs and no eyebrows tab', tabNames.join(','));
+    st.geneTab = 'eyes';
+    breed.__test.render();
+    var sub = host.querySelector('.genes .gsub');
+    say(!!sub && /eyebrows/.test(sub.textContent),
+        'the eyes tab carries the eyebrows as a sub-section');
+    var eyeRows = [].map.call(host.querySelectorAll('.genes .grow'),
+                              function(r){ return r.title || ''; }).join('\n');
+    say(/face\.eyeStyle/.test(eyeRows) && /face\.lashTone/.test(eyeRows) &&
+        /face\.browThick/.test(eyeRows) && /colors\.lash/.test(eyeRows),
+        'the eyes tab has the style, lash opacity, brow and lash colour rows');
+    // LASH OPACITY is a ramp, not a switch: three settings, three previews.
+    st.animate = false;
+    var lashShots = [0.3, 0.6, 1].map(function(t){
+      breed.__test.set('face.lashTone', t);
+      return host.querySelector('.prev canvas').toDataURL();
+    });
+    say(lashShots[0] !== lashShots[1] && lashShots[1] !== lashShots[2],
+        'lash opacity 0.3 / 0.6 / 1 draw three different previews');
+    breed.__test.set('face.lashTone', 0.7);
+    st.animate = true;
+    st.geneTab = 'body';
+
     mark('6. a slider edit reaches the preview');
     // ---- 6. a slider edit reaches the preview ----------------------------
     var before = inked(host.querySelector('.prev canvas'));

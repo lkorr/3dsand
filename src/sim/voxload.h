@@ -147,6 +147,10 @@ struct Prefab {
   // RGB for art palette slots, indexed by (slot - kArtPaletteBase); empty when
   // the file painted nothing. Packed 0x00RRGGBB.
   std::vector<uint32_t> artColors;
+  // The ART BANK its colours were merged into (microbody.h MicroBodyMergeArt,
+  // world.h kArtBanks): after the merge, every voxel's `color` is an index
+  // within this bank, and every brick packed from it carries it.
+  uint32_t artBank = 0;
 };
 
 // Parse from memory (unit-testable without a GPU). materialCount gates the

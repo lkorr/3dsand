@@ -292,6 +292,45 @@ are the OTHER half of this frame; they are not additive with `nomicro`.
    read (shadow_resolve.wgsl's 2026-10-03 note); in flight today it is 0.17
    (peaks-route) to 0.26 ms (ticket flight) mean, p99 1.34. Nothing left to
    take here; the largest row of the per-frame table is now `ray_start_trace`.
+   **Re-opened and handed off 2026-10-15 (worktree agent-a034c8b7, branch
+   `worktree-agent-a034c8b79d4282554`, on main e145446).** The wave-1014 work
+   (fresh windows cast whole, far-patch openness fans, far gathers) took the
+   ticket flight's resolve to **2.2 ms a frame**. READ THE TABLE RIGHT: the
+   `--frames` per-pass CSV showed it as 5.5 ms on "tick frames" and 0 on the
+   rest, because the sim PassTimer is kicked only on tick frames and the
+   per-frame rows recorded on the frames between are summed into the next
+   tick frame's row (tick-frame row / frames-since-last-tick = 2.07-2.33 ms
+   for gaps of 1-3 frames). The same holds for `ray_start_trace`,
+   `cloud_*`, `gi_gather`, `opennessRefresh`: divide by the gap, or read the
+   all-frames mean (`framepass.py`'s "ms/frame"). Attribution: a counter
+   build (resolve classes read back per frame, not committed) and stub arms
+   (`nearone`, `full3`, `noopen`, `nomarch`, `nogather`, `nofg` ...), one exe,
+   asset trees A/B, exclusive. Per frame: 19.5k near requests (5.4k fresh: 5.3k
+   settled by the three probes, ~190 casting all sixteen), 23k far (5.8k
+   fresh, 7.2k fans; marches 23k but only 0.11 ms of the pass). The sixteen-ray
+   windows cost 0.61 ms and the fans 0.44 ms through warp divergence (a warp
+   runs as long as its slowest lane; nearly every warp held one). Landed
+   (DESIGN.md 9.s "The rays are shared"): a far slot between refreshes is held
+   (`raymarch.wgsl shadowSlotHeld`; fresh far 5.8k -> 3.6k), one inlined copy of
+   each march, and the resolve's rays as a per-warp task list. Result, n=2
+   each interleaved: **2.19-2.20 -> 1.16-1.20 ms a frame**, wall mean 13.4-13.5
+   -> 12.3, p50 11.6-11.7 -> 9.7-9.8. `--perf` (n=1, same exe and asset A/B,
+   exclusive; the `shadowCache` node): forestfire 1.79 -> 1.23 ms, wall p50
+   20.2 -> 19.5; flythrough 1.84 -> 0.94 ms, wall p50 13.3 -> 12.5. Pictures:
+   the ticket camera still (SANDVOX_AT_LIST, clock frozen) differs from base
+   by mean |dL| 0.34-0.36 against 0.45 between two base runs; in-flight
+   frames differ run to run by more than the change can be seen through.
+   REFUTED here: sorting a 256-lane
+   workgroup's requests by kind (+0.4 ms; the group holds the SM until its
+   slowest warp ends), seeding a fresh window from its pool parent (-0.05,
+   dropped). LEFT (~1.2 ms): ~14k one-ray window refreshes, ~5k fresh windows'
+   probes, ~23k far marches, ~4.5k fans -- now ray count, not divergence. The
+   next levers: fewer fresh far patches (3.6k a frame are genuinely new
+   ground at the screen edge, the handoff sphere and the level rings while
+   strafing -- a world-keyed openness memo would only help re-visits), and the
+   kernel's occupancy (80 registers, ~124 B a lane of driver shared memory,
+   both from the far path; splitting near and far into two dispatches is a
+   C++ pass-table change).
 2. **Async compute queue for the sim** (ROADMAP_scale.md §3.6, never started — still true 2026-10-02: `src/gpu/` has one queue).
    Hides most of the ~13 ms tick side under the raymarch in flight; zero win
    standing still. Large: the barrier generator in `vk_record.cpp` is
@@ -615,7 +654,7 @@ bits and the occupancy word has 1 left (bit 29) without repacking the
 blocker COUNT that stream.cpp writes from the CPU (every reader only tests it
 against zero, so a 1-bit blocker flag would free 13 bits) — i.e. a C++ change
 plus both WGSL producers. Measure it the way the jump was: the region must be
-per-CHUNK (coherent across a warp), never per-ray.
+per-CHUNK (coherent across a warp), never per-ray. (DONE: §8.)
 
 ## 7. Handoff 2026-10-15: water pouring through a breach (ticket 22-55-02)
 
@@ -723,3 +762,92 @@ normal (~3.5 ms here). It needs a pass, a buffer (8 MB at kFluidBlocks 256) and
 a binding, which could go in a fluidGrid tail. (3) A 4^3 brick source mask beside
 it: <= 1.5 samples/px. (4) Calm rafts pay two water shades. Deciding the raft
 weight before the MPM shade (E) is the place, once it can be measured.
+
+## 8. Handoff 2026-10-15: the water-surface chunk layer -- agent a4fc38
+
+Package: §6's "what is left on the deep lake", meaning grazing rays inside the
+chunk layer that holds a lake's or the sea's surface. The uniform-chunk jump
+never covered that layer. `--render-budget`, 1920x1080, RTX 3060 Ti,
+`SANDVOX_RUN_EXCLUSIVE=1`. Every arm uses one exe (this branch's C++). The
+control is perf-1015's assets via `SANDVOX_ASSET_DIR`.
+
+**Attribution first.** One stub arm, `debug.perfExp 1` on the control: the
+uniform jump taken in EVERY chunk a liquid run starts in. That is an upper
+bound on any per-chunk jump. The picture is wrong; the arm is for timing only.
+One process per map:
+
+| camera | baseline | stub | bound |
+|---|---|---|---|
+| `at` (ticket 22-55-53's deep lake, default map) | 14.44 | 12.49 | 1.95 ms |
+| `lake` (harness) | 13.17 | 11.17 | 2.00 |
+| `submerged` (harness) | 9.37 | 8.06 | 1.31 |
+| `peaksea` (peaks map) | 6.78 | 6.57 | 0.21 |
+
+So §6's "~3 ms" is ~2 ms on `at`, and the same lever is worth as much on the
+harness lake and under water. The sea camera is not march-bound.
+
+**Design (landed).** The occupancy word's blocker COUNT is now a flag (bit 16):
+every reader only tested it against 0. That frees bits 17..25 for a LIQUID
+SPAN: layers [lo, lo+len) of the chunk hold one full-liquid key in every cell
+(the longest such run). It replaces bit 30's UNIFORM (= span [0,16)). There are
+three producers: genChunk, both sim_occupancy entry points and the CPU
+store-hit upload. Each computes the span with a per-thread (key, bad-layer
+mask) pair, reduced by min/max/or. That is exact for any cell-to-thread
+mapping and needs no extra pass and no new workgroup memory beyond one atomic.
+
+trace()'s liquid run jumps the box [chunk x/z] x [span y] when the cell it
+started from AND the next cell are both in the span. The start cell's y is
+rebuilt from `cell` and the step axis, so nothing new lives across the DDA
+loop. The ray lands on the exit face's neighbour, with the other two axes
+clamped into the box. The region is per-CHUNK, so a warp jumps together (the
+per-ray region in §6 was +2.8 ms).
+
+**Before / after.** Interleaved boots ctl / fin / ctl / fin, baseline arm.
+These "fin" runs are from BEFORE the landing-cell clamp was added. The clamp
+was then measured in ONE process against its absence and is neutral: `at`
+14.61 with it vs 14.74 without, `lake` 14.29 vs 14.46, `submerged` 9.75 vs
+9.67.
+
+| camera | control | final | change |
+|---|---|---|---|
+| `at` | 14.44 / 14.42 | 12.74 / 12.65 | **-1.73 ms** (89% of the bound) |
+| `submerged` | 9.37 / 8.50 | 7.26 / 7.23 | **-1.2..-2.1** |
+| `lake` | 13.17 / 13.09 | 12.18 / 11.30 | **-0.9..-1.8** (noisy camera) |
+| `peaksea` | 6.78 / 6.52 | 6.47 / 6.44 | ~0 |
+
+In-process confirmation, same exe. `debug.perfExp 2` limited the span jump to
+whole-chunk spans, which is the old uniform jump. Span jump vs uniform-only:
+`at` 14.61 vs 18.97, `lake` 14.29 vs 16.30, `submerged` 9.75 vs 11.62,
+`peaksea` 8.48 vs 7.94. The peaksea baseline was the first arm after a map
+load, and its interleaved boots above show no regression. CAUTION: these runs,
+and one more interleaved pair, came after the machine dropped into a slower
+state, about +2 ms on every camera including the control (`lake` control
+15.13, `at` final 15.49). Quote the first table.
+
+**Pictures** (`scripts/perf/bmpdiff.py` on the budget's own shots):
+- `at`: control vs final, 1,147..2,765 px differ, 0 over 2, max 1. Control vs
+  control: 2,935 px, 0 over 2, max 1.
+- `lake`: 268 / 561 px over 2, max 16. Two control boots: 502 over 2, max 5
+  (GI noise on the bank cliff).
+- `submerged`: 931 px over 2, max 39. Two control boots: 0 over 2. The
+  difference is a 1-px line along chunk sides where the bed meets them. A ray
+  grazing the shared edge of two adjacent bed cells hits one or the other,
+  depending on rounding (the jump's analytic exit vs the DDA's accumulated
+  tMax). There are also two isolated pixels over 12: one is an outlier in the
+  control, one in the final. Neither difference is visible in the picture.
+- Without the clamp, the final had dark one-pixel speckles on the harness lake
+  bed (max 78). The clamp removed them.
+
+`--shader-stats`: raymarch fs 128 registers, 112 B local memory (unchanged;
+binary 4,525,440 B).
+
+**Determinism.** No sim kernel reads the occupancy word, and the word is not
+hashed. The `--verify` result is in the commit message.
+
+**What is left.**
+- On `at`, ~0.2 ms of the bound: rays whose run starts in a partial surface
+  cell, or on a layer that a floating object breaks.
+- `peaksea`'s 10.6 ms from the brief did not reproduce (6.5 ms here). Its sea
+  is not where the cost is.
+- On the harness lake, shading the bed under > 2 m of water (§6: 1.79 ms) is
+  untouched. That is general opaque shading, not the march.

@@ -1044,8 +1044,11 @@ inline constexpr uint64_t kPipelineCacheMaxBytes = 512ull << 20;
 // shader_cache/ (the SPIR-V disk cache) is content-keyed, so every shader edit
 // leaves the previous entry behind forever — measured 2.5 GB / 35,405 files.
 // Each hit touches its file's mtime; a background sweep at the first shader
-// load deletes entries untouched for this long.
-inline constexpr int kShaderCacheMaxAgeDays = 14;
+// load deletes entries untouched for this long. 3 days, not 14 (2026-10-15):
+// with several agents editing shaders a day, 14 days grew the shared
+// C:/sv-deps/shader_cache to 14 GB; a live entry is touched on every hit, so
+// only a checkout idle for 3+ days pays a recompile.
+inline constexpr int kShaderCacheMaxAgeDays = 3;
 
 // The descriptor pool's budget (see its creation in rhi_vulkan.cpp for why it
 // is a budget and aborts rather than failing soft). Named so a resize is one

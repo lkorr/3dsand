@@ -150,6 +150,7 @@ Status GateItemStage(Ctx& c, std::string& detail) {
   itemstage::Look look;
   look.mats = &c.mats;
   look.artColors = mobs.MicroSet() ? &mobs.MicroSet()->artColors : nullptr;
+  look.artBank = sword->prefab.artBank;
   look.scale = sword->scale;
   const itemstage::View view;
   auto draw = [&](const KitRef& ref, std::vector<uint8_t>& px, itemstage::LatticeGrid& g,

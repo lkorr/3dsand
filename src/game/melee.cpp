@@ -70,7 +70,7 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
   if (!d.prefab.artColors.empty()) {
     const std::vector<uint8_t> remap =
         MicroBodyMergeArt(micro, d.prefab.artColors, "item/" + d.name, errors,
-                          &d.prefab);
+                          &d.prefab, &d.prefab.artBank);
     for (PrefabModel& pm : d.prefab.models)
       for (PrefabVoxel& v : pm.voxels)
         if (v.color) v.color = remap[v.color];
@@ -175,6 +175,8 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
         cv.microModel = MicroBodyPack(micro, cv.voxels, cv.size, d.scale,
                                       "item/" + d.name + "/" + cv.part, errors,
                                       cv.cutFaces);
+        if (cv.microModel >= 0)
+          MicroBodySetArtBank(micro, (uint32_t)cv.microModel, d.prefab.artBank);
         if (cv.microModel < 0)
           errors += "items: \"" + d.name + "\" shell \"" + cv.part +
                     "\" has no micro brick and will not render\n";
@@ -501,6 +503,8 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
     d.microModel =
         MicroBodyPack(micro, d.voxels, d.size, d.scale, "item/" + d.name,
                       errors);
+    if (d.microModel >= 0)
+      MicroBodySetArtBank(micro, (uint32_t)d.microModel, d.prefab.artBank);
     if (d.microModel < 0)
       errors += "items: \"" + d.name +
                 "\" has no micro brick and will not render\n";
@@ -554,6 +558,8 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
         bs.cell = inv;
         bs.unstrungModel = MicroBodyPack(micro, unstrung, d.size, d.scale,
                                          "item/" + d.name + "/unstrung", errors);
+        if (bs.unstrungModel >= 0)
+          MicroBodySetArtBank(micro, (uint32_t)bs.unstrungModel, d.prefab.artBank);
         // Every length a half string can take: from a few cells (a tip
         // pressed to the hand) to a part's 120-cell limit, which is past the
         // longest tip-to-hand reach of any draw.
@@ -573,6 +579,7 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
                                       "item/" + d.name + "/string" + std::to_string(n),
                                       errors);
           if (m < 0) break;
+          MicroBodySetArtBank(micro, (uint32_t)m, d.prefab.artBank);
           bs.rods.push_back(m);
         }
         bs.has = bs.unstrungModel >= 0 && !bs.rods.empty();

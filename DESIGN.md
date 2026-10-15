@@ -415,9 +415,10 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
 - Per-chunk metadata (CPU-mirrored, few bytes each):
   - `dirty` — contains moving/reacting voxels; the only chunks the CA dispatches
   - `nonEmpty` — any voxels at all (empty-space skipping for rendering & raycasts).
-    Implemented as a packed per-chunk word: low 16 bits = non-air count, high 16 =
-    ray-blocker count (solid/powder/opaque-liquid), so media-blind rays (shadows)
-    skip chunks that hold only gas/translucent liquid (see common.wgsl packOcc)
+    Implemented as a packed per-chunk word: low 16 bits = non-air count, bit 16 =
+    any ray blocker (solid/powder/opaque-liquid), so media-blind rays (shadows)
+    skip chunks that hold only gas/translucent liquid, bits 17..25 = the liquid
+    span the raymarch jumps, bit 31 = any stain (see common.wgsl packOcc)
   - `hasLiquid`, `hasLights` — cheap routing flags
   - `faceOccupancy[6]` — does any voxel touch each boundary face (island detection §7)
 - **Hierarchical dirty flags**: a mip-style tree over chunk flags so the dispatcher
@@ -1110,7 +1111,7 @@ SSBO lists of chunk indices.
   cell of <= 4 eighths whose ray segment stays above its mid-plane is passed
   as air in the march and costs no record or neighbour read, 2026-10-03 —
   on the harness desert that second pass is the frame's largest term); light
-  (shadow rays, AO, occupancy's blocker count) treats a partial under
+  (shadow rays, AO, occupancy's blocker flag) treats a partial under
   `POWDER_BLOCK_MIN` = 5 eighths as open (`isRayBlockerW`), and the CPU mirror
   walks through a film under `kPowderWalkMin` = 3 eighths (`KindOfWord`).
   Gate `powder-mass`: exact eighths through merge and sink, no buried partial,
@@ -4414,26 +4415,36 @@ does not keep an idle lake awake (its miss path marks only a cell
 `stillWant` says can still change). Next lever if water is ever hot again: a
 UNIFORM-water chunk crossed analytically instead of ~16 run-loop steps.
 
-THE UNIFORM-CHUNK JUMP (2026-10-15, frame-perf pass; the lever named above).
-The occupancy word carries a fourth field, bit 30 = UNIFORM: every one of the
-chunk's 4,096 cells holds the same material + state (word bits 0..15) and none
-is air (`OCC_UNIFORM_BIT`, common.wgsl; the layout is now [31] anyStain | [30]
-uniform | [28..16] blockers | [15..0] nonAir, and `occBlockers` masks 13 bits).
-`genChunk` (worldgen.wgsl) and both `sim_occupancy` entry points compute it as
-a min/max of the key over the chunk; every other writer (the sentinel paths,
-the CPU store-hit upload) leaves it 0, which costs only a per-cell march. It is
-render-only: the CPU snapshot keeps the counts (world.cpp masks 0xFFFF), the
-world hash never sees occupancy. `trace()`'s liquid run, entering a uniform
-chunk of its own liquid, crosses it with one box exit and one add (the
-segments telescope exactly as the run loop's do), taken only when the face is
-nearer than the 10 m depth cap and the march's exit, so the cell a ray stops
-on is still found cell by cell. `--render-budget at` on ticket 22-55-53's lake
-(deep, no bed in reach; one process): 15.77 -> 14.50 ms. What is left there
-is the chunk layer holding the SURFACE (not uniform: air above, often a
-partial top layer), where grazing rays spend most of their 10 m: crossing it
-needs a per-chunk uniform Y SPAN, i.e. more bits than the word has free
-without repacking the CPU-written blocker count (stream.cpp) -- see
-docs/PLAN_frame_perf.md. Two shapes were measured and are not to be retried:
+THE LIQUID-SPAN JUMP (2026-10-15, frame-perf pass; the lever named above).
+The occupancy word carries a LIQUID SPAN: chunk-local layers [lo, lo+len) hold,
+in every cell, one full-liquid key (word bits 0..15, a CLASS_LIQUID material at
+state 7); len 0 = none, the longest such run wins (lowest on a tie). Layout
+(common.wgsl, `occSpanLo`/`occSpanLen`): [31] anyStain | [25..21] span len |
+[20..17] span lo | [16] anyRayBlocker | [15..0] nonAir. Bit 16 became a FLAG
+when the 13-bit blocker count turned out to be read only against zero; that
+freed the span's nine bits. It replaced the first form of this lever, bit 30
+= UNIFORM (the whole chunk one key -- now just the span [0, 16)). Producers:
+`genChunk` (worldgen.wgsl), both `sim_occupancy` entry points (a per-thread
+key + bad-layer mask, reduced by min/max/or: `occSpanStep`/`occSpanBits`) and
+the CPU store-hit upload (stream.cpp `OccSpanBits`, same tie rule); the
+sentinel paths leave it 0 (a sentinel is never a full liquid), which costs
+only a per-cell march. Render-only: the CPU snapshot keeps the count
+(world.cpp masks 0xFFFF), no sim kernel reads occupancy, the world hash never
+sees it. `trace()`'s liquid run, when the cell it started from AND the next
+cell both lie in the span, crosses the box [chunk x/z] x [span y] with one
+exit and one add (the segments telescope exactly as the run loop's do), taken
+only when the face is nearer than the 10 m depth cap and the march's exit; the
+landing cell is the exit face's neighbour with the other two axes clamped into
+the box (without the clamp the 1e-4 nudge near a box edge could carry
+floor(p) into the bed below the span with the wrong face axis: one-pixel dark
+speckles along every chunk side a lake bed meets). That covers the deep
+interior (span [0,16)) and the chunk LAYER holding a lake's or the sea's
+surface (span [0, h)), where grazing rays spent most of their 10 m.
+`--render-budget`, 1080p, same exe, interleaved control/final boots:
+`at` (ticket 22-55-53's deep lake) 14.43 -> 12.70 ms, `submerged` ~8.5 ->
+7.25, `lake` ~13.1 -> 11.3..12.2 (a noisy camera), `peaksea` unchanged
+(~6.5; its sea costs little in the march). Docs/PLAN_frame_perf.md §8 has the
+attribution and the arms. Two shapes were measured and are not to be retried:
 issuing the next cell's load one step ahead (-0.1..-0.25 ms, nothing on top of
 the jump), and letting the run cross chunk faces itself (+2.6 ms: lanes reach
 a face on different steps, and the face work, serialised per lane, costs more
@@ -11391,6 +11402,99 @@ proud of the widest FILLED column, and a thumb at an absolute row instead of
 proud of the front-most filled cell. The anatomy peel needs a solid volume, and
 a detached speckle becomes a floating scrap of flesh in the world.
 
+#### The fine face and the skin pass (2026-10-15)
+
+Every humanoid ships at 80 art vox/m, but a generated body is AUTHORED at 40
+(`AUTHORED_VOXELS_PER_METRE`) and block-replicated (`SKIN_UPSCALE` 2), so every
+painted cell is a 2x2x2 block. The races with a surface pass (goblin, demon,
+naga, the robots, the sylvan's bark) paint on the shipped lattice after the
+upscale; the human had none, so its eye was a 25 mm square and its mouth a
+25 mm bar, and the owner saw goblins as "twice as detailed" — at the face, they
+were. Nothing about storage or rendering changes: the human already paid for
+12.5 mm cells and was using them as 25 mm ones.
+
+- **`headVoxFine`** builds a HUMAN's head on the shipped lattice. The skull,
+  cap, mane and knot are `headVox`'s own expressions evaluated at the centre of
+  each shipped cell (the same shape sampled twice as finely, so no stair steps
+  and a hairline that moves in half rows); the face is redrawn at 12.5 mm: a
+  lash line over white–iris–white, a nose with a straight profile (bridge one
+  cell out, bulb two, filled back to the face), nostrils, a mouth line bent
+  along a curve with a lip above and below, brows that taper to the tail,
+  ears with a rim and a hollow, a beard whose density is per fine cell
+  (stubble at last). Every gene keeps its authored-unit meaning; the integer
+  face rows take HALF steps on a human (`fineStep`, `specStep`), one shipped
+  cell each, and stay whole on every other race (`coerceGene`). The fine
+  face's own rows (eye shape/tilt/iris/whites/glint, lashes and their length,
+  opacity and colour, lid crease, the ear rows, nose bridge/tip, the skin
+  tab) are `late`: appended to `GENE_SPECS` and rolled after every other
+  draw, so no seeded litter or pinned random body moved; a row's `ui` places
+  it on its tab (breed.js `groupSpecs`) without moving a draw.
+- **Tabs (same day, owner ask):** an **eyes** tab holds every eye row with the
+  eyebrows as a sub-section under a divider (`GENE_GROUPS` `parent`), an
+  **ears** tab holds size, height, set-back, width, stick-out, tilt, lobe, the
+  elf point and its length; **`EYE_STYLES`** (almond, round, narrow, hooded,
+  upturned, doll, tired, **old**) are presets like the beards'. `old` is the
+  block eye: §T holds it to the legacy head's eye cell for cell at eye size 1.
+- **Opacity rows.** Lashes, whites, lid crease, under-eyes, the ear's hollow
+  and every skin feature (collarbones, chest line, navel, kneecaps, elbows,
+  fingers, knuckles, nails, toes — split out of one `detail` gene) are an
+  OPACITY: the feature's own art slot (`ART.CREASE` … `ART.TOE`, 181-194) is
+  painted the same cells at any setting, and `detailColors(colors, genome)`
+  mixes its COLOUR from the skin toward the full tone, snapped to tenths
+  (`toneQ`). 0 paints nothing; 1 is the existing colour (free); a step between
+  is a palette colour of its own, shared by every body with the same skin and
+  setting — the defaults share one shade mix and one lit mix per complexion.
+  The lash colour is `colors.lash`, a tone of the hair. The NOSTRILS are a
+  derived tone of the skin (`NOSTRIL_TONE`, the owner's pick off shana's
+  repainted mouth), lighter than the skin's shade they used.
+- **The art palette is banked (2026-10-15).** The shared run of 255 merged
+  art colours was full (486 wanted across the shipped models), so every model
+  loaded after it took the NEAREST colour already there -- which is how a
+  0.1-step lash opacity rendered as a switch in game while the Characters page,
+  which draws exact colours, showed a ramp. The run is now `kArtBanks` (8) x
+  `kArtBankSlots` (255) entries in the material table. A voxel's art byte is
+  unchanged (8 bits, 1-based) but means an index WITHIN ITS MODEL'S BANK:
+  `MicroBodyMergeArt` puts all of a prefab's colours in one bank (first fit,
+  deduplicated within it, `Prefab::artBank`), the bank rides
+  `MicroBodyModelGpu::cutFaces` bits 8..15 to `microbody.wgsl`
+  (`microBodyArtBaseOf`), and every CPU reader turns a byte into a colour
+  with `MicroBodyArtFlat` (debris ground tint, burn stand-ins per bank, the
+  item preview). Clones, carve gobbets and fitted shells copy their source's
+  bank; a body rising undead re-finds its living bytes in the undead def's
+  bank. The cast may use banks 0..6; bank 7 is the wardrobe's (its dyeable
+  weave must stay exact greys). The cube path (`debris.wgsl`, 4-bit art)
+  reads bank 0 only, as it only ever reached the first 15 entries.
+
+- **`humanSkinPass`** runs on every part of a human after the upscale and
+  PAINTS ONLY — no cell added or removed, so armour boxes, the collider, the
+  anchors and the left/right mirror are untouched (`test_mobgen.mjs` §T
+  asserts the body below the neck has exactly the old cells): fingers, nails,
+  knuckles, toes, a kneecap, the elbow crease, collarbones, a navel, the line
+  under a man's chest, a one-cell checker where `shadeBack`'s dark half
+  begins, `texture` mottle and `moles`.
+- **Detail art slots** (`ART.FACE_SHADE` 201, `FACE_LIGHT` 200,
+  `EYE_WHITE` 199, `LASH` 198, then 197-180: `mg.DETAIL_SLOTS`). Three are an existing colour under a new number
+  (skinShade, skinLight, hairShade), which costs the shared art palette nothing
+  (it dedupes by RGB and merges only painted slots) and says two things the old
+  numbers could not: `hairMass` reads `SKIN_LIGHT` on a head as scalp and roots
+  hair on it, and the Characters page draws a family's shade/light slots in
+  the base colour, which had made every painted freckle and line invisible
+  there. `EYE_WHITE` is one constant colour for the whole cast (one merged slot).
+- **Races are untouched**: `isFineFace` is `race === 'human'`, and every race's
+  surface pass still reads `headVox`'s face. **`generateMob(…, { face:
+  'legacy' })`** builds a human the old way; the Characters page's **faces:
+  new / OLD** button (key `` ` ``) flips every preview between the two for
+  comparison. It is a view only — a save always writes the fine face.
+- The 10 named humans were re-baked with `gen_mobs.mjs --rebake` and the 20
+  pool bodies with the new **`bake_human_pool.mjs --rebake`** (each from the
+  genome in its own sidecar; the plain run re-rolls the population). Four pool
+  bodies' art (f02, f08, m04, m08) did not match what their own genomes
+  generate before the re-bake (cause not traced; their sidecars did match, so
+  the likeliest is a sidecar-only re-diff that left the art stale), and
+  `shana`'s torso had 34 cells of bra the current generator no longer paints;
+  all now match. `assets/mobs/human.vox`, the hand-authored base (player model), has no
+  genome and its own palette, and is NOT converted.
+
 ---
 
 ## 8. Player & Projectiles
@@ -18264,7 +18368,7 @@ where you hear from either (§12b, "The ears are on the character").
       blocker in the block") is not. Measured on the up fan: the any-of rule
       alone 0.60 -> 0.49.
     So the HEIGHTFIELD and its cards take the near walk's definition
-    marched over the cascade (`farGroundOpen`, shadow_resolve.wgsl) -- the
+    marched over the cascade (`farOpenRay` x5, shadow_resolve.wgsl; `farGroundOpen` until 2026-10-15) -- the
     face's own fan from just off the face (a card asks for the ground's up
     face), a side face's down-diagonal re-aimed 63 degrees up, real rays with
     the reach along the ray, the endpoint up-march, and the outer stretch as
@@ -18372,7 +18476,7 @@ where you hear from either (§12b, "The ears are on the character").
   - **The crowns' openness is the definition too, per patch (2026-10-14,
     same ticket; closes the crown-fan handoff).** A FEATURE face (crown,
     trunk, wall: a cell standing on its column's top) takes the near walk's
-    definition from just off the face (`farGroundOpenByte` .z: no ground start
+    definition from just off the face (`farGroundOpenPlan` fan 0, `farGroundOpenByte` .z until 2026-10-15: no ground start
     rules), in the patch word's bits 24..31; fs replaces the closed form with
     it as the ground does, and scales the closed-form bounce by it. The
     per-pixel cell-diagonal feature fan (`farSkyFan`) is gone from fs.
@@ -21022,6 +21126,48 @@ a still frame is unchanged apart from grass-sway noise.
 per pixel, whether NOTHING answered (the pixel shades as sun), the shadow
 value, and how a near pixel was answered (0.5 its own taps, 0.75 a fallback
 probe, 1 nothing); far pixels write (nothing answered, value, 0.25).
+
+**The rays are shared, and a far patch between refreshes is held**
+(2026-10-15, frame-perf flight package; `shadow_resolve.wgsl` THE HEAVY RAYS
+ARE SHARED, `raymarch.wgsl` `shadowSlotHeld`). On the 12-10-09 ticket flight
+(13.75 m/s) the resolve cost **2.2 ms a frame** (the `--frames` GPU table
+showed ~5.5 on "tick frames" only because the per-frame rows of the frames
+between ticks are summed into the next tick frame's row: the sim PassTimer is
+kicked on ticks), up from 0.26 on 2026-10-13. Attributed with a GPU counter
+build (per-class counts read back per frame) and stub arms: per frame ~41k
+requests -- 19.5k near (5.4k of them FRESH windows: 5.3k settled by the three
+probes, ~190 in a penumbra casting all sixteen) and 23k far (5.8k fresh, 7.2k
+openness fans). The sixteen-ray windows were 0.6 ms and the fans 0.44 ms, not
+because there were many but because a warp runs for its slowest lane and
+nearly every warp held one. Three changes, all render-only:
+
+1. **A far patch between its refreshes is not a free slot.** A far patch
+   stamps its slot only on its refresh frames (`farSlotRead`, one in four), so
+   `shadowSlotLive` ("asked this frame or last") called it free half the time
+   and any claim in its set took it -- ahead of the empty ways after it -- and
+   it came back fresh: the march, the fans, a gather, again. The claim now
+   also passes over a VALID slot stamped within one refresh period
+   (`shadowSlotHeld`). Fresh far patches 5.8k -> 3.6k a frame, fans 7.2k ->
+   4.5k.
+2. **The rays are the workgroup's.** The resolve workgroup is one warp; each
+   lane does its request's bookkeeping, but the rays go into a task list that
+   all 32 lanes cast from, in two rounds (centre + probes, then the thirteen a
+   penumbra needs), the answers back through workgroup memory. Every ray is
+   the ray the owner would have cast and every bit lands where it did; a fan's
+   five rays are counted in sixths, which gives the same byte as the float
+   sum for all 32 combinations.
+3. **One inlined copy of each march** (the riser foreground's march through
+   the patch march's call site, the fans' three calls through one task, the
+   gathers' constant loops as mask loops): the kernel binary was 197 KB.
+
+Measured (the ticket flight, `SANDVOX_GPU_TIMER_SERIAL=1`, one exe, asset
+trees A/B, exclusive, interleaved, n=2 each): `shadow_resolve` **2.19-2.20 ->
+1.16-1.20 ms a frame**; wall mean 13.4-13.5 -> 12.3 ms, p50 11.6-11.7 -> 9.7-9.8.
+By stage (n=1 each): the held slots 2.20 -> 2.05, the call sites and mask
+loops about -0.1, the shared rays about -0.7. Tried and dropped: sorting each 256-lane workgroup's requests by
+kind (+0.4 ms: a big workgroup holds its SM slot until its slowest warp
+ends); seeding a fresh window from its pool parent's (-0.05 ms, not worth an
+approximation).
 
 **What is NOT here.** Soft shadows on the raster body paths. `bodySunShadow`
 casts one ray per FRAGMENT with nowhere to accumulate, so a limb still takes a
@@ -24900,9 +25046,13 @@ Three properties matter and each is a deliberate cost:
   to a tool. A 64³ region is ~8 ms once the process is warm.
 * **It is a server because boot is ~3 s and a region is ~8 ms.** A viewer that
   streams as the camera moves cannot pay device creation and SPIR-V compilation
-  per box. The tuner keeps one process and takes the machine-global run mutex
-  around each request rather than for the process lifetime — a persistent holder
-  would block every build in every worktree for a whole session.
+  per box. The tuner keeps one process and never holds the machine-global GPU
+  lock for its lifetime — a persistent holder would block every build in every
+  worktree for a whole session. Since 2026-10-15 it takes that lock only while
+  a `SANDVOX_RUN_EXCLUSIVE` measurement is running or queued, as a lease over
+  back-to-back requests (released after 1.5 s idle or 20 s); gates, smokes and
+  shots are timing-blind, and queueing FIFO behind them one region per turn
+  left the Dungeons tab minutes from its first voxel.
 * **`lod > 1` is a MAJORITY over the block, per chunk.** 16 divides every
   supported lod so a chunk's cells never straddle a sample. Point sampling was
   the obvious alternative and it deletes exactly what you zoom out to see: a
@@ -26354,9 +26504,11 @@ and all four are the reason for it:
   cloned, nothing is re-packed, and the cost of a dye is one word per instance.
 * **The colour is CONTINUOUS.** The rejected alternative — allocating art
   palette slots per dye and baking it into the voxels — costs nothing at shade
-  time and has a hard ceiling: the merged art palette is 255 entries *total*
+  time and has a hard ceiling: the merged art palette was 255 entries *total*
   across every prefab in the game (`kArtPaletteSlotsGpu`), shared with every
   creature's skin, so a six-tone ramp buys about forty simultaneous colours.
+  (Since 2026-10-15 it is eight banks of 255 -- see "The art palette is
+  banked" -- but a model still addresses only its own bank's 255.)
 * **A severed sleeve keeps its colour.** The dye rides `MicroBodyRef`, which is
   a render description and is what `DebrisSystem::AdoptBody` already takes — so
   the hand-off path needed no new argument.
