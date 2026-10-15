@@ -271,13 +271,16 @@ function slotRGB(genome) {
   // on the face (a red is not a shading cue).
   for (const [base, deps] of Object.entries(mg.COLOR_FAMILIES))
     for (const d of deps)
-      if (d !== 'lip')
+      // (a tone with no slot of its own -- the lash colour -- reaches the
+      // art only through detailColors below)
+      if (d !== 'lip' && mg.COLOR_SLOTS[d] !== undefined)
         out[mg.COLOR_SLOTS[d] - 127] = out[mg.COLOR_SLOTS[base] - 127];
   // THE FINE FACE'S DETAIL SLOTS (mobgen.js detailColors) are drawn as
   // THEMSELVES, not flattened to their family's base like skinShade above:
   // they are the lines, nostrils, lashes and eye whites, and flattened they
-  // would be invisible here while plain in the game.
-  for (const [slot, hex] of Object.entries(mg.detailColors(genome.colors))) {
+  // would be invisible here while plain in the game. The genome goes too: a
+  // toned slot's colour is its opacity gene's mix (collarbones at 0.3 ...).
+  for (const [slot, hex] of Object.entries(mg.detailColors(genome.colors, genome))) {
     if (!hex) continue;
     const n = parseInt(hex.slice(1, 7), 16);
     out[slot - 127] = [(n >> 16) & 255, (n >> 8) & 255, n & 255];
@@ -1107,6 +1110,7 @@ function css() {
 #view-characters .bhead{display:flex;align-items:center;gap:6px;margin:0 0 6px}
 #view-characters .bhead h3{margin:0;flex:1}
 #view-characters .bhead button{font-size:10px;padding:0 6px}
+#view-characters .gh.gsub{border-top:1px solid #8886;margin-top:10px;padding-top:6px}
 #view-characters .bhead button.oldface.on{background:#b5651d;color:#fff;
   border-color:#e08a3c}
 #view-characters .oldbanner{font-size:10px;background:#b5651d;color:#fff;
@@ -1790,8 +1794,11 @@ function collapsedLitter() {
 
 const groupOf = k => mg.GENE_GROUPS.find(x => x.key === k) || null;
 
-/** The rows a group shows on this character, in GENE_SPECS order. A row
- *  another race has (the sylvan's face, bark and crown) is not one of them. */
+/** The rows a group shows on this character, in GENE_SPECS order -- or by a
+ *  row's `ui` place where it has one (the eyes and the skin tabs: their newer
+ *  rows sit at the end of GENE_SPECS so no seeded roll moved, but belong
+ *  beside the rows they shape). A row another race has (the sylvan's face,
+ *  bark and crown) is not one of them. */
 function groupSpecs() {
   const groups = new Map();
   for (const spec of mg.GENE_SPECS) {
@@ -1799,8 +1806,18 @@ function groupSpecs() {
     if (!groups.has(spec.group)) groups.set(spec.group, []);
     groups.get(spec.group).push(spec);
   }
+  for (const [k, list] of groups) {
+    const at = new Map(list.map((sp, i) => [sp, i]));
+    const ui = sp => (sp.ui ?? 1000);
+    groups.set(k, [...list].sort((a, b) => ui(a) - ui(b) || at.get(a) - at.get(b)));
+  }
   return groups;
 }
+
+/** A SUB-SECTION group (mg.GENE_GROUPS `parent`: the eyebrows under the
+ *  eyes) has no tab of its own; its rows follow its parent's under a divider. */
+const parentOf = k => (groupOf(k) || {}).parent || null;
+const childrenOf = k => mg.GENE_GROUPS.filter(x => x.parent === k).map(x => x.key);
 
 /** RANDOMIZE ONE TAB: a whole random character of this race (randomGenome,
  *  colours rolled as a set), moved onto this character's sex, and only this
@@ -1809,7 +1826,8 @@ function groupSpecs() {
  *  with its own lengths, not with the old ones. The sex and race buttons stay
  *  put: they move the whole body, which is not "this tab". */
 function randomizeGroup(key) {
-  const specs = groupSpecs().get(key) || [];
+  const gs = groupSpecs();
+  const specs = [key, ...childrenOf(key)].flatMap(k => gs.get(k) || []);
   const rng = mg.makeRng((Math.random() * 1e9) | 0);
   const g = mg.rollColors(mg.randomGenome(rng, S.locks,
                                           { race: S.genome.body.race }), rng);
@@ -1835,8 +1853,9 @@ function randomizeGroup(key) {
 function genesPane() {
   rowSync.clear();
   const groups = groupSpecs();
-  const keys = [...groups.keys()];
-  const cur = groups.has(S.geneTab) ? S.geneTab : keys[0];
+  const keys = [...groups.keys()].filter(k => !parentOf(k) || !groups.has(parentOf(k)));
+  const cur = keys.includes(S.geneTab) ? S.geneTab
+            : keys.includes(parentOf(S.geneTab)) ? parentOf(S.geneTab) : keys[0];
   const title = k => (groupOf(k) && groupOf(k).title) || k;
   const tabs = el('div', { class: 'gtabs' }, keys.map(k => el('button', {
     class: 'gtab' + (k === cur ? ' on' : ''),
@@ -1863,6 +1882,14 @@ function genesPane() {
     rows.push(geneRow(spec));
   };
   for (const spec of groups.get(cur) || []) push(spec);
+  // ...then each sub-section's, under a divider with its own note.
+  for (const ck of childrenOf(cur)) {
+    if (!groups.has(ck)) continue;
+    const cg = groupOf(ck);
+    rows.push(el('div', { class: 'gh gsub', title: cg.note || '' }, cg.title || ck));
+    if (cg.note) rows.push(el('div', { class: 'gnote' }, cg.note));
+    for (const spec of groups.get(ck)) push(spec);
+  }
   // THIS TAB'S COLOURS, the same rows the colours tab has (mg.COLOR_HOME):
   // the eye colour on the face tab, the lips on the mouth tab.
   if (cur !== 'colour') {
@@ -2341,6 +2368,8 @@ function geneRow(spec) {
       onchange: e => { gset(spec.path, e.target.value);
                        if (spec.path === 'hair.style')
                          mg.applyHairStyle(S.genome, e.target.value);
+                       // A style row (the eyes' style) takes its numbers.
+                       mg.applyStyleRow(S.genome, spec.path, e.target.value);
                        render(); },
     }, spec.choices.map(c => el('option', { value: c, selected: c === v }, c)));
     // A style pick (beard tone, say) must reach this select too.

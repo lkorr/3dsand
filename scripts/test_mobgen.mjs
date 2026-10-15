@@ -2226,7 +2226,7 @@ section('T. the fine face and the skin pass: a human drawn at the shipped lattic
   // is what the Characters page's old/fine toggle shows. What must hold:
   const opts = { materials, player: tuning.player, avatar: avatarConstants() };
   const A = mg.ART;
-  const DETAIL = new Set([A.FACE_SHADE, A.FACE_LIGHT, A.EYE_WHITE, A.LASH]);
+  const DETAIL = new Set(mg.DETAIL_SLOTS);
   const partsOf = b => Object.fromEntries(b.parts.map(p => [p.name, p]));
   const shapeOf = p => p.cells.map(c => c.slice(0, 3).join(',')).sort().join(';');
   const paintOf = p => p.cells.map(c => c.join(',')).sort().join(';');
@@ -2255,12 +2255,48 @@ section('T. the fine face and the skin pass: a human drawn at the shipped lattic
   }
   ok(moved === 0, 'the skin pass adds and removes no cell anywhere', `${moved} parts moved`);
   ok(repainted >= 10, 'the skin pass paints most of the body', `${repainted} parts`);
-  ok(F['hand.L'].cells.some(c => c[3] === A.NAIL) && F['foot.R'].cells.some(c => c[3] === A.NAIL),
+  ok(F['hand.L'].cells.some(c => c[3] === A.NAIL_T) && F['foot.R'].cells.some(c => c[3] === A.NAIL_T),
      'hands and feet get nails');
-  const noDetail = mg.normalizeGenome({ body: { skin: { detail: 0, texture: 0, moles: 0 } } });
+  const FEATURES = ['collarbones', 'chest', 'navel', 'knees', 'elbows',
+                    'fingers', 'knuckles', 'nails', 'toes'];
+  const noDetail = mg.normalizeGenome({ body: { skin: { texture: 0, moles: 0,
+    ...Object.fromEntries(FEATURES.map(k => [k, 0])) } } });
   ok(!mg.generateMob(noDetail, 0, opts).parts.filter(p => p.name !== 'head')
        .some(p => p.cells.some(c => DETAIL.has(c[3]) || c[3] === A.NAIL)),
-     'skin detail, texture and moles at 0 paint nothing below the neck');
+     'every skin feature, texture and moles at 0 paint nothing below the neck');
+  // EACH FEATURE IS ITS OWN SLIDER: alone at 0 it is gone and the rest stay.
+  const allOn = partsOf(fine);
+  const slotOf = { collarbones: A.COLLAR_L, chest: A.CHEST, navel: A.NAVEL,
+                   knees: A.KNEE_L, elbows: A.ELBOW, fingers: A.FINGER,
+                   knuckles: A.KNUCKLE, nails: A.NAIL_T, toes: A.TOE };
+  const has = (P, slot) => Object.values(P).some(p => p.cells.some(c => c[3] === slot));
+  for (const k of FEATURES) {
+    const P = partsOf(mg.generateMob(mg.normalizeGenome({ body: { skin: { [k]: 0 } } }), 0, opts));
+    ok(has(allOn, slotOf[k]) && !has(P, slotOf[k]) &&
+       FEATURES.filter(j => j !== k && slotOf[j] !== slotOf[k]).every(j => has(P, slotOf[j])),
+       `body.skin.${k} at 0 removes it and only it`);
+  }
+  // AN OPACITY MOVES A COLOUR, NOT A CELL: the same cells in the same slots,
+  // the slot's colour mixed toward the skin -- in tenths, ends exact.
+  const tone = (path, v) => {
+    const g = mg.normalizeGenome({}); mg.setPath(g, path, v); return mg.normalizeGenome(g);
+  };
+  for (const [path, slot] of [['body.skin.collarbones', A.COLLAR_L],
+                              ['body.skin.nails', A.NAIL_T], ['face.lashTone', A.LASH],
+                              ['face.creaseTone', A.CREASE], ['face.earTone', A.EAR_IN],
+                              ['face.whites', A.EYE_WHITE], ['face.bagTone', A.BAGS]]) {
+    const lo = tone(path, 0.3), hi = tone(path, 0.9);
+    const cells = g => mg.generateMob(g, 0, opts).parts.map(p => shapeOf(p)).join('|');
+    if (path !== 'face.bagTone')
+      ok(cells(lo) === cells(hi), `${path} moves no cell`);
+    const c0 = mg.detailColors(lo.colors, lo)[slot], c1 = mg.detailColors(hi.colors, hi)[slot];
+    ok(c0 !== c1, `${path} moves the colour`, `${c0} vs ${c1}`);
+    const full = mg.detailColors(lo.colors, tone(path, 1))[slot];
+    ok(c0 !== full && mg.detailColors(lo.colors, tone(path, 0.31))[slot] === c0,
+       `${path} snaps to tenths`);
+  }
+  ok(mg.detailColors(def.colors, tone('body.skin.collarbones', 1))[A.COLLAR_L] ===
+     def.colors.skinLight, 'a full-strength tone is the existing colour (no palette cost)');
 
   // 3. THE FINE FACE IS SYMMETRIC in shape on a symmetric genome: every lever
   //    that is not a side (the parting, the smirk, the offset, the scar) high.
@@ -2279,6 +2315,10 @@ section('T. the fine face and the skin pass: a human drawn at the shipped lattic
   const head = g => paintOf(partsOf(mg.generateMob(g, 0, opts)).head);
   const browOn = { brow: true };
   const LEVERS = [
+    ['face.irisSize', 0.9], ['face.whites', 0], ['face.lashSpan', 1],
+    ['face.lashSpan', 0.2], ['face.earHeight', 0.5], ['face.earBack', 1],
+    ['face.earWidth', 1], ['face.earOut', 0.5], ['face.earOut', 1],
+    ['face.earTilt', 1], ['face.earLobe', 0], ['face.earLobe', 1],
     ['face.eyeOpen', 0.9], ['face.eyeTilt', 0.8], ['face.eyeTilt', -0.8],
     ['face.lashes', 0], ['face.lashes', 0.9], ['face.lidCrease', 0.7],
     ['face.eyeRow', 0.5], ['face.eyeCols', 1.5], ['face.mouthWidth', 2.5],
@@ -2308,6 +2348,52 @@ section('T. the fine face and the skin pass: a human drawn at the shipped lattic
   }
   ok(head(mg.normalizeGenome({ body: { skin: { texture: 0.8 } } })) !== head(mg.defaultGenome()),
      'skin texture reaches the face');
+  const round = mg.normalizeGenome({ face: { eyeOpen: 1 } });
+  ok(head(mg.normalizeGenome({ face: { eyeOpen: 1, glint: true } })) !== head(round),
+     'fine lever face.glint moves a cell (on a two-row eye)');
+  const pointed = mg.normalizeGenome({ face: { earPoint: true } });
+  ok(head(mg.normalizeGenome({ face: { earPoint: true, earPointLen: 1 } })) !== head(pointed),
+     'fine lever face.earPointLen moves a cell');
+
+  // THE OLD EYE IS A SETTING: the `old` style draws the legacy head's eye,
+  // cell for cell, at the eye size most characters have, and the same
+  // number of iris cells at the biggest.
+  const eyeCells = b => {
+    const h = partsOf(b).head, m = new Map();
+    for (const [x, y, z, c] of h.cells) {
+      const k = x + ',' + z;
+      if (!m.has(k) || y < m.get(k)[0]) m.set(k, [y, c]);
+    }
+    return [...m].filter(([, v]) => v[1] === A.EYE).map(([k]) => k).sort();
+  };
+  for (const cols of [1, 2]) {
+    const base = mg.normalizeGenome({ face: { eyeCols: cols } });
+    const legacyEye = eyeCells(mg.generateMob(base, 0, { ...opts, face: 'legacy' }));
+    const o = mg.normalizeGenome(base);
+    mg.applyEyeStyle(o, 'old');
+    const oldStyle = eyeCells(mg.generateMob(mg.normalizeGenome(o), 0, opts));
+    if (cols === 1)
+      ok(JSON.stringify(legacyEye) === JSON.stringify(oldStyle),
+         'the `old` eye style is the legacy eye, cell for cell');
+    else
+      ok(legacyEye.length === oldStyle.length,
+         'the `old` eye style has the legacy iris size at eye size 2',
+         `${legacyEye.length} vs ${oldStyle.length}`);
+  }
+  for (const st of mg.EYE_STYLE_ORDER) {
+    const g = mg.normalizeGenome({});
+    mg.applyEyeStyle(g, st);
+    ok(mg.validateMob(mg.generateMob(mg.normalizeGenome(g), 0, opts)).length === 0,
+       `eye style ${st} builds sound`);
+  }
+
+  // THE EYES TAB holds the eyebrows as a sub-section, and every eye row is on it.
+  ok((mg.GENE_GROUPS.find(x => x.key === 'brows') || {}).parent === 'eyes',
+     'the eyebrows are a sub-section of the eyes tab');
+  ok(['face.eyeDx', 'face.eyeRow', 'face.eyeCols', 'face.eyeWhites', 'face.eyeBags',
+      'face.eyeOpen', 'face.eyeTilt', 'face.lashes', 'face.lidCrease']
+       .every(pth => mg.GENE_SPECS.find(x => x.path === pth).group === 'eyes'),
+     'every eye row is on the eyes tab');
 
   // 5. THE RACES ARE UNTOUCHED: a half step is a whole one on them, their
   //    slider steps are whole, the human's new rows do not show, and they
@@ -2347,7 +2433,8 @@ section('T. the fine face and the skin pass: a human drawn at the shipped lattic
   const late = mg.GENE_SPECS.filter(s => s.late).map(s => s.path);
   const r1bare = JSON.parse(JSON.stringify(r1));
   for (const p of late) mg.setPath(r1bare, p, mg.getPath(def, p));
-  ok(late.length === 10, 'ten late rows (the fine face’s and the skin’s)', String(late.length));
+  ok(mg.GENE_SPECS.filter(s => s.late).every(s => s.race === 'human'),
+     'every late row is a human\u2019s', String(late.length));
 }
 
 // =============================================================================

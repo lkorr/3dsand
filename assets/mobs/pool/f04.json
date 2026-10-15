@@ -305,9 +305,18 @@
       "armLengths": 1,
       "skin": {
         "texture": 0.15,
-        "detail": 0.6,
         "blush": 0,
-        "moles": 0.1
+        "moles": 0.1,
+        "collarbones": 0.5,
+        "chest": 0.6,
+        "navel": 0.6,
+        "knees": 0.6,
+        "elbows": 0.6,
+        "fingers": 0.6,
+        "knuckles": 0.5,
+        "nails": 1,
+        "toes": 0.6,
+        "softEdge": 1
       }
     },
     "shape": {
@@ -383,7 +392,23 @@
       "lashes": 0.5,
       "lidCrease": 0.25,
       "noseBridge": 0.5,
-      "noseBulb": 0.3
+      "noseBulb": 0.3,
+      "eyeStyle": "almond",
+      "irisSize": 0.3,
+      "whites": 1,
+      "glint": false,
+      "lashSpan": 0.7,
+      "lashTone": 0.7,
+      "creaseTone": 0.6,
+      "bagTone": 0.6,
+      "earHeight": 0,
+      "earBack": 0,
+      "earWidth": 0.5,
+      "earOut": 0,
+      "earTilt": 0,
+      "earLobe": 0.5,
+      "earPointLen": 0.5,
+      "earTone": 0.6
     },
     "hair": {
       "style": "fringe",
@@ -427,6 +452,7 @@
       "clothShade": "#663027",
       "nail": "#e4cab3",
       "lip": "#b5675f",
+      "lash": "#66625c",
       "root": "#4a3a2b",
       "moss": "#7f9a3e",
       "branch": "#6b5540",

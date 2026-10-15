@@ -11412,10 +11412,30 @@ were. Nothing about storage or rendering changes: the human already paid for
   ears with a rim and a hollow, a beard whose density is per fine cell
   (stubble at last). Every gene keeps its authored-unit meaning; the integer
   face rows take HALF steps on a human (`fineStep`, `specStep`), one shipped
-  cell each, and stay whole on every other race (`coerceGene`). Ten new rows
-  (`eyeOpen`, `eyeTilt`, `lashes`, `lidCrease`, `noseBridge`, `noseBulb`,
-  `body.skin.*`) are `late`: appended to `GENE_SPECS` and rolled after every
-  other draw, so no seeded litter or pinned random body moved.
+  cell each, and stay whole on every other race (`coerceGene`). The fine
+  face's own rows (eye shape/tilt/iris/whites/glint, lashes and their length,
+  opacity and colour, lid crease, the ear rows, nose bridge/tip, the skin
+  tab) are `late`: appended to `GENE_SPECS` and rolled after every other
+  draw, so no seeded litter or pinned random body moved; a row's `ui` places
+  it on its tab (breed.js `groupSpecs`) without moving a draw.
+- **Tabs (same day, owner ask):** an **eyes** tab holds every eye row with the
+  eyebrows as a sub-section under a divider (`GENE_GROUPS` `parent`), an
+  **ears** tab holds size, height, set-back, width, stick-out, tilt, lobe, the
+  elf point and its length; **`EYE_STYLES`** (almond, round, narrow, hooded,
+  upturned, doll, tired, **old**) are presets like the beards'. `old` is the
+  block eye: §T holds it to the legacy head's eye cell for cell at eye size 1.
+- **Opacity rows.** Lashes, whites, lid crease, under-eyes, the ear's hollow
+  and every skin feature (collarbones, chest line, navel, kneecaps, elbows,
+  fingers, knuckles, nails, toes — split out of one `detail` gene) are an
+  OPACITY: the feature's own art slot (`ART.CREASE` … `ART.TOE`, 181-194) is
+  painted the same cells at any setting, and `detailColors(colors, genome)`
+  mixes its COLOUR from the skin toward the full tone, snapped to tenths
+  (`toneQ`). 0 paints nothing; 1 is the existing colour (free); a step between
+  is a palette colour of its own, shared by every body with the same skin and
+  setting — the defaults share one shade mix and one lit mix per complexion.
+  The lash colour is `colors.lash`, a tone of the hair. The NOSTRILS are a
+  derived tone of the skin (`NOSTRIL_TONE`, the owner's pick off shana's
+  repainted mouth), lighter than the skin's shade they used.
 - **`humanSkinPass`** runs on every part of a human after the upscale and
   PAINTS ONLY — no cell added or removed, so armour boxes, the collider, the
   anchors and the left/right mirror are untouched (`test_mobgen.mjs` §T
@@ -11423,8 +11443,8 @@ were. Nothing about storage or rendering changes: the human already paid for
   knuckles, toes, a kneecap, the elbow crease, collarbones, a navel, the line
   under a man's chest, a one-cell checker where `shadeBack`'s dark half
   begins, `texture` mottle and `moles`.
-- **Four detail art slots** (`ART.FACE_SHADE` 201, `FACE_LIGHT` 200,
-  `EYE_WHITE` 199, `LASH` 198). Three are an existing colour under a new number
+- **Detail art slots** (`ART.FACE_SHADE` 201, `FACE_LIGHT` 200,
+  `EYE_WHITE` 199, `LASH` 198, then 197-180: `mg.DETAIL_SLOTS`). Three are an existing colour under a new number
   (skinShade, skinLight, hairShade), which costs the shared art palette nothing
   (it dedupes by RGB and merges only painted slots) and says two things the old
   numbers could not: `hairMass` reads `SKIN_LIGHT` on a head as scalp and roots

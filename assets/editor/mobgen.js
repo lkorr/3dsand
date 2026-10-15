@@ -323,27 +323,115 @@ export const ART = {
   //    the creator. These four are drawn as themselves.
   // EYE_WHITE is the one new colour, and it is ONE colour for every human
   // (EYE_WHITE_HEX), so the whole cast spends one merged slot on it.
-  FACE_SHADE: 201,   // = skinShade: lines, creases, nostrils, a soft mouth
+  FACE_SHADE: 201,   // = skinShade: lines, creases, freckles, a soft mouth
   FACE_LIGHT: 200,   // = skinLight: highlights, a lit lip, a scar
-  EYE_WHITE: 199,    // the whites of the eyes, and teeth in an open mouth
-  LASH: 198,         // = hairShade: the lash line over each eye, moles
+  EYE_WHITE: 199,    // the whites of the eyes (toned: face.whites)
+  LASH: 198,         // the lash line (toned: colors.lash at face.lashTone)
+  // The NOSTRILS (and the crease of each wing): a tone of the skin of their
+  // own, DERIVED (nostrilHex). skinShade was a hole punched in the face. A
+  // colour of its own per complexion -- six for the whole stock pool.
+  NOSTRIL: 197,
+  TEETH: 196,        // = EYE_WHITE_HEX: an open mouth's teeth, which do not fade
+  GLINT: 195,        // = GLINT_HEX: a catchlight in the iris
+  // THE TONED DETAIL (2026-10-15, owner ask): every feature below has its own
+  // OPACITY gene, and its colour is MIXED from the skin toward the feature's
+  // full tone by it (detailColors) -- "it looks like I'm adjusting the opacity
+  // of the collarbone". Snapped to tenths (toneQ), so two bodies with the same
+  // skin and the same setting share the colour in the engine's merged art
+  // palette; 0 paints nothing and 1 is an existing colour, so only the steps
+  // between cost a palette entry.
+  CREASE: 194,       // the lid crease        -> skinShade, face.creaseTone
+  BAGS: 193,         // under the eyes        -> skinShade, face.bagTone
+  EAR_IN: 192,       // the ear's hollow      -> skinShade, face.earTone
+  COLLAR_L: 191,     // collarbone, lit       -> skinLight, body.skin.collarbones
+  COLLAR_S: 190,     // collarbone, shadow    -> skinShade, body.skin.collarbones
+  CHEST: 189,        // the line under a man's chest -> skinShade, body.skin.chest
+  NAVEL: 188,        //                       -> skinShade, body.skin.navel
+  KNEE_L: 187,       // kneecap, lit          -> skinLight, body.skin.knees
+  KNEE_S: 186,       // under the kneecap     -> skinShade, body.skin.knees
+  ELBOW: 185,        // the elbow crease      -> skinShade, body.skin.elbows
+  FINGER: 184,       // between the fingers   -> skinShade, body.skin.fingers
+  KNUCKLE: 183,      //                       -> skinLight, body.skin.knuckles
+  NAIL_T: 182,       // finger and toe nails  -> nail,      body.skin.nails
+  TOE: 181,          // between the toes      -> skinShade, body.skin.toes
+  MOLE: 180,         // = hairShade: moles
 };
+
+/** Every slot the fine face and the skin pass may paint, and only they. */
+export const DETAIL_SLOTS = [ART.FACE_SHADE, ART.FACE_LIGHT, ART.EYE_WHITE,
+  ART.LASH, ART.NOSTRIL, ART.TEETH, ART.GLINT, ART.CREASE, ART.BAGS, ART.EAR_IN,
+  ART.COLLAR_L, ART.COLLAR_S, ART.CHEST, ART.NAVEL, ART.KNEE_L, ART.KNEE_S,
+  ART.ELBOW, ART.FINGER, ART.KNUCKLE, ART.NAIL_T, ART.TOE, ART.MOLE];
+
+/** The nostril's tone AS A RATIO OF THE SKIN, per channel. Taken from the
+ *  owner's own pick (2026-10-15): shana's mouth line repainted #b07a66 over
+ *  her #bc8660 skin, "the lighting of her new mouth colour compared to her
+ *  skin should be how nostrils look". A touch darker and cooler than the skin
+ *  -- a crease in the light, not a hole -- carried onto every complexion. */
+export const NOSTRIL_TONE = [0xb0 / 0xbc, 0x7a / 0x86, 0x66 / 0x60];
+
+/** The nostril colour for this skin (NOSTRIL_TONE). */
+export function nostrilHex(skin) {
+  const n = parseInt(String(skin || '#c98d63').slice(1, 7), 16);
+  return '#' + [16, 8, 0].map((sh, i) =>
+    clamp(Math.round(((n >> sh) & 255) * NOSTRIL_TONE[i]), 0, 255)
+      .toString(16).padStart(2, '0')).join('');
+}
 
 /** The whites of every human's eyes: one colour for the whole cast (see
  *  ART.EYE_WHITE). A warm off-white, because a pure white sclera next to
  *  skin reads as a glowing eye under the engine's lighting. */
 export const EYE_WHITE_HEX = '#ddd5c8';
+/** A catchlight: one colour for the cast, brighter than the whites. */
+export const GLINT_HEX = '#f4eee4';
 
-/** Detail slot -> colour, DERIVED from the genome's own colours (see the
- *  ART note above). Written into a palette for a human only, the one race
- *  that paints them (paletteBytes); the Characters page draws them from here
- *  so its preview and the file agree. */
-export function detailColors(colors) {
+/** A tone's opacity, snapped to tenths: the steps a slider can show, and the
+ *  steps the merged palette pays for (see the ART note on the toned detail). */
+export const toneQ = v => Math.round(clamp(Number(v) || 0, 0, 1) * 10) / 10;
+
+/** `from` mixed toward `to` by t (0..1, snapped by the caller). The ends are
+ *  returned EXACTLY, so a full-strength tone is the existing colour and costs
+ *  the palette nothing. */
+function mixHex(from, to, t) {
+  if (t >= 1) return to;
+  if (t <= 0) return from;
+  const a = parseInt(String(from).slice(1, 7), 16), b = parseInt(String(to).slice(1, 7), 16);
+  return '#' + [16, 8, 0].map(sh => Math.round(((a >> sh) & 255) * (1 - t) +
+    ((b >> sh) & 255) * t).toString(16).padStart(2, '0')).join('');
+}
+
+/** Detail slot -> colour, DERIVED from the genome's own colours and, for the
+ *  toned slots, its opacity genes (without a genome every tone is at full
+ *  strength). Written into a palette for a human only, the one race that
+ *  paints them (paletteBytes); the Characters page draws them from here so
+ *  its preview and the file agree. */
+export function detailColors(colors, g) {
+  const skin = colors.skin;
+  const op = path => (g ? toneQ(getPath(g, path) ?? 1) : 1);
+  const mix = (to, path) => mixHex(skin, to, op(path));
   return {
     [ART.FACE_SHADE]: colors.skinShade,
     [ART.FACE_LIGHT]: colors.skinLight,
-    [ART.EYE_WHITE]: EYE_WHITE_HEX,
-    [ART.LASH]: colors.hairShade,
+    [ART.EYE_WHITE]: mix(EYE_WHITE_HEX, 'face.whites'),
+    [ART.LASH]: mix(colors.lash || colors.hairShade, 'face.lashTone'),
+    [ART.NOSTRIL]: nostrilHex(skin),
+    [ART.TEETH]: EYE_WHITE_HEX,
+    [ART.GLINT]: GLINT_HEX,
+    [ART.CREASE]: mix(colors.skinShade, 'face.creaseTone'),
+    [ART.BAGS]: mix(colors.skinShade, 'face.bagTone'),
+    [ART.EAR_IN]: mix(colors.skinShade, 'face.earTone'),
+    [ART.COLLAR_L]: mix(colors.skinLight, 'body.skin.collarbones'),
+    [ART.COLLAR_S]: mix(colors.skinShade, 'body.skin.collarbones'),
+    [ART.CHEST]: mix(colors.skinShade, 'body.skin.chest'),
+    [ART.NAVEL]: mix(colors.skinShade, 'body.skin.navel'),
+    [ART.KNEE_L]: mix(colors.skinLight, 'body.skin.knees'),
+    [ART.KNEE_S]: mix(colors.skinShade, 'body.skin.knees'),
+    [ART.ELBOW]: mix(colors.skinShade, 'body.skin.elbows'),
+    [ART.FINGER]: mix(colors.skinShade, 'body.skin.fingers'),
+    [ART.KNUCKLE]: mix(colors.skinLight, 'body.skin.knuckles'),
+    [ART.NAIL_T]: mix(colors.nail, 'body.skin.nails'),
+    [ART.TOE]: mix(colors.skinShade, 'body.skin.toes'),
+    [ART.MOLE]: colors.hairShade,
   };
 }
 
@@ -408,6 +496,10 @@ export const COLOR_SLOTS = {
   ...SE.COLOR_SLOTS,
   // ...and the goblin's, last again.
   ...GB.COLOR_SLOTS,
+  // THE LASH COLOUR (2026-10-15), last: a tone of the hair, so it takes no
+  // draw in rollColors' jitter loop. Its slot's colour on a human is the
+  // MIX detailColors makes (face.lashTone), written after this one.
+  lash: ART.LASH,
 };
 
 /**
@@ -439,7 +531,7 @@ export const COLOR_FAMILIES = {
   // with it -- so a random character's lips are its own complexion's, and a
   // red picked by hand keeps its relationship when the skin moves.
   skin:  ['skinShade', 'skinLight', 'nail', 'lip'],
-  hair:  ['hairShade'],
+  hair:  ['hairShade', 'lash'],
   cloth: ['clothShade'],
 };
 /** slot -> the base it is a tone of, for every dependent slot. */
@@ -614,9 +706,22 @@ export function defaultGenome() {
        *  shipped lattice, never geometry, so armour fits whatever is set. */
       skin: {
         texture: 0.15,  // a fine mottle of the shade and lit tones
-        detail: 0.6,    // fingers, nails, knuckles, toes, knees, collarbones, navel
         blush: 0,       // the lip colour over the cheeks (and, strong, the nose)
         moles: 0.1,     // a few dark marks on bare skin
+        // Each feature is an OPACITY: 0 not there, 1 its full tone
+        // (detailColors). The shade features share one default and the lit
+        // ones another, so a whole cast at the defaults spends two merged
+        // palette colours per complexion on them, not ten.
+        collarbones: 0.5,
+        chest: 0.6,     // the line under a man's chest
+        navel: 0.6,
+        knees: 0.6,
+        elbows: 0.6,
+        fingers: 0.6,   // the grooves between the fingers
+        knuckles: 0.5,
+        nails: 1,
+        toes: 0.6,
+        softEdge: 1,    // the checker where a limb's shaded side begins
       },
     },
 
@@ -720,6 +825,26 @@ export function defaultGenome() {
       lidCrease: 0.25,  // a shaded line over the lashes: deep-set eyes
       noseBridge: 0.5,  // 0 a button (tip only) .. 1 a bridge up between the eyes
       noseBulb: 0.3,    // the tip: flat .. a round bulb .. a wide one
+      // ---- the eyes tab (2026-10-15, owner ask: more eye control). Opacity
+      // genes (*Tone, whites) mix their colour from the skin toward the full
+      // tone (detailColors); 0 is gone, 1 the full colour.
+      eyeStyle: 'almond', // the last preset picked (EYE_STYLES): a label only
+      irisSize: 0.3,    // how much of the eye's width is iris
+      whites: 1,        // the whites: 0 skin-coloured (the old look) .. 1 white
+      glint: false,     // a catchlight in the iris (needs a two-row eye)
+      lashSpan: 0.7,    // how much of the eye the lash line covers, from the outer corner
+      lashTone: 0.7,    // the lash line: the skin .. colors.lash
+      creaseTone: 0.6,  // the lid crease: the skin .. the shade
+      bagTone: 0.6,     // under the eyes: the skin .. the shade
+      // ---- the ears tab (2026-10-15)
+      earHeight: 0,     // the ear up (+) or down (-), authored rows (half steps = a row)
+      earBack: 0,       // the ear back (+) or forward (-), shipped cells
+      earWidth: 0.5,    // front to back: 2 .. 4 cells
+      earOut: 0,        // how far it stands off the head: flat .. the rim .. all of it
+      earTilt: 0,       // the top leans back (+) or forward (-)
+      earLobe: 0.5,     // 0 attached .. 1 a long hanging lobe
+      earPointLen: 0.5, // the elf point's length (with earPoint)
+      earTone: 0.6,     // the hollow: the skin .. the shade
     },
 
     /** HAIR IS A FUNCTION, not a texture: `back`/`front` are the z at or above
@@ -785,6 +910,9 @@ export function defaultGenome() {
       clothShade: '#5c4f39',
       nail: '#d9ae90',
       lip: '#a8564a',
+      // The lash line's colour (2026-10-15): a tone of the hair, carried with
+      // it, faded toward the skin by face.lashTone.
+      lash: '#33251a',
       // Sylvan-only colours (sylvan.js). Carried by every genome so a race
       // switch has somewhere to put them; a human never paints them.
       root: SY.DEFAULT_COLORS.root,
@@ -935,6 +1063,55 @@ function weightedPick(weights, r) {
   return ks[ks.length - 1];
 }
 
+/** EYE STYLES (2026-10-15): presets of the fine eye's genes, as hairstyles and
+ *  beards are -- a starting point, every row still drags freely after. Every
+ *  style states every gene it touches. `old` is the block eye the human had
+ *  before the fine face: a two-by-two iris, no whites, no lashes, no crease
+ *  (test_mobgen.mjs §T holds it to the legacy head's eye cell for cell). */
+export const EYE_STYLES = {
+  almond:   { eyeOpen: 0.4, eyeTilt: 0, irisSize: 0.3, whites: 1, glint: false,
+              lashes: 0.5, lashSpan: 0.7, lashTone: 0.7, lidCrease: 0.25,
+              creaseTone: 0.6, eyeBags: 0 },
+  round:    { eyeOpen: 0.85, eyeTilt: 0, irisSize: 0.45, whites: 1, glint: true,
+              lashes: 0.5, lashSpan: 0.8, lashTone: 0.7, lidCrease: 0.2,
+              creaseTone: 0.5, eyeBags: 0 },
+  narrow:   { eyeOpen: 0.1, eyeTilt: 0, irisSize: 0.3, whites: 0.8, glint: false,
+              lashes: 0.4, lashSpan: 0.6, lashTone: 0.6, lidCrease: 0.5,
+              creaseTone: 0.6, eyeBags: 0 },
+  hooded:   { eyeOpen: 0.3, eyeTilt: -0.4, irisSize: 0.3, whites: 0.9, glint: false,
+              lashes: 0.4, lashSpan: 0.6, lashTone: 0.6, lidCrease: 0.7,
+              creaseTone: 0.8, eyeBags: 0 },
+  upturned: { eyeOpen: 0.45, eyeTilt: 0.6, irisSize: 0.3, whites: 1, glint: false,
+              lashes: 0.75, lashSpan: 0.8, lashTone: 0.8, lidCrease: 0.25,
+              creaseTone: 0.6, eyeBags: 0 },
+  doll:     { eyeOpen: 1, eyeTilt: 0, irisSize: 0.6, whites: 1, glint: true,
+              lashes: 0.9, lashSpan: 1, lashTone: 0.9, lidCrease: 0,
+              creaseTone: 0.6, eyeBags: 0 },
+  tired:    { eyeOpen: 0.25, eyeTilt: -0.4, irisSize: 0.3, whites: 0.7, glint: false,
+              lashes: 0.3, lashSpan: 0.5, lashTone: 0.5, lidCrease: 0.4,
+              creaseTone: 0.6, eyeBags: 0.6 },
+  old:      { eyeOpen: 1, eyeTilt: 0, irisSize: 1, whites: 0, glint: false,
+              lashes: 0, lashSpan: 0.7, lashTone: 0.7, lidCrease: 0,
+              creaseTone: 0.6, eyeBags: 0, eyeWhites: false },
+};
+export const EYE_STYLE_ORDER = Object.keys(EYE_STYLES);
+
+/** Snap the eye genes to a named style. */
+export function applyEyeStyle(genome, style) {
+  const s = EYE_STYLES[style];
+  if (!s) return genome;
+  genome.face.eyeStyle = style;
+  Object.assign(genome.face, s);
+  return genome;
+}
+
+/** A STYLE ROW's pick, for the Characters page's generic enum row: the
+ *  style's own numbers go with the name. Returns whether `path` is one. */
+export function applyStyleRow(genome, path, value) {
+  if (path === 'face.eyeStyle') { applyEyeStyle(genome, value); return true; }
+  return false;
+}
+
 /** Snap the beard genes to a named style (see applyHairStyle). */
 export function applyBeardStyle(genome, style) {
   const s = BEARD_STYLES[style];
@@ -1045,12 +1222,17 @@ export const GENE_GROUPS = [
     note: 'The three lengths ADD UP to the arm (the stock arm hangs to the ' +
           'hip line; longer reaches down the thigh). Size and muscle widen ' +
           'the arm itself, so a big arm hangs a little further out.' },
-  { key: 'face', title: 'head and face',
-    note: 'A face here is about twenty voxels across, so small moves read ' +
-          'large. The side view is where the skull shape shows. A HUMAN\u2019s ' +
-          'face is drawn at full resolution (12.5 mm cells) and its sliders ' +
-          'take half steps, a cell each; other races paint at half that.' },
-  { key: 'brows', title: 'eyebrows',
+  { key: 'face', title: 'head',
+    note: 'The skull: jaw, cheekbones, crown and how far it sits behind the ' +
+          'face. A face here is about twenty voxels across, so small moves ' +
+          'read large; the side view is where the skull shape shows.' },
+  { key: 'eyes', title: 'eyes',
+    note: 'A HUMAN\u2019s eyes are drawn at full resolution (12.5 mm cells) and ' +
+          'its sliders take half steps, a cell each; other races paint at ' +
+          'half that. Pick a style to set the rows below, then drag. The ' +
+          'opacity rows (whites, lashes, crease, under-eyes) fade a feature ' +
+          'toward the skin behind it, in tenths. Eyebrows are further down.' },
+  { key: 'brows', title: 'eyebrows', parent: 'eyes',
     note: 'Painted over the eyes in the hair colour (or the tone picked ' +
           'here). Every row below needs the eyebrows box ticked. A step is ' +
           'two cells; on a human a half step is one, and the brow tapers ' +
@@ -1061,12 +1243,18 @@ export const GENE_GROUPS = [
           'under the line. On a human the line bends along a curve and the ' +
           'lips sit above and below it.' },
   { key: 'details', title: 'face details',
-    note: 'Nose and ears are real geometry (a cell standing proud of the ' +
-          'face); the rest is paint in the skin tones -- shade for hollows, ' +
-          'lines and freckles, the lit tone for highlights and scars.' },
+    note: 'The nose is real geometry (cells standing proud of the face); the ' +
+          'rest is paint in the skin tones -- shade for hollows, lines and ' +
+          'freckles, the lit tone for highlights and scars.' },
+  { key: 'ears', title: 'ears',
+    note: 'Real geometry off the side of the skull, a rim around a shaded ' +
+          'hollow. Size and the elf point work on every race; the rest are a ' +
+          'human\u2019s (its fine head).' },
   { key: 'skin', title: 'skin',
     note: 'Painted at full resolution over the whole body, never geometry, ' +
-          'so armour still fits. Humans only.' },
+          'so armour still fits. Humans only. Each feature row is an OPACITY: ' +
+          '0 is not there, 1 is its full tone, and between it fades toward ' +
+          'the plain skin in tenths.' },
   { key: 'beard', title: 'facial hair',
     note: 'Pick a style to set everything below, then drag. The beard is ' +
           'paint on the lower face built from regions -- moustache, chin, ' +
@@ -1310,29 +1498,29 @@ export const GENE_SPECS = [
           'and the face pushes out into a snout; a human wants most of it ' +
           'behind. Side view.',
     min: 0.0, max: 1.6, step: 0.1, sigma: 0.25 },
-  { path: 'face.eyeDx', label: 'eye spacing', group: 'face',
+  { path: 'face.eyeDx', label: 'eye spacing', group: 'eyes', ui: 1,
     hint: 'Half the gap between the pupils. Wide-set eyes read young, or not ' +
           'quite human.',
     min: 1.5, max: 3.5, step: 0.25, sigma: 0.3 },
-  { path: 'face.eyeRow', label: 'eye height', group: 'face',
+  { path: 'face.eyeRow', label: 'eye height', group: 'eyes', ui: 2,
     hint: 'Nudges the eyes one row up or down from where the skull puts ' +
           'them. Up is a high brow, down is a heavy one.',
     min: -1, max: 1, step: 1, int: true, fineStep: 0.5, sigma: 0.5,
     fineHint: 'Moves the eyes up or down a row at a time from where the ' +
               'skull puts them. Up is a high brow, down is a heavy one.' },
-  { path: 'face.eyeCols', label: 'eye size', group: 'face',
+  { path: 'face.eyeCols', label: 'eye size', group: 'eyes', ui: 3,
     hint: 'Columns painted per eye. 1 is a dot, 2 is a wide stare.',
     min: 1, max: 2, step: 1, int: true, fineStep: 0.5, sigma: 0.4,
     fineHint: 'How wide each eye is. 1 is an iris with a white either side; ' +
               '1.5 widens the iris; 2 adds a white at the outer corner.' },
-  { path: 'face.eyeWhites', label: 'eye whites', group: 'face', kind: 'bool',
+  { path: 'face.eyeWhites', label: 'eye whites', group: 'eyes', kind: 'bool', ui: 9,
     hint: 'A lit cell outward of each pupil, so the eye reads as an eye ' +
           'rather than a dot.',
     fineLabel: 'wide eyes',
     fineHint: 'One more white at the outer corner of each eye: a wider, ' +
               'more open stare. (A human\u2019s eyes always have whites.)',
     roll: 0.3, sigma: 0.1 },
-  { path: 'face.eyeBags', label: 'under-eyes', group: 'face',
+  { path: 'face.eyeBags', label: 'under-eyes', group: 'eyes', ui: 15,
     hint: 'Shade under the eyes: tired, old, or hard-living. Past halfway ' +
           'it spreads to the outer corner.',
     min: 0, max: 1, step: 0.05, roll: 0.2, sigma: 0.1 },
@@ -1449,12 +1637,12 @@ export const GENE_SPECS = [
     fineHint: '1 is a narrow tip, 1.5 flares the nostrils, 2 is broad all ' +
               'the way down.',
     min: 1, max: 2, step: 1, int: true, fineStep: 0.5, sigma: 0.3 },
-  { path: 'face.earSize', label: 'ears', group: 'details',
+  { path: 'face.earSize', label: 'size', group: 'ears', ui: 1,
     hint: 'Rows of ear: 0 small, 1 as drawn, 2 large.',
     fineHint: 'Rows of ear, a row a half step: 0 small, 1 as drawn, 2 large. ' +
               'From 1.5 the back rim stands out from the head.',
     min: 0, max: 2, step: 1, int: true, fineStep: 0.5, sigma: 0.3 },
-  { path: 'face.earPoint', label: 'pointed ears', group: 'details',
+  { path: 'face.earPoint', label: 'pointed ears', group: 'ears', ui: 8,
     kind: 'bool',
     hint: 'A point on top of each ear -- elf, goblin.',
     roll: 0.1, sigma: 0.05 },
@@ -1774,24 +1962,108 @@ GENE_SPECS.splice(GENE_SPECS.findIndex(sp => sp.group === 'colour'), 0,
  *  loop too, which draws again after it (the sex, the hairstyle); they are
  *  rolled at its very end instead. */
 GENE_SPECS.push(
-  { path: 'face.eyeOpen', label: 'eye shape', group: 'face', race: 'human', late: true,
+  // ---- THE EYES TAB (2026-10-15). `ui` orders a tab's rows on the page
+  // (breed.js groupSpecs) without moving a draw: rows without one follow in
+  // this array's order.
+  { path: 'face.eyeStyle', label: 'style', group: 'eyes', race: 'human',
+    late: true, styled: true, ui: 0, kind: 'enum', choices: EYE_STYLE_ORDER,
+    hint: 'A preset of the shape, lash, crease and whites rows below. ' +
+          '"old" is the block eye from before the fine face: no whites, no ' +
+          'lashes, a two-by-two iris. Drag the rows afterwards as you like.' },
+  { path: 'face.eyeOpen', label: 'eye shape', group: 'eyes', race: 'human', late: true,
+    ui: 4,
     hint: 'Narrow to round. Below 0.7 the eye is one row, an almond under ' +
           'its lashes; from 0.7 it is two rows with skin at its corners -- ' +
           'round, open, young.',
     min: 0, max: 1, step: 0.05, sigma: 0.15 },
-  { path: 'face.eyeTilt', label: 'eye tilt', group: 'face', race: 'human', late: true,
+  { path: 'face.eyeTilt', label: 'eye tilt', group: 'eyes', race: 'human', late: true,
+    ui: 5,
     hint: 'Lifts (above 0) or drops (below 0) the outer corner of each eye ' +
           'by a row: upturned, cat-like eyes or sad, hooded ones.',
     min: -1, max: 1, step: 0.05, roll: 0.4, sigma: 0.2 },
-  { path: 'face.lashes', label: 'lashes', group: 'face', race: 'human', late: true,
-    hint: 'The dark line over each eye, in the hair\u2019s shade. None, ' +
-          'then a line, then from 0.7 a flick past the outer corner and ' +
-          'from 0.85 a line under it too.',
+  { path: 'face.irisSize', label: 'iris size', group: 'eyes', race: 'human',
+    late: true, ui: 6,
+    hint: 'How much of the eye is iris: from one cell with white either side ' +
+          'to nearly all of it. At 1, with the whites at 0 and a round eye, ' +
+          'it is the old block eye.',
     min: 0, max: 1, step: 0.05, sigma: 0.15 },
-  { path: 'face.lidCrease', label: 'lid crease', group: 'face', race: 'human', late: true,
+  { path: 'face.whites', label: 'whites', group: 'eyes', race: 'human',
+    late: true, ui: 7,
+    hint: 'OPACITY of the whites: 1 white, 0 the skin colour, so only the ' +
+          'iris shows (the old look). Between, they fade in tenths.',
+    min: 0, max: 1, step: 0.1, sigma: 0.1 },
+  { path: 'face.glint', label: 'glint', group: 'eyes', race: 'human',
+    late: true, ui: 8, kind: 'bool', roll: 0.3,
+    hint: 'A catchlight in the top outer corner of the iris. Needs a ' +
+          'two-row eye (eye shape from 0.7).', sigma: 0.1 },
+  { path: 'face.lashes', label: 'lashes', group: 'eyes', race: 'human', late: true,
+    ui: 10,
+    hint: 'The line over each eye. None, then a line, then from 0.7 a ' +
+          'flick past the outer corner and from 0.85 a line under it too.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'face.lashSpan', label: 'lash length', group: 'eyes', race: 'human',
+    late: true, ui: 11,
+    hint: 'How much of the eye the lash line covers, from the outer corner ' +
+          'in: short is a wing at the outer corner, 1 the whole eye.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'face.lashTone', label: 'lash opacity', group: 'eyes', race: 'human',
+    late: true, ui: 12,
+    hint: 'OPACITY of the lash line: 1 is the lash colour (the swatch at the ' +
+          'bottom of this tab), lower fades it into the skin behind it -- a ' +
+          'lighter, finer lash.',
+    min: 0, max: 1, step: 0.1, sigma: 0.1 },
+  { path: 'face.lidCrease', label: 'lid crease', group: 'eyes', race: 'human', late: true,
+    ui: 13,
     hint: 'A shaded line over the lashes: deep-set eyes. From 0.6 it runs ' +
           'past the outer corner, hooding it.',
     min: 0, max: 1, step: 0.05, roll: 0.5, sigma: 0.15 },
+  { path: 'face.creaseTone', label: 'crease opacity', group: 'eyes',
+    race: 'human', late: true, ui: 14,
+    hint: 'OPACITY of the lid crease: 1 the skin\u2019s shade, lower fades it ' +
+          'toward the skin.',
+    min: 0, max: 1, step: 0.1, sigma: 0.1 },
+  { path: 'face.bagTone', label: 'under-eye opacity', group: 'eyes',
+    race: 'human', late: true, ui: 16,
+    hint: 'OPACITY of the under-eye shade (the under-eyes row sets how much ' +
+          'of it there is).',
+    min: 0, max: 1, step: 0.1, sigma: 0.1 },
+  // ---- THE EARS TAB (2026-10-15) ----
+  { path: 'face.earHeight', label: 'height', group: 'ears', race: 'human',
+    late: true, ui: 2,
+    hint: 'The ear up or down the side of the head, a row a half step.',
+    min: -1, max: 1, step: 0.5, roll: 0.3, sigma: 0.3 },
+  { path: 'face.earBack', label: 'set back', group: 'ears', race: 'human',
+    late: true, ui: 3,
+    hint: 'The ear back (above 0) or forward along the side of the head, ' +
+          'two cells either way.',
+    min: -1, max: 1, step: 0.5, roll: 0.3, sigma: 0.3 },
+  { path: 'face.earWidth', label: 'width', group: 'ears', race: 'human',
+    late: true, ui: 4,
+    hint: 'Front to back: 0 a narrow two-cell ear, 1 a broad four-cell one.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'face.earOut', label: 'stick-out', group: 'ears', race: 'human',
+    late: true, ui: 5,
+    hint: 'How far the ear stands off the head. From 0.4 its back rim stands ' +
+          'a second cell out; from 0.8 the whole ear does (jug ears).',
+    min: 0, max: 1, step: 0.05, roll: 0.3, sigma: 0.15 },
+  { path: 'face.earTilt', label: 'tilt', group: 'ears', race: 'human',
+    late: true, ui: 6,
+    hint: 'Above 0 the top of the ear leans back a cell; below 0 forward.',
+    min: -1, max: 1, step: 0.05, roll: 0.3, sigma: 0.2 },
+  { path: 'face.earLobe', label: 'lobe', group: 'ears', race: 'human',
+    late: true, ui: 7,
+    hint: '0 an attached lobe (the ear ends in its front cell), 0.5 as ' +
+          'drawn, from 0.75 a lobe that hangs a row lower.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'face.earPointLen', label: 'point length', group: 'ears',
+    race: 'human', late: true, ui: 9,
+    hint: 'How long the elf point is, two cells to six (needs pointed ears).',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'face.earTone', label: 'hollow opacity', group: 'ears',
+    race: 'human', late: true, ui: 10,
+    hint: 'OPACITY of the shaded hollow inside the rim: 0 a flat skin ear, ' +
+          '1 the skin\u2019s full shade.',
+    min: 0, max: 1, step: 0.1, sigma: 0.1 },
   { path: 'face.noseBridge', label: 'nose bridge', group: 'details',
     race: 'human', late: true,
     hint: 'How much nose stands between the tip and the eyes. Below 0.3 a ' +
@@ -1802,25 +2074,52 @@ GENE_SPECS.push(
     hint: 'From 0.4 the tip stands a second cell proud (a bulb); from 0.8 its ' +
           'bottom row widens too.',
     min: 0, max: 1, step: 0.05, sigma: 0.2 },
-  { path: 'body.skin.detail', label: 'body detail', group: 'skin',
-    race: 'human', late: true,
-    hint: 'Fingers, nails and knuckles, toes and toenails, kneecaps, the ' +
-          'crease of each elbow, collarbones, a navel, and on a man the line ' +
-          'under the chest -- with the hard edge where the shadowed side ' +
-          'begins broken up. 0 turns it all off; past halfway the lines ' +
-          'gain their shadows.',
+  ...[
+    ['collarbones', 'collarbones', 'The two lines from the throat out to the ' +
+     'shoulders: a lit ridge with its shadow under it.'],
+    ['chest', 'chest line', 'The line under each side of the chest. A man\u2019s ' +
+     'only (a woman\u2019s chest is the bra).'],
+    ['navel', 'navel', 'The navel, low on the belly.'],
+    ['knees', 'kneecaps', 'A lit kneecap at the top of each shin, shaded under.'],
+    ['elbows', 'elbows', 'The crease inside each elbow.'],
+    ['fingers', 'fingers', 'The grooves that split the hand into fingers, ' +
+     'down both sides and across the tips.'],
+    ['knuckles', 'knuckles', 'Lit knuckles across the back of each hand.'],
+    ['nails', 'nails', 'Finger and toe nails, in the nail colour (on the ' +
+     'colours tab).'],
+    ['toes', 'toes', 'The grooves between the toes, over the top of each foot.'],
+  ].map(([k, label, hint], i) => ({
+    path: 'body.skin.' + k, label, group: 'skin', race: 'human', late: true,
+    ui: 10 + i, hint: hint + ' OPACITY: 0 none, 1 the full tone; between, it ' +
+                      'fades toward the skin in tenths.',
+    min: 0, max: 1, step: 0.1, sigma: 0.1,
+    ...(k === 'chest' ? { sex: 'male' } : {}) })),
+  { path: 'body.skin.softEdge', label: 'soft shading', group: 'skin',
+    race: 'human', late: true, ui: 20,
+    hint: 'Breaks up the hard line where each limb\u2019s shaded side begins ' +
+          'into a one-cell checker, so it reads as the form turning. 0 is ' +
+          'the hard line.',
     min: 0, max: 1, step: 0.05, sigma: 0.1 },
   { path: 'body.skin.texture', label: 'texture', group: 'skin', race: 'human', late: true,
+    ui: 1,
     hint: 'A fine mottle of the shaded and lit skin tones, in patches. ' +
           'A little reads as skin; a lot as weathered or blotched.',
     min: 0, max: 1, step: 0.05, sigma: 0.1 },
   { path: 'body.skin.blush', label: 'blush', group: 'skin', race: 'human', late: true,
+    ui: 2,
     hint: 'The lip colour dabbed over the cheeks, thinning to the edge: a ' +
           'flush, cold, drink, rouge. Pick the lip colour to change it.',
     min: 0, max: 1, step: 0.05, roll: 0.25, sigma: 0.1 },
   { path: 'body.skin.moles', label: 'moles', group: 'skin', race: 'human', late: true,
+    ui: 3,
     hint: 'A few dark marks scattered over bare skin, face included.',
     min: 0, max: 1, step: 0.05, roll: 0.5, sigma: 0.1 },
+  // THE LASH COLOUR: a tone of the hair (COLOR_FAMILIES), so a roll carries
+  // it with the hair; shown on the eyes tab (COLOR_HOME).
+  { path: 'colors.lash', label: 'lashes', group: 'colour', kind: 'color',
+    tone: 'hair', race: 'human', late: true, sigma: 0.1,
+    hint: 'The lash line\u2019s colour. The eyes tab\u2019s lash opacity fades ' +
+          'it toward the skin.' },
 );
 
 /** Does this row apply to this genome? (race-gated rows, see GENE_SPECS;
@@ -1936,6 +2235,11 @@ export function normalizeGenome(src) {
   if (src && typeof src === 'object' &&
       !(src.colors && typeof src.colors === 'object' && 'lip' in src.colors))
     g.colors.lip = deepLip(g.colors);
+  // ...and one from before the LASH colour, lashes in its own hair's shade:
+  // the colour the lash line was drawn in until it had a swatch.
+  if (src && typeof src === 'object' &&
+      !(src.colors && typeof src.colors === 'object' && 'lash' in src.colors))
+    g.colors.lash = g.colors.hairShade;
   const def = defaultGenome();
   for (const spec of GENE_SPECS)
     setPath(g, spec.path, coerceGene(spec, getPath(g, spec.path),
@@ -1980,7 +2284,8 @@ export const COLOR_HOME = {
   nail: ['arms', 'dmbody', 'gbhide'],
   lip: ['mouth'],
   hair: ['hair', 'sylcrown'], hairShade: ['hair', 'sylcrown'],
-  eye: ['face', 'sylface', 'autoface', 'andface', 'dmhead', 'gbface'],
+  eye: ['eyes', 'sylface', 'autoface', 'andface', 'dmhead', 'gbface'],
+  lash: ['eyes'],
   cloth: ['underwear'], clothShade: ['underwear'],
   root: ['sylbark'], moss: ['sylbark'], branch: ['sylbranch'],
   flower: ['sylcrown'], flowerEye: ['sylcrown'], leaf2: ['sylcrown'],
@@ -2526,6 +2831,9 @@ export function randomGenome(rng, locks, opts = {}) {
   // default. A race that is not human takes no draw (specApplies).
   for (const spec of GENE_SPECS) {
     if (!spec.late || isLocked(locks, spec.path) || !specApplies(spec, g)) continue;
+    // A colour is carried with its base (reshadeFamily above); a style row
+    // is a label, not a draw.
+    if (spec.kind === 'color' || spec.styled) continue;
     if (spec.roll !== undefined && r() >= spec.roll) continue;
     if (spec.kind === 'bool') { setPath(g, spec.path, r() < 0.4); continue; }
     if (spec.kind === 'enum') { setPath(g, spec.path, r.pick(spec.choices)); continue; }
@@ -3933,42 +4241,66 @@ function headVoxFine(g, artSize, ctx) {
   // curls back at the top. Placed per (Y, Z) against the skull's own outermost
   // cell, so a narrow skull's ear still touches it.
   const earYA = pyRound(hcy) - 1;
-  const eY0 = earYA * S - 1, eY1 = earYA * S + S - 1;      // back .. front
-  const earTop = Math.floor(S * (eyeA + 1)) - 1;
+  // THE BAND, front to back: 2..4 cells (earWidth; 3, headVox's cell and one
+  // in front, at the default), set back or forward (earBack, whole cells;
+  // back is LOW y in this frame).
+  const earCells = 2 + Math.round(2 * f.earWidth);
+  const eY0 = earYA * S - 1 - Math.round(S * f.earBack);
+  const eY1 = eY0 + earCells - 1;                           // back .. front
+  const earTop = Math.floor(S * (eyeA + 1)) - 1 + Math.round(S * f.earHeight);
   const earH = Math.max(2, Math.round(S * (1 + f.earSize)));
   const earBot = earTop - earH + 1;
+  // THE TILT leans the top half back (+) or forward (-) a cell.
+  const eTilt = f.earTilt >= 0.35 ? 1 : f.earTilt <= -0.35 ? -1 : 0;
+  // THE LOBE: attached (the bottom row is its front cell only), as drawn
+  // (the middle of the band), or hanging a row lower.
+  const lobeHang = f.earLobe >= 0.75;
+  const zLow = earBot - (lobeHang ? 1 : 0);
+  const stickOut = f.earOut;
   const earTips = [[], []];                                 // per side: [X, Y, Z]
-  for (let Z = earBot; Z <= earTop; Z++) {
+  for (let Z = zLow; Z <= earTop; Z++) {
     if (Z < 0 || Z >= sz) continue;
-    for (let Y = Math.max(0, eY0); Y <= Math.min(sy - 1, eY1); Y++) {
-      // The lobe is the middle of the band; the top row curls back.
-      if (Z === earBot && earH >= 3 && Y === eY0) continue;
-      if (Z === earTop && earH >= 3 && Y === eY1) continue;
+    const sh = eTilt && Z > earBot + earH / 2 ? -eTilt : 0;
+    const yLo = eY0 + sh, yHi = eY1 + sh;
+    const lobeRow = Z === zLow && earH >= 3;
+    for (let Y = Math.max(0, yLo); Y <= Math.min(sy - 1, yHi); Y++) {
+      // The lobe is the middle of the band (or its front, attached); the
+      // top row curls back.
+      if (lobeRow) {
+        if (f.earLobe < 0.25 && !lobeHang) { if (Y !== yHi) continue; }
+        else if (Y === yLo || (lobeHang && Y === yHi && earCells >= 3)) continue;
+      }
+      if (Z === earTop && earH >= 3 && Y === yHi) continue;
       let lo = -1, hi = -1;
       for (let X = 0; X < sx; X++) if (get(X, Y, Z)) { if (lo < 0) lo = X; hi = X; }
       if (lo < 0) continue;
-      const rim = Z === earTop || Z === earBot || Y === eY0 || Y === eY1;
-      const c = rim ? ART.SKIN_SHADE : ART.FACE_SHADE;
+      const rim = Z === earTop || Z === zLow || Y === yLo || Y === yHi;
+      const c = rim ? ART.SKIN_SHADE : ART.EAR_IN;
       for (const [X, side] of [[lo - 1, 0], [hi + 1, 1]]) {
         if (!add(X, Y, Z, c)) continue;
         earSet.add(keyOf(X, Y, Z));
         if (Z === earTop) earTips[side].push([X, Y, Z]);
-        // A BIG EAR STANDS OUT: the back rim takes a second cell outward.
-        if (f.earSize >= 1.5 && Y === eY0 && Z > earBot && Z < earTop) {
+        // STICK-OUT: from 0.4 the back rim stands a second cell out, from
+        // 0.8 all of the ear but its front column.
+        const mid = Z > zLow && Z < earTop;
+        if (mid && ((stickOut >= 0.4 && Y === yLo) || (stickOut >= 0.8 && Y < yHi))) {
           const X2 = side === 0 ? X - 1 : X + 1;
-          if (add(X2, Y, Z, ART.SKIN_SHADE)) earSet.add(keyOf(X2, Y, Z));
+          if (add(X2, Y, Z, rim ? ART.SKIN_SHADE : ART.EAR_IN))
+            earSet.add(keyOf(X2, Y, Z));
         }
       }
     }
   }
-  // AN ELF POINT: up off the back of each ear's top, sweeping back a cell.
-  if (f.earPoint)
+  // AN ELF POINT: up off the back of each ear's top, 2..6 cells
+  // (earPointLen), sweeping back a cell every third.
+  if (f.earPoint) {
+    const n = 2 + Math.round(4 * f.earPointLen);
     for (const tips of earTips) {
       if (!tips.length) continue;
       const [X, Y0, Z0] = tips.reduce((a, b) => (b[1] < a[1] ? b : a));
       let Y = Y0;
-      for (let d = 1; d <= 4; d++) {
-        if (d === 3 && Y - 1 >= 0) {
+      for (let d = 1; d <= n; d++) {
+        if (d % 3 === 0 && Y - 1 >= 0) {
           if (!add(X, Y - 1, Z0 + d - 1, ART.SKIN_SHADE)) break;
           earSet.add(keyOf(X, Y - 1, Z0 + d - 1));
           Y -= 1;
@@ -3977,6 +4309,7 @@ function headVoxFine(g, artSize, ctx) {
         earSet.add(keyOf(X, Y, Z0 + d));
       }
     }
+  }
 
   // ---- the face's paint helpers --------------------------------------------
   // The FRONTMOST filled cell of column (X, Z) -- front is HIGH y here.
@@ -4006,27 +4339,30 @@ function headVoxFine(g, artSize, ctx) {
   const both = (X, fn) => { fn(X); fn(mirror(X)); };
 
   // ---- THE EYES' columns (painted later, placed now: everything keys off them)
-  // Per side the iris is centred on headVox's eye centre, cx -+ eyeDx, and
-  // flanked by a white on each side; a bigger eye widens the iris, the
-  // `eyeWhites` gene and the biggest size each add a white at the outer
-  // corner. Computed for the LEFT eye (low X) and mirrored, so the face is
-  // symmetric to the cell.
+  // The eye's WIDTH comes from the size gene (3, 4, 5 cells), plus a white at
+  // the outer corner for `eyeWhites` (to five); the IRIS is a share of the
+  // size's width (irisSize), centred on headVox's eye centre cx -+ eyeDx; the
+  // whites split round it, one inside, the rest out. Computed for the LEFT
+  // eye (low X) and mirrored, so the face is symmetric to the cell.
   const eyeDxA = f.eyeDx * (ax / DEF.head.size[0]);
-  const iw = f.eyeCols >= 1.5 ? 2 : 1;
+  const Wbase = f.eyeCols >= 2 ? 5 : f.eyeCols >= 1.5 ? 4 : 3;
+  const W = Math.min(5, Wbase + (f.eyeWhites ? 1 : 0));
+  const iw = clamp(Math.round(Wbase * (0.2 + 0.6 * f.irisSize)), 1, W);
+  const wIn = Math.min(1, W - iw), wOut = W - iw - wIn;
   let i0 = Math.round(S * (cx - eyeDxA) - iw / 2);
-  const extra = Math.min(5 - iw - 2,
-                         (f.eyeCols >= 2 ? 1 : 0) + (f.eyeWhites ? 1 : 0));
-  // Keep the inner white clear of the midline by a cell (the bridge of the
+  // Keep the inner corner clear of the midline by a cell (the bridge of the
   // nose), and the outer corner inside the box.
-  i0 -= Math.max(0, (i0 + iw) - (CX - 2));
-  i0 += Math.max(0, 1 + extra - i0);
-  const eOut = i0 - 1 - extra, eIn = i0 + iw;               // outer, inner columns
+  i0 -= Math.max(0, (i0 + iw + wIn - 1) - (CX - 2));
+  i0 += Math.max(0, wOut - i0);
+  const eOut = i0 - wOut, eIn = i0 + iw + wIn - 1;         // outer, inner columns
+  const isIris = X => X >= i0 && X < i0 + iw;
   const eyeRows = f.eyeOpen >= 0.7 ? 2 : 1;
   const tilt = f.eyeTilt >= 0.35 ? 1 : f.eyeTilt <= -0.35 ? -1 : 0;
   const dzOf = X => (X === eOut ? tilt : 0);                // the outer corner tilts
-  // A round eye's END columns stay one row: the corners of a 2-row eye are skin.
+  // A round eye's END columns stay one row: the corners of a 2-row eye are
+  // skin. Only a WHITE corner: an iris that reaches the corner keeps its rows.
   const rowsOf = X => (eyeRows === 2 && (X === eOut || X === eIn) &&
-                       eIn - eOut + 1 >= 4 ? 1 : eyeRows);
+                       !isIris(X) && eIn - eOut + 1 >= 4 ? 1 : eyeRows);
   const lashRow = X => Ze + rowsOf(X) + dzOf(X);
   const lashTop = Ze + eyeRows + Math.max(0, tilt);
 
@@ -4152,16 +4488,18 @@ function headVoxFine(g, artSize, ctx) {
             rnd01(X, Z, 151) < f.freckles * 0.3) shade(X, Z);
   // THE NOSE'S OWN SHADING: nostrils under the tip's outer cells, the crease
   // of each wing beside it, a highlight on the bulb. A face with no nose
-  // still gets two nostrils, where a nose would end.
+  // still gets two nostrils, where a nose would end. All in the NOSTRIL tone,
+  // not the skin's shade (ART.NOSTRIL).
+  const nostril = (X, Z) => paintAt(X, Z, ART.NOSTRIL, true);
   if (nL > 0) {
     const lowHalf = f.noseWidth >= 1.5 || f.noseBulb >= 0.8
       ? Math.max(tipHalf, 2) : tipHalf;
-    both(CX - lowHalf, X => paintAt(X, tipLow, ART.FACE_SHADE, true));
-    both(CX - lowHalf - 1, X => shade(X, tipLow));
+    both(CX - lowHalf, X => nostril(X, tipLow));
+    both(CX - lowHalf - 1, X => nostril(X, tipLow));
     if (f.nose >= 1 && tipRows >= 2)
       both(CX - 1, X => paintAt(X, tipLow + 1, ART.FACE_LIGHT, true));
   } else {
-    both(CX - 2, X => shade(X, Zm + 3));
+    both(CX - 2, X => nostril(X, Zm + 3));
   }
   // AGE LINES, in steps: crow's feet, then the forehead, then (with the
   // mouth, below) the lines from the nose to its corners.
@@ -4197,7 +4535,8 @@ function headVoxFine(g, artSize, ctx) {
   // band is one shipped cell, and the density test is per shipped cell -- a
   // stubble grain at last (headVox's note on why its stubble read as blotches).
   const beardTone = f.beardTone === 'hair' ? ART.HAIR : ART.HAIR_SHADE;
-  const NOT_BEARD = new Set([ART.EYE, ART.EYE_WHITE, ART.LASH]);
+  const NOT_BEARD = new Set([ART.EYE, ART.EYE_WHITE, ART.LASH, ART.GLINT,
+                             ART.NOSTRIL]);
   if (f.beard > 0) {
     const bd = f.beard;
     const topZ = eyeA - 2;
@@ -4269,15 +4608,22 @@ function headVoxFine(g, artSize, ctx) {
 
   // ---- THE EYES --------------------------------------------------------------
   // Repaints of the frontmost cell, so an eye can neither float nor sink.
+  // The whites at opacity 0 are not painted at all: the skin is what shows.
+  const whitesOn = toneQ(f.whites) > 0;
   for (let X = eOut; X <= eIn; X++) {
-    const iris = X >= i0 && X < i0 + iw;
+    const iris = isIris(X);
+    if (!iris && !whitesOn) continue;
     for (let r = 0; r < rowsOf(X); r++)
       both(X, XX => paintAt(XX, Ze + r + dzOf(X), iris ? ART.EYE : ART.EYE_WHITE));
   }
+  // A GLINT: the top outer cell of a two-row iris.
+  if (f.glint && eyeRows === 2)
+    both(i0, X => paintAt(X, Ze + 1 + dzOf(i0), ART.GLINT));
   // THE LASH LINE, over the eye; light lashes stop short of the inner corner.
   // Heavy ones flick out past the outer corner and line its underside.
-  if (f.lashes >= 0.15) {
-    const xEnd = f.lashes < 0.5 ? eIn - 1 : eIn;
+  if (f.lashes >= 0.15 && toneQ(f.lashTone) > 0) {
+    // LASH LENGTH: how much of the eye the line covers, from the outer corner.
+    const xEnd = eOut + Math.max(1, Math.round((eIn - eOut + 1) * f.lashSpan)) - 1;
     for (let X = eOut; X <= xEnd; X++) both(X, XX => paintAt(XX, lashRow(X), ART.LASH));
     if (f.lashes >= 0.7)
       both(eOut - 1, X => paintAt(X, lashRow(eOut) + (tilt >= 0 ? 1 : 0), ART.LASH, true));
@@ -4285,17 +4631,19 @@ function headVoxFine(g, artSize, ctx) {
       both(eOut, X => paintAt(X, Ze - 1 + tilt, ART.LASH, true));
   }
   // THE LID CREASE: a shaded line a row over the lashes (deep-set, hooded).
-  if (f.lidCrease >= 0.2)
+  if (f.lidCrease >= 0.2 && toneQ(f.creaseTone) > 0)
     for (let X = eOut - (f.lidCrease >= 0.6 ? 1 : 0); X < eIn; X++)
-      both(X, XX => shade(XX, lashRow(X) + 1));
+      both(X, XX => paintAt(XX, lashRow(X) + 1, ART.CREASE, true));
   // UNDER THE EYES: shade under the iris and the outer white; past halfway a
   // second row and the outer corner.
-  if (f.eyeBags > 0.2)
+  const bag = (X, Z) => paintAt(X, Z, ART.BAGS, true);
+  if (f.eyeBags > 0.2 && toneQ(f.bagTone) > 0) {
     for (let X = eOut; X < i0 + iw; X++) {
-      both(X, XX => shade(XX, Ze - 1 + dzOf(X)));
-      if (f.eyeBags > 0.6) both(X, XX => shade(XX, Ze - 2 + dzOf(X)));
+      both(X, XX => bag(XX, Ze - 1 + dzOf(X)));
+      if (f.eyeBags > 0.6) both(X, XX => bag(XX, Ze - 2 + dzOf(X)));
     }
-  if (f.eyeBags > 0.6) both(eOut - 1, X => shade(X, Ze - 1));
+    if (f.eyeBags > 0.6) both(eOut - 1, X => bag(X, Ze - 1));
+  }
 
   // ---- THE MOUTH ---------------------------------------------------------------
   // A line `2 * mouthWidth` cells long, centred on MC. Its shape is a curve, not
@@ -4325,7 +4673,7 @@ function headVoxFine(g, artSize, ctx) {
   for (let r = 1; r <= openRows; r++)
     mcols.forEach((X, n) => paintAt(X, Zm + moff[n] - r,
       r === 1 && openRows >= 2 && Math.abs(X + 0.5 - MC) < mHalf - 0.5
-        ? ART.EYE_WHITE : ART.EYE));
+        ? ART.TEETH : ART.EYE));
   // LIPS: the lower lip from half a step (its middle), the upper from one and
   // a half (a cupid's bow, the cells either side of the middle), both full
   // at two and the lower lip a row deeper. Hidden under a moustache.
@@ -4439,108 +4787,113 @@ function humanSkinPass(g, cells, size, info) {
   for (const ch of name) seed = hashN(seed, ch.charCodeAt(0));
   const rnd = (...v) => hashN(seed, ...v) / 4294967296;
   const CXp = sx / 2;
-  const detail = sk.detail;
+  // EACH FEATURE IS ITS OWN GENE, an opacity: 0 skips it (nothing painted,
+  // no palette cost), anything else paints its own toned slot, whose colour
+  // detailColors mixes from the skin toward the feature's full tone.
+  const on = k => toneQ(sk[k]) > 0;
 
   // ---- THE SEAM: a checker band where shadeBack's dark half begins ----------
-  if (detail >= 0.2)
+  // softEdge is the share of the checker's cells that are laid.
+  if (sk.softEdge > 0)
     for (const v of cells) {
       if (v[3] !== ART.SKIN_BASE || ((v[0] + v[2]) & 1)) continue;
       const b = get(v[0], v[1] + 1, v[2]);
-      if (b && b[3] === ART.SKIN_SHADE && exposed(v[0], v[1], v[2]))
+      if (b && b[3] === ART.SKIN_SHADE && exposed(v[0], v[1], v[2]) &&
+          (sk.softEdge >= 1 || rnd(v[0], v[1], v[2], 0x5e) < sk.softEdge))
         v[3] = ART.SKIN_SHADE;
     }
 
   // ---- ANATOMY ----------------------------------------------------------------
-  if (detail >= 0.25) {
-    const shade = ART.FACE_SHADE, light = ART.FACE_LIGHT;
-    const isL = name.endsWith('.L');
-    if (role === 'hand') {
-      // The back of the hand faces OUT (a left hand's is +x); the palm faces
-      // the thigh. Fingers run down from `fz` to the tips at z = 0, stacked
-      // front to back, so they are split by lines of constant y.
-      const back = isL ? 1 : -1;
-      const fz = Math.max(2, Math.round(sz * 0.45));
-      // Measured at the TIPS, the narrowest row: the hand rounds out above
-      // them, and fingers planned across its widest row put grooves where the
-      // tips have no cells at all.
-      let y0 = sy, y1 = -1;
-      for (const [, y, z] of cells) if (z === 0) { y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
-      const n = y1 - y0 + 1;
-      if (n >= 3) {
-        // As many fingers as the depth holds with a groove between each.
-        const F = n >= 7 ? 4 : n >= 5 ? 3 : 2;
-        const cuts = [];
-        for (let k = 1; k < F; k++) cuts.push(y0 + Math.round(k * n / F));
-        const edges = [y0 - 1, ...cuts, y1 + 1];
-        const mids = [];
-        for (let k = 0; k < F; k++) mids.push(Math.floor((edges[k] + 1 + edges[k + 1] - 1) / 2));
+  const isL = name.endsWith('.L');
+  if (role === 'hand') {
+    // The back of the hand faces OUT (a left hand's is +x); the palm faces
+    // the thigh. Fingers run down from `fz` to the tips at z = 0, stacked
+    // front to back, so they are split by lines of constant y.
+    const back = isL ? 1 : -1;
+    const fz = Math.max(2, Math.round(sz * 0.45));
+    // Measured at the TIPS, the narrowest row: the hand rounds out above
+    // them, and fingers planned across its widest row put grooves where the
+    // tips have no cells at all.
+    let y0 = sy, y1 = -1;
+    for (const [, y, z] of cells) if (z === 0) { y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
+    const n = y1 - y0 + 1;
+    if (n >= 3) {
+      // As many fingers as the depth holds with a groove between each.
+      const F = n >= 7 ? 4 : n >= 5 ? 3 : 2;
+      const cuts = [];
+      for (let k = 1; k < F; k++) cuts.push(y0 + Math.round(k * n / F));
+      const edges = [y0 - 1, ...cuts, y1 + 1];
+      const mids = [];
+      for (let k = 0; k < F; k++) mids.push(Math.floor((edges[k] + 1 + edges[k + 1] - 1) / 2));
+      if (on('fingers')) {
         for (let z = 0; z < fz; z++)
           for (const y of cuts)
             for (const dir of [1, -1]) {
               const x = sideX(y, z, dir);
-              if (x >= 0) paint(x, y, z, shade);
+              if (x >= 0) paint(x, y, z, ART.FINGER);
             }
         // ...and across the tips, so the split shows from below.
         for (const y of cuts)
-          for (let x = 0; x < sx; x++) if (has(x, y, 0)) paint(x, y, 0, shade);
-        for (const y of mids) {
-          const kx = sideX(y, fz, back);
-          if (kx >= 0 && detail >= 0.5) paint(kx, y, fz, light);   // knuckles
+          for (let x = 0; x < sx; x++) if (has(x, y, 0)) paint(x, y, 0, ART.FINGER);
+      }
+      for (const y of mids) {
+        const kx = sideX(y, fz, back);
+        if (kx >= 0 && on('knuckles')) paint(kx, y, fz, ART.KNUCKLE);
+        if (on('nails'))
           for (const z of sz >= 10 ? [0, 1] : [0]) {
             const nx = sideX(y, z, back);
-            if (nx >= 0) paint(nx, y, z, ART.NAIL);                // nails
+            if (nx >= 0) paint(nx, y, z, ART.NAIL_T);
           }
-        }
       }
-    } else if (role === 'foot') {
-      // Toes at the front (low y), along the top of the sole; the big toe on
-      // the inside (a left foot's inside is low x).
-      let top = -1;
-      for (const [, , z] of cells) top = Math.max(top, z);
-      const soleTop = Math.max(0, Math.round(sz / 2) - 1);
-      const cuts = isL ? [2, 4, 6] : [sx - 3, sx - 5, sx - 7];
-      const tips = isL ? [0, 3, 5, 7] : [sx - 1, sx - 4, sx - 6, sx - 8];
-      for (let x = 0; x < sx; x++) {
-        const yF = frontY(x, soleTop);
-        if (yF < 0) continue;
-        if (cuts.includes(x)) {
-          for (let y = yF; y < yF + 3; y++) paint(x, y, soleTop, shade);
-          for (let z = 1; z <= soleTop; z++) paintFront(x, z, shade);
-        }
-        if (tips.includes(x)) paint(x, yF, soleTop, ART.NAIL);
+    }
+  } else if (role === 'foot') {
+    // Toes at the front (low y), along the top of the sole; the big toe on
+    // the inside (a left foot's inside is low x).
+    const soleTop = Math.max(0, Math.round(sz / 2) - 1);
+    const cuts = isL ? [2, 4, 6] : [sx - 3, sx - 5, sx - 7];
+    const tips = isL ? [0, 3, 5, 7] : [sx - 1, sx - 4, sx - 6, sx - 8];
+    for (let x = 0; x < sx; x++) {
+      const yF = frontY(x, soleTop);
+      if (yF < 0) continue;
+      if (cuts.includes(x) && on('toes')) {
+        for (let y = yF; y < yF + 3; y++) paint(x, y, soleTop, ART.TOE);
+        for (let z = 1; z <= soleTop; z++) paintFront(x, z, ART.TOE);
       }
-      void top;
-    } else if (name.startsWith('legL')) {
-      // The kneecap: lit at the top of the shin's front, shaded under it.
+      if (tips.includes(x) && on('nails')) paint(x, yF, soleTop, ART.NAIL_T);
+    }
+  } else if (name.startsWith('legL')) {
+    // The kneecap: lit at the top of the shin's front, shaded under it.
+    if (on('knees'))
       for (const x of [CXp - 1, CXp]) {
-        paintFront(x, sz - 2, light); paintFront(x, sz - 3, light);
-        if (detail >= 0.5) paintFront(x, sz - 4, shade);
+        paintFront(x, sz - 2, ART.KNEE_L); paintFront(x, sz - 3, ART.KNEE_L);
+        paintFront(x, sz - 4, ART.KNEE_S);
       }
-    } else if (name.startsWith('armL')) {
-      // The crease inside the elbow, at the top of the forearm's front.
-      for (const x of [CXp - 1, CXp]) paintFront(x, sz - 2, shade);
-    } else if (name === 'torso') {
-      // COLLARBONES: from beside the throat out toward each shoulder, rising a
-      // row at the outer end, lit with a shadow under.
+  } else if (name.startsWith('armL')) {
+    // The crease inside the elbow, at the top of the forearm's front.
+    if (on('elbows')) for (const x of [CXp - 1, CXp]) paintFront(x, sz - 2, ART.ELBOW);
+  } else if (name === 'torso') {
+    // COLLARBONES: from beside the throat out toward each shoulder, rising a
+    // row at the outer end, lit with a shadow under.
+    if (on('collarbones')) {
       const zc = sz - 3, reach = Math.round(sx * 0.36);
       for (let d = 2; d <= reach; d++) {
         const z = zc + (d > reach * 0.6 ? 1 : 0);
         for (const x of [CXp - d, CXp + d - 1]) {
-          paintFront(x, z, light);
-          if (detail >= 0.5) paintFront(x, z - 1, shade);
+          paintFront(x, z, ART.COLLAR_L);
+          paintFront(x, z - 1, ART.COLLAR_S);
         }
       }
-      // THE NAVEL, at 60% of the figure's height.
-      const zN = Math.round((0.6 * info.microH - info.mnZ) * SKIN_UPSCALE);
-      if (zN > 0 && zN < sz)
-        for (const x of [CXp - 1, CXp]) paintFront(x, zN, shade);
-      // THE LINE UNDER THE CHEST, on a man: a shallow curve under each pec.
-      if (info.sex === 'male' && detail >= 0.5) {
-        const zp = Math.round(sz * 0.6), w = Math.round(sx * 0.3);
-        for (let d = 2; d <= w; d++) {
-          const z = zp + (d >= w - 1 ? 1 : 0);
-          for (const x of [CXp - d, CXp + d - 1]) paintFront(x, z, shade);
-        }
+    }
+    // THE NAVEL, at 60% of the figure's height.
+    const zN = Math.round((0.6 * info.microH - info.mnZ) * SKIN_UPSCALE);
+    if (on('navel') && zN > 0 && zN < sz)
+      for (const x of [CXp - 1, CXp]) paintFront(x, zN, ART.NAVEL);
+    // THE LINE UNDER THE CHEST, on a man: a shallow curve under each pec.
+    if (info.sex === 'male' && on('chest')) {
+      const zp = Math.round(sz * 0.6), w = Math.round(sx * 0.3);
+      for (let d = 2; d <= w; d++) {
+        const z = zp + (d >= w - 1 ? 1 : 0);
+        for (const x of [CXp - d, CXp + d - 1]) paintFront(x, z, ART.CHEST);
       }
     }
   }
@@ -4570,7 +4923,7 @@ function humanSkinPass(g, cells, size, info) {
     const rate = sk.moles * (role === 'head' ? 0.004 : 0.0012);
     for (const v of cells)
       if (v[3] === ART.SKIN_BASE && exposed(v[0], v[1], v[2]) &&
-          rnd(v[0], v[1], v[2], 0x30) < rate) v[3] = ART.LASH;
+          rnd(v[0], v[1], v[2], 0x30) < rate) v[3] = ART.MOLE;
   }
   return cells;
 }
@@ -6443,7 +6796,7 @@ export function generateMob(genome, seed = 0, opts = {}) {
     vox = writeVox(models, paletteBytes(opts.materials,
                                         lipUsed(g) ? g.colors
                                                    : { ...g.colors, lip: null },
-                                        g.body.race, g.body.lower),
+                                        g.body.race, g.body.lower, g),
                    { scene: true });
   }
 
@@ -6535,7 +6888,7 @@ export function bakeAnatomy(built, materials) {
 }
 
 export function paletteBytes(materials, colors, race = 'human',
-                             lower = 'legs') {
+                             lower = 'legs', genome = null) {
   const pal = new Uint8Array(1024);
   const put = (idx, hex) => {
     const h = String(hex).replace('#', '');
@@ -6557,6 +6910,7 @@ export function paletteBytes(materials, colors, race = 'human',
   // by that race.
   // ...and the serpent tail's (serpent.js) by a body that has the tail.
   for (const [k, slot] of Object.entries(COLOR_SLOTS)) {
+    if (k === 'lash' && race !== 'human') continue;   // a human's (detailColors)
     const owner = colorOwner(k);
     if (colors[k] && (!owner || owner === race ||
                       (owner === 'serpent' && lower === 'serpent')))
@@ -6566,7 +6920,7 @@ export function paletteBytes(materials, colors, race = 'human',
     put(Number(slot), hex);
   // The fine face's detail slots, on a human only (detailColors).
   if (race === 'human')
-    for (const [slot, hex] of Object.entries(detailColors(colors)))
+    for (const [slot, hex] of Object.entries(detailColors(colors, genome)))
       if (hex) put(Number(slot), hex);
   return pal;
 }

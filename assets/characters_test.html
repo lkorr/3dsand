@@ -276,6 +276,24 @@ var toasts = [], dirt = [];
           Math.abs(wd[wi + 1] - wd[wi + 2]) < 20) { whiteSeen = true; break; }
     say(whiteSeen, 'the preview draws the eye whites in their own colour');
     st.animate = true;
+    // The EYES tab: every eye row, then the eyebrows under a divider (no
+    // eyebrows tab of their own); the ears have a tab.
+    var tabNames = [].map.call(host.querySelectorAll('.gtab'),
+                               function(b){ return b.textContent; });
+    say(tabNames.indexOf('eyes') >= 0 && tabNames.indexOf('ears') >= 0 &&
+        tabNames.indexOf('eyebrows') < 0,
+        'there are eyes and ears tabs and no eyebrows tab', tabNames.join(','));
+    st.geneTab = 'eyes';
+    breed.__test.render();
+    var sub = host.querySelector('.genes .gsub');
+    say(!!sub && /eyebrows/.test(sub.textContent),
+        'the eyes tab carries the eyebrows as a sub-section');
+    var eyeRows = [].map.call(host.querySelectorAll('.genes .grow'),
+                              function(r){ return r.title || ''; }).join('\n');
+    say(/face\.eyeStyle/.test(eyeRows) && /face\.lashTone/.test(eyeRows) &&
+        /face\.browThick/.test(eyeRows) && /colors\.lash/.test(eyeRows),
+        'the eyes tab has the style, lash opacity, brow and lash colour rows');
+    st.geneTab = 'body';
 
     mark('6. a slider edit reaches the preview');
     // ---- 6. a slider edit reaches the preview ----------------------------
