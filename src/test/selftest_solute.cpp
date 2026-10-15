@@ -456,6 +456,114 @@ Status GateSoluteDilute(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- solute-halo ------------------------------------------------------------
+// THE NEIGHBOURS OF A CARRIER SLEEP (ticket 2026-10-14_23-01-29: a 5x5 cube of
+// awake chunks over a lake where piranhas had eaten a corpse, which "just
+// disappeared entirely on its own all at once"). Every dirty chunk in N27 of a
+// chunk carrying solute is on solWant's list and is handed a fresh all-zero
+// page each tick; solDiffuse read that page as "carries solute" and kept the
+// chunk awake, and solCompact, finding it EMPTY again, zeroed the stall clock
+// that would have let it stop -- so the sky, rock and clean water round a
+// blood cloud stayed awake for as long as the cloud lasted, and all of them
+// slept on the tick the last unit faded.
+//
+// The fixture is `solute`'s settled salt pond (a CONSERVED species above its
+// floor, so the carrier never goes away and the old loop never ends). Once it
+// has settled, two chunks that hold no solvent are woken by a cell op that
+// rewrites a cell with the word it already holds: the roof chunk above the
+// pond and the rock chunk under it, both in N27 of a carrier. Asserted: both
+// are asleep within `solute-halo.sleepTicks` ticks of the poke while the
+// carrier still carries; the reason word of a chunk still awake is printed,
+// so a failure names the rule that held it.
+Status GateSoluteHalo(Ctx& c, std::string& detail) {
+  const uint32_t water = MatNamed(c, "water"), salt = MatNamed(c, "salt");
+  if (!water || !salt || !CurrentSoluteNamed("salt")) {
+    detail = "needs materials water + salt and a `salt` species in solutes.json";
+    return Status::Fail;
+  }
+  FixtureTuning tune;
+  const int px = 96, py = 120, pz = 96;
+  const Box box{px - 6, px + 5, pz - 6, pz + 5, py, py + 9, true};
+  const int layers = 4;
+  const int kPoke = (int)BaselineNumber("solute-halo.pokeTick", 600);
+  const int kAfter = (int)BaselineNumber("solute-halo.watchTicks", 120);
+  const int kSleep = (int)BaselineNumber("solute-halo.sleepTicks", 40);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  const std::vector<CellOp> build = box.Build((uint32_t)kMatStone);
+  const std::vector<CellOp> pond = box.Layers(water, py + 1, layers, 7u);
+  std::vector<CellOp> grains;
+  for (int z = pz - 2; z < pz + 2; z++)
+    for (int x = px - 2; x < px + 2; x++)
+      grains.push_back({World::SlotCellIndex({x, py + 1 + layers, z}), salt & 0xFFFu});
+
+  // The carrier: the pond's chunk under the poke column (x, z = 100 is inside
+  // the interior and inside chunk 6). The two pokes sit mid-chunk, so the
+  // rewrite fans out to its own chunk only.
+  const IVec3 carrier{100 >> 4, (py + 1) >> 4, 100 >> 4};
+  const IVec3 pokes[2] = {{100, carrier.y * 16 + 16 + 8, 100},   // roof chunk, above
+                          {100, carrier.y * 16 - 16 + 8, 100}};  // rock chunk, below
+  const char* pokeName[2] = {"above", "below"};
+
+  uint32_t t = 54000;
+  support::TickCursor ticker{c, t, {px >> 4, py >> 4, pz >> 4}};
+  for (int i = 0; i < kPoke; i++)
+    ticker({}, i == 0 ? build : i == 2 ? pond : i == 4 ? grains : std::vector<CellOp>{});
+  // The poke: each cell rewritten with the word it holds, so nothing changes
+  // but the chunk's dirty flag.
+  std::vector<CellOp> poke;
+  std::vector<uint32_t> cbuf((size_t)kChunkVol);
+  uint32_t pokeSlot[2] = {0, 0};
+  for (int k = 0; k < 2; k++) {
+    const IVec3 p = pokes[k];
+    pokeSlot[k] = World::SlotChunkIndex({p.x >> 4, p.y >> 4, p.z >> 4});
+    ReadVoxelsSync(c.ctx, c.world, pokeSlot[k], 1, cbuf.data(), "haloPoke");
+    const uint32_t li = (uint32_t)(((p.z & 15) * 16 + (p.y & 15)) * 16 + (p.x & 15));
+    poke.push_back({World::SlotCellIndex(p), cbuf[li] & 0x7FFFFFFFu});
+  }
+  ticker({}, poke);
+  // Watch: the last tick each poked chunk was awake, and its reason word then.
+  int lastAwake[2] = {-1, -1};
+  uint32_t lastWord[2] = {0, 0};
+  std::vector<uint32_t> flags(kNumSlots, 0);
+  for (int i = 1; i <= kAfter; i++) {
+    c.ctx.WaitIdle();
+    rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.DirtyActive(), 0, flags.data(),
+                          kNumSlots * 4, "haloAwake");
+    for (int k = 0; k < 2; k++)
+      if (flags[pokeSlot[k]] != 0) { lastAwake[k] = i; lastWord[k] = flags[pokeSlot[k]]; }
+    ticker({}, {});
+  }
+  SoluteLayer L;
+  ReadSoluteLayer(c, L);
+  const uint32_t carrierSlot = World::SlotChunkIndex(carrier);
+  const bool carriesOk = L.table[carrierSlot] != 0u;
+  std::string latch;
+  const bool latchOk = LatchesClean(L, latch);
+  bool sleepOk = true;
+  detail = Format("salt pond settled %d ticks, carrier chunk (%d,%d,%d) entry %08x (%s); "
+                  "poked at tick %d, watched %d:",
+                  kPoke, carrier.x, carrier.y, carrier.z, L.table[carrierSlot],
+                  carriesOk ? "carries" : "EMPTY: the fixture proves nothing", kPoke, kAfter);
+  for (int k = 0; k < 2; k++) {
+    const bool ok = lastAwake[k] >= 0 && lastAwake[k] <= kSleep;
+    sleepOk = sleepOk && ok;
+    const IVec3 wc{pokes[k].x >> 4, pokes[k].y >> 4, pokes[k].z >> 4};
+    std::string why;
+    for (int b = 0; b < kDirtyReasonBits; b++)
+      if (lastWord[k] & (1u << b)) why += Format("%s%s", why.empty() ? "" : "+", kDirtyReasonName[b]);
+    detail += Format(" %s (%d,%d,%d) %s%s, last awake +%d (%s, allow %d) stall %u;",
+                     pokeName[k], wc.x, wc.y, wc.z, lastAwake[k] < 0 ? "NEVER WOKE" : "slept",
+                     lastAwake[k] > kSleep ? " LATE" : "", lastAwake[k],
+                     why.empty() ? "-" : why.c_str(), kSleep, L.stall[pokeSlot[k]]);
+    RecordObserved(Format("solute-halo.lastAwake.%s", pokeName[k]).c_str(), (double)lastAwake[k]);
+  }
+  if (!latchOk) detail += " " + latch;
+  const bool pass = carriesOk && sleepOk && latchOk;
+  std::printf("solute-halo: %s (%s)\n", pass ? "PASS" : "FAIL", detail.c_str());
+  return pass ? Status::Pass : Status::Fail;
+}
+
 // ---- solute-evap ------------------------------------------------------------
 // Brine boiled off a LAVA floor. The water touching lava boils (water +
 // tag:hot -> steam); the boiling cell's mass is pushed into the brine above it
@@ -2049,6 +2157,7 @@ const std::vector<Gate>& SoluteGates() {
   static const std::vector<Gate> g = {
       {"solute", "sim", {}, false, GateSolute, false},
       {"solute-dilute", "sim", {}, false, GateSoluteDilute, false},
+      {"solute-halo", "sim", {}, false, GateSoluteHalo, false},
       {"solute-evap", "sim", {}, false, GateSoluteEvap, false},
       {"solute-seam", "sim", {}, false, GateSoluteSeam, false},
       {"solute-electrolysis", "sim", {}, false, GateSoluteElectrolysis, false},

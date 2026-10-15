@@ -1363,7 +1363,7 @@ const char* const kOrder[] = {
     "pool-evict",
     // The solute layer (docs/PLAN_solutes.md). Each regenerates worldgen and
     // builds a sealed stone box of its own; nothing after them reads solute.
-    "solute", "solute-dilute", "solute-evap", "solute-seam", "solute-electrolysis", "solute-vessel",
+    "solute", "solute-dilute", "solute-halo", "solute-evap", "solute-seam", "solute-electrolysis", "solute-vessel",
     "solute-pour", "solute-payout", "solute-blood",
     // The render half: tinted and glowing pools drawn to build/solute_look.bmp.
     "solute-look",

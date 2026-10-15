@@ -1771,7 +1771,13 @@ amount rounded half-down and the rate (`diffusivity` / 256 x `sim.soluteDiffusio
 the integer fixpoint flat (stride 1 alone stalls in a ramp: spread 13 measured,
 3-4 with strides). A chunk idle for 24 consecutive dispatches (every axis,
 parity and stride) is STALLED: the dilution floor (`floor`) discards what is
-below it (conserved species only; see Fade) and the chunk stops keeping itself awake. Dirty reasons 26 `solute`
+below it (conserved species only; see Fade) and the chunk stops keeping itself awake. The stall clock
+STARTS WHEN MASS ARRIVES in a chunk that carried none (`solAlloc` marks a page it made from EMPTY,
+`solCompact` restarts the clock only if that page received mass, and never floors it on that
+compaction) -- it is NOT zeroed when a chunk goes EMPTY. Zeroing on departure was a loop: every
+dirty chunk in N27 of a carrier gets a fresh all-zero page each tick, read as "carries solute",
+so the sky, rock and clean water round a blood cloud kept themselves awake until its last unit
+faded (ticket 2026-10-14_23-01-29, the 5x5 cube; gate `solute-halo`). Dirty reasons 26 `solute`
 and 27 `solute-back` (a pair owned by the -axis neighbour, which must be woken
 for a whole phase cycle). The partner reads those face pairs ONLY when their
 owner is not writing them in the same dispatch (owner off the dirty list, or

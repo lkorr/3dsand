@@ -279,16 +279,23 @@ fn solArgs() {
 // counted, never silently absorbed, and fatal on the CPU
 // (SubmitTick, support.cpp): which slots lost the race would be
 // scheduling-dependent, and a slot without its page would drop writes.
+//
+// A page made from an EMPTY entry leaves SOL_WANT_FRESH in the slot's want
+// flag (solWant's dedupe word, which this pass zeroed anyway): "this chunk
+// carried nothing when the tick began". solCompact reads it and zeroes it --
+// same list, same tick -- so the next solWant still finds every flag 0. See
+// solCompact's THE STALL CLOCK STARTS WHEN MASS ARRIVES for what it decides.
 // ============================================================================
 var<workgroup> allocPage : u32;
 var<workgroup> allocFill : u32;
+const SOL_WANT_FRESH : u32 = 2u;
 
 @compute @workgroup_size(64)
 fn solAlloc(@builtin(workgroup_id) wg : vec3<u32>,
             @builtin(local_invocation_index) li : u32) {
   if (li == 0u) {
     let slot = atomicLoad(&solMeta[SOLM_WANT_LIST + wg.x]);
-    atomicStore(&solMeta[SOLM_WANT_FLAG + slot], 0u);
+    var flag = 0u;
     allocPage = 0xFFFFFFFFu;
     allocFill = 0u;
     let e = solTable[slot];
@@ -304,9 +311,11 @@ fn solAlloc(@builtin(workgroup_id) wg : vec3<u32>,
         var v = 0u;
         if ((e & SOL_UNIFORM_BIT) != 0u) { v = e & 0xFFFFu; }
         allocFill = v | (v << 16u);
+        if (e == 0u) { flag = SOL_WANT_FRESH; }
         atomicMax(&solMeta[SOLM_HIGH_WATER], SOL_POOL_PAGES - (old - 1u));
       }
     }
+    atomicStore(&solMeta[SOLM_WANT_FLAG + slot], flag);
   }
   workgroupBarrier();
   let page = workgroupUniformLoad(&allocPage);
@@ -557,9 +566,29 @@ fn solDiffuse(@builtin(workgroup_id) wg : vec3<u32>,
 //      SOL_EMPTY when the value is 0) and its page goes back on the stack.
 // Every discarded unit is counted (SOLM_DISCARDED), so the gates balance the
 // ledger rather than trusting it.
+//
+// THE STALL CLOCK STARTS WHEN MASS ARRIVES, not when it leaves (ticket
+// 2026-10-14_23-01-29, the 5x5 cube of awake chunks over a lake). The clock
+// used to be zeroed whenever a chunk compacted back to EMPTY, so the dilution
+// floor could not fire on mass arriving into a chunk a finished plume had
+// stalled. But every DIRTY chunk in N27 of a carrier is on the want list, is
+// handed a fresh all-zero page by solAlloc, and solDiffuse reads that page as
+// "carries solute": no work, clock 0 -> 3 over the three axes, still under
+// SOL_STALL_TICKS, so it marks itself DIRTY_R_SOLUTE -- and the compaction
+// then found it EMPTY and zeroed the clock again. A self-sustaining loop: the
+// sky, the rock and the clean water round a blood cloud stayed awake (and
+// churned 27 pages each a tick) for as long as the cloud lasted, and all
+// went to sleep on the tick its last unit faded. Measured, --shot-aquatic
+// piranha*6+human:dead: 191 EMPTY chunks awake, "solute" their only reason.
+// Now a page solAlloc made from EMPTY (SOL_WANT_FRESH) is not "stalled"
+// whatever its clock says -- the clock describes earlier mass, so nothing it
+// receives this tick is floored -- and the clock restarts only if mass did
+// arrive. A chunk that stays empty keeps counting, and after one cycle of
+// phases stops marking itself, like any other idle chunk.
 // ============================================================================
 var<workgroup> cmpSlot : u32;
 var<workgroup> cmpEntry : u32;
+var<workgroup> cmpFresh : u32;
 var<workgroup> cmpMixed : atomic<u32>;
 var<workgroup> cmpMass : atomic<u32>;
 var<workgroup> cmpSpecies : atomic<u32>;
@@ -591,6 +620,10 @@ fn solCompact(@builtin(workgroup_id) wg : vec3<u32>,
     let slot = atomicLoad(&solMeta[SOLM_WANT_LIST + wg.x]);
     cmpSlot = slot;
     cmpEntry = solTable[slot];
+    // solAlloc's mark, read and cleared by the one group that owns the slot
+    // (the list holds it once): next tick's solWant dedupes on a zero word.
+    cmpFresh = atomicLoad(&solMeta[SOLM_WANT_FLAG + slot]);
+    atomicStore(&solMeta[SOLM_WANT_FLAG + slot], 0u);
     atomicStore(&cmpMixed, 0u);
     atomicStore(&cmpMass, 0u);
     atomicStore(&cmpSpecies, 0u);
@@ -599,20 +632,24 @@ fn solCompact(@builtin(workgroup_id) wg : vec3<u32>,
   workgroupBarrier();
   let slot = workgroupUniformLoad(&cmpSlot);
   let e = workgroupUniformLoad(&cmpEntry);
+  let fresh = workgroupUniformLoad(&cmpFresh) == SOL_WANT_FRESH;
   if ((e & SOL_PAGE_BIT) == 0u) {
-    // A sentinel: nothing to clean or hand back, only the aggregate.
+    // A sentinel: nothing to clean or hand back, only the aggregate. (A want
+    // slot is a sentinel here only when solAlloc found the pool exhausted,
+    // which SubmitTick treats as fatal.)
     if (li == 0u) {
       var agg = 0u;
       if (e != 0u) { agg = (solSpeciesOf(e & 0xFFFFu) << 24u) | (solMassOf(e & 0xFFFFu) * CHUNK_VOL); }
       atomicStore(&solMeta[SOLM_AGG + slot], agg);
-      // An EMPTY slot has no diffusion history: see the demotion below.
       if (e == 0u) { atomicStore(&solMeta[SOLM_STALL + slot], 0u); }
     }
     return;
   }
   let page = e & SOL_PAGE_MASK;
   let pbase = page * SOL_WORDS_PER_PAGE;
-  let stalled = atomicLoad(&solMeta[SOLM_STALL + slot]) >= SOL_STALL_TICKS;
+  // A FRESH page's clock belongs to whatever left it, not to what arrived
+  // (THE STALL CLOCK STARTS WHEN MASS ARRIVES, above): never stalled.
+  let stalled = !fresh && atomicLoad(&solMeta[SOLM_STALL + slot]) >= SOL_STALL_TICKS;
   let cbase = slotWorldChunk(slot, T.origin) * i32(CHUNK);
   var mass = 0u;
   var species = 0u;
@@ -685,6 +722,15 @@ fn solCompact(@builtin(workgroup_id) wg : vec3<u32>,
   let total = atomicLoad(&cmpMass);
   atomicStore(&solMeta[SOLM_AGG + slot],
               (atomicLoad(&cmpSpecies) << 24u) | min(total, 0xFFFFFFu));
+  // MASS ARRIVED IN A CHUNK THAT CARRIED NONE: its stall clock starts now.
+  // The count a finished plume left (e.g. 78) must not be what the dilution
+  // floor reads on the new mass's next compaction -- before it has diffused
+  // at all. (This used to be done the other way round, by zeroing the clock
+  // whenever a chunk went EMPTY, and that is what made an empty neighbour of
+  // a carrier keep itself awake forever: the header above.) Safe here:
+  // solDiffuse (the only other writer during a tick) ran earlier in this
+  // tick, and this group owns slot.
+  if (fresh && total != 0u) { atomicStore(&solMeta[SOLM_STALL + slot], 0u); }
   // Fading mass left: awake next tick, so this pass runs on it again.
   if (atomicLoad(&cmpFading) != 0u) { atomicOr(&dirtyOut[slot], DIRTY_R_SOLUTE); }
   if (atomicLoad(&cmpMixed) != 0u) { return; }
@@ -692,13 +738,6 @@ fn solCompact(@builtin(workgroup_id) wg : vec3<u32>,
   var ne = 0u;
   if (v0 != 0u) { ne = SOL_UNIFORM_BIT | v0; }
   solTable[slot] = ne;
-  // A chunk that is EMPTY again forgets its stall clock. solDiffuse only
-  // touches the counter of a slot that carries solute, so without this the
-  // count a finished plume left (e.g. 78) was still there when the next mass
-  // arrived, and the dilution floor discarded it on its first compaction --
-  // before it had diffused at all. Safe here: solDiffuse (the only other
-  // writer during a tick) ran earlier in this tick, and this group owns slot.
-  if (ne == 0u) { atomicStore(&solMeta[SOLM_STALL + slot], 0u); }
   let at = atomicAdd(&solMeta[SOLM_FREE], 1u);
   atomicStore(&solMeta[SOLM_STACK + at], page);
 }
