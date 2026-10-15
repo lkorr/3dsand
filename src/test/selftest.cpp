@@ -1226,6 +1226,13 @@ const char* const kOrder[] = {
     // ...and a SEVERED PIECE is food that bleeds (a shoal at a cut-off head).
     // Ticks the world; regenerated on the way out.
     "loose-carrion",
+    // ...and a shoal at a body torn into pieces spreads over them, drops
+    // nothing into the grid and gives up on meat out of reach. Ticks the
+    // world; regenerated on the way out.
+    "carrion-feast",
+    // ...and a collider-only creature (the shark) draws its art after a
+    // save/load repaint. Nothing ticked; resets mobs on the way out.
+    "brick-paint",
     // ...and EVERY liquid coats a body, syrup by hand and walked through
     // (DefaultLiquidStain). Ticks the world; regenerated on the way out.
     "liquid-coats",

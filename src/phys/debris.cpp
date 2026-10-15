@@ -3110,6 +3110,7 @@ DebrisSystem::FleshLattice DebrisSystem::FleshOf(Body& b) {
   f.bleeding = b.bleedMat != 0 && b.wound.open &&
                (b.wound.gushTicks > 0 || b.wound.budget >= 1.0f);
   f.geomGen = b.geomGen;
+  f.biteMisses = b.biteMisses;
   return f;
 }
 
@@ -3854,6 +3855,13 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
       }
     }
     // small clump: back to loose voxels, flying with the body's point velocity
+    // -- unless a BITE broke it loose (DebrisSystem::BiteShed): a tuft of hair
+    // or a chip of bone the meat under it held on goes with the mouthful, not
+    // into the grid (ticket 2026-10-14_22-41-46).
+    if (bite_.on) {
+      biteEaten_ += parts[c].size();
+      continue;
+    }
     VoxelsToParticles(b, parts[c], lin, ang, world, spawns);
   }
 
@@ -4952,11 +4960,44 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
     }
   }
   instancesDirty_ = true;
+  if (bite_.on) bite_.took = (uint32_t)(fine ? skinLostN : removed.size());
+  else b.biteMisses = 0;   // a new shape: the teeth may reach meat again
 
   Vec3 lin{}, ang{};
   phys_->GetBodyVelocities(b.handle, lin, ang);
-  if (eject && !removed.empty())
-    VoxelsToParticles(b, removed, lin, ang, world, spawns);
+  if (eject && !removed.empty()) {
+    if (bite_.on && bite_.swallow > 0.0f) {
+      // SWALLOWED: the corpse rule (Mob::CarveLimb's DamageCtx::swallow) on a
+      // loose piece -- the same jaws eat the same share of what they tear,
+      // keyed on the cell so a replay sheds the same ones. A COPY: `removed`
+      // still places the wound below.
+      const uint32_t keep16 = (uint32_t)std::lround((1.0f - bite_.swallow) * 65536.0f);
+      std::vector<DebrisVoxel> shed;
+      for (const DebrisVoxel& v : removed) {
+        const uint32_t cell = ((uint32_t)(uint8_t)v.x) | ((uint32_t)(uint8_t)v.y << 8) |
+                              ((uint32_t)(uint8_t)v.z << 16);
+        if ((Hash3(bite_.key, cell, 0x5A11Du) & 0xFFFFu) < keep16) shed.push_back(v);
+      }
+      biteShed_ += shed.size();
+      biteEaten_ += removed.size() - shed.size();
+      if (bite_.edible != nullptr)
+        for (const DebrisVoxel& v : shed) {
+          const uint32_t m = v.payload & 0xFFFu;
+          if (m >= bite_.edible->size() || (*bite_.edible)[m] == 0) biteShedInedible_++;
+        }
+      VoxelsToParticles(b, shed, lin, ang, world, spawns);
+    } else {
+      if (bite_.on) {
+        biteShed_ += removed.size();
+        if (bite_.edible != nullptr)
+          for (const DebrisVoxel& v : removed) {
+            const uint32_t m = v.payload & 0xFFFu;
+            if (m >= bite_.edible->size() || (*bite_.edible)[m] == 0) biteShedInedible_++;
+          }
+      }
+      VoxelsToParticles(b, removed, lin, ang, world, spawns);
+    }
+  }
 
   // CORPSE BLEEDING is a WOUND, not a puff: the cut is remembered on every
   // piece it leaves (the surviving body and each fragment ShatterBody splits
@@ -5065,7 +5106,12 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
     // burst stops once the ring is half full: the gout is a budget, the
     // matter is conserved, and the matter keeps the other half.
     const size_t restN = fine ? b.skinVoxels.size() : b.voxels.size();
-    VoxelsToParticles(b, b.voxels, lin, ang, world, spawns);
+    // ...except under a BITE, which swallows the last scrap of a piece it
+    // ate below the floor (DebrisSystem::BiteShed): the crumb is the mouthful.
+    if (bite_.on)
+      biteEaten_ += b.voxels.size();
+    else
+      VoxelsToParticles(b, b.voxels, lin, ang, world, spawns);
     if (b.bleedMat != 0 && lostN > 0) {
       const auto& gore = CurrentTuning().gore;
       const int ms = std::max(2, gore.microScale);
@@ -6149,7 +6195,8 @@ bool DebrisSystem::BluntBody(uint64_t handle, Vec3 atVoxel, float radiusVoxels,
                              uint32_t seed, World& world,
                              std::vector<ParticleSpawn>& spawns,
                              DamageCause cause,
-                             const std::vector<uint8_t>* meatOnly) {
+                             const std::vector<uint8_t>* meatOnly,
+                             float swallow) {
   if (!phys_ || radiusVoxels <= 0.0f) return false;
   size_t bi = 0;
   for (; bi < bodies_.size(); bi++)
@@ -6185,6 +6232,30 @@ bool DebrisSystem::BluntBody(uint64_t handle, Vec3 atVoxel, float radiusVoxels,
       const Vec3 inward = mid - cBody;
       const float d = inward.len();
       if (d > 1e-3f) cBody += inward * (std::min(radiusVoxels, d * 0.5f) / d);
+    }
+    // ...AND ON THE MEAT (Mob::BiteHit's rule, 2026-10-15): a scavenger's
+    // hole is centred on the edible cell nearest that point, within twice
+    // the hole -- not on a bone the meat-only filter would keep.
+    if (meatOnly != nullptr) {
+      const bool fineB = b.HasFineSkin();
+      const float sc = (float)(fineB ? std::max(1u, b.micro.skinScale) : std::max(1u, b.physScale));
+      float best = 4.0f * radiusVoxels * radiusVoxels;
+      Vec3 at = cBody;
+      auto consider = [&](int x, int y, int z, uint32_t mat) {
+        if (mat == 0 || mat >= meatOnly->size() || (*meatOnly)[mat] == 0) return;
+        const Vec3 p{((float)x + 0.5f) / sc, ((float)y + 0.5f) / sc, ((float)z + 0.5f) / sc};
+        const Vec3 dv = p - cBody;
+        const float d2 = dv.dot(dv);
+        if (d2 < best) {
+          best = d2;
+          at = p;
+        }
+      };
+      if (fineB)
+        for (const PrefabVoxel& v : b.skinVoxels) consider(v.x, v.y, v.z, v.material & 0xFFFu);
+      else
+        for (const DebrisVoxel& v : b.voxels) consider(v.x, v.y, v.z, v.payload & 0xFFFu);
+      cBody = at;
     }
   }
   const float r2 = radiusVoxels * radiusVoxels;
@@ -6262,8 +6333,66 @@ bool DebrisSystem::BluntBody(uint64_t handle, Vec3 atVoxel, float radiusVoxels,
   std::vector<Body> fragments;
   uint32_t budget = MaxNewBodiesPerTick();
   const bool ghost = !OwnedLocally(bodies_[bi]);   // CutBody's note
+  // A BITE SHEDS WHAT THE JAWS DO NOT SWALLOW, AND NOTHING ELSE (DebrisSystem::
+  // BiteShed): scoped to this one carve.
+  // ---- WHAT THE BALL HELD, for a bite (SANDVOX_BITE_DEBUG=1; rule 6) ------
+  // A nip that took nothing has three causes that read as one zero from
+  // outside: the ball was in the air, it held only what the teeth may not
+  // take (bone, hair, char), or the meat was there and the carve lost it.
+  // Counted on the authoritative lattice before the carve.
+  static const bool kBiteDebug = [] {
+    const char* e = std::getenv("SANDVOX_BITE_DEBUG");
+    return e != nullptr && e[0] != '0';
+  }();
+  uint32_t ballMeat = 0, ballOther = 0;
+  const uint64_t gid = bodies_[bi].handle;
+  const uint64_t globalId = GlobalIdOf(gid);
+  if (cause == DamageCause::Bite && (kBiteDebug || meatOnly != nullptr)) {
+    const Body& bb = bodies_[bi];
+    const bool fineB = bb.HasFineSkin();
+    const float sc = (float)(fineB ? jScale : std::max(1u, bb.physScale));
+    const Vec3 cl = cBody * sc;
+    const float rl2 = r2 * sc * sc;
+    auto tally = [&](int x, int y, int z, uint32_t mat) {
+      if (mat == 0) return;
+      const Vec3 d{(float)x + 0.5f - cl.x, (float)y + 0.5f - cl.y, (float)z + 0.5f - cl.z};
+      if (d.dot(d) >= rl2) return;
+      if (meatOnly == nullptr || (mat < meatOnly->size() && (*meatOnly)[mat] != 0)) ballMeat++;
+      else ballOther++;
+    };
+    if (fineB)
+      for (const PrefabVoxel& v : bb.skinVoxels) tally(v.x, v.y, v.z, v.material & 0xFFFu);
+    else
+      for (const DebrisVoxel& v : bb.voxels) tally(v.x, v.y, v.z, v.payload & 0xFFFu);
+  }
+  if (cause == DamageCause::Bite) {
+    bite_.on = true;
+    bite_.swallow = std::clamp(swallow, 0.0f, 1.0f);
+    bite_.key = key ^ 0x5A11Du;
+    bite_.edible = meatOnly;
+  }
   DamageBody(bi, world, spawns, fragments, budget, /*eject=*/true, carve,
              cause, 1.0f);
+  if (cause == DamageCause::Bite) {
+    // A SCAVENGER'S MISS, remembered on the piece (Body::biteMisses): what
+    // makes a shoal give up on meat its teeth cannot reach.
+    // By GLOBAL id: the carve may have rebuilt the collider under a new handle.
+    if (meatOnly != nullptr) {
+      biteTries_++;
+      if (bite_.took == 0) biteEmpty_++;
+      const uint64_t h = HandleOfGlobalId(globalId);
+      for (Body& bb : bodies_)
+        if (h != 0 && bb.handle == h) {
+          bb.biteMisses = bite_.took > 0 ? 0 : (uint8_t)std::min(255, bb.biteMisses + 1);
+          break;
+        }
+    }
+    if (kBiteDebug)
+      std::printf("loose bite body %llu: r %.2f%s | ball %u meat, %u other | took %u cells\n",
+                  (unsigned long long)gid, (double)radiusVoxels,
+                  meatOnly != nullptr ? " meat-only" : "", ballMeat, ballOther, bite_.took);
+  }
+  bite_ = BiteShed{};
   KeepFragments(fragments, ghost);
   return true;
 }

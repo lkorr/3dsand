@@ -1801,6 +1801,12 @@ struct MobLimb {
   // throws are all scaled by it. Set by Sever() from the matter at the cut --
   // a wooden stump (a sylvan's, or an arm turned to wood) gouts a fifth.
   float woundScale = 1.0f;
+  // SCAVENGERS' MISSES IN A ROW on this limb of a corpse: meat-only bites
+  // (Mob::BiteHit, StrikeProfile::biteCarrion) that took nothing since the
+  // last that took something. At DebrisSystem::kBiteBarrenMisses the carrion
+  // count calls the limb's meat out of reach (MobSystem::RefreshCarrion) and
+  // the shoal moves on (ticket 2026-10-14_23-09-28). Not saved.
+  uint8_t biteMisses = 0;
   // WHAT THIS LIMB'S OPEN WOUND LEAKS (materials.h bleedFluid): blood, syrup,
   // ichor -- decided by the matter the wound opened, set wherever the wound
   // is (Damage, CarveLimb, Sever, the fall) through Mob::NoteWoundFluid, and
@@ -6169,6 +6175,12 @@ class Mob {
   bool carrionKnown_ = false;
   float fleshRatio_ = 0.0f;
   std::vector<uint32_t> carrionLimb_;
+  // ...and, on an EATER, the corpse limb its brain last aimed at
+  // (MobSystem::CarrionLimbFor; 0 / -1 = none). The stroke bites the limb the
+  // fish swam at (PickTargetLimb), and the shoal's per-limb crowd is counted
+  // off these. Not saved: re-chosen on the next tick's aim.
+  uint64_t carrionAimVictim_ = 0;
+  int carrionAimLimb_ = -1;
   // What this creature is looking at between strokes (Mob::SetAimLook).
   Vec3 aimLook_{};
   bool aimLookValid_ = false;
@@ -7275,8 +7287,18 @@ class MobSystem {
   // counted corpse: nearest with meat left), -1 if none. targetNearest and
   // ai::Perception::nearestPart both ask this.
   static int NearestLimbTo(const Mob& victim, Vec3 from);
-  // ai::WorldView::aimPart: the world centre of NearestLimbTo.
-  bool NearestPartOf(uint64_t actorId, Vec3 from, Vec3& out);
+  // ai::WorldView::aimPart: the world centre of NearestLimbTo -- or, when
+  // `eaterId` eats the dead with the carrion terms on (ai::Perception::
+  // meatPull / crowdPush / whim) and `actorId` is a counted corpse, of
+  // CarrionLimbFor, which it records as the eater's aim (Mob::carrionAim*_).
+  bool NearestPartOf(uint64_t actorId, Vec3 from, Vec3& out, uint64_t eaterId = 0,
+                     uint32_t tick = 0);
+  // WHICH LIMB OF A CORPSE (2026-10-15, ticket 2026-10-14_22-44-33): the
+  // limb with meat left that scores lowest on distance from `from` plus the
+  // eater's carrion terms (ai::CarrionTerms) over that limb's OWN edible cells
+  // and the other eaters aimed at it last tick (carrionLimbCrowd_). -1 = none.
+  int CarrionLimbFor(const Mob& victim, Vec3 from, uint64_t eaterId,
+                     const ai::Perception& p, uint32_t tick) const;
   // The item library, so an NPC's sweep can read the damage, carve bonus and
   // HEFT of whatever is in its fist. By POINTER and not owned: items reload on
   // R and a copy here would be a second, stale library. The Mob stores its held
@@ -8818,6 +8840,18 @@ class MobSystem {
                                float radius) const;
   // The brick a limb draws from (-1 = cube path / none).
   int32_t LimbMicroModel(uint64_t mobId, int limbIndex) const;
+  // DOES THE BRICK SHOW THE LATTICE? Cells of mob `mobId`'s live limbs whose
+  // brick cell (MicroBodyCell) disagrees with the authoritative lattice in
+  // material or ART colour -- the divergence a same-shape repaint that drops
+  // the art leaves (ticket 2026-10-14_22-52-51). `first` names the first one;
+  // `checked` / `colliderOnly` count the cells compared (the second, those on
+  // a limb with no separate skin), so a gate can tell it was not vacuous.
+  uint32_t BrickPaintMismatches(uint64_t mobId, std::string* first = nullptr,
+                                uint32_t* checked = nullptr,
+                                uint32_t* colliderOnly = nullptr) const;
+  // Limbs repainted by pokes after a same-shape overlay (RepaintLimbMicro),
+  // ever, process-wide.
+  static uint64_t LimbRepaints();
   // DebrisSystem::RewriteBodyMaterial for a limb: up to `maxCount` voxels of
   // `fromMat` on its authoritative lattice become `toMat`, the brick is poked,
   // the collider re-derived, and the burn pass told the lattice is alight. A
@@ -9246,8 +9280,39 @@ class MobSystem {
     uint32_t geomGen = 0;
     size_t cells = 0;
     float ratio = 0.0f;
+    uint32_t meat = 0;   // edible cells (ai::Actor::meat)
   };
   std::unordered_map<uint64_t, LooseMeat> looseMeat_;
+  // (corpse id, limb) -> eaters whose aim was on it last tick (Mob::
+  // carrionAimVictim_/Limb_), rebuilt with the actor list: CarrionLimbFor's
+  // crowd, the same snapshot for whichever eater asks first.
+  std::map<std::pair<uint64_t, int>, uint32_t> carrionLimbCrowd_;
+  // Meat-only bites on a corpse's limbs (Mob::BiteHit), and those that took
+  // nothing, ever (DebrisSystem counts the loose half).
+  uint64_t carrionBites_ = 0, carrionBitesEmpty_ = 0;
+
+ public:
+  uint64_t CarrionBites() const { return carrionBites_; }
+  uint64_t CarrionBitesEmpty() const { return carrionBitesEmpty_; }
+  // The corpse limb an eater last aimed at (Mob::carrionAimLimb_), -1 = none:
+  // what the gates read the shoal's spread off.
+  int CarrionAimLimb(uint64_t eaterId, uint64_t* victim = nullptr) const {
+    const Mob* m = FindMob(eaterId);
+    if (m == nullptr) return -1;
+    if (victim) *victim = m->carrionAimVictim_;
+    return m->carrionAimLimb_;
+  }
+  // A carrion actor's meat (ai::Actor::meat) as this tick's list published
+  // it; 0 = no such actor (not food, or not counted).
+  uint32_t CarrionMeatOf(uint64_t actorId) const {
+    for (const ai::Actor& a : actors_)
+      if (a.id == actorId && !a.alive) return a.meat;
+    return 0;
+  }
+  // This tick's actor list, read-only (the gates' view of what the brains saw).
+  const std::vector<ai::Actor>& ActorList() const { return actors_; }
+
+ private:
   // The body a SWIMMING mob's live stroke is closing its jaws on, through the
   // windup and the cut; nullptr otherwise. BlockedByMob and CrowdPush let the
   // two touch for that window.
@@ -9471,8 +9536,9 @@ class MobSystem {
   std::vector<MatBurst> matStruck_, matBurst_;
   std::vector<uint8_t> matShell_;
   std::vector<uint8_t> matHot_;         // carries tag:hot
-  // tag:organic and not tag:hot -- what a carrion eater counts as meat on a
-  // corpse (MobSystem::RefreshCarrion). Bone carries neither tag.
+  // tag:organic, not tag:hot, and WET (a liquid, or crumbles to one) -- what a
+  // carrion eater counts as meat on a corpse (MobSystem::RefreshCarrion) and
+  // what its teeth may take. Bone, hair, cloth and char are not.
   std::vector<uint8_t> matEdible_;
   // mat -> its electric.resist (0 = insulator), for the shock's wet coat and
   // conducting armour (mob_shock.cpp). Rebuilt with the rest on a reload.

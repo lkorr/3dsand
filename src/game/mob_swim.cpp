@@ -210,6 +210,13 @@ void MobSystem::RefreshCarrion(Mob& m) const {
     } else {
       for (const DebrisVoxel& v : L.voxels) count(v.payload & 0xFFFu);
     }
+    // OUT OF REACH (MobLimb::biteMisses): the teeth have missed this limb
+    // kBiteBarrenMisses times in a row -- its meat is inside bone or too deep
+    // to bite. It is not food, and it does not keep the body food either.
+    if (L.biteMisses >= DebrisSystem::kBiteBarrenMisses) {
+      o += e;
+      e = 0;
+    }
     m.carrionLimb_[(size_t)i] = e;
     edible += e;
     other += o;

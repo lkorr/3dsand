@@ -288,7 +288,9 @@ TuneMode TuneModeOf(Tune t) {
 //     // ---- the swimmers (2026-10-10); every key optional --------------------
 //     // perception: "minImmersion" (a target must be this wet), "scentRange",
 //     //             "scentPull" (a bleeding body in the water, felt unseen),
-//     //             "carrion", "carrionPull" (a corpse with meat left is food)
+//     //             "carrion", "carrionPull" (a corpse with meat left is food),
+//             "meatPull", "crowdPush", "whim" (which piece of it: the most
+//             flesh, fewest eaters already on it, a per-creature fancy)
 //     // movement.wander: "depth" (a volumetric body draws each leg's height),
 //     //             "figure8", "figure8Size", "figure8Laps" (Movement)
 //     "orbit": { "radius": 19, "speed": 0.7, "height": 6, "engage": 2.0,
@@ -474,6 +476,9 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
       pr.perception.scentPull = q.value("scentPull", 0.0f);
       pr.perception.carrion = std::max(0.0f, q.value("carrion", 0.0f));
       pr.perception.carrionPull = q.value("carrionPull", 0.0f);
+      pr.perception.meatPull = std::max(0.0f, q.value("meatPull", 0.0f));
+      pr.perception.crowdPush = std::max(0.0f, q.value("crowdPush", 0.0f));
+      pr.perception.whim = std::max(0.0f, q.value("whim", 0.0f));
       pr.perception.nearestPart = q.value("nearestPart", false);
     }
     if (p.contains("movement")) {
@@ -765,6 +770,12 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
     if (p.perception.carrion > 0.0f)
       o << ", \"carrion\": " << num(p.perception.carrion)
         << ", \"carrionPull\": " << num(p.perception.carrionPull);
+    if (p.perception.meatPull > 0.0f)
+      o << ", \"meatPull\": " << num(p.perception.meatPull);
+    if (p.perception.crowdPush > 0.0f)
+      o << ", \"crowdPush\": " << num(p.perception.crowdPush);
+    if (p.perception.whim > 0.0f)
+      o << ", \"whim\": " << num(p.perception.whim);
     if (p.perception.nearestPart) o << ", \"nearestPart\": true";
     o << " },\n";
     o << "      \"movement\": { \"mobile\": "
@@ -1016,6 +1027,24 @@ bool PerceivesLine(const SelfView& self, const Profile& pr, const WorldView& v,
   return true;
 }
 
+}  // namespace (CarrionTerms is ai's, ai_behavior.h: MobSystem asks it too)
+
+float CarrionTerms(const Perception& p, uint32_t meat, uint32_t crowd,
+                   uint64_t selfId, uint64_t pieceKey, uint32_t tick) {
+  float s = 0.0f;
+  if (p.meatPull > 0.0f) s -= p.meatPull * std::log2(1.0f + (float)meat);
+  if (p.crowdPush > 0.0f) s += p.crowdPush * (float)crowd;
+  if (p.whim > 0.0f) {
+    const uint32_t h = rng::Hash3((uint32_t)selfId ^ (uint32_t)(selfId >> 32) ^ 0xCA77u,
+                                  (uint32_t)pieceKey ^ (uint32_t)(pieceKey >> 32) * 0x9E3779B1u,
+                                  tick / kCarrionWhimTicks);
+    s += p.whim * rng::Unit01(h);
+  }
+  return s;
+}
+
+namespace {
+
 void Perceive(Brain& b, const Profile& pr, const SelfView& self,
               const WorldView& v, uint32_t tick) {
   b.visible = false;
@@ -1064,6 +1093,25 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
   };
   thread_local std::vector<Cand> cands;
   cands.clear();
+  // WHO IS ALREADY ON WHICH PIECE (Perception::crowdPush): every OTHER living
+  // actor's target, as the actor list published it at the top of the tick --
+  // last tick's choices, so the count is the same whichever creature asks
+  // first. Sorted once, counted by range; only for a profile that eats.
+  thread_local std::vector<uint64_t> eaters;
+  eaters.clear();
+  const bool carrionTerms =
+      pr.perception.carrion > 0.0f &&
+      (pr.perception.meatPull > 0.0f || pr.perception.crowdPush > 0.0f ||
+       pr.perception.whim > 0.0f);
+  if (carrionTerms && pr.perception.crowdPush > 0.0f) {
+    for (const Actor& a : *v.actors)
+      if (a.alive && a.id != self.id && a.targetId != 0) eaters.push_back(a.targetId);
+    std::sort(eaters.begin(), eaters.end());
+  }
+  auto crowdOn = [&](uint64_t id) -> uint32_t {
+    const auto r = std::equal_range(eaters.begin(), eaters.end(), id);
+    return (uint32_t)(r.second - r.first);
+  };
   uint32_t order = 0;
   for (const Actor& a : *v.actors) {
     order++;
@@ -1099,8 +1147,15 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
     }
     if (!scent && !PerceivesNoLine(self, pr, a, range, d)) continue;
     float score = d;
-    if (scent) score -= pr.perception.scentPull;
+    // Blood in the water pulls toward the living -- and among the DEAD, when
+    // this creature ranks them by their meat, it only lets a piece be FOUND:
+    // a gouting fingertip is not more food than a quiet torso.
+    if (scent && !(carrion && carrionTerms)) score -= pr.perception.scentPull;
     if (carrion) score += pr.perception.carrionPull;
+    // ...and WHICH of the dead: the most flesh, the fewest already on it, a
+    // fancy of this creature's own (Perception::meatPull / crowdPush / whim).
+    if (carrion && carrionTerms)
+      score += CarrionTerms(pr.perception, a.meat, crowdOn(a.id), self.id, a.id, tick);
     if (current) score -= pr.perception.stickiness;
     // Whoever is fighting ME is the one a provoked neutral answers.
     if (neutral && a.targetId == self.id) score -= 1000.0f;
@@ -1748,7 +1803,7 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
     const Vec3 jaws = self.Centre() + Vec3{std::sin(self.heading) * cpN, std::sin(self.pitch),
                                            std::cos(self.heading) * cpN} * jawFwd;
     Vec3 part{};
-    if (view.aimPart(view.aimCtx, brain.targetId, jaws, part)) {
+    if (view.aimPart(view.aimCtx, self.id, brain.targetId, jaws, tick, part)) {
       brain.targetPos = part;
       brain.targetDist = BodyDist(self, self.Centre(), part);
     }

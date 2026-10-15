@@ -318,6 +318,312 @@ Status GateLooseCarrion(Ctx& c, std::string& detail) {
   return aOk && bOk && cOk ? Status::Pass : Status::Fail;
 }
 
+// carrion-feast: a shoal at a body torn into pieces (2026-10-15)
+// ---------------------------------------------------------------------------
+// Three owner tickets from one evening at a lake, one fixture: a long-haired
+// villager in a pool, her hair, head, arms and legs cut off, and ten piranha.
+//   A. A BITE DROPS NOTHING INTO THE GRID (2026-10-14_22-41-46): no cell a
+//      bite shed was anything but meat (hair, bone, cloth), and the loose
+//      hair is never a target. Hair counted as meat (`organic`): a scalp of
+//      hair was a piece made of nothing but food, and every nip on it threw
+//      hair into the water as world voxels.
+//   B. THE SHOAL SPREADS (2026-10-14_22-44-33): sampled every 10 ticks, the
+//      mean number of DIFFERENT things the fish on the dead are at (a piece,
+//      or a limb of the corpse) is at least carrionFeastSpreadMin.
+//   C. NO CRUMBS: no fish is ever on a piece with carrionFeastCrumb or fewer
+//      cells of meat while one with 32x that is in its sight
+//      (<= carrionFeastCrumbMax fish-samples).
+//   D. THE TEETH TAKE SOMETHING, OR THE SHOAL GIVES UP (2026-10-14_23-09-28):
+//      in the last third of the run, meat-only bites that took nothing are at
+//      most carrionFeastEmptyMax of the bites. A piece whose meat the teeth
+//      cannot reach stops being food (Body / MobLimb ::biteMisses).
+// Thresholds in tests/baseline.json. Ticks the world and regenerates it on
+// the way out.
+Status GateCarrionFeast(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  MobSystem& mobs = c.mobs;
+  const uint32_t mStone = MatIdOf(c, "stone"), mWater = MatIdOf(c, "water");
+  const int dPiranha = mobs.FindDef("piranha");
+  int dVictim = mobs.FindDef("shana");   // a human variant with long hair
+  if (dVictim < 0) dVictim = mobs.FindDef("human");
+  if (!mStone || !mWater || dPiranha < 0 || dVictim < 0) {
+    detail = "missing stone / water / piranha / victim";
+    return Status::Fail;
+  }
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  mobs.Reset();
+  c.debris.Reset();
+
+  constexpr int R = 34, kDepth = 16;
+  IVec3 site{};
+  int hMin = 0, hMax = 0;
+  std::string siteWhy;
+  if (!PickDrySite(c, R, kDepth, site, hMin, hMax, siteWhy)) {
+    detail = "no dry, flat site: " + siteWhy;
+    return Status::Fail;
+  }
+  const int bedY = hMin - kDepth - 1;
+  const int waterTop = bedY + kDepth;
+  const int wallTop = hMax + 2;
+  std::vector<CellOp> pool;
+  for (int x = site.x - R; x <= site.x + R; x++)
+    for (int z = site.z - R; z <= site.z + R; z++)
+      for (int y = bedY - 1; y <= wallTop + 14; y++) {
+        const IVec3 cc{x, y, z};
+        if (!c.world.CellInWindow(cc)) continue;
+        const bool wall = std::abs(x - site.x) >= R - 1 || std::abs(z - site.z) >= R - 1;
+        uint32_t w = PackVoxNew(0u, 0u);
+        if (y <= bedY || (wall && y <= wallTop)) w = PackVoxNew(mStone, 0u);
+        else if (y <= waterTop && !wall) w = (mWater & 0xFFFu) | (7u << 12);
+        pool.push_back({World::SlotCellIndex(cc), w});
+      }
+  support::TickRig rig(c, 74000u, IVec3{site.x >> 4, waterTop >> 4, site.z >> 4});
+  for (size_t off = 0; off < pool.size(); off += 60000) {
+    const size_t n = std::min<size_t>(60000, pool.size() - off);
+    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) {
+      o.cells.assign(pool.begin() + (ptrdiff_t)off, pool.begin() + (ptrdiff_t)(off + n));
+    });
+  }
+  support::RunTicks(rig, 30);
+
+  const Vec3 poolC{(float)site.x + 0.5f, (float)bedY + 1.0f, (float)site.z + 0.5f};
+  const Vec3 vs = mobs.Defs()[dVictim].worldSize;
+  const uint64_t corpse = mobs.Spawn(dVictim, {ifloor(poolC.x - vs.x * 0.5f), ifloor(poolC.y),
+                                               ifloor(poolC.z - vs.z * 0.5f)});
+  if (corpse) mobs.SetMobBehavior(corpse, "dummy");
+  support::RunTicks(rig, 10);
+  // Her hair first (so it comes off as its own piece), then the head and the
+  // four limbs at the shoulder and the hip: a torso and seven pieces.
+  std::vector<std::string> cut;
+  if (const Mob* cm = mobs.FindMobById(corpse)) {
+    const auto& L = cm->Def()->limbs;
+    for (size_t li = 0; li < L.size(); li++)
+      if (L[li].tag == "hair") cut.push_back(L[li].name);
+    for (const char* n : {"head", "armU.L", "armU.R", "legU.L", "legU.R"}) cut.push_back(n);
+  }
+  for (const std::string& n : cut) {
+    const Mob* cm = mobs.FindMobById(corpse);
+    if (cm == nullptr) break;
+    for (size_t li = 0; li < cm->Def()->limbs.size(); li++)
+      if (cm->Def()->limbs[li].name == n && mobs.LimbBody(corpse, (int)li) != 0) {
+        mobs.Sever(corpse, (int)li);
+        break;
+      }
+    support::RunTicks(rig, 2);
+  }
+  support::RunTicks(rig, 30);
+
+  std::vector<uint8_t> isHair(c.mats.size(), 0);
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name.rfind("hair", 0) == 0) isHair[i] = 1;
+  // The loose pieces of her that are nothing but hair, by global id, and
+  // their cells now.
+  auto hairPieces = [&](uint64_t& cells) {
+    std::vector<uint64_t> ids;
+    cells = 0;
+    for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++) {
+      DebrisSystem::FleshLattice f;
+      if (!c.debris.CoatLatticeOf(c.debris.BodyHandle(bi), f) || f.creature != corpse) continue;
+      uint64_t h = 0, o = 0;
+      if (f.skin) { for (const PrefabVoxel& v : *f.skin) if (v.material & 0xFFFu) (isHair[v.material & 0xFFFu] ? h : o)++; }
+      else if (f.coll) { for (const DebrisVoxel& v : *f.coll) if (v.payload & 0xFFFu) (isHair[v.payload & 0xFFFu] ? h : o)++; }
+      if (h > 0 && o == 0) { ids.push_back(f.id); cells += h; }
+    }
+    return ids;
+  };
+  uint64_t hair0 = 0;
+  const std::vector<uint64_t> hairIds = hairPieces(hair0);
+
+  std::vector<uint64_t> shoal;
+  const int nFish = (int)BaselineNumber("carrionFeastFish", 10);
+  for (int k = 0; k < nFish; k++) {
+    const float a = 0.3f + (float)k * (6.2832f / (float)nFish);
+    const Vec3 ws = mobs.Defs()[dPiranha].worldSize;
+    const Vec3 at = poolC + Vec3{std::cos(a) * 10.0f, 4.0f + (float)(k % 3), std::sin(a) * 10.0f};
+    shoal.push_back(mobs.Spawn(dPiranha, {ifloor(at.x - ws.x * 0.5f), ifloor(at.y - ws.y * 0.5f),
+                                          ifloor(at.z - ws.z * 0.5f)}));
+  }
+  const uint64_t shed0 = c.debris.BiteShedInedibleCells();
+  const int kTicks = (int)BaselineNumber("carrionFeastTicks", 1800);
+  const float crumb = (float)BaselineNumber("carrionFeastCrumb", 8);
+  const float sight = 22.0f;
+  uint64_t spreadSum = 0, spreadN = 0, onHair = 0, crumbs = 0, onDead = 0;
+  uint32_t spreadMax = 0;
+  std::string crumbWhy;
+  uint64_t lateTries0 = 0, lateEmpty0 = 0;
+  const int lateFrom = kTicks * 2 / 3;
+  std::string trace;
+  for (int i = 0; i < kTicks; i++) {
+    support::RunTicks(rig, 1);
+    mobs.ClearAttackRequests();   // the seam, drained as the frame loop does (GateAquatic B)
+    if (i == lateFrom) {
+      lateTries0 = mobs.CarrionBites() + c.debris.LooseBiteTries();
+      lateEmpty0 = mobs.CarrionBitesEmpty() + c.debris.LooseBitesEmpty();
+    }
+    if (i % 10 != 0) continue;
+    const std::vector<ai::Actor>& acts = mobs.ActorList();
+    std::vector<std::pair<uint64_t, int>> at;
+    for (uint64_t id : shoal) {
+      const ai::Brain* b = mobs.MobBrain(id);
+      const Mob* fm = mobs.FindMobById(id);
+      if (b == nullptr || fm == nullptr || !b->hasTarget) continue;
+      const ai::Actor* tgt = nullptr;
+      for (const ai::Actor& a : acts)
+        if (a.id == b->targetId) tgt = &a;
+      if (tgt == nullptr || tgt->alive) continue;
+      onDead++;
+      for (uint64_t hid : hairIds)
+        if (ai::IsLooseActorId(b->targetId) && ai::LooseActorGlobalId(b->targetId) == hid) onHair++;
+      uint64_t aimV = 0;
+      const int limb = mobs.CarrionAimLimb(id, &aimV);
+      at.push_back({b->targetId, aimV == b->targetId ? limb : -1});
+      // C: a crumb while a feast is in sight.
+      if (i >= 150 && (float)tgt->meat <= crumb) {
+        const Vec3 me = CentreOf(*fm);
+        for (const ai::Actor& a : acts)
+          if (!a.alive && a.meat > 0 && (float)a.meat >= crumb * 32.0f &&
+              (a.centre - me).len() <= sight) {
+            if (crumbs == 0)
+              crumbWhy = Format(" (t%d fish %llu on %u cells, %u in sight)", i,
+                                (unsigned long long)id, tgt->meat, a.meat);
+            crumbs++;
+            break;
+          }
+      }
+    }
+    if (i >= 150 && !at.empty()) {
+      std::sort(at.begin(), at.end());
+      const uint32_t distinct = (uint32_t)(std::unique(at.begin(), at.end()) - at.begin());
+      spreadSum += distinct;
+      spreadN++;
+      spreadMax = std::max(spreadMax, distinct);
+    }
+    if (i % 300 == 0) {
+      uint32_t live = 0;
+      uint64_t meat = 0;
+      for (const ai::Actor& a : acts)
+        if (!a.alive && a.meat > 0) { live++; meat += a.meat; }
+      uint32_t barren = 0;
+      for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++) {
+        DebrisSystem::FleshLattice f;
+        if (c.debris.CoatLatticeOf(c.debris.BodyHandle(bi), f) && f.creature == corpse &&
+            f.biteMisses >= DebrisSystem::kBiteBarrenMisses)
+          barren++;
+      }
+      trace += Format(" t%d %u-on-dead %u-food(%llu meat) %u-barren", i, (unsigned)at.size(),
+                      live, (unsigned long long)meat, barren);
+    }
+  }
+  const uint64_t triesAll = mobs.CarrionBites() + c.debris.LooseBiteTries();
+  const uint64_t emptyAll = mobs.CarrionBitesEmpty() + c.debris.LooseBitesEmpty();
+  const uint64_t lateTries = triesAll - lateTries0, lateEmpty = emptyAll - lateEmpty0;
+  uint64_t hair1 = 0;
+  hairPieces(hair1);
+  const uint64_t shedInedible = c.debris.BiteShedInedibleCells() - shed0;
+  mobs.Reset();
+  c.debris.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const double spread = spreadN ? (double)spreadSum / (double)spreadN : 0.0;
+  const double lateEmptyShare = lateTries ? (double)lateEmpty / (double)lateTries : 0.0;
+  const bool aOk = shedInedible == 0 && onHair == 0 && hair1 >= hair0;
+  const bool bOk = spread >= BaselineNumber("carrionFeastSpreadMin", 3.0);
+  const bool cOk = crumbs <= (uint64_t)BaselineNumber("carrionFeastCrumbMax", 0);
+  const bool dOk = lateEmptyShare <= BaselineNumber("carrionFeastEmptyMax", 0.5);
+  RecordObserved("carrionFeastSpread", spread);
+  RecordObserved("carrionFeastLateEmptyShare", lateEmptyShare);
+  detail = Format(
+      "A nothing dropped %s: %llu inedible cells shed by bites, %llu fish-samples on the %zu hair "
+      "piece(s), hair %llu -> %llu cells | B spread %s: %.2f different things eaten at once "
+      "(max %u, %llu fish-samples on the dead) | C crumbs %s: %llu%s | D teeth %s: last third "
+      "%llu of %llu meat-only bites took nothing (%.2f); all run %llu of %llu |%s",
+      aOk ? "PASS" : "FAIL", (unsigned long long)shedInedible, (unsigned long long)onHair,
+      hairIds.size(), (unsigned long long)hair0, (unsigned long long)hair1, bOk ? "PASS" : "FAIL",
+      spread, spreadMax, (unsigned long long)onDead, cOk ? "PASS" : "FAIL",
+      (unsigned long long)crumbs, crumbWhy.c_str(), dOk ? "PASS" : "FAIL",
+      (unsigned long long)lateEmpty, (unsigned long long)lateTries, lateEmptyShare,
+      (unsigned long long)emptyAll, (unsigned long long)triesAll, trace.c_str());
+  return aOk && bOk && cOk && dOk ? Status::Pass : Status::Fail;
+}
+
+// brick-paint: a brick shows its lattice after a round trip (2026-10-15)
+// ---------------------------------------------------------------------------
+// Ticket 2026-10-14_22-52-51: a shark's body below the head drew in raw
+// `skin` tan, and a hit put it right. The shark has no separate skin (40 art
+// voxels/m: skinScale 4 = physScale 4), so its art lives on the collider
+// voxels; a limb that came back from a save / park / handoff with the SAME
+// SHAPE and a different coat is repainted by pokes (RepaintLimbMicro), which
+// poked art 0 on exactly that kind of limb. A shark and a human (fine skin),
+// one limb of each soaked in blood, saved, reset and loaded: every lattice
+// cell of every limb must draw its own material AND art in the brick
+// (MobSystem::BrickPaintMismatches), and some of those cells must be on a
+// collider-only limb, or the claim was not asked. Nothing is ticked.
+Status GateBrickPaint(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  MobSystem& mobs = c.mobs;
+  c.debris.Reset();
+  mobs.Reset();
+  const int dShark = mobs.FindDef("shark"), dHuman = mobs.FindDef("human");
+  const uint32_t mBlood = MatIdOf(c, "blood");
+  if (dShark < 0 || dHuman < 0 || mBlood == 0) {
+    detail = "missing shark / human / blood";
+    return Status::Fail;
+  }
+  const IVec3 o = c.world.WindowOrigin();
+  const IVec3 base{(o.x + (int)kNChunk / 2) * (int)kChunk, (o.y + (int)kNChunk / 2) * (int)kChunk,
+                   (o.z + (int)kNChunk / 2) * (int)kChunk};
+  const uint64_t shark = mobs.Spawn(dShark, base);
+  const uint64_t human = mobs.Spawn(dHuman, {base.x + 40, base.y, base.z});
+  if (shark == 0 || human == 0) {
+    detail = "spawn refused";
+    mobs.Reset();
+    return Status::Fail;
+  }
+  // Soak a NON-root limb of each: the trunk behind the head, the torso.
+  auto soakOne = [&](uint64_t id) {
+    const Mob* m = mobs.FindMobById(id);
+    if (m == nullptr) return 0u;
+    const int root = m->Def()->rootLimb;
+    for (int li = 0; li < (int)m->Def()->limbs.size(); li++)
+      if (li != root && !m->Def()->limbs[li].bloodless)
+        if (const uint32_t n = mobs.SoakLimb(id, li, mBlood, 6, 7000)) return n;
+    return 0u;
+  };
+  const uint32_t soakedS = soakOne(shark), soakedH = soakOne(human);
+  std::string why0;
+  const uint32_t before = mobs.BrickPaintMismatches(shark, &why0) + mobs.BrickPaintMismatches(human);
+  std::vector<uint8_t> blob;
+  mobs.SaveState(blob);
+  c.debris.Reset();
+  mobs.Reset();
+  const uint64_t repaints0 = MobSystem::LimbRepaints();
+  const bool loaded = mobs.LoadState(blob.data(), blob.size(), MobSystem::kSaveVersion);
+  // The soaked limbs came back through the same-shape REPAINT, or the claim
+  // below was asked of some other door.
+  const uint64_t repaints = MobSystem::LimbRepaints() - repaints0;
+  uint32_t bad = 0, checked = 0, collider = 0;
+  std::string why;
+  for (uint32_t i = 0; i < mobs.MobCount(); i++) {
+    std::string w;
+    bad += mobs.BrickPaintMismatches(mobs.MobIdAt(i), &w, &checked, &collider);
+    if (why.empty() && !w.empty()) why = w;
+  }
+  const uint32_t back = mobs.MobCount();
+  c.debris.Reset();
+  mobs.Reset();
+  const bool ok = loaded && back == 2 && soakedS > 0 && soakedH > 0 && before == 0 && bad == 0 &&
+                  collider > 0 && repaints >= 2;
+  detail = Format("soaked %u + %u cells; before the save %u mismatched%s%s | loaded %s, %u "
+                  "creature(s), %llu limb(s) repainted: %u of %u cells (%u on collider-only "
+                  "limbs) draw another material or art%s%s",
+                  soakedS, soakedH, before, why0.empty() ? "" : ": ", why0.c_str(),
+                  loaded ? "yes" : "NO", back, (unsigned long long)repaints, bad, checked,
+                  collider, why.empty() ? "" : ": ", why.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 Status GateAquatic(Ctx& c, std::string& detail) {
   IdCounterScope idScope(c.mobs);
   MobSystem& mobs = c.mobs;
@@ -2062,6 +2368,11 @@ const std::vector<Gate>& AquaticGates() {
       // The swimmers: a shark's hunt, a piranha shoal, the medium, stranding.
       {"aquatic", "mob", {}, false, GateAquatic, false},
       {"loose-carrion", "mob", {}, false, GateLooseCarrion, false},
+      // A shoal at a body torn into pieces: bites drop nothing into the grid,
+      // the fish spread over the pieces, no crumbs, and no nibbling forever.
+      {"carrion-feast", "mob", {}, false, GateCarrionFeast, false},
+      // A collider-only creature's brick draws its art after a round trip.
+      {"brick-paint", "mob", {}, false, GateBrickPaint, false},
       // A walker swims: floats and treads, swims out over a low bank, dives.
       {"npc-swim", "mob", {}, false, GateNpcSwim, false},
       // An amputation under water bleeds on, at underwaterBleedRate x dry.
