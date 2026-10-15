@@ -17,6 +17,7 @@
 
 #include "game/brush.h"
 #include "game/camera.h"
+#include "gpu/passtimer.h"
 #include "gpu/resources.h"
 #include "sim/biomes.h"
 #include "sim/celestial.h"
@@ -133,6 +134,195 @@ static bool CheckFarBlockerFlag(GpuContext& ctx, World& world) {
               "cell the centre sample called air)\n",
               ok ? "PASS" : "FAIL", columns, recovered);
   return ok;
+}
+
+// ---- THE FAR BENCH (SANDVOX_FAR_BENCH, measurement only) -----------------
+// What one far tick costs on the GPU, per pass, for a fixed workload that two
+// asset trees (or two builds) both run: a FullRefill around a start point,
+// drained at the game's refill rate, then N ticks of sprint flight along +x
+// with the game's own plane pacing (render.farPlaneFillRate / farPlaneBatch)
+// and one tick per frame. Every tick is submitted alone and waited on, so the
+// per-pass numbers are that tick's GPU time and nothing else's; run with
+// SANDVOX_GPU_TIMER_SERIAL=1 for attribution (row spans that do not overlap).
+// The cascade digest at the end covers the whole sprint (every map, cover and
+// patch pass), so an exact rewrite shows the same two words.
+//
+//   SANDVOX_FAR_BENCH=x,y,z[,ticks[,speed m/s[,plane batch]]]
+//     start voxel, flight length, speed, and render.farPlaneBatch for this
+//     run (0 = the tuning's) -- the knob whose best value moves with the far
+//     passes' fixed cost
+//
+// Off by default and env-only: it rewrites the cascades this gate filled, so
+// it belongs at the end of a `--gate far-fog` run, never inside the suite.
+static uint64_t FarDigest(GpuContext& ctx, const rhi::Buffer& src, uint64_t total) {
+  const uint64_t step = 64ull << 20;
+  rhi::Buffer st = CreateBuffer(ctx.device, std::min(step, total),
+                                rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                                "farDigest");
+  std::vector<uint8_t> buf((size_t)std::min(step, total));
+  uint64_t h = 1469598103934665603ull;
+  for (uint64_t off = 0; off < total; off += step) {
+    const uint64_t n = std::min(step, total - off);
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    enc.CopyBufferToBuffer(src, off, st, 0, n);
+    ctx.queue.Submit(enc.Finish());
+    rhi::ReadBufferBlocking(ctx.device, st, 0, buf.data(), n);
+    for (uint64_t i = 0; i + 8 <= n; i += 8) {
+      uint64_t w;
+      std::memcpy(&w, buf.data() + i, 8);
+      h = (h ^ w) * 1099511628211ull;
+    }
+  }
+  return h;
+}
+
+static void RunFarBench(GpuContext& ctx, World& world, Simulation& sim, const char* spec) {
+  double sx = 10585.33, sy = 686.62, sz = -10815.28;
+  int ticks = 600;
+  double speed = CurrentTuning().player.flySprint;
+  int batch = 0;
+  std::sscanf(spec, "%lf,%lf,%lf,%d,%lf,%d", &sx, &sy, &sz, &ticks, &speed, &batch);
+  PassTimer timer;
+  if (!timer.Init(ctx, 32)) {
+    std::printf("far bench: no GPU timer on this device\n");
+    return;
+  }
+  timer.SetRowGranularity(true);
+  sim.SetPassTimer(&timer);
+
+  struct TickRec {
+    uint32_t n = 0, map = 0, heads = 0;
+    uint32_t levels = 0;   // bit k-1: the tick carried a level-k entry
+    double wallMs = 0;
+    std::vector<std::pair<std::string, double>> pass;
+  };
+  auto tick = [&](FarField& far, TickRec& r) -> bool {
+    const uint32_t n = far.PrepareTick(ctx.queue);
+    if (n == 0) return false;
+    r.n = n;
+    r.map = FarField::ListMapCount();
+    r.heads = FarField::ListHeadCount();
+    for (uint32_t e : far.LastList())
+      r.levels |= 1u << ((e & ~kFarListMapBit) >> kFarSlotShift);
+    TickParams tp{0, kDefaultSeed, 0, 0};
+    tp.farCount = n;
+    ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeFarFill(enc, n);
+    sim.EncodeTimerResolve(enc);
+    const double t0 = NowSeconds();
+    ctx.queue.Submit(enc.Finish());
+    ctx.WaitIdle();
+    r.wallMs = (NowSeconds() - t0) * 1000.0;
+    timer.Collect(ctx);
+    for (const PassSample& p : timer.LastFrame())
+      r.pass.push_back({p.name ? p.name : "?", (double)p.ns / 1e6});
+    return true;
+  };
+  auto report = [&](const char* phase, const std::vector<TickRec>& recs) {
+    std::vector<std::string> names;
+    for (const TickRec& r : recs)
+      for (const auto& p : r.pass)
+        if (std::find(names.begin(), names.end(), p.first) == names.end())
+          names.push_back(p.first);
+    names.push_back("(tick wall)");
+    uint64_t entries = 0, maps = 0, heads = 0;
+    for (const TickRec& r : recs) { entries += r.n; maps += r.map; heads += r.heads; }
+    std::printf("far bench %s: %zu ticks, %llu entries, %llu map columns, %llu runs\n",
+                phase, recs.size(), (unsigned long long)entries,
+                (unsigned long long)maps, (unsigned long long)heads);
+    std::printf("  %-16s %9s %8s %8s %8s %8s %8s\n", "pass", "total ms", "mean", "p50",
+                "p90", "p99", "max");
+    for (const std::string& nm : names) {
+      std::vector<double> v;
+      for (const TickRec& r : recs) {
+        double ms = 0;
+        bool hit = false;
+        if (nm == "(tick wall)") { ms = r.wallMs; hit = true; }
+        for (const auto& p : r.pass)
+          if (p.first == nm) { ms += p.second; hit = true; }
+        if (hit) v.push_back(ms);
+      }
+      if (v.empty()) continue;
+      double tot = 0;
+      for (double x : v) tot += x;
+      std::sort(v.begin(), v.end());
+      auto q = [&](double f) { return v[std::min(v.size() - 1, (size_t)(f * v.size()))]; };
+      std::printf("  %-16s %9.1f %8.3f %8.3f %8.3f %8.3f %8.3f\n", nm.c_str(), tot,
+                  tot / v.size(), q(0.5), q(0.9), q(0.99), v.back());
+    }
+    // The same rows over the ticks that carried ONE level only: a pass's
+    // per-tick cost is its slowest workgroup's, and the levels differ.
+    for (uint32_t k = 1; k <= kFarLevels; k++) {
+      std::string line;
+      uint32_t ticksK = 0;
+      for (const std::string& nm : names) {
+        double tot = 0;
+        uint32_t cnt = 0;
+        for (const TickRec& r : recs) {
+          if (r.levels != (1u << (k - 1))) continue;
+          double ms = 0;
+          bool hit = false;
+          if (nm == "(tick wall)") { ms = r.wallMs; hit = true; }
+          for (const auto& p : r.pass)
+            if (p.first == nm) { ms += p.second; hit = true; }
+          if (hit) { tot += ms; cnt++; }
+        }
+        if (cnt == 0) continue;
+        ticksK = std::max(ticksK, cnt);
+        char b[64];
+        std::snprintf(b, sizeof b, " %s %.2f", nm.c_str(), tot / cnt);
+        line += b;
+      }
+      if (ticksK) std::printf("  level %u only (%u ticks), mean ms:%s\n", k, ticksK, line.c_str());
+    }
+    std::fflush(stdout);
+  };
+
+  FarField far;
+  far.Init(&world);
+  far.SetBulkCap((uint32_t)CurrentTuning().render.farRefillRate);
+  far.SetPlaneCap((uint32_t)CurrentTuning().render.farPlaneFillRate);
+  far.SetPlaneBatch(batch > 0 ? (uint32_t)batch : (uint32_t)CurrentTuning().render.farPlaneBatch);
+  auto chunkOf = [](double x, double y, double z) {
+    return IVec3{(int)std::floor(x) >> 4, (int)std::floor(y) >> 4, (int)std::floor(z) >> 4};
+  };
+  far.FullRefill(chunkOf(sx, sy, sz));
+  std::vector<TickRec> refill;
+  for (;;) {
+    TickRec r;
+    if (!tick(far, r)) break;
+    refill.push_back(std::move(r));
+  }
+  report("refill", refill);
+
+  // Sprint: one tick per frame (BeginFrame each tick), the eye moving `speed`
+  // m/s along +x, every queued plane paced exactly as the game paces it.
+  std::vector<TickRec> sprint;
+  const double step = speed / kVoxelMeters * kTickDt;
+  double x = sx;
+  for (int t = 0; t < ticks; t++) {
+    x += step;
+    far.BeginFrame();
+    far.Update(chunkOf(x, sy, sz));
+    TickRec r;
+    if (tick(far, r)) sprint.push_back(std::move(r));
+  }
+  report("sprint", sprint);
+  // What the sprint left behind, drained, then digested: the whole sequence's
+  // output in two words.
+  for (;;) {
+    TickRec r;
+    if (!tick(far, r)) break;
+  }
+  ctx.WaitIdle();
+  std::printf("far bench digest: farVox %016llx farMap %016llx (%zu queued at exit)\n",
+              (unsigned long long)FarDigest(ctx, world.farVox, (uint64_t)kFarLevels * kFarVox),
+              (unsigned long long)FarDigest(
+                  ctx, world.farMap,
+                  (kFarMapWords + kFarFeatWords + kFarStrataWords + kFarCoverWords) * 4ull),
+              far.PendingFills());
+  sim.SetPassTimer(nullptr);
 }
 
 // ---- far-fog -----------------------------------------------------------
@@ -333,7 +523,9 @@ bool fogOk = false;
 }
 
   // Verdict: the flag the moved body already computed, plus the blocker bit.
-  return (fogOk && CheckFarBlockerFlag(ctx, world)) ? Status::Pass : Status::Fail;
+  const bool blockerOk = CheckFarBlockerFlag(ctx, world);
+  if (const char* b = std::getenv("SANDVOX_FAR_BENCH")) RunFarBench(ctx, world, sim, b);
+  return (fogOk && blockerOk) ? Status::Pass : Status::Fail;
 }
 
 // ---- far-downsample ----------------------------------------------------

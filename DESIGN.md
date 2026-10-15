@@ -17028,6 +17028,54 @@ where you hear from either (§12b, "The ears are on the character").
   shrinking those kernels is the next lever. Not kept: draining the far
   slice on the non-tick frame (at sprint ~70% of frames tick; farMapFill
   rose), and `render.farPlaneBatch` 2048 (p50 -4 ms but p95/p99 +10 ms).
+  **The far kernels stop recomputing trees (2026-10-14, sprint flight).**
+  The paragraph above blamed `far`'s and `farmap`'s binary size and spills;
+  attribution says the cost was mostly WORK the kernels repeated. A fixed
+  workload made it measurable: `SANDVOX_FAR_BENCH=x,y,z[,ticks[,speed[,batch]]]`
+  on `--gate far-fog` (selftest_render.cpp RunFarBench) refills the cascade at
+  a point, flies `ticks` of sprint along +x with the game's plane pacing, one
+  submit per tick waited on, and prints per-pass GPU ms per tick (all ticks
+  and by level; `SANDVOX_GPU_TIMER_SERIAL=1 SANDVOX_FAR_SERIAL=1` to
+  attribute) plus a digest of the whole cascade after the flight, so an exact
+  rewrite shows the same two words. On the default map at the sprint ticket's
+  start: switching the sweep's candidate scan off took farFill 4.6 -> 2.5 ms a
+  tick, and `farmap`'s voxel-over-the-top lookup off took farMapFill 5.2 ->
+  2.0. Both were TREE SCANS: each column pays treeInfo (landAt, biomeAt,
+  treelineAt, the species gates) for the 5 x 5 tiles around it, and asked up
+  to three scans of the same tiles (candidates, canopy memo, crown proxy),
+  plus genCellIn's one-shot treeAt for `farmap`'s q = 0 at EVERY level although
+  only the feature levels (1-2) read that voxel. What landed, every step
+  byte-identical (digest farVox 653146adbedd6acf farMap 2d48d9afdedfed13):
+  (1) THE FAR TILE CACHE (worldgen.wgsl `FAR_TILE_MAX`): a workgroup fills
+  the window of tiles its columns can reach once, packed 8 words a tile in
+  workgroup memory (576 tiles: the sweep's 16 x 16 columns up to level 6,
+  `farmap`'s 8 x 8 sub-column blocks at every level -- `farmap` now takes its
+  sub-columns in square blocks for this), and the scans read it pond-gated
+  per column (`farTileTree`); a tile outside the window is computed as
+  before. (2) ONE WALK for the three scans (`farTreeScans`), which also skips
+  a tile past the widest crown for the two crown scans. (3) q = 0 only at the
+  feature levels, with the candidates from the window handed to genCellIn as
+  valid. (4) G WORKGROUPS PER RUN for the sweep (`FarField::ListSweepGroups`,
+  tail header word 2, ~64 workgroups a tick): a sprint slice was 8 runs, i.e.
+  8 workgroups each walking 32 entries in series. (5) The cave seal reads its
+  four neighbours' ground from the run's own threads (only the chunk's edge
+  pays a landColumn). (6) `farcover` lays each tree's atlas runs over a
+  sub-column's 32 samples once (sorted runs, first tree in mask order keeps a
+  sample) instead of asking every tree of the box per sub-sample, with the
+  variant's grid words cached on the CoverTree. (7) genCellIn's cover and
+  shore blocks skip a cell above the plant reach (WM_B_MAX_COVER_H /
+  WM_H_MAX_COVER_H, the sky-skip's own bound): the sweep asked every canopy
+  row of a forest; genChunk gets the same skip, and the world hash cannot
+  move. Bench, quiet GPU, original vs final back to back (real overlap, no
+  serial timers): sprint far tick mean 8.3 -> 3.8 ms, p50 7.6 -> 3.4, p90
+  14.5 -> 6.1, p99 18.7 -> 9.5, max 20.3 -> 12.4; refill tick mean 10.7 ->
+  4.0, p99 21.3 -> 8.2. Left: level 1 (forest rows in the sweep; `farcover`'s
+  thin rule asks neighbours tree by tree) and the sweep at levels 7-8, whose
+  windows do not fit (2,000-6,000 tiles). `render.farPlaneBatch` 128 / 256 /
+  512 measured the same at sprint (the deadlines, not the floor, set the
+  slices). NOT kept: marking the big helpers `DontInline` in the SPIR-V
+  (spirv-opt respects it, and so does the NVIDIA driver -- the far compile
+  went 64 -> 319 s and the first refill lost the device).
   **The ticket harness had been measuring an F5.** A default `--frames 1200`
   reloads shaders at frame 600 -- the moment the flight starts -- and the
   far pipelines' re-arrival queues a whole FullRefill; that refill, not
@@ -25732,6 +25780,36 @@ cloth is worn on the same way. Blunt and bite blows keep the shell rows they
 had. Arm D sweeps the sword through a tunic: flesh lost must be at least
 `impactArmorSweptClothMinFraction` of bare, the cloth must be cut, and no
 probe may be turned back onto it.
+
+**...and the cloth over the cut opens** (2026-10-14; `Mob::OpenClothOver`,
+`gore.clothGape`, `impact-armor` arm D). Owner: "slashing someone wearing a
+robe should just leave a cut through the robe where it hits the skin, so that
+the robe is cut / split open there, showing the flesh underneath". Passing the
+blow was not enough to SEE it: the garment's own kerf is this blow's kerf
+entry-snapped onto the cloth, a slot a blade thick and a bite deep, which on a
+garment one micro thick is a two-cell nick (measured: 9 robe voxels for a
+slash, the wound under it invisible). So `Mob::CutLimb`, cutting any base limb
+of a dressed creature, first parts every SOFT worn shell (most of the voxels in
+the opening no harder than `gear.cutHardnessRef`) over the flesh slot it has
+just resolved -- before the flesh carve, which may take the limb and the sleeve
+with it, already slit. The opening is a LENS, not the kerf: along the edge's
+line a little past the wound's ends, `gore.clothGape` wide each side at its
+middle on an ellipse (never more than half the cut's half-length, so a graze or
+a stab parts a slit or a small hole), its outer third torn ragged on the
+shell's own skin lattice; it runs through the cloth along the way the blade
+came, from a voxel in front of the wound mouth to the bottom of the cut (a chop
+parts the garment over the mouth, a slash along the body parts it along the
+blade's path, a cut through a limb parts the sleeve on both sides). Every worn
+slot is asked, not only those strapped to the cut limb (a neck cut opens the
+torso shell's collar). Not ejected: cloth parts, it does not shed confetti, and
+a micro-thin shell would be billed as whole world voxels of litter. Every
+caller of `CutLimb` gets it -- the sweep, a peer's blow, a ghost, a gate. Arm D
+also asserts the wound can be seen: three rays out of the last cut's mouth back
+along the blade's travel (the mouth, and `impactArmorClothOpenVox` either side
+of the edge's line) must leave the body without meeting the tunic -- 3/3 at the
+shipped gape, 1/3 with `clothGape` 0 (380 vs 67 cloth cells parted).
+`--shot-strike` gained `SANDVOX_SHOT_STRIKE_CLOSE=<voxels>`: two close-ups
+(`close_a`/`close_b`) looking in at the wound of the slot that lost the most.
 
 **The NPC AI panel dresses what it spawns** (`UIState::aiOutfit`, the Spawn
 tab's "wearing:" block). Nothing / random commoner clothes (a dyeable piece per

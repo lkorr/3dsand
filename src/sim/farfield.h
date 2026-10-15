@@ -74,6 +74,10 @@ class FarField {
   static uint32_t ListMapCount() { return listMapCount_; }
   // ...and the run heads after them: the sweep's (`far`) dispatch extent.
   static uint32_t ListHeadCount() { return listHeadCount_; }
+  // ...and how many workgroups the sweep puts on each run (worldgen.wgsl `far`,
+  // "SEVERAL WORKGROUPS PER RUN"): the sweep's extent is heads x this. Tail
+  // header word 2.
+  static uint32_t ListSweepGroups() { return listSweepGroups_; }
   // The tail header's word index in farList (worldgen.wgsl FAR_LIST_TAIL_HDR).
   static constexpr uint32_t kFarListTailHdr = 3 * kFarListCap;
 
@@ -124,6 +128,9 @@ class FarField {
 
   // Patch words uploaded by the last PrepareTick (diagnostics / selftest).
   uint32_t LastPatchWords() const { return lastPatchWords_; }
+  // The last PrepareTick's list as dispatched (column-sorted; diagnostics: the
+  // far bench groups its per-tick GPU times by the levels a tick carried).
+  const std::vector<uint32_t>& LastList() const { return list_; }
 
   // Re-derive every origin around the interest set's primary point and refill
   // all levels, FINEST first (startup, load, regen). See the order note in
@@ -432,7 +439,16 @@ class FarField {
   // (EnqueuePlane, ONE PASS). (`farcover` then went to four
   // lanes as well and its fixed cost fell to ~1.2 ms; Tuning::Render::
   // farPlaneBatch has the measured arms.)
+  // (2026-10-14: the far kernels stopped recomputing tree tiles and the
+  // sweep runs several workgroups a run -- DESIGN.md "The far kernels stop
+  // recomputing trees" -- and a sprint far tick is ~3.8 ms mean; batch 128,
+  // 256 and 512 measured the same on the far bench, so 256 stays.)
   uint32_t planeBatch_ = 256;
+  // The sweep's workgroups a tick aims at, and the most it puts on one run
+  // (PrepareTick, THE SWEEP'S GROUPS PER RUN): a 256-entry plane slice's
+  // eight runs get eight groups of four entries.
+  static constexpr uint32_t kSweepTarget = 64;
+  static constexpr uint32_t kSweepMaxGroups = 32;
   uint64_t tick_ = 0;                                 // PrepareTick(drain) calls
   uint64_t lastStep_[kFarLevels][3] = {};             // tick + 1; 0 = never
   uint32_t period_[kFarLevels][3] = {};               // ticks between steps; 0 = unknown
@@ -453,6 +469,7 @@ class FarField {
   uint64_t mapCols_ = 0;
   static inline uint32_t listMapCount_ = 0;
   static inline uint32_t listHeadCount_ = 0;
+  static inline uint32_t listSweepGroups_ = 1;
   std::vector<uint32_t> listOut_;   // list_ then its map entries, one upload
   uint64_t mapColsLevel_[kFarLevels] = {};
   uint64_t latePlanes_[kFarLevels] = {}, landedPlanes_[kFarLevels] = {};

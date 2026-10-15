@@ -2071,6 +2071,18 @@ struct MobLimb {
   // recipe; any new damage moves it. 0 = never settled / something blocked
   // the healing since. Derived, not saved.
   uint64_t scarSig = 0;
+  // THE NEXT SCAR EVENT (Mob::ScarTick): the tick the next cell of this
+  // limb's wound scars over, drawn when the limb was last walked from the
+  // count of cells whose clock was running (`scarSchedE`, at `scarSchedTick`,
+  // on a limb whose ScarSigOf was `scarSchedSig`). 0 = not scheduled: the
+  // next ScarTick walks the recipe and draws one. Derived, not saved (a load
+  // redraws it, which the clock being memoryless makes exact).
+  // Times are exact (fractional ticks), so a short sped-up clock is not
+  // rounded up a tick per event; the event fires at the first check after.
+  double scarNext = 0.0;
+  double scarSchedTick = 0.0;
+  uint32_t scarSchedE = 0;
+  uint64_t scarSchedSig = 0;
   // What is ON this limb, recounted at a bounded cadence (see LimbCoat).
   // Index-parallel by construction because it rides the limb itself, which is
   // what RemoveAppendedSlots moves wholesale.
@@ -4881,6 +4893,15 @@ class Mob {
                  const CarveSpall* spall = nullptr,
                  CarveReport* report = nullptr,
                  const CarveBounds* bounds = nullptr);
+  // ---- THE CLOTH OVER A CUT OPENS (2026-10-14) ------------------------------
+  // A blade that cut flesh went through whatever soft garment lay over it, so
+  // every worn shell no harder than skin (gear.cutHardnessRef) is parted over
+  // the wound: a lens along the edge's line, gore.clothGape wide each side, out
+  // along the way the blade came. `slot` is the flesh kerf as CutLimb resolved
+  // it (entry-snapped, final depth), in body limb `limbIndex`'s frame. Returns
+  // the cloth voxels removed. Mob::CutLimb's note says why it lives there.
+  uint32_t OpenClothOver(int limbIndex, const KerfSlot& slot, World& world,
+                         std::vector<ParticleSpawn>& spawns, float severity);
   // Sum MobDef::WoundHpOf and MobDef::OrganHpOf over a limb's CURRENT
   // authoritative lattice, in one pass. This is what MobLimb::weightCharged /
   // organCharged are deltas of; see the note on those fields for why the
@@ -5397,10 +5418,12 @@ class Mob {
   // grows back and burnt tissue is mended -- both as gore.scarMat (`scar`),
   // never as the recipe's own skin or flesh, and softer than either
   // (materials.json hardness), so an old wound is a weak spot a blade or an
-  // arrow goes deeper into. A SURFACE cell of the recipe (one with a face open
-  // in the limb's own shape: the skin layer) grows back only once a deeper
-  // cell beside it is whole again -- the wound fills from the bottom and
-  // skins over last. Bone and other non-tissue recipe cells are not regrown.
+  // arrow goes deeper into. ONE CELL AT A TIME: a missing cell's clock runs
+  // only once a DEEPER cell beside it (the recipe's depth from its own skin)
+  // is whole, and then it scars over after a random wait averaging
+  // gore.scarMinutes -- the wound fills from the bottom, skins over last, and
+  // a deep one takes longer. Bone and other non-tissue recipe cells are not
+  // regrown.
   // Paused while the limb bleeds, burns, rots or pulps. hp comes back at
   // gore.scarHpPerMin of the limb's authored hp a minute, up to the burn cap.
   // The same step as the coat's (HealLimbStep, given a ScarPass), so the pick,
@@ -5409,6 +5432,10 @@ class Mob {
     uint32_t budget = 0;  // recipe cells this step may scar
     uint32_t mat = 0;     // gore.scarMat, resolved
     bool found = false;   // OUT: the step saw a cell still to scar
+    // OUT: cells whose scar clock is RUNNING (tissue to scar whose tissue
+    // beneath is whole), counted before this step's growth. budget 0 =
+    // count only, grow nothing.
+    uint32_t eligible = 0;
   };
   // One limb's passive heal for this tick (staggered to kHealPeriod). True
   // when it rebuilt something.
@@ -5447,6 +5474,10 @@ class Mob {
     uint32_t scarMended = 0;   // burnt tissue mended to scar
     uint32_t scarSteps = 0;    // passive steps that rebuilt anything
     float scarHp = 0.0f;       // hp the passive regen credited
+    // Cell-ticks of RUNNING scar clocks (eligible cells x ticks waited):
+    // over scarGrown + scarMended it is the mean wait per cell, which is
+    // gore.scarMinutes by construction (the scar-heal gate checks it).
+    double scarExposure = 0.0;
     // Wall-clock cost of the steps that walked the recipe (diagnostic only:
     // read by the gates, never by anything the tick decides).
     uint32_t timedSteps = 0;

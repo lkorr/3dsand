@@ -975,6 +975,12 @@ Status GateImpactArmor(Ctx& c, std::string& detail) {
     float hpDrop = 0.0f;
     int covered = 0;
     bool ran = false, wore = false;
+    // THE WOUND CAN BE SEEN (2026-10-14): rays from the last cut's mouth out
+    // along the way the blade came -- the mouth itself and either side of the
+    // edge's line at impactArmorClothOpenVox -- that meet no garment. 3 = the
+    // cloth over the wound is parted wider than the nick a blade's own kerf
+    // leaves in it (a cell either side, 0.125 of a voxel on the stock art).
+    int exposedRays = 0;
   };
   const int kSweptHits = (int)BaselineNumber("impactArmorSweptHits", 3);
   auto sweep = [&](const ItemDef* wear) -> Swept {
@@ -1066,6 +1072,19 @@ Status GateImpactArmor(Ctx& c, std::string& detail) {
     r.fleshLost = r.fleshBefore > fleshNow ? r.fleshBefore - fleshNow : 0u;
     r.shellLost = r.shellBefore > shellNow ? r.shellBefore - shellNow : 0u;
     r.hpDrop = hp0 - hpNow;
+    if (dressed && r.fleshLost > 0 && mobs.LimbBody(id, t.torso)) {
+      if (Mob* mm = mobs.FindMobById(id)) {
+        const Vec3 mouth = mobs.LimbWoundWorld(id, t.torso);
+        const Vec3 across = edge.cross(travel).normalized();
+        const float off =
+            (float)BaselineNumber("impactArmorClothOpenVox", 0.15);
+        const Vec3 from[3] = {mouth, mouth + across * off, mouth - across * off};
+        for (const Vec3& f : from)
+          if (mm->WornShellAlong(t.torso, f, travel * -1.0f, 6.0f, 64, nullptr,
+                                 nullptr) < 0)
+            r.exposedRays++;
+      }
+    }
     mobs.Reset();
     c.debris.Reset();
     return r;
@@ -1115,11 +1134,16 @@ Status GateImpactArmor(Ctx& c, std::string& detail) {
   RecordObserved("impactArmorSweptClothShellLost", (double)sweptCloth.shellLost);
   const double clothMin =
       BaselineNumber("impactArmorSweptClothMinFraction", 0.5);
+  // ...AND THE TUNIC IS PARTED OVER THE CUT (Mob::OpenClothOver): every ray
+  // out of the wound mouth leaves the body without meeting the cloth.
+  RecordObserved("impactArmorSweptClothExposedRays",
+                 (double)sweptCloth.exposedRays);
   const bool clothCut =
       !sweptCloth.wore ||
       (sweptCloth.ran && sweptCloth.covered == 0 && sweptCloth.shellLost > 0 &&
        (double)sweptCloth.fleshLost >=
-           (double)sweptBare.fleshLost * clothMin);
+           (double)sweptBare.fleshLost * clothMin &&
+       sweptCloth.exposedRays == 3);
 
   const uint32_t bladeLost =
       blade.shellBefore > blade.shellAfter ? blade.shellBefore - blade.shellAfter : 0u;
@@ -1185,7 +1209,7 @@ Status GateImpactArmor(Ctx& c, std::string& detail) {
       "dressed lost %u flesh (hp -%.1f, cap %.0f%% of bare and %.1f%% of the "
       "torso), plate chipped %u/%u, %d probes turned back onto it%s | "
       "TUNIC%s: lost %u flesh (hp -%.1f, need %.0f%% of bare), cloth cut "
-      "%u/%u, %d probes turned back%s",
+      "%u/%u, %d probes turned back, wound seen by %d/3 rays%s",
       t.defName.c_str(), mobs.Defs()[t.defIndex].limbs[t.torso].name.c_str(),
       kHits, bladeLost, blade.shellBefore, bladeFrac * 100.0f, chipMax * 100.0,
       bladeHost, clubLost, club.shellBefore, clubFrac * 100.0f, clubHost,
@@ -1196,8 +1220,8 @@ Status GateImpactArmor(Ctx& c, std::string& detail) {
       sweptDressed.covered, sweptRan ? "" : " (A SWEEP HIT NOTHING)",
       sweptCloth.wore ? "" : " (NOT WORN, skipped)", sweptCloth.fleshLost,
       sweptCloth.hpDrop, clothMin * 100.0, sweptCloth.shellLost,
-      sweptCloth.shellBefore, sweptCloth.covered,
-      clothCut ? "" : " <- CLOTH ACTED AS ARMOUR");
+      sweptCloth.shellBefore, sweptCloth.covered, sweptCloth.exposedRays,
+      clothCut ? "" : " <- CLOTH ACTED AS ARMOUR, OR HIDES THE WOUND");
   return ok ? Status::Pass : Status::Fail;
 }
 

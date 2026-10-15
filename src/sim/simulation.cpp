@@ -3350,7 +3350,8 @@ void Simulation::EncodeFarFill(const rhi::CommandEncoder& enc, uint32_t count) {
   // ListMapCount); never more than the list itself.
   cx.farMapCount = std::min(FarField::ListMapCount(), count);
   // ...and the column runs' first entries after them: the sweep's extent.
-  cx.farHeadCount = std::min(FarField::ListHeadCount(), count);
+  // (x the sweep's groups per run: its extent is runs x G.)
+  cx.farHeadCount = std::min(FarField::ListHeadCount(), count) * FarField::ListSweepGroups();
   RecordTable(enc, pass::Table::FarFill, &cx);
 }
 
