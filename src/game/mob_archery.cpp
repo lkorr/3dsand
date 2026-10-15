@@ -242,6 +242,10 @@ bool StepDraw(TickAuthorityCtx& w, std::span<SessionTick> players, MobArcheryWor
   if (m == nullptr || !m->Alive() || m->Ragdolled() || !MobSystem::OwnedHere(*m))
     return abort("the body is gone");
   if (m->Stunned(tick)) return abort("stunned");
+  // A stagger holds attacks back (StaggerBlocksAttack: "neither swings, casts
+  // nor looses"), and the gate on new shoot requests does not reach a draw
+  // already under way: the string is let down, as a head stagger ends a swing.
+  if (m->StaggerBlocksAttack()) return abort("staggered");
   if (m->CastBusy()) return abort("a spell in the hand");
   const Hand h = HandAt(d.hand);
   if (m->HeldItem(h) != d.bow) return abort("the bow left the hand");
