@@ -112,12 +112,15 @@ bool SignalLevel(RefStore& s, const std::string& group, const std::string& signa
 
 // What spawn number `serial` of this spawner is: the base and the min-corner
 // cell it is placed at (the footprint centred on a point within radius).
+// `attempt` redraws only the point (the base is the serial's alone): the
+// spawner tries attempt 0, 1, .. kSpawnTries-1 and takes the first whose body
+// column is open over support in the fetch cache, else its own pos.
 struct SpawnPlan {
   bool ok = false;
   std::string base;
   Vec3 foot{};
 };
-SpawnPlan PlanSpawn(const Ref& spawner, uint32_t serial);
+SpawnPlan PlanSpawn(const Ref& spawner, uint32_t serial, uint32_t attempt = 0);
 
 // ---- status (gates, the References page) ------------------------------------------
 struct GateStatus {

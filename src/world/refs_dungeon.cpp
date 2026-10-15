@@ -40,6 +40,9 @@ constexpr int kMaxSpawnerCount = 16;
 // counted dead (despawned, eaten, released to debris): 20 s, long enough for
 // a parked one to be unparked first.
 constexpr uint32_t kSpawnMissingTicks = 600;
+// Draws a spawner makes for an OPEN spot before it falls back to its own pos
+// (SpawnInto's ground rule).
+constexpr uint32_t kSpawnTries = 8;
 
 int FloorDiv(int v, int d) { return (v >= 0) ? v / d : -((-v + d - 1) / d); }
 IVec3 ChunkOfCell(IVec3 c) { return {FloorDiv(c.x, 16), FloorDiv(c.y, 16), FloorDiv(c.z, 16)}; }
@@ -785,25 +788,58 @@ bool SpawnInto(RefCtx& c, const Ref& r, SpawnerLive& L, size_t si) {
     L.note = "no mob def \"" + plan.base + "\"";
     return false;
   }
+  const Vec3 ws = mobs.Defs()[(size_t)def].worldSize;
   // THE GROUND RULE (the npc kind's): place a body only onto ground the
-  // fetch cache has answered for since this spawner first asked.
+  // fetch cache has answered for since this spawner first asked -- and only
+  // where that ground is OPEN. The radius is a disc at the spawner's own y and
+  // knows nothing of the room's walls, and the mob ground probe climbs at most
+  // 1.2 m out of matter, so a point drawn into the host rock is a creature
+  // entombed for good. Each draw is tested against the cached words: the body
+  // column above the foot cell clear of solid and powder (the foot cell itself
+  // may be the floor), with something to stand on at or below the foot. A
+  // closed draw takes the next attempt (PlanSpawn's own salt, so the answer is
+  // still the serial's and the cache's, never the tick's); after kSpawnTries
+  // the spawner's own pos, which its author put in the room.
+  Vec3 foot = plan.foot;
   if (c.world != nullptr) {
-    const IVec3 cell{(int)std::floor(plan.foot.x), (int)std::floor(plan.foot.y),
-                     (int)std::floor(plan.foot.z)};
     if (L.askedAt == 0) L.askedAt = c.tick;
-    const IVec3 lo{cell.x, cell.y - 16, cell.z};
-    if (!CacheFresh(*c.world, lo, cell, L.askedAt, c.tick, L.fetchAt)) {
-      L.note = "waiting for the ground";
-      return false;
+    const int h = std::max(2, (int)std::ceil(ws.y));
+    bool placed = false;
+    for (uint32_t k = 0; k <= kSpawnTries && !placed; k++) {
+      const Vec3 f = k == 0             ? plan.foot
+                     : k < kSpawnTries ? PlanSpawn(r, L.serial + 1, k).foot
+                                       : Vec3{(float)r.pos.x + 0.5f, (float)r.pos.y, (float)r.pos.z + 0.5f};
+      const IVec3 cell{(int)std::floor(f.x), (int)std::floor(f.y), (int)std::floor(f.z)};
+      const IVec3 lo{cell.x, cell.y - 16, cell.z}, hi{cell.x, cell.y + h - 1, cell.z};
+      if (!CacheFresh(*c.world, lo, hi, L.askedAt, c.tick, L.fetchAt)) {
+        L.note = "waiting for the ground";
+        return false;
+      }
+      auto blocks = [&](uint32_t m) {
+        if (m == 0) return false;
+        const uint32_t cls = ClassOf(c, m);
+        return cls == CLASS_SOLID || cls == CLASS_POWDER;
+      };
+      bool open = true;
+      for (int y = cell.y + 1; y <= hi.y && open; y++)
+        open = !blocks(CachedWord(*c.world, {cell.x, y, cell.z}) & 0xFFFu);
+      bool support = false;
+      for (int y = cell.y; y >= lo.y && open && !support; y--) {
+        const uint32_t m = CachedWord(*c.world, {cell.x, y, cell.z}) & 0xFFFu;
+        support = m != 0 && (blocks(m) || ClassOf(c, m) == CLASS_LIQUID);
+      }
+      if ((open && support) || k == kSpawnTries) {
+        foot = f;
+        placed = true;
+      }
     }
   }
   if (!mobs.HasRoomToSpawn()) {
     L.note = "the crowd is full";
     return false;
   }
-  const Vec3 ws = mobs.Defs()[(size_t)def].worldSize;
-  const IVec3 origin{(int)std::floor(plan.foot.x - ws.x * 0.5f), (int)std::floor(plan.foot.y),
-                     (int)std::floor(plan.foot.z - ws.z * 0.5f)};
+  const IVec3 origin{(int)std::floor(foot.x - ws.x * 0.5f), (int)std::floor(foot.y),
+                     (int)std::floor(foot.z - ws.z * 0.5f)};
   const uint64_t id = mobs.Spawn(def, origin);
   if (id == 0) return false;
   L.askedAt = 0;
@@ -981,7 +1017,7 @@ bool SignalLevel(RefStore& s, const std::string& group, const std::string& signa
   return false;
 }
 
-SpawnPlan PlanSpawn(const Ref& r, uint32_t serial) {
+SpawnPlan PlanSpawn(const Ref& r, uint32_t serial, uint32_t attempt) {
   SpawnPlan p;
   struct Opt {
     std::string base;
@@ -1008,10 +1044,11 @@ SpawnPlan PlanSpawn(const Ref& r, uint32_t serial) {
   p.base = opts[k].base;
   // WHERE: an integer point within `radius` (metres) of pos, hashed on the
   // serial -- never the tick, so a respawn lands where its number says.
+  // Attempt k > 0 is a fresh draw on its own salt (SpawnInto's open test).
   const int R = std::max(0, (int)std::lround(PropFloat(r, "radius", 1.5f) * 10.0f));
   int dx = 0, dz = 0;
   if (R > 0) {
-    const uint32_t h = rng::Hash3(key, serial, 0x5A2u);
+    const uint32_t h = rng::Hash3(key, serial, 0x5A2u + 0x100u * attempt);
     dx = (int)(h % (uint32_t)(2 * R + 1)) - R;
     dz = (int)((h >> 16) % (uint32_t)(2 * R + 1)) - R;
     while (dx * dx + dz * dz > R * R) {
