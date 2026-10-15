@@ -415,6 +415,22 @@ FirstBody FirstBodyOn(Physics& phys, MobSystem& mobs, Vec3 from, Vec3 d, float l
   return fb;
 }
 
+// THE SPLASH FLOOR ON THE STRUCK BODY'S LATTICE. SplashRadiusMille's floor
+// (0.1 voxel) is half a skin column's diagonal on the HUMAN's 8 cells per
+// voxel -- the farthest the column the ray met can be from the ray. PourOnBody
+// keeps a cell only when its centre is inside the disc round the ray line,
+// so on a coarser body (the dummy's 1 cell per voxel, a critter's 2, a
+// shark's 4) a confirmed skin hit usually coated nothing. The same
+// half-diagonal, on this creature's own skin lattice; never under the old
+// floor, so a human's splash is the one it was.
+float SplashFloorOn(const MobSystem& mobs, uint64_t mobId) {
+  float r = 0.1f;
+  if (const Mob* m = mobs.FindCreature(mobId))
+    if (const MobDef* def = m->Def())
+      r = std::max(r, 0.7072f / (float)std::max(1u, def->skinScale));
+  return r;
+}
+
 }  // namespace
 
 void SpellMatterStrike(Physics& phys, MobSystem& mobs, DebrisSystem& debris, World& world,
@@ -444,7 +460,8 @@ void SpellMatterStrike(Physics& phys, MobSystem& mobs, DebrisSystem& debris, Wor
     if (shot.kind == SpellMatterKind::Splash && fb.mobId != 0 && shot.coatAmount > 0) {
       const float hp0 = mobs.TotalHp(fb.mobId);
       uint32_t marked = 0;
-      mobs.PourOnBody(fb.mobId, fb.pick, d, std::max(0.1f, shot.splashRadius), shot.material,
+      mobs.PourOnBody(fb.mobId, fb.pick, d,
+                      std::max(SplashFloorOn(mobs, fb.mobId), shot.splashRadius), shot.material,
                       shot.coatAmount, shot.tick, &marked);
       out.coated = marked;
       out.tookMatter = marked > 0;
@@ -532,7 +549,8 @@ void SpellMatterStrike(Physics& phys, MobSystem& mobs, DebrisSystem& debris, Wor
     const MobSystem::BodyRayHit pk = mobs.PickBody(last.mobId, o, d, back + 4.0f);
     if (pk.hit) {
       uint32_t marked = 0;
-      mobs.PourOnBody(last.mobId, pk, d, std::max(0.1f, shot.splashRadius * 0.5f),
+      mobs.PourOnBody(last.mobId, pk, d,
+                      std::max(SplashFloorOn(mobs, last.mobId), shot.splashRadius * 0.5f),
                       shot.material, shot.coatAmount, shot.tick, &marked);
       out.coated = marked;
       out.tookMatter = marked > 0;
