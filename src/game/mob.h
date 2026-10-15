@@ -8017,6 +8017,61 @@ class MobSystem {
   // SetMobBehavior that also reaches a distant creature (a fresh Brain on the
   // named profile, as SetMobBehavior gives a near one).
   bool SetBehaviorAnyTier(uint64_t mobId, const std::string& name);
+
+  // ==== THE DISTANT TICK (docs/PLAN_distant_npcs.md D1; distant.cpp) ========
+  //
+  // ONE STEP OF THE DISTANT TIER. Called from the top of PreTick (after the
+  // retire scan and the actor list, before the creature loop -- so both tiers
+  // read each other AS OF THE START OF THE TICK, and a creature demoted this
+  // tick takes its first distant step next tick), which is what puts it in
+  // every gate that ticks THE tick. In id order, every AWAKE living creature
+  // whose turn it is (engaged = every tick; else on its idle stride,
+  // `(tick + id) % distant.idleStride == 0`, moving that many ticks' worth):
+  //   1. THINK: ai::Think with a WorldView of the distant creatures in its
+  //      hash neighbourhood plus `nearActors` within the same reach -- the
+  //      near creatures of the edge band; NEVER a player, an avatar or its
+  //      corpse (section 2.7), whatever the caller hands in -- line of sight
+  //      and aimPart null (open-field sight: hills do not block at this
+  //      tier), and a NavProbe over DistantGround capped at the profile's
+  //      navRadius. Attack / shoot / cast intents are HELD (D2b).
+  //   2. STEER: SteerStep, the near tier's own function.
+  //   3. SPACE: the near crowd's spacing (LocomotionDef::spacingMul) over the
+  //      same neighbourhood.
+  //   4. DRIVE: forward x align + strafe at the def's speed (a swim fraction
+  //      afloat), in <= 1-voxel substeps, each onto DistantGround with the
+  //      body's own climb / drop budgets; a fish only onto water; never deeper
+  //      over the PROMOTION LINE once over it (a waiting creature is held
+  //      there, section 2.1); an ANCHORED creature never drives.
+  // Then the hash is refiled (waking the sleepers a mover reached), the
+  // border latches set for a creature that ended over a border, and every
+  // stepped creature that has nothing to do falls asleep. Reads only
+  // tick-start state of other creatures (a snapshot), so the order it steps
+  // them in cannot change any outcome. Emits NO ops, ever.
+  // `nearActors` may be null (a gate's CPU-only arm).
+  void TickDistant(uint32_t tick, World& world,
+                   const std::vector<ai::Actor>* nearActors);
+  // The edited-ground source the distant ground reads (Stream::
+  // SettledStoredChunk). Phase H sets it every tick; a gate driving
+  // TickDistant directly sets it itself (or leaves it null: TerrainHeight
+  // and water only).
+  void SetDistantStream(Stream* s);
+  DistantGround& DistantGroundMut() { return distantGround_; }
+  // THE STATUES (D4a, game/distant_draw.h): the bake cache a demotion bakes
+  // into, BEFORE the rig is released. Null (every harness) = no statue.
+  void SetDistantDraw(DistantDraw* dd) { distantDraw_ = dd; }
+  DistantDraw* DistantDrawer() const { return distantDraw_; }
+  // TEST SEAM (the D1 gates): demote creature `id` NOW, wherever it stands,
+  // through the very path the park rule takes (SaveOne -> DemoteToDistant ->
+  // ReleaseRig), so a gate can build a distant crowd without teleporting the
+  // window once per creature. False (and the creature untouched) where the
+  // park rule's demotion would have refused it. Never called by the game.
+  bool DemoteForTest(uint64_t id);
+  // THE PROMOTION SNAP's chunks (section 2.4): every chunk SnapPromotionGround
+  // will read for `d`, in the window -- the footprint's columns, from
+  // promoteMaxDropVox below its feet to that much (plus headroom) above.
+  // EntityParking::Unpark waits on these being fresh in the fetch cache, on
+  // top of its own footprint wait.
+  void DistantPromotionChunks(const DistantMob& d, std::vector<IVec3>& out) const;
   // ---- THE TWO CAPS (PLAN_corpse_is_a_mob.md "Bounds") ---------------------
   // `kMaxMobs` counts the LIVING; the dead have their own count and a body
   // budget over their limbs. Past either, the oldest corpse (lowest DeathSeq)
@@ -10010,6 +10065,25 @@ class MobSystem {
   // record through parkFn_. Top of PreTick; runs only when the window moved
   // or the tier changed since its last pass.
   void RetireDistant(Vec3 wlo);
+  // ---- D1: the distant tick's own state (distant.cpp) ----------------------
+  DistantGround distantGround_;
+  DistantDraw* distantDraw_ = nullptr;
+  // The near creatures of the edge band as the distant hash last saw them
+  // (id -> cell), so one that MOVED INTO a sleeper's neighbourhood wakes it
+  // the way a distant mover does. Sorted by id.
+  struct NearBandCell {
+    uint64_t id;
+    int32_t cx, cz;
+  };
+  std::vector<NearBandCell> nearBand_;
+  // The mid-air landing (section 2.4): DistantGround under it, fall damage
+  // from the drop and vel.y by ApplyFallDamage's thresholds, spread over the
+  // limbs' hp as SpendHp spreads it. Clears landPending.
+  void LandDistant(DistantMob& d, uint32_t tick);
+  // The promotion snap (section 2.4): `d.origin.y` onto the REAL ground under
+  // its footprint, from the fetch cache, searching up out of matter when
+  // TerrainHeight disagreed, within distant.promoteMaxDropVox. Counted.
+  void SnapPromotionGround(DistantMob& d);
   uint64_t aiSteps_ = 0;
   // The drip pot taken in turns (Mob::BleedTick): creatures that wanted a
   // drip this tick / last tick, and the refusals. Not hashed, not saved --

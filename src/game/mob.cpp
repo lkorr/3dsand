@@ -2648,6 +2648,9 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   // A reload can change what a corpse is made of reacting to: every sleeping
   // one looks again (Mob::DeadAsleep's wake list).
   for (Mob& m : mobs_) m.WakeDead();
+  // ...and what carries weight under a distant creature (the class table
+  // below is rebuilt in place): every decoded stored chunk is stale.
+  distantGround_.InvalidateAll();
   densityOf_.clear();
   classOf_.clear();
   matGpu_.clear();
@@ -4101,6 +4104,10 @@ void MobSystem::Reset(bool rewindIds) {
   // Cleared BEFORE a `rewindIds` below can re-issue the ids they held.
   distant_.Clear();
   distantScanHave_ = false;
+  // ...its ground caches (the map or the store may be replaced next) and the
+  // edge band's memory of near creatures that no longer exist.
+  distantGround_.InvalidateAll();
+  nearBand_.clear();
   bodyFx_.clear();
   // ...and the corpses that were going to get up do not, because the world
   // they were lying in is gone: a booked rising names a place and a handful of
@@ -9758,6 +9765,17 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     }
   }
   bpActors.Stop();
+
+  // ---- THE DISTANT TIER STEPS (docs/PLAN_distant_npcs.md D1, distant.cpp) --
+  // Here, with the near actor list complete and before any near creature
+  // moves: both tiers read each other as of the START of the tick (the near
+  // creatures of the edge band from `actors_`; D3 hands the distant ones the
+  // other way), and a creature the loop below demotes takes its first
+  // distant step next tick. Nothing at all while the tier is empty -- which,
+  // with `distant.enabled` off, it always is -- and nothing but two compares
+  // while everyone in it sleeps (rule 2).
+  TickDistant(tick, world, &actors_);
+  sc.Mark("distant");
 
   // THE DEAD CAP, before anybody steps: a corpse released here is a husk
   // the loop below sweeps in this same pass once its holds are over.

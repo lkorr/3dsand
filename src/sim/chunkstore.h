@@ -83,15 +83,31 @@ class ChunkStore {
     chunkCount_ = 0;
     dir_.clear();
     tables_.Bind(std::string());
+    NotifyChanged(IVec3{}, /*all=*/true);
   }
   // The entity buckets go with the binding (a dormant record belongs to the
   // world dir it was read from); the RAM chunks stay, as they always have.
+  // (A chunk that had been spilled to the dir is no longer reachable by Get,
+  // so the listener hears "everything".)
   void Unbind() {
     dir_.clear();
     entityRegions_.clear();
     absentRegions_.clear();
     tables_.Bind(std::string());
+    NotifyChanged(IVec3{}, /*all=*/true);
   }
+
+  // ---- THE CHANGE LISTENER (docs/PLAN_distant_npcs.md §2.4) ----------------
+  //
+  // ONE optional listener, told whenever what Get(wc) would answer may have
+  // changed: `(wc, false)` from every Put and Erase, `(_, true)` when the
+  // whole content is replaced or dropped (Clear, Unbind, BindLoad). An LRU
+  // spill or a lazy region load changes nothing a reader sees and says
+  // nothing. For a derived cache over stored chunks (the distant tier's
+  // ground) that must never answer from bytes the store has replaced. The
+  // listener is called synchronously and must not touch the store.
+  using ChangeFn = std::function<void(IVec3 wc, bool all)>;
+  void SetChangeFn(ChangeFn fn) { changeFn_ = std::move(fn); }
   bool Bound() const { return !dir_.empty(); }
   const std::string& Dir() const { return dir_; }
   size_t Count() const { return chunkCount_; }  // chunks resident in RAM
@@ -319,4 +335,8 @@ class ChunkStore {
   std::unordered_map<uint64_t, EntityRegion> entityRegions_;  // packed region key
   size_t chunkCount_ = 0;
   uint64_t useCounter_ = 0;
+  ChangeFn changeFn_;   // SetChangeFn; empty = nobody listening
+  void NotifyChanged(IVec3 wc, bool all) {
+    if (changeFn_) changeFn_(wc, all);
+  }
 };

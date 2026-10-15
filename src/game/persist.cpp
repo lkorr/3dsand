@@ -1478,6 +1478,7 @@ uint32_t EntityParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
     if (tier.Count() > 0) {
       tier.Note(&DistantMobs::Stats::promoteScans);
       std::vector<uint64_t> cands;   // distance to the window centre, then id
+      std::vector<IVec3> snapChunks;
       tier.PromotionCandidates(wo, m, cands);
       for (const uint64_t cid : cands) {
         const DistantMob* d = tier.Find(cid);
@@ -1492,7 +1493,15 @@ uint32_t EntityParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
           pending_ = true;
           continue;
         }
-        if (!footprintGround(d->origin)) {
+        // ...AND THE SNAP's GROUND (D1, MobSystem::SnapPromotionGround): the
+        // footprint's columns from promoteMaxDropVox below the feet to that
+        // much above, so the promotion lands on ground the fetch cache has
+        // ANSWERED for, not ground it has not delivered yet. Every chunk is
+        // asked (no short-circuit), so the fetches go out together.
+        bool ground = footprintGround(d->origin);
+        mobs.DistantPromotionChunks(*d, snapChunks);
+        for (const IVec3& wc : snapChunks) ground &= GroundKnown(world, wc, tick);
+        if (!ground) {
           tier.Note(&DistantMobs::Stats::groundWaits);
           pending_ = true;
           continue;

@@ -411,6 +411,35 @@ class Stream {
   void DiscardSoluteState();
 
   ChunkStore& Store() { return store_; }
+
+  // ---- A READ OF THE STORE THAT IS A FUNCTION OF THE TICK -------------------
+  // (docs/PLAN_distant_npcs.md §2.4 item 3, audit A3)
+  //
+  // `Store().Get(wc)` answers with whatever the store holds NOW, and an evicted
+  // chunk's bytes reach the store when its readback is HARVESTED -- by Update's
+  // non-blocking `map.Ready()` loop, i.e. on a tick the GPU decides. A reader
+  // whose answer must not depend on that (the distant tier's ground) asks
+  // here instead: every eviction of `wc` still in flight is completed first,
+  // exactly the loop RegenerateChunks runs (`while (pendingChunks_.count(key))
+  // CompleteOldest(false)`), and only then is the store asked. Blocks at most
+  // once per eviction (and only for a chunk somebody asks about); the pointer
+  // is the store's, valid until its next Put / Get / Clear.
+  //
+  // KNOWN GAP: a chunk-TICKET batch (EvictTicketSlots) whose keep decision is
+  // still pending is completed the way a forced drain completes one -- keeping
+  // every chunk -- where the decision, ticks later, might have dropped the
+  // undirtied ones. Those are procgen-equal, so only a reader that tells
+  // "stored" from "procgen" (the distant ground does) could see it.
+  const std::vector<uint32_t>* SettledStoredChunk(IVec3 wc);
+  // Is an eviction of `wc` still in flight (counted, not yet in the store)?
+  bool EvictionPending(IVec3 wc) const {
+    return pendingChunks_.count(World::PackChunkKey(wc)) != 0;
+  }
+  // ...is ANY? (The distant ground's "nothing edited anywhere" fast path.)
+  bool AnyEvictionPending() const { return !pendingChunks_.empty(); }
+  // Evictions SettledStoredChunk had to complete itself (the ones Update's
+  // harvest had not reached yet): the drain's witness.
+  uint64_t SettleDrains() const { return settleDrains_; }
   // The far-field edit index. LoadWorld rebuilds it from the store it just
   // bound; nothing else outside Stream writes it.
   FarEdits& Edits() { return farEdits_; }
@@ -742,6 +771,7 @@ class Stream {
   std::deque<PendingEvict> pending_;
   std::vector<rhi::Buffer> stagingPool_;
   std::unordered_map<uint64_t, uint32_t> pendingChunks_;  // packed wc -> count
+  uint64_t settleDrains_ = 0;   // SettledStoredChunk's own completions
   // The subset of pendingChunks_ a TICKET batch holds. A window shift's fill
   // may skip draining a slot THIS shift evicted (shiftEvicted_), but a ticket
   // released for overlapping the incoming plane is not this shift's eviction:

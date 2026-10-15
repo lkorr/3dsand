@@ -9170,6 +9170,9 @@ int main(int argc, char** argv) {
   // stands n statues in a ring around the player without the tier.
   DistantDraw distantDraw;
   DistantDrawTestHook distantDrawTest;
+  // D1: a creature demoted from here on bakes its statue from its live rig
+  // (MobSystem::DemoteToDistant, before ReleaseRig) into this cache.
+  mobs.SetDistantDraw(&distantDraw);
   // SANDVOX_BODY_INST_LEGACY=1: whole-list upload + one undivided draw, the
   // one-binary A/B arm for the arena and the cull (phys/debris.cpp reads the
   // same variable for its cull cache). The 18-vertex cube is NOT in the arm.
@@ -21132,6 +21135,11 @@ int main(int argc, char** argv) {
         if (distantDrawTest.Enabled())
           distantDrawTest.Fill(distantDraw, mobs.Defs(), mbSet, player.pos,
                                NowSeconds(), kDefaultSeed);
+        else
+          // D1: one statue per distant creature with a baked look, walking
+          // while it walks (FillDistantDrawItems, game/distant.h).
+          FillDistantDrawItems(mobs.Distant(), tick, CurrentTuning().distant.idleStride,
+                               distantDraw.Items());
         const uint32_t used = bodyReg.RealSlots() + (uint32_t)flightBodies.size();
         DistantView dv;
         dv.eye = eye;

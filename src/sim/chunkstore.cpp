@@ -403,6 +403,7 @@ void ChunkStore::Put(IVec3 wc, std::vector<uint32_t> rle, uint32_t tick) {
   it->second.rle = std::move(rle);
   r.dirty = true;
   SpillOverBudget();
+  NotifyChanged(wc, /*all=*/false);
 }
 
 bool ChunkStore::Erase(IVec3 wc) {
@@ -417,6 +418,7 @@ bool ChunkStore::Erase(IVec3 wc) {
   chunkCount_--;
   rit->second.dirty = true;
   tickTags_.erase(key);
+  NotifyChanged(wc, /*all=*/false);
   return true;
 }
 
@@ -810,6 +812,7 @@ bool ChunkStore::BindLoad(const std::string& dir) {
   // the legacy table from meta.svm next, before anything is read.
   tables_.Bind(dir);
   LoadManifest();  // ...and so does its manifest; absent file = all tags 0
+  NotifyChanged(IVec3{}, /*all=*/true);
   return true;
 }
 

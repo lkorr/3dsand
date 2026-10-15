@@ -13307,9 +13307,9 @@ Status GateDistantRoundtrip(Ctx& c, std::string& detail) {
     }
   }
   const bool okK =
-      check(kSurface == (int)DistantGround::Surface, "K: on the terrain is not SURFACE") &&
-      check(kHigh == (int)DistantGround::Anchored, "K: 3 m up is not ANCHORED") &&
-      check(kDungeon == -1 || kDungeon == (int)DistantGround::Anchored,
+      check(kSurface == (int)DistantGroundMode::Surface, "K: on the terrain is not SURFACE") &&
+      check(kHigh == (int)DistantGroundMode::Anchored, "K: 3 m up is not ANCHORED") &&
+      check(kDungeon == -1 || kDungeon == (int)DistantGroundMode::Anchored,
             "K: inside the dungeon box is not ANCHORED (" + kDungeonWhy + ")");
 
   // ---- five humans --------------------------------------------------------
@@ -13452,10 +13452,10 @@ Status GateDistantRoundtrip(Ctx& c, std::string& detail) {
     // A corpse's brain is not a mind any more; the living keep theirs whole.
     aBrain += (!snaps[k].alive || sameBrain(d->brain, snaps[k].brain)) ? 1 : 0;
     aLife += d->dead == !snaps[k].alive ? 1 : 0;
-    const DistantGround want = k == 4 ? DistantGround::Anchored : DistantGround::Surface;
-    if (d->ground == want) aGround++;
+    const DistantGroundMode want = k == 4 ? DistantGroundMode::Anchored : DistantGroundMode::Surface;
+    if (d->groundMode == want) aGround++;
     else if (whyA.empty())
-      whyA = Format("creature %zu classified %s", k, DistantGroundName(d->ground));
+      whyA = Format("creature %zu classified %s", k, DistantGroundModeName(d->groundMode));
     // The overlay patches the record into its own bytes (DemoteToDistant's
     // proof, re-asked from outside).
     std::vector<uint8_t> patched;

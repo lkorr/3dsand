@@ -143,6 +143,8 @@ const std::vector<Gate>& DistantLookGates();
 // Distant NPCs D2a (selftest_distant_calib.cpp): the duel matrix that
 // calibrates the distant tier's abstract hit model, and its resolver's unit arm.
 const std::vector<Gate>& DistantCalibGates();
+// The distant tier walks and sleeps (selftest_distant.cpp, PLAN_distant_npcs D1).
+const std::vector<Gate>& DistantGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -717,6 +719,15 @@ const char* const kOrder[] = {
     // debris reset, id counter put back, park function removed, store cleared,
     // its save dir deleted, worldgen regenerated at the home window.
     "distant-roundtrip",
+    // THE DISTANT TIER WALKS AND SLEEPS (docs/PLAN_distant_npcs.md D1). After
+    // `distant-roundtrip` for its exit contract: tuning restored, mobs and
+    // debris reset, park function removed, id counter put back, the store
+    // cleared (OnRegen), the window shifted back and worldgen regenerated at
+    // home; `distant-walk` also puts the world map back after its `peaks`
+    // arm. `distant-sleep` leaves the window where it found it (it ticks THE
+    // tick but never moves or edits it).
+    "distant-walk",
+    "distant-sleep",
     // MOBS v6 (PLAN_corpse_is_a_mob P2a). After `mob-park` for the same exit
     // contract: mobs, debris and risings reset, id counter restored, park
     // function removed, store cleared, worldgen regenerated at home.
@@ -1478,7 +1489,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(), &ItemStageGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &DungeonEntityGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates(), &StaggerGates(), &DistantLookGates(), &DistantCalibGates()})
+                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &DungeonEntityGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates(), &StaggerGates(), &DistantLookGates(), &DistantCalibGates(), &DistantGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;
@@ -1769,7 +1780,25 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << ", \"budgetWaits\": " << ds.budgetWaits << ", \"spawnWaits\": " << ds.spawnWaits
       << ", \"failed\": " << ds.failed << ", \"retireScans\": " << ds.retireScans
       << ", \"promoteScans\": " << ds.promoteScans << ", \"peak\": " << ds.peak
-      << ", \"cap\": " << DistantMobs::kMaxDistantMobs << "},\n";
+      << ", \"cap\": " << DistantMobs::kMaxDistantMobs
+      // D1: the walk -- steps run, TickDistant's own wall time (a measurement,
+      // never an input) per call, sleeps / wakes, and every refused step by
+      // its reason; the promotion snaps and their worst error.
+      << ", \"steps\": " << ds.steps << ", \"tickCalls\": " << ds.tickCallsAll
+      << ", \"tickCallsStepping\": " << ds.tickCalls
+      << ", \"tickUsTotal\": " << (double)ds.tickNs / 1000.0
+      << ", \"tickUsPerCall\": "
+      << (ds.tickCallsAll > 0 ? (double)ds.tickNs / 1000.0 / (double)ds.tickCallsAll : 0.0)
+      << ", \"sleeps\": " << ds.sleeps << ", \"wakesNeighbour\": " << ds.wakesNeighbour
+      << ", \"wakesTimer\": " << ds.wakesTimer << ", \"lineHolds\": " << ds.lineHolds
+      << ", \"climbRefusals\": " << ds.climbRefusals
+      << ", \"dropRefusals\": " << ds.dropRefusals
+      << ", \"waterRefusals\": " << ds.waterRefusals << ", \"swimSteps\": " << ds.swimSteps
+      << ", \"combatHolds\": " << ds.combatHolds << ", \"landings\": " << ds.landings
+      << ", \"landingHurt\": " << ds.landingHurt
+      << ", \"landingDeaths\": " << ds.landingDeaths << ", \"snaps\": " << ds.snaps
+      << ", \"snapMisses\": " << ds.snapMisses
+      << ", \"snapErrMaxVox\": " << (double)ds.snapErrQ / 16.0 << "},\n";
   }
   // ---- THE DISTANT STATUES (game/distant_draw.h, PLAN_distant_npcs D4a) ---
   // What every DistantDraw in the run did: drawn / culled / starved for want

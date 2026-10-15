@@ -2960,6 +2960,12 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
       // gate ticking THE tick never saw (audit A12). The window has already
       // moved for this tick (phase B), and the fetch cache's answers are the
       // fixed-latency ones every tier decision may read (rule 1).
+      //
+      // The distant tier's ground reads EDITED chunks out of this stream's
+      // store, after draining their evictions (Stream::SettledStoredChunk;
+      // docs/PLAN_distant_npcs.md §2.4): bound here, every tick, so a gate
+      // ticking THE tick walks distant creatures over real edits too.
+      mobs.SetDistantStream(&stream);
       if (w.parking != nullptr) w.parking->Unpark(mobs, stream.Store(), world, tick);
 
       // mobs: kinematic walk drive, terrain anchors for ManageTerrain,
