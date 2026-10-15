@@ -11402,6 +11402,81 @@ proud of the widest FILLED column, and a thumb at an absolute row instead of
 proud of the front-most filled cell. The anatomy peel needs a solid volume, and
 a detached speckle becomes a floating scrap of flesh in the world.
 
+#### The fine face and the skin pass (2026-10-15)
+
+Every humanoid ships at 80 art vox/m, but a generated body is AUTHORED at 40
+(`AUTHORED_VOXELS_PER_METRE`) and block-replicated (`SKIN_UPSCALE` 2), so every
+painted cell is a 2x2x2 block. The races with a surface pass (goblin, demon,
+naga, the robots, the sylvan's bark) paint on the shipped lattice after the
+upscale; the human had none, so its eye was a 25 mm square and its mouth a
+25 mm bar, and the owner saw goblins as "twice as detailed" — at the face, they
+were. Nothing about storage or rendering changes: the human already paid for
+12.5 mm cells and was using them as 25 mm ones.
+
+- **`headVoxFine`** builds a HUMAN's head on the shipped lattice. The skull,
+  cap, mane and knot are `headVox`'s own expressions evaluated at the centre of
+  each shipped cell (the same shape sampled twice as finely, so no stair steps
+  and a hairline that moves in half rows); the face is redrawn at 12.5 mm: a
+  lash line over white–iris–white, a nose with a straight profile (bridge one
+  cell out, bulb two, filled back to the face), nostrils, a mouth line bent
+  along a curve with a lip above and below, brows that taper to the tail,
+  ears with a rim and a hollow, a beard whose density is per fine cell
+  (stubble at last). Every gene keeps its authored-unit meaning; the integer
+  face rows take HALF steps on a human (`fineStep`, `specStep`), one shipped
+  cell each, and stay whole on every other race (`coerceGene`). The fine
+  face's own rows (eye shape/tilt/iris/whites/glint, lashes and their length,
+  opacity and colour, lid crease, the ear rows, nose bridge/tip, the skin
+  tab) are `late`: appended to `GENE_SPECS` and rolled after every other
+  draw, so no seeded litter or pinned random body moved; a row's `ui` places
+  it on its tab (breed.js `groupSpecs`) without moving a draw.
+- **Tabs (same day, owner ask):** an **eyes** tab holds every eye row with the
+  eyebrows as a sub-section under a divider (`GENE_GROUPS` `parent`), an
+  **ears** tab holds size, height, set-back, width, stick-out, tilt, lobe, the
+  elf point and its length; **`EYE_STYLES`** (almond, round, narrow, hooded,
+  upturned, doll, tired, **old**) are presets like the beards'. `old` is the
+  block eye: §T holds it to the legacy head's eye cell for cell at eye size 1.
+- **Opacity rows.** Lashes, whites, lid crease, under-eyes, the ear's hollow
+  and every skin feature (collarbones, chest line, navel, kneecaps, elbows,
+  fingers, knuckles, nails, toes — split out of one `detail` gene) are an
+  OPACITY: the feature's own art slot (`ART.CREASE` … `ART.TOE`, 181-194) is
+  painted the same cells at any setting, and `detailColors(colors, genome)`
+  mixes its COLOUR from the skin toward the full tone, snapped to tenths
+  (`toneQ`). 0 paints nothing; 1 is the existing colour (free); a step between
+  is a palette colour of its own, shared by every body with the same skin and
+  setting — the defaults share one shade mix and one lit mix per complexion.
+  The lash colour is `colors.lash`, a tone of the hair. The NOSTRILS are a
+  derived tone of the skin (`NOSTRIL_TONE`, the owner's pick off shana's
+  repainted mouth), lighter than the skin's shade they used.
+- **`humanSkinPass`** runs on every part of a human after the upscale and
+  PAINTS ONLY — no cell added or removed, so armour boxes, the collider, the
+  anchors and the left/right mirror are untouched (`test_mobgen.mjs` §T
+  asserts the body below the neck has exactly the old cells): fingers, nails,
+  knuckles, toes, a kneecap, the elbow crease, collarbones, a navel, the line
+  under a man's chest, a one-cell checker where `shadeBack`'s dark half
+  begins, `texture` mottle and `moles`.
+- **Detail art slots** (`ART.FACE_SHADE` 201, `FACE_LIGHT` 200,
+  `EYE_WHITE` 199, `LASH` 198, then 197-180: `mg.DETAIL_SLOTS`). Three are an existing colour under a new number
+  (skinShade, skinLight, hairShade), which costs the shared art palette nothing
+  (it dedupes by RGB and merges only painted slots) and says two things the old
+  numbers could not: `hairMass` reads `SKIN_LIGHT` on a head as scalp and roots
+  hair on it, and the Characters page draws a family's shade/light slots in
+  the base colour, which had made every painted freckle and line invisible
+  there. `EYE_WHITE` is one constant colour for the whole cast (one merged slot).
+- **Races are untouched**: `isFineFace` is `race === 'human'`, and every race's
+  surface pass still reads `headVox`'s face. **`generateMob(…, { face:
+  'legacy' })`** builds a human the old way; the Characters page's **faces:
+  new / OLD** button (key `` ` ``) flips every preview between the two for
+  comparison. It is a view only — a save always writes the fine face.
+- The 10 named humans were re-baked with `gen_mobs.mjs --rebake` and the 20
+  pool bodies with the new **`bake_human_pool.mjs --rebake`** (each from the
+  genome in its own sidecar; the plain run re-rolls the population). Four pool
+  bodies' art (f02, f08, m04, m08) did not match what their own genomes
+  generate before the re-bake (cause not traced; their sidecars did match, so
+  the likeliest is a sidecar-only re-diff that left the art stale), and
+  `shana`'s torso had 34 cells of bra the current generator no longer paints;
+  all now match. `assets/mobs/human.vox`, the hand-authored base (player model), has no
+  genome and its own palette, and is NOT converted.
+
 ---
 
 ## 8. Player & Projectiles
@@ -24953,9 +25028,13 @@ Three properties matter and each is a deliberate cost:
   to a tool. A 64³ region is ~8 ms once the process is warm.
 * **It is a server because boot is ~3 s and a region is ~8 ms.** A viewer that
   streams as the camera moves cannot pay device creation and SPIR-V compilation
-  per box. The tuner keeps one process and takes the machine-global run mutex
-  around each request rather than for the process lifetime — a persistent holder
-  would block every build in every worktree for a whole session.
+  per box. The tuner keeps one process and never holds the machine-global GPU
+  lock for its lifetime — a persistent holder would block every build in every
+  worktree for a whole session. Since 2026-10-15 it takes that lock only while
+  a `SANDVOX_RUN_EXCLUSIVE` measurement is running or queued, as a lease over
+  back-to-back requests (released after 1.5 s idle or 20 s); gates, smokes and
+  shots are timing-blind, and queueing FIFO behind them one region per turn
+  left the Dungeons tab minutes from its first voxel.
 * **`lod > 1` is a MAJORITY over the block, per chunk.** 16 divides every
   supported lod so a chunk's cells never straddle a sample. Point sampling was
   the obvious alternative and it deletes exactly what you zoom out to see: a
