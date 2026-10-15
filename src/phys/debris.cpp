@@ -2593,9 +2593,9 @@ std::vector<DebrisVoxel> DownsampleMicro(const std::vector<DebrisVoxel>& src,
 // every body precisely so it can build collision there. A body whose underside
 // really is unfetched has no collision either, so it is falling, not sleeping,
 // and cannot reach this code.
-bool DebrisSystem::SettleFootprintSupported(const std::vector<DebrisVoxel>& src,
-                                            const int (*snap)[3], IVec3 base,
-                                            World& world) const {
+DebrisSystem::SettleSupport DebrisSystem::SettleFootprintSupported(
+    const std::vector<DebrisVoxel>& src, const int (*snap)[3], IVec3 base,
+    World& world) const {
   // A/B SWITCH, in the spirit of SANDVOX_PT_DEBUG / SANDVOX_PT_AUDIT. Setting
   // SANDVOX_NO_SETTLE_SUPPORT=1 restores the pre-2026-09-03 behaviour of
   // settling anything that is asleep and aligned, so "did the support test
@@ -2606,7 +2606,7 @@ bool DebrisSystem::SettleFootprintSupported(const std::vector<DebrisVoxel>& src,
     const char* e = std::getenv("SANDVOX_NO_SETTLE_SUPPORT");
     return e && *e && *e != '0';
   }();
-  if (kDisabled) return true;
+  if (kDisabled) return SettleSupport::Ground;
   // The footprint as a set, so "the cell below is my own voxel" is answerable
   // without an O(n^2) scan. Bodies that reach here are at most a few thousand
   // voxels (kMaxIslandVoxels bounds the island that made them), and this runs
@@ -2636,11 +2636,13 @@ bool DebrisSystem::SettleFootprintSupported(const std::vector<DebrisVoxel>& src,
     occupied.insert(cellKey(c));
   }
   bool sawUnknown = false;
+  bool sawLiquid = false;
   for (const DebrisVoxel& v : src) {
     IVec3 c = cellOf(v);
     IVec3 below{c.x, c.y - 1, c.z};
     if (occupied.count(cellKey(below))) continue;  // my own voxel, not support
-    if (!world.CellInWindow(below)) return true;  // outside the window is solid
+    if (!world.CellInWindow(below))
+      return SettleSupport::Ground;  // outside the window is solid
     IVec3 wc = ChunkOfCell(below.x, below.y, below.z);
     const CachedChunk* cc = world.Cached(wc);
     if (!cc || cc->voxels.size() != kChunkVol) {
@@ -2653,7 +2655,9 @@ bool DebrisSystem::SettleFootprintSupported(const std::vector<DebrisVoxel>& src,
                               (uint32_t)(below.x & 15)] & 0xFFF;
     if (mat != 0 && mat < classOf_.size() &&
         (classOf_[mat] == CLASS_SOLID || classOf_[mat] == CLASS_POWDER))
-      return true;
+      return SettleSupport::Ground;
+    if (mat != 0 && mat < classOf_.size() && classOf_[mat] == CLASS_LIQUID)
+      sawLiquid = true;
   }
   // Nothing supported it. An UNREADABLE cell below is NOT support -- this used
   // to abstain by returning true, which stamped the body into the grid on a
@@ -2663,8 +2667,12 @@ bool DebrisSystem::SettleFootprintSupported(const std::vector<DebrisVoxel>& src,
   // region, its below-chunk was not cached, it settled, and it was the biggest
   // floater left after the fire. The fetch has been requested; the body stays
   // a body and is re-tested in 30 ticks, by which time the chunk is here.
+  //
+  // Liquid below is not ground, but it is not a void either: a body asleep
+  // over water is FLOATING at rest (or lying in it), and waking it to "fall"
+  // only bobbed it until Jolt slept it again, every ~60 ticks, forever.
   (void)sawUnknown;
-  return false;
+  return sawLiquid ? SettleSupport::Liquid : SettleSupport::None;
 }
 
 // ---- Archimedes for rigid bodies (PLAN_debris_buoyancy.md phase 3) ---------
@@ -2947,13 +2955,23 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
     // Support: a lone body needs ground under its own footprint; an assembly
     // rests as one object, so ground under ANY shard carries all of them (a
     // felled trunk's middle shard hangs between the two that touch down).
-    bool supported = false;
-    for (Member& mem : members)
-      if (SettleFootprintSupported(*mem.src, mem.snap, mem.base, world)) {
-        supported = true;
+    SettleSupport support = SettleSupport::None;
+    for (Member& mem : members) {
+      const SettleSupport s =
+          SettleFootprintSupported(*mem.src, mem.snap, mem.base, world);
+      if (s == SettleSupport::Ground) {
+        support = s;
         break;
       }
-    if (!supported) {
+      if (s == SettleSupport::Liquid) support = s;
+    }
+    // Over liquid and on no ground: a floater at rest. It is neither stamped
+    // (it is not resting on anything the grid holds) nor woken (nothing is
+    // under it to fall into) -- it stays asleep, its clock keeps running, and
+    // it is looked at again in 30 ticks, so a raft that drifts onto a bank
+    // still settles there.
+    if (support == SettleSupport::Liquid) continue;
+    if (support == SettleSupport::None) {
       floaters_.settleWithoutSupport++;
       for (Member& mem : members) {
         bodies_[mem.idx].inactiveTicks = 0;

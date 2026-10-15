@@ -1987,9 +1987,16 @@ class DebrisSystem {
   // rounded body origin. Chunks that are not cached are REQUESTED and read as
   // "no support", so a settle near an unfetched chunk waits for the fetch
   // instead of guessing — the same self-healing shape EventReady has.
-  bool SettleFootprintSupported(const std::vector<DebrisVoxel>& src,
-                                const int (*snap)[3], IVec3 base,
-                                World& world) const;
+  //
+  // THREE-VALUED: Ground (solid/powder under some voxel), Liquid (no ground,
+  // but liquid under some voxel -- a floater at rest, or a body hanging in
+  // water), None (nothing seen to hold it). Only None wakes the body to fall;
+  // a floater is left asleep, which is what FloatBodies' "a raft at rest
+  // stays asleep" promises (rule 2).
+  enum class SettleSupport : uint8_t { None, Ground, Liquid };
+  SettleSupport SettleFootprintSupported(const std::vector<DebrisVoxel>& src,
+                                         const int (*snap)[3], IVec3 base,
+                                         World& world) const;
   void RunIslandDetection(const Event& e, uint32_t tick, World& world,
                           std::vector<CellOp>& cellOps,
                           std::vector<ParticleSpawn>& spawns);
