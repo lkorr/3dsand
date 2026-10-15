@@ -1203,6 +1203,12 @@ class DebrisSystem {
   // read), so its patch would polygonize EMPTY and needs no fetch to say so.
   // Answers for the chunk as of the snapshot, the same age the mirror is.
   bool SkyKnown(IVec3 worldChunk) const;
+  // WHY ColliderVouched(wc) SAYS WHAT IT SAYS, as one line: the patch entry
+  // (built version, body, last sweep that listed it, sky verdict, fetch asked),
+  // the mirror copy, and SkyKnown's first failing test (snapshot invalid, a
+  // neighbour outside the snapshot's window, or the neighbour with matter and
+  // its count). Diagnostic; allocates.
+  std::string VouchReport(IVec3 worldChunk) const;
 
   // ---- why a body stopped in mid-air, or did not (CLAUDE.md rule 6) -------
   // A clamp that fires is not a bug and a clamp that releases IS one, so the
@@ -1221,6 +1227,14 @@ class DebrisSystem {
     // one that introduced it.
     uint32_t rigHolds = 0;
     float minRigFrac = 1.0f;
+    // THE LAST RIG HOLD, RECORDED WHERE IT FIRED (UntunnelRig, probe on only):
+    // the member whose step ended unvouched, where its step started and ended,
+    // and VouchReport() of the chunk it entered, taken at that moment -- the
+    // verdict the clamp acted on, not what the entry says a tick later after
+    // the next sweep has built it.
+    uint64_t lastHandle = 0;
+    Vec3 lastFrom{}, lastTo{};
+    std::string lastWhy;
   };
   const UntunnelProbe& Untunnel() const { return untunnel_; }
   void ResetUntunnelProbe() { untunnel_ = UntunnelProbe{}; }
@@ -2461,6 +2475,11 @@ class DebrisSystem {
     float horizon = 0.0f;
   };
   std::vector<Anchor> extraAnchors_;                    // mob limbs, this tick
+  // The limp rigs UntunnelRig was handed since the last sweep: members flat,
+  // and one end index per rig. ManageTerrain lists each rig's live extent
+  // ("A LIMP RIG NEEDS THE CHUNKS ITS LIMBS ARE IN") and clears both.
+  std::vector<uint64_t> rigWatch_;
+  std::vector<uint32_t> rigWatchEnd_;
   std::unordered_map<uint64_t, TerrainEntry> terrain_;  // packed world chunk key
   std::vector<TerrainBuild> terrainBuilds_;  // this tick's, see TerrainBuild
   uint32_t lastTerrainTick_ = 0;  // the sweep TerrainCensus reports on

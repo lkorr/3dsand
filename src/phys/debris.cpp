@@ -203,6 +203,13 @@ constexpr float kTerrainUrgentReachVox = 64.0f;    // ~3 ticks at 60 m/s
 constexpr uint32_t kTerrainUrgentFetches = 16;
 constexpr uint32_t kTerrainUrgentGathers = 16;
 constexpr uint32_t kTerrainUrgentBuilds = 10;
+// A limp rig's terrain need is the box of its members' centres grown by this
+// (ManageTerrain, "A LIMP RIG NEEDS THE CHUNKS ITS LIMBS ARE IN"): a limb's
+// half-length past its centre plus a tick of its swing at the spin clamp.
+constexpr float kRigLimbReachVox = 4.0f;
+// Members remembered between UntunnelRig and the next sweep, at most (a bound
+// for a caller that steps rigs without sweeping; 64 humans is ~1,000).
+constexpr size_t kRigWatchCap = 8192;
 // Consecutive steps a body may be held at a collider boundary before it is let
 // through anyway. Half a second at 60 Hz: long enough that the patch normally
 // lands first, short enough that a starved readback reads as a stutter rather
@@ -705,6 +712,8 @@ void DebrisSystem::Reset() {
   for (auto& [ci, t] : terrain_)
     if (t.handle) phys_->RemoveBody(t.handle);
   terrain_.clear();
+  rigWatch_.clear();
+  rigWatchEnd_.clear();
   events_.clear();
   gore_.clear();
   pendingSupport_.clear();
@@ -6939,6 +6948,66 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     sweepAhead(a.pos, a.vel, a.radius);
   }
   extraAnchors_.clear();
+  // A LIMP RIG NEEDS THE CHUNKS ITS LIMBS ARE IN, NOT ITS REST POSE'S.
+  //
+  // The creature anchor above is the live pelvis with the radius of the
+  // creature's REST box (Mob::RegisterTerrainAnchor), swept along the
+  // pelvis's velocity. A rig tumbling down a cliff face is not in its rest
+  // pose: legs flung out and limbs at the 47 rad/s spin clamp put a limb 20-40
+  // voxels from the pelvis, outside that box, and UntunnelRig holds the WHOLE
+  // rig the moment any limb's step ends in a chunk with no patch. Attributed on
+  // the owner's mountain (`freefall-slope`, SANDVOX_FREEFALL_SITE, 2026-10-15):
+  // all 13 holds were a limb 20-40 voxels from the anchor entering a chunk
+  // first listed 0-3 ticks before (or never: the leg sat outside the box for
+  // five held ticks in a row) beside the face, where the snapshot's known-sky
+  // verdict cannot vouch for it and only a fetch round trip can.
+  // So each rig UntunnelRig was handed last PostStep is listed by the box of
+  // its members' CURRENT positions (+ kRigLimbReachVox for the limb beyond its
+  // centre and its swing), swept along the rig's mean velocity. A rig whose
+  // members are all asleep lists nothing here (its mob anchor still does).
+  // SANDVOX_NO_RIG_EXTENT=1 is the A/B arm (one binary).
+  static const bool rigExtentOff = [] {
+    const char* e = std::getenv("SANDVOX_NO_RIG_EXTENT");
+    return e != nullptr && e[0] != '0';
+  }();
+  if (!rigExtentOff) {
+    size_t begin = 0;
+    for (const uint32_t end : rigWatchEnd_) {
+      Vec3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f}, vsum{};
+      float vmax = 0.0f;
+      int live = 0;
+      bool anyActive = false;
+      for (size_t k = begin; k < end && k < rigWatch_.size(); k++) {
+        BodyTransform xf{};
+        if (!phys_->GetTransform(rigWatch_[k], xf)) continue;
+        Vec3 lin{}, ang{};
+        if (phys_->IsActive(rigWatch_[k])) {
+          anyActive = true;
+          phys_->GetBodyVelocities(rigWatch_[k], lin, ang);
+        }
+        lo = Vec3{std::min(lo.x, xf.pos.x), std::min(lo.y, xf.pos.y), std::min(lo.z, xf.pos.z)};
+        hi = Vec3{std::max(hi.x, xf.pos.x), std::max(hi.y, xf.pos.y), std::max(hi.z, xf.pos.z)};
+        vsum = vsum + lin;
+        vmax = std::max(vmax, lin.len());
+        live++;
+      }
+      begin = end;
+      if (live == 0 || !anyActive) continue;
+      const float m = kRigLimbReachVox;
+      const size_t before = needed.size();
+      needBoxWorld(Vec3{lo.x - m - 6.0f, lo.y - m - 6.0f, lo.z - m - 6.0f},
+                   Vec3{hi.x + m + 6.0f, hi.y + m + 6.0f, hi.z + m + 6.0f});
+      if (!urgentOff && vmax >= kTerrainUrgentSpeedVox)
+        for (size_t k = before; k < needed.size(); k++)
+          terrainUrgent_.push_back(World::PackChunkKey(needed[k].first));
+      const Vec3 centre = (lo + hi) * 0.5f;
+      const float half = std::max({hi.x - lo.x, hi.y - lo.y, hi.z - lo.z}) * 0.5f + m;
+      sweepAhead(centre, vsum * (1.0f / (float)live), half);
+      if (prof_.on) prof_.anchorChunks += needed.size() - before;
+    }
+  }
+  rigWatch_.clear();
+  rigWatchEnd_.clear();
   // Dedupe by chunk, keeping the NEAREST distance any anchor gave it, then
   // order nearest-first, equal distances by chunk key (this runs under the
   // selftest, whose debris gates compare against a baseline).
@@ -7529,6 +7598,73 @@ bool DebrisSystem::SkyKnown(IVec3 wc) const {
   return true;
 }
 
+std::string DebrisSystem::VouchReport(IVec3 wc) const {
+  char buf[512];
+  std::string out;
+  if (world_ == nullptr) return "no world";
+  const bool inWin = world_->ChunkInWindow(wc);
+  auto it = terrain_.find(World::PackChunkKey(wc));
+  if (it == terrain_.end()) {
+    out = "entry none";
+  } else {
+    const TerrainEntry& t = it->second;
+    std::snprintf(buf, sizeof buf,
+                  "entry built v%u body %d needed @%u sky @%u fetchReq @%u (sweep @%u)",
+                  t.builtVersion, t.handle != 0 ? 1 : 0, t.lastNeeded, t.skyTick,
+                  t.fetchReqTick, lastTerrainTick_);
+    out = buf;
+  }
+  const CachedChunk* cc = world_->Cached(wc);
+  std::snprintf(buf, sizeof buf, "; inWin %d cached %s", inWin ? 1 : 0,
+                cc ? ("v" + std::to_string(cc->version)).c_str() : "no");
+  out += buf;
+  // SkyKnown's tests in its own order, stopping at the first that fails.
+  const WorldSnapshot& snap = world_->Snap();
+  if (!snap.valid || snap.occupancy.size() < kNumChunks) {
+    out += "; sky: no valid snapshot";
+    return out;
+  }
+  const IVec3 so = snap.windowOrigin;
+  const int n = (int)kNChunk;
+  int matterNbrs = 0, unbuiltMatterNbrs = 0;
+  uint32_t ownOcc = 0;
+  std::string firstMatter;
+  for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+      for (int dx = -1; dx <= 1; dx++) {
+        const IVec3 c{wc.x + dx, wc.y + dy, wc.z + dz};
+        const bool inSnap = c.x >= so.x && c.y >= so.y && c.z >= so.z && c.x < so.x + n &&
+                            c.y < so.y + n && c.z < so.z + n;
+        if (!inSnap || !world_->ChunkInWindow(c)) {
+          std::snprintf(buf, sizeof buf,
+                        "; sky: nbr (%+d,%+d,%+d) outside the %s window (snap @%u origin "
+                        "(%d,%d,%d))",
+                        dx, dy, dz, inSnap ? "current" : "snapshot's", snap.tick, so.x, so.y,
+                        so.z);
+          return out + buf;
+        }
+        const uint32_t occ = snap.occupancy[World::SlotChunkIndex(c)];
+        if ((dx | dy | dz) == 0) { ownOcc = occ; continue; }
+        if (occ == 0) continue;
+        matterNbrs++;
+        auto nt = terrain_.find(World::PackChunkKey(c));
+        if (nt == terrain_.end() || nt->second.builtVersion == 0) unbuiltMatterNbrs++;
+        if (firstMatter.empty()) {
+          std::snprintf(buf, sizeof buf, " first (%+d,%+d,%+d) 0x%x", dx, dy, dz, occ);
+          firstMatter = buf;
+        }
+      }
+  if (ownOcc == 0 && matterNbrs == 0) {
+    std::snprintf(buf, sizeof buf, "; sky: known empty (snap @%u)", snap.tick);
+    return out + buf;
+  }
+  std::snprintf(buf, sizeof buf,
+                "; sky: no (snap @%u): own occupancy 0x%x, %d nbrs with matter (%d without a "
+                "built patch)%s",
+                snap.tick, ownOcc, matterNbrs, unbuiltMatterNbrs, firstMatter.c_str());
+  return out + buf;
+}
+
 bool DebrisSystem::UntunnelBody(uint64_t handle, const Vec3& prevPosVoxel) {
   if (handle == 0 || phys_ == nullptr || world_ == nullptr) return false;
   if (AntiTunnelOff(AntiTunnel::Clamp)) return false;
@@ -7588,9 +7724,18 @@ bool DebrisSystem::UntunnelBody(uint64_t handle, const Vec3& prevPosVoxel) {
 bool DebrisSystem::UntunnelRig(const std::vector<uint64_t>& handles,
                                const std::vector<Vec3>& prevPosVoxel) {
   if (phys_ == nullptr || world_ == nullptr) return false;
-  if (AntiTunnelOff(AntiTunnel::Clamp)) return false;
   const size_t n = std::min(handles.size(), prevPosVoxel.size());
   if (n == 0) return false;
+  // The rig's members, for the next ManageTerrain's rig-extent listing ("A
+  // LIMP RIG NEEDS THE CHUNKS ITS LIMBS ARE IN"). Consumed and cleared there;
+  // the cap only matters to a caller that steps rigs without ever sweeping.
+  if (rigWatch_.size() + n > kRigWatchCap) {
+    rigWatch_.clear();
+    rigWatchEnd_.clear();
+  }
+  rigWatch_.insert(rigWatch_.end(), handles.begin(), handles.begin() + (std::ptrdiff_t)n);
+  rigWatchEnd_.push_back((uint32_t)rigWatch_.size());
+  if (AntiTunnelOff(AntiTunnel::Clamp)) return false;
   auto chunkOf = [](const Vec3& p) {
     return IVec3{ifloor(p.x) >> 4, ifloor(p.y) >> 4, ifloor(p.z) >> 4};
   };
@@ -7687,7 +7832,16 @@ bool DebrisSystem::UntunnelRig(const std::vector<uint64_t>& handles,
   untunnel_.minRigFrac = std::min(untunnel_.minRigFrac, frac);
   untunnel_.maxStepVox = std::max(untunnel_.maxStepVox, maxLen);
   for (size_t i = 0; i < n; i++)
-    if (live[i] && !vouched(now[i])) { untunnel_.lastChunk = chunkOf(now[i]); break; }
+    if (live[i] && !vouched(now[i])) {
+      untunnel_.lastChunk = chunkOf(now[i]);
+      if (needProbeOn_) {
+        untunnel_.lastHandle = handles[i];
+        untunnel_.lastFrom = prevPosVoxel[i];
+        untunnel_.lastTo = now[i];
+        untunnel_.lastWhy = VouchReport(untunnel_.lastChunk);
+      }
+      break;
+    }
   return true;
 }
 

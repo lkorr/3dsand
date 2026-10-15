@@ -8066,7 +8066,7 @@ neighbors, so this needs an explicit connectivity pass:
      `kSnapshotLatency + 1` ticks before arrival, only a fetch round trip from
      their patch — one on a chunk no anchor box listed, one requested nine
      ticks ahead and still uncached at arrival with the fetch FIFO showing no
-     drop; both singletons unexplained). The gate now runs two arms on `peaks`
+     drop; both singletons unexplained -- explained in round 3 below). The gate now runs two arms on `peaks`
      (`graze`, and `terminal` 300 m higher), counts holds and damps only while
      the body is alive (after a splat the counter is the flung pieces'), and
      splits holds into budget (must be 0) and late (bounded by
@@ -8086,6 +8086,24 @@ neighbors, so this needs an explicit connectivity pass:
      on, cuts the wrist — a hand flies off a living body mid-fall. The gate
      records it (`spinDamps`, with the part) and does not fail on it; the fix
      is limp-rig joint damping, a tuning change that moves every ragdoll.
+  7. **Round 3: the holds were LIMBS outside the anchor (2026-10-15, same
+     ticket).** On main 2e34096 the real-mountain arm held the rig 13 ticks
+     (all "late", over `maxLateHolds`). Each hold now prints the limb whose
+     step ended unvouched, its step, its distance from the anchor the sweep
+     listed round, and `DebrisSystem::VouchReport` of the chunk TAKEN AT THE
+     HOLD (`UntunnelProbe::lastWhy`: the patch entry, the mirror copy, and why
+     `SkyKnown` refused — own occupancy, how many neighbours hold matter and
+     how many of those have no patch). Every one was a leg, foot or arm 20-40
+     voxels from the pelvis — a tumbling rig is not its rest pose — entering a
+     chunk beside the face that the pelvis-centred rest-radius anchor first
+     listed 0-3 ticks earlier, or never (a leg sat outside the box for five
+     held ticks in a row), and that known sky cannot vouch for because a
+     neighbour is rock. Fix: `UntunnelRig` remembers each rig it was handed,
+     and the next `ManageTerrain` lists the box of the members' CURRENT
+     centres (+ `kRigLimbReachVox` 4, + the usual 6) with the urgent lane
+     when fast, swept along the rig's mean velocity (a rig whose members all
+     sleep lists nothing). `SANDVOX_NO_RIG_EXTENT=1` is the A/B arm. Real
+     mountain: rig holds 13 -> 0.
 
 ### A corpse in armour is not allowed to be a motor (2026-09-13; `Physics::SweepRunawayRigs`, gate `corpse-armor`)
 

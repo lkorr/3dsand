@@ -3573,6 +3573,7 @@ Status GateFreefallSlope(Ctx& c, std::string& detail) {
     uint32_t damped = 0;  // runaway-net damps this tick (Physics::Runaway)
     float spin = 0.0f;    // the fastest-spinning part's rad/s, and which
     std::string spinPart;
+    float span = 0.0f;    // the furthest part's centre from the pelvis, voxels
     int needAgo = -1;     // a held tick: how long before it the chunk was first listed
     std::string why;     // a held tick: the unvouched chunk and its NeedProbe
   };
@@ -3669,6 +3670,27 @@ Status GateFreefallSlope(Ctx& c, std::string& detail) {
           } else {
             r.why = Format("unvouched (%d,%d,%d): never listed", uc.x, uc.y, uc.z);
           }
+          // WHO and WHERE (UntunnelRig's own record, taken at the hold): the
+          // limb whose step ended in the chunk, its step, how far that end is
+          // from the anchor the sweep before it listed chunks round (the
+          // pelvis), and the vouch verdict's own reasons.
+          const auto& un = c.debris.Untunnel();
+          std::string part = "?";
+          if (s.avatar.Spawned())
+            for (int pi = 0; pi < s.avatar.PartCount(); pi++)
+              if (s.avatar.PartBody(pi) == un.lastHandle && s.avatar.PartName(pi))
+                part = s.avatar.PartName(pi);
+          float anchorDist = -1.0f;
+          Vec3 anchorVel{};
+          for (const auto& [ap, av] : c.debris.ProbeAnchors()) {
+            const float d = (un.lastTo - ap).len();
+            if (anchorDist < 0.0f || d < anchorDist) { anchorDist = d; anchorVel = av; }
+          }
+          r.why += Format(" | limb %s step (%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f) %.1f vox, %.1f vox "
+                          "from the anchor (v %.0f vox/s) | %s",
+                          part.c_str(), un.lastFrom.x, un.lastFrom.y, un.lastFrom.z, un.lastTo.x,
+                          un.lastTo.y, un.lastTo.z, (un.lastTo - un.lastFrom).len(), anchorDist,
+                          anchorVel.len(), un.lastWhy.c_str());
         }
         r.limp = s.avatar.Spawned() && s.avatar.Ragdolled() ? 1 : 0;
         r.alive = s.avatar.Spawned() && s.avatar.Alive() ? 1 : 0;
@@ -3689,6 +3711,8 @@ Status GateFreefallSlope(Ctx& c, std::string& detail) {
             const uint64_t pb = s.avatar.PartBody(pi);
             Vec3 pl{}, pa{};
             if (pb == 0 || !c.phys.GetBodyVelocities(pb, pl, pa)) continue;
+            BodyTransform pxf{};
+            if (c.phys.GetTransform(pb, pxf)) r.span = std::max(r.span, (pxf.pos - hp).len());
             if (pa.len() > r.spin) {
               r.spin = pa.len();
               r.spinPart = s.avatar.PartName(pi) ? s.avatar.PartName(pi) : "?";
@@ -3914,13 +3938,18 @@ Status GateFreefallSlope(Ctx& c, std::string& detail) {
       if (i < 0 || i >= (int)rows.size()) return "-";
       const Row& r = rows[i];
       return Format("tick %d: hips (%.1f,%.1f,%.1f) v (%.1f,%.1f,%.1f) m/s lost %.1f m/s clear %.1f "
-                    "limp %d alive %d held %d bills %d damped %u spin %.1f %s outPatches %d %.1f ms [step %.2f "
+                    "limp %d alive %d held %d bills %d damped %u spin %.1f %s span %.1f outPatches %d %.1f ms [step %.2f "
                     "ccd %.2f find %.2f solve %.2f static %u ccdB %u meshes %u tris %u %.2f ms] %s",
                     i, r.hips.x, r.hips.y, r.hips.z, r.hv.x * kVoxelMeters, r.hv.y * kVoxelMeters,
                     r.hv.z * kVoxelMeters, r.lost, r.clear, r.limp, r.alive, r.held, r.bills,
-                    r.damped, r.spin, r.spinPart.c_str(), r.outPatches, r.ms, r.stepMs, r.ccdMs, r.findMs, r.solveMs, r.statMan,
+                    r.damped, r.spin, r.spinPart.c_str(), r.span, r.outPatches, r.ms, r.stepMs, r.ccdMs, r.findMs, r.solveMs, r.statMan,
                     r.ccdBodies, r.meshes, r.tris, r.meshUs * 0.001f, r.why.c_str());
     };
+    // EVERY hold while alive, one line each (there are a handful at most): the
+    // first one in the failure text is not enough to attribute a COUNT.
+    for (int i = 0; i < (int)rows.size(); i++)
+      if (rows[i].held && rows[i].alive)
+        std::printf("freefall-slope: %s hold [%s]\n", arm, rowAt(i).c_str());
     const std::string pre = std::string("freefallSlope.") + arm + ".";
     RecordObserved((pre + "rigHolds").c_str(), (double)holds);
     RecordObserved((pre + "lateHolds").c_str(), (double)lateHolds);
