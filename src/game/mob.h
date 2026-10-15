@@ -4871,6 +4871,15 @@ class Mob {
                  const CarveSpall* spall = nullptr,
                  CarveReport* report = nullptr,
                  const CarveBounds* bounds = nullptr);
+  // ---- THE CLOTH OVER A CUT OPENS (2026-10-14) ------------------------------
+  // A blade that cut flesh went through whatever soft garment lay over it, so
+  // every worn shell no harder than skin (gear.cutHardnessRef) is parted over
+  // the wound: a lens along the edge's line, gore.clothGape wide each side, out
+  // along the way the blade came. `slot` is the flesh kerf as CutLimb resolved
+  // it (entry-snapped, final depth), in body limb `limbIndex`'s frame. Returns
+  // the cloth voxels removed. Mob::CutLimb's note says why it lives there.
+  uint32_t OpenClothOver(int limbIndex, const KerfSlot& slot, World& world,
+                         std::vector<ParticleSpawn>& spawns, float severity);
   // Sum MobDef::WoundHpOf and MobDef::OrganHpOf over a limb's CURRENT
   // authoritative lattice, in one pass. This is what MobLimb::weightCharged /
   // organCharged are deltas of; see the note on those fields for why the

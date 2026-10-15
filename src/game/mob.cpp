@@ -15322,6 +15322,23 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
       nearSign = sa > 0.0f ? 1.0f : -1.0f;
     }
 
+    // ---- THE CLOTH OVER THE WOUND OPENS (2026-10-14) -----------------------
+    //
+    // Owner: "slashing someone wearing a robe should just leave a cut through
+    // the robe where it hits the skin, so that the robe is cut / split open
+    // there, showing the flesh underneath that's been cut". The melee sweep
+    // already lets an edge through cloth (melee.cpp "CLOTH IS NOT ARMOUR") and
+    // cut the garment where the probe crossed it -- but with THIS kerf, entry-
+    // snapped onto the cloth: a slot a blade thick and a bite deep, which on a
+    // garment one micro thick is a two-cell nick (measured: 9 robe voxels for
+    // a slash, the wound under it invisible). The wound is a fact about where
+    // the blade went, and the blade went through the cloth to make it, so the
+    // cloth is opened HERE, from the flesh slot itself, for every caller that
+    // cuts a limb (a sweep, a peer's blow, a gate). Before the flesh carve,
+    // which may take the limb -- and the sleeve with it, already slit.
+    if (!worn_.empty() && (int)i < baseLimbs_)
+      OpenClothOver((int)i, slot, world, spawns, severity);
+
     // Everything the structural sever rules in CarveLimb need to know is
     // "an edge did this": DamageCause::Blade, the one row with the cut-through
     // rule (game/severpolicy.h says why the other causes do not get it). An
@@ -15402,6 +15419,204 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
     return true;
   }
   return false;
+}
+
+// ---- THE CLOTH OVER A CUT, PARTED (2026-10-14; Mob::CutLimb says why) --------
+//
+// THE SHAPE IS A LENS, NOT THE KERF. A kerf is the matter an edge displaces,
+// and in cloth one micro thick that is a slit a blade wide -- a line you
+// cannot see the wound through. Slit cloth that is stretched over a body
+// GAPES: the cut is widest at its middle and closes toward its ends, so the
+// opening is the edge's line (the slot's u, a little past the wound's ends)
+// widened by up to gore.clothGape across it (v) on an ellipse, and its outer
+// third tears raggedly, quantised on the shell's own skin lattice so the rim
+// is a property of the art. It runs through the cloth along the way the blade
+// came (w), from kClothReach out in front of the wound mouth to the bottom of
+// the cut: a chop parts the garment over the mouth, a slash that ran along the
+// body parts it along the blade's path, and a cut that went right through a
+// limb parts the sleeve on both sides. No wedge: the blade went all the way
+// through the cloth wherever it went through the cloth.
+//
+// WHICH SHELLS. Every worn slot, not only the ones strapped to this limb (a
+// sleeve shares cells with the torso shell over a shoulder), but only where
+// the garment is SOFT -- no harder than skin, gear.cutHardnessRef, the line
+// the melee sweep passes cloth by. Decided by the voxels inside the opening,
+// most of them wins: leather trim across a robe does not open, and a cuirass
+// the slot happens to reach is the plate rule's business, not this one's.
+//
+// NOT EJECTED. The cloth parts; it is not shed as confetti, and a shell one
+// micro thick would be billed as whole world voxels of litter by the collider
+// delta (LimbVoxelsToParticles). The melee sweep's own cloth kerf still ejects
+// what the edge actually took out of it.
+namespace {
+// How far in front of the wound mouth the opening reaches, world voxels: past
+// a garment fitted one micro off the skin at any angle short of grazing (the
+// stock wardrobe is the body's silhouette dilated by one cell, so a few cells
+// along the normal is a voxel at ~80 degrees off it).
+constexpr float kClothReach = 1.0f;
+// The outer share of the lens whose cloth tears raggedly.
+constexpr float kClothRim = 0.35f;
+// The widest the gape gets, as a share of the cut's half-length.
+constexpr float kClothGapeOfLength = 0.5f;
+
+struct ClothOpening {
+  Vec3 c, u, v, w;  // lattice units / unit axes, in the shell's frame
+  float halfL = 0, hw0 = 0, gape = 0, back = 0, depth = 0, toSkin = 1;
+  uint32_t seed = 0;
+  // 0 = outside the opening; 1 = parted for certain; between = the tear.
+  float Chance(float x, float y, float z) const {
+    const Vec3 d{x + 0.5f - c.x, y + 0.5f - c.y, z + 0.5f - c.z};
+    const float dw = d.dot(w);
+    if (dw < -back || dw > depth) return 0.0f;
+    const float lu = std::fabs(d.dot(u)) / std::max(halfL, 1e-3f);
+    if (lu >= 1.0f) return 0.0f;
+    const float open = hw0 + gape * std::sqrt(1.0f - lu * lu);
+    const float e = std::fabs(d.dot(v)) / std::max(open, 1e-3f);
+    if (e >= 1.0f) return 0.0f;
+    return e <= 1.0f - kClothRim ? 1.0f : (1.0f - e) / kClothRim;
+  }
+  bool Keep(float x, float y, float z) const {
+    const float p = Chance(x, y, z);
+    if (p <= 0.0f) return true;
+    if (p >= 1.0f) return false;
+    const int sx = (int)std::floor(x * toSkin);
+    const int sy = (int)std::floor(y * toSkin);
+    const int sz = (int)std::floor(z * toSkin);
+    const uint32_t h = rng::Hash3(seed, (uint32_t)sx * 73856093u,
+                                  (uint32_t)sy * 19349663u ^
+                                      (uint32_t)sz * 83492791u);
+    return (float)(h & 0xFFFFu) / 65535.0f >= p;
+  }
+};
+}  // namespace
+
+uint32_t Mob::OpenClothOver(int limbIndex, const KerfSlot& slot, World& world,
+                            std::vector<ParticleSpawn>& spawns,
+                            float severity) {
+  if (worn_.empty() || phys_ == nullptr || sys_ == nullptr) return 0;
+  if (limbIndex < 0 || limbIndex >= (int)limbs_.size()) return 0;
+  // A SHORT CUT GAPES LESS: the lens is never wider than half its length, so
+  // a graze or a dagger's nick parts a slit and a stab a small hole, and only
+  // a full-length slash opens the whole gore.clothGape.
+  const float gape = std::clamp(CurrentTuning().gore.clothGape, 0.0f,
+                                kClothGapeOfLength * std::max(slot.halfL, 0.0f));
+  const float passHard = CurrentTuning().gear.cutHardnessRef;
+  // The flesh slot in WORLD space, re-expressed per shell below. The host's
+  // pose is the one CutLimb just read and built `slot` against.
+  const MobLimb& host = limbs_[limbIndex];
+  const Quat qh{host.xf.quat[0], host.xf.quat[1], host.xf.quat[2],
+                host.xf.quat[3]};
+  const Vec3 cW = host.xf.pos + Rotate(qh, slot.c);
+  const Vec3 uW = Rotate(qh, slot.u), vW = Rotate(qh, slot.v),
+             wW = Rotate(qh, slot.w);
+  const float halfL = slot.halfL + gape;
+  const float back = std::max(kClothReach, slot.back);
+  const float depth = std::max(slot.depth, 0.0f);
+  // The slots first: a carve never resizes limbs_, but a shell carved below
+  // its Jolt floor is shed, and the walk must not ride `worn_` through that.
+  std::vector<int> shells;
+  for (const WornPiece& p : worn_)
+    for (int s : p.slots)
+      if (s >= 0 && s < (int)limbs_.size() && IsWornSlot(s) &&
+          limbs_[s].body)
+        shells.push_back(s);
+  uint32_t parted = 0;
+  for (int s : shells) {
+    if (!limbs_[s].body) continue;
+    MobLimb& shell = limbs_[s];
+    // Read ONCE, as CutLimb reads the host: the predicate is built against
+    // this pose and CarveLimb does not refresh it (gotcha-live-limb-carve-pose).
+    phys_->GetTransform(shell.body, shell.xf);
+    const Quat qs{shell.xf.quat[0], shell.xf.quat[1], shell.xf.quat[2],
+                  shell.xf.quat[3]};
+    const Vec3 cS = RotateInv(qs, cW - shell.xf.pos);
+    const Vec3 uS = RotateInv(qs, uW), vS = RotateInv(qs, vW),
+               wS = RotateInv(qs, wW);
+    const float skin = (float)std::max(1u, SkinScaleOf(shell));
+    const uint32_t seed = slot.seed ^ ((uint32_t)s * 0x9E3779B9u) ^ 0xC107Bu;
+    auto openingAt = [=](float sc) {
+      ClothOpening o;
+      o.c = cS * sc;
+      o.u = uS;
+      o.v = vS;
+      o.w = wS;
+      o.halfL = halfL * sc;
+      // Never thinner than a cell of the lattice it is tested on, or the
+      // edge's own line falls between cell centres at the ends of the lens.
+      o.hw0 = std::max(slot.halfW * sc, 0.51f);
+      o.gape = gape * sc;
+      o.back = back * sc;
+      o.depth = depth * sc;
+      o.toSkin = skin / sc;
+      o.seed = seed;
+      return o;
+    };
+    // The lens's hull in the shell's frame (Mob::CarveBounds, world voxels).
+    Mob::CarveBounds box;
+    {
+      const float hd = 0.5f * (depth + back);
+      const Vec3 mid = cS + wS * (0.5f * (depth - back));
+      const float hv = std::max(slot.halfW, 0.0f) + gape;
+      const Vec3 e{halfL * std::fabs(uS.x) + hv * std::fabs(vS.x) +
+                       hd * std::fabs(wS.x),
+                   halfL * std::fabs(uS.y) + hv * std::fabs(vS.y) +
+                       hd * std::fabs(wS.y),
+                   halfL * std::fabs(uS.z) + hv * std::fabs(vS.z) +
+                       hd * std::fabs(wS.z)};
+      box.lo = mid - e;
+      box.hi = mid + e;
+    }
+    // What the opening would part, on the authoritative lattice: nothing at
+    // all (the slot is nowhere near this shell -- the usual answer, so the
+    // hull rejects a voxel on six integer compares before the lens is asked),
+    // or mostly armour.
+    const bool fine = shell.HasFineSkin();
+    const float latScale =
+        (float)std::max(1u, fine ? SkinScaleOf(shell) : PhysScaleOf(shell));
+    const ClothOpening probe = openingAt(latScale);
+    int lo[3], hi[3];
+    {
+      const float l[3] = {box.lo.x, box.lo.y, box.lo.z};
+      const float h[3] = {box.hi.x, box.hi.y, box.hi.z};
+      for (int a = 0; a < 3; a++) {
+        lo[a] = (int)std::floor(std::clamp(l[a] * latScale, -1e6f, 1e6f)) - 1;
+        hi[a] = (int)std::ceil(std::clamp(h[a] * latScale, -1e6f, 1e6f)) + 1;
+      }
+    }
+    uint32_t soft = 0, hard = 0;
+    auto tally = [&](int x, int y, int z, uint32_t m) {
+      if (m == 0u || x < lo[0] || x > hi[0] || y < lo[1] || y > hi[1] ||
+          z < lo[2] || z > hi[2])
+        return;
+      if (probe.Chance((float)x, (float)y, (float)z) <= 0.0f) return;
+      if (MaterialHardness(m) <= passHard) soft++;
+      else hard++;
+    };
+    if (fine)
+      for (const PrefabVoxel& pv : shell.skinVoxels)
+        tally(pv.x, pv.y, pv.z, pv.material & 0xFFFu);
+    else
+      for (const DebrisVoxel& dv : shell.voxels)
+        tally(dv.x, dv.y, dv.z, dv.payload & 0xFFFu);
+    if (soft == 0 || hard > soft) continue;
+    const size_t before = fine ? shell.skinVoxels.size() : shell.voxels.size();
+    const bool kept = CarveLimb(
+        s, DamageCtx(DamageCause::Blade, severity), world, spawns,
+        /*eject=*/false,
+        [openingAt](float scale) -> LimbCarveKeep {
+          const ClothOpening o = openingAt(scale);
+          return [o](int x, int y, int z) -> bool {
+            return o.Keep((float)x, (float)y, (float)z);
+          };
+        },
+        nullptr, nullptr, &box);
+    if (!kept || !limbs_[s].body) continue;
+    const MobLimb& after = limbs_[s];
+    const size_t now = after.HasFineSkin() ? after.skinVoxels.size()
+                                           : after.voxels.size();
+    if (now < before) parted += (uint32_t)(before - now);
+  }
+  return parted;
 }
 
 // ---- per-voxel carving of LIVE limbs ---------------------------------------

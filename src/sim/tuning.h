@@ -1332,6 +1332,16 @@ struct Tuning {
     // cell is 1/skinScale of a voxel (0.125 on the human), and a slot thinner
     // than about one cell falls between cell centres and takes nothing.
     float cutWidthMin = TPD(gore, cutWidthMin);
+    // THE CLOTH OVER A CUT (Mob::OpenClothOver, 2026-10-14). A blade that
+    // cut flesh went through any soft garment over it (no harder than skin,
+    // gear.cutHardnessRef), and slit cloth stretched over a body GAPES: the
+    // garment is parted over the wound in a lens along the edge's line, this
+    // wide each side of it at the middle (world voxels), closing toward the
+    // ends, its outer third torn ragged; never more than half the cut's
+    // half-length, so a graze or a stab parts a slit or a small hole.
+    // 0 = a slit a blade thick, which on a garment one micro thick hides
+    // the wound under it.
+    float clothGape = TPD(gore, clothGape);
 
     // ---- E1c. the stab (2026-09-26) -----------------------------------------
     // A blade driven ALONG ITS OWN LENGTH is a stab, not a cut: the wound is a

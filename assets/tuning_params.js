@@ -719,6 +719,7 @@ const TUNING_PARAMS = {
   'gore.cleaveArea':{t:'f',def:1.6,min:0,max:16},
   'gore.cleaveFrom':{t:'f',def:0.5,min:0,max:0.95},
   'gore.cutWidthMin':{t:'f',def:0.08,min:0,max:2},
+  'gore.clothGape':{t:'f',def:0.25,min:0,max:2},
   'gore.stabAlign':{t:'f',def:0.7,min:0,max:1.01},
   'gore.stabDepth':{t:'f',def:0.35,min:0,max:8},
   'gore.stabDepthPower':{t:'f',def:0.6,min:0,max:8},

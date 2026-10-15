@@ -5398,6 +5398,10 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
       (uint32_t)((double)g_shotTimeOfDay * (double)ticksPerDay) % ticksPerDay;
   std::vector<MicroBodyInstGpu> microInsts;
   std::vector<BodyVoxInst> inst;
+  // A CLOSE-UP, when a caller sets one: the camera at `closeEye` looking at
+  // `closeAt` instead of the pair framing below (SANDVOX_SHOT_STRIKE_CLOSE).
+  bool closeOn = false;
+  Vec3 closeEye{}, closeAt{};
   auto shoot = [&](const char* phaseName) {
     // PUBLISHED EVERY SHOT, not once at the end. This harness is not the frame
     // loop, so the brick upload and the instance arrays only happen where they
@@ -5437,8 +5441,8 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     const float span = std::max(sep, std::max(dA.worldSize.y, dB.worldSize.y));
     const float dist = std::max(16.0f, 1.15f * (span + 6.0f));
     const Vec3 dir = Vec3{0.77f, 0.42f, -0.64f}.normalized();
-    const Vec3 eye = mid + dir * dist;
-    const Vec3 look = (mid - eye).normalized();
+    const Vec3 eye = closeOn ? closeEye : mid + dir * dist;
+    const Vec3 look = ((closeOn ? closeAt : mid) - eye).normalized();
     Camera cam;
     cam.yaw = std::atan2(look.z, look.x);
     cam.pitch = std::asin(std::clamp(look.y, -1.0f, 1.0f));
@@ -5640,6 +5644,57 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   if (!shotRecover) shoot("recover");
   const std::string tailName = "after" + std::to_string(tailTicksWanted);
   shoot(tailName.c_str());
+
+  // ---- SANDVOX_SHOT_STRIKE_CLOSE=<voxels>: THE WOUND, UP CLOSE -------------
+  // The pair framing keeps both creatures in the picture, which leaves a cut
+  // a few pixels wide -- fine for "did it land", useless for "what does it
+  // look like" (a slit robe over a cut, 2026-10-14). Two more pictures, the
+  // camera `<voxels>` (default 4) from the wound of the slot that lost the
+  // most art -- flesh or shell -- looking IN at it from outside the body
+  // (along the line from the struck limb's middle out through the wound),
+  // 50 degrees either side of that, slightly above. `close_a` / `close_b`.
+  if (const char* cv = std::getenv("SANDVOX_SHOT_STRIKE_CLOSE")) {
+    std::vector<SlotState> now;
+    SampleSlots(mobs, idB, slotsB, bruiseMat, rotMat, now);
+    int bestSlot = -1, bestLost = 0;
+    for (int i = 0; i < slotsB && i < (int)now.size(); i++) {
+      if (!now[(size_t)i].alive) continue;
+      const int lost = (int)before[(size_t)i].art - (int)now[(size_t)i].art;
+      if (lost > bestLost) { bestLost = lost; bestSlot = i; }
+    }
+    // The flesh UNDER a slit shell is the subject, so a shell's wound is
+    // looked at through its host's: the host keeps the wound point.
+    int at = bestSlot;
+    if (at >= mB->AppendedBase()) {
+      const int host = mB->WornHostOf(at);
+      if (host >= 0) at = host;
+    }
+    closeAt = at >= 0 ? mobs.LimbWoundWorld(idB, at) : chestOf(idB, dB);
+    const float d = std::atof(cv) > 0.0f ? (float)std::atof(cv) : 4.0f;
+    // OUT through the wound, horizontally: from the struck limb's joint (the
+    // chest when nothing was cut), falling back on the attacker's side.
+    const Vec3 mid0 = at >= 0 ? mobs.LimbAnchorPos(idB, at) : chestOf(idB, dB);
+    Vec3 toA = closeAt - mid0;
+    toA.y = 0.0f;
+    if (toA.len() < 0.2f) toA = mobs.MobOrigin(idA) - mobs.MobOrigin(idB);
+    toA.y = 0.0f;
+    toA = toA.len() > 1e-3f ? toA.normalized() : Vec3{0, 0, -1};
+    const float ang[2] = {-0.8727f, 0.8727f};
+    const char* names[2] = {"close_a", "close_b"};
+    for (int k = 0; k < 2; k++) {
+      const float c = std::cos(ang[k]), sn = std::sin(ang[k]);
+      const Vec3 dir = Vec3{toA.x * c - toA.z * sn, 0.35f, toA.x * sn + toA.z * c}
+                           .normalized();
+      closeEye = closeAt + dir * d;
+      closeOn = true;
+      shoot(names[k]);
+    }
+    closeOn = false;
+    std::printf("--shot-strike: close-up on %s (lost %d art voxels)\n",
+                at >= 0 && at < (int)dB.limbs.size() ? dB.limbs[(size_t)at].name.c_str()
+                                                     : "the chest",
+                bestLost);
+  }
 
   // ---- WHAT IT DID ------------------------------------------------------
   SampleSlots(mobs, idB, slotsB, bruiseMat, rotMat, after);

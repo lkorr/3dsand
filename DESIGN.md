@@ -25652,6 +25652,36 @@ had. Arm D sweeps the sword through a tunic: flesh lost must be at least
 `impactArmorSweptClothMinFraction` of bare, the cloth must be cut, and no
 probe may be turned back onto it.
 
+**...and the cloth over the cut opens** (2026-10-14; `Mob::OpenClothOver`,
+`gore.clothGape`, `impact-armor` arm D). Owner: "slashing someone wearing a
+robe should just leave a cut through the robe where it hits the skin, so that
+the robe is cut / split open there, showing the flesh underneath". Passing the
+blow was not enough to SEE it: the garment's own kerf is this blow's kerf
+entry-snapped onto the cloth, a slot a blade thick and a bite deep, which on a
+garment one micro thick is a two-cell nick (measured: 9 robe voxels for a
+slash, the wound under it invisible). So `Mob::CutLimb`, cutting any base limb
+of a dressed creature, first parts every SOFT worn shell (most of the voxels in
+the opening no harder than `gear.cutHardnessRef`) over the flesh slot it has
+just resolved -- before the flesh carve, which may take the limb and the sleeve
+with it, already slit. The opening is a LENS, not the kerf: along the edge's
+line a little past the wound's ends, `gore.clothGape` wide each side at its
+middle on an ellipse (never more than half the cut's half-length, so a graze or
+a stab parts a slit or a small hole), its outer third torn ragged on the
+shell's own skin lattice; it runs through the cloth along the way the blade
+came, from a voxel in front of the wound mouth to the bottom of the cut (a chop
+parts the garment over the mouth, a slash along the body parts it along the
+blade's path, a cut through a limb parts the sleeve on both sides). Every worn
+slot is asked, not only those strapped to the cut limb (a neck cut opens the
+torso shell's collar). Not ejected: cloth parts, it does not shed confetti, and
+a micro-thin shell would be billed as whole world voxels of litter. Every
+caller of `CutLimb` gets it -- the sweep, a peer's blow, a ghost, a gate. Arm D
+also asserts the wound can be seen: three rays out of the last cut's mouth back
+along the blade's travel (the mouth, and `impactArmorClothOpenVox` either side
+of the edge's line) must leave the body without meeting the tunic -- 3/3 at the
+shipped gape, 1/3 with `clothGape` 0 (380 vs 67 cloth cells parted).
+`--shot-strike` gained `SANDVOX_SHOT_STRIKE_CLOSE=<voxels>`: two close-ups
+(`close_a`/`close_b`) looking in at the wound of the slot that lost the most.
+
 **The NPC AI panel dresses what it spawns** (`UIState::aiOutfit`, the Spawn
 tab's "wearing:" block). Nothing / random commoner clothes (a dyeable piece per
 slot, each in its own hashed colour) / full plate (every slot's `iron_*` piece)

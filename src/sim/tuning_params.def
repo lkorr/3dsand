@@ -1867,6 +1867,8 @@ TP_F(gore, cleaveArea, NO_WGSL, 1.6f, 0.0f, 16.0f)
 TP_F(gore, cleaveFrom, NO_WGSL, 0.5f, 0.0f, 0.95f)
 // The kerf's half-thickness floor, world voxels (was a literal 0.08 in melee.cpp).
 TP_F(gore, cutWidthMin, NO_WGSL, 0.08f, 0.0f, 2.0f)
+// How far cloth over a cut parts each side of the edge (Tuning::Gore::clothGape).
+TP_F(gore, clothGape, NO_WGSL, 0.25f, 0.0f, 2.0f)
 // THE STAB (Tuning::Gore::stabAlign). Above 1 no blow is ever a stab.
 TP_F(gore, stabAlign, NO_WGSL, 0.7f, 0.0f, 1.01f)
 TP_F(gore, stabDepth, NO_WGSL, 0.35f, 0.0f, 8.0f)

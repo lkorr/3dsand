@@ -289,6 +289,7 @@
     "cleaveArea": 1.6,
     "cleaveFrom": 0.5,
     "cutWidthMin": 0.08,
+    "clothGape": 0.25,
     "stabAlign": 0.7,
     "stabDepth": 0.8,
     "stabDepthPower": 0.6,
