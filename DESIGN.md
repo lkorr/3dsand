@@ -15982,6 +15982,42 @@ cause Bite), meat only. A piece a blast DESTROYS pays its whole wound at
 once (`DamageBody`: drip budget + sever voxels as whole blood, the gout as
 one burst) -- the survivor-only wound left it bloodless. Gate `loose-carrion`.
 
+**Meat, which piece, and when to give up** (2026-10-15; gate `carrion-feast`).
+- *Meat is WET tissue* (`MobSystem::matEdible_`): organic, not alight, and a
+  liquid or crumbling to one (`rubble`) -- skin, flesh, muscle, organs, rot,
+  scar. Not bone, hair, cloth, leather or char. It was `organic` alone, so a
+  loose scalp of hair was a piece made of nothing but food, and the shoal
+  threw it into the water a nip at a time as world voxels.
+- *A bite drops nothing into the grid but what the jaws spit.* On a loose
+  piece as on a corpse, `strike.swallow` of the torn cells is eaten
+  (`BluntBody`'s `swallow`), and an island or remainder a bite leaves under
+  the body floor goes with the mouthful (`DebrisSystem::BiteShed`) -- a hair
+  tuft the scalp under it held on is not shed as hair voxels.
+- *Which piece* (`Perception::meatPull`, `crowdPush`, `whim`; the piranha's
+  4 / 3 / 6): among the dead -- a corpse, its pieces and the limbs of a
+  corpse still in one piece (`MobSystem::CarrionLimbFor`) -- a fish's score is
+  distance, minus `meatPull` per doubling of the piece's edible cells
+  (`ai::Actor::meat`: the most flesh in absolute amount, not its proportion of
+  the bone -- a foot with one voxel left lost to the torso only by distance
+  before), plus `crowdPush` per other eater already on it (last tick's
+  targets / aims, so the order the brains run in does not matter), plus a
+  counter-RNG fancy up to `whim` drawn per (fish, piece, 3 s). Blood in the
+  water only lets a dead piece be FOUND; it no longer pulls among them. The
+  stroke bites the limb the fish swam at (`Mob::carrionAimLimb_`).
+- *The teeth close on the meat*: a meat-only bite's hole is centred on the
+  edible cell nearest the contact, within twice the hole (`Mob::BiteHit`,
+  `BluntBody`). Measured before: bites into a corpse's torso took nothing with
+  40-160 cells of flesh in the ball -- the blob's certain core sat on a rib,
+  which meat-only keeps, and the correlated noise kept the flesh round it; the
+  shoal nibbled a picked-at body forever with nothing coming off.
+- *Out of reach*: `kBiteBarrenMisses` (6) meat-only bites in a row that took
+  nothing (`MobLimb::biteMisses`, `DebrisSystem::Body::biteMisses`; any bite
+  that takes something, or any other carve of the piece, resets it) and that
+  limb's or piece's meat no longer counts -- what is left is inside bone or
+  too deep for the teeth, and the shoal moves on instead of shoving it round
+  the pool for nothing. `SANDVOX_BITE_DEBUG=1` prints what an empty bite's
+  ball held (meat / other), loose pieces included.
+
 **The bite: a mouthful, and jaws that close by their own force.** Two strike
 profile fields on the natural weapon. `strike.biteForce` (0..1): a floor on
 the blow's power, and the sweep runs however slowly the head is moving --

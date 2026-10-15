@@ -2775,12 +2775,28 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
                                                         : m.gpu.klass);
     matGpu_.push_back(m.gpu);
     {
+      // MEAT IS WET (2026-10-15, ticket 2026-10-14_22-41-46). Organic and not
+      // alight was the whole test, and `organic` is also hair, cloth, leather,
+      // wood and every plant -- so a loose scalp of hair or a dropped shirt
+      // counted as a piece that was ALL meat (ratio 1e9), a shoal ate it, and
+      // every cell it tore off went into the grid as a world voxel: the owner's
+      // white hair floating by the corpse. Edible is now the body's WET tissue:
+      // a liquid itself (the blood speckle in muscle), or a material that
+      // crumbles to one (skin, flesh, muscle, brain, heart, rot, scar ... all
+      // crumble to blood or ichor; hair, cloth and char to ash, bone to dust).
+      // Read off `rubble`, which every tissue already authors -- no new tag.
       bool organic = false, hot = false;
       for (const std::string& t : m.tags) {
         if (t == "organic") organic = true;
         if (t == "hot") hot = true;
       }
-      matEdible_.push_back(organic && !hot ? 1u : 0u);
+      bool wet = m.gpu.klass == CLASS_LIQUID;
+      if (!wet && !m.rubble.empty()) {
+        const int r = FindMaterialId(mats, m.rubble);
+        wet = r > 0 && r < (int)mats.size() &&
+              mats[(size_t)r].gpu.klass == CLASS_LIQUID;
+      }
+      matEdible_.push_back(organic && !hot && wet ? 1u : 0u);
     }
     // AN INFECTION IS A MATERIAL WITH AN `infect` BLOCK (B1). The legacy tag
     // is honoured as well, so a table predating the block still rots.
@@ -6661,7 +6677,37 @@ int MobSystem::NearestLimbTo(const Mob& victim, Vec3 from) {
   return best;
 }
 
-bool MobSystem::NearestPartOf(uint64_t actorId, Vec3 from, Vec3& out) {
+int MobSystem::CarrionLimbFor(const Mob& victim, Vec3 from, uint64_t eaterId,
+                              const ai::Perception& p, uint32_t tick) const {
+  if (victim.alive_ || !victim.carrionKnown_) return NearestLimbTo(victim, from);
+  int best = -1;
+  float bestS = 1e30f;
+  for (int i = 0; i < victim.AppendedBase() && i < (int)victim.limbs_.size() &&
+                  i < (int)victim.carrionLimb_.size();
+       i++) {
+    const uint32_t meat = victim.carrionLimb_[(size_t)i];
+    if (meat == 0 || !victim.LimbAlive(i) || victim.IsBloodless(i)) continue;
+    Vec3 c{};
+    if (!victim.LimbCentreWorld(i, c)) continue;
+    uint32_t crowd = 0;
+    if (auto it = carrionLimbCrowd_.find({victim.id_, i}); it != carrionLimbCrowd_.end())
+      crowd = it->second;
+    // The eater's own aim is not a crowd on it.
+    if (const Mob* e = FindMob(eaterId))
+      if (e->carrionAimVictim_ == victim.id_ && e->carrionAimLimb_ == i && crowd > 0) crowd--;
+    const float s = (c - from).len() +
+                    ai::CarrionTerms(p, meat, crowd, eaterId,
+                                     victim.id_ * 64u + (uint64_t)i, tick);
+    if (s < bestS) {
+      bestS = s;
+      best = i;
+    }
+  }
+  return best;
+}
+
+bool MobSystem::NearestPartOf(uint64_t actorId, Vec3 from, Vec3& out,
+                              uint64_t eaterId, uint32_t tick) {
   // A severed piece is one part: its centre of mass.
   if (ai::IsLooseActorId(actorId)) {
     if (debris_ == nullptr || phys_ == nullptr) return false;
@@ -6674,6 +6720,21 @@ bool MobSystem::NearestPartOf(uint64_t actorId, Vec3 from, Vec3& out) {
   }
   const Mob* v = FindCombatantById(actorId);
   if (v == nullptr) return false;
+  // A CARRION EATER AT A CORPSE picks its limb by the meat on it, the eaters
+  // already at it and its own fancy (CarrionLimbFor), and remembers the pick
+  // so its stroke bites that limb and the next tick's crowd counts it.
+  Mob* eater = eaterId != 0 && !v->alive_ && v->carrionKnown_ ? FindMobById(eaterId)
+                                                              : nullptr;
+  const ai::Profile* pr =
+      eater != nullptr ? behaviors_.At(eater->ai_.profile) : nullptr;
+  if (pr != nullptr && pr->perception.carrion > 0.0f &&
+      (pr->perception.meatPull > 0.0f || pr->perception.crowdPush > 0.0f ||
+       pr->perception.whim > 0.0f)) {
+    const int li = CarrionLimbFor(*v, from, eaterId, pr->perception, tick);
+    eater->carrionAimVictim_ = li >= 0 ? v->id_ : 0;
+    eater->carrionAimLimb_ = li;
+    return li >= 0 && v->LimbCentreWorld(li, out);
+  }
   const int li = NearestLimbTo(*v, from);
   return li >= 0 && v->LimbCentreWorld(li, out);
 }
@@ -7152,6 +7213,16 @@ void MobSystem::StartStroke(Mob& mob, int styleIndex, uint64_t targetId,
                                                        : Vec3{});
     st.targetLimb =
         PickTargetLimb(sty, *victim, mob.id_, prone, tick, reachH, &at);
+    // A CARRION EATER BITES THE LIMB IT SWAM AT (CarrionLimbFor, through the
+    // brain's aim this tick), not the one nearest its middle: the two differ
+    // whenever the meat or the crowd made the choice, and a stroke aimed at
+    // another limb than the approach would bite whatever it bumped into.
+    if (sty.targetNearest && !victim->alive_ && victim->carrionKnown_ &&
+        mob.carrionAimVictim_ == victim->id_ && mob.carrionAimLimb_ >= 0 &&
+        mob.carrionAimLimb_ < (int)victim->carrionLimb_.size() &&
+        victim->carrionLimb_[(size_t)mob.carrionAimLimb_] > 0 &&
+        victim->LimbAlive(mob.carrionAimLimb_))
+      st.targetLimb = mob.carrionAimLimb_;
     // ---- ...AND THE BLOW IS THEN AIMED AT IT (2026-09-19) -----------------
     //
     // UNTIL NOW THE DRAW STEERED NOTHING. `targetLimb` was recorded, reported
@@ -8304,8 +8375,9 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     wv.probe.ctx = &pctx;
     wv.lineOfSight = &AiLineOfSight;
     wv.losCtx = &pctx;
-    wv.aimPart = [](void* ctx, uint64_t id, Vec3 from, Vec3& out) {
-      return static_cast<MobSystem*>(ctx)->NearestPartOf(id, from, out);
+    wv.aimPart = [](void* ctx, uint64_t selfId, uint64_t id, Vec3 from,
+                    uint32_t t, Vec3& out) {
+      return static_cast<MobSystem*>(ctx)->NearestPartOf(id, from, out, selfId, t);
     };
     wv.aimCtx = this;
 
@@ -9534,8 +9606,17 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       a.immersion = PointImmersion(m, c);
       a.bleeding = m.Bleeding();
       a.fleshRatio = m.fleshRatio_;
+      a.meat = m.CarrionCells();
       actors_.push_back(std::move(a));
     }
+    // ...WHO IS AT WHICH LIMB OF THEM (CarrionLimbFor's crowd): every living
+    // eater whose brain still holds the corpse it last aimed a limb of.
+    carrionLimbCrowd_.clear();
+    if (eater)
+      for (const Mob& m : mobs_)
+        if (m.alive_ && m.carrionAimVictim_ != 0 && m.carrionAimLimb_ >= 0 &&
+            m.ai_.hasTarget && m.ai_.targetId == m.carrionAimVictim_)
+          carrionLimbCrowd_[{m.carrionAimVictim_, m.carrionAimLimb_}]++;
     // ...AND THE PIECES (2026-10-11): a severed limb, and every piece of a
     // corpse whose rig went to debris, is food the same way -- an actor in the
     // ai::kLooseActorBase band, its meat counted with the corpse's rule
@@ -9583,12 +9664,18 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
             for (const DebrisVoxel& v : *f.coll) count(v.payload & 0xFFFu);
           lm.geomGen = f.geomGen;
           lm.cells = n;
+          lm.meat = (uint32_t)std::min<uint64_t>(e, 0xFFFFFFFFull);
           lm.ratio = e == 0   ? 0.0f
                      : o == 0 ? 1e9f
                               : (float)((double)e / (double)o);
         }
         keep[f.id] = lm;
         if (!(lm.ratio > 0.0f)) return;
+        // OUT OF REACH: the teeth have missed it kBiteBarrenMisses times in a
+        // row (DebrisSystem::Body::biteMisses) -- what meat is left is inside
+        // bone or too deep to bite, and it is no longer food. Outside the
+        // recount cache: a miss changes no lattice.
+        if (f.biteMisses >= DebrisSystem::kBiteBarrenMisses) return;
         const Vec3 c = f.xf->pos;
         const float ps = (float)std::max(1u, f.physScale);
         const float ex = (float)std::max(f.hi.x - f.lo.x, f.hi.z - f.lo.z) / ps;
@@ -9608,6 +9695,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
         a.immersion =
             eaterMob != nullptr ? PointImmersion(*eaterMob, c) : 1.0f;
         a.fleshRatio = lm.ratio;
+        a.meat = lm.meat;
         // ...and a piece that still BLEEDS is smelled in the water like the
         // corpse it came off (Perception::scentRange / scentPull). Without it
         // a gouting severed head ranked as a dry one, and a shoal at the
@@ -12544,6 +12632,40 @@ int32_t MobSystem::LimbMicroModel(uint64_t mobId, int limbIndex) const {
   const Mob* m = FindMob(mobId);
   if (!m || limbIndex < 0 || limbIndex >= (int)m->limbs_.size()) return -1;
   return m->limbs_[limbIndex].microModel;
+}
+uint32_t MobSystem::BrickPaintMismatches(uint64_t mobId, std::string* first,
+                                         uint32_t* checked,
+                                         uint32_t* colliderOnly) const {
+  const Mob* m = FindMob(mobId);
+  if (m == nullptr || microSet_ == nullptr) return 0;
+  uint32_t bad = 0;
+  for (size_t li = 0; li < m->limbs_.size(); li++) {
+    const MobLimb& L = m->limbs_[li];
+    if (L.body == 0 || L.microModel < 0) continue;
+    const bool fine = L.HasFineSkin();
+    auto check = [&](int x, int y, int z, uint32_t mat, uint32_t art) {
+      if ((mat & 0xFFFu) == 0) return;   // a tombstone draws nothing
+      const uint16_t cell = MicroBodyCell(*microSet_, (uint32_t)L.microModel, x, y, z);
+      if (checked) (*checked)++;
+      if (!fine && colliderOnly) (*colliderOnly)++;
+      if ((cell & 0xFFu) == (mat & 0xFFu) && (uint32_t)(cell >> 8) == (art & 0xFFu)) return;
+      if (bad == 0 && first != nullptr) {
+        char buf[200];
+        std::snprintf(buf, sizeof buf,
+                      "limb %zu (%s, %s) cell (%d,%d,%d): lattice mat %u art %u, brick mat %u art %u",
+                      li, li < m->limbDefs_.size() ? m->limbDefs_[li].name.c_str() : "?",
+                      fine ? "fine skin" : "collider only", x, y, z, mat & 0xFFu, art & 0xFFu,
+                      (unsigned)(cell & 0xFFu), (unsigned)(cell >> 8));
+        *first = buf;
+      }
+      bad++;
+    };
+    if (fine)
+      for (const PrefabVoxel& v : L.skinVoxels) check(v.x, v.y, v.z, v.material, v.color);
+    else
+      for (const DebrisVoxel& v : L.voxels) check(v.x, v.y, v.z, v.payload, v.color);
+  }
+  return bad;
 }
 const char* MobSystem::DeathCause(uint64_t mobId) const {
   // The corpse answers for itself: it is still here to ask.
@@ -27513,6 +27635,38 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
   // meat and leave the bone: what a shoal leaves behind is a skeleton.
   // ...and the skeleton stays in one piece (DamageCtx::keepWhole).
   const bool meatOnly = !alive_ && hit.carrion;
+  // ---- A SCAVENGER'S TEETH CLOSE ON THE MEAT (2026-10-15) -----------------
+  // Ticket 2026-10-14_23-09-28, measured (SANDVOX_BITE_DEBUG, gate
+  // `carrion-feast`): bites into a corpse's torso took NOTHING while their
+  // ball held 40-160 cells of meat -- the blob's certain core sat on a rib or
+  // the spine, which meat-only keeps, and the correlated noise kept the ring
+  // of flesh round it. So a meat-only bite closes on the meat nearest where
+  // the jaws met the body, within twice the hole: the core of the hole is
+  // flesh, and an empty bite now means there is no flesh within reach.
+  if (meatOnly && sys_ != nullptr && !sys_->matEdible_.empty()) {
+    const MobLimb& lb = limbs_[li];
+    const std::vector<uint8_t>& ed = sys_->matEdible_;
+    const bool fine = lb.HasFineSkin();
+    const float sc = (float)std::max(1u, fine ? SkinScaleOf(lb) : PhysScaleOf(lb));
+    const float reach2 = 4.0f * biteR * biteR;
+    float best = reach2;
+    Vec3 at = centre;
+    auto consider = [&](int x, int y, int z, uint32_t mat) {
+      if (mat == 0 || mat >= ed.size() || ed[mat] == 0) return;
+      const Vec3 p{((float)x + 0.5f) / sc, ((float)y + 0.5f) / sc, ((float)z + 0.5f) / sc};
+      const Vec3 d = p - centre;
+      const float d2 = d.dot(d);
+      if (d2 < best) {
+        best = d2;
+        at = p;
+      }
+    };
+    if (fine)
+      for (const PrefabVoxel& v : lb.skinVoxels) consider(v.x, v.y, v.z, v.material & 0xFFFu);
+    else
+      for (const DebrisVoxel& v : lb.voxels) consider(v.x, v.y, v.z, v.payload & 0xFFFu);
+    centre = at;
+  }
   DamageCtx feed = bite;
   feed.keepWhole = meatOnly;
   feed.swallow = hit.swallow;
@@ -27532,6 +27686,45 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
         (double)(CurrentTuning().gore.craterStainRim *
                  CurrentTuning().gore.biteStainScale),
         (unsigned)hit.infectMat, (unsigned)hit.infectStain);
+  // A SCAVENGER'S MISS (MobLimb::biteMisses): a meat-only bite that took
+  // nothing. Enough of them in a row and the carrion count calls the limb's
+  // meat out of reach; one that took anything resets it.
+  if (meatOnly && survived) {
+    for (MobLimb& L : limbs_)
+      if (L.body == bodyHandle) {
+        const bool took = rep.count > 0 || !rep.cells.empty();
+        L.biteMisses = took ? 0 : (uint8_t)std::min(255, L.biteMisses + 1);
+        if (sys_ != nullptr) {
+          sys_->carrionBites_++;
+          if (!took) sys_->carrionBitesEmpty_++;
+        }
+        if (kBiteDebug && !took) {
+          // ...and WHAT THE BALL HELD (rule 6): air, or only what the teeth
+          // may not take, or meat the carve lost.
+          uint32_t bm = 0, bo = 0;
+          const std::vector<uint8_t>* ed = sys_ ? &sys_->matEdible_ : nullptr;
+          const bool fine = L.HasFineSkin();
+          const float sc = (float)std::max(1u, fine ? SkinScaleOf(L) : PhysScaleOf(L));
+          const Vec3 cl = centre * sc;
+          const float rl2 = biteR * biteR * sc * sc;
+          auto tally = [&](int x, int y, int z, uint32_t mat) {
+            if (mat == 0) return;
+            const Vec3 d{(float)x + 0.5f - cl.x, (float)y + 0.5f - cl.y,
+                         (float)z + 0.5f - cl.z};
+            if (d.dot(d) >= rl2) return;
+            if (ed && mat < ed->size() && (*ed)[mat]) bm++;
+            else bo++;
+          };
+          if (fine)
+            for (const PrefabVoxel& v : L.skinVoxels) tally(v.x, v.y, v.z, v.material & 0xFFFu);
+          else
+            for (const DebrisVoxel& v : L.voxels) tally(v.x, v.y, v.z, v.payload & 0xFFFu);
+          std::printf("     ...EMPTY carrion bite: ball %u meat, %u other; misses %u\n", bm,
+                      bo, (unsigned)L.biteMisses);
+        }
+        break;
+      }
+  }
   if (!survived)
     return true;  // the limb did not survive: CarveLimb's contract applies
   if (rep.count == 0 || rep.cells.empty()) return true;
@@ -31281,9 +31474,19 @@ static bool SameShape(const std::vector<V>& a, const std::vector<V>& b) {
 // on-write, then rewrite every cell's material, art slot, coat and bruise — the door
 // SoakLimb and the burn front use, which never rebases the brick. Lattice
 // coordinates are brick-local for a limb (those paths poke v.At(i) directly).
-// A collider-only limb draws unpainted (ReskinLimbMicro's rule for that case).
+// A COLLIDER-ONLY limb is painted from DebrisVoxel::color, as ReskinLimbMicro
+// packs it (since 6f3262e). This door poked art 0 there until 2026-10-15 --
+// the rule ReskinLimbMicro had dropped -- so a shark (skinScale 4 = physScale
+// 4: no separate skin, its art lives on the collider) whose limbs came back
+// from a park with only their coat changed drew every unbitten limb in raw
+// `skin` tan, until a carve re-packed it (ticket 2026-10-14_22-52-51).
+// How many limbs this door has repainted, ever: the gate `brick-paint` reads
+// it so its claim cannot pass without this door having run.
+static std::atomic<uint64_t> gLimbRepaints{0};
+uint64_t MobSystem::LimbRepaints() { return gLimbRepaints.load(); }
 static void RepaintLimbMicro(MobLimb& L, MicroBodySet* micro) {
   if (L.microModel < 0 || micro == nullptr) return;
+  gLimbRepaints++;
   const int own = MicroBodyOwn(*micro, (uint32_t)L.microModel);
   if (own < 0) return;   // pool full: the skin lags, the lattice is right
   L.microModel = own;
@@ -31300,7 +31503,7 @@ static void RepaintLimbMicro(MobLimb& L, MicroBodySet* micro) {
   } else {
     for (const DebrisVoxel& v : L.voxels) {
       MicroBodyPoke(*micro, model, v.x, v.y, v.z,
-                    (uint8_t)(v.payload & 0xFFFu), 0);
+                    (uint8_t)(v.payload & 0xFFFu), v.color);
       MicroBodyPokeStain(*micro, model, v.x, v.y, v.z, v.stain);
     }
   }

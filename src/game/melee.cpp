@@ -1117,7 +1117,9 @@ void ResolveOnLooseMatter(uint64_t body, const StrikeParts& p,
                      profile.biteCarrion && edible != nullptr &&
                              !edible->empty() && debris.BodyIsDeadFlesh(body)
                          ? edible
-                         : nullptr);
+                         : nullptr,
+                     // ...and swallow what they take, as on a corpse.
+                     profile.biteSwallow);
     if (bitten != nullptr) *bitten = true;
   }
 }

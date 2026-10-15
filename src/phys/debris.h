@@ -285,6 +285,7 @@ class DebrisSystem {
     // Body::geomGen. With the voxel count, the key every index derived from
     // lattice COORDINATES is cached on (MobSystem::FleshView).
     uint32_t geomGen = 0;
+    uint8_t biteMisses = 0;  // Body::biteMisses
     std::vector<FleshShell> shells;  // filled by BurnFleshBodies only
   };
   // A corpse piece MobSystem burns, rather than BurnBodies. Followers are not:
@@ -422,11 +423,18 @@ class DebrisSystem {
   // table, nonzero = edible; every cell it does not mark is KEPT, so the
   // teeth strip a severed piece to the bone as they do a corpse
   // (Mob::CarveBlob's meatOnly).
+  // `swallow` (a BITE only, StrikeProfile::biteSwallow): that share of the
+  // torn cells is eaten rather than shed, exactly as Mob::CarveLimb's
+  // DamageCtx::swallow does on a corpse. And whatever a bite leaves too small
+  // to be a body (an island under the fragment floor, a remainder under the
+  // body floor) goes with the mouthful: a bite never drops loose matter into
+  // the grid (ticket 2026-10-14_22-41-46: a shoal's nips shed hair tufts).
   bool BluntBody(uint64_t handle, Vec3 atVoxel, float radiusVoxels,
                  uint32_t seed, World& world,
                  std::vector<ParticleSpawn>& spawns,
                  DamageCause cause = DamageCause::Blunt,
-                 const std::vector<uint8_t>* meatOnly = nullptr);
+                 const std::vector<uint8_t>* meatOnly = nullptr,
+                 float swallow = 0.0f);
 
   // ---- A GARMENT ON A CORPSE IS A FOLLOWER, NOT A JOINTED BODY -------------
   //
@@ -1830,6 +1838,19 @@ class DebrisSystem {
     // flesh as FLESH rather than as a chip, and `GoreEvent` gives a corpse its
     // own species' wet noises.
     bool dead = false;
+    // SCAVENGERS' MISSES IN A ROW: meat-only bites (BluntBody, cause Bite)
+    // that took nothing since the last one that took something. Read through
+    // FleshLattice::biteMisses by the carrion count, which stops calling a
+    // piece food once its meat is out of the teeth's reach. Not saved: a
+    // loaded piece is tried afresh.
+    uint8_t biteMisses = 0;
+    // ...and how many such misses make a piece's meat OUT OF REACH: the meat
+    // that is left is inside bone or too deep for the teeth, and a shoal
+    // nibbling at it forever pushed it round the pool and took nothing
+    // (ticket 2026-10-14_23-09-28). Shared with the corpse's limbs
+    // (MobLimb::biteMisses). A bite that takes anything resets the count; so
+    // does any other carve of the piece (its shape changed: try again).
+    // The count is DebrisSystem::kBiteBarrenMisses.
     // A DROPPED ITEM'S BODY (MarkItemBody, from worlditems.h DropItemToWorld).
     // It wears a coat as severed flesh does -- the contact, rain, drying and
     // splatter passes walk it (ForEachCoatBody) -- and the coat goes back into
@@ -2072,6 +2093,37 @@ class DebrisSystem {
   void VoxelsToParticles(const Body& b, const std::vector<DebrisVoxel>& voxels,
                          Vec3 lin, Vec3 ang, World& world,
                          std::vector<ParticleSpawn>& spawns) const;
+  // ---- A BITE IN PROGRESS (BluntBody, cause Bite) ---------------------------
+  // Set for the one DamageBody call a bite makes and cleared after it, so the
+  // three places that shed loose matter -- the torn cells, an island under the
+  // fragment floor, a remainder under the body floor -- can follow the jaws'
+  // rule without every DamageBody caller growing a parameter: the torn cells
+  // are shed at (1 - swallow), the islands and the remainder not at all.
+  struct BiteShed {
+    bool on = false;
+    float swallow = 0.0f;
+    uint32_t key = 0;
+    uint32_t took = 0;   // authoritative-lattice cells the carve removed
+    const std::vector<uint8_t>* edible = nullptr;   // the meat-only table
+  } bite_;
+  // ...of which NOT meat (hair, bone, cloth: what a bite must never drop).
+  uint64_t biteShedInedible_ = 0;
+  // Cells a bite left in the grid (shed) and took with it (eaten), ever --
+  // the gates' measure of "a bite never drops loose matter into the world".
+  uint64_t biteShed_ = 0, biteEaten_ = 0;
+  // Meat-only bites on loose flesh, and those that took nothing, ever.
+  uint64_t biteTries_ = 0, biteEmpty_ = 0;
+
+ public:
+  // Body::biteMisses at which a piece's meat is OUT OF REACH (see there).
+  static constexpr uint8_t kBiteBarrenMisses = 6;
+  uint64_t BiteShedCells() const { return biteShed_; }
+  uint64_t BiteEatenCells() const { return biteEaten_; }
+  uint64_t BiteShedInedibleCells() const { return biteShedInedible_; }
+  uint64_t LooseBiteTries() const { return biteTries_; }
+  uint64_t LooseBitesEmpty() const { return biteEmpty_; }
+
+ private:
 
   // ---- shared damage core ----------------------------------------------------
   //

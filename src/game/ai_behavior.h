@@ -261,6 +261,26 @@ struct Perception {
   // FURTHER than it is, so a swimmer still turns on the living.
   float carrion = 0.0f;
   float carrionPull = 0.0f;
+  // ---- WHICH PIECE OF THE DEAD (2026-10-15; ticket 2026-10-14_22-44-33) ----
+  // A shoal at a body torn into pieces went, every fish of it, for the
+  // nearest piece with any meat on it -- a foot with one voxel left beat a
+  // torso a few voxels further on. Three terms on a carrion candidate's score
+  // (voxels, lower wins, the same arithmetic as stickiness), each 0 = off:
+  //   meatPull  -- per DOUBLING of the piece's edible cells (Actor::meat):
+  //                the most flesh wins, in absolute amount, not proportion.
+  //                A log, so a torso beats a hand by a lot and a crumb by
+  //                everything, and a head is still worth the swim past it.
+  //   crowdPush -- per OTHER creature already on that piece (Actor::targetId):
+  //                a shoal spreads over the pieces -- a few on the torso, a
+  //                few on the head -- instead of stacking on one.
+  //   whim      -- up to this much, drawn per (creature, piece) from the
+  //                counter RNG and redrawn every kCarrionWhimTicks: two fish
+  //                at one spot do not make the same choice in lockstep.
+  // The same three pick the LIMB of a corpse still in one piece (MobSystem::
+  // CarrionLimbFor), counted on that limb's own meat and its own eaters.
+  float meatPull = 0.0f;
+  float crowdPush = 0.0f;
+  float whim = 0.0f;
   // ---- THE NEAREST PART, NOT THE MIDDLE (2026-10-11, the piranha) ---------
   // true: once the target is seen and its motion tracked, `targetPos` is the
   // centre of its body part nearest this creature's JAWS (WorldView::aimPart
@@ -998,6 +1018,9 @@ struct Actor {
   // any meat reads 1e9). 0 = not food -- the default, and what every living
   // actor carries. Read only by Perception::carrion.
   float fleshRatio = 0.0f;
+  // ...and how MUCH meat, in edible cells (the fine skin where there is one):
+  // what Perception::meatPull ranks the dead by. 0 on the living.
+  uint32_t meat = 0;
   // Its velocity, world voxels/sec, when the publisher knows it (0 = unknown;
   // the brain's own low-passed estimate is used instead).
   Vec3 velocity{};
@@ -1012,8 +1035,11 @@ struct WorldView {
   bool (*lineOfSight)(void* ctx, Vec3 from, Vec3 to) = nullptr;
   void* losCtx = nullptr;
   // Perception::nearestPart: the world centre of actor `id`'s body part
-  // nearest `from` (false = no answer; the actor's centre stands).
-  bool (*aimPart)(void* ctx, uint64_t id, Vec3 from, Vec3& out) = nullptr;
+  // nearest `from` (false = no answer; the actor's centre stands). `selfId`
+  // and `tick` are the asker's: a carrion eater's limb of a corpse is chosen
+  // by its carrion terms (MobSystem::CarrionLimbFor), not by distance alone.
+  bool (*aimPart)(void* ctx, uint64_t selfId, uint64_t id, Vec3 from,
+                  uint32_t tick, Vec3& out) = nullptr;
   void* aimCtx = nullptr;
 };
 
@@ -1510,6 +1536,18 @@ struct IntentOut {
 bool Think(Brain& brain, const Library& lib, const SelfView& self,
            const GroundView& ground, const WorldView& view, uint32_t tick,
            float dt, IntentOut& out);
+
+// ---- WHICH PIECE OF THE DEAD: the carrion terms of a score ------------------
+// Perception::meatPull / crowdPush / whim, as voxels to ADD to a candidate's
+// distance score (lower wins): `meat` edible cells on the piece, `crowd` other
+// creatures already on it, `pieceKey` naming it (an actor id, or an actor id
+// and a limb) for the whim. Pure and counter-based: the whim is drawn from
+// (self, piece, tick / kCarrionWhimTicks), so a replay chooses the same and a
+// fish keeps one fancy for three seconds rather than flickering every tick.
+// Shared by Perceive (which actor) and MobSystem::CarrionLimbFor (which limb).
+constexpr uint32_t kCarrionWhimTicks = 90;
+float CarrionTerms(const Perception& p, uint32_t meat, uint32_t crowd,
+                   uint64_t selfId, uint64_t pieceKey, uint32_t tick);
 
 // Resolve a faction name to an id, interning as it goes. Names are content;
 // ids are runtime. Shared by profile load and by whoever labels the player.
