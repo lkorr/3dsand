@@ -399,13 +399,14 @@ export function surfacePass(g, role, name, cells, size, info) {
   // sole. Inside the part's own box, which never grows.
   let shaped = G.list();
   if (s.claws > 0.05 && (role === 'hand' || role === 'foot'))
-    shaped = talons(shaped, role, size, s.claws);
+    shaped = talons(shaped, role, size, s.claws, SLOTS.CLAW);
   return keepLargest(shaped, size);
 }
 
 /** Rebuild a hand's fingertips (LOW z) or a foot's toes (LOW y, at the sole)
- *  as three talons. Part-local, front LOW y. */
-function talons(cells, role, size, claws) {
+ *  as three talons in `slot`. Part-local, front LOW y. Exported for the
+ *  goblin (goblin.js), whose claws are the same carving in its nail colour. */
+export function talons(cells, role, size, claws, slot) {
   const [sx] = size;
   const cxL = sx / 2;
   // Talon centres across x: two outer, one middle (2 wide at the root).
@@ -432,7 +433,7 @@ function talons(cells, role, size, claws) {
           const x = xs[i];
           // Root: two deep. Tip: one, hooked a cell toward the palm (high y).
           const yy = tip ? [yc + 1] : [yc, yc + 1];
-          for (const y of yy) out.push([x, y, z, SLOTS.CLAW]);
+          for (const y of yy) out.push([x, y, z, slot]);
         }
     }
     return out;
@@ -450,7 +451,7 @@ function talons(cells, role, size, claws) {
       for (let i = 0; i < xs.length; i++) {
         if (tip && i > 0) continue;
         const zz = tip ? [0] : [0, 1];
-        for (const z of zz) out.push([xs[i], y, z, SLOTS.CLAW]);
+        for (const z of zz) out.push([xs[i], y, z, slot]);
       }
   }
   return out;

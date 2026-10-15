@@ -15610,6 +15610,73 @@ the wave's plane measured in the tail's own frame. `test_mobgen` section R:
 the upper body is the human's box for box, the legs are gone, the trail and
 only the trail trails, every preset / kind / tip / random roll is sound.
 
+### The goblin: small, big-headed flesh on the human rig (2026-10-14; `assets/editor/goblin.js`, `assets/mobs/goblin.*` + `assets/mobs/goblin/`)
+
+A race module of the demon's shape (`mobgen.RACE_MODS.goblin`): the human's
+fifteen limbs, sockets, chains, clips and natural weapons BY NAME, so every
+helm, blade and damage state binds; the human's anatomy, blood and hair. All
+of it is generator data -- no C++ knows what a goblin is (the F1 spawn list's
+race filter has a button for it, and that is all).
+
+- **Smaller, by offsets.** Becoming a goblin moves the build by
+  `BUILD_DELTA` (applySex's rule, undone exactly on the way back for a body
+  not already at a slider's end): 0.45 m shorter, a wider and taller head,
+  short shins and thighs, a longer forearm, a fuller belly. The race's own
+  height band is 0.9..1.6 m. Two consequences of size the generator already
+  had rules for: under a metre the stock foot row is too thin to hold its
+  ankle anchor (the offsets add a row), and the EYE ROW is derived from the
+  height (the first-person camera contract), so a taller skull would put the
+  eyes up under the hairline -- the offsets lower them one row instead.
+- **What sticks out is head EXTRAS** (scene coordinates past the head box,
+  the demon horns' mechanism, each piece its own small fixed limb): EARS
+  (flat blades: length, width, rise, sweep back, a flop at the tip, point,
+  torn notches, hair tufts, iron rings up the lower edge; six starting shapes),
+  a NOSE swept out of the bridge (length, hook from snout to beak, a bulb, a
+  crooked bend, warts; a ring, a bone or a stud through it; six shapes), TUSKS
+  up from the lower jaw (rooted on a real jaw cell: a narrow chin moves the
+  root inward, since validateMob refuses a piece that does not touch its
+  parent), and a HAT (`assets/editor/goblinhats.js`).
+- **Hats are worn, not balanced.** Every hat starts from a FITTED CROWN --
+  the skull's own surface from the row over the eyes up, dilated by the hat's
+  thickness -- so it follows the real head and covers the painted hair (the
+  first hats stood on the skull from half way up and showed a dark band of
+  hair under every brim). Nine: a knitted redcap that flops, a hood with ear
+  slits and a long point, a toadstool, a morel's honeycomb cone, an upturned
+  pot (loop handles or a saucepan handle), a bone-spiked band, a beast's skull
+  (sockets, jaw, teeth, horns), a battered top hat (feather), a witch's hat
+  (buckle). Six genes vary them all: size, height, tilt, flop, detail, wear
+  (patches and holes in cloth; dents and chips in the rest). Materials follow
+  the hat (`HAT_MATS`: a mushroom is `cap_red`, a morel `cap_tan`, a pot
+  `iron`, a skull `bone`). A hat takes the hair mass under it out of the
+  build (the extras context carries `mass`); a hood takes all of it.
+- **What is painted** (surfacePass, inside each box): eyes from beady to huge
+  cave eyes, slit or squinting, optionally lit (`gem_arcane`); teeth -- a
+  snaggle, fangs, a grin, a saw-edge; warts (raised where the box has room)
+  and blotches; war paint on the face (stripes, mask, skull, handprint, dots,
+  half-face) with a matching share on the arms and chest; the nails carved
+  into claws (`demon.talons`, now exported with the slot as a parameter).
+- **Kinds** (forest, cave, bog, hill, redcap, hob, frost, ash) pick ears,
+  nose, teeth, eyes and colours together; colours roll as whole sets (hide,
+  eyes, metal, hat, paint, rags, hair) so they dedupe in the shared art
+  palette. Art slots 208..202, written only by a goblin.
+- **Bites and scratches**: claws add a little `cut` to the fists, tusks and
+  fangs / saw teeth raise the jaws' `bite`. A hunched goblin carries the
+  library `hunch` as its last loco state (demon.js's mechanism).
+- **Characters** (`assets/mobs/goblin/`): grib, snikkit, gutrot (hobgoblin
+  chieftain), mirewart (bog witch), redcap, gloomeye (cave), tinkerpot,
+  frostnip, sootskin. The race base `goblin.*` is bare by rule (mobgen
+  raceBase), so it has no ears; spawn a character to see one.
+
+**Open:** small goblins walk slower than a man (mobgen's size rule, dynamic
+similarity) where folklore has them scurry -- a `speed` override would be a
+sidecar key the race emits; no goblin behaviour profile yet (they fight with
+the human's); ears and hats poke through a worn helm.
+
+`test_mobgen` section S: the rig by name, smaller and bigger-headed, the
+offsets round-trip, the band, every character sound / flesh / blood / filed /
+eared, the hat flattens hair, a human writes no goblin colour, every named
+choice and random roll is sound, every numeric gene reaches the body.
+
 ### Swimmers: the shark and the piranha (2026-10-10; `src/game/mob_swim.cpp`, sidecar `swim`, `ai::Intent::Orbit` / `Charge`, `scripts/gen_fish.mjs`, gate `aquatic`)
 
 The first creatures that live in the water. Owner ask: a medium shark that

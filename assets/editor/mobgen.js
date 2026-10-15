@@ -86,6 +86,7 @@ import * as AU from './automaton.js';
 import * as AN from './android.js';
 import * as DM from './demon.js';
 import * as NG from './naga.js';
+import * as GB from './goblin.js';
 import * as SE from './serpent.js';
 
 /** THE MACHINE RACES (automaton.js, android.js), by race key. Everything such
@@ -95,7 +96,8 @@ import * as SE from './serpent.js';
  *  made of (with stand-ins for ids a .vox cannot paint), the inside, the
  *  bleed, presets and its folder. A new race of that shape is a module and a
  *  row here. The sylvan predates the interface and keeps its own hooks. */
-export const RACE_MODS = { automaton: AU, android: AN, demon: DM, naga: NG };
+export const RACE_MODS = { automaton: AU, android: AN, demon: DM, naga: NG,
+                            goblin: GB };
 export const RACES = [...SY.RACES, ...Object.keys(RACE_MODS)];
 /** The machine race module a genome is, or null (human, sylvan). */
 export const raceMod = g =>
@@ -299,6 +301,8 @@ export const ART = {
   // 213..209: a lower-body plan's, painted on any body that has the tail).
   ...NG.SLOTS,
   ...SE.SLOTS,
+  // THE GOBLIN's (goblin.js, 208..202), below the serpent's.
+  ...GB.SLOTS,
   // THE LIPS (2026-10-08): below the demon's. Written into a palette only
   // when a face paints it (lipUsed), so a body without coloured lips spends
   // no slot of the engine's shared art palette on it.
@@ -364,6 +368,8 @@ export const COLOR_SLOTS = {
   // existed is still the draw it makes.
   ...NG.COLOR_SLOTS,
   ...SE.COLOR_SLOTS,
+  // ...and the goblin's, last again.
+  ...GB.COLOR_SLOTS,
 };
 
 /**
@@ -1025,6 +1031,7 @@ export const GENE_GROUPS = [
   ...AN.GENE_GROUPS,
   ...DM.GENE_GROUPS,
   ...NG.GENE_GROUPS,
+  ...GB.GENE_GROUPS,
   SE.GENE_GROUP,
   { key: 'colour', title: 'colours',
     note: 'Nine art slots. Each surface picks base, shadow or highlight by ' +
@@ -1667,7 +1674,8 @@ const BRIEFS_SPECS = [
 ];
 GENE_SPECS.splice(GENE_SPECS.findIndex(sp => sp.group === 'colour'), 0,
                   ...BRA_SPECS, ...BRIEFS_SPECS, ...SY.GENE_SPECS, ...AU.GENE_SPECS, ...AN.GENE_SPECS,
-                  ...DM.GENE_SPECS, ...NG.GENE_SPECS, ...SE.GENE_SPECS);
+                  ...DM.GENE_SPECS, ...NG.GENE_SPECS, ...SE.GENE_SPECS,
+                  ...GB.GENE_SPECS);
 
 /** Does this row apply to this genome? (race-gated rows, see GENE_SPECS;
  *  `sex`-gated rows, the bra, show on that sex only) */
@@ -1804,13 +1812,13 @@ export const LIP_STOCK = {
  *  colours tab, so the eye colour is on the face tab and the lips on the
  *  mouth tab. A tab the race does not have simply never shows. */
 export const COLOR_HOME = {
-  skin: ['body', 'sylbark', 'autobody', 'andbody', 'dmbody'],
-  skinShade: ['body', 'sylbark', 'autobody', 'andbody', 'dmbody'],
-  skinLight: ['body', 'sylbark', 'autobody', 'andbody', 'dmbody'],
-  nail: ['arms', 'dmbody'],
+  skin: ['body', 'sylbark', 'autobody', 'andbody', 'dmbody', 'gbhide'],
+  skinShade: ['body', 'sylbark', 'autobody', 'andbody', 'dmbody', 'gbhide'],
+  skinLight: ['body', 'sylbark', 'autobody', 'andbody', 'dmbody', 'gbhide'],
+  nail: ['arms', 'dmbody', 'gbhide'],
   lip: ['mouth'],
   hair: ['hair', 'sylcrown'], hairShade: ['hair', 'sylcrown'],
-  eye: ['face', 'sylface', 'autoface', 'andface', 'dmhead'],
+  eye: ['face', 'sylface', 'autoface', 'andface', 'dmhead', 'gbface'],
   cloth: ['underwear'], clothShade: ['underwear'],
   root: ['sylbark'], moss: ['sylbark'], branch: ['sylbranch'],
   flower: ['sylcrown'], flowerEye: ['sylcrown'], leaf2: ['sylcrown'],
@@ -1821,6 +1829,8 @@ export const COLOR_HOME = {
   light: ['andbody'], seam: ['andbody'], frame: ['andbody'], core: ['andbody'],
   trace: ['andbody'], visor: ['andface'],
   horn: ['dmhead'], hornTip: ['dmhead'], claw: ['dmbody'], mark: ['dmbody'],
+  wart: ['gbhide'], warpaint: ['gbhide'], tusk: ['gbface'], eyeDark: ['gbface'],
+  ring: ['gbears', 'gbhat'], hat: ['gbhat'], hatTrim: ['gbhat'],
 };
 
 /**
@@ -4394,9 +4404,11 @@ function hairMass(g, parts, extra = {}) {
   // What rides the head goes with the snout (a fixed, small-piece group), what
   // rides the torso with the boughs (fixed, and dropped unless it touches it).
   if (extrasOn) {
+    // `mass` is the hair mass so far, keyed by K: a race may take cells
+    // OUT of it (goblin.js: a hat flattens the hair under it).
     const got = Mx.extras(g, { ART, K, body, head, torso: P.torso,
                                face: extra.face, C, halfW, halfD, skullH,
-                               splitZ });
+                               splitZ, mass });
     snoutCells = snoutCells.concat(got.head);
     boughCells = boughCells.concat(got.torso);
     limbTail = limbTail.concat(got.tail || []);

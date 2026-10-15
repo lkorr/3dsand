@@ -2055,6 +2055,171 @@ section('R. the naga: the human above the hips, a serpent tail below');
 }
 
 // =============================================================================
+// 12. the goblin race (goblin.js)
+// =============================================================================
+
+section('S. the goblin: small, big-headed flesh on the SAME rig, its own height band');
+{
+  const opts = { materials, player: tuning.player, avatar: avatarConstants() };
+  const GB = mg.RACE_MODS.goblin;
+  ok(!!GB && GB.MACHINE === false && !GB.LOWER,
+     'goblin is a flesh race module on legs');
+  const sound = (label, g) => {
+    let b;
+    try { b = mg.generateMob(g, 0, opts); } catch (e) {
+      ok(false, `${label}: builds`, e.message);
+      return null;
+    }
+    const v = mg.validateMob(b);
+    ok(!v.length, `${label}: structurally sound`, v.join('; '));
+    return b;
+  };
+  const human = mg.generateMob(mg.defaultGenome(), 0, opts);
+  // 1. THE RIG IS THE HUMAN'S by NAME: the same limbs in the same order, the
+  //    same sockets, chains and natural weapons. The boxes are smaller (it is
+  //    a smaller body), which is the point; every system binds by name.
+  {
+    const gob = mg.applyRace(mg.defaultGenome(), 'goblin');
+    const b = sound('goblin default', gob);
+    if (b) {
+      const names = r => ({
+        limbs: r.sidecar.limbs.filter(l => l.tag !== 'hair').map(l => l.name),
+        sockets: r.sidecar.sockets.map(s => s.name),
+        chains: r.sidecar.chains.map(c => c.name),
+        natural: r.sidecar.natural.map(n => n.name + '@' + n.part),
+      });
+      const d = diff(names(human), names(b), 'rig');
+      ok(!d, 'goblin: the human limbs, sockets, chains and natural weapons by name', d);
+      ok(b.table.worldH < human.table.worldH, 'goblin: shorter than the human it was',
+         `${b.table.worldH} vs ${human.table.worldH}`);
+      const headShare = r => r.table.limbs.head.size[2] / r.table.microH;
+      ok(headShare(b) > headShare(human), 'goblin: a bigger head for its height');
+    }
+  }
+  // 2. BECOMING A GOBLIN IS AN OFFSET, so a round trip through it lands where
+  //    it started (BUILD_DELTA, the applySex rule) -- for a body whose genes
+  //    the offsets do not push past a slider's end (a brute's jaw is already
+  //    at its maximum, so it clamps going in, exactly as applySex does).
+  for (const [label, g0] of [['default', mg.defaultGenome()]]) {
+    const g = mg.normalizeGenome(g0);
+    const back = mg.applyRace(mg.applyRace(mg.normalizeGenome(g0), 'goblin'), 'human');
+    const build = x => JSON.stringify([x.body.heightM, x.body.headWidth, x.body.stack,
+                                       x.body.armStack, x.shape, x.head, x.face.eyeRow]);
+    ok(build(back) === build(g), `goblin ${label}: human -> goblin -> human keeps the build`,
+       `${build(g)} -> ${build(back)}`);
+  }
+  // 3. THE HEIGHT BAND IS THE RACE'S, and only the race's.
+  {
+    const h = mg.normalizeGenome({ body: { heightM: 1.0 } });
+    ok(h.body.heightM === mg.HEIGHT_BAND[0], 'a 1.0 m HUMAN still clamps to the human band');
+    const wild = mg.normalizeGenome({ body: { race: 'goblin', heightM: 99 } });
+    ok(wild.body.heightM === GB.HEIGHT_BAND[1], 'a 99 m goblin clamps to the goblin band',
+       `got ${wild.body.heightM}`);
+    const m = mg.mutate(mg.presetGenome('gloomeye'), 1.5, mg.makeRng(3));
+    ok(m.body.heightM >= GB.HEIGHT_BAND[0] && m.body.heightM <= GB.HEIGHT_BAND[1],
+       'a mutant goblin stays inside the goblin band', `got ${m.body.heightM}`);
+  }
+  // 4. EVERY CHARACTER builds sound, bakes FLESH, bleeds blood, is filed in
+  //    assets/mobs/goblin/, wears its ears (two head pieces at least), and a
+  //    hunched one carries the hunch as its LAST state.
+  for (const k of GB.PRESET_ORDER) {
+    const g = mg.presetGenome(k);
+    ok(g.body.race === 'goblin', `${k} is a goblin`);
+    const b = sound(k, g);
+    if (!b) continue;
+    const c = mg.bakeAnatomy(b, materials).census;
+    ok(c.skin > 0 && c.flesh > 0 && c.bone > 0 && c.brain > 0 && c.blood > 0,
+       `${k}: the human inside`, JSON.stringify(c));
+    ok(b.sidecar.bleed && b.sidecar.bleed.material === 'blood', `${k}: bleeds blood`);
+    ok(mg.raceFolder(g) === 'goblin', `${k}: filed in assets/mobs/goblin/`);
+    // (The race BASE is bare by rule -- mobgen raceBase: no extras -- so
+    // every character grows its own ears.)
+    if (k !== GB.RACE) {
+      const heads = b.parts.filter(p => p.name.startsWith('snout'));
+      ok(heads.length >= 2, `${k}: its ears (and nose) ride the head`,
+         `${heads.length} head pieces`);
+    }
+    const hunched = g.goblin.posture === 'hunched';
+    const st = b.sidecar.states;
+    ok(hunched === st.some(s => s.name === 'hunch' && s.always && s.clip === 'hunch'),
+       `${k}: a hunch state iff hunched (${g.goblin.posture})`);
+    ok(!hunched || st[st.length - 1].name === 'hunch', `${k}: the hunch is the LAST state`);
+    if (g.goblin.hat !== 'none') {
+      const hat = b.parts.some(p => p.cells.some(c => c[3] === GB.SLOTS.HAT ||
+                                                    c[3] === GB.SLOTS.RING ||
+                                                    c[3] === GB.SLOTS.TUSK ||
+                                                    c[3] === GB.SLOTS.HAT_TRIM));
+      ok(hat, `${k}: wears its ${g.goblin.hat}`);
+    }
+  }
+  // 5. A HAT FLATTENS THE HAIR UNDER IT: the redcap with long hair carries
+  //    less hair mass than the same genome bare-headed.
+  {
+    const hatted = mg.presetGenome('redcap');
+    const bare = mg.normalizeGenome(hatted);
+    bare.goblin.hat = 'none';
+    const hairOf = g => mg.generateMob(g, 0, opts).parts
+      .filter(p => p.name === 'hair').reduce((a, p) => a + p.cells.length, 0);
+    ok(hairOf(hatted) < hairOf(bare), 'a redcap flattens the hair under it',
+       `${hairOf(hatted)} vs ${hairOf(bare)} hair cells`);
+  }
+  // 6. A HUMAN NEVER SEES THE RACE: no goblin colour in a human's goblin slots.
+  {
+    const { palette } = readVox(human.vox);
+    const hex = sl => '#' + [0, 1, 2].map(i => palette[(sl - 1) * 4 + i]
+      .toString(16).padStart(2, '0')).join('');
+    const gobHexes = new Set(Object.keys(GB.COLOR_SLOTS).map(k => GB.DEFAULT_COLORS[k]));
+    ok(Object.values(GB.COLOR_SLOTS).every(sl => !gobHexes.has(hex(sl))),
+       'a human writes none of the goblin colours into its palette');
+  }
+  // 7. EVERY NAMED CHOICE BUILDS: kinds, ear and nose shapes, hats, teeth,
+  //    eyes, war paint, piercings; and random and mutant goblins are sound.
+  const base = () => mg.applyRace(mg.defaultGenome(), 'goblin');
+  for (const kd of GB.KIND_ORDER) sound(`kind ${kd}`, GB.applyKind(base(), kd));
+  for (const st of GB.EAR_ORDER) sound(`ears ${st}`, GB.applyEars(base(), st));
+  for (const st of GB.NOSE_ORDER) sound(`nose ${st}`, GB.applyNose(base(), st));
+  for (const [key, list] of [['hat', GB.HATS], ['teeth', GB.TEETH], ['eyes', GB.EYE_STYLES],
+                             ['warpaint', GB.WARPAINT], ['nosePierce', GB.PIERCINGS]])
+    for (const v of list) {
+      const g = base();
+      g.goblin[key] = v;
+      if (key === 'warpaint') g.goblin.bodyPaint = 1;
+      sound(`${key} ${v}`, g);
+    }
+  for (const s of [1, 2, 3, 5, 8, 21]) {
+    const g = mg.rollColors(mg.randomGenome(mg.makeRng(s), null, { race: 'goblin' }),
+                            mg.makeRng(s ^ 77));
+    ok(g.body.race === 'goblin', `random goblin seed ${s} is a goblin`);
+    sound(`random goblin seed ${s}`, g);
+    sound(`goblin mutant seed ${s}`,
+          mg.mutate(mg.presetGenome(GB.PRESET_ORDER[s % GB.PRESET_ORDER.length]), 1.5,
+                    mg.makeRng(s)));
+  }
+  // 8. EVERY NUMERIC GENE REACHES THE BODY, at a genome where it can: hat
+  //    genes under a redcap, the paint amount under a paint, rings on.
+  {
+    const g0 = base();
+    g0.goblin.hat = 'redcap';
+    g0.goblin.warpaint = 'stripes';
+    g0.goblin.tusks = 0.5;
+    g0.goblin.warts = 0.5;
+    g0.goblin.earRings = 1;
+    const key = g => {
+      const b = mg.generateMob(g, 0, opts);
+      return b.parts.map(p => p.name + ':' + p.cells.map(c => c.join(',')).join(';')).join('|') +
+             JSON.stringify(b.sidecar.natural);
+    };
+    const k0 = key(g0);
+    for (const spec of mg.GENE_SPECS.filter(sp => sp.race === 'goblin' && !sp.kind)) {
+      const g = mg.normalizeGenome(g0);
+      const v = mg.getPath(g, spec.path);
+      mg.setPath(g, spec.path, v > (spec.min + spec.max) / 2 ? spec.min : spec.max);
+      ok(key(g) !== k0, `${spec.path} changes the body`);
+    }
+  }
+}
+
+// =============================================================================
 
 if (fails) {
   console.log('\nThe standard is assets/mobs/human.json. If it moved on purpose, ' +

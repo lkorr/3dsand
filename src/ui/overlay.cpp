@@ -1868,11 +1868,13 @@ void Overlay::DrawDevSpawn(UIState& s) {
       // stays an index into the FULL list (the spawn reads it that way); the
       // filtered view maps its rows back.
       // The machine races (automaton, android: assets/editor/automaton.js /
-      // android.js), the demons and the nagas (demon.js, naga.js) each have
-      // their own button; "other" is everything else.
-      static const char* kRaces[] = {"all",     "human", "sylvan", "automaton",
-                                     "android", "demon", "naga",   "other"};
-      constexpr int kNamed = 8;
+      // android.js), the demons, the nagas and the goblins (demon.js,
+      // naga.js, goblin.js) each have their own button; "other" is
+      // everything else.
+      static const char* kRaces[] = {"all",   "human",  "sylvan",
+                                     "automaton", "android", "demon",
+                                     "naga",  "goblin", "other"};
+      constexpr int kNamed = 9;
       Caption("race");
       {
         const float w = CellWidth(3);
