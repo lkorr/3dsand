@@ -754,6 +754,23 @@ bool TargetNow(TickAuthorityCtx& w, std::span<SessionTick> players, uint64_t id,
       out = p.s->player.pos;
       return true;
     }
+  // A PEER'S PLAYER (M9): the actor band is positional, every local session
+  // first and then the ghosts in RemotePlayers list order
+  // (RemotePlayersAppendActors), so band index `players.size() + j` is ghost
+  // j. Without this a ghost resolved to nothing, and an archer that picked
+  // the peer let its draw down as "the target is gone" on the first step,
+  // every cadence, never loosing. Alive the way the actor list publishes it:
+  // a ghost with no state yet, or a dead one, is gone.
+  if (ai::IsPlayerActorId(id)) {
+    const uint64_t band = id - ai::kPlayerActorBase;
+    if (w.remotes == nullptr || band < (uint64_t)players.size()) return false;
+    const uint64_t j = band - (uint64_t)players.size();
+    if (j >= (uint64_t)w.remotes->list.size()) return false;
+    const RemotePlayer& r = *w.remotes->list[(size_t)j];
+    if (!r.haveState || !r.last.Has(PlayerState::kAlive)) return false;
+    out = r.ghost.pos;
+    return true;
+  }
   if (w.mobs.IsAlive(id)) {
     out = BoxCentre(w.mobs, id);
     return true;
