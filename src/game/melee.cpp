@@ -10,6 +10,7 @@
 
 #include "game/burnprof.h"  // the blade path's own scopes (kSweep, kCoat)
 #include "game/mob.h"     // MobSystem/Mob: the sweep carves live limbs
+#include "game/arrows.h"  // ArrowHeadIn: a peer's arrow stays only with its head in
 #include "phys/debris.h"  // DebrisSystem: ...and melts loose ones
 #include "phys/physics.h"
 #include "sim/scale.h"    // SkinScaleFor / NeededArtUpsample / kLegacyAuthoring*
@@ -2532,11 +2533,13 @@ RemoteHitOutcome ApplyRemotePierceHit(const MeleeHit& h, Physics& phys,
     return RemoteHitOutcome::Applied;
   }
   mobs.PierceLimb(hb, from, dir, h.c.pierce, world, spawns, r);
+  // The flight's own rule (game/arrows.h ArrowHeadIn): it stays only with its
+  // head in. A shallower stop is the shooter's to drop.
   if (r.hit && !r.missed && !r.severed &&
       r.outcome == PierceOutcome::Embedded && !h.embedItem.empty() &&
       mobs.Items() != nullptr)
     if (const ItemDef* d = mobs.Items()->Named(h.embedItem))
-      t->EmbedArrow(*d, sl, r.stopWorld, dir);
+      if (ArrowHeadIn(*d, r)) t->EmbedArrow(*d, sl, r.stopWorld, dir);
   return RemoteHitOutcome::Applied;
 }
 

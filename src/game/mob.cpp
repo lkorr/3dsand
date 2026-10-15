@@ -21,6 +21,7 @@
 #include "game/dye.h"
 #include "game/rigrender.h"
 #include "game/sidecar.h"
+#include "game/wornfit.h"  // a looted piece's damage moved onto this wearer's fit
 #include "phys/bodystain.h"
 #include "phys/floatrho.h"
 #include "phys/lattice.h"
@@ -34229,6 +34230,16 @@ bool Mob::WearOnRig(const ItemDef* item, int equipSlot,
           (sameGeom(now, sh.lattice) || sameGeom(cv.voxels, sh.lattice))) {
         if (sh.hp >= 0.0f) limbs_[slot].hp = sh.hp;
         ApplyLimbCoats(slot, sh.lattice);
+      } else if (!sh.lattice.empty() &&
+                 !wornfit::LatticeFitsShell(sh.lattice, sh.atSpawn, now)) {
+        // RECORDED ON ANOTHER BODY'S FIT (game/wornfit.h): a piece looted off
+        // a bigger or smaller wearer. Its lattice is that body's resample;
+        // put back whole it rebuilt this shell at that body's size. The
+        // damage moves through the authored lattice onto THIS fit instead.
+        WornShellDamage moved = sh;
+        moved.lattice =
+            wornfit::RefitShellLattice(cv, sh.lattice, sh.atSpawn, now);
+        RestoreShellLattice(slot, moved);
       } else {
         RestoreShellLattice(slot, sh);
       }

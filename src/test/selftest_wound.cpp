@@ -11661,7 +11661,9 @@ Status GatePierce(Ctx& c, std::string& detail) {
 // (support::RunTicks), against a fresh fixture human posed like the pierce
 // gate's, aimed from its own measured geometry:
 //
-//   (a) EMBED: half draw into the upper arm stops in it, an arrow slot exists
+//   (a) EMBED: a full draw (arrowEmbedArmDraw) into the upper arm stops in
+//       it with its head in (ArrowHeadIn; a half draw no longer does: it
+//       stops short of the head and drops), an arrow slot exists
 //       on THAT limb, and it rides the limb -- its pose in the limb's frame is
 //       unchanged after the creature is killed and its corpse has fallen (the
 //       limb moved, the arrow went with it), and after the arm is severed the
@@ -11708,6 +11710,11 @@ Status GateArrow(Ctx& c, std::string& detail) {
   const float fallMin = (float)BaselineNumber("arrowFallMinVox", 1.0);
   const int volleyTicks = (int)BaselineNumber("arrowVolleyTicks", 40);
   const float throughX = (float)BaselineNumber("arrowThroughSpeedX", 3.0);
+  // The draws (a) and (d) shoot at, as fractions of the full draw's speed:
+  // each must bury the head (ArrowHeadIn) or the arrow does not stay to be
+  // ridden or pulled.
+  const float armDraw = (float)BaselineNumber("arrowEmbedArmDraw", 1.0);
+  const float pullDraw = (float)BaselineNumber("arrowPullDraw", 1.0);
 
   // THE GROUND REGISTRY the game binds (main.cpp): shed gear and stuck arrows
   // land in it, a released body leaves it.
@@ -11847,7 +11854,7 @@ Status GateArrow(Ctx& c, std::string& detail) {
       return Status::Fail;
     }
     const uint32_t seed = 0xA0001u;
-    shoot(f, f.armC, f.side, 0.5f * fullVox, seed);
+    shoot(f, f.armC, f.side, armDraw * fullVox, seed);
     support::RunTicks(*f.rig, 2);
     const std::vector<ArrowEvent> ev = eventsOf(f, seed);
     auditHits(ev);
@@ -11860,7 +11867,7 @@ Status GateArrow(Ctx& c, std::string& detail) {
       for (const ArrowEvent& e : ev)
         seen += Format(" kind %d outcome %s;", (int)e.kind,
                        PierceOutcomeName(e.r.outcome));
-      fail("(a) half draw into the arm did not embed:" + seen);
+      fail(Format("(a) a %.2f draw into the arm did not embed:", armDraw) + seen);
     } else {
       const int slot = emb->slot;
       const bool onLimb = m->IsArrowSlot(slot) && m->WornHostOf(slot) == arm;
@@ -11891,10 +11898,10 @@ Status GateArrow(Ctx& c, std::string& detail) {
           hpIn = e.r.hpCharged;
         }
       lines += Format(
-          "(a) armU half draw: embedded %.1f cm (hp %.1f), slot %d on armU; "
+          "(a) armU %.2f draw: embedded %.1f cm (hp %.1f), slot %d on armU; "
           "dead and fallen, arm moved %.2f vox, arrow drift in the arm's frame "
           "%.4f | ",
-          depthCm, hpIn, slot, armMoved, drift);
+          armDraw, depthCm, hpIn, slot, armMoved, drift);
       if (!stillThere) fail("(a) the arrow is gone from the corpse");
       if (armMoved < fallMin)
         fail(Format("(a) the dead arm moved only %.2f vox (< %.2f): nothing "
@@ -11929,7 +11936,7 @@ Status GateArrow(Ctx& c, std::string& detail) {
     // (d): half draw into the torso embeds; G's take pulls it into the kit.
     const uint32_t s0 = 0xB0001u;
     const Vec3 torsoAim = f.torsoC - f.side * 0.6f;   // off the midline
-    shoot(f, torsoAim, f.front, 0.5f * fullVox, s0);
+    shoot(f, torsoAim, f.front, pullDraw * fullVox, s0);
     support::RunTicks(*f.rig, 2);
     auditHits(eventsOf(f, s0));
     int slot = -1;
@@ -11937,7 +11944,7 @@ Status GateArrow(Ctx& c, std::string& detail) {
       if (e.kind == ArrowEvent::Kind::Embedded) slot = e.slot;
     Mob* m = mobs.FindCreature(f.id);
     if (slot < 0 || m == nullptr) {
-      fail("(d) half draw into the torso did not embed");
+      fail(Format("(d) a %.2f draw into the torso did not embed", pullDraw));
     } else {
       Kit kit;
       const uint64_t ab = mobs.LimbBody(f.id, slot);
@@ -12054,6 +12061,149 @@ Status GateArrow(Ctx& c, std::string& detail) {
     RecordObserved("arrowHeadKill", (double)headKill);
     lines += Format("head: %d full-draw arrows killed (hp per arrow %s) | ",
                     headKill, seq.c_str());
+  }
+
+  // ======== (h) THE HEAD IS IN (ticket 2026-10-14_22-26-58) ====================
+  // "it should only really stick out if it's actually embedded in the flesh. i
+  // shouldn't just see the whole arrow head on the outside." Six shots at a
+  // bare fixture and six at one in a tunic -- full, 3/4 and half draw into the
+  // chest, full draw through the arm into the side, full draw 50 degrees off
+  // the chest's normal, full draw into the head -- and for every arrow that
+  // stayed in the body, the HEAD'S DEPTH MEASURED ON THE BODY: four rays
+  // parallel to the shaft, three art cells off its axis (clear of the channel
+  // the point bored and of the head's own socket), from behind the nock to
+  // the point, each stopping on the first cell of the limb the arrow is in;
+  // the median of the four is how far the point is under that limb's
+  // surface. Asserted: every arrow that stayed is in by its head's length
+  // (ArrowHeadLength, less one art cell), and every stop shallower than the
+  // head (the channel's own depth) did NOT stay. And THROUGH THE TUNIC the
+  // full-draw chest shot reaches the torso: the garment's channel used to
+  // run front panel -> back panel across the torso it wraps (kerf.h
+  // exitGapBins) and the arrow flew on through the man untouched.
+  {
+    const float headLen = ArrowHeadLength(*arrowDef);
+    const float cell = 1.0f / (float)std::max(1u, arrowDef->scale);
+    const ItemDef* tunic = c.items.Named("tunic");
+    auto buriedOf = [&](uint64_t id, int slot, int host) {
+      BodyTransform x{};
+      if (!c.phys.GetTransform(mobs.LimbBody(id, slot), x)) return -1.0f;
+      const Quat q{x.quat[0], x.quat[1], x.quat[2], x.quat[3]};
+      const Vec3 d = QuatRotate(q, Vec3{1, 0, 0});
+      const Vec3 tip = x.pos + QuatRotate(q, arrowDef->arrow.tip);
+      const Vec3 u = (std::fabs(d.y) < 0.9f ? d.cross(Vec3{0, 1, 0})
+                                            : d.cross(Vec3{1, 0, 0}))
+                         .normalized();
+      const Vec3 w = d.cross(u);
+      const float L = arrowDef->arrow.length + 2.0f;
+      float dep[4];
+      for (int k = 0; k < 4; k++) {
+        const Vec3 off = (k < 2 ? u : w) * ((k & 1) ? -3.0f * cell : 3.0f * cell);
+        const Vec3 ro = tip + off - d * L;
+        dep[k] = 0.0f;
+        float t0 = 0.0f;
+        for (int it = 0; it < 512 && t0 < L; it++) {
+          const MobSystem::BodyRayHit h = mobs.PickBody(id, ro + d * t0, d, L - t0);
+          if (!h.hit) break;
+          const float t = t0 + h.t;
+          if (h.limb == host) {
+            dep[k] = L - t;
+            break;
+          }
+          t0 = t + 0.75f * cell;   // past that cell (a sleeve, the arm, itself)
+        }
+      }
+      std::sort(dep, dep + 4);
+      return 0.5f * (dep[1] + dep[2]);
+    };
+    int stayed = 0, shallowStayed = 0, shallowDropped = 0, notBuried = 0;
+    bool tunicReachedTorso = false;
+    std::string rows;
+    for (int dressed = 0; dressed < 2; dressed++) {
+      Fixture f = fixture(72500 + 500 * (uint32_t)dressed);
+      Mob* m = f.id ? mobs.FindCreature(f.id) : nullptr;
+      if (m == nullptr) {
+        fail("(h) the fixture did not spawn");
+        break;
+      }
+      if (dressed && tunic != nullptr)
+        m->WearItem(tunic, EquipSlotFor(tunic->kind, Equipment{}));
+      for (int k = 0; k < 6; k++) {
+        const Vec3 tC = centroid(f.id, torso), aC = centroid(f.id, arm),
+                   hC = centroid(f.id, head);
+        Vec3 sd = tC - aC;
+        sd.y = 0.0f;
+        sd = sd.len() > 1e-3f ? sd.normalized() : f.side;
+        const Vec3 fr = Vec3{0, 1, 0}.cross(sd).normalized();
+        const Vec3 up{0, 1, 0};
+        Vec3 aim = tC, dir = fr;
+        float speed = fullVox;
+        const char* what = "";
+        switch (k) {
+          case 0: aim = tC - sd * 0.6f + up * 0.5f; what = "chest full"; break;
+          case 1: aim = tC + sd * 0.6f + up * 0.5f; speed = 0.75f * fullVox;
+                  what = "chest 3/4"; break;
+          case 2: aim = tC - sd * 0.6f - up * 1.0f; speed = 0.5f * fullVox;
+                  what = "chest 1/2"; break;
+          case 3: aim = aC; dir = sd; what = "arm->side full"; break;
+          case 4: aim = tC + sd * 0.4f - up * 0.5f;
+                  dir = (fr * 0.64f + sd * 0.77f).normalized();
+                  what = "chest 50deg full"; break;
+          default: aim = hC; dir = sd; what = "head full"; break;
+        }
+        const uint32_t sk = 0xA8000u + 0x100u * (uint32_t)dressed + (uint32_t)k;
+        shoot(f, aim, dir, speed, sk);
+        support::RunTicks(*f.rig, 3);
+        const std::vector<ArrowEvent> ev = eventsOf(f, sk);
+        auditHits(ev);
+        const ArrowEvent* lastHit = nullptr;
+        const ArrowEvent* end = nullptr;
+        std::string chain;
+        for (const ArrowEvent& e : ev) {
+          if (e.kind == ArrowEvent::Kind::Hit) {
+            lastHit = &e;
+            if (dressed && k == 0 && e.mobId == f.id && e.limb == torso)
+              tunicReachedTorso = true;
+            chain += Format("%s%s %s %.1fcm", chain.empty() ? "" : ">",
+                            e.limb >= 0 ? m->LimbDefAt(e.limb).name.c_str() : "?",
+                            PierceOutcomeName(e.r.outcome),
+                            e.r.depth * kVoxelMeters * 100.0f);
+          } else {
+            end = &e;
+          }
+        }
+        const bool stopIn = lastHit && lastHit->r.outcome == PierceOutcome::Embedded;
+        const bool shallow = stopIn && lastHit->r.depth < headLen;
+        const bool stays = end && end->kind == ArrowEvent::Kind::Embedded;
+        float buried = -1.0f;
+        if (stays) {
+          stayed++;
+          buried = buriedOf(f.id, end->slot, m->WornHostOf(end->slot));
+          if (buried < headLen - cell) notBuried++;
+          if (shallow) shallowStayed++;
+        } else if (shallow) {
+          shallowDropped++;
+        }
+        rows += Format("%s%s: [%s] -> %s%s; ", dressed ? "tunic " : "", what,
+                       chain.c_str(),
+                       end ? (end->kind == ArrowEvent::Kind::Embedded ? "STAYED"
+                              : end->kind == ArrowEvent::Kind::Dropped ? "dropped"
+                              : end->kind == ArrowEvent::Kind::Stuck   ? "stuck"
+                                                                        : "other")
+                           : "still flying",
+                       stays ? Format(", head %.1f cm under", buried * kVoxelMeters * 100.0f).c_str()
+                             : "");
+      }
+    }
+    lines += Format("(h) head %.1f cm: %d stayed (%d not in by the head), %d shallow "
+                    "stops dropped, %d shallow stayed: %s| ",
+                    headLen * kVoxelMeters * 100.0f, stayed, notBuried,
+                    shallowDropped, shallowStayed, rows.c_str());
+    RecordObserved("arrowHeadInStayed", (double)stayed);
+    if (notBuried) fail(Format("(h) %d arrows stayed with the head not in", notBuried));
+    if (shallowStayed) fail(Format("(h) %d stops shallower than the head stayed", shallowStayed));
+    if (stayed == 0) fail("(h) no arrow stayed in any body: nothing was measured");
+    if (tunic != nullptr && !tunicReachedTorso)
+      fail("(h) the full draw through the tunic never met the torso it covers");
   }
 
   // ======== (e) the glance + (c) TERRAIN ========================================

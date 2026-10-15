@@ -330,7 +330,31 @@ class Player {
   // movement rules want: `inLiquid` used to stand in for it and cost a wader
   // their jump, their step-up and their ground snap for one voxel of puddle.
   // Never true in fly or during a scripted climb.
+  //
+  // ...AND ONLY IN SWIMMING WATER (`swimWater`, below). Three-quarters under
+  // while standing on the bed of water shallower than the neck is wading.
   bool swimming = false;
+  // SWIMMING WATER (2026-10-14, owner: "swimming animation should only start
+  // if floating fully in water at the neck"). The water COLUMN the body is in
+  // is deep enough that a body standing on its bed would have the surface at
+  // its neck (kSwimNeckFrac of the standing height, player.cpp) -- a property
+  // of the water, not of how high the body happens to float in it, because a
+  // floating body rides with its shoulders out and could never be "neck deep"
+  // by its own samples. HELD with hysteresis: it lets go only once the column
+  // is shallower than kSwimWadeFrac (chest), so a swimmer crossing a ripple of
+  // the bed, or bobbing at the line, does not flicker between swim and wade.
+  //
+  // Everything that makes the water carry a body is gated on it: `swimming`,
+  // the implied tread that holds an afloat body at the surface, the surface
+  // dive, and the avatar's swim pose. Before it, a body that DROPPED into
+  // waist-deep water (off a bank, a jump) was afloat for the frame it landed
+  // in, the implied tread caught it at the surface float, and it never touched
+  // the bed again: it swam, carried by the stream, in water it could stand in.
+  bool swimWater = false;
+  // The depth of that column, world voxels from the waterline down to the
+  // first solid under the body (capped at kSwimDepthScan: deeper is "deep").
+  // 0 when not in liquid. Read by swimWater and printed by the gate.
+  float waterDepth = 0.0f;
   // While `swimming`, the direction the stroke is pushing: the LOOK direction
   // (pitch included) under the movement keys, unit length; zero with no
   // movement input or when not swimming. Under water the body travels along

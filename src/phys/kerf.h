@@ -574,6 +574,11 @@ struct PierceResult {
   // merge's convex radius, or a body rebuilt under a new handle by a carve
   // the same flight just made) and passed it by. Outcome Exited, nothing paid.
   bool missed = false;
+  // ...it EXITED at a gap in this body's matter, not past its last cell
+  // (PierceChannel's exitGapBins: a garment, the hair -- a body wrapped round
+  // another). The gap is the wrapped body's: PierceAlongRay meets that next,
+  // and may meet this one again beyond it.
+  bool gapExit = false;
   PierceOutcome outcome = PierceOutcome::Glanced;
   float energyIn = 0.0f;       // J at the entry face
   float energyLeft = 0.0f;     // J past the exit (Exited only)
@@ -687,6 +692,7 @@ struct PierceChannelResult {
   bool any = false;      // there was matter on the axis at all
   bool glanced = false;  // ...and the point could not pay for its first cell
   bool exited = false;   // paid for everything on the axis
+  bool gapExit = false;  // ...or left the matter at a gap (exitGapBins)
   float tEntry = 0.0f;   // world voxels along the axis from the origin
   float tStop = 0.0f;    // the channel ends here (world voxels)
   float tExit = 0.0f;    // far side of the last cell paid (exited)
@@ -725,11 +731,23 @@ struct PierceChannelResult {
 //
 // GLANCE: the first bin -- the first lattice cell of depth of matter -- is
 // what the point must be able to pay for to get in at all.
+//
+// A BODY WRAPPED ROUND ANOTHER (`exitGapBins` > 0; 2026-10-14). A garment's
+// lattice is a hollow shell, and on its own lattice the torso it is worn
+// over is a GAP: walked through as "nothing to pay", the channel went in at
+// the chest panel and out of the back panel, and the flight -- which skips a
+// body once met -- resumed behind the man without ever meeting his torso (an
+// arrow through a tunic flew on through the chest untouched; one that ran
+// out of speed in the back panel stuck there, its head standing out of his
+// back). With exitGapBins = n the channel EXITS at the first run of n or
+// more empty bins after matter it paid for: `exited` and `gapExit`, `tExit` the
+// far face of the last cell paid, `binStop` the first bin not paid (the carve
+// takes exactly what was paid, as for a stop).
 template <class ForEach, class CostOf>
 inline PierceChannelResult PierceChannel(Vec3 oLocal, Vec3 dLocal,
                                          float latScale, float rCells,
                                          float energyJ, ForEach forEach,
-                                         CostOf costOf) {
+                                         CostOf costOf, int exitGapBins = 0) {
   PierceChannelResult r;
   const float s = std::max(latScale, 1e-3f);
   const Vec3 o = oLocal * s;
@@ -805,6 +823,7 @@ inline PierceChannelResult PierceChannel(Vec3 oLocal, Vec3 dLocal,
     r.byMat.push_back({mat, 1u, j});
   };
   size_t i = 0;
+  int lastPaid = -1;
   for (int k = 0; k < nBins && i < cells.size(); k++) {
     size_t j = i;
     float price = 0.0f;
@@ -813,6 +832,15 @@ inline PierceChannelResult PierceChannel(Vec3 oLocal, Vec3 dLocal,
       j++;
     }
     if (j == i) continue;  // a gap in the matter: nothing to pay
+    if (exitGapBins > 0 && lastPaid >= 0 && k - lastPaid > exitGapBins) {
+      // Out of this body's matter, into the gap it wraps.
+      r.exited = true;
+      r.gapExit = true;
+      r.tExit = (cells[i - 1].t + 0.5f) / s;
+      r.tStop = r.tExit;
+      r.binStop = lastPaid + 1;
+      return r;
+    }
     const float norm = area / (float)std::max(geomCount(k), 1);
     price *= norm;
     if (k == 0) r.firstLayerJ = price;
@@ -839,6 +867,7 @@ inline PierceChannelResult PierceChannel(Vec3 oLocal, Vec3 dLocal,
       tally(cells[a].mat, costOf(cells[a].mat) * norm);
       r.cells++;
     }
+    lastPaid = k;
     i = j;
   }
   if (i < cells.size()) {
