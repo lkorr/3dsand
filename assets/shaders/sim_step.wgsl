@@ -4930,13 +4930,25 @@ fn gasLeaveKey(local : u32) -> u32 {
 // resident -- the only way a primary step (a unit step) can leave -- count it
 // into GAS_SP_EDGECH. Every dirty chunk is initialised, edge or not, because
 // the CA reads the word of every chunk it runs.
+//
+// "Resident" here MUST be the question inBounds asks of this chunk's cells,
+// or a chunk whose cells can leave is not called an edge: it goes SPARSE, and
+// the leave tail in main (which finds a leaver's chunk through the DENSE list)
+// resolved it from a stale list slot and moved a word in an unrelated chunk
+// (audit DET-2, 2026-10-14). A WINDOW cell is in bounds only inside the window
+// (inBounds), so a window slot asks chunkInWindow -- a ticket box flush
+// against the window face does not stop its face chunks being edges. A ticket
+// cell is in bounds anywhere resident, so a ticket slot asks chunkResident.
 fn caChunkAtEdge(ci : u32) -> bool {
   let wc = slotWorldChunk(ci, T.origin);
+  let isTicket = ci >= NUM_CHUNKS;
   var edge = false;
   for (var dz = -1; dz <= 1; dz++) {
     for (var dy = -1; dy <= 1; dy++) {
       for (var dx = -1; dx <= 1; dx++) {
-        if (!chunkResident(wc + vec3<i32>(dx, dy, dz), T.origin)) { edge = true; }
+        let nc = wc + vec3<i32>(dx, dy, dz);
+        let res = select(chunkInWindow(nc, T.origin), chunkResident(nc, T.origin), isTicket);
+        if (!res) { edge = true; }
       }
     }
   }
@@ -5990,6 +6002,11 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     workgroupBarrier();
     let nl = min(atomicLoad(&wgLvN), GAS_LV_MAX);
     for (var k = li; k < nl; k += CA_WG) {
+      // A SPARSE workgroup holds no edge chunk (caChunkAtEdge), so it never
+      // defers; if it ever did, `first + j` below would name a stale DENSE
+      // list slot, not the leaver's chunk. Count the broken invariant and
+      // leave the voxel where it is (it was never written) instead.
+      if (!dense) { atomicAdd(&gasSpawn[GAS_SP_OVERRUN], 1u); continue; }
       let ent = wgLvCell[k];
       let j = (ent >> 12u) & 1u;
       let lm = ent & 0xFFFu;
