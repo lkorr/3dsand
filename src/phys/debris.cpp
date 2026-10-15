@@ -5035,11 +5035,23 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
     // It pays the whole of it NOW, as an amputation: the gout's droplets in
     // one burst, the drip budget and the sever's thrown voxels as whole
     // blood voxels, every one out from where the piece was.
+    //
+    // THE PIECE'S OWN MATTER GOES FIRST, AND THE BURST TAKES ONLY HALF THE
+    // RING. The burst is ~600 spawns at default tuning and shares this tick's
+    // spawn vector with every other emitter, whose matter is LOST, silently,
+    // once the vector reaches kMaxParticleSpawnsPerTick (VoxelsToParticles'
+    // "ring full" return, CarveMobsRadial's carved flesh after this). Emitted
+    // before the remainder and uncapped, a handful of bloody pieces in one
+    // blast filled the ring with blood and deleted the bone and flesh of every
+    // body processed after them. So the remainder is emitted first, and a
+    // burst stops once the ring is half full: the gout is a budget, the
+    // matter is conserved, and the matter keeps the other half.
+    const size_t restN = fine ? b.skinVoxels.size() : b.voxels.size();
+    VoxelsToParticles(b, b.voxels, lin, ang, world, spawns);
     if (b.bleedMat != 0 && lostN > 0) {
       const auto& gore = CurrentTuning().gore;
       const int ms = std::max(2, gore.microScale);
       const uint32_t fluid = cutFluid != 0 ? cutFluid : b.bleedMat;
-      const size_t restN = fine ? b.skinVoxels.size() : b.voxels.size();
       const float wholeVox =
           carvedWorldVox + (float)restN / (lostScale * lostScale * lostScale);
       const Vec3 at = woundW;
@@ -5053,7 +5065,7 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
                                          std::max(0.0f, gore.bleedGain) * scale);
       const float sprd = gore.severGobbetSpread;
       for (int k = 0; k < nVox + nDrop; k++) {
-        if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+        if (spawns.size() >= kMaxParticleSpawnsPerTick / 2) break;
         const bool drop = k >= nVox;
         const uint32_t h = rng::Hash3(b.serial * 2246822519u, (uint32_t)k, 0xB1A57u);
         Vec3 dir{rng::SignedUnit(h),
@@ -5070,7 +5082,6 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
                                     drop ? gore.microLifeTicks : 0, drop ? ms : 0));
       }
     }
-    VoxelsToParticles(b, b.voxels, lin, ang, world, spawns);
     ReleaseBody(b);
     bodies_[bi] = std::move(bodies_.back());
     bodies_.pop_back();
