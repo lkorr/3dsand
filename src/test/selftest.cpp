@@ -541,6 +541,7 @@ const char* const kOrder[] = {
     // the way out, beside `kit-instance` for the same standing world.
     "dual-wield",
     "armor-fit",
+    "armor-loot-fit",
     // Pure anim over its own five-part fixture — it touches no shared World and
     // so is order-independent; it sits here to keep the armour gates together.
     "armor-track", "armor-stock",

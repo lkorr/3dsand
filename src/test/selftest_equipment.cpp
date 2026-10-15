@@ -46,6 +46,7 @@
 #include "game/strokes.h"
 #include "sim/tuning.h"
 #include "game/worlditems.h"
+#include "game/wornfit.h"  // armor-fit 3b: damage moved between fits
 #include "sim/microbody.h"
 #include "test/selftest.h"
 #include "test/support.h"
@@ -1620,6 +1621,72 @@ Status GateArmorFit(Ctx& c, std::string& detail) {
     check(dn.size() == 8, "shrinking gives the smaller box, filled");
   }
 
+  // ---- 3b. DAMAGE MOVES BETWEEN FITS (game/wornfit.h) ----------------------
+  //
+  // Ticket 2026-10-14_22-29-47: a piece's damage is its exact lattice IN THE
+  // FIT IT WAS RECORDED ON, and a looted jerkin put that lattice -- Zeus's
+  // size -- onto the player's shell. A hollow authored panel, fitted big
+  // (the dead wearer), holed on its +x half and coated in one corner, then
+  // moved onto the authored fit (the next wearer):
+  //   * recognised as foreign (and the big fit's own record as its own);
+  //   * the big fit recovered from the holed record and its spawn count;
+  //   * the result is a SUBSET of the fresh fit -- never the old body's size;
+  //   * the hole came across (cells lost, on the +x half only) and the coat
+  //     with it.
+  {
+    const IVec3 a{6, 8, 4};
+    ItemCover cv;
+    cv.size = a;
+    for (int z = 0; z < a.z; z++)
+      for (int y = 0; y < a.y; y++)
+        for (int x = 0; x < a.x; x++)
+          if (x == 0 || y == 0 || z == 0 || x == a.x - 1 || y == a.y - 1 ||
+              z == a.z - 1)
+            cv.voxels.push_back(PrefabVoxel{(int16_t)x, (int16_t)y, (int16_t)z,
+                                            5, (uint8_t)(1 + y)});
+    const IVec3 big{9, 12, 6};
+    const std::vector<PrefabVoxel> bigFresh = ResampleLattice(cv.voxels, a, big);
+    std::vector<PrefabVoxel> worn;   // the dead wearer's, damaged
+    for (PrefabVoxel v : bigFresh) {
+      if (v.x >= 6 && v.y >= 3 && v.y <= 8) continue;   // a hole, +x side
+      if (v.x == 0 && v.y == 0) v.stain = 0x1234;        // a coat, one edge
+      worn.push_back(v);
+    }
+    const std::vector<PrefabVoxel>& fresh = cv.voxels;   // the next wearer
+    check(wornfit::LatticeFitsShell(worn, (uint32_t)bigFresh.size(), bigFresh),
+          "a record goes back whole on the fit it was made on");
+    check(!wornfit::LatticeFitsShell(worn, (uint32_t)bigFresh.size(), fresh),
+          "and is recognised as another body's fit on a different one");
+    const IVec3 inferred =
+        wornfit::InferFitDims(cv, worn, (uint32_t)bigFresh.size());
+    check(inferred.x == big.x && inferred.y == big.y && inferred.z == big.z,
+          "the fit a holed record was made at is recovered from it");
+    const std::vector<PrefabVoxel> moved =
+        wornfit::RefitShellLattice(cv, worn, (uint32_t)bigFresh.size(), fresh);
+    wornfit::LatticeBox fb;
+    fb.Build(fresh, a);
+    bool subset = true, coat = false;
+    for (const PrefabVoxel& v : moved) {
+      subset &= fb.Find(v.x, v.y, v.z) >= 0;
+      if (v.stain == 0x1234) coat = true;
+    }
+    uint32_t lostLeft = 0, lostRight = 0;
+    wornfit::LatticeBox mb;
+    mb.Build(moved, a);
+    for (const PrefabVoxel& v : fresh)
+      if (mb.Find(v.x, v.y, v.z) < 0) (v.x >= 4 ? lostRight : lostLeft)++;
+    check(subset && moved.size() < fresh.size(),
+          "moved onto the authored fit it is a holed SUBSET of that fit -- "
+          "never the old body's size");
+    check(lostRight > 0 && lostLeft == 0,
+          "the hole came across on the side it was made, and only there");
+    check(coat, "and the coat came with it");
+    std::printf("  refit: %zu cells on the big fit, %zu worn -> %zu of %zu on "
+                "the authored fit (lost %u +x, %u -x), fit recovered %d/%d/%d\n",
+                bigFresh.size(), worn.size(), moved.size(), fresh.size(),
+                lostRight, lostLeft, inferred.x, inferred.y, inferred.z);
+  }
+
   // ---- 4. THE BRICK. A resampled shell must not draw through the def's -----
   int avDef = -1;
   for (size_t i = 0; i < mobs.Defs().size(); i++)
@@ -1742,6 +1809,138 @@ Status GateArmorFit(Ctx& c, std::string& detail) {
 
   detail = Format("%d checks", checks);
   std::printf("armor-fit: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ============================================================================
+// armor-loot-fit — A LOOTED PIECE IS THE NEXT WEARER'S SIZE, AND KEEPS ITS
+// DAMAGE (ticket 2026-10-14_22-29-47).
+//
+// The shipped jerkin on the shipped `zeus` (a torso half again the stock
+// human's), holed, taken off, and put on the stock human the player is.
+// Asserted per shell: the precondition that Zeus's fit really is another fit
+// (his record is NOT a subset of the human's fresh shell -- else this gate
+// proves nothing), and then that the human's shell is a subset of the
+// human's own fresh fit (never Zeus's size), that the holed shell lost cells,
+// and that a second take-off/put-on on the human is exact (the record is now
+// the human's own fit and goes back whole).
+// ============================================================================
+
+Status GateArmorLootFit(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  bool ok = true;
+  auto fail = [&](const std::string& s) {
+    ok = false;
+    std::printf("armor-loot-fit: FAILED %s\n", s.c_str());
+  };
+  const int zeusDef = mobs.FindDef("zeus");
+  const int humanDef = mobs.FindDef(kAvatarDefName);
+  const ItemDef* jerkin = c.items.Named("jerkin");
+  if (zeusDef < 0 || humanDef < 0 || jerkin == nullptr || jerkin->cover.empty()) {
+    detail = "no zeus / human def, or no jerkin";
+    std::printf("armor-loot-fit: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  const int slot = EquipSlotFor(jerkin->kind, Equipment{});
+  mobs.Reset();
+  const IVec3 wOrg = c.world.WindowOrigin();
+  auto spawnAt = [&](int def, int dx) {
+    const int sx = wOrg.x * (int)kChunk + 160 + dx, sz = wOrg.z * (int)kChunk + 160;
+    const int h = World::TerrainHeight(sx, sz, kDefaultSeed);
+    return mobs.Spawn(def, {sx, h + 1, sz});
+  };
+  const uint64_t zid = spawnAt(zeusDef, 0), hid = spawnAt(humanDef, 12);
+  Mob* zeus = mobs.FindMobById(zid);
+  Mob* man = mobs.FindMobById(hid);
+  if (!zeus || !man) {
+    detail = "spawn refused";
+    std::printf("armor-loot-fit: FAIL (%s)\n", detail.c_str());
+    mobs.Reset();
+    return Status::Fail;
+  }
+  // The piece's shells on a wearer, in cover order: (cover index, lattice).
+  auto shells = [&](Mob* m) {
+    std::vector<std::vector<PrefabVoxel>> out(jerkin->cover.size());
+    for (int p = 0; p < m->WornPieceCount(); p++) {
+      const std::vector<int>& s = m->WornSlotsAt(p);
+      for (int sl : s) {
+        const std::string& nm = m->LimbDefAt(sl).name;
+        if (nm.rfind("worn:jerkin:", 0) != 0) continue;
+        const std::string part = nm.substr(12);
+        for (size_t ci = 0; ci < jerkin->cover.size(); ci++)
+          if (jerkin->cover[ci].part == part) m->LatticeOfSlot(sl, out[ci]);
+      }
+    }
+    return out;
+  };
+  // HOLED ON ZEUS: a blast through the middle of the torso panel.
+  if (!zeus->WearItem(jerkin, slot)) fail("the jerkin does not go on zeus");
+  int torsoCover = -1;
+  for (size_t ci = 0; ci < jerkin->cover.size(); ci++)
+    if (jerkin->cover[ci].part == "torso") torsoCover = (int)ci;
+  for (int p = 0; p < zeus->WornPieceCount(); p++)
+    for (int sl : zeus->WornSlotsAt(p))
+      if (zeus->LimbDefAt(sl).name == "worn:jerkin:torso") {
+        const uint32_t n = mobs.LimbVoxelCount(zid, sl);
+        std::vector<ParticleSpawn> sp;
+        mobs.CarveLimbRadial(mobs.LimbBody(zid, sl),
+                             mobs.LimbVoxelPos(zid, sl, n / 3), 1.2f, false,
+                             false, c.world, sp);
+      }
+  WornDamage dmg;
+  if (!zeus->CaptureWorn(slot, dmg) || dmg.Empty())
+    fail("the holed jerkin captured no damage off zeus");
+  zeus->UnwearItem(slot);
+
+  // THE HUMAN'S OWN FIT, fresh -- the reference.
+  man->WearItem(jerkin, slot);
+  const auto fresh = shells(man);
+  man->UnwearItem(slot);
+  // ...and the looted one.
+  man->WearItem(jerkin, slot, &dmg);
+  const auto looted = shells(man);
+  std::string lines;
+  bool foreign = false, holed = false;
+  for (size_t ci = 0; ci < jerkin->cover.size(); ci++) {
+    const std::vector<PrefabVoxel>& f = fresh[ci];
+    const std::vector<PrefabVoxel>& l = looted[ci];
+    if (f.empty()) continue;
+    wornfit::LatticeBox fb;
+    fb.Build(f, wornfit::LatticeExtent(f));
+    uint32_t outside = 0;
+    for (const PrefabVoxel& v : l) outside += fb.Find(v.x, v.y, v.z) < 0;
+    const bool rec = ci < dmg.shells.size() && !dmg.shells[ci].lattice.empty();
+    const bool recForeign =
+        rec && !wornfit::LatticeFitsShell(dmg.shells[ci].lattice,
+                                          dmg.shells[ci].atSpawn, f);
+    foreign |= recForeign;
+    if ((int)ci == torsoCover) holed = l.size() < f.size();
+    const IVec3 fe = wornfit::LatticeExtent(f), le = wornfit::LatticeExtent(l);
+    lines += Format("%s: fresh %zu (%dx%dx%d), looted %zu (%dx%dx%d), %u outside "
+                    "the fit, record %s | ",
+                    jerkin->cover[ci].part.c_str(), f.size(), fe.x, fe.y, fe.z,
+                    l.size(), le.x, le.y, le.z, outside,
+                    !rec ? "none" : recForeign ? "zeus's fit" : "this fit");
+    if (outside) fail(jerkin->cover[ci].part + ": the looted shell reaches outside the wearer's fit");
+  }
+  if (!foreign)
+    fail("precondition: zeus's record fits the human's shell -- the fits do not differ, "
+         "so nothing here was tested");
+  if (!holed) fail("the torso hole did not come across");
+  // Off and on again on the human: now its own fit, exact.
+  WornDamage again;
+  man->CaptureWorn(slot, again);
+  man->UnwearItem(slot);
+  man->WearItem(jerkin, slot, &again);
+  const auto twice = shells(man);
+  bool exact = true;
+  for (size_t ci = 0; ci < twice.size(); ci++) exact &= twice[ci].size() == looted[ci].size();
+  if (!exact) fail("a second take-off/put-on on the same body did not round-trip");
+  man->UnwearItem(slot);
+  mobs.Reset();
+  c.debris.Reset();   // the carve's shed scraps
+  detail = lines + (exact ? "re-worn exact" : "re-worn DIFFERS");
+  std::printf("armor-loot-fit: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -3195,6 +3394,7 @@ const std::vector<Gate>& EquipmentGates() {
       // Mostly a pure function over integers, plus one rig assertion. Cheap,
       // and it wants nothing any other gate leaves behind.
       {"armor-fit", "equipment", {"prefab"}, false, GateArmorFit},
+      {"armor-loot-fit", "equipment", {"prefab"}, false, GateArmorLootFit},
       // Pure anim over a five-part fixture: no world, no physics, no defs. It
       // declares no dependency because it genuinely has none.
       {"armor-track", "equipment", {}, false, GateArmorTrack},

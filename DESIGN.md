@@ -25168,6 +25168,20 @@ wide short one". A resampled shell packs its own copy-on-write brick and frees
 it on unwear; at ratio 1 (the stock set on the stock human) nothing is
 resampled and the def's brick is shared, exactly as a body limb shares its.
 
+**Damage crosses fits** (2026-10-14, a looted jerkin worn at its dead owner's
+size). A piece's damage is its exact lattice IN THE FIT IT WAS RECORDED ON.
+`WearOnRig` puts it back whole only when it is this wearer's fit
+(`wornfit::LatticeFitsShell`: every recorded cell is a cell of the fresh shell
+and the spawn counts agree -- your own clothes off and on again, exact). A
+record from another fit is moved through the AUTHORED lattice
+(`wornfit::RefitShellLattice`, `game/wornfit.h`): both fits are recovered
+(`InferFitDims`, the box whose resample of the cover holds every recorded cell
+with the recorded spawn count), an authored cell is lost when most of the
+cells it became on the old body are gone, and the fresh shell keeps the cells
+whose authored cell survived, wearing their matter, colour and coat. Holes
+travel at the authored lattice's resolution. Gates `armor-fit` (3b, the pure
+functions) and `armor-loot-fit` (the shipped jerkin, zeus -> human).
+
 ### Two hands (dual wielding, 2026-09-27)
 
 Each hand is a KIT SLOT (`EquipSlotId::HandR` / `HandL`, `game/equipment.h`;
