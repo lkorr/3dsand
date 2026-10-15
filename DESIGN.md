@@ -13206,6 +13206,16 @@ debris for the network). All of that is gone.
   wooden sylvan (~610) rides high. Asleep limbs are skipped (a corpse at rest
   costs nothing); a corpse woken by the chunks round it changing activates
   its wet limbs once, so water arriving over a corpse lifts it.
+- **A severed limb floats by the SAME rule (2026-10-14; `phys/floatrho.h`,
+  gate `corpse-float`'s severed arm).** One function (`FloatRho` +
+  `FloatingDensity`) gives the density for both floaters: the rig's
+  `Mob::LimbFloatDensity` and debris's `DebrisSystem::BodyMatterDensity`
+  (the body plus its strapped followers). A body that came off a creature
+  (`Body::dead`) loses `corpseAirFraction` as its rig limb did. Before this,
+  debris floated by its single most common material (`domMat`), so an arm
+  cut off a floating human floated as muscle (1,060) and sank. Plain debris
+  gets the mean too, so a mixed body floats by all of its matter; a
+  one-material body is unchanged.
 - **A loose rig falling into water goes in, metres deep (2026-10-11;
   `Mob::FloatLimpLimbs`, gate `water-entry`).** Jolt's per-limb drag is
   quadratic and clamped never to reverse a velocity, so at fall speeds every

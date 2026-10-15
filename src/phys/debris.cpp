@@ -15,6 +15,7 @@
 #include <unordered_set>
 
 #include "phys/bodystain.h"
+#include "phys/floatrho.h"
 #include "phys/lattice.h"
 #include "phys/marching_cubes.h"
 #include "measure/perfscope.h"
@@ -2687,6 +2688,42 @@ bool DebrisSystem::SettleFootprintSupported(const std::vector<DebrisVoxel>& src,
 // what lets a raft that has come to rest stay asleep (rule 2) — buoyancy is not
 // applied to a sleeping body and therefore cannot be the reason one never
 // sleeps.
+// The mean density of `b`'s matter and everything strapped to it (a severed
+// forearm's bracer is a kinematic follower with no buoyancy of its own, so it
+// weighs on its host as a worn shell weighs on a rig limb). Cached on the
+// body, keyed on the voxel counts; only a wet, awake body asks, so the
+// follower scan is paid by the few bodies actually in water.
+float DebrisSystem::BodyMatterDensity(Body& b) {
+  auto count = [](const Body& x) {
+    return (uint32_t)(x.HasFineSkin() ? x.skinVoxels.size() : x.voxels.size());
+  };
+  auto add = [&](FloatRho& acc, const Body& x) {
+    if (x.HasFineSkin())
+      acc.Add(x.skinVoxels, x.micro.skinScale, densityOf_);
+    else
+      acc.Add(x.voxels, x.physScale, densityOf_);
+  };
+  uint32_t key = count(b);
+  for (const Body& f : bodies_)
+    if (f.wornHost == b.handle && &f != &b) key += count(f) + 1u;
+  if (key == b.floatRhoKey && b.floatRho > 0) return b.floatRho;
+  FloatRho acc;
+  add(acc, b);
+  for (const Body& f : bodies_)
+    if (f.wornHost == b.handle && &f != &b) add(acc, f);
+  b.floatRhoKey = key;
+  b.floatRho = acc.Rho();
+  return b.floatRho;
+}
+
+float DebrisSystem::FloatingDensityOf(uint64_t handle) {
+  for (Body& b : bodies_)
+    if (b.handle == handle && handle != 0)
+      return FloatingDensity(BodyMatterDensity(b), b.dead,
+                             CurrentTuning().ragdoll.corpseAirFraction);
+  return 0.0f;
+}
+
 void DebrisSystem::FloatBodies(uint32_t tick, World& world) {
   (void)tick;
   if (!phys_ || bodies_.empty()) return;
@@ -2763,8 +2800,14 @@ void DebrisSystem::FloatBodies(uint32_t tick, World& world) {
     // the same ratio sim_particle.wgsl uses for a voxel in flight, off the same
     // `density` field. `lift` scales it toward neutral rather than toward zero:
     // a half-lift material should be half as buoyant, not weightless.
+    //
+    // rhoBody is the body's WHOLE matter (phys/floatrho.h), not its most
+    // common material: until 2026-10-14 a severed arm floated as muscle alone
+    // and sank off a corpse that floated. A piece that came off a creature
+    // (`dead`) loses the corpse's air fraction exactly as the rig's limb did.
     const float rhoF = (float)matGpu_[mat].density;
-    const float rhoB = (float)std::max(1, matGpu_[b.domMat].density);
+    const float rhoB = FloatingDensity(BodyMatterDensity(b), b.dead,
+                                       CurrentTuning().ragdoll.corpseAirFraction);
     const float full = rhoF / rhoB;
     const float buoy = 1.0f + (full - 1.0f) * ((float)lift / (float)kFluidMax);
     if (phys_->ApplyBuoyancy(b.handle, (float)surfY, buoy, linDrag, angDrag,

@@ -22,6 +22,7 @@
 #include "game/rigrender.h"
 #include "game/sidecar.h"
 #include "phys/bodystain.h"
+#include "phys/floatrho.h"
 #include "phys/lattice.h"
 #include "sim/bytestream.h"
 #include "sim/mattable.h"
@@ -28600,26 +28601,20 @@ float Mob::LimbFloatDensity(int li) {
     key += (uint32_t)(l.HasFineSkin() ? l.skinVoxels.size() : l.voxels.size());
   }
   if (key == host.floatRhoKey && host.floatRho > 0) return host.floatRho;
+  // phys/floatrho.h: the same sum DebrisSystem::FloatBodies takes over a
+  // severed limb, so the piece floats as it did on the body.
   const std::vector<float>& rhoOf = sys_->densityOf_;
-  double mass = 0, vol = 0;
+  FloatRho acc;
   for (size_t j = 0; j < limbs_.size(); j++) {
     const MobLimb& l = limbs_[j];
     if ((int)j != li && l.wornHost != li) continue;
-    const bool fine = l.HasFineSkin();
-    const double s = (double)std::max(1u, fine ? SkinScaleOf(l) : PhysScaleOf(l));
-    const double cell = 1.0 / (s * s * s);
-    auto add = [&](uint32_t mat) {
-      if (mat == 0 || mat >= rhoOf.size()) return;
-      mass += rhoOf[mat] * cell;
-      vol += cell;
-    };
-    if (fine)
-      for (const PrefabVoxel& v : l.skinVoxels) add(v.material & 0xFFFu);
+    if (l.HasFineSkin())
+      acc.Add(l.skinVoxels, SkinScaleOf(l), rhoOf);
     else
-      for (const DebrisVoxel& v : l.voxels) add(v.payload & 0xFFFu);
+      acc.Add(l.voxels, PhysScaleOf(l), rhoOf);
   }
   host.floatRhoKey = key;
-  host.floatRho = vol > 0 ? (float)(mass / vol) : 1000.0f;
+  host.floatRho = acc.Rho();
   return host.floatRho;
 }
 
@@ -28711,7 +28706,7 @@ void Mob::FloatLimpLimbs(World& world, float dt, bool rouse, float liftMs2) {
     for (int k = 0; k < kMaxColumnWalk && isLiquid(matAt(cx, surfY, cz)); k++)
       surfY++;
     if (!active) phys_->ActivateBody(l.body);  // rouse: the water came to it
-    const float rhoB = std::max(1.0f, LimbFloatDensity((int)i) * (1.0f - air));
+    const float rhoB = FloatingDensity(LimbFloatDensity((int)i), true, air);
     const float buoy = (float)mg[mat].density / rhoB;
     // The limb's submerged fraction (its bounds against the waterline).
     const float topY = MetresToCells(bmax[1]);
