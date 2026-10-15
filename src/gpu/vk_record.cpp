@@ -192,6 +192,8 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::ElecR7:        return cx.caActive && cx.elecLive && cx.elecRounds > 7;
     // The body query (package E4): boxes this tick, whatever the CA did.
     case pass::Cond::ElecQuery:     return cx.elecQueries > 0;
+    case pass::Cond::FlowMeasure:      return cx.flowMeasure;
+    case pass::Cond::FlowMeasureClear: return cx.flowMeasureClear;
   }
   return false;
 }

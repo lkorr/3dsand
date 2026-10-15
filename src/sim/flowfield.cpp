@@ -736,6 +736,37 @@ void SetBuffer(const rhi::Buffer* buf) {
   gUploaded = 0xFFFFFFFFu;
 }
 
+Vec3 SampleMeasured(const uint32_t* grid, Vec3 p) {
+  const Vec3 zero{0.0f, 0.0f, 0.0f};
+  if (grid == nullptr || grid[2] == 0u) return zero;
+  const int n = (int)grid[2];
+  const float fx = (p.x - (float)(int32_t)grid[0]) / (float)kFlowStep;
+  const float fz = (p.z - (float)(int32_t)grid[1]) / (float)kFlowStep;
+  const int ix = (int)std::floor(fx), iz = (int)std::floor(fz);
+  if (ix < 0 || iz < 0 || ix >= n - 1 || iz >= n - 1) return zero;
+  const float tx = fx - (float)ix, tz = fz - (float)iz;
+  float vx = 0.0f, vz = 0.0f, top = -1e9f, bot = 1e9f;
+  for (int c = 0; c < 4; c++) {
+    const int dx = c & 1, dz = c >> 1;
+    const size_t k = kFlowHeaderWords + 2 * ((size_t)(iz + dz) * n + (ix + dx));
+    const int t = (int16_t)(grid[k + 1] & 0xFFFFu);
+    if (t == kFlowDry) continue;
+    const float w = (dx ? tx : 1.0f - tx) * (dz ? tz : 1.0f - tz);
+    vx += w * (float)(int16_t)(grid[k] & 0xFFFFu);
+    vz += w * (float)(int16_t)(grid[k] >> 16);
+    top = std::max(top, (float)t);
+    bot = std::min(bot, (float)(int16_t)(grid[k + 1] >> 16));
+  }
+  if (top < -1e8f || p.y > top + 1.5f || p.y < bot - 1.5f) return zero;
+  return Vec3{vx / (float)kFlowVelQ, 0.0f, vz / (float)kFlowVelQ};
+}
+
+Vec3 BlendMeasured(Vec3 solved, Vec3 measured) {
+  const float m = std::sqrt(measured.x * measured.x + measured.z * measured.z);
+  const float keep = 1.0f - std::clamp(m / kFlowMeasTakeover, 0.0f, 1.0f);
+  return Vec3{solved.x * keep + measured.x, 0.0f, solved.z * keep + measured.z};
+}
+
 void Upload(const rhi::Queue& queue) {
   if (gBuf == nullptr) return;
   const WaterFlowField& f = WaterFlow();

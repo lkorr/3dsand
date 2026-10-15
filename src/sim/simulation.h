@@ -704,6 +704,9 @@ class Simulation {
                    IVec3 originChunk);
   // The rain exposure map buffer, for a gate's readback (rain-lean) only.
   const rhi::Buffer& RainExpoBuffer() const { return rainExpoBuf_; }
+  // The measured flow's buffer (flowfield.h kFlowMeas*), for a gate's readback
+  // (`flow-measure`) only -- nothing on the frame path reads it back.
+  const rhi::Buffer& FlowMeasureBuffer() const { return flowMeasBuf_; }
 
   // ---- WIND DRAFTS: the shelter volume (sim_draft.wgsl, world.h kDraft*) ----
   // For the next EncodeTick: the gate (tuning sim.draftMode) and the tick's
@@ -1277,6 +1280,15 @@ class Simulation {
   // boltfx::Upload while a bolt burns.
   rhi::Buffer boltBuf_;
   rhi::Buffer flowGridBuf_;   // the terrain flow field's window grid (flowfield.h)
+  // THE MEASURED FLOW (flowfield.h kFlowMeas*): ACC | STATE | GRID, 61 in
+  // simBGL_ and the slim layout, 49 in renderBGL_, 36 in shadowBGL_. GPU-owned.
+  rhi::Buffer flowMeasBuf_;
+  rhi::ComputePipeline flowMeasFold_;   // flow_measure.wgsl `fold`
+  // Ticks the fold keeps recording after the last tick anything fed it
+  // (EncodeTick), and whether the last tick recorded it (so the tick after
+  // the tail records the one Fill that zeroes the published field).
+  uint32_t flowMeasTail_ = 0;
+  bool flowMeasLive_ = false;
   // The far horizon's height pyramid (sim/horizon.h): 45 in renderBGL_
   // (fragment, read). Built from the map at Init and every UploadEnvironment;
   // grow-only. renderBGBuilt_ says the render bind groups exist yet (Init

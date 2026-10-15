@@ -4450,13 +4450,17 @@ fn currentPrimAt(p : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
 // wind_streak, debug_current); LoadShader (resources.cpp kFlowBound*) keeps the
 // BOUND block for a body that declares `> flowGrid` and the stub for every
 // other, exactly as it does the draft reader; check_shaders.sh does the same.
+// A body that declares `flowGrid` declares `flowMeas` (the MEASURED flow's
+// buffer, below) beside it: raymarch, wind_streak and debug_current all do.
 // >>>FLOW_BOUND_BEGIN<<<
 const FLOW_BOUND : bool = true;
 fn flowWord(i : u32) -> u32 { return flowGrid[i]; }
+fn flowMeasWord(i : u32) -> u32 { return flowMeas[FLOWM_GRID + i]; }
 // >>>FLOW_BOUND_END<<<
 // >>>FLOW_UNBOUND_BEGIN<<<
 const FLOW_BOUND : bool = false;
 fn flowWord(i : u32) -> u32 { return 0u; }
+fn flowMeasWord(i : u32) -> u32 { return 0u; }
 // >>>FLOW_UNBOUND_END<<<
 // Must match flowfield.h kFlowStep / kFlowVelQ / kFlowDry / kFlowHeaderWords.
 const FLOW_STEP : f32 = 8.0;
@@ -4504,16 +4508,80 @@ fn flowGridAt(p : vec3f) -> vec3f {
   return vec3f(v.x * prof, 0.0, v.y * prof);
 }
 
+// ==================== THE MEASURED FLOW (render side) =======================
+// src/sim/flowfield.h kFlowMeas*, DESIGN.md §9d.12. The solved field above is
+// a function of the MAP: it cannot see a dam somebody breached. This one is a
+// function of the water the simulation actually MOVED -- every lateral liquid
+// move of the CA and every MPM particle, summed per node, smoothed in time
+// and space by flow_measure.wgsl's fold -- so a breach pulls the current
+// toward it and the field relaxes back once the flood has settled. The GRID
+// region of `flowMeas` is the flowGrid layout exactly, except that the second
+// word is the BAND of water that moved (top | bot) instead of surf | bed:
+//   [0] origin x  [1] origin z  [2] nodes per axis, 0 = none  [3] fold tick
+//   per node: w0 = vx | vz (i16, 1/FLOW_VEL_Q cells/s), w1 = top | bot (i16,
+//   world cells; top == FLOW_DRY where nothing flows).
+// RENDER-ONLY, and that is the whole safety argument: the sim never reads it,
+// the CPU never reads it back on the frame path, and the player's swim stroke
+// (CurrentAtCpuSim) feels the solved field only.
+// Must match flowfield.h kFlowMeasGridBase / kFlowMeasTakeover.
+const FLOWM_GRID : u32 = 35912u;
+const FLOW_MEAS_TAKEOVER : f32 = 4.0;
+
+// World cells/s at `p`, horizontal. TRANSCRIBED from -- and by --
+// flowfield::SampleMeasured (flowfield.cpp): same weights, same words, same
+// band gate. No depth profile: what moved is the band, and it moved as a body.
+fn flowMeasAt(p : vec3f) -> vec3f {
+  if (!FLOW_BOUND || TUNE_CURRENT_MEASURED <= 0.0) { return vec3f(0.0); }
+  let n = i32(flowMeasWord(2u));
+  if (n == 0) { return vec3f(0.0); }
+  let fx = (p.x - f32(bitcast<i32>(flowMeasWord(0u)))) / FLOW_STEP;
+  let fz = (p.z - f32(bitcast<i32>(flowMeasWord(1u)))) / FLOW_STEP;
+  let ix = i32(floor(fx));
+  let iz = i32(floor(fz));
+  if (ix < 0 || iz < 0 || ix >= n - 1 || iz >= n - 1) { return vec3f(0.0); }
+  let tx = fx - f32(ix);
+  let tz = fz - f32(iz);
+  var v = vec2f(0.0);
+  var top = -1e9;
+  var bot = 1e9;
+  for (var c = 0; c < 4; c++) {
+    let dx = c & 1;
+    let dz = c >> 1u;
+    let k = FLOW_HEADER + 2u * u32((iz + dz) * n + (ix + dx));
+    let w1 = flowMeasWord(k + 1u);
+    let t = flowI16Lo(w1);
+    if (t == FLOW_DRY) { continue; }
+    let w0 = flowMeasWord(k);
+    let w = select(1.0 - tx, tx, dx == 1) * select(1.0 - tz, tz, dz == 1);
+    v += w * vec2f(f32(flowI16Lo(w0)), f32(flowI16Hi(w0)));
+    top = max(top, f32(t));
+    bot = min(bot, f32(flowI16Hi(w1)));
+  }
+  if (top < -1e8 || p.y > top + 1.5 || p.y < bot - 1.5) { return vec3f(0.0); }
+  return vec3f(v.x, 0.0, v.y) / FLOW_VEL_Q;
+}
+
+// The two fields together: the measured flow counts in full, the solved one
+// fades out under it (gone at FLOW_MEAS_TAKEOVER cells/s), so where the water
+// is really running the arrows say where, and everywhere else the map's
+// answer stands. flowfield::BlendMeasured is the CPU twin.
+fn flowBlend(solved : vec3f, measured : vec3f) -> vec3f {
+  let keep = 1.0 - clamp(length(measured.xz) / FLOW_MEAS_TAKEOVER, 0.0, 1.0);
+  return solved * keep + measured;
+}
+
 // THE FIELD, render side. World cells/s at world position `p`.
 //
 // There is no ambient term to add — unlike wind, which has weather everywhere,
-// still water is still. Two parts: the TERRAIN flow field above (the map's
-// rivers and lakes, solved from their shape), and the primitive list (events:
-// a drain's sink and whirlpool), because a river is somewhere and a wind is
-// everywhere.
+// still water is still. Three parts: the TERRAIN flow field above (the map's
+// rivers and lakes, solved from their shape), the MEASURED flow over it (what
+// the simulation's water is really doing: a breach, a flood, a pour), and the
+// primitive list (events: a drain's sink and whirlpool), because a river is
+// somewhere and a wind is everywhere.
 fn currentAt(p : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
   if ((*R).currentRenderOn == 0u) { return vec3f(0.0); }
-  return currentPrimAt(p, R) + flowGridAt(p);
+  return currentPrimAt(p, R) +
+         flowBlend(flowGridAt(p), flowMeasAt(p) * TUNE_CURRENT_MEASURED);
 }
 
 // CONVERGENCE of the field at a point, per second — negative divergence, so
@@ -4526,7 +4594,8 @@ fn currentAt(p : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
 // one compare outside the AABB. `e` is in world cells.
 fn currentConvergeAt(p : vec3f, R : ptr<uniform, RenderParams>) -> f32 {
   if ((*R).currentRenderOn == 0u) { return 0.0; }
-  if ((*R).currentPrimCount == 0u && (!FLOW_BOUND || flowWord(2u) == 0u)) { return 0.0; }
+  if ((*R).currentPrimCount == 0u &&
+      (!FLOW_BOUND || (flowWord(2u) == 0u && flowMeasWord(2u) == 0u))) { return 0.0; }
   let e = 1.5;
   let vx1 = currentAt(p + vec3f(e, 0.0, 0.0), R).x;
   let vx0 = currentAt(p - vec3f(e, 0.0, 0.0), R).x;

@@ -844,6 +844,7 @@
     "asyncCompute": false,
     "dbgCurrentSpacing": 6,
     "dbgCurrentRadius": 40,
+    "currentMeasured": 1,
     "bloodTransmit": 0.35,
     "bloodMaxTransmit": 0.03,
     "subMurkGlow": 2.2,

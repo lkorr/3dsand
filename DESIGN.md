@@ -24283,10 +24283,12 @@ FROM THE WATER'S SHAPE, §9d.10. The primitive list carries events only.
 ### 9d.4 The consumers, and the third transcription
 
 `currentAt` (render) is the primitive list PLUS the terrain flow field's window
-grid (`flowGridAt`, §9d.10); `CurrentAtCpu` / `CurrentAtCpuSim` add the same
-grid through `WaterFlowField::Sample`. `currentAtQ` (the GPU sim kernels) sums
-the primitives only -- the grid is not bound to any sim kernel, and
-`sim.currentMode` is off.
+grid (`flowGridAt`, §9d.10) with the MEASURED flow blended over it
+(`flowMeasAt`, §9d.12); `CurrentAtCpu` / `CurrentAtCpuSim` add the solved grid
+through `WaterFlowField::Sample` but NOT the measured flow, which is GPU-only
+and render-only (the swimmer is not pushed by a breach's flood -- §9d.12).
+`currentAtQ` (the GPU sim kernels) sums the primitives only -- neither grid is
+bound to any sim kernel as an input, and `sim.currentMode` is off.
 
 * **Render surface advection** -- component 9 evaluates wave phase at
   `position - current*age`. This is what makes flow read as flow. `age` is NOT
@@ -24607,6 +24609,87 @@ the river and the foam as marbling. The frame is therefore one of 16 FIXED
 directions, the pattern the variance-preserving blend of the two that bracket
 the local flow (`flowFrame`): each a rigid rotation of the world, a bend a
 crossfade between them.
+
+### 9d.12 The measured flow: the current follows the water the sim moves (added 2026-10-15)
+
+`src/sim/flowfield.h` `kFlowMeas*` (the layout), `assets/shaders/flow_measure.wgsl`
+(the fold), `common.wgsl` `flowMeasAt` / `flowBlend` (the reader), gate
+`flow-measure`. Ticket 2026-10-14_22-57-12: "a break in this dam should cause
+the arrows to point pretty dramatically in that direction, which should shift
+the other current arrows in the vicinity".
+
+**Why a second field.** §9d.10's field is solved from the MAP, so it is a pure
+function of (map, seed, position): exactly what makes it window-move proof,
+and exactly why it cannot see a dam somebody breached. The only honest answer
+to "which way is the water going" is the water the simulation is moving, so
+that is now recorded:
+
+* **The CA** (`sim_step.wgsl` `flowMeasNote`): every lateral liquid move --
+  `transferLiquid` (equalize, split, bridge, partial descents) and a liquid's
+  whole-cell `tryMove` (film steps, diagonal falls, displaces) -- adds
+  `eighths x displacement` to the node bin it LEFT (node k owns cells 8k-4 ..
+  8k+3, flowGrid's lattice), plus the band of rows that moved (atomicMax of
+  `y + bias` and `bias - y`). A vertical move is no current and adds nothing.
+* **The MPM particles** (`sim_fluid.wgsl` `mark`, `flowMeasParticle`): once a
+  tick, each live particle adds its horizontal velocity (one eighth x v cells).
+  A breach's torrent is largely excited particles, so the CA alone would have
+  shown only the trickle at the lip.
+
+The accumulator (ACC) is a torus of `kFlowMeasN` (= `kFlowWinNodes`, 67) slots
+per axis: the window spans fewer nodes than that, so within one tick no two
+nodes share a slot.
+
+**The fold** (`flow_measure.wgsl`, one thread per window-grid node, after the
+CA): a [1 2 1] tent over the node's 3 x 3 neighbourhood (the CA moves water in
+1-cell hops at a free surface, so the raw bins are lumpy, and the pull of a
+breach spreads), converted to cells/s by dividing the discharge per unit width
+by a reference depth (`FLOWM_DEPTH`, 0.5 cells: the CA moves a body's SURFACE,
+not its depth, so a fixed depth is the honest conversion; the value is the
+look's one calibration -- at 1.0 the gate's 0.8 m head through a 0.6 m gap read
+0.9 m/s, half of what that head drives), then followed in time -- tau 0.5 s up so a breach shows at once,
+1.5 s down so a flood fades instead of flickering, zero under 5 mm/s. STATE
+keeps each slot's velocity, its world node as a tag (a window move keeps every
+node still in view and starts the ones that scroll in from zero) and its band;
+GRID publishes it in flowGrid's own layout, except that the second word is the
+band (top | bot) the reader gates on (+-1.5 cells).
+
+**The blend** (`flowBlend`, CPU twin `flowfield::BlendMeasured`): the measured
+flow counts in full and the solved field fades out under it, gone at
+`kFlowMeasTakeover` (4 cells/s, 0.4 m/s). Where water really runs the arrows say
+where; everywhere else the map's answer stands. `render.currentMeasured` is the
+gain (0 const-folds the record out of the CA and `mark`, the read out of the
+renderers, and records no fold).
+
+**Authority: render-only, and that is the safety argument.** No sim kernel
+reads `flowMeasure`; it is not hashed, saved, replayed or sent; nothing reads
+it back on the frame path. The adds and maxes are integer and commute, so even
+the side buffer is a function of the moves, not of the schedule -- but nothing
+depends on that. The world hash does not move. The cost of the authority line:
+the player's swim stroke (`CurrentAtCpuSim`) feels only the solved field, so a
+swimmer is not carried by a breach's flood that the surface draws. Feeding it
+would need either an async readback of GRID (one tick latent, CPU-side render
+data) or a sim-side flux the CA itself produces deterministically -- an owner
+call, not done here.
+
+**Cost scales with activity.** The record is a few atomics per LATERAL liquid
+move (still water does not move, so a settled lake adds nothing) and per live
+particle. The fold is 67^2 threads, recorded only on ticks the CA ran (or the
+fluid seam ran the tick before -- `mark` records after PT_TICK, so the fold
+picks its particles up a tick late) and for `kFlowMeasTailTicks` (10 s) after,
+while the field decays; the tick after that one Fill zeroes STATE + GRID, and a
+settled world records nothing (`Cond::FlowMeasure` / `FlowMeasureClear`,
+`Simulation::EncodeTick`). The reader is flowGridAt's loop over different words,
+and it early-outs on the grid header once the tail's Fill has zeroed it.
+
+**Gate `flow-measure`** (harness, own worldgen, its own dammed box): a still
+reservoir publishes nothing at the dam (Q); a full-height gap is cut; 1.5 s
+later the gap runs east above the solved field (G), at least half the
+reservoir points on a 1.6 m arc round the gap have turned toward it (V), the
+flood east of it runs east (D); 30 s on, the gap and the ring have relaxed to
+<= 5% of their peak (R; the box's fastest node and its awake chunks are
+printed beside it -- the CA's last levelling far from the breach is real motion
+and reads as such). Thresholds `flowMeasure.*` in baseline.json; a trace every
+15 ticks prints gap / ring / box max and the fold's tick.
 
 ## 9c. The terrain viewer and the edit layer (added 2026-08-27)
 

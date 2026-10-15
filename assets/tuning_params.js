@@ -137,6 +137,7 @@ const TUNING_PARAMS = {
   'render.waveSimFoam':{t:'f',def:0.55,min:0,max:4,wgsl:'TUNE_WAVE_SIM_FOAM'},
   'render.dbgCurrentSpacing':{t:'f',def:6,min:1,max:64,wgsl:'TUNE_CUR_DBG_SPACING'},
   'render.dbgCurrentRadius':{t:'f',def:40,min:0,max:256,wgsl:'TUNE_CUR_DBG_RADIUS'},
+  'render.currentMeasured':{t:'f',def:1,min:0,max:4,wgsl:'TUNE_CURRENT_MEASURED'},
   'render.reflectionCutoff':{t:'f',def:0.06,min:0,max:1,wgsl:'TUNE_REFLECTION_CUTOFF'},
   'render.reflectionSteps':{t:'i',def:96,min:0,max:512,wgsl:'TUNE_REFLECTION_STEPS'},
   'render.causticGain':{t:'f',def:1.5,min:0,max:8,wgsl:'TUNE_CAUSTIC_GAIN'},

@@ -1377,6 +1377,10 @@ const char* const kOrder[] = {
     // Two liquids side by side drawn as one surface (own worldgen, own basin
     // at (224, ., 224), as blood-cloud; nothing after it reads that region).
     "liquid-seam",
+    // The measured current through a breached dam (own worldgen, own box at
+    // (288, ., 160)). BEFORE blast-water, whose own worldgen wipes the box, so
+    // nothing downstream inherits it.
+    "flow-measure",
     // A blast in a pond gives its water back (own worldgen, own basin).
     "blast-water",
     "snapshot-latency",

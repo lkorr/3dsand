@@ -429,6 +429,9 @@ fn pixelAngle() -> f32 { return 2.0 * R.tanHalfFov / max(R.viewPx, 1.0); }
 // CPU-written on window moves. currentAt adds it: the waves drift with it, the
 // foam gathers on its convergence and in its shear, the oil film rides it.
 @group(0) @binding(48) var<storage, read> flowGrid : array<u32>;
+// The MEASURED flow (renderBGL_ 49, flowfield.h kFlowMeas*; common.wgsl
+// flowMeasAt): currentAt blends it over flowGrid. Tick-written, render-only.
+@group(0) @binding(49) var<storage, read> flowMeas : array<u32>;
 const BOLT_ROW_GROUPS : u32 = 1u;
 const BOLT_ROW_LIGHTS : u32 = 129u;
 const BOLT_ROW_SEGS : u32 = 145u;

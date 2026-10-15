@@ -77,6 +77,39 @@ const PT_KERNEL : u32 = PT_K_STEP;
 // cleared by fill_gasOuter before the CA runs. So the splat below cannot move
 // a voxel or a hash — it is exactly as observable as `actVoxViz` at 23.
 @group(0) @binding(34) var<storage, read_write> gasOuter : array<atomic<u32>>;
+// ---- THE MEASURED FLOW'S ACCUMULATOR (src/sim/flowfield.h kFlowMeas*) ------
+// RENDER-ONLY, gasOuter's standing exactly: every lateral move of a liquid
+// adds its eighths x displacement to the node bin it left, so the renderer's
+// current arrows, streaks and foam can follow the water the simulation is
+// really moving (a breached dam, a flood) and not only the map's solved field.
+// The sim never reads it and the hash never covers it; the adds and maxes are
+// integer and commute, so even the side buffer is a function of the moves and
+// not of the schedule. flow_measure.wgsl folds it after the CA; a Fill zeroes
+// it. The MPM `mark` pass (sim_fluid.wgsl) adds its particles to the same bins.
+@group(0) @binding(61) var<storage, read_write> flowMeasAcc : array<atomic<i32>>;
+// Must match flowfield.h kFlowMeasN / kFlowMeasAccQ, sim_fluid.wgsl's copy of
+// this block and flow_measure.wgsl (check_invariants.py "measured flow").
+const FLOWM_N : i32 = 67;
+const FLOWM_ACC_Q : i32 = 16;
+const FLOWM_Y_BIAS : i32 = 1048576;
+// `eighths` of liquid left `src` for `dst` (reach 1). Binned by the source
+// cell onto the node lattice (node k owns cells 8k-4 .. 8k+3), the slot being
+// the node mod FLOWM_N -- the window spans fewer nodes than that, so within a
+// tick no two nodes share a slot. A vertical move is no current and costs
+// nothing; at render.currentMeasured 0 the whole body const-folds away.
+fn flowMeasNote(src : vec3<i32>, dst : vec3<i32>, eighths : u32) {
+  if (TUNE_CURRENT_MEASURED <= 0.0) { return; }
+  let d = dst - src;
+  if (d.x == 0 && d.z == 0) { return; }
+  let kx = ((((src.x + 4) >> 3u) % FLOWM_N) + FLOWM_N) % FLOWM_N;
+  let kz = ((((src.z + 4) >> 3u) % FLOWM_N) + FLOWM_N) % FLOWM_N;
+  let s = u32(kz * FLOWM_N + kx) * 4u;
+  let q = i32(eighths) * FLOWM_ACC_Q;
+  if (d.x != 0) { atomicAdd(&flowMeasAcc[s], d.x * q); }
+  if (d.z != 0) { atomicAdd(&flowMeasAcc[s + 1u], d.z * q); }
+  atomicMax(&flowMeasAcc[s + 2u], src.y + FLOWM_Y_BIAS);
+  atomicMax(&flowMeasAcc[s + 3u], FLOWM_Y_BIAS - src.y);
+}
 
 // gasSpawn's header. Words 0..2 are written HERE (the CA is the only producer
 // of edge conversions); words 3..7 are written by sim_gas.wgsl. Must agree with
@@ -1583,6 +1616,9 @@ fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, risi
   // a powder sliding out from under a solid may leave it floating
   let myKlass = materials[voxMat(myWord)].klass;
   if (myKlass == CLASS_POWDER) { flagSupportLoss(src, myKlass, voxMat(tw)); }
+  // A whole liquid cell moved (a film step, a diagonal fall into air, a
+  // lateral displace): the measured flow's record. Render-only.
+  if (myKlass == CLASS_LIQUID) { flowMeasNote(src, dst, voxState(myWord) + 1u); }
   return true;
 }
 
@@ -2259,6 +2295,7 @@ fn transferLiquid(src : vec3<i32>, dst : vec3<i32>, mat : u32,
   solTransfer(src, dst, sf, df, t);
   markDirtyR(src, DIRTY_R_MOVE);
   markDirtyR(dst, DIRTY_R_MOVE);
+  flowMeasNote(src, dst, t);   // the measured flow's record (render-only)
 }
 
 // faceDir and faceDirBit (the six face directions with their RDIR_* bits)

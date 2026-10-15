@@ -21,6 +21,10 @@
 // The terrain flow field (renderBGL_ 48, Vertex | Fragment; sim/flowfield.h):
 // currentAt adds it, so the arrows show the river the surface draws.
 @group(0) @binding(48) var<storage, read> flowGrid : array<u32>;
+// The MEASURED flow (renderBGL_ 49; flowfield.h kFlowMeas*): what the sim's
+// water is really doing, blended over flowGrid by currentAt -- so a breached
+// dam turns these arrows toward the breach.
+@group(0) @binding(49) var<storage, read> flowMeas : array<u32>;
 
 struct VSOut {
   @builtin(position) pos : vec4f,
