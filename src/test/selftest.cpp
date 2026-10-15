@@ -136,6 +136,9 @@ const std::vector<Gate>& BugReportGates();
 const std::vector<Gate>& AquaticGates();
 // The hit stagger (selftest_stagger.cpp): head / trunk blows on a walker.
 const std::vector<Gate>& StaggerGates();
+// Distant NPCs D2a (selftest_distant_calib.cpp): the duel matrix that
+// calibrates the distant tier's abstract hit model, and its resolver's unit arm.
+const std::vector<Gate>& DistantCalibGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -1426,6 +1429,14 @@ const char* const kOrder[] = {
     // its regenerate lands on later fixtures (measured: player-corpse's corpse
     // at inset 360 never slept, picking the stains up by contact).
     "infect-perf",
+    // The distant tier's calibration (docs/PLAN_distant_npcs.md D2a), as late
+    // as a world-touching gate can go and for infect-perf's reason: whole
+    // rounds of fights in fresh worlds (its own id base, Jolt's body-id
+    // history rewound each round, as mob-cap64-twice does), blood over the
+    // harness window. It restores the id counter and regenerates worldgen on
+    // the way out, and only voxregion / worldedit (which regenerate again)
+    // run after it.
+    "distant-calib-matrix",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it
@@ -1453,7 +1464,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(), &ItemStageGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &DungeonEntityGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates(), &StaggerGates()})
+                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &DungeonEntityGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates(), &StaggerGates(), &DistantCalibGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

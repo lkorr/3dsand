@@ -603,6 +603,10 @@ add_library(sandvox_core OBJECT
   src/game/flaskchem.cpp
   src/game/alchemy_bench.cpp
   src/game/strokes.cpp
+  # THE DISTANT TIER'S HIT MODEL (docs/PLAN_distant_npcs.md D2a): the pure
+  # resolver + its calibration table, and the stroke log that measures it.
+  src/game/distant_combat.cpp
+  src/game/stroke_log.cpp
   # Is this pose inside itself? (game/selfclip.h) — voxel-level limb
   # interpenetration, differenced against the bind pose.
   src/game/selfclip.cpp
@@ -708,6 +712,8 @@ add_library(sandvox_core OBJECT
   src/test/selftest_dye.cpp
   src/test/selftest_wound.cpp
   src/test/selftest_archer.cpp
+  # distant NPCs D2a: gate distant-calib-matrix (the duel matrix + resolver).
+  src/test/selftest_distant_calib.cpp
   src/test/selftest_aquatic.cpp
   src/test/selftest_stagger.cpp
   src/test/selftest_solute.cpp

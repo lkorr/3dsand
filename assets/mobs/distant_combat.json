@@ -1,0 +1,514 @@
+{
+  "_about": "THE DISTANT TIER'S HIT MODEL, MEASURED (docs/PLAN_distant_npcs.md 2.6; game/distant_combat.h reads it). Produced by the duel-matrix gate distant-calib-matrix (src/test/selftest_distant_calib.cpp): full-fidelity fights through the real tick -- weapon class x armour x creature kind, archers, a 4v3 -- with every NPC stroke STARTED logged with its outcome (game/stroke_log.h), reduced to per-style hit rates, role weights and effective power, block chance per guard class, armour exposure, bleed and burn laws, ranged hit rate vs distance and target speed, and the asymmetric matchups' win rates and time-to-kill (ticks, 30 Hz). REGENERATE after any melee/gore/AI tuning change: bash scripts/run.sh ./build/Release/sandvox.exe --verify distant-calib-matrix with SANDVOX_DISTANT_CALIB=assets/mobs/distant_combat.json in the environment (matrix size: tests/baseline.json distantCalib.calib*). This file: 8 rounds x 12 melee bouts + 2 ranged bouts, 4936 strokes (4936 counted: 2787 hits, 224 blocked/parried, 1733 misses), 147 arrows.",
+  "version": 1,
+  "minSamples": 8,
+  "reachSlack": 2.0,
+  "styles": {
+    "*": {
+      "n": 4936,
+      "hits": 2787,
+      "blocked": 224,
+      "hitRate": 0.5915,
+      "meanPower": 0.9757,
+      "powerCv": 1.0,
+      "impactTicks": 12.4099,
+      "roleWeights": {
+        "head": 0.1263,
+        "torso": 0.3326,
+        "arm": 0.3732,
+        "leg": 0.1679
+      }
+    },
+    "bite": {
+      "n": 82,
+      "hits": 48,
+      "blocked": 11,
+      "hitRate": 0.6715,
+      "meanPower": 0.4534,
+      "powerCv": 1.0,
+      "impactTicks": 11.2742,
+      "roleWeights": {
+        "head": 0.202,
+        "torso": 0.4487,
+        "arm": 0.2979,
+        "leg": 0.0514
+      },
+      "byWeapon": {
+        "jaws": {
+          "n": 82,
+          "hits": 48,
+          "blocked": 11,
+          "hitRate": 0.6758,
+          "meanPower": 0.3969
+        }
+      }
+    },
+    "bite_lunge": {
+      "n": 118,
+      "hits": 52,
+      "blocked": 17,
+      "hitRate": 0.5178,
+      "meanPower": 0.8702,
+      "powerCv": 1.0,
+      "impactTicks": 11.1806,
+      "roleWeights": {
+        "head": 0.384,
+        "torso": 0.2202,
+        "arm": 0.3838,
+        "leg": 0.012
+      },
+      "byWeapon": {
+        "jaws": {
+          "n": 118,
+          "hits": 52,
+          "blocked": 17,
+          "hitRate": 0.515,
+          "meanPower": 0.8561
+        }
+      }
+    },
+    "diag_tr_bl": {
+      "n": 919,
+      "hits": 581,
+      "blocked": 41,
+      "hitRate": 0.6614,
+      "meanPower": 1.2902,
+      "powerCv": 0.7544,
+      "impactTicks": 12.14,
+      "roleWeights": {
+        "head": 0.194,
+        "torso": 0.2963,
+        "arm": 0.4128,
+        "leg": 0.0969
+      },
+      "byWeapon": {
+        "cleaver": {
+          "n": 32,
+          "hits": 13,
+          "blocked": 2,
+          "hitRate": 0.4602,
+          "meanPower": 2.3224
+        },
+        "fist.R": {
+          "n": 112,
+          "hits": 69,
+          "blocked": 0,
+          "hitRate": 0.6176,
+          "meanPower": 0.5983
+        },
+        "mace": {
+          "n": 18,
+          "hits": 8,
+          "blocked": 0,
+          "hitRate": 0.4839,
+          "meanPower": 0.8268
+        },
+        "sword": {
+          "n": 750,
+          "hits": 486,
+          "blocked": 38,
+          "hitRate": 0.6825,
+          "meanPower": 1.3728
+        }
+      }
+    },
+    "horizontal_l": {
+      "n": 952,
+      "hits": 537,
+      "blocked": 42,
+      "hitRate": 0.5901,
+      "meanPower": 1.2638,
+      "powerCv": 0.9153,
+      "impactTicks": 14.7168,
+      "roleWeights": {
+        "head": 0.0379,
+        "torso": 0.3648,
+        "arm": 0.3687,
+        "leg": 0.2286
+      },
+      "byWeapon": {
+        "cleaver": {
+          "n": 28,
+          "hits": 14,
+          "blocked": 3,
+          "hitRate": 0.5642,
+          "meanPower": 1.5506
+        },
+        "fist.R": {
+          "n": 157,
+          "hits": 98,
+          "blocked": 4,
+          "hitRate": 0.6392,
+          "meanPower": 0.5352
+        },
+        "mace": {
+          "n": 19,
+          "hits": 4,
+          "blocked": 1,
+          "hitRate": 0.2891,
+          "meanPower": 0.9594
+        },
+        "sword": {
+          "n": 742,
+          "hits": 419,
+          "blocked": 33,
+          "hitRate": 0.591,
+          "meanPower": 1.4371
+        }
+      }
+    },
+    "horizontal_r": {
+      "n": 894,
+      "hits": 533,
+      "blocked": 26,
+      "hitRate": 0.614,
+      "meanPower": 0.9728,
+      "powerCv": 1.0,
+      "impactTicks": 11.3378,
+      "roleWeights": {
+        "head": 0.0289,
+        "torso": 0.3768,
+        "arm": 0.4497,
+        "leg": 0.1446
+      },
+      "byWeapon": {
+        "cleaver": {
+          "n": 26,
+          "hits": 16,
+          "blocked": 1,
+          "hitRate": 0.6364,
+          "meanPower": 1.577
+        },
+        "dagger": {
+          "n": 11,
+          "hits": 4,
+          "blocked": 1,
+          "hitRate": 0.4611,
+          "meanPower": 0.7448
+        },
+        "fist.R": {
+          "n": 141,
+          "hits": 76,
+          "blocked": 6,
+          "hitRate": 0.5644,
+          "meanPower": 0.4723
+        },
+        "mace": {
+          "n": 13,
+          "hits": 5,
+          "blocked": 0,
+          "hitRate": 0.4386,
+          "meanPower": 0.8006
+        },
+        "sword": {
+          "n": 703,
+          "hits": 432,
+          "blocked": 18,
+          "hitRate": 0.6306,
+          "meanPower": 1.0331
+        }
+      }
+    },
+    "overhead": {
+      "n": 915,
+      "hits": 479,
+      "blocked": 40,
+      "hitRate": 0.5476,
+      "meanPower": 0.9967,
+      "powerCv": 1.0,
+      "impactTicks": 13.5036,
+      "roleWeights": {
+        "head": 0.3157,
+        "torso": 0.2408,
+        "arm": 0.3468,
+        "leg": 0.0966
+      },
+      "byWeapon": {
+        "cleaver": {
+          "n": 20,
+          "hits": 6,
+          "blocked": 3,
+          "hitRate": 0.39,
+          "meanPower": 1.2203
+        },
+        "fist.R": {
+          "n": 140,
+          "hits": 79,
+          "blocked": 2,
+          "hitRate": 0.5718,
+          "meanPower": 0.2757
+        },
+        "mace": {
+          "n": 23,
+          "hits": 11,
+          "blocked": 2,
+          "hitRate": 0.5276,
+          "meanPower": 0.9089
+        },
+        "sword": {
+          "n": 725,
+          "hits": 381,
+          "blocked": 33,
+          "hitRate": 0.5506,
+          "meanPower": 1.1417
+        }
+      }
+    },
+    "snake_rear_strike": {
+      "n": 68,
+      "hits": 28,
+      "blocked": 10,
+      "hitRate": 0.4898,
+      "meanPower": 0.3705,
+      "powerCv": 0.4777,
+      "impactTicks": 9.5789,
+      "roleWeights": {
+        "head": 0.0158,
+        "torso": 0.2916,
+        "arm": 0.6716,
+        "leg": 0.021
+      },
+      "byWeapon": {
+        "jaws": {
+          "n": 68,
+          "hits": 28,
+          "blocked": 10,
+          "hitRate": 0.4832,
+          "meanPower": 0.2871
+        }
+      }
+    },
+    "snake_strike": {
+      "n": 43,
+      "hits": 28,
+      "blocked": 1,
+      "hitRate": 0.6601,
+      "meanPower": 0.4094,
+      "powerCv": 1.0,
+      "impactTicks": 10.931,
+      "roleWeights": {
+        "head": 0.0158,
+        "torso": 0.0416,
+        "arm": 0.0466,
+        "leg": 0.896
+      },
+      "byWeapon": {
+        "jaws": {
+          "n": 43,
+          "hits": 28,
+          "blocked": 1,
+          "hitRate": 0.6661,
+          "meanPower": 0.3256
+        }
+      }
+    },
+    "thrust": {
+      "n": 945,
+      "hits": 501,
+      "blocked": 36,
+      "hitRate": 0.5513,
+      "meanPower": 0.3982,
+      "powerCv": 1.0,
+      "impactTicks": 10.7317,
+      "roleWeights": {
+        "head": 0.0426,
+        "torso": 0.4026,
+        "arm": 0.2841,
+        "leg": 0.2706
+      },
+      "byWeapon": {
+        "cleaver": {
+          "n": 32,
+          "hits": 13,
+          "blocked": 3,
+          "hitRate": 0.4608,
+          "meanPower": 0.4663
+        },
+        "dagger": {
+          "n": 11,
+          "hits": 2,
+          "blocked": 0,
+          "hitRate": 0.2804,
+          "meanPower": 0.3882
+        },
+        "fist.R": {
+          "n": 141,
+          "hits": 112,
+          "blocked": 3,
+          "hitRate": 0.8043,
+          "meanPower": 0.286
+        },
+        "mace": {
+          "n": 17,
+          "hits": 13,
+          "blocked": 0,
+          "hitRate": 0.7241,
+          "meanPower": 0.2575
+        },
+        "sword": {
+          "n": 744,
+          "hits": 361,
+          "blocked": 30,
+          "hitRate": 0.5059,
+          "meanPower": 0.4284
+        }
+      }
+    }
+  },
+  "block": {
+    "none": {
+      "n": 2603,
+      "chance": 0.0127
+    },
+    "blade": {
+      "n": 2168,
+      "chance": 0.0875
+    },
+    "shield": {
+      "n": 165,
+      "chance": 0.0059
+    }
+  },
+  "armour": {
+    "exposure": {
+      "cut": 0.015,
+      "blunt": 0.0328,
+      "bite": 0.1086,
+      "pierce": 0.0
+    },
+    "n": {
+      "cut": 85,
+      "blunt": 57,
+      "bite": 49,
+      "pierce": 44
+    }
+  },
+  "bleed": {
+    "perHp": {
+      "cut": 1.5826,
+      "blunt": 0.0763,
+      "bite": 1.2937,
+      "pierce": 0.9
+    },
+    "decay": 0.9866,
+    "drainShare": 1.0254
+  },
+  "burn": {
+    "fracPerTick": 0.0009,
+    "hpPerTick": 0.0004,
+    "meanTicks": 817,
+    "capMidFraction": 0.4,
+    "capMidHealth": 0.333,
+    "deathFraction": 0.7
+  },
+  "ranged": {
+    "n": 147,
+    "hits": 79,
+    "arrowSpeed": 500.0,
+    "rateByDistance": [
+      [
+        20.3465,
+        0.8
+      ],
+      [
+        53.2734,
+        0.4924
+      ]
+    ],
+    "speedRef": 40.0,
+    "speedPenalty": 0.0,
+    "damageFrac": 1.5899,
+    "roleWeights": {
+      "head": 0.0127,
+      "torso": 0.6456,
+      "arm": 0.3418
+    }
+  },
+  "matchups": [
+    {
+      "name": "armoured_vs_unarmoured",
+      "a": "1x duelist+sword+iron plate",
+      "b": "1x duelist+sword",
+      "aCount": 1,
+      "bCount": 1,
+      "gapVox": 14.0,
+      "n": 8,
+      "winA": 0.625,
+      "winB": 0.0,
+      "draw": 0.375,
+      "ttkTicks": 604.8,
+      "ttkSd": 510.1605,
+      "timeoutTicks": 1800,
+      "hpLeftA": 0.993,
+      "hpLeftB": 0.1623
+    },
+    {
+      "name": "mace_vs_plate",
+      "a": "1x duelist+mace",
+      "b": "1x duelist+sword+iron plate",
+      "aCount": 1,
+      "bCount": 1,
+      "gapVox": 14.0,
+      "n": 8,
+      "winA": 0.0,
+      "winB": 0.75,
+      "draw": 0.25,
+      "ttkTicks": 1038.1666,
+      "ttkSd": 504.7453,
+      "timeoutTicks": 1800,
+      "hpLeftA": 0.0652,
+      "hpLeftB": 0.995
+    },
+    {
+      "name": "sword_vs_zombie",
+      "a": "1x zombie",
+      "b": "1x duelist+sword",
+      "aCount": 1,
+      "bCount": 1,
+      "gapVox": 14.0,
+      "n": 8,
+      "winA": 0.0,
+      "winB": 0.375,
+      "draw": 0.625,
+      "ttkTicks": 580.3333,
+      "ttkSd": 407.8238,
+      "timeoutTicks": 1800,
+      "hpLeftA": 0.1957,
+      "hpLeftB": 0.8921
+    },
+    {
+      "name": "brawl_4v3",
+      "a": "4x duelist+sword",
+      "b": "3x duelist+sword",
+      "aCount": 4,
+      "bCount": 3,
+      "gapVox": 16.0,
+      "n": 8,
+      "winA": 0.0,
+      "winB": 0.0,
+      "draw": 1.0,
+      "ttkTicks": 0.0,
+      "ttkSd": 0.0,
+      "timeoutTicks": 1800,
+      "hpLeftA": 0.563,
+      "hpLeftB": 0.541
+    },
+    {
+      "name": "archer_vs_melee",
+      "a": "1x archer (bow, sword sidearm)",
+      "b": "1x duelist+sword",
+      "aCount": 1,
+      "bCount": 1,
+      "gapVox": 55.0,
+      "n": 5,
+      "winA": 0.2,
+      "winB": 0.0,
+      "draw": 0.8,
+      "ttkTicks": 782.0,
+      "ttkSd": 0.0,
+      "timeoutTicks": 1200,
+      "hpLeftA": 0.9964,
+      "hpLeftB": 0.4946
+    }
+  ]
+}

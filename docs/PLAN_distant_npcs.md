@@ -810,7 +810,114 @@ recommendations):
 
 ## 6. Deviations from this plan (filled in by the implementing packages)
 
-(empty)
+### D2a (branch `dnpc-d2a`): calibration harness and the pure resolver
+
+**What landed.** `src/game/stroke_log.{h,cpp}` (the log + its reducer),
+`src/game/distant_combat.{h,cpp}` (vocabulary, table, loader/writer, kit,
+resolvers), five hook lines in `mob.cpp` (`StartStroke`: OnStart;
+`StepStroke`: BeforeSweep / OnSweep x2 / AfterSweep around the head and haft
+`MeleeSweepDamage`, OnEnd at Finished and at the abort), the three salts
+`kSaltDistantStrike/Arrow/Style` in `ai_behavior.cpp` beside the AI's (with a
+`static_assert` that all nine are distinct), gate `distant-calib-matrix`
+(`selftest_distant_calib.cpp`, kOrder after `infect-perf`), and the first
+`assets/mobs/distant_combat.json`, written by the harness (8 rounds, 112
+bouts, 4,936 strokes, 147 arrows; ~5 min).
+
+**The API D2b drives** (all in `distant::`): at DEMOTION, before
+`ReleaseRig`, `BuildDistantKit(mob, items)` and `CaptureDistantVitals(mob,
+cal)`; once at load, `LoadDistantCombat(path, cal, log)` (builtin fallback if
+absent). Per distant tick: `PickDistantStyle(kit, dist, id, tick)` when Think
+says attack; at the style's `impactTicks` (kit; or the table's measured one)
+`ResolveStrike(att, def, defVitals.limbHp, style, dist, {id, tick}, cal,
+gear)` then `ApplyStrike(defVitals, defKit, out, cal)`; for `shoot`,
+`ResolveArrow(...)` (impact after `flightTicks`) then `ApplyArrow`; every
+tick `StepBleed` and `StepBurn`; `DeathTest` is the near rules. Every
+resolver is pure (outcomes are returned, the caller applies them in its own
+defined order).
+
+**Deviations.**
+1. **No axe or spear item exists** (items.json: sword, cleaver, shortsword,
+   dagger, mace, bow). The cleaver (long, the heaviest edge) stands in for
+   the axe and the dagger (short form, thrust-heavy) for the spear.
+2. **`meanPower` is an EFFECTIVE multiplier** on `StrikeProfile::Total()`:
+   life hp per hit on UNARMOURED flesh / strike total. It folds in the speed
+   ramp, edge alignment, the carve's volume hp and repeat-strike falloff, so
+   the resolver reproduces the measured mean without re-deriving any of them.
+   The sweep's own 0..1 power is logged too (`Stroke::power`). Each style
+   also carries `powerCv`; the resolver spreads hp by an exponential mixture
+   with that CV (mean exact), so sever-sized blows still happen at distance.
+3. **The log measures by DIFFERENCE**, not by instrumenting the wound model:
+   the target's per-limb hp, shell hp, held-item hp, `HpLostBy` ledger and
+   bleed budget are read before and after the stroke's sweeps. No resolver
+   (cut / blunt / bite / parry / shield) was touched; off = one branch.
+4. **Shell factor** = `ShellResponseOf(h, cause).passed + (1 - passed) x
+   exposure[kind]`, where `exposure` (the gap rate: holes, a side the plate
+   does not cover) is measured per kind. Cloth (hardness <= cutHardnessRef)
+   passes an edge whole (melee.cpp's rule). Pierce uses the Blade row's
+   `carve` ratio as its `passed` (the channel's own pricing, kerf.h). The
+   kit caches each limb's hardest live worn shell by dominant material.
+5. **Bleed** is a RATE (`DistantVitals::bleedRate`, hp/tick) decaying by
+   `bleed.decay`; a blow owing B adds B(1 - decay). `perHp` per kind comes
+   from the log (bleed budget opened x gore.bleedHpPerVoxel per life hp),
+   times `drainShare` from a probe (one direct `Mob::Damage` on a passive
+   dummy); `decay` from that probe's mean drain time. Fists pool into Blunt.
+   Measured: cut 1.58 hp of blood per hp, blunt 0.08, bite 1.29, decay
+   0.9866 (mean drain 73.5 ticks), drainShare 1.03.
+6. **Burn costs nothing but the cap**: on a body the fire chars (rewrites)
+   rather than carves, so measured burn hp/tick is ~0 and the whole cost is
+   `BurnCapFor(burnFrac)` (gore's curve, copied at load; equal to
+   `Mob::BurnHealthCapFor`, asserted). Measured 0.00086 burnt fraction per
+   tick, 817 ticks to the burn death of an undoused human (fire does not
+   gutter on a human: mob-burn's note).
+7. **Matchups also carry `hpLeftA`/`hpLeftB`.** Full-fidelity fights mostly
+   end UNDECIDED in 60 s (both sides disarmed or handless, bleeding slowly:
+   59 "none of its styles is usable" lines in the run), so win rate and TTK
+   score only 42 of 112 bouts and the 4v3 brawl none. Each side's TotalHp
+   fraction at the end, decided or not, scores every bout; D2b's
+   `distant-calibrate` should compare that damage race as well as the win
+   rate and TTK (amend §4's assertions accordingly).
+8. **Ranged hit = CONTACT** (a glance off plate is armour, not a miss); life
+   hp per arrow = the target's TotalHp drop on the strike tick less that
+   tick's blood loss (`hpCharged` is the struck slot's, a shell's for a
+   cuirass). The knots are in-band (20 and 53 voxels: archers hold 35..80);
+   the rate is flat past the last knot. Moving targets were hit no less often
+   than still ones (they approach radially), so `speedPenalty` came out 0.
+9. **Block chance is per defender guard class only** (none / blade /
+   shield), additively smoothed. The shield measured 0.6%: the AI raises it
+   only between its own strokes.
+10. **Small samples are smoothed**: hitRate, roleWeights and meanPower take 4
+    pseudo-samples of the pooled value; `byWeapon` rows from `minSamples` (8).
+11. **Reach at impact** = style reach + the attacker's half depth (BeginStroke's
+    slack) + `reachSlack` (2, not measured).
+12. **The default gate is a subset** (the bouts marked `inDefault`, one round
+    of 300 + 300 ticks, 9.3 s measured including the unit and log-neutral
+    arms); it asserts that bouts DREW BLOOD (`minBoutsHurt`), not that they
+    were decided, since a full-fidelity kill takes 600+ ticks.
+    `SANDVOX_DISTANT_CALIB` runs all fifteen bouts for
+    `distantCalib.calibRounds` rounds and writes the table. Re-running the
+    harness reproduced every table value (one of 4,936 strokes flipped
+    miss -> hit-other between the two processes; no reduced number moved).
+
+**Headline numbers (the shipped table).** Pooled stroke hit rate 0.59 of
+4,936 started (2,787 hits, 224 blocked/parried, 1,733 misses); meanPower
+0.98. Per style: horizontal_r 0.61 / 0.97, horizontal_l 0.59 / 1.26,
+diag_tr_bl 0.66 / 1.29, overhead 0.55 / 1.00 (a third of its hits on the
+head), thrust 0.55 / 0.40, bite 0.67 / 0.45, bite_lunge 0.52 / 0.87,
+snake_strike 0.66 / 0.41 (90% legs), snake_rear_strike 0.49 / 0.37 (67%
+arms). Block: none 0.013, blade 0.087, shield 0.006. Armour exposure: cut
+0.01, blunt 0.03, bite 0.11, pierce 0.0. Arrows: 500 vox/s, contact 0.80 at
+20 voxels and 0.49 at 53, 1.59 x the flat 35 hp per bare contact. Matchups
+(8 bouts each, 1,800-tick timeout; archer 5, 1,200): armoured vs unarmoured
+winA 0.62 / winB 0 (hp left 0.99 / 0.16, TTK 605); duelist+mace vs plated
+swordsman winA 0 / winB 0.75 (0.07 / 1.00, TTK 1,038); zombie vs swordsman
+winA 0 / winB 0.38 (0.20 / 0.89, TTK 580); 4v3 swords never decided (0.56 /
+0.54); archer vs swordsman winA 0.20 (1.00 / 0.49, TTK 782).
+
+**Open.** Pierce `perHp` is the builtin 0.9 (arrows are not strokes; no
+arrow-bleed probe). Infection (zombie rot, snake venom) is not modelled at
+this tier. The player's own swings are not logged (no NPC stroke behind
+them). ARCH_NODES / DESIGN.md are left to D3, which owns the feature's
+documentation flip.
 
 ## 7. Audit 2026-10-15: what changed and why
 
