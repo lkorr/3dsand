@@ -56,6 +56,12 @@ var<workgroup> wgHash  : atomic<u32>;
 // chunks as clean and silently drop the stain — the failure this bit exists to
 // prevent.
 var<workgroup> wgStain : atomic<u32>;
+// The chunk's lowest and highest cell KEY (word bits 0..15, material +
+// state), for the UNIFORM bit of the occupancy word (common.wgsl
+// OCC_UNIFORM_BIT): uniform <=> every cell non-air (count == CHUNK_VOL) and
+// lo == hi. Min/max are order-independent, like every other reduction here.
+var<workgroup> wgKeyLo : atomic<u32>;
+var<workgroup> wgKeyHi : atomic<u32>;
 // Sub-chunk occupancy bitmask (common.wgsl SUB-CHUNK OCCUPANCY block):
 // [0..1] = TOTAL class, [2..3] = BLOCKER class, laid out exactly as
 // subOccIndex expects so the store at the end is a straight copy.
@@ -92,6 +98,8 @@ fn mainDirty(@builtin(workgroup_id) wg : vec3<u32>,
     atomicStore(&wgCount, 0u);
     atomicStore(&wgBlock, 0u);
     atomicStore(&wgStain, 0u);
+    atomicStore(&wgKeyLo, 0xFFFFFFFFu);
+    atomicStore(&wgKeyHi, 0u);
     atomicStore(&wgSub[0], 0u);
     atomicStore(&wgSub[1], 0u);
     atomicStore(&wgSub[2], 0u);
@@ -126,9 +134,13 @@ fn mainDirty(@builtin(workgroup_id) wg : vec3<u32>,
   var stain = 0u;
   var sm0 = 0u; var sm1 = 0u;   // TOTAL class, bits 0..31 / 32..63
   var sb0 = 0u; var sb1 = 0u;   // BLOCKER class
+  var kLo = 0xFFFFFFFFu;
+  var kHi = 0u;
   if (!sentinel) {
     for (var i = li; i < CHUNK_VOL; i += 64u) {
       let w = voxels[base + i];
+      kLo = min(kLo, w & 0xFFFFu);
+      kHi = max(kHi, w & 0xFFFFu);
       // OUTSIDE the non-air test on purpose: stain on an air cell is the whole
       // point (see the wgStain note above).
       if ((w & STAIN_BITS) != 0u) { stain = 1u; }
@@ -152,6 +164,8 @@ fn mainDirty(@builtin(workgroup_id) wg : vec3<u32>,
   atomicAdd(&wgCount, count);
   atomicAdd(&wgBlock, block);
   atomicMax(&wgStain, stain);
+  atomicMin(&wgKeyLo, kLo);
+  atomicMax(&wgKeyHi, kHi);
   atomicOr(&wgSub[0], sm0);
   atomicOr(&wgSub[1], sm1);
   atomicOr(&wgSub[2], sb0);
@@ -183,8 +197,11 @@ fn mainDirty(@builtin(workgroup_id) wg : vec3<u32>,
         storeSubOcc(slot, subOccAllOnes(), subOccAllOnes(), bo, bo);
       }
     } else {
-      occupancy[slot] = packOccStain(atomicLoad(&wgCount), atomicLoad(&wgBlock),
-                                     atomicLoad(&wgStain) != 0u);
+      let n = atomicLoad(&wgCount);
+      let uni = n == CHUNK_VOL && atomicLoad(&wgKeyLo) == atomicLoad(&wgKeyHi);
+      occupancy[slot] = packOccStain(n, atomicLoad(&wgBlock),
+                                     atomicLoad(&wgStain) != 0u) |
+                        select(0u, OCC_UNIFORM_BIT, uni);
       storeSubOcc(slot, atomicLoad(&wgSub[0]), atomicLoad(&wgSub[1]),
                   atomicLoad(&wgSub[2]), atomicLoad(&wgSub[3]));
     }
@@ -203,6 +220,8 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   if (wg.x == 0u && li == 0u) { chunkHash[NUM_SLOTS] = T.tick; }
   if (li == 0u) {
     atomicStore(&wgStain, 0u);
+    atomicStore(&wgKeyLo, 0xFFFFFFFFu);
+    atomicStore(&wgKeyHi, 0u);
     atomicStore(&wgCount, 0u);
     atomicStore(&wgBlock, 0u);
     atomicStore(&wgHash, 0u);
@@ -318,6 +337,8 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   var hc = 0u;
   var sm0 = 0u; var sm1 = 0u;   // sub-chunk TOTAL class
   var sb0 = 0u; var sb1 = 0u;   // sub-chunk BLOCKER class
+  var kLo = 0xFFFFFFFFu;
+  var kHi = 0u;
   for (var i = li; i < CHUNK_VOL; i += 64u) {
     // What counts as "state identity" for the determinism hash: material +
     // state nibble (bits 0..15) and the STAIN layer (bits 24..30).
@@ -334,6 +355,8 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     // transient CELLOP_IF_AIR message flag and is never stored.
     let w = voxels[loadBase + i];
     let v = (w & 0xFFFFu) | ((w & STAIN_BITS) >> 8u);
+    kLo = min(kLo, w & 0xFFFFu);
+    kHi = max(kHi, w & 0xFFFFu);
     // OUTSIDE the non-air branch below, deliberately: an all-air chunk that
     // still carries stain is hashed state and must keep its page (see wgStain).
     if ((w & STAIN_BITS) != 0u) { stain = 1u; }
@@ -367,6 +390,8 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   atomicAdd(&wgCount, count);
   atomicAdd(&wgBlock, block);
   atomicMax(&wgStain, stain);
+  atomicMin(&wgKeyLo, kLo);
+  atomicMax(&wgKeyHi, kHi);
   atomicOr(&wgSub[0], sm0);
   atomicOr(&wgSub[1], sm1);
   atomicOr(&wgSub[2], sb0);
@@ -376,8 +401,11 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   workgroupBarrier();
 
   if (li == 0u) {
-    occupancy[wg.x] = packOccStain(atomicLoad(&wgCount), atomicLoad(&wgBlock),
-                                   atomicLoad(&wgStain) != 0u);
+    let n = atomicLoad(&wgCount);
+    let uni = n == CHUNK_VOL && atomicLoad(&wgKeyLo) == atomicLoad(&wgKeyHi);
+    occupancy[wg.x] = packOccStain(n, atomicLoad(&wgBlock),
+                                   atomicLoad(&wgStain) != 0u) |
+                      select(0u, OCC_UNIFORM_BIT, uni);
     storeSubOcc(wg.x, atomicLoad(&wgSub[0]), atomicLoad(&wgSub[1]),
                 atomicLoad(&wgSub[2]), atomicLoad(&wgSub[3]));
     if (T.hashEnable != 0u) {

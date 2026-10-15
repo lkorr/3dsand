@@ -6491,6 +6491,12 @@ fn farPeakMat(biome : u32, peak : i32, tl : i32) -> u32 {
 
 var<workgroup> wgCount : atomic<u32>;
 var<workgroup> wgBlock : atomic<u32>;
+// The chunk's lowest and highest generated cell KEY (word bits 0..15), for
+// the occupancy word's UNIFORM bit (common.wgsl OCC_UNIFORM_BIT) -- the same
+// reduction sim_occupancy makes, so a generated lake's interior chunks carry
+// the bit from the first frame instead of from the first hash tick.
+var<workgroup> wgKeyLo : atomic<u32>;
+var<workgroup> wgKeyHi : atomic<u32>;
 // Cells in this chunk that can ACT (matCanAct, common.wgsl). Third counter
 // rather than a reuse of wgCount because occupancy needs the total and the
 // wake needs this one, and they are different questions about the same sweep.
@@ -6530,6 +6536,8 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
   if (li == 0u) {
     atomicStore(&wgCount, 0u);
     atomicStore(&wgBlock, 0u);
+    atomicStore(&wgKeyLo, 0xFFFFFFFFu);
+    atomicStore(&wgKeyHi, 0u);
     atomicStore(&wgAct, 0u);
     atomicStore(&wgNotEq, 0u);
     atomicStore(&wgNotJit, 0u);
@@ -6543,6 +6551,8 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
   let base = slotWorldChunk(slot, T.origin) * i32(CHUNK);
   var count = 0u;
   var block = 0u;
+  var kLo = 0xFFFFFFFFu;
+  var kHi = 0u;
   var act = 0u;
   var sm0 = 0u; var sm1 = 0u;   // sub-chunk TOTAL class
   var sb0 = 0u; var sb1 = 0u;   // sub-chunk BLOCKER class
@@ -6718,6 +6728,8 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
         // point. genChunk overwrites the WHOLE chunk, so the CPU materializes
         // every target slot before the dispatch (§3.5c) and this never faults.
         voxStore(voxWordInChunk(slot, i), w);
+        kLo = min(kLo, w & 0xFFFFu);
+        kHi = max(kHi, w & 0xFFFFu);
         let m = w & 0xFFFu;
         if (m != MAT_AIR) {
           count += 1u;
@@ -6739,6 +6751,8 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
   }
   atomicAdd(&wgCount, count);
   atomicAdd(&wgBlock, block);
+  atomicMin(&wgKeyLo, kLo);
+  atomicMax(&wgKeyHi, kHi);
   atomicAdd(&wgAct, act);
   atomicOr(&wgSub[0], sm0);
   atomicOr(&wgSub[1], sm1);
@@ -6755,7 +6769,9 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
     // stainless by construction and bit 31 must read 0. The page-table free
     // path relies on exactly that — a generated sky chunk has to be demotable
     // on sight, without a readback.
-    occupancy[slot] = packOcc(n, atomicLoad(&wgBlock));
+    let uni = n == CHUNK_VOL && atomicLoad(&wgKeyLo) == atomicLoad(&wgKeyHi);
+    occupancy[slot] = packOcc(n, atomicLoad(&wgBlock)) |
+                      select(0u, OCC_UNIFORM_BIT, uni);
     storeSubOcc(slot, atomicLoad(&wgSub[0]), atomicLoad(&wgSub[1]),
                 atomicLoad(&wgSub[2]), atomicLoad(&wgSub[3]));
     // ---- THE STREAMING WAKE (CLAUDE.md rule 2) -------------------------

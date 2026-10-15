@@ -5597,7 +5597,8 @@ fn isRayBlockerW(m : Material, w : u32) -> bool {
   if (!isRayBlocker(m)) { return false; }
   return m.klass != CLASS_POWDER || powderMass(w) >= POWDER_BLOCK_MIN;
 }
-// OCCUPANCY WORD: [31] anyStain | [30..16] rayBlockers | [15..0] nonAir count.
+// OCCUPANCY WORD: [31] anyStain | [30] uniform | [28..16] rayBlockers |
+// [15..0] nonAir count.
 //
 // Both counts are bounded by CHUNK_VOL = 4,096, so each needs 13 bits and bit
 // 31 was dead space. It now carries "some cell in this chunk has STAIN bits
@@ -5614,11 +5615,25 @@ fn isRayBlockerW(m : Material, w : u32) -> bool {
 // is why reclamation was capped at 128 chunks/tick against an allocation rate
 // measured at 1,270/tick. With the answer folded in here it is one bit test.
 //
-// occBlockers MASKS to 15 bits: it used to be a bare `>> 16`, which would now
-// read the stain flag as a blocker count of 32,768 and make every stained
-// chunk fully opaque to the raymarcher's chunk-skip test.
+// occBlockers MASKS to 13 bits (a count of at most CHUNK_VOL = 4,096): it used
+// to be a bare `>> 16`, which would now read the stain flag as a blocker count
+// of 32,768 and make every stained chunk fully opaque to the raymarcher's
+// chunk-skip test -- and bit 30 below is the same hazard one bit down.
+//
+// [30] UNIFORM (2026-10-15, frame-perf pass): every one of the chunk's 4,096
+// cells holds the SAME material + state (word bits 0..15) and none is air.
+// RENDER-ONLY and CONSERVATIVE: worldgen's genChunk and sim_occupancy's
+// resident paths compute it (a min/max of the key over the chunk); every other
+// writer (the sentinel paths, the CPU store-hit upload) leaves it 0, which only
+// costs the raymarcher a per-cell march, never a picture. The CPU snapshot keeps the count only (world.cpp masks 0xFFFF), so
+// no C++ reader sees it. What it buys: trace()'s liquid run crosses a chunk
+// that is all one full liquid in one step instead of cell by cell -- the
+// interior of a deep lake, which a primary ray otherwise walks for the whole
+// render.subVisibility (10 m) cap.
+const OCC_UNIFORM_BIT : u32 = 0x40000000u;
 fn occTotal(occ : u32) -> u32 { return occ & 0xFFFFu; }
-fn occBlockers(occ : u32) -> u32 { return (occ >> 16u) & 0x7FFFu; }
+fn occBlockers(occ : u32) -> u32 { return (occ >> 16u) & 0x1FFFu; }
+fn occUniform(occ : u32) -> bool { return (occ & OCC_UNIFORM_BIT) != 0u; }
 fn occAnyStain(occ : u32) -> bool { return (occ & 0x80000000u) != 0u; }
 fn packOcc(total : u32, blockers : u32) -> u32 { return total | (blockers << 16u); }
 fn packOccStain(total : u32, blockers : u32, anyStain : bool) -> u32 {
