@@ -16002,6 +16002,27 @@ bool Mob::ReskinLimbMicro(MobLimb& limb, uint32_t skinScale,
     // The joint anchors are expressed from the limb origin, so they move the
     // opposite way to stay on the same physical point of the creature.
     limb.anchorLimb = limb.anchorLimb - d;
+    // A HELD ITEM is not posed from restOffset: the drive loop puts its body
+    // at `socket - itemQ * gripBody` every tick, and the edge and haft are
+    // read as points of that same body frame (WeaponEdge, the aim's tip).
+    // All three are body-frame points measured once at EquipItem, so they
+    // follow the rebase as anchorLimb does -- or the art, the collider and the
+    // lattice a shield block is tested against slide off the fist by `d`, and
+    // by one more `d` per min-plane carve (a chipped shield point, a dented
+    // mace). Moving the grip alone would leave the edge `d` off the blade.
+    for (HeldHand& hh : held_) {
+      if (hh.slot < 0 || hh.slot >= (int)limbs_.size() ||
+          &limbs_[(size_t)hh.slot] != &limb)
+        continue;
+      hh.gripBody = hh.gripBody - d;
+      if ((size_t)hh.slot < limbDefs_.size()) {
+        MobLimbDef& ld = limbDefs_[(size_t)hh.slot];
+        ld.edgeFrom = ld.edgeFrom - d;
+        ld.edgeTo = ld.edgeTo - d;
+        ld.haftFrom = ld.haftFrom - d;
+        ld.haftTo = ld.haftTo - d;
+      }
+    }
     if (fine) {
       // A skin-unit shift is not generally a whole number of collider voxels
       // (at skin 8 / collider 2, a shift of 3 is 0.75 of one). So the skin
