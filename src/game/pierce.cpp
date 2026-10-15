@@ -72,6 +72,14 @@ bool Mob::PierceLimb(uint64_t bodyHandle, Vec3 fromWorld, Vec3 dirWorld,
 
   const float energy = pen.EnergyJ();
   out.energyIn = energy;
+  // A BODY WRAPPED ROUND ANOTHER -- a garment (a follower shell) or the hair
+  // over the skull -- ends its channel at the first gap: the gap is the body
+  // it wraps, which the flight meets next (kerf.h exitGapBins). ONE empty
+  // bin is enough: a sleeve hugs the arm a cell off its skin, so a ray across
+  // the arm near its edge crosses a chord of it only a couple of cells deep,
+  // and at two the sleeve's channel ran on over that chord and the flight
+  // passed the arm by (measured, `arrow` (h): the tunic's arm shot).
+  const bool wraps = limb.wornHost >= 0 || limbDefs_[(size_t)li].tag == "hair";
   const PierceChannelResult ch = PierceChannel(
       oL, dL, s, lat.rCells, energy,
       [&](auto&& probe) {
@@ -86,7 +94,8 @@ bool Mob::PierceLimb(uint64_t bodyHandle, Vec3 fromWorld, Vec3 dirWorld,
             if (m) probe((float)v.x, (float)v.y, (float)v.z, m);
           }
       },
-      costOf);
+      costOf, wraps ? 1 : 0);
+  out.gapExit = ch.gapExit;
   out.firstLayerJ = ch.firstLayerJ;
   out.stopMat = ch.stopMat;
   out.byMat = ch.byMat;
@@ -264,6 +273,18 @@ PierceFlight PierceAlongRay(Physics& phys, MobSystem& mobs, DebrisSystem& debris
   // report the same body at fraction 0.
   std::vector<uint64_t> skip = ignore;
   float at = 0.0f;  // world voxels of the ray consumed
+  // A WRAPPER LEFT AT A GAP (PierceResult::gapExit: a garment, the hair) is
+  // skipped for the NEXT cast only -- from its exit face the cast would meet
+  // its own collider again at fraction 0 and price its far side before the
+  // body inside it. Once the ray has met something else (the torso in the
+  // tunic), or met nothing, it can be met again: the arrow that goes on
+  // through the man goes out through the back of his coat.
+  uint64_t deferred = 0;
+  auto release = [&]() {
+    if (deferred == 0) return;
+    skip.erase(std::find(skip.begin(), skip.end(), deferred));
+    deferred = 0;
+  };
   // kPierceMaxBodies resolved hits, plus as many capsule skips (each capsule
   // is skipped once), so the loop is bounded either way.
   for (int k = 0; k < 2 * kPierceMaxBodies &&
@@ -274,7 +295,12 @@ PierceFlight PierceAlongRay(Physics& phys, MobSystem& mobs, DebrisSystem& debris
     const Vec3 from = fromWorld + d * at;
     float frac = 1.0f;
     const uint64_t body = phys.CastRayBody(from, d, remain, frac, skip);
-    if (body == 0) break;
+    if (body == 0) {
+      if (deferred == 0) break;
+      release();   // nothing inside it: the wrapper's far side is next
+      continue;
+    }
+    release();
     skip.push_back(body);
     const float hitAt = at + std::clamp(frac, 0.0f, 1.0f) * remain;
     // A PLAYER'S CAPSULE encloses the torso; the limbs inside it are what the
@@ -356,6 +382,7 @@ PierceFlight PierceAlongRay(Physics& phys, MobSystem& mobs, DebrisSystem& debris
     // THROUGH: on from the far side, at what is left.
     cur.speedMps = h.r.exitSpeedMps;
     at = std::max(hitAt, (h.r.stopWorld - fromWorld).dot(d));
+    if (h.r.gapExit) deferred = body;
   }
   f.speedMps = cur.speedMps;
   f.travelled = maxDistVox;

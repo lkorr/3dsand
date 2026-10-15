@@ -87,6 +87,27 @@ float BowArrowSpeed(const ItemDef& bow, int ticks);
 // The penetrator an arrow flies as, at `speedMps`.
 Penetrator ArrowPenetrator(const ItemDef& arrow, float speedMps, uint32_t seed);
 
+// ---- AN ARROW STAYS ONLY WITH ITS HEAD IN ----------------------------------
+// (ticket 2026-10-14_22-26-58, owner: "it should only really stick out if
+// it's actually embedded in the flesh. i shouldn't just see the whole arrow
+// head on the outside"). The point is placed where the channel stopped
+// (PierceResult::stopWorld), so an arrow that stopped a centimetre into a
+// body -- spent by the arm it went through first, by a coat of mail, by a
+// long flight -- was stuck to the skin with its whole head standing out in
+// front of it. A real head that has not gone in past its own length has
+// nothing to hold it, and falls out.
+//
+// The HEAD is the art's: the run of cells, back from the point along the
+// shaft, in the point's own matter (ItemDef::ArrowSpec::headMaterial) -- so
+// re-authoring the head re-derives how deep it has to go, as the point and
+// its hardness already are. World voxels.
+float ArrowHeadLength(const ItemDef& arrow);
+// True when a hit that stopped in a body (Embedded) went in at least the
+// head's length -- the one rule every embed path asks (the flight's, and the
+// owner's for a peer's shot, game/melee.cpp ApplyRemotePierceHit). Anything
+// shallower is dropped where it struck, as a glance is.
+bool ArrowHeadIn(const ItemDef& arrow, const PierceResult& r);
+
 // THE DRAWN BOW AS SEEN (2026-10-14, owner: "drawing a bow should actually
 // draw the string, and there should be a visibly notched arrow that flies
 // out"). For a creature whose bow_draw* clip is playing and has come in: the

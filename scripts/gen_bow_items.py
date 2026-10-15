@@ -64,9 +64,19 @@ bs.COLOURS.update({
 # string (game/arrows.h PresentDrawnBow), and at 0.60 m it was shorter than the
 # draw: its point sat inside the bow hand at full draw. The draw is 46 cells
 # (scripts/gen_archery_clips.py), so 52 puts the point ~6 cm past the grip.
+# 2026-10-14 (owner: "arrows should probably be a bit smaller", ticket
+# 2026-10-14_22-26-58): the BULK, not the length -- the length is the draw's
+# (above). The vanes stand one cell off the shaft, not two (the cross-section
+# 5 -> 3 cells, 6.25 -> 3.75 cm: a real fletch is ~1.3 cm high), eight cells
+# long instead of nine, and the head is a 2-cell socket and a 2-cell point
+# (7 -> 4 cells, 8.75 -> 5 cm, a short bodkin). The head's length is also how
+# deep an arrow must go in to STAY (game/arrows.h ArrowHeadIn, read off this
+# art), so a full draw now stays in an upper arm (~6 cm) and a chest.
 ARROW_LEN = 52          # 0.65 m
-ARROW_X = 5             # cross-section, odd: the axis through the middle cell
-HEAD_FROM = ARROW_LEN - 7   # socket + point from here on (7 cells, 8.75 cm)
+ARROW_X = 3             # cross-section, odd: the axis through the middle cell
+HEAD_LEN = 4            # socket + point (5 cm)
+HEAD_SOCKET = 2         # ...of which the socket round the shaft's end
+HEAD_FROM = ARROW_LEN - HEAD_LEN
 
 
 def arrow_cells():
@@ -75,11 +85,11 @@ def arrow_cells():
     def fn(x, dy, dz):
         on_axis = dy == 0 and dz == 0
         # The head: a socket (a 3-cell cross round the shaft's end), then a
-        # four-cell bodkin point. The foremost cell is the arrow's POINT
+        # bodkin point on the axis. The foremost cell is the arrow's POINT
         # (ItemDef::ArrowSpec::tip).
         if x >= HEAD_FROM:
             k = x - HEAD_FROM
-            if k <= 2:
+            if k < HEAD_SOCKET:
                 if (abs(dy) + abs(dz)) <= 1:
                     return (STEEL, "head")
                 return None
@@ -87,12 +97,10 @@ def arrow_cells():
         # The nock.
         if x <= 1:
             return (STAFF_WOOD, "nock") if on_axis else None
-        # Fletching: four vanes, 9 cells long, 2 out from the shaft at their
-        # middle, 1 at the ends (a trailing taper read at a glance).
-        if 2 <= x <= 10 and (dy == 0) != (dz == 0):
+        # Fletching: four vanes, 8 cells long, one cell out from the shaft.
+        if 2 <= x <= 9 and (dy == 0) != (dz == 0):
             r = max(abs(dy), abs(dz))
-            full = 5 <= x <= 8
-            if r == 1 or (r == 2 and full):
+            if r == 1:
                 cock = dz > 0   # the up vane is the cock feather
                 return (LINEN, "fletch_a" if cock else "fletch_b")
             return None

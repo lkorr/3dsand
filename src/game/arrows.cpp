@@ -115,6 +115,28 @@ Penetrator ArrowPenetrator(const ItemDef& a, float speedMps, uint32_t seed) {
   return p;
 }
 
+float ArrowHeadLength(const ItemDef& a) {
+  if (!a.IsAmmo() || a.voxels.empty()) return 0.0f;
+  int maxX = -(1 << 20);
+  for (const PrefabVoxel& v : a.voxels) maxX = std::max(maxX, (int)v.x);
+  // Back from the point while the slice still holds the head's matter.
+  auto sliceIsHead = [&](int x) {
+    for (const PrefabVoxel& v : a.voxels)
+      if ((int)v.x == x && (v.material & 0xFFFu) == a.arrow.headMaterial)
+        return true;
+    return false;
+  };
+  int x = maxX;
+  while (sliceIsHead(x - 1)) x--;
+  const float inv = 1.0f / (float)(a.scale ? a.scale : 1u);
+  return (float)(maxX + 1 - x) * inv;
+}
+
+bool ArrowHeadIn(const ItemDef& a, const PierceResult& r) {
+  return r.hit && !r.missed && r.outcome == PierceOutcome::Embedded &&
+         r.depth >= ArrowHeadLength(a);
+}
+
 Vec3 ArrowHoldover(Vec3 from, Vec3 to, float speedVox) {
   const float perTick = speedVox / (float)kArrowTicksPerSecond;
   if (!(perTick > 1e-3f)) return to;
@@ -515,7 +537,10 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
           e.limb = last.limb;
           e.dir = d;
           e.at = last.r.hit ? last.r.stopWorld : pf.endWorld;
-          if (last.r.hit && last.r.outcome == PierceOutcome::Embedded) {
+          // IN ONLY WITH ITS HEAD IN (ArrowHeadIn): a stop shallower than the
+          // head leaves it nothing to hold by, and it falls out below.
+          if (last.r.hit && last.r.outcome == PierceOutcome::Embedded &&
+              ArrowHeadIn(*def, last.r)) {
             if (last.mobId != 0) {
               // IT STAYS IN THE LIMB -- on a creature this machine owns. A
               // peer's creature gets it from its owner (the routed record
@@ -556,8 +581,11 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
               }
             }
           } else {
-            // GLANCED, or a body nobody carves (a door, a bomb): it falls
-            // from where it met it, kicked back a little.
+            // GLANCED, STOPPED SHORT OF ITS OWN HEAD, or a body nobody carves
+            // (a door, a bomb): it falls from where it met it, kicked back a
+            // little. A shallow stop has done its harm already (the channel
+            // and the flat damage were charged by the hit); it just does not
+            // stay.
             const Vec3 at = last.r.hit ? last.r.entryWorld : pf.endWorld;
             const Vec3 back =
                 d * (-0.15f * MetresPerSecToCells(speed0)) + Vec3{0, 2.0f, 0};
@@ -583,8 +611,11 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
         // From the last free sample, a hand's breadth or two into whatever
         // stopped it, by how fast it was going (a spent arrow barely bites).
         const float mps = SpeedMpsOf(f.vel);
-        const float depth =
-            std::clamp(0.3f + 1.7f * mps / 65.0f, 0.3f, 2.5f);   // voxels
+        // Never shallower than the head (ArrowHeadIn's rule, on the ground):
+        // an arrow standing in the earth shows its shaft, not its point.
+        const float depth = std::max(
+            ArrowHeadLength(*def),
+            std::clamp(0.3f + 1.7f * mps / 65.0f, 0.3f, 2.5f));   // voxels
         const Vec3 tip = FloatOf(p) + d * depth;
         const uint64_t ab = placeItem(*def, tip, d, Vec3{}, true);
         ArrowEvent e = event(ab ? ArrowEvent::Kind::Stuck : ArrowEvent::Kind::Broke, f);
