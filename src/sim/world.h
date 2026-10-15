@@ -998,11 +998,29 @@ constexpr uint32_t kBodySlotsPerLiveMob = 24;
 //   the dead          MobSystem::kMaxDeadBodies (240)
 //   the avatars       a few dozen
 // = ~2000, so 2048. 512 until 2026-10-04 — sized for 16 creatures; 64 armed
-// humans alone are ~1100 limb bodies. VRAM: bodyXforms 32 B and
-// microBodyInsts 16 B per slot, 96 KiB in all (was 24 KiB).
-constexpr uint32_t kMaxBodySlots = 2048;
-static_assert(kMaxBodySlots >= 200 + kMaxLiveMobs * kBodySlotsPerLiveMob + 240,
+// humans alone are ~1100 limb bodies.
+//
+// THE REAL BODIES' SHARE IS STILL 2048 (kBodySlotsReal); THE CEILING IS 4096
+// (2026-10-15, docs/PLAN_distant_npcs.md §2.9, package D4a). Past the real
+// bodies come the RENDER-ONLY ones (game/renderonly.h: arrows in flight, and
+// the distant creatures' statues, game/distant_draw.h), walked LAST so they
+// starve first. At 2048 a full near crowd left ~72 slots for a fight beyond
+// the window -- the plan's "72 drawn is too few". 4096 is the hard ceiling
+// (BodyVoxInst packs the slot in 12 bits), so this is the last raise this
+// constant gets without widening that word. VRAM: bodyXforms 32 B and
+// microBodyInsts 16 B per slot, 192 KiB in all (was 96 KiB). No shader sizes
+// anything by it (both bind runtime-sized arrays, and it is not in the
+// constant prelude), so the SPIR-V cache does not move.
+//
+// The two numbers are kept apart because the micro-body MODEL TABLE below is
+// sized against the real share, not against the ceiling: an owned clone
+// belongs to a real body part, and a render-only body holds none.
+constexpr uint32_t kBodySlotsReal = 2048;
+static_assert(kBodySlotsReal >= 200 + kMaxLiveMobs * kBodySlotsPerLiveMob + 240,
               "body render slots must cover debris + the living cap + the dead");
+constexpr uint32_t kMaxBodySlots = 4096;
+static_assert(kMaxBodySlots >= kBodySlotsReal,
+              "the real bodies' share must fit under the ceiling");
 static_assert(kMaxBodySlots <= 4096, "BodyVoxInst packs the slot in 12 bits");
 
 // CPU-authored render instance (grenades, markers) — must match Sprite in
@@ -2564,9 +2582,23 @@ constexpr uint32_t kMicroBodyPoolWordsWorld = 8u << 20;
 // 4096 since 2026-10-04 (kMaxLiveMobs 16 -> 64): the owned term is bounded by
 // kMaxBodySlots, which went 512 -> 2048, so the shared ~1000 (load + every pool
 // body) plus 2048 owned no longer fit 2048. 64 KiB, +32 KiB of VRAM.
+//
+// RESTATED, NOT RAISED, when kMaxBodySlots went 2048 -> 4096 (2026-10-15, D4a).
+// The owned term was "one clone per SLOT" only because every slot was a real
+// body part; the slots added then are render-only (arrows, distant statues),
+// and a render-only body draws a SHARED model and owns nothing -- so the owned
+// term is bounded by the REAL share, kBodySlotsReal, exactly as before. What
+// the statues DO add is shared records of their own, one per packed pose,
+// capped at kDistantPoseModelsMax by game/distant_draw.cpp (which also leaves
+// the table's last kDistantModelReserve records to gore). So the table covers
+// shared (load + pool bodies, ~1024) + owned (<= kBodySlotsReal) + statue
+// poses: 1024 + 2048 + 512 = 3584 <= 4096.
 constexpr uint32_t kMaxMicroBodyModels = 4096;
-static_assert(kMaxMicroBodyModels >= kMaxBodySlots + 1024,
-              "micro-body model table: shared records + one owned clone per slot");
+constexpr uint32_t kDistantPoseModelsMax = 512;
+static_assert(kMaxMicroBodyModels >=
+                  kBodySlotsReal + 1024 + kDistantPoseModelsMax,
+              "micro-body model table: shared records + one owned clone per "
+              "real body slot + the distant statues' packed poses");
 // A micro body's model has no micro model when its slot maps here.
 constexpr uint32_t kMicroBodyNoModel = 0xFFFFFFFFu;
 

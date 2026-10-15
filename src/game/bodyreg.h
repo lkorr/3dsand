@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdarg>
+#include <initializer_list>
 #include <cstdint>
 #include <unordered_map>
 #include <utility>
@@ -95,7 +96,8 @@ void CullBodyRanges(const std::vector<BodyDrawRange>& ranges,
 // mob limbs (the dead included) stack after those — the avatar ahead of the
 // mobs so a crowd of corpses can never be what starves the player's own body
 // at kMaxBodySlots (bodyreg.cpp); render-only bodies (SetRenderOnly: the
-// arrows in flight) take the slots after everything real. Three parallel
+// arrows in flight, then the distant statues) take the slots after everything
+// real. Three parallel
 // arrays are indexed by that
 // slot: the transforms (bodyXforms), the cube instances (bodyInstances) and
 // the compacted micro-body draw list. All three MUST agree on the walk order
@@ -132,8 +134,25 @@ class BodyRegistry {
   // anybody's body. The list must outlive every Build* call made with it;
   // null (the default) is no extras, which is every harness's walk.
   void SetRenderOnly(const std::vector<RenderOnlyBody>* extras) {
-    extras_ = extras;
+    SetRenderOnly({extras});
   }
+  // SEVERAL LISTS (2026-10-15, distant statues, game/distant_draw.h), walked
+  // in the order given, all after every real body: the frame loop passes
+  // {&arrows, &statues}, so the arrows keep exactly the slots they had and
+  // the statues -- which can be hundreds -- are what a crowded frame starves.
+  // Null entries are skipped; past kMaxRenderOnlyLists are ignored.
+  static constexpr int kMaxRenderOnlyLists = 4;
+  void SetRenderOnly(
+      std::initializer_list<const std::vector<RenderOnlyBody>*> lists) {
+    nExtras_ = 0;
+    for (const std::vector<RenderOnlyBody>* l : lists)
+      if (l != nullptr && nExtras_ < kMaxRenderOnlyLists) extras_[nExtras_++] = l;
+  }
+  // The slots the REAL bodies take (debris, the avatar, every mob limb),
+  // capped where their walks stop: where the render-only lists begin. A
+  // producer's slot budget is kMaxBodySlots minus this minus whatever lists
+  // go before it.
+  uint32_t RealSlots() const { return ExtrasBase(); }
 
   // Per-slot transforms, refreshed every frame (cheap).
   void BuildXforms(std::vector<BodyXformGpu>& out) const;
@@ -191,7 +210,14 @@ class BodyRegistry {
   MobSystem& mobs_;
   PlayerAvatar* avatar_;
   const MicroBodySet* microSet_ = nullptr;
-  const std::vector<RenderOnlyBody>* extras_ = nullptr;
+  const std::vector<RenderOnlyBody>* extras_[kMaxRenderOnlyLists] = {};
+  int nExtras_ = 0;
+  // Every render-only body across the lists, in walk order.
+  size_t ExtrasCount() const {
+    size_t n = 0;
+    for (int i = 0; i < nExtras_; i++) n += extras_[i]->size();
+    return n;
+  }
   // Slots the real bodies take before the extras: what the three walks emit,
   // capped where they stop (kMaxBodySlots).
   uint32_t ExtrasBase() const;

@@ -540,6 +540,9 @@ add_library(sandvox_core OBJECT
   src/game/arrows.cpp
   src/game/mob_archery.cpp
   src/game/mob_shield.cpp
+  # Distant creatures drawn as baked flipbook statues (docs/PLAN_distant_npcs.md
+  # §2.9, D4a): the pose bake, the pose LRU and the render-only producer.
+  src/game/distant_draw.cpp
   # The death screen's peel: depth layers of a corpse's bricks, drawn as
   # clones (render only) and read as strata.
   src/game/autopsy.cpp
@@ -710,6 +713,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_archer.cpp
   src/test/selftest_aquatic.cpp
   src/test/selftest_stagger.cpp
+  src/test/selftest_distant_look.cpp
   src/test/selftest_solute.cpp
   src/test/selftest_heat.cpp
   src/test/selftest_impact.cpp

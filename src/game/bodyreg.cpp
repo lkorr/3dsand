@@ -44,9 +44,9 @@ void BodyRegistry::BuildXforms(std::vector<BodyXformGpu>& out) const {
   debris_.BuildXforms(out);  // clears + fills [0, SlotCount)
   if (avatar_) avatar_->AppendXforms(out);
   mobs_.AppendXforms(out);
-  if (extras_) {
-    for (const RenderOnlyBody& e : *extras_) {
-      if (out.size() >= kMaxBodySlots) break;
+  for (int l = 0; l < nExtras_; l++)
+    for (const RenderOnlyBody& e : *extras_[l]) {
+      if (out.size() >= kMaxBodySlots) return;
       BodyXformGpu x{};
       x.pos[0] = e.pos.x;
       x.pos[1] = e.pos.y;
@@ -54,7 +54,6 @@ void BodyRegistry::BuildXforms(std::vector<BodyXformGpu>& out) const {
       std::memcpy(x.quat, e.quat, sizeof(x.quat));
       out.push_back(x);
     }
-  }
 }
 
 void BodyRegistry::BuildHandles(std::vector<uint64_t>& out) const {
@@ -64,9 +63,9 @@ void BodyRegistry::BuildHandles(std::vector<uint64_t>& out) const {
   if (avatar_) avatar_->AppendBodyHandles(out);
   mobs_.AppendBodyHandles(out);
   // No physics body: handle 0, which every handle consumer already skips.
-  if (extras_)
-    for (size_t k = 0; k < extras_->size() && out.size() < kMaxBodySlots; k++)
-      out.push_back(0);
+  const size_t extras = ExtrasCount();
+  for (size_t k = 0; k < extras && out.size() < kMaxBodySlots; k++)
+    out.push_back(0);
 }
 
 void BodyRegistry::BuildInstances(std::vector<BodyVoxInst>& out) {
@@ -93,13 +92,15 @@ void BodyRegistry::BuildMicroInsts(std::vector<MicroBodyInstGpu>& out) const {
   // The render-only bodies, at the slots BuildXforms gave them. Their models
   // are SHARED item records (never owned), so the alias check below skips
   // them by construction: two arrows in the air draw one brick, correctly.
-  if (extras_) {
+  // (Several lists, walked in order: the arrows, then the distant statues.)
+  {
     uint32_t slot = std::min(mobEnd, kMaxBodySlots);
-    for (const RenderOnlyBody& e : *extras_) {
-      if (slot >= kMaxBodySlots) break;
-      out.push_back({slot, e.model, 0u, 0u});
-      slot++;
-    }
+    for (int l = 0; l < nExtras_ && slot < kMaxBodySlots; l++)
+      for (const RenderOnlyBody& e : *extras_[l]) {
+        if (slot >= kMaxBodySlots) break;
+        out.push_back({slot, e.model, 0u, 0u});
+        slot++;
+      }
   }
 
   // ---- ALIASING DIAGNOSTIC --------------------------------------------------
@@ -527,9 +528,10 @@ void CullBodyRanges(const std::vector<BodyDrawRange>& ranges,
 uint32_t BodyRegistry::TotalSlots() const {
   const uint32_t real = debris_.SlotCount() + mobs_.LimbBodyCount() +
                         (avatar_ ? avatar_->LimbBodyCount() : 0u);
-  if (!extras_ || extras_->empty()) return real;
+  const size_t extras = ExtrasCount();
+  if (extras == 0) return real;
   const uint32_t base = ExtrasBase();
-  return real + std::min((uint32_t)extras_->size(), kMaxBodySlots - base);
+  return real + (uint32_t)std::min<size_t>(extras, kMaxBodySlots - base);
 }
 
 bool BodyRegistry::AnyInstancesDirty() const {

@@ -6580,6 +6580,9 @@ class Mob {
   static constexpr uint32_t kBurnRebuildShift = 6;
 
   friend class MobSystem;
+  // The distant statue bake (game/distant_draw.cpp) READS the live rig --
+  // limbs, skeleton, gear -- at demotion, before ReleaseRig. Read-only.
+  friend class DistantDraw;
 };
 
 class MobSystem {
