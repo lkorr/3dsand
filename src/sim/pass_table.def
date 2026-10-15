@@ -1673,6 +1673,10 @@ PASS(ho_solHash, "occupancyFull(hashOnly)", PT_HASHONLY, PIPE_SOL_HASH, K_COMPUT
 // STACK), so its extent is the runs' first indices (FarField::PrepareTick's
 // tail, D_FARHEADCOUNT), not every entry. farPatchFill keeps D_FARCOUNT and
 // its wg.x indexing of the header pairs.
+// ...TIMES G (2026-10-14): D_FARHEADCOUNT is runs x the sweep's groups per run
+// (FarField::ListSweepGroups, Simulation::EncodeFarFill), each group filling
+// every G-th entry of its run (worldgen.wgsl `far`, SEVERAL WORKGROUPS PER
+// RUN): a sprint tick's ~8 runs were 8 workgroups on a 38-SM GPU.
 PASS(farFill, "farFill", PT_FARFILL, PIPE_FAR_FILL, K_COMPUTE, D_FARHEADCOUNT,1,1,
      GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
      USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO)

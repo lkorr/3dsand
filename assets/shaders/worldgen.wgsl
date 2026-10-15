@@ -4927,8 +4927,8 @@ fn colSkyMargin(biome : u32) -> i32 {
 // column-cache pre-pass (`cols`, over the y-range of every listed chunk on
 // the column) and the far sweep (`far`, over its sixteen row samples). It
 // fills the cave bands and says which of the two tile scans the range needs;
-// the caller runs them (`cols` from the tree tile cache, `far` directly --
-// its sample columns are 2^shift apart and share no tiles). A declined
+// the caller runs them (`cols` from the tree tile cache, `far` from the far
+// tile cache: FAR_TILE_MAX's note, farTreeScans). A declined
 // computation is one no cell in [yLo, yHi] can read:
 //
 //   cave bands   genCellIn reads them only for `y <= h && !inRim`: none when
@@ -5536,7 +5536,15 @@ fn genCellIn(col : ptr<function, Col>,
   // head never floats over no stalk. worldmap.cpp's MaxPlantH includes the
   // jitter, so the sky-skip and far blocker ceilings cover the tallest column
   // a row can produce.
-  if (GROUND_COVER && mat == MAT_AIR && shore.onShore && y > h) {
+  // (THE PLANT REACH, both blocks: a row's stalk ends `hgt` over the ground,
+  // jitter and head included, and worldmap.cpp packs the tallest any row can
+  // reach -- the biome's own cover rows as WM_B_MAX_COVER_H, every water
+  // preset's shore rows in WM_H_MAX_COVER_H -- so a cell above that reach is
+  // air to both blocks and skips their per-row hashes. Exact: it is the
+  // sky-skip's own bound (colSkyMargin), applied per cell. The far sweep
+  // asks every row of a forest's canopy band, and this was most of each.)
+  if (GROUND_COVER && mat == MAT_AIR && shore.onShore && y > h &&
+      y - h <= i32(worldMap[WM_H_MAX_COVER_H])) {
     let up = y - h;                  // voxels above this column's ground
     let nRows = wmWater(wp, WM_W_SHORE_COUNT);
     for (var i = 0u; i < nRows; i++) {
@@ -5592,8 +5600,8 @@ fn genCellIn(col : ptr<function, Col>,
   // is a row that grows only above it; minY / maxY stay absolute bands for a
   // row an author pins to one map's altitudes. Steep rock grows nothing
   // (coverRowPick).
-  if (GROUND_COVER && mat == MAT_AIR && y > h && !inRim && pond < 0 &&
-      !siteKeepOut(x, z) && !dgSurfNear(x, z, 0)) {
+  if (GROUND_COVER && mat == MAT_AIR && y > h && y - h <= i32(wmBiome(biome, WM_B_MAX_COVER_H)) &&
+      !inRim && pond < 0 && !siteKeepOut(x, z) && !dgSurfNear(x, z, 0)) {
     // The row is a property of the COLUMN (coverRowPick); only "is this cell
     // inside its stalk" depends on y.
     let cp = coverRowPick(col, ponds, canopyMemo, x, z, seed);
@@ -7422,6 +7430,216 @@ const FAR_SIG_RAN : u32 = 1u;
 // they share (a coarse level's sub-column is wider than a chunk).
 @group(1) @binding(7) var<storage, read_write> farMap : array<atomic<u32>>;
 
+// ---- THE FAR TILE CACHE (2026-10-14, sprint flight) -------------------------
+// Every per-column tree scan in the far kernels -- the candidate set
+// (treeCandsInto), the canopy memo (undergrowthSite), the crown proxy
+// (farCanopyAt) and genCellIn's own one-shot treeAt -- visits the 5 x 5 tiles
+// around its column and pays treeInfo for each: a landAt, a biomeAt, a
+// treelineAt and the species gates, ~25 times per scan and up to three scans
+// per column. Measured on the far bench (selftest_render.cpp RunFarBench,
+// 600 ticks of sprint over the default map): with the sweep's candidate scan
+// off, farFill went 4.6 -> 2.5 ms a tick; with `farmap`'s one-shot treeAt off,
+// farMapFill 5.2 -> 2.0. The trees were half of both kernels.
+//
+// And the scans are the SAME tiles. A workgroup's columns are 2^shift apart
+// (the sweep: 16 x 16 of them) or 2^(shift-1) (`farmap`: an 8 x 8 block), so
+// up to level 5 they share a window of a few dozen tiles, not 25 apiece. The
+// genChunk/`cols` tile cache (wgTree) is the same idea for one fine chunk;
+// this is its generalisation to a footprint whose size is the level's.
+// (colPrologue's note used to say the sweep's columns "share no tiles"; that
+// is true only from level 6 up.)
+//
+// The workgroup fills each tile of its window ONCE (treeInfoBare: the tile
+// half, everything but the asking column's pond gates), and each scan reads
+// it back pond-gated for its own column (farTileTree, the wgTreeFor rule). A
+// tile outside the window -- a window too big for the array, i.e. a coarse
+// level -- is computed on the spot exactly as treeInfo computes it. Same
+// tiles, same order, same rejects, same per-tile halves (treeCandAdd,
+// undergrowthAdd, canopyFor): every scan returns what the uncached one did,
+// and the far digest says so (RunFarBench prints it).
+//
+// THE TILE IS EIGHT WORDS, not the Tree's sixteen (farTilePack): 576 of them
+// fit in 18 KiB, which is the worst-case window of the sweep at level 6
+// (16 columns 64 voxels apart: 24 x 24 tiles) and of `farmap` at level 8
+// (8 sub-columns 128 apart). Past those the window is too big and the tiles
+// are computed on the spot, through the one walk (farTreeScans) that keeps
+// it to one evaluation per tile per column.
+const FAR_TILE_MAX : i32 = 576;
+var<workgroup> wgFarTree : array<array<u32, 8>, FAR_TILE_MAX>;
+// A tile whose numbers do not fit the packing below (an atlas no shipped
+// species comes near) is marked and computed on the spot instead: the cache
+// can only ever be exact.
+const FAR_TILE_RAW : u32 = 0x200000u;
+fn farTilePack(t : Tree) -> array<u32, 8> {
+  var w : array<u32, 8>;
+  w[0] = bitcast<u32>(t.wx);
+  w[1] = bitcast<u32>(t.wz);
+  w[2] = bitcast<u32>(t.base);
+  w[3] = t.varOff;
+  let fits = t.sp >= -1 && t.sp < 65534 && t.rot < 4u && t.reach >= 0 && t.reach < 65536 &&
+             t.above >= 0 && t.above < 65536 && t.crownR >= 0 && t.crownR < 65536 &&
+             t.shade >= 0 && t.shade < 65536 && t.nwMax >= -32768 && t.nwMax < 32768 &&
+             t.nwMin >= 0 && t.nwMin < 65536;
+  w[4] = (u32(t.sp + 1) & 0xFFFFu) | (t.rot << 16u) | select(0u, 1u << 18u, t.mir) |
+         select(0u, 1u << 19u, t.autumn) | select(0u, 1u << 20u, t.present) |
+         select(FAR_TILE_RAW, 0u, fits);
+  w[5] = (u32(t.reach) & 0xFFFFu) | (u32(t.above) << 16u);
+  w[6] = (u32(t.crownR) & 0xFFFFu) | (u32(t.shade) << 16u);
+  w[7] = (bitcast<u32>(t.nwMax) & 0xFFFFu) | (u32(t.nwMin) << 16u);
+  return w;
+}
+// The Tree back, every field a scan reads (`rnd` is read by none).
+fn farTileUnpack(w : array<u32, 8>) -> Tree {
+  var t : Tree;
+  t.wx = bitcast<i32>(w[0]);
+  t.wz = bitcast<i32>(w[1]);
+  t.base = bitcast<i32>(w[2]);
+  t.varOff = w[3];
+  t.sp = i32(w[4] & 0xFFFFu) - 1;
+  t.rot = (w[4] >> 16u) & 3u;
+  t.mir = (w[4] & (1u << 18u)) != 0u;
+  t.autumn = (w[4] & (1u << 19u)) != 0u;
+  t.present = (w[4] & (1u << 20u)) != 0u;
+  t.reach = i32(w[5] & 0xFFFFu);
+  t.above = i32(w[5] >> 16u);
+  t.crownR = i32(w[6] & 0xFFFFu);
+  t.shade = i32(w[6] >> 16u);
+  t.nwMax = bitcast<i32>(w[7] << 16u) >> 16u;
+  t.nwMin = i32(w[7] >> 16u);
+  t.rnd = 0u;
+  return t;
+}
+// Whether any thread of the workgroup will scan (read through
+// workgroupUniformLoad: the fill ends in a barrier).
+var<workgroup> wgFarTileUse : atomic<u32>;
+// The sweep's sixteen-by-sixteen columns' ground (`far`'s cave seal).
+var<workgroup> wgFarColH : array<i32, 256>;
+
+// The window (x0, z0 tile, x and z tile counts) that every scan of a column in
+// [lo, hi] (fine x/z) reads; all zero = no cache (too big for the array).
+fn farTileWin(lo : vec2<i32>, hi : vec2<i32>) -> vec4<i32> {
+  let t0 = vec2<i32>(fdiv(lo.x, TREE_TILE), fdiv(lo.y, TREE_TILE)) - vec2<i32>(TREE_SCAN);
+  let t1 = vec2<i32>(fdiv(hi.x, TREE_TILE), fdiv(hi.y, TREE_TILE)) + vec2<i32>(TREE_SCAN);
+  let a = t1 - t0 + vec2<i32>(1);
+  if (a.x * a.y > FAR_TILE_MAX) { return vec4<i32>(0); }
+  return vec4<i32>(t0, a);
+}
+// Fill the window. The whole workgroup, in uniform control flow; the caller
+// barriers after.
+fn farTilesFill(li : u32, nThreads : u32, win : vec4<i32>, seed : u32) {
+  for (var i = i32(li); i < win.z * win.w; i += i32(nThreads)) {
+    let s = treeSite(win.x + i % win.z, win.y + i / win.z, seed);
+    wgFarTree[i] = farTilePack(treeInfoBare(s, landAt(s.wx, s.wz, seed), seed));
+  }
+}
+// treeInfo(tx, tz) for the asking column (its pond set), from the window when
+// the tile is in it.
+fn farTileTree(win : vec4<i32>, tx : i32, tz : i32, seed : u32,
+               ponds : ptr<function, PondSet>) -> Tree {
+  var t : Tree;
+  let r = vec2<i32>(tx, tz) - win.xy;
+  var cached = r.x >= 0 && r.y >= 0 && r.x < win.z && r.y < win.w;
+  if (cached) {
+    let w = wgFarTree[r.y * win.z + r.x];
+    cached = (w[4] & FAR_TILE_RAW) == 0u;
+    t = farTileUnpack(w);
+  }
+  if (!cached) {
+    let s = treeSite(tx, tz, seed);
+    t = treeInfoBare(s, landAt(s.wx, s.wz, seed), seed);
+  }
+  if (t.present && !treePondOk(&t, ponds)) { t.present = false; }
+  return t;
+}
+// The widest crown in the atlas (TA_S_CROWN_R): a lattice tree's crown,
+// undergrowth shade and far canopy proxy all end at its own crownR.
+fn treeMaxCrownR() -> i32 {
+  var r = 0;
+  for (var sp = 0; sp < taSpeciesCount(); sp++) { r = max(r, i32(taSpecies(sp, TA_S_CROWN_R))); }
+  return r;
+}
+// ---- THE THREE SCANS IN ONE (2026-10-14) ------------------------------------
+// treeCandsInto, undergrowthSite(x, z).cover and farCanopyAt walk the SAME
+// 5 x 5 tiles in the same order, and a column of the far kernels asks up to
+// all three: one walk here, one farTileTree per tile, each scan fed exactly
+// the tiles it would have taken --
+//   the candidates  every tile whose site is within treeMaxReach (its own
+//                   reject), then the site trees; nothing at all, sites
+//                   included, when the atlas has no species (its early out);
+//   the cover       every tile, then siteUndergrowth -- but a tile whose site
+//                   is past the widest crown on either axis adds nothing
+//                   (undergrowthAdd's d2 > crownR^2), so it is not asked;
+//   the canopy      every tile until the first crown over the column (its
+//                   early return), then the site trees until one; a tile past
+//                   max(widest crown, half a cell) adds neither a crown
+//                   (canopyOf: d2 > crownR^2) nor a stem (the trunk axis must
+//                   lie in the column's cell), so it is not asked either.
+// A tile no scan asks for is never evaluated, which is most of the outer
+// ring at the coarse levels where the window is too big to cache.
+// `trees` is the candidate set (colNoTrees' empty one when not wanted).
+struct FarScans { cover : i32, can : FarCanopy };
+fn farTreeScans(trees : ptr<function, TreeCands>, x : i32, z : i32, seed : u32,
+                ponds : ptr<function, PondSet>, win : vec4<i32>,
+                wantTrees : bool, wantCover : bool, wantCan : bool, shift : u32) -> FarScans {
+  (*trees).n = 0;
+  (*trees).top = -1048576;
+  let candOn = wantTrees && taSpeciesCount() > 0;
+  var u : Undergrowth;
+  u.cover = 0;
+  u.trunkD2 = 1 << 24;
+  let shaped = shift <= FAR_CANOPY_SHAPED_MAX_SHIFT;
+  let half = 1 << (max(shift, 1u) - 1u);
+  var can = farCanopyNone();
+  var stemOnly = farCanopyNone();
+  var canFound = !wantCan;
+  var out : FarScans;
+  out.cover = 0;
+  out.can = farCanopyNone();
+  if (!candOn && !wantCover && !wantCan) { return out; }
+  let maxReach = treeMaxReach();
+  let crownR = max(treeMaxCrownR(), half);
+  let tx = fdiv(x, TREE_TILE);
+  let tz = fdiv(z, TREE_TILE);
+  for (var oz = -TREE_SCAN + unrollFence(); oz <= TREE_SCAN; oz++) {
+    for (var ox = -TREE_SCAN + unrollFence(); ox <= TREE_SCAN; ox++) {
+      let s = treeSite(tx + ox, tz + oz, seed);
+      let dx = abs(x - s.wx);
+      let dz = abs(z - s.wz);
+      let cand = candOn && dx <= maxReach && dz <= maxReach;
+      let crown = dx <= crownR && dz <= crownR;
+      let cov = wantCover && crown;
+      let cn = !canFound && crown;
+      if (!cand && !cov && !cn) { continue; }
+      var t = farTileTree(win, tx + ox, tz + oz, seed, ponds);
+      if (cand) { treeCandAdd(trees, &t, x, z); }
+      if (cov) { undergrowthAdd(&u, &t, x, z); }
+      if (cn) {
+        let c = canopyFor(&t, x, z, seed, shaped, half);
+        if (c.mat != MAT_AIR) { can = c; canFound = true; }
+        else if (c.bark != MAT_AIR && stemOnly.bark == MAT_AIR) { stemOnly = c; }
+      }
+    }
+  }
+  if (candOn) { siteTreesInto(trees, x, z, seed); }
+  if (wantCover) { siteUndergrowth(&u, x, z, seed); }
+  if (!canFound) {
+    let lst = wmSiteList(x, z);
+    let n = wmSiteN(lst);
+    for (var k = 0u; k < n && !canFound; k++) {
+      let sid = wmSiteK(lst, k);
+      if (wmSiteKind(sid) != WM_SITE_TREE) { continue; }
+      var t = siteTree(sid, seed);
+      let c = canopyFor(&t, x, z, seed, shaped, half);
+      if (c.mat != MAT_AIR) { can = c; canFound = true; }
+      else if (c.bark != MAT_AIR && stemOnly.bark == MAT_AIR) { stemOnly = c; }
+    }
+    if (!canFound) { can = stemOnly; }
+  }
+  out.cover = u.cover;
+  if (wantCan) { out.can = can; }
+  return out;
+}
+
 var<workgroup> wgFarCount : atomic<u32>;
 // Non-air cells contributed by the patch pass (`farpatch`). Kept apart from
 // wgFarCount because the two are answers to different questions and only their
@@ -7511,12 +7729,30 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   // other 31 entries of a column no longer launch a 256-thread workgroup of
   // this kernel only to return. The head test stays as the guard: an index
   // that is not a run's first returns exactly as before.
-  let hi = farList[T.farCount + farList[FAR_LIST_TAIL_HDR] + wg.x];
+  //
+  // ...AND SEVERAL WORKGROUPS PER RUN WHEN THE TICK HAS FEW (2026-10-14).
+  // A sprint tick's slice is ~8 runs of a level-1 plane, so the sweep was 8
+  // workgroups on a 38-SM GPU, each thread walking every row of all 32 of
+  // its column's entries in series -- in a forest, a hundred genCellIn calls
+  // -- and the tick took as long as the slowest such column. So
+  // FarField::PrepareTick picks a GROUP COUNT G (tail header word 2, >= 1)
+  // and the extent is runs x G: workgroup wg.x fills run wg.x / G, and only
+  // its entries e with e % G == wg.x % G (interleaved, so the run's surface
+  // band is shared out rather than handed to one group). Each group builds
+  // the column prologue for its own entries' union range -- the work G
+  // groups repeat in parallel, which is the price of a shorter chain -- and
+  // every entry re-applies its own gates to it exactly as before (THE COLUMN
+  // STACK's EXACTNESS note holds for any subset of a run). Same calls with
+  // the same arguments per entry: the same bytes.
+  let groups = max(farList[FAR_LIST_TAIL_HDR + 2u], 1u);
+  let grp = wg.x % groups;
+  let hi = farList[T.farCount + farList[FAR_LIST_TAIL_HDR] + wg.x / groups];
   if (hi >= T.farCount) { return; }
   let head = farList[hi];
   if (hi > 0u && farSameColumn(farList[hi - 1u], head)) { return; }
   var nRun = 1u;
   while (hi + nRun < T.farCount && farSameColumn(farList[hi + nRun], head)) { nRun += 1u; }
+  if (grp >= nRun) { return; }   // a run shorter than G: this group has no entry
 
   // Bit 31 is the surface-map fill flag (`farmap`), not part of the level.
   let level = ((head & ~FAR_LIST_MAP_BIT) >> FAR_SLOT_SHIFT) + 1u;   // 1-based
@@ -7526,11 +7762,13 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   let half = 1 << (shift - 1u);
   // The run's level chunks share x and z; their y (level-cell units) spans
   // [cyLo, cyHi] -- the union of the row ranges the column is built for.
+  if (li == 0u) { atomicStore(&wgFarTileUse, 0u); }
+  workgroupBarrier();
   var cyLo = 2147483647;
   var cyHi = -2147483647;
   var hx = 0;
   var hz = 0;
-  for (var e = 0u; e < nRun; e++) {
+  for (var e = grp; e < nRun; e += groups) {
     let s = farList[hi + e] & FAR_SLOT_MASK;
     let sc = vec3<i32>(vec3<u32>(s % FAR_NCHUNK, (s / FAR_NCHUNK) % FAR_NCHUNK,
                                  s / (FAR_NCHUNK * FAR_NCHUNK)));
@@ -7586,23 +7824,50 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   var caveU : CaveBands;
   var trees : TreeCands;
   let needU = colPrologue(&col, fx, fz, yLoU, yHiU, &caveU);
+  // This column's ground for its neighbours' cave seal (below): genColumn's
+  // `h` IS colHeightAt's (both are landColumn's), and the axis-neighbouring
+  // sample columns step apart are this run's own threads.
+  let cxi = x0 + b;   // this thread's column in the level chunk
+  wgFarColH[zi * CHUNK + cxi] = col.h;
+  // THE TILE CACHE (FAR_TILE_MAX's note): the run's 16 x 16 columns share
+  // one window up to level 5. Filled only when some column will scan.
+  let canNeedU = shift >= FAR_CANOPY_MIN_SHIFT && farCanopyRows(col.h, yLoU, yHiU, step);
+  if (needU.trees || needU.canopy || canNeedU) { atomicOr(&wgFarTileUse, 1u); }
+  var win = farTileWin(vec2<i32>((hx << shift) + half, (hz << shift) + half),
+                       vec2<i32>(((hx + i32(CHUNK) - 1) << shift) + half,
+                                 ((hz + i32(CHUNK) - 1) << shift) + half));
+  if (workgroupUniformLoad(&wgFarTileUse) == 0u) { win = vec4<i32>(0); }
+  if (win.z != 0) { farTilesFill(li, 256u, win, T.seed); }
+  workgroupBarrier();
   // THE NEIGHBOUR CELLS' GROUND (farCaveSealed): the lowest ground of the four
   // axis-neighbouring cells' sample columns, only for a column whose cave
-  // bands are on in this run's range. One call site, a fenced loop: each
-  // colHeightAt is a whole landColumn (see farCornerTop's note).
+  // bands are on in this run's range. A neighbour inside the level chunk is
+  // another thread's column, whose `h` (wgFarColH, published above the
+  // barrier) is the colHeightAt it would have paid a whole landColumn for;
+  // only one across the chunk's edge is computed (one call site, a fenced
+  // loop: see farCornerTop's note).
   var caveNbrMin = 2147483647;
   if ((caveU.on1 || caveU.on2) && !col.inRim && !col.wet && yLoU <= col.h) {
     for (var ni = unrollFenceU(); ni < 4u; ni++) {
-      let sx = select(-step, step, (ni & 1u) != 0u);
-      let nxz = select(vec2<i32>(fx, fz + sx), vec2<i32>(fx + sx, fz), ni < 2u);
-      caveNbrMin = min(caveNbrMin, colHeightAt(nxz.x, nxz.y, T.seed));
+      let d = select(-1, 1, (ni & 1u) != 0u);
+      let nc = select(vec2<i32>(i32(cxi), i32(zi) + d), vec2<i32>(i32(cxi) + d, i32(zi)), ni < 2u);
+      if (all(nc >= vec2<i32>(0)) && all(nc < vec2<i32>(i32(CHUNK)))) {
+        caveNbrMin = min(caveNbrMin, wgFarColH[u32(nc.y) * CHUNK + u32(nc.x)]);
+      } else {
+        caveNbrMin = min(caveNbrMin, colHeightAt(fx + (nc.x - i32(cxi)) * step,
+                                                 fz + (nc.y - i32(zi)) * step, T.seed));
+      }
     }
   }
-  if (needU.trees) { treeCandsInto(&trees, fx, fz, T.seed, &ponds); } else { colNoTrees(&trees); }
+  // The candidates, the canopy memo and the crown proxy in one tile walk
+  // (farTreeScans); each is what treeCandsInto / undergrowthSite /
+  // farCanopyAt answer, and colNoTrees' empty set where the run declined it.
+  let scans = farTreeScans(&trees, fx, fz, T.seed, &ponds, win, needU.trees, needU.canopy,
+                           canNeedU, shift);
   let treesN = trees.n;
   let treesTop = trees.top;
   var canopy = -1;
-  if (needU.canopy) { canopy = undergrowthSite(fx, fz, T.seed, &ponds).cover; }
+  if (needU.canopy) { canopy = scans.cover; }
   let skyMargin = colSkyMargin(col.biome);
 
   // ---- THE SKY CEILING: the row above which this column has nothing ----
@@ -7652,10 +7917,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   // holds rows that can hold the surface cell or a crown over it
   // (farCanopyRows is a superset rule, so the union range answers for every
   // entry that wants it); the crown's dome is not sky either.
-  var canU = farCanopyNone();
-  if (shift >= FAR_CANOPY_MIN_SHIFT && farCanopyRows(col.h, yLoU, yHiU, step)) {
-    canU = farCanopyAt(fx, fz, T.seed, &ponds, shift);
-  }
+  let canU = scans.can;   // farCanopyNone unless canNeedU (farTreeScans)
   // THE BURIED ROWS (map v2 P1): a sample at or under colDeepStoneTop that
   // the cave bands leave solid is M_STONE -- genCellIn's own answer there,
   // by colDeepStoneTop's enumeration of its chain -- so it is answered
@@ -7666,7 +7928,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   // byte is the one the call would have produced.
   let deepTop = colDeepStoneTop(&col);
 
-  for (var e = 0u; e < nRun; e++) {
+  for (var e = grp; e < nRun; e += groups) {
     if (li == 0u) {
       atomicStore(&wgFarCount, 0u);
       atomicStore(&wgFarTop, 0u);
@@ -8252,6 +8514,12 @@ struct CoverTree {
   rm     : u32,   // rot | mir << 2
   reach  : i32,
   leafSw : u32,   // treeCandAdd's autumn word
+  // The variant's own grid words, read once here instead of five atlas loads
+  // per sub-sample in coverTreeColumn (TA_V_ANCHORX | ANCHORZ << 16,
+  // TA_V_NX | NZ << 16, TA_V_COLUMNS). Grids are a few hundred voxels.
+  anchor : u32,
+  nxz    : u32,
+  cols   : u32,
 };
 const FAR_COVER_NONE : i32 = -1048576;
 const FAR_COVER_TREES : u32 = 64u;   // two 32-bit masks per column
@@ -8280,12 +8548,17 @@ fn coverTreeOf(t : ptr<function, Tree>) -> CoverTree {
   e.reach = (*t).reach;
   e.leafSw = select(0u, treeAtlas[TA_H_SPECIES_DIR] + u32((*t).sp) * TA_SPECIES_WORDS,
                     (*t).autumn);
+  let vo = (*t).varOff;
+  e.anchor = treeAtlas[vo + TA_V_ANCHORX] | (treeAtlas[vo + TA_V_ANCHORZ] << 16u);
+  e.nxz = treeAtlas[vo + TA_V_NX] | (treeAtlas[vo + TA_V_NZ] << 16u);
+  e.cols = treeAtlas[vo + TA_V_COLUMNS];
   return e;
 }
 fn coverTreeNone() -> CoverTree {
   var e : CoverTree;
   e.wx = 0; e.wz = 0; e.base = 0; e.vtop = FAR_COVER_NONE;
   e.varOff = 0u; e.rm = 0u; e.reach = 0; e.leafSw = 0u;
+  e.anchor = 0u; e.nxz = 0u; e.cols = 0u;
   return e;
 }
 // Does the tree reach the box [lo, hi] (fine x/z, inclusive) and the rows [ylo, yhi]?
@@ -8297,11 +8570,13 @@ fn coverTreeMeets(e : CoverTree, lo : vec2<i32>, hi : vec2<i32>, ylo : i32, yhi 
 }
 // What tree `e` puts at fine voxel p (MAT_AIR when nothing): treeCandAdd's
 // column lookup and treeCellFrom's run scan.
-fn coverTreeCell(e : CoverTree, p : vec3<i32>) -> u32 {
-  if (p.y <= e.base || p.y > e.vtop) { return MAT_AIR; }
-  let dx = p.x - e.wx;
-  let dz = p.z - e.wz;
-  if (abs(dx) > e.reach || abs(dz) > e.reach) { return MAT_AIR; }
+// The tree's atlas column at fine (x, z): (run offset, run count), count 0
+// when it holds nothing there (or the column is out of its reach / grid) --
+// treeCandAdd's column lookup on the cached grid words.
+fn coverTreeColumn(e : CoverTree, x : i32, z : i32) -> vec2<u32> {
+  let dx = x - e.wx;
+  let dz = z - e.wz;
+  if (abs(dx) > e.reach || abs(dz) > e.reach) { return vec2<u32>(0u); }
   var rx = dx;
   var rz = dz;
   switch (e.rm & 3u) {
@@ -8311,23 +8586,48 @@ fn coverTreeCell(e : CoverTree, p : vec3<i32>) -> u32 {
     default: {}
   }
   if ((e.rm & 4u) != 0u) { rx = -rx; }
-  let vo = e.varOff;
-  let lx = i32(treeAtlas[vo + TA_V_ANCHORX]) + rx;
-  let lz = i32(treeAtlas[vo + TA_V_ANCHORZ]) + rz;
-  let nx = i32(treeAtlas[vo + TA_V_NX]);
-  let nz = i32(treeAtlas[vo + TA_V_NZ]);
-  if (lx < 0 || lz < 0 || lx >= nx || lz >= nz) { return MAT_AIR; }
-  let ci = treeAtlas[vo + TA_V_COLUMNS] + u32(lz * nx + lx) * 2u;
-  let cnt = treeAtlas[ci + 1u];
-  if (cnt == 0u) { return MAT_AIR; }
+  let lx = i32(e.anchor & 0xFFFFu) + rx;
+  let lz = i32(e.anchor >> 16u) + rz;
+  let nx = i32(e.nxz & 0xFFFFu);
+  let nz = i32(e.nxz >> 16u);
+  if (lx < 0 || lz < 0 || lx >= nx || lz >= nz) { return vec2<u32>(0u); }
+  let ci = e.cols + u32(lz * nx + lx) * 2u;
+  return vec2<u32>(treeAtlas[ci], treeAtlas[ci + 1u]);
+}
+// What tree `e` puts at fine voxel p (MAT_AIR when nothing): treeCandAdd's
+// column lookup and treeCellFrom's run scan.
+fn coverTreeCell(e : CoverTree, p : vec3<i32>) -> u32 {
+  if (p.y <= e.base || p.y > e.vtop) { return MAT_AIR; }
+  let col = coverTreeColumn(e, p.x, p.z);
+  if (col.y == 0u) { return MAT_AIR; }
   var c : TreeCand;
   c.wx = e.wx; c.wz = e.wz; c.base = e.base;
   c.ny = e.vtop - e.base - 1;
   c.vtop = e.vtop;
-  c.colOff = treeAtlas[ci];
-  c.colCnt = cnt;
+  c.colOff = col.x;
+  c.colCnt = col.y;
   c.leafSw = e.leafSw;
   return treeCellFrom(c, p.y);
+}
+// The trees of mask (m0, m1) that hold an atlas column at fine (x, z), in the
+// mask's order: coverTreesAt over this answers what it answers over the whole
+// mask at every y of that column (the others are air there).
+fn coverMaskAt(m0 : u32, m1 : u32, x : i32, z : i32) -> vec2<u32> {
+  var a = 0u;
+  var lo = m0;
+  while (lo != 0u) {
+    let bt = countTrailingZeros(lo);
+    lo &= lo - 1u;
+    if (coverTreeColumn(wgCover[wgCoverIdx[bt]], x, z).y != 0u) { a |= 1u << bt; }
+  }
+  var c = 0u;
+  var hi = m1;
+  while (hi != 0u) {
+    let bt = countTrailingZeros(hi);
+    hi &= hi - 1u;
+    if (coverTreeColumn(wgCover[wgCoverIdx[32u + bt]], x, z).y != 0u) { c |= 1u << bt; }
+  }
+  return vec2<u32>(a, c);
 }
 // The first tree of the column's mask (compact-list order) with matter at p.
 fn coverTreesAt(m0 : u32, m1 : u32, p : vec3<i32>) -> u32 {
@@ -8538,6 +8838,88 @@ fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
     // (No trees reach this column: the loop below runs zero times.)
     let anyTree = (m0 | m1) != 0u;
     let thinLevel = shift <= FAR_THIN_MAX_SHIFT;
+    // THE SUB-COLUMNS' OWN MASKS (2026-10-14). The eight sub-samples stand in
+    // FOUR fine columns (x, z), the same four on every row, and most trees of
+    // the column's box mask have no atlas column at a given one (a crown is
+    // round, the mask a box). Each sub-column keeps the trees that do, in the
+    // mask's order, found once per lane: a row then asks only those, where it
+    // asked every tree of the box with five atlas reads apiece. A tree left
+    // out answers air at that column on every row (coverTreeCell's column
+    // test), so the first tree with matter is the same one.
+    var sm : array<vec2<u32>, 4>;
+    for (var k = 0u; k < 4u && anyTree; k++) {
+      sm[k] = coverMaskAt(m0, m1, cx0 + i32(k & 1u) * half + (half >> 1u),
+                          cz0 + i32(k >> 1u) * half + (half >> 1u));
+    }
+    // ...and the thin rule's: every face neighbour of a sub-sample stands in
+    // a fine column at (half >> 1) - 1 .. (half >> 1) + half + 1 from the
+    // cell's corner per axis (4 x 4 at level 1, 5 x 5 at level 2), built the
+    // first time a row of this lane needs the rule.
+    let nmLo = (half >> 1u) - 1;
+    var nm : array<vec2<u32>, 25>;
+    var nmReady = false;
+    // THE SUB-SAMPLES, A COLUMN AT A TIME (2026-10-14). A sub-column's 32
+    // sub-samples (16 rows x 2) stand `half` apart from y = f0.y + half / 2,
+    // and a tree's atlas column there is a few sorted runs: so each tree of
+    // the sub-column's mask is looked up ONCE and its runs are laid over the
+    // samples they cover, first tree in mask order first (a sample a tree
+    // already claimed keeps it: coverTreesAt's "first tree with matter"). What
+    // treeCellFrom answers for the sample is the run holding ly = y - base - 1
+    // when ly is in [0, ny) and air otherwise, the autumn ramp applied; a run
+    // that would answer air claims nothing, as coverTreesAt then asks the next
+    // tree. The row loop below reads each sample's two slots (cover | thin,
+    // farCoverSlotOf / farThinSlotOf of that material) instead of asking every
+    // tree per row: cs[k * 16 + yi] holds sub-sample sy of row yi at bits
+    // sy * 16.
+    var cs : array<u32, 64>;
+    let sy0 = f0.y + (half >> 1u);
+    for (var k = 0u; k < 4u && anyTree; k++) {
+      let sx = cx0 + i32(k & 1u) * half + (half >> 1u);
+      let sz = cz0 + i32(k >> 1u) * half + (half >> 1u);
+      var claimed = 0u;
+      var mlo = sm[k].x;
+      var mhi = sm[k].y;
+      while (mlo != 0u || mhi != 0u) {
+        var q = 0u;   // the mask's next tree, m0's bits before m1's
+        if (mlo != 0u) { q = countTrailingZeros(mlo); mlo &= mlo - 1u; }
+        else { q = 32u + countTrailingZeros(mhi); mhi &= mhi - 1u; }
+        let e = wgCover[wgCoverIdx[q]];
+        let col = coverTreeColumn(e, sx, sz);
+        let ny = e.vtop - e.base - 1;
+        for (var r = 0u; r < col.y; r++) {
+          let rw = treeAtlas[col.x + r];
+          let y0 = i32((rw >> 16u) & TREE_RUN_Y0_MASK);
+          let y1 = min(y0 + i32((rw >> TREE_RUN_LEN_SHIFT) & TREE_RUN_LEN_MASK), ny);   // ly in [y0, y1)
+          if (y1 <= y0) { continue; }
+          // The samples whose ly lies in [y0, y1): y = sy0 + s * half, ly = y - base - 1.
+          let a = e.base + 1 + y0 - sy0;        // first y offset the run covers
+          let z = e.base + 1 + y1 - 1 - sy0;    // last
+          let sLo = max((a + half - 1) / half, 0);
+          let sHi = min(select((z - (half - 1)) / half, z / half, z >= 0), 31);
+          if (z < 0 || sLo > sHi) { continue; }
+          let bits = (select(0xFFFFFFFFu >> u32(31 - (sHi - sLo)), 0xFFFFFFFFu, sHi - sLo >= 31) << u32(sLo)) & ~claimed;
+          if (bits == 0u) { continue; }
+          var m = rw & 0xFFFu;
+          if (e.leafSw != 0u) {
+            for (var i = 0u; i < 3u; i++) {
+              if (m == treeAtlas[e.leafSw + TA_S_LEAF0 + i]) {
+                m = treeAtlas[e.leafSw + TA_S_AUTUMN0 + i];
+                break;
+              }
+            }
+          }
+          if (m == MAT_AIR) { continue; }
+          claimed |= bits;
+          let sl = farCoverSlotOf(m) | (farThinSlotOf(m) << 8u);
+          var bb = bits;
+          while (bb != 0u) {
+            let sb = countTrailingZeros(bb);
+            bb &= bb - 1u;
+            cs[k * 16u + (sb >> 1u)] |= sl << ((sb & 1u) * 16u);
+          }
+        }
+      }
+    }
     for (var yi = 0u; yi < CHUNK && anyTree; yi++) {
       let byteV = bytes[yi];
       if (farCellSlot(byteV) != 0u) { continue; }       // the centre found matter
@@ -8550,9 +8932,10 @@ fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
       thin.lo = 0u;
       thin.hi = 0u;
       for (var o = 0u; o < 8u; o++) {
-        let m = coverTreesAt(m0, m1, farCoverSub(c0, half, o));
-        farCoverPut(&acc, o, farCoverSlotOf(m));
-        if (thinLevel) { farCoverPut(&thin, o, farThinSlotOf(m)); }
+        let k = (o & 1u) | ((o >> 1u) & 2u);   // the sub-column: x bit, z bit
+        let sl = (cs[k * 16u + yi] >> (((o >> 1u) & 1u) * 16u)) & 0xFFFFu;
+        farCoverPut(&acc, o, sl & 0xFFu);
+        if (thinLevel) { farCoverPut(&thin, o, sl >> 8u); }
       }
       var pick = farCoverPick(acc, level);
       // THE THIN RULE over the trees (a one-voxel twig, a sapling's trunk):
@@ -8561,6 +8944,12 @@ fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
       if (pick == 0u && thinLevel) {
         let need = farThinNeedMask(thin);
         if (need != 0u) {
+          if (!nmReady) {
+            nmReady = true;
+            for (var g = 0; g < (half + 3) * (half + 3); g++) {
+              nm[g] = coverMaskAt(m0, m1, cx0 + nmLo + g % (half + 3), cz0 + nmLo + g / (half + 3));
+            }
+          }
           var oLo = 0u;
           var oHi = 0u;
           for (var k = 0u; k < 48u; k++) {
@@ -8568,7 +8957,8 @@ fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
             let j = k % 6u;
             if ((need & (1u << o)) == 0u) { continue; }
             let q = farThinNbr(farCoverSub(c0, half, o), j);
-            if (!farCellIsSolid(coverTreesAt(m0, m1, q))) { farThinOpenSet(&oLo, &oHi, o, j); }
+            let g = nm[(q.x - cx0 - nmLo) + (q.z - cz0 - nmLo) * (half + 3)];
+            if (!farCellIsSolid(coverTreesAt(g.x, g.y, q))) { farThinOpenSet(&oLo, &oHi, o, j); }
           }
           pick = farThinPick(thin, oLo, oHi);
         }
@@ -8734,10 +9124,10 @@ fn farcover(@builtin(workgroup_id) wg : vec3<u32>,
 // in-flight harness (ticket 2026-10-11_12-10-09, `--frames` worst-frame
 // table), as long as the 1,024-entry sieve beside it -- half of every
 // 100-200 ms flying hitch. The row is now dispatched (farCount, 16)
-// (pass_table.def farMapFill) and workgroup wg.y takes every 16th block of 64
-// sub-columns, so each thread does ONE: same work, sixteen times the
-// parallelism. The stride is read from num_workgroups, so a dispatch of any
-// height still covers the whole column.
+// (pass_table.def farMapFill) and each thread does ONE sub-column: same
+// work, sixteen times the parallelism. Since 2026-10-14 workgroup wg.y takes
+// the 8 x 8 BLOCK (wg.y % 4, wg.y / 4), for the far tile cache's window
+// (`farmap` has the note), so the dispatch height must stay 16.
 // THE COVER BIT (LOD-seam package E, 2026-09-28 -- RETIRED 2026-10-14). A
 // column plant (grass, a flower, moss: any MATF_MICRO material) is dropped by
 // every far writer (farCellIsSolid), so past the handoff a meadow was its bare
@@ -9046,9 +9436,18 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
   let shift = farCellShift(level);
   let wsh = shift - 1u;               // fine voxels per sub-column, as a shift
   let hw = (1 << wsh) >> 1;           // its centre column (0 at level 1)
-  let n = 2u * CHUNK;                 // sub-columns per axis under the chunk
-  for (var i = wg.y * 64u + li + unrollFenceU(); i < n * n; i += 64u * nwg.y) {
-    let m = vec2<i32>(base.x * 2 + i32(i % n), base.z * 2 + i32(i / n));
+  // ONE SUB-COLUMN PER THREAD, IN 8 x 8 BLOCKS (2026-10-14). The entry's
+  // (2 x CHUNK)^2 = 1,024 sub-columns are sixteen workgroups (pass_table.def
+  // farMapFill's 16 in y) of 64 threads, and workgroup `wg.y` takes block
+  // (wg.y % 4, wg.y / 4) of 8 x 8 -- a square, so its tree tile window (FAR
+  // TILE CACHE) stays under FAR_TILE_MAX up to level 7. Which thread fills
+  // which sub-column changes no word: each writes only its own (and the cover
+  // plane's word only from its (even, even) sub-column, as before).
+  let m = vec2<i32>(base.x * 2 + i32((wg.y % 4u) * 8u + li % 8u),
+                    base.z * 2 + i32((wg.y / 4u) * 8u + li / 8u));
+  if (li == 0u) { atomicStore(&wgFarTileUse, 0u); }
+  workgroupBarrier();
+  {
     let fx = (m.x << wsh) + hw;
     let fz = (m.y << wsh) + hw;
     var ponds : PondSet;
@@ -9058,6 +9457,34 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
     // not a heightfield. And a top the 16-bit field cannot hold is no claim.
     var ok = wmSiteTopAt(fx, fz) <= col.h &&
              top + FAR_MAP_H_BIAS >= 0 && top + FAR_MAP_H_BIAS <= 0xFFFF;
+    // ---- THE TREE SCANS, through the block's tile window ----
+    // q = 0 below (the voxel over the top) is read only by the feature fill,
+    // so it is asked only at its levels (<= FAR_FEAT_LEVELS); there the tree
+    // candidates of the column are built from the window and handed to
+    // genCellIn as VALID (treeFromCands of exactly treeCandsInto's set, which
+    // is treeAt) -- a column that cannot grow a tree, or whose q = 0 voxel is
+    // over every tree top, gets the empty set treeAt would have answered air
+    // with. Every other q asks y <= top, where genCellIn never reaches its
+    // tree block (y > h, AIR: a dry top is h, a wet one is fluid).
+    // The canopy memo (undergrowthSite's cover) is computed once, from the
+    // window, for coverRowPick (q = 0) and for the cover plane and features.
+    let featLevel = level <= FAR_FEAT_LEVELS;
+    let needTrees = featLevel && colGrowsTrees(&col) && top + 1 <= treeMaxTop();
+    let canopyRows = wmFlag(col.biome, WM_BF_CANOPY_ROWS);
+    let needCanopy = canopyRows && (featLevel || top == col.h);
+    let needCan = shift >= FAR_CANOPY_MIN_SHIFT && top == col.h;
+    if (needTrees || needCanopy || needCan) { atomicOr(&wgFarTileUse, 1u); }
+    let m0 = vec2<i32>(base.x * 2 + i32((wg.y % 4u) * 8u), base.z * 2 + i32((wg.y / 4u) * 8u));
+    var win = farTileWin((m0 << vec2<u32>(wsh)) + vec2<i32>(hw),
+                         ((m0 + vec2<i32>(7)) << vec2<u32>(wsh)) + vec2<i32>(hw));
+    if (workgroupUniformLoad(&wgFarTileUse) == 0u) { win = vec4<i32>(0); }
+    if (win.z != 0) { farTilesFill(li, 64u, win, T.seed); }
+    workgroupBarrier();
+    var trees : TreeCands;
+    let scans = farTreeScans(&trees, fx, fz, T.seed, &ponds, win, needTrees, needCanopy,
+                             needCan && ok, shift);
+    var canopyQ = -1;
+    if (needCanopy) { canopyQ = scans.cover; }
     // The skin (y == top) and the sub-skin (y == top - 1) in ONE rolled loop:
     // every genCellCol call site is a whole inlined genCellIn, and this entry
     // should cost the driver one of them (see unrollFence()).
@@ -9091,7 +9518,6 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
     var noCave : CaveBands;
     noCave.on1 = false;
     noCave.on2 = false;
-    var trees : TreeCands;
     // q = 0 the voxel over the top (the cover plant, if any), 1 the skin, 2
     // the sub-skin; 3.. the strata probes (one depth each, while the searches
     // run). ONE genCellIn call site: each is a whole inlined copy (see
@@ -9105,7 +9531,8 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
         if (sHiS == 0xFFFFu) { y = top - sHi; }
         else { y = top - (sLo + sHi) / 2; }
       }
-      let mq = genCellIn(&col, &noCave, q >= 3u, &trees, false, &ponds, -1,
+      if (q == 0u && !featLevel) { continue; }
+      let mq = genCellIn(&col, &noCave, q >= 3u, &trees, true, &ponds, canopyQ,
                          fx, y, fz, T.seed) & 0xFFFu;
       if (q == 0u) { cover = mq; } else if (q == 1u) { skin = mq; } else if (q == 2u) {
         under = mq;
@@ -9154,9 +9581,10 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
     // a crown too thin to survive sampling is painted onto the ground skin, and
     // a refined sub-column there must wear the same paint as the cell it
     // replaces, or the far forest turns into bare grass the moment it refines.
-    if (shift >= FAR_CANOPY_MIN_SHIFT && top == col.h && ok) {
-      let can = farCanopyAt(fx, fz, T.seed, &ponds, shift);
-      if (farCanopyPaintsGround(can, col.h, shift)) { skin = can.mat; }
+    if (needCan && ok) {
+      // scans.can is farCanopyAt's answer: computed when needCan held with
+      // the `ok` of before the skin test, and `ok` only ever turns false.
+      if (farCanopyPaintsGround(scans.can, col.h, shift)) { skin = scans.can.mat; }
     }
     if (!farCellIsSolid(under)) { under = skin; }
     // THE ENTRY'S SLOT FIELDS ARE SEVEN BITS (16..22, 23..29), the cell byte's
@@ -9177,9 +9605,7 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
     // block. The cover plane below carries the cell's coverage instead, and
     // the sub-skin field is the sub-skin again.
     var canopy = -1;
-    if (wmFlag(col.biome, WM_BF_CANOPY_ROWS) && top == col.h) {
-      canopy = undergrowthSite(fx, fz, T.seed, &ponds).cover;
-    }
+    if (canopyRows && top == col.h) { canopy = canopyQ; }
     // THE COVER PLANE (farCoverCell): one word per level cell, written by its
     // (even, even) sub-column's thread, from that column.
     if ((m.x & 1) == 0 && (m.y & 1) == 0) {

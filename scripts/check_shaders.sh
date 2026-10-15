@@ -771,7 +771,13 @@ if [ -f "$WORLDGEN_COMBINED" ]; then
   # the far LOD trees (132b822, baked silhouette at levels 5-6) each fit alone
   # (24,918) and together measure 25,425. fardown compiles in ~100 s cold, not
   # far's ~750 s; the merged tree's cold pipeline time is in that commit.
-  for spec in "far:32000" "farpatch:25000" "fardown:28000" "farmap:25000"; do
+  # `farmap` 25000 -> 27000 (2026-10-14, far kernel perf): the far tile
+  # cache (worldgen.wgsl FAR TILE CACHE: the window fill, the packed tile and
+  # the one-walk tree scans, farTreeScans) replaced three per-column scans
+  # and the one-shot treeAt with one walk over workgroup memory: 24,031 ->
+  # 25,136. Its cold pipeline compile went DOWN with it (the far bench run,
+  # SANDVOX_SHADER_TIMING: see that commit), and the kernel runs ~4x faster.
+  for spec in "far:32000" "farpatch:25000" "fardown:28000" "farmap:27000"; do
     ep="${spec%%:*}"; ceil="${spec##*:}"
     spv="$TMP/worldgen_${ep}.spv"
     if ! "$TINT_BIN" -f spirv -ep "$ep" -o "$spv" "$WORLDGEN_COMBINED" >/dev/null 2>&1; then

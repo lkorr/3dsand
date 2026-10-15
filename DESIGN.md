@@ -16990,6 +16990,54 @@ where you hear from either (§12b, "The ears are on the character").
   shrinking those kernels is the next lever. Not kept: draining the far
   slice on the non-tick frame (at sprint ~70% of frames tick; farMapFill
   rose), and `render.farPlaneBatch` 2048 (p50 -4 ms but p95/p99 +10 ms).
+  **The far kernels stop recomputing trees (2026-10-14, sprint flight).**
+  The paragraph above blamed `far`'s and `farmap`'s binary size and spills;
+  attribution says the cost was mostly WORK the kernels repeated. A fixed
+  workload made it measurable: `SANDVOX_FAR_BENCH=x,y,z[,ticks[,speed[,batch]]]`
+  on `--gate far-fog` (selftest_render.cpp RunFarBench) refills the cascade at
+  a point, flies `ticks` of sprint along +x with the game's plane pacing, one
+  submit per tick waited on, and prints per-pass GPU ms per tick (all ticks
+  and by level; `SANDVOX_GPU_TIMER_SERIAL=1 SANDVOX_FAR_SERIAL=1` to
+  attribute) plus a digest of the whole cascade after the flight, so an exact
+  rewrite shows the same two words. On the default map at the sprint ticket's
+  start: switching the sweep's candidate scan off took farFill 4.6 -> 2.5 ms a
+  tick, and `farmap`'s voxel-over-the-top lookup off took farMapFill 5.2 ->
+  2.0. Both were TREE SCANS: each column pays treeInfo (landAt, biomeAt,
+  treelineAt, the species gates) for the 5 x 5 tiles around it, and asked up
+  to three scans of the same tiles (candidates, canopy memo, crown proxy),
+  plus genCellIn's one-shot treeAt for `farmap`'s q = 0 at EVERY level although
+  only the feature levels (1-2) read that voxel. What landed, every step
+  byte-identical (digest farVox 653146adbedd6acf farMap 2d48d9afdedfed13):
+  (1) THE FAR TILE CACHE (worldgen.wgsl `FAR_TILE_MAX`): a workgroup fills
+  the window of tiles its columns can reach once, packed 8 words a tile in
+  workgroup memory (576 tiles: the sweep's 16 x 16 columns up to level 6,
+  `farmap`'s 8 x 8 sub-column blocks at every level -- `farmap` now takes its
+  sub-columns in square blocks for this), and the scans read it pond-gated
+  per column (`farTileTree`); a tile outside the window is computed as
+  before. (2) ONE WALK for the three scans (`farTreeScans`), which also skips
+  a tile past the widest crown for the two crown scans. (3) q = 0 only at the
+  feature levels, with the candidates from the window handed to genCellIn as
+  valid. (4) G WORKGROUPS PER RUN for the sweep (`FarField::ListSweepGroups`,
+  tail header word 2, ~64 workgroups a tick): a sprint slice was 8 runs, i.e.
+  8 workgroups each walking 32 entries in series. (5) The cave seal reads its
+  four neighbours' ground from the run's own threads (only the chunk's edge
+  pays a landColumn). (6) `farcover` lays each tree's atlas runs over a
+  sub-column's 32 samples once (sorted runs, first tree in mask order keeps a
+  sample) instead of asking every tree of the box per sub-sample, with the
+  variant's grid words cached on the CoverTree. (7) genCellIn's cover and
+  shore blocks skip a cell above the plant reach (WM_B_MAX_COVER_H /
+  WM_H_MAX_COVER_H, the sky-skip's own bound): the sweep asked every canopy
+  row of a forest; genChunk gets the same skip, and the world hash cannot
+  move. Bench, quiet GPU, original vs final back to back (real overlap, no
+  serial timers): sprint far tick mean 8.3 -> 3.8 ms, p50 7.6 -> 3.4, p90
+  14.5 -> 6.1, p99 18.7 -> 9.5, max 20.3 -> 12.4; refill tick mean 10.7 ->
+  4.0, p99 21.3 -> 8.2. Left: level 1 (forest rows in the sweep; `farcover`'s
+  thin rule asks neighbours tree by tree) and the sweep at levels 7-8, whose
+  windows do not fit (2,000-6,000 tiles). `render.farPlaneBatch` 128 / 256 /
+  512 measured the same at sprint (the deadlines, not the floor, set the
+  slices). NOT kept: marking the big helpers `DontInline` in the SPIR-V
+  (spirv-opt respects it, and so does the NVIDIA driver -- the far compile
+  went 64 -> 319 s and the first refill lost the device).
   **The ticket harness had been measuring an F5.** A default `--frames 1200`
   reloads shaders at frame 600 -- the moment the flight starts -- and the
   far pipelines' re-arrival queues a whole FullRefill; that refill, not

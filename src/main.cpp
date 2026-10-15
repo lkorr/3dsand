@@ -7447,7 +7447,8 @@ int main(int argc, char** argv) {
   if (!ctx.Init(window, (uint32_t)initW, (uint32_t)initH, lowPowerAdapter,
                 /*wantTimestamps=*/measure || perf || renderBudget || fluidBench ||
                     budgetArms || telemetryEnabled || g_harnessFrames > 0 ||
-                    std::getenv("SANDVOX_TICKET_COST") != nullptr,
+                    std::getenv("SANDVOX_TICKET_COST") != nullptr ||
+                    std::getenv("SANDVOX_FAR_BENCH") != nullptr,
                 backend, vkValidation,
                 sledgehammer))
     return 1;

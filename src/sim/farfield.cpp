@@ -511,6 +511,7 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
   // still has to tell the renderer which levels it may march.
   listMapCount_ = 0;   // whatever returns 0 below dispatches no `farmap`
   listHeadCount_ = 0;
+  listSweepGroups_ = 1;
   if (!drain) return 0;
   // The pacing clock (PlaneDue / PlaneQuota) counts DRAINING ticks, the ones
   // that could have dispatched: `now` is the tick Update just stamped its
@@ -692,7 +693,8 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
   listMapCount_ = (uint32_t)listOut_.size() - count;
   // ...THEN EACH RUN'S FIRST INDEX: the sweep (`far`) fills a level-chunk
   // column's whole run from its first entry's workgroup (worldgen.wgsl THE
-  // COLUMN STACK), so it dispatches one workgroup per run, not per entry.
+  // COLUMN STACK), so it dispatches per run, not per entry (G workgroups a
+  // run: THE SWEEP'S GROUPS PER RUN below).
   // farSameColumn's test, word for word; an index this misses would be a
   // column never filled, so the shader keeps its own head test as the guard
   // in the other direction. SANDVOX_FAR_ALLWG=1 lists every index (the
@@ -709,11 +711,32 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
   for (uint32_t i = 0; i < count; i++)
     if (allWg || i == 0 || !sameColumn(list_[i - 1], list_[i])) listOut_.push_back(i);
   listHeadCount_ = (uint32_t)(listOut_.size() - headBase);
+  // ---- THE SWEEP'S GROUPS PER RUN (worldgen.wgsl `far`, 2026-10-14) -------
+  // A far pass costs its slowest workgroup, and the sweep's workgroup walks
+  // its run's entries in series: with few runs in the tick (a 256-entry plane
+  // slice is ~8) the GPU idled while 8 threads per column ground through 32
+  // entries each. G workgroups per run split a run's entries G ways; each
+  // repeats the column prologue, which is why G shrinks as the tick's runs
+  // grow: about kSweepTarget workgroups a tick (a refill tick's 32 runs get 2,
+  // a Y plane's 1,024 runs of one get 1). SANDVOX_FAR_SWEEP_GROUPS=<n> pins
+  // G (the A/B arm; 1 = the one-workgroup-per-run sweep).
+  {
+    static const uint32_t pinned = [] {
+      const char* e = std::getenv("SANDVOX_FAR_SWEEP_GROUPS");
+      return e ? (uint32_t)std::max(0, std::atoi(e)) : 0u;
+    }();
+    static const uint32_t target = [] {
+      const char* e = std::getenv("SANDVOX_FAR_SWEEP_TARGET");
+      return e ? (uint32_t)std::max(1, std::atoi(e)) : kSweepTarget;
+    }();
+    const uint32_t g = pinned ? pinned : target / std::max(listHeadCount_, 1u);
+    listSweepGroups_ = std::clamp<uint32_t>(g, 1u, kSweepMaxGroups);
+  }
   queue.WriteBuffer(world_->farList, 0, listOut_.data(), listOut_.size() * 4);
   // The tail header at 3 x kFarListCap: the map count, so `far` can find the
   // heads after the map entries (worldgen.wgsl FAR_LIST_TAIL_HDR).
   static_assert(kFarListCap == 4096, "worldgen.wgsl FAR_LIST_TAIL_HDR is 3 x 4096");
-  const uint32_t hdr[2] = {listMapCount_, listHeadCount_};
+  const uint32_t hdr[3] = {listMapCount_, listHeadCount_, listSweepGroups_};
   queue.WriteBuffer(world_->farList, (uint64_t)kFarListTailHdr * 4, hdr, sizeof hdr);
   // The header is written for EVERY dispatched entry, always — the kernel
   // indexes it by dispatch index and a stale pair points the patch loop at
