@@ -662,6 +662,13 @@ struct MobDef {
   // every other cross-asset reference in this engine (CLAUDE.md design rule 4).
   // Empty = no AI: the creature keeps the legacy wander-and-avoid.
   std::string behavior;
+  // THIS CHARACTER'S STEALTH SKILLS, 0..100, from the sidecar's `stealth`
+  // block (`sneak`, `awareness`); < 0 = its behaviour profile's (ai_behavior.h
+  // Profile::stealth). Per character, so one `villager` profile holds a keen
+  // watchman and a dozy farmhand -- and a player's chosen body brings its own
+  // sneak (a goblin is quieter than a knight). Inherited through `extends`.
+  float stealthSneak = -1.0f;
+  float stealthAwareness = -1.0f;
   // THE POSE A CREATURE HOLDS WHILE IT IS COMING FOR YOU. A clip name (sidecar
   // or assets/anims), played by MobSystem::UpdateAnimation whenever the brain
   // has a target and is not idling, and weight-ramped down to nothing when it
@@ -4688,7 +4695,13 @@ class Mob {
   void PushFootfall(const Footfall& ff) {
     if (footfalls_.size() >= kMaxFootfalls) footfalls_.erase(footfalls_.begin());
     footfalls_.push_back(ff);
+    // ...and what a LISTENER makes of it (stealth): the surface underfoot,
+    // and a landing's thump. Tick-side state, like the plant that set it.
+    if (ff.mat != 0) lastFootMat_ = ff.mat;
+    if (ff.landing) landNoise_ = std::max(landNoise_, ff.fallSpeed);
   }
+  // The AI is sneaking this body (Intent::Stalk).
+  bool AiCrouch() const { return aiCrouch_; }
 
   // Release a body's burn index and front (lattice compacted / rig torn down).
   static void DropBurnIndex(BodyBurnState& st);
@@ -5921,6 +5934,22 @@ class Mob {
   // The behaviour layer's per-creature memory (game/ai_behavior.h). Pure
   // gameplay state: never hashed, never saved, rebuilt from the def on spawn.
   ai::Brain ai_;
+  // ---- STEALTH (game/mob_stealth.cpp) ------------------------------------
+  // `aiCrouch_`: the AI is sneaking this body (IntentOut::crouch, a stalk):
+  // the pose crouches (PoseInputs::crouch) and it publishes Stance::Crouch.
+  // The LIGHT on it and its WORN METAL are measured on a cadence, not every
+  // tick (both change slowly; MobSystem::PublishStealth). `lastFootMat_` is
+  // what the last footfall planted on, `landNoise_` a landing's fall speed
+  // not yet turned into a noise event -- both set at the plant, in the tick.
+  bool aiCrouch_ = false;
+  float stealthLight_ = 1.0f;
+  uint32_t stealthLightAt_ = 0;
+  bool stealthLightValid_ = false;
+  float wornMetal_ = 0.0f;
+  uint32_t wornMetalAt_ = 0;
+  bool wornMetalValid_ = false;
+  uint32_t lastFootMat_ = 0;
+  float landNoise_ = 0.0f;
   // ---- ownership (M9.4-B) --------------------------------------------------
   // The playerId that STEPS this creature. Default 0 = session 0 = the only
   // player a single-player process has, so nothing below ever fires until
@@ -6831,6 +6860,16 @@ class MobSystem {
     // watcher sees (reach, hp, facing, the point) is read off the avatar in
     // PreTick. 0 = None, which is also what a remote ghost publishes.
     uint8_t action = 0;
+    // ---- HOW HIDDEN THE PLAYER IS (stealth; game/stealth.h) ---------------
+    // What only the session's controller knows: the stance, the walk it is
+    // making as a fraction of its own walk speed, and how deep in liquid the
+    // legs are. MobSystem::PublishStealth adds the light, the noise and the
+    // skill. `stealth` false -- a fly-mode camera, a gate's fixture, a remote
+    // ghost -- is perceived the legacy way (stealth::Exposure::modelled).
+    bool stealth = false;
+    uint8_t stance = 0;       // stealth::Stance
+    float moveFrac = 0.0f;
+    float wading = 0.0f;
   };
   void SetPlayerActors(std::span<const PlayerActorDesc> players);
   void ClearPlayerActors() { playerActors_.clear(); }
@@ -7116,6 +7155,82 @@ class MobSystem {
   }
   const std::vector<StrikeEvent>& StrikeEvents() const { return strikes_; }
   void ClearStrikeEvents() { strikes_.clear(); }
+
+  // ==== STEALTH (game/stealth.h; game/mob_stealth.cpp) =====================
+  //
+  // NOISE EVENTS. Posted at any phase of a tick (a blow, a cry, a landing,
+  // an arrow striking stone) and HEARD on the next one: PreTick swaps the
+  // double buffer before any brain thinks, so what a creature hears never
+  // depends on which phase of the tick made the noise -- and a replay of the
+  // same ticks hears the same things. Bounded (rule 2): past kMaxNoises in a
+  // tick the quietest is refused, and the refusal is counted.
+  static constexpr size_t kMaxNoises = 256;
+  void PostNoise(const stealth::Noise& n);
+  const std::vector<stealth::Noise>& HeardNoises() const { return noiseNow_; }
+  uint64_t NoisesRefused() const { return noiseRefused_; }
+  // THE LIGHT ON A BODY, 0..1, from the tick: daylight (dayPhase_), how open
+  // the sky is over it (five columns through the chunk caches -- roofs and
+  // canopy are shade; it asks NO fetches), rain, and glowing matter near it
+  // (per-chunk emitter sums, cached by chunk version). CPU-deterministic like
+  // the line of sight, and the same stores it reads; never a render target.
+  float LightAt(World& world, const Vec3& centre, float heightVox);
+  // The id `m` has in the actor list: its mob id, or a player's band id for
+  // an avatar (ai::kPlayerActorBase + i). 0 = not an actor.
+  uint64_t ActorIdOf(const Mob& m) const;
+  // SNEAK ATTACK: the multiplier a blow (or an arrow) from `attackerActorId`
+  // lands with on `victim` -- stealth.sneakMelee / sneakRanged (or the
+  // weapon's own `itemMul` when > 0) when the victim has NOT DETECTED the
+  // attacker (ai::Detects) and the attacker is crouched or prone (when
+  // stealth.sneakNeedsCrouch); else 1. A player's body is never "caught
+  // unaware" (it has no meter); neither is a creature with no stealth senses.
+  float SneakAttackMul(const Mob& victim, uint64_t attackerActorId, bool ranged,
+                       float itemMul = 0.0f) const;
+  // A BLOW LANDED on `victim` from `attackerActorId` (at `attackerPos`): its
+  // brain knows at once (melee) or searches toward the shot (an arrow from a
+  // body it had not detected) -- ai::NoteAttacked.
+  void NoteAttacked(Mob& victim, uint64_t attackerActorId, Vec3 attackerPos,
+                    bool ranged, uint32_t tick);
+  // WHAT THE WORLD THINKS OF ONE ACTOR (the HUD's eye): the highest meter any
+  // creature holds for it and the worst alert among those that hold one,
+  // plus the few strongest watchers for the direction pips.
+  struct StealthWatcher {
+    Vec3 pos{};
+    float level = 0.0f;
+    stealth::Alert alert = stealth::Alert::Calm;
+  };
+  struct StealthReport {
+    float maxLevel = 0.0f;
+    stealth::Alert alert = stealth::Alert::Calm;
+    int watchers = 0;          // creatures with a meter for it over cautionAt
+    int fighting = 0;          // ...that hold it as their target
+    static constexpr int kTop = 4;
+    StealthWatcher top[kTop];
+    int topN = 0;
+  };
+  StealthReport StealthOf(uint64_t actorId) const;
+  // The exposure the players were published with this tick (the HUD's light
+  // and noise meters), by player index; a default (unmodelled) one past it.
+  const stealth::Exposure& PlayerExposure(size_t i) const;
+  const stealth::Params& StealthParams() const { return stealthP_; }
+  float AmbientNoise() const { return ambient_; }
+  // SNEAK ATTACKS THAT LANDED (presentation: the HUD's "SNEAK ATTACK x3").
+  // Frame-drained like the strike events; capped.
+  struct SneakEvent {
+    uint64_t attacker = 0;    // actor id
+    uint64_t victim = 0;      // mob id
+    float mul = 1.0f;
+    Vec3 at{};
+    uint32_t tick = 0;
+    bool ranged = false;
+  };
+  void PushSneakEvent(const SneakEvent& e) {
+    if (sneaks_.size() < 64) sneaks_.push_back(e);
+  }
+  const std::vector<SneakEvent>& SneakEvents() const { return sneaks_; }
+  void ClearSneakEvents() { sneaks_.clear(); }
+  // The tick PreTick last ran (what a hit resolved outside it is stamped
+  // with; the same clock Mob::Die books a rising against).
+  uint32_t TickNow() const { return tick_; }
 
   // ==== MELEE ACROSS THE WIRE (game/meleehit.h, 2026-10-08) =================
   //
@@ -9681,6 +9796,39 @@ class MobSystem {
   std::vector<uint32_t> ignitedForm_;
   uint32_t dayPhase_ = 0;
   uint32_t weatherRain_ = 0;
+  // ---- STEALTH (game/mob_stealth.cpp) ------------------------------------
+  // The noise double buffer (PostNoise / PreTick), this tick's coefficients
+  // (stealth::FromTuning, refreshed at the top of PreTick) and ambient floor,
+  // the sneak events for the HUD, and the players' published exposure.
+  std::vector<stealth::Noise> noiseNow_, noiseNext_;
+  uint64_t noiseRefused_ = 0;
+  std::vector<SneakEvent> sneaks_;
+  stealth::Params stealthP_ = stealth::Defaults();
+  float ambient_ = 0.0f;
+  std::vector<stealth::Exposure> playerExposure_;
+  std::vector<PlayerActorDesc> playerDescs_;
+  // Per material: a footstep's loudness on it (from its footstep sound set
+  // and its class), whether it is METAL (worn, it clanks), and its glow
+  // (emission / 255).
+  std::vector<float> matStepNoise_;
+  std::vector<uint8_t> matMetal_;
+  std::vector<float> matGlow_;
+  // GLOWING MATTER PER CHUNK, by the cached chunk's version: the summed glow
+  // of its cells and their glow-weighted centroid. Rebuilt only when the
+  // chunk's version moves; trimmed when it grows.
+  struct EmitterSum {
+    uint32_t version = 0;
+    float glow = 0.0f;
+    Vec3 centroid{};
+  };
+  std::unordered_map<uint64_t, EmitterSum> emitters_;
+  void BuildStealthTables(const std::vector<MaterialDef>& mats);
+  // Fill `a.stealth` for a creature (or an avatar, from its desc).
+  void PublishStealth(World& world, Mob& m, ai::Actor& a, uint32_t tick,
+                      const PlayerActorDesc* desc);
+  // The share of a body's worn shells that is metal, 0..1.
+  float WornMetalOf(const Mob& m) const;
+  const EmitterSum* EmitterOf(World& world, IVec3 chunk);
   int32_t rainSlopeQx_ = 0, rainSlopeQz_ = 0;
   // EVERY LIVE BODY POINTS INTO THIS VECTOR (Mob::def_, and the avatar's too,
   // which this system cannot reach). So it is never allowed to reallocate

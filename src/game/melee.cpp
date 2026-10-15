@@ -640,6 +640,7 @@ bool LoadItems(const std::string& dir, size_t materialCount,
     d.strike.bluntCarve = std::clamp(it.value("bluntCarve", 0.0f), 0.0f, 1.0f);
     d.strike.armorBreak = std::clamp(it.value("armorBreak", 0.0f), 0.0f, 1.0f);
     d.carveBonus = it.value("carveBonus", 0.0f);
+    d.sneakAttack = std::max(0.0f, it.value("sneakAttack", 0.0f));
     // The authored heft OVERRIDE. Absent (or 0) is the normal case and means
     // "derive it from the art" — LoadItemAsset below fills heftVolume and
     // ItemDef::HeftFactor does the division. Present is for the item whose
@@ -2306,6 +2307,39 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         if (n > 1)
           repeat = std::pow(std::clamp(t.repeatHitScale, 0.0f, 1.0f),
                             (float)(n - 1));
+      }
+      // ---- A SNEAK ATTACK (stealth; EdgeSweep::sneakHits) ------------------
+      // Decided once per stroke per creature, at the first contact, BEFORE the
+      // blow tells the victim anything; then the victim knows (NoteAttacked),
+      // and the blow is heard by everything near.
+      if (kind != StruckKind::Debris && s.sneakHits != nullptr && owner != nullptr) {
+        const uint64_t vid = owner->Id();
+        float mul = 0.0f;
+        for (const auto& e : *s.sneakHits)
+          if (e.first == vid) mul = e.second;
+        if (mul == 0.0f) {
+          const uint64_t attacker = mobs.ActorIdOf(wielder);
+          mul = mobs.SneakAttackMul(*owner, attacker, false, s.sneakItemMul);
+          s.sneakHits->push_back({vid, mul});
+          if (mul > 1.0f) {
+            MobSystem::SneakEvent ev;
+            ev.attacker = attacker;
+            ev.victim = vid;
+            ev.mul = mul;
+            ev.at = at;
+            ev.tick = s.tick;
+            mobs.PushSneakEvent(ev);
+          }
+          mobs.NoteAttacked(*owner, attacker, wielder.Origin(), false, s.tick);
+          stealth::Noise nz;
+          nz.pos = nz.point = at;
+          nz.radius = mobs.StealthParams().strikeNoise *
+                      std::clamp(0.4f + 0.6f * out.power * out.edgeAlign, 0.0f, 1.5f);
+          nz.source = attacker;
+          nz.kind = stealth::NoiseKind::Strike;
+          mobs.PostNoise(nz);
+        }
+        repeat *= std::max(1.0f, mul);
       }
       parts.blunt.hp *= repeat;
       parts.bite.hp *= repeat;

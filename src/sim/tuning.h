@@ -2390,6 +2390,73 @@ struct Tuning {
     float flatMinSin = TPD(melee, flatMinSin);
   } melee;
 
+  // ---- stealth and detection (game/stealth.h, docs/PLAN_stealth.md) --------
+  //
+  // CPU gameplay state beside the AI, like everything the arbiter reads: no
+  // shader sees these, and the world hash moves only through what a creature
+  // then DOES. Copied into stealth::Params by stealth::FromTuning once a tick
+  // (MobSystem::PreTick), so an F5 reload reaches the next tick. Every row's
+  // why is above it in tuning_params.def; one line each here.
+  struct Stealth {
+    // -- the meter (0..1; 1 = detected) --
+    float cautionAt = TPD(stealth, cautionAt);          // turns to look
+    float investigateAt = TPD(stealth, investigateAt);  // walks over to look
+    float soundCap = TPD(stealth, soundCap);            // sound alone stops here
+    float sightRate = TPD(stealth, sightRate);          // /s, point blank
+    float soundRate = TPD(stealth, soundRate);          // /s, at the source
+    float decay = TPD(stealth, decay);                  // /s, always draining
+    float searchDecay = TPD(stealth, searchDecay);      // /s, a fought / sought body
+    float searchHold = TPD(stealth, searchHold);        // a lost body's meter at the search
+    float searchGainMul = TPD(stealth, searchGainMul);  // gains while searching
+    float alertedGainMul = TPD(stealth, alertedGainMul);  // gains while alerted
+    int alertedTicks = TPD(stealth, alertedTicks);      // alerted after a search
+    // -- sight --
+    float sightFalloff = TPD(stealth, sightFalloff);    // exponent on (1 - d/reach)
+    float awarenessReach = TPD(stealth, awarenessReach);  // reach per awareness
+    float nearAlways = TPD(stealth, nearAlways);        // vox: the dark stops hiding
+    float lightFloor = TPD(stealth, lightFloor);        // the darkest a body reads
+    float lightGamma = TPD(stealth, lightGamma);        // < 1 lifts the dim end
+    float crouchVis = TPD(stealth, crouchVis);
+    float proneVis = TPD(stealth, proneVis);
+    float stillVis = TPD(stealth, stillVis);            // a body that does not move
+    float runVis = TPD(stealth, runVis);                // per walk-speed past a walk
+    float sneakVisCut = TPD(stealth, sneakVisCut);      // at sneak 100
+    float sneakNoiseCut = TPD(stealth, sneakNoiseCut);  // at sneak 100
+    float refHeight = TPD(stealth, refHeight);          // vox: size 1
+    float combatSightMul = TPD(stealth, combatSightMul);
+    float combatLightFloor = TPD(stealth, combatLightFloor);
+    float keepGain = TPD(stealth, keepGain);            // a fought body is "seen" above
+    // -- sound (audible radius, vox, awareness 50, silence) --
+    float walkNoise = TPD(stealth, walkNoise);
+    float crouchNoise = TPD(stealth, crouchNoise);
+    float proneNoise = TPD(stealth, proneNoise);
+    float runNoisePow = TPD(stealth, runNoisePow);
+    float metalNoise = TPD(stealth, metalNoise);        // a full suit of worn metal
+    float splashNoise = TPD(stealth, splashNoise);      // wading, per walk-speed
+    float muffled = TPD(stealth, muffled);              // through matter
+    float rainMask = TPD(stealth, rainMask);            // ambient in the hardest rain
+    float alarmGain = TPD(stealth, alarmGain);          // an ally's cry
+    float landNoise = TPD(stealth, landNoise);
+    float landRefSpeed = TPD(stealth, landRefSpeed);    // vox/s down
+    float strikeNoise = TPD(stealth, strikeNoise);
+    float voiceNoise = TPD(stealth, voiceNoise);
+    float impactNoise = TPD(stealth, impactNoise);
+    float twangNoise = TPD(stealth, twangNoise);
+    // -- light on a body (0..1) --
+    float nightLight = TPD(stealth, nightLight);
+    float roofedDay = TPD(stealth, roofedDay);
+    float overcastDim = TPD(stealth, overcastDim);
+    float emitterRadius = TPD(stealth, emitterRadius);  // vox
+    float emitterGain = TPD(stealth, emitterGain);
+    float burningLight = TPD(stealth, burningLight);
+    // -- sneak attacks --
+    float sneakMelee = TPD(stealth, sneakMelee);
+    float sneakRanged = TPD(stealth, sneakRanged);
+    bool sneakNeedsCrouch = TPD(stealth, sneakNeedsCrouch);
+    // -- skills (0..100) --
+    float playerSneak = TPD(stealth, playerSneak);
+  } stealth;
+
   // ---- combat feel: hit-stop, hit flash, combat cues --------------------------
   //
   // PRESENTATION ONLY, and the distinction is load-bearing rather than tidy.

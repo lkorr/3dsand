@@ -2272,6 +2272,108 @@ TP_F(melee, leanMinSpeed, NO_WGSL, 0.05f, 0.0f, 5.0f)
 TP_F(melee, flatMinSin, NO_WGSL, 0.20f, 0.0f, 0.95f)
 
 
+// ==== stealth ====
+// ---- stealth and detection (game/stealth.h, docs/PLAN_stealth.md) ---------
+// Every row is NO_WGSL: the model is CPU gameplay state beside the AI, so no
+// shader reads it and no row can miss the shader cache. Distances are world
+// voxels, rates per second, skills 0..100.
+//
+// THE METER. A creature's awareness of a body, 0..1, turns it to look at
+// cautionAt, walks it over to look at investigateAt, and is a DETECTION at 1.
+// Sound alone stops at soundCap: it says where to look, sight must confirm.
+TP_F(stealth, cautionAt, NO_WGSL, 0.3f, 0.0f, 1.0f)
+TP_F(stealth, investigateAt, NO_WGSL, 0.6f, 0.0f, 1.0f)
+TP_F(stealth, soundCap, NO_WGSL, 0.9f, 0.0f, 0.999f)
+// Fill rates at point blank (sight: a fully visible body; sound: at the
+// source), and the drain that runs every tick -- so a body is noticed at all
+// only where its gain beats `decay` (about three quarters of the reach).
+TP_F(stealth, sightRate, NO_WGSL, 2.4f, 0.0f, 20.0f)
+TP_F(stealth, soundRate, NO_WGSL, 1.2f, 0.0f, 20.0f)
+TP_F(stealth, decay, NO_WGSL, 0.18f, 0.0f, 5.0f)
+// HARDER TO LOSE: a target being fought, or one being searched for, drains
+// at searchDecay; a search starts with the lost body's meter at searchHold and
+// fills searchGainMul faster. After the search the creature stays ALERTED for
+// alertedTicks, its gains x alertedGainMul.
+TP_F(stealth, searchDecay, NO_WGSL, 0.05f, 0.0f, 5.0f)
+TP_F(stealth, searchHold, NO_WGSL, 0.75f, 0.0f, 0.999f)
+TP_F(stealth, searchGainMul, NO_WGSL, 1.6f, 1.0f, 10.0f)
+TP_F(stealth, alertedGainMul, NO_WGSL, 1.35f, 1.0f, 10.0f)
+TP_I(stealth, alertedTicks, NO_WGSL, 900, 0, 36000)
+// SIGHT: gain = sightRate x cone x (1 - d/reach)^sightFalloff, reach =
+// sightRange x (0.6 + awarenessReach x awareness/100) x visibility. Skyrim's
+// distance attenuation exponent is 2.
+TP_F(stealth, sightFalloff, NO_WGSL, 2.0f, 0.1f, 6.0f)
+TP_F(stealth, awarenessReach, NO_WGSL, 0.8f, 0.0f, 3.0f)
+// Inside nearAlways voxels the dark stops hiding a body (arm's length).
+TP_F(stealth, nearAlways, NO_WGSL, 14.0f, 0.0f, 100.0f)
+// VISIBILITY = light x stance x motion x size x sneak. Light reads as
+// lightFloor + (1 - lightFloor) x light^lightGamma: pitch black still leaves
+// a shape (Skyrim's light term keeps ~13% in the dark).
+TP_F(stealth, lightFloor, NO_WGSL, 0.12f, 0.0f, 1.0f)
+TP_F(stealth, lightGamma, NO_WGSL, 0.75f, 0.05f, 4.0f)
+TP_F(stealth, crouchVis, NO_WGSL, 0.55f, 0.0f, 1.0f)
+TP_F(stealth, proneVis, NO_WGSL, 0.3f, 0.0f, 1.0f)
+// Motion: stillVis for a body that does not move, 1 at its walk, runVis
+// more per walk-speed past it.
+TP_F(stealth, stillVis, NO_WGSL, 0.7f, 0.0f, 1.0f)
+TP_F(stealth, runVis, NO_WGSL, 0.35f, 0.0f, 3.0f)
+// A sneak skill of 100 takes sneakVisCut off visibility and sneakNoiseCut off
+// every noise the body makes.
+TP_F(stealth, sneakVisCut, NO_WGSL, 0.6f, 0.0f, 1.0f)
+TP_F(stealth, sneakNoiseCut, NO_WGSL, 0.5f, 0.0f, 1.0f)
+// The body height that counts as size 1 (a 1.7 m person).
+TP_F(stealth, refHeight, NO_WGSL, 17.0f, 1.0f, 200.0f)
+// Fighting it: reach x combatSightMul, its light never darker than
+// combatLightFloor, and it stays "seen" while the gain is over keepGain.
+TP_F(stealth, combatSightMul, NO_WGSL, 3.0f, 1.0f, 10.0f)
+TP_F(stealth, combatLightFloor, NO_WGSL, 0.6f, 0.0f, 1.0f)
+TP_F(stealth, keepGain, NO_WGSL, 0.05f, 0.0f, 5.0f)
+// SOUND: every noise is an audible radius (voxels) for an awareness-50
+// listener in silence. Walking on stone is walkNoise; x moveFrac^runNoisePow;
+// crouched / prone x crouchNoise / proneNoise; a full suit of worn metal adds
+// metalNoise of it; wading adds splashNoise per walk-speed.
+TP_F(stealth, walkNoise, NO_WGSL, 70.0f, 0.0f, 1000.0f)
+TP_F(stealth, crouchNoise, NO_WGSL, 0.35f, 0.0f, 1.0f)
+TP_F(stealth, proneNoise, NO_WGSL, 0.2f, 0.0f, 1.0f)
+TP_F(stealth, runNoisePow, NO_WGSL, 1.5f, 0.5f, 4.0f)
+TP_F(stealth, metalNoise, NO_WGSL, 0.8f, 0.0f, 5.0f)
+TP_F(stealth, splashNoise, NO_WGSL, 60.0f, 0.0f, 1000.0f)
+// Through solid matter a sound carries muffled of its radius (Skyrim: 0.3).
+TP_F(stealth, muffled, NO_WGSL, 0.35f, 0.0f, 1.0f)
+// THE AMBIENT FLOOR (Chaos Theory): a noise is heard while radius / distance
+// beats 1 + ambient; the hardest rain is an ambient of rainMask.
+TP_F(stealth, rainMask, NO_WGSL, 0.8f, 0.0f, 5.0f)
+// An ally's alarm cry lifts a listener's meter for the intruder by alarmGain.
+TP_F(stealth, alarmGain, NO_WGSL, 0.5f, 0.0f, 1.0f)
+// Event loudness, voxels: a landing at landRefSpeed (vox/s down), a blow at
+// full power, a cry of pain, an arrow striking matter, a bow loosed.
+TP_F(stealth, landNoise, NO_WGSL, 90.0f, 0.0f, 1000.0f)
+TP_F(stealth, landRefSpeed, NO_WGSL, 120.0f, 1.0f, 2000.0f)
+TP_F(stealth, strikeNoise, NO_WGSL, 110.0f, 0.0f, 1000.0f)
+TP_F(stealth, voiceNoise, NO_WGSL, 130.0f, 0.0f, 1000.0f)
+TP_F(stealth, impactNoise, NO_WGSL, 80.0f, 0.0f, 1000.0f)
+TP_F(stealth, twangNoise, NO_WGSL, 25.0f, 0.0f, 1000.0f)
+// LIGHT on a body: the sky (daylight eased up, nightLight under the moon,
+// roofedDay of the day under a roof, x overcastDim in rain) plus glowing
+// matter (each cell's emission/255 over 1 + (d/emitterRadius)^2, summed, x
+// emitterGain, saturating) plus burningLight while the body is alight.
+TP_F(stealth, nightLight, NO_WGSL, 0.15f, 0.0f, 1.0f)
+TP_F(stealth, roofedDay, NO_WGSL, 0.18f, 0.0f, 1.0f)
+TP_F(stealth, overcastDim, NO_WGSL, 0.75f, 0.0f, 1.0f)
+TP_F(stealth, emitterRadius, NO_WGSL, 30.0f, 1.0f, 500.0f)
+TP_F(stealth, emitterGain, NO_WGSL, 0.12f, 0.0f, 10.0f)
+TP_F(stealth, burningLight, NO_WGSL, 0.8f, 0.0f, 1.0f)
+// SNEAK ATTACKS: a blow on a creature that has not DETECTED its attacker
+// lands sneakMelee (an arrow sneakRanged) times harder -- every hp of it, the
+// way melee.chargeDamage does (Skyrim: x3 one-handed, x2 bows). An item may
+// carry its own `sneakAttack` multiplier. sneakNeedsCrouch: only from a
+// crouch or a crawl, as in Skyrim.
+TP_F(stealth, sneakMelee, NO_WGSL, 3.0f, 1.0f, 30.0f)
+TP_F(stealth, sneakRanged, NO_WGSL, 2.0f, 1.0f, 30.0f)
+TP_B(stealth, sneakNeedsCrouch, NO_WGSL, true)
+// Sneak skill 0..100 of a player whose body's sidecar authors none.
+TP_F(stealth, playerSneak, NO_WGSL, 30.0f, 0.0f, 100.0f)
+
 // ==== combatfx ====
 // ---- combat feel: hit-stop, hit flash, combat cues ------------------------
 TP_B(combatfx, hitStop, NO_WGSL, true)

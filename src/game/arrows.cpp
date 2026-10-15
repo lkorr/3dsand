@@ -247,7 +247,7 @@ bool PullArrowSlotToKit(Mob& m, int li, Kit& kit, const ItemLibrary& items,
 
 bool ArrowFlights::Launch(const ItemDef& arrow, Vec3 fromWorld, Vec3 dirWorld,
                           float speedVox, Vec3 carryVox, uint32_t seed,
-                          std::vector<uint64_t> ignore) {
+                          std::vector<uint64_t> ignore, uint64_t shooterActor) {
   if (!arrow.IsAmmo()) return false;
   const float dl = dirWorld.len();
   if (!(dl > 1e-6f) || !(speedVox > 0.0f)) return false;
@@ -265,6 +265,8 @@ bool ArrowFlights::Launch(const ItemDef& arrow, Vec3 fromWorld, Vec3 dirWorld,
   f.seed = seed;
   f.ticksLeft = kLifeTicks;
   f.ignore = std::move(ignore);
+  f.shooter = shooterActor;
+  f.from = fromWorld;
   live_.push_back(std::move(f));
   stats.launched++;
   return true;
@@ -469,6 +471,17 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
       stats.expired++;
       done = true;
     } else {
+      // THE TWANG (stealth): a bow loosed is heard -- quietly -- at the
+      // archer, once, on the flight's first tick.
+      if (!f.twanged) {
+        f.twanged = true;
+        stealth::Noise n;
+        n.pos = n.point = f.from;
+        n.radius = w.mobs.StealthParams().twangNoise;
+        n.source = f.shooter;
+        n.kind = stealth::NoiseKind::Loose;
+        w.mobs.PostNoise(n);
+      }
       f.vel.y -= kArrowGravityFx;
       prefetch(f.pos, f.vel);
       const SpellFxVec start = f.pos;
@@ -505,6 +518,18 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
         p = next;
       }
       const SpellFxVec segEnd = wall ? wallAt : p;
+      // AN ARROW STRIKING MATTER IS HEARD WHERE IT STRUCK (stealth), and it
+      // betrays nobody: a creature that hears it goes to look at the spot,
+      // not at the archer -- which is what makes a shot into the wall behind
+      // a guard a distraction.
+      if (wall) {
+        stealth::Noise n;
+        n.pos = n.point = FloatOf(wallAt);
+        n.radius = w.mobs.StealthParams().impactNoise;
+        n.source = 0;
+        n.kind = stealth::NoiseKind::Impact;
+        w.mobs.PostNoise(n);
+      }
       const Vec3 a = FloatOf(start), b = FloatOf(segEnd);
       const Vec3 seg = b - a;
       const float len = seg.len();
@@ -519,7 +544,7 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
             ArrowPenetrator(*def, speed0, f.seed ^ (tick * 2654435761u));
         const PierceFlight pf =
             PierceAlongRay(w.phys, w.mobs, w.debris, w.world, spawns, a, seg,
-                           len, pen, f.ignore, def->name);
+                           len, pen, f.ignore, def->name, f.shooter, f.from);
         for (const PierceHit& h : pf.hits) {
           ArrowEvent e = event(ArrowEvent::Kind::Hit, f);
           e.mobId = h.mobId;

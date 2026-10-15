@@ -142,6 +142,9 @@ const char* IntentName(Intent i) {
     case Intent::Orbit: return "orbit";
     case Intent::Charge: return "charge";
     case Intent::Shoot: return "shoot";
+    case Intent::Investigate: return "investigate";
+    case Intent::Search: return "search";
+    case Intent::Stalk: return "stalk";
     default: return "?";
   }
 }
@@ -192,6 +195,8 @@ const char* FactName(Fact f) {
     case Fact::TargetBleeding: return "targetBleeding";
     case Fact::Ammo: return "ammo";
     case Fact::Cornered: return "cornered";
+    case Fact::Awareness: return "awareness";
+    case Fact::Alert: return "alert";
     default: return "?";
   }
 }
@@ -310,6 +315,17 @@ TuneMode TuneModeOf(Tune t) {
 //                 "lead": 1.0, "leadCap": 12, "aimRaise": 0.15,
 //                 "quiver": 12, "bow": "bow" },
 //     // rules may read the facts "ammo" and "cornered".
+//     // ---- stealth (2026-10-15; game/stealth.h Senses) ----------------------
+//     // Present (and not "enabled": false) = this creature perceives through
+//     // the detection meter: light, stance, motion and sound against its
+//     // skills, the intents "investigate", "search" and "stalk" available.
+//     "stealth": { "awareness": 50, "sneak": 20, "sightRange": 220,
+//                  "fovDegrees": 200, "hearing": 1, "darkVision": 0,
+//                  "centralDeg": 70, "peripheral": 0.35,
+//                  "searchTicks": 360, "searchRadius": 40,
+//                  "investigateTicks": 240, "investigateSpeed": 0.45,
+//                  "stalkSpeed": 0.4, "alarm": 120 },
+//     // rules may read the facts "awareness" (0..1) and "alert" (0..3).
 //     // rules may also carry "tune": { "cadence": 0.7, "band": 3, ... } --
 //     // HOW it fights while the rule holds. Names in TuneName.
 //     "rules": [ { "when": { "hp": "<0.35" }, "weight": { "guard": 3 },
@@ -650,6 +666,26 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
       r.quiver = std::clamp(q.value("quiver", 12), 0, 999);
       r.bow = q.value("bow", std::string("bow"));
     }
+    // STEALTH SENSES (game/stealth.h). Absent = the legacy perception.
+    if (p.contains("stealth") && p["stealth"].is_object()) {
+      const auto& q = p["stealth"];
+      stealth::Senses& t = pr.stealth;
+      t.enabled = q.value("enabled", true);
+      t.awareness = std::clamp(q.value("awareness", 50.0f), 0.0f, 100.0f);
+      t.sneak = std::clamp(q.value("sneak", 20.0f), 0.0f, 100.0f);
+      t.sightRange = std::max(0.0f, q.value("sightRange", 0.0f));
+      t.fovDegrees = std::clamp(q.value("fovDegrees", 0.0f), 0.0f, 360.0f);
+      t.hearing = std::max(0.0f, q.value("hearing", 1.0f));
+      t.darkVision = std::clamp(q.value("darkVision", 0.0f), 0.0f, 1.0f);
+      t.centralDeg = std::clamp(q.value("centralDeg", 70.0f), 0.0f, 360.0f);
+      t.peripheral = std::clamp(q.value("peripheral", 0.35f), 0.0f, 1.0f);
+      t.searchTicks = q.value("searchTicks", 360u);
+      t.searchRadius = std::max(0.0f, q.value("searchRadius", 40.0f));
+      t.investigateTicks = std::max(1u, q.value("investigateTicks", 240u));
+      t.investigateSpeed = std::max(0.0f, q.value("investigateSpeed", 0.45f));
+      t.stalkSpeed = std::max(0.0f, q.value("stalkSpeed", 0.4f));
+      t.alarm = std::max(0.0f, q.value("alarm", 0.0f));
+    }
     if (p.contains("intents") && p["intents"].is_object()) {
       for (auto& [k, v] : p["intents"].items()) {
         const Intent in = IntentFromName(k);
@@ -917,6 +953,24 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
         << ", \"quiver\": " << r.quiver
         << ", \"bow\": \"" << Escaped(r.bow) << "\" },\n";
     }
+    // The stealth senses, only for a creature that has them.
+    if (p.stealth.enabled) {
+      const stealth::Senses& t = p.stealth;
+      o << "      \"stealth\": { \"awareness\": " << num(t.awareness)
+        << ", \"sneak\": " << num(t.sneak)
+        << ", \"sightRange\": " << num(t.sightRange)
+        << ", \"fovDegrees\": " << num(t.fovDegrees)
+        << ", \"hearing\": " << num(t.hearing)
+        << ", \"darkVision\": " << num(t.darkVision)
+        << ", \"centralDeg\": " << num(t.centralDeg)
+        << ", \"peripheral\": " << num(t.peripheral)
+        << ", \"searchTicks\": " << t.searchTicks
+        << ", \"searchRadius\": " << num(t.searchRadius)
+        << ", \"investigateTicks\": " << t.investigateTicks
+        << ", \"investigateSpeed\": " << num(t.investigateSpeed)
+        << ", \"stalkSpeed\": " << num(t.stalkSpeed)
+        << ", \"alarm\": " << num(t.alarm) << " },\n";
+    }
     o << "      \"intents\": {\n";
     bool first = true;
     for (int k = 0; k < (int)Intent::Count; k++) {
@@ -1027,7 +1081,399 @@ bool PerceivesLine(const SelfView& self, const Profile& pr, const WorldView& v,
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// STEALTH: THE METER (game/stealth.h; a profile with an enabled `stealth`)
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t kSaltSearch = 0x5EA2Cu;
+// A body that is not the target is weighed every kAwareCadence ticks, its
+// gains integrated over the stride, staggered by the pair's ids (rule 2: a
+// brawl of 64 must not cast 64 lines each, per creature, per tick)...
+constexpr uint32_t kAwareCadence = 3;
+// ...and only the nearest kAwareNearest strangers are weighed at all. A body
+// already in a slot is always weighed.
+constexpr int kAwareNearest = 8;
+// A DETECTED body that is not in sight is still a target this long after it
+// was last sensed: a creature stabbed in the back FEELS where the blade came
+// from and turns on it (it is not in its cone, so it cannot be "seen").
+constexpr uint32_t kFeltTicks = 20;
+
+bool StealthOn(const Profile& pr) {
+  return pr.stealth.enabled &&
+         (pr.perception.sightRange > 0.0f || pr.stealth.sightRange > 0.0f ||
+          pr.stealth.hearing > 0.0f);
+}
+
+// Where a body can be SEEN, by its stance: its upper body, and the top of its
+// head. A crouched body behind a waist-high wall shows the second only; a
+// prone one, usually neither (Blacklist's bone raycasts, at two bones).
+void StealthPoints(const Actor& a, Vec3& torso, Vec3& head) {
+  const float k = a.stealth.stance == stealth::Stance::Crouch ? 0.65f
+                  : a.stealth.stance == stealth::Stance::Prone ? 0.3f
+                                                               : 1.0f;
+  const float h = a.height * k;
+  const float foot = a.centre.y - a.height * 0.5f;
+  torso = Vec3{a.centre.x, foot + h * 0.6f, a.centre.z};
+  head = Vec3{a.centre.x, foot + h * 0.92f, a.centre.z};
+}
+
+stealth::Awareness* FindAware(Brain& b, uint64_t id) {
+  if (id == 0) return nullptr;
+  for (stealth::Awareness& e : b.aware)
+    if (e.id == id) return &e;
+  return nullptr;
+}
+const stealth::Awareness* FindAware(const Brain& b, uint64_t id) {
+  if (id == 0) return nullptr;
+  for (const stealth::Awareness& e : b.aware)
+    if (e.id == id) return &e;
+  return nullptr;
+}
+
+// A slot for `id`: its own, else a free one, else the weakest that is neither
+// the target nor the body being searched for -- and only if `want` (the level
+// it would have) beats that one's. Null = the body is not worth a slot yet.
+stealth::Awareness* SlotFor(Brain& b, uint64_t id, float want) {
+  if (stealth::Awareness* e = FindAware(b, id)) return e;
+  stealth::Awareness* weakest = nullptr;
+  for (stealth::Awareness& e : b.aware) {
+    if (e.id == 0) {
+      e = stealth::Awareness{};
+      e.id = id;
+      return &e;
+    }
+    if ((b.hasTarget && e.id == b.targetId) || e.id == b.searchFor) continue;
+    if (weakest == nullptr || e.level < weakest->level) weakest = &e;
+  }
+  if (weakest == nullptr || want <= weakest->level) return nullptr;
+  *weakest = stealth::Awareness{};
+  weakest->id = id;
+  return weakest;
+}
+
+// RAISE WHAT THE CREATURE IS LOOKING AT (Brain::stim). The same thing again
+// (the same body, or a noise of the same kind at the same place) refreshes
+// it; something else replaces it only if it is at least as strong, so a far
+// clang does not pull a creature off the footsteps it was following. A search
+// owns the stimulus while it runs.
+void RaiseStim(Brain& b, stealth::StimKind kind, Vec3 pos, float level,
+               uint64_t source, uint32_t tick, uint32_t hold) {
+  stealth::Stimulus& s = b.stim;
+  const bool live = s.kind != stealth::StimKind::None && tick <= s.until;
+  if (live && s.kind == stealth::StimKind::Lost) {
+    if (source != 0 && source == s.source) {
+      s.pos = pos;
+      s.tick = tick;
+    }
+    return;
+  }
+  const float dx = s.pos.x - pos.x, dz = s.pos.z - pos.z;
+  const bool near = dx * dx + dz * dz < 36.0f;
+  const bool same = live && ((source != 0 && source == s.source) ||
+                             (source == 0 && s.source == 0 && s.kind == kind && near));
+  if (live && !same && level < s.level) return;
+  if (!same || !near) b.investigateArrived = 0;   // a new place: walk to it
+  s.level = same && kind != stealth::StimKind::Body ? std::max(s.level, level) : level;
+  s.kind = kind;
+  s.pos = pos;
+  s.source = source;
+  s.tick = tick;
+  s.until = tick + hold;
+}
+
+void StartSearch(Brain& b, const Profile& pr, const stealth::Params& P,
+                 uint64_t lost, Vec3 where, uint32_t tick) {
+  if (pr.stealth.searchTicks == 0) return;
+  b.searchUntil = tick + pr.stealth.searchTicks;
+  b.searchFor = lost;
+  b.searchOrigin = where;
+  b.searchGoal = where;
+  b.searchLeg = 0;
+  b.searchLegSince = tick;
+  b.searchLookUntil = 0;
+  b.stim = stealth::Stimulus{};
+  b.stim.kind = stealth::StimKind::Lost;
+  b.stim.pos = where;
+  b.stim.level = 1.0f;
+  b.stim.source = lost;
+  b.stim.tick = tick;
+  b.stim.until = b.searchUntil;
+  // NO LONGER DETECTED: it has to be FOUND again -- but from nearly there.
+  if (stealth::Awareness* e = FindAware(b, lost)) {
+    e->level = std::min(e->level, P.searchHold);
+    e->detected = false;
+  }
+  b.searches++;
+}
+
+// ONE TICK OF THE METER, for every stranger worth weighing. Runs at the top
+// of Perceive, BEFORE the passive / neutral filters: a deer that will never
+// fight anybody still has to SEE you (its rules flee on `awareness`), and a
+// villager who would not attack you still knows you are there -- which is
+// exactly what decides whether your blade is a sneak attack.
+void UpdateAwareness(Brain& b, const Profile& pr, const SelfView& self,
+                     const WorldView& v, uint32_t tick, float dt) {
+  const stealth::Params& P =
+      v.stealthParams != nullptr ? *v.stealthParams : stealth::Defaults();
+  const stealth::Senses& S = pr.stealth;
+  const float aw = self.awareness >= 0.0f ? self.awareness : S.awareness;
+  const float sightRange =
+      S.sightRange > 0.0f ? S.sightRange : pr.perception.sightRange;
+  const float fov = S.fovDegrees > 0.0f ? S.fovDegrees : pr.perception.fovDegrees;
+  const bool searching = tick < b.searchUntil;
+  const bool alerted = tick < b.alertedUntil;
+  // A searching or alerted creature looks HARDER and WIDER: it is turning its
+  // head, not walking its round.
+  const float gainMul =
+      (searching ? P.searchGainMul : 1.0f) * (alerted ? P.alertedGainMul : 1.0f);
+  const float fovNow = (searching || alerted) ? std::min(360.0f, fov * 1.25f) : fov;
+  for (stealth::Awareness& e : b.aware) {
+    e.seen = e.heard = false;
+    e.sightGain = e.soundGain = 0.0f;
+  }
+  const Vec3 c = self.Centre();
+  const Vec3 eye = EyeOf(self);
+  // HURT, BY SOMEBODY WHO HAD ME AS THEIR TARGET: I know who did it. The
+  // explicit path is MobSystem::NoteAttacked (melee and arrows name the
+  // attacker); this is the fallback for a blow nobody reported.
+  const bool hurtNow = b.everHurt && b.hurtTick == tick;
+
+  // THE CANDIDATES: modelled strangers, nearest first (then id: storage order
+  // is not a fact a decision may depend on).
+  thread_local std::vector<std::pair<float, const Actor*>> near;
+  near.clear();
+  if (v.actors != nullptr)
+    for (const Actor& a : *v.actors) {
+      if (a.id == self.id || !a.alive || !a.stealth.modelled) continue;
+      if (a.faction == self.faction) continue;
+      near.push_back({(a.centre - c).len(), &a});
+    }
+  std::sort(near.begin(), near.end(), [](const auto& x, const auto& y) {
+    return x.first < y.first || (x.first == y.first && x.second->id < y.second->id);
+  });
+  // Which slots were LOOKED AT this tick (or deferred by the cadence): the
+  // rest -- a body gone, dead, out of every range -- simply drain.
+  bool listed[Brain::kAware] = {};
+  int considered = 0;
+  for (const auto& [d, ap] : near) {
+    const Actor& a = *ap;
+    const bool current = b.hasTarget && b.targetId == a.id;
+    stealth::Awareness* have = FindAware(b, a.id);
+    if (have != nullptr) listed[have - b.aware] = true;
+    if (!current && have == nullptr && considered >= kAwareNearest) continue;
+    considered++;
+    // Hurt by a body that names me as its target: I know who did it --
+    // whatever the cadence says about weighing it this tick.
+    if (hurtNow && a.targetId == self.id) {
+      if (stealth::Awareness* e = SlotFor(b, a.id, 1.0f)) {
+        if (!e->detected) b.detections++;
+        e->level = 1.0f;
+        e->detected = true;
+        e->lastPos = a.centre;
+        e->lastTick = tick;
+        e->heard = true;
+        listed[e - b.aware] = true;
+        have = e;
+      }
+    }
+    const uint32_t phase =
+        (uint32_t)((self.id ^ a.id) ^ ((self.id ^ a.id) >> 32)) % kAwareCadence;
+    if (!current && tick % kAwareCadence != phase) continue;
+    const float step = current ? dt : dt * (float)kAwareCadence;
+
+    // ---- SIGHT ----
+    float lightFloor = S.darkVision;
+    if (current) lightFloor = std::max(lightFloor, P.combatLightFloor);
+    stealth::Exposure ex = a.stealth;
+    // ARM'S LENGTH: the dark stops hiding a body as it comes into reach.
+    if (P.nearAlways > 0.0f && d < P.nearAlways)
+      ex.light = std::max(ex.light, 1.0f - d / P.nearAlways);
+    const float vis = stealth::Visibility(P, ex, a.height, lightFloor);
+    const float reach = stealth::SightReach(
+        P, sightRange * (current ? P.combatSightMul : 1.0f), aw, vis);
+    float sg = 0.0f;
+    bool losAsked = false, losClear = false;
+    if (reach > 0.0f && d < reach) {
+      const float off = WrapPi(BearingTo(c, a.centre) - self.heading);
+      const float cone = stealth::ConeGain(off, fovNow, S.centralDeg, S.peripheral);
+      if (cone > 0.0f) {
+        Vec3 torso, head;
+        StealthPoints(a, torso, head);
+        float cover = 1.0f;
+        if (!pr.perception.requireLos || v.lineOfSight == nullptr) {
+          losClear = true;
+        } else {
+          losAsked = true;
+          losClear = v.lineOfSight(v.losCtx, eye, torso);
+          // ...a head over the wall is half a body.
+          if (!losClear && v.lineOfSight(v.losCtx, eye, head)) {
+            losClear = true;
+            cover = 0.5f;
+          }
+        }
+        if (losClear) sg = stealth::SightGain(P, d, reach, cone) * cover * gainMul;
+      }
+    }
+    // ---- SOUND (its footsteps) ----
+    // Muffled only where a line was asked and refused: a line is not cast
+    // for sound alone, so a wall the sight test never looked through is
+    // heard through whole. The cheaper error (Oblivion's walls do not stop
+    // sound at all).
+    float hg = 0.0f;
+    if (a.stealth.noise > 0.0f && S.hearing > 0.0f)
+      hg = stealth::SoundGain(P, a.stealth.noise, d, S.hearing, aw, v.ambient,
+                              losAsked && !losClear) *
+           gainMul;
+    if (sg <= 0.0f && hg <= 0.0f && have == nullptr) continue;
+    stealth::Awareness* e = have != nullptr ? have : SlotFor(b, a.id, (sg + hg) * step);
+    if (e == nullptr) continue;
+    listed[e - b.aware] = true;
+    // THE METER: sight fills it freely; sound only up to soundCap (it tells
+    // the creature where to look, sight must confirm) -- unless this is the
+    // body it is fighting, which it follows by ear. The drain always runs, so
+    // a body is noticed only where its gain beats it.
+    float lv = e->level + sg * step;
+    if (hg > 0.0f) {
+      const float cap = current ? 1.0f : P.soundCap;
+      if (lv < cap) lv = std::min(cap, lv + hg * step);
+    }
+    const bool held = current || (searching && b.searchFor == a.id);
+    lv -= (held ? P.searchDecay : P.decay) * step;
+    e->level = std::clamp(lv, 0.0f, 1.0f);
+    e->sightGain = sg;
+    e->soundGain = hg;
+    if (sg > (current ? P.keepGain : 0.0f)) {
+      e->seen = true;
+      e->lastPos = a.centre;
+      e->lastTick = tick;
+    } else if (hg > 0.0f) {
+      e->heard = true;
+      e->lastPos = a.centre;
+      e->lastTick = tick;
+    }
+    if (e->level >= 1.0f) {
+      if (!e->detected) b.detections++;
+      e->detected = true;
+    } else if (e->level < P.investigateAt) {
+      e->detected = false;
+    }
+  }
+  // ---- WHAT NOBODY WEIGHED THIS TICK DRAINS ----
+  for (int i = 0; i < Brain::kAware; i++) {
+    stealth::Awareness& e = b.aware[i];
+    if (e.id == 0 || listed[i]) continue;
+    const bool held = (b.hasTarget && e.id == b.targetId) ||
+                      (searching && e.id == b.searchFor);
+    e.level = std::max(0.0f, e.level - (held ? P.searchDecay : P.decay) * dt);
+    if (e.level < P.investigateAt) e.detected = false;
+    if (e.level <= 0.0f && !held) e = stealth::Awareness{};
+  }
+
+  // ---- NOISE EVENTS (posted last tick, heard this one) ----
+  if (v.noises != nullptr && S.hearing > 0.0f) {
+    for (const stealth::Noise& n : *v.noises) {
+      if (n.source == self.id) continue;
+      const float d = (n.pos - c).len();
+      const float imp = stealth::SoundImpulse(P, n.radius, d, S.hearing, aw,
+                                              v.ambient, false) * gainMul;
+      if (imp <= 0.0f) continue;
+      if (n.kind == stealth::NoiseKind::Alarm) {
+        // An ALLY'S CRY: go and look where it points, and be readier for the
+        // body it is about.
+        if (n.faction != self.faction) continue;
+        RaiseStim(b, stealth::StimKind::Alarm, n.point,
+                  std::max(P.investigateAt, std::min(1.0f, imp)), 0, tick,
+                  S.investigateTicks);
+        if (n.source != 0)
+          if (stealth::Awareness* e = SlotFor(b, n.source, P.alarmGain * imp)) {
+            e->level = std::min(P.soundCap, e->level + P.alarmGain * imp);
+            e->lastPos = n.point;
+            e->lastTick = tick;
+          }
+        continue;
+      }
+      const Actor* src = n.source != 0 ? FindActor(v, n.source) : nullptr;
+      if (src != nullptr && src->alive && src->stealth.modelled &&
+          src->faction != self.faction) {
+        // A NOISE THAT BETRAYS A BODY: its landing, its blow, its bow.
+        const bool current = b.hasTarget && b.targetId == src->id;
+        if (stealth::Awareness* e = SlotFor(b, src->id, imp)) {
+          const float cap = current ? 1.0f : P.soundCap;
+          if (e->level < cap) e->level = std::min(cap, e->level + imp);
+          e->heard = true;
+          e->lastPos = n.pos;
+          e->lastTick = tick;
+        }
+      } else if (src == nullptr || src->faction == self.faction ||
+                 !src->stealth.modelled) {
+        // NOTHING TO PUT A BODY TO: an arrow striking stone, a friend's cry
+        // of pain -- a place to go and look. What makes a distraction work.
+        RaiseStim(b, stealth::StimKind::Noise, n.pos, std::min(1.0f, imp), 0,
+                  tick, S.investigateTicks);
+      }
+    }
+  }
+
+  // ---- WHAT IT IS LOOKING AT: the strongest body it is not yet sure of ----
+  b.awareMax = 0.0f;
+  const stealth::Awareness* top = nullptr;
+  for (const stealth::Awareness& e : b.aware) {
+    if (e.id == 0) continue;
+    b.awareMax = std::max(b.awareMax, e.level);
+    if (e.detected || e.level < P.cautionAt) continue;
+    if (b.hasTarget && e.id == b.targetId) continue;
+    if (!e.seen && !e.heard) continue;
+    if (top == nullptr || e.level > top->level) top = &e;
+  }
+  if (top != nullptr)
+    RaiseStim(b, stealth::StimKind::Body, top->lastPos, top->level, top->id, tick,
+              S.investigateTicks);
+  if (b.stim.kind != stealth::StimKind::None && tick > b.stim.until &&
+      b.stim.kind != stealth::StimKind::Lost)
+    b.stim = stealth::Stimulus{};
+}
+
 }  // namespace (CarrionTerms is ai's, ai_behavior.h: MobSystem asks it too)
+
+float AwarenessOf(const Brain& b, uint64_t actorId) {
+  const stealth::Awareness* e = FindAware(b, actorId);
+  return e == nullptr ? 0.0f : e->detected ? 1.0f : e->level;
+}
+
+bool Detects(const Brain& b, const Library& lib, uint64_t actorId) {
+  if (b.hasTarget && b.targetId == actorId && b.visible) return true;
+  const Profile* pr = lib.At(b.profile);
+  // A creature with no stealth senses never fills a meter, so it cannot be
+  // asked "has it noticed": it is never caught unaware, as it never was.
+  if (pr == nullptr || !StealthOn(*pr)) return true;
+  const stealth::Awareness* e = FindAware(b, actorId);
+  return e != nullptr && e->detected;
+}
+
+void NoteAttacked(Brain& b, const Library& lib, uint64_t attacker, Vec3 where,
+                  bool ranged, uint32_t tick, const stealth::Params& P) {
+  const Profile* pr = lib.At(b.profile);
+  if (pr == nullptr || !StealthOn(*pr) || attacker == 0) return;
+  stealth::Awareness* e = SlotFor(b, attacker, 2.0f);
+  if (e == nullptr) return;
+  if (!ranged) {
+    // A BLADE IN THE BACK IS NOT A RUMOUR: it knows, now, and it turns on it.
+    if (!e->detected) b.detections++;
+    e->level = 1.0f;
+    e->detected = true;
+    e->lastPos = where;
+    e->lastTick = tick;
+    return;
+  }
+  if (e->detected) return;
+  // AN ARROW FROM NOWHERE: it did not see the archer. It searches toward the
+  // rough place the shot came from, its meter for the archer held high --
+  // so a second shot from the same shadow is a gamble, not a free kill.
+  e->level = std::max(e->level, P.searchHold);
+  e->lastPos = where;
+  e->lastTick = tick;
+  if (!b.hasTarget) StartSearch(b, *pr, P, attacker, where, tick);
+}
 
 float CarrionTerms(const Perception& p, uint32_t meat, uint32_t crowd,
                    uint64_t selfId, uint64_t pieceKey, uint32_t tick) {
@@ -1045,9 +1491,48 @@ float CarrionTerms(const Perception& p, uint32_t meat, uint32_t crowd,
 
 namespace {
 
+// The alert state, from what Perceive left on the brain (Fact::Alert, the
+// HUD's eye, the dev panel).
+void SetAlert(Brain& b, const stealth::Params& P, uint32_t tick) {
+  if (b.hasTarget) b.alert = stealth::Alert::Combat;
+  else if (tick < b.searchUntil) b.alert = stealth::Alert::Searching;
+  else if ((b.stim.kind != stealth::StimKind::None && tick <= b.stim.until) ||
+           b.awareMax >= P.cautionAt)
+    b.alert = stealth::Alert::Suspicious;
+  else b.alert = stealth::Alert::Calm;
+}
+
 void Perceive(Brain& b, const Profile& pr, const SelfView& self,
-              const WorldView& v, uint32_t tick) {
+              const WorldView& v, uint32_t tick, float dt) {
   b.visible = false;
+  // THE METER FIRST, and for every profile with stealth senses -- even one
+  // that will never pick a target (see UpdateAwareness).
+  const bool stealthOn = StealthOn(pr);
+  const stealth::Params& SP =
+      v.stealthParams != nullptr ? *v.stealthParams : stealth::Defaults();
+  struct AlertScope {
+    Brain& b;
+    const stealth::Params& P;
+    uint32_t tick;
+    bool on;
+    ~AlertScope() {
+      if (on) SetAlert(b, P, tick);
+    }
+  } alertScope{b, SP, tick, stealthOn};
+  if (stealthOn) {
+    UpdateAwareness(b, pr, self, v, tick, dt);
+    // A search ends on its clock, or the moment there is a target again.
+    if (b.searchUntil != 0 && (b.hasTarget || tick >= b.searchUntil)) {
+      if (!b.hasTarget) {
+        b.standDowns++;
+        // "Must have been the wind." -- but it is watching now.
+        b.alertedUntil = tick + SP.alertedTicks;
+      }
+      b.searchUntil = 0;
+      b.searchFor = 0;
+      if (b.stim.kind == stealth::StimKind::Lost) b.stim = stealth::Stimulus{};
+    }
+  }
   if (pr.perception.aggro == Aggro::Passive || pr.perception.sightRange <= 0 ||
       v.actors == nullptr) {
     b.hasTarget = false;
@@ -1090,6 +1575,14 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
     const Actor* a;
     uint32_t order;
     bool scent;   // perceived by its blood in the water: no line asked
+    // DECIDED BY THE METER (stealth): range, cone and line were weighed in
+    // UpdateAwareness; `seen` = in sight this tick (else felt / heard).
+    bool metered = false;
+    bool seen = true;
+    // ...and where it is KNOWN to be: the body itself when seen, else where
+    // the meter last sensed it (a felt or heard target is not tracked live).
+    Vec3 known{};
+    uint32_t knownTick = 0;
   };
   thread_local std::vector<Cand> cands;
   cands.clear();
@@ -1145,7 +1638,29 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
         d = ds;
       }
     }
-    if (!scent && !PerceivesNoLine(self, pr, a, range, d)) continue;
+    // THE METER DECIDES WHO IS PERCEIVED (stealth): a modelled body is a
+    // candidate only once DETECTED, and then while it is in sight this tick
+    // -- or was sensed in the last kFeltTicks (a blade in the back, a body
+    // it is following by ear). A sleeper's / an ambusher's cap still narrows
+    // what is newly acquired.
+    bool metered = false, seenNow = true;
+    Vec3 known = a.centre;
+    uint32_t knownTick = tick;
+    if (stealthOn && a.stealth.modelled && !scent) {
+      const stealth::Awareness* e = FindAware(b, a.id);
+      if (e == nullptr || !e->detected) continue;
+      if (!e->seen && tick - e->lastTick > kFeltTicks) continue;
+      metered = true;
+      seenNow = e->seen;
+      if (!seenNow) {
+        known = e->lastPos;
+        knownTick = e->lastTick;
+      }
+      d = BodyDist(self, self.Centre(), known);
+      if (!current && b.acquireCap >= 0.0f && d > b.acquireCap) continue;
+    } else if (!scent && !PerceivesNoLine(self, pr, a, range, d)) {
+      continue;
+    }
     float score = d;
     // Blood in the water pulls toward the living -- and among the DEAD, when
     // this creature ranks them by their meat, it only lets a piece be FOUND:
@@ -1164,25 +1679,33 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
     // The all-tests loop kept an actor only on `score < best` from 1e30: a
     // NaN, or a score at or past 1e30, was never kept, so it is not a candidate.
     if (!(score < 1e30f)) continue;
-    cands.push_back({score, d, &a, order, scent});
+    cands.push_back({score, d, &a, order, scent, metered, seenNow, known, knownTick});
   }
   std::sort(cands.begin(), cands.end(), [](const Cand& x, const Cand& y) {
     return x.score < y.score || (x.score == y.score && x.order < y.order);
   });
+  bool bestSeen = true;
+  Vec3 bestKnown{};
+  uint32_t bestKnownTick = tick;
   for (const Cand& c : cands) {
-    if (!c.scent && !PerceivesLine(self, pr, v, *c.a)) continue;
+    if (!c.scent && !c.metered && !PerceivesLine(self, pr, v, *c.a)) continue;
     best = c.a;
     bestDist = c.d;
+    bestSeen = c.seen;
+    bestKnown = c.metered ? c.known : c.a->centre;
+    bestKnownTick = c.metered ? c.knownTick : tick;
     break;
   }
 
   if (best != nullptr) {
     b.targetId = best->id;
     b.hasTarget = true;
-    b.visible = true;
-    b.targetPos = best->centre;
-    b.lastSeenPos = best->centre;
-    b.lastSeenTick = tick;
+    // A FELT target is held and turned toward, but not "visible": nothing
+    // aims at, parries or leads a body it has not got its eyes on.
+    b.visible = bestSeen;
+    b.targetPos = bestKnown;
+    b.lastSeenPos = bestKnown;
+    b.lastSeenTick = bestKnownTick;
     b.targetDist = bestDist;
     return;
   }
@@ -1192,12 +1715,34 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
   // behind a rock and came looking" and "it lost me behind a rock and forgot I
   // exist".
   if (!b.hasTarget) return;
+  const Actor* held = FindActor(v, b.targetId);
+  // FOLLOWED BY EAR (stealth): a fought body that is heard -- running, a
+  // blow, a landing -- is known to be where the noise was. Losing a creature
+  // takes going QUIET as well as out of sight.
+  if (stealthOn && held != nullptr && held->stealth.modelled)
+    if (const stealth::Awareness* e = FindAware(b, b.targetId))
+      if (e->heard && e->lastTick == tick) {
+        b.lastSeenPos = e->lastPos;
+        b.lastSeenTick = tick;
+      }
   if (tick > b.lastSeenTick + pr.perception.alertDecayTicks) {
+    // LOST. A stealth creature does not shrug: it SEARCHES where the body
+    // was last known and a little on along the way it was going.
+    if (stealthOn && held != nullptr && held->alive && held->stealth.modelled) {
+      Vec3 lead = b.lastSeenPos;
+      if (b.haveTargetVel) {
+        Vec3 vv{b.targetVel.x, 0.0f, b.targetVel.z};
+        const float m = vv.len();
+        const float cap = 0.5f * pr.stealth.searchRadius;
+        const Vec3 step = vv * 1.5f;   // a second and a half on
+        lead = lead + (m * 1.5f > cap && m > 1e-3f ? step * (cap / (m * 1.5f)) : step);
+      }
+      StartSearch(b, pr, SP, b.targetId, lead, tick);
+    }
     b.hasTarget = false;
     b.targetId = 0;
     return;
   }
-  const Actor* held = FindActor(v, b.targetId);
   // A held corpse is dropped as soon as there is no meat left on it (at
   // once, to a creature that does not eat the dead).
   if (held != nullptr && !held->alive &&
@@ -1443,6 +1988,16 @@ void EvaluateRules(Brain& b, const Profile& pr, const SelfView& self,
   float nearest = kNever, nearestHostile = kNever;
   b.hasThreat = false;
   Vec3 hostilePos{};
+  // A STEALTH CREATURE COUNTS ONLY THE STRANGERS IT HAS NOTICED. These facts
+  // take no line on purpose (they are character, not targeting), but "an
+  // enemy is near" about a body the creature has never seen or heard would
+  // make every stalker a failure: the villager it creeps toward would bolt
+  // from it unseen. So for a creature with stealth senses a MODELLED stranger
+  // counts -- and is the threat it runs from -- once its meter for it is at
+  // the notice level; a legacy body counts as it always did.
+  const bool noticeGate = StealthOn(pr);
+  const float noticeAt =
+      (view.stealthParams != nullptr ? *view.stealthParams : stealth::Defaults()).cautionAt;
   if (view.actors != nullptr && range > 0.0f) {
     for (const Actor& a : *view.actors) {
       if (!a.alive || a.id == self.id) continue;
@@ -1450,6 +2005,8 @@ void EvaluateRules(Brain& b, const Profile& pr, const SelfView& self,
       if (d > range) continue;
       if (a.faction == self.faction) {
         allies++;
+      } else if (noticeGate && a.stealth.modelled && AwarenessOf(b, a.id) < noticeAt) {
+        continue;
       } else {
         enemies++;
         if (d < nearest) {
@@ -1531,6 +2088,8 @@ void EvaluateRules(Brain& b, const Profile& pr, const SelfView& self,
   f[(int)Fact::TargetBleeding] = tgt != nullptr && tgt->bleeding ? 1.0f : 0.0f;
   f[(int)Fact::Ammo] = (float)std::max(0, self.ammo);
   f[(int)Fact::Cornered] = self.cornered ? 1.0f : 0.0f;
+  f[(int)Fact::Awareness] = b.awareMax;
+  f[(int)Fact::Alert] = (float)(int)b.alert;
 
   // THE QUEUE AROUND ONE TARGET. Allies are anyone of our faction who has
   // named the same target (Actor::targetId); rank is how many of them stand
@@ -1788,7 +2347,18 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   out.breach = false;
 
   NoteHurt(brain, self, tick);
-  Perceive(brain, pr, self, view, tick);
+  Perceive(brain, pr, self, view, tick, dt);
+  // THE ALARM (stealth.alarm): the tick a stealth creature takes a target it
+  // cries out, once -- a noise event pointing at the intruder, which brings
+  // its allies to look (MobSystem::PostNoise turns this into the event).
+  out.alarm = false;
+  out.crouch = false;
+  if (StealthOn(pr) && brain.hasTarget && !brain.hadTarget && pr.stealth.alarm > 0.0f) {
+    out.alarm = true;
+    out.alarmPoint = brain.targetPos;
+    brain.alarms++;
+  }
+  brain.hadTarget = brain.hasTarget;
   TrackTargetMotion(brain, self, tick, dt);
   // THE NEAREST PART (Perception::nearestPart): after the motion is tracked
   // on the body's centre, so the velocity estimate does not jump between
@@ -2465,6 +3035,31 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
              brain.visible) {
     raw[(int)Intent::Guard] = std::clamp(pr.defense.guardStance, 0.0f, 1.0f);
   }
+  // ---- STEALTH: THE VERBS OF A CREATURE NOT YET FIGHTING (game/stealth.h) --
+  // Search while a lost target is being hunted for; otherwise investigate
+  // whatever the meter or a noise left on the brain. Both only with no
+  // target: the moment the body is detected the fight's verbs take over.
+  // STALK: closing on a target that has not turned to face me (and is not
+  // fighting me) -- crouched, slow, from behind.
+  const bool stealthOn = StealthOn(pr);
+  const stealth::Params& SP =
+      view.stealthParams != nullptr ? *view.stealthParams : stealth::Defaults();
+  const bool stimLive =
+      brain.stim.kind != stealth::StimKind::None && tick <= brain.stim.until;
+  if (stealthOn && !brain.hasTarget) {
+    if (tick < brain.searchUntil) {
+      raw[(int)Intent::Search] = 1.0f;
+    } else if (stimLive && brain.stim.kind != stealth::StimKind::Lost &&
+               (brain.stim.level >= SP.cautionAt ||
+                brain.stim.kind == stealth::StimKind::Alarm)) {
+      raw[(int)Intent::Investigate] = 1.0f;
+    }
+  }
+  if (stealthOn && pr.movement.mobile && brain.hasTarget && brain.visible &&
+      tgtActor != nullptr && tgtActor->targetId != self.id &&
+      brain.facts[(int)Fact::TargetFacingMe] < 0.3f && bandErr > slack * 2.0f)
+    raw[(int)Intent::Stalk] = 1.0f;
+
   // THE FENCE (demons D6 item 10; SelfView::targetFenced / castFenced): what
   // the fence would refuse is not an option. A contained demon whose target
   // is past its salt neither closes, keeps a band, circles nor swings at it
@@ -3300,6 +3895,108 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       break;
     }
 
+    case Intent::Investigate: {
+      // ---- WHAT WAS THAT? ---------------------------------------------------
+      // Under `investigateAt` (and for anything that is not an ally's alarm)
+      // it only turns to look. At or over it, it walks there at
+      // `investigateSpeed` over the local navigator and, arrived, looks round
+      // -- a slow sweep either side of the way it came -- until the
+      // stimulus is forgotten (`investigateTicks` after the last refresh).
+      const stealth::Stimulus& st = brain.stim;
+      const Vec3 foot = self.Foot();
+      const float dist = PlanarDist(foot, st.pos);
+      const bool go = st.level >= SP.investigateAt ||
+                      st.kind == stealth::StimKind::Alarm;
+      const float arriveR = std::max(4.0f, 0.6f * std::max(self.size.x, self.size.z));
+      if (!go) {
+        brain.path.Clear();
+        out.desiredHeading = BearingTo(centre, st.pos);
+        break;
+      }
+      if (brain.investigateArrived == 0 && dist > arriveR) {
+        if (self.volumetric) brain.path.Clear();
+        else UpdatePath(brain, pr, self, view, tick, st.pos);
+        const Vec3 wp = SteerPoint(brain, st.pos);
+        out.desiredHeading = Deflect(BearingTo(foot, wp), self.heading, ground);
+        out.driveScale = sp * pr.stealth.investigateSpeed * spd;
+        if (brain.path.Done())
+          out.driveScale = std::min(out.driveScale, sp * std::max(0.25f, arrive(dist)));
+        break;
+      }
+      if (brain.investigateArrived == 0) {
+        brain.investigateArrived = tick;
+        brain.investigateLookBase = self.heading;
+        brain.investigations++;
+      }
+      brain.path.Clear();
+      const float t = (float)(tick - brain.investigateArrived) / 30.0f;
+      out.desiredHeading = brain.investigateLookBase + 1.1f * std::sin(t * 1.3f);
+      break;
+    }
+
+    case Intent::Search: {
+      // ---- WHERE DID IT GO? ------------------------------------------------
+      // A LEG at a time: walk to the goal -- first where it was lost (led a
+      // little along its heading), then points drawn round that within
+      // `searchRadius` -- and on arrival look round for a couple of seconds.
+      // Counter-based on (id, leg), so a replayed search walks the same legs.
+      const Vec3 foot = self.Foot();
+      const float arriveR = std::max(4.0f, 0.6f * std::max(self.size.x, self.size.z));
+      if (brain.searchLookUntil != 0 && tick < brain.searchLookUntil) {
+        brain.path.Clear();
+        const float t = (float)(brain.searchLookUntil - tick) / 30.0f;
+        out.desiredHeading = brain.searchLookBase + 1.2f * std::sin(t * 1.6f);
+        break;
+      }
+      const float dist = PlanarDist(foot, brain.searchGoal);
+      // A leg that is taking far too long is not getting there (a wall, a
+      // drop): count it as walked.
+      const bool stuck = brain.searchLegSince != 0 && tick - brain.searchLegSince > 300u;
+      if (brain.searchLookUntil != 0 || dist <= arriveR || stuck) {
+        if (brain.searchLookUntil == 0) {
+          // Arrived: look round first.
+          const uint32_t h = rng::Hash3((uint32_t)self.id ^ kSaltSearch, brain.searchLeg, 7u);
+          brain.searchLookUntil = tick + 45u + h % 40u;
+          brain.searchLookBase = self.heading;
+          out.desiredHeading = self.heading;
+          break;
+        }
+        // Looked: the next leg.
+        brain.searchLookUntil = 0;
+        brain.searchLeg++;
+        const uint32_t h = rng::Hash3((uint32_t)self.id ^ kSaltSearch, brain.searchLeg, 3u);
+        const float ang = (float)(h & 0xFFFFu) * (kTau / 65536.0f);
+        const float u = (float)((h >> 16) & 0xFFFFu) / 65535.0f;
+        const float r = pr.stealth.searchRadius * (0.35f + 0.65f * u);
+        brain.searchGoal = Vec3{brain.searchOrigin.x + std::cos(ang) * r,
+                                brain.searchOrigin.y,
+                                brain.searchOrigin.z + std::sin(ang) * r};
+        brain.searchLegSince = tick;
+      }
+      if (brain.searchLegSince == 0) brain.searchLegSince = tick;
+      if (self.volumetric) brain.path.Clear();
+      else UpdatePath(brain, pr, self, view, tick, brain.searchGoal);
+      const Vec3 wp = SteerPoint(brain, brain.searchGoal);
+      out.desiredHeading = Deflect(BearingTo(foot, wp), self.heading, ground);
+      // A search is brisker than a look: it knows there is someone to find.
+      out.driveScale = sp * std::min(1.0f, pr.stealth.investigateSpeed * 1.3f) * spd;
+      break;
+    }
+
+    case Intent::Stalk: {
+      // ---- THE NPC SIDE OF THE SNEAK --------------------------------------
+      // Approach's route and fan, at `stalkSpeed`, CROUCHED (IntentOut::crouch
+      // drops the body's noise and its visibility like the player's crouch).
+      if (self.volumetric) brain.path.Clear();
+      else UpdatePath(brain, pr, self, view, tick, brain.targetPos);
+      const Vec3 wp = SteerPoint(brain, brain.targetPos);
+      out.desiredHeading = Deflect(BearingTo(self.Foot(), wp), self.heading, ground);
+      out.driveScale = sp * pr.stealth.stalkSpeed * spd;
+      if (brain.path.Done())
+        out.driveScale = std::min(out.driveScale, sp * arrive(bandErr));
+      break;
+    }
+
     default:
       break;
   }
@@ -3372,6 +4069,29 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       out.driveScale = fwd;
       brain.pursueDrive = fwd;
     }
+  }
+
+  // ---- SNEAKING IS A MODE, NOT A VERB --------------------------------------
+  // Begun by a Stalk tick, it holds through EVERY verb that follows -- the
+  // footwork inside the band, the request, its commit -- for as long as the
+  // target has not turned to face this creature or named it as its target:
+  // a stalker that stood up to step into range, or to swing, would throw
+  // away the sneak attack it crept in for (stealth.sneakNeedsCrouch). While
+  // it holds, the body is crouched and every drive is held to `stalkSpeed`
+  // (a crouch at a run is not quiet). A lost target ends it; a commit window
+  // already running is let finish.
+  if (brain.intent == Intent::Stalk) brain.stalking = true;
+  if (brain.stalking) {
+    const bool unaware = brain.hasTarget && tgtActor != nullptr &&
+                         tgtActor->targetId != self.id &&
+                         brain.facts[(int)Fact::TargetFacingMe] < 0.3f;
+    if (!brain.hasTarget || (!unaware && tick >= brain.commitUntil)) brain.stalking = false;
+  }
+  out.crouch = brain.stalking;
+  if (brain.stalking) {
+    const float cap = sp * std::max(0.0f, pr.stealth.stalkSpeed) * spd;
+    out.driveScale = std::clamp(out.driveScale, -cap, cap);
+    out.driveStrafe = std::clamp(out.driveStrafe, -cap, cap);
   }
 
   // A profile that cannot move its feet cannot move them by any route. Enforced

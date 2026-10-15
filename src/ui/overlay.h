@@ -357,6 +357,35 @@ struct UIState {
   float strikeBlend = 1.0f;
   float strikeChargeMul = 1.5f;
 
+  // ---- STEALTH (game/stealth.h; MobSystem::StealthOf / PlayerExposure) -----
+  // THE EYE above the crosshair (Skyrim's): shown while the player sneaks
+  // (crouched or prone). `stealthEye` 0..1 is
+  // the highest detection meter any creature holds for the player -- the
+  // lids open with it -- and `stealthAlert` the worst state among those
+  // creatures (stealth::Alert: 0 calm .. 3 fighting), which colours it.
+  // Under it, Chaos Theory's two meters: the LIGHT on the body and its NOISE,
+  // 0..1 of their scales, with `stealthQuiet` the noise below which not even
+  // a creature at arm's length hears it (it rises in rain). Round it, up to
+  // four PIPS, one per watcher: where it is, as a screen angle (radians
+  // clockwise from straight ahead), how sure it is, and its state.
+  bool stealthShow = false;
+  bool stealthSneaking = false;
+  float stealthEye = 0.0f;
+  int stealthAlert = 0;
+  float stealthLight = 0.0f;
+  float stealthNoise = 0.0f;
+  float stealthQuiet = 0.0f;
+  int stealthPipN = 0;
+  float stealthPipAngle[4] = {};
+  float stealthPipLevel[4] = {};
+  int stealthPipAlert[4] = {};
+  // THE SNEAK-ATTACK TOAST: "SNEAK ATTACK x3.0" under the crosshair for a
+  // moment after one of the player's blows (or arrows) lands on a creature
+  // that had not detected them. Age in seconds; large = not showing.
+  float sneakToastMul = 0.0f;
+  float sneakToastAge = 99.0f;
+  bool sneakToastRanged = false;
+
   // Ledge-grab readout (dev panel). main.cpp composes the text from the
   // player's per-frame probe so a refused grab says WHICH latch gate refused;
   // state drives the colour: 0 = no lip in reach, 1 = in reach, 2 = hanging.
@@ -578,7 +607,7 @@ struct UIState {
       aiDisengageTicks = 22;
   float aiHysteresis = 0.22f;
   // One per ai::Intent, in enum order (main.cpp static_asserts the count).
-  static constexpr int kAiIntents = 19;   // + `cast` (demons D4), `orbit` + `charge` (swimmers), `shoot` (archers)
+  static constexpr int kAiIntents = 22;   // + `cast` (demons D4), `orbit` + `charge` (swimmers), `shoot` (archers), `investigate` + `search` + `stalk` (stealth)
   float aiIntentWeight[kAiIntents] = {};
   int aiIntentCooldown[kAiIntents] = {};
   int aiIntentDwell[kAiIntents] = {};

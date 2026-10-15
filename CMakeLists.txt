@@ -561,6 +561,11 @@ add_library(sandvox_core OBJECT
   # content) and the local combat navigator it steers with.
   src/game/ai_behavior.cpp
   src/game/ai_nav.cpp
+  # Stealth and detection: the detection meter's math (light, stance,
+  # sound, skill; game/stealth.h) and MobSystem's half of it -- the light
+  # on a body, the noise events, sneak attacks (game/mob_stealth.cpp).
+  src/game/stealth.cpp
+  src/game/mob_stealth.cpp
   src/game/bodyreg.cpp
   src/game/persist.cpp
   # Branching conversations: content, flags store, the tick hook
@@ -708,6 +713,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_dye.cpp
   src/test/selftest_wound.cpp
   src/test/selftest_archer.cpp
+  src/test/selftest_stealth.cpp
   src/test/selftest_aquatic.cpp
   src/test/selftest_stagger.cpp
   src/test/selftest_solute.cpp

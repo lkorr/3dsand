@@ -13154,6 +13154,12 @@ int main(int argc, char** argv) {
           }
         }
       }
+      // SANDVOX_SHOT_HUD_SNEAK=1: CROUCH before screenshot_hud.bmp, so the
+      // stealth eye and its light / noise meters are in the picture (they
+      // only show while sneaking). The stance is asked for the way Ctrl asks
+      // (Player::stanceWant_), so the body crouches on its own next tick.
+      if (frameCounter == kShotInvHudSetup + 2 && std::getenv("SANDVOX_SHOT_HUD_SNEAK"))
+        player.stanceWant_ = Player::kCrouch;
       // SANDVOX_SHOT_HUD_HURT=1: hurt the body BEFORE screenshot_hud.bmp, so
       // the HUD's paper doll is photographed with something to say — a hand
       // off, a forearm bored through, a shin on fire and a cut thigh. Off by
@@ -17333,6 +17339,70 @@ int main(int argc, char** argv) {
       mobs.ClearVoiceEvents();
       mobs.ClearShockCues();
       mobs.ClearStrikeEvents();
+      // SNEAK ATTACKS THAT LANDED (stealth): the local player's own become
+      // the HUD's "SNEAK ATTACK x3" toast. Drained per frame, like the strike
+      // events above, whether or not anything shows them.
+      for (const MobSystem::SneakEvent& e : mobs.SneakEvents())
+        if (e.attacker == ai::kPlayerActorId) {
+          ui.sneakToastMul = ui.sneakToastAge < 0.25f ? std::max(ui.sneakToastMul, e.mul) : e.mul;
+          ui.sneakToastAge = 0.0f;
+          ui.sneakToastRanged = e.ranged;
+        }
+      mobs.ClearSneakEvents();
+      // ---- STEALTH: the eye, the two meters, the watchers' pips ---------
+      // (game/stealth.h; overlay.h UIState::stealth*). Read off what the
+      // last tick published -- presentation only, nothing here feeds back.
+      {
+        const MobSystem::StealthReport rep = mobs.StealthOf(ai::kPlayerActorId);
+        const stealth::Exposure& ex = mobs.PlayerExposure(0);
+        const stealth::Params& sp = mobs.StealthParams();
+        const bool sneaking = player.crouching || player.prone;
+        // The noise meter's scale: a sprint on stone is about full.
+        constexpr float kNoiseScale = 150.0f;
+        ui.stealthSneaking = sneaking;
+        // Skyrim shows the eye only in sneak mode: walking round a town every
+        // villager has seen you, and an eye wide open there says nothing.
+        ui.stealthShow = ex.modelled && sneaking;
+        ui.stealthEye = rep.maxLevel;
+        ui.stealthAlert = (int)rep.alert;
+        ui.stealthLight = ex.light;
+        ui.stealthNoise = std::clamp(ex.noise / kNoiseScale, 0.0f, 1.0f);
+        ui.stealthQuiet = std::clamp(
+            sp.nearAlways * (1.0f + mobs.AmbientNoise()) / kNoiseScale, 0.0f, 1.0f);
+        Vec3 fwd = cam.Forward(), rgt = cam.Right();
+        fwd.y = 0.0f;
+        rgt.y = 0.0f;
+        fwd = fwd.normalized();
+        rgt = rgt.normalized();
+        ui.stealthPipN = std::min(rep.topN, 4);
+        for (int i = 0; i < ui.stealthPipN; i++) {
+          const Vec3 to = rep.top[i].pos - player.pos;
+          ui.stealthPipAngle[i] = std::atan2(to.dot(rgt), to.dot(fwd));
+          ui.stealthPipLevel[i] = rep.top[i].level;
+          ui.stealthPipAlert[i] = (int)rep.top[i].alert;
+        }
+        ui.sneakToastAge += dt;
+        // SANDVOX_SHOT_HUD_SNEAK=2 (--shot-inventory): photograph the eye
+        // HALF OPEN with two watchers and a sneak-attack toast, which the
+        // creature-less harness never produces on its own. Writes the HUD's
+        // copy of the numbers only -- no brain, no tick sees it.
+        if (g_shotInventory) {
+          static const char* kSneakShot = std::getenv("SANDVOX_SHOT_HUD_SNEAK");
+          if (kSneakShot != nullptr && std::atoi(kSneakShot) >= 2) {
+            ui.stealthEye = 0.62f;
+            ui.stealthAlert = 2;
+            ui.stealthPipN = 2;
+            ui.stealthPipAngle[0] = -0.7f;
+            ui.stealthPipLevel[0] = 0.62f;
+            ui.stealthPipAlert[0] = 2;
+            ui.stealthPipAngle[1] = 2.4f;
+            ui.stealthPipLevel[1] = 0.35f;
+            ui.stealthPipAlert[1] = 1;
+            ui.sneakToastMul = 3.0f;
+            ui.sneakToastAge = 0.3f;
+          }
+        }
+      }
       debris.ClearGoreEvents();
       // OUTSIDE the audio block, exactly like the queues above and for the
       // same reason stated there: a request that only clears when audio

@@ -67,6 +67,8 @@ const std::vector<Gate>& WaterGates();
 const std::vector<Gate>& RenderGates();
 const std::vector<Gate>& PlayerGates();
 const std::vector<Gate>& MobGates();
+// Stealth and detection (game/stealth.h): pure arbiter arms over the meter.
+const std::vector<Gate>& StealthGates();
 const std::vector<Gate>& BodyGates();
 const std::vector<Gate>& FloaterGates();
 const std::vector<Gate>& AudioGates();
@@ -1352,6 +1354,15 @@ const char* const kOrder[] = {
     // resets mobs + debris and removes its two scratch profiles on the way
     // out).
     "ai-tactics",
+    // ...and STEALTH, the detection meter (game/stealth.h): pure arbiter arms
+    // through ai::Think over hand-built actors. Touches no world and no body,
+    // so it inherits and hands on exactly what ai-tactics left.
+    "stealth",
+    // ...and its LIVE half, by the same append rule: a stalker and a villager
+    // on a stone strip through THE tick (support::TickRig). Fresh world and
+    // ids on the way in; mobs + debris reset and worldgen regenerated on the
+    // way out.
+    "stealth-world",
     // ...and one pose pipeline, whoever drives the body (W2-L), by the same
     // append rule: it spawns an NPC and an avatar, poses both through
     // Mob::PosePipeline only (no PreTick, no Jolt step), and resets mobs +
@@ -1446,7 +1457,7 @@ const std::vector<Gate>& Registry() {
                           &SimGates(), &CaGates(), &GasGates(), &TicketGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),
-                          &MobGates(), &BodyGates(), &FloaterGates(),
+                          &MobGates(), &StealthGates(), &BodyGates(), &FloaterGates(),
                           &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
                           &SpellGates(), &PlayerKitGates(), &VesselGates(), &AlchemyGates(), &ChemGates(), &ElecStrikeGates(), &ElecPlayGates(), &ElecGates(), &ElecMobGates(), &DemonGates(), &GrimoireGates(), &SpellGraphGates(),

@@ -14834,6 +14834,168 @@ it. The hurt check moved ahead of Perceive (`NoteHurt`) because neutral
 perception reads it. No existing profile is neutral or names the new verbs, so
 every other creature is arbitrated exactly as before.
 
+### Stealth and detection (2026-10-15; `game/stealth.*`, `game/mob_stealth.cpp`, `ai::UpdateAwareness`, profile `stealth` block, tuning `stealth.*`, gate `stealth`, `docs/PLAN_stealth.md`)
+
+Perception used to be a switch. A creature saw a stranger the tick it came
+inside range, cone and line, and stopped seeing it the tick it left them. That
+cannot carry sneaking. Light, posture, motion and noise have to *fill*
+something, and losing a creature has to take more than one step behind a
+tree. The model is The Elder Scrolls' detection, with two Splinter Cell:
+Chaos Theory ideas on top.
+
+**One meter, two channels.** Every creature whose profile has a `stealth`
+block keeps an AWARENESS level, 0..1, for each stranger it is tracking
+(`Brain::aware`, four slots). 1 means DETECTED: the body becomes a candidate
+target, and the arbiter fights it as before. Below 1 the creature is only
+suspicious. At `stealth.cautionAt` it turns to look; at `investigateAt` it
+walks over. Two channels fill the meter, and it drains at `decay` every tick,
+so a body is noticed at all only where its gain beats the drain:
+
+- **Sight** needs the cone and the line of sight. The gain is
+  `sightRate × cone × (1 − d/reach)²`, which is Skyrim's attenuation exponent.
+  `reach = sightRange × awareness × visibility`.
+  - `visibility` multiplies five terms: the light on the body, stance (crouch
+    0.55, prone 0.3), motion (still 0.7, walk 1, sprint more), size, and the
+    body's sneak skill.
+  - Light dominates on purpose. The same crouched body that a guard sees
+    across a lit room is invisible past arm's length in shadow.
+  - The line is cast to the upper body and then to the head, so a head over
+    a wall counts as half a body.
+  - `nearAlways` lifts the light toward full inside arm's length.
+- **Sound** needs neither cone nor line; a wall that a sight line was refused
+  through muffles it.
+  - Every moving body has a NOISE, published as an audible radius. Walking on
+    stone is `walkNoise`, and noise scales with speed^1.5. Crouching, crawling,
+    sneak skill and soft ground reduce it. Worn metal and twigs underfoot
+    raise it. Footstep loudness is derived from each material's footstep
+    sound set.
+  - Discrete EVENTS add more: a blow, a cry of pain, a landing, a bow loosed,
+    an arrow striking stone, an ally's alarm.
+  - A noise is heard while `radius/d > 1 + ambient`, where ambient is rain.
+    This is Chaos Theory's rule that a sound quieter than the room is no
+    sound.
+  - Sound alone stops at `soundCap`. It tells the creature where to look, and
+    sight must confirm. The exception is a creature that is already fighting
+    you: it follows you by ear.
+
+**Harder to lose than to avoid.** For the body a creature is fighting:
+
+- reach is ×`combatSightMul`;
+- the light on the body cannot read darker than `combatLightFloor`;
+- its noise refreshes the last known position;
+- the meter drains at `searchDecay`.
+
+Losing it takes breaking the line for `alertDecayTicks`. The creature then
+SEARCHES (`Intent::Search`): legs round the last known point, led along the
+body's heading. During the search its meter for the lost body sits at
+`searchHold`, and gains are ×`searchGainMul`. When it stands down it stays
+ALERTED for `alertedTicks`, with gains ×`alertedGainMul` ("must have been the
+wind").
+
+**Struck.** `MobSystem::NoteAttacked` handles a body that is hit:
+
+- A blade means the creature knows the attacker at once. It is a target even
+  from behind, "felt" for `kFeltTicks`, so the creature turns on it.
+- An arrow from a body it had not detected does NOT reveal the archer. The
+  creature searches toward the shot's rough origin, blurred by a fifth of the
+  distance.
+- An arrow into stone betrays nobody. It is a place to go and look, which is
+  a distraction.
+
+**Sneak attacks.** A blow or arrow lands ×`sneakMelee` / ×`sneakRanged` (or
+the weapon's `sneakAttack`; the dagger authors 5) when all of these hold:
+
+- the victim's brain has not detected the attacker (`ai::Detects`);
+- the attacker is crouched or prone (`sneakNeedsCrouch`, as in Skyrim);
+- for melee, it is the stroke's first contact with that creature.
+
+The multiplier rides `repeat` (melee) or `Penetrator::hp` (arrows), so it
+scales every hp of the strike, the way `melee.chargeDamage` does.
+
+Two cases are never caught unaware:
+
+- a creature with no stealth senses (a dummy, a legacy profile), because it
+  has no meter;
+- a player, who has no brain to fool.
+
+**What a body looks like to a watcher.** `MobSystem::PublishStealth` fills
+`Actor::stealth` (`stealth::Exposure`). It is computed once a tick, beside
+`PublishCombatant`.
+
+- **Light** is `MobSystem::LightAt`, re-measured every 8 ticks. It is
+  computed on the CPU from the tick:
+  - daylight, from `DaylightStrengthCpu` eased up;
+  - five open-sky columns through the chunk caches, so roofs and canopy are
+    shade, and below `World::TerrainHeight` counts as underground;
+  - rain;
+  - per-chunk glow sums of cells with emission ≥ 60, by cache version.
+
+  It is never a render target. The camera and the frame cannot reach the
+  decision.
+- **Noise** comes from stance, speed over the body's own walk, the share of
+  worn pieces that are metal, and the last footfall's material.
+- **Players**: the session publishes stance, walk fraction and wading through
+  `PlayerActorDesc`. A fly-mode camera is not modelled.
+
+**What stays exactly as it was.** Stealth is a trait of the creatures that
+author it, and it works in both directions:
+
+- A profile with no `stealth` block perceives the legacy way.
+- Its BODY is not hideable either. It publishes no exposure, so even a stealth
+  creature acquires it at once inside range, cone and line.
+- The same holds for every other unmodelled actor: a gate's hand-built list,
+  a corpse, a fly-mode camera.
+
+For a stealth creature, the `enemies` / `hostiles` rule facts, and the threat
+Flee runs from, count a modelled stranger only once its meter for it is at
+the notice level. A villager cannot bolt from a stalker it never noticed. Shipped with the
+block are `villager`, `zombie`, `guardian`, the fighting styles (`swordsman`,
+`fencer`, `brawler`, `berserker`, `battlemage`), `archer`, `snake`, `imp`,
+`fiend` and the new `stalker`. Left as they were:
+
+- the gate fixtures (`dummy`, `crowder`, `retreater`, `duelist`,
+  `duelist_blue`, `swordsman_static`, `training_dummy`);
+- the swimmers (scent-driven);
+- the bound demons;
+- `skittish`, whose flee rule still counts enemies, not awareness.
+
+**The NPC side of sneaking.** `Intent::Stalk` starts SNEAKING, and sneaking
+is a mode, not a verb:
+
+- With a target that has not turned to face it, and is not fighting it, a
+  stalker goes crouched (`IntentOut::crouch` → `Mob::aiCrouch_` →
+  `PoseInputs::crouch` and `Stance::Crouch`).
+- Every drive is held to `stalkSpeed`, through every verb that follows: the
+  stalk, the footwork inside the band, the request and its commit.
+- It ends when the target turns or names it.
+- A stroke begun crouched is finished crouched (`Mob::stroke_` active), so the
+  first contact on an unaware creature is a sneak attack. The
+  `stealth-world` gate lands one at ×3 on the real tick. Entering a fight, a
+creature with `stealth.alarm` cries out once. That is a noise event pointing
+at the intruder; allies who hear it investigate and their meter for the
+intruder jumps.
+
+**The HUD.** Skyrim's eye, in pixel art, sits above the crosshair while you
+sneak or while anything is watching. Its lids open with the highest meter any
+creature holds for you, and it is coloured by the worst alert state. Round it
+are MGSV-style pips, one per watcher at its screen bearing. Under it are
+Chaos Theory's two meters, light and noise. The noise meter has a tick at the
+level that not even someone at arm's length would hear, and the tick rises in
+rain. "SNEAK ATTACK ×3.0" toasts under the crosshair.
+
+**Determinism and cost.**
+
+- It is CPU float gameplay state in the 30 Hz tick, like the arbiter it
+  feeds. The counter RNG is used only for the search legs and the shot blur.
+- Noise events are double-buffered: posted in tick N, heard in tick N+1,
+  whatever phase posted them.
+- Non-target bodies are weighed every 3rd tick, staggered, and only the 8
+  nearest at all.
+- Light and metal are measured on a cadence.
+- Glow sums rebuild only when a cached chunk's version moves.
+- The noise queue is capped at 256; the quietest are refused, counted
+  (`NoisesRefused`).
+
 ### NPCs swinging, and blades meeting blades (2026-08-31; `game/strokes.*`, `assets/mobs/attack_styles.json`)
 
 The AI decides *when* and *where*; this is what turns that into a sword moving

@@ -505,6 +505,113 @@ void Overlay::DrawHUD(const UIState& s) {
     return ts.y + 8;
   };
   float py = std::floor(disp.y * 0.5f) + 28.0f;
+  // ---- STEALTH: the eye above the crosshair (game/stealth.h) ---------------
+  //
+  // Skyrim's eye, in pixel art on a 3 px grid: a 15x7-block sprite that
+  // opens with the highest detection meter any creature holds for the
+  // player -- shut with its lashes down hidden, a slit at the notice level,
+  // half open past it, wide when something has DETECTED you -- coloured by
+  // the worst state among the
+  // watchers (parchment calm, gold suspicious, ember searching, cinnabar
+  // fighting). Round it, MGSV's per-watcher pips: one block per creature that
+  // is watching, on a ring, at the screen bearing it is watching from, as
+  // bright as it is sure. Under it, Chaos Theory's two meters on a dark tab:
+  // the LIGHT on you (gold) and your NOISE (parchment) with a steel tick at
+  // the level under which not even someone beside you hears it.
+  if (s.playerAlive && s.stealthShow) {
+    const float b = 2.0f;
+    const ImU32 lidCol = s.stealthAlert >= 3   ? ui::ColBloodHi()
+                         : s.stealthAlert == 2 ? ui::ColEmber()
+                         : s.stealthAlert == 1 ? ui::ColGold()
+                                               : ui::ColParchDim();
+    // THE EYE: four hand-drawn 15x7 sprites, picked by how far the meter has
+    // got -- shut (nobody has noticed you), a slit (something half-saw or
+    // heard), half open (it is coming to look / searching), wide (DETECTED).
+    static const char* kShut[7] = {"...............", "...............",
+                                   "...............", ".##.........##.",
+                                   "...#########...", "....#.#.#.#....",
+                                   "..............."};
+    static const char* kSlit[7] = {"...............", "...............",
+                                   "....#######....", ".###..###..###.",
+                                   "....#######....", "...............",
+                                   "..............."};
+    static const char* kHalf[7] = {"...............", "....#######....",
+                                   "..##..###..##..", ".#...#####...#.",
+                                   "..##..###..##..", "....#######....",
+                                   "..............."};
+    static const char* kOpen[7] = {"....#######....", "..##.......##..",
+                                   ".#....###....#.", "#....#####....#",
+                                   ".#....###....#.", "..##.......##..",
+                                   "....#######...."};
+    const float lv = std::clamp(s.stealthEye, 0.0f, 1.0f);
+    const char* const* eye = lv >= 0.999f ? kOpen
+                             : lv >= 0.45f ? kHalf
+                             : lv >= 0.05f ? kSlit
+                                           : kShut;
+    // The tab: the eye on top, the two meters under it.
+    constexpr int kPips = 10;
+    const float pw = 3.0f, ph = 4.0f, pg = 1.0f;
+    const float mw = kPips * pw + (kPips - 1) * pg;
+    const float glyphW = 10.0f;
+    const float eb = 3.0f;   // the eye's own block: 45 x 21 px
+    const float tabW = std::max(15 * eb, glyphW + mw) + 16.0f;
+    const float tabH = 7 * eb + 2 * ph + 4.0f + 18.0f;
+    const float cx = std::floor(disp.x * 0.5f);
+    const float tx0 = std::floor(cx - tabW * 0.5f);
+    const float ty0 = std::floor(disp.y * 0.5f) - 34.0f - tabH;
+    d->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx0 + tabW, ty0 + tabH), IM_COL32(0, 0, 0, 140));
+    d->AddRect(ImVec2(tx0, ty0), ImVec2(tx0 + tabW, ty0 + tabH), ui::Fade(lidCol, 0.8f), 0.0f, 0,
+               1.0f);
+    const float ex0 = std::floor(cx - 7.5f * eb), ey0 = ty0 + 6.0f;
+    for (int r = 0; r < 7; r++)
+      for (int c = 0; c < 15; c++)
+        if (eye[r][c] == '#')
+          d->AddRectFilled(ImVec2(ex0 + c * eb, ey0 + r * eb),
+                           ImVec2(ex0 + (c + 1) * eb, ey0 + (r + 1) * eb), lidCol);
+    // THE WATCHERS' PIPS on a ring round the tab, at the screen bearing each
+    // watches from (0 = ahead, clockwise), as bright as it is sure.
+    const float rcx = tx0 + tabW * 0.5f, rcy = ty0 + tabH * 0.5f;
+    const float ring = 0.5f * std::sqrt(tabW * tabW + tabH * tabH) + 6.0f;
+    for (int i = 0; i < s.stealthPipN && i < 4; i++) {
+      const float a = s.stealthPipAngle[i];
+      const float px = std::floor(rcx + std::sin(a) * ring - b);
+      const float pyy = std::floor(rcy - std::cos(a) * ring - b);
+      const ImU32 pc = s.stealthPipAlert[i] >= 3   ? ui::ColBloodHi()
+                       : s.stealthPipAlert[i] == 2 ? ui::ColEmber()
+                                                   : ui::ColGold();
+      d->AddRectFilled(ImVec2(px - 1, pyy - 1), ImVec2(px + 2 * b + 1, pyy + 2 * b + 1),
+                       IM_COL32(0, 0, 0, 150));
+      d->AddRectFilled(ImVec2(px, pyy), ImVec2(px + 2 * b, pyy + 2 * b),
+                       ui::Fade(pc, 0.35f + 0.65f * std::clamp(s.stealthPipLevel[i], 0.0f, 1.0f)));
+    }
+    // THE TWO METERS: ten pips each, the empty ones still drawn so the
+    // meter's length reads, and the noise meter's steel tick at the level
+    // under which not even someone at arm's length hears you.
+    const float mx = std::floor(tx0 + (tabW - (glyphW + mw)) * 0.5f + glyphW);
+    auto meter = [&](float y, float frac, ImU32 col, float tick, const char* glyph) {
+      d->AddText(ImVec2(mx - glyphW, y - 5.0f), ui::Fade(col, 0.85f), glyph);
+      const int lit = (int)std::ceil(std::clamp(frac, 0.0f, 1.0f) * kPips - 1e-3f);
+      for (int i = 0; i < kPips; i++) {
+        const float x0 = mx + i * (pw + pg);
+        d->AddRectFilled(ImVec2(x0, y), ImVec2(x0 + pw, y + ph), i < lit ? col : ui::ColMid());
+      }
+      if (tick >= 0.0f) {
+        const float tx = std::floor(mx + std::clamp(tick, 0.0f, 1.0f) * mw);
+        d->AddRectFilled(ImVec2(tx, y - 2.0f), ImVec2(tx + 1.0f, y + ph + 2.0f), ui::ColSteel());
+      }
+    };
+    const float my = ey0 + 7 * eb + 6.0f;
+    meter(my, s.stealthLight, ui::ColGold(), -1.0f, "*");
+    meter(my + ph + 5.0f, s.stealthNoise, ui::ColParch(), s.stealthQuiet, "~");
+  }
+  // ---- THE SNEAK-ATTACK TOAST, under the crosshair -------------------------
+  if (s.playerAlive && s.sneakToastAge < 1.6f && s.sneakToastMul > 1.0f) {
+    char t[48];
+    std::snprintf(t, sizeof t, "%s  x%.1f", s.sneakToastRanged ? "SNEAK SHOT" : "SNEAK ATTACK",
+                  s.sneakToastMul);
+    const float alpha = std::clamp((1.6f - s.sneakToastAge) / 0.5f, 0.0f, 1.0f);
+    py += tab(t, py, ui::ColEmber(), ui::ColEmber(), alpha);
+  }
   // ---- SHOCKED: an edge flash, then STUNNED under the crosshair ------------
   //
   // Pixel art on the 2 px grid like the throw meter below. The FLASH: for six
@@ -3362,7 +3469,8 @@ void Overlay::Draw(UIState& s) {
                                               "socialize", "eat",
                                               "goto",      "cast",
                                               "orbit",     "charge",
-                                              "shoot"};
+                                              "shoot",     "investigate",
+                                              "search",    "stalk"};
               static_assert(sizeof(kIntent) / sizeof(kIntent[0]) ==
                             (size_t)UIState::kAiIntents);
               for (int k = 0; k < UIState::kAiIntents; k++) {

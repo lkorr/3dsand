@@ -79,7 +79,8 @@ PierceFlight PierceAlongRay(Physics& phys, MobSystem& mobs, DebrisSystem& debris
                             Vec3 fromWorld, Vec3 dirWorld, float maxDistVox,
                             const Penetrator& pen,
                             const std::vector<uint64_t>& ignore = {},
-                            const std::string& embedItem = {});
+                            const std::string& embedItem = {},
+                            uint64_t shooterActor = 0, Vec3 shooterAt = {});
 
 // ---- A SPELL FLIGHT'S MATTER MEETS A BODY (docs/PLAN_projectiles.md D) -------
 //

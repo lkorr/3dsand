@@ -2421,7 +2421,8 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             const uint32_t aseed =
                 rng::Hash3(0xA770B0u, tick, (uint32_t)s.index);
             if (w.arrows.Launch(*ammo, from, dir, speed, player.vel, aseed,
-                                std::move(ignore))) {
+                                std::move(ignore),
+                                ai::kPlayerActorBase + (uint64_t)s.index)) {
               KitTakeAmmo(kit, ammo->name);
               have--;
             } else {
@@ -2925,6 +2926,20 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
         }
         ws.actors.push_back({pl.player.pos, Player::kHalfXZ,
                              Player::kHalfY * 2.0f, alive, (uint8_t)act});
+        // HOW HIDDEN THE PLAYER IS (stealth; MobSystem::PublishStealth adds
+        // the light, the noise and the skill): the stance, the walk as a
+        // share of the walk speed, the legs in liquid. A fly-mode camera -- a
+        // spectator, the gate rig's body -- is perceived the legacy way.
+        MobSystem::PlayerActorDesc& dsc = ws.actors.back();
+        dsc.stealth = alive && !pl.player.fly && pl.avatar.Spawned();
+        dsc.stance = pl.player.prone ? 2 : pl.player.crouching ? 1 : 0;
+        {
+          const float walk =
+              std::max(1.0f, CurrentTuning().player.walkSpeed / kVoxelMeters);
+          const float vx = pl.player.vel.x, vz = pl.player.vel.z;
+          dsc.moveFrac = std::sqrt(vx * vx + vz * vz) / walk;
+        }
+        dsc.wading = pl.player.inLiquid ? pl.player.submersion : 0.0f;
       }
       // THE PEERS' BODIES ARE TARGETS TOO (M9.2 package B). Appended AFTER
       // every local session because the actor id band is POSITIONAL: entry i
@@ -5157,6 +5172,7 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
             playerBitten = false;
             s.playerHaftStruck.clear();
             s.playerVictimHits.clear();
+            s.playerSneakHits.clear();
           }
           if (lastEdgeValid && playerStrike.Cutting()) {
             EdgeSweep sw;
@@ -5211,6 +5227,11 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
             // Strike n on one creature does repeatHitScale^(n-1) of its hp;
             // the haft copies this pointer and shares the count.
             sw.victimHits = &s.playerVictimHits;
+            // A SNEAK ATTACK (stealth): from a crouch, on a creature that has
+            // not detected the player -- the weapon's own multiplier if it has
+            // one (a dagger), else stealth.sneakMelee.
+            sw.sneakHits = &s.playerSneakHits;
+            sw.sneakItemMul = heldItem != nullptr ? heldItem->sneakAttack : 0.0f;
             // A FIST IS PART OF THE ARM THAT THROWS IT (melee.h selfMounted).
             sw.selfMounted = avatar.EffectorWeapon() != nullptr;
             sw.valid = true;

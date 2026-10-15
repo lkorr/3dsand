@@ -457,6 +457,10 @@ struct ItemDef {
   // voxels. This is the difference between a cut and a cleave; keep it small,
   // since the blade geometry is supposed to be what decides the wound.
   float carveBonus = 0.0f;
+  // A SNEAK ATTACK with this weapon lands this many times harder (stealth:
+  // MobSystem::SneakAttackMul). 0 = stealth.sneakMelee / sneakRanged, the
+  // default for everything; a dagger authors its own, as Skyrim's does.
+  float sneakAttack = 0.0f;
 
   // Which FORM of every attack style this weapon swings: "short", "long" or
   // "blunt" (strokes.h WEAPON FORMS). Authored in items.json; absent or

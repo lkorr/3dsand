@@ -1286,6 +1286,15 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
   // "no AI": the creature keeps the wander-and-avoid DecideIntent has always
   // had, so adding this system changed nothing about any existing sidecar.
   def.behavior = j.value("behavior", std::string());
+  // This character's own stealth skills (MobDef::stealthSneak /
+  // stealthAwareness): absent keys keep the profile's.
+  if (j.contains("stealth") && j["stealth"].is_object()) {
+    const auto& q = j["stealth"];
+    if (q.contains("sneak") && q["sneak"].is_number())
+      def.stealthSneak = std::clamp(q["sneak"].get<float>(), 0.0f, 100.0f);
+    if (q.contains("awareness") && q["awareness"].is_number())
+      def.stealthAwareness = std::clamp(q["awareness"].get<float>(), 0.0f, 100.0f);
+  }
   // The pose held while pursuing, BY NAME, resolved against this rig's own
   // clips below (MobDef::chaseClip). Absent = the creature chases in
   // whatever pose it walks in, which is every def but the undead.
@@ -2951,6 +2960,9 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
                                                               : sear;
     flashForm_.push_back(flash);
   }
+  // The stealth tables: what a footstep on each material sounds like to a
+  // listener, and which worn materials clank (game/mob_stealth.cpp).
+  BuildStealthTables(mats);
 }
 
 void MobSystem::SetDefs(std::vector<MobDef> defs) {
@@ -4050,6 +4062,9 @@ ai::Brain* MobSystem::MobBrainMut(uint64_t mobId) {
 void MobSystem::SetPlayerActors(std::span<const PlayerActorDesc> players) {
   playerActors_.clear();
   playerActors_.reserve(players.size());
+  // ...and what only the session knows about how hidden each one is, for
+  // PublishStealth to finish in PreTick (it needs the world for the light).
+  playerDescs_.assign(players.begin(), players.end());
   for (size_t i = 0; i < players.size(); i++) {
     ai::Actor a;
     // THE ID IS THE BAND, NOT THE INDEX (M9.1 P2). The index used to BE the id,
@@ -4086,6 +4101,12 @@ void MobSystem::Reset(bool rewindIds) {
   casts_.clear();   // D4
   shoots_.clear();  // the archers
   actors_.clear();
+  // Stealth's tick-to-tick state: the noises the torn-down world made, its
+  // sneak events and its glow summaries (they name chunks of the old world).
+  noiseNow_.clear();
+  noiseNext_.clear();
+  sneaks_.clear();
+  emitters_.clear();
   blocks_.clear();
   strikes_.clear();
   // The drip pot's demand is derived from wounds that no longer exist.
@@ -7885,6 +7906,10 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     // (melee.h EdgeSweep::victimHits / reportStrikes). Without the report an
     // NPC's blow made no weapon or flesh sound at all -- even on the player.
     sw.victimHits = &st.victimHits;
+    // ...and the stalker's sneak attack (stealth): a crouched NPC's blow on a
+    // creature that has not detected it.
+    sw.sneakHits = &st.sneakHits;
+    sw.sneakItemMul = item != nullptr ? item->sneakAttack : 0.0f;
     sw.reportStrikes = true;
     // ...and WHICH limb that one bite is trying to close on (melee.h
     // EdgeSweep::bitePrefer). The draw already happened, once, at the start of
@@ -8382,6 +8407,8 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
       self.ammo = MobShotsLeft(mob, *items_);
     self.drawing = mob.bowDraw_;
     self.cornered = sense.haveGround && !sense.clear[GroundSense::kProbeCount / 2];
+    // This character's own detection skill (sidecar `stealth.awareness`).
+    self.awareness = def.stealthAwareness;
     // THE FENCE, as the scorer sees it (demons D6 item 10; mobfence.h Reach /
     // Cast): asked once, uncounted, about last tick's target.
     if (fence_.allow != nullptr && mob.ai_.hasTarget) {
@@ -8414,14 +8441,37 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
       return static_cast<MobSystem*>(ctx)->NearestPartOf(id, from, out, selfId, t);
     };
     wv.aimCtx = this;
+    // STEALTH: the tick's noise events, coefficients and ambient floor.
+    wv.noises = &noiseNow_;
+    wv.stealthParams = &stealthP_;
+    wv.ambient = ambient_;
 
     ai::IntentOut out;
     if (ai::Think(mob.ai_, behaviors_, self, gv, wv, tick, dt, out)) {
+      // THE ALARM (ai_behavior.h IntentOut::alarm): it cries out, pointing at
+      // the intruder, and its allies hear it next tick.
+      if (out.alarm && prof != nullptr) {
+        stealth::Noise n;
+        n.pos = mob.origin_ + def.worldSize * 0.5f;
+        n.point = out.alarmPoint;
+        n.radius = prof->stealth.alarm;
+        n.source = mob.ai_.targetId;
+        n.faction = self.faction;
+        n.kind = stealth::NoiseKind::Alarm;
+        PostNoise(n);
+      }
       if (stunned) {
+        mob.aiCrouch_ = false;
         holdStill();
         shockAttacksDropped_ += out.attack ? 1u : 0u;
         return;
       }
+      // A STALKER CROUCHES (Intent::Stalk): the pose and the published stance.
+      // ...and a stroke begun from the crouch is finished from it: the AI's
+      // commit window ends before the cut does (windup, then cut), and a
+      // stalker that stood up mid-swing would land its blow standing -- no
+      // sneak attack (stealth.sneakNeedsCrouch) for the swing it crept in for.
+      mob.aiCrouch_ = out.crouch || (mob.aiCrouch_ && mob.stroke_.Active());
       // ...and turn its head toward whatever it decided to fight (plan §4's
       // closing note on ApplyAimPart). Read off the brain rather than passed
       // out of Think, because it is not an INTENT — the AI has no opinion
@@ -8431,6 +8481,12 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
       // fish) does not turn its head on its trunk.
       if (mob.ai_.hasTarget && mob.ai_.visible && def.headLook)
         mob.SetAimLook(mob.ai_.targetPos);
+      // ...or toward whatever it half saw or heard (stealth: Brain::stim) --
+      // the guard's head turning before its feet do.
+      else if (!mob.ai_.hasTarget && def.headLook &&
+               mob.ai_.stim.kind != stealth::StimKind::None && tick <= mob.ai_.stim.until)
+        mob.SetAimLook(mob.ai_.stim.kind == stealth::StimKind::Lost ? mob.ai_.searchGoal
+                                                                     : mob.ai_.stim.pos);
       else
         mob.ClearAimLook();
       mob.desiredHeading_ = out.desiredHeading;
@@ -8468,6 +8524,7 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     }
   }
 
+  mob.aiCrouch_ = false;
   if (stunned) {
     holdStill();
     return;
@@ -9331,6 +9388,9 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
   // climbs a step in one tick, and the foot average is what eases it.
   in.height = PoseInputs::Height::FromFeet;
   in.tiltFromGround = true;
+  // A STALKER'S CROUCH (stealth, Intent::Stalk): the player's held crouch,
+  // the same knee drop and sneak clip, driven by the AI instead of Ctrl.
+  in.crouch = mob.aiCrouch_;
   // The chase pose: engaged with something and not mid-strike (the clip is
   // ADDITIVE — see the note in Mob::PosePipeline).
   // A style thrown FROM the stance (AttackStyle::fromStance) keeps it held:
@@ -9441,6 +9501,13 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // The clock a rising is booked against (Mob::Die runs from inside a damage
   // path, which has no tick to hand).
   tick_ = tick;
+  // STEALTH (game/mob_stealth.cpp): this tick's coefficients and ambient
+  // floor, and the noises posted since the last PreTick become the ones every
+  // brain hears this tick -- whatever phase of the tick posted them.
+  stealthP_ = stealth::FromTuning(CurrentTuning());
+  ambient_ = stealth::Ambient(stealthP_, weatherRain_ & kRainAmountMask);
+  noiseNow_.swap(noiseNext_);
+  noiseNext_.clear();
   RefreshHeldFills();
   // WHO OWNS WHAT, ONCE, BEFORE ANYTHING STEPS (M9.4-B). A creature's owner
   // may not change halfway through its own tick: burning is a pre-pass, the
@@ -9542,7 +9609,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // The AI's own creatures: the players are in the list above, as ACTORS
   // (their ids live in the player-actor band), so a body a player drives is
   // skipped here by its controller rather than by which container holds it.
-  for (const Mob& m : mobs_) {
+  for (Mob& m : mobs_) {
     if (!m.alive_ || m.def_ == nullptr || m.PlayerControlled()) continue;
     const ai::Profile* pr = behaviors_.At(m.ai_.profile);
     ai::Actor a;
@@ -9559,6 +9626,8 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     a.hostile = pr != nullptr && pr->perception.aggro == ai::Aggro::Hostile;
     a.alive = true;
     PublishCombatant(m, a);
+    // How hidden it is (stealth): light, stance, noise, skill.
+    PublishStealth(world, m, a, tick, nullptr);
     a.targetId = m.ai_.hasTarget ? m.ai_.targetId : 0;
     switch (m.stroke_.phase) {
       case NpcStroke::Phase::Guard: a.action = ai::Action::Guard; break;
@@ -9580,10 +9649,16 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // avatar, which is actor i's body by the band (FindCombatantById).
   for (size_t i = 0; i < playerActors_.size() && i < actors_.size(); i++) {
     if (i >= avatars_.size() || avatars_[i] == nullptr) continue;
-    const Mob& av = *avatars_[i];
+    Mob& av = *avatars_[i];
     if (!av.alive_ || av.def_ == nullptr) continue;
     PublishCombatant(av, actors_[i]);
+    if (i < playerDescs_.size())
+      PublishStealth(world, av, actors_[i], tick, &playerDescs_[i]);
   }
+  // The players' exposure, as published, for the HUD's meters.
+  playerExposure_.resize(playerActors_.size());
+  for (size_t i = 0; i < playerActors_.size() && i < actors_.size(); i++)
+    playerExposure_[i] = actors_[i].stealth;
   // ---- SOFT PUSHERS (MobDef::bodyPush): this tick's posed limbs ---------
   if (phys_ != nullptr) {
     std::vector<std::pair<uint64_t, float>> soft;
@@ -29056,6 +29131,17 @@ void MobSystem::PushVoice(const Mob& mob, VoiceKind kind, Vec3 posVoxel,
       if (v.mobId == mob.id_ && v.kind == VoiceKind::Hurt) return;
   voices_.push_back(VoiceEvent{posVoxel, mob.id_, (int)mob.defIndex_, kind,
                                std::clamp(intensity, 0.0f, 1.0f)});
+  // ...AND EVERYBODY NEAR HEARS IT (stealth): a cry betrays the crier to its
+  // enemies, and brings its friends to look (ai_behavior.cpp's noise branch
+  // tells the two apart by faction).
+  {
+    stealth::Noise n;
+    n.pos = n.point = posVoxel;
+    n.radius = stealthP_.voiceNoise * (0.5f + 0.5f * std::clamp(intensity, 0.0f, 1.0f));
+    n.source = ActorIdOf(mob);
+    n.kind = stealth::NoiseKind::Voice;
+    PostNoise(n);
+  }
 }
 
 void Mob::Die() {

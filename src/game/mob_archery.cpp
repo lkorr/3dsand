@@ -284,7 +284,8 @@ bool StepDraw(TickAuthorityCtx& w, std::span<SessionTick> players, MobArcheryWor
   m->AppendLiveLimbBodies(ignore);
   const uint32_t seed = rng::Hash3(kSaltSeed, tick, (uint32_t)d.mobId);
   EndDraw(m, d);
-  if (!w.arrows.Launch(*ammo, s.from, s.dir, speed, Vec3{}, seed, std::move(ignore))) {
+  if (!w.arrows.Launch(*ammo, s.from, s.dir, speed, Vec3{}, seed, std::move(ignore),
+                       d.mobId)) {
     ev.kind = ArcheryEvent::Kind::Abort;
     ev.why = "too many arrows in the air";
     a.stats.aborted++;

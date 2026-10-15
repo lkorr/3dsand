@@ -178,6 +178,14 @@ struct ArrowFlight {
   uint32_t seed = 0;        // the soak's draw key, per hit
   int ticksLeft = 0;
   std::vector<uint64_t> ignore;  // the shooter's own bodies at the loose
+  // ---- STEALTH: WHO LOOSED IT, AND FROM WHERE --------------------------
+  // The shooter's ACTOR id (a mob id, or a player's band id; 0 = nobody --
+  // a gate's arrow) and the loose point: what a struck creature that never
+  // saw the archer searches toward, what decides a sneak attack, and where
+  // the bow's twang is heard (`twanged` once it has been).
+  uint64_t shooter = 0;
+  Vec3 from{};
+  bool twanged = false;
 };
 
 // What one arrow did, for the `arrow` gate and the counters. Bounded log.
@@ -230,7 +238,7 @@ class ArrowFlights {
   // state, as melee does).
   bool Launch(const ItemDef& arrow, Vec3 fromWorld, Vec3 dirWorld,
               float speedVox, Vec3 carryVox, uint32_t seed,
-              std::vector<uint64_t> ignore);
+              std::vector<uint64_t> ignore, uint64_t shooterActor = 0);
   void Tick(uint32_t tick, ArrowWorld& w, std::vector<ParticleSpawn>& spawns);
 
   size_t Live() const { return live_.size(); }

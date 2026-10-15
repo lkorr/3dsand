@@ -258,7 +258,8 @@ PierceFlight PierceAlongRay(Physics& phys, MobSystem& mobs, DebrisSystem& debris
                             Vec3 fromWorld, Vec3 dirWorld, float maxDistVox,
                             const Penetrator& pen,
                             const std::vector<uint64_t>& ignore,
-                            const std::string& embedItem) {
+                            const std::string& embedItem,
+                            uint64_t shooterActor, Vec3 shooterAt) {
   PierceFlight f;
   f.speedMps = pen.speedMps;
   const float dl = dirWorld.len();
@@ -344,7 +345,29 @@ PierceFlight PierceAlongRay(Physics& phys, MobSystem& mobs, DebrisSystem& debris
       h.mobId = m->Id();
       h.limb = li;
       if (MobSystem::OwnedHere(*m)) {
-        mobs.PierceLimb(body, origin, d, cur, world, spawns, h.r);
+        // A SNEAK SHOT (stealth): the flat hp of the point, x the multiplier,
+        // when the creature had not detected the archer -- decided before
+        // the hit tells it, which it then does (it searches, or turns).
+        Penetrator hitPen = cur;
+        float sneak = 1.0f;
+        if (shooterActor != 0) {
+          sneak = mobs.SneakAttackMul(*m, shooterActor, true);
+          hitPen.hp *= sneak;
+        }
+        mobs.PierceLimb(body, origin, d, hitPen, world, spawns, h.r);
+        if (shooterActor != 0 && h.r.hit && !h.r.missed) {
+          if (sneak > 1.0f) {
+            MobSystem::SneakEvent ev;
+            ev.attacker = shooterActor;
+            ev.victim = m->Id();
+            ev.mul = sneak;
+            ev.at = h.r.entryWorld;
+            ev.tick = mobs.TickNow();
+            ev.ranged = true;
+            mobs.PushSneakEvent(ev);
+          }
+          mobs.NoteAttacked(*m, shooterActor, shooterAt, true, mobs.TickNow());
+        }
       } else {
         MeleeHit wire = wireFor(mobs.RefOf(*m), m->SlotName(li));
         mobs.PierceLimb(body, origin, d, cur, world, ghostGore, h.r);

@@ -42,6 +42,7 @@
       "id": "dagger",
       "kind": "melee",
       "weaponClass": "short",
+      "sneakAttack": 5.0,
       "damage": 6.5,
       "carveBonus": 0.04,
       "heft": 0.224,

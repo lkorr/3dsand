@@ -776,6 +776,18 @@ struct EdgeSweep {
   // fabricates N sweeps gets N full blows. The head and the haft of one stroke
   // share ONE of these -- it is the same swing hitting the same person.
   std::vector<std::pair<uint64_t, int>>* victimHits = nullptr;
+  // ---- A SNEAK ATTACK (stealth; game/stealth.h, MobSystem::SneakAttackMul) --
+  //
+  // (creature id, multiplier), decided at this stroke's FIRST contact with
+  // each creature -- did it know the attacker was there? -- and kept for every
+  // later contact of the same swing: the blow that told it is the blow that
+  // was the surprise, all of it. The multiplier rides `repeat` (every hp of
+  // the strike, as a charged strike's does). Null = no stroke identity: no
+  // sneak attacks, and no "a blade landed" note to the victim's brain either.
+  // `sneakItemMul` is the weapon's own multiplier (ItemDef::sneakAttack; 0 =
+  // stealth.sneakMelee).
+  std::vector<std::pair<uint64_t, float>>* sneakHits = nullptr;
+  float sneakItemMul = 0.0f;
   // Push a StrikeEvent the first time this stroke meets each creature (needs
   // `victimHits` to know "first"). Set by the NPC stroke runner; the player's
   // sweep latches its own cues and leaves it off.
