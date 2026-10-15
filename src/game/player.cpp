@@ -1397,8 +1397,23 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     // fighting a control that pulled toward a still-water wish; at the
     // surface float (~0.3 under) the control won by 9 to 1 and a treading
     // body barely moved however fast the river ran.
+    //
+    // SAMPLED IN THE WATER, NOT AT THE BODY'S CENTRE. A treading body rests
+    // with its centre ~5 cells above the top water cell, and the terrain flow
+    // field (rivers, lakes, sea) reads zero more than 1.5 cells above that
+    // cell (WaterFlowField::Sample), so a centre sample left a floating
+    // player still in a running river. The probe is the middle of the
+    // submerged span -- feet to the waterline, or to the head when the body
+    // is under -- which, like an NPC afloat's mid-body sample
+    // (AfloatCurrent), lies inside the water; a fully submerged swimmer's
+    // probe is its centre, as before.
     const bool carried = inLiquid && (swimming || (afloat && !rising));
-    const Vec3 cur = carried ? sandvox::CurrentAtCpuSim(pos) : Vec3{0, 0, 0};
+    Vec3 curProbe = pos;
+    if (haveSurface)
+      curProbe.y = 0.5f * ((pos.y - kHalfY) +
+                           std::min(pos.y + kHalfY, waterSurfaceY));
+    const Vec3 cur =
+        carried ? sandvox::CurrentAtCpuSim(curProbe) : Vec3{0, 0, 0};
     currentVel = cur;
     vel.x += (wish.x + cur.x - vel.x) * blend;
     vel.z += (wish.z + cur.z - vel.z) * blend;
