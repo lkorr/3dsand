@@ -14834,7 +14834,7 @@ it. The hurt check moved ahead of Perceive (`NoteHurt`) because neutral
 perception reads it. No existing profile is neutral or names the new verbs, so
 every other creature is arbitrated exactly as before.
 
-### Stealth and detection (2026-10-15; `game/stealth.*`, `game/mob_stealth.cpp`, `ai::UpdateAwareness`, profile `stealth` block, tuning `stealth.*`, gate `stealth`, `docs/PLAN_stealth.md`)
+### Stealth and detection (2026-10-15; `game/stealth.*`, `game/mob_stealth.cpp`, `ai::UpdateAwareness`, profile `stealth` block, tuning `stealth.*`, gates `stealth`, `stealth-world`, `stealth-light`, `docs/PLAN_stealth.md`)
 
 Perception used to be a switch. A creature saw a stranger the tick it came
 inside range, cone and line, and stopped seeing it the tick it left them. That
@@ -14922,20 +14922,47 @@ Two cases are never caught unaware:
 `Actor::stealth` (`stealth::Exposure`). It is computed once a tick, beside
 `PublishCombatant`.
 
-- **Light** is `MobSystem::LightAt`, re-measured every 8 ticks. It is
-  computed on the CPU from the tick:
-  - daylight, from `DaylightStrengthCpu` eased up;
-  - five open-sky columns through the chunk caches, so roofs and canopy are
-    shade, and below `World::TerrainHeight` counts as underground;
-  - rain;
-  - per-chunk glow sums of cells with emission ≥ 60, by cache version.
+- **Light** is `MobSystem::LightAt`: the RENDERER'S OWN BODY LIGHTING,
+  evaluated on the CPU (microbody.wgsl `litColorSNoFog` + `glowLight`, term
+  for term, for a white body), every 2nd tick for a player and every 6th for
+  a creature. The value is how bright the body is DRAWN, so a watcher sees
+  what the player sees:
+  - the key light and the hemisphere ambient of the tick, from the renderer's
+    own frame-light resolve on the sim clock (`FrameLightForTick` →
+    `ResolveFrameLight`, set by the session as `MobSystem::SetSkyLight`);
+  - a SHADOW RAY toward the sun or moon from three heights (head, chest,
+    knees; lower for a crouch or a crawl), softened by the renderer's law
+    (`shadowFromOpaqueHit`): a roof, a wall, a tree's crown;
+  - the SKY OPENNESS of the ground under the body by the renderer's five
+    rays (`opennessAtBody` / `sim_openness`), which scales the ambient, caps
+    the shadow lift and adds the enclosed ambient: a room, a cave, an alley;
+  - the GLOW FIELD's per-chunk sources (`sim_glow.wgsl`: mean emitter
+    radiance × saturating fill, `(1 − d/glowReach)²` from the chunk centre) —
+    but a chunk lights the body ONLY if a line reaches one of its exposed
+    glowing cells. The renderer's body path does not occlude the field, so a
+    fire behind a wall still tints a drawn body; it does not reveal it.
+  - the rain word dims the key (`rainKeyDim`): the cloud deck is render-only
+    weather, so the sim's rain stands in for it;
+  - then the renderer's tonemap, over `lightFull` (0.73: a white body in open
+    noon sun draws at 0.732).
 
-  It is never a render target. The camera and the frame cannot reach the
-  decision.
+  Rays read the snapshot mirror, then the fetch cache, then the snapshot's
+  per-chunk occupancy (an empty chunk is air), then the analytic ground
+  (`World::TerrainHeight`). It asks no fetches, and it is never a render
+  target: the camera and the frame cannot reach the decision. The
+  `stealth-light` gate pins it against fixtures with known answers (open
+  noon 1.0, midnight 0.35, a lava pit in sight 0.65, the same pit behind a
+  wall exactly the wall's own light, a closed room at noon 0.19).
 - **Noise** comes from stance, speed over the body's own walk, the share of
   worn pieces that are metal, and the last footfall's material.
 - **Players**: the session publishes stance, walk fraction and wading through
   `PlayerActorDesc`. A fly-mode camera is not modelled.
+- **What the player hears.** Every NPC footfall (the gait's touchdown, as the
+  avatar's) is queued with the loudness the stealth model gives it against a
+  plain walk — stance, sneak skill, worn metal (`MobSystem::NpcSteps`, capped
+  at 192 a frame, drops counted) — and the frame loop voices it through
+  `Cues::Footstep` with that gain on the volume AND the audible radius. A
+  creature creeping up is as quiet to the player as to its prey.
 
 **What stays exactly as it was.** Stealth is a trait of the creatures that
 author it, and it works in both directions:
@@ -14991,8 +15018,13 @@ rain. "SNEAK ATTACK ×3.0" toasts under the crosshair.
   whatever phase posted them.
 - Non-target bodies are weighed every 3rd tick, staggered, and only the 8
   nearest at all.
-- Light and metal are measured on a cadence.
-- Glow sums rebuild only when a cached chunk's version moves.
+- Light and metal are measured on a cadence. One light reading is ~13 µs
+  (open sky, the dearest case: `stealth-light` measures it): rays resolve
+  their store once per chunk, and the sky's empty chunks are air without a
+  word read.
+- Glow sums rebuild only when their words' version moves (the mirror's tick
+  or the cached chunk's), and only for chunks whose centre is within
+  `render.glowReach` of a body.
 - The noise queue is capped at 256; the quietest are refused, counted
   (`NoisesRefused`).
 

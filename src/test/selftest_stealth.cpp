@@ -47,7 +47,18 @@
 //            the blow (NoteAttacked) and provoked by the hurt -- turns on it
 //            within `stealth.answerTicks`. Both bodies publish a modelled
 //            exposure (MobSystem::PublishStealth). The world is regenerated
-//            on the way out.
+//            on the way out. The NPC footfalls it plants reach the ears'
+//            queue (MobSystem::NpcSteps), the stalker's quieter than a walk.
+//
+//   stealth-light  THE LIGHT ON A BODY against fixtures with known answers
+//            (MobSystem::LightAt, the renderer's body lighting on the CPU):
+//            a platform floating over the harness, the body at its centre.
+//            Open at noon: bright (>= stealth.lightOpenMin). At midnight:
+//            darker. A lava pit in sight at night: brighter by
+//            stealth.lightGlowMin. The same pit behind a wall: exactly the
+//            light of the wall alone (the glow does not pass). Four walls and
+//            a roof at noon: dark (<= stealth.lightRoomMax). Each reading
+//            prints its terms (openness, shadow per height, glow seen).
 //
 // Thresholds in tests/baseline.json (`stealth.*`).
 
@@ -451,9 +462,13 @@ Status GateStealth(Ctx& c, std::string& detail) {
   // ---- L: the light on a body, in the live world (MobSystem::LightAt) ------
   // Open air over the harness at noon is bright; the same column at night is
   // moonlight; a point well under the analytic ground is dark whatever the
-  // caches hold. No tick runs: the day phase is put back to the harness's 0.
+  // caches hold. No tick runs: the sky is the renderer's own frame light for
+  // a FROZEN noon and midnight (FrameLightForTick), put back afterwards.
   float noon = 0.0f, night = 0.0f, buried = 0.0f;
   {
+    const stealth::SkyLight keep = c.mobs.SkyLightNow();
+    Tuning frozen = CurrentTuning();
+    frozen.dayNight.freeze = 1;
     const IVec3 wo = c.world.WindowOrigin();
     const int x = wo.x * (int)kChunk + (int)kWorldN / 2;
     const int z = wo.z * (int)kChunk + (int)kWorldN / 2;
@@ -461,13 +476,17 @@ Status GateStealth(Ctx& c, std::string& detail) {
     const int gy = std::clamp(World::TerrainHeight(x, z, c.world.WorldSeed()), ylo + 40, yhi);
     const Vec3 above{(float)x + 0.5f, (float)gy + 30.0f, (float)z + 0.5f};
     const Vec3 under{(float)x + 0.5f, (float)gy - 36.0f, (float)z + 0.5f};
-    c.mobs.SetDayPhase(kDayNoon);
+    frozen.dayNight.freezePhase = (decltype(frozen.dayNight.freezePhase))kDayNoon;
+    c.mobs.SetSkyLight(FrameLightForTick(frozen, 1u));
     noon = c.mobs.LightAt(c.world, above, 17.0f);
     buried = c.mobs.LightAt(c.world, under, 17.0f);
-    c.mobs.SetDayPhase(0u);
+    frozen.dayNight.freezePhase = 0;
+    c.mobs.SetSkyLight(FrameLightForTick(frozen, 1u));
     night = c.mobs.LightAt(c.world, above, 17.0f);
-    if (!(noon > 0.8f && night < 0.35f && buried < 0.25f))
-      fail(Format("L: light noon %.2f (want > 0.8), night %.2f (< 0.35), buried %.2f (< 0.25)",
+    c.mobs.SetSkyLight(keep);
+    if (!(noon > 0.8f && night < noon - 0.3f && buried < 0.25f))
+      fail(Format("L: light noon %.2f (want > 0.8), night %.2f (0.3 under noon), buried %.2f "
+                  "(< 0.25)",
                   noon, night, buried));
     RecordObserved("stealth.lightNoon", (double)noon);
     RecordObserved("stealth.lightNight", (double)night);
@@ -581,8 +600,19 @@ Status GateStealthWorld(Ctx& c, std::string& detail) {
   std::string noticed = "never";
   float minGap = 1e9f;
   int intentHist[(int)ai::Intent::Count] = {};
+  // THE EARS: the NPC footfalls the frame loop voices (MobSystem::NpcSteps),
+  // drained here per tick as main.cpp drains them per frame.
+  c.mobs.ClearNpcSteps();
+  int stepsQueued = 0;
+  float stepGainMin = 1e9f, stepGainMax = 0.0f;
   for (int t = 0; t < maxTicks; t++) {
     support::RunTicks(*rig, 1, [](uint32_t, support::TickOps&) {});
+    for (const MobSystem::NpcStep& ns : c.mobs.NpcSteps()) {
+      stepsQueued++;
+      stepGainMin = std::min(stepGainMin, ns.gain);
+      stepGainMax = std::max(stepGainMax, ns.gain);
+    }
+    c.mobs.ClearNpcSteps();
     const ai::Brain* sb = c.mobs.MobBrain(stalker);
     const ai::Brain* vb = c.mobs.MobBrain(victim);
     Mob* sm = c.mobs.FindMobById(stalker);
@@ -642,6 +672,12 @@ Status GateStealthWorld(Ctx& c, std::string& detail) {
         Format("the villager did not turn on its attacker within %d ticks (at %d after a hit "
                "at %d)",
                answerTicks, answeredTick, hitTick));
+  // A sneaking stalker's steps are queued for the ears, and quieter than a
+  // plain walk by the stealth model's own terms (crouch x sneak skill).
+  check(stepsQueued > 0, "no NPC footfall reached the ears' queue (MobSystem::NpcSteps)");
+  check(stepsQueued == 0 || stepGainMin < 0.7f,
+        Format("no queued footfall was quieter than a walk (gain %.2f..%.2f over %d steps)",
+               stepGainMin, stepGainMax, stepsQueued));
   RecordObserved("stealth.worldHitTick", (double)hitTick);
   RecordObserved("stealth.worldSeenTick", (double)seenTick);
 
@@ -657,11 +693,189 @@ Status GateStealthWorld(Ctx& c, std::string& detail) {
     if (intentHist[k] > 0) hist += Format(" %s %d", ai::IntentName((ai::Intent)k), intentHist[k]);
   detail = Format("stalker targeted at t%d, stalked %d ticks (crouched %d), sneak attack at t%d "
                   "x%.2f, villager answered at t%d | closest %.1f | villager noticed: %s | "
-                  "stalker intents:%s",
+                  "stalker intents:%s | npc steps %d gain %.2f..%.2f",
                   seenTick, stalkTicks, crouchTicks, hitTick, mul, answeredTick, minGap,
-                  noticed.c_str(), hist.c_str());
+                  noticed.c_str(), hist.c_str(), stepsQueued,
+                  stepsQueued > 0 ? stepGainMin : 0.0f, stepGainMax);
   if (!fails.empty()) detail += " | FAILED: " + fails;
   std::printf("stealth-world: %s (%s)\n", fails.empty() ? "PASS" : "FAIL", detail.c_str());
+  return fails.empty() ? Status::Pass : Status::Fail;
+}
+
+// ============================================================================
+// stealth-light: the light on a body is the light the renderer draws on it
+// ============================================================================
+
+Status GateStealthLight(Ctx& c, std::string& detail) {
+  std::string fails;
+  auto check = [&](bool ok, const std::string& what) {
+    if (!ok) {
+      fails += (fails.empty() ? "" : "; ") + what;
+      std::printf("stealth-light: FAILED %s\n", what.c_str());
+    }
+  };
+  const uint32_t stoneId = MatIdOf(c, "stone"), lavaId = MatIdOf(c, "lava");
+  if (stoneId == 0 || lavaId == 0) {
+    detail = "needs the stone and lava materials";
+    return Status::Fail;
+  }
+  const float openMin = (float)BaselineNumber("stealth.lightOpenMin", 0.85);
+  const float roomMax = (float)BaselineNumber("stealth.lightRoomMax", 0.45);
+  const float glowMin = (float)BaselineNumber("stealth.lightGlowMin", 0.08);
+
+  c.mobs.Reset();
+  c.debris.Reset();
+  c.mobs.SetWeatherRain(0u);
+  c.stream.OnRegen();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  // THE FIXTURE, all inside the 3x3x3 chunks the CPU mirror holds round the
+  // rig's chunk: a 31 x 31 stone platform 48+ voxels over the ground
+  // (nothing of the world above it to cast a shadow), the body standing at
+  // the centre of a chunk on it. On a PILLAR down into the ground: a
+  // platform in the air is an island, and the debris scan drops it.
+  const IVec3 o = c.world.WindowOrigin();
+  const int bx = o.x * (int)kChunk + 216, bz = o.z * (int)kChunk + 216;
+  const int fy = FixtureYOver(bx - 24, bz - 24, bx + 23, bz + 23, kDefaultSeed, 48);
+  const int cy = (fy >> 4) + 1;
+  const int sy = cy * (int)kChunk + 2;   // the platform's top: the body's feet
+  const IVec3 fixture{bx >> 4, cy, bz >> 4};
+  auto rig = std::make_unique<support::TickRig>(c, 131000u, fixture);
+  const uint32_t stone = PackVoxNew(stoneId, 0), lava = PackVoxNew(lavaId, 8);
+  auto box = [](std::vector<CellOp>& v, int x0, int y0, int z0, int x1, int y1, int z1,
+                uint32_t w) {
+    for (int z = z0; z <= z1; z++)
+      for (int y = y0; y <= y1; y++)
+        for (int x = x0; x <= x1; x++) v.push_back({World::SlotCellIndex({x, y, z}), w});
+  };
+  // Apply, then run past the snapshot latency so the mirror holds the words.
+  auto apply = [&](const std::vector<CellOp>& cells) {
+    const size_t step = kMaxCellOpsPerTick / 2;
+    for (size_t i = 0; i < cells.size(); i += step) {
+      const std::vector<CellOp> part(cells.begin() + (ptrdiff_t)i,
+                                     cells.begin() + (ptrdiff_t)std::min(cells.size(), i + step));
+      support::RunTicks(*rig, 1, [&](uint32_t, support::TickOps& op) { op.cells = part; });
+    }
+    support::RunTicks(*rig, (int)World::kSnapshotLatency + 3, [](uint32_t, support::TickOps&) {});
+  };
+  const stealth::SkyLight keep = c.mobs.SkyLightNow();
+  Tuning frozen = CurrentTuning();
+  frozen.dayNight.freeze = 1;
+  const stealth::SkyLight noonSky = [&] {
+    frozen.dayNight.freezePhase = (int)kDayNoon;
+    return FrameLightForTick(frozen, 1u);
+  }();
+  const stealth::SkyLight nightSky = [&] {
+    frozen.dayNight.freezePhase = 0;
+    return FrameLightForTick(frozen, 1u);
+  }();
+  const Vec3 body{(float)bx + 0.5f, (float)sy + 8.5f, (float)bz + 0.5f};
+  std::string log;
+  auto measure = [&](const char* name, const stealth::SkyLight& sky, MobSystem::LightProbe& p) {
+    c.mobs.SetSkyLight(sky);
+    p = MobSystem::LightProbe{};
+    const float v = c.mobs.LightAt(c.world, body, 17.0f, stealth::Stance::Stand, &p);
+    log += Format(" | %s %.3f (screen %.3f open %.2f shadow %.2f/%.2f/%.2f glow %.3f %d/%d)",
+                  name, v, p.screen, p.openRaw, p.shadow[0], p.shadow[1], p.shadow[2], p.glow,
+                  p.glowSeen, p.glowChunks);
+    return v;
+  };
+  MobSystem::LightProbe pOpen, pNight, pLava, pWalled, pWallOnly, pRoom;
+
+  // A. OPEN: the platform, cleared air over the whole mirror above it.
+  {
+    std::vector<CellOp> cells;
+    box(cells, bx - 24, sy, bz - 24, bx + 23, (cy + 1) * (int)kChunk + 15, bz + 23, 0u);
+    box(cells, bx - 15, sy - 4, bz - 15, bx + 15, sy - 1, bz + 15, stone);
+    box(cells, bx - 1, World::TerrainHeight(bx, bz, kDefaultSeed) - 4, bz - 1, bx + 1, sy - 5,
+        bz + 1, stone);
+    apply(cells);
+  }
+  const float openNoon = measure("open noon", noonSky, pOpen);
+  // THE COST of one reading (rule 2's budget is per modelled body, every
+  // kLightEveryNpc ticks): open sky is the dearest case, every ray running
+  // its whole length.
+  double usPerCall = 0.0;
+  {
+    constexpr int kCalls = 200;
+    const double t0 = NowSeconds();
+    float sink = 0.0f;
+    for (int i = 0; i < kCalls; i++)
+      sink += c.mobs.LightAt(c.world, Vec3{body.x + (float)(i % 7), body.y, body.z}, 17.0f);
+    usPerCall = (NowSeconds() - t0) * 1e6 / kCalls;
+    if (sink < 0.0f) std::printf("%f", sink);
+  }
+  const float openNight = measure("open night", nightSky, pNight);
+  // B. A LAVA PIT five voxels off, sunk in the platform, at night.
+  {
+    std::vector<CellOp> cells;
+    box(cells, bx + 5, sy - 2, bz - 3, bx + 10, sy - 1, bz + 3, lava);
+    apply(cells);
+  }
+  const float lavaNight = measure("lava", nightSky, pLava);
+  // C. A WALL between the body and the pit: the same lava, no line to it.
+  {
+    std::vector<CellOp> cells;
+    box(cells, bx + 2, sy, bz - 14, bx + 3, sy + 19, bz + 14, stone);
+    apply(cells);
+  }
+  const float walled = measure("walled", nightSky, pWalled);
+  // ...and the wall alone (the pit filled with stone): what the wall itself
+  // does to the light, so the lava's share behind it is a difference.
+  {
+    std::vector<CellOp> cells;
+    box(cells, bx + 5, sy - 2, bz - 3, bx + 10, sy - 1, bz + 3, stone);
+    apply(cells);
+  }
+  const float wallOnly = measure("wall only", nightSky, pWallOnly);
+  // D. INDOORS AT NOON: four walls and a roof round the body.
+  {
+    std::vector<CellOp> cells;
+    box(cells, bx - 15, sy + 20, bz - 15, bx + 15, sy + 21, bz + 15, stone);
+    box(cells, bx - 15, sy, bz - 15, bx - 14, sy + 19, bz + 15, stone);
+    box(cells, bx + 14, sy, bz - 15, bx + 15, sy + 19, bz + 15, stone);
+    box(cells, bx - 13, sy, bz - 15, bx + 13, sy + 19, bz - 14, stone);
+    box(cells, bx - 13, sy, bz + 14, bx + 13, sy + 19, bz + 15, stone);
+    apply(cells);
+  }
+  const float roomNoon = measure("room noon", noonSky, pRoom);
+  c.mobs.SetSkyLight(keep);
+
+  check(openNoon >= openMin, Format("open ground at noon reads %.3f (want >= %.2f)", openNoon, openMin));
+  check(openNight < openNoon - 0.2f,
+        Format("night (%.3f) is not darker than noon (%.3f)", openNight, openNoon));
+  check(roomNoon <= roomMax && roomNoon < openNoon - 0.3f,
+        Format("a closed room at noon reads %.3f (want <= %.2f, and well under open %.3f)",
+               roomNoon, roomMax, openNoon));
+  check(pLava.glowSeen > 0 && lavaNight >= openNight + glowMin,
+        Format("a lava pit in sight lit the body to %.3f from %.3f (want +%.2f; %d of %d "
+               "emitter chunks seen)",
+               lavaNight, openNight, glowMin, pLava.glowSeen, pLava.glowChunks));
+  check(pWalled.glowChunks > 0 && pWalled.glowSeen == 0 && std::abs(walled - wallOnly) < 0.01f,
+        Format("lava behind a wall lit the body: %.3f vs %.3f with the wall alone (%d of %d "
+               "emitter chunks seen)",
+               walled, wallOnly, pWalled.glowSeen, pWalled.glowChunks));
+  RecordObserved("stealth.lightOpenNoon", (double)openNoon);
+  RecordObserved("stealth.lightOpenScreen", (double)pOpen.screen);
+  RecordObserved("stealth.lightOpenNight", (double)openNight);
+  RecordObserved("stealth.lightLava", (double)lavaNight);
+  RecordObserved("stealth.lightRoomNoon", (double)roomNoon);
+  RecordObserved("stealth.lightUsPerCall", usPerCall);
+
+  rig.reset();
+  c.mobs.Reset();
+  c.debris.Reset();
+  c.stream.OnRegen();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  detail = Format("open noon %.3f / night %.3f, lava in sight %.3f, behind a wall %.3f "
+                  "(wall alone %.3f), room at noon %.3f; %.1f us a reading",
+                  openNoon, openNight, lavaNight, walled, wallOnly, roomNoon, usPerCall) +
+           log;
+  if (!fails.empty()) detail += " | FAILED: " + fails;
+  std::printf("stealth-light: %s (%s)\n", fails.empty() ? "PASS" : "FAIL", detail.c_str());
   return fails.empty() ? Status::Pass : Status::Fail;
 }
 
@@ -674,6 +888,10 @@ const std::vector<Gate>& StealthGates() {
       // The live path: a stalker, a villager, THE tick. Regenerates on the
       // way out.
       {"stealth-world", "mob", {}, false, GateStealthWorld, /*needsRender=*/false},
+      // The light on a body (MobSystem::LightAt) against fixtures whose answer
+      // the renderer's law fixes: open noon, a closed room, a lava pit in
+      // sight and behind a wall. Regenerates on the way out.
+      {"stealth-light", "mob", {}, false, GateStealthLight, /*needsRender=*/false},
   };
   return g;
 }

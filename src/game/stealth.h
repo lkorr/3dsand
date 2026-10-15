@@ -57,9 +57,12 @@
 // All of this is CPU float gameplay state beside the arbiter it feeds, under
 // the same rules: it runs in the 30 Hz tick, its only randomness is the
 // counter RNG keyed on (id, tick), and its inputs are the tick's published
-// actors and the tick's noise events. Light is computed from the tick's day
-// phase and rain word and the CPU's chunk caches -- the same stores the line
-// of sight already reads -- never from a render target or the camera.
+// actors and the tick's noise events. LIGHT is the renderer's own body
+// lighting law evaluated on the CPU (MobSystem::LightAt): the tick's sky
+// resolved by the renderer's frame-light function, a shadow ray toward the
+// sun or moon and the five openness rays through the CPU's voxel stores (the
+// mirror, the fetch cache, the analytic ground), and the glow field's own
+// source and falloff -- never a render target or the camera.
 
 #include <cstdint>
 
@@ -194,12 +197,9 @@ struct Params {
   float voiceNoise{};    // a cry of pain
   float impactNoise{};    // an arrow / thrown thing striking matter
   float twangNoise{};     // a bow loosed
-  // -- light --
-  float nightLight{};
-  float roofedDay{};      // daylight under a roof (doorways, windows)
-  float overcastDim{};    // in rain
-  float emitterRadius{};  // voxels: a glowing cell's reach
-  float emitterGain{};
+  // -- light (the renderer's body lighting; MobSystem::LightAt) --
+  float lightFull{};      // on-screen brightness that reads as fully lit
+  float rainKeyDim{};     // the rain deck's shadow on the key light
   float burningLight{};
   // -- sneak attacks --
   float sneakMelee{};
@@ -290,11 +290,20 @@ float SoundGain(const Params& p, float radius, float d, float hearing,
 // The same as a one-shot (an event): how far the meter jumps.
 float SoundImpulse(const Params& p, float radius, float d, float hearing,
                    float awareness, float ambient, bool blocked);
-// The ambient light model's pieces, for MobSystem::LightAt: daylight 0..1
-// from DaylightStrengthCpu's 0..255, an open-sky fraction, the rain amount,
-// and the emitter sum (already distance-weighted, in glowing-cell units).
-float SkyLight(const Params& p, uint32_t daylight255, float openFrac,
-               uint32_t rainAmount);
-float EmitterLight(const Params& p, float weightedCells);
+// THE FRAME'S LIGHT FOR ONE TICK, as the renderer resolves it
+// (test/support.cpp FrameLightForTick -> ResolveFrameLight, the function that
+// fills RenderParams' key and ambient): the key light's direction and colour
+// (the sun by day, the brighter moon by night) and the hemisphere ambient's
+// two ends. Taken from the SIM tick through the celestial clock, so it is a
+// function of the tick alone. `valid` false = nobody set one (a gate that
+// never ticked): LightAt then answers "fully lit", the legacy reading.
+struct SkyLight {
+  bool valid = false;
+  float keyDir[3] = {0.0f, 1.0f, 0.0f};
+  float keyCol[3] = {0.0f, 0.0f, 0.0f};
+  float ambGround[3] = {0.0f, 0.0f, 0.0f};
+  float ambSky[3] = {0.0f, 0.0f, 0.0f};
+  float ambOvercast = 0.0f;
+};
 
 }  // namespace stealth

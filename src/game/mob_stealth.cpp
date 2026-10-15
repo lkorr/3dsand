@@ -21,55 +21,228 @@
 
 namespace {
 
-// A material glows enough to LIGHT a body at this emission and up. Fainter
-// self-lit matter (glowing moss at 18, a flower's sheen) is an art choice --
-// it shows in the dark without lighting what stands beside it -- and a meadow
-// of it summed would read as a bonfire.
-constexpr uint32_t kLampEmission = 60;
-
-// How often a body's light and worn metal are re-measured (ticks), staggered
-// by id. Both change on the scale of a walk across a room, not of a tick.
-constexpr uint32_t kLightEvery = 8;
+// How often a body's light is re-measured (ticks), staggered by id: a player
+// every other tick, so the HUD's light meter follows a step into a doorway's
+// shadow; a creature every sixth. Worn metal every thirtieth.
+constexpr uint32_t kLightEveryPlayer = 2;
+constexpr uint32_t kLightEveryNpc = 6;
 constexpr uint32_t kMetalEvery = 30;
 
-// Emitter chunks within this many chunks of a body are summed (horizontal,
-// vertical): 4 x 16 = 64 voxels, a little over twice stealth.emitterRadius's
-// default -- past that a cell contributes under a fifth of its glow.
-constexpr int kEmitReachXZ = 4;
-constexpr int kEmitReachY = 2;
+// THE SHADOW RAY'S REACH, world voxels (25.6 m), cell by cell. The renderer's
+// traceOpaque spends render.shadowSteps (384) steps, going COARSE (4^3 blocks)
+// past the near field; the CPU walks cells to here and then asks the same
+// question the renderer asks of a ray that ran out -- is its end under the
+// ground? (shadowFromOpaqueHit: "out of steps underground is a far blocker").
+constexpr float kShadowReach = 256.0f;
+// How far DOWN a body looks for the ground its ambient is measured on:
+// common.wgsl opennessAtBody's six 4^3 blocks (2.4 m). Past that it is over a
+// hole and the ambient is unscaled, as there.
+constexpr int kGroundWalk = 24;
 
-// THE SKY OVER A POINT, ASKING NOTHING. MobSystem::OpenToSky's column walk
-// (nothing but air and gas for kSkyProbeCells above), except that a chunk the
-// cache does not hold reads OPEN and is NOT requested: this is a watcher's
-// question about a body, asked for every creature every few ticks, and a
-// fetch request per miss would queue in front of the ground probes and the
-// dissolution scans that actually need the chunk (World::FetchSource, one
-// FIFO, kFetchPerTick a tick).
-constexpr int kSkyProbeCells = 48;
-bool OpenSkyNoFetch(const World& world, const std::vector<MaterialGpu>& mats,
-                    const Vec3& p) {
-  const int x = ifloor(p.x), z = ifloor(p.z);
-  const int y0 = ifloor(p.y) + 1;
-  IVec3 memo{INT_MIN, INT_MIN, INT_MIN};
-  const CachedChunk* cc = nullptr;
-  for (int y = y0; y < y0 + kSkyProbeCells; y++) {
-    const IVec3 c{x, y, z};
-    if (!world.CellInWindow(c)) return true;
-    const IVec3 wc{x >> 4, y >> 4, z >> 4};
-    if (wc.x != memo.x || wc.y != memo.y || wc.z != memo.z) {
-      memo = wc;
-      cc = world.Cached(wc);
-    }
-    if (cc == nullptr || cc->voxels.size() != kChunkVol) {
-      // Unknown: skip to the next chunk up rather than call it a roof.
-      y = ((y >> 4) << 4) + 15;
-      continue;
-    }
-    const uint32_t m = cc->voxels[((uint32_t)(z & 15) * kChunk + (uint32_t)(y & 15)) * kChunk +
-                                  (uint32_t)(x & 15)] & 0xFFFu;
-    if (m != 0 && m < mats.size() && mats[m].klass != CLASS_GAS) return false;
+float Lum3(const float* c) { return 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2]; }
+float Smooth(float e0, float e1, float x) {
+  const float t = std::clamp((x - e0) / std::max(e1 - e0, 1e-6f), 0.0f, 1.0f);
+  return t * t * (3.0f - 2.0f * t);
+}
+
+// EVERY CELL A LIGHT RAY CAN MEET, from the freshest store that holds it:
+// the tick's snapshot MIRROR (the 27 chunks round the player, this tick's
+// words), then the FETCH CACHE (what the creatures' own probes fetched, and
+// what the mirror seeded as the player walked), then the snapshot's
+// per-chunk OCCUPANCY (a chunk with no matter in it is all air: the sky, by
+// far the most of what a light ray crosses) -- and for a cell nothing holds,
+// the ANALYTIC GROUND (World::TerrainHeight, worldgen's own height contract)
+// stands in, so a hill whose chunks were never fetched still casts its
+// shadow and still roofs a cave. It asks no fetches. One resolve per chunk
+// a ray enters, not per cell.
+class LightCells {
+ public:
+  LightCells(const World& w, const std::vector<uint8_t>& blocks)
+      : w_(w), snap_(w.Snap()), blocks_(blocks), seed_(w.WorldSeed()) {
+    mirrorOk_ = snap_.valid && snap_.mirror.size() == 27u * kChunkVol;
+    occOk_ = snap_.valid && snap_.occupancy.size() >= kNumChunks;
   }
-  return true;
+  // 1 = stops light (common.wgsl isRayBlockerW), 0 = lets it through,
+  // -1 = no store holds the word.
+  int At(int x, int y, int z) {
+    const int cx = x >> 4, cy = y >> 4, cz = z >> 4;
+    if (cx != mx_ || cy != my_ || cz != mz_) Resolve(cx, cy, cz);
+    if (words_ == nullptr) return kind_;
+    return Word(words_[((uint32_t)(z & 15) * kChunk + (uint32_t)(y & 15)) * kChunk +
+                       (uint32_t)(x & 15)]);
+  }
+  // Under the analytic ground. Memoised per column for the call's lifetime:
+  // a ray walks many cells of few columns, and one answer is a map lookup
+  // and a noise stack.
+  bool Buried(int x, int y, int z) {
+    for (const Col& c : cols_)
+      if (c.x == x && c.z == z) return y <= c.h;
+    Col c{x, z, World::TerrainHeight(x, z, seed_)};
+    cols_[nextCol_++ & 15] = c;
+    return y <= c.h;
+  }
+
+ private:
+  void Resolve(int cx, int cy, int cz) {
+    mx_ = cx;
+    my_ = cy;
+    mz_ = cz;
+    words_ = nullptr;
+    kind_ = -1;
+    const IVec3 wc{cx, cy, cz};
+    if (!w_.ChunkInWindow(wc)) return;
+    if (mirrorOk_) {
+      const int ax = cx - snap_.mirrorBase.x, ay = cy - snap_.mirrorBase.y,
+                az = cz - snap_.mirrorBase.z;
+      if (ax >= 0 && ay >= 0 && az >= 0 && ax < 3 && ay < 3 && az < 3) {
+        words_ = snap_.mirror.data() + (size_t)((az * 3 + ay) * 3 + ax) * kChunkVol;
+        return;
+      }
+    }
+    const CachedChunk* cc = w_.Cached(wc);
+    if (cc != nullptr && cc->voxels.size() == kChunkVol) {
+      words_ = cc->voxels.data();
+      return;
+    }
+    if (occOk_ && snap_.occupancy[World::SlotChunkIndex(wc)] == 0u) kind_ = 0;
+  }
+  int Word(uint32_t w) const {
+    const uint32_t m = w & 0xFFFu;
+    if (m == 0 || m >= blocks_.size()) return 0;
+    const uint8_t b = blocks_[m];
+    if (b == 2) return PowderMassOfState((w >> 12) & 0xFu) >= kPowderBlockMin ? 1 : 0;
+    return b;
+  }
+  struct Col {
+    int x = INT_MIN, z = INT_MIN, h = 0;
+  };
+  const World& w_;
+  const WorldSnapshot& snap_;
+  const std::vector<uint8_t>& blocks_;
+  uint32_t seed_ = 0;
+  bool mirrorOk_ = false, occOk_ = false;
+  int mx_ = INT_MIN, my_ = INT_MIN, mz_ = INT_MIN;
+  const uint32_t* words_ = nullptr;
+  int kind_ = -1;
+  Col cols_[16];
+  uint32_t nextCol_ = 0;
+};
+
+// ONE RAY, CELL BY CELL (Amanatides & Woo): the distance to the first cell
+// that stops light, or none within `maxT` -- and then whether the ray's END is
+// under the analytic ground. A cell no store holds is asked of the ground
+// every fourth step (a ridge is wider than four cells; a wall the caches do
+// not know is not a ridge, and is open, as an unfetched chunk is everywhere
+// in this engine).
+struct LightRay {
+  bool hit = false;
+  float t = 0.0f;
+  bool buriedEnd = false;
+};
+LightRay March(LightCells& L, Vec3 o, Vec3 d, float maxT) {
+  LightRay r;
+  int x = ifloor(o.x), y = ifloor(o.y), z = ifloor(o.z);
+  const int sx = d.x >= 0.0f ? 1 : -1, sy = d.y >= 0.0f ? 1 : -1, sz = d.z >= 0.0f ? 1 : -1;
+  auto inv = [](float v) { return std::abs(v) > 1e-6f ? 1.0f / std::abs(v) : 1e30f; };
+  const float dx = inv(d.x), dy = inv(d.y), dz = inv(d.z);
+  auto first = [](float o, int c, float dir, float invd) {
+    if (std::abs(dir) <= 1e-6f) return 1e30f;
+    return (dir > 0.0f ? ((float)(c + 1) - o) : (o - (float)c)) * invd;
+  };
+  float tx = first(o.x, x, d.x, dx), ty = first(o.y, y, d.y, dy), tz = first(o.z, z, d.z, dz);
+  float t = 0.0f;
+  int unknown = 0;
+  while (t <= maxT) {
+    const int b = L.At(x, y, z);
+    if (b == 1) {
+      r.hit = true;
+      r.t = t;
+      return r;
+    }
+    if (b < 0) {
+      if ((unknown++ & 3) == 0 && L.Buried(x, y, z)) {
+        r.hit = true;
+        r.t = t;
+        return r;
+      }
+    } else {
+      unknown = 0;
+    }
+    if (tx < ty && tx < tz) {
+      x += sx;
+      t = tx;
+      tx += dx;
+    } else if (ty < tz) {
+      y += sy;
+      t = ty;
+      ty += dy;
+    } else {
+      z += sz;
+      t = tz;
+      tz += dz;
+    }
+  }
+  r.t = maxT;
+  const Vec3 e = o + d * maxT;
+  r.buriedEnd = L.Buried(ifloor(e.x), ifloor(e.y), ifloor(e.z));
+  return r;
+}
+
+// THE RENDERER'S BODY SHADING, FOR A WHITE BODY, AS LUMINANCE: microbody.wgsl
+// -> common.wgsl litColorSNoFog + glowLight, term for term, averaged over the
+// five faces a standing body turns to the world (up and the four sides).
+//   ambient   ambientHemi(n) (the overcast grey included) x openScale, plus
+//             the ENCLOSED ambient x (1 - raw openness) -- ambientOpen;
+//   key       keyCol x wrapDiffuse(n.L) x shadowLiftCap(sh, raw);
+//   face      render.faceX / faceZ on the side faces (litColorSNoFog's tie
+//             breaker between the horizontal axes);
+//   glow      the field's luminance x openScale (the `ao` glowLight takes:
+//             open.x) x render.glowStrength.
+// `keyScale` is the rain deck's dimming of the key (stealth.rainKeyDim).
+float BodyRadiance(const stealth::SkyLight& s, const Tuning::Render& r, float sh,
+                   float openRaw, float glowLum, float keyScale) {
+  const float strength = std::clamp(r.opennessStrength, 0.0f, 1.0f);
+  const float openScale =
+      openRaw < 0.0f ? 1.0f : 1.0f + (std::max(openRaw, r.opennessFloor) - 1.0f) * strength;
+  float cap = sh;   // shadowLiftCap
+  if (openRaw >= 0.0f) {
+    const float full = Smooth(std::min(r.shadowLift, 0.99f), 1.0f, sh) * Smooth(0.0f, 0.05f, openRaw);
+    cap = sh * (openRaw + (1.0f - openRaw) * full);
+  }
+  const float keyLum = Lum3(s.keyCol) * keyScale;
+  const float enclosed =
+      openRaw < 0.0f ? 0.0f : Lum3(r.enclosedAmbient) * strength * (1.0f - openRaw);
+  static const float kN[5][3] = {{0, 1, 0}, {1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}};
+  static const float kGrey[3] = {0.96f, 0.99f, 1.04f};
+  const float greyLum = Lum3(kGrey);
+  const float ov = std::clamp(s.ambOvercast, 0.0f, 1.0f);
+  float sum = 0.0f;
+  for (const auto& n : kN) {
+    const float face = std::abs(n[0]) > 0.5f ? r.faceX : std::abs(n[2]) > 0.5f ? r.faceZ : 1.0f;
+    const float up = n[1] * 0.5f + 0.5f;
+    float amb[3];
+    for (int k = 0; k < 3; k++) amb[k] = s.ambGround[k] + (s.ambSky[k] - s.ambGround[k]) * up;
+    float al = Lum3(amb);
+    if (ov > 0.0f) {
+      const float g = al * greyLum * (1.0f + (0.72f - 1.0f) * std::clamp(-n[1], 0.0f, 1.0f));
+      al += (g - al) * ov;
+    }
+    const float ndl = n[0] * s.keyDir[0] + n[1] * s.keyDir[1] + n[2] * s.keyDir[2];
+    const float lambert =
+        std::clamp((ndl + r.diffuseWrap) / (1.0f + r.diffuseWrap), 0.0f, 1.0f) * cap;
+    sum += face * (al * openScale + enclosed + keyLum * lambert);
+  }
+  return sum / 5.0f + glowLum * openScale * r.glowStrength;
+}
+
+// common.wgsl tonemapHdr on LUMINANCE (Reinhard with the white point, then
+// the output gamma; the bleach is a hue effect and is left out): what the
+// screen shows of a white body lit this much, 0..1.
+float OnScreen(float lum, const Tuning::Render& r) {
+  const float W = std::max(r.exposureWhite, 0.01f);
+  const float l = std::max(lum, 0.0f);
+  const float mapped = l * (1.0f + l / (W * W)) / (1.0f + l);
+  return std::pow(mapped, 1.0f / std::max(1.0f, r.gamma));
 }
 
 }  // namespace
@@ -82,16 +255,49 @@ bool OpenSkyNoFetch(const World& world, const std::vector<MaterialGpu>& mats,
 // is loud to a listener for the same reason it is loud to the player), and
 // failing that from its class. Thief's rule -- moss quiet, metal loud -- falls
 // out of the sound sets the materials already carry.
+//
+// WHAT A MATERIAL IS TO LIGHT is the renderer's two answers, copied: whether
+// it stops a ray (common.wgsl isRayBlocker: not a micro material; a solid, a
+// powder, or an OPAQUE liquid) and how bright an emitting cell of it is
+// (sim_glow.wgsl glowBlockSum: the palette colour through burnTint at its
+// mean weight, times emission / 255; render.emissiveStrength at the sum), as
+// luminance. The burn tint is taken with the tuning of the moment; a material
+// reload rebuilds.
 void MobSystem::BuildStealthTables(const std::vector<MaterialDef>& mats) {
   matStepNoise_.assign(mats.size(), 1.0f);
   matMetal_.assign(mats.size(), 0);
-  matGlow_.assign(mats.size(), 0.0f);
+  matGlowLum_.assign(mats.size(), 0.0f);
+  matLightBlock_.assign(mats.size(), 0);
+  const Tuning::Render& R = CurrentTuning().render;
+  const float tintW = 0.5f * (R.burnTintMin + R.burnTintMax);
   for (size_t i = 0; i < mats.size(); i++) {
     const MaterialDef& m = mats[i];
+    const MaterialGpu& g = m.gpu;
     bool metal = false;
     for (const std::string& t : m.tags) metal |= t == "metal";
     matMetal_[i] = metal ? 1 : 0;
-    matGlow_[i] = m.gpu.emission >= kLampEmission ? (float)m.gpu.emission / 255.0f : 0.0f;
+    if ((g.flags & kMatFlagMicro) == 0u) {
+      if (g.klass == CLASS_SOLID) matLightBlock_[i] = 1;
+      else if (g.klass == CLASS_POWDER) matLightBlock_[i] = 2;
+      else if (g.klass == CLASS_LIQUID && (g.flags & kMatFlagOpaque) != 0u) matLightBlock_[i] = 1;
+    }
+    if (g.emission > 0u) {
+      // The three palette variants (paletteJitter) in equal shares: the
+      // positional jitter spreads a mass of the material over all three.
+      const bool tint = (g.flags & kMatFlagBurnTint) != 0u;
+      float lum = 0.0f;
+      for (uint32_t pc : {g.color0, g.color1, g.color2}) {
+        float col[3] = {(float)(pc & 0xFFu) / 255.0f, (float)((pc >> 8) & 0xFFu) / 255.0f,
+                        (float)((pc >> 16) & 0xFFu) / 255.0f};
+        if (tint)
+          for (int k = 0; k < 3; k++) col[k] += (R.burnTintColor[k] - col[k]) * tintW;
+        lum += Lum3(col) / 3.0f;
+      }
+      const float emis = (float)g.emission / 255.0f * (tint ? tintW : 1.0f);
+      // render.emissiveStrength is applied where the light is summed (LightAt),
+      // so an F5 of it needs no material reload.
+      matGlowLum_[i] = lum * emis;
+    }
     const std::string& step = m.Sound("footstep");
     float k = 1.0f;
     if (step == "leaf") k = 0.7f;          // grass, moss, leaf litter
@@ -99,10 +305,11 @@ void MobSystem::BuildStealthTables(const std::vector<MaterialDef>& mats) {
     else if (step == "metal") k = 1.4f;
     else if (step == "stone") k = 1.1f;
     else if (step == "path") k = 0.9f;     // packed earth
-    else if (m.gpu.klass == CLASS_POWDER) k = 0.75f;   // sand, snow, ash
+    else if (g.klass == CLASS_POWDER) k = 0.75f;   // sand, snow, ash
     else if (metal) k = 1.4f;
     matStepNoise_[i] = k;
   }
+  emitters_.clear();   // their luminance was taken from the old table
 }
 
 // ---------------------------------------------------------------------------
@@ -124,91 +331,261 @@ void MobSystem::PostNoise(const stealth::Noise& n) {
 }
 
 // ---------------------------------------------------------------------------
-// THE LIGHT ON A BODY
+// THE LIGHT ON A BODY -- the renderer's body lighting, on the CPU
 //
-// Two terms, both from the tick:
-//   SKY      five columns over the head (OpenSkyNoFetch: nothing but air and
-//            gas for 48 cells -- a roof, a cave ceiling and a tree's canopy
-//            are all shade; an unfetched chunk is open and NOT requested)
-//            give an open fraction, and stealth::SkyLight turns
-//            that and the day phase and the rain into a level. A body below
-//            the ANALYTIC ground (World::TerrainHeight, worldgen's own height
-//            contract) is underground whatever the caches say: a cave whose
-//            ceiling was never fetched must not read as open sky.
-//   GLOW     every glowing cell nearby, through per-chunk sums (EmitterOf),
-//            each weighted 1 / (1 + (d / emitterRadius)^2). Not occluded: a
-//            fire behind a wall still lights you, the price of not casting a
-//            ray per cell. Unfetched chunks contribute nothing -- this asks
-//            no fetches (a watcher's question about somebody else must not
-//            queue a request every ground probe waits behind).
-float MobSystem::LightAt(World& world, const Vec3& centre, float heightVox) {
+// What the watchers see is what the renderer draws: a white body's on-screen
+// brightness at three heights, by the same law microbody.wgsl lights a limb
+// with (BodyRadiance above), from the same inputs measured the same way:
+//
+//   KEY      the tick's sun or moon (SetSkyLight: the renderer's own frame
+//            light resolve), through a SHADOW RAY toward it from each height
+//            and the renderer's softening law (shadowFromOpaqueHit: a far
+//            blocker lifts toward render.shadowLift, a ray that runs out
+//            under the ground is a far blocker). A roof, a wall between you
+//            and a low sun, a tree's crown: shade, as drawn.
+//   SKY      the openness of the GROUND under the body (opennessAtBody: walk
+//            down to the first matter, take its up face) by the renderer's
+//            five rays -- straight up at weight 2, four at 45 degrees at
+//            weight 1, render.opennessReach long. A cave, a room, an alley.
+//   GLOW     the glow field (sim_glow.wgsl): each nearby chunk's SOURCE (the
+//            mean radiance of its glowing cells times the saturating fill)
+//            with the field's (1 - d / glowReach)^2 falloff from the chunk's
+//            centre -- and, unlike the renderer's body path, ONLY if a line
+//            reaches one of that chunk's glowing cells. A fire behind a wall
+//            does not light you.
+//   ITSELF   a burning body is a lamp (Exposure::burning, in Visibility).
+//
+// Then the renderer's tonemap, and the mean of the three heights over
+// stealth.lightFull.
+float MobSystem::LightAt(World& world, const Vec3& centre, float heightVox,
+                         stealth::Stance stance, LightProbe* probe) {
+  if (!skyLight_.valid || matLightBlock_.empty()) return 1.0f;
   const stealth::Params& P = stealthP_;
-  const Vec3 head{centre.x, centre.y + 0.4f * heightVox, centre.z};
-  float open = 0.0f;
-  const int ground =
-      World::TerrainHeight(ifloor(head.x), ifloor(head.z), world.WorldSeed());
-  if ((float)ground <= head.y + 4.0f) {
-    static const int kOff[5][2] = {{0, 0}, {5, 0}, {-5, 0}, {0, 5}, {0, -5}};
-    int n = 0;
-    for (const auto& o : kOff)
-      if (OpenSkyNoFetch(world, matGpu_, Vec3{head.x + (float)o[0], head.y, head.z + (float)o[1]}))
-        n++;
-    open = (float)n / 5.0f;
+  const Tuning::Render& R = CurrentTuning().render;
+  LightCells L(world, matLightBlock_);
+  const float k = stance == stealth::Stance::Crouch ? 0.65f
+                  : stance == stealth::Stance::Prone ? 0.3f
+                                                     : 1.0f;
+  const float foot = centre.y - heightVox * 0.5f;
+  const float h = heightVox * k;
+  const int cx = ifloor(centre.x), cz = ifloor(centre.z);
+
+  // ---- SKY: the ground under the body, and the five rays over it ----
+  float openRaw = -1.0f;
+  for (int dy = 0; dy <= kGroundWalk; dy++) {
+    const int y = ifloor(foot) - dy;
+    const int b = L.At(cx, y, cz);
+    if (b == 1 || (b < 0 && L.Buried(cx, y, cz))) {
+      const Vec3 o{(float)cx + 0.5f, (float)y + 1.05f, (float)cz + 0.5f};
+      const float reach = std::max(1.0f, R.opennessReach / kVoxelMeters);
+      constexpr float kD = 0.70710678f;
+      static const float kRays[5][4] = {{0, 1, 0, 2}, {kD, kD, 0, 1}, {-kD, kD, 0, 1},
+                                        {0, kD, kD, 1}, {0, kD, -kD, 1}};
+      float w = 0.0f;
+      for (const auto& rr : kRays) {
+        const LightRay ray = March(L, o, Vec3{rr[0], rr[1], rr[2]}, reach);
+        if (!ray.hit && !ray.buriedEnd) w += rr[3];
+      }
+      openRaw = w / 6.0f;
+      break;
+    }
   }
-  const float sky = stealth::SkyLight(P, DaylightStrengthCpu(dayPhase_), open,
-                                      weatherRain_ & kRainAmountMask);
+
+  // ---- GLOW at the chest, behind lines of sight ----
+  // The chunk's field weight first (a distance, no words read), so only the
+  // handful of chunks whose centre is within render.glowReach is summarised.
+  const Vec3 chest{centre.x, foot + h * 0.6f, centre.z};
   float glow = 0.0f;
-  if (!matGlow_.empty()) {
-    const IVec3 c0{ifloor(centre.x) >> 4, ifloor(centre.y) >> 4, ifloor(centre.z) >> 4};
-    const float R = std::max(1.0f, P.emitterRadius);
-    for (int dz = -kEmitReachXZ; dz <= kEmitReachXZ; dz++)
-      for (int dy = -kEmitReachY; dy <= kEmitReachY; dy++)
-        for (int dx = -kEmitReachXZ; dx <= kEmitReachXZ; dx++) {
-          const EmitterSum* es = EmitterOf(world, IVec3{c0.x + dx, c0.y + dy, c0.z + dz});
-          if (es == nullptr || es->glow <= 0.0f) continue;
-          const float d = (es->centroid - centre).len();
-          glow += es->glow / (1.0f + (d / R) * (d / R));
-        }
+  int glowChunks = 0, glowSeen = 0;
+  {
+    const float reach = std::max(R.glowReach / kVoxelMeters, 1.0f);
+    const IVec3 c0{ifloor(chest.x) >> 4, ifloor(chest.y) >> 4, ifloor(chest.z) >> 4};
+    for (int i = 0; i < 27; i++) {
+      const IVec3 wc{c0.x + i % 3 - 1, c0.y + (i / 3) % 3 - 1, c0.z + i / 9 - 1};
+      const Vec3 cc{(float)wc.x * 16.0f + 8.0f, (float)wc.y * 16.0f + 8.0f,
+                    (float)wc.z * 16.0f + 8.0f};
+      const float fw = std::max(0.0f, 1.0f - (chest - cc).len() / reach);
+      if (fw <= 0.0f) continue;
+      const EmitterSum* es = EmitterOf(world, wc);
+      if (es == nullptr || es->lum <= 0.0f) continue;
+      glowChunks++;
+      bool seen = false;
+      for (int s = 0; s < es->nSamples && !seen; s++) {
+        const Vec3 tgt{(float)es->samples[s].x + 0.5f, (float)es->samples[s].y + 0.5f,
+                       (float)es->samples[s].z + 0.5f};
+        const Vec3 v = tgt - chest;
+        const float len = v.len();
+        // Stop a cell short: the glowing cell itself is matter.
+        seen = len < 1.5f || !March(L, chest, v * (1.0f / len), len - 1.0f).hit;
+      }
+      if (!seen) continue;
+      glowSeen++;
+      glow += es->lum * fw * fw;
+    }
+    glow *= R.emissiveStrength;
   }
-  return std::clamp(sky + stealth::EmitterLight(P, glow), 0.0f, 1.0f);
+
+  // ---- KEY: a shadow ray from each height ----
+  const uint32_t rain = weatherRain_ & kRainAmountMask;
+  const float keyScale = 1.0f - P.rainKeyDim * std::clamp((float)rain / 128.0f, 0.0f, 1.0f);
+  const Vec3 keyDir{skyLight_.keyDir[0], skyLight_.keyDir[1], skyLight_.keyDir[2]};
+  const float heights[3] = {0.92f, 0.6f, 0.25f};
+  float screen = 0.0f;
+  for (int hi = 0; hi < 3; hi++) {
+    const Vec3 p{centre.x, foot + h * heights[hi], centre.z};
+    const LightRay ray = March(L, p + keyDir * 0.75f, keyDir, kShadowReach);
+    float sh = 1.0f;
+    if (ray.hit)
+      sh = std::clamp(Smooth(R.shadowSoftNear, R.shadowSoftFar, (ray.t + 0.75f) * kVoxelMeters) *
+                          R.shadowLift,
+                      0.0f, 1.0f);
+    else if (ray.buriedEnd)
+      sh = R.shadowLift;
+    if (probe != nullptr) probe->shadow[hi] = sh;
+    screen += OnScreen(BodyRadiance(skyLight_, R, sh, openRaw, glow, keyScale), R);
+  }
+  screen /= 3.0f;
+  if (probe != nullptr) {
+    probe->openRaw = openRaw;
+    probe->glow = glow;
+    probe->glowChunks = glowChunks;
+    probe->glowSeen = glowSeen;
+    probe->screen = screen;
+  }
+  return std::clamp(screen / std::max(P.lightFull, 0.01f), 0.0f, 1.0f);
 }
 
+// THE GLOW FIELD'S SOURCE FOR ONE CHUNK, from the freshest words the CPU has
+// (the tick's snapshot mirror, else the fetch cache): the mean luminance of
+// its glowing cells times the saturating fill (sim_glow.wgsl glowStoreSrc:
+// render.glowFill, saturating at 1, so a lava lake is no brighter than one
+// lava voxel's surface), and one glowing cell per octant for the line of
+// sight -- an EXPOSED one (a face on a cell light passes, or on the chunk's
+// edge) where the octant has one: the bottom of a lava pool is lava under
+// lava, and a line to it is stopped by the pool's own surface.
 const MobSystem::EmitterSum* MobSystem::EmitterOf(World& world, IVec3 chunk) {
   if (!world.ChunkInWindow(chunk)) return nullptr;
-  const CachedChunk* cc = world.Cached(chunk);
-  if (cc == nullptr || cc->voxels.size() != kChunkVol) return nullptr;
+  const uint32_t* words = nullptr;
+  bool fromMirror = false;
+  uint32_t version = 0;
+  const WorldSnapshot& snap = world.Snap();
+  if (snap.valid && snap.mirror.size() == 27u * kChunkVol) {
+    const int mx = chunk.x - snap.mirrorBase.x, my = chunk.y - snap.mirrorBase.y,
+              mz = chunk.z - snap.mirrorBase.z;
+    if (mx >= 0 && my >= 0 && mz >= 0 && mx < 3 && my < 3 && mz < 3) {
+      words = snap.mirror.data() + (size_t)((mz * 3 + my) * 3 + mx) * kChunkVol;
+      fromMirror = true;
+      version = snap.tick;
+    }
+  }
+  if (words == nullptr) {
+    const CachedChunk* cc = world.Cached(chunk);
+    if (cc == nullptr || cc->voxels.size() != kChunkVol) return nullptr;
+    words = cc->voxels.data();
+    version = cc->version;
+  }
   const uint64_t key = World::PackChunkKey(chunk);
   auto it = emitters_.find(key);
-  if (it != emitters_.end() && it->second.version == cc->version) return &it->second;
+  if (it != emitters_.end() && it->second.fromMirror == fromMirror &&
+      it->second.version == version)
+    return &it->second;
   // Bounded like the cache it shadows (rule 2): past 4096 summaries the whole
   // table goes and refills from what is asked next.
-  if (it == emitters_.end() && emitters_.size() >= 4096) {
-    emitters_.clear();
-    it = emitters_.end();
-  }
+  if (it == emitters_.end() && emitters_.size() >= 4096) emitters_.clear();
+  auto blocks = [&](uint32_t w) {
+    const uint32_t m = w & 0xFFFu;
+    if (m == 0 || m >= matLightBlock_.size()) return false;
+    const uint8_t b = matLightBlock_[m];
+    return b == 2 ? PowderMassOfState((w >> 12) & 0xFu) >= kPowderBlockMin : b == 1;
+  };
+  // 2 = a face on a cell IN THIS CHUNK that light passes (known exposed),
+  // 1 = a face on the chunk's edge only (the neighbour is another chunk's,
+  // unread: maybe), 0 = buried in its own kind.
+  auto exposure = [&](int x, int y, int z) {
+    static const int kF[6][3] = {{0, 1, 0}, {1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}, {0, -1, 0}};
+    int best = 0;
+    for (const auto& f : kF) {
+      const int nx = x + f[0], ny = y + f[1], nz = z + f[2];
+      if (nx < 0 || ny < 0 || nz < 0 || nx >= (int)kChunk || ny >= (int)kChunk ||
+          nz >= (int)kChunk) {
+        best = 1;
+        continue;
+      }
+      if (!blocks(words[((uint32_t)nz * kChunk + (uint32_t)ny) * kChunk + (uint32_t)nx]))
+        return 2;
+    }
+    return best;
+  };
   EmitterSum es;
-  es.version = cc->version;
-  float g = 0.0f;
-  Vec3 acc{};
+  es.fromMirror = fromMirror;
+  es.version = version;
+  float sum = 0.0f;
+  uint32_t count = 0;
+  int8_t octant[8];   // sample slot per octant; -1 none yet
+  int octRank[8] = {};   // the exposure of the octant's sample so far
+  for (int8_t& o : octant) o = -1;
   for (uint32_t z = 0; z < kChunk; z++)
     for (uint32_t y = 0; y < kChunk; y++)
       for (uint32_t x = 0; x < kChunk; x++) {
-        const uint32_t m = cc->voxels[(z * kChunk + y) * kChunk + x] & 0xFFFu;
-        if (m == 0 || m >= matGlow_.size()) continue;
-        const float gl = matGlow_[m];
+        const uint32_t m = words[(z * kChunk + y) * kChunk + x] & 0xFFFu;
+        if (m == 0 || m >= matGlowLum_.size()) continue;
+        const float gl = matGlowLum_[m];
         if (gl <= 0.0f) continue;
-        g += gl;
-        acc += Vec3{(float)x + 0.5f, (float)y + 0.5f, (float)z + 0.5f} * gl;
+        sum += gl;
+        count++;
+        const int o = (x >= 8 ? 1 : 0) | (y >= 8 ? 2 : 0) | (z >= 8 ? 4 : 0);
+        if (octant[o] >= 0 && octRank[o] == 2) continue;
+        const int rank = exposure((int)x, (int)y, (int)z);
+        if (octant[o] >= 0 && rank <= octRank[o]) continue;
+        if (octant[o] < 0) octant[o] = (int8_t)es.nSamples++;
+        octRank[o] = rank;
+        es.samples[octant[o]] = IVec3{chunk.x * (int)kChunk + (int)x,
+                                      chunk.y * (int)kChunk + (int)y,
+                                      chunk.z * (int)kChunk + (int)z};
       }
-  es.glow = g;
-  es.centroid = g > 0.0f
-                    ? Vec3{(float)(chunk.x * (int)kChunk), (float)(chunk.y * (int)kChunk),
-                           (float)(chunk.z * (int)kChunk)} +
-                          acc * (1.0f / g)
-                    : Vec3{};
+  if (count > 0) {
+    const float fill = std::clamp(
+        (float)count / (float)kChunkVol * CurrentTuning().render.glowFill, 0.0f, 1.0f);
+    es.lum = sum / (float)count * fill;
+  }
   EmitterSum& slot = emitters_[key];
   slot = es;
   return &slot;
+}
+
+// ---------------------------------------------------------------------------
+// NPC FOOTSTEPS (presentation: the frame loop voices them)
+//
+// How loud, against a plain walk at the same speed: the stealth model's own
+// terms -- the stance, the sneak skill, worn metal -- so a stalker creeping in
+// sounds as quiet to the player as it is to the creature it is stalking. The
+// speed term is the footstep cue's own (Cues::Footstep), not repeated here.
+void MobSystem::QueueNpcSteps(Mob& m) {
+  if (m.footfalls_.empty()) return;
+  const stealth::Params& P = stealthP_;
+  const ai::Profile* pr = behaviors_.At(m.ai_.profile);
+  float sneak = 0.0f;
+  if (m.def_ != nullptr && m.def_->stealthSneak >= 0.0f) sneak = m.def_->stealthSneak;
+  else if (pr != nullptr && pr->stealth.enabled) sneak = pr->stealth.sneak;
+  const float stanceK = m.aiCrouch_ ? P.crouchNoise : 1.0f;
+  const float gain = stanceK * (1.0f + P.metalNoise * std::clamp(m.wornMetal_, 0.0f, 1.0f)) *
+                     (1.0f - P.sneakNoiseCut * std::clamp(sneak / 100.0f, 0.0f, 1.0f));
+  for (const Mob::Footfall& ff : m.footfalls_) {
+    if (npcSteps_.size() >= kMaxNpcSteps) {
+      npcStepsDropped_++;
+      continue;
+    }
+    NpcStep s;
+    s.posVox = ff.posVox;
+    s.mat = ff.mat;
+    s.speed = ff.speed;
+    s.foot = ff.foot;
+    s.landing = ff.landing;
+    s.fallSpeed = ff.fallSpeed;
+    s.gain = gain;
+    npcSteps_.push_back(s);
+  }
+  m.footfalls_.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -286,9 +663,11 @@ void MobSystem::PublishStealth(World& world, Mob& m, ai::Actor& a, uint32_t tick
     const bool swimmer = m.def_ != nullptr && m.def_->swim.present;
     wading = swimmer ? 0.0f : std::clamp(a.immersion * 2.0f, 0.0f, 1.0f);
   }
-  // THE LIGHT, on a cadence.
-  if (!m.stealthLightValid_ || (tick + (uint32_t)m.id_) % kLightEvery == 0) {
-    m.stealthLight_ = LightAt(world, a.centre, a.height);
+  // THE LIGHT, on a cadence (a player's every other tick: the meter on the
+  // HUD follows a step into shadow).
+  const uint32_t every = desc != nullptr ? kLightEveryPlayer : kLightEveryNpc;
+  if (!m.stealthLightValid_ || (tick + (uint32_t)m.id_) % every == 0) {
+    m.stealthLight_ = LightAt(world, a.centre, a.height, e.stance);
     m.stealthLightValid_ = true;
     m.stealthLightAt_ = tick;
   }

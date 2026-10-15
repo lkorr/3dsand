@@ -2415,7 +2415,7 @@ struct Tuning {
     float awarenessReach = TPD(stealth, awarenessReach);  // reach per awareness
     float nearAlways = TPD(stealth, nearAlways);        // vox: the dark stops hiding
     float lightFloor = TPD(stealth, lightFloor);        // the darkest a body reads
-    float lightGamma = TPD(stealth, lightGamma);        // < 1 lifts the dim end
+    float lightGamma = TPD(stealth, lightGamma);        // > 1: shadow hides more
     float crouchVis = TPD(stealth, crouchVis);
     float proneVis = TPD(stealth, proneVis);
     float stillVis = TPD(stealth, stillVis);            // a body that does not move
@@ -2442,12 +2442,9 @@ struct Tuning {
     float voiceNoise = TPD(stealth, voiceNoise);
     float impactNoise = TPD(stealth, impactNoise);
     float twangNoise = TPD(stealth, twangNoise);
-    // -- light on a body (0..1) --
-    float nightLight = TPD(stealth, nightLight);
-    float roofedDay = TPD(stealth, roofedDay);
-    float overcastDim = TPD(stealth, overcastDim);
-    float emitterRadius = TPD(stealth, emitterRadius);  // vox
-    float emitterGain = TPD(stealth, emitterGain);
+    // -- light on a body: the renderer's body lighting (MobSystem::LightAt) --
+    float lightFull = TPD(stealth, lightFull);          // on-screen = fully lit
+    float rainKeyDim = TPD(stealth, rainKeyDim);        // rain deck on the key
     float burningLight = TPD(stealth, burningLight);
     // -- sneak attacks --
     float sneakMelee = TPD(stealth, sneakMelee);

@@ -51,11 +51,8 @@ Params FromTuning(const Tuning& t) {
   p.voiceNoise = s.voiceNoise;
   p.impactNoise = s.impactNoise;
   p.twangNoise = s.twangNoise;
-  p.nightLight = s.nightLight;
-  p.roofedDay = s.roofedDay;
-  p.overcastDim = s.overcastDim;
-  p.emitterRadius = s.emitterRadius;
-  p.emitterGain = s.emitterGain;
+  p.lightFull = std::max(0.01f, s.lightFull);
+  p.rainKeyDim = s.rainKeyDim;
   p.burningLight = s.burningLight;
   p.sneakMelee = s.sneakMelee;
   p.sneakRanged = s.sneakRanged;
@@ -94,8 +91,10 @@ float Clamp01(float x) { return std::clamp(x, 0.0f, 1.0f); }
 //
 //   light   lightFloor + (1 - lightFloor) x light^gamma, never below the
 //           viewer's own floor (dark vision; a creature already fighting the
-//           body). gamma < 1 lifts the dim end: a body in moonlight is still
-//           a SHAPE, it is the deep shadow that hides it.
+//           body). `light` is the body's ON-SCREEN brightness over
+//           stealth.lightFull (MobSystem::LightAt: the renderer's own body
+//           lighting, tonemapped), already perceptual -- gamma > 1 is the
+//           designer's contrast: how much more a shadow hides than it looks.
 //   stance  1 / crouchVis / proneVis.
 //   motion  stillVis for a body that does not move, 1 at its walk, and
 //           runVis more per walk-speed past that: the eye catches motion.
@@ -211,32 +210,6 @@ float SoundImpulse(const Params& p, float radius, float d, float hearing,
   const float r = HeardRadius(p, radius, hearing, awareness, ambient, blocked);
   if (r <= 0.0f || d >= r) return 0.0f;
   return 1.0f - std::max(0.0f, d) / r;
-}
-
-// ---------------------------------------------------------------------------
-// LIGHT (the inputs MobSystem::LightAt measures)
-//
-// The sky: daylight eased up off the sim's own triangle (DaylightStrengthCpu
-// climbs linearly from sunrise to noon; the eye calls the world bright long
-// before noon), moonlight under it at night, both scaled by how open the sky
-// is over the body -- a roof leaves `roofedDay` of the day (doors, windows,
-// bounce) and nothing of the night -- and dimmed by rain.
-float SkyLight(const Params& p, uint32_t daylight255, float openFrac,
-               uint32_t rainAmount) {
-  const float day = Clamp01((float)daylight255 / 255.0f * 2.5f);
-  const float open = Clamp01(openFrac);
-  float sky = day * (open + (1.0f - open) * Clamp01(p.roofedDay)) +
-              (1.0f - day) * Clamp01(p.nightLight) * open;
-  if (rainAmount > 0)
-    sky *= 1.0f - (1.0f - Clamp01(p.overcastDim)) * Clamp01((float)rainAmount / 128.0f);
-  return Clamp01(sky);
-}
-
-// Glowing matter: `weightedCells` is the sum over emissive cells of
-// (emission / 255) / (1 + (d / emitterRadius)^2). Saturating, so a lava lake
-// is bright and two lava lakes are not twice as bright.
-float EmitterLight(const Params& p, float weightedCells) {
-  return 1.0f - std::exp(-std::max(0.0f, p.emitterGain) * std::max(0.0f, weightedCells));
 }
 
 }  // namespace stealth

@@ -4094,6 +4094,11 @@ void MobSystem::Reset(bool rewindIds) {
   // they were lying in is gone: a booked rising names a place and a handful of
   // debris handles, and both belong to the world that is being torn down.
   rises_.clear();
+  npcSteps_.clear();
+  // The sky goes with the world: until the next tick sets it, every body is
+  // fully lit (LightAt) -- a harness that drives the phases by hand without
+  // THE tick sees plain bodies, whatever gate ran before it.
+  skyLight_ = stealth::SkyLight{};
   // The AI's two derived mirrors: the per-tick actor list PreTick rebuilds and
   // the attack requests nobody has drained yet. Both are pure derived state, so
   // a Reset simply drops them (game/mob.h AttackRequests).
@@ -9837,11 +9842,13 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // a piece left kinematic and unowned would never sleep (rule #2).
     mob.DrainPendingSpawns(world, spawns);
     mob.TickSeveredHolds(dt);
-    // NOBODY DRAINS AN NPC'S FOOTFALLS YET, so this tick's plants are cleared
-    // here at the top of the tick that will produce them. The avatar's queue
-    // is main.cpp's — cleared per FRAME, because that is who reads it — and
-    // this loop never sees the avatar. Without this the cap (Mob::PushFootfall)
-    // would be the only thing bounding a walking crowd's queues.
+    // AN NPC'S FOOTFALLS go to the frame loop's ears through the system's
+    // one queue (QueueNpcSteps, after the pose step that plants them), so a
+    // mob's own queue holds a tick's plants at most and is cleared here at
+    // the top of the tick that will produce them -- a path that plants
+    // without reaching QueueNpcSteps cannot grow it. The avatar's queue is
+    // main.cpp's (cleared per FRAME, because that is who reads it) and this
+    // loop never sees the avatar.
     mob.ClearFootfalls();
 
     // A HUSK: a rig that went to DebrisSystem (the dead cap, the window, a
@@ -10056,6 +10063,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       mob.TickGetUp(dt);
       mob.StepShield();  // still lowering: see the limp branch
       UpdateAnimation(mob, def, world, dt, tick);
+      QueueNpcSteps(mob);
       mob.SubmitPose(dt, /*writeXf=*/false);
     } else if (mob.alive_) {
       // ---- locomotion: sense -> intent -> steer -> drive ----
@@ -10197,6 +10205,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       burnprof::Scope bpAnim(burnprof::kAnim);
       UpdateAnimation(mob, def, world, dt, tick);
       bpAnim.Stop();
+      QueueNpcSteps(mob);   // the steps it just planted, for the ears
 
       // ---- stages 6-7: model space -> world, submit to Jolt ----
       // writeXf=false: the NPC path keeps limb.xf as PostStep left it, so its

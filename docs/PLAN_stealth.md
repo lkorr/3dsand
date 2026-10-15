@@ -58,20 +58,21 @@ Sources: UESP Skyrim:Sneak, its talk archive of `fSneak*` settings, the Creation
   - Sound fills it as `soundRate × (1 − d·(1+ambient)/radius)`, capped at `soundCap` unless the creature is fighting that body.
   - It drains at `decay` every tick.
 - `reach = sightRange × (0.6 + 0.8·awareness/100) × visibility`.
-- `visibility = light' × stance × motion × size × (1 − 0.6·sneak/100)`, where `light' = 0.12 + 0.88·light^0.75`.
+- `visibility = light' × stance × motion × size × (1 − 0.6·sneak/100)`, where `light' = 0.12 + 0.88·light^2` and `light` is the body's on-screen brightness as the renderer draws it (`MobSystem::LightAt`), over `lightFull`. The renderer's brightness is gamma-encoded (a moonlit white body draws at 0.26 of full), so the exponent is 2, not Skyrim's 0.75, to give the dark its weight back.
 - The thresholds: look at 0.3, walk over at 0.6, detected at 1.0.
 
 ### Worked numbers
 
-These use the defaults: a `guardian` (sight range 260, awareness 65) and the player at sneak 30.
+These use the defaults: a `guardian` (sight range 260, awareness 65, dark vision 0.2) and the player at sneak 30, creeping at 0.4 of a walk. The light values are the `stealth-light` gate's readings (open noon 1.0, open midnight 0.35, a closed room 0.19, a lava pit in sight at night 0.65). Inside `nearAlways` (1.4 m) the dark stops hiding anyone.
 
 | Situation | Where it gets noticed, roughly |
 |---|---|
 | Daylight, standing, walking | within about 17 m |
-| Daylight, crouched, creeping | about 8 m |
-| Shade under a roof, crouched, creeping | about 3.5 m |
-| Night under open sky, standing, walking | about 6 m |
-| Night, crouched, creeping | about 2.5 m |
+| Daylight, crouched, creeping | about 6 m |
+| Indoors (a closed room), crouched, creeping | about 1.3 m |
+| Night under open sky, standing, walking | about 4 m |
+| Night, crouched, creeping | about 1.4 m |
+| Night, crouched, creeping, beside a fire in sight | about 3 m |
 | Prone and still at night | only at arm's length |
 
 | Footsteps (heard at awareness 50, in silence) | Distance |
@@ -145,6 +146,8 @@ Each of these is one tuning or JSON edit.
 - **Corpses as an alarm** (Blacklist, Chaos Theory): a guard finding a dead ally becomes alert.
 - **Alarm escalation per area** (Chaos Theory's stages).
 - **Barks** ("What was that?" / "Must have been the wind"). The dialogue system exists, but these need voice and text assets.
-- **NPC footsteps.** They are not yet audible to the player, because nobody drains the NPC footfall queue. The detection side already uses NPC noise.
-- **Light occlusion.** Glow is not occluded: a fire behind a wall still lights you. A ray to the brightest chunk would fix it.
-- **Light near the player.** It comes from what the chunk caches hold, which the mirror seeds around the player. A glowing cell in a chunk nobody fetched contributes nothing.
+- **Where detection and the renderer still differ** (2026-10-15, after the light became the renderer's own body lighting):
+  - The renderer's body path does not occlude the glow field, so a fire behind a wall still tints a drawn body. Detection does occlude it (a line to an exposed glowing cell of each chunk). This is the one place the two disagree on purpose.
+  - The renderer multiplies a body's glow by the sky openness of its ground (`glowLight(albedo, open.x, …)`), and `render.opennessFloor` is 0, so a body in a fully enclosed room or cave gets NO emitter light from a fire beside it. Detection copies this, so a torch-lit sealed room hides you as well as a dark one. If that is a renderer bug (the comment there means `open.x` as crease occlusion, and it predates the 2026-09-11 change that took the floor from 30% to 0), the fix is in `microbody.wgsl` and `LightAt`'s glow line together.
+  - The cloud deck is render-only weather, so the sim dims the key light by the rain word instead (`rainKeyDim`). An overcast sky with no rain reads as sunny to the watchers.
+- **Light away from the player.** Cells come from the snapshot mirror (27 chunks round the player), then the fetch cache, then the snapshot's occupancy (empty chunks are air), then the analytic ground. A glowing cell in a chunk nobody fetched contributes nothing.

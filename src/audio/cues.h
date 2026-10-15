@@ -95,12 +95,16 @@ class Cues {
   // A foot planted on `matId` at `posVox`. `speed` is the walker's speed in
   // voxels/sec (drives loudness and pitch), `foot` distinguishes left/right so
   // the two can be pitched apart slightly -- a real gait is not two identical
-  // impacts, and identical ones read as a machine.
-  void Footstep(uint32_t matId, const Vec3& posVox, float speed, int foot);
+  // impacts, and identical ones read as a machine. `gainMul` scales the
+  // loudness AND the audible radius (a creature's step at the loudness the
+  // stealth model gives it, MobSystem::NpcStep::gain: a sneaking stalker is
+  // as hard for the player to hear as for the creature it stalks).
+  void Footstep(uint32_t matId, const Vec3& posVox, float speed, int foot,
+                float gainMul = 1.0f);
 
   // Landing from a fall. `fallSpeed` is the downward speed at touchdown in
   // voxels/sec; louder and lower-pitched than a step.
-  void Land(uint32_t matId, const Vec3& posVox, float fallSpeed);
+  void Land(uint32_t matId, const Vec3& posVox, float fallSpeed, float gainMul = 1.0f);
 
   // A physical impact (debris, a thrown body) carrying `energy` in [0,1].
   void Impact(uint32_t matId, const Vec3& posVox, float energy);

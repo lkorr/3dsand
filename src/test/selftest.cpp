@@ -1363,6 +1363,10 @@ const char* const kOrder[] = {
     // ids on the way in; mobs + debris reset and worldgen regenerated on the
     // way out.
     "stealth-world",
+    // ...and the light on a body, by the same append rule: a floating stone
+    // platform through THE tick; mobs + debris reset and worldgen regenerated
+    // on the way out.
+    "stealth-light",
     // ...and one pose pipeline, whoever drives the body (W2-L), by the same
     // append rule: it spawns an NPC and an avatar, poses both through
     // Mob::PosePipeline only (no PreTick, no Jolt step), and resets mobs +

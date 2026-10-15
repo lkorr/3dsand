@@ -17074,6 +17074,15 @@ int main(int argc, char** argv) {
           else
             audioCues.Footstep(ff.mat, ff.posVox, ff.speed, ff.foot);
         }
+        // EVERY OTHER BODY'S STEPS: the tick's NPC footfalls, each at the
+        // loudness the stealth model gives it (MobSystem::NpcStep::gain) --
+        // a creature creeping up is as quiet to the player as to its prey.
+        for (const MobSystem::NpcStep& ns : mobs.NpcSteps()) {
+          if (ns.landing)
+            audioCues.Land(ns.mat, ns.posVox, ns.fallSpeed, ns.gain);
+          else
+            audioCues.Footstep(ns.mat, ns.posVox, ns.speed, ns.foot, ns.gain);
+        }
         // Terrain that came loose this frame. Drained here for the same reason
         // as the footfalls: PreTick runs once per tick and the tick loop runs
         // up to 4 times a frame, so voicing from inside it would stack several
@@ -17339,6 +17348,7 @@ int main(int argc, char** argv) {
       mobs.ClearVoiceEvents();
       mobs.ClearShockCues();
       mobs.ClearStrikeEvents();
+      mobs.ClearNpcSteps();
       // SNEAK ATTACKS THAT LANDED (stealth): the local player's own become
       // the HUD's "SNEAK ATTACK x3" toast. Drained per frame, like the strike
       // events above, whether or not anything shows them.

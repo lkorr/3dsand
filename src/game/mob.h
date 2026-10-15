@@ -7168,12 +7168,55 @@ class MobSystem {
   void PostNoise(const stealth::Noise& n);
   const std::vector<stealth::Noise>& HeardNoises() const { return noiseNow_; }
   uint64_t NoisesRefused() const { return noiseRefused_; }
-  // THE LIGHT ON A BODY, 0..1, from the tick: daylight (dayPhase_), how open
-  // the sky is over it (five columns through the chunk caches -- roofs and
-  // canopy are shade; it asks NO fetches), rain, and glowing matter near it
-  // (per-chunk emitter sums, cached by chunk version). CPU-deterministic like
-  // the line of sight, and the same stores it reads; never a render target.
-  float LightAt(World& world, const Vec3& centre, float heightVox);
+  // THE LIGHT ON A BODY, 0..1: how lit the renderer draws it, as a share of
+  // stealth.lightFull. The renderer's body lighting (microbody.wgsl:
+  // litColorSNoFog + glowLight) evaluated on the CPU for a white body at
+  // three heights (head, chest, knees -- by stance): the tick's key light
+  // (SetSkyLight) through a SHADOW RAY toward it, the sky ambient through the
+  // FIVE OPENNESS RAYS over the ground under the body, and the glow field's
+  // emitters, each chunk of them only if a LINE reaches one of its glowing
+  // cells -- then the renderer's tonemap. Rays read the CPU's own stores:
+  // the snapshot mirror, then the fetch cache, then the analytic ground; it
+  // asks NO fetches. Deterministic: a function of the tick, never a render
+  // target or a camera. 1 (fully lit) while no sky is set (since Reset).
+  // `probe`, when given, gets every term (the reporter's attribution: a gate
+  // that fails on a light value says WHICH term made it).
+  struct LightProbe {
+    float openRaw = -1.0f;   // sky openness of the ground (-1 = no ground)
+    float shadow[3] = {};    // the key's shadow factor per height
+    float glow = 0.0f;       // glow-field luminance that reached the body
+    int glowChunks = 0;      // emitter chunks in reach / with a line to them
+    int glowSeen = 0;
+    float screen = 0.0f;     // mean on-screen brightness, before lightFull
+  };
+  float LightAt(World& world, const Vec3& centre, float heightVox,
+                stealth::Stance stance = stealth::Stance::Stand,
+                LightProbe* probe = nullptr);
+  // The tick's frame light (test/support.cpp FrameLightForTick), set by the
+  // session beside the day phase.
+  void SetSkyLight(const stealth::SkyLight& s) { skyLight_ = s; }
+  const stealth::SkyLight& SkyLightNow() const { return skyLight_; }
+  // ---- NPC FOOTSTEPS, FOR THE EARS (presentation) -------------------------
+  // Every NPC footfall and landing of the tick, with how loud the stealth
+  // model says it is against a plain walk at the same speed (crouch, crawl,
+  // sneak skill, worn metal): what the player HEARS is what a watcher hears.
+  // Filled in PreTick right after each creature's pose step; drained once a
+  // frame by the frame loop into the audio cues, and cleared there whether
+  // or not audio ran. Capped (rule 2): past kMaxNpcSteps a tick's steps are
+  // dropped, and the drop is counted.
+  struct NpcStep {
+    Vec3 posVox{};
+    uint32_t mat = 0;
+    float speed = 0.0f;      // vox/s at the plant
+    int foot = 0;
+    bool landing = false;
+    float fallSpeed = 0.0f;  // vox/s down, a landing
+    float gain = 1.0f;       // x the plain walk's loudness
+  };
+  static constexpr size_t kMaxNpcSteps = 192;
+  const std::vector<NpcStep>& NpcSteps() const { return npcSteps_; }
+  void ClearNpcSteps() { npcSteps_.clear(); }
+  uint64_t NpcStepsDropped() const { return npcStepsDropped_; }
   // The id `m` has in the actor list: its mob id, or a player's band id for
   // an avatar (ai::kPlayerActorBase + i). 0 = not an actor.
   uint64_t ActorIdOf(const Mob& m) const;
@@ -9808,18 +9851,37 @@ class MobSystem {
   std::vector<stealth::Exposure> playerExposure_;
   std::vector<PlayerActorDesc> playerDescs_;
   // Per material: a footstep's loudness on it (from its footstep sound set
-  // and its class), whether it is METAL (worn, it clanks), and its glow
-  // (emission / 255).
+  // and its class), whether it is METAL (worn, it clanks), the luminance of
+  // the radiance an emitting cell of it leaves (sim_glow.wgsl glowBlockSum's
+  // expression: palette colour, burnTint, emission, render.emissiveStrength),
+  // and what it is to a light ray (common.wgsl isRayBlocker: 0 lets light
+  // through, 1 stops it, 2 = a powder, which stops it only above
+  // kPowderBlockMin eighths).
   std::vector<float> matStepNoise_;
   std::vector<uint8_t> matMetal_;
-  std::vector<float> matGlow_;
-  // GLOWING MATTER PER CHUNK, by the cached chunk's version: the summed glow
-  // of its cells and their glow-weighted centroid. Rebuilt only when the
-  // chunk's version moves; trimmed when it grows.
+  std::vector<float> matGlowLum_;
+  std::vector<uint8_t> matLightBlock_;
+  // The tick's frame light (SetSkyLight).
+  stealth::SkyLight skyLight_;
+  std::vector<NpcStep> npcSteps_;
+  uint64_t npcStepsDropped_ = 0;
+  // A creature's footfalls of this tick into npcSteps_ (PreTick, after its
+  // pose step), with their stealth loudness.
+  void QueueNpcSteps(Mob& m);
+  // GLOWING MATTER PER CHUNK, by the words' source and version (the snapshot
+  // mirror's tick, or the cached chunk's): the glow field's SOURCE for that
+  // chunk (sim_glow.wgsl glowStoreSrc: the mean radiance of its emitting
+  // cells times the saturating fill, as luminance) and up to eight of its
+  // glowing cells, one per octant and an EXPOSED one where there is one (a
+  // face on something light passes), for the line of sight a body needs to
+  // one of them before the chunk lights it. Rebuilt only when the version
+  // moves; dropped wholesale past 4096 chunks.
   struct EmitterSum {
+    bool fromMirror = false;
     uint32_t version = 0;
-    float glow = 0.0f;
-    Vec3 centroid{};
+    float lum = 0.0f;
+    IVec3 samples[8]{};
+    int nSamples = 0;
   };
   std::unordered_map<uint64_t, EmitterSum> emitters_;
   void BuildStealthTables(const std::vector<MaterialDef>& mats);

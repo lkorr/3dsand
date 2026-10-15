@@ -2306,11 +2306,14 @@ TP_F(stealth, sightFalloff, NO_WGSL, 2.0f, 0.1f, 6.0f)
 TP_F(stealth, awarenessReach, NO_WGSL, 0.8f, 0.0f, 3.0f)
 // Inside nearAlways voxels the dark stops hiding a body (arm's length).
 TP_F(stealth, nearAlways, NO_WGSL, 14.0f, 0.0f, 100.0f)
-// VISIBILITY = light x stance x motion x size x sneak. Light reads as
-// lightFloor + (1 - lightFloor) x light^lightGamma: pitch black still leaves
-// a shape (Skyrim's light term keeps ~13% in the dark).
+// VISIBILITY = light x stance x motion x size x sneak. `light` is the body's
+// ON-SCREEN brightness (MobSystem::LightAt: the renderer's body lighting,
+// tonemapped) over lightFull, and reads as lightFloor + (1 - lightFloor) x
+// light^lightGamma: pitch black still leaves a shape (Skyrim's light term
+// keeps ~13% in the dark), and gamma > 1 makes a shadow hide more than the
+// eye says it darkens.
 TP_F(stealth, lightFloor, NO_WGSL, 0.12f, 0.0f, 1.0f)
-TP_F(stealth, lightGamma, NO_WGSL, 0.75f, 0.05f, 4.0f)
+TP_F(stealth, lightGamma, NO_WGSL, 2.0f, 0.05f, 6.0f)
 TP_F(stealth, crouchVis, NO_WGSL, 0.55f, 0.0f, 1.0f)
 TP_F(stealth, proneVis, NO_WGSL, 0.3f, 0.0f, 1.0f)
 // Motion: stillVis for a body that does not move, 1 at its walk, runVis
@@ -2353,15 +2356,18 @@ TP_F(stealth, strikeNoise, NO_WGSL, 110.0f, 0.0f, 1000.0f)
 TP_F(stealth, voiceNoise, NO_WGSL, 130.0f, 0.0f, 1000.0f)
 TP_F(stealth, impactNoise, NO_WGSL, 80.0f, 0.0f, 1000.0f)
 TP_F(stealth, twangNoise, NO_WGSL, 25.0f, 0.0f, 1000.0f)
-// LIGHT on a body: the sky (daylight eased up, nightLight under the moon,
-// roofedDay of the day under a roof, x overcastDim in rain) plus glowing
-// matter (each cell's emission/255 over 1 + (d/emitterRadius)^2, summed, x
-// emitterGain, saturating) plus burningLight while the body is alight.
-TP_F(stealth, nightLight, NO_WGSL, 0.15f, 0.0f, 1.0f)
-TP_F(stealth, roofedDay, NO_WGSL, 0.18f, 0.0f, 1.0f)
-TP_F(stealth, overcastDim, NO_WGSL, 0.75f, 0.0f, 1.0f)
-TP_F(stealth, emitterRadius, NO_WGSL, 30.0f, 1.0f, 500.0f)
-TP_F(stealth, emitterGain, NO_WGSL, 0.12f, 0.0f, 10.0f)
+// LIGHT on a body is the RENDERER'S body lighting (microbody.wgsl ->
+// litColorSNoFog + glowLight), evaluated on the CPU with the render.* knobs
+// the GPU reads: the key light through a shadow ray toward the sun or moon,
+// the sky ambient through the five openness rays, the glow field's emitters
+// -- each behind a line of sight -- tonemapped to on-screen brightness.
+// lightFull is the brightness that counts as fully lit: a white body in full
+// noon sun on open ground draws at 0.732 (the stealth-light gate's open-noon
+// reading, 2026-10-15), so that is 1; rainKeyDim is how much of the key light the rain deck takes
+// (the renderer's cloud shadow map is render-only weather, so the sim's own
+// rain word stands in for it); burningLight is the least a body ALIGHT reads.
+TP_F(stealth, lightFull, NO_WGSL, 0.73f, 0.05f, 1.0f)
+TP_F(stealth, rainKeyDim, NO_WGSL, 0.7f, 0.0f, 1.0f)
 TP_F(stealth, burningLight, NO_WGSL, 0.8f, 0.0f, 1.0f)
 // SNEAK ATTACKS: a blow on a creature that has not DETECTED its attacker
 // lands sneakMelee (an arrow sneakRanged) times harder -- every hp of it, the

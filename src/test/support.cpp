@@ -816,6 +816,32 @@ static void ResolveFrameLight(RenderParams& rp, const Tuning::Render& r) {
   rp.ambOvercast = clampf(rp.overcast, 0.0f, 1.0f) * 0.8f;
 }
 
+stealth::SkyLight FrameLightForTick(const Tuning& t, uint32_t tick) {
+  const SkyState sky = ComputeSky(t, (double)Celestial().SimTick(tick));
+  RenderParams rp{};
+  for (int k = 0; k < 3; k++) {
+    rp.sunDir[k] = sky.sunDir[k];
+    rp.moonDir[k] = sky.moonDir[k];
+    rp.moon2Dir[k] = sky.moon2Dir[k];
+  }
+  rp.sunUp = sky.sunUp;
+  rp.moonPhase = sky.moonPhase;
+  rp.moon2Phase = sky.moon2Phase;
+  rp.solarEclipse = sky.solarEclipse;
+  rp.overcast = 0.0f;
+  ResolveFrameLight(rp, t.render);
+  stealth::SkyLight s;
+  s.valid = true;
+  for (int k = 0; k < 3; k++) {
+    s.keyDir[k] = rp.keyDir[k];
+    s.keyCol[k] = rp.keyCol[k];
+    s.ambGround[k] = rp.ambGround[k];
+    s.ambSky[k] = rp.ambSky[k];
+  }
+  s.ambOvercast = rp.ambOvercast;
+  return s;
+}
+
 void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        const Vec3& eye, const Camera& cam, float aspect,
                        bool shadows, float time,

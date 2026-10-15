@@ -2832,6 +2832,9 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
         // RainExposedCpu), the same TickParams will carry.
         mobs.SetRainSlope(rain.slopeQx, rain.slopeQz);
       }
+      // ...and the tick's key and ambient light, as the renderer resolves
+      // them, for the stealth model's light on a body (MobSystem::LightAt).
+      mobs.SetSkyLight(FrameLightForTick(CurrentTuning(), tick));
 
       // ---- BROKEN VESSELS (game/container.h ContainerShouldBreak) -----------
       //
