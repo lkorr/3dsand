@@ -1027,23 +1027,59 @@ void RegisterDoorKinds() {
       p.push_back("props.locked: true or false");
     if (r.props.contains("loot") && !r.props["loot"].is_string())
       p.push_back("props.loot: a loot table name (assets/loot/<name>.json)");
+    if (r.props.contains("lock") && !r.props["lock"].is_string())
+      p.push_back("props.lock: the keyId a key item unlocks (text), e.g. \"iron_key\"");
   };
   // props.locked: the door rule for a chest (P8, Osric's strongbox). A locked
-  // chest says so and does not open -- no keys yet, exactly like a door.
+  // chest says so and does not open, and no key opens it -- exactly like a door.
   auto chestLocked = [](const Ref& r) {
     return r.props.contains("locked") && r.props["locked"].is_boolean() &&
            r.props["locked"].get<bool>();
   };
-  box.usePrompt = [chestLocked](RefCtx&, const Ref& r) {
-    return chestLocked(r) ? "Locked " + Lower(ContainerTitle(r))
-                          : "Search " + Lower(ContainerTitle(r));
+  // props.lock: the door's KEYED lock (D3) on a chest -- the keyId a key item
+  // unlocks; the key anywhere in the user's kit turns it, once. What remembers
+  // the turn is the container's own delta: nothing but an open ever writes it
+  // (the loot roll here, the loot panel's take/put after), and the unlocking
+  // open writes one if the roll did not, so "has a container delta" is "a key
+  // has turned" with no new delta format.
+  auto chestLock = [](const Ref& r) {
+    return r.props.contains("lock") && r.props["lock"].is_string() ? r.props["lock"].get<std::string>()
+                                                                      : std::string();
   };
-  box.onUse = [chestLocked](RefCtx& c, const Ref& r, RefUse& u) {
+  auto chestKeyed = [chestLock](RefStore* s, const Ref& r) {
+    if (chestLock(r).empty()) return false;
+    const RefDelta* d = s != nullptr ? s->Delta(r.id) : nullptr;
+    return d == nullptr || d->kind != "container";
+  };
+  box.usePrompt = [chestLocked, chestKeyed](RefCtx& c, const Ref& r) {
+    return chestLocked(r) || chestKeyed(c.refs, r) ? "Locked " + Lower(ContainerTitle(r))
+                                                   : "Search " + Lower(ContainerTitle(r));
+  };
+  box.onUse = [chestLocked, chestLock, chestKeyed](RefCtx& c, const Ref& r, RefUse& u) {
     if (chestLocked(r)) {
       u.message = "The " + Lower(ContainerTitle(r)) + " is locked.";
       return;
     }
-    if (c.refs != nullptr) ContainerRollLoot(*c.refs, r, c.items);
+    const bool keyed = chestKeyed(c.refs, r);
+    if (keyed) {
+      std::string key;
+      if (u.session != nullptr && c.items != nullptr)
+        key = KeyInKit(u.session->kit(), *c.items, chestLock(r));
+      if (key.empty()) {
+        u.message = "The " + Lower(ContainerTitle(r)) + " is locked.";
+        return;
+      }
+      u.message = "You unlock it with the " + key + ".";
+    }
+    if (c.refs != nullptr) {
+      ContainerRollLoot(*c.refs, r, c.items);
+      // No loot table: the unlock is remembered as the contents it opened on.
+      if (keyed && chestKeyed(c.refs, r)) {
+        Bag bag;
+        ContainerContents(*c.refs, r, c.items, bag);
+        ContainerSetContents(*c.refs, r, bag);
+      }
+    }
     u.openContainer = r.id;
   };
   box.useRadius = 5.0f;

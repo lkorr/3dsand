@@ -44,7 +44,10 @@
 // props.loot ("<table>", D3: assets/loot/<table>.json, world/loot.h): on the
 // FIRST open the table is rolled -- seeded by RefHash(id), so the same chest
 // holds the same things everywhere -- on top of props.items, and the result
-// becomes the delta at once.
+// becomes the delta at once. props.locked (bool) shuts it for good, like a
+// door's; props.lock ("<keyId>") is the door's keyed lock: the key anywhere
+// in the user's kit turns it ONCE, and the unlocking open writes the delta,
+// so a chest with a delta is a chest whose lock has turned.
 //
 // BED: an anchor. pos is the mattress cell where the HEAD lies, yaw points
 // from head to foot, props.length (cells, default 18). The player's use says
