@@ -22233,6 +22233,31 @@ only texels of the current frame's kind (renormalised bilinear; none = start
 over from this frame), and the span history likewise. Verified at the ticket's
 camera under `towering` at 11:00: the dotted ridge lines are gone.
 
+**A texel's CUT bit does not move with the jitter** (2026-10-15, ticket
+`2026-10-14_22-58-27`, "mountain top strobing in the cloud"). Both rules above
+key on the cut bit, and the bit itself flickered: `terrainHitM`'s geometric
+ladder was fitted to each ray's own reach (the deck's far side, which moves
+with rd.y) and walked the JITTERED ray, so the R2 sub-texel jitter slid every
+step along the ray and a thin summit was caught one frame and stepped over the
+next. The texels round a summit inside the deck changed kind every frame; the
+resolve restarted their history and the hit composite swapped between cut
+texels, the class search and the sky span, so the tip strobed between clouded
+and bare rock. Now the ground search walks the texel's UNJITTERED ray
+(`gGroundRd`) up ONE fixed ladder (64 steps from 20 m to cloudMaxDistM + the
+rain reach), each step shortened to 0.75 x the ray's clearance over the ground
+(at least 1/16 of the geometric step) while the iteration budget (3 x 64)
+still covers the plain ladder to tMax. The jitter still drives the march
+itself, which is what the resolve accumulates. Measured at the ticket camera
+under `overcast` (summit at 6 km in the deck), a debug view of the hit
+composite's inputs over 30 frames: pixels whose footprint changed kind 6,567
+-> 164, mean per-frame change of the cut weight 0.045 -> 0.0006; in the
+picture, frame-to-frame luma p99 over the summit box 10.1 -> 2.6 and pixels
+with a temporal std over 6 levels 1.61% -> 0.05% (rain streaks are the rest).
+The clearance refinement also made the cut region cover the summit at all: the
+plain fixed ladder stepped over its top third, which then took the sky span's
+guess and showed through a closed deck as a ghost. `cloud_march` 0.80 ->
+0.78 ms mean (noise).
+
 Cost of the march itself: within noise of before (cloud pass 1.3-1.8 ms mean in
 the 10-09 ticket views at 1600x900 under overcast, `--frames` pass attribution).
 
