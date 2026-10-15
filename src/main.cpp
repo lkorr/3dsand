@@ -28,6 +28,7 @@
 #include "sim/trample.h"
 #include "sim/plants.h"
 #include "game/bodyreg.h"
+#include "game/distant_draw.h"
 #include "game/demon.h"
 #include "game/demon_cast.h"
 #include "game/demon_lore.h"
@@ -9161,6 +9162,14 @@ int main(int argc, char** argv) {
   // BodyInstanceArena): only what changed is uploaded, and each body is
   // frustum-culled on its own. `bodyDraws` is the main view's culled list.
   BodyInstanceArena bodyArena;
+  // THE DISTANT CREATURES' STATUES (game/distant_draw.h, PLAN_distant_npcs
+  // §2.9 D4a): the baked-look cache and the producer, drawn as render-only
+  // bodies after the arrows. Its item list is EMPTY until the distant tier
+  // fills it -- D1: `distantDraw.Items()` every frame, `distantDraw.Bake(mob,
+  // mbSet)` at demotion before ReleaseRig. SANDVOX_DISTANT_DRAW_TEST=<n>
+  // stands n statues in a ring around the player without the tier.
+  DistantDraw distantDraw;
+  DistantDrawTestHook distantDrawTest;
   // SANDVOX_BODY_INST_LEGACY=1: whole-list upload + one undivided draw, the
   // one-binary A/B arm for the arena and the cull (phys/debris.cpp reads the
   // same variable for its cull cache). The 18-vertex cube is NOT in the arm.
@@ -21113,7 +21122,30 @@ int main(int argc, char** argv) {
           PresentDrawnBow(avatar, items, flightBodies,
                           camMode == CameraMode::First ? &eye : nullptr, 1.0f);
       }
-      bodyReg.SetRenderOnly(&flightBodies);
+      // THE DISTANT STATUES, after the arrows (game/distant_draw.h): culled
+      // against this frame's camera, nearest first, the living before the
+      // dead, into the slots the real bodies and the arrows left -- never one
+      // of theirs. A pose packed here dirties the micro set, so the upload
+      // runs again before anything draws it.
+      static std::vector<RenderOnlyBody> statueBodies;
+      {
+        if (distantDrawTest.Enabled())
+          distantDrawTest.Fill(distantDraw, mobs.Defs(), mbSet, player.pos,
+                               NowSeconds(), kDefaultSeed);
+        const uint32_t used = bodyReg.RealSlots() + (uint32_t)flightBodies.size();
+        DistantView dv;
+        dv.eye = eye;
+        dv.fwd = jcam.Forward();
+        dv.right = jcam.Right();
+        dv.up = jcam.Up();
+        dv.tanHalfFovY = std::tan(CurrentTuning().camera.fovY * 0.5f);
+        dv.aspect = (float)ctx.width / (float)ctx.height;
+        distantDraw.Produce(mbSet, &mobs.Defs(), dv,
+                            used < kMaxBodySlots ? kMaxBodySlots - used : 0u,
+                            statueBodies);
+        if (mbSet.dirty) sim.UploadMicroBodies(ctx.queue, mbSet);
+      }
+      bodyReg.SetRenderOnly({&flightBodies, &statueBodies});
       const auto bodyT0 = std::chrono::steady_clock::now();
       // WHO ELSE IS HOLDING MY ARM. One index sweep while everything is
       // healthy, a named report the moment two entities point at one brick

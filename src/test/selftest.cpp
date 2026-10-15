@@ -27,6 +27,7 @@
 #include "sim/tuningstamp.h"  // the tuning/materials/reactions desync stamp
 #include "sim/weather.h"     // leak reporter: the pinned weather preset
 #include "test/support.h"
+#include "game/distant_draw.h"  // the distantDraw block of last_run.json
 
 using namespace sandvox;
 
@@ -137,6 +138,8 @@ const std::vector<Gate>& BugReportGates();
 const std::vector<Gate>& AquaticGates();
 // The hit stagger (selftest_stagger.cpp): head / trunk blows on a walker.
 const std::vector<Gate>& StaggerGates();
+// Distant creatures' baked statues (selftest_distant_look.cpp, PLAN_distant_npcs D4a).
+const std::vector<Gate>& DistantLookGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -1366,6 +1369,11 @@ const char* const kOrder[] = {
     // CPU only: a synthetic-wall Player climb posing a PlayerAvatar through
     // PosePipeline; spawns and despawns its own avatar, touches no world.
     "ledge-climb-pose",
+    // ...and the distant statues (game/distant_draw.h, PLAN_distant_npcs D4a),
+    // by the same append rule: it spawns two humans (one killed), bakes and
+    // draws their statues, and resets mobs + debris, releases every pose it
+    // packed and regenerates worldgen on the way out.
+    "distant-look",
     // ---- THE SNAPSHOT LATENCY IS A CONSTANT (PLAN_multiplayer_now N1) ----
     // As late as it can go, by the rule the `floaters` block above spells out.
     // It regenerates worldgen three times (once per pacing arm and once on the
@@ -1459,7 +1467,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(), &ItemStageGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &DungeonEntityGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates(), &StaggerGates()})
+                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &DungeonEntityGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates(), &StaggerGates(), &DistantLookGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;
@@ -1751,6 +1759,32 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << ", \"failed\": " << ds.failed << ", \"retireScans\": " << ds.retireScans
       << ", \"promoteScans\": " << ds.promoteScans << ", \"peak\": " << ds.peak
       << ", \"cap\": " << DistantMobs::kMaxDistantMobs << "},\n";
+  }
+  // ---- THE DISTANT STATUES (game/distant_draw.h, PLAN_distant_npcs D4a) ---
+  // What every DistantDraw in the run did: drawn / culled / starved for want
+  // of a body slot / not baked / waiting for a pack / no room, the pool words
+  // and packed poses at their peak against the budget, evictions, bakes.
+  {
+    const DistantDrawRunStats& dr = DistantDrawRunTotals();
+    f << "  \"distantDraw\": {\"produces\": " << dr.produces
+      << ", \"drawnTotal\": " << dr.drawnTotal << ", \"drawnPeak\": " << dr.drawnPeak
+      << ", \"culledTotal\": " << dr.culledTotal
+      << ", \"starvedTotal\": " << dr.starvedTotal
+      << ", \"unbakedTotal\": " << dr.unbakedTotal
+      << ", \"deferredTotal\": " << dr.deferredTotal
+      << ", \"noFitTotal\": " << dr.noFitTotal
+      << ", \"fallbacksTotal\": " << dr.fallbacksTotal
+      << ", \"residentWordsPeak\": " << dr.residentWordsPeak
+      << ", \"wordsBudget\": " << kDistantPoseWordsMax
+      << ", \"packedPosesPeak\": " << dr.packedPosesPeak
+      << ", \"poseModelsMax\": " << kDistantPoseModelsMax
+      << ", \"looksPeak\": " << dr.looksPeak << ", \"bakes\": " << dr.bakes
+      << ", \"bakeMsMax\": " << dr.bakeMsMax << ", \"packs\": " << dr.packs
+      << ", \"evictions\": " << dr.evictions
+      << ", \"lookEvictions\": " << dr.lookEvictions
+      << ", \"packRefused\": " << dr.packRefused
+      << ", \"epochDrops\": " << dr.epochDrops << ", \"artAdded\": " << dr.artAdded
+      << ", \"artNearest\": " << dr.artNearest << "},\n";
   }
   // ---- CHUNK TICKETS, ALWAYS (docs/PLAN_chunk_tickets.md) -----------------
   // What the run's ticket system did, so "the pile never landed" has numbers

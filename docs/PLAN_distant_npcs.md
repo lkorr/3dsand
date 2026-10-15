@@ -966,6 +966,118 @@ bodies per ref over `MobAt` and `demon-contract` / `demon-malice` use
 `!IsAlive` as "gone"; all run with the switch off, so they still mean what
 they meant. D3's flip should revisit them.
 
+### D4a (branch `dnpc-d4a`, 2026-10-15)
+
+Landed: `src/game/distant_draw.{h,cpp}` (bake, pose cache, producer, test
+hook), `BodyRegistry::SetRenderOnly({lists...})` + `RealSlots()`,
+`kMaxBodySlots` 4096, gate `distant-look`, the `distantDraw` block in
+`build/last_run.json`, the frame-loop wiring in `main.cpp`.
+
+**The API D1 calls** (all on the `DistantDraw distantDraw` main.cpp owns;
+D1 must thread a pointer to it into `TickAuthorityCtx` to bake from the tick):
+- `DistantBake Bake(const Mob&, MicroBodySet&)` -- at DEMOTION, **before
+  `ReleaseRig`** (it reads the live limbs, bricks, gear and skeleton). Store
+  `.key` (a `DistantLookKey`, plain data) on the `DistantMob`; for a corpse
+  use `.restY` as the item's `origin.y` (a corpse's `origin_` follows its
+  pelvis's rest corner, below the ground when it lies flat). Not
+  thread-safe: call from the tick's serial part.
+- `std::vector<DistantDrawItem>& Items()` -- every frame (or `SetItems`):
+  `{look, state Idle/Walk/Strike, gaitPhase, origin (Mob::origin_ frame,
+  y = what the statue rests on), heading, dead}`.
+- `Produce(...)` is already called by the frame loop; D1 only fills items.
+- `BakeDef(const MobDef&, MicroBodySet&)` -- the def's rest pose (the `bare`
+  key); `Produce` also does this on demand from `mobs.Defs()`.
+
+Deviations and decisions:
+- **`kMaxMicroBodyModels` restated, not raised.** A render-only body owns no
+  clone, so the owned term stays bounded by the REAL slots: new
+  `kBodySlotsReal = 2048` (what the old static_assert sized) and
+  `kDistantPoseModelsMax = 512` (statue records, enforced by the cache) in
+  `world.h`; assert `4096 >= 2048 + 1024 + 512`. Neither constant reaches WGSL
+  (not in the prelude; both shaders bind runtime-sized arrays), so no shader
+  or `check_shaders.sh` change and no SPIR-V cache miss.
+- **Baked on the CPU, packed lazily.** `Bake` builds every pose's downsampled
+  cell list on the CPU (kept for `kDistantLooksMax` = 512 looks, LRU); a pose
+  is `MicroBodyPack`ed only the first frame it is drawn, at most
+  `kDistantPacksPerFrame` (8) per frame, and packed poses live in an LRU under
+  `kDistantPoseWordsMax` (1 MiW). An evicted pose re-packs from the CPU copy;
+  no live creature is needed. A pose is never packed if it would leave the
+  pool under `kDistantPoolReserveWords` (512 KiW) or the model table under
+  `kDistantModelReserve` (256 records): a statue goes without, never a wound.
+- **The look key has a third part, a coarse DAMAGE signature** (per limb:
+  gone; brick owned with remaining-volume and rewrite buckets; coat bucket).
+  Without it a bloodied or one-armed creature would draw the first clean
+  statue of its outfit, which contradicts "bake from the live limbs". The
+  fallback chain is `full` -> `pristine` (same gear, damage 0) -> `bare` (the
+  def alone, baked automatically by the first `Bake` and on demand).
+- **Walk A/B legs are procedural.** No clip carries a leg (the runtime walks
+  legs by gait IK), so the statue's stride is a hip/knee scissor on the leg
+  chains (the gait's own leg groups pick which leads) plus the `walk` clip's
+  arm swing, with the arm on the back-leg side forward.
+- **Strike** = the punch clip that keys the weapon hand (else `bite`/`lunge`/
+  ...) at the sampled time of its farthest forward reach; held items, worn
+  shells and embedded arrows follow their host rigidly at the offset they
+  have in the live rig.
+- **Lying** = the corpse's real ragdoll pose when baked from a corpse (and a
+  later corpse upgrades a look whose Lying was only the tipped idle); else
+  the idle rotated onto its back. Every pose is GROUNDED (lowest cell at
+  `origin.y`).
+- **Downsample rule**: a 5 cm cell is solid if ANY source voxel lands in it
+  (thin limbs, blades and hair survive); its material/colour is the weighted
+  majority with exposed voxels at 16x interior ones (the cell shows skin, not
+  the meat behind it); interior voxels are subsampled at the scale ratio; a
+  coat survives when >= 1/4 of the cell's exposed voxels carry one (the
+  statue then has a stain lattice: blood shows); bruises are dropped.
+- **Colour**: a model has one art bank, a statue's paint comes from several
+  (cast + wardrobe + dyes, which are baked into the colour since a
+  render-only body has no dye word). The palette maps into the dominant
+  bank: an entry within RGB distance^2 300, else a new entry (at most 96 per
+  palette epoch, never the bank's last 32), else the nearest. Counted:
+  `artAdded`, `artNearest`.
+- **Epoch**: a replaced `MicroBodySet` (materials reload) drops every packed
+  pose UNFREED and every CPU look (material ids may renumber). Looks come
+  back from the next `Bake` or as `bare` on demand.
+- **The owner's look check is written by the gate**, not a `--shot-frames`
+  frame (RunShots draws the world only, no bodies):
+  `build/distant_look.bmp` (a row 20..80 m out, all poses, the live creature
+  at 6 m) and `build/distant_look_close.bmp` (the poses side by side).
+  `SANDVOX_DISTANT_DRAW_TEST=<n>[:<def>,...]` stands `n` statues in a
+  30..80 m ring in the windowed game, baked from the defs' rest poses (no
+  creature spawned, no sim effect).
+- Not done here: `DESIGN.md` and the tuner's `ARCH_NODES` (D3 per §3; D0 also
+  holds `ARCH_NODES`). Cube-path limbs (skinScale 1: the test mob only) are
+  not baked. Statues out of the window are fully lit (§2.9, known).
+
+Measured (`--verify distant-look,mob-cap64`, both PASS; `build/last_run.json`):
+- **Words per pose**, the human dressed (dyed tunic) and armed (sword): idle
+  4,114, walk A/B 5,236, strike 3,690, lying 4,235 (~22.5k for all five;
+  idle 11x34x22 cells -- the sword sets the depth). Naked: 1,122 / 2,601 /
+  2,601 / 2,380 / 2,916 (~11.6k). No pose carried a blood lattice here. So the
+  1 MiW budget holds ~45-90 fully packed looks, and far more in practice since
+  a look only packs the poses being drawn. Plan §2.9 estimated far worse
+  (~66k for the full-res human): the downsample is ~15-60x.
+- **40 m**: one statue covers 180 px at 1920x1080 (threshold 80).
+- **Slots**: 35 real + 7 arrows leave 4,054; 5,000 items -> 4,054 drawn,
+  946 starved, living before dead, nearest first, and the near crowd's
+  transforms / handles / micro instances byte-identical with and without.
+- **Bake**: 3.2 ms naked, 7.7 ms dressed + armed, 10.6 ms worst (a def's bare
+  look); colours: 0 added, 3 mapped to the nearest (the human's bank is
+  within the 32-slot reserve).
+
+Open issues for D1/D3:
+- **In a full 64-brawl the POOL, not the budget, is the limit.** `mob-cap64`
+  peaks at 8,371,749 of 8,388,608 pool words (gore clones), so the pack
+  reserve refuses every new statue pose during such a fight (counted as
+  `noFit`; already-packed poses keep drawing). That is the intended
+  priority (gore first), but it means a big near fight can leave newly
+  demoted creatures undrawn until it calms. If that shows, the lever is a
+  pool share reserved for statues (the 1 MiW budget carved out of the pool
+  rather than competing for it), which is a `world.h` sizing decision.
+- An unwounded corpse shares its living look's key, so its real ragdoll pose
+  becomes that look's Lying for every creature of the look (by design; the
+  key's damage part is coarse). A held weapon stays in the hand when the
+  idle is tipped onto its back (it points up).
+
 ## 7. Audit 2026-10-15: what changed and why
 
 The 2026-10-13 plan was audited against the code at `79f8f21` (157 commits
