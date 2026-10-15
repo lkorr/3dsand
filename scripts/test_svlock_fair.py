@@ -17,6 +17,10 @@ SVLOCK_LEGACY_DIR point both implementations at a temp dir.
   D  THE OLD GUARANTEES: a pid-less (orphan) lock dir older than 30 s is
      reaped by both; a stale-ts lock is reaped; RunLock does not delete a
      lock that is no longer its own.
+  E  THE VOXEL SERVER'S TURN (VoxServe._take_turn): no wait behind ordinary
+     runs or builds; queues behind an EXCLUSIVE run; then holds the lock as
+     a lease across back-to-back commands, released when idle, when it has
+     run too long, and on stop().
 """
 import os
 import shutil
@@ -150,6 +154,77 @@ check(os.path.isdir(LOCK), "D: RunLock does not release a lock that is no longer
 shutil.rmtree(LOCK, ignore_errors=True)
 leftover = [n for n in os.listdir(LOCK + ".queue")] if os.path.isdir(LOCK + ".queue") else []
 check(not leftover, "no tickets left behind (%s)" % leftover)
+
+# ---- E ----------------------------------------------------------------------
+# The voxel server's GPU turn (tuner_server.py VoxServe._take_turn): it waits
+# for the GPU lock only while an EXCLUSIVE run (a measurement) holds the
+# compile lock, and then holds it as a LEASE across back-to-back commands.
+CLOCK = os.environ["SVLOCK_COMPILE_DIR"]
+
+
+def hold(d, who, age=0, pid="1"):
+    os.mkdir(d)
+    for n, v in (("ts", str(int(time.time()) - age)), ("who", who), ("pid", pid)):
+        with open(os.path.join(d, n), "w") as f:
+            f.write(v)
+
+
+def lock_pid():
+    try:
+        with open(os.path.join(LOCK, "pid")) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def turn(vs, who, timeout):
+    with vs.lock:
+        vs._take_turn(who, timeout)
+
+
+vs = ts.VoxServe()
+vs.LEASE_IDLE_SEC = 0.3
+hold(LOCK, "run:other-session")       # an ordinary run holds the GPU
+t0 = time.time()
+turn(vs, "E1", 2)
+check(time.time() - t0 < 0.5 and vs.lease is None, "E: an ordinary run's GPU lock does not stall the voxel server")
+hold(CLOCK, "build:other-tree")       # a compile is not a measurement
+turn(vs, "E2", 2)
+check(time.time() - t0 < 0.5 and vs.lease is None, "E: a build's compile lock does not stall it either")
+shutil.rmtree(CLOCK)
+hold(CLOCK, "run:dead-session (exclusive)", age=1200)
+turn(vs, "E3", 2)
+check(time.time() - t0 < 0.5 and vs.lease is None, "E: a stale exclusive compile lock is ignored")
+shutil.rmtree(CLOCK)
+hold(CLOCK, "run:other-session (exclusive)")
+busy = False
+try:
+    turn(vs, "E4", 1)
+except ts.LockBusy:
+    busy = True
+check(busy and vs.lease is None, "E: an exclusive run makes it queue for the GPU lock (LockBusy past its patience)")
+check(lock_pid() == "1", "E: the other session's GPU lock was never touched")
+shutil.rmtree(LOCK)                   # the measurement's GPU turn ends; its compile lock stays
+me = str(os.getpid())
+turn(vs, "E5", 2)
+first = vs.lease
+check(first is not None and lock_pid() == me, "E: with the GPU free it takes the lock as a lease")
+time.sleep(0.1)
+turn(vs, "E5b", 2)
+check(vs.lease is first and lock_pid() == me, "E: a back-to-back command reuses the lease")
+time.sleep(1.0)
+check(vs.lease is None and lock_pid() is None, "E: the lease is released after LEASE_IDLE_SEC without a command")
+vs.LEASE_MAX_SEC = 0.0
+turn(vs, "E6", 2)
+first = vs.lease
+turn(vs, "E6b", 2)
+check(vs.lease is not None and vs.lease is not first and lock_pid() == me,
+      "E: past LEASE_MAX_SEC the lease is released and taken again (back of the queue)")
+vs.stop()
+check(vs.lease is None and lock_pid() is None, "E: stop() releases the lease")
+shutil.rmtree(CLOCK)
+leftover = [n for n in os.listdir(LOCK + ".queue")] if os.path.isdir(LOCK + ".queue") else []
+check(not leftover, "E: no tickets left behind (%s)" % leftover)
 
 shutil.rmtree(TMP, ignore_errors=True)
 print("test_svlock_fair: " + ("PASS" if not fails else "FAIL (%d)" % len(fails)))

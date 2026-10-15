@@ -25017,9 +25017,13 @@ Three properties matter and each is a deliberate cost:
   to a tool. A 64³ region is ~8 ms once the process is warm.
 * **It is a server because boot is ~3 s and a region is ~8 ms.** A viewer that
   streams as the camera moves cannot pay device creation and SPIR-V compilation
-  per box. The tuner keeps one process and takes the machine-global run mutex
-  around each request rather than for the process lifetime — a persistent holder
-  would block every build in every worktree for a whole session.
+  per box. The tuner keeps one process and never holds the machine-global GPU
+  lock for its lifetime — a persistent holder would block every build in every
+  worktree for a whole session. Since 2026-10-15 it takes that lock only while
+  a `SANDVOX_RUN_EXCLUSIVE` measurement is running or queued, as a lease over
+  back-to-back requests (released after 1.5 s idle or 20 s); gates, smokes and
+  shots are timing-blind, and queueing FIFO behind them one region per turn
+  left the Dungeons tab minutes from its first voxel.
 * **`lod > 1` is a MAJORITY over the block, per chunk.** 16 divides every
   supported lod so a chunk's cells never straddle a sample. Point sampling was
   the obvious alternative and it deletes exactly what you zoom out to see: a

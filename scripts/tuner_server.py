@@ -148,6 +148,7 @@ SCOPE / SAFETY. This is a developer tool for one machine, not a service:
 Anyone exposing this beyond localhost is opting into arbitrary local builds.
 """
 import argparse
+import atexit
 import gzip
 import hashlib
 import json
@@ -624,10 +625,27 @@ EXE = os.environ.get("SANDVOX_EXE") or os.path.join(ROOT, "build", "Release", "s
 
 
 def _exe_env(env=None):
-    """os.environ (or `env`) plus SANDVOX_ASSET_DIR when the exe is borrowed."""
+    """os.environ (or `env`) plus SANDVOX_ASSET_DIR when the exe is borrowed,
+    plus the machine-global shader caches run.sh exports.
+
+    THE SHARED CACHES (2026-10-15). Without them the exe falls back to the
+    CWD-relative shader_cache/ and sandvox_pipeline_cache.bin, which only the
+    tuner's own launches ever warm -- every agent's run.sh launch warms
+    C:/sv-deps instead. Measured that day: 706 entry points compiled into the
+    shared cache since the tuner's private one was last written, so a
+    --voxserve boot after shader landings re-ran Tint and the driver on
+    whatever it uses of them (rhi_vulkan.cpp: worldgen's cold compile is
+    multi-minute) while holding the GPU lock, and the
+    Dungeons tab sat on "installing the program" / "waiting for the material
+    palette". Both caches are content-keyed and written temp+rename, so sharing
+    is safe (run.sh says why at length)."""
     env = dict(os.environ if env is None else env)
     if os.environ.get("SANDVOX_EXE") and not env.get("SANDVOX_ASSET_DIR"):
         env["SANDVOX_ASSET_DIR"] = ASSETS
+    if not env.get("SANDVOX_SHADER_CACHE"):
+        env["SANDVOX_SHADER_CACHE"] = "C:/sv-deps/shader_cache"
+    if not env.get("SANDVOX_PIPELINE_CACHE"):
+        env["SANDVOX_PIPELINE_CACHE"] = "C:/sv-deps/sandvox_pipeline_cache.bin"
     return env
 
 # Build state, shared with the poller. Guarded because ThreadingHTTPServer
@@ -738,7 +756,21 @@ WORLDMAP_DIR = os.path.join(ASSETS, "worldmap")
 # nobody takes the lock while a live ticket older than its own is queued.
 # svlock.sh says why at length; the two must agree on the directory, the
 # ticket format and the stale window.
+#
+# WHEN THE VOXEL SERVER TAKES IT AT ALL (2026-10-15): only while a MEASUREMENT
+# is in progress or queued -- a run.sh SANDVOX_RUN_EXCLUSIVE=1 run, the one
+# kind of run whose output is a number that sharing the GPU would poison
+# (CLAUDE.md: quote --perf / --render-budget numbers only from those). Every
+# other run is a gate, a smoke or a shot: deterministic, timing-blind, and
+# unharmed by a ~10-400 ms region beside it. Waiting behind them FIFO had the
+# owner's Dungeons tab stuck for minutes on "installing the program in the
+# voxel server" while parallel sessions' selftests and suites took turns --
+# the boot alone queued 86 s+ behind one run with the page open (measured
+# 2026-10-15). A spawn still waits out a LINK (_wait_for_link: an exe started
+# mid-link holds the image open, LNK1104), and the process is still killed by
+# this tree's links exactly as before; the next request respawns it.
 RUNLOCK_DIR = os.environ.get("SVLOCK_GPU_DIR") or "C:/sv-gpu-lock"
+COMPILELOCK_DIR = os.environ.get("SVLOCK_COMPILE_DIR") or "C:/sv-compile-lock"
 RUNLOCK_STALE_SEC = 600
 RUNLOCK_TICKET_STALE_SEC = 15
 # How long a region / dungeon-preview request waits for the GPU lock before it
@@ -911,6 +943,25 @@ class RunLock:
         return False
 
 
+def _measuring():
+    """The `who` of an EXCLUSIVE run (run.sh SANDVOX_RUN_EXCLUSIVE=1) in
+    progress, else None. It holds the compile lock tagged "(exclusive)" from
+    BEFORE it queues for the GPU lock until it exits, so this also sees one
+    still waiting for its GPU turn -- and the voxel server then queues behind
+    it instead of streaming through its measurement."""
+    try:
+        with open(os.path.join(COMPILELOCK_DIR, "who")) as f:
+            who = f.read().strip()
+        if not who.endswith("(exclusive)"):
+            return None
+        with open(os.path.join(COMPILELOCK_DIR, "ts")) as f:
+            if time.time() - int(f.read().strip() or 0) > RUNLOCK_STALE_SEC:
+                return None             # svlock.sh's stale rule: abandoned
+    except (OSError, ValueError):
+        return None
+    return who
+
+
 class VoxServe:
     """The one --voxserve subprocess, and the request lock in front of it.
 
@@ -951,6 +1002,59 @@ class VoxServe:
         # "stuck on the previous dungeon"). Such a region is answered, never
         # cached.
         self.scratch_gen = 0
+        # THE GPU TURN, as a lease (_take_turn).
+        self.lease = None
+        self.lease_t0 = 0.0
+        self.lease_last = 0.0
+        self.reaper = None
+
+    # A TURN IS A LEASE, NOT ONE COMMAND (2026-10-15). While a measurement
+    # holds or awaits the GPU the server takes its turn in the FIFO, and taking
+    # it per command bought ONE REGION PER TURN: each release let the next
+    # queued run in and the next region re-queued behind it, so a cold Dungeons
+    # view (hundreds of regions) waited out hundreds of other people's runs.
+    # The turn is now held across back-to-back commands and released after
+    # LEASE_IDLE_SEC without one, or LEASE_MAX_SEC in all -- then re-queued at
+    # the BACK, so a tab that streams forever cannot starve the measurement
+    # that waited for it. Short enough that the GPU lock's 600 s stale rule
+    # (no heartbeat here) never comes near it.
+    LEASE_IDLE_SEC = 1.5
+    LEASE_MAX_SEC = 20.0
+
+    def _take_turn(self, who, timeout):
+        """Before a boot or a GPU command, with self.lock held: hold the GPU
+        lock if a measurement is running or queued (_measuring), else nothing
+        (the block above RUNLOCK_DIR says why). Raises LockBusy past
+        `timeout`."""
+        now = time.time()
+        if self.lease is not None:
+            if now - self.lease_t0 < self.LEASE_MAX_SEC:
+                self.lease_last = now
+                return
+            self._release_lease()
+        if not _measuring():
+            return
+        rl = RunLock(who, timeout=timeout)
+        rl.__enter__()
+        self.lease, self.lease_t0, self.lease_last = rl, time.time(), time.time()
+        if self.reaper is None:
+            self.reaper = threading.Thread(target=self._reap_lease, daemon=True)
+            self.reaper.start()
+
+    def _release_lease(self):
+        rl, self.lease = self.lease, None
+        if rl is not None:
+            rl.__exit__(None, None, None)
+
+    def _reap_lease(self):
+        while True:
+            time.sleep(0.25)
+            with self.lock:
+                if self.lease is not None and time.time() - self.lease_last > self.LEASE_IDLE_SEC:
+                    self._release_lease()
+                if self.lease is None:
+                    self.reaper = None
+                    return
 
     def _spawn(self, map_name, lock_timeout=180.0):
         if not os.path.isfile(EXE):
@@ -960,21 +1064,26 @@ class VoxServe:
         # shows as a mismatch and the next request reloads.
         sig = _world_signature(map_name)
         env = _exe_env(dict(os.environ, SANDVOX_MAP=map_name))
-        # The boot is the expensive, GPU-heavy part, so it holds the run mutex.
-        with RunLock("voxserve-boot", timeout=lock_timeout):
-            p = subprocess.Popen(
-                [EXE, "--voxserve"], cwd=ROOT, env=env,
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, bufsize=1,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            # Skip the boot log; the protocol starts at the READY line.
-            while True:
-                line = p.stdout.readline()
-                if not line:
-                    p.kill()
-                    raise RuntimeError("voxserve died during boot")
-                if line.startswith("VOXSERVE READY"):
-                    break
+        # Never start the exe while a link is overwriting it (LNK1104 for the
+        # linker, a half-written image for us); past that, the boot holds the
+        # GPU lock only while a measurement is running or queued (_take_turn).
+        link = _wait_for_link(lock_timeout)
+        if link:
+            raise LockBusy("waiting for %s to finish linking sandvox.exe for >%ds" % (link, lock_timeout))
+        self._take_turn("voxserve-boot", lock_timeout)
+        p = subprocess.Popen(
+            [EXE, "--voxserve"], cwd=ROOT, env=env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        # Skip the boot log; the protocol starts at the READY line.
+        while True:
+            line = p.stdout.readline()
+            if not line:
+                p.kill()
+                raise RuntimeError("voxserve died during boot")
+            if line.startswith("VOXSERVE READY"):
+                break
         self.proc = p
         self.sig = sig
         self.map = map_name
@@ -1044,10 +1153,8 @@ class VoxServe:
                 return ack
             try:
                 if hold_lock:
-                    with RunLock("voxserve", timeout=lock_timeout):
-                        ack = _all()
-                else:
-                    ack = _all()
+                    self._take_turn("voxserve", lock_timeout)
+                ack = _all()
             except LockBusy as e:
                 return False, "busy: " + str(e)
             except Exception as e:
@@ -1078,6 +1185,7 @@ class VoxServe:
     def stop(self):
         with self.lock:
             self._stop_locked()
+            self._release_lease()
 
     def _stop_locked(self):
         p, self.proc = self.proc, None
@@ -1094,6 +1202,19 @@ class VoxServe:
 
 
 _voxserve = VoxServe()
+
+
+def _release_gpu_turn_at_exit():
+    # A lease left behind by a closed tuner would block every run on the
+    # machine until the GPU lock's 600 s stale rule. Not under _voxserve.lock:
+    # a daemon request thread may hold it as the process exits, and
+    # RunLock.__exit__ releases only a lock whose pid is still ours.
+    rl = _voxserve.lease
+    if rl is not None:
+        rl.__exit__(None, None, None)
+
+
+atexit.register(_release_gpu_turn_at_exit)
 
 
 def _palette_key():
@@ -3727,7 +3848,10 @@ class Handler(BaseHTTPRequestHandler):
 
             def run_perf():
                 try:
-                    env = dict(os.environ, SANDVOX_NO_CRASH_DIALOG="1")
+                    # EXCLUSIVE: a measurement (CLAUDE.md), so no compile shares
+                    # its CPU and the voxel server stops streaming through it
+                    # (_measuring keys on exactly this tag).
+                    env = dict(os.environ, SANDVOX_NO_CRASH_DIALOG="1", SANDVOX_RUN_EXCLUSIVE="1")
                     r = subprocess.run(argv, cwd=ROOT, capture_output=True,
                                        text=True, timeout=2400, env=env,
                                        creationflags=getattr(subprocess,
