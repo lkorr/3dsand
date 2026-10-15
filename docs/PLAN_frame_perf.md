@@ -441,3 +441,76 @@ DONE, 2026-10-13, with a re-measure: 0 wake-wait misses in 1,394 + 282
 shifts); raymarch.wgsl's header says `Hit` has 26 fields
 (it has 30); `build/shader_stats_before.json` is byte-identical to the current
 stats and is not a baseline.
+
+## 5. Handoff 2026-10-15 -- watching a fire: the CA and the openness walk
+
+Package of the 10-15 frame-rate pass (fire scenes). One exe per arm pair,
+asset arms via SANDVOX_ASSET_DIR, SANDVOX_RUN_EXCLUSIVE=1, `--perf`; the
+harness is quiet to +-0.03 ms per pass between boots, so n=1 attribution arms
+are readable and the shipped numbers are n=2.
+
+**"The CA doubled since 10-06" was a definition mismatch, not a regression of
+that size.** On the same `--perf village-fire` harness the CA rows were ca
+14.06 + ca1 8.26 = 22.3 ms on 10-01 (build/perf_vf_cur.json, post-fix) and
+9.77 + 4.98 = 14.74 on 10-10 (a frozen e7f839f exe with its own assets,
+same scene: 158,507 oil cells, 654k gas / 395k other cells a tick). The
+"7.23 ms" of 10-06 (ROADMAP_scale.md) is `ca` alone. What DID grow was
+10-10 -> e145446: ca + ca1 14.74 -> 16.41 (+1.7), opennessDirty 2.07 ->
+2.56, opennessRefresh 0.91 -> 1.17.
+
+Attribution (ms/frame, village-fire, same exe, asset arms, world hash
+fc3db438 in every arm -- none of these changes is behaviour):
+
+| arm | ca + ca1 | opennessDirty | opennessRefresh |
+|---|---|---|---|
+| control (e145446 assets) | 16.40 | 2.55 | 1.17 |
+| sim_step.wgsl of 10-10 (e7f839f) | 14.55 | | |
+| revert 8833133 (audit DET-1) only | 15.42 | | |
+| flowMeasNote a no-op (4d42cce) | 15.55 | | |
+| flow notes summed in workgroup memory | 16.54 (worse) | | |
+| gasOuterSplat a no-op | 16.19 | | |
+| every dirtyOut atomicOr issued twice | 16.35 (no cost) | | |
+| openness: return after the blocker signature | | 0.35 | 1.05 |
+| openness: no rays (origin search kept) | | 0.98 | 0.53 |
+| openness: no sweep 1 of the column search (a94edc5) | | 2.20 | 0.91 |
+| openness: no sun sample | | 2.21 | 1.09 |
+
+The CA mechanism is REGISTERS (`--shader-stats`, pipeline `step`): 72
+registers either way, local memory 64 B at 10-10 and 192 B at e145446.
+DET-1's flagSupportLossNbr carried the actor cell into three inlined call
+sites; that plus the flow note's per-move atomics pushed the kernel into
+spill, which every cell of both substeps pays. The atomics themselves are
+cheap (the doubling arm moved nothing; the shared-memory version cost more).
+
+LANDED (branch worktree-agent-a83e8ec746f2fc2f2):
+1. `flagSupportLossNbr(n, f, ...)` takes the face index (the far face is
+   face f of n): same test, one u32. `step` 80 regs / 96 B local.
+2. `main1` / Pipe::Step1: ca1's pipeline with the substep a compile-time
+   constant (all `P.substep` reads go through `gCaSub`); `step1` is 64 regs,
+   half the binary. ca1 5.07 -> 4.82.
+3. The openness walk in three workgroup phases (DESIGN.md §9.x, "A walk is
+   three workgroup phases"): blocker bitmap for dense chunks, origin search,
+   then every surface face's five rays as one shared list. Exact (integer
+   weights, half-voxel origins).
+
+Shipped, n=2 each, interleaved with control:
+
+| scene | pass | control | shipped |
+|---|---|---|---|
+| village-fire | ca + ca1 | 16.39 | 14.43 |
+| | opennessDirty + Refresh | 3.71 | 2.65 |
+| | sum of GPU passes | 37.85 | 34.80 (-3.0) |
+| forestfire | ca + ca1 | 9.50 | 8.38 |
+| | opennessDirty + Refresh | 4.82 | 3.44 |
+| | sum of GPU passes | 28.33 | 25.82 (-2.5) |
+
+World hashes unchanged (village-fire fc3db438, forestfire d7c2097f,
+determinism gate 4993b9b0). `--verify` determinism, repose, oil-fire,
+wind-gas, openness, gi-bounce, gi-nightfall, cave-window, support-flag,
+support-flag-post, fire-down, tree-fell, solute-blood, blood-cloud,
+flow-measure: PASS.
+
+LEFT: reposeSnap 1.09 ms (skipping it for chunks without repose powder is
+not exact, DESIGN.md), caMask 1.06 + 0.70, the openness rays (~1.2 ms of
+the walk after compaction: the up-ray to the window top is the long one) and
+the sun sample (~0.4 ms, still per-thread, could join the shared list).

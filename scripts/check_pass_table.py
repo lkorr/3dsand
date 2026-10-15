@@ -98,6 +98,7 @@ PIPE_TO_MEMBER = {
     "PIPE_COMPACT": "compact_",
     "PIPE_COMPACT_NEXT": "compactNext_",
     "PIPE_STEP": "step_",
+    "PIPE_STEP1": "step1_",
     "PIPE_REPOSE_SNAP": "reposeSnap_",
     "PIPE_CA_MASK": "caMask_",
     "PIPE_CA_LIST": "caList_",

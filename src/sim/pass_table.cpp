@@ -74,6 +74,7 @@ namespace {
 #define PIPE_COMPACT         Pipe::Compact
 #define PIPE_COMPACT_NEXT    Pipe::CompactNext
 #define PIPE_STEP            Pipe::Step
+#define PIPE_STEP1           Pipe::Step1
 #define PIPE_REPOSE_SNAP     Pipe::ReposeSnap
 #define PIPE_CA_MASK         Pipe::CaMask
 #define PIPE_CA_LIST         Pipe::CaList

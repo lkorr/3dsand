@@ -7525,6 +7525,29 @@ neighbors, so this needs an explicit connectivity pass:
   (ash) that runs its repose probe on substep 1. Keeping each thread's cell
   kinds in registers and reserving its pool run once (six shared atomics
   instead of one per cell) measured no better (camask 1.72 -> 1.80).
+- **The CA kernel is REGISTER-bound: code that never runs still costs
+  (2026-10-15, frame-rate pass).** `sim_step.wgsl main` sits at the driver's
+  72-register budget (`--shader-stats`, pipeline `step`), and what does not fit
+  spills to local memory for EVERY path, including substep 1, which runs no
+  reaction at all. Two changes in the 10-14 / 10-15 waves each pushed it
+  further: audit DET-1's `flagSupportLossNbr` (it carried the actor cell `c` to
+  build the far face, three more live vec3s at three inlined call sites) and
+  the measured flow's per-move atomics. Spill 64 -> 192 bytes; `--perf
+  village-fire` ca + ca1 14.55 -> 16.41 ms with the world hash unchanged
+  (sim_step.wgsl at e7f839f against e145446, same exe). Reverting DET-1 alone
+  bought back 0.94 ms, removing the flow note 0.87; summing the flow notes in
+  workgroup memory instead made it WORSE (+0.19: more code, same pressure).
+  The fix that kept both: `flagSupportLossNbr(n, f, ...)` takes the FACE index
+  the actor's neighbour is on (the far face is face `f` of n, skipped by
+  index -- the same test, one u32): `step` 80 registers / 96 bytes local, ca +
+  ca1 16.39 -> 14.68 (n=2). And ca1 runs its
+  own pipeline, `main1` (Pipe::Step1), with the substep a compile-time
+  constant (`gCaSub`, every `P.substep` read routed through it), so every
+  substep-0-only path folds away and ca1's kernel is 64 registers and half the
+  binary: ca1 5.07 -> 4.82 ms. Together (village-fire, n=2, same scene hash)
+  ca + ca1 16.39 -> 14.43; forestfire 9.50 -> 8.38.
+  **Before adding code to the CA, read `--shader-stats` for `step`
+  and `step1`:** a change that moves Local Memory Size moves every cell's cost.
 - **Dead flesh collides as one convex a body (2026-10-04, fight64 package
   P).** Owner: "lets get corpses to have simpler colliders; lets try to
   heavily optimize 64 creature fights". In `--gate mob-cap64` (64 creatures,
@@ -20621,6 +20644,22 @@ other columns; a face with no exposed column in ANY of them has no surface
 facing that way, so no pixel can land on it. "No opinion" is still the right
 answer for a slot nobody has walked, where the honest fallback is the open
 look; it is never right for a face somebody is looking at.
+
+**A walk is three workgroup phases, not one thread per four bytes**
+(2026-10-15, frame-rate pass). `openChunk` used to give each of its 96 threads
+four (block, face) bytes and let it search the origin and march all five rays
+of each in turn, so a warp ran as long as its busiest lane while the lanes
+whose bytes were air or buried idled. Now: phase 0 reads the chunk and a
+one-cell rim into a workgroup blocker bitmap (only when the chunk has at least
+`OPEN_BM_MIN_BLOCKS` blocker blocks, where the column walks dominate); phase 1
+searches each byte's origin (`openOrigin`, reading the bitmap) and lists the
+faces that found one; phase 2 runs every listed face's five rays as one shared
+list, one ray per item (`openRayBlocked`), summing integer weights per face;
+phase 3 is the old per-byte tail (sun sample, irradiance, packing). Same reads,
+same origins (packed to half-voxel bytes, exact in f32), same rays, same
+weights: every byte is what `openValueAt` — kept as the single-thread
+definition — returns. `--perf village-fire`: opennessDirty 2.55 -> 1.83 ms,
+opennessRefresh 1.17 -> 0.82 ms.
 
 **THE AMBIENT IS A SUM, NOT A FLOORED PRODUCT** (2026-09-11). The reader used
 to be `ambientAt(n) * ao * max(openness, render.opennessFloor)`, with the floor

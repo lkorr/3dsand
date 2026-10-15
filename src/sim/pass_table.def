@@ -607,7 +607,7 @@ PASS(caMask1, "ca(54 color x substep)", PT_TICK, PIPE_CA_MASK, K_INDIRECT, IND_D
 PASS(caList1, "ca(54 color x substep)", PT_TICK, PIPE_CA_LIST, K_COMPUTE, 27,1,1, GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(RW(CaMask) R(ArgsStage) R(DirtyList) A(CaArgs)))
 // read-only in practice: `reposeSnap` and `caMask`, as for ca above.
-PASS(ca1, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_CAARGS,0,0, GRP_SIM, DYN_CA1, C_CAACTIVE, 27,
+PASS(ca1, "ca(54 color x substep)", PT_TICK, PIPE_STEP1, K_INDIRECT, IND_CAARGS,0,0, GRP_SIM, DYN_CA1, C_CAACTIVE, 27,
      USES(R(Materials) U(TickUBO) U(PassUBO) R(Reactions) R(DirtyIn) I(CaArgs)
           RW(Voxels) A(DirtyOut) A(Support) R(PageTable) A(PageFaults)
           R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch) A(ActVoxViz)

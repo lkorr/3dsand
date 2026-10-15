@@ -450,6 +450,10 @@ enum class Pipe : uint8_t {
   RainExpo,
   Compact, CompactNext,
   Step,
+  // The CA's substep-1 rows: sim_step.wgsl `main1`, the same kernel with the
+  // substep a compile-time constant, so the reaction / staining / solute
+  // paths only substep 0 runs are not in the register budget ca1 runs under.
+  Step1,
   Occupancy, OccupancyDirty,
   Pick,
   ExplodeMark, ExplodeApply,

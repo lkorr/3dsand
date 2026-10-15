@@ -24,6 +24,9 @@
 @group(0) @binding(3) var<storage, read>       materials : array<Material>;
 @group(0) @binding(4) var<uniform> T : TickParams;
 @group(0) @binding(5) var<uniform> P : PassParams;
+// THE SUBSTEP, routed through one private so an entry point can fix it
+// at compile time (main1). Every entry point sets it before anything else.
+var<private> gCaSub : u32 = 0u;
 @group(0) @binding(11) var<storage, read>      reactions : array<Reaction>;
 // ---- MLS-MPM excited-fluid coupling (sim_fluid_seam.wgsl; DESIGN.md §5) ----
 // The solver's block map + node grid (LAST tick's final substep) and the
@@ -756,8 +759,17 @@ fn rngCellId(c : vec3<i32>) -> u32 {
 // neighbour. The other five faces of n are within distance 1 of c (c itself,
 // or a cell diagonal to it), inside c's own write box, so only c can write
 // them and their reads stay. Everything else is common.wgsl's rule verbatim;
-// keep the copies in step. `c` must be the ACTOR and n one face away from it.
-fn flagSupportLossNbr(c : vec3<i32>, n : vec3<i32>, oldKlass : u32, newMat : u32) {
+// keep the copies in step. `f` is the face of the ACTOR c that n is on
+// (n = c + faceDir(f)), so the far face n + d is n + faceDir(f): face `f` of
+// n, skipped by index.
+//
+// THE FACE, NOT THE ACTOR CELL (2026-10-15, frame-rate pass). This took `c`
+// and compared each neighbour against `away = n + (n - c)`: three more live
+// vec3s at three inlined call sites, which pushed the whole CA kernel past its
+// register budget -- its spill grew 64 -> 192 bytes and the CA cost 0.94 ms a
+// frame more in --perf village-fire (ca AND ca1, though no call is reachable on
+// substep 1). The index is the same test (faceDir is one-to-one) in one u32.
+fn flagSupportLossNbr(n : vec3<i32>, f : u32, oldKlass : u32, newMat : u32) {
   if (oldKlass != CLASS_SOLID && oldKlass != CLASS_POWDER) { return; }
   let nm = newMat & 0xFFFu;
   var keepsAbove = false;
@@ -766,13 +778,12 @@ fn flagSupportLossNbr(c : vec3<i32>, n : vec3<i32>, oldKlass : u32, newMat : u32
     if (nk == CLASS_SOLID) { return; }  // still supports everything
     if (nk == CLASS_POWDER) { keepsAbove = true; }
   }
-  let away = n + (n - c);  // the face pointing away from the actor
   for (var i = 0u; i < 6u; i++) {
     if (oldKlass == CLASS_POWDER && i != 1u) { continue; }  // up only
     if (keepsAbove && i == 1u) { continue; }
     let nn = n + faceDir(i);
     if (!inWindow(nn, ptOrigin())) { continue; }
-    var solid = all(nn == away);  // another actor's box: never read it
+    var solid = i == f;  // the far face, another actor's box: never read it
     if (!solid) {
       let nmat = voxMat(voxWordAt(nn));
       solid = nmat != MAT_AIR && materials[nmat].klass == CLASS_SOLID;
@@ -1394,7 +1405,7 @@ fn solTryMix(c : vec3<i32>, idx : u32, w : u32, s : u32, slotIdx : u32,
     }
     let f = voxState(w) + 1u;
     let units = min(f * solYield8(s), solCap(s, f));
-    voxStore(idx, packVoxKeepStain(nmat, voxState(w), stampFor(T.tick, P.substep), w));
+    voxStore(idx, packVoxKeepStain(nmat, voxState(w), stampFor(T.tick, gCaSub), w));
     _ = solStoreAt(c, solPack(s, units));
     atomicAdd(&solMeta[SOLM_DISSOLVED], units);
     markVoxActive(idx);
@@ -1424,7 +1435,7 @@ fn solTryMix(c : vec3<i32>, idx : u32, w : u32, s : u32, slotIdx : u32,
       return false;
     }
     let bw = bt.y;
-    let stamp = stampFor(T.tick, P.substep);
+    let stamp = stampFor(T.tick, gCaSub);
     voxStore(bt.x, packVoxKeepStain(voxMat(w), voxState(w), stamp, w));
     voxStore(idx, packVoxKeepStain(voxMat(bw), voxState(bw), stamp, bw));
     markVoxActive(bt.x);
@@ -1503,7 +1514,7 @@ fn solTryDissolve(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material,
       markDirtyR(c, DIRTY_R_REACT);
       return false;
     }
-    let stamp = stampFor(T.tick, P.substep);
+    let stamp = stampFor(T.tick, gCaSub);
     _ = solStoreAt(n, solPack(s, have + k * y8));
     atomicAdd(&solMeta[SOLM_DISSOLVED], k * y8);
     if (k >= pm) {
@@ -1579,7 +1590,7 @@ fn solTryConvert(c : vec3<i32>, idx : u32, w : u32, mat : u32) -> bool {
     let row = solConvertRow(s, k);
     if ((row & 0xFFFu) != mat || conc < (row >> 24u)) { continue; }
     let into = (row >> 12u) & 0xFFFu;
-    voxStore(idx, packVoxKeepStain(into, voxState(w), stampFor(T.tick, P.substep), w));
+    voxStore(idx, packVoxKeepStain(into, voxState(w), stampFor(T.tick, gCaSub), w));
     _ = solStoreAt(c, 0u);
     atomicAdd(&solMeta[SOLM_CONVERTED], solMassOf(v));
     markVoxActive(idx);
@@ -1596,7 +1607,7 @@ fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, risi
   let di = dt.x;
   let tw = dt.y;
   if (!canDisplace(myDensity, rising, tw)) { return false; }
-  let stamp = stampFor(T.tick, P.substep);
+  let stamp = stampFor(T.tick, gCaSub);
   // Stain travels WITH the voxel, not with the cell: a stained pebble that
   // falls is still stained, and the air it left behind is not. Both sides of
   // the swap therefore carry their own source word's stain bits.
@@ -1645,7 +1656,7 @@ fn tryCrush(src : vec3<i32>, dst : vec3<i32>, myWord : u32) -> bool {
   if (tmat == MAT_AIR || (materials[tmat].flags & MATF_PASSABLE) == 0u) { return false; }
   let myMat = voxMat(myWord);
   if ((materials[myMat].flags & MATF_PASSABLE) != 0u) { return false; }
-  let stamp = stampFor(T.tick, P.substep);
+  let stamp = stampFor(T.tick, gCaSub);
   voxStore(dt.x, packVoxKeepStain(myMat, voxState(myWord), stamp, myWord));
   markVoxActive(dt.x);
   var si = gSelfIdx;
@@ -1695,7 +1706,7 @@ fn tryPowderOnto(src : vec3<i32>, dst : vec3<i32>, myWord : u32, m : Material) -
   let myMat = voxMat(myWord);
   let f = powderMass(myWord);
   let nf = powderMass(tw);
-  let stamp = stampFor(T.tick, P.substep);
+  let stamp = stampFor(T.tick, gCaSub);
   var si = gSelfIdx;
   if (any(src != gSelfCell) || si == PT_NO_WORD) { si = voxWordIndex(src); }
   var srcNow = tmat;   // what the source cell holds afterwards
@@ -1826,7 +1837,7 @@ fn tryFineRepose(c : vec3<i32>, w : u32, m : Material, r : u32) -> bool {
     if (drop <= t) { continue; }
     let k = min(min(u32((drop - t + 1) / 2), f), POWDER_FULL - tMass);
     if (k == 0u) { continue; }
-    let stamp = stampFor(T.tick, P.substep);
+    let stamp = stampFor(T.tick, gCaSub);
     let tv = voxIndexAndWord(tgt);
     voxStore(tv.x, packVoxKeepStain(myMat, powderStateFor(tMass + k, tgt, ptSeed()),
                                     stamp, tw));
@@ -2269,7 +2280,7 @@ fn reposeDiagAllowed(c : vec3<i32>, d : vec2<i32>, code : u32) -> bool {
 // 0 = air). Mass-conserving: src empties to air when it gives everything.
 fn transferLiquid(src : vec3<i32>, dst : vec3<i32>, mat : u32,
                   sf : u32, df : u32, t : u32) {
-  let stamp = stampFor(T.tick, P.substep);
+  let stamp = stampFor(T.tick, gCaSub);
   // One table resolution per cell for index AND word (they used to be four).
   let sv = voxIndexAndWord(src);
   let dv = voxIndexAndWord(dst);
@@ -2618,7 +2629,7 @@ fn excitedReact(c : vec3<i32>, idx : u32, slotIdx : u32) {
   if (fm == 0u) { return; }
   let m = materials[fm];
   if (m.reactCount == 0u) { return; }
-  let rnd = hash3(T.seed, T.tick * 2u + P.substep, slotIdx);
+  let rnd = hash3(T.seed, T.tick * 2u + gCaSub, slotIdx);
   _ = doReactions(c, idx, slotIdx, 0u, fm, m, rnd, true, 0u, false, false);
 }
 
@@ -3056,7 +3067,7 @@ fn coatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
   // A coat's rules are PAIR rules (rules 1-3): none of them runs in a ticket
   // (gInTicket). Nothing covered, nothing spent, no reason to wake.
   if (gInTicket) { return vec2<u32>(0u, w); }
-  let stamp = stampFor(T.tick, P.substep);
+  let stamp = stampFor(T.tick, gCaSub);
   var keepAwake = false;
   var covered = false;
   for (var ri = 0u; ri < cmat.reactCount; ri++) {
@@ -3137,7 +3148,7 @@ fn coatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
       else { voxStore(pni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp)); }
       markVoxActive(pni);
       markDirtyR(n, DIRTY_R_REACTW);
-      if (!psyn) { flagSupportLossNbr(c, n, materials[pmat].klass, rule.prodNbr); }
+      if (!psyn) { flagSupportLossNbr(n, pk, materials[pmat].klass, rule.prodNbr); }
     }
     // Clause 2c: the flame was made ON the cell, so a cell that can catch
     // CATCHES -- it takes its catch form (its own heat rules' burning product,
@@ -3274,7 +3285,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
                m : Material, rnd : u32, synthSelf : bool, coat : u32,
                covered : bool, probe : bool) -> bool {
   var keepAwake = false;
-  let stamp = stampFor(T.tick, P.substep);
+  let stamp = stampFor(T.tick, gCaSub);
   // A partial grain cannot become a whole SOLID (a 1/8 seed does not grow a
   // whole sprout): such rules are skipped, not rolled, and do not hold the
   // chunk awake. Eight grains that merge into a full cell react normally.
@@ -3445,7 +3456,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
             markVoxActive(ni);
             markDirtyR(n, DIRTY_R_REACTW);
             if (!synthFluid) {
-              flagSupportLossNbr(c, n, materials[nmat].klass, rule.prodNbr);
+              flagSupportLossNbr(n, di, materials[nmat].klass, rule.prodNbr);
             }
           }
           if (rule.prodSelf != PROD_KEEP) {
@@ -3791,7 +3802,7 @@ fn doStaining(c : vec3<i32>, idx : u32, selfWord : u32, m : Material,
   let stainType = matStainType(m);
   let addAmt = matStainAmount(m);
   let washes = matWashes(m);
-  let stamp = stampFor(T.tick, P.substep);
+  let stamp = stampFor(T.tick, gCaSub);
 
   // Rotate the scan so the stained neighbour is not biased toward -Y. One roll
   // decides WHETHER we stain this tick; the rotation decides WHICH neighbour.
@@ -3889,7 +3900,7 @@ fn doStaining(c : vec3<i32>, idx : u32, selfWord : u32, m : Material,
       voxStore(ni, 0u);
       markVoxActive(ni);
       // The voxel that vanished may have been holding a solid up.
-      flagSupportLossNbr(c, n, materials[nmat].klass, MAT_AIR);
+      flagSupportLossNbr(n, di, materials[nmat].klass, MAT_AIR);
     }
     break;  // one neighbour per tick — bounds the rule's rate (rule 2)
   }
@@ -4454,12 +4465,12 @@ fn stillWant(c : vec3<i32>, mat : u32, f : u32) -> u32 {
 fn stillReservoir(c : vec3<i32>, mat : u32, f : u32) -> bool {
   let want = stillWant(c, mat, f);
   if (want == STILL_NONE) { return false; }
-  let roll = hash3(T.seed ^ STILL_SALT, T.tick * 4u + P.substep, cellIndexW(c)) & 1023u;
+  let roll = hash3(T.seed ^ STILL_SALT, T.tick * 4u + gCaSub, cellIndexW(c)) & 1023u;
   if (roll >= T.stillWaterRelax) {
     markDirtyR(c, DIRTY_R_REACT);   // matched, did not fire: own chunk only
     return false;
   }
-  let stamp = stampFor(T.tick, P.substep);
+  let stamp = stampFor(T.tick, gCaSub);
   let iw = voxIndexAndWord(c);
   if (want == STILL_GIVE) {
     if (f <= 1u) { voxStore(iw.x, 0u); }
@@ -4788,7 +4799,7 @@ const WIND_ENTRAIN_SPAN_Q10 : i32 =
 // slot index nor a PassParams; these three wrappers supply the CA's, so every
 // call site in this file reads exactly as it did before the move.
 fn windRndS(slotIdx : u32, stream : u32) -> u32 {
-  return gasRndK(slotIdx, stream, P.substep, &T);
+  return gasRndK(slotIdx, stream, gCaSub, &T);
 }
 fn windRnd(slotIdx : u32) -> u32 { return windRndS(slotIdx, 0u); }
 // The wind at an ACTING cell: its 4^3 block's cached ambient (camask) plus
@@ -4803,13 +4814,13 @@ fn caWindAt(c : vec3<i32>) -> vec3<i32> {
 fn windLateralStart(c : vec3<i32>, base : u32, m : Material,
                     slotIdx : u32) -> u32 {
   if (T.windMode == WIND_MODE_OFF || matWindResponse(m) == 0u) { return base; }
-  return windLateralStartW(caWindAt(c), base, m, slotIdx, P.substep, &T);
+  return windLateralStartW(caWindAt(c), base, m, slotIdx, gCaSub, &T);
 }
 fn gasIntent(c : vec3<i32>, m : Material, slotIdx : u32, base : u32) -> GasIntent {
   if (T.windMode == WIND_MODE_OFF || matWindResponse(m) == 0u) {
-    return gasIntentK(c, m, slotIdx, base, P.substep, &T);   // calm: no wind read
+    return gasIntentK(c, m, slotIdx, base, gCaSub, &T);   // calm: no wind read
   }
-  return gasIntentW(caWindAt(c), m, slotIdx, base, P.substep, &T);
+  return gasIntentW(caWindAt(c), m, slotIdx, base, gCaSub, &T);
 }
 
 // ---- THE WINDOW EDGE IS A SINK (docs/PLAN_gas_particles.md §2.3) -----------
@@ -4854,7 +4865,7 @@ fn gasIntent(c : vec3<i32>, m : Material, slotIdx : u32, base : u32) -> GasInten
 //
 // ONCE PER VOXEL PER TICK. The CA runs 2 gravity substeps x 27 colour phases;
 // the stamp gate at the top of stepCell lets a voxel act at most once per
-// SUBSTEP, so `P.substep == 0u` at the call site is what makes this once per
+// SUBSTEP, so `gCaSub == 0u` at the call site is what makes this once per
 // tick. Called BEFORE the voxel moves, so a voxel that leaves the window this
 // tick is splatted at the cell it left from and sim_gas splats the parcel it
 // became at the cell it arrived at — one contribution each, from two
@@ -4959,7 +4970,7 @@ fn gasLeaveAllow(ci : u32) -> u32 {
 // chunk's leavers lose when it is over its share is a pure function of the
 // cells and is not always the same corner of the chunk.
 fn gasLeaveKey(local : u32) -> u32 {
-  return hash3(T.seed ^ GAS_LV_SALT, T.tick * 2u + P.substep, local);
+  return hash3(T.seed ^ GAS_LV_SALT, T.tick * 2u + gCaSub, local);
 }
 
 // THE CHUNK BUDGET'S DOORBELL (camask, substep 0, one thread per dirty chunk):
@@ -5207,7 +5218,7 @@ fn windGrain(c : vec3<i32>, dst : vec3<i32>, w : u32, m : Material) -> bool {
   let dv = voxIndexAndWord(dst);
   if (voxMat(dv.y) != MAT_AIR) { return false; }
   let myMat = voxMat(w);
-  let stamp = stampFor(T.tick, P.substep);
+  let stamp = stampFor(T.tick, gCaSub);
   voxStore(dv.x, packVox(myMat, POWDER_GRAIN_STATE, stamp));
   var si = gSelfIdx;
   if (any(c != gSelfCell) || si == PT_NO_WORD) { si = voxWordIndex(c); }
@@ -5392,6 +5403,7 @@ fn camaskHeatBlocks(ci : u32, li : u32, e : u32, sentinel : bool) {
 @compute @workgroup_size(256)
 fn camask(@builtin(workgroup_id) wg : vec3<u32>,
           @builtin(local_invocation_index) li : u32) {
+  gCaSub = P.substep;
   let ci = dirtyList[wg.x];
   let e = pageEntryOf(ci);
   // No early return for a sentinel: the barriers below need uniform control
@@ -5414,7 +5426,7 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
   // THE SOURCE FOLD's gate (above camask): substep 0, a window slot holding a
   // heat page, the layer on. The same answer in every thread.
   var heatScan = false;
-  if (P.substep == 0u && ci < NUM_CHUNKS && heatParams[HP_MODE] != 0u) {
+  if (gCaSub == 0u && ci < NUM_CHUNKS && heatParams[HP_MODE] != 0u) {
     heatScan = (atomicLoad(&heatMeta[HM_ENTRY + ci]) & HEAT_ENTRY_HAS) != 0u;
   }
   if (li == 0u) {
@@ -5533,7 +5545,7 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
     let r = o + atomicLoad(&wgColCnt[li * 3u + 2u]);
     let tot = g + r;
     if (tot != 0u) {
-      let mpm = P.substep == 0u && fluidBlockMapS[ci] != 0u;
+      let mpm = gCaSub == 0u && fluidBlockMapS[ci] != 0u;
       var sparse = !sentinel && !mpm && wgCaEdge == 0u && tot <= CA_SPARSE_T;
       if (sparse) {
         // Reserve both kinds; if either does not fit, neither is used.
@@ -5612,7 +5624,7 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
     if (sentinel) {
       let smat = e & PT_MAT_MASK;
       cols = select(CA_ALL_COLOURS, 0u, smat == MAT_AIR || !matCanAct(materials[smat]));
-    } else if (P.substep == 0u && fluidBlockMapS[ci] != 0u) {
+    } else if (gCaSub == 0u && fluidBlockMapS[ci] != 0u) {
       cols = CA_ALL_COLOURS;
     }
     caMask[CA_WORK_COL0 + wg.x] = cols;
@@ -5633,7 +5645,7 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
   // reposeSnapOpenMat: open = not solid and not powder. reposesnap skips ring
   // member 0. Written whether or not the prepass is recorded this tick: a
   // valid snapshot nobody reads costs 512 bytes.
-  if (P.substep == 0u && li < CA_MASK_WORDS) {
+  if (gCaSub == 0u && li < CA_MASK_WORDS) {
     var open = ~atomicLoad(&wgCaBlk[li]);
     if (sentinel) { open = select(0u, 0xFFFFFFFFu, reposeSnapOpenMat(e & PT_MAT_MASK)); }
     reposeSnap[ci * CA_MASK_WORDS + li] = open;
@@ -5664,7 +5676,7 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
   // does not run in a ticket. A sentinel chunk's one material is tested here.
   // THE EDGE'S BUDGET (gasLeaveCount): substep 0 only -- both substeps run
   // the same dirty list -- and before the CA's first colour by pass order.
-  if (li == 0u && P.substep == 0u && T.gasMode != GAS_MODE_OFF) { gasLeaveCount(ci); }
+  if (li == 0u && gCaSub == 0u && T.gasMode != GAS_MODE_OFF) { gasLeaveCount(ci); }
   if (li == 0u && ci < NUM_CHUNKS) {
     // wgCaEmit: bit 0 = a heat emitter, bit 1 = an electric source.
     let emit = atomicLoad(&wgCaEmit);
@@ -5726,7 +5738,7 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
       if (mode != 2u) { atomicOr(&heatMeta[HM_FLAGS + q], HF_URGENT); }
     }
   }
-  if (li == 0u && P.substep == 0u && T.gasMode != GAS_MODE_OFF) {
+  if (li == 0u && gCaSub == 0u && T.gasMode != GAS_MODE_OFF) {
     let nm = atomicLoad(&wgCaPop[0]);
     let ng = atomicLoad(&wgCaPop[1]);
     if (nm == 0u) {
@@ -5745,7 +5757,7 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
   // slice (pass_table.def DYN_CA1) to say which one it is. Halves the cache's
   // cost, which the heat term made heavier (village fire: caMask 1.09 ->
   // 1.36 ms with the heat lookups, both substeps).
-  if (P.substep == 0u && T.windMode != WIND_MODE_OFF && li < CA_WIND_BLOCKS) {
+  if (gCaSub == 0u && T.windMode != WIND_MODE_OFF && li < CA_WIND_BLOCKS) {
     let b = vec3<i32>(i32(li & 3u), i32((li >> 2u) & 3u), i32(li >> 4u));
     let w = windAmbQ(slotWorldChunk(ci, T.origin) * i32(CHUNK) + b * 4 + vec3<i32>(2), &T);
     let o = (ci * CA_WIND_BLOCKS + li) * 3u;
@@ -5902,7 +5914,7 @@ fn caRow(first : u32, total : u32, t : u32) -> CaRow {
   let wi = ci * CA_MASK_STRIDE + u32(y >> 1) + 8u * u32(z);
   let sh = 16u * u32(y & 1);
   var bits = caRowBits(start.x);
-  if (P.substep != 0u || fluidBlockMapS[ci] == 0u) {
+  if (gCaSub != 0u || fluidBlockMapS[ci] == 0u) {
     bits &= (caMask[wi] >> sh) & 0xFFFFu;
   }
   let gas = bits & (caMask[wi + CA_MASK_WORDS] >> sh);
@@ -5915,9 +5927,7 @@ fn caRow(first : u32, total : u32, t : u32) -> CaRow {
 // x positions of one colour in a 16-wide row: bits sx, sx+3, ... (0x9249 = 0,3,..,15).
 fn caRowBits(sx : i32) -> u32 { return (0x9249u << u32(sx)) & 0xFFFFu; }
 
-@compute @workgroup_size(128)
-fn main(@builtin(workgroup_id) wg : vec3<u32>,
-        @builtin(local_invocation_index) li : u32) {
+fn caMain(wg : vec3<u32>, li : u32) {
   // This colour's work (calist): the workgroups below `dwg` take chunks of its
   // DENSE list, pack at a time, and gather; the ones above take 128 cells of
   // its sparse POOL (gas cells, then the rest). Same caCell either way.
@@ -6085,10 +6095,28 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
       if (!ok) { atomicAdd(&gasSpawn[GAS_SP_REFUSED], 1u); }
       let slotIdx = rngCellId(c);
       stepGasFrom(c, idx, w, materials[voxMat(w)], slotIdx,
-                  hash3(T.seed, T.tick * 2u + P.substep, slotIdx), 1u);
+                  hash3(T.seed, T.tick * 2u + gCaSub, slotIdx), 1u);
     }
   }
 }
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg : vec3<u32>,
+        @builtin(local_invocation_index) li : u32) {
+  gCaSub = P.substep;
+  caMain(wg, li);
+}
+
+// Substep 1 with the substep a CONSTANT: every substep-0-only path
+// (reactions, staining, the solute self-rules, the splat) folds away, so
+// the kernel the ca1 rows run is allocated for the movement it does.
+@compute @workgroup_size(128)
+fn main1(@builtin(workgroup_id) wg : vec3<u32>,
+        @builtin(local_invocation_index) li : u32) {
+  gCaSub = 1u;
+  caMain(wg, li);
+}
+
 
 // ONE CELL of one colour (was main's body, one thread per lattice site).
 // `ci` is the chunk's slot, `local` the cell within it.
@@ -6145,7 +6173,7 @@ fn caCell(ci : u32, local : vec3<i32>) {
     // (excitedReact). Reactions roll on substep 0 only, as for voxels, and
     // the block-map load is workgroup-uniform (every thread is in chunk ci),
     // so a fluid-free chunk pays one broadcast load per air cell.
-    if (P.substep == 0u && fluidBlockMapS[ci] != 0u) {
+    if (gCaSub == 0u && fluidBlockMapS[ci] != 0u) {
       excitedReact(c, idx, slotIdx);
     }
     return;
@@ -6156,8 +6184,8 @@ fn caCell(ci : u32, local : vec3<i32>) {
   // STAMP GATE MUST NOT EAT A KEEP-AWAKE MARK" above): the gate cannot tell
   // which, so on substep 0 a skipped cell runs its rules as a PROBE (match,
   // mark, never fire) and returns after staining; on substep 1 it just returns.
-  let skip = voxStamp(w) == stampFor(T.tick, P.substep);
-  if (skip && P.substep != 0u) { return; }
+  let skip = voxStamp(w) == stampFor(T.tick, gCaSub);
+  if (skip && gCaSub != 0u) { return; }
 
   let m = materials[mat];
   // ---- THE SOLUTE LAYER'S TWO SELF-RULES (substep 0, before the authored
@@ -6179,7 +6207,7 @@ fn caCell(ci : u32, local : vec3<i32>) {
   // and solids -- most of a burning forest's awake
   // cells -- skip the species-table read entirely (measured: +9% CA in the
   // --perf forestfire scene before this gate).
-  if (P.substep == 0u && (m.klass == CLASS_POWDER || m.klass == CLASS_LIQUID)) {
+  if (gCaSub == 0u && (m.klass == CLASS_POWDER || m.klass == CLASS_LIQUID)) {
     let sp = solFromSpecies(mat);
     if (sp != 0u && TUNE_SOLUTE_MODE != 0u &&
         solTryDissolve(c, idx, w, mat, m, sp, slotIdx, skip)) { return; }
@@ -6248,7 +6276,7 @@ fn caCell(ci : u32, local : vec3<i32>) {
   // A wet stain dries (stainDry), on any surface, absorbent or not -- so this
   // is tested before the inert return. One stain-bits test (already paid by
   // coatMatOf) for every cell; the palette load only for a stained one.
-  if (P.substep == 0u && voxStained(w) &&
+  if (gCaSub == 0u && voxStained(w) &&
       stainDry(c, idx, w, m, hash3(T.seed, T.tick * 2u, slotIdx), skip)) {
     return;
   }
@@ -6257,7 +6285,7 @@ fn caCell(ci : u32, local : vec3<i32>) {
   // substep 0 only, and only by a conductor.
   let conducts = (m._r2 & ELEC_R2_CONDUCTS) != 0u;
   if (!matCanAct(m) && coat == 0u && !conducts) { return; }
-  let rnd = hash3(T.seed, T.tick * 2u + P.substep, slotIdx);
+  let rnd = hash3(T.seed, T.tick * 2u + gCaSub, slotIdx);
 
   // Reactions roll once per tick (substep 0 of the two gravity substeps).
   // The COAT first (rules 1-3 of "A COAT IS A CO-LOCATED VIRTUAL NEIGHBOUR"),
@@ -6268,7 +6296,7 @@ fn caCell(ci : u32, local : vec3<i32>) {
   // gone -- and the cell does not move this substep (its stamp is this
   // substep's: moving it would carry a stale word). One that matched and
   // quenches covers the cell for its own rules.
-  if (P.substep == 0u) {
+  if (gCaSub == 0u) {
     var covered = false;
     var spent = false;
     var wNow = w;
@@ -6292,7 +6320,7 @@ fn caCell(ci : u32, local : vec3<i32>) {
     // A conductor with no reaction bucket (copper, iron, steel) still takes
     // E2's after-bucket step; one with a bucket took it in doReactions.
     if (m.reactCount == 0u && conducts && !gInTicket && !spent) {
-      let er = elecReact(c, idx, slotIdx, wNow, mat, m, rnd, skip, stampFor(T.tick, P.substep));
+      let er = elecReact(c, idx, slotIdx, wNow, mat, m, rnd, skip, stampFor(T.tick, gCaSub));
       if (er == 2u) { return; }
       if (er == 1u) { markDirtyR(c, DIRTY_R_REACT); }
     }
@@ -6304,14 +6332,14 @@ fn caCell(ci : u32, local : vec3<i32>) {
   // flag first so the ~all materials that do not stain pay one comparison.
   // Keeps the chunk awake only while unstained surface remains in reach — see
   // the sleep note on doStaining.
-  if (P.substep == 0u && matStains(m)) {
+  if (gCaSub == 0u && matStains(m)) {
     if (doStaining(c, idx, w, m, rnd, skip)) { markDirtyR(c, DIRTY_R_STAIN); }
     // Absorption can have emptied this cell (the liquid soaked away) or docked
     // its fullness and stamped it. Re-read before the movement code below acts
     // on a stale word: moving an already-spent eighth would create mass.
     let after = voxWordAt(c);
     if (voxMat(after) == MAT_AIR) { return; }
-    if (voxStamp(after) == stampFor(T.tick, P.substep)) { return; }
+    if (voxStamp(after) == stampFor(T.tick, gCaSub)) { return; }
   }
 
   // A stamp-skipped cell has said whether it has matched work; it does not move.
@@ -6370,7 +6398,7 @@ fn caCell(ci : u32, local : vec3<i32>) {
     // with GAS_MODE_OFF no gas row is recorded at all, fill_gasOuter never
     // clears the box, and a splat into an uncleared box would accumulate
     // forever. See gasOuterSplat.
-    if (T.gasMode != GAS_MODE_OFF && P.substep == 0u) { gasOuterSplat(c); }
+    if (T.gasMode != GAS_MODE_OFF && gCaSub == 0u) { gasOuterSplat(c); }
     // A DISCHARGE DOES NOT DRIFT (E2, 2026-10-03). A gas that is an electric
     // SOURCE (spark, arc, lightning: `_r2` bit 25) lives a tick or two where
     // it struck and never moves. Two reasons, one physical: a spark does not
@@ -6574,7 +6602,7 @@ fn caCell(ci : u32, local : vec3<i32>) {
   //    Order matters for cost, not for correctness: the mode compare is free
   //    and the footprint test walks the primitive list, so the cheap one goes
   //    first and a world with no primitives never reaches the loop.
-  if (T.windMode >= WIND_MODE_DRIFT && P.substep == 0u &&
+  if (T.windMode >= WIND_MODE_DRIFT && gCaSub == 0u &&
       m.klass == CLASS_POWDER &&
       (T.windMode >= WIND_MODE_ENTRAIN || windPrimEntrainsQ(c, &T))) {
     if (windEntrain(c, w, m, slotIdx)) { return; }

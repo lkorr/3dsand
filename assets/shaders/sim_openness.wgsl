@@ -193,7 +193,38 @@ fn openWorldChunk(slot : u32, origin : vec3<i32>) -> vec3<i32> {
 // `blockMin` is the block's minimum world cell. The block is known to hold at
 // least one blocker (the caller tested the bit), which is what makes this a
 // SURFACE face worth measuring rather than a face of empty air.
+//
+// SPLIT IN TWO SINCE 2026-10-15 (frame-rate pass): openOrigin below is the
+// origin search, openRayBlocked is ONE of the five rays, and openChunk runs
+// them as two workgroup phases instead of one thread doing all of a face. A
+// thread used to own four (block, face) bytes and march every ray of every
+// surface face among them in turn, so a warp ran as long as its busiest lane
+// while the lanes whose bytes were air or buried idled: the rays were 1.6 of
+// opennessDirty's 2.6 ms in --perf village-fire. The rays of the chunk's
+// surface faces are now a compacted list that all OPEN_WORDS_PER_CHUNK threads
+// share, one ray per item. Same rays, same origins, integer weights summed per
+// face (exact in f32 at any order), so every byte is what it was.
+// openValueAt is the single-thread composition, kept as the definition.
 fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
+  let o = openOrigin(blockMin, face, vec3<i32>(0), false);
+  if (o.w == 0.0) { return 256u; }
+  var openW = 0u;
+  for (var r = 0u; r < OPEN_RAYS; r++) {
+    if (!openRayBlocked(o.xyz, face, r)) { openW += select(1u, 2u, r == 0u); }
+  }
+  return openByteOfWeight(openW);
+}
+// 0..OPEN_MAX (254): 255 is the reader's "not measured" sentinel
+// (opennessByteAt, common.wgsl), never a measurement. `openW` is the summed
+// integer weight of the unblocked rays (2 for the normal, 1 for each diagonal).
+fn openByteOfWeight(openW : u32) -> u32 {
+  return u32(clamp(f32(openW) / OPEN_WEIGHT_TOTAL, 0.0, 1.0) * OPEN_MAX + 0.5);
+}
+// The rays' origin for (block, face): xyz, with w = 1 -- or w = 0 when the face
+// has no exposed column at all (openValueAt's 256, "no opinion").
+// `useBm`: answer the column walk's blocker reads from openChunk's workgroup
+// bitmap of this chunk (wgOpenBm), which holds exactly what those reads return.
+fn openOrigin(blockMin : vec3<i32>, face : u32, chunkMin : vec3<i32>, useBm : bool) -> vec4f {
   let n = openFaceNormal(face);
   let ni = vec3<i32>(round(n));
   let axis = face >> 1u;
@@ -250,10 +281,10 @@ fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
         let quin = ((u - q) % qs) == 0 && ((v - q) % qs) == 0;
         if (quin != (sweep == 0)) { continue; }
         let c0 = outer + t0i * u + t1i * v + ni;   // just outside the block
-        var prevAir = !isRayBlocker(materials[voxMat(voxWordAt(c0))]);
+        var prevAir = !openBlockerAt(c0, chunkMin, useBm);
         for (var k = 1; k <= i32(SUBOCC_BLOCK); k++) {
           let c = c0 - ni * k;
-          let blocker = isRayBlocker(materials[voxMat(voxWordAt(c))]);
+          let blocker = openBlockerAt(c, chunkMin, useBm);
           if (blocker && prevAir) {
             ro = vec3f(c + ni) + vec3f(0.5);
             found = true;
@@ -267,9 +298,20 @@ fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
     // 256, not 255, so the caller can tell "no opinion" from a face that
     // marched: P1's irradiance keeps a different word for each. The caller
     // clamps it into the byte.
-    if (!found) { return 256u; }
+    if (!found) { return vec4f(0.0); }
   }
+  return vec4f(ro, 1.0);
+}
 
+// Ray `r` (0 = the normal, 1..4 the diagonals) of (face) from origin `ro`:
+// did it find something within reach, or under the terrain past it?
+fn openRayBlocked(ro : vec3f, face : u32, r : u32) -> bool {
+  let n = openFaceNormal(face);
+  let axis = face >> 1u;
+  let t0 = vec3f(select(0.0, 1.0, axis == 1u), select(0.0, 1.0, axis == 2u),
+                 select(0.0, 1.0, axis == 0u));
+  let t1 = vec3f(select(0.0, 1.0, axis == 2u), select(0.0, 1.0, axis == 0u),
+                 select(0.0, 1.0, axis == 1u));
   let reachVox = TUNE_OPENNESS_REACH / VOXEL_METERS;
   // FINE FOR THE FIRST TWO BLOCKS, COARSE AFTER. A ray that started inside a
   // rough wall's own block would terminate on the block mask in its first
@@ -293,8 +335,7 @@ fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
   // is bounded by the window height (WORLD_N / SUBOCC_BLOCK coarse steps).
   let upSteps = i32(WORLD_N / SUBOCC_BLOCK) + 4;
   let up = vec3f(0.0, 1.0, 0.0);
-  var openW = 0.0;
-  for (var r = 0u; r < OPEN_RAYS; r++) {
+  {
     var d = n;
     if (r == 1u) { d = normalize(n + t0); }
     else if (r == 2u) { d = normalize(n - t0); }
@@ -322,12 +363,8 @@ fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
       // where its up-ray left.
       if (!blocked) { blocked = openExitUnderTerrain(e, up); }
     }
-    let w = select(1.0, 2.0, r == 0u);
-    if (!blocked) { openW += w; }
+    return blocked;
   }
-  // 0..OPEN_MAX (254): 255 is the reader's "not measured" sentinel
-  // (opennessByteAt, common.wgsl), never a measurement.
-  return u32(clamp(openW / OPEN_WEIGHT_TOTAL, 0.0, 1.0) * OPEN_MAX + 0.5);
 }
 
 // ---- P1: the walk's coarse sun sample (docs/PLAN_gi.md §3) -----------------
@@ -475,7 +512,37 @@ fn openChunk(slot : u32, li : u32, origin : vec3<i32>, fullIn : bool) {
   // barrier for the same reason as the stamp (nothing else writes it, but the
   // habit is the point).
   let prev = openness[slot * OPEN_WORDS_PER_CHUNK + li];
-  if (li == 0u) { atomicStore(&wgOpenUnc, 0u); }
+  if (li == 0u) {
+    atomicStore(&wgOpenUnc, 0u);
+    atomicStore(&wgOpenTaskN, 0u);
+  }
+  // ---- PHASE 0: the chunk's blocker bitmap, for a walk with many surfaces --
+  // The origin search walks up to sixteen five-cell columns per face, three
+  // dependent loads a cell (page entry, word, material), one thread at a time;
+  // a face looking into rock walks all sixteen and finds nothing. With enough
+  // blocker blocks to make that the bulk of the walk, the workgroup reads the
+  // chunk and its one-cell rim ONCE (OPEN_BM_DIM^3 cells, independent loads)
+  // into bits, and the columns read those. Same voxWordAt, same isRayBlocker:
+  // the same answers, so the same origins. A walk of a few scattered blocks
+  // keeps the direct reads, which are fewer.
+  let bmask0 = occupancy[subOccIndex(slot, 1u, 0u)];
+  let bmask1 = occupancy[subOccIndex(slot, 1u, 1u)];
+  let useBm = full && (countOneBits(bmask0) + countOneBits(bmask1)) >= OPEN_BM_MIN_BLOCKS;
+  if (useBm) {
+    for (var w = li; w < OPEN_BM_WORDS; w += OPEN_WORDS_PER_CHUNK) {
+      var bits = 0u;
+      for (var b = 0u; b < 32u; b++) {
+        let i = w * 32u + b;
+        if (i >= OPEN_BM_CELLS) { break; }
+        let l = vec3<i32>(i32(i % OPEN_BM_DIM), i32((i / OPEN_BM_DIM) % OPEN_BM_DIM),
+                          i32(i / (OPEN_BM_DIM * OPEN_BM_DIM)));
+        if (isRayBlocker(materials[voxMat(voxWordAt(chunkMin + l - vec3<i32>(1)))])) {
+          bits |= 1u << b;
+        }
+      }
+      wgOpenBm[w] = bits;
+    }
+  }
   workgroupBarrier();
   // The stamp, from thread 0. Written unconditionally, including for a chunk
   // with no matter in it at all: "computed, and the answer is open" is a
@@ -505,6 +572,51 @@ fn openChunk(slot : u32, li : u32, origin : vec3<i32>, fullIn : bool) {
   let solidSentinel = (pt & PT_SENTINEL_BIT) != 0u && pt != PT_EMPTY &&
                       isRayBlocker(materials[pt & PT_MAT_MASK]);
 
+  // ---- PHASE 1: the origins (openValueAt's SPLIT, above) ------------------
+  // Each thread searches its own four bytes' origins, exactly the faces the
+  // per-byte loop below would have marched, and lists every face that found
+  // one. `mine` remembers which of its four did.
+  var mine = 0u;
+  if (full) {
+    for (var k = 0u; k < 4u; k++) {
+      let byteIdx = li * 4u + k;
+      let block = byteIdx / OPEN_FACES;
+      let face = byteIdx % OPEN_FACES;
+      let bx = block % SUBOCC_DIM;
+      let by = (block / SUBOCC_DIM) % SUBOCC_DIM;
+      let bz = block / (SUBOCC_DIM * SUBOCC_DIM);
+      let sw = occupancy[subOccIndex(slot, 1u, block >> 5u)];
+      if ((sw & (1u << (block & 31u))) == 0u) { continue; }
+      let axis = face >> 1u;
+      let coord = select(select(bx, by, axis == 1u), bz, axis == 2u);
+      let onEdge = select(coord == 0u, coord == SUBOCC_DIM - 1u, (face & 1u) != 0u);
+      if (solidSentinel && !onEdge) { continue; }
+      let blockMin = chunkMin + vec3<i32>(i32(bx), i32(by), i32(bz)) * i32(SUBOCC_BLOCK);
+      let o = openOrigin(blockMin, face, chunkMin, useBm);
+      if (o.w == 0.0) { continue; }
+      let t = atomicAdd(&wgOpenTaskN, 1u);
+      wgOpenTask[t] = byteIdx;
+      wgOpenRo[byteIdx] = openPackRo(o.xyz, chunkMin);
+      atomicStore(&wgOpenW[byteIdx], 0u);
+      mine |= 1u << k;
+    }
+  }
+  workgroupBarrier();
+  // ---- PHASE 2: every listed face's five rays, shared by the workgroup -----
+  // Item = face * OPEN_RAYS + ray, so a face's rays run on neighbouring lanes
+  // (one origin, five directions: coherent reads). The list's order is the
+  // atomic's and is of no consequence: a face's weight is an integer sum.
+  let nRays = atomicLoad(&wgOpenTaskN) * OPEN_RAYS;
+  for (var it = li; it < nRays; it += OPEN_WORDS_PER_CHUNK) {
+    let byteIdx = wgOpenTask[it / OPEN_RAYS];
+    let r = it % OPEN_RAYS;
+    if (!openRayBlocked(openUnpackRo(wgOpenRo[byteIdx], chunkMin), byteIdx % OPEN_FACES, r)) {
+      atomicAdd(&wgOpenW[byteIdx], select(1u, 2u, r == 0u));
+    }
+  }
+  workgroupBarrier();
+
+  // ---- PHASE 3: each thread's four bytes, as before ------------------------
   var packed = 0u;
   for (var k = 0u; k < 4u; k++) {
     let byteIdx = li * 4u + k;
@@ -533,7 +645,10 @@ fn openChunk(slot : u32, li : u32, origin : vec3<i32>, fullIn : bool) {
       let onEdge = select(coord == 0u, coord == SUBOCC_DIM - 1u, (face & 1u) != 0u);
       if (!(solidSentinel && !onEdge)) {
         if (full) {
-          ov = openValueAt(blockMin, face);
+          // openValueAt(blockMin, face), from phases 1 and 2.
+          if ((mine & (1u << k)) != 0u) {
+            ov = openByteOfWeight(atomicLoad(&wgOpenW[byteIdx]));
+          }
         } else {
           // The skip visit: the byte stands. 255 in the byte is 256 here.
           let pb = (prev >> (k * 8u)) & 0xFFu;
@@ -612,6 +727,42 @@ fn openChunk(slot : u32, li : u32, origin : vec3<i32>, fullIn : bool) {
   }
 }
 var<workgroup> wgOpenUnc : atomic<u32>;
+// The phase-2 ray list (openChunk): byte indices of the faces that found an
+// origin, the origin per byte, and the unblocked weight per byte.
+var<workgroup> wgOpenTaskN : atomic<u32>;
+// PHASE 0's bitmap: the chunk plus a one-cell rim, bit (x + D (y + D z)) of
+// the cell chunkMin + (x, y, z) - 1, set for a ray blocker.
+const OPEN_BM_DIM : u32 = CHUNK + 2u;
+const OPEN_BM_CELLS : u32 = OPEN_BM_DIM * OPEN_BM_DIM * OPEN_BM_DIM;
+const OPEN_BM_WORDS : u32 = (OPEN_BM_CELLS + 31u) / 32u;
+// Blocker blocks (of the chunk's 64) from which the bitmap pays.
+const OPEN_BM_MIN_BLOCKS : u32 = 8u;
+var<workgroup> wgOpenBm : array<u32, OPEN_BM_WORDS>;
+fn openBlockerAt(c : vec3<i32>, chunkMin : vec3<i32>, useBm : bool) -> bool {
+  if (useBm) {
+    let l = c - chunkMin + vec3<i32>(1);
+    if (all(l >= vec3<i32>(0)) && all(l < vec3<i32>(i32(OPEN_BM_DIM)))) {
+      let i = u32(l.x) + OPEN_BM_DIM * (u32(l.y) + OPEN_BM_DIM * u32(l.z));
+      return (wgOpenBm[i >> 5u] & (1u << (i & 31u))) != 0u;
+    }
+  }
+  return isRayBlocker(materials[voxMat(voxWordAt(c))]);
+}
+var<workgroup> wgOpenTask : array<u32, OPEN_WORDS_PER_CHUNK * 4u>;
+var<workgroup> wgOpenRo : array<u32, OPEN_WORDS_PER_CHUNK * 4u>;
+// An origin is always a whole or half voxel (openOrigin: a cell + 0.5, or the
+// block centre + 2.5 along the normal) within a cell of the chunk, so 2 x
+// (ro - chunkMin) is a small integer per axis: one byte each, biased by 8. The
+// unpacked value is the same float bit for bit (every term is exact in f32).
+fn openPackRo(ro : vec3f, chunkMin : vec3<i32>) -> u32 {
+  let q = vec3<u32>(vec3<i32>(round((ro - vec3f(chunkMin)) * 2.0)) + vec3<i32>(8));
+  return q.x | (q.y << 8u) | (q.z << 16u);
+}
+fn openUnpackRo(w : u32, chunkMin : vec3<i32>) -> vec3f {
+  let q = vec3<i32>(vec3<u32>(w & 0xFFu, (w >> 8u) & 0xFFu, (w >> 16u) & 0xFFu)) - vec3<i32>(8);
+  return vec3f(chunkMin) + vec3f(q) * 0.5;
+}
+var<workgroup> wgOpenW : array<atomic<u32>, OPEN_WORDS_PER_CHUNK * 4u>;
 
 // ---------------------------------------------------------------- passes ----
 

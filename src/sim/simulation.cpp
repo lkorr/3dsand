@@ -2503,6 +2503,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { compact_ = MakeComputePipeline(device, simPL_, mCompact, "main", "compact"); });
   pool.Add([&] { compactNext_ = MakeComputePipeline(device, simPL_, mCompact, "mainNext", "compactNext"); });
   pool.Add([&] { step_ = MakeComputePipeline(device, simPL_, mStep, "main", "step"); });
+  // Substep 1 with the substep a constant (sim_step.wgsl `main1`; Pipe::Step1).
+  pool.Add([&] { step1_ = MakeComputePipeline(device, simPL_, mStep, "main1", "step1"); });
   // Same module as the CA: the snapshot has to agree with the kernel that
   // reads it about the bit layout, and one module is how that is enforced.
   pool.Add([&] {
@@ -2675,7 +2677,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !pageFill_ || !mutate_ ||
       !mutateCells_ || !windWake_ || !rainFall_ || !rainExpo_ ||
       !draftMaskAll_ || !draftMaskDirty_ || !draftArgs_ || !draftCoarseBuild_ || !draftCoarseFaces_ ||
-      !draftCoarseSolve_ || !draftFineFirst_ || !draftFineMid_ || !draftFineMid2_ || !draftFineLast_ || !draftJetPrep_ || !draftJets_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
+      !draftCoarseSolve_ || !draftFineFirst_ || !draftFineMid_ || !draftFineMid2_ || !draftFineLast_ || !draftJetPrep_ || !draftJets_ || !compact_ || !compactNext_ || !step_ || !step1_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
       !solWant_ || !solArgs_ || !solAlloc_ || !solDiffuse_ || !solCompact_ || !solScoop_ || !solPour_ || !solHash_ || !solEvict_ || !solRestore_ ||
       !heatBegin_ || !heatShift_ || !heatPend_ || !heatWant_ || !heatArgs_ || !heatAlloc_ || !heatSrc_ || !heatDue_ || !heatTent_ || !heatRelax_ ||
@@ -3079,6 +3081,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::Compact:        return compact_;
     case P::CompactNext:    return compactNext_;
     case P::Step:           return step_;
+    case P::Step1:          return step1_;
     case P::ReposeSnap:     return reposeSnap_;
     case P::CaMask:         return caMask_;
     case P::CaList:         return caList_;
