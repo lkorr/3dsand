@@ -711,8 +711,18 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   window reaches again first (nearest first, same three waits, same budget,
   `LoadOne(..., keepId)` + `Mob::ApplyDistantOverlay`); past radius +
   hysteresis one RETIRES as its patched record (`MobSystem::PatchMobRecord`);
-  a save writes each as its patched record. D0 creatures are frozen. Gate
-  `distant-roundtrip`; the full section lands with D3.
+  a save writes each as its patched record. **D1 (2026-10-15):** an awake
+  distant creature THINKS (`ai::Think`; its actor list = the distant creatures
+  of its 2D hash neighbourhood + near creatures of the edge band, never a
+  player; open-field sight), turns with `SteerStep` and walks
+  (`MobSystem::TickDistant`, top of `PreTick`) on `DistantGround` --
+  `TerrainHeight` + water + evicted edits read through
+  `Stream::SettledStoredChunk` after their eviction drain -- held at the
+  promotion line while it waits; an idle one SLEEPS (no cost) until a creature
+  enters its 3x3 cells or its clock comes round; a promotion snaps one that
+  moved onto the real ground. No fighting at distance yet (D2b). Gates
+  `distant-roundtrip`, `distant-walk`, `distant-sleep`; the full section lands
+  with D3.
 - **The save stores the delta, and meta names its generator (2026-09-22,
   `docs/PLAN_save_system.md` S1).** A saved world is `genChunk(seed,
   generator)` plus the store. `Stream::FlushResident` used to write all 32,768

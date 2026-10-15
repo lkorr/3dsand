@@ -1187,6 +1187,176 @@ this tier. The player's own swings are not logged (no NPC stroke behind
 them). ARCH_NODES / DESIGN.md are left to D3, which owns the feature's
 documentation flip.
 
+### D1 (branch `dnpc-d1`): ground, walking, sleeping
+
+**What landed.** `DistantGround` (the ground SOURCE; D0's `DistantGround`
+MODE enum is renamed `DistantGroundMode`, the field `DistantMob::groundMode`),
+the distant tick `MobSystem::TickDistant`, the 2D spatial hash, sleep and the
+idle stride inside `DistantMobs`, the mid-air landing (`LandDistant`), the
+promotion snap (`SnapPromotionGround`, plus its chunks in `Unpark`'s ground
+wait), `MobSystem::DemoteForTest` (a gate seam: the park rule's own demotion,
+now), `FillDistantDrawItems` and the statue bake at demotion (D4a wired:
+`mobs.SetDistantDraw(&distantDraw)` in `main.cpp`, `DistantDraw::Bake` in
+`DemoteToDistant` before the caller's `ReleaseRig`, the frame loop fills
+`distantDraw.Items()` from the tier unless the D4a test hook is on).
+Engine seams: `Stream::SettledStoredChunk` / `EvictionPending` (the drain),
+`ChunkStore::SetChangeFn` (one listener; Put / Erase / Clear / Unbind /
+BindLoad), `worldmap::CurrentWorldMapSerial()`, phase H binds the stream every
+tick (`mobs.SetDistantStream(&stream)`). Gates `distant-walk`,
+`distant-sleep` (`selftest_distant.cpp`, kOrder after `distant-roundtrip`);
+`build/last_run.json`'s `distant` block gains the walk's counters and
+`tickUsPerCall`. No tuning row added; `idleStride` and `promoteMaxDropVox` are
+read now (left the consumer allowlist).
+
+**The API D2b / D3 build on.**
+- WHERE IT RUNS: `MobSystem::TickDistant(tick, world, &actors_)`, called from
+  the top of `MobSystem::PreTick` after the retire scan and the actor list,
+  before the creature loop. Both tiers therefore read each other as of the
+  START of the tick; a creature demoted this tick takes its first distant
+  step next tick. `nearActors` may be null (a gate's CPU arm).
+- ONE STEP (phase 1, id order, writes only the stepper): `SelfView` from the
+  creature's cache (`stepUpCells` etc., `armed`/`canGuard`/`ammo` cached at
+  demotion, hpFrac from `limbHp` over `hpFull`), a `GroundView` fan over
+  DistantGround, a `WorldView` (actors = tick-start snapshots of the distant
+  creatures in its hash reach + the near band; `lineOfSight`/`aimPart` null;
+  `NavProbe` = `DistantNavCtx`), `ai::Think` -> `IntentOut`, then
+  `SteerStep`, crowd spacing, the drive. **D2b plugs combat in right after
+  `Think`**: the block `if (out.attack || out.shoot || out.cast)
+  Note(combatHolds)` in `TickDistant` is where `PickDistantStyle` /
+  `strokeImpactTick` scheduling and the abstract arrow go; the impact
+  resolution belongs in a pass after phase 1 (reading tick-start snapshots
+  of the defender, applying in id order), before phase 2's sleep test --
+  which already refuses to sleep a creature with `strokeImpactTick != 0`.
+- Snapshots: `DistantSnap` (centre, faction, hostile, keep, targetId, hpFrac,
+  immersion, vel) -- eager for steppers, lazy for the rest. D3's near list
+  wants the same struct the other way.
+- Phase 2 sleeps (before the moves are filed, so a mover's wake is never
+  slept through); phase 3 files the moves (`DistantMobs::Relocate`: refile +
+  `WakeEntered`), sets the border latches, writes the sleep summary.
+- Hash / wake: `DistantMobs::kCellVox` 64, `Neighbourhood`, `WakeEntered`,
+  `Relocate` (the door a gate teleports through), `AnyAwakeHint` /
+  `MarkAwakeHint` (a gate writing `asleep` by hand calls it).
+
+**Deviations.**
+1. **The ground mode enum is `DistantGroundMode`** (the brief's fix of D0's
+   name clash); `ClassifyDistantGround` keeps its name.
+2. **Edited ground is read per CELL**: a column's support search treats a
+   stored chunk's cells as truth and every other chunk as procgen
+   (`y <= TerrainHeight`). So a stored chunk next to a procgen one shows
+   worldgen's trees / ruins only on the stored side (a seam), and a
+   chunk-TICKET batch forced by the drain before its keep decision keeps all
+   its chunks (stream.h, the known gap): those then read as stored, which is
+   procgen-equal in content but not in model (trees count).
+3. **The stored-chunk cache is a support MASK** (4,096 bits per chunk), not
+   the words; liquid in a stored chunk is not read as water (water is the
+   analytic columns only). A pond the player drained still reads full.
+4. **Water = max(TerrainColumn().water, WaterColumnAt().water)**, and the two
+   do disagree at shorelines (plan §5 risk, confirmed): the harness map's
+   home lake has columns whose surface stands ~7 voxels ABOVE the adjacent
+   dry bank on its south side, so a walker coming from that bank meets a
+   wall and walks round. `distant-walk` S therefore starts its swimmer in the
+   lake. A fish counts a column as water only where the surface is above the
+   bed; it never left the water (`dry ticks 0`).
+5. **Swimmers** (`DistantMob::canFloat` = CanSwimAfloat's predicate with the
+   tread clip looked up on the RIG at demotion -- the pose resolves its swim
+   table on its first animated tick, so a creature demoted before it ever
+   animated read "cannot swim"): water reads as a floor at its surface to the
+   planner, the line test and the fan (`DistantNavCtx`), the drive floats it
+   at `kAfloatShare` of its height under the surface at
+   `player.liquidSpeedScale`, climbs out onto a bank within a step of the
+   SURFACE, and wades with the step-down budget extended by the water depth.
+   A walker that cannot swim walks the bed. Fish: volumetric `Think` (no nav),
+   confined to columns with >= max(2, height) of water, eased to the asked
+   altitude inside it.
+6. **Drops past the step-down budget are REFUSED** (the near tier lets a body
+   step off and fall): the fan marks them blocked so steering sees them, and
+   the planner's `StepTo` refuses them. DistantGround's `ProbeGround` never
+   answers "unknown" (nothing is unknown at this tier), so a column past the
+   reach reports its real height and `StepTo` refuses it, instead of near's
+   "unknown = open".
+7. **A stride must not overshoot its waypoint**: the drive cuts a step to end
+   1 voxel short of the live A* waypoint. Without it the strider (4 ticks of
+   travel per step, ~4 voxels) stepped past a waypoint the follower only
+   retires within 1.9 voxels, turned back, and circled: 1,121 voxels walked
+   for 458 of progress on `peaks`; with it 1,123 for 1,118.
+8. **No profile = no mind**: a creature with no behaviour profile neither
+   thinks nor turns at this tier (the near tier's legacy wander-and-avoid is
+   not run) and sleeps at its first step. Every D0 gate's human has no
+   profile, which is why `distant-roundtrip`'s frozen / byte-exact arms still
+   hold unchanged.
+9. **Only a creature that MOVED while distant is snapped at promotion**
+   (`DistantMob::movedWhileDistant`: a step, a landing, a `Relocate`). One that
+   never moved stands on the ground the near tier gave it, outside the window
+   where nothing can have been edited since, and must come back byte for byte
+   (D0's contract). The snap is over the footprint's 3x3 columns (the max,
+   FootprintFooting's rule), up out of matter or down to the first support,
+   within `promoteMaxDropVox`, from the FETCH CACHE -- and `Unpark` waits on
+   those chunks (`DistantPromotionChunks`, in-window only) on top of its own
+   footprint wait. A kinematic creature's fall bills no damage near (only a
+   ragdoll arrest does), so "fall damage suppressed on the promotion tick" is
+   true by construction; the gate asserts every limb's hp unchanged and
+   `FallsBilled() == 0` over 30 ticks.
+10. **The promotion line hold allows the crossing step**: a creature outside
+    the line may step in (it must, to become a candidate); once inside, any
+    substep that would put it DEEPER (the nearest face's distance) is refused;
+    lateral and outward moves are free. Measured: 0.58 voxels over the line,
+    then held.
+11. **The mid-air landing happens on the first distant STEP** (`landPending`,
+    set at demotion for an airborne SURFACE creature), not inside
+    `DemoteToDistant`: the gate can then set `vel.y`, and the landing reads
+    DistantGround like every other step. Corpses are not landed (they are
+    asleep forever; a corpse falling off the window's bottom face lies where
+    it left). A fall death sets `dead`, cause "fall", `deathSeq = ++deathSeq_`
+    and books nothing in `rises_`.
+12. **Sleep, precisely**: a stepped creature sleeps when it did not move, has
+    no target, no threat, no landing pending, no stroke (D2b), no goal it can
+    walk (a routine that is active and not holding -- ignored for an ANCHORED
+    or immobile body), and no stranger of another faction is within the
+    longer of the two keep ranges (+16) where either side is hostile. A
+    wanderer resting between legs sleeps until `wanderPauseUntil`. Woken by a
+    distant mover or a NEAR creature of the band entering its 3x3 cells
+    ("entering" = a cell of the new neighbourhood that was not in the old
+    one), or its clock. A demotion arrives awake.
+13. **Near creatures in a distant creature's world**: the near actor list
+    entries that are alive, not a player (`IsPlayerActorId`), not loose flesh,
+    and within 192 voxels of the window boundary; then within the stepper's
+    own keep / scent reach. Distant corpses are not actors (D2b may add
+    carrion).
+14. **Cost** (`distant-sleep`): 200 asleep cost 0.195 us a tick (the summary
+    fast path: no creature is looked at); an AWAKE step averaged ~50 us in
+    that gate (Think over a dense same-faction grid, the sleep test's 9x9-cell
+    reach for the library's longest keep range, 216). 128 engaged at that
+    rate would be ~6.4 ms against §2.11's 1.5 ms target: D2b should measure
+    its own (engaged creatures skip the sleep test), and the work pool is the
+    lever.
+15. **The `--shot` frame of a distant patrol is not made**: `RunShots` draws
+    the world only, no bodies (D4a's note), so no shot path can see a statue.
+    D4a's `distant-look` writes its own BMPs from a gate; a patrol view would
+    be the same machinery and is left to whoever wants the look check.
+16. Gates drive the tier directly where the window cannot hold the ground
+    (the `peaks` walk, the crater after a manual shift, the water arm):
+    `DIRECT PHASE CALLS ON PURPOSE (W2-O)` with the reason in the file
+    header; the promotion-line / snap and sleep arms run THE tick.
+
+**Measured** (`--verify distant-walk,distant-sleep,distant-roundtrip,mob-park,
+mob-cap64-twice`, all PASS, 23.8 s): `peaks` walk 1,123 voxels in 1,154
+ticks (1,118 progress, heading 0 deg, y 9,129..9,182, 27 replans, 0 refusals,
+on DistantGround every tick), twice-run digests equal; anchored origin
+bit-identical over 200 ticks; landings: 2 m soft (no damage), 13.4 m/s billed
+20 hp exactly (lround of the formula), 40 m/s splat dead of "fall"; promotion
+line deepest 0.58 voxels, snap 3.70 voxels up onto the stone bump (bound 48),
+hp drift 0, falls 0; crater dip 6.0 voxels, 1 eviction drained by the reader,
+both runs' traces identical (run 2 after the harvest, cache cleared); shark 105
+water refusals, 0 dry ticks; swimmer 222 swim steps at <= the water speed;
+200 asleep after 4 ticks; 40 of 40 sleepers in reach woken, none outside.
+
+**Open.** Trees, buildings and ruins are still not obstacles (the plan's v1
+gap; the `sitePadAt` mask is the cheap fix if it shows). `.svedit` layers and
+dungeon floors are D1b. Ticket batches and the shoreline disagreement (2, 4).
+Distant villagers do not walk schedules (D5) and promotion keeps D0's
+`catchUp = true` -- D5 must turn it off for creatures that walked
+(`movedWhileDistant` is the flag to read). The awake step cost (14).
+
 ## 7. Audit 2026-10-15: what changed and why
 
 The 2026-10-13 plan was audited against the code at `79f8f21` (157 commits
