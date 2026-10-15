@@ -11391,6 +11391,61 @@ proud of the widest FILLED column, and a thumb at an absolute row instead of
 proud of the front-most filled cell. The anatomy peel needs a solid volume, and
 a detached speckle becomes a floating scrap of flesh in the world.
 
+#### The fine face and the skin pass (2026-10-15)
+
+Every humanoid ships at 80 art vox/m, but a generated body is AUTHORED at 40
+(`AUTHORED_VOXELS_PER_METRE`) and block-replicated (`SKIN_UPSCALE` 2), so every
+painted cell is a 2x2x2 block. The races with a surface pass (goblin, demon,
+naga, the robots, the sylvan's bark) paint on the shipped lattice after the
+upscale; the human had none, so its eye was a 25 mm square and its mouth a
+25 mm bar, and the owner saw goblins as "twice as detailed" — at the face, they
+were. Nothing about storage or rendering changes: the human already paid for
+12.5 mm cells and was using them as 25 mm ones.
+
+- **`headVoxFine`** builds a HUMAN's head on the shipped lattice. The skull,
+  cap, mane and knot are `headVox`'s own expressions evaluated at the centre of
+  each shipped cell (the same shape sampled twice as finely, so no stair steps
+  and a hairline that moves in half rows); the face is redrawn at 12.5 mm: a
+  lash line over white–iris–white, a nose with a straight profile (bridge one
+  cell out, bulb two, filled back to the face), nostrils, a mouth line bent
+  along a curve with a lip above and below, brows that taper to the tail,
+  ears with a rim and a hollow, a beard whose density is per fine cell
+  (stubble at last). Every gene keeps its authored-unit meaning; the integer
+  face rows take HALF steps on a human (`fineStep`, `specStep`), one shipped
+  cell each, and stay whole on every other race (`coerceGene`). Ten new rows
+  (`eyeOpen`, `eyeTilt`, `lashes`, `lidCrease`, `noseBridge`, `noseBulb`,
+  `body.skin.*`) are `late`: appended to `GENE_SPECS` and rolled after every
+  other draw, so no seeded litter or pinned random body moved.
+- **`humanSkinPass`** runs on every part of a human after the upscale and
+  PAINTS ONLY — no cell added or removed, so armour boxes, the collider, the
+  anchors and the left/right mirror are untouched (`test_mobgen.mjs` §T
+  asserts the body below the neck has exactly the old cells): fingers, nails,
+  knuckles, toes, a kneecap, the elbow crease, collarbones, a navel, the line
+  under a man's chest, a one-cell checker where `shadeBack`'s dark half
+  begins, `texture` mottle and `moles`.
+- **Four detail art slots** (`ART.FACE_SHADE` 201, `FACE_LIGHT` 200,
+  `EYE_WHITE` 199, `LASH` 198). Three are an existing colour under a new number
+  (skinShade, skinLight, hairShade), which costs the shared art palette nothing
+  (it dedupes by RGB and merges only painted slots) and says two things the old
+  numbers could not: `hairMass` reads `SKIN_LIGHT` on a head as scalp and roots
+  hair on it, and the Characters page draws a family's shade/light slots in
+  the base colour, which had made every painted freckle and line invisible
+  there. `EYE_WHITE` is one constant colour for the whole cast (one merged slot).
+- **Races are untouched**: `isFineFace` is `race === 'human'`, and every race's
+  surface pass still reads `headVox`'s face. **`generateMob(…, { face:
+  'legacy' })`** builds a human the old way; the Characters page's **faces:
+  new / OLD** button (key `` ` ``) flips every preview between the two for
+  comparison. It is a view only — a save always writes the fine face.
+- The 10 named humans were re-baked with `gen_mobs.mjs --rebake` and the 20
+  pool bodies with the new **`bake_human_pool.mjs --rebake`** (each from the
+  genome in its own sidecar; the plain run re-rolls the population). Four pool
+  bodies' art (f02, f08, m04, m08) did not match what their own genomes
+  generate before the re-bake (cause not traced; their sidecars did match, so
+  the likeliest is a sidecar-only re-diff that left the art stale), and
+  `shana`'s torso had 34 cells of bra the current generator no longer paints;
+  all now match. `assets/mobs/human.vox`, the hand-authored base (player model), has no
+  genome and its own palette, and is NOT converted.
+
 ---
 
 ## 8. Player & Projectiles

@@ -2219,6 +2219,137 @@ section('S. the goblin: small, big-headed flesh on the SAME rig, its own height 
   }
 }
 
+section('T. the fine face and the skin pass: a human drawn at the shipped lattice');
+{
+  // A HUMAN's head is built on the 80 vox/m lattice (headVoxFine) and its body
+  // painted there (humanSkinPass); `face: 'legacy'` builds the old head, which
+  // is what the Characters page's old/fine toggle shows. What must hold:
+  const opts = { materials, player: tuning.player, avatar: avatarConstants() };
+  const A = mg.ART;
+  const DETAIL = new Set([A.FACE_SHADE, A.FACE_LIGHT, A.EYE_WHITE, A.LASH]);
+  const partsOf = b => Object.fromEntries(b.parts.map(p => [p.name, p]));
+  const shapeOf = p => p.cells.map(c => c.slice(0, 3).join(',')).sort().join(';');
+  const paintOf = p => p.cells.map(c => c.join(',')).sort().join(';');
+  const def = mg.defaultGenome();
+  const fine = mg.generateMob(def, 0, opts), old = mg.generateMob(def, 0, { ...opts, face: 'legacy' });
+  const F = partsOf(fine), O = partsOf(old);
+
+  // 1. Both build sound, and the head keeps its BOX (every helm is fit to it).
+  ok(mg.validateMob(fine).length === 0 && mg.validateMob(old).length === 0,
+     'the fine and the old human both pass the structural asserts');
+  ok(F.head.size.join() === O.head.size.join() && F.head.mn.join() === O.head.mn.join(),
+     'the fine head has the old head’s box', `${F.head.size} vs ${O.head.size}`);
+  ok(paintOf(F.head) !== paintOf(O.head), 'the fine head is not the old one');
+  ok(F.head.cells.some(c => c[3] === A.EYE_WHITE) && F.head.cells.some(c => c[3] === A.LASH),
+     'a fine face has eye whites and a lash line by default');
+  ok(!O.head.cells.some(c => DETAIL.has(c[3])), 'the old face paints no detail slot');
+
+  // 2. THE SKIN PASS IS PAINT. Below the neck the fine body has exactly the old
+  //    body's cells -- armour, the collider, anchors and the mirror all ride on
+  //    that -- and it does repaint some of them.
+  let moved = 0, repainted = 0;
+  for (const nm of Object.keys(O)) {
+    if (nm === 'head') continue;
+    if (shapeOf(F[nm]) !== shapeOf(O[nm])) moved++;
+    if (paintOf(F[nm]) !== paintOf(O[nm])) repainted++;
+  }
+  ok(moved === 0, 'the skin pass adds and removes no cell anywhere', `${moved} parts moved`);
+  ok(repainted >= 10, 'the skin pass paints most of the body', `${repainted} parts`);
+  ok(F['hand.L'].cells.some(c => c[3] === A.NAIL) && F['foot.R'].cells.some(c => c[3] === A.NAIL),
+     'hands and feet get nails');
+  const noDetail = mg.normalizeGenome({ body: { skin: { detail: 0, texture: 0, moles: 0 } } });
+  ok(!mg.generateMob(noDetail, 0, opts).parts.filter(p => p.name !== 'head')
+       .some(p => p.cells.some(c => DETAIL.has(c[3]) || c[3] === A.NAIL)),
+     'skin detail, texture and moles at 0 paint nothing below the neck');
+
+  // 3. THE FINE FACE IS SYMMETRIC in shape on a symmetric genome: every lever
+  //    that is not a side (the parting, the smirk, the offset, the scar) high.
+  const sym = mg.normalizeGenome({ face: { brow: true, browProud: true, nose: 2.5,
+    noseWidth: 2, noseBridge: 1, noseBulb: 1, earSize: 2, earPoint: true,
+    eyeCols: 2, eyeWhites: true, eyeOpen: 1, eyeTilt: 1, lashes: 1, lips: 2 } });
+  const H = partsOf(mg.generateMob(sym, 0, opts)).head;
+  const set = new Set(H.cells.map(c => c.slice(0, 3).join(',')));
+  const sx = H.size[0];
+  const unmatched = H.cells.filter(([x, y, z]) => !set.has(`${sx - 1 - x},${y},${z}`)).length;
+  ok(unmatched === 0, 'the fine head is an exact left/right mirror in shape',
+     `${unmatched} cells unmatched`);
+
+  // 4. EVERY NEW GENE AND EVERY HALF STEP MOVES A CELL of a human's head --
+  //    a half step that renders like its neighbour is a slider that lies.
+  const head = g => paintOf(partsOf(mg.generateMob(g, 0, opts)).head);
+  const browOn = { brow: true };
+  const LEVERS = [
+    ['face.eyeOpen', 0.9], ['face.eyeTilt', 0.8], ['face.eyeTilt', -0.8],
+    ['face.lashes', 0], ['face.lashes', 0.9], ['face.lidCrease', 0.7],
+    ['face.eyeRow', 0.5], ['face.eyeCols', 1.5], ['face.mouthWidth', 2.5],
+    ['face.mouthDrop', 3.5], ['face.mouthOpen', 0.5], ['face.lips', 0.5],
+    ['face.lips', 1.5], ['face.earSize', 1.5], ['face.browThick', 1.5],
+    ['face.browHeight', 0.5], ['face.browInner', 1.5], ['face.browOuter', 0.5],
+    ['face.mouthShift', 0.5], ['body.skin.blush', 0.6], ['body.skin.moles', 1],
+  ];
+  for (const [path, v] of LEVERS) {
+    const base = mg.normalizeGenome({ face: path.startsWith('face.brow') ? browOn : {} });
+    const g = mg.normalizeGenome(base);
+    mg.setPath(g, path, v);
+    const n = mg.normalizeGenome(g);
+    ok(mg.getPath(n, path) === v, `${path} keeps ${v} on a human (the half step)`,
+       `normalised to ${mg.getPath(n, path)}`);
+    ok(head(n) !== head(base), `fine lever ${path} = ${v} moves a cell`);
+  }
+  // A low mouth, so the nose has rows to grow into: it stops two rows above the
+  // mouth line, and at the default mouth anything past 1.5 is that stop.
+  const nosed = mg.normalizeGenome({ face: { nose: 2, mouthDrop: 4.5 } });
+  for (const [path, v] of [['face.nose', 1.5], ['face.noseWidth', 1.5],
+                           ['face.noseBridge', 0.9], ['face.noseBridge', 0.1],
+                           ['face.noseBulb', 0.9]]) {
+    const g = mg.normalizeGenome(nosed);
+    mg.setPath(g, path, v);
+    ok(head(mg.normalizeGenome(g)) !== head(nosed), `fine lever ${path} = ${v} moves a cell`);
+  }
+  ok(head(mg.normalizeGenome({ body: { skin: { texture: 0.8 } } })) !== head(mg.defaultGenome()),
+     'skin texture reaches the face');
+
+  // 5. THE RACES ARE UNTOUCHED: a half step is a whole one on them, their
+  //    slider steps are whole, the human's new rows do not show, and they
+  //    paint no detail slot.
+  for (const race of mg.RACES.filter(r => r !== 'human')) {
+    const g = mg.presetGenome(race);
+    const spec = mg.GENE_SPECS.find(s => s.path === 'face.eyeRow');
+    mg.setPath(g, 'face.eyeRow', 0.5);
+    const n = mg.normalizeGenome(g);
+    ok(Number.isInteger(n.face.eyeRow), `${race}: a half-step eye row rounds to a whole one`);
+    ok(mg.specStep(spec, n) === 1, `${race}: the eye-row slider steps whole rows`);
+    ok(!mg.GENE_SPECS.some(s => s.late && mg.specApplies(s, n)),
+       `${race}: none of the fine face's rows show`);
+    const b = mg.generateMob(n, 0, opts);
+    ok(!b.parts.some(p => p.cells.some(c => DETAIL.has(c[3]))),
+       `${race}: paints no fine-face detail slot`);
+  }
+  ok(mg.specStep(mg.GENE_SPECS.find(s => s.path === 'face.eyeRow'), def) === 0.5,
+     'a human’s eye-row slider takes half steps');
+
+  // 6. THE PALETTE: the detail slots are written for a human only, and three
+  //    of the four are colours the human already has (no new merged slot).
+  const pal = mg.paletteBytes(materials, def.colors, 'human');
+  const hexAt = s => '#' + [0, 1, 2].map(i => pal[(s - 1) * 4 + i].toString(16).padStart(2, '0')).join('');
+  ok(hexAt(A.FACE_SHADE) === def.colors.skinShade && hexAt(A.FACE_LIGHT) === def.colors.skinLight &&
+     hexAt(A.LASH) === def.colors.hairShade && hexAt(A.EYE_WHITE) === mg.EYE_WHITE_HEX,
+     'the detail slots carry the skin, hair and eye-white colours');
+  // (No palette assertion for the races: paletteBytes fills the low end with
+  // MATERIAL colours, and with 200+ materials those spill into 128..255. The
+  // engine merges only slots a voxel paints (MicroBodyMergeArt `used`), so
+  // what counts is section 5's "paints no detail slot".)
+
+  // 7. THE OLD FACE IS STILL THE OLD FACE: on the old path a human's half
+  //    steps are as they were (whole cells), so the toggle compares like with
+  //    like -- and a rolled litter is unchanged by the late rows' arrival.
+  const r1 = mg.randomGenome(mg.makeRng(4242));
+  const late = mg.GENE_SPECS.filter(s => s.late).map(s => s.path);
+  const r1bare = JSON.parse(JSON.stringify(r1));
+  for (const p of late) mg.setPath(r1bare, p, mg.getPath(def, p));
+  ok(late.length === 10, 'ten late rows (the fine face’s and the skin’s)', String(late.length));
+}
+
 // =============================================================================
 
 if (fails) {

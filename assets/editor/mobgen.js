@@ -88,6 +88,7 @@ import * as DM from './demon.js';
 import * as NG from './naga.js';
 import * as GB from './goblin.js';
 import * as SE from './serpent.js';
+import { vnoise } from './robotkit.js';
 
 /** THE MACHINE RACES (automaton.js, android.js), by race key. Everything such
  *  a race contributes reaches the generator through this table and ONE
@@ -307,7 +308,44 @@ export const ART = {
   // when a face paints it (lipUsed), so a body without coloured lips spends
   // no slot of the engine's shared art palette on it.
   LIP: 217,
+  // THE HUMAN'S DETAIL SLOTS (2026-10-15), below the goblin's: what the FINE
+  // face and the skin pass paint with (headVoxFine, humanSkinPass). Three of
+  // the four are an EXISTING colour under a new number, which costs the
+  // engine's shared art palette nothing (MicroBodyMergeArt dedupes by RGB) and
+  // buys two things the old numbers cannot say:
+  //  - hairMass reads SKIN_LIGHT on the head as SCALP showing through thin
+  //    hair and roots the mass on it, so a highlight painted in SKIN_LIGHT on
+  //    a cheek is a place hair may grow. FACE_LIGHT is the same colour and is
+  //    never scalp.
+  //  - the Characters page draws a family's shade/light slots in the BASE
+  //    colour (breed.js slotRGB: the painter's own face shading is its depth
+  //    cue), which made every painted freckle, line and nostril invisible in
+  //    the creator. These four are drawn as themselves.
+  // EYE_WHITE is the one new colour, and it is ONE colour for every human
+  // (EYE_WHITE_HEX), so the whole cast spends one merged slot on it.
+  FACE_SHADE: 201,   // = skinShade: lines, creases, nostrils, a soft mouth
+  FACE_LIGHT: 200,   // = skinLight: highlights, a lit lip, a scar
+  EYE_WHITE: 199,    // the whites of the eyes, and teeth in an open mouth
+  LASH: 198,         // = hairShade: the lash line over each eye, moles
 };
+
+/** The whites of every human's eyes: one colour for the whole cast (see
+ *  ART.EYE_WHITE). A warm off-white, because a pure white sclera next to
+ *  skin reads as a glowing eye under the engine's lighting. */
+export const EYE_WHITE_HEX = '#ddd5c8';
+
+/** Detail slot -> colour, DERIVED from the genome's own colours (see the
+ *  ART note above). Written into a palette for a human only, the one race
+ *  that paints them (paletteBytes); the Characters page draws them from here
+ *  so its preview and the file agree. */
+export function detailColors(colors) {
+  return {
+    [ART.FACE_SHADE]: colors.skinShade,
+    [ART.FACE_LIGHT]: colors.skinLight,
+    [ART.EYE_WHITE]: EYE_WHITE_HEX,
+    [ART.LASH]: colors.hairShade,
+  };
+}
 
 /** Coverage of each wisp tier, 0..255. The steps are even in how THIN they
  *  read rather than in the number: the eye barely separates 200 from 255, so
@@ -572,6 +610,14 @@ export function defaultGenome() {
        *  shoulder to pelvis -- and normalizeGenome rescales it to the stock
        *  sum, which keeps its ratios and so rebuilds it cell-identical. */
       armLengths: 1,
+      /** THE SKIN (humanSkinPass, 2026-10-15; a human's only). Paint at the
+       *  shipped lattice, never geometry, so armour fits whatever is set. */
+      skin: {
+        texture: 0.15,  // a fine mottle of the shade and lit tones
+        detail: 0.6,    // fingers, nails, knuckles, toes, knees, collarbones, navel
+        blush: 0,       // the lip colour over the cheeks (and, strong, the nose)
+        moles: 0.1,     // a few dark marks on bare skin
+      },
     },
 
     /** Silhouette multipliers on the authored radius profiles. 1.0 is the
@@ -664,6 +710,16 @@ export function defaultGenome() {
       beardLen: 0,      // real hair hanging off the chin: 1 reaches the waist
       beardPoint: 0,    // the hanging beard tapers to a point
       beardFork: false, // ...to two points
+      // ---- 2026-10-15: THE FINE FACE's own genes (headVoxFine; a human's
+      // only). These defaults are the fine face as first drawn, and a genome
+      // written before them takes them, which is how every saved human gets
+      // eyes, a nose and a lash line on its next rebake.
+      eyeOpen: 0.4,     // 0 narrow .. 1 round: past 0.7 the eye is two rows
+      eyeTilt: 0,       // -1 outer corners down .. 1 up
+      lashes: 0.5,      // the lash line: none .. a line .. heavy with a flick
+      lidCrease: 0.25,  // a shaded line over the lashes: deep-set eyes
+      noseBridge: 0.5,  // 0 a button (tip only) .. 1 a bridge up between the eyes
+      noseBulb: 0.3,    // the tip: flat .. a round bulb .. a wide one
     },
 
     /** HAIR IS A FUNCTION, not a texture: `back`/`front` are the z at or above
@@ -991,19 +1047,26 @@ export const GENE_GROUPS = [
           'the arm itself, so a big arm hangs a little further out.' },
   { key: 'face', title: 'head and face',
     note: 'A face here is about twenty voxels across, so small moves read ' +
-          'large. The side view is where the skull shape shows.' },
+          'large. The side view is where the skull shape shows. A HUMAN\u2019s ' +
+          'face is drawn at full resolution (12.5 mm cells) and its sliders ' +
+          'take half steps, a cell each; other races paint at half that.' },
   { key: 'brows', title: 'eyebrows',
     note: 'Painted over the eyes in the hair colour (or the tone picked ' +
-          'here). Every row below needs the eyebrows box ticked; one cell ' +
-          'here ships as a 2x2 block, so a brow is two or three cells long.' },
+          'here). Every row below needs the eyebrows box ticked. A step is ' +
+          'two cells; on a human a half step is one, and the brow tapers ' +
+          'to its tail.' },
   { key: 'mouth', title: 'mouth',
-    note: 'A line of paint a couple of cells long, so expression is corners: ' +
+    note: 'A line of paint a few cells long, so expression is corners: ' +
           'curve turns both ends, skew lifts one. Opening it paints dark rows ' +
-          'under the line.' },
+          'under the line. On a human the line bends along a curve and the ' +
+          'lips sit above and below it.' },
   { key: 'details', title: 'face details',
     note: 'Nose and ears are real geometry (a cell standing proud of the ' +
           'face); the rest is paint in the skin tones -- shade for hollows, ' +
           'lines and freckles, the lit tone for highlights and scars.' },
+  { key: 'skin', title: 'skin',
+    note: 'Painted at full resolution over the whole body, never geometry, ' +
+          'so armour still fits. Humans only.' },
   { key: 'beard', title: 'facial hair',
     note: 'Pick a style to set everything below, then drag. The beard is ' +
           'paint on the lower face built from regions -- moustache, chin, ' +
@@ -1254,13 +1317,20 @@ export const GENE_SPECS = [
   { path: 'face.eyeRow', label: 'eye height', group: 'face',
     hint: 'Nudges the eyes one row up or down from where the skull puts ' +
           'them. Up is a high brow, down is a heavy one.',
-    min: -1, max: 1, step: 1, int: true, sigma: 0.5 },
+    min: -1, max: 1, step: 1, int: true, fineStep: 0.5, sigma: 0.5,
+    fineHint: 'Moves the eyes up or down a row at a time from where the ' +
+              'skull puts them. Up is a high brow, down is a heavy one.' },
   { path: 'face.eyeCols', label: 'eye size', group: 'face',
     hint: 'Columns painted per eye. 1 is a dot, 2 is a wide stare.',
-    min: 1, max: 2, step: 1, int: true, sigma: 0.4 },
+    min: 1, max: 2, step: 1, int: true, fineStep: 0.5, sigma: 0.4,
+    fineHint: 'How wide each eye is. 1 is an iris with a white either side; ' +
+              '1.5 widens the iris; 2 adds a white at the outer corner.' },
   { path: 'face.eyeWhites', label: 'eye whites', group: 'face', kind: 'bool',
     hint: 'A lit cell outward of each pupil, so the eye reads as an eye ' +
           'rather than a dot.',
+    fineLabel: 'wide eyes',
+    fineHint: 'One more white at the outer corner of each eye: a wider, ' +
+              'more open stare. (A human\u2019s eyes always have whites.)',
     roll: 0.3, sigma: 0.1 },
   { path: 'face.eyeBags', label: 'under-eyes', group: 'face',
     hint: 'Shade under the eyes: tired, old, or hard-living. Past halfway ' +
@@ -1275,17 +1345,20 @@ export const GENE_SPECS = [
   { path: 'face.browHeight', label: 'height', group: 'brows',
     hint: 'Rows above where the brow normally sits. Down is a heavy, ' +
           'hooded look; up is surprise.',
-    min: -1, max: 2, step: 1, int: true, sigma: 0.4 },
+    min: -1, max: 2, step: 1, int: true, fineStep: 0.5, sigma: 0.4 },
   { path: 'face.browThick', label: 'thickness', group: 'brows',
     hint: 'Rows of brow. 1 is a line, 3 is bushy.',
-    min: 1, max: 3, step: 1, int: true, sigma: 0.4 },
+    fineHint: 'How thick the brow is at its thickest, two rows a step; the ' +
+              'outer third (the tail) is always a row thinner. 1 is two ' +
+              'rows, 3 is bushy.',
+    min: 1, max: 3, step: 1, int: true, fineStep: 0.5, sigma: 0.4 },
   { path: 'face.browInner', label: 'inner reach', group: 'brows',
     hint: 'Cells past the eye toward the nose. At 3 the two brows meet in ' +
           'the middle: a unibrow.',
-    min: 0, max: 3, step: 1, int: true, sigma: 0.4 },
+    min: 0, max: 3, step: 1, int: true, fineStep: 0.5, sigma: 0.4 },
   { path: 'face.browOuter', label: 'outer reach', group: 'brows',
     hint: 'Cells past the eye toward the temple.',
-    min: 0, max: 2, step: 1, int: true, sigma: 0.4 },
+    min: 0, max: 2, step: 1, int: true, fineStep: 0.5, sigma: 0.4 },
   { path: 'face.browTilt', label: 'tilt', group: 'brows',
     hint: 'Below 0 the inner ends drop into a frown (stern, angry); above ' +
           '0 they lift (worried, sad). A cell of slope needs a brow at ' +
@@ -1312,15 +1385,18 @@ export const GENE_SPECS = [
   // ---- mouth ----
   { path: 'face.mouthWidth', label: 'width', group: 'mouth',
     hint: 'How far the mouth line runs. 1 is a dot, 4 spans the face.',
-    min: 1, max: 4, step: 1, int: true, sigma: 0.6 },
+    fineHint: 'How far the mouth line runs, two cells a step; a half step ' +
+              'ends it in a pair of soft corners. 1 is a small mouth, 4 ' +
+              'spans the face.',
+    min: 1, max: 4, step: 1, int: true, fineStep: 0.5, sigma: 0.6 },
   { path: 'face.mouthDrop', label: 'height', group: 'mouth',
     hint: 'How far below the eyes the mouth sits. Bigger drops lengthen the ' +
           'face and shorten the chin under it.',
-    min: 2, max: 5, step: 1, int: true, sigma: 0.6 },
+    min: 2, max: 5, step: 1, int: true, fineStep: 0.5, sigma: 0.6 },
   { path: 'face.mouthShift', label: 'offset', group: 'mouth',
     hint: 'Moves the mouth a cell to one side. Off-centre reads as a ' +
           'crooked, lived-in face.',
-    min: -1, max: 1, step: 1, int: true, roll: 0.25, sigma: 0.2 },
+    min: -1, max: 1, step: 1, int: true, fineStep: 0.5, roll: 0.25, sigma: 0.2 },
   { path: 'face.mouthCurve', label: 'smile', group: 'mouth',
     hint: 'Above 0 a corner cell turns up past each end of the mouth (a ' +
           'smile); below 0 it turns down (a frown). Past 0.7 on a wide ' +
@@ -1332,7 +1408,9 @@ export const GENE_SPECS = [
     min: -1, max: 1, step: 0.1, roll: 0.4, sigma: 0.25 },
   { path: 'face.mouthOpen', label: 'open', group: 'mouth',
     hint: 'Rows of open mouth under the line, painted dark.',
-    min: 0, max: 2, step: 1, int: true, roll: 0.2, sigma: 0.3 },
+    fineHint: 'Rows of open mouth under the line. From 1 the first row is ' +
+              'the upper teeth.',
+    min: 0, max: 2, step: 1, int: true, fineStep: 0.5, roll: 0.2, sigma: 0.3 },
   { path: 'face.mouthTone', label: 'line colour', group: 'mouth',
     kind: 'enum',
     hint: 'The mouth line in the skin shade (soft) or the eye colour (a ' +
@@ -1341,7 +1419,10 @@ export const GENE_SPECS = [
   { path: 'face.lips', label: 'lips', group: 'mouth',
     hint: 'A row under the mouth for the lower lip; 2 paints the upper lip ' +
           'too. Hidden under a moustache.',
-    min: 0, max: 2, step: 1, int: true, sigma: 0.3 },
+    fineHint: '0.5 the middle of the lower lip, 1 all of it, 1.5 adds a ' +
+              'cupid\u2019s bow over the line, 2 both lips full. Hidden under ' +
+              'a moustache.',
+    min: 0, max: 2, step: 1, int: true, fineStep: 0.5, sigma: 0.3 },
   { path: 'face.lipTone', label: 'lip colour', group: 'mouth', kind: 'enum',
     hint: 'lit: the skin\'s lit tone (the old lips). shade: the skin\'s shade, ' +
           'a deeper version of it. colour: the lip swatch -- a deeper skin ' +
@@ -1359,13 +1440,20 @@ export const GENE_SPECS = [
   { path: 'face.nose', label: 'nose length', group: 'details',
     hint: 'Rows of nose standing a cell proud of the face, down from the ' +
           'eye row. It stops above the mouth however long you ask for.',
-    min: 0, max: 3, step: 1, int: true, sigma: 0.4 },
+    fineHint: 'How far the nose runs down from the eyes, a row a half step. ' +
+              'It always stops two rows above the mouth. 0 is two nostrils ' +
+              'and no nose.',
+    min: 0, max: 3, step: 1, int: true, fineStep: 0.5, sigma: 0.4 },
   { path: 'face.noseWidth', label: 'nose width', group: 'details',
     hint: '1 is a narrow two-cell nose, 2 a broad four-cell one.',
-    min: 1, max: 2, step: 1, int: true, sigma: 0.3 },
+    fineHint: '1 is a narrow tip, 1.5 flares the nostrils, 2 is broad all ' +
+              'the way down.',
+    min: 1, max: 2, step: 1, int: true, fineStep: 0.5, sigma: 0.3 },
   { path: 'face.earSize', label: 'ears', group: 'details',
     hint: 'Rows of ear: 0 small, 1 as drawn, 2 large.',
-    min: 0, max: 2, step: 1, int: true, sigma: 0.3 },
+    fineHint: 'Rows of ear, a row a half step: 0 small, 1 as drawn, 2 large. ' +
+              'From 1.5 the back rim stands out from the head.',
+    min: 0, max: 2, step: 1, int: true, fineStep: 0.5, sigma: 0.3 },
   { path: 'face.earPoint', label: 'pointed ears', group: 'details',
     kind: 'bool',
     hint: 'A point on top of each ear -- elf, goblin.',
@@ -1408,7 +1496,7 @@ export const GENE_SPECS = [
   { path: 'face.beardJaw', label: 'jaw line', group: 'beard',
     hint: 'Rows of beard along the jaw, added to or taken from what the ' +
           'amount gives. -4 clears the jaw: goatees and circle beards.',
-    min: -4, max: 3, step: 1, int: true, sigma: 0.6 },
+    min: -4, max: 3, step: 1, int: true, fineStep: 0.5, sigma: 0.6 },
   { path: 'face.beardCheek', label: 'cheeks', group: 'beard',
     hint: 'How far up the cheeks it grows. 0 follows the amount (cheeks ' +
           'fill only on a full beard); 1 always fills to the cheekbone; -1 ' +
@@ -1463,7 +1551,7 @@ export const GENE_SPECS = [
     min: 2, max: 99, uiMax: 14, step: 0.5, sigma: 1.0 },
   { path: 'hair.length', label: 'mane length', group: 'hair',
     hint: 'Hair hanging below the skull, down the neck. 0 is a close cap.',
-    min: 0, max: 14, step: 1, int: true, sigma: 1.5 },
+    min: 0, max: 14, step: 1, int: true, fineStep: 0.5, sigma: 1.5 },
   { path: 'hair.knot', label: 'topknot', group: 'hair', kind: 'bool',
     hint: 'A nub of hair above the crown.',
     sigma: 0.15 },
@@ -1677,6 +1765,64 @@ GENE_SPECS.splice(GENE_SPECS.findIndex(sp => sp.group === 'colour'), 0,
                   ...DM.GENE_SPECS, ...NG.GENE_SPECS, ...SE.GENE_SPECS,
                   ...GB.GENE_SPECS);
 
+/** THE FINE FACE'S AND THE SKIN'S OWN ROWS (2026-10-15), a human's only.
+ *  APPENDED, not interleaved with the face rows they sit beside on the page
+ *  (a group shows its rows in this array's order, so they still land at the
+ *  end of their groups): mutate and cross draw in array order, so a row in
+ *  the middle would shift every later draw and re-roll every seeded litter
+ *  and every pinned random body. `late` keeps them out of randomGenome's main
+ *  loop too, which draws again after it (the sex, the hairstyle); they are
+ *  rolled at its very end instead. */
+GENE_SPECS.push(
+  { path: 'face.eyeOpen', label: 'eye shape', group: 'face', race: 'human', late: true,
+    hint: 'Narrow to round. Below 0.7 the eye is one row, an almond under ' +
+          'its lashes; from 0.7 it is two rows with skin at its corners -- ' +
+          'round, open, young.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'face.eyeTilt', label: 'eye tilt', group: 'face', race: 'human', late: true,
+    hint: 'Lifts (above 0) or drops (below 0) the outer corner of each eye ' +
+          'by a row: upturned, cat-like eyes or sad, hooded ones.',
+    min: -1, max: 1, step: 0.05, roll: 0.4, sigma: 0.2 },
+  { path: 'face.lashes', label: 'lashes', group: 'face', race: 'human', late: true,
+    hint: 'The dark line over each eye, in the hair\u2019s shade. None, ' +
+          'then a line, then from 0.7 a flick past the outer corner and ' +
+          'from 0.85 a line under it too.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'face.lidCrease', label: 'lid crease', group: 'face', race: 'human', late: true,
+    hint: 'A shaded line over the lashes: deep-set eyes. From 0.6 it runs ' +
+          'past the outer corner, hooding it.',
+    min: 0, max: 1, step: 0.05, roll: 0.5, sigma: 0.15 },
+  { path: 'face.noseBridge', label: 'nose bridge', group: 'details',
+    race: 'human', late: true,
+    hint: 'How much nose stands between the tip and the eyes. Below 0.3 a ' +
+          'button (the tip alone); from 0.7 the bridge runs up between the ' +
+          'eyes. Side view.',
+    min: 0, max: 1, step: 0.05, sigma: 0.2 },
+  { path: 'face.noseBulb', label: 'nose tip', group: 'details', race: 'human', late: true,
+    hint: 'From 0.4 the tip stands a second cell proud (a bulb); from 0.8 its ' +
+          'bottom row widens too.',
+    min: 0, max: 1, step: 0.05, sigma: 0.2 },
+  { path: 'body.skin.detail', label: 'body detail', group: 'skin',
+    race: 'human', late: true,
+    hint: 'Fingers, nails and knuckles, toes and toenails, kneecaps, the ' +
+          'crease of each elbow, collarbones, a navel, and on a man the line ' +
+          'under the chest -- with the hard edge where the shadowed side ' +
+          'begins broken up. 0 turns it all off; past halfway the lines ' +
+          'gain their shadows.',
+    min: 0, max: 1, step: 0.05, sigma: 0.1 },
+  { path: 'body.skin.texture', label: 'texture', group: 'skin', race: 'human', late: true,
+    hint: 'A fine mottle of the shaded and lit skin tones, in patches. ' +
+          'A little reads as skin; a lot as weathered or blotched.',
+    min: 0, max: 1, step: 0.05, sigma: 0.1 },
+  { path: 'body.skin.blush', label: 'blush', group: 'skin', race: 'human', late: true,
+    hint: 'The lip colour dabbed over the cheeks, thinning to the edge: a ' +
+          'flush, cold, drink, rouge. Pick the lip colour to change it.',
+    min: 0, max: 1, step: 0.05, roll: 0.25, sigma: 0.1 },
+  { path: 'body.skin.moles', label: 'moles', group: 'skin', race: 'human', late: true,
+    hint: 'A few dark marks scattered over bare skin, face included.',
+    min: 0, max: 1, step: 0.05, roll: 0.5, sigma: 0.1 },
+);
+
 /** Does this row apply to this genome? (race-gated rows, see GENE_SPECS;
  *  `sex`-gated rows, the bra, show on that sex only) */
 export const specApplies = (spec, genome) =>
@@ -1687,9 +1833,18 @@ export const specApplies = (spec, genome) =>
   (!spec.sex ||
    spec.sex === ((genome && genome.body && genome.body.sex) || 'male'));
 
-/** The label and hint a row shows for this genome: a sylvan's skin is bark. */
+/** A numeric row's slider step FOR THIS GENOME: the half step (`fineStep`,
+ *  one shipped cell) on a fine-faced human, the row's own everywhere else. */
+export const specStep = (spec, genome) =>
+  (spec.fineStep && isFineFace(genome) ? spec.fineStep : spec.step);
+
+/** The label and hint a row shows for this genome: a sylvan's skin is bark,
+ *  and a human's face rows describe the fine face (`fineLabel`/`fineHint`). */
 export function specText(spec, genome) {
   const race = (genome && genome.body && genome.body.race) || 'human';
+  if ((spec.fineHint || spec.fineLabel) && isFineFace(genome))
+    return { label: spec.fineLabel || spec.label,
+             hint: spec.fineHint || spec.hint };
   if (race === 'sylvan' && spec.path.startsWith('colors.')) {
     const t = SY.COLOR_LABELS[spec.path.slice(7)];
     if (t) return { label: t[0], hint: t[1] };
@@ -1731,7 +1886,10 @@ function coerceGene(spec, v, fallback, g) {
   let n = Number(v);
   if (!Number.isFinite(n)) return fallback;
   if (spec.even) n = Math.max(2, Math.round(n / 2) * 2);
-  else if (spec.int) n = Math.round(n);
+  // A `fineStep` row is whole cells on every race but a fine-faced human,
+  // whose face is drawn at twice the resolution and takes the half step.
+  else if (spec.int) n = spec.fineStep && isFineFace(g)
+    ? Math.round(n / spec.fineStep) * spec.fineStep : Math.round(n);
   const [lo, hi] = specRange(spec, g);
   return clamp(n, lo, hi);
 }
@@ -1797,7 +1955,11 @@ export function deepLip(colors) {
 /** Does this face paint the lip slot? (paletteBytes writes it only then.) */
 export function lipUsed(g) {
   const f = g.face || {};
-  return (f.lips >= 1 && f.lipTone === 'colour') || !!f.lipLine;
+  // A fine face paints lips from half a step, and blush in the lip colour.
+  const fine = isFineFace(g);
+  const blush = fine && g.body && g.body.skin && g.body.skin.blush >= 0.1;
+  return (f.lips >= (fine ? 0.5 : 1) && f.lipTone === 'colour') ||
+         !!f.lipLine || !!blush;
 }
 
 /** Stock lip colours for the Characters page's swatches. `skin` is computed
@@ -1854,6 +2016,7 @@ export const SEX_FEMALE_DELTA = {
   'shape.legGirth': -0.03,
   'head.jaw': -0.1,
   'head.cheek': 0.03,
+  'face.lashes': 0.25,
 };
 
 /** Switch a genome's sex, moving the build genes by SEX_FEMALE_DELTA. A no-op
@@ -2286,7 +2449,7 @@ export function randomGenome(rng, locks, opts = {}) {
     // A SEX-GATED ROW (the bra) is rolled as a style at the end, not here:
     // `body.sex` is drawn earlier in this very loop, so a draw gated on it
     // would shift every draw after it whenever the sex came up female.
-    if (spec.sex || spec.styled) continue;
+    if (spec.sex || spec.styled || spec.late) continue;
     // A RARE FEATURE stays at its default unless its own draw comes up: a
     // scar, freckles or pointed ears on every other roll is not variety.
     if (spec.roll !== undefined && r() >= spec.roll) continue;
@@ -2356,6 +2519,19 @@ export function randomGenome(rng, locks, opts = {}) {
     if (!isLocked(locks, 'body.bra.bandPos'))
       g.body.bra.bandPos = clamp(g.body.bra.bandPos + (r() - 0.5) * 0.6,
                                  -1.5, 1);
+  }
+  // THE LATE ROWS (the fine face's, the skin's), after every draw above, so
+  // their arrival re-rolled no seeded body. Same rule as the main loop: a
+  // rare feature takes its own draw first, a number is pulled toward its
+  // default. A race that is not human takes no draw (specApplies).
+  for (const spec of GENE_SPECS) {
+    if (!spec.late || isLocked(locks, spec.path) || !specApplies(spec, g)) continue;
+    if (spec.roll !== undefined && r() >= spec.roll) continue;
+    if (spec.kind === 'bool') { setPath(g, spec.path, r() < 0.4); continue; }
+    if (spec.kind === 'enum') { setPath(g, spec.path, r.pick(spec.choices)); continue; }
+    const d = getPath(g, spec.path);
+    const t = (r() + r()) * 0.5;
+    setPath(g, spec.path, d + (t - 0.5) * 2 * Math.max(d - spec.min, spec.max - d));
   }
   return normalizeGenome(g);
 }
@@ -3540,6 +3716,863 @@ function headVox(g, size, ctx) {
     }
   }
   return flipY(size, out);
+}
+
+// =============================================================================
+// THE FINE HEAD (2026-10-15)
+//
+// A HUMAN's head is built ON THE SHIPPED LATTICE instead of on the authored
+// one and then doubled. Everything else on the figure is authored at 40 vox/m
+// and block-replicated to the 80 the engine draws (SKIN_UPSCALE), so a painted
+// cell is a 2x2x2 block -- an eye was a 25 mm square and a mouth a 25 mm bar --
+// while every race with a surface pass (goblin, demon, naga, the robots)
+// paints its face on the fine lattice. The owner saw it: goblins looked twice
+// as detailed as humans, and at the face they were.
+//
+//  - THE SKULL, CAP, MANE AND KNOT are headVox's shape SAMPLED TWICE AS
+//    FINELY rather than replicated: every test is headVox's own expression
+//    evaluated at the centre of a shipped cell (`ac`), so the head keeps its
+//    size and proportions and loses its stair steps, and the hairline moves
+//    in half rows.
+//  - THE FACE is drawn at shipped resolution: an eye is a lash line over
+//    white-iris-white, a nose has a bridge, a tip and nostrils, a mouth has
+//    corners that turn and lips above and below it, an ear has a rim and a
+//    hollow, a brow tapers to its tail.
+//  - EVERY GENE KEEPS ITS AUTHORED-UNIT MEANING (eyeDx 2.5 is still 2.5
+//    authored cells), so a genome builds the face it always did, finer. The
+//    integer face genes take HALF steps on a human (`fineStep`), which is one
+//    shipped cell each.
+//
+// RACES KEEP headVox: their surface passes are written against its painted
+// face. `opts.face = 'legacy'` builds a human the old way too, which is what
+// the Characters page's old/fine toggle compares against.
+//
+// Paint uses the detail slots (ART.FACE_SHADE ...) wherever headVox used
+// SKIN_SHADE / SKIN_LIGHT on the face; see the ART note for why.
+// =============================================================================
+
+/** Does this genome get the fine head and the skin pass? Humans only, unless
+ *  the caller asked for the old face (`opts.face === 'legacy'`). */
+export function isFineFace(g, opts) {
+  // A declaration, not a const: normalizeGenome (far above) asks it, and a
+  // module-level normalize would otherwise meet it in its dead zone.
+  return ((g && g.body && g.body.race) || 'human') === 'human' &&
+         !(opts && opts.face === 'legacy');
+}
+
+/** Every slot the fine face counts as SKIN: what a mark may paint over. */
+const FINE_SKIN = new Set([ART.SKIN_BASE, ART.SKIN_SHADE, ART.SKIN_LIGHT,
+                           ART.FACE_SHADE, ART.FACE_LIGHT]);
+
+/**
+ * @param g       normalized genome
+ * @param artSize the head's AUTHORED box (the limb table's); the cells come
+ *                back at SKIN_UPSCALE times it, front LOW y, like any part
+ *                after flipY + upscale
+ * @param ctx     the limb table plus `limbs`, as SHAPES get it
+ */
+function headVoxFine(g, artSize, ctx) {
+  const S = SKIN_UPSCALE;
+  const [ax, ay, az] = artSize;
+  const sx = ax * S, sy = ay * S, sz = az * S;
+  // A shipped cell's CENTRE in authored units: the `x + 0.5` every headVox
+  // test is written in.
+  const ac = X => (X + 0.5) / S;
+  const cx = ax * 0.5, cy = ay * 0.5;
+  const hcy = cy - g.head.skullBack * (ay / DEF.head.size[1]);
+  const eyeA = ctx.eyeZ - ctx.limbs.head.mn[2] + g.face.eyeRow;
+  if (!(eyeA >= 0 && eyeA < az))
+    throw new Error(`eye row ${eyeA} is outside the head model (0..${az - 1}); ` +
+                    `the head's scene z or its height moved without the eye ` +
+                    `metre contract following`);
+  const neckTop = Math.max(1, Math.round(2 * az / DEF.head.size[2]));
+  const skullLo = neckTop + 1;
+  const hm = g.head;
+  const mod = u => (u < 0.30 ? hm.jaw : u < 0.72 ? hm.cheek : hm.crown);
+  const prx = scaleKnots([[0.00, 2.3], [0.18, 3.4], [0.40, 4.2], [0.70, 4.3],
+                          [0.88, 3.8], [1.00, 2.4]], ax / DEF.head.size[0], mod);
+  const pry = scaleKnots([[0.00, 2.7], [0.18, 3.7], [0.45, 4.6], [0.75, 4.6],
+                          [1.00, 2.9]], ay / DEF.head.size[1], mod);
+  const neckR = 2.0 * (ax / DEF.head.size[0]);
+  // The profile past its last knot CONTINUES its last slope instead of
+  // holding: the fine top row sits a quarter row above headVox's, and
+  // holding the crown's radius there is a flat lid one cell rounder than it
+  // has any reason to be.
+  const profX = (u, pts) => {
+    if (u <= 1) return profile(u, pts);
+    const [u0, v0] = pts[pts.length - 2], [u1, v1] = pts[pts.length - 1];
+    return Math.max(0.6, v1 + (v1 - v0) / (u1 - u0) * (u - 1));
+  };
+
+  // ONE DENSE GRID, occupancy and paint together: the face below asks for the
+  // front of a column a few thousand times, which a cell list answers in O(n).
+  const col = new Uint8Array(sx * sy * sz);         // 0 = empty, else a slot
+  const at = (X, Y, Z) => (Z * sy + Y) * sx + X;
+  const inBox = (X, Y, Z) => X >= 0 && Y >= 0 && Z >= 0 &&
+                             X < sx && Y < sy && Z < sz;
+  const get = (X, Y, Z) => (inBox(X, Y, Z) ? col[at(X, Y, Z)] : 0);
+  const add = (X, Y, Z, c) => {
+    if (!inBox(X, Y, Z) || col[at(X, Y, Z)]) return false;
+    col[at(X, Y, Z)] = c;
+    return true;
+  };
+  const inEllipse = (X, Y, rx, ry) => {
+    if (rx <= 0 || ry <= 0) return false;
+    const dx = (ac(X) - cx) / rx, dy = (ac(Y) - hcy) / ry;
+    return dx * dx + dy * dy <= 1.0;
+  };
+
+  // ---- the hair function, headVox's own, at shipped resolution ------------
+  const hz = az / DEF.head.size[2], hy = ay / DEF.head.size[1];
+  const hBack = g.hair.back * hz, hFront = g.hair.front * hz;
+  const hairT = Y => clamp((ac(Y) - (hcy - 4.0 * hy)) / (8.0 * hy), 0.0, 1.0);
+  const skullR = Math.max(...prx.map(k => k[1]));
+  const bandHalf = g.hair.band * skullR;
+  const lineAt = (X, Y) => {
+    let line = hBack + (hFront - hBack) * hairT(Y);
+    if (g.hair.side)
+      line += g.hair.side * ((ac(X) - cx) / Math.max(bandHalf, 1)) * 3.0 * hz *
+              hairT(Y);
+    return line;
+  };
+  // headVox asks "z >= line" of a row's BOTTOM edge; Z / S is the fine row's.
+  const isHair = (X, Y, Z) => {
+    if (Math.floor(Z / S) < skullLo) return false;
+    if (Math.abs(ac(X) - cx) > bandHalf) return false;
+    return Z / S >= lineAt(X, Y);
+  };
+  const hg = g.hair;
+  const thinCap = hg.hairlineSoft > 0 || hg.topThin > 0 || hg.sideThin > 0;
+  const scalpShows = (X, Y, Z) => {
+    const axd = Math.abs(ac(X) - cx) / Math.max(skullR, 1);
+    let p = 0;
+    if (hg.hairlineSoft > 0) {
+      const dz = ac(Z) - lineAt(X, Y);
+      p = Math.max(p, hg.hairlineSoft * 0.85 * clamp(1 - dz / (3.5 * hz), 0, 1));
+      if (Math.abs(ac(X) - cx) > bandHalf - 1.5)
+        p = Math.max(p, hg.hairlineSoft * 0.5);
+    }
+    if (hg.topThin > 0) {
+      const u = clamp((ac(Z) - az * 0.62) / (az * 0.38), 0, 1);
+      p = Math.max(p, hg.topThin * 0.75 * u * (1 - 0.5 * clamp(axd, 0, 1)));
+    }
+    if (hg.sideThin > 0) {
+      const w = clamp((axd - 0.55) / 0.4, 0, 1) * (Z / S < az * 0.8 ? 1 : 0.4);
+      p = Math.max(p, hg.sideThin * 0.6 * w);
+    }
+    return p > 0 && hashN(X, Y, Z, 71) / 4294967296 < p;
+  };
+
+  // ---- the skull ------------------------------------------------------------
+  for (let Z = 0; Z < sz; Z++) {
+    let rx, ry;
+    if (Math.floor(Z / S) <= neckTop) { rx = neckR; ry = neckR; }
+    else {
+      // headVox's u at THIS cell's height: its rows sit at z, these at
+      // z - 0.25 and z + 0.25, so the radius steps twice as often.
+      const u = (ac(Z) - 0.5 - skullLo) / Math.max(az - 1 - skullLo, 1);
+      rx = profX(u, prx); ry = profX(u, pry);
+    }
+    for (let Y = 0; Y < sy; Y++)
+      for (let X = 0; X < sx; X++) {
+        if (!inEllipse(X, Y, rx, ry)) continue;
+        const back = ac(Y) < hcy - 1.5;
+        let c;
+        if (isHair(X, Y, Z))
+          c = thinCap && scalpShows(X, Y, Z) ? ART.SKIN_LIGHT
+            : back ? ART.HAIR_SHADE : ART.HAIR;
+        else c = back ? ART.SKIN_SHADE : ART.SKIN_BASE;
+        col[at(X, Y, Z)] = c;
+      }
+  }
+
+  // A MANE, headVox's: the skull's base ellipse continued down the nape, back
+  // half only. The same ellipse as the skull's lowest rows, so every mane cell
+  // has skull or mane straight above it -- connected by construction.
+  if (g.hair.length > 0 && hBack < az) {
+    const lz = g.hair.length * hz;
+    const rx = profile(0.0, prx), ry = profile(0.0, pry);
+    const Z0 = Math.max(0, Math.round((skullLo - lz) * S));
+    for (let Z = Z0; Z < skullLo * S; Z++)
+      for (let Y = 0; Y < sy; Y++)
+        for (let X = 0; X < sx; X++) {
+          if (!inEllipse(X, Y, rx, ry)) continue;
+          if (ac(Y) >= hcy - 1.0) continue;
+          add(X, Y, Z, ART.HAIR_SHADE);
+        }
+  }
+  // A TOPKNOT, headVox's: grown back off the back-most cell of each column
+  // near the crown (front is HIGH y in this frame, until the flip at the end).
+  if (g.hair.knot) {
+    const kd = Math.max(1, Math.round(2 * hy)) * S;
+    const x0 = (Math.floor(cx) - 1) * S, x1 = (Math.floor(cx) + 1) * S;
+    for (let X = x0; X < x1; X++)
+      for (let Z = sz - Math.max(2, Math.round(3 * hz)) * S; Z < sz; Z++) {
+        let backY = -1;
+        for (let Y = 0; Y < sy; Y++) if (get(X, Y, Z)) { backY = Y; break; }
+        if (backY <= 0) continue;
+        for (let d = 1; d <= kd && backY - d >= 0; d++)
+          add(X, backY - d, Z, ART.HAIR_SHADE);
+      }
+  }
+
+  const f = g.face;
+  const CX = sx / 2;                 // the midline, between columns CX-1 and CX
+  const mirror = X => sx - 1 - X;
+  const Ze = Math.round(S * eyeA);   // the eye's lower row: headVox's eye row's bottom
+  const sround = v => Math.sign(v) * Math.floor(Math.abs(v) + 0.5);
+  const rnd01 = (...v) => hashN(...v) / 4294967296;
+  const keyOf = (X, Y, Z) => at(X, Y, Z);
+  const earSet = new Set(), noseSet = new Set();
+
+  // ---- EARS: a rim and a hollow -------------------------------------------
+  // headVox's ear is one cell proud of the widest filled column over a band
+  // one authored cell deep. Here it is the same placement, a shipped cell
+  // deeper and in half rows: the rim (top, back edge, lobe) in the skin, the
+  // bowl inside it shaded, a lobe that narrows at the bottom and a helix that
+  // curls back at the top. Placed per (Y, Z) against the skull's own outermost
+  // cell, so a narrow skull's ear still touches it.
+  const earYA = pyRound(hcy) - 1;
+  const eY0 = earYA * S - 1, eY1 = earYA * S + S - 1;      // back .. front
+  const earTop = Math.floor(S * (eyeA + 1)) - 1;
+  const earH = Math.max(2, Math.round(S * (1 + f.earSize)));
+  const earBot = earTop - earH + 1;
+  const earTips = [[], []];                                 // per side: [X, Y, Z]
+  for (let Z = earBot; Z <= earTop; Z++) {
+    if (Z < 0 || Z >= sz) continue;
+    for (let Y = Math.max(0, eY0); Y <= Math.min(sy - 1, eY1); Y++) {
+      // The lobe is the middle of the band; the top row curls back.
+      if (Z === earBot && earH >= 3 && Y === eY0) continue;
+      if (Z === earTop && earH >= 3 && Y === eY1) continue;
+      let lo = -1, hi = -1;
+      for (let X = 0; X < sx; X++) if (get(X, Y, Z)) { if (lo < 0) lo = X; hi = X; }
+      if (lo < 0) continue;
+      const rim = Z === earTop || Z === earBot || Y === eY0 || Y === eY1;
+      const c = rim ? ART.SKIN_SHADE : ART.FACE_SHADE;
+      for (const [X, side] of [[lo - 1, 0], [hi + 1, 1]]) {
+        if (!add(X, Y, Z, c)) continue;
+        earSet.add(keyOf(X, Y, Z));
+        if (Z === earTop) earTips[side].push([X, Y, Z]);
+        // A BIG EAR STANDS OUT: the back rim takes a second cell outward.
+        if (f.earSize >= 1.5 && Y === eY0 && Z > earBot && Z < earTop) {
+          const X2 = side === 0 ? X - 1 : X + 1;
+          if (add(X2, Y, Z, ART.SKIN_SHADE)) earSet.add(keyOf(X2, Y, Z));
+        }
+      }
+    }
+  }
+  // AN ELF POINT: up off the back of each ear's top, sweeping back a cell.
+  if (f.earPoint)
+    for (const tips of earTips) {
+      if (!tips.length) continue;
+      const [X, Y0, Z0] = tips.reduce((a, b) => (b[1] < a[1] ? b : a));
+      let Y = Y0;
+      for (let d = 1; d <= 4; d++) {
+        if (d === 3 && Y - 1 >= 0) {
+          if (!add(X, Y - 1, Z0 + d - 1, ART.SKIN_SHADE)) break;
+          earSet.add(keyOf(X, Y - 1, Z0 + d - 1));
+          Y -= 1;
+        }
+        if (!add(X, Y, Z0 + d, ART.SKIN_SHADE)) break;
+        earSet.add(keyOf(X, Y, Z0 + d));
+      }
+    }
+
+  // ---- the face's paint helpers --------------------------------------------
+  // The FRONTMOST filled cell of column (X, Z) -- front is HIGH y here.
+  const frontY = (X, Z) => {
+    if (X < 0 || X >= sx || Z < 0 || Z >= sz) return -1;
+    for (let Y = sy - 1; Y >= 0; Y--) if (col[at(X, Y, Z)]) return Y;
+    return -1;
+  };
+  // Paint the front of (X, Z). `skinOnly` leaves hair, eyes and beard alone.
+  const paintAt = (X, Z, c, skinOnly) => {
+    const Y = frontY(X, Z);
+    if (Y < 0) return false;
+    const k = at(X, Y, Z);
+    if (skinOnly && !FINE_SKIN.has(col[k])) return false;
+    col[k] = c;
+    return true;
+  };
+  // Stand a cell one proud of the front of (X, Z).
+  const proud = (X, Z, c) => {
+    const Y = frontY(X, Z);
+    if (Y < 0 || Y + 1 >= sy || col[at(X, Y + 1, Z)]) return false;
+    col[at(X, Y + 1, Z)] = c;
+    noseSet.add(at(X, Y + 1, Z));
+    return true;
+  };
+  // Both sides at once: `fn(X)` for the LEFT feature and its mirror.
+  const both = (X, fn) => { fn(X); fn(mirror(X)); };
+
+  // ---- THE EYES' columns (painted later, placed now: everything keys off them)
+  // Per side the iris is centred on headVox's eye centre, cx -+ eyeDx, and
+  // flanked by a white on each side; a bigger eye widens the iris, the
+  // `eyeWhites` gene and the biggest size each add a white at the outer
+  // corner. Computed for the LEFT eye (low X) and mirrored, so the face is
+  // symmetric to the cell.
+  const eyeDxA = f.eyeDx * (ax / DEF.head.size[0]);
+  const iw = f.eyeCols >= 1.5 ? 2 : 1;
+  let i0 = Math.round(S * (cx - eyeDxA) - iw / 2);
+  const extra = Math.min(5 - iw - 2,
+                         (f.eyeCols >= 2 ? 1 : 0) + (f.eyeWhites ? 1 : 0));
+  // Keep the inner white clear of the midline by a cell (the bridge of the
+  // nose), and the outer corner inside the box.
+  i0 -= Math.max(0, (i0 + iw) - (CX - 2));
+  i0 += Math.max(0, 1 + extra - i0);
+  const eOut = i0 - 1 - extra, eIn = i0 + iw;               // outer, inner columns
+  const eyeRows = f.eyeOpen >= 0.7 ? 2 : 1;
+  const tilt = f.eyeTilt >= 0.35 ? 1 : f.eyeTilt <= -0.35 ? -1 : 0;
+  const dzOf = X => (X === eOut ? tilt : 0);                // the outer corner tilts
+  // A round eye's END columns stay one row: the corners of a 2-row eye are skin.
+  const rowsOf = X => (eyeRows === 2 && (X === eOut || X === eIn) &&
+                       eIn - eOut + 1 >= 4 ? 1 : eyeRows);
+  const lashRow = X => Ze + rowsOf(X) + dzOf(X);
+  const lashTop = Ze + eyeRows + Math.max(0, tilt);
+
+  // ---- the mouth's row and columns (painted later) --------------------------
+  const mzA = eyeA - f.mouthDrop;                     // headVox's mouth row
+  const Zm = Math.round(S * mzA) + 1;                 // the line: its upper half
+  const MC = CX + Math.round(S * f.mouthShift);       // between MC-1 and MC
+  const mHalf = Math.max(1, Math.floor(f.mouthWidth + 1e-9));
+  const softCorners = f.mouthWidth - mHalf >= 0.5 - 1e-9;
+
+  // ---- THE NOSE: a bridge, a tip and nostrils -------------------------------
+  // Rows count down from just under the eye line, headVox's band; the nose
+  // stops two rows above the mouth line so the upper lip has a row of its own.
+  // The room is there: headVox's face sits one AUTHORED cell short of the
+  // box's front, which is two shipped cells -- a bridge one cell proud and a
+  // tip two.
+  const nL = Math.max(0, Math.min(Math.round(S * f.nose), Ze - Zm - 2));
+  const tipHalf = f.noseWidth >= 2 ? 2 : 1;             // cells each side of CX
+  const tipLow = Ze - nL;                               // the tip's lowest row
+  const tipRows = nL >= 2 ? 2 : nL;
+  if (nL > 0) {
+    // A STRAIGHT PROFILE. Every nose cell is filled out to a fixed depth --
+    // one past the face at the eye row (its most forward point) for the
+    // bridge and the wings, two for a bulb -- rather than "one proud of
+    // whatever is there": the face falls away below the eyes, so a nose that
+    // followed it would be a ridge of bumps; one that holds its line projects
+    // further the lower it gets, which is what a nose does.
+    const yRef = Math.max(frontY(CX - 1, Ze), frontY(CX, Ze));
+    const yMax = sy - 1;
+    const fill = (X, Z, Yt) => {
+      const y0 = frontY(X, Z);
+      if (y0 < 0) return;
+      for (let Y = y0 + 1; Y <= Math.min(Yt, yMax); Y++)
+        if (add(X, Y, Z, ART.SKIN_BASE)) noseSet.add(at(X, Y, Z));
+    };
+    // The bridge, two cells wide, from between the eyes (or, on a lower
+    // bridge, from under them) down to the tip.
+    if (f.noseBridge >= 0.3) {
+      const zTop = f.noseBridge >= 0.7 ? Ze + 1 : Ze - 1;
+      for (let Z = tipLow + tipRows; Z <= zTop; Z++)
+        both(CX - 1, X => fill(X, Z, yRef + 1));
+    }
+    // The tip: two rows, wider at the bottom on a broad nose (the wings), and
+    // a second cell out at its centre -- the bulb -- unless it is flat.
+    const bulb = f.noseBulb >= 0.4 && tipRows >= 2;
+    for (let r = 0; r < tipRows; r++) {
+      const Z = tipLow + r;
+      const half = r === 0 && (f.noseWidth >= 1.5 || f.noseBulb >= 0.8)
+        ? Math.max(tipHalf, 2) : tipHalf;
+      for (let k = 1; k <= half; k++)
+        both(CX - k, X => fill(X, Z, yRef + (bulb && r === 1 && k === 1 ? 2 : 1)));
+    }
+  }
+
+  // ---- eyebrow cells: computed now (the ridge is geometry), painted last ----
+  const browCells = [];                                 // [X, Z]
+  // Two rows a step -- headVox's own thickness, so every half step is a row --
+  // with the tail a row thinner (below).
+  const browTR = Math.max(1, Math.round(S * f.browThick));
+  // A shipped row lower than headVox's brow (eye row + 2 authored): there, it
+  // sits on the hairline of most stock styles and is painted into the cap.
+  // The fine eye is one row plus its lashes, so one row of gap (the crease's)
+  // is enough above it.
+  const browZ0 = Math.max(lashTop + 1 + (f.lidCrease >= 0.2 ? 1 : 0),
+                          Ze + Math.round(S * (1.5 + f.browHeight)));
+  if (f.brow) {
+    // Outer end to inner end. The inner reach is not clamped at the eye: three
+    // cells of it meets its mirror at the midline, the unibrow.
+    const xOut = eOut - Math.round(S * f.browOuter);
+    const xIn = Math.min(CX - 1, eIn + Math.round(S * f.browInner) - 1);
+    const n = xIn - xOut + 1;
+    for (let X = xOut; X <= xIn; X++) {
+      const t = n > 1 ? (X - xOut) / (n - 1) : 0.5;           // 0 outer .. 1 inner
+      const off = sround(f.browTilt * t * 2.5) +
+                  sround(f.browArch * (1 - Math.abs(2 * t - 1)) * 2.5);
+      const z0 = Math.min(sz - 1, Math.max(lashTop + 1, browZ0 + off));
+      // The TAIL tapers: the outer third is a row thinner.
+      const rows = t < 0.3 ? Math.max(1, browTR - 1) : browTR;
+      for (let r = 0; r < rows; r++)
+        if (z0 + r < sz) both(X, XX => browCells.push([XX, z0 + r, r === 0]));
+    }
+    if (f.browProud)
+      for (const [X, Z, low] of browCells) if (low) proud(X, Z, ART.SKIN_BASE);
+  }
+  const browTop = browCells.length
+    ? Math.max(...browCells.map(c => c[1])) : browZ0 + browTR - 1;
+
+  // ---- skin marks: painted first, so beard, eyes, mouth and brows lie over --
+  const shade = (X, Z) => paintAt(X, Z, ART.FACE_SHADE, true);
+  const light = (X, Z) => paintAt(X, Z, ART.FACE_LIGHT, true);
+  // CHEEKS: a soft patch under the outer eye, lit (cheekbones) or shaded
+  // (hollows, set a row lower).
+  if (Math.abs(f.cheeks) >= 0.25) {
+    const big = Math.abs(f.cheeks) >= 0.6;
+    const rx = big ? 2.2 : 1.5, rz = big ? 1.6 : 1.0;
+    const pcx = eOut + 1.5, pcz = Ze - (f.cheeks > 0 ? 2.5 : 3.5);
+    for (let Z = Math.floor(pcz - rz); Z <= Math.ceil(pcz + rz); Z++)
+      for (let X = Math.floor(pcx - rx); X <= Math.ceil(pcx + rx); X++) {
+        const ex = (X + 0.5 - pcx) / rx, ez = (Z + 0.5 - pcz) / rz;
+        if (ex * ex + ez * ez > 1) continue;
+        both(X, XX => (f.cheeks > 0 ? light : shade)(XX, Z));
+      }
+  }
+  // BLUSH (body.skin.blush): the lip colour, dithered over the same cheek
+  // patch, thinning to its rim; strong enough, it reaches the tip of the nose.
+  const blush = g.body.skin.blush;
+  if (blush >= 0.1) {
+    const rx = 2.4, rz = 1.7, pcx = eOut + 1.5, pcz = Ze - 2.5;
+    for (let Z = Math.floor(pcz - rz); Z <= Math.ceil(pcz + rz); Z++)
+      for (let X = Math.floor(pcx - rx); X <= Math.ceil(pcx + rx); X++) {
+        const ex = (X + 0.5 - pcx) / rx, ez = (Z + 0.5 - pcz) / rz;
+        const d = Math.sqrt(ex * ex + ez * ez);
+        if (d > 1 || rnd01(X, Z, 0xb1) >= Math.min(1, blush * 1.6 * (1.15 - d)))
+          continue;
+        both(X, XX => paintAt(XX, Z, ART.LIP, true));
+      }
+  }
+  // FRECKLES: single cells now, across the nose and the cheeks.
+  if (f.freckles > 0)
+    for (let Z = Ze - 5; Z <= Ze - 1; Z++)
+      for (let X = 0; X < sx; X++)
+        if (Math.abs(X + 0.5 - CX) < 7.5 &&
+            rnd01(X, Z, 151) < f.freckles * 0.3) shade(X, Z);
+  // THE NOSE'S OWN SHADING: nostrils under the tip's outer cells, the crease
+  // of each wing beside it, a highlight on the bulb. A face with no nose
+  // still gets two nostrils, where a nose would end.
+  if (nL > 0) {
+    const lowHalf = f.noseWidth >= 1.5 || f.noseBulb >= 0.8
+      ? Math.max(tipHalf, 2) : tipHalf;
+    both(CX - lowHalf, X => paintAt(X, tipLow, ART.FACE_SHADE, true));
+    both(CX - lowHalf - 1, X => shade(X, tipLow));
+    if (f.nose >= 1 && tipRows >= 2)
+      both(CX - 1, X => paintAt(X, tipLow + 1, ART.FACE_LIGHT, true));
+  } else {
+    both(CX - 2, X => shade(X, Zm + 3));
+  }
+  // AGE LINES, in steps: crow's feet, then the forehead, then (with the
+  // mouth, below) the lines from the nose to its corners.
+  if (f.wrinkles >= 0.2)
+    both(eOut - 2, X => { shade(X, Ze + 1 + tilt); shade(X, Ze - 1 + tilt); });
+  if (f.wrinkles >= 0.35)
+    both(eOut - 3, X => { shade(X, Ze + 2 + tilt); shade(X, Ze - 2 + tilt); });
+  if (f.wrinkles >= 0.45)
+    for (const Zf of f.wrinkles >= 0.8 ? [browTop + 2, browTop + 4] : [browTop + 2])
+      for (let X = 0; X < sx; X++) {
+        const dx = Math.abs(X + 0.5 - CX);
+        if (dx < 4.5 && !(dx > 2 && dx < 3)) shade(X, Zf);
+      }
+  // A SCAR: a pale slash down through one brow and eye, one cell wide.
+  const scarKeys = new Set();
+  if (f.scar !== 0) {
+    const n = Math.max(4, Math.round(Math.abs(f.scar) * 12));
+    const right = f.scar > 0;
+    const zS = browTop + 1;
+    for (let i = 0; i < n; i++) {
+      // Through hair too: a scar is a bald line in a brow or a cap. The eye
+      // it crosses is painted after it, so the eye survives.
+      const XL = eIn - Math.floor(i / 2), Z = zS - i;
+      const X = right ? mirror(XL) : XL;
+      if (paintAt(X, Z, ART.FACE_LIGHT)) scarKeys.add(X * 4096 + Z);
+    }
+  }
+
+  // ---- THE BEARD: headVox's regions, read at shipped resolution ------------
+  // Every threshold is headVox's own number, unrounded: a row test `z <= T`
+  // becomes `Z/S < T + 1` (the fine row's bottom edge), which agrees with
+  // headVox on every whole T and moves in half rows between them. The edge
+  // band is one shipped cell, and the density test is per shipped cell -- a
+  // stubble grain at last (headVox's note on why its stubble read as blotches).
+  const beardTone = f.beardTone === 'hair' ? ART.HAIR : ART.HAIR_SHADE;
+  const NOT_BEARD = new Set([ART.EYE, ART.EYE_WHITE, ART.LASH]);
+  if (f.beard > 0) {
+    const bd = f.beard;
+    const topZ = eyeA - 2;
+    const reach = 1.5 + bd * (ax * 0.5) * (1 + f.beardWidth * 0.6);
+    const jawTop = skullLo + 1 + bd * 3 + f.beardJaw;
+    const auto = bd >= 0.75 ? 1 : 0;
+    const cheekF = f.beardCheek >= 0 ? Math.max(auto, f.beardCheek)
+                                     : auto * (1 + f.beardCheek);
+    const cheekTop = jawTop + (topZ - jawTop) * cheekF;
+    const lipHalf = f.beardLip >= 0 ? 2.2 + f.beardLip * 2 : 2.2 * (1 + f.beardLip);
+    const chinHalf = f.beardChin >= 0 ? 2.2 + f.beardChin * 1.5
+                                      : 2.2 * (1 + f.beardChin);
+    const lipW = f.beardLip > 0 ? Math.max(reach, lipHalf) : Math.min(reach, lipHalf);
+    const chinW = f.beardChin > 0 ? Math.max(reach, chinHalf) : Math.min(reach, chinHalf);
+    const mouthHalf = f.mouthWidth / 2;
+    const droop = f.beardLip >= 0.75;
+    const keep = 1 - f.beardRagged;
+    for (let Z = 0; Z < sz; Z++) {
+      const zE = Z / S;
+      if (zE >= topZ + 1 || Math.floor(zE) < skullLo) continue;
+      const jawRow = zE < jawTop + 1;
+      const lipRow = zE >= mzA;
+      const cW = lipRow ? lipW : chinW;
+      for (let Y = 0; Y < sy; Y++) {
+        if (ac(Y) < hcy - 0.5) continue;                 // the back of the head
+        for (let X = 0; X < sx; X++) {
+          const k = at(X, Y, Z);
+          const c = col[k];
+          if (!c || NOT_BEARD.has(c) || noseSet.has(k) || earSet.has(k)) continue;
+          const dx = Math.abs(ac(X) - cx);
+          const centre = dx <= cW;
+          const side = dx > 2.2 && dx <= reach && (jawRow || zE < cheekTop + 1);
+          const hang = droop && !lipRow && dx > mouthHalf && dx <= lipW;
+          if (!centre && !side && !hang) continue;
+          let edge = dx > reach - 0.5 || (!jawRow && dx > 1.2);
+          if (centre && !side && (lipRow ? f.beardLip : f.beardChin) !== 0 &&
+              dx > cW - 0.5) edge = true;
+          if (f.beardDensity < 1 && rnd01(X, Y, Z, 131) >= f.beardDensity) continue;
+          if (!edge || hashN(X, Y, Z, 97) / 4294967296 < keep) col[k] = beardTone;
+        }
+      }
+    }
+  }
+  // SIDEBURNS: the outermost authored cell's worth of face in front of the
+  // ear, from the hairline down. Independent of `beard`.
+  if (f.beardSide > 0) {
+    const zTop = eyeA + 1;
+    const zBot = zTop - f.beardSide * (zTop - skullLo);
+    const yLo = earYA * S, yHi = (earYA + 3) * S - 1;
+    for (let Z = Math.floor(zBot * S); Z < (zTop + 1) * S && Z < sz; Z++) {
+      if (Z < 0 || Z / S < zBot) continue;
+      let maxDx = -1;
+      for (let Y = yLo; Y <= Math.min(yHi, sy - 1); Y++)
+        for (let X = 0; X < sx; X++) {
+          const k = at(X, Y, Z);
+          if (col[k] && !earSet.has(k)) maxDx = Math.max(maxDx, Math.abs(ac(X) - cx));
+        }
+      if (maxDx < 0) continue;
+      for (let Y = yLo; Y <= Math.min(yHi, sy - 1); Y++)
+        for (let X = 0; X < sx; X++) {
+          const k = at(X, Y, Z);
+          if (!FINE_SKIN.has(col[k]) || earSet.has(k)) continue;
+          if (Math.abs(ac(X) - cx) < maxDx - 1) continue;
+          if (f.beardDensity < 1 && rnd01(X, Y, Z, 131) >= f.beardDensity) continue;
+          col[k] = beardTone;
+        }
+    }
+  }
+
+  // ---- THE EYES --------------------------------------------------------------
+  // Repaints of the frontmost cell, so an eye can neither float nor sink.
+  for (let X = eOut; X <= eIn; X++) {
+    const iris = X >= i0 && X < i0 + iw;
+    for (let r = 0; r < rowsOf(X); r++)
+      both(X, XX => paintAt(XX, Ze + r + dzOf(X), iris ? ART.EYE : ART.EYE_WHITE));
+  }
+  // THE LASH LINE, over the eye; light lashes stop short of the inner corner.
+  // Heavy ones flick out past the outer corner and line its underside.
+  if (f.lashes >= 0.15) {
+    const xEnd = f.lashes < 0.5 ? eIn - 1 : eIn;
+    for (let X = eOut; X <= xEnd; X++) both(X, XX => paintAt(XX, lashRow(X), ART.LASH));
+    if (f.lashes >= 0.7)
+      both(eOut - 1, X => paintAt(X, lashRow(eOut) + (tilt >= 0 ? 1 : 0), ART.LASH, true));
+    if (f.lashes >= 0.85)
+      both(eOut, X => paintAt(X, Ze - 1 + tilt, ART.LASH, true));
+  }
+  // THE LID CREASE: a shaded line a row over the lashes (deep-set, hooded).
+  if (f.lidCrease >= 0.2)
+    for (let X = eOut - (f.lidCrease >= 0.6 ? 1 : 0); X < eIn; X++)
+      both(X, XX => shade(XX, lashRow(X) + 1));
+  // UNDER THE EYES: shade under the iris and the outer white; past halfway a
+  // second row and the outer corner.
+  if (f.eyeBags > 0.2)
+    for (let X = eOut; X < i0 + iw; X++) {
+      both(X, XX => shade(XX, Ze - 1 + dzOf(X)));
+      if (f.eyeBags > 0.6) both(X, XX => shade(XX, Ze - 2 + dzOf(X)));
+    }
+  if (f.eyeBags > 0.6) both(eOut - 1, X => shade(X, Ze - 1));
+
+  // ---- THE MOUTH ---------------------------------------------------------------
+  // A line `2 * mouthWidth` cells long, centred on MC. Its shape is a curve, not
+  // a corner cell: a smile lifts the ends by up to two rows along a parabola
+  // and a smirk tilts the whole line. A half step of width is a pair of soft
+  // corners in the shade rather than an off-centre cell.
+  const mtone = f.lipLine ? ART.LIP : f.mouthTone === 'dark' ? ART.EYE : ART.FACE_SHADE;
+  const lipCol = f.lipTone === 'colour' ? ART.LIP
+               : f.lipTone === 'shade' ? ART.FACE_SHADE : ART.FACE_LIGHT;
+  const openRows = Math.round(S * f.mouthOpen);
+  const mcols = [];
+  for (let X = MC - mHalf; X < MC + mHalf; X++) mcols.push(X);
+  const offOf = X => {
+    const s = (X + 0.5 - MC) / mHalf;                  // -1 .. 1 along the line
+    const t = (s + 1) / 2;
+    return sround(f.mouthCurve * 1.6 * s * s) +
+           sround(Math.abs(f.mouthSkew) * 2 * (f.mouthSkew > 0 ? t : 1 - t));
+  };
+  const moff = mcols.map(offOf);
+  mcols.forEach((X, n) => paintAt(X, Zm + moff[n], mtone));
+  const ends = [[mcols[0] - 1, moff[0]], [mcols[mcols.length - 1] + 1, moff[moff.length - 1]]];
+  if (Math.abs(f.mouthCurve) >= 0.3)
+    for (const [X, o] of ends) paintAt(X, Zm + o + Math.sign(f.mouthCurve), mtone);
+  else if (softCorners)
+    for (const [X, o] of ends) paintAt(X, Zm + o, ART.FACE_SHADE, true);
+  // OPEN: dark rows under the line, the upper teeth in the first of two.
+  for (let r = 1; r <= openRows; r++)
+    mcols.forEach((X, n) => paintAt(X, Zm + moff[n] - r,
+      r === 1 && openRows >= 2 && Math.abs(X + 0.5 - MC) < mHalf - 0.5
+        ? ART.EYE_WHITE : ART.EYE));
+  // LIPS: the lower lip from half a step (its middle), the upper from one and
+  // a half (a cupid's bow, the cells either side of the middle), both full
+  // at two and the lower lip a row deeper. Hidden under a moustache.
+  const L = f.lips;
+  const lowZ = Zm + Math.min(...moff) - openRows - 1;
+  const upZ = Zm + Math.max(...moff) + 1;
+  for (const X of mcols) {
+    const d = Math.abs(X + 0.5 - MC) / mHalf;           // 0 middle .. ~1 end
+    if (L >= 1 || (L >= 0.5 && d < 0.6)) paintAt(X, lowZ, lipCol, true);
+    if (L >= 2 && d < 0.6) paintAt(X, lowZ - 1, lipCol, true);
+    // The bow is the middle of the upper lip; at two it runs to the corners.
+    if ((L >= 2 && d < 1) || (L >= 1.5 && d < 0.6)) paintAt(X, upZ, lipCol, true);
+  }
+  // NOSE-TO-MOUTH lines, the last step of the age lines.
+  if (f.wrinkles >= 0.7) {
+    const [lx] = ends[0], [rx] = ends[1];
+    shade(lx, Zm + 1); shade(lx, Zm + 2); shade(lx - 1, Zm + 3);
+    shade(rx, Zm + 1); shade(rx, Zm + 2); shade(rx + 1, Zm + 3);
+  }
+
+  // ---- BROWS, last: over the hair cap and any mark except the scar ---------
+  if (browCells.length) {
+    const tone = { hair: ART.HAIR, dark: ART.EYE, light: ART.FACE_LIGHT }[
+      f.browTone] ?? ART.HAIR_SHADE;
+    for (const [X, Z] of browCells) {
+      if (scarKeys.has(X * 4096 + Z)) continue;
+      if (f.browSparse > 0 && rnd01(X, Z, 163) < f.browSparse) continue;
+      paintAt(X, Z, tone);
+    }
+  }
+
+  // Out: cell list, then the flip every builder ends with (front LOW y).
+  const out = [];
+  for (let Z = 0; Z < sz; Z++)
+    for (let Y = 0; Y < sy; Y++)
+      for (let X = 0; X < sx; X++) {
+        const c = col[at(X, Y, Z)];
+        if (c) out.push([X, Y, Z, c]);
+      }
+  return flipY([sx, sy, sz], out);
+}
+
+// =============================================================================
+// THE SKIN PASS (2026-10-15): a human's body detail, at the shipped lattice.
+//
+// The body is authored at 40 vox/m and doubled, so before this every limb was
+// two flat tones split down its side. This pass runs after the upscale (and
+// after the shoulder round) on every part of a fine-faced human and PAINTS --
+// it never adds or removes a cell, so the boxes armour is fitted to, the
+// collider, the anchors and the left/right mirror are all untouched:
+//
+//  - the hard seam where shadeBack turns a limb's back half dark gets a
+//    one-cell checker band, so it reads as a turn of the form, not a stripe;
+//  - hands get fingers (grooves down both faces and across the tips),
+//    knuckles and nails; feet get toes and toenails; a kneecap, the crease
+//    of each elbow, the collarbones, a navel and (on a man) the line under
+//    the chest;
+//  - `body.skin.texture` mottles the skin, `body.skin.moles` scatters a few
+//    marks, and freckles past halfway reach the shoulders.
+//
+// Only SKIN_BASE cells are repainted (and SKIN_SHADE by the seam band), so
+// clothing, hair, the face's own paint and a goblin's anything are safe. Every
+// random choice is a hash of the genome's own numbers and the part's name: a
+// body is a pure function of its genome. `body.skin.detail` 0 turns the
+// anatomy off, and the old/fine toggle turns the whole pass off.
+// =============================================================================
+
+/**
+ * @param cells [x,y,z,col] at the SHIPPED lattice, part-local, front LOW y
+ * @param size  the part's shipped box
+ * @param info  { name, role, mnZ: the part's authored scene z, microH, sex }
+ * @returns the same cells, some repainted
+ */
+function humanSkinPass(g, cells, size, info) {
+  const sk = g.body.skin;
+  const { name, role } = info;
+  const [sx, sy, sz] = size;
+  const idx = (x, y, z) => (z * sy + y) * sx + x;
+  const at = new Map();
+  for (const c of cells) at.set(idx(c[0], c[1], c[2]), c);
+  const has = (x, y, z) => x >= 0 && y >= 0 && z >= 0 && x < sx && y < sy &&
+                           z < sz && at.has(idx(x, y, z));
+  const get = (x, y, z) => (has(x, y, z) ? at.get(idx(x, y, z)) : undefined);
+  const exposed = (x, y, z) => !has(x + 1, y, z) || !has(x - 1, y, z) ||
+                               !has(x, y + 1, z) || !has(x, y - 1, z) ||
+                               !has(x, y, z + 1) || !has(x, y, z - 1);
+  const BASE = new Set([ART.SKIN_BASE]);
+  const paint = (x, y, z, c, over = BASE) => {
+    const v = get(x, y, z);
+    if (!v || !over.has(v[3])) return false;
+    v[3] = c;
+    return true;
+  };
+  // Front (lowest y) / back (highest y) / outermost-in-x of a line of cells.
+  const frontY = (x, z) => { for (let y = 0; y < sy; y++) if (has(x, y, z)) return y; return -1; };
+  const sideX = (y, z, dir) => {
+    if (dir > 0) { for (let x = sx - 1; x >= 0; x--) if (has(x, y, z)) return x; }
+    else for (let x = 0; x < sx; x++) if (has(x, y, z)) return x;
+    return -1;
+  };
+  const paintFront = (x, z, c, over) => {
+    const y = frontY(x, z);
+    return y >= 0 && paint(x, y, z, c, over);
+  };
+  // The part's own seed: the genome's SHAPE numbers and the part's name. Never
+  // a colour -- a recolour is the palette moving, and must move no cell's slot
+  // (scripts/test_mobgen.mjs asserts it).
+  let seed = hashN(Math.round(g.face.eyeDx * 1000), Math.round(g.body.heightM * 1000),
+                   Math.round(g.face.freckles * 1000), Math.round(g.head.jaw * 1000),
+                   g.body.shoulderWidth | 0, Math.round(sk.texture * 1000));
+  for (const ch of name) seed = hashN(seed, ch.charCodeAt(0));
+  const rnd = (...v) => hashN(seed, ...v) / 4294967296;
+  const CXp = sx / 2;
+  const detail = sk.detail;
+
+  // ---- THE SEAM: a checker band where shadeBack's dark half begins ----------
+  if (detail >= 0.2)
+    for (const v of cells) {
+      if (v[3] !== ART.SKIN_BASE || ((v[0] + v[2]) & 1)) continue;
+      const b = get(v[0], v[1] + 1, v[2]);
+      if (b && b[3] === ART.SKIN_SHADE && exposed(v[0], v[1], v[2]))
+        v[3] = ART.SKIN_SHADE;
+    }
+
+  // ---- ANATOMY ----------------------------------------------------------------
+  if (detail >= 0.25) {
+    const shade = ART.FACE_SHADE, light = ART.FACE_LIGHT;
+    const isL = name.endsWith('.L');
+    if (role === 'hand') {
+      // The back of the hand faces OUT (a left hand's is +x); the palm faces
+      // the thigh. Fingers run down from `fz` to the tips at z = 0, stacked
+      // front to back, so they are split by lines of constant y.
+      const back = isL ? 1 : -1;
+      const fz = Math.max(2, Math.round(sz * 0.45));
+      // Measured at the TIPS, the narrowest row: the hand rounds out above
+      // them, and fingers planned across its widest row put grooves where the
+      // tips have no cells at all.
+      let y0 = sy, y1 = -1;
+      for (const [, y, z] of cells) if (z === 0) { y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
+      const n = y1 - y0 + 1;
+      if (n >= 3) {
+        // As many fingers as the depth holds with a groove between each.
+        const F = n >= 7 ? 4 : n >= 5 ? 3 : 2;
+        const cuts = [];
+        for (let k = 1; k < F; k++) cuts.push(y0 + Math.round(k * n / F));
+        const edges = [y0 - 1, ...cuts, y1 + 1];
+        const mids = [];
+        for (let k = 0; k < F; k++) mids.push(Math.floor((edges[k] + 1 + edges[k + 1] - 1) / 2));
+        for (let z = 0; z < fz; z++)
+          for (const y of cuts)
+            for (const dir of [1, -1]) {
+              const x = sideX(y, z, dir);
+              if (x >= 0) paint(x, y, z, shade);
+            }
+        // ...and across the tips, so the split shows from below.
+        for (const y of cuts)
+          for (let x = 0; x < sx; x++) if (has(x, y, 0)) paint(x, y, 0, shade);
+        for (const y of mids) {
+          const kx = sideX(y, fz, back);
+          if (kx >= 0 && detail >= 0.5) paint(kx, y, fz, light);   // knuckles
+          for (const z of sz >= 10 ? [0, 1] : [0]) {
+            const nx = sideX(y, z, back);
+            if (nx >= 0) paint(nx, y, z, ART.NAIL);                // nails
+          }
+        }
+      }
+    } else if (role === 'foot') {
+      // Toes at the front (low y), along the top of the sole; the big toe on
+      // the inside (a left foot's inside is low x).
+      let top = -1;
+      for (const [, , z] of cells) top = Math.max(top, z);
+      const soleTop = Math.max(0, Math.round(sz / 2) - 1);
+      const cuts = isL ? [2, 4, 6] : [sx - 3, sx - 5, sx - 7];
+      const tips = isL ? [0, 3, 5, 7] : [sx - 1, sx - 4, sx - 6, sx - 8];
+      for (let x = 0; x < sx; x++) {
+        const yF = frontY(x, soleTop);
+        if (yF < 0) continue;
+        if (cuts.includes(x)) {
+          for (let y = yF; y < yF + 3; y++) paint(x, y, soleTop, shade);
+          for (let z = 1; z <= soleTop; z++) paintFront(x, z, shade);
+        }
+        if (tips.includes(x)) paint(x, yF, soleTop, ART.NAIL);
+      }
+      void top;
+    } else if (name.startsWith('legL')) {
+      // The kneecap: lit at the top of the shin's front, shaded under it.
+      for (const x of [CXp - 1, CXp]) {
+        paintFront(x, sz - 2, light); paintFront(x, sz - 3, light);
+        if (detail >= 0.5) paintFront(x, sz - 4, shade);
+      }
+    } else if (name.startsWith('armL')) {
+      // The crease inside the elbow, at the top of the forearm's front.
+      for (const x of [CXp - 1, CXp]) paintFront(x, sz - 2, shade);
+    } else if (name === 'torso') {
+      // COLLARBONES: from beside the throat out toward each shoulder, rising a
+      // row at the outer end, lit with a shadow under.
+      const zc = sz - 3, reach = Math.round(sx * 0.36);
+      for (let d = 2; d <= reach; d++) {
+        const z = zc + (d > reach * 0.6 ? 1 : 0);
+        for (const x of [CXp - d, CXp + d - 1]) {
+          paintFront(x, z, light);
+          if (detail >= 0.5) paintFront(x, z - 1, shade);
+        }
+      }
+      // THE NAVEL, at 60% of the figure's height.
+      const zN = Math.round((0.6 * info.microH - info.mnZ) * SKIN_UPSCALE);
+      if (zN > 0 && zN < sz)
+        for (const x of [CXp - 1, CXp]) paintFront(x, zN, shade);
+      // THE LINE UNDER THE CHEST, on a man: a shallow curve under each pec.
+      if (info.sex === 'male' && detail >= 0.5) {
+        const zp = Math.round(sz * 0.6), w = Math.round(sx * 0.3);
+        for (let d = 2; d <= w; d++) {
+          const z = zp + (d >= w - 1 ? 1 : 0);
+          for (const x of [CXp - d, CXp + d - 1]) paintFront(x, z, shade);
+        }
+      }
+    }
+  }
+
+  // ---- FRECKLES ON THE SHOULDERS, past halfway --------------------------------
+  if (g.face.freckles > 0.5 && (name === 'torso' || name.startsWith('armU')))
+    for (const v of cells) {
+      if (v[3] !== ART.SKIN_BASE || v[2] < sz * 0.7) continue;
+      if (!exposed(v[0], v[1], v[2])) continue;
+      if (rnd(v[0], v[1], v[2], 0x51) < (g.face.freckles - 0.5) * 0.25)
+        v[3] = ART.FACE_SHADE;
+    }
+
+  // ---- TEXTURE: a fine mottle, in patches ------------------------------------
+  if (sk.texture > 0) {
+    const rate = sk.texture * (role === 'head' ? 0.05 : 0.09);
+    for (const v of cells) {
+      if (v[3] !== ART.SKIN_BASE || !exposed(v[0], v[1], v[2])) continue;
+      const patch = vnoise(seed, v[0], v[1], v[2], 4);
+      if (rnd(v[0], v[1], v[2], 0x7e) < rate * (0.3 + 1.4 * patch))
+        v[3] = rnd(v[0], v[1], v[2], 0x7f) < 0.65 ? ART.FACE_SHADE : ART.FACE_LIGHT;
+    }
+  }
+
+  // ---- MOLES: a few, anywhere on bare skin ------------------------------------
+  if (sk.moles > 0) {
+    const rate = sk.moles * (role === 'head' ? 0.004 : 0.0012);
+    for (const v of cells)
+      if (v[3] === ART.SKIN_BASE && exposed(v[0], v[1], v[2]) &&
+          rnd(v[0], v[1], v[2], 0x30) < rate) v[3] = ART.LASH;
+  }
+  return cells;
 }
 
 function upperArmVox(g, size) {
@@ -5024,7 +6057,6 @@ function buildClips(gait) {
   };
   const clips = {};
 
-
   // walk/run arm swing: additive over the gait, masked to the arms and spine
   // so the IK-driven legs are untouched. Periods derived above.
   //
@@ -5235,6 +6267,9 @@ export function generateMob(genome, seed = 0, opts = {}) {
   // page can say the sculpting ran rather than leaving you to squint for it.
   let rounded = 0;
   const sylvan = g.body.race === 'sylvan';
+  // THE FINE HEAD AND THE SKIN PASS (headVoxFine, humanSkinPass): a human's,
+  // unless the caller asked for the old face to compare against.
+  const fine = isFineFace(g, opts);
   // What the sylvan face pass found (eyes, mouth, brow), head-local shipped:
   // the crown hangs its veil and its snout off it.
   let sylFace = null;
@@ -5249,10 +6284,16 @@ export function generateMob(genome, seed = 0, opts = {}) {
     if (worldExtent > 120)
       throw new Error(`${nm} is ${worldExtent} world voxels; even a 1:1 ` +
                       `collider exceeds the DebrisVoxel int8 bound`);
-    let cells = SHAPES[nm] ? SHAPES[nm](g, artSize, { ...table, limbs: L, name: nm })
-                           : SE.shape(g, nm, table);
-    if (!cells.length) throw new Error(`${nm} generated no voxels`);
-    cells = upscaleCells(cells, SKIN_UPSCALE);
+    const ctx = { ...table, limbs: L, name: nm };
+    let cells;
+    if (fine && roleOf(nm) === 'head') {
+      // Built at the shipped lattice already: no upscale.
+      cells = headVoxFine(g, artSize, ctx);
+    } else {
+      cells = SHAPES[nm] ? SHAPES[nm](g, artSize, ctx) : SE.shape(g, nm, table);
+      if (!cells.length) throw new Error(`${nm} generated no voxels`);
+      cells = upscaleCells(cells, SKIN_UPSCALE);
+    }
     // THE SHOULDER ROUND, after the upscale because that is the only lattice
     // fine enough to round on (see roundShoulders). `roundShoulders: false`
     // gives the retired gen_human.py's geometry exactly, which is what
@@ -5284,6 +6325,12 @@ export function generateMob(genome, seed = 0, opts = {}) {
       cells = sylvan ? SY.barkPass(g, roleOf(nm), nm, cells, size, info)
                      : Ms.surfacePass(g, roleOf(nm), nm, cells, size, info);
       if (info.face) sylFace = info.face;
+    } else if (fine) {
+      // A HUMAN's surface: fingers, nails, collarbones, the seam band... Paint
+      // only, inside the part's own box.
+      cells = humanSkinPass(g, cells, size, {
+        name: nm, role: roleOf(nm), mnZ: L[nm].mn[2], microH: table.microH,
+        sex: g.body.sex });
     }
     const seen = new Set();
     const uniq = [];
@@ -5517,6 +6564,10 @@ export function paletteBytes(materials, colors, race = 'human',
   }
   for (const [slot, hex] of Object.entries(wispColors(colors)))
     put(Number(slot), hex);
+  // The fine face's detail slots, on a human only (detailColors).
+  if (race === 'human')
+    for (const [slot, hex] of Object.entries(detailColors(colors)))
+      if (hex) put(Number(slot), hex);
   return pal;
 }
 
