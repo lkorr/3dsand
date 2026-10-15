@@ -12,6 +12,7 @@
 // expansions, no possibility of drift.
 
 #include "sim/pass_table.h"
+#include "sim/flowfield.h"
 #include "sim/world.h"
 
 namespace {
@@ -31,6 +32,12 @@ constexpr uint32_t kGodVisGroups = (pass::kGodVisBlocks + 63) / 64;
 // gas_mask.wgsl: one 32-thread group per mask word (32 bricks along x).
 static_assert(pass::kGasMaskCellsN == kGasOuterN, "gas mask sized for the gasOuter box");
 constexpr uint32_t kGasMaskGroups = pass::kGasMaskWords;
+// THE MEASURED FLOW (flowfield.h kFlowMeas*): the fold's 8 x 8 groups, and
+// the byte spans its two Fills clear (ACC after every fold; STATE + GRID once
+// when the tail ends -- size 0 is "to the end of the buffer").
+constexpr uint32_t kFlowMeasAccBytes = sandvox::kFlowMeasAccWords * 4u;
+constexpr uint32_t kFlowMeasStateOffset = sandvox::kFlowMeasStateBase * 4u;
+constexpr uint32_t kFlowMeasFoldGroups = sandvox::kFlowMeasGroups;
 }  // namespace
 
 namespace pass {
@@ -116,6 +123,7 @@ namespace {
 #define PIPE_GI_GATHER       Pipe::GiGather
 #define PIPE_WIND_STREAK     Pipe::WindStreak
 #define PIPE_SHADOW_RESOLVE  Pipe::ShadowResolve
+#define PIPE_FLOWMEAS_FOLD   Pipe::FlowMeasFold
 #define PIPE_FLUID_SPAWN     Pipe::FluidSpawn
 #define PIPE_FLUID_MARK      Pipe::FluidMark
 #define PIPE_FLUID_ALLOC     Pipe::FluidAlloc
@@ -266,6 +274,8 @@ namespace {
 #define C_ELECR6     Cond::ElecR6
 #define C_ELECR7     Cond::ElecR7
 #define C_ELECQUERY  Cond::ElecQuery
+#define C_FLOWMEAS   Cond::FlowMeasure
+#define C_FLOWMEASCLR Cond::FlowMeasureClear
 
 #define D_WINDWAKE  (uint32_t)DispatchSel::WindWakeSel
 #define D_RAINFALL  (uint32_t)DispatchSel::RainFallSel

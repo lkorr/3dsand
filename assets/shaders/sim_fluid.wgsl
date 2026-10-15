@@ -90,6 +90,31 @@
 // The wind-draft shelter volume: the surface-node wind (windAtScaledQ) feels
 // walls (common.wgsl WIND DRAFTS). Slim group, same number as simBGL_.
 @group(0) @binding(46) var<storage, read> draftField : array<u32>;
+// THE MEASURED FLOW'S ACCUMULATOR (src/sim/flowfield.h kFlowMeas*; slim group,
+// the same number as simBGL_): `mark` adds every live particle's horizontal
+// momentum to the node bin it is in, beside the CA's moves (sim_step.wgsl
+// flowMeasNote). Render-only -- no fluid or sim kernel reads it back.
+@group(0) @binding(61) var<storage, read_write> flowMeasAcc : array<atomic<i32>>;
+// Must match sim_step.wgsl's block of the same name.
+const FLOWM_N : i32 = 67;
+const FLOWM_ACC_Q : i32 = 16;
+const FLOWM_Y_BIAS : i32 = 1048576;
+// One particle is one eighth of liquid moving `v` cells this tick (Q16.16):
+// eighths x cells x FLOWM_ACC_Q (= 2^4) is v >> 12. A particle at rest, or
+// one moving straight up or down, records nothing.
+fn flowMeasParticle(cell : vec3<i32>, vx : i32, vz : i32) {
+  if (TUNE_CURRENT_MEASURED <= 0.0) { return; }
+  let fx = vx >> 12u;
+  let fz = vz >> 12u;
+  if (fx == 0 && fz == 0) { return; }
+  let kx = ((((cell.x + 4) >> 3u) % FLOWM_N) + FLOWM_N) % FLOWM_N;
+  let kz = ((((cell.z + 4) >> 3u) % FLOWM_N) + FLOWM_N) % FLOWM_N;
+  let s = u32(kz * FLOWM_N + kx) * 4u;
+  if (fx != 0) { atomicAdd(&flowMeasAcc[s], fx); }
+  if (fz != 0) { atomicAdd(&flowMeasAcc[s + 1u], fz); }
+  atomicMax(&flowMeasAcc[s + 2u], cell.y + FLOWM_Y_BIAS);
+  atomicMax(&flowMeasAcc[s + 3u], FLOWM_Y_BIAS - cell.y);
+}
 
 @group(1) @binding(0) var<storage, read_write> fluidParticles : array<FluidParticle>;
 @group(1) @binding(2) var<storage, read_write> fluidBlockMap : array<atomic<u32>>;
@@ -653,6 +678,9 @@ fn mark(@builtin(global_invocation_id) gid : vec3<u32>) {
   let p = fluidParticles[gid.x];
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
   if (!cellResident(cell, T.origin)) { return; }  // frozen out-of-residency
+  // The measured flow's record (render-only): once a tick, here, because
+  // this is the one per-particle pass that runs once a tick.
+  if (fpMat(p.attr) != 0u) { flowMeasParticle(cell, p.vx, p.vz); }
   let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
   let lo = vec3<i32>(ax.base, ay.base, az.base) - vec3<i32>(FLUID_MARK_PAD);
   let hi = vec3<i32>(ax.base, ay.base, az.base) +

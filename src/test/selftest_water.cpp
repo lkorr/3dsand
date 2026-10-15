@@ -80,6 +80,7 @@
 
 #include "sim/waterbody.h"
 #include "sim/currentprim.h"
+#include "sim/flowfield.h"
 #include "test/selftest.h"
 #include "test/support.h"
 #include "test/tickrig.h"
@@ -3941,6 +3942,222 @@ Status GateBlastWater(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- flow-measure -------------------------------------------------------------
+// THE CURRENT FOLLOWS THE WATER THE SIMULATION ACTUALLY MOVES (ticket
+// 2026-10-14_22-57-12: "a break in this dam should cause the arrows to point
+// pretty dramatically in that direction, which should shift the other current
+// arrows in the vicinity"). DESIGN.md §9d.12, flowfield.h kFlowMeas*.
+//
+// FIXTURE. An open stone box, split by a stone dam across x = cx: the west
+// half a reservoir kDeep full cells deep, the east half dry. At kBreachAt a
+// gap is cut through the dam, the full height, kGap cells wide round z = cz,
+// and the reservoir floods east through it. The harness map has no rivers or
+// lakes, so the SOLVED field is zero here; it is sampled anyway, because the
+// claim is "above the map field", and on a map with water it would not be.
+//
+// The published grid (the region the raymarch, the arrow overlay and the
+// current tracers read) is read back and sampled through
+// flowfield::SampleMeasured, the CPU transcription of common.wgsl
+// flowMeasAt -- so the claims are about the field the arrows draw:
+//   Q. QUIET: before the breach the still reservoir publishes no current at
+//      the gap (a still pond has no flow, measured or otherwise).
+//   G. THE GAP: `flowMeasure.at` ticks after the breach the current in the
+//      gap runs EAST (through the breach) at >= flowMeasure.gapMin cells/s,
+//      above the solved field there.
+//   V. THE VICINITY: of the reservoir points on a ring flowMeasure.ring cells
+//      from the gap, at least flowMeasure.pullMin have turned toward it
+//      (direction within 60 degrees of the gap, at >= flowMeasure.pullSpeed).
+//   D. DOWNSTREAM: the flood east of the gap runs east too.
+//   R. RELAX: once the flood has settled (flowMeasure.settle ticks), the
+//      current at the gap and on the ring has fallen to <=
+//      flowMeasure.relaxMax of its peak -- the field is the water's, so it
+//      stops when the water does. (The fastest node anywhere in the box is
+//      printed beside it with the box's awake chunks: the CA's last
+//      levelling far from the breach is real motion and reads as such.)
+// Every 15 ticks the trace prints gap / ring mean / box max, so a FAIL says
+// which phase did not happen. Thresholds in baseline.json.
+Status GateFlowMeasure(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  const IVec3 org = world.WindowOrigin();
+  const int cx = org.x * (int)kChunk + 288, cz = org.z * (int)kChunk + 160;
+  const int kHalfX = (int)BaselineNumber("flowMeasure.halfX", 32);
+  const int kHalfZ = (int)BaselineNumber("flowMeasure.halfZ", 24);
+  const int kDeep = (int)BaselineNumber("flowMeasure.deep", 8);
+  const int kGap = (int)BaselineNumber("flowMeasure.gap", 6);
+  const int x0 = cx - kHalfX, x1 = cx + kHalfX, z0 = cz - kHalfZ, z1 = cz + kHalfZ;
+  const int fy = FixtureYOver(x0 - 1, z0 - 1, x1 + 1, z1 + 1, kDefaultSeed, 1);
+  const int wallTop = fy + kDeep + 3;
+  std::vector<CellOp> build, fill, breach;
+  // The floor is a SLAB down into the ground, not one layer at fy: fy is one
+  // over the footprint's highest terrain, so a one-layer floor touches
+  // nothing, and the first support-loss scan after the breach (the dam's cut
+  // cells) turned the whole box into a debris body and poured the reservoir
+  // out (the first run: "island of 4711 voxels -> 1 body shard").
+  for (int z = z0 - 1; z <= z1 + 1; z++)
+    for (int x = x0 - 1; x <= x1 + 1; x++)
+      for (int y = fy - 12; y <= wallTop + 6; y++) {
+        const bool wall = x < x0 || x > x1 || z < z0 || z > z1 || x == cx;
+        const bool solid = (y <= wallTop && wall) || y <= fy;
+        build.push_back({World::SlotCellIndex({x, y, z}), solid ? (uint32_t)kMatStone : 0u});
+        if (x >= x0 && x < cx && z >= z0 && z <= z1 && y >= fy + 1 && y <= fy + kDeep)
+          fill.push_back({World::SlotCellIndex({x, y, z}), PackVoxNew(kMatWater, 7u)});
+      }
+  const int gz0 = cz - kGap / 2, gz1 = gz0 + kGap - 1;
+  for (int z = gz0; z <= gz1; z++)
+    for (int y = fy + 1; y <= wallTop; y++) breach.push_back({World::SlotCellIndex({cx, y, z}), 0u});
+
+  const int kBreachAt = (int)BaselineNumber("flowMeasure.breachAt", 90);
+  const int kAt = (int)BaselineNumber("flowMeasure.at", 45);
+  const int kSettle = (int)BaselineNumber("flowMeasure.settle", 900);
+  const double gapMin = BaselineNumber("flowMeasure.gapMin", 10.0);
+  const double ringR = BaselineNumber("flowMeasure.ring", 16.0);
+  const double pullSpeed = BaselineNumber("flowMeasure.pullSpeed", 0.5);
+  const int pullMin = (int)BaselineNumber("flowMeasure.pullMin", 4);
+  const double relaxMax = BaselineNumber("flowMeasure.relaxMax", 0.05);
+  uint32_t t = 66000;
+  support::TickCursor ticker{c, t, {cx >> 4, fy >> 4, cz >> 4}};
+
+  std::vector<uint32_t> grid(kFlowMeasGridWords, 0u);
+  auto readGrid = [&]() {
+    ctx.WaitIdle();
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.FlowMeasureBuffer(),
+                          (uint64_t)kFlowMeasGridBase * 4, grid.data(),
+                          (size_t)kFlowMeasGridWords * 4, "flowMeasGrid");
+  };
+  const float sy = (float)(fy + 1) + 0.5f * (float)kDeep * 0.5f;   // in the water band
+  const Vec3 gapP{(float)cx + 0.5f, sy, (float)cz};
+  auto at = [&](Vec3 p) { return flowfield::SampleMeasured(grid.data(), p); };
+  auto speed = [](Vec3 v) { return std::sqrt(v.x * v.x + v.z * v.z); };
+  // The vicinity: eight points on an arc round the gap, in the reservoir
+  // (112.5 .. 247.5 degrees from +x: the west side, clear of the dam's face).
+  std::vector<Vec3> ring;
+  for (int k = 0; k < 8; k++) {
+    const double a = 3.14159265358979 * (0.625 + 0.75 * (k + 0.5) / 8.0);
+    ring.push_back({gapP.x + (float)(ringR * std::cos(a)), sy, gapP.z + (float)(ringR * std::sin(a))});
+  }
+  float ringMax = 0.0f;   // the last ringPull's fastest point
+  auto ringPull = [&](int& pulled, float& mean) {
+    pulled = 0;
+    mean = 0.0f;
+    ringMax = 0.0f;
+    for (const Vec3& p : ring) {
+      const Vec3 v = at(p);
+      const float s = speed(v);
+      mean += s / (float)ring.size();
+      ringMax = std::max(ringMax, s);
+      const float dx = gapP.x - p.x, dz = gapP.z - p.z, dl = std::sqrt(dx * dx + dz * dz);
+      if (s >= pullSpeed && (v.x * dx + v.z * dz) / (s * dl) >= 0.5f) pulled++;
+    }
+  };
+  // The box's fastest published node (the R claim).
+  auto boxMax = [&]() {
+    float m = 0.0f;
+    for (int z = z0; z <= z1; z += 4)
+      for (int x = x0; x <= x1; x += 4) m = std::max(m, speed(at({(float)x, sy, (float)z})));
+    return m;
+  };
+
+  std::string trace;
+  float quietGap = -1.0f, peak = 0.0f, nearPeak = 0.0f;
+  Vec3 gapV{0, 0, 0}, downV{0, 0, 0};
+  int pulled = 0;
+  float ringMean = 0.0f;
+  const Vec3 solvedGap = WaterFlow().Sample(gapP);
+  const int total = kBreachAt + kSettle;
+  // The box is ~120k cell ops and a tick takes kMaxCellOpsPerTick (65,536):
+  // the rest are REFUSED, not queued (the first run built half a box and its
+  // reservoir leaked out of the open side; last_run.json opstream.cellTrunc).
+  // So the build goes in over consecutive ticks, then the fill.
+  const size_t kPerTick = kMaxCellOpsPerTick;
+  const int buildTicks = (int)((build.size() + kPerTick - 1) / kPerTick);
+  const int fillAt = buildTicks + 1;
+  for (int i = 0; i <= total; i++) {
+    support::TickOps o;
+    if (i < buildTicks)
+      o.cells.assign(build.begin() + (size_t)i * kPerTick,
+                     build.begin() + std::min(build.size(), (size_t)(i + 1) * kPerTick));
+    if (i == fillAt) o.cells = fill;
+    if (i == kBreachAt) o.cells = breach;
+    ticker(o);
+    if (i == kBreachAt - 1) {
+      readGrid();
+      quietGap = speed(at(gapP));
+    }
+    if (i == kBreachAt + kAt) {
+      readGrid();
+      gapV = at(gapP);
+      downV = at({gapP.x + 12.0f, sy - 2.0f, gapP.z});
+      ringPull(pulled, ringMean);
+    }
+    if (i > kBreachAt && (i - kBreachAt) % 15 == 0) {
+      readGrid();
+      int p = 0;
+      float m = 0.0f;
+      ringPull(p, m);
+      const float bm = boxMax();
+      peak = std::max(peak, bm);
+      nearPeak = std::max(nearPeak, std::max(speed(at(gapP)), ringMax));
+      if ((i - kBreachAt) % 60 == 0 || i - kBreachAt <= 90)
+        trace += Format("%s+%d: gap %.1f ring %.2f (%d pulled) box %.1f [fold@%d]",
+                        trace.empty() ? "" : "; ", i - kBreachAt, speed(at(gapP)), m, p, bm,
+                        (int)grid[3] - (int)t);
+    }
+  }
+  readGrid();
+  const float endMax = boxMax();
+  int endPulled = 0;
+  float endRingMean = 0.0f;
+  ringPull(endPulled, endRingMean);
+  const float endNear = std::max(speed(at(gapP)), ringMax);
+  // The box's awake chunks, for the residual box max beside R.
+  uint32_t boxAwake = 0, boxChunks = 0;
+  {
+    std::vector<uint32_t> flags(kNumSlots, 0u);
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0, flags.data(),
+                          (size_t)kNumSlots * 4, "flowMeasActive");
+    for (int qz = (z0 - 1) >> 4; qz <= (z1 + 1) >> 4; qz++)
+      for (int qy = fy >> 4; qy <= wallTop >> 4; qy++)
+        for (int qx = (x0 - 1) >> 4; qx <= (x1 + 1) >> 4; qx++) {
+          boxChunks++;
+          if (flags[World::SlotChunkIndex({qx, qy, qz})] != 0u) boxAwake++;
+        }
+  }
+
+  RecordObserved("flowMeasure.gapObserved", gapV.x);
+  RecordObserved("flowMeasure.pulledObserved", pulled);
+  RecordObserved("flowMeasure.peakObserved", peak);
+  RecordObserved("flowMeasure.endObserved", endNear);
+  std::vector<std::string> fails;
+  if (quietGap < 0.0f || quietGap > 0.05f)
+    fails.push_back(Format("Q: the still reservoir already published %.2f cells/s at the gap", quietGap));
+  if (gapV.x < gapMin || speed(solvedGap) >= speed(gapV))
+    fails.push_back(Format("G: gap current (%.1f, %.1f) cells/s, need east >= %.1f and above the solved %.2f",
+                           gapV.x, gapV.z, gapMin, speed(solvedGap)));
+  if (pulled < pullMin)
+    fails.push_back(Format("V: %d of %zu ring points pulled toward the gap, need %d", pulled, ring.size(), pullMin));
+  if (downV.x <= 0.0f)
+    fails.push_back(Format("D: downstream current (%.1f, %.1f), need east", downV.x, downV.z));
+  if (nearPeak <= 0.0f || endNear > relaxMax * nearPeak)
+    fails.push_back(Format("R: gap / ring still %.2f cells/s after %d ticks, peak %.1f (allow %.0f%%)", endNear,
+                           kSettle, nearPeak, relaxMax * 100.0));
+  detail = Format(
+      "dam breach %dx%dx%d, gap %d: Q quiet %.2f | G gap (%.1f, %.1f) cells/s vs solved %.2f | V %d/%zu ring "
+      "points at %.0f cells pulled (mean %.2f) | D downstream (%.1f, %.1f) | R gap/ring peak %.1f -> %.2f "
+      "after %d ticks; box max %.1f -> %.2f (%u of %u box chunks awake), grid n %u | %s",
+      2 * kHalfX + 1, 2 * kHalfZ + 1, kDeep, kGap, quietGap, gapV.x, gapV.z, speed(solvedGap), pulled,
+      ring.size(), ringR, ringMean, downV.x, downV.z, nearPeak, endNear, kSettle, peak, endMax, boxAwake,
+      boxChunks, grid[2], trace.c_str());
+  for (const std::string& f : fails) detail = f + "; " + detail;
+  const bool ok = fails.empty();
+  std::printf("flow-measure: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 
@@ -4259,6 +4476,9 @@ const std::vector<Gate>& WaterGates() {
       {"current", "sim", {}, false, GateCurrent},
       // Own worldgen and its own basin; leaves a drained pond at (160, ., 288).
       {"blast-water", "sim", {}, false, GateBlastWater},
+      // Own worldgen and its own dammed box at (288, ., 160); the measured
+      // flow (flowfield.h kFlowMeas*) through a breach, then its relaxation.
+      {"flow-measure", "sim", {}, false, GateFlowMeasure},
   };
   return g;
 }

@@ -101,6 +101,45 @@ constexpr uint32_t kFlowWords =
 constexpr int kFlowVelQ = 128;
 constexpr int kFlowDry = -32768;
 
+// THE MEASURED FLOW (DESIGN.md §9d.12): which way the water the simulation
+// is ACTUALLY moving goes, recorded on the GPU, render-only. The solved field
+// above is a function of the MAP, so it cannot see a dam somebody breached;
+// this one is a function of the moves. One buffer (`flowMeasure`), three
+// regions, all on the node lattice above (a node every kFlowStep cells, the
+// window grid's kFlowWinNodes per axis):
+//   ACC   per toroidal slot (world node mod kFlowMeasN), four i32: the net
+//         horizontal liquid flux this tick (x, z; eighths x cells, scaled by
+//         kFlowMeasAccQ) and the highest / lowest cell that moved (y + bias,
+//         bias - y; 0 = nothing moved). Atomically ADDED / MAXed by the CA
+//         (sim_step.wgsl) and the MPM `mark` pass, zeroed by a Fill after the
+//         fold. Integer adds and maxes commute, so the sum is a function of
+//         the moves and not of the schedule -- and nothing in the sim reads it.
+//   STATE per slot, four words: the smoothed velocity (vx, vz, f32 cells/s),
+//         the world node the slot holds (a tag: the window moves under it),
+//         and the water band (top | bot, i16 each).
+//   GRID  the render's view, the flowGrid layout exactly: a 4-word header
+//         ([0] origin x [1] origin z [2] nodes per axis, 0 = no field [3] the
+//         tick it was folded) and two words a node, w0 = vx | vz (i16,
+//         1/kFlowVelQ cells/s), w1 = top | bot (i16 world cells; top =
+//         kFlowDry where nothing flows).
+// The fold (flow_measure.wgsl) runs on ticks the CA or the fluid seam ran
+// and for a tail after (Simulation::EncodeTick), so a settled world records
+// nothing; when the tail ends one Fill zeroes STATE + GRID.
+constexpr int kFlowMeasN = kFlowWinNodes;
+constexpr uint32_t kFlowMeasSlots = (uint32_t)(kFlowMeasN * kFlowMeasN);
+constexpr uint32_t kFlowMeasAccWords = kFlowMeasSlots * 4u;
+constexpr uint32_t kFlowMeasStateBase = kFlowMeasAccWords;
+constexpr uint32_t kFlowMeasGridBase = kFlowMeasStateBase + kFlowMeasSlots * 4u;
+constexpr uint32_t kFlowMeasGridWords = kFlowHeaderWords + kFlowMeasSlots * 2u;
+constexpr uint32_t kFlowMeasWords = kFlowMeasGridBase + kFlowMeasGridWords;
+constexpr int kFlowMeasAccQ = 16;
+// The fold's dispatch: 8 x 8 threads a group, one thread per grid node.
+constexpr uint32_t kFlowMeasGroups = (uint32_t)(kFlowMeasN + 7) / 8u;
+// Ticks the fold keeps running after the last tick anything fed it: long
+// enough for the slowest decay to fall under the fold's zero snap
+// (flow_measure.wgsl FLOWM_TAU_FALL_S x ~7), so the closing Fill is not a step.
+constexpr uint32_t kFlowMeasTailTicks = 300;
+
 class WaterFlowField {
  public:
   // Re-compose the window grid when the window's XZ origin (chunks), the seed,
@@ -164,6 +203,19 @@ void SetBuffer(const rhi::Buffer* buf);
 // Writes WaterFlow().Words() when they changed since the last upload. Called
 // from WriteRenderParams, the one place every drawing path sets its params.
 void Upload(const rhi::Queue& queue);
+
+// THE MEASURED FLOW at a world position, cells/s (horizontal), from a copy of
+// the GRID region (`grid` = kFlowMeasGridWords words, read back by a gate).
+// TRANSCRIBED from common.wgsl flowMeasAt -- the same bilinear weights over
+// the same quantised words and the same band gate. Render-only data: no sim
+// consumer may read it (there is no readback on the frame path, and the moves
+// it records are this machine's GPU's).
+Vec3 SampleMeasured(const uint32_t* grid, Vec3 posVox);
+// The composition currentAt makes (common.wgsl): the measured flow counts in
+// full and the solved field fades out under it, gone once the measured speed
+// reaches kFlowMeasTakeover cells/s.
+constexpr float kFlowMeasTakeover = 4.0f;
+Vec3 BlendMeasured(Vec3 solved, Vec3 measured);
 }  // namespace flowfield
 
 }  // namespace sandvox

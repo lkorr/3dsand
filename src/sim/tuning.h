@@ -4526,6 +4526,15 @@ struct Tuning {
     bool asyncCompute = TPD(render, asyncCompute);
     float dbgCurrentSpacing = TPD(render, dbgCurrentSpacing);
     float dbgCurrentRadius = TPD(render, dbgCurrentRadius);
+    // THE MEASURED FLOW's gain (flowfield.h kFlowMeas*, DESIGN.md §9d.12):
+    // how much of the current the simulation's own water records -- every
+    // lateral liquid move of the CA and every MPM particle, folded per node --
+    // the renderer draws over the map's solved field (arrows, streaks, boils,
+    // foam, film). 1 is the calibrated look; 0 removes it entirely (the
+    // record const-folds out of the CA and `mark`, the read out of the
+    // renderers, and the fold row is never recorded). Render-only either way:
+    // the world hash cannot see it.
+    float currentMeasured = TPD(render, currentMeasured);
 
     // translucent solids — ice, glass (shadeTranslucent in raymarch.wgsl).
     // A solid is translucent when its authored `opacity` is < 255; these

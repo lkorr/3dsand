@@ -124,14 +124,17 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "Flat per-tick cost over kNumChunks. This is the pass that makes every "
      "row below it scale with activity."},
     {"caLoop", "CA (54 passes)", "simTick", PerfSide::Gpu, PerfScope::Count,
-     "caMask;caList;ca;caMask1;caList1;ca1;reposeSnap",
+     "caMask;caList;ca;caMask1;caList1;ca1;reposeSnap;flowMeasFold",
      "27 colours x 2 substeps over the dirty list. Divide by active chunks for "
      "the per-chunk number the compute budget is denominated in. `reposeSnap` "
      "is the prepass that takes the angle-of-repose occupancy snapshot for the "
      "same list plus the nine neighbours a probe can reach: it is charged HERE "
      "rather than to a node of "
      "its own because it exists only to serve the CA row behind it, and a "
-     "reader comparing them separately would have to add them up anyway."},
+     "reader comparing them separately would have to add them up anyway. "
+     "`flowMeasFold` is the same kind of tail: the measured flow's fold "
+     "(flow_measure.wgsl), 67^2 threads over what the colour rows' liquid moves "
+     "recorded, on CA ticks and a 10 s decay tail after."},
     {"soluteSys", "Solute Layer", "simTick", PerfSide::Gpu, PerfScope::Count,
      "solWant;solArgs;solAlloc;solScoop;solPour;solDiffuse;solCompact;solHash;lr_solHash;ho_solHash;"
      "solEvict;solRestore",

@@ -442,6 +442,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // slots of this dense 0..58 layout.
         entry(59, T::ReadOnlyStorage), // farMap
         entry(60, T::Uniform),         // farUBO
+        // THE MEASURED FLOW (flowfield.h kFlowMeas*): the CA adds its liquid
+        // moves to the accumulator, flow_measure.wgsl folds it into the field
+        // the renderer reads (renderBGL_ 49). ALSO 61 in simSlimBGL_: the MPM
+        // `mark` pass adds its particles. Render-only. 61 is the first free
+        // slot of this dense 0..60 layout.
+        entry(61, T::Storage),         // flowMeasure (ACC | STATE | GRID)
     };
     simBGL_ =device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -490,6 +496,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // temperature layer's pool (common.wgsl HEAT UPDRAFTS).
         entry(50, T::Storage),         // heatPool
         entry(51, T::Storage),         // heatMeta
+        // Same binding number as in simBGL_: sim_fluid's `mark` adds every
+        // particle's momentum to the measured flow's accumulator.
+        entry(61, T::Storage),         // flowMeasure
     };
     simSlimBGL_ = device.CreateBindGroupLayout(sentries, std::size(sentries));
 
@@ -825,6 +834,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // window moves. Fragment for the waves, foam and film; Vertex for the
         // current arrow overlay (debug_current.wgsl). Render-only.
         entry(48, T::ReadOnlyStorage, S::Fragment | S::Vertex),   // flowGrid
+        // THE MEASURED FLOW (flowfield.h kFlowMeas*; common.wgsl flowMeasAt):
+        // what the simulation's water is really doing, blended over flowGrid
+        // by currentAt. Written by the tick's fold (flow_measure.wgsl), read
+        // here in the fragment and vertex stages, covered by the global
+        // barrier every command buffer opens with (gasOuter's standing).
+        entry(49, T::ReadOnlyStorage, S::Fragment | S::Vertex),   // flowMeas
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -921,6 +936,15 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   rainExpoBuf_ = CreateBuffer(
       device, (uint64_t)rainlat::kExpoMaxAxis * rainlat::kExpoMaxAxis * 4,
       rhi::BufferUsage::Storage | rhi::BufferUsage::CopySrc, "rainExpo");
+  // THE MEASURED FLOW (flowfield.h kFlowMeas*): ACC | STATE | GRID. Zeroed =
+  // nothing moved, no state, no field (GRID header word 2). CopySrc for the
+  // `flow-measure` gate's readback; CopyDst for the Fill rows. NO ZERO UPLOAD:
+  // CreateBuffer already queues a GPU zero fill (rhi_vulkan.cpp, "Zero-init,
+  // queued"), and the worldgen / load-reset Fill rows zero it again.
+  flowMeasBuf_ = CreateBuffer(device, (uint64_t)sandvox::kFlowMeasWords * 4,
+                              rhi::BufferUsage::Storage | rhi::BufferUsage::CopySrc |
+                                  rhi::BufferUsage::CopyDst,
+                              "flowMeasure");
   // The CA's air mask (pass_table.def caMask): written before each substep
   // for every dirty chunk and read only for those, so it needs no clear.
   // Its TAIL is the colour work lists (sim_step.wgsl CA_WORK_* / CA_POOL*):
@@ -1240,6 +1264,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // THE TERRAIN FLOW FIELD (flowfield.h): the current tracers in
         // wind_streak's `update` are advected by currentAt, which adds it.
         entry(35, T::ReadOnlyStorage), // flowGrid
+        // ...and the MEASURED flow it blends over it (flowfield.h kFlowMeas*),
+        // which the tick's fold writes; R(FlowMeasure) on the row.
+        entry(36, T::ReadOnlyStorage), // flowMeas
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1489,6 +1516,7 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(58, stillWaterBuf_),
         b(59, world_->farMap),
         b(60, world_->farUBO),
+        b(61, flowMeasBuf_),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -1508,6 +1536,7 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(46, draftBuf_),
         b(50, world_->heatPool),
         b(51, world_->heatMeta),
+        b(61, flowMeasBuf_),
     };
     simSlimBG_[page] =
         device.CreateBindGroup(simSlimBGL_, sentries, std::size(sentries), "simSlimBG");
@@ -2262,6 +2291,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mWorldgen, mMutate, mCompact, mStep, mOcc, mPick;
   // The rain exposure map (sim_rain_expo.wgsl): one tick entry on simPL_.
   rhi::ShaderModule mRainExpo;
+  // The measured flow's fold (flow_measure.wgsl): one tick entry on simPL_.
+  rhi::ShaderModule mFlowMeas;
   rhi::ShaderModule mDraft;
   // The solute layer's allocator, diffusion, compaction and hash
   // (docs/PLAN_solutes.md). Its own module: the CA carries mass through its
@@ -2325,6 +2356,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mWorldgen, "worldgen.wgsl");
     mod(&mMutate, "sim_mutate.wgsl");
     mod(&mRainExpo, "sim_rain_expo.wgsl");
+    mod(&mFlowMeas, "flow_measure.wgsl");
     mod(&mDraft, "sim_draft.wgsl");
     mod(&mCompact, "sim_compact.wgsl");
     mod(&mStep, "sim_step.wgsl");
@@ -2452,6 +2484,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { windWake_ = MakeComputePipeline(device, simPL_, mMutate, "windWake", "windWake"); });
   pool.Add([&] { rainFall_ = MakeComputePipeline(device, simPL_, mMutate, "rainFall", "rainFall"); });
   pool.Add([&] { rainExpo_ = MakeComputePipeline(device, simPL_, mRainExpo, "build", "rainExpo"); });
+  pool.Add([&] { flowMeasFold_ = MakeComputePipeline(device, simPL_, mFlowMeas, "fold", "flowMeasFold"); });
   pool.Add([&] { draftMaskAll_ = MakeComputePipeline(device, simPL_, mDraft, "maskAll", "draftMaskAll"); });
   pool.Add([&] { draftMaskDirty_ = MakeComputePipeline(device, simPL_, mDraft, "maskDirty", "draftMaskDirty"); });
   pool.Add([&] { draftArgs_ = MakeComputePipeline(device, simPL_, mDraft, "args", "draftArgs"); });
@@ -2951,6 +2984,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::Horizon:             return horizonBuf_;
     case B::HzLight:             return hzLightBuf_;
     case B::FlowGrid:            return flowGridBuf_;
+    case B::FlowMeasure:         return flowMeasBuf_;
     case B::GodVis:              return godVisBuf_;
     case B::GasMask:             return gasMaskBuf_;
     case B::GiReq:               return giReqBuf_;
@@ -3101,6 +3135,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::GiGather:       return giGather_;
     case P::ShadowPrepare:  return shadowPrepare_;
     case P::ShadowResolve:  return shadowResolve_;
+    case P::FlowMeasFold:   return flowMeasFold_;
     case P::FluidSpawn:     return fluidSpawn_;
     case P::FluidMark:      return fluidMark_;
     case P::FluidAlloc:     return fluidAlloc_;
@@ -3239,6 +3274,9 @@ void Simulation::EncodeWorldgen(const rhi::CommandEncoder& enc, bool denseGen) {
   // The dense `main` reads the column cache; WriteDenseGenList sized it.
   cx.genColCount = genColCount_;
   RecordTable(enc, pass::Table::Worldgen, &cx);
+  // wg_fill_flowMeasure zeroed the measured flow: nothing left to decay.
+  flowMeasTail_ = 0;
+  flowMeasLive_ = false;
   // A freshly generated world is maximally unsettled — the first hundreds of
   // ticks ARE the settling. Same self-declaration rule (§3.4).
   NoteWakeAll();
@@ -3564,6 +3602,8 @@ void Simulation::EncodeLoadReset(const rhi::CommandEncoder& enc) {
   page_ = 0;
   RecordCtx cx{};
   RecordTable(enc, pass::Table::LoadReset, &cx);
+  flowMeasTail_ = 0;      // lr_fill_flowMeasure zeroed the measured flow
+  flowMeasLive_ = false;
   // A load replaces every voxel in the window and the caller has already
   // written both dirty pages (worldio.cpp). Nothing the latch believed about
   // the previous world survives that (§3.4).
@@ -4175,6 +4215,26 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
     draftTail_--;
   }
   cx.draftTail = draftOn_ && draftTail_ > 0;
+  // ---- THE MEASURED FLOW (Cond::FlowMeasure / FlowMeasureClear) -----------
+  // The accumulator is fed by the CA colour rows (this tick, before the fold)
+  // and by the MPM `mark` row (LAST tick: PT_FLUIDMAP records after this
+  // table). So the fold records when either may have added -- the CA runs now,
+  // or the seam ran last tick -- and then for kFlowMeasTailTicks more, while
+  // the published field decays; the tick after that records ONE Fill that
+  // zeroes it, and a settled world then records nothing (rule 2). Every input
+  // is CPU-known tick state; the field is render-only either way.
+  {
+    const bool on = CurrentTuning().render.currentMeasured > 0.0f;
+    const bool fed = on && (cx.caActive || fluidSeamRecorded_);
+    if (fed) {
+      flowMeasTail_ = sandvox::kFlowMeasTailTicks;
+    } else if (flowMeasTail_ > 0) {
+      flowMeasTail_--;
+    }
+    cx.flowMeasure = on && (fed || flowMeasTail_ > 0);
+    cx.flowMeasureClear = !cx.flowMeasure && flowMeasLive_;
+    flowMeasLive_ = cx.flowMeasure;
+  }
   caSkipped_ = !cx.caActive;
   if (caSkipped_) caSkipCount_++;
 
@@ -4442,6 +4502,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(46, hzLightBuf_),           // the terrain light map (horizon.h kL*)
         b(47, world_->shadowHist),    // far patches' indirect light (shadow_resolve.wgsl)
         b(48, flowGridBuf_),          // the terrain flow field (flowfield.h)
+        b(49, flowMeasBuf_),          // the measured flow (flowfield.h kFlowMeas*)
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");
@@ -4544,6 +4605,7 @@ void Simulation::BuildShadowBindGroup() {
       b(33, hzLightBuf_),
       b(34, world_->farMap),
       b(35, flowGridBuf_),
+      b(36, flowMeasBuf_),
   };
   shadowBG_ = device_.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
 }

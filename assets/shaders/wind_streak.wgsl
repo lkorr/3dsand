@@ -80,6 +80,9 @@
 // a current tracer is advected by currentAt, which adds it. The wind_streak
 // row's R(FlowGrid) declares the read; the draw never reads it.
 @group(0) @binding(35) var<storage, read> flowGrid : array<u32>;
+// The MEASURED flow (shadowBGL_ 36; flowfield.h kFlowMeas*): currentAt blends
+// it over flowGrid. Written by the tick's fold; R(FlowMeasure) on the row.
+@group(0) @binding(36) var<storage, read> flowMeas : array<u32>;
 // The update's view (shadowBGL_ binding 22, compute).
 @group(0) @binding(22) var<storage, read_write> streaks : array<vec4f>;
 // The draw's view of the same buffer (renderBGL_ binding 33, vertex).
@@ -286,11 +289,13 @@ fn currentUpdate(i : u32, base : u32, h0In : vec4f, h1In : vec4f, dt : f32,
   var h1 = h1In;
   if (!streakAlive(h0, h1)) {
     // ---- respawn attempt ----
-    // Rivers, lakes and the sea live in flowGrid, not on the primitive list
-    // (which holds only live drains), so an empty list is not still water:
-    // the same gate as currentConvergeAt.
+    // Rivers, lakes and the sea live in flowGrid, and a breach's flood in the
+    // measured flow, not on the primitive list (which holds only live
+    // drains), so an empty list is not still water: the same gate as
+    // currentConvergeAt.
     if (R.currentRenderOn == 0u) { return; }
-    if (R.currentPrimCount == 0u && (!FLOW_BOUND || flowWord(2u) == 0u)) { return; }
+    if (R.currentPrimCount == 0u &&
+        (!FLOW_BOUND || (flowWord(2u) == 0u && flowMeasWord(2u) == 0u))) { return; }
     if (streakU01(11u, i) >= min(dt * CUR_SPAWN_RATE, 1.0)) { return; }
     let ang = streakU01(12u, i) * 6.28318531;
     let rr = sqrt(streakU01(13u, i)) * radius;

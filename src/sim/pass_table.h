@@ -400,6 +400,12 @@ enum class Buf : uint8_t {
   // surface of a map lake / river reach / the sea, or none. Derived from the
   // map like colCache, but persistent across gen lists.
   StillWater,
+  // THE MEASURED FLOW (src/sim/flowfield.h kFlowMeas*; simBGL_ / slim 61,
+  // renderBGL_ 49, shadowBGL_ 36): ACC is atomically added by the CA colour
+  // rows and the MPM `mark` row, folded into STATE + GRID by flowMeasFold and
+  // zeroed by a Fill; the raymarch, the arrow overlay and the current tracers
+  // read GRID. gasOuter's standing: render-only, never hashed, never saved.
+  FlowMeasure,
   kCount,
 };
 
@@ -572,6 +578,9 @@ enum class Pipe : uint8_t {
   // ShadowCache table.
   GasMask,
   // The GI gather cache's refresh (gi_gather.wgsl), two per-FRAME rows on the
+  // The measured flow's fold (flow_measure.wgsl `fold`), after the CA. Here,
+  // before ShadowResolve, which must stay the last enumerator.
+  FlowMeasFold,
   // ShadowCache table. Before ShadowResolve for the copy loop's bound.
   GiPrepare, GiGather,
   ShadowPrepare, ShadowResolve,
@@ -796,6 +805,14 @@ enum class Cond : uint8_t {
   // The body query (package E4): RecordCtx::elecQueries > 0, whatever the CA
   // did this tick.
   ElecQuery,
+  // THE MEASURED FLOW (RecordCtx::flowMeasure / flowMeasureClear,
+  // Simulation::EncodeTick). FlowMeasure: the fold + the accumulator's Fill --
+  // a tick on which the CA or the fluid seam ran (either may have added), and
+  // kFlowMeasTailTicks after, while the field decays. FlowMeasureClear: the
+  // ONE tick after that, which zeroes the published field so a settled world
+  // reads none and records nothing.
+  FlowMeasure,
+  FlowMeasureClear,
 };
 
 // Which command buffer a row belongs to — one per Encode* entry point.
@@ -926,6 +943,7 @@ enum class DispatchSel : uint32_t {
 // Raised 28 -> 32 by the temperature layer: `ca` gains R(HeatPool)
 // A(HeatMeta) R(HeatParams) -> 29 uses.
 // Raised 32 -> 36 by the lake reservoir: `ca` gains R(StillWater) -> 33 uses.
+// `ca` gains A(FlowMeasure) (the measured flow, 2026-10-15) -> 34 uses.
 inline constexpr int kMaxUses = 36;
 
 
@@ -1109,6 +1127,9 @@ struct RecordCtx {
   // Cond::Draft's args + solve rows recorded on SETTLED ticks long enough
   // for any solve already started to publish.
   bool draftTail = false;
+  // The measured flow's two conditions (Cond::FlowMeasure / FlowMeasureClear).
+  bool flowMeasure = false;
+  bool flowMeasureClear = false;
   // The charge field's rounds this tick (Simulation::PrepareElec: sim.elecRounds,
   // or 1 with the layer off). Gates Cond::ElecR1..ElecR7.
   uint32_t elecRounds = 1;

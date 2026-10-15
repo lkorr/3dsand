@@ -988,6 +988,78 @@ def check_ca_pool():
             f"sized from the C++ one")
 
 
+# ------------------------------------------------------------ measured flow
+def check_flow_measure():
+    """The measured flow's layout (flowfield.h kFlowMeas*) against its WGSL copies.
+
+    Four shaders spell it as literals: sim_step.wgsl and sim_fluid.wgsl ADD to
+    the accumulator (FLOWM_N slots per axis, FLOWM_ACC_Q, FLOWM_Y_BIAS),
+    flow_measure.wgsl folds it (the same three, plus FLOWM_STATE), and
+    common.wgsl reads the published grid (FLOWM_GRID, FLOW_MEAS_TAKEOVER).
+    The C++ side derives every one of them from kWorldN and kFlowStep, so a
+    window or lattice change moves them there and nowhere else -- which is
+    exactly the drift this catches: a writer binning onto a 67-slot torus
+    while the fold reads a 131-slot one draws a field from the wrong nodes.
+    """
+    wh = read("src/sim/world.h")
+    ff = read("src/sim/flowfield.h")
+    if not wh or not ff:
+        return
+    checked.append("measured flow")
+    mw = re.search(r"constexpr\s+uint32_t\s+kWorldN\s*=\s*(\d+)", wh)
+    ms = re.search(r"constexpr\s+int\s+kFlowStep\s*=\s*(\d+)", ff)
+    mh = re.search(r"constexpr\s+uint32_t\s+kFlowHeaderWords\s*=\s*(\d+)", ff)
+    mq = re.search(r"constexpr\s+int\s+kFlowMeasAccQ\s*=\s*(\d+)", ff)
+    mt = re.search(r"constexpr\s+float\s+kFlowMeasTakeover\s*=\s*([\d.]+)f", ff)
+    if not (mw and ms and mh and mq and mt):
+        problems.append("measured flow: kWorldN / kFlowStep / kFlowHeaderWords / "
+                        "kFlowMeasAccQ / kFlowMeasTakeover not found")
+        return
+    n = int(mw.group(1)) // int(ms.group(1)) + 3
+    slots = n * n
+    want = {
+        "FLOWM_N": n,
+        "FLOWM_ACC_Q": int(mq.group(1)),
+        "FLOWM_STATE": slots * 4,
+        "FLOWM_GRID": slots * 8,
+    }
+    sources = {
+        "sim_step.wgsl": ["FLOWM_N", "FLOWM_ACC_Q", "FLOWM_Y_BIAS"],
+        "sim_fluid.wgsl": ["FLOWM_N", "FLOWM_ACC_Q", "FLOWM_Y_BIAS"],
+        "flow_measure.wgsl": ["FLOWM_N", "FLOWM_ACC_Q", "FLOWM_Y_BIAS", "FLOWM_STATE"],
+        "common.wgsl": ["FLOWM_GRID", "FLOW_MEAS_TAKEOVER"],
+    }
+    bias = set()
+    for f, names in sources.items():
+        src = read("assets/shaders/" + f)
+        if not src:
+            problems.append(f"measured flow: assets/shaders/{f} not found")
+            continue
+        for name in names:
+            m = re.search(r"const\s+" + name + r"\s*:\s*\w+\s*=\s*([\d.]+)u?", src)
+            if not m:
+                problems.append(f"measured flow: {f} declares no {name}")
+                continue
+            v = float(m.group(1))
+            if name == "FLOWM_Y_BIAS":
+                bias.add(v)
+                continue
+            if name == "FLOW_MEAS_TAKEOVER":
+                if v != float(mt.group(1)):
+                    problems.append(f"measured flow: {f} FLOW_MEAS_TAKEOVER = {v} but "
+                                    f"flowfield.h kFlowMeasTakeover = {mt.group(1)}")
+                continue
+            if v != want[name]:
+                problems.append(f"measured flow: {f} {name} = {m.group(1)} but "
+                                f"flowfield.h derives {want[name]} (kWorldN "
+                                f"{mw.group(1)}, kFlowStep {ms.group(1)})")
+    if len(bias) > 1:
+        problems.append(f"measured flow: FLOWM_Y_BIAS differs between shaders ({sorted(bias)})")
+    if int(mh.group(1)) != 4:
+        problems.append("measured flow: common.wgsl's FLOW_HEADER is 4 words; "
+                        f"flowfield.h kFlowHeaderWords = {mh.group(1)}")
+
+
 # ------------------------------------------------------ wind primitive layout
 def check_wind_prims():
     """world.h's wind primitive ceilings must match common.wgsl's constants.
@@ -3600,6 +3672,7 @@ ALL = {
     "sound": check_sound_slots,
     "substeps": check_fluid_substeps,
     "capool": check_ca_pool,
+    "flowmeas": check_flow_measure,
     "tuning": check_tuning_consts,
     "tuningreach": check_tuning_reach,
     "tuningused": check_tuning_consumers,
@@ -3685,6 +3758,9 @@ RELEVANT = {
     "src/sim/windfield.cpp": ["windmirror"],
     "assets/shaders/wind_streak.wgsl": ["windstreak"],
     "assets/shaders/sim_draft.wgsl": ["drafts"],
+    "assets/shaders/flow_measure.wgsl": ["flowmeas"],
+    "assets/shaders/sim_fluid.wgsl": ["flowmeas"],
+    "src/sim/flowfield.h": ["flowmeas"],
     "src/sim/coatrule.h": ["coatrule", "stainprec"],
     "src/sim/reactcpu.h": ["reactgate"],
 }

@@ -269,6 +269,11 @@ TP_F(render, waveSimSlope, TUNE_WAVE_SIM_SLOPE, 0.030f, 0.0f, 0.5f)
 TP_F(render, waveSimFoam, TUNE_WAVE_SIM_FOAM, 0.55f, 0.0f, 4.0f)
 TP_F(render, dbgCurrentSpacing, TUNE_CUR_DBG_SPACING, 6.0f, 1.0f, 64.0f)
 TP_F(render, dbgCurrentRadius, TUNE_CUR_DBG_RADIUS, 40.0f, 0.0f, 256.0f)
+// THE MEASURED FLOW (flowfield.h kFlowMeas*, DESIGN.md 9d.12): the gain on the
+// current the simulation's own water records (a breach, a flood), blended over
+// the map's solved field. 0 const-folds the record out of the CA and the MPM
+// mark pass and the read out of every renderer, and records no fold row.
+TP_F(render, currentMeasured, TUNE_CURRENT_MEASURED, 1.0f, 0.0f, 4.0f)
 TP_F(render, reflectionCutoff, TUNE_REFLECTION_CUTOFF, 0.06f, 0.0f, 1.0f)
 TP_I(render, reflectionSteps, TUNE_REFLECTION_STEPS, 96, 0, 512)
 TP_F(render, causticGain, TUNE_CAUSTIC_GAIN, 1.5f, 0.0f, 8.0f)

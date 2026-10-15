@@ -159,6 +159,7 @@ PIPE_TO_MEMBER = {
     "PIPE_GI_PREPARE": "giPrepare_",
     "PIPE_GI_GATHER": "giGather_",
     "PIPE_RAIN_EXPO": "rainExpo_",
+    "PIPE_FLOWMEAS_FOLD": "flowMeasFold_",
     "PIPE_WIND_STREAK": "windStreak_",
     "PIPE_FLUID_SPAWN": "fluidSpawn_",
     "PIPE_FLUID_MARK": "fluidMark_",
@@ -277,6 +278,9 @@ BUF_TO_WGSL = {
     # The terrain flow field (src/sim/flowfield.h); the raymarch DRAW's view
     # (renderBGL 48) is not a row.
     "FlowGrid": {"flowGrid"},
+    # The MEASURED flow (flowfield.h kFlowMeas*): the CA's / mark's
+    # accumulator view, the fold's read-write view, the readers' view.
+    "FlowMeasure": {"flowMeasAcc", "flowMeasRW", "flowMeas"},
     "GodVis": {"godVis"},
     "GasMask": {"gasMask"},
     # The GI gather request list; GiArgs is indirect-only and never bound.
@@ -524,6 +528,9 @@ _SIM_GROUP0 = {
     # beyond-the-window completion (a clear ray leaving the window under the
     # terrain's top is blocked). simBGL_ only.
     "farMap", "F",
+    # The measured flow, binding 61 (flowfield.h kFlowMeas*): sim_step adds
+    # to it (`flowMeasAcc`), flow_measure.wgsl folds it (`flowMeasRW`).
+    "flowMeasAcc", "flowMeasRW",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers
@@ -564,7 +571,10 @@ _SLIM_GROUP0 = {"voxels", "dirtyIn", "dirtyOut", "materials", "T",
                 "draftField",
                 # heatPool / heatMeta (50/51) too, since wind phase 5: the
                 # particle drag reads the heat updraft through windAtQ.
-                "heatPool", "heatMeta"}
+                "heatPool", "heatMeta",
+                # flowMeasAcc (61) too: sim_fluid's `mark` adds its particles
+                # to the measured flow's accumulator.
+                "flowMeasAcc"}
 # farVox + farP since chunk tickets P2: a particle outside residency flies on
 # and blocks against the far cascade (sim_particle.wgsl FAR FLIGHT), exactly as
 # a gas parcel does (simulation.cpp particleBGL_ bindings 8 and 9).
