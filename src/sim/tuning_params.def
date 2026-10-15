@@ -1291,6 +1291,15 @@ TP_I(sim, draftMode, NO_WGSL, 1, 0, 1)
 // chunk-sized coarse grid, and sweeps per fine (Schwarz) pass.
 TP_I(sim, draftCoarseSweeps, TUNE_DRAFT_COARSE_SWEEPS, 32, 4, 256)
 TP_I(sim, draftFineSweeps, TUNE_DRAFT_FINE_SWEEPS, 6, 1, 64)
+// THE JETS (sim_draft.wgsl `jets`): indoor air keeps its momentum. 0 = the
+// readers' directional transfers are +-R exactly (the pure projection).
+TP_I(sim, draftJet, TUNE_DRAFT_JET, 1, 0, 1)
+// A jet's sideways spread per 0.4 m cell: 64ths of its momentum flux to each
+// of four sides. More = a wider, faster-fading jet; 6 widens a 0.6 m window's
+// jet to ~1.2 m across a 5 m room, near a free jet's ~12 degrees a side.
+TP_I(sim, draftJetSpread, TUNE_DRAFT_JET_SPREAD, 6, 0, 16)
+// A jet's loss per 0.4 m cell, in 256ths: 3 keeps ~70% over 4.8 m.
+TP_I(sim, draftJetDecay, TUNE_DRAFT_JET_DECAY, 3, 0, 64)
 // ---- the CURRENT field's one sim coupling (PLAN_water_master.md comp 8)
 // The only current knob the SHADER reads. Everything else about the field is
 // resolved into primitives on the CPU, so this is the whole .def surface:

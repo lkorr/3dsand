@@ -2664,6 +2664,20 @@ static_assert(kWindStreakStride == 2 + kWindStreakTrail, "streak row layout");
 //   [kDraftStackField, + 2 cells)    THE STACK FIELD: S = P(b) - b, 3 x i16
 //                                   Q12 of the cap: S.x | S.y << 16, S.z
 //   [kDraftStackLive]                1 when the published solve saw heat
+//   THE JETS (2026-10-14, sim_draft.wgsl `jets`): the transfer the READERS
+//   use. Potential flow has no momentum, so air through a window spread over
+//   the whole room at once; the jet stage marches each opening's inflow
+//   across covered air and keeps whichever of it and the projection is
+//   stronger. That is not odd in the wind, so it is stored per SIGN:
+//   [kDraftJetField, + 8 cells)      4 directional transfers (+X, -X, +Z, -Z),
+//                                   2 words a cell each: T.x | T.y << 16, T.z
+//                                   (i16 Q12). Direction d at kDraftJetField +
+//                                   d * 2 cells, in its MARCH order: cell
+//                                   (x * 2048 + z + 64 y) for +-X, (z * 2048 +
+//                                   x + 64 y) for +-Z (common.wgsl
+//                                   draftJetIndex). Outdoors (no roof above) and
+//                                   with the jets off, T = +-R exactly.
+//   [kDraftJetPrep, + 6 cells)       the march's packed input, scratch
 // Buffer `draftMeta` (binding 47, atomics): kDraftMeta* words below.
 // MIRRORED as DRAFT_* in common.wgsl (check_invariants `drafts`).
 constexpr uint32_t kDraftCellShift = 2;   // a cell is 4 voxels (0.4 m)
@@ -2689,7 +2703,12 @@ constexpr uint32_t kDraftStackPhiA = kDraftStackB + kDraftCells;
 constexpr uint32_t kDraftStackPhiB = kDraftStackPhiA + kDraftCells;
 constexpr uint32_t kDraftStackField = kDraftStackPhiB + kDraftCells;
 constexpr uint32_t kDraftStackLive = kDraftStackField + 2 * kDraftCells;
-constexpr uint32_t kDraftWords = kDraftStackLive + 4;
+constexpr uint32_t kDraftJetField = kDraftStackLive + 4;
+// The jet march's packed input (sim_draft.wgsl jetPrep): per march axis (X,
+// then Z) 3 words a cell in slice-major order, so the serial march reads
+// coalesced words instead of the field's scattered ones.
+constexpr uint32_t kDraftJetPrep = kDraftJetField + 8 * kDraftCells;
+constexpr uint32_t kDraftWords = kDraftJetPrep + 6 * kDraftCells;
 // The fine pass works one 8^3-cell TILE per workgroup.
 constexpr uint32_t kDraftTiles = (kDraftNX / 8) * (kDraftNY / 8) * (kDraftNZ / 8);
 // draftMeta words.
@@ -2708,6 +2727,9 @@ constexpr uint32_t kDraftMetaHeatClock = 33;  // kHmDraftHeatClock at the last s
 constexpr uint32_t kDraftMetaBoxHot = 34;     // the last snapshot saw b != 0 (OR)
 constexpr uint32_t kDraftMetaHeatStart = 35;  // tick the last solve started
 constexpr uint32_t kDraftMetaWords = 40;
+static_assert(kDraftNX == 64 && kDraftNY == 32 && kDraftNZ == 64,
+              "sim_draft.wgsl jets / common.wgsl draftJetIndex: 64-cell slices of 64 x 32 "
+              "planes (JET_PLANE 2048, u < 64) -- a new box size needs the march re-laid");
 static_assert(kDraftNX % 8 == 0 && kDraftNY % 8 == 0 && kDraftNZ % 8 == 0,
               "the fine passes work whole 8^3-cell tiles (2 x 2 x 2 chunks)");
 static_assert((kChunk >> kDraftCellShift) == 4,

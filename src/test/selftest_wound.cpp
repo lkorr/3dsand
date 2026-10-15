@@ -74,6 +74,7 @@
 #include "gpu/resources.h"  // CreateBuffer, ditto
 #include "sim/microbody.h"
 #include "phys/bodystain.h"   // bruise-is-skin: SoakBruise and the coat rules
+#include "phys/floatrho.h"    // corpse-float: the one floating-density rule
 #include "phys/coatcontact.h"  // lava-quench: BuildLatticeOcc (which voxels are surface)
 #include "sim/tuning.h"
 #include "sim/weather.h"  // corpse-sleep: the rain word, for attribution
@@ -8847,6 +8848,83 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
       }
     }
   }
+  // THE SEVERED ARM. Owner, 2026-10-14: "corpses will float but their limbs
+  // will slowly sink. we need consistency in how corpses and limbs float under
+  // the same rules." A severed piece is DEBRIS (DebrisSystem::FloatBodies),
+  // which floated it as its single most common material -- muscle, heavier
+  // than water -- while the rig floats a limb on its mean matter less the
+  // corpse's air. Same basin, same drop: a human loses its right arm at the
+  // shoulder and its left leg at the knee, then dies. Each piece must float at
+  // the density its rig limb did (the piece's FloatingDensityOf against the
+  // limb's LimbFloatDensity x (1 - air), within 1 kg/m^3), and each chain's
+  // top piece, lighter than water as a limb, must come to rest at the waterline as
+  // the corpse does rather than sink to the bed.
+  struct Piece {
+    const char* limb;
+    bool top;            // the cut limb (its children ride jointed to it)
+    uint64_t h = 0;      // the body handle, kept across the sever
+    float rigRho = 0;    // what the rig floated it at
+    float debrisRho = 0; // what debris floats it at
+    float lowest = 1e9f, final = -1;
+  };
+  Piece pieces[] = {{"armU.R", true}, {"armL.R", false}, {"hand.R", false},
+                    {"legL.L", true}, {"foot.L", false}};
+  bool severRan = false;
+  std::string severWhy;
+  if (const int d = mobs.FindDef("human"); d >= 0) {
+    mobs.Reset();
+    c.debris.Reset();
+    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) { o.cells = basin; });
+    support::RunTicks(rig, 20);
+    const uint64_t id = mobs.Spawn(d, {site.x, waterTop + 3, site.z});
+    Mob* m = id ? mobs.FindMobById(id) : nullptr;
+    if (m && m->Def()) {
+      mobs.SetMobBehavior(id, "dummy");
+      const float air = CurrentTuning().ragdoll.corpseAirFraction;
+      auto limbIdx = [&](const char* n) {
+        for (int li = 0; li < (int)m->Def()->limbs.size(); li++)
+          if (m->Def()->limbs[li].name == n) return li;
+        return -1;
+      };
+      for (Piece& p : pieces) {
+        const int li = limbIdx(p.limb);
+        if (li < 0) continue;
+        p.h = mobs.LimbBody(id, li);
+        p.rigRho = FloatingDensity(m->LimbFloatDensity(li), true, air);
+      }
+      for (const Piece& p : pieces)
+        if (p.top && limbIdx(p.limb) >= 0) mobs.Sever(id, limbIdx(p.limb));
+      if (Mob* mm = mobs.FindMobById(id)) mm->Die();
+      severRan = true;
+      for (int i = 0; i < kTicks; i++) {
+        support::RunTicks(rig, 1);
+        for (Piece& p : pieces) {
+          Vec3 com{};
+          if (p.h && c.phys.BodyCenterOfMass(p.h, com)) {
+            p.lowest = std::min(p.lowest, com.y);
+            p.final = com.y;
+          }
+        }
+      }
+      for (Piece& p : pieces) p.debrisRho = c.debris.FloatingDensityOf(p.h);
+    }
+  }
+  bool severOk = severRan;
+  for (const Piece& p : pieces) {
+    const bool sameRule = p.h != 0 && p.debrisRho > 0 &&
+                          std::fabs(p.debrisRho - p.rigRho) <= 1.0f;
+    // Where it RESTS, not how deep it went: a piece dropped in goes under
+    // and bobs back up (measured: the cut leg dipped to 3.6 voxels off the
+    // bed and ended at the waterline). `lowest` is reported, not asserted.
+    const bool floats = !p.top || p.rigRho >= 1000.0f ||
+                        std::fabs(p.final - (float)(waterTop + 1)) <=
+                            (float)BaselineNumber("corpseFloatBand", 4.0);
+    severOk = severOk && sameRule && floats;
+    severWhy += Format(" %s%s: rig %.0f debris %.0f, lowest y%.1f final y%.1f%s;",
+                       p.limb, p.top ? "(cut)" : "", p.rigRho, p.debrisRho,
+                       p.lowest, p.final,
+                       !sameRule ? " RULES DIFFER" : !floats ? " SANK" : "");
+  }
   mobs.Reset();
   c.debris.Reset();
   PrepareWorld(c);
@@ -8869,7 +8947,7 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
                        std::fabs(limp.final - (float)(waterTop + 1)) <= band &&
                        limp.final >= hu.final - 0.5f);
   const bool ok = humanOk && sank(au) && (!au.ran || au.asleepAt >= 0) &&
-                  sank(an) && sylvanOk && limpOk;
+                  sank(an) && sylvanOk && limpOk && severOk;
   auto line = [&](const Arm& a) {
     if (!a.ran) return Format("%s: (no def %s); ", a.label, a.def);
     return Format("%s: surface y%.0f, ", a.label, a.surf) + Format("rho %.0f, pelvis lowest y%.1f final y%.1f, %u pushes, "
@@ -8886,7 +8964,9 @@ Status GateCorpseFloat(Ctx& c, std::string& detail) {
                               limpHeld ? "held limp" : "NOT LIMP AT END",
                               limp.surf, limp.lowest, limp.final, limp.pushes,
                               limp.trace.c_str())
-                     : std::string("limp human: (no def)"));
+                     : std::string("limp human: (no def)")) +
+           (severRan ? " | severed:" + severWhy
+                     : std::string(" | severed: (no human)"));
   std::printf("corpse-float: %s %s\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }

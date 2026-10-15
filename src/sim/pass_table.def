@@ -463,6 +463,15 @@ PASS(draftFineMid2, "draft", PT_TICK, PIPE_DRAFT_FINE2B, K_INDIRECT, IND_DRAFTAR
      USES(I(DraftArgs) RW(Draft) A(DraftMeta)))
 PASS(draftFineLast, "draft", PT_TICK, PIPE_DRAFT_FINE3, K_INDIRECT, IND_DRAFTARGS,80,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
      USES(I(DraftArgs) RW(Draft) A(DraftMeta)))
+// THE JETS (2026-10-14): on the publishing stage's own args record, after the
+// field it reads -- the four directional transfers the readers apply (indoor
+// air keeps its momentum). jetPrep packs the march's input slice-major (16
+// groups of columns do the work); jets marches it, one group per direction.
+// The rest of the record's tile count returns at once in both.
+PASS(draftJetPrep, "draft", PT_TICK, PIPE_DRAFT_JET_PREP, K_INDIRECT, IND_DRAFTARGS,80,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
+     USES(I(DraftArgs) RW(Draft)))
+PASS(draftJets, "draft", PT_TICK, PIPE_DRAFT_JETS, K_INDIRECT, IND_DRAFTARGS,80,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
+     USES(I(DraftArgs) RW(Draft)))
 
 // ---- phase 3: the CA loop -------------------------------------------------
 // 27 colors x 2 gravity substeps, one workgroup per dirty chunk. A settled

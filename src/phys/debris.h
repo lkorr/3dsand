@@ -1480,6 +1480,10 @@ class DebrisSystem {
     float floatLastSurfaceY = 0;
   };
   const FloaterProbe& Floaters() const { return floaters_; }
+  // The density body `handle` floats at (FloatBodies' rhoBody: its matter,
+  // less ragdoll.corpseAirFraction when it came off a creature), 0 when there
+  // is no such body. For gates comparing a severed piece with the rig limb.
+  float FloatingDensityOf(uint64_t handle);
   void ResetFloaterProbe() { floaters_ = FloaterProbe{}; }
 
   // ---- persistence (sim/worldio.h, entities.sve section 'DBRS') -----------
@@ -1735,6 +1739,11 @@ class DebrisSystem {
     // 32k-voxel lattice per contact would not be free. Refreshed wherever the
     // voxel list is rewritten (adoption, damage, shatter, load).
     uint32_t domMat = 0;
+    // FloatBodies' cache of the mean density of this body's matter plus its
+    // strapped followers (phys/floatrho.h), keyed on their total voxel count
+    // the way Mob::LimbFloatDensity keys a limb's. Derived, never saved.
+    float floatRho = 0;
+    uint32_t floatRhoKey = 0;
     uint32_t lastImpactStep = 0;  // rate limit, in PostStep counts (30 Hz)
     // body burn (fire continuity on rigidbodies):
     uint32_t serial = 0;          // stable RNG stream id (bodies_ reshuffles)
@@ -2195,6 +2204,10 @@ class DebrisSystem {
   // buoyancy factor is rhoLiquid/rhoBody off the same materials.json density
   // the particle kernel uses, so a chip blown off a log and the log agree.
   void FloatBodies(uint32_t tick, World& world);
+  // The mean density of a body's matter plus its strapped followers
+  // (phys/floatrho.h, cached on the body): what FloatBodies floats it at
+  // before the air a creature's piece loses.
+  float BodyMatterDensity(Body& b);
 
   Physics* phys_ = nullptr;
   World* world_ = nullptr;

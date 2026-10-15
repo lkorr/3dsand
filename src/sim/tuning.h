@@ -3435,6 +3435,17 @@ struct Tuning {
     // runs only when blockers in the box change).
     int draftCoarseSweeps = TPD(sim, draftCoarseSweeps);
     int draftFineSweeps = TPD(sim, draftFineSweeps);
+    // THE JETS (sim_draft.wgsl `jets`). Potential flow has no momentum, so
+    // air through a window spread over the whole room at once and a room
+    // with a gale through it stood still between its openings. Under cover
+    // (a roof or ceiling somewhere above) the inflow is marched across the
+    // room as a jet: it widens by draftJetSpread 64ths a side and loses
+    // draftJetDecay 256ths per 0.4 m cell, and a cell takes whichever of the
+    // jet and the projection is stronger. Outdoors nothing changes. 0 = the
+    // pure projection, an exact identity. A change re-solves the box.
+    int draftJet = TPD(sim, draftJet);
+    int draftJetSpread = TPD(sim, draftJetSpread);
+    int draftJetDecay = TPD(sim, draftJetDecay);
 
     // ---- dev force multipliers, one per TIER ----
     // NO_WGSL rows in tuning_params.def, and that is deliberate rather than

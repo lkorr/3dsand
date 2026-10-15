@@ -1537,6 +1537,9 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       // a change re-solves the whole volume (a burst), as a material reload
       // does. Live tuning, outside replay, like every live sim.* knob.
       sim.NoteDraftHeatKnobs(tp.updraftGainQ, tp.updraftCapQ, tp.draftStackQ);
+      const int32_t solverKnobs[5] = {s.draftCoarseSweeps, s.draftFineSweeps, s.draftJet,
+                                      s.draftJetSpread, s.draftJetDecay};
+      sim.NoteDraftSolverKnobs(solverKnobs);
       // The render copy. The sim reads the term only through windAtQ, which
       // windMode 0 switches off whole, so the arrows show none then either.
       gHeatRenderQ[0] = tp.windMode != 0 ? tp.updraftGainQ : 0;

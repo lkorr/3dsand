@@ -1114,6 +1114,68 @@ Still open (§14.9 stands):
 - grass sway inside the volume, which needs raymarch register headroom;
 - an F1 readout of the volume's state (solves, stage, last publish).
 
+### 14.12 Jets: the momentum the projection does not have (2026-10-14)
+
+Owner report: wind points into a window and out of the next one, but there is
+almost no air movement inside the building, even with an intense wind.
+
+**Diagnosis: the model, not a bug.** Potential flow is irrotational and
+inertia-free; continuity alone sets the speed inside, so a room behind small
+windows sits at (window area / room section) of the window speed. The gate's
+new window hall measured it: 3.1 at the windward window cell, 0.57 one cell in,
+0.30 mid-room, 3.4 at the leeward window. Real cross-ventilation is a free jet
+(core ~6 opening widths, then centre speed ~ 1/distance, half-angle ~12 deg):
+a sudden expansion recovers no pressure, so the inflow keeps its momentum
+across a room whose pressure is roughly uniform.
+
+**Why not a time-stepped fluid in the box.** It would carry history (the
+field stops being a function of the geometry), never sleep while the wind
+blows, and need f32 or a far bigger integer solver. A jet field is still a
+function of geometry alone, so it re-solves with the projection and nothing
+else.
+
+**Why directional.** The projection is odd in the wind and stores two
+transfers; a jet is not (which window is the inlet depends on the sign), so the
+box now publishes four, and the readers pick by sign. The readers index the
+direction's own slice-major layout, which costs a single-cell lookup nothing.
+
+**Why only under cover.** Carrying momentum everywhere broke the projection
+where it is right: the stagnation in front of a wall (a carried stream rammed
+the wall at full speed), the dead-end door (outdoor momentum carried in through
+a door the projection had correctly closed to net flow), and the hill lee. Under
+a roof every one of those cases is either absent or seeded by the projection's
+own flux at the first covered cell. "Covered" = a horizontal face at most 4 of
+16 rows open somewhere above, in the box.
+
+**What it carries, and three versions.** (1) The whole J vector times its
+forward share: the projection spreads a doorway's inflow sideways at its edges,
+the per-component pick kept that sideways part, and every later step charged
+it again -- a quarter of the jet lost per cell. (2) The forward component,
+spread linearly: conserves volume flux, so the jet stayed a 0.6 m pencil (room
+mean 1.5x the projection's). (3) The forward MOMENTUM FLUX, u^2, spread and
+square-rooted (integer bit-by-bit sqrt): speed falls as 1/width as the jet
+entrains the room, faces pass their open share of u^2 (so the root of the
+contraction in speed). Shipped: spread 6/64 a side, decay 3/256 a cell.
+
+**Measured** (`drafts`, wind +X 12 m/s): window hall mid-room 0.30 -> 1.43 of
+the outside wind, room mean 0.25 -> 0.48, cells at >= 0.25 of the wind 240 ->
+346 of 605; door hut room mean 0.40 -> 0.76; sealed 0.038, door-only 0.139
+(the projection's 0.035: the inflow half of the mouth's exchange carries in);
+open air and the alley bit-identical to the projection; purity 0 of 1,048,576
+jet words differ on a forced rebuild. Determinism hash unchanged (the harness
+scenario has no covered air in the box).
+
+**Cost.** First layout 142 µs/frame in `--perf explosion` (the march read the
+field directly, X-march threads 2,048 words apart, ~13 scattered reads a cell a
+slice). A slice-major prep pass plus coalesced output stores: `draftJetPrep`
+15 + `draftJets` 37 µs/frame. Prefetching the next slice's words changed
+nothing (the stores were the bottleneck, not the loads).
+
+Still open: the recirculating eddy round a jet (the far corners of a room stay
+calmer than they would), jets through roof openings and chimneys (the march is
+horizontal; the stack effect covers buoyant flow there), and the CPU mirror
+(debris, corpses, the F1 readout) still reads the ambient field.
+
 ### 14.11 The stack effect: heat as a third right-hand side (wind phase 5, 2026-10-02)
 
 The projection is linear, so heat enters the SAME solve as a third source: the

@@ -534,7 +534,7 @@ enum class Pipe : uint8_t {
   // Wind drafts (sim_draft.wgsl). BEFORE ShadowResolve for the copy loop's
   // bound stated above.
   DraftMaskAll, DraftMaskDirty, DraftArgsP, DraftCoarseBuild, DraftCoarseFaces,
-  DraftCoarseSolve, DraftFineFirst, DraftFineMid, DraftFineMid2, DraftFineLast,
+  DraftCoarseSolve, DraftFineFirst, DraftFineMid, DraftFineMid2, DraftFineLast, DraftJetPrep, DraftJets,
   // The temperature layer (sim_heat.wgsl). BEFORE ShadowResolve for the copy
   // loop's bound stated above.
   HeatBegin, HeatShift, HeatPend, HeatWant, HeatArgsP, HeatAlloc, HeatSrc, HeatDue, HeatTent, HeatRelax,

@@ -27,7 +27,9 @@
 // between big volumes jets (the interstitial speed is the flux over the open
 // fraction). Two walls with an alley speed the wind up by continuity. What it
 // does NOT do: no turbulent wake (the calm pocket behind a wall is about one
-// wall high, not ten), and fans are added after, unprojected. HEAT is a third
+// wall high, not ten), and fans are added after, unprojected. Nor does it
+// carry MOMENTUM -- air through a window spreads over the room at once -- which
+// THE JETS stage (end of file) adds back under cover. HEAT is a third
 // right-hand side since wind phase 5 (THE STACK EFFECT below): the volume is
 // then a function of geometry AND the heat in it, and re-solves when either
 // moves.
@@ -75,6 +77,12 @@
 //                        held -- at the coarse reconstruction on the first pass,
 //                        at the neighbours' previous answer after that -- and
 //                        the last pass writes the transfer.
+//   jetPrep / jets       on the last pass's tick: the cover and a slice-major
+//                        copy of the march's input, then one group per
+//                        horizontal direction marches the inflow across
+//                        covered air as a jet and publishes the four
+//                        DIRECTIONAL transfers the readers apply (THE JETS, at
+//                        the end of this file).
 //
 // THE POCKET RULE IS NOT OPTIONAL. A coarse cell is one node; its fine cells
 // need not be one air. Where a roof meets a wall the coarse cell holds the
@@ -1134,5 +1142,315 @@ fn fineLast(@builtin(workgroup_id) wg : vec3<u32>,
   // Publish whether the stack field is live, with the field it describes.
   if (wg.x == 0u && li == 0u) {
     draftField[DRAFT_STACK_LIVE] = select(0u, 1u, stackLive());
+  }
+}
+
+// ---- THE JETS (2026-10-14): indoor air keeps its momentum ----------------------
+// WHAT WAS WRONG. The projection above is potential flow, and potential flow
+// has no momentum: air through a window spreads over the whole room the
+// moment it is inside, so the speed in the room is the window's flux over the
+// room's cross-section. A 0.6 m window into a 7 m longhouse left the room at a
+// percent of the window's speed -- a gale through the windows and still air
+// between them. Real cross-ventilation is a JET: the inflow keeps going across
+// the room at near its entry speed (a free jet's core runs ~6 opening widths),
+// spreads slowly, and splashes along the far wall toward the way out. The
+// pressure in a room is roughly uniform, so nothing decelerates it the way the
+// projection does; a sudden expansion recovers no pressure.
+//
+// WHAT THIS COMPUTES. Per sign of each horizontal axis (+X, -X, +Z, -Z) a
+// DIRECTIONAL transfer T: what a unit wind along that direction becomes at the
+// cell. The projection is odd in the wind (R(-e) = -R(e)), a jet is not -- a
+// +X wind's jet enters at the west window, a -X wind's at the east one -- so
+// the readers (common.wgsl draftApplyQ / draftApplyF) pick T by the sign of
+// the ambient's component and scale it by the magnitude. One workgroup per
+// direction marches the box slice by slice along that direction, the slice
+// (2,048 cells) in workgroup memory:
+//
+//   C(p) = (1 - decay) x sqrt(sum over the 5 upstream cells q (straight
+//          behind, and one step to each side of it) of w_q x k_q x J(q).fwd^2)
+//   J(p).fwd = whichever of C(p) and S(p).fwd is larger in size (S = +-R(p));
+//   J(p).side = S(p).side, plus what a wall ahead turns aside (below)
+//
+// The jet is the FORWARD momentum only: what is carried is J's component along
+// the march, and the sideways components are the projection's own. The first
+// version carried the whole vector scaled by its forward share, and lost a
+// quarter of the jet per cell: the projection spreads a doorway's inflow
+// sideways at its edges, the pick kept that sideways part, and every later
+// step charged it again. What spreads is the MOMENTUM FLUX, u^2: w is
+// 1 - 4 x spread straight behind and spread to each side, k the open share
+// of the faces crossed, and the root brings it back to a speed. So a uniform
+// stream carries itself unchanged, and a jet widens and slows as a free jet
+// does -- it entrains the room's still air, so its volume flux grows while
+// its momentum flux holds, and its speed falls as 1 / width, not 1 / area.
+// (Spreading u itself, the first version, conserved the volume flux instead:
+// the jet either stayed a pencil or died within a metre.) A window passes its
+// momentum flux, so the speed into the room drops with the ROOT of the
+// contraction, not linearly as the volume flux would have it. Where the
+// forward face is closed the blocked part of the forward momentum turns along
+// the wall, in the direction the projection's own lateral flow already points
+// -- toward the way out, if there is one.
+//
+// WHERE IT APPLIES: ONLY UNDER COVER. A cell is covered when a (nearly) closed
+// horizontal face lies anywhere above it in the box -- a roof, a floor above,
+// a cave ceiling. Momentum is carried only between covered cells, and an
+// uncovered cell keeps T = S exactly. That is the whole safety argument:
+//   * outdoors nothing changes (the stagnation in front of a wall, the lee
+//     behind it, the venturi in an alley are the projection's, as before);
+//   * a jet is SEEDED by the projection at the first covered cell it meets,
+//     and the projection only sends air through an opening that has a way out,
+//     so a room with one door (or none) stays still -- outdoor momentum never
+//     carries into it;
+//   * a pavilion or an overhang with the wind straight through is unchanged
+//     (the carried stream decays, so S wins).
+// A closed cell (a slab sharing a cell with up to 3 voxels of real air) takes
+// the stronger of its own S and the mean of its slice neighbours' J, so smoke
+// under a ceiling rides the jet below it.
+//
+// COST. Two rows on the publishing stage's args record, so they run once a
+// solve. `jetPrep` (one thread per column, 16 groups) finds the cover and
+// packs what the march needs -- the transfer, the cell's flags and its face
+// coefficients -- into SLICE-MAJOR order per march axis. `jets` is then one
+// 1,024-thread group per direction walking 64 slices, three coalesced words a
+// cell a slice, the neighbours' faces and the carried jet in 16 KiB of
+// workgroup memory. The first version read R, the masks and ten face words a
+// cell a slice straight from the field, and in the X march consecutive
+// threads sat 2,048 words apart: 142 us a frame in --perf explosion, ~0.85 ms
+// on every publishing tick, the dearest draft row.
+//
+// DETERMINISM (rule 1): integers throughout (J is Q12 like R), each slice is a
+// pure function of the previous slice and the solve's own outputs, and the
+// barriers separate every read of the slice from every write. With
+// TUNE_DRAFT_JET 0 every T is +-R and the readers reproduce R x amb to the bit.
+const JET_PLANE : u32 = 2048u;   // DRAFT_NY x DRAFT_NZ = DRAFT_NX x DRAFT_NY
+const JET_COLS : u32 = 4096u;    // DRAFT_NX x DRAFT_NZ
+// A horizontal face at most this open (Q8: 4 of 16 rows) is a roof.
+const JET_ROOF_K : i32 = 64;
+// The prep's two layouts (world.h kDraftJetPrep): per march axis, 3 words a
+// cell at (slice x 2,048 + u + 64 v), v = y and u the other horizontal axis.
+//   w0 = R.x | R.y << 16 (that axis's transfer, i16 Q12)
+//   w1 = R.z | k- << 16 | ELIG << 25 | CLOSED << 26
+//   w2 = k+ | ku+ << 9 | kv+ << 18        (9-bit Q8 face coefficients)
+// k- / k+ are the faces behind / ahead of the cell along the axis, ku+ / kv+
+// its faces toward + u and + y. ELIG = covered air carrying the jet; CLOSED =
+// a covered closed cell (rides its neighbours).
+const DRAFT_JET_PREP : u32 = 3031044u;
+const JET_ELIG : u32 = 0x2000000u;
+const JET_CLOSED : u32 = 0x4000000u;
+
+var<workgroup> jv : array<i32, 2048>;    // the carried jet, forward speed
+var<workgroup> jf : array<u32, 2048>;    // k back | ku+ << 9 | kv+ << 18
+
+fn jetK(g : vec3<i32>) -> u32 {
+  if (draftInside(g)) { return draftField[DRAFT_KBASE + fineIndex(g)]; }
+  return fineFaceK(g, 0u) | (fineFaceK(g, 1u) << 9u) | (fineFaceK(g, 2u) << 18u);
+}
+fn jetPick(s : i32, c : i32) -> i32 { return select(s, c, abs(c) > abs(s)); }
+// The integer square root (bit by bit, exact for every u32).
+fn jetSqrt(n : u32) -> u32 {
+  var op = n;
+  var res = 0u;
+  var one = 1u << 30u;
+  while (one > op) { one >>= 2u; }
+  while (one != 0u) {
+    if (op >= res + one) {
+      op -= res + one;
+      res = (res >> 1u) + one;
+    } else {
+      res >>= 1u;
+    }
+    one >>= 2u;
+  }
+  return res;
+}
+
+// One thread per column, top down: the cover, then both axes' packed words.
+@compute @workgroup_size(256)
+fn jetPrep(@builtin(workgroup_id) wg : vec3<u32>,
+           @builtin(local_invocation_index) li : u32) {
+  let col = wg.x * 256u + li;
+  if (col >= JET_COLS) { return; }
+  let x = i32(col % 64u);
+  let z = i32(col / 64u);
+  let on = TUNE_DRAFT_JET != 0;
+  let nCells = u32(DRAFT_NX * DRAFT_NY * DRAFT_NZ);
+  var cov = false;
+  for (var y = DRAFT_NY - 1; y >= 0; y--) {
+    let g = vec3<i32>(x, y, z);
+    let fi = fineIndex(g);
+    let kb = jetK(g);
+    if (on && kGet(kb, 1u) <= JET_ROOF_K) { cov = true; }
+    let mk = vec2<u32>(draftField[2u * fi], draftField[2u * fi + 1u] & 0xFFFFu);
+    let air = rowsOpen(mk) != 0u;
+    let dm = min(min(min(x, DRAFT_NX - 1 - x), min(y, DRAFT_NY - 1 - y)),
+                 min(z, DRAFT_NZ - 1 - z));
+    var fl = 0u;
+    if (cov && dm >= 2) { fl = select(JET_CLOSED, JET_ELIG, air); }
+    let rw = DRAFT_FIELD_BASE + 3u * fi;
+    let w0 = draftField[rw];
+    let w1 = draftField[rw + 1u];
+    let w2 = draftField[rw + 2u];
+    // X: R_x, u = z.
+    let ox = DRAFT_JET_PREP + 3u * (u32(x) * JET_PLANE + u32(z + 64 * y));
+    draftField[ox] = w0;
+    draftField[ox + 1u] = (w1 & 0xFFFFu) | (u32(kGet(jetK(g - vec3<i32>(1, 0, 0)), 0u)) << 16u) | fl;
+    draftField[ox + 2u] = u32(kGet(kb, 0u)) | (u32(kGet(kb, 2u)) << 9u) | (u32(kGet(kb, 1u)) << 18u);
+    // Z: R_z, u = x.
+    let oz = DRAFT_JET_PREP + 3u * nCells + 3u * (u32(z) * JET_PLANE + u32(x + 64 * y));
+    draftField[oz] = (w1 >> 16u) | (w2 << 16u);
+    draftField[oz + 1u] = (w2 >> 16u) | (u32(kGet(jetK(g - vec3<i32>(0, 0, 1)), 2u)) << 16u) | fl;
+    draftField[oz + 2u] = u32(kGet(kb, 2u)) | (u32(kGet(kb, 0u)) << 9u) | (u32(kGet(kb, 1u)) << 18u);
+  }
+}
+
+@compute @workgroup_size(1024)
+fn jets(@builtin(workgroup_id) wg : vec3<u32>,
+        @builtin(local_invocation_index) li : u32) {
+  // Dispatched with fineLast's args (the tile count); one group per direction.
+  if (wg.x >= 4u) { return; }
+  let dir = wg.x;
+  let zAxis = dir >= 2u;              // march along Z (else X)
+  let sgn = select(1, -1, (dir & 1u) != 0u);
+  let ea = select(vec3<i32>(1, 0, 0), vec3<i32>(0, 0, 1), zAxis);
+  let spread = clamp(TUNE_DRAFT_JET_SPREAD, 0, 16);
+  let keep = 256 - clamp(TUNE_DRAFT_JET_DECAY, 0, 256);
+  let nCells = u32(DRAFT_NX * DRAFT_NY * DRAFT_NZ);
+  let prep = DRAFT_JET_PREP + select(0u, 3u * nCells, zAxis);
+  let outBase = DRAFT_JET_FIELD + 2u * dir * nCells;
+  for (var i = li; i < JET_PLANE; i += 1024u) { jv[i] = 0; }
+
+  var tOut : array<vec3<i32>, 2>;     // what the readers get, held to phase C
+  var sOut : array<vec3<i32>, 2>;     // the projection there (closed cells)
+  var flags : array<u32, 2>;
+  // This slice's packed words, loaded one slice AHEAD: the loads for slice
+  // s + 1 are issued before slice s computes, so their latency hides behind
+  // its barriers instead of stalling every slice (the march is one group a
+  // direction and latency, not arithmetic, is what it waits on).
+  var w0 : array<u32, 2>;
+  var w1 : array<u32, 2>;
+  var w2 : array<u32, 2>;
+  let m0 = select(0, 63, sgn < 0);
+  for (var k = 0u; k < 2u; k++) {
+    let pw = prep + 3u * (u32(m0) * JET_PLANE + li + 1024u * k);
+    w0[k] = draftField[pw];
+    w1[k] = draftField[pw + 1u];
+    w2[k] = draftField[pw + 2u];
+  }
+  for (var s = 0; s <= 64; s++) {
+    let mPrev = select(s - 1, 64 - s, sgn < 0);
+    let mNext = select(s + 1, 62 - s, sgn < 0);
+    // ---- C (previous slice): closed cells ride their neighbours; write ----
+    // ---- 0 (this slice): publish the faces, start the next slice's loads ----
+    var n0 : array<u32, 2>;
+    var n1 : array<u32, 2>;
+    var n2 : array<u32, 2>;
+    for (var k = 0u; k < 2u; k++) {
+      let pi = li + 1024u * k;
+      let u = i32(pi % 64u);
+      let v = i32(pi / 64u);
+      if (s > 0) {
+        var t = tOut[k];
+        if ((flags[k] & JET_CLOSED) != 0u) {
+          var acc = 0;
+          if (u > 0) { acc += jv[pi - 1u]; }
+          if (u < 63) { acc += jv[pi + 1u]; }
+          if (v > 0) { acc += jv[pi - 64u]; }
+          if (v < DRAFT_NY - 1) { acc += jv[pi + 64u]; }
+          let sf = sgn * dot(sOut[k], ea);
+          t = sOut[k] + ea * (sgn * (jetPick(sf, acc / 4) - sf));
+        }
+        // Slice-major, as the readers index it (common.wgsl draftJetIndex).
+        let o = outBase + 2u * (u32(mPrev) * JET_PLANE + pi);
+        draftField[o] = pack16(t.x, t.y);
+        draftField[o + 1u] = pack16(t.z, 0);
+      }
+      if (s < 64) {
+        let kback = select((w1[k] >> 16u) & K_MASK, w2[k] & K_MASK, sgn < 0);
+        jf[pi] = kback | (w2[k] & ~K_MASK);
+      }
+      if (s < 63) {
+        let pw = prep + 3u * (u32(mNext) * JET_PLANE + pi);
+        n0[k] = draftField[pw];
+        n1[k] = draftField[pw + 1u];
+        n2[k] = draftField[pw + 2u];
+      }
+    }
+    if (s == 64) { break; }
+    workgroupBarrier();
+    // ---- A: this slice from the previous one (registers) ----
+    var jNext : array<i32, 2>;
+    for (var k = 0u; k < 2u; k++) {
+      let pi = li + 1024u * k;
+      let u = i32(pi % 64u);
+      let v = i32(pi / 64u);
+      let sv = sgn * vec3<i32>(draftSext(w0[k]), draftSext(w0[k] >> 16u), draftSext(w1[k]));
+      flags[k] = w1[k] & (JET_ELIG | JET_CLOSED);
+      sOut[k] = sv;
+      var j = sv;
+      jNext[k] = 0;
+      if ((flags[k] & JET_ELIG) != 0u) {
+        // C: the momentum flux arriving from the previous slice.
+        let own = jf[pi];
+        var e = 0u;   // u^2 in Q16
+        for (var o = 0u; o < 5u; o++) {
+          var qi = pi;
+          var klat = 256u;
+          var w = 64 - 4 * spread;
+          if (o != 0u) { w = spread; }
+          if (o == 1u) {
+            if (u == 0) { continue; }
+            qi = pi - 1u;
+            klat = (jf[qi] >> 9u) & K_MASK;
+          } else if (o == 2u) {
+            if (u == 63) { continue; }
+            qi = pi + 1u;
+            klat = (own >> 9u) & K_MASK;
+          } else if (o == 3u) {
+            if (v == 0) { continue; }
+            qi = pi - 64u;
+            klat = (jf[qi] >> 18u) & K_MASK;
+          } else if (o == 4u) {
+            if (v == DRAFT_NY - 1) { continue; }
+            qi = pi + 64u;
+            klat = (own >> 18u) & K_MASK;
+          }
+          if (w == 0) { continue; }
+          let fw = jv[qi];
+          if (fw <= 0) { continue; }
+          // In through the face behind p's slice neighbour, then (for a side
+          // step) across the face between that neighbour and p.
+          let kf = ((jf[qi] & K_MASK) * klat) >> 8u;
+          if (kf == 0u) { continue; }
+          // u^2 (Q24 -> Q16) x face share x weight; every product < 2^31.
+          let uq = u32(fw);
+          e += ((((((uq * uq) >> 8u) * kf) >> 8u) * u32(w)) >> 6u);
+        }
+        var c = 0;
+        if (e != 0u) { c = (i32(jetSqrt(e) << 4u) * keep) / 256; }
+        let sf = sgn * dot(sv, ea);
+        j = sv + ea * (sgn * (jetPick(sf, c) - sf));
+        jNext[k] = sgn * dot(j, ea);
+        // A CARRIED jet (not the projection's own flow, which already respects
+        // the walls) that meets a closed face ahead: the blocked share turns
+        // along the wall, the way the projection's lateral flow points. What
+        // the next slice carries is the undeflected jet -- a part-open face
+        // charges its own share there -- so this shapes only what is read here.
+        let kfw = i32(select(w2[k] & K_MASK, (w1[k] >> 16u) & K_MASK, sgn < 0));
+        if (c > abs(sf) && kfw < 256) {
+          let lost = (c * (256 - kfw)) / 256;
+          j -= ea * (sgn * lost);
+          let lat = sv - ea * dot(sv, ea);
+          let ll = abs(lat.x) + abs(lat.y) + abs(lat.z);
+          if (ll > 0) { j += (lat * lost) / ll; }
+        }
+      }
+      tOut[k] = j;
+    }
+    workgroupBarrier();
+    // ---- B: publish the slice for the next one ----
+    for (var k = 0u; k < 2u; k++) { jv[li + 1024u * k] = jNext[k]; }
+    w0 = n0;
+    w1 = n1;
+    w2 = n2;
+    workgroupBarrier();
   }
 }
