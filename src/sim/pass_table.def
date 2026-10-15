@@ -2083,10 +2083,12 @@ PASS(hz_sun, "hzLight", PT_SHADOWCACHE, PIPE_HZ_SUN, K_COMPUTE, D_HZGX,1,1,
 PASS(fluidMark, "fluid(substep)", PT_FLUIDMAP, PIPE_FLUID_MARK, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) R(FluidParticlesWrite) A(FluidBlockMap) R(FluidArgsStage) I(FluidPDispatchArgs) R(PageTable)
           A(FlowMeasure)))
+// U(TickUBO) R(PageTable): the near-block and live-box bookkeeping maps a slot
+// back to its world chunk (T.origin) and through the ticket-slot helpers.
 // RW(FluidBlockList) / A(FluidArgsStage): the retire phase READS last tick's
 // list and its length (fluidArgs[3]) before the scan overwrites both.
 PASS(fluidAlloc, "fluid(substep)", PT_FLUIDMAP, PIPE_FLUID_ALLOC, K_COMPUTE, 1,1,1, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
-     USES(RW(FluidBlockMap) RW(FluidBlockList) A(FluidArgsStage)))
+     USES(U(TickUBO) R(PageTable) RW(FluidBlockMap) RW(FluidBlockList) A(FluidArgsStage)))
 // Same staging-copy shape as argsStage -> dispatchArgs: the indirect-only
 // buffer is never bound in any bind group.
 PASS(copy_fluidArgs, nullptr, PT_FLUIDMAP, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
