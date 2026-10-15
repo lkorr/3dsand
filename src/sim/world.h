@@ -2400,7 +2400,22 @@ constexpr uint32_t kStainPaletteBase = kMaterialSlots - 8;
 // Art colour is render-only and never reaches a world cell, so none of this can
 // move the world hash (rule 1). GRID colour is a separate mechanism that
 // resolves through this same palette run — see MATF_TINTED.
-constexpr uint32_t kArtPaletteSlotsGpu = 255;
+//
+// ---- BANKS (2026-10-15) ----
+// The byte is still 8 bits, but the run is no longer 255 entries: it is
+// kArtBanks BANKS of 255, and a voxel's byte is an index WITHIN ITS MODEL'S
+// BANK. Every prefab's colours are merged into ONE bank (first fit,
+// deduplicated within it; MicroBodyMergeArt), the bank rides the model record
+// (MicroBodyModelGpu::cutFaces bits 8..15) to the shader, and anything on the
+// CPU that turns a byte into a colour adds `bank * kArtBankSlots`
+// (MicroBodyArtFlat). One shared run of 255 had filled with the cast (486
+// distinct colours wanted, measured 2026-10-15): every model loaded after it
+// took the nearest colour already there, which is how a 0.1-step opacity
+// slider rendered as a switch. The cube path (debris.wgsl) is bank 0 only --
+// its art is 4 bits, so it never addressed past the first 15 entries anyway.
+constexpr uint32_t kArtBankSlots = 255;
+constexpr uint32_t kArtBanks = 8;
+constexpr uint32_t kArtPaletteSlotsGpu = kArtBanks * kArtBankSlots;
 constexpr uint32_t kArtPaletteBaseGpu = kStainPaletteBase - kArtPaletteSlotsGpu;
 
 // ---- the tint palette (GRID colour — sim/materials.h kMatFlagTinted) --------

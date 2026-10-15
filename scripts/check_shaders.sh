@@ -209,9 +209,13 @@ done
 # MERGED art index, and the .vox palette slot is converted to one on the CPU at
 # load (MicroBodyMergeArt), so voxload.h's kArtPaletteBase no longer reaches
 # WGSL and is deliberately not scraped here.
-W_ARTSLOTS="$(cpp_const kArtPaletteSlotsGpu)"
-[ -n "$W_ARTSLOTS" ] || {
-  echo "check_shaders: cannot parse kArtPaletteSlotsGpu from $WORLD_H" >&2; exit 1; }
+# BANKS (2026-10-15): the run is kArtBanks x kArtBankSlots, so the slot count
+# is a product in world.h and is rebuilt here from its two literals.
+W_ARTBANKSLOTS="$(cpp_const kArtBankSlots)"
+W_ARTBANKS="$(cpp_const kArtBanks)"
+[ -n "$W_ARTBANKSLOTS" ] && [ -n "$W_ARTBANKS" ] || {
+  echo "check_shaders: cannot parse kArtBankSlots/kArtBanks from $WORLD_H" >&2; exit 1; }
+W_ARTSLOTS=$((W_ARTBANKSLOTS * W_ARTBANKS))
 W_ARTBASE=$((W_STAINBASE - W_ARTSLOTS))
 
 # Tint palette — the third reserved run (world.h kTintPaletteBaseGpu), holding
@@ -355,6 +359,7 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const PT_NO_WORD : u32 = ${W_PTNOWORD}u;" \
   "const STAIN_PALETTE_BASE : u32 = ${W_STAINBASE}u;" \
   "const ART_PALETTE_BASE : u32 = ${W_ARTBASE}u;" \
+  "const ART_BANK_SLOTS : u32 = ${W_ARTBANKSLOTS}u;" \
   "const TINT_PALETTE_BASE : u32 = ${W_TINTBASE}u;" \
   "const FAR_PALETTE_BASE : u32 = ${W_FARBASE}u;" \
   "const MICRO_POOL_WORDS : u32 = ${W_MICROPOOL}u;" \

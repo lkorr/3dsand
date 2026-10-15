@@ -276,7 +276,9 @@ fn vs(@builtin(vertex_index) vi : u32,
   out.fillPlane = vec4f(quatRotateInv(xf.quat, vec3f(0.0, 1.0, 0.0)),
                         (f32(dyeBits >> HELD_FILL_LEVEL_SHIFT) / 127.0 * 2.0 - 1.0) *
                             halfDiag);
-  out.cut = microBodyCutFaces(m);
+  // The WHOLE word: the joint mask (bits 0..5, `in.cut & 0x3F`) and the art
+  // bank (bits 8..15, microBodyArtBaseOf) in one flat interpolant.
+  out.cut = m.cutFaces;
   // Payload is 2 voxels per word; the stain lattice sits right after it.
   let cells = u32(dims.x * dims.y * dims.z);
   out.stainBase = select(0u, m.base + (cells + 1u) / 2u,
@@ -468,7 +470,12 @@ const BODY_Z_PRIORITY : f32 = 3.0e-5;
 // the brick, set when ANOTHER limb of the same prefab is pressed against that
 // plane — i.e. when the plane is a JOINT rather than the end of the model.
 // (The common.wgsl mirror called it `_pad` until 2026-09-24.)
-fn microBodyCutFaces(m : MicroBodyModel) -> u32 { return m.cutFaces; }
+fn microBodyCutFaces(m : MicroBodyModel) -> u32 { return m.cutFaces & 0x3Fu; }
+// THE ART BANK (2026-10-15, world.h kArtBanks) rides the same word, bits 8..15:
+// a voxel's art byte indexes 255 entries starting here.
+fn microBodyArtBaseOf(word : u32) -> u32 {
+  return ART_PALETTE_BASE + ((word >> 8u) & 0xFFu) * ART_BANK_SLOTS;
+}
 
 // ---- SEE-THROUGH ART (wisps, 2026-09-24) ------------------------------------
 //
@@ -493,8 +500,9 @@ fn microBodyCutFaces(m : MicroBodyModel) -> u32 { return m.cutFaces; }
 //
 // Opaque art (alpha 255, every colour but the wisps) exits on the first
 // compare, and unpainted voxels never get here at all.
-fn artCovers(art : u32, c : vec3<i32>, px : vec2f, slot : u32) -> bool {
-  let a = materials[ART_PALETTE_BASE + (art - 1u)].color0 >> 24u;
+fn artCovers(art : u32, c : vec3<i32>, px : vec2f, slot : u32,
+             artBase : u32) -> bool {
+  let a = materials[artBase + (art - 1u)].color0 >> 24u;
   if (a >= 255u) { return true; }
   let ign = fract(52.9829189 * fract(dot(floor(px), vec2f(0.06711056, 0.00583715))));
   let h = f32(pcg(u32(c.x * 73856093) ^ u32(c.y * 19349663) ^
@@ -564,6 +572,7 @@ fn fs(in : VSOut) -> FSOut {
   let dims = in.dims;
   let scale = in.scale;
   let roM = in.roM;
+  let artBase = microBodyArtBaseOf(in.cut);
 
   // ---- world ray -> object space ----
   // `rd` is NOT normalized: it is the camera-to-fragment vector, so any `t`
@@ -630,7 +639,7 @@ fn fs(in : VSOut) -> FSOut {
       let art = (v >> 8u) & 0xFFu;
       // A see-through art voxel this pixel misses is empty to the march
       // (artCovers, above): step on to whatever lies behind it.
-      if (art == 0u || artCovers(art, c, in.pos.xy, in.slot)) {
+      if (art == 0u || artCovers(art, c, in.pos.xy, in.slot, artBase)) {
         hitMat = v & 0xFFu;
         hitArt = art;
         break;
@@ -653,7 +662,7 @@ fn fs(in : VSOut) -> FSOut {
   let nFace = axisVec(axis, -f32(axisPickI(stepv, axis)));
   var nLocal = nFace;
   if (BODY_SMOOTH_N > 0.0) {
-    let g = bodyFieldNormal(in.base, dims, c, in.cut);
+    let g = bodyFieldNormal(in.base, dims, c, in.cut & 0x3Fu);
     let gl = length(g);
     // A uniform neighbourhood gives g == 0 and no opinion; keep the face
     // normal rather than normalizing a zero vector.
@@ -683,7 +692,7 @@ fn fs(in : VSOut) -> FSOut {
   // one-material-per-colour mob draw as a zebra (common.wgsl).
   var albedo : vec3f;
   if (hitArt != 0u) {
-    albedo = unpackColor(materials[ART_PALETTE_BASE + (hitArt - 1u)].color0);
+    albedo = unpackColor(materials[artBase + (hitArt - 1u)].color0);
   } else {
     albedo = paletteJitter(mat, u32(c.x * 7 + c.y * 13 + c.z * 29));
   }

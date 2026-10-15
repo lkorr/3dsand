@@ -181,7 +181,7 @@ Status GateDye(Ctx& c, std::string& detail) {
       for (const ItemCover& cv : it.cover) {
         for (const PrefabVoxel& v : cv.voxels) {
           if (v.color == 0) continue;   // unpainted: takes the material colour
-          const size_t idx = (size_t)v.color - 1;
+          const size_t idx = (size_t)ArtFlat(it.prefab.artBank, v.color) - 1;
           if (idx >= mb->artColors.size()) continue;
           const uint32_t rgb = mb->artColors[idx];
           const uint32_t r = rgb & 0xFFu, g = (rgb >> 8) & 0xFFu,
@@ -598,7 +598,8 @@ Status GateGarmentTint(Ctx& c, std::string& detail) {
       for (const PrefabVoxel& v : lat) {
         const uint32_t mat = v.material & 0xFFFu;
         if (tintedMat(mat))
-          s.allowed[mat][debris.GridStateFor(mat, v.color, 0, dye) & 15u] = 1;
+          s.allowed[mat][debris.GridStateFor(
+              mat, ArtFlat(piece->prefab.artBank, v.color), 0, dye) & 15u] = 1;
       }
     }
     for (int sl : shells) {

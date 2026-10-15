@@ -552,7 +552,10 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
 }
 
 void DebrisSystem::RefreshTintMap() {
-  // FNV-1a over the merged palette. 255 words at most, once a tick, against a
+  // ART IS A FLAT INDEX HERE (world.h kArtBanks): every caller turns a voxel's
+  // byte into `bank * kArtBankSlots + byte` with its body's bank
+  // (MicroBodyArtFlat) before it asks, so one table covers every bank.
+  // FNV-1a over the merged palette. 2,040 words at most, once a tick, against a
   // rebuild that only happens when it actually changed — see the header for why
   // this is a content stamp and not a length.
   uint64_t stamp = 1469598103934665603ull;
@@ -3039,7 +3042,11 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
         // cloth island lands in the tint it left the grid with.
         const Body& owner = bodies_[mem.idx];
         const uint32_t state = DepositState(
-            kTintSettle, mat, v.color, ((uint32_t)v.payload >> 12) & 0xFu,
+            kTintSettle, mat,
+            MicroBodyArtFlat(microSet_, owner.micro.model == kMicroBodyNoModel
+                                            ? -1 : (int64_t)owner.micro.model,
+                             v.color),
+            ((uint32_t)v.payload >> 12) & 0xFu,
             owner.micro.dye, owner.gridNibble);
         const uint32_t word = PackVoxNew(mat, state) | kCellOpIfAir;
         cellOps.push_back({World::SlotCellIndex(cell), word});
@@ -3939,7 +3946,10 @@ void DebrisSystem::VoxelsToParticles(const Body& b,
     // shattered corpse's chunks the right colour and its spray the wrong one.
     const uint32_t pmat = (uint32_t)v.payload & 0xFFFu;
     const uint32_t pstate =
-        DepositState(kTintBodySpray, pmat, v.color,
+        DepositState(kTintBodySpray, pmat,
+                     MicroBodyArtFlat(microSet_, b.micro.model == kMicroBodyNoModel
+                                                     ? -1 : (int64_t)b.micro.model,
+                                      v.color),
                      ((uint32_t)v.payload >> 12) & 0xFu, b.micro.dye,
                      b.gridNibble);
     s.payload = (uint16_t)(pmat | (pstate << 12));

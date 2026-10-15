@@ -63,6 +63,8 @@ StageCamera MakeCamera(const LatticeGrid& g, const View& v, int w, int h);
 struct Look {
   const std::vector<MaterialDef>* mats = nullptr;
   const std::vector<uint32_t>* artColors = nullptr;   // merged, 0xTTRRGGBB
+  // The item's ART BANK (Prefab::artBank): its voxels' bytes index it.
+  uint32_t artBank = 0;
   uint32_t dye = 0;                                   // game/dye.h, 0 = undyed
   uint32_t scale = 1;                                 // micro cells per world voxel
 };

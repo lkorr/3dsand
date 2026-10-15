@@ -665,6 +665,8 @@ struct MicroBodyModel {
   scale : u32,  // micro voxels per world voxel: 2 or 4
   // Boundary planes of the brick that are JOINTS (another limb pressed
   // against them): six bits, axis * 2 + positive. microbody.h `cutFaces`.
+  // Bits 8..15: the model's ART BANK (world.h kArtBanks, microbody.wgsl
+  // microBodyArtBaseOf).
   cutFaces : u32,
 };
 

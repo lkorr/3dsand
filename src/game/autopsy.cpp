@@ -17,7 +17,7 @@ void MeasureDepth(const MicroBodySet& set, uint32_t model, DepthField& out) {
   const size_t cells = (size_t)std::max(0, d.x) * std::max(0, d.y) * std::max(0, d.z);
   out.depth.assign(cells, kEmpty);
   if (cells == 0) return;
-  const uint32_t cut = model < set.models.size() ? set.models[model].cutFaces : 0u;
+  const uint32_t cut = model < set.models.size() ? (set.models[model].cutFaces & 0x3Fu) : 0u;
 
   // Solid = a non-zero material byte. Read once into the depth array as a
   // sentinel (kEmpty / 0xFE "solid, not yet reached").

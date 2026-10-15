@@ -319,6 +319,9 @@ static std::string BuildShaderConstantPrelude() {
   // index once, on the CPU at load (MicroBodyMergeArt), so no shader needs to
   // know where the .vox art range starts.
   o << "const ART_PALETTE_BASE : u32 = " << kArtPaletteBaseGpu << "u;\n";
+  // ...in BANKS of this many (world.h kArtBankSlots): a micro model's bank
+  // rides MicroBodyModel.cutFaces bits 8..15 (microbody.wgsl microBodyArtBase).
+  o << "const ART_BANK_SLOTS : u32 = " << kArtBankSlots << "u;\n";
   // Tint palette: a third reserved run holding per-material GRID colours, which
   // a MATF_TINTED material's state nibble indexes (world.h). paletteColor()
   // reads materials[TINT_PALETTE_BASE + tintBase + state].

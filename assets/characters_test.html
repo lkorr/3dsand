@@ -293,6 +293,16 @@ var toasts = [], dirt = [];
     say(/face\.eyeStyle/.test(eyeRows) && /face\.lashTone/.test(eyeRows) &&
         /face\.browThick/.test(eyeRows) && /colors\.lash/.test(eyeRows),
         'the eyes tab has the style, lash opacity, brow and lash colour rows');
+    // LASH OPACITY is a ramp, not a switch: three settings, three previews.
+    st.animate = false;
+    var lashShots = [0.3, 0.6, 1].map(function(t){
+      breed.__test.set('face.lashTone', t);
+      return host.querySelector('.prev canvas').toDataURL();
+    });
+    say(lashShots[0] !== lashShots[1] && lashShots[1] !== lashShots[2],
+        'lash opacity 0.3 / 0.6 / 1 draw three different previews');
+    breed.__test.set('face.lashTone', 0.7);
+    st.animate = true;
     st.geneTab = 'body';
 
     mark('6. a slider edit reaches the preview');

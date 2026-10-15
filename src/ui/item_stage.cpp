@@ -5,6 +5,7 @@
 
 #include "game/dye.h"
 #include "sim/materials.h"
+#include "sim/world.h"
 #include "sim/tuning.h"
 
 namespace itemstage {
@@ -64,8 +65,9 @@ Vec3 Albedo(const PrefabVoxel& v, const Look& look, float& glow) {
   const std::vector<MaterialDef>& mats = *look.mats;
   const uint32_t m = v.material & 0xFFFu;
   Vec3 a{0.6f, 0.6f, 0.6f};
-  if (v.color && look.artColors && (size_t)(v.color - 1) < look.artColors->size()) {
-    a = ArtCol((*look.artColors)[v.color - 1]);
+  const size_t flat = (size_t)look.artBank * kArtBankSlots + v.color;
+  if (v.color && look.artColors && flat - 1 < look.artColors->size()) {
+    a = ArtCol((*look.artColors)[flat - 1]);
   } else if (m < mats.size()) {
     const uint32_t j = (uint32_t)(v.x * 7 + v.y * 13 + v.z * 29) % 3u;
     const MaterialGpu& g = mats[m].gpu;

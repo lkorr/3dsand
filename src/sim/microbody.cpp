@@ -252,20 +252,103 @@ void MicroBodySet::ClearDirty() {
   dirtyRanges.clear();
 }
 
+namespace {
+// RGB distance squared, transparency bytes equal or not (the caller decides).
+int64_t ArtDist2(uint32_t a, uint32_t b) {
+  const int dr = (int)((a >> 16) & 255u) - (int)((b >> 16) & 255u);
+  const int dg = (int)((a >> 8) & 255u) - (int)((b >> 8) & 255u);
+  const int db = (int)(a & 255u) - (int)(b & 255u);
+  return (int64_t)dr * dr + (int64_t)dg * dg + (int64_t)db * db;
+}
+bool ArtIsGrey(uint32_t rgb) {
+  return ((rgb >> 16) & 255u) == ((rgb >> 8) & 255u) &&
+         ((rgb >> 8) & 255u) == (rgb & 255u);
+}
+// The entry of `bank` that already IS `rgb`: exact, or -- never for a pure
+// grey, the wardrobe's dyeable weave must stay exact (the `dye` gate) -- within
+// kArtMergeNear with the same transparency byte. -1 when there is none.
+//
+// NEAR ENOUGH IS THE SAME COLOUR (2026-10-02). Jittered characters carry
+// dozens of near-twins, and the run was full; this alone freed ~50 slots. Load
+// order decides which twin survives, so the result is a pure function of it.
+// Render-only: art colour never reaches a world cell.
+int ArtFindInBank(const MicroBodySet& set, uint32_t bank, uint32_t rgb) {
+  const size_t b0 = (size_t)bank * kArtBankSlots;
+  const uint32_t fill = set.artBankFill[bank];
+  for (uint32_t i = 0; i < fill; i++)
+    if (set.artColors[b0 + i] == rgb) return (int)i;
+  if (ArtIsGrey(rgb)) return -1;
+  int best = -1;
+  int64_t bestD = kArtMergeNear + 1;
+  for (uint32_t i = 0; i < fill; i++) {
+    const uint32_t c = set.artColors[b0 + i];
+    if ((c >> 24) != (rgb >> 24)) continue;
+    const int64_t d = ArtDist2(c, rgb);
+    if (d < bestD) { bestD = d; best = (int)i; }
+  }
+  return best;
+}
+// The NEAREST entry of a full bank: transparency byte equal first (a wisp must
+// stay see-through), ties to the lower index -- a pure function of load order.
+int ArtNearestInBank(const MicroBodySet& set, uint32_t bank, uint32_t rgb) {
+  const size_t b0 = (size_t)bank * kArtBankSlots;
+  int best = -1;
+  int64_t bestD = INT64_MAX;
+  for (uint32_t i = 0; i < set.artBankFill[bank]; i++) {
+    const uint32_t c = set.artColors[b0 + i];
+    const int64_t d = ArtDist2(c, rgb) +
+                      ((c >> 24) != (rgb >> 24) ? ((int64_t)1 << 40) : 0);
+    if (d < bestD) { bestD = d; best = (int)i; }
+  }
+  return best;
+}
+// Take the next entry of `bank` for `rgb`; the caller checked the room.
+uint32_t ArtPushInBank(MicroBodySet& set, uint32_t bank, uint32_t rgb) {
+  const size_t need = ((size_t)bank + 1) * kArtBankSlots;
+  if (set.artColors.size() < need) set.artColors.resize(need, 0u);
+  const uint32_t i = set.artBankFill[bank]++;
+  set.artColors[(size_t)bank * kArtBankSlots + i] = rgb;
+  return i;
+}
+}  // namespace
+
+uint8_t MicroBodyArtInBank(MicroBodySet& set, uint32_t bank, uint32_t rgb) {
+  if (bank >= kArtBanks) return 0;
+  int at = ArtFindInBank(set, bank, rgb);
+  if (at < 0 && set.artBankFill[bank] < kArtBankSlots)
+    at = (int)ArtPushInBank(set, bank, rgb);
+  if (at < 0) at = ArtNearestInBank(set, bank, rgb);
+  return at < 0 ? 0 : (uint8_t)(at + 1);
+}
+
+void MicroBodySetArtBank(MicroBodySet& set, uint32_t model, uint32_t bank) {
+  if (model >= set.models.size()) return;
+  MicroBodyModelGpu& m = set.models[model];
+  m.cutFaces = (m.cutFaces & 0x3Fu) | ((bank & 0xFFu) << 8);
+  set.dirty = true;   // the model table goes up whole on any dirty
+}
+
+uint32_t MicroBodyArtBank(const MicroBodySet& set, int64_t model) {
+  if (model < 0 || (size_t)model >= set.models.size()) return 0;
+  return (set.models[(size_t)model].cutFaces >> 8) & 0xFFu;
+}
+
 std::vector<uint8_t> MicroBodyMergeArt(MicroBodySet& set,
                                        const std::vector<uint32_t>& artColors,
                                        const std::string& label,
                                        std::string& log,
-                                       const Prefab* paintedBy) {
+                                       const Prefab* paintedBy,
+                                       uint32_t* bankOut) {
   // Identity by default, so a prefab that painted nothing costs nothing and
   // every unpainted voxel keeps color 0.
   //
-  // INDEXED BY .vox PALETTE SLOT (128..255), VALUED IN MERGED 1-BASED INDICES.
-  // The two sides of this table are deliberately different numbering systems
-  // and that IS the conversion: the caller applies it once
+  // INDEXED BY .vox PALETTE SLOT (128..255), VALUED IN 1-BASED INDICES WITHIN
+  // THE PREFAB'S BANK. The two sides of this table are deliberately different
+  // numbering systems and that IS the conversion: the caller applies it once
   // (`if (v.color) v.color = remap[v.color]`) and from that point on a
-  // PrefabVoxel/DebrisVoxel `color` is a merged index, never a .vox slot again.
+  // PrefabVoxel/DebrisVoxel `color` is a bank index, never a .vox slot again.
   std::vector<uint8_t> remap(256, 0);
+  if (bankOut) *bankOut = 0;
   if (artColors.empty()) return remap;
 
   // Which .vox slots a voxel actually paints (see the header). Without a
@@ -276,81 +359,58 @@ std::vector<uint8_t> MicroBodyMergeArt(MicroBodySet& set,
     for (const PrefabModel& pm : paintedBy->models)
       for (const PrefabVoxel& v : pm.voxels) used[v.color] = true;
 
-  uint32_t dropped = 0;
-  // The SOURCE bound is the per-file limit (a .vox addresses art at 128..255);
-  // the MERGED bound below is kArtPaletteSlotsGpu. Conflating the two is what
-  // used to cap the whole cast at 128 colours — see the note in world.h.
+  // The colours to place, in slot order. The SOURCE bound is the per-file
+  // limit (a .vox addresses art at 128..255).
+  std::vector<std::pair<int, uint32_t>> want;   // {srcSlot, rgb}
   for (size_t i = 0; i < artColors.size() && i < (size_t)kArtPaletteSlots; i++) {
-    const uint32_t rgb = artColors[i];
     const int srcSlot = kArtPaletteBase + (int)i;
     if (srcSlot > kArtPaletteTop) break;
-    if (!used[srcSlot]) continue;
-    // Colours are deduplicated across prefabs: two mobs painted the same red
-    // share one slot, which is what keeps the merged palette small enough for a
-    // whole cast plus its wardrobe.
-    auto it = std::find(set.artColors.begin(), set.artColors.end(), rgb);
-    // NEAR ENOUGH IS THE SAME COLOUR (2026-10-02). Within kArtMergeNear (RGB
-    // distance squared; 27 is three levels a channel, invisible in 8-bit art)
-    // of a colour already merged, with the same transparency byte, a colour
-    // takes that slot instead of a new one. Jittered characters carry dozens of
-    // such near-twins, and the run was full; this alone frees ~50 slots. Never
-    // for a pure GREY: the wardrobe's dyeable pieces are exact greys that the
-    // dye multiplies (the `dye` gate), and a near match would tint a garment.
-    // Load order decides which twin survives, so the result is a pure function
-    // of it. Render-only: art colour never reaches a world cell.
-    if (it == set.artColors.end() &&
-        !(((rgb >> 16) & 255u) == ((rgb >> 8) & 255u) &&
-          ((rgb >> 8) & 255u) == (rgb & 255u))) {
-      int64_t bestNear = kArtMergeNear + 1;
-      for (auto k = set.artColors.begin(); k != set.artColors.end(); ++k) {
-        const uint32_t c = *k;
-        if ((c >> 24) != (rgb >> 24)) continue;
-        const int dr = (int)((c >> 16) & 255u) - (int)((rgb >> 16) & 255u);
-        const int dg = (int)((c >> 8) & 255u) - (int)((rgb >> 8) & 255u);
-        const int db = (int)(c & 255u) - (int)(rgb & 255u);
-        const int64_t d = (int64_t)dr * dr + (int64_t)dg * dg + (int64_t)db * db;
-        if (d < bestNear) { bestNear = d; it = k; }
-      }
+    if (used[srcSlot]) want.push_back({srcSlot, artColors[i]});
+  }
+  if (want.empty()) return remap;
+
+  // PICK THE BANK: the first whose free entries hold every colour of this
+  // prefab it does not already have. Counting dedupes the prefab against
+  // ITSELF too (two slots, one colour: one entry).
+  const uint32_t usable = std::max(1u, std::min(set.artBanksUsable, kArtBanks));
+  auto need = [&](uint32_t b) {
+    std::vector<uint32_t> added;
+    for (const auto& w : want) {
+      if (ArtFindInBank(set, b, w.second) >= 0) continue;
+      bool dup = false;
+      for (uint32_t a : added)
+        if (a == w.second || (!ArtIsGrey(w.second) && (a >> 24) == (w.second >> 24) &&
+                              ArtDist2(a, w.second) <= kArtMergeNear)) { dup = true; break; }
+      if (!dup) added.push_back(w.second);
     }
-    size_t at;
-    if (it != set.artColors.end()) {
-      at = (size_t)(it - set.artColors.begin());
-    } else if (set.artColors.size() >=
-               std::min(set.artCeiling, (size_t)kArtPaletteSlotsGpu)) {
-      // FULL: the NEAREST colour already merged, not the material's own
-      // (2026-10-02). The cast plus its wardrobe outgrew 255 colours when the
-      // robot races landed, and the old fallback painted a hood or a robe
-      // the raw colour of `cloth` -- a mid-grey where the art said madder.
-      // Nearest by RGB distance with the transparency byte equal first (a
-      // wisp must stay see-through); ties go to the lower index, so the
-      // answer is a pure function of load order. Render-only: art colour
-      // never reaches a world cell.
-      dropped++;
-      size_t best = 0;
-      int64_t bestD = INT64_MAX;
-      for (size_t k = 0; k < set.artColors.size(); k++) {
-        const uint32_t c = set.artColors[k];
-        const int dr = (int)((c >> 16) & 255u) - (int)((rgb >> 16) & 255u);
-        const int dg = (int)((c >> 8) & 255u) - (int)((rgb >> 8) & 255u);
-        const int db = (int)(c & 255u) - (int)(rgb & 255u);
-        const int64_t d = (int64_t)dr * dr + (int64_t)dg * dg +
-                          (int64_t)db * db +
-                          ((c >> 24) != (rgb >> 24) ? ((int64_t)1 << 40) : 0);
-        if (d < bestD) { bestD = d; best = k; }
-      }
-      at = best;
-    } else {
-      at = set.artColors.size();
-      set.artColors.push_back(rgb);
-    }
-    // 1-BASED: 0 is reserved for "unpainted, use the material's own colour", so
-    // merged entry `at` is stored as `at + 1`. This is also why the merged
-    // ceiling is 255 and not 256 — the byte has to hold at+1.
-    remap[srcSlot] = (uint8_t)(at + 1);
+    return (uint32_t)added.size();
+  };
+  int bank = -1;
+  uint32_t roomiest = 0, roomiestRoom = 0;
+  for (uint32_t b = 0; b < usable; b++) {
+    const uint32_t room = kArtBankSlots - set.artBankFill[b];
+    if (room > roomiestRoom) { roomiestRoom = room; roomiest = b; }
+    if (need(b) <= room) { bank = (int)b; break; }
+  }
+  // NO BANK HOLDS IT: the roomiest, and the overflow takes the nearest colour
+  // already there (render-only; reported below).
+  if (bank < 0) bank = (int)roomiest;
+  if (bankOut) *bankOut = (uint32_t)bank;
+
+  uint32_t dropped = 0;
+  for (const auto& w : want) {
+    int at = ArtFindInBank(set, (uint32_t)bank, w.second);
+    if (at < 0 && set.artBankFill[bank] < kArtBankSlots)
+      at = (int)ArtPushInBank(set, (uint32_t)bank, w.second);
+    if (at < 0) { dropped++; at = ArtNearestInBank(set, (uint32_t)bank, w.second); }
+    // 1-BASED: 0 is reserved for "unpainted, use the material's own colour".
+    remap[w.first] = at < 0 ? 0 : (uint8_t)(at + 1);
   }
   if (dropped)
-    log += label + ": art palette full (" + std::to_string(kArtPaletteSlotsGpu) +
-           " colours across all loaded models); " + std::to_string(dropped) +
+    log += label + ": art bank " + std::to_string(bank) + " full (" +
+           std::to_string(kArtBankSlots) + " colours; " +
+           std::to_string(usable) + " of " + std::to_string(kArtBanks) +
+           " banks usable); " + std::to_string(dropped) +
            " colour(s) take the nearest merged colour\n";
   return remap;
 }

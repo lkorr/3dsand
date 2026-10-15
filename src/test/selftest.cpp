@@ -2117,7 +2117,7 @@ int Run(Ctx& c, const Options& opt) {
       // rise-tint slots), so a gate that grows it shortens every later gate's
       // headroom: pool-human's claim G was red only in the suite for this.
       auto artCount = [&]() -> size_t {
-        return c.mobs.MicroSet() ? c.mobs.MicroSet()->artColors.size() : 0;
+        return c.mobs.MicroSet() ? MicroBodyArtUsed(*c.mobs.MicroSet()) : 0;
       };
       const size_t leakArt = artCount();
       r.status = g->fn(c, detail);
