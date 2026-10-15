@@ -11931,6 +11931,10 @@ int main(int argc, char** argv) {
   // The ground-item registry: the tick throws vessels into it and breaks the
   // ones that land hard (session.h section H2).
   tickCtx.ground = &ground;
+  // Parking and the distant tier's promotion run INSIDE the tick now (phase
+  // H, session.h section H3b; docs/PLAN_distant_npcs.md §2.1). The binding
+  // stays out here, before each tick (see the S5b block by TickAuthority).
+  tickCtx.parking = &mobParking;
   // ---- THE MAP'S REFERENCES (world/refs.h, PLAN_world_editor.md P1) -------
   // assets/worldmap/<map>/refs/*.json: villagers, doors, markers, houses. The
   // tick activates them against the window and runs the use verb
@@ -16635,24 +16639,30 @@ int main(int argc, char** argv) {
         }
       }
 
-      TickAuthority(tickCtx, session,
-                    FrameIntent{brushActive, handsUp, pourAimValid, pourAim,
-                                ui.pourRadius, pourFromValid, pourFrom},
-                    ti, tick, opBatch);
-
       // ---- S5b: NPCs AND GROUND ITEMS OUTLIVE THE WINDOW (persist.h) -------
-      // A creature leaving the window is parked in its region bucket by
-      // mobs.PreTick, a ground item (with whatever it is strapped to) by
-      // debris.PostStep's cull; here, after the tick, the ones the window has
-      // reached again come back, a few per tick and only onto ground the fetch
-      // cache has answered for. Parking is on for single player and the host
-      // (whose store is the world's), off for a client.
+      // A creature leaving the window is parked in its region bucket (or,
+      // with `distant.enabled`, demoted to the distant tier) by mobs.PreTick,
+      // a ground item (with whatever it is strapped to) by debris.PostStep's
+      // cull; the ones the window has reached again come back -- distant
+      // creatures promoted first -- a few per tick and only onto ground the
+      // fetch cache has answered for. Parking is on for single player and the
+      // host (whose store is the world's), off for a client.
+      //
+      // THE BINDING IS HERE, BEFORE THE TICK; THE UNPARK IS IN IT (phase H,
+      // through tickCtx.parking; docs/PLAN_distant_npcs.md §2.1, audit A12).
+      // It used to run after TickAuthority, outside the tick, which every gate
+      // that ticks THE tick had to imitate by hand. Bind is idempotent, so a
+      // call per tick costs a compare.
       {
         const WorldItemRefs parkGround{&ground, &phys, &debris, &mbSet, &items};
         mobParking.Bind(mobs, stream.Store(), netRoleBoot != NetRole::Client,
                         &parkGround);
-        mobParking.Unpark(mobs, stream.Store(), world, tick);
       }
+
+      TickAuthority(tickCtx, session,
+                    FrameIntent{brushActive, handsUp, pourAimValid, pourAim,
+                                ui.pourRadius, pourFromValid, pourFrom},
+                    ti, tick, opBatch);
 
       // ---- M9.3-B: THE SMOKE'S AUTHOR ------------------------------------
       //

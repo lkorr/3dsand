@@ -861,7 +861,9 @@ void Depart(TickAuthorityCtx& w, LiveDemon& ld, uint32_t tick, const char* why) 
   ld.pact.reset();
   ld.why = why;
   ld.stateTick = tick;
-  w.mobs.RemoveMob(ld.mobId);   // gone home; DemonTick forgets it next tick
+  // Gone home; DemonTick forgets it next tick. RemoveMob reaches the distant
+  // tier too (mob.h), so a demon dismissed from afar does not walk back in.
+  w.mobs.RemoveMob(ld.mobId);
 }
 
 PresentInfo Present(TickAuthorityCtx& w, std::span<SessionTick> players, int session,
@@ -914,8 +916,11 @@ PresentInfo Present(TickAuthorityCtx& w, std::span<SessionTick> players, int ses
     ld->pact = std::move(pact);
     // BOUND: it stops prowling the ring (the def's calm profile, no target);
     // a circle that breaks now still lets it loose (DemonUnbind).
-    if (def != nullptr && !def->released.empty()) w.mobs.SetMobBehavior(ld->mobId, def->released);
-    if (ai::Brain* b = w.mobs.MobBrainMut(ld->mobId)) ClearTarget(*b);
+    // EITHER TIER (docs/PLAN_distant_npcs.md §2.14): a binding offered from
+    // a distance must calm a demon that is distant right now too.
+    if (def != nullptr && !def->released.empty())
+      w.mobs.SetBehaviorAnyTier(ld->mobId, def->released);
+    if (ai::Brain* b = w.mobs.BrainAnyTierMut(ld->mobId)) ClearTarget(*b);
   }
   std::printf("demons: %s is offered \"%s\" (weight %d, upkeep %d): strength %d vs power %d -> "
               "%s (margin %d)\n",
@@ -1066,6 +1071,18 @@ void ContractTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t 
         if (dd <= bd) {
           bd = dd;
           best = m->Id();
+        }
+      }
+      // ...AND THE DISTANT TIER (docs/PLAN_distant_npcs.md §2.14): a body
+      // that unparked and walked out again inside the restore window is still
+      // the demon's. Strictly nearer only, so a near body wins a tie.
+      for (const DistantMob& dm : w.mobs.Distant().All()) {
+        if (dm.dead || dm.defName != r.mobDef) continue;
+        if (Live(w, dm.id) != nullptr) continue;
+        const float dd = (dm.origin - r.origin).len();
+        if (dd < bd) {
+          bd = dd;
+          best = dm.id;
         }
       }
       if (best != 0 && d.live.size() < DemonWorld::kMaxLive) {
@@ -1375,17 +1392,23 @@ void AppendSaveSections(EntityIO& io, TickAuthorityCtx& w, PlayerSession& s) {
         DemonWorld& d = Demons(*wp);
         const uint32_t now = TW(d).actorsTick;
         std::vector<const LiveDemon*> bound;
+        // EITHER TIER (docs/PLAN_distant_npcs.md §2.14): a bound demon that
+        // is distant right now is saved too -- its MOBS record is written by
+        // the distant tier (persist.cpp), and this is the binding that goes
+        // with it. Def name and origin come from whichever tier holds it.
         for (const LiveDemon& ld : d.live)
-          if (ld.pact && wp->mobs.IsAlive(ld.mobId)) bound.push_back(&ld);
+          if (ld.pact && wp->mobs.LocateCreature(ld.mobId).alive) bound.push_back(&ld);
         PutU32(o, (uint32_t)bound.size());
         for (const LiveDemon* ld : bound) {
           const Mob* m = wp->mobs.FindMobById(ld->mobId);
+          const DistantMob* far = m ? nullptr : wp->mobs.Distant().Find(ld->mobId);
           PutStr(o, ld->demon);
           PutStr(o, ld->name);
-          PutStr(o, m && m->Def() ? m->Def()->name : std::string());
+          PutStr(o, m && m->Def() ? m->Def()->name
+                                  : (far != nullptr ? far->defName : std::string()));
           PutU32(o, (uint32_t)ld->session);
           PutU32(o, (uint32_t)ld->state);
-          const Vec3 org = m ? m->Origin() : Vec3{};
+          const Vec3 org = m ? m->Origin() : (far != nullptr ? far->origin : Vec3{});
           PutF(o, org.x);
           PutF(o, org.y);
           PutF(o, org.z);

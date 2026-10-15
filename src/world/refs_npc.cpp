@@ -1224,7 +1224,9 @@ void RegisterResidentKinds() {
         return true;
       });
     // Already standing (a load or an unpark brought it back): nothing to do.
-    if (mobs.FindMobByRef(r.id) != nullptr) {
+    // IN EITHER TIER (docs/PLAN_distant_npcs.md §2.14): a villager that
+    // walked out of the window is standing too, just not here.
+    if (mobs.LocateByRef(r.id).exists) {
       w.askedAt.erase(r.id);
       return Activation::Done;
     }
@@ -1307,8 +1309,12 @@ void RegisterResidentKinds() {
     if (why != RefEvent::Edited && why != RefEvent::Deleted) return;
     // The author changed or removed the villager: take the old body away so
     // the new line can spawn fresh (Deleted: nothing comes back).
+    // EITHER TIER (docs/PLAN_distant_npcs.md §2.14): an old body that is
+    // distant right now would otherwise come back beside the fresh one.
     if (c.mobs != nullptr) {
       if (Mob* m = c.mobs->FindMobByRef(r.id)) c.mobs->RemoveMob(m->Id());
+      if (const DistantMob* far = c.mobs->Distant().FindByRef(r.id))
+        c.mobs->RemoveMob(far->id);
     }
     if (c.refs != nullptr) c.refs->ClearDelta(r.id);
   };

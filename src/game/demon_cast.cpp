@@ -1133,12 +1133,18 @@ void MobCastTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t t
   // ---- every creature's VM, one tick -------------------------------------------------
   for (MobCaster& c : m.casters) {
     c.spells.SetLibrary(&w.glyphs);
-    if (!c.gone && !w.mobs.IsAlive(c.mobId)) {
+    // EITHER TIER (docs/PLAN_distant_npcs.md §2.14): a caster that walked out
+    // of the window is not gone -- latching `gone` would drop what it
+    // sustains and freeze its mana for good when it came back. While DISTANT
+    // it is frozen instead: no regeneration, nothing new begun (its brain
+    // does not think at that tier in D0); what it already loosed still flies.
+    const MobSystem::CreatureWhere where = w.mobs.LocateCreature(c.mobId);
+    if (!c.gone && !where.alive) {
       // Dead or gone: what it sustains drops; its bolts in flight still land.
       c.gone = true;
       c.spells.DropAll(c.mobId);
     }
-    if (!c.gone) {
+    if (!c.gone && !where.distant) {
       c.mana.Tick();
       c.mana.reserved = c.spells.ReservationFor(c.mobId);
     }

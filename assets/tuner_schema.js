@@ -930,6 +930,23 @@ const TUNING_SCHEMA = [
   },
 
   {
+    id: 'distant',
+    title: 'Distant creatures',
+    icon: '\u{1F52D}',
+    apply: 'cpu',
+    blurb: 'The distant tier (docs/PLAN_distant_npcs.md). A creature that leaves the 51 m residency window used to be PARKED: its record put away in its region bucket, frozen, its id and mind lost. With the switch on it DEMOTES instead: it keeps its id and its brain in a cheap second tier with no rig and no physics, out to the radius below, and is promoted back into a full creature (same id, same brain) when the window reaches it again. Past radius + hysteresis it is parked as before. CPU-only, never hashed. Package D0 is the seam only: distant creatures are frozen (they neither walk nor fight yet), and the switch stays OFF until package D3.',
+    params: [
+      {k:'enabled', n:'distant tier on', d:'THE SWITCH. Off = the park rule exactly as before and the tier stays empty; it is the parity oracle every package of the plan is tested against. Turning it off while creatures are distant parks them all at the next tick.', bool:true},
+      {k:'radius', n:'distant radius', d:'A creature leaving the window demotes (keeps living, cheaply) when its centre is within this distance of the window centre; further out it parks. 1280 = 128 m. 0 parks everything.', step:16, u:'vox'},
+      {k:'hysteresis', n:'retire hysteresis', d:'A distant creature is parked only once it is this much further out than the radius, so one standing on the radius cannot flip between the two every tick.', step:16, u:'vox'},
+      {k:'idleStride', n:'idle tick stride', d:'An awake distant creature that is not fighting thinks and walks every Nth tick (on its own phase) and moves N ticks worth each time. Fighting creatures tick every tick. Read from package D1 on.', step:1, int:true},
+      {k:'surfaceSnapMaxVox', n:'surface snap', d:'At demotion a creature whose feet are within this of the terrain height, and outside every dungeon, walks on the terrain while distant (SURFACE). Anything else (underground, indoors, on a wall) is ANCHORED: it thinks and turns but never moves until promoted. 24 = 2.4 m.', step:1, u:'vox'},
+      {k:'promoteMaxDropVox', n:'promotion drop bound', d:'Promotion snaps a distant creature onto the real ground; a landing that has to drop further than this is reported. Read from package D1 on.', step:1, u:'vox'},
+      {k:'overflowMinDistVox', n:'overflow min distance', d:'Cap overflow (package D8): with the living cap full, only a near creature at least this far from the player may demote to make room for a distant one. 150 = 15 m.', step:5, u:'vox'},
+    ],
+  },
+
+  {
     id: 'physics',
     title: 'Physics',
     icon: '⚙',

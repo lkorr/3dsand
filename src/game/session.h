@@ -110,6 +110,7 @@
 #include "ui/overlay.h"
 
 class WorldItems;  // game/worlditems.h; TickAuthorityCtx holds it by pointer
+class EntityParking;  // game/persist.h; TickAuthorityCtx holds it by pointer
 namespace refs {
 class RefStore;  // world/refs.h; TickAuthorityCtx holds it by pointer
 }
@@ -1271,6 +1272,20 @@ struct TickAuthorityCtx {
   // the harness map's refs are gate fixtures, and a gate that did not ask for
   // them must not find an NPC standing in its world.
   refs::RefStore* refs = nullptr;
+
+  // ---- H3b. PARKING AND THE DISTANT TIER'S PROMOTION (game/persist.h,
+  // docs/PLAN_distant_npcs.md §2.1), owned by main().
+  //
+  // When set, phase H calls EntityParking::Unpark right before mobs.PreTick:
+  // the distant creatures the window has reached again are promoted
+  // (nearest first) and then parked records are unparked, out of one budget
+  // against one living cap -- INSIDE the tick, where the game used to call it
+  // after (main.cpp), so a gate that ticks THE tick gets the same tier
+  // changes the game does. The binding (EntityParking::Bind: on for single
+  // player and the host, off for a client) stays the owner's, before the
+  // tick. NULL IN EVERY HARNESS unless a gate sets it; the parking gates that
+  // own their EntityParking keep calling Unpark by hand.
+  EntityParking* parking = nullptr;
 
   // ---- H4. CONVERSATIONS (game/dialogue.h), owned by main().
   //

@@ -527,6 +527,11 @@ add_library(sandvox_core OBJECT
   src/game/brush.cpp
   src/game/prefab.cpp
   src/game/mob.cpp
+  # The distant tier: creatures that keep existing past the residency window
+  # (docs/PLAN_distant_npcs.md; game/distant.h), and the pure steer both
+  # tiers turn with (game/steer.h).
+  src/game/distant.cpp
+  src/game/steer.cpp
   src/game/mob_shock.cpp
   # A body the water carries (MobDef::SwimDef): the swimmers' locomotion.
   src/game/mob_swim.cpp

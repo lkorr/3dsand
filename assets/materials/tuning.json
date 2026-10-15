@@ -151,6 +151,15 @@
     "respawnDelay": 3,
     "keepKitOnTurn": true
   },
+  "distant": {
+    "enabled": false,
+    "radius": 1280,
+    "hysteresis": 256,
+    "idleStride": 4,
+    "surfaceSnapMaxVox": 24,
+    "promoteMaxDropVox": 48,
+    "overflowMinDistVox": 150
+  },
   "audio": {
     "enabled": true,
     "masterVolume": 0.95,

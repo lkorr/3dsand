@@ -2675,6 +2675,39 @@ TP_I(render, presentMode, NO_WGSL, 1, 0, 2)
 TP_F(render, fpsCap, NO_WGSL, 0.0f, 0.0f, 240.0f)
 
 
+// ==== distant ====
+// THE DISTANT TIER (docs/PLAN_distant_npcs.md, game/distant.h): creatures that
+// keep existing past the residency window. CPU-only -- every row is NO_WGSL,
+// so this group never reaches the shader prelude and never misses the SPIR-V
+// cache. Every row the feature needs is here from D0 (batched on purpose: a
+// later row in this file is a rebuild for everyone).
+//
+// THE SWITCH. False until package D3 (the edge, and the flip): with it off
+// the park rule runs exactly as before S5b's parking did and the tier stays
+// empty -- the parity oracle for every package.
+TP_B(distant, enabled, NO_WGSL, false)
+// A creature leaving the window DEMOTES (instead of parking) when its centre
+// is within this many world voxels of the window centre: 1280 = 128 m.
+// 0 parks everything, which is the switch by another name.
+TP_F(distant, radius, NO_WGSL, 1280.0f, 0.0f, 8192.0f)
+// A distant creature RETIRES (is parked as its patched record) past radius +
+// hysteresis, so one walking along the radius cannot flip every tick.
+TP_F(distant, hysteresis, NO_WGSL, 256.0f, 0.0f, 4096.0f)
+// D1: an awake but unengaged distant creature ticks every idleStride ticks,
+// on phase (tick + id) % stride, and moves stride x dt.
+TP_I(distant, idleStride, NO_WGSL, 4, 1, 30)
+// Demotion classifies the ground: SURFACE when the feet are within this many
+// voxels of TerrainHeight there AND outside every placed dungeon box, else
+// ANCHORED (thinks, turns, never drives). 24 = 2.4 m.
+TP_F(distant, surfaceSnapMaxVox, NO_WGSL, 24.0f, 0.0f, 256.0f)
+// D1: promotion snaps to the real ground; a landing that has to drop further
+// than this is reported (the mobParkMaxDropVox of the distant tier).
+TP_F(distant, promoteMaxDropVox, NO_WGSL, 48.0f, 0.0f, 512.0f)
+// D8: with the living cap full, only a near creature at least this far from
+// the player demotes to make room. 150 = 15 m.
+TP_F(distant, overflowMinDistVox, NO_WGSL, 150.0f, 0.0f, 1024.0f)
+
+
 // ==== world ====
 // A NAME, never a path: worldmap.cpp joins it under assets/worldmap/,
 // and a value with a separator in it would reach outside that directory.

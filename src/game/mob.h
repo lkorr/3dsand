@@ -13,6 +13,7 @@
 #include "game/ai_behavior.h"
 #include "game/anim.h"
 #include "game/container.h"  // ContainerHeldFill: a held vessel's contents
+#include "game/distant.h"    // DistantMobs: the tier past the window (PLAN_distant_npcs)
 #include "game/pose.h"     // PoseInputs / PoseDrive: the one pose pipeline (W2-L)
 #include "game/equipment.h"
 #include "game/impact.h"    // StrikeProfile / StrikeEffectorMode: what a blow IS
@@ -2914,6 +2915,27 @@ class Mob {
   // nothing else: no rising (the owner books it), no ragdoll flip (the limbs
   // stay kinematic and go on being placed from the pose stream), no debris.
   void EnterGhostDeath();
+  // ---- BACK FROM THE DISTANT TIER (docs/PLAN_distant_npcs.md §2.2) --------
+  //
+  // The first of the only two functions that carry the distant overlay (the
+  // other is MobSystem::PatchMobRecord), run by MobSystem::PromoteDistant
+  // right after the LoadOne of the patched record. Per-limb hp is ALREADY the
+  // overlay's at that point -- the patch wrote it into the record and the
+  // overlay of the load set each MobLimb::hp directly: no SpendHp spread and
+  // no carve (a carve would spend the hp a second time; wounds taken at
+  // distance are not carved, a known look gap). What is left is what the
+  // near tier would have done on the way to those numbers:
+  //   * THE HP-ZERO RULES. An attached base limb at hp <= 0 whose hp-zero
+  //     rule takes it (HpZeroSevers: the root, a vital or a non-severable
+  //     limb) goes through Sever(), which routes a vital or root limb to
+  //     Die() -- the near tier's own door, in limb order. Any other limb at
+  //     zero hangs ruined, as it would near.
+  //   * DEATH. An overlay that is dead on a body that loaded alive (a record
+  //     patched without its dead block) dies through the ordinary Die() with
+  //     the overlay's cause. A record patched dead loads as a corpse already
+  //     (LoadOne's EnterLoadedDead: no cry, no rising booked twice).
+  // No-op on a ghost or a released husk. D2b adds the burn re-light here.
+  void ApplyDistantOverlay(const DistantMob& d);
   // A CORPSE DECAYS TO DEBRIS: hand every limb to DebrisSystem::AdoptBody as
   // dead flesh, re-tie the garments as debris straps, and forget the rig. The
   // TAIL of a corpse's life, not its start: used for the dead-cap eviction
@@ -3751,6 +3773,11 @@ class Mob {
   // at with the shield down): eased from freeRate to the spec's turnRate as
   // the shield comes up, never above freeRate.
   float ShieldTurnRate(float freeRate) const;
+  // The same ceiling as a bare number: the spec's turnRate over the raise
+  // with a shield up, +inf with none, so ShieldTurnRate(r) == min(r,
+  // ShieldTurnCap()) for every r. What SteerStep (game/steer.h) takes, so the
+  // pure steer needs no Mob.
+  float ShieldTurnCap() const;
   // A blow above the spec's stability: the shield is driven down and cannot
   // come back up for `ticks` (the larger of a live stagger and this one).
   void StaggerShield(int ticks);
@@ -7364,6 +7391,10 @@ class MobSystem {
   // Take one creature out of the world with no corpse — its rig is released
   // (bodies destroyed, not handed to debris). A test/harness seam: the game
   // kills things, it does not delete them. False for an unknown id.
+  // EITHER TIER (docs/PLAN_distant_npcs.md §2.14): a DISTANT creature with
+  // this id is dropped from the tier (it has no rig to release). "Take this
+  // body away" that missed a distant body would have it walk back in later
+  // beside whatever replaced it (a ref edited, a demon dismissed).
   bool RemoveMob(uint64_t id);
   // ---- THE PLAYER'S CORPSE BECOMES A DEAD MOB (PLAN_corpse_is_a_mob.md P2b)
   // A dead avatar still holding its rig has that rig MOVED into mobs_ as a
@@ -7806,8 +7837,19 @@ class MobSystem {
   // BuildRig short of a physics body / micro brick) -- TRANSIENT, a caller
   // holding the record should keep it and retry. False with a null return is
   // permanent (retired def, corrupt or short record).
+  //
+  // `keepId` (docs/PLAN_distant_npcs.md §2.3): nonzero = Spawn ISSUES THIS ID
+  // instead of `nextId_++`. Only the distant tier's promotion passes it: the
+  // tier HELD the id while the creature was distant, so nobody else can have
+  // been issued it, and keeping it is what keeps every Hash3(mobId ^ salt,
+  // ...) stream, every Brain::targetId and every dialogue Speaker naming the
+  // creature across the edge. A player's corpse keeps its band id too (no
+  // renumbering). The duplicate-ref refusal ignores the distant creature that
+  // is coming back under this id (it is the same creature). An id some live
+  // creature already holds is a bug: logged, and a fresh id is issued.
   Mob* LoadOne(ByteReader& r, uint32_t version, bool placeLimbs = false,
-               bool* spawnRefused = nullptr, bool catchUp = false);
+               bool* spawnRefused = nullptr, bool catchUp = false,
+               uint64_t keepId = 0);
 
   // ==== CATCH-UP: A VILLAGER COMES BACK WHERE ITS DAY SAYS (P7) ============
   //
@@ -7868,8 +7910,11 @@ class MobSystem {
   // the world's) is the installer's decision -- no function, no parking.
   //
   // The function returns false to refuse (the creature is then despawned, the
-  // pre-S5b behaviour). `record` may be moved from.
-  using ParkFn = std::function<bool(const Mob& m, std::vector<uint8_t>& record)>;
+  // pre-S5b behaviour). `record` may be moved from. `origin` is where the
+  // record says the creature stands (Mob::Origin of a creature leaving the
+  // window; the overlay's origin of a distant creature RETIRING, which has no
+  // Mob to ask -- docs/PLAN_distant_npcs.md §2.1).
+  using ParkFn = std::function<bool(Vec3 origin, std::vector<uint8_t>& record)>;
   void SetParkFn(ParkFn fn) { parkFn_ = std::move(fn); }
   bool HasParkFn() const { return (bool)parkFn_; }
   // Creatures parked over the life of this system (a diagnostic, never saved).
@@ -7891,6 +7936,84 @@ class MobSystem {
   bool HasRoomForRecord(const uint8_t* data, size_t len, uint32_t version) const {
     return HasRoomToSpawn() || RecordIsDead(data, len, version);
   }
+
+  // ==== THE DISTANT TIER (docs/PLAN_distant_npcs.md, game/distant.h) ========
+  //
+  // Owned here because the park rule that feeds it is PreTick's and the
+  // LoadOne that empties it is this system's; WORLD state, not a player's
+  // (one tier per MobSystem, centred on the residency window). The header of
+  // game/distant.h has the three tiers, the borders and the rules; this is
+  // the API the packages after D0 build on.
+  const DistantMobs& Distant() const { return distant_; }
+  DistantMobs& DistantMut() { return distant_; }
+  // May `d` come back NOW as far as the caps go: a corpse always (the dead
+  // cap decays the oldest, it never refuses), the living while the living cap
+  // has room. Unpark's cap wait, asked of a distant creature.
+  bool HasRoomForDistant(const DistantMob& d) const {
+    return d.dead || HasRoomToSpawn();
+  }
+  // PROMOTE distant creature `id` (§2.1): its record patched with the overlay
+  // (PatchMobRecord), LoadOne(..., placeLimbs = true, catchUp = true, keepId =
+  // id), the brain and steer state moved back, then Mob::ApplyDistantOverlay.
+  // The CALLER has decided the waits (EntityParking::Unpark: budget, cap,
+  // ground known). Returns the creature (null when it did not come back);
+  // `spawnRefused` true = transient (Spawn short of a body or brick, or the
+  // cap): it STAYS distant and is retried. A permanent refusal (its def is
+  // gone, a ref that already has a body in the near tier) drops it, logged
+  // and counted (Stats::failed) -- LoadOne's rule for a parked record.
+  //
+  // CATCH-UP STAYS ON IN D0: a distant villager is frozen like a parked one,
+  // so it comes back where its schedule says, as an unpark does. D5 (distant
+  // villagers walk their schedules) turns it off for creatures that walked.
+  Mob* PromoteDistant(uint64_t id, bool* spawnRefused = nullptr);
+  // THE PATCHED RECORD of a distant creature: its demotion record with the
+  // overlay written in (§2.10). What a retire parks and what a save writes.
+  // False (out untouched) if the record does not take the patch -- which a
+  // record this tier made never fails to.
+  bool DistantRecord(const DistantMob& d, std::vector<uint8_t>& out) const;
+  // THE OVERLAY INTO A RECORD (§2.2, the second of the only two functions
+  // that carry it). Built on ReadMobRecord, so it reads exactly what the
+  // loader reads: origin and heading (the limb transforms moved rigidly with
+  // them about the body box's vertical centre line), every limb's hp, the ref
+  // id, and the dead block (bit 0 of the flags word, the cause, the death
+  // order; a rising the record carried is kept). Everything else -- lattices,
+  // gear, pack, brain tail -- is copied byte for byte, and an overlay equal to
+  // what the record holds gives back the same bytes. Current-version records
+  // only (MobSystem::kSaveVersion); false (bytes untouched) for anything
+  // else, a limb count that disagrees, or a dead record overlaid alive.
+  static bool PatchMobRecord(std::vector<uint8_t>& bytes, uint32_t version,
+                             const DistantOverlay& ov);
+
+  // ---- WHO IS STILL IN THE WORLD, IN EITHER TIER (§2.14's (a) sites) -------
+  //
+  // `FindMobById` / `FindMobByRef` / `IsAlive` stay what they are -- a Mob
+  // in `mobs_`, a rig a caller may touch -- because ~140 call sites need
+  // exactly that (the audit's class (b)). A question about LIVENESS or
+  // IDENTITY that must not answer "gone" for a creature that merely walked
+  // out of the window asks these instead.
+  struct CreatureWhere {
+    bool exists = false;    // in either tier
+    bool distant = false;   // ...in the distant tier (no rig: do not FindMobById it)
+    bool alive = false;
+    uint64_t id = 0;
+  };
+  CreatureWhere LocateCreature(uint64_t id) const;
+  // The near tier first (FindMobByRef's first match), then the distant tier.
+  CreatureWhere LocateByRef(const std::string& refId) const;
+  // Is `id` held by ANY creature (near or distant)? An id allocator's
+  // uniqueness probe (a player corpse's band id).
+  bool IdInUse(uint64_t id) const;
+  // Rename a DISTANT creature's ref (the dungeon spawner's "the dead give
+  // back the slot's name"); the patched record carries it. False if absent.
+  bool SetDistantRefId(uint64_t id, const std::string& refId);
+  // THE BRAIN, WHICHEVER TIER HOLDS IT: a ONE-TIME write that must reach a
+  // creature that is distant right now (a demon's binding, unbinding or
+  // release). Per-tick readers keep MobBrain / MobBrainMut, which see the
+  // near tier only -- a distant brain is frozen and is not theirs to drive.
+  ai::Brain* BrainAnyTierMut(uint64_t id);
+  // SetMobBehavior that also reaches a distant creature (a fresh Brain on the
+  // named profile, as SetMobBehavior gives a near one).
+  bool SetBehaviorAnyTier(uint64_t mobId, const std::string& name);
   // ---- THE TWO CAPS (PLAN_corpse_is_a_mob.md "Bounds") ---------------------
   // `kMaxMobs` counts the LIVING; the dead have their own count and a body
   // budget over their limbs. Past either, the oldest corpse (lowest DeathSeq)
@@ -9834,7 +9957,13 @@ class MobSystem {
   // there — rebuilding it would throw away its Jolt bodies and bricks and
   // flicker the body for nothing.
   struct MobRecord;
-  static bool ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version);
+  // WHERE each overlay field sits in the record's bytes (offsets from the
+  // record's first byte), captured by ReadMobRecord on request: what
+  // PatchMobRecord writes in place, so everything it does not own is copied
+  // and never re-serialised. Defined in mob.cpp beside MobRecord.
+  struct MobRecordLayout;
+  static bool ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version,
+                            MobRecordLayout* layout = nullptr);
   // LoadOne's dead branch (MOBS v6): Die's end state without Die's effects.
   void EnterLoadedDead(Mob& m, const MobRecord& rec);
   // v6: the record's slots re-ordered onto the dressed rig's (base by index,
@@ -9856,6 +9985,28 @@ class MobSystem {
   ParkFn parkFn_;               // S5b; null = despawn out of window (pre-S5b)
   UnparkPlacer unparkPlacer_;   // P7 catch-up; null = come back where it froze
   uint64_t parkedTotal_ = 0;
+  // ---- the distant tier (game/distant.h; distant.cpp holds the code) -------
+  DistantMobs distant_;
+  // LoadOne's keepId, scoped to its one Spawn exactly like `spawnDead_`
+  // (0 = Spawn issues nextId_++).
+  uint64_t spawnKeepId_ = 0;
+  // The retire scan's "has anything changed" memory (rule 2): the window
+  // origin it last ran for. A frozen tier under a still window costs one
+  // compare a tick.
+  bool distantScanHave_ = false;
+  IVec3 distantScanOrigin_{};
+  float distantScanReach_ = -1.0f;   // radius + hysteresis it last ran for
+  // THE DEMOTE BRANCH of PreTick's park rule. `record` is the creature's
+  // SaveOne, already written; true = it is distant now (the caller withdraws
+  // its risings and releases the rig, as for a park), false = park it as
+  // before (switch off, past the radius, the tier full, a ghost, a body a
+  // player drives). `wlo` is the window's min corner in world voxels.
+  bool DemoteToDistant(Mob& mob, std::vector<uint8_t>& record, Vec3 wlo);
+  // RETIRE: every distant creature past radius + hysteresis of the window
+  // centre (all of them with the switch off) is parked as its patched
+  // record through parkFn_. Top of PreTick; runs only when the window moved
+  // or the tier changed since its last pass.
+  void RetireDistant(Vec3 wlo);
   uint64_t aiSteps_ = 0;
   // The drip pot taken in turns (Mob::BleedTick): creatures that wanted a
   // drip this tick / last tick, and the refusals. Not hashed, not saved --

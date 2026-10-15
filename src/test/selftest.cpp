@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "game/distant.h"  // DistantRunTotals: the distant tier's counters
 #include "gpu/context.h"    // LastDeviceJson — which implementation ran
 #include "gpu/resources.h"
 #include "sim/oprecord.h"   // op-stream clamp counters + SANDVOX_RECORD_OPS
@@ -705,6 +706,11 @@ const char* const kOrder[] = {
     // world dir, and so REGENERATES worldgen at the home window on the way
     // out, removes its park function and clears the store.
     "mob-park",
+    // THE DISTANT TIER (docs/PLAN_distant_npcs.md D0). After `mob-park` for its
+    // exit contract and then some: tuning and the tier cap restored, mobs and
+    // debris reset, id counter put back, park function removed, store cleared,
+    // its save dir deleted, worldgen regenerated at the home window.
+    "distant-roundtrip",
     // MOBS v6 (PLAN_corpse_is_a_mob P2a). After `mob-park` for the same exit
     // contract: mobs, debris and risings reset, id counter restored, park
     // function removed, store cleared, worldgen regenerated at home.
@@ -1726,6 +1732,25 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << ", \"firstViolChunk\": [" << oc.firstViolChunk[0] << ", "
       << oc.firstViolChunk[1] << ", " << oc.firstViolChunk[2] << "]"
       << "},\n";
+  }
+  // ---- THE DISTANT TIER, ALWAYS (docs/PLAN_distant_npcs.md) ---------------
+  // Every demotion, promotion and retire the run's creature systems made, and
+  // -- the point of writing it -- every refusal: a leaver that parked because
+  // the tier was full (refusedFull) or was past the radius (outsideRadius), a
+  // promotion that waited (ground / cap / budget / spawn) or failed. Zero
+  // everywhere while `distant.enabled` is off, which it is until D3.
+  {
+    const DistantMobs::Stats& ds = DistantRunTotals();
+    f << "  \"distant\": {\"demoted\": " << ds.demoted
+      << ", \"demotedDead\": " << ds.demotedDead << ", \"anchored\": " << ds.anchored
+      << ", \"promoted\": " << ds.promoted << ", \"promotedDead\": " << ds.promotedDead
+      << ", \"retired\": " << ds.retired << ", \"refusedFull\": " << ds.refusedFull
+      << ", \"outsideRadius\": " << ds.outsideRadius
+      << ", \"groundWaits\": " << ds.groundWaits << ", \"capWaits\": " << ds.capWaits
+      << ", \"budgetWaits\": " << ds.budgetWaits << ", \"spawnWaits\": " << ds.spawnWaits
+      << ", \"failed\": " << ds.failed << ", \"retireScans\": " << ds.retireScans
+      << ", \"promoteScans\": " << ds.promoteScans << ", \"peak\": " << ds.peak
+      << ", \"cap\": " << DistantMobs::kMaxDistantMobs << "},\n";
   }
   // ---- CHUNK TICKETS, ALWAYS (docs/PLAN_chunk_tickets.md) -----------------
   // What the run's ticket system did, so "the pile never landed" has numbers
