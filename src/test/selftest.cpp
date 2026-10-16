@@ -1375,6 +1375,10 @@ const char* const kOrder[] = {
     // CPU only: a synthetic-wall Player climb posing a PlayerAvatar through
     // PosePipeline; spawns and despawns its own avatar, touches no world.
     "ledge-climb-pose",
+    // CPU only, by the same rule: the sneak's stride posed on a PlayerAvatar
+    // off the window (flat, probe-free ground) and the quick sneak's pace on
+    // a Player against a lambda floor; touches no world.
+    "sneak-stride",
     // ---- THE SNAPSHOT LATENCY IS A CONSTANT (PLAN_multiplayer_now N1) ----
     // As late as it can go, by the rule the `floaters` block above spells out.
     // It regenerates worldgen three times (once per pacing arm and once on the

@@ -440,6 +440,7 @@ constexpr uint64_t kShotCrawlLast = 520;
 // person, then first person level / up / down), loose and photograph the
 // arrow's first frames, tap Ctrl into the crouch, sneak side-on and
 // three-quarter-front, then draw crouched (third and first person) and loose.
+// SANDVOX_SHOT_SNEAK_SPRINT=1 sneaks with Shift held (the quick sneak).
 // Every picture is screenshot_archery_<what>.bmp. `g_shotArcheryDraw` is the
 // scripted LMB (the frame's mouse sample is replaced by it).
 bool g_shotArchery = false;
@@ -14810,7 +14811,10 @@ int main(int argc, char** argv) {
       if (f >= 300 && f < 345) pin.strafe = 1.f;             // sneak, side-on
       if (f >= 345 && f < 380) { pin.strafe = 1.f; pin.forward = -0.6f; }  // 3/4 front
       if (f >= 380 && f < 392) pin.strafe = 1.f;             // square up again
-      pin.SetHeld(TB_SPRINT, false);
+      // SANDVOX_SHOT_SNEAK_SPRINT=1: the sneak windows with Shift held (the
+      // quick sneak, player.crouchSprintScale).
+      static const bool sneakSprint = std::getenv("SANDVOX_SHOT_SNEAK_SPRINT") != nullptr;
+      pin.SetHeld(TB_SPRINT, sneakSprint && f >= 300 && f < 392);
       pin.SetHeld(TB_JUMP, false);
       pin.SetPressed(TB_JUMP, false);
       // A TAP of Ctrl toggles the crouch (a hold would go prone).
@@ -14888,6 +14892,25 @@ int main(int argc, char** argv) {
             const float left = d.x * std::cos(h) - d.z * std::sin(h);
             std::printf("    %-7s rel eye: left %6.1f up %6.1f ahead %6.1f\n", nm,
                         left * art, d.y * art, fwd * art);
+          }
+          // ...and the feet against the hips, in metres in the body's frame
+          // (the sneak's stride: one foot ahead, one behind), and the pace.
+          Vec3 hips{};
+          const int hp = avatar.PartIndex("hips");
+          if (hp >= 0 && avatar.PartAnchorWorld(hp, hips)) {
+            for (const char* nm : {"foot.L", "foot.R"}) {
+              Vec3 a{};
+              const int pi = avatar.PartIndex(nm);
+              if (pi < 0 || !avatar.PartAnchorWorld(pi, a)) continue;
+              const Vec3 d = a - hips;
+              const float fwd = d.x * std::sin(h) + d.z * std::cos(h);
+              const float left = d.x * std::cos(h) - d.z * std::sin(h);
+              std::printf("    %-7s rel hips (m): left %5.2f down %5.2f ahead %5.2f\n", nm,
+                          left * kVoxelMeters, -d.y * kVoxelMeters, fwd * kVoxelMeters);
+            }
+            std::printf("    pace %.2f m/s\n",
+                        std::sqrt(player.vel.x * player.vel.x + player.vel.z * player.vel.z) *
+                            kVoxelMeters);
           }
         }
       }

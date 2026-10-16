@@ -1381,13 +1381,19 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     // slow you, chest-deep should be the authored liquidSpeedScale.
     float wade =
         inLiquid ? (1.0f + (T().liquidSpeedScale - 1.0f) * submersion) : 1.0f;
-    // Crouched: no sprint, and the walk scaled down. A crouch is a deliberate
-    // slow-and-low, and letting Shift sprint through it would make the box
-    // shrink for free.
+    // Crouched: the walk scaled down, and Shift is the QUICK SNEAK -- the
+    // same crouch a little faster (crouchSprintScale, under 1), never a
+    // sprint. A crouch is a deliberate slow-and-low, and letting Shift sprint
+    // through it would make the box shrink for free. Faster is louder with
+    // no rule of its own: the stealth noise grows with the speed
+    // (stealth::MovementNoise), so the quick sneak is heard further than the
+    // sneak and still not as far as a walk.
     const bool sprint = in.Held(TB_SPRINT) && !crouching && !prone;
+    const float crouchScale =
+        in.Held(TB_SPRINT) ? T().crouchSprintScale : T().crouchSpeedScale;
     float speed = ((sprint ? T().sprintSpeed : T().walkSpeed) / kVoxelMeters) *
                   wade * (speedScale > 0.0f ? speedScale : 0.0f) *
-                  (crouching ? T().crouchSpeedScale : 1.0f);
+                  (crouching ? crouchScale : 1.0f);
     Vec3 wish = flatFwd * in.forward + right * in.strafe;
     wish.y = 0;
     // The ASKED-FOR pace (player.h moveWish): backing up reads negative, so

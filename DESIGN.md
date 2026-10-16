@@ -11684,7 +11684,10 @@ something the slider moved:
   body is, so a crawl-space cannot wedge you and a stand asked for under a
   ceiling finishes when you walk out. Crouched, the box is
   `player.crouchHeight` (1.15 m), speed scales by `player.crouchSpeedScale`
-  and sprint is off. Prone, the box is `player.proneHeight` (0.5 m; its 0.4 m
+  (0.8 m/s) and Shift is the QUICK SNEAK, `player.crouchSprintScale` (1.2
+  m/s; held at or above the sneak) -- never a sprint, and louder only through
+  the stealth noise's own speed term (`stealth::MovementNoise`), so it is
+  heard further than the sneak and still not as far as a walk. Prone, the box is `player.proneHeight` (0.5 m; its 0.4 m
   floor keeps it taller than the terminal-velocity sweep substep), sprint and
   jump are off, and the pace is the avatar's `prone` loco state (an ACTIVITY
   state in human.json, set by avatar.cpp unless the damage already has the
@@ -11708,6 +11711,28 @@ something the slider moved:
   `crouchKneeDrop` went 0.35 -> 0.30 m with it: the lean takes the head the
   rest of the way down. Solved, with the bow draws, by
   `scripts/gen_archery_clips.py`.
+  **The sneak's legs (2026-10-14, stride 2026-10-15; pose.cpp, all weighted
+  by `SneakWeight`):** standing, a WIDE BASE with the lead foot half a step
+  ahead, the knees splayed out over the toes and a settle step into the
+  stance. Moving, a STRIDE (`kSneakStride`, 0.85 leg lengths): a foot steps
+  once the body has carried it that far and lands half of it ahead of the
+  hip along the travel, so it trails as far behind before it lifts -- one
+  foot ahead and one behind, both legs angled, at any pace (the plain gait
+  at sneak pace stepped every 0.3 L and kept both feet within a fifth of a
+  leg under the pelvis: a squat-shuffle at 3.5 steps/s). The slot rule
+  alone pairs such steps, so a foot may lift only once the other planted
+  foot has drifted (stride - swing travel) / 2 -- where it sits at half
+  cycle -- which spreads a pair on the first step. Only along the facing
+  (a sidestep keeps the plain step; a whole-leg stride sideways crosses the
+  feet); while striding the base comes in to the rest width and the knees
+  keep half their splay. **The knee stop is 135 degrees** (human.json
+  `legL.*` `poseLimit`, was 100): under the held crouch the knee needs ~113
+  degrees with the foot under the hip, and the clamp at 100 lengthened the
+  leg after the IK, so every crouched planted foot skated ~1 vox a stance --
+  the old squat and the sneak alike, at either pace. Gate `sneak-stride` (L/R
+  alternate, evenly spaced, the trailing foot behind the hips, NO FOOT
+  SKATE, sneak cadence under the walk's, the quick sneak's pace and noise
+  between the sneak's and the walk's).
 - **Projectiles** (spells, thrown things): no colliders — swept ray each frame
   (position + velocity look-ahead, anti-tunneling). Spell modifiers attach as
   **tags with per-frame logic** (material trail, AoE on hit, bounce, acceleration
