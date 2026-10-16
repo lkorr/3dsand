@@ -504,6 +504,7 @@ const TUNING_PARAMS = {
   'player.collisionHeight':{t:'f',def:1.5,min:0.5,max:3},
   'player.crouchHeight':{t:'f',def:1.15,min:0.3,max:2},
   'player.crouchSpeedScale':{t:'f',def:0.5,min:0.1,max:1},
+  'player.crouchSprintScale':{t:'f',def:0.75,min:0.1,max:1},
   'player.crouchKneeDrop':{t:'f',def:0.35,min:0,max:0.8},
   'player.proneHeight':{t:'f',def:0.5,min:0.4,max:1},
   'player.proneHoldTime':{t:'f',def:0.3,min:0.1,max:1.5},

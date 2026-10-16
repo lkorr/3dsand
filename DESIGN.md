@@ -9120,7 +9120,7 @@ Calibration, `gore.pierceCellJ` 1.0 J per fine cell of skin-hard matter (a full 
 - **Half draw** (32.5 m/s, 15.8 J): through the head's hair and flesh, STOPPED by the skull (one bone bin costs 9.4 J), 2.5 cm, no brain cell. Into the upper arm: skin, flesh, muscle, stopped by the humerus at 3.8 cm.
 - **Full draw** (65 m/s, 63.4 J): through the WHOLE head, temple to temple (19.4 cm, 62.8 J spent, out at 6 m/s); through the upper arm (9.4 cm, out at 42.9 m/s) and 8.8 cm on into the torso, stopped by a rib; through the torso front to back 6 cm off the midline (14.4 cm, out at 39.4 m/s).
 - **Harder skin, same full-draw shot**: the automaton (`tinker`) loses 1.9 cm of the brass piece on its chest and the arrow then GLANCES off its brass torso (27.5 J for the first bin, 26.7 J left); the sylvan (`dryad`) takes 7.5 cm of bark and wood and stops it.
-- **The bow's arrow since 2026-10-13** (owner: "arrows shouldn't go through someone unless they're an extremely thin layer"): 50 m/s and `sharpness` 0.8 (37.5 J, ~30 J of a perfect point's bite), the ARROW's numbers and not this price, which the spell projectiles share. Half draw (9.4 J): 2.5 cm into the head (stopped by the skull), 2.5 cm into the upper arm. Full draw: into the head 8.8 cm (hair 2, flesh 2, bone 4, brain 7; 25 hp) and STAYS -- 4..13 brain cells across the sub-cell offsets, none killed outright; into the upper arm 6.2 cm, through the humerus and stopped in the far flesh; into the torso 10.0 cm of the 14.4 a perfect point crosses; a side-on fist 6.2 cm (the art's hand is not thin from the side). What it still goes through is what is thin ALONG ITS LINE: an NPC archer's off-centre arrow grazing the torso's edge (skin 10, flesh 7, muscle 4 over 9.5 cm) leaves out the far side. The `pierce` gate asserts the full draw stays in the head, the arm and the torso.
+- **The bow's arrow since 2026-10-13** (owner: "arrows shouldn't go through someone unless they're an extremely thin layer"): 50 m/s and `sharpness` 0.8 (37.5 J, ~30 J of a perfect point's bite), the ARROW's numbers and not this price, which the spell projectiles share. Half draw (9.4 J): 2.5 cm into the head (stopped by the skull), 2.5 cm into the upper arm. Full draw: into the head 8.8 cm (hair 2, flesh 2, bone 4, brain 7; 25 hp) and STAYS -- 4..13 brain cells across the sub-cell offsets, none killed outright; into the upper arm 6.2 cm, through the humerus and stopped in the far flesh; into the torso 10.0 cm of the 14.4 a perfect point crosses; a side-on fist 6.2 cm (the art's hand is not thin from the side). What it still goes through is what is thin ALONG ITS LINE: an NPC archer's off-centre arrow grazing the torso's edge (skin 10, flesh 7, muscle 4 over 9.5 cm) leaves out the far side. The `pierce` gate asserts the full draw stays in the head, the arm and the torso. **Since 2026-10-15 the bow flies at 35 m/s** (owner: slower in the air so the arc reads) and the arrow weighs 61.2 g instead of 30, so the full draw is still these 37.5 J and every number in this paragraph stands (the `pierce` gate prices its own 30 g penetrator at 50 m/s; the `arrow` and `archer` gates fly the item's). A faint render-only trail follows each flight: its own system (`sim/arrowtrail.h`; `game/arrows.h` `ArrowTrails` packs the rows, `arrow_trail.wgsl` draws them), deliberately not a slice of the gust streaks so a change to the wind's look leaves it alone.
 - **Does an arrow through the brain kill?** Not by itself. The brain charge is per CELL destroyed (`gore.brainHpPerVoxel` 3.5), and a one-cell-radius channel holds 2 to 5 cells per cell of depth by its alignment with the lattice alone: across five sub-cell offsets of the same full-draw shot, 16..31 brain cells, 57..111 hp of the head's 135, none killed outright; the 16-cell wound bled the head from 77.7 to 75.9 hp in 10 s. The PRICE is alignment-free (bins); the HP is not, because the carve and the brain charge count cells. That spread, and whether a brain shot should kill, are the owner's (decision 1).
 
 Known limits: no angle-of-incidence glance (a grazing shot pays the same first bin as a square one); materials.json hardness ranks ice (35) ABOVE bone (24), so the soft-point rule does not shatter ice on bone. A body another machine owns is no longer carved for real by the shooter (package C, below): `PierceAlongRay` routes it.
@@ -11769,7 +11769,10 @@ something the slider moved:
   body is, so a crawl-space cannot wedge you and a stand asked for under a
   ceiling finishes when you walk out. Crouched, the box is
   `player.crouchHeight` (1.15 m), speed scales by `player.crouchSpeedScale`
-  and sprint is off. Prone, the box is `player.proneHeight` (0.5 m; its 0.4 m
+  (0.8 m/s) and Shift is the QUICK SNEAK, `player.crouchSprintScale` (1.2
+  m/s; held at or above the sneak) -- never a sprint, and louder only through
+  the stealth noise's own speed term (`stealth::MovementNoise`), so it is
+  heard further than the sneak and still not as far as a walk. Prone, the box is `player.proneHeight` (0.5 m; its 0.4 m
   floor keeps it taller than the terminal-velocity sweep substep), sprint and
   jump are off, and the pace is the avatar's `prone` loco state (an ACTIVITY
   state in human.json, set by avatar.cpp unless the damage already has the
@@ -11793,6 +11796,28 @@ something the slider moved:
   `crouchKneeDrop` went 0.35 -> 0.30 m with it: the lean takes the head the
   rest of the way down. Solved, with the bow draws, by
   `scripts/gen_archery_clips.py`.
+  **The sneak's legs (2026-10-14, stride 2026-10-15; pose.cpp, all weighted
+  by `SneakWeight`):** standing, a WIDE BASE with the lead foot half a step
+  ahead, the knees splayed out over the toes and a settle step into the
+  stance. Moving, a STRIDE (`kSneakStride`, 0.85 leg lengths): a foot steps
+  once the body has carried it that far and lands half of it ahead of the
+  hip along the travel, so it trails as far behind before it lifts -- one
+  foot ahead and one behind, both legs angled, at any pace (the plain gait
+  at sneak pace stepped every 0.3 L and kept both feet within a fifth of a
+  leg under the pelvis: a squat-shuffle at 3.5 steps/s). The slot rule
+  alone pairs such steps, so a foot may lift only once the other planted
+  foot has drifted (stride - swing travel) / 2 -- where it sits at half
+  cycle -- which spreads a pair on the first step. Only along the facing
+  (a sidestep keeps the plain step; a whole-leg stride sideways crosses the
+  feet); while striding the base comes in to the rest width and the knees
+  keep half their splay. **The knee stop is 135 degrees** (human.json
+  `legL.*` `poseLimit`, was 100): under the held crouch the knee needs ~113
+  degrees with the foot under the hip, and the clamp at 100 lengthened the
+  leg after the IK, so every crouched planted foot skated ~1 vox a stance --
+  the old squat and the sneak alike, at either pace. Gate `sneak-stride` (L/R
+  alternate, evenly spaced, the trailing foot behind the hips, NO FOOT
+  SKATE, sneak cadence under the walk's, the quick sneak's pace and noise
+  between the sneak's and the walk's).
 - **Projectiles** (spells, thrown things): no colliders — swept ray each frame
   (position + velocity look-ahead, anti-tunneling). Spell modifiers attach as
   **tags with per-frame logic** (material trail, AoE on hit, bounce, acceleration

@@ -285,11 +285,14 @@ struct Tuning {
     float collisionHeight = TPD(player, collisionHeight);
     // Ctrl. The box shrinks to this height while crouched (and stays crouched
     // under a ceiling the standing box would not fit back under), speed is
-    // scaled by crouchSpeedScale, and the avatar bends its knees by
+    // scaled by crouchSpeedScale (crouchSprintScale with Shift held: the
+    // QUICK SNEAK -- faster, so louder by the stealth model's speed term, and
+    // still slower and quieter than a walk), and the avatar bends its knees by
     // crouchKneeDrop — the pelvis drops that far and the leg IK, whose foot
     // targets are world points, turns the drop into a bend.
     float crouchHeight = TPD(player, crouchHeight);
     float crouchSpeedScale = TPD(player, crouchSpeedScale);
+    float crouchSprintScale = TPD(player, crouchSprintScale);
     float crouchKneeDrop = TPD(player, crouchKneeDrop);
     // PRONE (Player::prone): Ctrl HELD this long goes prone (a shorter press
     // is a tap, which toggles the crouch). The box shrinks to proneHeight;

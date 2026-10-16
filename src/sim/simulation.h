@@ -454,6 +454,13 @@ class Simulation {
   // The gust streaks (wind_streak.wgsl): `count` pool slots, `trail` points
   // each. Zero count is skipped outright; see WindStreakDrawCount.
   void DrawWindStreaks(const rhi::RenderPass& pass, uint32_t count, uint32_t trail);
+  // The arrows' flight trails (sim/arrowtrail.h, arrow_trail.wgsl;
+  // render-only): `count` trails of kArrowTrailPts (x, y, z, alpha) rows,
+  // queue-written BEFORE the frame's encoder exists (the write
+  // drains at the head of the next command buffer). The draw draws what the
+  // last upload wrote, nothing when it wrote none.
+  void UploadArrowTrails(const rhi::Queue& queue, const float* rows, uint32_t count);
+  void DrawArrowTrails(const rhi::RenderPass& pass);
   // Kill every streak (zero the pool, lifetime 0 = never spawned). For a
   // harness that pinned a windy regime and must not leave its streaks, frozen,
   // in the frames that follow.
@@ -1154,9 +1161,10 @@ class Simulation {
       fluidConsumeApply_, fluidStainApply_, fluidMirrorFold_, fluidCellClear_;
   rhi::RenderPipeline raymarch_, particleDraw_, spriteDraw_, bodyDraw_, bodyDepth_,
       microBodyDraw_, debugBoxDraw_, pourMarkerDraw_, debugWindDraw_, debugCurrentDraw_,
-      fluidDraw_, windStreakDraw_;
+      fluidDraw_, windStreakDraw_, arrowTrailDraw_;
   rhi::ShaderModule raymarchModule_, debrisModule_, microBodyModule_,
-      debugLineModule_, debugWindModule_, debugCurModule_, windStreakModule_;
+      debugLineModule_, debugWindModule_, debugCurModule_, windStreakModule_,
+      arrowTrailModule_;
   // ---- the specialized raymarch (W2-A) --------------------------------------
   // `raymarchLeanModule_` is raymarchModule_'s assembled source with the three
   // SPEC_* consts flipped to false (BuildRaymarchVariant). `raymarchLean_` is
@@ -1271,6 +1279,10 @@ class Simulation {
   rhi::Buffer rayStartBuf_;
   // The gust streaks' fixed particle pool (world.h kWindStreakCap).
   rhi::Buffer windStreakBuf_;
+  // The arrow trails' rows (sim/arrowtrail.h; renderPartBGL_ 6), and how many
+  // trails the last UploadArrowTrails wrote.
+  rhi::Buffer arrowTrailBuf_;
+  uint32_t arrowTrailCount_ = 0;
   // The god-ray sun visibility volume (godray_vis.wgsl; pass_table.h
   // kGodVis*): fixed size, made at Init. 27 in shadowBGL_ (compute, written),
   // 38 in renderBGL_ (fragment, read).

@@ -56,6 +56,7 @@
     "collisionHeight": 1.5,
     "crouchHeight": 1.15,
     "crouchSpeedScale": 0.5,
+    "crouchSprintScale": 0.75,
     "crouchKneeDrop": 0.30,
     "proneHeight": 0.5,
     "proneHoldTime": 0.3,

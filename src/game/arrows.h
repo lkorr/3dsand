@@ -58,7 +58,7 @@
 // coats with the channel's walls by the melee rule (game/pierce.h
 // PierceCoat) -- a venomed head envenoms the wound, the wound bleeds onto the
 // head. The coat is put on on the item stage (a quiver, brush one, copy to N).
-// Nothing draws the coat of an arrow IN FLIGHT (a 5 cm head at 50 m/s); it is
+// Nothing draws the coat of an arrow IN FLIGHT (a 5 cm head at 35 m/s); it is
 // drawn once it stands in a body or the ground.
 
 #include <cstdint>
@@ -208,6 +208,9 @@ struct ArrowFlight {
   uint64_t shooter = 0;
   Vec3 from{};
   bool twanged = false;
+  // RENDER-ONLY: which flight this is to its trail (ArrowTrails), handed out
+  // by Launch in order. Nothing the flight decides reads it.
+  uint32_t fxId = 0;
 };
 
 // What one arrow did, for the `arrow` gate and the counters. Bounded log.
@@ -293,7 +296,48 @@ class ArrowFlights {
 
  private:
   void Log(const ArrowEvent& e);
+  uint32_t nextFxId_ = 0;
   std::vector<ArrowFlight> live_;
   std::vector<ArrowEvent> events_;
   std::vector<uint64_t> stuck_;   // oldest first
+};
+
+// ---- THE TRAILS BEHIND THEM (render-only; sim/arrowtrail.h) --------------------
+// A faint white ribbon behind every arrow in flight, so the arc it flies
+// reads (owner, 2026-10-15). Its own system, not the gust streaks' (the
+// wind's look will change; this should not change with it): drawn by
+// arrow_trail.wgsl from the rows the frame queue-writes into its own buffer
+// (Simulation::UploadArrowTrails). Each frame the HEAD is the arrow's drawn
+// point (AppendRenderBodies' lerp, so the ribbon meets the shaft); behind it,
+// a point every kLife / (kPts - 1) seconds of where the head was, each fading
+// out over kLife. A flight that ends -- stuck, embedded, dropped, gone --
+// leaves its trail where it was, to fade on its own. Real seconds, so a
+// paused frame holds its trails. Nothing the tick reads.
+class ArrowTrails {
+ public:
+  static constexpr int kPts = 16;           // == sim/arrowtrail.h kArrowTrailPts
+  static constexpr float kLife = 0.4f;      // s a point lasts
+  static constexpr float kAlpha = 0.45f;    // at the head, fading to 0
+
+  // Follow the flights this frame: `tickAlpha` exactly as AppendRenderBodies
+  // is given it, `dt` the frame's seconds.
+  void Update(const ArrowFlights& flights, float tickAlpha, float dt);
+  // kPts (x, y, z, alpha) rows per trail into `rows` (resized); the count,
+  // at most kArrowTrailSlots.
+  uint32_t Pack(std::vector<float>& rows) const;
+  void Clear() { trails_.clear(); }
+  size_t Count() const { return trails_.size(); }
+
+ private:
+  struct Trail {
+    uint32_t id = 0;
+    bool live = false;
+    Vec3 head{};
+    float headAge = 0.0f;   // s since the flight ended (0 while it flies)
+    float timer = 0.0f;     // s since the last point was laid
+    int n = 0;              // points behind the head, newest first
+    Vec3 pt[kPts - 1]{};
+    float age[kPts - 1]{};
+  };
+  std::vector<Trail> trails_;   // oldest first
 };

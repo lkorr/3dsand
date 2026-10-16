@@ -1525,6 +1525,10 @@ TP_F(player, collisionWidth, NO_WGSL, 0.40f, 0.1f, 1.5f)
 TP_F(player, collisionHeight, NO_WGSL, 1.50f, 0.5f, 3.0f)
 TP_F(player, crouchHeight, NO_WGSL, 1.15f, 0.3f, 2.0f)
 TP_F(player, crouchSpeedScale, NO_WGSL, 0.5f, 0.1f, 1.0f)
+// Shift while crouched: the QUICK SNEAK, a multiplier on walkSpeed like
+// crouchSpeedScale. LoadTuning holds it at or above crouchSpeedScale.
+// + a hand-written rule in LoadTuning
+TP_F(player, crouchSprintScale, NO_WGSL, 0.75f, 0.1f, 1.0f)
 TP_F(player, crouchKneeDrop, NO_WGSL, 0.35f, 0.0f, 0.8f)
 // The prone box's floor is 0.4 m: below 4 voxels the terminal-velocity
 // SweepAxis substep (3.4 voxels) could step a falling prone body over a

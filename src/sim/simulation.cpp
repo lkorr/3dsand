@@ -20,6 +20,7 @@
 #include "sim/rainexpo.h"  // the rain lattice (rainFall / rainExpo extents)
 #include "sim/renderspec.h"  // LastRenderSpec(): which raymarch variant this frame takes
 #include "sim/tuning.h"      // fluidExciteMode gates the seam recording
+#include "sim/arrowtrail.h"   // the arrow trails' rows (render-only)
 #include "sim/wind.h"        // WindStreakDrawCount: the streak pool's live slots
 #include "gpu/rhi_record.h"  // the Vulkan table-recording bridge (phase 4a)
 #include "gpu/rhi_vk.h"      // rhi::vkr::SavePipelineCache (EnsureRenderPipelines)
@@ -853,6 +854,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // off overlay costs nothing but this declaration.
         entry(4, T::ReadOnlyStorage, S::Vertex),  // debug wireframe boxes
         entry(5, T::ReadOnlyStorage, S::Vertex),  // MLS-MPM fluid particles
+        entry(6, T::ReadOnlyStorage, S::Vertex),  // arrow trails (sim/arrowtrail.h)
     };
     renderPartBGL_ = device.CreateBindGroupLayout(pentries, std::size(pentries));
 
@@ -1051,6 +1053,15 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     gasBG_[page] =
         device.CreateBindGroup(gasBGL_, gentries, std::size(gentries), "gasBG");
 
+    // The ARROW TRAILS' rows (sim/arrowtrail.h): CPU-written each frame,
+    // read by arrow_trail.wgsl's vertex stage. Zeroed: alpha 0 draws nothing.
+    if (!arrowTrailBuf_) {
+      using U = rhi::BufferUsage;
+      const size_t bytes = (size_t)kArrowTrailSlots * kArrowTrailPts * 16u;
+      arrowTrailBuf_ = CreateBuffer(device, bytes, U::Storage | U::CopyDst, "arrowTrails");
+      std::vector<uint8_t> zero(bytes, 0u);
+      device.GetQueue().WriteBuffer(arrowTrailBuf_, 0, zero.data(), zero.size());
+    }
     rhi::BindGroupEntry rpentries[] = {
         b(0, world_->particles[page]),
         b(1, world_->sprites),
@@ -1060,6 +1071,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // The fluid pair pages exactly like the ballistic particles: after
         // FlipPage, fluidParticles[Page()] is the buffer the tick just wrote.
         b(5, world_->fluidParticles[page]),
+        b(6, arrowTrailBuf_),
     };
     renderPartBG_[page] = device.CreateBindGroup(renderPartBGL_, rpentries,
                                                  std::size(rpentries), "renderPartBG");
@@ -2339,6 +2351,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // shadowPL_.
   rhi::ShaderModule mGiGather;
   rhi::ShaderModule mWindStreak;
+  rhi::ShaderModule mArrowTrail;
   rhi::ShaderModule mExplode, mParticle, mFluid, mFluidSeam, mWaterBody, mGas;
   rhi::ShaderModule mRay, mDebris, mMicroBody, mDebugLines, mDebugWind, mDebugCur;
   // The TAA resolve (taa.wgsl). Its own tiny module on purpose: the render
@@ -2376,6 +2389,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mGasMask, "gas_mask.wgsl");
     mod(&mGiGather, "gi_gather.wgsl");
     mod(&mWindStreak, "wind_streak.wgsl");
+    mod(&mArrowTrail, "arrow_trail.wgsl");
     mod(&mCloud, "cloud.wgsl");
     mod(&mExplode, "sim_explode.wgsl");
     mod(&mParticle, "sim_particle.wgsl");
@@ -2398,7 +2412,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !mExplode || !mParticle || !mGas || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
       !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur || !mSkyTop ||
-      !mRayStart || !mRainMap || !mHzLight || !mWindStreak || !mGodVis || !mGiGather ||
+      !mRayStart || !mRainMap || !mHzLight || !mWindStreak || !mArrowTrail || !mGodVis || !mGiGather ||
       !mGasMask) {
     if (err) *err = "shader file read failure";
     return false;
@@ -2713,6 +2727,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   debugLineModule_ = mDebugLines;
   debugWindModule_ = mDebugWind;
   windStreakModule_ = mWindStreak;
+  arrowTrailModule_ = mArrowTrail;
   debugCurModule_ = mDebugCur;
   targetFormat_ = rhi::TextureFormat::Undefined;  // force render pipeline rebuild
   return true;
@@ -5203,6 +5218,16 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.depth = dsWind;
     pool.Add([this, d] { windStreakDraw_ = device_.CreateRenderPipeline(d); });
 
+    // The ARROW TRAILS (sim/arrowtrail.h): the same depth rule and straight
+    // alpha, their own module -- a faint ribbon over the scene, not geometry.
+    d.label = "arrowTrailDraw";
+    d.vertexModule = arrowTrailModule_;
+    d.vertexEntry = "vsTrail";
+    d.fragmentModule = arrowTrailModule_;
+    d.fragmentEntry = "fsTrail";
+    d.depth = dsWind;
+    pool.Add([this, d] { arrowTrailDraw_ = device_.CreateRenderPipeline(d); });
+
     // The CURRENT field's arrows (water plan component 8). Same pipeline
     // state as the wind's EXCEPT the depth rule: NOT depth tested, the
     // wireframes' rule. Every non-zero current arrow is INSIDE water, and the
@@ -5554,6 +5579,23 @@ void Simulation::DrawWindStreaks(const rhi::RenderPass& pass, uint32_t count,
   // (trail - 1) ribbon segments x 6 vertices, one instance per pool slot. No
   // vertex buffer: the shader reads the pool at renderBGL_ 33.
   pass.Draw(6 * (trail - 1), count);
+}
+
+void Simulation::UploadArrowTrails(const rhi::Queue& queue, const float* rows,
+                                   uint32_t count) {
+  arrowTrailCount_ = 0;
+  if (!arrowTrailBuf_ || rows == nullptr || count == 0) return;
+  count = std::min(count, kArrowTrailSlots);
+  queue.WriteBuffer(arrowTrailBuf_, 0, rows, (size_t)count * kArrowTrailPts * 16u);
+  arrowTrailCount_ = count;
+}
+
+void Simulation::DrawArrowTrails(const rhi::RenderPass& pass) {
+  if (arrowTrailCount_ == 0 || !arrowTrailDraw_) return;
+  pass.SetPipeline(arrowTrailDraw_);
+  pass.SetBindGroup(0, BodyRenderBG());
+  pass.SetBindGroup(1, renderPartBG_[page_]);
+  pass.Draw(6 * (kArrowTrailPts - 1), arrowTrailCount_);
 }
 
 void Simulation::DrawCurrentField(const rhi::RenderPass& pass,
