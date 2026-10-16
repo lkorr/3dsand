@@ -93,6 +93,41 @@
 //     line (Stats::flipWaits) until the oldest flip ages out, which bounds a
 //     creature pacing the edge to kDistantMaxFlips flips per window.
 //
+// D8 CAP OVERFLOW (fights larger than 64; MobSystem::OverflowSwaps, called once
+// from EntityParking::Unpark before its promotion pass). While the LIVING cap
+// binds -- more living distant creatures wait over the promotion line than
+// there are free slots -- the waiting are served NEAREST TO THE PLAYER first
+// (the nearest living player actor; the window centre with none), and when no
+// slot is free one is MADE: the FARTHEST near creature from the player that
+// is at least `distant.overflowMinDistVox` away and farther than the waiting
+// one by kDistantOverflowMarginVox is demoted where it stands (the park
+// rule's own DemoteToDistant, inside the window) and the waiting one promoted
+// into its slot. A near creature whose brain targets a PLAYER is the last
+// choice (it stops seeing the player the moment it is distant). Both flips
+// pass the thrash bound; at most kDistantOverflowSwapsPerTick swaps a tick.
+// An overflow-demoted creature (DistantMob::overflow) lives INSIDE the window:
+// it walks on the WINDOW'S ground (the fetch cache, DistantGround's window
+// source) where the cache has it, fights near and distant creatures through
+// the edge above (the near band widens to the whole near crowd while any
+// distant creature is inside the window), is drawn as a statue, never
+// perceives a player, and is HELD AT THE PLAYER'S RING -- no step that ends
+// within overflowMinDistVox of a player AND nearer to it -- instead of at the
+// promotion line, so the near side of a fight is always the full-fidelity one.
+//
+// D9 THE PLAYER'S REACH (game/arrows.h). Every flight in the window tests the
+// distant creatures' body boxes (MobBodyBox's world box, published at the
+// start of the tick: DistantBoxes) along each tick's segment: the earliest
+// box, ties by id, ends it, and the hit is resolved on the next distant tick
+// by distant::ResolveArrowContact (the limb nearest the arrow's line in the
+// body as it stood at demotion -> its role, the shell, the bleed). A PLAYER's
+// flight (no ArrowShot target) that leaves the window is not lost: the tier
+// flies it on (an OUTBOUND DistantArrowFlight, ArrowStepOutside over
+// DistantGround) testing the boxes round it every tick, until it hits, lands
+// on the ground, re-enters the window (a real flight again) or runs out of
+// life. Spells stay window-bound. NPC flights with a target keep the D3
+// hand-over -- except at a target INSIDE the window, which the box test has
+// already judged.
+//
 // RULES (CLAUDE.md, §2.11-2.12):
 //   1. Deterministic. The container is a vector SORTED BY ID and every walk is
 //      in that order; tier changes are decided inside the authority tick from
@@ -125,6 +160,7 @@
 #include "math3d.h"
 
 class Stream;
+class World;
 
 // ---- the ground MODE a distant creature has (§2.4) ---------------------------
 //
@@ -210,6 +246,19 @@ class DistantGround {
   // Everything cached, gone (a materials reload, a world reset, a gate that
   // swapped the map by hand).
   void InvalidateAll();
+  // ---- 4. THE WINDOW'S OWN GROUND (D8) ---------------------------------------
+  // For a creature the cap overflow demoted INSIDE the window (DistantMob::
+  // overflow): while set, a cell in a window chunk the FETCH CACHE holds reads
+  // from the cached words -- buildings, trees, the crater dug an hour ago and
+  // still in the window, everything the near tier walks on -- by the same
+  // "carries weight" test, and every other cell from the sources above. The
+  // fetch cache's arrivals are fixed-latency (K = 4) and it is the very cache
+  // the near tier's own ground reads, so this is the near tier's ground at the
+  // near tier's determinism. Set by the distant tick around ONE overflow
+  // creature's step and cleared after it, so no other creature's answers
+  // change; null = off. A cached chunk is decoded once per fetched VERSION.
+  void SetWindowSource(const World* w) { window_ = w; }
+  const World* WindowSource() const { return window_; }
 
   // TerrainHeight(x, z): the top solid cell of the pristine column.
   int TerrainTop(int x, int z);
@@ -245,6 +294,7 @@ class DistantGround {
     uint64_t drains = 0;        // evictions this reader had to complete
     uint64_t invalidations = 0; // chunk entries dropped by the listener
     uint64_t flushes = 0;       // whole-cache drops (map, seed, classes, Clear)
+    uint64_t windowDecodes = 0; // D8: fetched window chunks decoded into a mask
   };
   const Stats& GetStats() const { return stats_; }
   // The stream this reads (null when unbound).
@@ -263,6 +313,15 @@ class DistantGround {
     uint64_t solid[kChunkVol / 64] = {};   // bit (lz*16 + ly)*16 + lx
     uint64_t lastUse = 0;
   };
+  // D8: a fetched window chunk's mask, valid for the cache VERSION it was
+  // decoded from (a newer fetch re-decodes; the words at one version are one
+  // tick's end state, so a re-fetch at the same version is the same mask).
+  struct WinChunk {
+    uint32_t version = 0;
+    uint64_t solid[kChunkVol / 64] = {};
+    uint64_t lastUse = 0;
+  };
+  const WinChunk* WindowChunk(IVec3 wc);
   // What the store's listener writes and Absorb drains: shared, so a store
   // that outlives this object (or the reverse) never calls into freed memory.
   struct Inbox {
@@ -298,6 +357,9 @@ class DistantGround {
   bool memoStored_ = false;
   uint64_t gen_ = 0;      // bumped whenever a cached chunk entry is dropped
   std::vector<uint32_t> decodeScratch_;
+  // D8: the window source (null = off) and its decoded chunks.
+  const World* window_ = nullptr;
+  std::unordered_map<uint64_t, WinChunk> winChunks_;
   Stats stats_;
 };
 
@@ -407,6 +469,16 @@ struct DistantMob {
   // window, where nothing can have been edited since -- and comes back there
   // byte for byte (D0's round-trip contract).
   bool movedWhileDistant = false;
+  // D8: DEMOTED BY THE CAP OVERFLOW, inside the window (MobSystem::
+  // OverflowSwaps). While it stands over the promotion line it walks on the
+  // window's ground (DistantGround::SetWindowSource) and is held at THE
+  // PLAYER'S RING (no step ending within distant.overflowMinDistVox of a
+  // player and nearer to it) rather than at the promotion line, so it may
+  // walk and fight inside the window but never into the full-fidelity middle
+  // of the fight. Cleared when it ends a step outside the promotion line: from
+  // there it is an ordinary distant creature (held at the line if it comes
+  // back in). Not in the record: a retire / save forgets it, as it should.
+  bool overflow = false;
   // The spatial hash cell this creature is filed under (DistantMobs::kCellVox
   // cells of its body CENTRE, x / z). Maintained by DistantMobs; read only.
   int32_t cellX = 0, cellZ = 0;
@@ -539,6 +611,13 @@ struct DistantArrowFlight {
   std::string ammo;              // the item drawn in flight (its micro model)
   distant::ArrowOutcome out;
   bool inbound = false;
+  // D9: an OUTBOUND flight -- a player's arrow (no ArrowShot target) that left
+  // the window, flown on by the same integrator over DistantGround, testing
+  // the distant body boxes round it every tick (no roll: it hits what it
+  // meets). Uses pos / vel / seed / life as an inbound one does, plus the
+  // arrow's flat damage; `target` 0 until it strikes.
+  bool outbound = false;
+  float damage = 0.0f;           // outbound: ItemDef::ArrowSpec::damage
   int32_t pos[3] = {0, 0, 0};    // inbound: the point, 24.8 fixed world voxels
   int32_t vel[3] = {0, 0, 0};    // inbound: per tick, 24.8 fixed
   uint32_t seed = 0;             // inbound: the real flight's soak seed
@@ -568,6 +647,9 @@ struct DistantArrowIn {
   int32_t vel[3] = {0, 0, 0};    // per tick, 24.8 fixed
   uint32_t seed = 0;
   std::string ammo;
+  // D9: ticks already flown (a player's arrow coming back into the window after
+  // a stretch outside keeps the life it has left; a D3 inbound arrow, 0).
+  int life = 0;
 };
 // A NEAR flight that left the window at a DISTANT creature (ArrowFlights::
 // Tick, through MobSystem::QueueEdgeArrowOut): resolved by ResolveArrow at
@@ -582,6 +664,91 @@ struct NearArrowOut {
   float damage = 0.0f;           // the ammo's flat damage (ItemDef::ArrowSpec)
   std::string ammo;
 };
+
+// ---- D9: THE PLAYER'S REACH (game/arrows.h) ----------------------------------
+//
+// A distant creature's BODY BOX as the arrows in the window see it, published
+// at the start of the tick (MobSystem::PublishDistantBand, before anybody
+// moves): the near tier's own body box (MobBodyBox: the world box from the
+// origin, worldSize up), plus the facing the hit's limb is read in. Every
+// living distant creature whose box reaches into the window, in id order.
+struct DistantBox {
+  uint64_t id = 0;
+  Vec3 lo{}, hi{};
+  float heading = 0.0f;
+};
+// Where a segment met a body box: `t` along it (0..1), and the contact in the
+// BODY'S frame -- x right, y up from the feet, z forward, from the box's
+// centre column (distant::ArrowContact) -- with the segment's direction.
+struct DistantBoxHit {
+  uint64_t id = 0;
+  float t = 0.0f;
+  Vec3 at{};                     // world entry point
+  float local[3] = {0, 0, 0};    // the entry, body frame
+  float dir[3] = {0, 0, 1};      // the flight's direction, body frame (unit)
+};
+// A flight in the window that met a distant creature's box (ArrowFlights::
+// Tick, through MobSystem::QueueEdgeArrowBoxHit): resolved at the top of the
+// next distant impact pass by distant::ResolveArrowContact against the
+// defender's tick-start state, in (tick, shooter) order.
+struct NearArrowBoxHit {
+  uint64_t shooter = 0, target = 0;   // the shooter's ACTOR id (a player's is in the band)
+  uint32_t tick = 0;
+  DistantBoxHit hit;
+  float damage = 0.0f;               // ItemDef::ArrowSpec::damage
+  std::string ammo;
+};
+// A PLAYER's flight (no ArrowShot target) that left the window (ArrowFlights::
+// Tick, through MobSystem::QueueEdgeShotOut): taken into the tier's arrows as
+// an OUTBOUND flight at the top of the next impact pass, at exactly this state.
+struct NearShotOut {
+  uint64_t shooter = 0;
+  uint32_t tick = 0;
+  int32_t pos[3] = {0, 0, 0};    // the last in-window sample (or where the window left it)
+  int32_t vel[3] = {0, 0, 0};
+  uint32_t seed = 0;
+  int life = 0;                  // ticks flown in the window
+  float damage = 0.0f;
+  std::string ammo;
+};
+// What an arrow the distant tier flew or landed did (the gates' window into
+// D9; bounded, never an input).
+struct DistantShotEvent {
+  enum class Kind : uint8_t {
+    Hit,        // an OUTBOUND flight met a body box outside the window
+    BoxHit,     // an in-window flight's box hit, applied
+    Grounded,   // an outbound flight met DistantGround
+    Reentered,  // ...crossed back into the window (a real flight again)
+    Expired,    // ...ran out of life
+    Lost,       // a box hit whose creature was no longer a living distant one
+  };
+  Kind kind = Kind::Hit;
+  uint64_t shooter = 0, target = 0;
+  uint32_t tick = 0;
+  Vec3 at{};
+  int limb = -1;
+  float hp = 0.0f;
+};
+// One D8 swap, for the gates (bounded, never an input): who left, who came
+// in, and how far each stood from the player when it happened.
+struct DistantOverflowSwap {
+  uint32_t tick = 0;
+  uint64_t demoted = 0, promoted = 0;
+  float demotedDist = 0.0f, promotedDist = 0.0f;
+  bool lastResort = false;       // the demoted one targeted a player
+};
+
+// D8: at most this many cap-overflow swaps a tick (each is a demotion -- a
+// statue bake, ~3-10 ms in the game -- and a LoadOne), and a swap only when
+// the near creature stands farther from the player than the waiting one by
+// this much: the hysteresis that stops two fighters at about the same range
+// trading places every tick (the flip bound would stop it after four, but the
+// rigs it builds and releases are not free).
+constexpr int kDistantOverflowSwapsPerTick = 1;
+constexpr float kDistantOverflowMarginVox = 24.0f;
+// D9 / D8: the gates' logs (DistantShotEvent, DistantOverflowSwap), trimmed by
+// half past this.
+constexpr size_t kDistantLogMax = 256;
 
 // THE EDGE BAND's width (section 2.7): the longest near sight (the archer's
 // 160) plus a margin. A near creature within this of the window's boundary is
@@ -728,6 +895,27 @@ class DistantMobs {
     // section 2.7's "never a player", counted at the point the list is built
     // so a regression shows where it happens (`distant-edge` asserts it).
     uint64_t playerActorsSeen = 0;
+    // ---- D8: THE CAP OVERFLOW (MobSystem::OverflowSwaps) -------------------
+    uint64_t overflowCalls = 0;     // calls in which the living cap bound
+    uint64_t overflowFilled = 0;    // promotions into free slots, nearest to the player first
+    uint64_t overflowSwaps = 0;     // swaps made: a near creature out, a waiting one in
+    uint64_t overflowLastResort = 0;  // ...whose near creature targeted a player
+    uint64_t overflowNoVictim = 0;  // a waiting creature with no near one farther to trade
+    uint64_t overflowGroundWaits = 0; // a waiting creature whose ground was not known yet
+    uint64_t overflowRefused = 0;   // a swap's demotion refused, or its promotion (the
+                                    // near one stays distant; the slot is free)
+    uint64_t overflowRingHolds = 0; // overflow creatures' steps refused at the player's ring
+    uint64_t overflowInWindowPeak = 0;  // the most living distant creatures inside the window
+    // ---- D9: THE PLAYER'S REACH (game/arrows.h) -----------------------------
+    uint64_t boxHits = 0;           // in-window flights that met a distant body box
+    uint64_t boxHitsApplied = 0;    // ...resolved onto the body (ResolveArrowContact)
+    uint64_t boxHitsLost = 0;       // ...whose creature was no living distant one by then
+    uint64_t shotsOut = 0;          // player flights that left the window, flown on here
+    uint64_t shotsOutHits = 0;      // ...that met a distant body box
+    uint64_t shotsOutGrounded = 0;  // ...that met DistantGround (a miss lands and ends)
+    uint64_t shotsOutReentered = 0; // ...that crossed back into the window
+    uint64_t shotsOutExpired = 0;   // ...that ran out of life
+    uint64_t edgeArrowsOutInWindow = 0;  // D3 hand-overs refused: the target stood in the window
     uint32_t peak = 0;           // the most creatures the tier ever held at once
   };
 

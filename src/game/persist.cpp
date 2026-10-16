@@ -1543,6 +1543,17 @@ uint32_t EntityParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
   };
   uint32_t made = 0, itemsMade = 0;
 
+  // ---- 0. THE CAP OVERFLOW (D8, MobSystem::OverflowSwaps; game/distant.h) --
+  // While the living cap binds: the waiting served nearest to the player, a
+  // far near creature demoted to make a slot. Same budget, same ground wait.
+  made += mobs.OverflowSwaps(tick, budget, [&](const DistantMob& c) {
+    std::vector<IVec3> sc;
+    bool g = footprintGround(c.origin);
+    mobs.DistantPromotionChunks(c, sc);
+    for (const IVec3& wc : sc) g &= GroundKnown(world, wc, tick);
+    return g;
+  });
+
   // ---- 1. THE DISTANT TIER FIRST (docs/PLAN_distant_npcs.md §2.1) ---------
   //
   // PROMOTION and unparking compete for the same living cap and the same

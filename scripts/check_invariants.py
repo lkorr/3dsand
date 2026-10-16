@@ -381,11 +381,8 @@ TUNING_CONSUMER_ALLOWLIST = {
     # rows' defaults so the two cannot drift.
     "player.halfHeight": "scripts/test_mobgen.mjs (figure contract)",
     "player.eyeOffset": "scripts/test_mobgen.mjs (figure contract)",
-    # THE DISTANT TIER'S ROWS, BATCHED AHEAD OF THEIR READERS (on purpose:
-    # docs/PLAN_distant_npcs.md §3 D0 batches every row the feature needs so the
-    # tuner and the .def change once). Each entry leaves when its package
-    # lands the reader; a row still here after D8 is a dead slider.
-    "distant.overflowMinDistVox": "reserved: D8's cap overflow (docs/PLAN_distant_npcs.md §3 D8)",
+    # (The distant tier's rows batched ahead of their readers by D0 all have
+    # readers now: overflowMinDistVox, the last, is D8's -- game/distant.cpp.)
 }
 
 

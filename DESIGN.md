@@ -985,7 +985,7 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
     biome whose cover splits (desert, ocean); tundra's snow skin opted out of
     the firm split and keeps its settle transient.
 
-### Distant creatures (2026-10-15; `docs/PLAN_distant_npcs.md` D0-D3, `game/distant.h`)
+### Distant creatures (2026-10-15/16; `docs/PLAN_distant_npcs.md` D0-D3, D8, D9, `game/distant.h`)
 
 The window is 51.2 m across and used to be the edge of the living world: a
 creature 16 voxels past it was PARKED (its record in a region bucket, frozen,
@@ -1088,11 +1088,54 @@ local or remote, by construction (counted at the list's construction,
   arc. A near archer's flight that leaves the window at a distant creature
   (`ArrowShot` names who at whom) is handed back (`QueueEdgeArrowOut`) and
   resolved by the ranged roll over the whole shot, landing after the flight
-  time it has left.
+  time it has left -- unless that creature stands INSIDE the window (D8):
+  its body box was in the flight's path all along (D9's box test), so the
+  flight that left MISSED it and is not rolled again.
 - *Thrash*: a demotion cannot wait (past the pad there is no ground), so a
   PROMOTION does: a creature with `kDistantMaxFlips - 2` tier changes in the
   last `kDistantFlipWindowTicks` (600) waits at the line, so a creature pacing
   the edge changes tier at most `kDistantMaxFlips` (4) times per 600 ticks.
+
+**Cap overflow** (D8, `MobSystem::OverflowSwaps`, one call at the top of
+`Unpark`): fights larger than the 64-living cap. While the cap BINDS (more
+living distant creatures over the promotion line than free slots) the waiting
+are served NEAREST TO THE PLAYER (the nearest living player actor; the window
+centre with none) instead of the window centre, and with no slot free one is
+MADE: the FARTHEST near creature from the player at least
+`distant.overflowMinDistVox` (150 = 15 m) away and farther than the waiting one
+by `kDistantOverflowMarginVox` (24, the hysteresis) is demoted where it stands
+-- inside the window -- and the waiting one promoted into its slot. A near
+creature whose brain targets a player is the LAST choice (it stops seeing the
+player the moment it is distant); one ragdolled, airborne or holding a severed
+piece never goes. Both flips pass the thrash bound; `kDistantOverflowSwapsPerTick`
+(1) a tick, out of Unpark's own budget and ground wait. An overflow-demoted
+creature (`DistantMob::overflow`) lives in the window as a statue: it walks on
+the WINDOW'S ground (`DistantGround::SetWindowSource`: the fetch cache, the
+near tier's own ground at the near tier's fixed latency, where the cache has
+the chunk), fights near and distant creatures through the edge above (the
+distant tick's near band is the WHOLE near crowd while any distant creature is
+inside the window), never perceives a player, and is held at THE PLAYER'S RING
+-- no step that ends within `overflowMinDistVox` of a player and nearer to it
+-- instead of at the promotion line: the middle of a fight is always full
+fidelity, and the far side waits its turn at the ring. Leaving the promotion
+line makes it an ordinary distant creature again. Gate `distant-overflow`.
+
+**The player's reach** (D9, `game/arrows.h`): a statue has no collider, so
+every flight in the window also tests the distant creatures' BODY BOXES
+(`MobBodyBox`'s world box, published with the band at the start of the tick:
+`DistantBoxes`) along its segment -- the earliest box, ties by id, never the
+shooter's own; one met before anything near or solid ends the arrow there,
+and the next distant impact pass resolves it (`distant::ResolveArrowContact`:
+contact is GEOMETRY's, no roll -- the limb whose centre, captured in the
+body's frame at demotion, lies nearest the arrow's line; its shell; the
+ranged table's damage per contact; the bleed; no sever). A PLAYER's flight
+(no `ArrowShot` target) that leaves the window is not lost: the tier flies it
+on (an OUTBOUND `DistantArrowFlight`, `ArrowStepOutside` over DistantGround,
+< 1 tick late at the hand-over) testing the boxes round it every tick until it
+hits a statue, LANDS (a miss ends on the ground), comes back into the window
+(a real flight again, with the life it has left) or runs out of life; drawn
+in flight like an inbound one. Spells stay window-bound; NPC flights with a
+target keep D3's hand-over. Gate `distant-arrow`.
 
 **Drawing** (`game/distant_draw.h`): a statue -- the creature's own live limbs
 posed (idle, walk A/B, strike, lying), merged and downsampled to 5 cm cells,
@@ -1119,9 +1162,9 @@ gates that test the PARK path pin it off (`DistantSwitchScope`: `mob-park`
 A-F, `corpse-save`, `npc-catchup`, `refs-npc-identity` A-E; C2 runs the tier).
 Counters: `build/last_run.json` -> `distant`. Gates `distant-roundtrip`,
 `distant-walk`, `distant-sleep`, `distant-fight`, `distant-calibrate`,
-`distant-calib-matrix`, `distant-look`, `distant-edge`. Planned: D5+D6
-(activation, schedules walked while distant, load), D8 (cap overflow past 64),
-D9 (the player's arrows past the edge), D7 (multiplayer).
+`distant-calib-matrix`, `distant-look`, `distant-edge`, `distant-overflow`,
+`distant-arrow`. Planned: D5+D6 (activation, schedules walked while distant,
+load), D7 (multiplayer).
 
 ---
 

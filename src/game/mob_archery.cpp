@@ -357,9 +357,13 @@ void MobArcheryTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_
     ArrowShot shot;
     shot.shooter = in.shooter;
     shot.target = in.target;
+    // (D9: a player's arrow coming back in from past the edge -- target 0,
+    // shooter the player's actor id -- arrives here too, with the life it has
+    // left.)
     if (ammo != nullptr &&
         w.arrows.Inject(*ammo, SpellFxVec{in.pos[0], in.pos[1], in.pos[2]},
-                        SpellFxVec{in.vel[0], in.vel[1], in.vel[2]}, in.seed, shot))
+                        SpellFxVec{in.vel[0], in.vel[1], in.vel[2]}, in.seed, shot,
+                        ArrowFlights::kLifeTicks - in.life))
       w.mobs.DistantMut().Note(&DistantMobs::Stats::edgeArrowsInjected);
   }
   // RULE 2: nothing asked and nothing drawn = nothing to do.

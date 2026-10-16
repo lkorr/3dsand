@@ -8337,6 +8337,46 @@ class MobSystem {
   // EntityParking::Unpark waits on these being fresh in the fetch cache, on
   // top of its own footprint wait.
   void DistantPromotionChunks(const DistantMob& d, std::vector<IVec3>& out) const;
+  // ---- D8: THE CAP OVERFLOW (game/distant.h; docs/PLAN_distant_npcs.md) ----
+  // Called ONCE per EntityParking::Unpark, before its promotion pass, with
+  // that call's budget and its ground wait for a distant creature (the
+  // footprint + snap chunks known in the fetch cache). While the living cap
+  // BINDS (more living distant creatures over the promotion line than free
+  // slots) the waiting are served NEAREST TO THE PLAYER first: free slots are
+  // filled, then at most kDistantOverflowSwapsPerTick SWAPS demote the
+  // farthest eligible near creature (>= distant.overflowMinDistVox from the
+  // player and farther than the waiting one by kDistantOverflowMarginVox; one
+  // that targets a player last; never a ghost, a body a player drives, one
+  // ragdolled, airborne or holding a severed piece) INSIDE the window and
+  // promote the waiting one into its slot. Both flips pass the thrash bound.
+  // Returns the promotions made (Unpark's `made`). Does nothing, and costs a
+  // scan, while the cap does not bind.
+  uint32_t OverflowSwaps(uint32_t tick, uint32_t budget,
+                         const std::function<bool(const DistantMob&)>& groundReady);
+  // The distance from `c` to the nearest LIVING player actor's centre (the
+  // window centre's when none is listed): what "near the player" means to D8.
+  float PlayerDistance(Vec3 c) const;
+  // The swaps made, for the gates (bounded at kDistantLogMax, oldest dropped).
+  const std::vector<DistantOverflowSwap>& OverflowLog() const { return overflowLog_; }
+  void ClearOverflowLog() { overflowLog_.clear(); }
+  // ---- D9: THE PLAYER'S REACH (game/distant.h; game/arrows.h) --------------
+  // The distant body boxes the arrows in the window test, as of the START of
+  // this tick (PublishDistantBand), id order.
+  const std::vector<DistantBox>& DistantBoxes() const { return distantBoxes_; }
+  // The earliest of those boxes the segment a -> b meets (`ignore`: the
+  // shooter's own actor id), ties by id. False = none.
+  bool DistantBoxAlong(Vec3 a, Vec3 b, uint64_t ignore, DistantBoxHit& out) const;
+  // An in-window flight met distant creature `h.target`'s box: queued for the
+  // next distant impact pass. False (nothing queued) when the switch is off or
+  // the target is no living distant creature.
+  bool QueueEdgeArrowBoxHit(const NearArrowBoxHit& h);
+  // A PLAYER's flight (no target) left the window: queued, flown on by the
+  // tier from the next distant tick. False when the switch is off (the flight
+  // expires at the face, as before D9).
+  bool QueueEdgeShotOut(const NearShotOut& s);
+  // What the tier's arrows did (bounded at kDistantLogMax, oldest dropped).
+  const std::vector<DistantShotEvent>& DistantShotEvents() const { return shotEvents_; }
+  void ClearDistantShotEvents() { shotEvents_.clear(); }
   // ---- THE TWO CAPS (PLAN_corpse_is_a_mob.md "Bounds") ---------------------
   // `kMaxMobs` counts the LIVING; the dead have their own count and a body
   // budget over their limbs. Past either, the oldest corpse (lowest DeathSeq)
@@ -10376,7 +10416,15 @@ class MobSystem {
   // its risings and releases the rig, as for a park), false = park it as
   // before (switch off, past the radius, the tier full, a ghost, a body a
   // player drives). `wlo` is the window's min corner in world voxels.
-  bool DemoteToDistant(Mob& mob, std::vector<uint8_t>& record, Vec3 wlo);
+  // `flipTick` stamps the demotion (the thrash bound's clock, demotedTick);
+  // 0 = the last PreTick's tick (the park rule's own).
+  bool DemoteToDistant(Mob& mob, std::vector<uint8_t>& record, Vec3 wlo,
+                       uint32_t flipTick = 0);
+  // THE DEMOTION, WHEREVER THE CREATURE STANDS (DemoteForTest and D8's
+  // overflow swap): SaveOne -> DemoteToDistant -> the risings withdrawn ->
+  // ReleaseRig -> out of mobs_. `overflow` marks it DistantMob::overflow.
+  // False (the creature untouched) wherever DemoteToDistant refused it.
+  bool DemoteNow(uint64_t id, Vec3 wlo, uint32_t flipTick, bool overflow);
   // RETIRE: every distant creature past radius + hysteresis of the window
   // centre (all of them with the switch off) is parked as its patched
   // record through parkFn_. Top of PreTick; runs only when the window moved
@@ -10410,6 +10458,22 @@ class MobSystem {
   std::vector<NearEdgeBlow> edgeBlows_;
   std::vector<NearArrowOut> edgeArrowsOut_;
   std::vector<DistantArrowIn> edgeArrowsIn_;
+  // ---- D8 / D9 (distant.cpp) ------------------------------------------------
+  // Living distant creatures whose body CENTRE is inside the window box, as of
+  // the last band membership pass: while any is, the distant tick's near band
+  // is the whole near crowd (an overflow creature deep in the window must see
+  // the near creatures round it, not only those near a face).
+  size_t bandInWindow_ = 0;
+  // The arrows' body boxes (DistantBoxes): members by position (recomputed
+  // with the band's membership), the boxes themselves every tick.
+  std::vector<uint64_t> boxIds_;
+  std::vector<DistantBox> distantBoxes_;
+  // D9's two hand-overs: in-window box hits, and player flights out.
+  std::vector<NearArrowBoxHit> edgeBoxHits_;
+  std::vector<NearShotOut> edgeShotsOut_;
+  // The gates' logs.
+  std::vector<DistantShotEvent> shotEvents_;
+  std::vector<DistantOverflowSwap> overflowLog_;
   // The tier changes of every creature that changed tier recently (the thrash
   // bound): the last kDistantMaxFlips flip ticks, oldest first. Looked up by
   // id only (never walked for an outcome); trimmed of entries whose newest
