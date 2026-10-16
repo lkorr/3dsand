@@ -42,13 +42,19 @@
 //      trailing run inside the polygon) - Lf (Lf as in 5). So the water that
 //      meets the parent or the lake is at its level, and any drop is a step
 //      (with its weir) well clear of the other body.
-//   8. Reaches = runs of equal S. A step between samples i-1 and i is cut at
-//      sample i with the cut normal = normalize(p[i+1] - p[i-1]) * 1024
-//      (rounded), SHARED by both pieces, so the two sides partition the plane
-//      exactly. Within a reach, pieces split Douglas-Peucker style while a
-//      sample strays > 1 voxel from the chord, the chord is > kRiverPieceMax
-//      a side, or hw / d stray > 1 from their lerp.
-//   9. Per piece: bank = map's `bank`, else round(1.5 * 2 * max hw), clamped
+//   8. The running surface T8 (eighths): every step of S of at most
+//      kRiverWaterfall ramps (see the step's own comment); a bigger one stays
+//      a hard step.
+//   9. Reaches = runs between HARD steps. A hard step between samples i-1
+//      and i is cut at sample i with the cut normal =
+//      normalize(p[i+1] - p[i-1]) * 1024 (rounded), SHARED by both pieces, so
+//      the two sides partition the plane exactly. Within a reach, pieces split
+//      Douglas-Peucker style while a sample strays > 1 voxel from the chord,
+//      the chord is > kRiverPieceMax a side, hw / d stray > 1 from their lerp,
+//      or T8 strays > 2 eighths from its own. A reach's last piece ends at the
+//      cut sample (the first of the reach below) but on the reach's OWN
+//      surface there, never the lower one.
+//  10. Per piece: bank = map's `bank`, else round(1.5 * 2 * max hw), clamped
 //      to kRiverBankMax and hw + bank <= 1536.
 // The column-side rules (channel, dam, weir, bank, ford) are worldgen.wgsl
 // waterApply's comment.
@@ -792,6 +798,19 @@ bool BakeRiversLakes(WorldMapData& out, uint32_t seed, std::vector<WorldMapData:
       const int a0 = starts[r];
       const int b0 = r + 1 < starts.size() ? starts[r + 1] : N - 1;
       if (b0 <= a0) continue;
+      // A REACH ENDS ON ITS OWN SURFACE. Sample b0 of a reach that ends at a
+      // waterfall is the FIRST sample of the reach below the cut (the cut line
+      // runs through it), so its T8 is the lower water. Lerped toward it, the
+      // reach's last piece fell the whole waterfall across the last bake
+      // sample in front of the cut -- a pit as deep as the fall, 4 voxels
+      // long, upstream of every crest, with the crest standing up out of it
+      // at the upper level again (and the surface split down to that one
+      // sample). The upper surface runs on, level, to the cut; the crest and
+      // the curtain (worldgen waterApply) take it over the edge.
+      const bool toFall = r + 1 < starts.size();
+      auto t8At = [&](int k) {
+        return (toFall && k == b0) ? sm[static_cast<size_t>(b0 - 1)].T8 : sm[static_cast<size_t>(k)].T8;
+      };
       std::vector<std::pair<int, int>> stack{{a0, b0}}, done;
       while (!stack.empty()) {
         const auto [a, b] = stack.back();
@@ -810,7 +829,7 @@ bool BakeRiversLakes(WorldMapData& out, uint32_t seed, std::vector<WorldMapData:
           d = std::max(d, std::fabs(K.d - (A.d + (B.d - A.d) * f)));
           // The surface, in eighths: a piece is one straight ramp, so a
           // sample more than 2 eighths off the chord's lerp splits it.
-          d = std::max(d, std::fabs(K.T8 - (A.T8 + (B.T8 - A.T8) * f)) / 2.0);
+          d = std::max(d, std::fabs(K.T8 - (t8At(a) + (t8At(b) - t8At(a)) * f)) / 2.0);
           if (d > dev) { dev = d; farK = k; }
         }
         const bool tooLong = std::max(std::abs(B.x - A.x), std::abs(B.z - A.z)) > static_cast<int>(kRiverPieceMax);
@@ -839,7 +858,7 @@ bool BakeRiversLakes(WorldMapData& out, uint32_t seed, std::vector<WorldMapData:
         // The piece's surface, eighths, at each end (worldmap.h kS_RivSurf /
         // kS_RivLipY): waterApply lerps it along the chord.
         st.surf = A.T8;
-        st.surfB = B.T8;
+        st.surfB = t8At(b);
         st.bed = rv.bedId;
         st.len = static_cast<int>(std::lround(std::hypot(B.x - A.x, B.z - A.z)));
         st.wflags = rv.profile == "V" ? kRivProfileV : 0;

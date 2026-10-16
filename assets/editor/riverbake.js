@@ -353,6 +353,10 @@ export function bakeRiver(rv, ctx) {
   for (let r = 0; r < starts.length; r++) {
     const a0 = starts[r], b0 = r + 1 < starts.length ? starts[r + 1] : N - 1;
     if (b0 <= a0) continue;
+    // A reach ends on its OWN surface: sample b0 of a reach that ends at a
+    // waterfall is the first of the reach below the cut (worldwater.cpp step 9).
+    const toFall = r + 1 < starts.length;
+    const t8At = k => (toFall && k === b0) ? sm[b0 - 1].T8 : sm[k].T8;
     const stack = [[a0, b0]];
     while (stack.length) {
       const [a, b] = stack.pop();
@@ -365,7 +369,7 @@ export function bakeRiver(rv, ctx) {
         const f = B.s > A.s ? (Q.s - A.s) / (B.s - A.s) : 0;
         d = Math.max(d, Math.abs(Q.hw - (A.hw + (B.hw - A.hw) * f)));
         d = Math.max(d, Math.abs(Q.d - (A.d + (B.d - A.d) * f)));
-        d = Math.max(d, Math.abs(Q.T8 - (A.T8 + (B.T8 - A.T8) * f)) / 2.0);
+        d = Math.max(d, Math.abs(Q.T8 - (t8At(a) + (t8At(b) - t8At(a)) * f)) / 2.0);
         if (d > dev) { dev = d; farK = k; }
       }
       const tooLong = Math.max(Math.abs(B.x - A.x), Math.abs(B.z - A.z)) > K.riverPieceMax;

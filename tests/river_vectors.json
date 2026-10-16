@@ -2506,7 +2506,7 @@
     "joins": "",
     "lakeIn": "round_lake",
     "lakeOut": null,
-    "pieces": 18,
+    "pieces": 19,
     "profile": {
      "ground": [
       1126,
