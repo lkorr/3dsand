@@ -1165,6 +1165,31 @@ def check_wind_streak():
                         f"{gt.group(1)}/{gs.group(1)} -- the pool's rows would misalign")
 
 
+def check_arrow_trail():
+    """arrow_trail.wgsl's row layout must match sim/arrowtrail.h's.
+
+    The C++ sizes the buffer and packs each trail as kArrowTrailPts rows
+    (game/arrows.cpp ArrowTrails::Pack); the shader strides by ARROW_TRAIL_PTS.
+    A mismatch draws one trail's tail as the next one's head -- ribbons strung
+    between arrows, with no error anywhere.
+    """
+    ah = read("src/sim/arrowtrail.h")
+    at = read("assets/shaders/arrow_trail.wgsl")
+    if not ah or not at:
+        return
+    c = re.search(r"constexpr\s+uint32_t\s+kArrowTrailPts\s*=\s*(\d+)", ah)
+    g = re.search(r"const\s+ARROW_TRAIL_PTS\s*:\s*u32\s*=\s*(\d+)u", at)
+    if not (c and g):
+        problems.append("arrow trail layout: could not find kArrowTrailPts in "
+                        "sim/arrowtrail.h or ARROW_TRAIL_PTS in arrow_trail.wgsl")
+        return
+    checked.append("arrow trails")
+    if c.group(1) != g.group(1):
+        problems.append(f"sim/arrowtrail.h kArrowTrailPts = {c.group(1)} but "
+                        f"arrow_trail.wgsl ARROW_TRAIL_PTS = {g.group(1)} -- the "
+                        f"trails' rows would misalign")
+
+
 def check_godray_vis():
     """The god-ray visibility volume's dimensions: pass_table.h, godray_vis.wgsl
     and raymarch.wgsl must agree.
@@ -3685,6 +3710,7 @@ ALL = {
     "windprim": check_wind_prims,
     "windmirror": check_wind_mirror,
     "windstreak": check_wind_streak,
+    "arrowtrail": check_arrow_trail,
     "drafts": check_drafts,
     "godrayvis": check_godray_vis,
     "gasmask": check_gas_mask,
@@ -3757,6 +3783,8 @@ RELEVANT = {
     "assets/shaders/common.wgsl": ["stainprec", "powdermass", "windmirror", "drafts"],
     "src/sim/windfield.cpp": ["windmirror"],
     "assets/shaders/wind_streak.wgsl": ["windstreak"],
+    "assets/shaders/arrow_trail.wgsl": ["arrowtrail"],
+    "src/sim/arrowtrail.h": ["arrowtrail"],
     "assets/shaders/sim_draft.wgsl": ["drafts"],
     "assets/shaders/flow_measure.wgsl": ["flowmeas"],
     "assets/shaders/sim_fluid.wgsl": ["flowmeas"],
