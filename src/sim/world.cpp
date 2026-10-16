@@ -3084,9 +3084,8 @@ static WaterCol waterApply(int x, int z, bool roaded, int hRoad, int h0, std::st
       floorMin = std::min(floorMin, s - drop);
       if (strip == 1) crestY = std::max(crestY, lipV);
       if (strip == 2) curtY = std::max(curtY, lipV);
-    } else if (d2 < (hw + (int)kRiverLip) * (hw + (int)kRiverLip)) {
-      outS = std::max(outS, s + m - 1);
     }
+    if (d2 < (hw + (int)kRiverLip) * (hw + (int)kRiverLip)) outS = std::max(outS, s + m - 1);
     if (!nearR || d2 < nd2) {
       nearR = true;
       nd2 = d2;
@@ -3119,7 +3118,7 @@ static WaterCol waterApply(int x, int z, bool roaded, int hRoad, int h0, std::st
     }
     bed = nBed;
     if (h < top) { water = top; gap = wg; }
-    else h = std::max(h, wv + mCh);
+    else h = std::max(h, std::max(wv + mCh, outS + 1));
   } else if (nearR) {
     const int tgt = nS + nM;
     const int inner = nHw + (int)kRiverLip;

@@ -2333,9 +2333,11 @@ fn rivCut(w : i32) -> vec2<i32> {
 //     that crosses the channel wins up to the water (a ford).
 //     A channel column left DRY (its floor at or over the surface: the
 //     shallow edge of a U, where the ramp has just stepped down a voxel) is
-//     raised to S + M, M the piece's STEEPNESS: 1 + the most whole voxels its
-//     surface falls per column, so the wet column beside it upstream, whose
-//     surface is at most M - 1 cells higher, has a wall there and not a gap.
+//     raised to hold the HIGHEST water any piece within RIVER_LIP of it could
+//     stand beside it: S + M over every such piece, M the piece's STEEPNESS
+//     (1 + the most whole voxels its surface falls per column) -- the wet
+//     column next door may take its surface from another piece than this
+//     one did (a short steep piece at a bend), so every one is asked.
 //   * else in the NEAREST piece's BANK (hw .. hw + bank): the ground blends to
 //     S + M -- 256 within RIVER_LIP of the channel, a smoothstep out to the
 //     bank's edge -- cutting where the terrain is higher, building a levee
@@ -2459,9 +2461,10 @@ fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, La
       floorMin = min(floorMin, s - drop);
       if (strip == 1) { crestY = max(crestY, lipV); }
       if (strip == 2) { curtY = max(curtY, lipV); }
-    } else if (d2 < (hw + RIVER_LIP) * (hw + RIVER_LIP)) {
-      outS = max(outS, s + m - 1);
     }
+    // What this column must hold if it ends up dry or a bank: the water any
+    // piece within RIVER_LIP of it may stand beside it (channel or not).
+    if (d2 < (hw + RIVER_LIP) * (hw + RIVER_LIP)) { outS = max(outS, s + m - 1); }
     if (!near || d2 < nd2) {
       near = true;
       nd2 = d2;
@@ -2503,7 +2506,7 @@ fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, La
     }
     bed = nBed;
     if (h < top) { water = top; gap = wg; }
-    else { h = max(h, wv + mCh); }
+    else { h = max(h, max(wv + mCh, outS + 1)); }
   } else if (near) {
     let tgt = nS + nM;
     let inner = nHw + RIVER_LIP;

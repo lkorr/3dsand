@@ -4454,10 +4454,16 @@ fn stillLevel8(x : i32, z : i32, mat : u32) -> i32 {
   if (T.stillWaterRelax == 0u) { return STILL_UNHELD; }
   let si = stillIndex(x, z);
   if (stillWater[si] != stillTag(x, z)) { return STILL_UNHELD; }
-  var v = stillWater[si + 1u];
-  if (v == 0u) { v = stillWater[si + 2u]; }
-  if (v == 0u || (v >> 20u) != mat) { return STILL_UNHELD; }
-  return bitcast<i32>(v << 12u) >> 12u;
+  let v = stillWater[si + 1u];
+  if (v != 0u) {
+    if ((v >> 20u) != mat) { return STILL_UNHELD; }
+    return bitcast<i32>(v << 12u) >> 12u;
+  }
+  // A stream's (sim_stream.wgsl): the target in [2]'s low 20 bits (a hop
+  // above them), the liquid in [3]'s low 12.
+  let d = stillWater[si + 2u];
+  if (d == 0u || (stillWater[si + 3u] & 0xFFFu) != mat) { return STILL_UNHELD; }
+  return bitcast<i32>(d << 12u) >> 12u;
 }
 
 // ============================ HELD WATER ===================================

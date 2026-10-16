@@ -879,9 +879,10 @@ Status GateRivers(Ctx& c, std::string& detail) {
           for (int dx = -3; dx <= 3; dx++)
             for (int y = cTop - 3; y <= cTop; y++)
               crater.push_back(CellOp{World::SlotCellIndex(IVec3{cx + dx, y, cz + dz}), 0u});
-        // The breach: from inside the channel, out across the bank and 24
-        // voxels past it, 3 wide, its floor 2 cells under main's surface there
-        // and level (a dead end the river must FILL, then rest against).
+        // The breach: from inside the channel, out across the bank and 12
+        // voxels past it, 3 wide, its floor 2 cells under main's surface at the
+        // river and falling away from it (a dead end the river runs into, fills
+        // and then rests against).
         const auto& pb = Lm[(Lm.size() * 3) / 4];
         const auto& pb0 = Lm[(Lm.size() * 3) / 4 - 2];
         const auto& pb1 = Lm[(Lm.size() * 3) / 4 + 2];
@@ -900,7 +901,9 @@ Status GateRivers(Ctx& c, std::string& detail) {
             const int x = pb[0] + static_cast<int>(std::lround(nx * r + tx * w));
             const int z = pb[1] + static_cast<int>(std::lround(nz * r + tz * w));
             if (!trenchCols.insert({x, z}).second) continue;
-            trenchFloor[{x, z}] = bFloor;
+            // Falling away from the river one voxel in six, as a breach does:
+            // the river runs into it under gravity, not by levelling.
+            trenchFloor[{x, z}] = bFloor - (r - r0) / 6;
           }
         (void)bTop;
         std::vector<CellOp> trenchWalls, trench;
@@ -948,7 +951,7 @@ Status GateRivers(Ctx& c, std::string& detail) {
         // (diffusive), so the claim is REACH, not the brim.
         int outCells = 0, outWet = 0;
         for (const auto& [x, z] : outCols) {
-          const uint32_t w = voxRaw(x, bFloor, z);
+          const uint32_t w = voxRaw(x, trenchFloor[{x, z}], z);
           if ((w & 0xFFFu) != 0u && (w & 0xFFFu) != mWater) continue;   // not dug (the floor is the ground there)
           outCells++;
           if ((w & 0xFFFu) == mWater) outWet++;
@@ -956,7 +959,7 @@ Status GateRivers(Ctx& c, std::string& detail) {
         const double craterFrac = craterCells ? double(craterBack) / craterCells : 0.0;
         const double trenchFrac = outCells ? double(outWet) / outCells : 0.0;
         const double craterMin = BaselineNumber("rivers.craterRefillMin", 0.95);
-        const double trenchMin = BaselineNumber("rivers.breachReachMin", 0.7);
+        const double trenchMin = BaselineNumber("rivers.breachReachMin", 0.8);
         const bool rOk = craterCells > 50 && craterFrac >= craterMin && outCells > 40 && trenchFrac >= trenchMin;
         std::printf("rivers: R running: %s (after %d ticks: the crater %d / %d cells water again (%.2f >= %.2f); the "
                     "breach reached %d / %d trench columns past the bank (%.2f >= %.2f); peak %u chunks awake)\n",
