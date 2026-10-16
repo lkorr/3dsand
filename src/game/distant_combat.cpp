@@ -154,8 +154,27 @@ const MatchupCalib* DistantCalib::Matchup(const std::string& name) const {
   return nullptr;
 }
 
+namespace {
+// The near stump's law, from the TUNING (copied at load like the burn cap, so
+// the resolver is a pure function of the table): what a sever owes at once
+// (gore.severStumpBudget voxels of blood) and what an open stump then drains
+// a tick -- one bleed clump topped up per drip period, scaled by the volume
+// dial and the stump's gain and saturating at a whole clump (Mob::BleedTick,
+// "THE STUMP THAT NEVER CLOSES"), each voxel gore.bleedHpPerVoxel of life.
+void StumpLawFromTuning(SeverCalib& s) {
+  const Tuning::Gore& g = CurrentTuning().gore;
+  const float clump = (float)BleedClumpVoxels(std::max(0, g.bleedClumpRadius));
+  const float per = std::min(1.0f, std::max(0.0f, g.bleedVoxelGain) * std::max(0.0f, g.stumpBleedGain));
+  s.owedHp = std::max(0.0f, g.severStumpBudget) * g.bleedHpPerVoxel;
+  s.stumpHpPerTick = g.stumpBleedsOpen
+                         ? clump * per * g.bleedHpPerVoxel / (float)std::max(1, g.bleedDripTicks)
+                         : 0.0f;
+}
+}  // namespace
+
 DistantCalib DistantCalibBuiltin() {
   DistantCalib c;
+  StumpLawFromTuning(c.sever);
   c.about =
       "BUILT-IN FALLBACK (game/distant_combat.cpp DistantCalibBuiltin): "
       "assets/mobs/distant_combat.json was absent or unreadable. Round "
@@ -396,6 +415,59 @@ bool LoadDistantCombat(const std::string& path, DistantCalib& out,
       }
     }
   }
+  // D2b: the hit-size inverse CDF per role, and dismemberment.
+  if (j.contains("spread") && j["spread"].is_object()) {
+    for (auto it = j["spread"].begin(); it != j["spread"].end(); ++it) {
+      const LimbRole r = LimbRoleByName(it.key());
+      if (r == LimbRole::Count || !it.value().is_array()) {
+        log += "spread." + it.key() + ": not a role with a knot list, skipped\n";
+        continue;
+      }
+      HitSpread hs;
+      bool ok = true;
+      for (const json& e : it.value()) {
+        if (!e.is_array() || e.size() != 2 || !e[0].is_number() || !e[1].is_number()) {
+          ok = false;
+          break;
+        }
+        const float pp = (float)e[0].get<double>(), xx = (float)e[1].get<double>();
+        if (!std::isfinite(pp) || !std::isfinite(xx) || xx < 0.0f || pp < 0.0f || pp > 1.0f ||
+            (!hs.p.empty() && (pp <= hs.p.back() || xx < hs.x.back()))) {
+          ok = false;
+          break;
+        }
+        hs.p.push_back(pp);
+        hs.x.push_back(xx);
+      }
+      if (!ok || hs.p.size() < 2 || hs.p.front() != 0.0f || hs.p.back() != 1.0f) {
+        log += "spread." + it.key() + ": knots must be [p, x] pairs, p from 0 to 1 and both "
+               "ascending; the CV spread is kept\n";
+        continue;
+      }
+      c.spread[(int)r] = std::move(hs);
+    }
+  }
+  if (j.contains("sever") && j["sever"].is_object()) {
+    const json& sv = j["sever"];
+    if (sv.contains("rate") && sv["rate"].is_object())
+      for (int k = 0; k < kKinds; k++) {
+        if (!sv["rate"].contains(kKindNames[k])) continue;
+        const json& rk = sv["rate"][kKindNames[k]];
+        for (int r = 0; r < kRoles; r++)
+          c.sever.rate[k][r] = Num(rk, kRoleNames[r], 0.0f, 0.0f, 1.0f,
+                                   std::string("sever.rate.") + kKindNames[k], log);
+      }
+    if (sv.contains("hits") && sv["hits"].is_object())
+      for (int k = 0; k < kKinds; k++) {
+        if (!sv["hits"].contains(kKindNames[k])) continue;
+        const json& hk = sv["hits"][kKindNames[k]];
+        for (int r = 0; r < kRoles; r++)
+          c.sever.hits[k][r] = Int(hk, kRoleNames[r], 0, 0, 1 << 30,
+                                   std::string("sever.hits.") + kKindNames[k], log);
+      }
+    // owedHp / stumpHpPerTick are TUNING's (StumpLawFromTuning, in the
+    // builtin this started from); the file's copy is a record.
+  }
   if (j.contains("matchups") && j["matchups"].is_array()) {
     for (const json& m : j["matchups"]) {
       if (!m.is_object() || !m.contains("name") || !m["name"].is_string()) {
@@ -486,6 +558,36 @@ std::string DistantCalibToJson(const DistantCalib& c) {
     r["damageFrac"] = R4(c.ranged.damageFrac);
     r["roleWeights"] = RolesJson(c.ranged.roleWeights);
     o["ranged"] = r;
+  }
+  {
+    ojson sp = ojson::object();
+    for (int r = 0; r < kRoles; r++) {
+      const HitSpread& hs = c.spread[r];
+      if (hs.p.empty()) continue;
+      ojson knots = ojson::array();
+      for (size_t i = 0; i < hs.p.size() && i < hs.x.size(); i++)
+        knots.push_back(ojson::array({R4(hs.p[i]), R4(hs.x[i])}));
+      sp[kRoleNames[r]] = knots;
+    }
+    if (!sp.empty()) o["spread"] = sp;
+  }
+  {
+    ojson sv = ojson::object(), rate = ojson::object(), hits = ojson::object();
+    for (int k = 0; k < kKinds; k++) {
+      ojson rk = ojson::object(), hk = ojson::object();
+      for (int r = 0; r < kRoles; r++) {
+        if (c.sever.hits[k][r] == 0 && c.sever.rate[k][r] == 0.0f) continue;
+        rk[kRoleNames[r]] = R4(c.sever.rate[k][r]);
+        hk[kRoleNames[r]] = c.sever.hits[k][r];
+      }
+      rate[kKindNames[k]] = rk;
+      hits[kKindNames[k]] = hk;
+    }
+    sv["rate"] = rate;
+    sv["hits"] = hits;
+    sv["owedHp"] = R4(c.sever.owedHp);
+    sv["stumpHpPerTick"] = R4(c.sever.stumpHpPerTick);
+    o["sever"] = sv;
   }
   {
     ojson ms = ojson::array();
@@ -623,6 +725,7 @@ DistantKit BuildDistantKit(const Mob& m, const ItemLibrary* items) {
       const AttackStyle* played = lib.At(ds.form);
       StyleTiming(played != nullptr ? *played : *sty, ds.impactTicks, ds.totalTicks);
       const bool held = sty->weapon.empty() || sty->weapon == "held";
+      ds.held = held;
       const MobNaturalWeaponDef* nw = nullptr;
       if (held) {
         const ItemDef* w = right != nullptr ? right : left;
@@ -677,6 +780,12 @@ DistantKit BuildDistantKit(const Mob& m, const ItemLibrary* items) {
     L.vital = ld.vital || i == def->rootLimb;
     L.alive = sys->LimbBody(m.Id(), i) != 0;
     L.maxHp = i < (int)def->limbs.size() ? def->limbs[(size_t)i].hp : ld.hp;
+    L.severable = ld.severable && i != def->rootLimb;
+    for (int j = 0; j < base && !ld.parent.empty(); j++)
+      if (m.LimbDefAt(j).name == ld.parent) {
+        L.parent = j;
+        break;
+      }
   }
   const std::vector<float> hard = ShellHardnessOfLimbs(m);
   for (size_t i = 0; i < hard.size() && i < k.limbs.size(); i++)
@@ -714,10 +823,12 @@ DistantVitals CaptureDistantVitals(const Mob& m, const DistantCalib& cal) {
 
 namespace {
 
+// A limb a blow can land on: attached, flesh, a role -- and hp left, unless
+// the kit says a ruined limb is still in the way (DistantKit::absorbRuined).
 bool LiveLimb(const DistantKit& k, const std::vector<float>& hp, size_t i) {
   return i < k.limbs.size() && i < hp.size() && k.limbs[i].alive &&
          !k.limbs[i].bloodless && k.limbs[i].role != LimbRole::Other &&
-         hp[i] > 0.0f;
+         (hp[i] > 0.0f || k.absorbRuined);
 }
 
 // A role from the weights by the draw `u` in [0, 1).
@@ -894,9 +1005,22 @@ StrikeOutcome ResolveStrike(const DistantKit& att, const DistantKit& def,
   // through whatever is worn over that limb.
   o.shellFactor = ShellFactor(o.kind, o.cause, def.limbs[(size_t)o.limb].shellHardness,
                               cal.armour, gear);
-  o.hp = std::max(0.0f, s.strike.Total()) * std::max(0.0f, meanPower) *
-         Spread(sc.powerCv, rng::Unit01(rng::Hash3(seed, key.tick, 4))) * o.shellFactor;
+  // THE SIZE: the role's measured inverse CDF (its tail is the organs), else
+  // the CV spread round the mean.
+  const float u4 = rng::Unit01(rng::Hash3(seed, key.tick, 4));
+  const HitSpread& hs = cal.spread[(int)o.role];
+  const float mult = hs.p.size() >= 2 ? Interp(hs.p, hs.x, u4) : Spread(sc.powerCv, u4);
+  o.hp = std::max(0.0f, s.strike.Total()) * std::max(0.0f, meanPower) * mult * o.shellFactor;
   o.bleedAdded = Bleed(def, o.limb, o.hp, o.kind, cal);
+  // ...AND WHETHER IT COMES OFF: the measured rate for this kind on this role,
+  // through whatever is worn over it (an edge stopped by plate severs
+  // nothing), only for a limb that CAN come off.
+  const DistantLimb& L = def.limbs[(size_t)o.limb];
+  if (L.severable && (int)o.kind < kKinds) {
+    const float pSever = std::clamp(cal.sever.rate[(int)o.kind][(int)o.role], 0.0f, 1.0f) *
+                         o.shellFactor;
+    o.sever = pSever > 0.0f && rng::Unit01(rng::Hash3(seed, key.tick, 5)) < pSever;
+  }
   o.hit = true;
   o.result = StrikeResult::Hit;
   return o;
@@ -993,9 +1117,50 @@ void SpendProportional(DistantVitals& v, const DistantKit& k, float cost, float 
 }
 }  // namespace
 
+DistantDeath SeverLimb(DistantVitals& v, DistantKit& k, int limb, const DistantCalib& cal,
+                       std::vector<int>* off) {
+  if (off != nullptr) off->clear();
+  if (v.dead != DistantDeath::None) return v.dead;
+  if (limb < 0 || limb >= (int)k.limbs.size() || !k.limbs[(size_t)limb].alive)
+    return v.dead;
+  // The subtree: the limb, then (in index order, until nothing changes) every
+  // live limb whose parent is off. Rigs list a parent before its children,
+  // but the fixed point does not rely on it.
+  const bool vital = k.limbs[(size_t)limb].vital;
+  k.limbs[(size_t)limb].alive = false;
+  if (off != nullptr) off->push_back(limb);
+  for (bool more = true; more;) {
+    more = false;
+    for (size_t i = 0; i < k.limbs.size(); i++) {
+      DistantLimb& L = k.limbs[i];
+      if (!L.alive || L.parent < 0 || L.parent >= (int)k.limbs.size() ||
+          k.limbs[(size_t)L.parent].alive)
+        continue;
+      L.alive = false;
+      if (off != nullptr) off->push_back((int)i);
+      more = true;
+    }
+  }
+  // THE STUMP: open until death, and the gout's owed blood on the rate.
+  if (k.bleeds) {
+    v.stumps++;
+    v.bleedRate += std::max(0.0f, cal.sever.owedHp) *
+                   (1.0f - std::clamp(cal.bleed.decay, 0.0f, 0.9999f));
+  }
+  // A head off is a death (Mob::Sever routes a vital limb to Die).
+  if (vital) {
+    v.dead = DistantDeath::VitalLimb;
+    return v.dead;
+  }
+  v.dead = DeathTest(v, k, cal);
+  return v.dead;
+}
+
 float StepBleed(DistantVitals& v, const DistantKit& k, const DistantCalib& cal) {
-  if (v.dead != DistantDeath::None || v.bleedRate <= 0.0f) return 0.0f;
-  const float cost = v.bleedRate;
+  if (v.dead != DistantDeath::None || (v.bleedRate <= 0.0f && v.stumps <= 0)) return 0.0f;
+  // The decaying wounds, and every open stump's drain (until death).
+  const float cost = v.bleedRate + (float)std::max(0, v.stumps) *
+                                       std::max(0.0f, cal.sever.stumpHpPerTick);
   v.bleedRate *= std::clamp(cal.bleed.decay, 0.0f, 0.9999f);
   if (v.bleedRate < 1e-4f) v.bleedRate = 0.0f;
   const float total = TotalHp(v, k);
@@ -1004,6 +1169,39 @@ float StepBleed(DistantVitals& v, const DistantKit& k, const DistantCalib& cal) 
     v.dead = DistantDeath::BloodLoss;
     return total;
   }
+  SpendProportional(v, k, cost, total);
+  v.dead = DeathTest(v, k, cal);
+  return cost;
+}
+
+int StumpTicksLeft(const DistantVitals& v, const DistantKit& k, const DistantCalib& cal) {
+  const float c = (float)std::max(0, v.stumps) * std::max(0.0f, cal.sever.stumpHpPerTick);
+  if (v.dead != DistantDeath::None || !(c > 0.0f)) return INT32_MAX;
+  const float total = TotalHp(v, k);
+  // StepBleed kills on the tick whose opening total is at or under its
+  // bill: after j clean ticks the total is total - j c, so the first lethal
+  // tick is the smallest j with total - j c <= c.
+  if (total <= c) return 0;
+  return (int)std::min<double>((double)INT32_MAX - 1.0, std::ceil((double)(total - c) / (double)c));
+}
+
+float StepStumps(DistantVitals& v, const DistantKit& k, const DistantCalib& cal, int ticks,
+                 int* diedAfter) {
+  if (diedAfter != nullptr) *diedAfter = -1;
+  if (v.dead != DistantDeath::None || ticks <= 0 || v.stumps <= 0) return 0.0f;
+  const float c = (float)v.stumps * std::max(0.0f, cal.sever.stumpHpPerTick);
+  if (!(c > 0.0f)) return 0.0f;
+  const int clean = StumpTicksLeft(v, k, cal);
+  const float total = TotalHp(v, k);
+  if (clean < ticks) {
+    // It bled out inside the span: the clean ticks' drain, then the lethal
+    // one (DrainBlood's "bled white": the limbs keep what they had).
+    if (clean > 0) SpendProportional(v, k, (float)clean * c, total);
+    v.dead = DistantDeath::BloodLoss;
+    if (diedAfter != nullptr) *diedAfter = clean + 1;
+    return total;
+  }
+  const float cost = (float)ticks * c;
   SpendProportional(v, k, cost, total);
   v.dead = DeathTest(v, k, cal);
   return cost;

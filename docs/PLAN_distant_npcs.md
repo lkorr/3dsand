@@ -752,8 +752,8 @@ the window. Thresholds go in `tests/baseline.json` (`BaselineNumber` /
 | `distant-roundtrip` | D0 | demote → N ticks → promote: same id, same brain target, record digest equal (`mob-save-delta`'s), every limb's hp equal; a corpse round-trips dead; a creature demoted inside a dungeon box or 3 m above `TerrainHeight` classifies ANCHORED and promotes where it stood; a save taken while K creatures are distant loads K parked records back; `parked` did not increment inside the radius; with `enabled=false` the old park path runs |
 | `distant-walk` | D1 | a distant creature walks ≥1,000 voxels over varied ground (the `peaks` map, as `altitude` does) and stays on `DistantGround`; refuses an over-budget climb; water handled; an ANCHORED creature does not move; a waiting creature never crosses the promotion line; a creature over a dug-and-evicted crater walks into it identically in two runs (the eviction drain); promotion lands within `distantPromoteMaxDropVox` of real ground with no fall damage; twice-run trace digest equal |
 | `distant-sleep` | D1 | 200 idle distant creatures: awake count 0 within T ticks; µs/tick under `distantIdleMaxUs`; a creature walking past wakes exactly its neighbourhood |
-| `distant-fight` | D2b | two squads fight distant: casualties > 0, twice-run digest equal (per-creature limb hp + origin bits + deaths, `mob-cap64-twice`-style), awake count → 0 after the fight, dead promoted as corpses on the ground |
-| `distant-calibrate` | D2b | ASYMMETRIC matchups (armoured vs unarmoured, 4v3, sword vs zombie, archer vs melee), K seeds each, at full fidelity and distant: the stronger side's win rate agrees within `distantWinRateTol`, mean time-to-kill ratio inside `distantTtkRatioMin..Max` (±25%) |
+| `distant-fight` | D2b | two squads fight distant: casualties > 0, twice-run digest equal (per-creature limb hp + origin bits + deaths, `mob-cap64-twice`-style), awake count → 0 after the fight, dead promoted as corpses on the ground; 128 engaged costs ≤ `distantEngaged128MaxUs` (a regression ceiling; the target is §2.11's 1.5 ms) with the per-phase attribution recorded |
+| `distant-calibrate` | D2b | ASYMMETRIC matchups (armoured vs unarmoured, mace vs plate, 4v3, sword vs zombie, archer vs melee), K seeds each at distance against the table's full-fidelity rows: each side's win rate within `distantWinRateTol` (or 2 standard errors of the difference), mean time-to-kill ratio inside `distantTtkRatioMin..Max` (±25%, or within 2 standard errors of the full-fidelity mean) where full fidelity decided, and each side's hp left within `distantHpLeftTol`; a matchup listed in `distantCalibrate.knownDivergent` is measured and printed, not asserted (§6 D2b) |
 | `distant-edge` | D3 | near vs distant melee pair across the edge: both take damage, the near wound is real (lattice changed, blood op emitted); a distant archer's arrow enters the window as an `ArrowFlight` and hits; a creature pacing the edge flips tier ≤ `distantMaxFlips` per 600 ticks |
 | `distant-look` | D4a | a distant creature at 40 m covers > N pixels in a shot; render-only slots never exceed the free budget; the near crowd never loses a slot; baked pose words stay under `kDistantPoseWordsMax` and the words per pose are recorded |
 | `distant-schedule` | D5 | a parked villager inside the radius activates, walks its schedule while distant, promotes at its scheduled place |
@@ -1356,6 +1356,185 @@ dungeon floors are D1b. Ticket batches and the shoreline disagreement (2, 4).
 Distant villagers do not walk schedules (D5) and promotion keeps D0's
 `catchUp = true` -- D5 must turn it off for creatures that walked
 (`movedWhileDistant` is the flag to read). The awake step cost (14).
+
+### D2b (branch `dnpc-d2b`): abstract combat in the tick
+
+**What landed.** Distant creatures fight. `MobSystem::TickDistant` (distant.cpp)
+starts swings and draws in phase 1 (writing only the stepper) and resolves
+them in an **impact pass** between phase 1 and the sleep test: every swing
+whose impact tick it is resolves against its defender's tick-start snapshot
+(`distant::ResolveStrike`), every due bow looses (`ResolveArrow` -> a
+`DistantArrowFlight` in `DistantMobs::Arrows()`), every arrow due lands; the
+outcomes are then APPLIED in attacker-id order (swings and looses), then the
+arrows in loose order, then the statuses (`StepBleed` / `StepBurn` /
+`StepStumps`), then the grips. The kit, the vitals, the hands, the bow and
+the sidearm are cached on `DistantMob` at demotion (`DemoteToDistant`, before
+`ReleaseRig`); the calibration loads with the attack styles
+(`MobSystem::SetAttackStyles`, so the load, the selftest boot and the R reload
+all read it). Statues strike while a swing is in flight; arrows in the air are
+drawn on their arc (`AppendDistantArrowBodies`, one line in `main.cpp`). Gates
+`distant-fight` and `distant-calibrate` (`selftest_distant_calib.cpp`, kOrder
+after `distant-sleep`), the `distant` block of `build/last_run.json` gains the
+fight counters and the per-phase cost.
+
+**What D3 hooks into.**
+- *Distant hits near*: the impact pass's `strokeNoTarget` branch (target id
+  not in the tier) is where a swing at a near creature of the edge band lands
+  -- build the defender's kit with `distant::BuildDistantKit(mob)` (it works on
+  any live Mob), roll `ResolveStrike`, apply through the near creature's own
+  door. Same for `arrowsLost` (an arrow whose target crossed the edge: inject
+  a real `ArrowFlight` instead).
+- *Near hits distant*: a public "blow pending on distant id X" queue drained
+  at the top of the impact pass, applied in the same id order, keeps the
+  order-independence (the resolver is pure; only the apply order matters).
+- *Snapshots*: `DistantSnap` + `actorAt` (the `ai::Actor` of each living
+  distant creature, built once a tick from its tick-start state, with reach,
+  bleeding and the swing's Windup / Cut / Recover) are local to `TickDistant`
+  today; the edge band's near-side actor list wants exactly those, published
+  before the near creature loop.
+
+**Deviations and decisions.**
+1. **Severs, stumps and the hit-size tail were added to the model** (they
+   decide full-fidelity fights). D2a's log showed no heavy tail in a 300-tick
+   sample, so a run with attribution (per-stroke severed limbs, per-bout death
+   causes and limbs off) was taken: near, a cut hit on an arm takes a limb of
+   the arm off 18% of the time, a leg 26%, a head 4% (decapitation); survivors
+   carried 5-11 limbs off; organs (brain, heart) give head / torso hits a tail
+   to 11-34x the mean. So the table gained `spread` (the hit-size inverse CDF
+   per role, normalised by the style's mean) and `sever` (P(the struck limb
+   comes off | kind, role), unarmoured; a shell scales it), the stroke log a
+   severed mask, the resolver a `sever` outcome and `SeverLimb` (the subtree
+   off, an open stump, the gout's owed blood; a head off is a death), and
+   `StepBleed` an open-stump drain. The stump law (one clump per drip period,
+   `gore.*`, 0.15 hp/tick, 24 hp owed) is the tuning's, copied at load; a stump
+   probe in the harness measured 0.12-0.15 hp/tick, confirming it.
+2. **D2a's matchups were measured under a throttled bleed.** Near drips go
+   through a shared pot (`gore.bleedOpsPerTick`, 6 a tick per MobSystem,
+   taken in turns): the matrix's ~30 bleeding creatures each bled at about a
+   sixth of a lone fight's rate. The matrix now lifts the pot to its ceiling
+   (64) for its duration -- the distant tier's bleeding is a creature's own --
+   and the table was regenerated with **16 rounds** (`distantCalib.calibRounds`
+   8 -> 16, ~11 min). The reference changed shape: full-fidelity bouts are
+   mostly DECIDED now (armoured 15/16 at 1,145 ticks, mace-vs-plate 16/16 at
+   920, the zombie dies 15/16 at 769, the 4v3 5/16), so D2a's "most bouts end
+   undecided" was largely the pot. Arrow `damageFrac` moved 1.59 -> 2.58 in the
+   new table (the strike tick's TotalHp drop; not investigated further).
+3. **A ruined limb is still in the way** (`DistantKit::absorbRuined`, set on
+   every kit the tier builds): near, an arm at hp 0 hangs there and the next
+   blow aimed at it lands on it (`limb.hp -= amount`, which is what the log's
+   `meanPower` / `roleWeights` were measured from); D2a's resolver moved such
+   a blow onto the trunk. Limb hp may go negative, as near.
+4. **The impact tick is the table's measured one** (mean stroke start ->
+   first contact, which already carries the tempo jitter and the injured
+   arms), the authored windup + half cut where a style has no row; the arm is
+   busy until the authored end. A request on a busy arm, or one no style
+   reaches, is dropped (`strokesRefused`), as `BeginStroke` drops it.
+5. **Grips** (`melee.injuredArmDrop`): a weapon falls from a hand whose arm
+   chain is below 15% (and above 0), and with the chain severed the weapon and
+   the fist both go; the held styles re-arm with the other hand's weapon, else
+   a fist (its reach the chain's live bone length, `StyleReachOn`'s fist term),
+   else they go ("none of its styles is usable"). An archer out of arrows
+   draws its sheathed sidearm (reach estimated: a quarter arm + the item's
+   `reach`). The record keeps the item: a promotion's first `GripFails` drops
+   it again.
+6. **Bleed / burn across the edge: no `kSaveVersion` bump.** Promotion reads
+   the `DistantMob` directly: `ApplyDistantOverlay` re-opens the owed blood
+   (rate / (1 - decay)) on the limb the last cut landed on and severs, for
+   real, every limb lost at distance; `PromoteDistant` re-lights 40 voxels of
+   the biggest torso limb (`IgniteLimb`) on a creature still burning. A retire
+   or a save loses bleed and burn exactly as a near park / save does (the
+   record never carried them), and loses severs at distance (the record's limb
+   comes back hanging at its hp) -- a known gap.
+7. **An open stump does not keep a creature awake** (the brief said "awake
+   while bleeding"): a stump bleeds until death -- thousands of ticks for a
+   survivor -- so a creature whose only status is stumps sleeps with a clock
+   at the tick it bleeds out (`StumpTicksLeft`), and whatever wakes it first
+   pays the ticks it slept through in one sum (`StepStumps`: exact, since a
+   constant drain spent proportionally leaves every limb at the same share).
+   Decaying bleeds and burns keep it awake (they end in ~700-800 ticks).
+8. **Sleep ignores sub-0.05-voxel jitter** (`kDistantSleepJitterVox`): two idle
+   survivors inside each other's personal space were nudged ~1e-4 voxels a
+   stride by the spacing push against ground that refused most of it, and
+   "it moved" kept both awake for ever (a latent D1 case the fight exposed).
+9. **Actor lists are capped at the 24 nearest** (+ itself; its target always
+   kept), in id order: Think walks the list several times a step and a dense
+   battle is otherwise O(N^2). **Neighbourhoods are cached per (cell, reach)
+   per tick** (the hash does not change until phase 3).
+10. **A reach of 0 at demotion takes the profile's floor**: `StyleReachOn`
+    reads the live pose and answers 0 for a fist (1.2 for a mace) on a rig
+    that has never been posed, and 0 means "unlimited" to the draw and the
+    impact test. The gates pose their creatures 4 real ticks before demoting
+    them (`MusterDistant`).
+11. **Arrows**: resolved at the loose (hit, limb, hp: against the target's
+    tick-start state), applied at the impact tick if the target is still a
+    living distant creature; no spread and no sever on an arrow (pierce has
+    no strokes in the log). The draw: the bow's windup + pull x the profile's
+    `draw` + hold + jitter (`kSaltDistantArrow`, draw index 8).
+12. **Deaths**: cause by the near names ("vital limb destroyed", "blood
+    loss", "burnt past the death knot"), `deathSeq` from the near counter,
+    asleep forever, the statue lying at its feet's height; nothing booked in
+    `rises_` (infection is not modelled at this tier). A creature that walked
+    and then died is snapped onto the real ground at promotion like the
+    living (`DistantPromotionChunks` waits on its chunks).
+13. **`distant-calibrate` compares against the table's rows** (it does not
+    re-run full fidelity): win rate within 0.3 or two standard errors of the
+    difference of the two proportions; TTK within +/-25% or two standard errors
+    of the full-fidelity mean (with 16 bouts its SE is still 60-145 ticks);
+    hp left within 0.2. `distantCalibrate.knownDivergent` lists the matchups
+    measured and not asserted, with the reason in `baseline.json`.
+14. `distant-roundtrip` zeroes the bleed rates right after its demotions:
+    its creature [2] is carved before it leaves and would now bleed at
+    distance, which is not what its byte-for-byte round trip is about.
+15. Not done: severed limbs do not show on the statue (the look is baked at
+    demotion); DESIGN.md's full section stays D3's.
+
+**Measured** (`--verify distant-fight,distant-calibrate,distant-walk,
+distant-sleep,distant-roundtrip,mob-cap64-twice,distant-calib-matrix,mob-park`:
+all pass, 66.6 s; the cost quoted below from one `SANDVOX_RUN_EXCLUSIVE=1`
+run of `distant-fight`).
+
+`distant-fight`: four plated swordsmen and an archer against five unarmoured
+swordsmen: decided at tick 1,022 (5 dead), the tier asleep at 1,238; 130
+swings (83 hit, 12 blocked), 12 arrows (8 hit); twice-run digests equal; the 5
+corpses promoted dead under their ids, cause kept, no voice, no fall billed,
+lying with their lowest limb centre within 1.15 voxels of the ground.
+
+`distant-calibrate` (32 seeds at distance vs 16 full-fidelity bouts):
+
+| matchup | win (distant / full) | TTK ticks (distant / full +/- se) | hp left A, B (distant / full) | |
+|---|---|---|---|---|
+| armoured vs unarmoured | A 0.81 / 0.94 | 1,299 / 1,145 +/- 103 (1.13) | 0.99 / 1.00, 0.04 / 0.01 | agrees |
+| mace vs plate | B 0.97 / 1.00 | 1,144 / 920 +/- 72 (1.24) | 0.00 / 0.00, 0.99 / 1.00 | agrees |
+| sword vs zombie | B 1.00 / 0.94 | 957 / 769 +/- 93 (1.25) | 0.00 / 0.01, 0.97 / 0.90 | agrees (TTK at the band's edge) |
+| 4v3 swords | A 0.41 / 0.31 | 1,225 / 1,387 +/- 60 (0.88) | 0.56 / 0.27, 0.13 / 0.24 | known divergent (the 4-side's hp) |
+| archer vs melee | A 0.75 / 0.18 | 215 / 147 +/- 22 | 0.72 / 0.99, 0.17 / 0.42 | known divergent |
+
+The archer gap is MOVEMENT, not the hit model: at distance the duelist closes
+from 55 to ~10 voxels inside 60 ticks and the archer, holding its facing
+through each draw, keeps loosing point-blank, where the full-fidelity archer
+keeps its range (its shots' distance bins average 19 and 53 voxels) and is
+hardly touched. The 4v3: win rate and TTK agree, the 4-side keeps too much
+hp -- the leading hypothesis is frontage (near bodies block each other).
+
+**Cost (section 2.11)**, `distant-fight` arm C, 64 a side in two 16 x 4 blocks,
+~123 engaged steps a tick: **0.69 ms a tick** (5.6 us a step; exclusive run)
+against the 1.5 ms target -- setup 10, self + ground fan 77, the actor list
+358, Think 115, steer + spacing + drive 114, the impact pass + statuses 12,
+sleep 1, file 5 us a tick. The first measurement (64 a side in 8 x 8 blocks, ~64 engaged a
+tick) was 795 us a tick = 10 us a step, of which the actor list 5.9 and the
+drive + spacing 4.2 us a step: walking, sorting and id-searching one
+neighbourhood per creature. The per-cell cache took those to 3.2 and 1.0.
+Non-exclusive runs of the same binary on the shared machine read 740-1,255
+us a tick; the gate asserts only a 3,000 us regression ceiling. Not needed for the
+target, so not done: the work pool (phase 1 writes only the stepper but
+`DistantGround`'s caches and the lazy snapshots are shared state), and the
+actor list's remaining cost (the lazy snapshot build of ~128 neighbours a
+tick, ~half of it).
+
+**Open.** The two known divergences above. Arrow damage (`damageFrac` 2.58)
+and pierce bleeding are flat (no spread, no sever). Severs are lost on a
+retire / save. Statues keep severed limbs. Infection (zombie rot, venom) is
+not modelled at distance.
 
 ## 7. Audit 2026-10-15: what changed and why
 

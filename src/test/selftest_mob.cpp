@@ -13473,6 +13473,15 @@ Status GateDistantRoundtrip(Ctx& c, std::string& detail) {
                    c.mobs.MobCount(), tier.Count(),
                    (unsigned long long)parking.GetStats().parked, aRec, aHp, aBrain, aLife,
                    aGround, aPatch, K, worn, whyA.empty() ? "" : ", first: ", whyA.c_str()));
+  // D2b: THE TIER NOW STEPS A CREATURE'S STATUSES -- a bleed carried across
+  // the edge keeps paying out at distance (game/distant.h). Creature [2] was
+  // carved 50 ticks before it left and still owes blood, which would take hp
+  // off it below and is exactly what this gate's byte-for-byte round trip is
+  // NOT about (it holds the overlay for a body the tier does not change). So
+  // the owed blood is closed here, in the tier; a bleed at distance is
+  // `distant-fight`'s subject.
+  for (size_t i = 0; i < c.mobs.DistantMut().Count(); i++)
+    c.mobs.DistantMut().At(i).bloodLossPerTick = 0.0f;
 
   lap("A");
   // ======== C: save while distant ===========================================

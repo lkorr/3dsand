@@ -32803,6 +32803,18 @@ void MobSystem::EnterLoadedDead(Mob& m, const MobRecord& rec) {
 // to do; they are D2b's door, written once here so the two tiers share it.
 void Mob::ApplyDistantOverlay(const DistantMob& d) {
   if (IsGhost() || rigReleased_ || def_ == nullptr) return;
+  // ---- WHAT CAME OFF AT DISTANCE (D2b: distant::SeverLimb) -----------------
+  // The record still carries those limbs (it is the demotion's), so they come
+  // off here, for real, through the near tier's own door: the piece drops as
+  // debris and the parent's stump opens and bleeds on by its rule. A corpse
+  // too -- it lost them before it died. BASE limbs only, in limb order (a
+  // limb whose parent went first is already gone with it). Nothing for a
+  // creature that lost nothing at distance (the D0 round trip).
+  for (int i = 0; i < baseLimbs_ && i < (int)limbs_.size() && i < (int)d.limbRole.size(); i++) {
+    if ((d.limbRole[(size_t)i].flags & kDistantLimbAttached) != 0) continue;
+    if (limbs_[(size_t)i].body == 0) continue;   // severed at demotion already
+    Sever(i, DamageCtx(DamageCause::Blade));
+  }
   // ---- THE HP-ZERO RULES, in limb order, BASE limbs only (an appended slot
   // is a shell or an item: its hp is its condition, and it never kills) ----
   // The cause is the overlay's own (none at D0): the near tier's ordinary
@@ -32821,6 +32833,54 @@ void Mob::ApplyDistantOverlay(const DistantMob& d) {
   if (d.dead && alive_) {
     deathCause_ = InternDeathCause(d.cause);
     Die();
+  }
+  // ---- STILL BLEEDING (D2b): the blood the distant wounds still owe ------
+  // The record carries no bleed (a park or a save never did), so it crosses
+  // HERE, from the DistantMob itself: a rate r decaying by bleed.decay a tick
+  // still owes r / (1 - decay) hp, which is that many voxels of budget at
+  // gore.bleedHpPerVoxel over the table's drain share -- re-opened on the limb
+  // the last cut landed on, through the near tier's own wound fields, so it
+  // drips and drains as any near wound does. (Burning is re-lit by the caller,
+  // MobSystem::PromoteDistant, through IgniteLimb.) Nothing for a D0/D1
+  // creature (rate 0): the round trip stays byte for byte.
+  if (alive_ && d.bloodLossPerTick > 0.0f && sys_ != nullptr && def_ != nullptr &&
+      def_->bleedMat != 0) {
+    const distant::DistantCalib& cal = sys_->DistantCalibration();
+    const float decay = std::clamp(cal.bleed.decay, 0.0f, 0.9999f);
+    const float owedHp = d.bloodLossPerTick / std::max(1e-4f, 1.0f - decay);
+    const float perVox = CurrentTuning().gore.bleedHpPerVoxel *
+                         std::max(1e-3f, cal.bleed.drainShare);
+    int li = d.lastWoundLimb;
+    if (li < 0 || li >= baseLimbs_ || li >= (int)limbs_.size() || !limbs_[(size_t)li].body ||
+        IsBloodless(li))
+      li = def_->rootLimb;
+    if (li >= 0 && li < (int)limbs_.size() && limbs_[(size_t)li].body && perVox > 0.0f) {
+      MobLimb& L = limbs_[(size_t)li];
+      const float add = owedHp / perVox;
+      NoteWoundFluid(L, LimbFluid(li), add);
+      L.bleedBudget = AddBleedBudget(L.bleedBudget, add);
+      L.woundLocal = Vec3{};
+    }
+  }
+}
+
+// THE STYLES, AND THE DISTANT TABLE MEASURED FROM THEM (mob.h). Read through
+// the one asset-path chokepoint (test/support.cpp AssetDir), so a worktree's
+// SANDVOX_ASSET_DIR reads its own table.
+namespace sandvox {
+std::string AssetDir();   // test/support.cpp: the one asset-path chokepoint
+}
+void MobSystem::SetAttackStyles(StyleLibrary lib) {
+  styles_ = std::move(lib);
+  std::string log;
+  distant::LoadDistantCombat(sandvox::AssetDir() + "/mobs/distant_combat.json", distantCalib_,
+                             log);
+  // Said once per distinct message: a selftest boots several MobSystems and
+  // every R reload re-reads it, and the same warning N times is noise.
+  static std::string said;
+  if (!log.empty() && log != said) {
+    std::fprintf(stderr, "%s", log.c_str());
+    said = log;
   }
 }
 

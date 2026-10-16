@@ -102,6 +102,11 @@ struct Stroke {
   float power = 0;          // best contact sweep: speed ramp x edge alignment
   float tipSpeed = 0;       // world voxels/s, fastest sweep
   bool killed = false;      // the target died inside this stroke's sweeps
+  // D2b: base limbs of the target that came OFF inside this stroke's sweeps
+  // (a body before, none after), and the roles they had.
+  int severed = 0;
+  int severedByRole[distant::kRoles] = {};
+  uint64_t severedMask = 0;   // bit i: base limb i came off (i < 64)
   bool metOther = false;    // a sweep touched something that was not the target
   float StrikeTotal() const { return strikeCut + strikeBlunt + strikeBite; }
 };
@@ -138,6 +143,7 @@ class Sink {
     uint64_t victim = 0;
     bool alive = false;
     std::vector<float> limbHp;        // body limbs
+    std::vector<uint8_t> attached;    // ...that had a body (D2b: severs)
     std::vector<std::pair<int, float>> shells;   // (host, hp) per worn slot
     float held = 0;
     float lostBy[(int)DamageCause::Count] = {};

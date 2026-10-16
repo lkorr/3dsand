@@ -720,9 +720,20 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   `Stream::SettledStoredChunk` after their eviction drain -- held at the
   promotion line while it waits; an idle one SLEEPS (no cost) until a creature
   enters its 3x3 cells or its clock comes round; a promotion snaps one that
-  moved onto the real ground. No fighting at distance yet (D2b). Gates
-  `distant-roundtrip`, `distant-walk`, `distant-sleep`; the full section lands
-  with D3.
+  moved onto the real ground. **D2b (2026-10-15):** distant creatures FIGHT
+  -- Think's `attack` starts an abstract swing that lands at its impact tick
+  and is resolved against the defender's tick-start state by the calibrated
+  roll (`game/distant_combat.h`: guard, hit, limb by role, the measured
+  hit-size distribution whose tail is the organs, the shell, and
+  DISMEMBERMENT -- an open stump bleeds until death, as near), outcomes
+  applied in attacker-id order; `shoot` draws and looses an abstract arrow
+  (drawn in flight as a render-only body); `cast` holds. They bleed, burn,
+  drop a weapon from a ruined arm and die by the near rules; the dead
+  promote as corpses through the record's dead block, severed limbs are cut
+  off for real at promotion. The table (`assets/mobs/distant_combat.json`) is
+  measured by `distant-calib-matrix` with the near drip pot lifted (lone-fight
+  bleeding). Gates `distant-roundtrip`, `distant-walk`, `distant-sleep`,
+  `distant-fight`, `distant-calibrate`; the full section lands with D3.
 - **The save stores the delta, and meta names its generator (2026-09-22,
   `docs/PLAN_save_system.md` S1).** A saved world is `genChunk(seed,
   generator)` plus the store. `Stream::FlushResident` used to write all 32,768

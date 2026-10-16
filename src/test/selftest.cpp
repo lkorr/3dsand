@@ -728,6 +728,13 @@ const char* const kOrder[] = {
     // tick but never moves or edits it).
     "distant-walk",
     "distant-sleep",
+    // THE DISTANT TIER FIGHTS (docs/PLAN_distant_npcs.md D2b). After
+    // `distant-sleep` for the same exit contract: tuning, items and the id
+    // counter restored, mobs / debris / tier reset, ground caches dropped.
+    // Neither moves or edits the window; `distant-fight` ticks THE tick for
+    // its corpse-promotion arm (the corpses are reset with the mobs after).
+    "distant-fight",
+    "distant-calibrate",
     // MOBS v6 (PLAN_corpse_is_a_mob P2a). After `mob-park` for the same exit
     // contract: mobs, debris and risings reset, id counter restored, park
     // function removed, store cleared, worldgen regenerated at home.
@@ -1798,7 +1805,37 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << ", \"landingHurt\": " << ds.landingHurt
       << ", \"landingDeaths\": " << ds.landingDeaths << ", \"snaps\": " << ds.snaps
       << ", \"snapMisses\": " << ds.snapMisses
-      << ", \"snapErrMaxVox\": " << (double)ds.snapErrQ / 16.0 << "},\n";
+      << ", \"snapErrMaxVox\": " << (double)ds.snapErrQ / 16.0
+      // D2b: the fight -- every swing by its outcome, the bows, the deaths by
+      // cause, the grips that failed, the statuses stepped, the hp dealt; and
+      // WHERE THE TIME WENT inside TickDistant (us summed over the run, a
+      // measurement only: setup = band + who steps + snapshot, self = SelfView
+      // + ground fan, world = the actor list, think = ai::Think, move = steer
+      // + spacing + drive, combat = the impact pass + statuses + grips, sleep
+      // = phase 2, file = phase 3).
+      << ", \"strokes\": " << ds.strokes << ", \"strokesRefused\": " << ds.strokesRefused
+      << ", \"strokeHits\": " << ds.strokeHits << ", \"strokeMisses\": " << ds.strokeMisses
+      << ", \"strokeBlocked\": " << ds.strokeBlocked
+      << ", \"strokeOutOfReach\": " << ds.strokeOutOfReach
+      << ", \"strokeNoTarget\": " << ds.strokeNoTarget << ", \"draws\": " << ds.draws
+      << ", \"drawsAborted\": " << ds.drawsAborted << ", \"looses\": " << ds.looses
+      << ", \"arrowHits\": " << ds.arrowHits << ", \"arrowMisses\": " << ds.arrowMisses
+      << ", \"arrowsLost\": " << ds.arrowsLost << ", \"deaths\": " << ds.deaths
+      << ", \"deathsVital\": " << ds.deathsVital << ", \"deathsBlood\": " << ds.deathsBlood
+      << ", \"deathsBurns\": " << ds.deathsBurns << ", \"gripFails\": " << ds.gripFails
+      << ", \"severs\": " << ds.severs
+      << ", \"sidearms\": " << ds.sidearms << ", \"bleedTicks\": " << ds.bleedTicks
+      << ", \"burnTicks\": " << ds.burnTicks << ", \"relit\": " << ds.relit
+      << ", \"rebled\": " << ds.rebled << ", \"hpDealt\": " << (double)ds.hpDealtMilli / 1000.0
+      << ", \"stepsEngaged\": " << ds.stepsEngaged << ", \"actorCaps\": " << ds.actorCaps
+      << ", \"usSetup\": " << (double)ds.nsSetup / 1000.0
+      << ", \"usSelf\": " << (double)ds.nsSelf / 1000.0
+      << ", \"usWorld\": " << (double)ds.nsWorld / 1000.0
+      << ", \"usThink\": " << (double)ds.nsThink / 1000.0
+      << ", \"usMove\": " << (double)ds.nsMove / 1000.0
+      << ", \"usCombat\": " << (double)ds.nsCombat / 1000.0
+      << ", \"usSleep\": " << (double)ds.nsSleep / 1000.0
+      << ", \"usFile\": " << (double)ds.nsFile / 1000.0 << "},\n";
   }
   // ---- THE DISTANT STATUES (game/distant_draw.h, PLAN_distant_npcs D4a) ---
   // What every DistantDraw in the run did: drawn / culled / starved for want

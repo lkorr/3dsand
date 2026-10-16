@@ -159,6 +159,38 @@ struct BleedCalib {
   float drainShare = 1.0f;
 };
 
+// THE SIZE OF A HIT, BY ROLE (D2b). The multiplier on strike total x the
+// style's meanPower that a hit on this role carried, as an inverse CDF:
+// knots (p, x) with p ascending in [0, 1]. Measured from the same unarmoured
+// hits as meanPower, each normalised by its own style's mean, so the knots'
+// mean is ~1 and the style's meanPower still sets the scale. Where powerCv
+// (clamped at 1) could only spread a blow round its mean, this keeps the
+// TAIL: a skull's brain, a chest's heart -- organs charge a flat hp per voxel
+// (Mob::CarveLimb), so a hit on the head or torso now and then carries 5-30x
+// the mean, and that is what ends most full-fidelity fights early. Empty =
+// the CV spread (a table written before D2b).
+struct HitSpread {
+  std::vector<float> p, x;
+};
+
+// DISMEMBERMENT (D2b). Near, a cut that carves through a limb's neck takes it
+// off (Mob::Sever) -- the hp rule never does (Mob::HpZeroSevers) -- and an
+// open stump bleeds until the creature is dead (gore.stumpBleedsOpen). So a
+// sword fight is decided by limbs coming off as much as by hp. Measured from
+// the log: P(the struck limb comes off | a hit of this kind on this role,
+// unarmoured); a shell scales it by what it lets through.
+struct SeverCalib {
+  float rate[kKinds][kRoles] = {};
+  int hits[kKinds][kRoles] = {};
+  // At the sever, the gout and the stump budget (gore.severStumpBudget, hp
+  // owed); then each open stump drains this many hp a tick until death: the
+  // near stump's top-up (one bleed clump x min(1, bleedVoxelGain x
+  // stumpBleedGain) per gore.bleedDripTicks, x gore.bleedHpPerVoxel) -- the
+  // TUNING's law, copied at load like the burn cap.
+  float owedHp = 24.0f;
+  float stumpHpPerTick = 0.15f;
+};
+
 struct BurnCalib {
   float fracPerTick = 0.002f;  // burnt surface fraction gained per burning tick
   float hpPerTick = 0.3f;      // hp the flames eat per burning tick (whole body)
@@ -218,6 +250,8 @@ struct DistantCalib {
   BleedCalib bleed;
   BurnCalib burn;
   RangedCalib ranged;
+  HitSpread spread[kRoles];   // D2b: the hit-size inverse CDF per role
+  SeverCalib sever;           // D2b: dismemberment
   std::vector<MatchupCalib> matchups;
 
   const StyleCalib& Style(const std::string& name) const;
@@ -249,6 +283,12 @@ struct DistantStyle {
   std::string name;            // base style name (the table row)
   std::string weapon;          // item name or natural weapon name ("fist.R")
   bool natural = false;
+  // A `held` style (AttackStyle::weapon "" / "held"): swung with whatever is
+  // in the fist -- the item, or the fist itself once it is empty. The distant
+  // tier re-arms these (and only these) when a grip fails or an archer draws
+  // its sidearm (game/distant.cpp RearmHeld); a named natural weapon (jaws)
+  // never changes.
+  bool held = false;
   bool fallback = false;       // AttackStyle::fallback (the PickAttackStyle group rule)
   float reach = 0.0f;          // StyleReachOn at demotion, centre-to-centre
   int impactTicks = 1;         // authored: windup frames + half the cut
@@ -262,7 +302,9 @@ struct DistantLimb {
   LimbRole role = LimbRole::Other;
   bool vital = false;          // vital OR the root: zero hp here is a death
   bool bloodless = false;      // hair: not health, never struck
-  bool alive = true;           // still attached at demotion
+  bool alive = true;           // still attached (at demotion; D2b: until severed)
+  bool severable = false;      // MobLimbDef::severable (and not the root)
+  int parent = -1;             // base limb index of its parent (-1: the root)
   float maxHp = 0.0f;          // the AUTHORED hp (the burn cap's base)
   float shellHardness = 0.0f;  // hardest worn shell over it (0 = bare)
 };
@@ -278,6 +320,21 @@ struct DistantKit {
   GuardClass guard = GuardClass::None;
   std::vector<DistantLimb> limbs;    // the BASE limbs, index-parallel to the rig
   bool bleeds = true;                // MobDef::bleedMat != 0
+  // A RUINED LIMB IS STILL IN THE WAY (D2b). Near, an arm hacked to hp 0
+  // hangs there ruined (Mob::HpZeroSevers: hp alone never removes a limb) and
+  // the next blow aimed at it still lands ON it -- `limb.hp -= amount` takes
+  // it below zero and the stroke log counts that as the hit's life hp, which
+  // is what `meanPower` and `roleWeights` were measured from. So with this
+  // set, a blow's limb is drawn over the ATTACHED limbs of its role whatever
+  // their hp (a role with none attached still folds into torso), and hp may
+  // go negative exactly as near; DeathTest / TotalHp are unchanged (a ruined
+  // limb is not health). Off (the default, and D2a's synthetic kits) = the
+  // first resolver's rule: only limbs with hp left are struck. The distant
+  // tier sets it on every kit it builds (game/distant.cpp DemoteToDistant):
+  // without it every blow the table aimed at a ruined arm would move onto the
+  // trunk, and a body would reach its vital limbs faster than the fights the
+  // table was measured from.
+  bool absorbRuined = false;
   // A BOW (game/mob_archery.h): the arrow's flat damage and its full-draw
   // speed; shots = arrows in the kit at demotion.
   bool ranged = false;
@@ -309,6 +366,7 @@ const char* DistantDeathName(DistantDeath d);
 struct DistantVitals {
   std::vector<float> limbHp;   // Mob::limbs_[i].hp of the base limbs, exactly
   float bleedRate = 0.0f;      // hp/tick, decays by BleedCalib::decay
+  int stumps = 0;              // D2b: open stumps, each draining SeverCalib::stumpHpPerTick
   float burnFrac = 0.0f;       // burnt surface fraction (Mob::BurnFraction)
   int burnTicksLeft = 0;       // > 0 while the body is on fire
   DistantDeath dead = DistantDeath::None;
@@ -342,6 +400,7 @@ struct StrikeOutcome {
   DamageCause cause = DamageCause::Other;
   float bleedAdded = 0.0f;     // hp/tick to ADD to DistantVitals::bleedRate
   float shellFactor = 1.0f;    // what the shell let through (1 = bare)
+  bool sever = false;          // D2b: the struck limb comes off (SeverLimb)
 };
 
 // A STYLE FROM THE KIT, as PickAttackStyle draws one (strokes.cpp): usable
@@ -383,17 +442,40 @@ ArrowOutcome ResolveArrow(const DistantKit& shooter, const DistantKit& def,
                           const DistantCalib& cal, const Tuning::Gear& gear);
 
 // Apply a resolved blow: hp off the limb, bleed onto the rate, then the death
-// test. Returns the death (None while it lives).
+// test. Returns the death (None while it lives). A blow that SEVERS is applied
+// by the caller through SeverLimb (it edits the kit, which is the caller's own
+// copy), after this.
 DistantDeath ApplyStrike(DistantVitals& v, const DistantKit& k,
                          const StrikeOutcome& o, const DistantCalib& cal);
+// THE LIMB COMES OFF (D2b): `limb` and every base limb under it leave the
+// body (kit.limbs[i].alive = false: no longer struck, no longer health), the
+// stump opens (v.stumps + 1, draining every tick until death) and the gout's
+// owed blood joins the bleed rate. A VITAL limb off -- a head -- is a death.
+// Writes the subtree's indices to `off` (optional). Pure on its arguments; the
+// caller owns the kit it passes.
+DistantDeath SeverLimb(DistantVitals& v, DistantKit& k, int limb,
+                       const DistantCalib& cal, std::vector<int>* off = nullptr);
 DistantDeath ApplyArrow(DistantVitals& v, const DistantKit& k,
                         const ArrowOutcome& o, const DistantCalib& cal);
 
-// One tick of bleeding: the rate in hp, spread over the live non-bloodless
-// limbs in proportion to what each has (Mob::DrainBlood's rule), then the
-// rate decays. A total at or under the bill is a death by blood loss, as in
-// DrainBlood. Returns the hp drained.
+// One tick of bleeding: the rate in hp (+ every open stump's drain, D2b),
+// spread over the live non-bloodless limbs in proportion to what each has
+// (Mob::DrainBlood's rule), then the rate decays. A total at or under the
+// bill is a death by blood loss, as in DrainBlood. Returns the hp drained.
 float StepBleed(DistantVitals& v, const DistantKit& k, const DistantCalib& cal);
+// `ticks` ticks of OPEN STUMPS ONLY (D2b; bleedRate must be 0): what
+// StepBleed would drain over them, in one sum. Exact, not an approximation:
+// a constant drain c a tick spent proportionally leaves every limb at the
+// same share of a total that falls by c a tick, whatever the steps. A total
+// that would reach the bill inside the span is a death by blood loss, and
+// `diedAfter` (optional) gets how many of the ticks it took. Returns the hp
+// drained. What lets a creature whose only status is a stump SLEEP (its
+// clock is the tick it bleeds out) instead of being stepped until it dies.
+float StepStumps(DistantVitals& v, const DistantKit& k, const DistantCalib& cal, int ticks,
+                 int* diedAfter = nullptr);
+// The number of StepBleed ticks an open-stumps-only body has left before
+// the one that kills it (INT32_MAX when nothing drains).
+int StumpTicksLeft(const DistantVitals& v, const DistantKit& k, const DistantCalib& cal);
 // One tick of burning (while burnTicksLeft > 0): the burnt fraction grows,
 // the flames eat hpPerTick, every limb is clamped to maxHp x the cap
 // (Mob::ApplyBurnCap), and a cap of 0 is a death by burns. Returns hp lost.

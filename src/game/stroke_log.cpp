@@ -147,9 +147,11 @@ void Sink::BeforeSweep(MobSystem& sys, const Mob& attacker) {
   snap_.alive = v->Alive();
   const int base = v->AppendedBase();
   snap_.limbHp.resize((size_t)std::max(0, base));
+  snap_.attached.assign((size_t)std::max(0, base), 0);
   float owed = 0.0f;
   for (int i = 0; i < base; i++) {
     snap_.limbHp[(size_t)i] = v->LimbHpAt(i);
+    snap_.attached[(size_t)i] = sys.LimbBody(v->Id(), i) != 0 ? 1 : 0;
     owed += std::max(0.0f, sys.LimbBleedBudget(v->Id(), i));
   }
   snap_.owed = owed;
@@ -212,6 +214,15 @@ void Sink::AfterSweep(MobSystem& sys, const Mob& attacker, uint32_t tick) {
       if (owed > snap_.owed)
         s.bleedOwed += (owed - snap_.owed) * CurrentTuning().gore.bleedHpPerVoxel;
       if (snap_.alive && !v->Alive()) s.killed = true;
+      // D2b: what came OFF (a body before this sweep, none after).
+      for (int i = 0; i < base && i < (int)snap_.attached.size(); i++)
+        if (snap_.attached[(size_t)i] && sys.LimbBody(v->Id(), i) == 0) {
+          s.severed++;
+          if (i < 64) s.severedMask |= 1ull << i;
+          const MobLimbDef& ld = v->LimbDefAt(i);
+          const distant::LimbRole r = distant::LimbRoleOf(ld.tag, ld.name, ld.bloodless);
+          if ((int)r < distant::kRoles) s.severedByRole[(int)r]++;
+        }
     }
   if (snap_.contact) s.contacts++;
   if ((snap_.contact || snap_.arrested) && s.impactTick == 0) s.impactTick = tick;
@@ -445,6 +456,100 @@ void ReduceStrokes(const std::vector<Stroke>& log, int minSamples,
     const float raw = (float)std::clamp(e, 0.0, 1.0);
     out.armour.exposure[k] =
         (raw * (float)rN[k] + kPrior * out.armour.exposure[k]) / ((float)rN[k] + kPrior);
+  }
+  // ---- D2b: THE SIZE OF A HIT, AND WHAT COMES OFF, BY ROLE ----------------
+  //
+  // SIZE: life hp over (strike total x the style's own mean power), over the
+  // unarmoured hits -- the multiplier the resolver draws -- as an inverse CDF
+  // per role (DistantCalib::spread). Its TAIL is the organs (a brain, a heart
+  // charges a flat hp per voxel), which is what ends a full-fidelity fight
+  // early; powerCv, clamped at 1, could not carry it.
+  //
+  // DISMEMBERMENT: of the unarmoured hits of a kind on a role, the share that
+  // took a limb OF THAT ROLE off inside the stroke (DistantCalib::sever) --
+  // the struck limb or the one under it; the resolver takes the struck limb
+  // and everything under it off, which is what a cut through it does.
+  {
+    std::vector<double> xs[distant::kRoles];
+    int kills[distant::kRoles] = {};
+    int roleHits[distant::kRoles][distant::kKinds] = {};
+    int roleSevers[distant::kRoles][distant::kKinds] = {};
+    int killedHits = 0, severKills = 0;
+    for (const Stroke& s : log) {
+      if (!Counted(s) || s.outcome != Outcome::Hit || (int)s.role >= distant::kRoles) continue;
+      killedHits += s.killed ? 1 : 0;
+      severKills += (s.killed && s.severed > 0) ? 1 : 0;
+      if (s.shellHardness > 0.0f) continue;   // unarmoured: a shell scales it at distance
+      roleHits[(int)s.role][(int)s.kind]++;
+      if (s.severedByRole[(int)s.role] > 0) roleSevers[(int)s.role][(int)s.kind]++;
+    }
+    for (int r = 0; r < distant::kRoles; r++)
+      for (int k = 0; k < distant::kKinds; k++) {
+        out.sever.hits[k][r] = roleHits[r][k];
+        // A cell with few hits says little: it is not trusted below a
+        // handful (no sever), and a zero stays zero.
+        out.sever.rate[k][r] =
+            roleHits[r][k] >= 8 ? (float)roleSevers[r][k] / (float)(roleHits[r][k] + 1) : 0.0f;
+        if (roleHits[r][k] == 0) continue;
+        char line[200];
+        std::snprintf(line, sizeof line,
+                      "  severs %-5s %-6s unarmoured hits %4d that took one off %3d -> %.3f\n",
+                      distant::LimbRoleName((distant::LimbRole)r),
+                      distant::StrikeKindName((distant::StrikeKind)k), roleHits[r][k],
+                      roleSevers[r][k], out.sever.rate[k][r]);
+        report += line;
+      }
+    {
+      char line[160];
+      std::snprintf(line, sizeof line, "  strokes that killed: %d (%d of them severing)\n",
+                    killedHits, severKills);
+      report += line;
+    }
+    for (const Stroke& s : log) {
+      if (!Counted(s) || s.outcome != Outcome::Hit || s.shellHardness > 0.0f ||
+          s.lifeHp <= 0.0f || s.StrikeTotal() <= 0.0f || (int)s.role >= distant::kRoles)
+        continue;
+      auto it = byStyle.find(s.style);
+      const double mp = it != byStyle.end() && it->second.pwN > 0 ? it->second.Power()
+                                                                 : pool.Power();
+      if (mp <= 1e-6) continue;
+      xs[(int)s.role].push_back(s.lifeHp / s.StrikeTotal() / mp);
+      kills[(int)s.role] += s.killed ? 1 : 0;
+    }
+    // The knots: the body of the distribution every 5%, the tail at 97.5,
+    // 99, 99.5 and its ends.
+    static const double kKnotP[] = {0.0,  0.05, 0.10, 0.15, 0.20,  0.25, 0.30, 0.35,
+                                    0.40, 0.45, 0.50, 0.55, 0.60,  0.65, 0.70, 0.75,
+                                    0.80, 0.85, 0.90, 0.95, 0.975, 0.99, 0.995, 1.0};
+    for (int r = 0; r < distant::kRoles; r++) {
+      std::vector<double>& v = xs[r];
+      out.spread[r] = distant::HitSpread{};
+      if (v.empty()) continue;
+      std::sort(v.begin(), v.end());
+      auto q = [&](double p) { return v[std::min(v.size() - 1, (size_t)(p * (double)v.size()))]; };
+      // Too few hits for a shape: the CV spread stays (empty knots).
+      if (v.size() >= 40)
+        for (const double p : kKnotP) {
+          out.spread[r].p.push_back((float)p);
+          out.spread[r].x.push_back((float)(p >= 1.0 ? v.back() : q(p)));
+        }
+      double m = 0;
+      int over3 = 0, over5 = 0;
+      for (double x : v) {
+        m += x;
+        over3 += x > 3.0;
+        over5 += x > 5.0;
+      }
+      char line[320];
+      std::snprintf(line, sizeof line,
+                    "  hit size %-5s n %4zu mean %.2f | p10 %.2f p25 %.2f p50 %.2f p75 %.2f p90 "
+                    "%.2f p95 %.2f p99 %.2f max %.2f | >3x %.3f >5x %.3f | killed %d%s\n",
+                    distant::LimbRoleName((distant::LimbRole)r), v.size(), m / (double)v.size(),
+                    q(0.10), q(0.25), q(0.50), q(0.75), q(0.90), q(0.95), q(0.99), v.back(),
+                    (double)over3 / (double)v.size(), (double)over5 / (double)v.size(), kills[r],
+                    out.spread[r].p.empty() ? " (too few: CV spread)" : "");
+      report += line;
+    }
   }
   // ---- BLEED: blood opened per hp of each kind, x what actually drains.
   out.bleed.drainShare = drainShare;

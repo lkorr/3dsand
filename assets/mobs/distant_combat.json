@@ -1,428 +1,889 @@
 {
-  "_about": "THE DISTANT TIER'S HIT MODEL, MEASURED (docs/PLAN_distant_npcs.md 2.6; game/distant_combat.h reads it). Produced by the duel-matrix gate distant-calib-matrix (src/test/selftest_distant_calib.cpp): full-fidelity fights through the real tick -- weapon class x armour x creature kind, archers, a 4v3 -- with every NPC stroke STARTED logged with its outcome (game/stroke_log.h), reduced to per-style hit rates, role weights and effective power, block chance per guard class, armour exposure, bleed and burn laws, ranged hit rate vs distance and target speed, and the asymmetric matchups' win rates and time-to-kill (ticks, 30 Hz). REGENERATE after any melee/gore/AI tuning change: bash scripts/run.sh ./build/Release/sandvox.exe --verify distant-calib-matrix with SANDVOX_DISTANT_CALIB=assets/mobs/distant_combat.json in the environment (matrix size: tests/baseline.json distantCalib.calib*). This file: 8 rounds x 12 melee bouts + 2 ranged bouts, 4936 strokes (4936 counted: 2787 hits, 224 blocked/parried, 1733 misses), 147 arrows.",
+  "_about": "THE DISTANT TIER'S HIT MODEL, MEASURED (docs/PLAN_distant_npcs.md 2.6; game/distant_combat.h reads it). Produced by the duel-matrix gate distant-calib-matrix (src/test/selftest_distant_calib.cpp): full-fidelity fights through the real tick -- weapon class x armour x creature kind, archers, a 4v3 -- with every NPC stroke STARTED logged with its outcome (game/stroke_log.h), reduced to per-style hit rates, role weights and effective power, block chance per guard class, armour exposure, bleed and burn laws, ranged hit rate vs distance and target speed, and the asymmetric matchups' win rates and time-to-kill (ticks, 30 Hz). REGENERATE after any melee/gore/AI tuning change: bash scripts/run.sh ./build/Release/sandvox.exe --verify distant-calib-matrix with SANDVOX_DISTANT_CALIB=assets/mobs/distant_combat.json in the environment (matrix size: tests/baseline.json distantCalib.calib*). This file: 16 rounds x 12 melee bouts + 2 ranged bouts, 7531 strokes (7530 counted: 4727 hits, 403 blocked/parried, 2222 misses), 292 arrows.",
   "version": 1,
   "minSamples": 8,
   "reachSlack": 2.0,
   "styles": {
     "*": {
-      "n": 4936,
-      "hits": 2787,
-      "blocked": 224,
-      "hitRate": 0.5915,
-      "meanPower": 0.9757,
+      "n": 7530,
+      "hits": 4727,
+      "blocked": 403,
+      "hitRate": 0.6633,
+      "meanPower": 0.9263,
       "powerCv": 1.0,
-      "impactTicks": 12.4099,
+      "impactTicks": 12.4506,
       "roleWeights": {
-        "head": 0.1263,
-        "torso": 0.3326,
-        "arm": 0.3732,
-        "leg": 0.1679
+        "head": 0.1157,
+        "torso": 0.3321,
+        "arm": 0.4062,
+        "leg": 0.146
       }
     },
     "bite": {
-      "n": 82,
-      "hits": 48,
-      "blocked": 11,
-      "hitRate": 0.6715,
-      "meanPower": 0.4534,
-      "powerCv": 1.0,
-      "impactTicks": 11.2742,
+      "n": 105,
+      "hits": 67,
+      "blocked": 14,
+      "hitRate": 0.7332,
+      "meanPower": 0.2552,
+      "powerCv": 0.9724,
+      "impactTicks": 11.1481,
       "roleWeights": {
-        "head": 0.202,
-        "torso": 0.4487,
-        "arm": 0.2979,
-        "leg": 0.0514
+        "head": 0.3305,
+        "torso": 0.2863,
+        "arm": 0.3609,
+        "leg": 0.0223
       },
       "byWeapon": {
         "jaws": {
-          "n": 82,
-          "hits": 48,
-          "blocked": 11,
-          "hitRate": 0.6758,
-          "meanPower": 0.3969
+          "n": 105,
+          "hits": 67,
+          "blocked": 14,
+          "hitRate": 0.7361,
+          "meanPower": 0.1806
         }
       }
     },
     "bite_lunge": {
-      "n": 118,
-      "hits": 52,
-      "blocked": 17,
-      "hitRate": 0.5178,
-      "meanPower": 0.8702,
-      "powerCv": 1.0,
-      "impactTicks": 11.1806,
+      "n": 130,
+      "hits": 68,
+      "blocked": 18,
+      "hitRate": 0.6091,
+      "meanPower": 0.3436,
+      "powerCv": 0.9252,
+      "impactTicks": 11.3837,
       "roleWeights": {
-        "head": 0.384,
-        "torso": 0.2202,
-        "arm": 0.3838,
-        "leg": 0.012
+        "head": 0.3398,
+        "torso": 0.2407,
+        "arm": 0.3698,
+        "leg": 0.0498
       },
       "byWeapon": {
         "jaws": {
-          "n": 118,
-          "hits": 52,
-          "blocked": 17,
-          "hitRate": 0.515,
-          "meanPower": 0.8561
+          "n": 130,
+          "hits": 68,
+          "blocked": 18,
+          "hitRate": 0.6072,
+          "meanPower": 0.2789
         }
       }
     },
     "diag_tr_bl": {
-      "n": 919,
-      "hits": 581,
-      "blocked": 41,
-      "hitRate": 0.6614,
-      "meanPower": 1.2902,
-      "powerCv": 0.7544,
-      "impactTicks": 12.14,
+      "n": 1404,
+      "hits": 965,
+      "blocked": 73,
+      "hitRate": 0.7248,
+      "meanPower": 1.1975,
+      "powerCv": 0.8939,
+      "impactTicks": 11.9021,
       "roleWeights": {
-        "head": 0.194,
-        "torso": 0.2963,
-        "arm": 0.4128,
-        "leg": 0.0969
+        "head": 0.1904,
+        "torso": 0.3244,
+        "arm": 0.4289,
+        "leg": 0.0563
       },
       "byWeapon": {
         "cleaver": {
-          "n": 32,
-          "hits": 13,
+          "n": 45,
+          "hits": 27,
           "blocked": 2,
-          "hitRate": 0.4602,
-          "meanPower": 2.3224
+          "hitRate": 0.6362,
+          "meanPower": 2.2504
+        },
+        "dagger": {
+          "n": 22,
+          "hits": 13,
+          "blocked": 1,
+          "hitRate": 0.636,
+          "meanPower": 0.8218
         },
         "fist.R": {
-          "n": 112,
-          "hits": 69,
-          "blocked": 0,
-          "hitRate": 0.6176,
-          "meanPower": 0.5983
+          "n": 264,
+          "hits": 162,
+          "blocked": 2,
+          "hitRate": 0.6199,
+          "meanPower": 0.4615
         },
         "mace": {
-          "n": 18,
-          "hits": 8,
-          "blocked": 0,
-          "hitRate": 0.4839,
-          "meanPower": 0.8268
+          "n": 32,
+          "hits": 11,
+          "blocked": 6,
+          "hitRate": 0.4633,
+          "meanPower": 0.7757
         },
         "sword": {
-          "n": 750,
-          "hits": 486,
-          "blocked": 38,
-          "hitRate": 0.6825,
-          "meanPower": 1.3728
+          "n": 1041,
+          "hits": 752,
+          "blocked": 62,
+          "hitRate": 0.768,
+          "meanPower": 1.335
         }
       }
     },
     "horizontal_l": {
-      "n": 952,
-      "hits": 537,
-      "blocked": 42,
-      "hitRate": 0.5901,
-      "meanPower": 1.2638,
-      "powerCv": 0.9153,
-      "impactTicks": 14.7168,
+      "n": 1453,
+      "hits": 904,
+      "blocked": 86,
+      "hitRate": 0.6613,
+      "meanPower": 1.2145,
+      "powerCv": 0.8389,
+      "impactTicks": 14.8447,
       "roleWeights": {
-        "head": 0.0379,
-        "torso": 0.3648,
-        "arm": 0.3687,
-        "leg": 0.2286
+        "head": 0.0225,
+        "torso": 0.3792,
+        "arm": 0.3718,
+        "leg": 0.2264
       },
       "byWeapon": {
         "cleaver": {
-          "n": 28,
+          "n": 36,
           "hits": 14,
-          "blocked": 3,
-          "hitRate": 0.5642,
-          "meanPower": 1.5506
+          "blocked": 6,
+          "hitRate": 0.4896,
+          "meanPower": 1.3175
+        },
+        "dagger": {
+          "n": 17,
+          "hits": 6,
+          "blocked": 1,
+          "hitRate": 0.4323,
+          "meanPower": 0.7277
         },
         "fist.R": {
-          "n": 157,
-          "hits": 98,
-          "blocked": 4,
-          "hitRate": 0.6392,
-          "meanPower": 0.5352
+          "n": 308,
+          "hits": 169,
+          "blocked": 15,
+          "hitRate": 0.5779,
+          "meanPower": 0.4897
         },
         "mace": {
-          "n": 19,
-          "hits": 4,
-          "blocked": 1,
-          "hitRate": 0.2891,
-          "meanPower": 0.9594
+          "n": 20,
+          "hits": 11,
+          "blocked": 0,
+          "hitRate": 0.5686,
+          "meanPower": 0.6807
         },
         "sword": {
-          "n": 742,
-          "hits": 419,
-          "blocked": 33,
-          "hitRate": 0.591,
-          "meanPower": 1.4371
+          "n": 1072,
+          "hits": 704,
+          "blocked": 64,
+          "hitRate": 0.6983,
+          "meanPower": 1.403
         }
       }
     },
     "horizontal_r": {
-      "n": 894,
-      "hits": 533,
-      "blocked": 26,
-      "hitRate": 0.614,
-      "meanPower": 0.9728,
+      "n": 1414,
+      "hits": 984,
+      "blocked": 47,
+      "hitRate": 0.7197,
+      "meanPower": 0.9394,
       "powerCv": 1.0,
-      "impactTicks": 11.3378,
+      "impactTicks": 11.632,
       "roleWeights": {
-        "head": 0.0289,
-        "torso": 0.3768,
-        "arm": 0.4497,
-        "leg": 0.1446
+        "head": 0.0237,
+        "torso": 0.3262,
+        "arm": 0.532,
+        "leg": 0.118
       },
       "byWeapon": {
         "cleaver": {
-          "n": 26,
-          "hits": 16,
-          "blocked": 1,
-          "hitRate": 0.6364,
-          "meanPower": 1.577
+          "n": 42,
+          "hits": 27,
+          "blocked": 4,
+          "hitRate": 0.7114,
+          "meanPower": 1.3898
         },
         "dagger": {
-          "n": 11,
+          "n": 12,
           "hits": 4,
           "blocked": 1,
-          "hitRate": 0.4611,
-          "meanPower": 0.7448
+          "hitRate": 0.4586,
+          "meanPower": 0.6982
         },
         "fist.R": {
-          "n": 141,
-          "hits": 76,
-          "blocked": 6,
-          "hitRate": 0.5644,
-          "meanPower": 0.4723
+          "n": 294,
+          "hits": 154,
+          "blocked": 12,
+          "hitRate": 0.5485,
+          "meanPower": 0.4384
         },
         "mace": {
-          "n": 13,
-          "hits": 5,
+          "n": 32,
+          "hits": 20,
           "blocked": 0,
-          "hitRate": 0.4386,
-          "meanPower": 0.8006
+          "hitRate": 0.6355,
+          "meanPower": 0.5205
         },
         "sword": {
-          "n": 703,
-          "hits": 432,
-          "blocked": 18,
-          "hitRate": 0.6306,
-          "meanPower": 1.0331
+          "n": 1034,
+          "hits": 779,
+          "blocked": 30,
+          "hitRate": 0.7757,
+          "meanPower": 1.0215
         }
       }
     },
     "overhead": {
-      "n": 915,
-      "hits": 479,
-      "blocked": 40,
-      "hitRate": 0.5476,
-      "meanPower": 0.9967,
+      "n": 1508,
+      "hits": 838,
+      "blocked": 79,
+      "hitRate": 0.5866,
+      "meanPower": 0.9413,
       "powerCv": 1.0,
-      "impactTicks": 13.5036,
+      "impactTicks": 13.4061,
       "roleWeights": {
-        "head": 0.3157,
-        "torso": 0.2408,
-        "arm": 0.3468,
-        "leg": 0.0966
+        "head": 0.2975,
+        "torso": 0.2605,
+        "arm": 0.363,
+        "leg": 0.0791
       },
       "byWeapon": {
         "cleaver": {
-          "n": 20,
-          "hits": 6,
-          "blocked": 3,
-          "hitRate": 0.39,
-          "meanPower": 1.2203
+          "n": 39,
+          "hits": 8,
+          "blocked": 4,
+          "hitRate": 0.2653,
+          "meanPower": 1.1239
+        },
+        "dagger": {
+          "n": 15,
+          "hits": 8,
+          "blocked": 0,
+          "hitRate": 0.5446,
+          "meanPower": 0.541
         },
         "fist.R": {
-          "n": 140,
-          "hits": 79,
-          "blocked": 2,
-          "hitRate": 0.5718,
-          "meanPower": 0.2757
+          "n": 317,
+          "hits": 181,
+          "blocked": 12,
+          "hitRate": 0.5934,
+          "meanPower": 0.2421
         },
         "mace": {
-          "n": 23,
-          "hits": 11,
-          "blocked": 2,
-          "hitRate": 0.5276,
-          "meanPower": 0.9089
+          "n": 49,
+          "hits": 33,
+          "blocked": 5,
+          "hitRate": 0.7364,
+          "meanPower": 0.6479
         },
         "sword": {
-          "n": 725,
-          "hits": 381,
-          "blocked": 33,
-          "hitRate": 0.5506,
-          "meanPower": 1.1417
+          "n": 1088,
+          "hits": 608,
+          "blocked": 58,
+          "hitRate": 0.5903,
+          "meanPower": 1.1621
         }
       }
     },
     "snake_rear_strike": {
-      "n": 68,
-      "hits": 28,
-      "blocked": 10,
-      "hitRate": 0.4898,
-      "meanPower": 0.3705,
-      "powerCv": 0.4777,
-      "impactTicks": 9.5789,
+      "n": 80,
+      "hits": 30,
+      "blocked": 16,
+      "hitRate": 0.4802,
+      "meanPower": 0.3473,
+      "powerCv": 0.4651,
+      "impactTicks": 9.5,
       "roleWeights": {
-        "head": 0.0158,
-        "torso": 0.2916,
-        "arm": 0.6716,
-        "leg": 0.021
+        "head": 0.0136,
+        "torso": 0.3332,
+        "arm": 0.636,
+        "leg": 0.0172
       },
       "byWeapon": {
         "jaws": {
-          "n": 68,
-          "hits": 28,
-          "blocked": 10,
-          "hitRate": 0.4832,
-          "meanPower": 0.2871
+          "n": 80,
+          "hits": 30,
+          "blocked": 16,
+          "hitRate": 0.4694,
+          "meanPower": 0.2792
         }
       }
     },
     "snake_strike": {
-      "n": 43,
-      "hits": 28,
-      "blocked": 1,
-      "hitRate": 0.6601,
-      "meanPower": 0.4094,
+      "n": 71,
+      "hits": 51,
+      "blocked": 3,
+      "hitRate": 0.7452,
+      "meanPower": 0.3113,
       "powerCv": 1.0,
-      "impactTicks": 10.931,
+      "impactTicks": 10.8704,
       "roleWeights": {
-        "head": 0.0158,
-        "torso": 0.0416,
-        "arm": 0.0466,
-        "leg": 0.896
+        "head": 0.0084,
+        "torso": 0.0242,
+        "arm": 0.0295,
+        "leg": 0.9379
       },
       "byWeapon": {
         "jaws": {
-          "n": 43,
-          "hits": 28,
-          "blocked": 1,
-          "hitRate": 0.6661,
-          "meanPower": 0.3256
+          "n": 71,
+          "hits": 51,
+          "blocked": 3,
+          "hitRate": 0.7497,
+          "meanPower": 0.2666
         }
       }
     },
     "thrust": {
-      "n": 945,
-      "hits": 501,
-      "blocked": 36,
-      "hitRate": 0.5513,
-      "meanPower": 0.3982,
+      "n": 1365,
+      "hits": 820,
+      "blocked": 67,
+      "hitRate": 0.6318,
+      "meanPower": 0.3844,
       "powerCv": 1.0,
-      "impactTicks": 10.7317,
+      "impactTicks": 10.7615,
       "roleWeights": {
-        "head": 0.0426,
-        "torso": 0.4026,
-        "arm": 0.2841,
-        "leg": 0.2706
+        "head": 0.0285,
+        "torso": 0.4021,
+        "arm": 0.3333,
+        "leg": 0.2361
       },
       "byWeapon": {
         "cleaver": {
-          "n": 32,
-          "hits": 13,
-          "blocked": 3,
-          "hitRate": 0.4608,
-          "meanPower": 0.4663
+          "n": 37,
+          "hits": 15,
+          "blocked": 5,
+          "hitRate": 0.4869,
+          "meanPower": 1.0828
         },
         "dagger": {
-          "n": 11,
-          "hits": 2,
+          "n": 24,
+          "hits": 11,
           "blocked": 0,
-          "hitRate": 0.2804,
-          "meanPower": 0.3882
+          "hitRate": 0.4831,
+          "meanPower": 0.2696
         },
         "fist.R": {
-          "n": 141,
-          "hits": 112,
-          "blocked": 3,
-          "hitRate": 0.8043,
-          "meanPower": 0.286
+          "n": 253,
+          "hits": 193,
+          "blocked": 6,
+          "hitRate": 0.779,
+          "meanPower": 0.2548
         },
         "mace": {
-          "n": 17,
-          "hits": 13,
-          "blocked": 0,
-          "hitRate": 0.7241,
-          "meanPower": 0.2575
+          "n": 30,
+          "hits": 21,
+          "blocked": 1,
+          "hitRate": 0.713,
+          "meanPower": 0.1901
         },
         "sword": {
-          "n": 744,
-          "hits": 361,
-          "blocked": 30,
-          "hitRate": 0.5059,
-          "meanPower": 0.4284
+          "n": 1021,
+          "hits": 580,
+          "blocked": 55,
+          "hitRate": 0.6005,
+          "meanPower": 0.4098
         }
       }
     }
   },
   "block": {
     "none": {
-      "n": 2603,
-      "chance": 0.0127
+      "n": 3700,
+      "chance": 0.0089
     },
     "blade": {
-      "n": 2168,
-      "chance": 0.0875
+      "n": 3602,
+      "chance": 0.1012
     },
     "shield": {
-      "n": 165,
-      "chance": 0.0059
+      "n": 228,
+      "chance": 0.0216
     }
   },
   "armour": {
     "exposure": {
-      "cut": 0.015,
-      "blunt": 0.0328,
-      "bite": 0.1086,
+      "cut": 0.0133,
+      "blunt": 0.0165,
+      "bite": 0.2485,
       "pierce": 0.0
     },
     "n": {
-      "cut": 85,
-      "blunt": 57,
-      "bite": 49,
-      "pierce": 44
+      "cut": 203,
+      "blunt": 117,
+      "bite": 71,
+      "pierce": 99
     }
   },
   "bleed": {
     "perHp": {
-      "cut": 1.5826,
-      "blunt": 0.0763,
-      "bite": 1.2937,
+      "cut": 2.2171,
+      "blunt": 0.0771,
+      "bite": 2.4574,
       "pierce": 0.9
     },
     "decay": 0.9866,
-    "drainShare": 1.0254
+    "drainShare": 1.0273
   },
   "burn": {
     "fracPerTick": 0.0009,
-    "hpPerTick": 0.0004,
-    "meanTicks": 817,
+    "hpPerTick": 0.0003,
+    "meanTicks": 825,
     "capMidFraction": 0.4,
     "capMidHealth": 0.333,
     "deathFraction": 0.7
   },
   "ranged": {
-    "n": 147,
-    "hits": 79,
+    "n": 292,
+    "hits": 177,
     "arrowSpeed": 500.0,
     "rateByDistance": [
       [
-        20.3465,
-        0.8
+        19.1534,
+        0.8889
       ],
       [
-        53.2734,
-        0.4924
+        52.7149,
+        0.5672
       ]
     ],
     "speedRef": 40.0,
     "speedPenalty": 0.0,
-    "damageFrac": 1.5899,
+    "damageFrac": 2.5764,
     "roleWeights": {
-      "head": 0.0127,
-      "torso": 0.6456,
-      "arm": 0.3418
+      "head": 0.0282,
+      "torso": 0.6158,
+      "arm": 0.3559
     }
+  },
+  "spread": {
+    "head": [
+      [
+        0.0,
+        0.02
+      ],
+      [
+        0.05,
+        0.2214
+      ],
+      [
+        0.1,
+        0.3325
+      ],
+      [
+        0.15,
+        0.4526
+      ],
+      [
+        0.2,
+        0.5535
+      ],
+      [
+        0.25,
+        0.6199
+      ],
+      [
+        0.3,
+        0.6876
+      ],
+      [
+        0.35,
+        0.7886
+      ],
+      [
+        0.4,
+        0.895
+      ],
+      [
+        0.45,
+        0.9787
+      ],
+      [
+        0.5,
+        1.0604
+      ],
+      [
+        0.55,
+        1.1253
+      ],
+      [
+        0.6,
+        1.1903
+      ],
+      [
+        0.65,
+        1.2547
+      ],
+      [
+        0.7,
+        1.3444
+      ],
+      [
+        0.75,
+        1.4309
+      ],
+      [
+        0.8,
+        1.5184
+      ],
+      [
+        0.85,
+        1.6121
+      ],
+      [
+        0.9,
+        1.8181
+      ],
+      [
+        0.95,
+        2.1867
+      ],
+      [
+        0.975,
+        4.2739
+      ],
+      [
+        0.99,
+        11.5333
+      ],
+      [
+        0.995,
+        12.2763
+      ],
+      [
+        1.0,
+        34.2685
+      ]
+    ],
+    "torso": [
+      [
+        0.0,
+        0.0016
+      ],
+      [
+        0.05,
+        0.1135
+      ],
+      [
+        0.1,
+        0.1787
+      ],
+      [
+        0.15,
+        0.2399
+      ],
+      [
+        0.2,
+        0.3184
+      ],
+      [
+        0.25,
+        0.4011
+      ],
+      [
+        0.3,
+        0.452
+      ],
+      [
+        0.35,
+        0.519
+      ],
+      [
+        0.4,
+        0.578
+      ],
+      [
+        0.45,
+        0.6462
+      ],
+      [
+        0.5,
+        0.7149
+      ],
+      [
+        0.55,
+        0.7739
+      ],
+      [
+        0.6,
+        0.8547
+      ],
+      [
+        0.65,
+        0.9591
+      ],
+      [
+        0.7,
+        1.0633
+      ],
+      [
+        0.75,
+        1.1597
+      ],
+      [
+        0.8,
+        1.2627
+      ],
+      [
+        0.85,
+        1.3759
+      ],
+      [
+        0.9,
+        1.5718
+      ],
+      [
+        0.95,
+        1.9175
+      ],
+      [
+        0.975,
+        2.1667
+      ],
+      [
+        0.99,
+        3.3451
+      ],
+      [
+        0.995,
+        8.6499
+      ],
+      [
+        1.0,
+        32.7712
+      ]
+    ],
+    "arm": [
+      [
+        0.0,
+        0.0011
+      ],
+      [
+        0.05,
+        0.0584
+      ],
+      [
+        0.1,
+        0.1697
+      ],
+      [
+        0.15,
+        0.2853
+      ],
+      [
+        0.2,
+        0.3782
+      ],
+      [
+        0.25,
+        0.4876
+      ],
+      [
+        0.3,
+        0.5669
+      ],
+      [
+        0.35,
+        0.6611
+      ],
+      [
+        0.4,
+        0.7446
+      ],
+      [
+        0.45,
+        0.8338
+      ],
+      [
+        0.5,
+        0.937
+      ],
+      [
+        0.55,
+        1.041
+      ],
+      [
+        0.6,
+        1.1427
+      ],
+      [
+        0.65,
+        1.257
+      ],
+      [
+        0.7,
+        1.3294
+      ],
+      [
+        0.75,
+        1.4311
+      ],
+      [
+        0.8,
+        1.5266
+      ],
+      [
+        0.85,
+        1.6564
+      ],
+      [
+        0.9,
+        1.8282
+      ],
+      [
+        0.95,
+        2.12
+      ],
+      [
+        0.975,
+        2.3523
+      ],
+      [
+        0.99,
+        2.7249
+      ],
+      [
+        0.995,
+        2.9869
+      ],
+      [
+        1.0,
+        4.4293
+      ]
+    ],
+    "leg": [
+      [
+        0.0,
+        0.0279
+      ],
+      [
+        0.05,
+        0.1708
+      ],
+      [
+        0.1,
+        0.2233
+      ],
+      [
+        0.15,
+        0.2899
+      ],
+      [
+        0.2,
+        0.3571
+      ],
+      [
+        0.25,
+        0.4161
+      ],
+      [
+        0.3,
+        0.4796
+      ],
+      [
+        0.35,
+        0.5527
+      ],
+      [
+        0.4,
+        0.6207
+      ],
+      [
+        0.45,
+        0.695
+      ],
+      [
+        0.5,
+        0.7785
+      ],
+      [
+        0.55,
+        0.8846
+      ],
+      [
+        0.6,
+        1.0252
+      ],
+      [
+        0.65,
+        1.1176
+      ],
+      [
+        0.7,
+        1.2486
+      ],
+      [
+        0.75,
+        1.369
+      ],
+      [
+        0.8,
+        1.5282
+      ],
+      [
+        0.85,
+        1.7189
+      ],
+      [
+        0.9,
+        1.9439
+      ],
+      [
+        0.95,
+        2.466
+      ],
+      [
+        0.975,
+        3.1298
+      ],
+      [
+        0.99,
+        3.406
+      ],
+      [
+        0.995,
+        3.581
+      ],
+      [
+        1.0,
+        4.7582
+      ]
+    ]
+  },
+  "sever": {
+    "rate": {
+      "cut": {
+        "head": 0.0417,
+        "torso": 0.0019,
+        "arm": 0.1812,
+        "leg": 0.2611
+      },
+      "blunt": {
+        "head": 0.0,
+        "torso": 0.0,
+        "arm": 0.0,
+        "leg": 0.0
+      },
+      "bite": {
+        "head": 0.0,
+        "torso": 0.0,
+        "arm": 0.0,
+        "leg": 0.1786
+      },
+      "pierce": {}
+    },
+    "hits": {
+      "cut": {
+        "head": 431,
+        "torso": 1055,
+        "arm": 1351,
+        "leg": 516
+      },
+      "blunt": {
+        "head": 38,
+        "torso": 383,
+        "arm": 374,
+        "leg": 43
+      },
+      "bite": {
+        "head": 18,
+        "torso": 29,
+        "arm": 43,
+        "leg": 55
+      },
+      "pierce": {}
+    },
+    "owedHp": 24.0,
+    "stumpHpPerTick": 0.15
   },
   "matchups": [
     {
@@ -432,15 +893,15 @@
       "aCount": 1,
       "bCount": 1,
       "gapVox": 14.0,
-      "n": 8,
-      "winA": 0.625,
+      "n": 16,
+      "winA": 0.9375,
       "winB": 0.0,
-      "draw": 0.375,
-      "ttkTicks": 604.8,
-      "ttkSd": 510.1605,
+      "draw": 0.0625,
+      "ttkTicks": 1145.4667,
+      "ttkSd": 398.3471,
       "timeoutTicks": 1800,
-      "hpLeftA": 0.993,
-      "hpLeftB": 0.1623
+      "hpLeftA": 0.9972,
+      "hpLeftB": 0.0126
     },
     {
       "name": "mace_vs_plate",
@@ -449,15 +910,15 @@
       "aCount": 1,
       "bCount": 1,
       "gapVox": 14.0,
-      "n": 8,
+      "n": 16,
       "winA": 0.0,
-      "winB": 0.75,
-      "draw": 0.25,
-      "ttkTicks": 1038.1666,
-      "ttkSd": 504.7453,
+      "winB": 1.0,
+      "draw": 0.0,
+      "ttkTicks": 920.5,
+      "ttkSd": 287.0359,
       "timeoutTicks": 1800,
-      "hpLeftA": 0.0652,
-      "hpLeftB": 0.995
+      "hpLeftA": 0.0,
+      "hpLeftB": 0.9964
     },
     {
       "name": "sword_vs_zombie",
@@ -466,15 +927,15 @@
       "aCount": 1,
       "bCount": 1,
       "gapVox": 14.0,
-      "n": 8,
-      "winA": 0.0,
-      "winB": 0.375,
-      "draw": 0.625,
-      "ttkTicks": 580.3333,
-      "ttkSd": 407.8238,
+      "n": 16,
+      "winA": 0.0625,
+      "winB": 0.9375,
+      "draw": 0.0,
+      "ttkTicks": 768.6875,
+      "ttkSd": 372.5009,
       "timeoutTicks": 1800,
-      "hpLeftA": 0.1957,
-      "hpLeftB": 0.8921
+      "hpLeftA": 0.0085,
+      "hpLeftB": 0.9035
     },
     {
       "name": "brawl_4v3",
@@ -483,15 +944,15 @@
       "aCount": 4,
       "bCount": 3,
       "gapVox": 16.0,
-      "n": 8,
-      "winA": 0.0,
+      "n": 16,
+      "winA": 0.3125,
       "winB": 0.0,
-      "draw": 1.0,
-      "ttkTicks": 0.0,
-      "ttkSd": 0.0,
+      "draw": 0.6875,
+      "ttkTicks": 1387.4,
+      "ttkSd": 133.206,
       "timeoutTicks": 1800,
-      "hpLeftA": 0.563,
-      "hpLeftB": 0.541
+      "hpLeftA": 0.2661,
+      "hpLeftB": 0.239
     },
     {
       "name": "archer_vs_melee",
@@ -500,15 +961,15 @@
       "aCount": 1,
       "bCount": 1,
       "gapVox": 55.0,
-      "n": 5,
-      "winA": 0.2,
+      "n": 11,
+      "winA": 0.1818,
       "winB": 0.0,
-      "draw": 0.8,
-      "ttkTicks": 782.0,
-      "ttkSd": 0.0,
+      "draw": 0.8182,
+      "ttkTicks": 147.0,
+      "ttkSd": 31.0,
       "timeoutTicks": 1200,
-      "hpLeftA": 0.9964,
-      "hpLeftB": 0.4946
+      "hpLeftA": 0.9878,
+      "hpLeftB": 0.4234
     }
   ]
 }

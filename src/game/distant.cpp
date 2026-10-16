@@ -57,6 +57,11 @@ float DistSq(Vec3 a, Vec3 b) {
   return dx * dx + dy * dy + dz * dz;
 }
 
+// A promotion that is still burning (D2b) re-lights this many voxels of its
+// trunk (MobSystem::IgniteLimb) -- a foothold the near burn pass then spreads
+// by its own rules. Of the order of the calibration's burn probe (60).
+constexpr uint32_t kDistantRelightVoxels = 40;
+
 }  // namespace
 
 const DistantMobs::Stats& DistantRunTotals() { return RunTotalsMut(); }
@@ -195,6 +200,7 @@ bool DistantMobs::Erase(uint64_t id) {
 void DistantMobs::Clear() {
   list_.clear();
   cells_.clear();
+  arrows_.clear();
   nextWakeTick_ = UINT32_MAX;
   anyAwakeHint_ = false;
   promoteScanDue_ = retireScanDue_ = false;
@@ -338,9 +344,61 @@ void FillDistantDrawItems(const DistantMobs& tier, uint32_t tick, int idleStride
     // every `idleStride` ticks and must not flicker to idle between.
     const bool walking = !d.dead && d.lastMoveTick != 0 && tick >= d.lastMoveTick &&
                          tick - d.lastMoveTick <= walkWindow;
-    it.state = walking ? DistantDrawState::Walk : DistantDrawState::Idle;
+    // STRIKING from the swing's start to its end (D2b): the statue's one
+    // strike pose for the whole stroke -- windup, cut and recovery alike.
+    const bool striking = !d.dead && d.strokeEndTick != 0 && tick >= d.strokeStartTick &&
+                          tick < d.strokeEndTick;
+    it.state = striking  ? DistantDrawState::Strike
+               : walking ? DistantDrawState::Walk
+                         : DistantDrawState::Idle;
     it.gaitPhase = d.gaitPhase;
     out.push_back(it);
+  }
+}
+
+// ---- the arrows in the air (D2b) -----------------------------------------------
+void AppendDistantArrowBodies(const DistantMobs& tier, const ItemLibrary& items,
+                              uint32_t tick, float tickAlpha,
+                              std::vector<RenderOnlyBody>& out) {
+  if (tier.Arrows().empty()) return;
+  const float g = MetresToCells(CurrentTuning().physics.gravity);   // voxels/s^2
+  for (const DistantArrowFlight& f : tier.Arrows()) {
+    const ItemDef* def = items.Named(f.ammo);
+    if (def == nullptr || def->microModel < 0 || f.impactTick <= f.looseTick) continue;
+    // THE ARC: a parabola through both ends over the flight's own duration,
+    // so the arrow leaves the archer rising and comes down on its mark.
+    const float T = (float)(f.impactTick - f.looseTick) / 30.0f;
+    const float t = std::clamp(((float)(tick - f.looseTick) + std::clamp(tickAlpha, 0.0f, 1.0f)) /
+                                   30.0f,
+                               0.0f, T);
+    Vec3 to = f.to;
+    if (!f.out.hit) {
+      // A MISS goes past: a few voxels wide of the mark, the side from the
+      // shooter's id (render-only, so any stable rule will do).
+      const float dx = f.to.x - f.from.x, dz = f.to.z - f.from.z;
+      const float l = std::max(1e-3f, std::sqrt(dx * dx + dz * dz));
+      const float side = (f.shooter & 1u) ? 3.0f : -3.0f;
+      to = Vec3{f.to.x + (-dz / l) * side + (dx / l) * 4.0f, f.to.y,
+                f.to.z + (dx / l) * side + (dz / l) * 4.0f};
+    }
+    const Vec3 span = to - f.from;
+    const float u = T > 0.0f ? t / T : 1.0f;
+    const Vec3 tip{f.from.x + span.x * u, f.from.y + span.y * u + 0.5f * g * t * (T - t),
+                   f.from.z + span.z * u};
+    Vec3 dir{span.x / T, span.y / T + 0.5f * g * (T - 2.0f * t), span.z / T};
+    const float dl = dir.len();
+    dir = dl > 1e-6f ? dir * (1.0f / dl) : Vec3{1, 0, 0};
+    // game/arrows.cpp ArrowXf (file-local there): the tip at `tip`, the shaft
+    // along `dir` (the model's +x).
+    const Quat q = QuatNormalize(QuatFromTo(Vec3{1, 0, 0}, dir));
+    RenderOnlyBody b;
+    b.pos = tip - QuatRotate(q, def->arrow.tip);
+    b.quat[0] = q.x;
+    b.quat[1] = q.y;
+    b.quat[2] = q.z;
+    b.quat[3] = q.w;
+    b.model = (uint32_t)def->microModel;
+    out.push_back(b);
   }
 }
 
@@ -459,6 +517,97 @@ bool MobSystem::DemoteToDistant(Mob& mob, std::vector<uint8_t>& record, Vec3 wlo
   // holds where it was, as anchored creatures do.
   d.landPending = !d.dead && d.groundMode == DistantGroundMode::Surface && mob.airborne_;
 
+  // ---- D2b: THE ABSTRACT FIGHTER (section 2.6, game/distant_combat.h) -----
+  // Read off the LIVE rig while it still exists (the caller releases it right
+  // after this returns): what it swings and with what, what it holds up, its
+  // limbs' roles and the shells over them, its bow -- and its statuses (open
+  // wounds become a bleed rate, a burning body keeps burning). The brain is
+  // still on the Mob here, which BuildDistantKit reads for the profile's
+  // style list. A corpse needs none of it.
+  if (!d.dead) {
+    d.kit = distant::BuildDistantKit(mob, items_);
+    // A ruined limb is still in the way of the next blow, as it is near
+    // (DistantKit::absorbRuined says why the table needs this).
+    d.kit.absorbRuined = true;
+    // A REACH OF 0 MEANS "UNLIMITED" to the style draw and the impact test
+    // (`s.reach > 0` guards both), and StyleReachOn answers 0 for a rig that
+    // has never been posed (its arm's bones are all at the origin). Near, the
+    // next posed tick corrects it; here the kit is kept, so such a style
+    // takes the profile's authored reach -- AttackReachOf's floor -- rather
+    // than striking from anywhere.
+    if (const ai::Profile* pr = behaviors_.At(mob.ai_.profile))
+      for (distant::DistantStyle& st : d.kit.styles)
+        if (!(st.reach > 0.0f)) st.reach = std::max(1.0f, pr->attack.reach);
+    d.hasKit = !d.kit.limbs.empty() && d.kit.limbs.size() <= d.limbHp.size();
+    const distant::DistantVitals v = distant::CaptureDistantVitals(mob, distantCalib_);
+    d.bloodLossPerTick = v.bleedRate;
+    d.burnFrac = v.burnFrac;
+    d.burnTicksLeft = (uint16_t)std::clamp(v.burnTicksLeft, 0, 65535);
+    // THE FISTS: per hand, the arm chain that serves it (HandCondition's
+    // parts), what is in it, and the fist it has once it is empty -- its
+    // reach the chain's live bone length, StyleReachOn's own fist term.
+    for (int h = 0; h < kHands; h++) {
+      DistantMob::DistantHand& H = d.hands[h];
+      const Hand hand = HandAt(h);
+      const int part = mob.HandPart(hand);
+      if (part >= 0) {
+        int n = 0;
+        H.parts[n++] = (int16_t)part;
+        int eff = -1;
+        if (const IkChain* ch = mob.ChainForEffector(mob.skel_, part, eff))
+          for (int p : ch->parts)
+            if (n < 4 && p != part) H.parts[n++] = (int16_t)p;
+      }
+      const int slot = mob.HeldSlot(hand);
+      H.shield = slot >= 0 && mob.IsShieldSlot(slot);
+      H.weapon = slot >= 0 && !H.shield;
+      if (H.weapon && items_ != nullptr)
+        if (const ItemDef* it = items_->Named(mob.HeldItem(hand))) {
+          H.weaponStrike = it->strike;
+          H.weaponName = it->name;
+        }
+      if (const MobNaturalWeaponDef* nw = mob.HandFist(hand)) {
+        H.fist = true;
+        H.fistStrike = mob.StrikeProfileFor(*nw);
+        H.fistName = nw->name;
+        int handPart = -1;
+        if (const IkChain* ch = mob.ChainForEffector(mob.skel_, nw->partIndex, handPart)) {
+          const int i0 = ch->parts[0], i1 = ch->parts[1];
+          const size_t nm = mob.anim_.model.size();
+          if ((size_t)i0 < nm && (size_t)i1 < nm && handPart >= 0 && (size_t)handPart < nm)
+            H.fistReach = (mob.anim_.model[i1].pos - mob.anim_.model[i0].pos).len() +
+                          (mob.anim_.model[(size_t)handPart].pos - mob.anim_.model[i1].pos).len();
+        }
+        // An unposed rig (see the reach floor below): the profile's reach.
+        if (!(H.fistReach > 0.0f))
+          if (const ai::Profile* pr = behaviors_.At(mob.ai_.profile))
+            H.fistReach = std::max(1.0f, pr->attack.reach * 0.5f);
+      }
+    }
+    // THE BOW and, for an archer, the SIDEARM in its sheath (mob_archery.cpp
+    // DrawSidearm). Its reach: a quarter of the bow arm plus the item's own
+    // (StyleReachOn's held-weapon term, with the item's stated reach for the
+    // live edge it does not have in the sheath -- an estimate).
+    if (items_ != nullptr) {
+      Hand bh = Hand::Right;
+      if (const ItemDef* bow = HeldBow(mob, *items_, &bh)) {
+        d.bowHand = (int8_t)HandIndex(bh);
+        d.bowWindupTicks = bow->bow.windupTicks;
+        d.bowDrawTicks = bow->bow.drawTicks;
+        const ItemStack* st =
+            mob.GetKit().Resolve(KitRef{KitSpace::Equip, (int)EquipSlotId::Sheath});
+        if (st != nullptr && !st->Empty())
+          if (const ItemDef* side = items_->Named(st->name); side != nullptr && !side->IsBow()) {
+            d.haveSidearm = true;
+            d.sidearm = side->name;
+            d.sidearmStrike = side->strike;
+            const DistantMob::DistantHand& H = d.hands[d.bowHand];
+            d.sidearmReach = 0.25f * H.fistReach + side->reach;
+          }
+      }
+    }
+  }
+
   // THE OVERLAY MUST ROUND-TRIP BEFORE THE CREATURE IS TRUSTED TO IT. The
   // overlay was read off the live Mob and the record was written by SaveOne;
   // patching the record with its own overlay has to give back the same bytes,
@@ -572,13 +721,33 @@ Mob* MobSystem::PromoteDistant(uint64_t id, bool* spawnRefused) {
   // chunks this reads). A living SURFACE creature that MOVED while distant is
   // put on the ground the window really has under its footprint -- up out of
   // a wall it would otherwise come back inside -- before its record is
-  // patched, so the limbs are placed round the snapped origin. A corpse, an
-  // ANCHORED creature and one that never moved come back where they lie /
-  // stood (DistantMob::movedWhileDistant).
-  if (!dm->dead && dm->groundMode == DistantGroundMode::Surface && dm->movedWhileDistant &&
-      world_ != nullptr)
+  // patched, so the limbs are placed round the snapped origin. An ANCHORED
+  // creature and one that never moved come back where they lie / stood
+  // (DistantMob::movedWhileDistant). A creature that walked and then DIED at
+  // this tier (D2b) is snapped too: it fell where DistantGround had it, and
+  // its corpse must come down on the real ground, not inside a wall. A corpse
+  // demoted dead never moved, so D0's rule for it is unchanged.
+  if (dm->groundMode == DistantGroundMode::Surface && dm->movedWhileDistant && world_ != nullptr)
     SnapPromotionGround(*dm);
   const DistantMob* d = dm;
+  // STILL BURNING (D2b, section 2.6): the fire is re-lit on one limb after
+  // the creature is back, so it goes on visibly where it was abstract. The
+  // trunk -- the biggest attached torso limb -- is the one lit (it has the
+  // most to burn, and it is where a burning body's fire is seen).
+  const bool relight = !d->dead && d->burnTicksLeft > 0 && d->hasKit;
+  int relightLimb = -1;
+  if (relight) {
+    float best = -1.0f;
+    for (size_t i = 0; i < d->kit.limbs.size(); i++) {
+      const distant::DistantLimb& L = d->kit.limbs[i];
+      if (!L.alive || L.bloodless || L.role != distant::LimbRole::Torso) continue;
+      if (L.maxHp > best) {
+        best = L.maxHp;
+        relightLimb = (int)i;
+      }
+    }
+  }
+  const bool rebleed = !d->dead && d->bloodLossPerTick > 0.0f;
   std::vector<uint8_t> bytes;
   if (!DistantRecord(*d, bytes)) {
     std::fprintf(stderr, "distant: mob %llu ('%s') has a record the overlay "
@@ -630,6 +799,14 @@ Mob* MobSystem::PromoteDistant(uint64_t id, bool* spawnRefused) {
   distant_.Erase(id);
   distant_.Note(&DistantMobs::Stats::promoted);
   if (dead) distant_.Note(&DistantMobs::Stats::promotedDead);
+  // The fire, re-lit (see above) -- through the near tier's own door, after
+  // the overlay, on a creature that came back alive.
+  if (Mob* back = FindMobById(id); back != nullptr && back->alive_) {
+    if (relight && relightLimb >= 0 &&
+        IgniteLimb(id, relightLimb, kDistantRelightVoxels) > 0)
+      distant_.Note(&DistantMobs::Stats::relit);
+    if (rebleed) distant_.Note(&DistantMobs::Stats::rebled);
+  }
   return FindMobById(id);
 }
 
@@ -1068,6 +1245,12 @@ constexpr float kDistantFishMinDepthBodies = 1.0f;
 // Substep length of the drive, voxels: no step crosses more than one column
 // between ground checks, so a stride's 4-tick move cannot hop a thin wall.
 constexpr float kDistantSubstepVox = 1.0f;
+// A step shorter than this does not keep a creature awake (D2b, measured):
+// two idle survivors standing just inside each other's personal space are
+// nudged by the spacing push a ten-thousandth of a voxel a stride -- the
+// push resolved against ground that refuses most of it -- and "it moved"
+// kept both awake for ever. A twentieth of a voxel is no walk.
+constexpr float kDistantSleepJitterVox = 0.05f;
 
 // THE TICK-START STATE of one living distant creature: what every OTHER
 // creature's step reads (perception, spacing, the sleep test). Built once per
@@ -1084,7 +1267,21 @@ struct DistantSnap {
   bool hostile = false, armed = false;
   uint64_t targetId = 0;
   Vec3 vel{};
+  // D2b: what a watcher can read off it (ai::Actor's fight fields): how far
+  // its blows land, whether it bleeds, and what its swing is doing.
+  float reach = 0.0f;
+  bool bleeding = false;
+  ai::Action action = ai::Action::None;
 };
+
+// THE ACTOR LIST'S CAP (D2b, section 2.11). A creature's WorldView holds at
+// most this many others: the nearest ones (ties by id), its own target and
+// threat always among them. Think walks the list several times a step, so an
+// uncapped list made a 64-a-side battle cost O(N^2) -- every fighter weighing
+// every other, and an uncapped list makes a dense battle O(N^2). Nobody in a
+// melee needs more than the nearest couple of dozen; the near tier's list is
+// the whole crowd because the crowd is capped at 64.
+constexpr size_t kDistantActorsMax = 24;
 
 // THE PROMOTION BOX (§2.1): EntityParking::Unpark's "inside the window by
 // kUnparkMarginChunks on every face", as voxel bounds on the min corner.
@@ -1157,6 +1354,141 @@ void DistantBodyFacts(const DistantMob& d, float& hpFrac, int& limbsLost) {
     if (d.limbHp[i] > 0.0f) sum += d.limbHp[i];
   }
   hpFrac = d.hpFull > 0.0f ? std::clamp(sum / d.hpFull, 0.0f, 1.0f) : 0.0f;
+}
+
+// ---- D2b: the abstract body, as the resolver sees it --------------------------
+//
+// The resolver's DistantVitals is built from the fields the tier keeps (the
+// BASE part of limbHp -- the record writes every base limb first, index-
+// parallel to the kit -- and the statuses), stepped, and written back. A
+// thread-local scratch is reused, so a bleeding crowd allocates nothing.
+void LoadVitals(const DistantMob& d, distant::DistantVitals& v) {
+  const size_t n = std::min(d.kit.limbs.size(), d.limbHp.size());
+  v.limbHp.assign(d.limbHp.begin(), d.limbHp.begin() + (ptrdiff_t)n);
+  v.bleedRate = d.bloodLossPerTick;
+  v.stumps = d.stumps;
+  v.burnFrac = d.burnFrac;
+  v.burnTicksLeft = d.burnTicksLeft;
+  v.dead = d.dead ? distant::DistantDeath::Other : distant::DistantDeath::None;
+}
+void StoreVitals(const distant::DistantVitals& v, DistantMob& d) {
+  for (size_t i = 0; i < v.limbHp.size() && i < d.limbHp.size(); i++) d.limbHp[i] = v.limbHp[i];
+  d.bloodLossPerTick = v.bleedRate;
+  d.stumps = (uint8_t)std::clamp(v.stumps, 0, 255);
+  d.burnFrac = v.burnFrac;
+  d.burnTicksLeft = (uint16_t)std::clamp(v.burnTicksLeft, 0, 65535);
+}
+
+// The near tier's cause name for a distant death (InternDeathCause's known
+// list), so a corpse promoted from this tier reads like one that died near.
+const char* DistantDeathCause(distant::DistantDeath k) {
+  switch (k) {
+    case distant::DistantDeath::BloodLoss: return "blood loss";
+    case distant::DistantDeath::Burns: return "burnt past the death knot";
+    default: return "vital limb destroyed";
+  }
+}
+
+// Mob::HandCondition on the abstract body: the worst hp fraction over the arm
+// chain serving hand `h` (0 if a part of it is gone), against the authored hp.
+float DistantHandCondition(const DistantMob& d, int h) {
+  const DistantMob::DistantHand& H = d.hands[h];
+  if (H.parts[0] < 0) return 0.0f;
+  float worst = 1.0f;
+  for (int k = 0; k < 4; k++) {
+    const int p = H.parts[k];
+    if (p < 0) continue;
+    if ((size_t)p >= d.kit.limbs.size() || (size_t)p >= d.limbHp.size()) return 0.0f;
+    if (!d.kit.limbs[(size_t)p].alive) return 0.0f;
+    const float full = d.kit.limbs[(size_t)p].maxHp;
+    if (full <= 0.0f) continue;
+    worst = std::min(worst, std::clamp(d.limbHp[(size_t)p] / full, 0.0f, 1.0f));
+  }
+  return worst;
+}
+
+// THE HELD STYLES, RE-ARMED from what the fists now hold (a grip that failed,
+// an archer's sidearm): the first fist with a weapon swings it (the right
+// first, as StyleUsable / the strike hand prefer); else a usable fist punches
+// (its reach the arm's, MobSystem::StyleReachOn's fist term); else the held
+// styles go -- "none of its styles is usable", as near. Natural weapons (the
+// jaws) are untouched. `weaponReach` >= 0 replaces the held styles' reach
+// (a sidearm drawn); < 0 keeps it (the same weapon in the other fist). The
+// guard follows: a shield, else a blade, else nothing. A swing in flight with
+// a held style is dropped (the hand that was making it has let go).
+void RearmHeld(DistantMob& d, float weaponReach, uint32_t tick) {
+  const DistantMob::DistantHand* w = nullptr;
+  for (int h = 0; h < kHands && w == nullptr; h++)
+    if (d.hands[h].weapon) w = &d.hands[h];
+  const DistantMob::DistantHand* fist = nullptr;
+  for (int h = 0; h < kHands && fist == nullptr; h++)
+    if (d.hands[h].fist && !d.hands[h].shield) fist = &d.hands[h];
+  const std::string closeName =
+      d.kit.closeStyle >= 0 && d.kit.closeStyle < (int)d.kit.styles.size()
+          ? d.kit.styles[(size_t)d.kit.closeStyle].name
+          : std::string();
+  if (d.strokeImpactTick != 0 && d.strokeStyle < d.kit.styles.size() &&
+      d.kit.styles[d.strokeStyle].held) {
+    d.strokeImpactTick = 0;
+    d.strokeEndTick = tick;
+    d.strokeTarget = 0;
+  }
+  std::vector<distant::DistantStyle> kept;
+  kept.reserve(d.kit.styles.size());
+  for (distant::DistantStyle s : d.kit.styles) {
+    if (s.held) {
+      if (w != nullptr) {
+        s.strike = w->weaponStrike;
+        s.weapon = w->weaponName;
+        s.natural = false;
+        if (weaponReach >= 0.0f) s.reach = weaponReach;
+      } else if (fist != nullptr) {
+        s.strike = fist->fistStrike;
+        s.weapon = fist->fistName;
+        s.natural = true;
+        if (fist->fistReach > 0.0f) s.reach = fist->fistReach;
+      } else {
+        continue;
+      }
+      s.kind = distant::DominantKind(s.strike);
+    }
+    kept.push_back(std::move(s));
+  }
+  d.kit.styles.swap(kept);
+  d.kit.closeStyle = -1;
+  for (size_t i = 0; i < d.kit.styles.size() && !closeName.empty(); i++)
+    if (d.kit.styles[i].name == closeName) d.kit.closeStyle = (int)i;
+  bool shield = false;
+  for (int h = 0; h < kHands; h++) shield = shield || d.hands[h].shield;
+  d.kit.guard = shield ? distant::GuardClass::Shield
+                : w != nullptr ? distant::GuardClass::Blade
+                               : distant::GuardClass::None;
+  d.armed = w != nullptr;
+  d.canGuard = w != nullptr || shield;
+  if (d.strokeStyle >= d.kit.styles.size()) d.strokeStyle = 0;
+}
+
+// The reach facts Think needs (ai_behavior.h SelfView::attackReach /
+// strikeReach), off the kit as MobSystem::AttackReachOf / StrikeReachOf
+// compute them off the rig: the longest usable style (the fallback group
+// only when no real style is left), and that with the profile's floor.
+void KitReach(const DistantMob& d, const ai::Profile* prof, float& attackReach,
+              float& strikeReach) {
+  attackReach = prof != nullptr ? prof->attack.reach : 0.0f;
+  strikeReach = 0.0f;
+  if (!d.hasKit) return;
+  float real = 0.0f, fb = 0.0f;
+  bool haveReal = false;
+  for (const distant::DistantStyle& s : d.kit.styles) {
+    attackReach = std::max(attackReach, s.reach);
+    if (s.fallback) {
+      fb = std::max(fb, s.reach);
+    } else {
+      haveReal = true;
+      real = std::max(real, s.reach);
+    }
+  }
+  strikeReach = haveReal ? real : fb;
 }
 
 }  // namespace
@@ -1280,8 +1612,9 @@ void FootprintColumns(const DistantMob& d, int (&xs)[3], int (&zs)[3]) {
 
 void MobSystem::DistantPromotionChunks(const DistantMob& d, std::vector<IVec3>& out) const {
   out.clear();
-  if (world_ == nullptr || d.dead || d.groundMode != DistantGroundMode::Surface ||
-      !d.movedWhileDistant)
+  // The dead too (D2b): one that walked and then died here is snapped like
+  // the living (PromoteDistant). A corpse demoted dead never moved.
+  if (world_ == nullptr || d.groundMode != DistantGroundMode::Surface || !d.movedWhileDistant)
     return;
   const int maxD = std::max(0, (int)std::ceil(CurrentTuning().distant.promoteMaxDropVox));
   int xs[3], zs[3];
@@ -1367,19 +1700,23 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
                             const std::vector<ai::Actor>* nearActors) {
   if (distant_.Count() == 0) {
     nearBand_.clear();
+    distant_.ArrowsMut().clear();
     return;
   }
   const Tuning::Distant& tune = CurrentTuning().distant;
   // THE SWITCH OFF: RetireDistant parks everyone this very tick (with a park
   // function); without one they stay, frozen, as D0 kept them.
   if (!tune.enabled) return;
-  const auto t0 = std::chrono::steady_clock::now();
-  auto timeOut = [&]() {
-    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - t0)
-                        .count();
-    distant_.Note(&DistantMobs::Stats::tickNs, (uint64_t)std::max<int64_t>(0, ns));
+  using Clock = std::chrono::steady_clock;
+  const auto t0 = Clock::now();
+  // WHERE THE TIME GOES (section 2.11): wall time per phase, summed in locals
+  // and noted once at the end. MEASUREMENTS -- nothing below reads them.
+  auto nsSince = [](Clock::time_point a) -> uint64_t {
+    return (uint64_t)std::max<int64_t>(
+        0, std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - a).count());
   };
+  uint64_t nsSelf = 0, nsWorld = 0, nsThink = 0, nsMove = 0;
+  auto timeOut = [&]() { distant_.Note(&DistantMobs::Stats::tickNs, nsSince(t0)); };
   distant_.Note(&DistantMobs::Stats::tickCallsAll);
   // The classes and the seed the ground answers for (a materials reload
   // re-points classOf_; Bind is two compares when nothing changed).
@@ -1428,24 +1765,92 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
   }
 
   // ---- NOTHING TO DO COSTS NOTHING (rule 2) ---------------------------------
-  // Everybody asleep (or dead) and no sleeper's clock due: not one creature is
-  // looked at. 512 sleepers cost two compares a tick.
-  if (!distant_.AnyAwakeHint() && tick < distant_.NextWakeTick()) {
+  // Everybody asleep (or dead), no sleeper's clock due and no arrow in the
+  // air: not one creature is looked at. 512 sleepers cost two compares a tick.
+  if (!distant_.AnyAwakeHint() && tick < distant_.NextWakeTick() && distant_.Arrows().empty()) {
     timeOut();
     return;
   }
+  const distant::DistantCalib& cal = distantCalib_;
+  const Tuning::Gear& gear = CurrentTuning().gear;
+  thread_local distant::DistantVitals vit;
+  // ---- THE DEAD, and how (the impact pass, the statuses, a stump paid late) ----
+  auto kill = [&](DistantMob& d, distant::DistantDeath why) {
+    d.dead = true;
+    d.cause = DistantDeathCause(why);
+    d.deathKind = (uint8_t)why;
+    // The near tier's death order (EnterLoadedDead keeps it): this tier's
+    // deaths take their turn in the same sequence.
+    d.deathSeq = ++deathSeq_;
+    d.deathTick = tick;
+    // ASLEEP FOREVER (section 2.8), holding nothing: no swing, no draw, no
+    // bleed or fire to step. Its statue lies where it stood. Nothing is
+    // booked in rises_ -- infection is not modelled at this tier (D2a's open
+    // item), and a corpse's rising travels in its record.
+    d.asleep = true;
+    d.wakeTick = 0;
+    d.strokeImpactTick = d.strokeEndTick = 0;
+    d.strokeTarget = 0;
+    d.drawLooseTick = 0;
+    d.drawTarget = 0;
+    d.bloodLossPerTick = 0.0f;
+    d.burnTicksLeft = 0;
+    d.steer.speedNow = 0.0f;
+    d.vel = Vec3{};
+    d.statueRestY = d.origin.y;
+    distant_.Note(&DistantMobs::Stats::deaths);
+    switch (why) {
+      case distant::DistantDeath::BloodLoss: distant_.Note(&DistantMobs::Stats::deathsBlood); break;
+      case distant::DistantDeath::Burns: distant_.Note(&DistantMobs::Stats::deathsBurns); break;
+      default: distant_.Note(&DistantMobs::Stats::deathsVital); break;
+    }
+  };
+  // A STUMP PAID LATE (D2b): a creature whose only status is open stumps
+  // may have slept; the ticks it slept through are paid now, in one sum
+  // (distant::StepStumps -- exact), before anything reads or hurts it. One
+  // that bled out inside them dies on the tick it would have.
+  auto catchUpStumps = [&](DistantMob& d) {
+    if (d.dead || !d.hasKit || d.stumps == 0 || d.statusTick == 0 || tick <= d.statusTick + 1)
+      return;
+    const int missed = (int)(tick - d.statusTick - 1);
+    LoadVitals(d, vit);
+    int diedAfter = -1;
+    distant::StepStumps(vit, d.kit, cal, missed, &diedAfter);
+    StoreVitals(vit, d);
+    d.statusTick = tick - 1;
+    distant_.Note(&DistantMobs::Stats::bleedTicks, (uint64_t)missed);
+    if (vit.dead != distant::DistantDeath::None) {
+      kill(d, vit.dead);
+      if (diedAfter > 0) d.deathTick = tick - 1 - (uint32_t)(missed - diedAfter);
+    }
+  };
+  // ...and the clock of one falling asleep with them: the tick it bleeds out.
+  auto stumpClock = [&](DistantMob& d) {
+    if (d.stumps == 0 || !d.hasKit) return;
+    LoadVitals(d, vit);
+    const int left = distant::StumpTicksLeft(vit, d.kit, cal);
+    if (left >= INT32_MAX - 1) return;
+    const uint32_t dieAt = tick + 1 + (uint32_t)left;
+    d.wakeTick = d.wakeTick == 0 ? dieAt : std::min(d.wakeTick, dieAt);
+  };
 
   // ---- WHO STEPS ----------------------------------------------------------------
   // The dead: never. The asleep: not, unless their clock came round. The
-  // ENGAGED (a target, a threat, a landing to make): every tick. Everyone
-  // else awake: on the idle stride, phase (tick + id), moving stride ticks'
-  // worth when they do.
+  // ENGAGED (a target, a threat, a landing to make, a swing or a draw in
+  // flight): every tick. Everyone else awake: on the idle stride, phase
+  // (tick + id), moving stride ticks' worth when they do. Beside them, D2b's
+  // two lists, both in id order: the creatures whose swing lands or whose
+  // bow looses THIS tick (`due`), and those bleeding or burning (`status`,
+  // stepped every tick whether or not their turn to think came round).
   const int stride = std::max(1, tune.idleStride);
   const float dt = 1.0f / 30.0f;
-  thread_local std::vector<size_t> steppers;
+  thread_local std::vector<size_t> steppers, due, status;
   steppers.clear();
+  due.clear();
+  status.clear();
   bool anyAwake = false;
   uint32_t nextWake = UINT32_MAX;
+  uint64_t engagedSteps = 0;
   for (size_t i = 0; i < distant_.Count(); i++) {
     DistantMob& d = distant_.At(i);
     if (d.dead) continue;
@@ -1459,24 +1864,47 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
       d.wakes++;
       distant_.Note(&DistantMobs::Stats::wakesTimer);
     }
+    // A sleeper with an open stump, woken (by its clock or a neighbour):
+    // what it bled while it slept, first.
+    catchUpStumps(d);
+    if (d.dead) continue;
     anyAwake = true;
-    const bool engaged = d.brain.hasTarget || d.brain.hasThreat || d.landPending;
+    // A FINISHED SWING frees the arm (its impact was resolved on its own
+    // tick, below, before this one could come round).
+    if (d.strokeEndTick != 0 && tick >= d.strokeEndTick) {
+      d.strokeEndTick = 0;
+      d.strokeImpactTick = 0;
+      d.strokeTarget = 0;
+    }
+    const bool swinging = d.strokeEndTick != 0;
+    const bool drawing = d.drawLooseTick != 0;
+    if ((d.strokeImpactTick != 0 && d.strokeImpactTick <= tick) ||
+        (drawing && d.drawLooseTick <= tick))
+      due.push_back(i);
+    if (d.bloodLossPerTick > 0.0f || d.burnTicksLeft > 0 || d.stumps > 0) status.push_back(i);
+    const bool engaged =
+        d.brain.hasTarget || d.brain.hasThreat || d.landPending || swinging || drawing;
     if (!engaged && (tick + (uint32_t)d.id) % (uint32_t)stride != 0) continue;
+    engagedSteps += engaged ? 1u : 0u;
     steppers.push_back(i);
   }
-  if (steppers.empty()) {
+  bool arrowsDue = false;
+  for (const DistantArrowFlight& f : distant_.Arrows()) arrowsDue = arrowsDue || f.impactTick <= tick;
+  if (steppers.empty() && due.empty() && status.empty() && !arrowsDue) {
     distant_.SetSleepSummary(anyAwake, nextWake);
     timeOut();
     return;
   }
-  distant_.Note(&DistantMobs::Stats::tickCalls);
+  if (!steppers.empty()) distant_.Note(&DistantMobs::Stats::tickCalls);
+  if (engagedSteps != 0) distant_.Note(&DistantMobs::Stats::stepsEngaged, engagedSteps);
 
   // ---- THE SNAPSHOT: everyone living, AS OF NOW ------------------------------
   // What every step reads about every OTHER creature. Built EAGERLY for the
   // steppers, before any of them decides (they are the only creatures phase 1
-  // writes), and LAZILY for the rest, which nothing this tick changes -- so
-  // every read is tick-start state and the step order cannot matter (§2.12),
-  // and a lone walker among 512 sleepers builds a handful of entries, not 512.
+  // writes), and LAZILY for the rest, which nothing this tick changes before
+  // the impact pass has read them -- so every read is tick-start state and the
+  // step order cannot matter (§2.12), and a lone walker among 512 sleepers
+  // builds a handful of entries, not 512.
   thread_local std::vector<DistantSnap> snap;
   thread_local std::vector<uint8_t> snapBuilt;
   snap.assign(distant_.Count(), DistantSnap{});
@@ -1512,6 +1940,17 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
       if (wt != DistantGround::kNoWater && d.worldSize.y > 0.0f)
         s.immersion = std::clamp(((float)wt - d.origin.y) / d.worldSize.y, 0.0f, 1.0f);
     }
+    // D2b: what a watcher reads off it -- its blows' reach (ThreatReachOf's
+    // order: the styles, else half a metre), whether it bleeds, and what its
+    // swing is doing (the telegraph a defence reacts to).
+    float ar = 0.0f, sr = 0.0f;
+    KitReach(d, pr, ar, sr);
+    s.reach = sr > 0.0f ? sr : MetresToCells(0.5f);
+    s.bleeding = d.bloodLossPerTick > 0.0f;
+    if (d.strokeEndTick != 0 && tick >= d.strokeStartTick)
+      s.action = d.strokeImpactTick == 0       ? ai::Action::Recover
+                 : tick + 2 < d.strokeImpactTick ? ai::Action::Windup
+                                                 : ai::Action::Cut;
   };
   for (const size_t i : steppers) buildSnap(i);
   auto snapAt = [&](size_t i) -> const DistantSnap& {
@@ -1528,10 +1967,72 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
     }
     return lo < all.size() && all[lo].id == id ? lo : SIZE_MAX;
   };
+  // ...and each living creature as an ai::Actor, built once per tick from its
+  // snapshot (every stepper that sees it copies the same one).
+  thread_local std::vector<ai::Actor> actorOf;
+  thread_local std::vector<uint8_t> actorBuilt;
+  actorOf.resize(distant_.Count());
+  actorBuilt.assign(distant_.Count(), 0);
+  auto actorAt = [&](size_t i) -> const ai::Actor& {
+    if (!actorBuilt[i]) {
+      actorBuilt[i] = 1;
+      const DistantSnap& s = snapAt(i);
+      ai::Actor a;
+      a.id = s.id;
+      a.centre = s.centre;
+      a.radius = s.radius;
+      a.height = s.height;
+      a.faction = s.faction;
+      a.alive = true;
+      a.armed = s.armed;
+      a.hpFrac = s.hpFrac;
+      a.heading = s.heading;
+      a.targetId = s.targetId;
+      a.hostile = s.hostile;
+      a.immersion = s.immersion;
+      a.velocity = s.vel;
+      a.reach = s.reach;
+      a.bleeding = s.bleeding;
+      a.action = s.action;
+      actorOf[i] = a;
+    }
+    return actorOf[i];
+  };
+  // THE NEIGHBOURHOODS, ONCE PER CELL AND REACH PER TICK (section 2.11).
+  // Every creature filed within `rc` cells of a cell, as TIER INDICES in id
+  // order -- asked by perception, spacing and the sleep test of every
+  // creature in that cell. A battle packs dozens of creatures into a few
+  // cells, and walking + sorting + id-searching the same neighbourhood once
+  // per creature was the largest single cost of an engaged step (measured:
+  // 375 of 795 us a tick for 64 a side). The hash does not change until
+  // phase 3, so one list per (cell, reach) is the same list every asker got.
+  thread_local std::vector<uint64_t> ids;
+  thread_local std::unordered_map<uint64_t, uint32_t> nbKey;
+  thread_local std::vector<std::vector<uint32_t>> nbPool;
+  nbKey.clear();
+  size_t nbUsed = 0;
+  auto neighbours = [&](int cx, int cz, int rcells) -> uint32_t {
+    const uint64_t key = ((uint64_t)(uint32_t)cx << 32) |
+                         ((uint64_t)((uint32_t)cz & 0xFFFFFFu) << 8) |
+                         (uint64_t)((uint32_t)rcells & 0xFFu);
+    const auto it = nbKey.find(key);
+    if (it != nbKey.end()) return it->second;
+    if (nbUsed == nbPool.size()) nbPool.emplace_back();
+    std::vector<uint32_t>& v = nbPool[nbUsed];
+    v.clear();
+    distant_.Neighbourhood(cx, cz, rcells, ids);   // id-sorted
+    for (const uint64_t oid : ids) {
+      const size_t oi = indexOf(oid);
+      if (oi != SIZE_MAX) v.push_back((uint32_t)oi);
+    }
+    nbKey.emplace(key, (uint32_t)nbUsed);
+    return (uint32_t)nbUsed++;
+  };
   const PromoBox box = PromoBoxOf(wo);
   const Vec3 wc{wlo.x + 0.5f * (float)kWorldN, wlo.y + 0.5f * (float)kWorldN,
                 wlo.z + 0.5f * (float)kWorldN};
   const float retireReach = tune.radius + tune.hysteresis;
+  const uint64_t nsSetup = nsSince(t0);
 
   // ---- PHASE 1: every stepper decides, writing only itself -------------------
   struct Next {
@@ -1542,10 +2043,18 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
   };
   thread_local std::vector<Next> nexts;
   nexts.clear();
-  thread_local std::vector<uint64_t> ids;
   thread_local std::vector<ai::Actor> actors;
+  struct Cand {
+    float d2;
+    uint64_t id;
+    int32_t idx;     // tier index, or band index
+    bool fromBand;
+    bool keep;       // itself, or its target: never capped away
+  };
+  thread_local std::vector<Cand> cand;
   const auto& pt = CurrentTuning().player;
   for (const size_t i : steppers) {
+    const auto tStep = Clock::now();
     DistantMob& d = distant_.At(i);
     const uint32_t elapsed = d.lastStepTick == 0 ? 1u : tick - d.lastStepTick;
     const float dtStep = dt * (float)std::clamp(elapsed, 1u, (uint32_t)stride);
@@ -1563,6 +2072,7 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
     // it to sleep. A corpse made by the landing likewise.
     if (prof == nullptr) {
       nexts.push_back(nx);
+      nsSelf += nsSince(tStep);
       continue;
     }
     const Vec3 c = d.Centre();
@@ -1586,6 +2096,9 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
     self.stepDownCells = d.stepDownCells;
     self.headroomCells = d.headroomCells;
     self.faction = ai::FactionId(prof->faction);
+    // D2b: how far it can reach, off its kit (MobSystem::AttackReachOf /
+    // StrikeReachOf's numbers, which the near tier hands Think the same way).
+    KitReach(d, prof, self.attackReach, self.strikeReach);
     DistantBodyFacts(d, self.hpFrac, self.limbsLost);
     self.burningFrac = d.burnTicksLeft > 0 ? 1.0f : 0.0f;
     self.volumetric = d.aquatic && inWater;
@@ -1596,6 +2109,7 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
     self.armed = d.armed;
     self.canGuard = d.canGuard;
     self.ammo = d.ammo;
+    self.drawing = d.drawLooseTick != 0;   // the string is back: hold the facing
 
     // ---- THE GROUND FAN (SenseGround's shape, over DistantGround) ----
     DistantNavCtx nav{&distantGround_, d.canFloat};
@@ -1628,49 +2142,51 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
       }
     }
     self.cornered = gv.haveGround && !gv.clear[ai::GroundView::kProbes / 2];
+    const auto tWorld = Clock::now();
+    nsSelf += (uint64_t)std::max<int64_t>(
+        0, std::chrono::duration_cast<std::chrono::nanoseconds>(tWorld - tStep).count());
 
     // ---- THE WORLD: distant creatures round it + the near band ----
-    // Its own keep (or scent) range, and at least its own 3x3 cells.
+    // Its own keep (or scent) range, and at least its own 3x3 cells; at most
+    // kDistantActorsMax others, the nearest (its target always among them).
     const float reachR = std::max({KeepRangeOf(prof), prof->perception.scentRange,
                                    (float)DistantMobs::kCellVox}) +
                          kDistantSleepMarginVox;
+    const float reachR2 = reachR * reachR;
     const int rc = (int)std::ceil(reachR / (float)DistantMobs::kCellVox);
-    distant_.Neighbourhood(d.cellX, d.cellZ, rc, ids);
-    actors.clear();
-    {
-      size_t bj = 0;
-      auto pushBandUpTo = [&](uint64_t limit) {
-        for (; bj < band.size() && band[bj].id < limit; bj++) {
-          const ai::Actor& a = band[bj];
-          const float dx = a.centre.x - c.x, dz = a.centre.z - c.z;
-          if (dx * dx + dz * dz <= reachR * reachR) actors.push_back(a);
-        }
-      };
-      for (const uint64_t oid : ids) {
-        pushBandUpTo(oid);
-        const size_t oi = indexOf(oid);
-        if (oi == SIZE_MAX || !snapAt(oi).valid) continue;
-        const DistantSnap& s = snapAt(oi);
-        const float dx = s.centre.x - c.x, dz = s.centre.z - c.z;
-        if (oid != d.id && dx * dx + dz * dz > reachR * reachR) continue;
-        ai::Actor a;
-        a.id = s.id;
-        a.centre = s.centre;
-        a.radius = s.radius;
-        a.height = s.height;
-        a.faction = s.faction;
-        a.alive = true;
-        a.armed = s.armed;
-        a.hpFrac = s.hpFrac;
-        a.heading = s.heading;
-        a.targetId = s.targetId;
-        a.hostile = s.hostile;
-        a.immersion = s.immersion;
-        a.velocity = s.vel;
-        actors.push_back(a);
-      }
-      pushBandUpTo(UINT64_MAX);
+    const uint64_t tgt = d.brain.hasTarget ? d.brain.targetId : 0;
+    cand.clear();
+    for (const uint32_t oi : nbPool[neighbours(d.cellX, d.cellZ, rc)]) {
+      const DistantSnap& s = snapAt(oi);
+      if (!s.valid) continue;
+      const float dx = s.centre.x - c.x, dz = s.centre.z - c.z;
+      const float d2 = dx * dx + dz * dz;
+      if (s.id != d.id && d2 > reachR2) continue;
+      cand.push_back({d2, s.id, (int32_t)oi, false, s.id == d.id || s.id == tgt});
     }
+    for (size_t k = 0; k < band.size(); k++) {
+      const ai::Actor& a = band[k];
+      const float dx = a.centre.x - c.x, dz = a.centre.z - c.z;
+      const float d2 = dx * dx + dz * dz;
+      if (d2 <= reachR2) cand.push_back({d2, a.id, (int32_t)k, true, a.id == tgt});
+    }
+    if (cand.size() > kDistantActorsMax + 1) {
+      // The kept, then the nearest, ties by id: a total order, so the set
+      // that survives is a pure function of the tick-start snapshot.
+      std::nth_element(cand.begin(), cand.begin() + (ptrdiff_t)kDistantActorsMax, cand.end(),
+                       [](const Cand& a, const Cand& b) {
+                         if (a.keep != b.keep) return a.keep;
+                         if (a.d2 != b.d2) return a.d2 < b.d2;
+                         return a.id < b.id;
+                       });
+      cand.resize(kDistantActorsMax + 1);   // + itself
+      distant_.Note(&DistantMobs::Stats::actorCaps);
+    }
+    // In ID ORDER, as the near tier's list is (§2.12).
+    std::sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.id < b.id; });
+    actors.clear();
+    for (const Cand& k : cand)
+      actors.push_back(k.fromBand ? band[(size_t)k.idx] : actorAt((size_t)k.idx));
     ai::WorldView wv;
     wv.actors = &actors;
     wv.probe.ground = &DistantProbeGround;
@@ -1682,19 +2198,77 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
     wv.losCtx = nullptr;
     wv.aimPart = nullptr;
     wv.aimCtx = nullptr;
+    const auto tThink = Clock::now();
+    nsWorld += (uint64_t)std::max<int64_t>(
+        0, std::chrono::duration_cast<std::chrono::nanoseconds>(tThink - tWorld).count());
 
     // ---- THINK ----
     ai::IntentOut out;
     const bool thought = ai::Think(d.brain, behaviors_, self, gv, wv, tick, dtStep, out);
+    const auto tMove = Clock::now();
+    nsThink += (uint64_t)std::max<int64_t>(
+        0, std::chrono::duration_cast<std::chrono::nanoseconds>(tMove - tThink).count());
     if (!thought) {
       nexts.push_back(nx);
       continue;
     }
-    // NO FIGHTING YET (D2b wires the abstract strike, the abstract arrow and
-    // -- owner decision 5.3 -- casting stays held): the intent is counted and
-    // dropped; the brain's own clocks ran as if it had swung.
-    if (out.attack || out.shoot || out.cast)
-      distant_.Note(&DistantMobs::Stats::combatHolds);
+
+    // ---- THE FIGHT'S INTENTS (D2b, section 2.6) ----
+    // Started here, writing only this creature; RESOLVED in the impact pass
+    // after every step, against tick-start snapshots. An arm already busy (a
+    // swing in flight, a bow drawn) drops the request, as BeginStroke drops a
+    // request that arrives mid-stroke and DecideIntent drops a swing through
+    // a drawn bow: the AI's own cadence clock has already advanced.
+    if (out.cast) distant_.Note(&DistantMobs::Stats::combatHolds);   // casters HOLD (5.3)
+    const bool armBusy = d.strokeEndTick != 0 || d.drawLooseTick != 0;
+    if (out.attack) {
+      // THE STYLE, as PickAttackStyle draws one: usable, reaching the
+      // request's distance with the body's slack, the fallback group dropped
+      // while a real style survives, the close style first inside its range.
+      const int si = d.hasKit && !armBusy
+                         ? distant::PickDistantStyle(d.kit, out.request.distance, d.id, tick)
+                         : -1;
+      if (si < 0) {
+        distant_.Note(&DistantMobs::Stats::strokesRefused);
+      } else {
+        const distant::DistantStyle& st = d.kit.styles[(size_t)si];
+        // THE IMPACT: the table's MEASURED ticks from a stroke's start to its
+        // first contact (which already holds the tempo and the injured arms of
+        // the fights it was measured in); the authored windup + half the cut
+        // where the table has no row.
+        const distant::StyleCalib& sc = cal.Style(st.name);
+        const int impact = std::max(
+            1, sc.impactTicks > 0.0f ? (int)std::lround(sc.impactTicks) : st.impactTicks);
+        d.strokeStyle = (uint32_t)si;
+        d.strokeTarget = out.request.targetId;
+        d.strokeStartTick = tick;
+        d.strokeImpactTick = tick + (uint32_t)impact;
+        d.strokeEndTick = tick + (uint32_t)std::max(impact + 1, st.totalTicks);
+        distant_.Note(&DistantMobs::Stats::strokes);
+      }
+    } else if (out.shoot) {
+      // THE DRAW (MobArcheryTick's BeginDraw): a bow in a fist and an arrow
+      // for it; the loose after the bow's windup + its pull x the profile's
+      // `draw`, then the profile's hold + a counter-based jitter.
+      if (!armBusy && d.hasKit && d.kit.ranged && d.ammo > 0 && d.bowHand >= 0 &&
+          out.shootRequest.targetId != 0) {
+        const ai::RangedTuning& rt = prof->ranged;
+        const int drawTo = d.bowWindupTicks +
+                           std::max(1, (int)std::lround((double)d.bowDrawTicks * (double)rt.draw));
+        const int hold =
+            (int)rt.holdTicks +
+            (rt.holdJitter > 0
+                 ? (int)(rng::Hash3((uint32_t)d.id ^ ai::kSaltDistantArrow, tick, 8u) %
+                         (rt.holdJitter + 1u))
+                 : 0);
+        d.drawStartTick = tick;
+        d.drawTarget = out.shootRequest.targetId;
+        d.drawLooseTick = tick + (uint32_t)std::max(1, drawTo + hold);
+        distant_.Note(&DistantMobs::Stats::draws);
+      } else {
+        distant_.Note(&DistantMobs::Stats::strokesRefused);
+      }
+    }
 
     // ---- STEER (the near tier's own function) ----
     d.steer.desiredHeading = out.desiredHeading;
@@ -1703,6 +2277,7 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
     // ANCHORED: it thinks and it turns, and it never moves (§2.4).
     if (d.groundMode == DistantGroundMode::Anchored) {
       nexts.push_back(nx);
+      nsMove += nsSince(tMove);
       continue;
     }
     float drive = out.driveScale, strafe = out.driveStrafe;
@@ -1735,13 +2310,11 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
         push.x += (dx / len) * w;
         push.z += (dz / len) * w;
       };
-      thread_local std::vector<uint64_t> near3;
-      distant_.Neighbourhood(d.cellX, d.cellZ, 1, near3);
-      for (const uint64_t oid : near3) {
-        if (oid == d.id) continue;
-        const size_t oi = indexOf(oid);
-        if (oi == SIZE_MAX || !snapAt(oi).valid) continue;
-        pushFrom(oid, snapAt(oi).base, snapAt(oi).radius);
+      for (const uint32_t oi : nbPool[neighbours(d.cellX, d.cellZ, 1)]) {
+        if (oi == i) continue;
+        const DistantSnap& s = snapAt(oi);
+        if (!s.valid) continue;
+        pushFrom(s.id, s.base, s.radius);
       }
       for (const ai::Actor& a : band)
         pushFrom(a.id, Vec3{a.centre.x, a.centre.y - a.height * 0.5f, a.centre.z}, a.radius);
@@ -1922,7 +2495,266 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
     d.steer.speedNow = dtStep > 0.0f ? nx.movedLen / dtStep : 0.0f;
     d.vel = dtStep > 0.0f ? Vec3{mdx / dtStep, 0.0f, mdz / dtStep} : Vec3{};
     nexts.push_back(nx);
+    nsMove += nsSince(tMove);
   }
+
+  // ==== THE IMPACT PASS (D2b, section 2.6) ======================================
+  //
+  // Every outcome due this tick is RESOLVED first -- each against its target as
+  // it stood at the start of the tick (the snapshot's positions and the hp no
+  // blow of this tick has touched yet) -- and only then APPLIED, in a fixed
+  // order: the swings and looses by attacker id, then the arrows landing in
+  // the order they were loosed. So two blows on one body, or two bodies
+  // trading blows on the same tick, come out the same whichever was stepped
+  // first: the resolver is pure (game/distant_combat.h) and nothing it reads
+  // is written until every roll is taken.
+  //
+  // D3's EDGE plugs in here: a target that is not a distant creature (a near
+  // one in the edge band) is counted `strokeNoTarget` / `arrowsLost` today;
+  // D3 turns that branch into the near-door hit (section 2.7).
+  const auto tCombat = Clock::now();
+  struct Blow {
+    size_t def;               // the defender's tier index
+    distant::StrikeOutcome o;
+  };
+  thread_local std::vector<Blow> blows;
+  thread_local std::vector<size_t> touched;
+  blows.clear();
+  touched.clear();
+  double hpDealt = 0.0;
+  auto planarDist = [](Vec3 a, Vec3 b) {
+    const float dx = a.x - b.x, dz = a.z - b.z;
+    return std::sqrt(dx * dx + dz * dz);
+  };
+  // ---- (a) the swings and the looses due, attacker by attacker -------------
+  for (const size_t i : due) {
+    DistantMob& a = distant_.At(i);
+    if (a.dead) continue;   // a landing killed it this tick
+    const DistantSnap& as = snapAt(i);
+    if (a.strokeImpactTick != 0 && a.strokeImpactTick <= tick) {
+      a.strokeImpactTick = 0;   // resolved, once: the arm stays busy to strokeEndTick
+      const size_t ti = indexOf(a.strokeTarget);
+      if (ti == SIZE_MAX || ti == i || !snapAt(ti).valid || !distant_.At(ti).hasKit ||
+          a.strokeStyle >= a.kit.styles.size()) {
+        distant_.Note(&DistantMobs::Stats::strokeNoTarget);
+      } else {
+        const DistantMob& t = distant_.At(ti);
+        LoadVitals(t, vit);
+        // Planar, as the AI's request distance and the reach it was drawn
+        // against are measured for walkers.
+        const distant::StrikeOutcome o =
+            distant::ResolveStrike(a.kit, t.kit, vit.limbHp, (int)a.strokeStyle,
+                                   planarDist(as.centre, snapAt(ti).centre), {a.id, tick}, cal,
+                                   gear);
+        switch (o.result) {
+          case distant::StrikeResult::Hit: distant_.Note(&DistantMobs::Stats::strokeHits); break;
+          case distant::StrikeResult::Miss: distant_.Note(&DistantMobs::Stats::strokeMisses); break;
+          case distant::StrikeResult::Blocked:
+            distant_.Note(&DistantMobs::Stats::strokeBlocked);
+            break;
+          case distant::StrikeResult::OutOfReach:
+            distant_.Note(&DistantMobs::Stats::strokeOutOfReach);
+            break;
+          case distant::StrikeResult::NoTarget:
+            distant_.Note(&DistantMobs::Stats::strokeNoTarget);
+            break;
+        }
+        if (o.hit) blows.push_back({ti, o});
+      }
+    }
+    if (a.drawLooseTick != 0 && a.drawLooseTick <= tick) {
+      a.drawLooseTick = 0;
+      const size_t ti = indexOf(a.drawTarget);
+      if (ti == SIZE_MAX || ti == i || !snapAt(ti).valid || !distant_.At(ti).hasKit ||
+          !a.kit.ranged || a.ammo <= 0) {
+        // THE STRING IS LET DOWN (StepDraw's "the target is gone"): the
+        // arrow stays in the kit.
+        distant_.Note(&DistantMobs::Stats::drawsAborted);
+      } else {
+        const DistantMob& t = distant_.At(ti);
+        const DistantSnap& ts = snapAt(ti);
+        LoadVitals(t, vit);
+        const Vec3 dv = ts.centre - as.centre;
+        DistantArrowFlight f;
+        f.out = distant::ResolveArrow(a.kit, t.kit, vit.limbHp, dv.len(),
+                                      std::sqrt(ts.vel.x * ts.vel.x + ts.vel.z * ts.vel.z),
+                                      {a.id, tick}, cal, gear);
+        f.shooter = a.id;
+        f.target = t.id;
+        f.looseTick = tick;
+        f.impactTick = tick + (uint32_t)std::max(1, f.out.flightTicks);
+        f.from = as.centre;
+        f.to = ts.centre;
+        f.ammo = a.kit.ammo;
+        distant_.ArrowsMut().push_back(std::move(f));
+        distant_.Note(&DistantMobs::Stats::looses);
+        a.ammo = std::max(0, a.ammo - 1);
+        a.kit.shots = std::max(0, a.kit.shots - 1);
+        if (a.ammo <= 0 || a.kit.shots <= 0) {
+          a.ammo = 0;
+          a.kit.ranged = false;
+          // THE LAST ONE: the sidearm comes out (DrawSidearm), into the bow's
+          // fist; the bow goes to the bag.
+          if (a.haveSidearm && a.bowHand >= 0) {
+            DistantMob::DistantHand& H = a.hands[a.bowHand];
+            H.weapon = true;
+            H.weaponStrike = a.sidearmStrike;
+            H.weaponName = a.sidearm;
+            a.bowHand = -1;
+            RearmHeld(a, a.sidearmReach, tick);
+            distant_.Note(&DistantMobs::Stats::sidearms);
+          }
+        }
+      }
+    }
+  }
+  // ---- (b) the arrows landing this tick, in the order they were loosed ------
+  {
+    std::vector<DistantArrowFlight>& arrows = distant_.ArrowsMut();
+    size_t keep = 0;
+    for (size_t k = 0; k < arrows.size(); k++) {
+      DistantArrowFlight& f = arrows[k];
+      if (f.impactTick > tick) {
+        if (keep != k) arrows[keep] = std::move(f);
+        keep++;
+        continue;
+      }
+      const size_t ti = indexOf(f.target);
+      if (ti == SIZE_MAX || !snapAt(ti).valid) {
+        // Not a living distant creature any more: dead, retired -- or
+        // promoted (D3 will hand this one to the near tier).
+        distant_.Note(&DistantMobs::Stats::arrowsLost);
+        continue;
+      }
+      if (!f.out.hit) {
+        distant_.Note(&DistantMobs::Stats::arrowMisses);
+        continue;
+      }
+      distant_.Note(&DistantMobs::Stats::arrowHits);
+      distant::StrikeOutcome o;
+      o.result = distant::StrikeResult::Hit;
+      o.hit = true;
+      o.limb = f.out.limb;
+      o.role = f.out.role;
+      o.hp = f.out.hp;
+      o.kind = distant::StrikeKind::Pierce;
+      o.cause = DamageCause::Pierce;
+      o.bleedAdded = f.out.bleedAdded;
+      blows.push_back({ti, o});
+    }
+    arrows.resize(keep);
+  }
+  // ---- (d) APPLY, in the order above -----------------------------------------
+  for (const Blow& b : blows) {
+    DistantMob& t = distant_.At(b.def);
+    catchUpStumps(t);   // a sleeper struck: what it bled asleep, first
+    if (t.dead || !t.hasKit) continue;
+    LoadVitals(t, vit);
+    distant::DistantDeath died = distant::ApplyStrike(vit, t.kit, b.o, cal);
+    // THE LIMB COMES OFF (D2b): the struck limb and all under it leave the
+    // body -- the kit stops striking and counting them, the record's limb is
+    // marked off for the promotion (Mob::ApplyDistantOverlay severs it for
+    // real), and the stump bleeds from now until death.
+    if (b.o.sever && died == distant::DistantDeath::None) {
+      thread_local std::vector<int> off;
+      died = distant::SeverLimb(vit, t.kit, b.o.limb, cal, &off);
+      for (const int li : off)
+        if ((size_t)li < t.limbRole.size()) t.limbRole[(size_t)li].flags &= ~kDistantLimbAttached;
+      distant_.Note(&DistantMobs::Stats::severs);
+    }
+    StoreVitals(vit, t);
+    hpDealt += b.o.hp;
+    if (b.o.limb >= 0 && b.o.bleedAdded > 0.0f) t.lastWoundLimb = (int16_t)b.o.limb;
+    // A BLOW WAKES (it could only land on a sleeper from an arrow out of the
+    // dark); the hurt is read by its own Think next step (Brain::prevHp).
+    if (t.asleep) {
+      t.asleep = false;
+      t.wakeTick = 0;
+      t.wakes++;
+      distant_.MarkAwakeHint();
+    }
+    touched.push_back(b.def);
+    if (died != distant::DistantDeath::None) kill(t, died);
+  }
+  // ---- (e) THE STATUSES: a tick of bleeding, a tick of burning ---------------
+  for (const size_t i : status) {
+    DistantMob& d = distant_.At(i);
+    if (d.dead) continue;
+    if (!d.hasKit) {
+      d.bloodLossPerTick = 0.0f;
+      d.burnTicksLeft = 0;
+      continue;
+    }
+    LoadVitals(d, vit);
+    if (vit.bleedRate > 0.0f || vit.stumps > 0) {
+      distant::StepBleed(vit, d.kit, cal);
+      distant_.Note(&DistantMobs::Stats::bleedTicks);
+    }
+    if (vit.dead == distant::DistantDeath::None && vit.burnTicksLeft > 0) {
+      distant::StepBurn(vit, d.kit, cal);
+      distant_.Note(&DistantMobs::Stats::burnTicks);
+    }
+    StoreVitals(vit, d);
+    d.statusTick = tick;
+    touched.push_back(i);
+    if (vit.dead != distant::DistantDeath::None) kill(d, vit.dead);
+  }
+  // ---- (f) A HAND TOO HURT TO HOLD ON lets go (Mob::GripFails) ---------------
+  // Below melee.injuredArmDrop of its arm chain's worst limb -- and above
+  // zero: GripFails' own window -- the weapon falls, and the held styles are
+  // thrown with the fist from then on (RearmHeld). The record still has the
+  // item in the hand; a promotion's first GripFails drops it again.
+  const float dropBelow = CurrentTuning().melee.injuredArmDrop;
+  if (dropBelow > 0.0f && !touched.empty()) {
+    std::sort(touched.begin(), touched.end());
+    touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+    for (const size_t i : touched) {
+      DistantMob& d = distant_.At(i);
+      if (d.dead || !d.hasKit) continue;
+      bool fell = false;
+      for (int hh = 0; hh < kHands; hh++) {
+        DistantMob::DistantHand& H = d.hands[hh];
+        // A PART OF THE ARM OFF (D2b): what the hand held left with it, and
+        // there is no fist on the end of it any more (NaturalWeaponUsable:
+        // a chain effector needs its whole chain).
+        bool chainOff = false;
+        for (const int16_t pp : H.parts)
+          chainOff = chainOff || (pp >= 0 && (size_t)pp < d.kit.limbs.size() &&
+                                  !d.kit.limbs[(size_t)pp].alive);
+        if (chainOff) {
+          if (H.weapon || H.fist || H.shield) {
+            if (d.bowHand == hh) {
+              d.bowHand = -1;
+              d.kit.ranged = false;
+              d.ammo = 0;
+              d.drawLooseTick = 0;
+            }
+            H.weapon = H.fist = H.shield = false;
+            fell = true;
+          }
+          continue;
+        }
+        if (!H.weapon) continue;
+        const float cnd = DistantHandCondition(d, hh);
+        if (cnd <= 0.0f || cnd >= dropBelow) continue;
+        H.weapon = false;
+        fell = true;
+        if (d.bowHand == hh) {
+          // The bow went with it: no more shots.
+          d.bowHand = -1;
+          d.kit.ranged = false;
+          d.ammo = 0;
+          d.drawLooseTick = 0;
+        }
+        distant_.Note(&DistantMobs::Stats::gripFails);
+      }
+      if (fell) RearmHeld(d, -1.0f, tick);
+    }
+  }
+  if (hpDealt > 0.0) distant_.Note(&DistantMobs::Stats::hpDealtMilli, (uint64_t)std::llround(hpDealt * 1000.0));
+  const auto tSleep = Clock::now();
+  const uint64_t nsCombat = (uint64_t)std::max<int64_t>(
+      0, std::chrono::duration_cast<std::chrono::nanoseconds>(tSleep - tCombat).count());
 
   // ---- PHASE 2: who falls asleep (tick-start state of everyone else) ----------
   // Before the moves are filed: a sleeper a mover then reaches is woken by
@@ -1933,14 +2765,25 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
       d.asleep = true;
       continue;
     }
-    if (nx.moved || d.landPending || d.brain.hasTarget || d.brain.hasThreat) continue;
-    if (d.strokeImpactTick != 0) continue;   // D2b: a swing in flight
+    const bool movedEnough = nx.moved && (nx.movedLen > kDistantSleepJitterVox ||
+                                          std::fabs(nx.origin.y - d.origin.y) > kDistantSleepJitterVox);
+    if (movedEnough || d.landPending || d.brain.hasTarget || d.brain.hasThreat) continue;
+    // D2b: never with a swing or a draw in flight, nor while a wound bleeds
+    // or a fire burns (both run out: a bleed decays, a fire has its ticks).
+    // AN OPEN STUMP bleeds until the creature is dead (near's rule, gore.
+    // stumpBleedsOpen) -- thousands of ticks for a survivor -- so it does NOT
+    // keep a body awake: it sleeps with a clock at the tick it bleeds out
+    // (stumpClock), and whatever wakes it first pays the ticks it slept
+    // through in one sum (catchUpStumps). Rule 2 for an open-ended status.
+    if (d.strokeEndTick != 0 || d.drawLooseTick != 0) continue;
+    if (d.bloodLossPerTick > 0.0f || d.burnTicksLeft > 0) continue;
     const ai::Profile* prof = behaviors_.At(d.brain.profile);
     // No mind: nothing near it can change what it does, so it sleeps now
     // (a stranger that wants it comes to it, and its arrival wakes it).
     if (prof == nullptr) {
       d.asleep = true;
       d.wakeTick = 0;
+      stumpClock(d);
       distant_.Note(&DistantMobs::Stats::sleeps);
       continue;
     }
@@ -1961,18 +2804,16 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
     bool threat = false;
     if (reachR > kDistantSleepMarginVox) {
       const int rc = (int)std::ceil(reachR / (float)DistantMobs::kCellVox);
-      distant_.Neighbourhood(d.cellX, d.cellZ, rc, ids);
       auto hostileAt = [&](Vec3 oc, uint32_t of, bool oh, float okeep) {
         if (of == selfFaction || !(oh || selfHostile)) return false;
         const float r = std::max(selfKeep, okeep) + kDistantSleepMarginVox;
         const float dx = oc.x - c.x, dz = oc.z - c.z;
         return dx * dx + dz * dz <= r * r;
       };
-      for (const uint64_t oid : ids) {
-        if (oid == d.id) continue;
-        const size_t oi = indexOf(oid);
-        if (oi == SIZE_MAX || !snapAt(oi).valid) continue;
+      for (const uint32_t oi : nbPool[neighbours(d.cellX, d.cellZ, rc)]) {
+        if (oi == nx.i) continue;
         const DistantSnap& o = snapAt(oi);
+        if (!o.valid) continue;
         if (hostileAt(o.centre, o.faction, o.hostile, o.keep)) {
           threat = true;
           break;
@@ -1987,13 +2828,19 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
     d.wakeTick = (d.brain.wanderOwned && d.brain.routine.active && d.brain.routine.hold)
                      ? std::max(d.brain.wanderPauseUntil, tick + 1)
                      : 0;
+    stumpClock(d);
     distant_.Note(&DistantMobs::Stats::sleeps);
   }
+  const auto tFile = Clock::now();
+  const uint64_t nsSleep = (uint64_t)std::max<int64_t>(
+      0, std::chrono::duration_cast<std::chrono::nanoseconds>(tFile - tSleep).count());
 
   // ---- PHASE 3: the moves, filed in id order (waking whom they reach) ---------
   for (const Next& nx : nexts) {
     DistantMob& d = distant_.At(nx.i);
-    if (!nx.moved) {
+    // One that died this tick falls where it stood at the start of it (its
+    // statue already rests there): the step it had decided is not taken.
+    if (!nx.moved || d.dead) {
       d.steer.speedNow = 0.0f;
       continue;
     }
@@ -2018,18 +2865,25 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
   }
   // The sleep summary the fast path reads: anyone left awake, and the
   // earliest clock among the sleepers (this tick's new ones included).
+  // Walked whole (a blow can wake a creature the stepping loop never saw).
   {
-    bool awake = anyAwake;
-    uint32_t nw = nextWake;
-    if (awake) {
-      awake = false;
-      for (const DistantMob& d : distant_.All()) {
-        if (d.dead) continue;
-        if (!d.asleep) awake = true;
-        else if (d.wakeTick != 0) nw = std::min(nw, d.wakeTick);
-      }
+    bool awake = false;
+    uint32_t nw = UINT32_MAX;
+    for (const DistantMob& d : distant_.All()) {
+      if (d.dead) continue;
+      if (!d.asleep) awake = true;
+      else if (d.wakeTick != 0) nw = std::min(nw, d.wakeTick);
     }
     distant_.SetSleepSummary(awake, nw);
   }
+  const uint64_t nsFile = nsSince(tFile);
+  distant_.Note(&DistantMobs::Stats::nsSetup, nsSetup);
+  distant_.Note(&DistantMobs::Stats::nsSelf, nsSelf);
+  distant_.Note(&DistantMobs::Stats::nsWorld, nsWorld);
+  distant_.Note(&DistantMobs::Stats::nsThink, nsThink);
+  distant_.Note(&DistantMobs::Stats::nsMove, nsMove);
+  distant_.Note(&DistantMobs::Stats::nsCombat, nsCombat);
+  distant_.Note(&DistantMobs::Stats::nsSleep, nsSleep);
+  distant_.Note(&DistantMobs::Stats::nsFile, nsFile);
   timeOut();
 }

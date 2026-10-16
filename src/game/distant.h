@@ -47,8 +47,21 @@
 // the near ones in the edge band -- never a player, §2.7), STEERS (SteerStep,
 // the very function the near tier turns with) and DRIVES over DistantGround
 // below, held at the promotion line while it waits; an idle one SLEEPS and
-// costs nothing. They do not fight yet (D2b): an attack / shoot / cast intent
-// is held. Fields D2b will drive are marked with their package.
+// costs nothing.
+//
+// D2b CREATURES FIGHT (the same TickDistant, an IMPACT PASS after the steps):
+// Think's `attack` starts an abstract swing (distant::PickDistantStyle) that
+// lands at the style's impact tick and is RESOLVED against the defender as it
+// stood at the start of that tick (distant::ResolveStrike: the guard roll,
+// the hit roll, the limb by role, the hp through the shell, the bleed), the
+// outcomes APPLIED in attacker-id order; `shoot` draws a bow for the bow's
+// own draw time and looses an abstract arrow (ResolveArrow at the loose,
+// applied at its flight's impact tick); `cast` is HELD (owner decision 5.3).
+// They bleed and burn every tick (StepBleed / StepBurn; awake while they do),
+// lose a weapon from a hand too hurt to hold it (melee.injuredArmDrop), die by
+// the near rules (DeathTest) and lie as dead DistantMobs -- asleep forever --
+// until a promotion brings them back as corpses through the record's dead
+// block. The kit and the statuses are on DistantMob (below).
 //
 // RULES (CLAUDE.md, §2.11-2.12):
 //   1. Deterministic. The container is a vector SORTED BY ID and every walk is
@@ -76,6 +89,7 @@
 
 #include "game/ai_behavior.h"  // ai::Brain
 #include "game/anim.h"         // LocomotionDef
+#include "game/distant_combat.h"  // DistantKit, the abstract hit model (D2a, driven by D2b)
 #include "game/distant_draw.h" // DistantLookKey, DistantDrawItem (the statues, D4a)
 #include "game/steer.h"        // SteerState
 #include "math3d.h"
@@ -379,11 +393,78 @@ struct DistantMob {
   // demotion (bloodless kept, unspent). Severed limbs carry their record hp.
   std::vector<float> limbHp;
   std::vector<DistantLimbRole> limbRole;
-  // D2b: written by nobody in D0.
-  float bloodLossPerTick = 0.0f;  // cuts taken while distant; decays
-  uint16_t burnTicksLeft = 0;     // a burning demotion keeps burning abstractly
-  uint32_t strokeImpactTick = 0;  // an abstract swing in progress (0 = none)
-  uint32_t strokeStyle = 0;
+
+  // ---- D2b: THE ABSTRACT FIGHTER (section 2.6; game/distant_combat.h) -----
+  // THE KIT, built from the live rig at demotion BEFORE ReleaseRig
+  // (distant::BuildDistantKit): the styles it can swing and what each lands
+  // with, what it holds up (guard class), its BASE limbs' roles / vitality /
+  // authored hp / the shell over each, its bow. The tier's own copy -- a grip
+  // that fails or an archer's sidearm edits it (RearmHeld). Index-parallel to
+  // the first kit.limbs.size() entries of `limbHp` (the record writes every
+  // base limb first). `hasKit` false: a corpse, or a body with no def.
+  distant::DistantKit kit;
+  bool hasKit = false;
+  // THE FISTS (Mob::GripFails' rule, melee.injuredArmDrop): per hand
+  // (HandIndex), the base limbs of the arm chain that serves it (Mob::
+  // HandCondition's parts), what it held at demotion, and the fist it punches
+  // with once it is empty (Mob::HandFist; its reach is the chain's live bone
+  // length, MobSystem::StyleReachOn's fist term).
+  struct DistantHand {
+    int16_t parts[4] = {-1, -1, -1, -1};
+    bool weapon = false;     // a weapon (not a shield) in this fist
+    bool shield = false;     // a shield in it
+    bool fist = false;       // a usable natural fist (Mob::NaturalWeaponUsable)
+    StrikeProfile weaponStrike;
+    std::string weaponName;
+    StrikeProfile fistStrike;
+    std::string fistName;
+    float fistReach = 0.0f;
+  };
+  DistantHand hands[2];
+  // THE SIDEARM (game/mob_archery.cpp DrawSidearm): the weapon in an archer's
+  // sheath, drawn into the bow hand when the last arrow is loosed.
+  bool haveSidearm = false;
+  StrikeProfile sidearmStrike;
+  std::string sidearm;
+  float sidearmReach = 0.0f;
+  // THE BOW's full draw in ticks (ItemDef::BowSpec windupTicks + drawTicks):
+  // a shoot request's loose comes this long (x the profile's `draw`, plus its
+  // hold) after it, as MobArcheryTick's BeginDraw times it. `bowHand` is the
+  // fist that holds it (HandIndex; -1 = no bow).
+  int bowWindupTicks = 0, bowDrawTicks = 0;
+  int8_t bowHand = -1;
+
+  // ---- the statuses (distant::DistantVitals' fields, carried here) --------
+  float bloodLossPerTick = 0.0f;  // the bleed RATE, hp/tick; decays by bleed.decay
+  uint16_t burnTicksLeft = 0;     // > 0 while the body burns (abstractly)
+  float burnFrac = 0.0f;          // burnt surface fraction (Mob::BurnFraction)
+  // Open stumps: limbs SEVERED at this tier (distant::SeverLimb), each
+  // draining distant::SeverCalib::stumpHpPerTick until death. The limbs
+  // themselves are marked off in kit.limbs[i].alive and in limbRole's
+  // kDistantLimbAttached flag; Mob::ApplyDistantOverlay severs them for real
+  // at promotion (the near stump then bleeds on by its own rule).
+  uint8_t stumps = 0;
+  // The last tick its statuses were stepped (0 = never). A creature whose
+  // only status is open stumps may SLEEP (its wake clock is the tick it bleeds
+  // out); when it next wakes, the ticks it slept through are paid in one sum
+  // (distant::StepStumps), so sleeping changes when the cost is paid, not
+  // what it is.
+  uint32_t statusTick = 0;
+  // The base limb the latest cut landed on: a promotion that is still
+  // bleeding re-opens its owed blood THERE (Mob::ApplyDistantOverlay).
+  int16_t lastWoundLimb = -1;
+  // ---- a stroke in flight (PickDistantStyle at the request) ----------------
+  uint32_t strokeImpactTick = 0;  // the tick it lands (0 = none pending)
+  uint32_t strokeStyle = 0;       // index into kit.styles
+  uint32_t strokeStartTick = 0;
+  uint32_t strokeEndTick = 0;     // busy (no new swing, no draw) until this tick
+  uint64_t strokeTarget = 0;
+  // ---- a bow drawn (MobArcheryTick's BeginDraw, abstractly) ---------------
+  uint32_t drawLooseTick = 0;     // the tick it looses (0 = not drawing)
+  uint32_t drawStartTick = 0;
+  uint64_t drawTarget = 0;
+  // How it died at this tier (distant::DistantDeath; 0 = alive or demoted dead).
+  uint8_t deathKind = 0;
 
   // ---- life + sleep ---------------------------------------------------------
   bool dead = false;
@@ -404,6 +485,22 @@ struct DistantMob {
                 origin.z + worldSize.z * 0.5f};
   }
   DistantOverlay Overlay() const;
+};
+
+// ---- an arrow in the air between two distant creatures (section 2.6) --------
+//
+// RESOLVED AT THE LOOSE (distant::ResolveArrow: the hit roll, the limb, the
+// hp, against the target as it stood at the start of that tick) and APPLIED
+// at `impactTick` (ApplyArrow), when it is still a distant creature. `from` /
+// `to` are the two body centres at the loose: render-only, the arc a statue
+// archer's arrow is drawn on (AppendDistantArrowBodies). Never hashed, never
+// saved (a save loses an arrow in the air, as a near save does).
+struct DistantArrowFlight {
+  uint64_t shooter = 0, target = 0;
+  uint32_t looseTick = 0, impactTick = 0;
+  Vec3 from{}, to{};
+  std::string ammo;              // the item drawn in flight (its micro model)
+  distant::ArrowOutcome out;
 };
 
 // ---- the container ----------------------------------------------------------
@@ -456,6 +553,45 @@ class DistantMobs {
     uint64_t snaps = 0;          // promotions snapped onto the real ground
     uint64_t snapMisses = 0;     // ...that found no ground within the bound
     uint64_t snapErrQ = 0;       // the worst snap |dy| seen, in 1/16 voxel
+    // ---- D2b: the fight (MobSystem::TickDistant's impact pass) --------------
+    uint64_t strokes = 0;          // abstract swings started
+    uint64_t strokesRefused = 0;   // attack / shoot intents that started nothing: the arm
+                                   // busy, no style reaches, no bow or arrow
+    uint64_t strokeHits = 0;       // ...landed (ResolveStrike: Hit)
+    uint64_t strokeMisses = 0;     // ...Miss
+    uint64_t strokeBlocked = 0;    // ...Blocked (the defender's guard roll)
+    uint64_t strokeOutOfReach = 0; // ...the target stepped out of reach + slack
+    uint64_t strokeNoTarget = 0;   // ...the target was dead, gone, or not distant (D3's edge)
+    uint64_t draws = 0;            // bows drawn
+    uint64_t drawsAborted = 0;     // ...let down: the target gone at the loose
+    uint64_t looses = 0;           // arrows loosed (ResolveArrow)
+    uint64_t arrowHits = 0;        // ...that hit at their impact tick
+    uint64_t arrowMisses = 0;      // ...that missed
+    uint64_t arrowsLost = 0;       // ...whose target was not a distant creature at impact
+    uint64_t deaths = 0;           // creatures that died at this tier (landings excluded)
+    uint64_t deathsVital = 0;      // ...a vital / root limb at zero
+    uint64_t deathsBlood = 0;      // ...bled white
+    uint64_t deathsBurns = 0;      // ...burnt past the cap
+    uint64_t gripFails = 0;        // a weapon dropped from a hand too hurt to hold it
+    uint64_t severs = 0;           // limbs cut off at this tier (with all under them)
+    uint64_t sidearms = 0;         // an archer out of arrows drew its sidearm
+    uint64_t bleedTicks = 0;       // creature-ticks of StepBleed
+    uint64_t burnTicks = 0;        // creature-ticks of StepBurn
+    uint64_t relit = 0;            // promotions that came back burning (IgniteLimb)
+    uint64_t rebled = 0;           // promotions that came back bleeding
+    uint64_t hpDealtMilli = 0;     // life hp the blows and arrows took, x1000
+    // ---- D2b: WHERE THE TIME GOES (section 2.11), ns -- MEASUREMENTS, never an
+    // input to anything. Inside TickDistant, summed over every call:
+    uint64_t nsSetup = 0;          // the band, who steps, the snapshot
+    uint64_t nsSelf = 0;           // per step: SelfView + the ground fan + water
+    uint64_t nsWorld = 0;          // per step: the actor list (hash + band)
+    uint64_t nsThink = 0;          // per step: ai::Think (A* included)
+    uint64_t nsMove = 0;           // per step: steer + spacing + drive
+    uint64_t nsCombat = 0;         // the impact pass + the statuses + deaths
+    uint64_t nsSleep = 0;          // phase 2 (the sleep test)
+    uint64_t nsFile = 0;           // phase 3 (refile, latches, summary)
+    uint64_t stepsEngaged = 0;     // steps of creatures with a target / threat / swing
+    uint64_t actorCaps = 0;        // steps whose actor list was cut to kDistantActorsMax
     uint32_t peak = 0;           // the most creatures the tier ever held at once
   };
 
@@ -563,6 +699,13 @@ class DistantMobs {
   }
   void RefreshNextWake();
 
+  // ---- ARROWS IN THE AIR (D2b) ------------------------------------------------
+  // In LOOSE order (tick, then the shooter's id): the impact pass appends at
+  // the loose and applies + erases at the impact tick. Cleared with the tier.
+  // A gate that rewinds the tier (Erase + Insert) clears these too.
+  const std::vector<DistantArrowFlight>& Arrows() const { return arrows_; }
+  std::vector<DistantArrowFlight>& ArrowsMut() { return arrows_; }
+
   const Stats& GetStats() const { return stats_; }
   // Bump one counter here AND in DistantRunTotals().
   void Note(uint64_t Stats::*field, uint64_t n = 1);
@@ -577,6 +720,7 @@ class DistantMobs {
   Stats stats_;
   // The hash: packed cell -> ids filed there, ascending.
   std::unordered_map<uint64_t, std::vector<uint64_t>> cells_;
+  std::vector<DistantArrowFlight> arrows_;
   uint32_t nextWakeTick_ = UINT32_MAX;
   bool anyAwakeHint_ = false;
   static uint64_t CellKey(int cx, int cz) {
@@ -593,9 +737,21 @@ class DistantMobs {
 const DistantMobs::Stats& DistantRunTotals();
 
 // THE STATUES' ITEM LIST (D4a's seam, game/distant_draw.h): one DistantDrawItem
-// per distant creature that has a baked look -- WALK while it moved within its
-// last stride (WalkA / WalkB on its gait phase), IDLE otherwise, the dead
-// lying at their statue's rest height. `out` is cleared first. Render-only:
-// the frame loop calls it before DistantDraw::Produce.
+// per distant creature that has a baked look -- STRIKE while an abstract
+// swing is in flight (D2b), WALK while it moved within its last stride (WalkA
+// / WalkB on its gait phase), IDLE otherwise, the dead lying at their
+// statue's rest height. `out` is cleared first. Render-only: the frame loop
+// calls it before DistantDraw::Produce.
 void FillDistantDrawItems(const DistantMobs& tier, uint32_t tick, int idleStride,
                           std::vector<DistantDrawItem>& out);
+
+struct ItemLibrary;
+struct RenderOnlyBody;
+// THE ARROWS IN THE AIR between distant creatures (D2b), as render-only
+// bodies on their arc: the ammo item's own micro model (game/arrows.cpp's
+// ArrowXf placement), from the shooter's centre to the target's over the
+// flight's ticks, lifted by the drop gravity would give that flight, at the
+// frame's tick interpolation. Appended to `out`. Render-only, never hashed.
+void AppendDistantArrowBodies(const DistantMobs& tier, const ItemLibrary& items,
+                              uint32_t tick, float tickAlpha,
+                              std::vector<RenderOnlyBody>& out);

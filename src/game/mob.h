@@ -7216,8 +7216,16 @@ class MobSystem {
   // behaviour library is. A live stroke keeps the style INDEX it started with,
   // which is safe for the same reason a live Brain keeps its profile index
   // between reloads: both are re-resolved on the next attack.
-  void SetAttackStyles(StyleLibrary lib) { styles_ = std::move(lib); }
+  // ...and with them the DISTANT TIER'S CALIBRATION (game/distant_combat.h,
+  // assets/mobs/distant_combat.json): the table is measured FROM these styles
+  // (`distant-calib-matrix`), so it is (re)read wherever they are -- the
+  // load, the selftest boot, the R reload. A missing or bad file is the
+  // builtin table, said once on stderr; nothing is fatal.
+  void SetAttackStyles(StyleLibrary lib);
   const StyleLibrary& AttackStyles() const { return styles_; }
+  const distant::DistantCalib& DistantCalibration() const { return distantCalib_; }
+  // A gate's own table (or the file's again). Kits already built keep theirs.
+  void SetDistantCalibration(distant::DistantCalib c) { distantCalib_ = std::move(c); }
 
   // ---- DRIVING A SWING BY HAND --------------------------------------------
   //
@@ -8033,7 +8041,8 @@ class MobSystem {
   //      corpse (section 2.7), whatever the caller hands in -- line of sight
   //      and aimPart null (open-field sight: hills do not block at this
   //      tier), and a NavProbe over DistantGround capped at the profile's
-  //      navRadius. Attack / shoot / cast intents are HELD (D2b).
+  //      navRadius. An `attack` starts an abstract swing, a `shoot` draws a
+  //      bow (D2b, below); a `cast` is HELD (owner decision 5.3).
   //   2. STEER: SteerStep, the near tier's own function.
   //   3. SPACE: the near crowd's spacing (LocomotionDef::spacingMul) over the
   //      same neighbourhood.
@@ -8042,11 +8051,19 @@ class MobSystem {
   //      body's own climb / drop budgets; a fish only onto water; never deeper
   //      over the PROMOTION LINE once over it (a waiting creature is held
   //      there, section 2.1); an ANCHORED creature never drives.
+  // Then THE IMPACT PASS (D2b, section 2.6), every creature in id order: a
+  // swing whose impact tick this is resolves against its defender's
+  // tick-start snapshot (ResolveStrike), a drawn bow due looses (ResolveArrow
+  // -> an arrow in the air), an arrow due lands; the outcomes are applied in
+  // that order (attacker id, then the arrows in loose order), then every
+  // bleeding / burning creature takes its tick (StepBleed / StepBurn), a hand
+  // too hurt drops its weapon, and the dead become dead DistantMobs.
   // Then the hash is refiled (waking the sleepers a mover reached), the
   // border latches set for a creature that ended over a border, and every
-  // stepped creature that has nothing to do falls asleep. Reads only
-  // tick-start state of other creatures (a snapshot), so the order it steps
-  // them in cannot change any outcome. Emits NO ops, ever.
+  // stepped creature that has nothing to do falls asleep (never one with a
+  // swing, a draw, a bleed or a burn on it). Reads only tick-start state of
+  // other creatures (a snapshot), so the order it steps them in cannot change
+  // any outcome. Emits NO ops, ever.
   // `nearActors` may be null (a gate's CPU-only arm).
   void TickDistant(uint32_t tick, World& world,
                    const std::vector<ai::Actor>* nearActors);
@@ -10068,6 +10085,8 @@ class MobSystem {
   // ---- D1: the distant tick's own state (distant.cpp) ----------------------
   DistantGround distantGround_;
   DistantDraw* distantDraw_ = nullptr;
+  // ---- D2b: the abstract hit model's table (SetAttackStyles loads it) -------
+  distant::DistantCalib distantCalib_;
   // The near creatures of the edge band as the distant hash last saw them
   // (id -> cell), so one that MOVED INTO a sleeper's neighbourhood wakes it
   // the way a distant mover does. Sorted by id.

@@ -21110,6 +21110,9 @@ int main(int argc, char** argv) {
       static std::vector<RenderOnlyBody> flightBodies;
       flightBodies.clear();
       tickCtx.arrows.AppendRenderBodies(items, tickAlpha, flightBodies);
+      // ...and the ABSTRACT ones between distant creatures (D2b), on their
+      // arc from the statue archer to its mark (game/distant.h).
+      AppendDistantArrowBodies(mobs.Distant(), items, tick, tickAlpha, flightBodies);
       // THE DRAWN BOWS (game/arrows.h PresentDrawnBow): the string pulled
       // back to the hand and the arrow nocked on it, every creature drawing
       // one (the player, an NPC archer), off the pose this frame draws.
