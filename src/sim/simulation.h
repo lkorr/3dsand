@@ -1306,6 +1306,8 @@ class Simulation {
   // Streams become held (sim_stream.wgsl `scan` / `commit`; DESIGN.md §5b.13).
   rhi::ComputePipeline streamScan_;
   rhi::ComputePipeline streamCommit_;
+  rhi::ComputePipeline streamClear_;   // `clearStreams`: the load reset's
+                                       // (pass_table.def lr_streamClear)
   // Ticks the fold keeps recording after the last tick anything fed it
   // (EncodeTick), and whether the last tick recorded it (so the tick after
   // the tail records the one Fill that zeroes the published field).

@@ -25131,7 +25131,10 @@ port, `scripts/test_riverbake.mjs` holds them equal). The `stepVox` staircase is
 unchanged; every step of at most `kRiverWaterfall` (2 m) is SOFT and the surface
 ramps down to it in eighths over at most `kRiverRampVox` (48) of arc per voxel of
 drop. Only a drop over 2 m stays a hard step — a waterfall. `kS_RivSurf` is T8 at
-end A, `kS_RivLipY` the lip Y (i16) and the fall A -> B in eighths (u16).
+end A, `kS_RivLipY` the lip Y (i16) and the fall A -> B in eighths (u16). A
+reach's last piece ends at the cut sample (the first of the reach below) on the
+reach's OWN surface: lerping to the lower one dug a pit as deep as the fall in
+front of every crest (fixed in the 2026-10-16 audit; `rivers` B checks it).
 
 **`waterApply`** (GPU and CPU twin, per voxel equal — `rivers` D): channel water
 is the NEAREST claiming piece's surface (not the lowest: short ramp pieces of
@@ -25157,11 +25160,20 @@ adopted column of hop h — with an open way in) is adopted at its surface, hop 
 h + 1. One writer per column (the topmost dirty chunk of its window stack),
 neighbours read only from committed words. An adopted column visited and no
 longer fed by a SMALLER hop is released: a plugged mouth drains its stream from
-the top down. Derived, not saved; dense worldgen clears it.
+the top down. So is one a basin has DROWNED (a leaky count of visits over its
+target, released at 4000, sixteen times faster a voxel or more over: a slowly
+filling basin adopted part way up would otherwise be a source and a sink for
+ever; slow, because a stream's mouth sinks the stream's water exactly so until
+the stream above it is adopted). Derived, not saved; dense worldgen
+clears it, and so does a load (`clearStreams`, PT_LOADRESET: the load's
+streamed refill keeps a stream while its column's tag is unchanged).
 
-**The look** (`raymarch.wgsl`): every SIDE face of water is a falling sheet
-(`fallingSheet`: vertical whitewater streaks scrolling down at 3.2 m/s) — a held
-curtain, a rapid's step and a CA spill in flight all read as water going down;
+**The look** (`raymarch.wgsl`): a SIDE face of water where the water outside
+drops away by 0.75 cell or more is a falling sheet (`fallingSheet`: vertical
+whitewater streaks scrolling down at 3.2 m/s) — a held curtain, a rapid's step
+and a CA spill in flight all read as water going down; a smaller step is a
+RISER, lit as top; a face with a solid in front (glass, ice) stays a plain wall
+(`waterSideKind`);
 `fallCueAt` gives a held curtain the waterfall mist and its foot the plunge
 spray; `gSlopeFlow` turns the surface's own slope into a current for the streaks
 and foam lines, so a held ramp or an adopted stream runs visibly.

@@ -376,6 +376,22 @@ Status GateRivers(Ctx& c, std::string& detail) {
           break;
         }
     }
+    // ...and a reach ENDS on its own surface: the last piece before a
+    // waterfall's cut stands at the crest's level there (the next piece's lip),
+    // not at the reach below -- lerping to that dug a pit as deep as the fall
+    // in front of every crest (worldwater.cpp step 9).
+    int pits = 0, fallEnds = 0;
+    for (size_t i = 0; i + 1 < on.sites.size(); i++) {
+      const auto& st = on.sites[i];
+      const auto& nx = on.sites[i + 1];
+      if (st.kind != worldmap::kSiteRiver || nx.kind != worldmap::kSiteRiver || st.water != nx.water) continue;
+      if ((st.wflags & worldmap::kRivFlatB) == 0 || (nx.wflags & worldmap::kRivFlatA) == 0) continue;
+      fallEnds++;
+      if (((st.surfB - 1) >> 3) != nx.lipY && !pits++)
+        why += Format(" %s: piece %s ends at %d/8 (top cell %d) before a fall whose crest is y%d",
+                      on.rivers[static_cast<size_t>(st.water)].id.c_str(), st.id.c_str(), st.surfB, (st.surfB - 1) >> 3, nx.lipY);
+    }
+    notFlat += pits;
     // The junction: falls' last surface >= main's surface at its nearest sample.
     int mainAtJoin = 0;
     {
@@ -391,11 +407,12 @@ Status GateRivers(Ctx& c, std::string& detail) {
     // gate's claim; here the road crosses a river, whose channel is not road).
     const auto& rd = on.roads.at(0);
     const bool roadOk = rd.smooth && rd.points.size() > 3 && rd.worstGradeQ8 <= rd.maxGrade * 256 + 64;
-    const bool bOk = nonMono == 0 && notFlat == 0 && joinOk && creekOk && roadOk;
-    std::printf("rivers: B bake: %s (surfaces monotone: %d rises; pieces on the profile: %d off; junction falls %d >= main %d; creek "
+    const bool bOk = nonMono == 0 && notFlat == 0 && fallEnds > 0 && joinOk && creekOk && roadOk;
+    std::printf("rivers: B bake: %s (surfaces monotone: %d rises; pieces on the profile: %d off, %d of %d reach ends "
+                "before a fall off their own surface; junction falls %d >= main %d; creek "
                 "ends at %d, the lake's level %d; smooth road %zu vertices, baked grade %.2f %% <= %d %%)%s\n",
-                bOk ? "PASS" : "FAIL", nonMono, notFlat, rFalls->line.back()[2], mainAtJoin, rCreek->line.back()[2], lakeLevel,
-                rd.points.size(), rd.worstGradeQ8 / 256.0, rd.maxGrade, why.c_str());
+                bOk ? "PASS" : "FAIL", nonMono, notFlat, pits, fallEnds, rFalls->line.back()[2], mainAtJoin,
+                rCreek->line.back()[2], lakeLevel, rd.points.size(), rd.worstGradeQ8 / 256.0, rd.maxGrade, why.c_str());
     if (!bOk) problems.push_back("B: bake" + why);
   }
 
@@ -1023,15 +1040,24 @@ Status GateRivers(Ctx& c, std::string& detail) {
           for (int y = fy - 1; y <= fy + 3; y++)
             byChunks.insert(World::SlotChunkIndex(IVec3{xz.first >> 4, y >> 4, xz.second >> 4}));
         }
-        // The still table's dynamic words for the channel's columns.
+        // The still table's dynamic words for the channel's columns. `floodMax`:
+        // the highest FLOOD COUNT among the adopted ones (sim_stream.wgsl, [3]
+        // bits 12..23, released at 4000) -- the reporter for a column that
+        // stands over its target (a release by flood names itself here, not as
+        // a bare drop in the adopted count).
         const rhi::Buffer& still = c.sim.StillWaterBuffer();
+        uint32_t floodMax = 0;
         auto adoptedCount = [&]() {
           std::vector<uint32_t> tab(size_t(kWorldN) * kWorldN * 4u);
           rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, still, 0, tab.data(), tab.size() * 4, "riversStill");
           int k = 0;
+          floodMax = 0;
           for (const auto& xz : byCols) {
             const size_t si = (size_t(xz.second & int(kWorldN - 1)) * kWorldN + size_t(xz.first & int(kWorldN - 1))) * 4u;
-            if (tab[si + 2] != 0u) k++;
+            if (tab[si + 2] != 0u) {
+              k++;
+              floodMax = std::max(floodMax, (tab[si + 3] >> 12) & 4095u);
+            }
           }
           return k;
         };
@@ -1062,14 +1088,22 @@ Status GateRivers(Ctx& c, std::string& detail) {
         const int streamTicks = static_cast<int>(BaselineNumber("rivers.streamTicks", 1800));
         std::string curve;
         int wet = 0, adopted = 0, awake = 0;
+        // FLAPPING: the columns the adopted count LOSES between samples while
+        // the stream runs. Adoption runs from the source down and nothing is
+        // plugged yet, so a drop is a release cascade (one release cascades
+        // down the whole stream) -- measured monotone (0 lost) when it works;
+        // a first cut of the flood release took it to 22, 45, 27, 15, 69, 12 ...
+        int lost = 0;
         for (int k = 1; k < streamTicks; k++) {
           tick();
           if (k % 150 == 0) {
             c.ctx.WaitIdle();
             wet = wetCount();
+            const int prevAdopted = adopted;
             adopted = adoptedCount();
+            lost += std::max(0, prevAdopted - adopted);
             awake = awakeOn();
-            curve += Format(" %d:%d/%d/%d", k, wet, adopted, awake);
+            curve += Format(" %d:%d/%d/%d/%u", k, wet, adopted, awake, floodMax);
           }
         }
         c.ctx.WaitIdle();
@@ -1100,17 +1134,18 @@ Status GateRivers(Ctx& c, std::string& detail) {
         const double adoptMin = BaselineNumber("rivers.streamAdoptMin", 0.5);
         const int awakeMaxS = static_cast<int>(BaselineNumber("rivers.streamAwakeMax", 2));
         const double releaseMax = BaselineNumber("rivers.streamReleaseMax", 0.2);
+        const double flapMax = BaselineNumber("rivers.streamFlapMax", 0.1);
         const bool sOk = nBy > 50 && wet >= nBy / 2 && adopted >= static_cast<int>(adoptMin * nBy) && awake <= awakeMaxS &&
-                         adoptedAfter <= static_cast<int>(releaseMax * nBy);
+                         lost <= static_cast<int>(flapMax * nBy) && adoptedAfter <= static_cast<int>(releaseMax * nBy);
         std::printf("rivers: S stream held: %s (channel %d columns: after %d ticks %d wet, %d adopted (>= %.2f), %d of its "
-                    "%zu chunks awake (<= %d); plugged, %d ticks on: %d adopted (<= %.2f), %d wet; tick:wet/adopted/awake%s; "
-                    "after the plug tick:wet/adopted%s)\n",
-                    sOk ? "PASS" : "FAIL", nBy, streamTicks, wet, adopted, adoptMin, awake, byChunks.size(), awakeMaxS,
-                    drainTicks, adoptedAfter, releaseMax, wetAfter, curve.c_str(), curve2.c_str());
+                    "%zu chunks awake (<= %d), %d released while running (<= %.2f); plugged, %d ticks on: %d adopted "
+                    "(<= %.2f), %d wet; tick:wet/adopted/awake/floodMax%s; after the plug tick:wet/adopted%s)\n",
+                    sOk ? "PASS" : "FAIL", nBy, streamTicks, wet, adopted, adoptMin, awake, byChunks.size(), awakeMaxS, lost,
+                    flapMax, drainTicks, adoptedAfter, releaseMax, wetAfter, curve.c_str(), curve2.c_str());
         RecordObserved("rivers.observedStreamAdopted", std::to_string(adopted));
         if (!sOk)
-          problems.push_back(Format("S: channel %d cols, %d wet, %d adopted, %d awake; after plug %d adopted", nBy, wet, adopted,
-                                    awake, adoptedAfter));
+          problems.push_back(Format("S: channel %d cols, %d wet, %d adopted, %d awake, %d released while running; after plug "
+                                    "%d adopted", nBy, wet, adopted, awake, lost, adoptedAfter));
       }
       weather::SetOverride(prevPin);
       if (!gOk) problems.push_back(Format("G: %u chunks awake after %d ticks (%d at the water)", active, ticks, nearWater));

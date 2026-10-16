@@ -50,22 +50,59 @@
 // stream from the top down: the released water is ordinary water, it flows
 // into the next held column as water over its target, that wakes it, and it
 // finds its own support gone.
+// FLOODED (2026-10-16 audit): an adopted column that has stood OVER its
+// target long enough is released too -- a leaky count, +1 a visit its water
+// stands over the target, +STREAM_FLOOD_DEEP a visit it stands more than a
+// voxel over, -1 a visit it does not, released at STREAM_FLOOD_COUNT. The
+// steady test cannot tell a stream from a basin filling slowly (a big hollow
+// a breach fills at under a voxel per STREAM_ADOPT_TICKS), so a column of
+// such a basin is adopted part way up; the basin then rises past that target,
+// and its water, fed for ever through the breach, ran into the column and
+// back to the reservoir (GIVE) for ever -- a source and a sink with a chunk
+// awake between them (rule 2). Released, the basin rises to its feeder's
+// level and sleeps (or is adopted there, at the level it actually holds).
+// WHY SO SLOW, measured: at a count of 120 the `rivers` S stream flapped --
+// 22, 45, 27, 15, 69, 12, 112 ... of 153 columns adopted, instead of 6, 28,
+// 46 ... 153 -- because a column of a stream that is STILL BEING ADOPTED
+// stands over its target for as long as the unadopted water upstream of it
+// still runs into it (GIVE drains it, the running water refills it), which
+// is the source-and-sink pattern exactly, only transient; and one release
+// cascades down the whole stream. The gate's reporter (S's floodMax) shows
+// it: the largest count among the adopted columns climbs ONE A VISIT from
+// tick 150, when the first six are adopted (the columns at the river's
+// level, which the river feeds and the stream drains into), to 912 at tick
+// 1050, when the last column adopts and the stream stops running, then
+// falls. A stream of a thousand columns would take the mouth past 4000 and
+// release it -- harmless: nothing upstream rests on the mouth's support, so
+// it releases alone and is adopted again. So a shallow flood takes
+// STREAM_FLOOD_COUNT visits (about a minute) and only a deep one -- a voxel
+// or more over its target, which running water arriving at reach 1 did not
+// do in S (the count never stepped by STREAM_FLOOD_DEEP) -- is fast. Either
+// way the source and the sink are BOUNDED, which they were not.
 //
 // RULE 1. ONE WRITER PER COLUMN: only the topmost dirty chunk of a column's
 // window stack acts for it (the stack above it is asleep by construction).
 // Kernel `scan` reads neighbours' COMMITTED targets (word [2]) and writes only
 // its own column's word [3] (observation, age, and a pending action); kernel
-// `commit`, after a barrier, applies its own column's action to word [2]. So
-// no thread ever reads a word another thread writes in the same kernel, and
-// every decision is a function of the voxels after the CA and the committed
-// table -- the order threads run in cannot matter.
+// `commit`, after a barrier, applies its own column's action to word [2]. The
+// ONE word a scan thread reads that another may be writing is an adopted
+// neighbour's [3], for its liquid -- and scan never changes an adopted [3]'s
+// low 12 bits (only the flood count above them and the action), so whichever
+// value the read sees, the liquid is the same. Every decision is a function
+// of the voxels after the CA and the committed table -- the order threads run
+// in cannot matter.
 // RULE 2. A column is visited only while its chunk is dirty; adoption only
-// ever ADDS held columns, release only removes ones whose support is gone,
-// and nothing here writes a voxel, so this pass cannot keep anything awake.
+// ever ADDS held columns, release only removes ones whose support is gone or
+// that a basin has drowned, and nothing here writes a voxel, so this pass
+// cannot keep anything awake.
 // Derived, not saved: a reloaded stream runs as water and is adopted again.
 // Dense worldgen clears the whole table (pass_table.def fill_stillWater); a
+// LOAD clears the dynamic words (`clearStreams`, pass_table.def
+// lr_streamClear -- the load refills the window through the streamed path,
+// and a window loaded where the old one stood has every tag unchanged); a
 // streamed window column keeps its dynamic words only while its tag (the
-// world column) is unchanged (worldgen.wgsl cols).
+// world column) is unchanged (worldgen.wgsl cols), which a vertical window
+// shift, regenerating every column, must not cost the streams.
 
 @group(0) @binding(0) var<storage, read_write> voxels   : array<u32>;
 @group(0) @binding(1) var<storage, read>       dirtyIn  : array<u32>;
@@ -101,14 +138,20 @@ const STREAM_SCAN : i32 = 32;
 //       one and the map's water that feeds it. 0 = not adopted.
 //   [3] not adopted: the observed surface (20 bits) | age << 20 (10 bits) |
 //       the pending action << 30. Adopted: the liquid's material (12 bits) |
-//       the pending action << 30 -- sim_step.wgsl stillLevel8 reads the
-//       material from here, so an adopted record never claims another liquid.
+//       the flood count << 12 (12 bits) | the pending action << 30 --
+//       sim_step.wgsl stillLevel8 reads the material from here (low 12 bits
+//       only), so an adopted record never claims another liquid.
 // A pending ADOPT carries the hop in the age bits (the commit writes [2]).
 const STREAM_AGE_MAX : u32 = 1023u;
 const STREAM_HOP_MAX : u32 = 1023u;
 const STREAM_ACT_ADOPT : u32 = 1u;
 const STREAM_ACT_RELEASE : u32 = 2u;
 const STREAM_NONE : i32 = -1073741824;
+// THE FLOOD COUNT (see FLOODED above), [3] bits 12..23 of an adopted column.
+const STREAM_OVER_SHIFT : u32 = 12u;
+const STREAM_OVER_MAX : u32 = 4095u;
+const STREAM_FLOOD_COUNT : u32 = 4000u;
+const STREAM_FLOOD_DEEP : u32 = 16u;
 
 fn sdec(v : u32) -> i32 { return bitcast<i32>(v << 12u) >> 12u; }
 
@@ -223,31 +266,39 @@ fn streamOutflow(x : i32, y : i32, z : i32, s8 : i32, mat : u32) -> bool {
   return false;
 }
 
-// Is this workgroup's chunk the TOPMOST dirty chunk of its window stack? One
-// thread asks, the workgroup shares it.
-var<workgroup> wgTop : u32;
-fn topOfStack(centre : u32) -> bool {
-  let cy = (centre / NCHUNK) % NCHUNK;
-  let cz = centre / (NCHUNK * NCHUNK);
-  let cx = centre % NCHUNK;
-  let oy = bitcast<u32>(T.origin.y & i32(NCHUNK_MASK));
-  // Window rows ABOVE this one, in world order: slot rows (cy + k) & mask
-  // until the row that holds the window's top.
-  let rowsAbove = (oy + NCHUNK - 1u - cy) & u32(NCHUNK_MASK);
-  for (var k = 1u; k <= rowsAbove; k++) {
-    let sy = (cy + k) & u32(NCHUNK_MASK);
-    if (dirtyIn[(cz * NCHUNK + sy) * NCHUNK + cx] != 0u) { return false; }
+// Is this workgroup's chunk the TOPMOST dirty chunk of its window stack?
+// Thread k (1 <= k < NCHUNK) asks about the k-th window row above it, in
+// world order (slot row (cy + k) & mask, up to the row that holds the
+// window's top), and ORs the answer into the workgroup's word: one dirtyIn
+// latency, not up to NCHUNK - 1 of them in a row on one thread while the
+// other 255 wait. An OR is order-free, so the answer does not depend on which
+// thread runs first. Called by EVERY thread of the workgroup, in uniform
+// control flow (it holds two barriers). A ticket slot (>= NUM_CHUNKS: no
+// window column) is never the top.
+var<workgroup> wgAbove : atomic<u32>;
+fn stackTop(centre : u32, li : u32) -> bool {
+  if (li == 0u) { atomicStore(&wgAbove, 0u); }
+  workgroupBarrier();
+  if (centre < NUM_CHUNKS && li >= 1u) {
+    let cy = (centre / NCHUNK) % NCHUNK;
+    let cz = centre / (NCHUNK * NCHUNK);
+    let cx = centre % NCHUNK;
+    let oy = bitcast<u32>(T.origin.y & i32(NCHUNK_MASK));
+    let rowsAbove = (oy + NCHUNK - 1u - cy) & u32(NCHUNK_MASK);
+    if (li <= rowsAbove) {
+      let sy = (cy + li) & u32(NCHUNK_MASK);
+      if (dirtyIn[(cz * NCHUNK + sy) * NCHUNK + cx] != 0u) { atomicOr(&wgAbove, 1u); }
+    }
   }
-  return true;
+  workgroupBarrier();
+  return centre < NUM_CHUNKS && atomicLoad(&wgAbove) == 0u;
 }
 
 @compute @workgroup_size(256)
 fn scan(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index) li : u32) {
   let centre = dirtyList[wg.x];
-  if (li == 0u) {
-    wgTop = select(0u, 1u, centre < NUM_CHUNKS && T.stillWaterRelax != 0u && topOfStack(centre));
-  }
-  if (workgroupUniformLoad(&wgTop) == 0u) { return; }
+  // Every thread asks (the barriers in stackTop), then the not-top return.
+  if (!stackTop(centre, li) || T.stillWaterRelax == 0u) { return; }
   let wc = slotWorldChunk(centre, T.origin);
   let x = wc.x * i32(CHUNK) + i32(li & 15u);
   let z = wc.z * i32(CHUNK) + i32(li >> 4u);
@@ -257,44 +308,57 @@ fn scan(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index) 
   // the map already holds is not a stream.
   if (stillWater[si] != stillTag(x, z) || stillWater[si + 1u] != 0u) { return; }
   let dyn = stillWater[si + 2u];
-  let w3 = stillWater[si + 3u] & 0x3FFFFFFFu;
+  let old3 = stillWater[si + 3u];
+  let w3 = old3 & 0x3FFFFFFFu;
+  var word = 0u;
   if (dyn != 0u) {
     // ADOPTED: still supported at its own target by a neighbour nearer the
     // map's water (its surface may be under or over the target right now --
-    // the reservoir's business), or released.
+    // the reservoir's business), and not drowned (the flood count), or
+    // released.
     let mat = w3 & 0xFFFu;
-    let fed = streamSupport(x, z, sdec(dyn), mat, dyn >> 20u) <= STREAM_HOP_MAX;
-    stillWater[si + 3u] = mat | select(STREAM_ACT_RELEASE << 30u, 0u, fed);
-    return;
-  }
-  let s = columnSurface(x, top, z);
-  var age = (w3 >> 20u) & STREAM_AGE_MAX;
-  if (!s.ok) {
-    stillWater[si + 3u] = (w3 & 0xFFFFFu) | ((age >> 1u) << 20u);
-    return;
-  }
-  age = min(age + 1u, STREAM_AGE_MAX);   // this visit; reset below on a jump
-  // The band's centre stays where the count began; a jump out of it restarts
-  // the count from here.
-  var obs = s.s8;
-  if (age > 0u && abs(s.s8 - sdec(w3)) <= 8) { obs = sdec(w3); } else { age = 0u; }
-  var word = (bitcast<u32>(obs) & 0xFFFFFu) | (age << 20u);
-  if (age >= STREAM_ADOPT_TICKS && streamOutflow(x, s.y, z, s.s8, s.mat)) {
-    let hop = streamSupport(x, z, s.s8, s.mat, STREAM_HOP_MAX) + 1u;
-    if (hop <= STREAM_HOP_MAX) {
-      word = (bitcast<u32>(s.s8) & 0xFFFFFu) | (hop << 20u) | (STREAM_ACT_ADOPT << 30u);
+    let t8 = sdec(dyn);
+    var over = (w3 >> STREAM_OVER_SHIFT) & STREAM_OVER_MAX;
+    let s = columnSurface(x, top, z);
+    if (s.ok && s.mat == mat && s.s8 > t8) {
+      over = min(over + select(1u, STREAM_FLOOD_DEEP, s.s8 > t8 + 8), STREAM_OVER_MAX);
+    } else if (over > 0u) {
+      over = over - 1u;
+    }
+    let held = over < STREAM_FLOOD_COUNT &&
+               streamSupport(x, z, t8, mat, dyn >> 20u) <= STREAM_HOP_MAX;
+    word = mat | (over << STREAM_OVER_SHIFT) | select(STREAM_ACT_RELEASE << 30u, 0u, held);
+  } else {
+    let s = columnSurface(x, top, z);
+    var age = (w3 >> 20u) & STREAM_AGE_MAX;
+    if (!s.ok) {
+      word = (w3 & 0xFFFFFu) | ((age >> 1u) << 20u);
+    } else {
+      age = min(age + 1u, STREAM_AGE_MAX);   // this visit; reset below on a jump
+      // The band's centre stays where the count began; a jump out of it
+      // restarts the count from here.
+      var obs = s.s8;
+      if (age > 0u && abs(s.s8 - sdec(w3)) <= 8) { obs = sdec(w3); } else { age = 0u; }
+      word = (bitcast<u32>(obs) & 0xFFFFFu) | (age << 20u);
+      if (age >= STREAM_ADOPT_TICKS && streamOutflow(x, s.y, z, s.s8, s.mat)) {
+        let hop = streamSupport(x, z, s.s8, s.mat, STREAM_HOP_MAX) + 1u;
+        if (hop <= STREAM_HOP_MAX) {
+          word = (bitcast<u32>(s.s8) & 0xFFFFFu) | (hop << 20u) | (STREAM_ACT_ADOPT << 30u);
+        }
+      }
     }
   }
-  stillWater[si + 3u] = word;
+  // Only a CHANGED word is stored: every dry column of every topmost dirty
+  // chunk passes through here each tick, and almost all of them hold 0 and
+  // stay 0. (No pending action is ever left standing in an unchanged word:
+  // `commit` clears every action it reads.)
+  if (word != old3) { stillWater[si + 3u] = word; }
 }
 
 @compute @workgroup_size(256)
 fn commit(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index) li : u32) {
   let centre = dirtyList[wg.x];
-  if (li == 0u) {
-    wgTop = select(0u, 1u, centre < NUM_CHUNKS && T.stillWaterRelax != 0u && topOfStack(centre));
-  }
-  if (workgroupUniformLoad(&wgTop) == 0u) { return; }
+  if (!stackTop(centre, li) || T.stillWaterRelax == 0u) { return; }
   let wc = slotWorldChunk(centre, T.origin);
   let x = wc.x * i32(CHUNK) + i32(li & 15u);
   let z = wc.z * i32(CHUNK) + i32(li >> 4u);
@@ -316,4 +380,24 @@ fn commit(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index
       stillWater[si + 3u] = 0u;
     }
   }
+}
+
+// THE LOAD RESET (pass_table.def lr_streamClear, PT_LOADRESET). A stream's
+// words describe the world they were adopted in, and a LOAD replaces that
+// world. Dense worldgen clears the whole table, but a load refills the window
+// through the streamed path, whose `cols` keeps a column's dynamic words
+// while its tag is unchanged -- and a save loaded where the window already
+// stood changes no tag. So the old session's streams outlived the load: a
+// stale target held whatever water the loaded world had in that column at
+// the old level (refilling it from nothing), and the same save behaved
+// differently loaded into a fresh process and into one that had been playing.
+// One thread per window column, the dynamic words only: the authored [0] /
+// [1], which the refill's `cols` has just written, stay. The load's streams
+// run as water and are adopted again, as the header says they are.
+@compute @workgroup_size(256)
+fn clearStreams(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= WORLD_N * WORLD_N) { return; }
+  stillWater[i * STILL_WORDS + 2u] = 0u;
+  stillWater[i * STILL_WORDS + 3u] = 0u;
 }

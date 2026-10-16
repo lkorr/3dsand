@@ -1676,6 +1676,17 @@ PASS(lr_fill_opennessGen, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_N
 // off must not leave stale stamps behind for the moment it is turned back on.
 PASS(lr_fill_glow, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(Glow)))
+// A loaded world starts with NO adopted streams (sim_stream.wgsl
+// clearStreams; DESIGN.md §5b.13): their still-table words [2] / [3] describe
+// the world being replaced. Not a Fill: the same 16-byte column records hold
+// the authored [0] / [1], which the load's own refill (Stream::ReloadWindow ->
+// worldgen `cols`) has just written and which must stay; and not left to
+// `cols`, which keeps a stream while its column's tag is unchanged -- every
+// tag, for a save loaded where the window already stood. One thread per
+// window column.
+PASS(lr_streamClear, "occupancyFull(loadReset)", PT_LOADRESET, PIPE_STREAM_CLEAR, K_COMPUTE,
+     kWorldN * kWorldN / 256u,1,1, GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
+     USES(W(StillWater)))
 PASS(lr_occupancyFull, "occupancyFull(loadReset)", PT_LOADRESET, PIPE_OCCUPANCY, K_COMPUTE, D_CHUNKS,1,1,
      GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash) W(ChunkHash)

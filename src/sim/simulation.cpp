@@ -976,18 +976,22 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     const uint32_t zero[192] = {};
     device.GetQueue().WriteBuffer(caArgsBuf_, 0, zero, sizeof zero);
   }
-  // The still-water table (worldgen.wgsl, binding 58): two words per WINDOW
-  // column (tag, level | mat << 20), written by every `cols` dispatch. ZEROED
-  // so a record no list has written yet carries tag 0, which no column's tag
-  // equals (stillTag sets bit 0): it reads as "no still water", never as a
-  // level some uninitialised memory happened to spell. 2 MiB.
+  // The still-water table (worldgen.wgsl, binding 58): one record per WINDOW
+  // column (tag, T8 | mat << 20, and a stream's two words), written by every
+  // `cols` dispatch. ZEROED so a record no list has written yet carries tag 0,
+  // which no column's tag equals (stillTag sets bit 0): it reads as "no still
+  // water", never as a level some uninitialised memory happened to spell.
   {
     // FOUR words a column since 2026-10-16 (worldgen.wgsl STILL_WORDS): the
     // tag, the authored surface, and sim_stream.wgsl's dynamic target and its
-    // observation (docs/PLAN_running_water.md phase 2).
+    // observation (docs/PLAN_running_water.md phase 2). 4 MiB. CopySrc: the
+    // `rivers` gate reads a stream's words back (StillWaterBuffer()), and a
+    // copy out of a buffer without TRANSFER_SRC is a validation error
+    // (vk_record.cpp's [copy-src] line named it on the gate's first readback).
     constexpr uint64_t kStillWaterWords = (uint64_t)kWorldN * kWorldN * 4u;
     stillWaterBuf_ = CreateBuffer(device, kStillWaterWords * 4u,
-                                  rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                                  rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst |
+                                      rhi::BufferUsage::CopySrc,
                                   "stillWater");
     const std::vector<uint32_t> zero(kStillWaterWords, 0u);
     device.GetQueue().WriteBuffer(stillWaterBuf_, 0, zero.data(), zero.size() * 4u);
@@ -2507,6 +2511,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { flowMeasFold_ = MakeComputePipeline(device, simPL_, mFlowMeas, "fold", "flowMeasFold"); });
   pool.Add([&] { streamScan_ = MakeComputePipeline(device, simPL_, mStream, "scan", "streamScan"); });
   pool.Add([&] { streamCommit_ = MakeComputePipeline(device, simPL_, mStream, "commit", "streamCommit"); });
+  pool.Add([&] { streamClear_ = MakeComputePipeline(device, simPL_, mStream, "clearStreams", "streamClear"); });
   pool.Add([&] { draftMaskAll_ = MakeComputePipeline(device, simPL_, mDraft, "maskAll", "draftMaskAll"); });
   pool.Add([&] { draftMaskDirty_ = MakeComputePipeline(device, simPL_, mDraft, "maskDirty", "draftMaskDirty"); });
   pool.Add([&] { draftArgs_ = MakeComputePipeline(device, simPL_, mDraft, "args", "draftArgs"); });
@@ -3164,6 +3169,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::FlowMeasFold:   return flowMeasFold_;
     case P::StreamScan:     return streamScan_;
     case P::StreamCommit:   return streamCommit_;
+    case P::StreamClear:    return streamClear_;
     case P::FluidSpawn:     return fluidSpawn_;
     case P::FluidMark:      return fluidMark_;
     case P::FluidAlloc:     return fluidAlloc_;
