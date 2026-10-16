@@ -585,6 +585,8 @@ enum class Pipe : uint8_t {
   // The measured flow's fold (flow_measure.wgsl `fold`), after the CA. Here,
   // before ShadowResolve, which must stay the last enumerator.
   FlowMeasFold,
+  // Streams become held (sim_stream.wgsl `scan` / `commit`), after the CA.
+  StreamScan, StreamCommit,
   // ShadowCache table. Before ShadowResolve for the copy loop's bound.
   GiPrepare, GiGather,
   ShadowPrepare, ShadowResolve,

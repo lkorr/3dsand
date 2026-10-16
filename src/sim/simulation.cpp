@@ -982,7 +982,10 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   // equals (stillTag sets bit 0): it reads as "no still water", never as a
   // level some uninitialised memory happened to spell. 2 MiB.
   {
-    constexpr uint64_t kStillWaterWords = (uint64_t)kWorldN * kWorldN * 2u;
+    // FOUR words a column since 2026-10-16 (worldgen.wgsl STILL_WORDS): the
+    // tag, the authored surface, and sim_stream.wgsl's dynamic target and its
+    // observation (docs/PLAN_running_water.md phase 2).
+    constexpr uint64_t kStillWaterWords = (uint64_t)kWorldN * kWorldN * 4u;
     stillWaterBuf_ = CreateBuffer(device, kStillWaterWords * 4u,
                                   rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                                   "stillWater");
@@ -2305,6 +2308,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mRainExpo;
   // The measured flow's fold (flow_measure.wgsl): one tick entry on simPL_.
   rhi::ShaderModule mFlowMeas;
+  // Streams become held (sim_stream.wgsl): two tick entries on simPL_.
+  rhi::ShaderModule mStream;
   rhi::ShaderModule mDraft;
   // The solute layer's allocator, diffusion, compaction and hash
   // (docs/PLAN_solutes.md). Its own module: the CA carries mass through its
@@ -2370,6 +2375,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mMutate, "sim_mutate.wgsl");
     mod(&mRainExpo, "sim_rain_expo.wgsl");
     mod(&mFlowMeas, "flow_measure.wgsl");
+    mod(&mStream, "sim_stream.wgsl");
     mod(&mDraft, "sim_draft.wgsl");
     mod(&mCompact, "sim_compact.wgsl");
     mod(&mStep, "sim_step.wgsl");
@@ -2499,6 +2505,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { rainFall_ = MakeComputePipeline(device, simPL_, mMutate, "rainFall", "rainFall"); });
   pool.Add([&] { rainExpo_ = MakeComputePipeline(device, simPL_, mRainExpo, "build", "rainExpo"); });
   pool.Add([&] { flowMeasFold_ = MakeComputePipeline(device, simPL_, mFlowMeas, "fold", "flowMeasFold"); });
+  pool.Add([&] { streamScan_ = MakeComputePipeline(device, simPL_, mStream, "scan", "streamScan"); });
+  pool.Add([&] { streamCommit_ = MakeComputePipeline(device, simPL_, mStream, "commit", "streamCommit"); });
   pool.Add([&] { draftMaskAll_ = MakeComputePipeline(device, simPL_, mDraft, "maskAll", "draftMaskAll"); });
   pool.Add([&] { draftMaskDirty_ = MakeComputePipeline(device, simPL_, mDraft, "maskDirty", "draftMaskDirty"); });
   pool.Add([&] { draftArgs_ = MakeComputePipeline(device, simPL_, mDraft, "args", "draftArgs"); });
@@ -3154,6 +3162,8 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::ShadowPrepare:  return shadowPrepare_;
     case P::ShadowResolve:  return shadowResolve_;
     case P::FlowMeasFold:   return flowMeasFold_;
+    case P::StreamScan:     return streamScan_;
+    case P::StreamCommit:   return streamCommit_;
     case P::FluidSpawn:     return fluidSpawn_;
     case P::FluidMark:      return fluidMark_;
     case P::FluidAlloc:     return fluidAlloc_;

@@ -622,7 +622,7 @@ bool BakeRiversLakes(WorldMapData& out, uint32_t seed, std::vector<WorldMapData:
     }
     if (cl.size() < 2) { log += at + "river \"" + rv.id + "\": its centreline collapses to one point\n"; return false; }
     // 3. samples every 4 voxels.
-    struct Smp { int x, z, s, hw, d, g, S; };
+    struct Smp { int x, z, s, hw, d, g, S, T8; };
     std::vector<Smp> sm;
     {
       int arc = 0;
@@ -740,16 +740,46 @@ bool BakeRiversLakes(WorldMapData& out, uint32_t seed, std::vector<WorldMapData:
       if (i >= tailFrom) s.S = E;
     }
     rv.endLevel = E;
-    // 8. reaches, steps, pieces.
+    // 8. THE RUNNING SURFACE (2026-10-16): the staircase becomes a slope.
+    // Every step of S that drops at most kRiverWaterfall is SOFT: the surface
+    // ramps down to it linearly in arc, in EIGHTHS, over at most
+    // kRiverRampVox of arc per voxel of drop and never before the previous
+    // step (nor inside a source lake's lead). A step that drops more is a
+    // WATERFALL and stays HARD: a cut, a crest and a held curtain (worldgen
+    // waterApply). T8 is the water surface in eighths: the column holds full
+    // cells to (T8 - 1) >> 3 and the top one holds T8 - 8 * that eighths.
+    // T8 <= 8 S + 8 everywhere, so the ramp is under the staircase the
+    // ground was cut for, never over it. Integer only (the JS port matches).
+    for (Smp& s : sm) s.T8 = 8 * s.S + 8;
+    {
+      int prev = std::max(lead, 0);
+      for (int i = 1; i < N; i++) {
+        const Smp& sp = sm[static_cast<size_t>(i - 1)];
+        const Smp& si = sm[static_cast<size_t>(i)];
+        if (si.S == sp.S) continue;
+        const int D = sp.S - si.S;
+        if (D <= static_cast<int>(kRiverWaterfall)) {
+          const int s0 = std::max(sm[static_cast<size_t>(prev)].s, si.s - D * static_cast<int>(kRiverRampVox));
+          const int A8 = 8 * sp.S + 8, drop8 = 8 * D, span = std::max(si.s - s0, 1);
+          for (int j = prev; j < i; j++) {
+            Smp& sj = sm[static_cast<size_t>(j)];
+            if (sj.s <= s0) continue;
+            sj.T8 = A8 - static_cast<int>((static_cast<int64_t>(drop8) * (sj.s - s0)) / span);
+          }
+        }
+        prev = i;
+      }
+    }
+    // 9. reaches (runs between HARD steps), the waterfalls, pieces.
     std::vector<int> starts{0};
     rv.falls.clear();
-    for (int i = 1; i < N; i++)
-      if (sm[static_cast<size_t>(i)].S != sm[static_cast<size_t>(i - 1)].S) {
+    for (int i = 1; i < N; i++) {
+      const int drop = sm[static_cast<size_t>(i - 1)].S - sm[static_cast<size_t>(i)].S;
+      if (drop > static_cast<int>(kRiverWaterfall)) {
         starts.push_back(i);
-        const int drop = sm[static_cast<size_t>(i - 1)].S - sm[static_cast<size_t>(i)].S;
-        if (drop > static_cast<int>(kRiverWaterfall))
-          rv.falls.push_back({sm[static_cast<size_t>(i)].x, sm[static_cast<size_t>(i)].z, drop});
+        rv.falls.push_back({sm[static_cast<size_t>(i)].x, sm[static_cast<size_t>(i)].z, drop});
       }
+    }
     rv.reaches = static_cast<int>(starts.size());
     auto cutAt = [&](int i) {
       const Smp& a = sm[static_cast<size_t>(std::max(i - 1, 0))];
@@ -777,6 +807,9 @@ bool BakeRiversLakes(WorldMapData& out, uint32_t seed, std::vector<WorldMapData:
           const double f = B.s > A.s ? static_cast<double>(K.s - A.s) / (B.s - A.s) : 0.0;
           d = std::max(d, std::fabs(K.hw - (A.hw + (B.hw - A.hw) * f)));
           d = std::max(d, std::fabs(K.d - (A.d + (B.d - A.d) * f)));
+          // The surface, in eighths: a piece is one straight ramp, so a
+          // sample more than 2 eighths off the chord's lerp splits it.
+          d = std::max(d, std::fabs(K.T8 - (A.T8 + (B.T8 - A.T8) * f)) / 2.0);
           if (d > dev) { dev = d; farK = k; }
         }
         const bool tooLong = std::max(std::abs(B.x - A.x), std::abs(B.z - A.z)) > static_cast<int>(kRiverPieceMax);
@@ -802,11 +835,14 @@ bool BakeRiversLakes(WorldMapData& out, uint32_t seed, std::vector<WorldMapData:
         st.padMargin = bankAt(std::max(st.radius, st.hwB));
         st.depthA = A.d;
         st.depthB = B.d;
-        st.surf = sm[static_cast<size_t>(a0)].S;
+        // The piece's surface, eighths, at each end (worldmap.h kS_RivSurf /
+        // kS_RivLipY): waterApply lerps it along the chord.
+        st.surf = A.T8;
+        st.surfB = B.T8;
         st.bed = rv.bedId;
         st.len = static_cast<int>(std::lround(std::hypot(B.x - A.x, B.z - A.z)));
         st.wflags = rv.profile == "V" ? kRivProfileV : 0;
-        st.lipY = st.surf;
+        st.lipY = (A.T8 - 1) >> 3;
         if (pi == 0 && r > 0) {
           st.wflags |= kRivFlatA;
           st.cutA = cutAt(a);
@@ -822,17 +858,19 @@ bool BakeRiversLakes(WorldMapData& out, uint32_t seed, std::vector<WorldMapData:
     rv.pieces = q;
     // The baked line (the horizon, the gate, a tributary's junction) and the
     // reported profile.
+    // line[2] and the profile's y are the top WATER CELL's Y, (T8 - 1) >> 3
+    // (the staircase S where no ramp lowered it).
     rv.line.clear();
-    for (const Smp& s : sm) rv.line.push_back({s.x, s.z, s.S, s.hw});
+    for (const Smp& s : sm) rv.line.push_back({s.x, s.z, (s.T8 - 1) >> 3, s.hw});
     rv.profS.clear(); rv.profY.clear(); rv.profG.clear();
     const int pk = std::max(1, (N + kRoadProfileMax - 2) / (kRoadProfileMax - 1));
     for (int i = 0; i < N; i += pk) {
       rv.profS.push_back(sm[static_cast<size_t>(i)].s);
-      rv.profY.push_back(sm[static_cast<size_t>(i)].S);
+      rv.profY.push_back((sm[static_cast<size_t>(i)].T8 - 1) >> 3);
       rv.profG.push_back(sm[static_cast<size_t>(i)].g);
     }
     if ((N - 1) % pk != 0) {
-      rv.profS.push_back(sm.back().s); rv.profY.push_back(sm.back().S); rv.profG.push_back(sm.back().g);
+      rv.profS.push_back(sm.back().s); rv.profY.push_back((sm.back().T8 - 1) >> 3); rv.profG.push_back(sm.back().g);
     }
     std::printf("world map: river '%s': %d samples, %d reaches, %d pieces, %zu waterfalls, %d -> %d (drains to %d)\n",
                 rv.id.c_str(), N, rv.reaches, rv.pieces, rv.falls.size(), sm.front().S, sm.back().S, E);

@@ -43,22 +43,24 @@ const eqArr = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
   for (const e of T.engine.rivers) {
     const j = out.rivers.find(r => r.id === e.id);
     if (!j) { ok(false, `river "${e.id}" baked`); continue; }
-    const sOk = eqArr(j.samples.s, e.profile.s), yOk = eqArr(j.samples.S, e.profile.y);
+    // The profile's y is the top water cell of the RUNNING surface, (T8 - 1) >> 3.
+    const jy = j.samples.T8.map(t => (t - 1) >> 3);
+    const sOk = eqArr(j.samples.s, e.profile.s), yOk = eqArr(jy, e.profile.y);
     let firstBad = -1;
-    for (let i = 0; i < e.profile.y.length && firstBad < 0; i++) if (j.samples.S[i] !== e.profile.y[i] || j.samples.s[i] !== e.profile.s[i]) firstBad = i;
+    for (let i = 0; i < e.profile.y.length && firstBad < 0; i++) if (jy[i] !== e.profile.y[i] || j.samples.s[i] !== e.profile.s[i]) firstBad = i;
     const fOk = j.falls.length === e.waterfalls.length && j.falls.every((f, k) => eqArr(f, e.waterfalls[k]));
     ok(sOk && yOk && fOk && j.reaches === e.reaches && j.pieces === e.pieces && j.endLevel === e.endLevel &&
        j.lakeIn === e.lakeIn && j.lakeOut === e.lakeOut,
        `river "${e.id}": ${e.profile.s.length} samples, ${e.reaches} reaches, ${e.pieces} pieces, ${e.waterfalls.length} waterfalls, drains to ${e.endLevel}` +
        `${e.lakeIn ? ', from ' + e.lakeIn : ''}${e.lakeOut ? ', into ' + e.lakeOut : ''}` +
-       (firstBad >= 0 ? ` -- FIRST DIFF at sample ${firstBad}: s ${j.samples.s[firstBad]} / ${e.profile.s[firstBad]}, S ${j.samples.S[firstBad]} / ${e.profile.y[firstBad]}` : '') +
+       (firstBad >= 0 ? ` -- FIRST DIFF at sample ${firstBad}: s ${j.samples.s[firstBad]} / ${e.profile.s[firstBad]}, y ${jy[firstBad]} / ${e.profile.y[firstBad]}` : '') +
        (j.reaches !== e.reaches ? ` -- JS reaches ${j.reaches}` : '') + (j.pieces !== e.pieces ? ` -- JS pieces ${j.pieces}` : '') +
        (!fOk ? ` -- JS falls ${JSON.stringify(j.falls).slice(0, 120)}` : ''));
     falls += e.waterfalls.length; reaches += e.reaches;
   }
   ok(falls > 0 && reaches > T.rivers.length && T.engine.rivers.some(r => r.lakeIn) && T.engine.rivers.some(r => r.lakeOut) &&
      T.rivers.some(r => r.joins) && T.rivers.some(r => r.smooth === false),
-     `the table exercises waterfalls (${falls}), stepped reaches (${reaches}), a lake source, a lake mouth, a join and a polyline`);
+     `the table exercises waterfalls (${falls}), reaches between them (${reaches}), a lake source, a lake mouth, a join and a polyline`);
   const jw = out.warnings.filter(w => /clamped to it/.test(w)), ew = T.engine.warnings.filter(w => /clamped to it/.test(w));
   ok(jw.length === ew.length && jw.every((w, k) => w === ew[k]), `the junction clamp warning matches the engine's (${ew.length})`);
 }
@@ -73,10 +75,16 @@ const eqArr = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
   const S = b.samples.S;
   ok(b.samples.s.length === 101 && b.samples.s[100] === 400 && S[0] === 999 && S[3] === 999 && S[4] === 995 && S[100] === 899,
      `by hand: a 400-vox run falling 1/4 -> 101 samples, S 999 for samples 0..3, 995 from 4, 899 at the end (got ${S[0]}, ${S[3]}, ${S[4]}, ${S[100]})`);
-  ok(b.reaches === 26 && b.falls.length === 0 && b.endLevel === 0, `by hand: 26 reaches of 4 vox, no waterfalls (each step 4 <= 20), drains to the sea 0 (got ${b.reaches})`);
+  ok(b.reaches === 1 && b.falls.length === 0 && b.endLevel === 0, `by hand: one reach, no waterfalls (each step 4 <= 20), drains to the sea 0 (got ${b.reaches})`);
+  // THE RUNNING SURFACE: every 4-voxel step is a ramp over the 16 voxels of arc
+  // (4 samples) before it, so T8 falls 8 eighths per sample: 8 S + 8 at a
+  // step's sample, one voxel less each sample before it.
+  const T8 = b.samples.T8;
+  ok(T8[0] === 8 * 999 + 8 && T8[4] === 8 * 995 + 8 && T8[3] === 8 * 995 + 16 && T8[1] === 8 * 995 + 32,
+     `by hand: the ramp, eighths: ${T8[0]} ${T8[1]} ${T8[3]} ${T8[4]} (want ${8 * 999 + 8} ${8 * 995 + 32} ${8 * 995 + 16} ${8 * 995 + 8})`);
   let mono = true;
-  for (let i = 1; i < S.length; i++) if (S[i] > S[i - 1]) mono = false;
-  ok(mono, 'by hand: the surface never rises source -> mouth');
+  for (let i = 1; i < S.length; i++) if (S[i] > S[i - 1] || T8[i] > T8[i - 1]) mono = false;
+  ok(mono, 'by hand: the surface (steps and ramp) never rises source -> mouth');
   // a 30-voxel cliff at x = 200: one waterfall there, of 30
   const c = RB.bakeAll(json, {ground: x => (x < 200 ? 1000 : 970)}).rivers[0];
   ok(c.reaches === 2 && c.falls.length === 1 && c.falls[0][0] === 200 && c.falls[0][2] === 30,

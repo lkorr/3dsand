@@ -2990,18 +2990,22 @@ struct WaterCol {
   int water;      // the surface water stands to, -1 = dry
   uint32_t bed;   // bed / shore material, 0 = none
   bool wet;
+  int gap;        // eighths the top water cell lacks (a river's ramp), 0 = full
 };
-static WaterCol waterApply(int x, int z, bool roaded, int hRoad, int h0) {
+// `trace`, when given, collects one line per river piece the column is a
+// member of (the `rivers` gate prints it beside a leak it finds).
+static WaterCol waterApply(int x, int z, bool roaded, int hRoad, int h0, std::string* trace = nullptr) {
   using namespace worldmap;
-  WaterCol out{h0, -1, 0u, false};
+  WaterCol out{h0, -1, 0u, false, 0};
   if (sLabWorld) return out;
   const uint32_t* lst = wmSiteList(x, z);
   const uint32_t n = wmSiteN(lst);
   if (n == 0u) return out;
   bool inCh = false;
-  int wMin = 1048576, sMax = -1048576, floorMin = 1048576, outS = -1048576, lipY = -1048576;
+  int w8Min = 1 << 28, floorMin = 1048576, outS = -1048576, lipY = -1048576, chD2 = -1;
+  int crestY = -1048576, curtY = -1048576, mCh = 1;
   bool nearR = false;
-  int nd2 = 0, nS = 0, nHw = 0, nBank = 0;
+  int nd2 = 0, nS = 0, nM = 1, nHw = 0, nBank = 0;
   uint32_t nBed = 0u;
   uint32_t lake = 0u;
   bool lkIn = false;
@@ -3027,12 +3031,16 @@ static WaterCol waterApply(int x, int z, bool roaded, int hRoad, int h0) {
     if (x < std::min(ax, bx) - reach || x > std::max(ax, bx) + reach ||
         z < std::min(az, bz) - reach || z > std::max(az, bz) + reach) continue;
     const uint32_t fl = (uint32_t)st.wflags;
-    bool lip = false;
+    // 0 = no strip, 1 = a waterfall's CREST, 2 = its CURTAIN, 3 = the bank
+    // band past it (the shader's).
+    int strip = 0;
     if ((fl & kRivFlatA) != 0u) {
       const IV2 c = rivCut(st.cutA);
       const int cd = (x - ax) * c.x + (z - az) * c.y;
       if (cd <= 0) continue;
-      lip = cd <= (int)kRiverLip * 1024;
+      if (cd <= (int)kRiverLip * 1024) strip = 1;
+      else if (cd <= ((int)kRiverLip + (int)kRiverCurtain) * 1024) strip = 2;
+      else if (cd <= ((int)kRiverLip + (int)kRiverCurtain + 2) * 1024) strip = 3;
     }
     if ((fl & kRivFlatB) != 0u) {
       const IV2 c = rivCut(st.cutB);
@@ -3048,44 +3056,72 @@ static WaterCol waterApply(int x, int z, bool roaded, int hRoad, int h0) {
     const int hw = std::max(hwA + (((hwB - hwA) * tq) >> 8u), 1);
     const int o = hw + std::max(bank, (int)kRiverLip);
     if (d2 >= o * o) continue;
-    const int s = st.surf;
-    if (lip && d2 < (hw + 2 * (int)kRiverLip) * (hw + 2 * (int)kRiverLip)) lipY = std::max(lipY, st.lipY);
+    // The packed words exactly as the shader reads them (worldmap.cpp
+    // PackWorldMap): the lip Y as an i16, the fall A -> B in eighths above it.
+    const uint32_t lw = (static_cast<uint32_t>(st.lipY) & 0xFFFFu) |
+                        (static_cast<uint32_t>(std::clamp(st.surf - st.surfB, 0, 65535)) << 16);
+    const int lipV = (int32_t)(lw << 16u) >> 16;
+    const int fall8 = (int)(lw >> 16u);
+    const int s8 = st.surf - ((fall8 * tq) >> 8);
+    const int s = (s8 - 1) >> 3;
+    // The piece's steepness M, from the packed length (kS_RivBed bits 16..25).
+    const int plen = std::max(std::clamp(st.len, 0, 1023), 1);
+    const int m = 1 + (fall8 + 8 * plen - 1) / (8 * plen);
+    if (strip != 0 && d2 >= hw * hw) lipY = std::max(lipY, lipV);
+    if (trace) {
+      char b[200];
+      std::snprintf(b, sizeof b, " [%s d2 %d hw %d tq %d s8 %d m %d strip %d%s]", st.id.c_str(), d2, hw, tq, s8, m, strip,
+                    d2 < hw * hw ? " CH" : "");
+      *trace += b;
+    }
     if (d2 < hw * hw) {
       inCh = true;
-      wMin = std::min(wMin, s);
-      sMax = std::max(sMax, s);
+      if (chD2 < 0 || d2 < chD2) { chD2 = d2; w8Min = s8; }
+      mCh = std::max(mCh, m);
       const int dep = st.depthA + (((st.depthB - st.depthA) * tq) >> 8u);
       int drop = (dep * (hw * hw - d2)) / (hw * hw);
       if ((fl & kRivProfileV) != 0u) drop = (dep * (hw - isqrtLe(d2, hw))) / hw;
       floorMin = std::min(floorMin, s - drop);
+      if (strip == 1) crestY = std::max(crestY, lipV);
+      if (strip == 2) curtY = std::max(curtY, lipV);
     } else if (d2 < (hw + (int)kRiverLip) * (hw + (int)kRiverLip)) {
-      outS = std::max(outS, s);
+      outS = std::max(outS, s + m - 1);
     }
     if (!nearR || d2 < nd2) {
       nearR = true;
       nd2 = d2;
       nS = s;
+      nM = m;
       nHw = hw;
       nBank = std::max(bank, (int)kRiverLip);
       nBed = st.bed & 0xFFFu;
     }
   }
   if (!nearR && lake == 0u) return out;
-  int h = h0, water = -1;
+  int h = h0, water = -1, gap = 0;
   uint32_t bed = 0u;
   const int sea = seaLevelY();
   if (inCh) {
-    const int hold = std::max(sMax, std::max(outS, lipY));
-    if (hold > wMin) {
-      h = hold;
-      bed = nBed;
+    const int wv = (w8Min - 1) >> 3;
+    int top = wv, wg = 8 * wv + 8 - w8Min;
+    if (crestY > wv) {
+      h = crestY - 1;
+      top = crestY;
+      wg = 0;
     } else {
       h = floorMin;
-      if (roaded) h = std::max(h, std::min(hRoad, wMin - 1));
-      if (h < wMin) { water = wMin; bed = nBed; }
+      if (curtY > wv) {
+        top = curtY;
+        wg = 0;
+      } else if (roaded) {
+        h = std::max(h, std::min(hRoad, wv - 1));
+      }
     }
+    bed = nBed;
+    if (h < top) { water = top; gap = wg; }
+    else h = std::max(h, wv + mCh);
   } else if (nearR) {
-    const int tgt = nS + 1;
+    const int tgt = nS + nM;
     const int inner = nHw + (int)kRiverLip;
     const int o = nHw + nBank;
     int w = 256;
@@ -3102,7 +3138,7 @@ static WaterCol waterApply(int x, int z, bool roaded, int hRoad, int h0) {
     const int lv = lc.surf, band = lc.padMargin;
     if (lkIn) {
       if (water < 0) { h = h0; bed = 0u; }
-      if (h < lv) { water = lv; bed = lc.bed; }
+      if (h < lv) { water = lv; gap = 0; bed = lc.bed; }
       else if (lkD2 >= 0 && lkD2 < band * band) bed = lc.shore;
     } else if (water < 0 && lkD2 >= 0 && lkD2 < band * band) {
       const int tgt = lv + 1, half = band / 2;
@@ -3119,6 +3155,7 @@ static WaterCol waterApply(int x, int z, bool roaded, int hRoad, int h0) {
   out.water = water;
   out.bed = bed;
   out.wet = true;
+  out.gap = water >= 0 ? gap : 0;
   return out;
 }
 
@@ -3256,7 +3293,26 @@ worldmap::WaterColumn worldmap::WaterColumnAt(int x, int z, uint32_t seed) {
   c.water = w.water;
   c.bed = w.bed;
   c.wet = w.wet;
+  // The sea under a river that runs below it keeps its own full top
+  // (worldgen.wgsl waterApply's fluidGap rule).
+  c.gap = (w.water >= 0 && (h >= seaLevelY() || w.water >= seaLevelY())) ? w.gap : 0;
   return c;
+}
+
+// The `rivers` gate's leak report: what every river piece said about (x, z).
+namespace worldmap {
+std::string WaterColumnTrace(int x, int z, uint32_t seed);
+}
+std::string worldmap::WaterColumnTrace(int x, int z, uint32_t seed) {
+  if (sLabWorld) return std::string();
+  const int h = landColumnBare(x, z, seed).h;
+  const int hr = roadPadAt(x, z, h);
+  const int hp = sitePadAt(x, z, hr);
+  std::string t;
+  const WaterCol w = waterApply(x, z, hr != h, hr, hp, &t);
+  char b[96];
+  std::snprintf(b, sizeof b, " => ground %d water %d (pre %d)", w.h, w.water, hp);
+  return t + b;
 }
 
 // worldmap.h: the mirrored mapHeightAt, for the `worldmap-v2` gate and tools.

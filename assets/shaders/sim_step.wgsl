@@ -4263,11 +4263,14 @@ fn bridgeLevel(c : vec3<i32>, mat : u32, apply : bool) -> bool {
     for (var ib = 0u; ib < 4u; ib++) {
       if (ib == ia || fl[ib] == 0u) { continue; }
       if (fl[ib] + TUNE_LIQUID_EQUALIZE > fl[ia]) { continue; }
-      if (!apply) { return true; }
       let da = lateralDir(ia);
       let db = lateralDir(ib);
-      transferLiquid(c + vec3<i32>(da.x, 0, da.y), c + vec3<i32>(db.x, 0, db.y),
-                     mat, fl[ia], fl[ib], (fl[ia] - fl[ib]) / 2u);
+      let pa = c + vec3<i32>(da.x, 0, da.y);
+      let pb = c + vec3<i32>(db.x, 0, db.y);
+      // HELD WATER: the bridge moves a's water, so a's rest decides.
+      if (heldBlocks(heldRest(pa, mat, fl[ia]), pb, mat, fl[ib])) { continue; }
+      if (!apply) { return true; }
+      transferLiquid(pa, pb, mat, fl[ia], fl[ib], (fl[ia] - fl[ib]) / 2u);
       return true;
     }
   }
@@ -4293,6 +4296,8 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
   // tight direction lets a cell sleep with work left, and this predicate is
   // exactly where the never-sleeping pond was decided.
   let submerged = liquidSubmerged(c, mat);
+  // HELD WATER, the same test stepLiquid makes.
+  let rest = heldRest(c, mat, f);
 
   // 1) down: a partial same-liquid cell to top up, or anything displaceable.
   if (canDescend(c, c + vec3<i32>(0, -1, 0), mat, m.density)) { return true; }
@@ -4302,13 +4307,15 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
   // 2a) the four axis down-diagonals.
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i);
-    if (canDescend(c, c + vec3<i32>(d.x, -1, d.y), mat, m.density)) { return true; }
+    let n = c + vec3<i32>(d.x, -1, d.y);
+    if (!heldBlocksAt(rest, n, mat) && canDescend(c, n, mat, m.density)) { return true; }
   }
   // 2b) the four corner down-diagonals, path-gated exactly as stepLiquid does.
   for (var i = 0u; i < 4u; i++) {
     let d = cornerDir(i);
     if (!cornerDescentOpen(c, d)) { continue; }
-    if (canDescend(c, c + vec3<i32>(d.x, -1, d.y), mat, m.density)) { return true; }
+    let n = c + vec3<i32>(d.x, -1, d.y);
+    if (!heldBlocksAt(rest, n, mat) && canDescend(c, n, mat, m.density)) { return true; }
   }
 
   // 3) laterals: equalize into a same-liquid neighbour holding >= 2 less,
@@ -4324,6 +4331,7 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
     let n = c + vec3<i32>(d.x, 0, d.y);
     if (!inBounds(n)) { continue; }
     let nw = voxWordAt(n);
+    if (heldBlocks(rest, n, mat, heldFullness(nw, mat))) { continue; }
     let nmat = voxMat(nw);
     if (nmat == mat) {
       if (submerged) { continue; }
@@ -4406,7 +4414,7 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
 @group(0) @binding(58) var<storage, read> stillWater : array<u32>;
 // STILL_WORDS / stillIndex / stillTag: worldgen.wgsl's, written out again
 // (the WRITER is `cols`). Must agree; `--gate lake-settle` fails if not.
-const STILL_WORDS : u32 = 2u;
+const STILL_WORDS : u32 = 4u;
 fn stillIndex(x : i32, z : i32) -> u32 {
   return (bitcast<u32>(z & WORLD_MASK) * WORLD_N + bitcast<u32>(x & WORLD_MASK)) * STILL_WORDS;
 }
@@ -4420,26 +4428,113 @@ fn stillTag(x : i32, z : i32) -> u32 {
 // standing in the lake (a flooded tower) out of it.
 const STILL_BAND_UP : i32 = 8;
 // How far below the level a FULL cell grows upward. Small on purpose: a
-// deeper dip is the CA's (a lateral split off the level row fills it fast),
-// and a cell well under the level with air over it is a pocket under the bed,
-// which the lake has no business filling.
+// deeper dip is filled from the side (a held neighbour may pour into a column
+// under its target, see HELD WATER), and a cell well under the level with air
+// over it is a pocket under the bed, which the lake has no business filling.
 const STILL_BAND_DOWN : i32 = 2;
 const STILL_SALT : u32 = 0x5711A7E5u;
 const STILL_NONE : u32 = 0u;
 const STILL_GIVE : u32 = 1u;     // one eighth off this cell
-const STILL_TAKE : u32 = 2u;     // one eighth into this cell
+const STILL_TAKE : u32 = 2u;     // this cell filled to its target
 const STILL_GROW : u32 = 3u;     // a one-eighth cell into the air above
+// "This column holds no water of that material" -- below any surface a
+// window column can have, in eighths.
+const STILL_UNHELD : i32 = -1073741824;
+
+// The column's HELD surface in EIGHTHS (T8: full cells to (T8 - 1) >> 3, the
+// top one holding the rest) -- the map's (word [1]) or, where the map holds
+// none, a stream's that sim_stream.wgsl adopted (word [2]) -- or STILL_UNHELD:
+// no record, a record for another world column, another liquid, or the
+// reservoir switched off
+// (sim.stillWaterRelax 0 is the control arm of `lake-settle`, and the held
+// rule below is the same feature). A PURE READ of derived, never-hashed data,
+// keyed on the column only: every thread asking about the same column gets the
+// same answer whatever the dispatch order.
+fn stillLevel8(x : i32, z : i32, mat : u32) -> i32 {
+  if (T.stillWaterRelax == 0u) { return STILL_UNHELD; }
+  let si = stillIndex(x, z);
+  if (stillWater[si] != stillTag(x, z)) { return STILL_UNHELD; }
+  var v = stillWater[si + 1u];
+  if (v == 0u) { v = stillWater[si + 2u]; }
+  if (v == 0u || (v >> 20u) != mat) { return STILL_UNHELD; }
+  return bitcast<i32>(v << 12u) >> 12u;
+}
+
+// ============================ HELD WATER ===================================
+// docs/PLAN_running_water.md (2026-10-16). A river, the sea and a map lake
+// have, for the purposes of the window, INFINITE volume: the water past the
+// window is a reservoir held at its authored surface (THE RESERVOIR, below).
+// A river is also a surface that FALLS -- a ramp of a few eighths per cell, a
+// rapid of a voxel or two, a waterfall's curtain standing tens of voxels over
+// the reach below -- and a reach-1 CA cannot let that rest: every step of it
+// is a lateral or diagonal move the stages below would make, and the
+// reservoir would put back, forever. A running river would be a conveyor that
+// never sleeps (CLAUDE.md rule 2).
+//
+// So the CA does not move it. THE RULE: a cell AT REST in a held column -- its
+// surface 8 y + f at or under the column's target -- never sends liquid
+// sideways or diagonally into a cell of ANOTHER held column (same liquid)
+// that is AT OR OVER that column's own target. Held water does not pour into
+// held water that is already full. Everything else is unchanged:
+//   * a held column UNDER its target (a crater, a scooped hole, a curtain
+//     with a gap) takes liquid from its held neighbours like any water, and
+//     the neighbours that gave it are now under THEIR targets and refilled by
+//     the reservoir at once -- the river flows into a hole and the hole fills;
+//   * a held cell beside a column that is NOT held (a bank somebody dug
+//     through) spills into it like any water, and is refilled the same way:
+//     that is a breach, and a breach of a river runs for as long as the
+//     river does;
+//   * water OVER a held column's target (a bucket poured in, a splash, the
+//     breach's own stream coming back) is not at rest, so it flows as water
+//     and the reservoir takes it back.
+// What the rule removes is exactly the motion of a river that nothing has
+// disturbed. Generated rivers, ramps, rapids and curtains are therefore at
+// rest on tick 1 and their chunks sleep, and the look of running water is the
+// renderer's (the flow grid's streaks on the surface, whitewater on every
+// held water face standing over air).
+//
+// RULE 1. Pure reads of reach-1 cells and of the still table, which is a
+// function of (seed, map, column); the moves that remain are the same moves.
+// RULE 2. The rule only ever REFUSES a move, so no new move exists to
+// cycle; a held river nobody touched has no move left and sleeps. A breach is
+// a source by design (as the reservoir always was); its stream is ordinary
+// water and sleeps when it pools.
+//
+// `rest` is the ACTING cell's test, computed once per visit; `heldBlocks` is
+// asked per candidate target. `nf` is the target's current fullness in
+// eighths, 0 when it holds no liquid of this kind (air, a gas).
+fn heldRest(c : vec3<i32>, mat : u32, f : u32) -> bool {
+  let t8 = stillLevel8(c.x, c.z, mat);
+  return t8 != STILL_UNHELD && 8 * c.y + i32(f) <= t8;
+}
+fn heldBlocks(rest : bool, n : vec3<i32>, mat : u32, nf : u32) -> bool {
+  if (!rest) { return false; }
+  let t8 = stillLevel8(n.x, n.z, mat);
+  return t8 != STILL_UNHELD && 8 * n.y + i32(nf) >= t8;
+}
+// The fullness of liquid `mat` in the word, 0 when it holds something else.
+fn heldFullness(nw : u32, mat : u32) -> u32 {
+  return select(0u, voxState(nw) + 1u, voxMat(nw) == mat);
+}
+// heldBlocks for a target the caller has not read yet: the cheap tests first
+// (the acting cell's own `rest`, then the target column's record), the voxel
+// read only for a held target.
+fn heldBlocksAt(rest : bool, n : vec3<i32>, mat : u32) -> bool {
+  if (!rest || !inBounds(n)) { return false; }
+  let t8 = stillLevel8(n.x, n.z, mat);
+  if (t8 == STILL_UNHELD) { return false; }
+  return 8 * n.y + i32(heldFullness(voxWordAt(n), mat)) >= t8;
+}
 
 // Which branch, if any, cell c (liquid `mat`, fullness f) is in. PURE READ:
 // canFlowAnywhere asks it too, and the two must agree.
 fn stillWant(c : vec3<i32>, mat : u32, f : u32) -> u32 {
-  if (T.stillWaterRelax == 0u) { return STILL_NONE; }
-  let si = stillIndex(c.x, c.z);
-  if (stillWater[si] != stillTag(c.x, c.z)) { return STILL_NONE; }
-  let v = stillWater[si + 1u];
-  if (v == 0u || (v >> 20u) != mat) { return STILL_NONE; }
-  let level = bitcast<i32>(v << 12u) >> 12u;
-  let dy = c.y - level;
+  let t8 = stillLevel8(c.x, c.z, mat);
+  if (t8 == STILL_UNHELD) { return STILL_NONE; }
+  // The target's top cell and its fullness: (yt, ft), ft in 1..8.
+  let yt = (t8 - 1) >> 3u;
+  let ft = u32(t8 - 8 * yt);
+  let dy = c.y - yt;
   if (dy > STILL_BAND_UP || dy < -STILL_BAND_DOWN) { return STILL_NONE; }
   // A FREE SURFACE: air directly above. Ice, a raft, a roof or more water
   // over it and this is not the surface the level is about.
@@ -4458,21 +4553,30 @@ fn stillWant(c : vec3<i32>, mat : u32, f : u32) -> u32 {
     // Standing on the lake itself, not on a pier, a raft or a bank.
     return select(STILL_NONE, STILL_GIVE, bm == mat);
   }
+  if (dy == 0 && f > ft) { return STILL_GIVE; }
   // At or under the level, resting on something (the lake or its bed).
   if (bm == MAT_AIR) { return STILL_NONE; }
-  if (f < 8u) { return STILL_TAKE; }
+  if (f < select(8u, ft, dy == 0)) { return STILL_TAKE; }
   if (dy < 0 && voxWordIndex(a) != PT_NO_WORD) { return STILL_GROW; }
   return STILL_NONE;
 }
 
-// Stage 5 proper: roll, and on a hit move one eighth. Returns whether it wrote.
+// Stage 5 proper. The EXCESS branch rolls (sim.stillWaterRelax per 1024 per
+// visit) and moves one eighth, so a splash runs out before it is gone, as it
+// always did. The DEFICIT branches do not roll and fill the cell to its
+// target in one write: the reservoir is infinite, and a held river that has
+// just poured an eighth into a breach must be full again before the breach
+// asks for the next one, or the breach drains the river instead of the river
+// feeding the breach. Returns whether it wrote.
 fn stillReservoir(c : vec3<i32>, mat : u32, f : u32) -> bool {
   let want = stillWant(c, mat, f);
   if (want == STILL_NONE) { return false; }
-  let roll = hash3(T.seed ^ STILL_SALT, T.tick * 4u + gCaSub, cellIndexW(c)) & 1023u;
-  if (roll >= T.stillWaterRelax) {
-    markDirtyR(c, DIRTY_R_REACT);   // matched, did not fire: own chunk only
-    return false;
+  if (want == STILL_GIVE) {
+    let roll = hash3(T.seed ^ STILL_SALT, T.tick * 4u + gCaSub, cellIndexW(c)) & 1023u;
+    if (roll >= T.stillWaterRelax) {
+      markDirtyR(c, DIRTY_R_REACT);   // matched, did not fire: own chunk only
+      return false;
+    }
   }
   let stamp = stampFor(T.tick, gCaSub);
   let iw = voxIndexAndWord(c);
@@ -4480,7 +4584,10 @@ fn stillReservoir(c : vec3<i32>, mat : u32, f : u32) -> bool {
     if (f <= 1u) { voxStore(iw.x, 0u); }
     else { voxStore(iw.x, packVoxKeepStain(mat, f - 2u, stamp, iw.y)); }
   } else if (want == STILL_TAKE) {
-    voxStore(iw.x, packVoxKeepStain(mat, f, stamp, iw.y));
+    let t8 = stillLevel8(c.x, c.z, mat);
+    let yt = (t8 - 1) >> 3u;
+    let full = select(8u, u32(t8 - 8 * yt), c.y == yt);
+    voxStore(iw.x, packVoxKeepStain(mat, full - 1u, stamp, iw.y));
   } else {
     let ai = voxWordIndex(c + vec3<i32>(0, 1, 0));
     voxStore(ai, packVoxKeepStain(mat, 0u, stamp, 0u));
@@ -4543,6 +4650,11 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
   // with water standing on it.
   let submerged = liquidSubmerged(c, mat);
   let sub = select(0u, DIRTY_M_SUBMERGED, submerged);
+  // HELD WATER (the block above THE RESERVOIR): at rest in a held column, this
+  // cell may not pour sideways or diagonally into a held column that is full.
+  // One table read for most water (no record: false), and canFlowAnywhere
+  // makes the same test in the same places.
+  let rest = heldRest(c, mat, f);
 
   // 1) straight down: top a partial same-liquid cell up, else move/swap whole.
   if (tryDescend(c, c + vec3<i32>(0, -1, 0), w, mat, f, m.density)) {
@@ -4562,7 +4674,8 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
   let r = rnd >> 10u;
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i + r);
-    if (tryDescend(c, c + vec3<i32>(d.x, -1, d.y), w, mat, f, m.density)) {
+    let n = c + vec3<i32>(d.x, -1, d.y);
+    if (!heldBlocksAt(rest, n, mat) && tryDescend(c, n, w, mat, f, m.density)) {
       markDirtyR(c, DIRTY_M_DIAG | sub);
       return true;
     }
@@ -4573,7 +4686,8 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
   for (var i = 0u; i < 4u; i++) {
     let d = cornerDir(i + r);
     if (!cornerDescentOpen(c, d)) { continue; }
-    if (tryDescend(c, c + vec3<i32>(d.x, -1, d.y), w, mat, f, m.density)) {
+    let n = c + vec3<i32>(d.x, -1, d.y);
+    if (!heldBlocksAt(rest, n, mat) && tryDescend(c, n, w, mat, f, m.density)) {
       markDirtyR(c, DIRTY_M_DIAG | sub);
       return true;
     }
@@ -4611,6 +4725,7 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
     let n = c + vec3<i32>(d.x, 0, d.y);
     if (!inBounds(n)) { continue; }
     let nw = voxWordAt((n));
+    if (heldBlocks(rest, n, mat, heldFullness(nw, mat))) { continue; }
     let nmat = voxMat(nw);
     if (nmat == mat) {
       // Free-surface stage: a submerged cell does not level sideways.

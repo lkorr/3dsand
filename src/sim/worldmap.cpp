@@ -2978,7 +2978,8 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
       r[kS_RivSurf] = U(s.surf);
       r[kS_RivBed] = (s.bed & 0xFFFu) | ((static_cast<uint32_t>(s.wflags) & 15u) << 12) |
                      (static_cast<uint32_t>(std::clamp(s.len, 0, 1023)) << 16);
-      r[kS_RivLipY] = U(s.lipY);
+      r[kS_RivLipY] = (U(s.lipY) & 0xFFFFu) |
+                      (static_cast<uint32_t>(std::clamp(s.surf - s.surfB, 0, 65535)) << 16);
       r[kS_RivCutA] = static_cast<uint32_t>(s.cutA);
       r[kS_BoxX1] = U(s.x1); r[kS_BoxZ1] = U(s.z1);
       r[kS_RivCutB] = static_cast<uint32_t>(s.cutB);

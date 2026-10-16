@@ -125,6 +125,8 @@ namespace {
 #define PIPE_WIND_STREAK     Pipe::WindStreak
 #define PIPE_SHADOW_RESOLVE  Pipe::ShadowResolve
 #define PIPE_FLOWMEAS_FOLD   Pipe::FlowMeasFold
+#define PIPE_STREAM_SCAN     Pipe::StreamScan
+#define PIPE_STREAM_COMMIT   Pipe::StreamCommit
 #define PIPE_FLUID_SPAWN     Pipe::FluidSpawn
 #define PIPE_FLUID_MARK      Pipe::FluidMark
 #define PIPE_FLUID_ALLOC     Pipe::FluidAlloc

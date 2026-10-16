@@ -30,7 +30,7 @@ import * as SPL from './spline.js';
 // worldmap.h (kRiver* / kLake*): the loader's clamps and the bake's constants.
 export const K = {
   riverLip: 4, riverPieceMax: 256, widthMin: 8, widthMax: 1024, depthMin: 2, depthMax: 120,
-  bankMax: 1024, stepDefault: 4, stepMax: 64, waterfall: 20, lakeEdgeMax: 256,
+  bankMax: 1024, stepDefault: 4, stepMax: 64, waterfall: 20, rampVox: 48, lakeEdgeMax: 256,
   lakeBandDefault: 24, lakeBandMax: 128, roadProfileMax: 256,
 };
 
@@ -321,14 +321,34 @@ export function bakeRiver(rv, ctx) {
   }
   if (lakeIn >= 0 && leadLevel < E) warnings.push(`${wwho}its source lake's level ${leadLevel} is below the level it drains to (${E})`);
   for (let i = 0; i < N; i++) { sm[i].S = Math.max(sm[i].S, E); if (i >= tailFrom) sm[i].S = E; }
-  // 8. reaches, waterfalls, pieces
-  const starts = [0], falls = [];
-  for (let i = 1; i < N; i++)
-    if (sm[i].S !== sm[i - 1].S) {
-      starts.push(i);
-      const drop = sm[i - 1].S - sm[i].S;
-      if (drop > K.waterfall) falls.push([sm[i].x, sm[i].z, drop]);
+  // 8. THE RUNNING SURFACE (worldwater.cpp step 8): every step of S that
+  // drops at most K.waterfall is SOFT and the surface ramps down to it, in
+  // eighths (T8), over at most K.rampVox of arc per voxel of drop, never
+  // before the previous step nor inside a source lake's lead. Integer only.
+  for (const s of sm) s.T8 = 8 * s.S + 8;
+  {
+    let prev = Math.max(lead, 0);
+    for (let i = 1; i < N; i++) {
+      const sp = sm[i - 1], si = sm[i];
+      if (si.S === sp.S) continue;
+      const D = sp.S - si.S;
+      if (D <= K.waterfall) {
+        const s0 = Math.max(sm[prev].s, si.s - D * K.rampVox);
+        const A8 = 8 * sp.S + 8, drop8 = 8 * D, span = Math.max(si.s - s0, 1);
+        for (let j = prev; j < i; j++) {
+          if (sm[j].s <= s0) continue;
+          sm[j].T8 = A8 - Math.trunc((drop8 * (sm[j].s - s0)) / span);
+        }
+      }
+      prev = i;
     }
+  }
+  // 9. reaches (runs between HARD steps), the waterfalls, pieces
+  const starts = [0], falls = [];
+  for (let i = 1; i < N; i++) {
+    const drop = sm[i - 1].S - sm[i].S;
+    if (drop > K.waterfall) { starts.push(i); falls.push([sm[i].x, sm[i].z, drop]); }
+  }
   let pieces = 0;
   for (let r = 0; r < starts.length; r++) {
     const a0 = starts[r], b0 = r + 1 < starts.length ? starts[r + 1] : N - 1;
@@ -345,6 +365,7 @@ export function bakeRiver(rv, ctx) {
         const f = B.s > A.s ? (Q.s - A.s) / (B.s - A.s) : 0;
         d = Math.max(d, Math.abs(Q.hw - (A.hw + (B.hw - A.hw) * f)));
         d = Math.max(d, Math.abs(Q.d - (A.d + (B.d - A.d) * f)));
+        d = Math.max(d, Math.abs(Q.T8 - (A.T8 + (B.T8 - A.T8) * f)) / 2.0);
         if (d > dev) { dev = d; farK = k; }
       }
       const tooLong = Math.max(Math.abs(B.x - A.x), Math.abs(B.z - A.z)) > K.riverPieceMax;
@@ -356,15 +377,17 @@ export function bakeRiver(rv, ctx) {
       pieces++;
     }
   }
-  const line = sm.map(s => [s.x, s.z, s.S, s.hw]);
+  // line[2] and the profile's y: the top WATER CELL, (T8 - 1) >> 3.
+  const top = s => (s.T8 - 1) >> 3;
+  const line = sm.map(s => [s.x, s.z, top(s), s.hw]);
   const pk = Math.max(1, Math.trunc((N + K.roadProfileMax - 2) / (K.roadProfileMax - 1)));
   const prof = {s: [], y: [], ground: []};
-  for (let i = 0; i < N; i += pk) { prof.s.push(sm[i].s); prof.y.push(sm[i].S); prof.ground.push(sm[i].g); }
-  if ((N - 1) % pk !== 0) { prof.s.push(sm[N - 1].s); prof.y.push(sm[N - 1].S); prof.ground.push(sm[N - 1].g); }
+  for (let i = 0; i < N; i += pk) { prof.s.push(sm[i].s); prof.y.push(top(sm[i])); prof.ground.push(sm[i].g); }
+  if ((N - 1) % pk !== 0) { prof.s.push(sm[N - 1].s); prof.y.push(top(sm[N - 1])); prof.ground.push(sm[N - 1].g); }
   const col = key => sm.map(s => s[key]);
   return {
     id: rv.id, joins: rv.joins || null, joinIdx: rv.joinIdx, stepVox: rv.stepVox, bank: rv.bank, profile: rv.profile,
-    samples: {x: col('x'), z: col('z'), s: col('s'), hw: col('hw'), d: col('d'), g: col('g'), S: col('S')},
+    samples: {x: col('x'), z: col('z'), s: col('s'), hw: col('hw'), d: col('d'), g: col('g'), S: col('S'), T8: col('T8')},
     line, reaches: starts.length, starts, falls, pieces, endLevel: E, drainsTo,
     lakeIn: lakeIn >= 0 ? lakes[lakeIn].id : null, lakeOut: lakeOut >= 0 ? lakes[lakeOut].id : null,
     prof, bankAt, warnings,

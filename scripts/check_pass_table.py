@@ -161,6 +161,8 @@ PIPE_TO_MEMBER = {
     "PIPE_GI_GATHER": "giGather_",
     "PIPE_RAIN_EXPO": "rainExpo_",
     "PIPE_FLOWMEAS_FOLD": "flowMeasFold_",
+    "PIPE_STREAM_SCAN": "streamScan_",
+    "PIPE_STREAM_COMMIT": "streamCommit_",
     "PIPE_WIND_STREAK": "windStreak_",
     "PIPE_FLUID_SPAWN": "fluidSpawn_",
     "PIPE_FLUID_MARK": "fluidMark_",

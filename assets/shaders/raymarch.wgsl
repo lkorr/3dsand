@@ -10517,9 +10517,38 @@ fn rainRipples(pm : vec2f, t : f32, amount : f32, footM : f32) -> vec2f {
   return s * fade;
 }
 
+// RUNNING WATER'S OWN CURRENT (docs/PLAN_running_water.md). A held ramp, a
+// rapid and an adopted stream SLOPE, and water on a slope runs down it -- but
+// the sim moves none of it (it is held), the measured flow therefore reads
+// zero there, and the solved terrain field knows only the map's rivers. So the
+// surface's own macro slope is a current: downhill, at a speed growing with
+// the slope. Set by waterNormal from the four column heights it already reads
+// (interior cells only: a column with no liquid at or one under the sample
+// row is a bank, and its edge is not a slope), added to currentAt by the two
+// surface terms that draw motion (waterWaveNormal's advection and
+// flowFoamLines). Zero on the far field, which has no columns.
+var<private> gSlopeFlow : vec2f = vec2f(0.0);
+const SLOPE_FLOW_GAIN : f32 = 9.0;   // m/s per unit slope (voxels per voxel)
+const SLOPE_FLOW_MAX : f32 = 3.0;    // m/s, the river envelope's ceiling
+fn slopeFlowFrom(cell : vec3<i32>, slope : vec2f) -> vec2f {
+  for (var i = 0u; i < 4u; i++) {
+    var d = vec3<i32>(1, 0, 0);
+    if (i == 1u) { d = vec3<i32>(-1, 0, 0); }
+    else if (i == 2u) { d = vec3<i32>(0, 0, 1); }
+    else if (i == 3u) { d = vec3<i32>(0, 0, -1); }
+    if (liquidFullnessAt(cell + d) <= 0.0 && liquidFullnessAt(cell + d - vec3<i32>(0, 1, 0)) <= 0.0) {
+      return vec2f(0.0);
+    }
+  }
+  let v = slope * SLOPE_FLOW_GAIN;
+  let l = length(v);
+  return select(v, v * (SLOPE_FLOW_MAX / l), l > SLOPE_FLOW_MAX);
+}
+
 fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
                hitP : vec3f, upFacing : bool) -> vec3f {
   gRainSplash = 0.0;
+  gSlopeFlow = vec2f(0.0);
   // Side/bottom faces of a liquid volume keep their flat voxel normal: the
   // fullness gradient describes the TOP surface, and applying it to a wall
   // would tilt it into the terrain.
@@ -10534,6 +10563,8 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
   let hz0 = liquidColumn(cell + vec3<i32>(0, 0, -1));
   let hz1 = liquidColumn(cell + vec3<i32>(0, 0,  1));
   let slope = vec2f((hx0 - hx1) * 0.5, (hz0 - hz1) * 0.5);
+  // Downhill is where the column heights fall: +x when hx0 > hx1.
+  if (dot(slope, slope) > 1e-4) { gSlopeFlow = slopeFlowFrom(cell, slope); }
 
   // Ripples on top of the macro slope, in world metres (waterWaveNormal).
   // Damping is applied PER WAVE against its own wavelength inside
@@ -10587,7 +10618,7 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
 fn waterWaveNormal(hitP : vec3f, macroSlope : vec2f, depthM : f32, openness : f32,
                    flux : vec2f) -> vec3f {
   let pm = vec2f(hitP.x, hitP.z) * VOXEL_METERS;
-  let flowMS = currentAt(hitP, &R).xz * VOXEL_METERS;
+  let flowMS = currentAt(hitP, &R).xz * VOXEL_METERS + gSlopeFlow;
   var slope = macroSlope +
               waveSlope(pm, R.time, waterRippleFootprint(hitP), depthM, flowMS) * openness;
   slope += flux * TUNE_WAVE_SIM_SLOPE;
@@ -10691,7 +10722,7 @@ const FLOW_FOAM_WIDTH : f32 = 0.16; // m across it
 // drawn out into dashes, never round blobs.
 const FLOW_FLECK : vec2f = vec2f(0.45, 0.06);
 fn flowFoamLines(hitP : vec3f, pm : vec2f) -> f32 {
-  let flowMS = currentAt(hitP, &R).xz * VOXEL_METERS;
+  let flowMS = currentAt(hitP, &R).xz * VOXEL_METERS + gSlopeFlow;
   let speed = length(flowMS);
   let st = flowMarkStrength(speed);
   if (st <= 0.0) { return 0.0; }
@@ -10732,6 +10763,28 @@ fn flowFoamLines(hitP : vec3f, pm : vec2f) -> f32 {
   return line * (0.22 + 0.38 * density) * (1.0 - smoothstep(0.06, 0.25, foot));
 }
 const WATER_FOAM_COLOR : vec3f = vec3f(0.92, 0.95, 0.97);
+
+// FALLING WATER (docs/PLAN_running_water.md). A SIDE face of a liquid is that
+// liquid with nothing beside it: a river's held curtain, the step of a rapid
+// on a running surface, or the CA's own spill in flight. All of them are water
+// going DOWN, and a clear glassy wall is the one thing none of them looks like
+// -- so the face is drawn as a falling sheet: white water in vertical streaks
+// that scroll down at a fall speed, two octaves so it breaks up into ropes
+// rather than stripes. Metres in, so the look does not depend on voxel size.
+// Returns the whitewater cover 0..1. Two vnoise taps, on side-face water
+// pixels only.
+const FALL_SHEET_SPEED : f32 = 3.2;   // m/s the streaks fall
+const FALL_SHEET_WHITE : f32 = 0.85;  // the cover at a streak's core
+const FALL_SHEET_BASE : f32 = 0.35;   // the cover between streaks (aerated, never clear)
+fn fallingSheet(hitP : vec3f, axis : i32) -> f32 {
+  let pm = hitP * VOXEL_METERS;
+  let u = select(pm.x, pm.z, axis == 0);   // along the face
+  let v = pm.y + R.time * FALL_SHEET_SPEED;
+  let n1 = vnoise(vec3f(u * 9.0, v * 0.9, 0.0));
+  let n2 = vnoise(vec3f(u * 23.0, v * 2.3, 7.3));
+  let streak = smoothstep(0.42, 0.80, n1 * 0.65 + n2 * 0.35);
+  return (FALL_SHEET_BASE + (1.0 - FALL_SHEET_BASE) * streak) * FALL_SHEET_WHITE;
+}
 
 // THE STAR FIELD'S MEAN RADIANCE, analytically: what starField averages to
 // over any solid angle much larger than a star cell. Per layer it is
@@ -11530,6 +11583,27 @@ fn fallCueAt(cell : vec3<i32>) -> FallCue {
     let above = cell + vec3<i32>(0, 2, 0);
     if (mistAirAt(cell + vec3<i32>(0, 1, 0)) && mistLiquidAt(above)) {
       cue.impact = smoothstep(1.5, 3.5, fallMassAt(above));
+    } else if (mistLiquidAt(cell + vec3<i32>(0, 1, 0))) {
+      // A HELD CURTAIN (docs/PLAN_running_water.md): a river's waterfall is a
+      // standing sheet of water against the cliff -- liquid above, air in
+      // front -- that never detaches, so neither test above sees it. Liquid
+      // over liquid with air beside it and liquid along it is a sheet; it
+      // throws the same veil as one in flight. Its foot (air two below the
+      // face) is the plunge.
+      var open = 0.0;
+      var along = 0.0;
+      for (var d = 0; d < 4; d++) {
+        let o = select(select(vec3<i32>(0, 0, -1), vec3<i32>(0, 0, 1), d == 2),
+                       select(vec3<i32>(-1, 0, 0), vec3<i32>(1, 0, 0), d == 0), d < 2);
+        if (mistAirAt(cell + o)) {
+          open = 1.0;
+          if (!mistAirAt(cell + o + vec3<i32>(0, -1, 0))) { cue.impact = 1.0; }
+        } else if (mistLiquidAt(cell + o)) {
+          along += 1.0;
+        }
+      }
+      if (open > 0.0) { cue.fall = smoothstep(0.5, 2.0, along); }
+      cue.impact = cue.impact * cue.fall;
     }
   }
   return cue;
@@ -12608,6 +12682,18 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   var color = mix(refracted, reflection, fres);
   gVK = vec3f(1.0 - fres);
   dbgWater(fres, refracted, reflection, lit, depthM);
+
+  // ---- falling water: a side face is a falling sheet (fallingSheet) ----
+  // Lit like the rain splash below (sky + key light by the face's own
+  // normal); no shadow ray, the sheet is a thin bright layer and the scene
+  // behind it already carries the shadows.
+  if (!upFacing && !underwater && axis != 1) {
+    let a = fallingSheet(hitP, axis);
+    let sheetLit = (ambientAt(n) * 1.1 + keyLightColor() * (0.15 + 0.35 * max(dot(n, keyLightDir()), 0.0))) *
+                   WATER_FOAM_COLOR * mediaLightK(fogSkyK());
+    color = mix(color, sheetLit, a);
+    gVK *= 1.0 - a;
+  }
 
   // ---- sun glint ----
   // Sharp Blinn-Phong lobe on the RIPPLED normal. This is what turns a

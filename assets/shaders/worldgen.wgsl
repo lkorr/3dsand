@@ -104,8 +104,13 @@ const GEN_V_MAT_SHIFT : u32 = 4u;
 // ---- THE STILL-WATER TABLE (sim_step.wgsl's RESERVOIR stage reads it) ------
 // One record per WINDOW column, (x & WORLD_MASK, z & WORLD_MASK), stride
 // STILL_WORDS: [0] the world column's tag (stillTag), [1] the authored
-// standing-water surface of a map LAKE, a RIVER reach or the SEA at that
-// column -- (level & 0xFFFFF) | mat << 20, or 0 for "none". Disc ponds
+// standing-water surface of a map LAKE, a RIVER or the SEA at that column, in
+// EIGHTHS (T8: full cells to (T8 - 1) >> 3, the top one the rest) --
+// (T8 & 0xFFFFF) | mat << 20, or 0 for "none". [2] and [3] are a STREAM's:
+// the dynamic target sim_stream.wgsl adopted (same packing) and its
+// observation. `cols` keeps them while the slot's tag is unchanged and clears
+// them when the slot takes a new world column; a dense worldgen clears the
+// whole table first (pass_table.def wg_fill_stillWater). Disc ponds
 // (water sites, tarns) are deliberately NOT here: they are finite bodies the
 // water-body ledger owns, and a reservoir under one would refill a pond its
 // drain is emptying.
@@ -122,7 +127,7 @@ const GEN_V_MAT_SHIFT : u32 = 4u;
 // STILL_WORDS, stillIndex and stillTag are written out again in sim_step.wgsl
 // (the reader); `--gate lake-settle` fails if the two ever disagree, because
 // a reader that never matches a tag never levels anything.
-const STILL_WORDS : u32 = 2u;
+const STILL_WORDS : u32 = 4u;
 fn stillIndex(x : i32, z : i32) -> u32 {
   return (bitcast<u32>(z & WORLD_MASK) * WORLD_N + bitcast<u32>(x & WORLD_MASK)) * STILL_WORDS;
 }
@@ -2299,24 +2304,46 @@ fn rivCut(w : i32) -> vec2<i32> {
 // the sea. world.cpp waterApply is the twin; the `rivers` gate holds the two
 // to each other per voxel.
 //
-// RIVERS. Every listed river piece the column is a MEMBER of -- inside its box
-// grown by half-width + bank, and on the right side of a flat (step) end's
-// cut line -- is measured: d2 to its chord, the half-width hw and depth d
-// lerped along it, its reach's flat surface S. Then:
+// RIVERS RUN (2026-10-16, docs/PLAN_running_water.md). A piece's surface is a
+// RAMP in eighths, T8 at end A falling to end B (worldmap.h kS_RivSurf /
+// kS_RivLipY), lerped along the chord: the column holds full cells to
+// (T8 - 1) >> 3 and the top one holds the remainder. The water is HELD there
+// by sim_step.wgsl's held-water rule -- a cell at its column's target never
+// pours into another held column above that one's target -- so a slope, a
+// rapid and a waterfall's curtain are all at rest the moment worldgen writes
+// them, and the look of running water is the renderer's.
+//
+// Every listed river piece the column is a MEMBER of -- inside its box grown
+// by half-width + bank, and on the right side of a flat (step) end's cut line
+// -- is measured: d2 to its chord, the half-width hw and depth d lerped along
+// it, its surface T8 at the column. Then:
 //   * in some piece's CHANNEL (d2 < hw^2): the floor is S - the cross-section
-//     (U: d (1 - d2 / hw^2), V: d (1 - u / hw)), the lowest of every channel
-//     claiming the column. Water stands to S -- unless the column must HOLD
-//     a higher water: another channel with a higher S claims it, a higher
-//     reach's channel ends within RIVER_LIP of it, or it is in the WEIR STRIP
-//     of a step (the first RIVER_LIP voxels below the step's cut line, which
-//     hold the reach above). Then it is a dry dam at that height. A road deck
+//     (U: d (1 - d2 / hw^2), V: d (1 - u / hw)), S the surface's top cell, the
+//     lowest floor of every channel claiming the column; the water is the
+//     surface of the NEAREST channel claiming it (the closest point of the
+//     centreline: a ramp cut into short pieces of different slope claims a
+//     column from several, and their surfaces there can differ by voxels --
+//     the lowest of them stepped the water down wherever a steeper piece's
+//     channel edge passed; ties keep the first listed).
+//     A WATERFALL (a hard step, kRivFlatA) is two strips downstream of its
+//     cut: the CREST (the first RIVER_LIP voxels) is a sill one cell under
+//     the upstream surface with that water over it, and the CURTAIN (the next
+//     RIVER_CURTAIN) stands the upstream surface's water on the lower reach's
+//     floor -- a held column of falling water against the cliff. A road deck
 //     that crosses the channel wins up to the water (a ford).
+//     A channel column left DRY (its floor at or over the surface: the
+//     shallow edge of a U, where the ramp has just stepped down a voxel) is
+//     raised to S + M, M the piece's STEEPNESS: 1 + the most whole voxels its
+//     surface falls per column, so the wet column beside it upstream, whose
+//     surface is at most M - 1 cells higher, has a wall there and not a gap.
 //   * else in the NEAREST piece's BANK (hw .. hw + bank): the ground blends to
-//     S + 1 -- 256 within RIVER_LIP of the channel, a smoothstep out to the
+//     S + M -- 256 within RIVER_LIP of the channel, a smoothstep out to the
 //     bank's edge -- cutting where the terrain is higher, building a levee
 //     where it is lower; then it is raised to hold any higher water within
-//     RIVER_LIP (+1). A reach at the sea's level never builds a levee: the
-//     sea is that water already.
+//     RIVER_LIP (+1), a crest's or a curtain's included (anywhere in the
+//     bank from the cut to RIVER_LIP + RIVER_CURTAIN + 2 past it, so the
+//     curtain's downstream corners are walled too). A reach at the sea's
+//     level never builds a levee: the sea is that water.
 // LAKES. A column inside a lake's polygon whose ground (a river's channel
 // floor, else the ground before any river bank) is under the level holds
 // water to it; outside, within the shore band, the ground is raised toward
@@ -2327,7 +2354,9 @@ fn rivCut(w : i32) -> vec2<i32> {
 // material (WATER_BED_DEPTH cells; a powder bed keeps to its step line in
 // `cols`), a dry shore the lake's shore material.
 // Bounds: a piece is <= 256 voxels a side and hw + bank <= 1536, so after
-// routeDist2's box reject every product is < 2^30 (worldmap.h kRiver*).
+// routeDist2's box reject every product is < 2^30 (worldmap.h kRiver*); a
+// piece's fall is < 2^16 eighths, so fall * tq < 2^24.
+const RIVER_CURTAIN : i32 = 2;
 fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, LandCol>) {
   if (T.labMode != 0u) { return; }
   let lst = wmSiteList(x, z);
@@ -2335,14 +2364,18 @@ fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, La
   if (n == 0u) { return; }
   let h0 = (*L).h;
   var inCh = false;
-  var wMin = 1048576;
-  var sMax = -1048576;
+  var w8Min = 1 << 28u;
+  var chD2 = -1;
   var floorMin = 1048576;
   var outS = -1048576;
   var lipY = -1048576;
+  var crestY = -1048576;
+  var curtY = -1048576;
+  var mCh = 1;
   var near = false;
   var nd2 = 0;
   var nS = 0;
+  var nM = 1;
   var nHw = 0;
   var nBank = 0;
   var nBed = MAT_AIR;
@@ -2377,12 +2410,16 @@ fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, La
         z < min(az, bz) - reach || z > max(az, bz) + reach) { continue; }
     let bw = wmSiteI(sid, WM_S_RIV_BED);
     let fl = u32(bw >> 12u) & 15u;
-    var lip = false;
+    // 0 = no strip, 1 = a waterfall's CREST, 2 = its CURTAIN, 3 = the bank
+    // band just past the curtain that must still hold it.
+    var strip = 0;
     if ((fl & RIV_FLAT_A) != 0u) {
       let c = rivCut(wmSiteI(sid, WM_S_RIV_CUT_A));
       let cd = (x - ax) * c.x + (z - az) * c.y;
       if (cd <= 0) { continue; }
-      lip = cd <= RIVER_LIP * 1024;
+      if (cd <= RIVER_LIP * 1024) { strip = 1; }
+      else if (cd <= (RIVER_LIP + RIVER_CURTAIN) * 1024) { strip = 2; }
+      else if (cd <= (RIVER_LIP + RIVER_CURTAIN + 2) * 1024) { strip = 3; }
     }
     if ((fl & RIV_FLAT_B) != 0u) {
       let c = rivCut(wmSiteI(sid, WM_S_RIV_CUT_B));
@@ -2399,26 +2436,37 @@ fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, La
     let hw = max(hwA + (((hwB - hwA) * tq) >> 8u), 1);
     let o = hw + max(bank, RIVER_LIP);
     if (d2 >= o * o) { continue; }
-    let s = wmSiteI(sid, WM_S_RIV_SURF);
-    // The weir holds the reach above across the channel and the bank next
-    // to it (water above can touch nothing further out).
-    if (lip && d2 < (hw + 2 * RIVER_LIP) * (hw + 2 * RIVER_LIP)) { lipY = max(lipY, wmSiteI(sid, WM_S_RIV_LIP_Y)); }
+    let lw = bitcast<u32>(wmSiteI(sid, WM_S_RIV_LIP_Y));
+    let lipV = bitcast<i32>(lw << 16u) >> 16u;
+    let fall8 = i32(lw >> 16u);
+    let s8 = wmSiteI(sid, WM_S_RIV_SURF) - ((fall8 * tq) >> 8u);
+    let s = (s8 - 1) >> 3u;
+    // The piece's steepness M (see the header): 1 + its fall per column in
+    // whole voxels, rounded up. The length rides kS_RivBed's top bits.
+    let plen = max(i32((u32(bw) >> 16u) & 1023u), 1);
+    let m = 1 + (fall8 + 8 * plen - 1) / (8 * plen);
+    // The crest and the curtain hold the reach above across the channel and
+    // the bank next to it (water above can touch nothing further out).
+    if (strip != 0 && d2 >= hw * hw) { lipY = max(lipY, lipV); }
     if (d2 < hw * hw) {
       inCh = true;
-      wMin = min(wMin, s);
-      sMax = max(sMax, s);
+      if (chD2 < 0 || d2 < chD2) { chD2 = d2; w8Min = s8; }
+      mCh = max(mCh, m);
       let da = wmSiteI(sid, WM_S_RIV_DEPTH_A);
       let dep = da + (((wmSiteI(sid, WM_S_RIV_DEPTH_B) - da) * tq) >> 8u);
       var drop = (dep * (hw * hw - d2)) / (hw * hw);
       if ((fl & RIV_PROFILE_V) != 0u) { drop = (dep * (hw - isqrtLe(d2, hw))) / hw; }
       floorMin = min(floorMin, s - drop);
+      if (strip == 1) { crestY = max(crestY, lipV); }
+      if (strip == 2) { curtY = max(curtY, lipV); }
     } else if (d2 < (hw + RIVER_LIP) * (hw + RIVER_LIP)) {
-      outS = max(outS, s);
+      outS = max(outS, s + m - 1);
     }
     if (!near || d2 < nd2) {
       near = true;
       nd2 = d2;
       nS = s;
+      nM = m;
       nHw = hw;
       nBank = max(bank, RIVER_LIP);
       nBed = u32(bw) & 0xFFFu;
@@ -2427,24 +2475,37 @@ fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, La
   if (!near && lake == 0u) { return; }
   var h = h0;
   var water = -1;
+  var gap = 0u;
   var bed = MAT_AIR;
   let sea = seaLevelY();
   if (inCh) {
-    let hold = max(sMax, max(outS, lipY));
-    if (hold > wMin) {
-      // A dry dam (a weir's crest, two channels' seam): the bed's stone,
-      // not the bank's grass, so a step reads as a ledge in the stream.
-      h = hold;
-      bed = nBed;
+    let wv = (w8Min - 1) >> 3u;
+    var top = wv;
+    var wg = u32(8 * wv + 8 - w8Min);
+    if (crestY > wv) {
+      // THE CREST: a sill of the bed's stone one cell under the upstream
+      // surface, that water running over it.
+      h = crestY - 1;
+      top = crestY;
+      wg = 0u;
     } else {
       h = floorMin;
-      // A FORD: the road's deck, kept one voxel under the water so the
-      // river runs on over it.
-      if (roaded) { h = max(h, min(hRoad, wMin - 1)); }
-      if (h < wMin) { water = wMin; bed = nBed; }
+      if (curtY > wv) {
+        // THE CURTAIN: the upstream surface's water standing on the lower
+        // reach's floor.
+        top = curtY;
+        wg = 0u;
+      } else if (roaded) {
+        // A FORD: the road's deck, kept one voxel under the water so the
+        // river runs on over it.
+        h = max(h, min(hRoad, wv - 1));
+      }
     }
+    bed = nBed;
+    if (h < top) { water = top; gap = wg; }
+    else { h = max(h, wv + mCh); }
   } else if (near) {
-    let tgt = nS + 1;
+    let tgt = nS + nM;
     let inner = nHw + RIVER_LIP;
     let o = nHw + nBank;
     var w = 256;
@@ -2460,10 +2521,10 @@ fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, La
     let lv = wmSiteI(lake, WM_S_LAKE_LEVEL);
     let band = wmSiteI(lake, WM_S_PAD_MARGIN);
     if (lkIn) {
-      // Inside: a river's channel keeps its floor; its banks and dams give
-      // way to the lake's own ground.
+      // Inside: a river's channel keeps its floor; its banks give way to the
+      // lake's own ground.
       if (water < 0) { h = h0; bed = MAT_AIR; }
-      if (h < lv) { water = lv; bed = u32(wmSiteI(lake, WM_S_LAKE_BED)); }
+      if (h < lv) { water = lv; gap = 0u; bed = u32(wmSiteI(lake, WM_S_LAKE_BED)); }
       else if (lkD2 >= 0 && lkD2 < band * band) { bed = u32(wmSiteI(lake, WM_S_LAKE_SHORE)); }
     } else if (water < 0 && lkD2 >= 0 && lkD2 < band * band) {
       let tgt = lv + 1;
@@ -2486,6 +2547,9 @@ fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, La
     (*L).pond = water;
     (*L).pw = vec2<i32>(h, water);
     (*L).fluid = M_WATER;
+    // The top cell's missing eighths belong to the surface that wins: the sea
+    // under a river that runs below it keeps its own full top.
+    if (water >= (*L).fluidTop) { (*L).fluidGap = gap; }
     (*L).fluidTop = max((*L).fluidTop, water);
     (*L).wp = 0u;
     (*L).bedSolid = false;
@@ -4142,6 +4206,10 @@ struct Col {
   wet         : bool,
   wtd2        : i32,
   wthw        : i32,
+  // The fluid top cell's MISSING eighths, 0 = full (a river's running surface,
+  // waterApply). Zero-initialised like every other field, so a path that never
+  // meets a river reads a full top cell.
+  fluidGap    : u32,
 };
 
 // ---- tile plants: ferns and big toadstools ---------------------------------
@@ -4281,6 +4349,10 @@ struct LandCol {
   wet         : bool,
   wtd2        : i32,
   wthw        : i32,
+  // The fluid top cell's MISSING eighths, 0 = full (a river's running surface,
+  // waterApply). Zero-initialised like every other field, so a path that never
+  // meets a river reads a full top cell.
+  fluidGap    : u32,
 };
 
 // MIRROR-BEGIN landheight
@@ -4620,6 +4692,7 @@ fn genColumn(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> Co
   col.wet = L.wet;
   col.wtd2 = L.wtd2;
   col.wthw = L.wthw;
+  col.fluidGap = L.fluidGap;
   *ponds = L.ponds;
   return col;
 }
@@ -5036,7 +5109,7 @@ fn ccStore(w : u32, col : ptr<function, Col>, cave : ptr<function, CaveBands>,
   // The preset index is small; the river / lake bed (12 bits) and the `wet`
   // flag ride above it (W1).
   colCache[w + CCW_WP] = ((*col).wp & 0xFFFu) | (((*col).wbed & 0xFFFu) << 12u) |
-                         select(0u, 1u << 24u, (*col).wet);
+                         select(0u, 1u << 24u, (*col).wet) | (((*col).fluidGap & 7u) << 25u);
   colCache[w + CCW_SHORE_WP] = (*col).shore.wp;
   colCache[w + CCW_PACKED] = ((*col).fluid & 0xFFFu) | (((*col).plant.mat & 0xFFFu) << 12u) |
                              (f << 24u);
@@ -5078,6 +5151,7 @@ fn ccLoad(w : u32, col : ptr<function, Col>, cave : ptr<function, CaveBands>) {
   (*col).nearWater = (f & CCF_NEAR_WATER) != 0u;
   (*col).wp = colCache[w + CCW_WP] & 0xFFFu;
   (*col).wbed = (colCache[w + CCW_WP] >> 12u) & 0xFFFu;
+  (*col).fluidGap = (colCache[w + CCW_WP] >> 25u) & 7u;
   (*col).wet = (colCache[w + CCW_WP] & (1u << 24u)) != 0u;
   (*col).wtd2 = 0;
   (*col).wthw = 0;
@@ -5633,6 +5707,8 @@ fn genCellIn(col : ptr<function, Col>,
   // liquids are born full (state nibble = fullness); solids get palette jitter
   var state = rnd % 3u;
   if (mat == M_WATER || mat == M_OIL || mat == M_LAVA) { state = LIQ_FULL_STATE; }
+  // A river's running surface: its top cell holds the ramp's eighths.
+  if (mat == (*col).fluid && y == (*col).fluidTop) { state = LIQ_FULL_STATE - (*col).fluidGap; }
   // STAMP_NEVER, not a live code: a generated voxel has not acted, so it must
   // be free to move on the first tick it is simulated.
   return packVox(mat, state, STAMP_NEVER);
@@ -7319,10 +7395,19 @@ fn cols(@builtin(workgroup_id) wg : vec3<u32>,
       if (col.fluidTop >= 0 && col.fluid == M_WATER &&
           ((col.wet && col.pond == col.fluidTop) ||
            (col.pond < 0 && col.fluidTop == seaLevelY()))) {
-        sv = (bitcast<u32>(col.fluidTop) & 0xFFFFFu) | (col.fluid << 20u);
+        // The surface in EIGHTHS (T8 = 8 top + the top cell's fullness), so a
+        // river's ramp is held to the eighth (sim_step.wgsl stillLevel8).
+        let t8 = 8 * col.fluidTop + 8 - i32(col.fluidGap);
+        sv = (bitcast<u32>(t8) & 0xFFFFFu) | (col.fluid << 20u);
       }
       let si = stillIndex(x, z);
-      stillWater[si] = stillTag(x, z);
+      let tag = stillTag(x, z);
+      // A slot taking a NEW world column drops the stream the old one held.
+      if (stillWater[si] != tag) {
+        stillWater[si + 2u] = 0u;
+        stillWater[si + 3u] = 0u;
+      }
+      stillWater[si] = tag;
       stillWater[si + 1u] = sv;
     }
     // Low byte the top cell's grains, next byte h - sedTop (clamped: 255 is

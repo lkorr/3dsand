@@ -1,11 +1,15 @@
 // selftest_rivers.cpp -- `rivers`: map.json rivers[] and lakes[] in the engine
 // (docs/PLAN_worldbuilder.md W1), and the smooth roads that share their spline.
 //
-// WHAT THIS GUARDS. A river is a staircase of STILL pools (worldwater.cpp says
-// why): the bake makes its surface monotone and flat per reach, worldgen
-// carves the channel, holds the banks and builds a weir at every step, and
-// the whole thing must be generated AT REST -- the sim must sleep over it
-// (CLAUDE.md rule 2), which is the claim this gate exists for. One synthetic
+// WHAT THIS GUARDS. A river is a RUNNING surface held at rest (worldwater.cpp
+// and docs/PLAN_running_water.md say why): the bake makes its surface monotone
+// and ramps it in eighths, keeping only waterfalls as hard steps; worldgen
+// carves the channel, holds the banks and stands a crest and a curtain at
+// every fall; sim_step.wgsl's held-water rule keeps all of it still, and the
+// whole thing must be generated AT REST -- the sim must sleep over it
+// (CLAUDE.md rule 2), which is the claim this gate exists for. A river is
+// also an INFINITE reservoir: a hole in it refills and a breach in its bank
+// floods (pass R). One synthetic
 // map in a TEMP asset dir (the `roads` seam): ground falling 7 m across the
 // window with hills either side and a basin, carrying
 //   main   a smooth 4 m river down the valley (stepVox 4: many small steps),
@@ -21,7 +25,7 @@
 //      join resolves with the mouth on main's channel, the creek drains into
 //      the lake; a join naming no river and a join cycle are REFUSED by name.
 //   B. THE BAKE (CPU): every river's surface is monotone non-increasing
-//      source -> mouth and flat per piece; the tributary's surface at the
+//      source -> mouth and every piece starts on the profile; the tributary's surface at the
 //      junction is >= main's there; the creek ends at the lake's level; the
 //      smooth road went through the spline and its baked grade respects
 //      maxGrade (the walked grade is the `roads` gate's; this road fords).
@@ -32,7 +36,10 @@
 //   D. CPU == GPU (per column, every 2nd): the mirror's ground is the world's
 //      ground, its water the world's water (to the cell).
 //   E. CONTAINED (GPU, every water voxel in the window band): no water voxel
-//      has AIR beside it or under it -- nothing can flow on tick 1.
+//      has AIR under it, and AIR beside it only over a HELD column whose own
+//      surface is below that air (a ramp's step, a rapid, a curtain): the
+//      held rule refuses exactly that move, so nothing can flow on tick 1.
+//      The held faces are counted; the curtains of `falls` must be among them.
 //   F. FAR: the level-5 cascade cells (3.2 m) along the 2 m `falls` are
 //      water (the narrow-water tint); the horizon's water plane covers main
 //      and the lake.
@@ -40,6 +47,14 @@
 //      or meadow): ticked to <= rivers.maxAwake (32) awake chunks and HELD
 //      there rivers.holdTicks more, at most rivers.maxAwakeWater of them over
 //      water or banks; WHERE they are and WHICH field moves when it fails.
+//   R. RUNNING, after G: a CRATER scooped out of main's surface refills to
+//      the profile, and a TRENCH cut through main's bank fills from the river
+//      to the river's level -- the reservoir is infinite and the held rule
+//      lets water into a held column under its target and into a column
+//      that is not held at all.
+//   S. A STREAM IS HELD, after R: a channel dug from the lake down to main
+//      runs as water, is adopted column by column (sim_stream.wgsl) and
+//      sleeps; its mouth plugged with stone, it is released and drains.
 //   I. CURRENT: the map-river arm of the current field puts several stream
 //      primitives on main and the field there runs downstream.
 //   H. THE SITE INDEX on `default` with a 10 km test river + a lake: loads,
@@ -73,6 +88,11 @@
 #include "test/selftest.h"
 #include "test/support.h"
 #include "test/tickrig.h"
+
+namespace worldmap {
+// world.cpp: what every river piece said about a column (the E leak report).
+std::string WaterColumnTrace(int x, int z, uint32_t seed);
+}  // namespace worldmap
 
 namespace selftest {
 namespace {
@@ -310,12 +330,20 @@ Status GateRivers(Ctx& c, std::string& detail) {
   const auto* rCreek = riverOf("creek");
   bool offChannel = false;
   for (const std::string& w : on.warnings) offChannel = offChannel || w.find("outside its channel") != std::string::npos;
-  const bool aOk = rMain && rFalls && rCreek && on.lakes.size() == 1 && rMain->reaches >= 3 && !rFalls->falls.empty() &&
+  // main RUNS: one reach (no fall), its surface over several voxels of ramp.
+  int mainLevels = 0;
+  if (rMain) {
+    std::set<int> lv;
+    for (const auto& p : rMain->line) lv.insert(p[2]);
+    mainLevels = static_cast<int>(lv.size());
+  }
+  const bool aOk = rMain && rFalls && rCreek && on.lakes.size() == 1 && rMain->falls.empty() && mainLevels >= 3 &&
+                   !rFalls->falls.empty() &&
                    rFalls->joinIdx >= 0 && rCreek->lakeOut == 0 && !offChannel && unknownRefused && cycleRefused;
-  std::printf("rivers: A load: %s (%zu rivers, %zu lakes in %.0f ms; main %d reaches / %d pieces, falls %d reaches, %zu "
-              "waterfall(s)%s, creek -> lake %s; unknown join refused %d, cycle refused %d)\n",
+  std::printf("rivers: A load: %s (%zu rivers, %zu lakes in %.0f ms; main %d reach(es) / %d pieces over %d surface levels, "
+              "falls %d reaches, %zu waterfall(s)%s, creek -> lake %s; unknown join refused %d, cycle refused %d)\n",
               aOk ? "PASS" : "FAIL", on.rivers.size(), on.lakes.size(), loadMs, rMain ? rMain->reaches : -1,
-              rMain ? rMain->pieces : -1, rFalls ? rFalls->reaches : -1, rFalls ? rFalls->falls.size() : 0,
+              rMain ? rMain->pieces : -1, mainLevels, rFalls ? rFalls->reaches : -1, rFalls ? rFalls->falls.size() : 0,
               (rFalls && !rFalls->falls.empty()) ? Format(" (first drops %d)", rFalls->falls[0][2]).c_str() : "",
               (rCreek && rCreek->lakeOut == 0) ? "yes" : "NO", unknownRefused, cycleRefused);
   for (const std::string& w : on.warnings) std::printf("rivers:   load warning: %s\n", w.c_str());
@@ -335,13 +363,16 @@ Status GateRivers(Ctx& c, std::string& detail) {
         if (rv.line[i][2] > rv.line[i - 1][2]) {
           if (!nonMono++) why = Format(" %s rises %d -> %d at sample %zu", rv.id.c_str(), rv.line[i - 1][2], rv.line[i][2], i);
         }
-    // Flat per piece: the piece's surface is the surface at both its ends' samples.
+    // Every piece starts ON the profile: its end-A surface (eighths) is the
+    // top water cell its start sample reports, and its fall is downhill.
     for (const auto& st : on.sites) {
       if (st.kind != worldmap::kSiteRiver) continue;
       const auto& rv = on.rivers[static_cast<size_t>(st.water)];
+      if (st.surfB > st.surf && !notFlat++)
+        why += Format(" %s: piece %s rises %d -> %d eighths", rv.id.c_str(), st.id.c_str(), st.surf, st.surfB);
       for (const auto& p : rv.line)
-        if ((p[0] == st.x && p[1] == st.z && (st.wflags & worldmap::kRivFlatA) == 0 && p[2] != st.surf)) {
-          if (!notFlat++) why += Format(" %s: piece %s surface %d, its start sample %d", rv.id.c_str(), st.id.c_str(), st.surf, p[2]);
+        if ((p[0] == st.x && p[1] == st.z && (st.wflags & worldmap::kRivFlatA) == 0 && p[2] != ((st.surf - 1) >> 3))) {
+          if (!notFlat++) why += Format(" %s: piece %s surface %d/8, its start sample %d", rv.id.c_str(), st.id.c_str(), st.surf, p[2]);
           break;
         }
     }
@@ -361,7 +392,7 @@ Status GateRivers(Ctx& c, std::string& detail) {
     const auto& rd = on.roads.at(0);
     const bool roadOk = rd.smooth && rd.points.size() > 3 && rd.worstGradeQ8 <= rd.maxGrade * 256 + 64;
     const bool bOk = nonMono == 0 && notFlat == 0 && joinOk && creekOk && roadOk;
-    std::printf("rivers: B bake: %s (surfaces monotone: %d rises; flat pieces: %d off; junction falls %d >= main %d; creek "
+    std::printf("rivers: B bake: %s (surfaces monotone: %d rises; pieces on the profile: %d off; junction falls %d >= main %d; creek "
                 "ends at %d, the lake's level %d; smooth road %zu vertices, baked grade %.2f %% <= %d %%)%s\n",
                 bOk ? "PASS" : "FAIL", nonMono, notFlat, rFalls->line.back()[2], mainAtJoin, rCreek->line.back()[2], lakeLevel,
                 rd.points.size(), rd.worstGradeQ8 / 256.0, rd.maxGrade, why.c_str());
@@ -495,7 +526,7 @@ Status GateRivers(Ctx& c, std::string& detail) {
     c.ctx.WaitIdle();
     std::map<std::pair<int, int>, std::vector<uint32_t>> rows;
     const int m = static_cast<int>(kNChunk) - 1;
-    auto vox = [&](int x, int y, int z) -> uint32_t {
+    auto voxRaw = [&](int x, int y, int z) -> uint32_t {
       const int cy = y >> 4, cz = z >> 4;
       if (cy < org.y || cy >= org.y + static_cast<int>(kNChunk)) return 0u;
       if (x < ox || z < oz || x >= ox + static_cast<int>(kWorldN) || z >= oz + static_cast<int>(kWorldN)) return 0u;
@@ -506,8 +537,9 @@ Status GateRivers(Ctx& c, std::string& detail) {
         it = rows.emplace(std::make_pair(cy, cz), std::move(run)).first;
       }
       const uint32_t local = (uint32_t(z & 15) * kChunk + uint32_t(y & 15)) * kChunk + uint32_t(x & 15);
-      return it->second[size_t((x >> 4) & m) * kChunkVol + local] & 0xFFFu;
+      return it->second[size_t((x >> 4) & m) * kChunkVol + local];
     };
+    auto vox = [&](int x, int y, int z) -> uint32_t { return voxRaw(x, y, z) & 0xFFFu; };
     auto nameOf = [&](uint32_t id) { return id < c.mats.size() ? c.mats[id].name : std::string("?"); };
     auto isWater = [&](uint32_t id) { return id == mWater || id == mIce; };
     auto isBody = [&](uint32_t id) {
@@ -516,7 +548,7 @@ Status GateRivers(Ctx& c, std::string& detail) {
 
     // ---- D. CPU == GPU ----
     {
-      int cols = 0, hollow = 0, buried = 0, wetCols = 0, waterBad = 0;
+      int cols = 0, hollow = 0, buried = 0, wetCols = 0, waterBad = 0, rampCols = 0;
       std::string why;
       for (int z = oz + 2; z < oz + static_cast<int>(kWorldN) - 2; z += 2)
         for (int x = ox + 2; x < ox + static_cast<int>(kWorldN) - 2; x += 2) {
@@ -537,15 +569,21 @@ Status GateRivers(Ctx& c, std::string& detail) {
                 why = Format(" (%d,%d): mirror water y%d..%d, world %s at the top, %s above, %s at the bottom", x, z, h + 1,
                              wc.water, nameOf(vox(x, wc.water, z)).c_str(), nameOf(vox(x, wc.water + 1, z)).c_str(),
                              nameOf(vox(x, h + 1, z)).c_str());
+            } else if (vox(x, wc.water, z) == mWater) {
+              // The running surface's top cell holds the ramp's eighths.
+              const uint32_t f = ((voxRaw(x, wc.water, z) >> 12) & 15u) + 1u;
+              if (wc.gap > 0) rampCols++;
+              if (f != 8u - static_cast<uint32_t>(wc.gap) && !waterBad++ && why.empty())
+                why = Format(" (%d,%d): top water cell y%d holds %u eighths, the mirror says %d", x, z, wc.water, f, 8 - wc.gap);
             }
           } else if (isBody(vox(x, h + 2, z)) && !isBody(vox(x, h + 1, z))) {
             if (!buried++ && why.empty()) why = Format(" (%d,%d): matter at y%d over the mirror's y%d", x, z, h + 2, h);
           }
         }
-      const bool dOk = cols > 5000 && wetCols > 2000 && hollow == 0 && buried == 0 && waterBad == 0;
-      std::printf("rivers: D GPU vs twin: %s (%d river/lake columns, %d under water; %d hollow, %d buried, %d water "
-                  "mismatches)%s\n",
-                  dOk ? "PASS" : "FAIL", cols, wetCols, hollow, buried, waterBad, why.c_str());
+      const bool dOk = cols > 5000 && wetCols > 2000 && hollow == 0 && buried == 0 && waterBad == 0 && rampCols > 50;
+      std::printf("rivers: D GPU vs twin: %s (%d river/lake columns, %d under water, %d with a part-full top on the ramp; "
+                  "%d hollow, %d buried, %d water mismatches)%s\n",
+                  dOk ? "PASS" : "FAIL", cols, wetCols, rampCols, hollow, buried, waterBad, why.c_str());
       if (!dOk) problems.push_back(Format("D: %d/%d/%d mismatches of %d columns%s", hollow, buried, waterBad, cols, why.c_str()));
     }
 
@@ -553,8 +591,14 @@ Status GateRivers(Ctx& c, std::string& detail) {
     // Every water voxel over every column the mirror gives water (D holds the
     // mirror to the world on those columns): no AIR beside it or under it.
     {
-      int water = 0, open = 0;
+      int water = 0, open = 0, held = 0, heldFalls = 0;
       std::string why;
+      // Within a few voxels of a `falls` waterfall's crest (the curtain).
+      auto nearFall = [&](int x, int z) {
+        for (const auto& f : rFalls->falls)
+          if (std::abs(f[0] - x) <= 12 && std::abs(f[1] - z) <= 12) return true;
+        return false;
+      };
       for (int z = oz + 1; z < oz + static_cast<int>(kWorldN) - 1; z++)
         for (int x = ox + 1; x < ox + static_cast<int>(kWorldN) - 1; x++) {
           const worldmap::WaterColumn wc = worldmap::WaterColumnAt(x, z, kDefaultSeed);
@@ -563,22 +607,36 @@ Status GateRivers(Ctx& c, std::string& detail) {
             if (!isWater(vox(x, y, z))) continue;
             water++;
             const int nb[5][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}, {0, -1, 0}};
+            bool face = false;
             for (const auto& d : nb) {
               if (vox(x + d[0], y + d[1], z + d[2]) != 0u) continue;
+              // HELD: air beside, over a held column whose own water stands
+              // below it -- the move the held rule refuses.
+              if (d[1] == 0) {
+                const worldmap::WaterColumn b = worldmap::WaterColumnAt(x + d[0], z + d[2], kDefaultSeed);
+                if (b.water >= 0 && b.water > b.h && y > b.water) { face = true; continue; }
+              }
               if (!open++) {
                 const worldmap::WaterColumn b = worldmap::WaterColumnAt(x + d[0], z + d[2], kDefaultSeed);
                 why = Format(" first: water (%d,%d,%d) has air at (%d,%d,%d); mirror there ground %d water %d, next ground %d "
-                             "water %d",
-                             x, y, z, x + d[0], y + d[1], z + d[2], wc.h, wc.water, b.h, b.water);
+                             "water %d; there:%s; next:%s",
+                             x, y, z, x + d[0], y + d[1], z + d[2], wc.h, wc.water, b.h, b.water,
+                             worldmap::WaterColumnTrace(x, z, kDefaultSeed).c_str(),
+                             worldmap::WaterColumnTrace(x + d[0], z + d[2], kDefaultSeed).c_str());
               }
               break;
             }
+            if (face) {
+              held++;
+              if (nearFall(x, z)) heldFalls++;
+            }
           }
         }
-      const bool eOk = water > 20000 && open == 0;
-      std::printf("rivers: E contained: %s (%d water voxels over the window, %d with air beside or under)%s\n",
-                  eOk ? "PASS" : "FAIL", water, open, why.c_str());
-      if (!eOk) problems.push_back(Format("E: %d of %d water voxels touch air%s", open, water, why.c_str()));
+      const bool eOk = water > 20000 && open == 0 && heldFalls > 20;
+      std::printf("rivers: E contained: %s (%d water voxels over the window, %d with air beside or under that no held "
+                  "column refuses; %d held faces (ramp steps, rapids, curtains), %d of them at the falls)%s\n",
+                  eOk ? "PASS" : "FAIL", water, open, held, heldFalls, why.c_str());
+      if (!eOk) problems.push_back(Format("E: %d of %d water voxels touch air, %d held at the falls%s", open, water, heldFalls, why.c_str()));
     }
 
     // ---- the picture: build/rivers_top.bmp ----
@@ -771,6 +829,286 @@ Status GateRivers(Ctx& c, std::string& detail) {
                   gOk ? "PASS" : "FAIL", active, ticks, maxAwake, nearWater, maxWater, elsewhere, nearWater ? " --" : "",
                   nearWater ? where.c_str() : "");
       RecordObserved("rivers.observedAwake", std::to_string(active));
+      // A DUG CHANNEL, LINED WITH STONE. Cut into this fixture's ground, a
+      // trench's walls are the sediment wedge and the dirt skin, which slide
+      // into it at their angle of repose and dam it within a few cells (the
+      // first R and S runs: 48% and 10% reached, page faults 0). That is soil
+      // mechanics, not the subject; so the gate's channels get a stone floor
+      // and a stone wall two cells thick from the floor up WALL_H, and are
+      // cleared above the floor DIG_H. The river's own columns are left as
+      // they are. `floorOf` is every channel column with its floor's y.
+      auto channelOps = [&](const std::map<std::pair<int, int>, int>& floorOf, std::vector<CellOp>& walls,
+                            std::vector<CellOp>& dig) {
+        constexpr int WALL_H = 24, DIG_H = 30;
+        const uint32_t stoneId = matIdOf("stone");
+        std::map<std::pair<int, int>, int> wallFloor;
+        for (const auto& [xz, fy] : floorOf)
+          for (int dz = -2; dz <= 2; dz++)
+            for (int dx = -2; dx <= 2; dx++) {
+              const std::pair<int, int> q{xz.first + dx, xz.second + dz};
+              if (floorOf.count(q)) continue;
+              auto it = wallFloor.find(q);
+              if (it == wallFloor.end()) wallFloor[q] = fy;
+              else it->second = std::min(it->second, fy);
+            }
+        for (const auto& [q, fy] : wallFloor) {
+          if (worldmap::WaterColumnAt(q.first, q.second, kDefaultSeed).water >= 0) continue;   // the river's own
+          for (int y = fy - 1; y <= fy + WALL_H; y++)
+            walls.push_back(CellOp{World::SlotCellIndex(IVec3{q.first, y, q.second}), stoneId});
+        }
+        for (const auto& [xz, fy] : floorOf) {
+          if (worldmap::WaterColumnAt(xz.first, xz.second, kDefaultSeed).water < 0)
+            walls.push_back(CellOp{World::SlotCellIndex(IVec3{xz.first, fy - 1, xz.second}), stoneId});
+          for (int y = fy; y <= fy + DIG_H; y++) dig.push_back(CellOp{World::SlotCellIndex(IVec3{xz.first, y, xz.second}), 0u});
+        }
+      };
+
+      // ---- R. running: a crater refills, a breach floods ----
+      // The reservoir is infinite (sim_step.wgsl HELD WATER): main's surface
+      // scooped out must come back to the profile, and a trench cut through
+      // its bank must fill from the river to the river's level. Both after G,
+      // so the world they disturb is the settled one G just measured.
+      {
+        const auto& Lm = rMain->line;
+        // The crater: a 7 x 7 box down to 4 cells under the surface, at the
+        // middle of main.
+        const auto& pc = Lm[Lm.size() / 2];
+        const int cx = pc[0], cz = pc[1], cTop = pc[2];
+        std::vector<CellOp> crater;
+        for (int dz = -3; dz <= 3; dz++)
+          for (int dx = -3; dx <= 3; dx++)
+            for (int y = cTop - 3; y <= cTop; y++)
+              crater.push_back(CellOp{World::SlotCellIndex(IVec3{cx + dx, y, cz + dz}), 0u});
+        // The breach: from inside the channel, out across the bank and 24
+        // voxels past it, 3 wide, its floor 2 cells under main's surface there
+        // and level (a dead end the river must FILL, then rest against).
+        const auto& pb = Lm[(Lm.size() * 3) / 4];
+        const auto& pb0 = Lm[(Lm.size() * 3) / 4 - 2];
+        const auto& pb1 = Lm[(Lm.size() * 3) / 4 + 2];
+        double tx = pb1[0] - pb0[0], tz = pb1[1] - pb0[1];
+        const double tl = std::max(std::hypot(tx, tz), 1e-6);
+        tx /= tl;
+        tz /= tl;
+        const double nx = -tz, nz = tx;   // across the channel
+        const int bTop = pb[2], bFloor = pb[2] - 2;
+        const int bankW = static_cast<int>(std::lround(1.5 * 2.0 * pb[3]));
+        const int r0 = pb[3] - 3, r1 = pb[3] + bankW + 12;
+        std::set<std::pair<int, int>> trenchCols;
+        std::map<std::pair<int, int>, int> trenchFloor;
+        for (int r = r0; r <= r1; r++)
+          for (int w = -1; w <= 1; w++) {
+            const int x = pb[0] + static_cast<int>(std::lround(nx * r + tx * w));
+            const int z = pb[1] + static_cast<int>(std::lround(nz * r + tz * w));
+            if (!trenchCols.insert({x, z}).second) continue;
+            trenchFloor[{x, z}] = bFloor;
+          }
+        (void)bTop;
+        std::vector<CellOp> trenchWalls, trench;
+        channelOps(trenchFloor, trenchWalls, trench);
+        // Columns of the trench that are NOT the river's own (outside the
+        // channel and the crest): where any water must have come from the
+        // breach.
+        std::vector<std::pair<int, int>> outCols;
+        for (const auto& [x, z] : trenchCols) {
+          const worldmap::WaterColumn wc = worldmap::WaterColumnAt(x, z, kDefaultSeed);
+          if (wc.water < 0) outCols.push_back({x, z});
+        }
+        sandvox::support::TickOps first;
+        sandvox::support::TickOps lining;
+        lining.cells = trenchWalls;
+        tick(lining);
+        first.cells = crater;
+        first.cells.insert(first.cells.end(), trench.begin(), trench.end());
+        tick(first);
+        const int runTicks = static_cast<int>(BaselineNumber("rivers.runTicks", 600));
+        uint32_t awakeMax = 0;
+        for (int k = 1; k < runTicks; k++) {
+          tick();
+          if (k % 60 == 0) {
+            c.ctx.WaitIdle();
+            awakeMax = std::max(awakeMax, sandvox::ReadActiveChunksSync(c.ctx, c.world, c.sim));
+          }
+        }
+        c.ctx.WaitIdle();
+        rows.clear();
+        // The crater, cell by cell, against the profile it was cut from.
+        int craterCells = 0, craterBack = 0;
+        for (int dz = -3; dz <= 3; dz++)
+          for (int dx = -3; dx <= 3; dx++) {
+            const worldmap::WaterColumn wc = worldmap::WaterColumnAt(cx + dx, cz + dz, kDefaultSeed);
+            for (int y = cTop - 3; y <= cTop; y++) {
+              if (y <= wc.h || y > wc.water) continue;
+              craterCells++;
+              if (vox(cx + dx, y, cz + dz) == mWater) craterBack++;
+            }
+          }
+        // The trench: the columns the river does not own, and how many of
+        // them the river has reached (water on the trench floor). A flat
+        // dead end fills by the CA's levelling, which is slow at the far end
+        // (diffusive), so the claim is REACH, not the brim.
+        int outCells = 0, outWet = 0;
+        for (const auto& [x, z] : outCols) {
+          const uint32_t w = voxRaw(x, bFloor, z);
+          if ((w & 0xFFFu) != 0u && (w & 0xFFFu) != mWater) continue;   // not dug (the floor is the ground there)
+          outCells++;
+          if ((w & 0xFFFu) == mWater) outWet++;
+        }
+        const double craterFrac = craterCells ? double(craterBack) / craterCells : 0.0;
+        const double trenchFrac = outCells ? double(outWet) / outCells : 0.0;
+        const double craterMin = BaselineNumber("rivers.craterRefillMin", 0.95);
+        const double trenchMin = BaselineNumber("rivers.breachReachMin", 0.7);
+        const bool rOk = craterCells > 50 && craterFrac >= craterMin && outCells > 40 && trenchFrac >= trenchMin;
+        std::printf("rivers: R running: %s (after %d ticks: the crater %d / %d cells water again (%.2f >= %.2f); the "
+                    "breach reached %d / %d trench columns past the bank (%.2f >= %.2f); peak %u chunks awake)\n",
+                    rOk ? "PASS" : "FAIL", runTicks, craterBack, craterCells, craterFrac, craterMin, outWet, outCells,
+                    trenchFrac, trenchMin, awakeMax);
+        RecordObserved("rivers.observedBreachFill", Format("%.3f", trenchFrac));
+        if (!rOk)
+          problems.push_back(Format("R: crater %d/%d, breach %d/%d", craterBack, craterCells, outWet, outCells));
+      }
+      // ---- S. a stream becomes held (sim_stream.wgsl) ----
+      // A CHANNEL dug from the lake down to main -- the player's case: a lake
+      // drained into a river. The lake stands ~15 voxels over main and the
+      // land between them is ~50 columns, so the channel RUNS (a couple of
+      // eighths of fall per column, where the CA moves water by gravity, not
+      // by levelling). Fed by the lake's reservoir at the top and drained into
+      // main's at the bottom, it is the conveyor phase 1 took off the authored
+      // rivers: a stream that never sleeps on its own. It must (a) run,
+      // (b) be ADOPTED column by column and fall asleep, and (c) once its
+      // mouth is plugged with stone, be RELEASED and drain.
+      {
+        const auto& Lm = rMain->line;
+        size_t im = 0;
+        for (size_t i = 0; i < Lm.size(); i++)
+          if (std::abs(Lm[i][0] - lakeX) < std::abs(Lm[im][0] - lakeX)) im = i;
+        const int zMain = Lm[im][1], hwM = Lm[im][3], topM = Lm[im][2];
+        const int zLake = lakeZ - 70;   // inside the polygon (radius >= 82)
+        const int dir = zLake > zMain ? 1 : -1;
+        const int zA = zLake, zB = zMain + dir * (hwM - 3);
+        const int yA = lakeLevel - 2, yB = topM - 1;
+        struct PP { int x, z, y; };
+        std::vector<PP> path;
+        const int n = std::abs(zB - zA);
+        for (int k = 0; k <= n; k++)
+          path.push_back({lakeX, zA - dir * k, yA + static_cast<int>(std::lround(double(yB - yA) * k / std::max(n, 1)))});
+        std::map<std::pair<int, int>, int> floorOf;
+        for (const PP& p : path)
+          for (int dx = -1; dx <= 1; dx++) {
+            auto it = floorOf.find({p.x + dx, p.z});
+            if (it == floorOf.end()) floorOf[{p.x + dx, p.z}] = p.y;
+            else it->second = std::min(it->second, p.y);
+          }
+        std::vector<CellOp> byWalls, dig;
+        channelOps(floorOf, byWalls, dig);
+        std::vector<std::pair<int, int>> byCols;   // the channel's own columns (not the lake's, not main's)
+        for (const auto& [xz, fy] : floorOf)
+          if (worldmap::WaterColumnAt(xz.first, xz.second, kDefaultSeed).water < 0) byCols.push_back(xz);
+        // The mouth to plug later: the first channel rows past the lake's water.
+        std::set<std::pair<int, int>> plugCols;
+        {
+          int rows = 0;
+          for (const PP& p : path) {
+            if (worldmap::WaterColumnAt(p.x, p.z, kDefaultSeed).water >= 0) continue;
+            for (int dx = -1; dx <= 1; dx++) plugCols.insert({p.x + dx, p.z});
+            if (++rows >= 3) break;
+          }
+        }
+        // The chunks the channel's own columns lie in, at their floors.
+        std::set<uint32_t> byChunks;
+        for (const auto& xz : byCols) {
+          const int fy = floorOf[xz];
+          for (int y = fy - 1; y <= fy + 3; y++)
+            byChunks.insert(World::SlotChunkIndex(IVec3{xz.first >> 4, y >> 4, xz.second >> 4}));
+        }
+        // The still table's dynamic words for the channel's columns.
+        const rhi::Buffer& still = c.sim.StillWaterBuffer();
+        auto adoptedCount = [&]() {
+          std::vector<uint32_t> tab(size_t(kWorldN) * kWorldN * 4u);
+          rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, still, 0, tab.data(), tab.size() * 4, "riversStill");
+          int k = 0;
+          for (const auto& xz : byCols) {
+            const size_t si = (size_t(xz.second & int(kWorldN - 1)) * kWorldN + size_t(xz.first & int(kWorldN - 1))) * 4u;
+            if (tab[si + 2] != 0u) k++;
+          }
+          return k;
+        };
+        auto wetCount = [&]() {
+          rows.clear();
+          int k = 0;
+          for (const auto& xz : byCols)
+            if (vox(xz.first, floorOf[xz], xz.second) == mWater) k++;
+          return k;
+        };
+        auto awakeOn = [&]() {
+          std::vector<uint32_t> fl2(kNumSlots, 0);
+          rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.DirtyActive(), 0, fl2.data(), kNumSlots * 4, "riversActiveS");
+          int k = 0;
+          for (uint32_t ci : byChunks)
+            if (ci < kNumSlots && fl2[ci] != 0u) k++;
+          return k;
+        };
+        sandvox::support::TickOps byLining;
+        byLining.cells = byWalls;
+        tick(byLining);
+        sandvox::support::TickOps first;
+        first.cells = dig;
+        tick(first);
+        std::printf("rivers:   S channel: lake (%d,%d) y%d -> main (%d,%d) y%d, %zu columns (%zu its own), %zu wall ops, "
+                    "%zu dig ops\n",
+                    lakeX, zA, yA, lakeX, zB, yB, floorOf.size(), byCols.size(), byWalls.size(), dig.size());
+        const int streamTicks = static_cast<int>(BaselineNumber("rivers.streamTicks", 1800));
+        std::string curve;
+        int wet = 0, adopted = 0, awake = 0;
+        for (int k = 1; k < streamTicks; k++) {
+          tick();
+          if (k % 150 == 0) {
+            c.ctx.WaitIdle();
+            wet = wetCount();
+            adopted = adoptedCount();
+            awake = awakeOn();
+            curve += Format(" %d:%d/%d/%d", k, wet, adopted, awake);
+          }
+        }
+        c.ctx.WaitIdle();
+        wet = wetCount();
+        adopted = adoptedCount();
+        awake = awakeOn();
+        const int nBy = static_cast<int>(byCols.size());
+        // (c) the plug: stone over the mouth, from below the channel floor up.
+        std::vector<CellOp> plug;
+        const uint32_t stoneW = matIdOf("stone");
+        for (const auto& xz : plugCols)
+          for (int y = yA - 3; y <= yA + 8; y++) plug.push_back(CellOp{World::SlotCellIndex(IVec3{xz.first, y, xz.second}), stoneW});
+        sandvox::support::TickOps plugOps;
+        plugOps.cells = plug;
+        tick(plugOps);
+        const int drainTicks = static_cast<int>(BaselineNumber("rivers.streamDrainTicks", 900));
+        std::string curve2;
+        for (int k = 1; k < drainTicks; k++) {
+          tick();
+          if (k % 150 == 0) {
+            c.ctx.WaitIdle();
+            curve2 += Format(" %d:%d/%d", k, wetCount(), adoptedCount());
+          }
+        }
+        c.ctx.WaitIdle();
+        const int adoptedAfter = adoptedCount();
+        const int wetAfter = wetCount();
+        const double adoptMin = BaselineNumber("rivers.streamAdoptMin", 0.5);
+        const int awakeMaxS = static_cast<int>(BaselineNumber("rivers.streamAwakeMax", 2));
+        const double releaseMax = BaselineNumber("rivers.streamReleaseMax", 0.2);
+        const bool sOk = nBy > 50 && wet >= nBy / 2 && adopted >= static_cast<int>(adoptMin * nBy) && awake <= awakeMaxS &&
+                         adoptedAfter <= static_cast<int>(releaseMax * nBy);
+        std::printf("rivers: S stream held: %s (channel %d columns: after %d ticks %d wet, %d adopted (>= %.2f), %d of its "
+                    "%zu chunks awake (<= %d); plugged, %d ticks on: %d adopted (<= %.2f), %d wet; tick:wet/adopted/awake%s; "
+                    "after the plug tick:wet/adopted%s)\n",
+                    sOk ? "PASS" : "FAIL", nBy, streamTicks, wet, adopted, adoptMin, awake, byChunks.size(), awakeMaxS,
+                    drainTicks, adoptedAfter, releaseMax, wetAfter, curve.c_str(), curve2.c_str());
+        RecordObserved("rivers.observedStreamAdopted", std::to_string(adopted));
+        if (!sOk)
+          problems.push_back(Format("S: channel %d cols, %d wet, %d adopted, %d awake; after plug %d adopted", nBy, wet, adopted,
+                                    awake, adoptedAfter));
+      }
       weather::SetOverride(prevPin);
       if (!gOk) problems.push_back(Format("G: %u chunks awake after %d ticks (%d at the water)", active, ticks, nearWater));
     }
@@ -840,7 +1178,7 @@ Status GateRivers(Ctx& c, std::string& detail) {
     std::printf("rivers: FAIL (%s)\n", detail.c_str());
     return Status::Fail;
   }
-  detail = "spline, load, bake, lake, CPU == GPU, contained, far + horizon, sleep, site index";
+  detail = "spline, load, bake, lake, CPU == GPU, contained + held, far + horizon, sleep, running, stream held, site index";
   std::printf("rivers: PASS\n");
   return Status::Pass;
 }

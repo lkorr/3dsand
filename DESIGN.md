@@ -24860,6 +24860,65 @@ two layers dug out of it; F a twice-run of a one-layer mound + dent at the same
 tick numbers, hashed. Every arm prints its off-level curve (columns off, eighths
 off, highest, lowest, awake), so a failure says which half did not finish.
 
+### 5b.13 Running water that sleeps — held water, sloped rivers, curtains (added 2026-10-16)
+
+`docs/PLAN_running_water.md` is the full record. The owner asked for rivers that
+RUN — down a slope, over rapids and waterfalls — without the cost of
+simulating every voxel of it, and for rivers, lakes and the sea to behave as if
+their volume were infinite. A reach-1 CA cannot let a falling surface rest: fed
+at the top and drained at the bottom (the reservoir does both) a running river
+is a conveyor that never sleeps. So the voxels stay real and at rest, and the
+CA is told that a river at its surface is already where it is going.
+
+**The held rule** (`sim_step.wgsl`, HELD WATER, beside THE RESERVOIR). The still
+table's level is now **T8, in eighths** (full cells to `(T8 - 1) >> 3`, the top
+one holding the rest). A cell AT REST in a held column (`8 y + f <= T8`) never
+sends liquid sideways or diagonally into a cell of ANOTHER held column (same
+liquid) that is AT OR OVER that column's own target. Everything else moves as
+water: a held column under its target (a crater, a scoop) takes water from its
+held neighbours; a held cell beside a column that is not held (a dug bank)
+spills — a breach, fed for as long as the river exists; water over a target (a
+bucket, a splash) flows and is taken back. `canFlowAnywhere` and `bridgeLevel`
+ask the same predicates. The rule only REFUSES moves, so it adds nothing that
+could cycle; an undisturbed held river has no move left and sleeps.
+
+**The reservoir changes with it** (supersedes §5b.12's DEFICIT bullet): TAKE and
+GROW no longer roll and fill the cell to its target in one write — a river that
+has just poured into a breach must be full again before the breach asks for
+more, or the breach drains the river instead of the river feeding the breach.
+GIVE keeps its roll and its one eighth. `sim.stillWaterRelax = 0` switches the
+reservoir AND the held rule off (`lake-settle`'s control arm).
+
+**The bake** (`worldwater.cpp` step 8; `assets/editor/riverbake.js` is the
+port, `scripts/test_riverbake.mjs` holds them equal). The `stepVox` staircase is
+unchanged; every step of at most `kRiverWaterfall` (2 m) is SOFT and the surface
+ramps down to it in eighths over at most `kRiverRampVox` (48) of arc per voxel of
+drop. Only a drop over 2 m stays a hard step — a waterfall. `kS_RivSurf` is T8 at
+end A, `kS_RivLipY` the lip Y (i16) and the fall A -> B in eighths (u16).
+
+**`waterApply`** (GPU and CPU twin, per voxel equal — `rivers` D): channel water
+is the lowest T8 claiming the column with a part-full top cell (`fluidGap`, zero
+= full, colCache `CCW_WP` bits 25..27); the weir dams are gone except at a
+waterfall, which is a CREST (a sill one cell under the upstream surface, its
+water over it) and a CURTAIN (`RIVER_CURTAIN` = 2 voxels: the upstream surface's
+water standing on the lower reach's floor — a held sheet against the cliff);
+banks rise to hold both.
+
+**The look** (`raymarch.wgsl`): every SIDE face of water is a falling sheet
+(`fallingSheet`: vertical whitewater streaks scrolling down at 3.2 m/s) — a held
+curtain, a rapid's step and a CA spill in flight all read as water going down;
+`fallCueAt` gives a held curtain the waterfall mist and its foot the plunge
+spray; the top keeps the flow grid's streaks (§9d.10).
+
+**Gate `rivers`** grew: D compares the top cell's eighths, E allows air beside
+water only over a held column whose surface is below it (and requires the
+falls' curtain to be there), and **R** scoops a crater out of the river (it must
+refill) and cuts a trench through its bank (it must flood from the river).
+
+Phase 2 — a player-made stream between two held bodies adopted into a dynamic
+held layer once steady and released when its source is cut — is designed in the
+plan document and not built.
+
 ## 9d. The current field, and surface waves (added 2026-08-29)
 
 `docs/PLAN_water_master.md` components 8 and 9 (milestone M4, "it looks alive").

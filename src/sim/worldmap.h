@@ -733,9 +733,12 @@ enum : uint32_t {
   kS_RivHwB = 5,        // the channel half-width at end B
   kS_RivDepthA = 6,     // water depth at the centreline, end A
   kS_RivDepthB = 8,     // ... end B
-  kS_RivSurf = 9,       // the REACH'S water surface Y (flat over the piece)
+  kS_RivSurf = 9,       // the water surface at end A, EIGHTHS (T8: full cells to
+                        // (T8 - 1) >> 3, the top one T8 - 8 * that eighths)
   kS_RivBed = 10,       // bed material (bits 0..11) | kRiv* flags << 12 | length << 16
-  kS_RivLipY = 11,      // a step-start piece: the UPSTREAM reach's surface (the weir it holds)
+  kS_RivLipY = 11,      // i16: a step-start piece's UPSTREAM top water cell Y (the
+                        // crest and curtain it holds) | u16 << 16: the surface's
+                        // fall A -> B in eighths (end B's T8 = surf - this)
   kS_RivCutA = 12,      // a flat end A: the shared cut normal, i16 x | i16 z << 16 (|n| ~ 1024)
   kS_RivCutB = 15,      // a flat end B: likewise
   // Lake words (kSiteLakeEdge / kSiteLakeCell). An edge: kS_X / kS_Z and
@@ -762,6 +765,12 @@ enum : uint32_t {
   kRiverBankMax = 1024,      // the bank never reaches past hw + this
   kRiverStepDefault = 4, kRiverStepMax = 64,
   kRiverWaterfall = 20,      // a step that drops more than this (2 m) is a waterfall
+  // A SOFT step (<= kRiverWaterfall) is a ramp: the surface runs down to it
+  // over at most this much arc per voxel of drop (worldwater.cpp step 8).
+  kRiverRampVox = 48,
+  // A waterfall's CURTAIN: the held water column just past the crest strip,
+  // this many voxels along the cut normal (worldgen.wgsl waterApply).
+  kRiverCurtain = 2,
   kLakeEdgeMax = 256,        // a polygon edge's longest side (split at load)
   kLakeBandDefault = 24, kLakeBandMax = 128,
   kWaterBedDepth = 2,        // cells of bed / shore material a water column lays
@@ -1148,6 +1157,7 @@ struct WorldMapData {
     // the bank; these are the kS_Riv* words. A LAKE EDGE / CELL: `surf` the
     // level, `bed` / `shore` the materials, `bits` a cell's row parity.
     int hwB = 0, depthA = 0, depthB = 0, surf = 0, lipY = 0, len = 0;
+    int surfB = 0;                        // a river piece: end B's surface, eighths
     int wflags = 0;                       // kRiv* / kLakeCellInside
     int cutA = 0, cutB = 0;               // packed i16 x | i16 z << 16
     uint32_t bed = 0, shore = 0;
@@ -1439,6 +1449,7 @@ struct WaterColumn {
   int water = -1;
   uint32_t bed = 0;
   bool wet = false;
+  int gap = 0;      // eighths the top water cell lacks (a river's running surface)
 };
 WaterColumn WaterColumnAt(int x, int z, uint32_t seed);
 

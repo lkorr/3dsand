@@ -637,6 +637,23 @@ PASS(fill_flowMeasAcc, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,kFlowMeasAccBytes,
 PASS(fill_flowMeasField, nullptr, PT_TICK, PIPE_NONE, K_FILL, kFlowMeasStateOffset,0,0, GRP_NONE, DYN_NONE, C_FLOWMEASCLR, 1,
      USES(TW(FlowMeasure)))
 
+// ---- STREAMS BECOME HELD (sim_stream.wgsl; DESIGN.md §5b.13) -------------
+// After both colour-row sets, over the dirty list: the topmost dirty chunk of
+// each window column looks at that column's surface and moves its dynamic
+// target in the still table (words [2], [3]). `scan` reads neighbours'
+// committed targets and writes its own column's observation; `commit`, after
+// the barrier this row pair implies, applies it. The CA reads the targets on
+// the NEXT tick (stillLevel8). Read-only voxels: the module declares them
+// read_write for common.wgsl, and stores nothing.
+PASS(streamScan, "stream", PT_TICK, PIPE_STREAM_SCAN, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(U(TickUBO) R(Voxels) R(Materials) R(DirtyIn) R(DirtyList) I(DispatchArgs)
+          R(PageTable) RW(StillWater)))
+PASS(streamCommit, "stream", PT_TICK, PIPE_STREAM_COMMIT, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(U(TickUBO) R(Voxels) R(Materials) R(DirtyIn) R(DirtyList) I(DispatchArgs)
+          R(PageTable) RW(StillWater)))
+
 // ---- phase 3a: THE SOLUTE LAYER AFTER THE CA (docs/PLAN_solutes.md §3.3) ---
 //
 // solDiffuse  one group per dirty chunk: PAIR-EXCHANGE diffusion. The axis and
@@ -1517,10 +1534,17 @@ PASS(wg_fill_fluidBlockMap, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_
 // over every chunk-column of the window (Simulation::WriteDenseGenList wrote
 // genCols for slots 0..N-1). Same pass group, so the ColCache W -> R edge
 // below is an in-pass barrier.
+// The still table is cleared with the world: `cols` rewrites the authored
+// words of every column, but a stream's dynamic words (sim_stream.wgsl) belong
+// to the world being replaced, and a column keeps them across `cols` while its
+// tag is unchanged -- which a whole-window regeneration of the same window
+// would be.
+PASS(wg_fill_stillWater, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_DENSEWG, 1,
+     USES(TW(StillWater)))
 PASS(worldgenColsDense, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN_COLS, K_COMPUTE, D_GENCOLS,1,1,
      GRP_SIM, DYN_ZERO, C_DENSEWG, 1,
      USES(R(GenCols) R(Materials) U(TickUBO) W(ColCache) R(TreeAtlas) R(WorldMap)
-          W(StillWater)))
+          RW(StillWater)))
 // read-only in practice: `colCache` is read_write for the module because
 // `cols` writes it; genChunk only reads the column records.
 PASS(worldgen, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_DENSEWG, 1,
@@ -1551,7 +1575,7 @@ PASS(worldgenWetAll, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN_WET_ALL, K_COMPUTE, 
 PASS(worldgenCols, "worldgenList", PT_GENLIST, PIPE_WORLDGEN_COLS, K_COMPUTE, D_GENCOLS,1,1,
      GRP_SIM, DYN_ZERO, C_GENCOUNT, 1,
      USES(R(GenCols) R(Materials) U(TickUBO) W(ColCache) R(TreeAtlas) R(WorldMap)
-          W(StillWater)))
+          RW(StillWater)))
 // read-only in practice: `colCache` is read_write for the module because
 // `cols` writes it; genChunk only reads the column records.
 PASS(worldgenList,"worldgenList", PT_GENLIST, PIPE_WORLDGEN_LIST, K_COMPUTE, D_GENCOUNT,1,1,

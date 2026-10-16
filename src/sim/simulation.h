@@ -718,6 +718,9 @@ class Simulation {
   // The measured flow's buffer (flowfield.h kFlowMeas*), for a gate's readback
   // (`flow-measure`) only -- nothing on the frame path reads it back.
   const rhi::Buffer& FlowMeasureBuffer() const { return flowMeasBuf_; }
+  // The still table (worldgen.wgsl STILL_WORDS = 4 a window column): the `rivers`
+  // gate reads a stream's dynamic words back (sim_stream.wgsl).
+  const rhi::Buffer& StillWaterBuffer() const { return stillWaterBuf_; }
 
   // ---- WIND DRAFTS: the shelter volume (sim_draft.wgsl, world.h kDraft*) ----
   // For the next EncodeTick: the gate (tuning sim.draftMode) and the tick's
@@ -1300,6 +1303,9 @@ class Simulation {
   // simBGL_ and the slim layout, 49 in renderBGL_, 36 in shadowBGL_. GPU-owned.
   rhi::Buffer flowMeasBuf_;
   rhi::ComputePipeline flowMeasFold_;   // flow_measure.wgsl `fold`
+  // Streams become held (sim_stream.wgsl `scan` / `commit`; DESIGN.md §5b.13).
+  rhi::ComputePipeline streamScan_;
+  rhi::ComputePipeline streamCommit_;
   // Ticks the fold keeps recording after the last tick anything fed it
   // (EncodeTick), and whether the last tick recorded it (so the tick after
   // the tail records the one Fill that zeroes the published field).
