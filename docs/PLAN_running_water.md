@@ -151,11 +151,31 @@ full; colCache `CCW_WP` bits 25..27) into `genCellIn`.
   glass or ice: the plain flat face it always was), a RISER when the water
   outside stands less than 0.75 cell below this cell's surface (a step of a
   running surface: lit as top), else a FALLING SHEET — vertical whitewater
-  streaks scrolling down at 3.2 m/s. A held curtain, a rapid's step and the
-  CA's own spill all read as water going down. Water stepping off onto a
-  floor drops by its own depth (a puddle's 2/8 edge is not a waterfall).
+  streaks in FREE FALL: advected exactly from the crest (a parcel d metres
+  under it has fallen for T(d) = (sqrt(v0² + 2 g d) - v0) / g, v0 = 1 m/s,
+  so 4.5 m/s a metre down, 7.7 m/s three metres down; the streaks speed up
+  and draw out into ropes toward the foot). `fallCrestDepthM` finds d up the
+  face's own column (strides of 4 cells, then cell by cell, capped at
+  6.4 m). Was a constant 3.2 m/s (ticket 2026-10-16_11-08-20: "moves
+  unrealistically slowly"). A held curtain, a rapid's step and the CA's own
+  spill all read as water going down. Water stepping off onto a floor drops
+  by its own depth (a puddle's 2/8 edge is not a waterfall).
+* WATER IN FLIGHT (air or a gas under the cell) draws the sheet on EVERY
+  face: its underside — the face any ray from below meets — and its top as
+  end-on churning white water (ticket 2026-10-16_11-18-23: seen from below,
+  a falling column was a near-clear pane with only the tops of its cells
+  visible through it; a partial cell in free fall was a dark glass cube).
+* White water is lit by `whiteWaterLight`: sky by the face's normal (a face
+  turned down takes the side-on sky: the sheet is lit through) plus the key
+  light, the enclosure's ambient where the sky cannot reach. NOT times
+  `mediaLightK`, which the first cut applied on top of those absolute lights
+  and so squared the night: every streak of a curtain at night came out
+  black. Surface foam (authored colour) IS times `mediaLightK`; it used to
+  glow full daylight white at midnight.
 * `fallCueAt`: a held curtain (liquid over liquid, air in front, liquid along
-  it) throws the waterfall mist and spray, its foot is the plunge.
+  it) throws the waterfall mist and spray, its foot is the plunge. The mist's
+  key-light shadow darkens the key light only (it scaled the sky ambient too,
+  so mist with the moon down was darker than what it hangs in front of).
 * `gSlopeFlow`: the surface's own macro slope is a current (downhill, 9 m/s
   per unit slope, capped at 3 m/s), added to the flow grid where the two
   surface terms that draw motion read it — a held ramp, a rapid and an adopted

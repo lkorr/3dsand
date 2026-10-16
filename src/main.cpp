@@ -3686,6 +3686,29 @@ int RunWaterfallShot(GpuContext& ctx, World& world, Simulation& sim) {
     const auto ya = aim(eye, at);
     render(eye, ya.first, ya.second, "screenshot_waterfall_base.bmp");
   }
+  {
+    // _waterfall_under: standing in the basin beside the column, looking UP
+    // at the water falling past (ticket 2026-10-16_11-18-23: water seen from
+    // below drew only the tops of its cells). The subject is the UNDERSIDE of
+    // liquid in free fall, which none of the three frames above ever shows.
+    const Vec3 eye{(float)(cx + 7), (float)(floorY - 3), (float)cz + zs * 5.0f};
+    const Vec3 at{(float)(cx + 1), (float)(floorY + 26), (float)cz};
+    const auto ya = aim(eye, at);
+    render(eye, ya.first, ya.second, "screenshot_waterfall_under.bmp");
+  }
+  // SANDVOX_WATERFALL_EYE=ex,ey,ez,ax,ay,az: one more frame from that eye at
+  // that target, both relative to (fall x, plaza y, fall z) -- a look question
+  // about this subject without a rebuild per camera.
+  if (const char* we = std::getenv("SANDVOX_WATERFALL_EYE")) {
+    float e[6] = {};
+    if (std::sscanf(we, "%f,%f,%f,%f,%f,%f", &e[0], &e[1], &e[2], &e[3], &e[4],
+                    &e[5]) == 6) {
+      const Vec3 eye{(float)cx + e[0], (float)floorY + e[1], (float)cz + e[2]};
+      const Vec3 at{(float)cx + e[3], (float)floorY + e[4], (float)cz + e[5]};
+      const auto ya = aim(eye, at);
+      render(eye, ya.first, ya.second, "screenshot_waterfall_eye.bmp");
+    }
+  }
   std::printf("--shot-waterfall: floorY=%d cliffTop=%d, %zu build ops\n",
               floorY, cliffTop, build.size());
   return ctx.ReportVkValidation("--shot-waterfall") > 0 ? 1 : 0;

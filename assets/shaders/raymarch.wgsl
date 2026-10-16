@@ -10983,13 +10983,34 @@ const WATER_FOAM_COLOR : vec3f = vec3f(0.92, 0.95, 0.97);
 // on a running surface, or the CA's own spill in flight. All of them are water
 // going DOWN, and a clear glassy wall is the one thing none of them looks like
 // -- so the face is drawn as a falling sheet: white water in vertical streaks
-// that scroll down at a fall speed, two octaves so it breaks up into ropes
-// rather than stripes. Metres in, so the look does not depend on voxel size.
-// Returns the whitewater cover 0..1. Two vnoise taps, on side-face water
-// pixels only.
-const FALL_SHEET_SPEED : f32 = 3.2;   // m/s the streaks fall
+// that FALL, two octaves so it breaks up into ropes rather than stripes.
+// Metres in, so the look does not depend on voxel size. Returns the whitewater
+// cover 0..1. Two vnoise taps, on side-face water pixels only.
+//
+// FREE FALL, NOT A CONVEYOR (ticket 2026-10-16_11-08-20: "moves
+// unrealistically slowly"). The streaks used to scroll at one 3.2 m/s from
+// lip to foot; water leaves a crest at about a metre a second and then
+// accelerates, v = sqrt(v0^2 + 2 g d) at d metres under the crest (4.5 m/s
+// one metre down, 7.7 m/s three metres down). The texture is advected
+// exactly: a feature is a parcel of water that left the crest at time t0 and
+// is now d(t - t0) below it, so the conserved coordinate is
+// s = t - T(d), T(d) = (sqrt(v0^2 + 2 g d) - v0) / g, the time a parcel takes
+// to fall d. A streak therefore speeds up AND stretches as it falls -- short
+// flecks at the lip drawn out into long ropes at the foot, which is what a
+// real fall looks like. `d` is measured up the face's own column
+// (fallCrestDepthM).
+const FALL_SHEET_V0 : f32 = 1.0;      // m/s over the crest
+const FALL_SHEET_G : f32 = 9.81;      // m/s^2
+// The noise's vertical scale, in metres of fall at this speed: at the crest a
+// streak is FALL_SHEET_V0 / FALL_SHEET_TEX of the old one's length.
+const FALL_SHEET_TEX : f32 = 3.2;
 const FALL_SHEET_WHITE : f32 = 0.9;   // the cover at a streak's core
 const FALL_SHEET_BASE : f32 = 0.22;   // the cover between streaks (aerated, never clear)
+// The same for water IN FLIGHT (openBelow): a spill or a pour broken into
+// cells with air between them is spray, not a glassy sheet over a cliff, and
+// at 0.22 the cells behind the first one showed through it as a stack of
+// translucent cube shells (looking up at it, ticket 2026-10-16_11-18-23).
+const FALL_FLIGHT_BASE : f32 = 0.6;
 // Only where the water really DROPS AWAY beside the face: at least
 // FALL_SHEET_MIN_DROP cells from this cell's surface down to the water level
 // outside it (that cell's fullness, or the one under it, one cell lower). A
@@ -11042,14 +11063,78 @@ fn waterSideKind(cell : vec3<i32>, out : vec3<i32>) -> u32 {
   }
   return select(SIDE_RISER, SIDE_SHEET, liquidFullnessAt(cell) - level >= FALL_SHEET_MIN_DROP);
 }
-fn fallingSheet(hitP : vec3f, axis : i32) -> f32 {
+// How far under its crest a falling face is, in metres: up the face's own
+// column while it stays liquid, in strides of FALL_CREST_STRIDE cells (a held
+// curtain is solid water to the lip; a CA spill in flight has gaps, and a
+// stride steps over a short one), then cell by cell to the top cell, whose
+// fullness is the crest. Capped at FALL_CREST_STRIDES strides (6.4 m): past
+// that the fall is read as starting at the cap, a seam in the streaks every
+// 6.4 m of a taller fall and nothing else. At most 19 voxel reads, on falling
+// face pixels only.
+const FALL_CREST_STRIDE : i32 = 4;
+const FALL_CREST_STRIDES : i32 = 16;
+fn fallCrestDepthM(cell : vec3<i32>, hitY : f32) -> f32 {
+  var top = cell;
+  for (var i = 0; i < FALL_CREST_STRIDES; i++) {
+    let c = top + vec3<i32>(0, FALL_CREST_STRIDE, 0);
+    if (liquidFullnessAt(c) <= 0.0) { break; }
+    top = c;
+  }
+  var f = liquidFullnessAt(top);
+  for (var j = 0; j < FALL_CREST_STRIDE - 1; j++) {
+    let fu = liquidFullnessAt(top + vec3<i32>(0, 1, 0));
+    if (fu <= 0.0) { break; }
+    top.y += 1;
+    f = fu;
+  }
+  return max(f32(top.y) + f - hitY, 0.0) * VOXEL_METERS;
+}
+// `face` = the cover on a SIDE face (vertical streaks advected in free fall);
+// on a top or bottom face of water in flight (`axis` 1) the same white water
+// seen end-on: a churning mottle, no direction to streak along.
+fn fallingSheet(hitP : vec3f, axis : i32, cell : vec3<i32>, base : f32) -> f32 {
   let pm = hitP * VOXEL_METERS;
-  let u = select(pm.x, pm.z, axis == 0);   // along the face
-  let v = pm.y + R.time * FALL_SHEET_SPEED;
-  let n1 = vnoise(vec3f(u * 9.0, v * 0.9, 0.0));
-  let n2 = vnoise(vec3f(u * 23.0, v * 2.3, 7.3));
+  var n1 : f32;
+  var n2 : f32;
+  if (axis == 1) {
+    let c = R.time * 2.5;
+    n1 = vnoise(vec3f(pm.x * 9.0, pm.z * 9.0, c));
+    n2 = vnoise(vec3f(pm.x * 23.0, pm.z * 23.0, c * 2.3 + 7.3));
+  } else {
+    let u = select(pm.x, pm.z, axis == 0);   // along the face
+    let d = fallCrestDepthM(cell, hitP.y);
+    let T = (sqrt(FALL_SHEET_V0 * FALL_SHEET_V0 + 2.0 * FALL_SHEET_G * d) - FALL_SHEET_V0) /
+            FALL_SHEET_G;
+    let v = (R.time - T) * FALL_SHEET_TEX;
+    n1 = vnoise(vec3f(u * 9.0, v * 0.9, 0.0));
+    n2 = vnoise(vec3f(u * 23.0, v * 2.3, 7.3));
+  }
   let streak = smoothstep(0.42, 0.80, n1 * 0.65 + n2 * 0.35);
-  return (FALL_SHEET_BASE + (1.0 - FALL_SHEET_BASE) * streak) * FALL_SHEET_WHITE;
+  return (base + (1.0 - base) * streak) * FALL_SHEET_WHITE;
+}
+// Air or a gas under the cell (or the window's edge): liquid there is in
+// flight. One voxel read.
+fn openBelow(c : vec3<i32>) -> bool {
+  let b = c - vec3<i32>(0, 1, 0);
+  if (!inBounds(b)) { return true; }
+  let m = voxMat(voxWordAt(b));
+  return m == MAT_AIR || materials[m].klass == CLASS_GAS;
+}
+// What lights white water (a falling sheet, foam on a surface is the authored
+// colour times mediaLightK instead): the sky and key light by the face's own
+// normal where the sky reaches it, the enclosure's ambient where it does not.
+// The sheet is thin and aerated, so it is lit THROUGH as well: a face turned
+// down (the underside of water in flight) takes the side-on sky, not the
+// ground bounce, and a little of the key light from behind.
+// NOT times mediaLightK: these are already the absolute lights, and scaling
+// them by the light-fraction a second time (as the first cut did) squared the
+// night -- moonlit white water came out near black, darker than the scene
+// behind it, so every streak of a curtain at night was a BLACK streak
+// (ticket 2026-10-16_11-08-20).
+fn whiteWaterLight(n : vec3f) -> vec3f {
+  let open = ambientAt(vec3f(n.x, max(n.y, 0.0), n.z)) * 1.1 +
+             keyLightColor() * (0.15 + 0.35 * max(dot(n, keyLightDir()), 0.0));
+  return mix(TUNE_ENCLOSED_AMBIENT, open, fogSkyK()) * WATER_FOAM_COLOR;
 }
 
 // THE STAR FIELD'S MEAN RADIANCE, analytically: what starField averages to
@@ -11945,8 +12030,14 @@ fn waterfallMist(base : vec3f, hitP : vec3f, rd : vec3f, tHit : f32,
   let clarity = clamp((1.0 - f32(materials[mat].opacity) / 255.0) * 1.5,
                       0.0, 1.0);
   let tint = mix(lmc, vec3f(1.0), 0.65 * clarity);
-  let col = (ambientAt(vec3f(0.0, 1.0, 0.0)) + keyLightColor() * lit)
-            * (0.25 + 0.75 * lit) * tint * TUNE_MIST_BRIGHTNESS;
+  // The key light's shadow takes the KEY light, not the sky: this used to
+  // scale the ambient by (0.25 + 0.75 lit) too, so mist out of the sun -- and
+  // ALL mist with the moon down -- was a quarter of the sky light, darker than
+  // the shaded rock and water it hangs in front of: dark smudges drifting down
+  // every fall at night (ticket 2026-10-16_11-08-20). A sunlit plume is what
+  // it always was. Enclosed, the enclosure's ambient (THE MEDIUM'S SKY).
+  let col = (mix(TUNE_ENCLOSED_AMBIENT, ambientAt(vec3f(0.0, 1.0, 0.0)), fogSkyK()) +
+             keyLightColor() * lit) * tint * TUNE_MIST_BRIGHTNESS;
 
   var out = base;
   if (TUNE_MIST_DENSITY > 0.0 && cue.fall > 0.0) {
@@ -12970,13 +13061,31 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
 
   // ---- falling water: a side face is a falling sheet (fallingSheet) ----
   // Lit like the rain splash below (sky + key light by the face's own
-  // normal); no shadow ray, the sheet is a thin bright layer and the scene
-  // behind it already carries the shadows. Never behind glass (SIDE_WALL).
-  if (side == SIDE_SHEET) {
-    let a = fallingSheet(hitP, axis);
-    let sheetLit = (ambientAt(n) * 1.1 + keyLightColor() * (0.15 + 0.35 * max(dot(n, keyLightDir()), 0.0))) *
-                   WATER_FOAM_COLOR * mediaLightK(fogSkyK());
-    color = mix(color, sheetLit, a);
+  // normal, whiteWaterLight); no shadow ray, the sheet is a thin bright layer
+  // and the scene behind it already carries the shadows. Never behind glass
+  // (SIDE_WALL).
+  // WATER IN FLIGHT IS WHITE WATER ON EVERY FACE (ticket 2026-10-16_11-18-23:
+  // "looking up at falling water, only the top of its shell renders"). A cell
+  // with open air under it is falling, whichever face the ray met. Its
+  // underside -- always the face a ray from below meets, since that ray came
+  // up through the air under it -- was a flat, near-clear pane (normal down,
+  // the sky reflection clamped to the horizon, 2-8% Fresnel, a few cm of
+  // water to tint), so from below a falling column was invisible except for
+  // the top faces seen THROUGH it; and from above or beside, a partial cell
+  // in free fall was a dark glassy cube. Both now draw the sheet: the
+  // underside and the top as end-on white water, the sides as streaks. A
+  // top face reads the cell under it (one voxel read); an underside needs
+  // none; a lake's surface (liquid under it) is untouched.
+  // A falling SIDE face of a cell that is itself in flight takes the
+  // in-flight cover too; a held curtain's face (liquid under it) keeps the
+  // sheet's.
+  var inFlight = false;
+  if (!underwater && (axis == 1 || side == SIDE_SHEET)) {
+    inFlight = (axis == 1 && sgn > 0.0) || openBelow(cell);
+  }
+  if (inFlight || side == SIDE_SHEET) {
+    let a = fallingSheet(hitP, axis, cell, select(FALL_SHEET_BASE, FALL_FLIGHT_BASE, inFlight));
+    color = mix(color, whiteWaterLight(n), a);
     gVK *= 1.0 - a;
   }
 
@@ -13038,7 +13147,10 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     let simFoam = clamp(length(waveFluxAt(cell)) * TUNE_WAVE_SIM_FOAM, 0.0, 1.0);
     let foamA = waterFoam(hitP, depthM, simFoam);
     if (foamA > 0.0) {
-      color = mix(color, WATER_FOAM_COLOR, foamA);
+      // Foam is white MATTER, lit by what lights the water (THE MEDIUM'S
+      // SKY): the authored colour is its noon look. Unlit, it glowed at full
+      // daylight white on a river at midnight (ticket 2026-10-16_11-08-20).
+      color = mix(color, WATER_FOAM_COLOR * mediaLightK(fogSkyK()), foamA);
       gVK *= 1.0 - foamA;
       if (SEAM_DBG >= 5u) { gDbgW0.w = foamA; }
     }
@@ -16129,7 +16241,8 @@ fn shadeFarWater(hitP : vec3f, rd : vec3f, m : Material, nFace : vec3f,
     color += gl;
     let foamA = waterFoam(hitP, depthM, 0.0);
     if (foamA > 0.0) {
-      color = mix(color, WATER_FOAM_COLOR, foamA);
+      // Lit as the near field lights it (shadeWater's foam), or the seam shows.
+      color = mix(color, WATER_FOAM_COLOR * mediaLightK(fogSkyK()), foamA);
       if (SEAM_DBG >= 5u) { gDbgW0.w = foamA; }
     }
   }
