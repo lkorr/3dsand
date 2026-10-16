@@ -123,6 +123,11 @@ in eighths (u16).
   the curtain's two 16 and 24 (full to 2 and 3 cells under it). The slope
   steepens 1, 1, 1, 1, 2, 2 | 2, 3, 4, 8 eighths a voxel into the sheet. Only
   the WATER draws down: floors, banks and walls keep the reach's own surface;
+* **the curtain's ends** (2026-10-16): a channel column the crest/curtain
+  strips cross that is left dry (the shallow edge of a U) holds the fall
+  (`lipY`) like the bank beside it; it stood at the lower reach's level + 1,
+  and both ends of every curtain on `default` spilled down the cliff for ever.
+  `rivers` L walks every waterfall of `default` (CPU twin) for such leaks;
 * **another water** (2026-10-16, ticket 11-13-31; `RIVER_FOREIGN` =
   `kRiverWaterfall`): a channel claiming the column whose surface differs from
   the nearest channel's by more than a waterfall plus the nearer piece's

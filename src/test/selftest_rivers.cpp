@@ -1195,6 +1195,64 @@ Status GateRivers(Ctx& c, std::string& detail) {
     RecordObserved("rivers.defaultWorstCell", std::to_string(d1.siteCellWorst));
     if (!hOk) problems.push_back("H: default " + std::string(ok0 ? "" : "REFUSED: " + l0.substr(0, 200)) +
                                  (ok1 ? "" : " with a river REFUSED: " + l1.substr(0, 300)));
+
+    // ---- L. default's waterfalls contained (CPU twin; 2026-10-16) ----
+    // E holds the fixture's ONE fall; the shipped map has hundreds, in every
+    // shape the bake makes, and two classes of leak got past E there: a dry
+    // channel edge beside a curtain's END stood at the lower reach's level
+    // (every curtain of Hollowcrown Beck spilled down its cliff for ever, a
+    // breach that never slept), and two rivers' overlapping channels stood
+    // one's water on the other's floor (66-voxel slabs). A LEAK here = a
+    // water column standing over a DRY 4-neighbour whose ground is under that
+    // water's top: air beside held water with no held column under it. Every
+    // fall of every river, a box around it, waterApply's own answer per
+    // column (no GPU).
+    if (ok0) {
+      worldmap::SetCurrentWorldMap(d0);
+      const int halfBox = static_cast<int>(BaselineNumber("rivers.fallBoxHalf", 20));
+      const int fallStride = std::max(1, static_cast<int>(BaselineNumber("rivers.fallStride", 1)));
+      int fallsSeen = 0, leaks = 0, leakFalls = 0;
+      std::string firstLeaks;
+      const auto tl = std::chrono::steady_clock::now();
+      for (const auto& rv : d0.rivers) {
+        for (size_t fi = 0; fi < rv.falls.size(); fi += static_cast<size_t>(fallStride)) {
+          const int fx = rv.falls[fi][0], fz = rv.falls[fi][1];
+          const int n = 2 * halfBox + 1;
+          std::vector<worldmap::WaterColumn> box(static_cast<size_t>(n * n));
+          for (int dz = 0; dz < n; dz++)
+            for (int dx = 0; dx < n; dx++)
+              box[static_cast<size_t>(dz * n + dx)] = worldmap::WaterColumnAt(fx - halfBox + dx, fz - halfBox + dz, kDefaultSeed);
+          int here = 0;
+          for (int dz = 1; dz + 1 < n; dz++) {
+            for (int dx = 1; dx + 1 < n; dx++) {
+              const worldmap::WaterColumn& a = box[static_cast<size_t>(dz * n + dx)];
+              if (a.water < 0 || a.water <= a.h) continue;
+              static constexpr int kN[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+              for (const auto& d : kN) {
+                const worldmap::WaterColumn& b = box[static_cast<size_t>((dz + d[1]) * n + dx + d[0])];
+                // The sea holds a fall into it (water -1 = none above the sea's own).
+                if (b.water >= 0 || b.h >= a.water || b.h < d0.seaLevelY) continue;
+                here++;
+                if (firstLeaks.size() < 400)
+                  firstLeaks += Format(" [%s (%d,%d) water %d over (%d,%d) ground %d]", rv.id.c_str(), fx - halfBox + dx,
+                                       fz - halfBox + dz, a.water, fx - halfBox + dx + d[0], fz - halfBox + dz + d[1], b.h);
+              }
+            }
+          }
+          fallsSeen++;
+          leaks += here;
+          if (here) leakFalls++;
+        }
+      }
+      const double msL = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tl).count();
+      const int leakMax = static_cast<int>(BaselineNumber("rivers.fallLeakMax", 0));
+      const bool lOk = fallsSeen > 0 && leaks <= leakMax;
+      std::printf("rivers: L default falls contained: %s (%d falls, a %d-column box round each: %d leaking faces at %d "
+                  "falls (<= %d), %.0f ms)%s\n",
+                  lOk ? "PASS" : "FAIL", fallsSeen, 2 * halfBox + 1, leaks, leakFalls, leakMax, msL, firstLeaks.c_str());
+      RecordObserved("rivers.observedFallLeaks", std::to_string(leaks));
+      if (!lOk) problems.push_back(Format("L: %d leaking faces at %d of %d default falls", leaks, leakFalls, fallsSeen));
+    }
   }
 
   // ---- the pristine world back ----

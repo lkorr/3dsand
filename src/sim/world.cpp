@@ -3116,7 +3116,9 @@ static WaterCol waterApply(int x, int z, bool roaded, int hRoad, int h0, std::st
     const RivPM p = rivPieceAt(st, x, z);
     if (!p.ok) continue;
     const int d2 = p.d2, hw = p.hw;
-    if (p.strip != 0 && d2 >= hw * hw && d2 < (hw + 2 * (int)kRiverLip) * (hw + 2 * (int)kRiverLip)) lipY = std::max(lipY, p.lipV);
+    // The channel counts too (the shader's note: a DRY channel column beside
+    // a curtain's end must hold it).
+    if (p.strip != 0 && d2 < (hw + 2 * (int)kRiverLip) * (hw + 2 * (int)kRiverLip)) lipY = std::max(lipY, p.lipV);
     if (trace) {
       char b[200];
       std::snprintf(b, sizeof b, " [%s d2 %d hw %d tq %d s8 %d m %d strip %d%s]", st.id.c_str(), d2, hw, p.tq, p.s8, p.m, p.strip,
@@ -3191,7 +3193,7 @@ static WaterCol waterApply(int x, int z, bool roaded, int hRoad, int h0, std::st
     }
     bed = nBed;
     if (h < top && !foreignHi) { water = top; gap = wg; }
-    else h = std::max(h, std::max(wv + mCh, outS + 1));
+    else h = std::max(h, std::max(wv + mCh, std::max(outS, lipY) + 1));
   } else if (nearR) {
     const int tgt = nS + nM;
     const int inner = nHw + (int)kRiverLip;

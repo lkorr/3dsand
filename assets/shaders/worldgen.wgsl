@@ -2537,8 +2537,13 @@ fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, La
     // The crest and the curtain hold the reach above across the channel and
     // the bank next to it (water above can touch nothing further out).
     // (A band 2 RIVER_LIP wide beside the channel: the whole bank width at
-    // every fall walled a cascade into a canyon.)
-    if (p.strip != 0 && d2 >= hw * hw && d2 < (hw + 2 * RIVER_LIP) * (hw + 2 * RIVER_LIP)) { lipY = max(lipY, p.lipV); }
+    // every fall walled a cascade into a canyon.) The CHANNEL counts too: a
+    // channel column the strips cross that is left DRY (the shallow edge of a
+    // U, its floor over the lower reach's surface) stood at that surface + 1
+    // right beside the curtain's end -- measured on `default`'s Hollowcrown
+    // Beck: both ends of every curtain spilled down the cliff for ever, a
+    // breach of held water that never slept. A wet channel column ignores it.
+    if (p.strip != 0 && d2 < (hw + 2 * RIVER_LIP) * (hw + 2 * RIVER_LIP)) { lipY = max(lipY, p.lipV); }
     if (d2 < hw * hw) {
       inCh = true;
       if (chD2 < 0 || d2 < chD2) { chD2 = d2; w8Min = p.s8; mNear = p.m; }
@@ -2624,9 +2629,11 @@ fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, La
       }
     }
     bed = nBed;
-    // Another water above within RIVER_LIP: this column is its wall.
+    // Another water above within RIVER_LIP: this column is its wall. Dry, it
+    // holds whatever stands beside it: the pieces within RIVER_LIP and a
+    // fall's crest and curtain (lipY).
     if (h < top && !foreignHi) { water = top; gap = wg; }
-    else { h = max(h, max(wv + mCh, outS + 1)); }
+    else { h = max(h, max(wv + mCh, max(outS, lipY) + 1)); }
   } else if (near) {
     let tgt = nS + nM;
     let inner = nHw + RIVER_LIP;

@@ -6057,6 +6057,12 @@ int RunVerify(GpuContext& ctx, World& world, Simulation& sim,
   return failures == 0 ? 0 : 1;
 }
 
+namespace worldmap {
+// world.cpp: what every river piece said about a column (`rivers` E's leak
+// report; --mapcheck's SANDVOX_WATERCOL).
+std::string WaterColumnTrace(int x, int z, uint32_t seed);
+}  // namespace worldmap
+
 int main(int argc, char** argv) {
   InstallCrashHandler();
   StartupMark("main");
@@ -7035,6 +7041,19 @@ int main(int argc, char** argv) {
     ok = ok && biomes::LoadBiomeSet(ad, m, set, blog);
     ok = ok && worldmap::LoadWorldMap(ad, mapcheckName, set, m.size(), kDefaultSeed, map, blog);
     std::printf("MAPCHECK %s\n", worldmap::MapCheckJson(mapcheckName, ok, map, ok ? "" : blog).c_str());
+    // SANDVOX_WATERCOL="x,z;x,z;...": every river piece's view of those
+    // columns and what waterApply made of them (the CPU twin's trace, the
+    // one `rivers` E prints beside a leak) -- for a leak seen on a real map.
+    if (const char* wc = std::getenv("SANDVOX_WATERCOL"); ok && wc != nullptr) {
+      worldmap::SetCurrentWorldMap(map);
+      for (const char* p = wc; *p;) {
+        int x = 0, z = 0, n = 0;
+        if (std::sscanf(p, "%d,%d%n", &x, &z, &n) != 2) break;
+        std::printf("WATERCOL %d,%d:%s\n", x, z, worldmap::WaterColumnTrace(x, z, kDefaultSeed).c_str());
+        p += n;
+        while (*p == ';' || *p == ' ') p++;
+      }
+    }
     return 0;
   }
 

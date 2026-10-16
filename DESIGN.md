@@ -25169,7 +25169,13 @@ made held slabs of water 66 voxels tall with air beside them — every
 "waterfall" in the owner's 10-16 tickets. (The map was fixed too:
 `design_world.mjs` now joins a trace that reaches a river already built, if that
 river goes where it was sent, and never picks a source on one — Merebeck is a
-short tributary of the Beck, the Teethwater one of the Glimmer.)
+short tributary of the Beck, the Teethwater one of the Glimmer.) **The
+curtain's ENDS** (same day): a channel column the crest/curtain strips cross
+that is left DRY (the shallow edge of a U, floor over the lower reach) now holds
+the fall (`lipY`, as the bank beside it always did) — it stood at the lower
+reach's level + 1, so both ends of every curtain on `default` spilled down the
+cliff for ever, a breach of held water that never slept (210 leaking faces at
+Hollowcrown Beck's first fall, 0 after).
 
 **Streams become held** (`sim_stream.wgsl` `scan` / `commit`, after the CA over
 the dirty list). The still table grew to four words a column: the map's target,
@@ -25200,7 +25206,11 @@ RISER, lit as top; a face with a solid in front (glass, ice) stays a plain wall
 spray; `gSlopeFlow` turns the surface's own slope into a current for the streaks
 and foam lines, so a held ramp or an adopted stream runs visibly.
 
-**Gate `rivers`** grew: D compares the top cell's eighths, E allows air beside
+**Gate `rivers`** grew: **L** walks every waterfall of the SHIPPED map
+(`default`, CPU twin, a 41-column box round each) and counts leaking faces —
+water over a dry neighbour whose ground is under it, the sea excepted
+(`rivers.fallLeakMax` = 0); E holds only the fixture's one fall and passed both
+leaks above. D compares the top cell's eighths, E allows air beside
 water only over a held column whose surface is below it (and prints every
 piece's view of a leak), **R** scoops a crater out of the river (it refills) and
 cuts a breach through its bank (it floods), **S** digs a channel from the lake
