@@ -19600,6 +19600,51 @@ where you hear from either (§12b, "The ears are on the character").
     rule off vs on in one binary, every camera within +-0.1 ms (noon 5.83 /
     5.77, seam 5.92 / 5.89, seamveg 9.56 / 9.54, cascade 4.89 / 4.80).
     Render-only; the world hash is unchanged (ef7d9a06).
+  **FAR CROWNS ARE ROUND (2026-10-16; raymarch.wgsl `farRoundCell` /
+  `farRoundNormal`, ticket 2026-10-16_10-58-30).** The cover rule gave a far
+  crown its density, but its SHAPE was still cubes: 20 cm at level 1, 40 at
+  2, 80 at 3, 1.6 m at 4, so at 25-200 m a crown the near field draws as a
+  heap of round lobes read as a tetris piece, and it snapped back to a sphere
+  at the 20.5 m handoff and changed outline again at each level seam. The
+  byte cannot carry more, but the shape inside a cell can be read off its six
+  face neighbours. A primary far hit on a COVER slot (the far palette entry's
+  `tagMask`, the cover rule's own test: every leaf ramp, never bark, rock or
+  ground) at levels 1-4 (`FAR_ROUND_MAX_LEVEL`) is intersected against a
+  ROUNDED BOX inside its cell: flush with every face whose neighbour holds
+  any material, rounded with radius `FAR_ROUND_R` = 0.5 cell toward every
+  face that sees air (Inigo Quilez's analytic intersector, `roundBoxEntry`).
+  A lone cell is a ball, a row a capsule, a crown's outer shell a heap of
+  rounded lobes; a cell with no open face stays the cube. The shape is inside
+  the cube, so a ray that misses it continues the DDA as a refine miss does
+  and nothing it draws can stand in front of what the cube drew. The hit
+  keeps an AXIS face (FarHit is unchanged, so AO taps, the far shadow and GI
+  patch caches and everything else keyed on cell + face are too): the
+  largest normal component among the faces turned toward the ray. The
+  LIGHTING takes the crown's slope instead: `farRoundNormal` is the gradient
+  of the trilinear "open" field over the eight cell centres round the hit
+  (eight byte reads, continuous from cell to cell), fed through the far
+  ground staircase's terms (`lamSm` / `faceSm` / `nSh`) on its ramp (`wLit`:
+  the cube shade at the handoff, the smooth one by 3x the handoff or once a
+  cell is under ~2 px), so the seam rule -- only the cell size changes across
+  it -- holds where the near voxels are still faces. `FAR_HIT_ROUND` (0x1000)
+  in FarHit.level marks the hit for fs. Levels 5+ are untouched (crowns are
+  painted onto the ground there). Measured, `--verify lod-seam` against the
+  same boot on the committed shader: depth-disagree pixels (far silhouette
+  != near) 245,751 -> 215,927 (-12 %), leaf pixels agreeing 698,356 ->
+  721,061; leaf far - near luma noon -0.9 -> -1.2, afternoon -0.9 -> -1.0,
+  dusk -0.8 -> -0.9, overcast -0.6 -> -0.9 (limit 4.0); every other class
+  within 0.1; far-sky pixels 724 -> 1,345 (rays now pass a rounded edge).
+  Cost (`--render-budget` baseline arm, 1080p, NOT under the exclusive lock
+  -- the queue was starving it -- p10 of A/B/A/B boots, committed shader vs
+  this one): noon 11.23/11.24 -> 11.45/11.43 ms, cascade 6.29/6.32 ->
+  6.46/6.46, seamveg 10.67/10.72 -> 11.20/11.14 (an arm with the fs normal
+  block compiled out: 10.96, so about half is traceFar's test and the rays
+  that now pass a rounded edge -- far steps +1.6 % noon, +5 % seamveg -- and
+  half the fs normal). raymarch `fs` stays 128 registers, 112 B local
+  (`--shader-stats`). Cheapest lever if it has to come down: keep the
+  cube where a cell is under ~3 px (the rounding is invisible there).
+  Not done: far SHADOWS are still cast by cube cells (the patch caches are
+  per cell face), and crowns at levels 5+ are the painted canopy proxy.
   **A THIN LAYER KEEPS ITS FOOTPRINT: THE LOOSE TOP (2026-10-10; worldgen.wgsl
   `farRunTop` + the pass in `fardownFeat`, faredits.h `SetLooseSource`; gate
   `far-layer`; ticket 2026-10-10_11-01-58).** The third exception to "a cell

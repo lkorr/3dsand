@@ -6618,6 +6618,195 @@ fn rayStartKey() -> u32 {
           (bitcast<u32>(R.origin.z) << 7u) ^ (bitcast<u32>(R.origin.y) << 14u));
   return h | 1u;
 }
+// ---- ROUND FOLIAGE CELLS (ticket 2026-10-16_10-58-30) ----------------------
+// A crown in the near field is a heap of 10 cm voxels whose lobes read as
+// spheres; past the handoff the same crown is a few dozen cascade CUBES (20 cm
+// at level 1, 40 at 2, 80 at 3, 1.6 m at 4) and its silhouette turned into a
+// tetris piece that snapped back to a sphere as the camera crossed each seam.
+// The cell data cannot carry more (a byte per cell), but the SHAPE inside a
+// cell can be read off its six face neighbours, so a foliage cell (a COVER
+// slot: the far palette entry's tagMask, worldgen.wgsl farCoverWord -- every
+// leaf ramp, never bark, rock or ground) is drawn as a ROUNDED BOX: flush with
+// the cell face toward every occupied neighbour (so a crown's interior stays
+// one continuous mass and two touching leaf cells meet face to face), and
+// rounded with radius FAR_ROUND_R cells on every side that faces air. A lone
+// cell is a ball, a row a capsule, a slab a rounded plate, and a crown's outer
+// shell a heap of rounded lobes whose edges follow the cell lattice no longer.
+//
+// The rounded box is inside the cube, so nothing it draws can stand in front
+// of what the cube drew: a ray that misses the rounded part simply continues
+// the DDA (as a refine miss does) and meets the cell behind. Shadows, AO, the
+// sky fan and the patch caches keep reading cubes; the hit only moves the
+// point and picks the face. The FACE stays an axis (FarHit carries axis + sign,
+// so fs and every patch cache are unchanged): the axis of the rounded surface's
+// normal with the largest component among the faces turned toward the ray --
+// a voxel sphere's own shading, which is what the near crown shows.
+//
+// Cost: only a primary hit on a foliage cell at level <= FAR_ROUND_MAX_LEVEL
+// pays it -- one palette read, six byte reads and an analytic intersection --
+// plus the cells behind a missed corner. Levels 5+ paint crowns onto the
+// ground (farSurfaceMat / the canopy proxy), where a cell is wider than a lobe.
+const FAR_ROUND_MAX_LEVEL : u32 = 4u;
+// Rounding radius in cells, 0..0.5. 0.5 makes a lone cell a ball; 0 is the cube.
+const FAR_ROUND_R : f32 = 0.5;
+struct FarRound { hit : bool, t : f32, axis : i32, sgn : f32 };
+const FAR_HIT_ROUND : u32 = 0x1000u;   // FarHit.level flag: a round foliage hit
+// THE CROWN'S NORMAL at a round hit (fs, for the LIGHTING only -- the face
+// stays the axis, see above): the gradient of the trilinear interpolation of
+// "open" (farRoundOpen) over the eight cell centres around `pL` (level-cell
+// coords). It points out of the leaf mass, it is continuous from cell to cell
+// (the staircase a crown's cells make lights as the slope it stands for, as
+// the far ground's terraces do with farSurfAt's gradient), and eight byte
+// reads buy it, once per pixel. `n` (the face) where the gradient vanishes.
+fn farRoundNormal(level : u32, pL : vec3f, n : vec3f) -> vec3f {
+  let pc = pL - vec3f(0.5);
+  let i0 = vec3<i32>(floor(pc));
+  let f = pc - floor(pc);
+  let v000 = farRoundOpen(level, i0);
+  let v100 = farRoundOpen(level, i0 + vec3<i32>(1, 0, 0));
+  let v010 = farRoundOpen(level, i0 + vec3<i32>(0, 1, 0));
+  let v110 = farRoundOpen(level, i0 + vec3<i32>(1, 1, 0));
+  let v001 = farRoundOpen(level, i0 + vec3<i32>(0, 0, 1));
+  let v101 = farRoundOpen(level, i0 + vec3<i32>(1, 0, 1));
+  let v011 = farRoundOpen(level, i0 + vec3<i32>(0, 1, 1));
+  let v111 = farRoundOpen(level, i0 + vec3<i32>(1, 1, 1));
+  let gx = mix(mix(v100 - v000, v110 - v010, f.y), mix(v101 - v001, v111 - v011, f.y), f.z);
+  let gy = mix(mix(v010 - v000, v110 - v100, f.x), mix(v011 - v001, v111 - v101, f.x), f.z);
+  let gz = mix(mix(v001 - v000, v101 - v100, f.x), mix(v011 - v010, v111 - v110, f.x), f.y);
+  let g = vec3f(gx, gy, gz);
+  let l = length(g);
+  return select(n, g / l, l > 1e-3);
+}
+// 1 where the face neighbour holds no material (air or the blocker flag), 0
+// where it holds anything at all -- leaf, bark, ground: the cell is flush there.
+fn farRoundOpen(level : u32, c : vec3<i32>) -> f32 {
+  return select(0.0, 1.0, farPalAt(level, c) == 0u);
+}
+// Entry t of the ray (ro, rd; rd unit length, ro OUTSIDE the box's bounds)
+// into the rounded box centred at the origin with inner half-size `b` and
+// radius `r`; -1 on a miss. Inigo Quilez's analytic rounded-box intersector
+// (iquilezles.org/articles/intersectors): the bounding box gives the entry; a
+// flat-face entry is the hit, else the corner sphere and the three edge
+// cylinders of the entry point's octant.
+fn roundBoxEntry(roIn : vec3f, rdIn : vec3f, b : vec3f, r : f32) -> f32 {
+  let m = 1.0 / rdIn;
+  let n = m * roIn;
+  let k = abs(m) * (b + vec3f(r));
+  let t1 = -n - k;
+  let t2 = -n + k;
+  let tN = max(max(t1.x, t1.y), t1.z);
+  let tF = min(min(t2.x, t2.y), t2.z);
+  if (tN > tF || tF < 0.0) { return -1.0; }
+  // Fold into the first octant. select, not sign(): a zero component would
+  // zero the ray on that axis.
+  let pos0 = roIn + rdIn * tN;
+  let sg = select(vec3f(1.0), vec3f(-1.0), pos0 < vec3f(0.0));
+  let ro = roIn * sg;
+  let rd = rdIn * sg;
+  var pf = pos0 * sg - b;
+  pf = max(pf, pf.yzx);
+  if (min(min(pf.x, pf.y), pf.z) < 0.0) { return tN; }   // a flat face
+  let oc = ro - b;
+  let dd = rd * rd;
+  let oo = oc * oc;
+  let od = oc * rd;
+  let ra2 = r * r;
+  var t = 1e20;
+  // corner sphere
+  {
+    let bb = od.x + od.y + od.z;
+    let h = bb * bb - (oo.x + oo.y + oo.z - ra2);
+    if (h > 0.0) { t = -bb - sqrt(h); }
+  }
+  // edge along x
+  {
+    let a = dd.y + dd.z;
+    let bb = od.y + od.z;
+    let h = bb * bb - a * (oo.y + oo.z - ra2);
+    if (h > 0.0 && a > 1e-12) {
+      let te = (-bb - sqrt(h)) / a;
+      if (te > 0.0 && te < t && abs(ro.x + rd.x * te) < b.x) { t = te; }
+    }
+  }
+  // edge along y
+  {
+    let a = dd.z + dd.x;
+    let bb = od.z + od.x;
+    let h = bb * bb - a * (oo.z + oo.x - ra2);
+    if (h > 0.0 && a > 1e-12) {
+      let te = (-bb - sqrt(h)) / a;
+      if (te > 0.0 && te < t && abs(ro.y + rd.y * te) < b.y) { t = te; }
+    }
+  }
+  // edge along z
+  {
+    let a = dd.x + dd.y;
+    let bb = od.x + od.y;
+    let h = bb * bb - a * (oo.x + oo.y - ra2);
+    if (h > 0.0 && a > 1e-12) {
+      let te = (-bb - sqrt(h)) / a;
+      if (te > 0.0 && te < t && abs(ro.z + rd.z * te) < b.z) { t = te; }
+    }
+  }
+  return select(t, -1.0, t > 1e19);
+}
+// The ray against foliage cell `vc`'s rounded shape over [tIn, tOut] (level
+// cells, traceFar's units). `entryAxis` = the face the DDA entered by.
+fn farRoundCell(level : u32, vc : vec3<i32>, roL : vec3f, rd : vec3f, tIn : f32,
+                tOut : f32, entryAxis : i32) -> FarRound {
+  var o : FarRound;
+  o.hit = false;
+  o.t = tIn;
+  o.axis = entryAxis;
+  o.sgn = sign(select(select(rd.x, rd.z, entryAxis == 2), rd.y, entryAxis == 1));
+  let openN = vec3f(farRoundOpen(level, vc - vec3<i32>(1, 0, 0)),
+                    farRoundOpen(level, vc - vec3<i32>(0, 1, 0)),
+                    farRoundOpen(level, vc - vec3<i32>(0, 0, 1)));
+  let openP = vec3f(farRoundOpen(level, vc + vec3<i32>(1, 0, 0)),
+                    farRoundOpen(level, vc + vec3<i32>(0, 1, 0)),
+                    farRoundOpen(level, vc + vec3<i32>(0, 0, 1)));
+  // A cell with no open face is the cube (an interior cell a ray reaches
+  // through a neighbour's rounded corner).
+  if (dot(openN + openP, vec3f(1.0)) == 0.0) { o.hit = true; return o; }
+  let r = FAR_ROUND_R;
+  // The INNER box, cell-local (the cell spans -0.5..0.5): pulled in by r on
+  // every open side, so the rounded box's outer face there is the cell face;
+  // at the cell face on every closed side, so it is flush there.
+  let lo = vec3f(-0.5) + r * openN;
+  let hi = vec3f(0.5) - r * openP;
+  let cen = vec3f(vc) + vec3f(0.5) + 0.5 * (lo + hi);
+  let b = 0.5 * (hi - lo);
+  let p0 = roL + rd * tIn - cen;
+  // Already inside at the entry face (the ray came in through a face the
+  // shape fills, or started inside the cell at a seam): the cube's answer.
+  let q0 = abs(p0) - b;
+  if (length(max(q0, vec3f(0.0))) + min(max(q0.x, max(q0.y, q0.z)), 0.0) <= r + 1e-3) {
+    o.hit = true;
+    return o;
+  }
+  // Outside at the entry and the shape is convex: the entry, if any, is
+  // ahead. The intersector wants an origin outside the shape's bounds (at
+  // most 1 cell from its centre on any axis), so it starts 3.5 cells back.
+  // A face-flush entry a rounding error behind tIn counts as at tIn.
+  let te = roundBoxEntry(p0 - rd * 3.5, rd, b, r) - 3.5;
+  if (te < -1e-3 || tIn + te > tOut) { return o; }
+  let q = p0 + rd * te;
+  // The face: the largest component of the surface normal (sign(q) *
+  // max(|q| - b, 0), whose ranking |q| - b keeps on a flat face too) among
+  // the axes turned toward the ray, so a grazing hit never shades a face
+  // that looks away from the eye.
+  let fr = q * rd < vec3f(0.0);
+  let sc = select(vec3f(-1e9), abs(q) - b, fr);
+  var ax = 0;
+  if (sc.y > sc.x && sc.y >= sc.z) { ax = 1; }
+  else if (sc.z > sc.x && sc.z > sc.y) { ax = 2; }
+  o.hit = true;
+  o.t = tIn + max(te, 0.0);
+  o.axis = ax;
+  o.sgn = sign(select(select(rd.x, rd.z, ax == 2), rd.y, ax == 1));
+  return o;
+}
+
 // The start distance (fine voxels) for the pixel at `px`: 0 = unknown, march
 // from the camera; RS_NONE = no sample in reach saw anything, near or far.
 // Called twice by fs() — before trace() and after it — rather than carried
@@ -6966,6 +7155,26 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
               // (THE FEATURES are drawn after the march: farFeatMarch, fs. A
               // cactus stalk is not a feature any more but part of the surface
               // map, refined like the ground -- see farmap in worldgen.wgsl.)
+              // ---- ROUND FOLIAGE (farRoundCell) ----
+              // A cover slot (its far palette entry's tagMask) is a leaf cell:
+              // draw its rounded shape; a ray past it continues the march.
+              if (mat != 0u && level <= FAR_ROUND_MAX_LEVEL &&
+                  materials[FAR_PALETTE_BASE + farCellSlot(cellByte)].tagMask != 0u) {
+                let rc = farRoundCell(level, vc, roL, rd, vCur,
+                                      min(vMax.x, min(vMax.y, vMax.z)), axis);
+                if (!rc.hit) {
+                  mat = 0u;
+                } else {
+                  out.hit = true;
+                  out.t = rc.t * s;
+                  out.axis = rc.axis;
+                  out.sgn = rc.sgn;
+                  out.mat = mat;
+                  out.cell = vc;
+                  out.level = level | FAR_HIT_ROUND;
+                  return out;
+                }
+              }
               if (mat != 0u) {
                 out.hit = true;
                 out.t = vCur * s;   // back to fine-voxel units
@@ -17785,6 +17994,20 @@ fn fs(in : VSOut) -> FSOut {
             coverEmis = vec3f(0.0);
           }
         }
+      }
+      // A ROUND FOLIAGE hit (farRoundCell) lights as the CROWN, not the cell:
+      // farRoundNormal's slope through the same terms and on the same ramp
+      // (wLit: the cube shade at the handoff, the smooth one by 3x it or once
+      // a cell is under ~2 px) as the far ground's staircase above. A normal
+      // turned away from the eye (a silhouette) is laid back onto the view
+      // plane. The face `n` keeps the geometry (AO taps, shadow patch).
+      if ((far.level & FAR_HIT_ROUND) != 0u && wLit > 0.0) {
+        var nS = farRoundNormal(flv, hitP / sL, n);
+        let away = dot(nS, rd);
+        if (away > 0.0) { nS = normalize(nS - rd * (away + 0.05)); }
+        lamSm = wrapDiffuse(dot(nS, keyLightDir()), TUNE_DIFFUSE_WRAP);
+        faceSm = nS.y * nS.y + nS.x * nS.x * TUNE_FACE_X + nS.z * nS.z * TUNE_FACE_Z;
+        nSh = normalize(mix(n, nS, wLit));
       }
       // Clear, non-viscous liquid seen through open air takes shadeFarWater
       // (the near field's surface law) below and skips the lit-rock terms —
