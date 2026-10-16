@@ -2576,6 +2576,550 @@ Status GateDistantCalibrate(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- distant-edge --------------------------------------------------------------
+//
+// THE EDGE (docs/PLAN_distant_npcs.md 2.7, package D3; game/distant.h). One
+// world, THE tick (support::TickCursor, EntityParking bound and in the tick, so
+// the park rule DEMOTES and Unpark PROMOTES inside it, as in the game), five
+// arms at five places round the window's faces, all at once, run TWICE from a
+// fresh world (Fresh: Jolt's ids rewound, the same id base, the same ticks):
+//   M. NEAR HITS DISTANT, DISTANT HITS NEAR. A near swordsman 12 voxels inside
+//      the +X face and a distant one 3 outside it (anchored: it turns and
+//      strikes, never walks), hostile. The near one's strokes queue at their
+//      cut and land on the distant body by the roll (its hp drops). The distant
+//      one's land through the near body's own door: its lattice is carved (art
+//      voxels gone), Blade hp is charged, and blood left it.
+//   A. A DISTANT ARCHER SHOOTS IN. An anchored distant archer 50 outside the -X
+//      face at a near dummy 10 inside: the arrow is flown for real up to the
+//      boundary, injected as an ArrowFlight, and HITS the dummy (an ArrowEvent
+//      Hit on it, from ArrowFlights' own PierceAlongRay).
+//   B. A NEAR ARCHER SHOOTS OUT. A near archer 30 inside the +Z face at a
+//      distant dummy 20 outside: its flights leave the window and are handed
+//      to the tier (ArrowEvent PastEdge), resolved by the ranged roll at the
+//      flight time left, and at least one lands (the dummy's hp drops).
+//   C. AN ABSTRACT ARROW WHOSE TARGET IS NEAR (the impact pass's old
+//      `arrowsLost` branch): a distant arrow already in the air at a creature
+//      that is not distant (pushed by the gate, as if loosed 60 voxels outside
+//      the -X face two ticks before, at the bow's speed) is converted at its
+//      arc's state into a
+//      real flight, flown to the boundary, injected -- and hits the creature.
+//   T. THRASH. A duelist paced across the -Z face, 40 voxels each side: it
+//      walks IN as a distant creature (held at the promotion line while it
+//      may not come back, promoted in THE tick), and once near at the inner
+//      end the gate sends it OUT through the park rule's own demotion
+//      (DemoteForTest; a near creature does not walk off known ground, and in
+//      the game the outward crossing is the window moving). Its tier changes
+//      (observed tick by tick) number at most distantMaxFlips in any 600
+//      ticks, it did pace (>= distantEdge.minThrashFlips) and the bound
+//      engaged (Stats::flipWaits > 0).
+//   P. NEVER A PLAYER. A player actor 12 inside the -X face beside a near
+//      dummy, an anchored distant zombie ~30 voxels from both (inside its
+//      sight) that targets the dummy: no distant actor list ever held a player id (Stats::
+//      playerActorsSeen stays 0) and no distant brain ever targets one --
+//      while the zombie was awake and on the dummy (the claim is not vacuous).
+//   D. TWICE-RUN: the per-30-tick digest (every near creature's hp and origin
+//      bits, the tier's digest, the arrows' counters) is equal.
+// Thresholds: tests/baseline.json distantEdge.*, distantMaxFlips.
+// LEAVES NOTHING: mobs / debris / tier reset, store cleared, park function and
+// player actors removed, tuning / items / id counter restored, ground caches
+// dropped, worldgen regenerated (the near fight bled on the window's ground).
+Status GateDistantEdge(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  const Tuning tuneWas = CurrentTuning();
+  struct ItemsScope {
+    MobSystem& m;
+    const ItemLibrary* prev;
+    ItemsScope(MobSystem& mm, const ItemLibrary* now) : m(mm), prev(mm.Items()) {
+      m.SetItems(now);
+    }
+    ~ItemsScope() { m.SetItems(prev); }
+  } itemsScope(c.mobs, &c.items);
+  std::vector<std::string> fails, lines;
+  auto check = [&](bool ok, const std::string& why) {
+    lines.push_back(why);
+    if (!ok) fails.push_back(why);
+    return ok;
+  };
+  const int ticks = std::max(60, (int)BaselineNumber("distantEdge.ticks", 900));
+  const int maxFlips = (int)BaselineNumber("distantMaxFlips", 4);
+  const int minThrash = (int)BaselineNumber("distantEdge.minThrashFlips", 3);
+  const DistantMobs& tier = c.mobs.Distant();
+
+  struct Run {
+    std::string why;            // the fixture refused (empty = built)
+    uint64_t nM = 0, dM = 0, tA = 0, dA = 0, nB = 0, dB = 0, tP = 0, zP = 0, pT = 0, tC = 0;
+    int hitsOnTC = 0;           // C: hits the converted arrow made
+    std::string convTrace;      // C: the flight, tick by tick, and every event near it
+    // M
+    float dmHp0 = 0, dmHp1 = 0, nmHp0 = 0, nmHp1 = 0, nmBlood = 0, nmBlade = 0;
+    int nmCarvedLimbs = 0;
+    // A / B
+    int hitsOnTA = 0, pastEdge = 0;
+    float dbHp0 = 0, dbHp1 = 0;
+    // T
+    std::vector<uint32_t> flipTicks;
+    int maxWindow = 0;
+    bool pacerLost = false;
+    std::string pacerTrace;     // every 60 ticks: what the pacer was doing (rule 6)
+    // P
+    int playerTargets = 0, zAwake = 0, zOnDummy = 0;
+    // every counter that moved
+    DistantMobs::Stats s0, s1;
+    uint64_t arrowsInjected = 0, arrowsHandedOut = 0;
+    uint64_t digest = 0;
+  };
+
+  auto runOnce = [&](Run& r) {
+    Fresh(c, 120001);
+    c.stream.Store().Clear();
+    c.mobs.SetParkFn(nullptr);
+    c.mobs.ClearPlayerActors();
+    c.mobs.ClearVoiceEvents();
+    DistantTierOn();
+    c.mobs.SetDistantStream(&c.stream);
+    const IVec3 home = c.world.WindowOrigin();
+    const Vec3 wlo{(float)(home.x * (int)kChunk), (float)(home.y * (int)kChunk),
+                   (float)(home.z * (int)kChunk)};
+    const IVec3 wc = WindowCentre(c.world);
+    const float N = (float)kWorldN;
+    const float faceX = wlo.x + N, faceZ = wlo.z + N;
+    const float wcx = (float)wc.x, wcz = (float)wc.z;
+    uint32_t t = 120000;
+    std::string why;
+
+    // ---- THE DISTANT HALF: built near, posed, demoted (MusterDistant) ------
+    const Loadout blueSword{"human", "duelist_blue", "sword", nullptr, false, false,
+                            "duelist_blue+sword"};
+    const Loadout archerL{"human", "archer", "sword", nullptr, false, true, "archer"};
+    const Loadout dummyL{"human", "training_dummy", nullptr, nullptr, false, false, "dummy"};
+    const Loadout zombieL{"zombie", "zombie", nullptr, nullptr, false, false, "zombie"};
+    const Loadout swordL{"human", "duelist", "sword", nullptr, false, false, "duelist+sword"};
+    const Loadout pacerL{"human", "duelist", nullptr, nullptr, false, false, "pacer"};
+    std::vector<DistantOrder> orders;
+    orders.push_back({blueSword, faceX + 3.0f, wcz, Vec3{faceX - 12.0f, 0.0f, wcz}});
+    orders.push_back({archerL, wlo.x - 50.0f, wcz, Vec3{wlo.x + 10.0f, 0.0f, wcz}});
+    orders.push_back({dummyL, wcx, faceZ + 20.0f, Vec3{wcx, 0.0f, faceZ - 30.0f}});
+    orders.push_back({zombieL, wlo.x - 16.0f, wlo.z + 470.0f, Vec3{wlo.x + 12.0f, 0.0f, wlo.z + 470.0f}});
+    const std::vector<uint64_t> d = MusterDistant(c, orders, t, why);
+    if (d.size() != 4) {
+      r.why = "muster: " + why;
+      return;
+    }
+    r.dM = d[0];
+    r.dA = d[1];
+    r.dB = d[2];
+    r.zP = d[3];
+    // ANCHORED (a gate's seam, as the gates write `asleep`): the swordsman,
+    // the archer and the zombie turn and strike where they stand and never
+    // walk -- so the pair stays across the edge, the archer outside, and the
+    // zombie 37 voxels from the player it must not see.
+    for (uint64_t id : {r.dM, r.dA, r.zP})
+      if (DistantMob* m = c.mobs.DistantMut().Find(id)) m->groundMode = DistantGroundMode::Anchored;
+
+    // ---- THE NEAR HALF ------------------------------------------------------
+    r.nM = SpawnOne(c, swordL, ifloor(faceX - 12.0f), wc.z, why);
+    r.tA = r.nM ? SpawnOne(c, dummyL, ifloor(wlo.x + 10.0f), wc.z, why) : 0;
+    r.nB = r.tA ? SpawnOne(c, archerL, wc.x, ifloor(faceZ - 30.0f), why) : 0;
+    r.tP = r.nB ? SpawnOne(c, dummyL, ifloor(wlo.x + 12.0f), ifloor(wlo.z + 470.0f), why) : 0;
+    const float pacerX = wcx + 80.0f;
+    r.pT = r.tP ? SpawnOne(c, pacerL, ifloor(pacerX), ifloor(wlo.z + 40.0f), why) : 0;
+    // C's target: a passive creature of the archer's own faction, so nothing
+    // in the fixture shoots at it but the arrow C converts.
+    const Loadout monsterDummyL{"human", "dummy", nullptr, nullptr, false, false, "dummy (monster)"};
+    r.tC = r.pT ? SpawnOne(c, monsterDummyL, ifloor(wlo.x + 10.0f), wc.z - 120, why) : 0;
+    if (r.tC == 0) {
+      r.why = "near spawns: " + why;
+      return;
+    }
+    // THE PLAYER, as the NPC targeting layer sees one: an actor in the player
+    // band, beside the near dummy, 37 voxels from the distant zombie.
+    {
+      const int px = ifloor(wlo.x + 12.0f), pz = ifloor(wlo.z + 480.0f);
+      const MobSystem::PlayerActorDesc pa{
+          Vec3{(float)px, (float)World::TerrainHeight(px, pz, kDefaultSeed) + 10.0f, (float)pz},
+          4.0f, 18.0f, true};
+      c.mobs.SetPlayerActors(std::span<const MobSystem::PlayerActorDesc>(&pa, 1));
+    }
+
+    // ---- THE TICK, with the park rule's tier changes in it ----------------
+    EntityParking parking;
+    parking.Bind(c.mobs, c.stream.Store(), true);
+    const IVec3 pc{wc.x >> 4, World::TerrainHeight(wc.x, wc.z, kDefaultSeed) >> 4, wc.z >> 4};
+    support::TickCursor rt{c, t, pc};
+    rt.Rig().Authority().parking = &parking;
+    ArrowFlights& arrows = rt.Rig().Authority().arrows;
+    arrows.ClearEvents();
+    r.s0 = tier.GetStats();
+    const ArrowFlights::Stats as0 = arrows.stats;
+    r.dmHp0 = DistantHp(c.mobs, r.dM);
+    r.dbHp0 = DistantHp(c.mobs, r.dB);
+    r.nmHp0 = c.mobs.TotalHp(r.nM);
+    std::vector<uint32_t> art0;
+    if (const Mob* m = c.mobs.FindMobById(r.nM))
+      for (int li = 0; li < m->AppendedBase(); li++) art0.push_back(c.mobs.LimbArtVoxelCount(r.nM, li));
+    // THE PACER. Its INWARD crossing is the tier's own: a distant walker on a
+    // Goto to the inner end walks in over DistantGround, is held at the
+    // promotion line while it may not come back, and is PROMOTED in THE tick
+    // (Unpark, phase H). Its OUTWARD crossing is driven by the gate: a near
+    // creature does not walk off known ground into the unknown past the face
+    // (the near drive refuses the step -- measured, it stood at the face), and
+    // in the game the outward crossing is the WINDOW moving with the player.
+    // So once it is near and has reached the inner end, the gate demotes it
+    // through the park rule's own door (DemoteForTest: SaveOne ->
+    // DemoteToDistant -> ReleaseRig, the flip noted as PreTick's would be)
+    // and stands it at the outer end, to walk in again. Every round trip
+    // wants two flips; the bound lets four through per 600 ticks.
+    const Vec3 inner{pacerX, 0.0f, wlo.z + 40.0f}, outer{pacerX, 0.0f, wlo.z - 40.0f};
+    auto gotoInner = [&]() {
+      ai::Brain* b = c.mobs.BrainAnyTierMut(r.pT);
+      if (b == nullptr) return;
+      b->routine = ai::Routine{};
+      b->routine.active = true;
+      b->routine.verb = ai::Intent::Goto;
+      b->routine.goal = inner;
+      b->routine.final = true;
+      b->routine.arriveRadius = 4.0f;
+      b->routine.speed = 1.0f;
+    };
+    auto sendOut = [&]() {
+      if (!c.mobs.DemoteForTest(r.pT)) return false;
+      const DistantMob* d = tier.Find(r.pT);
+      if (d == nullptr) return false;
+      const Vec3 ws = d->worldSize;
+      const int cx = ifloor(outer.x), cz = ifloor(outer.z);
+      const float gy = (float)(c.mobs.DistantGroundMut().TerrainTop(cx, cz) + 1);
+      c.mobs.DistantMut().Relocate(
+          r.pT, Vec3{(float)cx + 0.5f - ws.x * 0.5f, gy, (float)cz + 0.5f - ws.z * 0.5f});
+      gotoInner();
+      return true;
+    };
+    int lastTier = 1;
+    const std::vector<uint64_t> nearIds = {r.nM, r.tA, r.nB, r.tP, r.pT, r.tC};
+    FnvDigest trace;
+    for (int k = 0; k < ticks; k++) {
+      // ---- C: AN ABSTRACT ARROW WHOSE TARGET IS NEAR (the arrowsLost branch
+      // D3 turned into a real flight). A distant arrow in the air, loosed two
+      // ticks ago from 60 voxels outside the -X face, at the bow's own speed,
+      // at a creature that is NOT distant: the impact pass must convert it, at
+      // its arc's state this tick, into an inbound flight, fly it to the
+      // boundary and hand it to ArrowFlights -- which must then hit the
+      // creature physically. (At the speed a bow looses: an arrow the fixture
+      // slowed to 7 m/s for a high arc went through the target's legs without
+      // a PierceHit, measured -- a fixture question, not this tier's.)
+      if (k == ticks / 3) {
+        // AIMED AT THE TRUNK ITSELF (the root limb's centre), not the body
+        // box's middle: measured, this standing dummy's pelvis sits 1.3
+        // voxels off its box centre, and a ray through the box middle along
+        // the flight's line met no collider at all.
+        Vec3 to{};
+        const Mob* tcm = c.mobs.FindMobById(r.tC);
+        if (tcm != nullptr && tcm->Def() != nullptr &&
+            tcm->LimbCentreWorld(tcm->Def()->rootLimb, to)) {
+          const int fx = ifloor(wlo.x - 60.0f), fz = ifloor(to.z);
+          const DistantMob* sh = tier.Find(r.dA);
+          DistantArrowFlight f;
+          f.shooter = r.dA;
+          f.target = r.tC;
+          f.from = Vec3{(float)fx + 0.5f, (float)(World::TerrainHeight(fx, fz, kDefaultSeed) + 10),
+                        (float)fz + 0.5f};
+          f.to = to;
+          const float speed =
+              sh != nullptr && sh->kit.arrowSpeed > 0.0f ? sh->kit.arrowSpeed : 500.0f;
+          const int flight = std::max(3, (int)std::ceil((to - f.from).len() / (speed / 30.0f)));
+          f.looseTick = t + 1 - 2;
+          f.impactTick = f.looseTick + (uint32_t)flight;
+          f.ammo = sh != nullptr && !sh->kit.ammo.empty() ? sh->kit.ammo : std::string("arrow");
+          f.out.hit = true;
+          c.mobs.DistantMut().ArrowsMut().push_back(f);
+        }
+      }
+      rt();
+      // ---- A / B: what the arrows did --------------------------------------
+      for (const ArrowEvent& e : arrows.Events()) {
+        if (e.kind == ArrowEvent::Kind::Hit && e.mobId == r.tA) r.hitsOnTA++;
+        if (e.kind == ArrowEvent::Kind::Hit && e.mobId == r.tC) r.hitsOnTC++;
+        // C's attribution (rule 6): every arrow event in the -X face's
+        // quarter round the target, after the push.
+        if (k >= ticks / 3 && k < ticks / 3 + 90 && e.at.x < wlo.x + 60.0f &&
+            std::fabs(e.at.z - (float)(wc.z - 120)) < 40.0f)
+          r.convTrace += Format(" ev%d:k%d mob%llu at(%.1f,%.1f,%.1f)", (int)e.kind, k,
+                                (unsigned long long)e.mobId, (double)(e.at.x - wlo.x), (double)e.at.y,
+                                (double)(e.at.z - wlo.z));
+        if (e.kind == ArrowEvent::Kind::PastEdge) r.pastEdge++;
+      }
+      arrows.ClearEvents();
+      if (k >= ticks / 3 && k < ticks / 3 + 90) {
+        for (const DistantArrowFlight& f : tier.Arrows())
+          if (f.target == r.tC)
+            r.convTrace += Format(" k%d:%s(%.1f,%.1f,%.1f)", k, f.inbound ? "in" : "abs",
+                                  (double)(SpellFxToFloat(f.pos[0]) - wlo.x),
+                                  (double)SpellFxToFloat(f.pos[1]),
+                                  (double)(SpellFxToFloat(f.pos[2]) - wlo.z));
+        for (const ArrowFlight& f : arrows.Flights())
+          if (f.shot.target == r.tC)
+            r.convTrace += Format(" k%d:real(%.1f,%.1f,%.1f)", k,
+                                  (double)(SpellFxToFloat(f.pos.x) - wlo.x),
+                                  (double)SpellFxToFloat(f.pos.y),
+                                  (double)(SpellFxToFloat(f.pos.z) - wlo.z));
+        if (k == ticks / 3) {
+          Vec3 lo{}, hi{};
+          if (c.mobs.MobBodyBox(r.tC, lo, hi)) {
+            r.convTrace += Format(" target box (%.1f..%.1f, %.1f..%.1f, %.1f..%.1f)",
+                                  (double)(lo.x - wlo.x), (double)(hi.x - wlo.x), (double)lo.y,
+                                  (double)hi.y, (double)(lo.z - wlo.z), (double)(hi.z - wlo.z));
+            // ...and what a ray through its middle along the flight's line
+            // meets (the collider the flight's PierceAlongRay would cast for).
+            const Vec3 mid = (lo + hi) * 0.5f;
+            float frac = 1.0f;
+            const uint64_t hb = c.phys.CastRayBody(Vec3{wlo.x - 2.0f, mid.y, mid.z}, Vec3{1, 0, 0},
+                                                   40.0f, frac);
+            int li = -1;
+            const Mob* owner = hb != 0 ? c.mobs.FindOwner(hb, &li) : nullptr;
+            int bodies = 0;
+            for (int i = 0; i < 40; i++) bodies += c.mobs.LimbBody(r.tC, i) != 0 ? 1 : 0;
+            Vec3 lc0{};
+            const Mob* tm = c.mobs.FindMobById(r.tC);
+            const bool haveLc = tm != nullptr && tm->LimbCentreWorld(tm->Def()->rootLimb, lc0);
+            r.convTrace += Format(" ray body %llu owner %llu limb %d at %.1f; target limb bodies "
+                                  "%d alive %d, root limb centre %s(%.1f,%.1f,%.1f)",
+                                  (unsigned long long)hb,
+                                  (unsigned long long)(owner ? owner->Id() : 0), li,
+                                  (double)(frac * 40.0f - 2.0f), bodies,
+                                  tm != nullptr && tm->Alive() ? 1 : 0, haveLc ? "" : "NONE ",
+                                  (double)(lc0.x - wlo.x), (double)lc0.y, (double)(lc0.z - wlo.z));
+          }
+        }
+      }
+      // ---- P: never a player, and the zombie on the dummy ------------------
+      for (const DistantMob& dm : tier.All())
+        if (dm.brain.hasTarget && ai::IsPlayerActorId(dm.brain.targetId)) r.playerTargets++;
+      if (const DistantMob* z = tier.Find(r.zP)) {
+        if (!z->asleep && !z->dead) r.zAwake++;
+        if (z->brain.hasTarget && z->brain.targetId == r.tP) r.zOnDummy++;
+      }
+      // ---- T: the pacer's tier, tick by tick, and its next crossing --------
+      // (Read after the tick and again after the gate's own demotion, so a
+      // flip is stamped with the tick it happened on.)
+      auto observe = [&]() {
+        const int tierNow = c.mobs.FindMobById(r.pT) != nullptr ? 1
+                            : tier.Find(r.pT) != nullptr    ? 2
+                                                            : 0;
+        if (tierNow == 0) {
+          r.pacerLost = true;
+          return 0;
+        }
+        if (tierNow != lastTier) r.flipTicks.push_back(t);
+        lastTier = tierNow;
+        return tierNow;
+      };
+      const int tierNow = observe();
+      if (tierNow != 0) {
+        Vec3 pcen{};
+        if (tierNow == 1) {
+          Vec3 lo{}, hi{};
+          pcen = c.mobs.MobBodyBox(r.pT, lo, hi) ? (lo + hi) * 0.5f : c.mobs.MobOrigin(r.pT);
+        } else {
+          pcen = tier.Find(r.pT)->Centre();
+        }
+        const ai::Brain* b = c.mobs.BrainAnyTierMut(r.pT);
+        if (k % 60 == 0 && b != nullptr)
+          r.pacerTrace += Format(" t%d:%s(%.0f,%.0f,%.0f) %s%s%s", k, tierNow == 1 ? "near" : "far",
+                                 (double)(pcen.x - wlo.x), (double)pcen.y, (double)(pcen.z - wlo.z),
+                                 ai::IntentName(b->intent), b->routine.active ? "" : " !routine",
+                                 b->hasTarget ? " target" : "");
+        const float dz = pcen.z - inner.z, dx = pcen.x - inner.x;
+        if (tierNow == 1 && (k == 0 || (b != nullptr && b->routine.arrived) || dx * dx + dz * dz <= 36.0f)) {
+          if (sendOut()) observe();
+        }
+      }
+      // ---- D: the trace ------------------------------------------------------
+      if (k % 30 == 29 || k + 1 == ticks) {
+        for (const uint64_t id : nearIds) {
+          const Mob* m = c.mobs.FindMobById(id);
+          trace.U(id);
+          trace.U(m != nullptr ? (m->Alive() ? 2u : 1u) : 0u);
+          if (m == nullptr) continue;
+          trace.F(m->Origin().x);
+          trace.F(m->Origin().y);
+          trace.F(m->Origin().z);
+          trace.F(c.mobs.TotalHp(id));
+        }
+        trace.U(TierDigest(tier));
+        trace.U(arrows.stats.launched);
+        trace.U(arrows.stats.hits);
+        trace.U(arrows.stats.injected);
+        trace.U(arrows.stats.handedOut);
+        trace.U((uint64_t)arrows.Live());
+      }
+    }
+    r.digest = trace.h;
+    r.s1 = tier.GetStats();
+    r.arrowsInjected = arrows.stats.injected - as0.injected;
+    r.arrowsHandedOut = arrows.stats.handedOut - as0.handedOut;
+    r.dmHp1 = DistantHp(c.mobs, r.dM);
+    r.dbHp1 = DistantHp(c.mobs, r.dB);
+    // The near swordsman: wherever it is now (a demotion would have moved it).
+    if (const Mob* m = c.mobs.FindMobById(r.nM)) {
+      r.nmHp1 = c.mobs.TotalHp(r.nM);
+      r.nmBlood = c.mobs.BloodLost(r.nM);
+      r.nmBlade = m->HpLostBy(DamageCause::Blade);
+      for (int li = 0; li < m->AppendedBase() && li < (int)art0.size(); li++)
+        r.nmCarvedLimbs += c.mobs.LimbArtVoxelCount(r.nM, li) < art0[(size_t)li] ? 1 : 0;
+    }
+    // THE BOUND, as observed: the most flips inside any 600 ticks.
+    for (size_t a = 0; a < r.flipTicks.size(); a++) {
+      int n = 0;
+      for (size_t b = a; b < r.flipTicks.size(); b++)
+        n += r.flipTicks[b] - r.flipTicks[a] < kDistantFlipWindowTicks ? 1 : 0;
+      r.maxWindow = std::max(r.maxWindow, n);
+    }
+    rt.Rig().Authority().parking = nullptr;
+    c.mobs.SetParkFn(nullptr);
+    c.mobs.ClearPlayerActors();
+  };
+
+  Run runs[2];
+  for (int k = 0; k < 2; k++) {
+    runOnce(runs[k]);
+    if (!runs[k].why.empty()) break;
+  }
+  const Run& r = runs[0];
+  const bool built = runs[0].why.empty() && runs[1].why.empty();
+  check(built, built ? std::string("fixture: built twice")
+                     : "fixture: " + (runs[0].why.empty() ? runs[1].why : runs[0].why));
+  auto delta = [&](uint64_t DistantMobs::Stats::*f) { return r.s1.*f - r.s0.*f; };
+
+  // ---- M ----
+  const bool okM = check(
+      built && delta(&DistantMobs::Stats::edgeNearHits) > 0 && r.dmHp1 < r.dmHp0 &&
+          delta(&DistantMobs::Stats::edgeFarApplied) > 0 && r.nmHp1 < r.nmHp0 &&
+          r.nmCarvedLimbs > 0 && r.nmBlade > 0.0f && r.nmBlood > 0.0f,
+      Format("M: near->distant blows %llu (hit %llu, miss %llu, blocked %llu, out of reach "
+             "%llu, no target %llu, unmatched %llu), distant hp %.0f -> %.0f | distant->near "
+             "swings %llu (hit %llu, applied %llu, unapplied %llu, ray misses %llu, covered "
+             "%llu; hp roll %.1f, door %.1f), near hp %.0f -> %.0f, %d limbs carved, Blade hp "
+             "%.1f, blood lost %.2f",
+             (unsigned long long)delta(&DistantMobs::Stats::edgeNearBlows),
+             (unsigned long long)delta(&DistantMobs::Stats::edgeNearHits),
+             (unsigned long long)delta(&DistantMobs::Stats::edgeNearMisses),
+             (unsigned long long)delta(&DistantMobs::Stats::edgeNearBlocked),
+             (unsigned long long)delta(&DistantMobs::Stats::edgeNearOutOfReach),
+             (unsigned long long)delta(&DistantMobs::Stats::edgeNearNoTarget),
+             (unsigned long long)delta(&DistantMobs::Stats::edgeNearUnmatched), (double)r.dmHp0,
+             (double)r.dmHp1, (unsigned long long)delta(&DistantMobs::Stats::edgeFarSwings),
+             (unsigned long long)delta(&DistantMobs::Stats::edgeFarHits),
+             (unsigned long long)delta(&DistantMobs::Stats::edgeFarApplied),
+             (unsigned long long)delta(&DistantMobs::Stats::edgeFarUnapplied),
+             (unsigned long long)delta(&DistantMobs::Stats::edgeFarRayMisses),
+             (unsigned long long)delta(&DistantMobs::Stats::edgeFarCovered),
+             (double)delta(&DistantMobs::Stats::edgeFarHpRollMilli) / 1000.0,
+             (double)delta(&DistantMobs::Stats::edgeFarHpDoorMilli) / 1000.0, (double)r.nmHp0,
+             (double)r.nmHp1, r.nmCarvedLimbs, (double)r.nmBlade, (double)r.nmBlood));
+  // ---- A ----
+  const bool okA = check(
+      built && delta(&DistantMobs::Stats::edgeArrowsIn) > 0 && r.arrowsInjected > 0 &&
+          r.hitsOnTA > 0,
+      Format("A: distant archer loosed %llu inbound, %llu injected (tier %llu), %llu grounded, "
+             "%llu expired, %d hits on the near dummy",
+             (unsigned long long)delta(&DistantMobs::Stats::edgeArrowsIn),
+             (unsigned long long)r.arrowsInjected,
+             (unsigned long long)delta(&DistantMobs::Stats::edgeArrowsInjected),
+             (unsigned long long)delta(&DistantMobs::Stats::edgeArrowsGrounded),
+             (unsigned long long)delta(&DistantMobs::Stats::edgeArrowsExpired), r.hitsOnTA));
+  // ---- C ----
+  const bool okC = check(built && delta(&DistantMobs::Stats::edgeArrowsConverted) > 0 &&
+                             r.hitsOnTC > 0,
+                         Format("C: abstract arrows converted to real flights %llu, hits on "
+                                "their near target %d",
+                                (unsigned long long)delta(&DistantMobs::Stats::edgeArrowsConverted),
+                                r.hitsOnTC));
+  if (!okC) std::printf("distant-edge: C trace:%s\n", r.convTrace.c_str());
+  // ---- B ----
+  const bool okB = check(
+      built && r.arrowsHandedOut > 0 && r.pastEdge > 0 &&
+          delta(&DistantMobs::Stats::edgeArrowsOutResolved) > 0 && r.dbHp1 < r.dbHp0,
+      Format("B: near archer's flights handed out %llu (events %d), resolved %llu, lost %llu, "
+             "distant dummy hp %.0f -> %.0f",
+             (unsigned long long)r.arrowsHandedOut, r.pastEdge,
+             (unsigned long long)delta(&DistantMobs::Stats::edgeArrowsOutResolved),
+             (unsigned long long)delta(&DistantMobs::Stats::edgeArrowsOutLost), (double)r.dbHp0,
+             (double)r.dbHp1));
+  // ---- T ----
+  std::string flips;
+  for (const uint32_t ft : r.flipTicks) flips += Format("%s%u", flips.empty() ? "" : ",", ft - 120000u);
+  const bool okT = check(built && !r.pacerLost && (int)r.flipTicks.size() >= minThrash &&
+                             r.maxWindow <= maxFlips && delta(&DistantMobs::Stats::flipWaits) > 0,
+                         Format("T: %zu tier flips (at %s), at most %d in 600 ticks (bound %d), "
+                                "flip waits %llu, lost %d",
+                                r.flipTicks.size(), flips.c_str(), r.maxWindow, maxFlips,
+                                (unsigned long long)delta(&DistantMobs::Stats::flipWaits),
+                                r.pacerLost ? 1 : 0));
+  if (!okT && !r.pacerTrace.empty())
+    std::printf("distant-edge: T pacer (window-relative x,z):%s\n", r.pacerTrace.c_str());
+  // ---- P ----
+  const bool okP = check(built && delta(&DistantMobs::Stats::playerActorsSeen) == 0 &&
+                             r.playerTargets == 0 && r.zAwake >= ticks / 2 && r.zOnDummy > 0,
+                         Format("P: player ids in distant actor lists %llu, distant brains on a "
+                                "player %d; the zombie awake %d of %d ticks, on the dummy %d",
+                                (unsigned long long)delta(&DistantMobs::Stats::playerActorsSeen),
+                                r.playerTargets, r.zAwake, ticks, r.zOnDummy));
+  // ---- D ----
+  const bool okD = check(built && runs[0].digest == runs[1].digest && runs[0].digest != 0,
+                         Format("D: twice-run digests %016llx / %016llx",
+                                (unsigned long long)runs[0].digest,
+                                (unsigned long long)runs[1].digest));
+
+  RecordObserved("distantEdge.nearBlows", (double)delta(&DistantMobs::Stats::edgeNearBlows));
+  RecordObserved("distantEdge.nearHits", (double)delta(&DistantMobs::Stats::edgeNearHits));
+  RecordObserved("distantEdge.farSwings", (double)delta(&DistantMobs::Stats::edgeFarSwings));
+  RecordObserved("distantEdge.farApplied", (double)delta(&DistantMobs::Stats::edgeFarApplied));
+  RecordObserved("distantEdge.farHpRoll",
+                 (double)delta(&DistantMobs::Stats::edgeFarHpRollMilli) / 1000.0);
+  RecordObserved("distantEdge.farHpDoor",
+                 (double)delta(&DistantMobs::Stats::edgeFarHpDoorMilli) / 1000.0);
+  RecordObserved("distantEdge.nearCarvedLimbs", (double)r.nmCarvedLimbs);
+  RecordObserved("distantEdge.arrowsIn", (double)delta(&DistantMobs::Stats::edgeArrowsIn));
+  RecordObserved("distantEdge.arrowsInjected", (double)r.arrowsInjected);
+  RecordObserved("distantEdge.arrowHitsIn", (double)r.hitsOnTA);
+  RecordObserved("distantEdge.arrowsOut", (double)r.arrowsHandedOut);
+  RecordObserved("distantEdge.arrowsOutResolved",
+                 (double)delta(&DistantMobs::Stats::edgeArrowsOutResolved));
+  RecordObserved("distantEdge.thrashFlips", (double)r.flipTicks.size());
+  RecordObserved("distantEdge.thrashMaxPer600", (double)r.maxWindow);
+  RecordObserved("distantEdge.flipWaits", (double)delta(&DistantMobs::Stats::flipWaits));
+  RecordObserved("distantEdge.bandPeak", (double)r.s1.bandPeak);
+
+  const bool ok = okM && okA && okB && okC && okT && okP && okD;
+  detail = Format("M %s: near->distant %llu hit, distant->near %llu applied (near %d limbs "
+                  "carved) | A %s: %d arrows in hit | B %s: %llu out resolved | T %s: %zu flips, "
+                  "<= %d/600 | P %s | D %s: %016llx",
+                  okM ? "ok" : "FAIL", (unsigned long long)delta(&DistantMobs::Stats::edgeNearHits),
+                  (unsigned long long)delta(&DistantMobs::Stats::edgeFarApplied), r.nmCarvedLimbs,
+                  okA ? "ok" : "FAIL", r.hitsOnTA, okB ? "ok" : "FAIL",
+                  (unsigned long long)delta(&DistantMobs::Stats::edgeArrowsOutResolved),
+                  okT ? "ok" : "FAIL", r.flipTicks.size(), r.maxWindow, okP ? "ok" : "FAIL",
+                  okD ? "ok" : "FAIL", (unsigned long long)runs[0].digest);
+  // EVERY claim's numbers, pass or fail: one line each, so a run says why.
+  for (const std::string& l : lines) std::printf("distant-edge: %s\n", l.c_str());
+  std::printf("distant-edge: %s\n", ok ? "PASS" : "FAIL");
+  for (size_t i = 0; i < fails.size(); i++) detail += (i == 0 ? " | FAIL: " : " / ") + fails[i];
+
+  // ---- LEAVES NOTHING ----
+  c.mobs.Reset();
+  c.debris.Reset();
+  c.mobs.SetParkFn(nullptr);
+  c.mobs.ClearPlayerActors();
+  c.mobs.ClearVoiceEvents();
+  c.stream.Store().Clear();
+  c.mobs.DistantGroundMut().InvalidateAll();
+  SetCurrentTuning(tuneWas);
+  c.mobs.SetDistantStream(&c.stream);
+  c.stream.OnRegen();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& DistantCalibGates() {
@@ -2591,6 +3135,12 @@ const std::vector<Gate>& DistantCalibGates() {
       // edits or moves the window; distant-fight's arm B ticks THE tick.
       {"distant-fight", "mob", {}, false, GateDistantFight, /*needsRender=*/false},
       {"distant-calibrate", "mob", {}, false, GateDistantCalibrate, /*needsRender=*/false},
+      // D3 (docs/PLAN_distant_npcs.md 2.7): THE EDGE. Two fresh worlds (Fresh:
+      // worldgen, Jolt ids rewound, its own id base), each ticked by THE tick
+      // with parking bound; leaves nothing -- mobs / debris / tier reset, the
+      // store cleared, park function and player actors removed, tuning, items
+      // and the id counter put back, worldgen regenerated at home.
+      {"distant-edge", "mob", {}, false, GateDistantEdge, /*needsRender=*/false},
   };
   return g;
 }

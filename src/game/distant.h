@@ -63,6 +63,36 @@
 // until a promotion brings them back as corpses through the record's dead
 // block. The kit and the statuses are on DistantMob (below).
 //
+// D3 THE EDGE (section 2.7; "a pair resolves at the lower fidelity of its two
+// members, and damage lands through the receiver's own door"). The near tier
+// and the distant one share a BAND kDistantEdgeBandVox wide outside the
+// window: the distant creatures in it are published, as tick-start actors,
+// into the near tier's actor list (MobSystem::PublishDistantBand), and the
+// near CREATURES in it are in every distant actor list (TickDistant) -- never
+// a player, local or remote, whatever the geometry. Across it:
+//   * NEAR HITS DISTANT. The near stroke plays; at its first cutting tick a
+//     stroke whose target is a distant creature queues a blow
+//     (MobSystem::QueueEdgeBlow, from StepStroke), resolved at the top of the
+//     next distant impact pass by the same roll (ResolveStrike) against the
+//     defender's tick-start state, in attacker-id order.
+//   * DISTANT HITS NEAR. The roll as for any distant swing; a hit enters the
+//     near creature through its ORDINARY door (game/melee.h ApplyEdgeBlow:
+//     ResolveOnCreature, the cover retarget onto a worn shell) at a contact
+//     point on the struck limb's surface facing the attacker -- a real wound,
+//     real blood, the real shell response. The ops are the near creature's.
+//   * ARROWS BOTH WAYS. A distant archer's arrow at a near creature is flown
+//     for REAL (ArrowFlights' own fixed-point integrator, DistantGround as the
+//     ground) and becomes a real ArrowFlight where it crosses into the window
+//     (MobArcheryTick drains them); an abstract arrow whose target was promoted
+//     mid-flight converts the same way. A near archer's flight that leaves the
+//     window at a distant creature is handed back (QueueEdgeArrowOut) and
+//     resolved by ResolveArrow at the flight time it has left.
+//   * THRASH. Demotion cannot be refused (a creature past the pad has no
+//     ground), so PROMOTION is: a creature that changed tier kDistantMaxFlips
+//     - 2 times in the last kDistantFlipWindowTicks waits at the promotion
+//     line (Stats::flipWaits) until the oldest flip ages out, which bounds a
+//     creature pacing the edge to kDistantMaxFlips flips per window.
+//
 // RULES (CLAUDE.md, §2.11-2.12):
 //   1. Deterministic. The container is a vector SORTED BY ID and every walk is
 //      in that order; tier changes are decided inside the authority tick from
@@ -495,13 +525,80 @@ struct DistantMob {
 // `to` are the two body centres at the loose: render-only, the arc a statue
 // archer's arrow is drawn on (AppendDistantArrowBodies). Never hashed, never
 // saved (a save loses an arrow in the air, as a near save does).
+//
+// D3: an INBOUND flight (`inbound`) is one aimed at a NEAR creature (or an
+// abstract one whose target was promoted mid-flight): no roll, a ballistic
+// state in ArrowFlights' own units (24.8 fixed world voxels, velocity per
+// tick) stepped by the same integrator (game/arrows.h ArrowStepOutside) over
+// DistantGround until it crosses into the window -- where it becomes a real
+// ArrowFlight that hits or misses physically.
 struct DistantArrowFlight {
   uint64_t shooter = 0, target = 0;
   uint32_t looseTick = 0, impactTick = 0;
   Vec3 from{}, to{};
   std::string ammo;              // the item drawn in flight (its micro model)
   distant::ArrowOutcome out;
+  bool inbound = false;
+  int32_t pos[3] = {0, 0, 0};    // inbound: the point, 24.8 fixed world voxels
+  int32_t vel[3] = {0, 0, 0};    // inbound: per tick, 24.8 fixed
+  uint32_t seed = 0;             // inbound: the real flight's soak seed
+  int life = 0;                  // inbound: ticks flown (ArrowFlights::kLifeTicks bounds it)
 };
+
+// ---- THE EDGE's three hand-overs (section 2.7, D3) ---------------------------
+//
+// A NEAR stroke at a DISTANT creature, queued at the stroke's first cutting
+// tick (MobSystem::QueueEdgeBlow) and resolved at the top of the next distant
+// impact pass, in attacker-id order, against the defender's tick-start state.
+// The attacker's kit is taken at the cut (its styles only: the reach, the
+// strike profile and the table row the roll reads).
+struct NearEdgeBlow {
+  uint64_t attacker = 0, target = 0;
+  uint32_t tick = 0;
+  Vec3 from{};                   // the attacker's body centre at the cut
+  distant::DistantKit kit;
+  int style = -1;                // index into kit.styles
+};
+// An INBOUND arrow crossing into the window this tick: what MobArcheryTick
+// turns into a real ArrowFlight (ArrowFlights::Inject), in the order queued.
+struct DistantArrowIn {
+  uint64_t shooter = 0, target = 0;
+  uint32_t tick = 0;
+  int32_t pos[3] = {0, 0, 0};    // the first in-window sample, 24.8 fixed
+  int32_t vel[3] = {0, 0, 0};    // per tick, 24.8 fixed
+  uint32_t seed = 0;
+  std::string ammo;
+};
+// A NEAR flight that left the window at a DISTANT creature (ArrowFlights::
+// Tick, through MobSystem::QueueEdgeArrowOut): resolved by ResolveArrow at
+// the top of the next distant impact pass over the WHOLE shot's distance (the
+// table's knots are the shot's, `from` -> the target), landing after the
+// flight time it has left (`exit` -> the target at `speed`).
+struct NearArrowOut {
+  uint64_t shooter = 0, target = 0;
+  uint32_t tick = 0;
+  Vec3 from{}, exit{};
+  float speed = 0.0f;            // world voxels/s as it left
+  float damage = 0.0f;           // the ammo's flat damage (ItemDef::ArrowSpec)
+  std::string ammo;
+};
+
+// THE EDGE BAND's width (section 2.7): the longest near sight (the archer's
+// 160) plus a margin. A near creature within this of the window's boundary is
+// in every distant actor list that reaches it; a distant creature within this
+// of the window (or inside it, waiting at the promotion line) is published to
+// the near tier's.
+constexpr float kDistantEdgeBandVox = 192.0f;
+// ...and at most this many distant creatures a tick are published (nearest
+// to the window first, ties by id, then in id order): Think walks the near
+// crowd's list several times a step, and 64 near creatures each weighing a
+// held-at-the-line crowd of 500 is the O(N^2) the distant lists cap away too.
+constexpr size_t kDistantBandMax = 128;
+// THE THRASH BOUND (section 2.7): at most kDistantMaxFlips tier changes per
+// creature in any kDistantFlipWindowTicks. Enforced on PROMOTION (a demotion
+// cannot wait), with room kept for the demotion that may follow it.
+constexpr uint32_t kDistantFlipWindowTicks = 600;
+constexpr int kDistantMaxFlips = 4;
 
 // ---- the container ----------------------------------------------------------
 class DistantMobs {
@@ -561,13 +658,14 @@ class DistantMobs {
     uint64_t strokeMisses = 0;     // ...Miss
     uint64_t strokeBlocked = 0;    // ...Blocked (the defender's guard roll)
     uint64_t strokeOutOfReach = 0; // ...the target stepped out of reach + slack
-    uint64_t strokeNoTarget = 0;   // ...the target was dead, gone, or not distant (D3's edge)
+    uint64_t strokeNoTarget = 0;   // ...the target was dead or gone (a near one of the band: edgeFar*)
     uint64_t draws = 0;            // bows drawn
     uint64_t drawsAborted = 0;     // ...let down: the target gone at the loose
     uint64_t looses = 0;           // arrows loosed (ResolveArrow)
     uint64_t arrowHits = 0;        // ...that hit at their impact tick
     uint64_t arrowMisses = 0;      // ...that missed
-    uint64_t arrowsLost = 0;       // ...whose target was not a distant creature at impact
+    uint64_t arrowsLost = 0;       // ...whose target was no living creature in either tier at impact
+                                   // (a near one converts: edgeArrowsConverted)
     uint64_t deaths = 0;           // creatures that died at this tier (landings excluded)
     uint64_t deathsVital = 0;      // ...a vital / root limb at zero
     uint64_t deathsBlood = 0;      // ...bled white
@@ -592,6 +690,44 @@ class DistantMobs {
     uint64_t nsFile = 0;           // phase 3 (refile, latches, summary)
     uint64_t stepsEngaged = 0;     // steps of creatures with a target / threat / swing
     uint64_t actorCaps = 0;        // steps whose actor list was cut to kDistantActorsMax
+    // ---- D3: THE EDGE (section 2.7; MobSystem::PublishDistantBand, the impact
+    // pass's near branches, the arrows across the boundary) -------------------
+    uint64_t bandPublished = 0;    // distant actors handed to the near tier, summed over ticks
+    uint64_t bandPeak = 0;         // ...the most in one tick
+    uint64_t bandCapped = 0;       // ticks the published band was cut to kDistantBandMax
+    uint64_t edgeNearBlows = 0;    // near strokes at a distant creature, queued at their cut
+    uint64_t edgeNearHits = 0;     // ...resolved: Hit (applied to the distant body)
+    uint64_t edgeNearMisses = 0;   // ...Miss
+    uint64_t edgeNearBlocked = 0;  // ...Blocked
+    uint64_t edgeNearOutOfReach = 0;  // ...the target was out of reach + slack by then
+    uint64_t edgeNearNoTarget = 0;    // ...it was dead, promoted or gone when it landed
+    uint64_t edgeNearUnmatched = 0;   // a near stroke whose style the attacker's kit lacks
+    uint64_t edgeFarSwings = 0;    // distant swings at a NEAR creature of the band, resolved
+    uint64_t edgeFarHits = 0;      // ...Hit
+    uint64_t edgeFarMisses = 0;    // ...Miss
+    uint64_t edgeFarBlocked = 0;   // ...Blocked
+    uint64_t edgeFarOutOfReach = 0;   // ...out of reach + slack
+    uint64_t edgeFarApplied = 0;   // hits that entered the near creature's own door
+    uint64_t edgeFarUnapplied = 0; // hits with no door to enter (no physics / spawns: a CPU arm;
+                                   // the struck limb already gone; a ghost)
+    uint64_t edgeFarRayMisses = 0; // ...whose contact fell back to the limb's centre
+    uint64_t edgeFarCovered = 0;   // ...that a worn shell took (the cover retarget)
+    uint64_t edgeFarHpRollMilli = 0;  // life hp the roll gave those hits, x1000
+    uint64_t edgeFarHpDoorMilli = 0;  // life hp the near door charged for them, x1000
+    uint64_t edgeArrowsIn = 0;     // inbound real flights loosed at a near creature
+    uint64_t edgeArrowsConverted = 0;  // abstract arrows whose target was promoted mid-flight
+    uint64_t edgeArrowsInjected = 0;   // inbound flights handed to ArrowFlights at the boundary
+    uint64_t edgeArrowsGrounded = 0;   // ...that met DistantGround first
+    uint64_t edgeArrowsExpired = 0;    // ...that ran out of life first
+    uint64_t edgeArrowsOut = 0;    // near flights handed to the tier as they left the window
+    uint64_t edgeArrowsOutResolved = 0;  // ...resolved (ResolveArrow) into an abstract flight
+    uint64_t edgeArrowsOutLost = 0;      // ...whose target was no living distant creature by then
+    uint64_t flipWaits = 0;        // promotions held for the flip bound (kDistantMaxFlips)
+    uint64_t flips = 0;            // tier changes recorded (demotions + promotions)
+    // A player-band id found in a distant creature's actor list. MUST stay 0:
+    // section 2.7's "never a player", counted at the point the list is built
+    // so a regression shows where it happens (`distant-edge` asserts it).
+    uint64_t playerActorsSeen = 0;
     uint32_t peak = 0;           // the most creatures the tier ever held at once
   };
 
@@ -698,6 +834,13 @@ class DistantMobs {
     nextWakeTick_ = nextWake;
   }
   void RefreshNextWake();
+  // THE MOVE GENERATION (D3): bumped by every door a creature enters, leaves or
+  // moves through (Insert, Erase, Take, Clear, Relocate). The published edge
+  // band's membership is cached against it (MobSystem::PublishDistantBand):
+  // nobody moved, nobody joined or left, so the members are the same.
+  uint64_t MoveGen() const { return moveGen_; }
+  // ...and anything else that changes who is published (a death).
+  void TouchMoveGen() { moveGen_++; }
 
   // ---- ARROWS IN THE AIR (D2b) ------------------------------------------------
   // In LOOSE order (tick, then the shooter's id): the impact pass appends at
@@ -723,6 +866,7 @@ class DistantMobs {
   std::vector<DistantArrowFlight> arrows_;
   uint32_t nextWakeTick_ = UINT32_MAX;
   bool anyAwakeHint_ = false;
+  uint64_t moveGen_ = 0;
   static uint64_t CellKey(int cx, int cz) {
     return ((uint64_t)(uint32_t)cx << 32) | (uint64_t)(uint32_t)cz;
   }

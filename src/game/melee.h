@@ -1,6 +1,7 @@
 #pragma once
 #include "sim/scale.h"  // MetresToCells / MetresPerSecToCells
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "game/anim.h"   // Quat, for WeaponPose::Keyed
@@ -972,6 +973,50 @@ inline constexpr uint32_t kMaxMeleeHops = 2;
 void ApplyRemoteMeleeHits(Physics& phys, MobSystem& mobs, DebrisSystem& debris,
                           World& world, std::vector<ParticleSpawn>& spawns,
                           uint32_t tick);
+
+// ---- A BLOW FROM PAST THE WINDOW (docs/PLAN_distant_npcs.md 2.7, D3) --------
+//
+// A DISTANT creature's swing that the abstract roll landed on a NEAR creature
+// (MobSystem::TickDistant's impact pass). The attacker has no blade, no rig
+// and no bodies, so there is no sweep: the roll decided THAT it hit, WHICH
+// base limb, and how hard (`power`, on the sweep's own 0..1 scale), and this
+// puts it on the near creature through the SAME door the sweep and a peer's
+// blow go through (ResolveOnCreature):
+//   * a CONTACT POINT SYNTHESIZED on the struck limb's surface FACING THE
+//     ATTACKER -- a ray from the attacker's side at that one limb's collider
+//     (anything else on the line, a worn shell, another limb, a bystander, is
+//     stepped past), its centre if no ray reaches it;
+//   * the COVER RETARGET onto a worn shell over it, MeleeSweepDamage's own
+//     march (an edge passes cloth no harder than gear.cutHardnessRef);
+//   * the strike parts BuildStrikeParts makes of the attacker's profile there
+//     (a thrust a stab, any other swing a cut across the travel), the
+//     reaction, the cut / blunt / bite resolvers. No coat exchange: the
+//     attacker has no lattice to trade with.
+// So the near creature gets a REAL wound, REAL blood (its own bleed, its own
+// ops) and its REAL shell response. Gore goes into `spawns`. Only a creature
+// this machine owns and the machine drives (never a player's body: the edge
+// band never holds one).
+struct EdgeBlow {
+  uint64_t attackerId = 0;   // the distant creature (no bodies)
+  uint64_t targetId = 0;     // the near creature
+  int limb = -1;             // the base limb the roll struck
+  Vec3 from{};               // the attacker's body centre, world voxels
+  StrikeProfile strike;      // what it lands with
+  std::string weapon;        // the item swung ("" for a natural weapon)
+  bool natural = false;      // a fist or jaws: self-mounted, no blade
+  bool stab = false;         // a thrust: the point along the travel
+  float power = 1.0f;        // 0..1
+  uint32_t seed = 0;         // every part's draw key
+};
+struct EdgeBlowResult {
+  bool applied = false;      // the door was entered
+  bool rayHit = false;       // the contact is on the limb's surface (not its centre)
+  bool covered = false;      // a worn shell took it
+  float hpCharged = 0.0f;    // the creature's TotalHp before, less after
+};
+EdgeBlowResult ApplyEdgeBlow(const EdgeBlow& b, Physics& phys, MobSystem& mobs,
+                             DebrisSystem& debris, World& world,
+                             std::vector<ParticleSpawn>& spawns);
 
 
 // The whole pose the driver commands, in one value. Passed to Mob::

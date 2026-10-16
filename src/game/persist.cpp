@@ -1578,6 +1578,17 @@ uint32_t EntityParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
           pending_ = true;
           continue;
         }
+        // ...AND THE THRASH BOUND (D3, section 2.7): a creature pacing the
+        // edge would otherwise change tier on every crossing. A demotion
+        // cannot wait (past the pad there is no ground for a body), so the
+        // promotion does: one that changed tier kDistantMaxFlips - 2 times in
+        // the last kDistantFlipWindowTicks stays distant, held at the line,
+        // until its oldest flip ages out.
+        if (!mobs.DistantFlipBudgetOk(cid, tick)) {
+          tier.Note(&DistantMobs::Stats::flipWaits);
+          pending_ = true;
+          continue;
+        }
         // ...AND THE SNAP's GROUND (D1, MobSystem::SnapPromotionGround): the
         // footprint's columns from promoteMaxDropVox below the feet to that
         // much above, so the promotion lands on ground the fetch cache has
@@ -1592,7 +1603,7 @@ uint32_t EntityParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
           continue;
         }
         bool refused = false;
-        if (mobs.PromoteDistant(cid, &refused) != nullptr) {
+        if (mobs.PromoteDistant(cid, &refused, tick) != nullptr) {
           made++;
         } else if (refused) {
           // Spawn short of a body or a brick: kept, retried, and this call

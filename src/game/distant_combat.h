@@ -352,8 +352,11 @@ std::vector<float> ShellHardnessOfLimbs(const Mob& m);
 
 // Cache the kit from a LIVE creature (the demotion, before ReleaseRig).
 // `items` may be null (no held-weapon profiles then); a null-system or
-// def-less mob yields an empty kit.
-DistantKit BuildDistantKit(const Mob& m, const ItemLibrary* items);
+// def-less mob yields an empty kit. `withBody` false (D3: a NEAR attacker's
+// kit at its cut, game/distant.h NearEdgeBlow) stops after the styles and the
+// bow -- no limb roles, no shell scan -- which is all an attacker's kit is
+// read for (ResolveStrike reads the defender's body, the attacker's styles).
+DistantKit BuildDistantKit(const Mob& m, const ItemLibrary* items, bool withBody = true);
 
 // =============================================================================
 // THE ABSTRACT BODY'S STATE (what the distant tier steps)

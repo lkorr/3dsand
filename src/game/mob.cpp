@@ -4123,6 +4123,16 @@ void MobSystem::Reset(bool rewindIds) {
   // edge band's memory of near creatures that no longer exist.
   distantGround_.InvalidateAll();
   nearBand_.clear();
+  // ...the edge's derived state and hand-overs (D3): the band published last
+  // tick, the blows and arrows queued for a tier that is gone, and every
+  // creature's flip log (its ids may be re-issued below).
+  distantBand_.clear();
+  bandIds_.clear();
+  bandHave_ = false;
+  edgeBlows_.clear();
+  edgeArrowsOut_.clear();
+  edgeArrowsIn_.clear();
+  tierFlips_.clear();
   bodyFx_.clear();
   // ...and the corpses that were going to get up do not, because the world
   // they were lying in is gone: a booked rising names a place and a handful of
@@ -7892,6 +7902,22 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     return;
   }
 
+  // ---- THE EDGE: A STROKE AT A DISTANT CREATURE (PLAN_distant_npcs 2.7) -----
+  //
+  // The near stroke PLAYS -- the player may be watching, and the blade still
+  // sweeps for real below (it can meet a near body on the way). But its
+  // target is past the window and has no body to meet, so at the stroke's
+  // FIRST CUTTING TICK the blow is handed to the distant tier
+  // (QueueEdgeBlow): rolled there, on this creature's own kit, against the
+  // defender's tick-start state, at the top of the next distant impact pass.
+  // Once per stroke. A pair across the edge resolves at the lower fidelity
+  // of its two members (section 2.7).
+  if (st.Cutting() && !st.edgeQueued && st.targetId != 0 && !ai::IsPlayerActorId(st.targetId) &&
+      !ai::IsLooseActorId(st.targetId) && FindMobById(st.targetId) == nullptr) {
+    st.edgeQueued = true;
+    QueueEdgeBlow(mob, st.style, st.targetId, tick);
+  }
+
   Vec3 right, up, fwd;
   MobBasis(mob, right, up, fwd);
   // A MIRRORED STROKE (the other arm from its author's) runs in the
@@ -9848,13 +9874,22 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
 
   // ---- THE DISTANT TIER STEPS (docs/PLAN_distant_npcs.md D1, distant.cpp) --
   // Here, with the near actor list complete and before any near creature
-  // moves: both tiers read each other as of the START of the tick (the near
-  // creatures of the edge band from `actors_`; D3 hands the distant ones the
-  // other way), and a creature the loop below demotes takes its first
-  // distant step next tick. Nothing at all while the tier is empty -- which,
-  // with `distant.enabled` off, it always is -- and nothing but two compares
+  // moves: both tiers read each other as of the START of the tick, and a
+  // creature the loop below demotes takes its first distant step next tick.
+  // Nothing at all while the tier is empty, and nothing but two compares
   // while everyone in it sleeps (rule 2).
-  TickDistant(tick, world, &actors_);
+  //
+  // THE EDGE BAND BOTH WAYS (D3, section 2.7). The distant creatures within
+  // kDistantEdgeBandVox of the window are PUBLISHED first, from the tier's
+  // tick-start state (before TickDistant moves anyone); TickDistant reads the
+  // near creatures of the band out of `actors_` as it stands -- never a
+  // player -- and lands its blows on them through their own doors (gore into
+  // this tick's `spawns`); THEN the published distant actors are appended, so
+  // the near creature loop below sees them (and only it: TickDistant must not
+  // read the distant tier back out of the near list).
+  PublishDistantBand(tick, wlo);
+  TickDistant(tick, world, &actors_, &spawns);
+  actors_.insert(actors_.end(), distantBand_.begin(), distantBand_.end());
   sc.Mark("distant");
 
   // THE DEAD CAP, before anybody steps: a corpse released here is a husk

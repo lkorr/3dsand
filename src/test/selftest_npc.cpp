@@ -378,7 +378,14 @@ Status GateNpcSchedule(Ctx& c, std::string& detail) {
 
 // ---- npc-catchup ------------------------------------------------------------------
 
+// THE SWITCH (docs/PLAN_distant_npcs.md D3): this is the PARKED record's
+// catch-up -- a villager that was never distant comes back where its day says
+// -- so it runs with `distant.enabled` PINNED OFF. With it on (the default
+// since the flip) the far teleport is inside the distant radius and the
+// villager would demote instead; its distant life (walking its schedule while
+// away) is package D5's gate, `distant-schedule`.
 Status GateNpcCatchup(Ctx& c, std::string& detail) {
+  DistantSwitchScope tierOff(false);
   refs::RegisterAllKinds();
   std::string why;
   if (!InstallSchedule(why)) {

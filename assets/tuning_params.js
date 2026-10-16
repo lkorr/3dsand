@@ -1172,7 +1172,7 @@ const TUNING_PARAMS = {
   'render.denoiseStrength':{t:'f',def:0.7,min:0,max:1},
   'render.presentMode':{t:'i',def:1,min:0,max:2},
   'render.fpsCap':{t:'f',def:0,min:0,max:240},
-  'distant.enabled':{t:'b',def:false},
+  'distant.enabled':{t:'b',def:true},
   'distant.radius':{t:'f',def:1280,min:0,max:8192},
   'distant.hysteresis':{t:'f',def:256,min:0,max:4096},
   'distant.idleStride':{t:'i',def:4,min:1,max:30},

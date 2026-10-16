@@ -152,7 +152,7 @@
     "keepKitOnTurn": true
   },
   "distant": {
-    "enabled": false,
+    "enabled": true,
     "radius": 1280,
     "hysteresis": 256,
     "idleStride": 4,

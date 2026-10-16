@@ -2790,10 +2790,12 @@ TP_F(render, fpsCap, NO_WGSL, 0.0f, 0.0f, 240.0f)
 // cache. Every row the feature needs is here from D0 (batched on purpose: a
 // later row in this file is a rebuild for everyone).
 //
-// THE SWITCH. False until package D3 (the edge, and the flip): with it off
-// the park rule runs exactly as before S5b's parking did and the tier stays
-// empty -- the parity oracle for every package.
-TP_B(distant, enabled, NO_WGSL, false)
+// THE SWITCH. ON since package D3 (the edge, and the flip, 2026-10-15): a
+// creature leaving the window keeps living out to the radius below. Off = the
+// park rule exactly as S5b's parking ran it, the tier empty -- the parity
+// oracle every package was tested against, and what a gate that tests the
+// PARK path pins (mob-park, corpse-save, npc-catchup, refs-npc-identity C).
+TP_B(distant, enabled, NO_WGSL, true)
 // A creature leaving the window DEMOTES (instead of parking) when its centre
 // is within this many world voxels of the window centre: 1280 = 128 m.
 // 0 parks everything, which is the switch by another name.

@@ -8175,7 +8175,9 @@ class MobSystem {
   // CATCH-UP STAYS ON IN D0: a distant villager is frozen like a parked one,
   // so it comes back where its schedule says, as an unpark does. D5 (distant
   // villagers walk their schedules) turns it off for creatures that walked.
-  Mob* PromoteDistant(uint64_t id, bool* spawnRefused = nullptr);
+  // `tick` is the tick the promotion happens on (the thrash bound's clock;
+  // 0 = the last PreTick's).
+  Mob* PromoteDistant(uint64_t id, bool* spawnRefused = nullptr, uint32_t tick = 0);
   // THE PATCHED RECORD of a distant creature: its demotion record with the
   // overlay written in (§2.10). What a retire parks and what a save writes.
   // False (out untouched) if the record does not take the patch -- which a
@@ -8264,8 +8266,55 @@ class MobSystem {
   // other creatures (a snapshot), so the order it steps them in cannot change
   // any outcome. Emits NO ops, ever.
   // `nearActors` may be null (a gate's CPU-only arm).
+  //
+  // D3, THE EDGE (section 2.7; game/distant.h): the impact pass first resolves
+  // the blows near creatures queued at distant ones (QueueEdgeBlow) and the
+  // near arrows that left the window at them (QueueEdgeArrowOut); a distant
+  // swing at a NEAR creature of the band lands through that creature's own
+  // door (ApplyEdgeBlow: a real wound, its gore into `spawns`, its blood from
+  // its own bleed this tick); a distant arrow at one is flown for real and
+  // queued for ArrowFlights where it crosses into the window
+  // (TakeEdgeArrowsIn). `spawns` null (a CPU arm): a hit on a near creature is
+  // rolled and counted (edgeFarUnapplied), never applied.
   void TickDistant(uint32_t tick, World& world,
-                   const std::vector<ai::Actor>* nearActors);
+                   const std::vector<ai::Actor>* nearActors,
+                   std::vector<ParticleSpawn>* spawns = nullptr);
+  // ---- THE EDGE BAND, the near tier's half (section 2.7; D3) ---------------
+  // Rebuilt by PreTick from the distant tier's TICK-START state, before
+  // TickDistant moves anybody and appended to the near actor list after it:
+  // every living distant creature within kDistantEdgeBandVox of the window
+  // box (inside it too -- one waiting at the promotion line), at most
+  // kDistantBandMax (nearest to the window first, ties by id), in id order.
+  // The same snapshot the distant tick's own actor lists are built from, so
+  // the two tiers read each other as of the start of the tick.
+  void PublishDistantBand(uint32_t tick, Vec3 wlo);
+  const std::vector<ai::Actor>& DistantBand() const { return distantBand_; }
+  // The published entry of distant creature `id` this tick (its centre,
+  // height, velocity), or null when it is not in the band. What a near
+  // archer's draw tracks a distant target by (game/mob_archery.cpp).
+  const ai::Actor* EdgeActor(uint64_t id) const;
+  // NEAR HITS DISTANT: a near stroke at distant creature `targetId` reached
+  // its cut (MobSystem::StepStroke). Queued with the attacker's kit as it is
+  // now; resolved by the next TickDistant. False when nothing was queued.
+  bool QueueEdgeBlow(const Mob& attacker, int styleIndex, uint64_t targetId, uint32_t tick);
+  // A NEAR flight that left the window at distant creature `out.target`
+  // (game/arrows.cpp ArrowFlights::Tick). False (nothing queued) when the
+  // target is not a living distant creature: the flight expires as before.
+  bool QueueEdgeArrowOut(const NearArrowOut& out);
+  // The inbound arrows that crossed into the window this tick, taken (the
+  // caller, MobArcheryTick, makes each a real ArrowFlight).
+  std::vector<DistantArrowIn> TakeEdgeArrowsIn() {
+    std::vector<DistantArrowIn> out;
+    out.swap(edgeArrowsIn_);
+    return out;
+  }
+  // THE THRASH BOUND (section 2.7): may distant creature `id` be promoted at
+  // `tick` -- fewer than kDistantMaxFlips - 1 tier changes in the last
+  // kDistantFlipWindowTicks, so the promotion and a demotion after it still
+  // fit? EntityParking::Unpark asks it as a fourth wait.
+  bool DistantFlipBudgetOk(uint64_t id, uint32_t tick) const;
+  // Tier changes of `id` inside (tick - kDistantFlipWindowTicks, tick].
+  int TierFlipsWithin(uint64_t id, uint32_t tick) const;
   // The edited-ground source the distant ground reads (Stream::
   // SettledStoredChunk). Phase H sets it every tick; a gate driving
   // TickDistant directly sets it itself (or leaves it null: TerrainHeight
@@ -10346,6 +10395,31 @@ class MobSystem {
     int32_t cx, cz;
   };
   std::vector<NearBandCell> nearBand_;
+  // ---- D3: THE EDGE (section 2.7; distant.cpp) ------------------------------
+  // The distant creatures published to the near tier this tick (id order),
+  // and the membership cache that keeps that a walk of the members only while
+  // nobody moved: the tier's move generation and the window it was built for.
+  std::vector<ai::Actor> distantBand_;
+  std::vector<uint64_t> bandIds_;
+  uint64_t bandGen_ = ~0ull;
+  IVec3 bandWo_{};
+  bool bandHave_ = false;
+  // The three hand-overs (game/distant.h): near blows queued at their cut (the
+  // near loop's order; sorted by attacker id at the drain), near arrows that
+  // left the window at a distant creature, and inbound arrows that crossed in.
+  std::vector<NearEdgeBlow> edgeBlows_;
+  std::vector<NearArrowOut> edgeArrowsOut_;
+  std::vector<DistantArrowIn> edgeArrowsIn_;
+  // The tier changes of every creature that changed tier recently (the thrash
+  // bound): the last kDistantMaxFlips flip ticks, oldest first. Looked up by
+  // id only (never walked for an outcome); trimmed of entries whose newest
+  // flip left the window once it grows.
+  struct TierFlipLog {
+    uint32_t t[kDistantMaxFlips] = {};
+    uint8_t n = 0;
+  };
+  std::unordered_map<uint64_t, TierFlipLog> tierFlips_;
+  void NoteTierFlip(uint64_t id, uint32_t tick);
   // The mid-air landing (section 2.4): DistantGround under it, fall damage
   // from the drop and vel.y by ApplyFallDamage's thresholds, spread over the
   // limbs' hp as SpendHp spreads it. Clears landPending.

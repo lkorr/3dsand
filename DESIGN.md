@@ -700,40 +700,13 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   **Multiplayer:** main enables parking in single player and on the host; a
   client keeps the old despawn, because its store is not the one the host
   saves. Known gap: a host-parked creature returns only when the HOST's window
-  reaches it. **Not done:** parked creatures do not tick (no off-screen
-  travel or schedules); authored NPCs still have no
-  stable content id (`npc:<name>`) for quests to name. Gate `mob-park`.
-  **The distant tier's seam (2026-10-15, docs/PLAN_distant_npcs.md D0,
-  `game/distant.h`), behind `distant.enabled` (OFF until D3):** a leaver within
-  `distant.radius` of the window centre DEMOTES instead of parking -- id,
-  `ai::Brain` and steer state kept in `MobSystem::Distant()`, the `SaveOne`
-  record kept as the bridge, the dead too -- and `Unpark` PROMOTES those the
-  window reaches again first (nearest first, same three waits, same budget,
-  `LoadOne(..., keepId)` + `Mob::ApplyDistantOverlay`); past radius +
-  hysteresis one RETIRES as its patched record (`MobSystem::PatchMobRecord`);
-  a save writes each as its patched record. **D1 (2026-10-15):** an awake
-  distant creature THINKS (`ai::Think`; its actor list = the distant creatures
-  of its 2D hash neighbourhood + near creatures of the edge band, never a
-  player; open-field sight), turns with `SteerStep` and walks
-  (`MobSystem::TickDistant`, top of `PreTick`) on `DistantGround` --
-  `TerrainHeight` + water + evicted edits read through
-  `Stream::SettledStoredChunk` after their eviction drain -- held at the
-  promotion line while it waits; an idle one SLEEPS (no cost) until a creature
-  enters its 3x3 cells or its clock comes round; a promotion snaps one that
-  moved onto the real ground. **D2b (2026-10-15):** distant creatures FIGHT
-  -- Think's `attack` starts an abstract swing that lands at its impact tick
-  and is resolved against the defender's tick-start state by the calibrated
-  roll (`game/distant_combat.h`: guard, hit, limb by role, the measured
-  hit-size distribution whose tail is the organs, the shell, and
-  DISMEMBERMENT -- an open stump bleeds until death, as near), outcomes
-  applied in attacker-id order; `shoot` draws and looses an abstract arrow
-  (drawn in flight as a render-only body); `cast` holds. They bleed, burn,
-  drop a weapon from a ruined arm and die by the near rules; the dead
-  promote as corpses through the record's dead block, severed limbs are cut
-  off for real at promotion. The table (`assets/mobs/distant_combat.json`) is
-  measured by `distant-calib-matrix` with the near drip pot lifted (lone-fight
-  bleeding). Gates `distant-roundtrip`, `distant-walk`, `distant-sleep`,
-  `distant-fight`, `distant-calibrate`; the full section lands with D3.
+  reaches it. A PARKED record still does not tick, but since the distant tier
+  (2026-10-15, on by default) a creature that leaves the window within 128 m
+  is not parked at all: it goes DISTANT and keeps living -- walks, sleeps,
+  fights, fights across the window edge -- and comes back under its own id
+  with its own brain (see "Distant creatures" below). Authored NPCs still have
+  no stable content id (`npc:<name>`) for quests to name. Gate `mob-park`
+  (which pins the switch off for its park-path arms).
 - **The save stores the delta, and meta names its generator (2026-09-22,
   `docs/PLAN_save_system.md` S1).** A saved world is `genChunk(seed,
   generator)` plus the store. `Stream::FlushResident` used to write all 32,768
@@ -1011,6 +984,144 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   - Caveat: the travel strip is one biome (desert). The step line covers every
     biome whose cover splits (desert, ocean); tundra's snow skin opted out of
     the firm split and keeps its settle transient.
+
+### Distant creatures (2026-10-15; `docs/PLAN_distant_npcs.md` D0-D3, `game/distant.h`)
+
+The window is 51.2 m across and used to be the edge of the living world: a
+creature 16 voxels past it was PARKED (its record in a region bucket, frozen,
+its id and mind dropped), so a fight could be no bigger than the window. Since
+the D3 flip (`distant.enabled`, **on by default**) it keeps living, cheaply,
+out to `distant.radius` (1,280 voxels = 128 m) round the window centre.
+
+**Three tiers.** NEAR = `MobSystem::mobs_` (a whole `Mob`: rig, Jolt, bricks,
+every pass). DISTANT = `MobSystem::Distant()` (`DistantMobs`, a vector sorted
+by id, cap `kMaxDistantMobs` 512): id + `ai::Brain` + steer state + the
+`SaveOne` record as the bridge for everything the tier does not simulate +
+an OVERLAY it owns (origin, heading, every limb's hp, dead + cause, ref id) +
+a cached fighting kit and statuses; no rig, no physics, no matter, **no
+ops**. PARKED = `ChunkStore::DormantEntities` (bytes; nothing ticks).
+
+**Borders**, all decided inside the authority tick from tick-start state:
+- *Demote* (PreTick's park rule, `DemoteToDistant`): a non-ghost leaver within
+  the radius with room in the tier -- the living AND the dead (a corpse is a
+  dead `DistantMob`, asleep forever) -- keeps its id and brain; the kit,
+  vitals and statue are read off the live rig before `ReleaseRig`. Past the
+  radius or with the tier full it parks as before (counted).
+- *Promote* (`EntityParking::Unpark`, phase H, before `mobs.PreTick`): inside
+  the window by `kUnparkMarginChunks` (THE PROMOTION LINE), nearest first, under
+  Unpark's waits (budget, living cap, ground in the fetch cache incl. the snap's
+  chunks) plus the THRASH BOUND (below) -- `PatchMobRecord` -> `LoadOne(...,
+  keepId)` -> brain back -> `Mob::ApplyDistantOverlay` (hp written directly,
+  severs cut for real, a still-bleeding body re-opened, a burning one re-lit).
+  A creature that walked is snapped onto the REAL ground (`SnapPromotionGround`,
+  fetch cache, up out of matter). While it waits it is HELD at the line (its
+  drive refuses any deeper step): no statue ever walks through the voxel world.
+- *Retire* past radius + `distant.hysteresis`: its PATCHED record parks. Id and
+  brain dropped (a parked creature's rule).
+Only two functions carry the overlay (`PatchMobRecord`, `ApplyDistantOverlay`);
+promote(demote(m)) re-saves byte for byte (`distant-roundtrip`).
+
+**Ground** (`DistantGround`, pure functions of seed + map): `TerrainHeight`,
+water (`TerrainColumn().water` / `WaterColumnAt`), and EDITED chunks read from
+the `ChunkStore` after their pending eviction is drained
+(`Stream::SettledStoredChunk` -- an eviction lands on a GPU-timed tick, audit
+A3). Trees, buildings and `.svedit` layers are not obstacles (v1 gap). Ground
+MODE is decided once at demotion: SURFACE (feet within `surfaceSnapMaxVox` of
+the terrain, outside every placed dungeon box) walks; ANCHORED (underground,
+indoors, on a wall) thinks, turns and strikes what reaches it but never moves.
+A SURFACE creature demoted in mid-air lands with `ApplyFallDamage`'s verdict.
+
+**The step** (`MobSystem::TickDistant`, top of PreTick): every AWAKE creature
+in id order THINKS (`ai::Think` with a `WorldView` of the distant creatures in
+its 2D hash neighbourhood + the near creatures of the edge band, capped at the
+24 nearest; open-field sight; a `NavProbe` over DistantGround), STEERS
+(`SteerStep`, the near tier's own function), spaces and DRIVES in <= 1-voxel
+substeps within its climb/drop budgets (a fish only in water, a swimmer
+afloat). It SLEEPS when idle (no target, threat, swing, bleed, burn or
+walkable goal, and no hostile stranger in reach) and costs nothing until a
+creature enters its 3x3 cells or its clock comes round; an unengaged walker
+steps every `distant.idleStride` ticks. Measured: 200 asleep 0.2 us a tick;
+128 engaged 0.69 ms (target 1.5).
+
+**Combat** (`game/distant_combat.h`, pure): a swing is a ROLL at the style's
+measured impact tick -- the defender's guard class, the style's contact rate,
+a limb by ROLE (head/torso/arm/leg/tail/fin, so the snake, shark and naga need
+no table), hp = strike total x the measured effective power x the role's
+hit-size distribution (its tail is the organs) x the worn shell's factor, the
+bleed it owes, and DISMEMBERMENT at the measured per-role rate (an open stump
+bleeds until death). Arrows: hit chance by distance knots, flight time from the
+bow's speed. Statuses: bleed (a decaying rate), burn (to the burn cap), grips
+failing on a ruined arm, an archer's sidearm. Deaths by the near rules; the
+dead promote as corpses through the record's dead block. Casters HOLD (owner
+decision). THE TABLE IS MEASURED, not tuned: `distant-calib-matrix` runs a
+duel matrix at full fidelity, logs every stroke STARTED with its outcome
+(`game/stroke_log.h`) and writes `assets/mobs/distant_combat.json`;
+`distant-calibrate` holds the asymmetric matchups' win rate / time-to-kill /
+damage race to it (two known divergences, listed in `tests/baseline.json`).
+
+**The edge** (D3, §2.7: "a pair resolves at the lower fidelity of its two
+members, and damage lands through the receiver's own door"). A BAND
+`kDistantEdgeBandVox` (192) wide is shared: the distant creatures within it of
+the window box (or inside it, held at the line) are PUBLISHED into the near
+actor list from the tier's TICK-START state (`PublishDistantBand`, before
+`TickDistant` moves anyone; at most 128, nearest first, in id order); the near
+CREATURES within it are in every distant actor list -- **never a player**,
+local or remote, by construction (counted at the list's construction,
+`playerActorsSeen`, held at 0 by `distant-edge`). Across it:
+- *Near hits distant*: the near stroke plays (its blade still sweeps for
+  real); at its first cutting tick a stroke whose target is distant queues the
+  blow (`QueueEdgeBlow`, the attacker's kit at the cut), rolled at the top of
+  the next distant impact pass in attacker-id order.
+- *Distant hits near*: the same roll against the near creature's live body
+  (kit + limb hp read once, before any blow of the tick applies); a hit enters
+  through `ApplyEdgeBlow` (`game/melee.h`): a contact point on the struck
+  limb's surface FACING THE ATTACKER (a ray at that one collider), the sweep's
+  cover retarget onto a worn shell, `BuildStrikeParts` + `ResolveOnCreature`
+  -- a real wound, real blood (the creature's own bleed and ops), the real
+  shell response. The roll's hp over the strike total is the sweep's 0..1
+  power; the near model prices it (measured: roll 120 hp, door 113 hp).
+- *Arrows*: a distant archer's arrow at a near creature is flown for real by
+  ArrowFlights' own integrator over DistantGround (`ArrowStepOutside`) and
+  becomes a real `ArrowFlight` where it crosses into the window
+  (`MobArcheryTick` injects it) -- it hits or misses physically. An abstract
+  arrow whose target was promoted mid-flight converts the same way from its
+  arc. A near archer's flight that leaves the window at a distant creature
+  (`ArrowShot` names who at whom) is handed back (`QueueEdgeArrowOut`) and
+  resolved by the ranged roll over the whole shot, landing after the flight
+  time it has left.
+- *Thrash*: a demotion cannot wait (past the pad there is no ground), so a
+  PROMOTION does: a creature with `kDistantMaxFlips - 2` tier changes in the
+  last `kDistantFlipWindowTicks` (600) waits at the line, so a creature pacing
+  the edge changes tier at most `kDistantMaxFlips` (4) times per 600 ticks.
+
+**Drawing** (`game/distant_draw.h`): a statue -- the creature's own live limbs
+posed (idle, walk A/B, strike, lying), merged and downsampled to 5 cm cells,
+baked at demotion per look key (def + gear + dyes + a coarse damage
+signature), packed lazily into the micro pool under a 1 MiW LRU, drawn as one
+`RenderOnlyBody` (living before dead, nearest first, never a near body's
+slot; `kMaxBodySlots` 4096). Distant arrows are drawn on their arc. Statues
+are fully lit outside the window and keep the limbs they left with (v1 gaps).
+
+**Persistence**: a save writes every distant creature as its patched record
+(`'MOBS'` saveRecords) -- a save is "everyone distant parks"; brain and id are
+lost across save/load exactly as before. Bleed, burn and distant severs are
+lost on a retire or a save (the record never carried them). Activating parked
+records back into the tier within the radius (and on load) is D5.
+
+**Determinism**: id-ordered walks, `Hash3(id ^ salt, tick, i)` with the
+`kSaltDistant*` salts beside the AI's, tick-start snapshots on both sides of
+the edge, outcomes resolved before any is applied, ground and ChunkStore reads
+latency-fixed. Mob state is not in `determinismHash`; twice-run digests hold
+it (`distant-walk`, `distant-fight`, `distant-edge`).
+
+**Off** (`distant.enabled = false`): the park rule exactly as S5b ran it; the
+gates that test the PARK path pin it off (`DistantSwitchScope`: `mob-park`
+A-F, `corpse-save`, `npc-catchup`, `refs-npc-identity` A-E; C2 runs the tier).
+Counters: `build/last_run.json` -> `distant`. Gates `distant-roundtrip`,
+`distant-walk`, `distant-sleep`, `distant-fight`, `distant-calibrate`,
+`distant-calib-matrix`, `distant-look`, `distant-edge`. Planned: D5+D6
+(activation, schedules walked while distant, load), D8 (cap overflow past 64),
+D9 (the player's arrows past the edge), D7 (multiplayer).
 
 ---
 

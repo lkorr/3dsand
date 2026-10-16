@@ -737,6 +737,12 @@ const char* const kOrder[] = {
     // its corpse-promotion arm (the corpses are reset with the mobs after).
     "distant-fight",
     "distant-calibrate",
+    // THE EDGE (docs/PLAN_distant_npcs.md D3). After `distant-calibrate` for
+    // the same exit contract plus its own: the store cleared, the park
+    // function and the player actor list removed, worldgen regenerated at
+    // home (its near fight bleeds on the window's ground). It never moves the
+    // window; it ticks THE tick with parking bound, from two fresh worlds.
+    "distant-edge",
     // MOBS v6 (PLAN_corpse_is_a_mob P2a). After `mob-park` for the same exit
     // contract: mobs, debris and risings reset, id counter restored, park
     // function removed, store cleared, worldgen regenerated at home.
@@ -1794,8 +1800,9 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
   // Every demotion, promotion and retire the run's creature systems made, and
   // -- the point of writing it -- every refusal: a leaver that parked because
   // the tier was full (refusedFull) or was past the radius (outsideRadius), a
-  // promotion that waited (ground / cap / budget / spawn) or failed. Zero
-  // everywhere while `distant.enabled` is off, which it is until D3.
+  // promotion that waited (ground / cap / budget / spawn / the flip bound) or
+  // failed. Zero everywhere while `distant.enabled` is off (on by default
+  // since D3; the gates that test the park path pin it off).
   {
     const DistantMobs::Stats& ds = DistantRunTotals();
     f << "  \"distant\": {\"demoted\": " << ds.demoted
@@ -1855,7 +1862,40 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << ", \"usMove\": " << (double)ds.nsMove / 1000.0
       << ", \"usCombat\": " << (double)ds.nsCombat / 1000.0
       << ", \"usSleep\": " << (double)ds.nsSleep / 1000.0
-      << ", \"usFile\": " << (double)ds.nsFile / 1000.0 << "},\n";
+      << ", \"usFile\": " << (double)ds.nsFile / 1000.0
+      // D3: THE EDGE -- the distant actors published to the near tier, the
+      // blows across it both ways by outcome (and the hp the distant roll gave
+      // a near hit beside what the near door then charged), the arrows across
+      // the boundary both ways and where they ended, the thrash bound's waits
+      // and flips, and the never-a-player witness (must be 0).
+      << ", \"bandPublished\": " << ds.bandPublished << ", \"bandPeak\": " << ds.bandPeak
+      << ", \"bandCapped\": " << ds.bandCapped << ", \"edgeNearBlows\": " << ds.edgeNearBlows
+      << ", \"edgeNearHits\": " << ds.edgeNearHits
+      << ", \"edgeNearMisses\": " << ds.edgeNearMisses
+      << ", \"edgeNearBlocked\": " << ds.edgeNearBlocked
+      << ", \"edgeNearOutOfReach\": " << ds.edgeNearOutOfReach
+      << ", \"edgeNearNoTarget\": " << ds.edgeNearNoTarget
+      << ", \"edgeNearUnmatched\": " << ds.edgeNearUnmatched
+      << ", \"edgeFarSwings\": " << ds.edgeFarSwings << ", \"edgeFarHits\": " << ds.edgeFarHits
+      << ", \"edgeFarMisses\": " << ds.edgeFarMisses
+      << ", \"edgeFarBlocked\": " << ds.edgeFarBlocked
+      << ", \"edgeFarOutOfReach\": " << ds.edgeFarOutOfReach
+      << ", \"edgeFarApplied\": " << ds.edgeFarApplied
+      << ", \"edgeFarUnapplied\": " << ds.edgeFarUnapplied
+      << ", \"edgeFarRayMisses\": " << ds.edgeFarRayMisses
+      << ", \"edgeFarCovered\": " << ds.edgeFarCovered
+      << ", \"edgeFarHpRoll\": " << (double)ds.edgeFarHpRollMilli / 1000.0
+      << ", \"edgeFarHpDoor\": " << (double)ds.edgeFarHpDoorMilli / 1000.0
+      << ", \"edgeArrowsIn\": " << ds.edgeArrowsIn
+      << ", \"edgeArrowsConverted\": " << ds.edgeArrowsConverted
+      << ", \"edgeArrowsInjected\": " << ds.edgeArrowsInjected
+      << ", \"edgeArrowsGrounded\": " << ds.edgeArrowsGrounded
+      << ", \"edgeArrowsExpired\": " << ds.edgeArrowsExpired
+      << ", \"edgeArrowsOut\": " << ds.edgeArrowsOut
+      << ", \"edgeArrowsOutResolved\": " << ds.edgeArrowsOutResolved
+      << ", \"edgeArrowsOutLost\": " << ds.edgeArrowsOutLost
+      << ", \"flipWaits\": " << ds.flipWaits << ", \"flips\": " << ds.flips
+      << ", \"playerActorsSeen\": " << ds.playerActorsSeen << "},\n";
   }
   // ---- THE DISTANT STATUES (game/distant_draw.h, PLAN_distant_npcs D4a) ---
   // What every DistantDraw in the run did: drawn / culled / starved for want
