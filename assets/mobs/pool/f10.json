@@ -163,8 +163,8 @@
       "bloodless": true,
       "tag": "hair",
       "anchor": [
-        21.5,
-        123,
+        20.5,
+        122,
         11.5
       ]
     },
@@ -172,7 +172,7 @@
       "name": "mane",
       "parent": "torso",
       "joint": "ball",
-      "hp": 39,
+      "hp": 37,
       "severable": true,
       "vital": false,
       "bloodless": true,
@@ -405,7 +405,16 @@
       "earTilt": 0,
       "earLobe": 0.5,
       "earPointLen": 0.5,
-      "earTone": 0.6
+      "earTone": 0.6,
+      "detail": 0,
+      "detailShape": 0,
+      "detailEyes": 0,
+      "detailBrows": 0,
+      "detailMouth": 0,
+      "detailNose": 0,
+      "detailMarks": 0,
+      "detailEars": 0,
+      "detailBeard": 0
     },
     "hair": {
       "style": "flowing",

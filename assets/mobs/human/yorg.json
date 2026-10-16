@@ -12,6 +12,14 @@
             "keep": true
           }
         ]
+      },
+      "hair.2": {
+        "layers": [
+          {
+            "material": "hair_white",
+            "keep": true
+          }
+        ]
       }
     }
   },
@@ -146,9 +154,24 @@
       "bloodless": true,
       "tag": "hair",
       "anchor": [
-        28.5,
+        26.5,
         125,
-        11.5
+        3.5
+      ]
+    },
+    {
+      "name": "hair.2",
+      "parent": "head",
+      "joint": "fixed",
+      "hp": 7,
+      "severable": true,
+      "vital": false,
+      "bloodless": true,
+      "tag": "hair",
+      "anchor": [
+        22.5,
+        120,
+        16.5
       ]
     }
   ],
@@ -348,7 +371,16 @@
       "earTilt": 0,
       "earLobe": 0.5,
       "earPointLen": 0.5,
-      "earTone": 0.6
+      "earTone": 0.6,
+      "detail": 0,
+      "detailShape": 0,
+      "detailEyes": 0,
+      "detailBrows": 0,
+      "detailMouth": 0,
+      "detailNose": 0,
+      "detailMarks": 0,
+      "detailEars": 0,
+      "detailBeard": 0
     },
     "hair": {
       "style": "undercut",

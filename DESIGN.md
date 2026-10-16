@@ -11430,9 +11430,9 @@ were. Nothing about storage or rendering changes: the human already paid for
 12.5 mm cells and was using them as 25 mm ones.
 
 - **`headVoxFine`** builds a HUMAN's head on the shipped lattice. The skull,
-  cap, mane and knot are `headVox`'s own expressions evaluated at the centre of
-  each shipped cell (the same shape sampled twice as finely, so no stair steps
-  and a hairline that moves in half rows); the face is redrawn at 12.5 mm: a
+  cap, mane and knot were first `headVox`'s own expressions evaluated at the
+  centre of each shipped cell -- superseded the same evening by **Face detail**
+  (below): resampled, the same ellipses read as an egg; the face is redrawn at 12.5 mm: a
   lash line over white–iris–white, a nose with a straight profile (bridge one
   cell out, bulb two, filled back to the face), nostrils, a mouth line bent
   along a curve with a lip above and below, brows that taper to the tail,
@@ -11499,9 +11499,11 @@ were. Nothing about storage or rendering changes: the human already paid for
   there. `EYE_WHITE` is one constant colour for the whole cast (one merged slot).
 - **Races are untouched**: `isFineFace` is `race === 'human'`, and every race's
   surface pass still reads `headVox`'s face. **`generateMob(…, { face:
-  'legacy' })`** builds a human the old way; the Characters page's **faces:
-  new / OLD** button (key `` ` ``) flips every preview between the two for
-  comparison. It is a view only — a save always writes the fine face.
+  'legacy' })`** builds a human the old way (its half steps rounded,
+  `legacyFace`: unrounded, a half-step brow reach looped forever in
+  `headVox`); the Characters page's **faces: new / OLD** button (key `` ` ``)
+  flips every preview between the two for comparison. It is a view only — a
+  save always writes the genome's own face, detail rows and all.
 - The 10 named humans were re-baked with `gen_mobs.mjs --rebake` and the 20
   pool bodies with the new **`bake_human_pool.mjs --rebake`** (each from the
   genome in its own sidecar; the plain run re-rolls the population). Four pool
@@ -11511,6 +11513,73 @@ were. Nothing about storage or rendering changes: the human already paid for
   `shana`'s torso had 34 cells of bra the current generator no longer paints;
   all now match. `assets/mobs/human.vox`, the hand-authored base (player model), has no
   genome and its own palette, and is NOT converted.
+
+#### Face detail: the old face at 0, the fine face at 1 (2026-10-15)
+
+Owner, the same evening: "the new faces are sculpted and shaped too
+differently and should follow the same contours, and there should be sliders
+that interpolate between the more blocky 2x2x2 look on the face and the new
+one ... I generally prefer the look of all of the previous ones, though the
+added detail for more possibilities of expressiveness is nice ... the facial
+hair is way too drastically different". Measured, the "different shape" was
+not a different head: the resampled ellipse was two cells WIDER through the
+cheeks than the old head, but tapered smoothly at the crown and the jaw where
+the old head has a flat lid and a square jaw -- the taper is what read as an
+egg.
+
+So a human's head is a function of **eight detail rows** (`face.detailShape`,
+`detailEyes`, `detailBrows`, `detailMouth`, `detailNose`, `detailMarks`,
+`detailEars`, `detailBeard`; `faceDetail(g)`), each 0..1, **every default 0**,
+plus a **master row** `face.detail` on the head tab (a `styled` row:
+`applyStyleRow` / `applyFaceDetail` sets all eight; no roll, mutate or cross
+draws it). Every face tab carries its own row at the top. The banner above
+`headVoxFine` in mobgen.js is the full account; in short:
+
+- **0 is `headVox`'s head cell for cell, in its order.** `headVoxFine` builds
+  the old skull, mane and knot on the authored lattice exactly as `headVox`
+  does, and every feature has an OLD branch that paints headVox's authored
+  cells as 2x2x2 blocks (`paintL`, `proudL`). The cells are LISTED in
+  `upscaleCells(headVox)`'s order too (`ord`: headVox's making order, a block's
+  cells dz, dy, dx): `hairMass` grows its shells breadth first in list order,
+  and the same cells in scan order moved 1..450 hair cells on 129 of 239
+  bodies. `test_mobgen.mjs` §V holds the head and every hair part to the
+  legacy build over every saved human, the presets and 60 rolls.
+- **The face's marks are `FACE_SHADE` / `FACE_LIGHT` at every detail.**
+  `headVox` paints them `SKIN_SHADE` / `SKIN_LIGHT`, which the Characters page
+  draws as plain skin, so on the page the old face had no mouth line, freckle,
+  eye bag or wrinkle the game drew; the `FACE_*` slots are the same two
+  colours (the game sees no change) under numbers the page draws. The skull's
+  own shading and the ears stay `SKIN_SHADE` (form, not marks).
+- **Head shape** keeps the old outline at every setting: the old occupancy's
+  binomial blur (radius 4) cut at 0.45 is the head at 1 -- a block's exposed
+  corner off, the step under it filled, the same 16-cell face, 20 at the
+  ears, the square jaw (§V: every row's edges to a cell, the flat lid to two,
+  volume to 3%). Between, the changed cells are taken most-urgent first in
+  even shares along the slider, mirror pairs together (a blend
+  `(1-t)B + t blur(B)` moved nothing below a half). The cap is headVox's hair
+  function asked at a point sliding from the block's centre to the cell's
+  own, so the hairline goes from whole rows to half rows.
+- **Facial hair** is headVox's regions asked at the same sliding point, its row
+  lines sliding from the rounded ones to the unrounded, and its two hashes
+  (density, ragged edge) sliding from the block's to the cell's: the outline
+  stays the old beard's and the edges and stubble break up from blocks into
+  single hairs.
+- **Eyes**: the fine eye with its rows slid from the `old` point (a two-row
+  iris filling the eye, every tone at 0) to the genome's (`eyeGenes`); the
+  same numbers drive `detailColors`, so the whites, lash line and crease FADE
+  in. **Brows** and **mouth**: a band per column whose rows and two ends slide
+  between the old blocks and the fine feature (the mouth's corners thin
+  first). **Nose**: each column's front slides from the block nose to the fine
+  one. **Ears**: band, rows and stand-off slide, the lobe and curl arrive at a
+  half, the hollow's shade slides from the rim's. **Marks**: cheeks, lines and
+  the scar switch at a half, freckles slide like the beard, and blush plus the
+  skin pass's mottle, moles and soft seam ON THE HEAD fade in with it.
+- **Half steps** cannot be drawn by the old head, so its branches round them
+  (`legacyFace`, half away from zero); a half step appears as its feature's
+  detail rises.
+- Every generated human was re-baked (`gen_mobs.mjs --rebake`,
+  `bake_human_pool.mjs --rebake`): with no detail rows in their genomes, every
+  saved character is its old face again, which is what the owner preferred.
 
 #### Every slider moves only what it is for (2026-10-15)
 
