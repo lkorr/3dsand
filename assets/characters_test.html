@@ -252,6 +252,18 @@ var toasts = [], dirt = [];
     // Every preview flips between the fine human face and the old one; the
     // still preview (no idle sway) makes the before/after a pixel compare.
     st.animate = false;
+    // THE FACE DETAIL master row (head tab, mobgen FACE DETAIL): every detail
+    // row defaults to 0, the old face, so the fine face is what dragging it to
+    // 1 makes -- through the row's own input, which must carry all eight.
+    st.geneTab = 'face';
+    breed.__test.render();
+    var dRow = Array.prototype.find.call(host.querySelectorAll('.grow'),
+      function(r){ return /\(face\.detail\)$/.test(r.title); });
+    var dIn = dRow && dRow.querySelector('input[type=range]');
+    say(!!dIn, 'the face detail row is on the head tab');
+    if (dIn) { dIn.value = '1'; dIn.dispatchEvent(new Event('input', { bubbles: true })); }
+    say(mg.DETAIL_KEYS.every(function(k){ return st.genome.face[k] === 1; }),
+        'dragging it to 1 sets every feature\u2019s detail row');
     breed.__test.render();
     var pv = function(){ return host.querySelector('.prev canvas').toDataURL(); };
     var newShot = pv();

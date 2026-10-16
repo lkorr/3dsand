@@ -2122,6 +2122,76 @@ fn faceSgn(f : u32) -> f32 { return select(1.0, -1.0, (f & 4u) != 0u); }
 // The +Y-entry default (axis 1, sign -1) the fields are initialised to.
 const FACE_DOWN_Y : u32 = 5u;
 
+// ---- A BUBBLE, RIDING IN liqFace's SPARE BITS (see BUBBLES, bubbleComposite) --
+// packFace uses bits 0..2. The first bubble the march met (an air cell the
+// water closes over) is stored as its offset from the liquid ENTRY cell,
+// 8 bits an axis biased by 128, in bits 3..26, with two flags above it. In
+// liqFace rather than a new Hit field because Hit is live across the whole
+// opaque shade, where this shader's spill lives (the PACKED note in Hit): a
+// new u32 there is a register for every pixel, a bubble or not. Every reader
+// of liqFace goes through faceAxis / faceSgn, which mask the low bits.
+const BUB_SHIFT : u32 = 3u;
+const BUB_REC : u32 = 1u << 27u;    // a bubble is recorded in bits 3..26
+const BUB_STOP : u32 = 1u << 28u;   // the ray left the liquid: stop looking
+fn bubPack(off : vec3<i32>) -> u32 {
+  let o = vec3<u32>(off + vec3<i32>(128));
+  return ((o.x | (o.y << 8u) | (o.z << 16u)) << BUB_SHIFT) | BUB_REC;
+}
+// A bubble cell's neighbour: bit 0 = matter (anything but air and gas: it
+// closes the cell on that side), bit 1 = a clear liquid.
+fn bubSide(c : vec3<i32>) -> u32 {
+  let m = voxMat(voxWordAt(c));
+  if (m == MAT_AIR) { return 0u; }
+  let mm = materials[m];
+  if (mm.klass == CLASS_GAS) { return 0u; }
+  return select(1u, 3u, mm.klass == CLASS_LIQUID && (mm.flags & MATF_OPAQUE) == 0u);
+}
+fn bubCellOf(liqCell : u32, face : u32) -> vec3<i32> {
+  let v = face >> BUB_SHIFT;
+  return unpackWinCell(liqCell) +
+         vec3<i32>(i32(v & 0xFFu), i32((v >> 8u) & 0xFFu), i32((v >> 16u) & 0xFFu)) -
+         vec3<i32>(128);
+}
+// The bubble in cell c: an ellipsoid inside the cell, centre and radii. ONE
+// definition, read by trace() -- which records only a cell whose bubble the
+// ray actually HITS -- and by bubbleComposite, which draws that one. Recording
+// the first bubble CELL instead drew half-moons: a ray through a cell's empty
+// corner, missing its bubble, hid the bubble in the cell behind, so
+// neighbouring bubbles were cut off along cell edges.
+struct BubShape {
+  ctr : vec3f,
+  rad : vec3f,
+};
+fn bubShape(c : vec3<i32>) -> BubShape {
+  let hc = pcg((bitcast<u32>(c.x) * 73856093u) ^ (bitcast<u32>(c.y) * 19349663u) ^
+               (bitcast<u32>(c.z) * 83492791u));
+  let hv = vec4f(f32(hc & 0xFFu), f32((hc >> 8u) & 0xFFu), f32((hc >> 16u) & 0xFFu),
+                 f32(hc >> 24u)) * (1.0 / 255.0);
+  let r = mix(0.30, 0.40, hv.x);
+  // A bubble this size oscillates as it rises: a wobble, its phase per cell.
+  let wob = sin(R.time * 9.0 + hv.w * 6.2831853) * 0.07;
+  let rad = r * vec3f(1.0 + wob, 0.86 - wob, 1.0 + wob);
+  // Off centre within what the cell leaves round it, more sideways than up.
+  let slack = vec3f(0.5) - rad;
+  return BubShape(vec3f(c) + vec3f(0.5) + (hv.yzw - vec3f(0.5)) * slack * vec3f(1.2, 0.6, 1.2),
+                  rad);
+}
+// The ray against it, in the frame where it is the unit sphere: x = the t of
+// closest approach, y = the squared distance there (radii), z = |rd / rad|^2,
+// w = the silhouette's anti-aliasing half-width (one pixel at x, in radii).
+fn bubRay(ro : vec3f, rd : vec3f, s : BubShape) -> vec4f {
+  let oc = (ro - s.ctr) / s.rad;
+  let dd = rd / s.rad;
+  let a = dot(dd, dd);
+  let tc = -dot(oc, dd) / a;
+  let q = max(dot(oc, oc) - tc * tc * a, 0.0);
+  return vec4f(tc, q, a, max(pixelAngle() * tc * sqrt(a), 1e-3));
+}
+// Does the ray meet the bubble, its anti-aliased fringe included?
+fn bubHit(b : vec4f) -> bool {
+  return b.x > 0.0 && sqrt(b.y) < 1.0 + b.w;
+}
+
 fn chunkOcc(cell : vec3<i32>) -> u32 {
   return occupancy[chunkIndexW(cell)];
 }
@@ -4371,6 +4441,54 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
         out.sgn = sign(rd[axis]);
         out.word = w;
         break;   // to the deferred-detail resolve at the tail, never past it
+      }
+    } else if (wantMedia && out.liqPath > 0.0 && (out.liqFace & BUB_STOP) == 0u) {
+      // ---- AN AIR CELL THE WATER CLOSES OVER: a bubble (BUBBLES) ----
+      // The CA lifts air through a body a cell at a time (the water above
+      // falls into it), and to this march such a cell was plain air: it only
+      // SHORTENED the water path, so a rising pocket drew as a stack of
+      // lighter-blue cubes and a lone bubble as almost nothing. An air cell
+      // this ray reached through liquid, with matter (not air, not gas) on at
+      // least three of its four SIDES and liquid among its sides or above, is
+      // a bubble -- a lone one, or any cell of a rising stack. It is counted as
+      // water here (no cube silhouette, its own or any behind it), and the
+      // first one whose bubble the ray actually HITS (bubShape) is recorded for
+      // fs() to draw; a cell the ray crosses beside its bubble keeps looking.
+      // Open air -- over the surface, under a falling sheet, beside a waterfall
+      // -- has open sides, and means this ray has left the liquid, so it stops
+      // looking. Cost: four or five voxel reads per air cell met INSIDE liquid
+      // (plus one hash and one ray-ellipsoid test until a bubble is hit), and
+      // one test per ray that leaves it; a ray that never entered liquid pays
+      // a compare.
+      var bub = false;
+      var walls = 0u;
+      let bx0 = cell - vec3<i32>(1, 0, 0);
+      let bx1 = cell + vec3<i32>(1, 0, 0);
+      let bz0 = cell - vec3<i32>(0, 0, 1);
+      let bz1 = cell + vec3<i32>(0, 0, 1);
+      let bup = cell + vec3<i32>(0, 1, 0);
+      if (inBounds(bx0) && inBounds(bx1) && inBounds(bz0) && inBounds(bz1) && inBounds(bup)) {
+        let s0 = bubSide(bx0);
+        let s1 = bubSide(bx1);
+        let s2 = bubSide(bz0);
+        let s3 = bubSide(bz1);
+        walls = (s0 & 1u) + (s1 & 1u) + (s2 & 1u) + (s3 & 1u);
+        if (walls >= 3u) {
+          bub = ((s0 | s1 | s2 | s3 | bubSide(bup)) & 2u) != 0u;
+        }
+      }
+      // Two closed sides is a cell of a cluster (two bubbles merged side by
+      // side, a short horizontal pocket): drawn as plain air, as before, but
+      // the ray keeps looking past it -- stopping there cut the bubble behind
+      // it in half. Only OPEN air (at most one closed side) ends the search.
+      if (!bub && walls <= 1u) { out.liqFace |= BUB_STOP; }
+      if (bub) {
+        cellLiq = 1.0;
+        cellWaterY = f32(cell.y) + 1.0;
+        if ((out.liqFace & BUB_REC) == 0u && bubHit(bubRay(ro, rd, bubShape(cell)))) {
+          let off = cell - unpackWinCell(out.liqCell);
+          if (all(abs(off) < vec3<i32>(128))) { out.liqFace |= bubPack(off); }
+        }
       }
     }
 
@@ -11834,6 +11952,97 @@ fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
   return color;
 }
 
+// ============================================================================
+// BUBBLES — an air cell the water closes over (DESIGN.md "Bubbles")
+// ============================================================================
+// The CA lifts air up through a body a cell a tick, and that motion is right.
+// What was wrong is that the march drew such a cell as plain air: the ray just
+// spent ten centimetres less in water, so a crater's worth of air rose as a
+// stack of lighter-blue cubes and a lone bubble barely showed. trace() now
+// counts a bubble cell as water (no silhouette) and records the first bubble
+// the ray actually hits (BUB_* in liqFace); this draws it, after whichever
+// liquid shade owned the pixel, from the veil terms that shade left (gV*):
+//
+//   * SHAPE (bubShape, shared with the record test): an ellipsoid inside the
+//     cell, a little flattened and wobbling (a rising bubble this size
+//     oscillates), sized and placed by a hash of the cell. The cell is the
+//     bubble's identity while it sits there; the CA moves it a cell at a time,
+//     so it is redrawn a cell up.
+//   * THE RIM: water -> air is the inside of a glass, not the outside. Past
+//     the critical angle (48.6 deg) it is TOTAL internal reflection, so the
+//     outer ring of every bubble is a mirror of the water round it -- bright
+//     towards the surface (the sky through Snell's window), dim below. That
+//     silver outline is what makes a bubble read as a bubble.
+//   * THE MIDDLE: ~2% reflectance head-on, so the scene behind shows through,
+//     darker in the band just inside the rim (where the refracted view bends
+//     round to the dark below) and a touch brighter in the centre.
+//   * THE GLINT: the key light, refracted into the water, off the crown.
+// Composited at the bubble's DEPTH: T over the water between the surface (or
+// a submerged eye) and the bubble, the in-scatter in front of it, and the
+// surface's transmitting fraction K over all of it -- the terms a raster body
+// under the water is drawn with (writeWaterVeil), so a bubble deep in murky
+// water fades into it exactly as the bed does.
+// Render-only, and paid only by a pixel whose ray met a bubble: everything
+// below is behind one bit test.
+const BUB_ETA : f32 = 1.333;   // water over air: the bubble is AIR seen from WATER
+
+fn bubbleComposite(color : vec3f, ro : vec3f, rd : vec3f, liqCell : u32,
+                   face : u32, tSurf : f32) -> vec3f {
+  if ((face & BUB_REC) == 0u) { return color; }
+  // The bubble trace() recorded, and the ray against it (bubShape / bubRay:
+  // the same numbers the record test used).
+  let s = bubShape(bubCellOf(liqCell, face));
+  let b = bubRay(ro, rd, s);
+  if (!bubHit(b)) { return color; }
+  let tc = b.x;
+  let q = b.y;
+  let a = b.z;
+  // Anti-aliased silhouette: one pixel at this distance, in radii.
+  let cover = 1.0 - smoothstep(1.0 - b.w, 1.0 + b.w, sqrt(q));
+  if (cover <= 0.0) { return color; }
+  let t0 = tc - sqrt(max(1.0 - q, 0.0) / a);
+  let n = normalize((ro + rd * t0 - s.ctr) / (s.rad * s.rad));
+  let cosI = clamp(dot(n, -rd), 0.0, 1.0);
+
+  // Fresnel, water -> air: total internal reflection past the critical angle.
+  let sin2T = BUB_ETA * BUB_ETA * (1.0 - cosI * cosI);
+  var refl = 1.0;
+  if (sin2T < 1.0) {
+    let cosT = sqrt(1.0 - sin2T);
+    let rs = (BUB_ETA * cosI - cosT) / (BUB_ETA * cosI + cosT);
+    let rp = (cosI - BUB_ETA * cosT) / (cosI + BUB_ETA * cosT);
+    refl = 0.5 * (rs * rs + rp * rp);
+  }
+
+  // What the mirror shows: the water round the bubble, brighter towards the
+  // surface, and straight up the sky and the key light through Snell's window
+  // (where there is a sky to see -- THE MEDIUM'S SKY).
+  let rr = reflect(rd, n);
+  let sky = fogSkyK();
+  var env = gVScatter * mix(0.5, 2.6, smoothstep(-0.35, 0.85, rr.y));
+  env += (ambientAt(vec3f(0.0, 1.0, 0.0)) * 0.8 + keyLightColor() * 0.25) * sky *
+         smoothstep(0.55, 0.95, rr.y);
+  var glint = vec3f(0.0);
+  let L = keyLightDir();
+  if (L.y > 0.0) {
+    let lw = normalize(vec3f(L.x / BUB_ETA,
+                             sqrt(max(1.0 - (L.x * L.x + L.z * L.z) / (BUB_ETA * BUB_ETA), 0.0)),
+                             L.z / BUB_ETA));
+    glint = keyLightColor() * (sky * 2.5 * pow(max(dot(rr, lw), 0.0), 400.0));
+  }
+  let inner = mix(0.62, 1.06, smoothstep(0.66, 0.92, cosI));
+
+  // At its depth, under the surface's K (the veil's terms; see above).
+  let dM = max(t0 - tSurf, 0.0) * VOXEL_METERS;
+  let T = exp(-gVAbsorb * dM) * liqVisFade(dM);
+  let base = gVScatter + gVDelta;
+  let seen = base * ((1.0 - refl) * inner) +
+             refl * (env * T + gVScatter * (vec3f(1.0) - T)) + glint * T;
+  // The bed's share the bubble left, for a raster body under it (the veil).
+  gVDelta = mix(gVDelta, gVDelta * ((1.0 - refl) * inner), cover);
+  return color + gVK * ((seen - base) * cover);
+}
+
 // ---- the full water shade ----
 // `sceneBehind` is whatever the primary march already resolved BEHIND the
 // water (lake bed, terrain, or sky) — this function decides how much of it
@@ -18688,6 +18897,7 @@ fn fs(in : VSOut) -> FSOut {
         rsAdd(RS_PX_SUB, 1u);
         color = shadeSubmerged(R.camPos, rd, lm, h.liqPath + liqExtra, color, in.pos.xy,
                                sawSky);
+        color = bubbleComposite(color, R.camPos, rd, h.liqCell, h.liqFace, 0.0);
         // A charged liquid round a submerged eye (wave 2 package D): the
         // surface glow below needs a surface; from inside, the water glows.
         if (elecAnyCharge()) { color += elecUnderwater(R.camPos, rd, h.liqPath); }
@@ -18716,6 +18926,7 @@ fn fs(in : VSOut) -> FSOut {
                            h.liqPath + liqExtra, max(h.mediaSurf, 0.125), color,
                            h.liqT, underwater);
         if (SEAM_DBG >= 5u) { gDbgW0.x = 0.5; gDbgW0.y = h.liqT; }
+        color = bubbleComposite(color, R.camPos, rd, h.liqCell, h.liqFace, h.liqT);
         color = applyAerial(color, rd, h.liqT);
         caShadedLiquid = true;
         veilT = h.liqT;
@@ -18878,6 +19089,8 @@ fn fs(in : VSOut) -> FSOut {
         gVDelta = mix(mD, gVDelta, lakeW);
         gVCurv = mix(mC, gVCurv, lakeW);
       }
+      color = bubbleComposite(color, R.camPos, rd, h.liqCell, h.liqFace,
+                              select(mf.t, 0.0, mf.inside));
       if (!mf.inside) { color = applyAerial(color, rd, mf.t); }
       if (WATER_VEIL) {
         writeWaterVeil(in.pos.xy, select(mf.t, 0.0, mf.inside),

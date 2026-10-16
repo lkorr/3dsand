@@ -357,15 +357,39 @@ WaveImpactRing& WaveImpacts() {
 // Transcribed from currentPrimEvalF in assets/shaders/common.wgsl, line for
 // line, in the same order and with the same clamps. Read the two side by side
 // when changing either.
-static Vec3 CurrentAtCpuImpl(Vec3 posVox, bool simOnly);
-Vec3 CurrentAtCpu(Vec3 posVox) { return CurrentAtCpuImpl(posVox, false); }
-Vec3 CurrentAtCpuSim(Vec3 posVox) { return CurrentAtCpuImpl(posVox, true); }
+static Vec3 CurrentAtCpuImpl(Vec3 posVox, bool simOnly, float wetLo,
+                             float wetHi);
+Vec3 CurrentAtCpu(Vec3 posVox) {
+  return CurrentAtCpuImpl(posVox, false, posVox.y, posVox.y);
+}
+Vec3 CurrentAtCpuSim(Vec3 posVox) {
+  return CurrentAtCpuImpl(posVox, true, posVox.y, posVox.y);
+}
+Vec3 CurrentAtCpuSim(Vec3 posVox, float wetLo, float wetHi) {
+  return CurrentAtCpuImpl(posVox, true, std::min(wetLo, wetHi),
+                          std::max(wetLo, wetHi));
+}
 
-static Vec3 CurrentAtCpuImpl(Vec3 posVox, bool simOnly) {
+static Vec3 CurrentAtCpuImpl(Vec3 posVox, bool simOnly, float wetLo,
+                             float wetHi) {
   // The terrain flow field first: rivers and lakes (flowfield.h). A pure
   // function of (map, seed, tuning, world position), so it is sim-licensed
   // and both arms read it -- the same words the renderer's flowGridAt reads.
   Vec3 acc = WaterFlow().Sample(posVox);
+  // THE MEASURED FLOW over it, for a body (DESIGN.md §9d.12): what the
+  // simulation's water is really doing -- a breach, a flood -- from the
+  // published snapshot's grid, blended exactly as currentAt blends it for the
+  // arrows (flowBlend: the measured counts in full, the solved fades out under
+  // it). The render arm (CurrentAtCpu, the gates' profile twin) keeps the
+  // solved field alone, as it always has.
+  if (simOnly) {
+    const float carry = CurrentTuning().sim.currentMeasuredCarry;
+    const uint32_t* grid = flowfield::PublishedMeasured();
+    if (carry > 0.0f && grid != nullptr) {
+      const Vec3 m = flowfield::SampleMeasuredSpan(grid, posVox, wetLo, wetHi);
+      acc = flowfield::BlendMeasured(acc, Vec3{m.x * carry, 0.0f, m.z * carry});
+    }
+  }
   const CurrentPrimSystem& cp = CurrentPrims();
   const uint32_t n = std::min(cp.Count(), kCurrentPrimCap);
   if (n == 0) return acc;

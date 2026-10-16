@@ -441,6 +441,7 @@ constexpr uint64_t kShotCrawlLast = 520;
 // person, then first person level / up / down), loose and photograph the
 // arrow's first frames, tap Ctrl into the crouch, sneak side-on and
 // three-quarter-front, then draw crouched (third and first person) and loose.
+// SANDVOX_SHOT_SNEAK_SPRINT=1 sneaks with Shift held (the quick sneak).
 // Every picture is screenshot_archery_<what>.bmp. `g_shotArcheryDraw` is the
 // scripted LMB (the frame's mouse sample is replaced by it).
 bool g_shotArchery = false;
@@ -4173,7 +4174,7 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   // ">N" / ">N~": N arrows at the creature's torso, arms, thighs and head from
   // around its front quarter, `standOff` voxels out along each line, at
   // `draw` x the bow's full-draw speed (game/arrows.h, the real flight).
-  int inAirVolley = 0;
+  int inAirVolley = 0, inAirTicks = 1;
   auto loose = [&](int n, float standOff, float draw) {
     const ItemDef* ad = items.Named("arrow");
     const ItemDef* bd = items.Named("bow");
@@ -4255,8 +4256,11 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     // three metres out AFTER the settle ticks below, and the pictures taken
     // one tick later, so what a flight looks like (game/arrows.h
     // AppendRenderBodies) is a screenshot too.
+    // ">N~T" keeps them in the air T ticks (default 1), loosed that much
+    // further out, so the picture shows T ticks of their trails.
     if (!nm.empty() && nm[0] == '>' && nm.find('~') != std::string::npos) {
       inAirVolley = std::clamp(std::atoi(nm.c_str() + 1), 1, 8);
+      inAirTicks = std::clamp(std::atoi(nm.c_str() + nm.find('~') + 1), 1, 12);
       continue;
     }
     if (!nm.empty() && nm[0] == '>') {
@@ -4349,9 +4353,20 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   // enough for the loco crossfade to finish and the sever spray to land, but
   // short enough that a crawler hasn't dragged itself in among the trees
   for (int i = 0; i < 90; i++) mobTick();
+  // The volley's trails (game/arrows.h ArrowTrails), followed tick by tick
+  // at the tick's own seconds, so the picture shows what a frame would.
+  ArrowTrails shotTrails;
   if (inAirVolley > 0) {
-    loose(inAirVolley, 30.0f, 1.0f);
-    mobTick();
+    const ItemDef* sbd = items.Named("bow");
+    const float perTick = (sbd && sbd->IsBow() ? sbd->bow.drawSpeed
+                                               : MetresPerSecToCells(35.0f)) *
+                          (float)kTickDt;
+    loose(inAirVolley, 30.0f + perTick * (float)(inAirTicks - 1), 1.0f);
+    shotTrails.Update(rig.Authority().arrows, 1.0f, 0.0f);
+    for (int k = 0; k < inAirTicks; k++) {
+      mobTick();
+      shotTrails.Update(rig.Authority().arrows, 1.0f, (float)kTickDt);
+    }
     std::printf("--shot-mob: %d arrows loosed, %zu in the air at the shot\n",
                 inAirVolley, rig.Authority().arrows.Live());
   }
@@ -4588,6 +4603,11 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
         "shotTarget");
     // Upload BEFORE the render pass opens (barrier graph §4.6).
     uint32_t microCount = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
+    {
+      std::vector<float> rows;
+      const uint32_t n = shotTrails.Pack(rows);
+      sim.UploadArrowTrails(ctx.queue, rows.data(), n);
+    }
     rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
     sim.EncodeShadowResolve(enc);
     rhi::RenderPass rp = sim.BeginRenderPass(
@@ -4595,6 +4615,7 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     sim.DrawWorld(rp);
     sim.DrawBodies(rp, (uint32_t)inst.size());
     sim.DrawMicroBodies(rp, microCount);
+    sim.DrawArrowTrails(rp);
     rp.End();
     rhi::Buffer shotBuf = CreateBuffer(
         ctx.device, (uint64_t)W * H * 4,
@@ -14876,7 +14897,10 @@ int main(int argc, char** argv) {
       if (f >= 300 && f < 345) pin.strafe = 1.f;             // sneak, side-on
       if (f >= 345 && f < 380) { pin.strafe = 1.f; pin.forward = -0.6f; }  // 3/4 front
       if (f >= 380 && f < 392) pin.strafe = 1.f;             // square up again
-      pin.SetHeld(TB_SPRINT, false);
+      // SANDVOX_SHOT_SNEAK_SPRINT=1: the sneak windows with Shift held (the
+      // quick sneak, player.crouchSprintScale).
+      static const bool sneakSprint = std::getenv("SANDVOX_SHOT_SNEAK_SPRINT") != nullptr;
+      pin.SetHeld(TB_SPRINT, sneakSprint && f >= 300 && f < 392);
       pin.SetHeld(TB_JUMP, false);
       pin.SetPressed(TB_JUMP, false);
       // A TAP of Ctrl toggles the crouch (a hold would go prone).
@@ -14954,6 +14978,25 @@ int main(int argc, char** argv) {
             const float left = d.x * std::cos(h) - d.z * std::sin(h);
             std::printf("    %-7s rel eye: left %6.1f up %6.1f ahead %6.1f\n", nm,
                         left * art, d.y * art, fwd * art);
+          }
+          // ...and the feet against the hips, in metres in the body's frame
+          // (the sneak's stride: one foot ahead, one behind), and the pace.
+          Vec3 hips{};
+          const int hp = avatar.PartIndex("hips");
+          if (hp >= 0 && avatar.PartAnchorWorld(hp, hips)) {
+            for (const char* nm : {"foot.L", "foot.R"}) {
+              Vec3 a{};
+              const int pi = avatar.PartIndex(nm);
+              if (pi < 0 || !avatar.PartAnchorWorld(pi, a)) continue;
+              const Vec3 d = a - hips;
+              const float fwd = d.x * std::sin(h) + d.z * std::cos(h);
+              const float left = d.x * std::cos(h) - d.z * std::sin(h);
+              std::printf("    %-7s rel hips (m): left %5.2f down %5.2f ahead %5.2f\n", nm,
+                          left * kVoxelMeters, -d.y * kVoxelMeters, fwd * kVoxelMeters);
+            }
+            std::printf("    pace %.2f m/s\n",
+                        std::sqrt(player.vel.x * player.vel.x + player.vel.z * player.vel.z) *
+                            kVoxelMeters);
           }
         }
       }
@@ -21377,6 +21420,16 @@ int main(int argc, char** argv) {
       // ...and the ABSTRACT ones between distant creatures (D2b), on their
       // arc from the statue archer to its mark (game/distant.h).
       AppendDistantArrowBodies(mobs.Distant(), items, tick, tickAlpha, flightBodies);
+      // ...and the TRAILS behind them (game/arrows.h ArrowTrails), queued
+      // here, ahead of the frame's encoder, so this frame draws them. The
+      // hit-stop dip slows them with the flights they follow.
+      {
+        static ArrowTrails arrowTrails;
+        static std::vector<float> trailRows;
+        arrowTrails.Update(tickCtx.arrows, tickAlpha, dt * ui.hitStopScale);
+        const uint32_t n = arrowTrails.Pack(trailRows);
+        sim.UploadArrowTrails(ctx.queue, trailRows.data(), n);
+      }
       // THE DRAWN BOWS (game/arrows.h PresentDrawnBow): the string pulled
       // back to the hand and the arrow nocked on it, every creature drawing
       // one (the player, an NPC archer), off the pose this frame draws.
@@ -22172,6 +22225,8 @@ int main(int argc, char** argv) {
         // update row nor this draw is recorded).
         sim.DrawWindStreaks(rp, WindStreakDrawCount(CurrentTuning()),
                             (uint32_t)CurrentTuning().wind.streakTrail);
+        // The arrows' flight trails (arrow_trail.wgsl; UploadArrowTrails above).
+        sim.DrawArrowTrails(rp);
         sim.DrawCurrentField(rp, ui.fieldViz == UIState::kFieldVizCurrent
                                      ? CurrentDebugArrowCount()
                                      : 0u);
@@ -22394,6 +22449,7 @@ int main(int argc, char** argv) {
         // the EncodeShadowResolve above steps it once more by the same dt.
         sim.DrawWindStreaks(srp, WindStreakDrawCount(CurrentTuning()),
                             (uint32_t)CurrentTuning().wind.streakTrail);
+        sim.DrawArrowTrails(srp);
         // The F4 field arrows, likewise: without them a --at picture of the
         // wind or current overlay was a picture of no overlay at all.
         sim.DrawWindField(srp, ui.fieldViz == UIState::kFieldVizWind

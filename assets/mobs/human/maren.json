@@ -147,9 +147,9 @@
       "bloodless": true,
       "tag": "hair",
       "anchor": [
-        24.5,
-        116,
-        9.5
+        20.5,
+        114,
+        3.5
       ]
     }
   ],
@@ -366,7 +366,16 @@
       "earTilt": 0,
       "earLobe": 0.5,
       "earPointLen": 0.5,
-      "earTone": 0.6
+      "earTone": 0.6,
+      "detail": 0,
+      "detailShape": 0,
+      "detailEyes": 0,
+      "detailBrows": 0,
+      "detailMouth": 0,
+      "detailNose": 0,
+      "detailMarks": 0,
+      "detailEars": 0,
+      "detailBeard": 0
     },
     "hair": {
       "style": "ponytail",

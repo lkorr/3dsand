@@ -1434,6 +1434,10 @@ const char* const kOrder[] = {
     // draws their statues, and resets mobs + debris, releases every pose it
     // packed and regenerates worldgen on the way out.
     "distant-look",
+    // CPU only, by the same rule: the sneak's stride posed on a PlayerAvatar
+    // off the window (flat, probe-free ground) and the quick sneak's pace on
+    // a Player against a lambda floor; touches no world.
+    "sneak-stride",
     // ---- THE SNAPSHOT LATENCY IS A CONSTANT (PLAN_multiplayer_now N1) ----
     // As late as it can go, by the rule the `floaters` block above spells out.
     // It regenerates worldgen three times (once per pacing arm and once on the

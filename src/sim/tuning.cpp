@@ -406,6 +406,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     }
   }
 
+  {
+    // HAND-WRITTEN (player.crouchSprintScale): Shift QUICKENS a sneak and
+    // never slows one, so the quick sneak is held at or above the sneak.
+    auto& p = out.player;
+    p.crouchSprintScale = std::max(p.crouchSprintScale, p.crouchSpeedScale);
+  }
+
   if (const json* g = Find(j, "thirdPerson")) {
     // HAND-WRITTEN: the rules a tuning_params.def row cannot state (a
     // bound that depends on another field, a reset-to-default, an enum

@@ -9312,7 +9312,7 @@ Calibration, `gore.pierceCellJ` 1.0 J per fine cell of skin-hard matter (a full 
 - **Half draw** (32.5 m/s, 15.8 J): through the head's hair and flesh, STOPPED by the skull (one bone bin costs 9.4 J), 2.5 cm, no brain cell. Into the upper arm: skin, flesh, muscle, stopped by the humerus at 3.8 cm.
 - **Full draw** (65 m/s, 63.4 J): through the WHOLE head, temple to temple (19.4 cm, 62.8 J spent, out at 6 m/s); through the upper arm (9.4 cm, out at 42.9 m/s) and 8.8 cm on into the torso, stopped by a rib; through the torso front to back 6 cm off the midline (14.4 cm, out at 39.4 m/s).
 - **Harder skin, same full-draw shot**: the automaton (`tinker`) loses 1.9 cm of the brass piece on its chest and the arrow then GLANCES off its brass torso (27.5 J for the first bin, 26.7 J left); the sylvan (`dryad`) takes 7.5 cm of bark and wood and stops it.
-- **The bow's arrow since 2026-10-13** (owner: "arrows shouldn't go through someone unless they're an extremely thin layer"): 50 m/s and `sharpness` 0.8 (37.5 J, ~30 J of a perfect point's bite), the ARROW's numbers and not this price, which the spell projectiles share. Half draw (9.4 J): 2.5 cm into the head (stopped by the skull), 2.5 cm into the upper arm. Full draw: into the head 8.8 cm (hair 2, flesh 2, bone 4, brain 7; 25 hp) and STAYS -- 4..13 brain cells across the sub-cell offsets, none killed outright; into the upper arm 6.2 cm, through the humerus and stopped in the far flesh; into the torso 10.0 cm of the 14.4 a perfect point crosses; a side-on fist 6.2 cm (the art's hand is not thin from the side). What it still goes through is what is thin ALONG ITS LINE: an NPC archer's off-centre arrow grazing the torso's edge (skin 10, flesh 7, muscle 4 over 9.5 cm) leaves out the far side. The `pierce` gate asserts the full draw stays in the head, the arm and the torso.
+- **The bow's arrow since 2026-10-13** (owner: "arrows shouldn't go through someone unless they're an extremely thin layer"): 50 m/s and `sharpness` 0.8 (37.5 J, ~30 J of a perfect point's bite), the ARROW's numbers and not this price, which the spell projectiles share. Half draw (9.4 J): 2.5 cm into the head (stopped by the skull), 2.5 cm into the upper arm. Full draw: into the head 8.8 cm (hair 2, flesh 2, bone 4, brain 7; 25 hp) and STAYS -- 4..13 brain cells across the sub-cell offsets, none killed outright; into the upper arm 6.2 cm, through the humerus and stopped in the far flesh; into the torso 10.0 cm of the 14.4 a perfect point crosses; a side-on fist 6.2 cm (the art's hand is not thin from the side). What it still goes through is what is thin ALONG ITS LINE: an NPC archer's off-centre arrow grazing the torso's edge (skin 10, flesh 7, muscle 4 over 9.5 cm) leaves out the far side. The `pierce` gate asserts the full draw stays in the head, the arm and the torso. **Since 2026-10-15 the bow flies at 35 m/s** (owner: slower in the air so the arc reads) and the arrow weighs 61.2 g instead of 30, so the full draw is still these 37.5 J and every number in this paragraph stands (the `pierce` gate prices its own 30 g penetrator at 50 m/s; the `arrow` and `archer` gates fly the item's). A faint render-only trail follows each flight: its own system (`sim/arrowtrail.h`; `game/arrows.h` `ArrowTrails` packs the rows, `arrow_trail.wgsl` draws them), deliberately not a slice of the gust streaks so a change to the wind's look leaves it alone.
 - **Does an arrow through the brain kill?** Not by itself. The brain charge is per CELL destroyed (`gore.brainHpPerVoxel` 3.5), and a one-cell-radius channel holds 2 to 5 cells per cell of depth by its alignment with the lattice alone: across five sub-cell offsets of the same full-draw shot, 16..31 brain cells, 57..111 hp of the head's 135, none killed outright; the 16-cell wound bled the head from 77.7 to 75.9 hp in 10 s. The PRICE is alignment-free (bins); the HP is not, because the carve and the brain charge count cells. That spread, and whether a brain shot should kill, are the owner's (decision 1).
 
 Known limits: no angle-of-incidence glance (a grazing shot pays the same first bin as a square one); materials.json hardness ranks ice (35) ABOVE bone (24), so the soft-point rule does not shatter ice on bone. A body another machine owns is no longer carved for real by the shooter (package C, below): `PierceAlongRay` routes it.
@@ -11622,9 +11622,9 @@ were. Nothing about storage or rendering changes: the human already paid for
 12.5 mm cells and was using them as 25 mm ones.
 
 - **`headVoxFine`** builds a HUMAN's head on the shipped lattice. The skull,
-  cap, mane and knot are `headVox`'s own expressions evaluated at the centre of
-  each shipped cell (the same shape sampled twice as finely, so no stair steps
-  and a hairline that moves in half rows); the face is redrawn at 12.5 mm: a
+  cap, mane and knot were first `headVox`'s own expressions evaluated at the
+  centre of each shipped cell -- superseded the same evening by **Face detail**
+  (below): resampled, the same ellipses read as an egg; the face is redrawn at 12.5 mm: a
   lash line over white–iris–white, a nose with a straight profile (bridge one
   cell out, bulb two, filled back to the face), nostrils, a mouth line bent
   along a curve with a lip above and below, brows that taper to the tail,
@@ -11691,9 +11691,11 @@ were. Nothing about storage or rendering changes: the human already paid for
   there. `EYE_WHITE` is one constant colour for the whole cast (one merged slot).
 - **Races are untouched**: `isFineFace` is `race === 'human'`, and every race's
   surface pass still reads `headVox`'s face. **`generateMob(…, { face:
-  'legacy' })`** builds a human the old way; the Characters page's **faces:
-  new / OLD** button (key `` ` ``) flips every preview between the two for
-  comparison. It is a view only — a save always writes the fine face.
+  'legacy' })`** builds a human the old way (its half steps rounded,
+  `legacyFace`: unrounded, a half-step brow reach looped forever in
+  `headVox`); the Characters page's **faces: new / OLD** button (key `` ` ``)
+  flips every preview between the two for comparison. It is a view only — a
+  save always writes the genome's own face, detail rows and all.
 - The 10 named humans were re-baked with `gen_mobs.mjs --rebake` and the 20
   pool bodies with the new **`bake_human_pool.mjs --rebake`** (each from the
   genome in its own sidecar; the plain run re-rolls the population). Four pool
@@ -11703,6 +11705,73 @@ were. Nothing about storage or rendering changes: the human already paid for
   `shana`'s torso had 34 cells of bra the current generator no longer paints;
   all now match. `assets/mobs/human.vox`, the hand-authored base (player model), has no
   genome and its own palette, and is NOT converted.
+
+#### Face detail: the old face at 0, the fine face at 1 (2026-10-15)
+
+Owner, the same evening: "the new faces are sculpted and shaped too
+differently and should follow the same contours, and there should be sliders
+that interpolate between the more blocky 2x2x2 look on the face and the new
+one ... I generally prefer the look of all of the previous ones, though the
+added detail for more possibilities of expressiveness is nice ... the facial
+hair is way too drastically different". Measured, the "different shape" was
+not a different head: the resampled ellipse was two cells WIDER through the
+cheeks than the old head, but tapered smoothly at the crown and the jaw where
+the old head has a flat lid and a square jaw -- the taper is what read as an
+egg.
+
+So a human's head is a function of **eight detail rows** (`face.detailShape`,
+`detailEyes`, `detailBrows`, `detailMouth`, `detailNose`, `detailMarks`,
+`detailEars`, `detailBeard`; `faceDetail(g)`), each 0..1, **every default 0**,
+plus a **master row** `face.detail` on the head tab (a `styled` row:
+`applyStyleRow` / `applyFaceDetail` sets all eight; no roll, mutate or cross
+draws it). Every face tab carries its own row at the top. The banner above
+`headVoxFine` in mobgen.js is the full account; in short:
+
+- **0 is `headVox`'s head cell for cell, in its order.** `headVoxFine` builds
+  the old skull, mane and knot on the authored lattice exactly as `headVox`
+  does, and every feature has an OLD branch that paints headVox's authored
+  cells as 2x2x2 blocks (`paintL`, `proudL`). The cells are LISTED in
+  `upscaleCells(headVox)`'s order too (`ord`: headVox's making order, a block's
+  cells dz, dy, dx): `hairMass` grows its shells breadth first in list order,
+  and the same cells in scan order moved 1..450 hair cells on 129 of 239
+  bodies. `test_mobgen.mjs` §V holds the head and every hair part to the
+  legacy build over every saved human, the presets and 60 rolls.
+- **The face's marks are `FACE_SHADE` / `FACE_LIGHT` at every detail.**
+  `headVox` paints them `SKIN_SHADE` / `SKIN_LIGHT`, which the Characters page
+  draws as plain skin, so on the page the old face had no mouth line, freckle,
+  eye bag or wrinkle the game drew; the `FACE_*` slots are the same two
+  colours (the game sees no change) under numbers the page draws. The skull's
+  own shading and the ears stay `SKIN_SHADE` (form, not marks).
+- **Head shape** keeps the old outline at every setting: the old occupancy's
+  binomial blur (radius 4) cut at 0.45 is the head at 1 -- a block's exposed
+  corner off, the step under it filled, the same 16-cell face, 20 at the
+  ears, the square jaw (§V: every row's edges to a cell, the flat lid to two,
+  volume to 3%). Between, the changed cells are taken most-urgent first in
+  even shares along the slider, mirror pairs together (a blend
+  `(1-t)B + t blur(B)` moved nothing below a half). The cap is headVox's hair
+  function asked at a point sliding from the block's centre to the cell's
+  own, so the hairline goes from whole rows to half rows.
+- **Facial hair** is headVox's regions asked at the same sliding point, its row
+  lines sliding from the rounded ones to the unrounded, and its two hashes
+  (density, ragged edge) sliding from the block's to the cell's: the outline
+  stays the old beard's and the edges and stubble break up from blocks into
+  single hairs.
+- **Eyes**: the fine eye with its rows slid from the `old` point (a two-row
+  iris filling the eye, every tone at 0) to the genome's (`eyeGenes`); the
+  same numbers drive `detailColors`, so the whites, lash line and crease FADE
+  in. **Brows** and **mouth**: a band per column whose rows and two ends slide
+  between the old blocks and the fine feature (the mouth's corners thin
+  first). **Nose**: each column's front slides from the block nose to the fine
+  one. **Ears**: band, rows and stand-off slide, the lobe and curl arrive at a
+  half, the hollow's shade slides from the rim's. **Marks**: cheeks, lines and
+  the scar switch at a half, freckles slide like the beard, and blush plus the
+  skin pass's mottle, moles and soft seam ON THE HEAD fade in with it.
+- **Half steps** cannot be drawn by the old head, so its branches round them
+  (`legacyFace`, half away from zero); a half step appears as its feature's
+  detail rises.
+- Every generated human was re-baked (`gen_mobs.mjs --rebake`,
+  `bake_human_pool.mjs --rebake`): with no detail rows in their genomes, every
+  saved character is its old face again, which is what the owner preferred.
 
 #### Every slider moves only what it is for (2026-10-15)
 
@@ -11892,7 +11961,10 @@ something the slider moved:
   body is, so a crawl-space cannot wedge you and a stand asked for under a
   ceiling finishes when you walk out. Crouched, the box is
   `player.crouchHeight` (1.15 m), speed scales by `player.crouchSpeedScale`
-  and sprint is off. Prone, the box is `player.proneHeight` (0.5 m; its 0.4 m
+  (0.8 m/s) and Shift is the QUICK SNEAK, `player.crouchSprintScale` (1.2
+  m/s; held at or above the sneak) -- never a sprint, and louder only through
+  the stealth noise's own speed term (`stealth::MovementNoise`), so it is
+  heard further than the sneak and still not as far as a walk. Prone, the box is `player.proneHeight` (0.5 m; its 0.4 m
   floor keeps it taller than the terminal-velocity sweep substep), sprint and
   jump are off, and the pace is the avatar's `prone` loco state (an ACTIVITY
   state in human.json, set by avatar.cpp unless the damage already has the
@@ -11916,6 +11988,28 @@ something the slider moved:
   `crouchKneeDrop` went 0.35 -> 0.30 m with it: the lean takes the head the
   rest of the way down. Solved, with the bow draws, by
   `scripts/gen_archery_clips.py`.
+  **The sneak's legs (2026-10-14, stride 2026-10-15; pose.cpp, all weighted
+  by `SneakWeight`):** standing, a WIDE BASE with the lead foot half a step
+  ahead, the knees splayed out over the toes and a settle step into the
+  stance. Moving, a STRIDE (`kSneakStride`, 0.85 leg lengths): a foot steps
+  once the body has carried it that far and lands half of it ahead of the
+  hip along the travel, so it trails as far behind before it lifts -- one
+  foot ahead and one behind, both legs angled, at any pace (the plain gait
+  at sneak pace stepped every 0.3 L and kept both feet within a fifth of a
+  leg under the pelvis: a squat-shuffle at 3.5 steps/s). The slot rule
+  alone pairs such steps, so a foot may lift only once the other planted
+  foot has drifted (stride - swing travel) / 2 -- where it sits at half
+  cycle -- which spreads a pair on the first step. Only along the facing
+  (a sidestep keeps the plain step; a whole-leg stride sideways crosses the
+  feet); while striding the base comes in to the rest width and the knees
+  keep half their splay. **The knee stop is 135 degrees** (human.json
+  `legL.*` `poseLimit`, was 100): under the held crouch the knee needs ~113
+  degrees with the foot under the hip, and the clamp at 100 lengthened the
+  leg after the IK, so every crouched planted foot skated ~1 vox a stance --
+  the old squat and the sneak alike, at either pace. Gate `sneak-stride` (L/R
+  alternate, evenly spaced, the trailing foot behind the hips, NO FOOT
+  SKATE, sneak cadence under the walk's, the quick sneak's pace and noise
+  between the sneak's and the walk's).
 - **Projectiles** (spells, thrown things): no colliders — swept ray each frame
   (position + velocity look-ahead, anti-tunneling). Spell modifiers attach as
   **tags with per-frame logic** (material trail, AoE on hit, bounce, acceleration
@@ -25078,11 +25172,15 @@ FROM THE WATER'S SHAPE, §9d.10. The primitive list carries events only.
 
 `currentAt` (render) is the primitive list PLUS the terrain flow field's window
 grid (`flowGridAt`, §9d.10) with the MEASURED flow blended over it
-(`flowMeasAt`, §9d.12); `CurrentAtCpu` / `CurrentAtCpuSim` add the solved grid
-through `WaterFlowField::Sample` but NOT the measured flow, which is GPU-only
-and render-only (the swimmer is not pushed by a breach's flood -- §9d.12).
-`currentAtQ` (the GPU sim kernels) sums the primitives only -- neither grid is
-bound to any sim kernel as an input, and `sim.currentMode` is off.
+(`flowMeasAt`, §9d.12). `CurrentAtCpuSim` -- what moves a body: the player's
+swim stroke, an NPC afloat -- is the same composition over the sim-licensed
+primitives: the solved grid through `WaterFlowField::Sample` with the measured
+flow blended over it at `sim.currentMeasuredCarry`, read from the snapshot
+ring's published grid (§9d.12, "The bodies feel it"), so a swimmer is carried
+by a breach's flood along the current the F4 overlay draws. `CurrentAtCpu` (the
+render arm's CPU twin, the `current` gate's profiles) keeps the solved grid
+alone. `currentAtQ` (the GPU sim kernels) sums the primitives only -- neither
+grid is bound to any sim kernel as an input, and `sim.currentMode` is off.
 
 * **Render surface advection** -- component 9 evaluates wave phase at
   `position - current*age`. This is what makes flow read as flow. `age` is NOT
@@ -25414,6 +25512,42 @@ directions, the pattern the variance-preserving blend of the two that bracket
 the local flow (`flowFrame`): each a rigid rotation of the world, a bend a
 crossfade between them.
 
+### 9d.11b Bubbles: an air cell the water closes over (added 2026-10-16)
+
+`raymarch.wgsl`, "BUBBLES" (`bubShape`, `bubbleComposite`, the bubble arm in
+`trace()`). The CA lifts air up through water a cell at a time, and the motion
+was right; the LOOK was a blue cube, because the march drew such a cell as plain
+air -- the ray just spent 10 cm less in water, so a rising pocket was a stack of
+lighter cubes and a lone bubble barely showed. Render-only; the sim is untouched.
+
+* **Which cells.** An air cell the primary ray reached THROUGH liquid, closed
+  (matter, not air or gas) on at least three of its four sides, with clear
+  liquid among its sides or above. Counted as water by the march, so it has no
+  cube silhouette. Open air (at most one closed side) ends the search for that
+  ray, which is what keeps the cost to rays still inside the water.
+* **The shape** (`bubShape`, one function for both readers): an ellipsoid inside
+  the cell, flattened and wobbling, sized and offset by a hash of the cell.
+  `trace()` records the first cell whose bubble the ray actually HITS, in
+  `liqFace`'s spare bits (no new `Hit` field: `Hit` is live across the opaque
+  shade, where this shader's registers are). Recording the first bubble CELL
+  instead drew half-moons: a ray through a cell's empty corner hid the bubble in
+  the cell behind.
+* **The look** (`bubbleComposite`, after whichever liquid shade owned the pixel,
+  from its veil terms): water -> air Fresnel, so past the critical angle the rim
+  is total internal reflection of the water round it -- the silver outline --
+  bright towards the surface and the sky through Snell's window; ~2% head-on, so
+  the middle shows what is behind; a refracted key-light glint on the crown;
+  composited at the bubble's depth under the same transmittance a body under the
+  surface gets, so it fades with murk.
+
+Known limits: a cell inside a larger pocket is open air to this test, so a
+pocket draws as before and stops the search, cutting a bubble behind it along
+the pocket's face; and EVERY enclosed air cell is drawn, whatever made it --
+which includes the deficit a drain from below sends up through a body (that is
+the CA's representation of it, the same cells the owner called bubbles).
+Measured on the `--lab pondcrater` underwater view, one process per arm, same
+exe: `rm_world` 6.06 ms mean with the change, 6.04 without (noise).
+
 ### 9d.12 The measured flow: the current follows the water the sim moves (added 2026-10-15)
 
 `src/sim/flowfield.h` `kFlowMeas*` (the layout), `assets/shaders/flow_measure.wgsl`
@@ -25451,9 +25585,11 @@ by a reference depth (`FLOWM_DEPTH`, 0.5 cells: the CA moves a body's SURFACE,
 not its depth, so a fixed depth is the honest conversion; the value is the
 look's one calibration -- at 1.0 the gate's 0.8 m head through a 0.6 m gap read
 0.9 m/s, half of what that head drives), then followed in time -- tau 0.5 s up so a breach shows at once,
-1.5 s down so a flood fades instead of flickering, zero under 5 mm/s. STATE
-keeps each slot's velocity, its world node as a tag (a window move keeps every
-node still in view and starts the ones that scroll in from zero) and its band;
+1.5 s down so a flood fades instead of flickering, zero under 5 mm/s -- all of
+it in INTEGERS since the bodies read it (below). STATE keeps each slot's
+velocity (i32, 1/16384 cells/s), its world node as a tag (a window move keeps
+every node still in view and starts the ones that scroll in from zero; a
+format bit in the tag restarts slots the old f32 fold wrote) and its band;
 GRID publishes it in flowGrid's own layout, except that the second word is the
 band (top | bot) the reader gates on (+-1.5 cells).
 
@@ -25461,19 +25597,57 @@ band (top | bot) the reader gates on (+-1.5 cells).
 flow counts in full and the solved field fades out under it, gone at
 `kFlowMeasTakeover` (4 cells/s, 0.4 m/s). Where water really runs the arrows say
 where; everywhere else the map's answer stands. `render.currentMeasured` is the
-gain (0 const-folds the record out of the CA and `mark`, the read out of the
-renderers, and records no fold).
+renderers' gain, `sim.currentMeasuredCarry` the bodies'; with both at 0 the
+record const-folds out of the CA and `mark` and no fold is recorded.
 
-**Authority: render-only, and that is the safety argument.** No sim kernel
-reads `flowMeasure`; it is not hashed, saved, replayed or sent; nothing reads
-it back on the frame path. The adds and maxes are integer and commute, so even
-the side buffer is a function of the moves, not of the schedule -- but nothing
-depends on that. The world hash does not move. The cost of the authority line:
-the player's swim stroke (`CurrentAtCpuSim`) feels only the solved field, so a
-swimmer is not carried by a breach's flood that the surface draws. Feeding it
-would need either an async readback of GRID (one tick latent, CPU-side render
-data) or a sim-side flux the CA itself produces deterministically -- an owner
-call, not done here.
+**The bodies feel it (2026-10-15; owner: "the character is only moved along
+the old water current field lines").** Until then this section's authority
+line was "render-only": the arrows turned toward a breach and a swimmer in
+the same water was pushed along the map's solved field. The measured flow is
+now gameplay input, through the one door every gameplay readback uses:
+
+* **The snapshot ring carries GRID** (`World::EncodeReadbacks`): 36 KiB, a
+  tracked copy after the fold, only on ticks the fold or the Fill closing its
+  tail rewrote it (`Simulation::FlowMeasureWritten`) or after a reset; any
+  other snapshot SHARES the previous one's table (`WorldSnapshot::flowMeas`,
+  `chunkHash`'s arrangement), so a settled world copies nothing.
+* **SubmitTick publishes it** right after `PublishSnapshotsUpTo`
+  (`flowfield::PublishMeasured`), so the grid a tick sees is the one recorded
+  exactly `World::kSnapshotLatency` ticks earlier, on every machine at every
+  frame rate -- never "whenever the fence retired".
+* **The fold is integer** (`flow_measure.wgsl`'s AUTHORITY note). The f32
+  follow was bit-exact on one GPU and not across vendors; with an NPC's drift
+  reading the result, that is a rule-1 hole. Fixed point (STATE in 1/16384
+  cells/s, Q11 follow coefficients, every product bounded under 2^31) makes
+  the whole chain -- move, bin, tent, follow, publish -- a function of the
+  moves alone.
+* **`CurrentAtCpuSim` blends it** over the solved field exactly as `flowBlend`
+  does for the arrows, at `sim.currentMeasuredCarry` (default 1). The measured
+  flow is a BAND of rows that moved -- for a lake the CA levels, its top few --
+  so a body passes its submerged span (`flowfield::SampleMeasuredSpan`): the
+  player feet to waterline, an NPC afloat soles to waterline. A floater whose
+  middle sits a few cells under the surface is still carried by the surface
+  layer it is in.
+
+Still no GPU sim kernel reads `flowMeasure`, and nothing reads it on the frame
+path; it is not saved or sent. The world hash moves only where a body the
+water carries moves differently. `CurrentAtCpu` (the render twin) does not
+read it. Not carried: floating debris and particles (`sim_particle.wgsl` reads
+`currentAtQ`, primitives only) and fish (`mob_swim.cpp` reads no current).
+
+Two things this exposed, both fixed with it. **The particle record floored**
+(`vx >> 12`): a particle creeping at -1/65536 cells a tick recorded -1 and its
++1 twin 0, so a pool of barely-moving particles summed to a pull toward -x/-z
+(`flowMeasParticle` truncates toward zero now; the breach gate's gap read
+(17.8, -1.8) before and (18.4, -0.1) after). **Fixture pools churned**: a pool
+stamped over several ticks in x-major slices filled slab by slab, and
+`npc-swim` measured ~9,500 MPM particles still sloshing at up to 1.6 m/s when
+its first body went in -- invisible to every body until bodies felt the
+measured flow. A gate that floats a live walker in a fixture pool fills it
+still (`selftest_aquatic.cpp` `StampPoolStill`: walls, bed and air first, the
+water in one tick); `npc-swim` and `loose-carrion` do. The other pools there
+still churn, and `aquatic`'s D (the stranded piranha) passes only in that
+churn: in a still pool it flops 51 times without leaving its ledge.
 
 **Cost scales with activity.** The record is a few atomics per LATERAL liquid
 move (still water does not move, so a settled lake adds nothing) and per live
@@ -25492,7 +25666,9 @@ reservoir points on a 1.6 m arc round the gap have turned toward it (V), the
 flood east of it runs east (D); 30 s on, the gap and the ring have relaxed to
 <= 5% of their peak (R; the box's fastest node and its awake chunks are
 printed beside it -- the CA's last levelling far from the breach is real motion
-and reads as such). Thresholds `flowMeasure.*` in baseline.json; a trace every
+and reads as such). C reads what a BODY feels (`CurrentAtCpuSim`, the published
+snapshot only, no blocking readback): still before the breach, east through
+the gap and toward it round the ring after -- the whole chain end to end. Thresholds `flowMeasure.*` in baseline.json; a trace every
 15 ticks prints gap / ring / box max and the fold's tick.
 
 ## 9c. The terrain viewer and the edit layer (added 2026-08-27)

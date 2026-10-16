@@ -1381,13 +1381,19 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     // slow you, chest-deep should be the authored liquidSpeedScale.
     float wade =
         inLiquid ? (1.0f + (T().liquidSpeedScale - 1.0f) * submersion) : 1.0f;
-    // Crouched: no sprint, and the walk scaled down. A crouch is a deliberate
-    // slow-and-low, and letting Shift sprint through it would make the box
-    // shrink for free.
+    // Crouched: the walk scaled down, and Shift is the QUICK SNEAK -- the
+    // same crouch a little faster (crouchSprintScale, under 1), never a
+    // sprint. A crouch is a deliberate slow-and-low, and letting Shift sprint
+    // through it would make the box shrink for free. Faster is louder with
+    // no rule of its own: the stealth noise grows with the speed
+    // (stealth::MovementNoise), so the quick sneak is heard further than the
+    // sneak and still not as far as a walk.
     const bool sprint = in.Held(TB_SPRINT) && !crouching && !prone;
+    const float crouchScale =
+        in.Held(TB_SPRINT) ? T().crouchSprintScale : T().crouchSpeedScale;
     float speed = ((sprint ? T().sprintSpeed : T().walkSpeed) / kVoxelMeters) *
                   wade * (speedScale > 0.0f ? speedScale : 0.0f) *
-                  (crouching ? T().crouchSpeedScale : 1.0f);
+                  (crouching ? crouchScale : 1.0f);
     Vec3 wish = flatFwd * in.forward + right * in.strafe;
     wish.y = 0;
     // The ASKED-FOR pace (player.h moveWish): backing up reads negative, so
@@ -1455,13 +1461,22 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     // is under -- which, like an NPC afloat's mid-body sample
     // (AfloatCurrent), lies inside the water; a fully submerged swimmer's
     // probe is its centre, as before.
+    //
+    // A BREACH'S FLOOD CARRIES IT TOO (2026-10-15). CurrentAtCpuSim blends
+    // the MEASURED flow -- what the simulation's water is really doing, the
+    // field the F4 arrows draw -- over the map's solved one, so a dam blown
+    // open pulls a swimmer toward the gap instead of along the lake's old
+    // lines. The measured flow is a BAND of rows the water moved in (the CA
+    // levels a lake by its top cells), so the stroke passes the submerged
+    // span, feet to waterline: any part of the body in that band is carried.
     const bool carried = inLiquid && (swimming || (afloat && !rising));
     Vec3 curProbe = pos;
-    if (haveSurface)
-      curProbe.y = 0.5f * ((pos.y - kHalfY) +
-                           std::min(pos.y + kHalfY, waterSurfaceY));
-    const Vec3 cur =
-        carried ? sandvox::CurrentAtCpuSim(curProbe) : Vec3{0, 0, 0};
+    const float wetLo = pos.y - kHalfY;
+    const float wetHi =
+        haveSurface ? std::min(pos.y + kHalfY, waterSurfaceY) : pos.y + kHalfY;
+    if (haveSurface) curProbe.y = 0.5f * (wetLo + wetHi);
+    const Vec3 cur = carried ? sandvox::CurrentAtCpuSim(curProbe, wetLo, wetHi)
+                             : Vec3{0, 0, 0};
     currentVel = cur;
     vel.x += (wish.x + cur.x - vel.x) * blend;
     vel.z += (wish.z + cur.z - vel.z) * blend;

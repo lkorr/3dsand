@@ -31,12 +31,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
 #include "game/avatar.h"
 #include "game/mob.h"
 #include "game/player.h"
+#include "game/stealth.h"
 #include "sim/scale.h"
 #include "sim/tuning.h"
 #include "test/selftest.h"
@@ -524,12 +526,286 @@ Status GateLedgeClimbPose(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- sneak-stride --------------------------------------------------------
+//
+// THE SNEAK STRIDES (2026-10-15, owner: "legs should be angled and one foot
+// should be positioned behind the other when walking while sneaking"; Shift
+// while sneaking = "slightly faster sneaking, a little bit louder but still
+// quieter than walking, and slower than walking"). pose.cpp kSneakStride.
+//
+// A PlayerAvatar is posed through PosePipeline at the sneak's pace and at the
+// quick sneak's, crouched, and at the walk's, standing, on flat ground (the
+// fixture stands outside the residency window, so every foot probe misses and
+// the gait plants on the driver's sole -- ledge-climb-pose's trick). Measured
+// over the steady stretch, after the crouch has sunk and the stride settled:
+//   - one foot AHEAD of the hips and the other BEHIND: the mean fore/aft
+//     split between the feet, and how far behind the hips the trailing foot
+//     gets (the old sneak kept both feet within a fifth of a leg under the
+//     pelvis);
+//   - the feet ALTERNATE and the steps are EVENLY SPACED: touchdowns go
+//     L, R, L, R, and consecutive intervals are alike (the slot rule alone
+//     pairs the steps -- two quick ones, then a long double support);
+//   - the sneak steps slower than the walk, the quick sneak faster than the
+//     sneak.
+// And the quick sneak itself, on a real Player: crouched + Shift moves at
+// crouchSprintScale of the walk, between the sneak and the walk, and the
+// stealth noise of the three paces is in that order.
+// Touchdowns are read off the WORLD feet (a planted foot does not move), not
+// the footfall queue: off the window the probe names no material, and a step
+// with no material is not queued.
+struct StrideArm {
+  float paceMs = 0;
+  float meanSplit = 0, maxSplit = 0;   // |ahead L - ahead R|, m
+  float frontMax = 0, backMax = 0;     // furthest a foot got ahead of / behind the hips, m
+  int steps = 0, sameFoot = 0;
+  float evenness = 1.0f;               // worst min/max of consecutive step intervals
+  float cadence = 0;                   // steps per second
+  float skate = 0;                     // worst planted-foot drift, vox
+  std::string why;
+};
+
+StrideArm RunStrideArm(Ctx& c, int defIndex, float paceMs, bool crouch, uint32_t tick) {
+  StrideArm r;
+  r.paceMs = paceMs;
+  const MobDef& def = c.mobs.Defs()[defIndex];
+  PlayerAvatar av;
+  av.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+  av.SetDefs(&c.mobs.Defs(), def.name);
+  // Far outside the residency window: flat, probe-free ground at y = 100.
+  const IVec3 wo = c.world.WindowOrigin();
+  Vec3 origin{(float)(wo.x * (int)kChunk) - 4096.0f, 100.0f,
+              (float)(wo.z * (int)kChunk) - 4096.0f};
+  Player pl;
+  pl.fly = false;
+  pl.pos = Vec3{origin.x + def.worldSize.x * 0.5f, origin.y + Player::kHalfY,
+                origin.z + def.worldSize.z * 0.5f};
+  const float heading = 0.0f;   // +Z
+  if (!av.Spawn(pl, heading)) {
+    r.why = "PlayerAvatar::Spawn refused the fixture";
+    return r;
+  }
+  // Model-pose indices (ledge-climb-pose's partNamed): PosePipeline writes
+  // ModelPose(), not the drawn anchors, which only the full PreTick refreshes.
+  auto partNamed = [&](const char* n) {
+    for (size_t i = 0; i < def.limbs.size(); i++)
+      if (def.limbs[i].name == n) return (int)i;
+    return -1;
+  };
+  const int hips = partNamed("hips");
+  const int feet[2] = {partNamed("foot.L"), partNamed("foot.R")};
+  if (hips < 0 || feet[0] < 0 || feet[1] < 0) {
+    av.Despawn();
+    r.why = "the avatar has no hips/foot.L/foot.R";
+    return r;
+  }
+  // Settle (crouched or not) standing, walk up to pace, then measure.
+  const int kSettle = 45, kRamp = 6, kWarm = 90, kWindow = 240;
+  const float pace = MetresPerSecToCells(paceMs);
+  Vec3 lastFoot[2]{};
+  bool moving[2] = {false, false}, haveLast = false;
+  bool planted[2] = {false, false};
+  Vec3 downAt[2]{};
+  int lastDownFoot = -1, lastDownTick = -1, lastInterval = -1;
+  int firstDown = -1, lastDown = -1;
+  double splitSum = 0;
+  int samples = 0;
+  for (int t = 0; t < kSettle + kWarm + kWindow; t++, tick++) {
+    const float speed =
+        t < kSettle ? 0.0f : pace * std::min(1.0f, (float)(t - kSettle + 1) / (float)kRamp);
+    origin.z += speed * kTickDt;
+    PoseInputs in;
+    in.velocity = Vec3{0.0f, 0.0f, speed};
+    in.grounded = true;
+    in.height = PoseInputs::Height::FromDriver;
+    in.tiltFromGround = false;
+    in.crouch = crouch;
+    av.SetDriverPlacement(origin, heading);
+    av.PosePipeline(in, kTickDt, c.world, tick);
+
+    // In the world: heading 0 is the prefab frame unturned, so a part's
+    // world XZ is the origin's plus its model XZ (the pivot cancels).
+    const std::vector<Transform>& mp = av.ModelPose();
+    if ((int)mp.size() <= std::max(hips, std::max(feet[0], feet[1]))) {
+      r.why = "the model pose has no hips/feet";
+      break;
+    }
+    const Vec3 h = Vec3{origin.x, 0, origin.z} + mp[hips].pos;
+    const Vec3 f[2] = {Vec3{origin.x, 0, origin.z} + mp[feet[0]].pos,
+                       Vec3{origin.x, 0, origin.z} + mp[feet[1]].pos};
+    const bool measuring = t >= kSettle + kWarm;
+    // SANDVOX_SNEAK_TRACE=1: one line a tick of the measured stretch (the
+    // feet ahead of the hips and how far each moved in the world).
+    static const bool trace = std::getenv("SANDVOX_SNEAK_TRACE") != nullptr;
+    if (trace && measuring && t < kSettle + kWarm + 90 && haveLast)
+      std::printf("  trace %.2f t=%d aheadL %+.3f aheadR %+.3f movedL %.3f movedR %.3f\n",
+                  paceMs, t, (f[0].z - h.z) * kVoxelMeters, (f[1].z - h.z) * kVoxelMeters,
+                  Vec3{f[0].x - lastFoot[0].x, 0, f[0].z - lastFoot[0].z}.len(),
+                  Vec3{f[1].x - lastFoot[1].x, 0, f[1].z - lastFoot[1].z}.len());
+    for (int k = 0; k < 2; k++) {
+      // A planted foot does not move in the world; a swinging one outruns
+      // the body. A touchdown is the tick it stops.
+      const float moved = haveLast ? Vec3{f[k].x - lastFoot[k].x, 0, f[k].z - lastFoot[k].z}.len()
+                                   : 0.0f;
+      const bool nowMoving = moved > 0.05f;
+      if (haveLast && moving[k] && !nowMoving && measuring) {
+        if (firstDown < 0) firstDown = t;
+        lastDown = t;
+        r.steps++;
+        if (lastDownFoot == k) r.sameFoot++;
+        if (lastDownTick >= 0) {
+          const int iv = t - lastDownTick;
+          if (lastInterval > 0)
+            r.evenness = std::min(r.evenness, (float)std::min(iv, lastInterval) /
+                                                  (float)std::max(iv, lastInterval));
+          lastInterval = iv;
+        }
+        lastDownFoot = k;
+        lastDownTick = t;
+        planted[k] = true;
+        downAt[k] = f[k];
+      }
+      // FOOT SKATE: how far a planted foot drifts from where it touched down
+      // before it lifts (a tick of swing-sized motion). A pose the leg cannot
+      // reach -- the knee's 100-degree stop under the held crouch -- slid the
+      // planted feet ~1 vox a stance.
+      if (planted[k] && moved > 0.5f) planted[k] = false;
+      if (planted[k] && measuring)
+        r.skate = std::max(r.skate, Vec3{f[k].x - downAt[k].x, 0, f[k].z - downAt[k].z}.len());
+      moving[k] = nowMoving;
+      lastFoot[k] = f[k];
+    }
+    haveLast = true;
+    if (measuring) {
+      const float aheadL = (f[0].z - h.z) * kVoxelMeters;
+      const float aheadR = (f[1].z - h.z) * kVoxelMeters;
+      const float split = std::fabs(aheadL - aheadR);
+      splitSum += split;
+      samples++;
+      r.maxSplit = std::max(r.maxSplit, split);
+      r.frontMax = std::max(r.frontMax, std::max(aheadL, aheadR));
+      r.backMax = std::max(r.backMax, -std::min(aheadL, aheadR));
+    }
+  }
+  r.meanSplit = samples > 0 ? (float)(splitSum / samples) : 0.0f;
+  if (r.steps >= 2 && lastDown > firstDown)
+    r.cadence = (float)(r.steps - 1) / ((float)(lastDown - firstDown) * kTickDt);
+  av.Despawn();
+  return r;
+}
+
+Status GateSneakStride(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  int defIndex = -1;
+  for (size_t i = 0; i < c.mobs.Defs().size(); i++)
+    if (c.mobs.Defs()[i].name == kAvatarDefName) defIndex = (int)i;
+  if (defIndex < 0) {
+    detail = std::string("no \"") + kAvatarDefName + "\" def";
+    std::printf("sneak-stride: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+  const Tuning::Player& tp = CurrentTuning().player;
+  const float sneakMs = tp.walkSpeed * tp.crouchSpeedScale;
+  const float quickMs = tp.walkSpeed * tp.crouchSprintScale;
+  const StrideArm sneak = RunStrideArm(c, defIndex, sneakMs, true, 61000);
+  const StrideArm quick = RunStrideArm(c, defIndex, quickMs, true, 62000);
+  const StrideArm walk = RunStrideArm(c, defIndex, tp.walkSpeed, false, 63000);
+
+  // ---- the quick sneak on a real Player: crouched + Shift --------------------
+  auto flat = [](IVec3 q) { return q.y < 100 ? CellKind::Solid : CellKind::Air; };
+  const Vec3 fwd{1, 0, 0}, right{0, 0, 1};
+  auto paceOf = [&](bool crouch, bool shift) {
+    Player p;
+    p.fly = false;
+    p.pos = Vec3{140.0f, 100.0f + Player::kHalfY, 200.5f};
+    TickInput in;
+    in.forward = 1.0f;
+    in.SetHeld(TB_SPRINT, shift);
+    for (int i = 0; i < 2; i++) p.Update(kTickDt, TickInput{}, fwd, right, fwd, flat);
+    if (crouch) {
+      TickInput down = in;
+      down.SetHeld(TB_CROUCH, true);
+      down.SetPressed(TB_CROUCH, true);
+      p.Update(kTickDt, down, fwd, right, fwd, flat);
+    }
+    for (int i = 0; i < 45; i++) p.Update(kTickDt, in, fwd, right, fwd, flat);
+    const float x0 = p.pos.x;
+    for (int i = 0; i < 30; i++) p.Update(kTickDt, in, fwd, right, fwd, flat);
+    return (p.pos.x - x0) / (30.0f * kTickDt) * kVoxelMeters;   // m/s
+  };
+  const float vSneak = paceOf(true, false), vQuick = paceOf(true, true),
+              vWalk = paceOf(false, false);
+  const stealth::Params sp = stealth::FromTuning(CurrentTuning());
+  auto noise = [&](stealth::Stance st, float ms) {
+    return stealth::MovementNoise(sp, st, ms / std::max(tp.walkSpeed, 1e-3f), 0.0f, 1.0f,
+                                  0.0f, 0.0f);
+  };
+  const float nSneak = noise(stealth::Stance::Crouch, vSneak);
+  const float nQuick = noise(stealth::Stance::Crouch, vQuick);
+  const float nWalk = noise(stealth::Stance::Stand, vWalk);
+
+  const float minMeanSplit = (float)BaselineNumber("sneakStride.minMeanSplitM", 0.15);
+  const float minBack = (float)BaselineNumber("sneakStride.minBackM", 0.15);
+  const float minEven = (float)BaselineNumber("sneakStride.minEvenness", 0.6);
+  const float maxSkate = (float)BaselineNumber("sneakStride.maxSkateVox", 0.25);
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const char* what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("sneak-stride: FAILED %s\n", what);
+    }
+  };
+  for (const StrideArm* a : {&sneak, &quick, &walk}) {
+    const char* arm = a == &sneak ? "sneak" : a == &quick ? "quick sneak" : "walk";
+    std::printf(
+        "sneak-stride %-11s %.2f m/s: feet split mean %.2f max %.2f m, front %.2f "
+        "back %.2f m of the hips | %d steps, %d same-foot, evenness %.2f, cadence "
+        "%.2f steps/s, skate %.2f vox%s%s\n",
+        arm, a->paceMs, a->meanSplit, a->maxSplit, a->frontMax, a->backMax, a->steps,
+        a->sameFoot, a->evenness, a->cadence, a->skate, a->why.empty() ? "" : " | ",
+        a->why.c_str());
+    check(a->why.empty(), "the fixture posed the avatar");
+    check(a->steps >= 4, "the arm stepped");
+    check(a->skate <= maxSkate, "planted feet stay planted (no foot skate)");
+  }
+  for (const StrideArm* a : {&sneak, &quick}) {
+    check(a->meanSplit >= minMeanSplit, "one foot ahead of the other (mean split)");
+    check(a->backMax >= minBack, "the trailing foot gets behind the hips");
+    check(a->sameFoot == 0, "the feet alternate");
+    check(a->evenness >= minEven, "the steps are evenly spaced, not paired");
+  }
+  check(sneak.cadence < walk.cadence, "the sneak steps slower than the walk");
+  check(quick.cadence > sneak.cadence, "the quick sneak steps faster than the sneak");
+  std::printf("sneak-stride: pace sneak %.2f quick %.2f walk %.2f m/s, noise %.1f / "
+              "%.1f / %.1f\n",
+              vSneak, vQuick, vWalk, nSneak, nQuick, nWalk);
+  check(vQuick > vSneak * 1.1f && vQuick < vWalk * 0.95f,
+        "Shift quickens the sneak, and it stays under a walk");
+  check(std::fabs(vQuick - quickMs) < 0.1f, "the quick sneak moves at crouchSprintScale");
+  check(nSneak < nQuick && nQuick < nWalk,
+        "the quick sneak is louder than the sneak and quieter than a walk");
+
+  RecordObserved("sneakStride.observedMeanSplitM", std::min(sneak.meanSplit, quick.meanSplit));
+  RecordObserved("sneakStride.observedEvenness", std::min(sneak.evenness, quick.evenness));
+  detail = Format("sneak split %.2f m back %.2f m %.2f steps/s even %.2f; quick split "
+                  "%.2f m back %.2f m %.2f steps/s even %.2f; walk %.2f steps/s; pace "
+                  "%.2f/%.2f/%.2f m/s noise %.1f/%.1f/%.1f",
+                  sneak.meanSplit, sneak.backMax, sneak.cadence, sneak.evenness,
+                  quick.meanSplit, quick.backMax, quick.cadence, quick.evenness,
+                  walk.cadence, vSneak, vQuick, vWalk, nSneak, nQuick, nWalk);
+  std::printf("sneak-stride: %s (%d checks, %s)\n", ok ? "PASS" : "FAIL", checks,
+              detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& PoseGates() {
   static const std::vector<Gate> g = {
       {"pose-parity", "mob", {}, false, GatePoseParity},
       {"ledge-climb-pose", "mob", {}, false, GateLedgeClimbPose},
+      {"sneak-stride", "mob", {}, false, GateSneakStride},
   };
   return g;
 }

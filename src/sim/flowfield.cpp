@@ -737,6 +737,10 @@ void SetBuffer(const rhi::Buffer* buf) {
 }
 
 Vec3 SampleMeasured(const uint32_t* grid, Vec3 p) {
+  return SampleMeasuredSpan(grid, p, p.y, p.y);
+}
+
+Vec3 SampleMeasuredSpan(const uint32_t* grid, Vec3 p, float yLo, float yHi) {
   const Vec3 zero{0.0f, 0.0f, 0.0f};
   if (grid == nullptr || grid[2] == 0u) return zero;
   const int n = (int)grid[2];
@@ -757,8 +761,27 @@ Vec3 SampleMeasured(const uint32_t* grid, Vec3 p) {
     top = std::max(top, (float)t);
     bot = std::min(bot, (float)(int16_t)(grid[k + 1] >> 16));
   }
-  if (top < -1e8f || p.y > top + 1.5f || p.y < bot - 1.5f) return zero;
+  // The band gate, for a span: zero only when the WHOLE of [yLo, yHi] is
+  // outside the band (+-1.5 cells). A point (yLo == yHi) is flowMeasAt's gate.
+  if (top < -1e8f || yLo > top + 1.5f || yHi < bot - 1.5f) return zero;
   return Vec3{vx / (float)kFlowVelQ, 0.0f, vz / (float)kFlowVelQ};
+}
+
+namespace {
+// The published snapshot's GRID copy (PublishMeasured). A shared pointer to
+// the snapshot's own immutable table, so installing it is a reference count,
+// not a 36 KiB copy, and a later snapshot sharing the same table (no fold ran
+// in between) installs the same pointer.
+std::shared_ptr<const std::vector<uint32_t>> gMeasured;
+}  // namespace
+
+void PublishMeasured(std::shared_ptr<const std::vector<uint32_t>> grid) {
+  gMeasured = std::move(grid);
+}
+
+const uint32_t* PublishedMeasured() {
+  if (!gMeasured || gMeasured->size() < (size_t)kFlowMeasGridWords) return nullptr;
+  return gMeasured->data();
 }
 
 Vec3 BlendMeasured(Vec3 solved, Vec3 measured) {

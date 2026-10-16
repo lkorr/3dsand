@@ -96,11 +96,22 @@ bool Engaged(ai::Intent it) {
 // The horizontal water velocity at a floating walker's middle (vox/s), from
 // the sim-licensed current field. Read by DriveAfloat (the drift) and by the
 // pose (mob.cpp, which takes it back out so a drifting body treads).
+//
+// The field includes the MEASURED flow (CurrentAtCpuSim, DESIGN.md §9d.12),
+// so a breached dam's flood carries the body the way the F4 arrows point. That
+// flow is a band of rows the water moved in -- the CA levels a lake by its top
+// cells -- and a floating walker's middle sits a few cells under its
+// waterline, so the body passes its submerged span (soles to waterline): any
+// part of it in the band is carried.
 Vec3 AfloatCurrent(const Mob& mob, const MobDef& def) {
+  const float soles = mob.Origin().y;
+  const float top = soles + def.worldSize.y;
+  const float wetHi = mob.SurfaceKnown() ? std::min(top, mob.SurfaceY()) : top;
   const Vec3 c = sandvox::CurrentAtCpuSim(
       Vec3{mob.Origin().x + def.worldSize.x * 0.5f,
            mob.Origin().y + def.worldSize.y * 0.5f,
-           mob.Origin().z + def.worldSize.z * 0.5f});
+           mob.Origin().z + def.worldSize.z * 0.5f},
+      soles, std::max(soles, wetHi));
   return Vec3{c.x, 0.0f, c.z};
 }
 

@@ -504,7 +504,7 @@
           0
         ],
         "min": 0,
-        "max": 100
+        "max": 135
       },
       "severImpactSpeed": 16
     },
@@ -578,7 +578,7 @@
           0
         ],
         "min": 0,
-        "max": 100
+        "max": 135
       },
       "severImpactSpeed": 16
     },

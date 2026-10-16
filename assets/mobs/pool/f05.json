@@ -150,15 +150,15 @@
       "name": "hair",
       "parent": "head",
       "joint": "fixed",
-      "hp": 26,
+      "hp": 25,
       "severable": true,
       "vital": false,
       "bloodless": true,
       "tag": "hair",
       "anchor": [
         32.5,
-        112,
-        16.5
+        111,
+        13.5
       ]
     }
   ],
@@ -400,7 +400,16 @@
       "earTilt": 0,
       "earLobe": 0.5,
       "earPointLen": 0.5,
-      "earTone": 0.6
+      "earTone": 0.6,
+      "detail": 0,
+      "detailShape": 0,
+      "detailEyes": 0,
+      "detailBrows": 0,
+      "detailMouth": 0,
+      "detailNose": 0,
+      "detailMarks": 0,
+      "detailEars": 0,
+      "detailBeard": 0
     },
     "hair": {
       "style": "ponytail",
