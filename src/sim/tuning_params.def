@@ -270,9 +270,10 @@ TP_F(render, waveSimFoam, TUNE_WAVE_SIM_FOAM, 0.55f, 0.0f, 4.0f)
 TP_F(render, dbgCurrentSpacing, TUNE_CUR_DBG_SPACING, 6.0f, 1.0f, 64.0f)
 TP_F(render, dbgCurrentRadius, TUNE_CUR_DBG_RADIUS, 40.0f, 0.0f, 256.0f)
 // THE MEASURED FLOW (flowfield.h kFlowMeas*, DESIGN.md 9d.12): the gain on the
-// current the simulation's own water records (a breach, a flood), blended over
-// the map's solved field. 0 const-folds the record out of the CA and the MPM
-// mark pass and the read out of every renderer, and records no fold row.
+// current the simulation's own water records (a breach, a flood) the renderers
+// draw, blended over the map's solved field. 0 const-folds the read out of
+// every renderer; the record and the fold stop too only when
+// sim.currentMeasuredCarry is also 0, because the bodies read them.
 TP_F(render, currentMeasured, TUNE_CURRENT_MEASURED, 1.0f, 0.0f, 4.0f)
 TP_F(render, reflectionCutoff, TUNE_REFLECTION_CUTOFF, 0.06f, 0.0f, 1.0f)
 TP_I(render, reflectionSteps, TUNE_REFLECTION_STEPS, 96, 0, 512)
@@ -2516,6 +2517,14 @@ TP_F(sim, currentVortexDecay, NO_WGSL, 3.0f, 0.05f, 120.0f)
 TP_I(sim, currentVortexRadius, NO_WGSL, 40, 4, kCurrentPrimMaxExtent)
 TP_F(sim, currentSinkSpeed, NO_WGSL, 3.0f, 0.0f, 20.0f)
 TP_F(sim, currentStreamScale, NO_WGSL, 1.2f, 0.0f, 20.0f)
+// THE MEASURED FLOW CARRIES BODIES (flowfield.h kFlowMeas*, DESIGN.md 9d.12):
+// the gain on the measured current a body the water holds feels (the player's
+// swim stroke, an NPC afloat: CurrentAtCpuSim), blended over the solved field
+// as render.currentMeasured blends it for the arrows. Read on the CPU off the
+// snapshot ring, a fixed kSnapshotLatency ticks late. The two shaders that
+// RECORD the flow name it only so the record keeps running for the bodies
+// when the renderers' gain is 0. 0 = bodies feel the solved field only.
+TP_F(sim, currentMeasuredCarry, TUNE_CURRENT_MEASURED_CARRY, 1.0f, 0.0f, 4.0f)
 
 
 // ==== dayNight ====

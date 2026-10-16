@@ -375,6 +375,10 @@ class Simulation {
   // the swimming fold). The snapshot readback copies the fold only then.
   // Readback plumbing only — nothing in the sim may branch on this either.
   bool FluidSeamRecorded() const { return fluidSeamRecorded_; }
+  // Whether the last EncodeTick rewrote the measured flow's published GRID:
+  // the fold, or the Fill that closes its tail. The snapshot readback copies
+  // the grid only then (World::EncodeReadbacks). Readback plumbing, as above.
+  bool FlowMeasureWritten() const { return flowMeasWritten_; }
   uint64_t CaSkipCount() const { return caSkipCount_; }
   // MEASUREMENT / TEST ONLY: force the CA rows to be recorded every tick, i.e.
   // defeat the §3.4 skip. Two uses, both of which need it to be a switch rather
@@ -1289,6 +1293,7 @@ class Simulation {
   // the tail records the one Fill that zeroes the published field).
   uint32_t flowMeasTail_ = 0;
   bool flowMeasLive_ = false;
+  bool flowMeasWritten_ = false;   // FlowMeasureWritten()
   // The far horizon's height pyramid (sim/horizon.h): 45 in renderBGL_
   // (fragment, read). Built from the map at Init and every UploadEnvironment;
   // grow-only. renderBGBuilt_ says the render bind groups exist yet (Init

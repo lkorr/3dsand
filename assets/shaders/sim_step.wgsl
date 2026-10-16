@@ -81,14 +81,17 @@ const PT_KERNEL : u32 = PT_K_STEP;
 // a voxel or a hash — it is exactly as observable as `actVoxViz` at 23.
 @group(0) @binding(34) var<storage, read_write> gasOuter : array<atomic<u32>>;
 // ---- THE MEASURED FLOW'S ACCUMULATOR (src/sim/flowfield.h kFlowMeas*) ------
-// RENDER-ONLY, gasOuter's standing exactly: every lateral move of a liquid
-// adds its eighths x displacement to the node bin it left, so the renderer's
-// current arrows, streaks and foam can follow the water the simulation is
-// really moving (a breached dam, a flood) and not only the map's solved field.
-// The sim never reads it and the hash never covers it; the adds and maxes are
-// integer and commute, so even the side buffer is a function of the moves and
-// not of the schedule. flow_measure.wgsl folds it after the CA; a Fill zeroes
-// it. The MPM `mark` pass (sim_fluid.wgsl) adds its particles to the same bins.
+// A SIDE RECORD, gasOuter's standing in this kernel: every lateral move of a
+// liquid adds its eighths x displacement to the node bin it left, so the
+// current follows the water the simulation is really moving (a breached dam,
+// a flood) and not only the map's solved field -- the renderer's arrows,
+// streaks and foam, and (through the snapshot ring, exactly kSnapshotLatency
+// ticks later) the bodies the water carries. No GPU sim kernel reads it and
+// the hash never covers it; the adds and maxes are integer and commute, so the
+// side buffer is a function of the moves and not of the schedule.
+// flow_measure.wgsl folds it after the CA (in integers, since bodies read the
+// result); a Fill zeroes it. The MPM `mark` pass (sim_fluid.wgsl) adds its
+// particles to the same bins.
 @group(0) @binding(61) var<storage, read_write> flowMeasAcc : array<atomic<i32>>;
 // Must match flowfield.h kFlowMeasN / kFlowMeasAccQ, sim_fluid.wgsl's copy of
 // this block and flow_measure.wgsl (check_invariants.py "measured flow").
@@ -99,9 +102,10 @@ const FLOWM_Y_BIAS : i32 = 1048576;
 // cell onto the node lattice (node k owns cells 8k-4 .. 8k+3), the slot being
 // the node mod FLOWM_N -- the window spans fewer nodes than that, so within a
 // tick no two nodes share a slot. A vertical move is no current and costs
-// nothing; at render.currentMeasured 0 the whole body const-folds away.
+// nothing; with nothing reading the field (render.currentMeasured AND
+// sim.currentMeasuredCarry both 0) the whole body const-folds away.
 fn flowMeasNote(src : vec3<i32>, dst : vec3<i32>, eighths : u32) {
-  if (TUNE_CURRENT_MEASURED <= 0.0) { return; }
+  if (TUNE_CURRENT_MEASURED <= 0.0 && TUNE_CURRENT_MEASURED_CARRY <= 0.0) { return; }
   let d = dst - src;
   if (d.x == 0 && d.z == 0) { return; }
   let kx = ((((src.x + 4) >> 3u) % FLOWM_N) + FLOWM_N) % FLOWM_N;

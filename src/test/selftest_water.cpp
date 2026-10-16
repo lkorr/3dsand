@@ -3974,6 +3974,16 @@ Status GateBlastWater(Ctx& c, std::string& detail) {
 //      stops when the water does. (The fastest node anywhere in the box is
 //      printed beside it with the box's awake chunks: the CA's last
 //      levelling far from the breach is real motion and reads as such.)
+//   C. CARRIED (2026-10-15): the current a BODY feels -- CurrentAtCpuSim, the
+//      player's swim stroke and an NPC afloat, reading the grid the snapshot
+//      ring published World::kSnapshotLatency ticks earlier -- is the same
+//      flood: still before the breach, east through the gap at >=
+//      flowMeasure.carryMin cells/s at `at`, and toward the gap at >=
+//      flowMeasure.pullMin of the ring points. The other claims read a
+//      blocking readback; this one reads nothing the game does not, so it is
+//      the whole chain (fold, tracked copy, parse, publish, blend) end to end.
+//      The bodies span the top few rows (sy - 3 .. sy + 1), as a floater's
+//      submerged span does.
 // Every 15 ticks the trace prints gap / ring mean / box max, so a FAIL says
 // which phase did not happen. Thresholds in baseline.json.
 Status GateFlowMeasure(Ctx& c, std::string& detail) {
@@ -4068,6 +4078,22 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   int pulled = 0;
   float ringMean = 0.0f;
   const Vec3 solvedGap = WaterFlow().Sample(gapP);
+  // C: what a body feels, through the published snapshot only.
+  const double carryMin = BaselineNumber("flowMeasure.carryMin", 5.0);
+  auto carry = [&](Vec3 p) { return CurrentAtCpuSim(p, p.y - 3.0f, p.y + 1.0f); };
+  float carryQuiet = -1.0f;
+  Vec3 carryGap{0, 0, 0};
+  int carryPulled = 0;
+  auto carryRing = [&]() {
+    int n = 0;
+    for (const Vec3& p : ring) {
+      const Vec3 v = carry(p);
+      const float s = speed(v);
+      const float dx = gapP.x - p.x, dz = gapP.z - p.z, dl = std::sqrt(dx * dx + dz * dz);
+      if (s >= pullSpeed && (v.x * dx + v.z * dz) / (s * dl) >= 0.5f) n++;
+    }
+    return n;
+  };
   const int total = kBreachAt + kSettle;
   // The box is ~120k cell ops and a tick takes kMaxCellOpsPerTick (65,536):
   // the rest are REFUSED, not queued (the first run built half a box and its
@@ -4087,12 +4113,15 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
     if (i == kBreachAt - 1) {
       readGrid();
       quietGap = speed(at(gapP));
+      carryQuiet = speed(carry(gapP));
     }
     if (i == kBreachAt + kAt) {
       readGrid();
       gapV = at(gapP);
       downV = at({gapP.x + 12.0f, sy - 2.0f, gapP.z});
       ringPull(pulled, ringMean);
+      carryGap = carry(gapP);
+      carryPulled = carryRing();
     }
     if (i > kBreachAt && (i - kBreachAt) % 15 == 0) {
       readGrid();
@@ -4132,6 +4161,8 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   RecordObserved("flowMeasure.pulledObserved", pulled);
   RecordObserved("flowMeasure.peakObserved", peak);
   RecordObserved("flowMeasure.endObserved", endNear);
+  RecordObserved("flowMeasure.carryObserved", carryGap.x);
+  RecordObserved("flowMeasure.carryPulledObserved", carryPulled);
   std::vector<std::string> fails;
   if (quietGap < 0.0f || quietGap > 0.05f)
     fails.push_back(Format("Q: the still reservoir already published %.2f cells/s at the gap", quietGap));
@@ -4145,13 +4176,19 @@ Status GateFlowMeasure(Ctx& c, std::string& detail) {
   if (nearPeak <= 0.0f || endNear > relaxMax * nearPeak)
     fails.push_back(Format("R: gap / ring still %.2f cells/s after %d ticks, peak %.1f (allow %.0f%%)", endNear,
                            kSettle, nearPeak, relaxMax * 100.0));
+  if (carryQuiet < 0.0f || carryQuiet > 0.05f || carryGap.x < carryMin || carryPulled < pullMin)
+    fails.push_back(Format("C: a body feels %.2f cells/s at the gap before the breach, (%.1f, %.1f) at +%d "
+                           "(need east >= %.1f), %d of %zu ring points carried toward the gap (need %d)",
+                           carryQuiet, carryGap.x, carryGap.z, kAt, carryMin, carryPulled, ring.size(),
+                           pullMin));
   detail = Format(
       "dam breach %dx%dx%d, gap %d: Q quiet %.2f | G gap (%.1f, %.1f) cells/s vs solved %.2f | V %d/%zu ring "
       "points at %.0f cells pulled (mean %.2f) | D downstream (%.1f, %.1f) | R gap/ring peak %.1f -> %.2f "
-      "after %d ticks; box max %.1f -> %.2f (%u of %u box chunks awake), grid n %u | %s",
+      "after %d ticks; box max %.1f -> %.2f (%u of %u box chunks awake), grid n %u | C body carry quiet %.2f, "
+      "gap (%.1f, %.1f), %d/%zu ring | %s",
       2 * kHalfX + 1, 2 * kHalfZ + 1, kDeep, kGap, quietGap, gapV.x, gapV.z, speed(solvedGap), pulled,
       ring.size(), ringR, ringMean, downV.x, downV.z, nearPeak, endNear, kSettle, peak, endMax, boxAwake,
-      boxChunks, grid[2], trace.c_str());
+      boxChunks, grid[2], carryQuiet, carryGap.x, carryGap.z, carryPulled, ring.size(), trace.c_str());
   for (const std::string& f : fails) detail = f + "; " + detail;
   const bool ok = fails.empty();
   std::printf("flow-measure: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());

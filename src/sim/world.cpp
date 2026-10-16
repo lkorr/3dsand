@@ -11,6 +11,7 @@
 
 #include "gpu/resources.h"
 #include "sim/farfeat.h"
+#include "sim/flowfield.h"
 #include "sim/pagetable.h"
 #include "sim/pass_table.h"  // pass::Buf ids for the tracked readback copies
 #include "sim/rng.h"
@@ -102,7 +103,12 @@ constexpr uint64_t kElecQueryOff = kElecSnapOff + kElecSnapBytes;
 constexpr uint64_t kElecQueryGridOff = kElecQueryOff + kElecQueryResBytes;
 // The solute aggregates asked for (World::RequestSoluteAgg): one word each.
 constexpr uint64_t kSolAggOff = kElecQueryGridOff + kElecQueryGridBytes;
-constexpr uint64_t kSlotBytes = kSolAggOff + (uint64_t)World::kSolAggPerTick * 4;
+// THE MEASURED FLOW's published grid (flowfield.h kFlowMeasGrid*): 36 KiB, on
+// the ticks the fold or its closing Fill rewrote it (EncodeReadbacks).
+constexpr uint64_t kFlowMeasSnapOff =
+    kSolAggOff + (uint64_t)World::kSolAggPerTick * 4;
+constexpr uint64_t kFlowMeasSnapBytes = (uint64_t)sandvox::kFlowMeasGridWords * 4;
+constexpr uint64_t kSlotBytes = kFlowMeasSnapOff + kFlowMeasSnapBytes;
 
 // Every WorldSnapshot the pipeline hands around is pre-sized: the readback
 // callback memcpys straight into these arrays. One definition, so the published
@@ -640,7 +646,8 @@ static int ActiveReadbackSlots() {
 
 bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
                             IVec3 playerChunkBase, uint32_t particleLivePage,
-                            uint32_t tick, bool hashTick, bool fluidRecorded) {
+                            uint32_t tick, bool hashTick, bool fluidRecorded,
+                            const rhi::Buffer* flowMeas, bool flowMeasWritten) {
   // A TICK REWIND FLUSHES THE PIPELINE. The harness runs many scenes through
   // one World and each restarts its own tick base (kOrder, test/selftest.cpp),
   // so `tick` is monotonic WITHIN a scene and not across them. Unsigned
@@ -850,6 +857,20 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
   if (fluidRecorded)
     enc.CopyTracked(pass::Buf::FluidMirror, fluidMirror, 0, s.buf,
                     kFluidMirrorOff, kFluidMirrorBytes);
+  // THE MEASURED FLOW's grid (36 KiB), the swimming fold's rule: only when it
+  // can have changed -- this tick's fold or the Fill closing its tail rewrote
+  // it, or a reset's fills zeroed it outside the tick (flowMeasForce_). A slot
+  // without it inherits the previous snapshot's grid at parse time, which is
+  // byte-for-byte what the buffer still holds, so a settled world copies
+  // nothing (rule 2). The fold ran earlier in this command buffer: tracked.
+  s.flowMeasCopied =
+      flowMeas != nullptr && (flowMeasWritten || flowMeasForce_);
+  if (s.flowMeasCopied) {
+    enc.CopyTracked(pass::Buf::FlowMeasure, *flowMeas,
+                    (uint64_t)sandvox::kFlowMeasGridBase * 4, s.buf,
+                    kFlowMeasSnapOff, kFlowMeasSnapBytes);
+    flowMeasForce_ = false;
+  }
   lastSlot_ = slot;
   return true;
 }
@@ -1189,6 +1210,16 @@ void World::KickReadback() {
         }
         out.chunkHash = lastChunkHash_;
         out.chunkHashTick = (*out.chunkHash)[kChunkHashTickWord];
+        // The measured flow's grid, chunkHash's arrangement: a fresh table
+        // when this slot carried one, otherwise the newest parsed table
+        // (null until the first copy after a reset = no grid).
+        if (sl.flowMeasCopied) {
+          auto g = std::make_shared<std::vector<uint32_t>>(
+              (size_t)sandvox::kFlowMeasGridWords, 0u);
+          std::memcpy(g->data(), p + kFlowMeasSnapOff, kFlowMeasSnapBytes);
+          lastFlowMeas_ = std::move(g);
+        }
+        out.flowMeas = lastFlowMeas_;
         std::memcpy(&out.pageFaults, p + kPageFaultOff, 4);
         std::memcpy(&out.scoopEighths, p + kPageFaultOff + kPageFaultScoopEighths * 4, 4);
         std::memcpy(&out.scoopApplied, p + kPageFaultOff + kPageFaultScoopApplied * 4, 4);
@@ -1536,6 +1567,10 @@ void World::InvalidateSnapshot() {
   // rewrite the GPU table: the next readback must COPY it, not share.
   lastChunkHash_.reset();
   chunkHashForce_ = true;
+  // The measured flow's grid likewise: the fills behind a reset zeroed it on
+  // the GPU, and the dead world's copy must not be inherited.
+  lastFlowMeas_.reset();
+  flowMeasForce_ = true;
   // The quiet streaks described the DEAD world's chunks (M9.3-A). A fresh
   // worldgen makes every slot's history meaningless, and a stale streak here
   // would read as "settled, safe to compare" for a chunk that has not been

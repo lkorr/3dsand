@@ -3651,6 +3651,18 @@ struct Tuning {
     // self-limiting, so no whirlpool and no knob value can fling water faster
     // than the field says it is moving. Only consulted when currentMode is 1.
     float currentDrag = TPD(sim, currentDrag);
+    // THE MEASURED FLOW CARRIES BODIES (flowfield.h kFlowMeas*, DESIGN.md
+    // 9d.12): the gain on the current the simulation's own water records --
+    // a breached dam's flood, a pour -- that a body the water holds feels: the
+    // player's swim stroke and an NPC afloat (CurrentAtCpuSim). Blended over
+    // the solved field exactly as render.currentMeasured blends it for the
+    // arrows, so at 1 (both defaults) a swimmer is carried by the current the
+    // F4 overlay draws. Read on the CPU from the snapshot ring, exactly
+    // World::kSnapshotLatency ticks late, off an integer fold, so where an NPC
+    // drifts is a function of the tick and not of the GPU's timing or vendor.
+    // 0 = bodies feel the solved field only (what they did before 2026-10-15);
+    // the record stops only when this and render.currentMeasured are both 0.
+    float currentMeasuredCarry = TPD(sim, currentMeasuredCarry);
   } sim;
 
   // ---- day/night cycle ----
@@ -4594,10 +4606,10 @@ struct Tuning {
     // how much of the current the simulation's own water records -- every
     // lateral liquid move of the CA and every MPM particle, folded per node --
     // the renderer draws over the map's solved field (arrows, streaks, boils,
-    // foam, film). 1 is the calibrated look; 0 removes it entirely (the
-    // record const-folds out of the CA and `mark`, the read out of the
-    // renderers, and the fold row is never recorded). Render-only either way:
-    // the world hash cannot see it.
+    // foam, film). 1 is the calibrated look; 0 removes it from the renderers.
+    // Render-only: what a BODY feels is sim.currentMeasuredCarry, so this
+    // never moves anything (the record and the fold stop only when both are
+    // 0).
     float currentMeasured = TPD(render, currentMeasured);
 
     // translucent solids — ice, glass (shadeTranslucent in raymarch.wgsl).

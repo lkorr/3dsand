@@ -4631,6 +4631,17 @@ struct WorldSnapshot {
   // other snapshot points at the table it inherited — immutable once parsed.
   std::shared_ptr<const std::vector<uint32_t>> chunkHash;
   uint32_t chunkHashTick = 0;
+  // ---- THE MEASURED FLOW's published grid (flowfield.h kFlowMeas*) ----
+  // The GRID region of `flowMeasure` (kFlowMeasGridWords: the header, then
+  // vx | vz and top | bot per node) as of this snapshot's tick: which way the
+  // water the simulation moved was going (DESIGN.md §9d.12). The bodies the
+  // water holds read it (SubmitTick installs Snap()'s with
+  // flowfield::PublishMeasured; CurrentAtCpuSim samples it). SHARED like
+  // chunkHash: the readback copies the 36 KiB grid only on ticks the fold or
+  // its closing Fill rewrote it (Simulation::FlowMeasureWritten), and every
+  // other snapshot points at the grid it inherited. Null = no grid yet (a
+  // fresh world, which the fills zeroed anyway).
+  std::shared_ptr<const std::vector<uint32_t>> flowMeas;
   // Page faults since process start — voxStore()'s sentinel no-op path
   // (PLAN_page_table.md §2.4). MONOTONIC and never cleared: a non-zero value is
   // a permanent "this build has a bug" latch. Every gate asserts it is zero,
@@ -4811,10 +4822,19 @@ class World {
   //                   (the seam's recording predicate covers every particle,
   //                   Simulation::EncodeTick), and the parse zero-fills.
   // Both default to true, which is the old copy-everything behaviour.
+  //   flowMeas / flowMeasWritten — the measured flow's buffer (Simulation's
+  //                   `flowMeasure`) and whether this tick's fold or its
+  //                   closing Fill rewrote its GRID (Simulation::
+  //                   FlowMeasureWritten). The 36 KiB grid is copied then (or
+  //                   after a reset) and otherwise shared from the previous
+  //                   snapshot, which is byte-for-byte what the buffer holds.
+  //                   Null = never copied (the snapshot carries no grid).
   bool EncodeReadbacks(const rhi::Device& device, const rhi::CommandEncoder& enc,
                        IVec3 playerChunkBase, uint32_t particleLivePage,
                        uint32_t tick, bool hashTick = true,
-                       bool fluidRecorded = true);
+                       bool fluidRecorded = true,
+                       const rhi::Buffer* flowMeas = nullptr,
+                       bool flowMeasWritten = false);
   // Something outside a hash tick rewrote the digest table (the standalone
   // hash-only pass): make the next readback copy it rather than share.
   void NoteChunkHashWritten() { chunkHashForce_ = true; }
@@ -6071,6 +6091,7 @@ class World {
     // snapshot's; a slot without the fold parses as no water.
     bool hashCopied = true;
     bool fluidCopied = true;
+    bool flowMeasCopied = false;   // the measured flow's GRID rides this slot
     // The body query's boxes this tick (SetElecQueriesInFlight): the TAGS of
     // the answers this slot carries. Empty = no answers copied.
     std::vector<ElecQuery> elecQueries;
@@ -6187,4 +6208,9 @@ class World {
   // The next readback must copy the digest table even on a non-hash tick:
   // something outside the tick recurrence rewrote it (see EncodeReadbacks).
   bool chunkHashForce_ = true;
+  // The measured flow's grid, the same two halves: the newest parsed copy a
+  // slot without one inherits, and the force a reset raises (worldgen's and
+  // the load reset's fills zero the GPU grid outside any tick).
+  std::shared_ptr<const std::vector<uint32_t>> lastFlowMeas_;
+  bool flowMeasForce_ = true;
 };

@@ -102,21 +102,27 @@ constexpr int kFlowVelQ = 128;
 constexpr int kFlowDry = -32768;
 
 // THE MEASURED FLOW (DESIGN.md §9d.12): which way the water the simulation
-// is ACTUALLY moving goes, recorded on the GPU, render-only. The solved field
-// above is a function of the MAP, so it cannot see a dam somebody breached;
-// this one is a function of the moves. One buffer (`flowMeasure`), three
-// regions, all on the node lattice above (a node every kFlowStep cells, the
-// window grid's kFlowWinNodes per axis):
+// is ACTUALLY moving goes, recorded on the GPU. The solved field above is a
+// function of the MAP, so it cannot see a dam somebody breached; this one is a
+// function of the moves. The renderers draw it over the solved field, and
+// since 2026-10-15 the bodies the water holds feel it too: the snapshot ring
+// copies GRID (World::EncodeReadbacks), SubmitTick publishes the copy owed to
+// the tick (PublishMeasured below, World::kSnapshotLatency ticks late) and
+// CurrentAtCpuSim blends it in. One buffer (`flowMeasure`), three regions, all
+// on the node lattice above (a node every kFlowStep cells, the window grid's
+// kFlowWinNodes per axis):
 //   ACC   per toroidal slot (world node mod kFlowMeasN), four i32: the net
 //         horizontal liquid flux this tick (x, z; eighths x cells, scaled by
 //         kFlowMeasAccQ) and the highest / lowest cell that moved (y + bias,
 //         bias - y; 0 = nothing moved). Atomically ADDED / MAXed by the CA
 //         (sim_step.wgsl) and the MPM `mark` pass, zeroed by a Fill after the
 //         fold. Integer adds and maxes commute, so the sum is a function of
-//         the moves and not of the schedule -- and nothing in the sim reads it.
-//   STATE per slot, four words: the smoothed velocity (vx, vz, f32 cells/s),
-//         the world node the slot holds (a tag: the window moves under it),
-//         and the water band (top | bot, i16 each).
+//         the moves and not of the schedule; no GPU sim kernel reads it.
+//   STATE per slot, four words: the smoothed velocity (vx, vz, i32 in
+//         1/16384 cells/s -- the fold is INTEGER because bodies read its
+//         output, flow_measure.wgsl's AUTHORITY note), the world node the slot
+//         holds (a tag: the window moves under it), and the water band (top |
+//         bot, i16 each).
 //   GRID  the render's view, the flowGrid layout exactly: a 4-word header
 //         ([0] origin x [1] origin z [2] nodes per axis, 0 = no field [3] the
 //         tick it was folded) and two words a node, w0 = vx | vz (i16,
@@ -205,12 +211,30 @@ void SetBuffer(const rhi::Buffer* buf);
 void Upload(const rhi::Queue& queue);
 
 // THE MEASURED FLOW at a world position, cells/s (horizontal), from a copy of
-// the GRID region (`grid` = kFlowMeasGridWords words, read back by a gate).
-// TRANSCRIBED from common.wgsl flowMeasAt -- the same bilinear weights over
-// the same quantised words and the same band gate. Render-only data: no sim
-// consumer may read it (there is no readback on the frame path, and the moves
-// it records are this machine's GPU's).
+// the GRID region (`grid` = kFlowMeasGridWords words: the published snapshot's,
+// or a gate's readback; nullptr = no field). TRANSCRIBED from common.wgsl
+// flowMeasAt -- the same bilinear weights over the same quantised words and
+// the same band gate.
 Vec3 SampleMeasured(const uint32_t* grid, Vec3 posVox);
+// The same field for a BODY spanning [yLo, yHi] vertically (world cells): the
+// record is a BAND of rows the water moved in (the CA levels a body of water
+// by its top cells), and a body is carried by it when any part of it is in
+// that band, not only its sample point. yLo == yHi == posVox.y is
+// SampleMeasured exactly.
+Vec3 SampleMeasuredSpan(const uint32_t* grid, Vec3 posVox, float yLo, float yHi);
+// THE PUBLISHED GRID: the snapshot's copy of GRID as of World::Snap() --
+// exactly World::kSnapshotLatency ticks behind the tick being assembled, the
+// fixed latency every gameplay readback has (DESIGN.md §2) -- installed by
+// SubmitTick right after it publishes the snapshot, read by CurrentAtCpuSim.
+// That fixed latency, plus the integer fold, is what makes it legal for a
+// body the tick owns (an NPC afloat) to read: its value at tick T is a pure
+// function of the ticks before T, never of when a fence retired or whose GPU
+// ran them. nullptr / an empty table = no field (no snapshot yet, or nothing
+// has moved since the last world reset). Window-keyed, like WaterFlow()'s
+// grid: it covers the residency window it was recorded in.
+void PublishMeasured(std::shared_ptr<const std::vector<uint32_t>> grid);
+// The installed table's words, or nullptr.
+const uint32_t* PublishedMeasured();
 // The composition currentAt makes (common.wgsl): the measured flow counts in
 // full and the solved field fades out under it, gone once the measured speed
 // reaches kFlowMeasTakeover cells/s.

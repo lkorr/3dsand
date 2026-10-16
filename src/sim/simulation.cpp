@@ -4225,9 +4225,13 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // or the seam ran last tick -- and then for kFlowMeasTailTicks more, while
   // the published field decays; the tick after that records ONE Fill that
   // zeroes it, and a settled world then records nothing (rule 2). Every input
-  // is CPU-known tick state; the field is render-only either way.
+  // is CPU-known tick state. Two readers keep it running: the renderers
+  // (render.currentMeasured) and the bodies the water carries
+  // (sim.currentMeasuredCarry, off the snapshot ring) -- the same pair that
+  // const-folds the record out of sim_step and `mark` when both are 0.
   {
-    const bool on = CurrentTuning().render.currentMeasured > 0.0f;
+    const bool on = CurrentTuning().render.currentMeasured > 0.0f ||
+                    CurrentTuning().sim.currentMeasuredCarry > 0.0f;
     const bool fed = on && (cx.caActive || fluidSeamRecorded_);
     if (fed) {
       flowMeasTail_ = sandvox::kFlowMeasTailTicks;
@@ -4237,6 +4241,7 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
     cx.flowMeasure = on && (fed || flowMeasTail_ > 0);
     cx.flowMeasureClear = !cx.flowMeasure && flowMeasLive_;
     flowMeasLive_ = cx.flowMeasure;
+    flowMeasWritten_ = cx.flowMeasure || cx.flowMeasureClear;
   }
   caSkipped_ = !cx.caActive;
   if (caSkipped_) caSkipCount_++;

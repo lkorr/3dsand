@@ -732,6 +732,7 @@
     "currentSinkSpeed": 3,
     "currentStreamScale": 1.2,
     "currentDrag": 6,
+    "currentMeasuredCarry": 1,
     "windMode": 1,
     "gasMode": 1,
     "gasThinDecayMul": 3,

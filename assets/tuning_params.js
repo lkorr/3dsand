@@ -1020,6 +1020,7 @@ const TUNING_PARAMS = {
   'sim.currentVortexRadius':{t:'i',def:40,min:4,max:512},
   'sim.currentSinkSpeed':{t:'f',def:3,min:0,max:20},
   'sim.currentStreamScale':{t:'f',def:1.2,min:0,max:20},
+  'sim.currentMeasuredCarry':{t:'f',def:1,min:0,max:4,wgsl:'TUNE_CURRENT_MEASURED_CARRY'},
   'dayNight.cycleMinutes':{t:'i',def:20,min:1,max:240},
   'dayNight.freeze':{t:'i',def:0,min:0,max:1},
   'dayNight.freezePhase':{t:'i',def:32768,min:0,max:65535},

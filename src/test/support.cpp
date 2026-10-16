@@ -1395,6 +1395,16 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     }
     if (world.PublishSnapshotsUpTo(target)) g_stallStats.mapArm++;
   }
+  // THE MEASURED FLOW the bodies feel (flowfield.h PublishMeasured): the grid
+  // of the snapshot just published -- exactly kSnapshotLatency ticks behind,
+  // on every machine -- or none while there is no valid snapshot (the first
+  // ticks after a reset). Installed here, at the one publish point, so every
+  // reader this tick (the player's swim stroke, an NPC afloat) sees the same
+  // grid, and the grid a tick sees is a function of the tick number.
+  {
+    const WorldSnapshot& ps = world.Snap();
+    flowfield::PublishMeasured(ps.valid ? ps.flowMeas : nullptr);
+  }
   // Every span is a branch on a bool unless --telemetry or --perf is live.
   sandvox::PerfSpan spanHead(PerfScope::Upload);
   particlesActive = particlesActive || !exps.empty() || !spawns.empty();
@@ -2664,7 +2674,9 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     doCopy = world.EncodeReadbacks(ctx.device, enc,
                                    {mc.x - 1, mc.y - 1, mc.z - 1},
                                    1 - sim.Page(), tick, hashEnable,
-                                   sim.FluidSeamRecorded());
+                                   sim.FluidSeamRecorded(),
+                                   &sim.FlowMeasureBuffer(),
+                                   sim.FlowMeasureWritten());
     if (doCopy) {
       world.EncodeDirtyCopy(enc, sim.DirtyNext());
     } else {

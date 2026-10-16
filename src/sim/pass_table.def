@@ -625,8 +625,10 @@ PASS(ca1, "ca(54 color x substep)", PT_TICK, PIPE_STEP1, K_INDIRECT, IND_CAARGS,
 // Recorded while anything may have added (the CA ran, or the fluid seam ran
 // last tick) and for kFlowMeasTailTicks after, while the field decays; the
 // tick after the tail, the clear row zeroes STATE + GRID and nothing records
-// again until something moves (rule 2). Render-only output: the raymarch,
-// the arrow overlay and the current tracers read GRID, and the sim never does.
+// again until something moves (rule 2). The raymarch, the arrow overlay and
+// the current tracers read GRID; no GPU sim kernel does. The snapshot ring
+// copies it (World::EncodeReadbacks, a tracked copy after this row) for the
+// bodies the water carries, which is why the fold is integer.
 PASS(flowMeasFold, "flowMeasure", PT_TICK, PIPE_FLOWMEAS_FOLD, K_COMPUTE, kFlowMeasFoldGroups,kFlowMeasFoldGroups,1,
      GRP_SIM, DYN_ZERO, C_FLOWMEAS, 1,
      USES(U(TickUBO) RW(FlowMeasure)))

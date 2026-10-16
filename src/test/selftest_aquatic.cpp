@@ -43,6 +43,7 @@
 #include "game/mob.h"
 #include "gpu/rhi.h"
 #include "sim/currentprim.h"
+#include "sim/flowfield.h"
 #include "sim/tuning.h"
 #include "sim/worldgen_run.h"
 #include "test/selftest.h"
@@ -61,6 +62,44 @@ uint32_t MatIdOf(Ctx& c, const char* n) {
 }
 
 Vec3 CentreOf(const Mob& m) { return m.Origin() + m.Def()->worldSize * 0.5f; }
+
+// THE POOL GOES IN STILL (2026-10-15). Every fixture here builds its pool as
+// one cell-op list, and a tick takes at most kMaxCellOpsPerTick, so the list
+// goes in over several ticks. Stamped in its x-major order, a pool filled
+// slab by slab against unstamped ground, and npc-swim measured ~9,500 MPM
+// particles still sloshing at up to 1.6 m/s when its first body went in.
+// Nothing that moved a body read that motion until the measured flow began to
+// carry swimmers (DESIGN.md §9d.12); since then a fixture whose claims are
+// about still water has to BE still. So: every non-water cell first (walls,
+// bed, air, in 60,000-op slices), then the water, in ONE tick when it fits --
+// full cells, all at once, into a basin its walls already enclose, leave
+// nothing to move. A pool too big for one tick still goes in last, sliced.
+//
+// npc-swim and loose-carrion: the two gates with a LIVE walker afloat in the
+// pool (npc-swim's swimmers; loose-carrion's dummy, afloat for 40 ticks before
+// its head comes off), whose drift in the churn moved what they measure. The
+// other pools in this file still go in sliced and churn, and one claim has
+// come to rest on that: aquatic's D (the stranded piranha) got back in at
+// tick 64 in the churn and, in a still pool, flopped 51 times without leaving
+// its ledge (measured 2026-10-15). Converting them is a change to those gates,
+// with that finding, not part of this one.
+void StampPoolStill(support::TickRig& rig, std::vector<CellOp>& pool, uint32_t water) {
+  const uint32_t wm = water & 0xFFFu;
+  const auto mid = std::stable_partition(pool.begin(), pool.end(), [&](const CellOp& op) {
+    return wm == 0u || (op.word & 0xFFFu) != wm;
+  });
+  const size_t firstWater = (size_t)(mid - pool.begin());
+  auto stamp = [&](size_t from, size_t to, size_t slice) {
+    for (size_t off = from; off < to; off += slice) {
+      const size_t n = std::min(slice, to - off);
+      support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) {
+        o.cells.assign(pool.begin() + (ptrdiff_t)off, pool.begin() + (ptrdiff_t)(off + n));
+      });
+    }
+  };
+  stamp(0, firstWater, 60000);
+  stamp(firstWater, pool.size(), (size_t)kMaxCellOpsPerTick);
+}
 
 // THE SITE: dry ground, chosen off the GPU's own voxels, for a pool of
 // half-width `R` dug `kDepth` below the lowest ground (gates `aquatic` and
@@ -190,12 +229,7 @@ Status GateLooseCarrion(Ctx& c, std::string& detail) {
                         PackVoxNew(y <= hMax ? mStone : 0u, 0u)});
       }
   support::TickRig rig(c, 74000u, IVec3{site.x >> 4, waterTop >> 4, site.z >> 4});
-  for (size_t off = 0; off < pool.size(); off += 60000) {
-    const size_t n = std::min<size_t>(60000, pool.size() - off);
-    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) {
-      o.cells.assign(pool.begin() + (ptrdiff_t)off, pool.begin() + (ptrdiff_t)(off + n));
-    });
-  }
+  StampPoolStill(rig, pool, mWater);
   support::RunTicks(rig, 30);
 
   const Vec3 poolC{(float)site.x + 0.5f, (float)bedY + 1.0f, (float)site.z + 0.5f};
@@ -1312,12 +1346,7 @@ Status GateNpcSwim(Ctx& c, std::string& detail) {
       }
     }
   support::TickRig rig(c, 75000u, IVec3{site.x >> 4, waterTop >> 4, site.z >> 4});
-  for (size_t off = 0; off < pool.size(); off += 60000) {
-    const size_t n = std::min<size_t>(60000, pool.size() - off);
-    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) {
-      o.cells.assign(pool.begin() + (ptrdiff_t)off, pool.begin() + (ptrdiff_t)(off + n));
-    });
-  }
+  StampPoolStill(rig, pool, mWater);
   support::RunTicks(rig, 30);
 
   const Vec3 hs = mobs.Defs()[dHuman].worldSize;
@@ -1336,6 +1365,18 @@ Status GateNpcSwim(Ctx& c, std::string& detail) {
                         3.0f, 17.0f, false);
   };
 
+  // The water before any body is in it (the attribution below's control):
+  // live MPM particles and the published measured flow's fastest pool node.
+  const uint32_t preFluid = c.world.Snap().fluidLive;
+  float prePoolMax = 0.0f;
+  for (int x = site.x - R + 2; x <= site.x + R - 2; x += 4)
+    for (int z = site.z - R + 2; z <= site.z + R - 2; z += 4) {
+      const Vec3 v = flowfield::SampleMeasuredSpan(
+          flowfield::PublishedMeasured(), Vec3{(float)x, (float)waterTop, (float)z},
+          (float)bedY, (float)surfY);
+      prePoolMax = std::max(prePoolMax, std::sqrt(v.x * v.x + v.z * v.z));
+    }
+
   // ======== A. IT FLOATS =====================================================
   const float floatTol = (float)BaselineNumber("npcSwimFloatTol", 2.5);
   parkPlayer();
@@ -1351,6 +1392,52 @@ Status GateNpcSwim(Ctx& c, std::string& detail) {
   }
   const bool aOk = a != 0 && aSwim && std::fabs(aY - floatY) <= floatTol && aPose &&
                    aTread >= 0.5f;
+  // WHAT THE WATER IS DOING AT THE BODY (rule 6): the MEASURED flow it feels
+  // (the published snapshot's grid over its submerged span, flowfield.h) and
+  // the whole field it is carried by (CurrentAtCpuSim, what AfloatCurrent
+  // reads), plus the pool's fastest measured node -- so a tread that fails
+  // names the water it was treading in.
+  auto feel = [&](uint64_t id, Vec3& meas, Vec3& cur) {
+    meas = cur = Vec3{0, 0, 0};
+    const Mob* m = mobs.FindMobById(id);
+    if (m == nullptr) return;
+    const Vec3 o = m->Origin();
+    const Vec3 ctr{o.x + hs.x * 0.5f, o.y + hs.y * 0.5f, o.z + hs.z * 0.5f};
+    const float wetHi = std::max(o.y, std::min(o.y + hs.y, (float)surfY));
+    meas = flowfield::SampleMeasuredSpan(flowfield::PublishedMeasured(), ctr, o.y, wetHi);
+    cur = CurrentAtCpuSim(ctr, o.y, wetHi);
+  };
+  auto poolMeasMax = [&]() {
+    float best = 0.0f;
+    for (int x = site.x - R + 2; x <= site.x + R - 2; x += 4)
+      for (int z = site.z - R + 2; z <= site.z + R - 2; z += 4) {
+        const Vec3 v = flowfield::SampleMeasuredSpan(
+            flowfield::PublishedMeasured(), Vec3{(float)x, (float)waterTop, (float)z},
+            (float)bedY, (float)surfY);
+        best = std::max(best, std::sqrt(v.x * v.x + v.z * v.z));
+      }
+    return best;
+  };
+  // ...and WHO is moving the water: the live MPM particles (each adds its
+  // velocity to the record every tick) and the pool's awake CA chunks (each
+  // lateral liquid move adds to it). A still pool has neither.
+  auto poolAwake = [&]() {
+    c.ctx.WaitIdle();
+    std::vector<uint32_t> flags(kNumSlots, 0u);
+    rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.DirtyActive(), 0, flags.data(),
+                          (size_t)kNumSlots * 4, "npcSwimAwake");
+    int n = 0;
+    for (int qz = (site.z - R) >> 4; qz <= (site.z + R) >> 4; qz++)
+      for (int qy = bedY >> 4; qy <= surfY >> 4; qy++)
+        for (int qx = (site.x - R) >> 4; qx <= (site.x + R) >> 4; qx++)
+          if (flags[World::SlotChunkIndex({qx, qy, qz})] != 0u) n++;
+    return n;
+  };
+  Vec3 aMeas{}, aCur{};
+  feel(a, aMeas, aCur);
+  const float aPoolMax = poolMeasMax();
+  const uint32_t aFluid = c.world.Snap().fluidLive;
+  const int aAwake = poolAwake();
 
   // ======== D. THE RIVER CARRIES IT (2026-10-14) ============================
   // The same floating dummy, a +x stream switched on through the pool. It has
@@ -1378,6 +1465,8 @@ Status GateNpcSwim(Ctx& c, std::string& detail) {
     dSwim = m->Swimming();
     dTread = m->Pose().swimW[0];
   }
+  Vec3 dMeas{}, dCur{};
+  feel(a, dMeas, dCur);
   CurrentPrims().Clear();
   const bool dOk = aOk && dSwim && dDrift >= 2.0f && dTread >= 0.5f;
 
@@ -1408,6 +1497,11 @@ Status GateNpcSwim(Ctx& c, std::string& detail) {
     }
   }
   const bool bOk = b != 0 && swamB > 0 && crawlPeak >= 0.5f && outAt >= 0;
+  Vec3 bMeas{}, bCur{};
+  feel(b, bMeas, bCur);
+  const float bPoolMax = poolMeasMax();
+  const uint32_t bFluid = c.world.Snap().fluidLive;
+  const int bAwake = poolAwake();
 
   // ======== C. IT DIVES ======================================================
   mobs.Reset();
@@ -1446,11 +1540,17 @@ Status GateNpcSwim(Ctx& c, std::string& detail) {
       "swimming (%d with a target), crawl peak %.2f, out on the bank at tick %d of %d "
       "(got to x %+.1f of the bank) | C dives %s: %d ticks swimming, %d with the head under (lowest %+.1f "
       "vs the waterline), stroke pitch peak %.2f rad (min %.2f) | D carried %s: drift %+.1f "
-      "in 60 ticks, swimming %d, tread %.2f",
+      "in 60 ticks, swimming %d, tread %.2f | the water at the body, cells/s (measured / "
+      "whole field): before any body: pool max %.2f (%u MPM particles); A (%.2f, %.2f) / "
+      "(%.2f, %.2f), pool max %.2f (%u MPM particles, %d awake pool chunks); D (%.2f, %.2f) / (%.2f, %.2f); B (%.2f, %.2f) / (%.2f, %.2f), pool "
+      "max %.2f (%u MPM particles, %d awake pool chunks)",
       siteWhy.c_str(), H, bedY, surfY, aOk ? "PASS" : "FAIL", (int)aSwim, aY, floatY,
       floatTol, (int)aPose, aTread, bOk ? "PASS" : "FAIL", swamB, targetedB, crawlPeak, outAt, kOut,
       bestX - (float)(site.x + R - 1), cOk ? "PASS" : "FAIL", swamC, underC, headLow,
-      pitchPeak, pitchMin, dOk ? "PASS" : "FAIL", dDrift, (int)dSwim, dTread);
+      pitchPeak, pitchMin, dOk ? "PASS" : "FAIL", dDrift, (int)dSwim, dTread, prePoolMax,
+      preFluid, aMeas.x,
+      aMeas.z, aCur.x, aCur.z, aPoolMax, aFluid, aAwake, dMeas.x, dMeas.z, dCur.x, dCur.z,
+      bMeas.x, bMeas.z, bCur.x, bCur.z, bPoolMax, bFluid, bAwake);
   return aOk && bOk && cOk && dOk ? Status::Pass : Status::Fail;
 }
 
