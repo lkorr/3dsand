@@ -27176,6 +27176,30 @@ starts at the RENDER eye, with a hit counting only if the point it lands on is
 within reach of the head. It is the one ray that reads the camera: a UI query
 against Jolt bodies, not a sim input, so the "picking rays use `player.EyePos`
 so the camera cannot change what the sim sees" contract does not apply to it.
+
+**It is a cone, not a ray (2026-10-16, owner ticket 2026-10-16_11-00-17:
+"picking up items isn't reduced to pixel perfect clicks").** A sword lying flat
+is a voxel tall and an arrow in the ground a voxel wide; a ray had to touch
+them exactly, and in FIRST person it started at `player.EyePos()` while the
+reticle's picture is drawn from the head-tracked render eye, so it did not even
+run through the screen centre. Now the query starts at last frame's render eye
+in every camera mode (`pourFrom`, the vessel pour's origin) and
+`game/lookpick.h` decides: every ground item and every arrow embedded in a
+creature this machine owns is a candidate; its angle is that of the nearest
+point of its own posed collider box to the centre ray (0 if the ray passes
+through it); it counts within `player.pickConeDeg` (6°), or
+`player.pickConeSmallDeg` (10°) when the box's middle extent is under
+`player.pickSmallSize` voxels (an arrow, a blade lying flat); smallest angle
+wins, distance breaking near-ties; and the best is taken only if one of three
+points on it (nearest the ray, centre, top) can be seen — no Solid cell
+(vegetation and liquid do not block) and no other body in the way, the arrow's
+own host excepted — else the next. The bare ray's body still competes when G
+acts on it and it is not a pickable (a corpse with loot), at 1.5° rather than
+0, so the corpse under the reticle beats a sword beside it but an arrow
+standing out of it is the arrow. With nothing in the cone `lookBody` is the
+bare ray's body, as before (the grab, a looted-out corpse). The prompt and the
+tap both read `lookBody`: one decision per frame. Gate `look-pick`.
+
 E over a corpse opens the
 character screen with a LOOT panel in the SPELLBOOK's place (looting is a
 moment; the words are not going anywhere, and a fourth column would not fit on

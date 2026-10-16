@@ -74,7 +74,10 @@
     "grabStiffness": 9,
     "grabCarrySpeed": 9,
     "grabBreakDistance": 2.5,
-    "grabSpinDamp": 0.8
+    "grabSpinDamp": 0.8,
+    "pickConeDeg": 6,
+    "pickConeSmallDeg": 10,
+    "pickSmallSize": 3
   },
   "camera": {
     "mouseSensitivity": 0.0022,
