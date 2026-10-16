@@ -147,6 +147,10 @@ const std::vector<Gate>& DistantLookGates();
 const std::vector<Gate>& DistantCalibGates();
 // The distant tier walks and sleeps (selftest_distant.cpp, PLAN_distant_npcs D1).
 const std::vector<Gate>& DistantGates();
+// The distant tier's life past the window: activation of parked records,
+// schedules walked at distance, saves that keep distant damage
+// (selftest_distant_life.cpp, PLAN_distant_npcs D5+D6).
+const std::vector<Gate>& DistantLifeGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -743,6 +747,15 @@ const char* const kOrder[] = {
     // home (its near fight bleeds on the window's ground). It never moves the
     // window; it ticks THE tick with parking bound, from two fresh worlds.
     "distant-edge",
+    // THE DISTANT TIER'S LIFE PAST THE WINDOW (docs/PLAN_distant_npcs.md
+    // D5+D6). After `distant-edge` for the same exit contract plus their own:
+    // tuning, the minute override, the residents and the id counter restored,
+    // mobs / debris / tier reset, the park function and the placer removed,
+    // the store cleared, scratch dirs deleted, the window back home and
+    // worldgen regenerated there (`distant-schedule` teleports it away and
+    // back; `distant-save` saves and loads a world dir).
+    "distant-schedule",
+    "distant-save",
     // MOBS v6 (PLAN_corpse_is_a_mob P2a). After `mob-park` for the same exit
     // contract: mobs, debris and risings reset, id counter restored, park
     // function removed, store cleared, worldgen regenerated at home.
@@ -1522,7 +1535,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(), &ItemStageGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &DungeonEntityGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates(), &StaggerGates(), &DistantLookGates(), &DistantCalibGates(), &DistantGates()})
+                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &DungeonEntityGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates(), &StaggerGates(), &DistantLookGates(), &DistantCalibGates(), &DistantGates(), &DistantLifeGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;
@@ -1895,7 +1908,23 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << ", \"edgeArrowsOutResolved\": " << ds.edgeArrowsOutResolved
       << ", \"edgeArrowsOutLost\": " << ds.edgeArrowsOutLost
       << ", \"flipWaits\": " << ds.flipWaits << ", \"flips\": " << ds.flips
-      << ", \"playerActorsSeen\": " << ds.playerActorsSeen << "},\n";
+      << ", \"playerActorsSeen\": " << ds.playerActorsSeen
+      // D5+D6: ACTIVATION (parked -> distant) -- scans run, records made
+      // distant (corpses, v12 upgrades), the waits by cause, the records left
+      // parked or dropped as duplicates -- and the schedules at distance.
+      << ", \"activateScans\": " << ds.activateScans << ", \"activated\": " << ds.activated
+      << ", \"activatedDead\": " << ds.activatedDead
+      << ", \"activateRecordsSeen\": " << ds.activateRecordsSeen
+      << ", \"activateBudgetWaits\": " << ds.activateBudgetWaits
+      << ", \"activateRoomWaits\": " << ds.activateRoomWaits
+      << ", \"activateDefWaits\": " << ds.activateDefWaits
+      << ", \"activateKept\": " << ds.activateKept
+      << ", \"activateDropped\": " << ds.activateDropped
+      << ", \"activateUpgraded\": " << ds.activateUpgraded
+      << ", \"scheduleSteps\": " << ds.scheduleSteps
+      << ", \"scheduleWakes\": " << ds.scheduleWakes
+      << ", \"scheduleHolds\": " << ds.scheduleHolds
+      << ", \"promoteCatchUps\": " << ds.promoteCatchUps << "},\n";
   }
   // ---- THE DISTANT STATUES (game/distant_draw.h, PLAN_distant_npcs D4a) ---
   // What every DistantDraw in the run did: drawn / culled / starved for want

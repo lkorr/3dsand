@@ -13587,9 +13587,13 @@ Status GateDistantRoundtrip(Ctx& c, std::string& detail) {
     else if (whyA.empty())
       whyA = Format("creature %zu classified %s", k, DistantGroundModeName(d->groundMode));
     // The overlay patches the record into its own bytes (DemoteToDistant's
-    // proof, re-asked from outside).
+    // proof, re-asked from outside). The RECORD-HELD fields: since D5+D6 the
+    // overlay also carries the statuses (a creature that left bleeding --
+    // [2], carved -- writes them into the v13 tail), which a near SaveOne
+    // never wrote, so they are left out of this identity, as the demotion's
+    // own probe leaves them out.
     std::vector<uint8_t> patched;
-    if (c.mobs.DistantRecord(*d, patched) && patched == d->record) aPatch++;
+    if (c.mobs.DistantRecord(*d, patched, /*withStatus=*/false) && patched == d->record) aPatch++;
   }
   const DistantMobs::Stats st1 = tier.GetStats();
   const bool okA =

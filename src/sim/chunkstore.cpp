@@ -1,5 +1,6 @@
 #include "sim/chunkstore.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -573,6 +574,7 @@ bool ChunkStore::BindSave(const std::string& dir) {
   dir_ = dir;
   tables_.Bind(dir);  // every table file was just wiped with the rest
   absentRegions_.clear();
+  entityEpoch_++;     // the disk half changed under any reader's index
   for (auto& [key, r] : regions_) {
     r.dirty = true;
     r.loaded = true;  // nothing on disk to merge anymore
@@ -683,6 +685,37 @@ void ChunkStore::EntityRegionsKnown(std::vector<IVec3>& out) const {
   for (const auto& [key, e] : entityRegions_) out.push_back(e.rc);
 }
 
+void ChunkStore::EntityRegionsAny(std::vector<IVec3>& out) {
+  out.clear();
+  // The disk, once per epoch: every r_<x>_<y>_<z>.sve under the bound dir.
+  if (entityDiskFor_ != entityEpoch_) {
+    entityDiskFor_ = entityEpoch_;
+    entityDisk_.clear();
+    if (!dir_.empty()) {
+      std::error_code ec;
+      for (const auto& de : fs::directory_iterator(dir_, ec)) {
+        const std::string name = de.path().filename().string();
+        if (name.rfind("r_", 0) != 0 || de.path().extension() != ".sve") continue;
+        IVec3 rc{};
+        if (std::sscanf(name.c_str(), "r_%d_%d_%d.sve", &rc.x, &rc.y, &rc.z) == 3)
+          entityDisk_.push_back(rc);
+      }
+    }
+  }
+  out = entityDisk_;
+  for (const auto& [key, e] : entityRegions_) out.push_back(e.rc);
+  std::sort(out.begin(), out.end(), [](const IVec3& a, const IVec3& b) {
+    if (a.z != b.z) return a.z < b.z;
+    if (a.y != b.y) return a.y < b.y;
+    return a.x < b.x;
+  });
+  out.erase(std::unique(out.begin(), out.end(),
+                        [](const IVec3& a, const IVec3& b) {
+                          return a.x == b.x && a.y == b.y && a.z == b.z;
+                        }),
+            out.end());
+}
+
 // An unreadable bucket (EntityRegion::unreadable) is renamed to the first
 // free `<path>.corrupt[N]` before a write or a delete would take its place.
 // False only if the rename itself failed -- then the caller must not write
@@ -790,6 +823,7 @@ bool ChunkStore::WriteEntityRegion(IVec3 rc,
 
 void ChunkStore::RemoveAllEntityFiles() {
   entityRegions_.clear();
+  entityEpoch_++;
   if (dir_.empty()) return;
   std::error_code ec;
   for (const auto& de : fs::directory_iterator(dir_, ec)) {
@@ -805,6 +839,7 @@ bool ChunkStore::BindLoad(const std::string& dir) {
   if (!fs::is_directory(dir, ec)) return false;
   regions_.clear();  // the disk's copy wins wholesale
   entityRegions_.clear();
+  entityEpoch_++;
   absentRegions_.clear();
   chunkCount_ = 0;
   dir_ = dir;

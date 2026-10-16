@@ -619,13 +619,12 @@ std::string DistantCalibToJson(const DistantCalib& c) {
 // The kit, from a live creature
 // =============================================================================
 
-namespace {
-
 // Authored impact timing of a style: every frame before the first cutting
 // frame (the windup, with BeginStrokeProgram's two-tick floor), then half the
 // cut -- the moment the blade crosses the aim. No tempo jitter: a distant
-// stroke lands on the authored beat.
-void StyleTiming(const AttackStyle& sty, int& impact, int& total) {
+// stroke lands on the authored beat. (Public since D5+D6: the activation
+// builds a kit from a record, game/distant.cpp.)
+void StyleTimingOf(const AttackStyle& sty, int& impact, int& total) {
   int windup = 0, cut = 0, all = 0;
   const int first = sty.FirstCut(), last = sty.LastCut();
   if (!sty.frames.empty()) {
@@ -645,6 +644,8 @@ void StyleTiming(const AttackStyle& sty, int& impact, int& total) {
   impact = std::max(1, windup + cut / 2);
   total = std::max(impact, all + std::max(1, sty.release));
 }
+
+namespace {
 
 // The non-shield item in fist `h`, or null.
 const ItemDef* HeldWeapon(const Mob& m, Hand h, const ItemLibrary* items) {
@@ -723,7 +724,7 @@ DistantKit BuildDistantKit(const Mob& m, const ItemLibrary* items, bool withBody
       ds.fallback = sty->fallback;
       ds.reach = StyleReachOn(m, *sty);
       const AttackStyle* played = lib.At(ds.form);
-      StyleTiming(played != nullptr ? *played : *sty, ds.impactTicks, ds.totalTicks);
+      StyleTimingOf(played != nullptr ? *played : *sty, ds.impactTicks, ds.totalTicks);
       const bool held = sty->weapon.empty() || sty->weapon == "held";
       ds.held = held;
       const MobNaturalWeaponDef* nw = nullptr;

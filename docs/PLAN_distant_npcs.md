@@ -1,7 +1,8 @@
 # PLAN: distant NPCs — creatures that keep living past the residency window
 
 Status: **D0-D3 DONE on `distant-npcs` (2026-10-15): the tier is ON by
-default; D5+D6, D8, D9 next (§6 D3 has what each must know).**
+default. D5+D6 DONE on `dnpc-d56` (2026-10-16): activation, schedules at
+distance, MOBS v13. D8, D9 next (§6 D3 and D5+D6 have what each must know).**
 PLANNED 2026-10-13. AUDITED AND AMENDED 2026-10-15 (§7 lists the
 twelve corrections; they are written into the sections below, so the body is
 the truth and §7 is the changelog). Owner decisions §5 are RESOLVED. Execution
@@ -758,8 +759,8 @@ the window. Thresholds go in `tests/baseline.json` (`BaselineNumber` /
 | `distant-calibrate` | D2b | ASYMMETRIC matchups (armoured vs unarmoured, mace vs plate, 4v3, sword vs zombie, archer vs melee), K seeds each at distance against the table's full-fidelity rows: each side's win rate within `distantWinRateTol` (or 2 standard errors of the difference), mean time-to-kill ratio inside `distantTtkRatioMin..Max` (±25%, or within 2 standard errors of the full-fidelity mean) where full fidelity decided, and each side's hp left within `distantHpLeftTol`; a matchup listed in `distantCalibrate.knownDivergent` is measured and printed, not asserted (§6 D2b) |
 | `distant-edge` | D3 | near vs distant melee pair across the edge: both take damage, the near wound is real (lattice changed, blood op emitted); a distant archer's arrow enters the window as an `ArrowFlight` and hits; a creature pacing the edge flips tier ≤ `distantMaxFlips` per 600 ticks |
 | `distant-look` | D4a | a distant creature at 40 m covers > N pixels in a shot; render-only slots never exceed the free budget; the near crowd never loses a slot; baked pose words stay under `kDistantPoseWordsMax` and the words per pose are recorded |
-| `distant-schedule` | D5 | a parked villager inside the radius activates, walks its schedule while distant, promotes at its scheduled place |
-| `distant-save` | D5+D6 | save with K distant creatures → load → the same K exist (activated), every limb's hp preserved |
+| `distant-schedule` | D5 | a parked villager inside the radius activates, walks its schedule while distant (ref dormant), sleeps at its anchor, promotes at its scheduled place where it walked (no catch-up); a never-moved one takes the catch-up placer; twice-run identical |
+| `distant-save` | D5+D6 | save with K distant creatures (one maimed + bleeding at distance, one burning, one armoured, a corpse) → load → one Unpark → the same K exist (activated), every limb's hp, sever, bleed, burn, stump and hand preserved; the maimed record loaded near keeps its sever and re-bleeds; a v12 record upgrades to v13 |
 | `distant-calib-matrix` | D2a | the duel matrix runs at full fidelity and logs every stroke STARTED with its outcome; under `SANDVOX_DISTANT_CALIB` it writes the tables; the resolver's unit arm (synthetic kits) is twice-run identical and its hit rate / mean hp over 10k rolls match the table it was given |
 | `distant-overflow` | D8 | 64 near + N distant with the cap full: the farthest near creature past `overflowMinDistVox` demotes and the nearest distant one promotes; never more than 64 living near; no player in any distant actor list; twice-run digest equal |
 | `distant-arrow` | D9 | a player arrow loosed at a distant creature past the edge resolves through the ranged branch at the computed flight time; a miss lands on `DistantGround`; twice-run identical |
@@ -1699,6 +1700,171 @@ statue. A distant `Blocked` on a near shield does no item wear. The published
 band's cost was not measured on its own (a walk of at most 128 members a
 tick, the tier only when somebody moved). Ghosts (MP) are in the near band
 but a distant blow on one is counted as no target (owned elsewhere) -- D7.
+
+### D5+D6 (branch `dnpc-d56`): activation, schedules and load
+
+**What landed.** Parked creatures inside the radius come back as distant ones,
+distant villagers walk their days, and what happens at distance survives a
+retire and a save.
+
+- **Activation** (`MobSystem::ActivateParked`, distant.cpp; one call at the top
+  of `EntityParking::Unpark`, so it runs in phase H in the same place and order
+  as promotion and unparking). A dormant `'MOBS'` record BEYOND THE PARK PAD
+  (more than 16 voxels outside the window box: where a leaving creature would
+  demote, not the band a parked record waits in) and within `distant.radius`
+  of the window centre (the record's origin) becomes a `DistantMob`: a fresh id
+  (`nextId_++` in service order; records carry none), the record kept as the
+  bridge, built by `MobSystem::DistantFromRecord` (below), then held to the
+  same identity proof a demotion is (the record patched with the overlay just
+  built must give back its own bytes, statuses included) and inserted awake (a
+  corpse asleep). Served NEAREST FIRST (squared distance to the window centre),
+  ties by region (the sorted region list) then record order; at most
+  `kActivatePerCall` (12) a call, at most `kActivateDefBuildsPerCall` (1) whose
+  def must be built (a pool body reads files); never the tier's last
+  `kActivateReserve` (64) slots -- the near crowd's, whose creatures hold an
+  identity and a mind a record has already lost.
+- **Bounded (rule 2).** A scan runs only when the window moved, the store's
+  new `EntityEpoch()` moved (Clear / Unbind / BindLoad / BindSave /
+  RemoveAllEntityFiles: a LOAD), this system parked something since
+  (`parkedTotal_`), the radius changed, the last call left work (budget, a def
+  build), room freed after a scan that ran out of it, or every
+  `kActivateStrideTicks` (600) as a backstop. It walks only the regions the
+  store knows inside the radius's box: `ChunkStore::EntityRegionsAny` = the RAM
+  buckets plus the `r_*.sve` files under the bound dir, listed ONCE per epoch
+  (a 128 m radius spans ~1,300 regions; probing each file to learn it is absent
+  is what this avoids). Measured over the whole verify run (14 gates): 18 scans.
+- **Load = activation, no special path.** After `LoadWorld` the records outside
+  the window are dormant (as before); the epoch moved, so the next Unpark scans
+  and brings them back as distant. `distant-save` proves it with one Unpark.
+- **Schedules at distance** (`world/refs_npc.cpp`). `StepResident` became
+  `StepResidentBody` over a `ResidentBody` view (id, near Mob or null, foot,
+  brain): ONE resident step for both tiers, one `Resident` per ref (the mob id
+  survives the edge, so a villager mid-route keeps its route across it). A
+  distant body opens no door (`DoorWait` becomes `Travel`, a leg's
+  `doorBefore` is skipped -- DistantGround has no doors), strikes no pose
+  (`SetActivity` is a rig's), and `CheckCloseBehind` waits for a near body.
+  `StepDistantResidents` (the npc kind's tick, after the near loop) steps every
+  living distant creature carrying an npc ref, in the tier's id order, ref
+  dormant or not; at its anchor it HOLDS (`routine.hold`), so the tier's sleep
+  test sleeps it; a patrol's pause sets `SetDistantRoutineClock` (a new
+  `DistantMob::routineWakeTick` the sleep test honours); a SLEEPER is woken
+  (`WakeDistant`) only when the schedule clock reaches a new minute and its row
+  index (or the refs / schedules revision) changed. Awake ones are stepped on
+  the tier's idle stride (every tick when engaged), the tick the tier thinks
+  with the routine. With everything asleep and the minute unchanged the pass
+  is three compares.
+- **Promotion: catch-up only for the never-moved.** `PromoteDistant` passes
+  `catchUp = !movedWhileDistant`; counted when the placer moved it
+  (`promoteCatchUps`). `npc-catchup` (switch pinned off, the parked record's
+  path) passes unchanged.
+- **Persistence: MOBS v13** (`kSaveVersion` 12 -> 13; 12 loads). A STATUS TAIL
+  as every record's LAST field: u32 flag, then (flag 1) bleed rate f32, last
+  wound i32, burn ticks u32, burnt fraction f32, open stumps u32. Only the tier
+  writes a 1 (`PatchMobRecord` from the overlay, which gained `limbAttached`
+  and the five statuses); a near `SaveOne` writes 0. Limbs severed at distance
+  need no field: `PatchMobRecord` rewrites a base limb the overlay calls
+  detached as `kLimbSevered` (its lattice block dropped -- the form a maimed
+  near creature saves in; a severed limb overlaid attached is refused).
+  `LoadOne` applies a set tail to the living (`ApplyRecordStatus`: the owed
+  blood through `Mob::ReopenOwedBlood` -- D2b's block, lifted out of
+  `ApplyDistantOverlay` -- and the trunk re-lit through `RelightTrunk`, lifted
+  out of `PromoteDistant`). A parked v12 record activates too: the tail is the
+  last field, so v12 + a 0 flag IS v13 (`UpgradeRecordToCurrent`, proven by a
+  parse). The parking / save consumers all name `kSaveVersion`, so the bump
+  moved them together.
+
+**Deviations and decisions.**
+1. **The status tail is applied by `LoadOne`, for promotions too.** D2b
+   re-opened the bleed in `ApplyDistantOverlay` and re-lit in `PromoteDistant`
+   from the `DistantMob`; now the promotion's patched record carries them and
+   the ONE door (`LoadOne`) applies them for a promotion, an unpark of a
+   retired creature and a load. `relit` / `rebled` now count all three.
+2. **Severs at promotion take the record path.** D2b cut limbs lost at
+   distance off "for real" at promotion (`Sever`: the limb dropped as debris at
+   the PROMOTION spot, a gout, `DrainBlood` billing hp a second time). Now the
+   patched record says `kLimbSevered` and the load detaches it (stump reopened,
+   nothing dropped, no second bill) -- the arm came off far away.
+   `ApplyDistantOverlay`'s sever pass stays as a safety net and finds nothing.
+   A held item in a hand the record severed (its gear still lists it) is
+   unequipped at the end of `OverlayMobRecord` (a near record never lists one:
+   `CaptureGear` skips a bodyless held slot).
+3. **The demotion's identity probe leaves the statuses out** (a near SaveOne
+   writes no status; the overlay now carries what `CaptureDistantVitals`
+   read). `DistantRecord(d, out, withStatus)`; `distant-roundtrip` A's patch
+   check asks `withStatus = false` -- the record-held fields, D0's claim.
+4. **Activation is NOT a tier flip.** The thrash bound is about the window's
+   edge (near <-> distant); a parked <-> distant cycle needs the window to move
+   a whole hysteresis (256), and counting it would make an activated creature's
+   first promotion wait.
+5. **Corpses activate too**, as dead statues (cheap: no kit, asleep forever),
+   resting on their lowest attached limb's transform. A player's corpse stays
+   parked (its id band is LoadOne's to renumber).
+6. **The record-built kit** (`DistantFromRecord`; what is exact and what is
+   approximated is listed at the top of the activation code in distant.cpp).
+   Exact: hp, severs, roles, vitality, the brain's five facts, statuses, what
+   each hand holds, the quiver's arrows, the def's terrain budgets
+   (`Mob::TerrainBudgetsOf` / `RestLegSpanOf`, lifted out of `BuildRig`),
+   natural weapons' usability (`Mob::ChainForEffector`, now static and
+   public, over the def's skeleton). Approximated: REACH on the rest pose
+   (bones are rigid; the held-weapon term a quarter arm + the edge; the lunge
+   at lungeScale 1 through `MobSystem::LungeClosesVox`, lifted out of
+   `StyleReachOn`) -- measured 9.25 voxels for the duelist's sword style; the
+   SHELL hardness from the shell's stored lattice or the item's cover (no fit
+   resample); a GAUNTLET by its cover's limb; the STATUE is the def's bare look
+   (`DistantDraw::KeyOfDef`, baked on demand by the producer). The grip rule
+   (`ApplyGripRule`, lifted out of the impact pass) runs once on the result, so
+   a hand cut off at distance lets go of what the gear says it held.
+7. **Left parked** (counted `activateKept`): a record older than v12, one whose
+   material table needs a remap, a player's corpse, one whose def no longer
+   resolves or no longer fits it. Its unpark is the path that remaps and reads
+   old versions. A record whose ref already has a body in either tier is
+   DROPPED (`activateDropped`, logged: LoadOne's own rule).
+8. **At distance a villager stands at wander and socialize rows** (no milling
+   about the anchor, no turning to neighbours): what keeps a village 100 m
+   away asleep. Patrols still walk their routes.
+9. `MobSystem::MobRecord` moved from mob.cpp into mob.h (the activation reads
+   one in distant.cpp); `distant::StyleTimingOf` is public.
+10. Test seam `MobSystem::SeverDistantForTest` (the impact pass's own sever +
+    grip rule) for `distant-save`.
+
+**Measured** (`--verify distant-schedule, distant-save, distant-roundtrip,
+distant-walk, distant-fight, npc-catchup, refs-npc-identity, mob-park,
+mob-save-delta, corpse-save, mob-handoff, item-park, save-entities,
+save-material-remap`: all 14 PASS on the first run, 99.8 s).
+`distant-schedule` (2.0 s): two villagers parked ~90 m off with the switch off,
+both activated 1 tick after it went on, buckets emptied; V1 walked 59.8 voxels
+A -> B while distant (largest single-tick step 2.10, its ref dormant), arrived
+after 123 ticks and slept the same tick, 0 steps over the next 60; promoted
+1.94 voxels from B with x / z bit-identical to where it walked (the placer not
+asked); V2, never moved, promoted through the catch-up placer; twice-run
+digests equal (b025aefef4d7a681). `distant-save` (13.2 s, most of it the full
+flush below): 5 distant (a duelist; one with its sword hand cut off at distance
+and bleeding; one burning; one in iron armour; a corpse), 5 records saved; after
+the load ONE Unpark activated all 5 (1 dead), every one exact by (def, origin):
+every limb's hp bits, severs, bleed rate, burn ticks and fraction, stumps,
+last wound, hands, life, the duelist's style list; the maimed record loaded
+straight near keeps its sever and re-bleeds, the burning one re-lights; a v12
+record upgrades to the same v13 bytes. Run totals: 18 activation scans, 9
+activated, 1 room wait (distant-roundtrip F's cap of 2), 0 kept / dropped.
+`distant-fight` C on this tree: 851 us/tick for 128 engaged (non-exclusive).
+
+**Open.**
+- An activated creature draws as its def's bare statue (no gear, no damage)
+  until it is next demoted from a rig.
+- A weapon a hurt hand dropped at distance is back in the hand after a retire
+  or a save (the record keeps it -- D2b's own note); arrows loosed at distance
+  are back in the quiver the same way.
+- `distant-save` pays a FULL store flush (13 s): its fixture regenerates the
+  world without `Stream::OnRegen`; calling it first would make the save a
+  delta (distant-roundtrip's note).
+- Rule 2 has a witness (no steps while asleep, the activation scan count) but
+  no microsecond number for a sleeping village; `distant-sleep`'s 0.2 us a tick
+  covers the tier, and the refs pass is a few compares on the same ticks.
+- An active npc ref whose villager is distant pays `Distant().FindByRef` (a
+  walk of the tier) each tick in the near loop.
+- For D8: activation never fills the tier's last 64 slots, and an overflow
+  swap's demotion is a demotion (the reserve is for it). For D9: nothing here
+  touches arrows.
 
 ## 7. Audit 2026-10-15: what changed and why
 

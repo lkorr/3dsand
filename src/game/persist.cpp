@@ -1490,6 +1490,10 @@ uint32_t EntityParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
                             uint32_t tick, uint32_t budget) {
   stats_.lastCall = 0;
   if (!enabled_) return 0;
+  // PARKED -> DISTANT (D5+D6, MobSystem::ActivateParked): records beyond the
+  // park pad, inside distant.radius. Its own scan memory and budget; the
+  // records it takes are never the ones below (those are over the line).
+  mobs.ActivateParked(store, world, tick);
   const IVec3 wo = world.WindowOrigin();
   const bool moved = !haveOrigin_ || wo.x != lastOrigin_.x ||
                      wo.y != lastOrigin_.y || wo.z != lastOrigin_.z;

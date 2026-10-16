@@ -335,11 +335,37 @@ struct DistantOverlay {
   Vec3 worldSize{};
   // Per RECORD limb (DistantMob::limbHp), exactly MobLimb::hp.
   std::vector<float> limbHp;
+  // D5+D6: per RECORD limb, 1 = still attached (DistantMob::limbRole's
+  // kDistantLimbAttached). A base limb the record holds attached and this
+  // says is off was SEVERED AT DISTANCE: PatchMobRecord writes it
+  // kLimbSevered. Empty = keep the record's kinds.
+  std::vector<uint8_t> limbAttached;
   bool dead = false;
   std::string cause;     // the death cause BY NAME (Mob::DeathCause), "" alive
   uint64_t deathSeq = 0; // the death order; 0 = "youngest" on load
   std::string refId;     // Mob::RefId: the dungeon spawner renames a corpse's
+  // D5+D6: THE STATUSES (MOBS v13's tail, mob.h kSaveVersion): what a retire
+  // or a save carries so the creature is still bleeding and burning when it
+  // comes back, as a promotion always had it. All zero = no tail entry.
+  float bleedRate = 0.0f;       // DistantMob::bloodLossPerTick
+  int32_t bleedLimb = -1;       // DistantMob::lastWoundLimb
+  uint32_t burnTicksLeft = 0;   // DistantMob::burnTicksLeft
+  float burnFrac = 0.0f;        // DistantMob::burnFrac
+  uint32_t stumps = 0;          // DistantMob::stumps
+  void ClearStatuses() {
+    bleedRate = 0.0f;
+    bleedLimb = -1;
+    burnTicksLeft = 0;
+    burnFrac = 0.0f;
+    stumps = 0;
+  }
 };
+
+// A creature still burning when it comes back from the tier re-lights this
+// many voxels of its trunk (MobSystem::RelightTrunk, IgniteLimb) -- a foothold
+// the near burn pass then spreads by its own rules. Of the order of the
+// calibration's burn probe (60).
+constexpr uint32_t kDistantRelightVoxels = 40;
 
 // ---- one distant creature (§2.2) --------------------------------------------
 struct DistantMob {
@@ -509,6 +535,15 @@ struct DistantMob {
   // arrives AWAKE, so it decides once before it may sleep.
   bool asleep = true;
   uint32_t wakeTick = 0;
+  // D5: THE ROUTINE'S OWN CLOCK (MobSystem::SetDistantRoutineClock): the tick
+  // a villager's routine next changes by itself (a patrol's pause at a node
+  // ends). When it falls asleep HOLDING its routine it wakes then. A schedule
+  // ROW changing is the resident layer's to notice (it wakes the sleeper).
+  uint32_t routineWakeTick = 0;
+  // D5+D6: built by ACTIVATION from a parked record (MobSystem::
+  // ActivateParked), not demoted from a rig. Diagnostic; nothing branches on
+  // it but the counters.
+  bool activated = false;
 
   Vec3 Centre() const {
     return Vec3{origin.x + worldSize.x * 0.5f, origin.y + worldSize.y * 0.5f,
@@ -675,8 +710,11 @@ class DistantMobs {
     uint64_t sidearms = 0;         // an archer out of arrows drew its sidearm
     uint64_t bleedTicks = 0;       // creature-ticks of StepBleed
     uint64_t burnTicks = 0;        // creature-ticks of StepBurn
-    uint64_t relit = 0;            // promotions that came back burning (IgniteLimb)
-    uint64_t rebled = 0;           // promotions that came back bleeding
+    // Creatures that came back near still burning / bleeding: a promotion, and
+    // since D5+D6 an unpark or a load of a record whose v13 tail carries it
+    // (MobSystem::ApplyRecordStatus, inside LoadOne).
+    uint64_t relit = 0;            // ...re-lit on the trunk (IgniteLimb)
+    uint64_t rebled = 0;           // ...the owed blood re-opened
     uint64_t hpDealtMilli = 0;     // life hp the blows and arrows took, x1000
     // ---- D2b: WHERE THE TIME GOES (section 2.11), ns -- MEASUREMENTS, never an
     // input to anything. Inside TickDistant, summed over every call:
@@ -728,6 +766,23 @@ class DistantMobs {
     // section 2.7's "never a player", counted at the point the list is built
     // so a regression shows where it happens (`distant-edge` asserts it).
     uint64_t playerActorsSeen = 0;
+    // ---- D5+D6: ACTIVATION (parked -> distant, MobSystem::ActivateParked) ---
+    uint64_t activateScans = 0;    // scans actually run (rule 2's witness)
+    uint64_t activated = 0;        // parked records made distant creatures
+    uint64_t activatedDead = 0;    // ...of which corpses
+    uint64_t activateRecordsSeen = 0;  // candidate records looked at, summed over scans
+    uint64_t activateBudgetWaits = 0;  // a candidate left for the next call: the budget
+    uint64_t activateRoomWaits = 0;    // ...the tier's activation share was full
+    uint64_t activateDefWaits = 0;     // ...its def needed a build and this call's was spent
+    uint64_t activateKept = 0;     // left parked for good reason (old version, a remap,
+                                   // no def, a player's corpse, a body the def no longer fits)
+    uint64_t activateDropped = 0;  // dropped: its ref already has a body (LoadOne's rule)
+    uint64_t activateUpgraded = 0; // v12 records taken as v13 (UpgradeRecordToCurrent)
+    // ---- D5: schedules at distance (refs_npc.cpp's distant residents) -------
+    uint64_t scheduleSteps = 0;    // resident steps run for a distant villager
+    uint64_t scheduleWakes = 0;    // sleeping villagers woken by a row change
+    uint64_t scheduleHolds = 0;    // ...steps that left one holding at its anchor
+    uint64_t promoteCatchUps = 0;  // promotions that took the catch-up placement (never moved)
     uint32_t peak = 0;           // the most creatures the tier ever held at once
   };
 

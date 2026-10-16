@@ -308,7 +308,12 @@ bool ResumeWorldClock(uint32_t savedSimTick, uint32_t simTickNow);
 // nearest to the window centre first, under the same three waits and out of
 // the same budget, before any parked record is looked at. A distant creature
 // past radius + hysteresis RETIRES through the park function above as its
-// patched record. With the switch off none of that runs.
+// patched record. And a parked record the window does NOT hold -- beyond the
+// park pad, inside the radius -- is ACTIVATED (D5+D6, MobSystem::
+// ActivateParked, called first thing here with its own scan memory and
+// budget): it becomes a distant creature, so a village 80 m away lives before
+// you arrive and a save's parked creatures come back as distant ones after a
+// load. With the switch off none of that runs.
 //
 // IN THE TICK, NOT AFTER IT (§2.1, audit A12): the game's TickAuthority calls
 // Unpark in phase H, right before mobs.PreTick, through
@@ -321,6 +326,8 @@ bool ResumeWorldClock(uint32_t savedSimTick, uint32_t simTickNow);
 //
 // OUT OF SCOPE (follow-ups): parked creatures do not tick -- no off-screen
 // travel, hunger or schedule; they stand frozen where they left the window.
+// (With the distant tier on, a parked creature inside distant.radius does not
+// stay parked: it is activated, and as a distant creature it walks its day.)
 // Plain debris (rubble, a severed limb wearing nothing) is still destroyed by
 // the cull: it is the Noita rule, and only a group holding an item is kept.
 // Multiplayer: see Bind.

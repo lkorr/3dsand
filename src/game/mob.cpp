@@ -4119,6 +4119,11 @@ void MobSystem::Reset(bool rewindIds) {
   // Cleared BEFORE a `rewindIds` below can re-issue the ids they held.
   distant_.Clear();
   distantScanHave_ = false;
+  // ...and the activation's scan memory (D5+D6): whatever is parked now is
+  // looked at afresh by the next scan.
+  actHave_ = false;
+  actPending_ = false;
+  actRoomAt_ = SIZE_MAX;
   // ...its ground caches (the map or the store may be replaced next) and the
   // edge band's memory of near creatures that no longer exist.
   distantGround_.InvalidateAll();
@@ -5055,72 +5060,81 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
   // one rig and pushes another several voxels into the air. `rideHeight` is the
   // authored per-rig trim for exactly this residual — see the stance term in
   // UpdateGait — and it is already within a voxel on every current def.
-  {
-    float lowest = 0, hipOfLowest = 0, aheadOfLowest = 0;
-    bool any = false;
-    for (const IkChain& ch : def.skel.chains) {
-      if (ch.tag != "leg" || ch.parts.empty()) continue;
-      // Horizontal hip -> ankle offset in the rest pose, accumulated the same
-      // way the heights are.
-      float ax = 0, az = 0;
-      for (size_t k = 1; k < ch.parts.size(); k++) {
-        ax += def.skel.parts[ch.parts[k]].rest.pos.x;
-        az += def.skel.parts[ch.parts[k]].rest.pos.z;
-      }
-      const float ahead = std::sqrt(ax * ax + az * az);
-      // rest.pos is parent-relative (anchorLocal deltas), so accumulating from
-      // the chain root's absolute anchor reproduces AnimFlatten's rest result
-      // without running the whole pipeline.
-      const float hip = def.skel.parts[ch.parts[0]].anchorLocal.y;
-      float y = hip;
-      for (size_t k = 1; k < ch.parts.size(); k++)
-        y += def.skel.parts[ch.parts[k]].rest.pos.y;
-      // The HIP of whichever leg reaches lowest, not the highest hip on the
-      // rig: the span these two describe has to belong to ONE chain, or a rig
-      // with legs at different heights reports a span no leg actually has.
-      if (!any || y < lowest) {
-        lowest = y;
-        hipOfLowest = hip;
-        aheadOfLowest = ahead;
-        any = true;
-      }
-    }
-    restSoleY_ = any ? lowest : 0.0f;
-    restHipY_ = any ? hipOfLowest : 0.0f;
-    restFootAhead_ = any ? aheadOfLowest : 0.0f;
-    // AN UPRIGHT BODY ON A SERPENT'S TAIL STANDS ON THE TAIL (SlitherDef::
-    // upright): no leg chain, but its hips are held as high as a man's by the
-    // rise of the tail, and that is the span it can gather to climb a step --
-    // without it the step-up below clamps to one cell and a naga cannot take
-    // a stair a man walks up.
-    if (!any && def.slither.upright && def.rootLimb >= 0 &&
-        def.rootLimb < (int)def.skel.parts.size())
-      restHipY_ = std::max(0.0f, def.skel.parts[def.rootLimb].anchorLocal.y);
-  }
+  // (Lifted into Mob::RestLegSpanOf -- below -- by D5+D6, so a creature with
+  // no rig, the distant tier activating a record, is measured the same way.)
+  RestLegSpanOf(def, restSoleY_, restHipY_, restFootAhead_);
 
   // ---- the terrain budgets, resolved ONCE per body -----------------------
   // Authored in metres (anim.h LocomotionDef), converted here, and read from
   // here by the drive, the sense fan, the freefall test AND the A* planner —
   // one number, four consumers, no chance of the drive and the planner
-  // disagreeing about what a wall is.
-  //
-  // The step-up is CLAMPED BY THE RIG'S OWN LEG SPAN. A default authored for a
-  // human is nonsense on a beetle, and the failure it produces is invisible:
-  // the creature would clear ledges taller than itself and look like it was
-  // gliding up walls. `restHipY_ - restSoleY_` is the standing hip-to-ankle
-  // distance measured off the rig in the block above, so this scales with the
-  // art rather than with a table somebody has to remember to extend.
-  {
-    const float legSpan = std::max(1.0f, restHipY_ - restSoleY_);
-    const int cap = std::max(1, (int)(legSpan * 0.9f));
-    stepUpCells_ = std::clamp(MetresToCellsI(def.skel.loco.stepUpM), 1, cap);
-    stepDownCells_ = std::max(1, MetresToCellsI(def.skel.loco.stepDownM));
-    headroomCells_ = std::max(1, MetresToCellsI(def.skel.loco.headroomM));
-  }
+  // disagreeing about what a wall is. (Mob::TerrainBudgetsOf, below, for the
+  // same reason as RestLegSpanOf.)
+  TerrainBudgetsOf(def, stepUpCells_, stepDownCells_, headroomCells_);
 
   anim_.lastPos = origin_;
   bodyY_ = origin_.y;
   return true;
+}
+
+// ---- THE REST LEG SPAN AND THE TERRAIN BUDGETS, off the def alone (mob.h) ----
+void Mob::RestLegSpanOf(const MobDef& def, float& sole, float& hip, float& ahead) {
+  float lowest = 0, hipOfLowest = 0, aheadOfLowest = 0;
+  bool any = false;
+  for (const IkChain& ch : def.skel.chains) {
+    if (ch.tag != "leg" || ch.parts.empty()) continue;
+    // Horizontal hip -> ankle offset in the rest pose, accumulated the same
+    // way the heights are.
+    float ax = 0, az = 0;
+    for (size_t k = 1; k < ch.parts.size(); k++) {
+      ax += def.skel.parts[ch.parts[k]].rest.pos.x;
+      az += def.skel.parts[ch.parts[k]].rest.pos.z;
+    }
+    const float fwd = std::sqrt(ax * ax + az * az);
+    // rest.pos is parent-relative (anchorLocal deltas), so accumulating from
+    // the chain root's absolute anchor reproduces AnimFlatten's rest result
+    // without running the whole pipeline.
+    const float h = def.skel.parts[ch.parts[0]].anchorLocal.y;
+    float y = h;
+    for (size_t k = 1; k < ch.parts.size(); k++)
+      y += def.skel.parts[ch.parts[k]].rest.pos.y;
+    // The HIP of whichever leg reaches lowest, not the highest hip on the
+    // rig: the span these two describe has to belong to ONE chain, or a rig
+    // with legs at different heights reports a span no leg actually has.
+    if (!any || y < lowest) {
+      lowest = y;
+      hipOfLowest = h;
+      aheadOfLowest = fwd;
+      any = true;
+    }
+  }
+  sole = any ? lowest : 0.0f;
+  hip = any ? hipOfLowest : 0.0f;
+  ahead = any ? aheadOfLowest : 0.0f;
+  // AN UPRIGHT BODY ON A SERPENT'S TAIL STANDS ON THE TAIL (SlitherDef::
+  // upright): no leg chain, but its hips are held as high as a man's by the
+  // rise of the tail, and that is the span it can gather to climb a step --
+  // without it the step-up below clamps to one cell and a naga cannot take
+  // a stair a man walks up.
+  if (!any && def.slither.upright && def.rootLimb >= 0 &&
+      def.rootLimb < (int)def.skel.parts.size())
+    hip = std::max(0.0f, def.skel.parts[def.rootLimb].anchorLocal.y);
+}
+
+void Mob::TerrainBudgetsOf(const MobDef& def, int& stepUp, int& stepDown, int& headroom) {
+  // The step-up is CLAMPED BY THE RIG'S OWN LEG SPAN. A default authored for a
+  // human is nonsense on a beetle, and the failure it produces is invisible:
+  // the creature would clear ledges taller than itself and look like it was
+  // gliding up walls. `hip - sole` is the standing hip-to-ankle distance
+  // measured off the rig (RestLegSpanOf), so this scales with the art rather
+  // than with a table somebody has to remember to extend.
+  float sole = 0, hip = 0, ahead = 0;
+  RestLegSpanOf(def, sole, hip, ahead);
+  const float legSpan = std::max(1.0f, hip - sole);
+  const int cap = std::max(1, (int)(legSpan * 0.9f));
+  stepUp = std::clamp(MetresToCellsI(def.skel.loco.stepUpM), 1, cap);
+  stepDown = std::max(1, MetresToCellsI(def.skel.loco.stepDownM));
+  headroom = std::max(1, MetresToCellsI(def.skel.loco.headroomM));
 }
 
 bool Mob::GroundHeightAt(World& world, int wx, int wz, int yFrom,
@@ -7644,6 +7658,19 @@ float MobSystem::StyleReachOn(const Mob& mob, const AttackStyle& sty) const {
     if (mob.anim_.locoState >= 0 &&
         mob.anim_.locoState < (int)mob.skel_.states.size())
       scale = std::max(0.0f, mob.skel_.states[mob.anim_.locoState].lungeScale);
+    closes = LungeClosesVox(sty, scale);
+  }
+  // NO BODY-DEPTH TERM. The first version added half a torso for "the victim's
+  // surface is nearer than its centre", and it double-counts: the pivot the
+  // effector's reach is measured from (a shoulder, a neck) already sits at the
+  // ATTACKER'S centre, so the two halves cancel and what is left is the plain
+  // sum. Measured, it stood the pair a whole body too far apart.
+  return effector + closes;
+}
+
+float MobSystem::LungeClosesVox(const AttackStyle& sty, float scale) {
+  float closes = 0.0f;
+  if (sty.lunge.Any()) {
     // THE SAME FLIGHT THE LAUNCH WILL USE, which is the BALLISTIC one and not
     // the authored tick count: a hop is airborne for 2*rise/g and the author's
     // `ticks` is the number they are aiming the cut at. Using `ticks` here and
@@ -7668,12 +7695,7 @@ float MobSystem::StyleReachOn(const Mob& mob, const AttackStyle& sty) const {
     // harness is how to re-take it if the fall integrator changes.
     closes = MetresPerSecToCells(sty.lunge.speed) * scale * flight0 * 0.65f;
   }
-  // NO BODY-DEPTH TERM. The first version added half a torso for "the victim's
-  // surface is nearer than its centre", and it double-counts: the pivot the
-  // effector's reach is measured from (a shoulder, a neck) already sits at the
-  // ATTACKER'S centre, so the two halves cancel and what is left is the plain
-  // sum. Measured, it stood the pair a whole body too far apart.
-  return effector + closes;
+  return closes;
 }
 
 float MobSystem::StrikeReachOf(const Mob& mob) const {
@@ -32042,7 +32064,17 @@ void Mob::SaveOne(ByteWriter& w, uint32_t version) const {
   WriteRecordGear(w, gear, version);
   // v11: the reference id (Mob::RefId), "" for a creature nobody authored.
   if (version >= 11) w.Str(refId_);
-  if (!dead) return;
+  // v13: THE STATUS TAIL, the record's last field (mob.h kSaveVersion). A
+  // near creature writes the 0 flag: its wounds and fire are its limbs', and
+  // a park or a save has never carried them. Only the distant tier writes a
+  // 1 (MobSystem::PatchMobRecord, from a creature's overlay).
+  auto statusTail = [&]() {
+    if (version >= 13) w.U32(0u);
+  };
+  if (!dead) {
+    statusTail();
+    return;
+  }
   // The cause by NAME: deathCause_ points at a literal in this file, and the
   // loader interns the name back onto the same literal (InternDeathCause).
   w.Str(std::string(deathCause_ != nullptr ? deathCause_ : ""));
@@ -32054,13 +32086,15 @@ void Mob::SaveOne(ByteWriter& w, uint32_t version) const {
     for (const MobSystem::PendingRise& r : sys_->rises_)
       if (r.mobId == id_) { rise = &r; break; }
   w.U32(rise != nullptr ? 1u : 0u);
-  if (rise == nullptr) return;
-  uint32_t left = rise->ticksLeft;
-  if (!rise->deferred)
-    left = rise->atTick > sys_->tick_ ? rise->atTick - sys_->tick_ : 0u;
-  w.U32(left);
-  w.U32((uint32_t)rise->fx.size());
-  for (const std::string& f : rise->fx) w.Str(f);
+  if (rise != nullptr) {
+    uint32_t left = rise->ticksLeft;
+    if (!rise->deferred)
+      left = rise->atTick > sys_->tick_ ? rise->atTick - sys_->tick_ : 0u;
+    w.U32(left);
+    w.U32((uint32_t)rise->fx.size());
+    for (const std::string& f : rise->fx) w.Str(f);
+  }
+  statusTail();
 }
 
 void MobSystem::SaveState(std::vector<uint8_t>& out) const {
@@ -32108,46 +32142,8 @@ bool MobSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) {
 // it would flicker the body and throw away its Jolt bodies and bricks for
 // nothing). So the read and the overlay are two functions and `LoadOne` is the
 // pair with a Spawn between them.
-struct MobSystem::MobRecord {
-  uint32_t version = kSaveVersion;
-  std::string defName;
-  Vec3 origin{};
-  float heading = 0, bodyY = 0;
-  struct LimbState {
-    uint32_t alive = 1;
-    // v4's limb kind; a v3 record reads as kLimbStored (attached) or
-    // kLimbSevered, which is what its bytes are.
-    uint32_t kind = kLimbStored;
-    float hp = 0;
-    Vec3 restOffset{}, anchorRoot{}, anchorLimb{};
-    BodyTransform xf{};
-    IVec3 size{};
-    std::vector<DebrisVoxel> voxels;
-    std::vector<PrefabVoxel> skinVoxels;
-  };
-  std::vector<LimbState> limbs;
-  std::vector<ItemInstance> carried;
-  // v5: the brain's memory (Mob::SaveOne's tail). `haveBrain` false for v3/v4.
-  bool haveBrain = false;
-  std::string brainProfile;
-  uint64_t targetId = 0;
-  uint32_t hasTarget = 0;
-  Vec3 targetPos{}, lastSeenPos{};
-  uint32_t lastSeenTick = 0;
-  // v6: the gear list and the dead state. `haveGear` false for v3..v5 (they
-  // load undressed, as they always did).
-  bool haveGear = false;
-  std::vector<std::string> appendedNames;   // the record's appended slots
-  std::vector<::net::WireGear> gear;
-  bool dead = false;
-  bool playerCorpse = false;   // flags bit 1: a player's corpse (Mob::PlayerCorpse)
-  std::string deathCause;
-  uint64_t deathSeq = 0;
-  bool haveRise = false;
-  uint32_t riseTicksLeft = 0;
-  std::vector<std::string> riseFx;
-  std::string refId;   // v11: Mob::RefId, "" for older records
-};
+// (MobSystem::MobRecord itself is defined in mob.h since D5+D6: the distant
+// tier's activation builds a creature from one.)
 
 // WHERE THE DISTANT OVERLAY'S FIELDS SIT (mob.h MobRecordLayout): offsets from
 // the record's first byte, filled by ReadMobRecord as it reads them, so the
@@ -32161,6 +32157,14 @@ struct MobSystem::MobRecordLayout {
   size_t refId = 0;     // v11+: the ref id string (u32 length + bytes)...
   size_t refIdEnd = 0;  // ...and the byte after it: the dead block, if any
   size_t riseAt = 0;    // a dead record's rising word (after cause + deathSeq)
+  // D5+D6: every limb's whole span (its kind word to its last byte), so the
+  // patch can rewrite one limb as severed without re-serialising the rest,
+  // and the end of the limbs (the pack starts there).
+  std::vector<size_t> limbStart, limbEnd;
+  size_t limbsEnd = 0;
+  // v13: where the status tail starts (after the dead block, or the ref id
+  // for the living) -- the end of the rising block a dead record carries.
+  size_t statusAt = 0;
   size_t end = 0;       // one past the record's last byte
 };
 
@@ -32198,8 +32202,11 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version,
   if (layout != nullptr) {
     layout->limbHp.assign(nLimbs, 0);
     layout->limbXf.assign(nLimbs, 0);
+    layout->limbStart.assign(nLimbs, 0);
+    layout->limbEnd.assign(nLimbs, 0);
   }
   for (MobRecord::LimbState& s : out.limbs) {
+    if (layout != nullptr) layout->limbStart[(size_t)(&s - out.limbs.data())] = r.off - base;
     if (version >= 4) {
       // Mob::SaveOne's v4 limb: kind, hp, transform, and the lattice block
       // only for kLimbStored. An unknown kind is a record this build cannot
@@ -32240,6 +32247,14 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version,
     r.PodVec(s.skinVoxels);
     // v3 is always older than the bruise byte (kSaveVersion 8).
     for (PrefabVoxel& v : s.skinVoxels) v.bruise = 0;
+  }
+  // Each limb's span ends where the next begins; the last ends with the
+  // limbs, where the pack starts.
+  if (layout != nullptr) {
+    layout->limbsEnd = r.off - base;
+    for (size_t li = 0; li < layout->limbStart.size(); li++)
+      layout->limbEnd[li] =
+          li + 1 < layout->limbStart.size() ? layout->limbStart[li + 1] : layout->limbsEnd;
   }
   // The pack, mirroring SaveOne's tail.
   //
@@ -32322,6 +32337,27 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version,
         for (std::string& f : out.riseFx) r.Str(f);
       }
     }
+    // v13: THE DISTANT TIER'S STATUSES, the record's last field (mob.h
+    // kSaveVersion). A flag other than 0 / 1 is a record this build cannot
+    // read correctly.
+    if (layout != nullptr) layout->statusAt = r.off - base;
+    out.haveStatus = false;
+    if (version >= 13 && r.ok) {
+      uint32_t has = 0;
+      r.U32(has);
+      if (has > 1u) {
+        r.ok = false;
+        return false;
+      }
+      out.haveStatus = has == 1u;
+      if (out.haveStatus) {
+        r.F32(out.bleedRate);
+        r.Pod(out.bleedLimb);
+        r.U32(out.burnTicksLeft);
+        r.F32(out.burnFrac);
+        r.U32(out.stumps);
+      }
+    }
   }
   if (layout != nullptr) layout->end = r.off - base;
   // MATERIAL NAMES (sim/mattable.h, W1-D): a stored lattice's ids are in the
@@ -32353,15 +32389,18 @@ bool MobSystem::RecordIsDead(const uint8_t* data, size_t len, uint32_t version) 
 // captured, copy its bytes up to the ref id, write the fixed-size overlay
 // fields (origin, heading, every limb's hp, the flags word, and the limb
 // transforms when the body moved) IN PLACE at the offsets the reader read
-// them from, then re-write the variable tail -- the ref id and the dead block
-// -- from the overlay. Nothing else is re-serialised, so nothing else can
-// drift: an overlay equal to what the record holds gives the same bytes, and
-// DemoteToDistant refuses a creature for which it does not.
+// them from; then, only if a limb came off at distance, rebuild the limb
+// section with that limb as kLimbSevered (its kind word, hp and transform; its
+// lattice dropped, as SaveOne writes a severed limb); then re-write the
+// variable tail -- the ref id, the dead block and the v13 status tail -- from
+// the overlay. Nothing else is re-serialised, so nothing else can drift: an
+// overlay equal to what the record holds gives the same bytes, and both
+// DemoteToDistant and the activation refuse a creature for which it does not.
 bool MobSystem::PatchMobRecord(std::vector<uint8_t>& bytes, uint32_t version,
                                const DistantOverlay& ov) {
   // The tier writes records with SaveOne at kSaveVersion and only patches its
-  // own; v11 is also the first with the ref id this rewrites.
-  if (version != kSaveVersion || version < 11 || bytes.empty()) return false;
+  // own (the activation upgrades a v12 record first: UpgradeRecordToCurrent).
+  if (version != kSaveVersion || bytes.empty()) return false;
   MobRecord rec;
   MobRecordLayout L;
   {
@@ -32369,11 +32408,27 @@ bool MobSystem::PatchMobRecord(std::vector<uint8_t>& bytes, uint32_t version,
     if (!ReadMobRecord(r, rec, version, &L) || !r.ok) return false;
   }
   // One whole record, nothing after it; one hp per record limb.
-  if (L.end != bytes.size() || L.refIdEnd < L.refId || L.refId > bytes.size())
+  if (L.end != bytes.size() || L.refIdEnd < L.refId || L.refId > bytes.size() ||
+      L.statusAt < L.refIdEnd || L.statusAt > bytes.size() || L.limbsEnd > L.refId)
     return false;
   if (ov.limbHp.size() != rec.limbs.size()) return false;
+  if (!ov.limbAttached.empty() && ov.limbAttached.size() != rec.limbs.size()) return false;
   // Nothing comes back to life.
   if (rec.dead && !ov.dead) return false;
+  // ---- WHAT CAME OFF AT DISTANCE (D5+D6) ---------------------------------
+  // An empty mask keeps the record's kinds. A limb the record has severed
+  // and the overlay calls attached is a limb grown back: refused.
+  std::vector<uint8_t> sever(rec.limbs.size(), 0);
+  bool anySever = false;
+  for (size_t i = 0; i < rec.limbs.size() && !ov.limbAttached.empty(); i++) {
+    const bool attached = ov.limbAttached[i] != 0;
+    const bool recSevered = rec.limbs[i].kind == kLimbSevered;
+    if (recSevered && attached) return false;
+    if (!recSevered && !attached) {
+      sever[i] = 1;
+      anySever = true;
+    }
+  }
 
   std::vector<uint8_t> out(bytes.begin(), bytes.begin() + (ptrdiff_t)L.refId);
   auto put = [&out](size_t at, const void* src, size_t n) {
@@ -32415,7 +32470,33 @@ bool MobSystem::PatchMobRecord(std::vector<uint8_t>& bytes, uint32_t version,
   std::memcpy(&flags, out.data() + L.flags, sizeof(uint32_t));
   flags = ov.dead ? (flags | 1u) : 0u;
   put(L.flags, &flags, sizeof(uint32_t));
-  // ---- the variable tail: the ref id, then the dead block ----------------
+  // ---- the severed limbs, rewritten (after the in-place writes above, which
+  // used the record's own offsets): kind kLimbSevered, then the hp and the
+  // transform as written; the lattice block a stored limb carried is
+  // dropped -- a severed limb stores none (Mob::SaveOne), and its matter is
+  // nowhere at distance. Every other byte is copied.
+  if (anySever) {
+    std::vector<uint8_t> o2;
+    o2.reserve(out.size());
+    const size_t first = L.limbStart.empty() ? L.limbsEnd : L.limbStart[0];
+    o2.insert(o2.end(), out.begin(), out.begin() + (ptrdiff_t)first);
+    for (size_t i = 0; i < rec.limbs.size(); i++) {
+      if (!sever[i]) {
+        o2.insert(o2.end(), out.begin() + (ptrdiff_t)L.limbStart[i],
+                  out.begin() + (ptrdiff_t)L.limbEnd[i]);
+        continue;
+      }
+      const uint32_t kind = kLimbSevered;
+      const uint8_t* k = reinterpret_cast<const uint8_t*>(&kind);
+      o2.insert(o2.end(), k, k + sizeof(uint32_t));
+      const size_t at = L.limbHp[i];
+      o2.insert(o2.end(), out.begin() + (ptrdiff_t)at,
+                out.begin() + (ptrdiff_t)(at + sizeof(float) + sizeof(BodyTransform)));
+    }
+    o2.insert(o2.end(), out.begin() + (ptrdiff_t)L.limbsEnd, out.end());
+    out = std::move(o2);
+  }
+  // ---- the variable tail: the ref id, the dead block, the statuses -------
   ByteWriter w{out};
   w.Str(ov.refId);
   if (ov.dead) {
@@ -32424,12 +32505,46 @@ bool MobSystem::PatchMobRecord(std::vector<uint8_t>& bytes, uint32_t version,
     // A rising the record carried travels on (fx by name, ticks left); a
     // creature that died at distance books none (D2b decides whether it
     // should).
-    if (rec.dead && L.riseAt > L.refIdEnd && L.riseAt <= bytes.size())
-      out.insert(out.end(), bytes.begin() + (ptrdiff_t)L.riseAt, bytes.end());
+    if (rec.dead && L.riseAt > L.refIdEnd && L.riseAt <= L.statusAt)
+      out.insert(out.end(), bytes.begin() + (ptrdiff_t)L.riseAt,
+                 bytes.begin() + (ptrdiff_t)L.statusAt);
     else
       w.U32(0u);
   }
+  // v13: THE STATUS TAIL (mob.h kSaveVersion). The flag is 1 exactly when
+  // the overlay carries a status, so a record whose tail is 0 and an overlay
+  // with none give back the same bytes.
+  const bool anyStatus = ov.bleedRate > 0.0f || ov.burnTicksLeft > 0 || ov.burnFrac > 0.0f ||
+                         ov.stumps > 0;
+  w.U32(anyStatus ? 1u : 0u);
+  if (anyStatus) {
+    w.F32(ov.bleedRate);
+    w.Pod(ov.bleedLimb);
+    w.U32(ov.burnTicksLeft);
+    w.F32(ov.burnFrac);
+    w.U32(ov.stumps);
+  }
   bytes = std::move(out);
+  return true;
+}
+
+bool MobSystem::UpgradeRecordToCurrent(std::vector<uint8_t>& bytes, uint32_t& version) {
+  if (version == kSaveVersion) return true;
+  // v12 -> v13 only: the status tail is the last field, so the v12 bytes
+  // plus its 0 flag are a v13 record. Proven by a parse before it is kept.
+  static_assert(kSaveVersion == 13, "UpgradeRecordToCurrent knows v12 -> v13 only");
+  if (version != 12 || bytes.empty()) return false;
+  std::vector<uint8_t> b = bytes;
+  {
+    ByteWriter w{b};
+    w.U32(0u);
+  }
+  MobRecord rec;
+  MobRecordLayout L;
+  ByteReader r{b.data(), b.size()};
+  if (!ReadMobRecord(r, rec, kSaveVersion, &L) || !r.ok || L.end != b.size()) return false;
+  bytes = std::move(b);
+  version = kSaveVersion;
   return true;
 }
 
@@ -32730,6 +32845,22 @@ void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
         m.phys_->SetBodyTransform(L.body, L.xf.pos, L.xf.quat);
     }
   }
+  // ---- A FIST THE RECORD CUT OFF HOLDS NOTHING (D5+D6) ---------------------
+  //
+  // LAST, after every index-based pass above (an unequip renumbers the
+  // appended tail). A near record never lists an item in a hand it lost --
+  // Mob::CaptureGear skips a held slot with no body -- but a DISTANT creature's
+  // patched record (PatchMobRecord: a limb taken off at distance written
+  // kLimbSevered) still carries the gear it was demoted with, so the dressing
+  // put the sword in the fist and the sever pass above detached the arm under
+  // it without adopting it. The fist is emptied the way GripFails empties a
+  // borrowed one: the item is gone with the arm, far away.
+  for (int hk = 0; hk < kHands; hk++) {
+    const int slot = m.held_[hk].slot;
+    if (slot >= 0 && (size_t)slot < m.limbs_.size() && m.limbs_[(size_t)slot].body == 0 &&
+        !m.held_[hk].item.empty())
+      m.EquipItem(nullptr, HandAt(hk));
+  }
   instancesDirty_ = true;
 }
 
@@ -32870,6 +33001,12 @@ Mob* MobSystem::LoadOne(ByteReader& r, uint32_t version, bool placeLimbs,
   OverlayMobRecord(*m, rec, placeLimbs || rec.dead);
   m = FindMobById(id);
   if (m != nullptr) m->RelatchInfections();
+  // v13: what a distant creature was still suffering when its record was
+  // written (a retire, a save, a promotion): the owed blood, the fire.
+  if (m != nullptr && !rec.dead && rec.haveStatus) {
+    ApplyRecordStatus(*m, rec);
+    m = FindMobById(id);
+  }
   if (m == nullptr || !rec.dead) return m;
   // A PLAYER'S CORPSE COMES BACK IN ITS OWN ID BAND (P3). Ids are not saved,
   // so Spawn just spent an NPC id on it; handing that back keeps nextId_ where
@@ -32949,22 +33086,24 @@ void MobSystem::EnterLoadedDead(Mob& m, const MobRecord& rec) {
 //
 // After MobSystem::PromoteDistant's LoadOne of the PATCHED record: the hp is
 // already the overlay's (written into the record, set per limb by the load's
-// overlay -- directly, no SpendHp, no carve), so what is left is what the near
-// tier would have done on its way to those numbers. In D0 nothing at distance
-// changes a number, so for every D0 promotion both passes below find nothing
-// to do; they are D2b's door, written once here so the two tiers share it.
+// overlay -- directly, no SpendHp, no carve), and since D5+D6 so are the limbs
+// severed at distance (the patch writes them kLimbSevered, the load detaches
+// them) and the statuses (the v13 tail, LoadOne's ApplyRecordStatus) -- one
+// door for a promotion, an unpark of a retired creature and a save load. What
+// is left is what the near tier would have done on its way to those numbers.
 void Mob::ApplyDistantOverlay(const DistantMob& d) {
   if (IsGhost() || rigReleased_ || def_ == nullptr) return;
   // ---- WHAT CAME OFF AT DISTANCE (D2b: distant::SeverLimb) -----------------
-  // The record still carries those limbs (it is the demotion's), so they come
-  // off here, for real, through the near tier's own door: the piece drops as
-  // debris and the parent's stump opens and bleeds on by its rule. A corpse
-  // too -- it lost them before it died. BASE limbs only, in limb order (a
-  // limb whose parent went first is already gone with it). Nothing for a
-  // creature that lost nothing at distance (the D0 round trip).
+  // The patched record carries those limbs as SEVERED now (D5+D6), so the
+  // load already took them off -- the near record path: the stump reopened,
+  // nothing dropped here (the arm came off far away), no second blood bill.
+  // This pass is belt and braces for a body the record somehow left whole:
+  // through the near tier's own door, BASE limbs only, in limb order (a limb
+  // whose parent went first is already gone with it). It finds nothing for
+  // every record this tier writes.
   for (int i = 0; i < baseLimbs_ && i < (int)limbs_.size() && i < (int)d.limbRole.size(); i++) {
     if ((d.limbRole[(size_t)i].flags & kDistantLimbAttached) != 0) continue;
-    if (limbs_[(size_t)i].body == 0) continue;   // severed at demotion already
+    if (limbs_[(size_t)i].body == 0) continue;   // the record severed it
     Sever(i, DamageCtx(DamageCause::Blade));
   }
   // ---- THE HP-ZERO RULES, in limb order, BASE limbs only (an appended slot
@@ -32986,34 +33125,68 @@ void Mob::ApplyDistantOverlay(const DistantMob& d) {
     deathCause_ = InternDeathCause(d.cause);
     Die();
   }
-  // ---- STILL BLEEDING (D2b): the blood the distant wounds still owe ------
-  // The record carries no bleed (a park or a save never did), so it crosses
-  // HERE, from the DistantMob itself: a rate r decaying by bleed.decay a tick
-  // still owes r / (1 - decay) hp, which is that many voxels of budget at
-  // gore.bleedHpPerVoxel over the table's drain share -- re-opened on the limb
-  // the last cut landed on, through the near tier's own wound fields, so it
-  // drips and drains as any near wound does. (Burning is re-lit by the caller,
-  // MobSystem::PromoteDistant, through IgniteLimb.) Nothing for a D0/D1
-  // creature (rate 0): the round trip stays byte for byte.
-  if (alive_ && d.bloodLossPerTick > 0.0f && sys_ != nullptr && def_ != nullptr &&
-      def_->bleedMat != 0) {
-    const distant::DistantCalib& cal = sys_->DistantCalibration();
-    const float decay = std::clamp(cal.bleed.decay, 0.0f, 0.9999f);
-    const float owedHp = d.bloodLossPerTick / std::max(1e-4f, 1.0f - decay);
-    const float perVox = CurrentTuning().gore.bleedHpPerVoxel *
-                         std::max(1e-3f, cal.bleed.drainShare);
-    int li = d.lastWoundLimb;
-    if (li < 0 || li >= baseLimbs_ || li >= (int)limbs_.size() || !limbs_[(size_t)li].body ||
-        IsBloodless(li))
-      li = def_->rootLimb;
-    if (li >= 0 && li < (int)limbs_.size() && limbs_[(size_t)li].body && perVox > 0.0f) {
-      MobLimb& L = limbs_[(size_t)li];
-      const float add = owedHp / perVox;
-      NoteWoundFluid(L, LimbFluid(li), add);
-      L.bleedBudget = AddBleedBudget(L.bleedBudget, add);
-      L.woundLocal = Vec3{};
+}
+
+bool Mob::ReopenOwedBlood(float rate, int limb) {
+  if (!alive_ || !(rate > 0.0f) || sys_ == nullptr || def_ == nullptr || def_->bleedMat == 0)
+    return false;
+  // A rate r decaying by bleed.decay a tick still owes r / (1 - decay) hp,
+  // which is that many voxels of budget at gore.bleedHpPerVoxel over the
+  // table's drain share -- re-opened on the limb the last cut landed on,
+  // through the near tier's own wound fields, so it drips and drains as any
+  // near wound does (D2b's rule, unchanged; ApplyDistantOverlay's until D5).
+  const distant::DistantCalib& cal = sys_->DistantCalibration();
+  const float decay = std::clamp(cal.bleed.decay, 0.0f, 0.9999f);
+  const float owedHp = rate / std::max(1e-4f, 1.0f - decay);
+  const float perVox =
+      CurrentTuning().gore.bleedHpPerVoxel * std::max(1e-3f, cal.bleed.drainShare);
+  int li = limb;
+  if (li < 0 || li >= baseLimbs_ || li >= (int)limbs_.size() || !limbs_[(size_t)li].body ||
+      IsBloodless(li))
+    li = def_->rootLimb;
+  if (li < 0 || li >= (int)limbs_.size() || !limbs_[(size_t)li].body || !(perVox > 0.0f))
+    return false;
+  MobLimb& L = limbs_[(size_t)li];
+  const float add = owedHp / perVox;
+  NoteWoundFluid(L, LimbFluid(li), add);
+  L.bleedBudget = AddBleedBudget(L.bleedBudget, add);
+  L.woundLocal = Vec3{};
+  return true;
+}
+
+// ---- v13: WHAT A DISTANT CREATURE WAS STILL SUFFERING (mob.h) -------------------
+uint32_t MobSystem::RelightTrunk(uint64_t mobId) {
+  const Mob* m = FindMobById(mobId);
+  if (m == nullptr || !m->alive_ || m->def_ == nullptr) return 0;
+  // THE TRUNK: the biggest ATTACHED torso limb by its authored hp -- the one
+  // with the most to burn, and where a burning body's fire is seen. The role
+  // is the distant table's own (distant::LimbRoleOf), so the limb a promotion
+  // re-lights is the one the abstract body was burning.
+  const MobDef& def = *m->def_;
+  int best = -1;
+  float bestHp = -1.0f;
+  for (int i = 0; i < m->baseLimbs_ && i < (int)m->limbs_.size() && i < (int)def.limbs.size();
+       i++) {
+    if (m->limbs_[(size_t)i].body == 0 || m->IsBloodless(i)) continue;
+    const MobLimbDef& ld = def.limbs[(size_t)i];
+    if (distant::LimbRoleOf(ld.tag, ld.name, ld.bloodless) != distant::LimbRole::Torso) continue;
+    if (ld.hp > bestHp) {
+      bestHp = ld.hp;
+      best = i;
     }
   }
+  if (best < 0) return 0;
+  return IgniteLimb(mobId, best, kDistantRelightVoxels);
+}
+
+void MobSystem::ApplyRecordStatus(Mob& m, const MobRecord& rec) {
+  if (!rec.haveStatus || !m.alive_) return;
+  const uint64_t id = m.id_;
+  if (rec.bleedRate > 0.0f && m.ReopenOwedBlood(rec.bleedRate, rec.bleedLimb))
+    distant_.Note(&DistantMobs::Stats::rebled);
+  // STILL BURNING: re-lit on one limb, so the fire goes on visibly where it
+  // was abstract (the near burn pass spreads it from there by its own rules).
+  if (rec.burnTicksLeft > 0 && RelightTrunk(id) > 0) distant_.Note(&DistantMobs::Stats::relit);
 }
 
 // THE STYLES, AND THE DISTANT TABLE MEASURED FROM THEM (mob.h). Read through
@@ -36313,7 +36486,7 @@ void Mob::ApplyHitReact(const AnimSkeleton& sk, AnimState& st, float dt) {
 }
 
 const IkChain* Mob::ChainForEffector(const AnimSkeleton& sk, int part,
-                                     int& outHandPart) const {
+                                     int& outHandPart) {
   outHandPart = -1;
   if (part < 0 || (size_t)part >= sk.parts.size()) return nullptr;
   const int parent = sk.parts[part].parent;

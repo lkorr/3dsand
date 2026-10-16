@@ -22,10 +22,12 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <map>
 
 #include "game/arrows.h"   // MobShotsLeft: an archer's arrows, cached at demotion
 #include "game/mob.h"
 #include "game/persist.h"   // EntityParking::kUnparkMarginChunks: the promotion line
+#include "sim/chunkstore.h"  // ActivateParked: the region buckets (D5+D6)
 #include "sim/materials.h"  // CLASS_SOLID / CLASS_POWDER: what carries weight
 #include "sim/rng.h"
 #include "sim/scale.h"      // MetresToCells
@@ -57,10 +59,6 @@ float DistSq(Vec3 a, Vec3 b) {
   return dx * dx + dy * dy + dz * dz;
 }
 
-// A promotion that is still burning (D2b) re-lights this many voxels of its
-// trunk (MobSystem::IgniteLimb) -- a foothold the near burn pass then spreads
-// by its own rules. Of the order of the calibration's burn probe (60).
-constexpr uint32_t kDistantRelightVoxels = 40;
 
 }  // namespace
 
@@ -110,10 +108,23 @@ DistantOverlay DistantMob::Overlay() const {
   o.heading = steer.heading;
   o.worldSize = worldSize;
   o.limbHp = limbHp;
+  // D5+D6: what came off at distance (limbRole's attached flag, parallel to
+  // the record's limbs), and the statuses -- what a retire or a save carries.
+  o.limbAttached.resize(limbRole.size());
+  for (size_t i = 0; i < limbRole.size(); i++)
+    o.limbAttached[i] = (limbRole[i].flags & kDistantLimbAttached) != 0 ? 1u : 0u;
+  if (o.limbAttached.size() != limbHp.size()) o.limbAttached.clear();
   o.dead = dead;
   o.cause = dead ? cause : std::string();
   o.deathSeq = dead ? deathSeq : 0;
   o.refId = refId;
+  if (!dead) {
+    o.bleedRate = bloodLossPerTick > 0.0f ? bloodLossPerTick : 0.0f;
+    o.bleedLimb = o.bleedRate > 0.0f ? (int32_t)lastWoundLimb : -1;
+    o.burnTicksLeft = burnTicksLeft;
+    o.burnFrac = burnFrac > 0.0f ? burnFrac : 0.0f;
+    o.stumps = stumps;
+  }
   return o;
 }
 
@@ -642,9 +653,15 @@ bool MobSystem::DemoteToDistant(Mob& mob, std::vector<uint8_t>& record, Vec3 wlo
   // or a promotion / retire / save would write something the creature never
   // was. A creature that fails is parked instead (the old path, no loss) and
   // the fault is logged -- it is a bug in this file or in SaveOne's walk.
+  // The STATUSES are left out of the probe (D5+D6): a near creature's SaveOne
+  // writes no status tail -- its wounds are its limbs' -- while the overlay
+  // now carries the bleed and the fire CaptureDistantVitals just read off
+  // them; the record-held fields are what must round-trip.
   {
     std::vector<uint8_t> probe = record;
-    if (!PatchMobRecord(probe, kSaveVersion, d.Overlay()) || probe != record) {
+    DistantOverlay ov = d.Overlay();
+    ov.ClearStatuses();
+    if (!PatchMobRecord(probe, kSaveVersion, ov) || probe != record) {
       std::fprintf(stderr,
                    "distant: mob %llu ('%s') did not round-trip its own overlay "
                    "(%zu limbs); parked instead\n",
@@ -761,24 +778,12 @@ Mob* MobSystem::PromoteDistant(uint64_t id, bool* spawnRefused, uint32_t tick) {
   if (dm->groundMode == DistantGroundMode::Surface && dm->movedWhileDistant && world_ != nullptr)
     SnapPromotionGround(*dm);
   const DistantMob* d = dm;
-  // STILL BURNING (D2b, section 2.6): the fire is re-lit on one limb after
-  // the creature is back, so it goes on visibly where it was abstract. The
-  // trunk -- the biggest attached torso limb -- is the one lit (it has the
-  // most to burn, and it is where a burning body's fire is seen).
-  const bool relight = !d->dead && d->burnTicksLeft > 0 && d->hasKit;
-  int relightLimb = -1;
-  if (relight) {
-    float best = -1.0f;
-    for (size_t i = 0; i < d->kit.limbs.size(); i++) {
-      const distant::DistantLimb& L = d->kit.limbs[i];
-      if (!L.alive || L.bloodless || L.role != distant::LimbRole::Torso) continue;
-      if (L.maxHp > best) {
-        best = L.maxHp;
-        relightLimb = (int)i;
-      }
-    }
-  }
-  const bool rebleed = !d->dead && d->bloodLossPerTick > 0.0f;
+  // STILL BURNING, STILL BLEEDING, MAIMED (D2b's statuses, carried by D5+D6):
+  // all three are IN THE PATCHED RECORD now -- the limbs taken off at
+  // distance as kLimbSevered, the bleed and the fire in its v13 status tail --
+  // so LoadOne applies them (the sever pass, ApplyRecordStatus: the owed
+  // blood re-opened on the last cut, the trunk re-lit) exactly as it does for
+  // an unpark or a load of the same creature retired. One door, not two.
   std::vector<uint8_t> bytes;
   if (!DistantRecord(*d, bytes)) {
     std::fprintf(stderr, "distant: mob %llu ('%s') has a record the overlay "
@@ -792,10 +797,13 @@ Mob* MobSystem::PromoteDistant(uint64_t id, bool* spawnRefused, uint32_t tick) {
   ByteReader rd{bytes.data(), bytes.size()};
   bool refused = false;
   // placeLimbs: it comes back in the pose it left in (an unpark's rule), the
-  // corpse on the pose it was lying in. catchUp: see mob.h PromoteDistant.
-  // keepId: the id the tier held.
-  Mob* m = LoadOne(rd, kSaveVersion, /*placeLimbs=*/true, &refused,
-                   /*catchUp=*/true, /*keepId=*/id);
+  // corpse on the pose it was lying in. catchUp (D5+D6, mob.h PromoteDistant):
+  // only for a creature that NEVER MOVED while distant -- one that walked (its
+  // schedule, a chase) comes back where it walked to, not teleported to where
+  // its day says it should be. keepId: the id the tier held.
+  const bool catchUp = !d->movedWhileDistant;
+  Mob* m = LoadOne(rd, kSaveVersion, /*placeLimbs=*/true, &refused, catchUp,
+                   /*keepId=*/id);
   // LoadOne reads the tier (its duplicate-ref test) and writes nothing in it,
   // but look the creature up again rather than trust a pointer across it.
   DistantMob* dd = distant_.Find(id);
@@ -825,26 +833,25 @@ Mob* MobSystem::PromoteDistant(uint64_t id, bool* spawnRefused, uint32_t tick) {
       m->speedNow_ = dd->steer.speedNow;
     }
   }
+  // Did the catch-up placer stand it somewhere else (a never-moved villager
+  // whose day moved on)? Counted: the gate's witness that it ran only then.
+  if (catchUp && m->alive_ && std::memcmp(&m->origin_, &wantOrigin, sizeof(Vec3)) != 0)
+    distant_.Note(&DistantMobs::Stats::promoteCatchUps);
   m->ApplyDistantOverlay(*dd);
   const bool dead = dd->dead;
   distant_.Erase(id);
   distant_.Note(&DistantMobs::Stats::promoted);
   NoteTierFlip(id, tick != 0 ? tick : tick_);
   if (dead) distant_.Note(&DistantMobs::Stats::promotedDead);
-  // The fire, re-lit (see above) -- through the near tier's own door, after
-  // the overlay, on a creature that came back alive.
-  if (Mob* back = FindMobById(id); back != nullptr && back->alive_) {
-    if (relight && relightLimb >= 0 &&
-        IgniteLimb(id, relightLimb, kDistantRelightVoxels) > 0)
-      distant_.Note(&DistantMobs::Stats::relit);
-    if (rebleed) distant_.Note(&DistantMobs::Stats::rebled);
-  }
   return FindMobById(id);
 }
 
-bool MobSystem::DistantRecord(const DistantMob& d, std::vector<uint8_t>& out) const {
+bool MobSystem::DistantRecord(const DistantMob& d, std::vector<uint8_t>& out,
+                              bool withStatus) const {
   std::vector<uint8_t> bytes = d.record;
-  if (!PatchMobRecord(bytes, kSaveVersion, d.Overlay())) return false;
+  DistantOverlay ov = d.Overlay();
+  if (!withStatus) ov.ClearStatuses();
+  if (!PatchMobRecord(bytes, kSaveVersion, ov)) return false;
   out = std::move(bytes);
   return true;
 }
@@ -1496,6 +1503,59 @@ void RearmHeld(DistantMob& d, float weaponReach, uint32_t tick) {
   d.armed = w != nullptr;
   d.canGuard = w != nullptr || shield;
   if (d.strokeStyle >= d.kit.styles.size()) d.strokeStyle = 0;
+}
+
+// THE GRIP RULE (Mob::GripFails' window, melee.injuredArmDrop), one creature:
+// a hand whose arm chain lost a part (D2b: severed at distance) lets go of
+// whatever it held and has no fist on the end of it any more
+// (NaturalWeaponUsable: a chain effector needs its whole chain); a hand whose
+// chain is below `dropBelow` (and above zero) drops its weapon. Then the held
+// styles re-arm (RearmHeld). The impact pass runs it on every creature a blow
+// or a status touched; D5+D6's activation runs it once on a creature built
+// from a record (whose gear still lists what a severed hand held), and the
+// distant-save gate's sever seam after its sever. Returns whether anything
+// fell.
+bool ApplyGripRule(DistantMob& d, float dropBelow, uint32_t tick, DistantMobs& tier) {
+  if (d.dead || !d.hasKit) return false;
+  bool fell = false;
+  for (int hh = 0; hh < kHands; hh++) {
+    DistantMob::DistantHand& H = d.hands[hh];
+    // A PART OF THE ARM OFF (D2b): what the hand held left with it, and
+    // there is no fist on the end of it any more (NaturalWeaponUsable:
+    // a chain effector needs its whole chain).
+    bool chainOff = false;
+    for (const int16_t pp : H.parts)
+      chainOff = chainOff || (pp >= 0 && (size_t)pp < d.kit.limbs.size() &&
+                              !d.kit.limbs[(size_t)pp].alive);
+    if (chainOff) {
+      if (H.weapon || H.fist || H.shield) {
+        if (d.bowHand == hh) {
+          d.bowHand = -1;
+          d.kit.ranged = false;
+          d.ammo = 0;
+          d.drawLooseTick = 0;
+        }
+        H.weapon = H.fist = H.shield = false;
+        fell = true;
+      }
+      continue;
+    }
+    if (!H.weapon || !(dropBelow > 0.0f)) continue;
+    const float cnd = DistantHandCondition(d, hh);
+    if (cnd <= 0.0f || cnd >= dropBelow) continue;
+    H.weapon = false;
+    fell = true;
+    if (d.bowHand == hh) {
+      // The bow went with it: no more shots.
+      d.bowHand = -1;
+      d.kit.ranged = false;
+      d.ammo = 0;
+      d.drawLooseTick = 0;
+    }
+    tier.Note(&DistantMobs::Stats::gripFails);
+  }
+  if (fell) RearmHeld(d, -1.0f, tick);
+  return fell;
 }
 
 // The reach facts Think needs (ai_behavior.h SelfView::attackReach /
@@ -3283,48 +3343,7 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
   if (dropBelow > 0.0f && !touched.empty()) {
     std::sort(touched.begin(), touched.end());
     touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
-    for (const size_t i : touched) {
-      DistantMob& d = distant_.At(i);
-      if (d.dead || !d.hasKit) continue;
-      bool fell = false;
-      for (int hh = 0; hh < kHands; hh++) {
-        DistantMob::DistantHand& H = d.hands[hh];
-        // A PART OF THE ARM OFF (D2b): what the hand held left with it, and
-        // there is no fist on the end of it any more (NaturalWeaponUsable:
-        // a chain effector needs its whole chain).
-        bool chainOff = false;
-        for (const int16_t pp : H.parts)
-          chainOff = chainOff || (pp >= 0 && (size_t)pp < d.kit.limbs.size() &&
-                                  !d.kit.limbs[(size_t)pp].alive);
-        if (chainOff) {
-          if (H.weapon || H.fist || H.shield) {
-            if (d.bowHand == hh) {
-              d.bowHand = -1;
-              d.kit.ranged = false;
-              d.ammo = 0;
-              d.drawLooseTick = 0;
-            }
-            H.weapon = H.fist = H.shield = false;
-            fell = true;
-          }
-          continue;
-        }
-        if (!H.weapon) continue;
-        const float cnd = DistantHandCondition(d, hh);
-        if (cnd <= 0.0f || cnd >= dropBelow) continue;
-        H.weapon = false;
-        fell = true;
-        if (d.bowHand == hh) {
-          // The bow went with it: no more shots.
-          d.bowHand = -1;
-          d.kit.ranged = false;
-          d.ammo = 0;
-          d.drawLooseTick = 0;
-        }
-        distant_.Note(&DistantMobs::Stats::gripFails);
-      }
-      if (fell) RearmHeld(d, -1.0f, tick);
-    }
+    for (const size_t i : touched) ApplyGripRule(distant_.At(i), dropBelow, tick, distant_);
   }
   if (hpDealt > 0.0) distant_.Note(&DistantMobs::Stats::hpDealtMilli, (uint64_t)std::llround(hpDealt * 1000.0));
   const auto tSleep = Clock::now();
@@ -3403,6 +3422,11 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
     d.wakeTick = (d.brain.wanderOwned && d.brain.routine.active && d.brain.routine.hold)
                      ? std::max(d.brain.wanderPauseUntil, tick + 1)
                      : 0;
+    // D5: ...and a villager HOLDING its routine at its anchor wakes when the
+    // routine changes by itself (a patrol's pause at a node ends). A schedule
+    // ROW changing is noticed by the resident layer, which wakes it.
+    if (d.brain.routine.active && d.brain.routine.hold && d.routineWakeTick > tick)
+      d.wakeTick = d.wakeTick == 0 ? d.routineWakeTick : std::min(d.wakeTick, d.routineWakeTick);
     stumpClock(d);
     distant_.Note(&DistantMobs::Stats::sleeps);
   }
@@ -3461,4 +3485,693 @@ void MobSystem::TickDistant(uint32_t tick, World& world,
   distant_.Note(&DistantMobs::Stats::nsSleep, nsSleep);
   distant_.Note(&DistantMobs::Stats::nsFile, nsFile);
   timeOut();
+}
+
+// ============================================================================
+// PARKED -> DISTANT: ACTIVATION (docs/PLAN_distant_npcs.md D5+D6; mob.h has
+// the contract, game/distant.h the tier)
+// ============================================================================
+//
+// A parked record is a creature with no rig. Everything DemoteToDistant reads
+// off a live Mob, DistantFromRecord reads off the record and the def instead:
+//
+//   EXACT (the record holds it): origin, heading, every limb's hp and whether
+//     it is still attached, the ref, the brain's five facts (OverlayMobRecord's
+//     rule: a fresh brain on the named profile), dead + cause + death order,
+//     the statuses (v13 tail), what the creature holds and wears (the gear).
+//   FROM THE DEF (what BuildRig would derive): the body box, speed, the
+//     locomotion, the terrain budgets (Mob::TerrainBudgetsOf, BuildRig's own
+//     function), aquatic / can-float (the tread clip on the def's skeleton),
+//     the limbs' roles, vitality, authored hp, the hand sockets and the arm
+//     chains (Mob::ChainForEffector over the def's skeleton), the natural
+//     weapons and whether each is usable (its chain all attached).
+//   APPROXIMATED (documented; a rig is what would make them exact):
+//     * REACH. StyleReachOn measures the LIVE bones; here they are the rest
+//       pose's (rigid bones: the same length, which is what the fist term
+//       uses), the held weapon's term is a quarter of the arm plus its edge
+//       (ItemDef::reach without one), the lunge at lungeScale 1 (the
+//       locomotion state is not known). <= 0 takes the profile's floor, as
+//       DemoteToDistant's unposed rig does.
+//     * SHELLS. The hardest worn shell over a limb is the dominant material of
+//       the shell's STORED lattice when the record carries one (a damaged
+//       piece), else of the item's authored cover (pristine) -- the same
+//       material, without the wearer's fit resample.
+//     * A GAUNTLET'S STRIKE overrides a fist when the piece's cover names the
+//       fist's own limb (StrikeProfileFor reads the rig's shell slots; the
+//       cover list is what built them).
+//     * THE STATUE is the def's bare look (DistantDraw::KeyOfDef): no gear, no
+//       damage. A creature that is demoted from a rig later bakes its own.
+//     * A weapon still in a hand whose arm was cut off at distance is dropped
+//       by the grip rule (ApplyGripRule), as the impact pass drops it; a
+//       weapon a hurt hand let go of at distance is held again until the grip
+//       rule next runs on it (the record keeps the item -- D2b's own note).
+namespace {
+
+// The rest pose's L1 + L2 of the IK chain that serves `part` (StyleReachOn's
+// fist term, with rest bones for live ones: bones are rigid). 0 when no
+// chain serves it or the chain is not a parent chain.
+float RestChainBones(const MobDef& def, int part) {
+  int handPart = -1;
+  const IkChain* ch = Mob::ChainForEffector(def.skel, part, handPart);
+  const auto& P = def.skel.parts;
+  if (ch == nullptr || ch->parts.size() < 2 || handPart < 0) return 0.0f;
+  const int i0 = ch->parts[0], i1 = ch->parts[1];
+  if (i0 < 0 || i1 < 0 || (size_t)i0 >= P.size() || (size_t)i1 >= P.size() ||
+      (size_t)handPart >= P.size())
+    return 0.0f;
+  if (P[(size_t)i1].parent != i0 || P[(size_t)handPart].parent != i1) return 0.0f;
+  return P[(size_t)i1].rest.pos.len() + P[(size_t)handPart].rest.pos.len();
+}
+
+// The dominant material of a lattice (ShellHardnessOfLimbs' rule).
+template <class V, class F>
+uint32_t DominantMat(const std::vector<V>& vox, F matOf) {
+  std::map<uint32_t, uint32_t> count;
+  for (const V& v : vox) count[matOf(v)]++;
+  uint32_t mat = 0, best = 0;
+  for (const auto& kv : count)
+    if (kv.second > best) {
+      best = kv.second;
+      mat = kv.first;
+    }
+  return mat;
+}
+
+constexpr uint32_t kMobsFourCC = 'M' | ('O' << 8) | ('B' << 16) | ((uint32_t)'S' << 24);
+
+}  // namespace
+
+bool MobSystem::DistantFromRecord(const MobRecord& rec, int defIndex, uint32_t tick,
+                                  DistantMob& d) {
+  if (defIndex < 0 || defIndex >= (int)defs_.size()) return false;
+  const MobDef& def = defs_[(size_t)defIndex];
+  const Tuning::Distant& tune = CurrentTuning().distant;
+  const size_t base = def.limbs.size();
+  const size_t nApp = rec.appendedNames.size();
+  // A record the def no longer fits (its base limbs are the def's, by index)
+  // is not guessed at: it stays parked, and the window reaching it unparks it.
+  if (!rec.haveGear || base == 0 || rec.limbs.size() != base + nApp) return false;
+  d = DistantMob{};
+  d.defIndex = defIndex;
+  d.defName = def.name;
+  d.refId = rec.refId;
+  d.origin = rec.origin;
+  d.steer.heading = rec.heading;
+  d.steer.desiredHeading = rec.heading;
+  d.worldSize = def.worldSize;
+  d.speed = def.speed;
+  d.loco = def.skel.loco;
+  Mob::TerrainBudgetsOf(def, d.stepUpCells, d.stepDownCells, d.headroomCells);
+  d.aquatic = def.swim.present;
+  d.canFloat = !d.aquatic && (!def.slither.present || def.slither.upright) &&
+               def.skel.FindClip("tread") >= 0;
+  // ---- THE BRAIN: OverlayMobRecord's rule (a fresh brain on the profile the
+  // record names, and its five facts) ----
+  {
+    const int profile = rec.brainProfile.empty() ? -1 : behaviors_.Find(rec.brainProfile);
+    d.brain = ai::Brain(profile);
+    if (rec.haveBrain) {
+      d.brain.targetId = rec.targetId;
+      d.brain.hasTarget = rec.hasTarget != 0;
+      d.brain.targetPos = rec.targetPos;
+      d.brain.lastSeenPos = rec.lastSeenPos;
+      d.brain.lastSeenTick = rec.lastSeenTick;
+    }
+  }
+  // ---- THE ABSTRACT BODY: one entry per RECORD limb (DemoteToDistant's) ----
+  auto attached = [&](int i) {
+    return i >= 0 && (size_t)i < rec.limbs.size() && rec.limbs[(size_t)i].kind != kLimbSevered;
+  };
+  for (size_t i = 0; i < rec.limbs.size(); i++) {
+    d.limbHp.push_back(rec.limbs[i].hp);
+    DistantLimbRole role;
+    if (attached((int)i)) role.flags |= kDistantLimbAttached;
+    if (i < base) {
+      const MobLimbDef& ld = def.limbs[i];
+      if (ld.vital) role.flags |= kDistantLimbVital;
+      if (ld.severable) role.flags |= kDistantLimbSeverable;
+      if (ld.bloodless) role.flags |= kDistantLimbBloodless;
+      if ((int)i == def.rootLimb) role.flags |= kDistantLimbRoot;
+      role.tag = ld.tag;
+    } else {
+      // An appended slot, by the name the rig gave it (Mob::AppendWornShell
+      // "worn:<item>:<host>", Mob::EquipItem "item:<name>").
+      const std::string& nm = rec.appendedNames[i - base];
+      if (nm.rfind("worn:", 0) == 0) {
+        role.flags |= kDistantLimbWorn | kDistantLimbBloodless | kDistantLimbSeverable;
+        role.tag = "worn";
+      } else if (nm.rfind("item:", 0) == 0) {
+        role.flags |= kDistantLimbHeld;
+        role.tag = "item";
+        const ItemDef* it = items_ != nullptr ? items_->Named(nm.substr(5)) : nullptr;
+        if (it == nullptr || it->severable) role.flags |= kDistantLimbSeverable;
+      }
+    }
+    d.limbRole.push_back(std::move(role));
+  }
+  for (size_t i = 0; i < base; i++)
+    if (!def.limbs[i].bloodless) d.hpFull += std::max(0.0f, def.limbs[i].hp);
+  d.baseLimbs = (int)base;
+  d.dead = rec.dead;
+  d.cause = rec.dead ? rec.deathCause : std::string();
+  d.deathSeq = rec.dead ? rec.deathSeq : 0;
+  d.groundMode = ClassifyDistantGround(d.origin, d.worldSize, tune.surfaceSnapMaxVox,
+                                       sandvox::kDefaultSeed);
+  d.demotedTick = tick;
+  // THE LIVING ARRIVE AWAKE (a demotion's rule: decide once, then sleep if
+  // there is nothing to do); a corpse is asleep forever.
+  d.asleep = d.dead;
+  d.activated = true;
+  // ---- THE STATUE: the def's bare look; a corpse rests on its lowest limb --
+  d.look = DistantDraw::KeyOfDef(def);
+  d.statueRestY = d.origin.y;
+  if (d.dead) {
+    float lo = std::numeric_limits<float>::infinity();
+    for (size_t i = 0; i < base; i++)
+      if (attached((int)i)) lo = std::min(lo, rec.limbs[i].xf.pos.y);
+    if (std::isfinite(lo)) d.statueRestY = lo;
+    return true;
+  }
+  // ---- THE STATUSES (v13's tail) -------------------------------------------
+  if (rec.haveStatus) {
+    d.bloodLossPerTick = rec.bleedRate > 0.0f ? rec.bleedRate : 0.0f;
+    d.lastWoundLimb = (int16_t)std::clamp(rec.bleedLimb, -1, 32767);
+    d.burnTicksLeft = (uint16_t)std::min<uint32_t>(rec.burnTicksLeft, 65535u);
+    d.burnFrac = rec.burnFrac > 0.0f ? rec.burnFrac : 0.0f;
+    d.stumps = (uint8_t)std::min<uint32_t>(rec.stumps, 255u);
+  }
+
+  // ---- THE GEAR, read off the record (Mob::CaptureGear's list) -------------
+  const ItemDef* heldIn[kHands] = {nullptr, nullptr};
+  const ItemDef* sheath = nullptr;
+  const ItemInstance* quiver = nullptr;
+  std::vector<const ItemDef*> worn;
+  for (const ::net::WireGear& g : rec.gear) {
+    const ItemDef* it = items_ != nullptr ? items_->Of(g) : nullptr;
+    if (it == nullptr) continue;   // a retired item: it arrives without it
+    if (g.held) {
+      heldIn[g.held == 2u ? 1 : 0] = it;
+    } else if (g.equipSlot == (int)EquipSlotId::Back) {
+      if (it->IsQuiver()) quiver = &g;
+    } else if (g.equipSlot == (int)EquipSlotId::Sheath) {
+      sheath = it;
+    } else {
+      worn.push_back(it);
+    }
+  }
+  auto weaponIn = [&](int h) {
+    return heldIn[h] != nullptr && !heldIn[h]->IsShield() ? heldIn[h] : nullptr;
+  };
+  const bool shieldAny = (heldIn[0] != nullptr && heldIn[0]->IsShield()) ||
+                         (heldIn[1] != nullptr && heldIn[1]->IsShield());
+  // The base limb a body-part name is (a cover's host).
+  auto limbNamed = [&](const std::string& n) {
+    for (size_t i = 0; i < base; i++)
+      if (def.limbs[i].name == n) return (int)i;
+    return -1;
+  };
+  // NaturalWeaponUsable on the record: its part attached and every part of
+  // the chain whose effector it (or its parent) is.
+  auto usable = [&](const MobNaturalWeaponDef& nw) {
+    if (nw.partIndex < 0 || !attached(nw.partIndex)) return false;
+    for (const IkChain& ch : def.skel.chains) {
+      if (ch.effector != nw.partIndex &&
+          !(nw.partIndex < (int)def.skel.parts.size() &&
+            def.skel.parts[(size_t)nw.partIndex].parent == ch.effector))
+        continue;
+      for (int p : ch.parts)
+        if (!attached(p)) return false;
+    }
+    return true;
+  };
+  auto handPartOf = [&](int h) {
+    const int si = def.FindSocket(HandContext(HandAt(h)));
+    return si >= 0 ? def.sockets[(size_t)si].partIndex : -1;
+  };
+  // Mob::HandFist: the natural weapon riding the hand's part, when usable.
+  auto fistOf = [&](int h) -> const MobNaturalWeaponDef* {
+    const int hp = handPartOf(h);
+    if (hp < 0) return nullptr;
+    for (const MobNaturalWeaponDef& nw : def.natural)
+      if (nw.partIndex == hp) return usable(nw) ? &nw : nullptr;
+    return nullptr;
+  };
+  // Mob::StrikeProfileFor: the gauntlet's override (a worn piece whose cover
+  // names the weapon's own limb, carrying a `strike` block), then the
+  // creature's own infection on anything that bites.
+  auto strikeOf = [&](const MobNaturalWeaponDef& nw) {
+    StrikeProfile p = nw.strike;
+    if (nw.partIndex >= 0)
+      for (const ItemDef* it : worn) {
+        if (!it->strike.Any()) continue;
+        bool covers = false;
+        for (const ItemCover& cv : it->cover)
+          covers = covers || (limbNamed(cv.part) == nw.partIndex && attached(nw.partIndex));
+        if (!covers) continue;
+        p.cut = it->strike.cut;
+        p.blunt = it->strike.blunt;
+        p.bluntCarve = it->strike.bluntCarve;
+        p.armorBreak = it->strike.armorBreak;
+        p.bite = it->strike.bite;
+      }
+    if (p.bite > 0.0f) {
+      if (p.infectMat == 0) p.infectMat = def.bite.infectMat;
+      if (p.infectStain == 0) p.infectStain = def.bite.infectStain;
+    }
+    return p;
+  };
+
+  // ---- THE KIT (distant::BuildDistantKit's fields, off the record) ---------
+  const ai::Profile* pr = behaviors_.At(d.brain.profile);
+  distant::DistantKit& k = d.kit;
+  k.def = def.name;
+  k.slack = def.worldSize.z * 0.5f;
+  k.bleeds = def.bleedMat != 0;
+  k.absorbRuined = true;   // a ruined limb is still in the way (DemoteToDistant's)
+  if (pr != nullptr) k.profile = pr->name;
+  const ItemDef* right = weaponIn(0);
+  const ItemDef* left = weaponIn(1);
+  k.guard = shieldAny ? distant::GuardClass::Shield
+            : (right != nullptr || left != nullptr) ? distant::GuardClass::Blade
+                                                    : distant::GuardClass::None;
+  // THE STRIKE HAND's item, for the form a held style resolves to (the right
+  // fist's weapon first, as the strike hand defaults).
+  const ItemDef* strikeItem = right != nullptr ? right : left;
+  const int strikeHand = right != nullptr ? 0 : left != nullptr ? 1 : -1;
+  const int form = FormForItem(strikeItem);
+  const float armBones = strikeHand >= 0 ? RestChainBones(def, handPartOf(strikeHand)) : 0.0f;
+  if (pr != nullptr) {
+    for (const std::string& n : pr->attack.styles) {
+      if (k.styles.size() >= 8) break;   // PickAttackStyle's own ceiling
+      const int idx = styles_.Find(n);
+      const AttackStyle* sty = styles_.At(idx);
+      if (sty == nullptr) continue;
+      const bool held = sty->weapon.empty() || sty->weapon == "held";
+      // StyleUsable on the record.
+      const MobNaturalWeaponDef* nw = nullptr;
+      if (held) {
+        const bool can = right != nullptr || left != nullptr ||
+                         (heldIn[0] == nullptr && fistOf(0) != nullptr) ||
+                         (heldIn[1] == nullptr && fistOf(1) != nullptr);
+        if (!can) continue;
+        if (strikeItem == nullptr) {
+          nw = heldIn[0] == nullptr ? fistOf(0) : nullptr;
+          if (nw == nullptr && heldIn[1] == nullptr) nw = fistOf(1);
+        }
+      } else {
+        const int ni = def.FindNatural(sty->weapon);
+        nw = ni >= 0 ? &def.natural[(size_t)ni] : nullptr;
+        if (nw == nullptr || !usable(*nw)) continue;
+      }
+      distant::DistantStyle ds;
+      ds.style = idx;
+      ds.form = items_ != nullptr ? styles_.ResolveForm(idx, form) : idx;
+      ds.name = sty->name;
+      ds.fallback = sty->fallback;
+      ds.held = held;
+      const AttackStyle* played = styles_.At(ds.form);
+      distant::StyleTimingOf(played != nullptr ? *played : *sty, ds.impactTicks, ds.totalTicks);
+      // THE REACH (StyleReachOn's three terms on the rest pose; see above).
+      float effector = 0.0f;
+      if (sty->reach > 0.0f) {
+        effector = sty->reach;
+      } else {
+        if (nw != nullptr) {
+          int hp = -1;
+          const bool chained = Mob::ChainForEffector(def.skel, nw->partIndex, hp) != nullptr;
+          effector = chained ? RestChainBones(def, nw->partIndex)
+                             : (nw->edgeTo - nw->edgeFrom).len() * 0.60f;
+        } else if (strikeItem != nullptr) {
+          effector = armBones * 0.25f;
+          if (strikeItem->hasEdge) effector += (strikeItem->edgeTo - strikeItem->edgeFrom).len();
+          else effector = std::max(effector, strikeItem->reach);
+        }
+        effector += LungeClosesVox(*sty, 1.0f);
+      }
+      ds.reach = effector;
+      if (!(ds.reach > 0.0f)) ds.reach = std::max(1.0f, pr->attack.reach);
+      if (held && strikeItem != nullptr) {
+        ds.strike = strikeItem->strike;
+        ds.weapon = strikeItem->name;
+      } else if (nw != nullptr) {
+        ds.strike = strikeOf(*nw);
+        ds.weapon = nw->name;
+        ds.natural = true;
+      }
+      ds.kind = distant::DominantKind(ds.strike);
+      k.styles.push_back(std::move(ds));
+    }
+  }
+  if (!def.closeStyle.empty())
+    for (size_t i = 0; i < k.styles.size(); i++)
+      if (k.styles[i].name == def.closeStyle) {
+        k.closeStyle = (int)i;
+        k.closeRange = def.closeStyleRange;
+        break;
+      }
+  // ---- THE BODY: roles, vitality, the shells over each limb ----------------
+  k.limbs.resize(base);
+  for (size_t i = 0; i < base; i++) {
+    const MobLimbDef& ld = def.limbs[i];
+    distant::DistantLimb& L = k.limbs[i];
+    L.name = ld.name;
+    L.bloodless = ld.bloodless;
+    L.role = distant::LimbRoleOf(ld.tag, ld.name, ld.bloodless);
+    L.vital = ld.vital || (int)i == def.rootLimb;
+    L.alive = attached((int)i);
+    L.maxHp = ld.hp;
+    L.severable = ld.severable && (int)i != def.rootLimb;
+    if (!ld.parent.empty()) L.parent = limbNamed(ld.parent);
+  }
+  for (const ItemDef* it : worn)
+    for (const ItemCover& cv : it->cover) {
+      const int host = limbNamed(cv.part);
+      if (host < 0 || !attached(host)) continue;
+      // The shell's slot in the record (its name is the rig's): severed or
+      // absent = the shell is not there any more.
+      const std::string slotName = "worn:" + it->name + ":" + cv.part;
+      int slot = -1;
+      for (size_t j = 0; j < nApp && slot < 0; j++)
+        if (rec.appendedNames[j] == slotName) slot = (int)(base + j);
+      if (slot < 0 || !attached(slot)) continue;
+      const MobRecord::LimbState& s = rec.limbs[(size_t)slot];
+      uint32_t mat = 0;
+      if (s.kind == kLimbStored && !s.skinVoxels.empty())
+        mat = DominantMat(s.skinVoxels, [](const PrefabVoxel& v) { return (uint32_t)(v.material & 0xFFFu); });
+      else if (s.kind == kLimbStored && !s.voxels.empty())
+        mat = DominantMat(s.voxels, [](const DebrisVoxel& v) { return (uint32_t)(v.payload & 0xFFFu); });
+      else
+        mat = DominantMat(cv.voxels, [](const PrefabVoxel& v) { return (uint32_t)(v.material & 0xFFFu); });
+      const float hard = mat != 0 && mat < matGpu_.size() ? (float)matGpu_[mat].hardness : 0.0f;
+      k.limbs[(size_t)host].shellHardness = std::max(k.limbs[(size_t)host].shellHardness, hard);
+    }
+  // ---- THE FISTS ------------------------------------------------------------
+  for (int h = 0; h < kHands; h++) {
+    DistantMob::DistantHand& H = d.hands[h];
+    const int part = handPartOf(h);
+    if (part >= 0) {
+      int n = 0, eff = -1;
+      H.parts[n++] = (int16_t)part;
+      if (const IkChain* ch = Mob::ChainForEffector(def.skel, part, eff))
+        for (int p : ch->parts)
+          if (n < 4 && p != part) H.parts[n++] = (int16_t)p;
+    }
+    H.shield = heldIn[h] != nullptr && heldIn[h]->IsShield();
+    H.weapon = heldIn[h] != nullptr && !H.shield;
+    if (H.weapon) {
+      H.weaponStrike = heldIn[h]->strike;
+      H.weaponName = heldIn[h]->name;
+    }
+    if (const MobNaturalWeaponDef* nw = fistOf(h)) {
+      H.fist = true;
+      H.fistStrike = strikeOf(*nw);
+      H.fistName = nw->name;
+      H.fistReach = RestChainBones(def, nw->partIndex);
+      if (!(H.fistReach > 0.0f) && pr != nullptr)
+        H.fistReach = std::max(1.0f, pr->attack.reach * 0.5f);
+    }
+  }
+  // ---- THE BOW, ITS ARROWS, THE SIDEARM -------------------------------------
+  int shots = 0;
+  if (items_ != nullptr)
+    for (int h = 0; h < kHands; h++) {
+      const ItemDef* bow = heldIn[h];
+      if (bow == nullptr || !bow->IsBow()) continue;
+      const ItemDef* arrow = items_->Named(bow->bow.ammo);
+      k.ammo = bow->bow.ammo;
+      k.arrowDamage = arrow != nullptr ? arrow->arrow.damage : 0.0f;
+      k.arrowSpeed = BowArrowSpeed(*bow, BowFullDrawTicks(*bow));
+      // KitAmmoCount: the worn quiver's held list.
+      if (quiver != nullptr)
+        for (const ItemInstance& a : quiver->held)
+          if (!a.Empty() && a.name == bow->bow.ammo) shots += std::max(0, a.count);
+      k.shots = shots;
+      k.ranged = shots > 0 && k.arrowSpeed > 0.0f;
+      d.bowHand = (int8_t)h;
+      d.bowWindupTicks = bow->bow.windupTicks;
+      d.bowDrawTicks = bow->bow.drawTicks;
+      if (sheath != nullptr && !sheath->IsBow()) {
+        d.haveSidearm = true;
+        d.sidearm = sheath->name;
+        d.sidearmStrike = sheath->strike;
+        d.sidearmReach = 0.25f * d.hands[h].fistReach + sheath->reach;
+      }
+      break;
+    }
+  if (pr != nullptr && pr->ranged.maxRange > 0.0f) d.ammo = shots;
+  d.armed = strikeItem != nullptr;
+  d.canGuard = d.armed || shieldAny;
+  d.hasKit = !k.limbs.empty() && k.limbs.size() <= d.limbHp.size();
+  // A hand whose arm came off at distance (the record's limbs say so, its
+  // gear still lists what it held) lets go now; a hand too hurt to grip, too.
+  ApplyGripRule(d, CurrentTuning().melee.injuredArmDrop, tick, distant_);
+  return true;
+}
+
+uint32_t MobSystem::ActivateParked(ChunkStore& store, World& world, uint32_t tick) {
+  const Tuning::Distant& tune = CurrentTuning().distant;
+  // Off with the switch; nowhere to have come from without parking.
+  if (!tune.enabled || !parkFn_) return 0;
+  const IVec3 wo = world.WindowOrigin();
+  const uint64_t epoch = store.EntityEpoch();
+  // ---- IS A SCAN DUE (rule 2) ----------------------------------------------
+  const bool roomFreed = actRoomAt_ != SIZE_MAX && distant_.Count() < actRoomAt_;
+  const bool stride = tick >= actTick_ + kActivateStrideTicks || tick < actTick_;
+  const bool due = !actHave_ || wo.x != actWo_.x || wo.y != actWo_.y || wo.z != actWo_.z ||
+                   epoch != actEpoch_ || parkedTotal_ != actParked_ ||
+                   std::memcmp(&actRadius_, &tune.radius, sizeof(float)) != 0 || actPending_ ||
+                   roomFreed || stride;
+  if (!due) return 0;
+  actHave_ = true;
+  actWo_ = wo;
+  actEpoch_ = epoch;
+  actParked_ = parkedTotal_;
+  actRadius_ = tune.radius;
+  actTick_ = tick;
+  actPending_ = false;
+  actRoomAt_ = SIZE_MAX;
+  distant_.Note(&DistantMobs::Stats::activateScans);
+
+  // ---- THE CANDIDATES: every 'MOBS' record beyond the park pad and inside
+  // the radius, in the regions the store knows inside the radius's box ----
+  const Vec3 wlo{(float)(wo.x * (int)kChunk), (float)(wo.y * (int)kChunk),
+                 (float)(wo.z * (int)kChunk)};
+  const Vec3 wc = WindowCentre(wlo);
+  const float r = tune.radius;
+  // PreTick's park rule's pad: a record nearer the window than this is where
+  // a creature would still be NEAR (or parked in the band), not distant.
+  const float kPad = 16.0f;
+  const float hi = (float)kWorldN + kPad;
+  auto beyondPad = [&](Vec3 p) {
+    return p.x < wlo.x - kPad || p.y < wlo.y - kPad || p.z < wlo.z - kPad ||
+           p.x > wlo.x + hi || p.y > wlo.y + hi || p.z > wlo.z + hi;
+  };
+  const IVec3 rlo = ChunkStore::RegionOfVoxel(Vec3{wc.x - r, wc.y - r, wc.z - r});
+  const IVec3 rhi = ChunkStore::RegionOfVoxel(Vec3{wc.x + r, wc.y + r, wc.z + r});
+  thread_local std::vector<IVec3> regs;
+  store.EntityRegionsAny(regs);
+  struct Cand {
+    float d2;
+    uint32_t reg, idx;
+  };
+  thread_local std::vector<Cand> cands;
+  cands.clear();
+  thread_local std::vector<IVec3> inBox;
+  inBox.clear();
+  for (const IVec3& rc : regs) {
+    if (rc.x < rlo.x || rc.x > rhi.x || rc.y < rlo.y || rc.y > rhi.y || rc.z < rlo.z ||
+        rc.z > rhi.z)
+      continue;
+    const std::vector<ChunkStore::EntityRecord>& bucket = store.DormantEntities(rc);
+    if (bucket.empty()) continue;
+    const uint32_t ri = (uint32_t)inBox.size();
+    inBox.push_back(rc);
+    for (size_t i = 0; i < bucket.size(); i++) {
+      const ChunkStore::EntityRecord& e = bucket[i];
+      if (e.section != kMobsFourCC || !beyondPad(e.pos)) continue;
+      const float d2 = DistSq(e.pos, wc);
+      if (!(d2 <= r * r)) continue;
+      cands.push_back({d2, ri, (uint32_t)i});
+    }
+  }
+  if (cands.empty()) return 0;
+  // NEAREST FIRST, ties by region then record order: a total order, so who
+  // comes back is a pure function of the store and the window.
+  std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+    if (a.d2 != b.d2) return a.d2 < b.d2;
+    if (a.reg != b.reg) return a.reg < b.reg;
+    return a.idx < b.idx;
+  });
+  // THE NEAR CROWD'S SHARE of the tier is never taken (mob.h kActivateReserve).
+  const size_t cap = distant_.Cap();
+  const size_t limit = cap > kActivateReserve ? cap - kActivateReserve : 0;
+
+  uint32_t made = 0, builds = 0;
+  struct Taken {
+    uint32_t reg, idx;
+  };
+  thread_local std::vector<Taken> taken;
+  taken.clear();
+  for (const Cand& k : cands) {
+    if (made >= kActivatePerCall) {
+      distant_.Note(&DistantMobs::Stats::activateBudgetWaits);
+      actPending_ = true;
+      break;
+    }
+    if (distant_.Count() >= limit) {
+      distant_.Note(&DistantMobs::Stats::activateRoomWaits);
+      actRoomAt_ = distant_.Count();
+      break;
+    }
+    distant_.Note(&DistantMobs::Stats::activateRecordsSeen);
+    // Re-fetched per candidate: DormantEntities may rehash the store's map.
+    const ChunkStore::EntityRecord& e = store.DormantEntities(inBox[k.reg])[k.idx];
+    // ---- THE FORMAT: this build's record, in this process's material table.
+    // Anything else stays parked -- its unpark is the path that remaps and
+    // reads old versions.
+    std::vector<uint8_t> bytes = e.bytes;
+    uint32_t version = e.version;
+    if (store.Tables().RemapFor(e.matTable) != nullptr ||
+        !UpgradeRecordToCurrent(bytes, version)) {
+      distant_.Note(&DistantMobs::Stats::activateKept);
+      continue;
+    }
+    const bool upgraded = version != e.version;
+    MobRecord rec;
+    {
+      ByteReader rd{bytes.data(), bytes.size()};
+      if (!ReadMobRecord(rd, rec, version) || !rd.ok || rd.off != bytes.size()) {
+        distant_.Note(&DistantMobs::Stats::activateKept);
+        continue;
+      }
+    }
+    // A player's corpse lives in its own id band (LoadOne renumbers it); it
+    // stays parked until the window reaches it.
+    if (rec.playerCorpse) {
+      distant_.Note(&DistantMobs::Stats::activateKept);
+      continue;
+    }
+    // ONE REF, ONE BODY (LoadOne's rule): a record for a ref that already has
+    // a creature standing, in either tier, is a duplicate -- dropped for good.
+    if (!rec.refId.empty() && LocateByRef(rec.refId).exists) {
+      std::printf("distant: a parked record for ref '%s' while that ref already has a body; "
+                  "the duplicate is dropped\n",
+                  rec.refId.c_str());
+      distant_.Note(&DistantMobs::Stats::activateDropped);
+      taken.push_back({k.reg, k.idx});
+      continue;
+    }
+    // ---- THE DEF. One not loaded (a pool body, a composition) is BUILT, at
+    // most kActivateDefBuildsPerCall a call: a pool body's first build reads
+    // files. The tier does not hold it (D0's rule): evicted later, the
+    // promotion's LoadOne re-resolves it by name.
+    int defIndex = FindDef(rec.defName);
+    if (defIndex < 0) {
+      if (builds >= kActivateDefBuildsPerCall) {
+        distant_.Note(&DistantMobs::Stats::activateDefWaits);
+        actPending_ = true;
+        continue;
+      }
+      builds++;
+      defIndex = FindOrComposeDef(rec.defName);
+      if (defIndex < 0) {
+        distant_.Note(&DistantMobs::Stats::activateKept);
+        continue;
+      }
+    }
+    DistantMob d;
+    if (!DistantFromRecord(rec, defIndex, tick, d)) {
+      distant_.Note(&DistantMobs::Stats::activateKept);
+      continue;
+    }
+    // THE OVERLAY MUST ROUND-TRIP (DemoteToDistant's proof, statuses
+    // included): the creature just built, patched back into its record, must
+    // give the record's own bytes -- or what it would retire, save or promote
+    // as is not what was parked. A record that fails stays parked, logged.
+    {
+      std::vector<uint8_t> probe = bytes;
+      if (!PatchMobRecord(probe, kSaveVersion, d.Overlay()) || probe != bytes) {
+        std::fprintf(stderr,
+                     "distant: a parked '%s' record did not round-trip its own overlay; "
+                     "left parked\n",
+                     rec.defName.c_str());
+        distant_.Note(&DistantMobs::Stats::failed);
+        distant_.Note(&DistantMobs::Stats::activateKept);
+        continue;
+      }
+    }
+    d.record = std::move(bytes);
+    d.id = nextId_++;
+    d.kit.id = d.id;
+    const bool dead = d.dead;
+    if (!distant_.Insert(std::move(d))) {
+      // Room was checked above and the id is fresh: unreachable, but the
+      // record stays parked rather than lost.
+      distant_.Note(&DistantMobs::Stats::failed);
+      continue;
+    }
+    taken.push_back({k.reg, k.idx});
+    made++;
+    distant_.Note(&DistantMobs::Stats::activated);
+    if (dead) distant_.Note(&DistantMobs::Stats::activatedDead);
+    if (upgraded) distant_.Note(&DistantMobs::Stats::activateUpgraded);
+  }
+  // ---- OUT OF THE BUCKETS (taking a record out IS making it live, S5b): per
+  // region, highest index first so the others keep theirs ----
+  std::sort(taken.begin(), taken.end(), [](const Taken& a, const Taken& b) {
+    return a.reg != b.reg ? a.reg < b.reg : a.idx > b.idx;
+  });
+  for (const Taken& t : taken) {
+    std::vector<ChunkStore::EntityRecord>& bucket = store.DormantEntities(inBox[t.reg]);
+    if (t.idx < bucket.size()) bucket.erase(bucket.begin() + (ptrdiff_t)t.idx);
+  }
+  return made;
+}
+
+// ---- the resident layer's doors (mob.h) ------------------------------------------
+bool MobSystem::WakeDistant(uint64_t id) {
+  DistantMob* d = distant_.Find(id);
+  if (d == nullptr || d->dead) return false;
+  if (d->asleep) {
+    d->asleep = false;
+    d->wakeTick = 0;
+    d->wakes++;
+  }
+  distant_.MarkAwakeHint();
+  return true;
+}
+
+bool MobSystem::SetDistantRoutineClock(uint64_t id, uint32_t wakeTick) {
+  DistantMob* d = distant_.Find(id);
+  if (d == nullptr || d->dead) return false;
+  d->routineWakeTick = wakeTick;
+  return true;
+}
+
+bool MobSystem::SeverDistantForTest(uint64_t id, int limb, uint32_t tick) {
+  DistantMob* d = distant_.Find(id);
+  if (d == nullptr || d->dead || !d->hasKit || limb < 0 || (size_t)limb >= d->kit.limbs.size())
+    return false;
+  const distant::DistantLimb& L = d->kit.limbs[(size_t)limb];
+  // A vital limb off is a death, which is the impact pass's to book.
+  if (!L.alive || L.vital || !L.severable) return false;
+  // THE IMPACT PASS's own sever (TickDistant (d)): the subtree off, the
+  // record's limbs marked off, the stump, the gout's owed blood, then the
+  // grip rule.
+  distant::DistantVitals v;
+  LoadVitals(*d, v);
+  std::vector<int> off;
+  const distant::DistantDeath died = distant::SeverLimb(v, d->kit, limb, distantCalib_, &off);
+  for (const int li : off)
+    if ((size_t)li < d->limbRole.size()) d->limbRole[(size_t)li].flags &= ~kDistantLimbAttached;
+  StoreVitals(v, *d);
+  d->lastWoundLimb = (int16_t)limb;
+  distant_.Note(&DistantMobs::Stats::severs);
+  ApplyGripRule(*d, CurrentTuning().melee.injuredArmDrop, tick, distant_);
+  if (d->asleep) {
+    d->asleep = false;
+    d->wakeTick = 0;
+    distant_.MarkAwakeHint();
+  }
+  return died == distant::DistantDeath::None;
 }

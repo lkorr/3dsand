@@ -48,6 +48,7 @@
 
 class Mob;
 struct ItemLibrary;
+struct AttackStyle;
 
 namespace ai {
 // THE DISTANT TIER'S DRAW STREAMS, defined in ai_behavior.cpp BESIDE the AI's
@@ -349,6 +350,12 @@ struct DistantKit {
 // the straps do not decide whether a sword gets through). One lattice scan per
 // worn slot: a demotion's cost, not a tick's.
 std::vector<float> ShellHardnessOfLimbs(const Mob& m);
+
+// A style's authored timing in ticks: the impact (the windup with
+// BeginStrokeProgram's two-tick floor, then half the cut) and the whole stroke
+// (every frame plus the release). What a kit's DistantStyle::impactTicks /
+// totalTicks hold, from a rig or (D5+D6) from a record.
+void StyleTimingOf(const AttackStyle& sty, int& impact, int& total);
 
 // Cache the kit from a LIVE creature (the demotion, before ReleaseRig).
 // `items` may be null (no held-weapon profiles then); a null-system or
