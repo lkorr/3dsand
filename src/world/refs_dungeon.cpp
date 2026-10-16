@@ -894,7 +894,12 @@ void TickSpawner(RefCtx& c, const Ref& r, SpawnerLive& L) {
     // turns up in an empty or dead slot (a save from before this rule) --
     // before anything else reads the id. Each pass renames one body, so the
     // loop ends.
-    while (m != nullptr && !m->Alive()) {
+    //
+    // IN EITHER TIER (docs/PLAN_distant_npcs.md §2.14): a corpse that is
+    // DISTANT right now gives the name back the same way (SetDistantRefId:
+    // its patched record carries the new one), and the new name is unique
+    // across both tiers, or the renamed corpse would collide with one there.
+    auto renameDead = [&]() {
       if (s.state == 1) {
         s.state = 2;
         s.deadTick = c.tick;
@@ -903,12 +908,31 @@ void TickSpawner(RefCtx& c, const Ref& r, SpawnerLive& L) {
       }
       const std::string stem = sid + "#dead" + std::to_string(s.serial);
       std::string dead = stem;
-      for (uint32_t n = 1; c.mobs->FindMobByRef(dead) != nullptr; n++) dead = stem + "." + std::to_string(n);
-      m->SetRefId(dead);
+      for (uint32_t n = 1; c.mobs->LocateByRef(dead).exists; n++) dead = stem + "." + std::to_string(n);
+      return dead;
+    };
+    while (m != nullptr && !m->Alive()) {
+      m->SetRefId(renameDead());
       m = c.mobs->FindMobByRef(sid);
     }
+    // THE SLOT'S CREATURE MAY HAVE WALKED OUT OF THE WINDOW (§2.14): alive in
+    // the distant tier, the slot is OCCUPIED (never "missing" -- 600 ticks of
+    // that and the spawner made a duplicate); dead there, it is booked and
+    // renamed like the near corpse above. Bounded: each pass renames one.
+    bool farAlive = false;
+    if (m == nullptr)
+      for (const DistantMob* far = c.mobs->Distant().FindByRef(sid); far != nullptr;
+           far = c.mobs->Distant().FindByRef(sid)) {
+        if (!far->dead) {
+          farAlive = true;
+          break;
+        }
+        c.mobs->SetDistantRefId(far->id, renameDead());
+      }
     if (s.state == 1) {
-      if (m == nullptr) {
+      if (m == nullptr && farAlive) {
+        s.missing = 0;   // away, not missing
+      } else if (m == nullptr) {
         if (++s.missing > kSpawnMissingTicks) {
           s.state = 2;
           s.deadTick = c.tick;
@@ -1412,8 +1436,14 @@ void RegisterDungeonKinds() {
         ForgetResident(sid);
         // The author changed or removed the spawner: its creatures go too
         // (the npc kind's rule), and the new line starts from nothing.
-        if ((why == RefEvent::Edited || why == RefEvent::Deleted) && c.mobs != nullptr)
+        // EITHER TIER (docs/PLAN_distant_npcs.md §2.14): a creature of the
+        // slot that is distant right now would otherwise walk back in beside
+        // the new line.
+        if ((why == RefEvent::Edited || why == RefEvent::Deleted) && c.mobs != nullptr) {
           if (Mob* m = c.mobs->FindMobByRef(sid)) c.mobs->RemoveMob(m->Id());
+          if (const DistantMob* far = c.mobs->Distant().FindByRef(sid))
+            c.mobs->RemoveMob(far->id);
+        }
       }
     DW().spawners.erase(r.id);
     Deact(r.id);

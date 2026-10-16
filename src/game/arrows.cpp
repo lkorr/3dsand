@@ -251,10 +251,80 @@ bool PullArrowSlotToKit(Mob& m, int li, Kit& kit, const ItemLibrary& items,
 
 // ---- THE ARROWS IN FLIGHT ------------------------------------------------------
 
+float ArrowGravityPerTick2() { return (float)kArrowGravityFx / (float)kSpellFxOne; }
+
+ArrowOutside ArrowStepOutside(SpellFxVec& pos, SpellFxVec& vel, const World& world,
+                              const std::function<bool(int, int, int)>& solid) {
+  // ArrowFlights::Tick's integrator, line for line: gravity off the velocity,
+  // then the tick's move in half-voxel samples (the same step count rule), so
+  // a flight handed over at the boundary is on the arc it would have flown.
+  vel.y -= kArrowGravityFx;
+  const int32_t kHalf = kSpellFxOne / 2;
+  const int64_t maxComp = std::max({(int64_t)std::abs(vel.x), (int64_t)std::abs(vel.y),
+                                    (int64_t)std::abs(vel.z)});
+  int32_t steps = (int32_t)((maxComp + kHalf - 1) / kHalf);
+  steps = std::clamp(steps, 1, 512);
+  SpellFxVec p = pos;
+  for (int32_t s = 0; s < steps; s++) {
+    SpellFxVec next = p;
+    next.x += vel.x / steps;
+    next.y += vel.y / steps;
+    next.z += vel.z / steps;
+    const int cx = SpellFxFloor(next.x), cy = SpellFxFloor(next.y), cz = SpellFxFloor(next.z);
+    if (world.CellInWindow({cx, cy, cz})) {
+      pos = next;
+      return ArrowOutside::Entered;
+    }
+    if (solid && solid(cx, cy, cz)) {
+      pos = p;
+      return ArrowOutside::Grounded;
+    }
+    p = next;
+  }
+  pos = p;
+  return ArrowOutside::Flying;
+}
+
+bool ArrowFlights::Inject(const ItemDef& arrow, SpellFxVec pos, SpellFxVec vel,
+                          uint32_t seed, const ArrowShot& shot, int ticksLeft) {
+  if (!arrow.IsAmmo()) return false;
+  if (vel.x == 0 && vel.y == 0 && vel.z == 0) return false;
+  if ((int)live_.size() >= kMaxLive) {
+    stats.refused++;
+    return false;
+  }
+  ArrowFlight f;
+  f.pos = pos;
+  f.prev = pos;
+  f.vel = vel;
+  f.item = arrow.name;
+  // The arrow as an object (what embeds, sticks or drops): a distant archer's
+  // quiver is not simulated, so it is the plain item, uncoated.
+  f.arrow.name = arrow.name;
+  f.arrow.count = 1;
+  f.seed = seed;
+  f.ticksLeft = std::clamp(ticksLeft, 1, (int)kLifeTicks);
+  f.shot = shot;
+  // STEALTH: the shooter is the distant creature (an actor id like any mob's),
+  // and its loose point is the face it came in through. Already TWANGED: the
+  // bow was drawn out past the window, so nobody hears a release at the face.
+  f.shooter = shot.shooter;
+  f.from = FloatOf(pos);
+  f.twanged = true;
+  // Its own TRAIL (ArrowTrails keys a trail on fxId): left at 0, every
+  // injected arrow would share one trail that jumps between them.
+  f.fxId = ++nextFxId_;
+  // No ignore list: the shooter is a distant creature, with no bodies.
+  live_.push_back(std::move(f));
+  stats.launched++;
+  stats.injected++;
+  return true;
+}
+
 bool ArrowFlights::Launch(const ItemDef& arrow, Vec3 fromWorld, Vec3 dirWorld,
                           float speedVox, Vec3 carryVox, uint32_t seed,
                           std::vector<uint64_t> ignore, uint64_t shooterActor,
-                          const ItemInstance* inst) {
+                          const ItemInstance* inst, const ArrowShot& shot) {
   if (!arrow.IsAmmo()) return false;
   const float dl = dirWorld.len();
   if (!(dl > 1e-6f) || !(speedVox > 0.0f)) return false;
@@ -280,6 +350,7 @@ bool ArrowFlights::Launch(const ItemDef& arrow, Vec3 fromWorld, Vec3 dirWorld,
   f.ticksLeft = kLifeTicks;
   f.ignore = std::move(ignore);
   f.shooter = shooterActor;
+  f.shot = shot;
   f.from = fromWorld;
   f.fxId = ++nextFxId_;
   live_.push_back(std::move(f));
@@ -556,6 +627,60 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
     e.seed = f.seed;
     return e;
   };
+  // ---- PAST THE EDGE (D3, docs/PLAN_distant_npcs.md section 2.7) ----------
+  // A flight aimed at a creature that is DISTANT now leaves the window into
+  // that tier rather than into nothing: it is handed over at the point it
+  // left, with the speed it has, and the tier lands it by its ranged roll at
+  // the flight time left (MobSystem::QueueEdgeArrowOut; false = the target is
+  // no living distant creature, and the flight expires as before).
+  auto handOver = [&](const ArrowFlight& f, SpellFxVec at) {
+    // ---- D9: A PLAYER'S FLIGHT (no target named) flies ON past the edge: the
+    // distant tier takes it at exactly this fixed-point state and flies it
+    // over DistantGround, hitting the statues it meets (QueueEdgeShotOut;
+    // false = the switch is off, and the flight expires at the face as it
+    // always did). Spells are not arrows: they stay window-bound.
+    if (f.shot.target == 0) {
+      const ItemDef* def = w.items.Named(f.item);
+      NearShotOut s;
+      s.shooter = f.shooter;
+      s.tick = tick;
+      s.pos[0] = at.x;
+      s.pos[1] = at.y;
+      s.pos[2] = at.z;
+      s.vel[0] = f.vel.x;
+      s.vel[1] = f.vel.y;
+      s.vel[2] = f.vel.z;
+      s.seed = f.seed;
+      s.life = kLifeTicks - f.ticksLeft;
+      s.damage = def != nullptr ? def->arrow.damage : 0.0f;
+      s.ammo = f.item;
+      if (!w.mobs.QueueEdgeShotOut(s)) return false;
+      ArrowEvent e = event(ArrowEvent::Kind::Continued, f);
+      e.at = FloatOf(at);
+      Log(e);
+      stats.continued++;
+      return true;
+    }
+    const ItemDef* def = w.items.Named(f.item);
+    NearArrowOut o;
+    o.shooter = f.shot.shooter;
+    o.target = f.shot.target;
+    o.tick = tick;
+    o.from = f.from;
+    o.exit = FloatOf(at);
+    o.speed = (float)(std::sqrt((double)f.vel.x * f.vel.x + (double)f.vel.y * f.vel.y +
+                                (double)f.vel.z * f.vel.z) /
+                      kSpellFxOne * kArrowTicksPerSecond);
+    o.damage = def != nullptr ? def->arrow.damage : 0.0f;
+    o.ammo = f.item;
+    if (!w.mobs.QueueEdgeArrowOut(o)) return false;
+    ArrowEvent e = event(ArrowEvent::Kind::PastEdge, f);
+    e.mobId = f.shot.target;
+    e.at = o.exit;
+    Log(e);
+    stats.handedOut++;
+    return true;
+  };
   // An item body for this arrow: stuck (kinematic) or dropped (falling).
   // ...as ITSELF: the flight's own instance, its coat with it (a clean one
   // settles back to a plain arrow first, so it stacks again when picked up).
@@ -576,7 +701,11 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
     bool done = false;
     const IVec3 cell{SpellFxFloor(f.pos.x), SpellFxFloor(f.pos.y),
                      SpellFxFloor(f.pos.z)};
-    if (def == nullptr || !def->IsAmmo() || --f.ticksLeft <= 0 ||
+    if (def != nullptr && def->IsAmmo() && f.ticksLeft > 1 && !w.world.CellInWindow(cell) &&
+        handOver(f, f.pos)) {
+      // The window moved off it: out of the window AT A DISTANT CREATURE.
+      done = true;
+    } else if (def == nullptr || !def->IsAmmo() || --f.ticksLeft <= 0 ||
         !w.world.CellInWindow(cell)) {
       ArrowEvent e = event(ArrowEvent::Kind::Expired, f);
       e.at = FloatOf(f.pos);
@@ -631,10 +760,36 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
         p = next;
       }
       const SpellFxVec segEnd = wall ? wallAt : p;
+      const Vec3 a = FloatOf(start), b = FloatOf(segEnd);
+      Vec3 seg = b - a;
+      float len = seg.len();
+      Vec3 d = FloatOf(f.vel);
+      d = d.len() > 1e-6f ? d * (1.0f / d.len()) : Vec3{1, 0, 0};
+      if (len > 1e-4f) d = seg * (1.0f / len);
+      // ---- A DISTANT BODY ON THE SEGMENT (D9, docs/PLAN_distant_npcs.md) ---
+      // A creature of the distant tier standing in the window (the cap
+      // overflow's, or one held at the promotion line) is a statue with no
+      // collider: the bodies the ray below casts for cannot see it. So the
+      // segment is tested against the distant BODY BOXES published at the
+      // start of this tick (the earliest box, a tie to the lower id; never
+      // the shooter's own). One met cuts the segment there: the near bodies
+      // before it are still pierced as ever, and if nothing near stops the
+      // arrow it ends in that body below -- before the wall it would have
+      // struck, or the face it would have left by. No distant creature in
+      // the window: no box, and this is one empty-vector test.
+      DistantBoxHit boxHit;
+      const bool toBox = len > 1e-4f && w.mobs.DistantBoxAlong(a, b, f.shooter, boxHit);
+      if (toBox) {
+        seg = seg * boxHit.t;
+        len = len * boxHit.t;
+        wall = false;
+        left = false;
+      }
       // AN ARROW STRIKING MATTER IS HEARD WHERE IT STRUCK (stealth), and it
       // betrays nobody: a creature that hears it goes to look at the spot,
       // not at the archer -- which is what makes a shot into the wall behind
-      // a guard a distraction.
+      // a guard a distraction. (After the box test: an arrow a statue stopped
+      // never reached the wall.)
       if (wall) {
         stealth::Noise n;
         n.pos = n.point = FloatOf(wallAt);
@@ -643,12 +798,6 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
         n.kind = stealth::NoiseKind::Impact;
         w.mobs.PostNoise(n);
       }
-      const Vec3 a = FloatOf(start), b = FloatOf(segEnd);
-      const Vec3 seg = b - a;
-      const float len = seg.len();
-      Vec3 d = FloatOf(f.vel);
-      d = d.len() > 1e-6f ? d * (1.0f / d.len()) : Vec3{1, 0, 0};
-      if (len > 1e-4f) d = seg * (1.0f / len);
 
       // ---- THE BODIES ON THE SEGMENT: one ray, body to body ----------------
       if (len > 1e-4f) {
@@ -756,6 +905,29 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
         }
       }
 
+      // ---- A DISTANT BODY (D9): nothing near stopped it before the box ----
+      // Handed to the distant tier, which resolves it on the body at the top
+      // of its next impact pass (ResolveArrowContact: the limb nearest the
+      // arrow's line, the shell, the bleed). The arrow ends here: a statue
+      // holds no embedded arrows. Counted either way; with the tier refusing
+      // (its switch off since the boxes were published) it is simply spent.
+      if (!done && toBox) {
+        NearArrowBoxHit h;
+        h.shooter = f.shooter;
+        h.target = boxHit.id;
+        h.tick = tick;
+        h.hit = boxHit;
+        h.damage = def->arrow.damage;
+        h.ammo = f.item;
+        w.mobs.QueueEdgeArrowBoxHit(h);
+        ArrowEvent e = event(ArrowEvent::Kind::DistantHit, f);
+        e.mobId = boxHit.id;
+        e.at = boxHit.at;
+        e.dir = d;
+        Log(e);
+        stats.distantHits++;
+        done = true;
+      }
       // ---- THE GROUND: it sticks, point first ------------------------------
       if (!done && wall) {
         // From the last free sample, a hand's breadth or two into whatever
@@ -793,6 +965,13 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
         done = true;
       }
       // ---- OUT OF THE WINDOW: gone, as the tick-start check would say ------
+      // ...unless it was aimed at a creature that is distant now (D3): then
+      // it flies on in that tier, from the last in-window sample.
+      if (!done && left) {
+        if (handOver(f, p)) {
+          done = true;
+        }
+      }
       if (!done && left) {
         ArrowEvent e = event(ArrowEvent::Kind::Expired, f);
         e.at = FloatOf(p);

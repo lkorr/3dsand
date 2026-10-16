@@ -1032,6 +1032,10 @@ struct NpcStroke : StrokeCursor {
   // Set when a parry arrested this stroke (game/melee.h EdgeSweepResult), so
   // the dev readout and the gates can tell "it finished" from "it was stopped".
   bool arrested = false;
+  // THE EDGE (docs/PLAN_distant_npcs.md 2.7, D3): a stroke at a DISTANT
+  // creature queued its blow for the distant tier at its first cutting tick
+  // (MobSystem::QueueEdgeBlow). Once per stroke.
+  bool edgeQueued = false;
   // ---- WHAT THIS SWING DID, recorded at the point it happened -------------
   //
   // "The NPC does not seem to hit very hard" has at least four causes — the

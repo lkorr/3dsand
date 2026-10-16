@@ -381,6 +381,8 @@ TUNING_CONSUMER_ALLOWLIST = {
     # rows' defaults so the two cannot drift.
     "player.halfHeight": "scripts/test_mobgen.mjs (figure contract)",
     "player.eyeOffset": "scripts/test_mobgen.mjs (figure contract)",
+    # (The distant tier's rows batched ahead of their readers by D0 all have
+    # readers now: overflowMinDistVox, the last, is D8's -- game/distant.cpp.)
 }
 
 

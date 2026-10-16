@@ -1420,6 +1420,10 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
  */
 const WorldMapData& CurrentWorldMap();
 void SetCurrentWorldMap(WorldMapData map);
+/** Bumped by every SetCurrentWorldMap: a cache of a pure function of the map
+ *  (the distant tier's ground columns, game/distant.h) compares it instead of
+ *  the map's contents. Never 0 after the first map is set. */
+uint64_t CurrentWorldMapSerial();
 
 /** The NAME of the region of CurrentWorldMap() holding world column (x, z)
  *  (WorldMapData::RegionAt; its id when it has no name), "" when none does. */

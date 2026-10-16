@@ -870,6 +870,31 @@ struct Tuning {
     float occlusionWetKeep = TPD(audio, occlusionWetKeep);
   } audio;
 
+  // ---- the distant tier (docs/PLAN_distant_npcs.md, game/distant.h) ----
+  // CPU-only (every row NO_WGSL): creatures that keep existing past the
+  // residency window, out to `radius` around the window centre. Read once a
+  // tick by MobSystem's park rule and EntityParking's promotion pass.
+  struct Distant {
+    // THE SWITCH. On by default since D3 (2026-10-15). False = the park rule
+    // exactly as before (the tier stays empty): the parity oracle for every
+    // package, and what a gate testing the PARK path pins.
+    bool enabled = TPD(distant, enabled);
+    // Demote (instead of park) within this many world voxels of the window
+    // centre: 1280 = 128 m.
+    float radius = TPD(distant, radius);
+    // Retire (park the patched record) past radius + hysteresis.
+    float hysteresis = TPD(distant, hysteresis);
+    // D1: an awake, unengaged distant creature ticks every idleStride ticks.
+    int idleStride = TPD(distant, idleStride);
+    // SURFACE vs ANCHORED at demotion: feet within this of TerrainHeight and
+    // outside every placed dungeon box = SURFACE.
+    float surfaceSnapMaxVox = TPD(distant, surfaceSnapMaxVox);
+    // D1: the promotion landing's reported bound.
+    float promoteMaxDropVox = TPD(distant, promoteMaxDropVox);
+    // D8: the cap-overflow demotion's minimum distance from the player.
+    float overflowMinDistVox = TPD(distant, overflowMinDistVox);
+  } distant;
+
   // ---- Jolt rigid bodies ----
   struct Physics {
     float gravity = TPD(physics, gravity);

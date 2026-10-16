@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "game/distant.h"  // DistantRunTotals: the distant tier's counters
 #include "gpu/context.h"    // LastDeviceJson — which implementation ran
 #include "gpu/resources.h"
 #include "sim/oprecord.h"   // op-stream clamp counters + SANDVOX_RECORD_OPS
@@ -26,6 +27,7 @@
 #include "sim/tuningstamp.h"  // the tuning/materials/reactions desync stamp
 #include "sim/weather.h"     // leak reporter: the pinned weather preset
 #include "test/support.h"
+#include "game/distant_draw.h"  // the distantDraw block of last_run.json
 
 using namespace sandvox;
 
@@ -138,6 +140,17 @@ const std::vector<Gate>& BugReportGates();
 const std::vector<Gate>& AquaticGates();
 // The hit stagger (selftest_stagger.cpp): head / trunk blows on a walker.
 const std::vector<Gate>& StaggerGates();
+// Distant creatures' baked statues (selftest_distant_look.cpp, PLAN_distant_npcs D4a).
+const std::vector<Gate>& DistantLookGates();
+// Distant NPCs D2a (selftest_distant_calib.cpp): the duel matrix that
+// calibrates the distant tier's abstract hit model, and its resolver's unit arm.
+const std::vector<Gate>& DistantCalibGates();
+// The distant tier walks and sleeps (selftest_distant.cpp, PLAN_distant_npcs D1).
+const std::vector<Gate>& DistantGates();
+// The distant tier's life past the window: activation of parked records,
+// schedules walked at distance, saves that keep distant damage
+// (selftest_distant_life.cpp, PLAN_distant_npcs D5+D6).
+const std::vector<Gate>& DistantLifeGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -707,6 +720,50 @@ const char* const kOrder[] = {
     // world dir, and so REGENERATES worldgen at the home window on the way
     // out, removes its park function and clears the store.
     "mob-park",
+    // THE DISTANT TIER (docs/PLAN_distant_npcs.md D0). After `mob-park` for its
+    // exit contract and then some: tuning and the tier cap restored, mobs and
+    // debris reset, id counter put back, park function removed, store cleared,
+    // its save dir deleted, worldgen regenerated at the home window.
+    "distant-roundtrip",
+    // THE DISTANT TIER WALKS AND SLEEPS (docs/PLAN_distant_npcs.md D1). After
+    // `distant-roundtrip` for its exit contract: tuning restored, mobs and
+    // debris reset, park function removed, id counter put back, the store
+    // cleared (OnRegen), the window shifted back and worldgen regenerated at
+    // home; `distant-walk` also puts the world map back after its `peaks`
+    // arm. `distant-sleep` leaves the window where it found it (it ticks THE
+    // tick but never moves or edits it).
+    "distant-walk",
+    "distant-sleep",
+    // THE DISTANT TIER FIGHTS (docs/PLAN_distant_npcs.md D2b). After
+    // `distant-sleep` for the same exit contract: tuning, items and the id
+    // counter restored, mobs / debris / tier reset, ground caches dropped.
+    // Neither moves or edits the window; `distant-fight` ticks THE tick for
+    // its corpse-promotion arm (the corpses are reset with the mobs after).
+    "distant-fight",
+    "distant-calibrate",
+    // THE EDGE (docs/PLAN_distant_npcs.md D3). After `distant-calibrate` for
+    // the same exit contract plus its own: the store cleared, the park
+    // function and the player actor list removed, worldgen regenerated at
+    // home (its near fight bleeds on the window's ground). It never moves the
+    // window; it ticks THE tick with parking bound, from two fresh worlds.
+    "distant-edge",
+    // THE DISTANT TIER'S LIFE PAST THE WINDOW (docs/PLAN_distant_npcs.md
+    // D5+D6). After `distant-edge` for the same exit contract plus their own:
+    // tuning, the minute override, the residents and the id counter restored,
+    // mobs / debris / tier reset, the park function and the placer removed,
+    // the store cleared, scratch dirs deleted, the window back home and
+    // worldgen regenerated there (`distant-schedule` teleports it away and
+    // back; `distant-save` saves and loads a world dir).
+    "distant-schedule",
+    "distant-save",
+    // THE CAP OVERFLOW and THE PLAYER'S REACH (docs/PLAN_distant_npcs.md D8,
+    // D9). After `distant-edge` for the same exit contract (two fresh worlds
+    // each; mobs / debris / tier reset, store cleared, park function and
+    // player actors removed, tuning / items / id counter restored, worldgen
+    // regenerated at home) plus their own logs cleared. Neither moves the
+    // window.
+    "distant-overflow",
+    "distant-arrow",
     // MOBS v6 (PLAN_corpse_is_a_mob P2a). After `mob-park` for the same exit
     // contract: mobs, debris and risings reset, id counter restored, park
     // function removed, store cleared, worldgen regenerated at home.
@@ -1380,6 +1437,11 @@ const char* const kOrder[] = {
     // CPU only: a synthetic-wall Player climb posing a PlayerAvatar through
     // PosePipeline; spawns and despawns its own avatar, touches no world.
     "ledge-climb-pose",
+    // ...and the distant statues (game/distant_draw.h, PLAN_distant_npcs D4a),
+    // by the same append rule: it spawns two humans (one killed), bakes and
+    // draws their statues, and resets mobs + debris, releases every pose it
+    // packed and regenerates worldgen on the way out.
+    "distant-look",
     // CPU only, by the same rule: the sneak's stride posed on a PlayerAvatar
     // off the window (flat, probe-free ground) and the quick sneak's pace on
     // a Player against a lambda floor; touches no world.
@@ -1450,6 +1512,14 @@ const char* const kOrder[] = {
     // its regenerate lands on later fixtures (measured: player-corpse's corpse
     // at inset 360 never slept, picking the stains up by contact).
     "infect-perf",
+    // The distant tier's calibration (docs/PLAN_distant_npcs.md D2a), as late
+    // as a world-touching gate can go and for infect-perf's reason: whole
+    // rounds of fights in fresh worlds (its own id base, Jolt's body-id
+    // history rewound each round, as mob-cap64-twice does), blood over the
+    // harness window. It restores the id counter and regenerates worldgen on
+    // the way out, and only voxregion / worldedit (which regenerate again)
+    // run after it.
+    "distant-calib-matrix",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it
@@ -1477,7 +1547,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(), &ItemStageGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &DungeonEntityGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates(), &StaggerGates()})
+                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &DungeonEntityGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates(), &BugReportGates(), &AquaticGates(), &StaggerGates(), &DistantLookGates(), &DistantCalibGates(), &DistantGates(), &DistantLifeGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;
@@ -1750,6 +1820,172 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << ", \"firstViolChunk\": [" << oc.firstViolChunk[0] << ", "
       << oc.firstViolChunk[1] << ", " << oc.firstViolChunk[2] << "]"
       << "},\n";
+  }
+  // ---- THE DISTANT TIER, ALWAYS (docs/PLAN_distant_npcs.md) ---------------
+  // Every demotion, promotion and retire the run's creature systems made, and
+  // -- the point of writing it -- every refusal: a leaver that parked because
+  // the tier was full (refusedFull) or was past the radius (outsideRadius), a
+  // promotion that waited (ground / cap / budget / spawn / the flip bound) or
+  // failed. Zero everywhere while `distant.enabled` is off (on by default
+  // since D3; the gates that test the park path pin it off).
+  {
+    const DistantMobs::Stats& ds = DistantRunTotals();
+    f << "  \"distant\": {\"demoted\": " << ds.demoted
+      << ", \"demotedDead\": " << ds.demotedDead << ", \"anchored\": " << ds.anchored
+      << ", \"promoted\": " << ds.promoted << ", \"promotedDead\": " << ds.promotedDead
+      << ", \"retired\": " << ds.retired << ", \"refusedFull\": " << ds.refusedFull
+      << ", \"outsideRadius\": " << ds.outsideRadius
+      << ", \"groundWaits\": " << ds.groundWaits << ", \"capWaits\": " << ds.capWaits
+      << ", \"budgetWaits\": " << ds.budgetWaits << ", \"spawnWaits\": " << ds.spawnWaits
+      << ", \"failed\": " << ds.failed << ", \"retireScans\": " << ds.retireScans
+      << ", \"promoteScans\": " << ds.promoteScans << ", \"peak\": " << ds.peak
+      << ", \"cap\": " << DistantMobs::kMaxDistantMobs
+      // D1: the walk -- steps run, TickDistant's own wall time (a measurement,
+      // never an input) per call, sleeps / wakes, and every refused step by
+      // its reason; the promotion snaps and their worst error.
+      << ", \"steps\": " << ds.steps << ", \"tickCalls\": " << ds.tickCallsAll
+      << ", \"tickCallsStepping\": " << ds.tickCalls
+      << ", \"tickUsTotal\": " << (double)ds.tickNs / 1000.0
+      << ", \"tickUsPerCall\": "
+      << (ds.tickCallsAll > 0 ? (double)ds.tickNs / 1000.0 / (double)ds.tickCallsAll : 0.0)
+      << ", \"sleeps\": " << ds.sleeps << ", \"wakesNeighbour\": " << ds.wakesNeighbour
+      << ", \"wakesTimer\": " << ds.wakesTimer << ", \"lineHolds\": " << ds.lineHolds
+      << ", \"climbRefusals\": " << ds.climbRefusals
+      << ", \"dropRefusals\": " << ds.dropRefusals
+      << ", \"waterRefusals\": " << ds.waterRefusals << ", \"swimSteps\": " << ds.swimSteps
+      << ", \"combatHolds\": " << ds.combatHolds << ", \"landings\": " << ds.landings
+      << ", \"landingHurt\": " << ds.landingHurt
+      << ", \"landingDeaths\": " << ds.landingDeaths << ", \"snaps\": " << ds.snaps
+      << ", \"snapMisses\": " << ds.snapMisses
+      << ", \"snapErrMaxVox\": " << (double)ds.snapErrQ / 16.0
+      // D2b: the fight -- every swing by its outcome, the bows, the deaths by
+      // cause, the grips that failed, the statuses stepped, the hp dealt; and
+      // WHERE THE TIME WENT inside TickDistant (us summed over the run, a
+      // measurement only: setup = band + who steps + snapshot, self = SelfView
+      // + ground fan, world = the actor list, think = ai::Think, move = steer
+      // + spacing + drive, combat = the impact pass + statuses + grips, sleep
+      // = phase 2, file = phase 3).
+      << ", \"strokes\": " << ds.strokes << ", \"strokesRefused\": " << ds.strokesRefused
+      << ", \"strokeHits\": " << ds.strokeHits << ", \"strokeMisses\": " << ds.strokeMisses
+      << ", \"strokeBlocked\": " << ds.strokeBlocked
+      << ", \"strokeOutOfReach\": " << ds.strokeOutOfReach
+      << ", \"strokeNoTarget\": " << ds.strokeNoTarget << ", \"draws\": " << ds.draws
+      << ", \"drawsAborted\": " << ds.drawsAborted << ", \"looses\": " << ds.looses
+      << ", \"arrowHits\": " << ds.arrowHits << ", \"arrowMisses\": " << ds.arrowMisses
+      << ", \"arrowsLost\": " << ds.arrowsLost << ", \"deaths\": " << ds.deaths
+      << ", \"deathsVital\": " << ds.deathsVital << ", \"deathsBlood\": " << ds.deathsBlood
+      << ", \"deathsBurns\": " << ds.deathsBurns << ", \"gripFails\": " << ds.gripFails
+      << ", \"severs\": " << ds.severs
+      << ", \"sidearms\": " << ds.sidearms << ", \"bleedTicks\": " << ds.bleedTicks
+      << ", \"burnTicks\": " << ds.burnTicks << ", \"relit\": " << ds.relit
+      << ", \"rebled\": " << ds.rebled << ", \"hpDealt\": " << (double)ds.hpDealtMilli / 1000.0
+      << ", \"stepsEngaged\": " << ds.stepsEngaged << ", \"actorCaps\": " << ds.actorCaps
+      << ", \"usSetup\": " << (double)ds.nsSetup / 1000.0
+      << ", \"usSelf\": " << (double)ds.nsSelf / 1000.0
+      << ", \"usWorld\": " << (double)ds.nsWorld / 1000.0
+      << ", \"usThink\": " << (double)ds.nsThink / 1000.0
+      << ", \"usMove\": " << (double)ds.nsMove / 1000.0
+      << ", \"usCombat\": " << (double)ds.nsCombat / 1000.0
+      << ", \"usSleep\": " << (double)ds.nsSleep / 1000.0
+      << ", \"usFile\": " << (double)ds.nsFile / 1000.0
+      // D3: THE EDGE -- the distant actors published to the near tier, the
+      // blows across it both ways by outcome (and the hp the distant roll gave
+      // a near hit beside what the near door then charged), the arrows across
+      // the boundary both ways and where they ended, the thrash bound's waits
+      // and flips, and the never-a-player witness (must be 0).
+      << ", \"bandPublished\": " << ds.bandPublished << ", \"bandPeak\": " << ds.bandPeak
+      << ", \"bandCapped\": " << ds.bandCapped << ", \"edgeNearBlows\": " << ds.edgeNearBlows
+      << ", \"edgeNearHits\": " << ds.edgeNearHits
+      << ", \"edgeNearMisses\": " << ds.edgeNearMisses
+      << ", \"edgeNearBlocked\": " << ds.edgeNearBlocked
+      << ", \"edgeNearOutOfReach\": " << ds.edgeNearOutOfReach
+      << ", \"edgeNearNoTarget\": " << ds.edgeNearNoTarget
+      << ", \"edgeNearUnmatched\": " << ds.edgeNearUnmatched
+      << ", \"edgeFarSwings\": " << ds.edgeFarSwings << ", \"edgeFarHits\": " << ds.edgeFarHits
+      << ", \"edgeFarMisses\": " << ds.edgeFarMisses
+      << ", \"edgeFarBlocked\": " << ds.edgeFarBlocked
+      << ", \"edgeFarOutOfReach\": " << ds.edgeFarOutOfReach
+      << ", \"edgeFarApplied\": " << ds.edgeFarApplied
+      << ", \"edgeFarUnapplied\": " << ds.edgeFarUnapplied
+      << ", \"edgeFarRayMisses\": " << ds.edgeFarRayMisses
+      << ", \"edgeFarCovered\": " << ds.edgeFarCovered
+      << ", \"edgeFarHpRoll\": " << (double)ds.edgeFarHpRollMilli / 1000.0
+      << ", \"edgeFarHpDoor\": " << (double)ds.edgeFarHpDoorMilli / 1000.0
+      << ", \"edgeArrowsIn\": " << ds.edgeArrowsIn
+      << ", \"edgeArrowsConverted\": " << ds.edgeArrowsConverted
+      << ", \"edgeArrowsInjected\": " << ds.edgeArrowsInjected
+      << ", \"edgeArrowsGrounded\": " << ds.edgeArrowsGrounded
+      << ", \"edgeArrowsExpired\": " << ds.edgeArrowsExpired
+      << ", \"edgeArrowsOut\": " << ds.edgeArrowsOut
+      << ", \"edgeArrowsOutResolved\": " << ds.edgeArrowsOutResolved
+      << ", \"edgeArrowsOutLost\": " << ds.edgeArrowsOutLost
+      << ", \"flipWaits\": " << ds.flipWaits << ", \"flips\": " << ds.flips
+      << ", \"playerActorsSeen\": " << ds.playerActorsSeen
+      // D5+D6: ACTIVATION (parked -> distant) -- scans run, records made
+      // distant (corpses, v12 upgrades), the waits by cause, the records left
+      // parked or dropped as duplicates -- and the schedules at distance.
+      << ", \"activateScans\": " << ds.activateScans << ", \"activated\": " << ds.activated
+      << ", \"activatedDead\": " << ds.activatedDead
+      << ", \"activateRecordsSeen\": " << ds.activateRecordsSeen
+      << ", \"activateBudgetWaits\": " << ds.activateBudgetWaits
+      << ", \"activateRoomWaits\": " << ds.activateRoomWaits
+      << ", \"activateDefWaits\": " << ds.activateDefWaits
+      << ", \"activateKept\": " << ds.activateKept
+      << ", \"activateDropped\": " << ds.activateDropped
+      << ", \"activateUpgraded\": " << ds.activateUpgraded
+      << ", \"scheduleSteps\": " << ds.scheduleSteps
+      << ", \"scheduleWakes\": " << ds.scheduleWakes
+      << ", \"scheduleHolds\": " << ds.scheduleHolds
+      << ", \"promoteCatchUps\": " << ds.promoteCatchUps
+      // D8: THE CAP OVERFLOW -- the calls in which the living cap bound, the
+      // slots filled nearest-to-the-player first, the swaps (and those whose
+      // near creature targeted a player), the waits and refusals, the steps
+      // held at the player's ring, the most distant creatures in the window.
+      << ", \"overflowCalls\": " << ds.overflowCalls
+      << ", \"overflowFilled\": " << ds.overflowFilled
+      << ", \"overflowSwaps\": " << ds.overflowSwaps
+      << ", \"overflowLastResort\": " << ds.overflowLastResort
+      << ", \"overflowNoVictim\": " << ds.overflowNoVictim
+      << ", \"overflowGroundWaits\": " << ds.overflowGroundWaits
+      << ", \"overflowRefused\": " << ds.overflowRefused
+      << ", \"overflowRingHolds\": " << ds.overflowRingHolds
+      << ", \"overflowInWindowPeak\": " << ds.overflowInWindowPeak
+      // D9: THE PLAYER'S REACH -- in-window flights that met a statue's box
+      // (applied / lost), player flights flown on past the edge and how each
+      // ended, and the D3 hand-overs refused for a target inside the window.
+      << ", \"boxHits\": " << ds.boxHits << ", \"boxHitsApplied\": " << ds.boxHitsApplied
+      << ", \"boxHitsLost\": " << ds.boxHitsLost << ", \"shotsOut\": " << ds.shotsOut
+      << ", \"shotsOutHits\": " << ds.shotsOutHits
+      << ", \"shotsOutGrounded\": " << ds.shotsOutGrounded
+      << ", \"shotsOutReentered\": " << ds.shotsOutReentered
+      << ", \"shotsOutExpired\": " << ds.shotsOutExpired
+      << ", \"edgeArrowsOutInWindow\": " << ds.edgeArrowsOutInWindow << "},\n";
+  }
+  // ---- THE DISTANT STATUES (game/distant_draw.h, PLAN_distant_npcs D4a) ---
+  // What every DistantDraw in the run did: drawn / culled / starved for want
+  // of a body slot / not baked / waiting for a pack / no room, the pool words
+  // and packed poses at their peak against the budget, evictions, bakes.
+  {
+    const DistantDrawRunStats& dr = DistantDrawRunTotals();
+    f << "  \"distantDraw\": {\"produces\": " << dr.produces
+      << ", \"drawnTotal\": " << dr.drawnTotal << ", \"drawnPeak\": " << dr.drawnPeak
+      << ", \"culledTotal\": " << dr.culledTotal
+      << ", \"starvedTotal\": " << dr.starvedTotal
+      << ", \"unbakedTotal\": " << dr.unbakedTotal
+      << ", \"deferredTotal\": " << dr.deferredTotal
+      << ", \"noFitTotal\": " << dr.noFitTotal
+      << ", \"fallbacksTotal\": " << dr.fallbacksTotal
+      << ", \"residentWordsPeak\": " << dr.residentWordsPeak
+      << ", \"wordsBudget\": " << kDistantPoseWordsMax
+      << ", \"packedPosesPeak\": " << dr.packedPosesPeak
+      << ", \"poseModelsMax\": " << kDistantPoseModelsMax
+      << ", \"looksPeak\": " << dr.looksPeak << ", \"bakes\": " << dr.bakes
+      << ", \"bakeMsMax\": " << dr.bakeMsMax << ", \"packs\": " << dr.packs
+      << ", \"evictions\": " << dr.evictions
+      << ", \"lookEvictions\": " << dr.lookEvictions
+      << ", \"packRefused\": " << dr.packRefused
+      << ", \"epochDrops\": " << dr.epochDrops << ", \"artAdded\": " << dr.artAdded
+      << ", \"artNearest\": " << dr.artNearest << "},\n";
   }
   // ---- CHUNK TICKETS, ALWAYS (docs/PLAN_chunk_tickets.md) -----------------
   // What the run's ticket system did, so "the pile never landed" has numbers

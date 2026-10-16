@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 
 #include "game/mob.h"
 #include "sim/scale.h"
@@ -71,6 +72,16 @@ float Mob::ShieldTurnRate(float freeRate) const {
   // eases onto the camera) and a lerp from infinity caps nothing.
   return std::min(freeRate,
                   std::max(s->turnRate, 0.0f) / std::max(shieldRaise_, 0.05f));
+}
+
+float Mob::ShieldTurnCap() const {
+  // ShieldTurnRate's ceiling, unapplied (SteerStep's input): the same
+  // expression, and +inf where that function returns freeRate untouched, so
+  // min(freeRate, this) is its answer bit for bit (game/steer.h).
+  const ItemDef::ShieldSpec* s = HeldShieldSpec();
+  if (s == nullptr || shieldRaise_ <= 0.0f)
+    return std::numeric_limits<float>::infinity();
+  return std::max(s->turnRate, 0.0f) / std::max(shieldRaise_, 0.05f);
 }
 
 void Mob::StaggerShield(int ticks) {

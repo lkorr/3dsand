@@ -79,19 +79,37 @@ class ChunkStore {
     regions_.clear();
     tickTags_.clear();
     entityRegions_.clear();
+    entityEpoch_++;
     absentRegions_.clear();
     chunkCount_ = 0;
     dir_.clear();
     tables_.Bind(std::string());
+    NotifyChanged(IVec3{}, /*all=*/true);
   }
   // The entity buckets go with the binding (a dormant record belongs to the
   // world dir it was read from); the RAM chunks stay, as they always have.
+  // (A chunk that had been spilled to the dir is no longer reachable by Get,
+  // so the listener hears "everything".)
   void Unbind() {
     dir_.clear();
     entityRegions_.clear();
+    entityEpoch_++;
     absentRegions_.clear();
     tables_.Bind(std::string());
+    NotifyChanged(IVec3{}, /*all=*/true);
   }
+
+  // ---- THE CHANGE LISTENER (docs/PLAN_distant_npcs.md §2.4) ----------------
+  //
+  // ONE optional listener, told whenever what Get(wc) would answer may have
+  // changed: `(wc, false)` from every Put and Erase, `(_, true)` when the
+  // whole content is replaced or dropped (Clear, Unbind, BindLoad). An LRU
+  // spill or a lazy region load changes nothing a reader sees and says
+  // nothing. For a derived cache over stored chunks (the distant tier's
+  // ground) that must never answer from bytes the store has replaced. The
+  // listener is called synchronously and must not touch the store.
+  using ChangeFn = std::function<void(IVec3 wc, bool all)>;
+  void SetChangeFn(ChangeFn fn) { changeFn_ = std::move(fn); }
   bool Bound() const { return !dir_.empty(); }
   const std::string& Dir() const { return dir_; }
   size_t Count() const { return chunkCount_; }  // chunks resident in RAM
@@ -215,6 +233,20 @@ class ChunkStore {
   std::vector<EntityRecord>& DormantEntities(IVec3 rc);
   // Every region the entity half has opened or written under this binding.
   void EntityRegionsKnown(std::vector<IVec3>& out) const;
+  // ---- FOR A READER THAT MUST FIND PARKED RECORDS FAR FROM THE WINDOW -------
+  // (docs/PLAN_distant_npcs.md D5+D6: the distant tier's ACTIVATION.)
+  //
+  // Every region that may hold a dormant record: the ones in RAM (opened,
+  // written, or parked into this session) and -- under a bound directory --
+  // every r_x_y_z.sve file on disk, listed ONCE per binding (a directory walk,
+  // not a probe per region: a 128 m radius spans ~1,300 regions, and opening
+  // each to learn it is absent is the cost this avoids). Sorted by (z, y, x),
+  // duplicates removed: a deterministic order for a deterministic reader.
+  void EntityRegionsAny(std::vector<IVec3>& out);
+  // Bumped whenever every bucket is forgotten or re-read from a different
+  // place (Clear, Unbind, BindLoad, BindSave, RemoveAllEntityFiles): a reader
+  // that scans the buckets on change scans again after a load.
+  uint64_t EntityEpoch() const { return entityEpoch_; }
   // Write region `rc`'s file as its dormant records + `live`. Skipped when the
   // bytes equal what the file already holds (so an unchanged bucket costs a
   // hash, not a write); the file is removed when the result is empty.
@@ -317,6 +349,16 @@ class ChunkStore {
   EntityRegion& TouchEntityRegion(IVec3 rc);
   bool SetAsideUnreadable(EntityRegion& e, const std::string& path);
   std::unordered_map<uint64_t, EntityRegion> entityRegions_;  // packed region key
+  // EntityRegionsAny's disk index: the r_*.sve files under the bound dir, as
+  // listed once per epoch (`entityDiskFor_` = the epoch it was listed for;
+  // ~0 = not listed). WriteEntityRegion adds the regions it creates.
+  std::vector<IVec3> entityDisk_;
+  uint64_t entityDiskFor_ = ~0ull;
+  uint64_t entityEpoch_ = 1;
   size_t chunkCount_ = 0;
   uint64_t useCounter_ = 0;
+  ChangeFn changeFn_;   // SetChangeFn; empty = nobody listening
+  void NotifyChanged(IVec3 wc, bool all) {
+    if (changeFn_) changeFn_(wc, all);
+  }
 };

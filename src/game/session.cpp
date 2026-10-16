@@ -2977,6 +2977,24 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
       // harness body is not a combatant.
       if (!w.harness.ownsActors) mobs.SetPlayerActors(ws.actors);
 
+      // ---- THE TIER BORDER, INWARD (docs/PLAN_distant_npcs.md §2.1) -------
+      //
+      // Distant creatures the window has reached again are PROMOTED (nearest
+      // first) and then PARKED records are made live, out of one budget and
+      // against one living cap, so the two can never both spend the same
+      // slot. Here, before mobs.PreTick, so what comes back is stepped by this
+      // very tick -- the frame loop used to do this after the tick, which a
+      // gate ticking THE tick never saw (audit A12). The window has already
+      // moved for this tick (phase B), and the fetch cache's answers are the
+      // fixed-latency ones every tier decision may read (rule 1).
+      //
+      // The distant tier's ground reads EDITED chunks out of this stream's
+      // store, after draining their evictions (Stream::SettledStoredChunk;
+      // docs/PLAN_distant_npcs.md §2.4): bound here, every tick, so a gate
+      // ticking THE tick walks distant creatures over real edits too.
+      mobs.SetDistantStream(&stream);
+      if (w.parking != nullptr) w.parking->Unpark(mobs, stream.Store(), world, tick);
+
       // mobs: kinematic walk drive, terrain anchors for ManageTerrain,
       // bleeding ops, per-voxel burning — must run before debris.PreTick
       // consumes the anchors

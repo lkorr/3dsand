@@ -36,7 +36,10 @@
 set -eu
 
 # ── Configuration ──────────────────────────────────────────────────────────
-MAX_JOBS=6                       # cap cl.exe parallelism (half of 16 cores)
+# cap cl.exe parallelism (half of 16 cores). SANDVOX_BUILD_JOBS lowers it when
+# the machine is short of RAM: one cl.exe on mob.cpp alone is ~1-2 GB, and
+# Claude Code reaps a background build outright when free memory runs out.
+MAX_JOBS="${SANDVOX_BUILD_JOBS:-6}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SVLOCK_TAG="build.sh"
 # shellcheck source=svlock.sh

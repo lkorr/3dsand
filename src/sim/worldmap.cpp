@@ -3073,10 +3073,20 @@ const std::vector<StructurePlacement>* StructureOverrideSlot() {
 const WorldMapData& CurrentWorldMap() { return Slot(); }
 // A terrain-flow solve (sim/flowfield.h) may be reading the map on a
 // background thread; it is finished before the map is replaced.
+namespace {
+uint64_t& MapSerialSlot() {
+  static uint64_t s = 0;
+  return s;
+}
+}  // namespace
+
 void SetCurrentWorldMap(WorldMapData map) {
   sandvox::WaterFlowQuiesce();
   Slot() = std::move(map);
+  MapSerialSlot()++;
 }
+
+uint64_t CurrentWorldMapSerial() { return MapSerialSlot(); }
 
 const WorldMapData::Region* WorldMapData::RegionAt(int x, int z) const {
   // Even-odd crossing test at the column CENTRE (x + 1/2, z + 1/2), in

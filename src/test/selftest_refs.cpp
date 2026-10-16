@@ -443,7 +443,18 @@ Status GateRefsActivate(Ctx& c, std::string& detail) {
 }
 
 // ---- refs-npc-identity --------------------------------------------------------
+//
+// THE SWITCH (docs/PLAN_distant_npcs.md D3). A-E run with `distant.enabled`
+// PINNED OFF: C is the PARK path's identity claim (the ref goes dormant with
+// its villager parked, comes back active, and the unpark -- not a second
+// spawn -- brings the body back). C2 then runs the SAME away-and-back with the
+// switch ON (the default since the flip): the villager DEMOTES (distant, the
+// same mob id held, nothing parked), the ref goes dormant, and coming back the
+// ref must again NOT spawn -- the distant body answers its ref (§2.14's (a)
+// sites: LocateByRef) -- and the PROMOTION brings back the same creature under
+// the same id. One ref, one body, in either tier.
 Status GateRefsNpcIdentity(Ctx& c, std::string& detail) {
+  DistantSwitchScope tierOff(false);
   RegisterProbeKind();
   const char* kPath = "selftest_refs_npc.svd";
   const char* kId = "fixture/villager";
@@ -560,6 +571,61 @@ Status GateRefsNpcIdentity(Ctx& c, std::string& detail) {
         Format("C: back live %d after %d ticks, active %d", liveC, back, activeAgain));
   const bool okC = liveAway == 0 && dormant && parkedNow >= 1 && liveC == 1 && activeAgain;
 
+  // C2. THE SAME, WITH THE DISTANT TIER ON: the villager goes DISTANT (not
+  //     parked) and comes back by PROMOTION under the id it left with.
+  int liveAway2 = -1, distantAway2 = -1, liveC2 = -1, back2 = 0;
+  bool dormant2 = false, active2 = false, sameId2 = false;
+  uint64_t parked2 = 0, idLeft2 = 0, idBack2 = 0, demoted2 = 0, promoted2 = 0;
+  {
+    DistantSwitchScope tierOn(true);
+    // Either tier counts for "is there a body for this ref" (one ref, one
+    // body): the near list and the distant tier.
+    auto countDistant = [&]() {
+      int n = 0;
+      for (const DistantMob& d : c.mobs.Distant().All()) n += d.refId == kId ? 1 : 0;
+      return n;
+    };
+    if (const Mob* m = c.mobs.FindMobByRef(kId)) idLeft2 = m->Id();
+    const uint64_t parked0 = parking.GetStats().parked;
+    const DistantMobs::Stats ds0 = c.mobs.Distant().GetStats();
+    teleport(away);
+    t = rig->tick;
+    rig = std::make_unique<support::TickRig>(c, t, IVec3{away.x + n / 2, 11, away.z + n / 2});
+    rig->Authority().refs = &st;
+    ticks(3);
+    liveAway2 = countRef();
+    distantAway2 = countDistant();
+    dormant2 = !st.IsActive(kId);
+    parked2 = parking.GetStats().parked - parked0;
+    teleport(home);
+    parking.ResetWaits();
+    t = rig->tick;
+    rig = std::make_unique<support::TickRig>(c, t, IVec3{16, 11, 16});
+    rig->Authority().refs = &st;
+    while (countRef() == 0 && back2 < 240) {
+      ticks(1);
+      back2++;
+    }
+    ticks(10);
+    liveC2 = countRef() + countDistant();
+    active2 = st.IsActive(kId);
+    if (const Mob* m = c.mobs.FindMobByRef(kId)) idBack2 = m->Id();
+    sameId2 = idLeft2 != 0 && idBack2 == idLeft2;
+    const DistantMobs::Stats ds1 = c.mobs.Distant().GetStats();
+    demoted2 = ds1.demoted - ds0.demoted;
+    promoted2 = ds1.promoted - ds0.promoted;
+  }
+  const bool okC2 = check(liveAway2 == 0 && distantAway2 == 1 && dormant2 && parked2 == 0 &&
+                              demoted2 >= 1 && liveC2 == 1 && active2 && sameId2 &&
+                              promoted2 >= 1,
+                          Format("C2 (tier on): away near %d distant %d dormant %d parked %llu "
+                                 "demoted %llu; back after %d ticks: bodies %d active %d id "
+                                 "%llu -> %llu, promoted %llu",
+                                 liveAway2, distantAway2, dormant2, (unsigned long long)parked2,
+                                 (unsigned long long)demoted2, back2, liveC2, active2,
+                                 (unsigned long long)idLeft2, (unsigned long long)idBack2,
+                                 (unsigned long long)promoted2));
+
   // D. ONE REF, ONE BODY: a copy of the villager's record is refused.
   bool okD = false;
   if (const Mob* m = c.mobs.FindMobByRef(kId)) {
@@ -601,11 +667,13 @@ Status GateRefsNpcIdentity(Ctx& c, std::string& detail) {
 
   detail = Format(
       "A %s: 1 villager after %d ticks, delta set | B %s: save+load keeps ref (mob id %llu -> "
-      "%llu), applied %u records | C %s: parked %llu, back after %d ticks, still one | D %s: "
-      "duplicate record refused | E %s: missing-id delta dropped + warned",
+      "%llu), applied %u records | C %s: parked %llu, back after %d ticks, still one | C2 %s "
+      "(tier on): distant while away, promoted back under id %llu after %d ticks, still one | "
+      "D %s: duplicate record refused | E %s: missing-id delta dropped + warned",
       okA ? "ok" : "FAIL", waited, okB ? "ok" : "FAIL", (unsigned long long)idA,
       (unsigned long long)idB, lr.recordsApplied, okC ? "ok" : "FAIL",
-      (unsigned long long)parkedNow, back, okD ? "ok" : "FAIL", okE ? "ok" : "FAIL");
+      (unsigned long long)parkedNow, back, okC2 ? "ok" : "FAIL", (unsigned long long)idBack2,
+      back2, okD ? "ok" : "FAIL", okE ? "ok" : "FAIL");
   if (!why.empty()) detail += " | FAIL: " + why[0];
   return why.empty() ? Status::Pass : Status::Fail;
 }

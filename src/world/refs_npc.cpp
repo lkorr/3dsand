@@ -18,6 +18,7 @@
 #include "game/mob_archery.h"  // ArmArcher: an archer profile arms itself
 #include "sim/bytestream.h"
 #include "sim/rng.h"
+#include "sim/tuning.h"   // distant.idleStride: the distant residents' stride (D5)
 #include "sim/world.h"
 #include "test/support.h"
 #include "world/refs_doors.h"
@@ -103,6 +104,10 @@ struct Resident {
   // again `kCalmTicks` after the last target, then back to the spot.
   bool sprung = false;
   uint32_t calmSince = 0;
+  // ---- D5: the revisions the row key was last computed against, so a
+  // DISTANT villager asleep at its anchor is woken only when its row (or an
+  // edit) gives it something new to do (StepDistantResidents) ----
+  uint64_t refsRev = 0, schedRev = 0;
 };
 
 struct ResidentsWorld {
@@ -115,6 +120,9 @@ struct ResidentsWorld {
   // after the tick, from EntityParking). Nulled when that store is destroyed.
   RefStore* store = nullptr;
   uint32_t lastTick = 0;
+  // ---- D5: the distant pass's "has the day moved" memory (StepDistantResidents)
+  int distMinute = -1;
+  uint64_t distRefsRev = ~0ull, distSchedRev = ~0ull;
   // Graph cache.
   const RefStore* graphFor = nullptr;
   uint64_t graphRev = ~0ull;
@@ -575,11 +583,35 @@ bool DoorStep(RefCtx& c, Resident& R, const Vec3& foot, ai::Routine& rt, const s
   return false;
 }
 
+// ---- THE VILLAGER'S BODY, in either tier (D5, docs/PLAN_distant_npcs.md) -------
+//
+// The day is the same day near and far: one row key, one anchor, one route,
+// one Resident (keyed by ref, and the mob id survives the edge, so a villager
+// mid-route that walks out of the window goes on walking the same route).
+// What a DISTANT body cannot do is touch the world: it opens no door (doors at
+// distance are not simulated -- it walks the ground it has, and DistantGround
+// has no doors), strikes no pose (SetActivity is a rig's), and is talked to by
+// nobody. Those three are skipped for it; everything else is shared.
+struct ResidentBody {
+  uint64_t id = 0;
+  Mob* near = nullptr;         // null: a distant creature
+  Vec3 foot{};                 // the footprint's centre at the sole
+  ai::Brain* brain = nullptr;
+  bool Distant() const { return near == nullptr; }
+};
+
+void StepResidentBody(RefCtx& c, const Ref& r, const ResidentBody& b);
+
 void StepResident(RefCtx& c, const Ref& r) {
   MobSystem& mobs = *c.mobs;
   Mob* m = mobs.FindMobByRef(r.id);
   ResidentsWorld& w = W();
   if (m == nullptr || !m->Alive() || m->Def() == nullptr) {
+    // WALKED OUT OF THE WINDOW (D5): still a resident, just distant -- the
+    // distant pass steps it (StepDistantResidents) and its state is kept.
+    if (m == nullptr)
+      if (const DistantMob* far = mobs.Distant().FindByRef(r.id); far != nullptr && !far->dead)
+        return;
     auto it = w.npcs.find(r.id);
     if (it != w.npcs.end()) {
       it->second.st.phase = ResidentPhase::None;
@@ -590,29 +622,51 @@ void StepResident(RefCtx& c, const Ref& r) {
   }
   ai::Brain* br = mobs.MobBrainMut(m->Id());
   if (br == nullptr) return;
-  Resident& R = w.npcs[r.id];
-  if (R.mobId != m->Id()) {
-    R = Resident{};
-    R.mobId = m->Id();
-  }
-  R.st.refId = r.id;
-  R.st.mobId = m->Id();
+  ResidentBody b;
+  b.id = m->Id();
+  b.near = m;
+  b.brain = br;
   const Vec3 ws = m->Def()->worldSize;
   const Vec3 o = m->Origin();
-  const Vec3 foot{o.x + ws.x * 0.5f, o.y, o.z + ws.z * 0.5f};
+  b.foot = Vec3{o.x + ws.x * 0.5f, o.y, o.z + ws.z * 0.5f};
+  StepResidentBody(c, r, b);
+}
+
+void StepResidentBody(RefCtx& c, const Ref& r, const ResidentBody& b) {
+  MobSystem& mobs = *c.mobs;
+  ResidentsWorld& w = W();
+  ai::Brain* br = b.brain;
+  Resident& R = w.npcs[r.id];
+  if (R.mobId != b.id) {
+    R = Resident{};
+    R.mobId = b.id;
+  }
+  R.st.refId = r.id;
+  R.st.mobId = b.id;
+  const Vec3 foot = b.foot;
   R.st.foot = foot;
   ai::Routine& rt = br->routine;
   const std::string who = r.id;
+  // The pose a row puts on the body (lying down, working): a rig's, so a
+  // distant villager has none.
+  auto setActivity = [&](const char* a) {
+    if (b.near != nullptr) b.near->SetActivity(a);
+  };
 
-  // A door opened on the way is closed behind, whatever else happens.
-  if (!R.closeDoor.empty()) CheckCloseBehind(c, R, foot, who);
+  // A door opened on the way is closed behind, whatever else happens -- by a
+  // villager that is still in the window to close it.
+  if (!R.closeDoor.empty() && !b.Distant()) CheckCloseBehind(c, R, foot, who);
 
   const std::string schedName = PropStr(r, "schedule");
   R.st.schedule = schedName;
   const schedule::Schedule* sc = Schedules().Find(schedName);
   if (sc == nullptr) {
+    // (The revisions this answer holds for: a distant villager with no day
+    // is then not woken every game minute to be told so again.)
+    R.refsRev = c.refs->Revision();
+    R.schedRev = Schedules().Revision();
     rt.active = false;
-    m->SetActivity("");
+    setActivity("");
     R.st.phase = ResidentPhase::None;
     R.st.activity.clear();
     R.st.note = schedName.empty() ? "no props.schedule" : "no schedule named '" + schedName + "'";
@@ -630,6 +684,8 @@ void StepResident(RefCtx& c, const Ref& r) {
                           std::to_string(Schedules().Revision());
   if (key != R.rowKey) {
     R.rowKey = key;
+    R.refsRev = c.refs->Revision();
+    R.schedRev = Schedules().Revision();
     const bool sameRow = R.st.row == row && R.st.activity == rw.act;
     R.st.row = row;
     R.st.activity = rw.act;
@@ -671,7 +727,7 @@ void StepResident(RefCtx& c, const Ref& r) {
     }
     R.st.note.clear();
     Plan(c, R, foot);
-    m->SetActivity("");
+    setActivity("");
   }
 
   const ai::Intent verb = ai::IntentForActivity(rw.act);
@@ -689,11 +745,11 @@ void StepResident(RefCtx& c, const Ref& r) {
   // ---- a player is talking to it: hold, face them ----
   if (c.talkers != nullptr)
     for (const RefCtx::Talker& t : *c.talkers)
-      if (t.mobId == m->Id()) {
+      if (t.mobId == b.id) {
         rt.hold = true;
         rt.facePointSet = true;
         rt.facePoint = t.eye;
-        m->SetActivity("");
+        setActivity("");
         R.bestTick = c.tick;
         R.st.talking = true;
         return;   // phase kept: the day resumes where it stood
@@ -704,7 +760,7 @@ void StepResident(RefCtx& c, const Ref& r) {
   R.st.busy = busy;
   if (busy) {
     R.bestTick = c.tick;   // no stuck clock while fighting or running
-    m->SetActivity("");
+    setActivity("");
   }
   // ---- THE MONSTER ROWS' EYES (D3): a sleeper / an ambusher sees a NEW
   //      target only within its radius until it is SPRUNG (a target, or
@@ -766,6 +822,9 @@ void StepResident(RefCtx& c, const Ref& r) {
   }
 
   // ---- DoorWait ----
+  // A DISTANT villager has no door to wait at (DistantGround has none): it
+  // walks on, and the near tier waits again if it comes back mid-doorway.
+  if (R.st.phase == ResidentPhase::DoorWait && b.Distant()) R.st.phase = ResidentPhase::Travel;
   if (R.st.phase == ResidentPhase::DoorWait) {
     if (!DoorStep(c, R, foot, rt, who)) return;
     if (R.st.phase == ResidentPhase::DoorWait) R.st.phase = ResidentPhase::Travel;
@@ -787,7 +846,7 @@ void StepResident(RefCtx& c, const Ref& r) {
       R.bestDist = 1e9f;
       R.bestTick = c.tick;
       if (last) break;
-      if (!route.doorBefore[R.st.cursor].empty()) {
+      if (!route.doorBefore[R.st.cursor].empty() && !b.Distant()) {
         BeginDoorWait(c, R, route.doorBefore[R.st.cursor], foot);
         if (!DoorStep(c, R, foot, rt, who)) return;
         R.st.phase = ResidentPhase::Travel;
@@ -838,12 +897,12 @@ void StepResident(RefCtx& c, const Ref& r) {
       rw.act == "wander" ? std::max(40.0f, rw.Radius() * 10.0f + 20.0f) : 24.0f;
   if (!busy && fromAnchor > strayMax) {
     // Knocked, chased or pushed well off its spot: walk back.
-    m->SetActivity("");
+    setActivity("");
     Plan(c, R, foot);
     return;
   }
   if (rw.act == "sleep") {
-    if (!busy && fromAnchor <= radius + 2.0f) m->SetActivity("sleep");
+    if (!busy && fromAnchor <= radius + 2.0f) setActivity("sleep");
     return;
   }
   // ---- the monster rows (D3) ----
@@ -851,19 +910,19 @@ void StepResident(RefCtx& c, const Ref& r) {
     // Asleep on the spot until something comes within the radius.
     if (!busy && !R.sprung && fromAnchor <= radius + 2.0f) {
       rt.verb = ai::Intent::Sleep;
-      m->SetActivity("sleep");
+      setActivity("sleep");
     } else {
-      m->SetActivity("");
+      setActivity("");
     }
     return;
   }
   if (rw.act == "ambush") {
-    m->SetActivity("");
+    setActivity("");
     if (!busy && !R.sprung) rt.hold = true;   // perfectly still
     return;
   }
   if (rw.act == "patrol") {
-    m->SetActivity("");
+    setActivity("");
     const std::vector<std::string> route = rw.Route();
     if (busy || route.empty()) return;
     if (R.patrolWaitUntil == 0) {
@@ -894,7 +953,12 @@ void StepResident(RefCtx& c, const Ref& r) {
     return;
   }
   // guard: stands its post facing the anchor's yaw (work's pose).
-  m->SetActivity("");
+  setActivity("");
+  // A DISTANT villager neither turns to its neighbours nor wanders round its
+  // anchor (a documented approximation, D5): it stands at its post until the
+  // row changes, so a village at its anchors 100 m away SLEEPS (rule 2) --
+  // the near tier's milling-about is for the creatures you can see.
+  if (b.Distant() && (rw.act == "socialize" || rw.act == "wander")) return;
   if (rw.act == "socialize") {
     // Face the nearest other villager in reach, else the anchor's yaw.
     float best = rw.Radius() * 10.0f + 30.0f;
@@ -1137,6 +1201,104 @@ std::string ResidentActivity(const std::string& refId) {
   return it->second.st.activity;
 }
 
+// ---- THE DISTANT RESIDENTS (D5, docs/PLAN_distant_npcs.md §2.5) ---------------
+//
+// A villager that is DISTANT walks its day too: the same StepResidentBody, on
+// the distant creature's own brain (MobSystem::BrainAnyTierMut), its foot off
+// the tier. The tier's Think then walks it toward the routine's goal over
+// DistantGround -- a movement goal, never a teleport. Two things are its own:
+//   * AT ITS ANCHOR IT HOLDS (routine.hold), so the tier's sleep test puts it
+//     to sleep (game/distant.cpp phase 2); a patrol's pause at a node sets the
+//     routine clock (SetDistantRoutineClock) it wakes on.
+//   * A SLEEPER IS WOKEN ONLY BY ITS DAY: when the schedule clock reaches a
+//     new minute, each sleeping villager's row is compared with the one it
+//     holds; a new row (or an edit to the refs or the schedules) wakes it
+//     (MobSystem::WakeDistant) and steps it.
+// RULE 2: with every distant creature asleep, no clock due and the minute
+// unchanged, the pass is three compares. An awake villager is stepped on the
+// tier's own idle stride (every tick when engaged), the tick the tier will
+// think with the routine this writes.
+namespace {
+
+void StepDistantResident(RefCtx& c, const Ref& r, uint64_t id) {
+  MobSystem& mobs = *c.mobs;
+  const DistantMob* d = mobs.Distant().Find(id);
+  ai::Brain* br = mobs.BrainAnyTierMut(id);
+  if (d == nullptr || d->dead || br == nullptr) return;
+  ResidentBody b;
+  b.id = id;
+  b.brain = br;
+  b.foot = Vec3{d->origin.x + d->worldSize.x * 0.5f, d->origin.y,
+                d->origin.z + d->worldSize.z * 0.5f};
+  StepResidentBody(c, r, b);
+  mobs.DistantMut().Note(&DistantMobs::Stats::scheduleSteps);
+  ResidentsWorld& w = W();
+  auto it = w.npcs.find(r.id);
+  if (it == w.npcs.end()) return;
+  Resident& R = it->second;
+  ai::Routine& rt = br->routine;
+  uint32_t clock = 0;
+  if (rt.active && !rt.hold && R.st.phase == ResidentPhase::AtAnchor && !R.st.busy) {
+    // NOTHING LEFT TO WALK: hold, and the tier sleeps it. A patrol paused at
+    // a node wakes when the pause ends (the node it walks to next).
+    rt.hold = true;
+    if (R.patrolWaitUntil > c.tick) clock = R.patrolWaitUntil;
+    mobs.DistantMut().Note(&DistantMobs::Stats::scheduleHolds);
+  }
+  mobs.SetDistantRoutineClock(id, clock);
+}
+
+void StepDistantResidents(RefCtx& c) {
+  MobSystem& mobs = *c.mobs;
+  const DistantMobs& tier = mobs.Distant();
+  if (tier.Count() == 0) return;
+  ResidentsWorld& w = W();
+  const int minute = schedule::MinuteNow(c.tick);
+  const uint64_t refsRev = c.refs->Revision(), schedRev = Schedules().Revision();
+  const bool dayMoved =
+      minute != w.distMinute || refsRev != w.distRefsRev || schedRev != w.distSchedRev;
+  // NOTHING TO DO COSTS NOTHING: every distant creature asleep, none due,
+  // and the day where it was.
+  if (!dayMoved && !tier.AnyAwakeHint() && c.tick < tier.NextWakeTick()) return;
+  w.distMinute = minute;
+  w.distRefsRev = refsRev;
+  w.distSchedRev = schedRev;
+  const uint32_t stride = (uint32_t)std::max(1, CurrentTuning().distant.idleStride);
+  // In the TIER'S ORDER (ascending id): the pass writes only each villager's
+  // own brain and clock, so the order changes nothing, and it is fixed.
+  for (size_t i = 0; i < tier.Count(); i++) {
+    const DistantMob& d = tier.At(i);
+    if (d.dead || d.refId.empty()) continue;
+    const Ref* r = c.refs->Find(d.refId);
+    if (r == nullptr || r->kind != "npc") continue;
+    const uint64_t id = d.id;
+    auto it = w.npcs.find(d.refId);
+    const bool known = it != w.npcs.end() && it->second.mobId == id;
+    if (d.asleep && !(d.wakeTick != 0 && c.tick >= d.wakeTick)) {
+      // A SLEEPER: only its day can give it something to do.
+      if (known) {
+        if (!dayMoved) continue;
+        const schedule::Schedule* sc = Schedules().Find(PropStr(*r, "schedule"));
+        const int row = sc != nullptr ? sc->RowAt(minute) : -1;
+        if (row == it->second.st.row && refsRev == it->second.refsRev &&
+            schedRev == it->second.schedRev)
+          continue;
+      }
+      mobs.WakeDistant(id);
+      mobs.DistantMut().Note(&DistantMobs::Stats::scheduleWakes);
+    } else {
+      // Awake: on the tier's own stride, unless engaged (game/distant.cpp's
+      // "who steps" rule), so the routine is fresh for the step it feeds.
+      const bool engaged = d.brain.hasTarget || d.brain.hasThreat || d.landPending ||
+                           d.strokeEndTick != 0 || d.drawLooseTick != 0;
+      if (known && !engaged && (c.tick + (uint32_t)id) % stride != 0) continue;
+    }
+    StepDistantResident(c, *r, id);
+  }
+}
+
+}  // namespace
+
 bool ScheduledPlace(const RefStore& s, const Ref& npc, uint32_t tick, Vec3& foot,
                     float& heading) {
   const schedule::Schedule* sc = Schedules().Find(PropStr(npc, "schedule"));
@@ -1224,7 +1386,9 @@ void RegisterResidentKinds() {
         return true;
       });
     // Already standing (a load or an unpark brought it back): nothing to do.
-    if (mobs.FindMobByRef(r.id) != nullptr) {
+    // IN EITHER TIER (docs/PLAN_distant_npcs.md §2.14): a villager that
+    // walked out of the window is standing too, just not here.
+    if (mobs.LocateByRef(r.id).exists) {
       w.askedAt.erase(r.id);
       return Activation::Done;
     }
@@ -1307,8 +1471,12 @@ void RegisterResidentKinds() {
     if (why != RefEvent::Edited && why != RefEvent::Deleted) return;
     // The author changed or removed the villager: take the old body away so
     // the new line can spawn fresh (Deleted: nothing comes back).
+    // EITHER TIER (docs/PLAN_distant_npcs.md §2.14): an old body that is
+    // distant right now would otherwise come back beside the fresh one.
     if (c.mobs != nullptr) {
       if (Mob* m = c.mobs->FindMobByRef(r.id)) c.mobs->RemoveMob(m->Id());
+      if (const DistantMob* far = c.mobs->Distant().FindByRef(r.id))
+        c.mobs->RemoveMob(far->id);
     }
     if (c.refs != nullptr) c.refs->ClearDelta(r.id);
   };
@@ -1357,6 +1525,9 @@ void RegisterResidentKinds() {
       if (r.kind != "npc" || !c.refs->IsActive(id)) continue;
       StepResident(c, r);
     }
+    // ...and the villagers who are DISTANT (D5): their refs may be dormant
+    // (the window left their home), their day goes on.
+    StepDistantResidents(c);
   };
   Kinds().Register(std::move(npc));
 }

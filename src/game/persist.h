@@ -301,16 +301,42 @@ bool ResumeWorldClock(uint32_t savedSimTick, uint32_t simTickNow);
 //     answer is back. An item comes back ASLEEP at its parked pose (the DBRS
 //     rule), so it is not falling while its terrain patch is built.
 //
+// THE DISTANT TIER SHARES THIS DOOR (docs/PLAN_distant_npcs.md, game/distant.h).
+// With `distant.enabled`, a creature leaving the window within the distant
+// radius DEMOTES instead of parking (MobSystem keeps its id and brain), and
+// Unpark PROMOTES the distant ones the window has reached again -- FIRST,
+// nearest to the window centre first, under the same three waits and out of
+// the same budget, before any parked record is looked at. A distant creature
+// past radius + hysteresis RETIRES through the park function above as its
+// patched record. And a parked record the window does NOT hold -- beyond the
+// park pad, inside the radius -- is ACTIVATED (D5+D6, MobSystem::
+// ActivateParked, called first thing here with its own scan memory and
+// budget): it becomes a distant creature, so a village 80 m away lives before
+// you arrive and a save's parked creatures come back as distant ones after a
+// load. With the switch off none of that runs.
+//
+// IN THE TICK, NOT AFTER IT (§2.1, audit A12): the game's TickAuthority calls
+// Unpark in phase H, right before mobs.PreTick, through
+// TickAuthorityCtx::parking -- a tier change decided outside the tick is the
+// "harness stops where the game keeps going" trap, and promotion and
+// unparking had to be one decision. A gate that owns an EntityParking of its
+// own (mob-park, npc-catchup, the refs and worldio gates) leaves `parking`
+// null on its rig and keeps calling Unpark by hand, which is the same
+// function with the same waits, at the point in the tick the gate chooses.
+//
 // OUT OF SCOPE (follow-ups): parked creatures do not tick -- no off-screen
 // travel, hunger or schedule; they stand frozen where they left the window.
+// (With the distant tier on, a parked creature inside distant.radius does not
+// stay parked: it is activated, and as a distant creature it walks its day.)
 // Plain debris (rubble, a severed limb wearing nothing) is still destroyed by
 // the cull: it is the Noita rule, and only a group holding an item is kept.
 // Multiplayer: see Bind.
 class EntityParking {
  public:
-  // Creatures made live per Unpark call. main.cpp calls once per sim tick, so
-  // this is creatures per tick: a crowd of 16 (MobSystem's cap) is back in
-  // eight ticks, ~0.13 s, and no tick pays for more than two rig builds.
+  // Creatures made live per Unpark call -- promoted distant ones and unparked
+  // records together. The tick calls once (phase H), so this is creatures per
+  // tick: a crowd of 16 is back in eight ticks, ~0.13 s, and no tick pays for
+  // more than two rig builds.
   static constexpr uint32_t kUnparkPerCall = 2;
   // Item groups per call. A group is one to a handful of debris bodies (no
   // rig, no joints): a dropped pack's worth comes back in a tick or two.
@@ -355,8 +381,10 @@ class EntityParking {
   // hand off).
   void Bind(MobSystem& mobs, ChunkStore& store, bool enabled,
             const WorldItemRefs* ground = nullptr);
-  // See the class comment. `tick` is the sim tick just run (the fetch-cache
-  // freshness bound is in ticks). Returns creatures made live.
+  // See the class comment. `tick` is the sim tick being run (phase H) or just
+  // run (a gate's by-hand call); the fetch-cache freshness bound is in ticks.
+  // Returns creatures made live: distant ones promoted plus records unparked
+  // (Stats::unparked counts only the latter; the tier counts its own).
   uint32_t Unpark(MobSystem& mobs, ChunkStore& store, World& world,
                   uint32_t tick, uint32_t budget = kUnparkPerCall);
   // Forget the ground-wait bookkeeping and the "nothing to do" shortcut

@@ -1161,6 +1161,26 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
         m->SaveOne(w);
         out.push_back(std::move(r));
       }
+      // ---- AND THE DISTANT TIER, AS PARKED RECORDS (PLAN_distant_npcs.md
+      // §2.10, audit A2) ----------------------------------------------------
+      // A save is "everyone distant parks": each distant creature, living or
+      // dead, is its demotion record patched with the overlay (origin,
+      // heading, every limb's hp, dead + cause, ref), bucketed by the
+      // overlay's origin like every record here, in id order. Without this a
+      // save taken while the tier held anyone silently dropped them all. The
+      // id and the brain do not travel -- a save/load drops them for every
+      // creature (records carry none), so this is no change from today.
+      for (const DistantMob& d : mobs.Distant().All()) {
+        EntityRecord r;
+        r.pos = d.origin;
+        if (!mobs.DistantRecord(d, r.bytes)) {
+          std::fprintf(stderr,
+                       "save: distant mob %llu ('%s') did not patch; not saved\n",
+                       (unsigned long long)d.id, d.defName.c_str());
+          continue;
+        }
+        out.push_back(std::move(r));
+      }
     };
     // Straight to LoadOne (LoadState's loop body) rather than through a
     // count-1 LoadState: LoadState reports only whether the BYTES parsed, and
@@ -1405,14 +1425,16 @@ void EntityParking::Bind(MobSystem& mobs, ChunkStore& store, bool enabled,
   }
   ChunkStore* st = &store;
   Stats* stats = &stats_;
-  mobs.SetParkFn([st, stats](const Mob& m, std::vector<uint8_t>& record) {
+  mobs.SetParkFn([st, stats](Vec3 origin, std::vector<uint8_t>& record) {
     // THE SAME RECORD A SAVE WRITES: section, version, origin, SaveOne bytes
     // (persist.cpp's 'MOBS' saveRecords builds exactly this). Its matTable
-    // stays 0, "this process's running table" (mattable.h).
+    // stays 0, "this process's running table" (mattable.h). A distant
+    // creature RETIRING comes through here too, as its patched record
+    // (docs/PLAN_distant_npcs.md §2.1): the same shape, by construction.
     ChunkStore::EntityRecord r;
     r.section = FourCC('M', 'O', 'B', 'S');
     r.version = MobSystem::kSaveVersion;
-    r.pos = m.Origin();
+    r.pos = origin;
     r.bytes = std::move(record);
     st->DormantEntities(ChunkStore::RegionOfVoxel(r.pos)).push_back(std::move(r));
     stats->parked++;
@@ -1468,10 +1490,17 @@ uint32_t EntityParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
                             uint32_t tick, uint32_t budget) {
   stats_.lastCall = 0;
   if (!enabled_) return 0;
+  // PARKED -> DISTANT (D5+D6, MobSystem::ActivateParked): records beyond the
+  // park pad, inside distant.radius. Its own scan memory and budget; the
+  // records it takes are never the ones below (those are over the line).
+  mobs.ActivateParked(store, world, tick);
   const IVec3 wo = world.WindowOrigin();
   const bool moved = !haveOrigin_ || wo.x != lastOrigin_.x ||
                      wo.y != lastOrigin_.y || wo.z != lastOrigin_.z;
-  if (!moved && !pending_) return 0;
+  // The distant tier's latch (game/distant.h): something other than the
+  // window may have put a distant creature over the promotion line.
+  const bool distantDue = mobs.Distant().PromoteScanDue();
+  if (!moved && !pending_ && !distantDue) return 0;
   const int n = (int)(kWorldN / kChunk);
   if (moved) {
     // A chunk that left the window forgets its wait: its cached copy is stale
@@ -1494,11 +1523,119 @@ uint32_t EntityParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
     return cx >= wo.x + m && cx < wo.x + n - m && cy >= wo.y + m &&
            cy < wo.y + n - m && cz >= wo.z + m && cz < wo.z + n - m;
   };
+  // THE GROUND UNDER A CREATURE'S FOOTPRINT, known in the fetch cache. The
+  // position is the body's MIN CORNER (Mob::Origin), and the ground the body
+  // rests on runs under the whole footprint -- so the chunks under the corner
+  // AND half a chunk on in x and z (the centre column of anything up to a
+  // chunk wide), at the feet and one below. Every one is asked every time (no
+  // short-circuit), so the fetches go out together rather than one call
+  // apart. A parked record and a distant creature wait on the same rule.
+  auto footprintGround = [&](const Vec3& p) {
+    const float half = 0.5f * (float)kChunk;
+    const int xs[2] = {chunkOf(p.x), chunkOf(p.x + half)};
+    const int zs[2] = {chunkOf(p.z), chunkOf(p.z + half)};
+    const int fy = chunkOf(p.y);
+    bool ground = true;
+    for (int a = 0; a < 2; a++)
+      for (int b = 0; b < 2; b++) {
+        if (a == 1 && xs[1] == xs[0]) continue;
+        if (b == 1 && zs[1] == zs[0]) continue;
+        for (int dy = 0; dy >= -1; dy--)
+          ground &= GroundKnown(world, {xs[a], fy + dy, zs[b]}, tick);
+      }
+    return ground;
+  };
+  uint32_t made = 0, itemsMade = 0;
+
+  // ---- 0. THE CAP OVERFLOW (D8, MobSystem::OverflowSwaps; game/distant.h) --
+  // While the living cap binds: the waiting served nearest to the player, a
+  // far near creature demoted to make a slot. Same budget, same ground wait.
+  made += mobs.OverflowSwaps(tick, budget, [&](const DistantMob& c) {
+    std::vector<IVec3> sc;
+    bool g = footprintGround(c.origin);
+    mobs.DistantPromotionChunks(c, sc);
+    for (const IVec3& wc : sc) g &= GroundKnown(world, wc, tick);
+    return g;
+  });
+
+  // ---- 1. THE DISTANT TIER FIRST (docs/PLAN_distant_npcs.md §2.1) ---------
+  //
+  // PROMOTION and unparking compete for the same living cap and the same
+  // per-call budget, so they are decided here, in one place and one order:
+  // the distant creatures first -- they hold an identity and a mind a parked
+  // record has already lost -- then the parked records with what is left.
+  //
+  // A candidate is a distant creature whose min corner is inside the window
+  // by kUnparkMarginChunks on every face (THE PROMOTION LINE, the same test
+  // a parked record passes), served NEAREST TO THE WINDOW CENTRE FIRST, ties
+  // by id, under the SAME THREE WAITS an unpark has: the budget, the living
+  // cap (a corpse never waits on it), and the ground under its footprint
+  // known in the fetch cache. A creature that waits stays distant, untouched
+  // (in D1 it is HELD at the line: its drive refuses any step deeper).
+  {
+    DistantMobs& tier = mobs.DistantMut();
+    tier.ClearPromoteScan();
+    if (tier.Count() > 0) {
+      tier.Note(&DistantMobs::Stats::promoteScans);
+      std::vector<uint64_t> cands;   // distance to the window centre, then id
+      std::vector<IVec3> snapChunks;
+      tier.PromotionCandidates(wo, m, cands);
+      for (const uint64_t cid : cands) {
+        const DistantMob* d = tier.Find(cid);
+        if (d == nullptr) continue;
+        if (made >= budget) {
+          tier.Note(&DistantMobs::Stats::budgetWaits);
+          pending_ = true;
+          continue;
+        }
+        if (!mobs.HasRoomForDistant(*d)) {
+          tier.Note(&DistantMobs::Stats::capWaits);
+          pending_ = true;
+          continue;
+        }
+        // ...AND THE THRASH BOUND (D3, section 2.7): a creature pacing the
+        // edge would otherwise change tier on every crossing. A demotion
+        // cannot wait (past the pad there is no ground for a body), so the
+        // promotion does: one that changed tier kDistantMaxFlips - 2 times in
+        // the last kDistantFlipWindowTicks stays distant, held at the line,
+        // until its oldest flip ages out.
+        if (!mobs.DistantFlipBudgetOk(cid, tick)) {
+          tier.Note(&DistantMobs::Stats::flipWaits);
+          pending_ = true;
+          continue;
+        }
+        // ...AND THE SNAP's GROUND (D1, MobSystem::SnapPromotionGround): the
+        // footprint's columns from promoteMaxDropVox below the feet to that
+        // much above, so the promotion lands on ground the fetch cache has
+        // ANSWERED for, not ground it has not delivered yet. Every chunk is
+        // asked (no short-circuit), so the fetches go out together.
+        bool ground = footprintGround(d->origin);
+        mobs.DistantPromotionChunks(*d, snapChunks);
+        for (const IVec3& wc : snapChunks) ground &= GroundKnown(world, wc, tick);
+        if (!ground) {
+          tier.Note(&DistantMobs::Stats::groundWaits);
+          pending_ = true;
+          continue;
+        }
+        bool refused = false;
+        if (mobs.PromoteDistant(cid, &refused, tick) != nullptr) {
+          made++;
+        } else if (refused) {
+          // Spawn short of a body or a brick: kept, retried, and this call
+          // spawns nothing more (the parked records' rule below).
+          pending_ = true;
+          budget = made;
+        }
+        // A permanent refusal was dropped and logged by PromoteDistant.
+      }
+    }
+  }
+
+  // ---- 2. THE PARKED RECORDS ----------------------------------------------
   const uint32_t kMobs = FourCC('M', 'O', 'B', 'S');
   const uint32_t kItms = FourCC('I', 'T', 'M', 'S');
   const IVec3 lo = ChunkStore::RegionOfChunk(wo);
   const IVec3 hi = ChunkStore::RegionOfChunk({wo.x + n - 1, wo.y + n - 1, wo.z + n - 1});
-  uint32_t made = 0, itemsMade = 0;
   for (int rz = lo.z; rz <= hi.z; rz++)
     for (int ry = lo.y; ry <= hi.y; ry++)
       for (int rx = lo.x; rx <= hi.x; rx++) {
@@ -1567,26 +1704,8 @@ uint32_t EntityParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
             i++;
             continue;
           }
-          // The record's position is the body's MIN CORNER (Mob::Origin), and
-          // the ground the body rests on runs under the whole footprint -- so
-          // the chunks under the corner AND half a chunk on in x and z (the
-          // centre column of anything up to a chunk wide), at the feet and
-          // one below. Every one is asked every time (no short-circuit), so
-          // the fetches go out together rather than one call apart.
-          const Vec3 p = dormant[i].pos;
-          const float half = 0.5f * (float)kChunk;
-          const int xs[2] = {chunkOf(p.x), chunkOf(p.x + half)};
-          const int zs[2] = {chunkOf(p.z), chunkOf(p.z + half)};
-          const int fy = chunkOf(p.y);
-          bool ground = true;
-          for (int a = 0; a < 2; a++)
-            for (int b = 0; b < 2; b++) {
-              if (a == 1 && xs[1] == xs[0]) continue;
-              if (b == 1 && zs[1] == zs[0]) continue;
-              for (int dy = 0; dy >= -1; dy--)
-                ground &= GroundKnown(world, {xs[a], fy + dy, zs[b]}, tick);
-            }
-          if (!ground) {
+          // The ground under the footprint (footprintGround above).
+          if (!footprintGround(dormant[i].pos)) {
             stats_.groundWaits++;
             pending_ = true;
             i++;

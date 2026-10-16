@@ -28,6 +28,7 @@
 #include "sim/trample.h"
 #include "sim/plants.h"
 #include "game/bodyreg.h"
+#include "game/distant_draw.h"
 #include "game/demon.h"
 #include "game/demon_cast.h"
 #include "game/demon_lore.h"
@@ -9197,6 +9198,17 @@ int main(int argc, char** argv) {
   // BodyInstanceArena): only what changed is uploaded, and each body is
   // frustum-culled on its own. `bodyDraws` is the main view's culled list.
   BodyInstanceArena bodyArena;
+  // THE DISTANT CREATURES' STATUES (game/distant_draw.h, PLAN_distant_npcs
+  // §2.9 D4a): the baked-look cache and the producer, drawn as render-only
+  // bodies after the arrows. Its item list is EMPTY until the distant tier
+  // fills it -- D1: `distantDraw.Items()` every frame, `distantDraw.Bake(mob,
+  // mbSet)` at demotion before ReleaseRig. SANDVOX_DISTANT_DRAW_TEST=<n>
+  // stands n statues in a ring around the player without the tier.
+  DistantDraw distantDraw;
+  DistantDrawTestHook distantDrawTest;
+  // D1: a creature demoted from here on bakes its statue from its live rig
+  // (MobSystem::DemoteToDistant, before ReleaseRig) into this cache.
+  mobs.SetDistantDraw(&distantDraw);
   // SANDVOX_BODY_INST_LEGACY=1: whole-list upload + one undivided draw, the
   // one-binary A/B arm for the arena and the cull (phys/debris.cpp reads the
   // same variable for its cull cache). The 18-vertex cube is NOT in the arm.
@@ -11967,6 +11979,10 @@ int main(int argc, char** argv) {
   // The ground-item registry: the tick throws vessels into it and breaks the
   // ones that land hard (session.h section H2).
   tickCtx.ground = &ground;
+  // Parking and the distant tier's promotion run INSIDE the tick now (phase
+  // H, session.h section H3b; docs/PLAN_distant_npcs.md §2.1). The binding
+  // stays out here, before each tick (see the S5b block by TickAuthority).
+  tickCtx.parking = &mobParking;
   // ---- THE MAP'S REFERENCES (world/refs.h, PLAN_world_editor.md P1) -------
   // assets/worldmap/<map>/refs/*.json: villagers, doors, markers, houses. The
   // tick activates them against the window and runs the use verb
@@ -16745,24 +16761,30 @@ int main(int argc, char** argv) {
         }
       }
 
-      TickAuthority(tickCtx, session,
-                    FrameIntent{brushActive, handsUp, pourAimValid, pourAim,
-                                ui.pourRadius, pourFromValid, pourFrom},
-                    ti, tick, opBatch);
-
       // ---- S5b: NPCs AND GROUND ITEMS OUTLIVE THE WINDOW (persist.h) -------
-      // A creature leaving the window is parked in its region bucket by
-      // mobs.PreTick, a ground item (with whatever it is strapped to) by
-      // debris.PostStep's cull; here, after the tick, the ones the window has
-      // reached again come back, a few per tick and only onto ground the fetch
-      // cache has answered for. Parking is on for single player and the host
-      // (whose store is the world's), off for a client.
+      // A creature leaving the window is parked in its region bucket (or,
+      // with `distant.enabled`, demoted to the distant tier) by mobs.PreTick,
+      // a ground item (with whatever it is strapped to) by debris.PostStep's
+      // cull; the ones the window has reached again come back -- distant
+      // creatures promoted first -- a few per tick and only onto ground the
+      // fetch cache has answered for. Parking is on for single player and the
+      // host (whose store is the world's), off for a client.
+      //
+      // THE BINDING IS HERE, BEFORE THE TICK; THE UNPARK IS IN IT (phase H,
+      // through tickCtx.parking; docs/PLAN_distant_npcs.md §2.1, audit A12).
+      // It used to run after TickAuthority, outside the tick, which every gate
+      // that ticks THE tick had to imitate by hand. Bind is idempotent, so a
+      // call per tick costs a compare.
       {
         const WorldItemRefs parkGround{&ground, &phys, &debris, &mbSet, &items};
         mobParking.Bind(mobs, stream.Store(), netRoleBoot != NetRole::Client,
                         &parkGround);
-        mobParking.Unpark(mobs, stream.Store(), world, tick);
       }
+
+      TickAuthority(tickCtx, session,
+                    FrameIntent{brushActive, handsUp, pourAimValid, pourAim,
+                                ui.pourRadius, pourFromValid, pourFrom},
+                    ti, tick, opBatch);
 
       // ---- M9.3-B: THE SMOKE'S AUTHOR ------------------------------------
       //
@@ -21395,6 +21417,9 @@ int main(int argc, char** argv) {
       static std::vector<RenderOnlyBody> flightBodies;
       flightBodies.clear();
       tickCtx.arrows.AppendRenderBodies(items, tickAlpha, flightBodies);
+      // ...and the ABSTRACT ones between distant creatures (D2b), on their
+      // arc from the statue archer to its mark (game/distant.h).
+      AppendDistantArrowBodies(mobs.Distant(), items, tick, tickAlpha, flightBodies);
       // ...and the TRAILS behind them (game/arrows.h ArrowTrails), queued
       // here, ahead of the frame's encoder, so this frame draws them. The
       // hit-stop dip slows them with the flights they follow.
@@ -21426,7 +21451,35 @@ int main(int argc, char** argv) {
           if (camMode != CameraMode::First) PresentQuiver(avatar, items, flightBodies);
         }
       }
-      bodyReg.SetRenderOnly(&flightBodies);
+      // THE DISTANT STATUES, after the arrows (game/distant_draw.h): culled
+      // against this frame's camera, nearest first, the living before the
+      // dead, into the slots the real bodies and the arrows left -- never one
+      // of theirs. A pose packed here dirties the micro set, so the upload
+      // runs again before anything draws it.
+      static std::vector<RenderOnlyBody> statueBodies;
+      {
+        if (distantDrawTest.Enabled())
+          distantDrawTest.Fill(distantDraw, mobs.Defs(), mbSet, player.pos,
+                               NowSeconds(), kDefaultSeed);
+        else
+          // D1: one statue per distant creature with a baked look, walking
+          // while it walks (FillDistantDrawItems, game/distant.h).
+          FillDistantDrawItems(mobs.Distant(), tick, CurrentTuning().distant.idleStride,
+                               distantDraw.Items());
+        const uint32_t used = bodyReg.RealSlots() + (uint32_t)flightBodies.size();
+        DistantView dv;
+        dv.eye = eye;
+        dv.fwd = jcam.Forward();
+        dv.right = jcam.Right();
+        dv.up = jcam.Up();
+        dv.tanHalfFovY = std::tan(CurrentTuning().camera.fovY * 0.5f);
+        dv.aspect = (float)ctx.width / (float)ctx.height;
+        distantDraw.Produce(mbSet, &mobs.Defs(), dv,
+                            used < kMaxBodySlots ? kMaxBodySlots - used : 0u,
+                            statueBodies);
+        if (mbSet.dirty) sim.UploadMicroBodies(ctx.queue, mbSet);
+      }
+      bodyReg.SetRenderOnly({&flightBodies, &statueBodies});
       const auto bodyT0 = std::chrono::steady_clock::now();
       // WHO ELSE IS HOLDING MY ARM. One index sweep while everything is
       // healthy, a named report the moment two entities point at one brick
@@ -23172,6 +23225,25 @@ int main(int argc, char** argv) {
           // The shared readback FIFO, whole run: who asked, how long they
           // waited, what was dropped. See World::FetchProbe.
           std::printf("    %s\n", world.FetchReport().c_str());
+          // THE DISTANT TIER, whole run (docs/PLAN_distant_npcs.md): what THIS
+          // loop demoted, promoted, activated and drew. Every distant gate
+          // drives TickAuthority through the rig; only a game run goes
+          // through the frame loop's wiring (the statue items, the producer).
+          {
+            const DistantMobs::Stats& ds = DistantRunTotals();
+            const DistantDrawRunStats& dr = DistantDrawRunTotals();
+            std::printf("    distant tier: demoted %llu (%llu dead, %llu anchored), "
+                        "promoted %llu, retired %llu, activated %llu, refused full "
+                        "%llu, peak %llu | statues: drawn peak %llu, drawn %llu, "
+                        "culled %llu, starved %llu, unbaked %llu, bakes %llu\n",
+                        (unsigned long long)ds.demoted, (unsigned long long)ds.demotedDead,
+                        (unsigned long long)ds.anchored, (unsigned long long)ds.promoted,
+                        (unsigned long long)ds.retired, (unsigned long long)ds.activated,
+                        (unsigned long long)ds.refusedFull, (unsigned long long)ds.peak,
+                        (unsigned long long)dr.drawnPeak, (unsigned long long)dr.drawnTotal,
+                        (unsigned long long)dr.culledTotal, (unsigned long long)dr.starvedTotal,
+                        (unsigned long long)dr.unbakedTotal, (unsigned long long)dr.bakes);
+          }
         }
         std::printf("    gpu-lag throttle: %llu ticks deferred to a later frame "
                     "(the GPU owed >= 2 snapshots when a second tick was due)\n",

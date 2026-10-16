@@ -339,8 +339,11 @@ ReleaseResult Release(TickAuthorityCtx& w, std::span<SessionTick> players, uint6
     ld->why = why;
     // Not aimed at anyone. D5's contract decides what it does next; until
     // then the def's `released` profile (a neutral one) stands in.
-    if (def != nullptr && !def->released.empty()) w.mobs.SetMobBehavior(ld->mobId, def->released);
-    if (ai::Brain* br = w.mobs.MobBrainMut(ld->mobId)) {
+    // EITHER TIER (docs/PLAN_distant_npcs.md §2.14): a release works from
+    // anywhere (TB_DEMON_RELEASE), so the demon may be distant right now.
+    if (def != nullptr && !def->released.empty())
+      w.mobs.SetBehaviorAnyTier(ld->mobId, def->released);
+    if (ai::Brain* br = w.mobs.BrainAnyTierMut(ld->mobId)) {
       br->hasTarget = false;
       br->targetId = 0;
       br->routine.active = false;   // D6: no longer waiting in the circle

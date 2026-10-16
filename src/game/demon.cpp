@@ -231,7 +231,8 @@ void Refund(std::span<SessionTick> players, int session, int32_t tariff) {
 // THE GOOF, AND THE BREAK: point the demon at the one who called it.
 void AimAtSummoner(MobSystem& mobs, std::span<SessionTick> players, const LiveDemon& ld,
                    uint32_t tick) {
-  ai::Brain* b = mobs.MobBrainMut(ld.mobId);
+  // Either tier: a one-time aim (DemonUnbind's reason, PLAN_distant_npcs §2.14).
+  ai::Brain* b = mobs.BrainAnyTierMut(ld.mobId);
   if (b == nullptr) return;
   for (SessionTick& p : players)
     if (p.s->index == ld.session) {
@@ -303,11 +304,13 @@ void DemonUnbind(TickAuthorityCtx& w, std::span<SessionTick> players, LiveDemon&
   ld.stateTick = tick;
   ld.why = why;
   ld.pact.reset();   // D5: loose is loose -- the contract is void, the upkeep freed
-  // A released demon going loose gets its hostile profile back.
+  // A released demon going loose gets its hostile profile back. EITHER TIER
+  // (docs/PLAN_distant_npcs.md §2.14): a one-time write that must reach a
+  // demon that is distant right now, or it would come back calm and waiting.
   if (const DemonDef* def = w.demons ? w.demons->lib.Find(ld.demon) : nullptr)
-    if (!def->behavior.empty()) w.mobs.SetMobBehavior(ld.mobId, def->behavior);
+    if (!def->behavior.empty()) w.mobs.SetBehaviorAnyTier(ld.mobId, def->behavior);
   // D6: the wait-at-home routine a held demon had is over (demon_malice.cpp).
-  if (ai::Brain* b = w.mobs.MobBrainMut(ld.mobId)) {
+  if (ai::Brain* b = w.mobs.BrainAnyTierMut(ld.mobId)) {
     b->routine.active = false;
     b->wanderOwned = false;
   }
@@ -457,8 +460,15 @@ void DemonTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t tic
   size_t keep = 0;
   for (size_t i = 0; i < d.live.size(); i++) {
     LiveDemon& ld = d.live[i];
-    if (!w.mobs.IsAlive(ld.mobId)) continue;   // dead or gone: forget it
-    if (ld.state == DemonState::Contained) {
+    // Dead or gone: forget it. IN EITHER TIER (docs/PLAN_distant_npcs.md
+    // §2.14): a demon that walked out of the window is still there, and an
+    // entry dropped for it would lose its binding, its circle and its pact
+    // for good. A DISTANT one is kept and NOT re-judged -- its circle is not
+    // in the window to be re-read, and a re-read that saw nothing would break
+    // it; it is judged again once it is promoted.
+    const MobSystem::CreatureWhere where = w.mobs.LocateCreature(ld.mobId);
+    if (!where.alive) continue;
+    if (ld.state == DemonState::Contained && !where.distant) {
       // RE-READ when a chunk the circle overlaps is awake in the snapshot, or
       // on the cadence. Never twice in a tick.
       bool due = tick >= ld.lastCheck + (uint32_t)d.lib.circle.recheckTicks;

@@ -11,6 +11,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <chrono>
+#include <limits>
 #include <unordered_set>
 #include <string>
 #include <vector>
@@ -35,6 +37,7 @@
 #include "phys/physics.h"
 #include "sim/microbody.h"
 #include "sim/reactcpu.h"
+#include "sim/worldmap.h"  // the placed dungeons (distant-roundtrip K)
 #include "test/selftest.h"
 #include "test/support.h"
 #include "test/tickrig.h"
@@ -12598,10 +12601,17 @@ Status GateMobSaveDelta(Ctx& c, std::string& detail) {
 // LEAVES NOTHING: resets mobs and debris, removes the park function, puts the
 // id counter back, clears the store, deletes its save dir and regenerates the
 // world at its home window.
+//
+// THE SWITCH (docs/PLAN_distant_npcs.md D3): arms A-F are the PARK path, so
+// they run with `distant.enabled` PINNED OFF (DistantSwitchScope) -- the
+// default is on since the flip, and the far teleport here (~90 m) is inside
+// the distant radius, so with it on these creatures would demote instead.
+// Arm G turns it on and is the demote path's half of this gate.
 Status GateMobPark(Ctx& c, std::string& detail) {
   namespace fs = std::filesystem;
   const char* kPath = "selftest_mobpark.svd";
   const uint64_t idCounterWas = c.mobs.NextIdCounter();
+  DistantSwitchScope tierOff(false);
   EntityParking parking;
   auto restore = [&]() {
     c.debris.Reset();
@@ -13042,7 +13052,57 @@ Status GateMobPark(Ctx& c, std::string& detail) {
   const bool okF = okF1 && okF2 && okF3 && okF4;
   c.mobs.Reset();
 
-  const bool ok = okA && okB && okC && okD && okE && okF;
+  // ======== G: THE DISTANT TIER'S SWITCH ON (docs/PLAN_distant_npcs.md D0) ===
+  //
+  // Everything above ran with `distant.enabled` PINNED false (the shipped
+  // default is on since D3), so it is the old park path, unchanged. With the
+  // switch on,
+  // the SAME teleport (the creatures are ~90 m from the new window's centre,
+  // inside the 128 m radius) DEMOTES instead: nothing parks, the tier holds
+  // them, and the same by-hand Unpark brings them back under THEIR OWN ids.
+  // (`distant-roundtrip` holds every byte of that round trip; this arm only
+  // says the switch is the switch.)
+  int distantG = -1, backG = 0;
+  uint64_t parkedG = ~0ull;
+  {
+    const Tuning tgWas = CurrentTuning();
+    Tuning tg = tgWas;
+    tg.distant.enabled = true;
+    tg.distant.radius = 1280.0f;
+    tg.distant.hysteresis = 256.0f;
+    SetCurrentTuning(tg);
+    teleport(home);
+    parking.ResetWaits();
+    parking.ResetStats();
+    pc = {base.x >> 4, (World::TerrainHeight(base.x, base.z, kDefaultSeed)) >> 4,
+          base.z >> 4};
+    std::vector<uint64_t> idsG;
+    for (int k = 0; k < 2; k++) {
+      const int x = base.x + k * 14, z = base.z;
+      const uint64_t id =
+          c.mobs.Spawn(hi, {x, World::TerrainHeight(x, z, kDefaultSeed) + 1, z});
+      if (id != 0) idsG.push_back(id);
+    }
+    teleport(away);
+    pc = {away.x + n / 2, home.y + n / 2, away.z + n / 2};
+    tick(true);
+    distantG = (int)c.mobs.Distant().Count();
+    parkedG = parking.GetStats().parked;
+    teleport(home);
+    parking.ResetWaits();
+    pc = {base.x >> 4, (World::TerrainHeight(base.x, base.z, kDefaultSeed)) >> 4,
+          base.z >> 4};
+    for (int i = 0; i < 240 && c.mobs.Distant().Count() > 0; i++) {
+      tick(false);
+      parking.Unpark(c.mobs, c.stream.Store(), c.world, t, budget);
+    }
+    for (uint64_t id : idsG) backG += c.mobs.FindMobById(id) != nullptr ? 1 : 0;
+    SetCurrentTuning(tgWas);
+    c.mobs.Reset();
+  }
+  const bool okG = distantG == 2 && parkedG == 0 && backG == 2;
+
+  const bool ok = okA && okB && okC && okD && okE && okF && okG;
   detail = Format(
       "A %s: %zu captured, live %u after park, parked %llu, %d/3 records in "
       "their buckets byte-identical, carved stores lattice %d%s%s | B %s: %d/16 "
@@ -13072,7 +13132,843 @@ Status GateMobPark(Ctx& c, std::string& detail) {
       fr2.recordsApplied, liveF1b, foundF1b, capNull ? 1 : 0, capRefused ? 1 : 0,
       retiredNull ? 1 : 0, retiredRefused ? 1 : 0, lieNull ? 1 : 0,
       lieRefused ? 1 : 0, okF4 ? "preserved" : "LOST", whyF4.c_str());
+  detail += Format(" | G %s (distant.enabled): %d/2 demoted, parked %llu, %d/2 back "
+                   "under their own ids",
+                   okG ? "ok" : "FAIL", distantG, (unsigned long long)parkedG, backG);
 
+  restore();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- distant-roundtrip -----------------------------------------------------
+//
+// THE DISTANT TIER'S SEAM (docs/PLAN_distant_npcs.md D0, game/distant.h).
+// The D0 contract, all in one run, on the switch turned ON for the gate:
+//
+//   S. STEER, EXTRACTED BIT FOR BIT. SteerStep (game/steer.h) against a
+//      verbatim copy of the Mob-field arithmetic it replaced, over 100k random
+//      states (shield up or not, ramps on and off, one-shot caps, hitches):
+//      every output bit equal. mob-cap64-twice's digest is downstream of it.
+//   K. THE GROUND, CLASSIFIED (§2.4). On the terrain = SURFACE; 3 m over it =
+//      ANCHORED; inside a placed dungeon's world box = ANCHORED (the harness
+//      map's dungeon fixture; reported, not failed, on a map with none).
+//   A. DEMOTE. Five humans at the window centre -- one dressed and armed (the
+//      record's appended slots), one carved (a stored lattice, spent hp), one
+//      KILLED (a corpse demotes too, audit A11), one spawned 3 m up -- and a
+//      player beside them so the brains have a target. The window teleports
+//      ~90 m away and ONE tick of the real tick runs: nothing near, nothing
+//      parked, all five distant under their own ids, each living one holding
+//      the very SaveOne record it had (the corpse's matter passes run once
+//      more before the park rule reaches it), its brain (profile, target, last-seen tick,
+//      intent), every limb's hp, its life; four SURFACE and the high one
+//      ANCHORED; and its overlay patches its record into the same bytes.
+//   C. SAVE WHILE DISTANT (§2.10, audit A2), straight after the demotion
+//      tick: SaveWorld writes one region record per distant creature (the
+//      save's own count: 5 records, 0 near).
+//   B. FROZEN COSTS NOTHING (rule 2). 30 more ticks there: every record and
+//      origin unchanged, and not one more retire or promotion scan.
+//   P. THE PATCH (§2.2). PatchMobRecord on the dressed creature's record: an
+//      hp written and written back is the same bytes; dead adds exactly the
+//      dead block; a ref id is carried; a record MOVED 10/5 voxels loads with
+//      its origin there and its limbs carried with it.
+//   D. PROMOTE, BOUNDED, BY THE SAME DOOR (§2.1). The window comes home; the
+//      tier's PromotionCandidates serves nearest-first, ties by id; Unpark at
+//      a budget of ONE per call brings all five back, never more than one per
+//      call, the first only after the ground wait -- each under its OWN id,
+//      re-saving byte for byte as it was demoted, the same brain, every
+//      limb's hp, the corpse dead, the high one exactly where it stood. And
+//      no duplicate: the save in C did not leave records to unpark beside them.
+//   E. THEY STAND. 40 real ticks: the three walkers alive, none dropped more
+//      than `mobParkMaxDropVox` below where it came back.
+//   R. RETIRE (§2.1). Demoted again (same ids after two cycles), the border
+//      is pulled in under them (radius 64 + 64): the next tick parks all of
+//      them, each bucket holding its creature's PATCHED record exactly.
+//   L. THE SAVE LOADS AS PARKED RECORDS. C's save into a fresh store at the
+//      far window: nothing live, nothing distant, five records in their
+//      buckets, byte for byte the records the tier held when it was taken.
+//   O. THE SWITCH OFF IS THE OLD PATH (§1 goal 6): three fresh humans leave
+//      the window with `distant.enabled` false -- three parked, the tier
+//      untouched.
+//   F. A FULL TIER PARKS (§2.11): the tier's cap pulled to 2 (a test seam),
+//      three leave: two demote, one parks, one refusal counted.
+//
+// LEAVES NOTHING: tuning and the tier cap restored, mobs and debris reset,
+// park function removed, id counter put back, store cleared, save dir
+// deleted, worldgen regenerated at home.
+namespace {
+
+// MobSystem::Steer's arithmetic EXACTLY as it stood before the extraction
+// (mob.cpp at 6ab2eff3, "locomotion stage 2: steer"), Mob fields renamed onto
+// a struct and Mob::ShieldTurnRate written out as that function computes it.
+// The oracle SteerStep is held to, bit for bit. DO NOT EDIT: this is a copy of
+// history, not of the current code -- if SteerStep must change on purpose,
+// this arm is retired with it, in the same commit, and says so.
+struct OldSteerMob {
+  float heading = 0, desiredHeading = 0, turnVel = 0, speedNow = 0;
+  float turnCapL = 1.0f, turnCapR = 1.0f;
+  bool shield = false;
+  float shieldSpecTurn = 0, shieldRaise = 0;
+};
+float OldSteerVerbatim(OldSteerMob& mob, const LocomotionDef& lo, float defSpeed,
+                       float dt) {
+  auto ShieldTurnRate = [&mob](float freeRate) {
+    if (!mob.shield || mob.shieldRaise <= 0.0f) return freeRate;
+    return std::min(freeRate, std::max(mob.shieldSpecTurn, 0.0f) /
+                                  std::max(mob.shieldRaise, 0.05f));
+  };
+  float err = std::remainder(mob.desiredHeading - mob.heading, 6.2831853f);
+  const float speedFrac =
+      std::clamp(mob.speedNow / std::max(defSpeed, 0.01f), 0.0f, 1.0f);
+  const float rateCap = ShieldTurnRate(
+      lo.turnRate * (1.0f + (lo.turnRateMoving - 1.0f) * speedFrac));
+  const float capL = rateCap * mob.turnCapL, capR = rateCap * mob.turnCapR;
+  mob.turnCapL = mob.turnCapR = 1.0f;
+  if (rateCap <= 0.0f) {
+    mob.turnVel = 0;
+  } else if (lo.turnAccel <= 0.0f) {
+    mob.turnVel = std::clamp(err / std::max(dt, 1e-4f), -capR, capL);
+  } else {
+    const float arrive =
+        std::sqrt(2.0f * lo.turnAccel * std::abs(err)) * (err < 0 ? -1.0f : 1.0f);
+    const float want = std::clamp(arrive, -capR, capL);
+    const float dv = lo.turnAccel * dt;
+    mob.turnVel += std::clamp(want - mob.turnVel, -dv, dv);
+  }
+  float step = mob.turnVel * dt;
+  if (std::abs(step) > std::abs(err)) {
+    step = err;
+    mob.turnVel = err / std::max(dt, 1e-4f);
+  }
+  mob.heading += step;
+  mob.heading = std::remainder(mob.heading, 6.2831853f);
+  const float e = std::abs(std::remainder(mob.desiredHeading - mob.heading,
+                                          6.2831853f));
+  if (e <= lo.driveAlignFull) return 1.0f;
+  if (e >= lo.driveAlignZero) return 0.0f;
+  return 1.0f - (e - lo.driveAlignFull) /
+                    (lo.driveAlignZero - lo.driveAlignFull);
+}
+
+bool SameBits(float a, float b) { return std::memcmp(&a, &b, sizeof(float)) == 0; }
+
+}  // namespace
+
+Status GateDistantRoundtrip(Ctx& c, std::string& detail) {
+  namespace fs = std::filesystem;
+  const char* kPath = "selftest_distant.svd";
+  const uint64_t idCounterWas = c.mobs.NextIdCounter();
+  const Tuning tuneWas = CurrentTuning();
+  EntityParking parking;
+  std::vector<std::string> fails;
+  auto check = [&](bool ok, const std::string& why) {
+    if (!ok) fails.push_back(why);
+    return ok;
+  };
+  auto restore = [&]() {
+    SetCurrentTuning(tuneWas);
+    c.mobs.DistantMut().SetCapForTest(0);
+    c.debris.Reset();
+    c.mobs.Reset();
+    c.mobs.SetParkFn(nullptr);
+    c.mobs.ClearPlayerActors();
+    c.mobs.SetNextIdCounter(idCounterWas);
+    c.stream.Store().Clear();
+    std::error_code ec;
+    fs::remove_all(kPath, ec);
+  };
+  const int hi = c.mobs.FindDef("human");
+  if (hi < 0) {
+    detail = "no 'human' def";
+    return Status::Fail;
+  }
+  const MobDef& hd = c.mobs.Defs()[hi];
+  const Vec3 ws = hd.worldSize;
+  // WHERE THE GATE'S TIME GOES, per arm (wall clock: a measurement of the
+  // harness, never an input to anything it asserts).
+  std::string laps;
+  auto lapT0 = std::chrono::steady_clock::now();
+  auto lap = [&](const char* arm) {
+    const auto now = std::chrono::steady_clock::now();
+    laps += Format("%s%s %lld", laps.empty() ? "" : " ", arm,
+                   (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                       now - lapT0).count());
+    lapT0 = now;
+  };
+
+  // ======== S: the steer, extracted bit for bit ============================
+  int steerSame = 0, steerN = 0;
+  std::string whyS;
+  {
+    uint64_t s = 0x5EED0D15A47ull;
+    auto rnd = [&s]() {   // splitmix64 -> [0, 1)
+      uint64_t z = (s += 0x9E3779B97F4A7C15ull);
+      z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+      z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+      return (float)((z ^ (z >> 31)) >> 40) / (float)(1ull << 24);
+    };
+    auto span = [&](float lo, float hi2) { return lo + (hi2 - lo) * rnd(); };
+    for (int i = 0; i < 100000; i++) {
+      LocomotionDef lo;
+      lo.turnRate = rnd() < 0.05f ? 0.0f : span(0.0f, 8.0f);
+      lo.turnAccel = rnd() < 0.2f ? span(-1.0f, 0.0f) : span(0.1f, 40.0f);
+      lo.turnRateMoving = span(0.0f, 1.5f);
+      lo.driveAlignFull = span(0.0f, 1.5f);
+      lo.driveAlignZero = lo.driveAlignFull + span(0.01f, 2.5f);
+      OldSteerMob o;
+      o.heading = span(-3.14159265f, 3.14159265f);
+      o.desiredHeading = span(-60.0f, 60.0f);
+      if (rnd() < 0.1f) o.desiredHeading = o.heading;   // on target
+      o.turnVel = span(-12.0f, 12.0f);
+      o.speedNow = span(0.0f, 40.0f);
+      const float defSpeed = rnd() < 0.05f ? 0.0f : span(0.0f, 30.0f);
+      const float pick = rnd();
+      const float dt = pick < 0.6f ? 1.0f / 30.0f : pick < 0.8f ? span(0.0f, 0.3f)
+                                                               : 1.0f / 60.0f;
+      if (rnd() < 0.2f) o.turnCapL = span(0.0f, 1.0f);
+      if (rnd() < 0.2f) o.turnCapR = span(0.0f, 1.0f);
+      o.shield = rnd() < 0.3f;
+      o.shieldSpecTurn = span(-1.0f, 5.0f);
+      o.shieldRaise = rnd() < 0.1f ? 0.0f : span(0.0f, 1.0f);
+      // The new path's inputs, from the same state.
+      SteerState ns{o.heading, o.desiredHeading, o.turnVel, o.speedNow};
+      const float cap =
+          (!o.shield || o.shieldRaise <= 0.0f)
+              ? std::numeric_limits<float>::infinity()
+              : std::max(o.shieldSpecTurn, 0.0f) / std::max(o.shieldRaise, 0.05f);
+      const float capL = o.turnCapL, capR = o.turnCapR;
+      const float aOld = OldSteerVerbatim(o, lo, defSpeed, dt);
+      const float aNew = SteerStep(ns, lo, defSpeed, cap, capL, capR, dt);
+      steerN++;
+      const bool same = SameBits(aOld, aNew) && SameBits(o.heading, ns.heading) &&
+                        SameBits(o.turnVel, ns.turnVel) &&
+                        SameBits(o.desiredHeading, ns.desiredHeading);
+      if (same) steerSame++;
+      else if (whyS.empty())
+        whyS = Format("state %d: align %.9g/%.9g heading %.9g/%.9g turnVel %.9g/%.9g", i,
+                      (double)aOld, (double)aNew, (double)o.heading, (double)ns.heading,
+                      (double)o.turnVel, (double)ns.turnVel);
+    }
+  }
+  const bool okS = check(steerSame == steerN, "S: " + whyS);
+
+  // ======== the fixture (the world) =========================================
+  c.stream.Store().Clear();
+  {
+    std::error_code ec;
+    fs::remove_all(kPath, ec);
+  }
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.SetNextIdCounter(1);
+  c.mobs.SetItems(&c.items);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  // The gate's own numbers, whatever tuning.json says today.
+  auto setTier = [&](bool on, float radius, float hysteresis) {
+    Tuning tt = CurrentTuning();
+    tt.distant.enabled = on;
+    tt.distant.radius = radius;
+    tt.distant.hysteresis = hysteresis;
+    tt.distant.surfaceSnapMaxVox = 24.0f;
+    SetCurrentTuning(tt);
+  };
+  setTier(true, 1280.0f, 256.0f);
+  const IVec3 home = c.world.WindowOrigin();
+  const int n = (int)kNChunk;
+  const IVec3 away{home.x + n + 8, home.y, home.z + n + 8};
+  parking.Bind(c.mobs, c.stream.Store(), true);
+  auto teleport = [&](IVec3 origin) {
+    c.world.InvalidateSnapshot();
+    c.stream.ReloadWindow(origin);
+    rhi::CommandEncoder enc = c.ctx.device.CreateCommandEncoder();
+    c.sim.EncodeLoadReset(enc);
+    rhi::CommandBuffer cmd = enc.Finish();
+    c.ctx.queue.Submit(1, &cmd);
+    c.ctx.WaitIdle();
+  };
+  uint32_t t = 7600;
+  IVec3 pc{home.x + n / 2, home.y + n / 2, home.z + n / 2};
+  // stepMobs: THE REAL TICK, and its phase H serves the tier border through
+  // this gate's EntityParking (session.h H3b) exactly as the game's does.
+  // !stepMobs is a WORLD-ONLY tick on purpose (mob-park's reason): arm D
+  // compares each promoted creature bit for bit against its demotion record,
+  // and DIRECT PHASE CALLS ON PURPOSE (W2-O): Unpark by hand at a budget of
+  // one, so "never more than one per call" is a claim about the call.
+  support::TickCursor realTick{c, t, pc};
+  realTick.Rig().Authority().parking = &parking;
+  auto tick = [&](bool stepMobs) {
+    if (stepMobs) {
+      realTick.chunk = pc;
+      realTick();
+      return;
+    }
+    ++t;
+    SubmitTick(c.ctx, c.world, c.sim, t, kDefaultSeed, {}, {}, {}, false, pc, true,
+               false);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+  };
+  const IVec3 base{(home.x + n / 2) * (int)kChunk, 0, (home.z + n / 2) * (int)kChunk};
+  pc = {base.x >> 4, World::TerrainHeight(base.x, base.z, kDefaultSeed) >> 4, base.z >> 4};
+
+  lap("S");
+  // ======== K: the ground, classified =======================================
+  int kSurface = -1, kHigh = -1, kDungeon = -1;
+  float kGap = 0.0f;
+  std::string kDungeonWhy = "no placed dungeon on this map";
+  {
+    const int h = World::TerrainHeight(base.x, base.z, kDefaultSeed);
+    const Vec3 o{(float)base.x - ws.x * 0.5f, (float)(h + 1), (float)base.z - ws.z * 0.5f};
+    kSurface = (int)ClassifyDistantGround(o, ws, 24.0f, kDefaultSeed);
+    kHigh = (int)ClassifyDistantGround(Vec3{o.x, o.y + 30.0f, o.z}, ws, 24.0f,
+                                       kDefaultSeed, &kGap);
+    for (const worldmap::DungeonDef& g : worldmap::CurrentWorldMap().dungeons) {
+      if (!g.Placed()) continue;
+      const IVec3 cc{(g.boxMin[0] + g.boxMax[0]) / 2, (g.boxMin[1] + g.boxMax[1]) / 2,
+                     (g.boxMin[2] + g.boxMax[2]) / 2};
+      const Vec3 d{(float)cc.x + 0.5f - ws.x * 0.5f, (float)cc.y,
+                   (float)cc.z + 0.5f - ws.z * 0.5f};
+      kDungeon = InPlacedDungeonBox(cc) ? (int)ClassifyDistantGround(d, ws, 24.0f, kDefaultSeed)
+                                        : -2;
+      kDungeonWhy = Format("dungeon '%s' box centre (%d,%d,%d)", g.id.c_str(), cc.x, cc.y, cc.z);
+      break;
+    }
+  }
+  const bool okK =
+      check(kSurface == (int)DistantGroundMode::Surface, "K: on the terrain is not SURFACE") &&
+      check(kHigh == (int)DistantGroundMode::Anchored, "K: 3 m up is not ANCHORED") &&
+      check(kDungeon == -1 || kDungeon == (int)DistantGroundMode::Anchored,
+            "K: inside the dungeon box is not ANCHORED (" + kDungeonWhy + ")");
+
+  // ---- five humans --------------------------------------------------------
+  std::vector<uint64_t> ids;
+  for (int k = 0; k < 4; k++) {
+    const int x = base.x + k * 14, z = base.z + (k % 2) * 10;
+    const uint64_t id =
+        c.mobs.Spawn(hi, {x, World::TerrainHeight(x, z, kDefaultSeed) + 1, z});
+    if (id == 0) {
+      detail = Format("spawn %d refused", k);
+      restore();
+      return Status::Fail;
+    }
+    ids.push_back(id);
+  }
+  // [0] dressed and armed: appended rig slots, so the record's limb walk and
+  // the overlay's are not the trivial base-limbs-only one.
+  int worn = 0;
+  std::string heldName;
+  {
+    bool used[kEquipSlotCount] = {};
+    for (const ItemDef& it : c.items.items) {
+      if (worn >= 2 || !ItemKindIsWorn(it.kind) || it.name.rfind("iron_", 0) != 0) continue;
+      for (int sl = 0; sl < kEquipSlotCount; sl++)
+        if (!used[sl] && EquipSlotAccepts(sl, it.kind)) {
+          if (c.mobs.WearItem(ids[0], &it, sl, 0)) {
+            used[sl] = true;
+            worn++;
+          }
+          break;
+        }
+    }
+    for (const ItemDef& it : c.items.items)
+      if (!ItemKindIsWorn(it.kind) && c.mobs.EquipItem(ids[0], &it)) {
+        heldName = it.name;
+        break;
+      }
+  }
+  // [2] carved: a stored lattice and spent hp in its record.
+  {
+    const int carveLimb = hd.rootLimb >= 0 ? hd.rootLimb : 0;
+    std::vector<ParticleSpawn> spawns;
+    if (const uint64_t lb = c.mobs.LimbBody(ids[2], carveLimb))
+      c.mobs.CarveLimbRadial(lb, c.mobs.LimbVoxelPos(ids[2], carveLimb, 977u), 1.0f,
+                             /*ragged=*/true, /*eject=*/false, c.world, spawns);
+  }
+  {
+    const int px = base.x + 30, pz = base.z + 30;
+    const MobSystem::PlayerActorDesc pa{
+        Vec3{(float)px, (float)World::TerrainHeight(px, pz, kDefaultSeed) + 10.0f, (float)pz},
+        4.0f, 18.0f, true};
+    c.mobs.SetPlayerActors(std::span<const MobSystem::PlayerActorDesc>(&pa, 1));
+  }
+  for (int i = 0; i < 30; i++) tick(true);
+  // [3] killed at the root: a corpse, which demotes too.
+  if (const uint64_t rb = c.mobs.LimbBody(ids[3], hd.rootLimb))
+    c.mobs.Damage(rb, 1.0e6f, c.mobs.LimbVoxelPos(ids[3], hd.rootLimb, 0), 0.0f);
+  for (int i = 0; i < 20; i++) tick(true);
+  // [4] spawned 3 m over the ground now, so it has not fallen when it leaves.
+  {
+    const int x = base.x + 4 * 14, z = base.z - 12;
+    const uint64_t id =
+        c.mobs.Spawn(hi, {x, World::TerrainHeight(x, z, kDefaultSeed) + 31, z});
+    if (id == 0) {
+      detail = "the high spawn was refused";
+      restore();
+      return Status::Fail;
+    }
+    ids.push_back(id);
+  }
+  const size_t K = ids.size();
+  struct Snap {
+    bool alive = false;
+    Vec3 origin{};
+    std::vector<uint8_t> rec;
+    ai::Brain brain;
+    std::vector<float> hp;   // base limbs, rig order (== record order there)
+    Vec3 rootVox{};
+  };
+  std::vector<Snap> snaps(K);
+  for (size_t k = 0; k < K; k++) {
+    const Mob* m = c.mobs.FindMobById(ids[k]);
+    if (m == nullptr) {
+      detail = Format("creature %zu gone before the window left", k);
+      restore();
+      return Status::Fail;
+    }
+    Snap& s = snaps[k];
+    s.alive = m->Alive();
+    s.origin = m->Origin();
+    ByteWriter w{s.rec};
+    m->SaveOne(w);
+    if (const ai::Brain* b = c.mobs.MobBrain(ids[k])) s.brain = *b;
+    for (size_t li = 0; li < hd.limbs.size(); li++)
+      s.hp.push_back(c.mobs.LimbHp(ids[k], (int)li));
+    s.rootVox = c.mobs.LimbVoxelPos(ids[k], hd.rootLimb, 0);
+  }
+  auto sameBrain = [](const ai::Brain& a, const ai::Brain& b) {
+    return a.profile == b.profile && a.targetId == b.targetId &&
+           a.hasTarget == b.hasTarget && a.lastSeenTick == b.lastSeenTick &&
+           a.intent == b.intent;
+  };
+  int targets = 0;
+  for (const Snap& s : snaps) targets += s.brain.hasTarget ? 1 : 0;
+
+  lap("K+fixture");
+  // ======== A: demote ========================================================
+  const DistantMobs& tier = c.mobs.Distant();
+  const DistantMobs::Stats st0 = tier.GetStats();
+  teleport(away);
+  pc = {away.x + n / 2, home.y + n / 2, away.z + n / 2};
+  tick(true);
+  int aRec = 0, aHp = 0, aBrain = 0, aLife = 0, aGround = 0, aPatch = 0;
+  std::string whyA;
+  // THE RECORD EACH CREATURE WAS DEMOTED WITH: what every later arm holds the
+  // tier to (B: unchanged; D: the promoted creature re-saves as it; the
+  // round-trip contract is promote(demote(m)) == the record at demotion).
+  std::vector<std::vector<uint8_t>> demoted(K);
+  for (size_t k = 0; k < K; k++) {
+    const DistantMob* d = tier.Find(ids[k]);
+    if (d == nullptr) {
+      if (whyA.empty()) whyA = Format("creature %zu not distant", k);
+      continue;
+    }
+    demoted[k] = d->record;
+    // ...and for the LIVING it is the very SaveOne taken before the window
+    // left: nothing steps a creature between the snapshot and the park rule.
+    // A CORPSE is not held to that: its matter passes (the bleed-out paying
+    // out onto its own skin, the dead-flesh burn pass) run in that tick's
+    // pre-passes, BEFORE the park rule reaches it, so its demotion record is
+    // the corpse as it lay one tick later. Only its life is asserted here.
+    const std::string diff =
+        snaps[k].alive ? MobRecordDiff(snaps[k].rec, d->record) : std::string();
+    if (diff.empty()) aRec++;
+    else if (whyA.empty()) whyA = Format("creature %zu record: %s", k, diff.c_str());
+    bool hpSame = d->limbHp.size() >= snaps[k].hp.size();
+    for (size_t li = 0; hpSame && li < snaps[k].hp.size(); li++)
+      hpSame = SameBits(d->limbHp[li], snaps[k].hp[li]);
+    aHp += hpSame ? 1 : 0;
+    // A corpse's brain is not a mind any more; the living keep theirs whole.
+    aBrain += (!snaps[k].alive || sameBrain(d->brain, snaps[k].brain)) ? 1 : 0;
+    aLife += d->dead == !snaps[k].alive ? 1 : 0;
+    const DistantGroundMode want = k == 4 ? DistantGroundMode::Anchored : DistantGroundMode::Surface;
+    if (d->groundMode == want) aGround++;
+    else if (whyA.empty())
+      whyA = Format("creature %zu classified %s", k, DistantGroundModeName(d->groundMode));
+    // The overlay patches the record into its own bytes (DemoteToDistant's
+    // proof, re-asked from outside). The RECORD-HELD fields: since D5+D6 the
+    // overlay also carries the statuses (a creature that left bleeding --
+    // [2], carved -- writes them into the v13 tail), which a near SaveOne
+    // never wrote, so they are left out of this identity, as the demotion's
+    // own probe leaves them out.
+    std::vector<uint8_t> patched;
+    if (c.mobs.DistantRecord(*d, patched, /*withStatus=*/false) && patched == d->record) aPatch++;
+  }
+  const DistantMobs::Stats st1 = tier.GetStats();
+  const bool okA =
+      check(c.mobs.MobCount() == 0 && tier.Count() == K && parking.GetStats().parked == 0 &&
+                aRec == (int)K && aHp == (int)K && aBrain == (int)K && aLife == (int)K &&
+                aGround == (int)K && aPatch == (int)K && worn > 0 &&
+                st1.demoted - st0.demoted == K && st1.demotedDead - st0.demotedDead == 1 &&
+                st1.anchored - st0.anchored == 1,
+            Format("A: near %u distant %zu parked %llu, records %d hp %d brains %d life "
+                   "%d ground %d patch %d /%zu, worn %d%s%s",
+                   c.mobs.MobCount(), tier.Count(),
+                   (unsigned long long)parking.GetStats().parked, aRec, aHp, aBrain, aLife,
+                   aGround, aPatch, K, worn, whyA.empty() ? "" : ", first: ", whyA.c_str()));
+  // D2b: THE TIER NOW STEPS A CREATURE'S STATUSES -- a bleed carried across
+  // the edge keeps paying out at distance (game/distant.h). Creature [2] was
+  // carved 50 ticks before it left and still owes blood, which would take hp
+  // off it below and is exactly what this gate's byte-for-byte round trip is
+  // NOT about (it holds the overlay for a body the tier does not change). So
+  // the owed blood is closed here, in the tier; a bleed at distance is
+  // `distant-fight`'s subject.
+  for (size_t i = 0; i < c.mobs.DistantMut().Count(); i++)
+    c.mobs.DistantMut().At(i).bloodLossPerTick = 0.0f;
+
+  lap("A");
+  // ======== C: save while distant ===========================================
+  // Right after the demotion tick, before anything else ticks: the save is
+  // then a DELTA of 0 chunks (the far window is pristine), as mob-park's is.
+  // Taken after B's 31 ticks instead (measured 2026-10-15) it reported "the
+  // snapshot tail has a hole" and flushed all 32,768 chunks, after which
+  // every teleport restored a whole window of real pages out of the store:
+  // 30.8 s for this gate against 3.7 s now.
+  // The records the tier would write, captured now (the demotion records,
+  // which A just showed the patch reproduces).
+  std::vector<std::vector<uint8_t>> savedRecs(K);
+  std::vector<Vec3> savedAt(K);
+  for (size_t k = 0; k < K; k++)
+    if (const DistantMob* d = tier.Find(ids[k])) {
+      c.mobs.DistantRecord(*d, savedRecs[k]);
+      savedAt[k] = d->origin;
+    }
+  EntityIO eio = MakeEntityIO(c.debris, c.mobs, nullptr);
+  SaveReport sr;
+  const bool saved = SaveWorld(c.ctx, c.world, c.stream, kPath, c.mats, &eio, {}, &sr);
+  const bool okC = check(saved && sr.entities.regionRecords == K,
+                         Format("C: saved %d, %u region records (want %zu: every distant "
+                                "creature, nothing near)",
+                                saved ? 1 : 0, sr.entities.regionRecords, K));
+
+  lap("C");
+  // ======== B: frozen costs nothing ==========================================
+  // One tick to settle the latches the demotions set (Insert flags a
+  // promotion scan; the first retire pass after the tier stops being empty
+  // has no memory yet), then 30 that must cost no scan at all.
+  tick(true);
+  const DistantMobs::Stats st1b = tier.GetStats();
+  for (int i = 0; i < 30; i++) tick(true);
+  int bSame = 0;
+  for (size_t k = 0; k < K; k++) {
+    const DistantMob* d = tier.Find(ids[k]);
+    if (d != nullptr && d->record == demoted[k] &&
+        std::memcmp(&d->origin, &snaps[k].origin, sizeof(Vec3)) == 0)
+      bSame++;
+  }
+  const DistantMobs::Stats st2 = tier.GetStats();
+  const uint64_t bRetire = st2.retireScans - st1b.retireScans;
+  const uint64_t bPromote = st2.promoteScans - st1b.promoteScans;
+  const bool okB = check(bSame == (int)K && bRetire == 0 && bPromote == 0,
+                         Format("B: %d/%zu unchanged, %llu retire + %llu promotion scans "
+                                "in 30 still ticks (want 0)",
+                                bSame, K, (unsigned long long)bRetire,
+                                (unsigned long long)bPromote));
+
+  lap("B");
+  // ======== P: the patch ======================================================
+  bool pHpBack = false, pDead = false, pRef = false, pMoved = false;
+  float pMoveErr = -1.0f;
+  if (const DistantMob* d = tier.Find(ids[0])) {
+    const std::vector<uint8_t>& rec = d->record;
+    DistantOverlay ov = d->Overlay();
+    {
+      std::vector<uint8_t> b = rec;
+      DistantOverlay o2 = ov;
+      o2.limbHp[0] -= 7.0f;
+      const bool p1 = MobSystem::PatchMobRecord(b, MobSystem::kSaveVersion, o2);
+      const bool changed = b != rec && b.size() == rec.size();
+      const bool p2 = MobSystem::PatchMobRecord(b, MobSystem::kSaveVersion, ov);
+      pHpBack = p1 && p2 && changed && b == rec;
+    }
+    {
+      std::vector<uint8_t> b = rec;
+      DistantOverlay o2 = ov;
+      o2.dead = true;
+      o2.cause = "blood loss";
+      o2.deathSeq = 77;
+      pDead = MobSystem::PatchMobRecord(b, MobSystem::kSaveVersion, o2) &&
+              MobSystem::RecordIsDead(b.data(), b.size(), MobSystem::kSaveVersion) &&
+              b.size() == rec.size() + 4 + o2.cause.size() + 8 + 4;
+    }
+    {
+      std::vector<uint8_t> b = rec;
+      DistantOverlay o2 = ov;
+      o2.refId = "gate.distant";
+      pRef = MobSystem::PatchMobRecord(b, MobSystem::kSaveVersion, o2) &&
+             b.size() == rec.size() + o2.refId.size();
+    }
+    {
+      // MOVED: the record loads with its origin there and its limbs carried
+      // with it (a near creature built from it, read and removed at once --
+      // no tick sees it).
+      std::vector<uint8_t> b = rec;
+      DistantOverlay o2 = ov;
+      o2.origin = o2.origin + Vec3{10.0f, 0.0f, 5.0f};
+      if (MobSystem::PatchMobRecord(b, MobSystem::kSaveVersion, o2)) {
+        ByteReader rd{b.data(), b.size()};
+        if (Mob* m = c.mobs.LoadOne(rd, MobSystem::kSaveVersion, /*placeLimbs=*/true)) {
+          const uint64_t mid = m->Id();
+          const Vec3 o = m->Origin();
+          const Vec3 rv = c.mobs.LimbVoxelPos(mid, hd.rootLimb, 0);
+          const Vec3 want = snaps[0].rootVox + Vec3{10.0f, 0.0f, 5.0f};
+          pMoveErr = (rv - want).len();
+          pMoved = std::memcmp(&o, &o2.origin, sizeof(Vec3)) == 0 && pMoveErr <= 0.01f;
+          c.mobs.RemoveMob(mid);
+        }
+      }
+    }
+  }
+  const bool okP = check(pHpBack && pDead && pRef && pMoved,
+                         Format("P: hp round trip %d, dead %d, ref %d, moved %d (root off "
+                                "by %.4f)",
+                                pHpBack, pDead, pRef, pMoved, (double)pMoveErr));
+
+  lap("P");
+  // ======== D: promote, bounded, by the same door ===========================
+  teleport(home);
+  parking.ResetWaits();
+  parking.ResetStats();
+  pc = {base.x >> 4, World::TerrainHeight(base.x, base.z, kDefaultSeed) >> 4, base.z >> 4};
+  std::vector<uint64_t> order, want;
+  tier.PromotionCandidates(home, EntityParking::kUnparkMarginChunks, order);
+  {
+    const float h = 0.5f * (float)kWorldN;
+    const Vec3 wc{(float)(home.x * (int)kChunk) + h, (float)(home.y * (int)kChunk) + h,
+                  (float)(home.z * (int)kChunk) + h};
+    std::vector<std::pair<float, uint64_t>> byDist;
+    for (size_t k = 0; k < K; k++) {
+      const Vec3 cc = snaps[k].origin + ws * 0.5f;
+      const Vec3 dv = cc - wc;
+      byDist.push_back({dv.x * dv.x + dv.y * dv.y + dv.z * dv.z, ids[k]});
+    }
+    std::sort(byDist.begin(), byDist.end());
+    for (const auto& p : byDist) want.push_back(p.second);
+  }
+  const DistantMobs::Stats st3 = tier.GetStats();
+  int calls = 0, firstCall = -1;
+  uint32_t maxMade = 0;
+  for (int i = 0; i < 240 && tier.Count() > 0; i++) {
+    tick(false);
+    const uint32_t made = parking.Unpark(c.mobs, c.stream.Store(), c.world, t, 1);
+    calls++;
+    maxMade = std::max(maxMade, made);
+    if (made > 0 && firstCall < 0) firstCall = calls - 1;
+  }
+  int dId = 0, dRec = 0, dHp = 0, dBrain = 0, dLife = 0;
+  bool dStood = false;
+  std::string whyD;
+  for (size_t k = 0; k < K; k++) {
+    const Mob* m = c.mobs.FindMobById(ids[k]);
+    if (m == nullptr) {
+      if (whyD.empty()) whyD = Format("creature %zu not back under id %llu", k,
+                                      (unsigned long long)ids[k]);
+      continue;
+    }
+    dId++;
+    std::vector<uint8_t> again;
+    {
+      ByteWriter w{again};
+      m->SaveOne(w);
+    }
+    const std::string diff = MobRecordDiff(demoted[k], again);
+    if (diff.empty()) dRec++;
+    else if (whyD.empty()) whyD = Format("creature %zu re-saves: %s", k, diff.c_str());
+    bool hpSame = true;
+    for (size_t li = 0; li < snaps[k].hp.size(); li++)
+      hpSame = hpSame && SameBits(c.mobs.LimbHp(ids[k], (int)li), snaps[k].hp[li]);
+    dHp += hpSame ? 1 : 0;
+    const ai::Brain* b = c.mobs.MobBrain(ids[k]);
+    dBrain += (!snaps[k].alive || (b != nullptr && sameBrain(*b, snaps[k].brain))) ? 1 : 0;
+    dLife += m->Alive() == snaps[k].alive ? 1 : 0;
+    if (k == 4) {
+      const Vec3 o = m->Origin();
+      dStood = std::memcmp(&o, &snaps[k].origin, sizeof(Vec3)) == 0;
+    }
+  }
+  const DistantMobs::Stats st4 = tier.GetStats();
+  const bool okD = check(
+      order == want && dId == (int)K && dRec == (int)K && dHp == (int)K &&
+          dBrain == (int)K && dLife == (int)K && dStood && tier.Count() == 0 &&
+          c.mobs.MobCount() == K && maxMade <= 1 && firstCall >= 1 &&
+          st4.promoted - st3.promoted == K && st4.promotedDead - st3.promotedDead == 1 &&
+          parking.GetStats().unparked == 0,
+      Format("D: order %s, %d/%zu back under their ids, records %d hp %d brains %d life "
+             "%d, high one where it stood %d, near %u (want %zu: no duplicate from the "
+             "save), %d calls (first after %d), max %u/call, promoted %llu, unparked "
+             "%llu%s%s",
+             order == want ? "nearest-first" : "WRONG", dId, K, dRec, dHp, dBrain, dLife,
+             dStood ? 1 : 0, c.mobs.MobCount(), K, calls, firstCall, maxMade,
+             (unsigned long long)(st4.promoted - st3.promoted),
+             (unsigned long long)parking.GetStats().unparked, whyD.empty() ? "" : ", first: ",
+             whyD.c_str()));
+
+  lap("D");
+  // ======== E: they stand ====================================================
+  const double maxDrop = BaselineNumber("mobParkMaxDropVox", 10);
+  std::vector<float> backY(K, 0.0f);
+  for (size_t k = 0; k < K; k++)
+    if (const Mob* m = c.mobs.FindMobById(ids[k])) backY[k] = m->Origin().y;
+  for (int i = 0; i < 40; i++) tick(true);
+  int standing = 0;
+  float worstDrop = 0.0f;
+  for (size_t k : {(size_t)0, (size_t)1, (size_t)2}) {
+    const Mob* m = c.mobs.FindMobById(ids[k]);
+    if (m == nullptr || !m->Alive()) continue;
+    const float drop = backY[k] - m->Origin().y;
+    worstDrop = std::max(worstDrop, drop);
+    if (drop <= (float)maxDrop) standing++;
+  }
+  const bool okE = check(standing == 3, Format("E: %d/3 standing, worst drop %.2f (max %.0f)",
+                                               standing, (double)worstDrop, maxDrop));
+
+  lap("E");
+  // ======== R: retire ========================================================
+  teleport(away);
+  pc = {away.x + n / 2, home.y + n / 2, away.z + n / 2};
+  tick(true);
+  int rIds = 0;
+  for (size_t k = 0; k < K; k++) rIds += tier.Find(ids[k]) != nullptr ? 1 : 0;
+  std::vector<std::vector<uint8_t>> retireRecs(K);
+  std::vector<Vec3> retireAt(K);
+  for (size_t k = 0; k < K; k++)
+    if (const DistantMob* d = tier.Find(ids[k])) {
+      c.mobs.DistantRecord(*d, retireRecs[k]);
+      retireAt[k] = d->origin;
+    }
+  const DistantMobs::Stats st5 = tier.GetStats();
+  const uint64_t parked5 = parking.GetStats().parked;
+  setTier(true, 64.0f, 64.0f);   // the border pulled in under them
+  tick(true);
+  const DistantMobs::Stats st6 = tier.GetStats();
+  const uint32_t kMobs = 'M' | ('O' << 8) | ('B' << 16) | ((uint32_t)'S' << 24);
+  auto bucketsHold = [&](const std::vector<std::vector<uint8_t>>& recs,
+                         const std::vector<Vec3>& at, std::string& why) {
+    int found = 0;
+    for (size_t k = 0; k < recs.size(); k++) {
+      if (recs[k].empty()) continue;
+      bool hit = false;
+      for (const EntityRecord& r :
+           c.stream.Store().DormantEntities(ChunkStore::RegionOfVoxel(at[k]))) {
+        if (r.section != kMobs || std::memcmp(&r.pos, &at[k], sizeof(Vec3)) != 0) continue;
+        if (r.bytes == recs[k] && r.version == MobSystem::kSaveVersion) hit = true;
+        else if (why.empty())
+          why = Format("creature %zu: %s", k, MobRecordDiff(recs[k], r.bytes).c_str());
+      }
+      if (hit) found++;
+      else if (why.empty()) why = Format("creature %zu: no record in its bucket", k);
+    }
+    return found;
+  };
+  std::string whyR;
+  const int foundR = bucketsHold(retireRecs, retireAt, whyR);
+  const bool okR = check(
+      rIds == (int)K && tier.Count() == 0 && st6.retired - st5.retired == K &&
+          parking.GetStats().parked - parked5 == K && foundR == (int)K,
+      Format("R: %d/%zu distant again under their ids, then retired %llu, parked %llu, "
+             "%d/%zu patched records in their buckets%s%s",
+             rIds, K, (unsigned long long)(st6.retired - st5.retired),
+             (unsigned long long)(parking.GetStats().parked - parked5), foundR, K,
+             whyR.empty() ? "" : ", first: ", whyR.c_str()));
+  setTier(true, 1280.0f, 256.0f);
+
+  lap("R");
+  // ======== L: the save loads as parked records ==============================
+  // LoadWorld's BindLoad forgets every RAM bucket (chunkstore.h), so what the
+  // buckets hold afterwards is the FILE's -- R's retired records were never
+  // saved and are gone with them.
+  c.mobs.Reset();
+  EntityFileReport lr;
+  const bool loaded =
+      LoadWorld(c.ctx, c.world, c.sim, c.stream, kPath, c.mats, &eio, nullptr, &lr);
+  std::string whyL;
+  const int foundL = bucketsHold(savedRecs, savedAt, whyL);
+  const bool okL = check(loaded && c.mobs.MobCount() == 0 && tier.Count() == 0 &&
+                             lr.recordsApplied == 0 && foundL == (int)K,
+                         Format("L: loaded %d, near %u, distant %zu, applied %u, %d/%zu "
+                                "records as the tier held them%s%s",
+                                loaded ? 1 : 0, c.mobs.MobCount(), tier.Count(),
+                                lr.recordsApplied, foundL, K,
+                                whyL.empty() ? "" : ", first: ", whyL.c_str()));
+
+  lap("L");
+  // ======== O and F: the switch off; a full tier ============================
+  // A fresh, unbound store: these arms need nothing the save left, and every
+  // teleport below then regenerates instead of restoring.
+  c.stream.Store().Clear();
+  auto leaveWith = [&](int count, uint64_t& parkedOut, size_t& distantOut) {
+    c.mobs.Reset();
+    teleport(home);
+    parking.ResetWaits();
+    pc = {base.x >> 4, World::TerrainHeight(base.x, base.z, kDefaultSeed) >> 4, base.z >> 4};
+    for (int k = 0; k < count; k++) {
+      const int x = base.x + k * 14, z = base.z - 30;
+      c.mobs.Spawn(hi, {x, World::TerrainHeight(x, z, kDefaultSeed) + 1, z});
+    }
+    const uint64_t p0 = parking.GetStats().parked;
+    teleport(away);
+    pc = {away.x + n / 2, home.y + n / 2, away.z + n / 2};
+    tick(true);
+    parkedOut = parking.GetStats().parked - p0;
+    distantOut = tier.Count();
+  };
+  uint64_t oParked = 0, fParked = 0;
+  size_t oDistant = 0, fDistant = 0;
+  const uint64_t demotedO = tier.GetStats().demoted;
+  setTier(false, 1280.0f, 256.0f);
+  leaveWith(3, oParked, oDistant);
+  const uint64_t demotedO2 = tier.GetStats().demoted;
+  const bool okO = check(oParked == 3 && oDistant == 0 && demotedO2 == demotedO,
+                         Format("O (switch off): parked %llu, distant %zu, demoted %llu "
+                                "(want 3, 0, 0)",
+                                (unsigned long long)oParked, oDistant,
+                                (unsigned long long)(demotedO2 - demotedO)));
+  setTier(true, 1280.0f, 256.0f);
+  c.mobs.DistantMut().SetCapForTest(2);
+  const uint64_t fullF0 = tier.GetStats().refusedFull;
+  leaveWith(3, fParked, fDistant);
+  const uint64_t fullF = tier.GetStats().refusedFull - fullF0;
+  c.mobs.DistantMut().SetCapForTest(0);
+  const bool okF = check(fDistant == 2 && fParked == 1 && fullF == 1,
+                         Format("F (cap 2): distant %zu, parked %llu, refused-full %llu "
+                                "(want 2, 1, 1)",
+                                fDistant, (unsigned long long)fParked,
+                                (unsigned long long)fullF));
+
+  lap("OF");
+  const bool ok = okS && okK && okA && okB && okC && okP && okD && okE && okR && okL && okO &&
+                  okF;
+  const DistantMobs::Stats& rt = DistantRunTotals();
+  RecordObserved("report:distant.demoted", (double)rt.demoted);
+  RecordObserved("report:distant.promoted", (double)rt.promoted);
+  RecordObserved("report:distant.retired", (double)rt.retired);
+  RecordObserved("report:distant.refusedFull", (double)rt.refusedFull);
+  detail = Format(
+      "S %s: steer %d/%d states bit-identical | K %s: surface %s, 3 m up %s (gap %.0f), "
+      "%s %s | A %s: %zu distant (1 dead, 1 anchored), records + hp + brains + patch "
+      "exact, %d brains held a target | B %s: frozen, %llu+%llu scans | C %s: %u "
+      "records saved | P %s | D %s: %s, %d/%zu back, %d calls, first after %d | E %s: "
+      "%d/3 standing | R %s: %d retired | L %s: %d/%zu parked records from the save | "
+      "O %s | F %s",
+      okS ? "ok" : "FAIL", steerSame, steerN, okK ? "ok" : "FAIL",
+      kSurface == 0 ? "SURFACE" : "ANCHORED", kHigh == 1 ? "ANCHORED" : "SURFACE",
+      (double)kGap, kDungeonWhy.c_str(),
+      kDungeon == -1 ? "(none)" : kDungeon == 1 ? "ANCHORED" : "WRONG", okA ? "ok" : "FAIL",
+      K, targets, okB ? "ok" : "FAIL", (unsigned long long)bRetire,
+      (unsigned long long)bPromote, okC ? "ok" : "FAIL", sr.entities.regionRecords,
+      okP ? "ok" : "FAIL", okD ? "ok" : "FAIL", order == want ? "nearest-first" : "WRONG",
+      dId, K, calls, firstCall, okE ? "ok" : "FAIL", standing, okR ? "ok" : "FAIL",
+      (int)(st6.retired - st5.retired), okL ? "ok" : "FAIL", foundL, K,
+      okO ? "ok" : "FAIL", okF ? "ok" : "FAIL");
+  // EVERY failed claim, each with its own numbers (CLAUDE.md rule 6).
+  for (size_t i = 0; i < fails.size(); i++)
+    detail += (i == 0 ? " | FAIL: " : " / ") + fails[i];
+  detail += " | ms: " + laps;
+
+  // The window goes back where the gate found it (the selftest leak check),
+  // then everything else is put back.
+  teleport(home);
   restore();
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
   c.ctx.WaitIdle();
@@ -13105,8 +14001,15 @@ Status GateMobPark(Ctx& c, std::string& detail) {
 //      booking the record carried stands B up as the turned def.
 // LEAVES NOTHING: resets mobs, debris and risings, removes the park function,
 // puts the id counter back, clears the store and regenerates the world.
+//
+// THE SWITCH (docs/PLAN_distant_npcs.md D3): P is the corpse's PARK path (the
+// MOBS v6 record in its bucket, the rising it carries), so the gate runs with
+// `distant.enabled` PINNED OFF; with it on (the default since the flip) the
+// teleport is inside the distant radius and the corpses would demote as dead
+// distant creatures instead -- the round trip `distant-roundtrip` holds.
 Status GateCorpseSave(Ctx& c, std::string& detail) {
   const uint64_t idCounterWas = c.mobs.NextIdCounter();
+  DistantSwitchScope tierOff(false);
   EntityParking parking;
   auto restore = [&]() {
     c.debris.Reset();
@@ -18783,6 +19686,10 @@ const std::vector<Gate>& MobGates() {
       // comes back, byte-identical and on known ground, when the window
       // returns -- bounded per tick, through a save and load. No render.
       {"mob-park", "mob", {}, false, GateMobPark, /*needsRender=*/false},
+      // The distant tier's seam (docs/PLAN_distant_npcs.md D0): demote,
+      // freeze, save, patch, promote, retire, the switch off, a full tier, the
+      // ground classifier and the extracted steer against its old self.
+      {"distant-roundtrip", "mob", {}, false, GateDistantRoundtrip, /*needsRender=*/false},
       // MOBS v6: an armoured, burnt, carved, half-looted corpse and a bitten
       // one round-trip through a save and through park/unpark past a full
       // living crowd -- still dead, same voxels, same loot, same lying pose,

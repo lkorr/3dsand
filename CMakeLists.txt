@@ -527,6 +527,11 @@ add_library(sandvox_core OBJECT
   src/game/brush.cpp
   src/game/prefab.cpp
   src/game/mob.cpp
+  # The distant tier: creatures that keep existing past the residency window
+  # (docs/PLAN_distant_npcs.md; game/distant.h), and the pure steer both
+  # tiers turn with (game/steer.h).
+  src/game/distant.cpp
+  src/game/steer.cpp
   src/game/mob_shock.cpp
   # A body the water carries (MobDef::SwimDef): the swimmers' locomotion.
   src/game/mob_swim.cpp
@@ -541,6 +546,9 @@ add_library(sandvox_core OBJECT
   src/game/quiver.cpp
   src/game/mob_archery.cpp
   src/game/mob_shield.cpp
+  # Distant creatures drawn as baked flipbook statues (docs/PLAN_distant_npcs.md
+  # §2.9, D4a): the pose bake, the pose LRU and the render-only producer.
+  src/game/distant_draw.cpp
   # The death screen's peel: depth layers of a corpse's bricks, drawn as
   # clones (render only) and read as strata.
   src/game/autopsy.cpp
@@ -609,6 +617,10 @@ add_library(sandvox_core OBJECT
   src/game/flaskchem.cpp
   src/game/alchemy_bench.cpp
   src/game/strokes.cpp
+  # THE DISTANT TIER'S HIT MODEL (docs/PLAN_distant_npcs.md D2a): the pure
+  # resolver + its calibration table, and the stroke log that measures it.
+  src/game/distant_combat.cpp
+  src/game/stroke_log.cpp
   # Is this pose inside itself? (game/selfclip.h) — voxel-level limb
   # interpenetration, differenced against the bind pose.
   src/game/selfclip.cpp
@@ -714,9 +726,14 @@ add_library(sandvox_core OBJECT
   src/test/selftest_dye.cpp
   src/test/selftest_wound.cpp
   src/test/selftest_archer.cpp
+  # distant NPCs D2a: gate distant-calib-matrix (the duel matrix + resolver).
+  src/test/selftest_distant_calib.cpp
   src/test/selftest_stealth.cpp
   src/test/selftest_aquatic.cpp
   src/test/selftest_stagger.cpp
+  src/test/selftest_distant_look.cpp
+  src/test/selftest_distant.cpp
+  src/test/selftest_distant_life.cpp
   src/test/selftest_solute.cpp
   src/test/selftest_heat.cpp
   src/test/selftest_impact.cpp
@@ -947,6 +964,12 @@ if(MSVC)
   # being someone else's to remove. NOT /fp:fast — see the deliberate note on
   # the Jolt options above; relaxed float must never reach the sim.
   target_compile_options(sandvox_core PRIVATE /arch:AVX2)
+  # main.cpp passed COFF's 65,279-section limit (C1128) on 2026-10-16, when the
+  # distant tier's frame-loop wiring met main's arrow trails and stealth UI.
+  # /bigobj on THIS FILE ONLY: target-wide it would change every object's
+  # format and miss the shared sccache for all ~1,000 TUs at once.
+  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp
+    PROPERTIES COMPILE_OPTIONS /bigobj)
 endif()
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,18 @@
 using nlohmann::json;
 
 namespace ai {
+
+// THE DISTANT TIER'S SALTS (game/distant_combat.h, docs/PLAN_distant_npcs.md
+// §2.6): the abstract blow, the abstract arrow and the distant style draw.
+// Declared here, beside the AI's own list below, rather than in the resolver,
+// because a salt is only safe if it is distinct from every other stream keyed
+// on the same `mobId ^ salt` -- and the place to see "every other" is one
+// list. External linkage (the resolver reads them); the static_asserts under
+// the list keep the two sets apart.
+extern const uint32_t kSaltDistantStrike = 0xD15B10u;
+extern const uint32_t kSaltDistantArrow = 0xD15A77u;
+extern const uint32_t kSaltDistantStyle = 0xD1557Eu;
+
 namespace {
 
 constexpr float kPi = 3.14159265f;
@@ -28,6 +40,18 @@ constexpr uint32_t kSaltReact = 0x8EAC7u;
 constexpr uint32_t kSaltFeint = 0xFE17u;
 constexpr uint32_t kSaltDodge = 0xD0D6u;
 constexpr uint32_t kSaltOrbit = 0x0B17u;
+// (the distant tier's three are above the namespace; see there)
+constexpr uint32_t kAllSalts[] = {kSaltAttack, kSaltCircle, kSaltReact,
+                                  kSaltFeint,  kSaltDodge,  kSaltOrbit,
+                                  kSaltDistantStrike, kSaltDistantArrow,
+                                  kSaltDistantStyle};
+constexpr bool SaltsDistinct() {
+  for (size_t i = 0; i < sizeof(kAllSalts) / sizeof(kAllSalts[0]); i++)
+    for (size_t j = i + 1; j < sizeof(kAllSalts) / sizeof(kAllSalts[0]); j++)
+      if (kAllSalts[i] == kAllSalts[j]) return false;
+  return true;
+}
+static_assert(SaltsDistinct(), "two AI/distant draw streams share a salt");
 
 float WrapPi(float a) { return std::remainder(a, kTau); }
 

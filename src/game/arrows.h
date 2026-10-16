@@ -42,6 +42,15 @@
 //     picks back up (DropItemToWorld's stuck variant). Bounded at kMaxStuck:
 //     the oldest stuck arrow is cleared when a new one would pass it.
 //   - Its life runs out, or it leaves the window: gone.
+//   - A DISTANT CREATURE (docs/PLAN_distant_npcs.md D9): a statue has no
+//     collider, so every flight also tests the distant creatures' BODY BOXES
+//     published at the start of the tick (MobSystem::DistantBoxAlong) along
+//     its segment; the earliest box, if it comes before anything solid or
+//     near, ends the arrow there and is resolved by that tier
+//     (QueueEdgeArrowBoxHit). And a PLAYER's flight (no ArrowShot target)
+//     that leaves the window is flown on by the distant tier
+//     (QueueEdgeShotOut) over DistantGround until it hits a statue, lands,
+//     comes back in or runs out of life -- not gone at the face.
 //
 // The flat damage (ItemDef::ArrowSpec::damage, Penetrator::hp) is charged by
 // Mob::PierceLimb only when the channel got IN (embedded or through), never on
@@ -62,6 +71,7 @@
 // drawn once it stands in a body or the ground.
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -185,6 +195,18 @@ bool PullArrowSlotToKit(Mob& m, int slot, Kit& kit, const ItemLibrary& items,
                         std::string* itemOut = nullptr, bool* noRoom = nullptr);
 
 // ---- THE ARROWS IN FLIGHT ------------------------------------------------------
+// WHO LOOSED IT AT WHOM (docs/PLAN_distant_npcs.md section 2.7, D3). A flight
+// that leaves the window with a `target` that is a DISTANT creature is not
+// lost: it is handed to the distant tier (MobSystem::QueueEdgeArrowOut), which
+// resolves it by its ranged roll at the flight time it has left. The NPC
+// archers fill it (game/mob_archery.cpp); the player's arrows leave it empty,
+// and an empty one is what makes a flight that leaves the window GEOMETRIC
+// past it (D9: flown on by the distant tier, hitting what it meets) rather
+// than rolled. Never an input to the flight itself.
+struct ArrowShot {
+  uint64_t shooter = 0;   // the creature that loosed it (0 = a player / unknown)
+  uint64_t target = 0;    // what it was aimed at (0 = nothing named)
+};
 struct ArrowFlight {
   SpellFxVec pos{}, vel{};  // 24.8 fixed world voxels; vel per TICK
   // Where the point was at the START of the last step: RENDER-ONLY, the other
@@ -208,10 +230,32 @@ struct ArrowFlight {
   uint64_t shooter = 0;
   Vec3 from{};
   bool twanged = false;
+  // ...and WHO AT WHOM (distant NPCs D3, ArrowShot): if the flight leaves
+  // the window at a creature that is distant by then, that tier lands it;
+  // a distant archer's arrow injected at the face carries its shooter here.
+  // `from` above doubles as the whole shot's distance origin.
+  ArrowShot shot;
   // RENDER-ONLY: which flight this is to its trail (ArrowTrails), handed out
   // by Launch in order. Nothing the flight decides reads it.
   uint32_t fxId = 0;
 };
+
+// ---- AN ARROW OUTSIDE THE WINDOW (D3, docs/PLAN_distant_npcs.md section 2.7) ----
+// The arrow integrator's gravity, world voxels per tick^2 (the spell VM's
+// kGravityFxPerTick2, in float): what a distant arrow's arc and an inbound
+// flight fall by, so the two tiers' arrows drop alike.
+float ArrowGravityPerTick2();
+// ONE TICK of an arrow's flight through space the window does not hold: the
+// distant tier's INBOUND arrow (a distant archer's shot at a near creature),
+// stepped by ArrowFlights::Tick's own integrator -- the velocity loses gravity
+// first, then the move in half-voxel samples. `solid(x, y, z)` is the ground
+// out there (DistantGround: a pure function of seed and map). Stops at the
+// first sample INSIDE the window (Entered: `pos` is that sample, the state a
+// real ArrowFlight takes over from), or at the first sample `solid` refuses
+// (Grounded: `pos` the last free one); otherwise the whole tick's move (Flying).
+enum class ArrowOutside : uint8_t { Flying = 0, Entered, Grounded };
+ArrowOutside ArrowStepOutside(SpellFxVec& pos, SpellFxVec& vel, const World& world,
+                              const std::function<bool(int, int, int)>& solid);
 
 // What one arrow did, for the `arrow` gate and the counters. Bounded log.
 struct ArrowEvent {
@@ -224,6 +268,13 @@ struct ArrowEvent {
     Broke,     // embedded where it cannot stay (a creature at its cap, a
                // peer's creature -- whose owner embeds it)
     Expired,   // its life ran out / it left the window
+    PastEdge,  // D3: it left the window at a DISTANT creature, handed to that
+               // tier (MobSystem::QueueEdgeArrowOut) to land abstractly
+    DistantHit,  // D9: it met a distant creature's body box IN the window
+                 // (`mobId`); queued for that tier (QueueEdgeArrowBoxHit) and
+                 // ended there -- statues hold no embedded arrows
+    Continued,   // D9: a player's flight (no target) left the window and the
+                 // distant tier flies it on (MobSystem::QueueEdgeShotOut)
   };
   Kind kind = Kind::Hit;
   uint32_t tick = 0;
@@ -265,7 +316,15 @@ class ArrowFlights {
   bool Launch(const ItemDef& arrow, Vec3 fromWorld, Vec3 dirWorld,
               float speedVox, Vec3 carryVox, uint32_t seed,
               std::vector<uint64_t> ignore, uint64_t shooterActor = 0,
-              const ItemInstance* inst = nullptr);
+              const ItemInstance* inst = nullptr, const ArrowShot& shot = {});
+  // D3: a flight that was already in the air -- a distant archer's arrow
+  // crossing INTO the window (MobSystem::TakeEdgeArrowsIn) -- at the exact
+  // fixed-point state the distant tier flew it to (no float round trip).
+  // The same cap and the same false as Launch. `ticksLeft` (D9): the life it
+  // has left -- a player's arrow coming back in after a stretch outside the
+  // window keeps its own clock; a distant archer's starts a fresh one.
+  bool Inject(const ItemDef& arrow, SpellFxVec pos, SpellFxVec vel, uint32_t seed,
+              const ArrowShot& shot, int ticksLeft = kLifeTicks);
   void Tick(uint32_t tick, ArrowWorld& w, std::vector<ParticleSpawn>& spawns);
 
   size_t Live() const { return live_.size(); }
@@ -292,6 +351,12 @@ class ArrowFlights {
   struct Stats {
     uint64_t launched = 0, refused = 0, hits = 0, embedded = 0, strapped = 0,
              dropped = 0, stuck = 0, broke = 0, expired = 0, cleared = 0;
+    // D3: flights that crossed the window's boundary between the tiers --
+    // injected from the distant tier, and handed back to it as they left.
+    uint64_t injected = 0, handedOut = 0;
+    // D9: flights that met a distant creature's body box in the window, and
+    // player flights the distant tier flies on past the edge.
+    uint64_t distantHits = 0, continued = 0;
   } stats;
 
  private:

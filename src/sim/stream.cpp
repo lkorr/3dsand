@@ -2335,6 +2335,26 @@ void Stream::ReloadWindow(IVec3 origin) {
   FillSlots(slots, /*deferWake=*/false);
 }
 
+// stream.h, "A READ OF THE STORE THAT IS A FUNCTION OF THE TICK". The loop is
+// RegenerateChunks' own, for the same reason: a store entry read while an
+// eviction of it is in flight is the OLD bytes now and the new ones a
+// GPU-decided tick later.
+const std::vector<uint32_t>* Stream::SettledStoredChunk(IVec3 wc) {
+  const uint64_t key = World::PackChunkKey(wc);
+  while (pendingChunks_.count(key)) {
+    // Every count in pendingChunks_ belongs to a batch in pending_ (EvictSlots
+    // and EvictTicketSlots push both together), so this cannot spin -- but a
+    // count with no batch left behind it would, so it is dropped instead.
+    if (pending_.empty()) {
+      pendingChunks_.erase(key);
+      break;
+    }
+    CompleteOldest(/*discard=*/false);
+    settleDrains_++;
+  }
+  return store_.Get(wc);
+}
+
 uint32_t Stream::RegenerateChunks(const std::vector<IVec3>& chunks, uint32_t* dropped) {
   // See stream.h. Store first, for every listed chunk, resident or not: an
   // eviction still in flight for one of them is completed so its bytes land
