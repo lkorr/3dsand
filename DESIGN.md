@@ -25291,6 +25291,42 @@ directions, the pattern the variance-preserving blend of the two that bracket
 the local flow (`flowFrame`): each a rigid rotation of the world, a bend a
 crossfade between them.
 
+### 9d.11b Bubbles: an air cell the water closes over (added 2026-10-16)
+
+`raymarch.wgsl`, "BUBBLES" (`bubShape`, `bubbleComposite`, the bubble arm in
+`trace()`). The CA lifts air up through water a cell at a time, and the motion
+was right; the LOOK was a blue cube, because the march drew such a cell as plain
+air -- the ray just spent 10 cm less in water, so a rising pocket was a stack of
+lighter cubes and a lone bubble barely showed. Render-only; the sim is untouched.
+
+* **Which cells.** An air cell the primary ray reached THROUGH liquid, closed
+  (matter, not air or gas) on at least three of its four sides, with clear
+  liquid among its sides or above. Counted as water by the march, so it has no
+  cube silhouette. Open air (at most one closed side) ends the search for that
+  ray, which is what keeps the cost to rays still inside the water.
+* **The shape** (`bubShape`, one function for both readers): an ellipsoid inside
+  the cell, flattened and wobbling, sized and offset by a hash of the cell.
+  `trace()` records the first cell whose bubble the ray actually HITS, in
+  `liqFace`'s spare bits (no new `Hit` field: `Hit` is live across the opaque
+  shade, where this shader's registers are). Recording the first bubble CELL
+  instead drew half-moons: a ray through a cell's empty corner hid the bubble in
+  the cell behind.
+* **The look** (`bubbleComposite`, after whichever liquid shade owned the pixel,
+  from its veil terms): water -> air Fresnel, so past the critical angle the rim
+  is total internal reflection of the water round it -- the silver outline --
+  bright towards the surface and the sky through Snell's window; ~2% head-on, so
+  the middle shows what is behind; a refracted key-light glint on the crown;
+  composited at the bubble's depth under the same transmittance a body under the
+  surface gets, so it fades with murk.
+
+Known limits: a cell inside a larger pocket is open air to this test, so a
+pocket draws as before and stops the search, cutting a bubble behind it along
+the pocket's face; and EVERY enclosed air cell is drawn, whatever made it --
+which includes the deficit a drain from below sends up through a body (that is
+the CA's representation of it, the same cells the owner called bubbles).
+Measured on the `--lab pondcrater` underwater view, one process per arm, same
+exe: `rm_world` 6.06 ms mean with the change, 6.04 without (noise).
+
 ### 9d.12 The measured flow: the current follows the water the sim moves (added 2026-10-15)
 
 `src/sim/flowfield.h` `kFlowMeas*` (the layout), `assets/shaders/flow_measure.wgsl`
