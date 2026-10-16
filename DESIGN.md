@@ -24860,15 +24860,17 @@ two layers dug out of it; F a twice-run of a one-layer mound + dent at the same
 tick numbers, hashed. Every arm prints its off-level curve (columns off, eighths
 off, highest, lowest, awake), so a failure says which half did not finish.
 
-### 5b.13 Running water that sleeps — held water, sloped rivers, curtains (added 2026-10-16)
+### 5b.13 Running water that sleeps — held water, sloped rivers, curtains, held streams (added 2026-10-16)
 
 `docs/PLAN_running_water.md` is the full record. The owner asked for rivers that
 RUN — down a slope, over rapids and waterfalls — without the cost of
-simulating every voxel of it, and for rivers, lakes and the sea to behave as if
-their volume were infinite. A reach-1 CA cannot let a falling surface rest: fed
-at the top and drained at the bottom (the reservoir does both) a running river
-is a conveyor that never sleeps. So the voxels stay real and at rest, and the
-CA is told that a river at its surface is already where it is going.
+simulating every voxel of it, for rivers, lakes and the sea to behave as if
+their volume were infinite, and for a player-made stream that does the same
+thing over and over to fall asleep. A reach-1 CA cannot let a falling surface
+rest: fed at the top and drained at the bottom (the reservoir does both) a
+running river is a conveyor that never sleeps. So the voxels stay real and at
+rest, and the CA is told that a river at its surface is already where it is
+going.
 
 **The held rule** (`sim_step.wgsl`, HELD WATER, beside THE RESERVOIR). The still
 table's level is now **T8, in eighths** (full cells to `(T8 - 1) >> 3`, the top
@@ -24883,11 +24885,12 @@ ask the same predicates. The rule only REFUSES moves, so it adds nothing that
 could cycle; an undisturbed held river has no move left and sleeps.
 
 **The reservoir changes with it** (supersedes §5b.12's DEFICIT bullet): TAKE and
-GROW no longer roll and fill the cell to its target in one write — a river that
-has just poured into a breach must be full again before the breach asks for
-more, or the breach drains the river instead of the river feeding the breach.
-GIVE keeps its roll and its one eighth. `sim.stillWaterRelax = 0` switches the
-reservoir AND the held rule off (`lake-settle`'s control arm).
+GROW no longer roll and fill the cell to its target in one write, and a TAKE is
+tried FIRST (stage 0, before the cell may move) — a river that has just poured
+into a breach must be full again before the breach asks for more, or the breach
+drains the river instead of the river feeding the breach. GIVE keeps its roll
+and its one eighth. `sim.stillWaterRelax = 0` switches the reservoir, the held
+rule and stream adoption off (`lake-settle`'s control arm).
 
 **The bake** (`worldwater.cpp` step 8; `assets/editor/riverbake.js` is the
 port, `scripts/test_riverbake.mjs` holds them equal). The `stepVox` staircase is
@@ -24897,27 +24900,44 @@ drop. Only a drop over 2 m stays a hard step — a waterfall. `kS_RivSurf` is T8
 end A, `kS_RivLipY` the lip Y (i16) and the fall A -> B in eighths (u16).
 
 **`waterApply`** (GPU and CPU twin, per voxel equal — `rivers` D): channel water
-is the lowest T8 claiming the column with a part-full top cell (`fluidGap`, zero
-= full, colCache `CCW_WP` bits 25..27); the weir dams are gone except at a
-waterfall, which is a CREST (a sill one cell under the upstream surface, its
-water over it) and a CURTAIN (`RIVER_CURTAIN` = 2 voxels: the upstream surface's
-water standing on the lower reach's floor — a held sheet against the cliff);
-banks rise to hold both.
+is the NEAREST claiming piece's surface (not the lowest: short ramp pieces of
+different slope claim a column near a bend, and the lowest stepped the water
+down where a steeper piece's edge passed) with a part-full top cell
+(`fluidGap`, zero = full, colCache `CCW_WP` bits 25..27). A dry channel column
+and every bank stand at least S + M over every piece within `RIVER_LIP`, M a
+piece's steepness (1 + its fall per column, whole voxels, rounded up). The weir
+dams are gone except at a waterfall: a CREST (`RIVER_CREST` = 2: a sill one cell
+under the upstream surface, its water over it) and a CURTAIN (`RIVER_CURTAIN` =
+2: the upstream surface's water standing on the lower reach's floor — a held
+sheet against the cliff), one bake sample together so a cascade of falls a
+sample apart keeps every curtain; banks rise to hold both.
+
+**Streams become held** (`sim_stream.wgsl` `scan` / `commit`, after the CA over
+the dirty list). The still table grew to four words a column: the map's target,
+a stream's adopted target (+ hop), and the stream's observation or liquid.
+`stillLevel8` reads the stream's target where the map's is empty. A column whose
+surface is STEADY (within a voxel of where the count began, 120 visits), that
+RUNS (somewhere lower beside it, or a held body at or under it) and is FED (a
+neighbour holds a target at or over its surface — the map's water, hop 0, or an
+adopted column of hop h — with an open way in) is adopted at its surface, hop =
+h + 1. One writer per column (the topmost dirty chunk of its window stack),
+neighbours read only from committed words. An adopted column visited and no
+longer fed by a SMALLER hop is released: a plugged mouth drains its stream from
+the top down. Derived, not saved; dense worldgen clears it.
 
 **The look** (`raymarch.wgsl`): every SIDE face of water is a falling sheet
 (`fallingSheet`: vertical whitewater streaks scrolling down at 3.2 m/s) — a held
 curtain, a rapid's step and a CA spill in flight all read as water going down;
 `fallCueAt` gives a held curtain the waterfall mist and its foot the plunge
-spray; the top keeps the flow grid's streaks (§9d.10).
+spray; `gSlopeFlow` turns the surface's own slope into a current for the streaks
+and foam lines, so a held ramp or an adopted stream runs visibly.
 
 **Gate `rivers`** grew: D compares the top cell's eighths, E allows air beside
-water only over a held column whose surface is below it (and requires the
-falls' curtain to be there), and **R** scoops a crater out of the river (it must
-refill) and cuts a trench through its bank (it must flood from the river).
-
-Phase 2 — a player-made stream between two held bodies adopted into a dynamic
-held layer once steady and released when its source is cut — is designed in the
-plan document and not built.
+water only over a held column whose surface is below it (and prints every
+piece's view of a leak), **R** scoops a crater out of the river (it refills) and
+cuts a breach through its bank (it floods), **S** digs a channel from the lake
+down to the river (it runs, is adopted and its chunks sleep; plugged, it is
+released). G measured 0 active chunks after 800 ticks over the whole fixture.
 
 ## 9d. The current field, and surface waves (added 2026-08-29)
 

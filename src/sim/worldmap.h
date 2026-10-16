@@ -768,8 +768,11 @@ enum : uint32_t {
   // A SOFT step (<= kRiverWaterfall) is a ramp: the surface runs down to it
   // over at most this much arc per voxel of drop (worldwater.cpp step 8).
   kRiverRampVox = 48,
-  // A waterfall's CURTAIN: the held water column just past the crest strip,
-  // this many voxels along the cut normal (worldgen.wgsl waterApply).
+  // A waterfall's CREST (a sill under the upstream water) and its CURTAIN
+  // (the held water column past it), voxels along the cut normal from the
+  // cut (worldgen.wgsl waterApply RIVER_CREST / RIVER_CURTAIN): together one
+  // bake sample, so falls one sample apart each keep a curtain.
+  kRiverCrest = 2,
   kRiverCurtain = 2,
   kLakeEdgeMax = 256,        // a polygon edge's longest side (split at load)
   kLakeBandDefault = 24, kLakeBandMax = 128,

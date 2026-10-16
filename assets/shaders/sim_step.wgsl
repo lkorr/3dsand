@@ -4662,6 +4662,15 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
   // makes the same test in the same places.
   let rest = heldRest(c, mat, f);
 
+  // 0) HELD WATER IS REFILLED BEFORE IT MOVES. A free-surface cell of a held
+  //    column under its target takes the reservoir's fill FIRST (THE
+  //    RESERVOIR's TAKE, the same write stage 5 makes): a river cell beside a
+  //    breach or a stream column the river feeds would otherwise spill every
+  //    visit and never get back to its level, and the water it hands on would
+  //    be whatever was left instead of what the reservoir behind it supplies.
+  //    canFlowAnywhere's stage-5 test (stillWant) is the same predicate.
+  if (!submerged && stillWant(c, mat, f) == STILL_TAKE && stillReservoir(c, mat, f)) { return true; }
+
   // 1) straight down: top a partial same-liquid cell up, else move/swap whole.
   if (tryDescend(c, c + vec3<i32>(0, -1, 0), w, mat, f, m.density)) {
     markDirtyR(c, DIRTY_M_DOWN | sub);

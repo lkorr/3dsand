@@ -2,15 +2,16 @@
 // (docs/PLAN_worldbuilder.md W1): the spline, the parse, and THE BAKE.
 //
 // WHY RIVERS CAN EXIST AT ALL. A flowing CA river never sleeps (CLAUDE.md
-// rule 2; docs/PLAN_water_master.md lists them as a non-goal). So a river here
-// is not a current: it is a STAIRCASE OF STILL POOLS laid along a line. The
-// bake makes the water surface monotone non-increasing source -> mouth and
-// quantizes it into flat REACHES; inside a reach the surface is one Y, so the
-// water is at rest the moment worldgen writes it, and between reaches a WEIR
-// (the lower reach's first RIVER_LIP voxels below the step's cut line, held
-// at the upper surface) keeps the upper pool from spilling. A step that
-// drops more than kRiverWaterfall is a waterfall: recorded, drawn as a step.
-// The look of flow is the renderer's business, never mass transport.
+// rule 2). So a river here is not a current: it is a surface HELD at rest
+// (sim_step.wgsl HELD WATER; docs/PLAN_running_water.md). The bake makes the
+// water surface monotone non-increasing source -> mouth, quantizes it into a
+// staircase by stepVox, and then RAMPS every step of up to kRiverWaterfall
+// (2 m) in eighths (step 8 below), so the surface slopes like a river's;
+// only a bigger drop stays a step -- a WATERFALL, which worldgen draws as a
+// crest and a held curtain. Held water at its target never pours into held
+// water at its own, so the ramp, the rapids and the curtains are at rest the
+// moment worldgen writes them. The look of flow is the renderer's business,
+// never mass transport.
 //
 // THE RIVER BAKE, precisely (E2's JS preview ports this; the numbers are
 // integer voxels unless said):

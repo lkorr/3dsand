@@ -3038,9 +3038,9 @@ static WaterCol waterApply(int x, int z, bool roaded, int hRoad, int h0, std::st
       const IV2 c = rivCut(st.cutA);
       const int cd = (x - ax) * c.x + (z - az) * c.y;
       if (cd <= 0) continue;
-      if (cd <= (int)kRiverLip * 1024) strip = 1;
-      else if (cd <= ((int)kRiverLip + (int)kRiverCurtain) * 1024) strip = 2;
-      else if (cd <= ((int)kRiverLip + (int)kRiverCurtain + 2) * 1024) strip = 3;
+      if (cd <= (int)kRiverCrest * 1024) strip = 1;
+      else if (cd <= ((int)kRiverCrest + (int)kRiverCurtain) * 1024) strip = 2;
+      else if (cd <= ((int)kRiverCrest + (int)kRiverCurtain + 2) * 1024) strip = 3;
     }
     if ((fl & kRivFlatB) != 0u) {
       const IV2 c = rivCut(st.cutB);

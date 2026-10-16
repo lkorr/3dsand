@@ -2326,10 +2326,12 @@ fn rivCut(w : i32) -> vec2<i32> {
 //     the lowest of them stepped the water down wherever a steeper piece's
 //     channel edge passed; ties keep the first listed).
 //     A WATERFALL (a hard step, kRivFlatA) is two strips downstream of its
-//     cut: the CREST (the first RIVER_LIP voxels) is a sill one cell under
+//     cut: the CREST (the first RIVER_CREST voxels) is a sill one cell under
 //     the upstream surface with that water over it, and the CURTAIN (the next
 //     RIVER_CURTAIN) stands the upstream surface's water on the lower reach's
-//     floor -- a held column of falling water against the cliff. A road deck
+//     floor -- a held column of falling water against the cliff. Both fit in
+//     one 4-voxel bake sample, so a mountain river whose falls come one a
+//     sample still gets a curtain on every one (a cascade, not dry ledges). A road deck
 //     that crosses the channel wins up to the water (a ford).
 //     A channel column left DRY (its floor at or over the surface: the
 //     shallow edge of a U, where the ramp has just stepped down a voxel) is
@@ -2358,6 +2360,7 @@ fn rivCut(w : i32) -> vec2<i32> {
 // Bounds: a piece is <= 256 voxels a side and hw + bank <= 1536, so after
 // routeDist2's box reject every product is < 2^30 (worldmap.h kRiver*); a
 // piece's fall is < 2^16 eighths, so fall * tq < 2^24.
+const RIVER_CREST : i32 = 2;
 const RIVER_CURTAIN : i32 = 2;
 fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, LandCol>) {
   if (T.labMode != 0u) { return; }
@@ -2419,9 +2422,9 @@ fn waterApply(x : i32, z : i32, roaded : bool, hRoad : i32, L : ptr<function, La
       let c = rivCut(wmSiteI(sid, WM_S_RIV_CUT_A));
       let cd = (x - ax) * c.x + (z - az) * c.y;
       if (cd <= 0) { continue; }
-      if (cd <= RIVER_LIP * 1024) { strip = 1; }
-      else if (cd <= (RIVER_LIP + RIVER_CURTAIN) * 1024) { strip = 2; }
-      else if (cd <= (RIVER_LIP + RIVER_CURTAIN + 2) * 1024) { strip = 3; }
+      if (cd <= RIVER_CREST * 1024) { strip = 1; }
+      else if (cd <= (RIVER_CREST + RIVER_CURTAIN) * 1024) { strip = 2; }
+      else if (cd <= (RIVER_CREST + RIVER_CURTAIN + 2) * 1024) { strip = 3; }
     }
     if ((fl & RIV_FLAT_B) != 0u) {
       let c = rivCut(wmSiteI(sid, WM_S_RIV_CUT_B));

@@ -25,21 +25,26 @@
 // ADOPTION, per column, by the two kernels below on every tick the CA ran:
 //   * the column's SURFACE is its highest free-surface liquid cell (liquid,
 //     non-liquid above) under the column's topmost awake chunk; s8 = 8 y + f;
-//   * it is ESTABLISHED when it has held liquid at its surface for
-//     STREAM_ADOPT_TICKS visits (a tick with no surface halves the count: a
-//     thin stream flickers). Not "at a constant level": the inflow of every
-//     column changes as the one above it is adopted, so a level test restarts
-//     the count all the way down the stream at each step and adoption crawls;
+//   * it is STEADY when its surface has stayed within one voxel (8 eighths)
+//     of where it stood when the count began, for STREAM_ADOPT_TICKS visits
+//     (a jump restarts the count from the new surface; a tick with no surface
+//     halves it: a thin stream flickers). A trench still FILLING rises out of
+//     the band and is not adopted part way up: it fills, rests at its
+//     feeder's level and sleeps as plain water. (Adoption does not disturb
+//     the column below it: a held cell under its target is refilled before
+//     it moves -- sim_step.wgsl stage 0 -- so an adopted column hands on what
+//     it did before);
 //   * it is FED when a lateral neighbour holds a target T >= s8 -- the map's
 //     own water (hop 0) or an adopted column (hop h) -- whose water stands at
 //     its surface where it can step into this column (its top cell is that
 //     liquid; this column's cell at that row is not a wall); the column takes
 //     hop = the smallest such h + 1, so hops strictly fall toward the map's
 //     water and support can never run in a circle;
-//   * it has OUTFLOW: somewhere lower to run beside its surface cell (a pool
-//     being filled has none, so it fills to its feeder's level and sleeps as
-//     plain water instead of being frozen part way up);
-//   * established, fed and running: adopted at its current surface.
+//   * it has OUTFLOW: somewhere lower to run beside its surface cell, or a
+//     held neighbour (the map's water or an adopted column) whose target is
+//     at or under its surface -- the body it drains into (a pool with no way
+//     out has neither, and sleeps as plain water);
+//   * steady, fed and running: adopted at its current surface.
 // RELEASE: an adopted column that is visited (something woke its chunk) and is
 // no longer fed at its own target by a neighbour of SMALLER hop is released -- a plugged breach drains its
 // stream from the top down: the released water is ordinary water, it flows
@@ -212,6 +217,8 @@ fn streamOutflow(x : i32, y : i32, z : i32, s8 : i32, mat : u32) -> bool {
     let m = voxMat(w);
     if (m == MAT_AIR) { return true; }
     if (m == mat && 8 * y + i32(voxState(w) + 1u) + 2 <= s8) { return true; }
+    let t = neighbourTarget(n.x, n.z, mat);
+    if (t.x != STREAM_NONE && t.x <= s8) { return true; }
   }
   return false;
 }
@@ -266,8 +273,12 @@ fn scan(@builtin(workgroup_id) wg : vec3<u32>, @builtin(local_invocation_index) 
     stillWater[si + 3u] = (w3 & 0xFFFFFu) | ((age >> 1u) << 20u);
     return;
   }
-  age = min(age + 1u, STREAM_AGE_MAX);
-  var word = (bitcast<u32>(s.s8) & 0xFFFFFu) | (age << 20u);
+  age = min(age + 1u, STREAM_AGE_MAX);   // this visit; reset below on a jump
+  // The band's centre stays where the count began; a jump out of it restarts
+  // the count from here.
+  var obs = s.s8;
+  if (age > 0u && abs(s.s8 - sdec(w3)) <= 8) { obs = sdec(w3); } else { age = 0u; }
+  var word = (bitcast<u32>(obs) & 0xFFFFFu) | (age << 20u);
   if (age >= STREAM_ADOPT_TICKS && streamOutflow(x, s.y, z, s.s8, s.mat)) {
     let hop = streamSupport(x, z, s.s8, s.mat, STREAM_HOP_MAX) + 1u;
     if (hop <= STREAM_HOP_MAX) {
