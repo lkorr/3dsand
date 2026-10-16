@@ -4138,6 +4138,15 @@ void MobSystem::Reset(bool rewindIds) {
   edgeArrowsOut_.clear();
   edgeArrowsIn_.clear();
   tierFlips_.clear();
+  // ...D8 / D9's: the in-window count, the arrows' boxes, the two arrow
+  // hand-overs and the gates' logs.
+  bandInWindow_ = 0;
+  boxIds_.clear();
+  distantBoxes_.clear();
+  edgeBoxHits_.clear();
+  edgeShotsOut_.clear();
+  shotEvents_.clear();
+  overflowLog_.clear();
   bodyFx_.clear();
   // ...and the corpses that were going to get up do not, because the world
   // they were lying in is gone: a booked rising names a place and a handful of

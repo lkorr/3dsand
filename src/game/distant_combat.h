@@ -308,6 +308,12 @@ struct DistantLimb {
   int parent = -1;             // base limb index of its parent (-1: the root)
   float maxHp = 0.0f;          // the AUTHORED hp (the burn cap's base)
   float shellHardness = 0.0f;  // hardest worn shell over it (0 = bare)
+  // D9: WHERE IT WAS on the body at the kit's capture (Mob::LimbCentreWorld),
+  // in the BODY'S FRAME: x right, y up from the feet, z forward, from the body
+  // box's centre column -- what an arrow that met the statue's box is laid
+  // against (ResolveArrowContact). `placed` false: the limb had no body then.
+  float at[3] = {0.0f, 0.0f, 0.0f};
+  bool placed = false;
 };
 
 struct DistantKit {
@@ -467,6 +473,34 @@ DistantDeath SeverLimb(DistantVitals& v, DistantKit& k, int limb,
                        const DistantCalib& cal, std::vector<int>* off = nullptr);
 DistantDeath ApplyArrow(DistantVitals& v, const DistantKit& k,
                         const ArrowOutcome& o, const DistantCalib& cal);
+
+// D9: AN ARROW THAT MET THE BODY. The player's arrows (and every flight in the
+// window) are flown for real and judged GEOMETRICALLY against a distant
+// creature's body box, so CONTACT is already decided -- there is no hit roll
+// (ResolveArrow's knots are a shot's odds; this is the shot). `at` / `dir` in
+// the body's frame (x right, y up from the feet, z forward, from the box's
+// centre column -- DistantLimb::at's frame).
+struct ArrowContact {
+  float at[3] = {0.0f, 0.0f, 0.0f};
+  float dir[3] = {0.0f, 0.0f, 1.0f};
+  float height = 0.0f;         // the body box's height (the height fallback's scale)
+  float halfWidth = 0.0f;      // half the box across
+};
+// THE LIMB is the live one whose captured centre lies NEAREST THE ARROW'S LINE
+// through the body (lowest index on a tie) -- the hit's height and side on the
+// body pick it, and its role is that limb's; a kit captured with no limb
+// positions falls back to the height alone (head over 0.82 of the body, legs
+// under 0.45, an arm past 0.6 of the half width, else torso; a role the body
+// lacks folds into torso: PickLimb). Then ResolveArrow's pricing exactly:
+// `damage` (the ammo's flat damage) x damageFrac x the shell factor over that
+// limb (Pierce prices plate by the cut-hardness ratio), and the bleed it owes.
+// No sever (an arrow has no strokes in the log). `hit` false only when the
+// body has no live limb to take it. Pure; the draw (the fallback's limb among
+// several of a role) is Hash3(key.id ^ kSaltDistantArrow, key.tick, 12).
+ArrowOutcome ResolveArrowContact(const DistantKit& def, const std::vector<float>& defHp,
+                                 const ArrowContact& c, float damage,
+                                 const DistantRngKey& key, const DistantCalib& cal,
+                                 const Tuning::Gear& gear);
 
 // One tick of bleeding: the rate in hp (+ every open stump's drain, D2b),
 // spread over the live non-bloodless limbs in proportion to what each has

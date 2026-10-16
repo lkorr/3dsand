@@ -756,6 +756,14 @@ const char* const kOrder[] = {
     // back; `distant-save` saves and loads a world dir).
     "distant-schedule",
     "distant-save",
+    // THE CAP OVERFLOW and THE PLAYER'S REACH (docs/PLAN_distant_npcs.md D8,
+    // D9). After `distant-edge` for the same exit contract (two fresh worlds
+    // each; mobs / debris / tier reset, store cleared, park function and
+    // player actors removed, tuning / items / id counter restored, worldgen
+    // regenerated at home) plus their own logs cleared. Neither moves the
+    // window.
+    "distant-overflow",
+    "distant-arrow",
     // MOBS v6 (PLAN_corpse_is_a_mob P2a). After `mob-park` for the same exit
     // contract: mobs, debris and risings reset, id counter restored, park
     // function removed, store cleared, worldgen regenerated at home.
@@ -1928,7 +1936,30 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << ", \"scheduleSteps\": " << ds.scheduleSteps
       << ", \"scheduleWakes\": " << ds.scheduleWakes
       << ", \"scheduleHolds\": " << ds.scheduleHolds
-      << ", \"promoteCatchUps\": " << ds.promoteCatchUps << "},\n";
+      << ", \"promoteCatchUps\": " << ds.promoteCatchUps
+      // D8: THE CAP OVERFLOW -- the calls in which the living cap bound, the
+      // slots filled nearest-to-the-player first, the swaps (and those whose
+      // near creature targeted a player), the waits and refusals, the steps
+      // held at the player's ring, the most distant creatures in the window.
+      << ", \"overflowCalls\": " << ds.overflowCalls
+      << ", \"overflowFilled\": " << ds.overflowFilled
+      << ", \"overflowSwaps\": " << ds.overflowSwaps
+      << ", \"overflowLastResort\": " << ds.overflowLastResort
+      << ", \"overflowNoVictim\": " << ds.overflowNoVictim
+      << ", \"overflowGroundWaits\": " << ds.overflowGroundWaits
+      << ", \"overflowRefused\": " << ds.overflowRefused
+      << ", \"overflowRingHolds\": " << ds.overflowRingHolds
+      << ", \"overflowInWindowPeak\": " << ds.overflowInWindowPeak
+      // D9: THE PLAYER'S REACH -- in-window flights that met a statue's box
+      // (applied / lost), player flights flown on past the edge and how each
+      // ended, and the D3 hand-overs refused for a target inside the window.
+      << ", \"boxHits\": " << ds.boxHits << ", \"boxHitsApplied\": " << ds.boxHitsApplied
+      << ", \"boxHitsLost\": " << ds.boxHitsLost << ", \"shotsOut\": " << ds.shotsOut
+      << ", \"shotsOutHits\": " << ds.shotsOutHits
+      << ", \"shotsOutGrounded\": " << ds.shotsOutGrounded
+      << ", \"shotsOutReentered\": " << ds.shotsOutReentered
+      << ", \"shotsOutExpired\": " << ds.shotsOutExpired
+      << ", \"edgeArrowsOutInWindow\": " << ds.edgeArrowsOutInWindow << "},\n";
   }
   // ---- THE DISTANT STATUES (game/distant_draw.h, PLAN_distant_npcs D4a) ---
   // What every DistantDraw in the run did: drawn / culled / starved for want

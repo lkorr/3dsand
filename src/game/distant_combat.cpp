@@ -792,6 +792,28 @@ DistantKit BuildDistantKit(const Mob& m, const ItemLibrary* items, bool withBody
   const std::vector<float> hard = ShellHardnessOfLimbs(m);
   for (size_t i = 0; i < hard.size() && i < k.limbs.size(); i++)
     k.limbs[i].shellHardness = hard[i];
+  // ---- D9: WHERE EACH LIMB IS ON THE BODY (the frame ResolveArrowContact
+  // lays an arrow in): its collider's centre as posed now, from the body
+  // box's centre column at the feet, turned into the facing (x right, z
+  // forward). Read off the LIVE rig, like everything above.
+  {
+    const Vec3 o = m.Origin();
+    const Vec3 ws = def->worldSize;
+    const float h = m.Heading();
+    const Vec3 fwd{std::sin(h), 0.0f, std::cos(h)};
+    const Vec3 rgt{std::cos(h), 0.0f, -std::sin(h)};
+    const Vec3 col{o.x + ws.x * 0.5f, o.y, o.z + ws.z * 0.5f};
+    for (int i = 0; i < base; i++) {
+      Vec3 c{};
+      if (!m.LimbCentreWorld(i, c)) continue;
+      const Vec3 r = c - col;
+      DistantLimb& L = k.limbs[(size_t)i];
+      L.at[0] = r.x * rgt.x + r.z * rgt.z;
+      L.at[1] = r.y;
+      L.at[2] = r.x * fwd.x + r.z * fwd.z;
+      L.placed = true;
+    }
+  }
   return k;
 }
 
@@ -1096,6 +1118,63 @@ DistantDeath ApplyStrike(DistantVitals& v, const DistantKit& k,
   v.bleedRate += o.bleedAdded;
   v.dead = DeathTest(v, k, cal);
   return v.dead;
+}
+
+ArrowOutcome ResolveArrowContact(const DistantKit& def, const std::vector<float>& defHp,
+                                 const ArrowContact& c, float damage,
+                                 const DistantRngKey& key, const DistantCalib& cal,
+                                 const Tuning::Gear& gear) {
+  ArrowOutcome o;
+  o.flightTicks = 0;   // it is here: the flight was flown, not estimated
+  o.pHit = 1.0f;       // ...and it met the body: contact is geometry's to say
+  // THE LIMB NEAREST THE ARROW'S LINE (the live limbs whose centre the kit
+  // captured): squared distance from the centre to the line through `at`
+  // along `dir`, in index order, strictly less to replace -- a tie keeps the
+  // lower index, so the pick is a pure function of the kit and the contact.
+  const float dl = std::sqrt(c.dir[0] * c.dir[0] + c.dir[1] * c.dir[1] + c.dir[2] * c.dir[2]);
+  const float u[3] = {dl > 1e-6f ? c.dir[0] / dl : 0.0f, dl > 1e-6f ? c.dir[1] / dl : 0.0f,
+                      dl > 1e-6f ? c.dir[2] / dl : 1.0f};
+  int best = -1;
+  float bestD2 = 0.0f;
+  for (size_t i = 0; i < def.limbs.size(); i++) {
+    if (!def.limbs[i].placed || !LiveLimb(def, defHp, i)) continue;
+    const float r[3] = {def.limbs[i].at[0] - c.at[0], def.limbs[i].at[1] - c.at[1],
+                        def.limbs[i].at[2] - c.at[2]};
+    const float along = r[0] * u[0] + r[1] * u[1] + r[2] * u[2];
+    const float p[3] = {r[0] - u[0] * along, r[1] - u[1] * along, r[2] - u[2] * along};
+    const float d2 = p[0] * p[0] + p[1] * p[1] + p[2] * p[2];
+    if (best < 0 || d2 < bestD2) {
+      best = (int)i;
+      bestD2 = d2;
+    }
+  }
+  if (best >= 0) {
+    o.limb = best;
+    o.role = def.limbs[(size_t)best].role;
+  } else {
+    // NO POSITIONS (a kit captured off a rig with no bodies): the HEIGHT on
+    // the body, then its side, decides the role; a live limb of it by the
+    // draw (a role the body lacks folds into torso).
+    const float hf = c.height > 0.0f ? c.at[1] / c.height : 0.5f;
+    LimbRole want = hf >= 0.82f   ? LimbRole::Head
+                    : hf < 0.45f  ? LimbRole::Leg
+                    : (c.halfWidth > 0.0f && std::fabs(c.at[0]) > 0.6f * c.halfWidth)
+                        ? LimbRole::Arm
+                        : LimbRole::Torso;
+    const uint32_t seed = (uint32_t)key.id ^ ai::kSaltDistantArrow;
+    o.limb = PickLimb(def, defHp, want, rng::Hash3(seed, key.tick, 12));
+    o.role = want;
+  }
+  if (o.limb < 0) return o;
+  // ResolveArrow's pricing, unchanged: the flat damage x the table's measured
+  // contact cost x what the shell over that limb lets a point through.
+  const float dmg = damage > 0.0f ? damage : 35.0f;
+  const float f = ShellFactor(StrikeKind::Pierce, DamageCause::Pierce,
+                              def.limbs[(size_t)o.limb].shellHardness, cal.armour, gear);
+  o.hp = dmg * std::max(0.0f, cal.ranged.damageFrac) * f;
+  o.bleedAdded = Bleed(def, o.limb, o.hp, StrikeKind::Pierce, cal);
+  o.hit = true;
+  return o;
 }
 
 DistantDeath ApplyArrow(DistantVitals& v, const DistantKit& k,

@@ -1866,6 +1866,163 @@ activated, 1 room wait (distant-roundtrip F's cap of 2), 0 kept / dropped.
   swap's demotion is a demotion (the reserve is for it). For D9: nothing here
   touches arrows.
 
+### D8+D9 (branch `dnpc-d89`): cap overflow, and the player's reach
+
+**What landed.** *D8*: `MobSystem::OverflowSwaps` (distant.cpp), called from
+ONE statement at the top of `EntityParking::Unpark` (before its promotion
+pass, with Unpark's budget and, as a lambda, its ground wait for a distant
+creature -- the footprint + snap chunks); `MobSystem::PlayerDistance`;
+`MobSystem::DemoteNow` (the park rule's demotion wherever a creature stands;
+`DemoteForTest` now calls it, and `DemoteToDistant` takes the flip tick);
+`DistantMob::overflow`; THE PLAYER'S RING in the drive; the window's own
+ground (`DistantGround::SetWindowSource`); the distant tick's near band
+widened to the whole near crowd while a distant creature stands in the window
+(`bandInWindow_`, counted by `PublishDistantBand`). *D9*: the body boxes
+(`MobSystem::DistantBoxes`, published with the band; `DistantBoxAlong`), the
+in-window box test in `ArrowFlights::Tick`, `QueueEdgeArrowBoxHit`, the
+player's flight past the face (`QueueEdgeShotOut` -> an OUTBOUND
+`DistantArrowFlight`, stepped in the impact pass), `distant::
+ResolveArrowContact` + `DistantLimb::at / placed` (captured by
+`BuildDistantKit`), `ArrowFlights::Inject(..., ticksLeft)`, two `ArrowEvent`
+kinds (`DistantHit`, `Continued`), the gates' logs (`OverflowLog`,
+`DistantShotEvents`). Gates `distant-overflow` and `distant-arrow`
+(`selftest_distant_calib.cpp`, kOrder after `distant-edge`);
+`build/last_run.json`'s `distant` block gains `overflow*`, `boxHits*`,
+`shotsOut*` and `edgeArrowsOutInWindow`. No tuning row added
+(`overflowMinDistVox` is read now and left `check_invariants.py`'s consumer
+allowlist). Shared signatures changed: `DemoteToDistant` (private, one
+defaulted parameter) and `ArrowFlights::Inject` (one defaulted parameter);
+`Unpark` gained one statement and nothing else.
+
+**THE OVERFLOW RULE (D8).**
+- *When*: only while the living cap BINDS -- more living distant creatures
+  over the promotion line than free slots. Otherwise it costs one scan, and
+  Unpark's own pass serves everyone in D0's window-centre order.
+- *Who comes in*: the waiting, NEAREST TO THE PLAYER first (3D, body centre to
+  the nearest LIVING player actor's centre; the window centre with none -- D0
+  deviation 1 answered), ties by id, each under Unpark's own waits (the flip
+  bound, then its ground). A free slot is filled first.
+- *Who goes out* (only when no slot is free): the FARTHEST near creature from
+  the player that is at least `distant.overflowMinDistVox` (150) away and
+  farther than the waiting one by `kDistantOverflowMarginVox` (24, the
+  hysteresis), with room in the flip bound -- `DistantFlipBudgetOk`, the
+  predicate a promotion passes: an OPTIONAL flip always leaves room for one
+  forced flip after it, so kDistantMaxFlips holds whatever order optional and
+  forced flips come in. Never a ghost, a body a player drives, one ragdolled,
+  airborne or holding a severed piece. One whose brain TARGETS A PLAYER is the
+  last choice (the order is: not on a player, then the farthest, then id): it
+  stops seeing the player the moment it is distant. At most
+  `kDistantOverflowSwapsPerTick` (1) a tick -- each swap is a statue bake
+  (3-10 ms in the game) and a LoadOne, and a battle's front moves slower than
+  thirty creatures a second. The waiting are taken nearest first, so once no
+  near creature qualifies for one, none can for the rest (the pass stops).
+- *How an overflow creature lives*: a distant creature INSIDE the window. It
+  walks on the window's own ground where the fetch cache holds the chunk
+  (buildings, trees, edits; else D1's sources), fights through D3's edge (the
+  published band already held in-window creatures, at box distance 0), is a
+  statue, never perceives a player (the list rule is untouched), and is HELD
+  AT THE PLAYER'S RING instead of at the promotion line: no step may END
+  within `overflowMinDistVox` of a player AND nearer to that player than it
+  started. It may walk and fight anywhere in the window but the middle;
+  reaching the ring it waits there, and the swap takes the nearest first.
+  Ending a step outside the promotion line clears the flag (an ordinary
+  distant creature from there, held at the line if it comes back).
+
+**Deviations.**
+1. **Distance is 3D** (centre to centre) for the swap and the ring alike, so
+   the ring is a sphere: on a slope "15 m" includes the height. The gate
+   places its fixture by `PlayerDistance` for that reason.
+2. **The ring replaces the promotion line for overflow creatures only.** The
+   line's "never deeper" would freeze a creature demoted deep in the window
+   where it stood. Creatures that walked in (held at the line) keep D1's rule.
+3. **The window's ground is for overflow creatures only**, set around each
+   one's step and cleared after it, so no D1-D3 behaviour moves. A fetched
+   chunk is decoded once per cache VERSION; liquid is not ground (as D1's
+   stored chunks).
+4. **The near band widens while ANY distant creature is in the window** --
+   one held at the promotion line included. In every D1-D3 gate the near
+   creatures were within the old band anyway.
+5. **An overflow creature promotes through the ordinary `PromoteDistant`**:
+   one that never moved comes back byte for byte, one that walked is snapped
+   from the fetch cache. `catchUp` is still true (D5's open item covers it).
+6. **A body box is the near tier's** (`MobBodyBox`: the axis-aligned world box
+   from the origin, worldSize up) -- what near archers already aim at -- not
+   the creature's turned footprint. A shot through the box's empty corner is
+   a hit: generous by the box/body area ratio, accepted at statue fidelity.
+   Corpses publish no box (an arrow passes a lying statue).
+7. **Contact is geometric, the pricing is the table's.** `ResolveArrowContact`
+   rolls no hit: the limb is the live one whose centre (captured in the body's
+   frame at demotion: x right, y up from the feet, z forward) lies nearest the
+   arrow's LINE, its role that limb's (a kit with no positions falls back to
+   the height on the body); the hp is ResolveArrow's (flat damage x
+   `damageFrac`, measured per CONTACT, x the shell factor), the bleed the
+   table's Pierce rate, no sever. Draw speed is not in it (the table's arrows
+   were full draws). Its one draw (the fallback's limb) is `Hash3(shooter ^
+   kSaltDistantArrow, tick, 12)`: the arrow salt with a new index rather than a
+   new salt (ai_behavior.cpp untouched).
+8. **In-window box hits land a tick late** (queued in phase K, rolled at the
+   next impact pass against the defender's tick-start state): D3's
+   near-hits-distant rule. Ties along one segment go to the lower id.
+9. **The player's flight past the face is < 1 tick late** (the part of the
+   tick past the face is not flown -- D3's inbound skew the other way round),
+   handed over at the last in-window sample (or where the window left it). A
+   flight that comes back INTO the window (shot high over the face) is
+   injected as a real flight again with the life it has left; its quiver coat
+   does not survive the stretch outside (a plain arrow comes back in).
+10. **A D3 hand-over at a target INSIDE the window is refused**
+    (`edgeArrowsOutInWindow`): its box was in the flight's path all along, so
+    a flight that left missed it, and rolling it again past the face would be
+    a second chance. That NPC flight expires at the face as before D9.
+11. **The wall's stealth noise moved after the box test** (an arrow a statue
+    stopped never reached the wall). With no distant box in the window, the
+    order of everything in `ArrowFlights::Tick` is what it was.
+12. **The arrow ends in the statue** (no embedded arrows at this tier; counted
+    `boxHits` / `shotsOutHits`). A miss outside the window lands and ends
+    (nothing out there can hold an item).
+
+**Measured** (`--verify distant-overflow, distant-arrow, distant-edge,
+distant-fight, distant-roundtrip, mob-cap64, mob-cap64-twice, archer, arrow,
+poison-arrow, stealth`: all 11 PASS, 86.7 s; `build/last_run.json`).
+
+`distant-overflow` (15.1 s; both runs a5b6dab76075581b). S: 8 swaps at ticks
++10..+17 (the ground waits first) -- the 4 blues (228-231 voxels from the
+player) and the four farthest dummies (220-222) out, the 8 distant dummies
+(81-118) in; after S the farthest near creature stands at 219.0 and the
+nearest waiting one at 220.4. F: 11 swaps -- the 8 reds (183) at +130..+137
+for dummies at 213-219, then two blues that fought their way in to 187-189
+(+202, +222), and at +413 a red that had chased out to 219 traded for a blue
+at 194: the front moving, the near side following it. Across the tiers 28
+near strokes at in-window distant blues (13 hit) and 13 distant swings at
+near reds (5 through the door). Never more than 64 living near; no overflow
+creature inside the ring (none tried: 0 ring holds); 0 player ids in a list;
+at most 2 flips in 600 ticks; 0 last resorts.
+
+`distant-arrow` (both runs 3d7504a0e46a652c). O: both flights continued at
+the face; the hit came 5 ticks after the loose where the open flight enters
+the box at 4 (the hand-over's < 1-tick lag), on limb 0 for 90.2 hp (35 x
+`damageFrac` 2.58, bare), and the dummy's hp was lower on that very tick
+(1107 -> 961 by the end, the bleed after it). M: landed 6 ticks after the
+loose, outside the window, 0.03 voxels above TerrainHeight + 1. I: the
+in-window statue's box was met on the first tick and applied on the next
+(1107 -> 973).
+
+Unchanged where no distant creature is involved, or none in the window:
+`distant-edge` reproduced D3's own digest (3ab6af95ccb29304) and every
+number of its record; `distant-fight` A reproduced D2b's (decided at 1,022,
+quiet at 1,238, 130 swings / 83 hit / 12 blocked, 12 arrows / 8 hit; C 975
+us/tick for 128 engaged in a NON-exclusive run against D2b's exclusive 668);
+`mob-cap64`, `mob-cap64-twice`, `archer`, `arrow`, `poison-arrow`, `stealth`
+pass.
+
+**Open.** One swap a tick: a front that jumps (a dozen waiting creatures
+suddenly nearest) catches up over a dozen ticks. The ring is a sphere round
+every LOCAL player actor (D7 decides what it means across peers). In-window
+statues walk through near bodies and are walked through (no colliders; D1's
+soft spacing between distant ones only). A near creature on a player is only
+the last resort, but it does go when nothing else qualifies. The player's
+melee still cannot reach a statue and near casters' casts at one are still
+refused (D3's open items).
+
 ## 7. Audit 2026-10-15: what changed and why
 
 The 2026-10-13 plan was audited against the code at `79f8f21` (157 commits
