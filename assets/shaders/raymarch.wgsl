@@ -10530,15 +10530,20 @@ fn rainRipples(pm : vec2f, t : f32, amount : f32, footM : f32) -> vec2f {
 var<private> gSlopeFlow : vec2f = vec2f(0.0);
 const SLOPE_FLOW_GAIN : f32 = 9.0;   // m/s per unit slope (voxels per voxel)
 const SLOPE_FLOW_MAX : f32 = 3.0;    // m/s, the river envelope's ceiling
-fn slopeFlowFrom(cell : vec3<i32>, slope : vec2f) -> vec2f {
-  for (var i = 0u; i < 4u; i++) {
-    var d = vec3<i32>(1, 0, 0);
-    if (i == 1u) { d = vec3<i32>(-1, 0, 0); }
-    else if (i == 2u) { d = vec3<i32>(0, 0, 1); }
-    else if (i == 3u) { d = vec3<i32>(0, 0, -1); }
-    if (liquidFullnessAt(cell + d) <= 0.0 && liquidFullnessAt(cell + d - vec3<i32>(0, 1, 0)) <= 0.0) {
-      return vec2f(0.0);
-    }
+// A lateral neighbour at `n` whose liquidColumn height came out `h` is a BANK:
+// no liquid at the sample row (h is 0 exactly when that cell holds none --
+// liquidColumn's first read is liquidFullnessAt(n)) nor one under it.
+fn slopeBankAt(n : vec3<i32>, h : f32) -> bool {
+  return h <= 0.0 && liquidFullnessAt(n - vec3<i32>(0, 1, 0)) <= 0.0;
+}
+// `hx0`.. are waterNormal's four column heights (-x, +x, -z, +z): the sample
+// row's reads are already in them, so only a dry neighbour costs one more read
+// (the cell under it), instead of eight reads a sloped surface pixel.
+fn slopeFlowFrom(cell : vec3<i32>, hx0 : f32, hx1 : f32, hz0 : f32, hz1 : f32,
+                 slope : vec2f) -> vec2f {
+  if (slopeBankAt(cell + vec3<i32>(-1, 0, 0), hx0) || slopeBankAt(cell + vec3<i32>(1, 0, 0), hx1) ||
+      slopeBankAt(cell + vec3<i32>(0, 0, -1), hz0) || slopeBankAt(cell + vec3<i32>(0, 0, 1), hz1)) {
+    return vec2f(0.0);
   }
   let v = slope * SLOPE_FLOW_GAIN;
   let l = length(v);
@@ -10564,7 +10569,7 @@ fn waterNormal(cell : vec3<i32>, mat : u32, axis : i32, sgn : f32,
   let hz1 = liquidColumn(cell + vec3<i32>(0, 0,  1));
   let slope = vec2f((hx0 - hx1) * 0.5, (hz0 - hz1) * 0.5);
   // Downhill is where the column heights fall: +x when hx0 > hx1.
-  if (dot(slope, slope) > 1e-4) { gSlopeFlow = slopeFlowFrom(cell, slope); }
+  if (dot(slope, slope) > 1e-4) { gSlopeFlow = slopeFlowFrom(cell, hx0, hx1, hz0, hz1, slope); }
 
   // Ripples on top of the macro slope, in world metres (waterWaveNormal).
   // Damping is applied PER WAVE against its own wavelength inside
@@ -10784,11 +10789,49 @@ const FALL_SHEET_BASE : f32 = 0.22;   // the cover between streaks (aerated, nev
 // as whitewater laid white stripes across every sloped river (the default
 // map's silverrun below its outlet). `out` is the face's outward direction.
 const FALL_SHEET_MIN_DROP : f32 = 0.75;
-fn fallingSheetHere(cell : vec3<i32>, out : vec3<i32>) -> bool {
+// What a SIDE face of liquid cell `cell`, looking out along `out`, shows:
+//   SIDE_WALL   a SOLID in front -- water seen through glass, ice or any
+//               other see-through solid. Nothing falls there and nothing is a
+//               surface: the flat side face it always was (2026-10-16 audit:
+//               the first cut had no such case, so an aquarium wall came out
+//               either as a white falling sheet or lit as a top face);
+//   SIDE_RISER  air, a gas or more liquid in front, the water outside
+//               standing less than FALL_SHEET_MIN_DROP under this cell's
+//               surface: a step of a running surface, part of the sheet;
+//   SIDE_SHEET  the same, dropping at least that far: a falling sheet.
+// The water level outside, in cells from this cell's floor: the liquid's
+// fullness in front; else (air or gas there) the cell under it -- a liquid's
+// fullness one cell lower, a FLOOR (solid / powder) at 0 (water stepping off
+// onto a floor drops by its own depth, not by a cell more: a puddle's 2/8 edge
+// is not a waterfall), nothing at -1. Three voxel reads worst case.
+const SIDE_WALL : u32 = 0u;
+const SIDE_RISER : u32 = 1u;
+const SIDE_SHEET : u32 = 2u;
+fn waterSideKind(cell : vec3<i32>, out : vec3<i32>) -> u32 {
   let n = cell + out;
-  let fn0 = liquidFullnessAt(n);
-  let level = select(liquidFullnessAt(n - vec3<i32>(0, 1, 0)) - 1.0, fn0, fn0 > 0.0);
-  return liquidFullnessAt(cell) - level >= FALL_SHEET_MIN_DROP;
+  var level = -1.0;   // out of the window: open, and falling
+  if (inBounds(n)) {
+    let w = voxWordAt(n);
+    let m = voxMat(w);
+    var open = m == MAT_AIR;
+    if (!open) {
+      let k = materials[m].klass;
+      if (k == CLASS_LIQUID) { level = f32(voxState(w) + 1u) / 8.0; }
+      else if (k == CLASS_GAS) { open = true; }
+      else { return SIDE_WALL; }
+    }
+    let b = n - vec3<i32>(0, 1, 0);
+    if (open && inBounds(b)) {
+      let wb = voxWordAt(b);
+      let mb = voxMat(wb);
+      if (mb != MAT_AIR) {
+        let kb = materials[mb].klass;
+        if (kb == CLASS_LIQUID) { level = f32(voxState(wb) + 1u) / 8.0 - 1.0; }
+        else if (kb != CLASS_GAS) { level = 0.0; }
+      }
+    }
+  }
+  return select(SIDE_RISER, SIDE_SHEET, liquidFullnessAt(cell) - level >= FALL_SHEET_MIN_DROP);
 }
 fn fallingSheet(hitP : vec3f, axis : i32) -> f32 {
   let pm = hitP * VOXEL_METERS;
@@ -11597,9 +11640,12 @@ fn fallCueAt(cell : vec3<i32>) -> FallCue {
     // be a fall by the same measure (taken up THERE, not here: a pool has five
     // liquid neighbours of its own and would pass its own test every time).
     let above = cell + vec3<i32>(0, 2, 0);
-    if (mistAirAt(cell + vec3<i32>(0, 1, 0)) && mistLiquidAt(above)) {
+    // One read of the cell overhead serves both branches: a pool surface (air
+    // there, the common pixel) must not pay it twice.
+    let airOver = mistAirAt(cell + vec3<i32>(0, 1, 0));
+    if (airOver && mistLiquidAt(above)) {
       cue.impact = smoothstep(1.5, 3.5, fallMassAt(above));
-    } else if (mistLiquidAt(cell + vec3<i32>(0, 1, 0))) {
+    } else if (!airOver && mistLiquidAt(cell + vec3<i32>(0, 1, 0))) {
       // A HELD CURTAIN (docs/PLAN_running_water.md): a river's waterfall is a
       // standing sheet of water against the cliff -- liquid above, air in
       // front -- that never detaches, so neither test above sees it. Liquid
@@ -12576,7 +12622,11 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // eighths on a running surface (a held ramp crosses a voxel every few
   // columns), and lit as a wall it caught the sky at grazing and drew a white
   // stripe across the river at every step. As top it is part of the sheet.
-  let riser = axis != 1 && !underwater && !fallingSheetHere(cell, vec3<i32>(axisVec(axis, -sgn)));
+  // waterSideKind says which a side face is (a wall behind glass, a riser, a
+  // falling sheet); asked on side faces seen from the air only.
+  var side = SIDE_WALL;
+  if (axis != 1 && !underwater) { side = waterSideKind(cell, vec3<i32>(axisVec(axis, -sgn))); }
+  let riser = side == SIDE_RISER;
   let upFacing = (axis == 1 && sgn < 0.0) || riser;
   var n = waterNormal(cell, mat, axis, sgn, hitP, upFacing);
   if (underwater) { n = -n; }   // seen from below, the interface faces down
@@ -12712,8 +12762,8 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // ---- falling water: a side face is a falling sheet (fallingSheet) ----
   // Lit like the rain splash below (sky + key light by the face's own
   // normal); no shadow ray, the sheet is a thin bright layer and the scene
-  // behind it already carries the shadows.
-  if (!upFacing && !underwater && axis != 1) {
+  // behind it already carries the shadows. Never behind glass (SIDE_WALL).
+  if (side == SIDE_SHEET) {
     let a = fallingSheet(hitP, axis);
     let sheetLit = (ambientAt(n) * 1.1 + keyLightColor() * (0.15 + 0.35 * max(dot(n, keyLightDir()), 0.0))) *
                    WATER_FOAM_COLOR * mediaLightK(fogSkyK());
