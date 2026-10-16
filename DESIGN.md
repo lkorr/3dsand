@@ -25144,10 +25144,32 @@ down where a steeper piece's edge passed) with a part-full top cell
 and every bank stand at least S + M over every piece within `RIVER_LIP`, M a
 piece's steepness (1 + its fall per column, whole voxels, rounded up). The weir
 dams are gone except at a waterfall: a CREST (`RIVER_CREST` = 2: a sill one cell
-under the upstream surface, its water over it) and a CURTAIN (`RIVER_CURTAIN` =
-2: the upstream surface's water standing on the lower reach's floor — a held
-sheet against the cliff), one bake sample together so a cascade of falls a
-sample apart keeps every curtain; banks rise to hold both.
+under the water's top cell, its water over it) and a CURTAIN (`RIVER_CURTAIN` =
+2: falling water standing on the lower reach's floor — a held sheet against the
+cliff), one bake sample together so a cascade of falls a sample apart keeps
+every curtain; banks rise to hold both. **THE BRINK** (2026-10-16, ticket
+11-08-20 "instead of a hard 90 degree edge it should flow over the edge"): the
+water ROUNDS over a fall instead of meeting it at a square corner — the reach
+above draws down over its last `RIVER_DRAW` (6) voxels (`brinkDraw8`: 1, 2, 3,
+4, 5, 7 eighths toward the cut), the two crest columns and the two curtain
+columns carry on down (`fallDrop8`: 9, 12, 16, 24 eighths under the upstream
+surface) into the vertical sheet. Every one of those columns is still held at
+its own surface, so the curve rests and sleeps like a ramp. **ANOTHER WATER**
+(`RIVER_FOREIGN` = `kRiverWaterfall`, ticket 11-13-31): two channels claiming
+one column whose surfaces there differ by more than a waterfall (plus the
+nearer piece's steepness) are two rivers — or one river's meander lobes — side
+by side at different levels, never one river at a bend (the bake makes no such
+step inside a reach, and a fall's reaches never claim each other's columns). A
+foreign LOWER channel adds nothing to the column's floor, steepness or strips
+(a second walk over the column's pieces, only where it happens), and a channel
+column within `RIVER_LIP` of foreign HIGHER water is that water's bank wall.
+Before it, lowest-floor + nearest-surface stood one river's water on the other's
+floor: `default`'s Merebeck, traced 36 voxels from Hollowcrown Beck for 20 km,
+made held slabs of water 66 voxels tall with air beside them — every
+"waterfall" in the owner's 10-16 tickets. (The map was fixed too:
+`design_world.mjs` now joins a trace that reaches a river already built, if that
+river goes where it was sent, and never picks a source on one — Merebeck is a
+short tributary of the Beck, the Teethwater one of the Glimmer.)
 
 **Streams become held** (`sim_stream.wgsl` `scan` / `commit`, after the CA over
 the dirty list). The still table grew to four words a column: the map's target,

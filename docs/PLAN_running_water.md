@@ -114,7 +114,27 @@ in eighths (u16).
   so a mountain river whose falls come one a sample (the default map's
   `river_redrun` has 164) keeps a curtain on every fall;
 * banks from the cut to `RIVER_CREST + RIVER_CURTAIN + 2` past it hold the
-  upstream surface, so the curtain's corners are walled.
+  upstream surface, so the curtain's corners are walled;
+* **the brink** (2026-10-16, ticket 11-08-20): the water rounds over a fall.
+  The last `RIVER_DRAW` (6) voxels upstream of a fall's cut sink by
+  `brinkDraw8` (1, 2, 3, 4, 5, 7 eighths toward the cut; distance along the
+  piece's B cut normal); the crest's two columns stand `fallDrop8` = 9 and 12
+  eighths under the upstream surface (top cell one under it, sill under that),
+  the curtain's two 16 and 24 (full to 2 and 3 cells under it). The slope
+  steepens 1, 1, 1, 1, 2, 2 | 2, 3, 4, 8 eighths a voxel into the sheet. Only
+  the WATER draws down: floors, banks and walls keep the reach's own surface;
+* **another water** (2026-10-16, ticket 11-13-31; `RIVER_FOREIGN` =
+  `kRiverWaterfall`): a channel claiming the column whose surface differs from
+  the nearest channel's by more than a waterfall plus the nearer piece's
+  steepness is another river (or a meander lobe of this one). A lower one adds
+  nothing to the floor / steepness / strips (a second walk over the pieces,
+  only where it happens); a higher one within `RIVER_LIP` makes the column
+  its bank wall. Measured before: `default`'s Merebeck (a trace whose source
+  landed on Hollowcrown Beck's channel) ran 36 voxels from it for 20 km and
+  the lowest-floor rule stood the upper river's water on the lower river's
+  floor: held slabs 66 voxels tall. The map is fixed as well
+  (`design_world.mjs` joins a trace to a river it reaches, if that river goes
+  where it was sent, and never picks a source on one).
 
 The top cell's missing eighths travel as `LandCol/Col.fluidGap` (zero-init =
 full; colCache `CCW_WP` bits 25..27) into `genCellIn`.
