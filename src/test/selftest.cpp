@@ -981,6 +981,10 @@ const char* const kOrder[] = {
     // every item in the library, and a gate that equips things perturbs the
     // id-keyed draws of anything after it, so it goes after the two that do not.
     "ragdoll-dress",
+    // ...and the held item equipped into a limp hand. Same self-contained
+    // shape (resets mobs + debris, regenerates worldgen both ways); after
+    // ragdoll-dress because it EQUIPS (the id-keyed draws note above).
+    "ragdoll-equip",
     // ---- THE WOUND MODEL ---------------------------------------------------
     // LAST of the mob gates, and the position is a lesson rather than a
     // preference.
