@@ -42,6 +42,7 @@
       "id": "dagger",
       "kind": "melee",
       "weaponClass": "short",
+      "sneakAttack": 5.0,
       "damage": 6.5,
       "carveBonus": 0.04,
       "heft": 0.224,
@@ -239,6 +240,16 @@
         "damage": 35.0
       },
       "desc": "A war arrow of spruce with a steel bodkin and goose fletching. It buries itself in whatever it strikes."
+    },
+    {
+      "//": "A QUIVER (kind quiver, docs/PLAN_poison_arrows.md, game/quiver.h). Worn on the BACK (equipment slot Back; Q or E on it in the hotbar puts it there), and the ONLY thing a bow draws from: no quiver on your back, no shot -- arrows loose in the pack are carried, not shot. It holds `quiver.capacity` of `quiver.ammo`, each arrow its OWN object (its own lattice, its own coat), so a poisoned arrow stays poisoned and a bloody one pulled out of a body stays bloody, while the quiver is still one slot. The bow draws a RANDOM arrow out of it each shot -- keep a poisoned quiver and a plain one and swap them on your back to choose. Drag arrows onto it to load it; picked-up and pulled arrows go into the worn one first. Coats on arrows in a quiver are FROZEN (the pack's rule). Open it on the item stage (double-click) to brush poison onto an arrow and copy that coat onto the rest. Drawn render-only on the rig's `back` socket, never carved (not damageable, for now). Art: scripts/gen_quiver_item.py.",
+      "id": "back_quiver",
+      "kind": "quiver",
+      "quiver": {
+        "capacity": 24,
+        "ammo": "arrow"
+      },
+      "desc": "A stitched leather quiver with a turned wooden base, slung over the right shoulder. Your bow draws from the one on your back -- whichever arrow the hand finds first."
     },
     {
       "//": "SHIELDS (kind shield, src/game/item.h ShieldSpec). Held in a hand slot like a weapon, but that hand's button RAISES it instead of swinging. WHAT IT STOPS IS ITS ART: a blade whose swept edge meets the shield's own voxels in their live pose is arrested (MobSystem::FindShieldBlock), raised or not -- so coverage is how big the shield is and where the arm holds it, and a shield hacked or burnt through has a hole a blade passes. The `shield` block is what HOLDING IT UP COSTS, in proportion to how far up it is: `raiseMs`/`lowerMs` to come up and go down; `moveScale` on the walk; `turnDegPerSec`, the most the body turns while raised (the shield faces where the body faces, so a fighter who circles you outpaces your guard); `stability`, the heaviest blow it holds against (impact = cut/2 x heft + blunt x (1 + armorBreak), times the blow's power: a full sword cut is ~9, a full mace blow ~29) -- above it the guard is beaten open and cannot come back up for `staggerMs`; `wear` x melee.blockItemDamage of each blow comes off its hp (sidecar `hp`; at 0 it breaks apart); `bluntThrough` of a blow's trauma reaches the arm behind it. And the other hand cannot start a swing while it is up (melee.shieldStrikeBelow). `clip` names the raise pose (assets/anims, authored for the right fist). Art and grips: scripts/gen_shield_items.py.",

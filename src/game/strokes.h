@@ -902,6 +902,9 @@ struct StrokeCursor {
   // EdgeSweep::victimHits): strike n does repeatHitScale^(n-1) of its hp.
   // Shared by the head and the haft sweep -- one swing, one count.
   std::vector<std::pair<uint64_t, int>> victimHits;
+  // ...and whether each of those strikes was a SNEAK ATTACK (melee.h
+  // EdgeSweep::sneakHits): decided at the first, kept for the swing.
+  std::vector<std::pair<uint64_t, float>> sneakHits;
 
   // ---- WHICH ARM, AND WHETHER IT IS THE AUTHORED ONE (dual wielding) -----
   // The hand this swing is thrown with, and whether that is the mirror of

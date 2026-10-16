@@ -1618,3 +1618,30 @@ collider resolution. That is the shipped cut depth, not a fixture fault.
 ## 2026-10-14 -- determinismHash ef7d9a06 -> 437b0cec (features stand on their own ground)
 
 Intentional worldgen change (worldgen.wgsl `featureSteepAt`, tickets 2026-10-13_23-57-48 / _23-59-16): no tree, cactus or tile plant roots on a column at or past `terrain.rockSlope`; tree ground-row columns and cactus boles fill down to the asking column's ground; tile-plant cells over ground 2+ below their base are not placed. Sim reproduces itself (twice-run equal); rebaselined with `--selftest --gate determinism --rebaseline`. far-parity / terrain / biomes / altitude / clearing pass unchanged in the same --verify boot.
+
+## 2026-10-15 -- `mob-burn` -> pass, `pool-evict` green again (gate fixtures; no hash moved)
+
+- `mob-burn` K "limbs sleep" (the last red subcheck; 48% charred / 57%
+  unburnt limb-visits asleep vs the 0.90 floor) was the FIXTURE. K's douse
+  floods the slope the body stands on; the water is still running downhill at
+  t+600, where the fixed settle (`mobBurnSleepSettleTicks`) opened the window.
+  debris.cpp re-fetches every dirty chunk round a body every 9 ticks
+  (`kTerrainRefreshTicks`), each landing re-versions the cached chunk, and the
+  burn walk's sleep key digests that version, so the limbs correctly woke to
+  re-read a world that had moved. Evidence: `SANDVOX_FETCH_TRACE` (71 of 72
+  landings of the ground chunks carried different matter) and K's new per-field
+  diff of the chunks round the body (water->air 338, air->water 152, 2400
+  fullness changes, wet stain on sandstone). Fix: the settle also waits for
+  `mobBurnSleepWorldQuietTicks` (40) ticks with no chunk round the body
+  re-versioned, capped at `mobBurnSleepSettleMaxTicks` (4000). Quiet at
+  ~t+2280; then 239/240 charred and 660/660 unburnt visits asleep. Gate time
+  35.6 s -> 51.6 s. A smaller douse box drained SLOWER (t+3133): the slope, not
+  the volume, sets the time. Key flipped `fail` -> `pass`.
+- `pool-evict` failed only `w1.killed > 0`: it leaned on the living cap (16)
+  to kill the oldest of its 20 bodies, and `kMaxMobs` went 16 -> 64
+  (2026-10-04), so nothing died and the corpse/debris holder populations its
+  claim B is about were never exercised. The gate now keeps 6 alive and 6
+  corpses itself and decays the rest to debris (`Mob::ReleaseRigToDebris`);
+  every wave asserts killed, decayed and debris-held > 0. Measured: killed 14,
+  decayed 8, 128 debris bodies holding defs, 0 held defs evicted, drains exact.
+  No eviction bug behind it.

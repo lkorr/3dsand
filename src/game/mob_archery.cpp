@@ -6,11 +6,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 #include "game/ai_behavior.h"
 #include "game/arrows.h"
 #include "game/demon_cast.h"  // MobAimCentre / MobTargetNow: the casters' aim
 #include "game/equipment.h"
+#include "game/quiver.h"
 #include "game/mob.h"
 #include "game/session.h"
 #include "game/spellhand.h"   // SpellHandWorld: where the bow fist is
@@ -283,15 +285,20 @@ bool StepDraw(TickAuthorityCtx& w, std::span<SessionTick> players, MobArcheryWor
   std::vector<uint64_t> ignore;
   m->AppendLiveLimbBodies(ignore);
   const uint32_t seed = rng::Hash3(kSaltSeed, tick, (uint32_t)d.mobId);
+  // WHICH ARROW: a random one out of its quiver (game/quiver.h), keyed like
+  // the player's on the shot's own stateless hash.
+  const uint32_t pick = rng::Hash3(kSaltSeed ^ 0x91C4E5u, tick, (uint32_t)d.mobId);
+  const ItemInstance nocked = KitPeekAmmo(m->GetKit(), ammo->name, pick);
   EndDraw(m, d);
-  if (!w.arrows.Launch(*ammo, s.from, s.dir, speed, Vec3{}, seed, std::move(ignore))) {
+  if (!w.arrows.Launch(*ammo, s.from, s.dir, speed, Vec3{}, seed, std::move(ignore),
+                       d.mobId, &nocked)) {
     ev.kind = ArcheryEvent::Kind::Abort;
     ev.why = "too many arrows in the air";
     a.stats.aborted++;
     Log(a, ev);
     return false;
   }
-  KitTakeAmmo(m->KitMut(), ammo->name);
+  KitTakeAmmo(m->KitMut(), ammo->name, pick);
   a.stats.loosed++;
   ev.kind = ArcheryEvent::Kind::Loose;
   ev.from = s.from;
@@ -389,12 +396,35 @@ int ArmArcher(MobSystem& mobs, uint64_t mobId, const ItemLibrary& items, std::st
     did = "a " + want->name + " in its right hand" +
           (side.empty() ? std::string() : ", its " + side + " as a sidearm");
   }
+  // A QUIVER ON ITS BACK (game/quiver.h): the bow draws from nothing else.
+  // The first quiver in the library that takes this bow's arrows, unless it
+  // already wears one; then arrows into it up to `quiver` (and what it holds).
+  Kit& kit = m->KitMut();
+  ItemStack& back = kit.equip.slots[(int)EquipSlotId::Back];
+  const ItemDef* qd = items.Of(back);
+  if (qd == nullptr || !qd->IsQuiver() || qd->quiver.ammo != bow->bow.ammo) {
+    qd = nullptr;
+    for (const ItemDef& d : items.items)
+      if (d.IsQuiver() && d.quiver.ammo == bow->bow.ammo) {
+        qd = &d;
+        break;
+      }
+    if (qd == nullptr) {
+      if (note) *note = "no quiver in the item library takes \"" + bow->bow.ammo + "\"";
+      return -1;
+    }
+    if (!back.Empty() && !m->AddCarried(back)) {
+      if (note) *note = "no room in its pack for what was on its back";
+      return -1;
+    }
+    back = StackOf(items, items.Find(qd->name));
+  }
   int added = 0;
   const int have = KitAmmoCount(m->GetKit(), bow->bow.ammo);
   const int idx = items.Find(bow->bow.ammo);
   if (idx >= 0 && rt->quiver > have) {
-    const ItemStack st = StackOf(items, idx, rt->quiver - have);
-    if (!st.Empty() && m->AddCarried(st)) added = rt->quiver - have;
+    ItemStack st = StackOf(items, idx, rt->quiver - have);
+    added = QuiverLoad(back, *qd, st);
   }
   if (note) {
     *note = did.empty() ? "already holds a " + bow->name : did;
@@ -435,6 +465,40 @@ bool Mob::HandSocketWorld(Hand h, Vec3& out) const {
   // hand part's frame, through the hand's live rotation.
   const Quat q{hand.xf.quat[0], hand.xf.quat[1], hand.xf.quat[2], hand.xf.quat[3]};
   out = hand.xf.pos + QuatRotate(q, sock.offset - hand.restOffset) + renderOffset_;
+  return true;
+}
+
+bool Mob::SocketWorldXf(const char* context, Vec3& pos, Quat& rot) const {
+  if (def_ == nullptr || context == nullptr) return false;
+  const int si = def_->FindSocket(context);
+  if (si < 0 && std::strcmp(context, "back") == 0) {
+    // THE BACK, DERIVED (MirrorHeldSockets' reason: thirty-odd generated
+    // characters inherit the human's sockets, and one authored by hand would
+    // be thirty edits that drift). The middle of the torso's BACK face --
+    // the rig faces +z, so its back is the box's z = 0 face -- five-ninths
+    // of the way up it, in the torso's own frame. An authored `back` socket
+    // wins. A rig with no `torso` part publishes no back.
+    const int ti = skel_.FindPart("torso");
+    if (ti < 0 || ti >= (int)limbs_.size() || !LimbAlive(ti)) return false;
+    const MobLimb& t = limbs_[(size_t)ti];
+    if (!t.body) return false;
+    const float inv = 1.0f / (float)PhysScaleOf(t);
+    const Vec3 local{(float)t.size.x * inv * 0.5f, (float)t.size.y * inv * (5.0f / 9.0f),
+                     0.0f};
+    const Quat q{t.xf.quat[0], t.xf.quat[1], t.xf.quat[2], t.xf.quat[3]};
+    pos = t.xf.pos + QuatRotate(q, local) + renderOffset_;
+    rot = QuatNormalize(q);
+    return true;
+  }
+  if (si < 0) return false;
+  const MobSocketDef& sock = def_->sockets[si];
+  if (sock.partIndex < 0 || sock.partIndex >= (int)limbs_.size()) return false;
+  if (!LimbAlive(sock.partIndex)) return false;
+  const MobLimb& part = limbs_[sock.partIndex];
+  if (!part.body) return false;
+  const Quat q{part.xf.quat[0], part.xf.quat[1], part.xf.quat[2], part.xf.quat[3]};
+  pos = part.xf.pos + QuatRotate(q, sock.offset - part.restOffset) + renderOffset_;
+  rot = QuatNormalize(QuatMul(q, sock.rotation));
   return true;
 }
 

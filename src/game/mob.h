@@ -663,6 +663,13 @@ struct MobDef {
   // every other cross-asset reference in this engine (CLAUDE.md design rule 4).
   // Empty = no AI: the creature keeps the legacy wander-and-avoid.
   std::string behavior;
+  // THIS CHARACTER'S STEALTH SKILLS, 0..100, from the sidecar's `stealth`
+  // block (`sneak`, `awareness`); < 0 = its behaviour profile's (ai_behavior.h
+  // Profile::stealth). Per character, so one `villager` profile holds a keen
+  // watchman and a dozy farmhand -- and a player's chosen body brings its own
+  // sneak (a goblin is quieter than a knight). Inherited through `extends`.
+  float stealthSneak = -1.0f;
+  float stealthAwareness = -1.0f;
   // THE POSE A CREATURE HOLDS WHILE IT IS COMING FOR YOU. A clip name (sidecar
   // or assets/anims), played by MobSystem::UpdateAnimation whenever the brain
   // has a target and is not idling, and weight-ramped down to nothing when it
@@ -2332,7 +2339,10 @@ struct InfectSpec {
 // (Mob::CaptureWorn: the shells are still on the body and still burning, so
 // it is read live every call). Taking it copies the instance whole.
 struct LootPiece : ItemInstance {
-  enum class Kind : uint8_t { Worn, Held, Carried };
+  // Back (2026-10-15): the quiver on its back (EquipSlotId::Back), with every
+  // arrow in it -- no body of its own (drawn render-only), so it is taken,
+  // never shed.
+  enum class Kind : uint8_t { Worn, Held, Carried, Back };
   Kind kind = Kind::Worn;
   int equipSlot = -1;             // worn only
   // Which ItemCover entry the identity shell is (worn only), -1 otherwise.
@@ -2869,10 +2879,14 @@ class Mob {
   // rows' impulse -> hp rule. `fromWorld` should be a little in front of the
   // matter (the flight's last position, or the collider hit backed off): only
   // matter at or past it is in the channel. False when the handle is not one of
-  // this creature's slots; `out` says what happened otherwise.
+  // this creature's slots; `out` says what happened otherwise. `woundOut`
+  // (optional) takes the cells the channel removed, in the slot's
+  // authoritative lattice -- the walls a coated point drags its coat across
+  // (MobSystem::CoatOnContact, CoatHitKind::Pierce).
   bool PierceLimb(uint64_t bodyHandle, Vec3 fromWorld, Vec3 dirWorld,
                   const Penetrator& pen, World& world,
-                  std::vector<ParticleSpawn>& spawns, PierceResult& out);
+                  std::vector<ParticleSpawn>& spawns, PierceResult& out,
+                  std::vector<IVec3>* woundOut = nullptr);
 
   // ---- WHAT DID IT: THE CAUSE IS AN ARGUMENT (W2-G, 2026-09-24) -------------
   //
@@ -3267,8 +3281,18 @@ class Mob {
   // `dirWorld` the way it was going; the art's point (ItemDef::ArrowSpec::tip)
   // is put there along that axis. Returns the slot, or -1 (no such limb, the
   // creature is at kMaxEmbeddedArrows, no art, physics refused).
+  //
+  // `inst` (optional, 2026-10-15): the arrow as an object -- its recorded
+  // lattice's COATS go onto the slot (ApplyLimbCoats), so a poisoned or bloody
+  // arrow stays so while it stands in the wound and comes back out so
+  // (PullArrowLattice).
   int EmbedArrow(const ItemDef& item, int hostLimb, Vec3 tipWorld,
-                 Vec3 dirWorld);
+                 Vec3 dirWorld, const ItemInstance* inst = nullptr);
+  // The arrow slot's lattice as its item records it (CaptureHeld's rule: only
+  // what differs from the authored arrow -- a clean whole one is nothing), for
+  // the instance that leaves the body when it is pulled. False for a slot that
+  // is not an arrow.
+  bool PullArrowLattice(int slot, WornDamage& out) const;
   bool IsArrowSlot(int slot) const {
     return slot >= baseLimbs_ && slot < (int)limbDefs_.size() &&
            limbDefs_[slot].tag == "arrow";
@@ -3352,6 +3376,11 @@ class Mob {
   // Where an item in this hand is held, world, as drawn: the hand's socket
   // point (the hilt centre's anchor), off the hand part's live transform.
   bool HandSocketWorld(Hand h, Vec3& out) const;
+  // ...ANY socket by its context ("back": where a quiver rides,
+  // game/quiver.h PresentQuiver): its point and its frame (the part's live
+  // rotation x the socket's own), world, as drawn. False when the rig
+  // publishes no such socket or its part is gone.
+  bool SocketWorldXf(const char* context, Vec3& pos, Quat& rot) const;
   // A running instance of `name` that is not blending out.
   bool ClipPlaying(const std::string& name) const;
   // A rig part's body corner as drawn (xf + the render offset), by name.
@@ -4715,7 +4744,13 @@ class Mob {
   void PushFootfall(const Footfall& ff) {
     if (footfalls_.size() >= kMaxFootfalls) footfalls_.erase(footfalls_.begin());
     footfalls_.push_back(ff);
+    // ...and what a LISTENER makes of it (stealth): the surface underfoot,
+    // and a landing's thump. Tick-side state, like the plant that set it.
+    if (ff.mat != 0) lastFootMat_ = ff.mat;
+    if (ff.landing) landNoise_ = std::max(landNoise_, ff.fallSpeed);
   }
+  // The AI is sneaking this body (Intent::Stalk).
+  bool AiCrouch() const { return aiCrouch_; }
 
   // Release a body's burn index and front (lattice compacted / rig torn down).
   static void DropBurnIndex(BodyBurnState& st);
@@ -5948,6 +5983,22 @@ class Mob {
   // The behaviour layer's per-creature memory (game/ai_behavior.h). Pure
   // gameplay state: never hashed, never saved, rebuilt from the def on spawn.
   ai::Brain ai_;
+  // ---- STEALTH (game/mob_stealth.cpp) ------------------------------------
+  // `aiCrouch_`: the AI is sneaking this body (IntentOut::crouch, a stalk):
+  // the pose crouches (PoseInputs::crouch) and it publishes Stance::Crouch.
+  // The LIGHT on it and its WORN METAL are measured on a cadence, not every
+  // tick (both change slowly; MobSystem::PublishStealth). `lastFootMat_` is
+  // what the last footfall planted on, `landNoise_` a landing's fall speed
+  // not yet turned into a noise event -- both set at the plant, in the tick.
+  bool aiCrouch_ = false;
+  float stealthLight_ = 1.0f;
+  uint32_t stealthLightAt_ = 0;
+  bool stealthLightValid_ = false;
+  float wornMetal_ = 0.0f;
+  uint32_t wornMetalAt_ = 0;
+  bool wornMetalValid_ = false;
+  uint32_t lastFootMat_ = 0;
+  float landNoise_ = 0.0f;
   // ---- ownership (M9.4-B) --------------------------------------------------
   // The playerId that STEPS this creature. Default 0 = session 0 = the only
   // player a single-player process has, so nothing below ever fires until
@@ -6861,6 +6912,16 @@ class MobSystem {
     // watcher sees (reach, hp, facing, the point) is read off the avatar in
     // PreTick. 0 = None, which is also what a remote ghost publishes.
     uint8_t action = 0;
+    // ---- HOW HIDDEN THE PLAYER IS (stealth; game/stealth.h) ---------------
+    // What only the session's controller knows: the stance, the walk it is
+    // making as a fraction of its own walk speed, and how deep in liquid the
+    // legs are. MobSystem::PublishStealth adds the light, the noise and the
+    // skill. `stealth` false -- a fly-mode camera, a gate's fixture, a remote
+    // ghost -- is perceived the legacy way (stealth::Exposure::modelled).
+    bool stealth = false;
+    uint8_t stance = 0;       // stealth::Stance
+    float moveFrac = 0.0f;
+    float wading = 0.0f;
   };
   void SetPlayerActors(std::span<const PlayerActorDesc> players);
   void ClearPlayerActors() { playerActors_.clear(); }
@@ -7147,6 +7208,125 @@ class MobSystem {
   const std::vector<StrikeEvent>& StrikeEvents() const { return strikes_; }
   void ClearStrikeEvents() { strikes_.clear(); }
 
+  // ==== STEALTH (game/stealth.h; game/mob_stealth.cpp) =====================
+  //
+  // NOISE EVENTS. Posted at any phase of a tick (a blow, a cry, a landing,
+  // an arrow striking stone) and HEARD on the next one: PreTick swaps the
+  // double buffer before any brain thinks, so what a creature hears never
+  // depends on which phase of the tick made the noise -- and a replay of the
+  // same ticks hears the same things. Bounded (rule 2): past kMaxNoises in a
+  // tick the quietest is refused, and the refusal is counted.
+  static constexpr size_t kMaxNoises = 256;
+  void PostNoise(const stealth::Noise& n);
+  const std::vector<stealth::Noise>& HeardNoises() const { return noiseNow_; }
+  uint64_t NoisesRefused() const { return noiseRefused_; }
+  // THE LIGHT ON A BODY, 0..1: how lit the renderer draws it, as a share of
+  // stealth.lightFull. The renderer's body lighting (microbody.wgsl:
+  // litColorSNoFog + glowLight) evaluated on the CPU for a white body at
+  // three heights (head, chest, knees -- by stance): the tick's key light
+  // (SetSkyLight) through a SHADOW RAY toward it, the sky ambient through the
+  // FIVE OPENNESS RAYS over the ground under the body, and the glow field's
+  // emitters, each chunk of them only if a LINE reaches one of its glowing
+  // cells -- then the renderer's tonemap. Rays read the CPU's own stores:
+  // the snapshot mirror, then the fetch cache, then the analytic ground; it
+  // asks NO fetches. Deterministic: a function of the tick, never a render
+  // target or a camera. 1 (fully lit) while no sky is set (since Reset).
+  // `probe`, when given, gets every term (the reporter's attribution: a gate
+  // that fails on a light value says WHICH term made it).
+  struct LightProbe {
+    float openRaw = -1.0f;   // sky openness of the ground (-1 = no ground)
+    float shadow[3] = {};    // the key's shadow factor per height
+    float glow = 0.0f;       // glow-field luminance that reached the body
+    int glowChunks = 0;      // emitter chunks in reach / with a line to them
+    int glowSeen = 0;
+    float screen = 0.0f;     // mean on-screen brightness, before lightFull
+  };
+  float LightAt(World& world, const Vec3& centre, float heightVox,
+                stealth::Stance stance = stealth::Stance::Stand,
+                LightProbe* probe = nullptr);
+  // The tick's frame light (test/support.cpp FrameLightForTick), set by the
+  // session beside the day phase.
+  void SetSkyLight(const stealth::SkyLight& s) { skyLight_ = s; }
+  const stealth::SkyLight& SkyLightNow() const { return skyLight_; }
+  // ---- NPC FOOTSTEPS, FOR THE EARS (presentation) -------------------------
+  // Every NPC footfall and landing of the tick, with how loud the stealth
+  // model says it is against a plain walk at the same speed (crouch, crawl,
+  // sneak skill, worn metal): what the player HEARS is what a watcher hears.
+  // Filled in PreTick right after each creature's pose step; drained once a
+  // frame by the frame loop into the audio cues, and cleared there whether
+  // or not audio ran. Capped (rule 2): past kMaxNpcSteps a tick's steps are
+  // dropped, and the drop is counted.
+  struct NpcStep {
+    Vec3 posVox{};
+    uint32_t mat = 0;
+    float speed = 0.0f;      // vox/s at the plant
+    int foot = 0;
+    bool landing = false;
+    float fallSpeed = 0.0f;  // vox/s down, a landing
+    float gain = 1.0f;       // x the plain walk's loudness
+  };
+  static constexpr size_t kMaxNpcSteps = 192;
+  const std::vector<NpcStep>& NpcSteps() const { return npcSteps_; }
+  void ClearNpcSteps() { npcSteps_.clear(); }
+  uint64_t NpcStepsDropped() const { return npcStepsDropped_; }
+  // The id `m` has in the actor list: its mob id, or a player's band id for
+  // an avatar (ai::kPlayerActorBase + i). 0 = not an actor.
+  uint64_t ActorIdOf(const Mob& m) const;
+  // SNEAK ATTACK: the multiplier a blow (or an arrow) from `attackerActorId`
+  // lands with on `victim` -- stealth.sneakMelee / sneakRanged (or the
+  // weapon's own `itemMul` when > 0) when the victim has NOT DETECTED the
+  // attacker (ai::Detects) and the attacker is crouched or prone (when
+  // stealth.sneakNeedsCrouch); else 1. A player's body is never "caught
+  // unaware" (it has no meter); neither is a creature with no stealth senses.
+  float SneakAttackMul(const Mob& victim, uint64_t attackerActorId, bool ranged,
+                       float itemMul = 0.0f) const;
+  // A BLOW LANDED on `victim` from `attackerActorId` (at `attackerPos`): its
+  // brain knows at once (melee) or searches toward the shot (an arrow from a
+  // body it had not detected) -- ai::NoteAttacked.
+  void NoteAttacked(Mob& victim, uint64_t attackerActorId, Vec3 attackerPos,
+                    bool ranged, uint32_t tick);
+  // WHAT THE WORLD THINKS OF ONE ACTOR (the HUD's eye): the highest meter any
+  // creature holds for it and the worst alert among those that hold one,
+  // plus the few strongest watchers for the direction pips.
+  struct StealthWatcher {
+    Vec3 pos{};
+    float level = 0.0f;
+    stealth::Alert alert = stealth::Alert::Calm;
+  };
+  struct StealthReport {
+    float maxLevel = 0.0f;
+    stealth::Alert alert = stealth::Alert::Calm;
+    int watchers = 0;          // creatures with a meter for it over cautionAt
+    int fighting = 0;          // ...that hold it as their target
+    static constexpr int kTop = 4;
+    StealthWatcher top[kTop];
+    int topN = 0;
+  };
+  StealthReport StealthOf(uint64_t actorId) const;
+  // The exposure the players were published with this tick (the HUD's light
+  // and noise meters), by player index; a default (unmodelled) one past it.
+  const stealth::Exposure& PlayerExposure(size_t i) const;
+  const stealth::Params& StealthParams() const { return stealthP_; }
+  float AmbientNoise() const { return ambient_; }
+  // SNEAK ATTACKS THAT LANDED (presentation: the HUD's "SNEAK ATTACK x3").
+  // Frame-drained like the strike events; capped.
+  struct SneakEvent {
+    uint64_t attacker = 0;    // actor id
+    uint64_t victim = 0;      // mob id
+    float mul = 1.0f;
+    Vec3 at{};
+    uint32_t tick = 0;
+    bool ranged = false;
+  };
+  void PushSneakEvent(const SneakEvent& e) {
+    if (sneaks_.size() < 64) sneaks_.push_back(e);
+  }
+  const std::vector<SneakEvent>& SneakEvents() const { return sneaks_; }
+  void ClearSneakEvents() { sneaks_.clear(); }
+  // The tick PreTick last ran (what a hit resolved outside it is stamped
+  // with; the same clock Mob::Die books a rising against).
+  uint32_t TickNow() const { return tick_; }
+
   // ==== MELEE ACROSS THE WIRE (game/meleehit.h, 2026-10-08) =================
   //
   // OUT: MeleeSweepDamage queues a record for every blow it lands on a body
@@ -7196,7 +7376,8 @@ class MobSystem {
   // PierceAlongRay, which uses this.
   bool PierceLimb(uint64_t bodyHandle, Vec3 fromWorld, Vec3 dirWorld,
                   const Penetrator& pen, World& world,
-                  std::vector<ParticleSpawn>& spawns, PierceResult& out);
+                  std::vector<ParticleSpawn>& spawns, PierceResult& out,
+                  std::vector<IVec3>* woundOut = nullptr);
   // ---- A MATERIAL, BY NAME, AT RUNTIME ------------------------------------
   //
   // Tuning cannot hold a material id: tuning.json is hot-reloaded on F5 and
@@ -7625,7 +7806,9 @@ class MobSystem {
   // and bite resolvers, for every creature-on-creature contact; no material is
   // special-cased -- what a transferred coat DOES afterwards is whatever that
   // material does as a body coat. See phys/coatcontact.h for the lattice half.
-  enum class CoatHitKind : uint8_t { Cut, Blunt, Bite };
+  // Pierce (2026-10-15): an arrow's point -- the coat goes on the CHANNEL's
+  // walls, as a cut's goes on its kerf's.
+  enum class CoatHitKind : uint8_t { Cut, Blunt, Bite, Pierce };
   struct CoatContact {
     uint64_t strikerId = 0;
     bool haft = false;         // the sweep was the held item's haft segment
@@ -7649,6 +7832,17 @@ class MobSystem {
     // same writers, on whatever lattice the matter has.
     uint64_t strikerBody = 0;
     uint64_t targetBody = 0;
+    // A BARE LATTICE AS THE STRIKER (2026-10-15, docs/PLAN_poison_arrows.md):
+    // an arrow in flight is neither a rig slot nor a body -- it is its
+    // ItemInstance's own lattice (game/itemcoat.h), and THAT is what wears its
+    // poison and takes the wound's blood. Replaces strikerId / strikerBody;
+    // `strikerScale` is its cells per world voxel, `strikerCell` the contact
+    // (the point) in those cells. No brick: nothing draws an arrow in flight's
+    // coat, and the lattice goes wherever the arrow ends up (an embed, the
+    // ground), which draws it from there.
+    std::vector<PrefabVoxel>* strikerLattice = nullptr;
+    float strikerScale = 1.0f;
+    Vec3 strikerCell{};
   };
   struct CoatContactResult {
     int strikerSlot = -1;      // which of the striker's slots touched
@@ -7803,7 +7997,12 @@ class MobSystem {
   // (Mob::RefId, "" for none), so an authored villager keeps its identity
   // through a save, a load, a park and an unpark. v10 and older load with no
   // ref -- which is what they were.
-  static constexpr uint32_t kSaveVersion = 11;
+  //
+  // 12 (2026-10-15, docs/PLAN_poison_arrows.md): A QUIVER'S ARROWS. Every
+  // ItemInstance ends with its held list (iteminstance.h kItemFmtQuiver), and
+  // the gear list carries the quiver on the creature's back
+  // (EquipSlotId::Back, Mob::CaptureGear). A v11 archer loads with no quiver.
+  static constexpr uint32_t kSaveVersion = 12;
   static constexpr uint32_t kSaveVersionMin = 3;
   // Record limb kinds (v4).
   static constexpr uint32_t kLimbSevered = 0;
@@ -9879,6 +10078,58 @@ class MobSystem {
   std::vector<uint32_t> ignitedForm_;
   uint32_t dayPhase_ = 0;
   uint32_t weatherRain_ = 0;
+  // ---- STEALTH (game/mob_stealth.cpp) ------------------------------------
+  // The noise double buffer (PostNoise / PreTick), this tick's coefficients
+  // (stealth::FromTuning, refreshed at the top of PreTick) and ambient floor,
+  // the sneak events for the HUD, and the players' published exposure.
+  std::vector<stealth::Noise> noiseNow_, noiseNext_;
+  uint64_t noiseRefused_ = 0;
+  std::vector<SneakEvent> sneaks_;
+  stealth::Params stealthP_ = stealth::Defaults();
+  float ambient_ = 0.0f;
+  std::vector<stealth::Exposure> playerExposure_;
+  std::vector<PlayerActorDesc> playerDescs_;
+  // Per material: a footstep's loudness on it (from its footstep sound set
+  // and its class), whether it is METAL (worn, it clanks), the luminance of
+  // the radiance an emitting cell of it leaves (sim_glow.wgsl glowBlockSum's
+  // expression: palette colour, burnTint, emission, render.emissiveStrength),
+  // and what it is to a light ray (common.wgsl isRayBlocker: 0 lets light
+  // through, 1 stops it, 2 = a powder, which stops it only above
+  // kPowderBlockMin eighths).
+  std::vector<float> matStepNoise_;
+  std::vector<uint8_t> matMetal_;
+  std::vector<float> matGlowLum_;
+  std::vector<uint8_t> matLightBlock_;
+  // The tick's frame light (SetSkyLight).
+  stealth::SkyLight skyLight_;
+  std::vector<NpcStep> npcSteps_;
+  uint64_t npcStepsDropped_ = 0;
+  // A creature's footfalls of this tick into npcSteps_ (PreTick, after its
+  // pose step), with their stealth loudness.
+  void QueueNpcSteps(Mob& m);
+  // GLOWING MATTER PER CHUNK, by the words' source and version (the snapshot
+  // mirror's tick, or the cached chunk's): the glow field's SOURCE for that
+  // chunk (sim_glow.wgsl glowStoreSrc: the mean radiance of its emitting
+  // cells times the saturating fill, as luminance) and up to eight of its
+  // glowing cells, one per octant and an EXPOSED one where there is one (a
+  // face on something light passes), for the line of sight a body needs to
+  // one of them before the chunk lights it. Rebuilt only when the version
+  // moves; dropped wholesale past 4096 chunks.
+  struct EmitterSum {
+    bool fromMirror = false;
+    uint32_t version = 0;
+    float lum = 0.0f;
+    IVec3 samples[8]{};
+    int nSamples = 0;
+  };
+  std::unordered_map<uint64_t, EmitterSum> emitters_;
+  void BuildStealthTables(const std::vector<MaterialDef>& mats);
+  // Fill `a.stealth` for a creature (or an avatar, from its desc).
+  void PublishStealth(World& world, Mob& m, ai::Actor& a, uint32_t tick,
+                      const PlayerActorDesc* desc);
+  // The share of a body's worn shells that is metal, 0..1.
+  float WornMetalOf(const Mob& m) const;
+  const EmitterSum* EmitterOf(World& world, IVec3 chunk);
   int32_t rainSlopeQx_ = 0, rainSlopeQz_ = 0;
   // EVERY LIVE BODY POINTS INTO THIS VECTOR (Mob::def_, and the avatar's too,
   // which this system cannot reach). So it is never allowed to reallocate

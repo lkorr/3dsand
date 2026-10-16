@@ -171,7 +171,18 @@ Scene Stage(Ctx& c, uint32_t clock, float gap, int arrows) {
     Kit& kit = m->KitMut();
     while (KitTakeAmmo(kit, bow->bow.ammo)) {
     }
-    if (arrows > 0) m->AddCarried(StackOf(c.items, c.items.Find(bow->bow.ammo), arrows));
+    // ...into the QUIVER ArmArcher put on its back (game/quiver.h): the bow
+    // draws from nothing else.
+    const ItemDef* qd = nullptr;
+    ItemStack* q = KitWornQuiver(kit, c.items, &qd);
+    if (q == nullptr) {
+      s.err = "the archer wears no quiver after ArmArcher";
+      return s;
+    }
+    if (arrows > 0) {
+      ItemStack st = StackOf(c.items, c.items.Find(bow->bow.ammo), arrows);
+      QuiverLoad(*q, *qd, st);
+    }
   }
   return s;
 }

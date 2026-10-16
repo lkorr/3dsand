@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "game/ai_nav.h"
+#include "game/stealth.h"
 #include "math3d.h"
 
 // ============================================================================
@@ -172,6 +173,25 @@ enum class Intent : uint8_t {
   // layer only decides when, and holds the facing while the string is back
   // (SelfView::drawing).
   Shoot,
+  // ---- STEALTH (2026-10-15, game/stealth.h; the profile's `stealth` block) --
+  // The three verbs of a creature that is NOT YET fighting. They score only
+  // for a profile whose `stealth` block is enabled, so every other profile is
+  // arbitrated exactly as before.
+  // INVESTIGATE: something half seen or heard (Brain::stim, below detection).
+  //   Under `investigateAt` it turns to look; at or over it, it walks there
+  //   at `investigateSpeed` and looks round. An ally's alarm and a noise it
+  //   cannot put a body to (an arrow striking stone) are things to go and
+  //   look at too -- which is what makes a distraction a distraction.
+  // SEARCH: the target was LOST (out of sight for alertDecayTicks). Walk to
+  //   where it was last known -- and a little on along its heading -- then
+  //   sweep round it for `searchTicks`, its meter for the lost body held high.
+  // STALK: hunting a target that has not turned to face it: approach
+  //   crouched at `stalkSpeed`, quietly, from behind -- the NPC side of the
+  //   sneak. Its blow lands as a sneak attack on a creature that has not
+  //   detected it.
+  Investigate,
+  Search,
+  Stalk,
   Count,
 };
 // The activity verb for a schedule row's `do` ("sleep" -> Intent::Sleep), or
@@ -850,6 +870,11 @@ enum class Fact : uint8_t {
   Cornered,         // 0/1: the step straight back is refused (the ground fan's
                     // rear probe is blocked) -- an archer that cannot give
                     // ground fights where it stands
+  // ---- (2026-10-15, stealth) -------------------------------------------------
+  Awareness,        // 0..1: the highest meter this creature holds for anybody
+                    // (1 = it has detected someone); 0 with stealth off
+  Alert,            // stealth::Alert: 0 calm, 1 suspicious, 2 searching,
+                    // 3 fighting
   Count,
 };
 const char* FactName(Fact f);
@@ -897,6 +922,9 @@ struct Profile {
   CastTuning cast;   // D4: magic (empty = never casts)
   OrbitTuning orbit; // the circling hunter (radius 0 = never orbits)
   RangedTuning ranged; // the archer (maxRange 0 = never shoots)
+  // THE STEALTH SENSES (game/stealth.h Senses). `enabled` false -- every
+  // profile that does not author the block -- perceives the legacy way.
+  stealth::Senses stealth;
   IntentTuning intents[(int)Intent::Count];
   // Flat score bonus the current intent keeps. See the arbiter note above.
   float hysteresis = 0.22f;
@@ -1024,6 +1052,11 @@ struct Actor {
   // Its velocity, world voxels/sec, when the publisher knows it (0 = unknown;
   // the brain's own low-passed estimate is used instead).
   Vec3 velocity{};
+  // ---- HOW HIDDEN IT IS (2026-10-15; game/stealth.h Exposure) ------------
+  // `stealth.modelled` false -- a gate's hand-built actor, a corpse, a body
+  // whose publisher knows nothing of stealth -- is perceived the legacy way
+  // even by a creature with stealth senses.
+  stealth::Exposure stealth;
 };
 
 // Everything Think() may read about the outside world.
@@ -1041,6 +1074,13 @@ struct WorldView {
   bool (*aimPart)(void* ctx, uint64_t selfId, uint64_t id, Vec3 from,
                   uint32_t tick, Vec3& out) = nullptr;
   void* aimCtx = nullptr;
+  // ---- STEALTH (game/stealth.h) ---------------------------------------------
+  // This tick's noise EVENTS (MobSystem::PostNoise: posted last tick, heard
+  // this one), the global coefficients (null = stealth::Defaults()), and the
+  // ambient noise floor (stealth::Ambient: rain).
+  const std::vector<stealth::Noise>* noises = nullptr;
+  const stealth::Params* stealthParams = nullptr;
+  float ambient = 0.0f;
 };
 
 // The mob, as the AI sees itself. A view rather than a Mob& so this file has no
@@ -1173,6 +1213,10 @@ struct SelfView {
   int ammo = 0;
   bool drawing = false;
   bool cornered = false;
+  // ---- STEALTH SKILLS PER CHARACTER (a sidecar's `stealth` block) --------
+  // < 0 = the profile's own (Senses::awareness / sneak). One villager
+  // profile, a keen watchman and a dozy farmhand.
+  float awareness = -1.0f;
   Vec3 Centre() const {
     return Vec3{origin.x + size.x * 0.5f, origin.y + size.y * 0.5f,
                 origin.z + size.z * 0.5f};
@@ -1465,6 +1509,49 @@ struct Brain {
   float fig8Phase = 0.0f;
   float fig8End = 0.0f;
 
+  // ---- STEALTH (game/stealth.h; a profile with an enabled `stealth` block) --
+  //
+  // `aware`: the meter per tracked body. A fixed handful, because a creature
+  // that is tracking more than four strangers at once is in a fight and the
+  // fight's verbs have taken over; a fifth body that wants a slot takes the
+  // weakest one's. Ordered by nothing -- every read is a scan by id.
+  static constexpr int kAware = 4;
+  stealth::Awareness aware[kAware];
+  // What an un-targeted creature is looking at / walking to (Investigate),
+  // or the place it lost its target (Search; kind Lost).
+  stealth::Stimulus stim;
+  stealth::Alert alert = stealth::Alert::Calm;
+  float awareMax = 0.0f;          // the highest meter this tick (Fact::Awareness)
+  // THE SEARCH (Intent::Search): it runs while tick < searchUntil, for the
+  // body `searchFor`, from `searchOrigin` (where it was lost, led a little
+  // along its heading). `searchLeg` numbers the legs (the RNG's key) and
+  // `searchGoal` is the current one; the creature looks round on arrival
+  // until `searchLookUntil`.
+  uint32_t searchUntil = 0;
+  uint64_t searchFor = 0;
+  Vec3 searchOrigin{};
+  Vec3 searchGoal{};
+  uint32_t searchLeg = 0;
+  uint32_t searchLookUntil = 0;
+  float searchLookBase = 0.0f;
+  uint32_t searchLegSince = 0;    // the tick this leg began (stuck guard)
+  // INVESTIGATING: the tick it arrived at the stimulus (0 = still walking),
+  // and the heading it looks round from.
+  uint32_t investigateArrived = 0;
+  float investigateLookBase = 0.0f;
+  // ALERTED after a search ended: gains x alertedGainMul until this tick.
+  uint32_t alertedUntil = 0;
+  // A target newly acquired THIS tick (the alarm fires once, on the edge).
+  bool hadTarget = false;
+  // Sneaking up on its target (Intent::Stalk, held through the blow).
+  bool stalking = false;
+  // Diagnostics the gates assert on (rule 6: a count with its cause).
+  uint32_t detections = 0;        // bodies whose meter reached 1
+  uint32_t investigations = 0;    // stimuli that sent it walking
+  uint32_t searches = 0;          // targets lost and searched for
+  uint32_t standDowns = 0;        // searches that ended with nothing found
+  uint32_t alarms = 0;            // alarms cried
+
   void Reset() {
     *this = Brain{profile};
   }
@@ -1525,6 +1612,13 @@ struct IntentOut {
   // ---- a bow (RangedTuning) ----
   bool shoot = false;
   ShootRequest shootRequest;
+  // ---- stealth ----
+  // `crouch`: the body sneaks (Intent::Stalk) -- the drive and the pose's
+  // crouch read it (Mob::aiCrouch_). `alarm`: it cries out, a noise event
+  // `stealth.alarm` voxels loud pointing at `alarmPoint` (MobSystem posts it).
+  bool crouch = false;
+  bool alarm = false;
+  Vec3 alarmPoint{};
 };
 
 // One tick of AI for one creature. Returns false when the mob has no profile,
@@ -1536,6 +1630,22 @@ struct IntentOut {
 bool Think(Brain& brain, const Library& lib, const SelfView& self,
            const GroundView& ground, const WorldView& view, uint32_t tick,
            float dt, IntentOut& out);
+
+// ---- STEALTH: what the outside world may ask of a brain --------------------
+//
+// How far this creature's meter for `actorId` has got, 0..1 (0 = not tracked).
+float AwarenessOf(const Brain& b, uint64_t actorId);
+// Has it DETECTED that body -- the meter at 1, or the body its target and in
+// sight this tick? The sneak-attack test (MobSystem::SneakAttackMul) is the
+// negation, so a creature with no stealth senses (which never fills a meter)
+// is asked only the second half. A legacy creature is never "unaware".
+bool Detects(const Brain& b, const Library& lib, uint64_t actorId);
+// A blow from `attacker` has landed on this creature. Melee: it knows at once
+// (meter to 1, at `where`). An arrow from a body it has not detected: it does
+// NOT see the archer -- it SEARCHES toward `where` (the shooter's position,
+// already blurred by the caller), the meter held at stealth.searchHold.
+void NoteAttacked(Brain& b, const Library& lib, uint64_t attacker, Vec3 where,
+                  bool ranged, uint32_t tick, const stealth::Params& p);
 
 // ---- WHICH PIECE OF THE DEAD: the carrion terms of a score ------------------
 // Perception::meatPull / crowdPush / whim, as voxels to ADD to a candidate's

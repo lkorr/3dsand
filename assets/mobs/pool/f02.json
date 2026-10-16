@@ -410,7 +410,8 @@
         "knuckles": 0.5,
         "nails": 1,
         "toes": 0.6,
-        "softEdge": 1
+        "softEdge": 1,
+        "pattern": 669
       }
     },
     "shape": {
@@ -481,6 +482,7 @@
       "beardLen": 0,
       "beardPoint": 0,
       "beardFork": false,
+      "beardVolume": 0,
       "eyeOpen": 0.4,
       "eyeTilt": 0,
       "lashes": 0.5,
@@ -520,6 +522,9 @@
       "tail": 0,
       "braid": false,
       "twin": false,
+      "tailCurve": 0,
+      "tailHeight": 0,
+      "tailThick": 1,
       "wisp": 0.2,
       "ragged": 0,
       "bangs": 1,

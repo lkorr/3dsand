@@ -9162,8 +9162,8 @@ Known limits: no angle-of-incidence glance (a grazing shot pays the same first b
 
 The first weapon that is not swung. Three items of data and two halves of code.
 
-- **Items.** `bow` is kind `melee` (it rides a hand slot, a sheath, the hotbar like any weapon) with `weaponClass: "bow"` and a `bow` block: `drawSpeedMps` (50, a real longbow's; 65 until 2026-10-13), `drawTimeMs` (800), `minDraw` (0.15), `ammo` (`arrow`). The weapon class takes it OUT of the stroke system: `ResolveHands` marks the hand `HandNow::bow`, never `weapon`, so the button is never a swing. `arrow` is the new kind `ammo` (carried, never held or worn) with an `arrow` block: `massKg` 0.03, `tipRadius` 1 fine cell, `sharpness` 0.8 (1 until 2026-10-13: see "It stays in what it hits" below), and a FLAT `damage` 35 hp (`Penetrator::hp`), charged by `Mob::PierceLimb` only when the channel got IN (embedded or through), never on a glance -- a weapon stat, as a sword's `damage` is its cut. The head's hardness is the art's: the loader takes the arrow's POINT from the foremost cell of its `.vox` along +x and that cell's material as `Penetrator::material` (steel, hardness 200), so re-authoring the head re-derives both. `startCount` (30) is how many the stub starting kit hands out as one stack (in the pack). Art: `scripts/gen_bow_items.py` (a braced yew longbow with a leather grip; a spruce arrow with goose fletching and a bodkin). The loader refuses a bow with no usable block and a bow whose `ammo` is not an ammo item.
-- **The bow is the player's** (session.cpp PhaseG's bow block, beside the throw it copies): with a bow in a hand and an arrow in the kit, that hand's button HELD draws (the `bow_draw` clip, an override on both arms with `pitchFollow`; crouched, `bow_draw_crouch`, the bow laid flat -- swapped mid-draw if the stance changes, `PlayerSession::bowClip`, the new clip's playhead put where the old one's was, `Mob::PlayClipAt`), LET GO looses. THE DRAW HAS A WINDUP (owner, 2026-10-14): for the bow's `windupMs` (450) the bow comes up from low and canted at the chest and the string is drawn most of the way back, and nothing can be loosed -- let go in it and the arrow stays on the string; then over `drawTimeMs` (800) the last ~15 cm are PULLED slowly to the anchor, which is the charge. The clips are ONE-SHOTS THAT HOLD (`AnimClip::holdEnd`: a non-looping clip that stays on its last key at full weight until stopped) keyed on that same timeline -- LIFT at 0, SET at the end of the windup, the pull keyed at the eased draw fraction -- so the string is where the loosed speed says it is; the generator reads the timing out of items.json. THE DRAWN BOW IS SEEN (2026-10-14): `PresentDrawnBow` (game/arrows.h), once a frame per creature before the body registry builds its list, shows a bow whose draw clip is in as its string-less art (`ItemDef::BowStringArt::unstrungModel`, swapped in through `Mob::SetHeldRenderModel`, never over a carved brick), the string as two one-cell rods from the tips to the string hand's socket (pre-packed lengths, `rods`), and the ARROW NOCKED on it: nock at the fingers, laid through the arrow rest two cells off the grip on the head's side of the bow -- all render-only bodies, never hashed; the bow's body and lattice keep their string. The sidecar's `string` block (two scene cells) is the only authored fact; the string's cells are FOUND on that segment at load, so a wrong frame is an error, not a silent miss. In first person the string is cut 2.5 voxels short of the lens. The draw is AIMED: the clips are solved so the shaft from the nock through the rest crosses the look at 30 m within a cell (`aimed_grip`, the bow arm angled in, the anchor under the chin -- under the right of the jaw crouched, where the flat bow's arm otherwise covers the reticle), and the flight leaves from where the nocked arrow's point was (`kAhead` 6.75 under the eye), so the arrow the player watched is the one that flies. The arrow art is 0.65 m (was 0.60): the 46-cell draw had its point inside the bow hand. Both draws are SOLVED from target points by `scripts/gen_archery_clips.py` (never hand-edit their quaternions): the upper body turned ~60 degrees side-on at the waist (the head turned back, so the eye does not move), the bow arm straight out a hand right of the eye line, the string hand under the jaw with its ELBOW BEHIND THE SHOULDER -- the first draw folded the string arm in front of the face, and first person (the eye rides the head) looked through its forearm. `pitchFollow` turns a part about its PARENT's X (the body's left-right axis, so a twisted torso still lifts the bow rather than rolling it), and the head hands back what its ancestors' follow carried (it was getting 1.6x the look). In first person the string forearm and hand are hidden from 0.75 of the draw on (out at the string in front of the face before that, the windup and pull are the thing to see): a fast flick down outruns the eased pitch the draw follows. Speed = `BowArrowSpeed` = eased draw fraction (`1 - (1 - t)^2`, t = (ticks - windup ticks) / draw ticks, 0 through the windup) x `drawSpeed`; under `minDraw` the release is a fumble and nothing leaves the kit. One arrow leaves the kit per shot (`KitTakeAmmo`, hotbar then pack). Everything is read off the tick's command -- TickInput's held mask, the camera the tick turned from the look delta (the spell aim's `cam.Forward()`) --; the flight leaves the ARROW REST (in the camera's frame, at arm's length a hand right of and under the eye line, where the drawn bow holds it; the crouched draw's flat bow lower and nearer the middle) aimed at the point the look reaches 30 m out, and from the eye only point-blank (a wall or a body inside that arm's length). Launched from the eye, it flew end-on away from the camera and nobody saw it fly (2026-10-13) -- so a replay or a peer draws the same bow the same way; there is no new TickInput field. The HUD draws a pixel bow under the crosshair whose string comes back with the draw, a draw bar with the `minDraw` notch, and the arrows left (`UIState::bowDraw / bowMinDraw / arrowsLeft`).
+- **Items.** `bow` is kind `melee` (it rides a hand slot, a sheath, the hotbar like any weapon) with `weaponClass: "bow"` and a `bow` block: `drawSpeedMps` (50, a real longbow's; 65 until 2026-10-13), `drawTimeMs` (800), `minDraw` (0.15), `ammo` (`arrow`). The weapon class takes it OUT of the stroke system: `ResolveHands` marks the hand `HandNow::bow`, never `weapon`, so the button is never a swing. `arrow` is the new kind `ammo` (carried, never held or worn) with an `arrow` block: `massKg` 0.03, `tipRadius` 1 fine cell, `sharpness` 0.8 (1 until 2026-10-13: see "It stays in what it hits" below), and a FLAT `damage` 35 hp (`Penetrator::hp`), charged by `Mob::PierceLimb` only when the channel got IN (embedded or through), never on a glance -- a weapon stat, as a sword's `damage` is its cut. The head's hardness is the art's: the loader takes the arrow's POINT from the foremost cell of its `.vox` along +x and that cell's material as `Penetrator::material` (steel, hardness 200), so re-authoring the head re-derives both. `startCount` (30) is how many the stub starting kit hands out as one stack (in the pack; as many as fit go into the worn quiver). Art: `scripts/gen_bow_items.py` (a braced yew longbow with a leather grip; a spruce arrow with goose fletching and a bodkin). The loader refuses a bow with no usable block and a bow whose `ammo` is not an ammo item.
+- **The bow is the player's** (session.cpp PhaseG's bow block, beside the throw it copies): with a bow in a hand and an arrow in the kit, that hand's button HELD draws (the `bow_draw` clip, an override on both arms with `pitchFollow`; crouched, `bow_draw_crouch`, the bow laid flat -- swapped mid-draw if the stance changes, `PlayerSession::bowClip`, the new clip's playhead put where the old one's was, `Mob::PlayClipAt`), LET GO looses. THE DRAW HAS A WINDUP (owner, 2026-10-14): for the bow's `windupMs` (450) the bow comes up from low and canted at the chest and the string is drawn most of the way back, and nothing can be loosed -- let go in it and the arrow stays on the string; then over `drawTimeMs` (800) the last ~15 cm are PULLED slowly to the anchor, which is the charge. The clips are ONE-SHOTS THAT HOLD (`AnimClip::holdEnd`: a non-looping clip that stays on its last key at full weight until stopped) keyed on that same timeline -- LIFT at 0, SET at the end of the windup, the pull keyed at the eased draw fraction -- so the string is where the loosed speed says it is; the generator reads the timing out of items.json. THE DRAWN BOW IS SEEN (2026-10-14): `PresentDrawnBow` (game/arrows.h), once a frame per creature before the body registry builds its list, shows a bow whose draw clip is in as its string-less art (`ItemDef::BowStringArt::unstrungModel`, swapped in through `Mob::SetHeldRenderModel`, never over a carved brick), the string as two one-cell rods from the tips to the string hand's socket (pre-packed lengths, `rods`), and the ARROW NOCKED on it: nock at the fingers, laid through the arrow rest two cells off the grip on the head's side of the bow -- all render-only bodies, never hashed; the bow's body and lattice keep their string. The sidecar's `string` block (two scene cells) is the only authored fact; the string's cells are FOUND on that segment at load, so a wrong frame is an error, not a silent miss. In first person the string is cut 2.5 voxels short of the lens. The draw is AIMED: the clips are solved so the shaft from the nock through the rest crosses the look at 30 m within a cell (`aimed_grip`, the bow arm angled in, the anchor under the chin -- under the right of the jaw crouched, where the flat bow's arm otherwise covers the reticle), and the flight leaves from where the nocked arrow's point was (`kAhead` 6.75 under the eye), so the arrow the player watched is the one that flies. The arrow art is 0.65 m (was 0.60): the 46-cell draw had its point inside the bow hand. Both draws are SOLVED from target points by `scripts/gen_archery_clips.py` (never hand-edit their quaternions): the upper body turned ~60 degrees side-on at the waist (the head turned back, so the eye does not move), the bow arm straight out a hand right of the eye line, the string hand under the jaw with its ELBOW BEHIND THE SHOULDER -- the first draw folded the string arm in front of the face, and first person (the eye rides the head) looked through its forearm. `pitchFollow` turns a part about its PARENT's X (the body's left-right axis, so a twisted torso still lifts the bow rather than rolling it), and the head hands back what its ancestors' follow carried (it was getting 1.6x the look). In first person the string forearm and hand are hidden from 0.75 of the draw on (out at the string in front of the face before that, the windup and pull are the thing to see): a fast flick down outruns the eased pitch the draw follows. Speed = `BowArrowSpeed` = eased draw fraction (`1 - (1 - t)^2`, t = (ticks - windup ticks) / draw ticks, 0 through the windup) x `drawSpeed`; under `minDraw` the release is a fumble and nothing leaves the kit. One arrow leaves the kit per shot (`KitTakeAmmo`): a RANDOM one out of the QUIVER ON THE BACK, and from nowhere else (2026-10-15, "The quiver and poisoned arrows" below). Everything is read off the tick's command -- TickInput's held mask, the camera the tick turned from the look delta (the spell aim's `cam.Forward()`) --; the flight leaves the ARROW REST (in the camera's frame, at arm's length a hand right of and under the eye line, where the drawn bow holds it; the crouched draw's flat bow lower and nearer the middle) aimed at the point the look reaches 30 m out, and from the eye only point-blank (a wall or a body inside that arm's length). Launched from the eye, it flew end-on away from the camera and nobody saw it fly (2026-10-13) -- so a replay or a peer draws the same bow the same way; there is no new TickInput field. The HUD draws a pixel bow under the crosshair whose string comes back with the draw, a draw bar with the `minDraw` notch, and the arrows left (`UIState::bowDraw / bowMinDraw / arrowsLeft`).
 - **The arrows in flight are the world's** (`TickAuthorityCtx::arrows`, `ArrowFlights`, stepped once a tick in phase K's slot, after the peers' blows and every session's swings, gore into this tick's batch). The `SpellProjectile` way, never a Jolt body (thin fast bodies tunnel; CCD is the 3 fps trap): 24.8 fixed voxels, gravity, half-voxel sub-steps against the grid through `FlightSolidAt` (`game/flightprobe.h` -- the spell VM's three-tier probe, factored out so the two share it), then ONE `PierceAlongRay` over the tick's segment (up to the wall if there is one). Through every body -> on at `PierceFlight::speedMps`. Bounded: 64 live, 10 s of life, out of the window = gone. **Seen in flight** (2026-10-13): until then nothing drew a flight, and a shot appeared already stuck a third of a second after the loose. A flight is not a body in any system, so it is a RENDER-ONLY body (`game/renderonly.h`): `ArrowFlights::AppendRenderBodies` places the arrow's art point-first exactly as the embed and the stuck item do (`ArrowXf`, the art's foremost cell on the point), at the point interpolated between the last two ticks by the frame's `tickAlpha` (the camera's own lerp; `ArrowFlight::prev` is render-only), along the segment it flew; the frame loop hands the list to `BodyRegistry::SetRenderOnly`, which walks it AFTER every real body -- a transform slot and a micro draw of the SHARED item model, handle 0, no cube instances (no other instance base shifts), never a holder in the brick audit. Last, so a frame at `kMaxBodySlots` starves the arrows and nobody's body. `--shot-mob human:>3~` photographs three in the air.
 - **Where an arrow ends.** EMBEDDED in a creature this machine owns: it STAYS IN THE LIMB. `Mob::EmbedArrow` appends a slot (tag `arrow`, `arrow:<item>`) that is a FOLLOWER of the struck limb exactly as a worn shell is (`MobLimb::wornHost`, posed by `DriveWornShells`, no joint -- `debris.h` StrapBody's note) but AT ITS ANGLE (`MobLimb::wornRotated / wornRot`: world rotation = host x wornRot; a garment's arithmetic is untouched), placed so the art's point is at `PierceResult::stopWorld` along the flight -- and ONLY when the channel went in at least the HEAD's length (`ArrowHeadIn` / `ArrowHeadLength`: the run of head-matter cells back from the point, read off the art; 2026-10-14, owner: "i shouldn't just see the whole arrow head on the outside"). A shallower stop -- spent by an arm it went through first, by mail, by a long flight -- does its harm and DROPS like a glance; the owner's half of a peer's shot (`ApplyRemotePierceHit`) asks the same rule. Gate `arrow` (h) measures the head's depth under the limb's surface on the body for every arrow that stayed. **A body wrapped round another** (a garment shell, the hair) ends its channel at the first gap in its own matter (`PierceChannel`'s `exitGapBins`, `PierceResult::gapExit`; `Mob::PierceLimb` passes 1 -- any empty bin -- for a follower shell or a `hair` limb): until 2026-10-14 a tunic's channel ran chest panel -> back panel ACROSS the torso it wraps, the flight skipped the tunic thereafter and resumed behind the man, so an arrow through clothes never met the chest (and one spent in the back panel stuck there, head out of his back). `PierceAlongRay` skips a gap-exited wrapper for the next cast only, so the arrow that goes on through the torso meets the coat's back on the way out. Kinematic, on the PROP layer (`LimbRole` HeldProp in every phase: touches nothing, every ray sees it), bloodless, not a figure slot, its host always a BASE limb (a hit on a garment embeds in the limb under it; on a held item nowhere). Melee probes and `PierceAlongRay` pass an arrow slot by. It rides the living limb and the corpse (corpses are Mobs; DriveWornShells keeps posing followers); on a SEVER `ShedGearBeforeDetach` names it as the item, DetachLimb straps it to the piece and registers it, so it rides the severed arm and G takes it; a decayed corpse (`ReleaseRigToDebris`) registers its arrows the same way. Capped at `Mob::kMaxEmbeddedArrows` (8): past it the new arrow breaks. EMBEDDED in loose matter: a stuck item strapped to that body (`DebrisSystem::StrapBody`). GLANCED, or stopped by a body nobody carves: it drops as an ordinary falling item. THE GROUND: it sticks point first, 0.3..2.5 voxels deep by speed and never shallower than its head, as a KINEMATIC ground item (`DropItemToWorldXf(..., stuck)`), registered, G picks it up; the oldest goes past 48 stuck arrows (tracked by global id).
 - **G on an arrow in a body** (alive or dead, `PullArrowToKit`, main.cpp's take, ahead of the corpse loot panel): room in the kit first, then the slot goes. Nothing else changes -- no plug, no bleed coupling (owner). Like the ground pickup and the loot panel it is a frame-layer take, not a TickInput command.
@@ -9189,6 +9189,22 @@ The casters' split, for a bow. The behaviour layer decides WHEN; `game/mob_arche
 - **Deterministic and authority-side**: requests served in issue order, draws stepped in the order they began, every draw by counter-based hash, the loosed arrows ordinary flights stepped in phase K. Bounded: `kMaxDrawing` 64 bows, `kServedPerTick` 16 requests, the flights' own cap. Not saved: a draw in progress (a loaded archer's string is slack).
 
 Gate `archer` (`src/test/selftest_archer.cpp`, the real tick, a stone strip, an `archer` armed by `ArmArcher` with a sword as its sidearm, a `training_dummy` to shoot at): A draws (the clip on, `BowDrawn` the whole draw, `FaceTarget` held), looses one arrow at the bow's full draw speed and gets into the dummy within `archer.hitTicks`; B backs off from a dummy inside `minRange` without drawing or swinging; C looses exactly its two arrows, draws nothing after, puts the bow in its bag, draws the sword and closes; D replays a scene bit for bit. Thresholds in `tests/baseline.json` (`archer.*`). First measurement: at 60 voxels it draws 16 ticks after first sight (`firstDelayTicks` 15), holds the string 33 ticks (the bow's 24 + a hold of 9), looses at 650 vox/s (65 m/s, the full draw) and goes THROUGH the dummy's torso 2 ticks later -- 3 arrows in 150 ticks (2026-10-13, at 50 m/s: into the dummy 3 ticks after the loose, and the arrows that land GRAZE the torso's edge -- skin 10, flesh 7, muscle 4 over 9.5 cm -- and leave by the far side, the thin matter the embed calibration allows; the gate now prints the limb, depth, energy and cells of that first hit); from 9 voxels it gives 24.6 voxels of ground in 2 s without drawing or swinging; with 2 arrows it looses both, then draws its sword and walks from 60 voxels to 8.5 in 5 s.
+
+### The quiver and poisoned arrows (2026-10-15; `docs/PLAN_poison_arrows.md`; `game/quiver.h`, `itemstage::ApplyCopy`, `CoatHitKind::Pierce`, gate `poison-arrow`)
+
+An arrow wears a coat the way a sword does -- on its own voxel lattice, `ItemInstance::damage.shells[0].lattice` (`game/itemcoat.h`) -- and the QUIVER is what keeps that from turning the pack into thirty one-arrow slots.
+
+- **The quiver is an item that holds items.** `ItemKind::Quiver` (appended after Shield), a `quiver` block (`capacity`, `ammo` by item id), and `ItemInstance::held`: its arrows, each an instance of its own. Plain arrows merge into one counted entry by the stack rule (`StacksWith`), a coated one is an entry of count 1. ONE LEVEL DEEP: an entry never holds anything (every insert and every reader refuses it). A loaded quiver is not `Plain()`, so it never stacks. Persisted whole: the item record's `kItemFmtQuiver` (MOBS v12, net protocol 4, refs container v2), PLYR v11 and ITMS v10 (`persist.cpp PutHeld`: name, count, dye, damage, coats per entry). Shipped: `back_quiver`, 24 arrows (`scripts/gen_quiver_item.py`, the bow's own palette colours by value).
+- **It is worn on the BACK and it is the only thing the bow draws from** (owner: a quiver is required). `EquipSlotId::Back` (appended after the hands; takes only a quiver; not a WORN slot -- `EquipSlotIsWorn` stops at Trinket). `KitAmmoCount` counts the worn quiver's arrows only; arrows loose in the pack or the hotbar are carried, not shot. Q / E on a quiver in the hotbar puts it on the back instead of in a hand (a swap, like any kit move). THE DRAW IS RANDOM: `QuiverPick` takes the arrow numbered `key % count` across the entries in order, each as wide as its count, keyed on the shot's own stateless hash (`rng::Hash3`, the player on (tick, session), an NPC archer on (tick, mob id)), so a replay or a peer looses the same arrow; `KitPeekAmmo` names it before the launch and `KitTakeAmmo` takes the same one after, so a launch the flight cap refuses leaves the quiver as it was. Keep a poisoned quiver and a plain one and swap them on your back to choose.
+- **Loading.** Arrows dragged onto a quiver (worn or not) LOAD it (`Kit::Move`, asked before the slot table: the Back slot takes no arrows), as many as fit, the rest stay; a full one says `QuiverFull`. Every pickup of an arrow -- G on one stuck in a body (`PullArrowToKit` -> `KitReceiveArrow`), on the ground (main.cpp's `pocket`) -- goes into the worn quiver first, then the pack, then the hotbar. The starting kit wears the first quiver loaded from the pack's arrows; `ArmArcher` gives an NPC archer one (its `quiver` count loaded into it), carried on its gear list (`Mob::CaptureGear` / `ApplyWireGear`, an entry with `equipSlot` Back) and on its loot list (`LootPiece::Kind::Back`).
+- **Drawn on the back, never a slot.** `PresentQuiver` (once a frame per creature, beside `PresentDrawnBow`) draws the quiver's art and up to 12 arrow tails standing out of its mouth as RENDER-ONLY bodies (`game/renderonly.h`), on the rig's `back` socket: an authored one wins, else DERIVED (`Mob::SocketWorldXf`, `MirrorHeldSockets`' reason -- thirty-odd generated characters): the middle of the `torso` box's back face, five-ninths up, the tube half its own depth behind it, its `back` grip tipping the mouth over the right shoulder. Not drawn for the player in first person. Nothing carves, burns or coats it (owner: not damageable, for now).
+- **A stored arrow is frozen** (owner rule 2026-10-01, the bag's): nothing ticks the arrows in a quiver, worn or not.
+- **Brush one, copy to N.** A quiver opens on the item stage one arrow at a time (the stage's part selector walks its entries; `itemstage::StageDrawDef` draws the arrow). A stroke (`Stroke::held`) splits the arrow out of its counted entry first and coats it through the stroke's own path. "apply" sends `itemstage::CopyOrder` (`PlayerSession::itemStageCopy`, a one-tick input): the coat the shown arrow wears OF WHAT THE FLASK POURS -- the poison, not the blood -- laid cell for cell (by position) on up to N other arrows through `AddBodyStain`; an arrow that would take nothing does not count, so a second copy does nothing. THE SPEND is the brush's own rate solved per level per cell (`PourBrushCellsPerSec` over `kStrokeAmount` levels on ~pi r^2 cells: the radius cancels), so copying costs what brushing by hand would; it stops at a dry flask.
+- **The coat goes in with the point.** A flight carries its `ItemInstance` (`ArrowFlight::arrow`, its lattice materialised on the first flight tick), and `PierceAlongRay` takes a `PierceCoat`: every channel that gets into a creature this machine owns trades coats with the CHANNEL'S WALLS by the melee rule -- `MobSystem::CoatOnContact` with a BARE LATTICE as the striker (`CoatContact::strikerLattice`, no rig slot, no brick) and the new `CoatHitKind::Pierce` (the cut's wound-wall rule: the carve's removed cells, `Mob::PierceLimb`'s `woundOut`). The poison on the head goes into the wound and does what that coat does there (venom seeds its infection); the wound's fluid smears onto the head. A glance trades nothing. The arrow then embeds wearing it (`Mob::EmbedArrow(..., inst)` -> `ApplyLimbCoats`), comes out wearing it (`Mob::PullArrowLattice`, CaptureHeld's rule), and sticks or drops in the ground wearing it (`DropItemToWorldXf` with the flight's instance; a clean one settles back to a plain arrow first). A peer's creature: the `MeleeHitKind::Pierce` record carries the arrow (`MeleeHit::embedInst`, meleehit.h v4) and its owner makes the trade and the embed. Nothing draws the coat of an arrow IN FLIGHT.
+
+Gate `poison-arrow` (`selftest_wound.cpp`): A the quiver loads to its capacity and refuses past it, the draw is a pure function of its key and reaches every entry by its count, a mixed quiver survives the item record byte for byte; B one arrow's head brushed with venom through `ApplyStroke`, `ApplyCopy` onto the rest (every arrow on the same cells, the flask paying exactly the brush plus the copy, a second copy a no-op); C a venomed arrow drawn out of that quiver into a fresh human's torso on the real tick embeds, puts venom on the channel and seeds the infection, and comes back out into a puller's quiver wearing a coat; D C replayed bit for bit. The venom levels delivered and the cells seeded are PRINTED, not thresholded beyond "it seeded" -- the head is ~10-15 cells, so an arrow carries far less than a brushed blade.
+
+Known limits: a shooter does not trade coats with a PEER's creature locally (the owner does; an arrow through a peer's arm flies on without that arm's blood); embedded arrows are still not saved (above); there is no "unload" gesture -- shoot them, or drag the quiver off and pick its arrows up again.
 
 ### The matter is the projectile: spell flights strike bodies (2026-10-12; `docs/PLAN_projectiles.md` decision 3, package D; `game/spell.h` `FlightMatter` / `KineticMana`, `game/pierce.h` `SpellMatterStrike`, `SpellBodyProbe::matterHit`, gate `spell-pierce`)
 
@@ -11504,7 +11520,8 @@ were. Nothing about storage or rendering changes: the human already paid for
   asserts the body below the neck has exactly the old cells): fingers, nails,
   knuckles, toes, a kneecap, the elbow crease, collarbones, a navel, the line
   under a man's chest, a one-cell checker where `shadeBack`'s dark half
-  begins, `texture` mottle and `moles`.
+  begins, `texture` mottle and `moles` (where they fall is `body.skin.pattern`
+  alone: see "Every slider moves only what it is for" below).
 - **Detail art slots** (`ART.FACE_SHADE` 201, `FACE_LIGHT` 200,
   `EYE_WHITE` 199, `LASH` 198, then 197-180: `mg.DETAIL_SLOTS`). Three are an existing colour under a new number
   (skinShade, skinLight, hairShade), which costs the shared art palette nothing
@@ -11527,6 +11544,85 @@ were. Nothing about storage or rendering changes: the human already paid for
   `shana`'s torso had 34 cells of bra the current generator no longer paints;
   all now match. `assets/mobs/human.vox`, the hand-authored base (player model), has no
   genome and its own palette, and is NOT converted.
+
+#### Every slider moves only what it is for (2026-10-15)
+
+Owner ticket: "eye spacing will change freckles on skin, a bunch of sliders will
+end up making subtle changes to hair, changing underwear can change hair and
+freckles". Measured with a coupling matrix (every gene stepped, every part
+diffed), every case was a random choice keyed on, or a landmark read from,
+something the slider moved:
+
+- **The skin pass's seed** mixed in eyeDx, heightM, freckles, the jaw, the
+  shoulder width and the texture amount, so those six re-rolled every mole and
+  mottle down to the feet. It is now the part's name plus **`body.skin.pattern`**,
+  a `dice` row (thrown whole by a roll, never nudged or blended) that nothing
+  else reads; a cell is keyed from its part's MIDLINE and TOP JOINT, not the box
+  corner, so a wider limb keeps the marks that did not move. Moles, shoulder
+  freckles and mottle claim bare skin in that order of precedence, so raising
+  one only adds its own marks. The fine face's freckles use the same dice,
+  keyed off the midline and the eye row.
+- **`hairMass` read the head's paint.** A dark or open mouth and a dark brow are
+  painted in the EYE slot, so they moved the eye line the beard, bangs and short
+  layer hang off; the old nose tip and cheeks are `SKIN_LIGHT`, which is scalp;
+  any hair-coloured paint was scalp, so the hair's VOLUME grew off beards (a
+  "3D beard" on anyone with hair mass and a painted beard, a curtain hanging
+  off yorg's beard) and beard paint lowered the nape the curtain is measured
+  from; the skull's centre was the bounding box of every head cell, ears and
+  nose included. Now the head builders RECORD what the hair needs as they
+  decide it (**headMarks**, `ctx.marks.head`, scaled with the cells for
+  `headVox`): the cap (by the hair function, before any face paint), the
+  skull's extent (before any ear), the beard cells, the eye cells and rows,
+  the eye line before the eye-height slider (the short layer's reach), and the
+  ears/nose/brow ridge. A race's face pass and extras get the same eyes
+  (`info.isEye`, `ctx.eyeLine`): a goblin hung its ears and nose off the mean
+  of every EYE-slot cell, so its mouth sliders moved them.
+- **Hair hashed scene coordinates**, so anything that moved the head re-rolled
+  every fluffy end and streak. Every hashed choice is keyed in the head's frame
+  (x from the midline, y and z from the head box); a draped cell carries its
+  STRAND's key (root column and row, or the tail's own cross-section), so a back
+  that moves the curtain keeps every wisp on its strand. The speck filter is a
+  fixed 32 cells: it was 2% of the group, so a few cells anywhere flipped a
+  speck on the far side of the head (1 speck in 200 groups depended on it).
+- **Underwear on the races was geometry.** A goblin's warts and a sylvan's root
+  grooves were raised only on bare skin, and the sylvan's knots were picked by
+  index from the bare-bark list, so a bra re-carved the body and re-draped the
+  hair over it. Bumps, grooves and knot centres now ignore paint; the sylvan's
+  leaf wrap frays first, back to exactly the skin the builder paints there
+  (`info.bareSlot`).
+- **New rows (owner ask, same day):** the ponytail's **tail curve** (-1 tucks
+  in and lies flat, 0 as drawn, 1 sweeps out in an arc; continuous through 0),
+  **tied at** (nape to crown, twin tails too) and **tail thickness**; the
+  beard's own **volume** (fine cells off the painted beard, riding the head),
+  which replaces what the hair's volume used to do to beards by accident. All
+  are `late` rows; 0 / 0 / 1 / 0 are exact no-ops.
+- **The guard:** `test_mobgen.mjs` §U steps every slider once on a man with
+  everything on (hanging hair, bangs and the eye window, shell, short layer,
+  thinning, every scatter, a hanging beard), a woman (the bra rows) and a goblin
+  and sylvan in underwear, and holds what moved to what the row is for:
+  CONFINED (face/skin/underwear rows touch only their own parts), NO HAIR
+  (skin and underwear rows), PAINT (underwear and the dice add or remove no
+  cell; underwear repaints only cells that were or became cloth), ITS OWN
+  (raising texture, moles or freckles only adds its own marks) and LOCAL (any
+  other row moves hair only within 12 cells of something it changed, or under
+  it in the same columns -- a strand hangs from what blocks it). Hair, beard
+  and short-layer rows are not held to these (moving the hair is their job),
+  nor height and the stack (hanging hair is measured to the waist). Run against
+  the generator before this change, §U fails on exactly the ticket's cases.
+  It costs the gate ~20 s.
+- **Still coupled, on purpose:** the bangs, beard and short layer follow the
+  EYE ROW; ears, a nose and a brow ridge are solid, so hair parts round them
+  (locally); hanging hair rests on the shoulders and back, so the body's shape
+  changes the drape; a race's own features hang off the face (goblin ears,
+  demon horns). Every one is local, and §U says so.
+- **Assets:** every generated body was re-baked (`gen_mobs.mjs --rebake`, the
+  race bases, `bake_human_pool.mjs --rebake`). Each human got its own `pattern`
+  (from its stem) so the cast does not share one scatter, and the nine bodies
+  whose beard the hair's volume used to puff out got that volume as
+  `beardVolume` (brug, corwin, ferdruk, fleepo, sherp, yorg, zeus, pool m02,
+  m08). Not restorable by a row: yorg's "mane" was hair hanging off his beard
+  paint, and sherp's short nape curtain came from beard paint lowering his
+  nape; both are gone.
 
 ---
 
@@ -14866,6 +14962,200 @@ runs from, so a villager bolts from the zombie and not from the player beside
 it. The hurt check moved ahead of Perceive (`NoteHurt`) because neutral
 perception reads it. No existing profile is neutral or names the new verbs, so
 every other creature is arbitrated exactly as before.
+
+### Stealth and detection (2026-10-15; `game/stealth.*`, `game/mob_stealth.cpp`, `ai::UpdateAwareness`, profile `stealth` block, tuning `stealth.*`, gates `stealth`, `stealth-world`, `stealth-light`, `docs/PLAN_stealth.md`)
+
+Perception used to be a switch. A creature saw a stranger the tick it came
+inside range, cone and line, and stopped seeing it the tick it left them. That
+cannot carry sneaking. Light, posture, motion and noise have to *fill*
+something, and losing a creature has to take more than one step behind a
+tree. The model is The Elder Scrolls' detection, with two Splinter Cell:
+Chaos Theory ideas on top.
+
+**One meter, two channels.** Every creature whose profile has a `stealth`
+block keeps an AWARENESS level, 0..1, for each stranger it is tracking
+(`Brain::aware`, four slots). 1 means DETECTED: the body becomes a candidate
+target, and the arbiter fights it as before. Below 1 the creature is only
+suspicious. At `stealth.cautionAt` it turns to look; at `investigateAt` it
+walks over. Two channels fill the meter, and it drains at `decay` every tick,
+so a body is noticed at all only where its gain beats the drain:
+
+- **Sight** needs the cone and the line of sight. The gain is
+  `sightRate × cone × (1 − d/reach)²`, which is Skyrim's attenuation exponent.
+  `reach = sightRange × awareness × visibility`.
+  - `visibility` multiplies five terms: the light on the body, stance (crouch
+    0.55, prone 0.3), motion (still 0.7, walk 1, sprint more), size, and the
+    body's sneak skill.
+  - Light dominates on purpose. The same crouched body that a guard sees
+    across a lit room is invisible past arm's length in shadow.
+  - The line is cast to the upper body and then to the head, so a head over
+    a wall counts as half a body.
+  - `nearAlways` lifts the light toward full inside arm's length.
+- **Sound** needs neither cone nor line; a wall that a sight line was refused
+  through muffles it.
+  - Every moving body has a NOISE, published as an audible radius. Walking on
+    stone is `walkNoise`, and noise scales with speed^1.5. Crouching, crawling,
+    sneak skill and soft ground reduce it. Worn metal and twigs underfoot
+    raise it. Footstep loudness is derived from each material's footstep
+    sound set.
+  - Discrete EVENTS add more: a blow, a cry of pain, a landing, a bow loosed,
+    an arrow striking stone, an ally's alarm.
+  - A noise is heard while `radius/d > 1 + ambient`, where ambient is rain.
+    This is Chaos Theory's rule that a sound quieter than the room is no
+    sound.
+  - Sound alone stops at `soundCap`. It tells the creature where to look, and
+    sight must confirm. The exception is a creature that is already fighting
+    you: it follows you by ear.
+
+**Harder to lose than to avoid.** For the body a creature is fighting:
+
+- reach is ×`combatSightMul`;
+- the light on the body cannot read darker than `combatLightFloor`;
+- its noise refreshes the last known position;
+- the meter drains at `searchDecay`.
+
+Losing it takes breaking the line for `alertDecayTicks`. The creature then
+SEARCHES (`Intent::Search`): legs round the last known point, led along the
+body's heading. During the search its meter for the lost body sits at
+`searchHold`, and gains are ×`searchGainMul`. When it stands down it stays
+ALERTED for `alertedTicks`, with gains ×`alertedGainMul` ("must have been the
+wind").
+
+**Struck.** `MobSystem::NoteAttacked` handles a body that is hit:
+
+- A blade means the creature knows the attacker at once. It is a target even
+  from behind, "felt" for `kFeltTicks`, so the creature turns on it.
+- An arrow from a body it had not detected does NOT reveal the archer. The
+  creature searches toward the shot's rough origin, blurred by a fifth of the
+  distance.
+- An arrow into stone betrays nobody. It is a place to go and look, which is
+  a distraction.
+
+**Sneak attacks.** A blow or arrow lands ×`sneakMelee` / ×`sneakRanged` (or
+the weapon's `sneakAttack`; the dagger authors 5) when all of these hold:
+
+- the victim's brain has not detected the attacker (`ai::Detects`);
+- the attacker is crouched or prone (`sneakNeedsCrouch`, as in Skyrim);
+- for melee, it is the stroke's first contact with that creature.
+
+The multiplier rides `repeat` (melee) or `Penetrator::hp` (arrows), so it
+scales every hp of the strike, the way `melee.chargeDamage` does.
+
+Two cases are never caught unaware:
+
+- a creature with no stealth senses (a dummy, a legacy profile), because it
+  has no meter;
+- a player, who has no brain to fool.
+
+**What a body looks like to a watcher.** `MobSystem::PublishStealth` fills
+`Actor::stealth` (`stealth::Exposure`). It is computed once a tick, beside
+`PublishCombatant`.
+
+- **Light** is `MobSystem::LightAt`: the RENDERER'S OWN BODY LIGHTING,
+  evaluated on the CPU (microbody.wgsl `litColorSNoFog` + `glowLight`, term
+  for term, for a white body), every 2nd tick for a player and every 6th for
+  a creature. The value is how bright the body is DRAWN, so a watcher sees
+  what the player sees:
+  - the key light and the hemisphere ambient of the tick, from the renderer's
+    own frame-light resolve on the sim clock (`FrameLightForTick` →
+    `ResolveFrameLight`, set by the session as `MobSystem::SetSkyLight`);
+  - a SHADOW RAY toward the sun or moon from three heights (head, chest,
+    knees; lower for a crouch or a crawl), softened by the renderer's law
+    (`shadowFromOpaqueHit`): a roof, a wall, a tree's crown;
+  - the SKY OPENNESS of the ground under the body by the renderer's five
+    rays (`opennessAtBody` / `sim_openness`), which scales the ambient, caps
+    the shadow lift and adds the enclosed ambient: a room, a cave, an alley;
+  - the GLOW FIELD's per-chunk sources (`sim_glow.wgsl`: mean emitter
+    radiance × saturating fill, `(1 − d/glowReach)²` from the chunk centre) —
+    but a chunk lights the body ONLY if a line reaches one of its exposed
+    glowing cells. The renderer's body path does not occlude the field, so a
+    fire behind a wall still tints a drawn body; it does not reveal it.
+  - the rain word dims the key (`rainKeyDim`): the cloud deck is render-only
+    weather, so the sim's rain stands in for it;
+  - then the renderer's tonemap, over `lightFull` (0.73: a white body in open
+    noon sun draws at 0.732).
+
+  Rays read the snapshot mirror, then the fetch cache, then the snapshot's
+  per-chunk occupancy (an empty chunk is air), then the analytic ground
+  (`World::TerrainHeight`). It asks no fetches, and it is never a render
+  target: the camera and the frame cannot reach the decision. The
+  `stealth-light` gate pins it against fixtures with known answers (open
+  noon 1.0, midnight 0.35, a lava pit in sight 0.65, the same pit behind a
+  wall exactly the wall's own light, a closed room at noon 0.19).
+- **Noise** comes from stance, speed over the body's own walk, the share of
+  worn pieces that are metal, and the last footfall's material.
+- **Players**: the session publishes stance, walk fraction and wading through
+  `PlayerActorDesc`. A fly-mode camera is not modelled.
+- **What the player hears.** Every NPC footfall (the gait's touchdown, as the
+  avatar's) is queued with the loudness the stealth model gives it against a
+  plain walk — stance, sneak skill, worn metal (`MobSystem::NpcSteps`, capped
+  at 192 a frame, drops counted) — and the frame loop voices it through
+  `Cues::Footstep` with that gain on the volume AND the audible radius. A
+  creature creeping up is as quiet to the player as to its prey.
+
+**What stays exactly as it was.** Stealth is a trait of the creatures that
+author it, and it works in both directions:
+
+- A profile with no `stealth` block perceives the legacy way.
+- Its BODY is not hideable either. It publishes no exposure, so even a stealth
+  creature acquires it at once inside range, cone and line.
+- The same holds for every other unmodelled actor: a gate's hand-built list,
+  a corpse, a fly-mode camera.
+
+For a stealth creature, the `enemies` / `hostiles` rule facts, and the threat
+Flee runs from, count a modelled stranger only once its meter for it is at
+the notice level. A villager cannot bolt from a stalker it never noticed. Shipped with the
+block are `villager`, `zombie`, `guardian`, the fighting styles (`swordsman`,
+`fencer`, `brawler`, `berserker`, `battlemage`), `archer`, `snake`, `imp`,
+`fiend` and the new `stalker`. Left as they were:
+
+- the gate fixtures (`dummy`, `crowder`, `retreater`, `duelist`,
+  `duelist_blue`, `swordsman_static`, `training_dummy`);
+- the swimmers (scent-driven);
+- the bound demons;
+- `skittish`, whose flee rule still counts enemies, not awareness.
+
+**The NPC side of sneaking.** `Intent::Stalk` starts SNEAKING, and sneaking
+is a mode, not a verb:
+
+- With a target that has not turned to face it, and is not fighting it, a
+  stalker goes crouched (`IntentOut::crouch` → `Mob::aiCrouch_` →
+  `PoseInputs::crouch` and `Stance::Crouch`).
+- Every drive is held to `stalkSpeed`, through every verb that follows: the
+  stalk, the footwork inside the band, the request and its commit.
+- It ends when the target turns or names it.
+- A stroke begun crouched is finished crouched (`Mob::stroke_` active), so the
+  first contact on an unaware creature is a sneak attack. The
+  `stealth-world` gate lands one at ×3 on the real tick. Entering a fight, a
+creature with `stealth.alarm` cries out once. That is a noise event pointing
+at the intruder; allies who hear it investigate and their meter for the
+intruder jumps.
+
+**The HUD.** Skyrim's eye, in pixel art, sits above the crosshair while you
+sneak or while anything is watching. Its lids open with the highest meter any
+creature holds for you, and it is coloured by the worst alert state. Round it
+are MGSV-style pips, one per watcher at its screen bearing. Under it are
+Chaos Theory's two meters, light and noise. The noise meter has a tick at the
+level that not even someone at arm's length would hear, and the tick rises in
+rain. "SNEAK ATTACK ×3.0" toasts under the crosshair.
+
+**Determinism and cost.**
+
+- It is CPU float gameplay state in the 30 Hz tick, like the arbiter it
+  feeds. The counter RNG is used only for the search legs and the shot blur.
+- Noise events are double-buffered: posted in tick N, heard in tick N+1,
+  whatever phase posted them.
+- Non-target bodies are weighed every 3rd tick, staggered, and only the 8
+  nearest at all.
+- Light and metal are measured on a cadence. One light reading is ~13 µs
+  (open sky, the dearest case: `stealth-light` measures it): rays resolve
+  their store once per chunk, and the sky's empty chunks are air without a
+  word read.
+- Glow sums rebuild only when their words' version moves (the mirror's tick
+  or the cached chunk's), and only for chunks whose centre is within
+  `render.glowReach` of a body.
+- The noise queue is capped at 256; the quietest are refused, counted
+  (`NoisesRefused`).
 
 ### NPCs swinging, and blades meeting blades (2026-08-31; `game/strokes.*`, `assets/mobs/attack_styles.json`)
 

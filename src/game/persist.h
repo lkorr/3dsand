@@ -119,7 +119,11 @@ struct PlayerKitRefs {
 // (one coat word per voxel, parallel to the v7 damage lattices): a held blade
 // or a worn piece put away coated comes back coated (DESIGN.md §7 "A coat
 // moves on contact"). A v9 kit loads its lattices clean.
-constexpr uint32_t kPlayerKitSaveVersion = 10;
+// Version 11 (2026-10-15) appends WHAT EACH QUIVER HOLDS (game/quiver.h):
+// per slot, its arrows as whole instances -- name, count, dye, damage, coats
+// (persist.cpp PutHeld) -- so a poisoned quiver comes back poisoned. A v10
+// kit loads every quiver empty.
+constexpr uint32_t kPlayerKitSaveVersion = 11;
 constexpr uint32_t kPlayerKitOldestLoadable = 3;
 
 // ITEMS ON THE GROUND ('ITMS'): what is lying around, by name and pose.
@@ -185,7 +189,9 @@ struct WorldItemRefs {
 // v9 (2026-10-08) is a different SHAPE: one record per strap group holding an
 // item, its bodies inline (see "AND SINCE v9" above). The payload is `u32
 // count` of those records. v1..v8 still load through the claim path.
-constexpr uint32_t kWorldItemSaveVersion = 9;
+// v10 (2026-10-15) appends each entry's HELD list (a dropped quiver's arrows,
+// persist.cpp PutHeld) at its end; a v9 ground quiver loads empty.
+constexpr uint32_t kWorldItemSaveVersion = 10;
 
 // The pre-v9 ITMS payload (`u32 count` + one entry per item; v8 entries end
 // with the body's DBRS index, v7 ones do not), for the migration gate: it is

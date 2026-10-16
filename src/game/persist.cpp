@@ -204,6 +204,44 @@ bool GetCoats(Reader& rd, WornDamage& d) {
   return rd.ok;
 }
 
+// ...AND WHAT A QUIVER HOLDS (PLYR v11, ITMS v10; game/quiver.h): its arrows,
+// each a whole instance of its own, coat and all:
+//
+//   u32 entries  then per entry: str name, u32 count, u32 dye, PutDamage,
+//                                PutCoats
+//
+// One level deep, like the instance itself: an entry's own held list is never
+// written. Bounded on read (kMaxQuiverEntries), and an entry naming nothing
+// this library knows is dropped with the rest of the quiver kept.
+void PutHeld(std::vector<uint8_t>& out, const ItemInstance& it) {
+  PutU32(out, (uint32_t)it.held.size());
+  for (const ItemInstance& h : it.held) {
+    PutStr(out, h.name);
+    PutU32(out, (uint32_t)std::max(0, h.count));
+    PutU32(out, h.dye);
+    PutDamage(out, h.damage);
+    PutCoats(out, h.damage);
+  }
+}
+
+bool GetHeld(Reader& rd, std::vector<ItemInstance>& held) {
+  held.clear();
+  const uint32_t n = rd.U32();
+  if (!rd.ok || n > kMaxQuiverEntries || (size_t)n * 16u > rd.left) {
+    rd.ok = false;
+    return false;
+  }
+  for (uint32_t i = 0; i < n && rd.ok; i++) {
+    ItemInstance h;
+    h.name = rd.Str();
+    h.count = (int)rd.U32();
+    h.dye = rd.U32();
+    if (!GetDamage(rd, h.damage) || !GetCoats(rd, h.damage)) return false;
+    if (!h.Empty()) held.push_back(std::move(h));
+  }
+  return rd.ok;
+}
+
 void SavePlayerKitBytes(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint32_t version) {
   // A worn piece's live holes are on its shells, not in its stack, until
   // something reads the stack without the body — and this is that something
@@ -405,6 +443,23 @@ void SavePlayerKitBytes(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint3
   putCoats(kit.hotbar.slots, kItemSlots);
   putCoats(kit.bag.slots, Bag::kSlots);
   putCoats(kit.equip.slots, kEquipSlotCount);
+  if (version < 11) return;
+
+  // ---- v11: WHAT EACH QUIVER HOLDS (PutHeld) --------------------------------
+  //
+  //   u32 hotbarCount  then per slot: PutHeld (u32 0 = holds nothing)
+  //   u32 bagCount     then per slot: PutHeld
+  //   u32 equipCount   then per slot: PutHeld
+  auto putHeld = [&](const ItemStack* v, int n) {
+    PutU32(out, (uint32_t)n);
+    for (int i = 0; i < n; i++) {
+      if (v[i].Empty()) PutU32(out, 0u);
+      else PutHeld(out, v[i]);
+    }
+  };
+  putHeld(kit.hotbar.slots, kItemSlots);
+  putHeld(kit.bag.slots, Bag::kSlots);
+  putHeld(kit.equip.slots, kEquipSlotCount);
 }
 
 bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
@@ -627,6 +682,28 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
     getCoats(kit.bag.slots, Bag::kSlots);
     getCoats(kit.equip.slots, kEquipSlotCount);
   }
+  // ---- v11: what each quiver holds ----------------------------------------------
+  // Only onto a slot that resolved to a QUIVER, and only arrows this library
+  // still knows (Kit::DropUnknown's rule): anything else holds nothing.
+  if (version >= 11) {
+    auto getHeld = [&](ItemStack* v, int n) {
+      const uint32_t count = rd.U32();
+      for (uint32_t i = 0; i < count && rd.ok; i++) {
+        std::vector<ItemInstance> held;
+        if (!GetHeld(rd, held)) return;
+        if ((int)i >= n || v[i].Empty()) continue;
+        const ItemDef* d = r.items->Of(v[i]);
+        if (!d || !d->IsQuiver()) continue;
+        for (ItemInstance& h : held) {
+          if (r.items->Find(h.name) < 0) { dropped++; continue; }
+          v[i].held.push_back(std::move(h));
+        }
+      }
+    };
+    getHeld(kit.hotbar.slots, kItemSlots);
+    getHeld(kit.bag.slots, Bag::kSlots);
+    getHeld(kit.equip.slots, kEquipSlotCount);
+  }
   if (dropped > 0)
     std::fprintf(stderr,
                  "PLYR: %d saved entries name content that no longer exists; "
@@ -672,7 +749,8 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
 // ONE ENTRY. `withBodyIndex` writes v8's trailing DBRS index (only the legacy
 // writer the migration gate uses); a v9 entry ends at the coats.
 void PutItemEntry(const WorldItemRefs& r, const WorldItem& w,
-                  std::vector<uint8_t>& out, Vec3* posOut, bool withBodyIndex) {
+                  std::vector<uint8_t>& out, Vec3* posOut, bool withBodyIndex,
+                  bool withHeld = true) {
   PutStr(out, w.name);
   // v2: THE DYE (game/dye.h). Written next to the name because it is the
   // other half of what the thing on the ground IS — a dropped red tunic and
@@ -737,6 +815,9 @@ void PutItemEntry(const WorldItemRefs& r, const WorldItem& w,
   // written at the same instant (DebrisSystem::SaveIndexOf). v9 carries the
   // body itself and needs no index.
   if (withBodyIndex) PutU32(out, r.debris->SaveIndexOf(w.body));
+  // v10: a dropped quiver's arrows (PutHeld). The legacy writers (v7/v8)
+  // never carry it.
+  if (withHeld) PutHeld(out, w);
 }
 
 // ONE ENTRY, READ. `savedBody` is the v8 DBRS index (0xFFFFFFFF otherwise).
@@ -806,6 +887,9 @@ bool ReadItemEntry(Reader& rd, uint32_t version, ItemInstance& inst,
     RemapPrefabVoxels(lat, *mr);
     RemapItemInstance(inst, *mr);
   }
+  // v10: a quiver's arrows -- read AFTER the remap above, because GetHeld's
+  // own GetDamage / GetCoats already remapped every arrow's ids.
+  if (version >= 10 && !GetHeld(rd, inst.held)) return false;
   return true;
 }
 
@@ -984,7 +1068,8 @@ void SaveWorldItemsLegacy(const WorldItemRefs& r, std::vector<uint8_t>& out,
                           uint32_t version) {
   const std::vector<WorldItem>& all = r.reg->All();
   PutU32(out, (uint32_t)all.size());
-  for (const WorldItem& w : all) PutItemEntry(r, w, out, nullptr, version >= 8);
+  for (const WorldItem& w : all)
+    PutItemEntry(r, w, out, nullptr, version >= 8, /*withHeld=*/false);
 }
 
 void SavePlayerKit(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint32_t version) {

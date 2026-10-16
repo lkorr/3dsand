@@ -14265,6 +14265,53 @@ fn fluidSeamShell(c : vec3<i32>) -> bool {
   return false;
 }
 
+// THE CHUNK, RESOLVED ONCE (2026-10-15, ticket 2026-10-14_22-55-02). What the
+// march holds per chunk: x = class (bits 0..1, fluidChunkClass's answer) |
+// the ring chunk's WATER FACES (bit 2 + 2a = the -a neighbour holds water,
+// bit 3 + 2a = the +a one), y = the Y mask (class 1 only). The same loads
+// fluidChunkClass / fluidYMaskOf / fluidSeamShell make, made once on entry:
+// fluidSeamShell re-read up to three neighbours' block-map and Y-mask words
+// on EVERY step through a ring chunk -- 4.6 of the pour camera's 14 march
+// iterations a pixel are ring steps -- and the class-1 path read its own
+// Y-mask word twice. A ring chunk now resolves all six faces where the class
+// test stopped at the first, which it pays once per chunk instead of per step.
+fn fluidChunkHeld(wc : vec3<i32>) -> vec2<u32> {
+  let ns = chunkSlotOf(wc, R.origin);
+  if (ns == SLOT_NONE ||
+      ((fluidBlockMapR[fbmNearWord(ns)] >> (ns & 31u)) & 1u) == 0u) {
+    return vec2<u32>(0u, 0u);
+  }
+  if (fluidBlockMapR[ns] != 0u) {
+    let ym = fluidBlockMapR[fbmYMaskIndex(ns)];
+    if (ym != 0u) { return vec2<u32>(1u, ym); }
+  }
+  var faces = 0u;
+  for (var a = 0; a < 3; a++) {
+    var lo = wc;
+    lo[a] -= 1;
+    var hi = wc;
+    hi[a] += 1;
+    if (fluidChunkWater(lo)) { faces |= 4u << u32(2 * a); }
+    if (fluidChunkWater(hi)) { faces |= 8u << u32(2 * a); }
+  }
+  return vec2<u32>(select(0u, 2u | faces, faces != 0u), 0u);
+}
+
+// fluidSeamShell on the faces fluidChunkHeld resolved: no loads.
+fn fluidSeamShellHeld(c : vec3<i32>, held : u32) -> bool {
+  let lo = c & vec3<i32>(CHUNK_MASK);
+  for (var a = 0; a < 3; a++) {
+    if (lo[a] < FLUID_SEAM_SHELL && (held & (4u << u32(2 * a))) != 0u) {
+      return true;
+    }
+    if (lo[a] >= i32(CHUNK) - FLUID_SEAM_SHELL &&
+        (held & (8u << u32(2 * a))) != 0u) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // NOTE: `fluidCellMarched` lived here — "is cell c inside the region the march
 // actually samples", used by fs() to decide whether the MPM surface owned a CA
 // liquid cell. It is GONE, deliberately: it answered a question about the
@@ -14494,6 +14541,7 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
     // about 13 times per chunk for an answer that could not have changed.
     var heldSlot : u32 = 0xFFFFFFFFu;
     var heldClass : u32 = 0u;
+    var heldFaces : u32 = 0u;
     var heldYMask : u32 = 0u;
     // Step budget = worst case fine-marching straight down a full window
     // diagonal of solid fluid; the chunk skip means open scenes never get
@@ -14513,8 +14561,10 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
       let slot = chunkSlotIndex(wc);
       if (slot != heldSlot) {
         heldSlot = slot;
-        heldClass = fluidChunkClass(wc);
-        heldYMask = fluidYMaskOf(wc);
+        let hc = fluidChunkHeld(wc);
+        heldClass = hc.x & 3u;
+        heldFaces = hc.x;
+        heldYMask = hc.y;
       }
       if (heldClass == 0u) {
         gFluidC0 += 1u;
@@ -14533,7 +14583,7 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
                     fluidChunkExit(ro, inv, c, t)), t + 0.25);
         continue;
       }
-      if (heldClass == 2u && !fluidSeamShell(c)) {
+      if (heldClass == 2u && !fluidSeamShellHeld(c, heldFaces)) {
         // Seam ring, away from the active face: no node within the tap cube
         // can carry mass, so a field sample here is guaranteed zero. Stride to
         // just inside the chunk's far shell rather than to its exit, so the

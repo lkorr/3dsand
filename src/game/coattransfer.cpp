@@ -324,9 +324,9 @@ MobSystem::CoatContactResult MobSystem::CoatOnContact(const CoatContact& c) {
       (uint32_t)std::clamp(gear.coatBleedPickup, 0, (int)kBodyStainAmtMax);
   if ((frac <= 0.0f || maxLevels == 0) && bleedAmt == 0) return r;
   if (phys_ == nullptr) return r;
-  Mob* striker = c.strikerBody ? nullptr : FindCreature(c.strikerId);
+  Mob* striker = (c.strikerBody || c.strikerLattice) ? nullptr : FindCreature(c.strikerId);
   Mob* target = c.targetBody ? nullptr : FindCreature(c.targetId);
-  if (!c.strikerBody && !striker) return r;
+  if (!c.strikerBody && !c.strikerLattice && !striker) return r;
   if (!c.targetBody && !target) return r;
   if ((c.strikerBody || c.targetBody) && !debris_) return r;
   if (striker && target && striker == target) return r;
@@ -424,6 +424,12 @@ MobSystem::CoatContactResult MobSystem::CoatOnContact(const CoatContact& c) {
                                        : striker->PhysScaleOf(sl));
     S.cell = sLocal * S.scale;
     S.model = sl.microModel;
+  } else if (c.strikerLattice) {
+    // AN ARROW'S OWN LATTICE: no brick, no ledger -- the instance carries it.
+    S.L.skin = c.strikerLattice;
+    S.scale = std::max(1.0f, c.strikerScale);
+    S.cell = c.strikerCell;
+    S.model = -1;
   } else {
     DebrisSystem::FleshLattice f;
     if (!debris_->CoatLatticeOf(c.strikerBody, f)) return r;
@@ -452,8 +458,9 @@ MobSystem::CoatContactResult MobSystem::CoatOnContact(const CoatContact& c) {
   // A CUT puts it on the WOUND WALL (the kerf's survivors, face-adjacent to
   // what it took); a cut that took nothing, a bruise and a bite on the
   // surface patch -- one cell deeper only under skin that split.
-  const bool cutWall = target && c.kind == CoatHitKind::Cut && c.woundCells &&
-                       !c.woundCells->empty();
+  const bool cutWall = target &&
+                       (c.kind == CoatHitKind::Cut || c.kind == CoatHitKind::Pierce) &&
+                       c.woundCells && !c.woundCells->empty();
   if (cutWall) {
     tCells = CoatWoundWall(T.L, *c.woundCells, T.cell);
   } else {
@@ -478,7 +485,7 @@ MobSystem::CoatContactResult MobSystem::CoatOnContact(const CoatContact& c) {
   uint32_t fluid = 0;
   if (target) {
     if (ts < target->baseLimbs_ && !target->IsBloodless(ts)) {
-      if (c.kind == CoatHitKind::Cut) wounded = cutWall;
+      if (c.kind == CoatHitKind::Cut || c.kind == CoatHitKind::Pierce) wounded = cutWall;
       else if (c.kind == CoatHitKind::Bite) wounded = c.landed;
       else
         for (const CoatCell& cc : tCells)

@@ -59,6 +59,14 @@ SkyState SkyForTick(const Tuning& t, uint32_t tick);
 // site is the ordinary way for two places to stop agreeing.
 uint32_t DayPhaseNow(uint32_t tick);
 
+// THE KEY AND AMBIENT LIGHT OF A SIM TICK, as the renderer resolves them
+// (ResolveFrameLight: key direction and colour, the hemisphere ambient's two
+// ends), for the stealth model's light on a body (MobSystem::SetSkyLight).
+// On the SIM clock (Celestial().SimTick, like DayPhaseNow) and with no
+// weather: the cloud deck is render-only, so the sim's stand-in for it is
+// the rain word (stealth.rainKeyDim). A pure function of the tick.
+stealth::SkyLight FrameLightForTick(const Tuning& t, uint32_t tick);
+
 // ---- short-range mode (dev panel "short range (100 m + fog)") --------------
 // Whether every ray is ceilinged at render.shortRangeDist with a fog ramp over
 // the last stretch (RenderParams flag bit 2). WriteRenderParams OR's this into

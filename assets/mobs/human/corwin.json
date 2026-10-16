@@ -20,14 +20,6 @@
             "keep": true
           }
         ]
-      },
-      "hair.3": {
-        "layers": [
-          {
-            "material": "hair_white",
-            "keep": true
-          }
-        ]
       }
     }
   },
@@ -36,7 +28,7 @@
       "name": "hair",
       "parent": "head",
       "joint": "fixed",
-      "hp": 38,
+      "hp": 36,
       "severable": true,
       "vital": false,
       "bloodless": true,
@@ -51,7 +43,7 @@
       "name": "hair.2",
       "parent": "head",
       "joint": "fixed",
-      "hp": 4,
+      "hp": 6,
       "severable": true,
       "vital": false,
       "bloodless": true,
@@ -60,21 +52,6 @@
         25.5,
         118,
         12.5
-      ]
-    },
-    {
-      "name": "hair.3",
-      "parent": "head",
-      "joint": "fixed",
-      "hp": 4,
-      "severable": true,
-      "vital": false,
-      "bloodless": true,
-      "tag": "hair",
-      "anchor": [
-        11.5,
-        118,
-        14.5
       ]
     }
   ],
@@ -162,7 +139,8 @@
         "knuckles": 0.5,
         "nails": 1,
         "toes": 0.6,
-        "softEdge": 1
+        "softEdge": 1,
+        "pattern": 545
       }
     },
     "shape": {
@@ -233,6 +211,7 @@
       "beardLen": 0,
       "beardPoint": 0,
       "beardFork": false,
+      "beardVolume": 2,
       "eyeOpen": 0.35,
       "eyeTilt": 0,
       "lashes": 0.45,
@@ -272,6 +251,9 @@
       "tail": 0,
       "braid": false,
       "twin": false,
+      "tailCurve": 0,
+      "tailHeight": 0,
+      "tailThick": 1,
       "wisp": 0.35,
       "ragged": 0.3,
       "bangs": 0,

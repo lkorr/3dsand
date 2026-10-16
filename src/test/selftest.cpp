@@ -69,6 +69,8 @@ const std::vector<Gate>& WaterGates();
 const std::vector<Gate>& RenderGates();
 const std::vector<Gate>& PlayerGates();
 const std::vector<Gate>& MobGates();
+// Stealth and detection (game/stealth.h): pure arbiter arms over the meter.
+const std::vector<Gate>& StealthGates();
 const std::vector<Gate>& BodyGates();
 const std::vector<Gate>& FloaterGates();
 const std::vector<Gate>& AudioGates();
@@ -1056,6 +1058,11 @@ const char* const kOrder[] = {
     // and burning out at the shipped rates; plus a venom mace / fist on skin
     // and into an open pit. Regenerates the ground on the way out.
     "venom-blade",
+    // ...and the same venom on an ARROW (docs/PLAN_poison_arrows.md): a quiver,
+    // one arrow brushed and copied to the rest on the stage, a shot into a
+    // fresh human that seeds the wound, the arrow pulled back into a quiver,
+    // and the shot replayed. Fresh spawns; regenerates the ground on the way out.
+    "poison-arrow",
     // ...and the item STAGE coats the same lattices from a flask: its CPU
     // picture, its pick, a stroke on an item in the pack and one in the fist
     // (DESIGN.md §8b "The item stage"). Regenerates the ground like
@@ -1382,6 +1389,19 @@ const char* const kOrder[] = {
     // resets mobs + debris and removes its two scratch profiles on the way
     // out).
     "ai-tactics",
+    // ...and STEALTH, the detection meter (game/stealth.h): pure arbiter arms
+    // through ai::Think over hand-built actors. Touches no world and no body,
+    // so it inherits and hands on exactly what ai-tactics left.
+    "stealth",
+    // ...and its LIVE half, by the same append rule: a stalker and a villager
+    // on a stone strip through THE tick (support::TickRig). Fresh world and
+    // ids on the way in; mobs + debris reset and worldgen regenerated on the
+    // way out.
+    "stealth-world",
+    // ...and the light on a body, by the same append rule: a floating stone
+    // platform through THE tick; mobs + debris reset and worldgen regenerated
+    // on the way out.
+    "stealth-light",
     // ...and one pose pipeline, whoever drives the body (W2-L), by the same
     // append rule: it spawns an NPC and an avatar, poses both through
     // Mob::PosePipeline only (no PreTick, no Jolt step), and resets mobs +
@@ -1489,7 +1509,7 @@ const std::vector<Gate>& Registry() {
                           &SimGates(), &CaGates(), &GasGates(), &TicketGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),
-                          &MobGates(), &BodyGates(), &FloaterGates(),
+                          &MobGates(), &StealthGates(), &BodyGates(), &FloaterGates(),
                           &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
                           &SpellGates(), &PlayerKitGates(), &VesselGates(), &AlchemyGates(), &ChemGates(), &ElecStrikeGates(), &ElecPlayGates(), &ElecGates(), &ElecMobGates(), &DemonGates(), &GrimoireGates(), &SpellGraphGates(),

@@ -49,7 +49,17 @@
 //
 // G on an arrow stuck in a creature (alive or dead) pulls it out into the kit
 // (PullArrowToKit, main.cpp's take): the slot goes and nothing else changes --
-// no plug, no bleed coupling (owner, 2026-10-12).
+// no plug, no bleed coupling (owner, 2026-10-12). It comes out WEARING what
+// it has been through (the slot's coats, Mob::PullArrowLattice) and goes
+// into the worn quiver first (KitReceiveArrow).
+//
+// POISON (2026-10-15, docs/PLAN_poison_arrows.md): a flight carries its
+// arrow's ItemInstance, and every channel that gets into a creature trades
+// coats with the channel's walls by the melee rule (game/pierce.h
+// PierceCoat) -- a venomed head envenoms the wound, the wound bleeds onto the
+// head. The coat is put on on the item stage (a quiver, brush one, copy to N).
+// Nothing draws the coat of an arrow IN FLIGHT (a 5 cm head at 50 m/s); it is
+// drawn once it stands in a body or the ground.
 
 #include <cstdint>
 #include <string>
@@ -137,11 +147,18 @@ void PresentDrawnBow(Mob& m, const ItemLibrary& items, std::vector<RenderOnlyBod
 Vec3 ArrowHoldover(Vec3 from, Vec3 to, float speedVox);
 
 // ---- AMMUNITION IN THE KIT -------------------------------------------------------
-// How many of `ammo` the kit carries (bag, hotbar, equipment), and take one:
-// hotbar first, then the bag (the quiver at hand before the pack). False when
-// there is none.
+// THE QUIVER ON YOUR BACK IS THE ONLY SOURCE (2026-10-15, game/quiver.h; owner:
+// a quiver is required). How many of `ammo` the worn quiver holds -- arrows
+// loose in the bag or the hotbar are carried, not counted -- and take one:
+// the entry QuiverPick names for `key` (the caller's stateless hash, so a
+// replay draws the same arrow), into `out` when given. False when there is
+// none to take.
 int KitAmmoCount(const Kit& kit, const std::string& ammo);
-bool KitTakeAmmo(Kit& kit, const std::string& ammo);
+bool KitTakeAmmo(Kit& kit, const std::string& ammo, uint32_t key = 0,
+                 ItemInstance* out = nullptr);
+// The arrow KitTakeAmmo(key) WOULD give, without taking it (a launch that is
+// refused leaves the quiver as it was). Empty when there is none.
+ItemInstance KitPeekAmmo(const Kit& kit, const std::string& ammo, uint32_t key);
 
 // ---- THE BOW IN A CREATURE'S HAND (the NPC archers, game/mob_archery.h) ----------
 // The bow a creature holds -- the right hand's, else the left's -- or null.
@@ -175,9 +192,22 @@ struct ArrowFlight {
   // flight decides reads it.
   SpellFxVec prev{};
   std::string item;         // what it is ("arrow"): what embeds or sticks
+  // ...and WHICH ONE (2026-10-15): the arrow as an object, its lattice
+  // carrying its coat. What the channel trades coats with (PierceCoat) and
+  // what embeds, sticks or drops -- so a poisoned arrow poisons and a
+  // recovered arrow comes back wearing what it went through.
+  ItemInstance arrow;
   uint32_t seed = 0;        // the soak's draw key, per hit
   int ticksLeft = 0;
   std::vector<uint64_t> ignore;  // the shooter's own bodies at the loose
+  // ---- STEALTH: WHO LOOSED IT, AND FROM WHERE --------------------------
+  // The shooter's ACTOR id (a mob id, or a player's band id; 0 = nobody --
+  // a gate's arrow) and the loose point: what a struck creature that never
+  // saw the archer searches toward, what decides a sneak attack, and where
+  // the bow's twang is heard (`twanged` once it has been).
+  uint64_t shooter = 0;
+  Vec3 from{};
+  bool twanged = false;
 };
 
 // What one arrow did, for the `arrow` gate and the counters. Bounded log.
@@ -228,9 +258,11 @@ class ArrowFlights {
   // arrow. Converted to fixed point ONCE, here; everything after is integer
   // (but the bodies, which PierceAlongRay prices in float on the physics
   // state, as melee does).
+  // `inst` = the arrow as it left the quiver (null = a plain one of `arrow`).
   bool Launch(const ItemDef& arrow, Vec3 fromWorld, Vec3 dirWorld,
               float speedVox, Vec3 carryVox, uint32_t seed,
-              std::vector<uint64_t> ignore);
+              std::vector<uint64_t> ignore, uint64_t shooterActor = 0,
+              const ItemInstance* inst = nullptr);
   void Tick(uint32_t tick, ArrowWorld& w, std::vector<ParticleSpawn>& spawns);
 
   size_t Live() const { return live_.size(); }

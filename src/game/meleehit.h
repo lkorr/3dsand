@@ -78,6 +78,7 @@
 #include "math3d.h"
 #include "phys/kerf.h"  // Penetrator: a MeleeHitKind::Pierce record's projectile
 #include "sim/bytestream.h"
+#include "game/iteminstance.h"  // a Pierce record's arrow, coat and all
 
 // A STRUCK THING, ACROSS TWO MACHINES. A mob is its mob id on both (the id
 // bands make it global). A PLAYER is not: its avatar's mob id is per-machine
@@ -155,6 +156,10 @@ struct MeleeHit {
   // PIERCE only: the item that stays in the limb when the point EMBEDS on
   // the owner (an arrow, Mob::EmbedArrow); "" = nothing stays.
   std::string embedItem;
+  // ...and THAT arrow, as an object (2026-10-15): its lattice is what wears
+  // its poison, so the owner trades coats with the channel from it and the
+  // arrow that stays in the limb is it. Empty = a plain `embedItem`.
+  ItemInstance embedInst;
 };
 
 // Bumped whenever MeleeHitCore or the string list changes. A record of
@@ -163,7 +168,8 @@ struct MeleeHit {
 // reactBodyGid); CombatantRef's first word is a kind.
 // v3 (2026-10-12): MeleeHitKind::Pierce -- MeleeHitCore::pierce and the
 // `embedItem` string (docs/PLAN_projectiles.md C).
-inline constexpr uint32_t kMeleeHitVersion = 3;
+// v4 (2026-10-15): the arrow as an ItemInstance (`embedInst`, its coats).
+inline constexpr uint32_t kMeleeHitVersion = 4;
 
 inline void EncodeMeleeHit(ByteWriter& w, const MeleeHit& h) {
   w.U32(kMeleeHitVersion);
@@ -172,6 +178,7 @@ inline void EncodeMeleeHit(ByteWriter& w, const MeleeHit& h) {
   w.Str(h.reactSlot);
   w.Str(h.clothSlot);
   w.Str(h.embedItem);
+  WriteItemInstance(w, h.embedInst, kItemFmtLatest);
 }
 
 inline bool DecodeMeleeHit(ByteReader& r, MeleeHit& h) {
@@ -185,6 +192,7 @@ inline bool DecodeMeleeHit(ByteReader& r, MeleeHit& h) {
   r.Str(h.reactSlot);
   r.Str(h.clothSlot);
   r.Str(h.embedItem);
+  ReadItemInstance(r, h.embedInst, kItemFmtLatest);
   h.c.waitTick = 0;
   return r.ok;
 }

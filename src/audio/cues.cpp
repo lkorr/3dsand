@@ -405,7 +405,8 @@ const std::vector<float>* Cues::PickStep(int setId, int& lastVariant) {
   return lib_.RandomVariantNoRepeat(setId, rng_, lastVariant);
 }
 
-void Cues::Footstep(uint32_t matId, const Vec3& posVox, float speed, int foot) {
+void Cues::Footstep(uint32_t matId, const Vec3& posVox, float speed, int foot,
+                    float gainMul) {
   if (!enabled_ || matId >= footstep_.size()) return;
   const FootstepMapping& fm = footstep_[matId];
   if (fm.setId < 0) return;
@@ -426,9 +427,11 @@ void Cues::Footstep(uint32_t matId, const Vec3& posVox, float speed, int foot) {
   if ((int)lastVariant_.size() <= fm.setId) lastVariant_.assign((size_t)lib_.Count(), -1);
   const std::vector<float>* buf = PickStep(fm.setId, lastVariant_[(size_t)fm.setId]);
 
+  const float mul = std::clamp(gainMul, 0.0f, 2.0f);
+  if (mul <= 0.0f) return;
   VoiceConfig cfg;
-  cfg.gain = gain;
-  cfg.audibleRadius = t.footstepRadius;
+  cfg.gain = gain * mul;
+  cfg.audibleRadius = t.footstepRadius * mul;
   cfg.verbWet = t.reverbWet;
   // Doppler off: the step is at the listener's own feet (or a mob's), and its
   // motion is already legible. Leaving it on pitch-bends every step you take
@@ -441,7 +444,7 @@ void Cues::Footstep(uint32_t matId, const Vec3& posVox, float speed, int foot) {
     stats_.dropped++;
 }
 
-void Cues::Land(uint32_t matId, const Vec3& posVox, float fallSpeed) {
+void Cues::Land(uint32_t matId, const Vec3& posVox, float fallSpeed, float gainMul) {
   if (!enabled_ || matId >= footstep_.size()) return;
   const FootstepMapping& fm = footstep_[matId];
   if (fm.setId < 0) return;
@@ -453,9 +456,11 @@ void Cues::Land(uint32_t matId, const Vec3& posVox, float fallSpeed) {
   if ((int)lastVariant_.size() <= fm.setId) lastVariant_.assign((size_t)lib_.Count(), -1);
   const std::vector<float>* buf = PickStep(fm.setId, lastVariant_[(size_t)fm.setId]);
 
+  const float mul = std::clamp(gainMul, 0.0f, 2.0f);
+  if (mul <= 0.0f) return;
   VoiceConfig cfg;
-  cfg.gain = t.landVolume * (0.6f + 0.7f * k);
-  cfg.audibleRadius = t.footstepRadius * 1.6f;
+  cfg.gain = t.landVolume * (0.6f + 0.7f * k) * mul;
+  cfg.audibleRadius = t.footstepRadius * 1.6f * mul;
   cfg.verbWet = t.reverbWet;
   cfg.doppler = false;
   // Pitched DOWN with impact speed: the same surface hit harder by more mass
