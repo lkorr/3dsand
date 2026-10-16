@@ -175,9 +175,16 @@ const std::vector<PrefabVoxel>* ViewLattice(const ItemInstance& it,
 }
 
 bool StageTakes(const ItemDef& def) {
+  if (def.IsQuiver()) return true;   // one of its arrows at a time
   if (ItemLatticeCount(def) <= 0) return false;
   if (def.kind == ItemKind::Melee) return true;
   return ItemKindIsWorn(def.kind) && !def.cover.empty();
+}
+
+const ItemDef* StageDrawDef(const ItemDef& def, const ItemLibrary& items) {
+  if (!def.IsQuiver()) return &def;
+  const ItemDef* a = items.Named(def.quiver.ammo);
+  return a != nullptr && ItemLatticeCount(*a) > 0 ? a : nullptr;
 }
 
 std::string ShellName(const ItemDef& def, int shell) {
@@ -204,6 +211,44 @@ bool IsolateOne(Kit& kit, ItemStack* p) {
   return false;
 }
 
+// ONE ARROW OF A QUIVER as its own entry: a plain entry of count > 1 gives
+// one up, inserted AT `i` (the rest moves to i + 1), so `i` names the arrow
+// being worked on before and after. Returns it, or null for a bad index.
+ItemInstance* IsolateArrow(ItemInstance& q, int i) {
+  if (i < 0 || i >= (int)q.held.size() || q.held[(size_t)i].Empty()) return nullptr;
+  ItemInstance& h = q.held[(size_t)i];
+  if (h.count <= 1) return &h;
+  ItemInstance one = h;
+  one.count = 1;
+  h.count -= 1;
+  q.held.insert(q.held.begin() + i, std::move(one));
+  return &q.held[(size_t)i];
+}
+
+// A plain arrow left by a wash or a copy that took nothing goes back into
+// the plain entry, so a quiver does not fill with count-1 twins.
+void TidyQuiver(ItemInstance& q) {
+  for (size_t i = 0; i < q.held.size(); i++)
+    for (size_t j = i + 1; j < q.held.size();) {
+      if (q.held[i].StacksWith(q.held[j])) {
+        q.held[i].count += q.held[j].count;
+        q.held.erase(q.held.begin() + (ptrdiff_t)j);
+      } else {
+        j++;
+      }
+    }
+}
+
+// A cell's key for the by-position match of two arrows' lattices.
+uint64_t CellKeyOf(const PrefabVoxel& v) {
+  return ((uint64_t)(uint16_t)v.x << 32) | ((uint64_t)(uint16_t)v.y << 16) |
+         (uint64_t)(uint16_t)v.z;
+}
+uint64_t CellKeyOf(const IVec3& v) {
+  return ((uint64_t)(uint16_t)v.x << 32) | ((uint64_t)(uint16_t)v.y << 16) |
+         (uint64_t)(uint16_t)v.z;
+}
+
 }  // namespace
 
 StrokeResult ApplyStroke(Kit& kit, MobSystem* mobs, uint64_t wearerId,
@@ -214,7 +259,8 @@ StrokeResult ApplyStroke(Kit& kit, MobSystem* mobs, uint64_t wearerId,
   if (!s.active) return r;
   ItemStack* st = kit.Resolve(s.item);
   const ItemDef* def = st ? items.Of(*st) : nullptr;
-  if (!def || !StageTakes(*def) || s.shell < 0 || s.shell >= ItemLatticeCount(*def)) {
+  if (!def || !StageTakes(*def) ||
+      (!def->IsQuiver() && (s.shell < 0 || s.shell >= ItemLatticeCount(*def)))) {
     r.refused = "nothing on the stage";
     return r;
   }
@@ -234,6 +280,25 @@ StrokeResult ApplyStroke(Kit& kit, MobSystem* mobs, uint64_t wearerId,
     r.refused = "no room to take one out of the stack";
     return r;
   }
+  // A QUIVER: the arrow at `held` is what takes the coat -- its own entry
+  // first, its own lattice, never on any rig (the quiver is drawn, not worn).
+  ItemStack* quiver = nullptr;
+  int shell = s.shell;
+  if (def->IsQuiver()) {
+    const ItemDef* ad = StageDrawDef(*def, items);
+    if (ad == nullptr) {
+      r.refused = "nothing in it the stage can show";
+      return r;
+    }
+    quiver = st;
+    st = IsolateArrow(*quiver, s.held);
+    if (st == nullptr || st->name != ad->name) {
+      r.refused = "no arrow there";
+      return r;
+    }
+    def = ad;
+    shell = 0;
+  }
   const uint16_t mat = ContainerTopMat(*vp, &mats);
   if (mat == 0 || mat >= mats.size()) {
     r.refused = "nothing pours from it";
@@ -246,7 +311,7 @@ StrokeResult ApplyStroke(Kit& kit, MobSystem* mobs, uint64_t wearerId,
   }
   // On the rig, the rig is the truth (itemcoat.h): bring the instance up to
   // date first, so a coat that dried in the hand is not painted back.
-  const bool onRig = s.item.space == KitSpace::Equip && mobs && wearerId;
+  const bool onRig = !quiver && s.item.space == KitSpace::Equip && mobs && wearerId;
   if (onRig) CaptureLimbToItem(*mobs, wearerId, s.item);
   // A piece on the rig that records nothing is CLEAN, but its geometry is the
   // rig's, not the authored one: a worn shell is resampled to fit its wearer,
@@ -254,13 +319,13 @@ StrokeResult ApplyStroke(Kit& kit, MobSystem* mobs, uint64_t wearerId,
   // a coat painted on them reached only the coincident ones when pushed. The
   // live lattice is what the stage shows and what the stroke coats.
   const WornDamage before = st->damage;   // to undo a materialisation that coats nothing
-  if (onRig && !ItemLatticeIfAny(*st, s.shell)) {
+  if (onRig && !ItemLatticeIfAny(*st, shell)) {
     const Mob* wearer = mobs->FindCreature(wearerId);
     std::vector<PrefabVoxel> live;
-    if (wearer && wearer->KitShellLattice(s.item.index, s.shell, live)) {
+    if (wearer && wearer->KitShellLattice(s.item.index, shell, live)) {
       const int n = ItemLatticeCount(*def);
       if (st->damage.shells.size() < (size_t)n) st->damage.shells.resize((size_t)n);
-      WornShellDamage& sh = st->damage.shells[(size_t)s.shell];
+      WornShellDamage& sh = st->damage.shells[(size_t)shell];
       // Untouched: whole as it sits on THIS wearer (the rig's count, not the
       // authored one, or the condition would read the fit as wear).
       if (sh.atSpawn == 0) sh.atSpawn = (uint32_t)live.size();
@@ -268,7 +333,7 @@ StrokeResult ApplyStroke(Kit& kit, MobSystem* mobs, uint64_t wearerId,
       sh.lattice = std::move(live);
     }
   }
-  std::vector<PrefabVoxel>& lat = ItemLatticeMut(*st, *def, s.shell);
+  std::vector<PrefabVoxel>& lat = ItemLatticeMut(*st, *def, shell);
   LatticeGrid g;
   g.Build(lat);
   std::vector<int32_t> cells;
@@ -277,6 +342,7 @@ StrokeResult ApplyStroke(Kit& kit, MobSystem* mobs, uint64_t wearerId,
     // The materialised copy was not needed: the stack goes back exactly as
     // it was (a plain stack stays plain).
     st->damage = before;
+    if (quiver) TidyQuiver(*quiver);
     return r;
   }
   r.hit = true;
@@ -300,10 +366,148 @@ StrokeResult ApplyStroke(Kit& kit, MobSystem* mobs, uint64_t wearerId,
   // A blade washed spotless is a plain stack again (and the push below then
   // rinses the blade in the fist to match).
   ItemLatticeSettle(*st, *def);
+  if (quiver) {
+    if (st->Plain()) TidyQuiver(*quiver);
+    return r;
+  }
   if (s.item.space == KitSpace::Equip && mobs && wearerId)
     r.pushed = PushItemLatticeToLimb(*mobs, wearerId, s.item);
   return r;
 }
+
+CopyResult ApplyCopy(Kit& kit, const ItemLibrary& items,
+                     const std::vector<MaterialDef>& mats, const CopyOrder& c) {
+  CopyResult r;
+  if (!c.active || c.n <= 0) return r;
+  ItemStack* q = kit.Resolve(c.quiver);
+  const ItemDef* qd = q ? items.Of(*q) : nullptr;
+  const ItemDef* ad = qd ? StageDrawDef(*qd, items) : nullptr;
+  if (!qd || !qd->IsQuiver() || !ad) {
+    r.refused = "not a quiver";
+    return r;
+  }
+  if (c.src < 0 || c.src >= (int)q->held.size()) {
+    r.refused = "no arrow there";
+    return r;
+  }
+  ItemStack* vp = kit.Resolve(c.vessel);
+  const ItemDef* vdef = vp ? items.Of(*vp) : nullptr;
+  if (!vdef || !vdef->IsContainer() || !vp->Filled()) {
+    r.refused = "choose a filled flask on the FLASKS row";
+    return r;
+  }
+  if (vp->stoppered) {
+    r.refused = "the flask is stoppered";
+    return r;
+  }
+  if (!IsolateOne(kit, vp)) {
+    r.refused = "no room to take one out of the stack";
+    return r;
+  }
+  const uint16_t mat = ContainerTopMat(*vp, &mats);
+  if (mat == 0 || mat >= mats.size() || mats[mat].stainSlot == 0) {
+    r.refused = "it will not coat anything";
+    return r;
+  }
+  r.mat = mat;
+  // THE PATTERN: the source arrow's coat of THIS material (not the blood it
+  // may also wear), cell by cell. Matched onto each other arrow by POSITION,
+  // so a carved arrow takes it where its cells still are.
+  const std::vector<PrefabVoxel>* src = ItemLatticeIfAny(q->held[(size_t)c.src], 0);
+  std::vector<std::pair<IVec3, uint32_t>> pattern;   // cell, amount
+  if (src)
+    for (const PrefabVoxel& v : *src)
+      if (v.stain && BodyStainMat(v.stain) == mat)
+        pattern.push_back({IVec3{v.x, v.y, v.z}, BodyStainAmt(v.stain)});
+  if (pattern.empty()) {
+    r.refused = "brush that arrow with it first";
+    return r;
+  }
+  // THE PRICE OF ONE LEVEL ON ONE CELL, in eighths: the brush spends
+  // PourBrushCellsPerSec(radius / scale) cells a second and lays
+  // kStrokeAmount levels on the ~pi r^2 cells under it each tick, so the
+  // radius cancels (ApplyStroke's spend, solved per level-cell). A copy costs
+  // what painting the same coat on by hand costs.
+  const float scale = (float)std::max(1u, ad->scale);
+  const float perLevelCell =
+      (float)vdef->container.applyCells * (float)kContainerUnitsPerCell /
+      (30.0f * (float)kStrokeAmount * 3.14159265f * scale * scale *
+       kPourBrushRefRadius * kPourBrushRefRadius);
+  const bool washes = (mats[mat].gpu.stainPack & kStainPackWashesBit) != 0;
+  auto lay = [&](uint16_t cur, uint32_t amt) {
+    return washes ? WashBodyStain(cur, mat, amt, amt) : AddBodyStain(cur, mat, amt, amt);
+  };
+  auto indexOf = [](const std::vector<PrefabVoxel>& lat) {
+    std::unordered_map<uint64_t, size_t> at;
+    at.reserve(lat.size());
+    for (size_t i = 0; i < lat.size(); i++) at.emplace(CellKeyOf(lat[i]), i);
+    return at;
+  };
+  int64_t owedMilli = 0;
+  int srcAt = c.src;
+  // Bounded by the quiver's own entries (rule 2): each pass coats one arrow
+  // or finds none and stops.
+  for (int guard = 0; r.done < c.n && guard < 4 * (int)kMaxQuiverEntries; guard++) {
+    // The first arrow after the source's entry (wrapping) that would take
+    // anything -- measured on its lattice as it is, or as authored.
+    int pick = -1;
+    const int nh = (int)q->held.size();
+    for (int k = 1; k < nh && pick < 0; k++) {
+      const int e = (srcAt + k) % nh;
+      const ItemInstance& h = q->held[(size_t)e];
+      if (h.Empty() || h.name != ad->name) continue;
+      std::vector<PrefabVoxel> scratch;
+      const std::vector<PrefabVoxel>* lat = ViewLattice(h, *ad, 0, scratch);
+      if (!lat) continue;
+      const auto at = indexOf(*lat);
+      for (const auto& p : pattern) {
+        auto it = at.find(CellKeyOf(p.first));
+        if (it == at.end()) continue;
+        const uint16_t cur = (*lat)[it->second].stain;
+        if (lay(cur, p.second) != cur) { pick = e; break; }
+      }
+    }
+    if (pick < 0) break;
+    // Its own entry (inserted at `pick`, so a split before the source moves
+    // the source one on).
+    const bool split = q->held[(size_t)pick].count > 1;
+    ItemInstance* a = IsolateArrow(*q, pick);
+    if (a == nullptr) break;
+    if (split && pick <= srcAt) srcAt++;
+    std::vector<PrefabVoxel>& lat = ItemLatticeMut(*a, *ad, 0);
+    const auto at = indexOf(lat);
+    uint32_t levels = 0;
+    for (const auto& p : pattern) {
+      auto it = at.find(CellKeyOf(p.first));
+      if (it == at.end()) continue;
+      uint16_t& cur = lat[it->second].stain;
+      const uint16_t next = lay(cur, p.second);
+      if (next == cur) continue;
+      const uint32_t before = BodyStainMat(cur) == mat ? BodyStainAmt(cur) : 0u;
+      const uint32_t after = BodyStainMat(next) == mat ? BodyStainAmt(next) : 0u;
+      levels += after > before ? after - before : 1u;
+      cur = next;
+    }
+    // PAID AS IT GOES: what this arrow owes, out of the vessel.
+    owedMilli += (int64_t)std::llround((double)levels * perLevelCell * 1000.0);
+    const uint32_t units = (uint32_t)(owedMilli / 1000);
+    r.done++;
+    if (units > 0) {
+      const uint32_t took = vp->contents.Take(mat, units);
+      r.spent += took;
+      owedMilli -= (int64_t)took * 1000;
+      // The vessel ran dry under this arrow: it keeps what it was given (the
+      // coat was paid for as far as there was any), and the copy ends.
+      if (took < units) break;
+    }
+    if (!vp->Filled()) break;
+  }
+  // The last fraction of an eighth is paid too: a copy is never free.
+  if (owedMilli > 0 && vp->Filled()) r.spent += vp->contents.Take(mat, 1);
+  TidyQuiver(*q);
+  return r;
+}
+
 
 std::vector<CoatShare> CoatSummary(const std::vector<PrefabVoxel>& lat) {
   std::map<uint16_t, CoatShare> by;

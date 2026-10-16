@@ -11,6 +11,7 @@
 #include "game/burnprof.h"  // the blade path's own scopes (kSweep, kCoat)
 #include "game/mob.h"     // MobSystem/Mob: the sweep carves live limbs
 #include "game/arrows.h"  // ArrowHeadIn: a peer's arrow stays only with its head in
+#include "game/itemcoat.h"  // a peer's arrow: its lattice wears its poison
 #include "phys/debris.h"  // DebrisSystem: ...and melts loose ones
 #include "phys/physics.h"
 #include "sim/scale.h"    // SkinScaleFor / NeededArtUpsample / kLegacyAuthoring*
@@ -719,6 +720,21 @@ bool LoadItems(const std::string& dir, size_t materialCount,
       d.arrow.sharpness = std::clamp(a.value("sharpness", 1.0f), 0.0f, 1.0f);
       d.arrow.hardness = std::max(0.0f, a.value("hardness", 0.0f));
       d.arrow.damage = std::max(0.0f, a.value("damage", 0.0f));
+    }
+    // ---- A QUIVER (game/quiver.h): what it takes and how many ----------------
+    // A quiver that holds nothing is a tube on your back that the bow can
+    // never draw from: skipped loudly, like a bow with no `bow` block.
+    if (d.kind == ItemKind::Quiver) {
+      const json q = it.value("quiver", json::object());
+      d.quiver.capacity = q.is_object() ? std::clamp(q.value("capacity", 0), 0, 256) : 0;
+      d.quiver.ammo = q.is_object() ? q.value("ammo", std::string("arrow")) : std::string();
+      if (d.quiver.capacity <= 0 || d.quiver.ammo.empty()) {
+        errors += "items: \"" + d.name +
+                  "\" is a quiver with no usable `quiver` block (capacity > 0, "
+                  "ammo) -- skipped\n";
+        continue;
+      }
+      d.quiver.has = true;
     }
     // ---- VESSELS (game/container.h) ----------------------------------------
     // `holds` by CLASS NAME, so what a vessel takes up is authored, not a
@@ -2575,14 +2591,39 @@ RemoteHitOutcome ApplyRemotePierceHit(const MeleeHit& h, Physics& phys,
     debris.PierceBody(hb, from, dir, h.c.pierce, world, spawns, r);
     return RemoteHitOutcome::Applied;
   }
-  mobs.PierceLimb(hb, from, dir, h.c.pierce, world, spawns, r);
+  // THE ARROW AS THE SHOOTER LOOSED IT (MeleeHit::embedInst): its lattice
+  // trades coats with this channel here, on the owner, by the flight's rule
+  // (game/pierce.h PierceCoat) -- the venom goes into the real wound.
+  const ItemDef* ad =
+      !h.embedItem.empty() && mobs.Items() != nullptr ? mobs.Items()->Named(h.embedItem) : nullptr;
+  ItemInstance arrow = h.embedInst;
+  std::vector<PrefabVoxel>* lat = nullptr;
+  if (ad != nullptr && ad->IsAmmo() && arrow.name == ad->name) {
+    lat = &ItemLatticeMut(arrow, *ad);
+    if (lat->empty()) lat = nullptr;
+  }
+  const std::string slotName = t->SlotName(sl);
+  std::vector<IVec3> wound;
+  mobs.PierceLimb(hb, from, dir, h.c.pierce, world, spawns, r, lat ? &wound : nullptr);
+  if (lat != nullptr && r.hit && !r.missed && !wound.empty()) {
+    MobSystem::CoatContact cc;
+    cc.strikerLattice = lat;
+    cc.strikerScale = (float)(ad->scale ? ad->scale : 1u);
+    cc.strikerCell = ad->arrow.tip * cc.strikerScale;
+    cc.radius = ArrowHeadLength(*ad);
+    cc.targetId = t->Id();
+    cc.targetSlot = sl;
+    cc.targetSlotName = slotName;
+    cc.at = r.stopWorld;
+    cc.kind = MobSystem::CoatHitKind::Pierce;
+    cc.woundCells = &wound;
+    mobs.CoatOnContact(cc);
+  }
   // The flight's own rule (game/arrows.h ArrowHeadIn): it stays only with its
   // head in. A shallower stop is the shooter's to drop.
   if (r.hit && !r.missed && !r.severed &&
-      r.outcome == PierceOutcome::Embedded && !h.embedItem.empty() &&
-      mobs.Items() != nullptr)
-    if (const ItemDef* d = mobs.Items()->Named(h.embedItem))
-      if (ArrowHeadIn(*d, r)) t->EmbedArrow(*d, sl, r.stopWorld, dir);
+      r.outcome == PierceOutcome::Embedded && ad != nullptr && ArrowHeadIn(*ad, r))
+    t->EmbedArrow(*ad, sl, r.stopWorld, dir, lat ? &arrow : nullptr);
   return RemoteHitOutcome::Applied;
 }
 

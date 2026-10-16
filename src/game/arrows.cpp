@@ -9,6 +9,8 @@
 #include "game/anim.h"  // QuatFromTo / QuatRotate
 #include "game/equipment.h"
 #include "game/flightprobe.h"
+#include "game/itemcoat.h"  // the arrow's own lattice: what wears its poison
+#include "game/quiver.h"
 #include "game/mob.h"
 #include "game/worlditems.h"
 #include "phys/debris.h"
@@ -171,27 +173,34 @@ int MobShotsLeft(const Mob& m, const ItemLibrary& items) {
 
 int KitAmmoCount(const Kit& kit, const std::string& ammo) {
   if (ammo.empty()) return 0;
+  // The Back slot takes nothing but a quiver (equipment.h), so its held list
+  // IS the worn quiver's -- no library needed to ask how many shots are left.
   int n = 0;
-  for (const ItemStack& s : kit.hotbar.slots)
-    if (!s.Empty() && s.name == ammo) n += std::max(0, s.count);
-  for (const ItemStack& s : kit.bag.slots)
-    if (!s.Empty() && s.name == ammo) n += std::max(0, s.count);
+  for (const ItemInstance& h : kit.equip.At((int)EquipSlotId::Back).held)
+    if (!h.Empty() && h.name == ammo) n += std::max(0, h.count);
   return n;
 }
 
-bool KitTakeAmmo(Kit& kit, const std::string& ammo) {
+bool KitTakeAmmo(Kit& kit, const std::string& ammo, uint32_t key,
+                 ItemInstance* out) {
   if (ammo.empty()) return false;
-  auto takeFrom = [&](ItemStack* slots, int n) {
-    for (int i = 0; i < n; i++) {
-      ItemStack& s = slots[i];
-      if (s.Empty() || s.name != ammo || s.count <= 0) continue;
-      if (--s.count <= 0) s = ItemStack{};
-      return true;
-    }
-    return false;
-  };
-  return takeFrom(kit.hotbar.slots, kItemSlots) ||
-         takeFrom(kit.bag.slots, Bag::kSlots);
+  ItemInstance& q = kit.equip.slots[(int)EquipSlotId::Back];
+  const int e = QuiverPick(q, key, ammo);
+  if (e < 0) return false;
+  ItemInstance one = QuiverTakeOne(q, e);
+  if (one.Empty()) return false;
+  if (out) *out = std::move(one);
+  return true;
+}
+
+ItemInstance KitPeekAmmo(const Kit& kit, const std::string& ammo, uint32_t key) {
+  if (ammo.empty()) return ItemInstance{};
+  const ItemInstance& q = kit.equip.At((int)EquipSlotId::Back);
+  const int e = QuiverPick(q, key, ammo);
+  if (e < 0) return ItemInstance{};
+  ItemInstance one = q.held[(size_t)e];
+  one.count = 1;
+  return one;
 }
 
 // ---- G ON AN ARROW STUCK IN A CREATURE ------------------------------------------
@@ -220,25 +229,21 @@ bool PullArrowSlotToKit(Mob& m, int li, Kit& kit, const ItemLibrary& items,
   const std::string name = m.ArrowItemOf(li);
   const int di = items.Find(name);
   if (di < 0) return false;
-  // ROOM FIRST: a full pack refuses and the arrow stays where it is, the
-  // ground pickup's rule (nothing a take does can lose an item).
-  const ItemStack one = StackOf(items, di, 1);
-  ItemStack* into = nullptr;
-  int where = kit.bag.Add(one);
-  if (where >= 0) {
-    into = &kit.bag.slots[where];
-  } else if ((where = kit.hotbar.Add(one)) >= 0) {
-    into = &kit.hotbar.slots[where];
-  } else {
+  // THE ARROW AS IT COMES OUT: wearing whatever the wound and the poison left
+  // on it (Mob::PullArrowLattice), so it goes into the quiver as itself.
+  ItemStack one = StackOf(items, di, 1);
+  m.PullArrowLattice(li, one.damage);
+  // A slot that will not come out (mid-sever hold) stays where it is.
+  // ROOM FIRST: a full kit refuses and the arrow stays in the body, the
+  // ground pickup's rule (nothing a take does can lose an item). The quiver
+  // on your back, then the pack, then the hotbar (KitReceiveArrow).
+  Kit trial = kit;
+  if (!KitReceiveArrow(trial, items, one)) {
     if (noRoom) *noRoom = true;
     return false;
   }
-  // A slot that will not come out (mid-sever hold) gives the pocketed one
-  // back: nothing a take does can make an item either.
-  if (!m.PullArrow(li)) {
-    if (--into->count <= 0) *into = ItemStack{};
-    return false;
-  }
+  if (!m.PullArrow(li)) return false;
+  kit = std::move(trial);
   if (itemOut) *itemOut = name;
   return true;
 }
@@ -247,7 +252,8 @@ bool PullArrowSlotToKit(Mob& m, int li, Kit& kit, const ItemLibrary& items,
 
 bool ArrowFlights::Launch(const ItemDef& arrow, Vec3 fromWorld, Vec3 dirWorld,
                           float speedVox, Vec3 carryVox, uint32_t seed,
-                          std::vector<uint64_t> ignore, uint64_t shooterActor) {
+                          std::vector<uint64_t> ignore, uint64_t shooterActor,
+                          const ItemInstance* inst) {
   if (!arrow.IsAmmo()) return false;
   const float dl = dirWorld.len();
   if (!(dl > 1e-6f) || !(speedVox > 0.0f)) return false;
@@ -262,6 +268,13 @@ bool ArrowFlights::Launch(const ItemDef& arrow, Vec3 fromWorld, Vec3 dirWorld,
   f.prev = f.pos;
   f.vel = FxOf(v * (1.0f / (float)kArrowTicksPerSecond));
   f.item = arrow.name;
+  if (inst != nullptr && !inst->Empty() && inst->name == arrow.name) {
+    f.arrow = *inst;
+  } else {
+    f.arrow.name = arrow.name;
+  }
+  f.arrow.count = 1;
+  f.arrow.held.clear();
   f.seed = seed;
   f.ticksLeft = kLifeTicks;
   f.ignore = std::move(ignore);
@@ -447,12 +460,15 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
     return e;
   };
   // An item body for this arrow: stuck (kinematic) or dropped (falling).
-  auto placeItem = [&](const ItemDef& def, Vec3 tip, Vec3 dir, Vec3 vel,
-                       bool stuck) -> uint64_t {
+  // ...as ITSELF: the flight's own instance, its coat with it (a clean one
+  // settles back to a plain arrow first, so it stacks again when picked up).
+  auto placeItem = [&](const ItemDef& def, ArrowFlight& fl, Vec3 tip, Vec3 dir,
+                       Vec3 vel, bool stuck) -> uint64_t {
     if (w.ground == nullptr) return 0;
-    ItemInstance inst;
+    ItemInstance inst = fl.arrow;
     inst.name = def.name;
     inst.count = 1;
+    ItemLatticeSettle(inst, def);
     return DropItemToWorldXf(def, inst, ArrowXf(def, tip, dir), vel, w.phys,
                              w.debris, w.micro, *w.ground, nullptr, stuck);
   };
@@ -542,9 +558,20 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
         const float speed0 = SpeedMpsOf(f.vel);
         const Penetrator pen =
             ArrowPenetrator(*def, speed0, f.seed ^ (tick * 2654435761u));
+        // WHAT THE POINT WEARS (PierceCoat): the arrow's own lattice,
+        // materialised on its first flight tick (a plain arrow's is the
+        // authored one, clean) -- the poison it carries goes into a wound it
+        // opens, and the wound's blood onto it.
+        PierceCoat pc;
+        pc.lattice = &ItemLatticeMut(f.arrow, *def);
+        pc.scale = (float)(def->scale ? def->scale : 1u);
+        pc.tipCell = def->arrow.tip * pc.scale;
+        pc.headVox = ArrowHeadLength(*def);
+        pc.item = &f.arrow;
+        if (pc.lattice->empty()) pc.lattice = nullptr;
         const PierceFlight pf =
             PierceAlongRay(w.phys, w.mobs, w.debris, w.world, spawns, a, seg,
-                           len, pen, f.ignore, def->name, f.shooter, f.from);
+                           len, pen, f.ignore, def->name, f.shooter, f.from, &pc);
         for (const PierceHit& h : pf.hits) {
           ArrowEvent e = event(ArrowEvent::Kind::Hit, f);
           e.mobId = h.mobId;
@@ -574,7 +601,8 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
               int slot = -1;
               if (m != nullptr && MobSystem::OwnedHere(*m) && !last.r.severed &&
                   last.limb >= 0)
-                slot = m->EmbedArrow(*def, last.limb, last.r.stopWorld, d);
+                slot = m->EmbedArrow(*def, last.limb, last.r.stopWorld, d,
+                                     &f.arrow);
               if (slot >= 0) {
                 e.kind = ArrowEvent::Kind::Embedded;
                 e.slot = slot;
@@ -592,7 +620,7 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
                 host = w.phys.Successor(host);
               uint64_t ab = 0;
               if (host != 0 && !w.debris.IsGhost(host)) {
-                ab = placeItem(*def, last.r.stopWorld, d, Vec3{}, true);
+                ab = placeItem(*def, f, last.r.stopWorld, d, Vec3{}, true);
                 if (ab != 0 && !w.debris.StrapBody(ab, host)) {
                   // No strap: it stands where it stopped, a stuck item.
                 }
@@ -614,7 +642,7 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
             const Vec3 at = last.r.hit ? last.r.entryWorld : pf.endWorld;
             const Vec3 back =
                 d * (-0.15f * MetresPerSecToCells(speed0)) + Vec3{0, 2.0f, 0};
-            const uint64_t ab = placeItem(*def, at - d * 0.5f, d, back, false);
+            const uint64_t ab = placeItem(*def, f, at - d * 0.5f, d, back, false);
             e.kind = ArrowEvent::Kind::Dropped;
             e.body = ab;
             e.at = at;
@@ -642,7 +670,7 @@ void ArrowFlights::Tick(uint32_t tick, ArrowWorld& w,
             ArrowHeadLength(*def),
             std::clamp(0.3f + 1.7f * mps / 65.0f, 0.3f, 2.5f));   // voxels
         const Vec3 tip = FloatOf(p) + d * depth;
-        const uint64_t ab = placeItem(*def, tip, d, Vec3{}, true);
+        const uint64_t ab = placeItem(*def, f, tip, d, Vec3{}, true);
         ArrowEvent e = event(ab ? ArrowEvent::Kind::Stuck : ArrowEvent::Kind::Broke, f);
         e.body = ab;
         e.at = tip;

@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -8,6 +9,7 @@
 #include "game/hand.h"
 #include "game/item.h"
 #include "game/kitref.h"
+#include "game/quiver.h"  // a drag of arrows onto a quiver LOADS it (Kit::Move)
 
 // WHAT THE CHARACTER IS WEARING AND CARRYING — the equipment slots, the bag,
 // and (since W2-M) the Kit that bundles them with the hotbar.
@@ -83,6 +85,13 @@ enum class EquipSlotId : uint8_t {
   // rig slot Mob::EquipItem makes, not a set of shells.
   HandR,
   HandL,
+  // THE BACK (2026-10-15, docs/PLAN_poison_arrows.md): where a QUIVER rides,
+  // and the only place the bow draws from (game/quiver.h). Not WORN in the
+  // shell sense (EquipSlotIsWorn stops at Trinket): the quiver is drawn on
+  // the rig's `back` socket as a render-only prop, never a shell or a slot,
+  // so nothing carves it (owner: not damageable, for now). Q / E on a quiver
+  // in the hotbar puts it here instead of in a hand.
+  Back,
   Count,
 };
 
@@ -102,6 +111,9 @@ enum class MoveResult : uint8_t {
   // melee.injuredArmDrop). Refused rather than equipped and then dropped by
   // Mob::GripFails on the next tick.
   HandTooHurt,
+  // Arrows dragged onto a quiver that has no room for any of them (a drag
+  // onto a quiver LOADS it rather than swapping, Kit::Move).
+  QuiverFull,
 };
 
 // One equipment slot's authored rules. `accepts` empty means REFUSE
@@ -164,6 +176,8 @@ inline const EquipSlotDef* EquipSlots() {
       {EquipSlotId::HandL, "Left hand", "slot_hands",
        {ItemKind::Melee, ItemKind::Container, ItemKind::Shield},
        "requires: something to hold"},
+      {EquipSlotId::Back, "Back", "slot_sheath", {ItemKind::Quiver},
+       "requires: a quiver"},
   };
   return k;
 }
@@ -397,6 +411,14 @@ struct Kit {
     if (!a || !b) return MoveResult::BadSlot;
     if (a->Empty()) return MoveResult::Empty;
 
+    // ARROWS ONTO A QUIVER LOAD IT (2026-10-15, game/quiver.h): as many as fit
+    // go in, the rest stay where they were -- not a swap, and asked BEFORE the
+    // slot table, because the quiver on your back is in a slot that takes no
+    // arrows. A full quiver says so rather than trading places with them.
+    if (const ItemDef* qd = lib.Of(*b); qd != nullptr && qd->IsQuiver() &&
+                                        QuiverTakes(*qd, *a))
+      return QuiverLoad(*b, *qd, *a) > 0 ? MoveResult::Ok : MoveResult::QuiverFull;
+
     auto kindOf = [&](const ItemStack& s) {
       const ItemDef* d = lib.Of(s);
       return d ? d->kind : ItemKind::None;
@@ -438,6 +460,17 @@ struct Kit {
         s = ItemStack{};
         return;
       }
+      // A quiver keeps only the arrows this library still knows; anything
+      // else never holds anything.
+      if (!d->IsQuiver()) {
+        s.held.clear();
+      } else {
+        s.held.erase(std::remove_if(s.held.begin(), s.held.end(),
+                                    [&](const ItemInstance& h) {
+                                      return h.Empty() || lib.Find(h.name) < 0;
+                                    }),
+                     s.held.end());
+      }
       if (!d->IsContainer()) {
         s.ClearFill();
       } else {
@@ -471,6 +504,8 @@ inline const char* MoveResultText(MoveResult r, const KitRef& to) {
       if (to.space == KitSpace::Equip && to.index == EquipSlotOfHand(Hand::Right))
         return "your right hand is too hurt to hold that";
       return "that hand is too hurt to hold anything";
+    case MoveResult::QuiverFull:
+      return "the quiver is full";
     case MoveResult::BadSlot:
     default:
       return "no such slot";

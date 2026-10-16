@@ -475,11 +475,13 @@ constexpr uint64_t kShotBenchLast = 425;
 // and a cuirass on the chest; the screen opened, the sword double-clicked,
 // the flask chosen on the FLASKS row, strokes painted, the item turned and
 // zoomed, Esc, the sword double-clicked again, then the cuirass double-
-// clicked, its next shell chosen and painted. Pictures
+// clicked, its next shell chosen and painted; then (2026-10-15) the QUIVER on
+// the back double-clicked, one arrow brushed and its coat copied onto the
+// rest with "apply". Pictures
 // screenshot_stage_<step>.bmp; the stage's own cost (redraws against frames)
 // is printed at the end.
 bool g_shotStage = false;
-constexpr uint64_t kShotStageLast = 520;
+constexpr uint64_t kShotStageLast = 660;
 // The stage's cost, counted while it is open: frames, CPU redraws of the
 // picture, and the milliseconds of each (--shot-stage prints them).
 struct StageProf {
@@ -4515,6 +4517,8 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   // The arrows still in the air (">N~"), where the last tick left them.
   std::vector<RenderOnlyBody> flightBodies;
   rig.Authority().arrows.AppendRenderBodies(items, 1.0f, flightBodies);
+  // ...and the quivers on the backs that wear one (game/quiver.h).
+  mobs.ForEachCreature([&](Mob& m) { PresentQuiver(m, items, flightBodies); });
   bodyReg.SetRenderOnly(&flightBodies);
   std::vector<BodyXformGpu> xf;
   bodyReg.BuildXforms(xf);
@@ -8871,6 +8875,16 @@ int main(int argc, char** argv) {
       else
         hotbar.Add(st);
     }
+    // THE QUIVER ON YOUR BACK, LOADED (game/quiver.h): the loop above put the
+    // first quiver in the Back slot (it takes nothing else) and the arrows in
+    // the pack; as many as it holds go into it, the rest stay in the pack --
+    // the bow draws from the quiver and from nothing else.
+    {
+      const ItemDef* qd = nullptr;
+      if (ItemStack* q = KitWornQuiver(kit, items, &qd))
+        for (ItemStack& b : kit.bag.slots)
+          if (!b.Empty() && QuiverTakes(*qd, b)) QuiverLoad(*q, *qd, b);
+    }
     // --shot-swim photographs the STROKE: a sword in the fist puts that arm
     // in its guard and hides half of it, so the harness swims empty-handed.
     // --shot-archery: the BOW in the right fist (whatever the stub kit put
@@ -8923,6 +8937,7 @@ int main(int argc, char** argv) {
     ui.bagRows = Bag::kRows;
     ui.handEquipSlot[0] = EquipSlotOfHand(Hand::Right);
     ui.handEquipSlot[1] = EquipSlotOfHand(Hand::Left);
+    ui.backEquipSlot = (int)EquipSlotId::Back;
   }
   // Burn-material ids for the inspector's charred readout, resolved ONCE here
   // and again after every materials reload — never per frame (see ResolveBurnMats).
@@ -12666,10 +12681,34 @@ int main(int argc, char** argv) {
         if (f == 492) hm.queue.push_back({0, false, 0});
       }
       if (f == 500) g_shotJumpPath = "screenshot_stage_bag_painted.bmp";
+      // THE QUIVER ON THE BACK (game/quiver.h): Esc the dagger, double-click
+      // the Back slot, brush the arrow shown, then "apply" copies its coat.
+      if (f == 505) g_harnessKey = GLFW_KEY_ESCAPE;
+      if (f == 507) g_harnessKey = -1;
+      if (f == 515) aim("eqback");
+      if (f == 518 && aim("eqback")) hm.DoubleClick(0);
+      if (f == 535) g_shotJumpPath = "screenshot_stage_quiver.bmp";
+      if (f >= 540 && f <= 580) {
+        const float t = (float)(f - 540) / 40.0f;
+        aimStage(W * (0.08f + 0.84f * t), H * 0.5f);
+        if (f == 540) hm.queue.push_back({0, true, 0});
+        if (f == 580) hm.queue.push_back({0, false, 0});
+      }
+      if (f == 588) g_shotJumpPath = "screenshot_stage_quiver_painted.bmp";
+      if (f == 592 && aim("##stagecopy")) hm.Click(0);
+      if (f == 606) {
+        g_shotJumpPath = "screenshot_stage_quiver_copied.bmp";
+        const ItemStack& q = kit.equip.At((int)EquipSlotId::Back);
+        int coated = 0;
+        for (const ItemInstance& a : q.held)
+          if (!a.Plain()) coated += a.count;
+        std::printf("--shot-stage: quiver: %d of %d arrows coated, %zu entries\n", coated,
+                    QuiverCount(q), q.held.size());
+      }
       // Esc twice: the stage, then the screen.
-      if (f == 505 || f == 512) g_harnessKey = GLFW_KEY_ESCAPE;
-      if (f == 507 || f == 514) g_harnessKey = -1;
-      if (f == 518) {
+      if (f == 615 || f == 622) g_harnessKey = GLFW_KEY_ESCAPE;
+      if (f == 617 || f == 624) g_harnessKey = -1;
+      if (f == 640) {
         std::printf("--shot-stage: after Esc x2: stage %s, screen %s\n",
                     ui.itemStage.open ? "OPEN" : "closed",
                     ui.inventoryOpen ? "OPEN" : "closed");
@@ -14468,9 +14507,20 @@ int main(int argc, char** argv) {
     // what a vessel holds, what a worn piece has been through — through this
     // one helper: bag first, hotbar as the overflow, -1 when there is no room
     // or the name is not an item this library has.
+    // AN ARROW GOES INTO THE QUIVER ON YOUR BACK FIRST (game/quiver.h
+    // KitReceiveArrow), if it takes it and has room -- answered as slot 0,
+    // which is all a caller reads ("where >= 0" is "it went in").
     auto pocket = [&](const ItemInstance& it) -> int {
       const ItemStack s = KitStackFrom(it.One(), items);
       if (s.Empty()) return -1;
+      {
+        const ItemDef* qd = nullptr;
+        ItemStack* q = KitWornQuiver(kit, items, &qd);
+        ItemStack one = s;
+        if (q && QuiverTakes(*qd, one) && QuiverRoom(*q, *qd) >= one.count &&
+            QuiverLoad(*q, *qd, one) > 0)
+          return 0;
+      }
       int where = kit.bag.Add(s);
       if (where < 0) where = hotbar.Add(s);
       return where;
@@ -16340,6 +16390,17 @@ int main(int argc, char** argv) {
           caster.ClearHand(hk);
         } else if (hotEmpty && handEmpty) {
           msg = std::string("nothing to put in your ") + HandName(h) + " hand";
+        } else if (const ItemDef* hd = hotEmpty ? nullptr : items.Of(hotbar.Selected());
+                   hd != nullptr && hd->IsQuiver()) {
+          // A QUIVER GOES ON YOUR BACK, not in a hand (game/quiver.h): Q or E
+          // is one more way to put it there, a swap like any kit move -- the
+          // one that was on your back comes into this hotbar slot.
+          std::string what = hd->name;
+          std::replace(what.begin(), what.end(), '_', ' ');
+          const KitRef back{KitSpace::Equip, (int)EquipSlotId::Back};
+          const MoveResult r = avatar.KitMove(hot, back, items);
+          msg = r == MoveResult::Ok ? "the " + what + " on your back"
+                                    : std::string(MoveResultText(r, back));
         } else {
           const std::string what =
               hotEmpty ? kit.equip.InHand(h).name : hotbar.Selected().name;
@@ -18614,8 +18675,10 @@ int main(int argc, char** argv) {
           const int gi = ui.dropItem.from.index;
           std::vector<LootPiece> pieces;
           if (c) c->LootPieces(pieces);
+          // ...and the quiver on its back (no body of its own either).
           const bool carried = c && gi >= 0 && gi < (int)pieces.size() &&
-                               pieces[(size_t)gi].kind == LootPiece::Kind::Carried;
+                               (pieces[(size_t)gi].kind == LootPiece::Kind::Carried ||
+                                pieces[(size_t)gi].kind == LootPiece::Kind::Back);
           if (carried) {
             // A CARRIED STACK HAS NO BODY TO SHED, so this one is a DROP, not
             // a hand-over: ShedCorpseLoot cuts loose a body that is already
@@ -18954,9 +19017,13 @@ int main(int argc, char** argv) {
             // torso, not on the left forearm that happens to be listed first).
             ui.itemStage.shell = 0;
             size_t most = 0;
-            for (int k = 0; k < ItemLatticeCount(*d); k++)
+            for (int k = 0; k < ItemLatticeCount(*d) && !d->IsQuiver(); k++)
               if (const std::vector<PrefabVoxel>* a = ItemAuthoredLattice(*d, k))
                 if (a->size() > most) { most = a->size(); ui.itemStage.shell = k; }
+            // A QUIVER opens on its first COATED arrow, else its first.
+            if (d->IsQuiver())
+              for (int k = 0; k < (int)st->held.size(); k++)
+                if (!st->held[(size_t)k].Plain()) { ui.itemStage.shell = k; break; }
             ui.itemStage.resetView = true;
             stageItem = st->name;
             stageKey = 0;
@@ -18982,8 +19049,27 @@ int main(int argc, char** argv) {
             T.zoom = v0.zoom;
             T.resetView = false;
           }
-          const int nShell = ItemLatticeCount(*sdef);
+          // A QUIVER shows ONE ARROW at a time: its "shells" are its arrows'
+          // entries, and what is drawn is the arrow (itemstage::StageDrawDef).
+          const bool isQuiver = sdef->IsQuiver();
+          const ItemDef* ddef = itemstage::StageDrawDef(*sdef, items);
+          const int nShell = isQuiver ? (int)sst->held.size() : ItemLatticeCount(*sdef);
           T.shell = std::clamp(T.shell, 0, std::max(0, nShell - 1));
+          T.quiver = isQuiver;
+          T.arrows = isQuiver ? QuiverCount(*sst) : 0;
+          const ItemInstance* entry =
+              isQuiver && T.shell < (int)sst->held.size() ? &sst->held[(size_t)T.shell] : nullptr;
+          if (T.wantCopy) {
+            T.wantCopy = false;
+            if (isQuiver && entry) {
+              itemstage::CopyOrder& co = session.itemStageCopy;
+              co.active = true;
+              co.quiver = T.openRef;
+              co.src = T.shell;
+              co.n = T.copyN;
+              co.vessel = ui.activeVessel;
+            }
+          }
           // WORDS, NOT IDENTIFIERS: "iron cuirass", "body armour", "left
           // forearm" -- the item's file name, the kind enum and the rig's part
           // names are content ids (BodySlotLabel's rule).
@@ -19000,22 +19086,54 @@ int main(int argc, char** argv) {
             case ItemKind::ArmorBelt: T.kindText = "worn at the waist"; break;
             case ItemKind::Trinket: T.kindText = "a trinket"; break;
             case ItemKind::Shield: T.kindText = "a shield, held"; break;
+            case ItemKind::Quiver: {
+              char kb[64];
+              std::snprintf(kb, sizeof kb, "%d / %d %ss", T.arrows,
+                            sdef->quiver.capacity, sdef->quiver.ammo.c_str());
+              T.kindText = T.arrows ? std::string(kb) : std::string("an empty quiver");
+              break;
+            }
             default: T.kindText = ItemKindName(sdef->kind); break;
           }
           {
             Hand sh = Hand::Right;
             const bool inHand = T.openRef.space == KitSpace::Equip &&
                                 EquipSlotIsHand(T.openRef.index, &sh);
+            const bool onBack = T.openRef.space == KitSpace::Equip &&
+                                T.openRef.index == (int)EquipSlotId::Back;
             T.where = inHand ? (sh == Hand::Right ? "in your right hand" : "in your left hand")
+                      : onBack ? "on your back"
                       : T.openRef.space == KitSpace::Equip  ? "you are wearing it"
                       : T.openRef.space == KitSpace::Hotbar ? "on the hotbar"
                                                             : "in the pack";
             // A coat dries only in the hand or on the body; in the pack it is
             // kept as it is (DESIGN.md "A coat moves on contact").
-            T.frozen = T.openRef.space != KitSpace::Equip;
+            T.frozen = T.openRef.space != KitSpace::Equip || isQuiver;
           }
           T.shellNames.clear();
-          if (!sdef->cover.empty()) {
+          // A quiver's entries, as words: "plain x18", "venom".
+          if (isQuiver)
+            for (const ItemInstance& a : sst->held) {
+              uint32_t best = 0, bestN = 0;
+              if (const std::vector<PrefabVoxel>* al = ItemLatticeIfAny(a, 0)) {
+                std::vector<std::pair<uint32_t, uint32_t>> on;
+                for (const PrefabVoxel& v : *al) {
+                  if (!v.stain) continue;
+                  const uint32_t m = BodyStainMat(v.stain);
+                  bool f = false;
+                  for (auto& t : on) if (t.first == m) { t.second++; f = true; break; }
+                  if (!f) on.push_back({m, 1u});
+                }
+                for (const auto& t : on)
+                  if (t.second > bestN) { bestN = t.second; best = t.first; }
+              }
+              // The arrow is always the quiver's ammo: the label is its COAT
+              // ("venom", "plain x18"), short enough for the selector.
+              std::string label = bestN && best < mats.size() ? mats[best].name : "plain";
+              if (a.count > 1) label += " x" + std::to_string(a.count);
+              T.shellNames.push_back(label);
+            }
+          if (!isQuiver && !sdef->cover.empty()) {
             // The part a shell covers, as the character screen names it: the
             // wearer's own rig gives the part's tag, BodySlotFor the figure
             // slot, BodySlotLabel the words. A part no figure slot has keeps
@@ -19040,13 +19158,22 @@ int main(int argc, char** argv) {
           // ApplyStroke); else the authored lattice, clean.
           const auto profT0 = std::chrono::steady_clock::now();
           static std::vector<PrefabVoxel> stageScratch;
-          const std::vector<PrefabVoxel>* lat = ItemLatticeIfAny(*sst, T.shell);
-          if (!lat && T.openRef.space == KitSpace::Equip && avatar.Spawned()) {
-            const Mob* wm = mobs.FindCreature(avatar.Id());
-            if (wm && wm->KitShellLattice(T.openRef.index, T.shell, stageScratch))
-              lat = &stageScratch;
+          const std::vector<PrefabVoxel>* lat = nullptr;
+          if (isQuiver) {
+            // The arrow: its record, else as authored, clean.
+            if (entry && ddef) {
+              lat = ItemLatticeIfAny(*entry, 0);
+              if (!lat) lat = itemstage::ViewLattice(*entry, *ddef, 0, stageScratch);
+            }
+          } else {
+            lat = ItemLatticeIfAny(*sst, T.shell);
+            if (!lat && T.openRef.space == KitSpace::Equip && avatar.Spawned()) {
+              const Mob* wm = mobs.FindCreature(avatar.Id());
+              if (wm && wm->KitShellLattice(T.openRef.index, T.shell, stageScratch))
+                lat = &stageScratch;
+            }
+            if (!lat) lat = itemstage::ViewLattice(*sst, *sdef, T.shell, stageScratch);
           }
-          if (!lat) lat = itemstage::ViewLattice(*sst, *sdef, T.shell, stageScratch);
           // REDRAW ONLY WHEN WHAT IT SHOWS MOVED. Two keys: the LATTICE (its
           // cells, words and coats, the shell, the dye) decides whether the
           // pick grid and the readout are rebuilt; the lattice and the VIEW
@@ -19112,9 +19239,10 @@ int main(int argc, char** argv) {
             itemstage::Look look;
             look.mats = &mats;
             look.artColors = mobs.MicroSet() ? &mobs.MicroSet()->artColors : nullptr;
-            look.artBank = sdef->prefab.artBank;
-            look.dye = sst->dye;
-            look.scale = sdef->scale;
+            const ItemDef& drawn = ddef ? *ddef : *sdef;
+            look.artBank = drawn.prefab.artBank;
+            look.dye = entry ? entry->dye : sst->dye;
+            look.scale = drawn.scale;
             itemstage::Render(grid, *lat, scam, look, stagePixels);
             stageKey = key;
             stageFresh = true;
@@ -19140,7 +19268,8 @@ int main(int argc, char** argv) {
               itemstage::Stroke& is = session.itemStroke;
               is.active = true;
               is.item = T.openRef;
-              is.shell = T.shell;
+              is.shell = isQuiver ? 0 : T.shell;
+              is.held = isQuiver ? T.shell : -1;
               is.ro = ro;
               is.rd = rd;
               is.radius = T.radius;
@@ -19669,6 +19798,61 @@ int main(int argc, char** argv) {
           u.count = st.count;
           u.wearable = ItemKindIsWorn(d->kind);
           u.stageable = itemstage::StageTakes(*d);
+          // A QUIVER (game/quiver.h): the number on it is its ARROWS, and its
+          // coat swatch is theirs -- the most common coat on its arrows, so a
+          // poisoned quiver reads as one on your back and in the pack.
+          if (d->IsQuiver()) {
+            u.count = QuiverCount(st);
+            int coated = 0;
+            std::vector<std::pair<uint32_t, int>> tally;
+            for (const ItemInstance& a : st.held) {
+              const std::vector<PrefabVoxel>* lat = ItemLatticeIfAny(a, 0);
+              if (!lat) continue;
+              uint32_t best = 0, bestN = 0;
+              std::vector<std::pair<uint32_t, uint32_t>> on;
+              for (const PrefabVoxel& v : *lat) {
+                if (!v.stain) continue;
+                const uint32_t m = BodyStainMat(v.stain);
+                bool f = false;
+                for (auto& t : on) if (t.first == m) { t.second++; f = true; break; }
+                if (!f) on.push_back({m, 1u});
+              }
+              for (const auto& t : on)
+                if (t.second > bestN) { bestN = t.second; best = t.first; }
+              if (!bestN) continue;
+              coated += a.count;
+              bool f = false;
+              for (auto& t : tally) if (t.first == best) { t.second += a.count; f = true; break; }
+              if (!f) tally.push_back({best, a.count});
+            }
+            uint32_t topMat = 0;
+            int topN = 0;
+            for (const auto& t : tally)
+              if (t.second > topN) { topN = t.second; topMat = t.first; }
+            if (topN && topMat < mats.size()) {
+              u.coatSwatch = 0xFF000000u | (mats[topMat].gpu.stainColor & 0x00FFFFFFu);
+              u.coatName = mats[topMat].name;
+            }
+            char tip[320];
+            std::snprintf(tip, sizeof tip,
+                          "%d of %d %ss%s%s\n"
+                          "the bow draws a random one\n"
+                          "from the quiver on your back;\n"
+                          "Q / E puts it on your back,\n"
+                          "drag arrows onto it to load it\n"
+                          "double-click: coat one arrow,\n"
+                          "then copy it to the rest",
+                          QuiverCount(st), d->quiver.capacity, d->quiver.ammo.c_str(),
+                          coated ? ", coated: " : "",
+                          coated ? (std::to_string(coated) + (topN && topMat < mats.size()
+                                                                  ? " (" + mats[topMat].name + ")"
+                                                                  : std::string()))
+                                       .c_str()
+                                 : "");
+            u.kind = ItemKindName(d->kind);
+            u.tip = tip;
+            return u;
+          }
           // ITS COAT: the material on most voxels, over every lattice the item
           // has -- the rig's live one for a piece in hand or worn (the rig is
           // its truth there, itemcoat.h), else the stack's record.
@@ -21178,10 +21362,16 @@ int main(int argc, char** argv) {
           // First person: the player's own string is cut short of the lens.
           const bool fp = &m == static_cast<Mob*>(&avatar) && camMode == CameraMode::First;
           PresentDrawnBow(m, items, flightBodies, fp ? &eye : nullptr, 1.0f);
+          // THE QUIVER ON ITS BACK (game/quiver.h), and the arrows in it --
+          // not the player's own in first person (it is behind the lens, and
+          // its tails stand up beside the head).
+          if (!fp) PresentQuiver(m, items, flightBodies);
         });
-        if (!avatarSeen)
+        if (!avatarSeen) {
           PresentDrawnBow(avatar, items, flightBodies,
                           camMode == CameraMode::First ? &eye : nullptr, 1.0f);
+          if (camMode != CameraMode::First) PresentQuiver(avatar, items, flightBodies);
+        }
       }
       bodyReg.SetRenderOnly(&flightBodies);
       const auto bodyT0 = std::chrono::steady_clock::now();

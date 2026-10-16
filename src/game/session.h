@@ -670,6 +670,10 @@ struct PlayerSession {
   // for each other.
   itemstage::Stroke itemStroke;
   int64_t itemStageSpendMilli = 0;
+  // ...and BRUSH ONE, COPY TO N on a quiver (itemstage::ApplyCopy): a one-shot,
+  // set by main.cpp when the stage's "apply" is pressed, applied and cleared
+  // by the next tick.
+  itemstage::CopyOrder itemStageCopy;
   uint32_t itemStageTicks = 0;   // ticks this stroke has poured
   // APPLY MODE (TB_APPLY): the same brush, on whatever body the crosshair is
   // on -- another creature, a corpse -- with the vessel in the HAND. Its own

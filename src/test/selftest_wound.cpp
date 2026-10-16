@@ -69,6 +69,12 @@
 #include "game/pierce.h"  // pierce: PierceAlongRay, the projectile entry point
 #include "game/arrows.h"  // arrow: the bow, the flights, the embed
 #include "game/worlditems.h"  // arrow: a stuck arrow is a ground item
+#include "game/itemcoat.h"   // poison-arrow: an arrow's own lattice and coat
+#include "game/itemstage.h"  // poison-arrow: brush one, copy to N
+#include "game/quiver.h"     // poison-arrow: the quiver
+#include "game/caster.h"     // poison-arrow: the PLYR section's refs
+#include "game/persist.h"    // poison-arrow: a quiver through a save
+#include "sim/rng.h"         // poison-arrow: the draw's key
 #include "game/anim.h"   // QuatRotate: a joint anchor is body-local
 #include "game/bodyreg.h"  // heal-restore's optional picture sequence
 #include "gpu/resources.h"  // CreateBuffer, ditto
@@ -11703,6 +11709,21 @@ Status GateArrow(Ctx& c, std::string& detail) {
     return Status::Fail;
   }
   const int arrowIdx = c.items.Find("arrow"), bowIdx = c.items.Find("bow");
+  // THE QUIVER (game/quiver.h): the only thing the bow draws from, and where
+  // a pulled or picked-up arrow goes first. The first in the library that
+  // takes these arrows.
+  int quiverIdx = -1;
+  for (int i = 0; i < (int)c.items.items.size() && quiverIdx < 0; i++)
+    if (c.items.items[(size_t)i].IsQuiver() && c.items.items[(size_t)i].quiver.ammo == "arrow")
+      quiverIdx = i;
+  if (quiverIdx < 0) {
+    detail = "no quiver for `arrow` in the item library";
+    return Status::Fail;
+  }
+  // A kit wearing an (empty) quiver on its back.
+  auto wearQuiver = [&](Kit& k) {
+    k.equip.slots[(int)EquipSlotId::Back] = StackOf(c.items, quiverIdx);
+  };
   const float fullVox = bowDef->bow.drawSpeed;
   const int torsoKillMin = (int)BaselineNumber("arrowTorsoKillMin", 3);
   const int torsoKillMax = (int)BaselineNumber("arrowTorsoKillMax", 5);
@@ -11947,14 +11968,20 @@ Status GateArrow(Ctx& c, std::string& detail) {
       fail(Format("(d) a %.2f draw into the torso did not embed", pullDraw));
     } else {
       Kit kit;
+      wearQuiver(kit);
       const uint64_t ab = mobs.LimbBody(f.id, slot);
       std::string got;
       const bool pulled = PullArrowToKit(mobs, ab, kit, c.items, &got);
+      // Into the QUIVER on the back (KitReceiveArrow), wearing the wound's
+      // blood (the pierce coat exchange, Mob::PullArrowLattice).
       const int inKit = KitAmmoCount(kit, "arrow");
-      lines += Format("(d) pulled the torso arrow: %s, kit %d, %d left in it | ",
-                      pulled ? "yes" : "NO", inKit, m->EmbeddedArrowCount());
+      const ItemInstance& qd = kit.equip.At((int)EquipSlotId::Back);
+      const bool bloody = !qd.held.empty() && !qd.held[0].Plain();
+      lines += Format("(d) pulled the torso arrow: %s, quiver %d (%s), %d left in it | ",
+                      pulled ? "yes" : "NO", inKit, bloody ? "coated" : "clean",
+                      m->EmbeddedArrowCount());
       if (!pulled || inKit != 1 || m->EmbeddedArrowCount() != 0)
-        fail("(d) the pull-out did not move the arrow into the kit");
+        fail("(d) the pull-out did not move the arrow into the quiver");
     }
     // (b) + the count: full draw into the torso until it dies (bounded).
     // The aim is re-measured before every shot: the creature is alive and
@@ -12245,10 +12272,11 @@ Status GateArrow(Ctx& c, std::string& detail) {
     // THE GROUND PICKUP, as main.cpp's take does it: the registry's instance
     // into the kit, then the body goes (its release hook drops the entry).
     Kit kit;
+    wearQuiver(kit);
     bool picked = false;
     if (wi != nullptr) {
       const ItemStack one = KitStackFrom(wi->One(), c.items);
-      picked = kit.bag.Add(one) >= 0 && c.debris.DestroyBody(stuck);
+      picked = KitReceiveArrow(kit, c.items, one) && c.debris.DestroyBody(stuck);
     }
     const bool gone = stuck && ground.Find(stuck) == nullptr;
     lines += Format("(c) into the ground: %s, %s, %s, picked up %s (kit %d) | ",
@@ -12342,6 +12370,8 @@ Status GateArrow(Ctx& c, std::string& detail) {
     PlayerSession& s = f.rig->Session();
     Kit& kit = s.kit();
     kit.equip.slots[EquipSlotOfHand(Hand::Right)] = StackOf(c.items, bowIdx);
+    // ARROWS IN THE PACK ARE CARRIED, NOT SHOT (game/quiver.h): with no
+    // quiver on the back a full draw looses nothing...
     kit.bag.Add(StackOf(c.items, arrowIdx, 3));
     ArrowFlights& fl = f.rig->Authority().arrows;
     const uint64_t launched0 = fl.stats.launched;
@@ -12351,6 +12381,23 @@ Status GateArrow(Ctx& c, std::string& detail) {
         if (down) o.input.SetHeld(TB_ATTACK, true);
       });
     };
+    hold(BowFullDrawTicks(*bowDef) + 3, true);
+    hold(1, false);
+    const uint64_t noQuiver = fl.stats.launched - launched0;
+    if (noQuiver != 0) fail("(g) a bow with no quiver on the back loosed an arrow");
+    // ...and dragged onto a worn quiver (Kit::Move LOADS it), they are.
+    wearQuiver(kit);
+    {
+      int from = -1;
+      for (int i = 0; i < Bag::kSlots && from < 0; i++)
+        if (kit.bag.slots[i].name == "arrow") from = i;
+      const MoveResult mr = kit.Move(KitRef{KitSpace::Bag, from},
+                                     KitRef{KitSpace::Equip, (int)EquipSlotId::Back}, c.items);
+      if (mr != MoveResult::Ok || KitAmmoCount(kit, "arrow") != 3)
+        fail(Format("(g) arrows dragged onto the quiver did not load it (%s, %d in it)",
+                    MoveResultText(mr, KitRef{KitSpace::Equip, (int)EquipSlotId::Back}),
+                    KitAmmoCount(kit, "arrow")));
+    }
     // A tap: one tick down, then up. Under minDraw: nothing flies.
     hold(1, true);
     hold(1, false);
@@ -12365,10 +12412,10 @@ Status GateArrow(Ctx& c, std::string& detail) {
     hold(1, false);
     const uint64_t afterDraw = fl.stats.launched - launched0;
     const int ammoAfterDraw = KitAmmoCount(kit, "arrow");
-    lines += Format("(g) input: tap loosed %llu (pack %d); full draw %.2f "
-                    "loosed %llu (pack %d)",
-                    (unsigned long long)afterTap, ammoAfterTap, drawn,
-                    (unsigned long long)afterDraw, ammoAfterDraw);
+    lines += Format("(g) input: no quiver loosed %llu; tap loosed %llu (quiver %d); "
+                    "full draw %.2f loosed %llu (quiver %d)",
+                    (unsigned long long)noQuiver, (unsigned long long)afterTap,
+                    ammoAfterTap, drawn, (unsigned long long)afterDraw, ammoAfterDraw);
     if (afterTap != 0 || ammoAfterTap != 3)
       fail("(g) a tap under minDraw loosed an arrow");
     if (afterDraw != 1 || ammoAfterDraw != 2 || drawn < 0.999f)
@@ -12382,6 +12429,388 @@ Status GateArrow(Ctx& c, std::string& detail) {
                   arrowDef->arrow.massKg * 1000.0f, arrowDef->arrow.damage,
                   CellsToMetres(fullVox), lines.c_str(), why.c_str());
   std::printf("arrow: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// poison-arrow: a QUIVER, an arrow brushed with venom and copied to the rest,
+// shot into a man (docs/PLAN_poison_arrows.md, game/quiver.h)
+// ---------------------------------------------------------------------------
+//
+//   A  the quiver   arrows dragged onto a worn quiver LOAD it (Kit::Move), to
+//                   its capacity and no further; the draw is a deterministic
+//                   function of its key (KitPeekAmmo == what KitTakeAmmo
+//                   takes) and reaches every entry by its count; a quiver of
+//                   plain and coated arrows survives the item record
+//                   (WriteItemInstance / ReadItemInstance) byte for byte.
+//   B  the stage    one arrow's head brushed with venom through
+//                   itemstage::ApplyStroke (the stage's tick path, the flask
+//                   paying), then ApplyCopy onto the rest: every arrow wears
+//                   venom on the same cells, the flask paid for every copy,
+//                   and a second copy finds nothing left to do.
+//   C  the shot     a venomed arrow out of that quiver (the draw), into a
+//                   fresh human's torso on the real tick: it embeds, the
+//                   channel's walls take venom and the infection SEEDS
+//                   (InfectStat), and the arrow pulled out comes back into the
+//                   quiver on the puller's back wearing the WOUND's fluid.
+//                   Printed: venom levels delivered and cells seeded (the
+//                   owner's calibration numbers; no gate threshold on them
+//                   beyond "it seeded").
+//   D  replay       C again on a fresh spawn: every number identical.
+Status GatePoisonArrow(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  const int human = mobs.FindDef("human");
+  const ItemDef* arrowDef = c.items.Named("arrow");
+  const ItemDef* bowDef = c.items.Named("bow");
+  const ItemDef* quiverDef = nullptr;
+  for (const ItemDef& d : c.items.items)
+    if (d.IsQuiver() && d.quiver.ammo == "arrow") { quiverDef = &d; break; }
+  const ItemDef* flask = nullptr;
+  for (const ItemDef& d : c.items.items)
+    if (d.IsContainer()) { flask = &d; break; }
+  if (human < 0 || !arrowDef || !arrowDef->IsAmmo() || !bowDef || !bowDef->IsBow() ||
+      !quiverDef || !flask) {
+    detail = "no human, bow, arrow, quiver or vessel in the libraries";
+    return Status::Fail;
+  }
+  const std::string* liqName = BaselineValue("venomBladeLiquid");
+  const uint32_t venom = mobs.MaterialIdNamed(liqName ? *liqName : "venom");
+  if (!venom || venom >= c.mats.size() || c.mats[venom].coatInfects == 0) {
+    detail = "the test liquid is not a coat that seeds an infection";
+    return Status::Skip;
+  }
+  const uint32_t infect = c.mats[venom].coatInfects;
+  const int arrowIdx = c.items.Find("arrow");
+  const int quiverIdx = c.items.Find(quiverDef->name);
+  const int flaskIdx = c.items.Find(flask->name);
+  const int cap = quiverDef->quiver.capacity;
+  const KitRef backRef{KitSpace::Equip, (int)EquipSlotId::Back};
+
+  bool ok = true;
+  std::string why, lines;
+  auto fail = [&](const std::string& s) {
+    ok = false;
+    why += " | " + s;
+  };
+  auto venomOn = [&](const std::vector<PrefabVoxel>* lat) {
+    uint32_t n = 0;
+    if (lat)
+      for (const PrefabVoxel& v : *lat)
+        if (v.stain && BodyStainMat(v.stain) == venom) n++;
+    return n;
+  };
+
+  // ======== A: THE QUIVER ======================================================
+  {
+    Kit kit;
+    kit.equip.slots[(int)EquipSlotId::Back] = StackOf(c.items, quiverIdx);
+    kit.bag.slots[0] = StackOf(c.items, arrowIdx, cap + 5);
+    const MoveResult mr = kit.Move(KitRef{KitSpace::Bag, 0}, backRef, c.items);
+    const int in = KitAmmoCount(kit, "arrow");
+    const int left = kit.bag.slots[0].Empty() ? 0 : kit.bag.slots[0].count;
+    const MoveResult full = kit.Move(KitRef{KitSpace::Bag, 0}, backRef, c.items);
+    lines += Format("A: drag %d onto a %d-quiver: %d in, %d left, again: %s | ", cap + 5,
+                    cap, in, left, MoveResultText(full, backRef));
+    if (mr != MoveResult::Ok || in != cap || left != 5 || full != MoveResult::QuiverFull)
+      fail("A: dragging arrows onto the quiver did not load it to its capacity");
+    // Two coated arrows among the plain ones: entries [plain x cap-2, a, b].
+    ItemStack& q = kit.equip.slots[(int)EquipSlotId::Back];
+    for (int k = 0; k < 2; k++) {
+      ItemInstance one = QuiverTakeOne(q, 0);
+      std::vector<PrefabVoxel>& lat = ItemLatticeMut(one, *arrowDef, 0);
+      lat[(size_t)k].stain = PackBodyStain(venom, 9u);
+      q.held.push_back(std::move(one));
+    }
+    // THE DRAW: a pure function of the key, and every entry reachable.
+    int hits[3] = {0, 0, 0};
+    bool same = true;
+    for (uint32_t key = 0; key < 600; key++) {
+      const int e = QuiverPick(q, rng::Hash3(0xA770B2u, key, 0u), "arrow");
+      if (e >= 0 && e < 3) hits[e]++;
+      Kit k2 = kit;
+      ItemInstance took;
+      const ItemInstance peek = KitPeekAmmo(k2, "arrow", rng::Hash3(0xA770B2u, key, 0u));
+      KitTakeAmmo(k2, "arrow", rng::Hash3(0xA770B2u, key, 0u), &took);
+      std::vector<uint8_t> b1, b2;
+      ByteWriter w1{b1}, w2{b2};
+      WriteItemInstance(w1, peek, kItemFmtLatest);
+      WriteItemInstance(w2, took, kItemFmtLatest);
+      same = same && b1 == b2 && KitAmmoCount(k2, "arrow") == cap - 1;
+    }
+    lines += Format("A: 600 draws: plain %d, coated %d + %d, peek==take %s | ", hits[0],
+                    hits[1], hits[2], same ? "yes" : "NO");
+    if (!same) fail("A: the arrow KitPeekAmmo names is not the one KitTakeAmmo takes");
+    if (hits[1] == 0 || hits[2] == 0 || hits[0] < hits[1] + hits[2])
+      fail("A: the draw does not reach every arrow by its count");
+    // THE RECORD: a quiver of plain and coated arrows, written and read back.
+    std::vector<uint8_t> b1, b2;
+    ByteWriter w1{b1};
+    WriteItemInstance(w1, q, kItemFmtLatest);
+    ItemInstance back;
+    ByteReader r{b1.data(), b1.size()};
+    const bool read = ReadItemInstance(r, back, kItemFmtLatest);
+    ByteWriter w2{b2};
+    WriteItemInstance(w2, back, kItemFmtLatest);
+    lines += Format("A: record %zu bytes, %zu entries, round trip %s | ", b1.size(),
+                    back.held.size(), read && b1 == b2 ? "exact" : "DIFFERS");
+    if (!read || b1 != b2 || back.held.size() != 3 || QuiverCount(back) != cap)
+      fail("A: the quiver's arrows did not survive the item record");
+    // ...AND A SAVE (PLYR v11, through MakeEntityIO for selftest_dye's reason:
+    // a field written by a section nobody registered persists nothing): the
+    // worn quiver and a second one in the pack, every arrow and its coat.
+    {
+      PlayerCaster caster;
+      GlyphLibrary glyphs;
+      Kit pk;
+      pk.equip.slots[(int)EquipSlotId::Back] = q;
+      pk.bag.slots[4] = q;
+      PlayerKitRefs refs{&caster, &glyphs, &pk, &c.items};
+      EntityIO io = MakeEntityIO(c.debris, c.mobs, nullptr, &refs);
+      const EntitySection* plyr = nullptr;
+      for (const EntitySection& sec : io.sections)
+        if (sec.id == (uint32_t)('P' | ('L' << 8) | ('Y' << 16) | ((uint32_t)'R' << 24)))
+          plyr = &sec;
+      bool same = false;
+      if (plyr != nullptr) {
+        std::vector<uint8_t> bytes;
+        plyr->save(bytes);
+        plyr->reset();
+        const bool loaded = plyr->load(bytes.data(), bytes.size(), kPlayerKitSaveVersion);
+        auto rec = [&](const ItemInstance& it) {
+          std::vector<uint8_t> b;
+          ByteWriter w{b};
+          WriteItemInstance(w, it, kItemFmtLatest);
+          return b;
+        };
+        same = loaded && rec(pk.equip.At((int)EquipSlotId::Back)) == b1 &&
+               rec(pk.bag.At(4)) == b1;
+      }
+      lines += Format("A: PLYR save/load of two quivers: %s | ", same ? "exact" : "DIFFERS");
+      if (!same) fail("A: a quiver did not survive a PLYR save and load arrow for arrow");
+    }
+  }
+
+  // ======== B: BRUSH ONE, COPY TO N ============================================
+  // The quiver the shots below draw from: 6 plain arrows, then one brushed.
+  const int kArrows = 6;
+  Kit stageKit;
+  stageKit.equip.slots[(int)EquipSlotId::Back] = StackOf(c.items, quiverIdx);
+  {
+    ItemStack a = StackOf(c.items, arrowIdx, kArrows);
+    QuiverLoad(stageKit.equip.slots[(int)EquipSlotId::Back], *quiverDef, a);
+  }
+  stageKit.bag.slots[1] = StackOf(c.items, flaskIdx);
+  stageKit.bag.slots[1].contents.Add((uint16_t)venom, (uint32_t)flask->container.capacity);
+  const KitRef vesselRef{KitSpace::Bag, 1};
+  // The head's cells (the art's foremost run in the head's matter): rays at
+  // them from the four sides across the shaft.
+  IVec3 hlo{1 << 20, 1 << 20, 1 << 20}, hhi{-(1 << 20), -(1 << 20), -(1 << 20)};
+  for (const PrefabVoxel& v : arrowDef->voxels)
+    if ((v.material & 0xFFFu) == arrowDef->arrow.headMaterial) {
+      hlo = IVec3{std::min(hlo.x, (int)v.x), std::min(hlo.y, (int)v.y), std::min(hlo.z, (int)v.z)};
+      hhi = IVec3{std::max(hhi.x, (int)v.x), std::max(hhi.y, (int)v.y), std::max(hhi.z, (int)v.z)};
+    }
+  const float cy = (hlo.y + hhi.y + 1) * 0.5f, cz = (hlo.z + hhi.z + 1) * 0.5f;
+  int64_t milli = 0;
+  uint32_t marked = 0, brushSpent = 0;
+  const uint32_t flask0 = stageKit.bag.slots[1].contents.Total();
+  for (int x = hlo.x; x <= hhi.x; x++)
+    for (int side = 0; side < 4; side++) {
+      itemstage::Stroke st;
+      st.active = true;
+      st.item = backRef;
+      st.shell = 0;
+      st.held = 0;
+      st.radius = 2.0f;
+      st.vessel = vesselRef;
+      const Vec3 dir = side == 0 ? Vec3{0, 0, -1} : side == 1 ? Vec3{0, 0, 1}
+                     : side == 2 ? Vec3{0, -1, 0} : Vec3{0, 1, 0};
+      st.rd = dir;
+      st.ro = Vec3{x + 0.5f, cy, cz} - dir * 8.0f;
+      for (int k = 0; k < 5; k++) {
+        const itemstage::StrokeResult sr =
+            itemstage::ApplyStroke(stageKit, nullptr, 0, c.items, c.mats, st, milli);
+        marked += sr.marked;
+        brushSpent += sr.spent;
+      }
+    }
+  ItemStack& sq = stageKit.equip.slots[(int)EquipSlotId::Back];
+  const uint32_t srcVenom = sq.held.empty() ? 0u : venomOn(ItemLatticeIfAny(sq.held[0], 0));
+  itemstage::CopyOrder co;
+  co.active = true;
+  co.quiver = backRef;
+  co.src = 0;
+  co.n = kArrows;   // more than there are: it stops at the last arrow
+  co.vessel = vesselRef;
+  const itemstage::CopyResult cr = itemstage::ApplyCopy(stageKit, c.items, c.mats, co);
+  const itemstage::CopyResult again = itemstage::ApplyCopy(stageKit, c.items, c.mats, co);
+  int coatedArrows = 0, sameCells = 0;
+  for (const ItemInstance& h : sq.held) {
+    const uint32_t n = venomOn(ItemLatticeIfAny(h, 0));
+    if (n > 0) coatedArrows += h.count;
+    if (n == srcVenom) sameCells += h.count;
+  }
+  const uint32_t flaskNow = stageKit.bag.slots[1].contents.Total();
+  lines += Format("B: brushed %u cells of the head (%u venom cells, %u/8 paid); copy: %d "
+                  "arrows, %u/8 paid; again: %d; %d of %d arrows venomed, %d on the "
+                  "same cells; flask %u -> %u | ",
+                  marked, srcVenom, brushSpent, cr.done, cr.spent, again.done, coatedArrows,
+                  QuiverCount(sq), sameCells, flask0, flaskNow);
+  if (srcVenom == 0) fail("B: the stroke put no venom on the arrow's head");
+  if (cr.refused) fail(std::string("B: the copy refused: ") + cr.refused);
+  if (cr.done != kArrows - 1 || coatedArrows != kArrows || sameCells != kArrows)
+    fail("B: the copy did not put the brushed arrow's venom on every other arrow");
+  if (again.done != 0) fail("B: a second copy found arrows still to coat");
+  if (cr.spent == 0 || flaskNow + brushSpent + cr.spent != flask0)
+    fail("B: the flask did not pay exactly what the brush and the copy took");
+  if (QuiverCount(sq) != kArrows) fail("B: the stage changed how many arrows the quiver holds");
+
+  // ======== C + D: THE SHOT, TWICE ===============================================
+  WorldItems ground;
+  c.debris.SetOnBodyGone([&ground](uint64_t h) { ground.OnBodyGone(h); });
+  mobs.SetOnItemShed([&ground](uint64_t h, const ItemInstance& it) { ground.Add(h, it); });
+  struct Unhook {
+    MobSystem& m;
+    DebrisSystem& d;
+    ~Unhook() {
+      m.SetOnItemShed(nullptr);
+      d.SetOnBodyGone(nullptr);
+    }
+  } unhook{mobs, c.debris};
+  auto limbNamed = [&](const char* nm) {
+    const auto& L = mobs.Defs()[human].limbs;
+    for (size_t i = 0; i < L.size(); i++)
+      if (L[i].name == nm) return (int)i;
+    return -1;
+  };
+  const int torso = limbNamed("torso");
+  const int arm = limbNamed("armU.L") >= 0 ? limbNamed("armU.L") : limbNamed("armU.R");
+  if (torso < 0 || arm < 0) {
+    detail = "the human has no torso / upper arm";
+    return Status::Fail;
+  }
+  auto centroid = [&](uint64_t id, int li) {
+    Vec3 sum{};
+    for (uint32_t k = 0; k < 512; k++) sum += mobs.LimbVoxelPos(id, li, k * 7919u);
+    return sum * (1.0f / 512.0f);
+  };
+  const int settle = (int)BaselineNumber("poisonArrowSettleTicks", 120);
+  struct Shot {
+    std::string err;
+    bool embedded = false, pulled = false, intoQuiver = false;
+    uint32_t delivered = 0, wallVenom = 0, seeded = 0, peak = 0;
+    uint32_t arrowVenom = 0, arrowOther = 0;
+    uint64_t digest = 0;
+  };
+  auto shot = [&](uint32_t clock) {
+    Shot r;
+    mobs.Reset();
+    c.debris.Reset();
+    c.phys.ResetBirthOrdinals();
+    c.phys.ResetBodyIdHistory();
+    mobs.SetNextIdCounter(1);
+    mobs.SetWeatherRain(0u);
+    mobs.SetRainSlope(0, 0);
+    mobs.SetDayPhase(0u);
+    PrepareWorld(c);
+    Target t;
+    t.defIndex = human;
+    t.limb = 0;
+    IVec3 chunk{};
+    const uint64_t id = SpawnTarget(c, t, 170, chunk);
+    if (!id) {
+      r.err = "the fixture human did not spawn";
+      return r;
+    }
+    const Vec3 tC = centroid(id, torso), aC = centroid(id, arm);
+    Vec3 side = tC - aC;
+    side.y = 0.0f;
+    side = side.len() > 1e-3f ? side.normalized() : Vec3{1, 0, 0};
+    const Vec3 front = Vec3{0, 1, 0}.cross(side).normalized();
+    support::TickRig rig(c, clock, chunk);
+    rig.Authority().ground = &ground;
+    // THE DRAW, as the bow takes it: a copy of the stage's quiver, one key.
+    Kit kit = stageKit;
+    const uint32_t key = rng::Hash3(0xA770B2u, clock, 0u);
+    ItemInstance nocked;
+    if (!KitTakeAmmo(kit, "arrow", key, &nocked) || venomOn(ItemLatticeIfAny(nocked, 0)) == 0) {
+      r.err = "the drawn arrow wears no venom";
+      return r;
+    }
+    const Vec3 aim = tC - side * 0.6f;
+    const uint32_t seed = 0x9015A0u;
+    rig.Authority().arrows.Launch(*arrowDef, aim - front * 12.0f, front,
+                                  bowDef->bow.drawSpeed, Vec3{}, seed, {}, 0, &nocked);
+    support::RunTicks(rig, 2);
+    int slot = -1;
+    for (const ArrowEvent& e : rig.Authority().arrows.Events())
+      if (e.seed == seed && e.kind == ArrowEvent::Kind::Embedded) slot = e.slot;
+    r.embedded = slot >= 0;
+    r.delivered = mobs.LastCoatContact().toTarget;
+    {
+      const std::vector<PrefabVoxel> lat = mobs.LimbLattice(id, torso);
+      r.wallVenom = venomOn(&lat);
+    }
+    // The venom works; the arrow stays in.
+    for (int k = 0; k < settle; k += 10) {
+      support::RunTicks(rig, 10);
+      if (const Mob* m = mobs.FindMobById(id)) {
+        r.peak = std::max(r.peak, mobs.LimbMaterialCount(id, torso, infect));
+        if (const Mob::InfectStat* s = m->InfectStatOf(infect)) r.seeded = s->seeded;
+      }
+    }
+    // THE PULL: into the quiver on the puller's back, wearing what it went
+    // through.
+    if (slot >= 0) {
+      Kit puller;
+      puller.equip.slots[(int)EquipSlotId::Back] = StackOf(c.items, quiverIdx);
+      std::string got;
+      r.pulled = PullArrowToKit(mobs, mobs.LimbBody(id, slot), puller, c.items, &got);
+      const ItemInstance& pq = puller.equip.At((int)EquipSlotId::Back);
+      r.intoQuiver = KitAmmoCount(puller, "arrow") == 1;
+      if (!pq.held.empty())
+        if (const std::vector<PrefabVoxel>* lat = ItemLatticeIfAny(pq.held[0], 0))
+          for (const PrefabVoxel& v : *lat) {
+            if (!v.stain) continue;
+            (BodyStainMat(v.stain) == venom ? r.arrowVenom : r.arrowOther)++;
+          }
+    }
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t v : {(uint32_t)r.embedded, (uint32_t)r.pulled, r.delivered, r.wallVenom,
+                       r.seeded, r.peak, r.arrowVenom, r.arrowOther}) {
+      h ^= v;
+      h *= 1099511628211ull;
+    }
+    h ^= (uint64_t)std::llround(mobs.TotalHp(id) * 1000.0);
+    r.digest = h;
+    return r;
+  };
+  const Shot s1 = shot(81000u);
+  const Shot s2 = shot(81000u);
+  if (!s1.err.empty()) fail("C: " + s1.err);
+  lines += Format("C: embedded %s; %u venom levels into the channel, %u venom cells on the "
+                  "torso, %u seeded (peak %u infected); pulled %s into the quiver %s, "
+                  "wearing %u venom + %u other coat cells | ",
+                  s1.embedded ? "yes" : "NO", s1.delivered, s1.wallVenom, s1.seeded, s1.peak,
+                  s1.pulled ? "out" : "NOT out", s1.intoQuiver ? "yes" : "NO", s1.arrowVenom,
+                  s1.arrowOther);
+  if (!s1.embedded) fail("C: the venomed arrow did not embed in the torso");
+  if (s1.wallVenom == 0) fail("C: no venom reached the channel's walls");
+  if (s1.seeded == 0) fail("C: the venom on the arrow seeded no infection");
+  if (!s1.pulled || !s1.intoQuiver) fail("C: the arrow did not come out into the quiver");
+  if (s1.arrowOther == 0 && s1.arrowVenom == 0)
+    fail("C: the pulled arrow came back clean (it should wear the wound's fluid)");
+  lines += Format("D: replay %016llx vs %016llx %s",
+                  (unsigned long long)s1.digest, (unsigned long long)s2.digest,
+                  s1.digest == s2.digest ? "IDENTICAL" : "DIFFER");
+  if (s1.digest != s2.digest) fail("D: the shot did not replay bit-identically");
+
+  mobs.Reset();
+  c.debris.Reset();
+  PrepareWorld(c);
+  detail = lines + why;
+  std::printf("poison-arrow: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -12841,6 +13270,10 @@ const std::vector<Gate>& WoundGates() {
       // dummy; backs off from one inside its minRange; stops at 0 arrows and
       // draws its sidearm; a scene replays bit for bit.
       {"archer", "mob", {}, false, GateArcher, false},
+      // ...and POISONED ARROWS (docs/PLAN_poison_arrows.md): a quiver that loads
+      // and draws by key, one arrow brushed with venom and copied to the rest,
+      // a venomed shot that seeds the wound and comes back out bloody, twice.
+      {"poison-arrow", "mob", {}, false, GatePoisonArrow, false},
       // ...and a SPELL's matter as the point: a stone projectile embeds, a
       // stone bolt goes deeper, water/acid/lava splash a coat that acts.
       {"spell-pierce", "mob", {}, false, GateSpellPierce, false},

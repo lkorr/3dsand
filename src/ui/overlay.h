@@ -1210,6 +1210,8 @@ struct UIState {
   // main.cpp from the table so this layer names no EquipSlotId. And the
   // hand last used, which the HUD frames: F cycles its vessel.
   int handEquipSlot[2] = {-1, -1};
+  // ...and the BACK's (game/equipment.h EquipSlotId::Back, a quiver), -1 = none.
+  int backEquipSlot = -1;
   int lastHand = 0;
   // Per equipment slot, from the authored table in game/equipment.h. Mirrored
   // rather than re-declared here on purpose: the accepted-kinds table is where
@@ -1773,6 +1775,15 @@ struct UIState {
     float yaw = 0.45f, pitch = -0.32f, zoom = 1.0f;   // itemstage::View
     bool resetView = false;      // consumed by main.cpp (the defaults live there)
     float radius = 2.0f;         // brush radius, lattice cells
+    // ---- a QUIVER on the stage (game/quiver.h) ----
+    // The stage shows one of its arrows at a time (`shell` is the arrow's
+    // entry; `shellNames` names each); "apply" copies the coat the shown arrow
+    // wears of what the chosen flask pours onto `copyN` more of them
+    // (itemstage::ApplyCopy).
+    bool quiver = false;         // mirror
+    int arrows = 0;              // mirror: arrows in it
+    int copyN = 24;              // panel-owned
+    bool wantCopy = false;       // latch, consumed by main.cpp
     // ---- input, written by the panel every frame ----
     bool over = false;
     float at[2] = {0, 0};        // stage pixels
@@ -1857,6 +1868,10 @@ struct UIState {
   float bowDraw = -1.0f;
   float bowMinDraw = 0.0f;
   int arrowsLeft = -1;
+  // ...counted in the QUIVER ON THE BACK only (game/quiver.h); true when a bow
+  // is in hand and no quiver is worn at all -- the tab says "no quiver" where
+  // the count would be, because x0 would read as "out of arrows".
+  bool bowNoQuiver = false;
   // THE SHOCK (MobSystem::ApplyShocks; wave 2 package E). Written by the tick
   // (TickAuthority's stun pass) for the HUD's pixel cue under the crosshair:
   // the stun's ticks left (0 = not stunned) and how many ticks ago this body

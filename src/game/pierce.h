@@ -26,6 +26,7 @@
 
 #include "math3d.h"
 #include "phys/kerf.h"
+#include "sim/voxload.h"  // PrefabVoxel: a coated point's lattice
 
 struct ParticleSpawn;
 class Physics;
@@ -65,6 +66,23 @@ inline constexpr float kPierceBackVox = 1.0f;
 // shooter's own). Every hit is resolved in place -- hp, wounds, gore, death --
 // before the next body is cast for.
 //
+// WHAT THE POINT WEARS (2026-10-15, docs/PLAN_poison_arrows.md): the flight's
+// own item lattice (an arrow's ItemInstance, game/itemcoat.h), its pitch, and
+// where its point and head are in its cells. When given, every channel that
+// gets IN to a creature this machine owns TRADES COATS with the channel's
+// walls by the melee rule (MobSystem::CoatOnContact, CoatHitKind::Pierce):
+// the poison on the head goes into the wound, the wound's blood onto the
+// head. `lattice` is written in place. `item` rides the wire record to a
+// peer's creature (MeleeHit::embedInst), where its owner makes the trade.
+struct ItemInstance;
+struct PierceCoat {
+  std::vector<PrefabVoxel>* lattice = nullptr;
+  float scale = 1.0f;      // its cells per world voxel
+  Vec3 tipCell{};          // the point, its own cells
+  float headVox = 0.0f;    // the head's length, world voxels (the contact's reach)
+  const ItemInstance* item = nullptr;
+};
+
 // A BODY ANOTHER MACHINE OWNS (a peer's creature or player, a peer's loose
 // body) is NOT carved for real here: the hit is routed to its owner as a
 // MeleeHitKind::Pierce record (game/meleehit.h, applied by
@@ -80,7 +98,8 @@ PierceFlight PierceAlongRay(Physics& phys, MobSystem& mobs, DebrisSystem& debris
                             const Penetrator& pen,
                             const std::vector<uint64_t>& ignore = {},
                             const std::string& embedItem = {},
-                            uint64_t shooterActor = 0, Vec3 shooterAt = {});
+                            uint64_t shooterActor = 0, Vec3 shooterAt = {},
+                            const PierceCoat* coat = nullptr);
 
 // ---- A SPELL FLIGHT'S MATTER MEETS A BODY (docs/PLAN_projectiles.md D) -------
 //

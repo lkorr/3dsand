@@ -92,8 +92,14 @@ const std::vector<PrefabVoxel>* ViewLattice(const ItemInstance& it,
                                             const ItemDef& def, int shell,
                                             std::vector<PrefabVoxel>& scratch);
 
-// Does the stage take this item? Weapons and worn pieces with voxels.
+// Does the stage take this item? Weapons and worn pieces with voxels, and a
+// QUIVER (2026-10-15, game/quiver.h): the stage then shows ONE of its arrows
+// at a time -- `shell` is the quiver's held-list entry -- and the brush coats
+// that arrow (a plain arrow is split out of its counted entry first).
 bool StageTakes(const ItemDef& def);
+// The def the stage DRAWS for `def` at `it`: the quiver's ammo for a quiver,
+// else `def` itself. Null for a quiver whose ammo the library lacks.
+const ItemDef* StageDrawDef(const ItemDef& def, const ItemLibrary& items);
 
 // What a shell is called on the stage ("torso", "arm.L"; "" for a held item).
 std::string ShellName(const ItemDef& def, int shell);
@@ -105,8 +111,37 @@ struct Stroke {
   int shell = 0;       // itemcoat.h: 0 for a held item, the cover index for armour
   Vec3 ro{}, rd{};     // lattice cells, the stage camera's ray through the cursor
   float radius = 2.0f; // lattice cells
+  // A QUIVER on the stage: which of its held-list entries is the arrow being
+  // brushed (`shell` is then 0, the arrow's one lattice). -1 otherwise.
+  int held = -1;
   KitRef vessel{};     // the FLASKS row's chosen vessel (UIState::activeVessel)
 };
+
+// ---- COPY ONE ARROW'S COAT ONTO THE REST (2026-10-15, a quiver on the stage) ----
+// Brush one, copy to N: the coat the `src` arrow wears OF WHAT THE VESSEL
+// POURS (the poison, not the blood it may also wear) is laid voxel for voxel
+// on up to `n` other arrows of the quiver, each through AddBodyStain (the
+// precedence rule decides every voxel, as a stroke's does). An arrow that
+// would take nothing (it wears that coat already) does not count. A plain
+// arrow is split out of its counted entry first. THE SPEND is the brush's
+// own rate per level per cell laid (PourBrushCellsPerSec, kStrokeAmount), so a
+// copy costs what painting the same coat on by hand would; it stops at a dry
+// vessel. An INPUT carried into the tick, like the stroke.
+struct CopyOrder {
+  bool active = false;
+  KitRef quiver{};
+  int src = -1;        // the brushed arrow: an entry of the quiver's held list
+  int n = 0;
+  KitRef vessel{};
+};
+struct CopyResult {
+  int done = 0;            // arrows that took the coat
+  uint32_t spent = 0;      // eighths taken from the vessel
+  uint16_t mat = 0;
+  const char* refused = nullptr;
+};
+CopyResult ApplyCopy(Kit& kit, const ItemLibrary& items,
+                     const std::vector<MaterialDef>& mats, const CopyOrder& c);
 
 struct StrokeResult {
   bool hit = false;        // the ray met the item (and the vessel could pour)

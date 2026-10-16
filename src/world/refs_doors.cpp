@@ -505,7 +505,8 @@ void DecodeBag(const RefDelta& d, Bag& out) {
     uint32_t slot = 0;
     rd.U32(slot);
     ItemInstance it;
-    if (!ReadItemInstance(rd, it, kItemFmtStopper)) break;
+    // v2 (2026-10-15): a quiver in the chest keeps its arrows.
+    if (!ReadItemInstance(rd, it, d.version >= 2 ? kItemFmtQuiver : kItemFmtStopper)) break;
     if (slot < (uint32_t)Bag::kSlots) out.slots[slot] = it;
   }
 }
@@ -740,9 +741,9 @@ void ContainerSetContents(RefStore& s, const Ref& r, const Bag& bag) {
   for (int i = 0; i < Bag::kSlots; i++) {
     if (bag.slots[i].Empty()) continue;
     w.U32((uint32_t)i);
-    WriteItemInstance(w, bag.slots[i], kItemFmtStopper);
+    WriteItemInstance(w, bag.slots[i], kItemFmtQuiver);
   }
-  s.SetDelta(r.id, "container", 1, std::move(b));
+  s.SetDelta(r.id, "container", 2, std::move(b));
 }
 
 bool ContainerTake(RefStore& s, const std::string& id, int n, Kit& kit,
