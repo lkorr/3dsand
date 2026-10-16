@@ -964,6 +964,12 @@ if(MSVC)
   # being someone else's to remove. NOT /fp:fast — see the deliberate note on
   # the Jolt options above; relaxed float must never reach the sim.
   target_compile_options(sandvox_core PRIVATE /arch:AVX2)
+  # main.cpp passed COFF's 65,279-section limit (C1128) on 2026-10-16, when the
+  # distant tier's frame-loop wiring met main's arrow trails and stealth UI.
+  # /bigobj on THIS FILE ONLY: target-wide it would change every object's
+  # format and miss the shared sccache for all ~1,000 TUs at once.
+  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp
+    PROPERTIES COMPILE_OPTIONS /bigobj)
 endif()
 
 # ---------------------------------------------------------------------------
