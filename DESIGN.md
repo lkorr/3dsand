@@ -25170,10 +25170,18 @@ streamed refill keeps a stream while its column's tag is unchanged).
 
 **The look** (`raymarch.wgsl`): a SIDE face of water where the water outside
 drops away by 0.75 cell or more is a falling sheet (`fallingSheet`: vertical
-whitewater streaks scrolling down at 3.2 m/s) — a held curtain, a rapid's step
-and a CA spill in flight all read as water going down; a smaller step is a
+whitewater streaks in free fall from the crest, v = sqrt(v0² + 2 g d) with
+v0 = 1 m/s and d found up the face's column by `fallCrestDepthM`, so they
+accelerate and draw out into ropes toward the foot) — a held curtain, a rapid's
+step and a CA spill in flight all read as water going down; a smaller step is a
 RISER, lit as top; a face with a solid in front (glass, ice) stays a plain wall
-(`waterSideKind`);
+(`waterSideKind`). Water IN FLIGHT (air or gas under it) is white water on
+every face, its underside and top included, so a falling column seen from
+below or a partial cell in free fall is not a clear pane or a dark glass cube.
+White water is lit by absolute light (`whiteWaterLight`), surface foam by its
+authored colour times `mediaLightK` — the night is then dark water with dim
+white water, not black streaks and glowing flecks (2026-10-16 tickets
+11-08-20 / 11-18-23);
 `fallCueAt` gives a held curtain the waterfall mist and its foot the plunge
 spray; `gSlopeFlow` turns the surface's own slope into a current for the streaks
 and foam lines, so a held ramp or an adopted stream runs visibly.
